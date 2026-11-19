@@ -21,6 +21,8 @@ import { BiliCommentsBlock, BiliDanmakuBlock, BiliRankBlock, BiliSubtitleBlock, 
 import { FeishuDocBlock, FeishuEventsBlock, WeiboHotBlock, WeiboPostsBlock, ZhihuAnswersBlock, ZhihuHotBlock } from "./PluginBlocks";
 import { TableBlock } from "./TableBlock";
 import { DraftBlock, OutlineBlock, SourcesBlock } from "./TextBlocks";
+import { CitationsBlock, DeliverablesBlock, RunbookBlock } from "./WorkBlocks";
+import { FlashcardsBlock, PromptTemplateBlock, StoryboardBlock } from "./StudioBlocks";
 import {
   CalloutBlock,
   ChoiceBlock,
@@ -37,7 +39,7 @@ import { BodyMarkdown, Skeleton } from "./shell";
 import { specToMarkdown } from "./toMarkdown";
 
 /** 这些组件要等内容完整才渲染(交互依赖完整数据);流式期间显示骨架。 */
-const WAIT_FOR_COMPLETE = new Set(["calculator", "choice", "suggestions", "callout", "quiz", "form", "recipe", "kline", "intraday", "blog_draft", "blog_status", "blog_published"]);
+const WAIT_FOR_COMPLETE = new Set(["calculator", "choice", "suggestions", "callout", "quiz", "form", "recipe", "runbook", "prompt_template", "storyboard", "flashcards", "kline", "intraday", "blog_draft", "blog_status", "blog_published"]);
 
 export class BlockBoundary extends Component<{ fallback: ReactNode; children: ReactNode; resetKey: string }, { failed: boolean; key: string }> {
   state = { failed: false, key: this.props.resetKey };
@@ -71,7 +73,7 @@ export function renderSpec(spec: IuiSpec, notes: string[], streaming: boolean, r
     case "chart":
       return <ChartBlock spec={spec} {...p} />;
     case "calculator":
-      return <CalculatorBlock spec={spec} {...p} />;
+      return <CalculatorBlock spec={spec} {...p} readOnly={readOnly} />;
     case "stats":
       return <StatsBlock spec={spec} {...p} />;
     case "steps":
@@ -114,6 +116,18 @@ export function renderSpec(spec: IuiSpec, notes: string[], streaming: boolean, r
       return <OutlineBlock spec={spec} {...p} />;
     case "draft":
       return <DraftBlock spec={spec} {...p} />;
+    case "deliverables":
+      return <DeliverablesBlock spec={spec} {...p} />;
+    case "citations":
+      return <CitationsBlock spec={spec} {...p} readOnly={readOnly} />;
+    case "runbook":
+      return <RunbookBlock spec={spec} {...p} />;
+    case "prompt_template":
+      return <PromptTemplateBlock spec={spec} {...p} readOnly={readOnly} />;
+    case "storyboard":
+      return <StoryboardBlock spec={spec} {...p} readOnly={readOnly} />;
+    case "flashcards":
+      return <FlashcardsBlock spec={spec} {...p} />;
     case "quote":
       return <QuoteBlock spec={spec} {...p} />;
     case "kline":
@@ -200,6 +214,17 @@ function hasContent(spec: IuiSpec): boolean {
       return spec.items.length > 0;
     case "draft":
       return spec.variants.length > 0;
+    case "deliverables":
+    case "citations":
+      return spec.items.length > 0;
+    case "runbook":
+      return spec.steps.length > 0;
+    case "prompt_template":
+      return spec.template.length > 0;
+    case "storyboard":
+      return spec.shots.length > 0;
+    case "flashcards":
+      return spec.cards.length > 0;
     case "quote":
     case "stocklist":
       return spec.items.length > 0;

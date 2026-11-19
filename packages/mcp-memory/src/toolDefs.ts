@@ -222,7 +222,7 @@ export const TOOLS = [
     name: 'delegate_task',
     description: [
       '将单个任务委派给另一个 agent，并先短时等待结果。与 send_to_agent 不同，作业结果仍回到当前队长。',
-      '若短等窗口内未完成，本工具会返回 jobId；必须立刻用 Bash 执行 `oc-memory delegate-wait <jobId>` 阻塞取回结果。',
+      '若短等窗口内未完成，本工具会返回 jobId；必须立刻用 Bash 执行 `oc-memory delegate-wait <jobId>` 阻塞取回结果（Antigravity 下调用 `oc_bash` 时请传 `timeout_ms: 600000`）。',
       '',
       '适用场景:',
       '- 需要专业 agent 处理后你还要继续用结果的场景',
@@ -289,7 +289,7 @@ export const TOOLS = [
     description: [
       '一次把多个**互相独立**的子任务并行委派给成员并短时等待(fan-out)。',
       '各子任务并发执行、互不依赖,单个失败不影响其余(每项独立标注 ✅/❌)。',
-      '仍在运行的任务会返回 jobId 列表；按返回指令用一条 `oc-memory delegate-wait ...` 阻塞取回全部结果。',
+      '仍在运行的任务会返回 jobId 列表；按返回指令用一条 `oc-memory delegate-wait ...` 阻塞取回全部结果（Antigravity 下调用 `oc_bash` 时请传 `timeout_ms: 600000`）。',
       '',
       '仅用于「彼此独立、可同时进行」的子任务;有先后依赖(B 需要 A 的产出)时,',
       '请分步用 `delegate_task` 串行委派,不要塞进本工具。单次最多 4 个并行子任务。',
@@ -704,23 +704,36 @@ export const TOOLS = [
   {
     name: 'oc_bash',
     description: [
-      '在 MCP 进程里同步执行一条 shell 命令,返回 stdout、stderr 和 exit。',
-      '默认等待 60000ms,最短 1000ms,最长 600000ms。超时才算工具错误;非零退出码写在文本里,不是协议错误。',
+      '在 MCP 进程里执行一条 shell 命令,返回 stdout、stderr 和 exit。',
+      '默认等待 60000ms,最短 1000ms,单段最长 600000ms。非零退出码写在文本里,不是协议错误。',
+      '到达 timeout_ms 仍未结束时,默认(kill_on_timeout=false)保留进程不强杀,返回 `status=running job_id=<id>`(非错误);随后用 `job_id` 配合 `action="wait"`(`timeout_ms: 600000`)继续等待,或 `action="status"` 看增量输出 / `action="kill"` 终止。仅探测类短命令确需超时强杀时传 `kill_on_timeout: true`。',
       'Antigravity 原生 run_command 前台最多等 10000ms 就会转后台。需要跑完再继续时用本工具,不要用 run_command 的 WaitMsBeforeAsync。',
     ].join('\n'),
     inputSchema: {
       type: 'object',
       properties: {
-        command: { type: 'string', description: '交给 bash -lc 的命令' },
-        cwd: { type: 'string', description: '工作目录;不填则用 MCP 进程当前目录' },
+        command: { type: 'string', description: '交给 bash -lc 的新命令(与 job_id 二选一)' },
+        cwd: { type: 'string', description: '启动新命令时的工作目录;不填则用 MCP 进程当前目录' },
         timeout_ms: {
           type: 'number',
           minimum: 1000,
           maximum: 600000,
-          description: '等待毫秒数,默认 60000,范围 1000–600000',
+          description: '本次等待毫秒数,默认 60000,范围 1000–600000',
+        },
+        job_id: {
+          type: 'string',
+          description: '续等、查询或终止本回合在途 oc_bash 任务 ID(如 ocb_1,与 command 二选一)',
+        },
+        action: {
+          type: 'string',
+          enum: ['wait', 'status', 'kill'],
+          description: '配合 job_id 使用:wait(默认,阻塞续等)、status(立即看增量输出)、kill(SIGTERM→SIGKILL 终止进程组)',
+        },
+        kill_on_timeout: {
+          type: 'boolean',
+          description: '默认 false(到期保留进程并返回 job_id 供续等);传 true 时到期立即强杀进程组并报错',
         },
       },
-      required: ['command'],
       additionalProperties: false,
     },
   },

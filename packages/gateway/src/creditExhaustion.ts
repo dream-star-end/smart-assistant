@@ -10,7 +10,7 @@
  * Missing pricing fails open (do not kill the turn). Admission still
  * rejects balance ≤ 0 before any engine work starts.
  */
-import { composeMultiplier, computeCostFen } from '@openclaude/protocol'
+import { type ServiceTier, codexServiceTierBillingMultiplier, composeMultiplier, computeCostFen } from '@openclaude/protocol'
 import { getModelCatalogClient } from './modelCatalogClient.js'
 import { lookupPlatformPricing } from './usageCost.js'
 
@@ -67,6 +67,7 @@ export class CreditBudgetGuard {
       modelId: () => string | undefined
       agentId?: string
       composeAgentMultiplier: boolean
+      codexServiceTier?: ServiceTier | (() => ServiceTier | null | undefined) | null
       /** true while this turn is still the adapter's live turn. */
       isLive: () => boolean
       onExhausted: () => void
@@ -97,11 +98,15 @@ export class CreditBudgetGuard {
     if (budget === undefined) return
     this.inflight++
     try {
+      const codexServiceTier = typeof this.opts.codexServiceTier === 'function'
+        ? this.opts.codexServiceTier()
+        : (this.opts.codexServiceTier ?? null)
       const fen = await runningCostFenForUsage({
         modelId: this.opts.modelId(),
         usage,
         agentId: this.opts.agentId,
         composeAgentMultiplier: this.opts.composeAgentMultiplier,
+        codexServiceTier,
       })
       if (this.exhausted || !this.opts.isLive()) return
       if (fen !== null && shouldAbortForCreditBudget(fen, budget)) {
@@ -129,6 +134,7 @@ export async function runningCostFenForUsage(args: {
   agentId?: string
   /** Grok/Codex settlement composes agent_cost_overrides; Cursor does not. */
   composeAgentMultiplier?: boolean
+  codexServiceTier?: ServiceTier | null
 }): Promise<bigint | null> {
   const modelId = args.modelId?.trim()
   if (!modelId) return null
@@ -140,6 +146,16 @@ export async function runningCostFenForUsage(args: {
     if (!agentMul) return null
     try {
       multiplier = composeMultiplier(pricing.multiplier, agentMul)
+    } catch {
+      return null
+    }
+  }
+  const tierMul = args.codexServiceTier
+    ? codexServiceTierBillingMultiplier(modelId, args.codexServiceTier)
+    : null
+  if (tierMul) {
+    try {
+      multiplier = composeMultiplier(multiplier, tierMul)
     } catch {
       return null
     }

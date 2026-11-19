@@ -223,11 +223,12 @@ describe('InboundMessage schema', () => {
     assert.equal(Value.Check(InboundMessage, { ...(baseInbound() as object), contextTier: 1000000 }), false)
     assert.equal(Value.Check(InboundMessage, { ...(baseInbound() as object), contextTier: null }), false)
   })
-  it('OCV5-434: serviceTier accepts fast or explicit standard (null) only', () => {
+  it('OCV5-434 / OCV5-798: serviceTier accepts fast, ultrafast, or explicit standard (null) only', () => {
     assert.equal(Value.Check(InboundMessage, { ...(baseInbound() as object), serviceTier: 'fast' }), true)
+    assert.equal(Value.Check(InboundMessage, { ...(baseInbound() as object), serviceTier: 'ultrafast' }), true)
     assert.equal(Value.Check(InboundMessage, { ...(baseInbound() as object), serviceTier: null }), true)
     assert.equal(Value.Check(InboundMessage, baseInbound()), true)
-    for (const bad of ['priority', 'default', 'Fast', 'ultrafast', 1, true]) {
+    for (const bad of ['priority', 'default', 'standard', 'Fast', 'Ultrafast', 1, true]) {
       assert.equal(Value.Check(InboundMessage, { ...(baseInbound() as object), serviceTier: bad }), false)
     }
   })

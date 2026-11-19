@@ -2232,3 +2232,37 @@ export type OrgPayResult = {
   mobileUrl: string | null;
   amountCents?: string;
 };
+
+export type UserSiteVisibility = "public" | "password" | "disabled";
+
+export type UserSiteCustomDomainStatus = "none" | "pending" | "verified";
+
+export type UserSiteItem = {
+  id: string;
+  slug: string;
+  url: string;
+  customDomain: string | null;
+  customDomainStatus?: UserSiteCustomDomainStatus;
+  customDomainTxtName?: string | null;
+  customDomainTxtValue?: string | null;
+  originSessionId: string | null;
+  hasServerApi: boolean;
+  title: string;
+  visibility: UserSiteVisibility;
+  spaMode: boolean;
+  fileCount: number;
+  sizeBytes: number;
+  contentSha256: string;
+  edgeRevision: number;
+  createdAt: string;
+  updatedAt: string;
+  lastPublishedAt: string;
+};
+
+export type SitesSummaryResponse = {
+  enabled: boolean;
+  baseDomain: string;
+  maxPerUser: number;
+  maxSiteBytes: number;
+  sites: UserSiteItem[];
+};

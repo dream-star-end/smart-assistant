@@ -5,9 +5,9 @@
  * construction so even a legacy launch without platform context is restricted. */
 import {
   ADVISOR_READ_ONLY_MCP_TOOLS,
-  CODEX_EXPLICIT_STANDARD_MODELS,
-  CODEX_STANDARD_SERVICE_TIER,
+  type ServiceTier,
   codexTransportModelId,
+  codexTurnServiceTierValue,
 } from '@openclaude/protocol'
 import { normalizeCodexReasoningEffort } from './codexShared.js'
 
@@ -42,6 +42,7 @@ export function buildCodexThreadPolicyParams(
 export function buildCodexTurnPolicyParams(prompt: string, threadId: string | null, opts: {
   model?: string
   effortLevel?: string
+  serviceTier?: ServiceTier | null
   mode: 'default' | 'plan'
   hermeticNoTools?: boolean
   readOnly: boolean
@@ -69,11 +70,11 @@ export function buildCodexTurnPolicyParams(prompt: string, threadId: string | nu
   if (model) params.model = model
   if (opts.readOnly) params.environments = []
   if (opts.structuredOutputSchema) params.outputSchema = opts.structuredOutputSchema
-  // OCV5-434: no Fast on Codex (the backend ignores priority from our client; the user chose to
-  // hide it rather than impersonate Codex CLI). GPT-6 turns state an explicit standard tier so
-  // a catalog Fast default (GPT-6 Luna) never applies.
-  if (CODEX_EXPLICIT_STANDARD_MODELS.has(opts.model ?? '')) {
-    params.serviceTierForTurn = CODEX_STANDARD_SERVICE_TIER
+  // OCV5-798: local Codex GPT-6 turns carry explicit speed tier ('priority' / 'ultrafast' / 'default').
+  // Read-only advisor turns always stay explicit Standard so background verification never burns 2x/6x.
+  const wireServiceTier = codexTurnServiceTierValue(opts.model, opts.readOnly ? null : opts.serviceTier)
+  if (wireServiceTier !== undefined) {
+    params.serviceTierForTurn = wireServiceTier
   }
   return params
 }

@@ -5,6 +5,7 @@
 import { ArrowUpRight, Check } from "lucide-react";
 import { useState } from "react";
 import { cn } from "../../lib/utils";
+import { GalleryLightbox } from "./GalleryLightbox";
 import type { CardsSpec, GallerySpec, SwatchesSpec, TilesSpec } from "./schema";
 import { Frame, Glyph, Inline, Media } from "./shell";
 import { specToMarkdown } from "./toMarkdown";
@@ -80,6 +81,7 @@ export function CardsBlock({ spec, notes, streaming, nested }: BlockProps<CardsS
 // ── 图片拼贴 ──────────────────────────────────────────────────────────
 
 export function GalleryBlock({ spec, notes, streaming, nested }: BlockProps<GallerySpec>) {
+  const [lightboxIdx, setLightboxIdx] = useState<number | null>(null);
   const shown = spec.images.slice(0, 3);
   const extra = spec.images.length - shown.length;
   return (
@@ -97,12 +99,29 @@ export function GalleryBlock({ spec, notes, streaming, nested }: BlockProps<Gall
       <div className="oc-iui-gallery" data-count={shown.length}>
         {shown.map((im, i) => (
           <figure key={`${i}:${im.src}`} className="oc-iui-gallery-item">
-            <Media src={im.src} alt={im.caption ?? `图片 ${i + 1}`} />
-            {i === shown.length - 1 && extra > 0 && <span className="oc-iui-gallery-more">+{extra}</span>}
-            {im.caption && shown.length === 1 && <figcaption className="oc-iui-gallery-caption">{im.caption}</figcaption>}
+            <button
+              type="button"
+              className="oc-iui-gallery-trigger"
+              disabled={streaming}
+              aria-label={`放大查看第 ${i + 1} 张图片${im.caption ? `：${im.caption}` : ""}`}
+              onClick={() => setLightboxIdx(i)}
+            >
+              <Media src={im.src} alt={im.caption ?? `图片 ${i + 1}`} />
+              {i === shown.length - 1 && extra > 0 && <span className="oc-iui-gallery-more">+{extra}</span>}
+              {im.caption && shown.length === 1 && <figcaption className="oc-iui-gallery-caption">{im.caption}</figcaption>}
+            </button>
           </figure>
         ))}
       </div>
+      {lightboxIdx !== null && (
+        <GalleryLightbox
+          images={spec.images}
+          index={lightboxIdx}
+          title={spec.title}
+          onClose={() => setLightboxIdx(null)}
+          onChange={setLightboxIdx}
+        />
+      )}
     </Frame>
   );
 }

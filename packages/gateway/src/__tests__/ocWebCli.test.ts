@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import { runOcWebCli } from '../ocWebCli.js'
+import { resolveWebContextBrowserExecutable } from '../webContextBrowser.js'
 
 describe('runOcWebCli — dispatch & usage', () => {
   it('no command → usage error (exit 2)', async () => {
@@ -132,9 +133,50 @@ esac
         browser: false,
       })
     } finally {
-      if (previous === undefined) process.env.OPENCLAUDE_WEB_CONTEXT_BIN = undefined
+      if (previous === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_WEB_CONTEXT_BIN')
       else process.env.OPENCLAUDE_WEB_CONTEXT_BIN = previous
       await rm(dir, { recursive: true, force: true })
     }
+  })
+
+  it('augments health output with browser executable and proxy check when helper omits top-level browser', async () => {
+    const browserPath = resolveWebContextBrowserExecutable()
+    assert.ok(browserPath, 'expected Chromium executable for health probe test')
+    const dir = await mkdtemp(join(tmpdir(), 'oc-web-health-browser-'))
+    const bin = join(dir, 'web-context-helper')
+    await writeFile(
+      bin,
+      `#!/bin/sh
+cat >/dev/null
+printf '%s\\n' '{"ok":true,"checks":{"trafilatura":{"ok":true}}}'
+`,
+    )
+    await chmod(bin, 0o755)
+
+    const prevBin = process.env.OPENCLAUDE_WEB_CONTEXT_BIN
+    const prevBrowser = process.env.OPENCLAUDE_WEB_CONTEXT_BROWSER
+    process.env.OPENCLAUDE_WEB_CONTEXT_BIN = bin
+    process.env.OPENCLAUDE_WEB_CONTEXT_BROWSER = browserPath
+    try {
+      const r = await runOcWebCli(['health', '--json'])
+      assert.equal(r.exitCode, 0, r.stderr)
+      const parsed = JSON.parse(r.stdout)
+      assert.equal(parsed.ok, true)
+      assert.equal(parsed.browser.ok, true)
+      assert.equal(parsed.browser.executable, browserPath)
+      assert.equal(parsed.browser.proxy, true)
+    } finally {
+      if (prevBin === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_WEB_CONTEXT_BIN')
+      else process.env.OPENCLAUDE_WEB_CONTEXT_BIN = prevBin
+      if (prevBrowser === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_WEB_CONTEXT_BROWSER')
+      else process.env.OPENCLAUDE_WEB_CONTEXT_BROWSER = prevBrowser
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects unknown extract mode cleanly', async () => {
+    const r = await runOcWebCli(['extract', 'https://example.com', '--mode=invalid'])
+    assert.equal(r.exitCode, 1)
+    assert.match(r.stderr, /invalid mode/)
   })
 })

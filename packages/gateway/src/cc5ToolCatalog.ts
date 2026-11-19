@@ -27,6 +27,7 @@ const OPAQUE_ALIAS = /^t[0-9]{1,3}$/
 const DESCRIPTION_MAX_BYTES = 20480
 const CATALOG_MAX_BYTES = 1048576
 export const CC5_PROMPT_MAX_BYTES = 262144
+export const REMOTE_V4_PROMPT_MAX_BYTES = 1024 * 1024
 
 function requireCatalog(value: unknown): asserts value {
   if (!value) throw new Error('CC5_TOOL_CATALOG_INVALID')
@@ -83,9 +84,14 @@ export function cc5ToolNamingNotice(catalog: Cc5ToolCatalog, cwd: string): strin
 }
 
 /** The platform prompt (persona, platform, skills, memory) plus the notice, within the node's bound. */
-export function cc5RemotePrompt(platformPrompt: string, catalog: Cc5ToolCatalog, cwd: string): string {
+export function cc5RemotePrompt(
+  platformPrompt: string,
+  catalog: Cc5ToolCatalog,
+  cwd: string,
+  maxBytes = CC5_PROMPT_MAX_BYTES,
+): string {
   const notice = cc5ToolNamingNotice(catalog, cwd)
-  const room = CC5_PROMPT_MAX_BYTES - Buffer.byteLength(notice) - 2
+  const room = maxBytes - Buffer.byteLength(notice) - 2
   requireCatalog(room > 0 && !platformPrompt.includes('\0') && !notice.includes('\0'))
   return `${utf8Head(platformPrompt, room)}\n\n${notice}`
 }

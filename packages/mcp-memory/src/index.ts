@@ -95,6 +95,7 @@ import {
   handleOcGrep,
   isLocalCliToolEnabled,
   isLocalCliToolName,
+  shutdownLocalCliTools,
 } from './localCliTools.js'
 import { filterSkillEvalTools, isSkillEvalBlockedTool } from './skillEvalToolPolicy.js'
 import { filterAdvisorReadOnlyMcpTools, isAdvisorReadOnlyMcpTool } from './advisorReadOnlyPolicy.js'
@@ -1289,6 +1290,16 @@ function toolError(msg: string) {
 }
 
 const transport = new StdioServerTransport()
+let localCliCleanedUp = false
+const cleanupLocalCliOnClose = () => {
+  if (localCliCleanedUp) return
+  localCliCleanedUp = true
+  shutdownLocalCliTools()
+}
+transport.onclose = cleanupLocalCliOnClose
+process.stdin.once('end', cleanupLocalCliOnClose)
+process.stdin.once('close', cleanupLocalCliOnClose)
+
 // No top-level await: the CJS bundle (dist/oc-memory-mcp.cjs) rejects it, and
 // the promise form behaves identically under tsx/ESM.
 server
@@ -1297,6 +1308,7 @@ server
     process.stderr.write(`[mcp-memory] started for agent=${AGENT_ID}\n`)
   })
   .catch((err: unknown) => {
+    cleanupLocalCliOnClose()
     process.stderr.write(`[mcp-memory] failed to start: ${String(err)}\n`)
     process.exit(1)
   })

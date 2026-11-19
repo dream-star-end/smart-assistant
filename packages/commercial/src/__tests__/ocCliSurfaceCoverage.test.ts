@@ -312,6 +312,21 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     video: scriptProbe('oc-muse.py', ['video', '--help'], { code: 0, stdout: /--resume/ }),
     fetch: scriptProbe('oc-muse.py', ['fetch', '--help'], { code: 0, stdout: /job_id/ }),
   },
+  'oc-site': {
+    publish: scriptProbe('oc-site.py', ['publish', '--help'], { code: 0, stdout: /--api/ }),
+    list: scriptProbe('oc-site.py', ['list', '--help'], { code: 0, stdout: /usage: oc-site list/ }),
+    info: scriptProbe('oc-site.py', ['info', '--help'], { code: 0, stdout: /slug/ }),
+    update: scriptProbe('oc-site.py', ['update', '--help'], { code: 0, stdout: /--custom-domain/ }),
+    rename: scriptProbe('oc-site.py', ['rename', '--help'], { code: 0, stdout: /new_slug/ }),
+    'verify-domain': scriptProbe('oc-site.py', ['verify-domain', '--help'], { code: 0, stdout: /slug/ }),
+    'env-list': scriptProbe('oc-site.py', ['env-list', '--help'], { code: 0, stdout: /slug/ }),
+    'env-set': scriptProbe('oc-site.py', ['env-set', '--help'], { code: 0, stdout: /--secret/ }),
+    'env-unset': scriptProbe('oc-site.py', ['env-unset', '--help'], { code: 0, stdout: /key/ }),
+    analytics: scriptProbe('oc-site.py', ['analytics', '--help'], { code: 0, stdout: /--days/ }),
+    'db-inspect': scriptProbe('oc-site.py', ['db-inspect', '--help'], { code: 0, stdout: /--table/ }),
+    'db-sql': scriptProbe('oc-site.py', ['db-sql', '--help'], { code: 0, stdout: /--params-json/ }),
+    delete: scriptProbe('oc-site.py', ['delete', '--help'], { code: 0, stdout: /slug/ }),
+  },
   'oc-h3': {
     generate: scriptProbe('oc-h3.py', ['generate', '--help'], {
       code: 0,
@@ -939,6 +954,9 @@ function productionSurfaces(): Record<string, Set<string>> {
     ),
     'oc-muse': pythonArgparseCommands(
       'packages/commercial/agent-sandbox/platform-runtime/bin/oc-muse.py',
+    ),
+    'oc-site': pythonArgparseCommands(
+      'packages/commercial/agent-sandbox/platform-runtime/bin/oc-site.py',
     ),
     'oc-docxcheck': singlePurpose(
       'packages/commercial/agent-sandbox/platform-runtime/bin/oc-docxcheck.sh',

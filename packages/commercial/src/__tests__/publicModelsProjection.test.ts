@@ -549,12 +549,60 @@ describe("/api/public/models — catalog 未注入 → legacy 投影(兼容)", (
     pricing._setForTests([legacyRow("glm-5.2")]);
     const body = await listCatalogBody(deps({ pricing }));
     assert.equal(body.locked_models, undefined);
-    assert.equal(body.team_leader_model, "gpt-6-astra");
+    assert.equal(body.team_leader_model, "gpt-6.2-astra");
   });
 
   test("catalog 与 legacy 均下发服务端权威队长模型 team_leader_model", async () => {
     const body = await listCatalogBody(deps({ modelCatalog: catalogOf(snap()) }));
-    assert.equal(body.team_leader_model, "gpt-6-astra");
+    assert.equal(body.team_leader_model, "gpt-6.2-astra");
+  });
+
+  test("Phase A 灰度窗口：6.2-astra 仅 admin 可见时，普通用户 team_leader_model 回落 gpt-6-astra", async () => {
+    const rolloutSnap = new ModelCatalogSnapshot({
+      entries: [
+        entry({ entryId: 10, modelId: "gpt-6-astra", engine: "codex", providerId: "codex" }),
+        entry({ entryId: 11, modelId: "gpt-6.2-astra", engine: "codex", providerId: "codex" }),
+      ],
+      aliases: new Map(),
+      pricing: new Map([
+        ["gpt-6-astra", price("gpt-6-astra", { visibility: "public" })],
+        ["gpt-6.2-astra", price("gpt-6.2-astra", { visibility: "admin" })],
+      ]),
+      securityEpoch: 12n,
+    });
+    const secret = new Uint8Array(32);
+    const userTok = await authToken(secret, "42");
+    const adminTok = await authToken(secret, "1");
+    const anonBody = await listCatalogBody(deps({ modelCatalog: catalogOf(rolloutSnap) }));
+    assert.equal(anonBody.team_leader_model, "gpt-6-astra");
+
+    const userBody = await listCatalogBody(
+      deps({
+        jwtSecret: secret,
+        modelCatalog: catalogOf(rolloutSnap),
+        loadUserModelAuthz: async () => ({ role: "user", grantedModelIds: new Set<string>() }),
+      }),
+      `Bearer ${userTok}`,
+    );
+    assert.equal(userBody.team_leader_model, "gpt-6-astra");
+
+    const adminBody = await listCatalogBody(
+      deps({
+        jwtSecret: secret,
+        modelCatalog: catalogOf(rolloutSnap),
+        loadUserModelAuthz: async () => ({ role: "admin", grantedModelIds: new Set<string>() }),
+      }),
+      `Bearer ${adminTok}`,
+    );
+    assert.equal(adminBody.team_leader_model, "gpt-6.2-astra");
+
+    const legacyPricing = new PricingCache();
+    legacyPricing._setForTests([
+      legacyRow("gpt-6-astra", { visibility: "public" }),
+      legacyRow("gpt-6.2-astra", { visibility: "admin" }),
+    ]);
+    const legacyAnon = await listCatalogBody(deps({ pricing: legacyPricing }));
+    assert.equal(legacyAnon.team_leader_model, "gpt-6-astra");
   });
 
   test("pricing 与 catalog 都没有 → 503 PRICING_NOT_READY", async () => {

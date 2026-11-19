@@ -1,7 +1,8 @@
 import type { readSessionMetadata } from '../db/sessionMetadataApproval.js'
 import { projectPublicModels, projectLockedModels } from '../billing/modelPublicProjection.js'
 export type { PublicModelProjection, LockedPublicModelProjection } from '../billing/modelPublicProjection.js'
-import { DEFAULT_CODEX_ENGINE_MODEL, DEFAULT_PROMPT_PRIVACY_SUPPORT, type PromptPrivacySupport } from '@openclaude/protocol'
+import { DEFAULT_PROMPT_PRIVACY_SUPPORT, type PromptPrivacySupport } from '@openclaude/protocol'
+import { resolveAuthorizedTeamLeaderModel } from "../ws/teamModeForwarding.js";
 import type { LiteratureArtifactStore } from '../plugins/literatureDb/artifactStore.js'
 import type { LiteratureSetupService } from '../plugins/literatureDb/setupService.js'
 /**
@@ -127,6 +128,7 @@ import type { DouyinSetupManager } from '../plugins/douyinSetup.js'
 import type { KnowledgePlanetAutomationService } from '../plugins/knowledgePlanetAutomation.js'
 import type { GoalStateService } from '../goal/goalStateService.js'
 import type { MediaGenerationService } from '../media-generation/service.js'
+import type { SitesService } from '../sites/service.js'
 import type { MuseBridgeHttpHandler } from '../muse/bridgeHttp.js'
 import type { StudioHttpDeps } from '../media-studio/http.js'
 import { communityBlogEnabled } from "../tutorials/tutorialImages.js";
@@ -145,6 +147,8 @@ export interface CommercialHttpDeps {
   jwtSecret: string | Uint8Array;
   /** Durable local H3 jobs and long-form storyboard projects. */
   mediaGeneration?: MediaGenerationService;
+  /** OCV5-791 persistent static user sites (*.congjianai.com). */
+  sites?: SitesService;
   /** OCV5-561 Muse bridge endpoints; undefined (→ 404) unless OC_MUSE_BRIDGE_ENABLED=1. */
   museBridgeHttp?: MuseBridgeHttpHandler;
   /** OCV5-591 media studio; undefined or disabled (→ 404) unless OC_STUDIO_ENABLED=1. */
@@ -1479,10 +1483,15 @@ export async function handleListPublicModels(
     const effective = claims
       ? await loadPublicModelScope(deps, claims, snapshot.securityEpoch)
       : anonymousModelScope();
+    const teamLeaderModel = resolveAuthorizedTeamLeaderModel(
+      (m) =>
+        Boolean(snapshot.billingPricingFor(m)?.enabled) &&
+        snapshot.canUseModel(effective, snapshot.aliasToCanonical(m)),
+    );
     sendJson(res, 200, {
       models: projectPublicModels(snapshot, effective, degraded),
       locked_models: projectLockedModels(snapshot, effective),
-      team_leader_model: DEFAULT_CODEX_ENGINE_MODEL,
+      team_leader_model: teamLeaderModel,
     });
     return;
   }
@@ -1493,7 +1502,9 @@ export async function handleListPublicModels(
   const models = scope
     ? pricing.listForUser(scope)
     : pricing.listPublic();
-  sendJson(res, 200, { models: annotateDegraded(models, degraded), team_leader_model: DEFAULT_CODEX_ENGINE_MODEL });
+  const visibleIds = new Set(models.map((m) => m.id));
+  const teamLeaderModel = resolveAuthorizedTeamLeaderModel((m) => visibleIds.has(m));
+  sendJson(res, 200, { models: annotateDegraded(models, degraded), team_leader_model: teamLeaderModel });
 }
 
 function anonymousModelScope(): UserModelScope {

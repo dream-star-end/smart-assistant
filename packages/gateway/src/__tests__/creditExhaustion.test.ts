@@ -225,4 +225,45 @@ describe('CreditBudgetGuard', () => {
     await settle()
     assert.equal(fired, 1)
   })
+
+  it('composes Fast (2x) and Ultrafast (6x) multipliers on gpt-6.2-sol running cost', async () => {
+    _setPlatformPricingLookupForTests(async () => PRICING)
+    fakeCatalog('1.000')
+    const usage = { inputTokens: 1_000_000, outputTokens: 0 } // base = 100 fen
+    assert.equal(await runningCostFenForUsage({
+      modelId: 'gpt-6.2-sol',
+      usage,
+      agentId: 'codex',
+      composeAgentMultiplier: true,
+      codexServiceTier: null,
+    }), 100n)
+    assert.equal(await runningCostFenForUsage({
+      modelId: 'gpt-6.2-sol',
+      usage,
+      agentId: 'codex',
+      composeAgentMultiplier: true,
+      codexServiceTier: 'fast',
+    }), 200n)
+    assert.equal(await runningCostFenForUsage({
+      modelId: 'gpt-6.2-sol',
+      usage,
+      agentId: 'codex',
+      composeAgentMultiplier: true,
+      codexServiceTier: 'ultrafast',
+    }), 600n)
+
+    let fired = 0
+    const guard = new CreditBudgetGuard({
+      budgetFen: 600n,
+      modelId: () => 'gpt-6.2-sol',
+      agentId: 'codex',
+      composeAgentMultiplier: true,
+      codexServiceTier: () => 'ultrafast',
+      isLive: () => true,
+      onExhausted: () => { fired++ },
+    })
+    guard.observe(usage)
+    await settle()
+    assert.equal(fired, 1)
+  })
 })

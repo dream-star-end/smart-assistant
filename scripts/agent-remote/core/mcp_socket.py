@@ -7,6 +7,7 @@ BEFORE emitting the first SSH byte to master, so disconnects never replay side e
 from __future__ import annotations
 
 import base64
+import gc
 import hashlib
 from http.server import BaseHTTPRequestHandler
 import json
@@ -36,7 +37,7 @@ from core.mcp_client import (  # noqa: E402
     validate_wire_response,
 )
 
-MAX_FRAME = 262144
+MAX_FRAME = 16 * 1024 * 1024
 
 
 def sync_dir(path: Path) -> None:
@@ -100,6 +101,7 @@ def run_socket_bridge(root: Path, source: BinaryIO, sink: BinaryIO) -> int:
                 data = self.rfile.read(int(lengths[0]))
                 need(len(data) == int(lengths[0]), "REMOTE_SOCKET_SHORT_READ")
                 body = strict_json(data)
+                del data
                 need(isinstance(body, dict) and body.get("version") == 4, "REMOTE_SOCKET_BODY_INVALID")
 
                 cur_cfg = read_config(root)
@@ -121,7 +123,7 @@ def run_socket_bridge(root: Path, source: BinaryIO, sink: BinaryIO) -> int:
                     while not obs_path.exists() and time.monotonic() < deadline:
                         time.sleep(0.01)
                     need(obs_path.exists(), "REMOTE_SOCKET_OBSERVATION_MISSING")
-                    obs = strict_json(read_private(obs_path.parent, obs_path.name, 16384))
+                    obs = strict_json(read_private(obs_path.parent, obs_path.name, 65536))
                     for obs_field in ("operationId", "runId", "generation", "nativeSessionId", "callId", "name", "argsHash"):
                         need(obs.get(obs_field) == body.get(obs_field), "REMOTE_SOCKET_OBSERVATION_MISMATCH")
                     if "nativeTurnId" in body:
@@ -154,10 +156,13 @@ def run_socket_bridge(root: Path, source: BinaryIO, sink: BinaryIO) -> int:
                 sequence += 1
                 if not disable_wal:
                     seen_calls.add(call_key)
+                body_bytes = remote_canonical_bytes(body)
                 dispatched = True
                 if not disable_wal:
-                    durable_record(attempt_file, remote_canonical_bytes(body))
+                    durable_record(attempt_file, body_bytes)
 
+                body_b64_req = base64.b64encode(body_bytes).decode("ascii")
+                del body_bytes
                 emit_frame(
                     sink,
                     {
@@ -166,12 +171,15 @@ def run_socket_bridge(root: Path, source: BinaryIO, sink: BinaryIO) -> int:
                         "engineId": cur_cfg["engineId"],
                         "kind": "tool-request",
                         "seq": sequence,
-                        "body": base64.b64encode(remote_canonical_bytes(body)).decode("ascii"),
+                        "body": body_b64_req,
                     },
                 )
+                del body_b64_req
+                gc.collect()
                 line = source.readline(MAX_FRAME + 1)
                 need(line.endswith(b"\n") and len(line) <= MAX_FRAME, "REMOTE_SOCKET_REPLY_INVALID")
                 resp = strict_json(line)
+                del line
                 need(
                     isinstance(resp, dict)
                     and set(resp.keys()) == {"version", "driverId", "engineId", "kind", "seq", "status", "body"}
@@ -184,9 +192,14 @@ def run_socket_bridge(root: Path, source: BinaryIO, sink: BinaryIO) -> int:
                     and isinstance(resp["body"], str),
                     "REMOTE_SOCKET_REPLY_MISMATCH",
                 )
-                receipt_bytes = base64.b64decode(resp["body"], validate=True)
+                body_b64_resp = resp["body"]
+                del resp
+                receipt_bytes = base64.b64decode(body_b64_resp, validate=True)
+                del body_b64_resp
                 need(len(receipt_bytes) <= MAX_REPLY, "REMOTE_SOCKET_RECEIPT_TOO_LARGE")
                 validate_wire_response(strict_json(receipt_bytes), body)
+                del body
+                gc.collect()
                 if not disable_wal:
                     durable_record(result_file, receipt_bytes)
 

@@ -18,7 +18,7 @@
 - table:{"type":"table","columns":["列名" 或 {"label","unit"?,"align"?:"right","bar"?:true}],"rows":[[单元格]],"highlight"?:行号,"source"?,"note"?} —— 可排序、可下载 CSV,行多时可筛选,长数据不要拆成几张表;数字列 bar 画数据条;单元格写 ✓ / ✗ 显示为图标
 - chart:{"type":"chart","kind":"bar"|"line"|"area"|"pie","labels":["类目"],"series":[{"name","values":[数字]}],"unit"?,"x_label"?,"y_label"?,"stacked"?,"source"?}
 - stats:{"type":"stats","items":[{"label","value","unit"?,"delta"?,"basis"?,"trend"?:[数字]}],"source"?} —— trend 画迷你走势线
-- steps:{"type":"steps","checkable"?:true,"items":[{"title","detail"?}]} —— checkable 为可勾选清单
+- steps:{"type":"steps","checkable"?:true,"items":[{"title":"步骤","detail"?:"说明"}]} —— checkable 为可勾选清单
 - compare:{"type":"compare","items":[{"name","tag"?,"price"?,"image"?,"summary"?,"points"?,"pros"?,"cons"?,"recommended"?}],"verdict"?}
 - calculator:{"type":"calculator","inputs":[{"id","label","kind"?:"number"|"slider"|"select"|"toggle","value","min"?,"max"?,"step"?,"unit"?,"options"?:[{"label","value"}]}],"outputs":[{"id","label","formula","unit"?,"format"?:"number"|"integer"|"currency"|"percent","decimals"?,"primary"?,"tone"?:"up"|"down"}],"breakdown"?:[输出 id],"chart"?:{"kind":"area"|"line"|"bar","x":输入 id,"from","to":数字或输入 id,"series":[输出 id],"x_label"?},"assumptions"?} —— 改输入即时重算;primary 大号显示,tone 的输出显示在它下面;breakdown 画占比条;chart 扫描 x 画曲线;slider 必须给 min/max
 - tabs:{"type":"tabs","tabs":[{"label","body"?,"block"?:另一个组件}]} —— 分段切换;body 可用 Markdown,block 放一个完整组件(不能再放 tabs)
@@ -36,8 +36,14 @@
 - timeline:{"type":"timeline","items":[{"time","title","detail"?}]}
 - callout:{"type":"callout","tone":"info"|"tip"|"warning"|"danger"|"success","title"?,"body"} —— body 可用 Markdown
 - choice:{"type":"choice","question"?,"multi"?,"options":["选项" 或 {"label","desc"?}]} —— 点选后作为用户消息发出
-- form:{"type":"form","fields":[{"id","label","kind"?:"text"|"number"|"select"|"chips"|"date","options"?,"multi"?,"unit"?,"placeholder"?,"required"?}],"submit"?} —— 填完作为一条用户消息发出
+- form:{"type":"form","fields":[{"id","label","kind"?:"text"|"textarea"|"number"|"select"|"chips"|"date","options"?,"multi"?,"unit"?,"placeholder"?,"required"?}],"submit"?} —— 填完作为一条用户消息发出
 - suggestions:{"type":"suggestions","items":["用户可能想接着问的一句话"]} —— 放在回答末尾,点一下直接发送
+- deliverables:{"type":"deliverables","items":[{"name":"文件名","path"?:工作区路径或https链接,"ext"?,"size"?,"meta"?,"desc"?,"preview"?}]} —— 多文件交付物工作台(支持页内速览与打包下载)
+- citations:{"type":"citations","items":[{"id":"1","title","meta"?,"url"?,"tags"?:[],"conclusion"?,"abstract"?,"gbt"?,"bibtex"?}]} —— 科研/检索文献精读卡(摘要折叠、国标/BibTeX 一键复制,链接须来自真实工具返回;普通末尾来源仍用普通 Markdown)
+- runbook:{"type":"runbook","vars":[{"id","label","value","placeholder"?}],"steps":[{"title","command","detail"?,"danger"?:true}]} —— 参数化运维命令流(改变量实时替换命令中的 `{{id}}`)
+- prompt_template:{"type":"prompt_template","template":"含{{slot}}的模板","slots":[{"id","label","value"?,"options"?:[],"placeholder"?}],"submit"?} —— 可点选填空的提示词/公文模板卡
+- storyboard:{"type":"storyboard","cps"?:4.5,"shots":[{"no"?,"shotType"?,"line","prompt"?,"image"?,"duration"?}]} —— 视频分镜脚本卡(按语速重算时长、可编辑台词)
+- flashcards:{"type":"flashcards","cards":[{"front","back","tag"?,"hint"?}]} —— 双面记忆闪卡(正反翻面与掌握进度)
 
 ## 示例
 ```ui

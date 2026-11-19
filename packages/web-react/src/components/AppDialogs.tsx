@@ -9,9 +9,7 @@ import { PendingPaymentRecovery } from "./payment/PendingPaymentRecovery";
 import { LazyBoundary } from "./ChunkErrorBoundary";
 import { DialogFallback } from "./DialogFallback";
 import { TASKBOARD_ENABLED } from "../lib/taskboardFeature";
-import { uploadFilesToProject } from "../lib/projectFileUpload";
 import { normalizeManageTab } from "../lib/manageTabs";
-import { CHAT_CREATE_TEMPLATES } from "../lib/chatCreateTemplates";
 import { taskContinuationPrompt } from "../lib/chat/manualTaskContinuation";
 import { DEFAULT_AGENT } from "../lib/agents";
 import { lazy, useEffect, useState } from "react";
@@ -152,6 +150,7 @@ export type AppDialogsProps = {
   openManage: (tab: ManageTab) => void;
   openMarketplace: (tab: MarketplaceTab, kind?: MarketplaceKind) => void;
   openRepo: () => void;
+  openSites?: () => void;
   openTutorial: (id?: "preferences" | "connectors" | "chat-basics" | "inbox" | "taskboard" | "session-goal" | "sessions-history" | "models-reasoning" | "files-media" | "voice-input" | "web-research" | "artifacts-download" | "container-web-preview" | "image-create-edit" | "github-repository" | "agents" | "team-mode" | "advisor-mode" | "memory-auto-dream" | "schedules-reminders" | "skills-training" | "marketplace-discovery" | "marketplace-publishing" | "billing-usage" | "organization" | "feedback-support" | undefined) => void;
   orgOpen: boolean;
   orgSection: OrgSection;
@@ -220,6 +219,7 @@ export type AppDialogsProps = {
   settingsOpen: boolean;
   settingsSection: SettingsDestinationSection;
   shareOpen: boolean;
+  sitesOpen?: boolean;
   subscribeOpenSignal: number;
   teamMode: boolean;
   theme: Theme;
@@ -278,6 +278,7 @@ export function AppDialogs({
   openManage,
   openMarketplace,
   openRepo,
+  openSites,
   openTutorial,
   orgOpen,
   orgSection,
@@ -346,6 +347,7 @@ export function AppDialogs({
   settingsOpen,
   settingsSection,
   shareOpen,
+  sitesOpen = false,
   subscribeOpenSignal,
   preferencesRevision,
   inboxRevision,
@@ -496,7 +498,7 @@ export function AppDialogs({
             sessions={sessions}
             currentProjectId={
               homeProject?.id ??
-              (boardOpen
+              (boardOpen || sitesOpen
                 ? null
                 : ((chatViewActiveId ? sessions.find((x) => x.id === chatViewActiveId)?.projectId : null) ??
                   draftProjectId))
@@ -508,7 +510,7 @@ export function AppDialogs({
             onOpenProject={(projectId, tab) => {
               if (!projects.some((x) => x.id === projectId)) return;
               setPendingRouteProject(null);
-              setBoardOpenState(false);
+              setBoardOpen(false);
               setProjectHome({ projectId, tab: tab ?? "overview" });
             }}
             onOpenSession={(id) => {
@@ -531,6 +533,7 @@ export function AppDialogs({
             onCreateProject={(name) => setCreateProjectFrom(name ? { title: name } : {})}
             onMoveSession={(sess, projectId) => void moveSessionToProject(sess, projectId)}
             onOpenBoard={demo || !TASKBOARD_ENABLED ? undefined : () => setBoardOpen(true)}
+            onOpenSites={demo || !openSites ? undefined : () => openSites()}
           />
         </LazyBoundary>
       )}
@@ -573,7 +576,7 @@ export function AppDialogs({
               if (!created) return false;
               if (identityChanged()) return true;
               if (input.files.length > 0 && !demo && auth) {
-                const result = await uploadFilesToProject({
+                const result = await (await import("../lib/projectFileUpload")).uploadFilesToProject({
                   auth: createAuth,
                   projectId: created.id,
                   files: input.files,
@@ -754,9 +757,15 @@ export function AppDialogs({
             isAdmin={user?.role === "admin"}
             initialBrowseKind={marketplaceBrowseKind}
             onCreateInChat={(kind) => {
-              setMarketplaceOpen(false);
-              newSession();
-              setComposerPrefill({ text: CHAT_CREATE_TEMPLATES[kind], nonce: Date.now() });
+              void import("../lib/chatCreateTemplates")
+                .then(({ CHAT_CREATE_TEMPLATES }) => {
+                  setMarketplaceOpen(false);
+                  newSession();
+                  setComposerPrefill({ text: CHAT_CREATE_TEMPLATES[kind], nonce: Date.now() });
+                })
+                .catch(() => {
+                  toast("创建模板加载失败，请重试", "error");
+                });
             }}
             onAskAiInChat={(text) => {
               // AI 导购入口(批3):与 onCreateInChat 同构——关市场 → 新会话 → 预填输入框。

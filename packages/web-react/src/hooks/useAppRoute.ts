@@ -46,8 +46,23 @@ export function parseSessionPath(pathname: string): string | null {
   return m ? m[1] : null
 }
 
-/** 工作区视图：对话主区 vs 任务面板全屏主区 vs 项目主页。 */
-export type WorkspaceView = 'chat' | 'board' | 'project'
+/** 工作区视图：对话主区 vs 任务面板全屏主区 vs 项目主页 vs 站点工作区。 */
+export type WorkspaceView = 'chat' | 'board' | 'project' | 'sites'
+
+/** 站点工作区位置：null = 列表主页 `/sites`；非空 = 站点详情 `/sites/<slug>`。 */
+export type SitesRoute = { slug: string | null }
+
+/** `/sites` 或 `/sites/<slug>` → SitesRoute；未知子路径返回 null。 */
+export function parseSitesPath(pathname: string): SitesRoute | null {
+  if (pathname === '/sites') return { slug: null }
+  const m = /^\/sites\/([a-z0-9](?:[a-z0-9-]{1,46}[a-z0-9]))$/.exec(pathname)
+  return m ? { slug: m[1] } : null
+}
+
+/** 站点工作区路径。 */
+export function sitesPath(slug?: string | null): string {
+  return slug ? `/sites/${slug}` : '/sites'
+}
 
 /** 项目主页页签。概览是默认页签，不进路径（`/p/<id>`）；其余为 `/p/<id>/<tab>`。 */
 export type ProjectTab = 'overview' | 'chats' | 'files' | 'outputs'
@@ -80,7 +95,7 @@ export function parseBoardPath(pathname: string): boolean {
 }
 
 /**
- * 会话路径镜像的 wantPath。board 工作区必须产出 `/board`，否则会话镜像会把
+ * 会话路径镜像的 wantPath。board / sites 工作区必须产出对应顶层路径，否则会话镜像会把
  * 顶级路径冲回 `/` 或 `/s/<id>`。
  */
 export function workspaceWantPath(
@@ -88,8 +103,10 @@ export function workspaceWantPath(
   activeId: string | undefined,
   isEmptyDraft: boolean,
   project?: ProjectRoute | null,
+  siteSlug?: string | null,
 ): string {
   if (workspace === 'board') return '/board'
+  if (workspace === 'sites') return sitesPath(siteSlug)
   // project 工作区缺位置（不应发生）时按对话处理，不产出无效的 `/p/`。
   if (workspace === 'project' && project) return projectPath(project)
   return activeId && !isEmptyDraft ? `/s/${activeId}` : '/'
@@ -462,6 +479,10 @@ export type UseAppRouteOptions = {
   projectListSettled?: boolean
   /** 打开项目主页（深链恢复 / popstate 反灌）。 */
   onOpenProject?: (route: ProjectRoute) => void
+  /** sites 工作区当前选中的站点 slug（null = `/sites` 列表，非空 = `/sites/<slug>`）。 */
+  siteSlug?: string | null
+  /** 打开/切换站点工作区（popstate 反灌）。 */
+  onOpenSites?: (slug: string | null) => void
   /** popstate 反灌 board 的 view/ticket/ticketType。 */
   onPopBoardParams?: (
     view: BoardViewParam,
@@ -500,6 +521,7 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
       )
       const id = parseSessionPath(location.pathname)
       const poppedProject = parseProjectPath(location.pathname)
+      const poppedSites = parseSitesPath(location.pathname)
       if (id) {
         cbRef.current.onPopWorkspace?.('chat')
         if (cbRef.current.sessions.some((s) => s.id === id)) {
@@ -509,6 +531,9 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
           cbRef.current.onPopToRoot()
           history.replaceState({}, '', `/${location.search}${location.hash}`)
         }
+      } else if (poppedSites) {
+        cbRef.current.onPopWorkspace?.('sites')
+        cbRef.current.onOpenSites?.(poppedSites.slug)
       } else if (parseBoardPath(location.pathname)) {
         // /board 是并列工作区，不能当未知路径掉进空分支（主区会仍停在对话）。
         cbRef.current.onPopWorkspace?.('board')
@@ -569,11 +594,13 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
   const isEmptyDraft = activeEntry !== undefined && activeEntry.messageCount === 0
   const workspace: WorkspaceView = opts.workspace ?? 'chat'
   const projectRoute = workspace === 'project' ? (opts.projectRoute ?? null) : null
-  const wantPath = workspaceWantPath(workspace, activeId, isEmptyDraft, projectRoute)
+  const siteSlug = workspace === 'sites' ? (opts.siteSlug ?? null) : null
+  const wantPath = workspaceWantPath(workspace, activeId, isEmptyDraft, projectRoute, siteSlug)
   const routeProjectId = projectRoute?.projectId
   const prevIdRef = useRef<string | undefined>(undefined)
   const prevWorkspaceRef = useRef<WorkspaceView | undefined>(undefined)
   const prevProjectIdRef = useRef<string | undefined>(undefined)
+  const prevSiteSlugRef = useRef<string | null | undefined>(undefined)
   useEffect(() => {
     if (!enabled) return
     // 深链恢复未决：不回写（否则把 URL 里的 /s/<id> 或 /p/<id> 冲成当前空态的 /）。
@@ -581,11 +608,22 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
     const prevId = prevIdRef.current
     const prevWorkspace = prevWorkspaceRef.current
     const prevProjectId = prevProjectIdRef.current
+    const prevSiteSlug = prevSiteSlugRef.current
     prevIdRef.current = activeId
     prevWorkspaceRef.current = workspace
     prevProjectIdRef.current = routeProjectId
+    prevSiteSlugRef.current = siteSlug
     if (location.pathname === wantPath) return // popstate 反灌/深链恢复:URL 已是权威
     const suffix = location.search + location.hash
+    // 站点工作区内从 `/sites` 点进 `/sites/<slug>` 或切换站点：push，浏览器后退回列表。
+    if (
+      workspace === 'sites' &&
+      prevWorkspace === 'sites' &&
+      prevSiteSlug !== siteSlug
+    ) {
+      history.pushState({}, '', wantPath + suffix)
+      return
+    }
     // 项目主页内换页签：同一位置换视角，replace（不压栈）；换项目是用户导航，push。
     if (
       workspace === 'project' &&
@@ -599,7 +637,7 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
       history.pushState({}, '', wantPath + suffix)
       return
     }
-    // 对话 ↔ 任务面板：用户换工作区，push（后退=上一个位置）。首次 boot 的
+    // 对话 ↔ 任务面板 / 站点 / 项目：用户换工作区，push（后退=上一个位置）。首次 boot 的
     // prevWorkspace 为空走下面的 replace 分支（启动噪音不压栈）。
     if (prevWorkspace !== undefined && prevWorkspace !== workspace) {
       history.pushState({}, '', wantPath + suffix)
@@ -622,7 +660,7 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
     }
     // 用户会话导航(切会话/新建):pushState —— 后退=上一个会话。
     history.pushState({}, '', wantPath + suffix)
-  }, [enabled, pendingSessionId, pendingProject, wantPath, activeId, workspace, routeProjectId])
+  }, [enabled, pendingSessionId, pendingProject, wantPath, activeId, workspace, routeProjectId, siteSlug])
 
   // 面板 → ?panel= query（replaceState；关闭时清参数）。不限工作区：未登录携带
   // ?panel= 深链时面板 state 已在 App 初始化为打开（进工作区即呈现），此 effect 恰好

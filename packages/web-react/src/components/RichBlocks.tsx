@@ -4,7 +4,7 @@
  * 独立 chunk(只有真出现 ```mermaid 才下载,不拖累首屏与普通对话)。
  */
 import { chatInteractionUnavailableText, useChatInteraction } from "./tool/context";
-import { useOptionsGroup, useOptionsGroupSnapshot } from "./optionsGroup";
+import { OptionsGroupFooter, OptionsGroupProvider, useOptionsGroup, useOptionsGroupSnapshot } from "./optionsGroup";
 import { useMemo, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 
 /** 主题响应:观察 <html> class(useTheme 切换写入 .dark)。mermaid/chart 的配色在渲染时
@@ -94,9 +94,20 @@ interface OptionItem {
   desc?: string;
 }
 
-function extractFirstJsonObject(source: string): { json: string; rest: string } | null {
+interface ParsedOptionsItem {
+  question?: string;
+  multi: boolean;
+  options: OptionItem[];
+}
+
+const MAX_QUESTIONS_PER_BLOCK = 8;
+
+function extractFirstJsonValue(source: string): { json: string; rest: string } | null {
   const start = source.search(/\S/);
-  if (start < 0 || source[start] !== "{") return null;
+  if (start < 0) return null;
+  const open = source[start];
+  if (open !== "{" && open !== "[") return null;
+  const close = open === "{" ? "}" : "]";
   let depth = 0;
   let inString = false;
   let escape = false;
@@ -118,8 +129,8 @@ function extractFirstJsonObject(source: string): { json: string; rest: string } 
       inString = true;
       continue;
     }
-    if (ch === "{") depth += 1;
-    else if (ch === "}") {
+    if (ch === open) depth += 1;
+    else if (ch === close) {
       depth -= 1;
       if (depth === 0) return { json: source.slice(start, i + 1), rest: source.slice(i + 1) };
     }
@@ -127,58 +138,130 @@ function extractFirstJsonObject(source: string): { json: string; rest: string } 
   return null;
 }
 
-function parseOptionsBlock(
-  code: string,
-): { question?: string; multi: boolean; options: OptionItem[]; trailing: string } | null {
-  try {
-    const extracted = extractFirstJsonObject(code);
-    if (!extracted) return null;
-    const raw = JSON.parse(extracted.json) as Record<string, unknown>;
-    if (!raw || typeof raw !== "object" || !Array.isArray(raw.options)) return null;
-    const options: OptionItem[] = [];
-    for (const o of raw.options as unknown[]) {
-      if (typeof o === "string") options.push({ label: o });
-      else if (o && typeof o === "object" && typeof (o as { label?: unknown }).label === "string") {
-        const oo = o as { label: string; desc?: unknown };
-        options.push({ label: oo.label, ...(typeof oo.desc === "string" ? { desc: oo.desc } : {}) });
-      }
+function parseStringOption(raw: string): OptionItem | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  // 兼容 `ask_question` 等原生风格里的 "标题 — 说明" 字符串写法。
+  const split = /^(.{1,120}?)\s+—\s+(.+)$/s.exec(trimmed);
+  if (split) {
+    const label = split[1]!.trim();
+    const desc = split[2]!.trim();
+    if (label && desc) return { label, desc };
+  }
+  return { label: trimmed };
+}
+
+function normalizeSingleOptionsItem(raw: unknown): ParsedOptionsItem | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  if (!Array.isArray(rec.options)) return null;
+  const options: OptionItem[] = [];
+  for (const o of rec.options) {
+    if (typeof o === "string") {
+      const parsed = parseStringOption(o);
+      if (parsed) options.push(parsed);
+    } else if (o && typeof o === "object") {
+      const oo = o as { label?: unknown; desc?: unknown; description?: unknown };
+      if (typeof oo.label !== "string" || !oo.label.trim()) continue;
+      const desc =
+        typeof oo.desc === "string" && oo.desc.trim()
+          ? oo.desc
+          : typeof oo.description === "string" && oo.description.trim()
+            ? oo.description
+            : undefined;
+      options.push(desc ? { label: oo.label, desc } : { label: oo.label });
     }
-    if (options.length === 0 || options.length > 12) return null;
+  }
+  if (options.length === 0 || options.length > 12) return null;
+  const question =
+    typeof rec.question === "string"
+      ? rec.question
+      : typeof rec.prompt === "string"
+        ? rec.prompt
+        : undefined;
+  return {
+    question,
+    multi: rec.multi === true || rec.multiSelect === true || rec.is_multi_select === true,
+    options,
+  };
+}
+
+function expandOptionsPayload(val: unknown): ParsedOptionsItem[] | null {
+  if (Array.isArray(val)) {
+    if (val.length === 0 || val.length > MAX_QUESTIONS_PER_BLOCK) return null;
+    const out: ParsedOptionsItem[] = [];
+    for (const item of val) {
+      const norm = normalizeSingleOptionsItem(item);
+      if (!norm) return null;
+      out.push(norm);
+    }
+    return out;
+  }
+  if (val && typeof val === "object") {
+    const rec = val as Record<string, unknown>;
+    if (Array.isArray(rec.questions)) {
+      if (rec.questions.length === 0 || rec.questions.length > MAX_QUESTIONS_PER_BLOCK) return null;
+      const out: ParsedOptionsItem[] = [];
+      for (const item of rec.questions) {
+        const norm = normalizeSingleOptionsItem(item);
+        if (!norm) return null;
+        out.push(norm);
+      }
+      return out;
+    }
+  }
+  const one = normalizeSingleOptionsItem(val);
+  return one ? [one] : null;
+}
+
+function parseOptionsBlocks(
+  code: string,
+): { items: ParsedOptionsItem[]; trailing: string } | null {
+  try {
+    const first = extractFirstJsonValue(code);
+    if (!first) return null;
+    const items = expandOptionsPayload(JSON.parse(first.json));
+    if (!items || items.length === 0) return null;
+    let rest = first.rest;
+    while (items.length < MAX_QUESTIONS_PER_BLOCK) {
+      const trimmed = rest.trimStart();
+      if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) break;
+      const next = extractFirstJsonValue(trimmed);
+      if (!next) break;
+      const more = expandOptionsPayload(JSON.parse(next.json));
+      if (!more || items.length + more.length > MAX_QUESTIONS_PER_BLOCK) break;
+      items.push(...more);
+      rest = next.rest;
+    }
     return {
-      question: typeof raw.question === "string" ? raw.question : undefined,
-      multi: raw.multi === true,
-      options,
-      trailing: extracted.rest.trim() ? extracted.rest.trim() : "",
+      items,
+      trailing: rest.trim() ? rest.trim() : "",
     };
   } catch {
     return null; // 流式半截 / 非法 JSON → 调用方回退源码
   }
 }
 
-export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: boolean }) {
+function OptionsCardItem({ parsed, readOnly }: { parsed: ParsedOptionsItem; readOnly?: boolean }) {
   const { sendUserText, busy, reason } = useChatInteraction();
   const group = useOptionsGroup();
   const groupSnap = useOptionsGroupSnapshot();
   const blockKey = useId();
   const [picked, setPicked] = useState<Set<number>>(new Set());
   const [sentLocal, setSentLocal] = useState<string | null>(null);
-  const parsed = useMemo(() => parseOptionsBlock(code), [code]);
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [customNote, setCustomNote] = useState("");
+  const composingRef = useRef(false);
 
   // 注册到消息级分组(多题聚合作答的前提;流式半截时不注册,解析成功即补登)。
   // 用 layout effect:passive effect 在 commit 之后才跑,中间那帧里块已可点、分组还没数到它,
   // 点选会误走「单块点击即发」(t-839 OG-01 实证:三题消息第一题被单独发出)。
   useLayoutEffect(() => {
-    if (readOnly || !group || !parsed) return;
+    if (readOnly || !group) return;
     group.register(blockKey, { question: parsed.question, multi: parsed.multi });
     return () => group.unregister(blockKey);
     // question/multi 变化(流式补全)时重登;blockKey 稳定。
   }, [group, blockKey, parsed, readOnly]);
-
-  if (!parsed) {
-    return (
-      <pre className="overflow-auto rounded-lg bg-code px-3 py-2 font-mono text-meta text-fg">{code}</pre>
-    );
-  }
 
   // 同消息多题 → 聚合模式:点选只记录,由 GroupFooter 统一发送。
   // 流式(live)期间即使目前只注册到 1 块也不走点击即发——长回合中途就会贴卡,
@@ -199,6 +282,8 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
   // 点击时刻直接读 store:同一 commit 里兄弟块刚注册完、本块还没因快照变化重渲时,
   // 渲染期算出的 grouped 可能还是旧值(单块),读 store 才不会误走「点击即发」。
   const groupedNow = () => !!group && group.getSnapshot().grouped;
+  const trimmedNote = customNote.trim();
+  const formatPick = (base: string) => (trimmedNote ? `${base}（补充：${trimmedNote}）` : base);
 
   const choose = (i: number) => {
     if (!interactive || blockedByBusy) return;
@@ -217,23 +302,36 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
       setPicked(new Set([i]));
       report([label]);
     } else {
-      setSentLocal(label);
-      sendUserText?.(`我选择:${label}`);
+      const display = formatPick(label);
+      setSentLocal(display);
+      sendUserText?.(`我选择:${display}`);
     }
   };
   const confirmMulti = () => {
     if (!interactive || blockedByBusy || picked.size === 0 || groupedNow()) return;
-    const labels = [...picked].sort((a, b) => a - b).map((i) => parsed.options[i].label);
-    setSentLocal(labels.join("、"));
-    sendUserText?.(`我选择:${labels.join("、")}`);
+    const labels = [...picked].sort((a, b) => a - b).map((i) => parsed.options[i].label).join("、");
+    const display = formatPick(labels);
+    setSentLocal(display);
+    sendUserText?.(`我选择:${display}`);
+  };
+  const sendCustomNote = () => {
+    if (!interactive || blockedByBusy || !trimmedNote || groupedNow()) return;
+    setSentLocal(trimmedNote);
+    sendUserText?.(trimmedNote);
   };
   return (
-    <>
-    <div className="my-1.5 flex flex-col gap-1.5 rounded-xl border border-border bg-surface p-2.5 not-prose">
-      {parsed.question && <p className="px-1 text-body font-medium text-fg">{parsed.question}</p>}
+    <div className="my-2 flex flex-col gap-2 rounded-2xl border border-border bg-surface p-3 not-prose shadow-[0_1px_2px_rgba(15,23,42,0.03)]">
+      {(parsed.question || parsed.options.length > 0) && (
+        <div className="flex items-start justify-between gap-2 px-1">
+          {parsed.question ? <p className="text-body font-medium text-fg">{parsed.question}</p> : <span />}
+          <span className="shrink-0 rounded-full bg-elevated px-2 py-0.5 text-[11px] font-medium text-muted border border-border">
+            {parsed.multi ? "可多选" : "单选"}
+          </span>
+        </div>
+      )}
       <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
         {parsed.options.map((o, i) => {
-          const chosen = parsed.multi || grouped ? picked.has(i) : sentText === o.label;
+          const chosen = parsed.multi || grouped ? picked.has(i) : sentText === o.label || (trimmedNote ? sentText === formatPick(o.label) : false);
           return (
             <button
               key={`${i}-${o.label}`}
@@ -241,7 +339,7 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
               disabled={!interactive || blockedByBusy}
               onClick={() => choose(i)}
               className={
-                "flex items-start gap-2 rounded-lg border px-3 py-2 text-left transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 " +
+                "flex items-start gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 " +
                 (chosen
                   ? "border-accent bg-accent-soft"
                   : "border-border bg-elevated hover:border-accent/40 hover:bg-hover") +
@@ -250,7 +348,8 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
             >
               <span
                 className={
-                  "mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border text-micro " +
+                  "mt-0.5 flex size-4 shrink-0 items-center justify-center border text-micro " +
+                  (parsed.multi ? "rounded-[5px] " : "rounded-full ") +
                   (chosen ? "border-accent bg-accent text-accent-fg" : "border-border text-transparent")
                 }
               >
@@ -264,15 +363,66 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
           );
         })}
       </div>
-      {parsed.multi && interactive && !grouped && (
-        <button
-          type="button"
-          disabled={picked.size === 0 || blockedByBusy}
-          onClick={confirmMulti}
-          className="self-end rounded-lg bg-accent px-3.5 py-1.5 text-meta font-medium text-accent-fg transition-opacity disabled:opacity-40"
-        >
-          确认选择{picked.size > 0 ? `(${picked.size})` : ""}
-        </button>
+      {interactive && !grouped && (
+        <div className="flex flex-col gap-1.5 px-1">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <button
+              type="button"
+              aria-expanded={noteOpen}
+              disabled={blockedByBusy}
+              onClick={() => setNoteOpen((v) => !v)}
+              className="text-caption font-medium text-muted hover:text-fg transition-colors disabled:opacity-40 [@media(hover:none)]:min-h-11"
+            >
+              {noteOpen ? "收起补充说明" : "补充说明后再发"}
+            </button>
+            {parsed.multi && (
+              <button
+                type="button"
+                disabled={picked.size === 0 || blockedByBusy}
+                onClick={confirmMulti}
+                className="ml-auto rounded-lg bg-accent px-3.5 py-1.5 text-meta font-medium text-accent-fg transition-opacity disabled:opacity-40 [@media(hover:none)]:min-h-11"
+              >
+                确认选择{picked.size > 0 ? `(${picked.size})` : ""}
+              </button>
+            )}
+          </div>
+          {noteOpen && (
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                type="text"
+                aria-label="补充说明"
+                value={customNote}
+                disabled={blockedByBusy}
+                onChange={(e) => setCustomNote(e.target.value)}
+                onCompositionStart={() => {
+                  composingRef.current = true;
+                }}
+                onCompositionEnd={() => {
+                  composingRef.current = false;
+                }}
+                onKeyDown={(e) => {
+                  if (composingRef.current || e.nativeEvent.isComposing || e.keyCode === 229) return;
+                  if (e.key === "Enter" && !parsed.multi && picked.size === 0 && trimmedNote) {
+                    e.preventDefault();
+                    sendCustomNote();
+                  }
+                }}
+                placeholder="选填：输入补充要求，点上方选项将一并带出"
+                className="min-w-0 flex-1 rounded-lg border border-border bg-elevated px-2.5 py-1.5 text-meta text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              />
+              {trimmedNote && (
+                <button
+                  type="button"
+                  disabled={blockedByBusy}
+                  onClick={sendCustomNote}
+                  className="shrink-0 rounded-lg border border-border bg-elevated px-3 py-1.5 text-caption font-medium text-fg hover:bg-hover disabled:opacity-40 [@media(hover:none)]:min-h-11"
+                >
+                  直接发送说明
+                </button>
+              )}
+            </div>
+          )}
+        </div>
       )}
       {sent && sentText && <p className="px-1 text-caption text-faint">已选择:{sentText}</p>}
       {grouped && !sent && (groupEntry?.labels.length ?? 0) > 0 && (
@@ -287,11 +437,40 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
         <output className="block px-1 text-caption text-faint">等待当前回合结束后可选择</output>
       )}
     </div>
-    {parsed.trailing ? (
-      <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-fg">{parsed.trailing}</p>
-    ) : null}
+  );
+}
+
+export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: boolean }) {
+  const outerGroup = useOptionsGroup();
+  const parsed = useMemo(() => parseOptionsBlocks(code), [code]);
+
+  if (!parsed) {
+    return (
+      <pre className="overflow-auto rounded-lg bg-code px-3 py-2 font-mono text-meta text-fg">{code}</pre>
+    );
+  }
+
+  const content = (
+    <>
+      {parsed.items.map((item, idx) => (
+        <OptionsCardItem key={`${idx}-${item.question ?? ""}`} parsed={item} readOnly={readOnly} />
+      ))}
+      {parsed.trailing ? (
+        <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-fg">{parsed.trailing}</p>
+      ) : null}
     </>
   );
+
+  // 未包外层分组（单独挂载测试或无 Provider 上下文）且同块拆出 ≥2 题时，就地补组上下文避免误触即发。
+  if (!outerGroup && !readOnly && parsed.items.length >= 2) {
+    return (
+      <OptionsGroupProvider>
+        {content}
+        <OptionsGroupFooter />
+      </OptionsGroupProvider>
+    );
+  }
+  return content;
 }
 
 /** ```chart 代码块(Chart.js config JSON）→ canvas 图表;无效/半截回退源码(对齐 v3 markdown.js）。 */

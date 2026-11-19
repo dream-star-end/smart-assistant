@@ -9,7 +9,7 @@ import {formatMessageReplyPrompt} from '@openclaude/protocol/browser';
  */
 import { useCallback, useState, useRef, useEffect, useMemo } from "react";
 import type { MediaRef, InboundMessage } from "../lib/chat/frames";
-import { type MessageReplyQuote, cursorModelSupportsContextTier, supportsFastServiceTier, isCodexEngineModel } from "@openclaude/protocol/browser";
+import { type MessageReplyQuote, type ServiceTier, cursorModelSupportsContextTier, normalizeServiceTierForModel, isCodexEngineModel } from "@openclaude/protocol/browser";
 import { sessionTitleFromText } from "../lib/sessionTitle";
 import type { Message, Session } from "../lib/types";
 import { demoReply } from "../lib/demo";
@@ -61,7 +61,7 @@ export type ComposerSendInput = {
   selectedSessionIdRef: React.RefObject<string | undefined>;
   sendImplicitRatingRef: React.RefObject<((target: ImplicitTarget, opts: { reason: ImplicitReason; }) => void) | null>;
   sendScrollRef?: React.RefObject<(() => void) | null>;
-  serviceTier: "fast" | null;
+  serviceTier: ServiceTier | null;
   sessionEffort: PreferenceEffort | null | undefined;
   sessions: Session[];
   setActiveId: React.Dispatch<React.SetStateAction<string | undefined>>;
@@ -234,7 +234,7 @@ export function useComposerSend({
         // 显式档位选择存在才落地(未选择 = 继续继承全局偏好,不写键)。
         if (sessionEffort !== undefined) writeSessionEffort(sessionId, sessionEffort);
         writeContextTier(sessionId, contextTier);
-        writeSessionServiceTier(sessionId, serviceTier);
+        writeSessionServiceTier(sessionId, normalizeServiceTierForModel(modelId, serviceTier));
         sockRef.current?.ensureSession(sessionId, agent.id, sessionTitle);
         if (modelId) sockRef.current?.setSessionModel(sessionId, modelId);
         if (auth && agent.id === "main" && !recoveredAdvisor) {
@@ -268,11 +268,32 @@ export function useComposerSend({
         toast(sendCollab.blockedReason, "error");
         return false;
       }
+      const promptForTurn = formatMessageReplyPrompt(text,replyTo);
+      const normalizedTurnTier = normalizeServiceTierForModel(modelId, serviceTier);
+      const effectiveTurnTier =
+        normalizedTurnTier &&
+        agent.id === "main" &&
+        sendCollab.collabMode === "advisor" &&
+        Boolean(sendCollab.advisorModel?.trim())
+          ? await import("../lib/modelSwitchCostClient")
+              .then((m) =>
+                m.resolveEffectiveTurnServiceTier({
+                  model: modelId,
+                  serviceTier: normalizedTurnTier,
+                  agentId: agent.id,
+                  collabMode: sendCollab.collabMode,
+                  advisorModel: sendCollab.advisorModel,
+                  text: promptForTurn,
+                }),
+              )
+              .catch(() => null)
+          : normalizedTurnTier;
       const authorization=!imageEdit&&modelId&&authorizeSwitch?await authorizeSwitch({
         sessionId,requestId:mintMsgId(),targetModel:modelId,agentId:agent.id,teamMode:sendCollab.teamMode,
-        text:formatMessageReplyPrompt(text,replyTo),mediaCount:media?.length??0,
+        collabMode:sendCollab.collabMode,...(sendCollab.advisorModel?{advisorModel:sendCollab.advisorModel}:{}),
+        text:promptForTurn,mediaCount:media?.length??0,
         ...(cursorModelSupportsContextTier(modelId)?{contextTier}:{}),
-        ...(serviceTier==='fast'&&supportsFastServiceTier(modelId)?{serviceTier}:{}),
+        ...(effectiveTurnTier?{serviceTier:effectiveTurnTier}:{}),
       },{useCachedRequestId:true,allowOfflineQueue:true,
         canPrompt:recoveryIsCurrent,
         isCurrent:()=>recoveryIdentityIsCurrent()&&(!originalSessionId||!!sockRef.current?.getSession(sessionId))}):undefined;
@@ -343,7 +364,7 @@ export function useComposerSend({
         // (master 对非分档模型本就忽略,但不发送可以让路由快照/日志更干净)。
         ...(cursorModelSupportsContextTier(modelId) ? { contextTier } : {}),
         // OCV5-434 GPT Fast:只在当前模型支持且用户开着时随帧发送;不带 = 标准。
-        ...(serviceTier === "fast" && supportsFastServiceTier(modelId) ? { serviceTier } : {}),
+        ...(effectiveTurnTier ? { serviceTier: effectiveTurnTier } : {}),
       });
       if(sent===false)return false;
       // Fee confirmation keeps ownership of the draft until the send is accepted.

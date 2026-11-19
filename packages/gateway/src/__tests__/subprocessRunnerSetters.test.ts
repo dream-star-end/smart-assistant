@@ -84,7 +84,11 @@ describe('SubprocessRunner.model getter / setModel', () => {
     assert.equal(r.serviceTier, 'fast')
     assert.equal(r.setServiceTier('fast', 'opencode-gpt-5.6-luna'), 'unchanged')
     // Any model outside the Go Fast list keeps standard.
-    for (const model of ['gpt-6-luna', 'opencode-grok-4.7', 'glm-5.3-go', undefined]) {
+    // Ultrafast is Codex-only; CCB /responses keeps Standard.
+    assert.equal(r.setServiceTier('ultrafast', 'opencode-gpt-6-luna'), 'applied')
+    assert.equal(r.serviceTier, null)
+    r.setServiceTier('fast', 'opencode-gpt-6-luna')
+    for (const model of ['gpt-6.2-sol', 'gpt-6-luna', 'opencode-grok-4.7', 'glm-5.3-go', undefined]) {
       assert.equal(r.setServiceTier('fast', model), 'applied')
       assert.equal(r.serviceTier, null, String(model))
       r.setServiceTier('fast', 'opencode-gpt-6-luna')

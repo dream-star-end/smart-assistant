@@ -1,9 +1,12 @@
 import { useState } from 'react'
+import type { ServiceTier } from '@openclaude/protocol/browser'
 import { act, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, expect, test, vi } from 'vitest'
 import { api, ApiError } from '../lib/api'
 import { createMemoryAuthSession } from '../lib/authSession'
-import { EMPTY_COLLAB_UI, type CollaborationConfigDoc, type CollabMode } from '../lib/collaborationConfig'
+import { readSessionServiceTier, writeSessionServiceTier } from '../lib/sessionServiceTier'
+import { useSessionEngineOptions } from './useSessionEngineOptions'
+import { EMPTY_COLLAB_UI, type CollaborationConfigDoc, type CollabMode, type CollabUiState } from '../lib/collaborationConfig'
 import type { AuthorizeSwitch } from '../lib/modelSwitchCostTypes'
 import type { PublicModel, Session } from '../lib/types'
 import type { UseChatSocket } from './useChatSocket'
@@ -585,4 +588,224 @@ test("new solo draft send dispatches immediately before ensureServerSession and 
   })
   await waitFor(() => expect(putCollab).toHaveBeenCalledTimes(1))
   await waitFor(() => expect(f.result.current.collab.collabUi.rev).toBe(7))
+})
+
+test('OCV5-798: Sol ultrafast -> Astra -> Sol clears stored serviceTier on commit (and keeps on cancel)', async () => {
+  localStorage.clear()
+  vi.spyOn(api, 'getCollaborationConfig').mockResolvedValue(doc('solo', 1))
+  let confirmReply = false
+  const auth = createMemoryAuthSession(() => {}, 'fixture')
+  const agent = { id: 'main', name: 'Main', description: '' }
+  const models: PublicModel[] = [
+    { id: 'gpt-6.2-sol', display_name: 'Sol', engine: 'codex' },
+    { id: 'gpt-6.2-astra', display_name: 'Astra', engine: 'codex' },
+  ]
+  const modelPrefs = {}
+  const noop = () => {}
+  const sessionsResetRef = { current: noop }
+  const sockRef = { current: { setSessionModel: vi.fn(), getMessages: () => [] } as unknown as UseChatSocket }
+  const authorizeSwitch: AuthorizeSwitch = async (req) =>
+    confirmReply ? { requestId: req.requestId, choice: true } : null
+  const confirmDialog = vi.fn(async () => confirmReply)
+  const f = renderHook(() => {
+    const [modelId, setModelId] = useState<string | undefined>('gpt-6.2-sol')
+    const [sessions, setSessions] = useState<Session[]>([
+      { id: 'own', title: 'S', ownerUserId: 'u', updatedAt: '2026-11-18T00:00:00Z', messageCount: 1, modelId: 'gpt-6.2-sol' },
+    ])
+    const { serviceTier, setServiceTier } = useSessionEngineOptions('own')
+    const collab = useSessionModelAndCollab({
+      activeId: 'own',
+      authorizeSwitch,
+      modelId,
+      auth,
+      agent,
+      demo: false,
+      models,
+      modelPrefs,
+      modelSwitchPreparing: false,
+      sessions,
+      confirmDialog,
+      handleNew: noop,
+      queueModelPatch: noop,
+      resetSessionList: noop,
+      sessionsResetRef,
+      serviceTier,
+      setServiceTier,
+      setModelId,
+      setModelSwitchPreparing: noop,
+      setSessions,
+      sockRef,
+      toast: noop,
+    })
+    return { modelId, serviceTier, setServiceTier, collab }
+  })
+  // Select Ultrafast AFTER mount (verifies selectModel does not capture stale Standard state).
+  expect(f.result.current.serviceTier).toBeNull()
+  act(() => {
+    f.result.current.setServiceTier('ultrafast')
+  })
+  expect(f.result.current.serviceTier).toBe('ultrafast')
+  expect(readSessionServiceTier('own')).toBe('ultrafast')
+  // Cancelled switch must keep ultrafast.
+  confirmReply = false
+  await act(async () => {
+    await f.result.current.collab.selectModel('gpt-6.2-astra')
+  })
+  expect(f.result.current.modelId).toBe('gpt-6.2-sol')
+  expect(f.result.current.serviceTier).toBe('ultrafast')
+  expect(readSessionServiceTier('own')).toBe('ultrafast')
+
+  // Confirmed switch Sol -> Astra drops ultrafast in both state and storage; switching back stays Standard.
+  confirmReply = true
+  await act(async () => {
+    await f.result.current.collab.selectModel('gpt-6.2-astra')
+  })
+  expect(f.result.current.modelId).toBe('gpt-6.2-astra')
+  expect(f.result.current.serviceTier).toBeNull()
+  expect(readSessionServiceTier('own')).toBeNull()
+
+  await act(async () => {
+    await f.result.current.collab.selectModel('gpt-6.2-sol')
+  })
+  expect(f.result.current.modelId).toBe('gpt-6.2-sol')
+  expect(f.result.current.serviceTier).toBeNull()
+  expect(readSessionServiceTier('own')).toBeNull()
+  localStorage.clear()
+})
+
+test('OCV5-798: draft Astra session with stale ultrafast normalizes persisted tier to null and clamps advisor no-write on send', async () => {
+  localStorage.clear()
+  const DRAFT = '11111111-1111-4111-8111-111111111112'
+  vi.spyOn(api, 'getCollaborationConfig').mockResolvedValue(doc('solo', 1))
+  vi.spyOn(api, 'putCollaborationConfig').mockResolvedValue({
+    rev: 1,
+    defaultMode: 'solo',
+    defaultAdvisorModel: null,
+    session: { mode: 'advisor', advisorModel: 'gpt-6.2-astra', configVersion: 'v1:advisor', source: 'session' },
+  })
+  const send = vi.fn().mockResolvedValue(true)
+  const ensureServerSession = vi.fn().mockResolvedValue(true)
+  const auth = createMemoryAuthSession(() => {}, 'fixture')
+  const authRef = { current: auth }
+  const agent = { id: 'main', name: 'Main', description: '' }
+  const models: PublicModel[] = [{ id: 'gpt-6.2-astra', display_name: 'Astra', engine: 'codex' }]
+  const modelPrefs = {}
+  const noop = () => {}
+  const sessionsResetRef = { current: noop }
+  const draftProjectRef = { current: null }
+  const selectedSessionIdRef = { current: undefined }
+  const sendImplicitRatingRef = { current: null }
+  const sendScrollRef = { current: null }
+  const stopRef = { current: false }
+  const publicCfg = { auth: true } as never
+  const user = { id: 'u', displayName: 'U', roles: ['user'] }
+  const advisorCollabUi: CollabUiState = {
+    ...EMPTY_COLLAB_UI,
+    mode: 'advisor',
+    advisorModel: 'gpt-6.2-astra',
+    configVersion: 'v1',
+    rev: 1,
+    source: 'session',
+  }
+  const sockRef = {
+    current: {
+      send,
+      ensureSession: noop,
+      setSessionModel: noop,
+      ensureServerSession,
+      getMessages: () => [],
+    } as unknown as UseChatSocket,
+  }
+  const confirmDialog = async () => true
+  const runDraftSend = async (tier: ServiceTier | null, prompt: string) => {
+    localStorage.clear()
+    send.mockClear()
+    const f = renderHook(() => {
+      const [activeId, setActiveId] = useState<string | undefined>(undefined)
+      const [sessions, setSessions] = useState<Session[]>([])
+      const collab = useSessionModelAndCollab({
+        activeId,
+        modelId: 'gpt-6.2-astra',
+        auth,
+        agent,
+        demo: false,
+        models,
+        modelPrefs,
+        modelSwitchPreparing: false,
+        sessions,
+        confirmDialog,
+        handleNew: noop,
+        queueModelPatch: noop,
+        resetSessionList: noop,
+        sessionsResetRef,
+        setModelId: noop,
+        setModelSwitchPreparing: noop,
+        setSessions,
+        sockRef,
+        toast: noop,
+      })
+      const composer = useComposerSend({
+        activeId,
+        agent,
+        applyCollabDoc: collab.applyCollabDoc,
+        auth,
+        authRef,
+        boardOpen: false,
+        collabAsDefault: collab.collabAsDefault,
+        collabEpochRef: collab.collabEpochRef,
+        collabUi: advisorCollabUi,
+        promoteDraftCollab: collab.promoteDraftCollab,
+        contextTier: '300k',
+        demo: false,
+        draftProjectId: null,
+        draftProjectRef,
+        draftSessionId: DRAFT,
+        modelId: 'gpt-6.2-astra',
+        models,
+        newSessionInProject: noop,
+        preferenceEffort: undefined,
+        projectHome: null,
+        publicCfg,
+        queueModelPatch: noop,
+        selectedSessionIdRef,
+        sendImplicitRatingRef,
+        sendScrollRef,
+        serviceTier: tier,
+        sessionEffort: undefined,
+        sessions,
+        setActiveId,
+        setBoardOpen: noop,
+        setBusy: noop,
+        setChatError: noop,
+        setCollabSaveError: collab.setCollabSaveError,
+        setCollabUi: collab.setCollabUi,
+        setDraftProject: noop,
+        setImageAnnotationSource: noop,
+        setMessages: noop,
+        setSessions,
+        setStreamText: noop,
+        sockRef,
+        stopPreparing: noop,
+        stopRef,
+        toast: noop,
+        user,
+      })
+      return { composer }
+    })
+    await act(async () => {
+      expect(await f.result.current.composer.send(prompt)).toBe(true)
+    })
+    expect(send).toHaveBeenCalledTimes(1)
+    return send.mock.calls[0]?.[0]
+  }
+  const staleCall = await runDraftSend('ultrafast', '不要修改任何文件')
+  expect(readSessionServiceTier(DRAFT)).toBeNull()
+  expect(staleCall?.serviceTier).toBeUndefined()
+
+  const clampedFastCall = await runDraftSend('fast', '不要修改任何文件')
+  expect(clampedFastCall?.serviceTier).toBeUndefined()
+
+  const editFastCall = await runDraftSend('fast', '帮我直接修改 README.md')
+  expect(editFastCall?.serviceTier).toBe('fast')
+  localStorage.clear()
 })

@@ -1,4 +1,4 @@
-import {cursorModelSupportsContextTier,supportsFastServiceTier} from '@openclaude/protocol/browser';
+import {cursorModelSupportsContextTier,normalizeServiceTierForModel,type ServiceTier} from '@openclaude/protocol/browser';
 import {SWITCH_COST_WARNING,type AuthorizeSwitch} from './useModelSwitchCost';
 import {mintMsgId} from '../lib/chat/model';
 import type {ModelSwitchCostRequest} from '@openclaude/protocol/browser';
@@ -11,6 +11,7 @@ import type {ModelSwitchCostRequest} from '@openclaude/protocol/browser';
 import { useEffect, useRef, useCallback, useState } from "react";
 import { resolveNewSessionModel, resolveSessionModel } from "../lib/modelPreferences";
 import { freshSessionRequiredForSwitch, freshSessionSwitchNotice, modelSwitchCompactionReason } from "../lib/modelSwitch";
+import { readSessionServiceTier, writeSessionServiceTier } from "../lib/sessionServiceTier";
 import { MODEL_SWITCH_CANCELLED_MESSAGE } from "../lib/chat/modelSwitchCostDispatch";
 import { type CollabUiState, EMPTY_COLLAB_UI, docToUiState, type CollabMode, advisorParentCapabilityAllowed, ADVISOR_PARENT_BLOCK_REASON, recommendedAdvisorModel, keepCollabChoiceOnSaveFailure, collaborationPutBody } from "../lib/collaborationConfig";
 import { api, ApiError, apiErrorMessage } from "../lib/api";
@@ -24,7 +25,7 @@ import type { ToastFn } from "../components/ui/Toast";
 export type SessionModelAndCollabInput = {
   activeId: string | undefined;
   authorizeSwitch?: AuthorizeSwitch;
-  getSwitchOptions?:()=>Partial<Pick<ModelSwitchCostRequest,'teamMode'|'contextTier'|'serviceTier'>>;
+  getSwitchOptions?:()=>Partial<Pick<ModelSwitchCostRequest,'teamMode'|'collabMode'|'advisorModel'|'contextTier'|'serviceTier'>>;
   agent: Agent;
   auth: AuthSession | null;
   confirmDialog: (opts: ConfirmOpts) => Promise<ConfirmChoice>;
@@ -38,6 +39,8 @@ export type SessionModelAndCollabInput = {
   resetSessionList: () => void;
   sessions: Session[];
   sessionsResetRef: React.RefObject<() => void>;
+  serviceTier?: ServiceTier | null;
+  setServiceTier?: (tier: ServiceTier | null) => void;
   setModelId: React.Dispatch<React.SetStateAction<string | undefined>>;
   setModelSwitchPreparing: React.Dispatch<React.SetStateAction<boolean>>;
   setSessions: React.Dispatch<React.SetStateAction<Session[]>>;
@@ -62,6 +65,8 @@ export function useSessionModelAndCollab({
   resetSessionList,
   sessions,
   sessionsResetRef,
+  serviceTier = null,
+  setServiceTier,
   setModelId,
   setModelSwitchPreparing,
   setSessions,
@@ -148,6 +153,10 @@ export function useSessionModelAndCollab({
   const modelSwitchSessionRef = useRef<string | undefined>(undefined);
   const activeModelSwitchSessionRef = useRef(activeId);
   activeModelSwitchSessionRef.current = activeId;
+  const latestServiceTierRef = useRef(serviceTier);
+  latestServiceTierRef.current = serviceTier;
+  const setServiceTierRef = useRef(setServiceTier);
+  setServiceTierRef.current = setServiceTier;
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); setModelId, setModelSwitchPreparing, sockRef are App useState setter/useRef passed in, stable
   const selectModel = useCallback(
     async (id: string) => {
@@ -158,6 +167,12 @@ export function useSessionModelAndCollab({
         if (activeModelSwitchSessionRef.current !== sid||modelSelectionEpochRef.current!==selectionEpoch) return;
         if (!sid) draftExplicitModelRef.current = true;
         setModelId(id);
+        const currentTier = latestServiceTierRef.current !== undefined ? latestServiceTierRef.current : readSessionServiceTier(sid);
+        const nextTier = normalizeServiceTierForModel(id, currentTier);
+        if (sid && nextTier === null) writeSessionServiceTier(sid, null);
+        if (setServiceTierRef.current && nextTier !== (latestServiceTierRef.current ?? null)) {
+          setServiceTierRef.current(nextTier);
+        }
         // 成功反馈只挂用户主动切换路径:boot 恢复模型偏好走上方 resolveSessionModel 的
         // setModelId,不经过 commit,不会误报。失败面已有 toast(压缩失败)或 server-wins
         // 盖回,成功此前静默;压缩切换(prepareModelSwitch)带明确等待,给压缩语义文案。
@@ -214,8 +229,10 @@ export function useSessionModelAndCollab({
       }:undefined;
       const options=getSwitchOptions?.();
       const authorization=authorizeSwitch?await authorizeSwitch({sessionId:activeId,requestId:mintMsgId(),targetModel:id,agentId:agent.id,teamMode:options?.teamMode,
+        ...(options?.collabMode?{collabMode:options.collabMode}:{}),
+        ...(options?.advisorModel?{advisorModel:options.advisorModel}:{}),
         ...(cursorModelSupportsContextTier(id)&&options?.contextTier?{contextTier:options.contextTier}:{}),
-        ...(supportsFastServiceTier(id)&&options?.serviceTier?{serviceTier:options.serviceTier}:{})},
+        ...(() => { const st = normalizeServiceTierForModel(id, options?.serviceTier); return st ? { serviceTier: st } : {}; })()},
         {notice,primeNextTurn:true,isCurrent:()=>activeModelSwitchSessionRef.current===sid&&modelSelectionEpochRef.current===selectionEpoch}):undefined;
       const confirmed=authorizeSwitch?authorization?.choice??false:notice?await confirmDialog({...notice,body:<>{SWITCH_COST_WARNING}{notice.body}</>}):true;
       if(confirmed===false||activeModelSwitchSessionRef.current!==sid||modelSelectionEpochRef.current!==selectionEpoch)return;
@@ -312,9 +329,9 @@ export function useSessionModelAndCollab({
             ...(cursorModelSupportsContextTier(modelId) && getSwitchOptions?.().contextTier
               ? { contextTier: getSwitchOptions!().contextTier }
               : {}),
-            ...(supportsFastServiceTier(modelId) && getSwitchOptions?.().serviceTier
-              ? { serviceTier: getSwitchOptions!().serviceTier }
-              : {}),
+            ...(() => { const st = normalizeServiceTierForModel(modelId, getSwitchOptions?.().serviceTier); return st ? { serviceTier: st } : {}; })(),
+            collabMode: mode,
+            ...(advisorModel ? { advisorModel } : {}),
             teamMode: mode === "team",
           },
           {

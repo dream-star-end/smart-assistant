@@ -85,17 +85,19 @@ esac`,
   "image inspect")
     image="\${@: -1}"; id=${IMAGE_ID}; [[ "$image" == ${OLD_IMAGE} ]] && id=${OLD_IMAGE_ID}
     case "$*" in
-      *"{{.Id}}|"*) echo "$id|$STANDIN_COMMIT|0|1" ;;
+      *"{{.Id}}|"*) echo "$id|$STANDIN_COMMIT|0|1|$STANDIN_CODEX_LABEL" ;;
       *"{{.Id}}"*) echo "$id" ;;
       *oc.runtime.source_commit*) echo "$STANDIN_COMMIT" ;;
-      *oc.runtime.codex_version*) echo 0.169.0 ;;
+      *oc.runtime.codex_version*) echo "$STANDIN_CODEX_LABEL" ;;
       *oc.runtime.include_grok*) echo 1 ;;
       *) : ;;
     esac ;;
   "run --rm")
     case "$*" in
       *"--entrypoint grok-native"*) echo "$STANDIN_GROK" ;;
-      *"--entrypoint codex"*) echo "codex-cli 0.169.0" ;;
+      *"--entrypoint codex"*)
+        if [[ "$STANDIN_CODEX_RC" != 0 ]]; then exit "$STANDIN_CODEX_RC"; fi
+        echo "$STANDIN_CODEX_BIN" ;;
       *) exit 64 ;;
     esac ;;
   *) exit 64 ;;
@@ -157,7 +159,13 @@ function furnish(root: string) {
 type Capsule = ReturnType<typeof furnish>;
 
 /** Source the real deploy-v5.sh and call one of its functions with DRY=0. */
-function consumer(box: Capsule, grok: string, unit: "active" | "inactive", call: string) {
+function consumer(
+  box: Capsule,
+  grok: string,
+  unit: "active" | "inactive",
+  call: string,
+  codex?: { label?: string; bin?: string; rc?: number },
+) {
   box.resetCalls();
   const harness = `set -euo pipefail
 export V5_DEPLOY_SOURCE_ONLY=1
@@ -181,7 +189,10 @@ ${call}
   const ran = spawnSync("/usr/bin/timeout", ["--signal=KILL", String(seconds), "bash", "-c", harness], { encoding: "utf8",
     timeout: seconds * 1000 + 1500, killSignal: "SIGKILL",
     env: { PATH: "/usr/bin:/bin", HOME: box.root, CAPSULE: box.root, STANDIN_GROK: grok, STANDIN_UNIT: unit,
-      STANDIN_COMMIT: box.commit, ALLOW_ANY_BRANCH: "1" } });
+      STANDIN_COMMIT: box.commit, ALLOW_ANY_BRANCH: "1",
+      STANDIN_CODEX_LABEL: codex?.label ?? "0.170.0",
+      STANDIN_CODEX_BIN: codex?.bin ?? "codex-cli 0.170.0",
+      STANDIN_CODEX_RC: String(codex?.rc ?? 0) } });
   if (ran.status === 137 || ran.signal === "SIGKILL" || ran.error) fail("DEADLINE_EXCEEDED");
   return { status: ran.status, out: `${ran.stdout}`, err: `${ran.stderr}`, calls: box.calls() };
 }
@@ -199,12 +210,25 @@ function proveOfflinePrepare(box: Capsule): string {
   if (old.calls.some((line) => line.startsWith("psql ")) || box.exists(`remote/cutovers/${NONCE}`)) {
     fail("OFFLINE_PREPARE_OLD_CLI_WENT_ON");
   }
+  const badCodexLabel = consumer(box, current, "active", call, { label: "0.169.0" });
+  if (badCodexLabel.status === 0 || !badCodexLabel.err.includes("expected 0.170.0")) {
+    fail(`OFFLINE_PREPARE_ACCEPTED_OLD_CODEX_LABEL_${badCodexLabel.status}: ${badCodexLabel.err.slice(-300)}`);
+  }
+  const badCodexBin = consumer(box, current, "active", call, { label: "0.170.0", bin: "codex-cli 0.169.0" });
+  if (badCodexBin.status === 0 || !badCodexBin.err.includes("expected codex-cli 0.170.0")) {
+    fail(`OFFLINE_PREPARE_ACCEPTED_OLD_CODEX_BIN_${badCodexBin.status}: ${badCodexBin.err.slice(-300)}`);
+  }
+  const missingCodex = consumer(box, current, "active", call, { label: "0.170.0", rc: 127 });
+  if (missingCodex.status === 0 || !missingCodex.err.includes("codex --version failed")) {
+    fail(`OFFLINE_PREPARE_ACCEPTED_MISSING_CODEX_${missingCodex.status}: ${missingCodex.err.slice(-300)}`);
+  }
   const ok = consumer(box, current, "active", call);
   if (ok.status !== 0) fail(`OFFLINE_PREPARE_REFUSED_${ok.status}: ${ok.err.slice(-400)}`);
   const manifest = JSON.parse(box.read(`remote/cutovers/${NONCE}/manifest.json`)) as Record<string, unknown>;
   if (manifest.target_image !== IMAGE || manifest.target_image_id !== IMAGE_ID || manifest.old_image !== OLD_IMAGE
     || manifest.target_commit !== box.commit) fail("OFFLINE_PREPARE_MANIFEST");
-  if (!ok.calls.includes(`docker run --rm --entrypoint grok-native ${IMAGE} --version`)) fail("OFFLINE_PREPARE_CLI_NOT_RUN");
+  if (!ok.calls.includes(`docker run --rm --entrypoint codex ${IMAGE_ID} --version`)) fail("OFFLINE_PREPARE_CODEX_NOT_RUN");
+  if (!ok.calls.includes(`docker run --rm --entrypoint grok-native ${IMAGE_ID} --version`)) fail("OFFLINE_PREPARE_CLI_NOT_RUN");
   return "[grok-426-offline-prepare] PASS — the cutover is prepared only for an image whose Grok CLI is 1.0.77";
 }
 
@@ -217,8 +241,22 @@ assert_target_runtime_image_ready`;
   if (old.status === 0 || !old.err.includes(`expected='grok ${PINNED}`)) {
     fail(`ONLINE_IMAGE_ACCEPTED_OLD_CLI_${old.status}: ${old.err.slice(-300)}`);
   }
+  const badCodexLabel = consumer(box, current, "active", call, { label: "0.169.0" });
+  if (badCodexLabel.status === 0 || !badCodexLabel.err.includes("expected=0.170.0")) {
+    fail(`ONLINE_IMAGE_ACCEPTED_OLD_CODEX_LABEL_${badCodexLabel.status}: ${badCodexLabel.err.slice(-300)}`);
+  }
+  const badCodexBin = consumer(box, current, "active", call, { label: "0.170.0", bin: "codex-cli 0.169.0" });
+  if (badCodexBin.status === 0 || !badCodexBin.err.includes("expected='codex-cli 0.170.0'")) {
+    fail(`ONLINE_IMAGE_ACCEPTED_OLD_CODEX_BIN_${badCodexBin.status}: ${badCodexBin.err.slice(-300)}`);
+  }
+  const missingCodex = consumer(box, current, "active", call, { label: "0.170.0", rc: 127 });
+  if (missingCodex.status === 0 || !missingCodex.err.includes("codex --version failed")) {
+    fail(`ONLINE_IMAGE_ACCEPTED_MISSING_CODEX_${missingCodex.status}: ${missingCodex.err.slice(-300)}`);
+  }
   const ok = consumer(box, current, "active", call);
-  if (ok.status !== 0 || !ok.out.includes(`grok=${current}`)) fail(`ONLINE_IMAGE_REFUSED_${ok.status}: ${ok.err.slice(-400)}`);
+  if (ok.status !== 0 || !ok.out.includes(`grok=${current}`) || !ok.out.includes("codex=codex-cli 0.170.0")) {
+    fail(`ONLINE_IMAGE_REFUSED_${ok.status}: ${ok.err.slice(-400)}`);
+  }
   return "[grok-426-online-image] PASS — the online image switch accepts only Grok CLI 1.0.77";
 }
 
@@ -226,18 +264,30 @@ assert_target_runtime_image_ready`;
 function proveStagedActivation(box: Capsule): string {
   const bundle = `remote/cutovers/${NONCE}`;
   const call = `CUTOVER_NONCE='${NONCE}'; activate_staged_inner`;
-  const staged = (grok: string) => {
+  const staged = (grok: string, codex?: { label?: string; bin?: string; rc?: number }) => {
     box.resetEnv();
     box.write(`${bundle}/state.json`, JSON.stringify({ state: "activating", updated_at: 1 }));
-    return consumer(box, grok, "inactive", call);
+    return consumer(box, grok, "inactive", call, codex);
   };
   const old = staged(previous);
   if (old.status === 0 || !old.err.includes(`runtime image Grok binary=${previous},expected='grok ${PINNED}`)) {
     fail(`STAGED_ACTIVATION_ACCEPTED_OLD_CLI_${old.status}: ${old.err.slice(-300)}`);
   }
   if (old.calls.some((line) => line.startsWith("systemctl start"))) fail("STAGED_ACTIVATION_OLD_CLI_STARTED");
+  const badCodexLabel = staged(current, { label: "0.169.0" });
+  if (badCodexLabel.status === 0 || !badCodexLabel.err.includes("expected=0.170.0")) {
+    fail(`STAGED_ACTIVATION_ACCEPTED_OLD_CODEX_LABEL_${badCodexLabel.status}: ${badCodexLabel.err.slice(-300)}`);
+  }
+  const badCodexBin = staged(current, { label: "0.170.0", bin: "codex-cli 0.169.0" });
+  if (badCodexBin.status === 0 || !badCodexBin.err.includes("expected='codex-cli 0.170.0'")) {
+    fail(`STAGED_ACTIVATION_ACCEPTED_OLD_CODEX_BIN_${badCodexBin.status}: ${badCodexBin.err.slice(-300)}`);
+  }
+  const missingCodex = staged(current, { label: "0.170.0", rc: 127 });
+  if (missingCodex.status === 0 || !missingCodex.err.includes("codex --version failed")) {
+    fail(`STAGED_ACTIVATION_ACCEPTED_MISSING_CODEX_${missingCodex.status}: ${missingCodex.err.slice(-300)}`);
+  }
   const ok = staged(current);
-  if (!ok.out.includes(`✓ runtime image source=${box.commit},codex=codex-cli 0.169.0,grok=${current}`)) {
+  if (!ok.out.includes(`✓ runtime image source=${box.commit},codex=codex-cli 0.170.0,grok=${current}`)) {
     fail(`STAGED_ACTIVATION_REFUSED_${ok.status}: ${ok.err.slice(-400)}`);
   }
   // the manifest's image was installed into the env file before the check, by the product's own step

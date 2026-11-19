@@ -32,7 +32,7 @@ agents:
   # displayName 仍由 entrypoint 动态拼:按**本处声明的 model** 反查 protocol 型号目录取显示名 +「队长」
   # —— 显示名权威留 protocol,换型号只改本文件一处。
   - id: codex
-    model: gpt-6-astra
+    model: gpt-6.2-astra
     provider: codex-native
     runnerKind: app-server
     permissionMode: bypassPermissions

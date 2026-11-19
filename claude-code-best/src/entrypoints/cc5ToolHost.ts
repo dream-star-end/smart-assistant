@@ -11,10 +11,15 @@ import type { Message } from '../types/message.js'
 
 export const CC5_TOOL_PROFILE = 'full'
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i
-/** Must stay equal to packages/gateway/src/cc5NativeTool.ts CC5_TOOL_RESULT_MAX_BYTES. */
-const MAX_RESULT_BYTES = 131072
-/** Must stay equal to packages/gateway/src/cc5NativeTool.ts CC5_TOOL_INPUT_MAX_BYTES. */
-const MAX_INPUT_BYTES = 98304
+function readBoundedEnvLimit(key: string, fallback: number, ceiling: number): number {
+  const raw = process.env[key]?.trim()
+  if (!raw || !/^[1-9][0-9]{0,8}$/.test(raw)) return fallback
+  const parsed = Number(raw)
+  return Number.isSafeInteger(parsed) && parsed >= fallback && parsed <= ceiling ? parsed : fallback
+}
+/** Defaults stay pinned to legacy v1/v2 limits (128 KiB / 96 KiB); v4 lanes opt in up to 4 MiB. */
+const MAX_RESULT_BYTES = readBoundedEnvLimit('OC_CC5_TOOL_RESULT_MAX_BYTES', 131072, 4 * 1024 * 1024)
+const MAX_INPUT_BYTES = readBoundedEnvLimit('OC_CC5_TOOL_INPUT_MAX_BYTES', 98304, 4 * 1024 * 1024)
 const MAX_PROFILE_BYTES = 65536
 const MAX_TOOLS = 128
 /** Inside the gateway's 11-minute tools/call bound. */

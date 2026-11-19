@@ -2,7 +2,15 @@ import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { once } from 'node:events'
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { createServer } from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
@@ -22,8 +30,9 @@ type Mode =
   | 'invalid-lock'
   | 'script-failure'
   | 'lock-change'
+  | 'onnx-cuda-skip'
 
-async function install(mode: Mode) {
+async function install(mode: Mode, opts?: { onnxCudaPolicy?: string }) {
   const root = mkdtempSync(path.join(os.tmpdir(), 'runtime-npm-test-'))
   const build = path.join(root, 'build')
   const bin = path.join(root, 'bin')
@@ -33,14 +42,36 @@ async function install(mode: Mode) {
   writeFileSync(attemptsFile, '')
   const attempts = () =>
     readFileSync(attemptsFile, 'utf8').trim().split('\n').filter(Boolean).length
-  writeFileSync(
-    path.join(packageDir, 'package.json'),
-    JSON.stringify({
-      name: 'oc-runtime-npm-fixture',
-      version: '1.0.0',
-      main: 'index.js',
-    }),
-  )
+  const fixturePkg: Record<string, unknown> = {
+    name: 'oc-runtime-npm-fixture',
+    version: '1.0.0',
+    main: 'index.js',
+  }
+  if (mode === 'onnx-cuda-skip') {
+    // Mirror onnxruntime-node/script/install.js: unless skip is set, request the CUDA tarball.
+    fixturePkg.scripts = { install: 'node ./install.js' }
+    writeFileSync(
+      path.join(packageDir, 'install.js'),
+      [
+        "const fs = require('node:fs');",
+        "const http = require('node:http');",
+        'const flag = process.env.ONNXRUNTIME_NODE_INSTALL_CUDA || process.env.npm_config_onnxruntime_node_install_cuda;',
+        "if (flag === 'skip') {",
+        "  fs.writeFileSync('install-cuda-skipped.marker', flag);",
+        '  process.exit(0);',
+        '}',
+        'const base = process.env.npm_config_registry;',
+        "http.get(base + '/onnxruntime-linux-x64-gpu-1.21.0.tgz', (res) => {",
+        '  res.resume();',
+        '  if (res.statusCode !== 200) {',
+        "    console.error('Failed to download the binaries: ' + res.statusCode + ' Not Found.');",
+        '    process.exit(1);',
+        '  }',
+        "}).on('error', (err) => { console.error(err); process.exit(1); });",
+      ].join('\n'),
+    )
+  }
+  writeFileSync(path.join(packageDir, 'package.json'), JSON.stringify(fixturePkg))
   writeFileSync(
     path.join(packageDir, 'index.js'),
     'module.exports = { installed: "exact-locked-package" }\n',
@@ -51,7 +82,13 @@ async function install(mode: Mode) {
   assert.equal(packed.status, 0, packed.stderr)
   const bytes = readFileSync(tarball)
   let requests = 0
+  let cudaAssetRequests = 0
   const server = createServer((req, res) => {
+    if (req.url === '/onnxruntime-linux-x64-gpu-1.21.0.tgz') {
+      cudaAssetRequests++
+      res.writeHead(404).end('Not Found')
+      return
+    }
     if (req.url !== '/package.tgz') {
       res.writeHead(404).end('fixture has no other packages')
       return
@@ -103,6 +140,7 @@ async function install(mode: Mode) {
                 version: '1.0.0',
                 resolved: `${registry}/package.tgz`,
                 integrity: `sha512-${createHash('sha512').update(bytes).digest('base64')}`,
+                ...(mode === 'onnx-cuda-skip' ? { hasInstallScript: true } : {}),
               },
             },
           })}\n`
@@ -142,7 +180,17 @@ async function install(mode: Mode) {
       {
         detached: true,
         env: {
-          ...process.env,
+          ...Object.fromEntries(
+            Object.entries(process.env).filter(
+              ([k]) =>
+                k !== 'OC_HOTCFG_ONNXRUNTIME_INSTALL_CUDA' &&
+                k !== 'ONNXRUNTIME_NODE_INSTALL_CUDA' &&
+                k !== 'npm_config_onnxruntime_node_install_cuda',
+            ),
+          ),
+          ...(opts?.onnxCudaPolicy !== undefined
+            ? { OC_HOTCFG_ONNXRUNTIME_INSTALL_CUDA: opts.onnxCudaPolicy }
+            : {}),
           OC_DOCKER_BIN: docker,
           PATH: `${bin}:${process.env.PATH}`,
           npm_config_cache: path.join(root, 'npm-cache'),
@@ -178,6 +226,10 @@ async function install(mode: Mode) {
       output: text,
       attempts: attempts(),
       requests,
+      cudaAssetRequests,
+      cudaSkipMarker: existsSync(
+        path.join(build, 'node_modules/oc-runtime-npm-fixture/install-cuda-skipped.marker'),
+      ),
       lockUnchanged: readFileSync(path.join(build, 'package-lock.json'), 'utf8') === lock,
       installed: installed.status === 0 ? JSON.parse(installed.stdout) : null,
     }
@@ -245,4 +297,63 @@ test('runtime npm: a successful lifecycle cannot silently rewrite the lock', asy
   assert.equal(r.attempts, 1)
   assert.equal(r.lockUnchanged, false)
   assert.match(r.output, /npm ci lock changed/)
+})
+
+test('runtime npm: selfhost opt-in skips onnxruntime CUDA download and proves install script ran', async () => {
+  const r = await install('onnx-cuda-skip', { onnxCudaPolicy: 'skip' })
+  assert.equal(r.status, 0, r.output)
+  assert.equal(r.attempts, 1)
+  assert.equal(r.requests, 1)
+  assert.equal(r.cudaAssetRequests, 0)
+  assert.equal(r.cudaSkipMarker, true)
+  assert.equal(r.lockUnchanged, true)
+  assert.deepEqual(r.installed, { installed: 'exact-locked-package' })
+})
+
+test('runtime npm: callers without selfhost opt-in preserve default CUDA install attempt', async () => {
+  const r = await install('onnx-cuda-skip')
+  assert.notEqual(r.status, 0, r.output)
+  assert.equal(r.attempts, 1)
+  assert.equal(r.requests, 1)
+  assert.equal(r.cudaAssetRequests, 1)
+  assert.equal(r.cudaSkipMarker, false)
+  assert.equal(r.lockUnchanged, true)
+  assert.match(r.output, /Failed to download the binaries: 404 Not Found\./)
+})
+
+test('runtime npm: deps cache key isolates selfhost skip policy while keeping default key unchanged', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'runtime-cache-key-'))
+  try {
+    writeFileSync(path.join(root, 'package-lock.json'), '{"name":"x","lockfileVersion":3}\n')
+    const runKey = (extraEnv: NodeJS.ProcessEnv) =>
+      spawnSync(
+        'bash',
+        ['-c', 'source "$1"; oc_hotcfg_deps_cache_key "$2" sha256:img-1', 'key', lib, root],
+        {
+          encoding: 'utf8',
+          env: {
+            ...Object.fromEntries(
+              Object.entries(process.env).filter(
+                ([k]) => k !== 'OC_HOTCFG_ONNXRUNTIME_INSTALL_CUDA',
+              ),
+            ),
+            ...extraEnv,
+          },
+        },
+      )
+    const defUnset = runKey({})
+    const defEmpty = runKey({ OC_HOTCFG_ONNXRUNTIME_INSTALL_CUDA: '' })
+    const selfhostSkip = runKey({ OC_HOTCFG_ONNXRUNTIME_INSTALL_CUDA: 'skip' })
+    const invalid = runKey({ OC_HOTCFG_ONNXRUNTIME_INSTALL_CUDA: 'bogus' })
+    assert.equal(defUnset.status, 0, defUnset.stderr)
+    assert.equal(defEmpty.status, 0, defEmpty.stderr)
+    assert.equal(selfhostSkip.status, 0, selfhostSkip.stderr)
+    assert.match(defUnset.stdout.trim(), /^[0-9a-f]{64}$/)
+    assert.equal(defUnset.stdout.trim(), defEmpty.stdout.trim())
+    assert.match(selfhostSkip.stdout.trim(), /^[0-9a-f]{64}$/)
+    assert.notEqual(selfhostSkip.stdout.trim(), defUnset.stdout.trim())
+    assert.notEqual(invalid.status, 0)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
 })

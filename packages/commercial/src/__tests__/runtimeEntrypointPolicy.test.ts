@@ -499,7 +499,7 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
       join(__dirname, "..", "..", "agent-sandbox", "platform-runtime", "seed", "platform-seed.yaml"),
       "utf-8",
     );
-    assert.match(seedYaml, /- id: codex\n\s+model: gpt-6-astra\n\s+provider: codex-native\n\s+runnerKind: app-server/,
+    assert.match(seedYaml, /- id: codex\n\s+model: gpt-6\.2-astra\n\s+provider: codex-native\n\s+runnerKind: app-server/,
       "codex 声明必须带 model + codex-native provider + app-server runnerKind(gateway runner 路由依据)");
     assert.match(
       src,

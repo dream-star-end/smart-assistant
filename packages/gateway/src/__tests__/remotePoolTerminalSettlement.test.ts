@@ -100,7 +100,11 @@ interface HarnessCallbackContext {
   readonly session: Awaited<ReturnType<InstanceType<typeof SessionManager>['getOrCreate']>>
   readonly pushPollFrame: (frame: RemoteRelayedFrame) => void
   readonly enqueueTool: (callId: string, remoteAlias: string, args: Record<string, unknown>) => void
+  readonly enqueueTerminal: (status?: 'success' | 'error' | 'interrupted', terminalId?: string) => void
+  readonly askPermission: (raw: Record<string, unknown>) => Promise<Record<string, unknown>>
   readonly nativeSessionId: string
+  readonly admitCount: () => number
+  readonly toolResults: () => Array<Record<string, unknown>>
 }
 
 interface ScriptedHarnessOptions {
@@ -108,6 +112,7 @@ interface ScriptedHarnessOptions {
   readonly terminalRequestGraceMs?: number
   readonly onAdmit?: (ctx: HarnessCallbackContext) => Promise<void>
   readonly onNewTurn?: (ctx: HarnessCallbackContext) => Promise<void>
+  readonly onToolResult?: (ctx: HarnessCallbackContext, body: Record<string, unknown>) => void
   readonly executeTool: (
     name: string,
     args: Record<string, unknown>,
@@ -178,6 +183,9 @@ async function createScriptedSettlementHarness(t: TestContext, options: Scripted
   let activeTurnKey = ''
   let revoked = false
   let abandonedCount = 0
+  let admitCount = 0
+  const recordedToolResults: Array<Record<string, unknown>> = []
+  let onHostPermission: ((raw: Record<string, unknown>) => Promise<Record<string, unknown>>) | undefined
   const hostCloseAbort = new AbortController()
   let smRef!: InstanceType<typeof SessionManager>
   let sessionRef!: Awaited<ReturnType<InstanceType<typeof SessionManager>['getOrCreate']>>
@@ -227,16 +235,115 @@ async function createScriptedSettlementHarness(t: TestContext, options: Scripted
     })
   }
 
+  const enqueueTerminal = (status: 'success' | 'error' | 'interrupted' = 'success', terminalId = `term-${pollSeq + 1}`): void => {
+    const usageSeq = pollSeq + 1
+    pushPollFrame({
+      kind: 'security',
+      event: {
+        protocolVersion: REMOTE_DRIVER_PROTOCOL_VERSION,
+        operationId,
+        generation: '1',
+        profileId,
+        authEpoch: 'epoch-1',
+        authorityTurnId: activeAuthorityTurnId,
+        nativeSessionId,
+        seq: usageSeq,
+        rawFrameRef: { channel: 'native', frameSeq: usageSeq, sha256: 'b'.repeat(64) },
+        driverId,
+        driverVersion: '4.0.0',
+        payload: {
+          kind: 'usage',
+          sampleId: `u-${usageSeq}`,
+          scopeId: `scope-${usageSeq}`,
+          semanticsId: 'ccb-stream-json-v1',
+          rawCounters: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        },
+      },
+    })
+    const termSeq = pollSeq + 1
+    pushPollFrame({
+      kind: 'security',
+      event: {
+        protocolVersion: REMOTE_DRIVER_PROTOCOL_VERSION,
+        operationId,
+        generation: '1',
+        profileId,
+        authEpoch: 'epoch-1',
+        authorityTurnId: activeAuthorityTurnId,
+        nativeSessionId,
+        seq: termSeq,
+        rawFrameRef: { channel: 'native', frameSeq: termSeq, sha256: 'c'.repeat(64) },
+        driverId,
+        driverVersion: '4.0.0',
+        payload: { kind: 'turnTerminal', terminalId, status },
+      },
+    })
+    pushPollFrame({
+      kind: 'turn_settled',
+      outcome: { kind: status === 'error' ? 'crashed' : 'settled' } as any,
+      receipt: {
+        protocolVersion: REMOTE_DRIVER_PROTOCOL_VERSION,
+        operationId,
+        runId,
+        driverId,
+        engineId: driverId,
+        driverVersion: '4.0.0',
+        driverDigest: '1'.repeat(64),
+        uid: '3',
+        containerDbId: '7',
+        dockerId: 'd'.repeat(64),
+        sessionKey,
+        canonicalModel,
+        upstreamModel,
+        profileId,
+        authEpoch: 'epoch-1',
+        authorityTurnId: activeAuthorityTurnId,
+        turnKey: activeTurnKey,
+        nativeSessionId,
+        terminalId,
+        status: status === 'error' ? 'error' : 'ok',
+        nativeStatus: status,
+        rawEvidenceDigest: 'e'.repeat(64),
+        usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        provenance: { authoritative: true, usageMode: 'per_turn', countersBaseline: null, countersFinal: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } },
+      } as any,
+    })
+  }
+
   const getCtx = (): HarnessCallbackContext => ({
     sm: smRef,
     session: sessionRef,
     pushPollFrame,
     enqueueTool,
+    enqueueTerminal,
+    askPermission: (raw) => {
+      if (!onHostPermission) return Promise.reject(new Error('NO_ON_PERMISSION'))
+      return onHostPermission(raw)
+    },
     nativeSessionId,
+    admitCount: () => admitCount,
+    toolResults: () => recordedToolResults,
   })
 
-  const hostFactory = (): LaneToolHost => ({
+  const hostFactory = (
+    _root: string,
+    _lifecycleId: string,
+    _profile: unknown,
+    _env: NodeJS.ProcessEnv,
+    onPermission?: (raw: Record<string, unknown>) => Promise<Record<string, unknown>>,
+  ): LaneToolHost => {
+    onHostPermission = onPermission
+    return {
     tools: async () => [
+      {
+        name: 'Read',
+        description: 'Reads files',
+        inputSchema: {
+          type: 'object',
+          properties: { file_path: { type: 'string' } },
+          required: ['file_path'],
+        },
+      },
       {
         name: 'ReadImage',
         description: 'Reads uploaded image',
@@ -244,6 +351,33 @@ async function createScriptedSettlementHarness(t: TestContext, options: Scripted
           type: 'object',
           properties: { file_path: { type: 'string' } },
           required: ['file_path'],
+        },
+      },
+      {
+        name: 'Bash',
+        description: 'Runs shell commands',
+        inputSchema: {
+          type: 'object',
+          properties: { command: { type: 'string' } },
+          required: ['command'],
+        },
+      },
+      {
+        name: 'Write',
+        description: 'Writes a file',
+        inputSchema: {
+          type: 'object',
+          properties: { file_path: { type: 'string' }, content: { type: 'string' } },
+          required: ['file_path', 'content'],
+        },
+      },
+      {
+        name: 'AskUserQuestion',
+        description: 'Asks the user a question',
+        inputSchema: {
+          type: 'object',
+          properties: { questions: { type: 'array' } },
+          required: ['questions'],
         },
       },
       {
@@ -261,7 +395,8 @@ async function createScriptedSettlementHarness(t: TestContext, options: Scripted
     close: async () => {
       hostCloseAbort.abort(new Error('CC5_TOOLHOST_STOPPED_DURING_EXECUTION'))
     },
-  })
+  }
+  }
 
   laneOverridesByOpId.set(operationId, {
     binding,
@@ -277,6 +412,7 @@ async function createScriptedSettlementHarness(t: TestContext, options: Scripted
     }),
     call: async (path, body) => {
       if (path === '/admit') {
+        admitCount += 1
         activeAuthority = String(body.authority ?? '')
         activeAuthorityTurnId = verifyAuthority(activeAuthority, keys, Date.now()).authorityTurnId
         activeLease = String(body.lease ?? '')
@@ -319,6 +455,8 @@ async function createScriptedSettlementHarness(t: TestContext, options: Scripted
         }
       }
       if (path === '/tool/result') {
+        recordedToolResults.push(body)
+        options.onToolResult?.(getCtx(), body)
         return { callId: String(body.callId ?? '') }
       }
       if (path === '/tool/ack' || path === '/tool/stopped' || path === '/renew') {
@@ -446,7 +584,7 @@ async function createScriptedSettlementHarness(t: TestContext, options: Scripted
     rmSync(sandbox, { recursive: true, force: true })
   })
 
-  const submitDurableTurn = async (prompt: string) => {
+  const submitDurableTurn = async (prompt: string, submitOpts: { readonly readOnly?: boolean } = {}) => {
     const dispatchId = randomUUID()
     const clientMessageId = `m-${randomUUID().slice(0, 12)}`
     const issuedAt = Date.now()
@@ -547,6 +685,7 @@ async function createScriptedSettlementHarness(t: TestContext, options: Scripted
           dispatchId,
           attemptNo: 1,
         },
+        ...(submitOpts.readOnly ? { readOnly: true } : {}),
       },
     )
 
@@ -794,5 +933,212 @@ test(
     )
     assert.equal(abandonedFenceRes.inboxRow?.state, 'terminal')
     assert.equal(abandonedFenceRes.inboxRow?.outcome, 'crashed')
+  },
+)
+
+test(
+  'remote-driver-v4 supports Plan Mode readOnly turns (fail-closed allowlist blocks Write and Bash cleanly) and AskUserQuestion permission round-trip',
+  { timeout: 15_000 },
+  async (t) => {
+    const executedTools: string[] = []
+    let seenToolUseID: unknown
+    let seenWaitingDuringPrompt = false
+
+    const h = await createScriptedSettlementHarness(t, {
+      terminalRequestGraceMs: 50,
+      onNewTurn: async (ctx) => {
+        ctx.enqueueTool('toolu_plan_write', 'Write', { file_path: '/tmp/nope.txt', content: 'bad' })
+        ctx.enqueueTool('toolu_plan_bash', 'Bash', { command: 'rm -rf /tmp/nope' })
+        ctx.enqueueTool('toolu_plan_read', 'Read', { file_path: '/tmp/ok.txt' })
+        ctx.enqueueTool('toolu_plan_ask', 'AskUserQuestion', { questions: [{ question: 'Proceed?' }] })
+      },
+      onToolResult: (ctx) => {
+        if (ctx.toolResults().length === 4) {
+          ctx.enqueueTerminal('success')
+        }
+      },
+      executeTool: async (name, _args, _signal, ctx) => {
+        executedTools.push(name)
+        if (name === 'AskUserQuestion') {
+          const permPromise = ctx.askPermission({
+            tool_name: 'AskUserQuestion',
+            tool_use_id: 'toolu_plan_ask',
+            input: { questions: [{ question: 'Proceed?' }] },
+          })
+          await new Promise((r) => setTimeout(r, 20))
+          seenWaitingDuringPrompt = ctx.session.runner.waitingForUserInput === true
+          assert.equal(seenWaitingDuringPrompt, true)
+          // Respond via RemoteEngineAdapter.sendPermissionResponse using emitted permission_request id:
+          const permReq = lastPermReq!
+          assert.equal(
+            ctx.session.runner.sendPermissionResponse(permReq.requestId, {
+              behavior: 'allow',
+              updatedInput: { answers: { 'Proceed?': 'Yes' } },
+            }),
+            true,
+          )
+          const permReply = await permPromise
+          seenToolUseID = permReply.toolUseID
+          assert.equal(ctx.session.runner.waitingForUserInput, false)
+          return { content: [{ type: 'text', text: 'answered:Yes' }], isError: false }
+        }
+        return { content: [{ type: 'text', text: `ran:${name}` }], isError: false }
+      },
+    })
+
+    let lastPermReq: { requestId: string; toolName: string; toolUseId?: string } | undefined
+    const origSubmit = h.sm.submit.bind(h.sm)
+    h.sm.submit = (async (...args: Parameters<typeof origSubmit>) => {
+      const origOnEvent = args[2]
+      args[2] = (ev) => {
+        if ((ev as { kind?: unknown }).kind === 'permission_request') {
+          lastPermReq = (ev as unknown as { request: { requestId: string; toolName: string; toolUseId?: string } }).request
+        }
+        origOnEvent(ev)
+      }
+      return origSubmit(...args)
+    }) as typeof origSubmit
+
+    const res = await h.submitDurableTurn('plan + ask question', { readOnly: true })
+    assert.equal(res.inboxRow?.state, 'terminal')
+    assert.equal(res.inboxRow?.outcome, 'completed')
+    assert.deepEqual(executedTools, ['Read', 'AskUserQuestion'])
+    assert.equal(seenWaitingDuringPrompt, true)
+    assert.equal(seenToolUseID, 'toolu_plan_ask')
+    assert.ok(lastPermReq && lastPermReq.toolName === 'AskUserQuestion')
+    assert.equal(res.events.some((e) => e.kind === 'final'), true)
+  },
+)
+
+test(
+  'early interrupt before queued executeTurn acquires mutex abandons cleanly without admitting or calling remote node',
+  { timeout: 15_000 },
+  async (t) => {
+    const adapter = new RemoteEngineAdapter(
+      {
+        agentId: 'main',
+        agentBaseDir: '/tmp',
+        sessionKey: 'agent:main:webchat:dm:early_int_unit',
+        model: 'antigravity-gemini-4-carbon-remote',
+        config: { auth: {}, gateway: { port: 18790, accessToken: 't' }, mcpServers: [] } as any,
+        executionBackend: {
+          kind: REMOTE_DRIVER_BACKEND,
+          version: REMOTE_DRIVER_PROTOCOL_VERSION,
+          sessionKey: 'agent:main:webchat:dm:early_int_unit',
+          operationId: '11111111-1111-4111-8111-111111111111',
+          driverId: 'antigravity',
+          engineId: 'antigravity',
+          authorityEngine: 'antigravity',
+          driverVersion: '1.0.0',
+          generation: '1',
+          profileId: '22222222-2222-4222-8222-222222222222',
+          authEpoch: 'epoch-1',
+        },
+      },
+      {
+        keyring: new Map([['k1', new Uint8Array(32).fill(1)]]),
+        binding: {
+          version: REMOTE_DRIVER_PROTOCOL_VERSION,
+          backendKind: REMOTE_DRIVER_BACKEND,
+          operationId: '11111111-1111-4111-8111-111111111111',
+          runId: 'run-early-1',
+          uid: '3',
+          containerDbId: '7',
+          dockerId: 'd'.repeat(64),
+          sessionKey: 'agent:main:webchat:dm:early_int_unit',
+          canonicalModel: 'antigravity-gemini-4-carbon-remote',
+          upstreamModel: 'gemini-4-carbon-medium',
+          driverId: 'antigravity',
+          engineId: 'antigravity',
+          authorityEngine: 'antigravity',
+          driverVersion: '1.0.0',
+          driverDigest: '1'.repeat(64),
+          coreDigest: '2'.repeat(64),
+          probeFingerprint: '3'.repeat(64),
+          manifestSha256: '4'.repeat(64),
+          generation: '1',
+          profileId: '22222222-2222-4222-8222-222222222222',
+          authEpoch: 'epoch-1',
+          capability: 'c'.repeat(64),
+          expiresAt: Date.now() + 600_000,
+        },
+        call: async (path) => {
+          if (path === '/admit') {
+            admitCalls += 1
+          }
+          if (path === '/stop') {
+            return { remoteStopped: true }
+          }
+          if (path === '/tool/stopped') {
+            return {}
+          }
+          throw new Error(`unexpected call: ${path}`)
+        },
+      },
+    )
+    t.after(() => adapter.shutdown().catch(() => {}))
+
+    const lane = (adapter as unknown as {
+      lane: {
+        executeTurn: (...args: any[]) => Promise<{ kind: string; nativeSessionId: string }>
+        interrupt: () => boolean
+        binding: RemotePoolBinding
+        turnMutex: Promise<void>
+      }
+    }).lane
+    let admitCalls = 0
+    // Hold the lane mutex directly to simulate Turn 1 finishing while Turn 2 is queued at `await prev`.
+    let releasePrev!: () => void
+    lane.turnMutex = new Promise<void>((res) => {
+      releasePrev = res
+    })
+
+    const now = Date.now()
+    const authPayload: ModelAuthorityPayload = {
+      v: 1,
+      keyId: 'k1',
+      uid: 3,
+      containerId: 7,
+      authorityTurnId: createHash('md5').update('early-2').digest('hex'),
+      connectionChallenge: 'c',
+      canonicalModel: lane.binding.canonicalModel,
+      engine: 'antigravity',
+      executionBackend: remotePoolBackendOf(lane.binding),
+      securityEpoch: 1,
+      executionRevision: 'rev-1',
+      issuedAt: now,
+      expiresAt: now + 120_000,
+      executionDescriptor: {
+        capabilityProfile: {},
+        capabilitySchemaVersion: 1,
+        contextWindow: 200_000,
+        supportsVision: true,
+        supportedEfforts: ['medium'],
+      },
+    }
+
+    const queuedPromise = lane.executeTurn(
+      {
+        authority: 'auth-unused-when-cancelled-pre-mutex',
+        lease: 'lease-unused-when-cancelled-pre-mutex',
+        turnKey: createHash('sha256').update('tk-early-2').digest('hex'),
+        payload: authPayload,
+        prompt: 'queued turn',
+        readOnly: false,
+      },
+      {
+        onNativeSession: () => {},
+        onSubmitted: () => {},
+        onSecurityEvent: () => {},
+        onPresentationItem: () => {},
+      },
+    )
+
+    await new Promise((r) => setTimeout(r, 10))
+    assert.equal(lane.interrupt(), true, 'interrupt() MUST match queued pendingTurns before await prev resolves')
+    releasePrev()
+    const outcome = await queuedPromise
+    assert.equal(outcome.kind, 'abandoned')
+    assert.equal(admitCalls, 0, 'cancelled queued turn must never invoke /admit on remote node')
   },
 )

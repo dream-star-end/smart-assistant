@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  DEFAULT_ADVISOR_MODEL,
   collabConfigVersionOf,
   collabModeToTeamMode,
   normalizeCollabMode,
@@ -29,4 +30,8 @@ test('collabConfigVersionOf is stable and ignores advisor model outside advisor 
   )
   assert.equal(collabConfigVersionOf({ mode: 'solo', advisorModel: 'gpt-6-astra' }), 'v1:solo:')
   assert.equal(collabConfigVersionOf({ mode: 'team', advisorModel: 'x' }), 'v1:team:')
+})
+
+test('DEFAULT_ADVISOR_MODEL points to gpt-6.2-astra', () => {
+  assert.equal(DEFAULT_ADVISOR_MODEL, 'gpt-6.2-astra')
 })

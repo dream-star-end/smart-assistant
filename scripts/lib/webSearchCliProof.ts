@@ -20,6 +20,7 @@ export async function proveWebSearchCli(root: string, entry = join(root, "packag
     let raw = ""; for await (const chunk of req) raw += chunk;
     requests.push({ path: req.url ?? "", body: raw ? JSON.parse(raw) : null, auth: req.headers.authorization });
     res.setHeader("content-type", "application/json");
+    if (req.url === "/internal/v3/tavily-search") { res.writeHead(503); res.end('{"error":"not configured"}'); return; }
     if (req.url === "/internal/v3/minimax-search") res.end('{"organic":[]}');
     else if (req.url === "/internal/v3/grok-search") res.end(JSON.stringify({ organic: [{ title: "Verified fixture source", url: sourceUrl, snippet: "Fixture content" }] }));
     else { res.writeHead(404); res.end('{}'); }
@@ -49,6 +50,7 @@ export async function proveWebSearchCli(root: string, entry = join(root, "packag
     assert.equal(result.ok, true, "SEARCH_CLI_RESULT_FAILED");
     assert.equal(result.results?.[0]?.url, sourceUrl, "SEARCH_CLI_SOURCE_MISSING");
     assert.deepEqual(requests, [
+      { path: "/internal/v3/tavily-search", body: { q: query }, auth: `Bearer ${identity}` },
       { path: "/internal/v3/minimax-search", body: { q: query }, auth: `Bearer ${identity}` },
       { path: "/internal/v3/grok-search", body: { q: query }, auth: `Bearer ${identity}` },
     ], "SEARCH_CLI_AUTH_OR_FALLBACK_MISSING");

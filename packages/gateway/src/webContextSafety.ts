@@ -1,20 +1,32 @@
+import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { lookup as dnsLookup } from 'node:dns/promises'
-import { Agent as HttpAgent, request as httpRequest } from 'node:http'
+import {
+  Agent as HttpAgent,
+  type ClientRequest,
+  createServer as createHttpServer,
+  type IncomingHttpHeaders,
+  type IncomingMessage,
+  type Server as HttpServer,
+  type ServerResponse,
+  request as httpRequest,
+} from 'node:http'
 import { Agent as HttpsAgent, request as httpsRequest } from 'node:https'
 import * as net from 'node:net'
 import { extname } from 'node:path'
-import { Readable } from 'node:stream'
+import { type Duplex, Readable } from 'node:stream'
 import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib'
 
 export type WebContextKind = 'html' | 'text' | 'pdf' | 'docx' | 'pptx' | 'xlsx'
 
 export interface WebContextFetchOptions {
   timeoutMs?: number
+  deadlineMs?: number
   maxRedirects?: number
   maxEncodedBytes?: number
   maxDecodedBytes?: number
   userAgent?: string
   lookup?: typeof dnsLookup
+  connectSocket?: (opts: { host: string; port: number }) => net.Socket
 }
 
 export interface WebContextFetchResult {
@@ -258,15 +270,18 @@ export async function resolvePublicIp(
   lookup: typeof dnsLookup = dnsLookup,
 ): Promise<{ address: string; family: 4 | 6 }> {
   const host = normalizeHostname(hostname)
-  if (net.isIP(host)) {
-    const address = normalizeIp(host)
+  const bareHost = host.replace(/^\[/, '').replace(/\]$/, '')
+  if (net.isIP(bareHost)) {
+    const address = normalizeIp(bareHost)
     if (!isPublicIpAddress(address)) throw new Error('URL resolves to a non-public IP address')
     return { address, family: net.isIP(address) as 4 | 6 }
   }
   const records = await lookup(host, { all: true, verbatim: false })
   for (const rec of records) {
     const address = normalizeIp(rec.address)
-    if (isPublicIpAddress(address)) return { address, family: rec.family as 4 | 6 }
+    if (isPublicIpAddress(address)) {
+      return { address, family: (net.isIP(address) as 4 | 6) || (rec.family as 4 | 6) }
+    }
   }
   throw new Error('URL host does not resolve to a public IP address')
 }
@@ -480,24 +495,57 @@ export function _buildPinnedLookup(
   }
 }
 
+async function withTimeoutDeadline<T>(
+  promise: Promise<T>,
+  deadlineMs: number,
+  message: string,
+): Promise<T> {
+  const rem = deadlineMs - Date.now()
+  if (rem <= 0) throw new Error(message)
+  let timer: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), rem)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 async function requestOnce(
   url: URL,
   opts: Required<
     Pick<WebContextFetchOptions, 'timeoutMs' | 'maxEncodedBytes' | 'maxDecodedBytes' | 'userAgent'>
-  > & { lookup: typeof dnsLookup },
+  > & {
+    deadlineMs: number
+    lookup: typeof dnsLookup
+    connectSocket?: (opts: { host: string; port: number }) => net.Socket
+  },
 ): Promise<{
   status: number
   headers: Record<string, string>
   body: Buffer
   encodedBytes: number
 }> {
-  const pinned = await resolvePublicIp(url.hostname, opts.lookup)
+  const pinned = await withTimeoutDeadline(
+    resolvePublicIp(url.hostname, opts.lookup),
+    opts.deadlineMs,
+    'request timed out',
+  )
   const expectedHost = normalizeHostname(url.hostname)
   const agentLookup = _buildPinnedLookup(pinned, expectedHost)
+  const port = url.port ? Number(url.port) : url.protocol === 'https:' ? 443 : 80
   const agent: HttpAgent | HttpsAgent =
     url.protocol === 'https:'
       ? new HttpsAgent({ lookup: agentLookup as any })
       : new HttpAgent({ lookup: agentLookup as any })
+  if (opts.connectSocket && url.protocol === 'http:' && agent instanceof HttpAgent) {
+    const customConnect = opts.connectSocket
+    agent.createConnection = () => customConnect({ host: pinned.address, port })
+  }
 
   return await new Promise<{
     status: number
@@ -505,11 +553,17 @@ async function requestOnce(
     body: Buffer
     encodedBytes: number
   }>((resolve, reject) => {
+    const wallRemaining = opts.deadlineMs - Date.now()
+    if (wallRemaining <= 0) {
+      reject(new Error('request timed out'))
+      return
+    }
+    const perHopTimeout = Math.max(1, Math.min(opts.timeoutMs, wallRemaining))
     const req = (url.protocol === 'https:' ? httpsRequest : httpRequest)(
       url,
       {
         agent,
-        timeout: opts.timeoutMs,
+        timeout: perHopTimeout,
         headers: {
           'User-Agent': opts.userAgent,
           Accept: [
@@ -556,10 +610,14 @@ async function requestOnce(
         })
       },
     )
+    const wallTimer = setTimeout(() => {
+      req.destroy(new Error('request timed out'))
+    }, wallRemaining)
+    req.on('close', () => clearTimeout(wallTimer))
     req.on('timeout', () => req.destroy(new Error('request timed out')))
     req.on('error', reject)
     req.end()
-  }).finally(() => agent.destroy())
+  }).finally(() => agent?.destroy())
 }
 
 function redirectTarget(current: URL, headers: Record<string, string>): URL | null {
@@ -579,6 +637,10 @@ export async function fetchWebContextUrl(
     1000,
     120_000,
   )
+  const deadlineMs =
+    typeof options.deadlineMs === 'number' && Number.isFinite(options.deadlineMs)
+      ? options.deadlineMs
+      : Date.now() + timeoutMs
   const maxRedirects = parseBoundedInt(
     String(options.maxRedirects ?? ''),
     DEFAULT_WEB_CONTEXT_MAX_REDIRECTS,
@@ -595,17 +657,25 @@ export async function fetchWebContextUrl(
   )
   const common = {
     timeoutMs,
+    deadlineMs,
     maxEncodedBytes,
     maxDecodedBytes,
     userAgent: options.userAgent ?? DEFAULT_UA,
     lookup: options.lookup ?? dnsLookup,
+    connectSocket: options.connectSocket,
   }
   const redirects: string[] = []
   let encodedBytes = 0
   for (let i = 0; i <= maxRedirects; i++) {
     const remainingEncodedBytes = maxEncodedBytes - encodedBytes
     if (remainingEncodedBytes <= 0) throw new Error('encoded response exceeds size limit')
-    const res = await requestOnce(url, { ...common, maxEncodedBytes: remainingEncodedBytes })
+    const remainingTimeMs = deadlineMs - Date.now()
+    if (remainingTimeMs <= 0) throw new Error('request timed out')
+    const res = await requestOnce(url, {
+      ...common,
+      timeoutMs: Math.min(timeoutMs, remainingTimeMs),
+      maxEncodedBytes: remainingEncodedBytes,
+    })
     encodedBytes += res.encodedBytes
     const status = res.status
     if (status >= 300 && status < 400 && headerValue(res.headers, 'location')) {
@@ -637,4 +707,430 @@ export async function fetchWebContextUrl(
     }
   }
   throw new Error('too many redirects')
+}
+
+export interface WebContextSsrfProxyOptions {
+  lookup?: typeof dnsLookup
+  allowedHttpPorts?: ReadonlySet<number>
+  allowedConnectPorts?: ReadonlySet<number>
+  maxBytesPerRequest?: number
+  socketTimeoutMs?: number
+  connectSocket?: (opts: { host: string; port: number }) => net.Socket
+}
+
+export interface WebContextSsrfProxyStats {
+  allowedCount: number
+  blockedCount: number
+  lastBlockedReason: string | null
+}
+
+export interface WebContextSsrfProxy {
+  host: string
+  port: number
+  serverUrl: string
+  username: string
+  password: string
+  getStats: () => WebContextSsrfProxyStats
+  close: () => Promise<void>
+}
+
+const DEFAULT_ALLOWED_HTTP_PORTS = new Set([80, 443])
+const DEFAULT_ALLOWED_CONNECT_PORTS = new Set([443])
+const PROXY_HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'proxy-connection',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+])
+
+function isAuthorizedProxyAuth(
+  header: string | string[] | undefined,
+  expectedBase64Buf: Buffer,
+): boolean {
+  const raw = Array.isArray(header) ? header[0] : header
+  if (!raw || typeof raw !== 'string') return false
+  const match = /^Basic\s+([A-Za-z0-9+/=]+)$/i.exec(raw.trim())
+  if (!match) return false
+  const provided = Buffer.from(match[1], 'utf8')
+  if (provided.length !== expectedBase64Buf.length) return false
+  return timingSafeEqual(provided, expectedBase64Buf)
+}
+
+function copyHeadersWithoutHopByHop(
+  src: IncomingHttpHeaders,
+  extra?: Record<string, string>,
+): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {}
+  for (const [k, v] of Object.entries(src)) {
+    if (v === undefined) continue
+    const lower = k.toLowerCase()
+    if (PROXY_HOP_BY_HOP_HEADERS.has(lower) || lower === 'host') continue
+    out[lower] = v
+  }
+  if (extra) Object.assign(out, extra)
+  return out
+}
+
+function sendProxyHttpBlocked(res: ServerResponse, reason: string): void {
+  if (res.writableEnded || res.destroyed) return
+  res.writeHead(403, {
+    Connection: 'close',
+    'Content-Type': 'text/plain; charset=utf-8',
+    'X-OpenClaude-SSRF-Blocked': '1',
+    'X-OpenClaude-SSRF-Reason': reason.replace(/[\r\n]+/g, ' ').slice(0, 200),
+  })
+  res.end(`SSRF guard blocked proxy request: ${reason}`)
+}
+
+function sendProxyConnectStatus(socket: Duplex, statusLine: string, extraHeaders = ''): void {
+  if (socket.destroyed) return
+  try {
+    socket.write(`${statusLine}\r\n${extraHeaders}Connection: close\r\n\r\n`)
+  } catch {
+    /* ignore write error on closing socket */
+  }
+  socket.destroy()
+}
+
+function parseConnectTarget(
+  rawAuthority: string | undefined,
+  allowedPorts: ReadonlySet<number>,
+): { hostname: string; port: number } {
+  const raw = (rawAuthority ?? '').trim()
+  if (!raw || /[\s/@?#]/.test(raw) || !/:\d+$/.test(raw)) {
+    throw new Error('CONNECT target must be host:port')
+  }
+  const url = normalizeHttpUrl(`https://${raw}`)
+  if (url.pathname !== '/' || url.search || url.hash) {
+    throw new Error('CONNECT target contains unexpected URL components')
+  }
+  const port = url.port ? Number(url.port) : 443
+  if (!Number.isInteger(port) || port < 1 || port > 65535 || !allowedPorts.has(port)) {
+    throw new Error(`CONNECT port ${port} is not allowed`)
+  }
+  return { hostname: url.hostname, port }
+}
+
+/**
+ * Start a short-lived loopback HTTP + CONNECT proxy bound to 127.0.0.1:0 that
+ * authenticates every request with a per-invocation secret and enforces the
+ * same URL/port/public-IP SSRF guard (with IP pinning to prevent DNS rebinding)
+ * on every navigation, redirect, and subresource request from headless Chromium.
+ */
+export async function startWebContextSsrfProxy(
+  options: WebContextSsrfProxyOptions = {},
+): Promise<WebContextSsrfProxy> {
+  const lookup = options.lookup ?? dnsLookup
+  const allowedHttpPorts = options.allowedHttpPorts ?? DEFAULT_ALLOWED_HTTP_PORTS
+  const allowedConnectPorts = options.allowedConnectPorts ?? DEFAULT_ALLOWED_CONNECT_PORTS
+  const maxBytesPerRequest = Math.min(
+    Math.max(1024, Math.floor(options.maxBytesPerRequest ?? DEFAULT_WEB_CONTEXT_MAX_ENCODED_BYTES)),
+    HARD_WEB_CONTEXT_MAX_ENCODED_BYTES,
+  )
+  const socketTimeoutMs = parseBoundedInt(
+    String(options.socketTimeoutMs ?? ''),
+    DEFAULT_WEB_CONTEXT_TIMEOUT_MS,
+    1_000,
+    120_000,
+  )
+  const connectSocket =
+    options.connectSocket ??
+    (({ host, port }) => {
+      const family = net.isIP(host)
+      return net.connect({ host, port, ...(family ? { family } : {}) })
+    })
+
+  const username = 'ocweb'
+  const password = randomBytes(24).toString('hex')
+  const expectedAuthBuf = Buffer.from(
+    Buffer.from(`${username}:${password}`, 'utf8').toString('base64'),
+    'utf8',
+  )
+
+  let allowedCount = 0
+  let blockedCount = 0
+  let lastBlockedReason: string | null = null
+  let closed = false
+  let closePromise: Promise<void> | null = null
+
+  const activeSockets = new Set<Duplex>()
+  const activeUpstreamReqs = new Set<ClientRequest>()
+
+  const trackSocket = (sock: Duplex) => {
+    activeSockets.add(sock)
+    sock.on('error', () => {})
+    sock.once('close', () => {
+      activeSockets.delete(sock)
+    })
+  }
+
+  const recordBlock = (reason: string) => {
+    blockedCount += 1
+    lastBlockedReason = reason
+  }
+
+  const server: HttpServer = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
+    if (closed) {
+      res.destroy()
+      return
+    }
+    if (!isAuthorizedProxyAuth(req.headers['proxy-authorization'], expectedAuthBuf)) {
+      res.writeHead(407, {
+        'Proxy-Authenticate': 'Basic realm="oc-web-context"',
+        Connection: 'close',
+        'Content-Type': 'text/plain',
+      })
+      res.end('Proxy Authentication Required')
+      return
+    }
+
+    let targetUrl: URL
+    let port: number
+    let pinned: { address: string; family: 4 | 6 }
+    try {
+      targetUrl = normalizeHttpUrl(req.url ?? '')
+      if (targetUrl.protocol !== 'http:') {
+        throw new Error('only http:// targets are valid on plain proxy requests; use CONNECT for https')
+      }
+      port = targetUrl.port ? Number(targetUrl.port) : 80
+      if (!Number.isInteger(port) || port < 1 || port > 65535 || !allowedHttpPorts.has(port)) {
+        throw new Error(`HTTP proxy port ${port} is not allowed`)
+      }
+      pinned = await resolvePublicIp(targetUrl.hostname, lookup)
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err)
+      recordBlock(reason)
+      sendProxyHttpBlocked(res, reason)
+      return
+    }
+
+    if (closed || req.destroyed || res.destroyed) return
+    allowedCount += 1
+
+    const expectedHost = normalizeHostname(targetUrl.hostname)
+    const agent = new HttpAgent({ lookup: _buildPinnedLookup(pinned, expectedHost) as any })
+    if (options.connectSocket) {
+      agent.createConnection = () => {
+        const sock = connectSocket({ host: pinned.address, port })
+        trackSocket(sock)
+        return sock
+      }
+    }
+
+    const cleanupAgent = () => {
+      agent.destroy()
+    }
+
+    const upstreamReq = httpRequest(
+      targetUrl,
+      {
+        method: req.method ?? 'GET',
+        headers: copyHeadersWithoutHopByHop(req.headers, { host: targetUrl.host }),
+        timeout: socketTimeoutMs,
+        agent,
+      },
+      (upstreamRes) => {
+        if (closed) {
+          upstreamRes.destroy()
+          return
+        }
+        let receivedBytes = 0
+        res.writeHead(
+          upstreamRes.statusCode ?? 502,
+          copyHeadersWithoutHopByHop(upstreamRes.headers),
+        )
+        upstreamRes.on('data', (chunk: Buffer) => {
+          receivedBytes += chunk.length
+          if (receivedBytes > maxBytesPerRequest) {
+            upstreamReq.destroy(new Error('proxy response exceeds size limit'))
+            res.destroy()
+            return
+          }
+          if (!res.write(chunk)) upstreamRes.pause()
+        })
+        res.on('drain', () => upstreamRes.resume())
+        upstreamRes.on('end', () => {
+          if (!res.writableEnded) res.end()
+        })
+        upstreamRes.on('error', () => {
+          if (!res.destroyed) res.destroy()
+        })
+      },
+    )
+
+    activeUpstreamReqs.add(upstreamReq)
+    upstreamReq.once('close', () => {
+      activeUpstreamReqs.delete(upstreamReq)
+      cleanupAgent()
+    })
+    upstreamReq.on('timeout', () => upstreamReq.destroy(new Error('proxy upstream timed out')))
+    upstreamReq.on('error', (err) => {
+      if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+        res.writeHead(502, { Connection: 'close', 'Content-Type': 'text/plain; charset=utf-8' })
+        res.end(`Proxy upstream failed: ${err.message}`)
+      } else if (!res.destroyed) {
+        res.destroy()
+      }
+    })
+
+    let sentBytes = 0
+    req.on('data', (chunk: Buffer) => {
+      sentBytes += chunk.length
+      if (sentBytes > maxBytesPerRequest) {
+        upstreamReq.destroy(new Error('proxy request body exceeds size limit'))
+        req.destroy()
+        return
+      }
+      if (!upstreamReq.write(chunk)) req.pause()
+    })
+    upstreamReq.on('drain', () => req.resume())
+    req.on('end', () => upstreamReq.end())
+    req.on('error', () => upstreamReq.destroy())
+    req.on('aborted', () => upstreamReq.destroy())
+    res.on('close', () => {
+      if (!res.writableEnded) upstreamReq.destroy()
+    })
+  })
+
+  server.on('connect', async (req: IncomingMessage, clientSocket: Duplex, head: Buffer) => {
+    trackSocket(clientSocket)
+    if (closed) {
+      clientSocket.destroy()
+      return
+    }
+    if (!isAuthorizedProxyAuth(req.headers['proxy-authorization'], expectedAuthBuf)) {
+      sendProxyConnectStatus(
+        clientSocket,
+        'HTTP/1.1 407 Proxy Authentication Required',
+        'Proxy-Authenticate: Basic realm="oc-web-context"\r\n',
+      )
+      return
+    }
+
+    let port: number
+    let pinned: { address: string; family: 4 | 6 }
+    try {
+      const target = parseConnectTarget(req.url, allowedConnectPorts)
+      port = target.port
+      pinned = await resolvePublicIp(target.hostname, lookup)
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err)
+      recordBlock(reason)
+      sendProxyConnectStatus(clientSocket, 'HTTP/1.1 403 Forbidden')
+      return
+    }
+
+    if (closed || clientSocket.destroyed) {
+      clientSocket.destroy()
+      return
+    }
+    allowedCount += 1
+
+    const upstreamSocket = connectSocket({ host: pinned.address, port })
+    trackSocket(upstreamSocket)
+    ;(clientSocket as net.Socket).setTimeout?.(socketTimeoutMs, () => {
+      clientSocket.destroy()
+      upstreamSocket.destroy()
+    })
+    upstreamSocket.setTimeout(socketTimeoutMs, () => {
+      upstreamSocket.destroy()
+      clientSocket.destroy()
+    })
+
+    let connected = false
+    const closeBoth = () => {
+      if (!clientSocket.destroyed) clientSocket.destroy()
+      if (!upstreamSocket.destroyed) upstreamSocket.destroy()
+    }
+    clientSocket.once('close', closeBoth)
+    upstreamSocket.once('close', closeBoth)
+    clientSocket.once('error', closeBoth)
+    upstreamSocket.once('error', () => {
+      if (!connected && !clientSocket.destroyed) {
+        sendProxyConnectStatus(clientSocket, 'HTTP/1.1 502 Bad Gateway')
+      }
+      closeBoth()
+    })
+
+    upstreamSocket.once('connect', () => {
+      connected = true
+      if (closed || clientSocket.destroyed) {
+        closeBoth()
+        return
+      }
+      try {
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+      } catch {
+        closeBoth()
+        return
+      }
+      let tunnelBytes = head.length
+      if (tunnelBytes > maxBytesPerRequest) {
+        closeBoth()
+        return
+      }
+      if (head.length > 0) upstreamSocket.write(head)
+      clientSocket.on('data', (chunk: Buffer) => {
+        tunnelBytes += chunk.length
+        if (tunnelBytes > maxBytesPerRequest) closeBoth()
+      })
+      upstreamSocket.on('data', (chunk: Buffer) => {
+        tunnelBytes += chunk.length
+        if (tunnelBytes > maxBytesPerRequest) closeBoth()
+      })
+      clientSocket.pipe(upstreamSocket)
+      upstreamSocket.pipe(clientSocket)
+    })
+  })
+
+  await new Promise<void>((resolve, reject) => {
+    const onError = (err: Error) => {
+      server.off('listening', onListening)
+      reject(err)
+    }
+    const onListening = () => {
+      server.off('error', onError)
+      resolve()
+    }
+    server.once('error', onError)
+    server.once('listening', onListening)
+    server.listen(0, '127.0.0.1')
+  })
+
+  const addr = server.address()
+  if (!addr || typeof addr === 'string') {
+    server.close()
+    throw new Error('failed to bind web-context SSRF proxy')
+  }
+
+  return {
+    host: '127.0.0.1',
+    port: addr.port,
+    serverUrl: `http://127.0.0.1:${addr.port}`,
+    username,
+    password,
+    getStats: () => ({ allowedCount, blockedCount, lastBlockedReason }),
+    close: () => {
+      if (closePromise) return closePromise
+      closed = true
+      closePromise = (async () => {
+        for (const req of activeUpstreamReqs) req.destroy()
+        activeUpstreamReqs.clear()
+        for (const sock of activeSockets) sock.destroy()
+        activeSockets.clear()
+        if (typeof server.closeAllConnections === 'function') {
+          server.closeAllConnections()
+        }
+        await new Promise<void>((resolve) => {
+          server.close(() => resolve())
+        })
+      })()
+      return closePromise
+    },
+  }
 }

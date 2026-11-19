@@ -251,16 +251,69 @@ describe('CodexAppServerRunner turn/start params', () => {
     await h.cleanup()
   })
 
-  it('OCV5-434: Codex GPT-6 turns always send explicit standard and never priority', async () => {
-    for (const model of ['gpt-6-luna', 'gpt-6-astra-1m', 'gpt-6.1-sol']) {
+  it('OCV5-434 / OCV5-798: Codex GPT-6 turns map default/fast/ultrafast safely per model', async () => {
+    for (const model of ['gpt-6.2-sol', 'gpt-6.2-sol-1m']) {
       const h = await makeHarness({ model })
       assert.equal((h.runner as any).buildTurnStartParams('hi').serviceTierForTurn, 'default')
-      // No Fast path on Codex: the runner does not take a service tier at all.
-      assert.equal(typeof (h.runner as any).setServiceTier, 'undefined')
+      assert.equal(h.runner.setServiceTier('fast', model), 'unchanged')
+      assert.equal(h.runner.serviceTier, 'fast')
+      assert.equal((h.runner as any).buildTurnStartParams('hi').serviceTierForTurn, 'priority')
+      assert.equal(h.runner.setServiceTier('ultrafast', model), 'unchanged')
+      assert.equal(h.runner.serviceTier, 'ultrafast')
+      assert.equal((h.runner as any).buildTurnStartParams('hi').serviceTierForTurn, 'ultrafast')
+      assert.equal(h.runner.setServiceTier(null, model), 'unchanged')
+      assert.equal((h.runner as any).buildTurnStartParams('hi').serviceTierForTurn, 'default')
       await h.cleanup()
     }
-    const h = await makeHarness({ model: 'gpt-5.6-sol' })
-    assert.equal('serviceTierForTurn' in (h.runner as any).buildTurnStartParams('hi'), false)
+    for (const model of ['gpt-6.2-astra', 'gpt-6.2-astra-1m', 'gpt-6-luna', 'gpt-6-luna-1m']) {
+      const h = await makeHarness({ model })
+      assert.equal(h.runner.setServiceTier('fast', model), 'unchanged')
+      assert.equal(h.runner.serviceTier, 'fast')
+      assert.equal((h.runner as any).buildTurnStartParams('hi').serviceTierForTurn, 'priority')
+      // Ultrafast is gated to 6.2-Sol; unsupported tier normalizes to Standard ('default').
+      assert.equal(h.runner.setServiceTier('ultrafast', model), 'unchanged')
+      assert.equal(h.runner.serviceTier, null)
+      assert.equal((h.runner as any).buildTurnStartParams('hi').serviceTierForTurn, 'default')
+      await h.cleanup()
+    }
+    // Switching from 6.2-sol Ultrafast to 6.2-astra drops stale ultrafast automatically.
+    const sw = await makeHarness({ model: 'gpt-6.2-sol' })
+    sw.runner.setServiceTier('ultrafast', 'gpt-6.2-sol')
+    assert.equal(sw.runner.serviceTier, 'ultrafast')
+    sw.runner.setModel('gpt-6.2-astra')
+    assert.equal(sw.runner.serviceTier, null)
+    assert.equal((sw.runner as any).buildTurnStartParams('hi').serviceTierForTurn, 'default')
+    // Read-only advisor turns always stay explicit Standard even when session tier is elevated.
+    sw.runner.setModel('gpt-6.2-sol')
+    sw.runner.setServiceTier('ultrafast', 'gpt-6.2-sol')
+    assert.equal((sw.runner as any).buildTurnStartParams('hi', 'ultrafast').serviceTierForTurn, 'ultrafast')
+    ;(sw.runner as any).advisorReadOnly = true
+    assert.equal((sw.runner as any).buildTurnStartParams('hi', 'ultrafast').serviceTierForTurn, 'default')
+    await sw.cleanup()
+
+    // Retired local GPT-6 stays explicit default; GPT-5.6 omits serviceTierForTurn.
+    const ret = await makeHarness({ model: 'gpt-6.1-sol' })
+    assert.equal(ret.runner.setServiceTier('fast', 'gpt-6.1-sol'), 'unchanged')
+    assert.equal(ret.runner.serviceTier, null)
+    assert.equal((ret.runner as any).buildTurnStartParams('hi').serviceTierForTurn, 'default')
+    await ret.cleanup()
+
+    const h5 = await makeHarness({ model: 'gpt-5.6-sol' })
+    assert.equal('serviceTierForTurn' in (h5.runner as any).buildTurnStartParams('hi'), false)
+    await h5.cleanup()
+  })
+
+
+  it('OCV5-798: submit() with omitted serviceTier defaults to Standard (never inherits prior _serviceTier)', async () => {
+    const h = await makeHarness({ model: 'gpt-6.2-sol' })
+    h.runner.setServiceTier('ultrafast', 'gpt-6.2-sol')
+    const seenTiers: Array<string | null> = []
+    ;(h.runner as any).runTurn = async (_p: string, _req?: string, _col?: unknown, _ret?: unknown, _tr?: unknown, _ro?: boolean, tier?: string | null) => {
+      seenTiers.push(tier ?? null)
+    }
+    await h.runner.submit('paid turn', 'req-uf', undefined, false, undefined, null, false, 'ultrafast')
+    await h.runner.submit('/compact', 'req-compact')
+    assert.deepEqual(seenTiers, ['ultrafast', null])
     await h.cleanup()
   })
 

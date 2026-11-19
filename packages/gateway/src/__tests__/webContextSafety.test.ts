@@ -1,4 +1,6 @@
 import * as assert from 'node:assert/strict'
+import { createServer, request as httpRequest } from 'node:http'
+import * as net from 'node:net'
 import { describe, it } from 'node:test'
 import {
   _buildPinnedLookup,
@@ -8,6 +10,7 @@ import {
   looksOoxml,
   normalizeHttpUrl,
   sniffWebContextContent,
+  startWebContextSsrfProxy,
 } from '../webContextSafety.js'
 
 function fakeLookup(address: string, family: 4 | 6 = 4): any {
@@ -153,5 +156,190 @@ describe('webContextSafety', () => {
       () => fetchWebContextUrl('http://example.com/', { lookup: fakeLookup('127.0.0.1') }),
       /resolve to a public IP address/,
     )
+  })
+})
+
+function sendRawConnect(
+  proxyPort: number,
+  target: string,
+  authHeader?: string,
+): Promise<{ statusLine: string; raw: string }> {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect({ host: '127.0.0.1', port: proxyPort }, () => {
+      const auth = authHeader ? `Proxy-Authorization: ${authHeader}\r\n` : ''
+      sock.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n${auth}\r\n`)
+    })
+    let buf = ''
+    sock.setTimeout(3_000, () => {
+      sock.destroy()
+      reject(new Error('raw CONNECT timed out'))
+    })
+    sock.on('data', (chunk) => {
+      buf += chunk.toString('utf8')
+      if (buf.includes('\r\n\r\n')) {
+        sock.destroy()
+        resolve({ statusLine: buf.split('\r\n', 1)[0] ?? '', raw: buf })
+      }
+    })
+    sock.on('end', () => resolve({ statusLine: buf.split('\r\n', 1)[0] ?? '', raw: buf }))
+    sock.on('error', reject)
+  })
+}
+
+function sendProxyHttp(
+  proxyPort: number,
+  targetUrl: string,
+  authHeader?: string,
+): Promise<{ status: number; headers: Record<string, string | string[] | undefined>; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      {
+        host: '127.0.0.1',
+        port: proxyPort,
+        method: 'GET',
+        path: targetUrl,
+        headers: authHeader ? { 'Proxy-Authorization': authHeader } : {},
+      },
+      (res) => {
+        const chunks: Buffer[] = []
+        res.on('data', (c: Buffer) => chunks.push(c))
+        res.on('end', () =>
+          resolve({
+            status: res.statusCode ?? 0,
+            headers: res.headers,
+            body: Buffer.concat(chunks).toString('utf8'),
+          }),
+        )
+      },
+    )
+    req.on('error', reject)
+    req.end()
+  })
+}
+
+describe('startWebContextSsrfProxy', () => {
+  it('requires valid per-invocation Proxy-Authorization on both HTTP and CONNECT', async () => {
+    const proxy = await startWebContextSsrfProxy()
+    try {
+      const noAuthHttp = await sendProxyHttp(proxy.port, 'http://example.com/')
+      assert.equal(noAuthHttp.status, 407)
+
+      const wrongAuth = `Basic ${Buffer.from('ocweb:wrong').toString('base64')}`
+      const badAuthHttp = await sendProxyHttp(proxy.port, 'http://example.com/', wrongAuth)
+      assert.equal(badAuthHttp.status, 407)
+
+      const noAuthConnect = await sendRawConnect(proxy.port, 'example.com:443')
+      assert.match(noAuthConnect.statusLine, /^HTTP\/1\.1 407\b/)
+    } finally {
+      await proxy.close()
+    }
+  })
+
+  it('blocks private IPs, localhost, non-allowlisted ports, and DNS rebinding before opening sockets', async () => {
+    const upstreamTargets: Array<{ host: string; port: number }> = []
+    const fixture = createServer((req, res) => {
+      assert.equal(req.headers['proxy-authorization'], undefined)
+      res.writeHead(200, { 'content-type': 'text/plain' })
+      res.end('ok-public')
+    })
+    await new Promise<void>((done) => fixture.listen(0, '127.0.0.1', done))
+    const fixturePort = (fixture.address() as net.AddressInfo).port
+
+    let rebindCount = 0
+    const proxy = await startWebContextSsrfProxy({
+      lookup: (async (host: string) => {
+        if (host === 'rebind.example.test') {
+          rebindCount += 1
+          return [{ address: rebindCount === 1 ? '93.184.216.34' : '127.0.0.1', family: 4 }]
+        }
+        return [{ address: '93.184.216.34', family: 4 }]
+      }) as any,
+      connectSocket: ({ host, port }) => {
+        upstreamTargets.push({ host, port })
+        if (host !== '93.184.216.34') throw new Error(`unexpected non-public connect to ${host}`)
+        return net.connect({ host: '127.0.0.1', port: fixturePort })
+      },
+    })
+
+    const auth = `Basic ${Buffer.from(`${proxy.username}:${proxy.password}`).toString('base64')}`
+    try {
+      for (const blockedUrl of [
+        'http://127.0.0.1/secret',
+        'http://localhost/secret',
+        'http://169.254.169.254/latest/meta-data/',
+        'http://[::ffff:127.0.0.1]/secret',
+        'http://example.com:6379/',
+        'https://example.com/',
+      ]) {
+        const res = await sendProxyHttp(proxy.port, blockedUrl, auth)
+        assert.equal(res.status, 403, `expected 403 for ${blockedUrl}`)
+        assert.equal(res.headers['x-openclaude-ssrf-blocked'], '1')
+      }
+
+      for (const blockedAuthority of [
+        '127.0.0.1:443',
+        'localhost:443',
+        '[::1]:443',
+        '169.254.169.254:443',
+        'example.com:80',
+        'example.com:6379',
+      ]) {
+        const res = await sendRawConnect(proxy.port, blockedAuthority, auth)
+        assert.match(res.statusLine, /^HTTP\/1\.1 403\b/, `expected 403 CONNECT for ${blockedAuthority}`)
+      }
+      assert.equal(upstreamTargets.length, 0)
+
+      // First lookup resolves to public IP 93.184.216.34 and succeeds (headers sanitized)
+      const first = await sendProxyHttp(proxy.port, 'http://rebind.example.test/hello', auth)
+      assert.equal(first.status, 200)
+      assert.equal(first.body, 'ok-public')
+      assert.deepEqual(upstreamTargets, [{ host: '93.184.216.34', port: 80 }])
+
+      // Second lookup flips to 127.0.0.1 (DNS rebinding) -> blocked before any socket connect
+      const second = await sendProxyHttp(proxy.port, 'http://rebind.example.test/hello', auth)
+      assert.equal(second.status, 403)
+      assert.equal(upstreamTargets.length, 1)
+
+      const stats = proxy.getStats()
+      assert.equal(stats.allowedCount, 1)
+      assert.equal(stats.blockedCount, 13)
+    } finally {
+      await proxy.close()
+      await new Promise<void>((done) => fixture.close(() => done()))
+    }
+
+    await assert.rejects(() => sendProxyHttp(proxy.port, 'http://example.com/', auth))
+  })
+
+  it('enforces shared wall-clock deadlineMs across slow DNS/redirects in fetchWebContextUrl', async () => {
+    const server = createServer((req, res) => {
+      if (req.url === '/r1') {
+        setTimeout(() => {
+          res.writeHead(302, { Location: 'http://example.test/r2' })
+          res.end()
+        }, 400)
+        return
+      }
+      setTimeout(() => {
+        res.writeHead(200, { 'content-type': 'text/plain' })
+        res.end('late-body')
+      }, 400)
+    })
+    await new Promise<void>((done) => server.listen(0, '127.0.0.1', done))
+    const serverPort = (server.address() as net.AddressInfo).port
+    try {
+      await assert.rejects(
+        () =>
+          fetchWebContextUrl('http://example.test/r1', {
+            timeoutMs: 1_500,
+            deadlineMs: Date.now() + 550,
+            lookup: fakeLookup('93.184.216.34'),
+            connectSocket: () => net.connect({ host: '127.0.0.1', port: serverPort }),
+          }),
+        /timed out/,
+      )
+    } finally {
+      await new Promise<void>((done) => server.close(() => done()))
+    }
   })
 })

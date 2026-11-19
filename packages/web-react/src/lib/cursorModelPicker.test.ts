@@ -274,6 +274,24 @@ describe('context family picker', () => {
     expect(spec).toBeDefined()
     expect(resolveContextPickerSelection(luna, spec!, 'gpt-6.1-sol-1m')).toBe('gpt-6-luna-1m')
   })
+
+  it('collapses GPT-6.2 Astra/Sol +1m twins, defaults standard, and keeps them expanded', () => {
+    const models62: PublicModel[] = [
+      { id: 'gpt-6.2-astra', display_name: 'GPT-6.2-Astra' },
+      { id: 'gpt-6.2-astra-1m', display_name: 'GPT-6.2-Astra' },
+      { id: 'gpt-6.2-sol', display_name: 'GPT-6.2-Sol' },
+      { id: 'gpt-6.2-sol-1m', display_name: 'GPT-6.2-Sol' },
+    ]
+    const rows = modelPickerRows(models62)
+    expect(rows.map(rowKey)).toEqual(['gpt-6.2-astra', 'gpt-6.2-sol'])
+    const astraSpec = CONTEXT_TIER_FAMILIES.find((f) => f.family === 'gpt-6.2-astra')!
+    const solSpec = CONTEXT_TIER_FAMILIES.find((f) => f.family === 'gpt-6.2-sol')!
+    expect(resolveContextPickerSelection(models62.slice(0, 2), astraSpec, 'glm-5.3')).toBe('gpt-6.2-astra')
+    expect(resolveContextPickerSelection(models62.slice(2), solSpec, 'gpt-6.2-astra-1m')).toBe('gpt-6.2-sol-1m')
+    const { collapsed, visible } = partitionCollapsedRows(rows, undefined)
+    expect(collapsed).toEqual([])
+    expect(visible.map(rowKey)).toEqual(['gpt-6.2-astra', 'gpt-6.2-sol'])
+  })
 })
 
 describe('collapsed GPT family group (2026-09-05)', () => {

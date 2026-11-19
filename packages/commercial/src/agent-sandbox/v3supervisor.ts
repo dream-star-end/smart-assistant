@@ -714,6 +714,8 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "ths",
   // OCV5-577 跟进：对话写经验分享草稿（SKILL.md + references/ui-blog.md）。
   "blog-writer",
+  // OCV5-791：持久化静态站点发布（oc-site）与外部 Supabase 全栈开发规范。
+  "site-publishing",
 ] as const;
 
 /**

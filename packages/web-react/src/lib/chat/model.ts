@@ -23,6 +23,7 @@ import type {
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import type { MessageUsageDelegate, ReviewVerdict } from "@openclaude/protocol/teamCards";
 import type { InboundMessage, MediaRef } from "./frames";
+import { isQuickAskSessionId, QUICK_ASK_TITLE_PREFIX } from "../quickAskSession";
 
 /** 用户消息状态机（派生展示，不持久化 'replied'，§9）。*/
 export type UserMsgStatus = "sending" | "sent" | "queued" | "read" | "replied" | "error";
@@ -881,7 +882,12 @@ export function addMessage(
   if (role === "user") {
     const userCount = sess.messages.filter((m) => m.role === "user").length;
     if (userCount === 1) {
-      sess.title = (text || "").slice(0, 50) + ((text || "").length > 50 ? "…" : "");
+      const keepQuickAskTitle =
+        isQuickAskSessionId(sess.id) && sess.title.trim().startsWith(QUICK_ASK_TITLE_PREFIX.trim());
+      if (!keepQuickAskTitle) {
+        const display = extra?.text ?? text ?? "";
+        sess.title = display.slice(0, 50) + (display.length > 50 ? "…" : "");
+      }
     }
   }
   return msg;

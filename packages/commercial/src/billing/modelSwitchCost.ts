@@ -7,7 +7,8 @@ import {
   estimateModelHistoryUtf8Bytes,
   DEFAULT_CODEX_ENGINE_MODEL,
   cursorModelSupportsContextTier,
-  supportsFastServiceTier,
+  codexServiceTierBillingMultiplier,
+  resolveEffectiveTurnServiceTier,
   type ModelSwitchCostRequest,
   type ModelSwitchCostQuote,
   type ModelSwitchUnitPrice,
@@ -42,6 +43,7 @@ export interface ModelSwitchCostDeps {
     uid: string,
     model: string,
     contextTier?: '300k' | '1m',
+    opts?: { allowLegacyTeamLeaderFallback?: boolean },
   ) => Promise<SwitchCostTarget>
   sourceEngine?: (model: string) => string | null
   balance?: (uid: string) => Promise<bigint>
@@ -168,6 +170,10 @@ export class ModelSwitchCostService {
           await getAgentCostMultiplier(this.deps.pool, agent),
         ),
       }
+    if (engine === 'codex') {
+      const tierMul = codexServiceTierBillingMultiplier(p.model_id, tier)
+      if (tierMul) p = { ...p, multiplier: composeMultiplier(p.multiplier, tierMul) }
+    }
     if (engine === 'ccb')
       p = applyFastServiceTierPricing(
         { model: p.model_id, service_tier: tier === 'fast' ? 'priority' : undefined },
@@ -204,13 +210,26 @@ export class ModelSwitchCostService {
     input: ModelSwitchCostRequest,
   ): Promise<{ quote: ModelSwitchCostQuote; grant?: Grant }> {
     const requested = effectiveSwitchCostModel(input)
+    const target = await this.deps.resolveTarget(
+      uid,
+      requested,
+      cursorModelSupportsContextTier(requested) ? input.contextTier : undefined,
+      { allowLegacyTeamLeaderFallback: input.agentId === 'main' && Boolean(input.teamMode) },
+    )
+    const canonical = target.pricing.model_id
     input = {
       ...input,
-      contextTier: cursorModelSupportsContextTier(requested) ? input.contextTier : undefined,
-      serviceTier: supportsFastServiceTier(requested) ? input.serviceTier : undefined,
+      contextTier: cursorModelSupportsContextTier(canonical) ? input.contextTier : undefined,
+      serviceTier:
+        resolveEffectiveTurnServiceTier({
+          model: canonical,
+          serviceTier: input.serviceTier,
+          agentId: input.agentId,
+          collabMode: input.collabMode,
+          advisorModel: input.advisorModel,
+          text: input.text,
+        }) ?? undefined,
     }
-    const target = await this.deps.resolveTarget(uid, requested, input.contextTier)
-    const canonical = target.pricing.model_id
     const ctx = await (this.deps.readContext ?? readSwitchContext)(
       this.deps.pool,
       uid,
@@ -349,7 +368,9 @@ export class ModelSwitchCostService {
     return { quote: { ...quote, quoteToken: this.sign(grant) }, grant }
   }
   async validateTarget(uid: string, input: ModelSwitchCostRequest): Promise<void> {
-    await this.deps.resolveTarget(uid, effectiveSwitchCostModel(input), input.contextTier)
+    await this.deps.resolveTarget(uid, effectiveSwitchCostModel(input), input.contextTier, {
+      allowLegacyTeamLeaderFallback: input.agentId === 'main' && Boolean(input.teamMode),
+    })
   }
   async quote(
     uid: string,

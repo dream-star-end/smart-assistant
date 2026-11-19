@@ -1999,6 +1999,51 @@ describe("MessageList Manus 过程披露", () => {
       expect(document.querySelectorAll(".oc-live-status-shine")).toHaveLength(1);
     });
 
+    test("本轮停在未决或提交中的用户问答卡时，过程外壳不误挂「等待模型响应」，回答完结后恢复", () => {
+      const mid = row("m", "assistant", "要不要我动手？", { _clientMessageId: "u", ts: T0 - 4_000 });
+      const ask = row("ask", "permission", "用户问答", {
+        _clientMessageId: "u",
+        toolName: "AskUserQuestion",
+        requestId: "req-wait-suppress",
+        _resolved: false,
+        inputJson: { questions: [{ question: "按哪个范围推进？", options: [{ label: "只修 P0" }] }] },
+        ts: T0 - 4_000,
+      });
+      const activity = { startedAt: T0 - 60_000, lastFrameAt: T0 - 4_000, agentName: "助手" };
+      const view = renderList([user, done, mid, ask], { sending: true, turnActivity: activity });
+
+      expect(screen.getByTestId("permission-card").closest("[data-testid=process-disclosure]")).toBeNull();
+      expect(screen.queryByTestId("process-live-tail")).not.toBeInTheDocument();
+      expect(screen.queryByText("等待模型响应")).not.toBeInTheDocument();
+
+      view.rerender(
+        <MessageList
+          processDisclosure
+          messages={[user, done, mid, { ...ask, _controlPending: true }]}
+          sending
+          sessionId="session-a"
+          cb={{}}
+          onRespondPermission={() => {}}
+          turnActivity={activity}
+        />,
+      );
+      expect(screen.queryByTestId("process-live-tail")).not.toBeInTheDocument();
+      expect(screen.queryByText("等待模型响应")).not.toBeInTheDocument();
+
+      view.rerender(
+        <MessageList
+          processDisclosure
+          messages={[user, done, mid, { ...ask, _resolved: true, _controlPending: false, _behavior: "allow" }]}
+          sending
+          sessionId="session-a"
+          cb={{}}
+          onRespondPermission={() => {}}
+          turnActivity={activity}
+        />,
+      );
+      expect(screen.getByTestId("process-live-tail")).toHaveTextContent("等待模型响应");
+    });
+
     test("工具完成后等待模型响应从结果计时，心跳不重置；新工具和终态清除等待", () => {
       const tool = { ...done, completedAt: T0 - 463_029, ts: T0 - 465_266 };
       const activity = { startedAt: T0 - 600_000, lastFrameAt: T0, agentName: "助手" };

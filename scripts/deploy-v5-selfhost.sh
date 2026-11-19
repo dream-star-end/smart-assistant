@@ -95,9 +95,9 @@ REDIS_URL="redis://127.0.0.1:6379/3"
 # agy134 (OCV5-415) = patch of the v5-cli-cc2280-codex01592-grok1013-zcode381-slim image that adds the official
 # Antigravity CLI 1.3.4 (same RUN block as Dockerfile.openclaude-runtime, sha512-pinned);
 # the previous tag stays for rollback.
-# cc2325/codex01690/grok1077/zcode3153/agy158 (OCV5-769) = Claude Code 2.1.325, Codex 0.169.0,
+# cc2325/codex01700/grok1077/zcode3153/agy158 (OCV5-798) = Claude Code 2.1.325, Codex 0.170.0,
 # Grok 1.0.77, ZCode 3.15.3 (CLI 0.16.9), Antigravity 1.5.8 and Cursor Agent 2026.10.16-e3cb207; previous agy150 tag stays for rollback.
-RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-cc2325-codex01690-grok1077-zcode3153-agy158-slim"
+RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-cc2325-codex01700-grok1077-zcode3153-agy158-slim"
 SECRETS_ENV="/etc/openclaude/secrets.env"
 PERSONAL_UNIT="openclaude.service"
 PERSONAL_PORT="18789"
@@ -1124,7 +1124,7 @@ ensure_node_modules() {
     echo "  [dry-run] npm ci --no-audit --no-fund (worktree 无 node_modules,gateway/migrate 都需要)"
     return 0
   fi
-  npm ci --no-audit --no-fund || die "npm ci 失败。补救: 检查网络/npm registry 后重跑。"
+  ONNXRUNTIME_NODE_INSTALL_CUDA=skip npm ci --no-audit --no-fund || die "npm ci 失败。补救: 检查网络/npm registry 后重跑。"
   log "  ✓ npm ci 完成"
 }
 

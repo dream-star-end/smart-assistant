@@ -192,4 +192,12 @@ describe('ccb-baseline skills ↔ manifest', () => {
     assert.match(dockerfile, /openssh-client/)
     assert.match(dockerfile, /\/usr\/bin\/ssh-keygen/)
   })
+
+  it('ships site-publishing skill calling oc-site and covering Supabase RLS safety', () => {
+    assert.ok((V3_CCB_BASELINE_SKILL_NAMES as readonly string[]).includes('site-publishing'))
+    const body = readFileSync(join(skillsDir, 'site-publishing', 'SKILL.md'), 'utf8')
+    assert.match(body, /oc-site publish/)
+    assert.match(body, /service_role/)
+    assert.match(body, /ROW LEVEL SECURITY/i)
+  })
 })

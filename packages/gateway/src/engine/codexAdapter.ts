@@ -1,4 +1,4 @@
-import type { PromptPrivacyPolicy } from '@openclaude/protocol'
+import type { PromptPrivacyPolicy, ServiceTier } from '@openclaude/protocol'
 /**
  * CodexAdapter — codex(gpt-5.5,app-server 形态)底座的 EngineAdapter 实现(M1a)。
  *
@@ -34,12 +34,13 @@ import { EventEmitter } from 'node:events'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type {
-  CallTokenUsageSnapshot,
-  CodexExecutionBackend,
-  GoalStateSnapshot,
-  JobTerminal,
-  TurnTokenUsageSnapshot,
+import {
+  normalizeServiceTierForModel,
+  type CallTokenUsageSnapshot,
+  type CodexExecutionBackend,
+  type GoalStateSnapshot,
+  type JobTerminal,
+  type TurnTokenUsageSnapshot,
 } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { IntelligentUiApplied } from '../promptSlots.js'
@@ -558,12 +559,16 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
         : {}),
       creditGuard: null as unknown as CreditBudgetGuard,
     }
+    const turnServiceTier = params.readOnly
+      ? null
+      : normalizeServiceTierForModel(this.kernel.model, params.serviceTier)
     ctx.creditGuard = new CreditBudgetGuard({
       budgetFen: params.creditBudgetFen,
       modelId: () => this.kernel.model,
       agentId: this.agentId,
-      // Codex settlement composes agent_cost_overrides (codexFinalizer).
+      // Codex settlement composes agent_cost_overrides and active turn speed tier.
       composeAgentMultiplier: true,
+      codexServiceTier: () => turnServiceTier,
       isLive: () => this._activeTurn === ctx && !ctx.parser.finalized,
       onExhausted: () => {
         // Same wire as a user Stop: turn/interrupt. The kernel then emits an
@@ -626,6 +631,7 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
         params.automaticRetryState,
         params.traceId ?? null,
         params.readOnly === true,
+        turnServiceTier,
       )
     } catch (err) {
       submitted = Promise.reject(err)
@@ -702,6 +708,15 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
 
   get effortLevel(): string | undefined {
     return this.kernel.effortLevel
+  }
+
+  /** OCV5-798: Codex speed tier is sent per turn via turn/start; never restarts app-server. */
+  setServiceTier(tier: ServiceTier | null, model: string | undefined): 'unchanged' {
+    return this.kernel.setServiceTier(tier, model)
+  }
+
+  get serviceTier(): ServiceTier | null {
+    return this.kernel.serviceTier
   }
 
   /** Intelligent UI(OCV5-361):spawn 时系统提示是否含组件协议(sessionManager 判断开关切换是否需重启)。 */

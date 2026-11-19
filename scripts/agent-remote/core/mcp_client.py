@@ -30,12 +30,12 @@ from core.canonical import (  # noqa: E402
 )
 from core.contract import load_driver, need, validate_decode_batch  # noqa: E402
 
-MAX_FRAME = 8 * 1024 * 1024
-MAX_REPLY = 163840
-MAX_RESULT = 131072
-MAX_ARGUMENTS = 98304
-MAX_BODY = 196608
-MAX_CATALOG = 1024 * 1024
+MAX_FRAME = 16 * 1024 * 1024
+MAX_REPLY = 6 * 1024 * 1024
+MAX_RESULT = 4 * 1024 * 1024
+MAX_ARGUMENTS = 4 * 1024 * 1024
+MAX_BODY = 6 * 1024 * 1024
+MAX_CATALOG = 2 * 1024 * 1024
 TOOL_TIMEOUT = 720
 SERVER = "ocbridge"
 IDENTITY_KEYS = (

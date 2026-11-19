@@ -122,3 +122,49 @@ test('createRemoteLaneRuntime accepts antigravity binding shape alongside ccb an
   assert.equal(binding.authorityEngine, 'antigravity')
   assert.equal(typeof createRemoteLaneRuntime, 'function')
 })
+
+test('RemoteEngineAdapter allows delegated turns (delegationDepth > 0) while preserving hermetic/advisor locks', () => {
+  const baseOpts = {
+    agentId: 'main',
+    agentBaseDir: '/tmp',
+    sessionKey: 'agent:main:webchat:dm:agy_unit_test_1',
+    model: 'antigravity-gemini-4-carbon-remote',
+    config: { auth: {}, gateway: { port: 18790, accessToken: 'test-token' }, mcpServers: [] } as any,
+    executionBackend: {
+      kind: REMOTE_DRIVER_BACKEND,
+      version: REMOTE_DRIVER_PROTOCOL_VERSION,
+      sessionKey: 'agent:main:webchat:dm:agy_unit_test_1',
+      operationId: '11111111-1111-4111-8111-111111111111',
+      driverId: 'antigravity',
+      engineId: 'antigravity',
+      authorityEngine: 'antigravity' as const,
+      driverVersion: '1.0.0',
+      generation: '1',
+      profileId: '22222222-2222-4222-8222-222222222222',
+      authEpoch: 'epoch-agy-1',
+    },
+  }
+  const laneOpts = {
+    binding: sampleAntigravityBinding(),
+    keyring: new Map([['v4-test', new Uint8Array(32).fill(1)]]),
+    socketPath: '/tmp/nonexistent-agy-relay.sock',
+    toolContextFactory: async () => ({
+      profile: {} as any,
+      env: { PATH: '/usr/bin:/bin' },
+      platformPrompt: '',
+      cleanup: () => {},
+    }),
+  }
+
+  const delegated = new RemoteEngineAdapter({ ...baseOpts, delegationDepth: 1 }, laneOpts)
+  assert.equal(delegated.engineId, 'antigravity')
+
+  assert.throws(
+    () => new RemoteEngineAdapter({ ...baseOpts, advisorExecutionLock: { consultModel: 'claude-opus-5-5' } as any }, laneOpts),
+    /REMOTE_ADAPTER_PROFILE_UNSUPPORTED/,
+  )
+  assert.throws(
+    () => new RemoteEngineAdapter({ ...baseOpts, hermeticNoTools: true }, laneOpts),
+    /REMOTE_ADAPTER_PROFILE_UNSUPPORTED/,
+  )
+})

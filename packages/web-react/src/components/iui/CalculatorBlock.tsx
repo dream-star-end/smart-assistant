@@ -2,9 +2,10 @@
  * Intelligent UI 计算器:改任一输入,全部输出立即按公式重算(本机计算,不经模型)。
  * 「公式」展开逐项列出公式原文与代入值 —— 让用户能核对,而不是只看一个漂亮的数字。
  */
-import { ChevronDown, Minus, Plus, TrendingDown, TrendingUp } from "lucide-react";
+import { ChevronDown, Minus, Plus, Send, TrendingDown, TrendingUp } from "lucide-react";
 import { type CSSProperties, useId, useMemo, useState } from "react";
 import { cn } from "../../lib/utils";
+import { useChatInteraction } from "../tool/context";
 import { CartesianChart, useWidth } from "./ChartBlock";
 import { computeOutputs, substitute } from "./formula";
 import type { CalcInput, CalcOutput, CalculatorSpec, ChartSpec } from "./schema";
@@ -68,6 +69,10 @@ function SliderField({ input, value, onChange, disabled }: { input: CalcInput; v
   const lo = input.min ?? 0;
   const hi = input.max ?? 100;
   const pct = hi > lo ? Math.max(0, Math.min(100, ((value - lo) / (hi - lo)) * 100)) : 0;
+  const step = input.step ?? (Number.isInteger(lo) && Number.isInteger(hi) ? 1 : (hi - lo) / 20);
+  const midRaw = lo + (hi - lo) / 2;
+  const mid = step > 0 ? clamp(Number((Math.round((midRaw - lo) / step) * step + lo).toFixed(Math.min(10, decimalsOf(step) + 2))), input) : midRaw;
+  const presets = hi > lo ? Array.from(new Set([lo, mid, hi])) : [];
   return (
     <div className="oc-iui-field">
       <div className="flex items-baseline justify-between gap-2">
@@ -88,6 +93,23 @@ function SliderField({ input, value, onChange, disabled }: { input: CalcInput; v
         disabled={disabled}
         onChange={(e) => onChange(Number(e.target.value))}
       />
+      {presets.length >= 2 && (
+        // biome-ignore lint/a11y/useSemanticElements: div avoids fieldset default UA border and min-content layout
+        <div className="oc-iui-calc-presets" role="group" aria-label={`${input.label}快捷挡位`}>
+          {presets.map((p) => (
+            <button
+              key={p}
+              type="button"
+              disabled={disabled}
+              className={cn("oc-iui-preset-btn", value === p && "is-active")}
+              aria-label={`设${input.label}为 ${withUnit(formatNumber(p), input.unit)}`}
+              onClick={() => onChange(p)}
+            >
+              {formatNumber(p)}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -226,7 +248,20 @@ function PrimaryValue({ output, value }: { output: CalcOutput; value: number | n
   return <>{withUnit(formatNumber(shown, output.format, output.decimals ?? (output.format === "number" && Math.abs(value ?? 0) >= 100 ? 0 : undefined)), output.unit)}</>;
 }
 
-export function CalculatorBlock({ spec, notes, streaming, nested }: { spec: CalculatorSpec; notes: string[]; streaming: boolean; nested?: boolean }) {
+export function CalculatorBlock({
+  spec,
+  notes,
+  streaming,
+  readOnly,
+  nested,
+}: {
+  spec: CalculatorSpec;
+  notes: string[];
+  streaming: boolean;
+  readOnly?: boolean;
+  nested?: boolean;
+}) {
+  const { sendUserText, busy } = useChatInteraction();
   const [values, setValues] = useState<Record<string, number>>({});
   const [showFormulas, setShowFormulas] = useState(false);
   const env = useMemo(() => {
@@ -276,58 +311,92 @@ export function CalculatorBlock({ spec, notes, streaming, nested }: { spec: Calc
         ) : undefined
       }
     >
-      <div className="oc-iui-calc-outputs" aria-live="polite">
-        {primary && (
-          <div className="oc-iui-calc-primary">
-            <div className="oc-iui-calc-primary-label">{primary.label}</div>
-            <div className={cn("oc-iui-calc-primary-value", primary.tone && `is-${primary.tone}`)}>
-              <PrimaryValue output={primary} value={results[primary.id]?.value ?? null} />
-            </div>
-            {toned.map((o) => {
-              const Icon = o.tone === "down" ? TrendingDown : TrendingUp;
-              return (
-                <div key={o.id} className={cn("oc-iui-calc-delta", `is-${o.tone}`)}>
-                  <Icon size={15} aria-hidden />
-                  <span className="tabular-nums">{show(o.id)}</span>
-                  <span>{o.label}</span>
-                </div>
-              );
-            })}
-            {results[primary.id]?.error && <div className="oc-iui-error">无法计算:{results[primary.id]!.error}</div>}
-          </div>
-        )}
-        {breakdownVals && <Breakdown outs={breakdownOuts} vals={breakdownVals} />}
-        {sweep && <SweepChart sweep={sweep} />}
-        {(others.length > 0 || (!primary && toned.length > 0)) && (
-          <dl className="oc-iui-calc-list">
-            {(primary ? others : [...toned, ...others]).map((o) => (
-              <div key={o.id}>
-                <dt>{o.label}</dt>
-                <dd className={cn(o.tone && `is-${o.tone}`)}>
-                  {show(o.id)}
-                  {results[o.id]?.error && <span className="oc-iui-error">{results[o.id]!.error}</span>}
-                </dd>
+      <div className="oc-iui-calc-workbench">
+        <div className="oc-iui-calc-outputs" aria-live="polite">
+          {primary && (
+            <div className="oc-iui-calc-primary">
+              <div className="oc-iui-calc-primary-label">{primary.label}</div>
+              <div className={cn("oc-iui-calc-primary-value", primary.tone && `is-${primary.tone}`)}>
+                <PrimaryValue output={primary} value={results[primary.id]?.value ?? null} />
               </div>
-            ))}
-          </dl>
-        )}
-      </div>
+              {toned.map((o) => {
+                const Icon = o.tone === "down" ? TrendingDown : TrendingUp;
+                return (
+                  <div key={o.id} className={cn("oc-iui-calc-delta", `is-${o.tone}`)}>
+                    <Icon size={15} aria-hidden />
+                    <span className="tabular-nums">{show(o.id)}</span>
+                    <span>{o.label}</span>
+                  </div>
+                );
+              })}
+              {results[primary.id]?.error && <div className="oc-iui-error">无法计算:{results[primary.id]!.error}</div>}
+            </div>
+          )}
+          {breakdownVals && <Breakdown outs={breakdownOuts} vals={breakdownVals} />}
+          {sweep && <SweepChart sweep={sweep} />}
+          {(others.length > 0 || (!primary && toned.length > 0)) && (
+            <dl className="oc-iui-calc-list">
+              {(primary ? others : [...toned, ...others]).map((o) => (
+                <div key={o.id}>
+                  <dt>{o.label}</dt>
+                  <dd className={cn(o.tone && `is-${o.tone}`)}>
+                    {show(o.id)}
+                    {results[o.id]?.error && <span className="oc-iui-error">{results[o.id]!.error}</span>}
+                  </dd>
+                </div>
+              ))}
+            </dl>
+          )}
+        </div>
 
-      <div className="oc-iui-calc-inputs">
-        {spec.inputs.map((i) => {
-          const props = { input: i, value: env[i.id]!, onChange: (v: number) => set(i.id, v), disabled: streaming };
-          if (i.kind === "slider") return <SliderField key={i.id} {...props} />;
-          if (i.kind === "select") return <SelectField key={i.id} {...props} />;
-          if (i.kind === "toggle") return <ToggleField key={i.id} {...props} />;
-          return <NumberField key={i.id} {...props} />;
-        })}
+        <div className="oc-iui-calc-inputs">
+          {spec.inputs.map((i) => {
+            const props = { input: i, value: env[i.id]!, onChange: (v: number) => set(i.id, v), disabled: streaming };
+            if (i.kind === "slider") return <SliderField key={i.id} {...props} />;
+            if (i.kind === "select") return <SelectField key={i.id} {...props} />;
+            if (i.kind === "toggle") return <ToggleField key={i.id} {...props} />;
+            return <NumberField key={i.id} {...props} />;
+          })}
+        </div>
       </div>
 
       <div className="oc-iui-calc-basis">
-        <button type="button" className="oc-iui-disclosure" aria-expanded={showFormulas} onClick={() => setShowFormulas((v) => !v)}>
-          <ChevronDown size={14} aria-hidden className={cn("transition-transform", showFormulas && "rotate-180")} />
-          公式与假设
-        </button>
+        <div className="oc-iui-calc-basis-head">
+          <button type="button" className="oc-iui-disclosure" aria-expanded={showFormulas} onClick={() => setShowFormulas((v) => !v)}>
+            <ChevronDown size={14} aria-hidden className={cn("transition-transform", showFormulas && "rotate-180")} />
+            公式与假设
+          </button>
+          {!streaming && !readOnly && !!sendUserText && (
+            <button
+              type="button"
+              className="oc-iui-text-btn"
+              disabled={!!busy}
+              onClick={() => {
+                const summary = spec.inputs
+                  .map((inp) => {
+                    const val = env[inp.id]!;
+                    const shown =
+                      inp.kind === "select"
+                        ? (inp.options.find((o) => o.value === val)?.label ?? formatNumber(val))
+                        : inp.kind === "toggle"
+                          ? val ? "是" : "否"
+                          : withUnit(formatNumber(val), inp.unit);
+                    return `${inp.label}=${shown}`;
+                  })
+                  .join("，");
+                const outVal = primary ? results[primary.id]?.value : undefined;
+                const outPart =
+                  primary && outVal != null
+                    ? `（${primary.label}：${withUnit(formatNumber(outVal, primary.format, primary.decimals), primary.unit)}）`
+                    : "";
+                sendUserText(`基于当前${spec.title ?? "测算"}参数继续分析：${summary}${outPart}`);
+              }}
+            >
+              <Send size={13} aria-hidden />
+              带此参数追问
+            </button>
+          )}
+        </div>
         {showFormulas && (
           <div className="oc-iui-formulas">
             <ul>

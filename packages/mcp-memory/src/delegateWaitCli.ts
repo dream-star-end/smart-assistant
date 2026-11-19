@@ -25,6 +25,8 @@ export const MAX_DELEGATE_WAIT_POLL_MS = 55_000
 export const DEFAULT_DELEGATE_CLI_FOREGROUND_BUDGET_MS = 50 * 60_000
 export const MIN_DELEGATE_CLI_FOREGROUND_BUDGET_MS = 60_000
 export const MAX_DELEGATE_CLI_FOREGROUND_BUDGET_MS = 55 * 60_000
+export const OC_BASH_DELEGATE_REPLY_MARGIN_MS = 5_000
+export const ANTIGRAVITY_DEFAULT_OC_BASH_BUDGET_MS = 55_000
 
 function normalizeMs(
   raw: string | undefined,
@@ -47,16 +49,31 @@ export function resolveDelegateWaitPollMs(env: NodeJS.ProcessEnv = process.env):
   )
 }
 
-/** One foreground Bash segment. Default 50m, always below Cursor's ~60m handoff. */
+/** One foreground Bash segment. Default 50m (Cursor), capped inside Antigravity oc_bash timeout windows (OCV5-772). */
 export function resolveDelegateCliForegroundBudgetMs(
   env: NodeJS.ProcessEnv = process.env,
 ): number {
-  return normalizeMs(
+  const baseMs = normalizeMs(
     env.OPENCLAUDE_DELEGATE_CLI_FOREGROUND_BUDGET_MS,
     DEFAULT_DELEGATE_CLI_FOREGROUND_BUDGET_MS,
     MIN_DELEGATE_CLI_FOREGROUND_BUDGET_MS,
     MAX_DELEGATE_CLI_FOREGROUND_BUDGET_MS,
   )
+  const ocBashTimeoutMs = Number.parseInt(String(env.OC_BASH_TIMEOUT_MS ?? ''), 10)
+  if (Number.isFinite(ocBashTimeoutMs) && ocBashTimeoutMs > 0) {
+    const safeOcBashMs =
+      ocBashTimeoutMs > OC_BASH_DELEGATE_REPLY_MARGIN_MS + MIN_DELEGATE_WAIT_POLL_MS
+        ? ocBashTimeoutMs - OC_BASH_DELEGATE_REPLY_MARGIN_MS
+        : Math.max(MIN_DELEGATE_WAIT_POLL_MS, Math.floor(ocBashTimeoutMs * 0.8))
+    return Math.min(baseMs, safeOcBashMs)
+  }
+  if (
+    env.OPENCLAUDE_ENGINE === 'antigravity' &&
+    !String(env.OPENCLAUDE_DELEGATE_CLI_FOREGROUND_BUDGET_MS ?? '').trim()
+  ) {
+    return Math.min(baseMs, ANTIGRAVITY_DEFAULT_OC_BASH_BUDGET_MS)
+  }
+  return baseMs
 }
 
 export type DelegateWaitOnce = (

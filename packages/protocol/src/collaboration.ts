@@ -7,7 +7,7 @@
 export const COLLABORATION_MODES = ['solo', 'advisor', 'team'] as const
 export type CollaborationMode = (typeof COLLABORATION_MODES)[number]
 
-export const DEFAULT_ADVISOR_MODEL = 'gpt-6-astra'
+export const DEFAULT_ADVISOR_MODEL = 'gpt-6.2-astra'
 export const ADVISOR_AGENT_ID = 'advisor'
 export const HIDDEN_REVIEWER_AGENT_ID = 'hidden-reviewer'
 

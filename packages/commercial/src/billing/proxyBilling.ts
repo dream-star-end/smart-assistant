@@ -33,7 +33,8 @@
  */
 
 import { readPoolOutcome, type PoolOutcome } from "../account-pool/policy/outcome.js";
-import { isBoxApiModel } from "@openclaude/protocol";
+import { isBoxApiModel, isServiceTier, type ServiceTier } from "@openclaude/protocol";
+import { parseBillingPricing } from "./persistedBillingPricing.js";
 import { unadmittedToolRolloverSql } from "./boxToolRolloverIdentity.js";
 import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
@@ -267,6 +268,9 @@ export async function readJournalForTakeover(
   dispatchId: string | null;
   attemptNo: number | null;
   model: string | null;
+  serviceTier?: ServiceTier | null | "invalid";
+  billingPricing?: ModelPricing | null;
+  hasBillingPricing?: boolean;
 } | null> {
   const row = (
     await pool.query<{
@@ -274,7 +278,7 @@ export async function readJournalForTakeover(
       user_id: string;
       dispatch_id: string | null;
       attempt_no: number | null;
-      ctx: { model?: unknown } | null;
+      ctx: Record<string, unknown> | null;
     }>(
       `SELECT state, user_id, dispatch_id, attempt_no, ctx
          FROM request_finalize_journal WHERE request_id = $1`,
@@ -282,12 +286,21 @@ export async function readJournalForTakeover(
     )
   ).rows[0];
   if (!row) return null;
+  const ctx = row.ctx && typeof row.ctx === "object" && !Array.isArray(row.ctx) ? row.ctx : null;
+  const model = typeof ctx?.model === "string" ? ctx.model : null;
+  const rawTier = ctx?.serviceTier;
+  const serviceTier: ServiceTier | null | "invalid" =
+    rawTier === undefined || rawTier === null ? null : isServiceTier(rawTier) ? rawTier : "invalid";
+  const rawBp = ctx?.billingPricing;
   return {
     state: row.state,
     userId: row.user_id,
     dispatchId: row.dispatch_id,
     attemptNo: row.attempt_no,
-    model: typeof row.ctx?.model === "string" ? row.ctx.model : null,
+    model,
+    serviceTier,
+    hasBillingPricing: rawBp !== undefined,
+    billingPricing: model !== null && rawBp !== undefined ? parseBillingPricing(rawBp, model) : null,
   };
 }
 

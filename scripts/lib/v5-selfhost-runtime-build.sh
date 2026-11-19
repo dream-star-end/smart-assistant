@@ -43,7 +43,7 @@ build_runtime_release() {
   rm -rf "$raw"
   write_flavor_manifest "$staging" selfhost "$sha" \
     || { rm -rf "$staging"; die "写 runtime flavor.manifest.json 失败"; }
-  BUILT_RUNTIME_RELEASE="$(oc_hotcfg_finalize_release "$staging" "$image_id" "$sha" "${prev:-}" "$caps")" \
+  BUILT_RUNTIME_RELEASE="$(OC_HOTCFG_ONNXRUNTIME_INSTALL_CUDA=skip oc_hotcfg_finalize_release "$staging" "$image_id" "$sha" "${prev:-}" "$caps")" \
     || { rm -rf "$staging"; die "release finalize 失败(npm ci / ccb bun build / MANIFEST)"; }
   BUILT_RUNTIME_RELEASE="$(printf '%s' "$BUILT_RUNTIME_RELEASE" | tr -d '[:space:]')"
   [[ "$BUILT_RUNTIME_RELEASE" == "$OC_HOTCFG_RELEASES_ROOT"/rel-* ]] \

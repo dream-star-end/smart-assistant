@@ -1974,15 +1974,15 @@ public="$(curl -fsS --max-time 5 -H 'Host: claudeai.chat' http://127.0.0.1/healt
 jq -e '.ok == true and .channel == "v5"' <<<"$public" >/dev/null || { echo 'FATAL: public route health is not v5/ok' >&2; exit 1; }
 
 target_image_id="$(docker image inspect --format '{{.Id}}' "$target_image")"
-image_commit="$(docker image inspect --format '{{ index .Config.Labels "oc.runtime.source_commit" }}' "$target_image")"
-image_codex="$(docker image inspect --format '{{ index .Config.Labels "oc.runtime.codex_version" }}' "$target_image")"
-image_grok="$(docker image inspect --format '{{ index .Config.Labels "oc.runtime.include_grok" }}' "$target_image")"
+image_commit="$(docker image inspect --format '{{ index .Config.Labels "oc.runtime.source_commit" }}' "$target_image_id")"
+image_codex="$(docker image inspect --format '{{ index .Config.Labels "oc.runtime.codex_version" }}' "$target_image_id")"
+image_grok="$(docker image inspect --format '{{ index .Config.Labels "oc.runtime.include_grok" }}' "$target_image_id")"
 [[ "$image_commit" =~ ^[0-9a-f]{7,40}$ && "$target_commit" == "$image_commit"* ]] || { echo "FATAL: image source_commit is not a prefix of target commit" >&2; exit 1; }
-[[ -n "$image_codex" ]] || { echo 'FATAL: image missing codex version label' >&2; exit 1; }
+[[ "$image_codex" == "0.170.0" ]] || { echo "FATAL: image codex label mismatch (expected 0.170.0, got ${image_codex:-<none>})" >&2; exit 1; }
 [[ "$image_grok" == 1 ]] || { echo 'FATAL: image missing official Grok runtime (oc.runtime.include_grok=1)' >&2; exit 1; }
-actual_codex="$(docker run --rm --entrypoint codex "$target_image" --version)"
-[[ "$actual_codex" == "codex-cli $image_codex" ]] || { echo 'FATAL: image codex label/binary mismatch' >&2; exit 1; }
-actual_grok="$(docker run --rm --entrypoint grok-native "$target_image" --version)"
+actual_codex="$(docker run --rm --entrypoint codex "$target_image_id" --version)" || { echo 'FATAL: image codex --version failed' >&2; exit 1; }
+[[ "$actual_codex" == "codex-cli 0.170.0" ]] || { echo "FATAL: image codex binary mismatch (expected codex-cli 0.170.0, got ${actual_codex:-<none>})" >&2; exit 1; }
+actual_grok="$(docker run --rm --entrypoint grok-native "$target_image_id" --version)" || { echo 'FATAL: image grok-native --version failed' >&2; exit 1; }
 [[ "$actual_grok" == grok\ 1.0.77\ * ]] || { echo 'FATAL: image Grok binary mismatch (expected grok 1.0.77 (...))' >&2; exit 1; }
 
 dburl="$(grep '^DATABASE_URL=' "$env_file" | tail -n 1 | cut -d= -f2-)"
@@ -5778,6 +5778,7 @@ export OC_HOTCFG_PLATFORM_ROOT='$OC_HOTCFG_PLATFORM_ROOT'
 export OC_HOTCFG_RELEASES_ROOT='$OC_HOTCFG_RELEASES_ROOT'
 export OC_HOTCFG_ENV_FILE='$V5_ENV'
 export OC_HOTCFG_HISTORY='$OC_HOTCFG_HISTORY'
+export OC_HOTCFG_ONNXRUNTIME_INSTALL_CUDA=skip
 . '$HOTCFG_REMOTE_LIB'
 $fn "\$@"
 RLIB
@@ -5817,25 +5818,25 @@ hotcfg_history_present() {
 assert_target_runtime_image_ready() {
   [[ -n "$TARGET_RUNTIME_IMAGE" ]] || return 0
   local -a pinned=()
-  local inspect actual_id source_commit embed_source include_grok actual_grok
+  local inspect actual_id source_commit embed_source include_grok codex_version actual_codex actual_grok
   mapfile -t pinned < <(grep -E '^OC_RUNTIME_IMAGE=' "$REPO_ROOT/deploy/v5/commercial-v5.env.overrides" || true)
   [[ ${#pinned[@]} == 1 && "${pinned[0]#OC_RUNTIME_IMAGE=}" == "$TARGET_RUNTIME_IMAGE" ]] || {
     echo "✗ repo overrides 必须唯一且精确钉住 --runtime-image（先合并 durable config）" >&2
     return 1
   }
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] 核验 target runtime image ID/slim label/source ancestor，随后以该 ID 构建 release 并由 joint saga 原子激活"
+    echo "  [dry-run] 核验 target runtime image ID/slim label/source ancestor/codex 0.170.0/grok 1.0.77，随后以该 ID 构建 release 并由 joint saga 原子激活"
     return 0
   fi
   hotcfg_release_axis_on || {
     echo "✗ --runtime-image 要求 runtime release hotcfg 轴已开启（或本次显式 --enable-runtime-release）" >&2
     return 1
   }
-  inspect="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}|{{ index .Config.Labels \"oc.runtime.source_commit\" }}|{{ index .Config.Labels \"oc.runtime.embed_source\" }}|{{ index .Config.Labels \"oc.runtime.include_grok\" }}' '$TARGET_RUNTIME_IMAGE'" 2>/dev/null)" || {
+  inspect="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}|{{ index .Config.Labels \"oc.runtime.source_commit\" }}|{{ index .Config.Labels \"oc.runtime.embed_source\" }}|{{ index .Config.Labels \"oc.runtime.include_grok\" }}|{{ index .Config.Labels \"oc.runtime.codex_version\" }}' '$TARGET_RUNTIME_IMAGE'" 2>/dev/null)" || {
     echo "✗ 目标 runtime image 不存在或 inspect 失败:$TARGET_RUNTIME_IMAGE" >&2
     return 1
   }
-  IFS='|' read -r actual_id source_commit embed_source include_grok <<<"$inspect"
+  IFS='|' read -r actual_id source_commit embed_source include_grok codex_version <<<"$inspect"
   [[ "$actual_id" == "$TARGET_RUNTIME_IMAGE_ID" ]] || {
     echo "✗ 目标 runtime image immutable ID 漂移(expected=$TARGET_RUNTIME_IMAGE_ID actual=${actual_id:-<none>})" >&2
     return 1
@@ -5844,11 +5845,26 @@ assert_target_runtime_image_ready() {
     echo "✗ --runtime-image 在线切换只接受 slim image(oc.runtime.embed_source=0)" >&2
     return 1
   }
+  [[ "$codex_version" == "0.170.0" ]] || {
+    echo "✗ target runtime image codex label=${codex_version:-<none>},expected=0.170.0" >&2
+    return 1
+  }
   [[ "$include_grok" == 1 ]] || {
     echo "✗ target runtime image 缺 official Grok binary(oc.runtime.include_grok=1)" >&2
     return 1
   }
-  actual_grok="$(ssh "$KL_HOST" "docker run --rm --entrypoint grok-native '$TARGET_RUNTIME_IMAGE' --version")" || return 1
+  actual_codex="$(ssh "$KL_HOST" "docker run --rm --entrypoint codex '$TARGET_RUNTIME_IMAGE_ID' --version")" || {
+    echo "✗ target runtime image codex --version failed" >&2
+    return 1
+  }
+  [[ "$actual_codex" == "codex-cli 0.170.0" ]] || {
+    echo "✗ target runtime image codex binary=${actual_codex:-<none>},expected='codex-cli 0.170.0'" >&2
+    return 1
+  }
+  actual_grok="$(ssh "$KL_HOST" "docker run --rm --entrypoint grok-native '$TARGET_RUNTIME_IMAGE_ID' --version")" || {
+    echo "✗ target runtime image grok-native --version failed" >&2
+    return 1
+  }
   [[ "$actual_grok" == grok\ 1.0.77\ * ]] || {
     echo "✗ target runtime image Grok binary=$actual_grok,expected='grok 1.0.77 (...)'" >&2
     return 1
@@ -5859,7 +5875,7 @@ assert_target_runtime_image_ready() {
     echo "✗ 目标 runtime image source_commit 不是 canonical HEAD 的可验证 ancestor:${source_commit:-<none>}" >&2
     return 1
   }
-  echo "  ✓ target runtime image 已钉死(ref=$TARGET_RUNTIME_IMAGE id=$TARGET_RUNTIME_IMAGE_ID source=$source_commit slim=1 grok=$actual_grok)"
+  echo "  ✓ target runtime image 已钉死(ref=$TARGET_RUNTIME_IMAGE id=$TARGET_RUNTIME_IMAGE_ID source=$source_commit slim=1 codex=$actual_codex grok=$actual_grok)"
 }
 
 # ── 1. build_platform_bundle:从**钉死的** BUILT_RELEASE 内 platform-runtime/ 组装 → 落 bundles/<rev> ──
@@ -8550,24 +8566,29 @@ activate_staged_inner() {
     }
     runtime_image="$(ssh "$KL_HOST" "grep '^OC_RUNTIME_IMAGE=' '$V5_ENV' | tail -n 1 | cut -d= -f2-")"
     [[ -n "$runtime_image" ]] || { echo "✗ OC_RUNTIME_IMAGE missing" >&2; exit 1; }
-    ssh "$KL_HOST" "docker image inspect '$runtime_image' >/dev/null"
-    image_commit="$(ssh "$KL_HOST" "docker image inspect --format '{{ index .Config.Labels \"oc.runtime.source_commit\" }}' '$runtime_image'")"
-    image_codex_version="$(ssh "$KL_HOST" "docker image inspect --format '{{ index .Config.Labels \"oc.runtime.codex_version\" }}' '$runtime_image'")"
-    image_include_grok="$(ssh "$KL_HOST" "docker image inspect --format '{{ index .Config.Labels \"oc.runtime.include_grok\" }}' '$runtime_image'")"
+    runtime_image_id="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}' '$runtime_image'")" || exit 1
+    [[ -n "$runtime_image_id" ]] || { echo "✗ runtime image ID missing for $runtime_image" >&2; exit 1; }
+    image_commit="$(ssh "$KL_HOST" "docker image inspect --format '{{ index .Config.Labels \"oc.runtime.source_commit\" }}' '$runtime_image_id'")"
+    image_codex_version="$(ssh "$KL_HOST" "docker image inspect --format '{{ index .Config.Labels \"oc.runtime.codex_version\" }}' '$runtime_image_id'")"
+    image_include_grok="$(ssh "$KL_HOST" "docker image inspect --format '{{ index .Config.Labels \"oc.runtime.include_grok\" }}' '$runtime_image_id'")"
     [[ "$image_commit" =~ ^[0-9a-f]{7,40}$ && "$expected_full_commit" == "$image_commit"* ]] || {
       echo "✗ runtime image source_commit=$image_commit is not target commit $expected_full_commit 的前缀" >&2; exit 1;
     }
-    [[ "$image_codex_version" == "0.169.0" ]] || {
-      echo "✗ runtime image codex label=$image_codex_version,expected=0.169.0" >&2; exit 1;
+    [[ "$image_codex_version" == "0.170.0" ]] || {
+      echo "✗ runtime image codex label=$image_codex_version,expected=0.170.0" >&2; exit 1;
     }
     [[ "$image_include_grok" == 1 ]] || {
       echo "✗ runtime image 缺 official Grok binary label(oc.runtime.include_grok=1)" >&2; exit 1;
     }
-    actual_codex_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint codex '$runtime_image' --version")"
-    [[ "$actual_codex_version" == "codex-cli 0.169.0" ]] || {
-      echo "✗ runtime image codex binary=$actual_codex_version,expected='codex-cli 0.169.0'" >&2; exit 1;
+    actual_codex_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint codex '$runtime_image_id' --version")" || {
+      echo "✗ runtime image codex --version failed" >&2; exit 1;
     }
-    actual_grok_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint grok-native '$runtime_image' --version")"
+    [[ "$actual_codex_version" == "codex-cli 0.170.0" ]] || {
+      echo "✗ runtime image codex binary=$actual_codex_version,expected='codex-cli 0.170.0'" >&2; exit 1;
+    }
+    actual_grok_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint grok-native '$runtime_image_id' --version")" || {
+      echo "✗ runtime image grok-native --version failed" >&2; exit 1;
+    }
     [[ "$actual_grok_version" == grok\ 1.0.77\ * ]] || {
       echo "✗ runtime image Grok binary=$actual_grok_version,expected='grok 1.0.77 (...)'" >&2; exit 1;
     }

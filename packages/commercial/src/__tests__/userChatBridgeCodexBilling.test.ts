@@ -46,6 +46,7 @@ import { signAccess } from "../auth/jwt.js";
 import {
   createUserChatBridge,
   BRIDGE_WS_PATH,
+  CONTAINER_ATTEST_FRAME_TYPE,
   PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE,
   PROMPT_QUEUE_DISPATCH_CANCEL_TYPE,
   PROMPT_QUEUE_DISPATCH_REQUEST_TYPE,
@@ -57,6 +58,9 @@ import {
   type CodexBindingHandle,
 } from "../ws/userChatBridge.js";
 import { PricingCache } from "../billing/pricing.js";
+import { composeCodexTurnPricing } from "../billing/codexServiceTierPricing.js";
+import { settleDurableCodexBilling } from "../billing/durableCodexBilling.js";
+import { ModelSwitchCostService } from "../billing/modelSwitchCost.js";
 import type { ModelPricing } from "../billing/pricing.js";
 import { InMemoryPreCheckRedis } from "../billing/preCheck.js";
 import { _resetAgentMultiplierCacheForTests } from "../billing/agentMultiplier.js";
@@ -68,7 +72,7 @@ import { setPoolOverride, resetPool } from "../db/index.js";
 import { AuthoritySigner } from "../ws/authoritySigner.js";
 import { AuthorityKeyCensus } from "../ws/authorityKeyCensus.js";
 import { ModelAuthorityConsumer, buildContainerAttestFrame } from "@openclaude/gateway";
-import { DEFAULT_CODEX_ENGINE_MODEL, DURABLE_TURN_DISPATCH_CAPABILITY, MODEL_AUTHORITY_FIELD } from "@openclaude/protocol";
+import { CODEX_SPEED_TIERS_CAPABILITY, DEFAULT_CODEX_ENGINE_MODEL, DURABLE_TURN_DISPATCH_CAPABILITY, MODEL_AUTHORITY_FIELD } from "@openclaude/protocol";
 import {
   ModelCatalogSnapshot,
   type ModelCatalogCache,
@@ -135,6 +139,8 @@ const GROK_PRICING: ModelPricing = {
 interface FakeJournalRow {
   state: "inflight" | "finalizing" | "committed" | "aborted";
   user_id: string;
+  dispatch_id?: string | null;
+  attempt_no?: number | null;
   ctx: Record<string, unknown>;
   precheck_credits: string;
   error_msg: string | null;
@@ -147,6 +153,7 @@ interface FakePoolControl {
   /** P0 跨桥修复 — 有状态 journal 表(INSERT/UPDATE CAS/SELECT 都作用于此),
    *  测试可直接读断言终态,或预置 synthetic 行(aborted 撞帧 / 串桥用例)。 */
   journalRows: Map<string, FakeJournalRow>;
+  ledgerAmounts: string[];
   /** Existing pending/component attribution visible after a committed settle. */
   attributionCredits: Map<string, string>;
 }
@@ -157,6 +164,7 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
   const periodCredits = opts.periodCredits ?? null; // null = 无 active 订阅(默认)
   const journalRows = new Map<string, FakeJournalRow>();
   const attributionCredits = new Map<string, string>();
+  const ledgerAmounts: string[] = [];
 
   function record(sql: string, params: unknown[] | undefined): void {
     queries.push({ sql, params });
@@ -206,7 +214,52 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
         return { rows: [], rowCount: 1 };
       }
       if (trimmed.startsWith("INSERT INTO credit_ledger")) {
+        const amt = (params ?? [])[1];
+        if (amt !== undefined) ledgerAmounts.push(String(amt));
         return { rows: [{ id: "200" }], rowCount: 1 };
+      }
+      if (trimmed.startsWith("UPDATE turn_dispatches")) {
+        const dId = String((params ?? [])[0] ?? "");
+        const row = {
+          trace_id: null,
+          dispatch_id: dId,
+          user_id: "11",
+          session_id: "p-takeover-6x",
+          client_message_id: "cmid-take-6x",
+          agent_id: "main",
+          model: "gpt-6.2-sol",
+          request_hash: "0".repeat(64),
+          billing_request_id: "c".repeat(32),
+          attempt_no: 1,
+          status: "terminal",
+          outcome: String((params ?? [])[1] ?? "executed_error"),
+          failure_code: (params ?? [])[2] ?? null,
+          conflict_reason: null,
+          resolution: null,
+          resolved_at: null,
+          client_notified: false,
+          owner_id: "owner-1",
+          lease_epoch: 1,
+          lease_until: null,
+          anchor_seq: null,
+          admitted_at: new Date(),
+          accepted_at: null,
+          terminal_at: new Date(),
+          last_attempt_at: new Date(),
+        };
+        return { rows: [row], rowCount: 1 };
+      }
+      if (trimmed.startsWith("UPDATE request_finalize_journal") && trimmed.includes("WHERE dispatch_id=$1")) {
+        const dispatchId = String((params ?? [])[0] ?? "");
+        const aborted: Array<{ user_id: string; request_id: string }> = [];
+        for (const [reqId, row] of journalRows) {
+          if (row.dispatch_id === dispatchId && row.state === "inflight") {
+            row.state = "aborted";
+            row.error_msg = String((params ?? [])[1] ?? "");
+            aborted.push({ user_id: row.user_id, request_id: reqId });
+          }
+        }
+        return { rows: aborted, rowCount: aborted.length };
       }
       if (trimmed.startsWith("UPDATE usage_records SET ledger_id")) {
         return { rows: [], rowCount: 1 };
@@ -251,18 +304,55 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
       // INSERT inflight / UPDATE CAS(finalizing|committed|aborted)/ SELECT 回查
       // 都作用于 journalRows,测试能断言权威终态(而不只是 SQL 形状)。
       if (trimmed.startsWith("INSERT INTO request_finalize_journal")) {
-        const [reqId, userId, , ctxJson, precheck] = params as [string, string, unknown, string, string];
+        const [reqId, userId, , ctxJson, precheck, dispatchId, attemptNo] = params as [
+          string, string, unknown, string, string, string | null | undefined, number | null | undefined,
+        ];
         const inserted = !journalRows.has(reqId);
         if (inserted) { // ON CONFLICT DO NOTHING
           journalRows.set(reqId, {
             state: "inflight",
             user_id: userId,
+            dispatch_id: dispatchId ?? null,
+            attempt_no: attemptNo ?? null,
             ctx: JSON.parse(ctxJson) as Record<string, unknown>,
             precheck_credits: precheck,
             error_msg: null,
           });
         }
         return { rows: [], rowCount: inserted ? 1 : 0 };
+      }
+      if (trimmed.startsWith("UPDATE turn_dispatches") || trimmed.startsWith("UPDATE turn_traces")) {
+        return {
+          rows: [{
+            trace_id: null, dispatch_id: String((params ?? [])[0] ?? ""), user_id: "11",
+            session_id: "p-takeover-6x", client_message_id: "cmid-take-6x", agent_id: "main",
+            model: "gpt-6.2-sol", request_hash: "0".repeat(64), billing_request_id: "c".repeat(32),
+            attempt_no: 1, status: "manual_reconcile", outcome: null, failure_code: null,
+            conflict_reason: null, resolution: null, resolved_at: null, client_notified: false,
+            owner_id: "owner-1", lease_epoch: 1, lease_until: null, anchor_seq: null,
+            admitted_at: new Date(), accepted_at: null, terminal_at: null, last_attempt_at: new Date(),
+          }],
+          rowCount: 1,
+        };
+      }
+      if (trimmed.includes("UPDATE product_friction_events")) {
+        return { rows: [], rowCount: 0 };
+      }
+      if (trimmed.startsWith("SELECT state, user_id, dispatch_id, attempt_no, ctx")) {
+        const reqId = (params as unknown[])[0] as string;
+        const row = journalRows.get(reqId);
+        return row === undefined
+          ? { rows: [], rowCount: 0 }
+          : {
+              rows: [{
+                state: row.state,
+                user_id: row.user_id,
+                dispatch_id: row.dispatch_id ?? null,
+                attempt_no: row.attempt_no ?? null,
+                ctx: row.ctx,
+              }],
+              rowCount: 1,
+            };
       }
       if (trimmed.startsWith("UPDATE request_finalize_journal")) {
         const values = params as unknown[];
@@ -363,7 +453,7 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
     async end(): Promise<void> { /* noop for tests */ },
   };
 
-  return { pool: fakePool as Pool, queries, journalRows, attributionCredits };
+  return { pool: fakePool as Pool, queries, journalRows, attributionCredits, ledgerAmounts };
 }
 
 // ---------- 模型执行权威夹具(签发边界 epoch 重读 / journal 补偿用) ----------
@@ -372,7 +462,7 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
 const AUTH_EPOCH = 42n;
 
 /** 只含本套件用的 codex 模型(gpt-5.6-sol),engine=codex → 走 codex 计费编排。 */
-function fakeAuthorityCatalog(cc5Alias = false): ModelCatalogCache {
+function fakeAuthorityCatalog(cc5Alias = false, solAlias = false): ModelCatalogCache {
   const entries: ModelCatalogEntry[] = [
     {
       entryId: 1,
@@ -408,14 +498,21 @@ function fakeAuthorityCatalog(cc5Alias = false): ModelCatalogCache {
       },
     ],
   ]);
+  const aliasEntries: Array<[string, number]> = [];
   if (cc5Alias) {
     entries.push({ ...entries[0]!, entryId: 99, modelId: 'cc5-remote-t1555u',
       engine: 'cursor', providerId: 'cursor', upstreamModelId: 'sonnet' });
     pricing.set('cc5-remote-t1555u', { ...pricing.get('gpt-5.6-sol')!, modelId: 'cc5-remote-t1555u' });
+    aliasEntries.push(['cursor-auto', 99]);
+  }
+  if (solAlias) {
+    entries.push({ ...entries[0]!, entryId: 100, modelId: 'gpt-6.2-sol' });
+    pricing.set('gpt-6.2-sol', { ...pricing.get('gpt-5.6-sol')!, modelId: 'gpt-6.2-sol' });
+    aliasEntries.push(['sol-alias', 100]);
   }
   const snapshot = new ModelCatalogSnapshot({
     entries,
-    aliases: new Map(cc5Alias ? [['cursor-auto', 99]] : []),
+    aliases: new Map(aliasEntries),
     pricing,
     securityEpoch: AUTH_EPOCH,
   });
@@ -498,9 +595,13 @@ async function startRig(opts: {
    */
   modelAuthority?: boolean;
   cc5Alias?: boolean;
+  solAlias?: boolean;
+  codexSpeedTiers?: boolean;
   cursorEligible?: boolean;
   admitUserTurn?: UserChatBridgeDeps['admitUserTurn'];
   promptQueueEnabled?: boolean;
+  poolCtrl?: FakePoolControl;
+  modelSwitchCost?: UserChatBridgeDeps['modelSwitchCost'];
 } = {}): Promise<BillingRig> {
   // 模型执行权威装配(flag 关 → 全部 undefined,rig 行为与本批次之前完全一致)
   const authoritySigner = opts.modelAuthority === true ? AuthoritySigner.createEphemeral() : null;
@@ -524,20 +625,31 @@ async function startRig(opts: {
       ws.send(
         JSON.stringify((() => {
           const frame = buildContainerAttestFrame(consumer, consumer.newConnection(), 999);
-          return opts.admitUserTurn ? { ...frame,
-            capabilities: [...frame.capabilities, DURABLE_TURN_DISPATCH_CAPABILITY] } : frame;
+          const extra = [
+            ...(opts.admitUserTurn ? [DURABLE_TURN_DISPATCH_CAPABILITY] : []),
+            ...(opts.codexSpeedTiers ? [CODEX_SPEED_TIERS_CAPABILITY] : []),
+          ];
+          return extra.length ? { ...frame, capabilities: [...frame.capabilities, ...extra] } : frame;
         })()),
       );
+    } else if (opts.codexSpeedTiers !== undefined) {
+      ws.send(JSON.stringify({
+        type: CONTAINER_ATTEST_FRAME_TYPE,
+        capabilities: [
+          ...(opts.admitUserTurn ? [DURABLE_TURN_DISPATCH_CAPABILITY] : []),
+          ...(opts.codexSpeedTiers ? [CODEX_SPEED_TIERS_CAPABILITY] : []),
+        ],
+      }));
     }
   });
 
   // billing deps
-  const poolCtrl = makeFakePool({ userBalance: opts.userBalance, periodCredits: opts.periodCredits, cursorEligible: opts.cursorEligible });
+  const poolCtrl = opts.poolCtrl ?? makeFakePool({ userBalance: opts.userBalance, periodCredits: opts.periodCredits, cursorEligible: opts.cursorEligible });
   // getSpendableBalance() 走 commercial/db getPool() — 注入同一只 fakePool。
   setPoolOverride(poolCtrl.pool);
   const preCheckRedis = new InMemoryPreCheckRedis();
   const pricing = new PricingCache();
-  pricing._setForTests([PRICING]);
+  pricing._setForTests([PRICING, { ...PRICING, model_id: "gpt-6.2-sol", display_name: "GPT 6.2 Sol" }]);
 
   const bindingState = {
     acquireCalls: 0,
@@ -589,12 +701,13 @@ async function startRig(opts: {
     maxPerUser: opts.maxPerUser,
     promptQueueEnabled: opts.promptQueueEnabled,
     admitUserTurn: opts.admitUserTurn,
+    modelSwitchCost: opts.modelSwitchCost,
     selfHostId: opts.cursorEligible ? '00000000-0000-4000-8000-000000000001' : undefined,
     ...(authoritySigner !== null
       ? {
           modelAuthority: {
             signer: authoritySigner,
-            catalog: fakeAuthorityCatalog(opts.cc5Alias),
+            catalog: fakeAuthorityCatalog(opts.cc5Alias, opts.solAlias),
             census: new AuthorityKeyCensus(),
             // **签发边界**的 epoch 直读(MAJOR-2)。默认 = 快照 epoch(无安全写);
             // 用例把它改掉 = turn 途中 admin 禁用/撤销/改价 → 签发前必须拒 + 补偿。
@@ -3271,6 +3384,120 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
     }
   });
 
+  test("Phase A rollout: ungranted user teamMode/main falls back to gpt-6-astra while admin uses 6.2 and ungranted-both rejects", async () => {
+    const LEGACY_ASTRA_PRICING: ModelPricing = {
+      ...PRICING,
+      model_id: "gpt-6-astra",
+      display_name: "GPT-6-Astra",
+      visibility: "public",
+    };
+    // 1. Ordinary ungranted user: gpt-6-astra public+enabled, gpt-6.2-astra admin+enabled -> falls back to gpt-6-astra
+    const rigUser = await startRig({
+      userBalance: 1_000_000n,
+      loadAllowedModelChecker: async () => (modelId: string) => modelId === "gpt-6-astra",
+      loadAgentModelResolver: async () => (agentId: string) =>
+        agentId === "main" ? "deepseek-v4-flash" : agentId === "codex" ? DEFAULT_CODEX_ENGINE_MODEL : null,
+    });
+    rigUser.pricing._setForTests([PRICING, LEGACY_ASTRA_PRICING, { ...TEAM_LEADER_PRICING, visibility: "admin" }]);
+    try {
+      const containerOpenP = waitNextContainerSocket(rigUser);
+      const ws = openClient(rigUser.gatewayPort, await makeJwt("31"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        peer: { id: "phase-a-user-team", kind: "dm" },
+        clientMessageId: "phase-a-user-msg",
+        agentId: "main",
+        model: "glm-5.2",
+        teamMode: true,
+        content: "hi",
+      }));
+
+      const frame = await waitContainerNextFrame(containerWs);
+      const parsed = JSON.parse(frame.data) as Record<string, unknown>;
+      assert.equal(parsed.agentId, "main");
+      assert.equal(parsed.model, "gpt-6-astra");
+      assert.equal(parsed.effortLevel, "high");
+      const journal = rigUser.poolCtrl.journalRows.get(parsed.requestId as string);
+      assert.ok(journal, "fallback GPT leader must open inflight journal");
+      assert.equal(journal.ctx.model, "gpt-6-astra");
+      ws.close();
+    } finally {
+      await stopRig(rigUser);
+    }
+
+    // 2. Admin / Phase B user allowed for both -> prefers DEFAULT_CODEX_ENGINE_MODEL (gpt-6.2-astra)
+    const rigAdmin = await startRig({
+      userBalance: 1_000_000n,
+      loadAllowedModelChecker: async () => (modelId: string) =>
+        modelId === "gpt-6-astra" || modelId === DEFAULT_CODEX_ENGINE_MODEL,
+      loadAgentModelResolver: async () => (agentId: string) =>
+        agentId === "main" ? "deepseek-v4-flash" : agentId === "codex" ? DEFAULT_CODEX_ENGINE_MODEL : null,
+    });
+    rigAdmin.pricing._setForTests([PRICING, LEGACY_ASTRA_PRICING, { ...TEAM_LEADER_PRICING, visibility: "admin" }]);
+    try {
+      const containerOpenP = waitNextContainerSocket(rigAdmin);
+      const ws = openClient(rigAdmin.gatewayPort, await makeJwt("1"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        peer: { id: "phase-a-admin-team", kind: "dm" },
+        clientMessageId: "phase-a-admin-msg",
+        agentId: "main",
+        model: "glm-5.2",
+        teamMode: true,
+        content: "hi",
+      }));
+
+      const frame = await waitContainerNextFrame(containerWs);
+      const parsed = JSON.parse(frame.data) as Record<string, unknown>;
+      assert.equal(parsed.agentId, "main");
+      assert.equal(parsed.model, DEFAULT_CODEX_ENGINE_MODEL);
+      const journal = rigAdmin.poolCtrl.journalRows.get(parsed.requestId as string);
+      assert.equal(journal?.ctx.model, DEFAULT_CODEX_ENGINE_MODEL);
+      ws.close();
+    } finally {
+      await stopRig(rigAdmin);
+    }
+
+    // 3. Denied both gpt-6.2-astra and gpt-6-astra -> fail-closed UNAUTHORIZED_MODEL
+    const rigDenied = await startRig({
+      userBalance: 1_000_000n,
+      loadAllowedModelChecker: async () => (modelId: string) => modelId === "glm-5.2",
+      loadAgentModelResolver: async () => (agentId: string) =>
+        agentId === "main" ? "glm-5.2" : null,
+    });
+    rigDenied.pricing._setForTests([PRICING, LEGACY_ASTRA_PRICING, { ...TEAM_LEADER_PRICING, visibility: "admin" }]);
+    try {
+      const containerOpenP = waitNextContainerSocket(rigDenied);
+      const ws = openClient(rigDenied.gatewayPort, await makeJwt("32"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+      let containerGotFrame = false;
+      containerWs.on("message", () => { containerGotFrame = true; });
+      const errP = waitJsonFrameOfType(ws, "error");
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        peer: { id: "phase-a-denied-team", kind: "dm" },
+        clientMessageId: "phase-a-denied-msg",
+        agentId: "main",
+        teamMode: true,
+        content: "hi",
+      }));
+      const err = await errP;
+      assert.equal(err.code, "UNAUTHORIZED_MODEL");
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(containerGotFrame, false);
+      ws.close();
+    } finally {
+      await stopRig(rigDenied);
+    }
+  });
+
   test("teamMode effort override leaves ordinary and registered non-main frames unchanged", async () => {
     const variants: Array<{
       name: string;
@@ -3752,6 +3979,433 @@ describe('cc5 task route financial and stale-alias admission', () => {
       }
     } finally {
       keys.forEach((key, i) => { if (saved[i] === undefined) delete process.env[key]; else process.env[key] = saved[i]; });
+    }
+  });
+});
+
+describe("OCV5-798 userChatBridge Codex speed tiers (readOnly / alias / capability gate)", () => {
+  test("clamps advisor read-only main turn to 1x and strips wire serviceTier", async () => {
+    const rig = await startRig({
+      userBalance: 100_000_000n,
+      modelAuthority: true,
+      solAlias: true,
+      codexSpeedTiers: true,
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("11"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "p-ro-tier", kind: "dm" },
+        agentId: "main",
+        model: "gpt-6.2-sol",
+        serviceTier: "ultrafast",
+        collabMode: "advisor",
+        advisorModel: "gpt-6.2-astra",
+        content: { text: "请分析原因，不要修改任何文件" },
+        ts: Date.now(),
+      }));
+      const forwarded = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+      assert.equal("serviceTier" in forwarded, false, "read-only advisor turn must strip serviceTier");
+      const [row] = Array.from(rig.poolCtrl.journalRows.values());
+      assert.ok(row);
+      assert.equal(((row.ctx as Record<string, unknown>).billingPricing as { modelId?: string }).modelId, "gpt-6.2-sol");
+      assert.equal((row.ctx as Record<string, unknown>).serviceTier, undefined);
+      assert.equal(((row.ctx as Record<string, unknown>).billingPricing as { multiplier?: string }).multiplier, "1.000");
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("resolves sol-alias to canonical gpt-6.2-sol for 6x journal + wire when attested", async () => {
+    const rig = await startRig({
+      userBalance: 100_000_000n,
+      modelAuthority: true,
+      solAlias: true,
+      codexSpeedTiers: true,
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("11"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "p-alias-tier", kind: "dm" },
+        agentId: "main",
+        model: "sol-alias",
+        serviceTier: "ultrafast",
+        content: { text: "apply patch" },
+        ts: Date.now(),
+      }));
+      const forwarded = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+      assert.equal(forwarded.model, "gpt-6.2-sol");
+      assert.equal(forwarded.serviceTier, "ultrafast");
+      const [row] = Array.from(rig.poolCtrl.journalRows.values());
+      assert.ok(row);
+      assert.equal(((row.ctx as Record<string, unknown>).billingPricing as { modelId?: string }).modelId, "gpt-6.2-sol");
+      assert.equal((row.ctx as Record<string, unknown>).serviceTier, "ultrafast");
+      assert.equal(((row.ctx as Record<string, unknown>).billingPricing as { multiplier?: string }).multiplier, "6.000");
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("capability gate across modelAuthority (on/off) × codexSpeedTiers (true/false/omitted)", async () => {
+    const cases = [
+      { modelAuthority: true, codexSpeedTiers: true, expectedWire: "fast", expectedMul: "2.000" },
+      { modelAuthority: true, codexSpeedTiers: false, expectedWire: undefined, expectedMul: "1.000" },
+      { modelAuthority: false, codexSpeedTiers: true, expectedWire: "fast", expectedMul: "2.000" },
+      { modelAuthority: false, codexSpeedTiers: false, expectedWire: undefined, expectedMul: "1.000" },
+      { modelAuthority: false, codexSpeedTiers: undefined, expectedWire: undefined, expectedMul: "1.000" },
+    ] as const;
+    for (const c of cases) {
+      const rig = await startRig({
+        userBalance: 100_000_000n,
+        modelAuthority: c.modelAuthority,
+        solAlias: true,
+        codexSpeedTiers: c.codexSpeedTiers,
+      });
+      try {
+        const containerOpenP = waitNextContainerSocket(rig);
+        const ws = openClient(rig.gatewayPort, await makeJwt("11"));
+        await waitOpen(ws);
+        const containerWs = await containerOpenP;
+        if (!c.modelAuthority && c.codexSpeedTiers !== undefined) {
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        ws.send(JSON.stringify({
+          type: "inbound.message",
+          channel: "webchat",
+          peer: { id: `p-gate-${String(c.modelAuthority)}-${String(c.codexSpeedTiers)}`, kind: "dm" },
+          agentId: "main",
+          model: "gpt-6.2-sol",
+          serviceTier: "fast",
+          content: { text: "implement" },
+          ts: Date.now(),
+        }));
+        const forwarded = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+        if (c.expectedWire === undefined) {
+          assert.equal("serviceTier" in forwarded, false, `expected stripped wire for ${JSON.stringify(c)}`);
+        } else {
+          assert.equal(forwarded.serviceTier, c.expectedWire);
+        }
+        const [row] = Array.from(rig.poolCtrl.journalRows.values());
+        assert.ok(row);
+        assert.equal((row.ctx as Record<string, unknown>).serviceTier, c.expectedWire);
+        assert.equal(((row.ctx as Record<string, unknown>).billingPricing as { multiplier?: string }).multiplier, c.expectedMul);
+        ws.close();
+      } finally {
+        await stopRig(rig);
+      }
+    }
+  });
+
+  test("advisor reply-quote with read-only quoted text matches 6x quote, WS switch guard, wire, and journal", async () => {
+    const pricing = new PricingCache();
+    pricing._setForTests([{ ...PRICING, model_id: "gpt-6.2-sol", display_name: "Sol" }]);
+    const poolCtrl = makeFakePool({ userBalance: 100_000_000n });
+    const switchCost = new ModelSwitchCostService({
+      pool: poolCtrl.pool,
+      pricing,
+      secret: "bridge-reply-quote-secret",
+      balance: async () => 100_000_000n,
+      sourceEngine: () => "ccb",
+      resolveTarget: async () => ({
+        pricing: { ...PRICING, model_id: "gpt-6.2-sol", display_name: "Sol" },
+        engine: "codex",
+        contextWindow: 1_000_000,
+      }),
+      readContext: async () => ({
+        revision: 1,
+        fingerprint: "fp-rq",
+        sourceModel: "gpt-6.2-astra",
+        sourceAgent: "main",
+        tokens: 200_000,
+        source: "last-call",
+        warmRatio: 0,
+        outputs: [500],
+        calls: 1,
+        lastOutputTokens: 500,
+      }),
+    });
+    const rqInput = {
+      sessionId: "p-reply-quote",
+      requestId: "cmid-rq-1",
+      targetModel: "gpt-6.2-sol",
+      agentId: "main",
+      collabMode: "advisor",
+      advisorModel: "gpt-6.2-astra",
+      serviceTier: "ultrafast" as const,
+      text: "[被引用的历史消息｜发送者：助手｜消息ID：m0｜原文字符数：9]\n不要修改任何文件。\n[用户当前消息]\n继续分析这个结果",
+    };
+    const quote = await switchCost.quote("11", rqInput);
+    assert.equal(quote.targetUnitPrice?.input, String(Number(PRICING.input_per_mtok) * 6));
+    assert.ok(quote.quoteToken);
+    const confirmed = await switchCost.confirm("11", rqInput, quote.quoteToken);
+    assert.ok(confirmed.consent);
+
+    const rig = await startRig({
+      userBalance: 100_000_000n,
+      poolCtrl,
+      modelAuthority: true,
+      solAlias: true,
+      codexSpeedTiers: true,
+      modelSwitchCost: switchCost,
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("11"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "p-reply-quote", kind: "dm" },
+        clientMessageId: "cmid-rq-1",
+        agentId: "main",
+        model: "gpt-6.2-sol",
+        serviceTier: "ultrafast",
+        collabMode: "advisor",
+        advisorModel: "gpt-6.2-astra",
+        modelSwitchConsent: confirmed.consent,
+        content: {
+          text: "继续分析这个结果",
+          replyTo: { messageId: "m0", role: "assistant", text: "不要修改任何文件。" },
+        },
+        ts: Date.now(),
+      }));
+      const forwarded = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+      assert.equal(forwarded.serviceTier, "ultrafast");
+      const [row] = Array.from(poolCtrl.journalRows.values());
+      assert.ok(row);
+      assert.equal((row.ctx as Record<string, unknown>).serviceTier, "ultrafast");
+      assert.equal(((row.ctx as Record<string, unknown>).billingPricing as { multiplier?: string }).multiplier, "6.000");
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("cross-capability durable takeover preserves original 1x billing/wire and blocks 6x -> non-speed bridge", async () => {
+    const sharedPool = makeFakePool({ userBalance: 100_000_000n });
+    const fixedReq1x = "a".repeat(32);
+    const makeAdmit = (reqId: string, dispatchId: string): NonNullable<UserChatBridgeDeps["admitUserTurn"]> =>
+      async (input) => {
+        const now = new Date();
+        return {
+          kind: "admitted",
+          workspaceMode: "legacy",
+          takeover: false,
+          dispatch: {
+            traceId: input.traceId ?? null,
+            dispatchId,
+            userId: input.uid,
+            sessionId: input.sessionId,
+            clientMessageId: input.clientMessageId,
+            agentId: input.agentId,
+            model: input.model,
+            requestHash: input.requestHash,
+            billingRequestId: reqId,
+            attemptNo: 1,
+            status: "admitted",
+            outcome: null,
+            failureCode: null,
+            conflictReason: null,
+            resolution: null,
+            resolvedAt: null,
+            clientNotified: false,
+            ownerId: input.ownerId,
+            leaseEpoch: 1,
+            leaseUntil: new Date(now.getTime() + 90_000),
+            anchorSeq: 5n,
+            admittedAt: now,
+            acceptedAt: null,
+            terminalAt: null,
+            lastAttemptAt: now,
+          },
+        };
+      };
+
+    // Bridge 1 (codexSpeedTiers: false) writes 1x journal for fixedReq1x, disconnects before settlement.
+    const rigOld = await startRig({
+      poolCtrl: sharedPool,
+      modelAuthority: true,
+      solAlias: true,
+      codexSpeedTiers: false,
+      admitUserTurn: makeAdmit(fixedReq1x, "disp-1x"),
+    });
+    try {
+      const c1P = waitNextContainerSocket(rigOld);
+      const ws1 = openClient(rigOld.gatewayPort, await makeJwt("11"));
+      await waitOpen(ws1);
+      const c1 = await c1P;
+      ws1.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "p-takeover-1x", kind: "dm" },
+        clientMessageId: "cmid-take-1x",
+        agentId: "main",
+        model: "gpt-6.2-sol",
+        serviceTier: "ultrafast",
+        content: { text: "step 1" },
+        ts: Date.now(),
+      }));
+      const fwd1 = JSON.parse((await waitContainerNextFrame(c1)).data) as Record<string, unknown>;
+      assert.equal("serviceTier" in fwd1, false);
+      ws1.close();
+    } finally {
+      await stopRig(rigOld);
+    }
+
+    // Bridge 2 (codexSpeedTiers: true) takes over same dispatch/journal even with ultrafast on frame -> must stay 1x on wire + live finalizer!
+    const livePoolCtrl = sharedPool;
+    const row1x = livePoolCtrl.journalRows.get(fixedReq1x);
+    assert.ok(row1x && row1x.state === "inflight");
+    const savedRow1xCtx = structuredClone(row1x.ctx);
+
+    const rigNew = await startRig({
+      poolCtrl: livePoolCtrl,
+      modelAuthority: true,
+      solAlias: true,
+      codexSpeedTiers: true,
+      admitUserTurn: makeAdmit(fixedReq1x, "disp-1x"),
+    });
+    try {
+      const c2P = waitNextContainerSocket(rigNew);
+      const ws2 = openClient(rigNew.gatewayPort, await makeJwt("11"));
+      await waitOpen(ws2);
+      const c2 = await c2P;
+      ws2.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "p-takeover-1x", kind: "dm" },
+        clientMessageId: "cmid-take-1x",
+        agentId: "main",
+        model: "gpt-6.2-sol",
+        serviceTier: "ultrafast",
+        content: { text: "step 1" },
+        ts: Date.now(),
+      }));
+      const fwd2 = JSON.parse((await waitContainerNextFrame(c2)).data) as Record<string, unknown>;
+      assert.equal("serviceTier" in fwd2, false, "takeover onto speed-capable bridge must still strip serviceTier to match 1x journal");
+      c2.send(JSON.stringify({
+        type: "outbound.codex_billing",
+        requestId: fixedReq1x,
+        turnKey: "cd".repeat(32),
+        engineSessionId: ENGINE_SID,
+        status: "success",
+        usage: { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_read_input_tokens: 0 },
+      }));
+      await waitUntil(() => livePoolCtrl.ledgerAmounts.length >= 1);
+      const liveCharged = livePoolCtrl.ledgerAmounts.at(-1);
+      assert.equal(liveCharged, "-6000");
+
+      // Re-disconnect recovery from same immutable journal ctx charges identical 1x amount (never 6x).
+      const durableReq = "b".repeat(32);
+      livePoolCtrl.journalRows.set(durableReq, {
+        state: "inflight",
+        user_id: "11",
+        dispatch_id: "disp-durable-1x",
+        attempt_no: 1,
+        ctx: { ...savedRow1xCtx, billingRequestId: durableReq },
+        precheck_credits: "100000",
+        error_msg: null,
+      });
+      const durableOut = await settleDurableCodexBilling(
+        { pgPool: livePoolCtrl.pool, pricing: new PricingCache(), preCheckRedis: new InMemoryPreCheckRedis() },
+        11n,
+        {
+          requestId: durableReq,
+          turnKey: "ef".repeat(32),
+          engineSessionId: ENGINE_SID,
+          status: "success",
+          durationMs: 500,
+          usage: { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_read_input_tokens: 0 },
+        },
+      );
+      assert.equal(durableOut, "committed");
+      assert.equal(livePoolCtrl.ledgerAmounts.at(-1), "-6000");
+      ws2.close();
+    } finally {
+      await stopRig(rigNew);
+    }
+
+    // Reverse: 6x journal started by speed-capable bridge cannot be taken over by non-speed bridge.
+    const pool6x = makeFakePool({ userBalance: 100_000_000n });
+    const req6x = "c".repeat(32);
+    const rigSpeed = await startRig({
+      poolCtrl: pool6x,
+      modelAuthority: true,
+      solAlias: true,
+      codexSpeedTiers: true,
+      admitUserTurn: makeAdmit(req6x, "disp-6x"),
+    });
+    try {
+      const c1P = waitNextContainerSocket(rigSpeed);
+      const ws1 = openClient(rigSpeed.gatewayPort, await makeJwt("11"));
+      await waitOpen(ws1);
+      const c1 = await c1P;
+      ws1.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "p-takeover-6x", kind: "dm" },
+        clientMessageId: "cmid-take-6x",
+        agentId: "main",
+        model: "gpt-6.2-sol",
+        serviceTier: "ultrafast",
+        content: { text: "step 1" },
+        ts: Date.now(),
+      }));
+      const fwd = JSON.parse((await waitContainerNextFrame(c1)).data) as Record<string, unknown>;
+      assert.equal(fwd.serviceTier, "ultrafast");
+      ws1.close();
+    } finally {
+      await stopRig(rigSpeed);
+    }
+
+    const rigLegacyTakeover = await startRig({
+      poolCtrl: pool6x,
+      modelAuthority: true,
+      solAlias: true,
+      codexSpeedTiers: false,
+      admitUserTurn: makeAdmit(req6x, "disp-6x"),
+    });
+    try {
+      const c2P = waitNextContainerSocket(rigLegacyTakeover);
+      const ws2 = openClient(rigLegacyTakeover.gatewayPort, await makeJwt("11"));
+      await waitOpen(ws2);
+      const c2 = await c2P;
+      let forwardedOnMismatch = 0;
+      c2.on("message", (raw) => {
+        if (raw.toString().includes("cmid-take-6x")) forwardedOnMismatch += 1;
+      });
+      const errFrame = waitJsonFrameOfType(ws2, "error", 3000);
+      ws2.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "p-takeover-6x", kind: "dm" },
+        clientMessageId: "cmid-take-6x",
+        agentId: "main",
+        model: "gpt-6.2-sol",
+        serviceTier: "ultrafast",
+        content: { text: "step 1" },
+        ts: Date.now(),
+      }));
+      await errFrame;
+      await waitUntil(() => pool6x.journalRows.get(req6x)?.state === "aborted");
+      assert.equal(forwardedOnMismatch, 0);
+      const j6x = pool6x.journalRows.get(req6x);
+      assert.equal(j6x?.state, "aborted");
+      ws2.close();
+    } finally {
+      await stopRig(rigLegacyTakeover);
     }
   });
 });

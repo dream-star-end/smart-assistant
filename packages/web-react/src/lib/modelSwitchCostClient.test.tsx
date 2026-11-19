@@ -232,3 +232,74 @@ test("non-interactive dispatch reuses and consumes the online-verified requestId
   })
   expect(request).toHaveBeenCalledTimes(2)
 })
+
+test("hung model-switch-estimate HTTP call aborts within bounded timeout so send falls back to offline queue instead of hanging forever (OCV5-788)", async () => {
+  vi.useFakeTimers()
+  vi.restoreAllMocks()
+  let observedSignal: AbortSignal | null | undefined
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = vi.fn((_url, init) => {
+    observedSignal = init?.signal
+    return new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => {
+        reject(new DOMException("The operation was aborted.", "AbortError"))
+      })
+    })
+  }) as typeof fetch
+  try {
+    const toast = vi.fn()
+    const authorize = createModelSwitchCostAuthorizer({
+      authRef: { current: createMemoryAuthSession(() => {}, "fixture-token") },
+      confirmDialog: vi.fn(),
+      toast,
+    })
+    const sendInput = {
+      sessionId: "s-hung",
+      requestId: "m-hung-send",
+      targetModel: "antigravity-gemini-4-pro",
+      agentId: "main",
+    }
+    const pendingSend = authorize(sendInput, { allowOfflineQueue: true })
+    await vi.advanceTimersByTimeAsync(5_100)
+    expect(observedSignal?.aborted).toBe(true)
+    expect(await pendingSend).toEqual({ requestId: "m-hung-send", choice: true })
+    expect(toast).not.toHaveBeenCalled()
+
+    const pickerInput = {
+      sessionId: "s-hung",
+      requestId: "m-hung-picker",
+      targetModel: "gpt-6-astra",
+      agentId: "main",
+    }
+    const pendingPicker = authorize(pickerInput)
+    await vi.advanceTimersByTimeAsync(5_100)
+    expect(await pendingPicker).toBeNull()
+    expect(toast).toHaveBeenCalledWith("费用确认暂不可用，请重试", "error")
+
+    // Headers arrive (HTTP 200), but response body stream stalls after partial chunk "{":
+    globalThis.fetch = vi.fn((_url, init) => {
+      observedSignal = init?.signal
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("{"))
+        },
+      })
+      return Promise.resolve(
+        new Response(body, { status: 200, headers: { "content-type": "application/json" } }),
+      )
+    }) as typeof fetch
+    const stalledBodyInput = {
+      sessionId: "s-hung-body",
+      requestId: "m-hung-body",
+      targetModel: "antigravity-gemini-4-pro",
+      agentId: "main",
+    }
+    const pendingStalledBody = authorize(stalledBodyInput, { allowOfflineQueue: true })
+    await vi.advanceTimersByTimeAsync(5_100)
+    expect(observedSignal?.aborted).toBe(true)
+    expect(await pendingStalledBody).toEqual({ requestId: "m-hung-body", choice: true })
+  } finally {
+    globalThis.fetch = originalFetch
+    vi.useRealTimers()
+  }
+})
