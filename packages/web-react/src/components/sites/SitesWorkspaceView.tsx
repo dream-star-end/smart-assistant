@@ -8,10 +8,11 @@ import {
   PanelLeftOpen,
   PauseCircle,
   Search,
+  Users,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { apiErrorMessage } from "../../lib/api";
-import { sitesApi } from "../../lib/sitesApi";
+import { type SiteInvitePreview, sitesApi } from "../../lib/sitesApi";
 import type { AuthSession, SitesSummaryResponse, UserSiteItem, UserSiteVisibility } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import {
@@ -23,14 +24,36 @@ import {
   DropdownMenuTrigger,
   EmptyState,
   IconButton,
+  Modal,
   Skeleton,
+  useToast,
 } from "../ui";
 import { SiteDetailView } from "./SiteDetailView";
 import { SitePreviewThumb } from "./SitePreviewThumb";
 import { sharingLabel } from "./SiteSettingsTab";
+import { roleLabel } from "./SiteShareTab";
 
-type SiteFilter = "all" | UserSiteVisibility;
+type SiteFilter = "all" | "shared" | UserSiteVisibility;
 type ViewMode = "list" | "grid";
+
+function readSiteInviteParam(): string | null {
+  if (typeof window === "undefined") return null;
+  const raw = new URLSearchParams(window.location.search).get("siteInvite")?.trim();
+  return raw || null;
+}
+
+function clearSiteInviteParam(): void {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  if (!url.searchParams.has("siteInvite")) return;
+  url.searchParams.delete("siteInvite");
+  const nextSearch = url.searchParams.toString();
+  window.history.replaceState(
+    window.history.state,
+    "",
+    `${url.pathname}${nextSearch ? `?${nextSearch}` : ""}${url.hash}`,
+  );
+}
 
 function formatMonthDay(iso: string): string {
   const d = new Date(iso);
@@ -50,6 +73,7 @@ export function SitesWorkspaceView({
   onSelectSlug,
   onCreateInChat,
   onEditSite,
+  onApplyLiveEdit,
   onOpenMobileNav,
   sidebarCollapsed,
   onExpandSidebar,
@@ -59,10 +83,12 @@ export function SitesWorkspaceView({
   onSelectSlug: (slug: string | null) => void;
   onCreateInChat: (prompt: string) => void;
   onEditSite: (site: UserSiteItem) => void;
+  onApplyLiveEdit?: (site: UserSiteItem, prompt: string) => void;
   onOpenMobileNav?: () => void;
   sidebarCollapsed?: boolean;
   onExpandSidebar?: () => void;
 }) {
+  const toast = useToast();
   const [accessGen, setAccessGen] = useState(() => auth.getAccessGeneration());
   useEffect(() => auth.subscribeAccessGeneration(() => setAccessGen(auth.getAccessGeneration())), [auth]);
   const authIdentityKey = `${accessGen}:${auth.snapshot().epoch}`;
@@ -78,6 +104,12 @@ export function SitesWorkspaceView({
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<SiteFilter>("all");
   const [viewMode, setViewMode] = useState<ViewMode>("list");
+
+  const [inviteToken, setInviteToken] = useState<string | null>(() => readSiteInviteParam());
+  const [invitePreview, setInvitePreview] = useState<SiteInvitePreview | null>(null);
+  const [inviteLoading, setInviteLoading] = useState(false);
+  const [inviteErr, setInviteErr] = useState<string | null>(null);
+  const [acceptingInvite, setAcceptingInvite] = useState(false);
 
   const loadSites = useCallback(async () => {
     const reqIdentity = authIdentityRef.current;
@@ -103,18 +135,86 @@ export function SitesWorkspaceView({
     void loadSites();
   }, [loadSites, authIdentityKey]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional re-preview trigger on authIdentityKey change
+  useEffect(() => {
+    if (!inviteToken) {
+      setInvitePreview(null);
+      setInviteErr(null);
+      return;
+    }
+    let alive = true;
+    setInviteLoading(true);
+    setInviteErr(null);
+    void sitesApi
+      .previewSiteInvite(auth, inviteToken)
+      .then((res) => {
+        if (!alive) return;
+        setInvitePreview(res.invite);
+      })
+      .catch((e) => {
+        if (!alive) return;
+        setInviteErr(apiErrorMessage(e, "邀请链接无效或已过期"));
+      })
+      .finally(() => {
+        if (alive) setInviteLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [auth, inviteToken, authIdentityKey]);
+
+  const dismissInvite = useCallback(() => {
+    clearSiteInviteParam();
+    setInviteToken(null);
+    setInvitePreview(null);
+    setInviteErr(null);
+  }, []);
+
+  const handleAcceptInvite = useCallback(async () => {
+    if (!inviteToken || acceptingInvite) return;
+    setAcceptingInvite(true);
+    setInviteErr(null);
+    try {
+      const res = await sitesApi.acceptSiteInvite(auth, inviteToken);
+      clearSiteInviteParam();
+      setInviteToken(null);
+      setInvitePreview(null);
+      await loadSites();
+      toast(
+        res.alreadyMember
+          ? `你已在站点「${res.site.title}」中（${roleLabel(res.role)}）`
+          : `已加入协作站点「${res.site.title}」（${roleLabel(res.role)}）`,
+        "success",
+      );
+      onSelectSlug(res.site.slug);
+    } catch (e) {
+      setInviteErr(apiErrorMessage(e, "接受协作邀请失败"));
+    } finally {
+      setAcceptingInvite(false);
+    }
+  }, [acceptingInvite, auth, inviteToken, loadSites, onSelectSlug, toast]);
+
   const baseDomain = summary?.baseDomain ?? "congjianai.com";
   const allSites = summary?.sites ?? [];
+  const sharedCount = useMemo(
+    () => allSites.filter((s) => (s.accessRole ?? "owner") !== "owner").length,
+    [allSites],
+  );
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return allSites.filter((site) => {
-      if (filter !== "all" && site.visibility !== filter) return false;
+      if (filter === "shared") {
+        if ((site.accessRole ?? "owner") === "owner") return false;
+      } else if (filter !== "all" && site.visibility !== filter) {
+        return false;
+      }
       if (!q) return true;
       return (
         site.title.toLowerCase().includes(q) ||
         site.slug.toLowerCase().includes(q) ||
-        (site.customDomain ?? "").toLowerCase().includes(q)
+        (site.customDomain ?? "").toLowerCase().includes(q) ||
+        (site.ownerEmail ?? "").toLowerCase().includes(q)
       );
     });
   }, [allSites, filter, query]);
@@ -204,9 +304,11 @@ export function SitesWorkspaceView({
           baseDomain={baseDomain}
           onBack={() => onSelectSlug(null)}
           onEditSite={onEditSite}
+          onApplyLiveEdit={onApplyLiveEdit}
           onSiteUpdated={(updated) => handleSiteUpdated(updated, authIdentityKey)}
           onSiteRenamed={(oldSlug, updated) => handleSiteRenamed(oldSlug, updated, authIdentityKey)}
           onSiteDeleted={(deletedSlug) => handleSiteDeleted(deletedSlug, authIdentityKey)}
+          onLeftSite={(leftSlug) => handleSiteDeleted(leftSlug, authIdentityKey)}
         />
       ) : (
         <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-4 py-6 sm:px-8 sm:py-8">
@@ -276,6 +378,10 @@ export function SitesWorkspaceView({
               {(
                 [
                   { id: "all", label: "全部" },
+                  {
+                    id: "shared",
+                    label: sharedCount > 0 ? `共享给我 (${sharedCount})` : "共享给我",
+                  },
                   { id: "public", label: "公开" },
                   { id: "password", label: "口令保护" },
                   { id: "disabled", label: "已下线" },
@@ -346,15 +452,23 @@ export function SitesWorkspaceView({
             </div>
           ) : filtered.length === 0 ? (
             <EmptyState
-              icon={Globe}
-              title={allSites.length === 0 ? "还没有发布过持久站点" : "没有匹配的站点"}
+              icon={filter === "shared" ? Users : Globe}
+              title={
+                filter === "shared"
+                  ? "还没有别人共享给你的站点"
+                  : allSites.length === 0
+                    ? "还没有发布过持久站点"
+                    : "没有匹配的站点"
+              }
               hint={
-                allSites.length === 0
-                  ? `在对话中让助手构建静态或全栈应用，或运行 oc-site publish，即可持久托管在 *.${baseDomain}。`
-                  : "尝试更换搜索关键词或切换筛选条件。"
+                filter === "shared"
+                  ? "当其他人在站点的「共享」页签添加你的邮箱或发给你邀请链接后，协作站点会显示在这里。"
+                  : allSites.length === 0
+                    ? `在对话中让助手构建静态或全栈应用，或运行 oc-site publish，即可持久托管在 *.${baseDomain}。`
+                    : "尝试更换搜索关键词或切换筛选条件。"
               }
               action={
-                allSites.length === 0 ? (
+                allSites.length === 0 && filter !== "shared" ? (
                   <Button
                     variant="primary"
                     onClick={() =>
@@ -390,6 +504,12 @@ export function SitesWorkspaceView({
                     <p className="truncate font-mono text-caption text-muted">
                       {site.customDomain || `${site.slug}.${baseDomain}`}
                     </p>
+                    {(site.accessRole ?? "owner") !== "owner" && (
+                      <p className="truncate text-micro font-medium text-info">
+                        共享 · {roleLabel(site.accessRole ?? "editor")}
+                        {site.ownerEmail ? ` · ${site.ownerEmail}` : ""}
+                      </p>
+                    )}
                   </div>
                 </button>
               ))}
@@ -412,8 +532,14 @@ export function SitesWorkspaceView({
                       <SitePreviewThumb site={site} baseDomain={baseDomain} />
                     </div>
                     <div className="min-w-0 space-y-1">
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
                         <p className="truncate text-body font-medium text-fg">{site.title}</p>
+                        {(site.accessRole ?? "owner") !== "owner" && (
+                          <span className="inline-flex items-center gap-1 rounded-full bg-info-soft px-2 py-0.5 text-micro font-medium text-info">
+                            <Users size={11} aria-hidden="true" />
+                            共享 · {roleLabel(site.accessRole ?? "editor")}
+                          </span>
+                        )}
                         {site.customDomain && (
                           <span className="hidden truncate rounded bg-bg-subtle px-1.5 py-0.5 font-mono text-micro text-muted sm:inline">
                             {site.customDomain}
@@ -423,12 +549,24 @@ export function SitesWorkspaceView({
                       <p className="text-caption text-muted">
                         {formatMonthDay(site.updatedAt)} ·{" "}
                         <span className="font-mono">{site.slug}</span>
+                        {(site.accessRole ?? "owner") !== "owner" && site.ownerEmail && (
+                          <span> · 来自 {site.ownerEmail}</span>
+                        )}
                       </p>
                     </div>
                   </div>
-                  <div className="flex items-center gap-1.5 text-body text-muted">
-                    <VisibilityIcon visibility={site.visibility} />
-                    <span>{sharingLabel(site.visibility)}</span>
+                  <div className="flex flex-col items-end gap-0.5 text-body text-muted sm:items-start">
+                    <span className="flex items-center gap-1.5">
+                      <VisibilityIcon visibility={site.visibility} />
+                      <span>{sharingLabel(site.visibility)}</span>
+                    </span>
+                    {(site.accessRole ?? "owner") === "owner" &&
+                      (site.collaboratorCount ?? 0) > 0 && (
+                        <span className="inline-flex items-center gap-1 text-caption text-faint">
+                          <Users size={12} aria-hidden="true" />
+                          协作 {site.collaboratorCount} 人
+                        </span>
+                      )}
                   </div>
                 </button>
               ))}
@@ -436,6 +574,49 @@ export function SitesWorkspaceView({
           )}
         </div>
       )}
+
+      <Modal
+        open={Boolean(inviteToken)}
+        onOpenChange={(next) => !next && dismissInvite()}
+        title="接受站点协作邀请"
+        size="sm"
+      >
+        <div className="space-y-4">
+          {inviteLoading ? (
+            <Skeleton className="h-20 w-full rounded-xl" />
+          ) : inviteErr ? (
+            <Alert tone="danger">{inviteErr}</Alert>
+          ) : invitePreview ? (
+            <div className="space-y-2 rounded-xl border border-border bg-bg-subtle/60 p-4 text-body">
+              <p className="font-semibold text-fg">{invitePreview.site.title}</p>
+              <p className="font-mono text-caption text-muted">{invitePreview.site.url}</p>
+              <p className="text-caption text-muted">
+                邀请人：{invitePreview.ownerDisplayName || invitePreview.ownerEmail || "站点所有者"} ·
+                授予角色：<strong className="text-fg">{roleLabel(invitePreview.role)}</strong>
+              </p>
+              {invitePreview.alreadyRole && (
+                <p className="text-caption text-success">
+                  你当前已是该站点的「{roleLabel(invitePreview.alreadyRole)}」。
+                </p>
+              )}
+            </div>
+          ) : null}
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" onClick={dismissInvite}>
+              取消
+            </Button>
+            {invitePreview && (
+              <Button
+                variant="primary"
+                disabled={acceptingInvite}
+                onClick={() => void handleAcceptInvite()}
+              >
+                {acceptingInvite ? "加入中…" : "加入协作"}
+              </Button>
+            )}
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }

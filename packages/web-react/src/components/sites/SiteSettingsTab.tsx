@@ -53,10 +53,16 @@ export function SiteSettingsTab({
   const [confirmDialog, confirmDialogEl] = useConfirm();
   const mountedRef = useRef(true);
   const siteGenRef = useRef(0);
+  const accessRole = site.accessRole ?? "owner";
+  const isOwner = accessRole === "owner";
+  const canEditBasic = accessRole === "owner" || accessRole === "editor";
+  const ownerMutationBlocked = readOnly || !isOwner;
+  const basicMutationBlocked = readOnly || !canEditBasic;
 
   // Inline title editing
   const [titleDraft, setTitleDraft] = useState(site.title);
   const [savingTitle, setSavingTitle] = useState(false);
+  const [savingSpa, setSavingSpa] = useState(false);
 
   // URL rename modal
   const [renameOpen, setRenameOpen] = useState(false);
@@ -115,6 +121,7 @@ export function SiteSettingsTab({
     setNewEnvSecret(true);
     setEnvBusyKey(null);
     setSavingTitle(false);
+    setSavingSpa(false);
     setRenaming(false);
     setSavingDomain(false);
     setVerifyingDomain(false);
@@ -141,7 +148,7 @@ export function SiteSettingsTab({
   }
 
   async function saveTitle() {
-    if (readOnly || savingTitle) return;
+    if (basicMutationBlocked || savingTitle) return;
     const trimmed = titleDraft.trim();
     if (!trimmed || trimmed === site.title) {
       setTitleDraft(site.title);
@@ -163,9 +170,26 @@ export function SiteSettingsTab({
     }
   }
 
+  async function toggleSpaMode(nextSpa: boolean) {
+    if (basicMutationBlocked || savingSpa || nextSpa === site.spaMode) return;
+    const gen = siteGenRef.current;
+    setSavingSpa(true);
+    try {
+      const res = await sitesApi.updateSite(auth, site.slug, { spaMode: nextSpa });
+      if (!isCurrentSiteGen(gen)) return;
+      onSiteUpdated(res.site);
+      toast(nextSpa ? "已开启 SPA 单页路由回退" : "已关闭 SPA 单页路由回退", "success");
+    } catch (e) {
+      if (!isCurrentSiteGen(gen)) return;
+      toast(apiErrorMessage(e, "更新 SPA 路由设置失败"), "error");
+    } finally {
+      if (isCurrentSiteGen(gen)) setSavingSpa(false);
+    }
+  }
+
   async function submitRename(e: FormEvent) {
     e.preventDefault();
-    if (readOnly || renaming) return;
+    if (ownerMutationBlocked || renaming) return;
     const target = slugDraft.trim().toLowerCase();
     if (!target || target === site.slug) {
       setRenameOpen(false);
@@ -190,7 +214,7 @@ export function SiteSettingsTab({
   }
 
   async function saveCustomDomain(domainValue: string | null) {
-    if (readOnly || savingDomain) return;
+    if (ownerMutationBlocked || savingDomain) return;
     const gen = siteGenRef.current;
     setSavingDomain(true);
     setDomainErr(null);
@@ -214,7 +238,7 @@ export function SiteSettingsTab({
   }
 
   async function verifyDomainDns() {
-    if (readOnly || verifyingDomain || !site.customDomain) return;
+    if (ownerMutationBlocked || verifyingDomain || !site.customDomain) return;
     const gen = siteGenRef.current;
     setVerifyingDomain(true);
     setDomainErr(null);
@@ -233,7 +257,7 @@ export function SiteSettingsTab({
 
   async function submitShare(e: FormEvent) {
     e.preventDefault();
-    if (readOnly || savingShare) return;
+    if (ownerMutationBlocked || savingShare) return;
     const gen = siteGenRef.current;
     setSavingShare(true);
     setShareErr(null);
@@ -259,7 +283,7 @@ export function SiteSettingsTab({
   }
 
   async function saveEnvVar(key: string, value: string, isSecret: boolean) {
-    if (readOnly) return;
+    if (ownerMutationBlocked) return;
     const gen = siteGenRef.current;
     setEnvBusyKey(key);
     try {
@@ -283,7 +307,7 @@ export function SiteSettingsTab({
   }
 
   async function removeEnvVar(key: string) {
-    if (readOnly) return;
+    if (ownerMutationBlocked) return;
     const gen = siteGenRef.current;
     setEnvBusyKey(key);
     try {
@@ -300,7 +324,7 @@ export function SiteSettingsTab({
   }
 
   async function handleDeleteSite() {
-    if (readOnly || deletingSite) return;
+    if (ownerMutationBlocked || deletingSite) return;
     const gen = siteGenRef.current;
     const originSlug = site.slug;
     const originTitle = site.title;
@@ -341,7 +365,7 @@ export function SiteSettingsTab({
               <Input
                 aria-label="站点名称"
                 value={titleDraft}
-                disabled={readOnly || savingTitle}
+                disabled={basicMutationBlocked || savingTitle}
                 onChange={(e) => setTitleDraft(e.target.value)}
                 onBlur={() => void saveTitle()}
                 onKeyDown={(e) => {
@@ -357,23 +381,25 @@ export function SiteSettingsTab({
           <div className="flex flex-wrap items-center justify-between gap-3 py-4">
             <div>
               <p className="text-body font-medium text-fg">URL</p>
-              <p className="text-caption text-muted">网址</p>
+              <p className="text-caption text-muted">网址{!isOwner ? "（仅所有者可更改）" : ""}</p>
             </div>
             <div className="flex flex-wrap items-center gap-3">
               <span className="font-mono text-body text-muted">{primaryHost}</span>
-              <Button
-                variant="secondary"
-                size="sm"
-                className="rounded-full"
-                disabled={readOnly}
-                onClick={() => {
-                  setSlugDraft(site.slug);
-                  setRenameErr(null);
-                  setRenameOpen(true);
-                }}
-              >
-                更改
-              </Button>
+              {isOwner && (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="rounded-full"
+                  disabled={ownerMutationBlocked}
+                  onClick={() => {
+                    setSlugDraft(site.slug);
+                    setRenameErr(null);
+                    setRenameOpen(true);
+                  }}
+                >
+                  更改
+                </Button>
+              )}
             </div>
           </div>
 
@@ -381,7 +407,9 @@ export function SiteSettingsTab({
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <p className="text-body font-medium text-fg">自定义域名</p>
-                <p className="text-caption text-muted">绑定你自己的独立域名</p>
+                <p className="text-caption text-muted">
+                  {isOwner ? "绑定你自己的独立域名" : "仅站点所有者可绑定或验证域名"}
+                </p>
               </div>
               <div className="flex flex-wrap items-center gap-2.5">
                 {site.customDomain && (
@@ -399,33 +427,36 @@ export function SiteSettingsTab({
                     )}
                   </>
                 )}
-                {site.customDomain && site.customDomainStatus !== "verified" && (
+                {isOwner && site.customDomain && site.customDomainStatus !== "verified" && (
                   <Button
                     variant="primary"
                     size="sm"
                     className="rounded-full"
-                    disabled={readOnly || verifyingDomain}
+                    disabled={ownerMutationBlocked || verifyingDomain}
                     onClick={() => void verifyDomainDns()}
                   >
                     {verifyingDomain ? "验证中…" : "验证域名"}
                   </Button>
                 )}
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  className="rounded-full"
-                  disabled={readOnly}
-                  onClick={() => {
-                    setDomainDraft(site.customDomain ?? "");
-                    setDomainErr(null);
-                    setDomainOpen(true);
-                  }}
-                >
-                  {site.customDomain ? "更改自定义域名" : "添加自定义域名"}
-                </Button>
+                {isOwner && (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    className="rounded-full"
+                    disabled={ownerMutationBlocked}
+                    onClick={() => {
+                      setDomainDraft(site.customDomain ?? "");
+                      setDomainErr(null);
+                      setDomainOpen(true);
+                    }}
+                  >
+                    {site.customDomain ? "更改自定义域名" : "添加自定义域名"}
+                  </Button>
+                )}
               </div>
             </div>
-            {site.customDomain &&
+            {isOwner &&
+              site.customDomain &&
               site.customDomainStatus !== "verified" &&
               site.customDomainTxtName &&
               site.customDomainTxtValue && (
@@ -445,8 +476,26 @@ export function SiteSettingsTab({
 
           <div className="flex flex-wrap items-center justify-between gap-3 py-4">
             <div>
+              <p className="text-body font-medium text-fg">SPA 单页应用路由</p>
+              <p className="text-caption text-muted">
+                未匹配静态文件时回退到 index.html
+                {!canEditBasic ? "（仅所有者或协作者可修改）" : ""}
+              </p>
+            </div>
+            <Switch
+              checked={site.spaMode}
+              disabled={basicMutationBlocked || savingSpa}
+              aria-label="SPA 单页应用路由开关"
+              onCheckedChange={(checked) => void toggleSpaMode(checked)}
+            />
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-3 py-4">
+            <div>
               <p className="text-body font-medium text-fg">共享设置</p>
-              <p className="text-caption text-muted">谁可以查看你的站点</p>
+              <p className="text-caption text-muted">
+                {isOwner ? "谁可以查看你的站点" : "仅站点所有者可调整访问权限与口令"}
+              </p>
             </div>
             <div className="flex flex-wrap items-center gap-3">
               <span className="inline-flex items-center gap-1.5 text-body text-muted">
@@ -459,43 +508,46 @@ export function SiteSettingsTab({
                 )}
                 {sharingLabel(site.visibility)}
               </span>
-              <Button
-                variant="secondary"
-                size="sm"
-                className="rounded-full"
-                disabled={readOnly}
-                onClick={() => {
-                  setShareVisibility(site.visibility);
-                  setShareSpaMode(site.spaMode);
-                  setSharePassword("");
-                  setShareErr(null);
-                  setShareOpen(true);
-                }}
-              >
-                管理
-              </Button>
+              {isOwner && (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="rounded-full"
+                  disabled={ownerMutationBlocked}
+                  onClick={() => {
+                    setShareVisibility(site.visibility);
+                    setShareSpaMode(site.spaMode);
+                    setSharePassword("");
+                    setShareErr(null);
+                    setShareOpen(true);
+                  }}
+                >
+                  管理
+                </Button>
+              )}
             </div>
           </div>
         </div>
       </section>
 
-      <section className="space-y-4">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h3 className="text-section font-semibold text-fg">环境变量</h3>
-            <p className="text-caption text-muted">添加站点所需的 API 密钥和其他环境变量</p>
+      {isOwner ? (
+        <section className="space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 className="text-section font-semibold text-fg">环境变量</h3>
+              <p className="text-caption text-muted">添加站点所需的 API 密钥和其他环境变量</p>
+            </div>
+            <Button
+              variant="secondary"
+              size="sm"
+              className="rounded-full"
+              disabled={ownerMutationBlocked}
+              onClick={() => setAddingEnv(true)}
+            >
+              <Plus size={14} aria-hidden="true" />
+              添加变量
+            </Button>
           </div>
-          <Button
-            variant="secondary"
-            size="sm"
-            className="rounded-full"
-            disabled={readOnly}
-            onClick={() => setAddingEnv(true)}
-          >
-            <Plus size={14} aria-hidden="true" />
-            添加变量
-          </Button>
-        </div>
 
         {envVars.length === 0 && !addingEnv ? (
           <p className="rounded-lg border border-dashed border-border px-4 py-6 text-center text-body text-muted">
@@ -695,25 +747,35 @@ export function SiteSettingsTab({
           </div>
         )}
       </section>
+      ) : (
+        <section className="space-y-2 border-t border-border/70 pt-6">
+          <h3 className="text-section font-semibold text-fg">环境变量</h3>
+          <p className="rounded-lg border border-dashed border-border px-4 py-5 text-body text-muted">
+            环境变量与机密密钥仅归站点所有者查看和管理。如需新增接口密钥，请联系所有者配置。
+          </p>
+        </section>
+      )}
 
-      <section className="space-y-3 border-t border-border/70 pt-6">
-        <h3 className="text-section font-semibold text-fg">危险操作区</h3>
-        <div className="flex flex-wrap items-center justify-between gap-4 py-2">
-          <div>
-            <p className="text-body font-medium text-fg">删除站点</p>
-            <p className="text-caption text-muted">永久删除此站点</p>
+      {isOwner && (
+        <section className="space-y-3 border-t border-border/70 pt-6">
+          <h3 className="text-section font-semibold text-fg">危险操作区</h3>
+          <div className="flex flex-wrap items-center justify-between gap-4 py-2">
+            <div>
+              <p className="text-body font-medium text-fg">删除站点</p>
+              <p className="text-caption text-muted">永久删除此站点</p>
+            </div>
+            <Button
+              variant="danger"
+              size="sm"
+              disabled={ownerMutationBlocked || deletingSite}
+              onClick={() => void handleDeleteSite()}
+              className="rounded-full"
+            >
+              删除站点
+            </Button>
           </div>
-          <Button
-            variant="danger"
-            size="sm"
-            disabled={readOnly || deletingSite}
-            onClick={() => void handleDeleteSite()}
-            className="rounded-full"
-          >
-            删除站点
-          </Button>
-        </div>
-      </section>
+        </section>
+      )}
 
       <Modal
         open={renameOpen}

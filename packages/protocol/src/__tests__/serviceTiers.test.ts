@@ -18,6 +18,7 @@ import {
   fastServiceTierRoute,
   isServiceTier,
   normalizeServiceTierForModel,
+  serviceTierBillingMultiplierNumber,
   supportedServiceTiers,
   supportsFastServiceTier,
   supportsServiceTier,
@@ -231,5 +232,25 @@ describe('OCV5-434 / OCV5-798 service tiers', () => {
       }),
       'fast',
     )
+  })
+
+  it('computes numeric display multiplier across supported, unsupported, and invalid inputs', () => {
+    for (const id of ['gpt-6.2-sol', 'gpt-6.2-sol-1m']) {
+      assert.equal(serviceTierBillingMultiplierNumber(id, 'ultrafast'), 6, id)
+      assert.equal(serviceTierBillingMultiplierNumber(id, 'fast'), 2, id)
+      assert.equal(serviceTierBillingMultiplierNumber(id, null), 1, id)
+      assert.equal(serviceTierBillingMultiplierNumber(id, undefined), 1, id)
+      assert.equal(serviceTierBillingMultiplierNumber(id, 'priority'), 1, id)
+    }
+    for (const id of ['gpt-6.2-astra', 'gpt-6.2-astra-1m', 'gpt-6-luna', 'gpt-6-luna-1m', 'opencode-gpt-6-luna', 'opencode-gpt-5.6-luna']) {
+      assert.equal(serviceTierBillingMultiplierNumber(id, 'ultrafast'), 1, id)
+      assert.equal(serviceTierBillingMultiplierNumber(id, 'fast'), 2, id)
+      assert.equal(serviceTierBillingMultiplierNumber(id, null), 1, id)
+    }
+    for (const id of ['gpt-6-luna-remote', 'glm-5.2', null, undefined]) {
+      assert.equal(serviceTierBillingMultiplierNumber(id, 'ultrafast'), 1, String(id))
+      assert.equal(serviceTierBillingMultiplierNumber(id, 'fast'), 1, String(id))
+      assert.equal(serviceTierBillingMultiplierNumber(id, null), 1, String(id))
+    }
   })
 })

@@ -46,6 +46,8 @@ export function resolveProbedUpstreamModel(
     const candidates: string[] = []
     if (slug === 'antigravity-orchestrator-carbon' || slug === 'gemini-pro-orchestrator') {
       candidates.push('gemini-pro-orchestrator')
+    } else if (slug === 'antigravity-orchestrator-neon' || slug === 'gemini-pro-orchestrator-neon') {
+      candidates.push('gemini-pro-orchestrator-neon')
     } else {
       const bare = slug.replace(/^antigravity-/, '').replace(/5\.5$/, '5-5')
       const base = bare.replace(/-(?:low|medium|high|xhigh|max)$/, '')
