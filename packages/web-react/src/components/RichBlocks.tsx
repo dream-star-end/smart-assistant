@@ -151,51 +151,93 @@ function parseStringOption(raw: string): OptionItem | null {
   return { label: trimmed };
 }
 
+function normalizeOptionEntry(o: unknown): OptionItem | null {
+  if (typeof o === "string") return parseStringOption(o);
+  if (!o || typeof o !== "object" || Array.isArray(o)) return null;
+  const oo = o as Record<string, unknown>;
+  if (Array.isArray(oo.options) || Array.isArray(oo.choices) || Array.isArray(oo.items)) return null;
+  const label =
+    typeof oo.label === "string" && oo.label.trim()
+      ? oo.label
+      : typeof oo.title === "string" && oo.title.trim()
+        ? oo.title.trim()
+        : typeof oo.text === "string" && oo.text.trim()
+          ? oo.text.trim()
+          : "";
+  if (!label) return null;
+  let desc: string | undefined;
+  for (const k of ["desc", "description", "detail", "sublabel"] as const) {
+    const v = oo[k];
+    if (typeof v === "string" && v.trim()) {
+      desc = v;
+      break;
+    }
+  }
+  return desc ? { label, desc } : { label };
+}
+
 function normalizeSingleOptionsItem(raw: unknown): ParsedOptionsItem | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const rec = raw as Record<string, unknown>;
-  if (!Array.isArray(rec.options)) return null;
+  const rawList = Array.isArray(rec.options)
+    ? rec.options
+    : Array.isArray(rec.choices)
+      ? rec.choices
+      : Array.isArray(rec.items)
+        ? rec.items
+        : null;
+  if (!rawList) return null;
   const options: OptionItem[] = [];
-  for (const o of rec.options) {
-    if (typeof o === "string") {
-      const parsed = parseStringOption(o);
-      if (parsed) options.push(parsed);
-    } else if (o && typeof o === "object") {
-      const oo = o as { label?: unknown; desc?: unknown; description?: unknown };
-      if (typeof oo.label !== "string" || !oo.label.trim()) continue;
-      const desc =
-        typeof oo.desc === "string" && oo.desc.trim()
-          ? oo.desc
-          : typeof oo.description === "string" && oo.description.trim()
-            ? oo.description
-            : undefined;
-      options.push(desc ? { label: oo.label, desc } : { label: oo.label });
-    }
+  for (const o of rawList) {
+    const parsed = normalizeOptionEntry(o);
+    if (parsed) options.push(parsed);
   }
   if (options.length === 0 || options.length > 12) return null;
-  const question =
-    typeof rec.question === "string"
-      ? rec.question
-      : typeof rec.prompt === "string"
-        ? rec.prompt
-        : undefined;
+  let question: string | undefined;
+  for (const k of ["question", "prompt", "header", "title"] as const) {
+    const v = rec[k];
+    if (typeof v === "string" && v.trim()) {
+      question = v;
+      break;
+    }
+  }
   return {
     question,
-    multi: rec.multi === true || rec.multiSelect === true || rec.is_multi_select === true,
+    multi:
+      rec.multi === true ||
+      rec.multiSelect === true ||
+      rec.is_multi_select === true ||
+      rec.allowMultiple === true,
     options,
   };
 }
 
 function expandOptionsPayload(val: unknown): ParsedOptionsItem[] | null {
   if (Array.isArray(val)) {
-    if (val.length === 0 || val.length > MAX_QUESTIONS_PER_BLOCK) return null;
-    const out: ParsedOptionsItem[] = [];
-    for (const item of val) {
-      const norm = normalizeSingleOptionsItem(item);
-      if (!norm) return null;
-      out.push(norm);
+    if (val.length === 0) return null;
+    if (val.length <= MAX_QUESTIONS_PER_BLOCK) {
+      const multiQ: ParsedOptionsItem[] = [];
+      let allQuestions = true;
+      for (const item of val) {
+        const norm = normalizeSingleOptionsItem(item);
+        if (!norm) {
+          allQuestions = false;
+          break;
+        }
+        multiQ.push(norm);
+      }
+      if (allQuestions) return multiQ;
     }
-    return out;
+    if (val.length <= 12) {
+      const bareOptions: OptionItem[] = [];
+      for (const entry of val) {
+        const norm = normalizeOptionEntry(entry);
+        if (!norm) return null;
+        bareOptions.push(norm);
+      }
+      return bareOptions.length > 0 ? [{ question: undefined, multi: false, options: bareOptions }] : null;
+    }
+    return null;
   }
   if (val && typeof val === "object") {
     const rec = val as Record<string, unknown>;
