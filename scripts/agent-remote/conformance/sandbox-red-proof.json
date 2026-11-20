@@ -121,10 +121,10 @@
     "antigravity": {
       "driverId": "antigravity",
       "engineId": "antigravity",
-      "driverDigest": "dba7e8e7d3eb7a919c7c0e02cb6a534d4265a4e48967ec49981a1bcd4707c235",
+      "driverDigest": "0e6efe1dff4430c4e609bfc3981f1da27531b25a295039f98e1844e1c1414dfa",
       "coreDigest": "4991e0b78abe1516d4ddc1bca60e524e295f1e76cbfa5b3349b49f75139d8744",
       "controllerSha256": "e6eb9f3e3ba0bb7bfe791ac2863a4efb793ba86a78a6e3fe8176c8765812bcb5",
-      "policySha256": "9df917e36e0bedf0f08ef705400cea11d20f3d1d4ce1473ee2cb9c02f31a3761",
+      "policySha256": "a722bd5c2a03572331c8bd3eef2584a39d4fb7cec4e4f9d0a6db912d25a9d449",
       "requirements": [
         {
           "requirementId": "R1",
@@ -177,5 +177,5 @@
       ]
     }
   },
-  "proofSha256": "e35c849bd325936b314903f2c65fa2f809e4397e78b296067f7f5b68de4f3361"
+  "proofSha256": "22d2f6a6c3238d19d6ce8d1f8147b4d392ba81ad0a5788143d43e96baa0a997f"
 }
