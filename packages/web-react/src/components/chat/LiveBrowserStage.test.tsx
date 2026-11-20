@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { LiveBrowserState } from "../../lib/liveBrowserApi";
 import type { AuthSession } from "../../lib/types";
+import { Sheet } from "../ui";
 import { LiveBrowserStage } from "./LiveBrowserStage";
 
 const fetchLiveMock = vi.fn();
@@ -255,5 +256,117 @@ describe("LiveBrowserStage", () => {
 
     await new Promise((r) => setTimeout(r, 280));
     expect(sendActionMock).not.toHaveBeenCalled();
+  });
+
+  test("queues rapid clicks while an action is in-flight instead of dropping the second click", async () => {
+    let resolveFirst!: (s: LiveBrowserState) => void;
+    const firstPromise = new Promise<LiveBrowserState>((r) => {
+      resolveFirst = r;
+    });
+    fetchLiveMock.mockResolvedValue(ACTIVE_STATE);
+    sendActionMock
+      .mockReturnValueOnce(firstPromise)
+      .mockResolvedValueOnce(ACTIVE_STATE);
+
+    render(<LiveBrowserStage agentId="main" auth={MOCK_AUTH} running={false} />);
+    await screen.findByTestId("live-browser-active");
+    fireEvent.click(screen.getByTestId("live-browser-takeover-btn"));
+
+    const img = screen.getByTestId("live-browser-frame");
+    vi.spyOn(img, "getBoundingClientRect").mockReturnValue({
+      left: 0,
+      top: 0,
+      width: 400,
+      height: 200,
+      right: 400,
+      bottom: 200,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+
+    // Two rapid clicks while first click is still pending
+    fireEvent.click(img, { clientX: 100, clientY: 50 });
+    fireEvent.click(img, { clientX: 300, clientY: 150 });
+    expect(sendActionMock).toHaveBeenCalledTimes(1);
+
+    resolveFirst(ACTIVE_STATE);
+    await waitFor(() => expect(sendActionMock).toHaveBeenCalledTimes(2));
+    expect(sendActionMock.mock.calls[0]?.[2]).toEqual({
+      action: "click",
+      x: 0.25,
+      y: 0.25,
+      normalized: true,
+      button: "left",
+    });
+    expect(sendActionMock.mock.calls[1]?.[2]).toEqual({
+      action: "click",
+      x: 0.75,
+      y: 0.75,
+      normalized: true,
+      button: "left",
+    });
+  });
+
+  test("supports expanding into theater fullscreen modal and collapsing with Escape while keeping takeover", async () => {
+    fetchLiveMock.mockResolvedValue(ACTIVE_STATE);
+
+    render(<LiveBrowserStage agentId="main" auth={MOCK_AUTH} running={false} />);
+    await screen.findByTestId("live-browser-active");
+    fireEvent.click(screen.getByTestId("live-browser-takeover-btn"));
+
+    // Expand to theater modal
+    fireEvent.click(screen.getByTestId("live-browser-expand-btn"));
+    expect(screen.getByTestId("live-browser-theater-dialog")).toBeInTheDocument();
+    expect(screen.getByTestId("live-browser-docked")).toBeInTheDocument();
+    expect(screen.getByTestId("live-browser-takeover-dock")).toBeInTheDocument();
+
+    // Pressing Escape inside expanded Radix Dialog collapses ONLY theater dialog (never parent Sheet)
+    const onSheetChange = vi.fn();
+    cleanup();
+    render(
+      <Sheet open={true} onOpenChange={onSheetChange} side="bottom" srTitle="详情面板">
+        <LiveBrowserStage agentId="main" auth={MOCK_AUTH} running={false} />
+      </Sheet>,
+    );
+    await screen.findByTestId("live-browser-active");
+    fireEvent.click(screen.getByTestId("live-browser-takeover-btn"));
+    fireEvent.click(screen.getByTestId("live-browser-expand-btn"));
+    const dialog = screen.getByTestId("live-browser-theater-dialog");
+    expect(dialog).toBeInTheDocument();
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("live-browser-theater-dialog")).toBeNull());
+    expect(onSheetChange).not.toHaveBeenCalled();
+    expect(screen.getByTestId("live-browser-takeover-dock")).toBeInTheDocument();
+  });
+
+  test("shows queue-full notice instead of silently swallowing clicks beyond cap", async () => {
+    const never = new Promise<LiveBrowserState>(() => {});
+    fetchLiveMock.mockResolvedValue(ACTIVE_STATE);
+    sendActionMock.mockReturnValue(never);
+
+    render(<LiveBrowserStage agentId="main" auth={MOCK_AUTH} running={false} />);
+    await screen.findByTestId("live-browser-active");
+    fireEvent.click(screen.getByTestId("live-browser-takeover-btn"));
+
+    const img = screen.getByTestId("live-browser-frame");
+    vi.spyOn(img, "getBoundingClientRect").mockReturnValue({
+      left: 0,
+      top: 0,
+      width: 400,
+      height: 200,
+      right: 400,
+      bottom: 200,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+
+    // 1 in-flight + 12 queued + 1 overflow = 14 clicks
+    for (let i = 0; i < 14; i++) {
+      fireEvent.click(img, { clientX: 100, clientY: 50 });
+    }
+    expect(await screen.findByTestId("live-browser-error")).toHaveTextContent("操作队列已满");
   });
 });

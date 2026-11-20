@@ -8,6 +8,7 @@
  * - Hand back: preserves cookies/localStorage/page state and optionally prefills a continuation
  *   prompt into the chat Composer.
  */
+import * as RD from "@radix-ui/react-dialog";
 import {
   ArrowLeft,
   ArrowRight,
@@ -16,6 +17,8 @@ import {
   Globe,
   Hand,
   Lock,
+  Maximize2,
+  Minimize2,
   Plus,
   Power,
   RotateCw,
@@ -121,6 +124,7 @@ export function LiveBrowserStage({
   const [initialLoading, setInitialLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [takeover, setTakeover] = useState(false);
+  const [expanded, setExpanded] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const [launchUrl, setLaunchUrl] = useState("https://scholar.google.com");
@@ -131,6 +135,7 @@ export function LiveBrowserStage({
 
   const stageRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
+  const expandBtnRef = useRef<HTMLButtonElement>(null);
   const mountedRef = useRef(true);
   const authRef = useRef(auth);
   authRef.current = auth;
@@ -187,9 +192,10 @@ export function LiveBrowserStage({
     }
   }, [lockedByAssistant, clearPendingInputBuffers]);
 
-  // Reset takeover and address draft if switching agent.
+  // Reset takeover, expanded theater view, and address draft if switching agent.
   useEffect(() => {
     setTakeover(false);
+    setExpanded(false);
     setAddressEditing(false);
     setError(null);
     setState(null);
@@ -208,7 +214,11 @@ export function LiveBrowserStage({
       setInitialLoading(false);
       setError(null);
       onActiveStateChange?.(next.active);
-      if (!next.active || next.agentBusy) {
+      if (!next.active) {
+        setTakeover(false);
+        setExpanded(false);
+        clearPendingInputBuffers();
+      } else if (next.agentBusy) {
         setTakeover(false);
         clearPendingInputBuffers();
       }
@@ -258,7 +268,7 @@ export function LiveBrowserStage({
     if (!isAvailable && state !== null) return;
     let cancelled = false;
     let timer: number | null = null;
-    const intervalMs = isActive ? (effectiveTakeover ? 2200 : 1600) : lockedByAssistant ? 2000 : 4000;
+    const intervalMs = isActive ? (effectiveTakeover ? 1200 : 900) : lockedByAssistant ? 1800 : 4000;
 
     const schedule = (delay: number) => {
       if (cancelled) return;
@@ -275,7 +285,11 @@ export function LiveBrowserStage({
       schedule(intervalMs);
     };
 
-    void runCycle();
+    if (state === null) {
+      void runCycle();
+    } else {
+      schedule(intervalMs);
+    }
 
     const onVisibility = () => {
       if (document.hidden) {
@@ -335,14 +349,18 @@ export function LiveBrowserStage({
   );
 
   const enqueueCanvasInput = useCallback(
-    (payload: LiveBrowserActionPayload) => {
-      if (!takeoverActiveRef.current) return;
-      if (inputQueueRef.current.length >= 12) return;
+    (payload: LiveBrowserActionPayload): boolean => {
+      if (!takeoverActiveRef.current) return false;
+      if (inputQueueRef.current.length >= 12) {
+        setError("操作队列已满，请等待当前操作完成后再试");
+        return false;
+      }
       inputQueueRef.current.push(payload);
       if (!actionInFlightRef.current) {
         const next = inputQueueRef.current.shift();
         if (next) void runAction(next);
       }
+      return true;
     },
     [runAction],
   );
@@ -404,22 +422,25 @@ export function LiveBrowserStage({
   };
 
   const handleCanvasClick = (e: ReactMouseEvent<HTMLImageElement>) => {
-    if (!effectiveTakeover || busy) return;
+    if (!effectiveTakeover) return;
     const pt = normalizedCoords(e);
     if (!pt) return;
     stageRef.current?.focus({ preventScroll: true });
-    showRipple(pt.x, pt.y);
-    void runAction({ action: "click", x: pt.x, y: pt.y, normalized: true, button: "left" });
+    flushKeyBufferToQueue();
+    if (enqueueCanvasInput({ action: "click", x: pt.x, y: pt.y, normalized: true, button: "left" })) {
+      showRipple(pt.x, pt.y);
+    }
   };
 
   const handleCanvasContextMenu = (e: ReactMouseEvent<HTMLImageElement>) => {
     if (!effectiveTakeover) return;
     e.preventDefault();
-    if (busy) return;
     const pt = normalizedCoords(e);
     if (!pt) return;
-    showRipple(pt.x, pt.y);
-    void runAction({ action: "click", x: pt.x, y: pt.y, normalized: true, button: "right" });
+    flushKeyBufferToQueue();
+    if (enqueueCanvasInput({ action: "click", x: pt.x, y: pt.y, normalized: true, button: "right" })) {
+      showRipple(pt.x, pt.y);
+    }
   };
 
   const handleCanvasWheel = (e: ReactWheelEvent<HTMLDivElement>) => {
@@ -606,8 +627,8 @@ export function LiveBrowserStage({
   const tabs = state.tabs ?? [];
   const isHttps = (state.url ?? "").startsWith("https://");
 
-  return (
-    <div className="lb-root" data-testid="live-browser-active">
+  const browserShell = (
+    <>
       {error && (
         <div className="lb-error-banner" role="alert" data-testid="live-browser-error">
           <span>{error}</span>
@@ -704,6 +725,17 @@ export function LiveBrowserStage({
               </button>
             )}
             <button
+              ref={expanded ? undefined : expandBtnRef}
+              type="button"
+              className="lb-icon-btn"
+              aria-label={expanded ? "退出放大视图" : "放大浏览器视图"}
+              title={expanded ? "缩小回侧栏 (Esc)" : "放大为沉浸全屏视口"}
+              data-testid="live-browser-expand-btn"
+              onClick={() => setExpanded((prev) => !prev)}
+            >
+              {expanded ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+            </button>
+            <button
               type="button"
               className="lb-icon-btn"
               aria-label="关闭云端浏览器"
@@ -714,6 +746,7 @@ export function LiveBrowserStage({
                 takeoverActiveRef.current = false;
                 clearPendingInputBuffers();
                 setTakeover(false);
+                setExpanded(false);
                 void runAction({ action: "close" });
               }}
             >
@@ -794,6 +827,7 @@ export function LiveBrowserStage({
           onKeyDown={handleStageKeyDown}
           onWheel={handleCanvasWheel}
         >
+          {busy && <span className="lb-progress-bar" aria-hidden />}
           {state.imageBase64 ? (
             <div className="lb-frame-wrap">
               <img
@@ -880,6 +914,60 @@ export function LiveBrowserStage({
           </div>
         )}
       </div>
-    </div>
+    </>
+  );
+
+  return (
+    <>
+      {expanded ? (
+        <div className="lb-root" data-testid="live-browser-docked">
+          <div className="lb-docked-placeholder">
+            <span className="lb-idle-icon" aria-hidden>
+              <Maximize2 size={16} />
+            </span>
+            <p className="lb-idle-desc">云端浏览器正在全屏放大视图中运行</p>
+            <button
+              type="button"
+              className="lb-preset-chip"
+              onClick={() => setExpanded(false)}
+            >
+              <Minimize2 size={12} />
+              恢复到侧栏
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="lb-root" data-testid="live-browser-active">
+          {browserShell}
+        </div>
+      )}
+
+      <RD.Root open={expanded} onOpenChange={setExpanded}>
+        <RD.Portal>
+          <RD.Overlay className="lb-theater-backdrop" data-testid="live-browser-theater-backdrop" />
+          <RD.Content
+            className="lb-theater-dialog"
+            data-testid="live-browser-theater-dialog"
+            aria-describedby={undefined}
+            onCloseAutoFocus={(e) => {
+              // Restore focus deterministically to the inline expand trigger after portal teardown.
+              e.preventDefault();
+              window.requestAnimationFrame(() => expandBtnRef.current?.focus());
+            }}
+            onEscapeKeyDown={(e) => {
+              // If the takeover canvas is focused, first Escape releases keyboard capture without
+              // closing the theater dialog; second Escape closes ONLY this dialog (never parent Sheet).
+              if (stageRef.current && document.activeElement === stageRef.current) {
+                e.preventDefault();
+                stageRef.current.blur();
+              }
+            }}
+          >
+            <RD.Title className="sr-only">云端实时浏览器放大视图</RD.Title>
+            {expanded ? browserShell : null}
+          </RD.Content>
+        </RD.Portal>
+      </RD.Root>
+    </>
   );
 }

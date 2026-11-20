@@ -18,10 +18,20 @@
  *   under commercial `containerApiProxy`'s 2 MiB response body limit.
  */
 import { createHash } from 'node:crypto'
-import { execFile as execFileCb } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { execFile as execFileCb, spawn } from 'node:child_process'
+import {
+  existsSync,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { join } from 'node:path'
+import { createConnection } from 'node:net'
+import { basename, dirname, join } from 'node:path'
 
 export const LIVE_BROWSER_AGENT_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/
 export const LIVE_BROWSER_MAX_URL_CHARS = 2048
@@ -70,6 +80,9 @@ export const ALLOWED_PRESS_KEYS: ReadonlySet<string> = new Set([
 const SESSION_CLOSED_RE =
   /browser is not open|not open\b|no browser\b|session.*not found|browser has been closed|target page, context or browser has been closed|context or browser has been closed|browser disconnected|no active session/i
 
+const DAEMON_SOCKET_DEAD_RE =
+  /\b(?:ENOENT|ECONNREFUSED|ECONNRESET|EPIPE)\b|daemon socket closed/i
+
 export interface LiveBrowserTabInfo {
   index: number
   title: string
@@ -86,7 +99,7 @@ export interface LiveBrowserState {
   viewport?: { width: number; height: number }
   tabs?: LiveBrowserTabInfo[]
   imageBase64?: string
-  mimeType?: 'image/jpeg'
+  mimeType?: 'image/jpeg' | 'image/png'
   capturedAt?: number
   reason?: string
 }
@@ -130,11 +143,356 @@ export type LiveBrowserExecFn = (
   opts: { env: NodeJS.ProcessEnv; timeout: number; maxBuffer: number },
 ) => Promise<LiveBrowserExecResult>
 
+export interface PlaywrightDaemonEndpoint {
+  socketPath: string
+  version: string
+  stateDir: string
+}
+
+export interface PlaywrightDaemonRpcResult {
+  text: string
+  isError?: boolean
+}
+
+export type PlaywrightDaemonRpcFn = (
+  endpoint: PlaywrightDaemonEndpoint,
+  args: Record<string, unknown>,
+  opts: { cwd: string; timeoutMs: number },
+) => Promise<PlaywrightDaemonRpcResult>
+
+export type PlaywrightLockFn = <T>(stateDir: string, fn: () => Promise<T>) => Promise<T>
+
 export interface LiveBrowserControllerDeps {
   ocBrowserBin?: string
   stateRoot?: string
+  browserHome?: string
   existsSync?: (p: string) => boolean
   execFn?: LiveBrowserExecFn
+  resolveDaemonEndpoint?: (stateDir: string) => PlaywrightDaemonEndpoint | null
+  daemonRpcFn?: PlaywrightDaemonRpcFn
+  withLock?: PlaywrightLockFn
+  readFrameFile?: (filePath: string) => Buffer
+  unlinkFrameFile?: (filePath: string) => void
+}
+
+const DAEMON_RPC_MAX_BYTES = 4 * 1024 * 1024
+const FLOCK_BIN = '/usr/bin/flock'
+const FLOCK_WAIT_SEC = '8'
+
+/**
+ * Acquire the exact same POSIX `flock` (`<stateDir>/activity.lock`) used by `oc-browser.sh`
+ * and its idle reaper so multi-step daemon RPCs (mousemove/down/up/screenshot) never interleave
+ * with external CLI invocations or idle reaping (~9ms acquire overhead).
+ */
+export async function withPlaywrightActivityLock<T>(
+  stateDir: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  if (!existsSync(FLOCK_BIN) || !existsSync(stateDir)) {
+    return fn()
+  }
+  const lockFile = join(stateDir, 'activity.lock')
+  const activityFile = join(stateDir, 'activity')
+  const pendingFile = join(stateDir, `pending.${process.pid}`)
+  // Mirror oc-browser.sh: record pending.<pid> & refresh activity BEFORE waiting on flock
+  // so an idle reaper waking first sees a live waiting consumer and will not close the session.
+  try {
+    writeFileSync(pendingFile, '')
+  } catch {}
+  try {
+    const now = new Date()
+    utimesSync(activityFile, now, now)
+  } catch {}
+
+  const child = spawn(FLOCK_BIN, ['-w', FLOCK_WAIT_SEC, lockFile, '/bin/sh', '-c', 'printf 1; exec cat'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let settled = false
+      const done = (err?: Error) => {
+        if (settled) return
+        settled = true
+        if (err) reject(err)
+        else resolve()
+      }
+      child.stdout.once('data', () => done())
+      child.once('error', (err) => done(err))
+      child.once('exit', (code) => done(new Error(`activity lock busy (flock exit ${code ?? 'signal'})`)))
+    })
+    return await fn()
+  } finally {
+    try {
+      unlinkSync(pendingFile)
+    } catch {}
+    try {
+      child.stdin.end()
+    } catch {}
+    try {
+      child.kill('SIGTERM')
+    } catch {}
+  }
+}
+
+/**
+ * Discover the live per-agent playwright-cli Unix domain socket inside `stateDir`.
+ * Strictly enforces:
+ * - `stateDir` itself is a real non-symlink directory whose realpath equals `join(realRoot, basename(stateDir))`
+ *   (strictly bound to this single agent, never another agent's directory);
+ * - the socket path itself is NOT a symlink (`!lstat.isSymbolicLink()`) and IS a Unix socket (`lstat.isSocket()`);
+ * - the socket's real parent directory stays strictly inside `realStateDir`.
+ */
+export function resolvePlaywrightDaemonEndpoint(
+  stateDir: string,
+  stateRoot?: string,
+): PlaywrightDaemonEndpoint | null {
+  if (!existsSync(stateDir)) return null
+  let realStateDir: string
+  try {
+    const dirStat = lstatSync(stateDir)
+    if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) return null
+    realStateDir = realpathSync(stateDir)
+    if (stateRoot && existsSync(stateRoot)) {
+      const realRoot = realpathSync(stateRoot)
+      const expectedDir = join(realRoot, basename(stateDir))
+      if (realStateDir !== expectedDir) {
+        return null
+      }
+    }
+  } catch {
+    return null
+  }
+  const isValidSocketInsideStateDir = (candidate: string): boolean => {
+    try {
+      const st = lstatSync(candidate)
+      if (st.isSymbolicLink() || !st.isSocket()) return false
+      const realDir = realpathSync(dirname(candidate))
+      return realDir === realStateDir || realDir.startsWith(`${realStateDir}/`)
+    } catch {
+      return false
+    }
+  }
+
+  // Prefer the structured daemon session file which carries both socketPath and protocol version.
+  const daemonRoot = join(stateDir, 'cache', 'ms-playwright', 'daemon')
+  try {
+    if (existsSync(daemonRoot)) {
+      for (const entry of readdirSync(daemonRoot)) {
+        const sub = join(daemonRoot, entry)
+        let files: string[]
+        try {
+          files = readdirSync(sub)
+        } catch {
+          continue
+        }
+        for (const f of files) {
+          if (!f.endsWith('.session')) continue
+          try {
+            const raw = JSON.parse(readFileSync(join(sub, f), 'utf8')) as {
+              socketPath?: unknown
+              version?: unknown
+            }
+            if (
+              typeof raw.socketPath === 'string' &&
+              raw.socketPath.endsWith('.sock') &&
+              isValidSocketInsideStateDir(raw.socketPath)
+            ) {
+              return {
+                socketPath: raw.socketPath,
+                version: typeof raw.version === 'string' && raw.version ? raw.version : '0.1.14',
+                stateDir: realStateDir,
+              }
+            }
+          } catch {
+            // Skip malformed session file and try fallback socket scan.
+          }
+        }
+      }
+    }
+  } catch {
+    // Ignore scan errors and try sockets/cli fallback.
+  }
+
+  const cliSockDir = join(stateDir, 'sockets', 'cli')
+  try {
+    if (existsSync(cliSockDir)) {
+      for (const f of readdirSync(cliSockDir)) {
+        if (!f.endsWith('-browser.sock')) continue
+        const sockPath = join(cliSockDir, f)
+        if (isValidSocketInsideStateDir(sockPath)) {
+          return { socketPath: sockPath, version: '0.1.14', stateDir: realStateDir }
+        }
+      }
+    }
+  } catch {
+    // No socket available.
+  }
+  return null
+}
+
+/**
+ * Direct newline-delimited JSON RPC over playwright-cli's local Unix socket.
+ * Accumulates raw Buffers up to `DAEMON_RPC_MAX_BYTES`, decodes UTF-8 ONLY after a complete
+ * newline frame arrives (preserving multi-byte characters split across TCP/Unix chunks),
+ * and verifies response `id`.
+ */
+export function sendPlaywrightDaemonRpc(
+  endpoint: PlaywrightDaemonEndpoint,
+  args: Record<string, unknown>,
+  opts: { cwd: string; timeoutMs: number; maxBytes?: number },
+): Promise<PlaywrightDaemonRpcResult> {
+  const maxBytes = opts.maxBytes ?? DAEMON_RPC_MAX_BYTES
+  const reqId = 1
+  return new Promise((resolve, reject) => {
+    const socket = createConnection(endpoint.socketPath)
+    let settled = false
+    const chunks: Buffer[] = []
+    let totalBytes = 0
+    const finish = (err: Error | null, res?: PlaywrightDaemonRpcResult) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      socket.destroy()
+      if (err) reject(err)
+      else resolve(res ?? { text: '' })
+    }
+    const timer = setTimeout(() => {
+      finish(new Error('playwright daemon rpc timed out'))
+    }, opts.timeoutMs)
+
+    socket.once('error', (err) => finish(err))
+    socket.once('close', () => {
+      if (!settled) finish(new Error('daemon socket closed'))
+    })
+    socket.once('connect', () => {
+      const payload = JSON.stringify({
+        id: reqId,
+        method: 'run',
+        params: { args, cwd: opts.cwd, version: endpoint.version },
+      })
+      socket.write(`${payload}\n`)
+    })
+    socket.on('data', (chunk: Buffer) => {
+      if (settled) return
+      let remaining = chunk
+      while (remaining.length > 0 && !settled) {
+        const nlIdx = remaining.indexOf(0x0a)
+        const frameLen = nlIdx >= 0 ? totalBytes + nlIdx : totalBytes + remaining.length
+        if (frameLen > maxBytes) {
+          finish(new Error('playwright daemon response too large'))
+          return
+        }
+        if (nlIdx < 0) {
+          chunks.push(remaining)
+          totalBytes += remaining.length
+          return
+        }
+        if (nlIdx > 0) chunks.push(remaining.subarray(0, nlIdx))
+        const line = Buffer.concat(chunks, frameLen).toString('utf8')
+        chunks.length = 0
+        totalBytes = 0
+        remaining = remaining.subarray(nlIdx + 1)
+        if (!line.trim()) continue
+        try {
+          const msg = JSON.parse(line) as {
+            id?: unknown
+            error?: unknown
+            result?: { text?: unknown; isError?: unknown }
+          }
+          // Strictly pair on exact reqId; skip unsolicited notifications or mismatched frames
+          // and keep scanning any sticky frames in the same buffer.
+          if (msg.id !== reqId) {
+            continue
+          }
+          if (msg.error) {
+            finish(new Error(typeof msg.error === 'string' ? msg.error : JSON.stringify(msg.error)))
+            return
+          }
+          const text = typeof msg.result?.text === 'string' ? msg.result.text : ''
+          const isError = msg.result?.isError === true
+          if (isError) {
+            finish(new Error(text.slice(0, 400) || 'playwright daemon command failed'))
+            return
+          }
+          finish(null, { text, isError: false })
+          return
+        } catch (err) {
+          finish(err instanceof Error ? err : new Error(String(err)))
+          return
+        }
+      }
+    })
+  })
+}
+
+const TAB_URL_SEP_RE = /\]\((?=(?:https?:|about:|chrome:|chrome-error:|file:|data:|blob:))/g
+
+/**
+ * Parse `playwright-cli tab-list` output lines: `- 0: (current) [Title](https://...)`.
+ * Picks the rightmost `](<scheme>` separator whose RHS is a valid URL, handling BOTH
+ * markdown links inside the page title AND `](` inside query parameters (`?q=a](b)`).
+ */
+export function parsePlaywrightTabList(text: string): LiveBrowserTabInfo[] {
+  const tabs: LiveBrowserTabInfo[] = []
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    const prefix = line.match(/^-\s+(\d+):\s+(?:(\(current\))\s+)?\[/)
+    if (!prefix || !line.endsWith(')')) continue
+    const rest = line.slice(prefix[0].length, -1)
+    let sep = -1
+    TAB_URL_SEP_RE.lastIndex = 0
+    for (let m = TAB_URL_SEP_RE.exec(rest); m !== null; m = TAB_URL_SEP_RE.exec(rest)) {
+      const candidateUrl = rest.slice(m.index + 2)
+      try {
+        // Ensure candidateUrl starts with a real parseable URL (not a fragment like `b)`).
+        // eslint-disable-next-line no-new
+        new URL(candidateUrl)
+        sep = m.index
+      } catch {
+        // Not a standalone URL — keep looking.
+      }
+    }
+    if (sep < 0) sep = rest.lastIndexOf('](')
+    if (sep < 0) continue
+    const index = Number.parseInt(prefix[1], 10)
+    if (!Number.isFinite(index)) continue
+    tabs.push({
+      index,
+      active: Boolean(prefix[2]),
+      title: rest.slice(0, sep).slice(0, 120),
+      url: rest.slice(sep + 2).slice(0, 512),
+    })
+  }
+  return tabs
+}
+
+function detectImageMime(buf: Buffer): 'image/png' | 'image/jpeg' {
+  if (buf.length >= 4 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+    return 'image/png'
+  }
+  return 'image/jpeg'
+}
+
+/** Extract exact viewport pixel dimensions from a PNG IHDR chunk (0 extra RPCs). */
+export function readPngDimensions(buf: Buffer): { width: number; height: number } | null {
+  if (
+    buf.length >= 24 &&
+    buf[0] === 0x89 &&
+    buf[1] === 0x50 &&
+    buf[2] === 0x4e &&
+    buf[3] === 0x47 &&
+    buf[12] === 0x49 && // 'I'
+    buf[13] === 0x48 && // 'H'
+    buf[14] === 0x44 && // 'D'
+    buf[15] === 0x52 // 'R'
+  ) {
+    const width = buf.readUInt32BE(16)
+    const height = buf.readUInt32BE(20)
+    if (width >= 64 && width <= 8192 && height >= 64 && height <= 8192) {
+      return { width, height }
+    }
+  }
+  return null
 }
 
 function defaultExecFn(
@@ -422,27 +780,77 @@ interface AgentQueueState {
   inFlightRead: Promise<LiveBrowserState> | null
 }
 
+interface AgentMetaCache {
+  viewport: { width: number; height: number }
+  tabs: LiveBrowserTabInfo[]
+  url: string
+  title: string
+}
+
 export class LiveBrowserController {
   private readonly bin: string
   private readonly stateRoot: string
+  private readonly browserHome: string
   private readonly checkExists: (p: string) => boolean
   private readonly execFn: LiveBrowserExecFn
+  private readonly resolveDaemon: (stateDir: string) => PlaywrightDaemonEndpoint | null
+  private readonly daemonRpc: PlaywrightDaemonRpcFn
+  private readonly lockFn: PlaywrightLockFn
+  private readonly readFrame: (filePath: string) => Buffer
+  private readonly unlinkFrame: (filePath: string) => void
   private readonly queues = new Map<string, AgentQueueState>()
+  private readonly metaCache = new Map<string, AgentMetaCache>()
+  private shotSeq = 0
 
   constructor(deps: LiveBrowserControllerDeps = {}) {
     this.bin = deps.ocBrowserBin ?? DEFAULT_OC_BROWSER_BIN
     this.stateRoot = deps.stateRoot ?? STATE_ROOT
+    this.browserHome = deps.browserHome ?? process.env.OPENCLAUDE_HOME ?? '/home/agent/.openclaude'
     this.checkExists = deps.existsSync ?? existsSync
     this.execFn = deps.execFn ?? defaultExecFn
+    // When tests inject a mock execFn without a daemon socket hook, stay on the mock CLI path.
+    this.resolveDaemon =
+      deps.resolveDaemonEndpoint ??
+      (deps.execFn && !deps.daemonRpcFn
+        ? () => null
+        : (stateDir) => resolvePlaywrightDaemonEndpoint(stateDir, this.stateRoot))
+    this.daemonRpc = deps.daemonRpcFn ?? sendPlaywrightDaemonRpc
+    this.lockFn = deps.withLock ?? (deps.daemonRpcFn ? (_d, fn) => fn() : withPlaywrightActivityLock)
+    this.readFrame = deps.readFrameFile ?? ((p) => readFileSync(p))
+    this.unlinkFrame =
+      deps.unlinkFrameFile ??
+      ((p) => {
+        try {
+          unlinkSync(p)
+        } catch {
+          // Best-effort temp cleanup.
+        }
+      })
   }
 
   isAvailable(): boolean {
     return this.checkExists(this.bin)
   }
 
+  private stateDirFor(agentId: string): string {
+    return join(this.stateRoot, ocBrowserAgentKey(agentId))
+  }
+
   private isSessionActive(agentId: string): boolean {
-    const key = ocBrowserAgentKey(agentId)
-    return this.checkExists(join(this.stateRoot, key, 'activity'))
+    return this.checkExists(join(this.stateDirFor(agentId), 'activity'))
+  }
+
+  private touchActivity(agentId: string): void {
+    try {
+      const now = new Date()
+      utimesSync(join(this.stateDirFor(agentId), 'activity'), now, now)
+    } catch {
+      // Best-effort keepalive for oc-browser idle reaper.
+    }
+  }
+
+  private daemonEndpointFor(agentId: string): PlaywrightDaemonEndpoint | null {
+    return this.resolveDaemon(this.stateDirFor(agentId))
   }
 
   private envFor(agentId: string): NodeJS.ProcessEnv {
@@ -517,6 +925,219 @@ export class LiveBrowserController {
     }
   }
 
+  private async captureViaDaemonLocked(
+    agentId: string,
+    endpoint: PlaywrightDaemonEndpoint,
+    opts: { includeFrame: boolean; quality: number; reuseTabs?: boolean; timeoutMs: number },
+  ): Promise<LiveBrowserState> {
+    this.touchActivity(agentId)
+    const rpcOpts = { cwd: this.browserHome, timeoutMs: opts.timeoutMs }
+    const cached = this.metaCache.get(agentId)
+    let tabs = cached?.tabs ?? []
+    let url = cached?.url ?? ''
+    let title = cached?.title ?? ''
+    let viewport = cached?.viewport ?? { width: 1280, height: 720 }
+
+    if (!opts.reuseTabs || !cached) {
+      const tabRes = await this.daemonRpc(endpoint, { _: ['tab-list'] }, rpcOpts)
+      const parsedTabs = parsePlaywrightTabList(tabRes.text)
+      if (parsedTabs.length > 0) {
+        tabs = parsedTabs
+        const activeTab = parsedTabs.find((t) => t.active) ?? parsedTabs[0]
+        url = activeTab.url
+        title = activeTab.title
+      }
+      this.metaCache.set(agentId, { viewport, tabs, url, title })
+    }
+
+    let imageBase64: string | undefined
+    let mimeType: 'image/jpeg' | 'image/png' | undefined
+    if (opts.includeFrame) {
+      // Sweep any stale `.live-frame-*.png` left by a previously timed-out capture, then write to
+      // a fresh per-request filename so late daemon writes can never clobber the next request's frame.
+      try {
+        if (existsSync(endpoint.stateDir)) {
+          for (const f of readdirSync(endpoint.stateDir)) {
+            if (f.startsWith('.live-frame-') && f.endsWith('.png')) {
+              this.unlinkFrame(join(endpoint.stateDir, f))
+            }
+          }
+        }
+      } catch {
+        // Best-effort sweep.
+      }
+      const shotPath = join(endpoint.stateDir, `.live-frame-${++this.shotSeq}.png`)
+      try {
+        await this.daemonRpc(endpoint, { _: ['screenshot'], filename: shotPath }, rpcOpts)
+        const buf = this.readFrame(shotPath)
+        const pngDims = readPngDimensions(buf)
+        if (pngDims) {
+          viewport = pngDims
+          this.metaCache.set(agentId, { viewport, tabs, url, title })
+        }
+        if (buf.length > 0 && buf.length <= LIVE_BROWSER_MAX_IMAGE_BYTES) {
+          imageBase64 = buf.toString('base64')
+          mimeType = detectImageMime(buf)
+        } else if (buf.length > LIVE_BROWSER_MAX_IMAGE_BYTES) {
+          // Oversized PNG on image-heavy pages: step down to compressed JPEG over the same fast socket.
+          const script = buildPlaywrightRunCodeScript({
+            mode: 'capture',
+            includeFrame: true,
+            quality: Math.min(opts.quality, 62),
+            maxBytes: LIVE_BROWSER_MAX_IMAGE_BYTES,
+          })
+          const jpegRes = await this.daemonRpc(endpoint, { _: ['run-code', script] }, rpcOpts)
+          const parsed = parsePlaywrightRunCodeResult(jpegRes.text)
+          if (parsed) {
+            const state = this.toState(parsed)
+            if (state.viewport && state.tabs) {
+              this.metaCache.set(agentId, {
+                viewport: state.viewport,
+                tabs: state.tabs,
+                url: state.url ?? url,
+                title: state.title ?? title,
+              })
+            }
+            this.touchActivity(agentId)
+            return state
+          }
+        }
+      } finally {
+        this.unlinkFrame(shotPath)
+      }
+    }
+
+    this.touchActivity(agentId)
+    return {
+      available: true,
+      active: true,
+      url,
+      title,
+      viewport,
+      tabs,
+      ...(imageBase64 && mimeType ? { imageBase64, mimeType } : {}),
+      capturedAt: Date.now(),
+    }
+  }
+
+  private captureViaDaemon(
+    agentId: string,
+    endpoint: PlaywrightDaemonEndpoint,
+    opts: { includeFrame: boolean; quality: number; reuseTabs?: boolean; timeoutMs: number },
+  ): Promise<LiveBrowserState> {
+    return this.lockFn(endpoint.stateDir, () => this.captureViaDaemonLocked(agentId, endpoint, opts))
+  }
+
+  private performActionViaDaemon(
+    agentId: string,
+    endpoint: PlaywrightDaemonEndpoint,
+    action: Exclude<LiveBrowserAction, { action: 'close' | 'open' }>,
+  ): Promise<LiveBrowserState> {
+    return this.lockFn(endpoint.stateDir, async () => {
+      this.touchActivity(agentId)
+      const rpcOpts = { cwd: this.browserHome, timeoutMs: ACTION_TIMEOUT_MS }
+      const vp = this.metaCache.get(agentId)?.viewport ?? { width: 1280, height: 720 }
+      const toPx = (x: number, y: number, norm?: boolean) => ({
+        px: clamp(Math.round(norm ? x * vp.width : x), 1, Math.max(1, vp.width - 1)),
+        py: clamp(Math.round(norm ? y * vp.height : y), 1, Math.max(1, vp.height - 1)),
+      })
+
+      // Authentic DOM dblclick (clickCount=2): run via Playwright run-code over the fast socket.
+      if (action.action === 'dblclick') {
+        const script = buildPlaywrightRunCodeScript({
+          mode: 'action',
+          includeFrame: true,
+          quality: 70,
+          maxBytes: LIVE_BROWSER_MAX_IMAGE_BYTES,
+          op: action,
+        })
+        const res = await this.daemonRpc(endpoint, { _: ['run-code', script] }, rpcOpts)
+        const state = this.toState(parsePlaywrightRunCodeResult(res.text))
+        if (state.active && state.viewport && state.tabs) {
+          this.metaCache.set(agentId, {
+            viewport: state.viewport,
+            tabs: state.tabs,
+            url: state.url ?? '',
+            title: state.title ?? '',
+          })
+        }
+        this.touchActivity(agentId)
+        return state
+      }
+
+      let reuseTabs = false
+      switch (action.action) {
+        case 'goto':
+          await this.daemonRpc(endpoint, { _: ['goto', action.url] }, rpcOpts)
+          break
+        case 'back':
+          await this.daemonRpc(endpoint, { _: ['go-back'] }, rpcOpts)
+          break
+        case 'forward':
+          await this.daemonRpc(endpoint, { _: ['go-forward'] }, rpcOpts)
+          break
+        case 'reload':
+          await this.daemonRpc(endpoint, { _: ['reload'] }, rpcOpts)
+          break
+        case 'click': {
+          const { px, py } = toPx(action.x, action.y, action.normalized)
+          const btn = action.button === 'right' ? 'right' : 'left'
+          await this.daemonRpc(endpoint, { _: ['mousemove', String(px), String(py)] }, rpcOpts)
+          await this.daemonRpc(endpoint, { _: btn === 'right' ? ['mousedown', 'right'] : ['mousedown'] }, rpcOpts)
+          await this.daemonRpc(endpoint, { _: btn === 'right' ? ['mouseup', 'right'] : ['mouseup'] }, rpcOpts)
+          break
+        }
+        case 'wheel': {
+          if (typeof action.x === 'number' && typeof action.y === 'number') {
+            const { px, py } = toPx(action.x, action.y, action.normalized)
+            await this.daemonRpc(endpoint, { _: ['mousemove', String(px), String(py)] }, rpcOpts)
+          }
+          await this.daemonRpc(
+            endpoint,
+            { _: ['mousewheel', String(Math.round(action.deltaX ?? 0)), String(Math.round(action.deltaY))] },
+            rpcOpts,
+          )
+          reuseTabs = true
+          break
+        }
+        case 'type': {
+          await this.daemonRpc(endpoint, { _: ['type', action.text] }, rpcOpts)
+          if (action.submit) {
+            await this.daemonRpc(endpoint, { _: ['press', 'Enter'] }, rpcOpts)
+          } else {
+            reuseTabs = true
+          }
+          break
+        }
+        case 'press': {
+          await this.daemonRpc(endpoint, { _: ['press', action.key] }, rpcOpts)
+          reuseTabs = action.key !== 'Enter'
+          break
+        }
+        case 'tab_select':
+          await this.daemonRpc(endpoint, { _: ['tab-select', String(action.index)] }, rpcOpts)
+          break
+        case 'tab_new':
+          await this.daemonRpc(endpoint, { _: action.url ? ['tab-new', action.url] : ['tab-new'] }, rpcOpts)
+          break
+        case 'tab_close':
+          await this.daemonRpc(
+            endpoint,
+            { _: typeof action.index === 'number' ? ['tab-close', String(action.index)] : ['tab-close'] },
+            rpcOpts,
+          )
+          break
+      }
+
+      return this.captureViaDaemonLocked(agentId, endpoint, {
+        includeFrame: true,
+        quality: 70,
+        reuseTabs,
+        timeoutMs: ACTION_TIMEOUT_MS,
+      })
+    })
+  }
+
   async getLiveState(agentId: string, opts?: { includeFrame?: boolean; quality?: number }): Promise<LiveBrowserState> {
     if (!isValidLiveBrowserAgentId(agentId)) {
       throw new LiveBrowserError(400, 'INVALID_AGENT_ID', '无效的智能体标识')
@@ -525,6 +1146,7 @@ export class LiveBrowserController {
       return { available: false, active: false, reason: 'unavailable' }
     }
     if (!this.isSessionActive(agentId)) {
+      this.metaCache.delete(agentId)
       return { available: true, active: false }
     }
 
@@ -539,8 +1161,28 @@ export class LiveBrowserController {
 
     const promise = this.enqueue(agentId, async (): Promise<LiveBrowserState> => {
       if (!this.isSessionActive(agentId)) {
+        this.metaCache.delete(agentId)
         return { available: true, active: false }
       }
+      const endpoint = this.daemonEndpointFor(agentId)
+      if (endpoint) {
+        try {
+          return await this.captureViaDaemon(agentId, endpoint, {
+            includeFrame,
+            quality,
+            reuseTabs: false,
+            timeoutMs: READ_TIMEOUT_MS,
+          })
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          if (SESSION_CLOSED_RE.test(msg) || DAEMON_SOCKET_DEAD_RE.test(msg)) {
+            this.metaCache.delete(agentId)
+            return { available: true, active: false }
+          }
+          throw new LiveBrowserError(502, 'BROWSER_CAPTURE_FAILED', msg.slice(0, 240))
+        }
+      }
+
       const script = buildPlaywrightRunCodeScript({
         mode: 'capture',
         includeFrame,
@@ -557,6 +1199,7 @@ export class LiveBrowserController {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         if (SESSION_CLOSED_RE.test(msg)) {
+          this.metaCache.delete(agentId)
           return { available: true, active: false }
         }
         throw new LiveBrowserError(502, 'BROWSER_CAPTURE_FAILED', msg.slice(0, 240))
@@ -579,7 +1222,16 @@ export class LiveBrowserController {
     return promise
   }
 
-  private async captureCurrentFrame(env: NodeJS.ProcessEnv): Promise<LiveBrowserState> {
+  private async captureCurrentFrame(agentId: string, env: NodeJS.ProcessEnv): Promise<LiveBrowserState> {
+    const endpoint = this.daemonEndpointFor(agentId)
+    if (endpoint) {
+      return this.captureViaDaemon(agentId, endpoint, {
+        includeFrame: true,
+        quality: 70,
+        reuseTabs: false,
+        timeoutMs: ACTION_TIMEOUT_MS,
+      })
+    }
     const captureScript = buildPlaywrightRunCodeScript({
       mode: 'capture',
       includeFrame: true,
@@ -594,13 +1246,14 @@ export class LiveBrowserController {
     return this.toState(parsePlaywrightRunCodeResult(res.stdout))
   }
 
-  private async openAndCapture(env: NodeJS.ProcessEnv, targetUrl: string): Promise<LiveBrowserState> {
+  private async openAndCapture(agentId: string, env: NodeJS.ProcessEnv, targetUrl: string): Promise<LiveBrowserState> {
+    this.metaCache.delete(agentId)
     await this.execFn(this.bin, ['open', targetUrl], {
       env,
       timeout: ACTION_TIMEOUT_MS,
       maxBuffer: EXEC_MAX_BUFFER,
     })
-    return this.captureCurrentFrame(env)
+    return this.captureCurrentFrame(agentId, env)
   }
 
   async performAction(agentId: string, rawAction: unknown): Promise<LiveBrowserState> {
@@ -619,6 +1272,7 @@ export class LiveBrowserController {
     return this.enqueue(agentId, async (): Promise<LiveBrowserState> => {
       const env = this.envFor(agentId)
       if (action.action === 'close') {
+        this.metaCache.delete(agentId)
         if (!this.isSessionActive(agentId)) {
           return { available: true, active: false }
         }
@@ -638,9 +1292,27 @@ export class LiveBrowserController {
         const targetUrl = action.url ?? 'https://scholar.google.com'
         try {
           if (!this.isSessionActive(agentId)) {
-            return await this.openAndCapture(env, targetUrl)
+            return await this.openAndCapture(agentId, env, targetUrl)
           }
           try {
+            const endpoint = this.daemonEndpointFor(agentId)
+            if (endpoint) {
+              return await this.lockFn(endpoint.stateDir, async () => {
+                this.touchActivity(agentId)
+                if (action.url) {
+                  await this.daemonRpc(endpoint, { _: ['goto', targetUrl] }, {
+                    cwd: this.browserHome,
+                    timeoutMs: ACTION_TIMEOUT_MS,
+                  })
+                }
+                return this.captureViaDaemonLocked(agentId, endpoint, {
+                  includeFrame: true,
+                  quality: 70,
+                  reuseTabs: false,
+                  timeoutMs: ACTION_TIMEOUT_MS,
+                })
+              })
+            }
             if (action.url) {
               await this.execFn(this.bin, ['goto', targetUrl], {
                 env,
@@ -648,12 +1320,12 @@ export class LiveBrowserController {
                 maxBuffer: EXEC_MAX_BUFFER,
               })
             }
-            return await this.captureCurrentFrame(env)
+            return await this.captureCurrentFrame(agentId, env)
           } catch (innerErr) {
             // Activity marker is only a hint: if the daemon died leaving a stale marker, cold-start once.
             const innerMsg = innerErr instanceof Error ? innerErr.message : String(innerErr)
-            if (SESSION_CLOSED_RE.test(innerMsg)) {
-              return await this.openAndCapture(env, targetUrl)
+            if (SESSION_CLOSED_RE.test(innerMsg) || DAEMON_SOCKET_DEAD_RE.test(innerMsg)) {
+              return await this.openAndCapture(agentId, env, targetUrl)
             }
             throw innerErr
           }
@@ -667,7 +1339,7 @@ export class LiveBrowserController {
       if (!this.isSessionActive(agentId)) {
         if (action.action === 'goto') {
           try {
-            return await this.openAndCapture(env, action.url)
+            return await this.openAndCapture(agentId, env, action.url)
           } catch (err) {
             if (err instanceof LiveBrowserError) throw err
             const msg = err instanceof Error ? err.message : String(err)
@@ -677,7 +1349,31 @@ export class LiveBrowserController {
         throw new LiveBrowserError(409, 'BROWSER_NOT_ACTIVE', '云端浏览器尚未启动，请先打开网页')
       }
 
-      // Tab operations MUST use native playwright-cli commands so the CLI's active tab pointer stays in sync.
+      // Fast path: talk directly to the per-agent playwright-cli Unix domain socket (~200-350ms vs ~1.2s CLI spawn).
+      const endpoint = this.daemonEndpointFor(agentId)
+      if (endpoint) {
+        try {
+          return await this.performActionViaDaemon(agentId, endpoint, action)
+        } catch (err) {
+          if (err instanceof LiveBrowserError) throw err
+          const msg = err instanceof Error ? err.message : String(err)
+          if (SESSION_CLOSED_RE.test(msg) || DAEMON_SOCKET_DEAD_RE.test(msg)) {
+            this.metaCache.delete(agentId)
+            if (action.action === 'goto') {
+              try {
+                return await this.openAndCapture(agentId, env, action.url)
+              } catch (openErr) {
+                const openMsg = openErr instanceof Error ? openErr.message : String(openErr)
+                throw new LiveBrowserError(502, 'BROWSER_ACTION_FAILED', openMsg.slice(0, 240))
+              }
+            }
+            return { available: true, active: false }
+          }
+          throw new LiveBrowserError(502, 'BROWSER_ACTION_FAILED', msg.slice(0, 240))
+        }
+      }
+
+      // Fallback CLI path (e.g. when daemon socket hasn't been created yet or in CLI-mocked unit tests).
       if (action.action === 'tab_select' || action.action === 'tab_new' || action.action === 'tab_close') {
         const cliArgs: string[] =
           action.action === 'tab_select'
@@ -691,11 +1387,12 @@ export class LiveBrowserController {
                 : ['tab-close']
         try {
           await this.execFn(this.bin, cliArgs, { env, timeout: ACTION_TIMEOUT_MS, maxBuffer: EXEC_MAX_BUFFER })
-          return await this.captureCurrentFrame(env)
+          return await this.captureCurrentFrame(agentId, env)
         } catch (err) {
           if (err instanceof LiveBrowserError) throw err
           const msg = err instanceof Error ? err.message : String(err)
           if (SESSION_CLOSED_RE.test(msg)) {
+            this.metaCache.delete(agentId)
             return { available: true, active: false }
           }
           throw new LiveBrowserError(502, 'BROWSER_ACTION_FAILED', msg.slice(0, 240))
@@ -720,10 +1417,11 @@ export class LiveBrowserController {
         if (err instanceof LiveBrowserError) throw err
         const msg = err instanceof Error ? err.message : String(err)
         if (SESSION_CLOSED_RE.test(msg)) {
+          this.metaCache.delete(agentId)
           // If goto hit a stale activity marker where daemon had already exited, cold-start once.
           if (action.action === 'goto') {
             try {
-              return await this.openAndCapture(env, action.url)
+              return await this.openAndCapture(agentId, env, action.url)
             } catch (openErr) {
               const openMsg = openErr instanceof Error ? openErr.message : String(openErr)
               throw new LiveBrowserError(502, 'BROWSER_ACTION_FAILED', openMsg.slice(0, 240))

@@ -1,7 +1,12 @@
 import * as assert from 'node:assert/strict'
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { createServer as createNetServer } from 'node:net'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import {
+  LIVE_BROWSER_MAX_IMAGE_BYTES,
   LIVE_BROWSER_MAX_QUEUE_DEPTH,
   LiveBrowserController,
   LiveBrowserError,
@@ -10,6 +15,10 @@ import {
   handleLiveBrowserLiveHttp,
   ocBrowserAgentKey,
   parsePlaywrightRunCodeResult,
+  parsePlaywrightTabList,
+  readPngDimensions,
+  resolvePlaywrightDaemonEndpoint,
+  sendPlaywrightDaemonRpc,
   validateLiveBrowserAction,
   validateLiveBrowserUrl,
 } from '../liveBrowserController.js'
@@ -478,5 +487,248 @@ describe('liveBrowserController', () => {
     // Must NOT invoke `open` which would restart the healthy browser and lose tabs/forms.
     assert.equal(cmds.length, 1)
     assert.equal(cmds[0][0], 'run-code')
+  })
+
+  it('parses playwright-cli tab-list output including titles with brackets, markdown links, and URLs containing ]( or parens', () => {
+    const raw = [
+      '### Result',
+      '- 0: (current) [Paper [2026] — arXiv](https://en.wikipedia.org/wiki/Foo_(bar))',
+      '- 1: [Search](https://example.com/search?q=a](b))',
+      '- 2: [See [doc](https://inner.example/) notes](https://outer.example/page)',
+    ].join('\n')
+    assert.deepEqual(parsePlaywrightTabList(raw), [
+      { index: 0, active: true, title: 'Paper [2026] — arXiv', url: 'https://en.wikipedia.org/wiki/Foo_(bar)' },
+      { index: 1, active: false, title: 'Search', url: 'https://example.com/search?q=a](b)' },
+      { index: 2, active: false, title: 'See [doc](https://inner.example/) notes', url: 'https://outer.example/page' },
+    ])
+  })
+
+  it('tracks real PNG IHDR viewport dimensions, holds activity lock, and routes dblclick cleanly', async () => {
+    const makePng = (w: number, h: number) => {
+      const b = Buffer.alloc(24)
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]).copy(b)
+      b.writeUInt32BE(w, 16)
+      b.writeUInt32BE(h, 20)
+      return b
+    }
+    assert.deepEqual(readPngDimensions(makePng(800, 600)), { width: 800, height: 600 })
+
+    let lockDepth = 0
+    let lockAcquired = 0
+    const rpcCalls: Array<Record<string, unknown>> = []
+    const ctrl = new LiveBrowserController({
+      ocBrowserBin: '/usr/local/bin/oc-browser',
+      existsSync: () => true,
+      resolveDaemonEndpoint: (stateDir) => ({
+        socketPath: `${stateDir}/sockets/cli/test-browser.sock`,
+        version: '1.61.0',
+        stateDir,
+      }),
+      withLock: async (_dir, fn) => {
+        lockAcquired += 1
+        lockDepth += 1
+        try {
+          return await fn()
+        } finally {
+          lockDepth -= 1
+        }
+      },
+      daemonRpcFn: async (_ep, args) => {
+        assert.equal(lockDepth, 1, 'daemon RPC must execute while holding activity lock')
+        rpcCalls.push(args)
+        const cmd = (args._ as string[])[0]
+        if (cmd === 'tab-list') return { text: '### Result\n- 0: (current) [Resized](https://example.com/)\n' }
+        if (cmd === 'run-code') {
+          return {
+            text: mockRunCodeOutput({
+              url: 'https://example.com/',
+              title: 'Resized',
+              viewport: { width: 800, height: 600 },
+              tabs: [{ index: 0, title: 'Resized', url: 'https://example.com/', active: true }],
+              imageBase64: 'AAAA',
+            }),
+          }
+        }
+        return { text: 'ok' }
+      },
+      readFrameFile: () => makePng(800, 600),
+      unlinkFrameFile: () => {},
+    })
+
+    // First capture reads 800x600 from PNG IHDR
+    const st = await ctrl.getLiveState('main')
+    assert.deepEqual(st.viewport, { width: 800, height: 600 })
+
+    // Next click at center (0.5, 0.5) must target (400, 300), NOT stale (640, 360)
+    rpcCalls.length = 0
+    await ctrl.performAction('main', { action: 'click', x: 0.5, y: 0.5, normalized: true })
+    assert.deepEqual(rpcCalls[0]._, ['mousemove', '400', '300'])
+
+    // dblclick uses run-code so DOM receives authentic clickCount=2
+    rpcCalls.length = 0
+    await ctrl.performAction('main', { action: 'dblclick', x: 0.5, y: 0.5, normalized: true })
+    assert.equal((rpcCalls[0]._ as string[])[0], 'run-code')
+    assert.ok(lockAcquired >= 3)
+  })
+
+  it('sendPlaywrightDaemonRpc preserves split multi-byte UTF-8 and enforces byte cap; resolver rejects symlinks', async () => {
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'lb-sock-test-'))
+    const stateDir = join(tmpRoot, 'agent-state')
+    const outsideDir = join(tmpRoot, 'outside')
+    mkdirSync(join(stateDir, 'sockets', 'cli'), { recursive: true })
+    mkdirSync(outsideDir, { recursive: true })
+
+    const outsideSock = join(outsideDir, 'evil.sock')
+    const realSock = join(stateDir, 'sockets', 'cli', 'ok-browser.sock')
+
+    const server = createNetServer((conn) => {
+      conn.once('data', () => {
+        // Send unsolicited notification + wrong-ID frame + real ID=1 frame with UTF-8 "研究" split mid-sequence!
+        const noise = Buffer.from(
+          JSON.stringify({ method: 'log', params: { msg: 'hi' } }) +
+            '\n' +
+            JSON.stringify({ id: 99, result: { text: 'wrong' } }) +
+            '\n',
+          'utf8',
+        )
+        const full = Buffer.from(JSON.stringify({ id: 1, result: { text: '研究成功' } }) + '\n', 'utf8')
+        const combined = Buffer.concat([noise, full])
+        const splitAt = combined.indexOf(0xe7) + 1 // split inside first char of 研
+        conn.write(combined.subarray(0, splitAt))
+        setTimeout(() => conn.write(combined.subarray(splitAt)), 10)
+      })
+    })
+    const evilServer = createNetServer()
+    await new Promise<void>((r) => server.listen(realSock, r))
+    await new Promise<void>((r) => evilServer.listen(outsideSock, r))
+    try {
+      // Symlinked stateDir pointing to another agent's dir inside stateRoot must be rejected
+      const peerLinkDir = join(tmpRoot, 'other-agent-symlink')
+      symlinkSync(stateDir, peerLinkDir)
+      assert.equal(resolvePlaywrightDaemonEndpoint(peerLinkDir, tmpRoot), null)
+
+      // Symlinked socket pointing outside stateDir must be rejected
+      const badDir = join(tmpRoot, 'bad-state')
+      mkdirSync(join(badDir, 'sockets', 'cli'), { recursive: true })
+      symlinkSync(outsideSock, join(badDir, 'sockets', 'cli', 'link-browser.sock'))
+      assert.equal(resolvePlaywrightDaemonEndpoint(badDir, tmpRoot), null)
+
+      // Real socket inside stateDir must be accepted
+      const ep = resolvePlaywrightDaemonEndpoint(stateDir, tmpRoot)
+      assert.ok(ep)
+      assert.equal(ep.socketPath, realSock)
+
+      // Split UTF-8 decodes cleanly without U+FFFD corruption
+      const res = await sendPlaywrightDaemonRpc(ep, { _: ['tab-list'] }, { cwd: tmpRoot, timeoutMs: 2000 })
+      assert.equal(res.text, '研究成功')
+
+      // Byte cap rejects oversized daemon response
+      await assert.rejects(
+        () => sendPlaywrightDaemonRpc(ep, { _: ['tab-list'] }, { cwd: tmpRoot, timeoutMs: 2000, maxBytes: 8 }),
+        /too large/,
+      )
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()))
+      await new Promise<void>((r) => evilServer.close(() => r()))
+      rmSync(tmpRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('uses fast direct daemon Unix socket for capture, click, type+submit, wheel, and oversized PNG JPEG fallback', async () => {
+    const rpcCalls: Array<Record<string, unknown>> = []
+    const unlinked: string[] = []
+    let cliCalls = 0
+    let shotBuf = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) // PNG magic
+
+    const ctrl = new LiveBrowserController({
+      ocBrowserBin: '/usr/local/bin/oc-browser',
+      existsSync: () => true,
+      execFn: async () => {
+        cliCalls += 1
+        return { stdout: '', stderr: '' }
+      },
+      resolveDaemonEndpoint: (stateDir) => ({
+        socketPath: `${stateDir}/sockets/cli/test-browser.sock`,
+        version: '1.61.0',
+        stateDir,
+      }),
+      daemonRpcFn: async (_ep, args) => {
+        rpcCalls.push(args)
+        const cmd = (args._ as string[])[0]
+        if (cmd === 'tab-list') {
+          return { text: '### Result\n- 0: (current) [Scholar](https://scholar.google.com/)\n' }
+        }
+        if (cmd === 'run-code') {
+          return {
+            text: mockRunCodeOutput({
+              url: 'https://scholar.google.com/',
+              title: 'Scholar',
+              viewport: { width: 1280, height: 720 },
+              tabs: [{ index: 0, title: 'Scholar', url: 'https://scholar.google.com/', active: true }],
+              imageBase64: 'SlBFRw==',
+            }),
+          }
+        }
+        return { text: 'ok' }
+      },
+      readFrameFile: () => shotBuf,
+      unlinkFrameFile: (p) => unlinked.push(p),
+    })
+
+    // 1) Fast GET live frame (PNG)
+    const live = await ctrl.getLiveState('main')
+    assert.equal(live.active, true)
+    assert.equal(live.mimeType, 'image/png')
+    assert.equal(live.title, 'Scholar')
+    assert.equal(cliCalls, 0)
+    assert.equal(unlinked.length, 1)
+
+    // 2) Fast click sends mousemove -> mousedown -> mouseup -> tab-list -> screenshot (zero CLI spawn)
+    rpcCalls.length = 0
+    await ctrl.performAction('main', { action: 'click', x: 0.5, y: 0.25, normalized: true })
+    assert.deepEqual(
+      rpcCalls.map((c) => c._),
+      [
+        ['mousemove', '640', '180'],
+        ['mousedown'],
+        ['mouseup'],
+        ['tab-list'],
+        ['screenshot'],
+      ],
+    )
+    assert.equal(cliCalls, 0)
+
+    // 3) Fast type + submit sends type -> press Enter (no slow --submit snapshot)
+    rpcCalls.length = 0
+    await ctrl.performAction('main', { action: 'type', text: 'transformer', submit: true })
+    assert.deepEqual(
+      rpcCalls.map((c) => c._),
+      [
+        ['type', 'transformer'],
+        ['press', 'Enter'],
+        ['tab-list'],
+        ['screenshot'],
+      ],
+    )
+
+    // 4) Fast wheel reuses cached tabs (skips extra tab-list roundtrip)
+    rpcCalls.length = 0
+    await ctrl.performAction('main', { action: 'wheel', deltaX: 0, deltaY: 240 })
+    assert.deepEqual(
+      rpcCalls.map((c) => c._),
+      [
+        ['mousewheel', '0', '240'],
+        ['screenshot'],
+      ],
+    )
+
+    // 5) Oversized PNG (>900 KiB) automatically steps down to JPEG run-code over the same socket
+    rpcCalls.length = 0
+    shotBuf = Buffer.alloc(LIVE_BROWSER_MAX_IMAGE_BYTES + 1024, 0x41)
+    const compressed = await ctrl.getLiveState('main')
+    assert.equal(compressed.mimeType, 'image/jpeg')
+    assert.equal(compressed.imageBase64, 'SlBFRw==')
+    assert.equal((rpcCalls.at(-1)?._ as string[])[0], 'run-code')
+    assert.equal(cliCalls, 0)
   })
 })

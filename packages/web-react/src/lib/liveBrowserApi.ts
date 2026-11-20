@@ -25,7 +25,7 @@ export interface LiveBrowserState {
   viewport?: { width: number; height: number };
   tabs?: LiveBrowserTabInfo[];
   imageBase64?: string;
-  mimeType?: "image/jpeg";
+  mimeType?: "image/jpeg" | "image/png";
   capturedAt?: number;
 }
 
