@@ -1,3 +1,4 @@
+import '../styles/containerWebPreview.css'
 import {
   CONTAINER_PREVIEW_DESKTOP_VIEWPORT,
   CONTAINER_PREVIEW_MOBILE_VIEWPORT,

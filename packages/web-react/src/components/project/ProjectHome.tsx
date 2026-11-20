@@ -7,10 +7,8 @@ import {
   Clock3,
   Download,
   FolderOpen,
-  Menu,
   MessageSquare,
   MoreHorizontal,
-  PanelLeft,
   Pencil,
   Pin,
   Plus,
@@ -43,6 +41,7 @@ import { cn } from "../../lib/utils";
 import { ProjectAssetsPanel } from "../ProjectAssetsPanel";
 import { useSignedDownload } from "../chat/media";
 import { ProjectFolderBrowser } from "./ProjectFolderBrowser";
+import { WorkspaceShellHeader } from "../ui/WorkspaceShellHeader";
 import { OutputRow, OutputViewer } from "./OutputViewer";
 import { ScheduledRecipeChips } from "./ScheduledRecipes";
 import {
@@ -267,27 +266,13 @@ export function ProjectHome(props: ProjectHomeProps) {
     <div data-testid="project-home" className="flex h-full min-h-0 flex-col bg-bg">
       {confirmEl}
       {promptEl}
-      <header className="flex shrink-0 items-center gap-2 px-3 pb-2 header-safe-t md:h-14 md:px-4 md:pb-0">
-        <IconButton
-          onClick={onOpenMobileNav}
-          aria-label="打开菜单"
-          shape="square"
-          className="md:hidden"
-        >
-          <Menu size={18} />
-        </IconButton>
-        {sidebarCollapsed && onExpandSidebar && (
-          <IconButton
-            onClick={onExpandSidebar}
-            aria-label="展开侧栏"
-            shape="square"
-            className="hidden md:inline-flex"
-          >
-            <PanelLeft size={18} />
-          </IconButton>
-        )}
-        <span className="text-meta text-muted">项目</span>
-      </header>
+      <WorkspaceShellHeader
+        onOpenMobileNav={onOpenMobileNav}
+        sidebarCollapsed={sidebarCollapsed}
+        onExpandSidebar={onExpandSidebar}
+      >
+        <span className="text-meta font-medium text-muted">项目</span>
+      </WorkspaceShellHeader>
 
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
         <div className="@container mx-auto flex w-full max-w-3xl flex-col gap-4 px-4 pb-10 pt-1 md:px-5 md:pt-4">

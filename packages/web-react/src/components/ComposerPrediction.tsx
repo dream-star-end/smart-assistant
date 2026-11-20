@@ -12,6 +12,7 @@ export default function ComposerPrediction({
   rest,
   large,
   hintId,
+  scrollTop = 0,
   onShown,
 }: {
   value: string;
@@ -20,6 +21,8 @@ export default function ComposerPrediction({
   large: boolean;
   /** textarea 和发送按钮的 aria-describedby 指向这里的读屏提示。 */
   hintId: string;
+  /** 与 textarea 滚动偏移同步，防止超过 max-h-[240px] 长草稿时预测文字错位。 */
+  scrollTop?: number;
   /**
    * 报告正在显示的预测和浮层高度:Composer 按高度撑开输入框(整句预测比空输入框长时会折行),
    * 并且只有真的显示出来的整句预测才允许被发送 —— 浮层加载失败时用户看不到的字不会被发出去。
@@ -50,12 +53,14 @@ export default function ComposerPrediction({
         large ? "text-[17.5px]" : "text-[16px]",
       )}
     >
-      <span aria-hidden="true" className="invisible">
-        {value}
-      </span>
-      <span aria-hidden="true" className="text-faint">
-        {rest}
-      </span>
+      <div style={scrollTop > 0 ? { transform: `translateY(-${scrollTop}px)` } : undefined}>
+        <span aria-hidden="true" className="invisible">
+          {value}
+        </span>
+        <span aria-hidden="true" className="text-faint">
+          {rest}
+        </span>
+      </div>
       <span id={hintId} className="sr-only">
         {value === ""
           ? `输入预测：${rest}。直接发送就发出这句；按 Tab 填入后可以修改。`

@@ -1,9 +1,14 @@
 import type { PromptPrivacySupport } from '@openclaude/protocol/browser'
 import { Monitor, Moon, Sun } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useSyncExternalStore } from 'react'
 import { useLocalComposerPrefs } from '../../hooks/useLocalComposerPrefs'
 import type { Theme } from '../../hooks/useTheme'
 import { api, apiErrorMessage } from '../../lib/api'
+import {
+  getDesktopNotifyState,
+  requestDesktopNotifyToggle,
+  subscribeDesktopNotifyState,
+} from '../../lib/desktopNotifyPref'
 import { setInputPredictionPref, setIntelligentUiPref, useIntelligentUiState } from '../../lib/intelligentUi'
 import { longContextCostConfirmationRequired } from '../../lib/cursorModelPicker'
 import {
@@ -90,6 +95,11 @@ export function PreferencesTab({
   const [confirmLongContext, confirmLongContextEl] = useConfirm()
   const composerPrefs = useLocalComposerPrefs()
   const iui = useIntelligentUiState()
+  const desktopNotify = useSyncExternalStore(
+    subscribeDesktopNotifyState,
+    getDesktopNotifyState,
+    getDesktopNotifyState,
+  )
 
   useEffect(() => {
     let alive = true
@@ -388,6 +398,28 @@ export function PreferencesTab({
         <div className="mb-3">
           <QqBindingCard auth={auth} prefs={prefs} onPatch={patch} />
         </div>
+        <label className="flex items-center justify-between gap-3 py-2" data-testid="desktop-notify-pref">
+          <span className="min-w-0">
+            <span className="block text-section text-fg">桌面通知</span>
+            <span className="block text-caption text-faint">
+              {desktopNotify.permission === 'unsupported'
+                ? '当前浏览器不支持系统桌面通知'
+                : desktopNotify.permission === 'denied'
+                  ? '浏览器已拦截通知权限，请在地址栏站点设置中允许后重新开启'
+                  : '后台会话完成、出错或等待你拍板时发送系统通知'}
+            </span>
+          </span>
+          <Switch
+            aria-label="桌面通知"
+            checked={desktopNotify.enabled}
+            disabled={
+              desktopNotify.permission === 'unsupported' || desktopNotify.permission === 'denied'
+            }
+            onCheckedChange={(checked) => {
+              void requestDesktopNotifyToggle(checked)
+            }}
+          />
+        </label>
         {NOTIF_FIELDS.map((f) => (
           <label key={String(f.key)} className="flex items-center justify-between gap-3 py-2">
             <span className="min-w-0">

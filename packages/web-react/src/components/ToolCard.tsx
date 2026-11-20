@@ -88,23 +88,17 @@ export function ToolCard({
 
   // 运行中（流式）默认展开以便边流边看 diff/输出；历史（挂载即完成）默认折叠。
   // 未成功的卡也默认展开:错误详情是用户此刻最需要的信息,不该多一次点击。
-  // 初值只在挂载求一次，之后用户手动 toggle 为权威（依赖稳定 key 保持实例）。
-  // 过程时间轴行(step):运行中 / 未成功都不自动摊开输出(输出只在点开这一步后出现),
-  // 未成功只标首行原因。用户在运行中点开过的,跑完自动收起(手动开合过则以用户为准)。
+  // 过程时间轴行(step, OCV5-817):ToolCard 只在用户主动点开外层步骤行(process-step-row)后挂载,
+  // 因此挂载即默认展开 ToolBody,消除「点开步骤 → 技术详情 → 再点一次折叠 ToolCard」的多余层级。
   const [open, setOpen] = useState(
-    () => (isRunning && !step) || isBlocked || status.isConfirmation || (hasError && !step),
+    () => step || isRunning || isBlocked || status.isConfirmation || hasError,
   );
   const userToggled = useRef(false);
   // 挂载时还是「完成/折叠」、随后归并成 error:true 的历史消息,同样按 F1 展开(T-07);
   // 用户已手动折叠过则尊重用户,不再跳动。
   useEffect(() => {
-    if (hasError && !step && !userToggled.current) setOpen(true);
-  }, [hasError, step]);
-  const wasRunning = useRef(isRunning);
-  useEffect(() => {
-    if (step && wasRunning.current && !isRunning && !isBlocked && !userToggled.current) setOpen(false);
-    wasRunning.current = isRunning;
-  }, [isRunning, isBlocked, step]);
+    if (hasError && !userToggled.current) setOpen(true);
+  }, [hasError]);
 
   // 无 body 的卡表头不渲染成 button(L5):没有可展开的内容,不该有可点语义。
   const HeaderTag = hasBody ? ("button" as const) : ("div" as const);

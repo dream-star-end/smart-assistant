@@ -29,6 +29,7 @@ import {
   type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
   type WheelEvent as ReactWheelEvent,
   useCallback,
   useEffect,
@@ -43,8 +44,8 @@ import {
   sendLiveBrowserAction,
 } from "../../lib/liveBrowserApi";
 import type { AuthSession } from "../../lib/types";
-import { Spinner } from "../ui";
-import type { LiveBrowserHandoffRequest } from "./inspectorState";
+import { Spinner, useToast } from "../ui";
+import { type LiveBrowserHandoffRequest, useInspectorStopTurn } from "./inspectorState";
 import "./liveBrowser.css";
 
 const QUICK_PRESETS = [
@@ -79,10 +80,24 @@ const SPECIAL_KEY_MAP: Record<string, string> = {
 
 const CTRL_COMBO_KEYS = new Set(["a", "c", "v", "x", "z"]);
 
+const TOUCH_DRAG_SLOP = 8;
+const TOUCH_SCROLL_GAIN = 2;
+const MAX_POLL_BACKOFF_MS = 30_000;
+
 interface ClickRipple {
   id: number;
   xPct: number;
   yPct: number;
+}
+
+interface TouchScrollGesture {
+  pointerId: number;
+  startX: number;
+  startY: number;
+  lastX: number;
+  lastY: number;
+  dragging: boolean;
+  lastSentAt: number;
 }
 
 export interface LiveBrowserStageProps {
@@ -96,6 +111,8 @@ export interface LiveBrowserStageProps {
   onHandoffSettled?: (nonce: number) => void;
   /** Prefill a continuation prompt into Composer when the user hands control back. */
   onHandBackToComposer?: (draft: string) => void;
+  /** Stop the currently running assistant turn so the user can take over immediately. */
+  onStopTurn?: () => void;
   /** Reports active status upward so BrowserView can render a live status indicator. */
   onActiveStateChange?: (active: boolean) => void;
 }
@@ -142,8 +159,13 @@ export function LiveBrowserStage({
   handoffRequest = null,
   onHandoffSettled,
   onHandBackToComposer,
+  onStopTurn,
   onActiveStateChange,
 }: LiveBrowserStageProps) {
+  const toast = useToast();
+  const ctxStopTurn = useInspectorStopTurn();
+  const effectiveStopTurn = onStopTurn ?? ctxStopTurn;
+
   const [state, setState] = useState<LiveBrowserState | null>(null);
   const [initialLoading, setInitialLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -152,6 +174,7 @@ export function LiveBrowserStage({
   const [error, setError] = useState<string | null>(null);
   const [originMismatch, setOriginMismatch] = useState<HandoffOriginMismatch | null>(null);
   const [handoffWaiting, setHandoffWaiting] = useState(false);
+  const [pollEpoch, setPollEpoch] = useState(0);
 
   const [launchUrl, setLaunchUrl] = useState("https://scholar.google.com");
   const [addressDraft, setAddressDraft] = useState("");
@@ -171,7 +194,14 @@ export function LiveBrowserStage({
   const appliedSeqRef = useRef(0);
   const pollAbortRef = useRef<AbortController | null>(null);
   const pollInFlightRef = useRef(false);
+  const pollErrorStreakRef = useRef(0);
   const actionInFlightRef = useRef(false);
+  const userClosingRef = useRef(false);
+  const pendingTakeoverAfterStopRef = useRef(false);
+  const prevActiveRef = useRef(false);
+  const prevTakeoverRef = useRef(false);
+  const touchGestureRef = useRef<TouchScrollGesture | null>(null);
+  const suppressNextClickRef = useRef(false);
   const keyBufferRef = useRef<{ text: string; timer: number | null }>({ text: "", timer: null });
   const inputQueueRef = useRef<LiveBrowserActionPayload[]>([]);
   const wheelBufferRef = useRef<{ dx: number; dy: number; x?: number; y?: number; timer: number | null }>({
@@ -259,13 +289,36 @@ export function LiveBrowserStage({
   }, [clearPendingInputBuffers]);
 
   // Honest exclusive control: whenever the assistant is actively running a turn (local or any
-  // server-side session for this agent), drop takeover back to watch-only mode and discard pending buffers.
+  // server-side session for this agent), drop takeover back to watch-only mode, discard pending
+  // buffers, and explain why via toast instead of silently dropping user input.
   useEffect(() => {
     if (lockedByAssistant) {
+      const wasInTakeover = prevTakeoverRef.current;
+      prevTakeoverRef.current = false;
       setTakeover(false);
       clearPendingInputBuffers();
+      if (wasInTakeover) {
+        const reasonSuffix = state?.reason ? `（${state.reason}）` : "";
+        toast(
+          state?.agentBusy && !running
+            ? `同智能体其他后台任务正在使用浏览器，已自动切回观看模式${reasonSuffix}`
+            : `助手已接管浏览器，已自动切回观看模式${reasonSuffix}`,
+          "info",
+        );
+      }
+      return;
     }
-  }, [lockedByAssistant, clearPendingInputBuffers]);
+    if (pendingTakeoverAfterStopRef.current && state?.active) {
+      pendingTakeoverAfterStopRef.current = false;
+      setTakeover(true);
+      window.requestAnimationFrame(() => stageRef.current?.focus({ preventScroll: true }));
+      toast("已暂停助手并进入人工接管", "success");
+    }
+  }, [lockedByAssistant, clearPendingInputBuffers, running, state?.agentBusy, state?.active, state?.reason, toast]);
+
+  useEffect(() => {
+    prevTakeoverRef.current = effectiveTakeover;
+  }, [effectiveTakeover]);
 
   // Reset takeover, expanded theater view, and address draft if switching agent.
   useEffect(() => {
@@ -277,6 +330,10 @@ export function LiveBrowserStage({
     setHandoffWaiting(false);
     setState(null);
     setInitialLoading(true);
+    pollErrorStreakRef.current = 0;
+    pendingTakeoverAfterStopRef.current = false;
+    prevActiveRef.current = false;
+    prevTakeoverRef.current = false;
     clearPendingInputBuffers();
     pendingHandoffRef.current = null;
     pendingPostOpenHandoffRef.current = null;
@@ -290,6 +347,9 @@ export function LiveBrowserStage({
     (seq: number, next: LiveBrowserState) => {
       if (!mountedRef.current || seq < appliedSeqRef.current) return;
       appliedSeqRef.current = seq;
+      pollErrorStreakRef.current = 0;
+      const wasActive = prevActiveRef.current;
+      prevActiveRef.current = next.active;
       setState(next);
       setInitialLoading(false);
       setError(null);
@@ -297,9 +357,19 @@ export function LiveBrowserStage({
       if (!next.active) {
         pendingPostOpenHandoffRef.current = null;
         setOriginMismatch(null);
+        const unexpectedClose = wasActive && !userClosingRef.current;
+        userClosingRef.current = false;
+        pendingTakeoverAfterStopRef.current = false;
+        prevTakeoverRef.current = false;
         setTakeover(false);
         setExpanded(false);
         clearPendingInputBuffers();
+        if (unexpectedClose) {
+          toast(
+            next.reason ? `云端浏览器已关闭（${next.reason}）` : "云端浏览器连接已结束，可重新启动。",
+            "info",
+          );
+        }
       } else if (next.agentBusy) {
         setTakeover(false);
         clearPendingInputBuffers();
@@ -310,7 +380,7 @@ export function LiveBrowserStage({
         onHandoffSettledRef.current?.(post.nonce);
       }
     },
-    [onActiveStateChange, clearPendingInputBuffers, activateHandoffOnActivePage],
+    [onActiveStateChange, clearPendingInputBuffers, activateHandoffOnActivePage, toast],
   );
 
   // Sync address bar with live URL unless user is currently editing it.
@@ -320,9 +390,9 @@ export function LiveBrowserStage({
     }
   }, [state?.url, addressEditing]);
 
-  const pollOnce = useCallback(async () => {
-    if (!mountedRef.current || actionInFlightRef.current || pollInFlightRef.current) return;
-    if (typeof document !== "undefined" && document.hidden) return;
+  const pollOnce = useCallback(async (): Promise<boolean> => {
+    if (!mountedRef.current || actionInFlightRef.current || pollInFlightRef.current) return true;
+    if (typeof document !== "undefined" && document.hidden) return true;
     const ctrl = new AbortController();
     pollAbortRef.current = ctrl;
     pollInFlightRef.current = true;
@@ -333,12 +403,15 @@ export function LiveBrowserStage({
         quality: 70,
         signal: ctrl.signal,
       });
-      if (ctrl.signal.aborted) return;
+      if (ctrl.signal.aborted) return true;
       applyState(mySeq, next);
+      return true;
     } catch (err) {
-      if (isAbortError(err) || !mountedRef.current) return;
+      if (isAbortError(err) || !mountedRef.current) return true;
+      pollErrorStreakRef.current += 1;
       setInitialLoading(false);
       setError((prev) => prev ?? errorMessageOf(err));
+      return false;
     } finally {
       if (pollAbortRef.current === ctrl) {
         pollAbortRef.current = null;
@@ -347,15 +420,30 @@ export function LiveBrowserStage({
     }
   }, [agentId, applyState]);
 
-  // Adaptive chained polling: schedules the next tick only AFTER the current GET settles so slow
-  // frames are never aborted mid-flight; pauses when tab is hidden.
+  const handleRetryConnection = useCallback(() => {
+    pollErrorStreakRef.current = 0;
+    setError(null);
+    if (state && !state.available) {
+      setState(null);
+      setInitialLoading(true);
+    }
+    setPollEpoch((n) => n + 1);
+  }, [state]);
+
+  // Adaptive chained polling with exponential backoff on errors; pauses when tab is hidden.
   const isActive = state?.active === true;
   const isAvailable = state?.available !== false;
   useEffect(() => {
     if (!isAvailable && state !== null) return;
     let cancelled = false;
     let timer: number | null = null;
-    const intervalMs = isActive ? (effectiveTakeover ? 1200 : 900) : lockedByAssistant ? 1800 : 4000;
+    const baseIntervalMs = isActive ? (effectiveTakeover ? 1200 : 900) : lockedByAssistant ? 1800 : 4000;
+
+    const nextDelayMs = () => {
+      const streak = pollErrorStreakRef.current;
+      if (streak <= 0) return baseIntervalMs;
+      return Math.min(MAX_POLL_BACKOFF_MS, baseIntervalMs * 2 ** Math.min(streak, 4));
+    };
 
     const schedule = (delay: number) => {
       if (cancelled) return;
@@ -369,13 +457,13 @@ export function LiveBrowserStage({
     const runCycle = async () => {
       if (cancelled) return;
       await pollOnce();
-      schedule(intervalMs);
+      schedule(nextDelayMs());
     };
 
-    if (state === null) {
+    if (state === null || pollEpoch > 0) {
       void runCycle();
     } else {
-      schedule(intervalMs);
+      schedule(nextDelayMs());
     }
 
     const onVisibility = () => {
@@ -390,6 +478,7 @@ export function LiveBrowserStage({
           window.clearTimeout(timer);
           timer = null;
         }
+        pollErrorStreakRef.current = 0;
         void runCycle();
       }
     };
@@ -399,7 +488,7 @@ export function LiveBrowserStage({
       if (timer !== null) window.clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [agentId, isActive, isAvailable, lockedByAssistant, effectiveTakeover, pollOnce, state === null]);
+  }, [agentId, isActive, isAvailable, lockedByAssistant, effectiveTakeover, pollOnce, state === null, pollEpoch]);
 
   const runAction = useCallback(
     async (payload: LiveBrowserActionPayload) => {
@@ -541,11 +630,26 @@ export function LiveBrowserStage({
 
   const handleCanvasClick = (e: ReactMouseEvent<HTMLImageElement>) => {
     if (!effectiveTakeover) return;
+    if (suppressNextClickRef.current) {
+      suppressNextClickRef.current = false;
+      return;
+    }
     const pt = normalizedCoords(e);
     if (!pt) return;
     stageRef.current?.focus({ preventScroll: true });
     flushKeyBufferToQueue();
     if (enqueueCanvasInput({ action: "click", x: pt.x, y: pt.y, normalized: true, button: "left" })) {
+      showRipple(pt.x, pt.y);
+    }
+  };
+
+  const handleCanvasDoubleClick = (e: ReactMouseEvent<HTMLImageElement>) => {
+    if (!effectiveTakeover) return;
+    const pt = normalizedCoords(e);
+    if (!pt) return;
+    stageRef.current?.focus({ preventScroll: true });
+    flushKeyBufferToQueue();
+    if (enqueueCanvasInput({ action: "dblclick", x: pt.x, y: pt.y, normalized: true })) {
       showRipple(pt.x, pt.y);
     }
   };
@@ -558,6 +662,74 @@ export function LiveBrowserStage({
     flushKeyBufferToQueue();
     if (enqueueCanvasInput({ action: "click", x: pt.x, y: pt.y, normalized: true, button: "right" })) {
       showRipple(pt.x, pt.y);
+    }
+  };
+
+  const handleTouchPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (!effectiveTakeover || e.pointerType !== "touch") return;
+    if (touchGestureRef.current) return;
+    touchGestureRef.current = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      lastX: e.clientX,
+      lastY: e.clientY,
+      dragging: false,
+      lastSentAt: 0,
+    };
+  };
+
+  const handleTouchPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (!effectiveTakeover || e.pointerType !== "touch") return;
+    const g = touchGestureRef.current;
+    if (!g || g.pointerId !== e.pointerId) return;
+    const totalDist = Math.hypot(e.clientX - g.startX, e.clientY - g.startY);
+    if (!g.dragging) {
+      if (totalDist <= TOUCH_DRAG_SLOP) return;
+      g.dragging = true;
+      suppressNextClickRef.current = true;
+    }
+    const now = performance.now();
+    if (now - g.lastSentAt < 120) return;
+    const dx = Math.round((g.lastX - e.clientX) * TOUCH_SCROLL_GAIN);
+    const dy = Math.round((g.lastY - e.clientY) * TOUCH_SCROLL_GAIN);
+    g.lastX = e.clientX;
+    g.lastY = e.clientY;
+    g.lastSentAt = now;
+    if (dx !== 0 || dy !== 0) {
+      const pt = normalizedCoords(e);
+      enqueueCanvasInput({
+        action: "wheel",
+        x: pt?.x,
+        y: pt?.y,
+        normalized: true,
+        deltaX: dx,
+        deltaY: dy,
+      });
+    }
+  };
+
+  const handleTouchPointerEnd = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const g = touchGestureRef.current;
+    if (!g || g.pointerId !== e.pointerId) return;
+    touchGestureRef.current = null;
+    if (g.dragging && effectiveTakeover) {
+      const dx = Math.round((g.lastX - e.clientX) * TOUCH_SCROLL_GAIN);
+      const dy = Math.round((g.lastY - e.clientY) * TOUCH_SCROLL_GAIN);
+      if (dx !== 0 || dy !== 0) {
+        const pt = normalizedCoords(e);
+        enqueueCanvasInput({
+          action: "wheel",
+          x: pt?.x,
+          y: pt?.y,
+          normalized: true,
+          deltaX: dx,
+          deltaY: dy,
+        });
+      }
+      window.setTimeout(() => {
+        suppressNextClickRef.current = false;
+      }, 300);
     }
   };
 
@@ -646,6 +818,8 @@ export function LiveBrowserStage({
 
   const handleHandBack = () => {
     takeoverActiveRef.current = false;
+    prevTakeoverRef.current = false;
+    pendingTakeoverAfterStopRef.current = false;
     clearPendingInputBuffers();
     setTakeover(false);
     setExpanded(false);
@@ -655,7 +829,17 @@ export function LiveBrowserStage({
     if (onHandBackToComposer) {
       const label = state?.title?.trim() || state?.url?.trim() || "当前网页";
       onHandBackToComposer(customPrompt || `我已在云端浏览器完成操作（当前页面：${label}），请继续刚才的任务。`);
+      toast("已交还控制权，并将续跑指令填入输入框", "success");
+    } else {
+      toast("已交还云端浏览器控制权", "success");
     }
+  };
+
+  const handlePauseAndTakeover = () => {
+    if (!effectiveStopTurn) return;
+    pendingTakeoverAfterStopRef.current = true;
+    effectiveStopTurn();
+    toast("正在暂停助手，暂停完成后自动进入人工接管…", "info");
   };
 
   // Fulfill one-click handoff requests emitted from chat `browser_handoff` cards.
@@ -730,6 +914,7 @@ export function LiveBrowserStage({
   }
 
   if (state && !state.available) {
+    const customReason = state.reason && state.reason !== "unavailable" ? state.reason : null;
     return (
       <div className="lb-root" data-testid="live-browser-unavailable">
         <div className="lb-idle-surface">
@@ -738,8 +923,19 @@ export function LiveBrowserStage({
           </span>
           <h3 className="lb-idle-title">当前环境未启用云端浏览器</h3>
           <p className="lb-idle-desc">
-            该运行容器暂未挂载实时浏览器引擎，助手的浏览器步骤快照仍可在「步骤记录」中查看。
+            {customReason
+              ? `${customReason}（容器冷启动中可稍候点击重新检测；历史步骤快照仍可在「步骤记录」查看）`
+              : "该运行容器暂未挂载实时浏览器引擎，若容器正在冷启动可点击重新检测；助手的浏览器步骤快照仍可在「步骤记录」中查看。"}
           </p>
+          <button
+            type="button"
+            className="lb-preset-chip"
+            data-testid="live-browser-retry-available"
+            onClick={handleRetryConnection}
+          >
+            <RotateCw size={12} aria-hidden />
+            重新检测
+          </button>
         </div>
       </div>
     );
@@ -751,9 +947,19 @@ export function LiveBrowserStage({
         {error && (
           <div className="lb-error-banner" role="alert" data-testid="live-browser-error">
             <span>{error}</span>
-            <button type="button" className="lb-error-close" aria-label="关闭提示" onClick={() => setError(null)}>
-              <X size={13} />
-            </button>
+            <div className="lb-error-actions">
+              <button
+                type="button"
+                className="lb-error-retry"
+                data-testid="live-browser-error-retry"
+                onClick={handleRetryConnection}
+              >
+                立即重试
+              </button>
+              <button type="button" className="lb-error-close" aria-label="关闭提示" onClick={() => setError(null)}>
+                <X size={13} />
+              </button>
+            </div>
           </div>
         )}
         {handoffWaiting && (
@@ -819,9 +1025,19 @@ export function LiveBrowserStage({
       {error && (
         <div className="lb-error-banner" role="alert" data-testid="live-browser-error">
           <span>{error}</span>
-          <button type="button" className="lb-error-close" aria-label="关闭提示" onClick={() => setError(null)}>
-            <X size={13} />
-          </button>
+          <div className="lb-error-actions">
+            <button
+              type="button"
+              className="lb-error-retry"
+              data-testid="live-browser-error-retry"
+              onClick={handleRetryConnection}
+            >
+              立即重试
+            </button>
+            <button type="button" className="lb-error-close" aria-label="关闭提示" onClick={() => setError(null)}>
+              <X size={13} />
+            </button>
+          </div>
         </div>
       )}
 
@@ -941,6 +1157,18 @@ export function LiveBrowserStage({
                 <Check size={13} />
                 交还助手
               </button>
+            ) : lockedByAssistant && running && effectiveStopTurn ? (
+              <button
+                type="button"
+                className="lb-cta-btn"
+                data-variant="watch"
+                title="暂停当前助手回合，并自动进入人工接管"
+                data-testid="live-browser-pause-takeover-btn"
+                onClick={handlePauseAndTakeover}
+              >
+                <Hand size={13} />
+                暂停并接管
+              </button>
             ) : (
               <button
                 type="button"
@@ -984,7 +1212,10 @@ export function LiveBrowserStage({
               disabled={busy || lockedByAssistant}
               data-testid="live-browser-close-btn"
               onClick={() => {
+                userClosingRef.current = true;
                 takeoverActiveRef.current = false;
+                prevTakeoverRef.current = false;
+                pendingTakeoverAfterStopRef.current = false;
                 clearPendingInputBuffers();
                 setTakeover(false);
                 setExpanded(false);
@@ -1067,6 +1298,10 @@ export function LiveBrowserStage({
           aria-label={effectiveTakeover ? "云端浏览器交互画布（接管中）" : "云端浏览器实时画布"}
           onKeyDown={handleStageKeyDown}
           onWheel={handleCanvasWheel}
+          onPointerDown={handleTouchPointerDown}
+          onPointerMove={handleTouchPointerMove}
+          onPointerUp={handleTouchPointerEnd}
+          onPointerCancel={handleTouchPointerEnd}
         >
           {busy && <span className="lb-progress-bar" aria-hidden />}
           {state.imageBase64 ? (
@@ -1079,6 +1314,7 @@ export function LiveBrowserStage({
                 className="lb-frame-img"
                 data-testid="live-browser-frame"
                 onClick={handleCanvasClick}
+                onDoubleClick={handleCanvasDoubleClick}
                 onContextMenu={handleCanvasContextMenu}
               />
               {ripple && (

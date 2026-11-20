@@ -34,11 +34,17 @@ export function shouldShowHistorySkeleton(p: {
   graceExpired: boolean;
   /** 安全兜底超时已过（有历史分支的封顶，防历史拉取失败时骨架永停）。 */
   capExpired: boolean;
+  /** 当前会话 canonical history 请求已失败：不再用骨架遮蔽错误重试面（OCV5-786）。 */
+  historyError?: boolean;
+  /** 当前会话 canonical history 已落定为空（成功返回 0 条实质消息或 404）：不再空等 capExpired。 */
+  settledEmpty?: boolean;
 }): boolean {
   if (!p.selected || p.gated) return false;
   if (p.cachedCount > 0) return false; // 有缓存消息 → 绝不骨架
   if (p.sending) return false; // 有 in-flight turn → 走 typing 指示
   if (p.loading) return true; // 真请求仍在途时固定 cap 不得伪装成 EmptyState
+  if (p.historyError) return false; // 失败立即让位给错误态 + 重试按钮，不白卡 8s 骨架
+  if (p.settledEmpty) return false; // 已落定为空，不再白等 8s cap
   if (p.knownMessageCount > 0) return !p.capExpired; // 确知有历史 → 骨架至到达/兜底
   if (p.metaKnown) return false; // 权威已知为空会话 → 直接 EmptyState
   return !p.graceExpired; // meta 未知（深链/列表未落定）→ 800ms 兜底窗
@@ -69,7 +75,14 @@ function SkeletonBubble({ side }: { side: "left" | "right" }) {
  * 消息区加载骨架：2~3 条左右交替气泡，容器几何对齐 MessageList
  * （mx-auto max-w-3xl px-5 py-8 gap-4），历史到达时替换为真列表无跳动。
  */
-export function MessageListSkeleton() {
+export function MessageListSkeleton({
+  slow = false,
+  onRetry,
+}: {
+  /** 冷加载超过慢网阈值时在骨架下方浮出轻量重试动作条（OCV5-786）。 */
+  slow?: boolean;
+  onRetry?: () => void;
+} = {}) {
   return (
     <div
       className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8"
@@ -79,6 +92,22 @@ export function MessageListSkeleton() {
       <SkeletonBubble side="right" />
       <SkeletonBubble side="left" />
       <SkeletonBubble side="right" />
+      {slow && onRetry && (
+        <output
+          data-testid="history-skeleton-slow-retry"
+          className="mt-2 flex items-center justify-between gap-3 rounded-xl border border-border/70 bg-surface/80 px-3.5 py-2 text-xs text-muted"
+          aria-live="polite"
+        >
+          <span>加载较慢，网络可能存在波动</span>
+          <button
+            type="button"
+            onClick={onRetry}
+            className="shrink-0 rounded-full bg-hover px-3 py-1 font-medium text-fg transition-colors hover:text-accent [@media(hover:none)]:min-h-11"
+          >
+            重试
+          </button>
+        </output>
+      )}
     </div>
   );
 }

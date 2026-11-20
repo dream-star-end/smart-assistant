@@ -4,6 +4,7 @@ import { type ChatMessage, isRetryingTurnStatus, isServerAuthoredRow } from "../
 import { agentTerminalStatus, isErrorCardHeldWithAnswer } from "../../lib/chat/render";
 import { agentDisplayName } from "./agentNames";
 import { STATUS } from "../../lib/ui/statusTone";
+import { StatusPill } from "../ui";
 import { ProgressiveMarkdown, RecoveredStepContext, type CardCallbacks } from "./cards";
 import { detectShellFileWrites, normalizeToolForDisplay, parseCodexTypeName, stripShellWrapperForDisplay, type ToolInput } from "../tool/format";
 import { detectOcCli, humanStepTitle, resolveToolMeta } from "../tool/meta";
@@ -75,6 +76,7 @@ function LazyPhaseTimelineStrip(props: {
   stepTimings: ReadonlyMap<string, StepTiming>;
   active: boolean;
   selectedPhase: PhaseKind | null;
+  hideFileMetric?: boolean;
   onSelectPhase: (kind: PhaseKind) => void;
 }) {
   const [Comp, setComp] = useState<PhaseSummaryModule["PhaseTimelineStripFromMessages"] | null>(
@@ -1025,7 +1027,7 @@ function ShellGlyph({ active, outcome }: { active: boolean; outcome: "done" | "s
   if (active) {
     return (
       <span aria-hidden data-testid="process-glyph-live" className="oc-orbit relative flex size-6 shrink-0 items-center justify-center">
-        <span className="oc-orbit-core size-2 rounded-full bg-accent" />
+        <StatusPill status="running" variant="dot" size="md" decorative className="oc-orbit-core" />
       </span>
     );
   }
@@ -1358,6 +1360,7 @@ export function ProcessDisclosure<T>({
           stepTimings={stepTimings}
           active={active}
           selectedPhase={phaseFilter}
+          hideFileMetric={Boolean(openPane && changedFiles > 0)}
           onSelectPhase={(kind) => {
             setPhaseFilter(kind);
             setOpen(true);

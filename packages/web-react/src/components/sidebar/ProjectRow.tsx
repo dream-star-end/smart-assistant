@@ -192,7 +192,7 @@ export function ProjectRow({
           dropActive
             ? "bg-accent-soft text-fg ring-1 ring-accent/40"
             : active
-              ? "bg-active text-fg"
+              ? "bg-sidebar-active text-fg shadow-sidebar-active"
               : "text-fg hover:bg-hover",
         )}
       >
@@ -215,7 +215,7 @@ export function ProjectRow({
               onClick={() => onToggle?.(p.id)}
               aria-expanded={!collapsed}
               aria-label={collapsed ? `展开 ${p.name} 的会话` : `收起 ${p.name} 的会话`}
-              className="flex h-full shrink-0 items-center justify-center rounded-sm px-1 text-faint outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-w-9"
+              className="flex h-full shrink-0 items-center justify-center rounded-sm px-1 text-faint outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-w-11"
             >
               {chevron}
             </button>

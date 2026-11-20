@@ -53,7 +53,10 @@ describe("StatusPill 点形态", () => {
     expect(qmark).toHaveAttribute("data-status", "needs_you");
     expect(qmark).toHaveAttribute("title", "等你批准");
     expect(qmark).toHaveClass("bg-status-attention", "ring-status-attention/20");
-    expect(qmark.querySelector("svg")).not.toBeNull();
+    const svg = qmark.querySelector("svg");
+    expect(svg).not.toBeNull();
+    expect(svg).toHaveClass("text-warning-fg");
+    expect(svg).not.toHaveClass("text-white");
   });
 
   it("decorative:旁边已有文字,点只做装饰", () => {

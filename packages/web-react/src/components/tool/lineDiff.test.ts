@@ -1,6 +1,7 @@
 /** 行级 LCS diff(F2)的纯函数单测:上下文识别、行号、退化路径。 */
 import { describe, expect, test } from 'vitest'
 import { diffLines } from './lineDiff'
+import { collapseDiffContext, diffStats, parseUnifiedDiffLines } from './diffHunk'
 
 describe('diffLines', () => {
   test('未变行识别为上下文,变化行标 +/-', () => {
@@ -38,5 +39,48 @@ describe('diffLines', () => {
     expect(rows).toHaveLength(4001)
     expect(rows.filter((r) => r.sign === '-')).toHaveLength(2000)
     expect(rows.filter((r) => r.sign === '+')).toHaveLength(2001)
+  })
+})
+
+describe('OCV5-817 diffStats / collapseDiffContext / parseUnifiedDiffLines', () => {
+  test('diffStats 精确统计新增与删除行数', () => {
+    const rows = diffLines('a\nb\nc', 'a\nb2\nc\nd')
+    expect(diffStats(rows)).toEqual({ added: 2, removed: 1 })
+  })
+
+  test('collapseDiffContext 按 ±3 行折叠中间大段未改动上下文，展开单个 gap 后恢复', () => {
+    const before = Array.from({ length: 20 }, (_, i) => `line-${i + 1}`)
+    const after = [...before]
+    after[0] = 'line-1-changed'
+    after[19] = 'line-20-changed'
+    const rows = diffLines(before.join('\n'), after.join('\n'))
+    const collapsed = collapseDiffContext(rows, 3)
+    const gaps = collapsed.filter((e) => e.kind === 'gap')
+    expect(gaps).toHaveLength(1)
+    expect(gaps[0]!.kind === 'gap' && gaps[0]!.count).toBeGreaterThanOrEqual(10)
+
+    const expanded = collapseDiffContext(rows, 3, new Set([gaps[0]!.kind === 'gap' ? gaps[0]!.start : -1]))
+    expect(expanded.filter((e) => e.kind === 'gap')).toHaveLength(0)
+    expect(expanded).toHaveLength(rows.length)
+  })
+
+  test('parseUnifiedDiffLines 区分 file-header / hunk-header 与行号统计', () => {
+    const diff = [
+      '--- a/foo.ts',
+      '+++ b/foo.ts',
+      '@@ -10,3 +10,3 @@ export function demo() {',
+      ' const keep = 1;',
+      '-const oldVal = 2;',
+      '+const newVal = 3;',
+    ].join('\n')
+    const parsed = parseUnifiedDiffLines(diff)
+    expect(parsed.added).toBe(1)
+    expect(parsed.removed).toBe(1)
+    expect(parsed.lines[0]?.kind).toBe('file-header')
+    expect(parsed.lines[1]?.kind).toBe('file-header')
+    expect(parsed.lines[2]?.kind).toBe('hunk-header')
+    expect(parsed.lines[3]).toMatchObject({ kind: 'context', oldNo: 10, newNo: 10, text: 'const keep = 1;' })
+    expect(parsed.lines[4]).toMatchObject({ kind: 'del', oldNo: 11, newNo: null, text: 'const oldVal = 2;' })
+    expect(parsed.lines[5]).toMatchObject({ kind: 'add', oldNo: null, newNo: 11, text: 'const newVal = 3;' })
   })
 })

@@ -18,12 +18,14 @@ import {
   Send,
   X,
 } from "lucide-react";
-import { type ReactNode, Suspense, lazy, useState } from "react";
+import { type ReactNode, Suspense, lazy, useEffect, useState } from "react";
+import type { EvidenceManifest } from "@openclaude/protocol/research";
 import type { ChatMessage } from "../../lib/chat/model";
 import { cn } from "../../lib/utils";
 import type { ToolLike } from "../tool/format";
 import { Button, IconButton, SegmentedControl, Skeleton, Spinner, useToast } from "../ui";
 import { buildAnnotationPrompt } from "./deliverablePreview";
+import type { TargetOutputRequest } from "./inspectorState";
 import { useSignedDownload, useSignedSrc } from "./media";
 import { CopyIconButton, FileChangeEntryView, LineCounts } from "./paneParts";
 import {
@@ -33,6 +35,7 @@ import {
   type OutputKind,
   type OutputMedia,
   type TurnOutputs,
+  baseName,
   classifyDeliverable,
   collectTurnOutputs,
   displayDir,
@@ -40,6 +43,8 @@ import {
   fileSnapshot,
   fileTouchFingerprint,
   formatDuration,
+  matchesOutputPath,
+  outputKindOf,
   pickHero,
   summarizeDeliverableCategories,
   turnSummary,
@@ -48,6 +53,51 @@ import type { WorkTurn } from "./workTurns";
 
 const FilePreview = lazy(() => import("./OutputPreview").then((m) => ({ default: m.FilePreview })));
 const MediaPreview = lazy(() => import("./OutputPreview").then((m) => ({ default: m.MediaPreview })));
+const ResearchEvidenceModule = lazy(() =>
+  import("./researchEvidence").then((m) => ({
+    default: function WorkbenchResearchEvidenceInner({ manifest }: { manifest: EvidenceManifest }) {
+      const [evTab, setEvTab] = useState<"evidence" | "library">("evidence");
+      return (
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center gap-2 border-b border-border/70 px-3.5 py-2">
+            <span className="text-meta font-medium text-fg">引用接地与文献核验</span>
+            <m.CoverageBadge coverage={manifest.coverage} />
+            <div className="ml-auto flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => setEvTab("evidence")}
+                className={cn(
+                  "rounded-md px-2 py-0.5 text-caption font-medium transition-colors",
+                  evTab === "evidence" ? "bg-accent-soft text-accent" : "text-muted hover:text-fg",
+                )}
+              >
+                证据链
+              </button>
+              <button
+                type="button"
+                onClick={() => setEvTab("library")}
+                className={cn(
+                  "rounded-md px-2 py-0.5 text-caption font-medium transition-colors",
+                  evTab === "library" ? "bg-accent-soft text-accent" : "text-muted hover:text-fg",
+                )}
+              >
+                文献库 ({manifest.sources.length})
+              </button>
+            </div>
+          </div>
+          {evTab === "evidence" ? (
+            <div className="px-3.5 pb-3">
+              <m.GatesRow manifest={manifest} />
+              <m.ClaimList manifest={manifest} />
+            </div>
+          ) : (
+            <m.LiteratureLibraryPanel sources={manifest.sources} />
+          )}
+        </div>
+      );
+    },
+  })),
+);
 
 type HeroView = "preview" | "source" | "changes";
 
@@ -596,7 +646,7 @@ function OtherOutputs({
                     <span className="flex shrink-0 items-center gap-2 text-meta">
                       {f.change?.running && <Spinner size={12} className="text-accent" />}
                       {f.change?.hasError && <span className="text-danger">有失败</span>}
-                      {f.change && f.change.hasCounts !== false && (
+                      {f.change && (f.change.hasCounts !== false || f.change.hasError) && (
                         <LineCounts added={f.change.added} removed={f.change.removed} />
                       )}
                     </span>
@@ -677,11 +727,93 @@ function OtherOutputs({
   );
 }
 
+function WorkbenchEvidenceCard({ manifestSrc }: { manifestSrc: string }) {
+  const { url: signed } = useSignedSrc(manifestSrc);
+  const [manifest, setManifest] = useState<EvidenceManifest | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    setManifest(null);
+    setFailed(false);
+    if (!signed) return;
+    let alive = true;
+    fetch(signed)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
+      .then((raw: unknown) => {
+        if (!alive) return;
+        const m = raw as Record<string, unknown> | null;
+        if (
+          m &&
+          typeof m === "object" &&
+          Array.isArray(m.claims) &&
+          Array.isArray(m.quotes) &&
+          Array.isArray(m.sources) &&
+          m.coverage &&
+          typeof m.coverage === "object"
+        ) {
+          setManifest(m as unknown as EvidenceManifest);
+        } else {
+          setFailed(true);
+        }
+      })
+      .catch(() => {
+        if (alive) setFailed(true);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [signed]);
+
+  return (
+    <section
+      data-testid="outputs-evidence-panel"
+      className="mx-4 mt-4 overflow-hidden rounded-xl border border-border/70 bg-surface shadow-soft"
+    >
+      {failed ? (
+        <div className="px-4 py-3 text-meta text-muted">证据清单暂不可用（可能已过期或被清理）。</div>
+      ) : !manifest ? (
+        <div className="flex items-center gap-2 px-4 py-3 text-meta text-muted">
+          <Spinner size={13} className="text-accent" />
+          正在加载科研引用证据清单…
+        </div>
+      ) : (
+        <Suspense fallback={<PreviewFallback />}>
+          <ResearchEvidenceModule manifest={manifest} />
+        </Suspense>
+      )}
+    </section>
+  );
+}
+
+function buildAdHocTarget(target: TargetOutputRequest): { file?: OutputFile; media?: OutputMedia } {
+  const rawPath = target.path?.trim();
+  if (!rawPath) return {};
+  const name = target.title?.trim() || baseName(rawPath);
+  const ext = extOf(rawPath);
+  if (["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"].includes(ext)) {
+    return { media: { src: rawPath, kind: "image", name } };
+  }
+  if (["mp4", "webm", "mov", "mkv"].includes(ext)) {
+    return { media: { src: rawPath, kind: "video", name } };
+  }
+  if (["mp3", "wav", "ogg", "m4a", "flac", "aac"].includes(ext)) {
+    return { media: { src: rawPath, kind: "audio", name } };
+  }
+  return {
+    file: {
+      path: rawPath,
+      name,
+      kind: outputKindOf(rawPath),
+    },
+  };
+}
+
 export function OutputsView({
   messages,
   turns,
   index,
   running,
+  targetOutput,
   onSelectTurn,
   onOpenSteps,
   onOpenStep,
@@ -693,6 +825,8 @@ export function OutputsView({
   index: number;
   /** 正在看的这一轮是否仍在进行。 */
   running: boolean;
+  /** 从对话文件卡 / 科研报告 / 智能 UI 交付物卡外部直达的目标产物定位请求。 */
+  targetOutput?: TargetOutputRequest | null;
   onSelectTurn: (index: number) => void;
   onOpenSteps: () => void;
   onOpenStep: (message: ToolLike) => void;
@@ -701,6 +835,31 @@ export function OutputsView({
 }) {
   const turn = turns[index];
   if (!turn) {
+    if (targetOutput?.path || targetOutput?.manifestSrc) {
+      const adHoc = buildAdHocTarget(targetOutput);
+      return (
+        <div className="min-h-0 flex-1 overflow-y-auto py-4" data-testid="outputs-view">
+          {adHoc.file && (
+            <div className="px-4">
+              <FileHero
+                key={adHoc.file.path}
+                file={adHoc.file}
+                messages={messages}
+                turnEnd={undefined}
+                onOpenStep={onOpenStep}
+                onAnnotateToComposer={onAnnotateToComposer}
+              />
+            </div>
+          )}
+          {adHoc.media && (
+            <div className="px-4">
+              <MediaHero media={adHoc.media} onAnnotateToComposer={onAnnotateToComposer} />
+            </div>
+          )}
+          {targetOutput.manifestSrc && <WorkbenchEvidenceCard manifestSrc={targetOutput.manifestSrc} />}
+        </div>
+      );
+    }
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-2 px-8 text-center" data-testid="outputs-empty">
         <Inbox size={22} className="text-faint" aria-hidden />
@@ -719,6 +878,7 @@ export function OutputsView({
         index={index}
         total={turns.length}
         running={running}
+        targetOutput={targetOutput}
         onSelectTurn={onSelectTurn}
         onOpenSteps={onOpenSteps}
         onOpenStep={onOpenStep}
@@ -734,6 +894,7 @@ function TurnOutputsBody({
   index,
   total,
   running,
+  targetOutput,
   onSelectTurn,
   onOpenSteps,
   onOpenStep,
@@ -744,6 +905,7 @@ function TurnOutputsBody({
   index: number;
   total: number;
   running: boolean;
+  targetOutput?: TargetOutputRequest | null;
   onSelectTurn: (index: number) => void;
   onOpenSteps: () => void;
   onOpenStep: (message: ToolLike) => void;
@@ -751,16 +913,52 @@ function TurnOutputsBody({
 }) {
   const outputs = collectTurnOutputs(turn);
   const [picked, setPicked] = useState<HeroRef | null>(null);
+  const [adHocTarget, setAdHocTarget] = useState<TargetOutputRequest | null>(null);
   const [activeCategory, setActiveCategory] = useState<DeliverableCategory | "all">("all");
+
+  // 响应从主对话文件卡 / 科研报告 / 智能 UI 交付物卡点进来的精确定位请求。
+  useEffect(() => {
+    if (!targetOutput) return;
+    setActiveCategory("all");
+    const targetPath = targetOutput.path?.trim();
+    if (targetPath) {
+      const matchedFile = outputs.files.find((f) => matchesOutputPath(f.path, targetPath));
+      if (matchedFile) {
+        setPicked({ type: "file", path: matchedFile.path });
+        setAdHocTarget(targetOutput.manifestSrc ? targetOutput : null);
+        return;
+      }
+      const matchedMedia = outputs.media.find((m) => matchesOutputPath(m.src, targetPath));
+      if (matchedMedia) {
+        setPicked({ type: "media", src: matchedMedia.src });
+        setAdHocTarget(targetOutput.manifestSrc ? targetOutput : null);
+        return;
+      }
+      setPicked(null);
+      setAdHocTarget(targetOutput);
+    } else if (targetOutput.manifestSrc) {
+      setAdHocTarget(targetOutput);
+    }
+    // biome-ignore lint/correctness/useExhaustiveDependencies: 仅响应新的定位请求 nonce，避免流式重渲覆盖用户手选
+  }, [targetOutput?.nonce]);
+
   const valid =
     picked &&
     (picked.type === "file" ? outputs.files.some((f) => f.path === picked.path) : outputs.media.some((m) => m.src === picked.src));
-  const hero = valid ? picked : pickHero(outputs);
-  const heroFile = hero?.type === "file" ? outputs.files.find((f) => f.path === hero.path) : undefined;
-  const heroMedia = hero?.type === "media" ? outputs.media.find((m) => m.src === hero.src) : undefined;
+  const adHoc = !valid && adHocTarget?.path ? buildAdHocTarget(adHocTarget) : {};
+  const hero = valid ? picked : adHoc.file || adHoc.media ? null : pickHero(outputs);
+  const heroFile =
+    hero?.type === "file"
+      ? outputs.files.find((f) => f.path === hero.path)
+      : adHoc.file;
+  const heroMedia =
+    hero?.type === "media"
+      ? outputs.media.find((m) => m.src === hero.src)
+      : adHoc.media;
   const turnEnd = turn.rows.at(-1);
   const empty = outputs.files.length + outputs.media.length + outputs.links.length + outputs.sources.length === 0;
   const fileCount = outputs.files.filter((f) => f.change).length;
+  const activeManifestSrc = adHocTarget?.manifestSrc ?? null;
 
   return (
     <>
@@ -796,7 +994,7 @@ function TurnOutputsBody({
             <MediaHero media={heroMedia} onAnnotateToComposer={onAnnotateToComposer} />
           ) : null}
         </div>
-      ) : empty ? (
+      ) : empty && !activeManifestSrc ? (
         <div className="mx-4 flex flex-col items-center gap-2 rounded-xl border border-dashed border-border px-6 py-10 text-center" data-testid="outputs-none">
           {running ? <Spinner size={18} className="text-accent" /> : <FileText size={20} className="text-faint" aria-hidden />}
           <p className="text-body font-medium text-fg">{running ? "这一轮还在进行" : "这一轮没有产出文件"}</p>
@@ -805,12 +1003,16 @@ function TurnOutputsBody({
           </p>
         </div>
       ) : null}
+      {activeManifestSrc && <WorkbenchEvidenceCard manifestSrc={activeManifestSrc} />}
       {!empty && (
         <OtherOutputs
           outputs={outputs}
           hero={hero}
           activeCategory={activeCategory}
-          onPick={setPicked}
+          onPick={(ref) => {
+            setAdHocTarget(null);
+            setPicked(ref);
+          }}
         />
       )}
     </>

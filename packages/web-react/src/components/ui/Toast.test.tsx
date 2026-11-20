@@ -203,4 +203,21 @@ describe('Toast 追踪号(UI-SPEC §1.1 C6:跟踪号不进正文)', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('tr-9')
     Reflect.deleteProperty(navigator, 'clipboard')
   })
+
+  it('Toast 使用不透明 elevated 底衬与有效 animate-in（OCV5-817）', () => {
+    let toast: ReturnType<typeof useToast> = () => {}
+    render(
+      <ToastProvider>
+        <Probe onReady={(fn) => (toast = fn)} />
+      </ToastProvider>,
+    )
+    act(() => {
+      toast('已保存', 'success')
+      toast('失败', 'error')
+    })
+    const status = screen.getByRole('status')
+    expect(status).toHaveClass('bg-elevated', 'oc-toast-success', 'shadow-pop', 'animate-in')
+    expect(status.className).not.toContain('data-[state=open]:animate-in')
+    expect(screen.getByRole('alert')).toHaveClass('bg-elevated', 'oc-toast-error', 'shadow-pop', 'animate-in')
+  })
 })

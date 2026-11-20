@@ -5,9 +5,7 @@ import {
   Kanban,
   Library,
   List,
-  Menu,
   MoreHorizontal,
-  PanelLeft,
   Plus,
   Settings,
   Settings2,
@@ -54,6 +52,7 @@ import { BoardColumns } from './BoardColumns'
 import { BoardSettingsPanel } from './BoardSettingsPanel'
 import { CostStatsView } from './CostStatsView'
 import { ProjectSettings } from './ProjectSettings'
+import { WorkspaceShellHeader } from '../ui/WorkspaceShellHeader'
 import { StageSettings } from './StageSettings'
 import { TemplateLibrary } from './TemplateLibrary'
 import { TicketDrawer } from './TicketDrawer'
@@ -833,28 +832,13 @@ export function TaskboardView({
 
   return (
     <div data-testid="taskboard-root" className="flex h-full min-h-0 flex-col bg-bg">
-      <header className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border px-3 pb-2.5 header-safe-t md:h-14 md:flex-nowrap md:border-b-0">
+      <WorkspaceShellHeader
+        onOpenMobileNav={onOpenMobileNav}
+        sidebarCollapsed={sidebarCollapsed}
+        onExpandSidebar={onExpandSidebar}
+        contentClassName="flex-wrap gap-2 px-3 pb-2 md:flex-nowrap md:px-4"
+      >
         <div className="order-1 flex min-w-0 items-center gap-2">
-          <IconButton
-            data-product-control
-            onClick={onOpenMobileNav}
-            aria-label="打开菜单"
-            shape="square"
-            className="md:hidden"
-          >
-            <Menu size={18} />
-          </IconButton>
-          {sidebarCollapsed && (
-            <IconButton
-              data-product-control
-              onClick={onExpandSidebar}
-              aria-label="展开侧栏"
-              shape="square"
-              className="hidden md:inline-flex"
-            >
-              <PanelLeft size={18} />
-            </IconButton>
-          )}
           <Kanban size={16} className="shrink-0 text-faint" />
           <h1 className="truncate text-title font-semibold">任务面板</h1>
         </div>
@@ -941,7 +925,7 @@ export function TaskboardView({
           <Plus size={14} />
           新建单据
         </Button>
-      </header>
+      </WorkspaceShellHeader>
 
       <div className="flex flex-wrap items-center gap-2 px-4 pb-2">
         <Tabs

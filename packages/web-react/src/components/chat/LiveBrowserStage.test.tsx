@@ -545,4 +545,87 @@ describe("LiveBrowserStage", () => {
     await screen.findByTestId("live-browser-theater-dialog");
     expect(screen.getByTestId("live-browser-takeover-dock")).toBeInTheDocument();
   });
+
+  test("handing back from fullscreen theater mode exits fullscreen cleanly", async () => {
+    fetchLiveMock.mockResolvedValue(ACTIVE_STATE);
+    const onHandBack = vi.fn();
+
+    render(
+      <LiveBrowserStage
+        agentId="main"
+        auth={MOCK_AUTH}
+        onHandBackToComposer={onHandBack}
+      />,
+    );
+    await screen.findByTestId("live-browser-active");
+
+    // Enter fullscreen theater mode and take over
+    fireEvent.click(screen.getByTestId("live-browser-expand-btn"));
+    expect(screen.getByTestId("live-browser-theater-dialog")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("live-browser-takeover-btn"));
+    expect(screen.getByTestId("live-browser-handback-btn")).toBeInTheDocument();
+
+    // Hand back -> must exit fullscreen theater modal AND call onHandBackToComposer
+    fireEvent.click(screen.getByTestId("live-browser-handback-btn"));
+    await waitFor(() => expect(screen.queryByTestId("live-browser-theater-dialog")).toBeNull());
+    expect(onHandBack).toHaveBeenCalledWith(expect.stringContaining("Sample Paper — arXiv"));
+  });
+
+  test("provides pause-and-takeover when assistant is running and onStopTurn is supplied", async () => {
+    fetchLiveMock.mockResolvedValue(ACTIVE_STATE);
+    const onStopTurn = vi.fn();
+
+    const { rerender } = render(
+      <LiveBrowserStage agentId="main" auth={MOCK_AUTH} running={true} onStopTurn={onStopTurn} />,
+    );
+    await screen.findByTestId("live-browser-active");
+
+    const pauseBtn = screen.getByTestId("live-browser-pause-takeover-btn");
+    expect(pauseBtn).toBeEnabled();
+    expect(pauseBtn).toHaveTextContent("暂停并接管");
+    fireEvent.click(pauseBtn);
+    expect(onStopTurn).toHaveBeenCalledTimes(1);
+
+    // Once assistant stops, stage automatically enters takeover mode
+    rerender(<LiveBrowserStage agentId="main" auth={MOCK_AUTH} running={false} onStopTurn={onStopTurn} />);
+    await waitFor(() => expect(screen.getByTestId("live-browser-takeover-dock")).toBeInTheDocument());
+  });
+
+  test("allows cold-start retry when browser reports unavailable and supports canvas dblclick", async () => {
+    fetchLiveMock
+      .mockResolvedValueOnce({ available: false, active: false, reason: "容器冷启动中" })
+      .mockResolvedValueOnce(ACTIVE_STATE);
+    sendActionMock.mockResolvedValue(ACTIVE_STATE);
+
+    render(<LiveBrowserStage agentId="main" auth={MOCK_AUTH} running={false} />);
+    const unavail = await screen.findByTestId("live-browser-unavailable");
+    expect(unavail).toHaveTextContent("容器冷启动中");
+
+    fireEvent.click(screen.getByTestId("live-browser-retry-available"));
+    await screen.findByTestId("live-browser-active");
+
+    fireEvent.click(screen.getByTestId("live-browser-takeover-btn"));
+    const img = screen.getByTestId("live-browser-frame");
+    vi.spyOn(img, "getBoundingClientRect").mockReturnValue({
+      left: 0,
+      top: 0,
+      width: 400,
+      height: 200,
+      right: 400,
+      bottom: 200,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+    fireEvent.doubleClick(img, { clientX: 200, clientY: 100 });
+    await waitFor(() =>
+      expect(sendActionMock).toHaveBeenCalledWith(MOCK_AUTH, "main", {
+        action: "dblclick",
+        x: 0.5,
+        y: 0.5,
+        normalized: true,
+        expectedOrigin: "https://arxiv.org",
+      }),
+    );
+  });
 });

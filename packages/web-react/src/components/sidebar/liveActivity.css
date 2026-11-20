@@ -112,6 +112,15 @@
   outline-offset: -2px;
 }
 
+.oc-live-strip-notify[data-enabled="true"] {
+  color: var(--accent);
+}
+
+.oc-live-strip-notify:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .oc-live-strip-list {
   display: flex;
   flex-direction: column;
@@ -124,13 +133,13 @@
   gap: 0.5rem;
   width: 100%;
   min-width: 0;
-  height: 2rem;
-  padding: 0 0.5rem;
+  height: 2.125rem;
+  padding: 0 0.625rem;
   border: 0;
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--fg);
-  font-size: var(--text-meta);
+  font-size: var(--text-section);
   text-align: left;
   cursor: pointer;
   transition: background-color 150ms var(--ease-standard), color 150ms var(--ease-standard);
@@ -188,7 +197,7 @@
   justify-content: flex-start;
   width: 100%;
   height: 1.75rem;
-  padding: 0 0.5rem;
+  padding: 0 0.625rem;
   border: 0;
   border-radius: var(--radius-xs);
   background: transparent;
@@ -211,21 +220,27 @@
 
 @media (hover: none), (max-width: 767px) {
   .oc-live-strip-pill {
-    height: 1.875rem;
-    padding: 0 0.5rem;
+    min-height: 2.75rem;
+    height: auto;
+    padding: 0 0.625rem;
   }
 
   .oc-live-strip-toggle {
-    width: 2rem;
-    height: 2rem;
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+    width: 2.75rem;
+    height: 2.75rem;
   }
 
   .oc-live-strip-item {
-    height: 2.375rem;
-    padding: 0 0.5rem;
+    min-height: 2.75rem;
+    height: auto;
+    padding: 0 0.625rem;
   }
 
   .oc-live-strip-more {
-    height: 2rem;
+    min-height: 2.75rem;
+    height: auto;
+    padding: 0 0.625rem;
   }
 }

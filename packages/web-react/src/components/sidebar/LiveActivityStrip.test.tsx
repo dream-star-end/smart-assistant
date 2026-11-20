@@ -1,6 +1,10 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
+import {
+  publishDesktopNotifyState,
+  registerDesktopNotifyToggle,
+} from "../../lib/desktopNotifyPref";
 import type { ChatProject, Session, User } from "../../lib/types";
 import { Sidebar } from "../Sidebar";
 import { LiveActivityStrip } from "./LiveActivityStrip";
@@ -147,5 +151,31 @@ describe("LiveActivityStrip", () => {
     // 搜索态下活态条让位，避免挤占搜索结果
     fireEvent.change(screen.getByPlaceholderText("搜索标题或消息"), { target: { value: "内核" } });
     expect(screen.queryByTestId("sidebar-live-strip")).toBeNull();
+  });
+
+  it("提供桌面通知轻量开关并联动 desktopNotifyPref（OCV5-817）", () => {
+    const toggle = vi.fn();
+    const unregister = registerDesktopNotifyToggle(toggle);
+    publishDesktopNotifyState({ enabled: false, permission: "default" });
+    try {
+      const summary = collectLiveActivity({
+        sessions: [makeSession({ id: "s-run", title: "跑单测", runState: "running" })],
+      });
+      render(<LiveActivityStrip summary={summary} onSelect={vi.fn()} />);
+      const btn = screen.getByTestId("live-strip-notify-toggle");
+      expect(btn).toHaveAttribute("aria-pressed", "false");
+      fireEvent.click(btn);
+      expect(toggle).toHaveBeenCalledWith(true);
+
+      act(() => {
+        publishDesktopNotifyState({ enabled: true, permission: "granted" });
+      });
+      expect(screen.getByTestId("live-strip-notify-toggle")).toHaveAttribute("aria-pressed", "true");
+    } finally {
+      unregister();
+      act(() => {
+        publishDesktopNotifyState({ enabled: false, permission: "unsupported" });
+      });
+    }
   });
 });

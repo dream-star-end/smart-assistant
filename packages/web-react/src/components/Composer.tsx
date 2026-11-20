@@ -50,6 +50,7 @@ import {
   DropdownMenuTrigger,
   IconButton,
   iconButtonVariants,
+  StatusPill,
   useToast,
 } from "./ui";
 
@@ -88,7 +89,28 @@ const AttachChip = lazy(() => import("./ComposerAttachChip").then((module) => ({
 const ComposerPrediction = lazy(() => import("./ComposerPrediction").catch(() => ({ default: NoPrediction })));
 
 // 已经盖进输入框的预填(按对象认,跨卸载重挂保留;见预填 effect)。
-const appliedPrefills = new WeakSet<{ text: string; nonce: number }>();
+export type ComposerPrefill = { text: string; nonce: number; mode?: "replace" | "append" };
+const appliedPrefills = new WeakSet<ComposerPrefill>();
+
+type SlashCommandDef = {
+  cmd: string;
+  label: string;
+  desc: string;
+};
+
+function availableSlashCommands(opts: { hasQuickAsk: boolean; swarmSupported: boolean }): SlashCommandDef[] {
+  const list: SlashCommandDef[] = [];
+  if (opts.hasQuickAsk) {
+    list.push(
+      { cmd: "/btw", label: "/btw", desc: "在支线快问小窗快速提问，不打断主线" },
+      { cmd: "/ask", label: "/ask", desc: "同 /btw，打开支线快问小窗" },
+    );
+  }
+  if (opts.swarmSupported) {
+    list.push({ cmd: "/swarm", label: "/swarm", desc: "以 Antigravity 蜂群多智能体协作执行本轮" });
+  }
+  return list;
+}
 
 function mediaKindOf(mime: string): MediaRef["kind"] {
   if (mime.startsWith("image/")) return "image";
@@ -122,13 +144,13 @@ export function resetComposerAttachmentCache(): void {
   attachEpoch += 1;
 }
 
-function clipboardImages(data: DataTransfer): File[] {
-  const itemImages = Array.from(data.items)
-    .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+function clipboardFiles(data: DataTransfer): File[] {
+  const fromItems = Array.from(data.items ?? [])
+    .filter((item) => item.kind === "file")
     .map((item) => item.getAsFile())
     .filter((file): file is File => file != null);
-  if (itemImages.length > 0) return itemImages;
-  return Array.from(data.files).filter((file) => file.type.startsWith("image/"));
+  if (fromItems.length > 0) return fromItems;
+  return Array.from(data.files ?? []);
 }
 
 /** 时间假进度的预期时长;超过后不再假装「快好了」,切成不确定态(C-09)。 */
@@ -223,8 +245,8 @@ export function Composer({
   onUpload?: (file: File, onProgress?: (sent: number, total: number) => void) => Promise<MediaRef>;
   /** 语音输入取 token（demo / 未登录省略 → 麦克风禁用）。 */
   getVoiceToken?: () => string | null;
-  /** 外部预填(如「在对话中创建」模板):nonce 变化即覆盖输入框并聚焦。 */
-  prefill?: { text: string; nonce: number } | null;
+  /** 外部预填(如「在对话中创建」模板或「引用到主线」):nonce 变化即触发；mode="append" 时追加而不覆盖现有草稿。 */
+  prefill?: ComposerPrefill | null;
   /** 当前会话的 GitHub 仓库绑定（省略 onOpenRepo 则不渲染底部仓库入口，如 demo）。 */
   repoSelection?: RepoSelection | null;
   /** 打开 GitHub 仓库绑定 modal（入口在底部左侧）。 */
@@ -334,6 +356,9 @@ export function Composer({
   // 整句预测(空输入框)直接点发送就发出去;带附件或引用时不显示,免得发送按钮的含义说不清。
   // 打字后的补全只是提示,发送只发已输入的部分。
   const [ghostShown, setGhostShown] = useState<{ rest: string; px: number } | null>(null);
+  const [textareaScrollTop, setTextareaScrollTop] = useState(0);
+  const [slashIndex, setSlashIndex] = useState(0);
+  const [slashDismissedFor, setSlashDismissedFor] = useState<string | null>(null);
   const predictionHintId = useId();
   const [composing, setComposing] = useState(false);
   const [caretAtEnd, setCaretAtEnd] = useState(true);
@@ -418,7 +443,11 @@ export function Composer({
   useLayoutEffect(() => {
     if (!prefill || appliedPrefills.has(prefill)) return;
     appliedPrefills.add(prefill);
-    setValue(prefill.text);
+    if (prefill.mode === "append") {
+      setValue((cur) => (cur.trim() ? `${cur}\n\n${prefill.text}` : prefill.text));
+    } else {
+      setValue(prefill.text);
+    }
     requestAnimationFrame(() => ref.current?.focus());
   }, [prefill, setValue]);
 
@@ -694,9 +723,33 @@ export function Composer({
     }
   };
 
-  const canAcceptDrop = !disabled && !busy && !!onUpload;
+  // 生成中也允许拖拽文件准备排队消息（与回形针选择、粘贴图片保持一致，不改变 <label htmlFor> 机制）。
+  const canAcceptDrop = !disabled && !!onUpload;
   const isFileDrag = (e: { dataTransfer: DataTransfer | null }) =>
     Array.from(e.dataTransfer?.types ?? []).includes("Files");
+
+  const slashQuery =
+    !disabled && value.startsWith("/") && !value.includes("\n") && !/\s/.test(value) ? value.toLowerCase() : null;
+  const slashMatches =
+    slashQuery !== null && slashDismissedFor !== value
+      ? availableSlashCommands({ hasQuickAsk: Boolean(onQuickAskCommand), swarmSupported }).filter((item) =>
+          item.cmd.startsWith(slashQuery),
+        )
+      : [];
+  const slashMenuOpen = slashMatches.length > 0;
+  const activeSlashIndex = slashMenuOpen ? Math.min(slashIndex, slashMatches.length - 1) : 0;
+
+  const applySlashCommand = (cmd: string) => {
+    const next = `${cmd} `;
+    setValue(next);
+    setSlashDismissedFor(null);
+    requestAnimationFrame(() => {
+      const el = ref.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(next.length, next.length);
+    });
+  };
 
   const voiceStatus =
     voiceMsg != null ? (
@@ -729,6 +782,38 @@ export function Composer({
           <span className="min-w-0 truncate">{visibleGoal.objective}</span>
           <span className="shrink-0 text-muted">{STATUS_LABEL[visibleGoal.status]}</span>
         </button>
+      )}
+      <div className="relative">
+      {slashMenuOpen && (
+        <div
+          role="listbox"
+          aria-label="快捷指令"
+          data-testid="composer-slash-menu"
+          className="absolute inset-x-0 bottom-full z-30 mb-1.5 overflow-hidden rounded-xl border border-border bg-elevated p-1 shadow-pop animate-in"
+        >
+          {slashMatches.map((item, idx) => {
+            const active = idx === activeSlashIndex;
+            return (
+              <button
+                key={item.cmd}
+                type="button"
+                role="option"
+                aria-selected={active}
+                data-slash-cmd={item.cmd}
+                onMouseDown={(e) => e.preventDefault()}
+                onMouseEnter={() => setSlashIndex(idx)}
+                onClick={() => applySlashCommand(item.cmd)}
+                className={cn(
+                  "flex min-h-9 w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-meta transition-colors [@media(hover:none)]:min-h-11",
+                  active ? "bg-hover text-fg" : "text-muted hover:bg-hover/60 hover:text-fg",
+                )}
+              >
+                <span className="shrink-0 font-mono font-semibold text-accent">{item.label}</span>
+                <span className="min-w-0 flex-1 truncate text-caption text-muted">{item.desc}</span>
+              </button>
+            );
+          })}
+        </div>
       )}
       <div
         data-testid="composer-shell"
@@ -861,9 +946,14 @@ export function Composer({
               aria-describedby={ghostRest ? predictionHintId : undefined}
               onChange={(e) => {
                 setValue(e.target.value);
+                setSlashIndex(0);
+                setSlashDismissedFor(null);
                 setCaretAtEnd(e.target.selectionEnd === e.target.value.length);
                 const inputType = (e.nativeEvent as InputEvent).inputType ?? "";
                 setDeletedTo(inputType.startsWith("delete") ? { key: draftKey, value: e.target.value } : null);
+              }}
+              onScroll={(e) => {
+                setTextareaScrollTop(e.currentTarget.scrollTop);
               }}
               onSelect={(e) => {
                 const el = e.currentTarget;
@@ -873,12 +963,38 @@ export function Composer({
               onCompositionEnd={() => setComposing(false)}
               onPaste={(e) => {
                 if (!onUpload) return;
-                const images = clipboardImages(e.clipboardData);
-                if (images.length === 0) return;
+                const files = clipboardFiles(e.clipboardData);
+                if (files.length === 0) return;
                 e.preventDefault();
-                void onFiles(images);
+                void onFiles(files);
               }}
               onKeyDown={(e) => {
+                if (slashMenuOpen && !e.nativeEvent.isComposing && e.keyCode !== 229) {
+                  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                    e.preventDefault();
+                    const step = e.key === "ArrowDown" ? 1 : -1;
+                    setSlashIndex((i) => (i + step + slashMatches.length) % slashMatches.length);
+                    return;
+                  }
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    setSlashDismissedFor(value);
+                    return;
+                  }
+                  if ((e.key === "Tab" || e.key === "Enter") && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
+                    const hit = slashMatches[activeSlashIndex];
+                    if (hit && hit.cmd !== value.toLowerCase()) {
+                      e.preventDefault();
+                      applySlashCommand(hit.cmd);
+                      return;
+                    }
+                    if (e.key === "Tab" && hit) {
+                      e.preventDefault();
+                      applySlashCommand(hit.cmd);
+                      return;
+                    }
+                  }
+                }
                 // 采用预测:Tab,或光标在末尾时按 →。没有预测时 Tab 照常移动焦点。
                 if (
                   ghostRest &&
@@ -943,6 +1059,7 @@ export function Composer({
                   rest={ghostRest}
                   large={fontSize === "large"}
                   hintId={predictionHintId}
+                  scrollTop={textareaScrollTop}
                   onShown={onPredictionShown}
                 />
               </Suspense>
@@ -1092,7 +1209,7 @@ export function Composer({
                     : "开启 Antigravity 蜂群模式：多智能体并行拆解与互审（也可直接输入 /swarm）"
                 }
                 className={cn(
-                  "inline-flex min-h-9 shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-caption font-medium transition-all duration-150",
+                  "inline-flex min-h-9 shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-caption font-medium transition-all duration-150 [@media(hover:none)]:min-h-11",
                   "outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50",
                   swarmMode
                     ? "border-accent/40 bg-accent-soft text-accent shadow-soft hover:bg-accent/15"
@@ -1106,18 +1223,29 @@ export function Composer({
                 />
                 <span>蜂群</span>
                 {swarmMode && (
-                  <span
-                    aria-hidden
-                    className="size-1.5 rounded-full bg-accent animate-pulse"
-                  />
+                  <StatusPill status="running" variant="dot" size="sm" decorative />
                 )}
               </button>
             )}
             <div className="ml-auto flex shrink-0 items-center gap-1.5">
-              {/* 「正在停止…」占位符已由 App 传入 placeholder 承载,角落再写一遍是冗余(C-17);
-                  这里只保留给读屏的状态播报,不再占视觉位。 */}
+              {/* 触屏端无 Tab/→ 键：有输入预测时在工具行提供可点击采纳胶囊（桌面不显示，保持无额外视觉噪点）。 */}
+              {coarsePointer && ghostRest && !busy && (
+                <button
+                  type="button"
+                  data-product-control
+                  data-testid="composer-accept-prediction-touch"
+                  onClick={acceptPrediction}
+                  className="inline-flex min-h-11 shrink-0 items-center rounded-full border border-border bg-bg px-3 text-caption font-medium text-accent transition-colors hover:bg-hover"
+                >
+                  填入建议
+                </button>
+              )}
               {stopping && (
-                <output className="sr-only" aria-live="polite">
+                <output
+                  data-testid="composer-stopping-status"
+                  className="inline-flex items-center gap-1 text-caption text-muted"
+                  aria-live="polite"
+                >
                   正在停止…
                 </output>
               )}
@@ -1227,6 +1355,7 @@ export function Composer({
             </div>
           </div>
         </div>
+      </div>
       </div>
       {/* 窄屏底栏:GitHub 仓库入口(sm+ 已并入工具行,这里只在 <sm 渲染)。 */}
       {(onOpenRepo || projectSlot) && (

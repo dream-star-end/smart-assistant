@@ -36,7 +36,11 @@ function locateStylesheet(): string {
 }
 
 const STYLESHEET = locateStylesheet();
+const LANDING_STYLESHEET = resolve(dirname(STYLESHEET), "styles/landing.css");
 const CSS = readFileSync(STYLESHEET, "utf8");
+const THEME_CSS = existsSync(LANDING_STYLESHEET)
+  ? `${CSS}\n${readFileSync(LANDING_STYLESHEET, "utf8")}`
+  : CSS;
 
 /**
  * 取某个主题块({ ... })内的 token 表。light = `:root`,dark = `.dark`,landing = `.congjian-landing`。
@@ -45,9 +49,9 @@ const CSS = readFileSync(STYLESHEET, "utf8");
  * 只看底层 token。
  */
 function tokensOf(selector: string): Record<string, string> {
-  const start = CSS.indexOf(`${selector} {`);
-  if (start === -1) throw new Error(`styles.css 缺少 ${selector} 块`);
-  const body = CSS.slice(start, CSS.indexOf("\n}", start));
+  const start = THEME_CSS.indexOf(`${selector} {`);
+  if (start === -1) throw new Error(`主题样式表缺少 ${selector} 块`);
+  const body = THEME_CSS.slice(start, THEME_CSS.indexOf("\n}", start));
   const out: Record<string, string> = {};
   for (const m of body.matchAll(/--([\w-]+):\s*(#[0-9a-fA-F]{6,8}|rgba?\([^)]*\));/g)) {
     if (m[1].startsWith("color-")) continue;
@@ -124,6 +128,7 @@ const FILL_PAIRS = [
   ["primary", "primary-fg"],
   ["accent", "accent-fg"],
   ["danger", "danger-fg"],
+  ["warning", "warning-fg"],
 ] as const;
 
 describe("四套主题 token 键集合一致(漏写一个 token 就会回落到别的主题)", () => {
@@ -176,6 +181,20 @@ describe.each(THEMES)("设计 token 对比度契约 · $name", ({ selector }) =>
     // 骨架不是文本,不适用 AA;要的是"一眼看出这里有东西在加载"。
     // 原实现复用 --hover(浅色 4% 墨)合成后仅 1.05:1,等于白屏。
     expect(contrast(parseHex(t.skeleton).rgb, surface)).toBeGreaterThanOrEqual(1.2);
+  });
+});
+
+describe("双主题空间景深投影契约（OCV5-817）", () => {
+  it("@theme 投影引用语义变量，且 .dark 提供暗部投影与顶部高光描边", () => {
+    const themeBlock = CSS.slice(CSS.indexOf("@theme {"), CSS.indexOf("\n}", CSS.indexOf("@theme {")));
+    expect(themeBlock).toMatch(/--shadow-soft:\s*var\(--shadow-soft-val\);/);
+    expect(themeBlock).toMatch(/--shadow-pop:\s*var\(--shadow-pop-val\);/);
+    expect(themeBlock).toMatch(/--shadow-float:\s*var\(--shadow-float-val\);/);
+
+    const darkBlock = CSS.slice(CSS.indexOf(".dark {"), CSS.indexOf("\n}", CSS.indexOf(".dark {")));
+    expect(darkBlock).toMatch(/--shadow-soft-val:[^;]*inset 0 1px 0 rgba\(255,\s*255,\s*255,/);
+    expect(darkBlock).toMatch(/--shadow-pop-val:[^;]*inset 0 1px 0 rgba\(255,\s*255,\s*255,/);
+    expect(darkBlock).toMatch(/--shadow-float-val:[^;]*inset 0 1px 0 rgba\(255,\s*255,\s*255,/);
   });
 });
 
@@ -261,6 +280,10 @@ const DRIFT_EXEMPT = [
   /^test\//,
   /\.test\.tsx?$/,
   /^styles\.css$/,
+  // OCV5-817: 从 styles.css 懒拆分出的独立样式文件，沿用原 styles.css 的豁免边界
+  /^styles\/landing\.css$/,
+  /^styles\/containerWebPreview\.css$/,
+  /^components\/iui\/iui\.css$/,
 ];
 const PALETTE =
   "slate|gray|zinc|neutral|stone|red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose";

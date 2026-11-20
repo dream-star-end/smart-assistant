@@ -1,9 +1,11 @@
-import { AlertTriangle, BookOpen, Check, ChevronDown, Copy, Download, Eye, EyeOff, Globe, Lock, Maximize2, RotateCcw } from "lucide-react";
+import { AlertTriangle, BookOpen, Check, ChevronDown, Copy, Download, Eye, EyeOff, Globe, Loader2, Lock, Maximize2, PanelRight, Play, RotateCcw } from "lucide-react";
 import { useState } from "react";
 import { nativeDownload } from "../../lib/chat/download";
 import { cn } from "../../lib/utils";
+import { dispatchOpenInWorkbench } from "../../lib/workbenchOpen";
 import { useMediaSigner } from "../chat/media";
 import { chatInteractionUnavailableText, useArtifactInspect, useChatInteraction } from "../tool/context";
+import { useToast } from "../ui";
 import { BodyMarkdown, Frame, Inline, useCopiedFlag } from "./shell";
 import { interpolateRunbookCommand, v2ToMarkdown } from "./v2Markdown";
 import type { BrowserHandoffSpec, CitationsSpec, DeliverablesSpec, RunbookSpec } from "./v2Schema";
@@ -13,6 +15,7 @@ type BlockProps<S> = { spec: S; notes: string[]; streaming: boolean; readOnly?: 
 
 function SmallCopy({ getText, label, idle }: { getText: () => string; label: string; idle: string }) {
   const [done, flash] = useCopiedFlag();
+  const toast = useToast();
   return (
     <button
       type="button"
@@ -23,7 +26,7 @@ function SmallCopy({ getText, label, idle }: { getText: () => string; label: str
           await navigator.clipboard.writeText(getText());
           flash();
         } catch {
-          /* ignore */
+          toast("复制失败，请手动选中文本复制", "error");
         }
       }}
     >
@@ -32,6 +35,8 @@ function SmallCopy({ getText, label, idle }: { getText: () => string; label: str
     </button>
   );
 }
+
+const BATCH_DOWNLOAD_DELAY_MS = 250;
 
 // ── 10. Deliverables 工作台 ──────────────────────────────────────────────
 
@@ -42,6 +47,7 @@ export function DeliverablesBlock({ spec, notes, streaming, nested }: BlockProps
     return first >= 0 && spec.items.length <= 4 ? first : null;
   });
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const [downloadingAll, setDownloadingAll] = useState(false);
   const downloadable = spec.items.filter((x) => !!x.path);
 
   const downloadItem = async (item: DeliverablesSpec["items"][number]) => {
@@ -54,6 +60,19 @@ export function DeliverablesBlock({ spec, notes, streaming, nested }: BlockProps
     const url = await resolve(item.path);
     if (url) nativeDownload(url, item.name);
     else setStatusMsg(`未能签名下载 ${item.name}（预览或只读环境不支持容器取档）`);
+  };
+
+  const downloadAll = async () => {
+    if (downloadingAll) return;
+    setDownloadingAll(true);
+    try {
+      for (let i = 0; i < downloadable.length; i += 1) {
+        if (i > 0) await new Promise((r) => window.setTimeout(r, BATCH_DOWNLOAD_DELAY_MS));
+        await downloadItem(downloadable[i]!);
+      }
+    } finally {
+      setDownloadingAll(false);
+    }
   };
 
   const activePreview = previewIdx !== null ? spec.items[previewIdx] : undefined;
@@ -71,12 +90,11 @@ export function DeliverablesBlock({ spec, notes, streaming, nested }: BlockProps
           <button
             type="button"
             className="oc-iui-btn is-primary"
-            onClick={async () => {
-              for (const item of downloadable) await downloadItem(item);
-            }}
+            disabled={downloadingAll}
+            onClick={() => void downloadAll()}
           >
-            <Download size={14} aria-hidden />
-            下载全部 ({downloadable.length})
+            {downloadingAll ? <Loader2 size={14} className="animate-spin" aria-hidden /> : <Download size={14} aria-hidden />}
+            {downloadingAll ? "正在下载…" : `下载全部 (${downloadable.length})`}
           </button>
         ) : undefined
       }
@@ -95,6 +113,23 @@ export function DeliverablesBlock({ spec, notes, streaming, nested }: BlockProps
                 {info && <div className="oc-iui-deliv-meta">{info}</div>}
               </div>
               <div className="oc-iui-deliv-actions">
+                {it.path && !streaming && (
+                  <button
+                    type="button"
+                    className="oc-iui-text-btn"
+                    data-testid="deliverable-open-workbench"
+                    onClick={() =>
+                      dispatchOpenInWorkbench({
+                        path: it.path,
+                        title: it.name,
+                        tab: "outputs",
+                      })
+                    }
+                  >
+                    <PanelRight size={13} aria-hidden />
+                    工作台预览
+                  </button>
+                )}
                 {it.preview && (
                   <button
                     type="button"
@@ -229,9 +264,11 @@ export function CitationsBlock({ spec, notes, streaming, readOnly, nested }: Blo
 
 // ── 12. Runbook 参数化命令流卡 ──────────────────────────────────────────
 
-export function RunbookBlock({ spec, notes, streaming, nested }: BlockProps<RunbookSpec>) {
+export function RunbookBlock({ spec, notes, streaming, readOnly, nested }: BlockProps<RunbookSpec>) {
+  const { sendUserText, busy } = useChatInteraction();
   const [values, setValues] = useState<Record<string, string>>(() => Object.fromEntries(spec.vars.map((v) => [v.id, v.value])));
   const dirty = spec.vars.some((v) => values[v.id] !== v.value);
+  const canRun = !readOnly && !streaming && !!sendUserText;
 
   const renderCommand = (cmd: string) => {
     const parts = cmd.split(/(\{\{[A-Za-z_][A-Za-z0-9_]*\}\}|\$\{[A-Za-z_][A-Za-z0-9_]*\})/g);
@@ -312,6 +349,21 @@ export function RunbookBlock({ spec, notes, streaming, nested }: BlockProps<Runb
                 </span>
               )}
               {!streaming && <SmallCopy getText={() => interpolateRunbookCommand(st.command, values)} label={`第 ${i + 1} 步命令`} idle="复制" />}
+              {canRun && (
+                <button
+                  type="button"
+                  className="oc-iui-text-btn"
+                  data-testid={`runbook-run-step-${i}`}
+                  disabled={!!busy}
+                  onClick={() => {
+                    const cmd = interpolateRunbookCommand(st.command, values);
+                    sendUserText?.(`请执行操作步骤「${st.title}」：\n\`\`\`bash\n${cmd}\n\`\`\``);
+                  }}
+                >
+                  <Play size={12} aria-hidden />
+                  执行
+                </button>
+              )}
             </div>
             {st.detail && <p className="oc-iui-runbook-detail">{st.detail}</p>}
             <pre className="oc-iui-cmd-pre">

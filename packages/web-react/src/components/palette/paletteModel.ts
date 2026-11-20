@@ -46,7 +46,12 @@ export type PaletteActionId =
   | "open-skills"
   | "open-cron"
   | "open-connectors"
-  | "open-quick-ask";
+  | "open-quick-ask"
+  | "open-settings"
+  | "toggle-theme"
+  | "toggle-pane"
+  | "toggle-swarm"
+  | "open-goal";
 
 const WORKSPACE_ACTION_IDS: ReadonlySet<PaletteActionId> = new Set([
   "open-board",
@@ -56,6 +61,11 @@ const WORKSPACE_ACTION_IDS: ReadonlySet<PaletteActionId> = new Set([
   "open-cron",
   "open-connectors",
   "open-quick-ask",
+  "open-settings",
+  "toggle-theme",
+  "toggle-pane",
+  "toggle-swarm",
+  "open-goal",
 ]);
 
 const UPGRADED_WORKSPACE_ACTION_IDS: ReadonlySet<PaletteActionId> = new Set([
@@ -653,6 +663,11 @@ export function paletteActions(opts: {
   canOpenSites?: boolean;
   canOpenManage?: boolean;
   canOpenQuickAsk?: boolean;
+  canOpenSettings?: boolean;
+  canToggleTheme?: boolean;
+  canTogglePane?: boolean;
+  canToggleSwarm?: boolean;
+  canOpenGoal?: boolean;
 }): PaletteAction[] {
   const q = opts.query.trim();
   const out: PaletteAction[] = [];
@@ -719,6 +734,46 @@ export function paletteActions(opts: {
       label: "打开快问小窗",
       keywords: "quick ask 快问 支线 小窗 速问",
       hint: "支线快问",
+    });
+  }
+  if (opts.canTogglePane) {
+    out.push({
+      id: "toggle-pane",
+      label: "切换工作台面板",
+      keywords: "workbench pane panel 工作台 面板 文件 预览 产出",
+      hint: "工作台",
+    });
+  }
+  if (opts.canToggleSwarm) {
+    out.push({
+      id: "toggle-swarm",
+      label: "打开蜂群协作看板",
+      keywords: "swarm board 蜂群 多代理 协作 看板",
+      hint: "蜂群协作",
+    });
+  }
+  if (opts.canOpenGoal) {
+    out.push({
+      id: "open-goal",
+      label: "创建长期目标",
+      keywords: "goal 目标 长期任务 自动推进 规划",
+      hint: "长期目标",
+    });
+  }
+  if (opts.canToggleTheme) {
+    out.push({
+      id: "toggle-theme",
+      label: "切换明暗主题",
+      keywords: "theme dark light 主题 深色 浅色 夜间 外观",
+      hint: "外观",
+    });
+  }
+  if (opts.canOpenSettings) {
+    out.push({
+      id: "open-settings",
+      label: "打开设置",
+      keywords: "settings preferences 设置 偏好 账号 快捷键 模型",
+      hint: "偏好设置",
     });
   }
   out.push({ id: "new-project", label: q ? `新建项目「${q}」` : "新建项目…", keywords: "new project" });

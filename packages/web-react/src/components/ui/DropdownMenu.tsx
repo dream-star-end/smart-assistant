@@ -20,7 +20,7 @@ export const DropdownMenuContent = forwardRef<
         // 矮视口（如手机横屏）下菜单高于触发点上下可用空间时，原先仅设 overflow-hidden 会导致翻转后顶出视口、
         // 首项（如侧栏项目行「新建会话」）被裁掉看不到；按 Radix 可用高度封顶并开启纵向滚动（OCV5-778）。
         "z-50 max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-[11rem] overflow-y-auto overflow-x-hidden overscroll-contain rounded-lg border border-border bg-elevated p-1 text-fg shadow-pop",
-        "data-[state=open]:animate-fade",
+        "data-[state=open]:animate-pop",
         className,
       )}
       {...props}
@@ -84,7 +84,7 @@ export const DropdownMenuSubContent = forwardRef<
     collisionPadding={collisionPadding}
     className={cn(
       "z-50 max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-[11rem] overflow-y-auto overflow-x-hidden overscroll-contain rounded-lg border border-border bg-elevated p-1 text-fg shadow-pop",
-      "data-[state=open]:animate-fade",
+      "data-[state=open]:animate-pop",
       className,
     )}
     {...props}

@@ -62,13 +62,13 @@ export function EmptyState({
         {/* 当前智能体身份 + 切换入口收成一枚胶囊,让问候成为视觉主角(参考主流 AI 产品的新会话页)。 */}
         <div className="inline-flex items-center gap-1.5 rounded-full border border-border bg-surface/80 py-1 pl-1 pr-1 shadow-soft backdrop-blur">
           <AgentAvatar agent={agent} className="size-7 rounded-full" iconSize={15} />
-          <span className="max-w-[40vw] truncate pl-0.5 text-[13px] font-medium text-fg">{agent.name}</span>
+          <span className="max-w-[40vw] truncate pl-0.5 text-body font-medium text-fg">{agent.name}</span>
           <Button
             variant="ghost"
             size="sm"
             shape="pill"
             onClick={onChangeAgent}
-            className="h-7 gap-1 px-2.5 text-[12.5px] text-muted"
+            className="h-7 gap-1 px-2.5 text-meta text-muted"
           >
             <ArrowLeftRight size={12} aria-hidden="true" />
             换一个智能体
@@ -76,11 +76,11 @@ export function EmptyState({
         </div>
         {/* h2 而非 h1:文档唯一的 h1 是 App 里给读屏定位的 sr-only 会话标题,欢迎页标题在
             语义上从属于当前会话;两个并列 h1 会稀释"我在哪个会话"的定位(shell 审计 S-10)。 */}
-        <h2 className="oc-home-title mt-6 max-w-2xl text-balance text-[30px] font-semibold leading-tight tracking-[-0.03em] sm:text-[38px]">
+        <h2 className="oc-home-title mt-6 max-w-2xl text-balance text-3xl font-semibold leading-tight tracking-[-0.03em] sm:text-4xl">
           {title}
         </h2>
         {/* text-balance:两行均分,不再留一个孤零零的「行。」挂在第二行。 */}
-        <p className="mt-3 max-w-md text-balance text-[15px] leading-relaxed text-muted">
+        <p className="mt-3 max-w-md text-balance text-title leading-relaxed text-muted">
           {name ? `今天想让${agent.name}帮你完成什么？` : agent.description}
         </p>
 
@@ -98,8 +98,8 @@ export function EmptyState({
                 type="button"
                 onClick={() => onPrefill(s)}
                 // 手机竖屏放不下 4 张卡(占满整屏视口):前 2 张足以下手,其余 md 起恢复。
-                // OCV5-307:14px 圆角卡;右上角箭头 hover 才浮出,提示"点了会填进输入框"。
-                className={`group flex items-start gap-3 rounded-[16px] border border-border bg-surface/85 px-4 py-3.5 text-left text-[14px] leading-relaxed text-muted outline-none backdrop-blur transition-[transform,box-shadow,border-color,color] duration-200 ease-standard hover:-translate-y-0.5 hover:border-border-strong hover:text-fg hover:shadow-soft focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg${
+                // OCV5-307:16px 圆角卡(rounded-lg);右上角箭头 hover 才浮出,提示"点了会填进输入框"。
+                className={`group flex items-start gap-3 rounded-lg border border-border bg-surface/85 px-4 py-3.5 text-left text-sm leading-relaxed text-muted outline-none backdrop-blur transition-[transform,box-shadow,border-color,color] duration-200 ease-standard hover:-translate-y-0.5 hover:border-border-strong hover:text-fg hover:shadow-soft focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg${
                   i >= 2 ? " hidden md:flex" : ""
                 }`}
               >

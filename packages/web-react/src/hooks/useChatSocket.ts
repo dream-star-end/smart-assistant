@@ -68,6 +68,8 @@ export type UseChatSocket = {
   /** 快照单调版本号:消息数组是就地 mutation 的同一引用,version 才是变更的权威信号
    *  (autoscroll 等 effect 的依赖必须用它;依赖数组引用恒等则流式期间永不触发)。*/
   version: number;
+  /** 低频壳层元数据版本号：仅在运行态/待拍板/终态/标题/模型/连接态变化时递增，普通文本流式 delta 不递增。 */
+  metaVersion?: number;
   /** 取某会话当前消息快照（就地 mutation 的数组，随 version 变更触发重渲）。*/
   getMessages: (sessId: string | undefined) => ChatMessage[];
   getSession: (sessId: string | undefined) => ChatSession | undefined;
@@ -614,6 +616,7 @@ export function useChatSocket(opts: {
     const stored = socket.toStored(sessId);
     if (!stored) return;
     sigRef.current.set(sessId, persistSignature(stored));
+    socket.markPersisted(sessId);
     void store.putSession(stored);
   };
   // 生命周期：enabled 时 start（绑事件）；卸载/禁用时 stop（解绑 + 关 ws）。
@@ -685,7 +688,11 @@ export function useChatSocket(opts: {
       .getAllForHydration()
       .then((all) => {
         if (cancelled) return;
-        for (const stored of all) socket.loadStored(stored);
+        for (const stored of all) {
+          socket.loadStored(stored);
+          sigRef.current.set(stored.id, persistSignature(stored));
+          socket.markPersisted(stored.id);
+        }
         onHydratedRef.current?.(all);
       })
       .catch(() => {
@@ -732,12 +739,14 @@ export function useChatSocket(opts: {
     };
   }, [enabled, userId, socket]);
 
-  // 流式期尾沿 debounce 落盘（高频 delta 不每帧写 IDB）；签名去重避免无谓写。
+  // 流式期尾沿 debounce 增量落盘：仅对本窗口内变更过的 dirtyPersistIds 执行 toStored + putSession，
+  // 不再全量遍历所有缓存会话；签名二次去重避免无谓 IDB 写。
   useEffect(() => {
     const store = storeRef.current;
     if (!store) return;
     const t = setTimeout(() => {
-      for (const [id] of socket.sessions) {
+      const dirtyIds = socket.consumeDirtyPersistIds();
+      for (const id of dirtyIds) {
         const stored = socket.toStored(id);
         if (!stored) continue;
         const sig = persistSignature(stored);
@@ -1182,6 +1191,7 @@ export function useChatSocket(opts: {
       provisioning: snap.provisioning,
       browserOnline: snap.browserOnline,
       version: snap.version,
+      metaVersion: snap.metaVersion,
       getMessages,
       getSession,
       isSending,

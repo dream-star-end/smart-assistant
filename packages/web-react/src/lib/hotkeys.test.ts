@@ -62,13 +62,13 @@ describe("resolveGlobalHotkey", () => {
     }
   });
 
-  test("输入框内忽略新建;⌘K 快速跳转在输入框内也生效", () => {
+  test("⌘K 快速跳转与 ⌘⇧O 新建在输入框内也生效", () => {
     const input = document.createElement("input");
     expect(resolveGlobalHotkey(key({ key: "k", metaKey: true, target: input }))).toBe("search");
     expect(resolveGlobalHotkey(key({ key: "k", ctrlKey: true, target: document.createElement("textarea") }))).toBe("search");
     expect(
       resolveGlobalHotkey(key({ key: "o", metaKey: true, shiftKey: true, target: input })),
-    ).toBeNull();
+    ).toBe("new");
   });
 
   test("⌘/Ctrl+F 会话内查找，输入框内忽略，Shift 不触发", () => {

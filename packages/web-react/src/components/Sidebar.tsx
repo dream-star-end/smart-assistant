@@ -1015,7 +1015,7 @@ export function Sidebar({
           )}
         />
       )}
-      <div className="flex flex-col px-2 pb-1 pt-2.5" data-product-entry-scope="sidebar-primary">
+      <div className="flex flex-col px-2 pb-1 sidebar-head-safe-t" data-product-entry-scope="sidebar-primary">
         <div className="mb-2.5 flex h-8 items-center justify-between pl-2 pr-0.5">
           <div className="flex min-w-0 items-center gap-2.5">
             <BrandMark
@@ -1440,7 +1440,7 @@ export function Sidebar({
               aria-label="打开案例展厅"
               title="案例展厅"
               className={cn(
-                "h-7 shrink-0 gap-1 rounded-xs text-faint hover:text-fg [@media(hover:none)]:size-11",
+                "h-7 shrink-0 gap-1 rounded-xs text-faint hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11",
                 footerCompact ? "w-7 px-0" : "px-2",
               )}
             >

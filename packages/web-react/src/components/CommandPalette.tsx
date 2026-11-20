@@ -9,11 +9,16 @@ import {
   Globe,
   House,
   MessageSquarePlus,
+  Moon,
+  PanelRight,
   Plug,
   Plus,
   Search,
+  Settings,
   Sparkles,
   SquareKanban,
+  Target,
+  Users,
   Wrench,
 } from "lucide-react";
 import {
@@ -54,7 +59,7 @@ import {
 } from "./palette/paletteModel";
 import "./palette/paletteUpgrade.css";
 import { HighlightedText } from "./sidebar/highlight";
-import { Badge, StatusPill } from "./ui";
+import { Badge, StatusPill, useToast } from "./ui";
 
 export const PALETTE_SEARCH_DEBOUNCE_MS = 200;
 const ASSET_SEARCH_LIMIT = 20;
@@ -99,9 +104,14 @@ export type CommandPaletteProps = {
   models?: readonly PublicModel[];
   activeModelId?: string | null;
   onSelectModel?: (modelId: string) => void;
-  /** 可选：工作区常用入口（记忆 / 技能 / 定时任务 / 插件 + 快问小窗）。 */
+  /** 可选：工作区常用入口（记忆 / 技能 / 定时任务 / 插件 + 快问小窗 + OS 级操作）。 */
   onOpenManage?: (tab: ManageTab) => void;
   onOpenQuickAsk?: () => void;
+  onOpenSettings?: () => void;
+  onToggleTheme?: () => void;
+  onTogglePane?: () => void;
+  onToggleSwarm?: () => void;
+  onOpenGoal?: () => void;
 };
 
 type RemoteResults = { q: string; hits: SessionSearchHit[]; assets: ProjectAsset[] };
@@ -123,13 +133,15 @@ export function CommandPalette(props: CommandPaletteProps) {
     searchMessages,
     searchAssets,
   } = props;
+  const toast = useToast();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<PaletteFilter>("all");
   const [mode, setMode] = useState<"list" | "move">("list");
   // Radix may hold an older onEscapeKeyDown closure; read the step from a ref.
   const modeRef = useRef(mode);
   modeRef.current = mode;
-  const [active, setActive] = useState(0);
+  // 按 item.key 锚定选中项，避免 200ms 异步远程结果回流时顶掉用户已选中的行。
+  const [activeKeyState, setActiveKeyState] = useState<string | null>(null);
   const [remote, setRemote] = useState<RemoteResults | null>(null);
   const [searching, setSearching] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -144,7 +156,7 @@ export function CommandPalette(props: CommandPaletteProps) {
     setQuery("");
     setFilter("all");
     setMode("list");
-    setActive(0);
+    setActiveKeyState(null);
     setRemote(null);
     activatedRef.current = false;
   }, [open]);
@@ -216,6 +228,11 @@ export function CommandPalette(props: CommandPaletteProps) {
         canOpenSites: !!props.onOpenSites,
         canOpenManage: !!props.onOpenManage,
         canOpenQuickAsk: !!props.onOpenQuickAsk,
+        canOpenSettings: !!props.onOpenSettings,
+        canToggleTheme: !!props.onToggleTheme,
+        canTogglePane: !!props.onTogglePane,
+        canToggleSwarm: !!props.onToggleSwarm,
+        canOpenGoal: !!props.onOpenGoal,
       }),
     });
   }, [
@@ -244,13 +261,29 @@ export function CommandPalette(props: CommandPaletteProps) {
     props.onOpenSites,
     props.onOpenManage,
     props.onOpenQuickAsk,
+    props.onOpenSettings,
+    props.onToggleTheme,
+    props.onTogglePane,
+    props.onToggleSwarm,
+    props.onOpenGoal,
   ]);
   const flat = useMemo(() => flattenPalette(groups), [groups]);
 
   useEffect(() => {
-    setActive(0);
+    setActiveKeyState(null);
   }, [query, filter, mode]);
-  const activeIndex = flat.length === 0 ? -1 : Math.min(active, flat.length - 1);
+
+  const isDisabledItem = (item: PaletteItem) => item.kind === "model" && Boolean(item.disabled);
+
+  const activeIndex = useMemo(() => {
+    if (flat.length === 0) return -1;
+    if (activeKeyState) {
+      const idx = flat.findIndex((it) => it.key === activeKeyState);
+      if (idx >= 0) return idx;
+    }
+    const firstEnabled = flat.findIndex((it) => !isDisabledItem(it));
+    return firstEnabled >= 0 ? firstEnabled : 0;
+  }, [flat, activeKeyState]);
   const activeKey = activeIndex >= 0 ? flat[activeIndex]!.key : null;
 
   useEffect(() => {
@@ -319,6 +352,26 @@ export function CommandPalette(props: CommandPaletteProps) {
         close();
         props.onOpenQuickAsk?.();
         return;
+      case "open-settings":
+        close();
+        props.onOpenSettings?.();
+        return;
+      case "toggle-theme":
+        close();
+        props.onToggleTheme?.();
+        return;
+      case "toggle-pane":
+        close();
+        props.onTogglePane?.();
+        return;
+      case "toggle-swarm":
+        close();
+        props.onToggleSwarm?.();
+        return;
+      case "open-goal":
+        close();
+        props.onOpenGoal?.();
+        return;
     }
   };
 
@@ -351,7 +404,10 @@ export function CommandPalette(props: CommandPaletteProps) {
         else props.onOpenSites?.();
         return;
       case "model":
-        if (item.disabled) return;
+        if (item.disabled) {
+          toast(`${item.meta.label} 当前服务降级，暂不可切换`, "info");
+          return;
+        }
         close();
         props.onSelectModel?.(item.model.id);
         return;
@@ -377,7 +433,13 @@ export function CommandPalette(props: CommandPaletteProps) {
       e.preventDefault();
       if (flat.length === 0) return;
       const step = e.key === "ArrowDown" ? 1 : -1;
-      setActive(((Math.max(activeIndex, 0) + step) % flat.length + flat.length) % flat.length);
+      const start = Math.max(activeIndex, 0);
+      let next = start;
+      for (let i = 0; i < flat.length; i += 1) {
+        next = ((next + step) % flat.length + flat.length) % flat.length;
+        if (!isDisabledItem(flat[next]!)) break;
+      }
+      setActiveKeyState(flat[next]!.key);
       return;
     }
     if (e.key === "Enter") {
@@ -430,8 +492,8 @@ export function CommandPalette(props: CommandPaletteProps) {
             }
           }}
           className={cn(
-            "oc-palette-shell fixed inset-0 z-50 flex flex-col overflow-hidden bg-elevated outline-none pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] data-[state=open]:animate-in",
-            "md:inset-auto md:left-1/2 md:top-[12vh] md:max-h-[min(74vh,38rem)] md:w-[min(42rem,calc(100vw-2rem))] md:-translate-x-1/2 md:rounded-xl md:border md:border-border md:pb-0 md:pt-0 md:shadow-float",
+            "oc-palette-shell fixed inset-0 top-[var(--oc-visual-offset-top,0px)] bottom-auto z-50 flex h-[var(--oc-visual-height,100dvh)] flex-col overflow-hidden bg-elevated outline-none pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] data-[state=open]:animate-in",
+            "md:inset-auto md:left-1/2 md:top-[12vh] md:h-auto md:max-h-[min(74vh,38rem)] md:w-[min(42rem,calc(100vw-2rem))] md:-translate-x-1/2 md:rounded-xl md:border md:border-border md:pb-0 md:pt-0 md:shadow-float",
           )}
         >
           <RD.Title className="sr-only">快速跳转</RD.Title>
@@ -490,7 +552,7 @@ export function CommandPalette(props: CommandPaletteProps) {
                     inputRef.current?.focus();
                   }}
                   className={cn(
-                    "min-h-9 shrink-0 rounded-full px-3 text-meta transition-colors md:min-h-7 md:px-2.5",
+                    "min-h-11 shrink-0 rounded-full px-3 text-meta transition-colors md:min-h-7 md:px-2.5",
                     filter === f.id ? "bg-accent-soft text-accent" : "text-muted hover:bg-hover hover:text-fg",
                   )}
                 >
@@ -528,7 +590,7 @@ export function CommandPalette(props: CommandPaletteProps) {
                       query={mode === "list" ? q : ""}
                       inCurrentGroup={g.id === "current"}
                       projectName={projectName}
-                      onHover={() => setActive(idx)}
+                      onHover={() => setActiveKeyState(item.key)}
                       onClick={() => activate(item)}
                     />
                   );
@@ -590,6 +652,16 @@ function actionIcon(id: PaletteActionId) {
       return Plug;
     case "open-quick-ask":
       return Sparkles;
+    case "open-settings":
+      return Settings;
+    case "toggle-theme":
+      return Moon;
+    case "toggle-pane":
+      return PanelRight;
+    case "toggle-swarm":
+      return Users;
+    case "open-goal":
+      return Target;
     default:
       return MessageSquarePlus;
   }

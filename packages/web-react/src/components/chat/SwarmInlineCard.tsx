@@ -106,7 +106,7 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
   blockId?: string;
   onOpenBoard?: (req: SwarmOpenRequest) => void;
 }) {
-  const openWith = (extra?: { focusMember?: string | null; focusChannel?: string | null }) =>
+  const openWith = (extra?: { focusMember?: string | null; focusChannel?: string | null; focusSeq?: number | null }) =>
     onOpenBoard?.({ snapshot, cardId, blockId, ...extra });
   const active = isSwarmActive(snapshot.phase);
   const phase = swarmPhaseMeta(snapshot.phase);
@@ -365,7 +365,7 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
                   return (
                     <div
                       key={post.seq}
-                      onClick={() => openWith({ focusChannel: post.channel })}
+                      onClick={() => openWith({ focusChannel: post.channel, focusSeq: post.seq })}
                       className={cn(
                         "flex items-start gap-2 px-3 py-2 text-meta transition-colors",
                         onOpenBoard && "cursor-pointer hover:bg-hover/60",

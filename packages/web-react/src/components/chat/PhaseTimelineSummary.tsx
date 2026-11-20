@@ -28,16 +28,25 @@ export function PhaseTimelineStripFromMessages({
   stepTimings,
   active,
   selectedPhase = null,
+  hideFileMetric = false,
   onSelectPhase,
 }: {
   messages: readonly ChatMessage[];
   stepTimings: ReadonlyMap<string, StepTiming>;
   active: boolean;
   selectedPhase?: PhaseKind | null;
+  hideFileMetric?: boolean;
   onSelectPhase?: (kind: PhaseKind) => void;
 }) {
   const timeline = buildPhaseTimeline(messages, { stepTimings, active });
-  return <PhaseTimelineStrip timeline={timeline} selectedPhase={selectedPhase} onSelectPhase={onSelectPhase} />;
+  return (
+    <PhaseTimelineStrip
+      timeline={timeline}
+      selectedPhase={selectedPhase}
+      hideFileMetric={hideFileMetric}
+      onSelectPhase={onSelectPhase}
+    />
+  );
 }
 
 /**
@@ -47,10 +56,12 @@ export function PhaseTimelineStripFromMessages({
 export function PhaseTimelineStrip({
   timeline,
   selectedPhase = null,
+  hideFileMetric = false,
   onSelectPhase,
 }: {
   timeline: PhaseTimelineData;
   selectedPhase?: PhaseKind | null;
+  hideFileMetric?: boolean;
   onSelectPhase?: (kind: PhaseKind) => void;
 }) {
   if (!timeline.showCompactBar) return null;
@@ -82,18 +93,19 @@ export function PhaseTimelineStrip({
               data-phase-active={phase.active ? "true" : "false"}
               aria-pressed={pressed}
               aria-label={ariaLabel}
-              title={phase.label}
+              title={duration ? `${phase.label} · ${duration}` : phase.label}
               onClick={() => onSelectPhase?.(phase.kind)}
               className="oc-phase-crumb"
             >
               <Icon size={11} strokeWidth={2} aria-hidden className="oc-phase-pill-icon" />
               <span>{phase.shortLabel}</span>
               <span className="oc-phase-pill-count">{phase.stepCount}</span>
+              {duration ? <span className="oc-phase-pill-duration">{duration}</span> : null}
             </button>
           </Fragment>
         );
       })}
-      {timeline.metrics.changedFileCount > 0 ? (
+      {!hideFileMetric && timeline.metrics.changedFileCount > 0 ? (
         <span data-testid="phase-metric-files" className="oc-phase-metric">
           改 {timeline.metrics.changedFileCount} 文件
         </span>
@@ -153,6 +165,7 @@ export function PhaseTimelineFilterBar({
               <Icon size={11} strokeWidth={2} aria-hidden className="oc-phase-pill-icon" />
               <span>{phase.shortLabel}</span>
               <span className="oc-phase-pill-count">{phase.stepCount}</span>
+              {duration ? <span className="oc-phase-pill-duration">{duration}</span> : null}
             </button>
           );
         })}

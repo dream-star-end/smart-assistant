@@ -2,8 +2,11 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import '@testing-library/jest-dom/vitest'
 import type { LockedPublicModel, PublicModel } from '../lib/types'
-import { ModelSelector, modelLabel, teamEngineLabel } from './ModelSelector'
+import { loadBeforeAll } from '../test/moduleLoad'
+import { ModelSelector, modelLabel, preloadModelSelectorPanel, teamEngineLabel } from './ModelSelector'
 import { EFFORT_OPTIONS } from './settings/labels'
+
+loadBeforeAll(preloadModelSelectorPanel)
 
 // 本仓 vitest 未开 globals 自动 cleanup,显式隔离每个用例的 DOM。
 afterEach(() => {
@@ -1119,6 +1122,39 @@ describe('ModelSelector OCV5-434 / OCV5-798 GPT 速度档位(turn 级 serviceTie
     )
     expect(screen.getByTestId('model-trigger-tier').textContent).toContain('Fast')
     expect(trigger.textContent).not.toMatch(/x\d/)
+  })
+
+  it('OCV5-817: 移动端非标准速度档(Fast/Ultrafast)显式渲染紧凑徽标 model-trigger-speed-mobile', () => {
+    const view = render(
+      <ModelSelector
+        models={GPT_MODELS}
+        selectedId="gpt-6.2-sol"
+        onSelect={() => {}}
+        serviceTier="fast"
+        onSelectServiceTier={() => {}}
+      />,
+    )
+    expect(screen.getByTestId('model-trigger-speed-mobile')).toHaveTextContent('Fast 2×')
+    view.rerender(
+      <ModelSelector
+        models={GPT_MODELS}
+        selectedId="gpt-6.2-sol"
+        onSelect={() => {}}
+        serviceTier="ultrafast"
+        onSelectServiceTier={() => {}}
+      />,
+    )
+    expect(screen.getByTestId('model-trigger-speed-mobile')).toHaveTextContent('Ultra 6×')
+    view.rerender(
+      <ModelSelector
+        models={GPT_MODELS}
+        selectedId="gpt-6.2-sol"
+        onSelect={() => {}}
+        serviceTier={null}
+        onSelectServiceTier={() => {}}
+      />,
+    )
+    expect(screen.queryByTestId('model-trigger-speed-mobile')).toBeNull()
   })
 
   it('Remote Codex 与非加速模型不渲染速度段', async () => {

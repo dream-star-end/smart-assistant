@@ -28,6 +28,7 @@ import {
   Mic,
   Music,
   Package,
+  PanelRightOpen,
   Quote,
   Search,
   ShieldCheck,
@@ -41,6 +42,7 @@ import { type ReactNode, useEffect, useState } from "react";
 import type { EvidenceManifest } from "@openclaude/protocol/research";
 import { shouldShowDelegateRunning } from "../../lib/chat/ocMemoryCli";
 import { PRODUCT_CAPABILITIES } from "../../lib/productCapabilities";
+import { dispatchOpenInWorkbench } from "../../lib/workbenchOpen";
 import { cn } from "../../lib/utils";
 import { SignedAudio, SignedFileCard, SignedImg, SignedVideo, useSignedSrc } from "../chat/media";
 import { ClaimList, CoverageBadge, GatesRow, LiteratureLibraryPanel } from "../chat/researchEvidence";
@@ -669,9 +671,25 @@ function ArtifactCard({ data }: { data: Record<string, unknown> }) {
       </div>
       {/* 引用接地详情(claim↔证据/闸门/文献库):manifest sidecar 懒加载 */}
       {manifestSrc && <EvidenceSection src={manifestSrc} coverage={coverage} />}
-      {/* 结果产物:下载 + 预览(仅白名单安全 src) */}
+      {/* 结果产物:优先右侧工作台预览(带引用接地 manifest),下载与新窗口预览为次操作(仅白名单安全 src) */}
       {safeOut && (
         <div className="mt-2 flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            data-testid="artifact-workbench-preview"
+            onClick={() =>
+              dispatchOpenInWorkbench({
+                path: safeOut,
+                title: fileName,
+                manifestSrc: manifestSrc ?? undefined,
+                tab: "outputs",
+              })
+            }
+            className="inline-flex items-center gap-1 rounded bg-accent px-2.5 py-1 text-meta font-medium text-accent-fg transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+          >
+            <PanelRightOpen className="size-3.5" aria-hidden />
+            工作台预览
+          </button>
           <SignedFileCard src={safeOut} filename={fileName} />
           <ArtifactPreviewLink src={safeOut} />
         </div>

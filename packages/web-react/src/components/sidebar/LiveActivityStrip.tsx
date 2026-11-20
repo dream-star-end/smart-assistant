@@ -1,5 +1,10 @@
-import { ChevronDown, ChevronRight } from "lucide-react";
-import { useMemo, useState } from "react";
+import { Bell, BellOff, ChevronDown, ChevronRight } from "lucide-react";
+import { useMemo, useState, useSyncExternalStore } from "react";
+import {
+  getDesktopNotifyState,
+  requestDesktopNotifyToggle,
+  subscribeDesktopNotifyState,
+} from "../../lib/desktopNotifyPref";
 import { StatusPill } from "../ui";
 import {
   type CollectLiveActivityInput,
@@ -53,6 +58,13 @@ export function LiveActivityStrip({
   const [requestedFilter, setRequestedFilter] = useState<LiveActivityFilter>("all");
   const [collapsed, setCollapsed] = useState(defaultCollapsed);
   const [showAll, setShowAll] = useState(false);
+  const notifyState = useSyncExternalStore(
+    subscribeDesktopNotifyState,
+    getDesktopNotifyState,
+    getDesktopNotifyState,
+  );
+  const notifyActive = notifyState.enabled && notifyState.permission === "granted";
+  const notifyDenied = notifyState.permission === "denied";
 
   if (summary.total === 0) return null;
 
@@ -102,6 +114,35 @@ export function LiveActivityStrip({
             );
           })}
         </div>
+        {notifyState.permission !== "unsupported" && (
+          <button
+            type="button"
+            data-testid="live-strip-notify-toggle"
+            data-enabled={notifyActive ? "true" : undefined}
+            aria-pressed={notifyActive}
+            disabled={notifyDenied}
+            aria-label={
+              notifyDenied
+                ? "桌面通知已被浏览器阻止"
+                : notifyActive
+                  ? "关闭桌面通知"
+                  : "开启桌面通知"
+            }
+            title={
+              notifyDenied
+                ? "浏览器已阻止桌面通知，请在站点设置中允许"
+                : notifyActive
+                  ? "已开启桌面通知（点击关闭）"
+                  : "开启桌面通知：待拍板或后台任务完成时提醒"
+            }
+            onClick={() => {
+              void requestDesktopNotifyToggle(!notifyState.enabled);
+            }}
+            className="oc-live-strip-toggle oc-live-strip-notify"
+          >
+            {notifyActive ? <Bell size={13} aria-hidden /> : <BellOff size={13} aria-hidden />}
+          </button>
+        )}
         <button
           type="button"
           data-testid="live-strip-collapse-toggle"

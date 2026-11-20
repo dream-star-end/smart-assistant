@@ -2,7 +2,7 @@
  * 对话内任务单人工审批卡。展示与操作一律以用户浏览器身份 GET/POST /api/board
  * 为准;agent 工具参数只提供 id / 可选提问,不能伪造单据状态。
  */
-import { ClipboardCheck, AlertTriangle } from "lucide-react";
+import { ClipboardCheck, AlertTriangle, ChevronDown, RotateCcw } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { ApiError } from "../../lib/api";
 import { recordTicketApprovalPending, syncTicketApprovalFromTicket } from "../../lib/sessionStatus";
@@ -16,6 +16,7 @@ import {
   type TicketType,
 } from "../../lib/taskboard";
 import { cn } from "../../lib/utils";
+import { Markdown } from "../Markdown";
 import { Badge, Button, Spinner, Textarea } from "../ui";
 import { useChatInteraction, useToolCardActions } from "./context";
 
@@ -37,6 +38,8 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
   const [ticket, setTicket] = useState<Ticket | null>(null);
   const [loading, setLoading] = useState(() => !!taskApproval);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [reloadTick, setReloadTick] = useState(0);
+  const [bodyExpanded, setBodyExpanded] = useState(false);
   const [deciding, setDeciding] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [rejectOpen, setRejectOpen] = useState(false);
@@ -69,7 +72,7 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
     return () => {
       alive = false;
     };
-  }, [taskApproval, id]);
+  }, [taskApproval, id, reloadTick]);
 
   const announce = useCallback(
     (message: string) => {
@@ -196,7 +199,21 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
             <Spinner /> 正在核验任务单…
           </div>
         ) : loadError ? (
-          <div className="py-1 text-body text-danger">{loadError}</div>
+          <div className="flex flex-wrap items-center justify-between gap-2 py-1">
+            <span className="text-body text-danger">{loadError}</span>
+            {taskApproval && (
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                data-testid="task-approval-retry-load"
+                onClick={() => setReloadTick((n) => n + 1)}
+              >
+                <RotateCcw className="size-3.5" />
+                重试加载
+              </Button>
+            )}
+          </div>
         ) : !taskApproval ? (
           <div className="py-1 text-body text-muted">此会话中不可交互，请打开任务面板处理。</div>
         ) : ticket ? (
@@ -209,9 +226,32 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
             <p className="mt-1 text-body font-medium text-fg">{ticket.title}</p>
             {prompt ? <p className="mt-1 text-[13px] leading-snug text-muted">{prompt}</p> : null}
             {ticket.body ? (
-              <p className="mt-1 line-clamp-3 whitespace-pre-wrap text-[13px] leading-snug text-muted">
-                {ticket.body}
-              </p>
+              <div className="mt-1.5">
+                {bodyExpanded ? (
+                  <div
+                    data-testid="task-approval-body-expanded"
+                    className="rounded-md bg-bg/50 px-2.5 py-2 text-meta leading-relaxed text-muted [&_.prose]:text-meta [&_.prose]:leading-relaxed"
+                  >
+                    <Markdown readOnly>{ticket.body}</Markdown>
+                  </div>
+                ) : (
+                  <p className="line-clamp-3 whitespace-pre-wrap text-[13px] leading-snug text-muted">
+                    {ticket.body}
+                  </p>
+                )}
+                {(ticket.body.length > 140 || ticket.body.includes("\n")) && (
+                  <button
+                    type="button"
+                    data-testid="task-approval-body-toggle"
+                    aria-expanded={bodyExpanded}
+                    onClick={() => setBodyExpanded((v) => !v)}
+                    className="mt-1 inline-flex items-center gap-1 text-caption font-medium text-accent hover:underline [@media(hover:none)]:min-h-11"
+                  >
+                    <ChevronDown className={cn("size-3.5 transition-transform", bodyExpanded && "rotate-180")} />
+                    {bodyExpanded ? "收起详情" : "展开完整详情"}
+                  </button>
+                )}
+              </div>
             ) : null}
           </>
         ) : (
@@ -219,6 +259,11 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
         )}
 
         {error ? <p className="mt-2 text-caption text-danger">{error}</p> : null}
+        {chatBusy && approvable && !loading && !loadError ? (
+          <output data-testid="task-approval-busy-hint" className="mt-2 block text-caption text-faint">
+            等待当前回合结束后可操作
+          </output>
+        ) : null}
         {settled === "approve" ? (
           <p className="mt-2 text-caption text-success">已在对话中确认</p>
         ) : null}
@@ -253,16 +298,31 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
               </Button>
               {status === "waiting_human" ? (
                 rejectOpen ? (
-                  <Button
-                    type="button"
-                    variant="danger"
-                    size="sm"
-                    disabled={!actionable || rejectReason.trim().length === 0}
-                    loading={deciding}
-                    onClick={onReject}
-                  >
-                    确认打回
-                  </Button>
+                  <>
+                    <Button
+                      type="button"
+                      variant="danger"
+                      size="sm"
+                      disabled={!actionable || rejectReason.trim().length === 0}
+                      loading={deciding}
+                      onClick={onReject}
+                    >
+                      确认打回
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      data-testid="task-approval-reject-cancel"
+                      disabled={deciding}
+                      onClick={() => {
+                        setRejectOpen(false);
+                        setRejectReason("");
+                      }}
+                    >
+                      取消
+                    </Button>
+                  </>
                 ) : (
                   <Button
                     type="button"

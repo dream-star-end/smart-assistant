@@ -13,6 +13,7 @@ import { Badge, Button, Spinner } from "../ui";
 import { ExpandControls, ExpandablePre, FULL_TEXT_CAP, useExpandableSlice } from "./expandable";
 import { languageForPath, useHighlighter } from "./highlight";
 import { diffLines, type DiffRow as LineDiffRow } from "./lineDiff";
+import { collapseDiffContext, diffStats, parseUnifiedDiffLines } from "./diffHunk";
 import { ReminderStatusCard, renderReminderListCard } from "./memoryReminderCards";
 import { renderSkillListCard, renderSkillSearchCard, renderSkillViewCard } from "./skillCards";
 import { renderDelegateFanoutCard } from "./delegateFanoutCard";
@@ -289,7 +290,7 @@ function DiffContainer({ children }: { children: ReactNode }) {
 }
 
 const GUTTER_CLS =
-  "w-9 shrink-0 select-none border-r border-border/60 pr-1.5 text-right text-[10.5px] leading-relaxed text-faint";
+  "w-9 shrink-0 select-none border-r border-border/60 pr-1.5 text-right text-micro leading-relaxed text-faint";
 
 /** diff 单行:行号(旧/新)+ 符号 + 内容(可选 hljs 着色;hljs 输出已转义)。
  *  gutters:全新增/全删除 diff 隐藏恒空的那一列;窄屏只保留新行号列(T-10:390px 下 92px 固定 gutter
@@ -338,15 +339,21 @@ function DiffRowView({
 }
 
 /**
- * Edit 工具的行级 diff(F2):LCS 求未变行为上下文,只把真正变化的行标 +/-,
- * 带快照内行号;按文件后缀做 hljs 着色;超过行数上限时可「展开全部」。
+ * Edit 工具的行级 diff(F2 / OCV5-817):LCS 求未变行为上下文,按 ±3 行折叠未改动片段(可原地展开),
+ * 顶部给出 +N / -M 变更统计徽标;按文件后缀做 hljs 着色;超过行数上限时可「展开全部」。
  */
 function DiffView({ oldStr, newStr, path }: { oldStr: string; newStr: string; path?: string }) {
   const full = useContext(ToolBodyFullContext);
   const [showAll, setShowAll] = useState(false);
+  const [expandedGaps, setExpandedGaps] = useState<Set<number>>(() => new Set());
   const rows = useMemo(() => diffLines(oldStr, newStr), [oldStr, newStr]);
+  const stats = useMemo(() => diffStats(rows), [rows]);
+  const entries = useMemo(
+    () => (full ? rows.map((row, index) => ({ kind: "row" as const, row, index })) : collapseDiffContext(rows, 3, expandedGaps)),
+    [rows, full, expandedGaps],
+  );
   const maxLines = full || showAll ? MAX_DIFF_LINES_FULL : MAX_DIFF_LINES;
-  const truncated = rows.length > maxLines;
+  const truncated = entries.length > maxLines;
   const highlight = useHighlighter(languageForPath(path ?? null));
   // 全新增(Write / 空 old_string)没有旧行号,全删除没有新行号:恒空的 gutter 不占位。
   const gutters = useMemo(
@@ -356,15 +363,51 @@ function DiffView({ oldStr, newStr, path }: { oldStr: string; newStr: string; pa
     }),
     [rows],
   );
+  const expandGap = (start: number) => {
+    setExpandedGaps((prev) => {
+      const next = new Set(prev);
+      next.add(start);
+      return next;
+    });
+  };
   return (
     <DiffContainer>
-      {rows.slice(0, maxLines).map((r, i) => (
-        <DiffRowView key={`${i}-${r.sign}`} row={r} html={highlight(r.text)} gutters={gutters} />
-      ))}
+      {(stats.added > 0 || stats.removed > 0) && (
+        <div
+          data-testid="diff-stats-bar"
+          className="flex items-center gap-2 border-b border-border/60 bg-hover/40 px-3 py-1 font-sans text-caption"
+        >
+          {path && <span className="min-w-0 truncate font-mono text-muted">{shortPath(path)}</span>}
+          <span className="ml-auto flex shrink-0 items-center gap-1.5 font-mono tabular-nums">
+            {stats.added > 0 && <span className="text-success">+{stats.added}</span>}
+            {stats.removed > 0 && <span className="text-danger">-{stats.removed}</span>}
+          </span>
+        </div>
+      )}
+      {entries.slice(0, maxLines).map((entry) =>
+        entry.kind === "gap" ? (
+          <button
+            key={`gap-${entry.start}`}
+            type="button"
+            data-testid="diff-context-gap"
+            onClick={() => expandGap(entry.start)}
+            className="flex w-full items-center gap-2 border-y border-border/50 bg-hover/40 px-3 py-1 text-left font-sans text-caption text-faint transition-colors hover:bg-hover hover:text-fg [@media(hover:none)]:min-h-11"
+          >
+            <span>⋯ 展开 {entry.count} 行未改动上下文</span>
+          </button>
+        ) : (
+          <DiffRowView
+            key={`${entry.index}-${entry.row.sign}`}
+            row={entry.row}
+            html={highlight(entry.row.text)}
+            gutters={gutters}
+          />
+        ),
+      )}
       {truncated && (
         <DiffTruncationRow
           shown={maxLines}
-          total={rows.length}
+          total={entries.length}
           onShowAll={showAll ? undefined : () => setShowAll(true)}
         />
       )}
@@ -538,34 +581,103 @@ function parseCodexFileChanges(input: Input): CodexFileChange[] | null {
   });
 }
 
-/** codex update 的 unified diff 按行着色(+绿 / -红 / 其余弱化),超上限可「展开全部」。 */
-function UnifiedDiffView({ diff }: { diff: string }) {
+/** codex update 的 unified diff：区分 +++/--- 文件头、@@ hunk 头与增删行并展示行号与 +N/-M 统计。 */
+function UnifiedDiffView({ diff, path }: { diff: string; path?: string }) {
   const full = useContext(ToolBodyFullContext);
   const [showAll, setShowAll] = useState(false);
   const maxLines = full || showAll ? MAX_DIFF_LINES_FULL : MAX_DIFF_LINES;
-  const lines = diff.replace(/\n$/, "").split("\n");
-  const truncated = lines.length > maxLines;
+  const parsed = useMemo(() => parseUnifiedDiffLines(diff), [diff]);
+  const highlight = useHighlighter(languageForPath(path ?? null));
+  const hasOldNo = useMemo(() => parsed.lines.some((l) => l.oldNo !== null), [parsed.lines]);
+  const hasNewNo = useMemo(() => parsed.lines.some((l) => l.newNo !== null), [parsed.lines]);
+  const truncated = parsed.lines.length > maxLines;
   return (
     <DiffContainer>
-      {lines.slice(0, maxLines).map((line, i) => (
+      {(parsed.added > 0 || parsed.removed > 0) && (
         <div
-          key={`${i}-${line.slice(0, 24)}`}
-          className={cn(
-            "w-max min-w-full whitespace-pre px-3 py-px sm:w-auto sm:whitespace-pre-wrap sm:break-words",
-            line.startsWith("+")
-              ? "bg-success-soft text-success"
-              : line.startsWith("-")
-                ? "bg-danger-soft text-danger"
-                : "text-muted",
-          )}
+          data-testid="diff-stats-bar"
+          className="flex items-center gap-2 border-b border-border/60 bg-hover/40 px-3 py-1 font-sans text-caption"
         >
-          {line || " "}
+          {path && <span className="min-w-0 truncate font-mono text-muted">{shortPath(path)}</span>}
+          <span className="ml-auto flex shrink-0 items-center gap-1.5 font-mono tabular-nums">
+            {parsed.added > 0 && <span className="text-success">+{parsed.added}</span>}
+            {parsed.removed > 0 && <span className="text-danger">-{parsed.removed}</span>}
+          </span>
         </div>
-      ))}
+      )}
+      {parsed.lines.slice(0, maxLines).map((line, i) => {
+        if (line.kind === "file-header") {
+          return (
+            <div
+              key={`${i}-hdr`}
+              data-diff-line-kind="file-header"
+              className="w-max min-w-full border-b border-border/40 bg-hover/50 px-3 py-0.5 font-medium text-muted sm:w-auto sm:whitespace-pre-wrap sm:break-words"
+            >
+              {line.raw}
+            </div>
+          );
+        }
+        if (line.kind === "hunk-header") {
+          return (
+            <div
+              key={`${i}-hunk`}
+              data-diff-line-kind="hunk-header"
+              className="w-max min-w-full bg-accent-soft/45 px-3 py-0.5 text-accent sm:w-auto sm:whitespace-pre-wrap sm:break-words"
+            >
+              {line.raw}
+            </div>
+          );
+        }
+        const html = highlight(line.text);
+        return (
+          <div
+            key={`${i}-${line.kind}`}
+            className={cn(
+              "flex w-max min-w-full sm:w-auto",
+              line.kind === "del" ? "bg-danger-soft" : line.kind === "add" ? "bg-success-soft" : undefined,
+            )}
+          >
+            {hasOldNo && (
+              <span className={cn(GUTTER_CLS, hasNewNo && "hidden sm:block")}>{line.oldNo ?? ""}</span>
+            )}
+            {hasNewNo && <span className={GUTTER_CLS}>{line.newNo ?? ""}</span>}
+            {html ? (
+              <>
+                <span
+                  className={cn(
+                    "w-5 shrink-0 select-none text-center",
+                    line.kind === "del" ? "text-danger" : line.kind === "add" ? "text-success" : "text-faint",
+                  )}
+                >
+                  {line.sign === " " ? "" : line.sign}
+                </span>
+                <span
+                  className={cn(
+                    "min-w-0 flex-1 whitespace-pre pr-3 sm:whitespace-pre-wrap sm:break-words",
+                    line.kind === "del" ? "text-danger" : line.kind === "add" ? "text-success" : "text-muted",
+                  )}
+                >
+                  {/* biome-ignore lint/security/noDangerouslySetInnerHtml: hljs 输出对源码已做 HTML 转义 */}
+                  <span dangerouslySetInnerHTML={{ __html: html }} />
+                </span>
+              </>
+            ) : (
+              <span
+                className={cn(
+                  "min-w-0 flex-1 whitespace-pre px-2 sm:whitespace-pre-wrap sm:break-words",
+                  line.kind === "del" ? "text-danger" : line.kind === "add" ? "text-success" : "text-muted",
+                )}
+              >
+                {line.kind === "del" || line.kind === "add" ? `${line.sign}${line.text}` : line.text || " "}
+              </span>
+            )}
+          </div>
+        );
+      })}
       {truncated && (
         <DiffTruncationRow
           shown={maxLines}
-          total={lines.length}
+          total={parsed.lines.length}
           onShowAll={showAll ? undefined : () => setShowAll(true)}
         />
       )}
@@ -593,7 +705,7 @@ function CodexFileChangesView({ changes, tool }: { changes: CodexFileChange[]; t
             // 删除是成功执行的破坏性动作:danger 色明示,不能像编辑成功一样绿。
             <div className="mt-1.5 text-xs text-danger">删除文件</div>
           ) : c.kind === "update" ? (
-            c.diff && <UnifiedDiffView diff={c.diff} />
+            c.diff && <UnifiedDiffView diff={c.diff} path={c.path} />
           ) : (
             c.diff && (
               <>
@@ -614,10 +726,10 @@ function CodexFileChangesView({ changes, tool }: { changes: CodexFileChange[]; t
 }
 
 function EditBody({ input, tool }: BodyProps) {
-  const full = useContext(ToolBodyFullContext);
-  const strCap = full ? FULL_TEXT_CAP : 3000;
-  const oldStr = asStr(input?.old_string).slice(0, strCap);
-  const newStr = asStr(input?.new_string).slice(0, strCap);
+  // OCV5-817: 移除 3000 字符前置静默截断，避免长上下文/大块替换的真实变动被切掉。
+  // DiffView 内部已按 ±3 行折叠未改动上下文并在 60/4000 行做渲染保护。
+  const oldStr = asStr(input?.old_string).slice(0, FULL_TEXT_CAP);
+  const newStr = asStr(input?.new_string).slice(0, FULL_TEXT_CAP);
   // codex apply_patch 形状(无 old/new_string,changes 数组)→ 结构化渲染;claude 原生不变。
   if (!oldStr && !newStr) {
     const changes = parseCodexFileChanges(input);

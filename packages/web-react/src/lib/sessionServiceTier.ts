@@ -37,3 +37,28 @@ export function writeSessionServiceTier(
     // Storage 只是最佳努力；写失败不影响内存状态。
   }
 }
+
+/** 删除会话时清理遗留的速度档键，防止 localStorage 持续泄漏。best-effort，失败不抛。 */
+export function clearSessionServiceTier(sessionId: string | undefined): void {
+  if (!sessionId) return
+  try {
+    localStorage.removeItem(serviceTierSessionKey(sessionId))
+  } catch {
+    // best-effort
+  }
+}
+
+/** 订阅同一会话在其他标签页的速度档切换（经 storage 事件实时同步）。 */
+export function subscribeSessionServiceTier(
+  sessionId: string | undefined,
+  onChange: (tier: ServiceTier | null) => void,
+): () => void {
+  if (!sessionId || typeof window === 'undefined') return () => {}
+  const targetKey = serviceTierSessionKey(sessionId)
+  const onStorage = (event: StorageEvent) => {
+    if (event.key !== null && event.key !== targetKey) return
+    onChange(event.key === null ? null : isServiceTier(event.newValue) ? event.newValue : null)
+  }
+  window.addEventListener('storage', onStorage)
+  return () => window.removeEventListener('storage', onStorage)
+}

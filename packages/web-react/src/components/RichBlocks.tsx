@@ -284,16 +284,48 @@ function parseOptionsBlocks(
   }
 }
 
+function detectFollowingUserAnswer(el: HTMLElement | null): string | null {
+  const assistantRow = el?.closest<HTMLElement>('[data-testid="assistant-row"]');
+  if (!assistantRow) return null;
+  const root =
+    assistantRow.closest<HTMLElement>('[data-testid="timeline-short-list"], [data-testid="message-list"]') ??
+    assistantRow.parentElement?.parentElement;
+  if (!root) return null;
+  const rows = Array.from(root.querySelectorAll<HTMLElement>('[data-testid="assistant-row"], [data-testid="user-row"]'));
+  const idx = rows.indexOf(assistantRow);
+  if (idx < 0) return null;
+  for (let i = idx + 1; i < rows.length; i += 1) {
+    const row = rows[i]!;
+    if (row.getAttribute("data-testid") === "user-row") {
+      const text = row.querySelector<HTMLElement>('[data-testid="message-text"]')?.textContent?.trim() ?? "";
+      if (/^我选择[:：]/.test(text)) return text.replace(/^我选择[:：]/, "").trim() || text;
+      if (/^我的选择[:：]/.test(text)) return text.replace(/^我的选择[:：]/, "").trim() || "已作答";
+      return text ? "已通过后续消息回复" : "已作答";
+    }
+  }
+  return null;
+}
+
 function OptionsCardItem({ parsed, readOnly }: { parsed: ParsedOptionsItem; readOnly?: boolean }) {
   const { sendUserText, busy, reason } = useChatInteraction();
   const group = useOptionsGroup();
   const groupSnap = useOptionsGroupSnapshot();
   const blockKey = useId();
+  const cardRef = useRef<HTMLDivElement>(null);
   const [picked, setPicked] = useState<Set<number>>(new Set());
   const [sentLocal, setSentLocal] = useState<string | null>(null);
+  const [historyAnswer, setHistoryAnswer] = useState<string | null>(null);
+  const [reopenedHistory, setReopenedHistory] = useState(false);
   const [noteOpen, setNoteOpen] = useState(false);
   const [customNote, setCustomNote] = useState("");
   const composingRef = useRef(false);
+
+  // 刷新或切回历史会话时，若该条助手消息后方已存在用户回复，则默认判定为历史已作答态，防止单选误触重发。
+  useEffect(() => {
+    if (readOnly || sentLocal !== null) return;
+    const found = detectFollowingUserAnswer(cardRef.current);
+    setHistoryAnswer(found);
+  }, [readOnly, sentLocal, busy]);
 
   // 注册到消息级分组(多题聚合作答的前提;流式半截时不注册,解析成功即补登)。
   // 用 layout effect:passive effect 在 commit 之后才跑,中间那帧里块已可点、分组还没数到它,
@@ -313,8 +345,12 @@ function OptionsCardItem({ parsed, readOnly }: { parsed: ParsedOptionsItem; read
   const streaming = groupSnap?.live === true;
   const grouped = !!group && (groupSnap?.grouped ?? false);
   const groupEntry = groupSnap?.entries.find((e) => e.key === blockKey);
-  const sent = sentLocal !== null || (groupSnap?.sent ?? false);
-  const sentText = sentLocal ?? (groupEntry?.labels.length ? groupEntry.labels.join("、") : null);
+  const lockedByHistory = !streaming && historyAnswer !== null && !reopenedHistory;
+  const sent = sentLocal !== null || (groupSnap?.sent ?? false) || lockedByHistory;
+  const sentText =
+    sentLocal ??
+    (groupEntry?.labels.length ? groupEntry.labels.join("、") : null) ??
+    (lockedByHistory ? historyAnswer : null);
   const interactive = !readOnly && !!sendUserText && !sent;
   // 生产里 busy===sending===live;流式期忽略 busy,否则长回合选项卡仍不可点。
   // 非流式仍尊重 busy(历史卡在新回合进行中不可点)。
@@ -362,7 +398,7 @@ function OptionsCardItem({ parsed, readOnly }: { parsed: ParsedOptionsItem; read
     sendUserText?.(trimmedNote);
   };
   return (
-    <div className="my-2 flex flex-col gap-2 rounded-2xl border border-border bg-surface p-3 not-prose shadow-[0_1px_2px_rgba(15,23,42,0.03)]">
+    <div ref={cardRef} className="my-2 flex flex-col gap-2 rounded-2xl border border-border bg-surface p-3 not-prose shadow-[0_1px_2px_rgba(15,23,42,0.03)]">
       {(parsed.question || parsed.options.length > 0) && (
         <div className="flex items-start justify-between gap-2 px-1">
           {parsed.question ? <p className="text-body font-medium text-fg">{parsed.question}</p> : <span />}
@@ -466,7 +502,21 @@ function OptionsCardItem({ parsed, readOnly }: { parsed: ParsedOptionsItem; read
           )}
         </div>
       )}
-      {sent && sentText && <p className="px-1 text-caption text-faint">已选择:{sentText}</p>}
+      {sent && sentText && (
+        <div className="flex flex-wrap items-center justify-between gap-2 px-1 text-caption text-faint">
+          <p className="min-w-0 truncate">已选择:{sentText}</p>
+          {lockedByHistory && !readOnly && !!sendUserText && !busy && (
+            <button
+              type="button"
+              data-testid="options-reopen-history"
+              onClick={() => setReopenedHistory(true)}
+              className="shrink-0 font-medium text-muted transition-colors hover:text-fg [@media(hover:none)]:min-h-11"
+            >
+              重新选择
+            </button>
+          )}
+        </div>
+      )}
       {grouped && !sent && (groupEntry?.labels.length ?? 0) > 0 && (
         <p className="px-1 text-caption text-faint">已选:{groupEntry?.labels.join("、")}(可在下方发送选择)</p>
       )}

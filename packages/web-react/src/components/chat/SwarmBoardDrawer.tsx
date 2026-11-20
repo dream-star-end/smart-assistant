@@ -20,6 +20,7 @@ import {
   Hash,
   Hexagon,
   MessageSquare,
+  Quote,
   Search,
   Users,
   X,
@@ -27,7 +28,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "../../lib/utils";
 import { Markdown } from "../Markdown";
-import { Badge, Button, IconButton, Spinner } from "../ui";
+import { Badge, Button, IconButton, Spinner, useToast } from "../ui";
 import {
   formatPostClock,
   formatSwarmElapsed,
@@ -47,6 +48,35 @@ function hasRichMarkdown(text: string): boolean {
   return /(?:^|\n)(?:#{1,4}\s|```|[-*]\s|\d+\.\s|\|.*\|)|`[^`]+`|\*\*[^*]+\*\*/.test(text);
 }
 
+/**
+ * 将富文本 Markdown 中非代码/非链接区域的 @member、@#channel、#seq 转为页内锚点链接，
+ * 以便 Markdown 完整渲染的同时，仍然保持点击聚焦成员 / 切换频道 / 跳转序号的交互能力。
+ */
+export function linkifySwarmMarkdownTokens(text: string): string {
+  // 跳过围栏代码块、行内代码与已有 Markdown 链接
+  const PROTECTED_RE = /(```[\s\S]*?```|`[^`\n]+`|\[[^\]]*\]\([^)]+\))/g;
+  const parts = text.split(PROTECTED_RE);
+  return parts
+    .map((part, idx) => {
+      if (idx % 2 === 1) return part;
+      return tokenizeSwarmInlineText(part)
+        .map((tok) => {
+          if (tok.kind === "mention") {
+            return `[${tok.value}](#swarm-mention:${encodeURIComponent(tok.target)})`;
+          }
+          if (tok.kind === "channel_mention") {
+            return `[${tok.value}](#swarm-channel:${encodeURIComponent(tok.channel)})`;
+          }
+          if (tok.kind === "seq") {
+            return `[${tok.value}](#swarm-seq:${tok.seq})`;
+          }
+          return tok.value;
+        })
+        .join("");
+    })
+    .join("");
+}
+
 function InteractivePostBody({
   text,
   onMention,
@@ -58,10 +88,36 @@ function InteractivePostBody({
   onChannel: (ch: string) => void;
   onJumpSeq: (seq: number) => void;
 }) {
-  if (hasRichMarkdown(text)) {
+  const rich = hasRichMarkdown(text);
+  const linkedMarkdown = useMemo(() => (rich ? linkifySwarmMarkdownTokens(text) : ""), [rich, text]);
+
+  if (rich) {
     return (
-      <div className="prose-sm max-w-none text-body leading-relaxed text-fg">
-        <Markdown>{text}</Markdown>
+      <div
+        className={cn(
+          "prose-sm max-w-none text-body leading-relaxed text-fg",
+          "[&_a[href^='#swarm-mention:']]:mx-0.5 [&_a[href^='#swarm-mention:']]:inline-flex [&_a[href^='#swarm-mention:']]:items-center [&_a[href^='#swarm-mention:']]:rounded-md [&_a[href^='#swarm-mention:']]:border-0 [&_a[href^='#swarm-mention:']]:bg-accent-soft [&_a[href^='#swarm-mention:']]:px-1.5 [&_a[href^='#swarm-mention:']]:py-0.5 [&_a[href^='#swarm-mention:']]:text-caption [&_a[href^='#swarm-mention:']]:font-medium [&_a[href^='#swarm-mention:']]:text-accent",
+          "[&_a[href^='#swarm-channel:']]:mx-0.5 [&_a[href^='#swarm-channel:']]:inline-flex [&_a[href^='#swarm-channel:']]:items-center [&_a[href^='#swarm-channel:']]:rounded-md [&_a[href^='#swarm-channel:']]:border-0 [&_a[href^='#swarm-channel:']]:bg-info-soft [&_a[href^='#swarm-channel:']]:px-1.5 [&_a[href^='#swarm-channel:']]:py-0.5 [&_a[href^='#swarm-channel:']]:text-caption [&_a[href^='#swarm-channel:']]:font-medium [&_a[href^='#swarm-channel:']]:text-info",
+          "[&_a[href^='#swarm-seq:']]:mx-0.5 [&_a[href^='#swarm-seq:']]:inline-flex [&_a[href^='#swarm-seq:']]:items-center [&_a[href^='#swarm-seq:']]:rounded [&_a[href^='#swarm-seq:']]:border-0 [&_a[href^='#swarm-seq:']]:bg-hover [&_a[href^='#swarm-seq:']]:px-1.5 [&_a[href^='#swarm-seq:']]:py-0.5 [&_a[href^='#swarm-seq:']]:font-mono [&_a[href^='#swarm-seq:']]:text-caption [&_a[href^='#swarm-seq:']]:font-medium [&_a[href^='#swarm-seq:']]:text-muted",
+        )}
+        onClick={(e) => {
+          const anchor = (e.target as HTMLElement | null)?.closest("a");
+          const href = anchor?.getAttribute("href");
+          if (!href || !href.startsWith("#swarm-")) return;
+          e.preventDefault();
+          if (href.startsWith("#swarm-mention:")) {
+            const target = decodeURIComponent(href.slice("#swarm-mention:".length));
+            if (target && target !== "all") onMention(target);
+          } else if (href.startsWith("#swarm-channel:")) {
+            const ch = decodeURIComponent(href.slice("#swarm-channel:".length));
+            if (ch) onChannel(ch);
+          } else if (href.startsWith("#swarm-seq:")) {
+            const seq = Number.parseInt(href.slice("#swarm-seq:".length), 10);
+            if (Number.isFinite(seq) && seq > 0) onJumpSeq(seq);
+          }
+        }}
+      >
+        <Markdown>{linkedMarkdown}</Markdown>
       </div>
     );
   }
@@ -215,6 +271,7 @@ function PostRow({
   onMention,
   onChannel,
   onJumpSeq,
+  onQuote,
   setRowRef,
 }: {
   post: SwarmBoardPost;
@@ -222,21 +279,26 @@ function PostRow({
   onMention: (name: string) => void;
   onChannel: (ch: string) => void;
   onJumpSeq: (seq: number) => void;
+  onQuote?: (post: SwarmBoardPost) => void;
   setRowRef: (seq: number, el: HTMLDivElement | null) => void;
 }) {
   const [copied, setCopied] = useState(false);
   const [expanded, setExpanded] = useState(false);
+  const toast = useToast();
   const style = swarmMemberStyle(post.agent);
   const clock = formatPostClock(post.time);
   const isDoneMarker = post.text.trimStart().startsWith("[done]");
   const isLong = post.text.length > 900;
   const shownText = isLong && !expanded ? `${post.text.slice(0, 900)}…` : post.text;
 
-  const copy = () => {
-    void navigator.clipboard?.writeText(post.text).then(() => {
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(post.text);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1500);
-    });
+    } catch {
+      toast("复制失败，请手动选中文本复制", "error");
+    }
   };
 
   return (
@@ -277,14 +339,26 @@ function PostRow({
           </button>
         )}
         {isDoneMarker && <Badge tone="success">阶段完结</Badge>}
-        <div className="ml-auto flex items-center gap-1.5">
+        <div className="ml-auto flex items-center gap-1">
           {clock && <span className="font-mono text-micro text-faint tabular-nums">{clock}</span>}
+          {onQuote && (
+            <button
+              type="button"
+              onClick={() => onQuote(post)}
+              aria-label={`引用 #${post.seq} 到主线`}
+              title="引用到主输入框"
+              data-testid={`swarm-quote-post-${post.seq}`}
+              className="flex size-7 items-center justify-center rounded-md text-faint opacity-0 transition-all hover:bg-hover hover:text-fg group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:size-11 [@media(hover:none)]:opacity-100"
+            >
+              <Quote size={12} />
+            </button>
+          )}
           <button
             type="button"
-            onClick={copy}
+            onClick={() => void copy()}
             aria-label="复制讨论内容"
             title="复制"
-            className="flex size-6 items-center justify-center rounded-md text-faint opacity-0 transition-all hover:bg-hover hover:text-fg group-hover:opacity-100 focus-visible:opacity-100"
+            className="flex size-7 items-center justify-center rounded-md text-faint opacity-0 transition-all hover:bg-hover hover:text-fg group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:size-11 [@media(hover:none)]:opacity-100"
           >
             {copied ? <Check size={12} className="text-success" /> : <Copy size={12} />}
           </button>
@@ -317,12 +391,16 @@ export function SwarmBoardDrawer({
   snapshot,
   initialFocusMember = null,
   initialFocusChannel = null,
+  initialFocusSeq = null,
+  onQuoteToComposer,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   snapshot: SwarmSnapshot | null;
   initialFocusMember?: string | null;
   initialFocusChannel?: string | null;
+  initialFocusSeq?: number | null;
+  onQuoteToComposer?: (text: string) => void;
 }) {
   const [selectedMember, setSelectedMember] = useState<string | null>(initialFocusMember);
   const [selectedChannel, setSelectedChannel] = useState<string | null>(initialFocusChannel);
@@ -331,10 +409,12 @@ export function SwarmBoardDrawer({
   const [mobileTab, setMobileTab] = useState<"board" | "roster">("board");
   const [highlightedSeq, setHighlightedSeq] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
+  const toast = useToast();
 
   const feedRef = useRef<HTMLDivElement>(null);
   const postRefs = useRef(new Map<number, HTMLDivElement>());
   const highlightTimerRef = useRef<number | null>(null);
+  const pendingJumpSeqRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -342,7 +422,14 @@ export function SwarmBoardDrawer({
     setSelectedChannel(initialFocusChannel ?? null);
     setSearch("");
     setMobileTab("board");
-  }, [open, initialFocusMember, initialFocusChannel]);
+    if (typeof initialFocusSeq === "number" && initialFocusSeq > 0) {
+      pendingJumpSeqRef.current = initialFocusSeq;
+      setFollowLatest(false);
+      setHighlightedSeq(initialFocusSeq);
+      if (highlightTimerRef.current !== null) window.clearTimeout(highlightTimerRef.current);
+      highlightTimerRef.current = window.setTimeout(() => setHighlightedSeq(null), 2200);
+    }
+  }, [open, initialFocusMember, initialFocusChannel, initialFocusSeq]);
 
   const active = snapshot ? isSwarmActive(snapshot.phase) : false;
 
@@ -384,20 +471,46 @@ export function SwarmBoardDrawer({
     else postRefs.current.delete(seq);
   }, []);
 
-  const jumpToSeq = useCallback((seq: number) => {
-    setSelectedMember(null);
-    setSelectedChannel(null);
-    setSearch("");
-    setFollowLatest(false);
-    setMobileTab("board");
-    setHighlightedSeq(seq);
-    if (highlightTimerRef.current !== null) window.clearTimeout(highlightTimerRef.current);
-    highlightTimerRef.current = window.setTimeout(() => setHighlightedSeq(null), 2200);
-    requestAnimationFrame(() => {
-      const target = postRefs.current.get(seq);
-      target?.scrollIntoView?.({ behavior: "smooth", block: "center" });
-    });
-  }, []);
+  const jumpToSeq = useCallback(
+    (seq: number) => {
+      const existsInWindow = snapshot?.posts.some((p) => p.seq === seq) ?? false;
+      if (!existsInWindow) {
+        toast(`#${seq} 属于更早的历史记录，当前窗口未保留`, "info");
+        return;
+      }
+      pendingJumpSeqRef.current = seq;
+      setSelectedMember(null);
+      setSelectedChannel(null);
+      setSearch("");
+      setFollowLatest(false);
+      setMobileTab("board");
+      setHighlightedSeq(seq);
+      if (highlightTimerRef.current !== null) window.clearTimeout(highlightTimerRef.current);
+      highlightTimerRef.current = window.setTimeout(() => setHighlightedSeq(null), 2200);
+    },
+    [snapshot, toast],
+  );
+
+  useEffect(() => {
+    const seq = pendingJumpSeqRef.current;
+    if (!open || seq === null) return;
+    const target = postRefs.current.get(seq);
+    if (!target) return;
+    pendingJumpSeqRef.current = null;
+    target.scrollIntoView?.({ behavior: "smooth", block: "center" });
+  }, [open, filteredPosts, highlightedSeq]);
+
+  const quotePostToMainline = useCallback(
+    (post: SwarmBoardPost) => {
+      if (!onQuoteToComposer) return;
+      const snippet = post.text.trim().slice(0, 600);
+      const quote = `> [蜂群讨论 #${post.seq} @${post.agent}]\n> ${snippet.replace(/\n/g, "\n> ")}`;
+      onQuoteToComposer(quote);
+      onOpenChange(false);
+      toast(`已引用 #${post.seq} 到主输入框`, "success");
+    },
+    [onQuoteToComposer, onOpenChange, toast],
+  );
 
   // `[` / `]` keyboard stepping across posts when not typing in search input.
   useEffect(() => {
@@ -437,7 +550,7 @@ export function SwarmBoardDrawer({
           aria-describedby={undefined}
           className={cn(
             "fixed left-1/2 top-1/2 z-50 flex -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden",
-            "h-[90vh] w-[calc(100vw-1rem)] max-w-5xl rounded-2xl border border-border bg-bg shadow-pop outline-none sm:h-[84vh] sm:w-[calc(100vw-2.5rem)]",
+            "h-[min(90dvh,calc(var(--oc-visual-height,100dvh)-1rem))] w-[calc(100vw-1rem)] max-w-5xl rounded-2xl border border-border bg-bg pb-[env(safe-area-inset-bottom)] shadow-pop outline-none sm:h-[min(84dvh,calc(var(--oc-visual-height,100dvh)-2rem))] sm:w-[calc(100vw-2.5rem)]",
           )}
         >
           {/* Top accent ribbon */}
@@ -530,7 +643,7 @@ export function SwarmBoardDrawer({
                 type="button"
                 onClick={() => setSelectedChannel(null)}
                 className={cn(
-                  "shrink-0 rounded-lg px-2.5 py-1 text-caption font-medium transition-colors",
+                  "shrink-0 rounded-lg px-2.5 py-1 text-caption font-medium transition-colors [@media(hover:none)]:min-h-11",
                   selectedChannel === null
                     ? "bg-accent-soft text-accent"
                     : "text-muted hover:bg-hover hover:text-fg",
@@ -544,7 +657,7 @@ export function SwarmBoardDrawer({
                   type="button"
                   onClick={() => setSelectedChannel(selectedChannel === ch.name ? null : ch.name)}
                   className={cn(
-                    "inline-flex shrink-0 items-center gap-1 rounded-lg px-2.5 py-1 text-caption font-medium transition-colors",
+                    "inline-flex shrink-0 items-center gap-1 rounded-lg px-2.5 py-1 text-caption font-medium transition-colors [@media(hover:none)]:min-h-11",
                     selectedChannel === ch.name
                       ? "bg-info-soft text-info"
                       : "text-muted hover:bg-hover hover:text-fg",
@@ -565,7 +678,7 @@ export function SwarmBoardDrawer({
                 type="button"
                 onClick={() => setMobileTab("board")}
                 className={cn(
-                  "flex items-center gap-1 rounded-md px-2.5 py-1 text-caption font-medium",
+                  "flex items-center gap-1 rounded-md px-2.5 py-1 text-caption font-medium [@media(hover:none)]:min-h-11",
                   mobileTab === "board" ? "bg-surface text-fg shadow-soft" : "text-muted",
                 )}
               >
@@ -575,7 +688,7 @@ export function SwarmBoardDrawer({
                 type="button"
                 onClick={() => setMobileTab("roster")}
                 className={cn(
-                  "flex items-center gap-1 rounded-md px-2.5 py-1 text-caption font-medium",
+                  "flex items-center gap-1 rounded-md px-2.5 py-1 text-caption font-medium [@media(hover:none)]:min-h-11",
                   mobileTab === "roster" ? "bg-surface text-fg shadow-soft" : "text-muted",
                 )}
               >
@@ -723,6 +836,7 @@ export function SwarmBoardDrawer({
                       onMention={(name) => setSelectedMember(name)}
                       onChannel={(ch) => setSelectedChannel(ch)}
                       onJumpSeq={jumpToSeq}
+                      onQuote={onQuoteToComposer ? quotePostToMainline : undefined}
                       setRowRef={setRowRef}
                     />
                   ))

@@ -129,7 +129,7 @@ export function OrgCenter({
           data-testid="org-center-dialog"
           // 五分区内容多、要定高让内部滚动；创建向导只有一两个输入框，定高会留下 700px 空白
           // （审计 SET-34），改为按内容自适应、只封顶。不走 cn()：twMerge 会把 vh 回退类当重复项吞掉。
-          className={`oc-center-dialog fixed left-1/2 z-50 flex w-[calc(100vw-2rem)] max-w-2xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-surface shadow-float focus:outline-none data-[state=open]:animate-in ${
+          className={`oc-center-dialog fixed left-1/2 z-50 flex w-[calc(100vw-2rem)] max-w-2xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-elevated shadow-float focus:outline-none data-[state=open]:animate-in ${
             showWizard
               ? "max-h-[min(85vh,46rem)] max-h-[min(85dvh,46rem)]"
               : "h-[min(85vh,46rem)] h-[min(85dvh,46rem)]"
@@ -140,8 +140,8 @@ export function OrgCenter({
               {showWizard ? "创建组织" : (user?.org?.name ?? "组织")}
             </Dialog.Title>
             <Dialog.Close asChild>
-              <IconButton variant="muted" size="md" shape="square" aria-label="关闭">
-                <X size={17} />
+              <IconButton variant="muted" size="sm" aria-label="关闭">
+                <X size={16} />
               </IconButton>
             </Dialog.Close>
           </div>

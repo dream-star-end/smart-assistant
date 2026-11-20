@@ -236,12 +236,13 @@ describe("quickAskSession helpers", () => {
     expect(parseQuickAskSlashCommand("普通提问 /btw 不在行首")).toEqual({ matched: false });
   });
 
-  test("pickDefaultQuickAskModel 跳过降级模型并优先选用快模型", () => {
-    expect(pickDefaultQuickAskModel(MODELS, "gpt-6-astra")).toBe("deepseek-v4-flash");
+  test("pickDefaultQuickAskModel 默认继承主会话健康模型，不静默降级至弱模型，并尊重用户显式选择", () => {
+    expect(pickDefaultQuickAskModel(MODELS, "gpt-6-astra")).toBe("gpt-6-astra");
+    expect(pickDefaultQuickAskModel(MODELS, "gpt-6-astra", "deepseek-v4-flash")).toBe("deepseek-v4-flash");
     expect(
       pickDefaultQuickAskModel(
         [
-          { id: "gpt-6-astra" },
+          { id: "gpt-6-astra", degraded: true },
           { id: "deepseek-v4-flash", degraded: true },
           { id: "gpt-6-luna" },
         ],
@@ -285,7 +286,7 @@ describe("QuickAskWindow 并行问答与隔离行为", () => {
     const onSendingChange = vi.fn();
     render(<Harness socket={socket} onSendingChange={onSendingChange} />);
 
-    expect(screen.getByTestId("quick-ask-model-trigger")).toHaveTextContent("DeepSeek Flash");
+    expect(screen.getByTestId("quick-ask-model-trigger")).toHaveTextContent("GPT-6-Astra");
 
     const textarea = screen.getByLabelText("快问输入框");
     fireEvent.change(textarea, { target: { value: "WeakMap 和 Map 区别？" } });
@@ -304,7 +305,7 @@ describe("QuickAskWindow 并行问答与隔离行为", () => {
     const qaFrame = inboundFrames[1]!;
     expect(qaFrame.peer?.id).toMatch(/^webqa_/);
     expect(qaFrame.peer?.id).not.toBe("webmain001");
-    expect(qaFrame.model).toBe("deepseek-v4-flash");
+    expect(qaFrame.model).toBe("gpt-6-astra");
     expect(qaFrame.content?.text).toBe("WeakMap 和 Map 区别？");
 
     // 主线仍在发送中且消息未受污染

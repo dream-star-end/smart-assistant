@@ -30,7 +30,7 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
-import { type KeyboardEvent as ReactKeyboardEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { type KeyboardEvent as ReactKeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import {
@@ -653,6 +653,10 @@ function SlideDeckView({
 
 // ── 长文档阅读器（Markdown + 大纲目录 + 字数/时长） ─────────────────────
 
+function normalizeHeadingText(raw: string | null | undefined): string {
+  return (raw ?? "").replace(/\s+/g, " ").trim();
+}
+
 function LongDocumentView({
   text,
   path,
@@ -664,15 +668,68 @@ function LongDocumentView({
 }) {
   const analysis = useMemo(() => extractMarkdownOutline(text), [text]);
   const deck = useMemo(() => parseMarkdownSlides(text, path), [text, path]);
-  const [slideMode, setSlideMode] = useState(deck.isSlideDeck);
-  const [outlineOpen, setOutlineOpen] = useState(analysis.headings.length >= 2);
+  // 流式写入期间首段尚未出现 `---` 或第 2 个标题时，不提前锁死模式；仅在用户显式点击切换后记录覆盖态。
+  const [slideModeOverride, setSlideModeOverride] = useState<boolean | null>(null);
+  const [outlineOpenOverride, setOutlineOpenOverride] = useState<boolean | null>(null);
   const [activeHeadingId, setActiveHeadingId] = useState<string | null>(null);
+  const docBodyRef = useRef<HTMLDivElement>(null);
+
+  const slideMode = slideModeOverride ?? deck.isSlideDeck;
+  const outlineOpen = outlineOpenOverride ?? analysis.headings.length >= 2;
+
+  // 为渲染后的 H1–H3 注入确定性 id，供大纲点击精准定位与无障碍关联。
+  useEffect(() => {
+    const body = docBodyRef.current;
+    if (!body || analysis.headings.length === 0) return;
+    const nodes = body.querySelectorAll<HTMLElement>("h1, h2, h3");
+    nodes.forEach((node, i) => {
+      const h = analysis.headings[i];
+      if (h && !node.id) node.id = h.id;
+    });
+  }, [analysis.headings, text]);
+
+  const scrollToHeading = useCallback(
+    (h: { id: string; text: string }, index: number) => {
+      setActiveHeadingId(h.id);
+      const body = docBodyRef.current;
+      if (!body) return;
+      const nodes = Array.from(body.querySelectorAll<HTMLElement>("h1, h2, h3"));
+      if (nodes.length === 0) return;
+      const targetText = normalizeHeadingText(h.text);
+      const byIndex = nodes[index];
+      const target =
+        (byIndex && normalizeHeadingText(byIndex.textContent) === targetText ? byIndex : null) ??
+        nodes.find((el) => el.id === h.id) ??
+        nodes.find((el) => normalizeHeadingText(el.textContent) === targetText) ??
+        byIndex;
+      if (!target) return;
+      if (!target.id) target.id = h.id;
+
+      // OCV5-95 滚动单 writer 约束：仅滚动 Workbench 自身正文容器，严禁触发聊天消息列表滚动。
+      const workbenchScroller = target.closest<HTMLElement>(
+        '[data-testid="outputs-hero-body"], [data-testid="output-viewer"], [data-testid="outputs-view"]',
+      );
+      if (workbenchScroller && workbenchScroller.scrollHeight > workbenchScroller.clientHeight) {
+        const containerRect = workbenchScroller.getBoundingClientRect();
+        const targetRect = target.getBoundingClientRect();
+        const nextTop = Math.max(0, workbenchScroller.scrollTop + (targetRect.top - containerRect.top) - 12);
+        if (typeof workbenchScroller.scrollTo === "function") {
+          workbenchScroller.scrollTo({ top: nextTop, behavior: "smooth" });
+        } else {
+          workbenchScroller.scrollTop = nextTop;
+        }
+      } else if (typeof target.scrollIntoView === "function") {
+        target.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    },
+    [],
+  );
 
   if (slideMode && deck.slides.length >= 2) {
     return (
       <SlideDeckView
         deck={deck}
-        onSwitchToDoc={() => setSlideMode(false)}
+        onSwitchToDoc={() => setSlideModeOverride(false)}
         onAnnotateSlide={onAnnotateSection}
       />
     );
@@ -687,7 +744,7 @@ function LongDocumentView({
             size="sm"
             variant={outlineOpen ? "secondary" : "ghost"}
             aria-expanded={outlineOpen}
-            onClick={() => setOutlineOpen((v) => !v)}
+            onClick={() => setOutlineOpenOverride(!outlineOpen)}
             data-testid="doc-outline-toggle"
           >
             <ListTree size={13} aria-hidden />
@@ -705,7 +762,7 @@ function LongDocumentView({
             type="button"
             size="sm"
             variant="ghost"
-            onClick={() => setSlideMode(true)}
+            onClick={() => setSlideModeOverride(true)}
             data-testid="doc-switch-slides"
           >
             <Presentation size={13} aria-hidden />
@@ -717,7 +774,7 @@ function LongDocumentView({
       {outlineOpen && analysis.headings.length > 0 && (
         <nav aria-label="文档大纲目录" className="wb-doc-outline" data-testid="doc-outline-list">
           <ol className="space-y-0.5">
-            {analysis.headings.map((h) => {
+            {analysis.headings.map((h, idx) => {
               const active = activeHeadingId === h.id;
               return (
                 <li
@@ -731,7 +788,8 @@ function LongDocumentView({
                 >
                   <button
                     type="button"
-                    onClick={() => setActiveHeadingId(h.id)}
+                    aria-current={active ? "location" : undefined}
+                    onClick={() => scrollToHeading(h, idx)}
                     className="min-w-0 flex-1 truncate text-left text-meta text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
                     title={`${h.text}（第 ${h.line} 行）`}
                   >
@@ -743,7 +801,7 @@ function LongDocumentView({
                     aria-label={`批注章节 ${h.text}`}
                     title={`批注章节「${h.text}」`}
                     onClick={() => {
-                      setActiveHeadingId(h.id);
+                      scrollToHeading(h, idx);
                       onAnnotateSection(
                         { kind: "section", heading: h.text, line: h.line },
                         `${"#".repeat(h.level)} ${h.text}`,
@@ -761,7 +819,7 @@ function LongDocumentView({
       )}
 
       {text.length <= MARKDOWN_RENDER_MAX_CHARS ? (
-        <div className="px-5 py-4 text-body" data-testid="output-preview-markdown">
+        <div ref={docBodyRef} className="px-5 py-4 text-body" data-testid="output-preview-markdown">
           <Markdown readOnly signMedia autoDetectCode={false}>
             {text}
           </Markdown>
@@ -974,7 +1032,15 @@ export function DeliverableRichPreview({
   showActionBar = true,
 }: DeliverableRichPreviewProps) {
   const name = nameProp ?? baseName(path);
-  const meta = useMemo(() => metaProp ?? classifyDeliverable(path, text), [metaProp, path, text]);
+  const meta = useMemo(() => {
+    if (metaProp) return metaProp;
+    const byPath = classifyDeliverable(path, text);
+    // 项目产出等走内容寻址 URL（如 /api/media/<sha256>）没有扩展名时，用展示文件名识别格式。
+    if (byPath.ext === "" && nameProp) {
+      return classifyDeliverable(nameProp, text);
+    }
+    return byPath;
+  }, [metaProp, path, nameProp, text]);
   const dispatchPrompt = usePromptDispatch(onAnnotateToComposer);
 
   const [annotateOpen, setAnnotateOpen] = useState(false);

@@ -101,7 +101,7 @@ describe("ChatHeader 团队模式指示 chip", () => {
 describe("ChatHeader 会话未读角标", () => {
   // 前景不写死 text-white:深色 accent/danger 是浅色底,白字只有 2.8/3.1:1,走 -fg token(a11y shell#1/#11)。
   const badgeLayoutClass =
-    "pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold leading-none tabular-nums";
+    "pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-micro font-semibold leading-none tabular-nums";
 
   it("无 sessionUnreadCount 时不渲染占位，打开菜单按钮仍在", () => {
     renderHeader({ onOpenMobileNav: () => {} });
@@ -208,13 +208,13 @@ describe("ChatHeader 分享会话", () => {
     expect(onShare).toHaveBeenCalledTimes(1);
   });
 
-  // C-12:窄屏独立按钮 hidden sm:flex,由「更多操作」菜单承接。
-  it("窄屏「更多操作」菜单承接分享(桌面键 hidden sm:flex,菜单 sm:hidden),菜单项调用 onShare", async () => {
+  // OCV5-817: 窄屏或桌面三栏态（容器 <720px）独立按钮 hidden @[720px]:flex，由「更多操作」菜单承接。
+  it("窄容器「更多操作」菜单承接分享(宽容器 hidden @[720px]:flex, 菜单 @[720px]:hidden),菜单项调用 onShare", async () => {
     const onShare = vi.fn();
     renderHeader({ onShare });
-    expect(screen.getByRole("button", { name: "分享会话" })).toHaveClass("hidden", "sm:flex");
+    expect(screen.getByRole("button", { name: "分享会话" })).toHaveClass("hidden", "@[720px]:flex");
     const more = screen.getByRole("button", { name: "更多操作" });
-    expect(more.parentElement).toHaveClass("sm:hidden");
+    expect(more.parentElement).toHaveClass("@[720px]:hidden");
     fireEvent.pointerDown(more, { button: 0, pointerType: "mouse" });
     fireEvent.click(more);
     const item = await screen.findByRole("menuitem", { name: /分享/ });
@@ -295,10 +295,12 @@ describe("ChatHeader 新版本 pill(OCV5-626)", () => {
 });
 
 describe("ChatHeader 未分类会话的项目建议", () => {
-  it("显示建议；移入与不用各自回调；已在项目里时显示所在项目而不是建议", () => {
+  it("显示建议；移入与不用各自回调；已在项目里时显示所在项目而不是建议；窄屏归位第二行防挤爆第一行", () => {
     const onAccept = vi.fn();
     const onDismiss = vi.fn();
     renderHeader({ projectSuggestion: { name: "论文综述", onAccept, onDismiss } });
+    const suggestion = screen.getByTestId("chat-project-suggestion");
+    expect(suggestion).toHaveClass("order-3", "basis-full");
     fireEvent.click(screen.getByRole("button", { name: "移入项目「论文综述」" }));
     fireEvent.click(screen.getByRole("button", { name: "不用移入" }));
     expect(onAccept).toHaveBeenCalledTimes(1);

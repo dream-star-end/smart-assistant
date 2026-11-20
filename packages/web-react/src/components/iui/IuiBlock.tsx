@@ -9,6 +9,7 @@
 import { parseSystemActionReference } from "@openclaude/protocol/browser";
 import { SystemActionBlock } from "./SystemActionBlock";
 import { Component, type ReactNode, useMemo } from "react";
+import "./iui.css";
 import { isNextBlockCode } from "../../lib/nextBlock";
 import { CalculatorBlock } from "./CalculatorBlock";
 import { ChartBlock } from "./ChartBlock";
@@ -35,7 +36,7 @@ import {
 } from "./blocks";
 import { parseUiBlock } from "./parse";
 import { type IuiSpec, resolveType, validateSpec } from "./schema";
-import { BodyMarkdown, Skeleton } from "./shell";
+import { BodyMarkdown, CopyButton, Skeleton } from "./shell";
 import { specToMarkdown } from "./toMarkdown";
 
 /** 这些组件要等内容完整才渲染(交互依赖完整数据);流式期间显示骨架。 */
@@ -58,8 +59,15 @@ export class BlockBoundary extends Component<{ fallback: ReactNode; children: Re
 function RawFallback({ code, message }: { code: string; message: string }) {
   return (
     <div className="oc-iui oc-iui-bare" data-iui="fallback">
-      <p className="oc-iui-hint">{message}</p>
-      <pre className="overflow-auto rounded-lg bg-code px-3 py-2 font-mono text-meta text-fg">{code}</pre>
+      <details className="rounded-xl border border-border bg-surface/80 px-3 py-2">
+        <summary className="flex cursor-pointer list-none items-center justify-between gap-2 text-meta text-muted outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11">
+          <span>{message} · 查看原始数据</span>
+          <CopyButton getText={() => code} label="原始数据" />
+        </summary>
+        <pre className="mt-2 max-h-64 overflow-auto rounded-lg bg-code px-3 py-2 font-mono text-meta text-fg">
+          {code}
+        </pre>
+      </details>
     </div>
   );
 }
@@ -121,7 +129,7 @@ export function renderSpec(spec: IuiSpec, notes: string[], streaming: boolean, r
     case "citations":
       return <CitationsBlock spec={spec} {...p} readOnly={readOnly} />;
     case "runbook":
-      return <RunbookBlock spec={spec} {...p} />;
+      return <RunbookBlock spec={spec} {...p} readOnly={readOnly} />;
     case "prompt_template":
       return <PromptTemplateBlock spec={spec} {...p} readOnly={readOnly} />;
     case "storyboard":

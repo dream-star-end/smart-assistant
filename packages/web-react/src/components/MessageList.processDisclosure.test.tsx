@@ -61,7 +61,7 @@ function expandDetailButtons(root: HTMLElement, passes = 2) {
 
 function expandAllProcess() {
   fireEvent.click(screen.getByTestId("process-toggle"));
-  for (const toggle of screen.getAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
+  for (const toggle of screen.queryAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
   // UI-3:「准备工作 N 步」和每一步的「技术详情」也点开,原卡(命令、输出入口)才渲染。
   for (const prep of screen.queryAllByTestId("process-prep")) fireEvent.click(within(prep).getAllByRole("button")[0]!);
   for (const step of screen.queryAllByTestId("process-step-row")) fireEvent.click(within(step).getAllByRole("button")[0]!);
@@ -1203,7 +1203,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(new Set(docs).size).toBe(2);
 
     for (const toggle of screen.getAllByTestId("process-toggle")) fireEvent.click(toggle);
-    for (const toggle of screen.getAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
+    for (const toggle of screen.queryAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
     for (const details of screen.getAllByTestId("process-details")) {
       expandDetailButtons(details, 3);
     }
@@ -1569,7 +1569,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(answerRow).not.toBeNull();
     expect(shells[0]!.compareDocumentPosition(answerRow!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     fireEvent.click(screen.getByTestId("process-toggle"));
-    fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    for (const toggle of screen.queryAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
     expandDetailButtons(screen.getByTestId("process-details"), 2);
     expect(screen.getByTestId("process-details").textContent ?? "").toMatch(/probe-before[\s\S]*probe-after-1[\s\S]*probe-after-2/);
   });
@@ -2610,7 +2610,7 @@ describe("MessageList Manus 过程披露", () => {
     if (!answer) throw new Error("missing answer row");
     expect(disclosure.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     fireEvent.click(screen.getByTestId("process-toggle"));
-    fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    for (const toggle of screen.queryAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
     expect(screen.getByText("只剩计划").closest("[data-testid=process-disclosure]")).toBe(disclosure);
   });
 
@@ -2814,7 +2814,7 @@ test("UI-3 步骤行说人话，技术信息收进技术详情，底层步骤并
   expect(screen.getByTestId("process-meta")).toHaveTextContent("6 分 42 秒");
   expect(screen.getByTestId("process-glyph-done")).toHaveAttribute("data-outcome", "done");
   fireEvent.click(screen.getByTestId("process-toggle"));
-  for (const toggle of screen.getAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
+  for (const toggle of screen.queryAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
   const titles = screen.getAllByTestId("process-step-row").map((node) => node.querySelector("button span")?.textContent);
   expect(titles).toEqual(["思考", "运行命令", "读取 周会记录.txt", "读取 missing.txt"]);
   expect(screen.getByTestId("process-prep")).toHaveTextContent("准备工作 2 步");
@@ -2919,7 +2919,7 @@ test("P3 委派步骤写出谁接了、做什么、进行中 / 完成", () => {
   ]);
   expect(screen.getByTestId("process-title")).toHaveTextContent("派出 1 个子任务");
   fireEvent.click(screen.getByTestId("process-toggle"));
-  for (const toggle of screen.getAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
+  for (const toggle of screen.queryAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
   const step = screen.getAllByTestId("process-step-row").find((node) => (node.textContent ?? "").includes("委派给"))!;
   expect(step).toHaveTextContent("委派给 researcher：检查报告格式");
   expect(within(step).getByTestId("process-delegate-state")).toHaveTextContent("完成");
@@ -2953,9 +2953,11 @@ test("U6 委派多子任务在过程总览、分组折叠行与 TeamPanel 步骤
   ]);
   expect(screen.getByTestId("process-title")).toHaveTextContent("派出 3 个子任务");
   fireEvent.click(screen.getByTestId("process-toggle"));
-  const detailToggle = screen.getByTestId("process-detail-toggle");
-  expect(detailToggle).toHaveTextContent("派出 3 个子任务");
-  fireEvent.click(detailToggle);
+  // OCV5-817: 单组工具省略冗余外层 process-step-group，展开外壳后直接露出步骤行。
+  for (const toggle of screen.queryAllByTestId("process-detail-toggle")) {
+    expect(toggle).toHaveTextContent("派出 3 个子任务");
+    fireEvent.click(toggle);
+  }
   const step = screen.getAllByTestId("process-step-row").find((node) => (node.textContent ?? "").includes("委派给"))!;
   expect(step).toHaveTextContent("委派给 research-assistant（3 个子任务）");
   fireEvent.click(within(step).getAllByRole("button")[0]!);

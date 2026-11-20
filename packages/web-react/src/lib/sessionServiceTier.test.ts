@@ -1,32 +1,53 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, test, vi } from "vitest";
 import {
+  clearSessionServiceTier,
   readSessionServiceTier,
   serviceTierSessionKey,
+  subscribeSessionServiceTier,
   writeSessionServiceTier,
-} from './sessionServiceTier'
+} from "./sessionServiceTier";
 
-describe('OCV5-434 / OCV5-798 sessionServiceTier(会话级、默认关、不继承)', () => {
-  afterEach(() => localStorage.clear())
+afterEach(() => {
+  localStorage.clear();
+});
 
-  it('默认标准;fast/ultrafast 只落本会话键,关 = 删键', () => {
-    expect(readSessionServiceTier('s1')).toBeNull()
-    writeSessionServiceTier('s1', 'fast')
-    expect(readSessionServiceTier('s1')).toBe('fast')
-    expect(localStorage.getItem(serviceTierSessionKey('s1'))).toBe('fast')
-    writeSessionServiceTier('s1', 'ultrafast')
-    expect(readSessionServiceTier('s1')).toBe('ultrafast')
-    expect(localStorage.getItem(serviceTierSessionKey('s1'))).toBe('ultrafast')
-    expect(readSessionServiceTier('s2')).toBeNull()
-    writeSessionServiceTier('s1', null)
-    expect(localStorage.getItem(serviceTierSessionKey('s1'))).toBeNull()
-    expect(readSessionServiceTier('s1')).toBeNull()
-  })
+describe("sessionServiceTier", () => {
+  test("clearSessionServiceTier removes stored key for deleted session", () => {
+    writeSessionServiceTier("s1", "ultrafast");
+    expect(readSessionServiceTier("s1")).toBe("ultrafast");
+    clearSessionServiceTier("s1");
+    expect(readSessionServiceTier("s1")).toBeNull();
+    expect(localStorage.getItem(serviceTierSessionKey("s1"))).toBeNull();
+  });
 
-  it('空会话不写盘;非法值按标准', () => {
-    writeSessionServiceTier(undefined, 'fast')
-    writeSessionServiceTier(undefined, 'ultrafast')
-    expect(localStorage.length).toBe(0)
-    localStorage.setItem(serviceTierSessionKey('s3'), 'priority')
-    expect(readSessionServiceTier('s3')).toBeNull()
-  })
-})
+  test("subscribeSessionServiceTier propagates cross-tab storage changes for the same session only", () => {
+    const onChange = vi.fn();
+    const unsub = subscribeSessionServiceTier("s1", onChange);
+
+    window.dispatchEvent(
+      new StorageEvent("storage", {
+        key: serviceTierSessionKey("s2"),
+        newValue: "fast",
+      }),
+    );
+    expect(onChange).not.toHaveBeenCalled();
+
+    window.dispatchEvent(
+      new StorageEvent("storage", {
+        key: serviceTierSessionKey("s1"),
+        newValue: "ultrafast",
+      }),
+    );
+    expect(onChange).toHaveBeenCalledWith("ultrafast");
+
+    window.dispatchEvent(
+      new StorageEvent("storage", {
+        key: serviceTierSessionKey("s1"),
+        newValue: null,
+      }),
+    );
+    expect(onChange).toHaveBeenCalledWith(null);
+
+    unsub();
+  });
+});

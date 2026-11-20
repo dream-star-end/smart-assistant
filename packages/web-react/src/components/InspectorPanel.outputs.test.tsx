@@ -6,7 +6,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
-import { InspectorPanelContent } from "./InspectorPanel";
+import { InspectorPanel, InspectorPanelContent, computeDynamicPaneMaxWidth } from "./InspectorPanel";
 import { wrapWithCspOnly } from "./embedCsp";
 import { prefetchMarkdownImpl } from "./Markdown";
 import { preloadToolBody } from "./tool/lazyToolBody";
@@ -223,5 +223,32 @@ describe("产出页", () => {
     render(<InspectorPanelContent messages={[]} onClose={() => {}} />);
     await outputsReady();
     expect(screen.getByTestId("outputs-empty")).toHaveTextContent("还没有产出");
+  });
+
+  test("targetPath 定位请求跨轮跳转并自动高亮选中目标产物", async () => {
+    render(
+      <InspectorPanelContent
+        messages={session()}
+        request={{ tab: "outputs", targetPath: `${W}/style.css`, nonce: 7 }}
+        onClose={() => {}}
+      />,
+    );
+    await outputsReady();
+    // style.css 位于第 1 轮，自动翻回第 1 轮并成为主产物
+    expect(screen.getByTestId("outputs-turn-counter")).toHaveTextContent("第 1 / 2 轮");
+    expect(screen.getByTestId("outputs-hero-name")).toHaveTextContent("style.css");
+  });
+
+  test("宽屏动态上限计算与全屏影院阅读模式切换", async () => {
+    expect(computeDynamicPaneMaxWidth(1920, 268)).toBe(1120);
+    expect(computeDynamicPaneMaxWidth(1200, 268)).toBe(512);
+
+    render(<InspectorPanel messages={session()} width={440} onClose={() => {}} />);
+    await outputsReady();
+    fireEvent.click(screen.getByTestId("pane-fullscreen-toggle"));
+    expect(screen.getByTestId("pane-fullscreen-dialog")).toBeInTheDocument();
+    expect(screen.getByTestId("pane-fullscreen-docked")).toBeInTheDocument();
+    fireEvent.click(within(screen.getByTestId("pane-fullscreen-dialog")).getByTestId("pane-fullscreen-toggle"));
+    expect(screen.queryByTestId("pane-fullscreen-dialog")).toBeNull();
   });
 });

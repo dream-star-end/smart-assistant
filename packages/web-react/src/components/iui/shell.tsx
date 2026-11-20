@@ -19,7 +19,9 @@ import {
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { cn } from "../../lib/utils";
+import { Markdown } from "../Markdown";
 import { useSignedSrc } from "../chat/media";
+import { useToast } from "../ui";
 import { iconFor, kindIcon } from "./icons";
 
 const INLINE_RE = /(\*\*[^*\n]+\*\*|`[^`\n]+`|\[[^\]\n]+\]\(https?:\/\/[^\s)]+\))/g;
@@ -60,8 +62,20 @@ const BODY_COMPONENTS = {
   img: ({ alt }: { alt?: string }) => <span className="text-faint">[{alt || "图片"}]</span>,
 };
 
-/** 较长的正文(提示框、分段标签内容):完整 GFM,无原始 HTML,无图片。 */
+/** 包含数学公式或围栏代码块时委托懒加载 Markdown 渲染器（不把 KaTeX/hljs 静态打进首屏包）。 */
+const NEEDS_RICH_MD_RE = /(?:```|\$\$|\\\(|\\\[|\$[^$\n]+\$)/;
+
+/** 较长的正文(提示框、分段标签内容、交付物 .md 速览):完整 GFM + 公式与代码高亮,无原始 HTML,无图片。 */
 export function BodyMarkdown({ text }: { text: string }) {
+  if (NEEDS_RICH_MD_RE.test(text)) {
+    return (
+      <div className="oc-iui-body">
+        <Markdown bare readOnly blockImages>
+          {text}
+        </Markdown>
+      </div>
+    );
+  }
   return (
     <div className="oc-iui-body">
       <ReactMarkdown remarkPlugins={[remarkGfm]} components={BODY_COMPONENTS}>
@@ -160,6 +174,7 @@ export function useCopiedFlag(): [boolean, () => void] {
 
 export function CopyButton({ getText, label = "复制" }: { getText: () => string; label?: string }) {
   const [done, flash] = useCopiedFlag();
+  const toast = useToast();
   return (
     <button
       type="button"
@@ -171,7 +186,7 @@ export function CopyButton({ getText, label = "复制" }: { getText: () => strin
           await navigator.clipboard.writeText(getText());
           flash();
         } catch {
-          /* 剪贴板不可用(非安全上下文):静默 */
+          toast("复制失败，请手动选中文本复制", "error");
         }
       }}
     >

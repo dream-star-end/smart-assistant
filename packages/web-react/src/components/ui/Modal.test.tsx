@@ -30,4 +30,17 @@ describe("F4 Modal 最大高度 dvh 收口", () => {
     expect(dialog).toHaveClass("max-h-[56rem]", "max-w-md");
     expect(dialog.className).not.toContain("max-h-[88dvh]");
   });
+
+  test("mobile=fullscreen 绑定 visualViewport 变量与安全区（OCV5-817）", () => {
+    render(
+      <Modal open onOpenChange={() => {}} mobile="fullscreen" srTitle="全屏弹层">
+        <p>body</p>
+      </Modal>,
+    );
+    const dialog = screen.getByRole("dialog", { name: "全屏弹层" });
+    expect(dialog.className).toContain("top-[var(--oc-visual-offset-top,0px)]");
+    expect(dialog.className).toContain("h-[var(--oc-visual-height,100dvh)]");
+    expect(dialog.className).toContain("pt-[env(safe-area-inset-top)]");
+    expect(dialog.className).toContain("pb-[env(safe-area-inset-bottom)]");
+  });
 });

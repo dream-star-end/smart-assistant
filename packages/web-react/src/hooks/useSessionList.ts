@@ -6,6 +6,7 @@ import type { ChatMessage } from "../lib/chat/model";
 import { DEMO_SESSIONS } from "../lib/demo";
 import type { StoredSession } from "../lib/persist";
 import { isHiddenQuickAskSession } from "../lib/quickAskSession";
+import { clearSessionServiceTier } from "../lib/sessionServiceTier";
 import type {
   AuthSession,
   Session,
@@ -217,6 +218,8 @@ export type UseSessionList = {
   serverListSettled: boolean;
   /** 当前活动会话的 canonical history 请求仍在途。用于避免慢响应期间误显空会话。 */
   historyLoading: boolean;
+  /** 当前活动会话的 canonical history 请求已至少落定一次（成功或 404）。 */
+  historySettled: boolean;
   /** GET 失败且按 sessionId+token 隔离。404 不算失败。 */
   historyError: { sessionId: string; token: number; message: string } | null;
   /** 直接重拉当前会话历史，不走 selectSession（同 activeId 会提前返回）。 */
@@ -261,6 +264,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const [historyLoadingTokens, setHistoryLoadingTokens] = useState<Map<string, number>>(
     () => new Map(),
   );
+  const [historySettledIds, setHistorySettledIds] = useState<Set<string>>(() => new Set());
   const [historyErrorBySession, setHistoryErrorBySession] = useState<
     Map<string, { token: number; message: string }>
   >(() => new Map());
@@ -350,6 +354,12 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           historyAbortRef.current.delete(id);
           prev.abort(new DOMException("superseded by forced history reload", "AbortError"));
         }
+        setHistorySettledIds((current) => {
+          if (!current.has(id)) return current;
+          const next = new Set(current);
+          next.delete(id);
+          return next;
+        });
       }
       const requestToken = ++historyRequestTokenRef.current;
       historyFetchingRef.current.set(id, requestToken);
@@ -467,6 +477,12 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           );
         }
         historyFetchedAtRef.current.set(id, Date.now());
+        setHistorySettledIds((current) => {
+          if (current.has(id)) return current;
+          const next = new Set(current);
+          next.add(id);
+          return next;
+        });
         setHistoryErrorBySession((current) => {
           const existing = current.get(id);
           if (!existing || existing.token > requestToken) return current;
@@ -484,6 +500,12 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           historyFetchingRef.current.get(id) === requestToken
         ) {
           historyFetchedAtRef.current.set(id, Date.now());
+          setHistorySettledIds((current) => {
+            if (current.has(id)) return current;
+            const next = new Set(current);
+            next.add(id);
+            return next;
+          });
           setHistoryErrorBySession((current) => {
             const existing = current.get(id);
             if (!existing || existing.token > requestToken) return current;
@@ -732,11 +754,18 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     });
     if (!ok) return;
     cbRef.current.onDeleteSession?.(s.id);
+    clearSessionServiceTier(s.id);
     historyFetchedAtRef.current.delete(s.id);
     historyFetchingRef.current.delete(s.id);
     setHistoryLoadingTokens((current) => {
       if (!current.has(s.id)) return current;
       const next = new Map(current);
+      next.delete(s.id);
+      return next;
+    });
+    setHistorySettledIds((current) => {
+      if (!current.has(s.id)) return current;
+      const next = new Set(current);
       next.delete(s.id);
       return next;
     });
@@ -797,6 +826,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   };
 
   const forgetSessionLocal = (id: string) => {
+    clearSessionServiceTier(id);
     historyFetchedAtRef.current.delete(id);
     historyFetchingRef.current.delete(id);
     const pendingAbort = historyAbortRef.current.get(id);
@@ -807,6 +837,12 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     setHistoryLoadingTokens((current) => {
       if (!current.has(id)) return current;
       const next = new Map(current);
+      next.delete(id);
+      return next;
+    });
+    setHistorySettledIds((current) => {
+      if (!current.has(id)) return current;
+      const next = new Set(current);
       next.delete(id);
       return next;
     });
@@ -978,8 +1014,9 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           allowEndedAtFill = !prev.serverSettled;
         }
       }
-      setSessions((c) =>
-        c.map((x) => {
+      setSessions((c) => {
+        let changed = false;
+        const next = c.map((x) => {
           if (x.id !== sessId) return x;
           const nextOutcome = terminal ? terminal.lastOutcome : x.lastOutcome;
           const nextCode = terminal ? terminal.lastErrorCode : x.lastErrorCode;
@@ -994,8 +1031,11 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
             x.lastOutcome === nextOutcome &&
             x.lastErrorCode === nextCode
           ) {
-            return ended ? { ...x, ...ended } : x;
+            if (!ended) return x;
+            changed = true;
+            return { ...x, ...ended };
           }
+          changed = true;
           return {
             ...x,
             ...ended,
@@ -1008,8 +1048,9 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
                 }
               : {}),
           };
-        }),
-      );
+        });
+        return changed ? next : c;
+      });
     },
     [],
   );
@@ -1028,6 +1069,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     }
     historyAbortRef.current.clear();
     setHistoryLoadingTokens(new Map());
+    setHistorySettledIds(new Set());
     setHistoryErrorBySession(new Map());
     terminalFillRef.current.clear();
     modelSyncRef.current.clear();
@@ -1070,6 +1112,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     reset,
     serverListSettled,
     historyLoading: activeId !== undefined && historyLoadingTokens.has(activeId),
+    historySettled: activeId !== undefined && historySettledIds.has(activeId),
     historyError: activeId
       ? (() => {
           const row = historyErrorBySession.get(activeId);

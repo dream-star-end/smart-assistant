@@ -16,6 +16,7 @@
  * 数据:消息对象由 ChatSocket 就地 mutate,App 随 version 重渲时面板自然读到最新流式内容。
  * 状态徽标与卡片共用 {@link resolveToolStatus}(T-05):卡片「受阻/未成功」面板就不会是「完成/已结束」。
  */
+import * as RD from "@radix-ui/react-dialog";
 import {
   ArrowDownToLine,
   Check,
@@ -29,6 +30,8 @@ import {
   FilePen,
   ListChecks,
   LoaderCircle,
+  Maximize2,
+  Minimize2,
   Route,
   X,
 } from "lucide-react";
@@ -44,15 +47,20 @@ import {
   useState,
 } from "react";
 import {
+  DETAIL_PANE_WIDTH,
+  InspectorStopTurnContext,
   PANE_TAB_STORAGE_KEY,
+  computeDynamicPaneMaxWidth,
   type DeferredPayloadLoader,
   type PaneRequest,
   type PaneTab,
+  type TargetOutputRequest,
 } from "./chat/inspectorState";
 export {
   DETAIL_PANE_WIDTH,
   PANE_OPEN_STORAGE_KEY,
   PANE_TAB_STORAGE_KEY,
+  computeDynamicPaneMaxWidth,
   paneRequestForSession,
   readDetailPaneOpen,
   writeDetailPaneOpen,
@@ -60,6 +68,7 @@ export {
   type LiveBrowserHandoffRequest,
   type PaneRequest,
   type PaneTab,
+  type TargetOutputRequest,
 } from "./chat/inspectorState";
 import type { ChatMessage } from "../lib/chat/model";
 import type { AuthSession } from "../lib/types";
@@ -68,6 +77,7 @@ import { cn } from "../lib/utils";
 import { extractLatestTodos, type TodoItem } from "./chat/todoExtract";
 import { CopyIconButton, FullToolBody } from "./chat/paneParts";
 import { collectWorkTurns, turnIndexOf } from "./chat/workTurns";
+import { findTurnIndexForPath } from "./chat/workbench";
 import { isBrowserStepMessage } from "./tool/browserDetect";
 import { collectPaneSteps, type PaneTurn } from "./chat/workPane";
 import {
@@ -579,6 +589,18 @@ function PlanView({ todos }: { todos: TodoItem[] }) {
   );
 }
 
+function targetOutputFromRequest(req: PaneRequest | null | undefined): TargetOutputRequest | null {
+  if (!req) return null;
+  if (!req.targetPath && !req.manifestSrc && !req.previewUrl) return null;
+  return {
+    path: req.targetPath,
+    title: req.targetTitle,
+    manifestSrc: req.manifestSrc,
+    previewUrl: req.previewUrl,
+    nonce: req.nonce,
+  };
+}
+
 /** 面板内容(分区 + 当前视图)。桌面 aside 与窄屏 Sheet 共用。`titleId` 供外层容器 aria-labelledby。 */
 export function InspectorPanelContent({
   messages,
@@ -589,8 +611,11 @@ export function InspectorPanelContent({
   onClose,
   onActiveChange,
   onAnnotateToComposer,
+  onStopTurn,
   liveBrowserAgentId,
   liveBrowserAuth,
+  fullscreen = false,
+  onToggleFullscreen,
   titleId,
 }: {
   messages: readonly ChatMessage[];
@@ -606,14 +631,22 @@ export function InspectorPanelContent({
   onActiveChange?: (message: ToolLike | null) => void;
   /** 可选：右侧交付物批注精修时，将结构化修改指令直接回填至左侧 Composer 输入框。 */
   onAnnotateToComposer?: (draft: string) => void;
+  /** 可选：停止当前运行中的助手回合（供云浏览器「暂停助手并接管」使用）。 */
+  onStopTurn?: () => void;
   /** 可选：云端实时浏览器与人工接管的目标智能体及鉴权会话（OCV5-813）。 */
   liveBrowserAgentId?: string;
   liveBrowserAuth?: AuthSession | null;
+  /** 是否处于全屏/影院阅读模式。 */
+  fullscreen?: boolean;
+  /** 切换全屏/影院阅读模式。 */
+  onToggleFullscreen?: () => void;
   titleId?: string;
 }) {
   // 浏览器卡点进来:那一步不在顶层轮里(团队子任务等)就退回步骤详情,不落到一个没有它的「浏览器」页。
   const resolveTab = (req: PaneRequest): PaneTab | null => {
-    if (!req.tab) return null;
+    if (!req.tab) {
+      return req.targetPath || req.manifestSrc || req.previewUrl ? "outputs" : null;
+    }
     if (req.tab === "browser" && req.message && turnIndexOf(collectWorkTurns(messages), req.message as { id?: string }) < 0) {
       return "steps";
     }
@@ -623,6 +656,7 @@ export function InspectorPanelContent({
   const [selected, setSelected] = useState<ToolLike | null>(() =>
     request && resolveTab(request) === "steps" ? (request.message ?? null) : null,
   );
+  const [targetOutput, setTargetOutput] = useState<TargetOutputRequest | null>(() => targetOutputFromRequest(request));
   const fallbackTitleId = useId();
   const headingId = titleId ?? fallbackTitleId;
   const idBase = useId();
@@ -638,13 +672,19 @@ export function InspectorPanelContent({
   const todos = extractLatestTodos(messages, 0);
   const lastTurn = workTurns.length - 1;
   // 产出页看的那一轮:null = 最新一轮(新一轮开始时自动跟过去);翻到旧轮时记它的 key。
-  const turnKeyFor = (message: ToolLike | null | undefined): string | null => {
-    const i = turnIndexOf(workTurns, message as { id?: string } | null | undefined);
+  const turnKeyFor = (message: ToolLike | null | undefined, targetPath?: string): string | null => {
+    const i = message
+      ? turnIndexOf(workTurns, message as { id?: string } | null | undefined)
+      : targetPath
+        ? findTurnIndexForPath(workTurns, targetPath)
+        : -1;
     return i < 0 || i === lastTurn ? null : (workTurns[i]?.key ?? null);
   };
   const turnScoped = (t: PaneRequest["tab"]) => t !== undefined && (requestTab(t) === "outputs" || t === "browser");
   const [turnKey, setTurnKey] = useState<string | null>(() =>
-    request && turnScoped(request.tab) ? turnKeyFor(request.message) : null,
+    request && (turnScoped(request.tab) || Boolean(request.targetPath))
+      ? turnKeyFor(request.message, request.targetPath)
+      : null,
   );
   const keyedTurn = turnKey === null ? -1 : workTurns.findIndex((t) => t.key === turnKey);
   const outputsIndex = keyedTurn >= 0 ? keyedTurn : lastTurn;
@@ -784,9 +824,14 @@ export function InspectorPanelContent({
     const next = resolveTab(request);
     if (!next) return;
     setTabState(next);
-    if (next === "outputs" || next === "browser") setTurnKey(turnKeyFor(request.message));
-    if (next === "browser") setBrowserFocus(idOf(request.message) ?? null);
-    if (next === "steps") {
+    const nextTarget = targetOutputFromRequest(request);
+    if (next === "outputs") {
+      setTargetOutput(nextTarget);
+      setTurnKey(turnKeyFor(request.message, request.targetPath));
+    } else if (next === "browser") {
+      setTurnKey(turnKeyFor(request.message));
+      setBrowserFocus(idOf(request.message) ?? null);
+    } else if (next === "steps") {
       setSelected(request.message ?? null);
       // 运行中从最新那张卡点开 = 想看它往下走:直接跟随。
       setFollow(!!request.message && running && sameMessage(request.message, latest));
@@ -839,6 +884,7 @@ export function InspectorPanelContent({
   ];
 
   return (
+    <InspectorStopTurnContext.Provider value={onStopTurn}>
     <div className="flex min-h-0 flex-1 flex-col bg-surface" onKeyDown={onKeyDown} data-testid="detail-pane">
       <header className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2 header-safe-t">
         <h2 id={headingId} className="sr-only">
@@ -853,6 +899,19 @@ export function InspectorPanelContent({
             aria-label="详情面板分区"
           />
         </div>
+        {onToggleFullscreen && (
+          <IconButton
+            aria-label={fullscreen ? "退出全屏阅读" : "全屏阅读"}
+            title={fullscreen ? "恢复到侧栏 (Esc)" : "全屏影院阅读"}
+            size="sm"
+            shape="square"
+            data-testid="pane-fullscreen-toggle"
+            className="[@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11"
+            onClick={onToggleFullscreen}
+          >
+            {fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+          </IconButton>
+        )}
         <IconButton aria-label="关闭详情面板" size="sm" shape="square" data-inspector-close="" onClick={onClose}>
           <X size={16} />
         </IconButton>
@@ -921,9 +980,11 @@ export function InspectorPanelContent({
             turns={workTurns}
             index={outputsIndex}
             running={running && outputsIndex === lastTurn}
+            targetOutput={targetOutput}
             onSelectTurn={(i) => {
               const t = workTurns[i];
               if (t) setTurnKey(i === lastTurn ? null : t.key);
+              setTargetOutput(null);
             }}
             onOpenSteps={() => {
               setTab("steps");
@@ -939,6 +1000,7 @@ export function InspectorPanelContent({
         )}
       </div>
     </div>
+    </InspectorStopTurnContext.Provider>
   );
 }
 
@@ -958,7 +1020,7 @@ export function InspectorPanel({
   focusNonce,
   onClose,
   ...content
-}: Omit<Parameters<typeof InspectorPanelContent>[0], "titleId"> & {
+}: Omit<Parameters<typeof InspectorPanelContent>[0], "titleId" | "fullscreen" | "onToggleFullscreen"> & {
   width?: number;
   resizing?: boolean;
   widthMin?: number;
@@ -970,17 +1032,34 @@ export function InspectorPanel({
   const asideRef = useRef<HTMLElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
   const titleId = useId();
+  const [fullscreen, setFullscreen] = useState(false);
+  const [viewportWidth, setViewportWidth] = useState(() =>
+    typeof window !== "undefined" ? window.innerWidth : 1440,
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener("resize", onResize, { passive: true });
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  const configuredMax = widthMax ?? DETAIL_PANE_WIDTH.max;
+  const effectiveMax =
+    viewportWidth >= 1100
+      ? Math.min(configuredMax, computeDynamicPaneMaxWidth(viewportWidth))
+      : configuredMax;
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       // Radix 弹层(Dialog/Sheet/Popover)处理过的 Escape 会 preventDefault,不抢。
-      if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (e.key !== "Escape" || e.defaultPrevented || fullscreen) return;
       if (!(e.target instanceof Node) || !asideRef.current?.contains(e.target)) return;
       onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [onClose, fullscreen]);
 
   // 每次从外面点开(换了一步 / 点了顶栏开关)都记下当时的焦点元素并把焦点移进面板;
   // 面板整体卸载时把焦点还给最后那个入口。
@@ -1009,36 +1088,92 @@ export function InspectorPanel({
   );
 
   return (
-    <aside
-      ref={asideRef}
-      aria-labelledby={titleId}
-      style={width !== undefined ? { width } : undefined}
-      className={cn(
-        "relative flex min-h-0 max-w-[45vw] shrink-0 flex-col border-l border-border",
-        width === undefined && "w-[clamp(20rem,36vw,34rem)]",
-        resizing && "select-none",
-      )}
-    >
-      {onResizeStart && (
-        <div
-          role="separator"
-          aria-orientation="vertical"
-          aria-label="调整详情面板宽度"
-          aria-valuenow={width}
-          aria-valuemin={widthMin}
-          aria-valuemax={widthMax}
-          title="拖动调整宽度，双击复位默认宽度"
-          tabIndex={onResizeKeyDown ? 0 : undefined}
-          onKeyDown={onResizeKeyDown}
-          onPointerDown={onResizeStart}
-          data-testid="pane-resize-handle"
-          className={cn(
-            "absolute inset-y-0 left-0 z-10 w-1 -translate-x-1/2 cursor-col-resize touch-none outline-none hover:bg-accent/40 focus-visible:bg-accent/60",
-            resizing && "bg-accent/40",
-          )}
-        />
-      )}
-      <InspectorPanelContent {...content} onClose={onClose} titleId={titleId} />
-    </aside>
+    <>
+      <aside
+        ref={asideRef}
+        aria-labelledby={titleId}
+        style={width !== undefined ? { width, maxWidth: effectiveMax } : { maxWidth: effectiveMax }}
+        className={cn(
+          "relative flex min-h-0 max-w-[62vw] shrink-0 flex-col border-l border-border",
+          width === undefined && "w-[clamp(20rem,36vw,34rem)]",
+          resizing && "select-none",
+        )}
+      >
+        {onResizeStart && (
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="调整详情面板宽度"
+            aria-valuenow={width}
+            aria-valuemin={widthMin}
+            aria-valuemax={effectiveMax}
+            title="拖动调整宽度，双击复位默认宽度"
+            tabIndex={onResizeKeyDown ? 0 : undefined}
+            onKeyDown={onResizeKeyDown}
+            onPointerDown={onResizeStart}
+            data-testid="pane-resize-handle"
+            className={cn(
+              "absolute inset-y-0 left-0 z-10 w-1 -translate-x-1/2 cursor-col-resize touch-none outline-none hover:bg-accent/40 focus-visible:bg-accent/60",
+              resizing && "bg-accent/40",
+            )}
+          />
+        )}
+        {fullscreen ? (
+          <div
+            className="flex flex-1 flex-col items-center justify-center gap-3 bg-surface px-6 text-center"
+            data-testid="pane-fullscreen-docked"
+          >
+            <span className="flex size-10 items-center justify-center rounded-xl bg-accent-soft text-accent">
+              <Maximize2 size={18} aria-hidden />
+            </span>
+            <p className="text-meta text-muted">工作台正在全屏影院阅读模式中打开</p>
+            <button
+              type="button"
+              onClick={() => setFullscreen(false)}
+              className="inline-flex min-h-8 items-center gap-1.5 rounded-md border border-border bg-elevated px-3 text-meta font-medium text-fg transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+            >
+              <Minimize2 size={13} aria-hidden />
+              恢复到侧栏
+            </button>
+          </div>
+        ) : (
+          <InspectorPanelContent
+            {...content}
+            onClose={onClose}
+            fullscreen={false}
+            onToggleFullscreen={() => setFullscreen(true)}
+            titleId={titleId}
+          />
+        )}
+      </aside>
+
+      <RD.Root open={fullscreen} onOpenChange={setFullscreen}>
+        <RD.Portal>
+          <RD.Overlay
+            className="fixed inset-0 z-[60] bg-bg/75 backdrop-blur-sm"
+            data-testid="pane-fullscreen-backdrop"
+          />
+          <RD.Content
+            aria-describedby={undefined}
+            data-testid="pane-fullscreen-dialog"
+            className="fixed left-1/2 top-1/2 z-[61] flex h-[92dvh] w-[min(94vw,90rem)] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-surface shadow-float outline-none"
+          >
+            <RD.Title className="sr-only">工作台全屏影院阅读</RD.Title>
+            {fullscreen ? (
+              <InspectorPanelContent
+                {...content}
+                onClose={() => {
+                  setFullscreen(false);
+                  onClose();
+                }}
+                fullscreen
+                onToggleFullscreen={() => setFullscreen(false)}
+                titleId={titleId}
+              />
+            ) : null}
+          </RD.Content>
+        </RD.Portal>
+      </RD.Root>
+    </>
   );
 }

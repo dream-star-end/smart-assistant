@@ -125,9 +125,9 @@ function TraceIdButton({ traceId }: { traceId: string }) {
 const ToastContext = createContext<ToastFn | null>(null);
 
 const TONE_STYLE: Record<ToastTone, { icon: ReactNode; cls: string }> = {
-  success: { icon: <CheckCircle2 size={16} />, cls: "border-success/40 bg-success-soft text-success" },
-  error: { icon: <TriangleAlert size={16} />, cls: "border-danger/40 bg-danger-soft text-danger" },
-  info: { icon: <Info size={16} />, cls: "border-info/40 bg-info-soft text-info" },
+  success: { icon: <CheckCircle2 size={16} />, cls: "border-success/40 bg-elevated oc-toast-success text-success" },
+  error: { icon: <TriangleAlert size={16} />, cls: "border-danger/40 bg-elevated oc-toast-error text-danger" },
+  info: { icon: <Info size={16} />, cls: "border-info/40 bg-elevated oc-toast-info text-info" },
 };
 
 const AUTO_DISMISS_MS = 3500;
@@ -249,7 +249,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                   : undefined
               }
               className={cn(
-                "pointer-events-auto flex max-w-[92vw] items-center gap-2 rounded-xl border px-3.5 py-2.5 text-body font-medium shadow-float backdrop-blur data-[state=open]:animate-in sm:max-w-md",
+                "pointer-events-auto flex max-w-[92vw] items-center gap-2 rounded-xl border px-3.5 py-2.5 text-body font-medium shadow-pop animate-in sm:max-w-md",
                 s.cls,
               )}
             >

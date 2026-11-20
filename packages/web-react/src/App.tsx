@@ -41,7 +41,7 @@ import {
   type ImageEditSubmit,
 } from "./components/chat/imageEditActions";
 import { extractLatestTodos } from "./components/chat/todoExtract";
-import { PinnedDelegateTrackerLazy, PinnedGoalBarLazy, PinnedSwarmDock, PinnedTaskTrackerLazy, QueuedSendListLazy, SwarmBoardDrawer } from "./components/chat/lazyTimelineCards";
+import { QueuedSendListLazy, SwarmBoardDrawer } from "./components/chat/lazyTimelineCards";
 import { useSwarmBoard, useSwarmMode } from "./hooks/useSwarmUi";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
 import { EmptyState, greetingName } from "./components/EmptyState";
@@ -69,7 +69,8 @@ import {
 } from "./components/chat/archivePaging";
 import { createStickToBottomController } from "./components/chat/stickToBottom";
 import { attachWheelFence } from "./components/chat/wheelFence";
-import { currentTurnSettled } from "./components/chat/turnSegment";
+import { useLiveTerminals } from "./lib/liveTerminals";
+import { useWorkbenchBridge } from "./hooks/useWorkbenchBridge";
 import type { CardCallbacks, FeedbackContext } from "./components/chat/cards";
 import { ResponseRatingProvider } from "./components/chat/ResponseRating";
 import { MediaSignProvider } from "./components/chat/media";
@@ -158,8 +159,6 @@ import {
 } from "./lib/implicitFeedback";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
 import {
-  deriveLiveTerminalEndedAt,
-  deriveLiveTerminalFromMessages,
   deriveSessionNeedsYou,
   getTicketApprovalPendingVersion,
   hasUnansweredOptionsFence,
@@ -207,7 +206,7 @@ import {
   resolveSessionModel,
 } from "./lib/modelPreferences";
 import { DEMO_MESSAGES, DEMO_MESSAGES_BY_SESSION, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
-import type { ChatProject, LockedPublicModel, Message, PublicConfig, PublicModel, Session, SessionLastOutcome, ToolCard } from "./lib/types";
+import type { ChatProject, LockedPublicModel, Message, PublicConfig, PublicModel, Session, ToolCard } from "./lib/types";
 import type { LockedSelectInfo } from "./components/ModelSelector";
 import { lockedModelUnlockNotice } from "./lib/cursorModelPicker";
 import {
@@ -230,12 +229,11 @@ import { useAppDeepLinks } from "./hooks/useAppDeepLinks";
 import { useAppNavigationActions } from "./hooks/useAppNavigationActions";
 import { useComposerSend } from "./hooks/useComposerSend";
 import { useSessionModelAndCollab } from "./hooks/useSessionModelAndCollab";
-import { AppDialogs } from "./components/AppDialogs";
 
 type PredictInput = typeof import("./lib/inputPrediction").predictInput;
 import {
   IdentityRecoveryNotice, AccountSwitchNotice, AgentGate, AuthGate,
-  RepoStatusBanner, ErrorBanner, UpdateBanner, BackgroundTurnBanner, TurnCostReminder,
+  RepoStatusBanner, ErrorBanner, UpdateBanner, BackgroundTurnBanner, TurnCostReminder, PinnedHudStack, AppDialogs,
   Landing, DesktopEnrollPage,
   TutorialCenter, ContainerWebPreview, StudioApp, TaskboardView, SitesWorkspaceView, InspectorPanel,
   InspectorPanelContent, ImageAnnotationEditor, ProjectHome, QuickAskWindow,
@@ -395,8 +393,15 @@ export function App() {
   const [tutorialStep, setTutorialStep] = useState<number | null>(urlRoute.tutorialStep);
   const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
-  // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
-  const [composerPrefill, setComposerPrefill] = useState<{ text: string; nonce: number } | null>(null);
+  const [composerPrefill, setComposerPrefillRaw] = useState<{ text: string; nonce: number; mode?: "replace" | "append" } | null>(null);
+  const setComposerPrefill: React.Dispatch<React.SetStateAction<{ text: string; nonce: number } | null>> = useCallback(
+    (next) => setComposerPrefillRaw((prev) => (typeof next === "function" ? next(prev) : next)),
+    [],
+  );
+  const appendToComposer = useCallback(
+    (text: string) => setComposerPrefillRaw({ text, nonce: Date.now(), mode: "append" }),
+    [],
+  );
   const quickAskSeedRef = useRef(0);
   const [quickAsk, setQuickAsk] = useState<{
     open: boolean;
@@ -658,6 +663,7 @@ export function App() {
     reset: resetSessionList,
     serverListSettled,
     historyLoading,
+    historySettled,
     historyError,
     retryHistory,
   } = useSessionList({
@@ -854,19 +860,6 @@ export function App() {
     [demo, auth],
   );
 
-  const unreadSessions = useUnreadSessions({
-    sessions,
-    activeId: activeId ?? null,
-    userId: user?.id ?? null,
-    auth: demo ? null : auth,
-    // sidebar-B UUS-01：系统通知点开后落到对应会话（hook 内已 window.focus()）。
-    // 在项目主页时点系统通知：落到对应会话即离开主页(任务面板保持原行为)。
-    onNotificationOpen: (id: string) => {
-      setProjectHome(null);
-      setPendingRouteProject(null);
-      selectSession(id);
-    },
-  });
   const sidebarWidth = useSidebarWidth();
 
   // 切会话/进出任务看板时清掉面板里的定位:消息对象引用属于旧会话上下文,跨会话保留只会
@@ -885,6 +878,7 @@ export function App() {
   // 本会话的思考档位与上下文档位(hooks/useSessionEngineOptions,提前以同步清理失效速度档)。
   const { sessionEffort, setSessionEffort, contextTier, setContextTier, serviceTier, setServiceTier } =
     useSessionEngineOptions(activeId);
+  useWorkbenchBridge({ demo, activeId, activeIdRef, isWideRef, setPaneRequest, setPaneOpen, setPaneSheetOpen, serviceTier, setServiceTier });
 
   const {
     applyCollabDoc,
@@ -1206,32 +1200,7 @@ export function App() {
     auth,
   });
 
-  const sendingIdsRef = useRef(new Set<string>());
-  const liveTerminalsRef = useRef(
-    new Map<string, { lastOutcome: SessionLastOutcome; lastErrorCode: string | null; endedAt: number }>(),
-  );
-  const liveTerminals = useMemo(() => {
-    void chat.version;
-    if (demo) return liveTerminalsRef.current;
-    const now = new Set(sessions.filter((s) => chat.isSending(s.id)).map((s) => s.id));
-    for (const id of now) liveTerminalsRef.current.delete(id);
-    for (const id of sendingIdsRef.current) {
-      if (!now.has(id)) {
-        const t = deriveLiveTerminalFromMessages(chat.getSession(id)?.messages);
-        if (t) liveTerminalsRef.current.set(id, { ...t, endedAt: deriveLiveTerminalEndedAt(chat.getSession(id)?.messages) });
-      }
-    }
-    sendingIdsRef.current = now;
-    return new Map(liveTerminalsRef.current);
-  }, [demo, chat, sessions]);
-  useEffect(() => {
-    for (const [id, t] of liveTerminals) applySessionTerminal(id, t);
-  }, [liveTerminals, applySessionTerminal]);
-
-  const liveTerminal = useCallback(
-    (id: string) => liveTerminals.get(id),
-    [liveTerminals],
-  );
+  const { liveTerminal } = useLiveTerminals({ demo, chat, sessions, applySessionTerminal });
   const ticketApprovalVersion = useSyncExternalStore(
     subscribeTicketApprovalPending,
     getTicketApprovalPendingVersion,
@@ -1239,7 +1208,7 @@ export function App() {
   );
   const sessionNeedsYou = useCallback(
     (id: string) => {
-      void chat.version;
+      void (chat.metaVersion ?? chat.version);
       void ticketApprovalVersion;
       if (demo) return null;
       const liveSess = chat.getSession(id);
@@ -1255,6 +1224,19 @@ export function App() {
     },
     [demo, chat, sessions, ticketApprovalVersion],
   );
+  const unreadSessions = useUnreadSessions({
+    sessions,
+    activeId: activeId ?? null,
+    userId: user?.id ?? null,
+    auth: demo ? null : auth,
+    sessionNeedsYou: demo ? undefined : sessionNeedsYou,
+    metaVersion: chat.metaVersion ?? chat.version,
+    onNotificationOpen: (id: string) => {
+      setProjectHome(null);
+      setPendingRouteProject(null);
+      selectSession(id);
+    },
+  });
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -1422,7 +1404,7 @@ export function App() {
   // 并禁用 Composer。demo 与已就绪（ready|dormant）放行正常对话。
   const gated = !demo && !gate.access;
   // 冷会话加载骨架（计时器 + 派生，见 hooks/useHistorySkeleton）。须在下方 boot/登录等早返回之前调用。
-  const { loadingHistory, historySurface } = useHistorySkeleton({
+  const { loadingHistory, historySurface, slowHistory } = useHistorySkeleton({
     demo,
     activeId,
     sessions,
@@ -1433,6 +1415,7 @@ export function App() {
     demoBusy: busy,
     serverListSettled,
     historyLoading,
+    historySettled,
     historyError,
   });
 
@@ -2059,7 +2042,7 @@ export function App() {
     isSending: (id: string) => !demo && chat.isSending(id),
     liveTerminal,
     sessionNeedsYou,
-    socketVersion: chat.version,
+    socketVersion: chat.metaVersion ?? chat.version,
     onLogout: demo ? undefined : closeMobileThen(logout),
     onOpenManage: demo ? undefined : closeMobileThen(() => openManage(DEFAULT_MANAGE_TAB)),
     onOpenMarketplace: demo ? undefined : closeMobileThen(() => openMarketplace("browse")),
@@ -2162,7 +2145,7 @@ export function App() {
         />
       </Sheet>
 
-      <main className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <main className="@container flex min-h-0 min-w-0 flex-1 flex-col">
         {TASKBOARD_ENABLED && boardOpen && !demo && auth ? (
           <LazyBoundary fallback={<SplashFallback />}>
             <TaskboardView
@@ -2272,6 +2255,8 @@ export function App() {
         <h1 className="sr-only">{activeSess?.title || "新对话"}</h1>
         <ChatHeader
           agent={agent}
+          sessionTitle={activeSess?.title}
+          running={wsSending}
           onAgentClick={() => setPickerOpen(true)}
           projectBreadcrumb={(() => {
             const pid = sessions.find((s) => s.id === activeId)?.projectId;
@@ -2398,7 +2383,10 @@ export function App() {
             </LazyBoundary>
           ) : loadingHistory || historySurface === "skeleton" ? (
             // 冷会话历史拉取期：消息形骨架占位，避免「空白 → 突然填满」的突变。
-            <MessageListSkeleton />
+            <MessageListSkeleton
+              slow={slowHistory}
+              onRetry={activeId ? () => retryHistory(activeId) : undefined}
+            />
           ) : historySurface === "error" ? (
             <div
               className="mx-auto flex max-w-3xl flex-col gap-3 px-5 py-12"
@@ -2411,10 +2399,10 @@ export function App() {
                   activeId ? (
                     <button
                       type="button"
-                      className="rounded-full bg-hover px-3 py-1.5 text-xs text-fg"
+                      className="rounded-full bg-hover px-3 py-1.5 text-xs text-fg [@media(hover:none)]:min-h-11"
                       onClick={() => retryHistory(activeId)}
                     >
-                      继续
+                      重试
                     </button>
                   ) : undefined
                 }
@@ -2518,26 +2506,22 @@ export function App() {
               null(收口后由 MessageRenderer 的 inline 只读 TodoWrite/plan 卡兜底)。 */}
           {!demo && !gated && (
             <>
-              <PinnedGoalBarLazy messages={timelineMessages} />
-              <PinnedTaskTrackerLazy
-                todos={extractLatestTodos(timelineMessages)}
-                active={wsSending}
-                settled={currentTurnSettled(timelineMessages)}
-                tokenUsage={activeSess?._liveTurnUsage?.usage}
-              />
-              <PinnedDelegateTrackerLazy
-                items={inflightDelegates.items}
-                onDismiss={inflightDelegates.dismiss}
-                onStop={wsSending ? stopTurn : undefined}
-              />
-              {swarmUi.latestSwarm && (
-                <PinnedSwarmDock
-                  snapshot={swarmUi.latestSwarm}
-                  cardId={swarmUi.latestCard?.messageId}
-                  blockId={swarmUi.latestCard?.blockId}
-                  dismissed={swarmUi.dismissedSwarmKey === swarmUi.latestSwarmKey}
-                  onOpenBoard={swarmUi.openBoard}
-                  onDismiss={() => swarmUi.latestSwarmKey && swarmUi.dismissSwarm(swarmUi.latestSwarmKey)}
+              {(wsSending || inflightDelegates.items.length > 0 || Boolean(swarmUi.latestSwarm) || timelineMessages.some((m) => m.role === "goal" || m.role === "tool")) && (
+                <PinnedHudStack
+                  timelineMessages={timelineMessages}
+                  chatVersion={chat.version}
+                  wsSending={wsSending}
+                  tokenUsage={activeSess?._liveTurnUsage?.usage}
+                  delegateItems={inflightDelegates.items}
+                  onDismissDelegate={inflightDelegates.dismiss}
+                  onStopTurn={wsSending ? stopTurn : undefined}
+                  latestSwarm={swarmUi.latestSwarm}
+                  latestSwarmCardId={swarmUi.latestCard?.messageId}
+                  latestSwarmBlockId={swarmUi.latestCard?.blockId}
+                  latestSwarmKey={swarmUi.latestSwarmKey}
+                  dismissedSwarmKey={swarmUi.dismissedSwarmKey}
+                  onOpenSwarmBoard={swarmUi.openBoard}
+                  onDismissSwarm={swarmUi.dismissSwarm}
                 />
               )}
               <div id="pending-approval-bar-slot" className="mx-auto mb-2 max-w-3xl px-4 empty:mb-0 empty:hidden" />
@@ -2725,7 +2709,10 @@ export function App() {
             widthMax={DETAIL_PANE_WIDTH.max}
             onResizeStart={paneWidth.onResizeStart}
             onResizeKeyDown={paneWidth.onResizeKeyDown}
-            onAnnotateToComposer={(text) => setComposerPrefill({ text, nonce: Date.now() })} liveBrowserAgentId={demo ? undefined : agent.id} liveBrowserAuth={auth}
+            onAnnotateToComposer={appendToComposer}
+            onStopTurn={wsSending ? stopTurn : undefined}
+            liveBrowserAgentId={demo ? undefined : agent.id}
+            liveBrowserAuth={auth}
           />
         </LazyBoundary>
       )}
@@ -2757,7 +2744,10 @@ export function App() {
                 deferredLoader={paneDeferredLoader}
                 onClose={() => setPaneSheetOpen(false)}
                 onActiveChange={setPaneActive}
-                onAnnotateToComposer={(text) => { setComposerPrefill({ text, nonce: Date.now() }); setPaneSheetOpen(false); }} liveBrowserAgentId={demo ? undefined : agent.id} liveBrowserAuth={auth}
+                onAnnotateToComposer={(text) => { appendToComposer(text); setPaneSheetOpen(false); }}
+                onStopTurn={wsSending ? stopTurn : undefined}
+                liveBrowserAgentId={demo ? undefined : agent.id}
+                liveBrowserAuth={auth}
               />
             </LazyBoundary>
           </div>
@@ -2936,6 +2926,7 @@ export function App() {
         <LazyBoundary key={user?.id ?? "anon"} fallback={null}>
           <QuickAskWindow
             open={quickAsk.open} onClose={closeQuickAsk} onSendingChange={onQuickAskSending} seed={quickAsk.seed}
+            onQuoteToComposer={appendToComposer}
             chat={chat} authRef={authRef} user={user} demo={demo} agent={agent} models={models} mainlineModelId={modelId}
             authorizeSwitch={demo ? undefined : authorizeSwitch}
             mainlineSessionId={activeId} mainlineTitle={activeSess?.title ?? sessions.find((s) => s.id === activeId)?.title}
@@ -2966,7 +2957,7 @@ export function App() {
         </LazyBoundary>
       )}
       {swarmUi.boardOpen && swarmUi.activeDrawerSwarm && (
-        <SwarmBoardDrawer open={swarmUi.boardOpen} onOpenChange={swarmUi.setBoardOpen} snapshot={swarmUi.activeDrawerSwarm} initialFocusMember={swarmUi.boardFocus.member} initialFocusChannel={swarmUi.boardFocus.channel} />
+        <SwarmBoardDrawer open={swarmUi.boardOpen} onOpenChange={swarmUi.setBoardOpen} snapshot={swarmUi.activeDrawerSwarm} initialFocusMember={swarmUi.boardFocus.member} initialFocusChannel={swarmUi.boardFocus.channel} onQuoteToComposer={appendToComposer} />
       )}
       {containerPreviewUrl && (
         <LazyBoundary fallback={<DialogFallback />}>
@@ -2977,7 +2968,7 @@ export function App() {
             auth={auth}
             onClose={() => setContainerPreviewUrl(null)}
             onUseComments={(text) => {
-              setComposerPrefill({ text, nonce: Date.now() });
+              appendToComposer(text);
               setContainerPreviewUrl(null);
             }}
           />

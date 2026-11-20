@@ -1,11 +1,10 @@
+import "../../styles/containerWebPreview.css";
 import {
   ChevronDown,
   Globe,
   LayoutGrid,
   List,
   Lock,
-  Menu,
-  PanelLeftOpen,
   PauseCircle,
   Search,
   Users,
@@ -28,6 +27,7 @@ import {
   Skeleton,
   useToast,
 } from "../ui";
+import { WorkspaceShellHeader } from "../ui/WorkspaceShellHeader";
 import { SiteDetailView } from "./SiteDetailView";
 import { SitePreviewThumb } from "./SitePreviewThumb";
 import { sharingLabel } from "./SiteSettingsTab";
@@ -267,32 +267,14 @@ export function SitesWorkspaceView({
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-bg">
       {(onOpenMobileNav || (sidebarCollapsed && onExpandSidebar)) && (
-        <div className="flex shrink-0 items-center gap-2 border-b border-border/60 px-4 py-2 md:hidden">
-          {onOpenMobileNav && (
-            <IconButton
-              variant="ghost"
-              size="sm"
-              aria-label="打开导航"
-              onClick={onOpenMobileNav}
-            >
-              <Menu size={18} />
-            </IconButton>
-          )}
-          <span className="text-section font-semibold text-fg">站点</span>
-        </div>
-      )}
-
-      {sidebarCollapsed && onExpandSidebar && (
-        <div className="hidden items-center px-4 pt-3 md:flex">
-          <IconButton
-            variant="ghost"
-            size="sm"
-            aria-label="展开侧栏"
-            onClick={onExpandSidebar}
-          >
-            <PanelLeftOpen size={17} />
-          </IconButton>
-        </div>
+        <WorkspaceShellHeader
+          onOpenMobileNav={onOpenMobileNav}
+          sidebarCollapsed={sidebarCollapsed}
+          onExpandSidebar={onExpandSidebar}
+          className={cn(!(sidebarCollapsed && onExpandSidebar) && "md:hidden")}
+        >
+          <span className="text-section font-semibold text-fg md:hidden">站点</span>
+        </WorkspaceShellHeader>
       )}
 
       {activeSlug ? (

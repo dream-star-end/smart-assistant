@@ -350,3 +350,32 @@ describe("Composer goalOpenRequest", () => {
     expect(screen.getByText("会话目标")).toBeInTheDocument();
   });
 });
+
+describe("OCV5-817 Composer prefill append / slash menu / stopping indicator", () => {
+  test("prefill.mode === 'append' 保留现有草稿并以空行追加，不静默覆盖", () => {
+    const { rerender } = render(<Composer onSend={() => {}} />);
+    const textarea = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "我已写的草稿" } });
+    rerender(
+      <Composer
+        onSend={() => {}}
+        prefill={{ text: "> 引用的要点", nonce: 1, mode: "append" }}
+      />,
+    );
+    expect(textarea.value).toBe("我已写的草稿\n\n> 引用的要点");
+  });
+
+  test("行首输入 / 弹出 Slash 命令补全菜单，回车补全 /btw", () => {
+    render(<Composer onSend={() => {}} onQuickAskCommand={vi.fn()} />);
+    const textarea = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "/b" } });
+    expect(screen.getByTestId("composer-slash-menu")).toBeInTheDocument();
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(textarea.value).toBe("/btw ");
+  });
+
+  test("stopping 为 true 时展示可见的「正在停止…」状态提示", () => {
+    render(<Composer onSend={() => {}} busy stopping onStop={vi.fn()} />);
+    expect(screen.getByTestId("composer-stopping-status")).toHaveTextContent("正在停止");
+  });
+});

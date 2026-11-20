@@ -289,4 +289,59 @@ describe("InspectorPanel 端到端集成（产物分类汇总筛选 + 批注透�
     fireEvent.click(screen.getByTestId("browser-back-latest"));
     expect(screen.getByTestId("browser-status-banner")).toHaveTextContent("会话快照回放");
   });
+
+  test("长文档点击大纲章节真实滚动到目标标题，且流式内容增长会自动解开幻灯片/目录锁死", async () => {
+    const scrollIntoView = vi.fn();
+    Element.prototype.scrollIntoView = scrollIntoView;
+
+    // 1. 先渲染单标题片段（模拟流式刚开始），目录默认折叠
+    const { rerender } = render(
+      <ToastProvider>
+        <DeliverableRichPreview path="/w/streaming.md" text="# 初始标题\n\n第一段" />
+      </ToastProvider>,
+    );
+    expect(screen.queryByTestId("doc-outline-list")).not.toBeInTheDocument();
+
+    // 2. 流式增长出现第 2、3 个标题 → 目录自动展开，点击章节真实触发滚动
+    const grownDoc = [
+      "# 初始标题",
+      "",
+      "第一段",
+      "",
+      "## 第二节 方法",
+      "方法内容",
+      "",
+      "## 第三节 结论",
+      "结论内容",
+    ].join("\n");
+    rerender(
+      <ToastProvider>
+        <DeliverableRichPreview path="/w/streaming.md" text={grownDoc} />
+      </ToastProvider>,
+    );
+    expect(screen.getByTestId("doc-outline-list")).toBeInTheDocument();
+    await within(screen.getByTestId("output-preview-markdown")).findByRole("heading", { name: "第三节 结论" });
+
+    const tocBtn = screen.getByRole("button", { name: "第三节 结论" });
+    fireEvent.click(tocBtn);
+    expect(tocBtn).toHaveAttribute("aria-current", "location");
+    expect(scrollIntoView).toHaveBeenCalled();
+
+    // 3. 流式 Marp 幻灯片：首段未含 `---`，后续补齐分页自动进入幻灯片模式
+    const { rerender: rerenderSlides } = render(
+      <ToastProvider>
+        <DeliverableRichPreview path="/w/pitch-deck.md" text={"---\nmarp: true\n---\n# 封面"} />
+      </ToastProvider>,
+    );
+    expect(screen.queryByTestId("deliverable-slides")).not.toBeInTheDocument();
+    rerenderSlides(
+      <ToastProvider>
+        <DeliverableRichPreview
+          path="/w/pitch-deck.md"
+          text={"---\nmarp: true\n---\n# 封面\n---\n## 第二页\n内容"}
+        />
+      </ToastProvider>,
+    );
+    expect(screen.getByTestId("deliverable-slides")).toBeInTheDocument();
+  });
 });

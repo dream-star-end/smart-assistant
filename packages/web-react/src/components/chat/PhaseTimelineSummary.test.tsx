@@ -77,10 +77,10 @@ describe("PhaseTimelineSummary integration in ProcessDisclosure", () => {
     expect(screen.getByTestId("process-phase-filtered")).toHaveAttribute("data-phase-filter", "explore");
     expect(within(screen.getByTestId("process-phase-filtered")).getAllByTestId("process-step-row")).toHaveLength(2);
 
-    // Resetting restores the chronological step group view
+    // Resetting restores the chronological step view (single-section renders step rows directly without redundant group fold)
     fireEvent.click(screen.getByTestId("phase-filter-reset"));
     expect(screen.queryByTestId("process-phase-filtered")).not.toBeInTheDocument();
-    expect(screen.getByTestId("process-step-group")).toBeInTheDocument();
+    expect(screen.getAllByTestId("process-step-row")).toHaveLength(4);
   });
 
   test("hides compact strip and filter bar for simple single-step turns", () => {

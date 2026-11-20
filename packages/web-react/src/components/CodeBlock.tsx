@@ -1,4 +1,4 @@
-import { Check, ChevronDown, Copy, WrapText } from "lucide-react";
+import { Check, ChevronDown, ChevronUp, Copy, WrapText } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { cn } from "../lib/utils";
 import { useToast } from "./ui";
@@ -47,8 +47,9 @@ export function CodeBlock({
   const ref = useRef<HTMLElement>(null);
   const [copied, setCopied] = useState(false);
   const [wrap, setWrap] = useState(readCodeWrap);
+  const canCollapse = !live && lineCount > CODE_COLLAPSE_LINES;
   // 只在挂载时决定一次;之后行数增长 / live 翻转都不再收起。
-  const [collapsed, setCollapsed] = useState(() => !live && lineCount > CODE_COLLAPSE_LINES);
+  const [collapsed, setCollapsed] = useState(() => canCollapse);
   const toast = useToast();
 
   useEffect(() => {
@@ -81,6 +82,17 @@ export function CodeBlock({
       <div className="sticky top-0 z-[1] flex items-center justify-between border-b border-border/70 bg-code py-1 pl-4 pr-1.5">
         <span className="font-mono text-caption tracking-wide text-faint">{language || "code"}</span>
         <div className="flex items-center gap-0.5">
+          {canCollapse && !collapsed && (
+            <button
+              type="button"
+              onClick={() => setCollapsed(true)}
+              aria-label="收起代码块"
+              className="flex items-center gap-1 rounded-md px-2 py-1 text-caption text-faint transition-colors hover:bg-hover hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+            >
+              <ChevronUp size={13} />
+              收起
+            </button>
+          )}
           <button
             type="button"
             onClick={toggleWrap}

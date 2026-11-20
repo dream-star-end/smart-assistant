@@ -9,8 +9,9 @@ import { ToastProvider, TooltipProvider } from "../ui";
 import { OutputRow, OutputViewer, __resetOutputSnippetCache } from "./OutputViewer";
 import { loadBeforeAll } from "../../test/moduleLoad";
 
-// 点开图片后断言查看器内容:懒加载的 ImageViewer 先在用例窗口外取好(src/test/moduleLoad.ts)。
+// 点开图片/富预览后断言查看器内容:懒加载块先在用例窗口外取好(src/test/moduleLoad.ts)。
 loadBeforeAll(() => import("../ImageViewer"));
+loadBeforeAll(() => import("../chat/DeliverableRichPreview"));
 
 const sign = async (paths: string[]) =>
   Object.fromEntries(paths.map((p) => [p, `/api/media-signed?t=${encodeURIComponent(p)}`]));
@@ -253,6 +254,14 @@ describe("OutputViewer", () => {
     expect(img).toHaveAttribute("src", "blob:img-1");
     expect(String(fetchMock.mock.calls[0]![0])).toMatch(/^\/api\/media-signed\?t=.*&w=1280$/);
     expect(within(dialog).getByRole("button", { name: "放大查看 chart.png" })).toBeInTheDocument();
+  });
+
+  it("CSV 产出复用 DeliverableRichPreview：支持搜索筛选与列统计", async () => {
+    fetchMock.mockResolvedValue(new Response("模型,准确率\nAlpha,92.5\nBeta,97.1\n"));
+    renderViewer(out({ id: "csv-1", name: "metrics.csv" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(await within(dialog).findByTestId("deliverable-spreadsheet")).toBeInTheDocument();
+    expect(within(dialog).getByTestId("spreadsheet-counts")).toHaveTextContent("共 2 行 · 2 列");
   });
 });
 

@@ -165,7 +165,7 @@ describe("F1b 剪贴板图片直接上传", () => {
     expect(textarea).toHaveValue("保留这段正文");
   });
 
-  test("纯文本或非图片文件不被拦截，也不触发上传", () => {
+  test("纯文本不被拦截；通用文件粘贴直接触发上传（OCV5-817）", async () => {
     const onUpload = vi.fn(async () => ({ kind: "file", url: "/api/media/file" }) as MediaRef);
     render(<Composer onSend={() => {}} onUpload={onUpload} />);
     const textarea = screen.getByPlaceholderText("给从简发消息…");
@@ -174,15 +174,17 @@ describe("F1b 剪贴板图片直接上传", () => {
       items: [{ kind: "string", type: "text/plain", getAsFile: () => null }],
       files: [],
     });
+    expect(textEvent.defaultPrevented).toBe(false);
+    expect(onUpload).not.toHaveBeenCalled();
+
     const pdf = new File(["pdf"], "report.pdf", { type: "application/pdf" });
     const fileEvent = paste(textarea, {
       items: [{ kind: "file", type: pdf.type, getAsFile: () => pdf }],
       files: [pdf],
     });
 
-    expect(textEvent.defaultPrevented).toBe(false);
-    expect(fileEvent.defaultPrevented).toBe(false);
-    expect(onUpload).not.toHaveBeenCalled();
+    expect(fileEvent.defaultPrevented).toBe(true);
+    await waitFor(() => expect(onUpload).toHaveBeenCalledWith(pdf, expect.any(Function)));
   });
 });
 

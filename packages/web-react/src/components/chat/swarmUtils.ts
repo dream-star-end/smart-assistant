@@ -96,10 +96,10 @@ const MEMBER_PALETTES: readonly MemberVisualStyle[] = [
     text: "text-warning",
   },
   {
-    badge: "bg-danger-soft text-danger border-danger/20",
-    avatar: "bg-danger-soft text-danger",
-    dot: "bg-danger",
-    text: "text-danger",
+    badge: "bg-hover text-fg border-border-strong",
+    avatar: "bg-hover text-fg",
+    dot: "bg-muted",
+    text: "text-fg",
   },
 ];
 

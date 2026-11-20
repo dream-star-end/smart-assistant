@@ -56,7 +56,7 @@ export function BootSplash({ slowHint = "网络较慢，正在加载…" }: { sl
           onClick={() => window.location.reload()}
           className="rounded-full px-3 py-1 text-meta text-muted underline-offset-2 hover:text-fg hover:underline [@media(hover:none)]:min-h-11"
         >
-          继续
+          刷新重试
         </button>
       )}
     </output>

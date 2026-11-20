@@ -424,3 +424,33 @@ export function groupOutputFiles(files: readonly OutputFile[]): OutputFileGroup[
   }
   return out;
 }
+
+function normalizePathForMatch(p: string): string {
+  return p.replace(/\\/g, "/").replace(/\/+$/, "").trim();
+}
+
+/** 判断两个交付物路径是否指向同一文件（完全一致、或相对/工作区前缀后缀一致）。 */
+export function matchesOutputPath(candidate: string, target: string): boolean {
+  const a = normalizePathForMatch(candidate);
+  const b = normalizePathForMatch(target);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (a.endsWith(`/${b}`) || b.endsWith(`/${a}`)) return true;
+  return false;
+}
+
+/** 在多轮会话中按最新优先查找包含目标路径（文件或媒体）的轮次下标；找不到返回 -1。 */
+export function findTurnIndexForPath(turns: readonly WorkTurn[], targetPath: string): number {
+  const norm = normalizePathForMatch(targetPath);
+  if (!norm) return -1;
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const out = collectTurnOutputs(turns[i]);
+    if (
+      out.files.some((f) => matchesOutputPath(f.path, norm)) ||
+      out.media.some((m) => matchesOutputPath(m.src, norm))
+    ) {
+      return i;
+    }
+  }
+  return -1;
+}

@@ -420,4 +420,60 @@ describe("CommandPalette", () => {
     fireEvent.click(screen.getByRole("option", { name: "打开快问小窗" }));
     expect(onOpenQuickAsk).toHaveBeenCalledTimes(1);
   });
+
+  it("OCV5-817: 异步远程结果回流时保持用户已选中的 activeKey，上下键跳过降级禁选模型，并支持高频 OS 操作", async () => {
+    const onOpenSettings = vi.fn();
+    const onToggleTheme = vi.fn();
+    const onTogglePane = vi.fn();
+    let resolveAssets!: (rows: ProjectAsset[]) => void;
+    const searchAssets = vi.fn(
+      () =>
+        new Promise<ProjectAsset[]>((r) => {
+          resolveAssets = r;
+        }),
+    );
+    const { input } = setup({
+      searchAssets,
+      onOpenSettings,
+      onToggleTheme,
+      onTogglePane,
+      models: [
+        { id: "gpt-5.4", display_name: "GPT-5.4", cost_x: 2.0 },
+        { id: "broken-pro", display_name: "Degraded Pro", degraded: true },
+      ],
+      activeModelId: "gpt-5.4",
+      onSelectModel: vi.fn(),
+    });
+
+    // 1. 异步结果插入上方时，保持用户主动选中的行
+    type(input, "周报");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    const pickedBefore = selected()?.getAttribute("data-palette-key");
+    expect(pickedBefore).toBeTruthy();
+    await waitFor(() => expect(searchAssets).toHaveBeenCalled());
+    resolveAssets([asset("a-late", "周报汇总.md", V5.id)]);
+    await screen.findByRole("option", { name: /周报汇总\.md/ });
+    expect(selected()?.getAttribute("data-palette-key")).toBe(pickedBefore);
+
+    // 2. 键盘导航跳过 disabled（降级）模型
+    type(input, "");
+    const allOpts = options();
+    const degradedOpt = allOpts.find((o) => o.getAttribute("data-palette-key") === "model:broken-pro");
+    expect(degradedOpt).toHaveAttribute("aria-disabled", "true");
+    for (let i = 0; i < allOpts.length; i += 1) {
+      fireEvent.keyDown(input, { key: "ArrowDown" });
+      expect(selected()?.getAttribute("data-palette-key")).not.toBe("model:broken-pro");
+    }
+
+    // 3. 高频 OS 操作（设置 / 主题 / 工作台面板）
+    type(input, "主题");
+    fireEvent.click(screen.getByRole("option", { name: /切换明暗主题/ }));
+    expect(onToggleTheme).toHaveBeenCalledTimes(1);
+    type(input, "设置");
+    fireEvent.click(screen.getByRole("option", { name: /打开设置/ }));
+    expect(onOpenSettings).toHaveBeenCalledTimes(1);
+    type(input, "工作台");
+    fireEvent.click(screen.getByRole("option", { name: /切换工作台面板/ }));
+    expect(onTogglePane).toHaveBeenCalledTimes(1);
+  });
 });

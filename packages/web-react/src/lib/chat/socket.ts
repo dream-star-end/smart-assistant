@@ -27,6 +27,7 @@ import {
   type PendingControlItem,
 } from "./controlReceipts";
 import { contextRebuiltRow } from "./contextRebuilt";
+import { SocketMetaTracker, STOP_SETTLEMENT_TIMEOUT_NOTICE } from "./socketMeta";
 import { applyRecoveryStatusFrame, rememberRetryStatus } from "./retryStatus";
 import {
   applyCostCharged,
@@ -605,6 +606,8 @@ export function automaticTurnRecoveryTarget(
 
 export type ChatSnapshot = {
   version: number;
+  /** Low-frequency version: bumps only on sidebar/shell metadata changes, not plain text deltas. */
+  metaVersion: number;
   status: { label: string; cls: ChatStatusClass };
   /** 容器初始化期 banner（4503 provisioning）。*/
   provisioning: boolean;
@@ -997,6 +1000,7 @@ export class ChatSocket {
   // 注:容器重启后 bridge 还有"自动重绑"(从 DB active selection 重发),此队列只覆盖
   // "PUT 时 WS 未就绪"与"reconnect"两场景,故省去 v3 的 30s GET 轮询。
   private pendingRepoBind = new Map<string, { agentId: string; version: number }>();
+  private metaTracker = new SocketMetaTracker();
 
   // ── 生命周期事件绑定句柄 ──
   private boundOnline?: () => void;
@@ -1010,6 +1014,7 @@ export class ChatSocket {
     this.deps = deps;
     this.snapshot = {
       version: 0,
+      metaVersion: 0,
       status: { label: this.statusLabel, cls: this.statusCls },
       provisioning: this.provisioning,
       browserOnline: this.isBrowserOnline,
@@ -1067,9 +1072,13 @@ export class ChatSocket {
     return { phase: "sending", queued: pending.length, serviceStarting: false };
   }
 
+  consumeDirtyPersistIds(): string[] { return this.metaTracker.consumeDirtyPersistIds(); }
+  markPersisted(sessId: string): void { this.metaTracker.markPersisted(sessId, this.sessions.get(sessId)); }
+
   private rebuildSnapshot(): void {
     this.snapshot = {
       version: this.version,
+      metaVersion: this.metaTracker.metaVersion,
       status: { label: this.statusLabel, cls: this.statusCls },
       provisioning: this.provisioning,
       browserOnline: this.isBrowserOnline,
@@ -1148,6 +1157,7 @@ export class ChatSocket {
     this.clearNotifyTimers();
     this.version++;
     this.lastNotifyAt = Date.now();
+    this.metaTracker.onFlush({ sessions: this.sessions, offlineQueue: this.offlineQueue, statusCls: this.statusCls, provisioning: this.provisioning, browserOnline: this.isBrowserOnline });
     this.rebuildSnapshot();
     const measure = this.anyTurnInFlight() && typeof performance !== "undefined" && typeof queueMicrotask === "function";
     const started = measure ? performance.now() : 0;
@@ -1232,6 +1242,7 @@ export class ChatSocket {
     this.unpublishedTapeRetries.clear();
     for (const t of this.controlPersistRetryTimers.values()) clearTimeout(t);
     this.controlPersistRetryTimers.clear();
+    this.metaTracker.clearAllStopTimers();
     this.everOpened = false;
     this.lastOpenAtMs = 0;
     const ws = this.ws;
@@ -1456,6 +1467,7 @@ export class ChatSocket {
       (synced) => {
         const sess = this.sessions.get(sessId);
         if (synced !== true || sess?._stopSettlement !== settlement) return;
+        this.metaTracker.clearStopTimeout(sessId);
         sess._stopSettlement = undefined;
         this.deps.persistSession?.(sessId);
         this.scheduleNotify();
@@ -3721,6 +3733,7 @@ export class ChatSocket {
     this.snapshotAckAt.delete(sessId);
     this.wsSnapshotAt.delete(sessId);
     this.helloAskedCmid.delete(sessId);
+    this.metaTracker.removeSession(sessId);
     if (this.sessions.delete(sessId)) this.scheduleNotify();
   }
 
@@ -3756,6 +3769,7 @@ export class ChatSocket {
     this.snapshotAckAt.clear();
     this.wsSnapshotAt.clear();
     this.helloAskedCmid.clear();
+    this.metaTracker.reset();
     this.activeSessionId = undefined;
     if (this.sessions.size === 0) return;
     this.sessions.clear();
@@ -5963,6 +5977,7 @@ export class ChatSocket {
     }
     if (item.controlKind === "stop") {
       this.finishDispatch(sess.id, item.clientMessageId);
+      this.metaTracker.clearStopTimeout(sess.id);
       sess._stopSettlement = undefined;
       this.clearSendingState(sess);
     } else if (item.requestId) {
@@ -6307,12 +6322,20 @@ export class ChatSocket {
       sess._sendingInFlight = true;
       sess._activeClientMessageId = activeClientMessageId;
       sess._activeAgentId = agentId;
-      sess._stopSettlement = {
-        ...(activeClientMessageId ? { clientMessageId: activeClientMessageId } : {}),
-        controlId,
-        phase: "persisting",
-      };
+      sess._stopSettlement = { ...(activeClientMessageId ? { clientMessageId: activeClientMessageId } : {}), controlId, phase: "persisting" };
       sess._recoveryStatus = { kind: "stopping" };
+      const settlement = sess._stopSettlement;
+      this.metaTracker.armStopTimeout(sess.id, () => {
+        const cur = this.sessions.get(sess.id);
+        if (!cur || cur._stopSettlement !== settlement) return;
+        const idx = this.controlQueue.findIndex((i) => i.controlId === controlId);
+        if (idx >= 0) this.controlQueue.splice(idx, 1);
+        void this.deps.deletePendingControl?.(sess.id, controlId)?.catch(() => {});
+        if (activeClientMessageId) this.finishDispatch(sess.id, activeClientMessageId);
+        cur._stopSettlement = undefined; this.clearSendingState(cur); cur._recoveryStatus = { kind: "completed" };
+        this.transientNotices.set(sess.id, { text: STOP_SETTLEMENT_TIMEOUT_NOTICE, ts: Date.now() });
+        this.deps.persistSession?.(sess.id); this.scheduleNotify(); void this.deps.syncSession?.(sess.id);
+      });
       this.enqueueControl({
         kind: "control",
         sessId: sess.id,

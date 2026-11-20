@@ -109,7 +109,7 @@ export function SiteDetailView({
           className="-ml-2 gap-1.5 text-muted hover:text-fg"
         >
           <ArrowLeft size={15} aria-hidden="true" />
-          网站
+          站点
         </Button>
 
         {site && (

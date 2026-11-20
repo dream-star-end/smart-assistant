@@ -38,11 +38,12 @@ export function useSwarmBoard(opts: {
   const [boardFocus, setBoardFocus] = useState<{
     member: string | null;
     channel: string | null;
+    seq: number | null;
     cardId: string | null;
     blockId: string | null;
     followLatest: boolean;
     snapshot: SwarmSnapshot | null;
-  }>({ member: null, channel: null, cardId: null, blockId: null, followLatest: true, snapshot: null });
+  }>({ member: null, channel: null, seq: null, cardId: null, blockId: null, followLatest: true, snapshot: null });
   const [dismissedSwarmKey, setDismissedSwarmKey] = useState<string | null>(null);
 
   // Re-evaluate whenever `messagesVersion` ticks (wsMessages is mutated in place).
@@ -55,13 +56,14 @@ export function useSwarmBoard(opts: {
   // Reset board overlay when navigating to another session so a stale swarm never lingers.
   useEffect(() => {
     setBoardOpen(false);
-    setBoardFocus({ member: null, channel: null, cardId: null, blockId: null, followLatest: true, snapshot: null });
+    setBoardFocus({ member: null, channel: null, seq: null, cardId: null, blockId: null, followLatest: true, snapshot: null });
   }, [sessionKey]);
 
   const openBoard = useCallback((req: SwarmOpenRequest) => {
     setBoardFocus({
       member: req.focusMember ?? null,
       channel: req.focusChannel ?? null,
+      seq: req.focusSeq ?? null,
       cardId: req.cardId ?? null,
       blockId: req.blockId ?? null,
       followLatest: !req.cardId && !req.blockId,
@@ -86,12 +88,22 @@ export function useSwarmBoard(opts: {
   useEffect(() => {
     if (!latestCard) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && e.key.toLowerCase() === "s") {
+      // macOS 按 Option+S 会把 e.key 映成 "ß"，必须同时识别物理键 e.code === "KeyS"（对齐 lib/hotkeys.ts）。
+      if (
+        e.altKey &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.shiftKey &&
+        !e.isComposing &&
+        e.keyCode !== 229 &&
+        (e.code === "KeyS" || e.key.toLowerCase() === "s")
+      ) {
         if (!boardOpen && isDialogLayerOpen()) return;
         e.preventDefault();
         setBoardFocus({
           member: null,
           channel: null,
+          seq: null,
           cardId: latestCard.messageId,
           blockId: latestCard.blockId ?? null,
           followLatest: true,

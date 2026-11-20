@@ -58,7 +58,7 @@ export const modalContentVariants = cva(
         center:
           "oc-center-dialog left-1/2 top-1/2 max-h-[88dvh] w-[calc(100vw-2rem)] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-border",
         fullscreen:
-          "bottom-0 left-0 right-0 top-0 h-auto max-h-none w-full max-w-none translate-x-0 translate-y-0 rounded-none border-0 border-border md:bottom-auto md:left-1/2 md:right-auto md:top-1/2 md:max-h-[88dvh] md:w-[calc(100vw-2rem)] md:-translate-x-1/2 md:-translate-y-1/2 md:rounded-xl md:border",
+          "bottom-auto left-0 right-0 top-[var(--oc-visual-offset-top,0px)] h-[var(--oc-visual-height,100dvh)] max-h-[var(--oc-visual-height,100dvh)] w-full max-w-none translate-x-0 translate-y-0 rounded-none border-0 border-border pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)] md:bottom-auto md:left-1/2 md:right-auto md:top-1/2 md:h-auto md:max-h-[88dvh] md:w-[calc(100vw-2rem)] md:-translate-x-1/2 md:-translate-y-1/2 md:rounded-xl md:border md:p-0",
         /**
          * 定位完全交给调用方:本轴一个类都不输出(连 oc-center-dialog 也不挂)。
          *

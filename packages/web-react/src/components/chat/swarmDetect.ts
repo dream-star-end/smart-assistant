@@ -13,6 +13,7 @@ export type SwarmOpenRequest = {
   blockId?: string;
   focusMember?: string | null;
   focusChannel?: string | null;
+  focusSeq?: number | null;
 };
 
 export type SwarmCardEntry = {

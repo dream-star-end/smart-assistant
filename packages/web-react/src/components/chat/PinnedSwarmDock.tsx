@@ -7,7 +7,7 @@ import { ArrowUpRight, Hexagon, MessageSquare, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { cn } from "../../lib/utils";
 import { altKeyLabel } from "../ChatHeader";
-import { Spinner } from "../ui";
+import { Badge, Spinner } from "../ui";
 import {
   formatSwarmElapsed,
   isSwarmActive,
@@ -87,25 +87,14 @@ export function PinnedSwarmDock({
               <span className="truncate text-meta font-semibold text-fg">
                 {snapshot.title || "蜂群协作"}
               </span>
-              <span
-                className={cn(
-                  "inline-flex shrink-0 items-center gap-1 rounded-full px-1.5 py-0 text-micro font-medium",
-                  phase.tone === "accent"
-                    ? "bg-accent-soft text-accent"
-                    : phase.tone === "success"
-                      ? "bg-success-soft text-success"
-                      : phase.tone === "warning"
-                        ? "bg-warning-soft text-warning"
-                        : "bg-danger-soft text-danger",
-                )}
-              >
+              <Badge tone={phase.tone} size="sm" className="shrink-0 gap-1 py-0 text-micro">
                 {active && <Spinner size={8} />}
                 {active
                   ? counts.working > 0
                     ? `${counts.working} 运行中`
                     : `${counts.live} 成员`
                   : phase.label}
-              </span>
+              </Badge>
               {elapsed && (
                 <span className="hidden shrink-0 font-mono text-micro text-faint tabular-nums sm:inline">
                   {elapsed}

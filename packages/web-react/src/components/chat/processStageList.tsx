@@ -491,6 +491,15 @@ export function ProcessStageList<T>({
               const details = detailOpen(section.key);
               const current = active && index === currentIndex;
               const group = groupNode(section.messages, current);
+              // OCV5-817: 整轮已完成且仅有一个工具步骤组时,外层 ProcessDisclosure 标题已给足汇总,
+              // 直接平铺步骤行省去冗余的第二层分组折叠(4 击压至 2 击)。
+              if (!active && sections.length === 1) {
+                return (
+                  <div key={section.key} className="space-y-0.5" data-testid="process-details">
+                    {stepRows(section.items, isLastSection)}
+                  </div>
+                );
+              }
               // OCV5-312: 流光挂在「正在干活」的这一段摘要行上(当前段、本轮仍在进行),表明 agent 此刻在做什么;
               // 其余过程文字一律 --faint,让下方 agent 的回复正文更突出。当前在写正文(叙述段)时不挂流光,流式文字本身就是信号。
               // 有意为之:干活行的回落色是 --muted(比完成行略实)。流光与节点光晕在 reduced-motion / 不支持

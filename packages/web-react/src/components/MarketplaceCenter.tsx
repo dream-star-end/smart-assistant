@@ -150,7 +150,7 @@ export function MarketplaceCenter({
           // 高度上限覆盖 oc-center-dialog 的默认 85dvh:市场是浏览型大弹层,要更高。该变量在未分层的
           // .oc-center-dialog 规则里有默认值,工具类盖不过,只能走内联样式(取小的兜底仍由该规则负责)。
           style={{ '--oc-center-max-h': 'calc(var(--oc-visual-height, 100dvh) - 24px)' } as CSSProperties}
-          className="marketplace-window oc-center-dialog fixed left-1/2 z-50 flex h-[calc(100dvh-24px)] w-[calc(100vw-16px)] max-w-[1120px] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-lg border border-border bg-surface text-fg shadow-float focus:outline-none data-[state=open]:animate-in sm:h-[min(91dvh,940px)] sm:w-[calc(100vw-32px)] lg:w-[calc(100vw-64px)]"
+          className="marketplace-window oc-center-dialog fixed left-1/2 z-50 flex h-[calc(100dvh-24px)] w-[calc(100vw-16px)] max-w-[1120px] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-elevated text-fg shadow-float focus:outline-none data-[state=open]:animate-in sm:h-[min(91dvh,940px)] sm:w-[calc(100vw-32px)] lg:w-[calc(100vw-64px)]"
         >
           <div className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 border-b border-border px-4 py-3 sm:flex-nowrap sm:px-6">
             <div className="min-w-0">

@@ -74,6 +74,15 @@ describe("shouldShowHistorySkeleton（冷会话骨架判定）", () => {
     expect(shouldShowHistorySkeleton(base({ metaKnown: false, graceExpired: false }))).toBe(true);
     expect(shouldShowHistorySkeleton(base({ metaKnown: false, graceExpired: true }))).toBe(false);
   });
+
+  test("OCV5-786: historyError 或 settledEmpty 时立即退出骨架，不干等 8s cap", () => {
+    expect(
+      shouldShowHistorySkeleton(base({ knownMessageCount: 6, metaKnown: true, historyError: true })),
+    ).toBe(false);
+    expect(
+      shouldShowHistorySkeleton(base({ knownMessageCount: 6, metaKnown: true, settledEmpty: true })),
+    ).toBe(false);
+  });
 });
 
 describe("MessageListSkeleton", () => {
@@ -81,6 +90,15 @@ describe("MessageListSkeleton", () => {
     render(<MessageListSkeleton />);
     const region = screen.getByLabelText("正在加载会话历史");
     expect(region).toHaveAttribute("aria-busy", "true");
+    expect(screen.queryByTestId("history-skeleton-slow-retry")).toBeNull();
+  });
+
+  test("slow=true 且传入 onRetry 时展示慢加载重试条", () => {
+    const onRetry = vi.fn();
+    render(<MessageListSkeleton slow onRetry={onRetry} />);
+    expect(screen.getByTestId("history-skeleton-slow-retry")).toBeInTheDocument();
+    screen.getByRole("button", { name: "重试" }).click();
+    expect(onRetry).toHaveBeenCalledTimes(1);
   });
 });
 
