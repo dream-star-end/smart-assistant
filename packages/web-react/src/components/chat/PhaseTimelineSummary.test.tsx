@@ -51,9 +51,9 @@ describe("PhaseTimelineSummary integration in ProcessDisclosure", () => {
     render(<Harness messages={MULTI_PHASE_MESSAGES} />);
 
     const strip = screen.getByTestId("phase-timeline-strip");
-    expect(within(strip).getByTestId("phase-pill-explore")).toHaveTextContent("检索探索2");
-    expect(within(strip).getByTestId("phase-pill-edit")).toHaveTextContent("编辑产物1");
-    expect(within(strip).getByTestId("phase-pill-verify")).toHaveTextContent("命令验证1");
+    expect(within(strip).getByTestId("phase-pill-explore")).toHaveTextContent("探索2");
+    expect(within(strip).getByTestId("phase-pill-edit")).toHaveTextContent("编辑1");
+    expect(within(strip).getByTestId("phase-pill-verify")).toHaveTextContent("验证1");
     expect(within(strip).getByTestId("phase-metric-files")).toHaveTextContent("改 1 文件");
     // Must never leak raw arguments or danger color inside disclosure
     expect(strip.textContent ?? "").not.toMatch(/SECRET_QUERY|secret-flag/);

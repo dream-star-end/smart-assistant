@@ -1313,7 +1313,8 @@ export function ProcessDisclosure<T>({
           ) : null}
           {roundCredits ? (
             <span className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint" data-testid="process-round-credits">
-              本轮 {groupDigits(roundCredits)} 积分
+              <span className="hidden sm:inline">本轮 </span>
+              {groupDigits(roundCredits)} 积分
             </span>
           ) : null}
         </span>
@@ -1327,14 +1328,16 @@ export function ProcessDisclosure<T>({
         <button
           type="button"
           data-testid="process-pane-changes"
-          className="inline-flex min-h-8 shrink-0 items-center gap-1 rounded-full border border-border px-2.5 text-meta text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+          className="group/changes inline-flex shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
           title="在详情面板查看这一轮的产出"
           onClick={() => openPane("outputs", processRows[0])}
         >
-          <Pencil size={12} aria-hidden className="text-faint" />
-          {/* 手机上省掉「改动」二字,给左边的步骤统计留位置;读屏仍念全句。 */}
-          <span className="sr-only sm:not-sr-only">改动 </span>
-          {changedFiles} 个文件
+          <span className="inline-flex h-7 items-center gap-1 rounded-full border border-border/80 px-2.5 text-caption font-medium text-muted transition-colors group-hover/changes:bg-hover group-hover/changes:text-fg">
+            <Pencil size={11.5} aria-hidden className="text-faint" />
+            {/* 手机上省掉「改动」二字,给左边的步骤统计留位置;读屏仍念全句。 */}
+            <span className="sr-only sm:not-sr-only">改动 </span>
+            {changedFiles} 个文件
+          </span>
         </button>
       ) : openPane && hasToolRows ? (
         <button

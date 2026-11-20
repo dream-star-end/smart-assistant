@@ -275,14 +275,14 @@ export function ChatHeader({
         </span>
       )}
       {projectBreadcrumb?.chatName ? (
-        // 所在项目:窄屏也显示(截断),点开项目本身,而不是管理中心。
+        // 所在项目:窄屏落位到第二行模型行右侧空位，释放第一行让智能体名完整展开；桌面紧跟智能体名。
         <button
           type="button"
           data-testid="chat-project-breadcrumb"
           data-product-control="project-breadcrumb"
           onClick={onOpenProjectScope}
           aria-label={`所在项目：${projectBreadcrumb.chatName}，点击打开项目`}
-          className="inline-flex min-h-11 min-w-0 max-w-[5.25rem] shrink items-center gap-1 rounded-full px-1.5 text-caption text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:min-h-0 sm:max-w-[13rem] sm:px-2 sm:py-1"
+          className="order-3 ml-auto inline-flex min-h-11 min-w-0 max-w-[7.5rem] shrink-0 items-center gap-1 rounded-full px-1.5 text-caption text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:order-none sm:ml-0 sm:min-h-0 sm:max-w-[13rem] sm:shrink sm:px-2 sm:py-1"
           title={`所在项目：${projectBreadcrumb.chatName}`}
         >
           <FolderOpen size={12.5} aria-hidden className="shrink-0" />
@@ -316,8 +316,10 @@ export function ChatHeader({
         </span>
       ) : null}
       {(teamModeActive || advisorModeActive || (models && onSelectModel) || running || showUpdatePill) && (
+        <>
+        <span aria-hidden className="order-1 h-0 basis-full border-t border-border/50 sm:hidden" />
         <div
-          className="order-last flex min-w-0 basis-full items-center gap-1.5 border-t border-border/50 pt-1 sm:order-none sm:flex-1 sm:basis-auto sm:border-t-0 sm:pt-0"
+          className="order-2 flex min-w-0 flex-1 items-center gap-1.5 pt-0.5 sm:order-none sm:basis-auto sm:pt-0"
           data-testid="chat-model-row"
         >
           <span aria-hidden className="hidden h-4 w-px shrink-0 bg-border sm:block" />
@@ -460,6 +462,7 @@ export function ChatHeader({
             </button>
           )}
         </div>
+        </>
       )}
       <div className="ml-auto flex shrink-0 items-center gap-0.5 sm:gap-1">
         {hasSecondaryActions && (

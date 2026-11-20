@@ -88,6 +88,35 @@ describe("collectFileChanges", () => {
     const files = collectFileChanges([tool("w", "Write", { file_path: "/f", content: "x" }, { _completed: false, output: "" })]);
     expect(files[0]?.running).toBe(true);
   });
+
+  test("裁剪正文的旧 Edit/Write：优先从输出解析 (+N/-M lines)，无行数时 hasCounts=false 不报假 +0 -0", () => {
+    const files = collectFileChanges([
+      tool("e-out", "Edit", { file_path: "/w/parsed.ts" }, { output: "Made 1 replacement in /w/parsed.ts starting at line 18 (+5/-2 lines)." }),
+      tool("e-empty", "Edit", { file_path: "/w/no-body.ts" }, { output: "ok" }),
+      tool("w-empty", "Write", { file_path: "/w/no-content.ts" }, { output: "Created file." }),
+    ]);
+    const byPath = Object.fromEntries(files.map((f) => [f.path, f]));
+    expect(byPath["/w/parsed.ts"]?.hasCounts).toBe(true);
+    expect([byPath["/w/parsed.ts"]?.added, byPath["/w/parsed.ts"]?.removed]).toEqual([5, 2]);
+    expect(byPath["/w/no-body.ts"]?.hasCounts).toBe(false);
+    expect(byPath["/w/no-body.ts"]?.entries[0]?.added).toBeNull();
+    expect(byPath["/w/no-content.ts"]?.hasCounts).toBe(false);
+    expect(byPath["/w/no-content.ts"]?.entries[0]?.added).toBeNull();
+  });
+
+  test("同一文件依次 Write(A) -> 无正文 Write -> Write(A) 时清除过期基线，不误渲染 +0 -0 覆盖 diff", () => {
+    const files = collectFileChanges([
+      tool("w1", "Write", { file_path: "/w/re.ts", content: "a\nb\n" }),
+      tool("w2", "Write", { file_path: "/w/re.ts" }, { output: "Created file." }),
+      tool("w3", "Write", { file_path: "/w/re.ts", content: "a\nb\n" }),
+    ]);
+    const f = files[0]!;
+    expect(f.entries[0]?.added).toBe(2);
+    expect(f.entries[1]?.added).toBeNull();
+    expect(f.entries[2]?.previousContent).toBeUndefined();
+    expect(f.entries[2]?.added).toBe(2);
+    expect(f.entries[2]?.removed).toBe(0);
+  });
 });
 
 describe("解析缓存", () => {

@@ -74,6 +74,7 @@ import {
   writeAntigravityPromptState,
 } from './antigravityPromptState.js'
 import { antigravityProductToolInput, antigravityProductToolName, antigravityToolOutput } from './antigravityToolNormalize.js'
+import { AntigravityToolBackfiller, isBackfillableAntigravityFileTool } from './antigravityToolBackfill.js'
 import {
   AntigravitySwarmWatcher,
   buildDurableSwarmBoardInput,
@@ -258,6 +259,8 @@ interface TurnContext {
   swarmEventOrdinal: number | undefined
   swarmCommitted: boolean
   lastEmittedSwarmSnapshot: SwarmSnapshot | null
+  /** Incremental sideband reader for edit_file/write_file full diff arguments (OCV5-812). */
+  toolBackfiller: AntigravityToolBackfiller | null
   resolveSummary: (summary: TurnSummary | null) => void
   resolveDrain: (() => void) | null
 }
@@ -474,6 +477,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       swarmEventOrdinal: undefined,
       swarmCommitted: false,
       lastEmittedSwarmSnapshot: null,
+      toolBackfiller: null,
       resolveSummary,
       resolveDrain: null,
     }
@@ -677,6 +681,9 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     ctx.releaseRelayTrace = bindRouteTrace(route.routeToken, this.traceId)
     if (ctx.requestedConversationId) {
       this.ensureSwarmWatcher(ctx, ctx.requestedConversationId)
+      // Snapshot pre-spawn transcript_full.jsonl EOF before launching the resumed CLI (B2).
+      const backfiller = this.ensureToolBackfiller(ctx)
+      backfiller?.captureStartOffset()
     }
     this.spawnChild(ctx, { bin, args, env, cwd: cwdDecision.cwd, line })
   }
@@ -1130,6 +1137,24 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     return `agy-${conv}-${count(step.step_index)}`
   }
 
+  private ensureToolBackfiller(ctx: TurnContext): AntigravityToolBackfiller | null {
+    if (ctx.toolBackfiller) return ctx.toolBackfiller
+    if (ctx.terminal || ctx.abandoned || !ctx.projection) return null
+    const convId = ctx.conversationId ?? ctx.requestedConversationId
+    if (!convId || !CONVERSATION_ID_RE.test(convId)) return null
+    ctx.toolBackfiller = new AntigravityToolBackfiller({
+      brainDir: ctx.projection.sessionBrainDir,
+      conversationId: convId,
+    })
+    return ctx.toolBackfiller
+  }
+
+  private minOwnStepIndex(ctx: TurnContext): number {
+    if (ctx.firstOwnStepIndex !== null) return ctx.firstOwnStepIndex
+    const baseline = ctx.nativeBinding?.baseline
+    return typeof baseline === 'number' && Number.isSafeInteger(baseline) ? baseline + 1 : 0
+  }
+
   private handleToolStep(ctx: TurnContext, step: Record<string, unknown>, state: string): void {
     ctx.sawOutput = true
     ctx.trailingErrorStep = false
@@ -1138,19 +1163,32 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     const info = recordOf(step.tool_info) ?? {}
     const nativeName = asText(info.name) || asText(step.tool_name)
     const parameters = info.parameters ?? {}
+    const stepIndex = typeof step.step_index === 'number' && Number.isSafeInteger(step.step_index) && step.step_index >= 0
+      ? step.step_index
+      : null
     // Only this launch's first ACTIVE proves that local work started. Replayed
     // history, duplicate ACTIVE, unrelated stdout and keepalive cannot renew it.
     if (
       state === 'ACTIVE' && BOUNDED_FILE_TOOLS.has(nativeName) &&
-      ctx.firstOwnStepIndex !== null && typeof step.step_index === 'number' &&
-      Number.isSafeInteger(step.step_index) && step.step_index >= ctx.firstOwnStepIndex &&
+      ctx.firstOwnStepIndex !== null && stepIndex !== null && stepIndex >= ctx.firstOwnStepIndex &&
       !ctx.tools.get(id)?.completed && !ctx.boundedFileToolStartedAt.has(id)
     ) {
       ctx.boundedFileToolStartedAt.set(id, Date.now())
     }
     if (!ctx.tools.has(id)) {
       const toolName = antigravityProductToolName(nativeName, parameters)
-      const inputJson = antigravityProductToolInput(nativeName, parameters)
+      let inputJson = antigravityProductToolInput(nativeName, parameters)
+      if (isBackfillableAntigravityFileTool(nativeName)) {
+        const backfiller = this.ensureToolBackfiller(ctx)
+        const filled = backfiller?.tryBackfill({
+          toolUseId: id,
+          nativeName,
+          productInput: inputJson,
+          stepIndex,
+          minStepIndex: this.minOwnStepIndex(ctx),
+        })
+        if (filled) inputJson = filled
+      }
       const tool: TurnToolEntry = {
         toolUseId: id,
         blockId: id,
@@ -1193,6 +1231,32 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     if (state !== 'DONE' && state !== 'ERROR') return
     const tool = ctx.tools.get(id)!
     if (tool.completed) return
+    // Retry backfill once at completion in case transcript_full.jsonl flushed after ACTIVE.
+    if (isBackfillableAntigravityFileTool(nativeName)) {
+      const backfiller = this.ensureToolBackfiller(ctx)
+      const filled = backfiller?.tryBackfill({
+        toolUseId: id,
+        nativeName,
+        productInput: tool.inputJson,
+        stepIndex,
+        minStepIndex: this.minOwnStepIndex(ctx),
+      })
+      if (filled) {
+        tool.inputJson = structuredClone(filled)
+        tool.inputPreview = asText(filled).slice(0, 500)
+        ctx.params.onEvent({
+          kind: 'block',
+          block: {
+            kind: 'tool_use',
+            blockId: id,
+            toolName: tool.toolName,
+            inputJson: structuredClone(filled),
+            inputPreview: tool.inputPreview,
+            partial: false,
+          },
+        })
+      }
+    }
     const error = recordOf(info.error)
     const isError = state === 'ERROR' || error !== null
     const raw = antigravityToolOutput(info.output, nativeName)
@@ -1485,6 +1549,8 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
 
   private cleanupLaunch(ctx: TurnContext, opts?: { persistSummaryCache?: boolean }): void {
     this.stopSwarmWatcher(ctx)
+    ctx.toolBackfiller?.dispose()
+    ctx.toolBackfiller = null
     // Every caller is the end of the turn's process, so its relay requests stop naming this turn too.
     ctx.releaseRelayTrace?.()
     ctx.releaseRelayTrace = null

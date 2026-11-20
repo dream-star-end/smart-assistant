@@ -89,7 +89,6 @@ export function PhaseTimelineStrip({
               <Icon size={11} strokeWidth={2} aria-hidden className="oc-phase-pill-icon" />
               <span>{phase.shortLabel}</span>
               <span className="oc-phase-pill-count">{phase.stepCount}</span>
-              {duration ? <span className="oc-phase-pill-count">· {duration}</span> : null}
             </button>
           </Fragment>
         );
@@ -154,7 +153,6 @@ export function PhaseTimelineFilterBar({
               <Icon size={11} strokeWidth={2} aria-hidden className="oc-phase-pill-icon" />
               <span>{phase.shortLabel}</span>
               <span className="oc-phase-pill-count">{phase.stepCount}</span>
-              {duration ? <span className="oc-phase-pill-count">· {duration}</span> : null}
             </button>
           );
         })}

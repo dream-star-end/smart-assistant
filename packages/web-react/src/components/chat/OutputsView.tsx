@@ -382,7 +382,9 @@ function FileHero({
                 ? "内容来自会话记录"
                 : "容器里的当前文件"}
         </span>
-        {change && !change.hasError && <LineCounts added={change.added} removed={change.removed} />}
+        {change && !change.hasError && change.hasCounts !== false && (
+          <LineCounts added={change.added} removed={change.removed} />
+        )}
         {!usesRichBar && (
           <button
             type="button"
@@ -594,7 +596,9 @@ function OtherOutputs({
                     <span className="flex shrink-0 items-center gap-2 text-meta">
                       {f.change?.running && <Spinner size={12} className="text-accent" />}
                       {f.change?.hasError && <span className="text-danger">有失败</span>}
-                      {f.change && <LineCounts added={f.change.added} removed={f.change.removed} />}
+                      {f.change && f.change.hasCounts !== false && (
+                        <LineCounts added={f.change.added} removed={f.change.removed} />
+                      )}
                     </span>
                   </button>
                 </li>

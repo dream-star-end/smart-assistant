@@ -34,6 +34,12 @@ describe("classifyMessagePhase", () => {
     expect(classifyMessagePhase(msg("2", "tool", { toolName: "Bash", inputJson: { command: "npx tsc --noEmit" } }))).toBe("verify");
     expect(classifyMessagePhase(msg("3", "tool", { toolName: "Bash", inputJson: { command: "oc-browser screenshot" } }))).toBe("verify");
     expect(classifyMessagePhase(msg("4", "tool", { toolName: "mcp__browser__browser_snapshot" }))).toBe("verify");
+    expect(
+      classifyMessagePhase(msg("5", "tool", { toolName: "mcp__openclaude-memory__oc_bash", inputJson: { command: "vitest run" } })),
+    ).toBe("verify");
+    expect(
+      classifyMessagePhase(msg("6", "tool", { toolName: "mcp__openclaude-memory__oc_grep", inputJson: { pattern: "foo" } })),
+    ).toBe("explore");
   });
 
   test("classifies collab tools (agent-group, delegate, swarm, Task)", () => {
@@ -106,7 +112,7 @@ describe("buildPhaseTimeline", () => {
       planCount: 0,
     });
 
-    expect(timeline.summaryText).toContain("检索探索 → 编辑产物 → 命令验证 → 多代理协作");
+    expect(timeline.summaryText).toContain("探索 → 编辑 → 验证 → 协作");
     expect(timeline.summaryText).toContain("检索 2 次");
     expect(timeline.summaryText).toContain("改动 2 个文件");
     expect(timeline.summaryText).toContain("执行 2 条命令");

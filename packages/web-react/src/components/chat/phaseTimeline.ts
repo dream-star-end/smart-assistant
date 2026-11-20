@@ -26,11 +26,11 @@ export interface PhaseDefinition {
 }
 
 export const PHASE_DEFINITIONS: Readonly<Record<PhaseKind, PhaseDefinition>> = {
-  explore: { kind: "explore", label: "检索探索", shortLabel: "检索探索" },
-  edit: { kind: "edit", label: "代码与产物编辑", shortLabel: "编辑产物" },
-  verify: { kind: "verify", label: "命令与验证", shortLabel: "命令验证" },
-  collab: { kind: "collab", label: "多代理协作", shortLabel: "多代理协作" },
-  plan: { kind: "plan", label: "思考与规划", shortLabel: "思考规划" },
+  explore: { kind: "explore", label: "检索探索", shortLabel: "探索" },
+  edit: { kind: "edit", label: "代码与产物编辑", shortLabel: "编辑" },
+  verify: { kind: "verify", label: "命令与验证", shortLabel: "验证" },
+  collab: { kind: "collab", label: "多代理协作", shortLabel: "协作" },
+  plan: { kind: "plan", label: "思考与规划", shortLabel: "思考" },
 };
 
 export interface PhaseMetrics {
@@ -78,7 +78,7 @@ export interface PhaseTimelineData {
   showFilterBar: boolean;
 }
 
-const SHELL_TOOLS = new Set(["bash", "shell", "run_terminal_command", "run_terminal_cmd", "run_command"]);
+const SHELL_TOOLS = new Set(["bash", "shell", "run_terminal_command", "run_terminal_cmd", "run_command", "oc_bash"]);
 const CAT_WRITE_RE = /(?:^|[^0-9&<>])>>?\s*[^\s&|>]/;
 
 const COLLAB_TOOL_TOKENS = new Set([
@@ -165,7 +165,9 @@ const EXPLORE_TOOL_TOKENS = new Set([
   "view_code_item",
   "grep",
   "grep_search",
+  "oc_grep",
   "glob",
+  "oc_glob",
   "glob_file_search",
   "globfilesearch",
   "find_by_name",
@@ -344,7 +346,7 @@ export function classifyMessagePhase(message: ChatMessage): PhaseKind | null {
   ) {
     return "explore";
   }
-  if (cli === "oc-memory" || server === "openclaude-memory") {
+  if (cli === "oc-memory" || (server === "openclaude-memory" && !SHELL_TOOLS.has(token))) {
     return "explore";
   }
   if (SHELL_TOOLS.has(token)) {
