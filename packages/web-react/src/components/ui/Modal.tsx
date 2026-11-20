@@ -153,7 +153,7 @@ export function Modal({
   return (
     <RD.Root open={open} onOpenChange={onOpenChange}>
       <RD.Portal>
-        <RD.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade" />
+        <RD.Overlay className="fixed inset-0 z-50 bg-black/35 backdrop-blur-sm data-[state=open]:animate-fade" />
         <RD.Content
           {...(hasDescription ? {} : { "aria-describedby": undefined })}
           {...(dataProductFeature
@@ -166,6 +166,12 @@ export function Modal({
           onFocusCapture={revealFocusedElement}
           className={cn(modalContentVariants({ size, fixedHeight, mobile }), className)}
         >
+          {mobile === "sheet" && (
+            <div
+              aria-hidden
+              className="mx-auto mt-2.5 h-1 w-10 shrink-0 rounded-full bg-border-strong/80 md:hidden"
+            />
+          )}
           {title ? (
             <div
               className={cn(

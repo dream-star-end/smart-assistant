@@ -1,0 +1,18 @@
+/* OCV5-820: ModelSelector BottomSheet & Popover responsive height contracts.
+   Unlayered rules intentionally override primitive max-h utility classes and keep
+   explicit vh fallbacks before dvh for older WebViews (cn/tailwind-merge would
+   otherwise deduplicate two max-h-[...] utilities). */
+.model-picker-sheet.model-picker-sheet {
+  max-height: 82vh;
+  max-height: min(82dvh, calc(100% - env(safe-area-inset-bottom, 0px)));
+}
+
+.model-picker-sheet-short.model-picker-sheet-short {
+  max-height: 92vh;
+  max-height: min(92dvh, calc(100% - env(safe-area-inset-bottom, 0px)));
+}
+
+.model-picker-popover {
+  max-height: min(80vh, var(--radix-dropdown-menu-content-available-height, 80vh));
+  max-height: min(80dvh, var(--radix-dropdown-menu-content-available-height, 80dvh));
+}

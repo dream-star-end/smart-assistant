@@ -344,4 +344,64 @@ describe("InspectorPanel 端到端集成（产物分类汇总筛选 + 批注透�
     );
     expect(screen.getByTestId("deliverable-slides")).toBeInTheDocument();
   });
+
+  test("2-Bar 沉浸阅读器：Slides/文档无顶部重复工具条与重复批注按钮，隐藏 /api/media 长路径，移动紧凑态目录默认折叠", async () => {
+    const SLIDES = "---\nmarp: true\n---\n# 封面页\n内容\n---\n## 第二页\n细节";
+    render(
+      <ToastProvider>
+        <DeliverableRichPreview path="/api/media/sha256deadbeef" name="deck.md" text={SLIDES} />
+      </ToastProvider>,
+    );
+
+    // Slides 仅保留底部唯一操作栏，不再渲染顶部 deliverable-action-bar，也不暴露 /api/media 长路径
+    expect(screen.queryByTestId("deliverable-action-bar")).toBeNull();
+    expect(screen.queryByTestId("deliverable-annotate-trigger")).toBeNull();
+    expect(screen.queryByText(/\/api\/media\/sha256deadbeef/)).toBeNull();
+    const bottomBar = screen.getByTestId("workbench-bottom-bar");
+    const slideAnnotate = within(bottomBar).getByTestId("slide-annotate-current");
+    expect(slideAnnotate).toHaveTextContent("批注修改");
+    fireEvent.click(slideAnnotate);
+    expect(screen.getByTestId("deliverable-annotate-anchor")).toHaveTextContent("第 1 页（封面页）");
+
+    // 二进制 Office 在 showActionBar=true 时不出现重复批注按钮，也不暴露 /api/media 路径
+    cleanup();
+    render(
+      <ToastProvider>
+        <DeliverableRichPreview path="/api/media/sha256pptx" name="q4.pptx" />
+      </ToastProvider>,
+    );
+    expect(screen.getAllByRole("button", { name: /批注/ })).toHaveLength(1);
+    expect(screen.queryByText(/\/api\/media\/sha256pptx/)).toBeNull();
+
+    // 移动端紧凑视口（<640px）：长文档默认折叠目录让正文首屏直达，点底部目录按钮展开
+    cleanup();
+    const origMatchMedia = window.matchMedia;
+    window.matchMedia = vi.fn().mockImplementation((q: string) => ({
+      matches: q.includes("max-width: 639"),
+      media: q,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })) as unknown as typeof window.matchMedia;
+    try {
+      render(
+        <ToastProvider>
+          <DeliverableRichPreview
+            path="/w/mobile-doc.md"
+            text={"# 总览\n\n正文\n\n## 第一节\n细节\n\n## 第二节\n总结"}
+          />
+        </ToastProvider>,
+      );
+      expect(screen.queryByTestId("deliverable-action-bar")).toBeNull();
+      expect(screen.queryByTestId("doc-outline-list")).toBeNull();
+      const docBar = screen.getByTestId("workbench-bottom-bar");
+      fireEvent.click(within(docBar).getByTestId("doc-outline-toggle"));
+      expect(screen.getByTestId("doc-outline-list")).toBeInTheDocument();
+    } finally {
+      window.matchMedia = origMatchMedia;
+    }
+  });
 });

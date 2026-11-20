@@ -35,14 +35,57 @@ describe("Composer 两行式布局", () => {
     }
     // 工具行在输入行之后(视觉上位于下方)。
     expect(inputRow.compareDocumentPosition(toolRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    // 仓库入口:sm+ 在工具行(hidden sm:flex),<sm 在外壳下方底栏(sm:hidden)—— 390px 生成中 5 个 44px 按钮
-    // 加不可截断的未绑定 pill 会撑爆一行。
-    const pills = screen.getAllByRole("button", { name: "关联 GitHub 仓库" });
-    expect(pills).toHaveLength(2);
+    // 已彻底消灭 <640px 独立底部悬浮废行 composer-repo-slot-mobile。
+    expect(screen.queryByTestId("composer-repo-slot-mobile")).toBeNull();
+    // 未绑定仓库且无项目时：顶部微上下文条不占位；桌面 sm+ 工具行保留无框轻量入口，移动端收敛进「+」菜单。
+    expect(screen.queryByTestId("composer-context-bar")).toBeNull();
+    expect(screen.getAllByRole("button", { name: "关联 GitHub 仓库" })).toHaveLength(1);
     expect(screen.getByTestId("composer-repo-slot")).toHaveClass("hidden", "sm:flex");
     expect(toolRow).toContainElement(screen.getByTestId("composer-repo-slot"));
-    expect(screen.getByTestId("composer-repo-slot-mobile")).toHaveClass("sm:hidden");
-    expect(toolRow).not.toContainElement(screen.getByTestId("composer-repo-slot-mobile"));
+    // 守住 <768px 16px (text-base) 防 iOS 缩放红线。
+    expect(textarea).toHaveClass("text-base", "md:text-sm");
+  });
+
+  test("已绑定仓库或项目时在卡片顶部微上下文条展示紧凑 chips，且未绑定仓库可通过「+」菜单触发", () => {
+    const onOpenRepo = vi.fn();
+    const { rerender } = render(
+      <Composer
+        onSend={() => {}}
+        onOpenRepo={onOpenRepo}
+        onSetGoal={vi.fn()}
+        onGoalAction={vi.fn()}
+      />,
+    );
+    const plusBtn = screen.getByRole("button", { name: "更多选项" });
+    fireEvent.pointerDown(plusBtn, { button: 0, pointerType: "mouse" });
+    fireEvent.click(plusBtn);
+    const menuRepo = screen.getByTestId("composer-menu-repo");
+    expect(menuRepo).toHaveTextContent("关联 GitHub 仓库");
+    fireEvent.click(menuRepo);
+    expect(onOpenRepo).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <Composer
+        onSend={() => {}}
+        onOpenRepo={onOpenRepo}
+        repoSelection={{
+          selected: true,
+          owner: "acme",
+          repo: "openclaude",
+          branch: "main",
+          status: "ready",
+          selection_version: 1,
+        }}
+        projectSlot={<span data-testid="fake-project">项目 A</span>}
+      />,
+    );
+    const contextBar = screen.getByTestId("composer-context-bar");
+    const shell = screen.getByTestId("composer-shell");
+    expect(shell).toContainElement(contextBar);
+    expect(contextBar).toContainElement(screen.getByTestId("fake-project"));
+    expect(contextBar).toContainElement(screen.getByTestId("composer-repo-slot"));
+    expect(screen.getByTestId("composer-tool-row")).not.toContainElement(screen.getByTestId("composer-repo-slot"));
+    expect(screen.queryByTestId("composer-repo-slot-mobile")).toBeNull();
   });
 
   test("品牌名来自 lib/brand,不写死(M-16)", () => {

@@ -21,16 +21,13 @@ const sheetVariants = cva(
   {
     variants: {
       side: {
-        left: "inset-y-0 left-0 w-[19rem] max-w-[84vw] pl-[env(safe-area-inset-left)] pt-[env(safe-area-inset-top)] [--oc-sheet-safe-t:0px] data-[state=open]:oc-sheet-in-left data-[state=closed]:oc-sheet-out-left",
+        left: "inset-y-0 left-0 w-[19rem] max-w-[84vw] border-r border-border pl-[env(safe-area-inset-left)] pt-[env(safe-area-inset-top)] [--oc-sheet-safe-t:0px] data-[state=open]:oc-sheet-in-left data-[state=closed]:oc-sheet-out-left",
         right:
-          "inset-y-0 right-0 w-[19rem] max-w-[84vw] pr-[env(safe-area-inset-right)] pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] [--oc-sheet-safe-t:0px] data-[state=open]:oc-sheet-in-right data-[state=closed]:oc-sheet-out-right",
-        // 贴底:高度按内容自适应到 85dvh 封顶(dvh 收口移动端动态工具栏);底部补安全区,
-        // 否则 Home 指示条会压住最后一行操作。底色取 elevated —— 贴底抽屉是浮在正文之上的
-        // 临时面板,不是侧栏那种常驻导航面。
-        // overflow-y-auto:内容超过 85dvh 时原语自己兜底可滚(shell 审计 S-17)—— 调用方若
-        // 自带 `min-h-0 flex-1 overflow-y-auto` 的滚动容器,外层不会溢出,不会叠出双滚动条。
+          "inset-y-0 right-0 w-[19rem] max-w-[84vw] border-l border-border pr-[env(safe-area-inset-right)] pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] [--oc-sheet-safe-t:0px] data-[state=open]:oc-sheet-in-right data-[state=closed]:oc-sheet-out-right",
+        // 贴底:高度按内容自适应到 85dvh 封顶(dvh 收口移动端动态工具栏);顶部圆角 22px(--radius-2xl),
+        // 底部补安全区,底色取 elevated + 细发丝顶边区分浮层与画布。
         bottom:
-          "inset-x-0 bottom-0 max-h-[85dvh] w-full overflow-y-auto overscroll-contain rounded-t-2xl bg-elevated pb-[env(safe-area-inset-bottom)] data-[state=open]:oc-sheet-in-bottom data-[state=closed]:oc-sheet-out-bottom",
+          "inset-x-0 bottom-0 max-h-[85dvh] w-full overflow-y-auto overscroll-contain rounded-t-2xl border-t border-border bg-elevated pb-[env(safe-area-inset-bottom)] data-[state=open]:oc-sheet-in-bottom data-[state=closed]:oc-sheet-out-bottom",
       },
     },
     defaultVariants: { side: "left" },
@@ -74,7 +71,7 @@ export function Sheet({
       <RD.Portal>
         <RD.Overlay
           className={cn(
-            "fixed inset-0 z-40 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade",
+            "fixed inset-0 z-40 bg-black/35 backdrop-blur-sm data-[state=open]:animate-fade",
             overlayClassName,
           )}
         />
@@ -107,7 +104,7 @@ export function Sheet({
             // 否则用户只会去找关闭按钮。aria-hidden —— 它对辅助技术没有信息量。
             <div
               aria-hidden
-              className="mx-auto mt-2 h-1 w-9 shrink-0 rounded-full bg-border-strong"
+              className="mx-auto mb-0.5 mt-2.5 h-1 w-10 shrink-0 rounded-full bg-border-strong/80"
             />
           )}
           {children}

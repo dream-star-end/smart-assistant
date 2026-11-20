@@ -3664,6 +3664,10 @@ describe("主时间线回到底部 FAB", () => {
     expect(btn).toHaveAttribute("aria-label", "回到底部");
     expect(btn).toHaveAttribute("tabindex", "0");
     expect(btn.className).not.toContain("pointer-events-none");
+    expect(btn.className).toContain("bg-elevated/90");
+    expect(btn.className).toContain("border-border-control");
+    expect(btn.className).toContain("backdrop-blur-md");
+    expect(btn.className).not.toContain("bg-fg");
     expect(screen.getByTestId("scroll-to-bottom-dock")).toHaveAttribute("data-visible", "true");
     jumpToBottom.mockClear();
     fireEvent.click(btn);

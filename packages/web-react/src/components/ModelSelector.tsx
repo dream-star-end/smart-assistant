@@ -9,7 +9,7 @@ import {
 } from '@openclaude/protocol/browser'
 import { AlertTriangle, ChevronDown, Cpu, Loader2, Users } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useNarrowViewport } from '../hooks/useMdViewport'
+import { useShortViewport, useViewportClass } from '../hooks/useMdViewport'
 import {
   GROK_BUILD_MODEL_ID,
   cursorPickerDef,
@@ -226,7 +226,9 @@ export function ModelSelector({
     return parts.length > 0 ? parts.join(' · ') : null
   })()
   const disabled = Boolean(loading || teamEngineActive || (models.length === 0 && lockedModels.length === 0))
-  const narrow = useNarrowViewport()
+  const viewportClass = useViewportClass()
+  const shortViewport = useShortViewport()
+  const useSheet = viewportClass === 'compact' || shortViewport
   const [uncontrolledSheetOpen, setUncontrolledSheetOpen] = useState(false)
   const sheetOpen = teamEngineActive ? false : (open ?? uncontrolledSheetOpen)
   const [everOpened, setEverOpened] = useState(Boolean(open))
@@ -255,14 +257,14 @@ export function ModelSelector({
       disabled={disabled}
       aria-label="选择对话模型"
       aria-haspopup="menu"
-      aria-expanded={narrow ? sheetOpen : undefined}
+      aria-expanded={useSheet ? sheetOpen : undefined}
       onPointerEnter={() => {
         void preloadModelSelectorPanel().catch(() => {})
       }}
       onFocus={() => {
         void preloadModelSelectorPanel().catch(() => {})
       }}
-      onClick={narrow && !disabled ? () => setSheetOpen(true) : undefined}
+      onClick={useSheet && !disabled ? () => setSheetOpen(true) : undefined}
       title={
         loading && selected
           ? '正在切换模型，请稍候'
@@ -275,7 +277,7 @@ export function ModelSelector({
       aria-busy={loading || undefined}
       data-degraded={selectedDegraded && !teamEngineActive ? 'true' : undefined}
       className={cn(
-        'flex min-h-11 min-w-0 max-w-full items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-section font-medium text-muted outline-none transition-colors',
+        'flex min-h-10 min-w-0 max-w-full items-center gap-1.5 rounded-full border border-border/70 bg-surface/80 px-2.5 py-1 text-section font-medium text-fg outline-none transition-colors sm:min-h-11 sm:rounded-xl sm:border-transparent sm:bg-transparent sm:py-1.5 sm:text-muted',
         'hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]',
         'disabled:pointer-events-none disabled:opacity-50',
         teamEngineActive && 'text-accent hover:text-accent disabled:opacity-100',
@@ -291,7 +293,7 @@ export function ModelSelector({
       ) : teamEngineActive ? (
         <Users size={14} className="shrink-0 text-accent" />
       ) : (
-        <Cpu size={14} className="shrink-0 text-faint" />
+        <Cpu size={14} className="hidden shrink-0 text-faint sm:block" />
       )}
       {teamEngineActive && <span className="hidden sm:inline">{'队长引擎 · '}</span>}
       {selectedDegraded && !teamEngineActive && (
@@ -302,7 +304,7 @@ export function ModelSelector({
           data-testid="model-trigger-degraded"
         />
       )}
-      <span className="min-w-0 truncate sm:max-w-[180px]">{label}</span>
+      <span className="min-w-0 truncate sm:max-w-[220px] lg:max-w-[260px]">{label}</span>
       {loading && selected && !teamEngineActive ? (
         <span className="shrink-0 text-faint" data-testid="model-trigger-loading">
           · 切换中…
@@ -348,11 +350,13 @@ export function ModelSelector({
     onSelectServiceTier,
     label,
     tierLabel,
+    shortViewport,
+    effectiveMultiplier: triggerCostMultiplier,
   }
 
   return (
     <>
-      {narrow ? (
+      {useSheet ? (
         <>
           {triggerButton}
           {everOpened && <LazyModelSelectorPanel mode="sheet" {...panelProps} />}

@@ -1,4 +1,3 @@
-import * as Dialog from "@radix-ui/react-dialog";
 import { MAX_ATTACHMENTS_PER_MESSAGE, MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_TOTAL_BYTES, attachmentTotalLimitMessage, uploadFailureCanContinue, uploadFileLimitMessage } from "@openclaude/protocol/browser";
 import type { MessageReplyQuote } from "@openclaude/protocol/browser";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
@@ -9,7 +8,6 @@ import {
   Loader2,
   Mic,
   Paperclip,
-  Plus,
   Square,
   Target,
   X,
@@ -26,7 +24,7 @@ import {
   type ReactNode,
   type SetStateAction,
 } from "react";
-import { useVoiceInput } from "../hooks/useVoiceInput";
+import type { VoiceState } from "../hooks/useVoiceInput";
 import { useComposerDraft } from "../hooks/useComposerDraft";
 import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
@@ -42,12 +40,9 @@ import {DialogFallback} from './DialogFallback';
 import type { MediaRef } from "../lib/chat/frames";
 import type { RepoSelection } from "../lib/types";
 import { cn } from "../lib/utils";
+import { ComposerPlusMenu } from "./ComposerPlusMenu";
 import { RepoPill } from "./github/RepoPill";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
   IconButton,
   iconButtonVariants,
   StatusPill,
@@ -87,6 +82,27 @@ const NoPrediction: typeof import("./ComposerPrediction").default = () => null;
 const GoalDialog=lazy(()=>import('./GoalDialog').then(module=>({default:module.GoalDialog})));
 const AttachChip = lazy(() => import("./ComposerAttachChip").then((module) => ({ default: module.AttachChip })));
 const ComposerPrediction = lazy(() => import("./ComposerPrediction").catch(() => ({ default: NoPrediction })));
+const ComposerImageLightbox = lazy(() => import("./ComposerImageLightbox"));
+const ComposerVoiceController = lazy(() => import("./ComposerVoiceController"));
+
+function isVoiceRecordingSupported(): boolean {
+  if (
+    typeof window === "undefined" ||
+    !navigator.mediaDevices?.getUserMedia ||
+    typeof window.MediaRecorder === "undefined" ||
+    typeof window.WebSocket === "undefined"
+  ) {
+    return false;
+  }
+  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
+  return candidates.some((t) => {
+    try {
+      return MediaRecorder.isTypeSupported(t);
+    } catch {
+      return false;
+    }
+  });
+}
 
 // 已经盖进输入框的预填(按对象认,跨卸载重挂保留;见预填 effect)。
 export type ComposerPrefill = { text: string; nonce: number; mode?: "replace" | "append" };
@@ -479,10 +495,12 @@ export function Composer({
     },
     [],
   );
-  const voice = useVoiceInput({ getToken: getVoiceToken, onText: onVoiceText, onError: onVoiceErr });
-  const voiceEnabled = voice.supported && !!getVoiceToken;
+  const [voiceState, setVoiceState] = useState<VoiceState>("idle");
+  const [voiceToggleNonce, setVoiceToggleNonce] = useState(0);
+  const voiceSupported = isVoiceRecordingSupported();
+  const voiceEnabled = voiceSupported && !!getVoiceToken;
   // 不可用原因要说得出来(C-20):触屏没有 hover title,灰掉的麦克风等于没解释。
-  const voiceUnavailableReason = !voice.supported
+  const voiceUnavailableReason = !voiceSupported
     ? "当前浏览器不支持语音输入，请用 HTTPS 打开并允许使用麦克风"
     : !getVoiceToken
       ? "语音输入需登录后在正式会话中使用"
@@ -497,7 +515,7 @@ export function Composer({
       voiceMsgTimerRef.current = null;
     }
     setVoiceMsg(null);
-    voice.toggle();
+    setVoiceToggleNonce((n) => n + 1);
   };
 
   useEffect(() => {
@@ -528,11 +546,9 @@ export function Composer({
   // 草稿超过 sessionStorage 上限后只留内存、刷新即丢,此前没有任何预警(C-21)。
   const draftVolatile = !!draftKey && draftExceedsStorage(value);
 
-  // 「+」菜单只保留目标(有 onSetGoal+onGoalAction)。附件已提到工具条一级回形针。
-  // 无目标时(如 demo)退化为禁用的「+」按钮,保留原视觉锚点而不弹空菜单。
   const canAttach = !!onUpload;
   const canGoal = !!onSetGoal && !!onGoalAction;
-  const hasPlusMenu = canGoal;
+  const hasBoundRepo = Boolean(onOpenRepo && repoSelection?.selected);
   const visibleGoal = visibleGoalOf(goal);
 
   const removeAttach = useCallback(
@@ -754,11 +770,11 @@ export function Composer({
   const voiceStatus =
     voiceMsg != null ? (
       <span className="text-danger">{voiceMsg}</span>
-    ) : voice.state === "recording" ? (
+    ) : voiceState === "recording" ? (
       <span className="text-danger">● 正在录音，点击麦克风停止</span>
-    ) : voice.state === "connecting" ? (
+    ) : voiceState === "connecting" ? (
       <span className="text-faint">正在打开麦克风…</span>
-    ) : voice.state === "transcribing" ? (
+    ) : voiceState === "transcribing" ? (
       <span className="text-faint">正在转写…</span>
     ) : null;
 
@@ -818,12 +834,8 @@ export function Composer({
       <div
         data-testid="composer-shell"
         className={cn(
-          // OCV5-295:外壳减负 —— 20px 圆角 + 轻阴影 --shadow-soft(原 26px + --shadow-float 浮层阴影)。
-          "rounded-[20px] border border-border-control bg-surface shadow-[var(--shadow-soft)] transition-all",
-          "focus-within:border-border-strong",
-          // OCV5-307:聚焦时只"浮起一点"——比 soft 略深的投影 + 极淡强调色光晕,不再只是边框变浅。
-          // 刻意不用 --shadow-float(OCV5-295 已把外壳从浮层阴影降下来,测试锁定)。
-          "focus-within:shadow-[0_1px_2px_rgba(0,0,0,0.05),0_6px_22px_rgba(0,0,0,0.08)] focus-within:ring-4 focus-within:ring-accent/[0.06]",
+          "rounded-[18px] border border-border-control bg-surface shadow-[var(--shadow-soft)] transition-all",
+          "focus-within:border-border-strong focus-within:shadow-[0_1px_2px_rgba(0,0,0,0.04),0_4px_16px_rgba(0,0,0,0.06)] focus-within:ring-[3px] focus-within:ring-accent/[0.08]",
           dragActive && "ring-2 ring-ring",
         )}
         onDragEnter={(e) => {
@@ -888,9 +900,27 @@ export function Composer({
             </IconButton>
           </div>
         )}
+        {/* 按需微上下文条：仅当存在项目或已绑定 GitHub 仓库时显现（empty:hidden 零空占位）。 */}
+        {(hasBoundRepo || projectSlot) && (
+          <div
+            data-testid="composer-context-bar"
+            className="flex flex-wrap items-center gap-1.5 px-3.5 pt-2.5 empty:hidden"
+          >
+            {projectSlot && (
+              <span className="inline-flex min-w-0 max-w-full items-center empty:hidden" data-testid="composer-project-slot">
+                {projectSlot}
+              </span>
+            )}
+            {hasBoundRepo && onOpenRepo && (
+              <span className="inline-flex min-w-0 max-w-full items-center" data-testid="composer-repo-slot">
+                <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} compact />
+              </span>
+            )}
+          </div>
+        )}
         {/* 附件 chips */}
         {attachments.length > 0 && (
-          <div className="flex flex-wrap gap-2 px-3.5 pt-3">
+          <div className="flex flex-wrap gap-2 px-3.5 pt-2.5">
             <LazyBoundary fallback={attachments.map((a) => (
               <div key={a.id} aria-busy="true" className="flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1.5 text-meta">
                 <span className="max-w-[160px] truncate">{a.name}</span>
@@ -1049,7 +1079,7 @@ export function Composer({
               placeholder={value === "" && ghostRest ? "" : placeholder}
               className={cn(
                 "max-h-[240px] min-h-[24px] w-full flex-1 resize-none bg-transparent py-1.5 leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50",
-                fontSize === "large" ? "text-[17.5px]" : "text-[16px]",
+                fontSize === "large" ? "text-[17.5px]" : "text-base md:text-sm",
               )}
             />
             {ghostRest && (
@@ -1111,88 +1141,20 @@ export function Composer({
                 <Paperclip size={18} />
               </label>
             )}
-            {/* 「+」选项菜单:仅「设定目标」(附件已提到一级回形针)。
-                菜单在移动端同样以触屏打开,DropdownMenu 原语已含 py-2 触控目标与向上翻转;
-                无目标时(demo)退化为禁用按钮,不弹空菜单。 */}
-            {hasPlusMenu ? (
-              <DropdownMenu open={plusMenuOpen} onOpenChange={setPlusMenuOpen}>
-                <DropdownMenuTrigger asChild>
-                  <IconButton
-                    data-product-feature={PRODUCT_CAPABILITIES.files.id}
-                    aria-label="更多选项"
-                    title="更多选项"
-                    disabled={disabled}
-                    className="relative"
-                  >
-                    <Plus size={20} />
-                    {/* 闭合态目标可见性:有活跃目标时在触发按钮右上角显小圆点,近预算转 warning 色,
-                        不点开菜单也能感知目标存在/临界(与菜单项内状态点同判定权威 goalNearBudget)。 */}
-                    {visibleGoal && (
-                      <span
-                        aria-hidden
-                        data-testid="composer-goal-dot"
-                        className={cn(
-                          "absolute right-1 top-1 size-1.5 rounded-full",
-                          goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent",
-                        )}
-                      />
-                    )}
-                  </IconButton>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="start" side="top">
-                  {canGoal && (
-                    <DropdownMenuItem
-                      data-product-feature={PRODUCT_CAPABILITIES.sessionGoal.id}
-                      onSelect={() => setGoalOpen(true)}
-                    >
-                      <Target size={16} className="shrink-0 text-muted" />
-                      <span className="flex-1">{visibleGoal ? "目标" : "设定目标"}</span>
-                      {visibleGoal && (
-                        <span
-                          aria-hidden
-                          className={cn(
-                            "size-1.5 shrink-0 rounded-full",
-                            goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent",
-                          )}
-                        />
-                      )}
-                    </DropdownMenuItem>
-                  )}
-                </DropdownMenuContent>
-              </DropdownMenu>
-            ) : (
-              <IconButton
-                data-product-feature={PRODUCT_CAPABILITIES.files.id}
-                aria-label="更多选项"
-                // 「+」菜单早已只剩「设定目标」(附件在一级回形针),禁用态文案跟着改,不再说「附件暂不可用」(C-15)。
-                title="会话目标暂不可用"
-                disabled
-                className="relative"
-              >
-                <Plus size={20} />
-                {visibleGoal && (
-                  <span
-                    aria-hidden
-                    data-testid="composer-goal-dot"
-                    className={cn(
-                      "absolute right-1 top-1 size-1.5 rounded-full",
-                      goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent",
-                    )}
-                  />
-                )}
-              </IconButton>
-            )}
-            {/* GitHub 仓库入口在 sm+ 并入工具行左侧(与附件/「+」同组,少一层视觉层级)。
-                390px 下 5 个 44px 按钮(含生成中的「排队发送」)加未绑定态不可截断的「关联 GitHub 仓库」会撑爆一行
-                (after 截图实测 pill 压在排队键上),窄屏仍放在外壳下方的底栏(见下)。 */}
-            {projectSlot && (
-              <span className="hidden min-w-0 items-center sm:flex" data-testid="composer-project-slot">
-                {projectSlot}
-              </span>
-            )}
-            {onOpenRepo && (
+            <ComposerPlusMenu
+              open={plusMenuOpen}
+              onOpenChange={setPlusMenuOpen}
+              disabled={disabled}
+              canGoal={canGoal}
+              visibleGoal={visibleGoal}
+              onOpenGoal={() => setGoalOpen(true)}
+              onOpenRepo={onOpenRepo}
+              repoSelection={repoSelection}
+            />
+            {/* 未绑定仓库时：移动端收纳在「+」菜单内，桌面 sm+ 保留无框轻量入口；已绑定则统一展示于顶部微上下文条。 */}
+            {onOpenRepo && !hasBoundRepo && (
               <span className="hidden min-w-0 items-center sm:flex" data-testid="composer-repo-slot">
-                <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />
+                <RepoPill selection={null} onClick={onOpenRepo} quiet />
               </span>
             )}
             {swarmSupported && onToggleSwarmMode && (
@@ -1290,20 +1252,20 @@ export function Composer({
               {/* 不支持/未登录时不再 disabled 灰掉了事(C-20):保持可聚焦可点,点了用 toast 说明原因。 */}
               <IconButton
                 data-product-feature={PRODUCT_CAPABILITIES.voice.id}
-                aria-label={voice.state === "recording" ? "停止录音" : "语音输入"}
-                title={voiceUnavailableReason ?? (voice.state === "recording" ? "停止录音" : "语音输入")}
+                aria-label={voiceState === "recording" ? "停止录音" : "语音输入"}
+                title={voiceUnavailableReason ?? (voiceState === "recording" ? "停止录音" : "语音输入")}
                 aria-disabled={voiceUnavailableReason ? true : undefined}
                 data-voice-unavailable={voiceUnavailableReason ? "true" : undefined}
-                disabled={disabled || voice.state === "transcribing"}
+                disabled={disabled || voiceState === "transcribing"}
                 onClick={onVoiceClick}
                 className={cn(
-                  voice.state === "recording" && "text-danger",
+                  voiceState === "recording" && "text-danger",
                   voiceUnavailableReason && "text-faint",
                 )}
               >
-                {voice.state === "transcribing" ? (
+                {voiceState === "transcribing" ? (
                   <Loader2 size={19} className="animate-spin" />
-                ) : voice.state === "recording" ? (
+                ) : voiceState === "recording" ? (
                   <Square size={16} className="fill-current" />
                 ) : (
                   <Mic size={19} />
@@ -1336,11 +1298,11 @@ export function Composer({
                 }}
                 disabled={stopping || (!canSend && !busy) || disabled}
                 className={cn(
-                  "flex size-9 shrink-0 items-center justify-center rounded-full transition-all [@media(hover:none)]:size-11",
+                  "flex size-9 shrink-0 items-center justify-center rounded-xl transition-all [@media(hover:none)]:size-11",
                   busy
-                    ? "bg-fg text-bg"
+                    ? "bg-primary text-primary-fg shadow-soft hover:opacity-90 active:scale-[0.97]"
                     : canSend
-                      ? "bg-primary text-primary-fg hover:opacity-90"
+                      ? "bg-primary text-primary-fg shadow-soft hover:opacity-90 active:scale-[0.97]"
                       : "bg-hover text-faint",
                 )}
               >
@@ -1357,16 +1319,6 @@ export function Composer({
         </div>
       </div>
       </div>
-      {/* 窄屏底栏:GitHub 仓库入口(sm+ 已并入工具行,这里只在 <sm 渲染)。 */}
-      {(onOpenRepo || projectSlot) && (
-        <div
-          className="flex min-h-[30px] min-w-0 items-center gap-2 px-1.5 py-1.5 sm:hidden"
-          data-testid="composer-repo-slot-mobile"
-        >
-          {projectSlot}
-          {onOpenRepo && <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />}
-        </div>
-      )}
       {/* 语音状态(录音/转写/错误)常驻 live region(C-19):容器随 voiceEnabled 常在、内容变化才被读屏播报;
           无内容时 sr-only 不占位。 */}
       {voiceEnabled && (
@@ -1382,34 +1334,23 @@ export function Composer({
         </output>
       )}
 
-      {/* 图片附件灯箱:点击缩略图看全图。 */}
-      <Dialog.Root open={!!preview} onOpenChange={(o) => !o && setPreview(null)}>
-        <Dialog.Portal>
-          <Dialog.Overlay className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm data-[state=open]:animate-fade" />
-          <Dialog.Content
-            aria-describedby={undefined}
-            className="fixed left-1/2 top-1/2 z-50 max-h-[90vh] max-w-[92vw] -translate-x-1/2 -translate-y-1/2 focus:outline-none"
-          >
-            <Dialog.Title className="sr-only">{preview?.name ?? "图片预览"}</Dialog.Title>
-            {preview && (
-              <img
-                src={preview.url}
-                alt={preview.name}
-                className="max-h-[90vh] max-w-[92vw] rounded-lg object-contain shadow-float"
-              />
-            )}
-            <Dialog.Close asChild>
-              <button
-                type="button"
-                aria-label="关闭预览"
-                className="absolute -right-2 -top-2 flex size-8 items-center justify-center rounded-full bg-surface text-fg shadow-float outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                <X size={16} />
-              </button>
-            </Dialog.Close>
-          </Dialog.Content>
-        </Dialog.Portal>
-      </Dialog.Root>
+      {voiceToggleNonce > 0 && (
+        <Suspense fallback={null}>
+          <ComposerVoiceController
+            toggleNonce={voiceToggleNonce}
+            getToken={getVoiceToken}
+            onText={onVoiceText}
+            onError={onVoiceErr}
+            onStateChange={setVoiceState}
+          />
+        </Suspense>
+      )}
+      {/* 图片附件灯箱:点击缩略图才按需加载，不进首屏包。 */}
+      {preview && (
+        <Suspense fallback={null}>
+          <ComposerImageLightbox preview={preview} onClose={() => setPreview(null)} />
+        </Suspense>
+      )}
 
       {/* 会话目标对话框:由「+」菜单里的目标项打开(入口自会话头部迁入,功能本身不变)。 */}
       {canGoal && onSetGoal && onGoalAction && goalOpen && (

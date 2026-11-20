@@ -1,52 +1,54 @@
 :root {
   color-scheme: light;
   font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
-  --accent: #6b57c8;
-  --accent-hover: #5c49b9;
-  --accent-pressed: #4e3da8;
-  --accent-soft: #f0edfb;
-  --canvas: #ffffff;
-  --appbar: rgba(255, 255, 255, 0.97);
-  --appbar-solid: #ffffff;
-  --sidebar-tint: #f7f8fa;
+  --accent: #a5421c;
+  --accent-fg: #ffffff;
+  --accent-hover: #8d3716;
+  --accent-pressed: #762d11;
+  --accent-soft: #f6ebe6;
+  --canvas: #faf9f6;
+  --appbar: rgba(250, 249, 246, 0.96);
+  --appbar-solid: #faf9f6;
+  --sidebar-tint: #f3f2ed;
   --surface: #ffffff;
-  --surface-subtle: #f7f8fa;
-  --surface-hover: #f0f1f3;
-  --surface-pressed: #e7e8ea;
-  --text: #1f2328;
-  --text-muted: #6b7280;
-  --text-faint: #6b7280;
-  --border: #e5e7eb;
-  --border-strong: #d5d8db;
-  --success: #178653;
-  --danger: #b32636;
-  --shadow: 0 12px 34px rgba(31, 35, 40, 0.1), 0 2px 8px rgba(31, 35, 40, 0.06);
-  --focus: #5469d4;
+  --surface-subtle: #f3f2ed;
+  --surface-hover: #eceae4;
+  --surface-pressed: #e3e0d8;
+  --text: #18181b;
+  --text-muted: #5c5a54;
+  --text-faint: #6a6760;
+  --border: rgba(28, 25, 23, 0.09);
+  --border-strong: rgba(28, 25, 23, 0.16);
+  --success: #156e42;
+  --danger: #b4232c;
+  --shadow: 0 12px 34px rgba(24, 24, 27, 0.1), 0 2px 8px rgba(24, 24, 27, 0.06);
+  --focus: #a5421c;
 }
 
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --accent: #b5a7f1;
-  --accent-hover: #c2b6f5;
-  --accent-pressed: #cec5f8;
-  --accent-soft: #35304a;
-  --canvas: #1d1e20;
-  --appbar: rgba(31, 32, 35, 0.97);
-  --appbar-solid: #1f2023;
-  --sidebar-tint: #20282b;
-  --surface: #25272a;
-  --surface-subtle: #2b2d31;
-  --surface-hover: #33363a;
-  --surface-pressed: #3b3e43;
-  --text: #f3f4f5;
-  --text-muted: #b7bcc1;
-  --text-faint: #8f969d;
-  --border: #373a3e;
-  --border-strong: #484c51;
-  --success: #68d49d;
-  --danger: #ff9aa7;
-  --shadow: 0 14px 40px rgba(0, 0, 0, 0.34), 0 2px 10px rgba(0, 0, 0, 0.2);
-  --focus: #b9c2ff;
+  --accent: #df7e59;
+  --accent-fg: #141416;
+  --accent-hover: #ea9473;
+  --accent-pressed: #f1a78a;
+  --accent-soft: rgba(223, 126, 89, 0.14);
+  --canvas: #141416;
+  --appbar: rgba(20, 20, 22, 0.96);
+  --appbar-solid: #141416;
+  --sidebar-tint: #1b1b1f;
+  --surface: #1b1b1f;
+  --surface-subtle: #222227;
+  --surface-hover: #29292f;
+  --surface-pressed: #32323a;
+  --text: #f2f0ec;
+  --text-muted: #9e9b95;
+  --text-faint: #8e8b85;
+  --border: rgba(242, 240, 236, 0.09);
+  --border-strong: rgba(242, 240, 236, 0.16);
+  --success: #42c282;
+  --danger: #f06e75;
+  --shadow: 0 14px 40px rgba(0, 0, 0, 0.36), 0 2px 10px rgba(0, 0, 0, 0.22);
+  --focus: #df7e59;
 }
 
 * {
@@ -293,7 +295,7 @@ button:focus-visible,
   height: 17px;
   padding: 0 5px;
   border-radius: 999px;
-  color: #fff;
+  color: var(--accent-fg);
   background: var(--accent);
   font-size: 10px;
   font-weight: 700;
@@ -775,6 +777,7 @@ body[data-shell-mode="downloads"] .downloads-layer {
   :root,
   :root[data-theme="dark"] {
     --accent: Highlight;
+    --accent-fg: HighlightText;
     --accent-hover: Highlight;
     --accent-pressed: Highlight;
     --accent-soft: Canvas;

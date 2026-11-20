@@ -25,10 +25,6 @@ import {
   ChevronRight,
   ChevronUp,
   Circle,
-  Copy,
-  FileDiff,
-  FilePen,
-  ListChecks,
   LoaderCircle,
   Maximize2,
   Minimize2,
@@ -93,7 +89,8 @@ import { resolveToolMeta, toolSummary } from "./tool/meta";
 import { parseShellEnvelope } from "./tool/shellEnvelope";
 import { resolveToolStatus } from "./tool/status";
 import { toneTileClass } from "./tool/tone";
-import { Badge, EmptyState, IconButton, Skeleton, Spinner, Tabs, useToast } from "./ui";
+import { Badge, EmptyState, IconButton, Skeleton, Spinner, Tabs } from "./ui";
+import { WorkbenchSheetContext } from "./chat/WorkbenchBottomBar";
 
 // 产出页(含主产物渲染)只在面板打开且停在产出时才需要:懒加载,不进首屏(first-screen-budget)。
 const OutputsView = lazy(() => import("./chat/OutputsView").then((m) => ({ default: m.OutputsView })));
@@ -285,18 +282,6 @@ const navButtonClass =
 
 const rowButtonClass =
   "flex w-full min-w-0 items-center gap-2.5 px-3 py-1.5 text-left outline-none transition-colors hover:bg-hover/70 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11";
-
-function baseName(path: string): string {
-  const parts = path.replace(/\\/g, "/").split("/").filter(Boolean);
-  return parts.at(-1) ?? path;
-}
-
-function dirName(path: string): string {
-  const norm = path.replace(/\\/g, "/");
-  const i = norm.lastIndexOf("/");
-  return i > 0 ? norm.slice(0, i) : "";
-}
-
 
 /** 一步的头部:类型图标 + 标签 + 状态 + 摘要 + 复制全文。 */
 function StepHeader({ message }: { message: ToolLike }) {
@@ -615,6 +600,7 @@ export function InspectorPanelContent({
   liveBrowserAgentId,
   liveBrowserAuth,
   fullscreen = false,
+  sheet = false,
   onToggleFullscreen,
   titleId,
 }: {
@@ -638,6 +624,8 @@ export function InspectorPanelContent({
   liveBrowserAuth?: AuthSession | null;
   /** 是否处于全屏/影院阅读模式。 */
   fullscreen?: boolean;
+  /** 是否渲染在移动端/平板端底部 Sheet 中（去掉多余顶部安全区并启用「2-Bar」紧凑阅读器）。 */
+  sheet?: boolean;
   /** 切换全屏/影院阅读模式。 */
   onToggleFullscreen?: () => void;
   titleId?: string;
@@ -884,9 +872,16 @@ export function InspectorPanelContent({
   ];
 
   return (
+    <WorkbenchSheetContext.Provider value={sheet}>
     <InspectorStopTurnContext.Provider value={onStopTurn}>
     <div className="flex min-h-0 flex-1 flex-col bg-surface" onKeyDown={onKeyDown} data-testid="detail-pane">
-      <header className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2 header-safe-t">
+      <header
+        data-testid="pane-header"
+        className={cn(
+          "flex min-h-12 shrink-0 items-center gap-1.5 border-b border-border bg-surface px-3 py-1.5",
+          (!sheet || fullscreen) && "header-safe-t",
+        )}
+      >
         <h2 id={headingId} className="sr-only">
           详情面板
         </h2>
@@ -897,16 +892,16 @@ export function InspectorPanelContent({
             items={tabItems}
             idBase={idBase}
             aria-label="详情面板分区"
+            className="[&_[role=tab]]:px-3 [&_[role=tab]]:py-1 [&_[role=tab]]:text-meta [@media(hover:none)]:[&_[role=tab]]:min-h-9"
           />
         </div>
         {onToggleFullscreen && (
           <IconButton
             aria-label={fullscreen ? "退出全屏阅读" : "全屏阅读"}
-            title={fullscreen ? "恢复到侧栏 (Esc)" : "全屏影院阅读"}
+            title={fullscreen ? "恢复默认高度 (Esc)" : "全屏沉浸阅读"}
             size="sm"
             shape="square"
             data-testid="pane-fullscreen-toggle"
-            className="[@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11"
             onClick={onToggleFullscreen}
           >
             {fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
@@ -1001,6 +996,7 @@ export function InspectorPanelContent({
       </div>
     </div>
     </InspectorStopTurnContext.Provider>
+    </WorkbenchSheetContext.Provider>
   );
 }
 
@@ -1046,7 +1042,7 @@ export function InspectorPanel({
 
   const configuredMax = widthMax ?? DETAIL_PANE_WIDTH.max;
   const effectiveMax =
-    viewportWidth >= 1100
+    viewportWidth >= 1024
       ? Math.min(configuredMax, computeDynamicPaneMaxWidth(viewportWidth))
       : configuredMax;
 

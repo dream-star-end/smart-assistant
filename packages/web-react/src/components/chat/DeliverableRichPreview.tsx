@@ -13,24 +13,19 @@ import {
   ArrowDown,
   ArrowUp,
   ArrowUpDown,
-  BookOpen,
   ChevronDown,
-  ChevronLeft,
-  ChevronRight,
   Copy,
   Download,
-  ExternalLink,
   FileSpreadsheet,
   FileText,
-  ListTree,
   MessageSquarePlus,
+  PencilLine,
   Presentation,
   Search,
-  Send,
   Sparkles,
-  X,
 } from "lucide-react";
-import { type KeyboardEvent as ReactKeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useViewportClass } from "../../hooks/useMdViewport";
 import { cn } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import {
@@ -48,17 +43,15 @@ import {
   type DeliverableMeta,
   type ParsedDeck,
   type ParsedTable,
-  buildAnnotationPrompt,
   classifyDeliverable,
   extractMarkdownOutline,
   filterAndSortTableRows,
-  formatAnchorLabel,
   parseDelimitedTable,
   parseMarkdownSlides,
   serializeCsvSlice,
 } from "./deliverablePreview";
 import { useFreshSignedUrl, useSignedDownload } from "./media";
-import { CopyIconButton } from "./paneParts";
+import { AnnotationComposer, FileOverflowMenu, WorkbenchBottomBar, useWorkbenchSheet } from "./WorkbenchBottomBar";
 import { baseName, displayDir } from "./workbench";
 import "./workbenchPreview.css";
 
@@ -129,48 +122,32 @@ function UnifiedActionBar({
   path,
   name,
   meta,
+  compact,
   annotateOpen,
   onToggleAnnotate,
 }: {
   path: string;
   name: string;
   meta: DeliverableMeta;
+  compact: boolean;
   annotateOpen: boolean;
   onToggleAnnotate: () => void;
 }) {
-  const isContainerFile = path.startsWith("/");
-  const { state: dlState, start: startDownload } = useSignedDownload(isContainerFile ? path : null, name);
-  const { get: getFreshUrl } = useFreshSignedUrl(isContainerFile ? path : null);
-  const toast = useToast();
-  const [opening, setOpening] = useState(false);
-
-  const openInNewWindow = async () => {
-    if (!isContainerFile) return;
-    setOpening(true);
-    try {
-      const url = await getFreshUrl();
-      if (!url) {
-        toast("暂时无法获取文件访问链接，请稍后再试", "error");
-        return;
-      }
-      window.open(url, "_blank", "noopener,noreferrer");
-    } finally {
-      setOpening(false);
-    }
-  };
-
   const dir = displayDir(path);
   const readablePath = dir ? `${dir}/${name}` : path;
+  const showPath = !compact && !path.startsWith("/api/media/");
 
   return (
     <div className="wb-action-bar" data-testid="deliverable-action-bar">
       <div className="wb-action-meta">
-        <Badge tone={badgeToneFor(meta)} size="sm" data-testid="deliverable-type-badge">
+        <Badge tone={badgeToneFor(meta)} size="sm" data-testid="deliverable-type-badge" className="shrink-0">
           {meta.label} · {meta.shortBadge}
         </Badge>
-        <span className="wb-action-path" title={path}>
-          {readablePath}
-        </span>
+        {showPath && (
+          <span className="wb-action-path hidden sm:inline" title={path}>
+            {readablePath}
+          </span>
+        )}
       </div>
       <div className="wb-action-controls">
         <Button
@@ -179,145 +156,12 @@ function UnifiedActionBar({
           variant={annotateOpen ? "accent" : "secondary"}
           onClick={onToggleAnnotate}
           data-testid="deliverable-annotate-trigger"
-          className="[@media(hover:none)]:min-h-11"
+          className="h-8 gap-1.5 px-2.5 text-meta whitespace-nowrap"
         >
-          <MessageSquarePlus size={13} aria-hidden />
-          批注让 Agent 修改
+          <PencilLine size={13} aria-hidden />
+          批注修改
         </Button>
-        <CopyIconButton getText={() => path} label="复制路径" doneText="已复制路径" />
-        {isContainerFile && (
-          <>
-            <IconButton
-              aria-label={`下载 ${name}`}
-              title="下载"
-              size="sm"
-              shape="square"
-              disabled={dlState.phase === "downloading"}
-              onClick={() => void startDownload()}
-            >
-              {dlState.phase === "downloading" ? <Spinner size={13} /> : <Download size={15} />}
-            </IconButton>
-            <IconButton
-              aria-label={`新窗口打开 ${name}`}
-              title="新窗口打开"
-              size="sm"
-              shape="square"
-              disabled={opening}
-              onClick={() => void openInNewWindow()}
-            >
-              {opening ? <Spinner size={13} /> : <ExternalLink size={15} />}
-            </IconButton>
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function AnnotationComposer({
-  filePath,
-  fileName,
-  category,
-  anchor,
-  excerpt,
-  hasComposerBridge,
-  onClearAnchor,
-  onClose,
-  onSubmitPrompt,
-}: {
-  filePath: string;
-  fileName: string;
-  category: DeliverableMeta["category"];
-  anchor: AnnotationAnchor;
-  excerpt?: string;
-  hasComposerBridge: boolean;
-  onClearAnchor: () => void;
-  onClose: () => void;
-  onSubmitPrompt: (prompt: string) => Promise<boolean>;
-}) {
-  const [comment, setComment] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-
-  const handleSubmit = async () => {
-    const trimmed = comment.trim();
-    if (!trimmed || submitting) return;
-    setSubmitting(true);
-    try {
-      const prompt = buildAnnotationPrompt({
-        filePath,
-        fileName,
-        category,
-        anchor,
-        comment: trimmed,
-        excerpt,
-      });
-      const ok = await onSubmitPrompt(prompt);
-      if (ok) {
-        setComment("");
-        onClose();
-      }
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const onKeyDown = (e: ReactKeyboardEvent<HTMLTextAreaElement>) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-      e.preventDefault();
-      void handleSubmit();
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      onClose();
-    }
-  };
-
-  return (
-    <div className="wb-annotate-box" data-testid="deliverable-annotate-box">
-      <div className="wb-annotate-header">
-        <span className="wb-anchor-chip" data-testid="deliverable-annotate-anchor">
-          定位：{formatAnchorLabel(anchor)}
-        </span>
-        {anchor.kind !== "file" && (
-          <button
-            type="button"
-            onClick={onClearAnchor}
-            className="rounded px-1.5 py-0.5 text-caption text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            改为整份文件
-          </button>
-        )}
-        <span className="flex-1" />
-        <IconButton aria-label="关闭批注输入框" size="sm" shape="square" onClick={onClose}>
-          <X size={14} />
-        </IconButton>
-      </div>
-      <textarea
-        value={comment}
-        onChange={(e) => setComment(e.target.value)}
-        onKeyDown={onKeyDown}
-        placeholder="写下你的精修要求（例如：精简要点、修正该行数据、补充对比结论…）"
-        aria-label="批注修改要求"
-        data-testid="deliverable-annotate-input"
-        className="wb-annotate-input text-base md:text-sm"
-      />
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="text-caption text-faint">⌘ / Ctrl + Enter 快捷提交</span>
-        <div className="flex items-center gap-2">
-          <Button type="button" size="sm" variant="ghost" onClick={onClose}>
-            取消
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            variant="accent"
-            disabled={!comment.trim() || submitting}
-            onClick={() => void handleSubmit()}
-            data-testid="deliverable-annotate-submit"
-          >
-            <Send size={12} aria-hidden />
-            {hasComposerBridge ? "回填到输入框" : "复制批注指令"}
-          </Button>
-        </div>
+        <FileOverflowMenu path={path} name={name} />
       </div>
     </div>
   );
@@ -517,12 +361,20 @@ function SpreadsheetView({
 
 function SlideDeckView({
   deck,
+  annotateOpen,
+  annotationDock,
+  fileOverflow,
   onSwitchToDoc,
   onAnnotateSlide,
+  onCloseAnnotate,
 }: {
   deck: ParsedDeck;
+  annotateOpen: boolean;
+  annotationDock: ReactNode;
+  fileOverflow?: ReactNode;
   onSwitchToDoc?: () => void;
   onAnnotateSlide: (anchor: AnnotationAnchor, excerpt: string) => void;
+  onCloseAnnotate: () => void;
 }) {
   const [pageIdx, setPageIdx] = useState(0);
   const [showNotes, setShowNotes] = useState(false);
@@ -545,108 +397,85 @@ function SlideDeckView({
   }
 
   return (
-    <div className="wb-slides-wrap" data-testid="deliverable-slides" onKeyDown={handleKeyDown}>
-      <div className="wb-slide-controls">
-        <div className="flex items-center gap-1">
-          <IconButton
-            size="sm"
-            shape="square"
-            aria-label="上一页"
-            title="上一页 (←)"
-            disabled={safeIdx <= 0}
-            onClick={() => setPageIdx((i) => Math.max(0, i - 1))}
-          >
-            <ChevronLeft size={15} />
-          </IconButton>
-          <span className="px-1.5 text-meta font-medium tabular-nums text-fg" data-testid="slide-counter">
-            第 {slide.index} / {total} 页
+    <div className="flex min-h-0 flex-1 flex-col" data-testid="deliverable-slides" onKeyDown={handleKeyDown}>
+      <div className="wb-slides-wrap flex-1">
+        {/* 16:9 精致画布 */}
+        <div className="wb-slide-stage" data-testid="slide-stage">
+          <div className="text-body">
+            <Markdown readOnly signMedia autoDetectCode={false}>
+              {slide.markdown}
+            </Markdown>
+          </div>
+          <span className="wb-slide-page-badge">
+            {slide.index} / {total}
           </span>
-          <IconButton
-            size="sm"
-            shape="square"
-            aria-label="下一页"
-            title="下一页 (→)"
-            disabled={safeIdx >= total - 1}
-            onClick={() => setPageIdx((i) => Math.min(total - 1, i + 1))}
-          >
-            <ChevronRight size={15} />
-          </IconButton>
         </div>
 
-        <span className="min-w-0 flex-1 truncate text-meta text-muted" title={slide.title}>
-          {slide.title}
-        </span>
-
-        {onSwitchToDoc && (
-          <Button type="button" size="sm" variant="ghost" onClick={onSwitchToDoc}>
-            <BookOpen size={12} aria-hidden />
-            文档模式
-          </Button>
+        {slide.notes && (
+          <div className="wb-slide-notes">
+            <button
+              type="button"
+              aria-expanded={showNotes}
+              onClick={() => setShowNotes((v) => !v)}
+              className="flex w-full items-center gap-1.5 text-left text-caption font-medium text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <ChevronDown size={13} className={cn("transition-transform", !showNotes && "-rotate-90")} aria-hidden />
+              演讲者备注
+            </button>
+            {showNotes && <p className="mt-1.5 whitespace-pre-wrap text-meta text-fg">{slide.notes}</p>}
+          </div>
         )}
 
-        <Button
-          type="button"
-          size="sm"
-          variant="secondary"
-          data-testid="slide-annotate-current"
-          onClick={() =>
-            onAnnotateSlide(
-              { kind: "slide", page: slide.index, title: slide.title },
-              slide.markdown.slice(0, 180),
-            )
-          }
-        >
-          <MessageSquarePlus size={12} aria-hidden />
-          批注第 {slide.index} 页
-        </Button>
+        {/* 缩略页码条 */}
+        <nav aria-label="幻灯片页码条" className="wb-slide-strip" data-testid="slide-strip">
+          {deck.slides.map((item, idx) => {
+            const active = idx === safeIdx;
+            return (
+              <button
+                key={item.index}
+                type="button"
+                aria-current={active ? "true" : undefined}
+                data-testid="slide-thumb"
+                onClick={() => setPageIdx(idx)}
+                className="wb-slide-thumb"
+              >
+                <span className="text-caption font-semibold tabular-nums text-accent">P{item.index}</span>
+                <span className="w-full truncate text-caption text-fg">{item.title}</span>
+              </button>
+            );
+          })}
+        </nav>
       </div>
 
-      {/* 16:9 精致画布 */}
-      <div className="wb-slide-stage" data-testid="slide-stage">
-        <div className="text-body">
-          <Markdown readOnly signMedia autoDetectCode={false}>
-            {slide.markdown}
-          </Markdown>
-        </div>
-        <span className="wb-slide-page-badge">
-          {slide.index} / {total}
-        </span>
+      <div className="wb-bottom-dock">
+        {annotationDock}
+        <WorkbenchBottomBar
+          slide={{
+            page: slide.index,
+            total,
+            onPrev: () => setPageIdx((i) => Math.max(0, i - 1)),
+            onNext: () => setPageIdx((i) => Math.min(total - 1, i + 1)),
+          }}
+          modeToggle={onSwitchToDoc ? { label: "文档", icon: "doc", onClick: onSwitchToDoc } : undefined}
+          trailing={fileOverflow}
+          annotate={{
+            label: "批注修改",
+            ariaLabel: `批注第 ${slide.index} 页`,
+            active: annotateOpen,
+            testId: "slide-annotate-current",
+            onClick: () => {
+              if (annotateOpen) {
+                onCloseAnnotate();
+                return;
+              }
+              onAnnotateSlide(
+                { kind: "slide", page: slide.index, title: slide.title },
+                slide.markdown.slice(0, 180),
+              );
+            },
+          }}
+        />
       </div>
-
-      {slide.notes && (
-        <div className="wb-slide-notes">
-          <button
-            type="button"
-            aria-expanded={showNotes}
-            onClick={() => setShowNotes((v) => !v)}
-            className="flex w-full items-center gap-1.5 text-left text-caption font-medium text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <ChevronDown size={13} className={cn("transition-transform", !showNotes && "-rotate-90")} aria-hidden />
-            演讲者备注
-          </button>
-          {showNotes && <p className="mt-1.5 whitespace-pre-wrap text-meta text-fg">{slide.notes}</p>}
-        </div>
-      )}
-
-      {/* 缩略页码条 */}
-      <nav aria-label="幻灯片页码条" className="wb-slide-strip" data-testid="slide-strip">
-        {deck.slides.map((item, idx) => {
-          const active = idx === safeIdx;
-          return (
-            <button
-              key={item.index}
-              type="button"
-              aria-current={active ? "true" : undefined}
-              data-testid="slide-thumb"
-              onClick={() => setPageIdx(idx)}
-              className="wb-slide-thumb"
-            >
-              <span className="text-caption font-semibold tabular-nums text-accent">P{item.index}</span>
-              <span className="w-full truncate text-caption text-fg">{item.title}</span>
-            </button>
-          );
-        })}
-      </nav>
     </div>
   );
 }
@@ -657,13 +486,40 @@ function normalizeHeadingText(raw: string | null | undefined): string {
   return (raw ?? "").replace(/\s+/g, " ").trim();
 }
 
+function findScrollableWorkbenchAncestor(el: HTMLElement): HTMLElement | null {
+  let cur: HTMLElement | null = el.parentElement;
+  while (cur) {
+    if (
+      cur.matches('[data-testid="outputs-hero-body"], [data-testid="output-viewer"], [data-testid="outputs-view"]') &&
+      cur.scrollHeight > cur.clientHeight
+    ) {
+      const ov = getComputedStyle(cur).overflowY;
+      if (ov === "auto" || ov === "scroll" || ov === "overlay") return cur;
+    }
+    cur = cur.parentElement;
+  }
+  return null;
+}
+
 function LongDocumentView({
   text,
   path,
+  compact,
+  annotateOpen,
+  annotationDock,
+  fileOverflow,
+  onToggleAnnotate,
+  onCloseAnnotate,
   onAnnotateSection,
 }: {
   text: string;
   path: string;
+  compact: boolean;
+  annotateOpen: boolean;
+  annotationDock: ReactNode;
+  fileOverflow?: ReactNode;
+  onToggleAnnotate: () => void;
+  onCloseAnnotate: () => void;
   onAnnotateSection: (anchor: AnnotationAnchor, excerpt: string) => void;
 }) {
   const analysis = useMemo(() => extractMarkdownOutline(text), [text]);
@@ -675,7 +531,8 @@ function LongDocumentView({
   const docBodyRef = useRef<HTMLDivElement>(null);
 
   const slideMode = slideModeOverride ?? deck.isSlideDeck;
-  const outlineOpen = outlineOpenOverride ?? analysis.headings.length >= 2;
+  // 移动端紧凑态默认折叠目录让正文首屏直达；桌面宽屏 ≥2 标题默认展开。
+  const outlineOpen = outlineOpenOverride ?? (!compact && analysis.headings.length >= 2);
 
   // 为渲染后的 H1–H3 注入确定性 id，供大纲点击精准定位与无障碍关联。
   useEffect(() => {
@@ -706,10 +563,8 @@ function LongDocumentView({
       if (!target.id) target.id = h.id;
 
       // OCV5-95 滚动单 writer 约束：仅滚动 Workbench 自身正文容器，严禁触发聊天消息列表滚动。
-      const workbenchScroller = target.closest<HTMLElement>(
-        '[data-testid="outputs-hero-body"], [data-testid="output-viewer"], [data-testid="outputs-view"]',
-      );
-      if (workbenchScroller && workbenchScroller.scrollHeight > workbenchScroller.clientHeight) {
+      const workbenchScroller = findScrollableWorkbenchAncestor(target);
+      if (workbenchScroller) {
         const containerRect = workbenchScroller.getBoundingClientRect();
         const targetRect = target.getBoundingClientRect();
         const nextTop = Math.max(0, workbenchScroller.scrollTop + (targetRect.top - containerRect.top) - 12);
@@ -729,46 +584,24 @@ function LongDocumentView({
     return (
       <SlideDeckView
         deck={deck}
+        annotateOpen={annotateOpen}
+        annotationDock={annotationDock}
+        fileOverflow={fileOverflow}
         onSwitchToDoc={() => setSlideModeOverride(false)}
         onAnnotateSlide={onAnnotateSection}
+        onCloseAnnotate={onCloseAnnotate}
       />
     );
   }
 
   return (
-    <div data-testid="deliverable-document">
+    <div className="flex min-h-0 flex-1 flex-col" data-testid="deliverable-document">
       <div className="wb-doc-bar" data-testid="doc-stats-bar">
-        {analysis.headings.length > 0 && (
-          <Button
-            type="button"
-            size="sm"
-            variant={outlineOpen ? "secondary" : "ghost"}
-            aria-expanded={outlineOpen}
-            onClick={() => setOutlineOpenOverride(!outlineOpen)}
-            data-testid="doc-outline-toggle"
-          >
-            <ListTree size={13} aria-hidden />
-            目录 ({analysis.headings.length})
-          </Button>
-        )}
-        <span className="text-caption tabular-nums text-faint">
+        <span className="truncate text-caption tabular-nums text-faint">
           约 {analysis.stats.wordCount.toLocaleString("zh-CN")} 字 · 阅读约 {analysis.stats.readingMinutes} 分钟
           {analysis.stats.tableCount > 0 ? ` · ${analysis.stats.tableCount} 表格` : ""}
           {analysis.stats.codeBlockCount > 0 ? ` · ${analysis.stats.codeBlockCount} 代码块` : ""}
         </span>
-        <span className="flex-1" />
-        {analysis.hasSlideDividers && deck.slides.length >= 2 && (
-          <Button
-            type="button"
-            size="sm"
-            variant="ghost"
-            onClick={() => setSlideModeOverride(true)}
-            data-testid="doc-switch-slides"
-          >
-            <Presentation size={13} aria-hidden />
-            幻灯片视图 ({deck.slides.length} 页)
-          </Button>
-        )}
       </div>
 
       {outlineOpen && analysis.headings.length > 0 && (
@@ -819,14 +652,49 @@ function LongDocumentView({
       )}
 
       {text.length <= MARKDOWN_RENDER_MAX_CHARS ? (
-        <div ref={docBodyRef} className="px-5 py-4 text-body" data-testid="output-preview-markdown">
+        <div
+          ref={docBodyRef}
+          className={cn("flex-1 text-body", compact ? "px-4 py-3" : "px-5 py-4")}
+          data-testid="output-preview-markdown"
+        >
           <Markdown readOnly signMedia autoDetectCode={false}>
             {text}
           </Markdown>
         </div>
       ) : (
-        <pre className="overflow-auto px-4 py-3 font-mono text-xs text-fg">{text}</pre>
+        <pre className="flex-1 overflow-auto px-4 py-3 font-mono text-xs text-fg">{text}</pre>
       )}
+
+      <div className="wb-bottom-dock">
+        {annotationDock}
+        <WorkbenchBottomBar
+          outline={
+            analysis.headings.length > 0
+              ? {
+                  count: analysis.headings.length,
+                  open: outlineOpen,
+                  onToggle: () => setOutlineOpenOverride(!outlineOpen),
+                }
+              : undefined
+          }
+          modeToggle={
+            analysis.hasSlideDividers && deck.slides.length >= 2
+              ? {
+                  label: "幻灯片",
+                  icon: "slides",
+                  onClick: () => setSlideModeOverride(true),
+                  testId: "doc-switch-slides",
+                }
+              : undefined
+          }
+          trailing={fileOverflow}
+          annotate={{
+            label: "批注修改",
+            active: annotateOpen,
+            onClick: onToggleAnnotate,
+          }}
+        />
+      </div>
     </div>
   );
 }
@@ -837,12 +705,14 @@ function BinaryOfficeCard({
   path,
   name,
   meta,
+  showInlineAnnotate,
   onDispatchPrompt,
   onOpenAnnotate,
 }: {
   path: string;
   name: string;
   meta: DeliverableMeta;
+  showInlineAnnotate: boolean;
   onDispatchPrompt: (prompt: string, label?: string) => Promise<boolean>;
   onOpenAnnotate: () => void;
 }) {
@@ -873,7 +743,8 @@ function BinaryOfficeCard({
       <div className="max-w-md space-y-1">
         <div className="text-section font-semibold text-fg">{name}</div>
         <div className="text-caption text-faint">
-          {meta.label} · {displayDir(path) || path}
+          {meta.label}
+          {!path.startsWith("/api/media/") && ` · ${displayDir(path) || path}`}
         </div>
         <p className="pt-1 text-meta text-muted">{hintText}</p>
       </div>
@@ -902,10 +773,12 @@ function BinaryOfficeCard({
             下载原文件
           </Button>
         )}
-        <Button type="button" size="sm" variant="ghost" onClick={onOpenAnnotate}>
-          <MessageSquarePlus size={14} aria-hidden />
-          批注修改
-        </Button>
+        {showInlineAnnotate && (
+          <Button type="button" size="sm" variant="ghost" onClick={onOpenAnnotate}>
+            <PencilLine size={14} aria-hidden />
+            批注修改
+          </Button>
+        )}
       </div>
     </div>
   );
@@ -1032,6 +905,9 @@ export function DeliverableRichPreview({
   showActionBar = true,
 }: DeliverableRichPreviewProps) {
   const name = nameProp ?? baseName(path);
+  const viewportClass = useViewportClass();
+  const isSheet = useWorkbenchSheet();
+  const isCompact = isSheet || viewportClass === "compact";
   const meta = useMemo(() => {
     if (metaProp) return metaProp;
     const byPath = classifyDeliverable(path, text);
@@ -1053,6 +929,34 @@ export function DeliverableRichPreview({
     setAnnotateOpen(true);
   }, []);
 
+  const toggleFileAnnotate = useCallback(() => {
+    if (!annotateOpen) {
+      setAnchor({ kind: "file" });
+      setExcerpt(undefined);
+    }
+    setAnnotateOpen((v) => !v);
+  }, [annotateOpen]);
+
+  const usesBottomBar = meta.format === "markdown-slides" || meta.format === "markdown";
+
+  const annotationComposer = annotateOpen ? (
+    <AnnotationComposer
+      filePath={path}
+      fileName={name}
+      category={meta.category}
+      anchor={anchor}
+      excerpt={excerpt}
+      hasComposerBridge={Boolean(onAnnotateToComposer)}
+      docked={usesBottomBar}
+      onClearAnchor={() => {
+        setAnchor({ kind: "file" });
+        setExcerpt(undefined);
+      }}
+      onClose={() => setAnnotateOpen(false)}
+      onSubmitPrompt={(prompt) => dispatchPrompt(prompt)}
+    />
+  ) : null;
+
   const renderBody = () => {
     if (meta.isBinaryOffice) {
       return (
@@ -1060,6 +964,7 @@ export function DeliverableRichPreview({
           path={path}
           name={name}
           meta={meta}
+          showInlineAnnotate={!showActionBar}
           onDispatchPrompt={dispatchPrompt}
           onOpenAnnotate={() => openAnchoredAnnotate({ kind: "file" })}
         />
@@ -1080,11 +985,17 @@ export function DeliverableRichPreview({
       );
     }
 
-    if (meta.format === "markdown-slides" || meta.format === "markdown") {
+    if (usesBottomBar) {
       return (
         <LongDocumentView
           text={text ?? ""}
           path={path}
+          compact={isCompact}
+          annotateOpen={annotateOpen}
+          annotationDock={annotationComposer}
+          fileOverflow={showActionBar ? <FileOverflowMenu path={path} name={name} /> : undefined}
+          onToggleAnnotate={toggleFileAnnotate}
+          onCloseAnnotate={() => setAnnotateOpen(false)}
           onAnnotateSection={openAnchoredAnnotate}
         />
       );
@@ -1106,39 +1017,23 @@ export function DeliverableRichPreview({
   };
 
   return (
-    <div className="wb-preview-shell" data-testid="deliverable-rich-preview">
-      {showActionBar && (
+    <div
+      className="wb-preview-shell"
+      data-compact={isCompact ? "true" : undefined}
+      data-testid="deliverable-rich-preview"
+    >
+      {showActionBar && !usesBottomBar && (
         <UnifiedActionBar
           path={path}
           name={name}
           meta={meta}
+          compact={isCompact}
           annotateOpen={annotateOpen}
-          onToggleAnnotate={() => {
-            if (!annotateOpen) {
-              setAnchor({ kind: "file" });
-              setExcerpt(undefined);
-            }
-            setAnnotateOpen((v) => !v);
-          }}
+          onToggleAnnotate={toggleFileAnnotate}
         />
       )}
 
-      {annotateOpen && (
-        <AnnotationComposer
-          filePath={path}
-          fileName={name}
-          category={meta.category}
-          anchor={anchor}
-          excerpt={excerpt}
-          hasComposerBridge={Boolean(onAnnotateToComposer)}
-          onClearAnchor={() => {
-            setAnchor({ kind: "file" });
-            setExcerpt(undefined);
-          }}
-          onClose={() => setAnnotateOpen(false)}
-          onSubmitPrompt={(prompt) => dispatchPrompt(prompt)}
-        />
-      )}
+      {!usesBottomBar && annotationComposer}
 
       {renderBody()}
     </div>

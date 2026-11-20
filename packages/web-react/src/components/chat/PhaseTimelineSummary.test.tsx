@@ -5,6 +5,7 @@ import type { ChatMessage } from "../../lib/chat/model";
 import { loadBeforeAll } from "../../test/moduleLoad";
 import { preloadProcessStages } from "./lazyProcessStages";
 import { ProcessDisclosure, preloadPhaseTimelineSummary, processSections } from "./ProcessDisclosure";
+import { formatPhaseDuration } from "./PhaseTimelineSummary";
 import { useState } from "react";
 
 loadBeforeAll(preloadProcessStages);
@@ -94,7 +95,7 @@ describe("PhaseTimelineSummary integration in ProcessDisclosure", () => {
     expect(screen.queryByTestId("phase-filter-bar")).not.toBeInTheDocument();
   });
 
-  test("marks active phase pill during a live running turn", () => {
+  test("marks active phase pill during a live running turn and separates running indicator from selected tab", () => {
     render(
       <Harness
         active
@@ -105,7 +106,34 @@ describe("PhaseTimelineSummary integration in ProcessDisclosure", () => {
         ]}
       />,
     );
-    expect(screen.getByTestId("phase-pill-verify")).toHaveAttribute("data-phase-active", "true");
-    expect(screen.getByTestId("phase-pill-explore")).toHaveAttribute("data-phase-active", "false");
+    const verifyCrumb = screen.getByTestId("phase-pill-verify");
+    const exploreCrumb = screen.getByTestId("phase-pill-explore");
+    expect(verifyCrumb).toHaveAttribute("data-phase-active", "true");
+    expect(exploreCrumb).toHaveAttribute("data-phase-active", "false");
+    expect(within(verifyCrumb).getByTestId("phase-active-dot-verify")).toHaveClass("oc-phase-active-dot");
+    expect(within(exploreCrumb).queryByTestId("phase-active-dot-explore")).toBeNull();
+
+    // Open disclosure: "全部" is aria-pressed="true", while "验证" is running (data-phase-active="true") with aria-pressed="false"
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    const filterBar = screen.getByTestId("phase-filter-bar");
+    expect(within(filterBar).getByTestId("phase-filter-all")).toHaveAttribute("aria-pressed", "true");
+    const verifyFilter = within(filterBar).getByTestId("phase-filter-verify");
+    expect(verifyFilter).toHaveAttribute("data-phase-active", "true");
+    expect(verifyFilter).toHaveAttribute("aria-pressed", "false");
+    expect(within(verifyFilter).getByTestId("phase-active-dot-verify")).toHaveClass("oc-phase-active-dot");
+    expect(within(filterBar).queryByTestId("phase-active-dot-explore")).toBeNull();
+  });
+
+  test("formats phase durations in compact tabular form", () => {
+    expect(formatPhaseDuration(undefined)).toBe("");
+    expect(formatPhaseDuration(0)).toBe("");
+    expect(formatPhaseDuration(40)).toBe("<0.1s");
+    expect(formatPhaseDuration(800)).toBe("0.8s");
+    expect(formatPhaseDuration(1_500)).toBe("1.5s");
+    expect(formatPhaseDuration(2_000)).toBe("2s");
+    expect(formatPhaseDuration(14_400)).toBe("14s");
+    expect(formatPhaseDuration(425_000)).toBe("07:05");
+    expect(formatPhaseDuration(1_294_000)).toBe("21:34");
+    expect(formatPhaseDuration(3_785_000)).toBe("1:03:05");
   });
 });

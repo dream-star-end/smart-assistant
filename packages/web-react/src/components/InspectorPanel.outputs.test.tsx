@@ -251,4 +251,60 @@ describe("产出页", () => {
     fireEvent.click(within(screen.getByTestId("pane-fullscreen-dialog")).getByTestId("pane-fullscreen-toggle"));
     expect(screen.queryByTestId("pane-fullscreen-dialog")).toBeNull();
   });
+
+  test("移动端底部 Sheet「2-Bar」紧凑阅读器：去 header-safe-t、单轮单文件全出血无套娃、多轮/多文件出极轻微条", async () => {
+    const onToggleFullscreen = vi.fn();
+    const singleFileMessages: ChatMessage[] = [
+      user("u1", "帮我整理一份很长的产品架构分析报告并总结重点", TS),
+      tool("w1", "Write", { file_path: `${W}/report.md`, content: "# 架构分析\n\n核心结论正文。\n" }),
+      assistant("a1", "已完成。", TS + 10_000),
+    ];
+
+    const { rerender } = render(
+      <InspectorPanelContent
+        messages={singleFileMessages}
+        sheet
+        fullscreen={false}
+        onToggleFullscreen={onToggleFullscreen}
+        onClose={() => {}}
+      />,
+    );
+    await outputsReady();
+
+    // 底部 Sheet 非全屏态去掉多余 header-safe-t；支持切全屏
+    expect(screen.getByTestId("pane-header")).not.toHaveClass("header-safe-t");
+    fireEvent.click(screen.getByTestId("pane-fullscreen-toggle"));
+    expect(onToggleFullscreen).toHaveBeenCalledTimes(1);
+
+    // 单轮单文件直接全出血进预览：无 TurnBar、无微条、无 max-h-[68vh] 嵌套滚动
+    expect(screen.queryByTestId("outputs-turn")).toBeNull();
+    expect(screen.queryByTestId("outputs-open-steps")).toBeNull();
+    expect(screen.queryByTestId("outputs-compact-strip")).toBeNull();
+    expect(screen.getByTestId("outputs-hero")).toHaveAttribute("data-compact", "true");
+    expect(screen.getByTestId("outputs-hero-body").className).not.toContain("max-h-[68vh]");
+    expect(await screen.findByTestId("output-preview-markdown")).toBeInTheDocument();
+    expect(screen.getByTestId("workbench-bottom-bar")).toBeInTheDocument();
+
+    // 全屏态恢复 header-safe-t 顶部安全区
+    rerender(
+      <InspectorPanelContent
+        messages={session()}
+        sheet
+        fullscreen
+        onToggleFullscreen={onToggleFullscreen}
+        onClose={() => {}}
+      />,
+    );
+    await outputsReady();
+    expect(screen.getByTestId("pane-header")).toHaveClass("header-safe-t");
+
+    // 多轮 / 多文件时显示极轻单行微条，依然无冗余 TurnBar 与「查看步骤 >」
+    expect(screen.queryByTestId("outputs-turn")).toBeNull();
+    expect(screen.queryByTestId("outputs-open-steps")).toBeNull();
+    const strip = screen.getByTestId("outputs-compact-strip");
+    expect(strip).toHaveTextContent("2/2");
+    fireEvent.click(within(strip).getByLabelText("上一轮"));
+    expect(screen.getByTestId("outputs-compact-strip")).toHaveTextContent("1/2");
+    expect(screen.getByTestId("outputs-compact-file-picker")).toBeInTheDocument();
+  });
 });

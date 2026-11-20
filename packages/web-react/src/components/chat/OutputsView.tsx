@@ -6,7 +6,6 @@
 import {
   ChevronLeft,
   ChevronRight,
-  Download,
   ExternalLink,
   FileCode2,
   FileText,
@@ -15,19 +14,19 @@ import {
   Inbox,
   MessageSquarePlus,
   MonitorPlay,
-  Send,
-  X,
 } from "lucide-react";
 import { type ReactNode, Suspense, lazy, useEffect, useState } from "react";
-import type { EvidenceManifest } from "@openclaude/protocol/research";
+import { useViewportClass } from "../../hooks/useMdViewport";
 import type { ChatMessage } from "../../lib/chat/model";
 import { cn } from "../../lib/utils";
 import type { ToolLike } from "../tool/format";
-import { Button, IconButton, SegmentedControl, Skeleton, Spinner, useToast } from "../ui";
-import { buildAnnotationPrompt } from "./deliverablePreview";
+import { SegmentedControl, Skeleton, Spinner } from "../ui";
 import type { TargetOutputRequest } from "./inspectorState";
-import { useSignedDownload, useSignedSrc } from "./media";
+import { useSignedSrc } from "./media";
+import { DownloadButton, QuickAnnotateDrawer, WorkbenchEvidenceCard } from "./OutputsAuxParts";
+import { type CompactHeroView, OutputsCompactBar } from "./OutputsCompactBar";
 import { CopyIconButton, FileChangeEntryView, LineCounts } from "./paneParts";
+import { FileOverflowMenu, WorkbenchBottomBar, useWorkbenchSheet } from "./WorkbenchBottomBar";
 import {
   type DeliverableCategory,
   type HeroRef,
@@ -53,51 +52,6 @@ import type { WorkTurn } from "./workTurns";
 
 const FilePreview = lazy(() => import("./OutputPreview").then((m) => ({ default: m.FilePreview })));
 const MediaPreview = lazy(() => import("./OutputPreview").then((m) => ({ default: m.MediaPreview })));
-const ResearchEvidenceModule = lazy(() =>
-  import("./researchEvidence").then((m) => ({
-    default: function WorkbenchResearchEvidenceInner({ manifest }: { manifest: EvidenceManifest }) {
-      const [evTab, setEvTab] = useState<"evidence" | "library">("evidence");
-      return (
-        <div className="space-y-2">
-          <div className="flex flex-wrap items-center gap-2 border-b border-border/70 px-3.5 py-2">
-            <span className="text-meta font-medium text-fg">引用接地与文献核验</span>
-            <m.CoverageBadge coverage={manifest.coverage} />
-            <div className="ml-auto flex items-center gap-1">
-              <button
-                type="button"
-                onClick={() => setEvTab("evidence")}
-                className={cn(
-                  "rounded-md px-2 py-0.5 text-caption font-medium transition-colors",
-                  evTab === "evidence" ? "bg-accent-soft text-accent" : "text-muted hover:text-fg",
-                )}
-              >
-                证据链
-              </button>
-              <button
-                type="button"
-                onClick={() => setEvTab("library")}
-                className={cn(
-                  "rounded-md px-2 py-0.5 text-caption font-medium transition-colors",
-                  evTab === "library" ? "bg-accent-soft text-accent" : "text-muted hover:text-fg",
-                )}
-              >
-                文献库 ({manifest.sources.length})
-              </button>
-            </div>
-          </div>
-          {evTab === "evidence" ? (
-            <div className="px-3.5 pb-3">
-              <m.GatesRow manifest={manifest} />
-              <m.ClaimList manifest={manifest} />
-            </div>
-          ) : (
-            <m.LiteratureLibraryPanel sources={manifest.sources} />
-          )}
-        </div>
-      );
-    },
-  })),
-);
 
 type HeroView = "preview" | "source" | "changes";
 
@@ -222,127 +176,11 @@ function PreviewFallback() {
   );
 }
 
-function DownloadButton({ path, name }: { path: string; name: string }) {
-  const { state, start } = useSignedDownload(path, name);
-  const busy = state.phase === "downloading";
-  return (
-    <button
-      type="button"
-      aria-label={`下载 ${name}`}
-      title="下载"
-      onClick={() => void start()}
-      disabled={busy}
-      className="inline-flex size-7 items-center justify-center rounded-md text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
-    >
-      {busy ? <Spinner size={13} /> : <Download size={15} />}
-    </button>
-  );
-}
-
-/** 非富预览视图（HTML / 代码 / 改动 / 媒体）的快捷批注回填条。 */
-function QuickAnnotateDrawer({
-  filePath,
-  fileName,
-  category,
-  onAnnotateToComposer,
-  onClose,
-}: {
-  filePath: string;
-  fileName: string;
-  category: DeliverableCategory;
-  onAnnotateToComposer?: (draft: string) => void;
-  onClose: () => void;
-}) {
-  const toast = useToast();
-  const [comment, setComment] = useState("");
-  const [lineRef, setLineRef] = useState("");
-
-  const submit = async () => {
-    const trimmed = comment.trim();
-    if (!trimmed) return;
-    const parsedLine = Number.parseInt(lineRef.trim(), 10);
-    const prompt = buildAnnotationPrompt({
-      filePath,
-      fileName,
-      category,
-      anchor:
-        category === "code" && Number.isFinite(parsedLine) && parsedLine > 0
-          ? { kind: "code-line", lineStart: parsedLine }
-          : { kind: "file" },
-      comment: trimmed,
-    });
-    if (onAnnotateToComposer) {
-      onAnnotateToComposer(prompt);
-      toast("已填入输入框，可直接发送给助手", "success");
-      setComment("");
-      onClose();
-      return;
-    }
-    try {
-      await navigator.clipboard.writeText(prompt);
-      toast("已复制批注修改指令，粘贴到输入框即可发送", "success");
-      setComment("");
-      onClose();
-    } catch {
-      toast("复制失败，请手动复制修改说明", "error");
-    }
-  };
-
-  return (
-    <div className="space-y-2 border-t border-border/70 bg-accent-soft/40 px-3.5 py-2.5" data-testid="hero-quick-annotate-box">
-      <div className="flex items-center gap-2">
-        <span className="text-caption font-medium text-accent">批注精修 · {fileName}</span>
-        {category === "code" && (
-          <input
-            type="text"
-            inputMode="numeric"
-            value={lineRef}
-            onChange={(e) => setLineRef(e.target.value)}
-            placeholder="行号(可选)"
-            aria-label="代码行号"
-            className="h-7 w-24 rounded-md border border-border-control bg-surface px-2 text-base text-fg outline-none placeholder:text-faint focus:border-accent md:text-xs"
-          />
-        )}
-        <span className="flex-1" />
-        <IconButton size="sm" shape="square" aria-label="关闭批注" onClick={onClose}>
-          <X size={13} />
-        </IconButton>
-      </div>
-      <textarea
-        value={comment}
-        onChange={(e) => setComment(e.target.value)}
-        placeholder="输入要让助手修改的具体要求…"
-        aria-label="修改要求"
-        className="min-h-14 w-full resize-y rounded-md border border-border-control bg-surface px-2.5 py-1.5 text-base text-fg outline-none placeholder:text-faint focus:border-accent md:text-sm"
-      />
-      <div className="flex justify-end gap-2">
-        <Button type="button" size="sm" variant="ghost" onClick={onClose}>
-          取消
-        </Button>
-        <Button type="button" size="sm" variant="accent" disabled={!comment.trim()} onClick={() => void submit()}>
-          <Send size={12} aria-hidden />
-          {onAnnotateToComposer ? "回填到输入框" : "复制批注指令"}
-        </Button>
-      </div>
-    </div>
-  );
-}
-
-/** 主卡片:文件。 */
-function FileHero({
-  file,
-  messages,
-  turnEnd,
-  onOpenStep,
-  onAnnotateToComposer,
-}: {
-  file: OutputFile;
-  messages: readonly ChatMessage[];
-  turnEnd: ChatMessage | undefined;
-  onOpenStep: (message: ToolLike) => void;
-  onAnnotateToComposer?: (draft: string) => void;
-}) {
-  // 不按 messages 引用记忆:流式期间消息就地增长,数组引用不变(同 collectPaneSteps,每次渲染重算)。
+function computeHeroMeta(
+  file: OutputFile,
+  messages: readonly ChatMessage[],
+  turnEnd: ChatMessage | undefined,
+) {
   const replayed = fileSnapshot(messages, file.path, turnEnd);
   const meta = classifyDeliverable(file.path, replayed);
   const richPreview =
@@ -355,16 +193,134 @@ function FileHero({
   const previewable = file.kind === "html" || richPreview;
   const textual = file.kind !== "file";
   const change = file.change;
-  const options = [
+  const options: { value: HeroView; label: string }[] = [
     ...(previewable ? [{ value: "preview" as const, label: "预览" }] : []),
     ...(textual ? [{ value: "source" as const, label: previewable ? "源码" : "内容" }] : []),
     ...(change ? [{ value: "changes" as const, label: `改动 ${change.entries.length}` }] : []),
   ];
+  return { replayed, meta, richPreview, textual, change, options };
+}
+
+/** 主卡片:文件。移动端紧凑态全出血单滚动直出正文，无厚外框与双层滚动。 */
+function FileHero({
+  file,
+  messages,
+  turnEnd,
+  compact = false,
+  controlledView,
+  onControlledViewChange,
+  showCompactViewInBar = false,
+  onOpenStep,
+  onAnnotateToComposer,
+}: {
+  file: OutputFile;
+  messages: readonly ChatMessage[];
+  turnEnd: ChatMessage | undefined;
+  compact?: boolean;
+  controlledView?: HeroView | null;
+  onControlledViewChange?: (v: HeroView) => void;
+  showCompactViewInBar?: boolean;
+  onOpenStep: (message: ToolLike) => void;
+  onAnnotateToComposer?: (draft: string) => void;
+}) {
+  // 不按 messages 引用记忆:流式期间消息就地增长,数组引用不变(同 collectPaneSteps,每次渲染重算)。
+  const { replayed, meta, richPreview, textual, change, options } = computeHeroMeta(file, messages, turnEnd);
   const [chosen, setChosen] = useState<HeroView | null>(null);
   const [quickAnnotateOpen, setQuickAnnotateOpen] = useState(false);
-  const view: HeroView = chosen && options.some((o) => o.value === chosen) ? chosen : (options[0]?.value ?? "changes");
+  const activeChosen = controlledView !== undefined ? controlledView : chosen;
+  const setView = onControlledViewChange ?? setChosen;
+  const view: HeroView =
+    activeChosen && options.some((o) => o.value === activeChosen) ? activeChosen : (options[0]?.value ?? "changes");
   const usesRichBar = view === "preview" && richPreview;
   const dir = displayDir(file.path);
+
+  const body = (
+    <div
+      className={cn(
+        "[overflow-wrap:anywhere]",
+        compact ? "flex min-h-0 flex-1 flex-col" : "min-h-24 overflow-x-auto",
+      )}
+      data-testid="outputs-hero-body"
+    >
+      {view === "changes" && change ? (
+        <div className="space-y-5 px-4 py-3">
+          {change.entries.map((entry, i) => (
+            <FileChangeEntryView key={`${entry.message.id}:${i}`} entry={entry} n={i + 1} onOpenStep={onOpenStep} />
+          ))}
+        </div>
+      ) : textual || richPreview ? (
+        <Suspense fallback={<PreviewFallback />}>
+          <FilePreview
+            path={file.path}
+            name={file.name}
+            kind={file.kind}
+            replayed={replayed}
+            refreshKey={fileTouchFingerprint(messages, file.path)}
+            view={view === "preview" ? "preview" : "source"}
+            onAnnotateToComposer={onAnnotateToComposer}
+          />
+        </Suspense>
+      ) : (
+        <div className="px-5 py-8 text-center text-meta text-muted">这类文件不在面板里预览，可以下载查看。</div>
+      )}
+    </div>
+  );
+
+  if (compact) {
+    return (
+      <article
+        className="flex min-h-0 flex-1 flex-col bg-surface"
+        data-testid="outputs-hero"
+        data-compact="true"
+        aria-label={`${meta.label} ${file.name}`}
+      >
+        {body}
+        {!usesRichBar && (
+          <div className="wb-bottom-dock">
+            {quickAnnotateOpen && (
+              <QuickAnnotateDrawer
+                filePath={file.path}
+                fileName={file.name}
+                category={meta.category}
+                onAnnotateToComposer={onAnnotateToComposer}
+                onClose={() => setQuickAnnotateOpen(false)}
+              />
+            )}
+            <WorkbenchBottomBar
+              leading={
+                showCompactViewInBar && options.length > 1 ? (
+                  <div className="flex items-center gap-0.5" role="group" aria-label="查看方式">
+                    {options.map((opt) => (
+                      <button
+                        key={opt.value}
+                        type="button"
+                        aria-pressed={opt.value === view}
+                        onClick={() => setView(opt.value)}
+                        className={cn(
+                          "h-7 rounded-md px-2 text-caption font-medium transition-colors",
+                          opt.value === view ? "bg-accent-soft text-accent" : "text-muted hover:bg-hover hover:text-fg",
+                        )}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                ) : undefined
+              }
+              trailing={<FileOverflowMenu path={file.path} name={file.name} />}
+              annotate={{
+                label: "批注修改",
+                active: quickAnnotateOpen,
+                testId: "hero-quick-annotate",
+                onClick: () => setQuickAnnotateOpen((v) => !v),
+              }}
+            />
+          </div>
+        )}
+      </article>
+    );
+  }
+
   return (
     <article
       className="overflow-hidden rounded-xl border border-border/70 bg-surface shadow-soft"
@@ -384,35 +340,13 @@ function FileHero({
             className="ml-auto"
             size="sm"
             value={view}
-            onValueChange={(v) => setChosen(v)}
+            onValueChange={(v) => setView(v)}
             options={options}
             aria-label="查看方式"
           />
         )}
       </header>
-      <div className="max-h-[68vh] min-h-24 overflow-auto [overflow-wrap:anywhere]" data-testid="outputs-hero-body">
-        {view === "changes" && change ? (
-          <div className="space-y-5 px-4 py-3">
-            {change.entries.map((entry, i) => (
-              <FileChangeEntryView key={`${entry.message.id}:${i}`} entry={entry} n={i + 1} onOpenStep={onOpenStep} />
-            ))}
-          </div>
-        ) : textual || richPreview ? (
-          <Suspense fallback={<PreviewFallback />}>
-            <FilePreview
-              path={file.path}
-              name={file.name}
-              kind={file.kind}
-              replayed={replayed}
-              refreshKey={fileTouchFingerprint(messages, file.path)}
-              view={view === "preview" ? "preview" : "source"}
-              onAnnotateToComposer={onAnnotateToComposer}
-            />
-          </Suspense>
-        ) : (
-          <div className="px-5 py-8 text-center text-meta text-muted">这类文件不在面板里预览，可以下载查看。</div>
-        )}
-      </div>
+      {body}
       {quickAnnotateOpen && !usesRichBar && (
         <QuickAnnotateDrawer
           filePath={file.path}
@@ -455,12 +389,45 @@ function FileHero({
 
 function MediaHero({
   media,
+  compact = false,
   onAnnotateToComposer,
 }: {
   media: OutputMedia;
+  compact?: boolean;
   onAnnotateToComposer?: (draft: string) => void;
 }) {
   const [annotateOpen, setAnnotateOpen] = useState(false);
+  if (compact) {
+    return (
+      <article className="flex min-h-0 flex-1 flex-col bg-surface" data-testid="outputs-hero" data-compact="true" aria-label={`图片 ${media.name}`}>
+        <div className="flex-1">
+          <Suspense fallback={<PreviewFallback />}>
+            <MediaPreview src={media.src} kind={media.kind} name={media.name} />
+          </Suspense>
+        </div>
+        <div className="wb-bottom-dock">
+          {annotateOpen && (
+            <QuickAnnotateDrawer
+              filePath={media.src}
+              fileName={media.name}
+              category="media"
+              onAnnotateToComposer={onAnnotateToComposer}
+              onClose={() => setAnnotateOpen(false)}
+            />
+          )}
+          <WorkbenchBottomBar
+            trailing={<FileOverflowMenu path={media.src} name={media.name} showOpenInNewWindow={false} />}
+            annotate={{
+              label: "批注修改",
+              active: annotateOpen,
+              testId: "hero-quick-annotate",
+              onClick: () => setAnnotateOpen((v) => !v),
+            }}
+          />
+        </div>
+      </article>
+    );
+  }
   return (
     <article className="overflow-hidden rounded-xl border border-border/70 bg-surface shadow-soft" data-testid="outputs-hero" aria-label={`图片 ${media.name}`}>
       <Suspense fallback={<PreviewFallback />}>
@@ -727,64 +694,6 @@ function OtherOutputs({
   );
 }
 
-function WorkbenchEvidenceCard({ manifestSrc }: { manifestSrc: string }) {
-  const { url: signed } = useSignedSrc(manifestSrc);
-  const [manifest, setManifest] = useState<EvidenceManifest | null>(null);
-  const [failed, setFailed] = useState(false);
-
-  useEffect(() => {
-    setManifest(null);
-    setFailed(false);
-    if (!signed) return;
-    let alive = true;
-    fetch(signed)
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
-      .then((raw: unknown) => {
-        if (!alive) return;
-        const m = raw as Record<string, unknown> | null;
-        if (
-          m &&
-          typeof m === "object" &&
-          Array.isArray(m.claims) &&
-          Array.isArray(m.quotes) &&
-          Array.isArray(m.sources) &&
-          m.coverage &&
-          typeof m.coverage === "object"
-        ) {
-          setManifest(m as unknown as EvidenceManifest);
-        } else {
-          setFailed(true);
-        }
-      })
-      .catch(() => {
-        if (alive) setFailed(true);
-      });
-    return () => {
-      alive = false;
-    };
-  }, [signed]);
-
-  return (
-    <section
-      data-testid="outputs-evidence-panel"
-      className="mx-4 mt-4 overflow-hidden rounded-xl border border-border/70 bg-surface shadow-soft"
-    >
-      {failed ? (
-        <div className="px-4 py-3 text-meta text-muted">证据清单暂不可用（可能已过期或被清理）。</div>
-      ) : !manifest ? (
-        <div className="flex items-center gap-2 px-4 py-3 text-meta text-muted">
-          <Spinner size={13} className="text-accent" />
-          正在加载科研引用证据清单…
-        </div>
-      ) : (
-        <Suspense fallback={<PreviewFallback />}>
-          <ResearchEvidenceModule manifest={manifest} />
-        </Suspense>
-      )}
-    </section>
-  );
-}
-
 function buildAdHocTarget(target: TargetOutputRequest): { file?: OutputFile; media?: OutputMedia } {
   const rawPath = target.path?.trim();
   if (!rawPath) return {};
@@ -833,27 +742,33 @@ export function OutputsView({
   /** 可选：批注回填至 Composer 输入框的回调。 */
   onAnnotateToComposer?: (draft: string) => void;
 }) {
+  const isCompact = useWorkbenchSheet() || useViewportClass() === "compact";
   const turn = turns[index];
   if (!turn) {
     if (targetOutput?.path || targetOutput?.manifestSrc) {
       const adHoc = buildAdHocTarget(targetOutput);
       return (
-        <div className="min-h-0 flex-1 overflow-y-auto py-4" data-testid="outputs-view">
+        <div
+          className={cn("flex min-h-0 flex-1 flex-col overflow-y-auto", !isCompact && "py-4")}
+          data-testid="outputs-view"
+        >
           {adHoc.file && (
-            <div className="px-4">
+            <div className={cn(isCompact ? "flex min-h-0 flex-1 flex-col" : "px-4")}>
               <FileHero
                 key={adHoc.file.path}
                 file={adHoc.file}
                 messages={messages}
                 turnEnd={undefined}
+                compact={isCompact}
+                showCompactViewInBar={isCompact}
                 onOpenStep={onOpenStep}
                 onAnnotateToComposer={onAnnotateToComposer}
               />
             </div>
           )}
           {adHoc.media && (
-            <div className="px-4">
-              <MediaHero media={adHoc.media} onAnnotateToComposer={onAnnotateToComposer} />
+            <div className={cn(isCompact ? "flex min-h-0 flex-1 flex-col" : "px-4")}>
+              <MediaHero media={adHoc.media} compact={isCompact} onAnnotateToComposer={onAnnotateToComposer} />
             </div>
           )}
           {targetOutput.manifestSrc && <WorkbenchEvidenceCard manifestSrc={targetOutput.manifestSrc} />}
@@ -869,7 +784,7 @@ export function OutputsView({
     );
   }
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto" data-testid="outputs-view">
+    <div className="flex min-h-0 flex-1 flex-col overflow-y-auto" data-testid="outputs-view">
       {/* key:换轮时主卡片的视图选择从头来。 */}
       <TurnOutputsBody
         key={turn.key}
@@ -878,6 +793,7 @@ export function OutputsView({
         index={index}
         total={turns.length}
         running={running}
+        compact={isCompact}
         targetOutput={targetOutput}
         onSelectTurn={onSelectTurn}
         onOpenSteps={onOpenSteps}
@@ -894,6 +810,7 @@ function TurnOutputsBody({
   index,
   total,
   running,
+  compact,
   targetOutput,
   onSelectTurn,
   onOpenSteps,
@@ -905,6 +822,7 @@ function TurnOutputsBody({
   index: number;
   total: number;
   running: boolean;
+  compact: boolean;
   targetOutput?: TargetOutputRequest | null;
   onSelectTurn: (index: number) => void;
   onOpenSteps: () => void;
@@ -915,6 +833,7 @@ function TurnOutputsBody({
   const [picked, setPicked] = useState<HeroRef | null>(null);
   const [adHocTarget, setAdHocTarget] = useState<TargetOutputRequest | null>(null);
   const [activeCategory, setActiveCategory] = useState<DeliverableCategory | "all">("all");
+  const [compactView, setCompactView] = useState<{ path: string; view: CompactHeroView } | null>(null);
 
   // 响应从主对话文件卡 / 科研报告 / 智能 UI 交付物卡点进来的精确定位请求。
   useEffect(() => {
@@ -956,46 +875,89 @@ function TurnOutputsBody({
       ? outputs.media.find((m) => m.src === hero.src)
       : adHoc.media;
   const turnEnd = turn.rows.at(-1);
-  const empty = outputs.files.length + outputs.media.length + outputs.links.length + outputs.sources.length === 0;
+  const deliverableCount = outputs.files.length + outputs.media.length;
+  const empty = deliverableCount + outputs.links.length + outputs.sources.length === 0;
   const fileCount = outputs.files.filter((f) => f.change).length;
   const activeManifestSrc = adHocTarget?.manifestSrc ?? null;
 
+  const compactHeroMeta = compact && heroFile ? computeHeroMeta(heroFile, messages, turnEnd) : null;
+  const activeCompactView =
+    compactHeroMeta && heroFile
+      ? compactView?.path === heroFile.path && compactHeroMeta.options.some((o) => o.value === compactView.view)
+        ? compactView.view
+        : (compactHeroMeta.options[0]?.value ?? "changes")
+      : undefined;
+  const hasCompactStrip = compact && (total > 1 || deliverableCount > 1);
+  const showOtherOutputs =
+    !empty && (!compact || deliverableCount > 1 || outputs.links.length > 0 || outputs.sources.length > 0);
+
   return (
     <>
-      <TurnBar
-        turn={turn}
-        index={index}
-        total={total}
-        running={running}
-        fileCount={fileCount}
-        onPrev={() => onSelectTurn(index - 1)}
-        onNext={() => onSelectTurn(index + 1)}
-        onOpenSteps={onOpenSteps}
-      />
-      {!empty && (
-        <DeliverableSummaryStrip
+      {compact ? (
+        <OutputsCompactBar
+          turnIndex={index}
+          turnTotal={total}
+          onPrevTurn={() => onSelectTurn(index - 1)}
+          onNextTurn={() => onSelectTurn(index + 1)}
           outputs={outputs}
-          activeCategory={activeCategory}
-          onSelectCategory={setActiveCategory}
+          hero={hero}
+          heroName={heroFile?.name ?? heroMedia?.name}
+          onPick={(ref) => {
+            setAdHocTarget(null);
+            setPicked(ref);
+          }}
+          view={activeCompactView}
+          viewOptions={compactHeroMeta?.options}
+          onChangeView={heroFile ? (v) => setCompactView({ path: heroFile.path, view: v }) : undefined}
         />
+      ) : (
+        <>
+          <TurnBar
+            turn={turn}
+            index={index}
+            total={total}
+            running={running}
+            fileCount={fileCount}
+            onPrev={() => onSelectTurn(index - 1)}
+            onNext={() => onSelectTurn(index + 1)}
+            onOpenSteps={onOpenSteps}
+          />
+          {!empty && (
+            <DeliverableSummaryStrip
+              outputs={outputs}
+              activeCategory={activeCategory}
+              onSelectCategory={setActiveCategory}
+            />
+          )}
+        </>
       )}
       {heroFile || heroMedia ? (
-        <div className="px-4">
+        <div className={cn(compact ? "flex min-h-0 flex-1 flex-col" : "px-4")}>
           {heroFile ? (
             <FileHero
               key={heroFile.path}
               file={heroFile}
               messages={messages}
               turnEnd={turnEnd}
+              compact={compact}
+              controlledView={compact ? (activeCompactView ?? null) : undefined}
+              onControlledViewChange={compact ? (v) => setCompactView({ path: heroFile.path, view: v }) : undefined}
+              showCompactViewInBar={compact && !hasCompactStrip}
               onOpenStep={onOpenStep}
               onAnnotateToComposer={onAnnotateToComposer}
             />
           ) : heroMedia ? (
-            <MediaHero media={heroMedia} onAnnotateToComposer={onAnnotateToComposer} />
+            <MediaHero media={heroMedia} compact={compact} onAnnotateToComposer={onAnnotateToComposer} />
           ) : null}
         </div>
       ) : empty && !activeManifestSrc ? (
-        <div className="mx-4 flex flex-col items-center gap-2 rounded-xl border border-dashed border-border px-6 py-10 text-center" data-testid="outputs-none">
+        <div
+          className={cn(
+            "flex flex-col items-center gap-2 rounded-xl border border-dashed border-border px-6 py-10 text-center",
+            compact ? "m-4" : "mx-4",
+          )}
+          data-testid="outputs-none"
+        >
           {running ? <Spinner size={18} className="text-accent" /> : <FileText size={20} className="text-faint" aria-hidden />}
           <p className="text-body font-medium text-fg">{running ? "这一轮还在进行" : "这一轮没有产出文件"}</p>
           <p className="text-meta text-muted">
@@ -1004,7 +966,7 @@ function TurnOutputsBody({
         </div>
       ) : null}
       {activeManifestSrc && <WorkbenchEvidenceCard manifestSrc={activeManifestSrc} />}
-      {!empty && (
+      {showOtherOutputs && (
         <OtherOutputs
           outputs={outputs}
           hero={hero}

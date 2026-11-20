@@ -457,7 +457,7 @@ export function TutorialCenter({
   return (
     <Dialog.Root open={open} onOpenChange={(next) => !next && onClose()}>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/45 backdrop-blur-sm data-[state=open]:animate-fade" />
+        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/35 backdrop-blur-sm data-[state=open]:animate-fade" />
         <Dialog.Content
           ref={dialogRef}
           aria-describedby={undefined}
@@ -475,13 +475,13 @@ export function TutorialCenter({
             }
             dialogRef.current?.focus();
           }}
-          className="tutorial-shell tut-shell fixed inset-x-2 bottom-2 top-2 z-50 flex min-h-0 flex-col overflow-hidden rounded-[22px] border border-border bg-bg shadow-float focus:outline-none data-[state=open]:animate-in sm:inset-x-4 sm:bottom-4 sm:top-4 sm:rounded-[28px] lg:left-1/2 lg:w-[min(1280px,calc(100vw-2rem))] lg:-translate-x-1/2"
+          className="tutorial-shell tut-shell fixed inset-x-2 bottom-2 top-2 z-50 flex min-h-0 flex-col overflow-hidden rounded-xl border border-border bg-bg shadow-float focus:outline-none data-[state=open]:animate-in sm:inset-x-4 sm:bottom-4 sm:top-4 sm:rounded-xl2 lg:left-1/2 lg:w-[min(1280px,calc(100vw-2rem))] lg:-translate-x-1/2"
         >
           {/* 一条统一的顶栏(OCV5-342 教程重构):标题 · 分段式页签 · 搜索 · 关闭。<lg 自动折成
               「标题+关闭 / 页签 / 搜索」三行;DOM 只有一份,读屏顺序与视觉一致。 */}
           <header className="relative z-10 flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2.5 border-b border-border/80 bg-surface/80 px-3 py-3 backdrop-blur-xl sm:px-5 lg:min-h-[68px] lg:flex-nowrap lg:py-2.5">
             <div className="order-1 flex min-w-0 flex-1 items-center gap-3 lg:w-[248px] lg:flex-none">
-              <span className={cn("tut-mark flex size-10 shrink-0 items-center justify-center rounded-[14px] text-white", mode === "cases" ? "bg-accent" : "bg-grad-cta")}>
+              <span className={cn("tut-mark flex size-10 shrink-0 items-center justify-center rounded-lg", mode === "cases" ? "bg-accent text-accent-fg" : "bg-grad-cta text-white")}>
                 {mode === "blog" ? <PenLine size={19} /> : <GraduationCap size={19} />}
               </span>
               <div className="min-w-0">
@@ -717,7 +717,7 @@ function ViewTab({
       aria-current={active ? "page" : undefined}
       className={cn(
         "inline-flex shrink-0 items-center gap-1.5 rounded-full px-3 py-1.5 text-meta font-semibold outline-none transition-[background-color,color,box-shadow] duration-200 focus-visible:ring-2 focus-visible:ring-ring sm:px-3.5 [@media(hover:none)]:min-h-11",
-        active ? "bg-surface text-fg shadow-[0_1px_2px_rgba(0,0,0,0.08),0_0_0_1px_var(--border)]" : "text-muted hover:text-fg",
+        active ? "bg-surface text-fg shadow-sidebar-active" : "text-muted hover:text-fg",
       )}
     >
       {/* 390px 下三个页签 + 「帮助与创作」放不下带图标的版本，第三个会被裁掉一半；窄屏只留文字。 */}
@@ -2068,7 +2068,7 @@ function FeatureDetail({
 
       <div className="mt-10 grid gap-4 sm:grid-cols-2"><InfoBox icon={Lightbulb} title="实用建议" tone="accent" items={topic.tips} /><InfoBox icon={TriangleAlert} title="使用前留意" tone="warning" items={topic.cautions} /></div>
 
-      <section className="tut-cta relative mt-10 overflow-hidden rounded-[24px] p-6 text-white sm:p-7"><div className="relative flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between"><div><h2 className="text-[19px] font-semibold">现在去真实功能里试一遍</h2><p className="mt-1.5 text-meta text-white/75">教程不会替你发送消息、修改设置或执行付费操作。</p>{!cta.enabled && cta.disabledReason && <p className="mt-2 inline-block rounded-lg bg-white/90 px-2.5 py-1 text-meta text-warning">{cta.disabledReason}</p>}</div><Button variant="secondary" shape="pill" size="lg" disabled={!cta.enabled} onClick={() => onRunAction(feature)} className="shrink-0 border-transparent bg-white text-[#14121f] hover:bg-white/90">{cta.label} <ArrowRight size={15} /></Button></div></section>
+      <section className="tut-cta relative mt-10 overflow-hidden rounded-xl p-6 text-white sm:p-7"><div className="relative flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between"><div><h2 className="text-[19px] font-semibold">现在去真实功能里试一遍</h2><p className="mt-1.5 text-meta text-white/75">教程不会替你发送消息、修改设置或执行付费操作。</p>{!cta.enabled && cta.disabledReason && <p className="mt-2 inline-block rounded-lg bg-white/90 px-2.5 py-1 text-meta text-warning">{cta.disabledReason}</p>}</div><Button variant="secondary" shape="pill" size="lg" disabled={!cta.enabled} onClick={() => onRunAction(feature)} className="shrink-0 border-transparent bg-white text-brand-fg hover:bg-white/90">{cta.label} <ArrowRight size={15} /></Button></div></section>
 
       <section className="mt-10"><h2 className="text-title font-semibold text-fg">接着了解</h2><div className="mt-3 grid gap-2.5 sm:grid-cols-3">{topic.related.map((relatedId) => { const related = capabilityById(relatedId); const RelatedIcon = ICONS[related.icon] ?? Sparkles; return <button key={relatedId} type="button" onClick={() => onTopicChange(relatedId)} className="tut-card group flex items-center gap-2.5 rounded-2xl border border-border bg-surface px-3.5 py-3 text-left text-meta text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"><span className="flex size-8 shrink-0 items-center justify-center rounded-xl bg-accent-soft text-accent"><RelatedIcon size={14} /></span><span className="min-w-0 flex-1 truncate font-medium">{related.shortTitle}</span><ArrowRight size={13} className="text-faint transition-transform group-hover:translate-x-0.5" /></button>; })}</div></section>
     </article>

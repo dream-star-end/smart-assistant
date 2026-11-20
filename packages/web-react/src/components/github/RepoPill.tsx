@@ -18,7 +18,7 @@ const STATUS_TEXT: Partial<Record<RepoDot, string>> = {
 };
 
 /** 官方 GitHub 标志（lucide 无此品牌图标 → 内联）。 */
-function GithubMark({ size = 14 }: { size?: number }) {
+export function GithubMark({ size = 14 }: { size?: number }) {
   return (
     <svg
       viewBox="0 0 24 24"
@@ -34,16 +34,20 @@ function GithubMark({ size = 14 }: { size?: number }) {
 }
 
 /**
- * 输入框底部「GitHub 仓库」入口。未绑：GitHub 标志 + 「关联 GitHub 仓库」文字（始终可见,
- * 一眼知道是啥、明显可点）；已绑：标志 + owner/repo + 分支 + 状态点，accent 高亮。
- * 点击开 GitHub 仓库 modal（账号关联 + 选仓 + 绑定）。
+ * Composer GitHub 仓库胶囊。
+ * - 已绑：标志 + owner/repo + 分支 + 状态点，用于 Composer 顶部微上下文条；
+ * - 未绑：默认带细边，quiet 态为无框轻透明入口（桌面工具行轻量不抢戏）。
  */
 export function RepoPill({
   selection,
   onClick,
+  compact = false,
+  quiet = false,
 }: {
   selection: RepoSelection | null;
   onClick: () => void;
+  compact?: boolean;
+  quiet?: boolean;
 }) {
   const { dot } = formatRepoLabel(selection);
   const sel = selection?.selected ? selection : null;
@@ -56,13 +60,16 @@ export function RepoPill({
       aria-label={sel ? `代码仓库 ${sel.owner}/${sel.repo}，点击管理` : "关联 GitHub 仓库"}
       title={sel ? `${sel.owner}/${sel.repo} @ ${sel.branch}` : "关联 GitHub 仓库"}
       className={cn(
-        "inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full border px-2.5 py-1 text-meta font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]",
+        "inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full border font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]",
+        compact ? "px-2 py-0.5 text-caption" : "px-2.5 py-1 text-meta",
         sel
-          ? "border-accent/40 bg-accent-soft text-accent hover:border-accent/60"
-          : "border-border text-muted hover:border-border-strong hover:bg-hover hover:text-fg",
+          ? "border-accent/35 bg-accent-soft text-accent hover:border-accent/55"
+          : quiet
+            ? "border-transparent bg-transparent px-2 text-caption text-faint hover:bg-hover hover:text-fg"
+            : "border-border text-muted hover:border-border-strong hover:bg-hover hover:text-fg",
       )}
     >
-      <GithubMark size={14} />
+      <GithubMark size={compact || quiet ? 13 : 14} />
       {sel ? (
         <>
           {/* owner / 分支 / 状态此前用 opacity-70/80 压暗:accent 文字在 accent-soft 底上被压到

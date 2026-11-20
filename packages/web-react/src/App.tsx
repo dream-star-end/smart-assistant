@@ -127,7 +127,7 @@ import { useChatProjects } from "./hooks/useChatProjects";
 import { useUnreadSessions } from "./hooks/useUnreadSessions";
 import { useSidebarWidth } from "./hooks/useSidebarWidth";
 import { useLocalComposerPrefs } from "./hooks/useLocalComposerPrefs";
-import { useMdViewport, useWideViewport } from "./hooks/useMdViewport";
+import { useMdViewport, useViewportClass } from "./hooks/useMdViewport";
 import { useResizableWidth } from "./hooks/useResizableWidth";
 import { readCollapsed, writeCollapsed } from "./lib/sidebarCollapsed";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
@@ -242,9 +242,6 @@ import {
 export { prefetchLazyCentersOnIdle } from "./appLazyViews";
 
 const EMPTY_WS_MESSAGES: ChatMessage[] = [];
-
-
-
 const EMPTY_CATALOG_MODELS: PublicModel[] = [];
 const EMPTY_LOCKED_CATALOG_MODELS: LockedPublicModel[] = [];
 
@@ -317,17 +314,16 @@ export function App() {
   const updatePillVisible = useSyncExternalStore(appUpdate.subscribe, appUpdate.getPillVisible);
   const [imageAnnotationSource, setImageAnnotationSource] = useState<ImageAnnotationSource | null>(null);
   const [containerPreviewUrl, setContainerPreviewUrl] = useState<string | null>(null);
-  // 详情面板(右侧第三栏,OCV5-370):宽屏(≥1100px)内联第三列,开合与宽度记在本机;
-  // 更窄的视口用贴底 Sheet,不硬挤三列。面板里看哪一步是纯 UI 态,不进 ChatSocket。
+  // 详情面板：1024-1199px(expanded)自动折侧栏双栏，≥1200px(wide)允许三栏；更窄走贴底 Sheet。
   const isMdViewport = useMdViewport();
-  const isWideViewport = useWideViewport();
-  // 侧栏抽屉只属于窄屏:拉宽到 md 时 CSS(md:hidden)藏起了它，但 Radix 模态仍开着，
-  // 下一次点输入框只会关掉这个看不见的抽屉(#1240「首次点击无响应」)。跨过 md 即关。
+  const viewportClass = useViewportClass();
+  const isWideViewport = viewportClass === "expanded" || viewportClass === "wide";
   useEffect(() => {
     if (isMdViewport) setMobileNavOpen(false);
   }, [isMdViewport]);
   const [paneOpen, setPaneOpenState] = useState(readDetailPaneOpen);
   const [paneSheetOpen, setPaneSheetOpen] = useState(false);
+  const [paneSheetFull, setPaneSheetFull] = useState(false);
   const [paneRequest, setPaneRequest] = useState<PaneRequest | null>(null);
   const [paneActive, setPaneActive] = useState<ToolLike | null>(null);
   const paneWidth = useResizableWidth(DETAIL_PANE_WIDTH);
@@ -1179,11 +1175,15 @@ export function App() {
     !boardOpen && !sitesOpen && !projectHome && (demo ? !!paneRequest?.message : !!activeId && wsMessages.length > 0);
   const paneRequestHere = paneRequestForSession(paneRequest, activeId);
   const paneInline = paneAvailable && isWideViewport && paneOpen;
+  useEffect(() => {
+    if (viewportClass === "expanded" && paneInline) setCollapsed(true);
+  }, [viewportClass, paneInline]);
   const paneShown = paneInline || (paneAvailable && !isWideViewport && paneSheetOpen);
+  const closePaneSheet = () => { setPaneSheetOpen(false); setPaneSheetFull(false); };
   const togglePane = () => {
     if (paneShown) {
       if (isWideViewport) setPaneOpen(false);
-      else setPaneSheetOpen(false);
+      else closePaneSheet();
       return;
     }
     openPane();
@@ -2681,78 +2681,77 @@ export function App() {
         )}
       </main>
 
-      {/* 详情面板(右侧第三栏)。宽屏:与 Sidebar|main 并列的内联 aside;
-          更窄:贴底 Sheet(共用 InspectorPanelContent)。任务看板 / 项目主页占据 main 时不渲染。 */}
-      {paneInline && (
-        <LazyBoundary
-          key={activeId ?? "demo"}
-          fallback={
-            <aside className="flex shrink-0 flex-col items-center gap-3 border-l border-border p-4" style={{ width: paneWidth.width }}>
-              <output className="flex items-center gap-2 text-muted"><Spinner />正在加载详情面板…</output>
-              <Button variant="ghost" onClick={() => setPaneOpen(false)}>关闭详情面板</Button>
-            </aside>
-          }
-        >
-          <InspectorPanel
-            key={activeId ?? "demo"}
-            messages={wsMessages}
-            version={chat.version}
-            running={wsSending}
-            request={paneRequestHere}
-            deferredLoader={paneDeferredLoader}
-            focusNonce={paneRequestHere?.nonce}
-            onClose={() => setPaneOpen(false)}
-            onActiveChange={setPaneActive}
-            width={paneWidth.width}
-            resizing={paneWidth.resizing}
-            widthMin={DETAIL_PANE_WIDTH.min}
-            widthMax={DETAIL_PANE_WIDTH.max}
-            onResizeStart={paneWidth.onResizeStart}
-            onResizeKeyDown={paneWidth.onResizeKeyDown}
-            onAnnotateToComposer={appendToComposer}
-            onStopTurn={wsSending ? stopTurn : undefined}
-            liveBrowserAgentId={demo ? undefined : agent.id}
-            liveBrowserAuth={auth}
-          />
-        </LazyBoundary>
-      )}
-      <Sheet
-        open={paneAvailable && paneSheetOpen && !isWideViewport}
-        onOpenChange={(o) => {
-          if (!o) setPaneSheetOpen(false);
-        }}
-        side="bottom"
-        srTitle="详情面板"
-      >
-        {paneSheetOpen && (
-          <div className="flex h-[80dvh] min-h-0 flex-col">
-            <LazyBoundary
-              key={activeId ?? "demo"}
-              fallback={
-                <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-4">
-                  <output className="flex items-center gap-2 text-muted"><Spinner />正在加载详情面板…</output>
-                  <Button variant="ghost" onClick={() => setPaneSheetOpen(false)}>关闭详情面板</Button>
-                </div>
+      {(() => {
+        const sharedPaneProps = {
+          messages: wsMessages, version: chat.version, running: wsSending, request: paneRequestHere,
+          deferredLoader: paneDeferredLoader, onActiveChange: setPaneActive,
+          onStopTurn: wsSending ? stopTurn : undefined, liveBrowserAgentId: demo ? undefined : agent.id, liveBrowserAuth: auth,
+        };
+        return (
+          <>
+            {paneInline && (
+              <LazyBoundary
+                key={activeId ?? "demo"}
+                fallback={
+                  <aside className="flex shrink-0 flex-col items-center gap-3 border-l border-border p-4" style={{ width: paneWidth.width }}>
+                    <output className="flex items-center gap-2 text-muted"><Spinner />正在加载详情面板…</output>
+                    <Button variant="ghost" onClick={() => setPaneOpen(false)}>关闭详情面板</Button>
+                  </aside>
+                }
+              >
+                <InspectorPanel
+                  key={activeId ?? "demo"}
+                  {...sharedPaneProps}
+                  focusNonce={paneRequestHere?.nonce}
+                  onClose={() => setPaneOpen(false)}
+                  width={paneWidth.width}
+                  resizing={paneWidth.resizing}
+                  widthMin={DETAIL_PANE_WIDTH.min}
+                  widthMax={DETAIL_PANE_WIDTH.max}
+                  onResizeStart={paneWidth.onResizeStart}
+                  onResizeKeyDown={paneWidth.onResizeKeyDown}
+                  onAnnotateToComposer={appendToComposer}
+                />
+              </LazyBoundary>
+            )}
+            <Sheet
+              open={paneAvailable && paneSheetOpen && !isWideViewport}
+              onOpenChange={(o) => { if (!o) closePaneSheet(); }}
+              side="bottom"
+              srTitle="详情面板"
+              className={
+                paneSheetFull
+                  ? "h-[100dvh] max-h-[100dvh] overflow-hidden rounded-none pb-0 [&>div:first-of-type]:hidden"
+                  : "h-[92dvh] max-h-[92dvh] overflow-hidden pb-0"
               }
             >
-              <InspectorPanelContent
-                key={activeId ?? "demo"}
-                messages={wsMessages}
-                version={chat.version}
-                running={wsSending}
-                request={paneRequestHere}
-                deferredLoader={paneDeferredLoader}
-                onClose={() => setPaneSheetOpen(false)}
-                onActiveChange={setPaneActive}
-                onAnnotateToComposer={(text) => { appendToComposer(text); setPaneSheetOpen(false); }}
-                onStopTurn={wsSending ? stopTurn : undefined}
-                liveBrowserAgentId={demo ? undefined : agent.id}
-                liveBrowserAuth={auth}
-              />
-            </LazyBoundary>
-          </div>
-        )}
-      </Sheet>
+              {paneSheetOpen && (
+                <div className="flex min-h-0 flex-1 flex-col">
+                  <LazyBoundary
+                    key={activeId ?? "demo"}
+                    fallback={
+                      <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-4">
+                        <output className="flex items-center gap-2 text-muted"><Spinner />正在加载详情面板…</output>
+                        <Button variant="ghost" onClick={closePaneSheet}>关闭详情面板</Button>
+                      </div>
+                    }
+                  >
+                    <InspectorPanelContent
+                      key={activeId ?? "demo"}
+                      {...sharedPaneProps}
+                      sheet
+                      fullscreen={paneSheetFull}
+                      onToggleFullscreen={() => setPaneSheetFull((v) => !v)}
+                      onClose={closePaneSheet}
+                      onAnnotateToComposer={(text) => { appendToComposer(text); closePaneSheet(); }}
+                    />
+                  </LazyBoundary>
+                </div>
+              )}
+            </Sheet>
+          </>
+        );
+      })()}
 
       <AppDialogs
         preferencesRevision={preferencesRevision}

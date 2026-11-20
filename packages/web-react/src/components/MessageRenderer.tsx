@@ -11,6 +11,11 @@ import { ReadOnlySystemActionsBoundary } from "./iui/ReadOnlySystemActionsBounda
  */
 import { returnStrayRowsToOwnerTurn } from "../lib/chat/order";
 import { FirstTextPaintCommitProbe } from "./chat/FirstTextPaintCommitProbe";
+import {
+  ScrollToBottomButton,
+  shouldShowScrollToBottom,
+  useScrollToBottomVisibility,
+} from "./chat/ScrollToBottomButton";
 import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isInteractiveToolMessage, isProcessMessage, keepDistinctActivity, processSections, promptShadowedToolIds, turnOutcome } from "./chat/ProcessDisclosure";
 import { ChevronDown, ChevronUp, Info, X } from "lucide-react";
 import {
@@ -1348,13 +1353,7 @@ function coalesceTeam(
 // hasMore / loadOlder button (scroll never issues a network page).
 export const TIMELINE_INITIAL_TAIL_ITEMS = 80;
 
-export function shouldShowScrollToBottom(
-  following: boolean | undefined,
-  messageCount: number,
-  distance = Number.POSITIVE_INFINITY,
-): boolean {
-  return messageCount > 0 && following === false && distance > 80;
-}
+export { shouldShowScrollToBottom };
 const TIMELINE_WINDOW_EXPAND_ITEMS = 80;
 /** Safety stop for a cursor that keeps moving. One manual page remains after this. */
 const LIVE_UNITS_AUTO_PAGE_CAP = 40;
@@ -1668,7 +1667,13 @@ export function MessageList({
   const didSnapToBottomRef = useRef(false);
   const followBottomRefBox = useRef(followBottomRef);
   followBottomRefBox.current = followBottomRef;
-  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [showScrollToBottom, setShowScrollToBottom] = useScrollToBottomVisibility({
+    scrollParent,
+    listRootRef,
+    followBottomRef,
+    sessionId,
+    messageCount: messages.length,
+  });
   const [findQuery, setFindQuery] = useState("");
   const [findCursor, setFindCursor] = useState(0);
   const [findPin, setFindPin] = useState<FindPinState | null>(null);
@@ -1823,36 +1828,6 @@ export function MessageList({
       if (frame) cancelAnimationFrame(frame);
     };
   }, [findPin, scrollParent, followBottomRef, windowVersion]);
-  useEffect(() => {
-    const el = scrollParent;
-    if (!el || !followBottomRef) {
-      setShowScrollToBottom(false);
-      return;
-    }
-    let frame = 0;
-    const sync = () => {
-      frame = 0;
-      // Store only visibility, not pixel distance: scrolling within the same
-      // state must not force the whole MessageList to re-render every frame.
-      setShowScrollToBottom(shouldShowScrollToBottom(
-        followBottomRef.current, messages.length, el.scrollHeight - el.clientHeight - el.scrollTop,
-      ));
-    };
-    const schedule = () => {
-      if (!frame) frame = requestAnimationFrame(sync);
-    };
-    sync();
-    el.addEventListener("scroll", schedule, { passive: true });
-    // Viewport/keyboard or content changes need not produce a scroll event.
-    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(schedule);
-    observer?.observe(el);
-    if (listRootRef.current) observer?.observe(listRootRef.current);
-    return () => {
-      el.removeEventListener("scroll", schedule);
-      observer?.disconnect();
-      cancelAnimationFrame(frame);
-    };
-  }, [scrollParent, followBottomRef, sessionId, messages.length]);
   const rowHeightCacheRef = useRef<Map<string, number>>(rowHeightBucket(sessionId));
   const visibleKeysRef = useRef<string[]>([]);
   const eagerPayloadKeysRef = useRef<Set<string> | null>(null);
@@ -3249,48 +3224,23 @@ export function MessageList({
       ) : null}
       {olderLiveStepsKey === null ? olderLiveStepsControl : null}
       {footer}
-      {/* 回到底部 FAB。它是滚动内容(也是 ResizeObserver root)的子节点,所以必须
-          **零高度、常驻挂载**,只用 opacity/pointer-events 切可见。若随 following
-          挂载/卸载,按钮自身 52px 就是 scrollHeight 的一部分:滑回底部 → following
-          翻真 → 按钮卸载 → scrollHeight 收缩 → 浏览器 clamp scrollTop → 篱笆仍在
-          (hadUserIntent)→ 零容差判成用户离底 → following 翻假 → 按钮再挂载……
-          几何自激,表现为每次滚回底部都弹一下(2026-09-07 rel-22a377d7f 复现)。
-          -mt-4 抵消 space-y-4 给前一个兄弟加的 16px 下边距,滚动内容总高与无按钮时一致。 */}
       {followBottomRef?.jumpToBottom && messages.length > 0 && (
-        <div
-          aria-hidden={!showScrollToBottom}
-          data-testid="scroll-to-bottom-dock"
-          data-visible={showScrollToBottom ? "true" : "false"}
-          className="sticky bottom-4 z-10 -mt-4 h-0 overflow-visible"
-        >
-          <button
-            type="button"
-            data-testid="scroll-to-bottom"
-            aria-label="回到底部"
-            tabIndex={showScrollToBottom ? 0 : -1}
-            // 移动端 44px 圆钮叠在末行正文/状态标签右侧:加一圈页面底色描边把它从底下的文字里
-            // 抬出来,并在触屏下挪进列表根的 px-5 边距(-right-3),少压 12px 正文。
-            className={
-              "absolute bottom-0 right-0 flex size-9 items-center justify-center rounded-full bg-fg text-bg shadow-float ring-[3px] ring-bg transition-opacity duration-200 [@media(hover:none)]:-right-3 [@media(hover:none)]:size-11 " +
-              (showScrollToBottom ? "opacity-100" : "pointer-events-none opacity-0")
-            }
-            onClick={() => {
-              if (!scrollParent || !followBottomRef?.jumpToBottom) return;
-              pendingExpandCorrectionRef.current = null;
-              viewportPreserveLockRef.current = false;
-              liveUnitsHoldRef.current = null;
-              liveUnitsSettleRef.current = null;
-              lastViewportAnchorRef.current = null;
-              followBottomRef.jumpToBottom(scrollParent);
-              setShowScrollToBottom(shouldShowScrollToBottom(
-                followBottomRef.current, messages.length,
-                scrollParent.scrollHeight - scrollParent.clientHeight - scrollParent.scrollTop,
-              ));
-            }}
-          >
-            <ChevronDown size={18} />
-          </button>
-        </div>
+        <ScrollToBottomButton
+          visible={showScrollToBottom}
+          onClick={() => {
+            if (!scrollParent || !followBottomRef?.jumpToBottom) return;
+            pendingExpandCorrectionRef.current = null;
+            viewportPreserveLockRef.current = false;
+            liveUnitsHoldRef.current = null;
+            liveUnitsSettleRef.current = null;
+            lastViewportAnchorRef.current = null;
+            followBottomRef.jumpToBottom(scrollParent);
+            setShowScrollToBottom(shouldShowScrollToBottom(
+              followBottomRef.current, messages.length,
+              scrollParent.scrollHeight - scrollParent.clientHeight - scrollParent.scrollTop,
+            ));
+          }}
+        />
       )}
     </div>
     </>

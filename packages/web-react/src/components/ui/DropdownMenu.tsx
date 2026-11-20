@@ -7,6 +7,11 @@ export const DropdownMenu = RD.Root;
 export const DropdownMenuTrigger = RD.Trigger;
 export const DropdownMenuGroup = RD.Group;
 
+const DEFAULT_DROPDOWN_MAX_H =
+  "max-h-[min(80dvh,var(--radix-dropdown-menu-content-available-height))]";
+const hasUnprefixedMaxH = (className?: string) =>
+  typeof className === "string" && /(?:^|\s)max-h-/.test(className);
+
 export const DropdownMenuContent = forwardRef<
   ComponentRef<typeof RD.Content>,
   ComponentPropsWithoutRef<typeof RD.Content>
@@ -17,9 +22,11 @@ export const DropdownMenuContent = forwardRef<
       sideOffset={sideOffset}
       collisionPadding={collisionPadding}
       className={cn(
-        // 矮视口（如手机横屏）下菜单高于触发点上下可用空间时，原先仅设 overflow-hidden 会导致翻转后顶出视口、
-        // 首项（如侧栏项目行「新建会话」）被裁掉看不到；按 Radix 可用高度封顶并开启纵向滚动（OCV5-778）。
-        "z-50 max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-[11rem] overflow-y-auto overflow-x-hidden overscroll-contain rounded-lg border border-border bg-elevated p-1 text-fg shadow-pop",
+        // 矮视口（如手机横屏）下按 min(80dvh, Radix 可用高) 封顶并开启纵向滚动（OCV5-778 / OCV5-820）；
+        // oc-dropdown-max-h 提供老 WebView 的 80vh 回退，调用方传自定义 max-h-* 时自动让位不冲突。
+        !hasUnprefixedMaxH(className) && "oc-dropdown-max-h",
+        "z-50 min-w-[11rem] overflow-y-auto overflow-x-hidden overscroll-contain rounded-lg border border-border bg-elevated p-1 text-fg shadow-pop",
+        DEFAULT_DROPDOWN_MAX_H,
         "data-[state=open]:animate-pop",
         className,
       )}
@@ -83,7 +90,9 @@ export const DropdownMenuSubContent = forwardRef<
     sideOffset={sideOffset}
     collisionPadding={collisionPadding}
     className={cn(
-      "z-50 max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-[11rem] overflow-y-auto overflow-x-hidden overscroll-contain rounded-lg border border-border bg-elevated p-1 text-fg shadow-pop",
+      !hasUnprefixedMaxH(className) && "oc-dropdown-max-h",
+      "z-50 min-w-[11rem] overflow-y-auto overflow-x-hidden overscroll-contain rounded-lg border border-border bg-elevated p-1 text-fg shadow-pop",
+      DEFAULT_DROPDOWN_MAX_H,
       "data-[state=open]:animate-pop",
       className,
     )}

@@ -1,16 +1,16 @@
-/* Phase Timeline — 极简微排版轨迹与单行分段筛选，仅消费 design system --* tokens。 */
+/* Phase Timeline — Quiet Telemetry 极简微排版轨迹与单行分段筛选，仅消费 design system --* tokens。 */
 
 .oc-phase-strip {
   display: flex;
   flex-wrap: nowrap;
   align-items: center;
   gap: 0.125rem;
-  padding: 0 1rem 0.25rem 2.125rem;
+  padding: 0 1.5rem 0.25rem 2.125rem;
   min-width: 0;
   overflow-x: auto;
   scrollbar-width: none;
-  -webkit-mask-image: linear-gradient(to right, black 0%, black calc(100% - 16px), transparent 100%);
-  mask-image: linear-gradient(to right, black 0%, black calc(100% - 16px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to right, black 0%, black calc(100% - 28px), transparent 100%);
+  mask-image: linear-gradient(to right, black 0%, black calc(100% - 28px), transparent 100%);
 }
 
 .oc-phase-strip::-webkit-scrollbar {
@@ -35,6 +35,7 @@
   background: transparent;
   color: var(--faint);
   font-size: var(--text-caption);
+  font-variant-numeric: tabular-nums;
   line-height: 1;
   font-weight: 500;
   white-space: nowrap;
@@ -53,9 +54,15 @@
   outline-offset: 1px;
 }
 
-.oc-phase-crumb[data-phase-active="true"],
+/* 语义分离：运行中仅加权文字+左侧呼吸点；选中筛选态才使用强调色。 */
+.oc-phase-crumb[data-phase-active="true"] {
+  color: var(--fg);
+  font-weight: 550;
+}
+
 .oc-phase-crumb[aria-pressed="true"] {
   color: var(--accent);
+  font-weight: 600;
 }
 
 .oc-phase-pill {
@@ -64,18 +71,22 @@
   align-items: center;
   gap: 0.25rem;
   height: 1.75rem;
-  padding: 0 0.5625rem;
+  padding: 0 0.5rem;
   border-radius: var(--radius-xs);
-  border: 0;
+  border: 1px solid transparent;
   background: transparent;
   color: var(--muted);
   font-size: var(--text-caption);
+  font-variant-numeric: tabular-nums;
   line-height: 1;
   font-weight: 500;
   white-space: nowrap;
   cursor: pointer;
   outline: none;
-  transition: background-color 150ms var(--ease-standard), color 150ms var(--ease-standard);
+  transition:
+    background-color 150ms var(--ease-standard),
+    border-color 150ms var(--ease-standard),
+    color 150ms var(--ease-standard);
 }
 
 .oc-phase-pill:hover {
@@ -88,15 +99,43 @@
   outline-offset: 1px;
 }
 
+/* 运行中但未被单选过滤的阶段：不铺满高亮底色，仅靠左侧 6px 呼吸点 + 轻度文字加权区分「谁在跑」。 */
 .oc-phase-pill[data-phase-active="true"] {
-  background: var(--accent-soft);
-  color: var(--accent);
+  background: transparent;
+  border-color: transparent;
+  color: var(--fg);
+  font-weight: 550;
 }
 
+/* 用户当前选中的筛选 Tab：唯一高对比清晰选中态，杜绝与运行中阶段双高亮。 */
 .oc-phase-pill[aria-pressed="true"] {
   background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
   color: var(--accent);
   font-weight: 600;
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--fg) 4%, transparent);
+}
+
+.oc-phase-active-dot {
+  width: 6px;
+  height: 6px;
+  flex-shrink: 0;
+  border-radius: 9999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
+  animation: oc-phase-dot-pulse 2s ease-in-out infinite;
+}
+
+@keyframes oc-phase-dot-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.42;
+    transform: scale(0.84);
+  }
 }
 
 .oc-phase-pill-icon {
@@ -112,7 +151,7 @@
 .oc-phase-pill-duration {
   font-variant-numeric: tabular-nums;
   opacity: 0.65;
-  margin-left: 0.125rem;
+  margin-left: 0.0625rem;
 }
 
 .oc-phase-connector {
@@ -152,8 +191,11 @@
   align-items: center;
   gap: 0.1875rem;
   min-width: 0;
+  padding-right: 1.5rem;
   overflow-x: auto;
   scrollbar-width: none;
+  -webkit-mask-image: linear-gradient(to right, black 0%, black calc(100% - 28px), transparent 100%);
+  mask-image: linear-gradient(to right, black 0%, black calc(100% - 28px), transparent 100%);
 }
 
 .oc-phase-filter-pills::-webkit-scrollbar {
@@ -163,7 +205,7 @@
 .oc-phase-reset {
   flex-shrink: 0;
   height: 1.75rem;
-  padding: 0 0.5rem;
+  padding: 0 0.4375rem;
   border-radius: var(--radius-xs);
   border: 0;
   background: transparent;
@@ -197,20 +239,22 @@
   padding: 0.25rem 0;
   color: var(--muted);
   font-size: var(--text-caption);
+  font-variant-numeric: tabular-nums;
   line-height: var(--text-caption--line-height);
   font-weight: 500;
 }
 
+/* 触屏下收紧横向冗余 padding，避免 390px 窄屏字符被腰斩，同时保持舒适点按高度。 */
 @media (hover: none) {
   .oc-phase-crumb {
-    min-height: 2.75rem;
-    padding: 0 0.5rem;
+    min-height: 2.25rem;
+    padding: 0 0.375rem;
   }
 
   .oc-phase-pill,
   .oc-phase-reset {
-    min-height: 2.75rem;
-    padding: 0 0.625rem;
+    min-height: 2.25rem;
+    padding: 0 0.4375rem;
   }
 }
 
@@ -219,5 +263,9 @@
   .oc-phase-pill,
   .oc-phase-reset {
     transition: none;
+  }
+
+  .oc-phase-active-dot {
+    animation: none;
   }
 }

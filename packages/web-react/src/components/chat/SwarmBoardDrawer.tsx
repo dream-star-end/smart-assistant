@@ -556,13 +556,13 @@ export function SwarmBoardDrawer({
   return (
     <RD.Root open={open} onOpenChange={onOpenChange}>
       <RD.Portal>
-        <RD.Overlay className="fixed inset-0 z-50 bg-black/45 backdrop-blur-[3px] animate-in" />
+        <RD.Overlay className="fixed inset-0 z-50 bg-black/35 backdrop-blur-sm data-[state=open]:animate-fade" />
         <RD.Content
           data-testid="swarm-board-drawer"
           aria-describedby={undefined}
           className={cn(
-            "fixed left-1/2 top-1/2 z-50 flex -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden",
-            "h-[min(90dvh,calc(var(--oc-visual-height,100dvh)-1rem))] w-[calc(100vw-1rem)] max-w-5xl rounded-2xl border border-border bg-bg pb-[env(safe-area-inset-bottom)] shadow-pop outline-none sm:h-[min(84dvh,calc(var(--oc-visual-height,100dvh)-2rem))] sm:w-[calc(100vw-2.5rem)]",
+            "fixed left-1/2 top-1/2 z-50 flex -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden data-[state=open]:animate-in",
+            "h-[min(90dvh,calc(var(--oc-visual-height,100dvh)-1rem))] w-[calc(100vw-1rem)] max-w-5xl rounded-xl border border-border bg-elevated pb-[env(safe-area-inset-bottom)] text-fg shadow-float outline-none sm:h-[min(84dvh,calc(var(--oc-visual-height,100dvh)-2rem))] sm:w-[calc(100vw-2.5rem)]",
           )}
         >
           {/* Top accent ribbon */}
@@ -575,8 +575,8 @@ export function SwarmBoardDrawer({
           <div className="flex flex-wrap items-center gap-2.5 border-b border-border bg-surface px-4 py-3">
             <span
               className={cn(
-                "relative flex size-8 shrink-0 items-center justify-center rounded-xl text-white shadow-soft",
-                active ? "bg-grad-cta" : "bg-primary text-primary-fg",
+                "relative flex size-8 shrink-0 items-center justify-center rounded-xl shadow-soft",
+                active ? "bg-grad-cta text-white" : "bg-primary text-primary-fg",
               )}
             >
               <Hexagon size={16} strokeWidth={2.2} />
@@ -620,7 +620,7 @@ export function SwarmBoardDrawer({
                   onChange={(e) => setSearch(e.target.value)}
                   placeholder="搜索讨论、@成员或 #序号"
                   aria-label="搜索蜂群讨论"
-                  className="h-8 w-full rounded-lg border border-border bg-bg pl-8 pr-2.5 text-meta text-fg outline-none transition-colors placeholder:text-faint focus:border-accent"
+                  className="h-8 w-full rounded-lg border border-border-control/60 bg-bg pl-8 pr-2.5 text-base text-fg outline-none transition-colors placeholder:text-faint focus:border-accent md:text-meta"
                 />
               </div>
               <Button

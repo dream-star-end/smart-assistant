@@ -50,7 +50,7 @@ export default function ComposerPrediction({
       data-testid="composer-prediction"
       className={cn(
         "pointer-events-none absolute inset-y-0 left-1 right-1 overflow-hidden whitespace-pre-wrap break-words py-1.5 leading-relaxed",
-        large ? "text-[17.5px]" : "text-[16px]",
+        large ? "text-[17.5px]" : "text-base md:text-sm",
       )}
     >
       <div style={scrollTop > 0 ? { transform: `translateY(-${scrollTop}px)` } : undefined}>

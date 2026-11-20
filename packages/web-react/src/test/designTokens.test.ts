@@ -160,8 +160,13 @@ describe.each(THEMES)("设计 token 对比度契约 · $name", ({ selector }) =>
   it.each(BADGE_TONES)("--%s 在自身 -soft 徽章底上 ≥ 4.5:1", (tone) => {
     const fg = parseHex(t[tone]).rgb;
     const soft = parseHex(t[`${tone}-soft`]);
-    // -soft 是同色低 alpha,徽章渲染在 surface/elevated 上。
+    const sidebar = parseHex(t.sidebar).rgb;
+    const hover = parseHex(t.hover);
+    const hoverSurface = composite(hover.rgb, hover.alpha, surface);
+    // -soft 是同色低 alpha,徽章渲染在 surface / sidebar / hover 叠底上都必须达 WCAG AA。
     expect(contrast(fg, composite(soft.rgb, soft.alpha, surface))).toBeGreaterThanOrEqual(4.5);
+    expect(contrast(fg, composite(soft.rgb, soft.alpha, sidebar))).toBeGreaterThanOrEqual(4.5);
+    expect(contrast(fg, composite(soft.rgb, soft.alpha, hoverSurface))).toBeGreaterThanOrEqual(4.5);
   });
 
   it("--ring 是实色且 ≥ 3:1(半透明焦点环等于没有焦点环)", () => {

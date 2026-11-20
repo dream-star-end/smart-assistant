@@ -9,6 +9,7 @@ import {
   PanelRight,
   PanelRightClose,
   PenSquare,
+  Plus,
   RefreshCw,
   Search,
   Share2,
@@ -25,10 +26,12 @@ import { cn, formatCredits } from "../lib/utils";
 import { AgentAvatar } from "./AgentAvatar";
 import { type LockedSelectInfo, ModelSelector, teamEngineLabel } from "./ModelSelector";
 import {
+  Badge,
   Button,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
   IconButton,
   Popover,
@@ -158,12 +161,12 @@ export function ChatHeader({
   onToggleQuickAsk?: () => void;
   quickAskOpen?: boolean;
   quickAskSending?: boolean;
-  /** 开合详情面板(右侧第三栏)。省略则不渲染(demo / 空会话 / 任务看板)。手机上入口在过程摘要行。 */
+  /** 开合详情面板(右侧第三栏 / 移动端 Workbench 入口)。省略则不渲染(demo / 空会话 / 任务看板)。 */
   onTogglePane?: () => void;
   paneOpen?: boolean;
-  /** 站内信未读数（>0 显红点，>99 显 99+）。 */
+  /** 站内信未读数（>0 显克制 6px 状态点，hover/溢出菜单显精准计数）。 */
   unreadCount?: number;
-  /** 会话未读数（侧栏折叠/移动抽屉入口角标）。与站内信 unreadCount 并存、语义不同。 */
+  /** 会话未读数（侧栏折叠/移动抽屉入口 6px 呼吸点）。与站内信 unreadCount 并存、语义不同。 */
   sessionUnreadCount?: number;
   projectBreadcrumb?: { chatName?: string | null; workName?: string | null } | null;
   /** 未分类会话的项目建议（P5，开关控制）。只提示，移入由用户点。 */
@@ -181,13 +184,25 @@ export function ChatHeader({
   const showUpdatePill = updateAvailable && !!onReloadForUpdate;
   const trimmedSessionTitle = typeof sessionTitle === "string" ? sessionTitle.trim() : "";
   const showSessionTitle = Boolean(trimmedSessionTitle && trimmedSessionTitle !== "新对话");
+  const hasUnreadInbox = Boolean(unreadCount && unreadCount > 0);
   const hasSecondaryActions = Boolean(onOpenFind || onShare || onOpenInbox || credits != null);
+  const hasDesktopOverflow = Boolean(onOpenFind || onShare);
+  const hasMobileOnlyOverflow = Boolean(
+    onOpenInbox ||
+      credits != null ||
+      onToggleQuickAsk ||
+      (projectBreadcrumb?.chatName && onOpenProjectScope) ||
+      showUpdatePill ||
+      onAgentClick,
+  );
+  const hasOverflowMenu = hasDesktopOverflow || hasMobileOnlyOverflow;
   const hasWorkspaceToggles = Boolean(onToggleQuickAsk || onTogglePane);
   // 团队模式说明弹层的受控开关：点「关闭团队模式」需要主动收起弹层（chip 随
   // teamModeActive 翻 false 一起卸载,不控 open 会留下无锚点的浮层）。
   const [teamPopoverOpen, setTeamPopoverOpen] = useState(false);
   const [advisorPopoverOpen, setAdvisorPopoverOpen] = useState(false);
   const engineLabel = teamEngineLabel(models ?? [], teamLeaderModelId, lockedModels);
+
   return (
     <WorkspaceShellHeader
       data-product-entry-scope="chat-header"
@@ -207,41 +222,42 @@ export function ChatHeader({
           </IconButton>
         ) : undefined
       }
-      contentClassName="flex-wrap gap-x-1.5 gap-y-0 px-2.5 pb-1.5 @[560px]:flex-nowrap @[560px]:gap-1.5 sm:px-4 sm:pb-2"
+      contentClassName="min-h-12 flex-nowrap items-center gap-1 px-2 py-1 sm:min-h-[52px] sm:gap-1.5 sm:px-4 sm:py-1.5"
     >
+      {/* 智能体切换：手机 <640px 收入「···」菜单以释放单行呼吸顶栏；sm+ 常驻且在平板 640-1023px 收束宽度防止挤压模型名。 */}
       <button
         type="button"
         data-product-feature={PRODUCT_CAPABILITIES.agents.id}
         onClick={onAgentClick}
         aria-label={`切换智能体，当前${agent.name}`}
-        className="flex min-h-11 min-w-0 flex-1 items-center gap-1.5 rounded-xl px-1 py-1.5 @[560px]:flex-initial @[560px]:px-2.5 outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
+        className="hidden min-h-11 min-w-0 shrink-0 items-center gap-1.5 rounded-xl px-2 py-1.5 outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98] sm:flex"
       >
         <AgentAvatar agent={agent} className="size-7 shrink-0 rounded-lg" iconSize={15} />
-        {/* 窄屏不折行：截断而非换行（避免"全能/助手"难看的两行）。 */}
-        <span className="max-w-[7.5rem] truncate whitespace-nowrap text-title font-semibold text-fg @[560px]:max-w-none">
+        <span className="max-w-[6.5rem] truncate whitespace-nowrap text-title font-semibold text-fg lg:max-w-[10rem]">
           {agent.name}
         </span>
-        <ChevronDown size={15} className="hidden shrink-0 text-faint @[560px]:block" />
+        <ChevronDown size={15} className="hidden shrink-0 text-faint lg:block" />
       </button>
+
       {showSessionTitle && (
         <span
           data-testid="chat-session-title"
           title={trimmedSessionTitle}
-          className="hidden min-w-0 max-w-[13rem] shrink items-center gap-1.5 text-meta font-medium text-muted @[760px]:inline-flex"
+          className="hidden min-w-0 max-w-[12rem] shrink items-center gap-1.5 text-meta font-medium text-muted @[880px]:inline-flex"
         >
           <span aria-hidden className="text-border-strong">/</span>
           <span className="truncate">{trimmedSessionTitle}</span>
         </span>
       )}
+
       {projectBreadcrumb?.chatName ? (
-        // 所在项目:窄容器落位到第二行模型行右侧空位，释放第一行让智能体名完整展开；宽容器紧跟智能体名。
         <button
           type="button"
           data-testid="chat-project-breadcrumb"
           data-product-control="project-breadcrumb"
           onClick={onOpenProjectScope}
           aria-label={`所在项目：${projectBreadcrumb.chatName}，点击打开项目`}
-          className="order-3 -my-1 ml-auto inline-flex min-h-11 min-w-0 max-w-[7.5rem] shrink-0 items-center gap-1 rounded-full px-1.5 text-caption text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring @[560px]:order-none @[560px]:my-0 @[560px]:ml-0 @[560px]:min-h-0 @[560px]:max-w-[13rem] @[560px]:shrink @[560px]:px-2 @[560px]:py-1"
+          className="hidden min-w-0 max-w-[11rem] shrink items-center gap-1 rounded-full px-2 py-1 text-caption text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring lg:inline-flex"
           title={`所在项目：${projectBreadcrumb.chatName}`}
         >
           <FolderOpen size={12.5} aria-hidden className="shrink-0" />
@@ -250,7 +266,7 @@ export function ChatHeader({
       ) : projectSuggestion ? (
         <span
           data-testid="chat-project-suggestion"
-          className="order-3 basis-full inline-flex min-w-0 max-w-full shrink items-center gap-0.5 rounded-lg border border-dashed border-border text-caption text-muted sm:order-none sm:basis-auto @[560px]:order-none @[560px]:basis-auto @[560px]:max-w-[18rem]"
+          className="hidden min-w-0 max-w-[18rem] shrink items-center gap-0.5 rounded-lg border border-dashed border-border text-caption text-muted sm:inline-flex"
         >
           <button
             type="button"
@@ -258,7 +274,7 @@ export function ChatHeader({
             data-product-control="project-suggestion-accept"
             aria-label={`移入项目「${projectSuggestion.name}」`}
             title={`这个会话可能属于「${projectSuggestion.name}」，点一下移入`}
-            className="inline-flex min-h-11 min-w-0 flex-1 items-center gap-1 rounded-lg px-1.5 outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring @[560px]:min-h-0 @[560px]:flex-initial @[560px]:py-1"
+            className="inline-flex min-w-0 items-center gap-1 rounded-lg px-1.5 py-1 outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
             <FolderOpen size={13} aria-hidden className="shrink-0" />
             <span className="truncate">移入「{projectSuggestion.name}」?</span>
@@ -268,23 +284,20 @@ export function ChatHeader({
             onClick={projectSuggestion.onDismiss}
             data-product-control="project-suggestion-dismiss"
             aria-label="不用移入"
-            className="inline-flex min-h-11 shrink-0 items-center rounded-lg px-1.5 outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring @[560px]:min-h-0 @[560px]:py-1"
+            className="inline-flex shrink-0 items-center rounded-lg px-1.5 py-1 outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
             不用
           </button>
         </span>
       ) : null}
+
+      {/* 模型与运行态核心区：手机 <640px 居中紧凑胶囊（单行永不折行）；平板/桌面 sm+ 左对齐且优先保障模型全名宽度。 */}
       {(teamModeActive || advisorModeActive || (models && onSelectModel) || running || showUpdatePill) && (
-        <>
-        <span aria-hidden className="order-1 h-0 basis-full border-t border-border/50 @[560px]:hidden" />
         <div
-          className="order-2 -my-1 flex min-w-0 flex-1 items-center gap-1.5 @[560px]:order-none @[560px]:my-0 @[560px]:basis-auto"
+          className="flex min-w-0 flex-1 items-center justify-center gap-1 sm:justify-start sm:gap-1.5"
           data-testid="chat-model-row"
         >
-          <span aria-hidden className="hidden h-4 w-px shrink-0 bg-border @[560px]:block" />
-          {/* OCV5-295:窄屏模型行不再铺整宽灰底(像主 CTA);触发器自带 44px 命中与截断,模型名/倍率直接可读。 */}
-          {/* 团队模式可见指示:开启期间常驻 agent 名旁(弹窗外唯一的知情入口),
-              点击弹说明 + 一键关闭。仅 main 会话(teamModeActive)显示。 */}
+          <span aria-hidden className="hidden h-4 w-px shrink-0 bg-border sm:block" />
           {advisorModeActive && (
             <Popover open={advisorPopoverOpen} onOpenChange={setAdvisorPopoverOpen}>
               <PopoverTrigger asChild>
@@ -292,13 +305,12 @@ export function ChatHeader({
                   type="button"
                   data-product-feature={PRODUCT_CAPABILITIES.advisorMode.id}
                   aria-label="顾问模式已开启"
-                  className="group flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
+                  className="group flex min-h-10 min-w-10 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98] sm:min-h-11 sm:min-w-11"
                 >
-                  {/* OCV5-307:44px 命中区留在透明 button 上,可见的是内层细胶囊 —— 原先整颗 44px 高的色块显得笨重。 */}
-                  <span className="flex items-center gap-1 rounded-full bg-accent-soft px-2.5 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15">
+                  <span className="flex items-center gap-1 rounded-full bg-accent-soft px-2 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15 sm:px-2.5">
                     <ShieldCheck size={11} className="shrink-0" />
-                    <span className="@[560px]:hidden">顾问</span>
-                    <span className="hidden @[560px]:inline">顾问模式</span>
+                    <span className="sm:hidden">顾问</span>
+                    <span className="hidden sm:inline">顾问模式</span>
                     {advisorModelLabel ? (
                       <span className="hidden max-w-[8rem] truncate @[720px]:inline" title={advisorModelLabel}>
                         · {advisorModelLabel}
@@ -337,13 +349,12 @@ export function ChatHeader({
                   type="button"
                   data-product-feature={PRODUCT_CAPABILITIES.teamMode.id}
                   aria-label="团队模式已开启"
-                  className="group flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
+                  className="group flex min-h-10 min-w-10 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98] sm:min-h-11 sm:min-w-11"
                 >
-                  <span className="flex items-center gap-1 rounded-full bg-accent-soft px-2.5 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15">
+                  <span className="flex items-center gap-1 rounded-full bg-accent-soft px-2 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15 sm:px-2.5">
                     <Users size={11} className="shrink-0" />
-                    {/* 窄容器给「团队」二字；宽容器用全称。 */}
-                    <span className="@[560px]:hidden">团队</span>
-                    <span className="hidden @[560px]:inline">团队模式</span>
+                    <span className="sm:hidden">团队</span>
+                    <span className="hidden sm:inline">团队模式</span>
                   </span>
                 </button>
               </PopoverTrigger>
@@ -395,14 +406,12 @@ export function ChatHeader({
               role="status"
               data-testid="header-running-badge"
               aria-label="当前会话正在运行"
-              className="inline-flex shrink-0 items-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-caption font-medium leading-none text-accent"
+              className="hidden shrink-0 items-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-caption font-medium leading-none text-accent sm:inline-flex"
             >
-              <Loader2 size={11} aria-hidden className="animate-spin shrink-0" />
+              <Loader2 size={11} aria-hidden className="shrink-0 animate-spin" />
               <span>运行中</span>
             </span>
           )}
-          {/* OCV5-626:版本不一致即亮,不等安全点 / 5 分钟横幅。放模型行右端:窄屏这一行整宽且右侧
-              本就空着,不挤顶栏图标;宽容器紧跟模型选择器。点一下走 governor.reloadNow()。 */}
           {showUpdatePill && (
             <button
               type="button"
@@ -411,7 +420,7 @@ export function ChatHeader({
               aria-label="有新版本，点击刷新页面"
               title="有新版本，点击刷新页面"
               onClick={onReloadForUpdate}
-              className="group ml-auto flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98] @[560px]:ml-1"
+              className="group ml-1 hidden min-h-11 min-w-11 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98] sm:flex"
             >
               <span className="flex items-center gap-1 rounded-full bg-accent-soft px-2.5 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15">
                 <RefreshCw size={11} className="shrink-0" />
@@ -421,11 +430,12 @@ export function ChatHeader({
             </button>
           )}
         </div>
-        </>
       )}
-      <div className="ml-auto flex shrink-0 items-center gap-0.5 @[560px]:gap-1">
+
+      {/* 右侧操作组：手机 <640px 仅展示 [◫ Workbench] + [＋ 新建] + [··· 溢出菜单]；sm+ 展示完整桌面操作。 */}
+      <div className="ml-auto flex shrink-0 items-center gap-0.5 sm:gap-1">
         {hasSecondaryActions && (
-          <div className="flex items-center gap-0 @[560px]:gap-0.5" data-testid="header-secondary-actions">
+          <div className="hidden items-center gap-0.5 sm:flex" data-testid="header-secondary-actions">
             {onOpenFind && (
               <IconButton
                 data-product-control
@@ -450,44 +460,23 @@ export function ChatHeader({
                 <Share2 size={17} />
               </IconButton>
             )}
-            {/* 窄屏或桌面三栏态（容器 <720px）将查找与分享并入「更多操作」菜单，防止顶栏挤压溢出。 */}
-            {(onShare || onOpenFind) && (
-              <div className="@[720px]:hidden">
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <IconButton
-                      data-product-control
-                      aria-label="更多操作"
-                      title="更多操作"
-                      shape="square"
-                      className="text-faint hover:text-fg"
-                    >
-                      <MoreHorizontal size={18} />
-                    </IconButton>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end">
-                    {onOpenFind && (
-                      <DropdownMenuItem data-product-control onSelect={onOpenFind}>
-                        <Search size={16} className="shrink-0 text-muted" />
-                        <span className="flex-1">会话内查找</span>
-                      </DropdownMenuItem>
-                    )}
-                    {onShare && (
-                      <DropdownMenuItem data-product-control onSelect={onShare}>
-                        <Share2 size={16} className="shrink-0 text-muted" />
-                        <span className="flex-1">分享</span>
-                      </DropdownMenuItem>
-                    )}
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              </div>
-            )}
             {onOpenInbox && (
               <div className="relative">
-                <IconButton data-product-feature={PRODUCT_CAPABILITIES.inbox.id} onClick={onOpenInbox} aria-label="站内信" shape="square">
+                <IconButton
+                  data-product-feature={PRODUCT_CAPABILITIES.inbox.id}
+                  onClick={onOpenInbox}
+                  aria-label={hasUnreadInbox ? `站内信，${unreadCount} 条未读` : "站内信"}
+                  title={hasUnreadInbox ? `站内信（${unreadCount} 条未读）` : "站内信"}
+                  shape="square"
+                >
                   <Bell size={18} />
                 </IconButton>
-                <HeaderCountBadge count={unreadCount} tone="danger" />
+                <HeaderCountBadge
+                  count={unreadCount}
+                  testId="inbox-unread-badge"
+                  tone="danger"
+                  ariaLabel={hasUnreadInbox ? `${unreadCount} 条未读站内信` : undefined}
+                />
               </div>
             )}
             {credits != null && (
@@ -497,24 +486,29 @@ export function ChatHeader({
                 onClick={onOpenBilling}
                 disabled={!onOpenBilling}
                 aria-label="账户与计费"
-                className={`flex min-h-11 min-w-11 items-center justify-center gap-1.5 rounded-full border px-2 py-1 text-meta font-medium tabular-nums outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg @[560px]:px-2.5 ${
+                title={`账户余额：${formatCredits(credits)}`}
+                className={cn(
+                  "flex min-h-9 min-w-9 items-center justify-center gap-1.5 rounded-full border px-2 py-1 text-meta font-medium tabular-nums outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg lg:px-2.5",
                   low
                     ? "border-danger/40 bg-danger-soft text-danger hover:bg-danger-soft"
-                    : "border-border text-muted enabled:hover:bg-hover enabled:hover:text-fg"
-                } disabled:cursor-default`}
+                    : "border-border text-muted enabled:hover:bg-hover enabled:hover:text-fg",
+                  "disabled:cursor-default",
+                )}
               >
                 <Wallet size={13} className="shrink-0" />
-                {/* 窄容器只留图标（点击进设置看余额），省出空间避免三栏或手机顶栏溢出。 */}
-                <span className="hidden @[560px]:inline">{formatCredits(credits)}</span>
+                {/* 平板 640-1023px 仅留图标避免挤压模型名，lg+ 展开余额数字。 */}
+                <span className="hidden lg:inline">{formatCredits(credits)}</span>
               </button>
             )}
           </div>
         )}
+
         {hasSecondaryActions && hasWorkspaceToggles && (
-          <span aria-hidden className="mx-0.5 hidden h-4 w-px shrink-0 bg-border @[560px]:block" />
+          <span aria-hidden className="mx-0.5 hidden h-4 w-px shrink-0 bg-border sm:block" />
         )}
+
         {hasWorkspaceToggles && (
-          <div className="flex items-center gap-0.5 @[560px]:gap-1" data-testid="header-workspace-toggles">
+          <div className="flex items-center gap-0.5 sm:gap-1" data-testid="header-workspace-toggles">
             {onToggleQuickAsk && (
               <IconButton
                 data-product-control="quick-ask"
@@ -524,7 +518,10 @@ export function ChatHeader({
                 aria-pressed={quickAskOpen}
                 title={`${quickAskOpen ? "收起" : "打开"}快问小窗：并行问答不打断主线 (${altKeyLabel()}K)`}
                 shape="square"
-                className={quickAskOpen ? "bg-accent-soft text-accent" : "text-muted hover:text-fg"}
+                className={cn(
+                  "hidden sm:flex",
+                  quickAskOpen ? "bg-accent-soft text-accent" : "text-muted hover:text-fg",
+                )}
               >
                 {quickAskSending && !quickAskOpen ? (
                   <Loader2 size={18} className="animate-spin text-accent" />
@@ -542,10 +539,145 @@ export function ChatHeader({
                 aria-pressed={paneOpen}
                 title={`${paneOpen ? "收起" : "打开"}详情面板：步骤、改动、计划 (${modKeyLabel()}\\)`}
                 shape="square"
-                className={cn("hidden sm:flex", paneOpen ? "bg-accent-soft text-accent" : "text-muted hover:text-fg")}
+                className={paneOpen ? "bg-accent-soft text-accent" : "text-muted hover:text-fg"}
               >
                 {paneOpen ? <PanelRightClose size={18} /> : <PanelRight size={18} />}
               </IconButton>
+            )}
+          </div>
+        )}
+
+        {onNew && (
+          <IconButton
+            data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
+            data-testid="mobile-new-chat-btn"
+            onClick={onNew}
+            aria-label="新建会话"
+            title="新建会话"
+            shape="square"
+            className="text-muted hover:text-fg sm:hidden"
+          >
+            <Plus size={18} />
+          </IconButton>
+        )}
+
+        {hasOverflowMenu && (
+          <div className={cn("relative", hasDesktopOverflow ? "@[720px]:hidden" : "sm:hidden")}>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <IconButton
+                  data-product-control
+                  data-testid="header-overflow-trigger"
+                  aria-label="更多操作"
+                  title="更多操作"
+                  shape="square"
+                  className="text-faint hover:text-fg"
+                >
+                  <MoreHorizontal size={18} />
+                </IconButton>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="min-w-[13rem]">
+                {onOpenInbox && (
+                  <DropdownMenuItem
+                    data-product-control
+                    data-testid="overflow-inbox-item"
+                    onSelect={onOpenInbox}
+                    className="sm:hidden"
+                  >
+                    <Bell size={16} className="shrink-0 text-muted" />
+                    <span className="flex-1">站内信</span>
+                    {hasUnreadInbox && (
+                      <Badge tone="danger" className="tabular-nums">
+                        {unreadCount}
+                      </Badge>
+                    )}
+                  </DropdownMenuItem>
+                )}
+                {credits != null && (
+                  <DropdownMenuItem
+                    data-product-control
+                    data-testid="overflow-billing-item"
+                    disabled={!onOpenBilling}
+                    onSelect={onOpenBilling}
+                    className="sm:hidden"
+                  >
+                    <Wallet size={16} className="shrink-0 text-muted" />
+                    <span className="flex-1">账户与计费</span>
+                    <span
+                      className={cn(
+                        "text-caption font-medium tabular-nums",
+                        low ? "text-danger" : "text-muted",
+                      )}
+                    >
+                      {formatCredits(credits)}
+                    </span>
+                  </DropdownMenuItem>
+                )}
+                {onToggleQuickAsk && (
+                  <DropdownMenuItem
+                    data-product-control
+                    data-testid="overflow-quick-ask-item"
+                    onSelect={onToggleQuickAsk}
+                    className="sm:hidden"
+                  >
+                    <MessageCircleQuestion size={16} className="shrink-0 text-muted" />
+                    <span className="flex-1">{quickAskOpen ? "收起快问小窗" : "快问小窗"}</span>
+                  </DropdownMenuItem>
+                )}
+                <DropdownMenuItem
+                  data-product-control
+                  data-testid="overflow-agent-item"
+                  onSelect={onAgentClick}
+                  className="sm:hidden"
+                >
+                  <Users size={16} className="shrink-0 text-muted" />
+                  <span className="flex-1">切换智能体</span>
+                  <span className="max-w-[6rem] truncate text-caption text-faint">{agent.name}</span>
+                </DropdownMenuItem>
+                {projectBreadcrumb?.chatName && onOpenProjectScope && (
+                  <DropdownMenuItem
+                    data-product-control
+                    data-testid="overflow-project-item"
+                    onSelect={onOpenProjectScope}
+                    className="sm:hidden"
+                  >
+                    <FolderOpen size={16} className="shrink-0 text-muted" />
+                    <span className="flex-1 truncate">项目：{projectBreadcrumb.chatName}</span>
+                  </DropdownMenuItem>
+                )}
+                {showUpdatePill && (
+                  <DropdownMenuItem
+                    data-product-control
+                    data-testid="overflow-update-item"
+                    onSelect={onReloadForUpdate}
+                    className="text-accent sm:hidden"
+                  >
+                    <RefreshCw size={16} className="shrink-0" />
+                    <span className="flex-1">有新版本 · 刷新</span>
+                  </DropdownMenuItem>
+                )}
+                {hasDesktopOverflow && <DropdownMenuSeparator className="sm:hidden" />}
+                {onOpenFind && (
+                  <DropdownMenuItem data-product-control onSelect={onOpenFind}>
+                    <Search size={16} className="shrink-0 text-muted" />
+                    <span className="flex-1">会话内查找</span>
+                  </DropdownMenuItem>
+                )}
+                {onShare && (
+                  <DropdownMenuItem data-product-control onSelect={onShare}>
+                    <Share2 size={16} className="shrink-0 text-muted" />
+                    <span className="flex-1">分享</span>
+                  </DropdownMenuItem>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+            {onOpenInbox && hasUnreadInbox && (
+              <HeaderCountBadge
+                count={unreadCount}
+                testId="overflow-inbox-dot"
+                tone="danger"
+                className="sm:hidden"
+              />
             )}
           </div>
         )}

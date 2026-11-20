@@ -144,7 +144,7 @@ export function MarketplaceCenter({
   return (
     <Dialog.Root open={open} onOpenChange={(o) => !o && requestClose()}>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade" />
+        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/35 backdrop-blur-sm data-[state=open]:animate-fade" />
         <Dialog.Content
           aria-describedby={undefined}
           // 高度上限覆盖 oc-center-dialog 的默认 85dvh:市场是浏览型大弹层,要更高。该变量在未分层的

@@ -1,7 +1,7 @@
 import { Brain, ChevronRight, Layers, Pencil, Search, Terminal, Users, type LucideIcon } from "lucide-react";
 import { Fragment } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
-import { formatStepDuration, type StepTiming } from "./ProcessDisclosure";
+import type { StepTiming } from "./ProcessDisclosure";
 import { buildPhaseTimeline, type PhaseKind, type PhaseSegment, type PhaseTimelineData } from "./phaseTimeline";
 import "./phaseTimeline.css";
 
@@ -13,9 +13,25 @@ const PHASE_ICON: Record<PhaseKind, LucideIcon> = {
   plan: Brain,
 };
 
-function formatPhaseDuration(ms: number | undefined): string {
+/**
+ * Compact tabular duration formatter for quiet phase telemetry:
+ * <100ms -> "<0.1s", <10s -> "1.5s"/"2s", <60s -> "14s",
+ * <1h -> "07:05"/"21:34", >=1h -> "1:03:05".
+ */
+export function formatPhaseDuration(ms: number | undefined): string {
   if (ms === undefined || !Number.isFinite(ms) || ms <= 0) return "";
-  return formatStepDuration(ms);
+  if (ms < 100) return "<0.1s";
+  if (ms < 10_000) {
+    const sec = (ms / 1000).toFixed(1).replace(/\.0$/, "");
+    return `${sec}s`;
+  }
+  const totalSec = Math.floor(ms / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const hours = Math.floor(totalSec / 3600);
+  const minutes = Math.floor((totalSec % 3600) / 60);
+  const seconds = totalSec % 60;
+  const mmss = `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  return hours > 0 ? `${hours}:${mmss}` : mmss;
 }
 
 /**
@@ -97,6 +113,13 @@ export function PhaseTimelineStrip({
               onClick={() => onSelectPhase?.(phase.kind)}
               className="oc-phase-crumb"
             >
+              {phase.active ? (
+                <span
+                  aria-hidden
+                  data-testid={`phase-active-dot-${phase.kind}`}
+                  className="oc-phase-active-dot"
+                />
+              ) : null}
               <Icon size={11} strokeWidth={2} aria-hidden className="oc-phase-pill-icon" />
               <span>{phase.shortLabel}</span>
               <span className="oc-phase-pill-count">{phase.stepCount}</span>
@@ -162,6 +185,13 @@ export function PhaseTimelineFilterBar({
               onClick={() => onSelectPhase(pressed ? null : phase.kind)}
               className="oc-phase-pill"
             >
+              {phase.active ? (
+                <span
+                  aria-hidden
+                  data-testid={`phase-active-dot-${phase.kind}`}
+                  className="oc-phase-active-dot"
+                />
+              ) : null}
               <Icon size={11} strokeWidth={2} aria-hidden className="oc-phase-pill-icon" />
               <span>{phase.shortLabel}</span>
               <span className="oc-phase-pill-count">{phase.stepCount}</span>

@@ -1206,3 +1206,193 @@ describe('OCV5-504 自选档说明保持默认与目录价格权威', () => {
     expect(onSelectEffort).toHaveBeenCalledExactlyOnceWith(null)
   })
 })
+
+function stubViewport({ width, height }: { width: number; height: number }) {
+  const original = window.matchMedia
+  window.matchMedia = ((query: string) => {
+    let matches = false
+    const minW = query.match(/\(min-width:\s*(\d+(?:\.\d+)?)px\)/)
+    const maxW = query.match(/\(max-width:\s*(\d+(?:\.\d+)?)px\)/)
+    const maxH = query.match(/\(max-height:\s*(\d+(?:\.\d+)?)px\)/)
+    if (minW) matches = width >= Number(minW[1])
+    else if (maxW) matches = width <= Number(maxW[1])
+    else if (maxH) matches = height <= Number(maxH[1])
+    return {
+      matches,
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    } as MediaQueryList
+  }) as typeof window.matchMedia
+  return () => {
+    window.matchMedia = original
+  }
+}
+
+describe('ModelSelector OCV5-820 响应式根治（<640 Sheet / ≥640 双栏 / ≤560 矮屏 2-Tab）', () => {
+  const FULL_MODELS: PublicModel[] = [
+    { id: 'glm-5.2', display_name: 'GLM-5.2', cost_x: 0.5 },
+    { id: 'gpt-6.2-sol', display_name: 'GPT-6.2 Sol', cost_x: 0.5 },
+    { id: 'gpt-6.2-sol-1m', display_name: 'GPT-6.2 Sol', cost_x: 0.8 },
+    { id: 'gpt-6.2-astra', display_name: 'GPT-6.2 Astra', cost_x: 4.1 },
+    { id: 'gpt-6.2-astra-1m', display_name: 'GPT-6.2 Astra', cost_x: 6.1 },
+    { id: 'deepseek-v4', display_name: 'DeepSeek-V4', cost_x: 0.3 },
+  ]
+
+  it('手机 <640px（390×844）：固定双区 BottomSheet（中区独立滚模型列表 + 底部参数坞），移除 sm:hidden', async () => {
+    const restore = stubViewport({ width: 390, height: 844 })
+    try {
+      const onSelectServiceTier = vi.fn()
+      const onSelectEffort = vi.fn()
+      render(
+        <ModelSelector
+          models={FULL_MODELS}
+          selectedId="gpt-6.2-sol"
+          onSelect={() => {}}
+          serviceTier="fast"
+          onSelectServiceTier={onSelectServiceTier}
+          effortSupported={['low', 'medium', 'high']}
+          effortActive="high"
+          onSelectEffort={onSelectEffort}
+        />,
+      )
+      fireEvent.click(screen.getByRole('button', { name: '选择对话模型' }))
+      const dialog = await screen.findByRole('dialog')
+      expect(dialog.className).toContain('model-picker-sheet')
+      expect(dialog.className).not.toContain('sm:hidden')
+      expect(dialog.previousElementSibling?.className ?? '').not.toContain('sm:hidden')
+
+      const scroll = screen.getByTestId('model-picker-sheet-scroll')
+      expect(scroll.className).toContain('min-h-0')
+      expect(scroll.className).toContain('flex-1')
+      expect(scroll.className).toContain('overflow-y-auto')
+      expect(scroll.textContent).toContain('GPT-6.2-Sol')
+      expect(scroll.textContent).toContain('GPT-6.2-Astra')
+      expect(scroll.textContent).toContain('DeepSeek-V4')
+
+      const dock = screen.getByTestId('model-picker-extras-dock')
+      expect(dock.className).toContain('shrink-0')
+      expect(dock.textContent).toContain('速度')
+      expect(dock.textContent).toContain('上下文')
+      expect(dock.textContent).toContain('思考档位')
+      fireEvent.click(dock.querySelector('[data-gpt-ultrafast="true"]')!)
+      expect(onSelectServiceTier).toHaveBeenCalledWith('ultrafast')
+    } finally {
+      restore()
+    }
+  })
+
+  it('折叠屏/平板/桌面 ≥640px 且 >560px（768×700）：左右双栏 Popover，左栏 min-h-[14rem] 防坍塌，右栏参数 + 倍率摘要', async () => {
+    const restore = stubViewport({ width: 768, height: 700 })
+    try {
+      const onSelectEffort = vi.fn()
+      const onSelectServiceTier = vi.fn()
+      render(
+        <ModelSelector
+          models={FULL_MODELS}
+          selectedId="gpt-6.2-sol"
+          onSelect={() => {}}
+          serviceTier="ultrafast"
+          onSelectServiceTier={onSelectServiceTier}
+          effortSupported={['low', 'medium', 'high']}
+          effortActive="high"
+          onSelectEffort={onSelectEffort}
+        />,
+      )
+      openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+      const twoCol = await screen.findByTestId('model-picker-two-col')
+      expect(twoCol.className).toContain('model-picker-popover')
+      expect(twoCol.className).toContain('w-[min(620px,calc(100vw-24px))]')
+
+      const listCol = screen.getByTestId('model-picker-list-col')
+      expect(listCol.className).toContain('min-h-[14rem]')
+      expect(listCol.textContent).toContain('GPT-6.2-Astra')
+      expect(listCol.textContent).toContain('DeepSeek-V4')
+
+      const extrasCol = screen.getByTestId('model-picker-extras-col')
+      expect(extrasCol.className).toContain('min-h-[14rem]')
+      expect(screen.getByTestId('model-picker-active-cost')).toHaveTextContent('x3.0')
+      expect(screen.getByTestId('model-picker-active-cost')).toHaveClass('tabular-nums')
+
+      fireEvent.click(extrasCol.querySelector('[data-effort="low"]')!)
+      expect(onSelectEffort).toHaveBeenCalledWith('low')
+    } finally {
+      restore()
+    }
+  })
+
+  it('平板/桌面 ≥640px 无任何 extras 参数时优雅回退单栏 Popover', async () => {
+    const restore = stubViewport({ width: 1024, height: 768 })
+    try {
+      render(<ModelSelector models={FULL_MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
+      openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+      const singleCol = await screen.findByTestId('model-picker-single-col')
+      expect(singleCol.className).toContain('model-picker-popover')
+      expect(screen.queryByTestId('model-picker-two-col')).toBeNull()
+      expect(singleCol.textContent).toContain('DeepSeek-V4')
+    } finally {
+      restore()
+    }
+  })
+
+  it('矮屏/横屏手机 ≤560px（844×390，宽度 ≥640px）：自动切入无 sm:hidden 的 Sheet + 顶部 2-Tab [模型 | 执行参数]', async () => {
+    const restore = stubViewport({ width: 844, height: 390 })
+    try {
+      const onSelect = vi.fn()
+      const onSelectServiceTier = vi.fn()
+      render(
+        <ModelSelector
+          models={FULL_MODELS}
+          selectedId="gpt-6.2-sol"
+          onSelect={onSelect}
+          serviceTier="fast"
+          onSelectServiceTier={onSelectServiceTier}
+          effortSupported={['low', 'medium', 'high']}
+          effortActive="medium"
+          onSelectEffort={() => {}}
+        />,
+      )
+      // 横屏 ≥640px 但高度 ≤560px 走 click 打开 Sheet（而非 DropdownMenu）
+      fireEvent.click(screen.getByRole('button', { name: '选择对话模型' }))
+      const dialog = await screen.findByRole('dialog')
+      expect(dialog.className).toContain('model-picker-sheet')
+      expect(dialog.className).toContain('model-picker-sheet-short')
+      // 关键防坑：绝不能带 sm:hidden，否则 ≥640px 横屏手机会被 CSS display:none 隐藏！
+      expect(dialog.className).not.toContain('sm:hidden')
+      expect(dialog.previousElementSibling?.className ?? '').not.toContain('sm:hidden')
+
+      // 默认落「模型」Tab，列表完整可见且可点选
+      const modelsTab = screen.getByTestId('model-picker-tab-models')
+      const extrasTab = screen.getByTestId('model-picker-tab-extras')
+      expect(modelsTab).toHaveAttribute('aria-selected', 'true')
+      expect(extrasTab).toHaveAttribute('aria-selected', 'false')
+      expect(screen.getByTestId('model-picker-sheet-scroll').textContent).toContain('DeepSeek-V4')
+      expect(screen.queryByTestId('model-picker-extras-panel')).toBeNull()
+
+      // 切到「执行参数」Tab，速度 / 上下文 / 思考档位完整可控
+      fireEvent.click(extrasTab)
+      expect(modelsTab).toHaveAttribute('aria-selected', 'false')
+      expect(extrasTab).toHaveAttribute('aria-selected', 'true')
+      const extrasPanel = screen.getByTestId('model-picker-extras-panel')
+      expect(extrasPanel.textContent).toContain('速度')
+      expect(extrasPanel.textContent).toContain('上下文')
+      expect(extrasPanel.textContent).toContain('思考档位')
+      fireEvent.click(extrasPanel.querySelector('[data-gpt-ultrafast="true"]')!)
+      expect(onSelectServiceTier).toHaveBeenCalledWith('ultrafast')
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+
+      // 再次打开自动重置回「模型」Tab，保证首屏必见模型列表
+      fireEvent.click(screen.getByRole('button', { name: '选择对话模型' }))
+      await screen.findByRole('dialog')
+      expect(screen.getByTestId('model-picker-tab-models')).toHaveAttribute('aria-selected', 'true')
+      fireEvent.click(screen.getByRole('menuitem', { name: /DeepSeek-V4/ }))
+      expect(onSelect).toHaveBeenCalledWith('deepseek-v4')
+    } finally {
+      restore()
+    }
+  })
+})

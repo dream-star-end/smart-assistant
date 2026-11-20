@@ -98,42 +98,50 @@ describe("ChatHeader 团队模式指示 chip", () => {
   });
 });
 
-describe("ChatHeader 会话未读角标", () => {
-  // 前景不写死 text-white:深色 accent/danger 是浅色底,白字只有 2.8/3.1:1,走 -fg token(a11y shell#1/#11)。
-  const badgeLayoutClass =
-    "pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-micro font-semibold leading-none tabular-nums";
-
+describe("ChatHeader 未读状态点降噪（OCV5-820 消灭 99+/40 红紫数字泡泡）", () => {
   it("无 sessionUnreadCount 时不渲染占位，打开菜单按钮仍在", () => {
     renderHeader({ onOpenMobileNav: () => {} });
     expect(screen.queryByTestId("session-unread-badge")).toBeNull();
     expect(screen.getByRole("button", { name: "打开菜单" })).toBeInTheDocument();
   });
 
-  it("角标挂在「打开菜单」按钮上，类名与站内信角标一致", () => {
-    renderHeader({ onOpenMobileNav: () => {}, onOpenInbox: () => {}, unreadCount: 2, sessionUnreadCount: 3 });
-    const menu = screen.getByRole("button", { name: /打开菜单/ });
-    const sessionBadge = menu.parentElement?.querySelector("[data-testid=session-unread-badge]");
-    expect(sessionBadge).toHaveTextContent("3");
-    expect(sessionBadge).toHaveClass(...badgeLayoutClass.split(" "));
-    expect(sessionBadge).toHaveClass("bg-accent", "text-accent-fg");
-    expect(sessionBadge).not.toHaveClass("text-white");
-    const inboxBtn = screen.getByRole("button", { name: "站内信" });
-    const inboxBadge = inboxBtn.parentElement?.querySelector("span");
-    expect(inboxBadge).toHaveTextContent("2");
-    expect(inboxBadge).toHaveClass(...badgeLayoutClass.split(" "));
-    expect(inboxBadge).toHaveClass("bg-danger", "text-danger-fg");
-    expect(inboxBadge).not.toHaveClass("text-white");
+  it("移动端汉堡钮与站内信铃铛均使用克制 6px 状态点，不渲染 99+/40 数字泡泡，保留 aria-label 与 hover title 精准计数", () => {
+    renderHeader({
+      onOpenMobileNav: () => {},
+      onOpenInbox: () => {},
+      unreadCount: 40,
+      sessionUnreadCount: 128,
+    });
+    const menu = screen.getByRole("button", { name: "打开菜单,128 条未读会话" });
+    expect(menu).toHaveAttribute("title", "打开菜单（128 条未读会话）");
+    const sessionDot = menu.parentElement?.querySelector("[data-testid=session-unread-badge]");
+    expect(sessionDot).toBeTruthy();
+    expect(sessionDot).toHaveTextContent("");
+    expect(sessionDot).toHaveAttribute("data-unread-count", "128");
+    expect(sessionDot).toHaveClass("size-1.5", "rounded-full", "bg-accent", "motion-safe:animate-pulse");
+    expect(menu.parentElement?.textContent).not.toContain("99+");
+
+    const inboxBtn = screen.getByRole("button", { name: "站内信，40 条未读" });
+    expect(inboxBtn).toHaveAttribute("title", "站内信（40 条未读）");
+    const inboxDot = screen.getByTestId("inbox-unread-badge");
+    expect(inboxDot).toHaveTextContent("");
+    expect(inboxDot).toHaveAttribute("data-unread-count", "40");
+    expect(inboxDot).toHaveClass("size-1.5", "rounded-full", "bg-danger");
+    expect(inboxBtn.parentElement?.textContent).not.toContain("40");
   });
 
-  it("折叠态角标挂在「展开侧栏」按钮上", () => {
+  it("折叠态 6px 呼吸点挂在「展开侧栏」按钮上并保留无障碍计数语义", () => {
     renderHeader({
       sidebarCollapsed: true,
       onExpandSidebar: () => {},
       sessionUnreadCount: 4,
     });
-    const expand = screen.getByRole("button", { name: /展开侧栏/ });
-    const badge = expand.parentElement?.querySelector("[data-testid=session-unread-badge]");
-    expect(badge).toHaveTextContent("4");
+    const expand = screen.getByRole("button", { name: "展开侧栏,4 条未读会话" });
+    const dot = expand.parentElement?.querySelector("[data-testid=session-unread-badge]");
+    expect(dot).toBeTruthy();
+    expect(dot).toHaveTextContent("");
+    expect(dot).toHaveAttribute("data-unread-count", "4");
+    expect(dot).toHaveClass("size-1.5", "bg-accent");
   });
 
   it("会话未读与站内信未读并存且互不影响", () => {
@@ -143,21 +151,8 @@ describe("ChatHeader 会话未读角标", () => {
       unreadCount: 7,
       sessionUnreadCount: 1,
     });
-    expect(screen.getByTestId("session-unread-badge")).toHaveTextContent("1");
-    expect(screen.getByRole("button", { name: "站内信" }).parentElement).toHaveTextContent("7");
-  });
-
-  it("会话未读角标用 accent，铃铛未读用 danger", () => {
-    renderHeader({
-      onOpenMobileNav: () => {},
-      onOpenInbox: () => {},
-      unreadCount: 2,
-      sessionUnreadCount: 3,
-    });
-    expect(screen.getByTestId("session-unread-badge")).toHaveClass("bg-accent");
-    const inboxBtn = screen.getByRole("button", { name: "站内信" });
-    const inboxBadge = inboxBtn.parentElement?.querySelector("span");
-    expect(inboxBadge).toHaveClass("bg-danger");
+    expect(screen.getByTestId("session-unread-badge")).toHaveAttribute("data-unread-count", "1");
+    expect(screen.getByTestId("inbox-unread-badge")).toHaveAttribute("data-unread-count", "7");
   });
 });
 
@@ -194,7 +189,7 @@ describe("ChatHeader 会话内查找", () => {
 });
 
 // OCV5-369:右上角「导出会话」改为「分享会话」(行为有意改变,原导出用例随之更新)。
-describe("ChatHeader 分享会话", () => {
+describe("ChatHeader 分享会话与溢出菜单", () => {
   it("无 onShare 时不渲染分享按钮", () => {
     renderHeader();
     expect(screen.queryByRole("button", { name: "分享会话" })).toBeNull();
@@ -208,7 +203,7 @@ describe("ChatHeader 分享会话", () => {
     expect(onShare).toHaveBeenCalledTimes(1);
   });
 
-  // OCV5-817: 窄屏或桌面三栏态（容器 <720px）独立按钮 hidden @[720px]:flex，由「更多操作」菜单承接。
+  // OCV5-817 / OCV5-820: 窄容器「更多操作」菜单承接分享、查找及移动端低频入口。
   it("窄容器「更多操作」菜单承接分享(宽容器 hidden @[720px]:flex, 菜单 @[720px]:hidden),菜单项调用 onShare", async () => {
     const onShare = vi.fn();
     renderHeader({ onShare });
@@ -222,9 +217,10 @@ describe("ChatHeader 分享会话", () => {
     expect(onShare).toHaveBeenCalledTimes(1);
   });
 
-  it("无 onShare 时也不渲染「更多操作」", () => {
+  it("无 onShare/onOpenFind 时，「更多操作」仅在移动端 sm:hidden 显示以收纳站内信/余额/快问/智能体", () => {
     renderHeader();
-    expect(screen.queryByRole("button", { name: "更多操作" })).toBeNull();
+    const more = screen.getByRole("button", { name: "更多操作" });
+    expect(more.parentElement).toHaveClass("sm:hidden");
   });
 });
 
@@ -248,17 +244,92 @@ describe("ChatHeader 快捷键标签平台化", () => {
   });
 });
 
+describe("ChatHeader 移动端单行化与平板宽度分配（OCV5-820）", () => {
+  it("单行 flex-nowrap 布局：消灭双行折行 chat-model-row，隐藏移动端绿圆头像，右侧保留 Workbench + 新建 + 溢出菜单", async () => {
+    const onNew = vi.fn();
+    const onTogglePane = vi.fn();
+    const onOpenInbox = vi.fn();
+    const onOpenBilling = vi.fn();
+    const onToggleQuickAsk = vi.fn();
+    const onAgentClick = vi.fn();
+    const onOpenProjectScope = vi.fn();
 
-describe("ChatHeader compact navigation", () => {
-  it("keeps the agent accessible and groups the model independently of actions", () => {
-    renderHeader({onOpenMobileNav: vi.fn(), onOpenInbox: vi.fn(), onOpenFind: vi.fn()});
-    expect(screen.getByRole("button", {name: `切换智能体，当前${MAIN_AGENT.name}`})).toBeInTheDocument();
-    const row = screen.getByTestId("chat-model-row");
-    expect(row).toContainElement(screen.getByRole("button", {name: "选择对话模型"}));
-    expect(row).not.toContainElement(screen.getByRole("button", {name: "会话内查找"}));
-    // OCV5-295:窄屏模型行不再铺整宽灰底胶囊。
-    expect(row).not.toHaveClass("bg-hover/50");
-    expect(row).not.toHaveClass("rounded-xl");
+    renderHeader({
+      onOpenMobileNav: vi.fn(),
+      onNew,
+      onTogglePane,
+      onOpenInbox,
+      unreadCount: 40,
+      credits: "12345",
+      onOpenBilling,
+      onToggleQuickAsk,
+      onAgentClick,
+      projectBreadcrumb: { chatName: "前端重构" },
+      onOpenProjectScope,
+      onOpenFind: vi.fn(),
+      onShare: vi.fn(),
+    });
+
+    const headerRow = screen.getByTestId("chat-model-row").parentElement;
+    expect(headerRow).toHaveClass("flex-nowrap", "min-h-12");
+
+    // 移动端隐藏顶栏大头像按钮（改由溢出菜单承接）
+    const agentBtn = screen.getByRole("button", { name: `切换智能体，当前${MAIN_AGENT.name}` });
+    expect(agentBtn).toHaveClass("hidden", "sm:flex");
+
+    // 移动端 chat-model-row 不再折到第二行（无 order-2），并居中承载紧凑模型胶囊
+    const modelRow = screen.getByTestId("chat-model-row");
+    expect(modelRow).not.toHaveClass("order-2");
+    expect(modelRow).toHaveClass("justify-center", "sm:justify-start");
+    expect(modelRow).toContainElement(screen.getByRole("button", { name: "选择对话模型" }));
+    expect(modelRow).not.toContainElement(screen.getByRole("button", { name: "会话内查找" }));
+
+    // 移动端右侧保留 [◫ Workbench] + [＋ 新建] + [··· 溢出菜单]
+    const paneBtn = screen.getByTestId("detail-pane-toggle");
+    expect(paneBtn).not.toHaveClass("hidden");
+    fireEvent.click(paneBtn);
+    expect(onTogglePane).toHaveBeenCalledTimes(1);
+
+    const mobileNewBtn = screen.getByTestId("mobile-new-chat-btn");
+    expect(mobileNewBtn).toHaveClass("sm:hidden");
+    fireEvent.click(mobileNewBtn);
+    expect(onNew).toHaveBeenCalledTimes(1);
+
+    // 移动端站内信、钱包、快问在顶栏隐藏，收纳进「···」溢出菜单且精准展示计数/余额
+    expect(screen.getByTestId("header-secondary-actions")).toHaveClass("hidden", "sm:flex");
+    expect(screen.getByTestId("quick-ask-toggle")).toHaveClass("hidden", "sm:flex");
+    expect(screen.getByTestId("overflow-inbox-dot")).toHaveClass("size-1.5", "bg-danger", "sm:hidden");
+
+    const more = screen.getByTestId("header-overflow-trigger");
+    fireEvent.pointerDown(more, { button: 0, pointerType: "mouse" });
+    fireEvent.click(more);
+
+    const inboxItem = await screen.findByTestId("overflow-inbox-item");
+    expect(inboxItem).toHaveTextContent("站内信");
+    expect(inboxItem).toHaveTextContent("40");
+    expect(screen.getByTestId("overflow-billing-item")).toHaveTextContent("12,345");
+    expect(screen.getByTestId("overflow-quick-ask-item")).toHaveTextContent("快问小窗");
+    expect(screen.getByTestId("overflow-agent-item")).toHaveTextContent(MAIN_AGENT.name);
+    expect(screen.getByTestId("overflow-project-item")).toHaveTextContent("前端重构");
+
+    fireEvent.click(inboxItem);
+    expect(onOpenInbox).toHaveBeenCalledTimes(1);
+  });
+
+  it("平板 640-1023px 合理分配宽度：收束余额数字与项目面包屑至 lg+，防止模型名被压成截断残片", () => {
+    renderHeader({
+      selectedModelId: "gpt-6.2-astra",
+      credits: "987654",
+      onOpenBilling: vi.fn(),
+      projectBreadcrumb: { chatName: "设计系统" },
+      onOpenProjectScope: vi.fn(),
+    });
+    const billingBtn = screen.getByRole("button", { name: "账户与计费" });
+    const creditsText = billingBtn.querySelector("span");
+    expect(creditsText).toHaveClass("hidden", "lg:inline");
+    expect(screen.getByTestId("chat-project-breadcrumb")).toHaveClass("hidden", "lg:inline-flex");
+    const trigger = screen.getByRole("button", { name: "选择对话模型" });
+    expect(trigger).toHaveTextContent("GPT-6.2-Astra");
   });
 });
 
@@ -271,17 +342,16 @@ describe("ChatHeader 新版本 pill(OCV5-626)", () => {
     expect(screen.queryByTestId("update-pill")).toBeNull();
   });
 
-  it("可见时落在模型行(窄屏整宽那一行),不挤右侧图标组;点一下回调刷新", () => {
+  it("可见时落在模型行,不挤右侧图标组;点一下回调刷新", () => {
     const onReloadForUpdate = vi.fn();
     renderHeader({ updateAvailable: true, onReloadForUpdate, onOpenFind: vi.fn() });
     const pill = screen.getByRole("button", { name: "有新版本，点击刷新页面" });
     const row = screen.getByTestId("chat-model-row");
     expect(row).toContainElement(pill);
     expect(row).not.toContainElement(screen.getByRole("button", { name: "会话内查找" }));
-    // 窄屏两字短文案 + 桌面全称都在 DOM,由断点切换;44px 命中区在透明外层 button 上。
     expect(pill.textContent).toContain("新版本");
     expect(pill.textContent).toContain("有新版本 · 刷新");
-    expect(pill).toHaveClass("min-h-11", "ml-auto");
+    expect(pill).toHaveClass("min-h-11");
     fireEvent.click(pill);
     expect(onReloadForUpdate).toHaveBeenCalledTimes(1);
   });
@@ -295,12 +365,12 @@ describe("ChatHeader 新版本 pill(OCV5-626)", () => {
 });
 
 describe("ChatHeader 未分类会话的项目建议", () => {
-  it("显示建议；移入与不用各自回调；已在项目里时显示所在项目而不是建议；窄屏归位第二行防挤爆第一行", () => {
+  it("显示建议；移入与不用各自回调；已在项目里时显示所在项目而不是建议", () => {
     const onAccept = vi.fn();
     const onDismiss = vi.fn();
     renderHeader({ projectSuggestion: { name: "论文综述", onAccept, onDismiss } });
     const suggestion = screen.getByTestId("chat-project-suggestion");
-    expect(suggestion).toHaveClass("order-3", "basis-full");
+    expect(suggestion).toHaveClass("hidden", "sm:inline-flex");
     fireEvent.click(screen.getByRole("button", { name: "移入项目「论文综述」" }));
     fireEvent.click(screen.getByRole("button", { name: "不用移入" }));
     expect(onAccept).toHaveBeenCalledTimes(1);
