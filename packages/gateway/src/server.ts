@@ -211,6 +211,7 @@ import { type AskUserPermissionsHost, handlePermissionResponse as handlePermissi
 import { type CronTaskWebhookHost, _drainFlagOffCronOriginNotifies as _drainFlagOffCronOriginNotifiesImpl, _handleWebhook as _handleWebhookImpl, _handleTasksApi as _handleTasksApiImpl, _handleTaskItem as _handleTaskItemImpl, _triggerTask as _triggerTaskImpl, injectCronOriginFromTerminal as injectCronOriginFromTerminalImpl, injectCronOriginSession as injectCronOriginSessionImpl, cronProjectPorts as cronProjectPortsImpl, stampCronProject as stampCronProjectImpl, handleCronChannels as handleCronChannelsImpl, handleCronApi as handleCronApiImpl, handleCronItem as handleCronItemImpl } from './cronTaskWebhook.js'
 import { type HttpMiscHandlersHost, _resolveMediaDirs as _resolveMediaDirsImpl, _sendMediaResolveError as _sendMediaResolveErrorImpl, handleApiFile as handleApiFileImpl, handleMediaGet as handleMediaGetImpl, handleUpload as handleUploadImpl, handleCollaborationConfig as handleCollaborationConfigImpl, handleSearch as handleSearchImpl, handleOAuthStart as handleOAuthStartImpl, handleOAuthCallback as handleOAuthCallbackImpl, refreshClaudeOAuthIfNeeded as refreshClaudeOAuthIfNeededImpl } from './httpMiscHandlers.js'
 import { handleChunkedUpload as handleChunkedUploadImpl } from './httpUploadChunks.js'
+import { LiveBrowserController, handleLiveBrowserActionHttp, handleLiveBrowserLiveHttp } from './liveBrowserController.js'
 import { type ChannelHandlersHost, _updateWechatIdempotency as _updateWechatIdempotencyImpl, checkInboundBypass as checkInboundBypassImpl, handleTurnCancelIfQueued as handleTurnCancelIfQueuedImpl, handleTurnRejectIfAbsent as handleTurnRejectIfAbsentImpl, handleTurnDispatchState as handleTurnDispatchStateImpl, handleWechatInbound as handleWechatInboundImpl, handleWechatStop as handleWechatStopImpl, handleWechatInboundCompensate as handleWechatInboundCompensateImpl, _handleWechat as _handleWechatImpl, handleEnginePreheat as handleEnginePreheatImpl } from './channelHandlers.js'
 import { type InboundDispatchHost, dispatchInbound as dispatchInboundImpl } from './inboundDispatch.js'
 import { type WsConnectionHost, handleWsConnection as handleWsConnectionImpl, autoResumeFromHello as autoResumeFromHelloImpl, handleStop as handleStopImpl, deliver as deliverImpl, _sendStatusFrame as _sendStatusFrameImpl, _sendStampedSessionFrame as _sendStampedSessionFrameImpl, _consumeFrameAuthority as _consumeFrameAuthorityImpl } from './wsConnection.js'
@@ -396,6 +397,7 @@ export class Gateway {
   private channels = new Map<string, ChannelAdapter>()
   private log = createLogger({ module: 'gateway' })
   private _containerPreview: ContainerPreviewHandler
+  private readonly liveBrowser = new LiveBrowserController()
   private rateLimiter = new RateLimiter()
   private _wsKeepaliveTimer: ReturnType<typeof setInterval> | null = null
   private _taskSchedulerTimer: ReturnType<typeof setInterval> | null = null
@@ -1025,6 +1027,8 @@ export class Gateway {
     handleDelegateWait: (...args) => gw.handleDelegateWait(...args),
     handleEngineAskUser: (...args) => gw.handleEngineAskUser(...args),
     handleMemory: (...args) => gw.handleMemory(...args),
+    handleLiveBrowserAction: (...args) => gw.handleLiveBrowserAction(...args),
+    handleLiveBrowserLive: (...args) => gw.handleLiveBrowserLive(...args),
     handleMemoryFile: (...args) => gw.handleMemoryFile(...args),
     handleMemoryUsage: (...args) => gw.handleMemoryUsage(...args),
     handleMemoryContext: (...args) => gw.handleMemoryContext(...args),
@@ -1525,6 +1529,16 @@ export class Gateway {
   // PUT /api/agents/:id/persona  → { text }
   private handlePersona(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
     return handlePersonaImpl.call(this as unknown as AgentHandlersHost, req, res, id)
+  }
+
+  private handleLiveBrowserLive(req: IncomingMessage, res: ServerResponse, agentId: string, url: URL): Promise<void> {
+    return handleLiveBrowserLiveHttp(this.liveBrowserHttpHost(), req, res, agentId, url)
+  }
+  private handleLiveBrowserAction(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
+    return handleLiveBrowserActionHttp(this.liveBrowserHttpHost(), req, res, agentId)
+  }
+  private liveBrowserHttpHost() {
+    return { controller: this.liveBrowser, hasAgent: async (id: string) => (await this._getAgentsConfig()).agents.some((a) => a.id === id), isAgentRunning: (id: string) => this.sessions.list().some((s) => { const live = s.agentId === id ? this.sessions.getByKey(s.sessionKey) : undefined; return Boolean(live && ((live._activeTurnCount ?? 0) > 0 || (live._activeClientTurnCount ?? 0) > 0 || (live._idleInternalTurns ?? 0) > 0)) }), sendJson: (r: ServerResponse, c: number, b: unknown) => this.sendJson(r, c, b), sendError: (r: ServerResponse, c: number, m: string) => this.sendError(r, c, m) }
   }
 
   // memdir 范式下的记忆读写面(单一权威在 storage 的 MemoryDir / userProfile):

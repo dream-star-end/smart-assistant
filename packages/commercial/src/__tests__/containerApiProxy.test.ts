@@ -479,4 +479,58 @@ describe('containerApiProxy', () => {
     assert.notEqual(boom.statusCode, 401)
     assert.equal(dispatched, 0)
   })
+
+  it('promotes upstream timeout from CONNECT_MS to IDLE_MS upon socket connect for slow browser actions', async () => {
+    let initialTimeout = 0
+    const promotedTimeouts: number[] = []
+    const httpRequestImpl = ((options: { timeout?: number }) => {
+      initialTimeout = options.timeout ?? 0
+      const reqEmitter = new EventEmitter() as EventEmitter & {
+        setTimeout: (ms: number) => void
+        write: (buf: Buffer) => boolean
+        end: () => void
+        destroy: () => void
+      }
+      reqEmitter.setTimeout = (ms: number) => {
+        promotedTimeouts.push(ms)
+      }
+      reqEmitter.write = () => true
+      reqEmitter.destroy = () => {}
+      reqEmitter.end = () => {
+        const fakeSocket = new EventEmitter() as EventEmitter & { connecting: boolean }
+        fakeSocket.connecting = true
+        reqEmitter.emit('socket', fakeSocket)
+        fakeSocket.emit('connect')
+        const resp = new EventEmitter() as EventEmitter & {
+          statusCode: number
+          headers: Record<string, string>
+          socket: { setTimeout: (ms: number) => void }
+        }
+        resp.statusCode = 200
+        resp.headers = { 'content-type': 'application/json' }
+        resp.socket = { setTimeout: () => {} }
+        reqEmitter.emit('response', resp)
+        resp.emit('data', Buffer.from('{"available":true,"active":true}'))
+        resp.emit('end')
+      }
+      return reqEmitter
+    }) as any
+
+    const res = makeRes()
+    await containerApiProxy(
+      makeReq({ method: 'POST', url: '/api/agents/main/browser/action', body: '{"action":"open"}' }) as any,
+      res as any,
+      makeCtx() as any,
+      {
+        v3: {} as any,
+        bridgeSecret: 'bridge-secret',
+        getStatus: async () => makeStatus(),
+        httpRequestImpl,
+      },
+      7n,
+    )
+    assert.equal(res.statusCode, 200)
+    assert.equal(initialTimeout, 3_000)
+    assert.ok(promotedTimeouts.includes(60_000), `expected IDLE_MS(60000), got ${JSON.stringify(promotedTimeouts)}`)
+  })
 })

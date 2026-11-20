@@ -1,0 +1,885 @@
+/**
+ * Live cloud browser viewport & one-click human takeover stage (OCV5-813).
+ *
+ * Lazily loaded inside BrowserView so zero bytes enter the initial bundle.
+ * Shares the container's persistent per-agent `oc-browser` Chromium daemon:
+ * - Watch mode: smart low-overhead frame sync (pauses on hidden tab).
+ * - Takeover mode: click / right-click / scroll / keyboard / text input / tab management.
+ * - Hand back: preserves cookies/localStorage/page state and optionally prefills a continuation
+ *   prompt into the chat Composer.
+ */
+import {
+  ArrowLeft,
+  ArrowRight,
+  Check,
+  CornerDownLeft,
+  Globe,
+  Hand,
+  Lock,
+  Plus,
+  Power,
+  RotateCw,
+  Send,
+  X,
+} from "lucide-react";
+import {
+  type FormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+  type WheelEvent as ReactWheelEvent,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import {
+  type LiveBrowserActionPayload,
+  type LiveBrowserState,
+  fetchLiveBrowserState,
+  normalizeBrowserUrlInput,
+  sendLiveBrowserAction,
+} from "../../lib/liveBrowserApi";
+import type { AuthSession } from "../../lib/types";
+import { Spinner } from "../ui";
+import "./liveBrowser.css";
+
+const QUICK_PRESETS = [
+  { label: "Google Scholar", url: "https://scholar.google.com" },
+  { label: "arXiv", url: "https://arxiv.org" },
+  { label: "GitHub", url: "https://github.com" },
+] as const;
+
+const QUICK_KEYS = [
+  { label: "Enter", key: "Enter" },
+  { label: "Tab", key: "Tab" },
+  { label: "退格", key: "Backspace" },
+  { label: "上翻", key: "PageUp" },
+  { label: "下翻", key: "PageDown" },
+  { label: "Esc", key: "Escape" },
+] as const;
+
+const SPECIAL_KEY_MAP: Record<string, string> = {
+  Enter: "Enter",
+  Backspace: "Backspace",
+  Delete: "Delete",
+  ArrowUp: "ArrowUp",
+  ArrowDown: "ArrowDown",
+  ArrowLeft: "ArrowLeft",
+  ArrowRight: "ArrowRight",
+  PageUp: "PageUp",
+  PageDown: "PageDown",
+  Home: "Home",
+  End: "End",
+  " ": "Space",
+};
+
+const CTRL_COMBO_KEYS = new Set(["a", "c", "v", "x", "z"]);
+
+interface ClickRipple {
+  id: number;
+  xPct: number;
+  yPct: number;
+}
+
+export interface LiveBrowserStageProps {
+  agentId: string;
+  auth: AuthSession;
+  /** Whether the assistant is currently executing a turn (speeds up idle→active detection). */
+  running?: boolean;
+  /** Prefill a continuation prompt into Composer when the user hands control back. */
+  onHandBackToComposer?: (draft: string) => void;
+  /** Reports active status upward so BrowserView can render a live status indicator. */
+  onActiveStateChange?: (active: boolean) => void;
+}
+
+function isAbortError(err: unknown): boolean {
+  return err instanceof DOMException && err.name === "AbortError";
+}
+
+function errorMessageOf(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message;
+  return "云端浏览器连接失败，请稍后重试";
+}
+
+function formatSyncTime(ts?: number): string {
+  if (!ts) return "";
+  try {
+    return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  } catch {
+    return "";
+  }
+}
+
+export function LiveBrowserStage({
+  agentId,
+  auth,
+  running = false,
+  onHandBackToComposer,
+  onActiveStateChange,
+}: LiveBrowserStageProps) {
+  const [state, setState] = useState<LiveBrowserState | null>(null);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [takeover, setTakeover] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const [launchUrl, setLaunchUrl] = useState("https://scholar.google.com");
+  const [addressDraft, setAddressDraft] = useState("");
+  const [addressEditing, setAddressEditing] = useState(false);
+  const [typeDraft, setTypeDraft] = useState("");
+  const [ripple, setRipple] = useState<ClickRipple | null>(null);
+
+  const stageRef = useRef<HTMLDivElement>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
+  const mountedRef = useRef(true);
+  const authRef = useRef(auth);
+  authRef.current = auth;
+
+  // Monotonic sequence fencing: stale GET polls can never overwrite newer POST action frames.
+  const reqSeqRef = useRef(0);
+  const appliedSeqRef = useRef(0);
+  const pollAbortRef = useRef<AbortController | null>(null);
+  const pollInFlightRef = useRef(false);
+  const actionInFlightRef = useRef(false);
+  const keyBufferRef = useRef<{ text: string; timer: number | null }>({ text: "", timer: null });
+  const inputQueueRef = useRef<LiveBrowserActionPayload[]>([]);
+  const wheelBufferRef = useRef<{ dx: number; dy: number; x?: number; y?: number; timer: number | null }>({
+    dx: 0,
+    dy: 0,
+    timer: null,
+  });
+
+  const lockedByAssistant = running || state?.agentBusy === true;
+  const effectiveTakeover = takeover && !lockedByAssistant;
+  const takeoverActiveRef = useRef(false);
+  takeoverActiveRef.current = effectiveTakeover;
+
+  const clearPendingInputBuffers = useCallback(() => {
+    keyBufferRef.current.text = "";
+    if (keyBufferRef.current.timer !== null) {
+      window.clearTimeout(keyBufferRef.current.timer);
+      keyBufferRef.current.timer = null;
+    }
+    wheelBufferRef.current.dx = 0;
+    wheelBufferRef.current.dy = 0;
+    if (wheelBufferRef.current.timer !== null) {
+      window.clearTimeout(wheelBufferRef.current.timer);
+      wheelBufferRef.current.timer = null;
+    }
+    inputQueueRef.current.length = 0;
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      pollAbortRef.current?.abort();
+      clearPendingInputBuffers();
+    };
+  }, [clearPendingInputBuffers]);
+
+  // Honest exclusive control: whenever the assistant is actively running a turn (local or any
+  // server-side session for this agent), drop takeover back to watch-only mode and discard pending buffers.
+  useEffect(() => {
+    if (lockedByAssistant) {
+      setTakeover(false);
+      clearPendingInputBuffers();
+    }
+  }, [lockedByAssistant, clearPendingInputBuffers]);
+
+  // Reset takeover and address draft if switching agent.
+  useEffect(() => {
+    setTakeover(false);
+    setAddressEditing(false);
+    setError(null);
+    setState(null);
+    setInitialLoading(true);
+    clearPendingInputBuffers();
+    reqSeqRef.current += 1;
+    appliedSeqRef.current = reqSeqRef.current;
+    pollAbortRef.current?.abort();
+  }, [agentId, clearPendingInputBuffers]);
+
+  const applyState = useCallback(
+    (seq: number, next: LiveBrowserState) => {
+      if (!mountedRef.current || seq < appliedSeqRef.current) return;
+      appliedSeqRef.current = seq;
+      setState(next);
+      setInitialLoading(false);
+      setError(null);
+      onActiveStateChange?.(next.active);
+      if (!next.active || next.agentBusy) {
+        setTakeover(false);
+        clearPendingInputBuffers();
+      }
+    },
+    [onActiveStateChange, clearPendingInputBuffers],
+  );
+
+  // Sync address bar with live URL unless user is currently editing it.
+  useEffect(() => {
+    if (!addressEditing && typeof state?.url === "string") {
+      setAddressDraft(state.url);
+    }
+  }, [state?.url, addressEditing]);
+
+  const pollOnce = useCallback(async () => {
+    if (!mountedRef.current || actionInFlightRef.current || pollInFlightRef.current) return;
+    if (typeof document !== "undefined" && document.hidden) return;
+    const ctrl = new AbortController();
+    pollAbortRef.current = ctrl;
+    pollInFlightRef.current = true;
+    const mySeq = ++reqSeqRef.current;
+    try {
+      const next = await fetchLiveBrowserState(authRef.current, agentId, {
+        includeFrame: true,
+        quality: 70,
+        signal: ctrl.signal,
+      });
+      if (ctrl.signal.aborted) return;
+      applyState(mySeq, next);
+    } catch (err) {
+      if (isAbortError(err) || !mountedRef.current) return;
+      setInitialLoading(false);
+      setError((prev) => prev ?? errorMessageOf(err));
+    } finally {
+      if (pollAbortRef.current === ctrl) {
+        pollAbortRef.current = null;
+        pollInFlightRef.current = false;
+      }
+    }
+  }, [agentId, applyState]);
+
+  // Adaptive chained polling: schedules the next tick only AFTER the current GET settles so slow
+  // frames are never aborted mid-flight; pauses when tab is hidden.
+  const isActive = state?.active === true;
+  const isAvailable = state?.available !== false;
+  useEffect(() => {
+    if (!isAvailable && state !== null) return;
+    let cancelled = false;
+    let timer: number | null = null;
+    const intervalMs = isActive ? (effectiveTakeover ? 2200 : 1600) : lockedByAssistant ? 2000 : 4000;
+
+    const schedule = (delay: number) => {
+      if (cancelled) return;
+      if (timer !== null) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        timer = null;
+        void runCycle();
+      }, delay);
+    };
+
+    const runCycle = async () => {
+      if (cancelled) return;
+      await pollOnce();
+      schedule(intervalMs);
+    };
+
+    void runCycle();
+
+    const onVisibility = () => {
+      if (document.hidden) {
+        if (timer !== null) {
+          window.clearTimeout(timer);
+          timer = null;
+        }
+        pollAbortRef.current?.abort();
+      } else if (!cancelled) {
+        if (timer !== null) {
+          window.clearTimeout(timer);
+          timer = null;
+        }
+        void runCycle();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [agentId, isActive, isAvailable, lockedByAssistant, effectiveTakeover, pollOnce, state === null]);
+
+  const runAction = useCallback(
+    async (payload: LiveBrowserActionPayload) => {
+      if (!mountedRef.current) return;
+      pollAbortRef.current?.abort();
+      actionInFlightRef.current = true;
+      setBusy(true);
+      setError(null);
+      const mySeq = ++reqSeqRef.current;
+      try {
+        const next = await sendLiveBrowserAction(authRef.current, agentId, payload);
+        applyState(mySeq, next);
+      } catch (err) {
+        if (!isAbortError(err) && mountedRef.current) {
+          setError(errorMessageOf(err));
+        }
+      } finally {
+        actionInFlightRef.current = false;
+        if (mountedRef.current) setBusy(false);
+        // Drain next queued canvas input in strict FIFO order only while still in takeover.
+        if (mountedRef.current && takeoverActiveRef.current) {
+          const nextQueued = inputQueueRef.current.shift();
+          if (nextQueued) {
+            void runAction(nextQueued);
+          } else if (keyBufferRef.current.text && keyBufferRef.current.timer === null) {
+            const pending = keyBufferRef.current.text;
+            keyBufferRef.current.text = "";
+            void runAction({ action: "type", text: pending, submit: false });
+          }
+        }
+      }
+    },
+    [agentId, applyState],
+  );
+
+  const enqueueCanvasInput = useCallback(
+    (payload: LiveBrowserActionPayload) => {
+      if (!takeoverActiveRef.current) return;
+      if (inputQueueRef.current.length >= 12) return;
+      inputQueueRef.current.push(payload);
+      if (!actionInFlightRef.current) {
+        const next = inputQueueRef.current.shift();
+        if (next) void runAction(next);
+      }
+    },
+    [runAction],
+  );
+
+  const flushKeyBufferToQueue = useCallback(() => {
+    const buf = keyBufferRef.current;
+    if (buf.timer !== null) {
+      window.clearTimeout(buf.timer);
+      buf.timer = null;
+    }
+    if (!buf.text || !takeoverActiveRef.current) {
+      buf.text = "";
+      return;
+    }
+    const pending = buf.text;
+    buf.text = "";
+    enqueueCanvasInput({ action: "type", text: pending, submit: false });
+  }, [enqueueCanvasInput]);
+
+  const handleLaunch = (e: FormEvent) => {
+    e.preventDefault();
+    if (lockedByAssistant || busy) return;
+    const url = normalizeBrowserUrlInput(launchUrl);
+    if (!url) {
+      setError("请输入有效的 http:// 或 https:// 网址");
+      return;
+    }
+    void runAction({ action: "open", url });
+  };
+
+  const handleAddressSubmit = (e: FormEvent) => {
+    e.preventDefault();
+    if (lockedByAssistant || busy) return;
+    const url = normalizeBrowserUrlInput(addressDraft);
+    if (!url) {
+      setError("仅支持打开 http:// 或 https:// 网址");
+      return;
+    }
+    setAddressEditing(false);
+    void runAction({ action: "goto", url });
+  };
+
+  const normalizedCoords = (e: { clientX: number; clientY: number }): { x: number; y: number } | null => {
+    const img = imgRef.current;
+    if (!img) return null;
+    const rect = img.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+    return { x, y };
+  };
+
+  const showRipple = (x: number, y: number) => {
+    const id = Date.now() + Math.random();
+    setRipple({ id, xPct: x * 100, yPct: y * 100 });
+    window.setTimeout(() => {
+      setRipple((curr) => (curr?.id === id ? null : curr));
+    }, 360);
+  };
+
+  const handleCanvasClick = (e: ReactMouseEvent<HTMLImageElement>) => {
+    if (!effectiveTakeover || busy) return;
+    const pt = normalizedCoords(e);
+    if (!pt) return;
+    stageRef.current?.focus({ preventScroll: true });
+    showRipple(pt.x, pt.y);
+    void runAction({ action: "click", x: pt.x, y: pt.y, normalized: true, button: "left" });
+  };
+
+  const handleCanvasContextMenu = (e: ReactMouseEvent<HTMLImageElement>) => {
+    if (!effectiveTakeover) return;
+    e.preventDefault();
+    if (busy) return;
+    const pt = normalizedCoords(e);
+    if (!pt) return;
+    showRipple(pt.x, pt.y);
+    void runAction({ action: "click", x: pt.x, y: pt.y, normalized: true, button: "right" });
+  };
+
+  const handleCanvasWheel = (e: ReactWheelEvent<HTMLDivElement>) => {
+    if (!effectiveTakeover) return;
+    const pt = normalizedCoords(e);
+    const buf = wheelBufferRef.current;
+    buf.dx += e.deltaX;
+    buf.dy += e.deltaY;
+    if (pt) {
+      buf.x = pt.x;
+      buf.y = pt.y;
+    }
+    if (buf.timer === null) {
+      buf.timer = window.setTimeout(() => {
+        const dx = Math.round(buf.dx);
+        const dy = Math.round(buf.dy);
+        const x = buf.x;
+        const y = buf.y;
+        buf.dx = 0;
+        buf.dy = 0;
+        buf.timer = null;
+        if (!takeoverActiveRef.current) return;
+        if (dx !== 0 || dy !== 0) {
+          enqueueCanvasInput({ action: "wheel", x, y, normalized: true, deltaX: dx, deltaY: dy });
+        }
+      }, 220);
+    }
+  };
+
+  const handleStageKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (!effectiveTakeover) return;
+    // Let native IME composition pass through untouched (users use bottom input bar for CJK).
+    if (e.nativeEvent.isComposing) return;
+    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+
+    // Local focus escape: pressing Escape releases keyboard capture on the canvas without closing
+    // InspectorPanel (remote Esc is available via the quick-keys dock). Tab stays native for a11y.
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      stageRef.current?.blur();
+      return;
+    }
+
+    if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+      const lower = e.key.toLowerCase();
+      if (CTRL_COMBO_KEYS.has(lower)) {
+        e.preventDefault();
+        e.stopPropagation();
+        flushKeyBufferToQueue();
+        enqueueCanvasInput({ action: "press", key: `Control+${lower}` });
+      }
+      return;
+    }
+
+    const mapped = SPECIAL_KEY_MAP[e.key];
+    if (mapped) {
+      e.preventDefault();
+      e.stopPropagation();
+      flushKeyBufferToQueue();
+      enqueueCanvasInput({ action: "press", key: mapped });
+      return;
+    }
+
+    // Buffer rapid printable keystrokes instead of dropping them while an action is in flight.
+    if (e.key.length === 1 && !e.altKey && !e.ctrlKey && !e.metaKey) {
+      e.preventDefault();
+      e.stopPropagation();
+      const buf = keyBufferRef.current;
+      buf.text += e.key;
+      if (buf.timer !== null) window.clearTimeout(buf.timer);
+      buf.timer = window.setTimeout(() => {
+        buf.timer = null;
+        flushKeyBufferToQueue();
+      }, 160);
+    }
+  };
+
+  const handleSendText = (submit: boolean) => {
+    if (!typeDraft || busy || lockedByAssistant) return;
+    const text = typeDraft;
+    setTypeDraft("");
+    void runAction({ action: "type", text, submit });
+  };
+
+  const handleHandBack = () => {
+    takeoverActiveRef.current = false;
+    clearPendingInputBuffers();
+    setTakeover(false);
+    if (onHandBackToComposer) {
+      const label = state?.title?.trim() || state?.url?.trim() || "当前网页";
+      onHandBackToComposer(`我已在云端浏览器完成操作（当前页面：${label}），请继续刚才的任务。`);
+    }
+  };
+
+  if (initialLoading && !state) {
+    return (
+      <div className="lb-root" data-testid="live-browser-loading">
+        <div className="lb-idle-surface">
+          <Spinner size={18} className="text-accent" />
+          <p className="lb-idle-desc">正在连接云端浏览器视口…</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (state && !state.available) {
+    return (
+      <div className="lb-root" data-testid="live-browser-unavailable">
+        <div className="lb-idle-surface">
+          <span className="lb-idle-icon" aria-hidden>
+            <Globe size={18} />
+          </span>
+          <h3 className="lb-idle-title">当前环境未启用云端浏览器</h3>
+          <p className="lb-idle-desc">
+            该运行容器暂未挂载实时浏览器引擎，助手的浏览器步骤快照仍可在「步骤记录」中查看。
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!state?.active) {
+    return (
+      <div className="lb-root" data-testid="live-browser-idle">
+        {error && (
+          <div className="lb-error-banner" role="alert" data-testid="live-browser-error">
+            <span>{error}</span>
+            <button type="button" className="lb-error-close" aria-label="关闭提示" onClick={() => setError(null)}>
+              <X size={13} />
+            </button>
+          </div>
+        )}
+        <div className="lb-idle-surface">
+          <span className="lb-idle-icon" aria-hidden>
+            <Globe size={18} />
+          </span>
+          <h3 className="lb-idle-title">云端实时浏览器</h3>
+          <p className="lb-idle-desc">
+            助手操作网页时会自动同步实时画面；你也可以现在启动，直接登录学术库或处理验证，页面状态与助手共享。
+          </p>
+          <form className="lb-launch-form" onSubmit={handleLaunch}>
+            <input
+              type="text"
+              value={launchUrl}
+              disabled={lockedByAssistant}
+              onChange={(e) => setLaunchUrl(e.target.value)}
+              placeholder="输入网址，例如 https://arxiv.org"
+              aria-label="启动网址"
+              className="lb-launch-input"
+              data-testid="live-browser-launch-input"
+            />
+            <button
+              type="submit"
+              disabled={busy || lockedByAssistant}
+              className="lb-launch-btn"
+              data-testid="live-browser-launch-btn"
+            >
+              {busy ? <Spinner size={13} /> : <Globe size={13} />}
+              启动
+            </button>
+          </form>
+          <div className="lb-presets" aria-label="快捷入口">
+            {QUICK_PRESETS.map((preset) => (
+              <button
+                key={preset.url}
+                type="button"
+                disabled={busy || lockedByAssistant}
+                className="lb-preset-chip"
+                onClick={() => {
+                  setLaunchUrl(preset.url);
+                  void runAction({ action: "open", url: preset.url });
+                }}
+              >
+                {preset.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const tabs = state.tabs ?? [];
+  const isHttps = (state.url ?? "").startsWith("https://");
+
+  return (
+    <div className="lb-root" data-testid="live-browser-active">
+      {error && (
+        <div className="lb-error-banner" role="alert" data-testid="live-browser-error">
+          <span>{error}</span>
+          <button type="button" className="lb-error-close" aria-label="关闭提示" onClick={() => setError(null)}>
+            <X size={13} />
+          </button>
+        </div>
+      )}
+
+      <div className="lb-shell" data-takeover={effectiveTakeover ? "true" : "false"}>
+        {/* Top Chrome Toolbar */}
+        <div className="lb-toolbar">
+          <div className="lb-nav-group">
+            <button
+              type="button"
+              className="lb-icon-btn"
+              aria-label="后退"
+              title={lockedByAssistant ? "助手执行中，暂不可操作" : "后退"}
+              disabled={busy || lockedByAssistant}
+              onClick={() => void runAction({ action: "back" })}
+            >
+              <ArrowLeft size={14} />
+            </button>
+            <button
+              type="button"
+              className="lb-icon-btn"
+              aria-label="前进"
+              title={lockedByAssistant ? "助手执行中，暂不可操作" : "前进"}
+              disabled={busy || lockedByAssistant}
+              onClick={() => void runAction({ action: "forward" })}
+            >
+              <ArrowRight size={14} />
+            </button>
+            <button
+              type="button"
+              className="lb-icon-btn"
+              aria-label="刷新页面"
+              title={lockedByAssistant ? "助手执行中，暂不可操作" : "刷新页面"}
+              disabled={busy || lockedByAssistant}
+              onClick={() => void runAction({ action: "reload" })}
+            >
+              <RotateCw size={13} className={busy ? "lb-spin" : undefined} />
+            </button>
+          </div>
+
+          <form className="lb-address-form" onSubmit={handleAddressSubmit}>
+            <span className="lb-address-icon" aria-hidden>
+              {isHttps ? <Lock size={11} /> : <Globe size={11} />}
+            </span>
+            <input
+              type="text"
+              value={addressDraft}
+              readOnly={lockedByAssistant}
+              onFocus={() => {
+                if (!lockedByAssistant) setAddressEditing(true);
+              }}
+              onBlur={() => setAddressEditing(false)}
+              onChange={(e) => setAddressDraft(e.target.value)}
+              placeholder="输入网址并回车…"
+              aria-label="浏览器地址栏"
+              className="lb-address-input"
+              data-testid="live-browser-address"
+            />
+          </form>
+
+          <div className="lb-toolbar-actions">
+            {effectiveTakeover ? (
+              <button
+                type="button"
+                className="lb-cta-btn"
+                data-variant="takeover"
+                data-testid="live-browser-handback-btn"
+                onClick={handleHandBack}
+              >
+                <Check size={13} />
+                交还助手
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="lb-cta-btn"
+                data-variant="watch"
+                disabled={lockedByAssistant}
+                title={lockedByAssistant ? "助手正在操作浏览器，本轮结束或停止后即可接管" : "接管云端浏览器"}
+                data-testid="live-browser-takeover-btn"
+                onClick={() => {
+                  if (lockedByAssistant) return;
+                  setTakeover(true);
+                  window.requestAnimationFrame(() => stageRef.current?.focus({ preventScroll: true }));
+                }}
+              >
+                <Hand size={13} />
+                {lockedByAssistant ? "助手操作中" : "接管"}
+              </button>
+            )}
+            <button
+              type="button"
+              className="lb-icon-btn"
+              aria-label="关闭云端浏览器"
+              title={lockedByAssistant ? "助手执行中，暂不可关闭" : "关闭云端浏览器"}
+              disabled={busy || lockedByAssistant}
+              data-testid="live-browser-close-btn"
+              onClick={() => {
+                takeoverActiveRef.current = false;
+                clearPendingInputBuffers();
+                setTakeover(false);
+                void runAction({ action: "close" });
+              }}
+            >
+              <Power size={13} />
+            </button>
+          </div>
+        </div>
+
+        {/* Multi-tab bar (rendered only when more than 1 tab is open) */}
+        {tabs.length > 1 && (
+          <div className="lb-tabs" role="tablist" aria-label="浏览器标签页" data-testid="live-browser-tabs">
+            {tabs.map((t) => (
+              <div key={t.index} className="lb-tab" data-active={t.active ? "true" : "false"}>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={t.active}
+                  disabled={busy || lockedByAssistant}
+                  className="lb-tab-select"
+                  title={t.title || t.url}
+                  onClick={() => void runAction({ action: "tab_select", index: t.index })}
+                >
+                  {t.title || t.url || `标签页 ${t.index + 1}`}
+                </button>
+                <button
+                  type="button"
+                  disabled={busy || lockedByAssistant}
+                  className="lb-tab-close"
+                  aria-label={`关闭标签页 ${t.title || t.index + 1}`}
+                  onClick={() => void runAction({ action: "tab_close", index: t.index })}
+                >
+                  <X size={11} />
+                </button>
+              </div>
+            ))}
+            <button
+              type="button"
+              className="lb-icon-btn"
+              aria-label="新建标签页"
+              title="新建标签页"
+              disabled={busy || lockedByAssistant}
+              onClick={() => void runAction({ action: "tab_new" })}
+            >
+              <Plus size={12} />
+            </button>
+          </div>
+        )}
+
+        {/* Integrated Status Ribbon */}
+        <div
+          className="lb-status-ribbon"
+          data-takeover={effectiveTakeover ? "true" : "false"}
+          data-testid="live-browser-status"
+        >
+          <div className="lb-status-left">
+            <span className="lb-live-dot" data-takeover={effectiveTakeover ? "true" : "false"} aria-hidden />
+            <span className="lb-status-text">
+              {lockedByAssistant
+                ? "助手正在操作浏览器 · 实时观看中（本轮结束或停止后可一键接管）"
+                : effectiveTakeover
+                  ? "已接管 · 点击画面交互，Esc 退出键盘捕获，完成后点「交还助手」"
+                  : state.title
+                    ? `实时画面 · ${state.title}`
+                    : "实时画面同步中 · 点击「接管」可直接操作"}
+            </span>
+          </div>
+          {state.capturedAt && <span className="lb-status-meta">{formatSyncTime(state.capturedAt)}</span>}
+        </div>
+
+        {/* Viewport Canvas */}
+        <div
+          ref={stageRef}
+          tabIndex={effectiveTakeover ? 0 : -1}
+          className="lb-stage"
+          data-takeover={effectiveTakeover ? "true" : "false"}
+          data-testid="live-browser-stage"
+          aria-label={effectiveTakeover ? "云端浏览器交互画布（接管中）" : "云端浏览器实时画布"}
+          onKeyDown={handleStageKeyDown}
+          onWheel={handleCanvasWheel}
+        >
+          {state.imageBase64 ? (
+            <div className="lb-frame-wrap">
+              <img
+                ref={imgRef}
+                src={`data:${state.mimeType ?? "image/jpeg"};base64,${state.imageBase64}`}
+                alt={state.title ? `${state.title} 实时画面` : "云端浏览器实时画面"}
+                draggable={false}
+                className="lb-frame-img"
+                data-testid="live-browser-frame"
+                onClick={handleCanvasClick}
+                onContextMenu={handleCanvasContextMenu}
+              />
+              {ripple && (
+                <span
+                  key={ripple.id}
+                  className="lb-ripple"
+                  style={{ left: `${ripple.xPct}%`, top: `${ripple.yPct}%` }}
+                  aria-hidden
+                />
+              )}
+            </div>
+          ) : (
+            <div className="lb-stage-placeholder">
+              <Spinner size={16} className="text-accent" />
+              <span>正在捕获页面画面…</span>
+            </div>
+          )}
+        </div>
+
+        {/* Takeover Bottom Text Input & Quick Keys */}
+        {effectiveTakeover && (
+          <div className="lb-takeover-dock" data-testid="live-browser-takeover-dock">
+            <form
+              className="lb-type-form"
+              onSubmit={(e) => {
+                e.preventDefault();
+                handleSendText(true);
+              }}
+            >
+              <input
+                type="text"
+                value={typeDraft}
+                onChange={(e) => setTypeDraft(e.target.value)}
+                placeholder="输入文字或验证码发送到页面焦点…"
+                aria-label="向云端浏览器输入文字"
+                className="lb-type-input"
+                data-testid="live-browser-type-input"
+              />
+              <button
+                type="button"
+                disabled={busy || !typeDraft}
+                className="lb-type-btn"
+                data-testid="live-browser-type-send"
+                onClick={() => handleSendText(false)}
+              >
+                <Send size={12} />
+                输入
+              </button>
+              <button
+                type="submit"
+                disabled={busy || !typeDraft}
+                className="lb-type-btn"
+                data-primary="true"
+                title="输入并按回车"
+                aria-label="输入并按回车"
+                data-testid="live-browser-type-submit"
+              >
+                <CornerDownLeft size={12} />
+              </button>
+            </form>
+            <div className="lb-keys-row" aria-label="快捷按键">
+              {QUICK_KEYS.map((item) => (
+                <button
+                  key={item.key}
+                  type="button"
+                  disabled={busy}
+                  className="lb-key-chip"
+                  onClick={() => void runAction({ action: "press", key: item.key })}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

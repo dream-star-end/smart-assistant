@@ -6,15 +6,21 @@
  * 数据全部来自 browserSteps.collectBrowserSteps;不新增请求,截图走现有的签名媒体通道。
  */
 import { ArrowDownToLine, ChevronRight, Globe, ImageOff } from "lucide-react";
-import { useState } from "react";
+import { Suspense, lazy, useEffect, useState } from "react";
+import type { AuthSession } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import { ActionTrail, AddressBar, PlainSignedImg, ShotThumb } from "../tool/BrowserStepCard";
 import { type BrowserTurnStep, collectBrowserSteps, displayAddress } from "../tool/browserSteps";
 import type { ToolLike } from "../tool/format";
-import { StatusPill } from "../ui";
+import { Spinner, StatusPill } from "../ui";
 import { SignedImg } from "./media";
 import { TurnBar } from "./OutputsView";
 import type { WorkTurn } from "./workTurns";
+import "./liveBrowser.css";
+
+const LiveBrowserStage = lazy(() =>
+  import("./LiveBrowserStage").then((m) => ({ default: m.LiveBrowserStage })),
+);
 
 function idOf(m: { id?: string }): string {
   return typeof m.id === "string" ? m.id : "";
@@ -276,36 +282,110 @@ export function BrowserView({
   turns,
   index,
   running,
+  liveRunning,
   focusId,
   onSelectTurn,
   onOpenSteps,
   onOpenStep,
+  liveBrowserAgentId,
+  liveBrowserAuth,
+  onAnnotateToComposer,
 }: {
   turns: readonly WorkTurn[];
   index: number;
   running: boolean;
+  /** 会话级运行态（独立于当前查看的历史轮次），用于实时浏览器接管仲裁。 */
+  liveRunning?: boolean;
   /** 从卡片点进来时要看的那一步(消息 id)。 */
   focusId: string | null;
   onSelectTurn: (index: number) => void;
   onOpenSteps: () => void;
   onOpenStep: (message: ToolLike) => void;
+  /** 可选：启用云端实时浏览器视口与人工接管（OCV5-813）。 */
+  liveBrowserAgentId?: string;
+  liveBrowserAuth?: AuthSession | null;
+  onAnnotateToComposer?: (draft: string) => void;
 }) {
   const turn = turns[index];
-  if (!turn) return null;
+  const stepCount = turn ? collectBrowserSteps(turn.steps).length : 0;
+  const liveEnabled = Boolean(liveBrowserAgentId && liveBrowserAuth);
+  const [mode, setMode] = useState<"live" | "steps">(() =>
+    liveEnabled && (!focusId || stepCount === 0) ? "live" : "steps",
+  );
+  const [liveActive, setLiveActive] = useState(false);
+
+  // 从具体浏览器步骤卡片点进来时自动切到「步骤记录」定位那一步。
+  useEffect(() => {
+    if (focusId && stepCount > 0) setMode("steps");
+  }, [focusId, stepCount]);
+
+  if (!turn && !liveEnabled) return null;
+  const effectiveMode: "live" | "steps" = !liveEnabled ? "steps" : stepCount === 0 ? "live" : mode;
+
   return (
     <div className="min-h-0 flex-1 overflow-y-auto" data-testid="browser-view">
-      {/* key:换轮 / 换入口时选中重置。 */}
-      <TurnBrowser
-        key={`${turn.key}:${focusId ?? ""}`}
-        turn={turn}
-        index={index}
-        total={turns.length}
-        running={running}
-        focusId={focusId}
-        onSelectTurn={onSelectTurn}
-        onOpenSteps={onOpenSteps}
-        onOpenStep={onOpenStep}
-      />
+      {liveEnabled && stepCount > 0 && (
+        <div className="lb-mode-bar" data-testid="browser-mode-switcher">
+          <div className="lb-segmented" role="tablist" aria-label="浏览器视图模式">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={effectiveMode === "live"}
+              data-active={effectiveMode === "live" ? "true" : "false"}
+              className="lb-seg-btn"
+              data-testid="browser-mode-live"
+              onClick={() => setMode("live")}
+            >
+              {liveActive && <span className="lb-live-dot" aria-hidden />}
+              实时视口
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={effectiveMode === "steps"}
+              data-active={effectiveMode === "steps" ? "true" : "false"}
+              className="lb-seg-btn"
+              data-testid="browser-mode-steps"
+              onClick={() => setMode("steps")}
+            >
+              步骤记录
+              <span className="lb-seg-count">{stepCount}</span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {effectiveMode === "live" && liveBrowserAgentId && liveBrowserAuth ? (
+        <Suspense
+          fallback={
+            <div className="flex items-center gap-2 px-4 py-4 text-meta text-muted">
+              <Spinner size={13} className="text-accent" />
+              正在加载实时浏览器…
+            </div>
+          }
+        >
+          <LiveBrowserStage
+            agentId={liveBrowserAgentId}
+            auth={liveBrowserAuth}
+            running={liveRunning ?? running}
+            onHandBackToComposer={onAnnotateToComposer}
+            onActiveStateChange={setLiveActive}
+          />
+        </Suspense>
+      ) : turn ? (
+        /* key:换轮 / 换入口时选中重置。 */
+        <TurnBrowser
+          key={`${turn.key}:${focusId ?? ""}`}
+          turn={turn}
+          index={index}
+          total={turns.length}
+          running={running}
+          focusId={focusId}
+          onSelectTurn={onSelectTurn}
+          onOpenSteps={onOpenSteps}
+          onOpenStep={onOpenStep}
+        />
+      ) : null}
     </div>
   );
 }

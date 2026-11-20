@@ -225,6 +225,16 @@ async function dispatchLocal(
       settled = true
       resolve()
     }
+    // Keep CONNECT_MS strictly for TCP connect; once connected, switch to IDLE_MS so slow
+    // container operations (e.g. live browser cold-start / navigation / screenshot) are not
+    // prematurely cut off at 3s before first response byte (OCV5-813).
+    upstream.on('socket', (sock) => {
+      const promoteTimeout = () => {
+        if (typeof upstream.setTimeout === 'function') upstream.setTimeout(IDLE_MS)
+      }
+      if (sock?.connecting) sock.once('connect', promoteTimeout)
+      else promoteTimeout()
+    })
     upstream.on('timeout', () => upstream.destroy(new Error('connect_or_idle_timeout')))
     upstream.on('error', (err) => {
       ctx.log.warn('container_api_proxy_upstream_error', {

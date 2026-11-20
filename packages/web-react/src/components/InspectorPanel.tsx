@@ -61,6 +61,7 @@ export {
   type PaneTab,
 } from "./chat/inspectorState";
 import type { ChatMessage } from "../lib/chat/model";
+import type { AuthSession } from "../lib/types";
 import { computeStepTimings, formatStepDuration } from "../lib/chat/stepTiming";
 import { cn } from "../lib/utils";
 import { extractLatestTodos, type TodoItem } from "./chat/todoExtract";
@@ -587,6 +588,8 @@ export function InspectorPanelContent({
   onClose,
   onActiveChange,
   onAnnotateToComposer,
+  liveBrowserAgentId,
+  liveBrowserAuth,
   titleId,
 }: {
   messages: readonly ChatMessage[];
@@ -602,6 +605,9 @@ export function InspectorPanelContent({
   onActiveChange?: (message: ToolLike | null) => void;
   /** 可选：右侧交付物批注精修时，将结构化修改指令直接回填至左侧 Composer 输入框。 */
   onAnnotateToComposer?: (draft: string) => void;
+  /** 可选：云端实时浏览器与人工接管的目标智能体及鉴权会话（OCV5-813）。 */
+  liveBrowserAgentId?: string;
+  liveBrowserAuth?: AuthSession | null;
   titleId?: string;
 }) {
   // 浏览器卡点进来:那一步不在顶层轮里(团队子任务等)就退回步骤详情,不落到一个没有它的「浏览器」页。
@@ -734,9 +740,11 @@ export function InspectorPanelContent({
   );
   // 停在「浏览器」页而这一轮的大记录还在补取:先给读取态,不退回产出(取完仍没有浏览器步再退回)。
   const browserPending = tab === "browser" && browserCount === 0 && browserProbing;
+  const liveBrowserAvailable = Boolean(liveBrowserAgentId && liveBrowserAuth);
 
   const view: PaneTab =
-    (tab === "plan" && todos.length === 0) || (tab === "browser" && browserCount === 0 && !browserPending)
+    (tab === "plan" && todos.length === 0) ||
+    (tab === "browser" && browserCount === 0 && !browserPending && !liveBrowserAvailable)
       ? "outputs"
       : tab;
   const shown: ToolLike | null = view === "steps" ? stepShown : null;
@@ -798,7 +806,9 @@ export function InspectorPanelContent({
   const count = (n: number) => (n > 0 ? <span className="ml-1 tabular-nums text-faint">{n}</span> : null);
   const tabItems = [
     { value: "outputs", label: <span>产出</span> },
-    ...(browserCount > 0 || browserPending ? [{ value: "browser", label: <span>浏览器{count(browserCount)}</span> }] : []),
+    ...(browserCount > 0 || browserPending || liveBrowserAvailable
+      ? [{ value: "browser", label: <span>浏览器{count(browserCount)}</span> }]
+      : []),
     { value: "steps", label: <span>步骤{count(steps.length)}</span> },
     ...(todos.length > 0 ? [{ value: "plan", label: <span>计划</span> }] : []),
   ];
@@ -859,6 +869,7 @@ export function InspectorPanelContent({
               turns={browserTurns}
               index={outputsIndex}
               running={running && outputsIndex === lastTurn}
+              liveRunning={running}
               focusId={browserFocus}
               onSelectTurn={(i) => {
                 const t = workTurns[i];
@@ -871,6 +882,9 @@ export function InspectorPanelContent({
                 setFollow(false);
               }}
               onOpenStep={openStep}
+              liveBrowserAgentId={liveBrowserAgentId}
+              liveBrowserAuth={liveBrowserAuth}
+              onAnnotateToComposer={onAnnotateToComposer}
             />
           </Suspense>
         ) : view === "outputs" ? (

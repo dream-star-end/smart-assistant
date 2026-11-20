@@ -115,6 +115,8 @@ export interface AgentRoutesIo {
   ): Promise<void>
   handleMemoryContext(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void>
   handlePersona(req: IncomingMessage, res: ServerResponse, id: string): Promise<void>
+  handleLiveBrowserLive(req: IncomingMessage, res: ServerResponse, agentId: string, url: URL): Promise<void>
+  handleLiveBrowserAction(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void>
   handleSkillItem(
     req: IncomingMessage,
     res: ServerResponse,
@@ -149,6 +151,22 @@ export const AGENT_ROUTES: readonly HttpRoute<AgentRoutesIo>[] = [
     (_req, url) => url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/persona$/),
     (io, req, res, _url, personaMatch) => {
       io.handlePersona(req, res, personaMatch[1]).catch((err) => io.sendInternalError(res, err))
+      return true
+    },
+  ),
+  regexRoute(
+    '/api/agents/:1/browser/live',
+    (_req, url) => url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/browser\/live$/),
+    (io, req, res, url, m) => {
+      io.handleLiveBrowserLive(req, res, m[1], url).catch((err) => io.sendInternalError(res, err))
+      return true
+    },
+  ),
+  regexRoute(
+    '/api/agents/:1/browser/action',
+    (_req, url) => url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/browser\/action$/),
+    (io, req, res, _url, m) => {
+      io.handleLiveBrowserAction(req, res, m[1]).catch((err) => io.sendInternalError(res, err))
       return true
     },
   ),

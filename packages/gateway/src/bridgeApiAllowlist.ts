@@ -110,6 +110,18 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     proxyFromCommercial: true,
   },
   {
+    label: '/api/agents/:id/browser/live',
+    re: /^\/api\/agents\/[A-Za-z0-9_-]+\/browser\/live$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/agents/:id/browser/action',
+    re: /^\/api\/agents\/[A-Za-z0-9_-]+\/browser\/action$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
+  {
     label: '/api/agents/:id/memory/:target',
     re: /^\/api\/agents\/[^/]+\/memory\/(memory|user)$/,
     methods: M('GET', 'PUT'),

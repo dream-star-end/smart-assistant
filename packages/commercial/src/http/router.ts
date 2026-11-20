@@ -516,6 +516,9 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
     label: '/api/agents/:id/auto-dream-optimizer/proposals/:proposalId/:action',
   },
   { re: /^\/api\/agents\/[^/]+\/skills(\/[A-Za-z0-9_\-]+)?$/, label: '/api/agents/:id/skills' },
+  // 容器内实时云浏览器接管(OCV5-813):必须经 containerApiProxy 落入调用者自己的隔离容器,
+  // 禁止在 host singleton 兜底执行。
+  { re: /^\/api\/agents\/[A-Za-z0-9_-]+\/browser\/(live|action)$/, label: '/api/agents/:id/browser/*' },
   // 用户级共享技能库(host singleton 存储);付费用户只能经 container proxy 操作自己容器
   { re: /^\/api\/skills(\/[A-Za-z0-9_\-]+)?$/, label: '/api/skills' },
   // SkillOpt 训练(/api/skills/:name/train + /api/skill-training/*):同样落 host singleton

@@ -2725,7 +2725,7 @@ export function App() {
             widthMax={DETAIL_PANE_WIDTH.max}
             onResizeStart={paneWidth.onResizeStart}
             onResizeKeyDown={paneWidth.onResizeKeyDown}
-            onAnnotateToComposer={(text) => setComposerPrefill({ text, nonce: Date.now() })}
+            onAnnotateToComposer={(text) => setComposerPrefill({ text, nonce: Date.now() })} liveBrowserAgentId={demo ? undefined : agent.id} liveBrowserAuth={auth}
           />
         </LazyBoundary>
       )}
@@ -2757,7 +2757,7 @@ export function App() {
                 deferredLoader={paneDeferredLoader}
                 onClose={() => setPaneSheetOpen(false)}
                 onActiveChange={setPaneActive}
-                onAnnotateToComposer={(text) => { setComposerPrefill({ text, nonce: Date.now() }); setPaneSheetOpen(false); }}
+                onAnnotateToComposer={(text) => { setComposerPrefill({ text, nonce: Date.now() }); setPaneSheetOpen(false); }} liveBrowserAgentId={demo ? undefined : agent.id} liveBrowserAuth={auth}
               />
             </LazyBoundary>
           </div>
