@@ -1,7 +1,8 @@
-import { SWARM_BOARD_TOOL_NAME, type SwarmSnapshot } from "@openclaude/protocol/browser";
+import { SWARM_BOARD_TOOL_NAME, reduceLiveFrames, type SwarmSnapshot } from "@openclaude/protocol/browser";
 import { act, fireEvent, render, renderHook, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { useSwarmBoard } from "../../hooks/useSwarmUi";
+import { liveUnitToMessage, restoreLiveUnitStreamingState } from "../../lib/chat/liveUnitsHydrate";
 import { createSession, type ChatMessage } from "../../lib/chat/model";
 import { applyOutboundMessage } from "../../lib/chat/reducer";
 import { isInteractiveToolMessage } from "./ProcessDisclosure";
@@ -346,5 +347,93 @@ describe("Antigravity native swarm reducer & UI (OCV5-809)", () => {
     const rows = within(drawer).getByTestId("swarm-board-feed").querySelectorAll("[data-swarm-post-seq]");
     expect(rows).toHaveLength(1);
     expect(rows[0]?.getAttribute("data-swarm-post-seq")).toBe("3");
+  });
+
+  it("OCV5-819: merges delta swarm_snapshot posts onto hydrated LiveUnit SwarmBoard card in place", () => {
+    const fullRev1 = makeSnapshot({
+      revision: 1,
+      postsMode: "full",
+      posts: [
+        { seq: 1, agent: "coordinator", channel: "main", text: "初始拆解", mentions: [] },
+      ],
+      totalPosts: 1,
+    });
+    const reduced = reduceLiveFrames([
+      {
+        recordId: "r-1",
+        streamKey: "dispatch:d1:1",
+        clientMessageId: "cm-1",
+        payload: {
+          type: "outbound.message",
+          frameSeq: 1,
+          sessionKey: "agent:main:webchat:dm:s-delta",
+          blocks: [{ kind: "swarm_snapshot", blockId: "agy-swarm-11111111-t0", snapshot: fullRev1 }],
+        },
+      },
+    ]);
+    expect(reduced.ok).toBe(true);
+    if (!reduced.ok) return;
+
+    const sess = createSession({ id: "s-delta", agentId: "main" });
+    sess.messages = reduced.state.units.map((u) => liveUnitToMessage(u));
+    restoreLiveUnitStreamingState(sess, reduced.state.units);
+
+    // Next WS frame arrives as lightweight delta carrying only post #2
+    const deltaRev2 = makeSnapshot({
+      revision: 2,
+      postsMode: "delta",
+      deltaBaseSeq: 1,
+      posts: [
+        { seq: 2, agent: "parser", channel: "parser", text: "增量新进展", mentions: ["coordinator"] },
+      ],
+      totalPosts: 2,
+    });
+    applyOutboundMessage(sess, {
+      type: "outbound.message",
+      sessionKey: "agent:main:webchat:dm:s-delta",
+      channel: "webchat",
+      peer: { id: "s-delta", kind: "dm" },
+      frameSeq: 2,
+      isFinal: false,
+      blocks: [{ kind: "swarm_snapshot", blockId: "agy-swarm-11111111-t0", snapshot: deltaRev2 }],
+    });
+
+    const swarmCards = sess.messages.filter((m) => m.role === "tool" && m.toolName === SWARM_BOARD_TOOL_NAME);
+    expect(swarmCards).toHaveLength(1);
+    const snap = extractSwarmSnapshotFromMessage(swarmCards[0]);
+    expect(snap?.revision).toBe(2);
+    expect(snap?.posts.map((p) => p.seq)).toEqual([1, 2]);
+  });
+
+  it("OCV5-819: renders isolated worktree badges and merge-safety notice for workspace=share members", () => {
+    const snap = makeSnapshot({
+      members: [
+        {
+          name: "coordinator",
+          role: "coordinator",
+          status: "waiting",
+          stepCount: 2,
+          unreadCount: 0,
+        },
+        {
+          name: "writer-a",
+          role: "worker",
+          status: "working",
+          workspace: "share",
+          stepCount: 5,
+          activity: "编辑 api.ts",
+          unreadCount: 0,
+        },
+      ],
+    });
+    render(
+      <div>
+        <SwarmInlineCard snapshot={snap} cardId="m-wt" blockId="b-wt" onOpenBoard={vi.fn()} />
+        <SwarmBoardDrawer open onOpenChange={vi.fn()} snapshot={snap} />
+      </div>,
+    );
+    expect(screen.getByText("1 独立 worktree")).toBeTruthy();
+    expect(screen.getByTestId("swarm-worktree-notice")).toBeTruthy();
+    expect(screen.getAllByText("worktree").length).toBeGreaterThanOrEqual(2);
   });
 });

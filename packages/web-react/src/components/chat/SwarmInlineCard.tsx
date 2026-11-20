@@ -10,6 +10,7 @@ import {
   AlertTriangle,
   ArrowUpRight,
   ChevronRight,
+  GitBranch,
   Hash,
   Hexagon,
   MessageSquare,
@@ -30,6 +31,7 @@ import {
   swarmPhaseMeta,
   swarmRoleLabel,
   swarmStatusLabel,
+  swarmWorkspaceBadge,
   tokenizeSwarmInlineText,
   type SwarmOpenRequest,
 } from "./swarmUtils";
@@ -200,6 +202,15 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
                 <MessageSquare size={11} />
                 {snapshot.totalPosts} 条讨论
               </span>
+              {counts.isolatedWorktrees > 0 && (
+                <span
+                  className="inline-flex items-center gap-0.5 text-info tabular-nums"
+                  title="成员使用独立 git worktree 隔离修改，收尾前需确认已合入主工作区"
+                >
+                  <GitBranch size={11} />
+                  {counts.isolatedWorktrees} 独立 worktree
+                </span>
+              )}
               {elapsed && <span className="font-mono tabular-nums text-muted">{elapsed}</span>}
               {counts.failed > 0 && (
                 <span className="inline-flex items-center gap-0.5 text-danger">
@@ -245,6 +256,7 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
                 const working = member.status === "working" && active;
                 const killed = member.status === "killed";
                 const modelText = humanizeSwarmModel(member.model);
+                const wsBadge = swarmWorkspaceBadge(member.workspace);
                 return (
                   <button
                     key={member.name}
@@ -292,6 +304,15 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
                           <span className="shrink-0 rounded bg-hover px-1 py-0 text-micro text-muted">
                             {swarmRoleLabel(member.role)}
                           </span>
+                          {wsBadge && (
+                            <span
+                              title={wsBadge.title}
+                              className="inline-flex shrink-0 items-center gap-0.5 rounded bg-info-soft px-1 py-0 text-micro font-medium text-info"
+                            >
+                              <GitBranch size={9} />
+                              {wsBadge.label}
+                            </span>
+                          )}
                         </div>
                         {modelText && (
                           <div className="truncate text-micro text-faint">{modelText}</div>

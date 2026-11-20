@@ -8,8 +8,15 @@
  */
 
 import { mintLiveProcessKey } from './timelineLifecycle.js'
+import {
+  SWARM_BOARD_TOOL_NAME,
+  compactSwarmSnapshotToByteBudget,
+  isSwarmSnapshot,
+  mergeSwarmSnapshotsStrict,
+  type SwarmSnapshot,
+} from './swarm.js'
 
-export const LIVE_UNITS_REDUCER_EPOCH = '3'
+export const LIVE_UNITS_REDUCER_EPOCH = '4'
 export const LIVE_UNITS_DEFAULT_N = 20
 export const LIVE_UNITS_MAX_N = 80
 export const LIVE_UNITS_DEFAULT_K = 20
@@ -651,14 +658,70 @@ function reduceLiveFramesOnto(
     if (meta.type === 'outbound.permission_request' || meta.type === 'outbound.permission_settled')
       return { ok: false, degraded: 'fallback' }
     if (meta.type !== 'outbound.message') continue
-    // Swarm snapshots carry live multi-agent board state that the compact
-    // live-unit schema does not fold. Advancing a resume cursor past one would
-    // make a refreshed or second tab miss the latest board while it is quiet.
-    // Fail closed to the raw-frame journal so hydration replays through the
-    // ordinary reducer (same contract as permission frames above).
-    if (meta.blocks.some((b) => str(b.kind) === 'swarm_snapshot'))
-      return { ok: false, degraded: 'fallback' }
-    const block = meta.blocks[0]
+    // Fold live Antigravity swarm_snapshot blocks natively into a single latest-wins
+    // SwarmBoard tool unit (with monotonic revision guard + delta post merging).
+    // Do NOT clear openThinking so sideband telemetry never fragments streaming text.
+    const swarmBlocks = meta.blocks.filter((b) => str(b.kind) === 'swarm_snapshot')
+    if (swarmBlocks.length > 0) {
+      const cmid = frame.clientMessageId
+      for (const sBlock of swarmBlocks) {
+        if (!isSwarmSnapshot(sBlock.snapshot)) continue
+        const incoming = sBlock.snapshot
+        const blockId = str(sBlock.blockId) || `agy-swarm-${incoming.swarmId.slice(0, 8)}`
+        let unit = tools.get(blockId)
+        const existingSnap = extractSwarmSnapshotFromLiveUnit(unit)
+        const mergeRes = mergeSwarmSnapshotsStrict(existingSnap, incoming)
+        if (!mergeRes.ok) {
+          // A delta frame whose baseline post was evicted/missing must fail closed
+          // rather than certifying a gapped board and advancing the resume cursor (OCV5-819 B7).
+          if (mergeRes.reason === 'missing_base') {
+            return { ok: false, degraded: 'fallback' }
+          }
+          continue
+        }
+        const merged = mergeRes.snapshot
+        const isTerminal = merged.phase !== 'running' && merged.phase !== 'starting'
+        const inputJson = {
+          swarmId: merged.swarmId,
+          title: merged.title,
+          phase: merged.phase,
+          snapshot: merged,
+        }
+        if (!unit) {
+          unit = {
+            id: unitId('tool', blockId, meta.seq),
+            kind: 'tool',
+            seqFirst: meta.seq,
+            seqLast: meta.seq,
+            recordIdFirst: frame.recordId,
+            recordIdLast: frame.recordId,
+            open: !isTerminal,
+            clientMessageId: cmid,
+            sessionKey: meta.sessionKey,
+            blockId,
+            toolName: SWARM_BOARD_TOOL_NAME,
+            inputJson,
+            text: merged.title,
+            error: merged.phase === 'error' ? true : undefined,
+            payloadRef: meta.ref,
+          }
+          pushStampedUnit(units, unit, processKeys, streamGeneration)
+          tools.set(blockId, unit)
+        } else {
+          unit.toolName = SWARM_BOARD_TOOL_NAME
+          unit.blockId = blockId
+          unit.inputJson = inputJson
+          unit.text = merged.title
+          unit.open = !isTerminal
+          unit.error = merged.phase === 'error' ? true : undefined
+          unit.seqLast = meta.seq
+          unit.recordIdLast = frame.recordId
+          unit.payloadRef = meta.ref
+        }
+      }
+      if (swarmBlocks.length === meta.blocks.length) continue
+    }
+    const block = meta.blocks.find((b) => str(b.kind) !== 'swarm_snapshot')
     if (!block) continue
     const kind = str(block.kind)
     const cmid = frame.clientMessageId
@@ -667,8 +730,14 @@ function reduceLiveFramesOnto(
       const messageId = str(block.messageId) || undefined
       const key = `${kind}:${messageId || cmid || 'default'}`
       let unit = openThinking.get(key)
-      const last = units[units.length - 1]
-      if (!unit || unit !== last || unit.kind !== kind) {
+      let lastNonSwarm: MutableUnit | undefined
+      for (let j = units.length - 1; j >= 0; j -= 1) {
+        if (!isSwarmBoardUnit(units[j])) {
+          lastNonSwarm = units[j]
+          break
+        }
+      }
+      if (!unit || unit !== lastNonSwarm || unit.kind !== kind) {
         unit = {
           id: unitId(kind, key, meta.seq),
           kind,
@@ -899,6 +968,41 @@ function reduceLiveFramesOnto(
   }
 }
 
+const SWARM_CHECKPOINT_MAX_BYTES = 128 * 1024
+
+function isSwarmBoardUnit(unit: LiveUnit | undefined | null): boolean {
+  return Boolean(unit && unit.kind === 'tool' && unit.toolName === SWARM_BOARD_TOOL_NAME)
+}
+
+function isPinnedOpenUnit(unit: LiveUnit): boolean {
+  return unit.open && (unit.kind === 'agent_group' || isSwarmBoardUnit(unit))
+}
+
+function extractSwarmSnapshotFromLiveUnit(unit: LiveUnit | undefined | null): SwarmSnapshot | null {
+  if (!isSwarmBoardUnit(unit) || !unit) return null
+  const input = unit.inputJson
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null
+  const rec = input as Record<string, unknown>
+  if (isSwarmSnapshot(rec.snapshot)) return rec.snapshot
+  if (isSwarmSnapshot(rec)) return rec
+  return null
+}
+
+function compactSwarmUnitEnvelope(unit: LiveUnit, maxBytes: number): boolean {
+  const snap = extractSwarmSnapshotFromLiveUnit(unit)
+  if (!snap) return false
+  const before = jsonSize(unit.inputJson)
+  if (before <= maxBytes) return false
+  const compacted = compactSwarmSnapshotToByteBudget(snap, maxBytes)
+  unit.inputJson = {
+    swarmId: compacted.swarmId,
+    title: compacted.title,
+    phase: compacted.phase,
+    snapshot: compacted,
+  }
+  return jsonSize(unit.inputJson) < before
+}
+
 function cloneUnit(unit: LiveUnit): LiveUnit {
   return {
     ...unit,
@@ -935,7 +1039,12 @@ function applyPreviewToUnit(unit: LiveUnit, previewMax: number): boolean {
   let changed = false
   if (truncateField(unit as unknown as Record<string, unknown>, 'output', previewMax)) changed = true
   if (truncateField(unit as unknown as Record<string, unknown>, 'outputJson', previewMax)) changed = true
-  if (truncateField(unit as unknown as Record<string, unknown>, 'inputJson', previewMax)) changed = true
+  if (isSwarmBoardUnit(unit)) {
+    // Keep SwarmBoard snapshots structurally intact while respecting serving byte budgets.
+    if (compactSwarmUnitEnvelope(unit, Math.max(4096, previewMax))) changed = true
+  } else if (truncateField(unit as unknown as Record<string, unknown>, 'inputJson', previewMax)) {
+    changed = true
+  }
   if (unit.kind !== 'thinking' && unit.kind !== 'text') {
     if (truncateField(unit as unknown as Record<string, unknown>, 'text', previewMax)) changed = true
   } else if ((unit.text || '').length > previewMax) {
@@ -960,7 +1069,13 @@ function applyCheckpointStubsToUnit(unit: LiveUnit, previewMax: number): void {
   if (unit.kind !== 'thinking' && unit.kind !== 'text') {
     truncateField(unit as unknown as Record<string, unknown>, 'output', previewMax)
     truncateField(unit as unknown as Record<string, unknown>, 'outputJson', previewMax)
-    truncateField(unit as unknown as Record<string, unknown>, 'inputJson', previewMax)
+    if (isSwarmBoardUnit(unit)) {
+      // SwarmBoard accumulates delta posts across frames; retain a bounded full snapshot
+      // in checkpoints so reload/second-tab hydration renders the live board immediately.
+      compactSwarmUnitEnvelope(unit, SWARM_CHECKPOINT_MAX_BYTES)
+    } else {
+      truncateField(unit as unknown as Record<string, unknown>, 'inputJson', previewMax)
+    }
     if (unit.kind === 'tool') {
       truncateField(unit as unknown as Record<string, unknown>, 'text', previewMax)
     }
@@ -973,7 +1088,7 @@ function applyCheckpointStubsToUnit(unit: LiveUnit, previewMax: number): void {
 }
 
 function selectFirstPack(units: LiveUnit[], n: number): { pack: LiveUnit[]; hasMoreBefore: boolean; beforeCursor: string | null } {
-  const open = units.filter((u) => u.open && u.kind === 'agent_group')
+  const open = units.filter(isPinnedOpenUnit)
   const tail = units.slice(Math.max(0, units.length - n))
   const seen = new Set<string>()
   const pack: LiveUnit[] = []
@@ -983,7 +1098,7 @@ function selectFirstPack(units: LiveUnit[], n: number): { pack: LiveUnit[]; hasM
     pack.push(unit)
   }
   pack.sort((a, b) => a.seqFirst - b.seqFirst || a.id.localeCompare(b.id))
-  // before 游标按 tail 窗口，不含被并入的更早 open 组卡，避免漏掉组卡与尾窗之间的单元。
+  // before 游标按 tail 窗口，不含被并入的更早 open 组卡/蜂群卡，避免漏掉组卡与尾窗之间的单元。
   const tailMinSeq = tail[0]?.seqFirst
   const hasMoreBefore = typeof tailMinSeq === 'number' && units.some((u) => u.seqFirst < tailMinSeq)
   const beforeCursor = hasMoreBefore && typeof tailMinSeq === 'number' ? `u:${tailMinSeq}` : null
@@ -995,7 +1110,7 @@ function selectBeforePack(units: LiveUnit[], beforeSeq: number, n: number): {
   hasMoreBefore: boolean
   beforeCursor: string | null
 } {
-  const older = units.filter((u) => u.seqFirst < beforeSeq && !(u.open && u.kind === 'agent_group'))
+  const older = units.filter((u) => u.seqFirst < beforeSeq && !isPinnedOpenUnit(u))
   const pack = older.slice(Math.max(0, older.length - n))
   const hasMoreBefore = older.length > pack.length
   const beforeCursor = hasMoreBefore && pack[0] ? `u:${pack[0].seqFirst}` : null
@@ -1074,21 +1189,28 @@ function enforceBudget(pack: LiveUnit[], opts: {
   // first left a refresh showing only the subtask (OCV5-275).
   if (over() && opts.keepOpenChrome) {
     current = current.map((u) => {
-      if (!(u.open && u.kind === 'agent_group')) return u
-      const chrome = cloneUnit(u)
-      const hadChildren = (u.children?.length ?? 0) > 0
-      chrome.children = []
-      chrome.nestedHasMoreBefore = hadChildren || u.nestedHasMoreBefore === true
-      chrome.nestedBeforeCursor = hadChildren
-        ? (u.nestedBeforeCursor ?? 'c:0')
-        : (u.nestedBeforeCursor ?? null)
-      applyPreviewToUnit(chrome, opts.previewMax)
-      return chrome
+      if (u.open && u.kind === 'agent_group') {
+        const chrome = cloneUnit(u)
+        const hadChildren = (u.children?.length ?? 0) > 0
+        chrome.children = []
+        chrome.nestedHasMoreBefore = hadChildren || u.nestedHasMoreBefore === true
+        chrome.nestedBeforeCursor = hadChildren
+          ? (u.nestedBeforeCursor ?? 'c:0')
+          : (u.nestedBeforeCursor ?? null)
+        applyPreviewToUnit(chrome, opts.previewMax)
+        return chrome
+      }
+      if (u.open && isSwarmBoardUnit(u)) {
+        const chrome = cloneUnit(u)
+        compactSwarmUnitEnvelope(chrome, Math.max(4096, Math.floor(opts.maxBytes / 4)))
+        return chrome
+      }
+      return u
     })
   }
   if (over()) {
-    const open = current.filter((u) => u.open && u.kind === 'agent_group')
-    const rest = current.filter((u) => !(u.open && u.kind === 'agent_group'))
+    const open = current.filter(isPinnedOpenUnit)
+    const rest = current.filter((u) => !isPinnedOpenUnit(u))
     while (over() && rest.length > 0) {
       rest.shift()
       droppedNonOpen = true
@@ -1097,10 +1219,14 @@ function enforceBudget(pack: LiveUnit[], opts: {
     if (over() && opts.keepOpenChrome) {
       current = open.map((u) => {
         const chrome = cloneUnit(u)
-        chrome.children = []
-        chrome.nestedHasMoreBefore = (u.children?.length ?? 0) > 0 || u.nestedHasMoreBefore === true
-        chrome.nestedBeforeCursor = u.nestedBeforeCursor ?? (chrome.nestedHasMoreBefore ? 'c:0' : null)
-        applyPreviewToUnit(chrome, opts.previewMax)
+        if (u.kind === 'agent_group') {
+          chrome.children = []
+          chrome.nestedHasMoreBefore = (u.children?.length ?? 0) > 0 || u.nestedHasMoreBefore === true
+          chrome.nestedBeforeCursor = u.nestedBeforeCursor ?? (chrome.nestedHasMoreBefore ? 'c:0' : null)
+          applyPreviewToUnit(chrome, opts.previewMax)
+        } else if (isSwarmBoardUnit(u)) {
+          compactSwarmUnitEnvelope(chrome, Math.max(2048, Math.floor(opts.maxBytes / 4)))
+        }
         return chrome
       })
       let preview = opts.previewMax
@@ -1114,7 +1240,7 @@ function enforceBudget(pack: LiveUnit[], opts: {
       }
     }
   }
-  const restNow = current.filter((u) => !(u.open && u.kind === 'agent_group'))
+  const restNow = current.filter((u) => !isPinnedOpenUnit(u))
   const restMinSeq = restNow.length > 0 ? Math.min(...restNow.map((u) => u.seqFirst)) : null
   return { units: current, droppedNonOpen, restMinSeq }
 }

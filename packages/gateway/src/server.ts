@@ -716,11 +716,9 @@ export class Gateway {
   // ── Phase 4 GitHub workspace: per-WS recent hello peers cache + pending binds ──
   // bind 帧到达时,sessionId 必须出现在 clientsByPeer 注册表 OR 该 ws 最近 5s 内
   // 收到的 hello peers。否则入 pending 队列(5s timeout 后 fail)。
-  // Map keyed by ws → { peerIds: Set<sessionId>, recordedAt: ms }
-  private _recentHelloPeers = new WeakMap<
-    WebSocket,
-    { peerIds: Set<string>; recordedAt: number }
-  >()
+  // Map keyed by ws → Map<peerId, recordedAtMs> so split per-peer hellos on a
+  // shared ContainerLink never overwrite another peer's 5s repo-bind grace window (OCV5-819 B6).
+  private _recentHelloPeers = new WeakMap<WebSocket, Map<string, number>>()
   private _pendingRepoBinds = new Map<
     string /* sessionId|version */,
     {

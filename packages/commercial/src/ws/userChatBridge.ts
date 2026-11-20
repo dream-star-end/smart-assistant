@@ -12,7 +12,12 @@ import { sendErrorFrame } from './userErrorFrames.js';
 import { withUserError } from '@openclaude/protocol';
 import {isPlainRecord,hasOnlyKeys} from './bridgeInputGuards.js';
 import { sendHelloSessionSnapshots } from "./helloOpenDispatchSnapshot.js";
-import { ContainerLinkRegistry, getContainerLinkHandle, type ContainerLinkSnapshot } from "./containerLink.js";
+import {
+  CONTAINER_LINK_ADMITTED_RENEW_MAX_AGE_MS,
+  ContainerLinkRegistry,
+  getContainerLinkHandle,
+  type ContainerLinkSnapshot,
+} from "./containerLink.js";
 import { containerLinkEnabled, hasBrowserActivity } from "./containerLinkPolicy.js";
 import {checkModelSwitchFrame,promptQueueDispositionForCode,_recoveryRefusalAction,shouldRejectCodexTurnForG7} from './modelSwitchCostGuard.js';
 export {_recoveryRefusalAction,shouldRejectCodexTurnForG7} from './modelSwitchCostGuard.js';
@@ -820,6 +825,8 @@ export interface UserChatBridgeDeps {
   promptQueuePreparationTimeoutMs?: number;
   /** Durable dispatch heartbeat cadence; override only for focused tests. */
   dispatchLeaseHeartbeatMs?: number;
+  /** Maximum age for renewing unacknowledged `status='admitted'` dispatches (OCV5-819 B1). */
+  admittedRenewMaxAgeMs?: number;
   /** @internal deterministic race-test seam; production never injects this. */
   deferContainerSendCompletionForTest?: (complete: () => void) => void;
   /**
@@ -1986,8 +1993,19 @@ export class _OutboundPersistQueueCoordinator {
     this.scheduleCleanup(key, state, task);
   }
 
-  async drain(): Promise<void> {
-    await Promise.allSettled([...this.queues.values()].map((state) => state.tail));
+  async drain(keys?: Iterable<string>): Promise<void> {
+    if (!keys) {
+      await Promise.allSettled([...this.queues.values()].map((state) => state.tail));
+      return;
+    }
+    const tails: Promise<void>[] = [];
+    for (const key of keys) {
+      const state = this.queues.get(key);
+      if (state) tails.push(state.tail);
+    }
+    if (tails.length > 0) {
+      await Promise.allSettled(tails);
+    }
   }
 
   snapshotForTest(): { queues: number; consumerKeys: number; consumers: number } {
@@ -2055,6 +2073,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     Number.isSafeInteger(deps.dispatchLeaseHeartbeatMs) && (deps.dispatchLeaseHeartbeatMs ?? 0) > 0
       ? deps.dispatchLeaseHeartbeatMs!
       : DISPATCH_LEASE_HEARTBEAT_MS;
+  const admittedRenewMaxAgeMs =
+    Number.isSafeInteger(deps.admittedRenewMaxAgeMs) && (deps.admittedRenewMaxAgeMs ?? 0) > 0
+      ? deps.admittedRenewMaxAgeMs!
+      : CONTAINER_LINK_ADMITTED_RENEW_MAX_AGE_MS;
   const log = deps.logger;
   const metrics = deps.metrics ?? {};
 
@@ -2218,9 +2240,20 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   };
   const uidToContainerWs = new Map<string, Set<WebSocket>>();
   const links = deps.pgPool && (deps.containerLinkEnabled ?? containerLinkEnabled())
-    ? new ContainerLinkRegistry(deps.pgPool, log, { heartbeatMs: deps.containerLinkHeartbeatMs, maxBufferedBytes, dialTimeoutMs: connectTimeoutMs })
+    ? new ContainerLinkRegistry(deps.pgPool, log, {
+        heartbeatMs: deps.containerLinkHeartbeatMs,
+        maxBufferedBytes,
+        dialTimeoutMs: connectTimeoutMs,
+        admittedRenewMaxAgeMs,
+      })
     : null;
-  if (links) links.beforeReplay = () => outboundPersistQueues.drain();
+  if (links) {
+    links.beforeReplay = (scope) => {
+      if (!scope || scope.sessionKeys.length === 0) return outboundPersistQueues.drain();
+      const prefix = `${scope.uid.toString()}:${scope.containerId.toString()}:`;
+      return outboundPersistQueues.drain(scope.sessionKeys.map((sk) => `${prefix}${sk}`));
+    };
+  }
   const recovery = links && deps.resolveContainerLinkEndpoint ? new ContainerLinkRecovery({
     pool: deps.pgPool!, channel: deps.containerLinkRecovery?.channel ?? "v5", log,
     ...deps.containerLinkRecovery,
@@ -2995,10 +3028,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
             return { kind: "delivery_unknown" };
           }
-          admittedDispatches.set(payload.admitted.clientMessageId, payload.admitted);
-          const receipt = beginCronOriginClaim(payload.admitted.dispatchId);
+          const claimedAdmitted: AdmittedDispatch = {
+            ...payload.admitted,
+            admittedAtMs: Date.now(),
+            wireSent: false,
+          };
+          admittedDispatches.set(claimedAdmitted.clientMessageId, claimedAdmitted);
+          const receipt = beginCronOriginClaim(claimedAdmitted.dispatchId);
           const enrichment = trackEnrichmentDispatch(
-            payload.admitted,
+            claimedAdmitted,
             "bridge_closed_before_cron_enrichment",
           );
           if (!isEnriching(enrichment)) return { kind: "delivery_unknown" };
@@ -3649,6 +3687,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       engineSessionKey?: string;
       /** OCV5-746: this turn was admitted on a remote_pool lane (server-owned placement fact). */
       remoteLane?: boolean;
+      /** OCV5-819 B1: wall-clock admission timestamp and physical wire-send proof so bridge
+       *  heartbeats share the same admitted grace window and unsent gate as ContainerLink. */
+      admittedAtMs?: number;
+      wireSent?: boolean;
     }
     const admittedDispatches = new Map<string, AdmittedDispatch>();
     type EnrichmentDispatchPhase = "enriching" | "transferring" | "terminalizing" | "transferred";
@@ -3930,7 +3972,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       dispatchHeartbeatTimer = setInterval(() => {
         const pool = deps.pgPool;
         if (!pool) return;
+        const now = Date.now();
         for (const rec of [...admittedDispatches.values()]) {
+          const enrichState = enrichmentDispatches.get(rec.clientMessageId);
+          const isEnrichingPhase = enrichState?.phase === "enriching";
+          // B1: Outside the bounded `enriching` phase, never renew an `admitted` dispatch that
+          // has not completed physical WS write OR has exceeded the admitted grace window.
+          // Accepted long turns are renewed separately via ContainerLink.renew() and live frames.
+          if (!isEnrichingPhase) {
+            if (rec.wireSent === false) continue;
+            if (rec.admittedAtMs !== undefined && now - rec.admittedAtMs > admittedRenewMaxAgeMs) {
+              continue;
+            }
+          }
           void heartbeatLease(pool, {
             dispatchId: rec.dispatchId,
             ownerId: rec.leaseOwnerId,
@@ -4674,6 +4728,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 leaseOwnerId: d.ownerId,
                 anchorSeq: d.anchorSeq,
                 requestHash,
+                admittedAtMs: Date.now(),
+                wireSent: false,
                 ...(recoveryJob ? { recoveryJob } : {}),
               };
               admittedDispatches.set(clientMessageId, admittedRecord);
@@ -8009,7 +8065,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       const transfer = beginEnrichmentTransfer(dispatchRecord);
       if (dispatchRecord !== undefined && transfer === null) return false;
       if (dispatchRecord) linkHandle?.bindDispatch(dispatchRecord);
-      return sendToContainer(data, isBinary, len, transfer);
+      return sendToContainer(data, isBinary, len, transfer, dispatchRecord);
     }
 
     const sendToContainer = (
@@ -8017,6 +8073,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       isBinary: boolean,
       len: number,
       transfer: EnrichmentDispatchState | null = null,
+      dispatchRecord?: AdmittedDispatch,
     ): boolean => {
       try {
         containerWs.send(data, { binary: isBinary }, (err) => {
@@ -8026,8 +8083,21 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               if (transfer) {
                 terminalizeEnrichmentDispatch(transfer, "container_forward_rejected");
                 cleanup("container_error", true);
+              } else if (
+                err instanceof Error &&
+                /hello|beforeReplay/i.test(err.message) &&
+                userWs.readyState === WebSocket.OPEN
+              ) {
+                // B4: When hello registration fails/times out on this handle, close ONLY this
+                // browser WS so the tab reconnects and re-registers cleanly without tearing down
+                // the shared container transport or other sessions.
+                try { userWs.close(CLOSE_BRIDGE.INTERNAL, "container hello failed"); } catch { /* */ }
               }
             } else {
+              if (dispatchRecord) {
+                dispatchRecord.wireSent = true;
+                linkHandle?.markDispatchSent(dispatchRecord.sessionId, dispatchRecord.clientMessageId);
+              }
               completeEnrichmentTransfer(transfer);
             }
           };

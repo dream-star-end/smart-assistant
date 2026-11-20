@@ -20,6 +20,7 @@ import {
   SWARM_MAX_MEMBERS,
   SWARM_MAX_POSTS,
   SWARM_MAX_POST_CHARS,
+  compactSwarmSnapshotToByteBudget,
   extractSwarmMentions,
   type SwarmBoardPost,
   type SwarmChannelSnapshot,
@@ -34,6 +35,13 @@ const MAX_MEMBERS_JSON_BYTES = 512 * 1024
 const MAX_BOARD_JSONL_BYTES = 2 * 1024 * 1024
 const TRANSCRIPT_TAIL_BYTES = 64 * 1024
 const DEFAULT_POLL_MS = 750
+/** Minimum interval between activity-only (`stepCount`/`activity`/`unreadCount`) emissions.
+ * Structural changes (new posts, member status/role/error changes, channels, terminal phase)
+ * still emit with 0ms delay (OCV5-819). */
+export const SWARM_ACTIVITY_THROTTLE_MS = 2_500
+/** Force a periodic full-posts keyframe so partial replays self-heal quickly. */
+export const SWARM_FULL_KEYFRAME_INTERVAL_EMITS = 20
+export const SWARM_FULL_KEYFRAME_INTERVAL_MS = 30_000
 const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 interface RawRosterMember {
@@ -615,9 +623,59 @@ export function readAntigravitySwarmSnapshot(opts: {
   }
 }
 
+function stripVolatileMemberFields(m: SwarmMemberSnapshot) {
+  const { lastActiveAt: _la, ...rest } = m
+  return rest
+}
+
 function snapshotFingerprint(snap: SwarmSnapshot): string {
-  const { revision: _r, updatedAt: _u, startedAt: _s, ...rest } = snap
-  return createHash('sha256').update(JSON.stringify(rest), 'utf8').digest('hex')
+  const {
+    revision: _r,
+    updatedAt: _u,
+    startedAt: _s,
+    postsMode: _pm,
+    deltaBaseSeq: _dbs,
+    ...rest
+  } = snap
+  return createHash('sha256')
+    .update(
+      JSON.stringify({
+        ...rest,
+        members: rest.members.map(stripVolatileMemberFields),
+      }),
+      'utf8',
+    )
+    .digest('hex')
+}
+
+/**
+ * High-priority structural fingerprint: changes here (new board posts, member
+ * join/leave/status/error/workspace transitions, title/channel updates) emit
+ * with 0ms delay. Activity-only churn (`stepCount`, `activity`, `unreadCount`)
+ * is coalesced under `activityThrottleMs` (OCV5-819).
+ */
+function structuralFingerprint(snap: SwarmSnapshot): string {
+  const normalized = {
+    swarmId: snap.swarmId,
+    title: snap.title,
+    phase: snap.phase,
+    channels: snap.channels,
+    posts: snap.posts,
+    totalPosts: snap.totalPosts,
+    members: snap.members.map((m) => ({
+      name: m.name,
+      role: m.role,
+      status: m.status,
+      model: m.model,
+      channels: m.channels,
+      workspace: m.workspace,
+      wakeMode: m.wakeMode,
+      failed: m.failed,
+      lastError: m.lastError,
+      lastPostSeq: m.lastPostSeq,
+    })),
+  }
+  return createHash('sha256').update(JSON.stringify(normalized), 'utf8').digest('hex')
 }
 
 /**
@@ -644,7 +702,7 @@ function swarmActivationFingerprint(snap: SwarmSnapshot): string {
             unreadCount: m.unreadCount,
             lastPostSeq: m.lastPostSeq,
           }
-        : m,
+        : stripVolatileMemberFields(m),
     ),
   }
   return createHash('sha256').update(JSON.stringify(normalized), 'utf8').digest('hex')
@@ -654,6 +712,15 @@ export interface AntigravitySwarmWatcherOptions {
   brainDir: string
   conversationId: string
   pollMs?: number
+  /** Coalesce window for activity-only (`stepCount`/`activity`/`unreadCount`) updates.
+   * Defaults to `SWARM_ACTIVITY_THROTTLE_MS` (2500ms). Pass `0` to disable throttling. */
+  activityThrottleMs?: number
+  /** Emit a full-posts keyframe every N emissions (default `SWARM_FULL_KEYFRAME_INTERVAL_EMITS`). */
+  fullKeyframeIntervalEmits?: number
+  /** Emit a full-posts keyframe at least every T ms (default `SWARM_FULL_KEYFRAME_INTERVAL_MS`). */
+  fullKeyframeIntervalMs?: number
+  /** Clock override for deterministic tests. */
+  now?: () => number
   /**
    * When true (resumed native conversations), an already-existing swarm directory
    * at turn start is recorded purely as a baseline without emitting or marking
@@ -665,8 +732,9 @@ export interface AntigravitySwarmWatcherOptions {
 }
 
 export function settleSwarmSnapshotTerminal(snap: SwarmSnapshot, phase: SwarmPhase): SwarmSnapshot {
+  const { postsMode: _pm, deltaBaseSeq: _dbs, ...clean } = structuredClone(snap)
   return {
-    ...structuredClone(snap),
+    ...clean,
     phase,
     revision: snap.revision + 1,
     updatedAt: Date.now(),
@@ -685,24 +753,41 @@ export class AntigravitySwarmWatcher {
   private readonly brainDir: string
   private readonly conversationId: string
   private readonly pollMs: number
+  private readonly activityThrottleMs: number
+  private readonly fullKeyframeIntervalEmits: number
+  private readonly fullKeyframeIntervalMs: number
+  private readonly now: () => number
   private readonly seedBaselineOnStart: boolean
   private readonly onSnapshot: (snapshot: SwarmSnapshot) => void
   private timer: NodeJS.Timeout | null = null
+  private throttleTimer: NodeJS.Timeout | null = null
+  private keyframeTimer: NodeJS.Timeout | null = null
+  private pendingActivitySnap: SwarmSnapshot | null = null
   private stopped = false
   private revision = 0
   private startedAt: number | undefined
   private lastHash: string | null = null
+  private lastStructuralHash: string | null = null
   private baselineActivationHash: string | null = null
   private lastStatSignature: string | null = null
   private trackedMemberConvIds: string[] = []
   private lastSnapshot: SwarmSnapshot | null = null
   private emittedInTurn = false
   private turnActive = false
+  private lastEmitAt = 0
+  private lastFullEmitAt = 0
+  private emitsSinceFull = 0
+  private lastEmittedPostSeq = 0
+  private lastEmittedTotalPosts = 0
 
   constructor(opts: AntigravitySwarmWatcherOptions) {
     this.brainDir = opts.brainDir
     this.conversationId = opts.conversationId
     this.pollMs = opts.pollMs ?? DEFAULT_POLL_MS
+    this.activityThrottleMs = opts.activityThrottleMs ?? SWARM_ACTIVITY_THROTTLE_MS
+    this.fullKeyframeIntervalEmits = opts.fullKeyframeIntervalEmits ?? SWARM_FULL_KEYFRAME_INTERVAL_EMITS
+    this.fullKeyframeIntervalMs = opts.fullKeyframeIntervalMs ?? SWARM_FULL_KEYFRAME_INTERVAL_MS
+    this.now = opts.now ?? Date.now
     this.seedBaselineOnStart = opts.seedBaselineOnStart === true
     this.onSnapshot = opts.onSnapshot
   }
@@ -740,11 +825,13 @@ export class AntigravitySwarmWatcher {
         ...structuredClone(this.lastSnapshot),
         phase: 'running',
         revision: nextRev,
-        updatedAt: Date.now(),
+        updatedAt: this.now(),
       }
       this.revision = nextRev
       this.lastSnapshot = snap
-      this.emitSafe(snap)
+      this.lastHash = snapshotFingerprint(snap)
+      this.lastStructuralHash = structuralFingerprint(snap)
+      this.emitWireSnapshot(snap, true)
     }
     this.pollOnce(true)
   }
@@ -788,23 +875,127 @@ export class AntigravitySwarmWatcher {
       conversationId: this.conversationId,
       phase: 'running',
       revision: 0,
+      now: this.now(),
       outMemberConvIds: memberConvIds,
     })
     if (!snap) return
     this.setTrackedMembers(memberConvIds)
     this.lastStatSignature = this.computeStatSignature()
     this.lastHash = snapshotFingerprint(snap)
+    this.lastStructuralHash = structuralFingerprint(snap)
     this.baselineActivationHash = swarmActivationFingerprint(snap)
     this.lastSnapshot = snap
   }
 
-  private emitSafe(snap: SwarmSnapshot): void {
+  private clearThrottleTimer(): void {
+    if (this.throttleTimer) {
+      clearTimeout(this.throttleTimer)
+      this.throttleTimer = null
+    }
+    this.pendingActivitySnap = null
+  }
+
+  private clearKeyframeTimer(): void {
+    if (this.keyframeTimer) {
+      clearTimeout(this.keyframeTimer)
+      this.keyframeTimer = null
+    }
+  }
+
+  /** Schedule a single bounded full-posts keyframe refresh after a delta emission so even
+   * a board that goes quiet after a delta self-heals within `fullKeyframeIntervalMs` (OCV5-819 B7). */
+  private scheduleQuietKeyframe(): void {
+    this.clearKeyframeTimer()
+    if (this.stopped || this.fullKeyframeIntervalMs <= 0) return
+    const delayMs = Math.max(10, this.fullKeyframeIntervalMs)
+    this.keyframeTimer = setTimeout(() => {
+      this.keyframeTimer = null
+      if (this.stopped || !this.lastSnapshot || this.emitsSinceFull === 0) return
+      const nextRev = this.revision + 1
+      const snap: SwarmSnapshot = {
+        ...structuredClone(this.lastSnapshot),
+        revision: nextRev,
+        updatedAt: this.now(),
+      }
+      this.revision = nextRev
+      this.lastSnapshot = snap
+      this.emitWireSnapshot(snap, true)
+    }, delayMs)
+    this.keyframeTimer.unref()
+  }
+
+  private emitWireSnapshot(fullSnap: SwarmSnapshot, forceFull: boolean): void {
+    this.clearThrottleTimer()
+    this.clearKeyframeTimer()
+    const ts = this.now()
+    const headSeq = fullSnap.posts.length > 0 ? fullSnap.posts[fullSnap.posts.length - 1]!.seq : 0
+    const postsShrank =
+      fullSnap.totalPosts < this.lastEmittedTotalPosts ||
+      headSeq < this.lastEmittedPostSeq
+    const keyframeDue =
+      !this.emittedInTurn ||
+      forceFull ||
+      postsShrank ||
+      (fullSnap.posts.length > 0 &&
+        (this.emitsSinceFull >= this.fullKeyframeIntervalEmits ||
+          ts - this.lastFullEmitAt >= this.fullKeyframeIntervalMs))
+
+    let wireSnap: SwarmSnapshot
+    if (keyframeDue) {
+      wireSnap = {
+        ...structuredClone(fullSnap),
+        postsMode: 'full',
+      }
+      this.lastFullEmitAt = ts
+      this.emitsSinceFull = 0
+    } else {
+      const deltaPosts = fullSnap.posts.filter((p) => p.seq > this.lastEmittedPostSeq)
+      wireSnap = {
+        ...structuredClone(fullSnap),
+        posts: structuredClone(deltaPosts),
+        postsMode: 'delta',
+        deltaBaseSeq: this.lastEmittedPostSeq,
+      }
+      this.emitsSinceFull += 1
+      if (fullSnap.posts.length > 0) {
+        this.scheduleQuietKeyframe()
+      }
+    }
+
+    this.lastEmitAt = ts
+    this.lastEmittedPostSeq = Math.max(this.lastEmittedPostSeq, headSeq)
+    this.lastEmittedTotalPosts = fullSnap.totalPosts
     this.emittedInTurn = true
     try {
-      this.onSnapshot(structuredClone(snap))
+      this.onSnapshot(wireSnap)
     } catch {
       // Observer errors must never crash the adapter timer loop.
     }
+  }
+
+  private scheduleThrottledActivityEmit(snap: SwarmSnapshot, delayMs: number): void {
+    this.pendingActivitySnap = snap
+    if (this.throttleTimer) return
+    this.throttleTimer = setTimeout(() => {
+      this.throttleTimer = null
+      if (this.stopped) {
+        this.pendingActivitySnap = null
+        return
+      }
+      const queued = this.pendingActivitySnap
+      this.pendingActivitySnap = null
+      if (!queued) return
+      const nextRev = this.revision + 1
+      const toEmit: SwarmSnapshot = {
+        ...queued,
+        revision: nextRev,
+        updatedAt: this.now(),
+      }
+      this.revision = nextRev
+      this.lastSnapshot = toEmit
+      this.emitWireSnapshot(toEmit, false)
+    }, Math.max(1, delayMs))
+    this.throttleTimer.unref()
   }
 
   private pollOnce(force: boolean): void {
@@ -816,24 +1007,28 @@ export class AntigravitySwarmWatcher {
     this.lastStatSignature = statSig
     const nextRev = this.revision + 1
     const memberConvIds: string[] = []
+    const ts = this.now()
     const snap = readAntigravitySwarmSnapshot({
       brainDir: this.brainDir,
       conversationId: this.conversationId,
       phase: 'running',
       revision: nextRev,
       startedAt: this.startedAt,
+      now: ts,
       outMemberConvIds: memberConvIds,
     })
     if (!snap) return
     this.setTrackedMembers(memberConvIds)
     this.lastStatSignature = this.computeStatSignature()
     const hash = snapshotFingerprint(snap)
+    const structHash = structuralFingerprint(snap)
     if (!this.turnActive && this.seedBaselineOnStart && this.baselineActivationHash !== null) {
       const actHash = swarmActivationFingerprint(snap)
       if (actHash === this.baselineActivationHash) {
         // Coordinator-only transcript advance on an ordinary resumed turn:
         // keep baseline fresh without activating or emitting the historical board.
         this.lastHash = hash
+        this.lastStructuralHash = structHash
         this.lastSnapshot = snap
         return
       }
@@ -843,11 +1038,25 @@ export class AntigravitySwarmWatcher {
       snap.startedAt = this.startedAt
     }
     if (hash === this.lastHash) return
+    const isStructuralChange = !this.emittedInTurn || structHash !== this.lastStructuralHash
     this.turnActive = true
-    this.revision = nextRev
     this.lastHash = hash
+    this.lastStructuralHash = structHash
+
+    if (!isStructuralChange && this.activityThrottleMs > 0) {
+      const elapsed = ts - this.lastEmitAt
+      if (elapsed < this.activityThrottleMs) {
+        // Keep `lastSnapshot` fresh (without advancing wire revision yet) and coalesce
+        // trailing activity update so UI stays responsive without flooding PG/WS.
+        this.lastSnapshot = { ...snap, revision: this.revision }
+        this.scheduleThrottledActivityEmit(snap, this.activityThrottleMs - elapsed)
+        return
+      }
+    }
+
+    this.revision = nextRev
     this.lastSnapshot = snap
-    this.emitSafe(snap)
+    this.emitWireSnapshot(snap, false)
   }
 
   /** Stop polling and capture one final authoritative snapshot with terminal phase.
@@ -862,6 +1071,7 @@ export class AntigravitySwarmWatcher {
       phase,
       revision: nextRev,
       startedAt: this.startedAt,
+      now: this.now(),
     })
     if (!snap) {
       if (!this.lastSnapshot) return null
@@ -877,6 +1087,8 @@ export class AntigravitySwarmWatcher {
 
   stop(): void {
     this.stopped = true
+    this.clearThrottleTimer()
+    this.clearKeyframeTimer()
     if (this.timer) {
       clearInterval(this.timer)
       this.timer = null
@@ -920,93 +1132,7 @@ export function compactSwarmSnapshotForPersistence(
   snap: SwarmSnapshot,
   maxBytes: number = 13_000,
 ): SwarmSnapshot {
-  const fit = (candidate: SwarmSnapshot): boolean =>
-    Buffer.byteLength(JSON.stringify(durableEnvelopeFor(candidate)), 'utf8') <= maxBytes
-
-  if (fit(snap)) return structuredClone(snap)
-
-  const baseMembers = snap.members.map((m) => ({
-    ...m,
-    ...(m.activity ? { activity: clampText(m.activity, 80) } : {}),
-    ...(m.lastError ? { lastError: clampText(m.lastError, 120) } : {}),
-  }))
-  const baseChannels = snap.channels.map((c) => ({
-    ...c,
-    ...(c.topic ? { topic: clampText(c.topic, 80) } : {}),
-  }))
-
-  for (const [maxPosts, maxPostText] of [
-    [40, 320],
-    [24, 220],
-    [12, 160],
-    [6, 120],
-    [0, 0],
-  ] as const) {
-    const posts = maxPosts === 0
-      ? []
-      : snap.posts.slice(-maxPosts).map((p) => ({
-          ...p,
-          text: clampText(p.text, maxPostText),
-        }))
-    const truncatedPosts = snap.totalPosts > posts.length ? snap.totalPosts - posts.length : undefined
-    const candidate: SwarmSnapshot = {
-      ...snap,
-      title: clampText(snap.title, 120),
-      members: baseMembers,
-      channels: baseChannels,
-      posts,
-      ...(truncatedPosts ? { truncatedPosts } : {}),
-    }
-    if (fit(candidate)) return candidate
-  }
-
-  // Final defensive fallback: shrink members & channels until the FULL UTF-8 envelope fits.
-  const minimalMembers = baseMembers.map((m) => ({
-    name: clampText(m.name, 40),
-    role: m.role,
-    status: m.status,
-    stepCount: m.stepCount,
-    unreadCount: m.unreadCount,
-    ...(m.failed ? { failed: true } : {}),
-  }))
-  const minimalChannels = baseChannels.map((c) => ({
-    name: clampText(c.name, 32),
-    memberCount: c.memberCount,
-    postCount: c.postCount,
-  }))
-  for (const [mCap, cCap] of [
-    [16, 8],
-    [8, 4],
-    [4, 2],
-    [0, 0],
-  ] as const) {
-    const candidate: SwarmSnapshot = {
-      swarmId: snap.swarmId,
-      title: clampText(snap.title, 80),
-      phase: snap.phase,
-      revision: snap.revision,
-      updatedAt: snap.updatedAt,
-      ...(snap.startedAt !== undefined ? { startedAt: snap.startedAt } : {}),
-      members: minimalMembers.slice(0, mCap),
-      channels: minimalChannels.slice(0, cCap),
-      posts: [],
-      totalPosts: snap.totalPosts,
-      ...(snap.totalPosts > 0 ? { truncatedPosts: snap.totalPosts } : {}),
-    }
-    if (fit(candidate)) return candidate
-  }
-  return {
-    swarmId: snap.swarmId,
-    title: clampText(snap.title, 32),
-    phase: snap.phase,
-    revision: snap.revision,
-    updatedAt: snap.updatedAt,
-    members: [],
-    channels: [],
-    posts: [],
-    totalPosts: snap.totalPosts,
-    ...(snap.totalPosts > 0 ? { truncatedPosts: snap.totalPosts } : {}),
-  }
+  return structuredClone(compactSwarmSnapshotToByteBudget(snap, maxBytes))
 }
 
 export function buildDurableSwarmBoardInput(

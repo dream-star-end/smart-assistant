@@ -37,6 +37,7 @@ import {
   ANTIGRAVITY_RELAY_PREFIX,
   SWARM_BOARD_TOOL_NAME,
   antigravityCliModelId,
+  mergeSwarmSnapshots,
   TOOL_FAILED_EMPTY_SENTINEL,
   type GoalStateSnapshot,
   type OutboundContentBlock,
@@ -721,7 +722,12 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     if (ctx.terminal || ctx.abandoned) return
     // Sideband disk telemetry must NEVER set `ctx.sawOutput = true`: delivery
     // evidence comes solely from CLI stdout/tool steps, preserving EMPTY_RUN guards.
-    ctx.lastEmittedSwarmSnapshot = structuredClone(snapshot)
+    // Keep `ctx.lastEmittedSwarmSnapshot` as the full merged snapshot even when the
+    // wire frame carries `postsMode: 'delta'` so forced-stop persistence never loses posts.
+    ctx.lastEmittedSwarmSnapshot =
+      ctx.swarmWatcher?.latestSnapshot() ??
+      mergeSwarmSnapshots(ctx.lastEmittedSwarmSnapshot, snapshot) ??
+      structuredClone(snapshot)
     this.lastActivityAt = Date.now()
     this.emit('activity')
     const blockId = this.swarmBlockIdFor(ctx, snapshot.swarmId)

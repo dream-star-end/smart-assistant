@@ -1,6 +1,8 @@
-import type { LiveChildBlock, LiveUnit, LiveUnitsPage } from "@openclaude/protocol/browser";
+import type { LiveChildBlock, LiveUnit, LiveUnitsPage, SwarmSnapshot } from "@openclaude/protocol/browser";
 import {
   EPOCH_BAND,
+  SWARM_BOARD_TOOL_NAME,
+  isSwarmSnapshot,
   packEpoch,
   timelineIdentity,
 } from "@openclaude/protocol/browser";
@@ -63,6 +65,16 @@ function toolInputPreviewOf(unit: LiveUnit): string | undefined {
   return undefined;
 }
 
+function extractSwarmSnapshotFromUnit(unit: LiveUnit): SwarmSnapshot | undefined {
+  if (unit.kind !== "tool" || unit.toolName !== SWARM_BOARD_TOOL_NAME) return undefined;
+  const input = unit.inputJson;
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+  const rec = input as Record<string, unknown>;
+  if (isSwarmSnapshot(rec.snapshot)) return rec.snapshot;
+  if (isSwarmSnapshot(rec)) return rec;
+  return undefined;
+}
+
 export function liveUnitToMessage(
   unit: LiveUnit,
   opts?: { streamGeneration?: number },
@@ -70,6 +82,7 @@ export function liveUnitToMessage(
   const role = roleFor(unit.kind);
   const text = unit.kind === "tool" ? "" : (unit.text || unit.goal || "");
   const inputPreview = toolInputPreviewOf(unit);
+  const swarmSnapshot = extractSwarmSnapshotFromUnit(unit);
   const owner = unit.clientMessageId || "";
   const processKey = unit.timelineProcessKey ?? "";
   const streamGeneration = typeof unit.streamGeneration === "number"
@@ -95,6 +108,7 @@ export function liveUnitToMessage(
     ...(unit.toolName ? { toolName: unit.toolName } : {}),
     ...(inputPreview ? { inputPreview } : {}),
     ...(unit.inputJson !== undefined ? { inputJson: unit.inputJson } : {}),
+    ...(swarmSnapshot ? { _swarmSnapshot: swarmSnapshot } : {}),
     ...(unit.output !== undefined ? { output: unit.output } : {}),
     ...(unit.outputJson !== undefined ? { outputJson: unit.outputJson } : {}),
     ...(unit.preview ? { preview: unit.preview } : {}),
@@ -130,15 +144,18 @@ export function restoreLiveUnitStreamingState(
     messages: ChatMessage[];
     _streamingThinking?: ChatMessage | null;
     _streamingAssistant?: ChatMessage | null;
+    _blockIdToMsgId?: Map<string, string>;
   },
   units: LiveUnit[],
 ): void {
   for (const unit of units) {
-    if (!unit.open) continue;
-    if (unit.kind !== "thinking" && unit.kind !== "text") continue;
     const id = engineMessageId(unit) || unit.id;
     const row = sess.messages.find((m) => m.id === id);
     if (!row) continue;
+    if (unit.blockId && unit.kind === "tool") {
+      sess._blockIdToMsgId?.set(unit.blockId, row.id);
+    }
+    if (!unit.open) continue;
     if (unit.kind === "thinking") sess._streamingThinking = row;
     if (unit.kind === "text") sess._streamingAssistant = row;
   }

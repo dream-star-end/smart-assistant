@@ -1,6 +1,6 @@
 import { recordContainerLinkGap, type LinkDispatch } from "./containerLinkRecoveryStore.js";
-import { containerLinkGap } from "../admin/metrics.js";
-import { ContainerLinkHello } from "./containerLinkHello.js";
+import { containerLinkGap, containerLinkSendEvents } from "../admin/metrics.js";
+import { ContainerLinkHello, extractHelloPeerTargets } from "./containerLinkHello.js";
 /**
  * Master owns one physical WS per (uid, containerId). Bridge handles retain
  * their existing authorization and billing closures; each incoming frame has
@@ -15,9 +15,73 @@ import { getDispatchByLogicalKey, type Queryable } from "../dispatch/turnDispatc
 import { CONTAINER_ATTEST_FRAME_TYPE } from "./userChatBridgeTypes.js";
 import { renewContainerLinkLease } from "./containerLinkStore.js";
 
+export const CONTAINER_LINK_HELLO_PREPARE_TIMEOUT_MS = 5_000;
+export const CONTAINER_LINK_SEND_QUEUE_TIMEOUT_MS = 15_000;
+export const CONTAINER_LINK_ADMITTED_RENEW_MAX_AGE_MS = 60_000;
+
+export type ContainerLinkReplayScope = {
+  uid: bigint;
+  containerId: number;
+  sessionIds: string[];
+  sessionKeys: string[];
+};
+
 type Log = { info?(message: string, fields?: Record<string, unknown>): void; warn?(message: string, fields?: Record<string, unknown>): void };
 type Wire = Record<string, any>;
-type Stream = { sessionId: string; clientMessageId: string; dispatchId?: string; attemptNo?: number; leaseEpoch?: number };
+type Stream = {
+  sessionId: string;
+  clientMessageId: string;
+  dispatchId?: string;
+  attemptNo?: number;
+  leaseEpoch?: number;
+  /** False while an admitted dispatch is still queued before physical WS write completes. */
+  wireSent?: boolean;
+  boundAtMs?: number;
+};
+
+function extractFrameSessionScope(frame: Wire | null): string | null {
+  if (!frame) return null;
+  if (typeof frame.peer?.id === "string" && frame.peer.id) return frame.peer.id;
+  if (typeof frame.sessionId === "string" && frame.sessionId) return frame.sessionId;
+  if (typeof frame.owner?.clientSessionId === "string" && frame.owner.clientSessionId) {
+    return frame.owner.clientSessionId;
+  }
+  if (typeof frame.owner?.peer?.id === "string" && frame.owner.peer.id) return frame.owner.peer.id;
+  if (typeof frame.sessionKey === "string" && frame.sessionKey) {
+    const idx = frame.sessionKey.lastIndexOf(":");
+    return idx >= 0 && idx + 1 < frame.sessionKey.length
+      ? frame.sessionKey.slice(idx + 1)
+      : frame.sessionKey;
+  }
+  return null;
+}
+
+class ContainerLinkPrepareTimeoutError extends Error {
+  readonly isPrepareTimeout = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "ContainerLinkPrepareTimeoutError";
+  }
+}
+
+async function runWithTimeout<T>(
+  work: Promise<T> | undefined,
+  timeoutMs: number,
+  label: string,
+): Promise<T | undefined> {
+  if (!work) return undefined;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new ContainerLinkPrepareTimeoutError(label)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 const streamKey = (session: string, message: string): string => JSON.stringify([session, message]);
 const handles = new WeakMap<WebSocket, ContainerLinkHandle>();
 export const getContainerLinkHandle = (ws: WebSocket): ContainerLinkHandle | undefined => handles.get(ws);
@@ -42,6 +106,9 @@ export class ContainerLinkHandle extends EventEmitter {
   readonly socket: WebSocket;
   readonly streams = new Map<string, Stream>();
   readonly closedStreams = new Set<string>();
+  /** Sessions whose `inbound.hello` registration failed/timed out on this handle;
+   * dependent session frames are blocked until a subsequent hello succeeds (OCV5-819 B4). */
+  readonly failedHelloSessions = new Set<string>();
   detached = false;
   recoveryOnly = false;
   keepAlive = false;
@@ -93,16 +160,25 @@ export class ContainerLinkHandle extends EventEmitter {
   restoreDispatch(record: LinkDispatch): void {
     const key = streamKey(record.sessionId, record.clientMessageId);
     if (!this.link.restoreDispatch(key, record, this)) return;
-    this.streams.set(key, record);
+    this.streams.set(key, { ...record, wireSent: true });
   }
   bindDispatch(record: Stream & { dispatchId: string; attemptNo: number; leaseEpoch: number }): void {
     const key = streamKey(record.sessionId, record.clientMessageId);
     this.closedStreams.delete(key);
     this.streams.set(key, {
-      sessionId: record.sessionId, clientMessageId: record.clientMessageId,
-      dispatchId: record.dispatchId, attemptNo: record.attemptNo, leaseEpoch: record.leaseEpoch,
+      sessionId: record.sessionId,
+      clientMessageId: record.clientMessageId,
+      dispatchId: record.dispatchId,
+      attemptNo: record.attemptNo,
+      leaseEpoch: record.leaseEpoch,
+      wireSent: false,
+      boundAtMs: Date.now(),
     });
     this.link.bindDispatch(key, record, this);
+  }
+  markDispatchSent(sessionId: string, clientMessageId: string): void {
+    const stream = this.streams.get(streamKey(sessionId, clientMessageId));
+    if (stream) stream.wireSent = true;
   }
   persisted(sessionId: string, clientMessageId: string | null, final: boolean): void {
     this.link.persisted(this);
@@ -151,7 +227,9 @@ class ContainerLink {
     set.add(transport);
     this.unmountTransport = () => { set.delete(transport); if (!set.size) map.delete(key); };
   }
-  private sending: Promise<void> | null = null;
+  /** Per-session send chains prevent a slow `inbound.hello` (beforeReplay/PG cursor lookup)
+   * on one session from head-of-line blocking unrelated sessions or pings (OCV5-819). */
+  private readonly sessionSending = new Map<string, Promise<void>>();
   private sendingBytes = 0;
 
   constructor(
@@ -222,6 +300,7 @@ class ContainerLink {
     const frame = parse(data, opts?.binary === true);
     if (typeof frame?.requestId === "string") this.routes.set(`request:${frame.requestId}`, handle);
     if (typeof frame?.sessionKey === "string") this.sessions.set(frame.sessionKey, handle);
+    let inboundStream: { sessionId: string; clientMessageId: string } | null = null;
     if (frame?.type === "ping") {
       const wireId = `container-link:${++this.pingSeq}`;
       handle.pendingPing = { wireId, originalId: frame.id };
@@ -231,7 +310,10 @@ class ContainerLink {
       const cmid = frame.clientMessageId;
       if (typeof session === "string") {
         this.sessions.set(session, handle);
-        if (typeof cmid === "string") handle.noteStream(session, cmid);
+        if (typeof cmid === "string") {
+          handle.noteStream(session, cmid);
+          inboundStream = { sessionId: session, clientMessageId: cmid };
+        }
       }
       const grantId = frame.__oc_prompt_queue_grant?.grantId;
       if (typeof grantId === "string") this.routes.set(`grant:${grantId}`, handle);
@@ -241,29 +323,223 @@ class ContainerLink {
       }
     }
     const helloPeers = frame?.type === "inbound.hello" && Array.isArray(frame.peers) ? frame.peers : null;
-    if (helloPeers === null && this.sending === null) { this.ws!.send(data, opts ?? {}, cb); return; }
+    const frameSession = helloPeers === null ? extractFrameSessionScope(frame) : null;
+    const finishWireSend = (err?: Error): void => {
+      if (!err && inboundStream) {
+        handle.markDispatchSent(inboundStream.sessionId, inboundStream.clientMessageId);
+      }
+      cb?.(err);
+    };
+
+    // B4: If this handle's hello registration failed for `frameSession`, refuse to send
+    // dependent session frames onto the wire until a fresh hello succeeds.
+    if (helloPeers === null && frameSession !== null && handle.failedHelloSessions.has(frameSession)) {
+      cb?.(new Error("container link hello failed"));
+      return;
+    }
+
+    // Fast path: non-hello frames whose target session has no pending queue (and all pings/global
+    // frames) bypass queuing entirely so a slow hello on session A never blocks session B.
+    if (helloPeers === null && (!frameSession || !this.sessionSending.has(frameSession))) {
+      this.ws!.send(data, opts ?? {}, finishWireSend);
+      return;
+    }
+
     const bytes = Buffer.byteLength(Buffer.isBuffer(data) ? data : String(data));
     if (this.sendingBytes + bytes > this.registry.maxBufferedBytes) {
       const error = new Error("container link send backpressure");
       cb?.(error); this.stop(error); return;
     }
+
+    // B6: Split multi-peer `inbound.hello` into independent per-session pipelines so a slow
+    // beforeReplay/PG cursor lookup for session A never blocks session B's hello, bind, or message.
+    if (helloPeers !== null) {
+      const grouped = new Map<string, unknown[]>();
+      for (const rawPeer of helloPeers) {
+        const pid =
+          rawPeer && typeof rawPeer === "object" && typeof (rawPeer as { peerId?: unknown }).peerId === "string"
+            ? (rawPeer as { peerId: string }).peerId
+            : "";
+        if (!pid) continue;
+        let bucket = grouped.get(pid);
+        if (!bucket) { bucket = []; grouped.set(pid, bucket); }
+        bucket.push(rawPeer);
+      }
+      const entries: Array<{ queueKey: string; sessionId: string | null; peers: unknown[] }> =
+        grouped.size > 0
+          ? [...grouped.entries()].map(([pid, peers]) => ({ queueKey: pid, sessionId: pid, peers }))
+          : [{ queueKey: "__hello_empty__", sessionId: null, peers: helloPeers }];
+
+      const shareBytes = Math.max(1, Math.ceil(bytes / entries.length));
+      let totalReserved = 0;
+      let firstError: Error | undefined;
+      let remaining = entries.length;
+      const doneOne = (err?: Error): void => {
+        if (err && !firstError) firstError = err;
+        remaining -= 1;
+        if (remaining === 0) cb?.(firstError);
+      };
+
+      for (const entry of entries) {
+        this.sendingBytes += shareBytes;
+        totalReserved += shareBytes;
+        const prior = this.sessionSending.get(entry.queueKey) ?? Promise.resolve();
+        const targets = extractHelloPeerTargets(entry.peers);
+        let released = false;
+        const releaseBytesOnce = (): void => {
+          if (!released) { released = true; this.sendingBytes -= shareBytes; }
+        };
+
+        const work = prior.then(async () => {
+          if (this.stopping || handle.disposed) {
+            doneOne(new Error("container link closed"));
+            return;
+          }
+          // B4: beforeReplay and hello.prepare share ONE absolute deadline (helloPrepareTimeoutMs).
+          const deadlineAt = Date.now() + this.registry.helloPrepareTimeoutMs;
+          let prepared: Awaited<ReturnType<ContainerLinkHello["prepare"]>> | null = null;
+          try {
+            const rem1 = deadlineAt - Date.now();
+            if (rem1 <= 0) throw new ContainerLinkPrepareTimeoutError("container link beforeReplay timeout");
+            await runWithTimeout(
+              this.registry.beforeReplay?.({
+                uid: this.uid,
+                containerId: this.containerId,
+                sessionIds: targets.sessionIds,
+                sessionKeys: targets.sessionKeys,
+              }),
+              rem1,
+              "container link beforeReplay timeout",
+            );
+            if (this.stopping || handle.disposed) {
+              doneOne(new Error("container link closed"));
+              return;
+            }
+            const rem2 = deadlineAt - Date.now();
+            if (rem2 <= 0) throw new ContainerLinkPrepareTimeoutError("container link hello prepare timeout");
+            prepared = (await runWithTimeout(
+              this.hello.prepare(entry.peers),
+              rem2,
+              "container link hello prepare timeout",
+            )) ?? null;
+          } catch (err) {
+            const rawErr = err instanceof Error ? err : new Error(String(err));
+            // B4: Isolate ALL pre-wire hello preparation errors (timeout, PG 57014, pool error, etc.)
+            // to this handle/session instead of tearing down the shared physical container transport.
+            if (entry.sessionId) handle.failedHelloSessions.add(entry.sessionId);
+            const isTimeout = rawErr instanceof ContainerLinkPrepareTimeoutError;
+            containerLinkSendEvents.inc({ outcome: isTimeout ? "hello_timeout" : "hello_prepare_error" });
+            this.registry.log?.warn?.("container-link: hello prepare failed; isolating to requesting handle", {
+              uid: String(this.uid),
+              containerId: this.containerId,
+              sessions: targets.sessionIds,
+              timeoutMs: this.registry.helloPrepareTimeoutMs,
+              err: rawErr.message,
+            });
+            const isolatedErr = isTimeout
+              ? rawErr
+              : new Error(`container link hello prepare failed: ${rawErr.message}`);
+            doneOne(isolatedErr);
+            return;
+          }
+          const wireBuf = prepared ? Buffer.from(JSON.stringify(prepared)) : data;
+          if (this.stopping || handle.disposed) {
+            doneOne(new Error("container link closed"));
+            return;
+          }
+          await new Promise<void>((resolve, reject) => {
+            this.ws!.send(wireBuf, opts ?? {}, (error) => error ? reject(error) : resolve());
+          });
+          if (prepared) this.hello.committed(prepared);
+          if (entry.sessionId) handle.failedHelloSessions.delete(entry.sessionId);
+          doneOne();
+        }).catch((error: Error) => {
+          doneOne(error);
+          this.transportFailed(error);
+        }).finally(() => {
+          releaseBytesOnce();
+          if (this.sessionSending.get(entry.queueKey) === work) {
+            this.sessionSending.delete(entry.queueKey);
+          }
+        });
+        this.sessionSending.set(entry.queueKey, work);
+      }
+      void totalReserved;
+      return;
+    }
+
+    // B5: Non-hello queued frame gets an independent absolute deadline timer at enqueue time AND
+    // a synchronous absolute deadline check right before physical ws.send so event-loop jitter
+    // between timer expiry and predecessor resolution can never let an expired frame onto the wire.
     this.sendingBytes += bytes;
-    const work = (this.sending ?? Promise.resolve()).then(async () => {
-      if (this.stopping || handle.disposed) { cb?.(new Error("container link closed")); return; }
-      if (helloPeers !== null) await this.registry.beforeReplay?.();
-      const prepared = helloPeers === null ? null : await this.hello.prepare(helloPeers);
-      if (prepared) data = Buffer.from(JSON.stringify(prepared));
-      if (this.stopping || handle.disposed) { cb?.(new Error("container link closed")); return; }
+    const queueKey = frameSession!;
+    const prior = this.sessionSending.get(queueKey) ?? Promise.resolve();
+    const enqueuedAt = Date.now();
+    const queueDeadlineAt = enqueuedAt + this.registry.sendQueueTimeoutMs;
+    let settled = false;
+    let released = false;
+    const releaseBytesOnce = (): void => {
+      if (!released) { released = true; this.sendingBytes -= bytes; }
+    };
+    let queueTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearQueueTimer = (): void => {
+      if (queueTimer) { clearTimeout(queueTimer); queueTimer = null; }
+    };
+    const failExpiredOnce = (): void => {
+      if (settled) return;
+      settled = true;
+      clearQueueTimer();
+      releaseBytesOnce();
+      const waitedMs = Date.now() - enqueuedAt;
+      containerLinkSendEvents.inc({ outcome: "queue_timeout" });
+      this.registry.log?.warn?.("container-link: queued frame expired before wire send", {
+        uid: String(this.uid),
+        containerId: this.containerId,
+        session: frameSession,
+        frameType: frame?.type,
+        waitedMs,
+      });
+      cb?.(new Error("container link send queue timeout"));
+    };
+    queueTimer = setTimeout(() => {
+      queueTimer = null;
+      failExpiredOnce();
+    }, this.registry.sendQueueTimeoutMs);
+
+    const work = prior.then(async () => {
+      if (settled) return;
+      if (Date.now() >= queueDeadlineAt) {
+        failExpiredOnce();
+        return;
+      }
+      clearQueueTimer();
+      if (this.stopping || handle.disposed) {
+        settled = true;
+        cb?.(new Error("container link closed"));
+        return;
+      }
+      if (frameSession !== null && handle.failedHelloSessions.has(frameSession)) {
+        settled = true;
+        cb?.(new Error("container link hello failed"));
+        return;
+      }
+      // Mark settled before invoking physical ws.send so queue timeout can never race wire write.
+      settled = true;
       await new Promise<void>((resolve, reject) => {
         this.ws!.send(data, opts ?? {}, (error) => error ? reject(error) : resolve());
       });
-      if (prepared) this.hello.committed(prepared);
-      cb?.();
-    }).catch((error: Error) => { cb?.(error); this.transportFailed(error); }).finally(() => {
-      this.sendingBytes -= bytes;
-      if (this.sending === work) this.sending = null;
+      finishWireSend();
+    }).catch((error: Error) => {
+      if (!settled) settled = true;
+      clearQueueTimer();
+      cb?.(error);
+      this.transportFailed(error);
+    }).finally(() => {
+      clearQueueTimer();
+      releaseBytesOnce();
+      if (this.sessionSending.get(queueKey) === work) this.sessionSending.delete(queueKey);
     });
-    this.sending = work;
+    this.sessionSending.set(queueKey, work);
   }
   private receiving: Promise<void> | null = null;
   private receivingBytes = 0;
@@ -364,7 +640,37 @@ class ContainerLink {
           stream.dispatchId = row.dispatchId;
           stream.attemptNo = row.attemptNo;
           stream.leaseEpoch = row.leaseEpoch;
-          if (handle.recoveryOnly && row.status === "admitted") continue;
+          if (row.status === "admitted") {
+            if (handle.recoveryOnly) continue;
+            // Never renew leases for dispatches still stuck in the send queue before
+            // physical WS delivery succeeds (OCV5-819).
+            if (stream.wireSent === false) {
+              containerLinkSendEvents.inc({ outcome: "admitted_renew_unsent" });
+              continue;
+            }
+            // Cap `admitted` (unacknowledged) lease renewal so undelivered turns cannot
+            // hang forever; once container sends `accepted`, long turns renew unboundedly.
+            const admittedAtMs =
+              row.admittedAt instanceof Date && Number.isFinite(row.admittedAt.getTime())
+                ? row.admittedAt.getTime()
+                : stream.boundAtMs;
+            if (
+              admittedAtMs !== undefined &&
+              Date.now() - admittedAtMs > this.registry.admittedRenewMaxAgeMs
+            ) {
+              containerLinkSendEvents.inc({ outcome: "admitted_renew_capped" });
+              this.registry.log?.warn?.("container-link: stopping lease renewal for stale admitted dispatch", {
+                uid: String(this.uid),
+                containerId: this.containerId,
+                sessionId: stream.sessionId,
+                clientMessageId: stream.clientMessageId,
+                dispatchId: row.dispatchId,
+                admittedAgeMs: Date.now() - admittedAtMs,
+                capMs: this.registry.admittedRenewMaxAgeMs,
+              });
+              continue;
+            }
+          }
           await renewContainerLinkLease(this.registry.pool, this.uid, this.containerId, row);
         } catch (err) {
           this.registry.log?.warn?.("container-link: heartbeat failed", { uid: String(this.uid), containerId: this.containerId, err });
@@ -406,7 +712,9 @@ class ContainerLink {
     this.queued = [];
     this.queuedBytes = 0;
   }
-  async drain(): Promise<void> { await Promise.allSettled([this.ready, this.tickWork, this.sending, this.receiving]); }
+  async drain(): Promise<void> {
+    await Promise.allSettled([this.ready, this.tickWork, ...this.sessionSending.values(), this.receiving]);
+  }
   snapshot(): ContainerLinkSnapshot {
     return { uid: String(this.uid), containerId: this.containerId,
       subscribers: [...this.consumers].filter((h) => !h.detached).length,
@@ -423,14 +731,31 @@ export class ContainerLinkRegistry {
   takeovers = 0;
   detachedFrames = 0;
   onTransportLost?: (uid: bigint, containerId: number) => void;
-  beforeReplay?: () => Promise<void>;
+  beforeReplay?: (scope?: ContainerLinkReplayScope) => Promise<void>;
   readonly dialTimeoutMs: number;
   readonly heartbeatMs: number;
   readonly maxBufferedBytes: number;
-  constructor(readonly pool: Queryable, readonly log?: Log | null, opts?: { heartbeatMs?: number; maxBufferedBytes?: number; dialTimeoutMs?: number }) {
+  readonly helloPrepareTimeoutMs: number;
+  readonly sendQueueTimeoutMs: number;
+  readonly admittedRenewMaxAgeMs: number;
+  constructor(
+    readonly pool: Queryable,
+    readonly log?: Log | null,
+    opts?: {
+      heartbeatMs?: number;
+      maxBufferedBytes?: number;
+      dialTimeoutMs?: number;
+      helloPrepareTimeoutMs?: number;
+      sendQueueTimeoutMs?: number;
+      admittedRenewMaxAgeMs?: number;
+    },
+  ) {
     this.dialTimeoutMs = opts?.dialTimeoutMs ?? 5000;
     this.heartbeatMs = opts?.heartbeatMs ?? 30_000;
     this.maxBufferedBytes = opts?.maxBufferedBytes ?? 4 * 1024 * 1024;
+    this.helloPrepareTimeoutMs = opts?.helloPrepareTimeoutMs ?? CONTAINER_LINK_HELLO_PREPARE_TIMEOUT_MS;
+    this.sendQueueTimeoutMs = opts?.sendQueueTimeoutMs ?? CONTAINER_LINK_SEND_QUEUE_TIMEOUT_MS;
+    this.admittedRenewMaxAgeMs = opts?.admittedRenewMaxAgeMs ?? CONTAINER_LINK_ADMITTED_RENEW_MAX_AGE_MS;
   }
   connect(uid: bigint, cid: number, create: (signal: AbortSignal) => WebSocket | Promise<WebSocket>): Promise<WebSocket> {
     return this.attach(uid, cid, create);

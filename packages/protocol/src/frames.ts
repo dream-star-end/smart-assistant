@@ -934,6 +934,10 @@ export const OutboundContentBlock = Type.Union([
       ),
       totalPosts: Type.Integer({ minimum: 0 }),
       truncatedPosts: Type.Optional(Type.Integer({ minimum: 0 })),
+      postsMode: Type.Optional(
+        Type.Union([Type.Literal('full'), Type.Literal('delta')]),
+      ),
+      deltaBaseSeq: Type.Optional(Type.Integer({ minimum: 0 })),
     }),
     parentToolUseId: Type.Optional(Type.String()),
   }),

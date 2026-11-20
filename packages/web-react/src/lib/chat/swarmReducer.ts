@@ -1,5 +1,6 @@
 import {
   isSwarmSnapshot,
+  mergeSwarmSnapshots,
   SWARM_BOARD_TOOL_NAME,
   type SwarmSnapshot,
 } from "@openclaude/protocol/browser";
@@ -69,31 +70,32 @@ export function applySwarmSnapshotBlock(
     }
   }
 
-  // 3. Monotonic revision guard against out-of-order replay frames (checks both
-  //    live `_swarmSnapshot` AND persisted `inputJson.snapshot`).
+  // 3. Monotonic revision guard + delta post merge against out-of-order replay frames
+  //    (checks both live `_swarmSnapshot` AND persisted `inputJson.snapshot`).
   const existingSnap = extractExistingSwarmSnapshot(existing);
-  if (existingSnap && existingSnap.swarmId === snap.swarmId && snap.revision <= existingSnap.revision) {
+  const mergedSnap = mergeSwarmSnapshots(existingSnap, snap);
+  if (!mergedSnap) {
     return;
   }
 
-  const isTerminal = snap.phase !== "running" && snap.phase !== "starting";
+  const isTerminal = mergedSnap.phase !== "running" && mergedSnap.phase !== "starting";
   const inputJson = {
-    swarmId: snap.swarmId,
-    title: snap.title,
-    phase: snap.phase,
-    snapshot: snap,
+    swarmId: mergedSnap.swarmId,
+    title: mergedSnap.title,
+    phase: mergedSnap.phase,
+    snapshot: mergedSnap,
   };
   if (!existing) {
     existing = addMessage(sess, "tool", SWARM_BOARD_TOOL_NAME, {
       blockId,
       toolName: SWARM_BOARD_TOOL_NAME,
       inputJson,
-      inputPreview: snap.title,
+      inputPreview: mergedSnap.title,
       output: "",
-      error: snap.phase === "error",
+      error: mergedSnap.phase === "error",
       _partial: false,
       _completed: isTerminal,
-      _swarmSnapshot: snap,
+      _swarmSnapshot: mergedSnap,
       ...(isTerminal ? { completedAt: Date.now() } : {}),
       ...(frameTurnOwnerId ? { _turnOwnerId: frameTurnOwnerId } : {}),
     });
@@ -101,11 +103,11 @@ export function applySwarmSnapshotBlock(
     existing.toolName = SWARM_BOARD_TOOL_NAME;
     existing.blockId = blockId;
     existing.inputJson = inputJson;
-    existing.inputPreview = snap.title;
-    existing.error = snap.phase === "error";
+    existing.inputPreview = mergedSnap.title;
+    existing.error = mergedSnap.phase === "error";
     existing._partial = false;
     existing._completed = isTerminal;
-    existing._swarmSnapshot = snap;
+    existing._swarmSnapshot = mergedSnap;
     existing.completedAt = Date.now();
     if (frameTurnOwnerId) existing._turnOwnerId = frameTurnOwnerId;
   }

@@ -17,6 +17,7 @@ import {
   ArrowDown,
   Check,
   Copy,
+  GitBranch,
   Hash,
   Hexagon,
   MessageSquare,
@@ -41,6 +42,7 @@ import {
   swarmPhaseMeta,
   swarmRoleLabel,
   swarmStatusLabel,
+  swarmWorkspaceBadge,
   tokenizeSwarmInlineText,
 } from "./swarmUtils";
 
@@ -187,6 +189,7 @@ function RosterMemberRow({
   const working = member.status === "working" && activeSwarm;
   const killed = member.status === "killed";
   const modelText = humanizeSwarmModel(member.model);
+  const wsBadge = swarmWorkspaceBadge(member.workspace);
 
   return (
     <button
@@ -230,6 +233,15 @@ function RosterMemberRow({
           <span className="shrink-0 rounded bg-hover px-1 py-0 text-micro text-muted">
             {swarmRoleLabel(member.role)}
           </span>
+          {wsBadge && (
+            <span
+              title={wsBadge.title}
+              className="inline-flex shrink-0 items-center gap-0.5 rounded bg-info-soft px-1 py-0 text-micro font-medium text-info"
+            >
+              <GitBranch size={9} />
+              {wsBadge.label}
+            </span>
+          )}
           {member.unreadCount > 0 && activeSwarm && (
             <span className="ml-auto shrink-0 rounded-full bg-accent-soft px-1.5 py-0 font-mono text-micro font-medium text-accent tabular-nums">
               +{member.unreadCount}
@@ -738,6 +750,26 @@ export function SwarmBoardDrawer({
                   />
                 ))}
               </div>
+              {counts.isolatedWorktrees > 0 && (
+                <div
+                  className="mt-3 rounded-xl border border-info/25 bg-info-soft/45 px-2.5 py-2 text-caption text-muted"
+                  data-testid="swarm-worktree-notice"
+                >
+                  <div className="flex items-center gap-1.5 font-medium text-info">
+                    <GitBranch size={12} />
+                    <span>
+                      {active
+                        ? `${counts.activeIsolatedWorktrees || counts.isolatedWorktrees} 个独立 worktree 并行中`
+                        : `已启用 ${counts.isolatedWorktrees} 个独立 worktree`}
+                    </span>
+                  </div>
+                  <p className="mt-0.5 text-micro leading-relaxed text-faint">
+                    {active
+                      ? "写手在独立工作区隔离修改，收尾前将核对并合入主工作区，避免改动遗漏。"
+                      : "请确认上述独立工作区的改动已全部合入主工作区并清理孤儿 worktree。"}
+                  </p>
+                </div>
+              )}
             </aside>
 
             {/* Right Stage: Board Feed */}

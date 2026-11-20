@@ -18,11 +18,17 @@ import {
   touchDispatchLeaseOnLiveFrame,
 } from "../dispatch/turnDispatchStore.js";
 import {
+  LIVE_UNIT_CHECKPOINT_STATEMENT_TIMEOUT_MS,
   deleteLiveUnitCheckpoints,
+  isLiveUnitCheckpointDegraded,
   loadOpenDispatchLiveUnitCheckpoint,
+  markLiveUnitCheckpointDegraded,
   scheduleLiveUnitCheckpoint,
   upsertLiveUnitCheckpoint,
 } from "./liveUnitCheckpoints.js";
+
+export const LIVE_UNITS_READ_MAX_ROWS = 4_000;
+export const LIVE_UNITS_READ_MAX_BYTES = 8 * 1024 * 1024;
 
 /** OCV5-57 audit r1 B3: in-process producer fence + terminal cache. */
 export const PRODUCER_FENCE_TTL_MS = 6 * 60 * 60_000;
@@ -807,6 +813,8 @@ export async function readClientSessionLiveFrames(
 
 export type ReadClientSessionLiveUnitsOptions = ServeLiveUnitsOptions & {
   deadlineMs?: number;
+  maxReadRows?: number;
+  maxReadBytes?: number;
 };
 
 function parseLiveFrameRow(row: {
@@ -842,6 +850,7 @@ async function readOpenDispatchStreamMeta(
   tapeProjectionVersion: number;
   streamGeneration: number;
   lineage: string[];
+  currentStreamKeys: string[];
 } | null> {
   const session = await client.query(
     "SELECT 1 FROM client_sessions WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL",
@@ -918,6 +927,7 @@ async function readOpenDispatchStreamMeta(
     tapeProjectionVersion,
     streamGeneration: streamGenerationFromLineage(lineage, currentStreamKeys),
     lineage,
+    currentStreamKeys,
   };
 }
 
@@ -956,65 +966,199 @@ export async function readClientSessionLiveUnits(
   userId: string,
   options?: ReadClientSessionLiveUnitsOptions,
 ): Promise<LiveUnitsPage | null> {
-  const snapshot = await withTx(pool, async (client) => {
-    const meta = await readOpenDispatchStreamMeta(client, sessionId, userId);
-    if (!meta) return null;
-    if (meta.streamClientMessageIds.length === 0) {
-      return { meta, frames: [] as LiveFrameInput[], checkpoint: null as Awaited<ReturnType<typeof loadOpenDispatchLiveUnitCheckpoint>> };
-    }
-    const checkpoint = await loadOpenDispatchLiveUnitCheckpoint(
-      client,
-      sessionId,
-      userId,
-      OPEN_DISPATCH_STREAM_SQL,
-    );
-    const afterRecordId = checkpoint ? checkpoint.state.throughRecordId : "0";
-    const rows = (
-      await client.query<{
-        record_id: string;
-        stream_key: string;
-        client_message_id: string | null;
-        payload: Buffer;
-        payload_sha256: string | null;
-      }>(
-        `SELECT f.record_id::text,f.stream_key,s.client_message_id,f.payload,f.payload_sha256
-           FROM client_session_live_streams s
-           JOIN client_session_live_frames f ON f.stream_key=s.stream_key
-          WHERE s.user_id=$2 AND s.session_id=$1
-            AND ${OPEN_DISPATCH_STREAM_SQL}
-            AND f.record_id>$3::bigint
-          ORDER BY f.record_id`,
-        [sessionId, userId, afterRecordId],
+  const maxReadRows = Math.max(1, options?.maxReadRows ?? LIVE_UNITS_READ_MAX_ROWS);
+  const maxReadBytes = Math.max(1024, options?.maxReadBytes ?? LIVE_UNITS_READ_MAX_BYTES);
+
+  type BoundedFrameRow = {
+    record_id: string;
+    stream_key: string;
+    client_message_id: string | null;
+    payload: Buffer | null;
+    payload_sha256: string | null;
+    nbytes?: string | number | null;
+    rn?: string | number | null;
+  };
+
+  const queryBoundedOpenFrames = async (
+    client: PoolClient,
+    afterRecordId: string,
+    rowBudget: number,
+    byteBudget: number,
+  ): Promise<BoundedFrameRow[]> => {
+    const safeRowBudget = Math.max(0, rowBudget);
+    const safeByteBudget = Math.max(0, byteBudget);
+    return (
+      await client.query<BoundedFrameRow>(
+        `WITH candidates AS (
+           SELECT f.record_id, f.stream_key, s.client_message_id, f.payload_sha256,
+                  octet_length(f.payload) AS nbytes,
+                  ROW_NUMBER() OVER (ORDER BY f.record_id ASC) AS rn
+             FROM client_session_live_streams s
+             JOIN client_session_live_frames f ON f.stream_key = s.stream_key
+            WHERE s.user_id = $2
+              AND s.session_id = $1
+              AND ${OPEN_DISPATCH_STREAM_SQL}
+              AND f.record_id > $3::bigint
+            ORDER BY f.record_id ASC
+            LIMIT $4
+         ), picked AS (
+           SELECT record_id, stream_key, client_message_id, payload_sha256, nbytes, rn,
+                  SUM(nbytes) OVER (ORDER BY record_id ASC) AS cum_bytes
+             FROM candidates
+         )
+         SELECT p.record_id::text, p.stream_key, p.client_message_id, p.payload_sha256, p.nbytes, p.rn,
+                CASE WHEN p.rn <= $5 AND p.cum_bytes <= $6 THEN f.payload ELSE NULL END AS payload
+           FROM picked p
+           LEFT JOIN client_session_live_frames f
+             ON f.record_id = p.record_id
+            AND p.rn <= $5
+            AND p.cum_bytes <= $6
+          WHERE (p.rn <= $5 AND p.cum_bytes <= $6)
+             OR (p.rn <= $5 AND p.record_id = (
+                  SELECT MIN(p2.record_id) FROM picked p2 WHERE p2.rn <= $5 AND p2.cum_bytes > $6
+                ))
+             OR p.rn = $4
+          ORDER BY p.record_id ASC`,
+        [sessionId, userId, afterRecordId, safeRowBudget + 1, safeRowBudget, safeByteBudget],
       )
     ).rows;
-    return { meta, frames: rows.map(parseLiveFrameRow), checkpoint };
+  };
+
+  const parseBoundedRows = (
+    rows: BoundedFrameRow[],
+    rowBudget: number,
+    initialBytes: number,
+  ): { ok: true; frames: LiveFrameInput[]; totalBytes: number } | { ok: false; reason: "budget" | "parse_error" } => {
+    if (rows.length > rowBudget) return { ok: false, reason: "budget" };
+    let totalBytes = initialBytes;
+    for (const row of rows) {
+      if ((row.rn != null && Number(row.rn) > rowBudget) || row.payload == null) {
+        return { ok: false, reason: "budget" };
+      }
+      const rowBytes =
+        row.nbytes != null && Number.isFinite(Number(row.nbytes))
+          ? Number(row.nbytes)
+          : Buffer.isBuffer(row.payload)
+            ? row.payload.byteLength
+            : Buffer.byteLength(String(row.payload), "utf8");
+      totalBytes += rowBytes;
+      if (totalBytes > maxReadBytes) return { ok: false, reason: "budget" };
+    }
+    const frames: LiveFrameInput[] = [];
+    for (const row of rows) {
+      try {
+        frames.push(parseLiveFrameRow({
+          record_id: row.record_id,
+          stream_key: row.stream_key,
+          client_message_id: row.client_message_id,
+          payload: row.payload!,
+          payload_sha256: row.payload_sha256,
+        }));
+      } catch {
+        return { ok: false, reason: "parse_error" };
+      }
+    }
+    return { ok: true, frames, totalBytes };
+  };
+
+  const snapshot = await withTx(pool, async (client) => {
+    await client.query(`SET LOCAL statement_timeout = '${LIVE_UNIT_CHECKPOINT_STATEMENT_TIMEOUT_MS}'`);
+    const meta = await readOpenDispatchStreamMeta(client, sessionId, userId);
+    if (!meta) return null;
+    const singleStreamKey = meta.currentStreamKeys.length === 1 ? meta.currentStreamKeys[0]! : null;
+    if (meta.streamClientMessageIds.length === 0) {
+      return {
+        meta,
+        singleStreamKey,
+        degradedReason: null as "fallback" | "budget" | "parse_error" | null,
+        frames: [] as LiveFrameInput[],
+        totalBytes: 0,
+        checkpoint: null as Awaited<ReturnType<typeof loadOpenDispatchLiveUnitCheckpoint>>,
+      };
+    }
+    // Only use per-stream degraded circuit-breaker and per-stream checkpoint when there
+    // is a single active open stream. Multi-open-stream sessions bypass single-stream
+    // checkpoints and rebuild from record 0 under the shared budget so one stream's
+    // checkpoint can never shadow an earlier sibling stream (OCV5-819 B8).
+    if (singleStreamKey !== null && isLiveUnitCheckpointDegraded(singleStreamKey)) {
+      return {
+        meta,
+        singleStreamKey,
+        degradedReason: "fallback" as const,
+        frames: [] as LiveFrameInput[],
+        totalBytes: 0,
+        checkpoint: null as Awaited<ReturnType<typeof loadOpenDispatchLiveUnitCheckpoint>>,
+      };
+    }
+    const checkpoint = singleStreamKey !== null
+      ? await loadOpenDispatchLiveUnitCheckpoint(
+          client,
+          sessionId,
+          userId,
+          OPEN_DISPATCH_STREAM_SQL,
+        )
+      : null;
+    const matchedCheckpoint =
+      checkpoint && checkpoint.streamKey === singleStreamKey ? checkpoint : null;
+    const afterRecordId = matchedCheckpoint ? matchedCheckpoint.state.throughRecordId : "0";
+    const rows = await queryBoundedOpenFrames(client, afterRecordId, maxReadRows, maxReadBytes);
+    const parsed = parseBoundedRows(rows, maxReadRows, 0);
+    if (!parsed.ok) {
+      return {
+        meta,
+        singleStreamKey,
+        degradedReason: parsed.reason,
+        frames: [] as LiveFrameInput[],
+        totalBytes: 0,
+        checkpoint: matchedCheckpoint,
+      };
+    }
+    return {
+      meta,
+      singleStreamKey,
+      degradedReason: null as "fallback" | "budget" | "parse_error" | null,
+      frames: parsed.frames,
+      totalBytes: parsed.totalBytes,
+      checkpoint: matchedCheckpoint,
+    };
   }, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
   if (!snapshot) return null;
+  if (snapshot.degradedReason !== null) {
+    if (snapshot.singleStreamKey !== null) {
+      markLiveUnitCheckpointDegraded(snapshot.singleStreamKey, snapshot.degradedReason);
+    }
+    return fallbackLiveUnitsPage(snapshot.meta);
+  }
   const lastRecordId = snapshot.frames.length > 0
     ? snapshot.frames[snapshot.frames.length - 1]!.recordId
     : snapshot.checkpoint?.state.throughRecordId ?? "0";
-  const catchUp = await withTx(pool, async (client) => {
-    if (snapshot.meta.streamClientMessageIds.length === 0) return [] as LiveFrameInput[];
-    const rows = (
-      await client.query<{
-        record_id: string;
-        stream_key: string;
-        client_message_id: string | null;
-        payload: Buffer;
-        payload_sha256: string | null;
-      }>(
-        `SELECT f.record_id::text,f.stream_key,s.client_message_id,f.payload,f.payload_sha256
-           FROM client_session_live_streams s
-           JOIN client_session_live_frames f ON f.stream_key=s.stream_key
-          WHERE s.user_id=$2 AND s.session_id=$1
-            AND ${OPEN_DISPATCH_STREAM_SQL}
-            AND f.record_id>$3::bigint
-          ORDER BY f.record_id`,
-        [sessionId, userId, lastRecordId],
-      )
-    ).rows;
-    return rows.map(parseLiveFrameRow);
+  const remainingRows = Math.max(0, maxReadRows - snapshot.frames.length);
+  const remainingBytes = Math.max(0, maxReadBytes - snapshot.totalBytes);
+  const catchUpResult = await withTx(pool, async (client) => {
+    if (snapshot.meta.streamClientMessageIds.length === 0) {
+      return { ok: true as const, frames: [] as LiveFrameInput[], streamSetChanged: false };
+    }
+    await client.query(`SET LOCAL statement_timeout = '${LIVE_UNIT_CHECKPOINT_STATEMENT_TIMEOUT_MS}'`);
+    const rows = await queryBoundedOpenFrames(client, lastRecordId, remainingRows, remainingBytes);
+    const parsed = parseBoundedRows(rows, remainingRows, snapshot.totalBytes);
+    if (!parsed.ok) return { ok: false as const, reason: parsed.reason };
+    // B8: Detect if a new open stream appeared between the snapshot tx and catch-up tx.
+    const knownStreams = new Set(snapshot.meta.currentStreamKeys);
+    const streamSetChanged = parsed.frames.some((f) => !knownStreams.has(f.streamKey));
+    return { ok: true as const, frames: parsed.frames, streamSetChanged };
   }, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  if (!catchUpResult.ok) {
+    if (snapshot.singleStreamKey !== null) {
+      markLiveUnitCheckpointDegraded(snapshot.singleStreamKey, catchUpResult.reason);
+    }
+    return fallbackLiveUnitsPage(snapshot.meta);
+  }
+  if (catchUpResult.streamSetChanged) {
+    // Active open-stream set changed mid-GET: fail closed without minting a stale resume
+    // cursor or polluting single-stream A's checkpoint with sibling stream B's units (OCV5-819 B8).
+    return fallbackLiveUnitsPage(snapshot.meta);
+  }
+  const catchUp = catchUpResult.frames;
 
   const opts = options ?? {};
   const reduced = reduceLiveJournal(snapshot.frames, {
@@ -1022,20 +1166,34 @@ export async function readClientSessionLiveUnits(
     lineage: snapshot.meta.lineage ?? [],
     checkpointState: snapshot.checkpoint?.state ?? null,
   });
-  if (!reduced.ok) return fallbackLiveUnitsPage(snapshot.meta);
+  if (!reduced.ok) {
+    if (snapshot.singleStreamKey !== null) {
+      markLiveUnitCheckpointDegraded(snapshot.singleStreamKey, "fallback");
+    }
+    return fallbackLiveUnitsPage(snapshot.meta);
+  }
   const page = assembleLiveUnitsFromState(reduced.state, snapshot.meta, opts, catchUp);
-  if (page.degraded === false) {
+  if (page.degraded !== false) {
+    if (snapshot.singleStreamKey !== null) {
+      markLiveUnitCheckpointDegraded(snapshot.singleStreamKey, "fallback");
+    }
+  } else if (
+    snapshot.singleStreamKey !== null &&
+    (snapshot.frames.length > 0 || catchUp.length > 0) &&
+    snapshot.frames.every((f) => f.streamKey === snapshot.singleStreamKey) &&
+    catchUp.every((f) => f.streamKey === snapshot.singleStreamKey)
+  ) {
+    // Only backfill single-stream checkpoints when every folded frame belongs strictly to
+    // that single stream and new frames actually advanced state (OCV5-819 B8/NB3).
     const forCache = catchUp.length === 0
       ? reduced
       : continueReduceLiveFrames(reduced.state, catchUp, opts);
-    const streamKey = snapshot.checkpoint?.streamKey
-      ?? snapshot.frames[0]?.streamKey
-      ?? catchUp[0]?.streamKey;
-    if (forCache.ok && streamKey) {
+    if (forCache.ok) {
       const cacheState = forCache.state;
+      const targetStreamKey = snapshot.singleStreamKey;
       setImmediate(() => {
         void upsertLiveUnitCheckpoint(pool, {
-          streamKey,
+          streamKey: targetStreamKey,
           sessionId,
           userId,
           state: cacheState,

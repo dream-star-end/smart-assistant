@@ -277,12 +277,25 @@ export function handleWsConnection(
            *  缺失(legacy)→ 旧 inFlight 布尔行为。 */
           inFlightClientMessageId?: string
         }> = hello.peers || []
-        // Phase 4 — 把这些 peerId 记下来,bind 帧用 5s grace window 校验
+        // Phase 4 — 按 peerId 合并记录最近 hello 时间戳，bind 帧用 5s grace window 校验，
+        // 绝不因共享 ContainerLink 拆发独立 peer hello 而覆盖其他 peer 的宽限窗 (OCV5-819 B6)。
         const peerIdSet = new Set<string>()
-        for (const p of peers) {
-          if (typeof p?.peerId === 'string') peerIdSet.add(p.peerId)
+        const nowHello = Date.now()
+        let recentMap = this._recentHelloPeers.get(ws)
+        if (!recentMap) {
+          recentMap = new Map<string, number>()
+          this._recentHelloPeers.set(ws, recentMap)
         }
-        this._recentHelloPeers.set(ws, { peerIds: peerIdSet, recordedAt: Date.now() })
+        // Evict stale entries opportunistically so long-lived shared links stay bounded.
+        for (const [oldPeer, ts] of recentMap) {
+          if (nowHello - ts > 60_000) recentMap.delete(oldPeer)
+        }
+        for (const p of peers) {
+          if (typeof p?.peerId === 'string') {
+            peerIdSet.add(p.peerId)
+            recentMap.set(p.peerId, nowHello)
+          }
+        }
         // Queue-enabled hello has a strict ordering contract: ring replay first,
         // then one fresh PG snapshot even when no AgentSession exists yet.
         // Flag-off keeps the legacy fire-and-forget path unchanged.
@@ -1557,7 +1570,12 @@ export function deliver(
     // turn_status sideband 是易失 UX 帧(REST 权威副本不含、也不需要),归
     // 'progress' 级 —— ring 超限时先淘它们,保住正文/终态帧的回放窗口。团队模式
     // review/嵌套委派以 >15 帧/s 刷进度帧,不分级时 2 分钟就冲穿整个 ring。
-    const blocks = (wire as { blocks?: Array<{ kind?: string }> }).blocks
+    const blocks = (wire as {
+      blocks?: Array<{
+        kind?: string
+        snapshot?: { postsMode?: string; posts?: unknown[] }
+      }>
+    }).blocks
     const isProgressFrame =
       wire.type === 'session.context_pressure' ||
       wire.type === 'outbound.turn_status' ||
@@ -1567,7 +1585,17 @@ export function deliver(
         Array.isArray(blocks) &&
         blocks.length > 0 &&
         !(wire as { isFinal?: boolean }).isFinal &&
-        blocks.every((b) => b?.kind === 'delegate_progress' || b?.kind === 'swarm_snapshot'))
+        blocks.every(
+          (b) =>
+            b?.kind === 'delegate_progress' ||
+            // Only empty-post activity-only swarm deltas are evictable progress frames;
+            // full keyframes and deltas carrying new board posts are durable content frames
+            // so ring eviction can never punch silent post gaps (OCV5-819 B7).
+            (b?.kind === 'swarm_snapshot' &&
+              b.snapshot?.postsMode === 'delta' &&
+              Array.isArray(b.snapshot.posts) &&
+              b.snapshot.posts.length === 0),
+        ))
     const evicted = this._outboundRing.store(
       sessionKey,
       frameSeq,

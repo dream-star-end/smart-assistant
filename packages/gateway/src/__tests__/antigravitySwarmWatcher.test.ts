@@ -13,9 +13,16 @@ import path from 'node:path'
 import { test } from 'node:test'
 import {
   LIVE_UNITS_REDUCER_EPOCH,
+  SWARM_BOARD_TOOL_NAME,
+  continueReduceLiveFrames,
   extractSwarmMentions,
+  foldLiveUnitStateForCheckpoint,
+  mergeSwarmSnapshots,
+  mergeSwarmSnapshotsStrict,
   parseSwarmSlashCommand,
   reduceLiveFrames,
+  serveLiveUnits,
+  type SwarmSnapshot,
 } from '@openclaude/protocol'
 import {
   antigravitySessionBrainDir,
@@ -350,9 +357,49 @@ test('BLOCKER 2: watcher rejects intermediate directory symlinks and isolates se
   }
 })
 
-test('BLOCKER 4: reduceLiveFrames fails closed to raw fallback on swarm_snapshot and bumps epoch', () => {
-  assert.equal(LIVE_UNITS_REDUCER_EPOCH, '3')
+test('OCV5-819 L2: reduceLiveFrames natively folds swarm_snapshot (full + delta) into a single latest-wins SwarmBoard unit and pins it in first pack', () => {
+  assert.equal(LIVE_UNITS_REDUCER_EPOCH, '4')
+  const baseSnap: SwarmSnapshot = {
+    swarmId: COORD_CONV,
+    title: '运行中蜂群',
+    phase: 'running',
+    revision: 1,
+    updatedAt: 1000,
+    postsMode: 'full',
+    members: [
+      { name: 'coordinator', role: 'coordinator', status: 'waiting', stepCount: 1, unreadCount: 0 },
+      { name: 'parser', role: 'worker', status: 'working', workspace: 'share', stepCount: 2, unreadCount: 0 },
+    ],
+    channels: [{ name: 'main', memberCount: 2, postCount: 1 }],
+    posts: [{ seq: 1, agent: 'coordinator', text: '任务开始', channel: 'main', mentions: [] }],
+    totalPosts: 1,
+  }
+  const deltaSnap: SwarmSnapshot = {
+    ...baseSnap,
+    revision: 2,
+    updatedAt: 2000,
+    postsMode: 'delta',
+    deltaBaseSeq: 1,
+    posts: [{ seq: 2, agent: 'parser', text: '完成解析模块', channel: 'main', mentions: ['coordinator'] }],
+    totalPosts: 2,
+  }
+  const staleSnap: SwarmSnapshot = {
+    ...baseSnap,
+    title: '旧标题不应覆盖',
+    revision: 1,
+  }
   const folded = reduceLiveFrames([
+    {
+      recordId: 'r-6',
+      streamKey: 's1:gen0',
+      clientMessageId: 'cmid-1',
+      payload: {
+        type: 'outbound.message',
+        frameSeq: 6,
+        sessionKey: 'agent:main:webchat:dm:s1',
+        blocks: [{ kind: 'text', messageId: 'm-1', text: '正在协调' }],
+      },
+    },
     {
       recordId: 'r-7',
       streamKey: 's1:gen0',
@@ -361,27 +408,283 @@ test('BLOCKER 4: reduceLiveFrames fails closed to raw fallback on swarm_snapshot
         type: 'outbound.message',
         frameSeq: 7,
         sessionKey: 'agent:main:webchat:dm:s1',
-        blocks: [
-          {
-            kind: 'swarm_snapshot',
-            blockId: 'agy-swarm-11111111-t0',
-            snapshot: {
-              swarmId: COORD_CONV,
-              title: '运行中蜂群',
-              phase: 'running',
-              revision: 3,
-              updatedAt: Date.now(),
-              members: [],
-              channels: [],
-              posts: [],
-              totalPosts: 0,
-            },
-          },
-        ],
+        blocks: [{ kind: 'swarm_snapshot', blockId: 'agy-swarm-11111111-t0', snapshot: baseSnap }],
+      },
+    },
+    {
+      recordId: 'r-8',
+      streamKey: 's1:gen0',
+      clientMessageId: 'cmid-1',
+      payload: {
+        type: 'outbound.message',
+        frameSeq: 8,
+        sessionKey: 'agent:main:webchat:dm:s1',
+        blocks: [{ kind: 'text', messageId: 'm-1', text: '继续汇报' }],
       },
     },
   ])
-  assert.deepEqual(folded, { ok: false, degraded: 'fallback' })
+  assert.equal(folded.ok, true)
+  if (!folded.ok) throw new Error('expected ok')
+  // Sideband swarm_snapshot must NOT split streaming text into two separate units
+  const textUnits = folded.state.units.filter((u) => u.kind === 'text')
+  assert.equal(textUnits.length, 1)
+  assert.equal(textUnits[0]?.text, '正在协调继续汇报')
+
+  // Continue reducing delta + stale frames incrementally (simulating checkpoint continuation)
+  const checkpoint = foldLiveUnitStateForCheckpoint(folded.state)
+  assert.ok(checkpoint)
+  const continued = continueReduceLiveFrames(checkpoint.state, [
+    {
+      recordId: 'r-9',
+      streamKey: 's1:gen0',
+      clientMessageId: 'cmid-1',
+      payload: {
+        type: 'outbound.message',
+        frameSeq: 9,
+        sessionKey: 'agent:main:webchat:dm:s1',
+        blocks: [{ kind: 'swarm_snapshot', blockId: 'agy-swarm-11111111-t0', snapshot: deltaSnap }],
+      },
+    },
+    {
+      recordId: 'r-10',
+      streamKey: 's1:gen0',
+      clientMessageId: 'cmid-1',
+      payload: {
+        type: 'outbound.message',
+        frameSeq: 10,
+        sessionKey: 'agent:main:webchat:dm:s1',
+        blocks: [{ kind: 'swarm_snapshot', blockId: 'agy-swarm-11111111-t0', snapshot: staleSnap }],
+      },
+    },
+  ])
+  assert.equal(continued.ok, true)
+  if (!continued.ok) throw new Error('expected continued ok')
+
+  const swarmUnits = continued.state.units.filter((u) => u.toolName === SWARM_BOARD_TOOL_NAME)
+  assert.equal(swarmUnits.length, 1, 'multiple swarm_snapshot frames must fold into 1 unit')
+  const env = swarmUnits[0]!.inputJson as { snapshot: SwarmSnapshot }
+  assert.equal(env.snapshot.revision, 2)
+  assert.equal(env.snapshot.title, '运行中蜂群')
+  assert.deepEqual(env.snapshot.posts.map((p) => p.seq), [1, 2])
+  assert.equal(env.snapshot.postsMode, undefined, 'folded snapshot is normalized full')
+
+  // First pack pins still-open SwarmBoard even when n=1
+  const page = serveLiveUnits(
+    continued.state,
+    { streamClientMessageIds: ['cmid-1'], openDispatch: true, hasTapeProjection: false, tapeProjectionVersion: 0 },
+    { n: 1 },
+  )
+  assert.equal(page.degraded, false)
+  assert.ok(page.units.some((u) => u.toolName === SWARM_BOARD_TOOL_NAME))
+  assert.equal(page.resume?.frameSeq, 10)
+})
+
+test('OCV5-819 L1: watcher emits delta posts, coalesces activity-only churn, ignores lastActiveAt jitter, and emits structural changes immediately', async () => {
+  const brainDir = await mkdtemp(path.join(tmpdir(), 'oc-swarm-delta-'))
+  try {
+    const { swarmDir } = await writeSwarmFixture(brainDir)
+    const parserLogs = path.join(brainDir, WORKER_CONV, '.system_generated', 'logs')
+    let fakeNow = 10_000
+    const emitted: SwarmSnapshot[] = []
+    const watcher = new AntigravitySwarmWatcher({
+      brainDir,
+      conversationId: COORD_CONV,
+      pollMs: 60_000,
+      activityThrottleMs: 2_500,
+      fullKeyframeIntervalEmits: 5,
+      now: () => fakeNow,
+      onSnapshot: (snap) => emitted.push(snap),
+    })
+
+    // 1. First emission is always full keyframe with both existing posts.
+    watcher.start()
+    assert.equal(emitted.length, 1)
+    assert.equal(emitted[0]!.postsMode, 'full')
+    assert.equal(emitted[0]!.posts.length, 2)
+
+    // 2. Pure timestamp jitter (same step_index/activity, different created_at) emits nothing.
+    fakeNow += 500
+    await writeFile(
+      path.join(parserLogs, 'transcript.jsonl'),
+      [
+        JSON.stringify({ step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-20T00:00:00.000Z' }),
+        JSON.stringify({
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          status: 'RUNNING',
+          created_at: '2026-11-20T00:00:09.999Z',
+          tool_calls: [{ name: 'edit_file', arguments: { Path: '/repo/src/parser.ts' } }],
+        }),
+      ].join('\n') + '\n',
+    )
+    watcher.kick()
+    assert.equal(emitted.length, 1, 'lastActiveAt-only change must not emit')
+
+    // 3. Activity-only change within activityThrottleMs is coalesced (not emitted immediately).
+    fakeNow += 400
+    await writeFile(
+      path.join(parserLogs, 'transcript.jsonl'),
+      [
+        JSON.stringify({ step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-20T00:00:00.000Z' }),
+        JSON.stringify({
+          step_index: 2,
+          type: 'PLANNER_RESPONSE',
+          status: 'RUNNING',
+          created_at: '2026-11-20T00:00:12.000Z',
+          tool_calls: [{ name: 'read_file', arguments: { Path: '/repo/src/lexer.ts' } }],
+        }),
+      ].join('\n') + '\n',
+    )
+    watcher.kick()
+    assert.equal(emitted.length, 1, 'activity-only update within throttle window must coalesce')
+
+    // 4. Structural change (new board post) bypasses activity throttle with 0ms delay and sends delta posts!
+    fakeNow += 200
+    await writeFile(
+      path.join(swarmDir, 'board.jsonl'),
+      `${readFileSync(path.join(swarmDir, 'board.jsonl'), 'utf8')}${JSON.stringify({
+        seq: 3,
+        agent: 'parser',
+        channel: 'parser',
+        text: '新增第 3 条增量帖',
+      })}\n`,
+    )
+    watcher.kick()
+    assert.equal(emitted.length, 2, 'new board post must emit immediately')
+    assert.equal(emitted[1]!.postsMode, 'delta')
+    assert.equal(emitted[1]!.deltaBaseSeq, 2)
+    assert.deepEqual(emitted[1]!.posts.map((p) => p.seq), [3])
+
+    // 5. Activity-only change AFTER throttle window emits delta with empty posts[] (tiny payload).
+    fakeNow += 3_000
+    await writeFile(
+      path.join(parserLogs, 'transcript.jsonl'),
+      [
+        JSON.stringify({ step_index: 0, type: 'USER_INPUT', status: 'DONE' }),
+        JSON.stringify({
+          step_index: 3,
+          type: 'PLANNER_RESPONSE',
+          status: 'RUNNING',
+          tool_calls: [{ name: 'write_file', arguments: { Path: '/repo/src/ast.ts' } }],
+        }),
+      ].join('\n') + '\n',
+    )
+    watcher.kick()
+    assert.equal(emitted.length, 3)
+    assert.equal(emitted[2]!.postsMode, 'delta')
+    assert.equal(emitted[2]!.posts.length, 0, 'activity-only delta carries zero repeated posts')
+
+    // Replaying all emitted wire snapshots through mergeSwarmSnapshots reconstructs full state losslessly.
+    let reconstructed: SwarmSnapshot | null = null
+    for (const frameSnap of emitted) {
+      reconstructed = mergeSwarmSnapshots(reconstructed, frameSnap) ?? reconstructed
+    }
+    assert.ok(reconstructed)
+    assert.deepEqual(reconstructed.posts.map((p) => p.seq), [1, 2, 3])
+    assert.equal(reconstructed.totalPosts, 3)
+
+    // Terminal snapshot is always full & clean.
+    const finalSnap = watcher.stopAndReadFinal('completed')
+    assert.ok(finalSnap)
+    assert.equal(finalSnap.posts.length, 3)
+    assert.equal(finalSnap.postsMode, undefined)
+  } finally {
+    await rm(brainDir, { recursive: true, force: true })
+  }
+})
+
+test('OCV5-819 B7: missing delta base fails closed in mergeSwarmSnapshotsStrict & reduceLiveFrames, and quiet keyframe timer self-heals', async () => {
+  const full1: SwarmSnapshot = {
+    swarmId: COORD_CONV,
+    title: '防缺帖测试',
+    phase: 'running',
+    revision: 1,
+    updatedAt: 1000,
+    postsMode: 'full',
+    members: [],
+    channels: [{ name: 'main', memberCount: 1, postCount: 1 }],
+    posts: [{ seq: 1, agent: 'coordinator', text: '帖1', channel: 'main', mentions: [] }],
+    totalPosts: 1,
+  }
+  // Delta 3 assumes post #2 was seen (deltaBaseSeq=2), but post #2 is missing!
+  const gappedDelta3: SwarmSnapshot = {
+    ...full1,
+    revision: 3,
+    updatedAt: 3000,
+    postsMode: 'delta',
+    deltaBaseSeq: 2,
+    posts: [{ seq: 3, agent: 'parser', text: '帖3', channel: 'main', mentions: [] }],
+    totalPosts: 3,
+  }
+  const strict = mergeSwarmSnapshotsStrict(full1, gappedDelta3)
+  assert.deepEqual(strict, { ok: false, reason: 'missing_base' })
+  assert.equal(mergeSwarmSnapshots(full1, gappedDelta3), null)
+
+  // reduceLiveFrames MUST fail closed to fallback instead of certifying [1, 3] and minting resume!
+  const reduced = reduceLiveFrames([
+    {
+      recordId: 'r-1',
+      streamKey: 'dispatch:g1:1',
+      clientMessageId: 'cm-1',
+      payload: {
+        type: 'outbound.message',
+        frameSeq: 1,
+        sessionKey: 'agent:main:webchat:dm:s1',
+        blocks: [{ kind: 'swarm_snapshot', blockId: 'agy-swarm-11111111-t0', snapshot: full1 }],
+      },
+    },
+    {
+      recordId: 'r-2',
+      streamKey: 'dispatch:g1:1',
+      clientMessageId: 'cm-1',
+      payload: {
+        type: 'outbound.message',
+        frameSeq: 2,
+        sessionKey: 'agent:main:webchat:dm:s1',
+        blocks: [{ kind: 'swarm_snapshot', blockId: 'agy-swarm-11111111-t0', snapshot: gappedDelta3 }],
+      },
+    },
+  ])
+  assert.deepEqual(reduced, { ok: false, degraded: 'fallback' })
+
+  // Quiet keyframe timer emits one authoritative full keyframe after delta goes quiet
+  const brainDir = await mkdtemp(path.join(tmpdir(), 'oc-swarm-quiet-kf-'))
+  try {
+    const { swarmDir } = await writeSwarmFixture(brainDir)
+    const emitted: SwarmSnapshot[] = []
+    const watcher = new AntigravitySwarmWatcher({
+      brainDir,
+      conversationId: COORD_CONV,
+      pollMs: 60_000,
+      activityThrottleMs: 0,
+      fullKeyframeIntervalEmits: 100,
+      fullKeyframeIntervalMs: 40,
+      onSnapshot: (snap) => emitted.push(snap),
+    })
+    watcher.start()
+    assert.equal(emitted.length, 1)
+    assert.equal(emitted[0]!.postsMode, 'full')
+    await writeFile(
+      path.join(swarmDir, 'board.jsonl'),
+      `${readFileSync(path.join(swarmDir, 'board.jsonl'), 'utf8')}${JSON.stringify({
+        seq: 3,
+        agent: 'parser',
+        channel: 'parser',
+        text: '静默前最后一条',
+      })}\n`,
+    )
+    watcher.kick()
+    assert.equal(emitted.length, 2)
+    assert.equal(emitted[1]!.postsMode, 'delta')
+    // Wait for quiet keyframe timer without any new disk writes
+    await new Promise((r) => setTimeout(r, 80))
+    assert.equal(emitted.length, 3, 'quiet keyframe timer must emit one full self-heal snapshot')
+    assert.equal(emitted[2]!.postsMode, 'full')
+    assert.equal(emitted[2]!.posts.length, 3)
+    watcher.stop()
+  } finally {
+    await rm(brainDir, { recursive: true, force: true })
+  }
 })
 
 test('NON-BLOCKING 1 & BLOCKER 7: UTF-8 byte-bounded durable envelope + disk-free terminal settlement', () => {

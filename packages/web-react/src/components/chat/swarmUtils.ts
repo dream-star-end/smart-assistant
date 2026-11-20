@@ -159,6 +159,34 @@ export function formatPostClock(time?: string): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
 }
 
+export function swarmWorkspaceBadge(workspace?: string): {
+  label: string;
+  title: string;
+  isolated: boolean;
+} | null {
+  const norm = workspace?.trim().toLowerCase();
+  if (!norm || norm === "inherit") return null;
+  if (norm === "share") {
+    return {
+      label: "worktree",
+      title: "独立 Git Worktree 隔离工作区（收尾前需核对并合入主工作区）",
+      isolated: true,
+    };
+  }
+  if (norm === "branch") {
+    return {
+      label: "独立分支",
+      title: "独立克隆隔离工作区（收尾前需核对并合入主工作区）",
+      isolated: true,
+    };
+  }
+  return {
+    label: norm,
+    title: `独立工作区（${norm}）`,
+    isolated: true,
+  };
+}
+
 export function summarizeSwarmCounts(members: readonly SwarmMemberSnapshot[]): {
   total: number;
   live: number;
@@ -166,16 +194,24 @@ export function summarizeSwarmCounts(members: readonly SwarmMemberSnapshot[]): {
   waiting: number;
   killed: number;
   failed: number;
+  isolatedWorktrees: number;
+  activeIsolatedWorktrees: number;
 } {
   let working = 0;
   let waiting = 0;
   let killed = 0;
   let failed = 0;
+  let isolatedWorktrees = 0;
+  let activeIsolatedWorktrees = 0;
   for (const m of members) {
     if (m.status === "killed") killed += 1;
     else if (m.status === "working") working += 1;
     else waiting += 1;
     if (m.failed) failed += 1;
+    if (swarmWorkspaceBadge(m.workspace)?.isolated) {
+      isolatedWorktrees += 1;
+      if (m.status !== "killed") activeIsolatedWorktrees += 1;
+    }
   }
   return {
     total: members.length,
@@ -184,6 +220,8 @@ export function summarizeSwarmCounts(members: readonly SwarmMemberSnapshot[]): {
     waiting,
     killed,
     failed,
+    isolatedWorktrees,
+    activeIsolatedWorktrees,
   };
 }
 
