@@ -30,17 +30,17 @@ export interface LiveBrowserState {
 }
 
 export type LiveBrowserActionPayload =
-  | { action: "open"; url?: string }
+  | { action: "open"; url?: string; ifIdle?: boolean }
   | { action: "goto"; url: string }
   | { action: "back" }
   | { action: "forward" }
   | { action: "reload" }
   | { action: "close" }
-  | { action: "click"; x: number; y: number; normalized?: boolean; button?: "left" | "right" }
-  | { action: "dblclick"; x: number; y: number; normalized?: boolean }
-  | { action: "wheel"; x?: number; y?: number; normalized?: boolean; deltaX: number; deltaY: number }
-  | { action: "type"; text: string; submit?: boolean }
-  | { action: "press"; key: string }
+  | { action: "click"; x: number; y: number; normalized?: boolean; button?: "left" | "right"; expectedOrigin?: string }
+  | { action: "dblclick"; x: number; y: number; normalized?: boolean; expectedOrigin?: string }
+  | { action: "wheel"; x?: number; y?: number; normalized?: boolean; deltaX: number; deltaY: number; expectedOrigin?: string }
+  | { action: "type"; text: string; submit?: boolean; expectedOrigin?: string }
+  | { action: "press"; key: string; expectedOrigin?: string }
   | { action: "tab_select"; index: number }
   | { action: "tab_new"; url?: string }
   | { action: "tab_close"; index?: number };

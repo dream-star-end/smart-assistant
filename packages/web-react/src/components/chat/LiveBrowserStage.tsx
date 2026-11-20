@@ -44,6 +44,7 @@ import {
 } from "../../lib/liveBrowserApi";
 import type { AuthSession } from "../../lib/types";
 import { Spinner } from "../ui";
+import type { LiveBrowserHandoffRequest } from "./inspectorState";
 import "./liveBrowser.css";
 
 const QUICK_PRESETS = [
@@ -87,12 +88,33 @@ interface ClickRipple {
 export interface LiveBrowserStageProps {
   agentId: string;
   auth: AuthSession;
-  /** Whether the assistant is currently executing a turn (speeds up idle→active detection). */
+  /** Whether the assistant is currently executing a browser tool step (speeds up idle→active detection). */
   running?: boolean;
+  /** Optional one-click handoff request emitted by a chat `browser_handoff` card. */
+  handoffRequest?: (LiveBrowserHandoffRequest & { nonce: number }) | null;
+  /** Notifies parent once a handoff request has been settled so remounting never replays it. */
+  onHandoffSettled?: (nonce: number) => void;
   /** Prefill a continuation prompt into Composer when the user hands control back. */
   onHandBackToComposer?: (draft: string) => void;
   /** Reports active status upward so BrowserView can render a live status indicator. */
   onActiveStateChange?: (active: boolean) => void;
+}
+
+interface HandoffOriginMismatch {
+  expectedHost: string;
+  actualHost: string;
+  continuePrompt: string | null;
+}
+
+function parseOriginAndHost(url?: string): { origin: string; host: string } | null {
+  if (!url) return null;
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    return { origin: u.origin, host: u.host };
+  } catch {
+    return null;
+  }
 }
 
 function isAbortError(err: unknown): boolean {
@@ -117,6 +139,8 @@ export function LiveBrowserStage({
   agentId,
   auth,
   running = false,
+  handoffRequest = null,
+  onHandoffSettled,
   onHandBackToComposer,
   onActiveStateChange,
 }: LiveBrowserStageProps) {
@@ -126,6 +150,8 @@ export function LiveBrowserStage({
   const [takeover, setTakeover] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [originMismatch, setOriginMismatch] = useState<HandoffOriginMismatch | null>(null);
+  const [handoffWaiting, setHandoffWaiting] = useState(false);
 
   const [launchUrl, setLaunchUrl] = useState("https://scholar.google.com");
   const [addressDraft, setAddressDraft] = useState("");
@@ -158,6 +184,22 @@ export function LiveBrowserStage({
   const effectiveTakeover = takeover && !lockedByAssistant;
   const takeoverActiveRef = useRef(false);
   takeoverActiveRef.current = effectiveTakeover;
+  const runningRef = useRef(running);
+  runningRef.current = running;
+  const stateUrlRef = useRef<string | undefined>(state?.url);
+  stateUrlRef.current = state?.url;
+  const lastHandoffNonceRef = useRef<number | null>(null);
+  const pendingHandoffRef = useRef<(LiveBrowserHandoffRequest & { nonce: number }) | null>(null);
+  const pendingPostOpenHandoffRef = useRef<{
+    nonce: number;
+    takeover?: boolean;
+    expand?: boolean;
+    url?: string;
+    continuePrompt?: string | null;
+  } | null>(null);
+  const handoffContinuePromptRef = useRef<string | null>(null);
+  const onHandoffSettledRef = useRef(onHandoffSettled);
+  onHandoffSettledRef.current = onHandoffSettled;
 
   const clearPendingInputBuffers = useCallback(() => {
     keyBufferRef.current.text = "";
@@ -173,6 +215,39 @@ export function LiveBrowserStage({
     }
     inputQueueRef.current.length = 0;
   }, []);
+
+  const activateHandoffOnActivePage = useCallback(
+    (
+      req: { takeover?: boolean; expand?: boolean; url?: string; continuePrompt?: string | null },
+      actualUrl: string | undefined,
+      isBusyNow: boolean,
+    ) => {
+      const expected = parseOriginAndHost(req.url);
+      const actual = parseOriginAndHost(actualUrl);
+      if (expected && actual && expected.origin !== actual.origin) {
+        // Always revoke any active takeover before asking the user to confirm the mismatched origin.
+        takeoverActiveRef.current = false;
+        clearPendingInputBuffers();
+        setTakeover(false);
+        handoffContinuePromptRef.current = null;
+        setOriginMismatch({
+          expectedHost: expected.host,
+          actualHost: actual.host,
+          continuePrompt: req.continuePrompt?.trim() || null,
+        });
+        if (req.expand) setExpanded(true);
+        return;
+      }
+      setOriginMismatch(null);
+      handoffContinuePromptRef.current = req.continuePrompt?.trim() || null;
+      if (req.takeover && !isBusyNow) {
+        setTakeover(true);
+        window.requestAnimationFrame(() => stageRef.current?.focus({ preventScroll: true }));
+      }
+      if (req.expand) setExpanded(true);
+    },
+    [clearPendingInputBuffers],
+  );
 
   useEffect(() => {
     mountedRef.current = true;
@@ -198,9 +273,14 @@ export function LiveBrowserStage({
     setExpanded(false);
     setAddressEditing(false);
     setError(null);
+    setOriginMismatch(null);
+    setHandoffWaiting(false);
     setState(null);
     setInitialLoading(true);
     clearPendingInputBuffers();
+    pendingHandoffRef.current = null;
+    pendingPostOpenHandoffRef.current = null;
+    handoffContinuePromptRef.current = null;
     reqSeqRef.current += 1;
     appliedSeqRef.current = reqSeqRef.current;
     pollAbortRef.current?.abort();
@@ -215,15 +295,22 @@ export function LiveBrowserStage({
       setError(null);
       onActiveStateChange?.(next.active);
       if (!next.active) {
+        pendingPostOpenHandoffRef.current = null;
+        setOriginMismatch(null);
         setTakeover(false);
         setExpanded(false);
         clearPendingInputBuffers();
       } else if (next.agentBusy) {
         setTakeover(false);
         clearPendingInputBuffers();
+      } else if (pendingPostOpenHandoffRef.current) {
+        const post = pendingPostOpenHandoffRef.current;
+        pendingPostOpenHandoffRef.current = null;
+        activateHandoffOnActivePage(post, next.url, Boolean(runningRef.current || next.agentBusy));
+        onHandoffSettledRef.current?.(post.nonce);
       }
     },
-    [onActiveStateChange, clearPendingInputBuffers],
+    [onActiveStateChange, clearPendingInputBuffers, activateHandoffOnActivePage],
   );
 
   // Sync address bar with live URL unless user is currently editing it.
@@ -323,11 +410,42 @@ export function LiveBrowserStage({
       setError(null);
       const mySeq = ++reqSeqRef.current;
       try {
-        const next = await sendLiveBrowserAction(authRef.current, agentId, payload);
+        const liveOrigin = parseOriginAndHost(stateUrlRef.current)?.origin;
+        const enrichedPayload: LiveBrowserActionPayload =
+          liveOrigin &&
+          (payload.action === "click" ||
+            payload.action === "dblclick" ||
+            payload.action === "wheel" ||
+            payload.action === "type" ||
+            payload.action === "press") &&
+          !payload.expectedOrigin
+            ? { ...payload, expectedOrigin: liveOrigin }
+            : payload;
+        const next = await sendLiveBrowserAction(authRef.current, agentId, enrichedPayload);
         applyState(mySeq, next);
       } catch (err) {
+        const post = pendingPostOpenHandoffRef.current;
+        pendingPostOpenHandoffRef.current = null;
         if (!isAbortError(err) && mountedRef.current) {
-          setError(errorMessageOf(err));
+          const msg = errorMessageOf(err);
+          const isAgentBusyConflict =
+            (err as { status?: number })?.status === 409 ||
+            /助手正在操作浏览器|AGENT_RUNNING/.test(msg);
+          if (post && isAgentBusyConflict) {
+            // Re-queue transient 409 handoff so it automatically resumes when the assistant finishes.
+            pendingHandoffRef.current = {
+              nonce: post.nonce,
+              takeover: post.takeover,
+              expand: post.expand,
+              url: post.url,
+              continuePrompt: post.continuePrompt ?? undefined,
+            };
+            setHandoffWaiting(true);
+            setState((prev) => (prev ? { ...prev, agentBusy: true } : prev));
+          } else {
+            if (post) onHandoffSettledRef.current?.(post.nonce);
+            setError(msg);
+          }
         }
       } finally {
         actionInFlightRef.current = false;
@@ -530,11 +648,75 @@ export function LiveBrowserStage({
     takeoverActiveRef.current = false;
     clearPendingInputBuffers();
     setTakeover(false);
+    setExpanded(false);
+    setOriginMismatch(null);
+    const customPrompt = handoffContinuePromptRef.current;
+    handoffContinuePromptRef.current = null;
     if (onHandBackToComposer) {
       const label = state?.title?.trim() || state?.url?.trim() || "当前网页";
-      onHandBackToComposer(`我已在云端浏览器完成操作（当前页面：${label}），请继续刚才的任务。`);
+      onHandBackToComposer(customPrompt || `我已在云端浏览器完成操作（当前页面：${label}），请继续刚才的任务。`);
     }
   };
+
+  // Fulfill one-click handoff requests emitted from chat `browser_handoff` cards.
+  useEffect(() => {
+    if (!handoffRequest || handoffRequest.nonce === lastHandoffNonceRef.current) return;
+    lastHandoffNonceRef.current = handoffRequest.nonce;
+    pendingHandoffRef.current = handoffRequest;
+  }, [handoffRequest]);
+
+  const stateLoaded = state !== null;
+  const stateActive = state?.active === true;
+  const stateAvailable = state?.available !== false;
+  const stateUrl = state?.url;
+  useEffect(() => {
+    const req = pendingHandoffRef.current;
+    if (!req || !stateLoaded) return;
+    if (!stateAvailable) {
+      pendingHandoffRef.current = null;
+      setHandoffWaiting(false);
+      onHandoffSettledRef.current?.(req.nonce);
+      return;
+    }
+    // Preserve pending handoff across temporary assistant/action locks instead of dropping clicks.
+    if (lockedByAssistant || busy || actionInFlightRef.current) {
+      setHandoffWaiting(true);
+      return;
+    }
+    pendingHandoffRef.current = null;
+    setHandoffWaiting(false);
+    if (stateActive) {
+      activateHandoffOnActivePage(req, stateUrl, false);
+      onHandoffSettledRef.current?.(req.nonce);
+      return;
+    }
+    if (req.url) {
+      const normalized = normalizeBrowserUrlInput(req.url);
+      if (normalized) {
+        setLaunchUrl(normalized);
+        pendingPostOpenHandoffRef.current = {
+          nonce: req.nonce,
+          takeover: req.takeover,
+          expand: req.expand,
+          url: normalized,
+          continuePrompt: req.continuePrompt?.trim() || null,
+        };
+        void runAction({ action: "open", url: normalized, ifIdle: true });
+        return;
+      }
+    }
+    onHandoffSettledRef.current?.(req.nonce);
+  }, [
+    handoffRequest,
+    stateLoaded,
+    stateActive,
+    stateAvailable,
+    stateUrl,
+    lockedByAssistant,
+    busy,
+    runAction,
+    activateHandoffOnActivePage,
+  ]);
 
   if (initialLoading && !state) {
     return (
@@ -572,6 +754,11 @@ export function LiveBrowserStage({
             <button type="button" className="lb-error-close" aria-label="关闭提示" onClick={() => setError(null)}>
               <X size={13} />
             </button>
+          </div>
+        )}
+        {handoffWaiting && (
+          <div className="lb-handoff-banner" role="status" data-testid="live-browser-handoff-waiting">
+            <span>助手正在操作浏览器，当前步骤完成后将自动为你开启接管…</span>
           </div>
         )}
         <div className="lb-idle-surface">
@@ -635,6 +822,54 @@ export function LiveBrowserStage({
           <button type="button" className="lb-error-close" aria-label="关闭提示" onClick={() => setError(null)}>
             <X size={13} />
           </button>
+        </div>
+      )}
+
+      {handoffWaiting && (
+        <div className="lb-handoff-banner" role="status" data-testid="live-browser-handoff-waiting">
+          <span>助手正在操作浏览器，当前步骤完成后将自动为你开启接管…</span>
+        </div>
+      )}
+
+      {originMismatch && !effectiveTakeover && (
+        <div className="lb-handoff-banner" role="alert" data-testid="live-browser-origin-mismatch">
+          <span>
+            当前实时页面域名为 <strong>{originMismatch.actualHost}</strong>（卡片指向{" "}
+            <strong>{originMismatch.expectedHost}</strong>）。请核对地址栏；如为正常跳转（如第三方 SSO 登录），确认后再开启接管。
+          </span>
+          <div className="lb-handoff-actions">
+            <button
+              type="button"
+              className="lb-cta-btn"
+              data-variant="watch"
+              disabled={lockedByAssistant}
+              data-testid="live-browser-confirm-mismatch"
+              onClick={() => {
+                if (lockedByAssistant) return;
+                // Re-verify live host at click time: if page navigated again before confirmation, refresh banner.
+                const currentActual = parseOriginAndHost(state?.url);
+                if (currentActual && currentActual.host !== originMismatch.actualHost) {
+                  setOriginMismatch({ ...originMismatch, actualHost: currentActual.host });
+                  return;
+                }
+                const prompt = originMismatch.continuePrompt;
+                setOriginMismatch(null);
+                handoffContinuePromptRef.current = prompt;
+                setTakeover(true);
+                window.requestAnimationFrame(() => stageRef.current?.focus({ preventScroll: true }));
+              }}
+            >
+              确认接管当前页
+            </button>
+            <button
+              type="button"
+              className="lb-icon-btn"
+              aria-label="关闭域名核对提示"
+              onClick={() => setOriginMismatch(null)}
+            >
+              <X size={13} />
+            </button>
+          </div>
         </div>
       )}
 
@@ -711,11 +946,17 @@ export function LiveBrowserStage({
                 type="button"
                 className="lb-cta-btn"
                 data-variant="watch"
-                disabled={lockedByAssistant}
-                title={lockedByAssistant ? "助手正在操作浏览器，本轮结束或停止后即可接管" : "接管云端浏览器"}
+                disabled={lockedByAssistant || Boolean(originMismatch)}
+                title={
+                  lockedByAssistant
+                    ? "助手正在操作浏览器，本轮结束或停止后即可接管"
+                    : originMismatch
+                      ? "请先核对上方域名提示并确认后再接管"
+                      : "接管云端浏览器"
+                }
                 data-testid="live-browser-takeover-btn"
                 onClick={() => {
-                  if (lockedByAssistant) return;
+                  if (lockedByAssistant || originMismatch) return;
                   setTakeover(true);
                   window.requestAnimationFrame(() => stageRef.current?.focus({ preventScroll: true }));
                 }}

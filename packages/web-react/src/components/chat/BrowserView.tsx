@@ -13,6 +13,7 @@ import { ActionTrail, AddressBar, PlainSignedImg, ShotThumb } from "../tool/Brow
 import { type BrowserTurnStep, collectBrowserSteps, displayAddress } from "../tool/browserSteps";
 import type { ToolLike } from "../tool/format";
 import { Spinner, StatusPill } from "../ui";
+import type { LiveBrowserHandoffRequest } from "./inspectorState";
 import { SignedImg } from "./media";
 import { TurnBar } from "./OutputsView";
 import type { WorkTurn } from "./workTurns";
@@ -289,12 +290,14 @@ export function BrowserView({
   onOpenStep,
   liveBrowserAgentId,
   liveBrowserAuth,
+  liveHandoff,
+  onHandoffSettled,
   onAnnotateToComposer,
 }: {
   turns: readonly WorkTurn[];
   index: number;
   running: boolean;
-  /** 会话级运行态（独立于当前查看的历史轮次），用于实时浏览器接管仲裁。 */
+  /** 当前是否有正在执行中的浏览器工具步，用于实时浏览器接管仲裁。 */
   liveRunning?: boolean;
   /** 从卡片点进来时要看的那一步(消息 id)。 */
   focusId: string | null;
@@ -304,13 +307,17 @@ export function BrowserView({
   /** 可选：启用云端实时浏览器视口与人工接管（OCV5-813）。 */
   liveBrowserAgentId?: string;
   liveBrowserAuth?: AuthSession | null;
+  /** 可选：来自对话区 `browser_handoff` 卡片的一键接管/放大意图。 */
+  liveHandoff?: (LiveBrowserHandoffRequest & { nonce: number }) | null;
+  /** Handoff 被消费后通知上层记录已处理 nonce，防止切换模式重挂时重复触发。 */
+  onHandoffSettled?: (nonce: number) => void;
   onAnnotateToComposer?: (draft: string) => void;
 }) {
   const turn = turns[index];
   const stepCount = turn ? collectBrowserSteps(turn.steps).length : 0;
   const liveEnabled = Boolean(liveBrowserAgentId && liveBrowserAuth);
   const [mode, setMode] = useState<"live" | "steps">(() =>
-    liveEnabled && (!focusId || stepCount === 0) ? "live" : "steps",
+    liveEnabled && (Boolean(liveHandoff) || !focusId || stepCount === 0) ? "live" : "steps",
   );
   const [liveActive, setLiveActive] = useState(false);
 
@@ -318,6 +325,11 @@ export function BrowserView({
   useEffect(() => {
     if (focusId && stepCount > 0) setMode("steps");
   }, [focusId, stepCount]);
+
+  // 从 `browser_handoff` 卡片一键接管时，强制切回「实时视口」。
+  useEffect(() => {
+    if (liveEnabled && liveHandoff) setMode("live");
+  }, [liveEnabled, liveHandoff?.nonce]);
 
   if (!turn && !liveEnabled) return null;
   const effectiveMode: "live" | "steps" = !liveEnabled ? "steps" : stepCount === 0 ? "live" : mode;
@@ -368,6 +380,8 @@ export function BrowserView({
             agentId={liveBrowserAgentId}
             auth={liveBrowserAuth}
             running={liveRunning ?? running}
+            handoffRequest={liveHandoff}
+            onHandoffSettled={onHandoffSettled}
             onHandBackToComposer={onAnnotateToComposer}
             onActiveStateChange={setLiveActive}
           />

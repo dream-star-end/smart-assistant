@@ -13,7 +13,7 @@ import type { FeedbackContext, CardCallbacks } from "../components/chat/cards";
 import { TASKBOARD_ENABLED } from "../lib/taskboardFeature";
 import type { ToolCardActions, SystemActionCardActions, ChatInteraction, ArtifactInspectTarget } from "../components/tool/context";
 import { isBrowserStepMessage } from "../components/tool/browserDetect";
-import type { PaneTab } from "../components/InspectorPanel";
+import type { LiveBrowserHandoffRequest, PaneTab } from "../components/InspectorPanel";
 import type { ToolLike } from "../components/tool/format";
 import type { ChatMessage } from "../lib/chat/model";
 import { preciseRetryEligible } from "../lib/chat/socket";
@@ -67,7 +67,7 @@ export type ChatCardActionsInput = {
   /** 经验分享开关（feature_community_blog）；关时对话卡只读。 */
   communityBlogEnabled: boolean;
   openBlog: (target: BlogOpenTarget) => void;
-  openPane: (tab?: PaneTab | undefined, message?: ToolLike | null | undefined) => void;
+  openPane: (tab?: PaneTab | undefined, message?: ToolLike | null | undefined, liveBrowser?: LiveBrowserHandoffRequest | undefined) => void;
   openSettings: (section?: SettingsDestinationSection) => void;
   onOpenSwarmBoard?: ToolCardActions["onOpenSwarmBoard"];
   regenerate: () => Promise<void>;
@@ -265,8 +265,9 @@ export function useChatCardActions({
       // 浏览器操作(OCV5-374)进「浏览器」页看截图和整轮操作记录;其余工具进步骤详情。
       open: (t: ArtifactInspectTarget) => openPane(isBrowserStepMessage(t.message) ? "browser" : "steps", t.message),
       openPane: (tab: PaneTab, message?: ToolLike | null) => openPane(tab, message),
+      ...(demo ? {} : { openLiveBrowser: (opts?: LiveBrowserHandoffRequest) => openPane("browser", null, opts) }),
     }),
-    [openPane],
+    [openPane, demo],
   );
 
   // 超长消息在会话里只有占位行(_userPayloadDeferred,text 为空):重试与「编辑 / 修改消息」都先

@@ -16,7 +16,7 @@ import { V2_ALIASES, V2_VALIDATORS, type V2Spec } from "./v2Schema";
 
 export type { IntradaySpec, KlineSpec, MarketSpec, QuoteSpec, StockListSpec } from "./marketSchema";
 export type { FeishuDocSpec, FeishuEventsSpec, PluginSpec, WeiboHotSpec, WeiboPostsSpec, ZhihuAnswersSpec, ZhihuHotSpec } from "./pluginSchema";
-export type { CitationsSpec, DeliverablesSpec, FlashcardsSpec, PromptTemplateSpec, RunbookSpec, StoryboardSpec, V2Spec } from "./v2Schema";
+export type { BrowserHandoffSpec, CitationsSpec, DeliverablesSpec, FlashcardsSpec, PromptTemplateSpec, RunbookSpec, StoryboardSpec, V2Spec } from "./v2Schema";
 
 export type Cell = string | number | null;
 
@@ -285,6 +285,7 @@ export const IUI_TYPES: readonly IuiType[] = [
   "prompt_template",
   "storyboard",
   "flashcards",
+  "browser_handoff",
   "quote",
   "kline",
   "intraday",

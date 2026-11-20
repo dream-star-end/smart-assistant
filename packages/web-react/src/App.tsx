@@ -344,8 +344,8 @@ export function App() {
   isWideRef.current = isWideViewport;
   /** 从面板外打开 / 定位面板:宽屏展开内联列,窄屏弹出贴底面板。 */
   const openPane = useCallback(
-    (tab?: PaneTab, message?: ToolLike | null) => {
-      setPaneRequest({ tab, message, nonce: Date.now(), sessionId: activeIdRef.current });
+    (tab?: PaneTab, message?: ToolLike | null, liveBrowser?: PaneRequest["liveBrowser"]) => {
+      setPaneRequest((prev) => ({ tab, message, liveBrowser, nonce: Math.max(Date.now(), (prev?.nonce ?? 0) + 1), sessionId: activeIdRef.current }));
       if (isWideRef.current) setPaneOpen(true);
       else setPaneSheetOpen(true);
     },

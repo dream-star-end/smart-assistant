@@ -12,6 +12,7 @@ import { createContext, type ReactNode, useContext } from "react";
 import type { CommunityTutorialCategory, CommunityTutorialMine, CommunityBlogPrecheck } from "../../lib/types";
 import type { ConnectorConfirmationDetail, ConnectorDecisionResult } from "../../lib/connectors";
 import type { Ticket } from "../../lib/taskboard";
+import type { LiveBrowserHandoffRequest } from "../chat/inspectorState";
 import type { ToolLike } from "./format";
 
 import type { SystemActionDetail, SystemActionSummary } from '@openclaude/protocol/browser';
@@ -156,6 +157,10 @@ export type ArtifactInspect = {
    * outputs 带上这一轮里的任意一行,面板定位到那一轮的产出。
    */
   openPane?: (tab: "steps" | "outputs", message?: ToolLike | null) => void;
+  /**
+   * 打开实时云端浏览器并可选一键放大/进入人工接管（由 `browser_handoff` 智能 UI 卡片触发）。
+   */
+  openLiveBrowser?: (opts?: LiveBrowserHandoffRequest) => void;
 };
 
 export const ArtifactInspectContext = createContext<ArtifactInspect>({});

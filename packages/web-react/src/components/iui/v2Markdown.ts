@@ -70,5 +70,11 @@ export function v2ToMarkdown(spec: V2Spec, values?: Record<string, string>): str
         ...head(spec.title, spec.subtitle),
         ...spec.cards.map((c, i) => `${i + 1}. **${c.front}**\n   答：${c.back}`),
       ].join("\n");
+    case "browser_handoff":
+      return [
+        ...head(spec.title ?? "需要你接管云端浏览器", spec.subtitle),
+        ...(spec.url ? [`页面：${spec.url}`] : []),
+        ...(spec.reason ? [spec.reason] : []),
+      ].join("\n");
   }
 }

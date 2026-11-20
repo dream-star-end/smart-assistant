@@ -441,6 +441,7 @@ const SKELETON_HEIGHT: Record<string, number> = {
   prompt_template: 220,
   storyboard: 280,
   flashcards: 220,
+  browser_handoff: 156,
   weibo_posts: 320,
   weibo_hot: 300,
   zhihu_hot: 300,

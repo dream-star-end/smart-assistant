@@ -4,6 +4,16 @@ import type { ToolLike } from "../tool/format";
 export type PaneTab = "outputs" | "steps" | "plan" | "browser";
 
 /**
+ * 从聊天流里的 `browser_handoff` 卡片一键打开实时云端浏览器并接管的意图参数。
+ */
+export type LiveBrowserHandoffRequest = {
+  takeover?: boolean;
+  expand?: boolean;
+  url?: string;
+  continuePrompt?: string;
+};
+
+/**
  * 从面板外打开 / 定位面板的请求(工具卡入口、过程摘要上的「改动 N 个文件」、顶栏开关)。
  * nonce 每次请求都换:同一条消息连点两次也会重新定位并把焦点移进面板。
  * tab 缺省 = 只开面板(停在上次的分区)。
@@ -13,6 +23,8 @@ export type PaneRequest = {
   tab?: PaneTab | "changes";
   /** steps / browser:要打开的那一步;outputs:这一轮里的任意一行(定位到它所在的那一轮)。 */
   message?: ToolLike | null;
+  /** browser_handoff 卡片发起的实时接管/放大意图。 */
+  liveBrowser?: LiveBrowserHandoffRequest;
   nonce: number;
   /** 发起请求时的会话;App 只把属于当前会话的请求交给面板(切会话后旧请求作废)。 */
   sessionId?: string | null;

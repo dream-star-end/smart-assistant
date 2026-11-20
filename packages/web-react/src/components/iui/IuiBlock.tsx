@@ -21,7 +21,7 @@ import { BiliCommentsBlock, BiliDanmakuBlock, BiliRankBlock, BiliSubtitleBlock, 
 import { FeishuDocBlock, FeishuEventsBlock, WeiboHotBlock, WeiboPostsBlock, ZhihuAnswersBlock, ZhihuHotBlock } from "./PluginBlocks";
 import { TableBlock } from "./TableBlock";
 import { DraftBlock, OutlineBlock, SourcesBlock } from "./TextBlocks";
-import { CitationsBlock, DeliverablesBlock, RunbookBlock } from "./WorkBlocks";
+import { BrowserHandoffBlock, CitationsBlock, DeliverablesBlock, RunbookBlock } from "./WorkBlocks";
 import { FlashcardsBlock, PromptTemplateBlock, StoryboardBlock } from "./StudioBlocks";
 import {
   CalloutBlock,
@@ -39,7 +39,7 @@ import { BodyMarkdown, Skeleton } from "./shell";
 import { specToMarkdown } from "./toMarkdown";
 
 /** 这些组件要等内容完整才渲染(交互依赖完整数据);流式期间显示骨架。 */
-const WAIT_FOR_COMPLETE = new Set(["calculator", "choice", "suggestions", "callout", "quiz", "form", "recipe", "runbook", "prompt_template", "storyboard", "flashcards", "kline", "intraday", "blog_draft", "blog_status", "blog_published"]);
+const WAIT_FOR_COMPLETE = new Set(["calculator", "choice", "suggestions", "callout", "quiz", "form", "recipe", "runbook", "prompt_template", "storyboard", "flashcards", "browser_handoff", "kline", "intraday", "blog_draft", "blog_status", "blog_published"]);
 
 export class BlockBoundary extends Component<{ fallback: ReactNode; children: ReactNode; resetKey: string }, { failed: boolean; key: string }> {
   state = { failed: false, key: this.props.resetKey };
@@ -128,6 +128,8 @@ export function renderSpec(spec: IuiSpec, notes: string[], streaming: boolean, r
       return <StoryboardBlock spec={spec} {...p} readOnly={readOnly} />;
     case "flashcards":
       return <FlashcardsBlock spec={spec} {...p} />;
+    case "browser_handoff":
+      return <BrowserHandoffBlock spec={spec} {...p} readOnly={readOnly} />;
     case "quote":
       return <QuoteBlock spec={spec} {...p} />;
     case "kline":
@@ -225,6 +227,8 @@ function hasContent(spec: IuiSpec): boolean {
       return spec.shots.length > 0;
     case "flashcards":
       return spec.cards.length > 0;
+    case "browser_handoff":
+      return true;
     case "quote":
     case "stocklist":
       return spec.items.length > 0;

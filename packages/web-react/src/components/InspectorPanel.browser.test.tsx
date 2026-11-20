@@ -209,4 +209,87 @@ describe("浏览器页", () => {
     render(<InspectorPanelContent messages={session()} request={{ tab: "browser", message: child, nonce: 1 }} onClose={() => {}} />);
     expect(screen.getByRole("tab", { name: /步骤/ })).toHaveAttribute("aria-selected", "true");
   });
+
+  test("非浏览器轮次 running=true 时，浏览器步骤页不误报「助手正在操作浏览器」", async () => {
+    const messages = [
+      user("u1", "先打开网页看看"),
+      bash("b1", "oc-browser open https://github.com/login && oc-browser screenshot", page("https://github.com/login", "GitHub", ".playwright-cli/login.png")),
+      assistant("a1", "已打开登录页", TS + 5_000),
+      user("u2", "顺便写一段总结", TS + 10_000),
+    ];
+    render(
+      <InspectorPanelContent
+        messages={messages}
+        running={true}
+        request={{ tab: "browser", message: messages[1], nonce: 1 }}
+        onClose={() => {}}
+      />,
+    );
+    await browserReady();
+    expect(screen.getByTestId("browser-status-banner")).not.toHaveTextContent("助手正在操作浏览器");
+  });
+
+  test("handoff 消费后切换「步骤记录」再切回「实时视口」不会重放全屏接管", async () => {
+    const payload = JSON.stringify({
+      available: true,
+      active: true,
+      agentBusy: false,
+      url: "https://github.com/login",
+      title: "Sign in to GitHub",
+      viewport: { width: 1280, height: 720 },
+      tabs: [{ index: 0, title: "Sign in to GitHub", url: "https://github.com/login", active: true }],
+      imageBase64: "AAAA",
+      mimeType: "image/jpeg",
+      capturedAt: Date.now(),
+    });
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async () => new Response(payload, { status: 200, headers: { "Content-Type": "application/json" } }));
+    try {
+      const messages = [
+        user("u1", "登录 GitHub"),
+        bash("b1", "oc-browser open https://github.com/login && oc-browser screenshot", page("https://github.com/login", "GitHub", ".playwright-cli/login.png")),
+        assistant("a1", "请接管登录", TS + 5_000),
+      ];
+      const mockAuth = {
+        snapshot: () => ({ token: "tok", username: "u", role: "user" as const }),
+        refresh: async () => "tok",
+        logout: () => {},
+      };
+      render(
+        <InspectorPanelContent
+          messages={messages}
+          liveBrowserAgentId="main"
+          liveBrowserAuth={mockAuth as never}
+          request={{
+            tab: "browser",
+            message: null,
+            liveBrowser: { takeover: true, expand: true, url: "https://github.com/login" },
+            nonce: 777,
+          }}
+          onClose={() => {}}
+        />,
+      );
+
+      // Initial handoff enters fullscreen theater + takeover
+      await screen.findByTestId("live-browser-theater-dialog");
+      expect(screen.getByTestId("live-browser-takeover-dock")).toBeInTheDocument();
+
+      // Hand back -> closes fullscreen theater
+      fireEvent.click(screen.getByTestId("live-browser-handback-btn"));
+      await waitFor(() => expect(screen.queryByTestId("live-browser-theater-dialog")).toBeNull());
+
+      // Switch to 步骤记录 then back to 实时视口 (remounts LiveBrowserStage)
+      fireEvent.click(screen.getByTestId("browser-mode-steps"));
+      expect(await screen.findByTestId("browser-window")).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("browser-mode-live"));
+      await screen.findByTestId("live-browser-active");
+
+      // Must NOT replay fullscreen theater or takeover
+      expect(screen.queryByTestId("live-browser-theater-dialog")).toBeNull();
+      expect(screen.queryByTestId("live-browser-takeover-dock")).toBeNull();
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
 });

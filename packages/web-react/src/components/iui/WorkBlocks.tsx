@@ -1,12 +1,13 @@
-import { AlertTriangle, BookOpen, Check, ChevronDown, Copy, Download, Eye, EyeOff, RotateCcw } from "lucide-react";
+import { AlertTriangle, BookOpen, Check, ChevronDown, Copy, Download, Eye, EyeOff, Globe, Lock, Maximize2, RotateCcw } from "lucide-react";
 import { useState } from "react";
 import { nativeDownload } from "../../lib/chat/download";
 import { cn } from "../../lib/utils";
 import { useMediaSigner } from "../chat/media";
-import { useChatInteraction } from "../tool/context";
+import { chatInteractionUnavailableText, useArtifactInspect, useChatInteraction } from "../tool/context";
 import { BodyMarkdown, Frame, Inline, useCopiedFlag } from "./shell";
 import { interpolateRunbookCommand, v2ToMarkdown } from "./v2Markdown";
-import type { CitationsSpec, DeliverablesSpec, RunbookSpec } from "./v2Schema";
+import type { BrowserHandoffSpec, CitationsSpec, DeliverablesSpec, RunbookSpec } from "./v2Schema";
+import "./browserHandoff.css";
 
 type BlockProps<S> = { spec: S; notes: string[]; streaming: boolean; readOnly?: boolean; nested?: boolean };
 
@@ -319,6 +320,111 @@ export function RunbookBlock({ spec, notes, streaming, nested }: BlockProps<Runb
           </li>
         ))}
       </ol>
+    </Frame>
+  );
+}
+
+// ── 13. BrowserHandoff 云端浏览器人工接管卡（OCV5-816） ────────────────────────
+
+function parseHandoffUrl(url: string): { isHttps: boolean; host: string; path: string } {
+  try {
+    const u = new URL(url);
+    return {
+      isHttps: u.protocol === "https:",
+      host: u.host,
+      path: `${u.pathname === "/" ? "" : u.pathname}${u.search}`,
+    };
+  } catch {
+    return { isHttps: url.startsWith("https://"), host: url, path: "" };
+  }
+}
+
+export function BrowserHandoffBlock({ spec, notes, streaming, readOnly, nested }: BlockProps<BrowserHandoffSpec>) {
+  const { openLiveBrowser } = useArtifactInspect();
+  const { sendUserText, busy, reason } = useChatInteraction();
+  const [opened, setOpened] = useState(false);
+  const [sent, setSent] = useState(false);
+
+  const parsedUrl = spec.url ? parseHandoffUrl(spec.url) : null;
+  // Secondary button auto-sends immediately: strictly send transparent user-visible copy,
+  // never an unshown model-authored prompt. Custom `continue_prompt` is only prefilled into
+  // Composer on browser handback so the user can review/edit before sending.
+  const visibleContinueMessage = parsedUrl
+    ? `我已完成 ${parsedUrl.host} 的浏览器操作，请继续。`
+    : "我已完成云端浏览器操作，请继续。";
+  const handbackDraft = spec.continue_prompt ?? visibleContinueMessage;
+  const canTakeover = !readOnly && !streaming && Boolean(openLiveBrowser);
+  const canContinue = !readOnly && !streaming && Boolean(sendUserText) && !busy && !sent;
+
+  return (
+    <Frame
+      kind="browser_handoff"
+      title={spec.title ?? "需要你接管云端浏览器"}
+      subtitle={spec.subtitle ?? "云端浏览器与助手共享同一会话与登录态，完成验证后即可无缝交还"}
+      notes={notes}
+      streaming={streaming}
+      nested={nested}
+      copyText={() => v2ToMarkdown(spec)}
+    >
+      <div className="oc-iui-bh" data-testid="iui-browser-handoff">
+        {parsedUrl && (
+          <div className="oc-iui-bh-url" title={spec.url}>
+            <span className="oc-iui-bh-url-icon" aria-hidden>
+              {parsedUrl.isHttps ? <Lock size={13} /> : <Globe size={13} />}
+            </span>
+            <span className="oc-iui-bh-url-text">
+              <span className="oc-iui-bh-url-host">{parsedUrl.host}</span>
+              {parsedUrl.path}
+            </span>
+          </div>
+        )}
+        <p className="oc-iui-bh-reason">
+          <Inline text={spec.reason ?? "当前页面需要人工完成登录、二次验证或确认操作。点击下方按钮将为你放大云端浏览器并开启直接操控。"} />
+        </p>
+        <div className="oc-iui-bh-actions">
+          <button
+            type="button"
+            className="oc-iui-btn is-primary"
+            disabled={!canTakeover}
+            data-testid="iui-browser-handoff-open"
+            onClick={() => {
+              if (!canTakeover) return;
+              setOpened(true);
+              openLiveBrowser?.({
+                takeover: true,
+                expand: true,
+                url: spec.url,
+                continuePrompt: handbackDraft,
+              });
+            }}
+          >
+            <Maximize2 size={14} aria-hidden />
+            {spec.action_label ?? "放大并接管浏览器"}
+          </button>
+          <button
+            type="button"
+            className="oc-iui-btn"
+            disabled={!canContinue}
+            data-testid="iui-browser-handoff-continue"
+            onClick={() => {
+              if (!canContinue) return;
+              setSent(true);
+              sendUserText?.(visibleContinueMessage);
+            }}
+          >
+            <Check size={14} aria-hidden />
+            {sent ? "已通知助手继续" : (spec.continue_label ?? "我已完成，继续任务")}
+          </button>
+        </div>
+        {opened && !sent && (
+          <p className="oc-iui-bh-note" role="status">
+            正在为你打开实时浏览器… 完成操作后可点击浏览器顶栏「交还助手」或上方按钮继续。
+          </p>
+        )}
+        {!readOnly && !streaming && !openLiveBrowser && (
+          <p className="oc-iui-bh-note">{chatInteractionUnavailableText(reason)}</p>
+        )}
+      </div>
     </Frame>
   );
 }

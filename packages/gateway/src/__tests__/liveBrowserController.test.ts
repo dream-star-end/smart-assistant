@@ -1,9 +1,10 @@
 import * as assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { createServer as createNetServer } from 'node:net'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { describe, it } from 'node:test'
 import {
   LIVE_BROWSER_MAX_IMAGE_BYTES,
@@ -13,6 +14,7 @@ import {
   buildPlaywrightRunCodeScript,
   handleLiveBrowserActionHttp,
   handleLiveBrowserLiveHttp,
+  isExternalBrowserCliActive,
   ocBrowserAgentKey,
   parsePlaywrightRunCodeResult,
   parsePlaywrightTabList,
@@ -730,5 +732,240 @@ describe('liveBrowserController', () => {
     assert.equal(compressed.imageBase64, 'SlBFRw==')
     assert.equal((rpcCalls.at(-1)?._ as string[])[0], 'run-code')
     assert.equal(cliCalls, 0)
+  })
+
+  it('detects live external oc-browser CLI via pending.<pid> and ignores self/dead PIDs', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-live-cli-probe-'))
+    try {
+      assert.equal(isExternalBrowserCliActive(dir, 100, () => true), false)
+      // Self PID marker must never trigger agentBusy
+      writeFileSync(join(dir, 'pending.100'), '')
+      assert.equal(isExternalBrowserCliActive(dir, 100, () => true), false)
+      // Stale dead PID marker must not trigger agentBusy
+      writeFileSync(join(dir, 'pending.202'), '')
+      assert.equal(isExternalBrowserCliActive(dir, 100, (pid) => pid === 303), false)
+      // Live external PID marker triggers agentBusy
+      writeFileSync(join(dir, 'pending.303'), '')
+      assert.equal(isExternalBrowserCliActive(dir, 100, (pid) => pid === 303), true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('real oc-browser.sh holds cli-active.<pid> through run_cli execution (after pending.<pid> is removed) and blocks human actions until exit', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'oc-live-real-wrapper-'))
+    const homeDir = join(root, 'home')
+    const stateRoot = join(root, 'state')
+    const fakeCli = join(root, 'playwright-cli')
+    const mockConfig = join(root, 'playwright-cli.config.json')
+    const launcher = join(root, 'oc-browser')
+    const startedFile = join(root, 'cli-started')
+    const releaseFile = join(root, 'cli-release')
+    const core = join(root, 'node_modules/playwright-core')
+    mkdirSync(homeDir, { recursive: true })
+    mkdirSync(stateRoot, { recursive: true })
+    mkdirSync(join(core, 'lib/tools/cli-client'), { recursive: true })
+    writeFileSync(join(core, 'package.json'), '{"name":"playwright-core"}\n')
+    writeFileSync(
+      join(core, 'lib/tools/cli-client/session.js'),
+      'exports.Session = class Session { async run() { return { text: "- Page URL: https://github.com/login" }; } };\n',
+    )
+    writeFileSync(mockConfig, '{}\n')
+    writeFileSync(
+      fakeCli,
+      `#!/usr/bin/env node
+const fs = require('node:fs');
+const { Session } = require('./node_modules/playwright-core/lib/tools/cli-client/session.js');
+fs.writeFileSync(${JSON.stringify(startedFile)}, '1');
+(async () => {
+  const deadline = Date.now() + 5000;
+  while (!fs.existsSync(${JSON.stringify(releaseFile)}) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  const res = await new Session().run();
+  console.log(res.text);
+})();
+`,
+    )
+    chmodSync(fakeCli, 0o755)
+    const wrapperSrc = readFileSync(
+      resolve(process.cwd(), 'packages/commercial/agent-sandbox/platform-runtime/bin/oc-browser.sh'),
+      'utf8',
+    )
+      .replace('state_dir="/tmp/openclaude-playwright-cli/$agent_key"', `state_dir="${stateRoot}/$agent_key"`)
+      .replace('cli_bin=/usr/local/bin/playwright-cli', `cli_bin=${fakeCli}`)
+      .replace('config_file=/etc/openclaude/playwright-cli.config.json', `config_file=${mockConfig}`)
+    writeFileSync(launcher, wrapperSrc)
+    chmodSync(launcher, 0o755)
+    const agentDir = join(stateRoot, ocBrowserAgentKey('main'))
+    const child = spawn(launcher, ['snapshot'], {
+      env: {
+        ...process.env,
+        OPENCLAUDE_HOME: homeDir,
+        OPENCLAUDE_AGENT_ID: 'main',
+        OPENCLAUDE_PLAYWRIGHT_CLI_IDLE_SECONDS: '30',
+        OPENCLAUDE_PLAYWRIGHT_CLI_POLL_SECONDS: '5',
+      },
+      stdio: 'ignore',
+    })
+    try {
+      // Wait until mock run_cli is executing INSIDE the lock (after pending.$$ has already been deleted)
+      const deadline = Date.now() + 5000
+      while (Date.now() < deadline) {
+        if (existsSync(startedFile)) break
+        await new Promise((r) => setTimeout(r, 25))
+      }
+      assert.equal(existsSync(startedFile), true, 'mock playwright-cli should have entered run_cli')
+      assert.equal(
+        isExternalBrowserCliActive(agentDir),
+        true,
+        'cli-active.<pid> must remain active throughout run_cli execution',
+      )
+
+      const controller = new LiveBrowserController({
+        stateRoot,
+        existsSync: () => true,
+        execFn: async () => ({
+          stdout: mockRunCodeOutput({
+            url: 'https://github.com/login',
+            title: 'Sign in',
+            viewport: { width: 1280, height: 720 },
+            tabs: [{ index: 0, title: 'Sign in', url: 'https://github.com/login', active: true }],
+            imageBase64: 'AAAA',
+            capturedAt: 1700000000000,
+          }),
+          stderr: '',
+        }),
+      })
+      const makeHost = (fake: ReturnType<typeof makeFakeRes>) => ({
+        controller,
+        hasAgent: async (id: string) => id === 'main',
+        sendJson: fake.sendJson,
+        sendError: fake.sendError,
+      })
+
+      // Live status & serialized action both observe active CLI ownership
+      const busyLiveRes = makeFakeRes()
+      await handleLiveBrowserLiveHttp(
+        makeHost(busyLiveRes),
+        { method: 'GET' } as IncomingMessage,
+        busyLiveRes.res,
+        'main',
+        new URL('http://localhost/api/agents/main/browser/live'),
+      )
+      assert.equal(busyLiveRes.statusCode, 200)
+      assert.equal((busyLiveRes.body as { agentBusy?: boolean }).agentBusy, true)
+
+      await assert.rejects(
+        () => controller.performAction('main', { action: 'reload' }),
+        (err: unknown) => err instanceof LiveBrowserError && err.status === 409 && err.code === 'AGENT_RUNNING',
+      )
+
+      // Release mock CLI and wait for wrapper to clean up cli-active.<pid>
+      writeFileSync(releaseFile, '')
+      await new Promise<void>((res, rej) => {
+        child.once('exit', () => res())
+        child.once('error', rej)
+      })
+      assert.equal(isExternalBrowserCliActive(agentDir), false, 'cli-active.<pid> must be cleaned up on exit')
+
+      const idleLiveRes = makeFakeRes()
+      await handleLiveBrowserLiveHttp(
+        makeHost(idleLiveRes),
+        { method: 'GET' } as IncomingMessage,
+        idleLiveRes.res,
+        'main',
+        new URL('http://localhost/api/agents/main/browser/live'),
+      )
+      assert.equal(idleLiveRes.statusCode, 200)
+      assert.equal((idleLiveRes.body as { agentBusy?: boolean }).agentBusy, false)
+    } finally {
+      try {
+        writeFileSync(releaseFile, '')
+      } catch {}
+      try {
+        child.kill('SIGTERM')
+      } catch {}
+      // Reap any detached idle reaper spawned for the temp stateDir
+      try {
+        const pidPath = join(agentDir, 'reaper.pid')
+        if (existsSync(pidPath)) {
+          const rpid = Number.parseInt(readFileSync(pidPath, 'utf8').trim(), 10)
+          if (Number.isFinite(rpid) && rpid > 0) process.kill(rpid, 'SIGTERM')
+        }
+      } catch {}
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('open with ifIdle=true preserves an already-active login page instead of navigating away', async () => {
+    const calls: (readonly string[])[] = []
+    const controller = new LiveBrowserController({
+      existsSync: () => true,
+      execFn: async (_bin, args) => {
+        calls.push(args)
+        return {
+          stdout: mockRunCodeOutput({
+            url: 'https://github.com/login',
+            title: 'Sign in to GitHub',
+            viewport: { width: 1280, height: 720 },
+            tabs: [{ index: 0, title: 'Sign in to GitHub', url: 'https://github.com/login', active: true }],
+            imageBase64: 'AAAA',
+            capturedAt: 1700000000000,
+          }),
+          stderr: '',
+        }
+      },
+    })
+    const state = await controller.performAction('main', {
+      action: 'open',
+      url: 'https://arxiv.org',
+      ifIdle: true,
+    })
+    assert.equal(state.active, true)
+    assert.equal(state.url, 'https://github.com/login')
+    assert.equal(
+      calls.some((a) => a[0] === 'goto'),
+      false,
+      'ifIdle=true must never call goto when browser is already active',
+    )
+  })
+
+  it('daemon fast-path rejects human input with 409 PAGE_ORIGIN_CHANGED when active tab navigated to another origin', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'oc-live-origin-guard-'))
+    const agentDir = join(root, ocBrowserAgentKey('main'))
+    mkdirSync(agentDir, { recursive: true })
+    writeFileSync(join(agentDir, 'activity'), '')
+    const rpcCalls: string[] = []
+    try {
+      const controller = new LiveBrowserController({
+        stateRoot: root,
+        existsSync: () => true,
+        resolveDaemonEndpoint: () => ({ socketPath: join(agentDir, 'd.sock'), stateDir: agentDir, version: '0.1.14' }),
+        daemonRpcFn: async (_ep, msg) => {
+          const cmd = (msg._ as string[])[0]
+          rpcCalls.push(cmd)
+          if (cmd === 'tab-list') {
+            return { text: '- 0: (current) [GitHub Login](https://github.com/login)\n' }
+          }
+          return { text: 'ok' }
+        },
+        readFrameFile: () => Buffer.from('AAAA'),
+      })
+      await assert.rejects(
+        () =>
+          controller.performAction('main', {
+            action: 'click',
+            x: 0.5,
+            y: 0.5,
+            normalized: true,
+            expectedOrigin: 'https://arxiv.org',
+          }),
+        (err: unknown) => err instanceof LiveBrowserError && err.status === 409 && err.code === 'PAGE_ORIGIN_CHANGED',
+      )
+      assert.deepEqual(rpcCalls, ['tab-list'], 'must reject before sending mousemove/mousedown')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 })

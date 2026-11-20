@@ -105,13 +105,13 @@ export interface LiveBrowserState {
 }
 
 export type LiveBrowserAction =
-  | { action: 'open'; url?: string }
+  | { action: 'open'; url?: string; ifIdle?: boolean }
   | { action: 'goto'; url: string }
-  | { action: 'click'; x: number; y: number; normalized?: boolean; button?: 'left' | 'right' }
-  | { action: 'dblclick'; x: number; y: number; normalized?: boolean; button?: 'left' | 'right' }
-  | { action: 'wheel'; x?: number; y?: number; normalized?: boolean; deltaX?: number; deltaY: number }
-  | { action: 'type'; text: string; submit?: boolean }
-  | { action: 'press'; key: string }
+  | { action: 'click'; x: number; y: number; normalized?: boolean; button?: 'left' | 'right'; expectedOrigin?: string }
+  | { action: 'dblclick'; x: number; y: number; normalized?: boolean; button?: 'left' | 'right'; expectedOrigin?: string }
+  | { action: 'wheel'; x?: number; y?: number; normalized?: boolean; deltaX?: number; deltaY: number; expectedOrigin?: string }
+  | { action: 'type'; text: string; submit?: boolean; expectedOrigin?: string }
+  | { action: 'press'; key: string; expectedOrigin?: string }
   | { action: 'back' }
   | { action: 'forward' }
   | { action: 'reload' }
@@ -232,6 +232,56 @@ export async function withPlaywrightActivityLock<T>(
       child.kill('SIGTERM')
     } catch {}
   }
+}
+
+const CLI_OWNER_PID_RE = /^(?:cli-active|pending)\.(\d+)$/
+const BROWSER_CLI_CMDLINE_RE = /(?:^|\/|\0)(?:oc-browser(?:\.sh)?|playwright-cli)(?:\0|$|\s)/
+
+/**
+ * Returns true if an external `oc-browser` CLI process (PID !== selfPid) is currently
+ * waiting on OR actively executing under the per-agent activity lock, verified via signal-0
+ * liveness probe plus `/proc/<pid>/cmdline` identity verification on Linux (preventing
+ * recycled PID false positives). Ignores stale marker files left behind by crashed processes.
+ */
+export function isExternalBrowserCliActive(
+  stateDir: string,
+  selfPid: number = process.pid,
+  probePid: (pid: number) => boolean = defaultProbePid,
+): boolean {
+  let entries: string[]
+  try {
+    entries = readdirSync(stateDir)
+  } catch {
+    return false
+  }
+  for (const name of entries) {
+    const m = CLI_OWNER_PID_RE.exec(name)
+    if (!m) continue
+    const pid = Number.parseInt(m[1], 10)
+    if (!Number.isFinite(pid) || pid <= 0 || pid === selfPid) continue
+    if (probePid(pid)) return true
+  }
+  return false
+}
+
+function defaultProbePid(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code
+    if (code !== 'EPERM') return false
+  }
+  // On Linux, verify process identity via /proc/<pid>/cmdline when readable so a recycled
+  // PID belonging to an unrelated process cannot falsely hold the browser lock.
+  try {
+    const cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf8')
+    if (cmdline.length > 0 && !BROWSER_CLI_CMDLINE_RE.test(cmdline)) {
+      return false
+    }
+  } catch {
+    // Non-Linux or unreadable /proc (e.g. hidepid / EPERM): fall back to signal-0 liveness.
+  }
+  return true
 }
 
 /**
@@ -569,6 +619,17 @@ function clamp(v: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, v))
 }
 
+function optionalExpectedOrigin(v: unknown): string | undefined {
+  if (v === undefined || v === null || v === '') return undefined
+  if (typeof v !== 'string') return undefined
+  try {
+    const u = new URL(v.trim())
+    return u.protocol === 'http:' || u.protocol === 'https:' ? u.origin : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export function validateLiveBrowserAction(raw: unknown): LiveBrowserAction {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new LiveBrowserError(400, 'INVALID_BODY', '请求体必须为 JSON 对象')
@@ -580,6 +641,7 @@ export function validateLiveBrowserAction(raw: unknown): LiveBrowserAction {
       return {
         action: 'open',
         ...(obj.url !== undefined && obj.url !== '' ? { url: validateLiveBrowserUrl(obj.url) } : {}),
+        ...(obj.ifIdle === true ? { ifIdle: true } : {}),
       }
     case 'goto':
       return { action: 'goto', url: validateLiveBrowserUrl(obj.url) }
@@ -595,7 +657,8 @@ export function validateLiveBrowserAction(raw: unknown): LiveBrowserAction {
         throw new LiveBrowserError(400, 'INVALID_COORD', '点击坐标超出合理范围')
       }
       const button = obj.button === 'right' ? 'right' : 'left'
-      return { action, x, y, normalized, button }
+      const expectedOrigin = optionalExpectedOrigin(obj.expectedOrigin)
+      return { action, x, y, normalized, button, ...(expectedOrigin ? { expectedOrigin } : {}) }
     }
     case 'wheel': {
       const normalized = obj.normalized === true
@@ -603,7 +666,16 @@ export function validateLiveBrowserAction(raw: unknown): LiveBrowserAction {
       const deltaX = obj.deltaX === undefined ? 0 : clamp(finiteNumber(obj.deltaX, 'deltaX'), -4000, 4000)
       const x = obj.x === undefined ? undefined : finiteNumber(obj.x, 'x')
       const y = obj.y === undefined ? undefined : finiteNumber(obj.y, 'y')
-      return { action: 'wheel', ...(x !== undefined ? { x } : {}), ...(y !== undefined ? { y } : {}), normalized, deltaX, deltaY }
+      const expectedOrigin = optionalExpectedOrigin(obj.expectedOrigin)
+      return {
+        action: 'wheel',
+        ...(x !== undefined ? { x } : {}),
+        ...(y !== undefined ? { y } : {}),
+        normalized,
+        deltaX,
+        deltaY,
+        ...(expectedOrigin ? { expectedOrigin } : {}),
+      }
     }
     case 'type': {
       if (typeof obj.text !== 'string' || obj.text.length === 0 || obj.text.length > LIVE_BROWSER_MAX_TYPE_CHARS) {
@@ -612,13 +684,15 @@ export function validateLiveBrowserAction(raw: unknown): LiveBrowserAction {
       if (obj.text.includes('\0')) {
         throw new LiveBrowserError(400, 'INVALID_TEXT', '输入文本包含非法字符')
       }
-      return { action: 'type', text: obj.text, submit: obj.submit === true }
+      const expectedOrigin = optionalExpectedOrigin(obj.expectedOrigin)
+      return { action: 'type', text: obj.text, submit: obj.submit === true, ...(expectedOrigin ? { expectedOrigin } : {}) }
     }
     case 'press': {
       if (typeof obj.key !== 'string' || !ALLOWED_PRESS_KEYS.has(obj.key)) {
         throw new LiveBrowserError(400, 'INVALID_KEY', '不支持该按键指令')
       }
-      return { action: 'press', key: obj.key }
+      const expectedOrigin = optionalExpectedOrigin(obj.expectedOrigin)
+      return { action: 'press', key: obj.key, ...(expectedOrigin ? { expectedOrigin } : {}) }
     }
     case 'back':
     case 'forward':
@@ -832,6 +906,14 @@ export class LiveBrowserController {
     return this.checkExists(this.bin)
   }
 
+  /**
+   * Returns true only when an external `oc-browser` CLI process is genuinely operating on
+   * this agent's browser state directory (not merely when the agent is running an unrelated chat turn).
+   */
+  isExternalCliActive(agentId: string): boolean {
+    return isExternalBrowserCliActive(this.stateDirFor(agentId))
+  }
+
   private stateDirFor(agentId: string): string {
     return join(this.stateRoot, ocBrowserAgentKey(agentId))
   }
@@ -1034,8 +1116,22 @@ export class LiveBrowserController {
     action: Exclude<LiveBrowserAction, { action: 'close' | 'open' }>,
   ): Promise<LiveBrowserState> {
     return this.lockFn(endpoint.stateDir, async () => {
+      // Re-verify external CLI ownership AFTER acquiring cross-process flock so a CLI
+      // command that raced ahead before flock acquisition blocks stale human input.
+      if (this.isExternalCliActive(agentId)) {
+        throw new LiveBrowserError(409, 'AGENT_RUNNING', '助手正在操作浏览器，请等待当前浏览器操作完成后再接管')
+      }
       this.touchActivity(agentId)
       const rpcOpts = { cwd: this.browserHome, timeoutMs: ACTION_TIMEOUT_MS }
+      if ('expectedOrigin' in action && action.expectedOrigin) {
+        const tabRes = await this.daemonRpc(endpoint, { _: ['tab-list'] }, rpcOpts)
+        const parsedTabs = parsePlaywrightTabList(tabRes.text)
+        const activeTab = parsedTabs.find((t) => t.active) ?? parsedTabs[0]
+        const liveOrigin = optionalExpectedOrigin(activeTab?.url)
+        if (liveOrigin && liveOrigin !== action.expectedOrigin) {
+          throw new LiveBrowserError(409, 'PAGE_ORIGIN_CHANGED', '页面已跳转到其他站点，请核对地址栏后再操作')
+        }
+      }
       const vp = this.metaCache.get(agentId)?.viewport ?? { width: 1280, height: 720 }
       const toPx = (x: number, y: number, norm?: boolean) => ({
         px: clamp(Math.round(norm ? x * vp.width : x), 1, Math.max(1, vp.width - 1)),
@@ -1246,10 +1342,16 @@ export class LiveBrowserController {
     return this.toState(parsePlaywrightRunCodeResult(res.stdout))
   }
 
-  private async openAndCapture(agentId: string, env: NodeJS.ProcessEnv, targetUrl: string): Promise<LiveBrowserState> {
+  private async openAndCapture(
+    agentId: string,
+    env: NodeJS.ProcessEnv,
+    targetUrl: string,
+    ifIdle = false,
+  ): Promise<LiveBrowserState> {
     this.metaCache.delete(agentId)
+    const openEnv = ifIdle ? { ...env, OPENCLAUDE_BROWSER_OPEN_IF_IDLE: '1' } : env
     await this.execFn(this.bin, ['open', targetUrl], {
-      env,
+      env: openEnv,
       timeout: ACTION_TIMEOUT_MS,
       maxBuffer: EXEC_MAX_BUFFER,
     })
@@ -1270,6 +1372,11 @@ export class LiveBrowserController {
     if (existingQueue) existingQueue.inFlightRead = null
 
     return this.enqueue(agentId, async (): Promise<LiveBrowserState> => {
+      // Re-verify external CLI ownership right at the serialized execution boundary so a
+      // queued human action cannot slip onto a page that the assistant just started navigating.
+      if (this.isExternalCliActive(agentId)) {
+        throw new LiveBrowserError(409, 'AGENT_RUNNING', '助手正在操作浏览器，请等待当前浏览器操作完成后再接管')
+      }
       const env = this.envFor(agentId)
       if (action.action === 'close') {
         this.metaCache.delete(agentId)
@@ -1290,16 +1397,19 @@ export class LiveBrowserController {
 
       if (action.action === 'open') {
         const targetUrl = action.url ?? 'https://scholar.google.com'
+        const ifIdle = action.ifIdle === true
         try {
           if (!this.isSessionActive(agentId)) {
-            return await this.openAndCapture(agentId, env, targetUrl)
+            return await this.openAndCapture(agentId, env, targetUrl, ifIdle)
           }
           try {
             const endpoint = this.daemonEndpointFor(agentId)
             if (endpoint) {
               return await this.lockFn(endpoint.stateDir, async () => {
                 this.touchActivity(agentId)
-                if (action.url) {
+                // When `ifIdle: true` (e.g. handoff card auto-open), never clobber an
+                // already-active page (such as a login/2FA challenge opened by the assistant).
+                if (action.url && !ifIdle) {
                   await this.daemonRpc(endpoint, { _: ['goto', targetUrl] }, {
                     cwd: this.browserHome,
                     timeoutMs: ACTION_TIMEOUT_MS,
@@ -1313,7 +1423,7 @@ export class LiveBrowserController {
                 })
               })
             }
-            if (action.url) {
+            if (action.url && !ifIdle) {
               await this.execFn(this.bin, ['goto', targetUrl], {
                 env,
                 timeout: ACTION_TIMEOUT_MS,
@@ -1325,7 +1435,7 @@ export class LiveBrowserController {
             // Activity marker is only a hint: if the daemon died leaving a stale marker, cold-start once.
             const innerMsg = innerErr instanceof Error ? innerErr.message : String(innerErr)
             if (SESSION_CLOSED_RE.test(innerMsg) || DAEMON_SOCKET_DEAD_RE.test(innerMsg)) {
-              return await this.openAndCapture(agentId, env, targetUrl)
+              return await this.openAndCapture(agentId, env, targetUrl, ifIdle)
             }
             throw innerErr
           }
@@ -1499,7 +1609,7 @@ export async function handleLiveBrowserLiveHttp(
   const quality = parsedQuality !== undefined && Number.isFinite(parsedQuality) ? parsedQuality : undefined
   try {
     const state = await host.controller.getLiveState(agentId, { includeFrame, quality })
-    const agentBusy = Boolean(host.isAgentRunning?.(agentId))
+    const agentBusy = Boolean(host.isAgentRunning?.(agentId)) || host.controller.isExternalCliActive(agentId)
     res.setHeader('Cache-Control', 'no-store')
     host.sendJson(res, 200, { ...state, agentBusy })
   } catch (err) {
@@ -1525,9 +1635,9 @@ export async function handleLiveBrowserActionHttp(
     host.sendJson(res, 404, { error: '智能体不存在', code: 'AGENT_NOT_FOUND' })
     return
   }
-  if (host.isAgentRunning?.(agentId)) {
+  if (host.isAgentRunning?.(agentId) || host.controller.isExternalCliActive(agentId)) {
     host.sendJson(res, 409, {
-      error: '助手正在执行任务，请等待本轮完成或停止后再操作云端浏览器',
+      error: '助手正在操作浏览器，请等待当前浏览器操作完成后再接管',
       code: 'AGENT_RUNNING',
     })
     return

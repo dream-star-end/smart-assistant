@@ -57,6 +57,7 @@ export {
   readDetailPaneOpen,
   writeDetailPaneOpen,
   type DeferredPayloadLoader,
+  type LiveBrowserHandoffRequest,
   type PaneRequest,
   type PaneTab,
 } from "./chat/inspectorState";
@@ -741,6 +742,30 @@ export function InspectorPanelContent({
   // 停在「浏览器」页而这一轮的大记录还在补取:先给读取态,不退回产出(取完仍没有浏览器步再退回)。
   const browserPending = tab === "browser" && browserCount === 0 && browserProbing;
   const liveBrowserAvailable = Boolean(liveBrowserAgentId && liveBrowserAuth);
+  const latestTurnSteps = browserTurns[lastTurn]?.steps;
+  // 只有当前轮真正存在正在执行中的浏览器工具步时，才把实时浏览器标记为「助手操作中」，
+  // 避免普通聊天 / 写代码 / 思考阶段误锁浏览器或误报「助手正在操作浏览器」。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: version 是就地 mutate 消息的变更信号
+  const liveBrowserRunning = useMemo(
+    () =>
+      running &&
+      Boolean(
+        latestTurnSteps?.some(
+          (m) =>
+            isBrowserStepMessage(m) &&
+            resolveToolStatus(normalizeToolForDisplay(m)).kind === "running",
+        ),
+      ),
+    [latestTurnSteps, running, version],
+  );
+  const [consumedHandoffNonce, setConsumedHandoffNonce] = useState<number | null>(null);
+  const liveBrowserHandoff = useMemo(
+    () =>
+      request?.tab === "browser" && request.liveBrowser && request.nonce !== consumedHandoffNonce
+        ? { ...request.liveBrowser, nonce: request.nonce }
+        : null,
+    [request, consumedHandoffNonce],
+  );
 
   const view: PaneTab =
     (tab === "plan" && todos.length === 0) ||
@@ -868,8 +893,8 @@ export function InspectorPanelContent({
             <BrowserView
               turns={browserTurns}
               index={outputsIndex}
-              running={running && outputsIndex === lastTurn}
-              liveRunning={running}
+              running={liveBrowserRunning && outputsIndex === lastTurn}
+              liveRunning={liveBrowserRunning}
               focusId={browserFocus}
               onSelectTurn={(i) => {
                 const t = workTurns[i];
@@ -884,6 +909,8 @@ export function InspectorPanelContent({
               onOpenStep={openStep}
               liveBrowserAgentId={liveBrowserAgentId}
               liveBrowserAuth={liveBrowserAuth}
+              liveHandoff={liveBrowserHandoff}
+              onHandoffSettled={setConsumedHandoffNonce}
               onAnnotateToComposer={onAnnotateToComposer}
             />
           </Suspense>

@@ -128,6 +128,7 @@ describe("LiveBrowserStage", () => {
         y: 0.5,
         normalized: true,
         button: "left",
+        expectedOrigin: "https://arxiv.org",
       }),
     );
 
@@ -139,6 +140,7 @@ describe("LiveBrowserStage", () => {
         action: "type",
         text: "123456",
         submit: true,
+        expectedOrigin: "https://arxiv.org",
       }),
     );
 
@@ -219,6 +221,7 @@ describe("LiveBrowserStage", () => {
           action: "type",
           text: "abc",
           submit: false,
+          expectedOrigin: "https://arxiv.org",
         }),
       { timeout: 1000 },
     );
@@ -245,8 +248,17 @@ describe("LiveBrowserStage", () => {
     fireEvent.keyDown(stage, { key: "Enter" });
 
     await waitFor(() => expect(sendActionMock).toHaveBeenCalledTimes(2));
-    expect(sendActionMock.mock.calls[0]?.[2]).toEqual({ action: "type", text: "xy", submit: false });
-    expect(sendActionMock.mock.calls[1]?.[2]).toEqual({ action: "press", key: "Enter" });
+    expect(sendActionMock.mock.calls[0]?.[2]).toEqual({
+      action: "type",
+      text: "xy",
+      submit: false,
+      expectedOrigin: "https://arxiv.org",
+    });
+    expect(sendActionMock.mock.calls[1]?.[2]).toEqual({
+      action: "press",
+      key: "Enter",
+      expectedOrigin: "https://arxiv.org",
+    });
 
     // Type + wheel then immediately hand back within 160ms: nothing should be sent after handback!
     sendActionMock.mockClear();
@@ -298,6 +310,7 @@ describe("LiveBrowserStage", () => {
       y: 0.25,
       normalized: true,
       button: "left",
+      expectedOrigin: "https://arxiv.org",
     });
     expect(sendActionMock.mock.calls[1]?.[2]).toEqual({
       action: "click",
@@ -305,6 +318,7 @@ describe("LiveBrowserStage", () => {
       y: 0.75,
       normalized: true,
       button: "left",
+      expectedOrigin: "https://arxiv.org",
     });
   });
 
@@ -368,5 +382,167 @@ describe("LiveBrowserStage", () => {
       fireEvent.click(img, { clientX: 100, clientY: 50 });
     }
     expect(await screen.findByTestId("live-browser-error")).toHaveTextContent("操作队列已满");
+  });
+
+  test("fulfills same-origin handoffRequest on active browser by entering takeover + fullscreen theater and collapses with custom continuePrompt on handback", async () => {
+    fetchLiveMock.mockResolvedValue(ACTIVE_STATE);
+    const onHandBack = vi.fn();
+    const onSettled = vi.fn();
+
+    render(
+      <LiveBrowserStage
+        agentId="main"
+        auth={MOCK_AUTH}
+        running={false}
+        handoffRequest={{
+          nonce: 42,
+          takeover: true,
+          expand: true,
+          url: "https://arxiv.org/login",
+          continuePrompt: "我已完成 arXiv 登录，请继续操作。",
+        }}
+        onHandoffSettled={onSettled}
+        onHandBackToComposer={onHandBack}
+      />,
+    );
+
+    await screen.findByTestId("live-browser-theater-dialog");
+    expect(screen.getByTestId("live-browser-takeover-dock")).toBeInTheDocument();
+    expect(onSettled).toHaveBeenCalledWith(42);
+
+    fireEvent.click(screen.getByTestId("live-browser-handback-btn"));
+    await waitFor(() => expect(screen.queryByTestId("live-browser-theater-dialog")).toBeNull());
+    expect(onHandBack).toHaveBeenCalledWith("我已完成 arXiv 登录，请继续操作。");
+  });
+
+  test("guards cross-origin handoff by revoking active takeover, disabling manual takeover btn, and requiring explicit confirmation", async () => {
+    fetchLiveMock.mockResolvedValue(ACTIVE_STATE);
+    const onSettled = vi.fn();
+
+    const { rerender } = render(
+      <LiveBrowserStage agentId="main" auth={MOCK_AUTH} running={false} onHandoffSettled={onSettled} />,
+    );
+    await screen.findByTestId("live-browser-active");
+    // Enter takeover manually in sidebar first
+    fireEvent.click(screen.getByTestId("live-browser-takeover-btn"));
+    expect(screen.getByTestId("live-browser-takeover-dock")).toBeInTheDocument();
+
+    // Now receive a handoff targeting a different origin (github.com while arxiv.org is active)
+    rerender(
+      <LiveBrowserStage
+        agentId="main"
+        auth={MOCK_AUTH}
+        running={false}
+        handoffRequest={{
+          nonce: 55,
+          takeover: true,
+          expand: true,
+          url: "https://github.com/login",
+          continuePrompt: "我已完成 GitHub 登录。",
+        }}
+        onHandoffSettled={onSettled}
+      />,
+    );
+
+    await screen.findByTestId("live-browser-theater-dialog");
+    expect(screen.getByTestId("live-browser-origin-mismatch")).toHaveTextContent("arxiv.org");
+    expect(screen.getByTestId("live-browser-origin-mismatch")).toHaveTextContent("github.com");
+    // Must revoke previous takeover and disable manual takeover button until confirmed
+    expect(screen.queryByTestId("live-browser-takeover-dock")).toBeNull();
+    expect(screen.getByTestId("live-browser-takeover-btn")).toBeDisabled();
+    expect(onSettled).toHaveBeenCalledWith(55);
+
+    // Explicitly confirming enables takeover on the live page
+    fireEvent.click(screen.getByTestId("live-browser-confirm-mismatch"));
+    expect(screen.getByTestId("live-browser-takeover-dock")).toBeInTheDocument();
+    expect(screen.queryByTestId("live-browser-origin-mismatch")).toBeNull();
+  });
+
+  test("re-queues idle handoff on transient 409 AGENT_RUNNING instead of settling early", async () => {
+    fetchLiveMock.mockResolvedValue({ available: true, active: false, agentBusy: false });
+    const conflictErr = Object.assign(new Error("助手正在操作浏览器，请等待当前浏览器操作完成后再接管"), { status: 409 });
+    sendActionMock.mockRejectedValueOnce(conflictErr).mockResolvedValueOnce(ACTIVE_STATE);
+    const onSettled = vi.fn();
+
+    render(
+      <LiveBrowserStage
+        agentId="main"
+        auth={MOCK_AUTH}
+        running={false}
+        handoffRequest={{
+          nonce: 108,
+          takeover: true,
+          expand: true,
+          url: "https://arxiv.org/login",
+        }}
+        onHandoffSettled={onSettled}
+      />,
+    );
+
+    await screen.findByTestId("live-browser-handoff-waiting");
+    expect(onSettled).not.toHaveBeenCalled();
+  });
+
+  test("preserves pending handoff across temporary assistant lock and fulfills once unlocked", async () => {
+    fetchLiveMock.mockResolvedValue(ACTIVE_STATE);
+    const onSettled = vi.fn();
+    const handoff = { nonce: 77, takeover: true, expand: true, url: "https://arxiv.org/login" };
+
+    const { rerender } = render(
+      <LiveBrowserStage
+        agentId="main"
+        auth={MOCK_AUTH}
+        running={true}
+        handoffRequest={handoff}
+        onHandoffSettled={onSettled}
+      />,
+    );
+
+    await screen.findByTestId("live-browser-handoff-waiting");
+    expect(onSettled).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("live-browser-theater-dialog")).toBeNull();
+
+    rerender(
+      <LiveBrowserStage
+        agentId="main"
+        auth={MOCK_AUTH}
+        running={false}
+        handoffRequest={handoff}
+        onHandoffSettled={onSettled}
+      />,
+    );
+
+    await screen.findByTestId("live-browser-theater-dialog");
+    expect(screen.getByTestId("live-browser-takeover-dock")).toBeInTheDocument();
+    expect(onSettled).toHaveBeenCalledWith(77);
+  });
+
+  test("auto-opens target URL with ifIdle=true on idle browser, then enters fullscreen takeover", async () => {
+    fetchLiveMock.mockResolvedValue({ available: true, active: false, agentBusy: false });
+    sendActionMock.mockResolvedValue(ACTIVE_STATE);
+
+    render(
+      <LiveBrowserStage
+        agentId="main"
+        auth={MOCK_AUTH}
+        running={false}
+        handoffRequest={{
+          nonce: 99,
+          takeover: true,
+          expand: true,
+          url: "https://arxiv.org/login",
+        }}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(sendActionMock).toHaveBeenCalledWith(MOCK_AUTH, "main", {
+        action: "open",
+        url: "https://arxiv.org/login",
+        ifIdle: true,
+      }),
+    );
+    await screen.findByTestId("live-browser-theater-dialog");
+    expect(screen.getByTestId("live-browser-takeover-dock")).toBeInTheDocument();
   });
 });

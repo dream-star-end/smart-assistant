@@ -1538,7 +1538,7 @@ export class Gateway {
     return handleLiveBrowserActionHttp(this.liveBrowserHttpHost(), req, res, agentId)
   }
   private liveBrowserHttpHost() {
-    return { controller: this.liveBrowser, hasAgent: async (id: string) => (await this._getAgentsConfig()).agents.some((a) => a.id === id), isAgentRunning: (id: string) => this.sessions.list().some((s) => { const live = s.agentId === id ? this.sessions.getByKey(s.sessionKey) : undefined; return Boolean(live && ((live._activeTurnCount ?? 0) > 0 || (live._activeClientTurnCount ?? 0) > 0 || (live._idleInternalTurns ?? 0) > 0)) }), sendJson: (r: ServerResponse, c: number, b: unknown) => this.sendJson(r, c, b), sendError: (r: ServerResponse, c: number, m: string) => this.sendError(r, c, m) }
+    return { controller: this.liveBrowser, hasAgent: async (id: string) => (await this._getAgentsConfig()).agents.some((a) => a.id === id), sendJson: (r: ServerResponse, c: number, b: unknown) => this.sendJson(r, c, b), sendError: (r: ServerResponse, c: number, m: string) => this.sendError(r, c, m) }
   }
 
   // memdir 范式下的记忆读写面(单一权威在 storage 的 MemoryDir / userProfile):

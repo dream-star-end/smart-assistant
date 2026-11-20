@@ -29,7 +29,21 @@ oc-browser close
 - ref 必须来自最近一次 `snapshot`，不要猜。页面变化后重新 snapshot。
 - 输入框优先 `fill <ref> <text>`；当前已聚焦的输入框才用 `type <text>`。
 - 截图仅在视觉确认或交付图片时使用；普通理解页面优先 snapshot。
-- 完成后执行 `close`。Agent 中断时平台会在 30 分钟无浏览器操作后兜底回收。
+- 正常完成整个任务后再执行 `close`；若需要用户接管登录/验证，**不要 `close`**。Agent 中断时平台会在 30 分钟无浏览器操作后兜底回收。
+
+## 登录 / 2FA / 验证码：实时视口人工接管（重要）
+
+OpenClaude Web 右侧工作台内置**实时云端浏览器视口（支持全屏放大与一键人工接管）**，与 `oc-browser` 共享同一个 Chromium 会话、Cookie 与页面状态。
+
+遇到登录页、二次验证（2FA）、人机验证或需要用户亲自确认的操作时：
+
+1. 让 `oc-browser` 停留在当前待操作页面，**切勿执行 `oc-browser close`**；
+2. **严禁**回复“暂不支持实时远程画面接管”或向用户索要账号、密码、验证码；
+3. 直接在回复中输出一张 `browser_handoff` 智能 UI 卡片，用户点击一次即可全屏放大并接管操作，完成后点「交还助手」即可保留登录态无缝继续：
+
+```ui
+{"type":"browser_handoff","title":"请完成 GitHub 登录","url":"https://github.com/login","reason":"当前页面需要登录授权，接管后你的登录态会自动同步给助手继续执行。","continue_prompt":"我已完成 GitHub 登录，请继续刚才的任务。"}
+```
 
 ## 常用命令
 
