@@ -492,11 +492,12 @@ function DeliverableSummaryStrip({
 }) {
   const counts = summarizeDeliverableCategories(outputs.files, outputs.media.length);
   const total = outputs.files.length + outputs.media.length;
-  if (total === 0) return null;
+  // 只有至少 2 种不同类型的交付物时才展示筛选条，避免单文件出现「全部 1 / 文件 1」冗余噪音。
+  if (total === 0 || counts.length < 2) return null;
 
   return (
     <div
-      className="flex flex-wrap items-center gap-1.5 px-4 pb-3"
+      className="flex flex-nowrap items-center gap-1 overflow-x-auto px-4 pb-2.5 [scrollbar-width:none]"
       role="group"
       aria-label="交付物按类型汇总与筛选"
       data-testid="outputs-summary-strip"
@@ -507,14 +508,14 @@ function DeliverableSummaryStrip({
         data-testid="outputs-filter-all"
         onClick={() => onSelectCategory("all")}
         className={cn(
-          "inline-flex min-h-7 items-center gap-1 rounded-full border px-2.5 text-caption font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+          "inline-flex h-7 shrink-0 items-center gap-1 rounded-xs px-2.5 text-caption font-medium whitespace-nowrap outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
           activeCategory === "all"
-            ? "border-accent bg-accent-soft text-accent"
-            : "border-border bg-surface text-muted hover:bg-hover hover:text-fg",
+            ? "bg-accent-soft text-accent"
+            : "text-muted hover:bg-hover hover:text-fg",
         )}
       >
         全部
-        <span className="tabular-nums">{total}</span>
+        <span className="tabular-nums opacity-80">{total}</span>
       </button>
       {counts.map((c) => {
         const active = activeCategory === c.category;
@@ -526,14 +527,14 @@ function DeliverableSummaryStrip({
             data-testid={`outputs-filter-${c.category}`}
             onClick={() => onSelectCategory(active ? "all" : c.category)}
             className={cn(
-              "inline-flex min-h-7 items-center gap-1 rounded-full border px-2.5 text-caption font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+              "inline-flex h-7 shrink-0 items-center gap-1 rounded-xs px-2.5 text-caption font-medium whitespace-nowrap outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
               active
-                ? "border-accent bg-accent-soft text-accent"
-                : "border-border bg-surface text-muted hover:bg-hover hover:text-fg",
+                ? "bg-accent-soft text-accent"
+                : "text-muted hover:bg-hover hover:text-fg",
             )}
           >
             {c.label}
-            <span className="tabular-nums">{c.count}</span>
+            <span className="tabular-nums opacity-80">{c.count}</span>
           </button>
         );
       })}

@@ -84,7 +84,7 @@ export function PhaseTimelineStrip({
               aria-label={ariaLabel}
               title={phase.label}
               onClick={() => onSelectPhase?.(phase.kind)}
-              className="oc-phase-pill"
+              className="oc-phase-crumb"
             >
               <Icon size={11} strokeWidth={2} aria-hidden className="oc-phase-pill-icon" />
               <span>{phase.shortLabel}</span>
@@ -120,21 +120,9 @@ export function PhaseTimelineFilterBar({
 
   return (
     <div data-testid="phase-filter-bar" className="oc-phase-filter-bar">
-      <div className="oc-phase-filter-top">
-        <span data-testid="phase-summary-text" className="oc-phase-summary-text" title={timeline.summaryText}>
-          {timeline.summaryText}
-        </span>
-        {selectedPhase !== null ? (
-          <button
-            type="button"
-            data-testid="phase-filter-reset"
-            onClick={() => onSelectPhase(null)}
-            className="oc-phase-reset"
-          >
-            显示全部
-          </button>
-        ) : null}
-      </div>
+      <span data-testid="phase-summary-text" className="sr-only">
+        {timeline.summaryText}
+      </span>
       <div role="group" aria-label="按阶段筛选步骤" className="oc-phase-filter-pills">
         <button
           type="button"
@@ -171,6 +159,16 @@ export function PhaseTimelineFilterBar({
           );
         })}
       </div>
+      {selectedPhase !== null ? (
+        <button
+          type="button"
+          data-testid="phase-filter-reset"
+          onClick={() => onSelectPhase(null)}
+          className="oc-phase-reset"
+        >
+          显示全部
+        </button>
+      ) : null}
     </div>
   );
 }

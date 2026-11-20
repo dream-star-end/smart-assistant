@@ -15,7 +15,7 @@ import {
 } from "./liveActivity";
 import "./liveActivity.css";
 
-const DEFAULT_VISIBLE_LIMIT = 4;
+const DEFAULT_VISIBLE_LIMIT = 3;
 
 export type LiveActivityStripProps = {
   summary: LiveActivitySummary;
@@ -138,9 +138,6 @@ export function LiveActivityStrip({
                 {bucketIndicator(item.bucket)}
                 <span className="oc-live-strip-item-text">
                   <span className="oc-live-strip-item-title">{title}</span>
-                  {item.projectName && (
-                    <span className="oc-live-strip-item-project">{item.projectName}</span>
-                  )}
                 </span>
                 <span data-bucket={item.bucket} className="oc-live-strip-item-tag">
                   {statusLabel}
@@ -206,6 +203,7 @@ export function SidebarLiveActivityStrip({
       sessionNeedsYou,
       unreadIds,
       swarmSessionIds,
+      includeUnread: false,
     });
   }, [
     sessions,

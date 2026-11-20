@@ -86,7 +86,7 @@ describe("LiveActivityStrip", () => {
     expect(onSelect).toHaveBeenLastCalledWith("s-done");
   });
 
-  it("支持收起/展开列表，且超出 4 条时提供展开全部开关", () => {
+  it("支持收起/展开列表，且超出 3 条时提供展开全部开关", () => {
     const sessions = Array.from({ length: 6 }, (_, i) =>
       makeSession({
         id: `run-${i}`,
@@ -98,7 +98,7 @@ describe("LiveActivityStrip", () => {
     const summary = collectLiveActivity({ sessions });
     render(<LiveActivityStrip summary={summary} onSelect={vi.fn()} />);
 
-    expect(screen.getByTestId("live-strip-list").querySelectorAll("[data-live-session-id]")).toHaveLength(4);
+    expect(screen.getByTestId("live-strip-list").querySelectorAll("[data-live-session-id]")).toHaveLength(3);
     fireEvent.click(screen.getByTestId("live-strip-show-more"));
     expect(screen.getByTestId("live-strip-list").querySelectorAll("[data-live-session-id]")).toHaveLength(6);
 
@@ -108,12 +108,15 @@ describe("LiveActivityStrip", () => {
     expect(screen.getByTestId("live-strip-filter-running")).toBeInTheDocument();
   });
 
-  it("接入 Sidebar 后：无活态项零占位；有活态项可直达；搜索时自动让位隐藏", async () => {
+  it("接入 Sidebar 后：仅历史未读不触发活态区；有运行/待拍板可直达；搜索时自动让位隐藏", async () => {
     const onSelect = vi.fn();
-    const idleSessions = [makeSession({ id: "s-idle", title: "普通历史会话" })];
+    const idleSessions = [
+      makeSession({ id: "s-idle", title: "普通历史会话", lastOutcome: "completed", unread: true }),
+    ];
     const { rerender } = render(
       <Sidebar
         sessions={idleSessions}
+        unreadIds={new Set(["s-idle"])}
         user={USER}
         onSelect={onSelect}
         onNew={vi.fn()}

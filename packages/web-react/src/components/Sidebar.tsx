@@ -504,7 +504,6 @@ export function Sidebar({
     if (runningIds.size > 0 || (swarmSessionIds?.size ?? 0) > 0) return true;
     for (const s of activeSessions) {
       if (sessionNeedsYou?.(s.id)) return true;
-      if (unreadIds ? unreadIds.has(s.id) : Boolean(s.unread)) return true;
     }
     return false;
   }, [
@@ -515,7 +514,6 @@ export function Sidebar({
     swarmSessionIds,
     activeSessions,
     sessionNeedsYou,
-    unreadIds,
     socketVersion,
   ]);
 

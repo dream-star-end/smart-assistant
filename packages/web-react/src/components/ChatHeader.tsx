@@ -282,7 +282,7 @@ export function ChatHeader({
           data-product-control="project-breadcrumb"
           onClick={onOpenProjectScope}
           aria-label={`所在项目：${projectBreadcrumb.chatName}，点击打开项目`}
-          className="inline-flex min-h-11 min-w-0 max-w-[7rem] shrink items-center gap-1 rounded-full px-2 text-caption text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:min-h-0 sm:max-w-[13rem] sm:py-1"
+          className="inline-flex min-h-11 min-w-0 max-w-[5.25rem] shrink items-center gap-1 rounded-full px-1.5 text-caption text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:min-h-0 sm:max-w-[13rem] sm:px-2 sm:py-1"
           title={`所在项目：${projectBreadcrumb.chatName}`}
         >
           <FolderOpen size={12.5} aria-hidden className="shrink-0" />
@@ -471,7 +471,7 @@ export function ChatHeader({
                 aria-label="会话内查找"
                 title={`会话内查找 (${modKeyLabel()}F)`}
                 shape="square"
-                className="text-faint hover:text-fg"
+                className="hidden text-faint hover:text-fg sm:flex"
               >
                 <Search size={17} />
               </IconButton>
@@ -488,8 +488,8 @@ export function ChatHeader({
                 <Share2 size={17} />
               </IconButton>
             )}
-            {/* 窄屏没有位置放独立分享键:并入「更多」菜单承接,功能按视口降级而不是消失(C-12)。 */}
-            {onShare && (
+            {/* 窄屏将查找与分享并入「更多操作」菜单，释放顶栏宽度让智能体名完整展示（C-12）。 */}
+            {(onShare || onOpenFind) && (
               <div className="sm:hidden">
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
@@ -504,10 +504,18 @@ export function ChatHeader({
                     </IconButton>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
-                    <DropdownMenuItem data-product-control onSelect={onShare}>
-                      <Share2 size={16} className="shrink-0 text-muted" />
-                      <span className="flex-1">分享</span>
-                    </DropdownMenuItem>
+                    {onOpenFind && (
+                      <DropdownMenuItem data-product-control onSelect={onOpenFind}>
+                        <Search size={16} className="shrink-0 text-muted" />
+                        <span className="flex-1">会话内查找</span>
+                      </DropdownMenuItem>
+                    )}
+                    {onShare && (
+                      <DropdownMenuItem data-product-control onSelect={onShare}>
+                        <Share2 size={16} className="shrink-0 text-muted" />
+                        <span className="flex-1">分享</span>
+                      </DropdownMenuItem>
+                    )}
                   </DropdownMenuContent>
                 </DropdownMenu>
               </div>

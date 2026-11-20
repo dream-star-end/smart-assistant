@@ -83,6 +83,8 @@ export type CollectLiveActivityInput = {
   sessionNeedsYou?: (id: string) => SessionNeedsYouKind | null | undefined;
   unreadIds?: ReadonlySet<string>;
   swarmSessionIds?: ReadonlySet<string>;
+  /** 是否纳入「刚完成未读」桶；侧栏活态区传 false，避免历史未读列表刷屏挤占侧栏。 */
+  includeUnread?: boolean;
 };
 
 function compareNeedsYouItems(a: LiveActivityItem, b: LiveActivityItem): number {
@@ -150,6 +152,8 @@ export function collectLiveActivity(input: CollectLiveActivityInput): LiveActivi
       });
       continue;
     }
+
+    if (input.includeUnread === false) continue;
 
     const unread = input.unreadIds !== undefined ? input.unreadIds.has(s.id) : Boolean(s.unread);
     if (!unread) continue;

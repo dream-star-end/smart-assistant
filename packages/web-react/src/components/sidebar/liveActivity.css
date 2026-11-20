@@ -1,23 +1,17 @@
-/* 工作台活态指挥区（Sidebar Live Strip）样式：只消费 styles.css 的设计 token。 */
+/* 工作台活态指挥区（Sidebar Live Strip）：与「从简」侧栏融为一体的无框轻巧分区。 */
 
 .oc-live-strip {
-  margin: 0.25rem 0.5rem 0.375rem;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
-  background: var(--surface);
-  box-shadow: var(--sidebar-btn-shadow);
-  overflow: hidden;
-}
-
-.oc-live-strip[data-has-attention="true"] {
-  border-color: color-mix(in srgb, var(--warning) 34%, var(--border));
+  margin: 0.25rem 0.5rem 0.25rem;
+  padding: 0.25rem 0 0.375rem;
+  border-top: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
 }
 
 .oc-live-strip-head {
   display: flex;
   align-items: center;
   gap: 0.25rem;
-  padding: 0.3125rem 0.375rem;
+  padding: 0 0.25rem 0.1875rem;
 }
 
 .oc-live-strip-pills {
@@ -38,20 +32,18 @@
   display: inline-flex;
   align-items: center;
   gap: 0.3125rem;
-  min-height: 1.5rem;
-  padding: 0.125rem 0.4375rem;
-  border-radius: var(--radius-full);
-  border: 1px solid transparent;
+  height: 1.5rem;
+  padding: 0 0.4375rem;
+  border-radius: var(--radius-xs);
+  border: 0;
   background: transparent;
   color: var(--muted);
   font-size: var(--text-caption);
   font-weight: 500;
-  line-height: 1.3;
+  line-height: 1;
   white-space: nowrap;
   cursor: pointer;
-  transition: background-color 150ms var(--ease-standard),
-    border-color 150ms var(--ease-standard),
-    color 150ms var(--ease-standard);
+  transition: background-color 150ms var(--ease-standard), color 150ms var(--ease-standard);
 }
 
 .oc-live-strip-pill:hover {
@@ -65,35 +57,34 @@
 }
 
 .oc-live-strip-pill[data-bucket="needs_you"] {
-  background: var(--warning-soft);
   color: var(--warning);
 }
 
 .oc-live-strip-pill[data-bucket="needs_you"][aria-pressed="true"] {
-  border-color: color-mix(in srgb, var(--warning) 48%, transparent);
+  background: var(--warning-soft);
 }
 
 .oc-live-strip-pill[data-bucket="running"] {
-  background: var(--accent-soft);
   color: var(--accent);
 }
 
 .oc-live-strip-pill[data-bucket="running"][aria-pressed="true"] {
-  border-color: color-mix(in srgb, var(--accent) 48%, transparent);
+  background: var(--accent-soft);
 }
 
 .oc-live-strip-pill[data-bucket="unread_done"] {
-  background: var(--success-soft);
-  color: var(--success);
+  color: var(--muted);
 }
 
 .oc-live-strip-pill[data-bucket="unread_done"][aria-pressed="true"] {
-  border-color: color-mix(in srgb, var(--success) 48%, transparent);
+  background: var(--hover);
+  color: var(--fg);
 }
 
 .oc-live-strip-pill-count {
   font-variant-numeric: tabular-nums;
   font-weight: 600;
+  opacity: 0.85;
 }
 
 .oc-live-strip-toggle {
@@ -124,22 +115,19 @@
 .oc-live-strip-list {
   display: flex;
   flex-direction: column;
-  gap: 0.125rem;
-  padding: 0 0.25rem 0.25rem;
-  border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
-  padding-top: 0.25rem;
+  gap: 0.0625rem;
 }
 
 .oc-live-strip-item {
   display: flex;
   align-items: center;
-  gap: 0.4375rem;
+  gap: 0.5rem;
   width: 100%;
   min-width: 0;
-  min-height: 1.875rem;
-  padding: 0.25rem 0.4375rem;
+  height: 2rem;
+  padding: 0 0.5rem;
   border: 0;
-  border-radius: var(--radius-xs);
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--fg);
   font-size: var(--text-meta);
@@ -166,8 +154,7 @@
   display: flex;
   flex: 1 1 auto;
   min-width: 0;
-  flex-direction: column;
-  gap: 0.0625rem;
+  align-items: center;
 }
 
 .oc-live-strip-item-title {
@@ -178,47 +165,30 @@
   line-height: 1.3;
 }
 
-.oc-live-strip-item-project {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--faint);
-  font-size: var(--text-caption);
-  line-height: 1.25;
-}
-
 .oc-live-strip-item-tag {
   flex-shrink: 0;
-  padding: 0.0625rem 0.375rem;
-  border-radius: var(--radius-full);
   font-size: var(--text-caption);
   font-weight: 500;
-  line-height: 1.35;
+  line-height: 1;
   white-space: nowrap;
+  color: var(--faint);
 }
 
 .oc-live-strip-item-tag[data-bucket="needs_you"] {
-  background: var(--warning-soft);
   color: var(--warning);
 }
 
 .oc-live-strip-item-tag[data-bucket="running"] {
-  background: var(--accent-soft);
   color: var(--accent);
-}
-
-.oc-live-strip-item-tag[data-bucket="unread_done"] {
-  background: var(--success-soft);
-  color: var(--success);
 }
 
 .oc-live-strip-more {
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 0.25rem;
+  justify-content: flex-start;
   width: 100%;
-  min-height: 1.625rem;
+  height: 1.75rem;
+  padding: 0 0.5rem;
   border: 0;
   border-radius: var(--radius-xs);
   background: transparent;
@@ -241,21 +211,21 @@
 
 @media (hover: none), (max-width: 767px) {
   .oc-live-strip-pill {
-    min-height: 2.75rem;
-    padding: 0.25rem 0.625rem;
+    height: 1.875rem;
+    padding: 0 0.5rem;
   }
 
   .oc-live-strip-toggle {
-    min-width: 2.75rem;
-    min-height: 2.75rem;
+    width: 2rem;
+    height: 2rem;
   }
 
   .oc-live-strip-item {
-    min-height: 2.75rem;
-    padding: 0.375rem 0.5rem;
+    height: 2.375rem;
+    padding: 0 0.5rem;
   }
 
   .oc-live-strip-more {
-    min-height: 2.75rem;
+    height: 2rem;
   }
 }
