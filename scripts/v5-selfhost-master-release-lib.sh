@@ -2282,19 +2282,19 @@ resolve_worktree_unit_backup() {
 # 后续(installed WD=live):只写 forensics 快照,不覆盖 worktree-current;
 # dest_var 返回已有的工作树备份,供二级回滚使用。
 backup_installed_units_for_cutover() { # <out-var>
-  local dest_var="$1" ts dest wd_m wd_e tmp_link wt
+  local dest_var="$1" ts dest wd_m wd_e tmp_link wt sysdir="${V5_SYSTEMD_DIR:-/etc/systemd/system}"
   [[ "$dest_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
   ts="$(date -u +%Y%m%d-%H%M%S)" || return 1
   dest="${BREAKGLASS_ROOT}/unit-backups/pre-cutover-${ts}"
   mkdir -p -- "$dest" || return 1
-  cp -a -- "/etc/systemd/system/${V5_UNIT}" "$dest/" || return 1
-  cp -a -- "/etc/systemd/system/${V5_EGRESS_UNIT}" "$dest/" || return 1
+  cp -a -- "${sysdir}/${V5_UNIT}" "$dest/" || return 1
+  cp -a -- "${sysdir}/${V5_EGRESS_UNIT}" "$dest/" || return 1
   # 双槽 egress 模板(已装才备;forensics 用,恢复脚本不依赖它们)。
   local sf
   for sf in "${V5_EGRESS_SLOT_SOCKET_TPL:-openclaude-v5-selfhost-egress@.socket}" \
             "${V5_EGRESS_SLOT_SERVICE_TPL:-openclaude-v5-selfhost-egress@.service}"; do
-    if [[ -f "/etc/systemd/system/$sf" ]]; then
-      cp -a -- "/etc/systemd/system/$sf" "$dest/" || return 1
+    if [[ -f "${sysdir}/$sf" ]]; then
+      cp -a -- "${sysdir}/$sf" "$dest/" || return 1
     fi
   done
   if [[ -n "${UNIT_DIR:-}" && -f "${UNIT_DIR}/${V5_UNIT}" ]]; then
@@ -2310,7 +2310,7 @@ backup_installed_units_for_cutover() { # <out-var>
   grep -q '^ExecStart=' "$dest/${V5_UNIT}" || return 1
   grep -q '^ExecStart=' "$dest/${V5_EGRESS_UNIT}" || return 1
   printf 'backup=%s\ninstalled_master=%s\ninstalled_egress=%s\nwd_master=%s\nwd_egress=%s\n' \
-    "$dest" "/etc/systemd/system/${V5_UNIT}" "/etc/systemd/system/${V5_EGRESS_UNIT}" \
+    "$dest" "${sysdir}/${V5_UNIT}" "${sysdir}/${V5_EGRESS_UNIT}" \
     "$wd_m" "$wd_e" \
     >"$dest/MANIFEST.txt" || return 1
   fsync_path "$dest/${V5_UNIT}" || return 1
@@ -2334,7 +2334,15 @@ backup_installed_units_for_cutover() { # <out-var>
   if [[ "$wd_m" == "$MASTER_LIVE_LINK" && "$wd_e" == "$MASTER_LIVE_LINK" ]]; then
     # 二级补偿/幸存者必须用「本次切流前」这份 forensics。禁止再把 dest_var
     # 指回陈旧 worktree-current(2026-08-29 11:21 用 Aug18 工作树 unit 拉倒 18790)。
-    mlog "  当前 unit 已是 live WD;forensics=$dest (本次切流备份,不改 worktree-current)"
+    # OCV5-818: 同步原子发布独立指针 live-current 供 watch 自动 tier2 默认消费,不改动 worktree-current。
+    tmp_link="${BREAKGLASS_ROOT}/unit-backups/live-current.new.$$"
+    ln -sfn -- "$dest" "$tmp_link" || return 1
+    mv -Tf -- "$tmp_link" "${BREAKGLASS_ROOT}/unit-backups/live-current" || {
+      rm -f -- "$tmp_link"
+      return 1
+    }
+    fsync_path "${BREAKGLASS_ROOT}/unit-backups" || true
+    mlog "  当前 unit 已是 live WD;forensics=$dest (本次切流备份,不改 worktree-current; 已更新 live-current)"
     printf -v "$dest_var" '%s' "$dest"
     return 0
   fi
