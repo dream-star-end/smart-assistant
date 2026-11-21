@@ -44,7 +44,8 @@ before(async () => {
       agent_container_id bigint DEFAULT NULL);
     CREATE TABLE client_session_live_streams(stream_key text PRIMARY KEY,session_id text,user_id text,
       client_message_id text,projection_source text,provenance jsonb DEFAULT '{}',
-      latest_turn_status_json jsonb,latest_turn_usage_json jsonb,created_at timestamptz DEFAULT now());
+      latest_turn_status_json jsonb,latest_turn_usage_json jsonb,
+      latest_turn_status_seq bigint,latest_turn_usage_seq bigint,created_at timestamptz DEFAULT now());
     CREATE TABLE client_session_live_frames(record_id bigserial PRIMARY KEY,stream_key text,frame_seq bigint,
       source text DEFAULT 'gateway',payload bytea,payload_sha256 text DEFAULT repeat('a',64),created_at timestamptz DEFAULT now());
     CREATE TABLE usage_records(user_id bigint,dispatch_id uuid,attempt_no int,created_at timestamptz,turn_key text,parent_turn_key text);

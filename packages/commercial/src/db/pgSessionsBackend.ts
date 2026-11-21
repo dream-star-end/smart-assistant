@@ -275,13 +275,10 @@ import {
 import {
   computeSessionLastPreviewRaw,
   computeSupersededApiErrorFlags,
-  evaluateTimelinePartialFastPath,
   parseHotTimelineMessages,
   precomputedTapePayloadBytesSql,
   precomputedTapeVisibleBytesSql,
-  serializeLastDispatchSummary,
   summarizeHotTimelineMessages,
-  updateSessionLastDispatchSummaryInTx,
   type PreloadedTimelineSession,
 } from "./pgTimelinePerf.js";
 import {
@@ -691,21 +688,13 @@ async function pgUnreadBySessionIds(
   const rows = (
     await pool.query<{ id: string; unread: boolean }>(
       `SELECT cs.id,
-              CASE WHEN cs.last_dispatch_summary IS NOT NULL
-                   THEN (
-                     (cs.last_dispatch_summary->>'outcome') IN (${UNREAD_OUTCOME_SQL})
-                     AND COALESCE((cs.last_dispatch_summary->>'terminalAtMs')::bigint, 0) > ${LAST_READ_AT_MS_SQL}
-                   )
-                   ELSE (
-                     last_d.outcome IN (${UNREAD_OUTCOME_SQL})
-                     AND ${LAST_D_TERMINAL_MS_SQL} > ${LAST_READ_AT_MS_SQL}
-                   ) END AS unread
+              (last_d.outcome IN (${UNREAD_OUTCOME_SQL})
+               AND ${LAST_D_TERMINAL_MS_SQL} > ${LAST_READ_AT_MS_SQL}) AS unread
          FROM client_sessions cs
          LEFT JOIN LATERAL (
            SELECT outcome, terminal_at
              FROM turn_dispatches
-            WHERE cs.last_dispatch_summary IS NULL
-              AND user_id = $2
+            WHERE user_id = $2
               AND session_id = cs.id
               AND status = 'terminal'
             ORDER BY terminal_at DESC NULLS LAST, admitted_at DESC, dispatch_id DESC
@@ -999,7 +988,6 @@ export async function advanceClientTimelineIdentityInTransaction(
     `UPDATE client_sessions
         SET history_revision = history_revision + 1,
             timeline_generation = timeline_generation + 1,
-            last_dispatch_summary = NULL,
             updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
     [sessionId, userId],
@@ -1260,8 +1248,10 @@ async function attachAdmissionRestartSnapshot(client: PoolClient, sessionId: str
     if (!deferred) throw new Error("admission snapshot payload conflict");
     messages[index] = { ...deferred, _seq: hot._seq, _orderSeq: hot._orderSeq };
   }
-  await client.query('UPDATE client_sessions SET messages=$3 WHERE id=$1 AND user_id=$2',
-    [sessionId, userId, escapeNulInSessionMessagesJson(JSON.stringify(messages))]);
+  await client.query(
+    "UPDATE client_sessions SET messages=$3, last_preview=$4 WHERE id=$1 AND user_id=$2",
+    [sessionId, userId, escapeNulInSessionMessagesJson(JSON.stringify(messages)), computeSessionLastPreviewRaw(messages)],
+  );
 }
 
 async function pgAppendServerAuthoredCore(
@@ -1327,16 +1317,13 @@ async function pgAppendServerAuthoredCore(
   const historyRevisionDelta =
     hasInvisibleMessageRemoval(msgs, tail) || archivedDelta > 0 ? 1 : 0;
 
-  const lastPreview = computeSessionLastPreviewRaw(tail);
-  const clearDispatchSummary = message.role === "user";
   const upd = await client.query(
     `UPDATE client_sessions
        SET messages = $1, message_count = $2, last_at = $3,
            updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
            next_seq = $4, archived_through_seq = $5, archived_count = $6,
            history_revision = history_revision + $9,
-           last_preview = $10,
-           last_dispatch_summary = CASE WHEN $11::boolean THEN NULL ELSE last_dispatch_summary END
+           last_preview = $10
      WHERE id = $7 AND user_id = $8 AND deleted_at IS NULL`,
     [
       escapeNulInSessionMessagesJson(plan.finalJson),
@@ -1348,8 +1335,7 @@ async function pgAppendServerAuthoredCore(
       sessId,
       userId,
       historyRevisionDelta,
-      lastPreview,
-      clearDispatchSummary,
+      computeSessionLastPreviewRaw(tail),
     ],
   );
   if (upd.rowCount !== 1) {
@@ -1766,13 +1752,6 @@ async function convergeDispatchOnFinalize(
       conflictReason: "late_tape_after_fence",
       fromStatuses: ["admitted", "accepted", "rejecting", "terminal"],
     });
-    if (held) {
-      await updateSessionLastDispatchSummaryInTx(client, {
-        sessionId: held.sessionId,
-        userId: `c:${held.userId.toString()}`,
-        summaryJson: null,
-      });
-    }
     return { lateTape: held !== null, removedVisibleStatus: false };
   }
   const converged = await casToTerminal(client, {
@@ -1781,18 +1760,7 @@ async function convergeDispatchOnFinalize(
     failureCode: nextFailureCode,
     fromStatuses: ["admitted", "accepted", "rejecting"],
   });
-  if (converged !== null) {
-    await updateSessionLastDispatchSummaryInTx(client, {
-      sessionId: converged.sessionId,
-      userId: `c:${converged.userId.toString()}`,
-      summaryJson: serializeLastDispatchSummary({
-        outcome: converged.outcome,
-        failureCode: converged.failureCode,
-        terminalAtMs: converged.terminalAt?.getTime() ?? Date.now(),
-      }),
-    });
-    return { lateTape: false, removedVisibleStatus: false };
-  }
+  if (converged !== null) return { lateTape: false, removedVisibleStatus: false };
   const d = await getDispatch(client, dispatchId);
   if (
     d && d.status === "terminal" && d.outcome === "executed_error" &&
@@ -1803,29 +1771,15 @@ async function convergeDispatchOnFinalize(
     // finalize is the stronger authority. Replace only that exact sentinel;
     // other executed_error outcomes remain immutable and reviewable.
     // completed 才允许清 failure_code;真崩溃必须写下真实码,不许残留 SERVICE_RESTART。
-    const replaced = (
-      await client.query<{ terminal_at: Date | null }>(
-        `UPDATE turn_dispatches
-            SET outcome=$2, failure_code=$3, client_notified=FALSE,
-                terminal_at=clock_timestamp()
-          WHERE dispatch_id=$1 AND status='terminal'
-            AND outcome='executed_error'
-            AND failure_code IN ('RESULT_RECOVERY_PENDING','SERVICE_RESTART')
-          RETURNING terminal_at`,
-        [dispatchId, outcome, nextFailureCode],
-      )
-    ).rows[0];
-    if (replaced) {
-      await updateSessionLastDispatchSummaryInTx(client, {
-        sessionId: d.sessionId,
-        userId: `c:${d.userId.toString()}`,
-        summaryJson: serializeLastDispatchSummary({
-          outcome,
-          failureCode: nextFailureCode ?? null,
-          terminalAtMs: replaced.terminal_at?.getTime() ?? Date.now(),
-        }),
-      });
-    }
+    await client.query(
+      `UPDATE turn_dispatches
+          SET outcome=$2, failure_code=$3, client_notified=FALSE,
+              terminal_at=clock_timestamp()
+        WHERE dispatch_id=$1 AND status='terminal'
+          AND outcome='executed_error'
+          AND failure_code IN ('RESULT_RECOVERY_PENDING','SERVICE_RESTART')`,
+      [dispatchId, outcome, nextFailureCode],
+    );
     return { lateTape: false, removedVisibleStatus: d.clientNotified };
   }
   if (d && d.status === "terminal" && d.outcome === "not_accepted") {
@@ -1834,13 +1788,6 @@ async function convergeDispatchOnFinalize(
       conflictReason: "late_tape",
       fromStatuses: ["terminal"],
     });
-    if (held) {
-      await updateSessionLastDispatchSummaryInTx(client, {
-        sessionId: held.sessionId,
-        userId: `c:${held.userId.toString()}`,
-        summaryJson: null,
-      });
-    }
     return {
       lateTape: held !== null,
       removedVisibleStatus: held !== null && d.clientNotified,
@@ -11663,19 +11610,13 @@ export function createPgSessionsBackend(
                           LIMIT 1
                        ) END AS last_preview_raw,
                   CASE WHEN open_d.session_id IS NOT NULL THEN 'running' ELSE 'idle' END AS run_state,
-                  COALESCE(cs.last_dispatch_summary->>'outcome', last_d.outcome) AS last_outcome,
-                  CASE WHEN cs.last_dispatch_summary IS NOT NULL
-                       THEN cs.last_dispatch_summary->>'failureCode'
-                       ELSE last_d.failure_code END AS last_error_code,
-                  CASE WHEN cs.last_dispatch_summary IS NOT NULL
-                       THEN (
-                         (cs.last_dispatch_summary->>'outcome') IN (${UNREAD_OUTCOME_SQL})
-                         AND COALESCE((cs.last_dispatch_summary->>'terminalAtMs')::bigint, 0) > ${LAST_READ_AT_MS_SQL}
-                       )
-                       ELSE (
-                         last_d.outcome IN (${UNREAD_OUTCOME_SQL})
-                         AND ${LAST_D_TERMINAL_MS_SQL} > ${LAST_READ_AT_MS_SQL}
-                       ) END AS unread
+                  last_d.outcome AS last_outcome,
+                  last_d.failure_code AS last_error_code,
+                  COALESCE(
+                    last_d.outcome IN (${UNREAD_OUTCOME_SQL})
+                      AND ${LAST_D_TERMINAL_MS_SQL} > ${LAST_READ_AT_MS_SQL},
+                    FALSE
+                  ) AS unread
              FROM client_sessions cs
              LEFT JOIN (
                SELECT session_id FROM turn_dispatches
@@ -11686,8 +11627,7 @@ export function createPgSessionsBackend(
              LEFT JOIN LATERAL (
                SELECT outcome, failure_code, terminal_at
                  FROM turn_dispatches
-                WHERE cs.last_dispatch_summary IS NULL
-                  AND user_id = $2
+                WHERE user_id = $2
                   AND session_id = cs.id
                   AND status = 'terminal'
                 ORDER BY terminal_at DESC NULLS LAST, admitted_at DESC, dispatch_id DESC
@@ -11932,43 +11872,14 @@ export function createPgSessionsBackend(
         const archivedThroughSeq = bigIntNumOr(row.archived_through_seq, 0);
 
         if (options.view === "timeline") {
-          const historyRevision = bigIntNum(row.history_revision, "history_revision");
-          const timelineGeneration = bigIntNum(row.timeline_generation, "timeline_generation");
-          const parsedHot = parseHotTimelineMessages(row.messages, archivedThroughSeq, row.id);
-          const sinceTimelineGeneration = (options as ClientSessionReadOptions & { sinceTimelineGeneration?: number }).sinceTimelineGeneration;
-          const fast = evaluateTimelinePartialFastPath({
-            sinceSeq,
-            sinceHistoryRevision: options.sinceHistoryRevision,
-            sinceTimelineGeneration,
-            historyRevision,
-            timelineGeneration,
-            snapshotMaxSeq: parsedHot.snapshotMaxSeq,
-            anyMissingSeq: parsedHot.anyMissingSeq,
-            hotCount: parsedHot.hot.length,
-          });
-          if (fast.hit) {
-            return {
-              id: row.id, userId: row.user_id, agentId: row.agent_id, title: row.title,
-              pinned: row.pinned === 1,
-              createdAt: bigIntNum(row.created_at, "created_at"),
-              lastAt: bigIntNum(row.last_at, "last_at"),
-              messages: [],
-              updatedAt: bigIntNum(row.updated_at, "updated_at"),
-              historyRevision,
-              ...(snapshotClient ? await readAutomaticRecoveriesForSession(snapshotClient, row.id, row.user_id) : {}),
-              ...(row.model_id ? { modelId: row.model_id } : {}),
-              totalMessageCount: fast.hotCount + archivedCount,
-              maxSeq: fast.snapshotMaxSeq,
-              isPartial: true,
-              archivedCount,
-              archivedThroughSeq,
-              ...(await readOpenDispatchForSession(queryable, row.id, row.user_id)),
-              ...(await readPermissionPromptsForSession(queryable, row.id, row.user_id, options.permissionLookupIds)),
-            };
-          }
+          // OCV5-824 B3: keep full timeline pagination fields (timelineGeneration /
+          // timelineCursor / timelineHasMore / timelineSnapshotMaxSeq) with
+          // isPartial:false so web-react never treats an empty partial delta as
+          // an unpaginated full replacement, while passing the already-loaded
+          // row into readClientTimelinePageImpl to avoid the duplicate SELECT
+          // and duplicate JSON.parse.
           const page = await readClientTimelinePageImpl(
-            pool, row.id, row.user_id, null, 100, snapshotClient,
-            { ...row, parsedHotMessages: parsedHot.hot },
+            pool, row.id, row.user_id, null, 100, snapshotClient, row,
           );
           if (!page) return null;
           return {
@@ -12269,8 +12180,8 @@ export function createPgSessionsBackend(
       const deleted = await withTx(pool, async (client): Promise<boolean> => {
         // updated_at 逻辑版本推进(软删也让并发 stale PUT 因版本落后被拒)。deleted_at 仍是删除权威。
         const sql = userId
-          ? `UPDATE client_sessions SET deleted_at = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}), messages = '[]', message_count = 0, last_preview = '', last_dispatch_summary = NULL WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL`
-          : `UPDATE client_sessions SET deleted_at = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}), messages = '[]', message_count = 0, last_preview = '', last_dispatch_summary = NULL WHERE id = $2 AND deleted_at IS NULL`;
+          ? `UPDATE client_sessions SET deleted_at = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}), messages = '[]', message_count = 0, last_preview = '' WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL`
+          : `UPDATE client_sessions SET deleted_at = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}), messages = '[]', message_count = 0, last_preview = '' WHERE id = $2 AND deleted_at IS NULL`;
         const result = userId
           ? await client.query(sql, [now, id, userId])
           : await client.query(sql, [now, id]);
@@ -12649,7 +12560,7 @@ export function createPgSessionsBackend(
               `UPDATE client_sessions
                   SET deleted_at = ${CLOCK_MS_SQL},
                       updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
-                      messages = '[]', message_count = 0, last_preview = '', last_dispatch_summary = NULL
+                      messages = '[]', message_count = 0, last_preview = ''
                 WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
               [id, userId],
             );

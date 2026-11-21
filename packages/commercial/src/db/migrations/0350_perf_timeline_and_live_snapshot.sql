@@ -1,9 +1,12 @@
 -- order-dependency: 0349_user_site_collaborators
--- compat: purely additive nullable columns and indexes on existing tables;
---   pre-0350 binaries ignore them and rollback drops them without data loss.
---   OCV5-824: cure GET /api/sessions/:id TOAST/EXISTS slow query, sidebar
---   listClientSessions JSON expansion & full-table window scan, WS hello
---   unbounded BYTEA fact scan, and retired live_frames maintenance pruning.
+-- compat: purely additive nullable columns and single-table preview-invalidation
+--   trigger in a short bounded-lock transaction (NO index builds here; indexes
+--   live in 0351_perf_timeline_and_live_snapshot_indexes.sql with -- no-transaction
+--   and CREATE INDEX CONCURRENTLY). Pre-0350 binaries ignore the new columns and
+--   the BEFORE UPDATE OF messages trigger auto-invalidates last_preview whenever
+--   any legacy or external writer modifies client_sessions.messages.
+
+SET LOCAL lock_timeout = '5s';
 
 -- 1. Tape record precomputed byte sizes & superseded API-error flag
 --    (NULL on legacy rows -> read path seamlessly falls back to octet_length / EXISTS).
@@ -12,28 +15,39 @@ ALTER TABLE client_session_turn_tape_records
   ADD COLUMN IF NOT EXISTS visible_payload_bytes INTEGER,
   ADD COLUMN IF NOT EXISTS is_superseded_api_error BOOLEAN;
 
--- 2. Sidebar preview & latest terminal dispatch summary cache on client_sessions
---    (NULL on legacy rows -> listClientSessions safely falls back to SQL JSON/LATERAL).
+-- 2. Sidebar preview cache on client_sessions
+--    (NULL on legacy rows or external message writers -> listClientSessions safely
+--    falls back to SQL JSON extraction).
 ALTER TABLE client_sessions
-  ADD COLUMN IF NOT EXISTS last_preview TEXT,
-  ADD COLUMN IF NOT EXISTS last_dispatch_summary JSONB;
+  ADD COLUMN IF NOT EXISTS last_preview TEXT;
 
--- 3. O(1) latest turn_status / turn_usage pointer columns on client_session_live_streams
---    (NULL on legacy streams -> sessionSnapshot safely falls back to bounded BYTEA scan).
+CREATE OR REPLACE FUNCTION trg_client_sessions_invalidate_last_preview()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.messages IS DISTINCT FROM OLD.messages
+     AND NEW.last_preview IS NOT DISTINCT FROM OLD.last_preview THEN
+    NEW.last_preview := NULL;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_client_sessions_invalidate_last_preview ON client_sessions;
+CREATE TRIGGER trg_client_sessions_invalidate_last_preview
+  BEFORE UPDATE OF messages ON client_sessions
+  FOR EACH ROW
+  EXECUTE FUNCTION trg_client_sessions_invalidate_last_preview();
+
+-- 3. O(1) latest turn_status / turn_usage pointer & sequence tracking columns on
+--    client_session_live_streams:
+--      seq IS NULL  => legacy un-tracked stream (fall back to bounded record_id scan)
+--      seq = 0      => tracked stream with no fact of this kind yet (O(1) skip scan)
+--      seq > 0      => latest fact frame_seq; if *_json IS NULL (e.g. NUL/surrogate
+--                      payload not representable in JSONB), fetch exact frame_seq row.
 ALTER TABLE client_session_live_streams
   ADD COLUMN IF NOT EXISTS latest_turn_status_json JSONB,
-  ADD COLUMN IF NOT EXISTS latest_turn_usage_json JSONB;
-
--- 4. Partial indexes to eliminate full-table scans on turn_dispatches (listClientSessions
---    LATERAL fallback & WS hello batch aggregation) and retired live_streams pruning.
-CREATE INDEX IF NOT EXISTS idx_turn_dispatches_user_session_terminal
-  ON turn_dispatches (user_id, session_id, terminal_at DESC NULLS LAST, admitted_at DESC, dispatch_id DESC)
-  WHERE status = 'terminal';
-
-CREATE INDEX IF NOT EXISTS idx_turn_dispatches_user_session_open
-  ON turn_dispatches (user_id, session_id, admitted_at DESC, dispatch_id DESC)
-  WHERE status IN ('admitted', 'accepted', 'rejecting');
-
-CREATE INDEX IF NOT EXISTS idx_live_streams_retired_updated
-  ON client_session_live_streams (updated_at)
-  WHERE provenance ? 'retired_at' AND source = 'gateway';
+  ADD COLUMN IF NOT EXISTS latest_turn_usage_json JSONB,
+  ADD COLUMN IF NOT EXISTS latest_turn_status_seq BIGINT,
+  ADD COLUMN IF NOT EXISTS latest_turn_usage_seq BIGINT;

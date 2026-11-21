@@ -1,14 +1,14 @@
 -- Rollback for 0350_perf_timeline_and_live_snapshot.sql (OCV5-824)
-DROP INDEX IF EXISTS idx_live_streams_retired_updated;
-DROP INDEX IF EXISTS idx_turn_dispatches_user_session_open;
-DROP INDEX IF EXISTS idx_turn_dispatches_user_session_terminal;
+DROP TRIGGER IF EXISTS trg_client_sessions_invalidate_last_preview ON client_sessions;
+DROP FUNCTION IF EXISTS trg_client_sessions_invalidate_last_preview();
 
 ALTER TABLE client_session_live_streams
+  DROP COLUMN IF EXISTS latest_turn_usage_seq,
+  DROP COLUMN IF EXISTS latest_turn_status_seq,
   DROP COLUMN IF EXISTS latest_turn_usage_json,
   DROP COLUMN IF EXISTS latest_turn_status_json;
 
 ALTER TABLE client_sessions
-  DROP COLUMN IF EXISTS last_dispatch_summary,
   DROP COLUMN IF EXISTS last_preview;
 
 ALTER TABLE client_session_turn_tape_records

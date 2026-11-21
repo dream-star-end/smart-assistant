@@ -83,7 +83,13 @@ export interface LiveFrameMaintenanceOptions {
   pruneRetiredFn?: (
     pool: Pool,
     options?: { olderThanDays?: number; batchSize?: number; maxBatches?: number },
-  ) => Promise<{ deletedFrames: number; prunedStreams: number; deletedStreams: number }>;
+  ) => Promise<{
+    deletedFrames: number;
+    prunedStreams: number;
+    deletedStreams: number;
+    retainedStreams?: number;
+    skippedInvalidRetiredAt?: number;
+  }>;
 }
 
 const EMPTY_COUNTS: LiveFrameMaintenanceCounts = {

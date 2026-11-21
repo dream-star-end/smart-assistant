@@ -4,28 +4,102 @@ import type { Pool } from 'pg'
 import { WebSocket } from 'ws'
 import { sendHelloSessionSnapshots } from '../ws/helloOpenDispatchSnapshot.js'
 
-test('hello snapshot read failure warns safely and continues to the next session', async () => {
+test('hello snapshot transient batch failure warns safely and delivers ALL peers including index 0 (B8)', async () => {
   let connections = 0
   let releases = 0
   const error = Object.assign(new Error('postgres://secret:password@database/private'), { code: '08006' })
   const pool = {
     async connect() {
       if (++connections === 1) throw error
-      return { query: async () => ({ rows: [] }), release: () => { releases++ } }
+      return {
+        async query(sql: string) {
+          if (sql.includes('session-snapshot-owner')) return { rows: [{ as_of: '1000' }] }
+          return { rows: [] }
+        },
+        release: () => { releases++ },
+      }
     },
   } as unknown as Pool
   const warnings: unknown[] = []
-  await sendHelloSessionSnapshots(pool, { readyState: WebSocket.OPEN, bufferedAmount: 0, send() {} },
-    '3', [{ peerId: 'failed-session' }, { peerId: 'next-session' }], {
-      info() {}, warn: (message, fields) => warnings.push({ message, fields }),
-    }, 'conn-123')
+  const sent: Array<{ peer: { id: string } }> = []
+  await sendHelloSessionSnapshots(pool, {
+    readyState: WebSocket.OPEN,
+    bufferedAmount: 0,
+    send: (raw) => { sent.push(JSON.parse(String(raw))) },
+  }, '3', [{ peerId: 'peer-a' }, { peerId: 'peer-b' }], {
+    info() {}, warn: (message, fields) => warnings.push({ message, fields }),
+  }, 'conn-123')
   assert.deepEqual(warnings, [{
     message: 'hello_session_snapshot_failed',
-    fields: { uid: '3', sessionId: 'failed-session', connId: 'conn-123', errorName: 'Error', errorCode: '08006' },
+    fields: { uid: '3', sessionId: 'peer-a', connId: 'conn-123', errorName: 'Error', errorCode: '08006' },
   }])
-  assert.equal(connections, 2)
-  assert.equal(releases, 1)
+  assert.deepEqual(sent.map((f) => f.peer.id), ['peer-a', 'peer-b'], 'both peer-a and peer-b must be delivered exactly once')
+  assert.equal(connections, 3)
+  assert.equal(releases, 2)
   assert.doesNotMatch(JSON.stringify(warnings), /postgres|secret|password/)
+})
+
+test('mid-send WS error after batch read logs safely and NEVER re-delivers already-sent peers (B8)', async () => {
+  let connects = 0
+  const pool = {
+    async connect() {
+      connects += 1
+      return {
+        async query(sql: string, params?: unknown[]) {
+          if (sql.includes('session-snapshot-batch-owner')) {
+            const ids = (params?.[1] as string[]) ?? []
+            return { rows: ids.map((id) => ({ session_id: id, as_of: '1000' })) }
+          }
+          return { rows: [] }
+        },
+        release() {},
+      }
+    },
+  } as unknown as Pool
+  const sent: string[] = []
+  const warnings: Array<{ sessionId: string }> = []
+  await sendHelloSessionSnapshots(
+    pool,
+    {
+      readyState: WebSocket.OPEN,
+      bufferedAmount: 0,
+      send(raw: unknown) {
+        const frame = JSON.parse(String(raw)) as { peer: { id: string } }
+        if (frame.peer.id === 'peer-b') throw new Error('ws_write_error')
+        sent.push(frame.peer.id)
+      },
+    },
+    '3',
+    [{ peerId: 'peer-a' }, { peerId: 'peer-b' }, { peerId: 'peer-c' }],
+    { info() {}, warn: (_m, fields) => warnings.push({ sessionId: String(fields.sessionId) }) },
+    'conn-send',
+  )
+  assert.equal(connects, 1, 'mid-send error must NOT fall back to DB re-reads')
+  assert.deepEqual(sent, ['peer-a', 'peer-c'], 'peer-a must NOT be re-delivered; peer-c still delivered')
+  assert.deepEqual(warnings, [{ sessionId: 'peer-b' }])
+})
+
+test('persistent DB failure stops fallback at consecutive-failure cap (3) without storming all peers (B8)', async () => {
+  let connects = 0
+  const pool = {
+    async connect() {
+      connects += 1
+      throw Object.assign(new Error('db_down'), { code: '57P01' })
+    },
+  } as unknown as Pool
+  const warnings: unknown[] = []
+  const peers = Array.from({ length: 8 }, (_, i) => ({ peerId: `p-${i + 1}` }))
+  await sendHelloSessionSnapshots(
+    pool,
+    { readyState: WebSocket.OPEN, bufferedAmount: 0, send() {} },
+    '3',
+    peers,
+    { info() {}, warn: (_m, fields) => warnings.push(fields) },
+    'conn-outage',
+  )
+  // 1 batch attempt + 3 fallback attempts = 4 total connects
+  assert.equal(connects, 4)
+  assert.equal(warnings.length, 4)
 })
 
 test('hello snapshot logging omits unsafe error names and codes', async () => {

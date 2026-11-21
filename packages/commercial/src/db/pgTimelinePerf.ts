@@ -1,4 +1,3 @@
-import type { PoolClient } from "pg";
 import {
   deriveOrderSeqsForRead,
   LAST_MESSAGE_PREVIEW_TAIL_MAX,
@@ -67,9 +66,35 @@ export function computeSupersededApiErrorFlags(
 const LAST_PREVIEW_RAW_MAX_CHARS = 240;
 
 /**
+ * Strip PostgreSQL UTF-8 TEXT-illegal NUL (U+0000) and unpaired UTF-16
+ * surrogates from a derived sidebar preview string so a derived preview column
+ * can NEVER fail an authoritative message write transaction with SQLSTATE 22021
+ * (OCV5-824 B4). Matches `toPlainSessionText`, which strips U+0000 as well.
+ */
+export function sanitizePgTextForPreview(raw: string): string {
+  let out = "";
+  for (let i = 0; i < raw.length; i += 1) {
+    const code = raw.charCodeAt(i);
+    if (code === 0) continue;
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = raw.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        out += raw[i]! + raw[i + 1]!;
+        i += 1;
+      }
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) continue;
+    out += raw[i]!;
+  }
+  return out;
+}
+
+/**
  * Precompute `client_sessions.last_preview` matching the SQL semantics of
  * `listClientSessions`: scan at most the trailing `tailMax` messages newest
- * first, take the first non-empty trimmed `.text`, and cap to 240 chars.
+ * first, take the first non-empty trimmed `.text` (sanitized to PG-safe UTF-8
+ * without NUL/unpaired surrogates), and cap to 240 chars.
  *
  * Returns `""` (empty string, NOT null) when computed with no non-empty text so
  * `listClientSessions` short-circuits `cs.last_preview IS NOT NULL` instead of
@@ -85,56 +110,14 @@ export function computeSessionLastPreviewRaw(
     if (!msg || typeof msg !== "object") continue;
     const text = (msg as { text?: unknown }).text;
     if (typeof text !== "string") continue;
-    const trimmed = text.trim();
-    if (trimmed.length > 0) {
-      return trimmed.length > LAST_PREVIEW_RAW_MAX_CHARS
-        ? trimmed.slice(0, LAST_PREVIEW_RAW_MAX_CHARS)
-        : trimmed;
+    const sanitized = sanitizePgTextForPreview(text).trim();
+    if (sanitized.length > 0) {
+      return sanitized.length > LAST_PREVIEW_RAW_MAX_CHARS
+        ? sanitized.slice(0, LAST_PREVIEW_RAW_MAX_CHARS)
+        : sanitized;
     }
   }
   return "";
-}
-
-export interface LastDispatchSummaryPayload {
-  outcome: string;
-  failureCode: string | null;
-  terminalAtMs: number;
-}
-
-export function serializeLastDispatchSummary(input: {
-  outcome: string | null;
-  failureCode: string | null;
-  terminalAtMs: number | null;
-}): string | null {
-  if (!input.outcome || !Number.isFinite(input.terminalAtMs)) return null;
-  const payload: LastDispatchSummaryPayload = {
-    outcome: input.outcome,
-    failureCode: input.failureCode ?? null,
-    terminalAtMs: Math.floor(input.terminalAtMs!),
-  };
-  return JSON.stringify(payload);
-}
-
-/**
- * Maintain `client_sessions.last_dispatch_summary` inside the caller's
- * transaction. Pass `summaryJson = null` to invalidate the cache (e.g. when a
- * dispatch downgrades to `manual_reconcile`), causing `listClientSessions` to
- * fall back to the indexed LATERAL lookup.
- */
-export async function updateSessionLastDispatchSummaryInTx(
-  client: Pick<PoolClient, "query">,
-  input: {
-    sessionId: string;
-    userId: string;
-    summaryJson: string | null;
-  },
-): Promise<void> {
-  await client.query(
-    `UPDATE client_sessions
-        SET last_dispatch_summary = $3::jsonb
-      WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
-    [input.sessionId, input.userId, input.summaryJson],
-  );
 }
 
 /**
@@ -197,64 +180,4 @@ export function summarizeHotTimelineMessages(
   }
   if (snapshotMaxSeq === 0) snapshotMaxSeq = archivedThroughSeq;
   return { hot, snapshotMaxSeq, anyMissingSeq };
-}
-
-export type TimelinePartialFastPathResult =
-  | { hit: true; snapshotMaxSeq: number; hotCount: number }
-  | {
-      hit: false;
-      reason:
-        | "invalid_since"
-        | "missing_seq"
-        | "revision_mismatch"
-        | "generation_mismatch"
-        | "newer_messages"
-        | "cursor_ahead";
-    };
-
-/**
- * Decide whether `getClientSessionPartial(..., { view: "timeline" })` can
- * safely fast-return an empty incremental delta (`isPartial: true, messages: []`)
- * without re-hydrating turn tapes.
- *
- * Strictly fail-closed: any version jump, timelineGeneration mismatch, missing
- * legacy `_seq`, newer messages (`sinceSeq < snapshotMaxSeq`), or out-of-order
- * cursor (`sinceSeq > snapshotMaxSeq`) falls back to a full unified page.
- */
-export function evaluateTimelinePartialFastPath(input: {
-  sinceSeq: number;
-  sinceHistoryRevision?: number;
-  sinceTimelineGeneration?: number;
-  historyRevision: number;
-  timelineGeneration: number;
-  snapshotMaxSeq: number;
-  anyMissingSeq: boolean;
-  hotCount: number;
-}): TimelinePartialFastPathResult {
-  if (!Number.isSafeInteger(input.sinceSeq) || input.sinceSeq <= 0) {
-    return { hit: false, reason: "invalid_since" };
-  }
-  if (input.anyMissingSeq) {
-    return { hit: false, reason: "missing_seq" };
-  }
-  if (
-    !Number.isSafeInteger(input.sinceHistoryRevision) ||
-    input.sinceHistoryRevision !== input.historyRevision
-  ) {
-    return { hit: false, reason: "revision_mismatch" };
-  }
-  if (
-    input.sinceTimelineGeneration !== undefined &&
-    (!Number.isSafeInteger(input.sinceTimelineGeneration) ||
-      input.sinceTimelineGeneration !== input.timelineGeneration)
-  ) {
-    return { hit: false, reason: "generation_mismatch" };
-  }
-  if (input.sinceSeq > input.snapshotMaxSeq) {
-    return { hit: false, reason: "cursor_ahead" };
-  }
-  if (input.sinceSeq < input.snapshotMaxSeq) {
-    return { hit: false, reason: "newer_messages" };
-  }
-  return { hit: true, snapshotMaxSeq: input.snapshotMaxSeq, hotCount: input.hotCount };
 }

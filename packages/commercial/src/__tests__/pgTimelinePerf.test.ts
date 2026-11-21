@@ -1,8 +1,9 @@
 /**
- * OCV5-824: Timeline perf helpers, GET /api/sessions/:id single-read & true
- * incremental ?since=, sidebar listClientSessions short-circuit, sessionSnapshot
- * O(1) pointers / bounded fallback / batch single-tx sequential execution, and
- * migration 0350 contract (all PG-free mock/unit tests).
+ * OCV5-824: Timeline perf helpers, GET /api/sessions/:id single-read, sidebar
+ * listClientSessions last_preview + indexed LATERAL, sessionSnapshot O(1)
+ * 3-state seq pointers / scanned-row-bounded legacy fallback / batch single-tx
+ * sequential execution & B6 permission quota safety, and 0350/0351 migration
+ * contract (all PG-free mock/unit tests).
  *
  * Run: npx tsx --test packages/commercial/src/__tests__/pgTimelinePerf.test.ts
  */
@@ -16,14 +17,14 @@ import { createPgSessionsBackend } from "../db/pgSessionsBackend.js";
 import {
   computeSessionLastPreviewRaw,
   computeSupersededApiErrorFlags,
-  evaluateTimelinePartialFastPath,
   precomputedTapePayloadBytesSql,
-  serializeLastDispatchSummary,
+  sanitizePgTextForPreview,
 } from "../db/pgTimelinePerf.js";
 import {
   buildSessionSnapshot,
   readSessionSnapshotsBatch,
   SESSION_SNAPSHOT_FACTS_MAX_PAGES,
+  SESSION_SNAPSHOT_FACTS_SCAN_WINDOW,
 } from "../db/sessionSnapshot.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -64,7 +65,7 @@ describe("pgTimelinePerf pure helpers (OCV5-824)", () => {
     assert.deepEqual(terminalFail, [false, true, false]);
   });
 
-  test("computeSessionLastPreviewRaw matches SQL tail semantics and distinguishes '' from NULL", () => {
+  test("computeSessionLastPreviewRaw matches SQL tail semantics, strips NUL/lone surrogates (B4), and distinguishes '' from NULL", () => {
     assert.equal(computeSessionLastPreviewRaw([]), "");
     assert.equal(computeSessionLastPreviewRaw([{ role: "assistant", text: "   " }]), "");
     assert.equal(
@@ -82,100 +83,20 @@ describe("pgTimelinePerf pure helpers (OCV5-824)", () => {
       ...Array.from({ length: 20 }, () => ({ role: "assistant", text: "" })),
     ];
     assert.equal(computeSessionLastPreviewRaw(olderPlus20Empty), "");
-  });
 
-  test("evaluateTimelinePartialFastPath enforces strict revision/generation/seq safety", () => {
-    assert.deepEqual(
-      evaluateTimelinePartialFastPath({
-        sinceSeq: 12,
-        sinceHistoryRevision: 5,
-        sinceTimelineGeneration: 2,
-        historyRevision: 5,
-        timelineGeneration: 2,
-        snapshotMaxSeq: 12,
-        anyMissingSeq: false,
-        hotCount: 10,
-      }),
-      { hit: true, snapshotMaxSeq: 12, hotCount: 10 },
+    // B4: NUL and unpaired UTF-16 surrogates are stripped while preserving valid emoji surrogate pairs.
+    assert.equal(sanitizePgTextForPreview("a\u0000b\ud800c\udfffd🚀"), "abcd🚀");
+    assert.equal(
+      computeSessionLastPreviewRaw([{ role: "user", text: "hello\u0000world\ud800!" }]),
+      "helloworld!",
     );
-
-    // Revision jump -> fallback full
-    assert.deepEqual(
-      evaluateTimelinePartialFastPath({
-        sinceSeq: 12,
-        sinceHistoryRevision: 4,
-        historyRevision: 5,
-        timelineGeneration: 2,
-        snapshotMaxSeq: 12,
-        anyMissingSeq: false,
-        hotCount: 10,
-      }),
-      { hit: false, reason: "revision_mismatch" },
-    );
-
-    // Timeline generation mismatch -> fallback full
-    assert.deepEqual(
-      evaluateTimelinePartialFastPath({
-        sinceSeq: 12,
-        sinceHistoryRevision: 5,
-        sinceTimelineGeneration: 1,
-        historyRevision: 5,
-        timelineGeneration: 2,
-        snapshotMaxSeq: 12,
-        anyMissingSeq: false,
-        hotCount: 10,
-      }),
-      { hit: false, reason: "generation_mismatch" },
-    );
-
-    // Newer messages exist -> fallback full
-    assert.deepEqual(
-      evaluateTimelinePartialFastPath({
-        sinceSeq: 10,
-        sinceHistoryRevision: 5,
-        historyRevision: 5,
-        timelineGeneration: 2,
-        snapshotMaxSeq: 12,
-        anyMissingSeq: false,
-        hotCount: 10,
-      }),
-      { hit: false, reason: "newer_messages" },
-    );
-
-    // Out-of-order cursor ahead of server -> fallback full
-    assert.deepEqual(
-      evaluateTimelinePartialFastPath({
-        sinceSeq: 15,
-        sinceHistoryRevision: 5,
-        historyRevision: 5,
-        timelineGeneration: 2,
-        snapshotMaxSeq: 12,
-        anyMissingSeq: false,
-        hotCount: 10,
-      }),
-      { hit: false, reason: "cursor_ahead" },
-    );
-
-    // Legacy row missing _seq -> fallback full
-    assert.deepEqual(
-      evaluateTimelinePartialFastPath({
-        sinceSeq: 12,
-        sinceHistoryRevision: 5,
-        historyRevision: 5,
-        timelineGeneration: 2,
-        snapshotMaxSeq: 12,
-        anyMissingSeq: true,
-        hotCount: 10,
-      }),
-      { hit: false, reason: "missing_seq" },
-    );
-  });
-
-  test("serializeLastDispatchSummary produces compact JSON or null", () => {
-    assert.equal(serializeLastDispatchSummary({ outcome: null, failureCode: null, terminalAtMs: 1000 }), null);
-    assert.deepEqual(
-      JSON.parse(serializeLastDispatchSummary({ outcome: "completed", failureCode: null, terminalAtMs: 1700000000123.9 })!),
-      { outcome: "completed", failureCode: null, terminalAtMs: 1700000000123 },
+    // Only NUL bytes -> falls back to earlier non-empty message.
+    assert.equal(
+      computeSessionLastPreviewRaw([
+        { role: "user", text: "fallback ok" },
+        { role: "assistant", text: "\u0000\u0000   " },
+      ]),
+      "fallback ok",
     );
     assert.match(precomputedTapePayloadBytesSql("r"), /COALESCE\(r\.visible_payload_bytes/);
   });
@@ -231,68 +152,33 @@ describe("pgSessionsBackend timeline & sidebar perf paths (mock PG)", () => {
     assert.equal(clientSessionSelects.length, 1, "must not re-SELECT client_sessions inside readClientTimelinePageImpl");
   });
 
-  test("getClientSessionPartial(view='timeline') fast-returns empty delta isPartial:true on unchanged revision+seq and falls back safely on mismatch", async () => {
+  test("getClientSessionPartial(view='timeline') preserves full timeline pagination contract (B3) with single client_sessions SELECT", async () => {
     const hot = [
-      {
-        id: "u1", role: "user", text: "q", ts: 1000, _seq: 1,
-      },
+      { id: "u1", role: "user", text: "q", ts: 1000, _seq: 1 },
       {
         id: "t1", role: "assistant", text: "a", ts: 1001, _seq: 2,
         _turnTapeComplete: true, _turnTapeId: "tape-1", _turnTapeSha256: "a".repeat(64),
       },
     ];
-    // Fast-path hit: sinceSeq === 2, sinceHistoryRevision === 3
-    {
-      const { pool, sqlCalls } = makeMockPool(hot, { historyRevision: 3, timelineGeneration: 2 });
-      const backend = createPgSessionsBackend(pool, { expectedGeneration: 1 });
-      const res = await backend.getClientSessionPartial("sess-perf-1", "c:7", 2, {
-        view: "timeline",
-        sinceHistoryRevision: 3,
-      });
-      assert.ok(res);
-      assert.equal(res.isPartial, true);
-      assert.deepEqual(res.messages, []);
-      assert.equal(res.maxSeq, 2);
-      assert.equal(res.historyRevision, 3);
-      // Must NOT emit timelineGeneration/timelineCursor on empty partial delta (preserves client pagination cursor).
-      assert.equal(res.timelineGeneration, undefined);
-      assert.equal(res.timelineCursor, undefined);
-      // Zero tape queries executed!
-      assert.equal(sqlCalls.some((s) => s.includes("client_session_turn_tapes")), false);
-      assert.equal(sqlCalls.some((s) => s.includes("client_session_turn_tape_records")), false);
-    }
-
-    // Revision mismatch -> safe fallback to full page (isPartial: false), still only 1 client_sessions SELECT!
-    {
-      const { pool, sqlCalls } = makeMockPool(hot, { historyRevision: 4, timelineGeneration: 2 });
-      const backend = createPgSessionsBackend(pool, { expectedGeneration: 1 });
-      const res = await backend.getClientSessionPartial("sess-perf-1", "c:7", 2, {
-        view: "timeline",
-        sinceHistoryRevision: 3,
-      });
-      assert.ok(res);
-      assert.equal(res.isPartial, false);
-      assert.equal(res.historyRevision, 4);
-      assert.equal(res.timelineGeneration, 2);
-      const clientSessionSelects = sqlCalls.filter((s) => /FROM client_sessions\b/.test(s));
-      assert.equal(clientSessionSelects.length, 1);
-      assert.equal(sqlCalls.some((s) => s.includes("is_superseded_api_error")), true);
-    }
-
-    // Out-of-order cursor ahead (sinceSeq > snapshotMaxSeq) -> safe fallback to full page
-    {
-      const { pool } = makeMockPool(hot, { historyRevision: 3, timelineGeneration: 2 });
-      const backend = createPgSessionsBackend(pool, { expectedGeneration: 1 });
-      const res = await backend.getClientSessionPartial("sess-perf-1", "c:7", 99, {
-        view: "timeline",
-        sinceHistoryRevision: 3,
-      });
-      assert.ok(res);
-      assert.equal(res.isPartial, false);
-    }
+    const { pool, sqlCalls } = makeMockPool(hot, { historyRevision: 3, timelineGeneration: 2 });
+    const backend = createPgSessionsBackend(pool, { expectedGeneration: 1 });
+    const res = await backend.getClientSessionPartial("sess-perf-1", "c:7", 2, {
+      view: "timeline",
+      sinceHistoryRevision: 3,
+    });
+    assert.ok(res);
+    // B3: Must NEVER emit isPartial:true with messages:[] on view='timeline' (web-react treats timeline partial responses without pagination as unpaginated full replacement).
+    assert.equal(res.isPartial, false);
+    assert.equal(res.historyRevision, 3);
+    assert.equal(res.timelineGeneration, 2);
+    assert.equal(res.timelineHasMore, false);
+    assert.equal(res.timelineSnapshotMaxSeq, 2);
+    const clientSessionSelects = sqlCalls.filter((s) => /FROM client_sessions\b/.test(s));
+    assert.equal(clientSessionSelects.length, 1, "still avoids duplicate SELECT on client_sessions");
+    assert.equal(sqlCalls.some((s) => s.includes("is_superseded_api_error")), true);
   });
 
-  test("listClientSessions uses precomputed last_preview / last_dispatch_summary with LATERAL fallback", async () => {
+  test("listClientSessions uses precomputed last_preview with authoritative indexed LATERAL (B7)", async () => {
     let listSql = "";
     const pool = {
       async query(sql: string) {
@@ -326,14 +212,14 @@ describe("pgSessionsBackend timeline & sidebar perf paths (mock PG)", () => {
     assert.equal(out.sessions[0]?.lastOutcome, "completed");
     assert.equal(out.sessions[0]?.unread, true);
     assert.match(listSql, /WHEN cs\.last_preview IS NOT NULL THEN cs\.last_preview/);
-    assert.match(listSql, /cs\.last_dispatch_summary/);
+    assert.equal(listSql.includes("last_dispatch_summary"), false, "B7: authoritative LATERAL replaces unmaintained summary cache");
     assert.match(listSql, /LEFT JOIN LATERAL/);
     assert.equal(listSql.includes("ROW_NUMBER() OVER"), false, "full-table ROW_NUMBER window scan removed");
   });
 });
 
-describe("sessionSnapshot O(1) pointers, bounded fallback & single-tx batch (mock PG)", () => {
-  test("O(1) pointer columns skip session-snapshot-facts BYTEA scan and omit recovery SAVEPOINT", async () => {
+describe("sessionSnapshot O(1) 3-state pointers, bounded fallback & single-tx batch (mock PG)", () => {
+  test("tracked stream with seq=0 (no status/usage emitted) skips BYTEA scan completely (B5)", async () => {
     const sqls: string[] = [];
     const client = {
       async query(sql: string) {
@@ -359,9 +245,11 @@ describe("sessionSnapshot O(1) pointers, bounded fallback & single-tx batch (moc
             rows: [{
               projection_source: "live",
               provenance: {},
-              latest_turn_status_json: { frameSeq: 10, type: "outbound.turn_status", status: "working", detail: "tool" },
-              latest_turn_usage_json: { frameSeq: 9, usage: { totalTokens: 55, inputTokens: 30, outputTokens: 25 } },
-              frame_seq: "10",
+              latest_turn_status_json: null,
+              latest_turn_usage_json: null,
+              latest_turn_status_seq: "0",
+              latest_turn_usage_seq: "0",
+              frame_seq: "4096",
               created_at: new Date(4000),
             }],
           };
@@ -373,18 +261,77 @@ describe("sessionSnapshot O(1) pointers, bounded fallback & single-tx batch (moc
       },
     } as unknown as PoolClient;
 
-    const snap = await buildSessionSnapshot(client, "3", "s-1");
+    const snap = await buildSessionSnapshot(client, "3", "s-no-facts");
     assert.ok(snap);
-    assert.equal(snap.turnStatus?.status, "working");
-    assert.equal(snap.turnStatus?.detail, "tool");
-    assert.equal(snap.usage?.frameSeq, 9);
-    assert.equal(snap.usage?.usage.totalTokens, 55);
-    assert.equal(sqls.some((s) => s.includes("session-snapshot-facts")), false, "must skip BYTEA scan");
-    assert.equal(sqls.some((s) => s.includes("SAVEPOINT session_snapshot_recovery")), false, "no recovery SAVEPOINT");
+    assert.equal(snap.usage, null);
+    assert.equal(sqls.some((s) => s.includes("session-snapshot-facts")), false, "seq=0 must skip BYTEA scan");
+    assert.equal(sqls.some((s) => s.includes("session-snapshot-fact-by-seq")), false, "seq=0 must skip exact-seq fetch");
   });
 
-  test("legacy NULL pointer fallback caps BYTEA fact scan at SESSION_SNAPSHOT_FACTS_MAX_PAGES", async () => {
+  test("tracked stream with seq>0 + NULL json (non-JSONB payload) fetches exact frame_seq without stale pointer (B5)", async () => {
+    const sqls: string[] = [];
+    let exactParams: unknown[] = [];
+    const client = {
+      async query(sql: string, params?: unknown[]) {
+        sqls.push(sql);
+        if (sql.includes("session-snapshot-owner")) return { rows: [{ as_of: "5000" }] };
+        if (sql.includes("session-snapshot-dispatch")) {
+          return {
+            rows: [{
+              dispatch_id: "00000000-0000-4000-8000-000000000001",
+              client_message_id: "cm-1",
+              agent_id: "main",
+              status: "accepted",
+              outcome: null,
+              attempt_no: 1,
+              admitted_at: new Date(1000),
+              accepted_at: new Date(2000),
+              terminal_at: null,
+            }],
+          };
+        }
+        if (sql.includes("session-snapshot-watermark")) {
+          return {
+            rows: [{
+              projection_source: "live",
+              provenance: {},
+              latest_turn_status_json: null,
+              latest_turn_usage_json: { frameSeq: 9, usage: { totalTokens: 55, inputTokens: 30, outputTokens: 25 } },
+              latest_turn_status_seq: "12",
+              latest_turn_usage_seq: "9",
+              frame_seq: "12",
+              created_at: new Date(4000),
+            }],
+          };
+        }
+        if (sql.includes("session-snapshot-fact-by-seq")) {
+          exactParams = params ?? [];
+          return {
+            rows: [{
+              frame_seq: "12",
+              payload: Buffer.from(JSON.stringify({ type: "outbound.turn_status", status: "retrying", detail: "err\u0000x" })),
+            }],
+          };
+        }
+        if (sql.includes("open-dispatch-engine-ready")) {
+          return { rows: [{ payload: Buffer.from('{"type":"outbound.message"}') }] };
+        }
+        return { rows: [] };
+      },
+    } as unknown as PoolClient;
+
+    const snap = await buildSessionSnapshot(client, "3", "s-exact");
+    assert.ok(snap);
+    assert.equal(snap.turnStatus?.status, "retrying");
+    assert.equal(snap.turnStatus?.detail, "err\u0000x");
+    assert.equal(snap.usage?.frameSeq, 9);
+    assert.deepEqual(exactParams[1], [12]);
+    assert.equal(sqls.some((s) => s.includes("session-snapshot-facts")), false, "exact-seq avoids legacy scan");
+  });
+
+  test("legacy NULL-seq fallback caps scanned rows via MATERIALIZED record_id window at SESSION_SNAPSHOT_FACTS_MAX_PAGES", async () => {
     let factPages = 0;
+    let factSql = "";
     const client = {
       async query(sql: string) {
         if (sql.includes("session-snapshot-owner")) return { rows: [{ as_of: "5000" }] };
@@ -410,6 +357,8 @@ describe("sessionSnapshot O(1) pointers, bounded fallback & single-tx batch (moc
               provenance: {},
               latest_turn_status_json: null,
               latest_turn_usage_json: null,
+              latest_turn_status_seq: null,
+              latest_turn_usage_seq: null,
               frame_seq: "99999",
               created_at: new Date(4000),
             }],
@@ -417,22 +366,27 @@ describe("sessionSnapshot O(1) pointers, bounded fallback & single-tx batch (moc
         }
         if (sql.includes("session-snapshot-facts")) {
           factPages += 1;
-          // Always return 64 false-positive rows (nested turn_usage) to try to trigger an unbounded loop.
+          factSql = sql;
+          // Sentinel row: full 256-row window scanned with 0 matching facts.
           return {
-            rows: Array.from({ length: 64 }, (_, i) => ({
-              record_id: String(10000 - factPages * 64 - i),
-              frame_seq: String(10000 - factPages * 64 - i),
-              payload: Buffer.from('{"type":"outbound.message","nested":{"type":"outbound.turn_usage"}}'),
-            })),
+            rows: [{
+              record_id: null,
+              frame_seq: null,
+              payload: null,
+              scanned_count: SESSION_SNAPSHOT_FACTS_SCAN_WINDOW,
+              min_record_id: String(100000 - factPages * SESSION_SNAPSHOT_FACTS_SCAN_WINDOW),
+            }],
           };
         }
         return { rows: [] };
       },
     } as unknown as PoolClient;
 
-    const snap = await buildSessionSnapshot(client, "3", "s-unbounded");
+    const snap = await buildSessionSnapshot(client, "3", "s-legacy-unbounded");
     assert.ok(snap);
     assert.equal(factPages, SESSION_SNAPSHOT_FACTS_MAX_PAGES, "fallback BYTEA scan must be strictly bounded");
+    assert.match(factSql, /WITH win AS MATERIALIZED/);
+    assert.match(factSql, /ORDER BY record_id DESC/);
   });
 
   test("readSessionSnapshotsBatch executes strictly sequentially in 1 tx and releases on error", async () => {
@@ -503,33 +457,63 @@ describe("sessionSnapshot O(1) pointers, bounded fallback & single-tx batch (moc
   });
 });
 
-describe("0350_perf_timeline_and_live_snapshot migration contract", () => {
-  test("migration, rollback, and release-metadata.json stay aligned", () => {
-    const mig = readFileSync(
+describe("0350 + 0351 migration split contract (B1)", () => {
+  test("0350 short DDL + trigger, 0351 -- no-transaction CONCURRENTLY indexes + preflight/postflight, rollbacks & metadata aligned", () => {
+    const mig350 = readFileSync(
       join(here, "../db/migrations/0350_perf_timeline_and_live_snapshot.sql"),
       "utf8",
     );
-    const rb = readFileSync(
+    const rb350 = readFileSync(
       join(here, "../db/rollbacks/0350_perf_timeline_and_live_snapshot.sql"),
+      "utf8",
+    );
+    const mig351 = readFileSync(
+      join(here, "../db/migrations/0351_perf_timeline_and_live_snapshot_indexes.sql"),
+      "utf8",
+    );
+    const rb351 = readFileSync(
+      join(here, "../db/rollbacks/0351_perf_timeline_and_live_snapshot_indexes.sql"),
       "utf8",
     );
     const meta = JSON.parse(
       readFileSync(join(here, "../../../../deploy/v5/release-metadata.json"), "utf8"),
     ) as { requiredMigrations: string[] };
 
-    assert.match(mig, /^-- order-dependency: 0349_user_site_collaborators/m);
+    assert.match(mig350, /^-- order-dependency: 0349_user_site_collaborators/m);
+    assert.match(mig350, /SET LOCAL lock_timeout = '5s';/);
+    const mig350NonComments = mig350.replace(/^--.*$/gm, "");
+    assert.equal(/\bCREATE\s+(?:UNIQUE\s+)?INDEX\b/i.test(mig350NonComments), false, "B1: 0350 must NOT execute CREATE INDEX");
+    assert.equal(mig350.includes("last_dispatch_summary"), false, "B7: dropped unmaintained summary column");
+    assert.match(mig350, /trg_client_sessions_invalidate_last_preview/);
+    assert.match(rb350, /trg_client_sessions_invalidate_last_preview/);
     for (const col of [
       "payload_bytes",
       "visible_payload_bytes",
       "is_superseded_api_error",
       "last_preview",
-      "last_dispatch_summary",
       "latest_turn_status_json",
       "latest_turn_usage_json",
+      "latest_turn_status_seq",
+      "latest_turn_usage_seq",
     ]) {
-      assert.ok(mig.includes(col), `migration missing ${col}`);
-      assert.ok(rb.includes(col), `rollback missing ${col}`);
+      assert.ok(mig350.includes(col), `0350 missing ${col}`);
+      assert.ok(rb350.includes(col), `0350 rollback missing ${col}`);
     }
+
+    assert.match(mig351, /^-- no-transaction/m);
+    assert.match(mig351, /^-- order-dependency: 0350_perf_timeline_and_live_snapshot/m);
+    assert.match(mig351, /NOT\s+i\.indisvalid|indisvalid\s*=\s*false/i, "B1: preflight must fail loud on INVALID indexes");
+    assert.match(mig351, /i\.indisvalid\b/i, "B1: postflight must verify VALID indexes");
+    for (const idx of [
+      "idx_turn_dispatches_user_session_terminal",
+      "idx_turn_dispatches_user_session_open",
+      "idx_live_streams_retired_updated",
+    ]) {
+      assert.ok(mig351.includes(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${idx}`), `0351 missing CONCURRENTLY ${idx}`);
+      assert.ok(rb351.includes(`DROP INDEX CONCURRENTLY IF EXISTS ${idx}`), `0351 rollback missing ${idx}`);
+    }
+
     assert.ok(meta.requiredMigrations.includes("0350_perf_timeline_and_live_snapshot"));
+    assert.ok(meta.requiredMigrations.includes("0351_perf_timeline_and_live_snapshot_indexes"));
   });
 });

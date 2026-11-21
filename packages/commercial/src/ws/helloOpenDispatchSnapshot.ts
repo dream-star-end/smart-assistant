@@ -197,30 +197,42 @@ export async function sendHelloSessionSnapshots(
     sessionId: agg.peerId,
     options: buildSnapshotOptions(agg, containerId).options,
   }))
+  let snapshots: Map<string, SessionSnapshot> | null = null
   try {
-    const snapshots = await readSessionSnapshotsBatch(pool, uid, targets, { containerId })
+    snapshots = await readSessionSnapshotsBatch(pool, uid, targets, { containerId })
+  } catch (error) {
+    // Log safely without leaking connection strings, then isolate per-session
+    // across ALL undelivered batch peers (starting at index 0) with a
+    // consecutive-failure cap to avoid connection storms on persistent outages.
+    logSnapshotFailure(log, uid, batchPeers[0]!.peerId, connId, error)
+  }
+
+  if (snapshots !== null) {
     for (const agg of batchPeers) {
       if (userWs.readyState !== WebSocket.OPEN || userWs.bufferedAmount > 4 * SESSION_SNAPSHOT_MAX_BYTES) break
       const snapshot = snapshots.get(agg.peerId)
       if (!snapshot) continue
-      emitSnapshot(userWs, uid, agg.peerId, snapshot, undefined, log)
-    }
-  } catch (error) {
-    // Log safely without leaking connection strings, then isolate per-session
-    // for remaining sessions with a small failure cap to avoid connection storms.
-    logSnapshotFailure(log, uid, batchPeers[0]!.peerId, connId, error)
-    let fallbackFailures = 0
-    for (const agg of batchPeers.slice(1)) {
-      if (userWs.readyState !== WebSocket.OPEN || userWs.bufferedAmount > 4 * SESSION_SNAPSHOT_MAX_BYTES) break
-      const { clientMessageId, options } = buildSnapshotOptions(agg, containerId)
       try {
-        const snapshot = await readSessionSnapshot(pool, uid, agg.peerId, options)
-        if (!snapshot || userWs.readyState !== WebSocket.OPEN) continue
-        emitSnapshot(userWs, uid, agg.peerId, snapshot, clientMessageId, log)
-      } catch (innerError) {
-        logSnapshotFailure(log, uid, agg.peerId, connId, innerError)
-        if (++fallbackFailures >= 3) break
+        emitSnapshot(userWs, uid, agg.peerId, snapshot, undefined, log)
+      } catch (sendError) {
+        logSnapshotFailure(log, uid, agg.peerId, connId, sendError)
       }
+    }
+    return
+  }
+
+  let consecutiveFailures = 0
+  for (const agg of batchPeers) {
+    if (userWs.readyState !== WebSocket.OPEN || userWs.bufferedAmount > 4 * SESSION_SNAPSHOT_MAX_BYTES) break
+    const { clientMessageId, options } = buildSnapshotOptions(agg, containerId)
+    try {
+      const snapshot = await readSessionSnapshot(pool, uid, agg.peerId, options)
+      consecutiveFailures = 0
+      if (!snapshot || userWs.readyState !== WebSocket.OPEN) continue
+      emitSnapshot(userWs, uid, agg.peerId, snapshot, clientMessageId, log)
+    } catch (innerError) {
+      logSnapshotFailure(log, uid, agg.peerId, connId, innerError)
+      if (++consecutiveFailures >= 3) break
     }
   }
 }
