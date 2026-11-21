@@ -9,6 +9,7 @@ import { mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolveGuardMode, type GuardMode } from './agentEfficiencyGuard.js'
+import { isActionPolicyEnabled } from './actionPolicyEngine.js'
 
 export type HookProtocol = 'ccb' | 'cursor'
 
@@ -26,8 +27,11 @@ export function resolveEfficiencyHookRunner(): string {
 export function resolveEfficiencyHookCommand(
   protocol: HookProtocol,
   mode: GuardMode = resolveGuardMode(),
+  actionPolicyEnabled: boolean = isActionPolicyEnabled(),
 ): string | null {
-  if (mode === 'off') return null
+  // Decouple action-policy enforcement from efficiency guard: only omit hook
+  // registration when BOTH efficiency guard AND action-policy are disabled.
+  if (mode === 'off' && !actionPolicyEnabled) return null
   return `${shellQuote(process.execPath)} ${shellQuote(resolveEfficiencyHookRunner())} --protocol=${protocol} --mode=${mode}`
 }
 
@@ -51,8 +55,9 @@ export function atomicWriteJsonFile(target: string, value: unknown, mode = 0o600
 
 export function buildCcbEfficiencySettings(
   mode: GuardMode = resolveGuardMode(),
+  actionPolicyEnabled: boolean = isActionPolicyEnabled(),
 ): Record<string, unknown> | null {
-  const command = resolveEfficiencyHookCommand('ccb', mode)
+  const command = resolveEfficiencyHookCommand('ccb', mode, actionPolicyEnabled)
   if (!command) return null
   return {
     hooks: {
@@ -68,8 +73,9 @@ export function buildCcbEfficiencySettings(
 
 export function buildCursorEfficiencyHooks(
   mode: GuardMode = resolveGuardMode(),
+  actionPolicyEnabled: boolean = isActionPolicyEnabled(),
 ): Record<string, unknown> | null {
-  const command = resolveEfficiencyHookCommand('cursor', mode)
+  const command = resolveEfficiencyHookCommand('cursor', mode, actionPolicyEnabled)
   if (!command) return null
   return {
     version: 1,

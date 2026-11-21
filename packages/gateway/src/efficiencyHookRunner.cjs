@@ -46,17 +46,38 @@ function allowPayload(protocol) {
   }
 }
 
-function isValidDecisionJson(protocol, text) {
+function normalizeDecisionObject(protocol, obj) {
+  if (!obj || typeof obj !== 'object') return null
+  if (protocol === 'cursor') {
+    if (obj.permission === 'allow' || obj.permission === 'deny') return obj
+    // Cursor cannot express interactive `ask`. Fail closed as `deny` with a clear
+    // human-approval-required message rather than treating `ask` as invalid_json -> allow.
+    if (obj.permission === 'ask') {
+      const base =
+        obj.user_message ||
+        obj.agent_message ||
+        '需要人工审批后执行（Cursor 不支持 ask，已 fail-closed 拦截）'
+      return {
+        ...obj,
+        permission: 'deny',
+        requiresHumanApproval: true,
+        agent_message: base,
+        user_message: base,
+      }
+    }
+    return null
+  }
+  const decision = obj.hookSpecificOutput && obj.hookSpecificOutput.permissionDecision
+  if (decision === 'allow' || decision === 'deny' || decision === 'ask') return obj
+  return null
+}
+
+function parseAndValidateDecision(protocol, text) {
   try {
     const obj = JSON.parse(String(text).replace(/^\uFEFF/, '').trim())
-    if (!obj || typeof obj !== 'object') return false
-    if (protocol === 'cursor') {
-      return obj.permission === 'allow' || obj.permission === 'deny'
-    }
-    const decision = obj.hookSpecificOutput && obj.hookSpecificOutput.permissionDecision
-    return decision === 'allow' || decision === 'deny' || decision === 'ask'
+    return normalizeDecisionObject(protocol, obj)
   } catch {
-    return false
+    return null
   }
 }
 
@@ -230,11 +251,12 @@ function main() {
       failOpen(protocol, 'empty_output')
       return
     }
-    if (!isValidDecisionJson(protocol, stdout)) {
+    const validated = parseAndValidateDecision(protocol, stdout)
+    if (!validated) {
       failOpen(protocol, 'invalid_json')
       return
     }
-    writeJsonAndExit(JSON.parse(String(stdout).replace(/^\uFEFF/, '').trim()))
+    writeJsonAndExit(validated)
   })
 }
 

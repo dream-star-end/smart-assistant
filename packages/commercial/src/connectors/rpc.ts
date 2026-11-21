@@ -55,7 +55,17 @@ import type { EngineHttpDeps } from './engine/driver.js'
 import { executeDeclarativeAction, loadContractForConnection } from './engine/execute.js'
 import { executeDeclarativeWrite, proposeDeclarativeWrite } from './engine/write.js'
 import { ConnectorError, toConnectorError } from './errors.js'
-import { beginExecute, finalizeExecute, proposeWrite, writeFinalizeStatus } from './ledger.js'
+import {
+  evaluateConnectorWritePolicy,
+  type ConnectorActionPolicyEvaluator,
+} from '../pendingDecisions/connectorActionPolicy.js'
+import {
+  beginExecute,
+  finalizeExecute,
+  getLedgerRow,
+  proposeWrite,
+  writeFinalizeStatus,
+} from './ledger.js'
 import type { DnsResolver } from './outboundPolicy.js'
 import type { ConnectorRedis } from './providers/feishu.js'
 import { GITHUB_VIRTUAL_CONNECTION_ID } from './providers/github.js'
@@ -274,6 +284,9 @@ export interface ConnectorsRpcDeps {
   limiter?: PerContainerLimiter
   now?: () => number
   log?: RpcLog
+  /** Optional 4-tier Action Policy evaluator or YAML path (defaults to ~/.openclaude/action-policy.yaml). */
+  actionPolicyEvaluator?: ConnectorActionPolicyEvaluator
+  actionPolicyPath?: string
   /** Non-declarative Plugin facade. Omitted in old tests/dev assembly = declarative aliases only. */
   pluginFacade?: Pick<
     PluginRuntimeFacade,
@@ -798,6 +811,26 @@ async function handleDeclarativeCall(
 
   if (body.confirmId) {
     const confirmId = body.confirmId
+    const ledgerRow = await getLedgerRow(confirmId, who.userId, pool)
+    if (ledgerRow && ledgerRow.connection_id === declRow.id) {
+      const policyCheck = await evaluateConnectorWritePolicy({
+        provider: ledgerRow.provider,
+        action: ledgerRow.action,
+        connectionId: declRow.id,
+        userId: who.userId,
+        evaluator: rt.deps.actionPolicyEvaluator,
+        policyPath: rt.deps.actionPolicyPath,
+      })
+      if (policyCheck.denied) {
+        throw new ConnectorError('OUTBOUND_BLOCKED', policyCheck.evaluation.reason)
+      }
+      if (policyCheck.blockPreapproval && ledgerRow.approval_source === 'account_preapproval') {
+        throw new ConnectorError(
+          'CONFIRMATION_NOT_APPROVED',
+          'Action policy requires explicit human approval instead of account preapproval',
+        )
+      }
+    }
     const r = await withConnectionSlot(`c:${declRow.id}`, () =>
       executeDeclarativeWrite(
         {
@@ -854,7 +887,19 @@ async function handleDeclarativeCall(
     return
   }
 
-  // write/send → 走确认门(propose)。
+  // write/send → 走动作权限策略 + 确认门(propose)。
+  const writePolicy = await evaluateConnectorWritePolicy({
+    provider: declRow.provider,
+    action: actionId,
+    connectionId: declRow.id,
+    userId: who.userId,
+    params: body.params,
+    evaluator: rt.deps.actionPolicyEvaluator,
+    policyPath: rt.deps.actionPolicyPath,
+  })
+  if (writePolicy.denied) {
+    throw new ConnectorError('OUTBOUND_BLOCKED', writePolicy.evaluation.reason)
+  }
   await checkRedisWindow(rt.deps.redis, 'propose', who.userId, rt.now(), rt.log)
   const prop = await proposeDeclarativeWrite(
     { connectionId: declRow.id, userId: who.userId, actionId, params: body.params ?? {} },
@@ -941,6 +986,32 @@ async function handleCall(
         (await facade.targetProvider?.(who.userId, body.connectionId).catch(() => null)) ?? null
       try {
         if (body.confirmId) {
+          const ledgerRow =
+            typeof (pool as { query?: unknown })?.query === 'function'
+              ? await getLedgerRow(body.confirmId, who.userId, pool)
+              : null
+          if (ledgerRow && ledgerRow.connection_id === body.connectionId) {
+            const confirmPolicy = await evaluateConnectorWritePolicy({
+              provider: ledgerRow.provider,
+              action: ledgerRow.action,
+              connectionId: body.connectionId,
+              userId: who.userId,
+              evaluator: rt.deps.actionPolicyEvaluator,
+              policyPath: rt.deps.actionPolicyPath,
+            })
+            if (confirmPolicy.denied) {
+              throw new ConnectorError('OUTBOUND_BLOCKED', confirmPolicy.evaluation.reason)
+            }
+            if (
+              confirmPolicy.blockPreapproval &&
+              ledgerRow.approval_source === 'account_preapproval'
+            ) {
+              throw new ConnectorError(
+                'CONFIRMATION_NOT_APPROVED',
+                'Action policy requires explicit human approval instead of account preapproval',
+              )
+            }
+          }
           const executed = await rt.deps.pluginFacade.executeConfirmedWrite({
             userId: who.userId,
             targetId: body.connectionId,
@@ -983,14 +1054,30 @@ async function handleCall(
           return
         }
 
+        const pluginProvider = (await targetProvider()) ?? pluginType
+        const pluginPolicy = await evaluateConnectorWritePolicy({
+          provider: pluginProvider,
+          action: actionId,
+          connectionId: body.connectionId,
+          userId: who.userId,
+          params: body.params,
+          evaluator: rt.deps.actionPolicyEvaluator,
+          policyPath: rt.deps.actionPolicyPath,
+        })
+        if (pluginPolicy.denied) {
+          throw new ConnectorError('OUTBOUND_BLOCKED', pluginPolicy.evaluation.reason)
+        }
         await checkRedisWindow(rt.deps.redis, 'propose', who.userId, rt.now(), rt.log)
         const proposed = await rt.deps.pluginFacade.proposeWrite({
           userId: who.userId,
           targetId: body.connectionId,
           actionId,
           params: body.params ?? {},
+          // B3: determine effective approval source BEFORE writing connector_write_ledger
+          // so policy-gated writes persist as status='pending' (never 'approved').
+          ...(pluginPolicy.blockPreapproval ? { forceInteractiveConfirmation: true } : {}),
         })
-        if (proposed.approvalMode === 'account_preapproval') {
+        if (proposed.approvalMode === 'account_preapproval' && !pluginPolicy.blockPreapproval) {
           const executed = await rt.deps.pluginFacade.executeConfirmedWrite({
             userId: who.userId,
             targetId: body.connectionId,
@@ -1160,6 +1247,24 @@ async function handleCall(
     try {
       ledgerDecl = requireAction(begun.row.provider, begun.row.action)
       ledgerParams = validateActionParams(ledgerDecl.params, begun.params)
+      const execPolicy = await evaluateConnectorWritePolicy({
+        provider: begun.row.provider,
+        action: begun.row.action,
+        connectionId: row.id,
+        userId: who.userId,
+        params: ledgerParams,
+        evaluator: rt.deps.actionPolicyEvaluator,
+        policyPath: rt.deps.actionPolicyPath,
+      })
+      if (execPolicy.denied) {
+        throw new ConnectorError('OUTBOUND_BLOCKED', execPolicy.evaluation.reason)
+      }
+      if (execPolicy.blockPreapproval && begun.row.approval_source === 'account_preapproval') {
+        throw new ConnectorError(
+          'CONFIRMATION_NOT_APPROVED',
+          'Action policy requires explicit human approval instead of account preapproval',
+        )
+      }
     } catch (err) {
       const ce = toConnectorError(err)
       await finalizeExecute(
@@ -1227,9 +1332,21 @@ async function handleCall(
     return
   }
 
-  // ── 写操作,无 confirmId:propose → 确认卡 ──
+  // ── 写操作,无 confirmId:动作权限策略 + propose → 确认卡 ──
   // P1#5:propose 只计 10/min 频率闸;send 类日上限**移到 execute 前**原子扣减,
   // 避免被拒/过期的 proposal 耗额度、以及跨 UTC 日预造 proposal 绕过日上限。
+  const v1WritePolicy = await evaluateConnectorWritePolicy({
+    provider: row.provider,
+    action: decl.id,
+    connectionId: row.id,
+    userId: who.userId,
+    params: body.params,
+    evaluator: rt.deps.actionPolicyEvaluator,
+    policyPath: rt.deps.actionPolicyPath,
+  })
+  if (v1WritePolicy.denied) {
+    throw new ConnectorError('OUTBOUND_BLOCKED', v1WritePolicy.evaluation.reason)
+  }
   await checkRedisWindow(rt.deps.redis, 'propose', who.userId, rt.now(), rt.log)
   const params = validateActionParams(decl.params, body.params)
   const proposed = await proposeWrite(

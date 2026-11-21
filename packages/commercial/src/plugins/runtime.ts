@@ -1562,6 +1562,8 @@ export class PluginRuntimeFacade {
     targetId: string
     actionId: string
     params: Record<string, unknown>
+    /** When true, Action Policy forbids account_preapproval and forces ledger status='pending'. */
+    forceInteractiveConfirmation?: boolean
   }): Promise<{
     confirmId: string
     provider: string
@@ -1617,9 +1619,10 @@ export class PluginRuntimeFacade {
       )
       if (!control?.enabled)
         throw new PluginRuntimeFacadeError('WRITE_DISABLED', 'Plugin writes are disabled')
-      const approvalMode = control.preapproval.enabled
-        ? ('account_preapproval' as const)
-        : ('interactive' as const)
+      const approvalMode =
+        !input.forceInteractiveConfirmation && control.preapproval.enabled
+          ? ('account_preapproval' as const)
+          : ('interactive' as const)
       validateRuntimePluginJson(action.params, sealedParams, 'params')
       await lease.assertHeld()
       const proposed = await proposeLedgerWrite(

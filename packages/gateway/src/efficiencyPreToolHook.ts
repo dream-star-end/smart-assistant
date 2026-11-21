@@ -10,6 +10,7 @@
  */
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import type { ActionPolicyEvaluation } from '@openclaude/protocol'
 import {
   auditEfficiencyEscape,
   evaluateShellForHook,
@@ -17,10 +18,22 @@ import {
   type GuardMode,
   type HookDecision,
 } from './agentEfficiencyGuard.js'
+import {
+  evaluateActionPolicy,
+  isActionPolicyEnabled,
+  type AiReviewHook,
+  type LoadedActionPolicy,
+} from './actionPolicyEngine.js'
 
 export type HookProtocol = 'ccb' | 'cursor'
 
 const INNER_TIMEOUT_MS = 1200
+
+function resolveInnerTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.OPENCLAUDE_EFFICIENCY_HOOK_TIMEOUT_MS)
+  if (!Number.isFinite(raw) || raw < 200) return INNER_TIMEOUT_MS
+  return Math.min(4800, Math.max(INNER_TIMEOUT_MS, Math.trunc(raw) - 200))
+}
 
 export function parseHookProtocol(argv: string[] = process.argv): HookProtocol {
   const flag = argv.find((a) => a.startsWith('--protocol='))
@@ -106,22 +119,173 @@ export function formatCursorHookResponse(decision: HookDecision): Record<string,
   return formatCursorAllow()
 }
 
+export interface PreToolHookActionPolicyOptions {
+  /** Override whether action-policy evaluation runs (defaults to OPENCLAUDE_ACTION_POLICY env). */
+  actionPolicyEnabled?: boolean
+  /** Pre-loaded policy or explicit YAML path (for tests / custom wiring). */
+  loadedPolicy?: LoadedActionPolicy
+  policyPath?: string
+  /** Active main strong model id for `ai_review` inheritance. */
+  mainModel?: string
+  /** Strong-model read-only pre-review hook. */
+  aiReviewHook?: AiReviewHook
+}
+
+function extractToolName(input: Record<string, unknown>): string {
+  const name = input.tool_name ?? input.tool
+  return typeof name === 'string' && name.trim() ? name.trim() : 'Bash'
+}
+
+function extractTarget(input: Record<string, unknown>): string | undefined {
+  const direct = input.target
+  if (typeof direct === 'string' && direct.trim()) return direct.trim()
+  const toolInput = input.tool_input
+  if (toolInput && typeof toolInput === 'object') {
+    const rec = toolInput as Record<string, unknown>
+    for (const key of ['target', 'provider', 'site', 'slug', 'url']) {
+      if (typeof rec[key] === 'string' && (rec[key] as string).trim()) {
+        return (rec[key] as string).trim()
+      }
+    }
+  }
+  return undefined
+}
+
+export function formatActionPolicyHookResponse(
+  protocol: HookProtocol,
+  evaluation: ActionPolicyEvaluation,
+  extraMessage?: string | null,
+): Record<string, unknown> | null {
+  if (evaluation.tier === 'allow') return null
+  const tag = evaluation.matchedRuleId ? `[action-policy:${evaluation.matchedRuleId}] ` : '[action-policy] '
+  const baseReason = `${tag}${evaluation.reason}`
+  const reason = extraMessage ? `${baseReason}\n${extraMessage}` : baseReason
+
+  if (evaluation.tier === 'deny') {
+    if (protocol === 'cursor') {
+      return {
+        permission: 'deny',
+        agent_message: reason,
+        user_message: reason,
+        actionPolicy: evaluation,
+      }
+    }
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: reason,
+      },
+      reason,
+      actionPolicy: evaluation,
+    }
+  }
+
+  // `human_approval` (and any unescalated `ai_review`):
+  //   - CCB natively supports `permissionDecision: 'ask'`.
+  //   - Cursor ONLY supports `permission: 'allow' | 'deny'`; emitting `ask` would be
+  //     rejected by Cursor / runner as invalid JSON! Fail closed as `deny` with an
+  //     explicit human-approval-required message instead of ever allowing.
+  if (protocol === 'cursor') {
+    const approvalMsg = `需要人工审批后执行（Cursor 不支持原生 ask，已 fail-closed 拦截）：${reason}`
+    return {
+      permission: 'deny',
+      requiresHumanApproval: true,
+      agent_message: approvalMsg,
+      user_message: approvalMsg,
+      actionPolicy: evaluation,
+    }
+  }
+  return {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'ask',
+      permissionDecisionReason: reason,
+    },
+    reason,
+    actionPolicy: evaluation,
+  }
+}
+
 export async function handlePreToolHookInput(
   raw: unknown,
   protocol: HookProtocol,
   mode: GuardMode = resolveGuardMode(),
+  options: PreToolHookActionPolicyOptions = {},
 ): Promise<Record<string, unknown>> {
   try {
     const input = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
-    if (!isShellTool(input)) {
+    const command = extractShellCommand(input)
+    const toolName = extractToolName(input)
+    const hasActionablePayload =
+      typeof input.tool_name === 'string' ||
+      typeof input.tool === 'string' ||
+      command.length > 0
+
+    // Evaluate both action-policy and efficiency guard, then take the STRICTER decision:
+    //   deny > ask (human_approval) > allow+warn > allow
+    // This ensures an existing efficiency `deny` is NEVER downgraded/masked by a policy `ask`.
+    let policyEvaluation: ActionPolicyEvaluation | null = null
+    const policyEnabled = options.actionPolicyEnabled ?? isActionPolicyEnabled()
+    if (policyEnabled && hasActionablePayload) {
+      const toolInputObj =
+        input.tool_input && typeof input.tool_input === 'object' && !Array.isArray(input.tool_input)
+          ? (input.tool_input as Record<string, unknown>)
+          : undefined
+      policyEvaluation = await evaluateActionPolicy(
+        {
+          toolName,
+          command: command || undefined,
+          target: extractTarget(input),
+          args: toolInputObj,
+          mainModel:
+            options.mainModel ??
+            (typeof input.model === 'string' ? input.model : process.env.OPENCLAUDE_MAIN_MODEL),
+          sessionKey: typeof input.session_key === 'string' ? input.session_key : undefined,
+        },
+        {
+          loaded: options.loadedPolicy,
+          policyPath: options.policyPath,
+          mainModel: options.mainModel,
+          aiReviewHook: options.aiReviewHook,
+        },
+      )
+    }
+
+    const shellTool = isShellTool(input)
+    const effDecision = shellTool ? evaluateShellForHook(command, mode) : null
+
+    // 1. Hard deny from either guard wins immediately (combine reasons if both flagged).
+    if (policyEvaluation?.tier === 'deny') {
+      return formatActionPolicyHookResponse(protocol, policyEvaluation, effDecision?.message) ?? formatAllow(protocol)
+    }
+    if (effDecision?.decision === 'deny') {
+      const combinedMessage =
+        policyEvaluation && policyEvaluation.tier !== 'allow'
+          ? `${effDecision.message ?? 'Blocked by efficiency guard'}\n[action-policy] ${policyEvaluation.reason}`
+          : effDecision.message
+      const merged: HookDecision = { ...effDecision, message: combinedMessage ?? null }
+      return protocol === 'cursor' ? formatCursorHookResponse(merged) : formatCcbHookResponse(merged)
+    }
+
+    // 2. Non-allow action-policy (`human_approval` / escalated `ai_review`) wins over warn/allow.
+    if (policyEvaluation && policyEvaluation.tier !== 'allow') {
+      return (
+        formatActionPolicyHookResponse(protocol, policyEvaluation, effDecision?.message) ??
+        formatAllow(protocol)
+      )
+    }
+
+    // 3. Action-policy allowed: fall through to efficiency guard (or allow for non-shell tools).
+    if (!shellTool || !effDecision) {
       return formatAllow(protocol)
     }
-    const command = extractShellCommand(input)
-    const decision = evaluateShellForHook(command, mode)
-    if (decision.escaped) {
+    if (effDecision.escaped) {
       await auditEfficiencyEscape(command, { protocol, mode })
     }
-    return protocol === 'cursor' ? formatCursorHookResponse(decision) : formatCcbHookResponse(decision)
+    return protocol === 'cursor'
+      ? formatCursorHookResponse(effDecision)
+      : formatCcbHookResponse(effDecision)
   } catch {
     return formatAllow(protocol)
   }
@@ -143,7 +307,7 @@ async function main(): Promise<void> {
   const timer = setTimeout(() => {
     writeJson(formatAllow(protocol))
     process.exit(0)
-  }, INNER_TIMEOUT_MS)
+  }, resolveInnerTimeoutMs())
   try {
     let parsed: unknown = {}
     try {

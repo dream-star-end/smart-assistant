@@ -372,6 +372,70 @@ export async function denyConfirmation(
   throw new ConnectorError('CONFIRMATION_ALREADY_FINALIZED', `status=${cur.status}`)
 }
 
+/**
+ * Atomic pending-only approve CAS for unified Pending Decisions.
+ * Transitions ONLY `pending -> approved` (never weakens existing `approveConfirmation`).
+ * Same-decision replay (`already approved`) returns `{ status: 'approved', idempotentReplay: true }`;
+ * opposite decision (`denied`) or other terminal states throw `CONFIRMATION_ALREADY_FINALIZED`.
+ */
+export async function approvePendingConfirmationCas(
+  id: string,
+  userId: number,
+  pool: Pool = getPool(),
+): Promise<{ status: 'approved'; idempotentReplay: boolean }> {
+  const row = await getLedgerRow(id, userId, pool)
+  if (!row) throw new ConnectorError('CONFIRMATION_NOT_FOUND', 'no such confirmation')
+  if (row.status === 'pending' && row.expires_at.getTime() > Date.now()) {
+    decryptLedgerParams(row)
+  }
+  const r = await pool.query<{ status: LedgerStatus }>(
+    `UPDATE connector_write_ledger
+        SET status = 'approved', approved_at = now(),
+            expires_at = now() + interval '10 minutes'
+      WHERE id = $1::uuid AND user_id = $2 AND status = 'pending' AND expires_at > now()
+      RETURNING status`,
+    [id, userId],
+  )
+  if ((r.rowCount ?? 0) > 0) return { status: 'approved', idempotentReplay: false }
+  const cur = await getLedgerRow(id, userId, pool)
+  if (!cur) throw new ConnectorError('CONFIRMATION_NOT_FOUND', 'no such confirmation')
+  if (cur.status === 'approved') return { status: 'approved', idempotentReplay: true }
+  if (cur.status === 'pending' || cur.status === 'expired') {
+    throw new ConnectorError('CONFIRMATION_EXPIRED', 'confirmation window elapsed')
+  }
+  throw new ConnectorError('CONFIRMATION_ALREADY_FINALIZED', `status=${cur.status}`)
+}
+
+/**
+ * Atomic pending-only deny CAS for unified Pending Decisions.
+ * Unlike legacy `denyConfirmation` (which intentionally permits revoking `approved`),
+ * this helper ONLY transitions `pending -> denied` (`WHERE status = 'pending' AND expires_at > now()`),
+ * so concurrent approve + deny races yield deterministic 409 conflict instead of overwriting `approved`.
+ */
+export async function denyPendingConfirmationCas(
+  id: string,
+  userId: number,
+  pool: Pool = getPool(),
+): Promise<{ status: 'denied'; idempotentReplay: boolean }> {
+  const r = await pool.query<{ status: LedgerStatus }>(
+    `UPDATE connector_write_ledger
+        SET status = 'denied', finished_at = now(),
+            params_enc = NULL, params_nonce = NULL
+      WHERE id = $1::uuid AND user_id = $2 AND status = 'pending' AND expires_at > now()
+      RETURNING status`,
+    [id, userId],
+  )
+  if ((r.rowCount ?? 0) > 0) return { status: 'denied', idempotentReplay: false }
+  const cur = await getLedgerRow(id, userId, pool)
+  if (!cur) throw new ConnectorError('CONFIRMATION_NOT_FOUND', 'no such confirmation')
+  if (cur.status === 'denied') return { status: 'denied', idempotentReplay: true }
+  if (cur.status === 'pending' || cur.status === 'expired') {
+    throw new ConnectorError('CONFIRMATION_EXPIRED', 'confirmation window elapsed')
+  }
+  if (cur.status === 'executing') throw new ConnectorError('CONFIRMATION_IN_PROGRESS', 'executing')
+  throw new ConnectorError('CONFIRMATION_ALREADY_FINALIZED', `status=${cur.status}`)
+}
+
 // ─── execute ─────────────────────────────────────────────────────────────
 
 export type BeginExecuteOutcome =
