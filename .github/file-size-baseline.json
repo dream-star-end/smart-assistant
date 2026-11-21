@@ -3,13 +3,12 @@
   "slack": 100,
   "files": {
     "packages/commercial/src/agent-sandbox/v3supervisor.ts": 4247,
-    "packages/commercial/src/db/pgSessionsBackend.ts": 13925,
-    "packages/commercial/src/http/handlers.ts": 3224,
+    "packages/commercial/src/db/pgSessionsBackend.ts": 13882,
+    "packages/commercial/src/http/handlers.ts": 3193,
     "packages/commercial/src/http/proxy/boxDurableJournal.ts": 3528,
     "packages/commercial/src/index.ts": 7700,
     "packages/commercial/src/marketplace/marketplaceDb.ts": 3621,
-    "packages/commercial/src/ws/userChatBridge.ts": 10600,
-    "packages/gateway/src/server.ts": 2981,
+    "packages/commercial/src/ws/userChatBridge.ts": 10578,
     "packages/storage/src/sessionsDb.ts": 6184,
     "packages/web-react/browser-tests/harness.tsx": 3837,
     "packages/web-react/browser-tests/run.mjs": 4185,
@@ -20,7 +19,7 @@
     "packages/web/public/modules/messages.js": 3663,
     "packages/web/public/modules/websocket.js": 4841,
     "scripts/deploy-v5-selfhost.sh": 3079,
-    "scripts/deploy-v5.sh": 11929,
+    "scripts/deploy-v5.sh": 11837,
     "scripts/generate-v5-tutorial-media.ts": 3313
   }
 }
