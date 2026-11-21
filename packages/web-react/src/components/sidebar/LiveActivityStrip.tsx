@@ -56,7 +56,9 @@ export function LiveActivityStrip({
   defaultCollapsed = false,
 }: LiveActivityStripProps) {
   const [requestedFilter, setRequestedFilter] = useState<LiveActivityFilter>("all");
-  const [collapsed, setCollapsed] = useState(defaultCollapsed);
+  const [collapseOverride, setCollapseOverride] = useState<boolean | null>(
+    defaultCollapsed ? true : null,
+  );
   const [showAll, setShowAll] = useState(false);
   const notifyState = useSyncExternalStore(
     subscribeDesktopNotifyState,
@@ -67,6 +69,15 @@ export function LiveActivityStrip({
   const notifyDenied = notifyState.permission === "denied";
 
   if (summary.total === 0) return null;
+
+  // 仅有 1 条运行中会话且正好是当前正在查看的会话时，默认收起明细行，
+  // 避免与下方项目第一行同屏重复呈现两张完全一样的活跃条；点展开或切到其它会话即恢复直达行。
+  const onlyActiveRunning =
+    summary.total === 1 &&
+    summary.items[0]?.bucket === "running" &&
+    Boolean(activeId) &&
+    summary.items[0]?.session.id === activeId;
+  const collapsed = collapseOverride ?? onlyActiveRunning;
 
   const activeFilter = resolveEffectiveLiveFilter(summary, requestedFilter);
   const items = filterLiveActivityItems(summary, activeFilter);
@@ -79,7 +90,7 @@ export function LiveActivityStrip({
       const effective = resolveEffectiveLiveFilter(summary, cur);
       return effective === bucket ? "all" : bucket;
     });
-    setCollapsed(false);
+    setCollapseOverride(false);
     setShowAll(false);
   };
 
@@ -88,6 +99,7 @@ export function LiveActivityStrip({
       aria-label="活态指挥区"
       data-testid="sidebar-live-strip"
       data-has-attention={summary.counts.needs_you > 0 ? "true" : undefined}
+      data-compact-active={onlyActiveRunning && collapsed ? "true" : undefined}
       className="oc-live-strip"
     >
       <div className="oc-live-strip-head">
@@ -149,7 +161,7 @@ export function LiveActivityStrip({
           aria-expanded={!collapsed}
           aria-label={collapsed ? `展开活态列表（${summary.total}）` : "收起活态列表"}
           title={collapsed ? "展开活态列表" : "收起活态列表"}
-          onClick={() => setCollapsed((v) => !v)}
+          onClick={() => setCollapseOverride(!collapsed)}
           className="oc-live-strip-toggle"
         >
           {collapsed ? <ChevronRight size={14} strokeWidth={1.75} aria-hidden /> : <ChevronDown size={14} strokeWidth={1.75} aria-hidden />}
@@ -176,10 +188,10 @@ export function LiveActivityStrip({
                 }}
                 className="oc-live-strip-item"
               >
-                {bucketIndicator(item.bucket)}
-                <span className="oc-live-strip-item-text">
-                  <span className="oc-live-strip-item-title">{title}</span>
+                <span className="oc-live-strip-item-lead" aria-hidden>
+                  {bucketIndicator(item.bucket)}
                 </span>
+                <span className="oc-live-strip-item-title">{title}</span>
                 <span data-bucket={item.bucket} className="oc-live-strip-item-tag">
                   {statusLabel}
                 </span>

@@ -72,8 +72,8 @@ import { computeStepTimings, formatStepDuration } from "../lib/chat/stepTiming";
 import { cn } from "../lib/utils";
 import { extractLatestTodos, type TodoItem } from "./chat/todoExtract";
 import { CopyIconButton, FullToolBody } from "./chat/paneParts";
-import { collectWorkTurns, turnIndexOf } from "./chat/workTurns";
-import { findTurnIndexForPath } from "./chat/workbench";
+import { collectWorkTurns, formatStepSummary, formatWorkTurnTitle, turnIndexOf } from "./chat/workTurns";
+import { findTurnIndexForPath, formatDuration } from "./chat/workbench";
 import { isBrowserStepMessage } from "./tool/browserDetect";
 import { collectPaneSteps, type PaneTurn } from "./chat/workPane";
 import {
@@ -85,7 +85,7 @@ import {
   stripShellWrapperForDisplay,
 } from "./tool/format";
 import { diffLines } from "./tool/lineDiff";
-import { resolveToolMeta, toolSummary } from "./tool/meta";
+import { resolveToolMeta, toolSummary, type ToolTone } from "./tool/meta";
 import { parseShellEnvelope } from "./tool/shellEnvelope";
 import { resolveToolStatus } from "./tool/status";
 import { toneTileClass } from "./tool/tone";
@@ -280,15 +280,39 @@ function writeStoredTab(tab: PaneTab): void {
 const navButtonClass =
   "oc-btn-tactile inline-flex min-h-8 items-center gap-1 rounded-md px-2 text-meta font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11";
 
-const rowButtonClass =
-  "flex w-full min-w-0 items-center gap-2.5 rounded-lg px-2.5 py-2 text-left outline-none transition-colors hover:bg-hover/80 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11";
+function stepIconToneClass(tone: ToolTone | undefined): string {
+  switch (tone) {
+    case "accent":
+      return "text-accent";
+    case "success":
+      return "text-success";
+    case "info":
+      return "text-info";
+    case "warning":
+      return "text-warning";
+    default:
+      return "text-muted";
+  }
+}
+
+function paneTurnDuration(turn: PaneTurn): string | null {
+  if (typeof turn.startedAt !== "number") return null;
+  let end = turn.startedAt;
+  for (const r of turn.rows) {
+    const t = r.completedAt ?? r.ts;
+    if (typeof t === "number" && t > end) end = t;
+  }
+  const ms = end - turn.startedAt;
+  return ms >= 1000 ? formatDuration(ms) : null;
+}
 
 /** 一步的头部:类型图标 + 标签 + 状态 + 摘要 + 复制全文。 */
 function StepHeader({ message }: { message: ToolLike }) {
   const display = normalizeToolForDisplay(message);
   const meta = resolveToolMeta(display.name, display.input);
   const Icon = meta.icon;
-  const summary = toolSummary(display.name, display.input);
+  const rawSummary = toolSummary(display.name, display.input);
+  const summary = formatStepSummary(display.name, display.input, rawSummary);
   const status = resolveToolStatus(display);
   return (
     <div className="flex shrink-0 items-center gap-3 border-b border-border bg-gradient-to-b from-hover/35 to-transparent px-4 py-3">
@@ -308,7 +332,7 @@ function StepHeader({ message }: { message: ToolLike }) {
           )}
         </div>
         {summary && (
-          <div className="mt-1 truncate font-mono text-caption text-muted" title={summary}>
+          <div className="mt-1 truncate text-caption text-muted" title={rawSummary || summary}>
             {summary}
           </div>
         )}
@@ -424,7 +448,8 @@ function StepRow({
   const display = normalizeToolForDisplay(message);
   const meta = resolveToolMeta(display.name, display.input);
   const Icon = meta.icon;
-  const summary = toolSummary(display.name, display.input);
+  const rawSummary = toolSummary(display.name, display.input);
+  const summary = formatStepSummary(display.name, display.input, rawSummary);
   const status = resolveToolStatus(display);
   const duration = durationMs === undefined ? null : formatStepDuration(durationMs);
   return (
@@ -433,21 +458,28 @@ function StepRow({
       data-testid="pane-step"
       data-tool-status={status.kind}
       aria-current={active ? "true" : undefined}
-      className={cn(rowButtonClass, active && "bg-accent-soft/70 ring-1 ring-inset ring-accent/25")}
+      className={cn(
+        "flex w-full min-w-0 items-center gap-2.5 px-4 py-2 text-left outline-none transition-colors hover:bg-hover/65 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+        active && "bg-accent-soft/60",
+      )}
       onClick={onPick}
     >
-      <span className={cn("oc-icon-badge size-6 shrink-0 rounded-sm", toneTileClass(meta.tone))}>
-        <Icon size={13} strokeWidth={1.75} />
+      <span className={cn("flex size-5 shrink-0 items-center justify-center", stepIconToneClass(meta.tone))} aria-hidden>
+        <Icon size={14} strokeWidth={1.75} />
       </span>
       <span className="min-w-0 flex-1">
-        <span className="block truncate text-body font-medium text-fg">{meta.label}</span>
-        {summary && <span className="block truncate font-mono text-meta text-faint">{summary}</span>}
+        <span className="block truncate text-meta font-medium text-fg">{meta.label}</span>
+        {summary && (
+          <span className="block truncate text-caption text-muted" title={rawSummary || summary}>
+            {summary}
+          </span>
+        )}
       </span>
-      <span className="flex shrink-0 items-center text-meta tabular-nums text-faint">
+      <span className="flex shrink-0 items-center text-caption tabular-nums text-faint">
         {status.isRunning ? (
           <>
             <span className="sr-only">{status.label}</span>
-            <Spinner size={13} className="text-accent" />
+            <Spinner size={12} className="text-accent" />
           </>
         ) : status.kind === "done" ? (
           (duration ?? <span className="sr-only">{status.label}</span>)
@@ -463,11 +495,13 @@ function StepRow({
 
 function StepList({
   turns,
+  turnTitles,
   total,
   active,
   onPick,
 }: {
   turns: PaneTurn[];
+  turnTitles?: ReadonlyMap<string, string>;
   total: number;
   active: ToolLike | null;
   onPick: (message: ToolLike) => void;
@@ -486,32 +520,34 @@ function StepList({
   const ordered = [...turns].reverse();
   const newestKey = ordered[0]?.key;
   return (
-    <div className="min-h-0 flex-1 space-y-2.5 overflow-y-auto px-3 py-3" data-testid="pane-step-list">
+    <div className="min-h-0 flex-1 divide-y divide-border/60 overflow-y-auto" data-testid="pane-step-list">
       {ordered.map((turn) => {
         const open = toggled[turn.key] ?? turn.key === newestKey;
         const timings = open ? computeStepTimings(turn.rows, { turnStartedAt: turn.startedAt, active: false }) : null;
+        const cleanTitle = turnTitles?.get(turn.key) ?? formatWorkTurnTitle(turn.title, 60);
+        const elapsed = paneTurnDuration(turn);
         return (
-          <section key={turn.key} data-testid="pane-turn" className="oc-surface-card overflow-hidden rounded-xl p-1">
+          <section key={turn.key} data-testid="pane-turn" className="bg-surface">
             <button
               type="button"
               aria-expanded={open}
-              className={cn(rowButtonClass, "gap-2 py-2")}
+              className="flex w-full min-w-0 items-center gap-2 px-3.5 py-2.5 text-left outline-none transition-colors hover:bg-hover/55 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11"
               onClick={() => setToggled((t) => ({ ...t, [turn.key]: !open }))}
             >
               <ChevronRight
-                size={14}
+                size={13}
                 aria-hidden
-                className={cn("shrink-0 text-faint transition-transform duration-200", open && "rotate-90 text-accent")}
+                className={cn("shrink-0 text-faint transition-transform duration-200", open && "rotate-90 text-muted")}
               />
-              <span className="min-w-0 flex-1 truncate text-body font-semibold text-fg" title={turn.title}>
-                {turn.title}
+              <span className="min-w-0 flex-1 truncate text-meta font-semibold text-fg" title={cleanTitle}>
+                {cleanTitle}
               </span>
-              <span className="oc-surface-recessed shrink-0 rounded-full px-2 py-0.5 text-caption font-medium tabular-nums text-muted">
-                {turn.steps.length} 步
+              <span className="shrink-0 text-caption tabular-nums text-faint">
+                {turn.steps.length} 步{elapsed ? ` · ${elapsed}` : ""}
               </span>
             </button>
             {open && (
-              <ol className="mt-0.5 space-y-0.5 border-t border-border/60 pt-1 pl-2">
+              <ol className="divide-y divide-border/45 border-t border-border/50 bg-bg/30">
                 {turn.steps.map((step) => (
                   <li key={step.message.id}>
                     <StepRow
@@ -601,11 +637,24 @@ function PlanView({ todos }: { todos: TodoItem[] }) {
   );
 }
 
+function filePathFromToolMessage(message: ToolLike | null | undefined): string | undefined {
+  if (!message) return undefined;
+  const { name, input } = normalizeToolForDisplay(message);
+  if (name !== "Write" && name !== "Edit" && name !== "MultiEdit") return undefined;
+  const direct = asStr(input?.file_path) || asStr(input?.path);
+  if (direct) return direct;
+  const firstPatch = asArr(input?.changes).find(
+    (c): c is Record<string, unknown> => !!c && typeof c === "object" && !Array.isArray(c),
+  );
+  return firstPatch ? asStr(firstPatch.path) || undefined : undefined;
+}
+
 function targetOutputFromRequest(req: PaneRequest | null | undefined): TargetOutputRequest | null {
   if (!req) return null;
-  if (!req.targetPath && !req.manifestSrc && !req.previewUrl) return null;
+  const path = req.targetPath || (req.tab === "outputs" || req.tab === "changes" ? filePathFromToolMessage(req.message) : undefined);
+  if (!path && !req.manifestSrc && !req.previewUrl) return null;
   return {
-    path: req.targetPath,
+    path,
     title: req.targetTitle,
     manifestSrc: req.manifestSrc,
     previewUrl: req.previewUrl,
@@ -888,13 +937,22 @@ export function InspectorPanelContent({
     }
   };
 
-  const count = (n: number) => (n > 0 ? <span className="ml-1 tabular-nums text-faint">{n}</span> : null);
+  const subtleCount = (n: number) =>
+    n > 0 ? <span className="ml-1 text-caption font-normal tabular-nums text-faint">{n}</span> : null;
   const tabItems = [
     { value: "outputs", label: <span>产出</span> },
     ...(browserCount > 0 || browserPending || liveBrowserAvailable
-      ? [{ value: "browser", label: <span>浏览器{count(browserCount)}</span> }]
+      ? [{ value: "browser", label: <span>浏览器{subtleCount(browserCount)}</span> }]
       : []),
-    { value: "steps", label: <span>步骤{count(steps.length)}</span> },
+    {
+      value: "steps",
+      label: (
+        <span>
+          过程
+          <span className="sr-only">步骤{steps.length > 0 ? ` ${steps.length}` : ""}</span>
+        </span>
+      ),
+    },
     ...(todos.length > 0 ? [{ value: "plan", label: <span>计划</span> }] : []),
   ];
 
@@ -962,7 +1020,13 @@ export function InspectorPanelContent({
               onLatest={() => setFollow(true)}
             />
           ) : (
-            <StepList turns={turns} total={steps.length} active={selected} onPick={pick} />
+            <StepList
+              turns={turns}
+              turnTitles={new Map(workTurns.map((t) => [t.key, t.title]))}
+              total={steps.length}
+              active={selected}
+              onPick={pick}
+            />
           )
         ) : view === "browser" && browserPending ? (
           <div className="flex items-center gap-2 px-4 py-4 text-meta text-muted" data-testid="browser-hydrating">

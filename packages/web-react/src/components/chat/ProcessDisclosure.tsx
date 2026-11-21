@@ -1012,8 +1012,8 @@ function stepLiveStatus(messages: readonly ChatMessage[]): { text: string; pendi
 function ShellGlyph({ active, outcome }: { active: boolean; outcome: "done" | "stopped" | "failed" }) {
   if (active) {
     return (
-      <span aria-hidden data-testid="process-glyph-live" className="oc-orbit relative flex size-6 shrink-0 items-center justify-center">
-        <StatusPill status="running" variant="dot" size="md" decorative className="oc-orbit-core" />
+      <span aria-hidden data-testid="process-glyph-live" className="oc-orbit relative flex size-5 shrink-0 items-center justify-center">
+        <StatusPill status="running" variant="dot" size="sm" decorative className="oc-orbit-core" />
       </span>
     );
   }
@@ -1023,9 +1023,9 @@ function ShellGlyph({ active, outcome }: { active: boolean; outcome: "done" | "s
       aria-hidden
       data-testid="process-glyph-done"
       data-outcome={outcome}
-      className="oc-icon-badge flex size-6 shrink-0 items-center justify-center rounded-full text-muted"
+      className="flex size-5 shrink-0 items-center justify-center text-faint"
     >
-      {Icon ? <Icon size={13} strokeWidth={2.1} fill={filled ? "currentColor" : "none"} /> : null}
+      {Icon ? <Icon size={13.5} strokeWidth={2} fill={filled ? "currentColor" : "none"} /> : null}
     </span>
   );
 }
@@ -1103,7 +1103,7 @@ function shellLivePhrase<T>(
 
 
 const shellToggleClass =
-  "group/shell -mx-1.5 flex min-h-10 w-[calc(100%+0.75rem)] items-center gap-2.5 rounded-xl px-2 py-1.5 text-left transition-colors duration-150 hover:bg-hover/70 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-11";
+  "group/shell -mx-1.5 flex min-h-8 w-[calc(100%+0.75rem)] items-center gap-2 rounded-lg px-1.5 py-1 text-left transition-colors duration-150 hover:bg-hover/60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-10";
 
 
 /** Sum of assistant cost labels. Zero and non-digits are skipped. */
@@ -1277,7 +1277,7 @@ export function ProcessDisclosure<T>({
         }}
       >
         <ShellGlyph active={active} outcome={outcome} />
-        <span className="flex min-w-0 flex-1 items-baseline gap-2">
+        <span className="flex min-w-0 flex-1 items-baseline gap-1.5">
           <span className="sr-only">{title}</span>
           {live && !liveInRail ? (
             <span
@@ -1295,9 +1295,12 @@ export function ProcessDisclosure<T>({
             </span>
           )}
           {meta ? (
-            <span className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint" data-testid="process-meta">
-              {meta}
-            </span>
+            <>
+              <span aria-hidden className="shrink-0 text-meta text-faint/55">·</span>
+              <span className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint" data-testid="process-meta">
+                {meta}
+              </span>
+            </>
           ) : null}
           {roundCredits ? (
             <span className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint" data-testid="process-round-credits">
@@ -1307,21 +1310,21 @@ export function ProcessDisclosure<T>({
           ) : null}
         </span>
         <ChevronDown
-          size={15}
+          size={14}
           aria-hidden
-          className={`shrink-0 text-faint transition-transform duration-300 ease-[var(--ease-spring)] group-hover/shell:text-muted ${open ? "rotate-180" : ""}`}
+          className={`shrink-0 text-faint/75 transition-transform duration-200 group-hover/shell:text-muted ${open ? "rotate-180" : ""}`}
         />
       </button>
       {openPane && changedFiles > 0 ? (
         <button
           type="button"
           data-testid="process-pane-changes"
-          className="group/changes oc-btn-tactile inline-flex shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+          className="group/changes oc-btn-tactile inline-flex shrink-0 items-center justify-center rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-10"
           title="在详情面板查看这一轮的产出"
           onClick={() => openPane("outputs", processRows[0])}
         >
-          <span className="oc-btn-secondary-craft inline-flex h-7 items-center gap-1.5 rounded-full border border-border/80 bg-surface px-2.5 text-caption font-medium text-muted transition-colors group-hover/changes:border-border-strong group-hover/changes:text-fg">
-            <Pencil size={11.5} strokeWidth={1.75} aria-hidden className="text-accent" />
+          <span className="inline-flex h-6 items-center gap-1 rounded-md border border-border/65 px-2 text-caption font-medium text-muted transition-colors group-hover/changes:border-border-strong group-hover/changes:bg-hover/65 group-hover/changes:text-fg">
+            <Pencil size={11} strokeWidth={1.75} aria-hidden className="text-accent" />
             {/* 手机上省掉「改动」二字,给左边的步骤统计留位置;读屏仍念全句。 */}
             <span className="sr-only sm:not-sr-only">改动 </span>
             {changedFiles} 个文件
@@ -1333,10 +1336,10 @@ export function ProcessDisclosure<T>({
           data-testid="process-pane-steps"
           aria-label="在详情面板查看步骤"
           title="在详情面板查看步骤"
-          className="oc-btn-tactile flex size-8 shrink-0 items-center justify-center rounded-lg text-faint opacity-0 outline-none transition-all hover:bg-hover hover:text-fg focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover/shellrow:opacity-100 [@media(hover:none)]:size-11 [@media(hover:none)]:opacity-100"
+          className="oc-btn-tactile flex size-7 shrink-0 items-center justify-center rounded-md text-faint/80 opacity-0 outline-none transition-all hover:bg-hover/70 hover:text-fg focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover/shellrow:opacity-100 [@media(hover:none)]:size-10 [@media(hover:none)]:opacity-100"
           onClick={() => openPane("steps")}
         >
-          <PanelRight size={15} strokeWidth={1.75} />
+          <PanelRight size={14} strokeWidth={1.75} />
         </button>
       ) : null}
       </div>
@@ -1358,10 +1361,10 @@ export function ProcessDisclosure<T>({
           隐藏容器立即下载并整段渲染,看不见却付全部流量与解析成本。 */}
       {(olderSteps || open) ? (
           <div
-            className={open ? "oc-surface-card oc-reveal mt-1.5 rounded-xl px-3 py-2" : "oc-rail relative mt-1 space-y-0.5 pb-1"}
+            className={open ? "oc-codex-rail oc-reveal relative ml-2.5 mt-1 pb-1 pl-3.5" : "oc-rail relative mt-1 space-y-0.5 pb-1"}
             data-testid={open ? "process-stages" : "process-older-steps"}
           >
-            {olderSteps ? <div className="pb-1 pl-9">{olderSteps}</div> : null}
+            {olderSteps ? <div className={open ? "pb-1" : "pb-1 pl-9"}>{olderSteps}</div> : null}
             {open ? (
               <ProcessStages
                 sections={sections}

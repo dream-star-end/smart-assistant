@@ -99,6 +99,10 @@ const EMPTY_ALL_HEIGHT = 200;
  * 把横向空间让给昵称与余额 —— 268px 下文字版会把「余额 258.5万 积分」截成「余额 258.5万…」（S-09 / SIDEBAR-R1）。
  */
 const FOOTER_LABEL_MIN_WIDTH = 300;
+const NAV_ITEM_BASE =
+  "group relative flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:h-9";
+const NAV_ITEM_ACTIVE = "bg-sidebar-active font-medium text-fg shadow-sidebar-active";
+const NAV_ITEM_IDLE = "text-muted hover:bg-hover/80 hover:text-fg";
 
 function readArchivedExpanded(userId: string | undefined): boolean {
   if (!userId) return false;
@@ -678,7 +682,7 @@ export function Sidebar({
       data-product-feature={PRODUCT_CAPABILITIES.billing.id}
       disabled={!hasAccountMenu}
       aria-label={hasAccountMenu ? "账号菜单" : undefined}
-      className="oc-btn-tactile group flex min-w-0 flex-1 items-center gap-2.5 rounded-md border border-transparent py-1.5 pl-1.5 pr-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring enabled:hover:border-border/80 enabled:hover:bg-surface/80 data-[state=open]:border-border data-[state=open]:bg-surface data-[state=open]:shadow-soft [@media(hover:none)]:min-h-11"
+      className="oc-btn-tactile group flex min-w-0 flex-1 items-center gap-2 rounded-sm py-1.5 pl-1.5 pr-2 text-left outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring enabled:hover:bg-hover/80 data-[state=open]:bg-sidebar-active data-[state=open]:shadow-sidebar-active [@media(hover:none)]:min-h-10"
     >
       <Avatar
         size="sm"
@@ -814,14 +818,13 @@ export function Sidebar({
       );
     }
     if (item.kind === "more") {
-      // 与子会话同轴（缩进 + 层级引导线），读作这一组的最后一行。
+      // 与项目下缩进会话标题同一左对齐基线（pl-2 + pl-7 = 36px）。
       return (
-        <div className="relative h-full py-px pl-[22px]">
-          <span aria-hidden className="pointer-events-none absolute inset-y-0 left-[15px] w-px bg-border" />
+        <div className="relative h-full py-px pl-2">
           <button
             type="button"
             onClick={() => onOpenProject?.(item.projectId)}
-            className="flex h-full w-full items-center gap-1 rounded-sm pl-7.5 text-left text-caption text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            className="flex h-full w-full items-center gap-1 rounded-sm pl-7 text-left text-caption text-faint outline-none transition-colors hover:bg-hover/80 hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
             查看全部 {item.count} 条
             <ChevronRight size={12} aria-hidden />
@@ -964,11 +967,11 @@ export function Sidebar({
               onLoadArchived?.();
             }
           }}
-          // 与项目行同一骨架（图标列 / 名称 / 旋转箭头 / 计数），但整行取 faint：归档是次要入口。
-          className="mt-1 flex h-[calc(100%-0.25rem)] w-full items-center gap-2 rounded-sm pl-2 pr-2 text-left text-section text-faint outline-none transition-colors duration-150 hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+          // 与项目行同一骨架（16px 图标列 / 名称 / 旋转箭头 / 计数），整行取 faint：归档是次要入口。
+          className="mt-1 flex h-[calc(100%-0.25rem)] w-full items-center gap-2.5 rounded-sm px-2.5 text-left text-section text-faint outline-none transition-colors duration-150 hover:bg-hover/80 hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
         >
-          <span className="flex size-3.5 shrink-0 items-center justify-center">
-            <Archive size={14} aria-hidden />
+          <span className="flex size-4 shrink-0 items-center justify-center">
+            <Archive size={14} strokeWidth={1.75} aria-hidden />
           </span>
           <span className="min-w-0 truncate">已归档</span>
           <ChevronRight
@@ -1018,8 +1021,11 @@ export function Sidebar({
           )}
         />
       )}
-      <div className="flex flex-col px-2 pb-1.5 sidebar-head-safe-t" data-product-entry-scope="sidebar-primary">
-        <div className="mb-3 flex h-8 items-center justify-between pl-1.5 pr-0.5">
+      <div
+        className="flex flex-col border-b border-border/60 px-2 pb-2 sidebar-head-safe-t"
+        data-product-entry-scope="sidebar-primary"
+      >
+        <div className="mb-2 flex h-8 items-center justify-between pl-1.5 pr-0.5">
           <div className="flex min-w-0 items-center gap-2.5">
             <BrandMark
               className="size-[26px]"
@@ -1047,26 +1053,25 @@ export function Sidebar({
           )}
         </div>
 
-        {/* 主操作：雕塑感浮起卡片，左侧墨色圆形「+」是整栏唯一的强视觉锚点；
-            有智能体选择时右侧以细分隔线切出下拉，而不是两块拼接的按钮（SIDEBAR-R1）。 */}
+        {/* 主操作：干练克制的 Codex/Linear 比例，去厚重白砖阴影；有智能体选择时右侧细线切出下拉。 */}
         <div
           data-sidebar-new
-          className="group/new oc-btn-tactile mb-2.5 flex h-9 w-full items-stretch rounded-sm border border-border bg-surface text-section shadow-sidebar-btn transition-[border-color,box-shadow,transform] duration-150 ease-standard hover:border-border-strong hover:shadow-soft [@media(hover:none)]:h-11"
+          className="group/new oc-btn-tactile mb-2 flex h-9 w-full items-stretch rounded-sm border border-border/80 bg-surface/90 text-section shadow-2xs transition-colors duration-150 ease-standard hover:border-border-strong hover:bg-surface [@media(hover:none)]:h-10"
         >
           <button
             type="button"
             data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
             onClick={onNew}
             className={cn(
-              "flex min-w-0 flex-1 items-center gap-2.5 pl-2 pr-2.5 text-left font-medium text-fg outline-none transition-colors duration-150 hover:bg-hover/70 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+              "flex min-w-0 flex-1 items-center gap-2.5 px-2.5 text-left font-medium text-fg outline-none transition-colors duration-150 hover:bg-hover/60 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
               onNewWithAgent ? "rounded-l-sm" : "rounded-sm",
             )}
           >
             <span
               aria-hidden
-              className="oc-btn-primary-craft flex size-[22px] shrink-0 items-center justify-center rounded-full text-primary-fg transition-transform duration-200 ease-spring group-hover/new:scale-105"
+              className="flex size-4 shrink-0 items-center justify-center rounded-full bg-primary text-primary-fg"
             >
-              <Plus size={13} strokeWidth={2.25} />
+              <Plus size={11} strokeWidth={2.5} />
             </span>
             <span className="truncate">新建会话</span>
           </button>
@@ -1079,21 +1084,21 @@ export function Sidebar({
                 aria-label="选择智能体后新建"
                 title="选择智能体后新建"
                 onClick={onNewWithAgent}
-                className="flex w-9 shrink-0 items-center justify-center rounded-r-sm text-faint outline-none transition-colors duration-150 hover:bg-hover/70 hover:text-fg focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:w-11"
+                className="flex w-8 shrink-0 items-center justify-center rounded-r-sm text-faint outline-none transition-colors duration-150 hover:bg-hover/60 hover:text-fg focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:w-10"
               >
-                <ChevronDown size={15} strokeWidth={1.75} />
+                <ChevronDown size={14} strokeWidth={1.75} />
               </button>
             </>
           )}
         </div>
 
-        {/* 搜索井：微凹槽容器，静息克制，聚焦时浮起成带暖陶土微光的雕塑搜索卡。 */}
-        <label className="group/search oc-surface-recessed flex h-8 min-w-0 items-center gap-2 rounded-sm pl-2.5 pr-1 text-muted transition-[background-color,box-shadow,border-color] duration-150 hover:border-border-strong/60 focus-within:border-accent/45 focus-within:bg-sidebar-active focus-within:shadow-sidebar-active focus-within:ring-1 focus-within:ring-ring/60 [@media(hover:none)]:min-h-11">
+        {/* 搜索条：轻柔微凹槽，图标与快捷键轻盈协调。 */}
+        <label className="group/search flex h-8 min-w-0 items-center gap-2.5 rounded-sm border border-transparent bg-hover/65 pl-2.5 pr-1 text-muted transition-colors duration-150 hover:border-border/70 focus-within:border-border-strong focus-within:bg-sidebar-active focus-within:shadow-sidebar-active [@media(hover:none)]:min-h-10">
           <Search
-            size={14}
+            size={15}
             strokeWidth={1.75}
             aria-hidden
-            className="shrink-0 text-faint transition-colors group-focus-within/search:text-accent"
+            className="size-4 shrink-0 text-faint transition-colors group-focus-within/search:text-fg"
           />
           <input
             data-product-feature={PRODUCT_CAPABILITIES.sessions.id}
@@ -1137,7 +1142,7 @@ export function Sidebar({
                 e.preventDefault();
                 onOpenPalette();
               }}
-              className="oc-btn-tactile flex h-6 shrink-0 items-center justify-center rounded-xs px-0.5 text-faint outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11 [@media(hover:none)]:px-0"
+              className="oc-btn-tactile flex h-6 shrink-0 items-center justify-center rounded-xs px-0.5 text-faint outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-10 [@media(hover:none)]:px-0"
             >
               <kbd className="oc-kbd [@media(hover:none)]:hidden">{paletteKeyLabel()}</kbd>
               <Command size={15} strokeWidth={1.75} aria-hidden className="hidden [@media(hover:none)]:block" />
@@ -1185,63 +1190,62 @@ export function Sidebar({
           </div>
         )}
 
-        {onOpenBoard && (
-          <button
-            type="button"
-            data-product-feature={PRODUCT_CAPABILITIES.taskboard.id}
-            data-testid="taskboard-nav"
-            onClick={onOpenBoard}
-            aria-current={boardActive ? "true" : undefined}
-            className={cn(
-              "relative mt-1 flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section outline-none transition-[background-color,color,box-shadow] duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
-              boardActive
-                ? "bg-sidebar-active font-medium text-fg shadow-sidebar-active before:absolute before:bottom-1.5 before:left-0.5 before:top-1.5 before:w-0.5 before:rounded-xs before:bg-accent"
-                : "text-muted hover:bg-hover hover:text-fg",
+        {(onOpenBoard || onOpenSites || onOpenBlog) && (
+          <div className="mt-1.5 flex flex-col gap-0.5">
+            {onOpenBoard && (
+              <button
+                type="button"
+                data-product-feature={PRODUCT_CAPABILITIES.taskboard.id}
+                data-testid="taskboard-nav"
+                onClick={onOpenBoard}
+                aria-current={boardActive ? "true" : undefined}
+                className={cn(NAV_ITEM_BASE, boardActive ? NAV_ITEM_ACTIVE : NAV_ITEM_IDLE)}
+              >
+                <SquareKanban
+                  size={16}
+                  strokeWidth={1.75}
+                  aria-hidden
+                  className={cn("shrink-0 transition-colors", boardActive ? "text-accent" : "text-faint group-hover:text-fg")}
+                />
+                任务
+              </button>
             )}
-          >
-            <SquareKanban
-              size={15}
-              strokeWidth={1.75}
-              aria-hidden
-              className={boardActive ? "text-accent" : "text-faint"}
-            />
-            任务
-          </button>
-        )}
-        {onOpenSites && (
-          <button
-            type="button"
-            data-product-control
-            data-testid="sites-nav"
-            onClick={onOpenSites}
-            aria-current={sitesActive ? "true" : undefined}
-            className={cn(
-              "relative mt-0.5 flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section outline-none transition-[background-color,color,box-shadow] duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
-              sitesActive
-                ? "bg-sidebar-active font-medium text-fg shadow-sidebar-active before:absolute before:bottom-1.5 before:left-0.5 before:top-1.5 before:w-0.5 before:rounded-xs before:bg-accent"
-                : "text-muted hover:bg-hover hover:text-fg",
+            {onOpenSites && (
+              <button
+                type="button"
+                data-product-control
+                data-testid="sites-nav"
+                onClick={onOpenSites}
+                aria-current={sitesActive ? "true" : undefined}
+                className={cn(NAV_ITEM_BASE, sitesActive ? NAV_ITEM_ACTIVE : NAV_ITEM_IDLE)}
+              >
+                <Globe
+                  size={16}
+                  strokeWidth={1.75}
+                  aria-hidden
+                  className={cn("shrink-0 transition-colors", sitesActive ? "text-accent" : "text-faint group-hover:text-fg")}
+                />
+                站点
+              </button>
             )}
-          >
-            <Globe
-              size={15}
-              strokeWidth={1.75}
-              aria-hidden
-              className={sitesActive ? "text-accent" : "text-faint"}
-            />
-            站点
-          </button>
-        )}
-        {onOpenBlog && (
-          <button
-            type="button"
-            data-product-control
-            data-testid="blog-nav"
-            onClick={onOpenBlog}
-            className="mt-0.5 flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section text-muted outline-none transition-[background-color,color,box-shadow] duration-150 hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
-          >
-            <PenLine size={15} strokeWidth={1.75} aria-hidden className="text-faint" />
-            经验分享
-          </button>
+            {onOpenBlog && (
+              <button
+                type="button"
+                data-product-control
+                data-testid="blog-nav"
+                onClick={onOpenBlog}
+                className={cn(NAV_ITEM_BASE, NAV_ITEM_IDLE)}
+              >
+                <PenLine
+                  size={16}
+                  strokeWidth={1.75}
+                  aria-hidden
+                  className="shrink-0 text-faint transition-colors group-hover:text-fg"
+                />
+                经验分享
+              </button>
+            )}
+          </div>
         )}
       </div>
 
@@ -1304,8 +1308,8 @@ export function Sidebar({
         </div>
       ) : null}
 
-      {/* 底栏：精致分隔与浮面层级，账号区 + 案例展厅 + 主题切换光学对齐。 */}
-      <div className="border-t border-border/80 bg-sidebar/95 px-2 pt-1.5 sidebar-foot-safe-b">
+      {/* 底栏：克制发丝边界，账号区 + 案例展厅 + 主题切换光学对齐。 */}
+      <div className="border-t border-border/60 px-2 pt-1.5 sidebar-foot-safe-b">
         <div className="flex items-center gap-0.5" data-product-entry-scope="sidebar-account">
           {hasAccountMenu ? (
             <DropdownMenu>
@@ -1519,7 +1523,7 @@ export function Sidebar({
               aria-label="打开案例展厅"
               title="案例展厅"
               className={cn(
-                "oc-btn-tactile h-7 shrink-0 gap-1 rounded-sm text-faint hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11",
+                "oc-btn-tactile h-7 shrink-0 gap-1 rounded-sm text-faint hover:text-fg [@media(hover:none)]:min-h-10 [@media(hover:none)]:min-w-10",
                 footerCompact ? "w-7 px-0" : "px-2",
               )}
             >

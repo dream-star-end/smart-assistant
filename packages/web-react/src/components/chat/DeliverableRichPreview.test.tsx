@@ -163,6 +163,20 @@ describe("DeliverableRichPreview · 幻灯片与二进制 Office", () => {
     expect(String(onAnnotate.mock.calls[0]?.[0] ?? "")).toContain("/w/quarterly.pptx");
     expect(String(onAnnotate.mock.calls[0]?.[0] ?? "")).toContain("预览图");
   });
+
+  test("PDF 无法读取时隐藏顶部「批注修改」按钮并提供「返回文件列表」入口", async () => {
+    const onBack = vi.fn();
+    render(
+      <ToastProvider>
+        <DeliverableRichPreview path="relative/unreadable.pdf" onBackToList={onBack} />
+      </ToastProvider>,
+    );
+
+    expect(await screen.findByTestId("deliverable-pdf-fallback")).toBeInTheDocument();
+    expect(screen.queryByTestId("deliverable-annotate-trigger")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "返回文件列表" }));
+    expect(onBack).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("DeliverableRichPreview · 长文档阅读器", () => {

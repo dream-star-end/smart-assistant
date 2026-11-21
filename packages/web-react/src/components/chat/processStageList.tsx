@@ -290,22 +290,22 @@ function stepNode(messages: readonly ChatMessage[], live: boolean): { Icon: Luci
   return { Icon, tone: "idle" };
 }
 
-const NODE_TONE: Record<NodeTone, string> = {
-  live: "oc-step-node-live text-accent ring-accent/45",
-  warning: "text-warning ring-warning/40 bg-[color-mix(in_srgb,var(--warning)_10%,var(--surface))]",
-  idle: "text-faint ring-border",
+const ICON_TONE: Record<NodeTone, string> = {
+  live: "oc-codex-icon-live",
+  warning: "text-warning",
+  idle: "text-faint transition-colors group-hover/step:text-muted group-hover/sum:text-muted",
 };
 
-function StepNode({ Icon, tone }: { Icon: LucideIcon; tone: NodeTone }) {
+function StepIcon({ Icon, tone }: { Icon: LucideIcon; tone: NodeTone }) {
   return (
-    <span
+    <i
       aria-hidden
       data-testid="process-step-node"
       data-tone={tone}
-      className={`relative z-[1] mt-1.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-surface ring-1 transition-colors duration-300 [@media(hover:none)]:mt-2.5 ${NODE_TONE[tone]}`}
+      className={`not-italic flex size-4 shrink-0 items-center justify-center ${ICON_TONE[tone]}`}
     >
-      <Icon size={12.5} strokeWidth={2} />
-    </span>
+      <Icon size={14} strokeWidth={1.75} />
+    </i>
   );
 }
 
@@ -314,14 +314,16 @@ function StepNode({ Icon, tone }: { Icon: LucideIcon; tone: NodeTone }) {
 const NO_TIMINGS = new Map<string, never>();
 
 /**
- * UI-3 点开才看的一行:时间轴里的一步(人话标题 + 未成功 + 耗时,点开是「技术详情」)和「准备工作 N 步」。
+ * UI-3 / Codex 极简步骤行:14px 柔和线性图标 + 人话标题 + 副摘要 + 单行耗时，点开是轻巧「技术详情」。
  * below 不论开合都挂在标题下面(未成功的原因)。
  */
-function Fold({ testId, head, meta, below, children }: {
+function Fold({ testId, icon, head, meta, below, showChevron = false, children }: {
   testId: string;
+  icon?: ReactNode;
   head: ReactNode;
   meta?: ReactNode;
   below?: ReactNode;
+  showChevron?: boolean;
   children: ReactNode;
 }) {
   const [open, setOpen] = useState(false);
@@ -331,15 +333,16 @@ function Fold({ testId, head, meta, below, children }: {
         type="button"
         aria-expanded={open}
         onClick={() => setOpen(!open)}
-        className="group/step -mx-1.5 flex min-h-9 w-[calc(100%+0.75rem)] items-center gap-2 rounded-lg px-2 py-1.5 text-left outline-none transition-colors duration-150 hover:bg-hover/75 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+        className="group/step -mx-1.5 flex min-h-8 w-[calc(100%+0.75rem)] items-center gap-2 rounded-md px-1.5 py-1.5 text-left outline-none transition-colors duration-150 hover:bg-hover/65 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-10"
       >
+        {icon}
         {head}
         <span className="ml-auto flex shrink-0 items-center gap-1.5 pl-1">
           {meta}
           <ChevronRight
-            size={14}
+            size={13}
             aria-hidden
-            className={`text-faint transition-transform duration-200 ${open ? "rotate-90" : "opacity-0 group-hover/step:opacity-100 group-focus-visible/step:opacity-100 [@media(hover:none)]:opacity-100"}`}
+            className={`text-faint/80 transition-transform duration-200 ${open ? "rotate-90" : showChevron ? "opacity-80 group-hover/step:text-muted" : "opacity-0 group-hover/step:opacity-100 group-focus-visible/step:opacity-100 [@media(hover:none)]:opacity-100"}`}
           />
         </span>
       </button>
@@ -347,6 +350,71 @@ function Fold({ testId, head, meta, below, children }: {
       {open ? children : null}
     </div>
   );
+}
+
+const EXPLORE_CLUSTER_MIN = 3;
+
+function isFoldableExploreItem<T>(item: T, messagesOf: (item: T) => ChatMessage[]): boolean {
+  const rows = messagesOf(item);
+  if (rows.length === 0) return false;
+  return rows.every(
+    (message) =>
+      !message._payloadDeferred &&
+      message.role === "tool" &&
+      message._completed === true &&
+      !hasErrorMark(message) &&
+      workKind(message) !== "prep" &&
+      classifyMessagePhase(message) === "explore",
+  );
+}
+
+function exploreClusterLabel<T>(items: readonly T[], messagesOf: (item: T) => ChatMessage[]): string {
+  let reads = 0;
+  let searches = 0;
+  let total = 0;
+  for (const item of items) {
+    for (const message of messagesOf(item)) {
+      total += 1;
+      const kind = workKind(message);
+      if (kind === "read" || kind === "attach") reads += 1;
+      else if (kind === "search") searches += 1;
+    }
+  }
+  const count = total || items.length;
+  if (reads === count) return `已读取 ${count} 个文件`;
+  if (searches === count) return `已检索 ${count} 处代码与资料`;
+  return `已探索 ${count} 处文件与代码`;
+}
+
+type StepRun<T> =
+  | { kind: "step"; item: T }
+  | { kind: "explore-cluster"; key: string; items: T[] };
+
+function groupExploreRuns<T>(
+  items: readonly T[],
+  messagesOf: (item: T) => ChatMessage[],
+  keyOf: (item: T) => string,
+): StepRun<T>[] {
+  const runs: StepRun<T>[] = [];
+  let buffer: T[] = [];
+  const flush = () => {
+    if (buffer.length >= EXPLORE_CLUSTER_MIN) {
+      runs.push({ kind: "explore-cluster", key: `explore:${keyOf(buffer[0]!)}`, items: buffer });
+    } else {
+      for (const item of buffer) runs.push({ kind: "step", item });
+    }
+    buffer = [];
+  };
+  for (const item of items) {
+    if (isFoldableExploreItem(item, messagesOf)) {
+      buffer.push(item);
+    } else {
+      flush();
+      runs.push({ kind: "step", item });
+    }
+  }
+  flush();
+  return runs;
 }
 
 /** 一段的节点:段里有在跑的就是运行态;图标取段内最多的那类。未成功在摘要行右侧单独标出,不把整段染红。 */
@@ -385,35 +453,6 @@ function StageText({ message, live = false, onFirstTextPaint }: {
       <FirstTextPaintCommitProbe message={message} onFirstTextPaint={onFirstTextPaint} />
       <ProgressiveMarkdown text={text} live={live} />
     </div>
-  );
-}
-
-/** 时间轴上的一行:左列节点,右列内容。内容列与节点中心对齐到同一条竖线。 */
-function RailRow({
-  node,
-  children,
-  enter,
-  testId,
-}: {
-  node: ReactNode;
-  children: ReactNode;
-  enter: boolean;
-  testId?: string;
-}) {
-  return (
-    <div data-testid={testId} className={enter ? "oc-step-enter oc-rail-step relative flex gap-3" : "oc-rail-step relative flex gap-3"}>
-      {node}
-      <div className="oc-rail-step-body min-w-0 flex-1">{children}</div>
-    </div>
-  );
-}
-
-/** 叙述段(中途的说明文字)在时间轴上只挂一颗小圆点,正文与步骤标题左缘对齐。 */
-function NarrativeDot() {
-  return (
-    <span aria-hidden className="relative z-[1] flex w-6 shrink-0 justify-center pt-[9px]">
-      <span className="size-1.5 rounded-full bg-border-strong ring-4 ring-surface" />
-    </span>
   );
 }
 
@@ -530,19 +569,24 @@ export function ProcessStageList<T>({
         ? `执行 ${formatStepDuration(stepTiming.executionMs)} · 等待 ${formatStepDuration(stepTiming.ms - stepTiming.executionMs)}`
         : "";
     return (
-      <RailRow key={key} testId="process-step" node={<StepNode Icon={node.Icon} tone={node.tone} />} enter={active && key === lastItemKey}>
+      <div
+        key={key}
+        data-testid="process-step"
+        className={active && key === lastItemKey ? "oc-step-enter min-w-0" : "min-w-0"}
+      >
         {(inline || delegated) && head ? (
-          // UI-3 & OCV5-831:主动作名 + 轻量人类可读副摘要(toolSummary/任务单号/检索词/短文件名/安全命令头),
+          // UI-3 & OCV5-831 / OCV5-834: Codex 极简紧凑行（14px 柔和线性微图标 + 主动作 + 人类可读副摘要 + 单行耗时），
           // 完整命令、参数与输出在点开后的「技术详情」(原卡,原样)里。
           <Fold
             testId="process-step-row"
+            icon={<StepIcon Icon={node.Icon} tone={node.tone} />}
             head={
               <>
                 <span
                   className={
                     subtitle
                       ? `max-w-[46%] shrink-0 truncate text-body font-medium ${node.tone === "live" ? "text-fg" : "text-fg/85"}`
-                      : `min-w-0 truncate text-body ${node.tone === "live" ? "text-muted" : "text-faint"}`
+                      : `min-w-0 truncate text-body ${node.tone === "live" ? "text-muted" : "text-faint group-hover/step:text-muted"}`
                   }
                 >
                   {node.tone === "live" && head.role === "thinking" ? "正在思考" : title}
@@ -557,21 +601,21 @@ export function ProcessStageList<T>({
                   </span>
                 ) : null}
                 {delegation ? (
-                  <span data-testid="process-delegate-state" className={`shrink-0 text-meta ${delegation.running ? "text-muted" : "text-faint"}`}>
+                  <span data-testid="process-delegate-state" className={`shrink-0 text-caption ${delegation.running ? "text-muted" : "text-faint"}`}>
                     {delegation.label}
                   </span>
-                ) : hasErrorMark(head) ? <span className="shrink-0 text-meta text-faint">未成功</span> : null}
+                ) : hasErrorMark(head) ? <span className="shrink-0 text-caption text-faint">未成功</span> : null}
               </>
             }
             meta={<StepMetaBadge ids={rowIds} tokenUsage={tokenUsageOf?.(item)} />}
             below={reason ? (
               // 未成功写原因(错误输出首行),安静灰字;整轮失败另有顶层提示。
-              <div data-testid="process-step-reason" className="-mt-0.5 truncate pb-1 text-meta text-faint" title={reason}>
+              <div data-testid="process-step-reason" className="-mt-0.5 truncate pb-1 pl-6 text-caption text-faint" title={reason}>
                 {reason}
               </div>
             ) : null}
           >
-            <div data-testid="process-step-tech" className="oc-reveal mb-1.5 mt-0.5 border-l-2 border-border pl-3">
+            <div data-testid="process-step-tech" className="oc-reveal mb-1.5 ml-2 mt-0.5 border-l border-border/75 pl-3">
               <p className="flex flex-wrap items-center gap-x-2 pt-0.5 text-caption tabular-nums text-faint">
                 <span>技术详情</span>
                 {splitTimingDetail ? <span data-testid="process-step-timing-detail">{splitTimingDetail}</span> : null}
@@ -582,27 +626,63 @@ export function ProcessStageList<T>({
         ) : (
           <div className="py-1">{body}</div>
         )}
-      </RailRow>
+      </div>
     );
   };
 
-  /** 一段的展开明细:人话步骤在前,底层步骤收成一行「准备工作 N 步」挂在后面。 */
+  /** 一段的展开明细:人话步骤在前(连续 ≥3 条已完成只读探索微折叠),底层步骤收成一行「准备工作 N 步」挂在后面。 */
   const stepRows = (items: readonly T[], isLastSection: boolean) => {
     const prep = items.filter((item) => {
       const rows = messagesOf(item);
       return rows.length > 0 && rows.every((message) => workKind(message) === "prep");
     });
+    const prepSet = new Set(prep);
+    const main = items.filter((item) => !prepSet.has(item));
     const last = items.at(-1);
     const row = (item: T) => stepRow(item, isLastSection && item === last);
+    const runs = groupExploreRuns(main, messagesOf, keyOf);
     return (
       <>
-        {items.filter((item) => !prep.includes(item)).map(row)}
+        {runs.map((entry) => {
+          if (entry.kind === "step") return row(entry.item);
+          const clusterIds = entry.items.flatMap((item) => messagesOf(item).map((message) => message.id));
+          const clusterTiming = combineStepTimings(stepTimings, clusterIds);
+          const clusterLabel = exploreClusterLabel(entry.items, messagesOf);
+          return (
+            <div key={entry.key} className="min-w-0">
+              <Fold
+                testId="process-explore-cluster"
+                icon={<StepIcon Icon={Search} tone="idle" />}
+                head={<span className="min-w-0 truncate text-body text-muted">{clusterLabel}</span>}
+                meta={
+                  clusterTiming?.ms !== undefined ? (
+                    <span className="shrink-0 whitespace-nowrap text-caption tabular-nums text-faint">
+                      {formatStepDuration(clusterTiming.ms)}
+                    </span>
+                  ) : undefined
+                }
+                showChevron
+              >
+                <div className="ml-2 mt-0.5 space-y-0.5 border-l border-border/55 pl-3">
+                  {entry.items.map(row)}
+                </div>
+              </Fold>
+            </div>
+          );
+        })}
         {prep.length ? (
-          <RailRow node={<StepNode Icon={Wrench} tone="idle" />} enter={false}>
-            <Fold testId="process-prep" head={<span className="min-w-0 truncate text-body text-faint">{`准备工作 ${prep.length} 步`}</span>}>
-              {prep.map(row)}
+          <div className="min-w-0">
+            <Fold
+              testId="process-prep"
+              icon={<StepIcon Icon={Wrench} tone="idle" />}
+              head={<span className="min-w-0 truncate text-body text-faint">{`准备工作 ${prep.length} 步`}</span>}
+              showChevron
+            >
+              <div className="ml-2 mt-0.5 space-y-0.5 border-l border-border/55 pl-3">
+                {prep.map(row)}
+              </div>
             </Fold>
-          </RailRow>
+          </div>
         ) : null}
       </>
     );
@@ -636,52 +716,45 @@ export function ProcessStageList<T>({
             {filteredItems !== null ? (
               <div data-testid="process-phase-filtered" data-phase-filter={activePhaseFilter}>
                 {filteredPhaseSegment ? <PhaseGroupHeader phase={filteredPhaseSegment} /> : null}
-                <div className="oc-rail relative space-y-0.5">
+                <div className="space-y-0.5">
                   {filteredItems.map((item, idx) => stepRow(item, idx === filteredItems.length - 1))}
                 </div>
               </div>
             ) : (
-            <div className="oc-rail relative space-y-0.5">
+            <div className="space-y-0.5">
             {sections.map((section, index) => {
               const isLastSection = index === sections.length - 1;
               if (section.card) {
                 // 过程里常显的整卡步骤:已回答的问答/审批(用户的选择是这轮的关键事实)、
                 // 本轮已越过的中途错误(模型不可用等)。用原卡渲染,不藏在「N 项」后面。
-                const node = stepNode(section.messages, false);
                 return (
-                  <RailRow key={section.key} testId="process-card" node={<StepNode Icon={node.Icon} tone={node.tone} />} enter={false}>
-                    <div className="min-w-0 space-y-1.5 py-1">
-                      {/* 能进过程的错误卡都已被本轮越过:不再给重试/切换模型/从断点继续(会重复开工)。 */}
-                      <RecoveredStepContext.Provider value>
-                        {section.items.map((item) => (
-                          <div key={keyOf(item)}>{renderItem(item)}</div>
-                        ))}
-                      </RecoveredStepContext.Provider>
-                    </div>
-                  </RailRow>
+                  <div key={section.key} data-testid="process-card" className="min-w-0 space-y-1.5 py-1">
+                    {/* 能进过程的错误卡都已被本轮越过:不再给重试/切换模型/从断点继续(会重复开工)。 */}
+                    <RecoveredStepContext.Provider value>
+                      {section.items.map((item) => (
+                        <div key={keyOf(item)}>{renderItem(item)}</div>
+                      ))}
+                    </RecoveredStepContext.Provider>
+                  </div>
                 );
               }
               if (section.goal) {
                 return (
-                  <RailRow key={section.key} testId="process-goal" node={<StepNode Icon={Target} tone="idle" />} enter={false}>
-                    <div className="py-1">
-                      {section.items.map((item) => (
-                        <div key={keyOf(item)}>{renderItem(item)}</div>
-                      ))}
-                    </div>
-                  </RailRow>
+                  <div key={section.key} data-testid="process-goal" className="min-w-0 py-1">
+                    {section.items.map((item) => (
+                      <div key={keyOf(item)}>{renderItem(item)}</div>
+                    ))}
+                  </div>
                 );
               }
               if (section.narrative) {
                 const current = active && index === currentIndex;
-                // Intermediate replies stay fully readable for the whole turn.
-                // A one-line stage hid text the reader had already seen, then
-                // showed it again only after the turn ended. Tool groups still
-                // collapse. Only the current stage is live.
+                // Intermediate replies stay fully readable for the whole turn,
+                // styled naturally like Codex editorial commentary without extra dots.
                 return (
-                  <RailRow key={section.key} node={<NarrativeDot />} enter={false}>
-                    <div className="py-1">{narrativeBody(section, current)}</div>
-                  </RailRow>
+                  <div key={section.key} className="oc-codex-commentary min-w-0">
+                    {narrativeBody(section, current)}
+                  </div>
                 );
               }
               const details = detailOpen(section.key);
@@ -696,69 +769,56 @@ export function ProcessStageList<T>({
                   </div>
                 );
               }
-              // OCV5-312: 流光挂在「正在干活」的这一段摘要行上(当前段、本轮仍在进行),表明 agent 此刻在做什么;
-              // 其余过程文字一律 --faint,让下方 agent 的回复正文更突出。当前在写正文(叙述段)时不挂流光,流式文字本身就是信号。
-              // 有意为之:干活行的回落色是 --muted(比完成行略实)。流光与节点光晕在 reduced-motion / 不支持
-              // background-clip:text 时都不生效,这一档静态差异是那时唯一能指出「哪一行在干活」的线索;
-              // 动效正常时流光静止色本就是 --faint,观感与其余过程行一致。
-              // UI-3:在干活的段,摘要行就是这一轮唯一的运行状态行(写「正在…」),跑完才换成这一段的人话摘要;
-              // 工具都已返回、在等模型时(#1234)那一行落到下面的「等待模型响应」尾行,不把已完成的工具标为仍在执行。
               const working = !!live && index === currentIndex && !toolsSettled;
               const groupTiming = working ? undefined : combineStepTimings(stepTimings, section.messages.map((message) => message.id));
               return (
                 <div key={section.key} className="space-y-0.5" data-testid="process-step-group">
-                  <RailRow node={<StepNode Icon={group.Icon} tone={group.tone} />} enter={false}>
-                    <button
-                      type="button"
-                      className="group/sum -mx-1.5 flex min-h-9 w-[calc(100%+0.75rem)] items-center gap-2 rounded-lg px-2 py-1.5 text-left transition-colors duration-150 hover:bg-hover/75 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-11"
-                      aria-expanded={details}
-                      data-testid="process-detail-toggle"
-                      onClick={() => setDetailOpen(section.key, !details)}
+                  <button
+                    type="button"
+                    className="group/sum -mx-1.5 flex min-h-8 w-[calc(100%+0.75rem)] items-center gap-2 rounded-md px-1.5 py-1.5 text-left transition-colors duration-150 hover:bg-hover/65 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-10"
+                    aria-expanded={details}
+                    data-testid="process-detail-toggle"
+                    onClick={() => setDetailOpen(section.key, !details)}
+                  >
+                    <StepIcon Icon={group.Icon} tone={group.tone} />
+                    <span
+                      data-testid="process-group-summary"
+                      data-live-working={working ? "true" : "false"}
+                      className={`min-w-0 truncate text-body ${working ? "oc-live-status-shine text-muted" : "text-faint"}`}
                     >
+                      {working && live ? (
+                        <span key={live.text} data-testid="process-step-live" data-live-pending={live.pending ? "true" : "false"} className="oc-swap-in">
+                          {live.text}
+                        </span>
+                      ) : (
+                        groupSummary(section.messages)
+                      )}
+                    </span>
+                    {working && runningFor ? (
                       <span
-                        data-testid="process-group-summary"
-                        data-live-working={working ? "true" : "false"}
-                        className={`min-w-0 truncate text-body ${working ? "oc-live-status-shine text-muted" : "text-faint"}`}
-                      >
-                        {working && live ? (
-                          <span key={live.text} data-testid="process-step-live" data-live-pending={live.pending ? "true" : "false"} className="oc-swap-in">
-                            {live.text}
-                          </span>
-                        ) : (
-                          groupSummary(section.messages)
-                        )}
-                      </span>
-                      {working && runningFor ? (
-                        // 长命令 / 长工具:流光之外再给一个每秒在走的数字,一眼看出「还在跑、跑了多久」。
-                        // 读屏不播报每秒变化的时长。
-                        <span
-                          aria-hidden
-                          data-testid="process-step-running-for"
-                          className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint"
-                        >
-                          {`已运行 ${runningFor}`}
-                        </span>
-                      ) : groupTiming?.ms !== undefined ? (
-                        // OCV5-367: 折叠的步骤组给出这一组合计用时(组内每一步都有可信时间才给)。
-                        <span
-                          data-testid="process-group-duration"
-                          className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint"
-                          title={`这一组步骤共用时 ${formatStepDuration(groupTiming.ms)}`}
-                        >
-                          {formatStepDuration(groupTiming.ms)}
-                        </span>
-                      ) : null}
-                      {/* OCV5-313: 不在摘要行单独点出「N 步未成功」——中途个别步骤没成功是正常流程,
-                          事实留在展开后的步骤行里(安静的灰字),整轮失败另有顶层错误卡。 */}
-                      <ChevronRight
-                        size={14}
                         aria-hidden
-                        className={`ml-auto shrink-0 text-faint transition-transform duration-200 ease-[var(--ease-spring)] group-hover/sum:text-muted ${details ? "rotate-90" : ""}`}
-                      />
-                    </button>
-                  </RailRow>
+                        data-testid="process-step-running-for"
+                        className="shrink-0 whitespace-nowrap text-caption tabular-nums text-faint"
+                      >
+                        {`已运行 ${runningFor}`}
+                      </span>
+                    ) : groupTiming?.ms !== undefined ? (
+                      <span
+                        data-testid="process-group-duration"
+                        className="shrink-0 whitespace-nowrap text-caption tabular-nums text-faint"
+                        title={`这一组步骤共用时 ${formatStepDuration(groupTiming.ms)}`}
+                      >
+                        {formatStepDuration(groupTiming.ms)}
+                      </span>
+                    ) : null}
+                    <ChevronRight
+                      size={13}
+                      aria-hidden
+                      className={`ml-auto shrink-0 text-faint/80 transition-transform duration-200 ease-[var(--ease-spring)] group-hover/sum:text-muted ${details ? "rotate-90" : ""}`}
+                    />
+                  </button>
                   {details ? (
-                    <div className="space-y-0.5" data-testid="process-details">
+                    <div className="ml-2 mt-0.5 space-y-0.5 border-l border-border/55 pl-3" data-testid="process-details">
                       {stepRows(section.items, isLastSection)}
                     </div>
                   ) : null}
@@ -766,16 +826,13 @@ export function ProcessStageList<T>({
               );
             })}
             {waiting && live ? (
-              // 可见进展之后在等模型(叙述写完或工具都已返回):在最新进展处挂一行活的「等待模型响应」+ 等待时长,
-              // 不把已经完成的工具标为仍在执行。下一步一冒出来这行就消失,流光随之落到那一段的摘要行上。
-              <RailRow key="__live-tail" testId="process-live-tail" node={<StepNode Icon={Brain} tone="live" />} enter>
-                <div className="flex min-h-9 items-center gap-2 py-1.5 [@media(hover:none)]:min-h-11">
-                  <span data-testid="process-step-live" data-live-pending="true" className="oc-live-status-shine min-w-0 truncate text-body text-muted">等待模型响应</span>
-                  <span aria-hidden className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint">
-                    {formatElapsed(waitingMs)}
-                  </span>
-                </div>
-              </RailRow>
+              <div key="__live-tail" data-testid="process-live-tail" className="oc-step-enter flex min-h-8 items-center gap-2 py-1 [@media(hover:none)]:min-h-10">
+                <StepIcon Icon={Brain} tone="live" />
+                <span data-testid="process-step-live" data-live-pending="true" className="oc-live-status-shine min-w-0 truncate text-body text-muted">等待模型响应</span>
+                <span aria-hidden className="shrink-0 whitespace-nowrap text-caption tabular-nums text-faint">
+                  {formatElapsed(waitingMs)}
+                </span>
+              </div>
             ) : null}
             </div>
             )}

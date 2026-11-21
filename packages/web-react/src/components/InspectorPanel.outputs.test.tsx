@@ -106,9 +106,16 @@ describe("产出页", () => {
     fireEvent.click(screen.getByRole("radio", { name: "改动 2" }));
     expect(screen.getAllByTestId("pane-file-change")).toHaveLength(2);
 
+    // 多产物精读态顶栏提供「← 文件列表 (3)」返回 Codex 目录总览，浏览全部文件 / 媒体 / 预览链接 / 来源
+    const backBtn = screen.getByTestId("outputs-back-to-list");
+    expect(backBtn).toHaveTextContent("文件列表");
+    expect(backBtn).toHaveTextContent("(3)");
+    fireEvent.click(backBtn);
+
+    expect(screen.getByTestId("outputs-directory")).toBeInTheDocument();
+    expect(screen.getByTestId("outputs-directory-header")).toHaveTextContent("文件与产出 · 3 项");
     const files = screen.getAllByTestId("outputs-file");
     expect(files.map((f) => f.textContent)).toEqual([expect.stringContaining("index.html"), expect.stringContaining("style.css")]);
-    expect(files[0]).toHaveAttribute("aria-current", "true");
     expect(screen.getAllByTestId("outputs-media")).toHaveLength(1);
     const link = screen.getByTestId("outputs-link");
     expect(link).toHaveAttribute("href", "http://localhost:5173/");
@@ -118,7 +125,7 @@ describe("产出页", () => {
     expect(source).toHaveAttribute("target", "_blank");
     expect(source).toHaveAttribute("rel", "noopener noreferrer");
 
-    // 点别的文件 → 成为主产物
+    // 点别的文件 → 进入单文件精读视图
     fireEvent.click(files[1]);
     expect(screen.getByTestId("outputs-hero-name")).toHaveTextContent("style.css");
     expect(await screen.findByTestId("output-preview-source")).toHaveTextContent("color: red");
@@ -133,7 +140,7 @@ describe("产出页", () => {
     expect(within(md).getAllByRole("listitem")).toHaveLength(2);
   });
 
-  test("回放不出来(只有 Edit)→ 读容器里的当前文件;读不到给重试", async () => {
+  test("回放不出来(只有 Edit)→ 读容器里的当前文件;读不到给「重试读取」并自动隐藏「批注修改」", async () => {
     render(
       <InspectorPanelContent
         messages={[user("u1", "改一下"), tool("e1", "Edit", { file_path: `${W}/app.py`, old_string: "a", new_string: "b" })]}
@@ -142,9 +149,11 @@ describe("产出页", () => {
     );
     await outputsReady();
     expect(screen.getByTestId("outputs-hero-origin")).toHaveTextContent("容器里的当前文件");
-    // 测试环境没有签名通道 → 读取失败,给重试
-    expect(await screen.findByText("没能读取这个文件（可能已被移动或删除）。")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "继续" })).toBeInTheDocument();
+    // 测试环境没有签名通道 → 读取失败,展示人话「重试读取」并隐藏「批注修改」
+    expect(await screen.findByText("没能读取这个文件")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重试读取" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
+    expect(screen.queryByTestId("hero-quick-annotate")).toBeNull();
   });
 
   test("读容器文件的回落:文件又被改过(新的一次 Edit 完成)就重读", async () => {
@@ -298,13 +307,59 @@ describe("产出页", () => {
     await outputsReady();
     expect(screen.getByTestId("pane-header")).toHaveClass("header-safe-t");
 
-    // 多轮 / 多文件时显示极轻单行微条，依然无冗余 TurnBar 与「查看步骤 >」
+    // 多轮单文件时显示清晰的「第 2/2 轮」微条，翻到多产物轮次默认展示 Codex 文件目录总览而非盲翻
     expect(screen.queryByTestId("outputs-turn")).toBeNull();
     expect(screen.queryByTestId("outputs-open-steps")).toBeNull();
     const strip = screen.getByTestId("outputs-compact-strip");
-    expect(strip).toHaveTextContent("2/2");
+    expect(strip).toHaveTextContent("第 2/2 轮");
     fireEvent.click(within(strip).getByLabelText("上一轮"));
-    expect(screen.getByTestId("outputs-compact-strip")).toHaveTextContent("1/2");
-    expect(screen.getByTestId("outputs-compact-file-picker")).toBeInTheDocument();
+    expect(screen.getByTestId("outputs-directory")).toBeInTheDocument();
+    expect(screen.getByTestId("outputs-directory-header")).toHaveTextContent("文件与产出 · 3 项");
+    expect(screen.getByTestId("outputs-turn-counter")).toHaveTextContent("第 1/2 轮");
+
+    // 点击文件平滑进入精读视图，顶栏展示「← 文件列表 (3)」与前后文件切换钮
+    fireEvent.click(screen.getAllByTestId("outputs-file")[0]);
+    expect(screen.getByTestId("outputs-back-to-list")).toHaveTextContent("(3)");
+    expect(screen.getByTestId("outputs-hero-name")).toHaveTextContent("index.html");
+    fireEvent.click(screen.getByLabelText("下一份文件"));
+    expect(screen.getByTestId("outputs-hero-name")).toHaveTextContent("style.css");
+  });
+
+  test("Codex 两级体验 + 幽灵路径过滤 + 移动端报错态提供「重试读取 / 返回文件列表」并隐藏「批注修改」", async () => {
+    const messages: ChatMessage[] = [
+      user("u1", "构建并改两个文件", TS),
+      tool("e1", "Edit", { file_path: `${W}/missing.ts`, old_string: "a", new_string: "b" }),
+      tool("w1", "Write", { file_path: `${W}/notes.md`, content: "# 说明\n内容\n" }),
+      assistant(
+        "a1",
+        "构建输出 `/assets/styles-1VWWTp9J.css`、宿主机 `/var/lib/docker/volumes/oc/_data/x.ts`、`/opt/openclaude/a.ts`。",
+        TS + 5_000,
+      ),
+    ];
+
+    render(<InspectorPanelContent messages={messages} sheet onClose={() => {}} />);
+    await outputsReady();
+
+    // 幽灵路径被彻底过滤，仅剩 2 个真实工作区文件，且默认打开 Codex 目录总览
+    expect(screen.getByTestId("outputs-directory")).toBeInTheDocument();
+    expect(screen.getByTestId("outputs-directory-header")).toHaveTextContent("文件与产出 · 2 项");
+    const rows = screen.getAllByTestId("outputs-file");
+    expect(rows.map((r) => r.textContent)).toEqual([
+      expect.stringContaining("missing.ts"),
+      expect.stringContaining("notes.md"),
+    ]);
+    expect(screen.queryByText(/styles-1VWWTp9J\.css/)).toBeNull();
+
+    // 点开不可读的 missing.ts → 报错态给出「重试读取」与「返回文件列表」，并自动隐藏「批注修改」
+    fireEvent.click(rows[0]);
+    expect(await screen.findByText("没能读取这个文件")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重试读取" })).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /返回文件列表/ }).length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByTestId("hero-quick-annotate")).toBeNull();
+    expect(screen.queryByRole("button", { name: /批注修改/ })).toBeNull();
+
+    // 点击「返回文件列表」回到目录总览
+    fireEvent.click(screen.getByTestId("outputs-back-to-list"));
+    expect(screen.getByTestId("outputs-directory")).toBeInTheDocument();
   });
 });

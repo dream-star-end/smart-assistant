@@ -3243,3 +3243,24 @@ test("a manually continued diagnostic-only error does not become a saved answer"
   expect(screen.queryByRole("alert")).toBeNull();
   expect(JSON.stringify(messages)).toBe(before);
 });
+
+test("OCV5-834: Codex 活动流无白卡外壳、旁白自然呈现且连续只读探索优雅微折叠", () => {
+  const owner = { _clientMessageId: "u-codex" };
+  renderList([
+    row("u-codex", "user", "排查样式问题", { status: "replied", ts: 1_700_000_000_000 }),
+    row("c-note", "assistant", "我先逐个核对相关样式与组件实现。", { ...owner, ts: 1_700_000_001_000 }),
+    row("c-r1", "tool", "读取", { ...owner, toolName: "Read", inputJson: { file_path: "src/a.tsx" }, _completed: true }),
+    row("c-r2", "tool", "读取", { ...owner, toolName: "Read", inputJson: { file_path: "src/b.tsx" }, _completed: true }),
+    row("c-r3", "tool", "搜索", { ...owner, toolName: "Grep", inputJson: { pattern: "oc-codex-rail" }, _completed: true }),
+    row("c-e1", "tool", "编辑", { ...owner, toolName: "Edit", inputJson: { file_path: "src/a.tsx", old_string: "a", new_string: "b" }, _completed: true }),
+    row("c-ans", "assistant", "已按 Codex 极简流完成重构。", { ...owner, ts: 1_700_000_010_000 }),
+  ]);
+  fireEvent.click(screen.getByTestId("process-toggle"));
+  const stages = screen.getByTestId("process-stages");
+  expect(stages.className).not.toContain("oc-surface-card");
+  expect(stages.className).toContain("oc-codex-rail");
+  expect(within(stages).getByTestId("process-stage")).toHaveTextContent("我先逐个核对相关样式与组件实现。");
+  expect(stages.querySelector(".oc-codex-commentary")).not.toBeNull();
+  for (const toggle of screen.queryAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
+  expect(within(stages).getByTestId("process-explore-cluster")).toHaveTextContent("已探索 3 处文件与代码");
+});

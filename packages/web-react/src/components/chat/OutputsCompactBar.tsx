@@ -1,19 +1,30 @@
 /**
- * 移动端紧凑态极轻单行微条（~32px，OCV5-820）：
- * 仅在多轮或多产物时出现，提供「轮次切换 + 文件切换 + 预览/源码图标切换」；
- * 单轮单文件时不渲染，直接全出血进入预览正文。
+ * Codex 风格单文件精读顶栏 / 移动端紧凑微条（OCV5-820 / OCV5-834）：
+ *   - 多产物进入精读态：左侧「← 文件列表 (N)」+ 当前文件名 + 右侧轻量 `‹ ›` 切换下一份（+ 紧凑模式视图切换）；
+ *   - 单产物多轮紧凑态：清晰的「‹ 第 X/Y 轮 ›」+ 文件名 + 视图切换（告别迷惑的裸 `< 8/8 >`）；
+ *   - 单轮单产物紧凑态：不渲染，直接全出血进入预览正文。
  */
-import { ChevronDown, ChevronLeft, ChevronRight, Code2, Eye, FileDiff } from "lucide-react";
+import { ArrowLeft, ChevronLeft, ChevronRight, Code2, Eye, FileDiff } from "lucide-react";
 import { cn } from "../../lib/utils";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "../ui";
 import type { HeroRef, TurnOutputs } from "./workbench";
 
 export type CompactHeroView = "preview" | "source" | "changes";
+
+function listDeliverables(outputs: TurnOutputs): HeroRef[] {
+  return [
+    ...outputs.files.map((f): HeroRef => ({ type: "file", path: f.path })),
+    ...outputs.media.map((m): HeroRef => ({ type: "media", src: m.src })),
+  ];
+}
+
+function activeDeliverableIndex(items: readonly HeroRef[], hero: HeroRef | null): number {
+  if (!hero) return -1;
+  return items.findIndex((item) =>
+    item.type === "file" && hero.type === "file"
+      ? item.path === hero.path
+      : item.type === "media" && hero.type === "media" && item.src === hero.src,
+  );
+}
 
 export function OutputsCompactBar({
   turnIndex,
@@ -24,6 +35,8 @@ export function OutputsCompactBar({
   hero,
   heroName,
   onPick,
+  onBackToList,
+  showFileName = true,
   view,
   viewOptions,
   onChangeView,
@@ -36,21 +49,44 @@ export function OutputsCompactBar({
   hero: HeroRef | null;
   heroName?: string;
   onPick: (ref: HeroRef) => void;
+  /** 多产物精读态返回「文件目录总览」的回调。 */
+  onBackToList?: () => void;
+  /** 是否在本条中渲染当前文件名（桌面端 FileHero 自带文件名头部时可关闭，避免重复）。 */
+  showFileName?: boolean;
   view?: CompactHeroView;
   viewOptions?: readonly { value: CompactHeroView; label: string }[];
   onChangeView?: (v: CompactHeroView) => void;
 }) {
-  const deliverableCount = outputs.files.length + outputs.media.length;
+  const deliverables = listDeliverables(outputs);
+  const deliverableCount = deliverables.length;
   const multiTurn = turnTotal > 1;
   const multiOutput = deliverableCount > 1;
-  if (!multiTurn && !multiOutput) return null;
+  const showBack = Boolean(onBackToList && multiOutput);
+
+  if (!showBack && !multiTurn) return null;
+
+  const curIdx = activeDeliverableIndex(deliverables, hero);
+  const canPrevFile = showBack && curIdx > 0;
+  const canNextFile = showBack && curIdx >= 0 && curIdx < deliverableCount - 1;
 
   return (
     <div
-      className="oc-surface-glass flex h-9 shrink-0 items-center gap-1.5 border-b border-border/75 px-2.5 text-caption text-muted"
+      className="oc-surface-glass flex min-h-10 shrink-0 items-center gap-1.5 border-b border-border/75 px-2.5 py-1 text-caption text-muted"
       data-testid="outputs-compact-strip"
     >
-      {multiTurn && (
+      {showBack ? (
+        <button
+          type="button"
+          onClick={onBackToList}
+          aria-label="返回文件列表"
+          data-testid="outputs-back-to-list"
+          className="oc-btn-tactile inline-flex min-h-7 shrink-0 items-center gap-1 rounded-md px-2 py-1 text-caption font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-9"
+        >
+          <ArrowLeft size={13} aria-hidden />
+          <span>文件列表</span>
+          <span className="tabular-nums text-faint">({deliverableCount})</span>
+        </button>
+      ) : multiTurn ? (
         <div className="oc-surface-recessed flex shrink-0 items-center gap-0.5 rounded-md p-0.5">
           <button
             type="button"
@@ -61,8 +97,8 @@ export function OutputsCompactBar({
           >
             <ChevronLeft size={12} />
           </button>
-          <span className="px-1 font-medium tabular-nums text-fg" data-testid="outputs-turn-counter">
-            {turnIndex + 1}/{turnTotal}
+          <span className="px-1.5 font-medium tabular-nums text-fg" data-testid="outputs-turn-counter">
+            第 {turnIndex + 1}/{turnTotal} 轮
           </span>
           <button
             type="button"
@@ -74,54 +110,49 @@ export function OutputsCompactBar({
             <ChevronRight size={12} />
           </button>
         </div>
-      )}
+      ) : null}
 
-      {multiOutput ? (
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <button
-              type="button"
-              data-testid="outputs-compact-file-picker"
-              className="oc-btn-tactile inline-flex min-w-0 flex-1 items-center gap-1 rounded-md px-2 py-1 text-left text-caption font-medium text-fg outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              <span className="truncate" data-testid="outputs-hero-name">
-                {heroName ?? "选择产物"}
-              </span>
-              <span className="shrink-0 tabular-nums text-faint">({deliverableCount})</span>
-              <ChevronDown size={12} className="shrink-0 text-faint" aria-hidden />
-            </button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="z-[70] max-w-[18rem]">
-            {outputs.files.map((f) => {
-              const active = hero?.type === "file" && hero.path === f.path;
-              return (
-                <DropdownMenuItem
-                  key={f.path}
-                  onSelect={() => onPick({ type: "file", path: f.path })}
-                  className={cn(active && "bg-accent-soft font-medium text-accent")}
-                >
-                  <span className="truncate">{f.name}</span>
-                </DropdownMenuItem>
-              );
-            })}
-            {outputs.media.map((m) => {
-              const active = hero?.type === "media" && hero.src === m.src;
-              return (
-                <DropdownMenuItem
-                  key={m.src}
-                  onSelect={() => onPick({ type: "media", src: m.src })}
-                  className={cn(active && "bg-accent-soft font-medium text-accent")}
-                >
-                  <span className="truncate">{m.name}</span>
-                </DropdownMenuItem>
-              );
-            })}
-          </DropdownMenuContent>
-        </DropdownMenu>
-      ) : (
-        <span className="min-w-0 flex-1 truncate px-1 font-medium text-fg" data-testid="outputs-hero-name">
+      {showFileName ? (
+        <span
+          className="min-w-0 flex-1 truncate px-1 text-meta font-medium text-fg"
+          data-testid="outputs-hero-name"
+          title={heroName}
+        >
           {heroName ?? ""}
         </span>
+      ) : (
+        <span className="min-w-0 flex-1" />
+      )}
+
+      {showBack && curIdx >= 0 && (
+        <div className="oc-surface-recessed flex shrink-0 items-center gap-0.5 rounded-md p-0.5">
+          <button
+            type="button"
+            aria-label="上一份文件"
+            title="上一份文件"
+            disabled={!canPrevFile}
+            onClick={() => {
+              const target = deliverables[curIdx - 1];
+              if (target) onPick(target);
+            }}
+            className="oc-btn-tactile inline-flex size-6 items-center justify-center rounded-xs text-muted outline-none hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30"
+          >
+            <ChevronLeft size={13} />
+          </button>
+          <button
+            type="button"
+            aria-label="下一份文件"
+            title="下一份文件"
+            disabled={!canNextFile}
+            onClick={() => {
+              const target = deliverables[curIdx + 1];
+              if (target) onPick(target);
+            }}
+            className="oc-btn-tactile inline-flex size-6 items-center justify-center rounded-xs text-muted outline-none hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30"
+          >
+            <ChevronRight size={13} />
+          </button>
+        </div>
       )}
 
       {viewOptions && viewOptions.length > 1 && view && onChangeView && (

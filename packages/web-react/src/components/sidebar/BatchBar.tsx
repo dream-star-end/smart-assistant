@@ -31,7 +31,7 @@ export function BatchBar({
   const disabled = count === 0;
   return (
     <div
-      className="oc-surface-card mx-2 mb-2 flex flex-col gap-1 rounded-md px-2 py-1.5 text-caption"
+      className="mx-2 mt-1.5 mb-1 flex flex-col gap-1 rounded-sm border border-border/70 bg-sidebar-active px-2 py-1.5 text-caption shadow-sidebar-active"
       data-testid="sidebar-batch-bar"
       role="toolbar"
       aria-label="批量操作"

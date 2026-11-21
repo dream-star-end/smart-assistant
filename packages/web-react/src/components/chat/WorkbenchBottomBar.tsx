@@ -159,6 +159,7 @@ export type WorkbenchBottomBarProps = {
     label?: string;
     ariaLabel?: string;
     active?: boolean;
+    disabled?: boolean;
     onClick: () => void;
     testId?: string;
   };
@@ -255,6 +256,7 @@ export function WorkbenchBottomBar({
           size="sm"
           variant={annotate.active ? "accent" : "secondary"}
           aria-label={annotate.ariaLabel}
+          disabled={annotate.disabled}
           onClick={annotate.onClick}
           data-testid={annotate.testId ?? "deliverable-annotate-trigger"}
           className="h-8 shrink-0 gap-1.5 px-2.5 text-meta font-medium whitespace-nowrap"

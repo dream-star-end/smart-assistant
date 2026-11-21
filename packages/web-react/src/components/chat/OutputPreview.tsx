@@ -8,7 +8,7 @@
  *  - HTML:沙盒 iframe(allow-scripts、无 same-origin)+ 与聊天里的 HTML 嵌入同一份 CSP(网络只认固定 CDN、禁表单)。
  *  - 源码 / 代码 / 文本:高亮渲染，走只读 Markdown,不执行内嵌 HTML、不自动探测语言。
  */
-import { AlertCircle, RotateCw } from "lucide-react";
+import { AlertCircle, ChevronLeft, RotateCw } from "lucide-react";
 import { Suspense, lazy, useEffect, useState } from "react";
 import { Markdown } from "../Markdown";
 import { wrapWithCspOnly } from "../embedCsp";
@@ -30,6 +30,7 @@ const DeliverableRichPreview = lazy(() =>
 );
 
 export type PreviewView = "preview" | "source";
+export type FilePreviewStatus = "loading" | "ready" | "error" | "unavailable";
 
 type TextState =
   | { phase: "ready"; text: string; origin: "session" | "file"; truncated?: boolean }
@@ -44,6 +45,7 @@ function useFileText(
   replayed: string | null,
   refreshKey: string,
   skip: boolean,
+  onStatusChange?: (status: FilePreviewStatus) => void,
 ): { state: TextState; retry: () => void } {
   const { get } = useFreshSignedUrl(!skip && replayed === null ? path : null);
   const [attempt, setAttempt] = useState(0);
@@ -58,27 +60,41 @@ function useFileText(
   useEffect(() => {
     if (skip) {
       setState({ phase: "binary" });
+      onStatusChange?.("ready");
       return;
     }
     if (replayed !== null) {
       setState({ phase: "ready", text: replayed, origin: "session" });
+      onStatusChange?.("ready");
       return;
     }
     const controller = new AbortController();
     setState({ phase: "loading" });
+    onStatusChange?.("loading");
     fetchSignedCapped(get, TEXT_PREVIEW_MAX_BYTES, { signal: controller.signal })
       .then((r) => {
         if (controller.signal.aborted) return;
-        if (r.kind === "too-large") return setState({ phase: "too-large" });
+        if (r.kind === "too-large") {
+          setState({ phase: "too-large" });
+          onStatusChange?.("unavailable");
+          return;
+        }
         const text = decodeText(r.bytes);
-        setState(text === null ? { phase: "binary" } : { phase: "ready", text, origin: "file" });
+        if (text === null) {
+          setState({ phase: "binary" });
+          onStatusChange?.("unavailable");
+        } else {
+          setState({ phase: "ready", text, origin: "file" });
+          onStatusChange?.("ready");
+        }
       })
       .catch((e: unknown) => {
         if (controller.signal.aborted) return;
         setState({ phase: "failed", message: e instanceof Error ? e.message : String(e) });
+        onStatusChange?.("error");
       });
     return () => controller.abort();
-  }, [replayed, get, attempt, refreshKey, skip]);
+  }, [replayed, get, attempt, refreshKey, skip, onStatusChange]);
   return { state, retry: () => setAttempt((n) => n + 1) };
 }
 
@@ -92,22 +108,49 @@ function PreviewSkeleton() {
   );
 }
 
-function Notice({ text, onRetry }: { text: string; onRetry?: () => void }) {
+function Notice({
+  title,
+  hint,
+  onRetry,
+  onBackToList,
+}: {
+  title: string;
+  hint?: string;
+  onRetry?: () => void;
+  onBackToList?: () => void;
+}) {
   return (
     <div className="flex flex-col items-center gap-3 px-6 py-12 text-center text-meta text-muted" data-testid="output-preview-notice">
       <span className="oc-icon-badge flex size-10 items-center justify-center rounded-xl text-faint" aria-hidden>
         <AlertCircle size={18} strokeWidth={1.75} />
       </span>
-      <p className="max-w-sm leading-relaxed">{text}</p>
-      {onRetry && (
-        <button
-          type="button"
-          onClick={onRetry}
-          className="oc-btn-tactile oc-btn-secondary-craft inline-flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-caption font-medium text-accent outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          <RotateCw size={12} aria-hidden />
-          继续
-        </button>
+      <div className="max-w-sm space-y-1">
+        <p className="text-body font-medium text-fg">{title}</p>
+        {hint && <p className="text-caption leading-relaxed text-muted">{hint}</p>}
+      </div>
+      {(onRetry || onBackToList) && (
+        <div className="mt-1 flex flex-wrap items-center justify-center gap-2">
+          {onRetry && (
+            <button
+              type="button"
+              onClick={onRetry}
+              className="oc-btn-tactile oc-btn-secondary-craft inline-flex min-h-8 items-center gap-1.5 rounded-full px-3.5 py-1.5 text-caption font-medium text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+            >
+              <RotateCw size={12} aria-hidden />
+              重试读取
+            </button>
+          )}
+          {onBackToList && (
+            <button
+              type="button"
+              onClick={onBackToList}
+              className="oc-btn-tactile inline-flex min-h-8 items-center gap-1 rounded-full px-3.5 py-1.5 text-caption font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+            >
+              <ChevronLeft size={13} aria-hidden />
+              返回文件列表
+            </button>
+          )}
+        </div>
       )}
     </div>
   );
@@ -184,6 +227,8 @@ export function FilePreview({
   refreshKey = "",
   view,
   onAnnotateToComposer,
+  onBackToList,
+  onStatusChange,
 }: {
   path: string;
   name: string;
@@ -195,10 +240,14 @@ export function FilePreview({
   view: PreviewView;
   /** 可选：批注回填至 Composer 输入框的回调。 */
   onAnnotateToComposer?: (draft: string) => void;
+  /** 可选：多文件模式下，读取失败时提供「返回文件列表」快捷入口。 */
+  onBackToList?: () => void;
+  /** 可选：向外同步读取状态，读取失败时自动隐藏底部「批注修改」。 */
+  onStatusChange?: (status: FilePreviewStatus) => void;
 }) {
   const staticMeta = classifyDeliverable(path, replayed);
   const directRich = view === "preview" && (staticMeta.isBinaryOffice || staticMeta.format === "pdf");
-  const { state, retry } = useFileText(path, replayed, refreshKey, directRich);
+  const { state, retry } = useFileText(path, replayed, refreshKey, directRich, onStatusChange);
 
   if (directRich) {
     return (
@@ -208,6 +257,8 @@ export function FilePreview({
           name={name}
           meta={staticMeta}
           onAnnotateToComposer={onAnnotateToComposer}
+          onBackToList={onBackToList}
+          onPreviewError={onStatusChange ? (failed) => onStatusChange(failed ? "error" : "ready") : undefined}
         />
       </Suspense>
     );
@@ -216,9 +267,22 @@ export function FilePreview({
   if (state.phase === "loading") {
     return <PreviewSkeleton />;
   }
-  if (state.phase === "too-large") return <Notice text="文件超过 1 MB，不在面板里预览；可以下载查看。" />;
-  if (state.phase === "binary") return <Notice text="这不是文本文件，不在面板里预览；可以下载查看。" />;
-  if (state.phase === "failed") return <Notice text="没能读取这个文件（可能已被移动或删除）。" onRetry={retry} />;
+  if (state.phase === "too-large") {
+    return <Notice title="文件超过 1 MB，暂不支持在线预览" hint="可以下载到本地查看完整内容。" onBackToList={onBackToList} />;
+  }
+  if (state.phase === "binary") {
+    return <Notice title="这不是文本文件，暂不支持在线预览" hint="可以下载到本地打开查看。" onBackToList={onBackToList} />;
+  }
+  if (state.phase === "failed") {
+    return (
+      <Notice
+        title="没能读取这个文件"
+        hint="文件可能已被移动、删除，或不在当前容器工作区内。"
+        onRetry={retry}
+        onBackToList={onBackToList}
+      />
+    );
+  }
   return (
     <TextBody
       path={path}

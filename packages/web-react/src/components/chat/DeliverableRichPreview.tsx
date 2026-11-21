@@ -14,6 +14,7 @@ import {
   ArrowUp,
   ArrowUpDown,
   ChevronDown,
+  ChevronLeft,
   Copy,
   Download,
   FileSpreadsheet,
@@ -21,6 +22,7 @@ import {
   MessageSquarePlus,
   PencilLine,
   Presentation,
+  RotateCw,
   Search,
   Sparkles,
 } from "lucide-react";
@@ -66,6 +68,10 @@ export type DeliverableRichPreviewProps = {
   onAnnotateToComposer?: (draft: string) => void;
   /** 是否显示顶部统一交付物操作条（默认 true）。 */
   showActionBar?: boolean;
+  /** 可选：多文件模式下预览失败时提供「返回文件列表」入口。 */
+  onBackToList?: () => void;
+  /** 可选：通知父级当前富预览是否处于不可读/报错态。 */
+  onPreviewError?: (failed: boolean) => void;
 };
 
 type BadgeTone = "accent" | "info" | "success" | "warning" | "neutral";
@@ -124,6 +130,7 @@ function UnifiedActionBar({
   meta,
   compact,
   annotateOpen,
+  canAnnotate = true,
   onToggleAnnotate,
 }: {
   path: string;
@@ -131,6 +138,7 @@ function UnifiedActionBar({
   meta: DeliverableMeta;
   compact: boolean;
   annotateOpen: boolean;
+  canAnnotate?: boolean;
   onToggleAnnotate: () => void;
 }) {
   const dir = displayDir(path);
@@ -150,17 +158,19 @@ function UnifiedActionBar({
         )}
       </div>
       <div className="wb-action-controls">
-        <Button
-          type="button"
-          size="sm"
-          variant={annotateOpen ? "accent" : "secondary"}
-          onClick={onToggleAnnotate}
-          data-testid="deliverable-annotate-trigger"
-          className="h-8 gap-1.5 px-2.5 text-meta whitespace-nowrap"
-        >
-          <PencilLine size={13} aria-hidden />
-          批注修改
-        </Button>
+        {canAnnotate && (
+          <Button
+            type="button"
+            size="sm"
+            variant={annotateOpen ? "accent" : "secondary"}
+            onClick={onToggleAnnotate}
+            data-testid="deliverable-annotate-trigger"
+            className="h-8 gap-1.5 px-2.5 text-meta whitespace-nowrap"
+          >
+            <PencilLine size={13} aria-hidden />
+            批注修改
+          </Button>
+        )}
         <FileOverflowMenu path={path} name={name} />
       </div>
     </div>
@@ -790,51 +800,67 @@ function PdfPreviewView({
   path,
   name,
   onDispatchPrompt,
+  onBackToList,
+  onErrorChange,
 }: {
   path: string;
   name: string;
   onDispatchPrompt: (prompt: string, label?: string) => Promise<boolean>;
+  onBackToList?: () => void;
+  onErrorChange?: (failed: boolean) => void;
 }) {
   const isContainerFile = path.startsWith("/");
   const { get } = useFreshSignedUrl(isContainerFile ? path : null);
   const { state: dlState, start: startDownload } = useSignedDownload(isContainerFile ? path : null, name);
+  const [attempt, setAttempt] = useState(0);
   const [state, setState] = useState<
     | { phase: "loading" }
     | { phase: "ready"; url: string }
-    | { phase: "fallback"; reason: string }
+    | { phase: "fallback"; reason: string; retryable?: boolean }
   >({ phase: "loading" });
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: attempt 是重试读取触发信号
   useEffect(() => {
     if (!isContainerFile) {
       setState({ phase: "fallback", reason: "当前路径无法在线拉取 PDF，请下载后查看。" });
+      onErrorChange?.(true);
       return;
     }
     const controller = new AbortController();
     let objectUrl: string | null = null;
     setState({ phase: "loading" });
+    onErrorChange?.(false);
     fetchSignedCapped(get, PDF_PREVIEW_MAX_BYTES, { signal: controller.signal })
       .then((res) => {
         if (controller.signal.aborted) return;
         if (res.kind === "too-large") {
           setState({ phase: "fallback", reason: "PDF 超过 20 MB 在线预览上限，请下载查看或让助手提炼摘要。" });
+          onErrorChange?.(true);
           return;
         }
         if (!looksLikePdf(res.bytes)) {
           setState({ phase: "fallback", reason: "文件内容不是标准 PDF 格式，请下载核对。" });
+          onErrorChange?.(true);
           return;
         }
         objectUrl = URL.createObjectURL(new Blob([res.bytes as BlobPart], { type: "application/pdf" }));
         setState({ phase: "ready", url: objectUrl });
+        onErrorChange?.(false);
       })
       .catch(() => {
         if (controller.signal.aborted) return;
-        setState({ phase: "fallback", reason: "暂时无法在面板中加载 PDF 预览，可直接下载或让助手提炼核心要点。" });
+        setState({
+          phase: "fallback",
+          reason: "暂时无法读取该 PDF 文件（可能已被移动或删除）。",
+          retryable: true,
+        });
+        onErrorChange?.(true);
       });
     return () => {
       controller.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [get, isContainerFile]);
+  }, [get, isContainerFile, attempt, onErrorChange]);
 
   if (state.phase === "loading") {
     return (
@@ -863,21 +889,40 @@ function PdfPreviewView({
         <p className="text-meta text-muted">{state.reason}</p>
       </div>
       <div className="wb-office-actions">
-        <Button
-          type="button"
-          size="sm"
-          variant="accent"
-          onClick={() =>
-            void onDispatchPrompt(
-              `请阅读 \`${path}\` 并整理一份结构化 Markdown 摘要（含核心结论、关键图表/数据与方法要点），方便我在右侧文档阅读器中审阅。`,
-              "已填入 PDF 提炼指令",
-            )
-          }
-        >
-          <Sparkles size={14} aria-hidden />
-          让 Agent 提炼摘要
-        </Button>
-        {isContainerFile && (
+        {state.retryable && (
+          <Button
+            type="button"
+            size="sm"
+            variant="secondary"
+            onClick={() => setAttempt((n) => n + 1)}
+          >
+            <RotateCw size={13} aria-hidden />
+            重试读取
+          </Button>
+        )}
+        {onBackToList && (
+          <Button type="button" size="sm" variant="ghost" onClick={onBackToList}>
+            <ChevronLeft size={14} aria-hidden />
+            返回文件列表
+          </Button>
+        )}
+        {!state.retryable && (
+          <Button
+            type="button"
+            size="sm"
+            variant="accent"
+            onClick={() =>
+              void onDispatchPrompt(
+                `请阅读 \`${path}\` 并整理一份结构化 Markdown 摘要（含核心结论、关键图表/数据与方法要点），方便我在右侧文档阅读器中审阅。`,
+                "已填入 PDF 提炼指令",
+              )
+            }
+          >
+            <Sparkles size={14} aria-hidden />
+            让 Agent 提炼摘要
+          </Button>
+        )}
+        {isContainerFile && !state.retryable && (
           <Button
             type="button"
             size="sm"
@@ -903,6 +948,8 @@ export function DeliverableRichPreview({
   meta: metaProp,
   onAnnotateToComposer,
   showActionBar = true,
+  onBackToList,
+  onPreviewError,
 }: DeliverableRichPreviewProps) {
   const name = nameProp ?? baseName(path);
   const viewportClass = useViewportClass();
@@ -920,8 +967,18 @@ export function DeliverableRichPreview({
   const dispatchPrompt = usePromptDispatch(onAnnotateToComposer);
 
   const [annotateOpen, setAnnotateOpen] = useState(false);
+  const [previewFailed, setPreviewFailed] = useState(false);
   const [anchor, setAnchor] = useState<AnnotationAnchor>({ kind: "file" });
   const [excerpt, setExcerpt] = useState<string | undefined>(undefined);
+
+  const handlePreviewError = useCallback(
+    (failed: boolean) => {
+      setPreviewFailed(failed);
+      if (failed) setAnnotateOpen(false);
+      onPreviewError?.(failed);
+    },
+    [onPreviewError],
+  );
 
   const openAnchoredAnnotate = useCallback((nextAnchor: AnnotationAnchor, nextExcerpt?: string) => {
     setAnchor(nextAnchor);
@@ -972,7 +1029,15 @@ export function DeliverableRichPreview({
     }
 
     if (meta.format === "pdf") {
-      return <PdfPreviewView path={path} name={name} onDispatchPrompt={dispatchPrompt} />;
+      return (
+        <PdfPreviewView
+          path={path}
+          name={name}
+          onDispatchPrompt={dispatchPrompt}
+          onBackToList={onBackToList}
+          onErrorChange={handlePreviewError}
+        />
+      );
     }
 
     if (meta.format === "csv" || meta.format === "tsv") {
@@ -1029,6 +1094,7 @@ export function DeliverableRichPreview({
           meta={meta}
           compact={isCompact}
           annotateOpen={annotateOpen}
+          canAnnotate={!previewFailed}
           onToggleAnnotate={toggleFileAnnotate}
         />
       )}

@@ -1,13 +1,15 @@
 /**
- * 详情面板「产出」页(OCV5-372):一轮对话的工作成果 —— 主产物直接渲染在卡片里,其余产出
- * (文件 / 图片 / 本机预览链接 / 参考来源)列在下面,步骤退到一行摘要后的「查看步骤」。
- * 数据全部来自 workbench.ts 的纯函数;正文渲染在懒加载块 OutputPreview 里,不进首屏。
+ * 详情面板「产出」页(OCV5-372 / OCV5-834):
+ * 参考 OpenAI Codex 重构为「清晰文件目录总览 ↔ 单文件精读 / Diff」两级体验：
+ *   - 多产物轮次默认展示清爽的 Codex 文件清单总览（顶部汇总 `文件与产出 · N 项` + 总 `+add −del`），
+ *     点击列表项平滑进入全出血精读 / Diff 预览，顶栏展示 `← 文件列表 (N)` + 文件名 + `‹ ›`；
+ *   - 单产物轮次直接进入精读视图（零多点一次），移动端保持 2-Bar 全出血沉浸阅读；
+ *   - 文件读取失败时展示优雅的人话提示（「重试读取」+「返回文件列表」），并自动隐藏底部「批注修改」。
  */
 import {
   ChevronLeft,
   ChevronRight,
   ExternalLink,
-  FileCode2,
   FileText,
   Globe,
   ImageIcon,
@@ -23,6 +25,7 @@ import type { ToolLike } from "../tool/format";
 import { SegmentedControl, Skeleton, Spinner } from "../ui";
 import type { TargetOutputRequest } from "./inspectorState";
 import { useSignedSrc } from "./media";
+import type { FilePreviewStatus } from "./OutputPreview";
 import { DownloadButton, QuickAnnotateDrawer, WorkbenchEvidenceCard } from "./OutputsAuxParts";
 import { type CompactHeroView, OutputsCompactBar } from "./OutputsCompactBar";
 import { CopyIconButton, FileChangeEntryView, LineCounts } from "./paneParts";
@@ -47,8 +50,10 @@ import {
   pickHero,
   summarizeDeliverableCategories,
   turnSummary,
+  turnTotalLineCounts,
 } from "./workbench";
 import type { WorkTurn } from "./workTurns";
+import "./workbenchPreview.css";
 
 const FilePreview = lazy(() => import("./OutputPreview").then((m) => ({ default: m.FilePreview })));
 const MediaPreview = lazy(() => import("./OutputPreview").then((m) => ({ default: m.MediaPreview })));
@@ -58,7 +63,7 @@ type HeroView = "preview" | "source" | "changes";
 /** 参考来源默认只列前几条,其余收在「显示全部」里:一次搜索常带回十来条,全列会把面板拉得很长。 */
 const SOURCES_PREVIEW = 5;
 
-const sectionLabel = "mb-2 flex items-center gap-1.5 text-caption font-semibold uppercase tracking-wide text-faint";
+const sectionLabel = "mb-2 flex items-center gap-1.5 text-caption font-medium text-faint";
 const quietRow =
   "group flex w-full min-w-0 items-center gap-3 rounded-lg px-2.5 py-2 text-left outline-none transition-colors hover:bg-hover/80 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11";
 
@@ -78,7 +83,7 @@ function ExtTile({ path, kind, className }: { path: string; kind: OutputKind; cl
     <span
       aria-hidden
       className={cn(
-        "flex size-8 shrink-0 items-center justify-center rounded-md font-mono text-micro font-bold tracking-tight",
+        "flex size-7 shrink-0 items-center justify-center rounded-md font-mono text-micro font-semibold tracking-tight",
         badgeTone,
         className,
       )}
@@ -114,8 +119,8 @@ export function TurnBar({
   if (s.steps > 0) parts.push(`${s.steps} 步${s.failedSteps > 0 ? `（${s.failedSteps} 步失败）` : ""}`);
   if (fileCount > 0) parts.push(`${fileCount} 个文件`);
   return (
-    <div className="px-4 pt-3.5 pb-3" data-testid="outputs-turn">
-      <div className="mb-2 flex items-center gap-1.5 text-caption text-faint">
+    <div className="border-b border-border/60 px-4 pt-3 pb-2.5" data-testid="outputs-turn">
+      <div className="mb-1.5 flex items-center gap-1.5 text-caption text-faint">
         <div className="oc-surface-recessed inline-flex items-center gap-0.5 rounded-full p-0.5">
           <button
             type="button"
@@ -149,10 +154,10 @@ export function TurnBar({
           <span className="oc-badge-craft rounded-full px-2.5 py-0.5 font-medium text-danger">出错</span>
         ) : null}
       </div>
-      <h3 className="line-clamp-2 text-section font-semibold leading-snug tracking-tight text-fg" title={turn.title}>
+      <h3 className="line-clamp-2 text-body font-semibold leading-snug tracking-tight text-fg" title={turn.title}>
         {turn.title}
       </h3>
-      <p className="mt-1.5 flex flex-wrap items-center gap-x-1.5 text-meta text-faint" data-testid="outputs-summary">
+      <p className="mt-1 flex flex-wrap items-center gap-x-1.5 text-caption text-faint" data-testid="outputs-summary">
         {parts.map((p, i) => (
           // biome-ignore lint/suspicious/noArrayIndexKey: 摘要片段按位置
           <span key={i} className="inline-flex items-center gap-1.5">
@@ -213,15 +218,17 @@ function computeHeroMeta(
   return { replayed, meta, richPreview, textual, change, options };
 }
 
-/** 主卡片:文件。移动端紧凑态全出血单滚动直出正文，无厚外框与双层滚动。 */
+/** 主卡片:文件。移动端紧凑态全出血单滚动直出正文，读取失败时自动隐藏底部「批注修改」。 */
 function FileHero({
   file,
   messages,
   turnEnd,
   compact = false,
+  singleFileDesktop = false,
   controlledView,
   onControlledViewChange,
   showCompactViewInBar = false,
+  onBackToList,
   onOpenStep,
   onAnnotateToComposer,
 }: {
@@ -229,9 +236,12 @@ function FileHero({
   messages: readonly ChatMessage[];
   turnEnd: ChatMessage | undefined;
   compact?: boolean;
+  /** 桌面端单文件直达模式：头部附带文件改动摘要标识，免于下方重复列单文件卡片。 */
+  singleFileDesktop?: boolean;
   controlledView?: HeroView | null;
   onControlledViewChange?: (v: HeroView) => void;
   showCompactViewInBar?: boolean;
+  onBackToList?: () => void;
   onOpenStep: (message: ToolLike) => void;
   onAnnotateToComposer?: (draft: string) => void;
 }) {
@@ -239,12 +249,23 @@ function FileHero({
   const { replayed, meta, richPreview, textual, change, options } = computeHeroMeta(file, messages, turnEnd);
   const [chosen, setChosen] = useState<HeroView | null>(null);
   const [quickAnnotateOpen, setQuickAnnotateOpen] = useState(false);
+  const [previewStatus, setPreviewStatus] = useState<FilePreviewStatus>(() =>
+    replayed !== null ? "ready" : "loading",
+  );
   const activeChosen = controlledView !== undefined ? controlledView : chosen;
   const setView = onControlledViewChange ?? setChosen;
   const view: HeroView =
     activeChosen && options.some((o) => o.value === activeChosen) ? activeChosen : (options[0]?.value ?? "changes");
   const usesRichBar = view === "preview" && richPreview;
+  const isPreviewError = view !== "changes" && previewStatus === "error";
+  const canAnnotate = !isPreviewError;
   const dir = displayDir(file.path);
+
+  useEffect(() => {
+    if (isPreviewError && quickAnnotateOpen) {
+      setQuickAnnotateOpen(false);
+    }
+  }, [isPreviewError, quickAnnotateOpen]);
 
   const body = (
     <div
@@ -270,6 +291,8 @@ function FileHero({
             refreshKey={fileTouchFingerprint(messages, file.path)}
             view={view === "preview" ? "preview" : "source"}
             onAnnotateToComposer={onAnnotateToComposer}
+            onBackToList={onBackToList}
+            onStatusChange={setPreviewStatus}
           />
         </Suspense>
       ) : (
@@ -279,6 +302,8 @@ function FileHero({
   );
 
   if (compact) {
+    const showCompactDock =
+      !usesRichBar && (!isPreviewError || (showCompactViewInBar && options.length > 1));
     return (
       <article
         className="flex min-h-0 flex-1 flex-col bg-surface"
@@ -287,9 +312,9 @@ function FileHero({
         aria-label={`${meta.label} ${file.name}`}
       >
         {body}
-        {!usesRichBar && (
+        {showCompactDock && (
           <div className="wb-bottom-dock">
-            {quickAnnotateOpen && (
+            {quickAnnotateOpen && canAnnotate && (
               <QuickAnnotateDrawer
                 filePath={file.path}
                 fileName={file.name}
@@ -319,13 +344,17 @@ function FileHero({
                   </div>
                 ) : undefined
               }
-              trailing={<FileOverflowMenu path={file.path} name={file.name} />}
-              annotate={{
-                label: "批注修改",
-                active: quickAnnotateOpen,
-                testId: "hero-quick-annotate",
-                onClick: () => setQuickAnnotateOpen((v) => !v),
-              }}
+              trailing={!isPreviewError ? <FileOverflowMenu path={file.path} name={file.name} /> : undefined}
+              annotate={
+                canAnnotate
+                  ? {
+                      label: "批注修改",
+                      active: quickAnnotateOpen,
+                      testId: "hero-quick-annotate",
+                      onClick: () => setQuickAnnotateOpen((v) => !v),
+                    }
+                  : undefined
+              }
             />
           </div>
         )}
@@ -335,17 +364,33 @@ function FileHero({
 
   return (
     <article
-      className="oc-surface-card overflow-hidden rounded-xl"
+      className="flex min-h-0 flex-1 flex-col bg-surface"
       data-testid="outputs-hero"
       aria-label={`${meta.label} ${file.name}`}
     >
-      <header className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border/70 bg-gradient-to-b from-hover/35 to-transparent px-3.5 py-2.5">
+      <header
+        className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border/70 px-4 py-2.5"
+        data-testid={singleFileDesktop ? "outputs-file" : undefined}
+      >
         <ExtTile path={file.path} kind={file.kind} />
         <div className="min-w-32 flex-1" title={file.path}>
-          <div className="truncate text-body font-semibold text-fg" data-testid="outputs-hero-name">
-            {file.name}
+          <div className="flex items-center gap-2">
+            <span className="truncate text-body font-semibold text-fg" data-testid="outputs-hero-name">
+              {file.name}
+            </span>
+            {change?.hasError && <span className="shrink-0 text-caption font-medium text-danger">有失败</span>}
+            {change && (change.hasCounts !== false || change.hasError) && (
+              <LineCounts added={change.added} removed={change.removed} />
+            )}
           </div>
-          {dir && <div className="truncate font-mono text-caption text-faint">{dir}</div>}
+          <div className="truncate text-caption text-faint">
+            {[
+              dir,
+              change ? `${change.entries.length} 次改动` : meta.label,
+            ]
+              .filter(Boolean)
+              .join(" · ")}
+          </div>
         </div>
         {options.length > 1 && (
           <SegmentedControl
@@ -359,7 +404,7 @@ function FileHero({
         )}
       </header>
       {body}
-      {quickAnnotateOpen && !usesRichBar && (
+      {quickAnnotateOpen && !usesRichBar && canAnnotate && (
         <QuickAnnotateDrawer
           filePath={file.path}
           fileName={file.name}
@@ -368,7 +413,7 @@ function FileHero({
           onClose={() => setQuickAnnotateOpen(false)}
         />
       )}
-      <footer className="flex items-center gap-2 border-t border-border/70 bg-hover/20 px-3.5 py-2 text-caption text-faint">
+      <footer className="flex items-center gap-2 border-t border-border/70 bg-hover/15 px-4 py-2 text-caption text-faint">
         <span className="min-w-0 flex-1 truncate" data-testid="outputs-hero-origin">
           {view === "changes"
             ? `${change?.entries.length ?? 0} 次改动`
@@ -378,10 +423,7 @@ function FileHero({
                 ? "内容来自会话记录"
                 : "容器里的当前文件"}
         </span>
-        {change && !change.hasError && change.hasCounts !== false && (
-          <LineCounts added={change.added} removed={change.removed} />
-        )}
-        {!usesRichBar && (
+        {!usesRichBar && canAnnotate && (
           <button
             type="button"
             data-testid="hero-quick-annotate"
@@ -393,7 +435,7 @@ function FileHero({
           </button>
         )}
         <CopyIconButton getText={() => file.path} label="复制路径" doneText="已复制路径" />
-        {file.path.startsWith("/") && <DownloadButton path={file.path} name={file.name} />}
+        {!isPreviewError && file.path.startsWith("/") && <DownloadButton path={file.path} name={file.name} />}
       </footer>
     </article>
   );
@@ -441,7 +483,7 @@ function MediaHero({
     );
   }
   return (
-    <article className="oc-surface-card overflow-hidden rounded-xl" data-testid="outputs-hero" aria-label={`图片 ${media.name}`}>
+    <article className="flex min-h-0 flex-1 flex-col bg-surface" data-testid="outputs-hero" aria-label={`图片 ${media.name}`}>
       <Suspense fallback={<PreviewFallback />}>
         <MediaPreview src={media.src} kind={media.kind} name={media.name} />
       </Suspense>
@@ -454,7 +496,7 @@ function MediaHero({
           onClose={() => setAnnotateOpen(false)}
         />
       )}
-      <footer className="flex items-center gap-2 border-t border-border/70 bg-hover/20 px-3.5 py-2 text-caption text-faint">
+      <footer className="flex items-center gap-2 border-t border-border/70 bg-hover/15 px-4 py-2 text-caption text-faint">
         <span className="min-w-0 flex-1 truncate font-medium text-fg" data-testid="outputs-hero-name" title={media.src}>
           {media.name}
         </span>
@@ -499,10 +541,24 @@ function Thumb({ media, active, onPick }: { media: OutputMedia; active: boolean;
   );
 }
 
-function Section({ icon: Icon, title, count, children, testId }: { icon: typeof Globe; title: string; count: number; children: ReactNode; testId: string }) {
+function Section({
+  icon: Icon,
+  title,
+  count,
+  children,
+  testId,
+  flush = false,
+}: {
+  icon: typeof Globe;
+  title: string;
+  count: number;
+  children: ReactNode;
+  testId: string;
+  flush?: boolean;
+}) {
   return (
-    <section data-testid={testId}>
-      <h4 className={sectionLabel}>
+    <section data-testid={testId} className={cn(!flush && "px-4")}>
+      <h4 className={cn(sectionLabel, flush && "px-4")}>
         <Icon size={12} aria-hidden />
         {title}
         <span className="tabular-nums font-normal">{count}</span>
@@ -528,7 +584,7 @@ function DeliverableSummaryStrip({
 
   return (
     <div
-      className="flex flex-nowrap items-center gap-1 overflow-x-auto px-4 pb-2.5 [scrollbar-width:none]"
+      className="flex flex-nowrap items-center gap-1 overflow-x-auto border-b border-border/60 px-4 py-2 [scrollbar-width:none]"
       role="group"
       aria-label="交付物按类型汇总与筛选"
       data-testid="outputs-summary-strip"
@@ -575,20 +631,38 @@ function DeliverableSummaryStrip({
   );
 }
 
-function OtherOutputs({
+/** Codex 风格清爽文件目录总览：顶行汇总 `文件与产出 · N 项` + `+add −del`，发丝分隔文件行 + 媒体/链接/来源。 */
+function DirectoryOverview({
   outputs,
   hero,
   activeCategory,
+  compact,
+  turnIndex,
+  turnTotal,
+  onPrevTurn,
+  onNextTurn,
+  onSelectCategory,
   onPick,
+  includeFilesAndMedia = true,
 }: {
   outputs: TurnOutputs;
   hero: HeroRef | null;
   activeCategory: DeliverableCategory | "all";
+  compact: boolean;
+  turnIndex: number;
+  turnTotal: number;
+  onPrevTurn: () => void;
+  onNextTurn: () => void;
+  onSelectCategory: (cat: DeliverableCategory | "all") => void;
   onPick: (ref: HeroRef) => void;
+  includeFilesAndMedia?: boolean;
 }) {
   const { files, media, links, sources } = outputs;
   const [allSources, setAllSources] = useState(false);
   const shownSources = allSources ? sources : sources.slice(0, SOURCES_PREVIEW);
+  const deliverableTotal = files.length + media.length;
+  const totals = turnTotalLineCounts(files);
+
   const filteredFiles =
     activeCategory === "all"
       ? files
@@ -598,119 +672,187 @@ function OtherOutputs({
   const showMedia = activeCategory === "all" || activeCategory === "media";
 
   return (
-    <div className="space-y-5 px-4 pt-5 pb-6">
-      {filteredFiles.length > 0 && (
-        <Section icon={FileCode2} title="文件" count={filteredFiles.length} testId="outputs-files">
-          <ul className="space-y-1.5">
-            {filteredFiles.map((f) => {
-              const active = hero?.type === "file" && hero.path === f.path;
-              const meta = classifyDeliverable(f.path);
-              return (
-                <li key={f.path}>
-                  <button
-                    type="button"
-                    data-testid="outputs-file"
-                    aria-current={active ? "true" : undefined}
-                    className={cn(
-                      "oc-surface-card oc-surface-card-hover group flex w-full min-w-0 items-center gap-3 rounded-xl px-3 py-2.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
-                      active && "border-accent/50 bg-accent-soft/60 ring-1 ring-inset ring-accent/25",
-                    )}
-                    onClick={() => onPick({ type: "file", path: f.path })}
-                    title={f.path}
-                  >
-                    <ExtTile path={f.path} kind={f.kind} />
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-body font-medium text-fg">{f.name}</span>
-                      <span className="block truncate text-caption text-faint">
-                        {f.change
-                          ? `${meta.label} · ${f.change.entries.length} 次改动`
-                          : `${meta.label} · 回答里提到`}
-                      </span>
-                    </span>
-                    <span className="flex shrink-0 items-center gap-2 text-meta">
-                      {f.change?.running && <Spinner size={12} className="text-accent" />}
-                      {f.change?.hasError && <span className="text-danger">有失败</span>}
-                      {f.change && (f.change.hasCounts !== false || f.change.hasError) && (
-                        <LineCounts added={f.change.added} removed={f.change.removed} />
-                      )}
-                    </span>
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
-        </Section>
-      )}
-      {showMedia && media.length > 0 && (
-        <Section icon={ImageIcon} title="图片与媒体" count={media.length} testId="outputs-media-grid">
-          <div className="grid grid-cols-3 gap-2">
-            {media.map((m) => (
-              <Thumb
-                key={m.src}
-                media={m}
-                active={hero?.type === "media" && hero.src === m.src}
-                onPick={() => onPick({ type: "media", src: m.src })}
-              />
-            ))}
-          </div>
-        </Section>
-      )}
-      {links.length > 0 && (
-        <Section icon={MonitorPlay} title="本机预览" count={links.length} testId="outputs-links">
-          <ul className="space-y-1.5">
-            {links.map((l) => (
-              <li key={l.url}>
-                {/* 普通链接:App 的全局点击监听会把容器回环地址交给「容器预览」打开。 */}
-                <a
-                  href={l.url}
-                  className="oc-surface-card oc-surface-card-hover group flex w-full min-w-0 items-center gap-3 rounded-xl px-3 py-2.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
-                  data-testid="outputs-link"
+    <div className="flex flex-1 flex-col" data-testid={includeFilesAndMedia ? "outputs-directory" : undefined}>
+      {includeFilesAndMedia && deliverableTotal > 0 && (
+        <>
+          <div
+            className="flex min-h-10 shrink-0 items-center gap-2 border-b border-border/60 bg-bg/35 px-4 py-2 text-caption"
+            data-testid="outputs-directory-header"
+          >
+            <span className="font-medium text-fg">
+              文件与产出 · <span className="tabular-nums">{deliverableTotal}</span> 项
+            </span>
+            {totals.hasCounts && (
+              <LineCounts added={totals.added} removed={totals.removed} />
+            )}
+            <span className="flex-1" />
+            {compact && turnTotal > 1 && (
+              <div className="oc-surface-recessed inline-flex shrink-0 items-center gap-0.5 rounded-md p-0.5">
+                <button
+                  type="button"
+                  aria-label="上一轮"
+                  disabled={turnIndex <= 0}
+                  onClick={onPrevTurn}
+                  className="oc-btn-tactile inline-flex size-5 items-center justify-center rounded-xs text-muted outline-none hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30"
                 >
-                  <span className="oc-icon-badge-accent flex size-8 shrink-0 items-center justify-center rounded-md">
-                    <MonitorPlay size={15} strokeWidth={1.75} />
-                  </span>
-                  <span className="min-w-0 flex-1 truncate font-mono text-meta font-medium text-fg">{l.label}</span>
-                  <span className="shrink-0 text-caption font-medium text-accent">打开预览</span>
-                </a>
-              </li>
-            ))}
-          </ul>
-        </Section>
+                  <ChevronLeft size={12} />
+                </button>
+                <span className="px-1.5 font-medium tabular-nums text-fg" data-testid="outputs-turn-counter">
+                  第 {turnIndex + 1}/{turnTotal} 轮
+                </span>
+                <button
+                  type="button"
+                  aria-label="下一轮"
+                  disabled={turnIndex >= turnTotal - 1}
+                  onClick={onNextTurn}
+                  className="oc-btn-tactile inline-flex size-5 items-center justify-center rounded-xs text-muted outline-none hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30"
+                >
+                  <ChevronRight size={12} />
+                </button>
+              </div>
+            )}
+          </div>
+          <DeliverableSummaryStrip
+            outputs={outputs}
+            activeCategory={activeCategory}
+            onSelectCategory={onSelectCategory}
+          />
+        </>
       )}
-      {sources.length > 0 && (
-        <Section icon={Globe} title="参考来源" count={sources.length} testId="outputs-sources">
-          <ul className="oc-surface-card divide-y divide-border/60 overflow-hidden rounded-xl p-1">
-            {shownSources.map((s) => (
-              <li key={s.url} data-container-preview-ignore="">
-                <a href={s.url} target="_blank" rel="noopener noreferrer" className={quietRow} data-testid="outputs-source" title={s.url}>
-                  <span
-                    aria-hidden
-                    className="oc-icon-badge flex size-6 shrink-0 items-center justify-center rounded-full text-caption font-semibold uppercase text-muted"
-                  >
-                    {s.domain.slice(0, 1)}
-                  </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate text-body font-medium text-fg">{s.title}</span>
-                    <span className="block truncate text-caption text-faint">{s.domain}</span>
-                  </span>
-                  <ExternalLink size={13} className="shrink-0 text-faint opacity-0 transition-opacity group-hover:opacity-100" aria-hidden />
-                </a>
-              </li>
-            ))}
-          </ul>
-          {sources.length > SOURCES_PREVIEW && (
-            <button
-              type="button"
-              onClick={() => setAllSources((v) => !v)}
-              aria-expanded={allSources}
-              data-testid="outputs-sources-more"
-              className="oc-btn-tactile mt-2 rounded-full px-2.5 py-1 text-meta font-medium text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              {allSources ? "收起" : `显示全部 ${sources.length} 条`}
-            </button>
-          )}
-        </Section>
-      )}
+
+      <div className="space-y-5 pb-6">
+        {includeFilesAndMedia && filteredFiles.length > 0 && (
+          <section data-testid="outputs-files">
+            <ul className="divide-y divide-border/55 border-b border-border/60">
+              {filteredFiles.map((f) => {
+                const active = hero?.type === "file" && hero.path === f.path;
+                const meta = classifyDeliverable(f.path);
+                const dir = displayDir(f.path);
+                const subline = [
+                  dir,
+                  f.change ? `${f.change.entries.length} 次改动` : meta.label,
+                ]
+                  .filter(Boolean)
+                  .join(" · ");
+                return (
+                  <li key={f.path}>
+                    <button
+                      type="button"
+                      data-testid="outputs-file"
+                      aria-current={active ? "true" : undefined}
+                      className={cn(
+                        "wb-dir-row group",
+                        active && "bg-accent-soft/50",
+                      )}
+                      onClick={() => onPick({ type: "file", path: f.path })}
+                      title={f.path}
+                    >
+                      <ExtTile path={f.path} kind={f.kind} />
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-body font-medium text-fg">{f.name}</span>
+                        <span className="block truncate text-caption text-faint">{subline}</span>
+                      </span>
+                      <span className="flex shrink-0 items-center gap-2 text-caption">
+                        {f.change?.running && <Spinner size={12} className="text-accent" />}
+                        {f.change?.hasError && <span className="font-medium text-danger">有失败</span>}
+                        {f.change && (f.change.hasCounts !== false || f.change.hasError) ? (
+                          <LineCounts added={f.change.added} removed={f.change.removed} />
+                        ) : (
+                          <span className="wb-type-pill">{meta.shortBadge}</span>
+                        )}
+                        <ChevronRight
+                          size={14}
+                          aria-hidden
+                          className="text-faint transition-transform group-hover:translate-x-0.5 group-hover:text-muted"
+                        />
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </section>
+        )}
+
+        {includeFilesAndMedia && showMedia && media.length > 0 && (
+          <div className="pt-3">
+            <Section icon={ImageIcon} title="图片与媒体" count={media.length} testId="outputs-media-grid">
+              <div className="grid grid-cols-3 gap-2">
+                {media.map((m) => (
+                  <Thumb
+                    key={m.src}
+                    media={m}
+                    active={hero?.type === "media" && hero.src === m.src}
+                    onPick={() => onPick({ type: "media", src: m.src })}
+                  />
+                ))}
+              </div>
+            </Section>
+          </div>
+        )}
+
+        {links.length > 0 && (
+          <div className="pt-3">
+            <Section icon={MonitorPlay} title="本机预览" count={links.length} testId="outputs-links">
+              <ul className="divide-y divide-border/55 overflow-hidden rounded-lg border border-border/70">
+                {links.map((l) => (
+                  <li key={l.url}>
+                    {/* 普通链接:App 的全局点击监听会把容器回环地址交给「容器预览」打开。 */}
+                    <a
+                      href={l.url}
+                      className="group flex w-full min-w-0 items-center gap-3 px-3 py-2.5 text-left outline-none transition-colors hover:bg-hover/70 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+                      data-testid="outputs-link"
+                    >
+                      <span className="oc-icon-badge-accent flex size-7 shrink-0 items-center justify-center rounded-md">
+                        <MonitorPlay size={14} strokeWidth={1.75} />
+                      </span>
+                      <span className="min-w-0 flex-1 truncate font-mono text-meta font-medium text-fg">{l.label}</span>
+                      <span className="shrink-0 text-caption font-medium text-accent">打开预览</span>
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </Section>
+          </div>
+        )}
+
+        {sources.length > 0 && (
+          <div className="pt-3">
+            <Section icon={Globe} title="参考来源" count={sources.length} testId="outputs-sources">
+              <ul className="divide-y divide-border/55 overflow-hidden rounded-lg border border-border/70 p-0.5">
+                {shownSources.map((s) => (
+                  <li key={s.url} data-container-preview-ignore="">
+                    <a href={s.url} target="_blank" rel="noopener noreferrer" className={quietRow} data-testid="outputs-source" title={s.url}>
+                      <span
+                        aria-hidden
+                        className="oc-icon-badge flex size-6 shrink-0 items-center justify-center rounded-full text-caption font-semibold uppercase text-muted"
+                      >
+                        {s.domain.slice(0, 1)}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-body font-medium text-fg">{s.title}</span>
+                        <span className="block truncate text-caption text-faint">{s.domain}</span>
+                      </span>
+                      <ExternalLink size={13} className="shrink-0 text-faint opacity-0 transition-opacity group-hover:opacity-100" aria-hidden />
+                    </a>
+                  </li>
+                ))}
+              </ul>
+              {sources.length > SOURCES_PREVIEW && (
+                <button
+                  type="button"
+                  onClick={() => setAllSources((v) => !v)}
+                  aria-expanded={allSources}
+                  data-testid="outputs-sources-more"
+                  className="oc-btn-tactile mt-2 rounded-full px-2.5 py-1 text-meta font-medium text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  {allSources ? "收起" : `显示全部 ${sources.length} 条`}
+                </button>
+              )}
+            </Section>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -770,11 +912,11 @@ export function OutputsView({
       const adHoc = buildAdHocTarget(targetOutput);
       return (
         <div
-          className={cn("flex min-h-0 flex-1 flex-col overflow-y-auto", !isCompact && "py-4")}
+          className="flex min-h-0 flex-1 flex-col overflow-y-auto"
           data-testid="outputs-view"
         >
           {adHoc.file && (
-            <div className={cn(isCompact ? "flex min-h-0 flex-1 flex-col" : "px-4")}>
+            <div className="flex min-h-0 flex-1 flex-col">
               <FileHero
                 key={adHoc.file.path}
                 file={adHoc.file}
@@ -788,7 +930,7 @@ export function OutputsView({
             </div>
           )}
           {adHoc.media && (
-            <div className={cn(isCompact ? "flex min-h-0 flex-1 flex-col" : "px-4")}>
+            <div className="flex min-h-0 flex-1 flex-col">
               <MediaHero media={adHoc.media} compact={isCompact} onAnnotateToComposer={onAnnotateToComposer} />
             </div>
           )}
@@ -798,9 +940,9 @@ export function OutputsView({
     }
     return (
       <div className="flex flex-1 flex-col items-center justify-center px-6 text-center" data-testid="outputs-empty">
-        <div className="oc-surface-card flex max-w-xs flex-col items-center gap-2.5 rounded-2xl px-6 py-7">
-          <span className="oc-icon-badge flex size-11 items-center justify-center rounded-xl text-faint" aria-hidden>
-            <Inbox size={20} strokeWidth={1.75} />
+        <div className="flex max-w-xs flex-col items-center gap-2.5 px-4 py-6">
+          <span className="oc-icon-badge flex size-10 items-center justify-center rounded-xl text-faint" aria-hidden>
+            <Inbox size={19} strokeWidth={1.75} />
           </span>
           <p className="text-body font-semibold text-fg">还没有产出</p>
           <p className="text-meta leading-relaxed text-muted">助手写的文件、生成的图片、查过的网页会按轮汇总在这里。</p>
@@ -886,11 +1028,18 @@ function TurnOutputsBody({
     // biome-ignore lint/correctness/useExhaustiveDependencies: 仅响应新的定位请求 nonce，避免流式重渲覆盖用户手选
   }, [targetOutput?.nonce]);
 
+  const deliverableCount = outputs.files.length + outputs.media.length;
+  const multiDeliverable = deliverableCount > 1;
   const valid =
     picked &&
-    (picked.type === "file" ? outputs.files.some((f) => f.path === picked.path) : outputs.media.some((m) => m.src === picked.src));
+    (picked.type === "file"
+      ? outputs.files.some((f) => f.path === picked.path)
+      : outputs.media.some((m) => m.src === picked.src));
   const adHoc = !valid && adHocTarget?.path ? buildAdHocTarget(adHocTarget) : {};
-  const hero = valid ? picked : adHoc.file || adHoc.media ? null : pickHero(outputs);
+
+  // 两级体验核心：多产物默认停在 Codex 文件目录总览（不盲翻）；单产物或显式选中直接进精读视图。
+  const inDetail = !multiDeliverable || Boolean(valid) || Boolean(adHoc.file || adHoc.media);
+  const hero = inDetail ? (valid ? picked : adHoc.file || adHoc.media ? null : pickHero(outputs)) : null;
   const heroFile =
     hero?.type === "file"
       ? outputs.files.find((f) => f.path === hero.path)
@@ -900,7 +1049,6 @@ function TurnOutputsBody({
       ? outputs.media.find((m) => m.src === hero.src)
       : adHoc.media;
   const turnEnd = turn.rows.at(-1);
-  const deliverableCount = outputs.files.length + outputs.media.length;
   const empty = deliverableCount + outputs.links.length + outputs.sources.length === 0;
   const fileCount = outputs.files.filter((f) => f.change).length;
   const activeManifestSrc = adHocTarget?.manifestSrc ?? null;
@@ -912,13 +1060,38 @@ function TurnOutputsBody({
         ? compactView.view
         : (compactHeroMeta.options[0]?.value ?? "changes")
       : undefined;
-  const hasCompactStrip = compact && (total > 1 || deliverableCount > 1);
-  const showOtherOutputs =
-    !empty && (!compact || deliverableCount > 1 || outputs.links.length > 0 || outputs.sources.length > 0);
+
+  const backToList = multiDeliverable
+    ? () => {
+        setPicked(null);
+        setAdHocTarget(null);
+      }
+    : undefined;
+
+  const showDetailNavBar =
+    (inDetail && Boolean(heroFile || heroMedia) && (Boolean(backToList) || (compact && total > 1))) ||
+    (compact && total > 1 && empty && !activeManifestSrc);
+
+  // 单产物 + 存在本机预览链接/参考来源时，在精读视图下方展示非重复的链接与来源
+  const showAuxLinksOrSources =
+    inDetail && !multiDeliverable && (outputs.links.length > 0 || outputs.sources.length > 0);
 
   return (
     <>
-      {compact ? (
+      {!compact && (
+        <TurnBar
+          turn={turn}
+          index={index}
+          total={total}
+          running={running}
+          fileCount={fileCount}
+          onPrev={() => onSelectTurn(index - 1)}
+          onNext={() => onSelectTurn(index + 1)}
+          onOpenSteps={onOpenSteps}
+        />
+      )}
+
+      {showDetailNavBar && (
         <OutputsCompactBar
           turnIndex={index}
           turnTotal={total}
@@ -927,37 +1100,20 @@ function TurnOutputsBody({
           outputs={outputs}
           hero={hero}
           heroName={heroFile?.name ?? heroMedia?.name}
+          showFileName={compact}
+          onBackToList={backToList}
           onPick={(ref) => {
             setAdHocTarget(null);
             setPicked(ref);
           }}
-          view={activeCompactView}
-          viewOptions={compactHeroMeta?.options}
-          onChangeView={heroFile ? (v) => setCompactView({ path: heroFile.path, view: v }) : undefined}
+          view={compact ? activeCompactView : undefined}
+          viewOptions={compact ? compactHeroMeta?.options : undefined}
+          onChangeView={compact && heroFile ? (v) => setCompactView({ path: heroFile.path, view: v }) : undefined}
         />
-      ) : (
-        <>
-          <TurnBar
-            turn={turn}
-            index={index}
-            total={total}
-            running={running}
-            fileCount={fileCount}
-            onPrev={() => onSelectTurn(index - 1)}
-            onNext={() => onSelectTurn(index + 1)}
-            onOpenSteps={onOpenSteps}
-          />
-          {!empty && (
-            <DeliverableSummaryStrip
-              outputs={outputs}
-              activeCategory={activeCategory}
-              onSelectCategory={setActiveCategory}
-            />
-          )}
-        </>
       )}
-      {heroFile || heroMedia ? (
-        <div className={cn(compact ? "flex min-h-0 flex-1 flex-col" : "px-4")}>
+
+      {inDetail && (heroFile || heroMedia) ? (
+        <div className="flex min-h-0 flex-1 flex-col">
           {heroFile ? (
             <FileHero
               key={heroFile.path}
@@ -965,25 +1121,64 @@ function TurnOutputsBody({
               messages={messages}
               turnEnd={turnEnd}
               compact={compact}
+              singleFileDesktop={!compact && !multiDeliverable}
               controlledView={compact ? (activeCompactView ?? null) : undefined}
               onControlledViewChange={compact ? (v) => setCompactView({ path: heroFile.path, view: v }) : undefined}
-              showCompactViewInBar={compact && !hasCompactStrip}
+              showCompactViewInBar={compact && !showDetailNavBar}
+              onBackToList={backToList}
               onOpenStep={onOpenStep}
               onAnnotateToComposer={onAnnotateToComposer}
             />
           ) : heroMedia ? (
             <MediaHero media={heroMedia} compact={compact} onAnnotateToComposer={onAnnotateToComposer} />
           ) : null}
-        </div>
-      ) : empty && !activeManifestSrc ? (
-        <div
-          className={cn(
-            "oc-surface-card flex flex-col items-center gap-2.5 rounded-2xl px-6 py-10 text-center",
-            compact ? "m-4" : "mx-4",
+          {showAuxLinksOrSources && (
+            <DirectoryOverview
+              outputs={outputs}
+              hero={hero}
+              activeCategory="all"
+              compact={compact}
+              turnIndex={index}
+              turnTotal={total}
+              onPrevTurn={() => onSelectTurn(index - 1)}
+              onNextTurn={() => onSelectTurn(index + 1)}
+              onSelectCategory={setActiveCategory}
+              onPick={(ref) => {
+                setAdHocTarget(null);
+                setPicked(ref);
+              }}
+              includeFilesAndMedia={false}
+            />
           )}
+        </div>
+      ) : !empty ? (
+        <DirectoryOverview
+          outputs={outputs}
+          hero={hero}
+          activeCategory={activeCategory}
+          compact={compact}
+          turnIndex={index}
+          turnTotal={total}
+          onPrevTurn={() => onSelectTurn(index - 1)}
+          onNextTurn={() => onSelectTurn(index + 1)}
+          onSelectCategory={setActiveCategory}
+          onPick={(ref) => {
+            setAdHocTarget(null);
+            setPicked(ref);
+          }}
+        />
+      ) : !activeManifestSrc ? (
+        <div
+          className="flex flex-1 flex-col items-center justify-center gap-2.5 px-6 py-12 text-center"
           data-testid="outputs-none"
         >
-          <span className={cn("flex size-10 items-center justify-center rounded-xl", running ? "oc-icon-badge-accent" : "oc-icon-badge text-faint")} aria-hidden>
+          <span
+            className={cn(
+              "flex size-10 items-center justify-center rounded-xl",
+              running ? "oc-icon-badge-accent" : "oc-icon-badge text-faint",
+            )}
+            aria-hidden
+          >
             {running ? <Spinner size={18} className="text-accent" /> : <FileText size={19} strokeWidth={1.75} />}
           </span>
           <p className="text-body font-semibold text-fg">{running ? "这一轮还在进行" : "这一轮没有产出文件"}</p>
@@ -992,18 +1187,8 @@ function TurnOutputsBody({
           </p>
         </div>
       ) : null}
+
       {activeManifestSrc && <WorkbenchEvidenceCard manifestSrc={activeManifestSrc} />}
-      {showOtherOutputs && (
-        <OtherOutputs
-          outputs={outputs}
-          hero={hero}
-          activeCategory={activeCategory}
-          onPick={(ref) => {
-            setAdHocTarget(null);
-            setPicked(ref);
-          }}
-        />
-      )}
     </>
   );
 }

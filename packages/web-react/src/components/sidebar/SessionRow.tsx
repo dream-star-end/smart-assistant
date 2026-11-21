@@ -146,8 +146,8 @@ export const SessionRow = memo(function SessionRow({
     : undefined;
 
   return (
-    // 外层只负责行高、缩进与层级引导线；可见的「药丸」是内层，选中/悬停态都画在内层上，
-    // 引导线因此不会被选中卡片盖住（SIDEBAR-R1）。
+    // 外层负责行高与克制缩进（无突兀长竖线）；内层承载温润微抬升选中面，
+    // 前导状态槽固定宽度占位，保证全部会话标题左边缘严格垂直对齐。
     <div
       draggable={allowDrag && Boolean(onMoveToProject)}
       onDragStart={(e) => {
@@ -156,15 +156,9 @@ export const SessionRow = memo(function SessionRow({
       }}
       style={{ height: "100%" }}
       data-session-row
-      className={cn("relative py-px", indent && "pl-[22px]")}
+      data-indented={indent ? "true" : undefined}
+      className={cn("relative py-px", indent && "pl-2")}
     >
-      {indent && (
-        <span
-          aria-hidden
-          data-session-guide
-          className="pointer-events-none absolute inset-y-0 left-[15px] w-px bg-border"
-        />
-      )}
       <div
         onPointerDown={onRowPointerDown}
         onPointerMove={onRowPointerMove}
@@ -180,14 +174,15 @@ export const SessionRow = memo(function SessionRow({
         }}
         data-active={active ? "true" : undefined}
         className={cn(
-          "group relative flex h-full items-center gap-2 rounded-sm pl-2.5 pr-1 text-section transition-[background-color,color,box-shadow] duration-150 ease-standard",
+          "group relative flex h-full items-center rounded-sm pr-1 text-section transition-colors duration-150 ease-standard",
+          indent ? "gap-1.5 pl-2" : "gap-2.5 pl-2.5",
           "[-webkit-touch-callout:none] [@media(hover:none)]:select-none",
           active
-            ? "bg-sidebar-active text-fg shadow-sidebar-active before:absolute before:bottom-1.5 before:left-0.5 before:top-1.5 before:w-0.5 before:rounded-xs before:bg-accent"
+            ? "bg-sidebar-active text-fg shadow-sidebar-active"
             : selected
               ? "bg-accent-soft text-fg ring-1 ring-inset ring-accent/20"
-              : "text-muted hover:bg-hover hover:text-fg",
-          menuOpen && !active && "bg-hover text-fg",
+              : "text-muted hover:bg-hover/80 hover:text-fg",
+          menuOpen && !active && "bg-hover/80 text-fg",
         )}
       >
         {/* 多选态复选框放在状态点左侧而不是替换它：勾选时仍能看到运行 / 出错 / 未读（SR-04）。 */}
@@ -204,7 +199,10 @@ export const SessionRow = memo(function SessionRow({
         )}
         <span
           data-session-lead
-          className="relative z-[1] flex size-3.5 shrink-0 items-center justify-center"
+          className={cn(
+            "relative z-[1] flex shrink-0 items-center justify-center",
+            indent ? "size-3.5" : "size-4",
+          )}
         >
           <SessionStatusDot
             running={running}
@@ -257,7 +255,7 @@ export const SessionRow = memo(function SessionRow({
               title={durationTitle}
               data-session-duration
               className={cn(
-                "pointer-events-none pr-1 tabular-nums text-caption text-faint transition-opacity duration-150",
+                "pointer-events-none pr-1.5 tabular-nums text-caption text-faint transition-opacity duration-150",
                 "[@media(hover:hover)]:group-hover:opacity-0 [@media(hover:hover)]:group-focus-within:opacity-0",
                 menuOpen && "opacity-0",
                 active && "[@media(hover:none)]:hidden",

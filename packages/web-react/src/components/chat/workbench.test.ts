@@ -8,10 +8,13 @@ import {
   fileSnapshot,
   fileTouchFingerprint,
   formatDuration,
+  isDeliverableAnswerPath,
+  isPreviewPageUrl,
   outputKindOf,
   pickHero,
   turnIndexOf,
   turnSummary,
+  turnTotalLineCounts,
 } from "./workbench";
 
 const TS = 1_700_000_000_000;
@@ -233,5 +236,43 @@ describe("浏览器截图(OCV5-374)", () => {
     ]);
     const out = collectTurnOutputs(turn);
     expect(out.media).toEqual([{ src: "/home/agent/.openclaude/generated/ex.png", kind: "image", name: "ex.png" }]);
+  });
+});
+
+describe("幽灵路径与静态构建碎片过滤(OCV5-834)", () => {
+  test("过滤 /assets/styles-*.css、宿主机 /opt 与 /var/lib/docker、/run 等不可读路径，仅保留真实交付物", () => {
+    expect(isDeliverableAnswerPath("/assets/styles-1VWWTp9J.css")).toBe(false);
+    expect(isDeliverableAnswerPath("/assets/index-B8x9kL2p.js")).toBe(false);
+    expect(isDeliverableAnswerPath("/opt/openclaude/openclaude/packages/web-react/src/App.tsx")).toBe(false);
+    expect(isDeliverableAnswerPath("/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/foo.ts")).toBe(false);
+    expect(isDeliverableAnswerPath("/run/secrets/token.txt")).toBe(false);
+    expect(isDeliverableAnswerPath("/etc/nginx/nginx.conf")).toBe(false);
+    expect(isDeliverableAnswerPath("/home/agent/.openclaude/workspace/s1/node_modules/pkg/index.js")).toBe(false);
+    expect(isDeliverableAnswerPath("/home/agent/.openclaude/workspace/s1/dist/assets/index-12345678.js")).toBe(false);
+
+    expect(isDeliverableAnswerPath("/home/agent/.openclaude/generated/report.md")).toBe(true);
+    expect(isDeliverableAnswerPath("/home/agent/.openclaude/workspace/s1/index.html")).toBe(true);
+
+    expect(isPreviewPageUrl("http://127.0.0.1:5173/assets/styles-1VWWTp9J.css")).toBe(false);
+    expect(isPreviewPageUrl("http://127.0.0.1:5173/assets/index-abc12345.js")).toBe(false);
+    expect(isPreviewPageUrl("http://127.0.0.1:5173/")).toBe(true);
+
+    const [turn] = collectWorkTurns([
+      user("u1", "构建并检查线上产物"),
+      tool("w1", "Write", { file_path: "/home/agent/.openclaude/workspace/s1/report.md", content: "# 报告\n" }),
+      assistant(
+        "a1",
+        [
+          "已构建完成：静态资源 `/assets/styles-1VWWTp9J.css`、`/assets/index-B8x9kL2p.js`，",
+          "宿主机路径 `/opt/openclaude/openclaude/src/App.tsx`、`/var/lib/docker/volumes/oc-v5-data-u3/_data/x.ts`、`/run/app.pid`，",
+          "静态调试链接 http://127.0.0.1:5173/assets/styles-1VWWTp9J.css ，页面预览 http://127.0.0.1:5173/app 。",
+          "交付文档见 `/home/agent/.openclaude/generated/summary.md`。",
+        ].join(""),
+      ),
+    ]);
+    const out = collectTurnOutputs(turn);
+    expect(out.files.map((f) => f.name)).toEqual(["report.md", "summary.md"]);
+    expect(out.links.map((l) => l.url)).toEqual(["http://127.0.0.1:5173/app"]);
+    expect(turnTotalLineCounts(out.files)).toEqual({ added: 1, removed: 0, hasCounts: true });
   });
 });

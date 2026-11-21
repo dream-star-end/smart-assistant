@@ -71,7 +71,7 @@ export function ScrollToBottomButton({
       aria-hidden={!visible}
       data-testid="scroll-to-bottom-dock"
       data-visible={visible ? "true" : "false"}
-      className="pointer-events-none sticky bottom-3 z-10 -mt-4 h-0 overflow-visible sm:bottom-4"
+      className="pointer-events-none sticky bottom-1.5 z-10 -mt-4 h-0 overflow-visible sm:bottom-2"
     >
       <button
         type="button"
@@ -79,13 +79,13 @@ export function ScrollToBottomButton({
         aria-label="回到底部"
         tabIndex={visible ? 0 : -1}
         className={
-          "oc-surface-glass oc-btn-tactile group absolute bottom-0 left-1/2 -translate-x-1/2 flex size-8 items-center justify-center rounded-full border border-border-control bg-elevated/90 text-muted shadow-float backdrop-blur-md outline-none transition-[opacity,transform,color,border-color] duration-200 ease-spring hover:-translate-y-0.5 hover:border-border-strong hover:text-fg focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:size-9 " +
+          "oc-surface-glass oc-btn-tactile group absolute bottom-0 left-1/2 -translate-x-1/2 flex size-7 items-center justify-center rounded-full border border-border-control bg-elevated/90 text-muted shadow-float backdrop-blur-md outline-none transition-[opacity,transform,color,border-color] duration-200 ease-spring hover:-translate-y-0.5 hover:border-border-strong hover:text-fg focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:size-8 " +
           (visible ? "pointer-events-auto translate-y-0 opacity-100" : "pointer-events-none translate-y-1 opacity-0")
         }
         onClick={onClick}
       >
         <ChevronDown
-          size={15}
+          size={14}
           strokeWidth={2}
           className="transition-transform duration-200 ease-spring group-hover:translate-y-0.5 group-hover:text-accent"
         />

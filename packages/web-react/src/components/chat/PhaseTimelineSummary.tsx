@@ -1,4 +1,4 @@
-import { Brain, ChevronRight, Layers, Pencil, Search, Terminal, Users, type LucideIcon } from "lucide-react";
+import { Brain, ChevronRight, Pencil, Search, Terminal, Users, type LucideIcon } from "lucide-react";
 import { Fragment } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import type { StepTiming } from "./ProcessDisclosure";
@@ -150,7 +150,8 @@ export function PhaseTimelineFilterBar({
   selectedPhase: PhaseKind | null;
   onSelectPhase: (kind: PhaseKind | null) => void;
 }) {
-  if (!timeline.showFilterBar) return null;
+  // Codex 极简零噪音原则：仅当多阶段且步骤较多（≥ 4 步）或用户主动从收起条点入筛选时才展示。
+  if (!timeline.showFilterBar || (timeline.totalSteps < 4 && selectedPhase === null)) return null;
 
   return (
     <div data-testid="phase-filter-bar" className="oc-phase-filter-bar">
@@ -165,12 +166,10 @@ export function PhaseTimelineFilterBar({
           onClick={() => onSelectPhase(null)}
           className="oc-phase-pill"
         >
-          <Layers size={11} strokeWidth={2} aria-hidden className="oc-phase-pill-icon" />
           <span>全部</span>
           <span className="oc-phase-pill-count">{timeline.totalSteps}</span>
         </button>
         {timeline.phases.map((phase) => {
-          const Icon = PHASE_ICON[phase.kind];
           const pressed = selectedPhase === phase.kind;
           const duration = formatPhaseDuration(phase.durationMs);
           return (
@@ -192,7 +191,6 @@ export function PhaseTimelineFilterBar({
                   className="oc-phase-active-dot"
                 />
               ) : null}
-              <Icon size={11} strokeWidth={2} aria-hidden className="oc-phase-pill-icon" />
               <span>{phase.shortLabel}</span>
               <span className="oc-phase-pill-count">{phase.stepCount}</span>
               {duration ? <span className="oc-phase-pill-duration">{duration}</span> : null}
@@ -226,10 +224,8 @@ export function PhaseGroupHeader({
   const duration = formatPhaseDuration(phase.durationMs);
   return (
     <div data-testid="phase-group-header" data-phase-kind={phase.kind} className="oc-phase-group-head">
-      <span className="oc-icon-badge oc-icon-badge-accent flex size-5 shrink-0 items-center justify-center rounded-sm">
-        <Icon size={11} strokeWidth={1.85} aria-hidden />
-      </span>
-      <span className="font-semibold text-fg">{phase.label}</span>
+      <Icon size={12.5} strokeWidth={1.85} aria-hidden className="shrink-0 text-accent" />
+      <span className="font-medium text-fg">{phase.label}</span>
       <span className="tabular-nums text-faint">· {phase.stepCount} 项</span>
       {phase.changedFileCount > 0 ? (
         <span className="tabular-nums text-faint">· 改动 {phase.changedFileCount} 个文件</span>

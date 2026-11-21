@@ -103,6 +103,8 @@ describe("PhaseTimelineSummary integration in ProcessDisclosure", () => {
         initialOpen={false}
         messages={[
           msg("r1", "tool", { toolName: "Read", inputJson: { file_path: "src/a.ts" }, _completed: true }),
+          msg("r2", "tool", { toolName: "Grep", inputJson: { pattern: "foo" }, _completed: true }),
+          msg("e1", "tool", { toolName: "Edit", inputJson: { file_path: "src/a.ts", old_string: "a", new_string: "b" }, _completed: true }),
           msg("v1", "tool", { toolName: "Bash", inputJson: { command: "pnpm test" }, _completed: false }),
         ]}
       />,
@@ -123,6 +125,29 @@ describe("PhaseTimelineSummary integration in ProcessDisclosure", () => {
     expect(verifyFilter).toHaveAttribute("aria-pressed", "false");
     expect(within(verifyFilter).getByTestId("phase-active-dot-verify")).toHaveClass("oc-phase-active-dot");
     expect(within(filterBar).queryByTestId("phase-active-dot-explore")).toBeNull();
+  });
+
+  test("OCV5-834: hides filter bar for short 2-3 step turns by default, but shows it when clicked from collapsed strip", () => {
+    render(
+      <Harness
+        messages={[
+          msg("r1", "tool", { toolName: "Read", inputJson: { file_path: "src/a.ts" }, _completed: true }),
+          msg("v1", "tool", { toolName: "Bash", inputJson: { command: "pnpm test" }, _completed: true }),
+        ]}
+      />,
+    );
+    // Normal open: zero filter-bar noise for < 4 steps
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    expect(screen.queryByTestId("phase-filter-bar")).not.toBeInTheDocument();
+    expect(screen.getAllByTestId("process-step-row")).toHaveLength(2);
+
+    // Close and click a phase crumb from the collapsed strip: filter bar shows so user can reset
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    fireEvent.click(screen.getByTestId("phase-pill-verify"));
+    expect(screen.getByTestId("phase-filter-bar")).toBeInTheDocument();
+    expect(screen.getByTestId("process-phase-filtered")).toHaveAttribute("data-phase-filter", "verify");
+    fireEvent.click(screen.getByTestId("phase-filter-reset"));
+    expect(screen.queryByTestId("phase-filter-bar")).not.toBeInTheDocument();
   });
 
   test("formats phase durations in compact tabular form", () => {
@@ -194,10 +219,15 @@ describe("PhaseTimelineSummary integration in ProcessDisclosure", () => {
       />,
     );
 
-    // #9c: expanded process list wrapped in refined surface card container
+    // OCV5-834: Codex frameless editorial activity stream (no bulky white card box, soft left rail, no 24px circle bubbles)
     const stages = screen.getByTestId("process-stages");
-    expect(stages.className).toContain("oc-surface-card");
-    expect(stages.className).toContain("rounded-xl");
+    expect(stages.className).not.toContain("oc-surface-card");
+    expect(stages.className).toContain("oc-codex-rail");
+    for (const iconNode of within(stages).getAllByTestId("process-step-node")) {
+      expect(iconNode.className).toContain("size-4");
+      expect(iconNode.className).not.toContain("rounded-full");
+      expect(iconNode.className).not.toContain("ring-1");
+    }
 
     // #7a: every step row displays action title + concise single-line muted subtitle
     const rows = screen.getAllByTestId("process-step-row");
@@ -250,5 +280,62 @@ describe("PhaseTimelineSummary integration in ProcessDisclosure", () => {
     expect(
       extractStepSubtitle("Bash", { command: "echo hi", description: "You are an internal prompt /home/agent/secret" }, "运行命令", promptLeakMsg),
     ).toBe("");
+  });
+
+  test("OCV5-834: collapses >= 3 consecutive completed read-only explore steps into a Codex cluster while keeping edits, errors, and running steps visible", () => {
+    const messages: ChatMessage[] = [
+      msg("r1", "tool", { toolName: "Read", inputJson: { file_path: "src/a.ts" }, _completed: true, ts: 1_700_000_001_000, durationMs: 200 }),
+      msg("r2", "tool", { toolName: "Read", inputJson: { file_path: "src/b.ts" }, _completed: true, ts: 1_700_000_002_000, durationMs: 300 }),
+      msg("s1", "tool", { toolName: "Grep", inputJson: { pattern: "ChatHeader" }, _completed: true, ts: 1_700_000_003_000, durationMs: 400 }),
+      msg("r3", "tool", { toolName: "Read", inputJson: { file_path: "src/c.ts" }, _completed: true, ts: 1_700_000_004_000, durationMs: 500 }),
+      msg("e1", "tool", { toolName: "Edit", inputJson: { file_path: "src/a.ts", old_string: "1", new_string: "2" }, _completed: true, ts: 1_700_000_005_000, durationMs: 900 }),
+      msg("bad-r", "tool", { toolName: "Read", inputJson: { file_path: "src/missing.ts" }, _completed: true, error: true, output: "ENOENT", ts: 1_700_000_006_000 }),
+      msg("v1", "tool", { toolName: "Bash", inputJson: { command: "pnpm vitest run" }, _completed: true, ts: 1_700_000_007_000, durationMs: 1_200 }),
+    ];
+
+    render(<Harness messages={messages} initialOpen />);
+
+    // The 4 consecutive completed read/grep steps fold into one clean Codex cluster row
+    const cluster = screen.getByTestId("process-explore-cluster");
+    expect(cluster).toHaveTextContent("已探索 4 处文件与代码");
+    // Edit, errored Read, and Bash remain directly visible (3 step rows before expanding cluster)
+    expect(screen.getAllByTestId("process-step-row")).toHaveLength(3);
+
+    // Expanding the cluster reveals all 4 underlying explore step rows
+    fireEvent.click(within(cluster).getAllByRole("button")[0]!);
+    expect(within(cluster).getAllByTestId("process-step-row")).toHaveLength(4);
+    expect(screen.getAllByTestId("process-step-row")).toHaveLength(7);
+  });
+
+  test("OCV5-834: pure read or pure search runs use crisp Codex labels and running explore steps never fold", () => {
+    const view = render(
+      <Harness
+        active
+        initialOpen
+        messages={[
+          msg("r1", "tool", { toolName: "Read", inputJson: { file_path: "src/a.ts" }, _completed: true }),
+          msg("r2", "tool", { toolName: "Read", inputJson: { file_path: "src/b.ts" }, _completed: true }),
+          msg("r3", "tool", { toolName: "Read", inputJson: { file_path: "src/c.ts" }, _completed: true }),
+          msg("r4", "tool", { toolName: "Read", inputJson: { file_path: "src/d.ts" }, _completed: false }),
+        ]}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    expect(screen.getByTestId("process-explore-cluster")).toHaveTextContent("已读取 3 个文件");
+    // The 4th running Read remains directly visible outside the cluster
+    expect(screen.getAllByTestId("process-step-row")).toHaveLength(1);
+    view.unmount();
+
+    render(
+      <Harness
+        initialOpen
+        messages={[
+          msg("s1", "tool", { toolName: "Grep", inputJson: { pattern: "one" }, _completed: true }),
+          msg("s2", "tool", { toolName: "Grep", inputJson: { pattern: "two" }, _completed: true }),
+          msg("s3", "tool", { toolName: "WebSearch", inputJson: { query: "three" }, _completed: true }),
+        ]}
+      />,
+    );
+    expect(screen.getByTestId("process-explore-cluster")).toHaveTextContent("已检索 3 处代码与资料");
   });
 });

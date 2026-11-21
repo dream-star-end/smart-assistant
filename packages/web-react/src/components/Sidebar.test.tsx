@@ -1960,12 +1960,13 @@ describe("Sidebar SIDEBAR-R1 行菜单：右键 / 触屏长按", () => {
     expect(await screen.findByTestId("sidebar-batch-bar")).toBeInTheDocument();
   });
 
-  it("项目内会话带层级引导线；置顶 / 未分组顶层会话不带", () => {
+  it("项目内会话采用克制缩进且无突兀长竖线；置顶 / 顶层会话不缩进；选中行无粗红竖条", () => {
     renderSidebar({
       sessions: [
         session({ id: "s-in", title: "项目里", projectId: "p-1", updatedAt: iso(3) }),
         session({ id: "s-pin", title: "置顶的", pinned: true, updatedAt: iso(2) }),
       ],
+      activeId: "s-in",
       projects: [project({ id: "p-1", name: "甲" })],
       collapsedProjectIds: new Set(),
       onToggleProjectCollapsed: () => {},
@@ -1973,8 +1974,35 @@ describe("Sidebar SIDEBAR-R1 行菜单：右键 / 触屏长按", () => {
     });
     const rowOf = (t: string) =>
       screen.getByRole("button", { name: t }).closest("[data-session-row]")!;
-    expect(rowOf("项目里").querySelector("[data-session-guide]")).not.toBeNull();
+    expect(rowOf("项目里").querySelector("[data-session-guide]")).toBeNull();
     expect(rowOf("置顶的").querySelector("[data-session-guide]")).toBeNull();
+    expect(rowOf("项目里")).toHaveAttribute("data-indented", "true");
+    expect(rowOf("项目里")).toHaveClass("pl-2");
+    expect(rowOf("置顶的")).not.toHaveAttribute("data-indented");
+
+    const activeInner = screen.getByRole("button", { name: "项目里" }).closest("[data-active='true']")!;
+    expect(activeInner.className).not.toContain("before:bg-accent");
+    expect(activeInner).toHaveClass("bg-sidebar-active", "shadow-sidebar-active");
+
+    // 项目计数去灰胶囊，保持极淡无框 tabular-nums
+    const projectBtn = screen.getByRole("button", { name: /甲/ });
+    const countEl = within(projectBtn.closest("[data-project-row]") as HTMLElement).getByText("1");
+    expect(countEl.className).not.toContain("bg-hover");
+    expect(countEl).toHaveClass("tabular-nums", "text-faint");
+  });
+
+  it("主导航区与会话列表之间有发丝分隔线，激活导航无红竖条", () => {
+    renderSidebar({
+      onOpenBoard: () => {},
+      onOpenSites: () => {},
+      onOpenBlog: () => {},
+      boardActive: true,
+    });
+    const primary = document.querySelector("[data-product-entry-scope='sidebar-primary']")!;
+    expect(primary).toHaveClass("border-b", "border-border/60");
+    const boardBtn = screen.getByTestId("taskboard-nav");
+    expect(boardBtn).toHaveClass("bg-sidebar-active", "shadow-sidebar-active");
+    expect(boardBtn.className).not.toContain("before:bg-accent");
   });
 });
 

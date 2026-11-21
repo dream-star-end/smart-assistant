@@ -439,8 +439,47 @@
   background: var(--bg);
 }
 
+/* ── Codex 风格文件目录总览行与类型微胶囊（OCV5-834） ────────────────── */
+.wb-dir-row {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.625rem 1rem;
+  background: transparent;
+  border: 0;
+  text-align: left;
+  outline: none;
+  cursor: pointer;
+  transition: background-color 140ms var(--ease-standard);
+}
+
+.wb-dir-row:hover {
+  background: var(--hover);
+}
+
+.wb-dir-row:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--ring);
+}
+
+.wb-type-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.125rem 0.4375rem;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  font-weight: 500;
+  letter-spacing: 0.01em;
+}
+
 @media (hover: none) {
-  .wb-th-btn {
+  .wb-th-btn,
+  .wb-dir-row {
     min-height: 2.75rem;
   }
 }

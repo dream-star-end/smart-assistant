@@ -178,4 +178,36 @@ describe("LiveActivityStrip", () => {
       });
     }
   });
+
+  it("仅有 1 条运行中且就是当前选中会话时自动收起明细行避免同屏重复，切走后自动展开直达", () => {
+    const summary = collectLiveActivity({
+      sessions: [
+        makeSession({ id: "s-run", title: "正在重构侧栏", runState: "running" }),
+        makeSession({ id: "s-other", title: "普通历史会话", lastOutcome: "completed" }),
+      ],
+    });
+    const onSelect = vi.fn();
+    const { rerender } = render(
+      <LiveActivityStrip summary={summary} activeId="s-run" onSelect={onSelect} />,
+    );
+
+    const strip = screen.getByTestId("sidebar-live-strip");
+    expect(strip).toHaveAttribute("data-compact-active", "true");
+    expect(screen.queryByTestId("live-strip-list")).toBeNull();
+    expect(screen.getByTestId("live-strip-filter-running")).toBeInTheDocument();
+    expect(screen.getByTestId("live-strip-collapse-toggle")).toHaveAttribute("aria-expanded", "false");
+
+    // 切到其他会话后，后台运行项自动展开，便于一键跳回
+    rerender(<LiveActivityStrip summary={summary} activeId="s-other" onSelect={onSelect} />);
+    expect(strip).not.toHaveAttribute("data-compact-active");
+    expect(screen.getByTestId("live-strip-list")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "运行中 · 正在重构侧栏" }));
+    expect(onSelect).toHaveBeenCalledWith("s-run");
+
+    // 回到当前运行会话后自动再次收起；手动点击展开仍可查看
+    rerender(<LiveActivityStrip summary={summary} activeId="s-run" onSelect={onSelect} />);
+    expect(screen.queryByTestId("live-strip-list")).toBeNull();
+    fireEvent.click(screen.getByTestId("live-strip-collapse-toggle"));
+    expect(screen.getByTestId("live-strip-list")).toBeInTheDocument();
+  });
 });

@@ -354,4 +354,39 @@ describe("Codex r1 回归", () => {
     render(<InspectorPanelContent messages={messages} running request={{ tab: "steps", message: messages[4], nonce: 1 }} onClose={() => {}} />);
     expect(screen.queryByTestId("pane-following")).not.toBeInTheDocument();
   });
+
+  test("过程 Tab 清洗系统回调标题与 env HOME 宿主桥接命令，顶栏标签克制显示「过程」", () => {
+    const hostCmd = [
+      "env HOME=/home/agent /home/agent/.local/bin/host '",
+      '  export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="*"',
+      "  set -euo pipefail",
+      "  cd /var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-832-codex-redesign",
+      "  ../../node_modules/.bin/tsc --noEmit",
+      "'",
+    ].join("\n");
+    const messages: ChatMessage[] = [
+      user("u1", "🚨 发版主工作树无法快进到 origin tip 7734e3a01b2c3d4e"),
+      tool("t1", "Bash", { command: "git status -s" }),
+      user("u2", "🎫 lease ls-20261121T072712Z-c88785cc5d71 已满足"),
+      tool("t2", "Bash", { command: hostCmd }),
+    ];
+    render(<InspectorPanelContent messages={messages} request={STEPS} onClose={() => {}} />);
+
+    // 顶栏显示克制的「过程」标签，同时兼容 /步骤/ 无障碍名称
+    const stepsTab = screen.getByRole("tab", { name: /过程/ });
+    expect(stepsTab).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: /步骤\s*2/ })).toBe(stepsTab);
+
+    // 轮次标题已清洗为人话，绝不暴露原始 lease id / emoji / hex
+    const turns = screen.getAllByTestId("pane-turn");
+    expect(turns[0]).toHaveTextContent("发布上线完成");
+    expect(turns[1]).toHaveTextContent("发版同步提示");
+    expect(screen.queryByText(/ls-20261121T072712Z/)).toBeNull();
+
+    // 步骤副摘要已剥离 env HOME=/home/agent 宿主桥接噪音
+    const stepRow = within(turns[0]).getByTestId("pane-step");
+    expect(stepRow).toHaveTextContent("tsc --noEmit");
+    expect(stepRow).not.toHaveTextContent("env HOME=");
+    expect(stepRow).not.toHaveTextContent("GIT_CONFIG_COUNT");
+  });
 });

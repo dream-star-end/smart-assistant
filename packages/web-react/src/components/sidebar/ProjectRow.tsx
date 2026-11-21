@@ -107,9 +107,9 @@ export function ProjectRow({
   const showAssetsOnlyMenu = Boolean(immutable && onOpenAssets);
   const showMenu = showMutateMenu || showAssetsOnlyMenu;
   const swatch = !immutable && PROJECT_COLORS.find((c) => c.key === p.color);
-  // 图标列与子会话的层级引导线同一中轴（SessionRow left-[15px]）：树形结构一眼可读。
+  // 图标列与一级导航、归档开关同一 16px 中轴，标题与下方会话左边缘整齐对齐。
   const icon = (
-    <span className="flex size-3.5 shrink-0 items-center justify-center text-faint">
+    <span className="flex size-4 shrink-0 items-center justify-center text-faint">
       {swatch ? (
         <span aria-hidden className={cn("size-2.5 rounded-full ring-1 ring-inset ring-black/10", swatch.dotClass)} />
       ) : immutable ? (
@@ -143,18 +143,18 @@ export function ProjectRow({
       )}
     >
       {collapsed && runningCount > 0 && (
-        // 运行中数做成独立 pill，与右侧总数分开，不再被读成「12」（PR-01）。
+        // 运行中数做成独立轻量提示，与右侧总数分开，不再被读成「12」（PR-01）。
         <span
           data-project-running={runningCount}
           title={`${runningCount} 个运行中`}
           aria-label={`${runningCount} 个运行中`}
-          className="flex shrink-0 items-center gap-1 rounded-full bg-status-running/10 px-1.5 py-px ring-1 ring-inset ring-status-running/20"
+          className="flex shrink-0 items-center gap-1 rounded-full bg-accent-soft px-1.5 py-px"
         >
           <SessionStatusDot running />
           <span className="tabular-nums text-caption font-medium text-status-running">{runningCount}</span>
         </span>
       )}
-      <span className="rounded-xs bg-hover/65 px-1.5 py-px tabular-nums text-caption text-faint">{count}</span>
+      <span className="tabular-nums text-caption text-faint">{count}</span>
     </span>
   );
   return (
@@ -189,12 +189,12 @@ export function ProjectRow({
     >
       <div
         className={cn(
-          "group relative flex h-full items-center rounded-sm text-section transition-[background-color,box-shadow] duration-150 ease-standard",
+          "group relative flex h-full items-center rounded-sm text-section transition-colors duration-150 ease-standard",
           dropActive
             ? "bg-accent-soft text-fg ring-1 ring-accent/40"
             : active
-              ? "bg-sidebar-active text-fg shadow-sidebar-active before:absolute before:bottom-1.5 before:left-0.5 before:top-1.5 before:w-0.5 before:rounded-xs before:bg-accent"
-              : "text-fg hover:bg-hover",
+              ? "bg-sidebar-active text-fg shadow-sidebar-active"
+              : "text-fg hover:bg-hover/80",
         )}
       >
         {onOpen && canMutate ? (
@@ -205,7 +205,7 @@ export function ProjectRow({
               onClick={() => onOpen(p.id)}
               aria-current={active ? "page" : undefined}
               title="打开项目主页"
-              className="flex h-full min-w-0 shrink items-center gap-2 rounded-sm pl-2 pr-1 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="flex h-full min-w-0 shrink items-center gap-2.5 rounded-sm pl-2.5 pr-1 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               {icon}
               <span className="min-w-0 truncate font-medium">{p.name}</span>
@@ -223,7 +223,7 @@ export function ProjectRow({
             {/* 右侧留白 + 计数：鼠标点到也算打开主页（键盘走左侧名字按钮，不重复进 Tab 序）。 */}
             <span
               onClick={() => onOpen(p.id)}
-              className="flex h-full min-w-0 flex-1 cursor-pointer items-center pr-2"
+              className="flex h-full min-w-0 flex-1 cursor-pointer items-center pr-2.5"
             >
               <span className="min-w-0 flex-1" />
               {trailing}
@@ -234,7 +234,7 @@ export function ProjectRow({
             type="button"
             onClick={() => onToggle?.(p.id)}
             aria-expanded={!collapsed}
-            className="flex h-full min-w-0 flex-1 items-center gap-2 rounded-sm pl-2 pr-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="flex h-full min-w-0 flex-1 items-center gap-2.5 rounded-sm px-2.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             {icon}
             <span className="min-w-0 truncate font-medium">{p.name}</span>
