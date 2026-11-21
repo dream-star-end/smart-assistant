@@ -4,6 +4,7 @@ import '@testing-library/jest-dom/vitest'
 import type { LockedPublicModel, PublicModel } from '../lib/types'
 import { loadBeforeAll } from '../test/moduleLoad'
 import { ModelSelector, compactMobileModelLabel, modelLabel, preloadModelSelectorPanel, teamEngineLabel } from './ModelSelector'
+import { parseModelDisplayMeta } from './ModelSelectorExtras'
 import { EFFORT_OPTIONS } from './settings/labels'
 
 loadBeforeAll(preloadModelSelectorPanel)
@@ -362,8 +363,11 @@ describe('ModelSelector Cursor Opus/Fable 上下文档(turn 级 contextTier)', (
     expect(std).toBeTruthy()
     expect(long).toBeTruthy()
     expect(std?.textContent).toContain('默认')
-    // 默认档:300k 行带勾,1M 行不带
-    expect(std?.querySelector('svg')).toBeTruthy()
+    // OCV5-836: 分段滑块去掉生硬 ✓ 对勾，改用浮起亮卡 .oc-segmented-thumb + aria-pressed 表达选中
+    expect(std).toHaveAttribute('aria-pressed', 'true')
+    expect(std?.className).toContain('oc-segmented-thumb')
+    expect(std?.querySelector('svg')).toBeNull()
+    expect(long).toHaveAttribute('aria-pressed', 'false')
     expect(long?.querySelector('svg')).toBeNull()
     if (long) fireEvent.click(long)
     expect(onSelectContextTier).toHaveBeenCalledWith('1m')
@@ -385,8 +389,10 @@ describe('ModelSelector Cursor Opus/Fable 上下文档(turn 级 contextTier)', (
     await screen.findAllByRole('menuitem')
     const std = document.querySelector('[data-cursor-context="300k"]')
     const long = document.querySelector('[data-cursor-context="1m"]')
-    expect(long?.querySelector('svg')).toBeTruthy()
-    expect(std?.querySelector('svg')).toBeNull()
+    expect(long).toHaveAttribute('aria-pressed', 'true')
+    expect(long?.className).toContain('oc-segmented-thumb')
+    expect(std).toHaveAttribute('aria-pressed', 'false')
+    expect(std?.className).not.toContain('oc-segmented-thumb')
     if (std) fireEvent.click(std)
     expect(onSelectContextTier).toHaveBeenCalledWith('300k')
     expect(onSelect).not.toHaveBeenCalled()
@@ -977,9 +983,10 @@ describe('ModelSelector OCV5-434 / OCV5-798 GPT 速度档位(turn 级 serviceTie
     const fast = document.querySelector('[data-gpt-fast="true"]')
     const ultra = document.querySelector('[data-gpt-ultrafast="true"]')
     expect(fast?.textContent).toContain('按 2× 计费')
-    expect(fast?.querySelector('svg')).toBeTruthy()
+    expect(fast).toHaveAttribute('aria-pressed', 'true')
+    expect(fast?.className).toContain('oc-segmented-thumb')
     expect(ultra?.textContent).toContain('按 6× 计费')
-    expect(ultra).toBeTruthy()
+    expect(ultra).toHaveAttribute('aria-pressed', 'false')
     fireEvent.click(ultra!)
     expect(onSelectServiceTier).toHaveBeenCalledWith('ultrafast')
 
@@ -1006,7 +1013,8 @@ describe('ModelSelector OCV5-434 / OCV5-798 GPT 速度档位(turn 级 serviceTie
       const std = document.querySelector('[data-gpt-fast="false"]')
       const fast = document.querySelector('[data-gpt-fast="true"]')
       expect(fast?.textContent).toContain('按 2× 计费')
-      expect(std?.querySelector('svg')).toBeTruthy()
+      expect(std).toHaveAttribute('aria-pressed', 'true')
+      expect(std?.className).toContain('oc-segmented-thumb')
       expect(document.querySelector('[data-gpt-ultrafast]')).toBeNull()
     }
   })
@@ -1421,5 +1429,125 @@ describe('ModelSelector OCV5-820 响应式根治（<640 Sheet / ≥640 双栏 / 
     openMenu(trigger)
     const items = await screen.findAllByRole('menuitem')
     expect(items.some((i) => i.textContent?.includes('Gemini 4 Neon (Antigravity)'))).toBe(true)
+  })
+})
+
+describe('ModelSelector OCV5-836 现代品牌徽标、去刷屏名称清洗与家族分组', () => {
+  const ATELIER_MODELS: PublicModel[] = [
+    { id: 'gemini-4-neon-ag', display_name: 'Gemini 4 Neon (Antigravity)', cost_x: 2.7 },
+    { id: 'gemini-4-flash-ag', display_name: 'Gemini 4 Flash (Antigravity)', cost_x: 0.9 },
+    { id: 'claude-opus-5.5-ag', display_name: 'Claude Opus 5.5 (Antigravity)', cost_x: 5.5 },
+    { id: 'claude-sonnet-5.5-remote', display_name: 'Claude Sonnet 5.5 远端 (Antigravity)', cost_x: 3.1 },
+    { id: 'orchestrator-carbon-ag', display_name: 'Orchestrator Carbon (Antigravity)', cost_x: 4.2 },
+    { id: 'gpt-6.2-sol', display_name: 'GPT-6.2 Sol', cost_x: 1.5 },
+  ]
+
+  it('parseModelDisplayMeta 清洗 (Antigravity) 刷屏后缀并提炼 远端/编排/Go 微标签', () => {
+    expect(parseModelDisplayMeta('Gemini 4 Neon (Antigravity)', 'gemini-4-neon-ag')).toEqual({
+      raw: 'Gemini 4 Neon (Antigravity)',
+      cleanName: 'Gemini 4 Neon',
+      tags: [],
+    })
+    expect(
+      parseModelDisplayMeta('Claude Sonnet 5.5 远端 (Antigravity)', 'claude-sonnet-5.5-remote'),
+    ).toEqual({
+      raw: 'Claude Sonnet 5.5 远端 (Antigravity)',
+      cleanName: 'Claude Sonnet 5.5',
+      tags: [{ label: '远端', tone: 'info' }],
+    })
+    expect(
+      parseModelDisplayMeta('Orchestrator Carbon (Antigravity)', 'orchestrator-carbon-ag'),
+    ).toEqual({
+      raw: 'Orchestrator Carbon (Antigravity)',
+      cleanName: 'Orchestrator Carbon',
+      tags: [{ label: '编排', tone: 'accent' }],
+    })
+    expect(parseModelDisplayMeta('Kimi K3 (Go)', 'kimi-k3-go')).toEqual({
+      raw: 'Kimi K3 (Go)',
+      cleanName: 'Kimi K3',
+      tags: [{ label: 'Go', tone: 'neutral' }],
+    })
+    expect(parseModelDisplayMeta('(Antigravity)', 'ag')).toEqual({
+      raw: '(Antigravity)',
+      cleanName: '(Antigravity)',
+      tags: [],
+    })
+  })
+
+  it('多家族模型自动按家族轻量分组、渲染双色调家族徽标、清洗名称并保留完整 title/sr-only', async () => {
+    render(
+      <ModelSelector
+        models={ATELIER_MODELS}
+        selectedId="gemini-4-neon-ag"
+        onSelect={() => {}}
+        effortSupported={['low', 'medium', 'high']}
+        effortActive="high"
+        onSelectEffort={() => {}}
+      />,
+    )
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+
+    // 轻量家族小标题按首现顺序渲染
+    const groupHeaders = Array.from(document.querySelectorAll('[data-family-group]')).map((el) =>
+      el.getAttribute('data-family-group'),
+    )
+    expect(groupHeaders).toEqual(['gemini', 'claude', 'orchestrator', 'gpt'])
+
+    // 选中项具备暖陶土呼吸光晕徽标与选中高亮类
+    const activeRow = document.querySelector('[data-model-id="gemini-4-neon-ag"]')
+    expect(activeRow).toBeTruthy()
+    expect(activeRow?.className).toContain('model-picker-row-active')
+    expect(activeRow?.querySelector('.oc-breathe-aura')).toBeTruthy()
+    expect(activeRow?.getAttribute('title')).toBe('Gemini 4 Neon (Antigravity)')
+    expect(activeRow?.querySelector('.sr-only')?.textContent).toBe('Gemini 4 Neon (Antigravity)')
+
+    // 远端 & 编排微标签
+    const remoteRow = document.querySelector('[data-model-id="claude-sonnet-5.5-remote"]')
+    expect(remoteRow?.querySelector('[data-model-tag="远端"]')).toBeTruthy()
+    const orchRow = document.querySelector('[data-model-id="orchestrator-carbon-ag"]')
+    expect(orchRow?.querySelector('[data-model-tag="编排"]')).toBeTruthy()
+
+    // 桌面双栏右侧当前模型摘要也带专属呼吸徽标且副名去除了 (Antigravity)
+    const summary = screen.getByTestId('model-picker-extras-summary')
+    expect(summary.querySelector('.oc-breathe-aura')).toBeTruthy()
+    expect(summary.textContent).toContain('Gemini 4 Neon')
+    expect(summary.textContent).not.toContain('(Antigravity)')
+
+    // 思考档位分段控件使用浮起滑块 + 弹簧触感且不含生硬对勾 SVG
+    const highBtn = document.querySelector('[data-effort="high"]')
+    expect(highBtn).toHaveAttribute('aria-pressed', 'true')
+    expect(highBtn?.className).toContain('oc-segmented-thumb')
+    expect(highBtn?.className).toContain('oc-spring-press')
+    expect(highBtn?.querySelector('svg')).toBeNull()
+  })
+
+  it('移动端 BottomSheet 顶部展示专属家族呼吸徽标与清洗后的简洁副标', async () => {
+    const restore = stubViewport({ width: 390, height: 844 })
+    try {
+      render(
+        <ModelSelector
+          models={ATELIER_MODELS}
+          selectedId="gemini-4-neon-ag"
+          onSelect={() => {}}
+          effortSupported={['low', 'medium', 'high']}
+          effortActive="high"
+          onSelectEffort={() => {}}
+        />,
+      )
+      fireEvent.click(screen.getByRole('button', { name: '选择对话模型' }))
+      await screen.findByRole('dialog')
+
+      const sheetIcon = screen.getByTestId('model-picker-sheet-icon')
+      expect(sheetIcon.className).toContain('oc-breathe-aura')
+      expect(sheetIcon.querySelector('svg')).toBeTruthy()
+
+      const subtitle = screen.getByTestId('model-picker-sheet-subtitle')
+      expect(subtitle.textContent).toContain('Gemini 4 Neon')
+      expect(subtitle.textContent).not.toContain('(Antigravity)')
+      expect(subtitle).toHaveAttribute('title', 'Gemini 4 Neon (Antigravity)')
+    } finally {
+      restore()
+    }
   })
 })

@@ -1,31 +1,20 @@
 import * as RD from "@radix-ui/react-dialog";
 import {
   ArrowLeft,
-  Brain,
   Check,
-  Clock,
-  Cpu,
-  FileOutput,
   FileText,
   Folder,
   FolderInput,
-  Globe,
   House,
   MessageSquare,
-  MessageSquarePlus,
   Moon,
-  PanelRight,
   Plug,
   Plus,
   Search,
-  Settings,
-  Sparkles,
-  SquareKanban,
   Target,
-  Users,
-  Wrench,
 } from "lucide-react";
 import {
+  type CSSProperties,
   type KeyboardEvent,
   type ReactNode,
   useEffect,
@@ -64,6 +53,8 @@ import {
 import "./palette/paletteUpgrade.css";
 import { HighlightedText } from "./sidebar/highlight";
 import { Badge, StatusPill, useToast } from "./ui";
+import { AtelierIcon } from "./ui/AtelierIcons";
+import { AtelierLazyIcon } from "./ui/AtelierLazyIcons";
 
 export const PALETTE_SEARCH_DEBOUNCE_MS = 200;
 const ASSET_SEARCH_LIMIT = 20;
@@ -561,7 +552,7 @@ export function CommandPalette(props: CommandPaletteProps) {
                     inputRef.current?.focus();
                   }}
                   className={cn(
-                    "oc-btn-tactile min-h-11 shrink-0 rounded-full px-3 text-meta font-medium md:min-h-7 md:px-2.5",
+                    "oc-btn-tactile oc-spring-press min-h-11 shrink-0 rounded-full px-3 text-meta font-medium md:min-h-7 md:px-2.5",
                     filter === f.id
                       ? "oc-badge-craft bg-accent-soft text-accent"
                       : "text-muted hover:bg-hover hover:text-fg",
@@ -580,8 +571,14 @@ export function CommandPalette(props: CommandPaletteProps) {
             aria-label="结果"
             className="min-h-0 flex-1 space-y-1 overflow-y-auto px-2 py-2"
           >
-            {groups.map((g) => (
-              <div key={g.id} role="group" aria-label={g.label} className="mb-1.5 last:mb-0">
+            {groups.map((g, groupIdx) => (
+              <div
+                key={g.id}
+                role="group"
+                aria-label={g.label}
+                style={{ "--stagger-i": groupIdx } as CSSProperties}
+                className="oc-stagger-in mb-1.5 last:mb-0"
+              >
                 <div className="oc-palette-group-head">
                   <span>{g.label}</span>
                   {g.items.length > 1 && (
@@ -656,40 +653,40 @@ function when(at: number | undefined): string {
   return typeof at === "number" && Number.isFinite(at) && at > 0 ? relativeTime(new Date(at).toISOString()) : "";
 }
 
-function actionIcon(id: PaletteActionId) {
+function renderActionIcon(id: PaletteActionId): ReactNode {
   switch (id) {
     case "new-project":
-      return Plus;
+      return <Plus size={14} strokeWidth={1.75} />;
     case "move-session":
-      return FolderInput;
+      return <FolderInput size={14} strokeWidth={1.75} />;
     case "open-home":
-      return House;
+      return <House size={14} strokeWidth={1.75} />;
     case "open-board":
-      return SquareKanban;
+      return <AtelierIcon name="tasks" size={15} />;
     case "open-sites":
-      return Globe;
+      return <AtelierIcon name="sites" size={15} />;
     case "open-memory":
-      return Brain;
+      return <AtelierLazyIcon name="memory" size={15} />;
     case "open-skills":
-      return Wrench;
+      return <AtelierIcon name="skills" size={15} />;
     case "open-cron":
-      return Clock;
+      return <AtelierLazyIcon name="cron" size={15} />;
     case "open-connectors":
-      return Plug;
+      return <Plug size={14} strokeWidth={1.75} />;
     case "open-quick-ask":
-      return Sparkles;
+      return <AtelierIcon name="sparkles" size={15} />;
     case "open-settings":
-      return Settings;
+      return <AtelierLazyIcon name="settings" size={15} />;
     case "toggle-theme":
-      return Moon;
+      return <Moon size={14} strokeWidth={1.75} />;
     case "toggle-pane":
-      return PanelRight;
+      return <AtelierIcon name="workbench" size={15} />;
     case "toggle-swarm":
-      return Users;
+      return <AtelierIcon name="swarm" size={15} />;
     case "open-goal":
-      return Target;
+      return <Target size={14} strokeWidth={1.75} />;
     default:
-      return MessageSquarePlus;
+      return <AtelierIcon name="newChat" size={15} />;
   }
 }
 
@@ -808,7 +805,7 @@ function PaletteRow({
           )}
         >
           {item.asset.source === "output" ? (
-            <FileOutput size={14} strokeWidth={1.75} />
+            <AtelierLazyIcon name="deliverables" size={15} />
           ) : (
             <FileText size={14} strokeWidth={1.75} />
           )}
@@ -837,7 +834,7 @@ function PaletteRow({
     case "site":
       lead = (
         <span aria-hidden className="oc-icon-badge oc-icon-badge-info size-7 rounded-sm">
-          <Globe size={14} strokeWidth={1.75} />
+          <AtelierIcon name="sites" size={15} />
         </span>
       );
       body = (
@@ -868,7 +865,7 @@ function PaletteRow({
                 : "",
           )}
         >
-          <Cpu size={14} strokeWidth={1.75} />
+          <AtelierLazyIcon name="model" size={15} />
         </span>
       );
       body = (
@@ -901,10 +898,9 @@ function PaletteRow({
       trail = item.meta.costLabel ?? "";
       break;
     case "action": {
-      const Icon = actionIcon(item.action.id);
       lead = (
         <span aria-hidden className={cn("oc-icon-badge size-7 rounded-sm", actionBadgeTone(item.action.id))}>
-          <Icon size={14} strokeWidth={1.75} />
+          {renderActionIcon(item.action.id)}
         </span>
       );
       body = <span className="truncate font-medium">{item.action.label}</span>;
@@ -948,7 +944,7 @@ function PaletteRow({
       onMouseDown={(e) => e.preventDefault()}
       onClick={onClick}
       className={cn(
-        "oc-palette-row flex min-h-11 cursor-pointer items-center gap-2.5 rounded-md px-2.5 py-2 text-sm text-fg md:min-h-10",
+        "oc-palette-row oc-spring-press oc-icon-nudge flex min-h-11 cursor-pointer items-center gap-2.5 rounded-md px-2.5 py-2 text-sm text-fg md:min-h-10",
       )}
     >
       {lead}

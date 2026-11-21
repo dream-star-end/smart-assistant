@@ -4,11 +4,12 @@
  * so it never duplicates the in-timeline SwarmInlineCard.
  */
 import type { SwarmSnapshot } from "@openclaude/protocol/browser";
-import { ArrowUpRight, Hexagon, MessageSquare } from "lucide-react";
+import { ArrowUpRight, MessageSquare } from "lucide-react";
 import { useEffect, useState } from "react";
 import { cn } from "../../lib/utils";
 import { altKeyLabel } from "../ChatHeader";
-import { Badge, Spinner } from "../ui";
+import { Badge } from "../ui";
+import { AtelierIcon } from "../ui/AtelierIcons";
 import {
   formatSwarmElapsed,
   isSwarmActive,
@@ -52,21 +53,18 @@ export function PinnedSwarmDock({
 
   return (
     <div className="mx-auto mb-2 w-full min-w-0 max-w-3xl px-4" data-testid="pinned-swarm-dock">
-      <div className="oc-surface-glass flex min-h-11 min-w-0 max-w-full items-center gap-2 overflow-hidden rounded-2xl border-accent/40 px-3 py-2 shadow-float transition-all">
+      <div className="oc-surface-glass oc-hover-lift flex min-h-11 min-w-0 max-w-full items-center gap-2 overflow-hidden rounded-2xl border-accent/40 px-3 py-2 shadow-float transition-all">
         {/* Main clickable area opens the immersive Swarm Board */}
         <button
           type="button"
           onClick={() => onOpenBoard({ snapshot, cardId, blockId })}
           className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden text-left outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:rounded-lg"
         >
-          <span className="oc-icon-badge oc-icon-badge-accent relative size-6 shrink-0 rounded-md">
-            <Hexagon size={13} strokeWidth={2} />
+          <span className="oc-icon-badge oc-icon-badge-accent oc-breathe-aura relative size-6 shrink-0 rounded-md">
+            <AtelierIcon name="swarm" size={14} />
             <span
               aria-hidden
-              className={cn(
-                "absolute -right-0.5 -top-0.5 size-1.5 rounded-full ring-2 ring-elevated",
-                "bg-accent animate-pulse",
-              )}
+              className="oc-alive-dot absolute -right-0.5 -top-0.5 size-1.5 ring-2 ring-elevated"
             />
           </span>
 
@@ -76,7 +74,7 @@ export function PinnedSwarmDock({
                 {snapshot.title || "蜂群协作"}
               </span>
               <Badge tone={phase.tone} size="sm" className="shrink-0 gap-1 py-0 text-micro">
-                <Spinner size={8} />
+                <span aria-hidden className="oc-alive-dot size-1.5 shrink-0" />
                 {counts.working > 0 ? `${counts.working} 运行中` : `${counts.live} 成员`}
               </Badge>
               {elapsed && (
@@ -131,7 +129,7 @@ export function PinnedSwarmDock({
           )}
 
           {/* Post counter + shortcut cue */}
-          <span className="oc-btn-tactile inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-accent/25 bg-accent-soft px-2.5 py-1 text-caption font-medium text-accent transition-colors hover:bg-accent/15">
+          <span className="oc-btn-tactile oc-spring-press oc-shimmer-sheen inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-accent/25 bg-accent-soft px-2.5 py-1 text-caption font-medium text-accent transition-colors hover:bg-accent/15">
             <MessageSquare size={11} strokeWidth={1.75} className="shrink-0" />
             <span className="tabular-nums">{snapshot.totalPosts}</span>
             <span className="hidden md:inline">看板</span>

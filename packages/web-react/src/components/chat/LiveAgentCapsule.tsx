@@ -1,9 +1,10 @@
 import type { SwarmSnapshot } from "@openclaude/protocol/browser";
-import { ArrowUpRight, Bot, ChevronDown, ChevronUp, Hexagon, ListChecks, Target } from "lucide-react";
+import { ArrowUpRight, Bot, ChevronDown, ChevronUp, ListChecks, Target } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { isTerminalDelegateState, type InflightDelegateItem } from "../../lib/chat/inflightDelegates";
 import type { ChatMessage, LiveTurnTokenUsageSnapshot } from "../../lib/chat/model";
 import { formatDurationSeconds } from "../../lib/chat/pure";
+import { AtelierIcon } from "../ui/AtelierIcons";
 import {
   PinnedDelegateTrackerLazy,
   PinnedGoalBarLazy,
@@ -174,14 +175,8 @@ export default function LiveAgentCapsule({
     timer = formatDurationSeconds(goalMessage.timeUsedSeconds);
   }
 
-  const PrimaryIcon =
-    primaryKind === "swarm"
-      ? Hexagon
-      : primaryKind === "delegate"
-        ? Bot
-        : primaryKind === "task"
-          ? ListChecks
-          : Target;
+  const SecondaryIcon =
+    primaryKind === "delegate" ? Bot : primaryKind === "task" ? ListChecks : Target;
 
   return (
     <div data-testid="pinned-hud-stack">
@@ -229,16 +224,30 @@ export default function LiveAgentCapsule({
             aria-expanded={expanded}
             aria-label={expanded ? `收起运行状态：${label}` : `展开运行状态：${label}`}
             onClick={() => setExpanded((v) => !v)}
-            className="oc-live-capsule-main min-w-0 flex-1 overflow-hidden"
+            className="oc-live-capsule-main oc-spring-press min-w-0 flex-1 overflow-hidden"
           >
             <span
               aria-hidden
               data-testid="live-agent-capsule-dot"
               data-running={isRunning ? "true" : "false"}
-              className="oc-live-capsule-dot shrink-0"
+              className={
+                isRunning
+                  ? "oc-live-capsule-dot oc-alive-dot shrink-0"
+                  : "oc-live-capsule-dot shrink-0"
+              }
             />
-            <span className="oc-icon-badge oc-icon-badge-accent flex size-5 shrink-0 items-center justify-center rounded-full">
-              <PrimaryIcon size={11} strokeWidth={1.85} aria-hidden className="oc-live-capsule-icon" />
+            <span
+              className={
+                isRunning && primaryKind === "swarm"
+                  ? "oc-icon-badge oc-icon-badge-accent oc-breathe-aura flex size-5 shrink-0 items-center justify-center rounded-full"
+                  : "oc-icon-badge oc-icon-badge-accent flex size-5 shrink-0 items-center justify-center rounded-full"
+              }
+            >
+              {primaryKind === "swarm" ? (
+                <AtelierIcon name="swarm" size={12} className="oc-live-capsule-icon" />
+              ) : (
+                <SecondaryIcon size={11} strokeWidth={1.85} aria-hidden className="oc-live-capsule-icon" />
+              )}
             </span>
             <span
               title={label}
@@ -290,7 +299,11 @@ export default function LiveAgentCapsule({
                   blockId: latestSwarmBlockId,
                 })
               }
-              className="oc-live-capsule-action shrink-0"
+              className={
+                isRunning
+                  ? "oc-live-capsule-action oc-spring-press oc-shimmer-sheen shrink-0"
+                  : "oc-live-capsule-action oc-spring-press shrink-0"
+              }
             >
               <span>看板</span>
               <ArrowUpRight size={11} aria-hidden className="shrink-0" />

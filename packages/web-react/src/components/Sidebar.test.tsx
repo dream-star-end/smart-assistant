@@ -3,10 +3,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import type { ChatProject, Session, User } from "../lib/types";
 import { ProjectScopeProvider } from "../hooks/useProjectScope";
-import { Sidebar } from "./Sidebar";
+import { loadBeforeAll } from "../test/moduleLoad";
+import { Sidebar, preloadAccountMenu } from "./Sidebar";
 import { SESSION_ROW_HEIGHT, DEFAULT_PROJECT_ID, PROJECT_ROW_HEIGHT } from "./sidebar/constants";
 import { flattenSidebarItems } from "./sidebar/flattenItems";
 import { HighlightedText } from "./sidebar/highlight";
+
+loadBeforeAll(preloadAccountMenu);
 
 afterEach(() => {
   cleanup();

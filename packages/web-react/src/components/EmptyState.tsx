@@ -1,8 +1,10 @@
-import { ArrowLeftRight, ArrowUpRight, Lightbulb, ListChecks, PenLine, Sparkles, Target } from "lucide-react";
+import { ArrowLeftRight, ArrowUpRight, Target } from "lucide-react";
+import type { CSSProperties } from "react";
 import type { Agent } from "../lib/agents";
 import type { User } from "../lib/types";
 import { AgentAvatar } from "./AgentAvatar";
 import { Button } from "./ui";
+import { AtelierIcon, type AtelierIconName } from "./ui/AtelierIcons";
 
 const FALLBACK_STARTERS = [
   "帮我把下面这段内容整理成要点",
@@ -10,12 +12,16 @@ const FALLBACK_STARTERS = [
 ];
 
 /** 起步卡的装饰图标、徽章色阶与编辑风短眉（均 aria-hidden，不影响按钮可访问名）。 */
-const STARTER_SLOTS = [
-  { Icon: Sparkles, badge: "oc-icon-badge-accent", eyebrow: "灵感切入" },
-  { Icon: PenLine, badge: "oc-icon-badge-info", eyebrow: "写作润色" },
-  { Icon: Lightbulb, badge: "oc-icon-badge-warning", eyebrow: "深度探索" },
-  { Icon: ListChecks, badge: "oc-icon-badge-success", eyebrow: "高效拆解" },
-] as const;
+const STARTER_SLOTS: ReadonlyArray<{
+  icon: AtelierIconName;
+  badge: string;
+  eyebrow: string;
+}> = [
+  { icon: "sparkles", badge: "oc-icon-badge-accent", eyebrow: "灵感切入" },
+  { icon: "newChat", badge: "oc-icon-badge-info", eyebrow: "写作润色" },
+  { icon: "skills", badge: "oc-icon-badge-warning", eyebrow: "深度探索" },
+  { icon: "tasks", badge: "oc-icon-badge-success", eyebrow: "高效拆解" },
+];
 
 /** 按本地时间问候;凌晨单独一档,不在 3 点说「早上好」。 */
 export function greetingFor(date: Date): string {
@@ -64,8 +70,8 @@ export function EmptyState({
         className="oc-home-glow pointer-events-none absolute left-1/2 top-[14%] h-[320px] w-[min(680px,100%)] -translate-x-1/2"
       />
       <div className="relative flex w-full max-w-3xl flex-col items-center">
-        {/* 当前智能体身份 + 切换入口收成一枚雕塑磨砂胶囊，让问候成为视觉主角。 */}
-        <div className="oc-surface-glass inline-flex items-center gap-1.5 rounded-full py-1 pl-1.5 pr-1">
+        {/* 当前智能体身份 + 切换入口收成一枚雕塑磨砂胶囊，轻盈漂浮 + 柔和暖陶土呼吸光晕。 */}
+        <div className="oc-surface-glass oc-float-gentle oc-breathe-aura oc-shimmer-sheen inline-flex items-center gap-1.5 rounded-full py-1 pl-1.5 pr-1">
           <AgentAvatar agent={agent} className="size-7 rounded-full" iconSize={14} />
           <span className="max-w-[40vw] truncate pl-1 text-body font-semibold tracking-tight text-fg">
             {agent.name}
@@ -76,7 +82,7 @@ export function EmptyState({
             size="sm"
             shape="pill"
             onClick={onChangeAgent}
-            className="oc-btn-tactile h-7 gap-1 px-2.5 text-caption font-medium text-muted hover:bg-accent-soft hover:text-accent"
+            className="oc-spring-press h-7 gap-1 px-2.5 text-caption font-medium text-muted hover:bg-accent-soft hover:text-accent"
           >
             <ArrowLeftRight size={12} strokeWidth={1.75} aria-hidden="true" />
             换一个智能体
@@ -100,22 +106,22 @@ export function EmptyState({
         >
           {starters.map((s, i) => {
             const slot = STARTER_SLOTS[i % STARTER_SLOTS.length];
-            const Icon = slot.Icon;
             return (
               <button
                 key={s}
                 type="button"
                 onClick={() => onPrefill(s)}
+                style={{ "--stagger-i": i } as CSSProperties}
                 // 手机竖屏放不下 4 张卡(占满整屏视口):前 2 张足以下手,其余 md 起恢复。
                 // 装饰性眉标与箭头均 aria-hidden，保证按钮可访问名精确等于 starter 文本。
-                className={`oc-surface-card oc-surface-card-hover group flex flex-col justify-between gap-3 rounded-lg p-4 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg${
+                className={`oc-surface-card oc-hover-lift oc-spring-press oc-shimmer-sheen oc-stagger-in oc-icon-nudge group flex flex-col justify-between gap-3 rounded-lg p-4 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg${
                   i >= 2 ? " hidden md:flex" : ""
                 }`}
               >
                 <div aria-hidden="true" className="flex w-full items-center justify-between gap-2">
                   <div className="flex items-center gap-2">
                     <span className={`oc-icon-badge ${slot.badge} size-7`}>
-                      <Icon size={14} strokeWidth={1.75} />
+                      <AtelierIcon name={slot.icon} size={15} />
                     </span>
                     <span className="text-caption font-medium tracking-wide text-faint transition-colors group-hover:text-muted">
                       {slot.eyebrow}
@@ -140,7 +146,7 @@ export function EmptyState({
           <Button
             variant="link"
             size="sm"
-            className="oc-btn-tactile mt-6 gap-1.5 rounded-full px-3 text-caption font-medium text-muted no-underline hover:bg-accent-soft hover:text-accent hover:no-underline"
+            className="oc-spring-press oc-icon-nudge mt-6 gap-1.5 rounded-full px-3 text-caption font-medium text-muted no-underline hover:bg-accent-soft hover:text-accent hover:no-underline"
             onClick={onOpenGoal}
           >
             <Target size={13} strokeWidth={1.75} aria-hidden="true" />

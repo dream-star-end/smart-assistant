@@ -54,18 +54,26 @@ export function ThemeToggle({
         ? {
             size: "sm" as const,
             variant: "muted" as const,
-            className: "group oc-btn-tactile rounded-sm hover:text-fg",
+            className: "group oc-spring-press rounded-sm hover:text-fg",
           }
         : {
             className:
-              "group oc-btn-tactile oc-btn-secondary-craft rounded-md text-muted hover:text-fg",
+              "group oc-spring-press oc-btn-secondary-craft rounded-md text-muted hover:text-fg",
           })}
     >
-      <Icon
-        size={compact ? 15 : 17}
-        strokeWidth={1.75}
-        className="transition-transform duration-200 ease-spring group-hover:scale-110 group-hover:-rotate-12"
-      />
+      <span key={theme} className="oc-theme-icon-swap inline-flex items-center justify-center">
+        <Icon
+          size={compact ? 15 : 17}
+          strokeWidth={1.7}
+          className={
+            theme === "light"
+              ? "fill-current/15 transition-transform duration-200 ease-spring group-hover:rotate-45 group-hover:scale-110"
+              : theme === "dark"
+                ? "fill-current/15 transition-transform duration-200 ease-spring group-hover:-rotate-15 group-hover:scale-110"
+                : "transition-transform duration-200 ease-spring group-hover:scale-110"
+          }
+        />
+      </span>
     </IconButton>
   );
 }

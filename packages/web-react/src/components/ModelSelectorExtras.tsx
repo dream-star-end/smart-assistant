@@ -5,7 +5,6 @@ import {
   type PlatformReasoningEffort,
   type ServiceTier,
 } from '@openclaude/protocol/browser'
-import { Check } from 'lucide-react'
 import type { ReactNode } from 'react'
 import {
   GROK_BUILD_FAST_MODEL_ID,
@@ -22,8 +21,129 @@ import type { PreferenceEffort } from '../lib/modelPreferences'
 import type { PublicModel } from '../lib/types'
 import { cn } from '../lib/utils'
 import { EFFORT_OPTIONS } from './settings/effortOptions'
+import { ModelFamilyIcon, type ModelFamilyKind, detectModelFamily } from './ui/ModelFamilyIcons'
 
 export type ExtrasLayout = 'dock' | 'column' | 'tab'
+
+export type ModelDisplayTag = {
+  label: string
+  tone: 'info' | 'accent' | 'neutral'
+}
+
+export type ParsedModelDisplay = {
+  raw: string
+  cleanName: string
+  tags: ModelDisplayTag[]
+}
+
+const TRAILING_PAREN_RE = /\s*(?:\(([^()]+)\)|（([^（）]+)）)\s*$/
+const TRAILING_MODE_WORD_RE = /\s+(远端|编排)\s*$/
+
+/**
+ * 清洗模型展示名中的高频冗余平台后缀（如 `(Antigravity)`）与末尾渠道/模式字样，
+ * 提炼为干净主名 + 轻巧微标签；原始全名保留于 `raw` 供 `title` 与 `sr-only` 兼容检索。
+ */
+export function parseModelDisplayMeta(
+  rawLabel: string,
+  modelId?: string,
+  familyHint?: ModelFamilyKind,
+): ParsedModelDisplay {
+  const raw = rawLabel
+  let text = rawLabel.trim()
+  const tags: ModelDisplayTag[] = []
+  const seen = new Set<string>()
+  const pushTag = (label: string, tone: ModelDisplayTag['tone']) => {
+    if (!label || seen.has(label)) return
+    seen.add(label)
+    tags.push({ label, tone })
+  }
+
+  for (let i = 0; i < 3; i += 1) {
+    const paren = TRAILING_PAREN_RE.exec(text)
+    if (paren) {
+      const inner = (paren[1] ?? paren[2] ?? '').trim()
+      const candidate = text.slice(0, paren.index).trim()
+      if (!candidate) break
+      text = candidate
+      const lower = inner.toLowerCase()
+      if (lower === 'antigravity') {
+        // 平台默认通道刷屏后缀直接静默清洗，不再重复渲染徽章
+      } else if (lower === 'remote' || inner === '远端') {
+        pushTag('远端', 'info')
+      } else if (lower === 'orchestrator' || inner === '编排') {
+        pushTag('编排', 'accent')
+      } else {
+        pushTag(inner, 'neutral')
+      }
+      continue
+    }
+    const modeWord = TRAILING_MODE_WORD_RE.exec(text)
+    if (modeWord) {
+      const candidate = text.slice(0, modeWord.index).trim()
+      if (!candidate) break
+      text = candidate
+      if (modeWord[1] === '远端') pushTag('远端', 'info')
+      else if (modeWord[1] === '编排') pushTag('编排', 'accent')
+      continue
+    }
+    break
+  }
+
+  const family = familyHint ?? detectModelFamily(`${modelId ?? ''} ${rawLabel}`)
+  if (family === 'orchestrator') {
+    pushTag('编排', 'accent')
+  }
+
+  return {
+    raw,
+    cleanName: text || rawLabel,
+    tags,
+  }
+}
+
+export function ModelNameWithTags({
+  rawLabel,
+  modelId,
+  family,
+  className,
+}: {
+  rawLabel: string
+  modelId?: string
+  family?: ModelFamilyKind
+  className?: string
+}) {
+  const { cleanName, tags } = parseModelDisplayMeta(rawLabel, modelId, family)
+  const hasCleanedDiff = cleanName !== rawLabel
+  return (
+    <span className={cn('flex min-w-0 items-center gap-1.5', className)} title={rawLabel}>
+      {hasCleanedDiff ? (
+        <>
+          <span className="sr-only">{rawLabel}</span>
+          <span aria-hidden="true" className="truncate">
+            {cleanName}
+          </span>
+        </>
+      ) : (
+        <span className="truncate">{cleanName}</span>
+      )}
+      {tags.map((tag) => (
+        <span
+          key={tag.label}
+          aria-hidden="true"
+          data-model-tag={tag.label}
+          className={cn(
+            'inline-flex shrink-0 items-center rounded-full px-1.5 py-px text-micro font-medium leading-tight',
+            tag.tone === 'info' && 'model-picker-tag-info',
+            tag.tone === 'accent' && 'model-picker-tag-accent',
+            tag.tone === 'neutral' && 'model-picker-tag-neutral',
+          )}
+        >
+          {tag.label}
+        </span>
+      ))}
+    </span>
+  )
+}
 
 export function CostMark({
   model,
@@ -39,7 +159,7 @@ export function CostMark({
   return (
     <span
       className={cn(
-        'rounded-xs bg-hover/70 px-1.5 py-px text-caption font-normal tabular-nums text-faint',
+        'model-picker-cost-pill inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-caption font-medium tabular-nums text-muted',
         className,
       )}
     >
@@ -48,7 +168,7 @@ export function CostMark({
   )
 }
 
-/** 底部参数坞 / 双栏右栏 / 矮屏 Tab 共用的横向分段滑块按钮：置于 .oc-surface-recessed 轨道内，触屏维持 ≥44px。 */
+/** 底部参数坞 / 双栏右栏 / 矮屏 Tab 共用的横向分段滑块按钮：雕塑感浮起亮卡 + 弹簧触感，无生硬对勾。 */
 export function SegmentPill({
   active,
   disabled,
@@ -79,15 +199,14 @@ export function SegmentPill({
       title={title}
       onClick={onClick}
       className={cn(
-        'oc-btn-tactile inline-flex min-h-8 flex-1 items-center justify-center gap-1 whitespace-nowrap rounded-sm px-2.5 py-1 text-caption font-medium outline-none',
+        'oc-btn-tactile oc-spring-press inline-flex min-h-9 flex-1 items-center justify-center gap-1 whitespace-nowrap rounded-sm px-2.5 py-1.5 text-caption font-medium outline-none',
         'focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-45 [@media(hover:none)]:min-h-11',
         active
-          ? 'oc-segmented-thumb font-semibold text-accent ring-1 ring-inset ring-accent/30'
+          ? 'oc-segmented-thumb font-semibold text-accent ring-1 ring-inset ring-accent/25'
           : 'bg-transparent text-muted hover:bg-hover/70 hover:text-fg',
       )}
       {...rest}
     >
-      {active && <Check size={12} strokeWidth={2.25} className="shrink-0 text-accent" aria-hidden />}
       {children}
     </button>
   )
@@ -106,11 +225,11 @@ function SectionHeading({
     <div
       className={cn(
         'flex items-center justify-between gap-2 px-1 text-caption font-semibold tracking-wide text-faint',
-        compact ? 'pb-1' : 'pb-1.5',
+        compact ? 'pb-1.5' : 'pb-2',
       )}
     >
       <span>{title}</span>
-      <span className="shrink-0 whitespace-nowrap rounded-xs bg-hover/65 px-1.5 py-px text-caption font-medium tabular-nums text-muted">
+      <span className="model-picker-cost-pill shrink-0 whitespace-nowrap rounded-full px-2 py-px text-caption font-medium tabular-nums text-muted">
         {summary}
       </span>
     </div>
@@ -227,16 +346,20 @@ export function ModelSelectorExtras({
   })()
 
   const activeCostLabel = modelCostLabel(selected, effectiveMultiplier)
+  const selectedFamily = detectModelFamily(`${selectedId ?? ''} ${label}`)
+  const summaryDisplay = parseModelDisplayMeta(label, selectedId, selectedFamily)
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       {layout === 'column' && (
         <div
           data-testid="model-picker-extras-summary"
-          className="shrink-0 border-b border-border/70 px-3 py-2.5"
+          className="shrink-0 border-b border-border/70 px-3.5 py-3"
         >
           <div className="flex items-center justify-between gap-2">
-            <span className="text-caption font-semibold tracking-wider text-faint">执行参数</span>
+            <span className="text-caption font-semibold uppercase tracking-wider text-faint">
+              执行参数
+            </span>
             {activeCostLabel && (
               <span
                 data-testid="model-picker-active-cost"
@@ -246,20 +369,46 @@ export function ModelSelectorExtras({
               </span>
             )}
           </div>
-          <p className="mt-1 truncate text-meta font-semibold text-fg">
-            {label}
-            {tierLabel ? <span className="font-normal text-muted"> · {tierLabel}</span> : null}
-          </p>
+          <div className="mt-2 flex items-center gap-2.5" title={label}>
+            <span
+              aria-hidden
+              className="oc-icon-badge oc-icon-badge-accent oc-breathe-aura size-8 rounded-sm"
+            >
+              <ModelFamilyIcon family={selectedFamily} size={16} />
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-1.5 text-meta font-semibold text-fg">
+                <span className="truncate">{summaryDisplay.cleanName}</span>
+                {summaryDisplay.tags.map((tag) => (
+                  <span
+                    key={tag.label}
+                    aria-hidden="true"
+                    className={cn(
+                      'inline-flex shrink-0 items-center rounded-full px-1.5 py-px text-micro font-medium leading-tight',
+                      tag.tone === 'info' && 'model-picker-tag-info',
+                      tag.tone === 'accent' && 'model-picker-tag-accent',
+                      tag.tone === 'neutral' && 'model-picker-tag-neutral',
+                    )}
+                  >
+                    {tag.label}
+                  </span>
+                ))}
+              </div>
+              {tierLabel && (
+                <p className="mt-0.5 truncate text-caption text-muted">{tierLabel}</p>
+              )}
+            </div>
+          </div>
         </div>
       )}
 
       <div
         className={cn(
           layout === 'column'
-            ? 'min-h-0 flex-1 space-y-3.5 overflow-y-auto overscroll-contain p-3'
+            ? 'min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-3.5'
             : compact
-              ? 'space-y-2'
-              : 'space-y-3',
+              ? 'space-y-2.5'
+              : 'space-y-3.5',
         )}
       >
         {showCursorFast && selectedCursor && (

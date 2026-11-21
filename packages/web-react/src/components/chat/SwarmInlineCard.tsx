@@ -12,7 +12,6 @@ import {
   ChevronRight,
   GitBranch,
   Hash,
-  Hexagon,
   MessageSquare,
   Sparkles,
   Users,
@@ -20,6 +19,7 @@ import {
 import { memo, useEffect, useState } from "react";
 import { cn } from "../../lib/utils";
 import { Badge, Button, Spinner } from "../ui";
+import { AtelierIcon } from "../ui/AtelierIcons";
 import {
   formatPostClock,
   formatSwarmElapsed,
@@ -156,7 +156,7 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
         onClick={() => openWith({ focusMember: member.name })}
         disabled={!onOpenBoard}
         className={cn(
-          "oc-surface-card oc-surface-card-hover flex flex-col gap-1.5 rounded-xl p-2.5 text-left transition-all duration-150",
+          "oc-surface-card oc-surface-card-hover oc-stagger-in oc-hover-lift oc-spring-press flex flex-col gap-1.5 rounded-xl p-2.5 text-left transition-all duration-150",
           "outline-none focus-visible:ring-2 focus-visible:ring-ring",
           working
             ? "border-accent/35 ring-1 ring-accent/15 hover:border-accent/55"
@@ -281,24 +281,25 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
         >
           <span
             data-testid="swarm-header-icon"
-            className={cn("oc-icon-badge relative size-7 shrink-0 rounded-lg", iconBadgeTone)}
+            className={cn(
+              "oc-icon-badge relative size-7 shrink-0 rounded-lg",
+              iconBadgeTone,
+              active && "oc-breathe-aura",
+            )}
           >
-            <Hexagon size={14} strokeWidth={2} />
+            <AtelierIcon name="swarm" size={15} />
             {active && (
               <span
                 aria-hidden
-                className={cn(
-                  "absolute -right-0.5 -top-0.5 size-2 rounded-full ring-2 ring-surface",
-                  "bg-accent animate-pulse",
-                )}
+                className="oc-alive-dot absolute -right-0.5 -top-0.5 size-2 ring-2 ring-surface"
               />
             )}
           </span>
           <span className="min-w-0 flex-1 truncate text-section font-semibold tracking-[-0.01em] text-fg">
             {snapshot.title || "蜂群协作"}
           </span>
-          <Badge tone={phase.tone} className="shrink-0">
-            {active && <Spinner size={9} className="mr-1" />}
+          <Badge tone={phase.tone} className="shrink-0 gap-1.5">
+            {active && <span aria-hidden className="oc-alive-dot size-1.5 shrink-0" />}
             {phase.label}
           </Badge>
         </button>
@@ -363,9 +364,9 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
               size="sm"
               onClick={() => openWith()}
               className={cn(
-                "oc-btn-tactile shrink-0 gap-1 rounded-lg px-2.5 text-caption font-semibold",
+                "oc-btn-tactile oc-spring-press shrink-0 gap-1 rounded-lg px-2.5 text-caption font-semibold",
                 active
-                  ? "oc-btn-accent-craft text-accent-fg"
+                  ? "oc-btn-accent-craft oc-shimmer-sheen text-accent-fg"
                   : "border border-accent/25 bg-accent-soft text-accent hover:bg-accent/15",
               )}
               data-testid="swarm-open-board-btn"
@@ -400,7 +401,7 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
                     data-testid="swarm-killed-toggle"
                     aria-expanded={showKilled}
                     onClick={() => setShowKilled((v) => !v)}
-                    className="oc-surface-card flex w-full items-center gap-2 rounded-xl px-2.5 py-1.5 text-left text-caption text-muted transition-colors hover:border-border-strong hover:text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    className="oc-surface-card oc-spring-press flex w-full items-center gap-2 rounded-xl px-2.5 py-1.5 text-left text-caption text-muted transition-colors hover:border-border-strong hover:text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
                     <span className="flex shrink-0 items-center -space-x-1.5" aria-hidden>
                       {killedMembers.slice(0, 4).map((m) => {

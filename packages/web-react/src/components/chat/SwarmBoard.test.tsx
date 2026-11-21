@@ -534,4 +534,89 @@ describe("Antigravity native swarm reducer & UI (OCV5-809)", () => {
     expect(doneBtn.className).toContain("bg-accent-soft");
     expect(doneBtn.className).toContain("text-accent");
   });
+
+  it("OCV5-836: SwarmBoardDrawer blocks auto-focus on search input, uses mobile bottom-sheet layout, and collapses mobile search by default", () => {
+    const snap = makeSnapshot();
+    render(<SwarmBoardDrawer open onOpenChange={vi.fn()} snapshot={snap} />);
+
+    const drawer = screen.getByTestId("swarm-board-drawer");
+    const desktopSearch = within(drawer).getByLabelText("搜索蜂群讨论");
+
+    // P0: opening drawer must NEVER auto-focus the search input (prevents iOS keyboard popup)
+    expect(document.activeElement).not.toBe(desktopSearch);
+    expect(document.activeElement?.tagName).not.toBe("INPUT");
+
+    // Mobile bottom-sheet geometry & desktop centered dialog breakpoints
+    expect(drawer.className).toContain("h-[92dvh]");
+    expect(drawer.className).toContain("rounded-t-2xl");
+    expect(drawer.className).toContain("rounded-b-none");
+    expect(drawer.className).toContain("oc-sheet-in-bottom");
+    expect(drawer.className).toContain("sm:h-[84dvh]");
+    expect(drawer.className).toContain("sm:rounded-2xl");
+
+    // Breathing modern swarm icon badge
+    const drawerIcon = within(drawer).getByTestId("swarm-drawer-icon");
+    expect(drawerIcon.className).toContain("oc-breathe-aura");
+
+    // Mobile search bar is collapsed by default; clicking toggle opens & focuses it
+    expect(within(drawer).queryByTestId("swarm-mobile-search-bar")).toBeNull();
+    const searchToggle = within(drawer).getByLabelText("搜索讨论");
+    expect(searchToggle.getAttribute("aria-expanded")).toBe("false");
+
+    fireEvent.click(searchToggle);
+    expect(searchToggle.getAttribute("aria-expanded")).toBe("true");
+    const mobileSearchInput = within(drawer).getByTestId("swarm-mobile-search-input");
+    expect(document.activeElement).toBe(mobileSearchInput);
+
+    // Typing filters posts and shows compact hit count only when searching
+    fireEvent.change(mobileSearchInput, { target: { value: "全绿" } });
+    expect(within(drawer).getByTestId("swarm-board-feed").querySelectorAll("[data-swarm-post-seq]")).toHaveLength(1);
+    expect(within(drawer).getByTestId("swarm-search-hit-count").textContent).toContain("找到 1 条");
+
+    // Clicking cancel clears search and collapses mobile search bar
+    fireEvent.click(within(drawer).getByTestId("swarm-mobile-search-close"));
+    expect(within(drawer).queryByTestId("swarm-mobile-search-bar")).toBeNull();
+    expect(within(drawer).getByTestId("swarm-board-feed").querySelectorAll("[data-swarm-post-seq]")).toHaveLength(3);
+    expect(within(drawer).queryByTestId("swarm-search-hit-count")).toBeNull();
+  });
+
+  it("OCV5-836: omits redundant channel bar when swarm only has a single main channel", () => {
+    const singleChannelSnap = makeSnapshot({
+      channels: [{ name: "main", memberCount: 3, postCount: 3 }],
+    });
+    render(<SwarmBoardDrawer open onOpenChange={vi.fn()} snapshot={singleChannelSnap} />);
+
+    const drawer = screen.getByTestId("swarm-board-drawer");
+    expect(within(drawer).queryByTestId("swarm-channel-bar")).toBeNull();
+    expect(within(drawer).queryByText(/全部频道/)).toBeNull();
+  });
+
+  it("OCV5-836: folds killed members by default in SwarmBoardDrawer roster and expands on click", () => {
+    const snap = makeSnapshot({
+      phase: "running",
+      members: [
+        { name: "coordinator", role: "coordinator", status: "waiting", stepCount: 10, activity: "统筹中", unreadCount: 0 },
+        { name: "parser", role: "worker", status: "working", stepCount: 25, activity: "重构中", unreadCount: 0 },
+        { name: "worker-old-1", role: "worker", status: "killed", stepCount: 14, activity: "已回收", unreadCount: 0 },
+        { name: "worker-old-2", role: "worker", status: "killed", stepCount: 18, activity: "已回收", unreadCount: 0 },
+      ],
+    });
+    render(<SwarmBoardDrawer open onOpenChange={vi.fn()} snapshot={snap} />);
+
+    const roster = screen.getByTestId("swarm-roster-rail");
+    const liveList = within(roster).getByTestId("swarm-roster-live-list");
+    expect(within(liveList).getByText("@parser")).toBeTruthy();
+    expect(within(liveList).queryByText("@worker-old-1")).toBeNull();
+
+    const toggle = within(roster).getByTestId("swarm-roster-killed-toggle");
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(toggle.textContent).toContain("已回收 2 名成员");
+    expect(within(roster).queryByTestId("swarm-roster-killed-list")).toBeNull();
+
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    const killedList = within(roster).getByTestId("swarm-roster-killed-list");
+    expect(within(killedList).getByText("@worker-old-1")).toBeTruthy();
+    expect(within(killedList).getByText("@worker-old-2")).toBeTruthy();
+  });
 });

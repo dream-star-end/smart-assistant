@@ -7,7 +7,7 @@ import {
   normalizeServiceTierForModel,
   serviceTierBillingMultiplierNumber,
 } from '@openclaude/protocol/browser'
-import { AlertTriangle, ChevronDown, Cpu, Loader2, Users } from 'lucide-react'
+import { AlertTriangle, ChevronDown, Loader2, Users } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useShortViewport, useViewportClass } from '../hooks/useMdViewport'
 import {
@@ -25,6 +25,7 @@ import { cn } from '../lib/utils'
 import { LazyModelSelectorPanel, preloadModelSelectorPanel } from './lazyModelSelectorPanel'
 import { EFFORT_OPTIONS } from './settings/effortOptions'
 import { Badge, DropdownMenu, DropdownMenuTrigger } from './ui'
+import { AtelierIcon } from './ui/AtelierIcons'
 
 export { preloadModelSelectorPanel }
 
@@ -287,7 +288,7 @@ export function ModelSelector({
       aria-busy={loading || undefined}
       data-degraded={selectedDegraded && !teamEngineActive ? 'true' : undefined}
       className={cn(
-        'oc-btn-tactile flex min-h-10 min-w-0 max-w-full items-center gap-1.5 rounded-full border border-border/80 bg-surface/85 px-3 py-1 text-section font-medium text-fg shadow-xs outline-none sm:min-h-10 sm:rounded-lg sm:border-border/60 sm:bg-surface/65 sm:px-2.5 sm:py-1.5',
+        'oc-btn-tactile oc-spring-press flex min-h-10 min-w-0 max-w-full items-center gap-1.5 rounded-full border border-border/80 bg-surface/85 px-3 py-1 text-section font-medium text-fg shadow-xs outline-none sm:min-h-10 sm:rounded-lg sm:border-border/60 sm:bg-surface/65 sm:px-2.5 sm:py-1.5',
         'hover:border-border-strong hover:bg-surface hover:text-fg hover:shadow-soft focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
         'disabled:pointer-events-none disabled:opacity-50',
         sheetOpen && 'border-accent/45 bg-surface shadow-soft',
@@ -304,9 +305,9 @@ export function ModelSelector({
         />
       ) : teamEngineActive ? (
         <Users size={14} strokeWidth={1.75} className="shrink-0 text-accent" />
-      ) : (
-        <Cpu size={14} strokeWidth={1.75} className="hidden shrink-0 text-muted sm:block" />
-      )}
+      ) : !selectedDegraded ? (
+        <AtelierIcon name="sparkles" size={14} className="hidden shrink-0 text-accent/85 sm:block" />
+      ) : null}
       {teamEngineActive && <span className="hidden sm:inline">{'队长引擎 · '}</span>}
       {selectedDegraded && !teamEngineActive && (
         <AlertTriangle

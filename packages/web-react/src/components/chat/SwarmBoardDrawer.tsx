@@ -16,10 +16,10 @@ import {
   AlertTriangle,
   ArrowDown,
   Check,
+  ChevronRight,
   Copy,
   GitBranch,
   Hash,
-  Hexagon,
   MessageSquare,
   Quote,
   Search,
@@ -29,7 +29,8 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "../../lib/utils";
 import { Markdown } from "../Markdown";
-import { Badge, Button, IconButton, Spinner, useToast } from "../ui";
+import { Badge, IconButton, useToast } from "../ui";
+import { AtelierIcon } from "../ui/AtelierIcons";
 import {
   formatPostClock,
   formatSwarmElapsed,
@@ -197,12 +198,12 @@ function RosterMemberRow({
       onClick={onSelect}
       aria-pressed={selected}
       className={cn(
-        "flex w-full items-start gap-2.5 rounded-xl border px-2.5 py-2 text-left transition-all duration-150",
+        "oc-stagger-in oc-hover-lift oc-spring-press flex w-full items-start gap-2.5 rounded-xl border px-2.5 py-2 text-left transition-all duration-150",
         "outline-none focus-visible:ring-2 focus-visible:ring-ring",
         selected
           ? "border-accent/45 bg-accent-soft/60 shadow-soft"
           : killed
-            ? "border-transparent opacity-55 hover:bg-hover/60"
+            ? "border-transparent opacity-60 hover:bg-hover/60"
             : "border-transparent hover:bg-hover/70",
       )}
     >
@@ -318,7 +319,7 @@ function PostRow({
       ref={(el) => setRowRef(post.seq, el)}
       data-swarm-post-seq={post.seq}
       className={cn(
-        "oc-surface-card group rounded-2xl px-3.5 py-3 transition-all duration-200",
+        "oc-surface-card oc-stagger-in oc-hover-lift group rounded-2xl px-3.5 py-3 transition-all duration-200",
         highlighted
           ? "border-accent bg-accent-soft/40 ring-2 ring-accent/30"
           : isDoneMarker
@@ -417,31 +418,55 @@ export function SwarmBoardDrawer({
   const [selectedMember, setSelectedMember] = useState<string | null>(initialFocusMember);
   const [selectedChannel, setSelectedChannel] = useState<string | null>(initialFocusChannel);
   const [search, setSearch] = useState("");
+  const [mobileSearchOpen, setMobileSearchOpen] = useState(false);
+  const [showKilledRoster, setShowKilledRoster] = useState(false);
   const [followLatest, setFollowLatest] = useState(true);
+  const [isNearBottom, setIsNearBottom] = useState(true);
   const [mobileTab, setMobileTab] = useState<"board" | "roster">("board");
   const [highlightedSeq, setHighlightedSeq] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const toast = useToast();
 
+  const contentRef = useRef<HTMLDivElement>(null);
+  const mobileSearchInputRef = useRef<HTMLInputElement>(null);
   const feedRef = useRef<HTMLDivElement>(null);
   const postRefs = useRef(new Map<number, HTMLDivElement>());
   const highlightTimerRef = useRef<number | null>(null);
   const pendingJumpSeqRef = useRef<number | null>(null);
+  const snapshotRef = useRef(snapshot);
+  snapshotRef.current = snapshot;
 
   useEffect(() => {
     if (!open) return;
     setSelectedMember(initialFocusMember ?? null);
     setSelectedChannel(initialFocusChannel ?? null);
     setSearch("");
+    setMobileSearchOpen(false);
     setMobileTab("board");
+    const focusedIsKilled = Boolean(
+      initialFocusMember &&
+        snapshotRef.current?.members.some(
+          (m) => m.status === "killed" && m.name.toLowerCase() === initialFocusMember.toLowerCase(),
+        ),
+    );
+    setShowKilledRoster(focusedIsKilled);
     if (typeof initialFocusSeq === "number" && initialFocusSeq > 0) {
       pendingJumpSeqRef.current = initialFocusSeq;
       setFollowLatest(false);
+      setIsNearBottom(false);
       setHighlightedSeq(initialFocusSeq);
       if (highlightTimerRef.current !== null) window.clearTimeout(highlightTimerRef.current);
       highlightTimerRef.current = window.setTimeout(() => setHighlightedSeq(null), 2200);
+    } else {
+      setFollowLatest(true);
+      setIsNearBottom(true);
     }
   }, [open, initialFocusMember, initialFocusChannel, initialFocusSeq]);
+
+  useEffect(() => {
+    if (!mobileSearchOpen) return;
+    mobileSearchInputRef.current?.focus();
+  }, [mobileSearchOpen]);
 
   const active = snapshot ? isSwarmActive(snapshot.phase) : false;
 
@@ -547,22 +572,41 @@ export function SwarmBoardDrawer({
     return () => window.removeEventListener("keydown", onKey);
   }, [open, filteredPosts, highlightedSeq, jumpToSeq]);
 
+  const liveMembers = useMemo(
+    () => (snapshot ? snapshot.members.filter((m) => m.status !== "killed") : []),
+    [snapshot],
+  );
+  const killedMembers = useMemo(
+    () => (snapshot ? snapshot.members.filter((m) => m.status === "killed") : []),
+    [snapshot],
+  );
+
   if (!snapshot) return null;
 
   const phase = swarmPhaseMeta(snapshot.phase);
   const counts = summarizeSwarmCounts(snapshot.members);
   const elapsed = active ? formatSwarmElapsed(snapshot.startedAt, now) : "";
+  const showChannelBar = snapshot.channels.length > 1;
+  const trimmedSearch = search.trim();
 
   return (
     <RD.Root open={open} onOpenChange={onOpenChange}>
       <RD.Portal>
         <RD.Overlay className="fixed inset-0 z-50 bg-black/35 backdrop-blur-sm data-[state=open]:animate-fade" />
         <RD.Content
+          ref={contentRef}
+          tabIndex={-1}
           data-testid="swarm-board-drawer"
           aria-describedby={undefined}
+          onOpenAutoFocus={(e) => {
+            e.preventDefault();
+            contentRef.current?.focus({ preventScroll: true });
+          }}
           className={cn(
-            "oc-surface-popover fixed left-1/2 top-1/2 z-50 flex -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden data-[state=open]:animate-in",
-            "h-[min(90dvh,calc(var(--oc-visual-height,100dvh)-1rem))] w-[calc(100vw-1rem)] max-w-5xl rounded-2xl pb-[env(safe-area-inset-bottom)] text-fg outline-none sm:h-[min(84dvh,calc(var(--oc-visual-height,100dvh)-2rem))] sm:w-[calc(100vw-2.5rem)]",
+            "oc-surface-popover fixed inset-x-0 bottom-0 top-auto z-50 flex translate-x-0 translate-y-0 flex-col overflow-hidden text-fg outline-none",
+            "h-[92dvh] max-h-[92dvh] w-full rounded-t-2xl rounded-b-none pb-[env(safe-area-inset-bottom,0px)] oc-sheet-in-bottom",
+            "sm:inset-x-auto sm:bottom-auto sm:left-1/2 sm:top-1/2 sm:-translate-x-1/2 sm:-translate-y-1/2",
+            "sm:h-[84dvh] sm:max-h-[min(84dvh,calc(var(--oc-visual-height,100dvh)-2rem))] sm:w-[calc(100vw-2.5rem)] sm:max-w-5xl sm:rounded-2xl sm:animate-in",
           )}
         >
           {/* Top accent ribbon */}
@@ -571,13 +615,19 @@ export function SwarmBoardDrawer({
             className={cn("h-[2px] w-full shrink-0", active ? "bg-grad-cta" : "bg-border")}
           />
 
-          {/* Command Header */}
-          <div className="flex flex-wrap items-center gap-2.5 border-b border-border bg-surface px-4 py-3">
+          {/* Mobile sheet grabber */}
+          <div aria-hidden className="flex justify-center bg-surface pt-2 pb-0.5 sm:hidden">
+            <span className="h-1 w-9 rounded-full bg-border-strong/70" />
+          </div>
+
+          {/* Row 1: Command Header */}
+          <div className="flex items-center gap-2 border-b border-border/80 bg-surface px-3.5 py-2 sm:gap-2.5 sm:px-4 sm:py-3">
             <span
+              data-testid="swarm-drawer-icon"
               className={cn(
-                "oc-icon-badge relative size-8 shrink-0 rounded-xl",
+                "oc-icon-badge relative size-7 shrink-0 rounded-xl sm:size-8",
                 active
-                  ? "oc-icon-badge-accent"
+                  ? "oc-icon-badge-accent oc-breathe-aura"
                   : snapshot.phase === "completed"
                     ? "oc-icon-badge-success"
                     : snapshot.phase === "error"
@@ -585,20 +635,20 @@ export function SwarmBoardDrawer({
                       : "oc-icon-badge-warning",
               )}
             >
-              <Hexagon size={16} strokeWidth={2} />
+              <AtelierIcon name="swarm" size={16} />
             </span>
 
             <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <RD.Title className="truncate text-title font-semibold tracking-[-0.015em] text-fg">
+              <div className="flex min-w-0 items-center gap-1.5 sm:gap-2">
+                <RD.Title className="min-w-0 truncate text-section font-semibold tracking-[-0.015em] text-fg sm:text-title">
                   {snapshot.title || "蜂群协作看板"}
                 </RD.Title>
-                <Badge tone={phase.tone}>
-                  {active && <Spinner size={9} className="mr-1" />}
+                <Badge tone={phase.tone} className="shrink-0 gap-1.5">
+                  {active && <span aria-hidden className="oc-alive-dot size-1.5 shrink-0" />}
                   {phase.label}
                 </Badge>
               </div>
-              <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-caption text-faint">
+              <div className="mt-0.5 hidden flex-wrap items-center gap-x-3 gap-y-0.5 text-caption text-faint sm:flex">
                 <span className="tabular-nums">
                   {counts.working > 0
                     ? `${counts.working} 运行中 · ${counts.waiting} 待命`
@@ -616,10 +666,14 @@ export function SwarmBoardDrawer({
               </div>
             </div>
 
-            {/* Search & Controls */}
-            <div className="flex w-full items-center gap-1.5 sm:w-auto">
-              <div className="relative flex-1 sm:w-52">
-                <Search size={13} strokeWidth={1.75} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" />
+            {/* Desktop inline search (sm+) + Mobile search toggle (<640px) + Close */}
+            <div className="flex shrink-0 items-center gap-1 sm:gap-1.5">
+              <div className="relative hidden sm:block sm:w-52">
+                <Search
+                  size={13}
+                  strokeWidth={1.75}
+                  className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint"
+                />
                 <input
                   type="search"
                   value={search}
@@ -629,90 +683,156 @@ export function SwarmBoardDrawer({
                   className="oc-field-control h-8 w-full rounded-lg border border-border-control/60 pl-8 pr-2.5 text-base text-fg outline-none transition-colors placeholder:text-faint focus:border-accent focus-visible:ring-2 focus-visible:ring-ring md:text-meta"
                 />
               </div>
-              <Button
-                type="button"
-                variant={followLatest ? "secondary" : "ghost"}
-                size="sm"
-                onClick={() => setFollowLatest((v) => !v)}
+              <IconButton
+                onClick={() => {
+                  if (mobileSearchOpen) {
+                    setSearch("");
+                    setMobileSearchOpen(false);
+                  } else {
+                    setMobileSearchOpen(true);
+                  }
+                }}
+                aria-label="搜索讨论"
+                aria-expanded={mobileSearchOpen}
+                data-testid="swarm-mobile-search-toggle"
+                shape="square"
                 className={cn(
-                  "oc-btn-tactile h-8 shrink-0 gap-1 px-2 text-caption",
-                  followLatest && "oc-btn-secondary-craft text-accent",
+                  "oc-spring-press size-8 shrink-0 sm:hidden",
+                  (mobileSearchOpen || Boolean(trimmedSearch)) && "bg-accent-soft text-accent",
                 )}
-                title="自动滚动到最新讨论"
               >
-                <ArrowDown size={12} strokeWidth={1.75} />
-                <span className="hidden md:inline">跟随</span>
-              </Button>
+                <Search size={15} strokeWidth={1.75} />
+              </IconButton>
               <IconButton
                 onClick={() => onOpenChange(false)}
                 aria-label="关闭蜂群看板"
                 shape="square"
-                className="oc-btn-tactile size-8 shrink-0"
+                className="oc-spring-press size-8 shrink-0"
               >
                 <X size={16} strokeWidth={1.75} />
               </IconButton>
             </div>
           </div>
 
-          {/* Channel Bar & Mobile Tab Bar */}
-          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/80 bg-surface/60 px-4 py-2">
-            <div className="flex items-center gap-1 overflow-x-auto">
+          {/* Expandable Mobile Search Bar (<640px only, collapsed by default) */}
+          {mobileSearchOpen && (
+            <div
+              data-testid="swarm-mobile-search-bar"
+              className="flex items-center gap-1.5 border-b border-border/70 bg-surface/90 px-3.5 py-2 sm:hidden"
+            >
+              <div className="relative min-w-0 flex-1">
+                <Search
+                  size={14}
+                  strokeWidth={1.75}
+                  className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint"
+                />
+                <input
+                  ref={mobileSearchInputRef}
+                  type="search"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="搜索讨论、@成员或 #序号"
+                  aria-label="输入关键词搜索讨论"
+                  data-testid="swarm-mobile-search-input"
+                  className="oc-field-control h-9 w-full rounded-lg border border-border-control/60 pl-8 pr-2.5 text-base text-fg outline-none transition-colors placeholder:text-faint focus:border-accent focus-visible:ring-2 focus-visible:ring-ring"
+                />
+              </div>
               <button
                 type="button"
-                onClick={() => setSelectedChannel(null)}
-                className={cn(
-                  "shrink-0 rounded-lg px-2.5 py-1 text-caption font-medium transition-colors [@media(hover:none)]:min-h-11",
-                  selectedChannel === null
-                    ? "bg-accent-soft text-accent"
-                    : "text-muted hover:bg-hover hover:text-fg",
-                )}
+                onClick={() => {
+                  setSearch("");
+                  setMobileSearchOpen(false);
+                }}
+                aria-label="收起搜索"
+                data-testid="swarm-mobile-search-close"
+                className="oc-spring-press shrink-0 rounded-lg px-2 py-1.5 text-caption font-medium text-muted transition-colors hover:bg-hover hover:text-fg"
               >
-                全部频道 ({snapshot.totalPosts})
+                取消
               </button>
-              {snapshot.channels.map((ch) => (
-                <button
-                  key={ch.name}
-                  type="button"
-                  onClick={() => setSelectedChannel(selectedChannel === ch.name ? null : ch.name)}
-                  className={cn(
-                    "inline-flex shrink-0 items-center gap-1 rounded-lg px-2.5 py-1 text-caption font-medium transition-colors [@media(hover:none)]:min-h-11",
-                    selectedChannel === ch.name
-                      ? "bg-info-soft text-info"
-                      : "text-muted hover:bg-hover hover:text-fg",
-                    ch.archived && "opacity-60",
-                  )}
-                  title={ch.topic || `#${ch.name}`}
-                >
-                  <Hash size={11} />
-                  <span>{ch.name}</span>
-                  <span className="font-mono text-micro opacity-75 tabular-nums">{ch.postCount}</span>
-                </button>
-              ))}
             </div>
+          )}
 
+          {/* Row 2: Mobile segmented switcher + conditional multi-channel strip */}
+          <div
+            data-testid="swarm-subbar"
+            className={cn(
+              "flex items-center gap-2 border-b border-border/70 bg-surface/60 px-3.5 py-1.5 sm:px-4",
+              !showChannelBar && "md:hidden",
+            )}
+          >
             {/* Mobile Roster / Board tab switcher */}
             <div className="oc-surface-recessed flex shrink-0 items-center rounded-lg border border-border p-0.5 md:hidden">
               <button
                 type="button"
                 onClick={() => setMobileTab("board")}
                 className={cn(
-                  "flex items-center gap-1 rounded-md px-2.5 py-1 text-caption font-medium transition-all [@media(hover:none)]:min-h-11",
+                  "oc-spring-press flex items-center gap-1 rounded-md px-2.5 py-1 text-caption font-medium transition-all",
                   mobileTab === "board" ? "oc-segmented-thumb text-fg" : "text-muted",
                 )}
               >
-                <MessageSquare size={11} strokeWidth={1.75} /> 讨论 ({filteredPosts.length})
+                <MessageSquare size={11} strokeWidth={1.75} />
+                <span className="tabular-nums">讨论 {filteredPosts.length}</span>
               </button>
               <button
                 type="button"
                 onClick={() => setMobileTab("roster")}
                 className={cn(
-                  "flex items-center gap-1 rounded-md px-2.5 py-1 text-caption font-medium transition-all [@media(hover:none)]:min-h-11",
+                  "oc-spring-press flex items-center gap-1 rounded-md px-2.5 py-1 text-caption font-medium transition-all",
                   mobileTab === "roster" ? "oc-segmented-thumb text-fg" : "text-muted",
                 )}
               >
-                <Users size={11} strokeWidth={1.75} /> 成员 ({snapshot.members.length})
+                <Users size={11} strokeWidth={1.75} />
+                <span className="tabular-nums">成员 {snapshot.members.length}</span>
               </button>
             </div>
+
+            {showChannelBar ? (
+              <div
+                data-testid="swarm-channel-bar"
+                className="no-scrollbar flex min-w-0 flex-1 items-center gap-1 overflow-x-auto"
+              >
+                <button
+                  type="button"
+                  onClick={() => setSelectedChannel(null)}
+                  className={cn(
+                    "oc-spring-press shrink-0 rounded-lg px-2 py-1 text-caption font-medium transition-colors",
+                    selectedChannel === null
+                      ? "bg-accent-soft text-accent"
+                      : "text-muted hover:bg-hover hover:text-fg",
+                  )}
+                >
+                  全部 ({snapshot.totalPosts})
+                </button>
+                {snapshot.channels.map((ch) => (
+                  <button
+                    key={ch.name}
+                    type="button"
+                    onClick={() => setSelectedChannel(selectedChannel === ch.name ? null : ch.name)}
+                    className={cn(
+                      "oc-spring-press inline-flex shrink-0 items-center gap-0.5 rounded-lg px-2 py-1 text-caption font-medium transition-colors",
+                      selectedChannel === ch.name
+                        ? "bg-info-soft text-info"
+                        : "text-muted hover:bg-hover hover:text-fg",
+                      ch.archived && "opacity-60",
+                    )}
+                    title={ch.topic || `#${ch.name}`}
+                  >
+                    <Hash size={10} />
+                    <span>{ch.name}</span>
+                    <span className="font-mono text-micro opacity-75 tabular-nums">{ch.postCount}</span>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="ml-auto flex items-center gap-2 text-micro text-faint tabular-nums md:hidden">
+                {counts.working > 0 ? (
+                  <span>{counts.working} 运行中</span>
+                ) : (
+                  <span>{counts.live} 活跃</span>
+                )}
+                {elapsed && <span className="font-mono text-muted">{elapsed}</span>}
+              </div>
+            )}
           </div>
 
           {/* Main Split Workspace */}
@@ -740,22 +860,82 @@ export function SwarmBoardDrawer({
                 )}
               </div>
 
-              <div className="space-y-1">
-                {snapshot.members.map((member) => (
-                  <RosterMemberRow
-                    key={member.name}
-                    member={member}
-                    activeSwarm={active}
-                    selected={selectedMember?.toLowerCase() === member.name.toLowerCase()}
-                    onSelect={() => {
-                      setSelectedMember((prev) =>
-                        prev?.toLowerCase() === member.name.toLowerCase() ? null : member.name,
-                      );
-                      setMobileTab("board");
-                    }}
-                  />
-                ))}
-              </div>
+              {liveMembers.length > 0 && (
+                <div className="space-y-1" data-testid="swarm-roster-live-list">
+                  {liveMembers.map((member) => (
+                    <RosterMemberRow
+                      key={member.name}
+                      member={member}
+                      activeSwarm={active}
+                      selected={selectedMember?.toLowerCase() === member.name.toLowerCase()}
+                      onSelect={() => {
+                        setSelectedMember((prev) =>
+                          prev?.toLowerCase() === member.name.toLowerCase() ? null : member.name,
+                        );
+                        setMobileTab("board");
+                      }}
+                    />
+                  ))}
+                </div>
+              )}
+
+              {killedMembers.length > 0 && (
+                <div className={cn("space-y-1", liveMembers.length > 0 && "mt-2")} data-testid="swarm-roster-killed-section">
+                  <button
+                    type="button"
+                    data-testid="swarm-roster-killed-toggle"
+                    aria-expanded={showKilledRoster}
+                    onClick={() => setShowKilledRoster((v) => !v)}
+                    className="oc-spring-press flex w-full items-center gap-2 rounded-xl border border-border/70 bg-surface/75 px-2.5 py-1.5 text-left text-caption text-muted outline-none transition-colors hover:border-border-strong hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <span className="flex shrink-0 items-center -space-x-1.5" aria-hidden>
+                      {killedMembers.slice(0, 4).map((m) => {
+                        const st = swarmMemberStyle(m.name, m.role);
+                        return (
+                          <span
+                            key={m.name}
+                            className={cn(
+                              "flex size-5 items-center justify-center rounded-full text-micro font-semibold ring-2 ring-surface opacity-75",
+                              st.avatar,
+                            )}
+                          >
+                            {memberInitial(m.name)}
+                          </span>
+                        );
+                      })}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate font-medium">
+                      已回收 {killedMembers.length} 名成员
+                    </span>
+                    <ChevronRight
+                      size={13}
+                      className={cn(
+                        "shrink-0 text-faint transition-transform duration-150",
+                        showKilledRoster && "rotate-90",
+                      )}
+                    />
+                  </button>
+                  {showKilledRoster && (
+                    <div className="space-y-1" data-testid="swarm-roster-killed-list">
+                      {killedMembers.map((member) => (
+                        <RosterMemberRow
+                          key={member.name}
+                          member={member}
+                          activeSwarm={active}
+                          selected={selectedMember?.toLowerCase() === member.name.toLowerCase()}
+                          onSelect={() => {
+                            setSelectedMember((prev) =>
+                              prev?.toLowerCase() === member.name.toLowerCase() ? null : member.name,
+                            );
+                            setMobileTab("board");
+                          }}
+                        />
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
               {counts.isolatedWorktrees > 0 && (
                 <div
                   className="mt-3 rounded-xl border border-info/25 bg-info-soft/45 px-2.5 py-2 text-caption text-muted"
@@ -781,13 +961,12 @@ export function SwarmBoardDrawer({
             {/* Right Stage: Board Feed */}
             <section
               className={cn(
-                "min-w-0 flex-1 flex-col overflow-hidden md:flex",
+                "relative min-w-0 flex-1 flex-col overflow-hidden md:flex",
                 mobileTab === "board" ? "flex" : "hidden",
               )}
             >
-              {(selectedMember || selectedChannel || search.trim()) && (
-                <div className="flex flex-wrap items-center gap-1.5 border-b border-border/60 bg-surface/40 px-4 py-2 text-caption">
-                  <span className="text-faint">当前筛选：</span>
+              {(selectedMember || selectedChannel || trimmedSearch) && (
+                <div className="flex flex-wrap items-center gap-1.5 border-b border-border/60 bg-surface/40 px-3.5 py-1.5 text-caption sm:px-4">
                   {selectedMember && (
                     <span className="inline-flex items-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 font-medium text-accent">
                       @{selectedMember}
@@ -814,9 +993,9 @@ export function SwarmBoardDrawer({
                       </button>
                     </span>
                   )}
-                  {search.trim() && (
+                  {trimmedSearch && (
                     <span className="inline-flex items-center gap-1 rounded-full bg-hover px-2 py-0.5 text-fg">
-                      “{search.trim()}”
+                      “{trimmedSearch}”
                       <button
                         type="button"
                         aria-label="清空搜索"
@@ -827,9 +1006,14 @@ export function SwarmBoardDrawer({
                       </button>
                     </span>
                   )}
-                  <span className="ml-auto font-mono text-micro text-faint tabular-nums">
-                    命中 {filteredPosts.length} / {snapshot.posts.length} 条
-                  </span>
+                  {trimmedSearch && (
+                    <span
+                      data-testid="swarm-search-hit-count"
+                      className="ml-auto shrink-0 font-mono text-micro text-faint tabular-nums"
+                    >
+                      找到 {filteredPosts.length} 条
+                    </span>
+                  )}
                 </div>
               )}
 
@@ -838,9 +1022,11 @@ export function SwarmBoardDrawer({
                 onScroll={(e) => {
                   const el = e.currentTarget;
                   const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+                  setIsNearBottom(nearBottom);
                   if (!nearBottom && followLatest) setFollowLatest(false);
+                  else if (nearBottom && !followLatest) setFollowLatest(true);
                 }}
-                className="flex-1 space-y-2.5 overflow-y-auto px-4 py-3.5"
+                className="flex-1 space-y-2.5 overflow-y-auto px-3.5 py-3 sm:px-4 sm:py-3.5"
                 data-testid="swarm-board-feed"
               >
                 {snapshot.truncatedPosts && snapshot.truncatedPosts > 0 && (
@@ -851,8 +1037,8 @@ export function SwarmBoardDrawer({
 
                 {filteredPosts.length === 0 ? (
                   <div className="flex h-48 flex-col items-center justify-center gap-2 text-center">
-                    <span className="flex size-10 items-center justify-center rounded-2xl bg-accent-soft text-accent">
-                      <Hexagon size={20} />
+                    <span className="oc-icon-badge oc-icon-badge-accent flex size-10 items-center justify-center rounded-2xl">
+                      <AtelierIcon name="swarm" size={20} />
                     </span>
                     <p className="text-body font-medium text-fg">
                       {snapshot.posts.length === 0
@@ -880,6 +1066,31 @@ export function SwarmBoardDrawer({
                   ))
                 )}
               </div>
+
+              {/* Floating jump-to-bottom micro button when scrolled away from bottom */}
+              {!isNearBottom && filteredPosts.length > 0 && (
+                <button
+                  type="button"
+                  data-testid="swarm-scroll-bottom-btn"
+                  aria-label="回到底部最新讨论"
+                  onClick={() => {
+                    setFollowLatest(true);
+                    setIsNearBottom(true);
+                    const el = feedRef.current;
+                    if (el) {
+                      if (typeof el.scrollTo === "function") {
+                        el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+                      } else {
+                        el.scrollTop = el.scrollHeight;
+                      }
+                    }
+                  }}
+                  className="oc-surface-glass oc-spring-press oc-hover-lift absolute bottom-3 right-3 z-10 inline-flex items-center gap-1 rounded-full border border-border-strong/70 px-2.5 py-1.5 text-caption font-medium text-fg shadow-float sm:bottom-11 sm:right-4"
+                >
+                  <ArrowDown size={13} strokeWidth={2} className="text-accent" />
+                  <span>回到底部</span>
+                </button>
+              )}
 
               {/* Subtle keyboard legend footer */}
               <div className="hidden items-center justify-between border-t border-border/70 bg-surface/60 px-4 py-2 text-micro text-faint sm:flex">

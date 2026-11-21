@@ -51,10 +51,10 @@ export function BootSplash({ slowHint = "网络较慢，正在加载…" }: { sl
     >
       <div
         aria-hidden="true"
-        className="oc-home-glow pointer-events-none absolute left-1/2 top-1/2 h-[220px] w-[min(420px,90vw)] -translate-x-1/2 -translate-y-1/2 opacity-80"
+        className="oc-home-glow oc-float-gentle pointer-events-none absolute left-1/2 top-1/2 h-[220px] w-[min(420px,90vw)] -translate-x-1/2 -translate-y-1/2 opacity-80"
       />
       <div className="relative flex flex-col items-center gap-4">
-        <div className="oc-surface-card flex items-center gap-3 rounded-2xl px-4 py-3">
+        <div className="oc-surface-card oc-breathe-aura oc-float-gentle oc-shimmer-sheen flex items-center gap-3 rounded-2xl px-4 py-3">
           <BrandMark className="size-9" fontSize="text-title" rounded="rounded-sm" flat />
           <div className="flex items-center gap-2.5 pr-1">
             <Spinner size={18} />
@@ -69,7 +69,7 @@ export function BootSplash({ slowHint = "网络较慢，正在加载…" }: { sl
           <button
             type="button"
             onClick={() => window.location.reload()}
-            className="oc-btn-tactile oc-btn-secondary-craft inline-flex items-center gap-1.5 rounded-full px-4 py-1.5 text-meta font-medium text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+            className="oc-spring-press oc-icon-nudge oc-btn-secondary-craft inline-flex items-center gap-1.5 rounded-full px-4 py-1.5 text-meta font-medium text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
           >
             <RefreshCw size={13} strokeWidth={1.75} aria-hidden="true" />
             刷新重试

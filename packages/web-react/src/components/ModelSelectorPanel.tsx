@@ -13,11 +13,12 @@ import {
   serviceTierBillingMultiplierNumber,
   supportedServiceTiers,
 } from '@openclaude/protocol/browser'
-import { AlertTriangle, Check, ChevronDown, ChevronRight, Cpu, Lock, Sparkles } from 'lucide-react'
-import { type ReactNode, useEffect, useState } from 'react'
+import { AlertTriangle, Check, ChevronDown, ChevronRight, Lock } from 'lucide-react'
+import { type CSSProperties, type ReactNode, useEffect, useState } from 'react'
 import {
   GROK_BUILD_FAST_MODEL_ID,
   GROK_BUILD_MODEL_ID,
+  type ModelPickerRow,
   availableCursorEfforts,
   contextFamilyHasLong,
   contextFamilyHasStandard,
@@ -40,7 +41,12 @@ import {
   LongContextCostWarning,
 } from './LongContextCostWarning'
 import { isDegraded, modelLabel, type LockedSelectInfo } from './ModelSelector'
-import { CostMark, ModelSelectorExtras } from './ModelSelectorExtras'
+import {
+  CostMark,
+  ModelNameWithTags,
+  ModelSelectorExtras,
+  parseModelDisplayMeta,
+} from './ModelSelectorExtras'
 import './modelSelector.css'
 import {
   Badge,
@@ -51,9 +57,24 @@ import {
   Sheet,
   useConfirm,
 } from './ui'
+import { ModelFamilyIcon, type ModelFamilyKind, detectModelFamily } from './ui/ModelFamilyIcons'
 
 type PickerMode = 'menu' | 'sheet'
 type ShortViewportTab = 'models' | 'extras'
+
+const MODEL_FAMILY_GROUP_LABELS: Record<ModelFamilyKind, string> = {
+  claude: 'Claude',
+  gemini: 'Gemini',
+  gpt: 'GPT',
+  orchestrator: 'Orchestrator',
+  grok: 'Grok',
+  deepseek: 'DeepSeek',
+  kimi: 'Kimi',
+  qwen: 'Qwen',
+  glm: 'GLM',
+  minimax: 'MiniMax',
+  default: '其他模型',
+}
 
 export type ModelSelectorPanelProps = {
   mode: PickerMode
@@ -83,6 +104,7 @@ function PickerItem({
   disabled,
   onSelect,
   className,
+  style,
   children,
   ...rest
 }: {
@@ -90,7 +112,9 @@ function PickerItem({
   disabled?: boolean
   onSelect?: (event: { preventDefault: () => void }) => void
   className?: string
+  style?: CSSProperties
   children: ReactNode
+  title?: string
   'data-model-id'?: string
   'data-locked'?: string
   'data-cursor-family'?: string
@@ -101,7 +125,13 @@ function PickerItem({
 }) {
   if (mode === 'menu') {
     return (
-      <DropdownMenuItem disabled={disabled} onSelect={onSelect} className={className} {...rest}>
+      <DropdownMenuItem
+        disabled={disabled}
+        onSelect={onSelect}
+        className={className}
+        style={style}
+        {...rest}
+      >
         {children}
       </DropdownMenuItem>
     )
@@ -112,6 +142,7 @@ function PickerItem({
       role="menuitem"
       disabled={disabled}
       onClick={() => onSelect?.({ preventDefault() {} })}
+      style={style}
       className={cn(
         'flex min-h-11 w-full cursor-pointer select-none items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-sm outline-none transition-colors',
         'hover:bg-hover focus-visible:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
@@ -135,6 +166,7 @@ function PickerLabel({
   className?: string
   children: ReactNode
   'data-recent-group'?: string
+  'data-family-group'?: string
 }) {
   if (mode === 'menu') {
     return (
@@ -158,7 +190,7 @@ function PickerLabel({
 
 function PickerSeparator({ mode }: { mode: PickerMode }) {
   if (mode === 'menu') return <DropdownMenuSeparator />
-  return <div role="separator" className="my-1 h-px bg-border" />
+  return <div role="separator" className="my-1.5 h-px bg-border/80" />
 }
 
 function promoLabelOf(model: { promo_label?: unknown } | undefined): string | undefined {
@@ -175,6 +207,45 @@ function lockedPlainLabel(model: LockedPublicModel): string {
   return typeof model.display_name === 'string' && model.display_name.trim()
     ? model.display_name
     : model.id
+}
+
+function isLockedRow(row: ModelPickerRow): boolean {
+  return row.kind === 'locked-plain' || row.kind === 'locked-cursor-family'
+}
+
+function isDegradedRow(row: ModelPickerRow): boolean {
+  if (row.kind === 'plain') return isDegraded(row.model)
+  if (row.kind === 'locked-plain' || row.kind === 'locked-cursor-family') return false
+  return row.row.members.length > 0 && row.row.members.every(isDegraded)
+}
+
+function rowFamily(row: ModelPickerRow): ModelFamilyKind {
+  if (row.kind === 'plain') return detectModelFamily(`${row.model.id} ${modelLabel(row.model)}`)
+  if (row.kind === 'context-family') return detectModelFamily(`${row.row.family} ${row.row.label}`)
+  if (row.kind === 'locked-plain') {
+    return detectModelFamily(`${row.model.id} ${lockedPlainLabel(row.model)}`)
+  }
+  if (row.kind === 'grok-build-family') return 'grok'
+  if (row.kind === 'locked-cursor-family') {
+    return detectModelFamily(`${row.row.representative.id} ${row.row.label}`)
+  }
+  return detectModelFamily(`${row.row.family} ${row.row.label}`)
+}
+
+function groupUsableByFamily(rows: readonly ModelPickerRow[]) {
+  const groups: Array<{ family: ModelFamilyKind; rows: ModelPickerRow[] }> = []
+  const byFamily = new Map<ModelFamilyKind, ModelPickerRow[]>()
+  for (const row of rows) {
+    const family = rowFamily(row)
+    let list = byFamily.get(family)
+    if (!list) {
+      list = []
+      byFamily.set(family, list)
+      groups.push({ family, rows: list })
+    }
+    list.push(row)
+  }
+  return groups
 }
 
 /**
@@ -356,52 +427,59 @@ export function ModelSelectorPanel({
     rememberAndSelect(id)
   }
 
-  const renderRow = (row: (typeof rows)[number], keyPrefix = '') => {
+  let staggerSeq = 0
+  const nextStaggerStyle = (): CSSProperties => {
+    const idx = Math.min(staggerSeq, 10)
+    staggerSeq += 1
+    return { '--stagger-i': idx } as CSSProperties
+  }
+
+  const renderRow = (row: ModelPickerRow, keyPrefix = '') => {
+    const family = rowFamily(row)
     const rowBadge = (active: boolean, locked = false) => (
       <span
         aria-hidden
         className={cn(
-          'oc-icon-badge size-6 rounded-xs',
-          active && !locked && 'oc-icon-badge-accent',
-          locked && 'opacity-75',
+          'oc-icon-badge size-7 rounded-sm',
+          active && !locked && 'oc-icon-badge-accent oc-breathe-aura',
+          locked && 'opacity-70',
         )}
       >
-        {locked ? (
-          <Lock size={12} strokeWidth={1.75} />
-        ) : active ? (
-          <Sparkles size={12} strokeWidth={1.75} />
-        ) : (
-          <Cpu size={12} strokeWidth={1.75} />
-        )}
+        <ModelFamilyIcon family={family} size={15} />
       </span>
     )
-    const activeRowCls =
-      'bg-accent-soft/75 font-medium text-fg ring-1 ring-inset ring-accent/25'
+    const baseRowCls =
+      'model-picker-row oc-spring-press oc-stagger-in justify-between gap-2.5 rounded-md'
+    const activeRowCls = 'model-picker-row-active font-medium text-fg'
     const checkMark = (
       <span
         aria-hidden
-        className="flex size-5 shrink-0 items-center justify-center rounded-full bg-accent-soft text-accent ring-1 ring-inset ring-accent/25"
+        className="model-picker-check flex size-5 shrink-0 items-center justify-center rounded-full"
       >
-        <Check size={12} strokeWidth={2.25} />
+        <Check size={12} strokeWidth={2.4} />
       </span>
     )
+    const rowStyle = nextStaggerStyle()
 
     if (row.kind === 'plain') {
       const m = row.model
       const active = m.id === selectedId
       const degraded = isDegraded(m)
+      const raw = modelLabel(m)
       return (
         <PickerItem
           mode={mode}
           key={`${keyPrefix}${m.id}`}
           data-model-id={m.id}
           disabled={degraded}
+          title={raw}
+          style={rowStyle}
           onSelect={degraded ? undefined : () => rememberAndSelect(m.id)}
-          className={cn('justify-between gap-2 rounded-sm', active && !degraded && activeRowCls)}
+          className={cn(baseRowCls, active && !degraded && activeRowCls)}
         >
-          <span className="flex min-w-0 items-center gap-2">
+          <span className="flex min-w-0 items-center gap-2.5">
             {rowBadge(active && !degraded)}
-            <span className="truncate">{modelLabel(m)}</span>
+            <ModelNameWithTags rawLabel={raw} modelId={m.id} family={family} />
           </span>
           <span className="flex shrink-0 items-center gap-1.5">
             <CostMark model={m} />
@@ -419,6 +497,7 @@ export function ModelSelectorPanel({
         row.row.members[0]?.id
       const representativeModel = row.row.members.find((item) => item.id === representative)
       const degraded = row.row.members.every(isDegraded)
+      const raw = row.row.label
       return (
         <PickerItem
           mode={mode}
@@ -426,6 +505,8 @@ export function ModelSelectorPanel({
           data-model-id={representative}
           data-context-family={row.row.family}
           disabled={degraded}
+          title={raw}
+          style={rowStyle}
           onSelect={
             degraded
               ? undefined
@@ -433,11 +514,11 @@ export function ModelSelectorPanel({
                   void selectContext(row.row.spec, row.row.members)
                 }
           }
-          className={cn('justify-between gap-2 rounded-sm', familyActive && !degraded && activeRowCls)}
+          className={cn(baseRowCls, familyActive && !degraded && activeRowCls)}
         >
-          <span className="flex min-w-0 items-center gap-2">
+          <span className="flex min-w-0 items-center gap-2.5">
             {rowBadge(familyActive && !degraded)}
-            <span className="truncate">{row.row.label}</span>
+            <ModelNameWithTags rawLabel={raw} modelId={representative} family={family} />
           </span>
           <span className="flex shrink-0 items-center gap-1.5">
             <CostMark model={representativeModel} />
@@ -457,6 +538,8 @@ export function ModelSelectorPanel({
           key={`${keyPrefix}locked-${locked.id}`}
           data-model-id={locked.id}
           data-locked="true"
+          title={labelText}
+          style={rowStyle}
           onSelect={() => {
             onLockedSelect?.({
               label: labelText,
@@ -466,14 +549,15 @@ export function ModelSelectorPanel({
             })
             onOpenChange(false)
           }}
-          className="justify-between gap-2 rounded-sm text-muted"
+          className={cn(baseRowCls, 'text-muted')}
         >
-          <span className="flex min-w-0 items-center gap-2">
+          <span className="flex min-w-0 items-center gap-2.5">
             {rowBadge(false, true)}
-            <span className="truncate">{labelText}</span>
+            <ModelNameWithTags rawLabel={labelText} modelId={locked.id} family={family} />
             <span className="sr-only">（需升级解锁）</span>
           </span>
           <span className="flex shrink-0 items-center gap-1.5">
+            <Lock size={12} strokeWidth={1.75} className="shrink-0 text-faint" aria-hidden />
             <CostMark model={locked} />
             <PromoBadge label={promoLabelOf(locked)} />
           </span>
@@ -488,6 +572,7 @@ export function ModelSelectorPanel({
           row.row.members[0]?.id)
       const representativeModel = row.row.members.find((item) => item.id === representative)
       const degraded = row.row.members.every(isDegraded)
+      const raw = row.row.label
       return (
         <PickerItem
           mode={mode}
@@ -495,6 +580,8 @@ export function ModelSelectorPanel({
           data-model-id={representative}
           data-grok-family={row.row.family}
           disabled={degraded}
+          title={raw}
+          style={rowStyle}
           onSelect={
             degraded
               ? undefined
@@ -502,11 +589,11 @@ export function ModelSelectorPanel({
                   if (representative) rememberAndSelect(representative)
                 }
           }
-          className={cn('justify-between gap-2 rounded-sm', familyActive && !degraded && activeRowCls)}
+          className={cn(baseRowCls, familyActive && !degraded && activeRowCls)}
         >
-          <span className="flex min-w-0 items-center gap-2">
+          <span className="flex min-w-0 items-center gap-2.5">
             {rowBadge(familyActive && !degraded)}
-            <span className="truncate">{row.row.label}</span>
+            <ModelNameWithTags rawLabel={raw} modelId={representative} family={family} />
           </span>
           <span className="flex shrink-0 items-center gap-1.5">
             <CostMark model={representativeModel} />
@@ -518,6 +605,7 @@ export function ModelSelectorPanel({
       )
     }
     if (row.kind === 'locked-cursor-family') {
+      const raw = row.row.label
       return (
         <PickerItem
           mode={mode}
@@ -525,23 +613,30 @@ export function ModelSelectorPanel({
           data-model-id={row.row.representative.id}
           data-cursor-family={row.row.family}
           data-locked="true"
+          title={raw}
+          style={rowStyle}
           onSelect={() => {
             onLockedSelect?.({
-              label: row.row.label,
+              label: raw,
               minPlanCode: row.row.minPlanCode,
               minPlanName: row.row.minPlanName,
               modelId: row.row.representative.id,
             })
             onOpenChange(false)
           }}
-          className="justify-between gap-2 rounded-sm text-muted"
+          className={cn(baseRowCls, 'text-muted')}
         >
-          <span className="flex min-w-0 items-center gap-2">
+          <span className="flex min-w-0 items-center gap-2.5">
             {rowBadge(false, true)}
-            <span className="truncate">{row.row.label}</span>
+            <ModelNameWithTags
+              rawLabel={raw}
+              modelId={row.row.representative.id}
+              family={family}
+            />
             <span className="sr-only">（需升级解锁）</span>
           </span>
           <span className="flex shrink-0 items-center gap-1.5">
+            <Lock size={12} strokeWidth={1.75} className="shrink-0 text-faint" aria-hidden />
             <CostMark model={row.row.representative} />
             <PromoBadge label={promoLabelOf(row.row.representative)} />
           </span>
@@ -554,6 +649,7 @@ export function ModelSelectorPanel({
       row.row.members[0]?.id
     const representativeModel = row.row.members.find((item) => item.id === representative)
     const degraded = row.row.members.every(isDegraded)
+    const raw = row.row.label
     return (
       <PickerItem
         mode={mode}
@@ -561,12 +657,14 @@ export function ModelSelectorPanel({
         data-model-id={representative}
         data-cursor-family={row.row.family}
         disabled={degraded}
+        title={raw}
+        style={rowStyle}
         onSelect={degraded ? undefined : () => selectCursor(row.row.family, row.row.members)}
-        className={cn('justify-between gap-2 rounded-sm', familyActive && !degraded && activeRowCls)}
+        className={cn(baseRowCls, familyActive && !degraded && activeRowCls)}
       >
-        <span className="flex min-w-0 items-center gap-2">
+        <span className="flex min-w-0 items-center gap-2.5">
           {rowBadge(familyActive && !degraded)}
-          <span className="truncate">{row.row.label}</span>
+          <ModelNameWithTags rawLabel={raw} modelId={representative} family={family} />
         </span>
         <span className="flex shrink-0 items-center gap-1.5">
           <CostMark model={representativeModel} />
@@ -577,6 +675,12 @@ export function ModelSelectorPanel({
       </PickerItem>
     )
   }
+
+  const usableVisibleRows = visibleRows.filter((r) => !isLockedRow(r) && !isDegradedRow(r))
+  const lockedVisibleRows = visibleRows.filter(isLockedRow)
+  const degradedVisibleRows = visibleRows.filter(isDegradedRow)
+  const familyGroups = groupUsableByFamily(usableVisibleRows)
+  const showFamilyGroups = familyGroups.length >= 2 && usableVisibleRows.length >= 3
 
   const notes = selectedDegraded && !teamEngineActive ? (
     <div
@@ -598,14 +702,42 @@ export function ModelSelectorPanel({
     <>
       {recentRows.length > 0 && (
         <>
-          <PickerLabel mode={mode} data-recent-group="true">
+          <PickerLabel
+            mode={mode}
+            data-recent-group="true"
+            className="model-picker-group-label text-caption font-semibold uppercase tracking-wider text-faint"
+          >
             最近
           </PickerLabel>
           {recentRows.map((row) => renderRow(row, 'recent-'))}
           <PickerSeparator mode={mode} />
         </>
       )}
-      {visibleRows.map((row) => renderRow(row, ''))}
+      {showFamilyGroups ? (
+        <>
+          {familyGroups.map((group) => (
+            <div key={`family-group-${group.family}`} className="space-y-0.5">
+              <PickerLabel
+                mode={mode}
+                data-family-group={group.family}
+                className="model-picker-group-label px-2.5 pb-0.5 pt-1.5 text-caption font-semibold uppercase tracking-wider text-faint"
+              >
+                {MODEL_FAMILY_GROUP_LABELS[group.family]}
+              </PickerLabel>
+              {group.rows.map((row) => renderRow(row, ''))}
+            </div>
+          ))}
+          {(lockedVisibleRows.length > 0 || degradedVisibleRows.length > 0) && (
+            <>
+              <PickerSeparator mode={mode} />
+              {lockedVisibleRows.map((row) => renderRow(row, ''))}
+              {degradedVisibleRows.map((row) => renderRow(row, ''))}
+            </>
+          )}
+        </>
+      ) : (
+        visibleRows.map((row) => renderRow(row, ''))
+      )}
       {showCollapsedGroup && (
         <>
           <PickerSeparator mode={mode} />
@@ -617,7 +749,7 @@ export function ModelSelectorPanel({
               event.preventDefault()
               setCollapsedOpen((cur) => !cur)
             }}
-            className="justify-between text-muted"
+            className="oc-spring-press justify-between rounded-md text-muted"
           >
             <span className="flex items-center gap-1.5">
               {collapsedOpen ? (
@@ -672,6 +804,9 @@ export function ModelSelectorPanel({
     onSelectServiceTier,
   }
 
+  const selectedFamily = detectModelFamily(`${selectedId ?? ''} ${label}`)
+  const headerDisplay = parseModelDisplayMeta(label, selectedId, selectedFamily)
+
   if (mode === 'sheet') {
     const useShortTabs = shortViewport && hasExtras
     return (
@@ -689,19 +824,41 @@ export function ModelSelectorPanel({
           )}
         >
           <div className="flex min-h-0 flex-1 flex-col" data-testid="model-picker-sheet">
-            <div className="flex shrink-0 items-center gap-2.5 border-b border-border/80 px-4 pb-3 pt-1.5 pr-12">
-              <span aria-hidden className="oc-icon-badge oc-icon-badge-accent size-8 rounded-sm">
-                <Cpu size={15} strokeWidth={1.75} />
+            <div className="model-picker-sheet-header flex shrink-0 items-center gap-3 border-b border-border/80 px-4 pb-3 pt-2 pr-12">
+              <span
+                aria-hidden
+                data-testid="model-picker-sheet-icon"
+                className="oc-icon-badge oc-icon-badge-accent oc-breathe-aura size-9 rounded-md"
+              >
+                <ModelFamilyIcon family={selectedFamily} size={18} />
               </span>
               <div className="min-w-0 flex-1">
                 <p className="text-title font-semibold tracking-tight text-fg">选择对话模型</p>
-                <p className="mt-0.5 flex items-center gap-1.5 truncate text-meta text-muted">
+                <div
+                  className="mt-0.5 flex items-center gap-1.5 truncate text-meta text-muted"
+                  title={label}
+                  data-testid="model-picker-sheet-subtitle"
+                >
                   <span className="truncate">
-                    {label}
+                    {headerDisplay.cleanName}
                     {tierLabel ? ` · ${tierLabel}` : ''}
                   </span>
+                  {headerDisplay.tags.map((tag) => (
+                    <span
+                      key={tag.label}
+                      aria-hidden="true"
+                      className={cn(
+                        'inline-flex shrink-0 items-center rounded-full px-1.5 py-px text-micro font-medium leading-tight',
+                        tag.tone === 'info' && 'model-picker-tag-info',
+                        tag.tone === 'accent' && 'model-picker-tag-accent',
+                        tag.tone === 'neutral' && 'model-picker-tag-neutral',
+                      )}
+                    >
+                      {tag.label}
+                    </span>
+                  ))}
                   <CostMark model={selected} multiplier={effectiveMultiplier} />
-                </p>
+                </div>
               </div>
             </div>
 
@@ -721,7 +878,7 @@ export function ModelSelectorPanel({
                       aria-selected={shortTab === 'models'}
                       onClick={() => setShortTab('models')}
                       className={cn(
-                        'oc-btn-tactile min-h-9 flex-1 rounded-sm px-3 py-1 text-meta font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                        'oc-btn-tactile oc-spring-press min-h-9 flex-1 rounded-sm px-3 py-1 text-meta font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring',
                         shortTab === 'models'
                           ? 'oc-segmented-thumb text-fg'
                           : 'text-muted hover:text-fg',
@@ -736,7 +893,7 @@ export function ModelSelectorPanel({
                       aria-selected={shortTab === 'extras'}
                       onClick={() => setShortTab('extras')}
                       className={cn(
-                        'oc-btn-tactile min-h-9 flex-1 rounded-sm px-3 py-1 text-meta font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                        'oc-btn-tactile oc-spring-press min-h-9 flex-1 rounded-sm px-3 py-1 text-meta font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring',
                         shortTab === 'extras'
                           ? 'oc-segmented-thumb text-fg'
                           : 'text-muted hover:text-fg',
@@ -750,7 +907,7 @@ export function ModelSelectorPanel({
                   <div
                     role="menu"
                     data-testid="model-picker-sheet-scroll"
-                    className="model-picker-sheet-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 py-2"
+                    className="model-picker-sheet-scroll min-h-0 flex-1 space-y-0.5 overflow-y-auto overscroll-contain px-2.5 py-2.5"
                   >
                     {notes}
                     {list}
@@ -759,7 +916,7 @@ export function ModelSelectorPanel({
                   <div
                     role="tabpanel"
                     data-testid="model-picker-extras-panel"
-                    className="model-picker-sheet-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 py-2.5"
+                    className="model-picker-sheet-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain px-3.5 py-3"
                   >
                     <ModelSelectorExtras layout="tab" {...sharedExtrasProps} />
                   </div>
@@ -770,7 +927,7 @@ export function ModelSelectorPanel({
                 <div
                   role="menu"
                   data-testid="model-picker-sheet-scroll"
-                  className="model-picker-sheet-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 py-2"
+                  className="model-picker-sheet-scroll min-h-0 flex-1 space-y-0.5 overflow-y-auto overscroll-contain px-2.5 py-2.5"
                 >
                   {notes}
                   {list}
@@ -780,7 +937,7 @@ export function ModelSelectorPanel({
                     role="region"
                     aria-label="执行参数"
                     data-testid="model-picker-extras-dock"
-                    className="max-h-[42%] shrink-0 overflow-y-auto overscroll-contain border-t border-border/80 bg-bg/70 px-3 py-2.5"
+                    className="max-h-[44%] shrink-0 overflow-y-auto overscroll-contain border-t border-border/80 bg-bg/75 px-3.5 py-3"
                   >
                     <ModelSelectorExtras layout="dock" {...sharedExtrasProps} />
                   </div>
@@ -807,7 +964,10 @@ export function ModelSelectorPanel({
               data-testid="model-picker-list-col"
               className="flex min-h-[14rem] min-w-0 flex-[56_1_0%] flex-col"
             >
-              <PickerLabel mode="menu" className="shrink-0 border-b border-border/70 px-3 py-2 text-caption font-semibold tracking-wider text-faint">
+              <PickerLabel
+                mode="menu"
+                className="shrink-0 border-b border-border/70 px-3 py-2 text-caption font-semibold uppercase tracking-wider text-faint"
+              >
                 对话模型
               </PickerLabel>
               {notes}
@@ -836,9 +996,12 @@ export function ModelSelectorPanel({
       <DropdownMenuContent
         align="start"
         data-testid="model-picker-single-col"
-        className="model-picker-popover oc-surface-popover flex w-[min(320px,calc(100vw-24px))] min-w-[15rem] flex-col overflow-hidden p-1.5"
+        className="model-picker-popover oc-surface-popover flex w-[min(340px,calc(100vw-24px))] min-w-[15.5rem] flex-col overflow-hidden p-1.5"
       >
-        <PickerLabel mode="menu" className="shrink-0 text-caption font-semibold tracking-wider text-faint">
+        <PickerLabel
+          mode="menu"
+          className="shrink-0 text-caption font-semibold uppercase tracking-wider text-faint"
+        >
           对话模型
         </PickerLabel>
         {notes}

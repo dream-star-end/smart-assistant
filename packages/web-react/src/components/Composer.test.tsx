@@ -437,16 +437,29 @@ describe("OCV5-831 Composer 蜂群占位符单行化与视觉重心", () => {
       <Composer onSend={() => {}} swarmSupported swarmMode={false} onToggleSwarmMode={vi.fn()} />,
     );
     const swarmBtn = screen.getByTestId("composer-swarm-toggle");
-    expect(swarmBtn).toHaveClass("border-transparent", "text-muted");
-    expect(swarmBtn).not.toHaveClass("bg-accent-soft");
+    const shell = screen.getByTestId("composer-shell");
+    expect(shell).not.toHaveAttribute("data-swarm");
+    expect(swarmBtn).toHaveClass("border-transparent", "text-muted", "oc-spring-press");
+    expect(swarmBtn).not.toHaveClass("bg-accent-soft", "oc-breathe-aura");
 
     const ta = screen.getByLabelText("消息输入框");
     fireEvent.change(ta, { target: { value: "写一个计划" } });
-    expect(screen.getByRole("button", { name: "发送" })).toHaveClass("oc-btn-primary-craft", "text-primary-fg");
+    expect(screen.getByRole("button", { name: "发送" })).toHaveClass(
+      "oc-btn-primary-craft",
+      "oc-shimmer-sheen",
+      "oc-spring-press",
+      "oc-icon-nudge",
+      "text-primary-fg",
+    );
 
     rerender(<Composer onSend={() => {}} swarmSupported swarmMode onToggleSwarmMode={vi.fn()} />);
-    expect(swarmBtn).toHaveClass("bg-accent-soft", "text-accent", "border-accent/30");
-    expect(screen.getByRole("button", { name: "发送" })).toHaveClass("oc-btn-accent-craft", "text-accent-fg");
+    expect(shell).toHaveAttribute("data-swarm", "true");
+    expect(swarmBtn).toHaveClass("bg-accent-soft", "text-accent", "border-accent/30", "oc-breathe-aura");
+    expect(screen.getByRole("button", { name: "发送" })).toHaveClass(
+      "oc-btn-accent-craft",
+      "oc-shimmer-sheen",
+      "text-accent-fg",
+    );
 
     rerender(<Composer onSend={() => {}} busy onStop={vi.fn()} swarmSupported swarmMode onToggleSwarmMode={vi.fn()} />);
     expect(screen.getByRole("button", { name: "停止" })).toHaveClass("oc-btn-primary-craft", "text-primary-fg");

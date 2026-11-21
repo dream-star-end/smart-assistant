@@ -21,7 +21,7 @@ export function BrandMark({
   return (
     <span
       aria-hidden
-      className={`${className} relative grid shrink-0 select-none place-items-center overflow-hidden ${rounded} bg-brand ${fontSize} font-black leading-none tracking-tight text-brand-fg ring-1 ring-inset ring-black/15 before:pointer-events-none before:absolute before:inset-0 before:bg-gradient-to-b before:from-white/40 before:via-white/5 before:to-black/10${
+      className={`${className} oc-shimmer-sheen relative grid shrink-0 select-none place-items-center overflow-hidden ${rounded} bg-brand ${fontSize} font-black leading-none tracking-tight text-brand-fg ring-1 ring-inset ring-black/15 transition-transform duration-200 ease-spring before:pointer-events-none before:absolute before:inset-0 before:bg-gradient-to-b before:from-white/40 before:via-white/5 before:to-black/10${
         glow ? ' shadow-brand-glow' : flat ? ' shadow-xs' : ' shadow-float'
       }`}
     >

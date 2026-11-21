@@ -90,6 +90,8 @@ import { parseShellEnvelope } from "./tool/shellEnvelope";
 import { resolveToolStatus } from "./tool/status";
 import { toneTileClass } from "./tool/tone";
 import { Badge, EmptyState, IconButton, Skeleton, Spinner, Tabs } from "./ui";
+import { AtelierIcon } from "./ui/AtelierIcons";
+import { AtelierLazyIcon } from "./ui/AtelierLazyIcons";
 import { WorkbenchSheetContext } from "./chat/WorkbenchBottomBar";
 
 // 产出页(含主产物渲染)只在面板打开且停在产出时才需要:懒加载,不进首屏(first-screen-budget)。
@@ -278,7 +280,7 @@ function writeStoredTab(tab: PaneTab): void {
 }
 
 const navButtonClass =
-  "oc-btn-tactile inline-flex min-h-8 items-center gap-1 rounded-md px-2 text-meta font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11";
+  "oc-btn-tactile oc-spring-press inline-flex min-h-8 items-center gap-1 rounded-md px-2 text-meta font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11";
 
 function stepIconToneClass(tone: ToolTone | undefined): string {
   switch (tone) {
@@ -379,7 +381,7 @@ function StepDetail({
         {following ? (
           <span
             data-testid="pane-following"
-            className="oc-badge-craft inline-flex items-center gap-1.5 rounded-full bg-accent-soft px-2.5 py-0.5 text-caption font-medium text-accent"
+            className="oc-badge-craft oc-breathe-aura inline-flex items-center gap-1.5 rounded-full bg-accent-soft px-2.5 py-0.5 text-caption font-medium text-accent"
           >
             <span aria-hidden className="size-1.5 rounded-full bg-accent motion-safe:animate-pulse" />
             跟随中
@@ -940,20 +942,53 @@ export function InspectorPanelContent({
   const subtleCount = (n: number) =>
     n > 0 ? <span className="ml-1 text-caption font-normal tabular-nums text-faint">{n}</span> : null;
   const tabItems = [
-    { value: "outputs", label: <span>产出</span> },
+    {
+      value: "outputs",
+      label: (
+        <span className="inline-flex items-center gap-1.5">
+          <AtelierLazyIcon name="deliverables" size={14} />
+          <span>产出</span>
+        </span>
+      ),
+    },
     ...(browserCount > 0 || browserPending || liveBrowserAvailable
-      ? [{ value: "browser", label: <span>浏览器{subtleCount(browserCount)}</span> }]
+      ? [
+          {
+            value: "browser",
+            label: (
+              <span className="inline-flex items-center gap-1.5">
+                <AtelierLazyIcon name="browser" size={14} />
+                <span>浏览器{subtleCount(browserCount)}</span>
+              </span>
+            ),
+          },
+        ]
       : []),
     {
       value: "steps",
       label: (
-        <span>
-          过程
-          <span className="sr-only">步骤{steps.length > 0 ? ` ${steps.length}` : ""}</span>
+        <span className="inline-flex items-center gap-1.5">
+          <AtelierIcon name="sparkles" size={14} />
+          <span>
+            过程
+            <span className="sr-only">步骤{steps.length > 0 ? ` ${steps.length}` : ""}</span>
+          </span>
         </span>
       ),
     },
-    ...(todos.length > 0 ? [{ value: "plan", label: <span>计划</span> }] : []),
+    ...(todos.length > 0
+      ? [
+          {
+            value: "plan",
+            label: (
+              <span className="inline-flex items-center gap-1.5">
+                <AtelierIcon name="tasks" size={14} />
+                <span>计划</span>
+              </span>
+            ),
+          },
+        ]
+      : []),
   ];
 
   return (
@@ -977,7 +1012,7 @@ export function InspectorPanelContent({
             items={tabItems}
             idBase={idBase}
             aria-label="详情面板分区"
-            className="[&_[role=tab]]:px-3 [&_[role=tab]]:py-1 [&_[role=tab]]:text-meta [@media(hover:none)]:[&_[role=tab]]:min-h-9"
+            className="[&_[role=tab]]:px-2.5 [&_[role=tab]]:py-1 [&_[role=tab]]:text-meta [&_[role=tab]]:transition-all [&_[role=tab]]:duration-150 [@media(hover:none)]:[&_[role=tab]]:min-h-9"
           />
         </div>
         {onToggleFullscreen && (
@@ -986,13 +1021,21 @@ export function InspectorPanelContent({
             title={fullscreen ? "恢复默认高度 (Esc)" : "全屏沉浸阅读"}
             size="sm"
             shape="square"
+            className="oc-spring-press oc-icon-nudge"
             data-testid="pane-fullscreen-toggle"
             onClick={onToggleFullscreen}
           >
             {fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
           </IconButton>
         )}
-        <IconButton aria-label="关闭详情面板" size="sm" shape="square" data-inspector-close="" onClick={onClose}>
+        <IconButton
+          aria-label="关闭详情面板"
+          size="sm"
+          shape="square"
+          className="oc-spring-press"
+          data-inspector-close=""
+          onClick={onClose}
+        >
           <X size={16} />
         </IconButton>
       </header>

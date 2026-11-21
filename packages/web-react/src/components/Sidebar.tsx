@@ -1,28 +1,14 @@
 import {
-  Clapperboard,
   Archive,
-  BookOpen,
-  Building2,
   ChevronDown,
   ChevronRight,
   ChevronsUpDown,
   Command,
-  Film,
-  Globe,
-  KeyRound,
-  LayoutGrid,
   ListChecks,
-  LogOut,
-  MessageSquareText,
   PanelLeftClose,
   Plus,
   Search,
-  Settings,
-  ShieldCheck,
-  SquareKanban,
-  Store,
   X,
-  PenLine,
 } from "lucide-react";
 import {
   type KeyboardEvent as ReactKeyboardEvent,
@@ -75,13 +61,11 @@ import {
   Avatar,
   Button,
   DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
   IconButton,
   StatusPill,
 } from "./ui";
+import { AtelierIcon } from "./ui/AtelierIcons";
 
 /** 多选批量条只在进入多选后出现，懒加载，不进首屏（UI-1 用它抵掉本片首屏增量）。 */
 const BatchBar = lazy(() => import("./sidebar/BatchBar").then((m) => ({ default: m.BatchBar })));
@@ -89,6 +73,48 @@ const BatchBar = lazy(() => import("./sidebar/BatchBar").then((m) => ({ default:
 const SidebarLiveActivityStrip = lazy(() =>
   import("./sidebar/LiveActivityStrip").then((m) => ({ default: m.SidebarLiveActivityStrip })),
 );
+
+type AccountMenuModule = typeof import("./sidebar/AccountMenuContent");
+let loadedAccountMenu: AccountMenuModule | null = null;
+let pendingAccountMenu: Promise<AccountMenuModule> | null = null;
+
+/** 账号下拉菜单懒块预热：移出首屏同步入口闭包，就绪后同步解析零闪烁。 */
+export function preloadAccountMenu(): Promise<AccountMenuModule> {
+  if (!pendingAccountMenu) {
+    pendingAccountMenu = import("./sidebar/AccountMenuContent").then(
+      (mod) => {
+        loadedAccountMenu = mod;
+        return mod;
+      },
+      (err: unknown) => {
+        pendingAccountMenu = null;
+        throw err;
+      },
+    );
+  }
+  return pendingAccountMenu;
+}
+
+const LazyAccountMenuContent = lazy(() => {
+  const ready = loadedAccountMenu;
+  if (ready) {
+    const sync = {
+      // biome-ignore lint/suspicious/noThenProperty: synchronous thenable for React.lazy once preloaded
+      then(resolve: (value: { default: AccountMenuModule["AccountMenuContent"] }) => void) {
+        resolve({ default: ready.AccountMenuContent });
+      },
+    };
+    return sync as unknown as Promise<{ default: AccountMenuModule["AccountMenuContent"] }>;
+  }
+  return preloadAccountMenu().then((mod) => ({ default: mod.AccountMenuContent }));
+});
+
+if (typeof window !== "undefined") {
+  const idle = (window as Window & { requestIdleCallback?: (cb: () => void) => number })
+    .requestIdleCallback;
+  if (idle) idle(() => { void preloadAccountMenu().catch(() => {}); });
+  else window.setTimeout(() => { void preloadAccountMenu().catch(() => {}); }, 10);
+}
 
 /** 空态提示行叠加「新建会话」CTA 后的行高(文字 + gap + 按钮 + 原 py-6 呼吸位)。 */
 const EMPTY_HINT_CTA_HEIGHT = 108;
@@ -100,7 +126,7 @@ const EMPTY_ALL_HEIGHT = 200;
  */
 const FOOTER_LABEL_MIN_WIDTH = 300;
 const NAV_ITEM_BASE =
-  "group relative flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:h-9";
+  "oc-spring-press oc-icon-nudge group relative flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:h-9";
 const NAV_ITEM_ACTIVE = "bg-sidebar-active font-medium text-fg shadow-sidebar-active";
 const NAV_ITEM_IDLE = "text-muted hover:bg-hover/80 hover:text-fg";
 
@@ -322,6 +348,7 @@ export function Sidebar({
   const [orderOverride, setOrderOverride] = useState<string[] | null>(null);
   const [searchHits, setSearchHits] = useState<SessionSearchHit[]>([]);
   const [searchRemote, setSearchRemote] = useState<"idle" | "loading" | "empty" | "error">("idle");
+  const [accountMenuOpened, setAccountMenuOpened] = useState(false);
   const coarse = useCoarsePointer();
   const userId = user?.id;
   const sessions = useMemo(
@@ -676,13 +703,16 @@ export function Sidebar({
   const displayName = user?.displayName?.trim() || "未登录";
   const showSecondaryEmail = Boolean(email && email.toLowerCase() !== displayName.toLowerCase());
   const accountSubtitle = credits != null ? null : showSecondaryEmail ? email : null;
+  const warmAccountMenu = hasAccountMenu ? () => { void preloadAccountMenu().catch(() => {}); } : undefined;
   const userChip = (
     <button
       type="button"
       data-product-feature={PRODUCT_CAPABILITIES.billing.id}
       disabled={!hasAccountMenu}
       aria-label={hasAccountMenu ? "账号菜单" : undefined}
-      className="oc-btn-tactile group flex min-w-0 flex-1 items-center gap-2 rounded-sm py-1.5 pl-1.5 pr-2 text-left outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring enabled:hover:bg-hover/80 data-[state=open]:bg-sidebar-active data-[state=open]:shadow-sidebar-active [@media(hover:none)]:min-h-10"
+      onPointerEnter={warmAccountMenu}
+      onFocus={warmAccountMenu}
+      className="oc-btn-tactile oc-spring-press group flex min-w-0 flex-1 items-center gap-2 rounded-sm py-1.5 pl-1.5 pr-2 text-left outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring enabled:hover:bg-hover/80 data-[state=open]:bg-sidebar-active data-[state=open]:shadow-sidebar-active [@media(hover:none)]:min-h-10"
     >
       <Avatar
         size="sm"
@@ -771,7 +801,7 @@ export function Sidebar({
             className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center"
           >
             <span className="oc-icon-badge oc-icon-badge-accent size-10 rounded-md">
-              <MessageSquareText size={18} strokeWidth={1.75} />
+              <AtelierIcon name="newChat" size={18} />
             </span>
             <div className="flex flex-col gap-1">
               <span className="text-body font-semibold text-fg">{item.text}</span>
@@ -1056,23 +1086,22 @@ export function Sidebar({
         {/* 主操作：干练克制的 Codex/Linear 比例，去厚重白砖阴影；有智能体选择时右侧细线切出下拉。 */}
         <div
           data-sidebar-new
-          className="group/new oc-btn-tactile mb-2 flex h-9 w-full items-stretch rounded-sm border border-border/80 bg-surface/90 text-section shadow-2xs transition-colors duration-150 ease-standard hover:border-border-strong hover:bg-surface [@media(hover:none)]:h-10"
+          className="group/new oc-btn-tactile oc-spring-press mb-2 flex h-9 w-full items-stretch rounded-sm border border-border/80 bg-surface/90 text-section shadow-2xs transition-colors duration-150 ease-standard hover:border-border-strong hover:bg-surface [@media(hover:none)]:h-10"
         >
           <button
             type="button"
             data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
             onClick={onNew}
             className={cn(
-              "flex min-w-0 flex-1 items-center gap-2.5 px-2.5 text-left font-medium text-fg outline-none transition-colors duration-150 hover:bg-hover/60 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+              "oc-icon-nudge flex min-w-0 flex-1 items-center gap-2.5 px-2.5 text-left font-medium text-fg outline-none transition-colors duration-150 hover:bg-hover/60 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
               onNewWithAgent ? "rounded-l-sm" : "rounded-sm",
             )}
           >
-            <span
-              aria-hidden
-              className="flex size-4 shrink-0 items-center justify-center rounded-full bg-primary text-primary-fg"
-            >
-              <Plus size={11} strokeWidth={2.5} />
-            </span>
+            <AtelierIcon
+              name="newChat"
+              size={16}
+              className="shrink-0 text-accent"
+            />
             <span className="truncate">新建会话</span>
           </button>
           {onNewWithAgent && (
@@ -1201,10 +1230,9 @@ export function Sidebar({
                 aria-current={boardActive ? "true" : undefined}
                 className={cn(NAV_ITEM_BASE, boardActive ? NAV_ITEM_ACTIVE : NAV_ITEM_IDLE)}
               >
-                <SquareKanban
+                <AtelierIcon
+                  name="tasks"
                   size={16}
-                  strokeWidth={1.75}
-                  aria-hidden
                   className={cn("shrink-0 transition-colors", boardActive ? "text-accent" : "text-faint group-hover:text-fg")}
                 />
                 任务
@@ -1219,10 +1247,9 @@ export function Sidebar({
                 aria-current={sitesActive ? "true" : undefined}
                 className={cn(NAV_ITEM_BASE, sitesActive ? NAV_ITEM_ACTIVE : NAV_ITEM_IDLE)}
               >
-                <Globe
+                <AtelierIcon
+                  name="sites"
                   size={16}
-                  strokeWidth={1.75}
-                  aria-hidden
                   className={cn("shrink-0 transition-colors", sitesActive ? "text-accent" : "text-faint group-hover:text-fg")}
                 />
                 站点
@@ -1236,10 +1263,9 @@ export function Sidebar({
                 onClick={onOpenBlog}
                 className={cn(NAV_ITEM_BASE, NAV_ITEM_IDLE)}
               >
-                <PenLine
+                <AtelierIcon
+                  name="blog"
                   size={16}
-                  strokeWidth={1.75}
-                  aria-hidden
                   className="shrink-0 text-faint transition-colors group-hover:text-fg"
                 />
                 经验分享
@@ -1312,203 +1338,39 @@ export function Sidebar({
       <div className="border-t border-border/60 px-2 pt-1.5 sidebar-foot-safe-b">
         <div className="flex items-center gap-0.5" data-product-entry-scope="sidebar-account">
           {hasAccountMenu ? (
-            <DropdownMenu>
+            <DropdownMenu
+              onOpenChange={(open) => {
+                if (open) {
+                  void preloadAccountMenu().catch(() => {});
+                  setAccountMenuOpened(true);
+                }
+              }}
+            >
               <DropdownMenuTrigger asChild>{userChip}</DropdownMenuTrigger>
-              <DropdownMenuContent
-                side="top"
-                align="start"
-                sideOffset={8}
-                className="oc-surface-popover w-72 rounded-lg p-1.5"
-                data-product-entry-scope="account-menu"
-              >
-                <div className="oc-surface-recessed mb-1.5 flex items-center gap-2.5 rounded-md px-2.5 py-2.5">
-                  <Avatar
-                    size="md"
-                    tone="neutral"
-                    className="oc-avatar-ring bg-accent-soft text-body font-semibold text-accent ring-1 ring-inset ring-accent/20"
-                  >
-                    {displayName.slice(0, 1).toUpperCase()}
-                  </Avatar>
-                  <div className="min-w-0 flex-1">
-                    <p
-                      className="truncate text-section font-semibold leading-snug text-fg"
-                      title={displayName}
-                    >
-                      {displayName}
-                    </p>
-                    {/* 当显示名与邮箱相同时只显示一行主标题，避免重复两遍邮箱；不同时保留登录邮箱副标题。 */}
-                    {showSecondaryEmail && (
-                      <p className="mt-0.5 truncate text-caption text-faint" title={email ?? undefined}>
-                        {email}
-                      </p>
-                    )}
-                    {credits != null && (
-                      <div className="mt-1.5 flex items-center">
-                        <span className="oc-badge-craft inline-flex max-w-full items-center truncate rounded-full bg-accent-soft px-2 py-0.5 text-caption font-semibold tabular-nums text-accent">
-                          {`${formatCredits(credits)} 积分`}
-                        </span>
-                      </div>
-                    )}
-                  </div>
-                </div>
-                <DropdownMenuSeparator />
-                {onOpenManage && (
-                  <DropdownMenuItem
-                    data-product-feature={PRODUCT_CAPABILITIES.memory.id}
-                    onSelect={onOpenManage}
-                    className="gap-2.5 rounded-md py-1.5"
-                  >
-                    <span className="oc-icon-badge oc-icon-badge-accent h-6 w-6 rounded-xs" aria-hidden>
-                      <LayoutGrid size={13} strokeWidth={1.75} />
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-body font-medium leading-tight text-fg">管理中心</span>
-                      <span className="mt-0.5 block truncate text-caption leading-tight text-faint">
-                        记忆 · 技能 · 定时 · 插件
-                      </span>
-                    </span>
-                  </DropdownMenuItem>
-                )}
-                {onOpenMarketplace && (
-                  <DropdownMenuItem
-                    data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}
-                    onSelect={onOpenMarketplace}
-                    className="gap-2.5 rounded-md py-1.5"
-                  >
-                    <span className="oc-icon-badge oc-icon-badge-info h-6 w-6 rounded-xs" aria-hidden>
-                      <Store size={13} strokeWidth={1.75} />
-                    </span>
-                    <span className="flex-1 font-medium">市场</span>
-                  </DropdownMenuItem>
-                )}
-                {onOpenOrg && (
-                  <DropdownMenuItem
-                    data-product-feature={PRODUCT_CAPABILITIES.organization.id}
-                    onSelect={onOpenOrg}
-                    className="gap-2.5 rounded-md py-1.5"
-                  >
-                    <span className="oc-icon-badge h-6 w-6 rounded-xs" aria-hidden>
-                      <Building2 size={13} strokeWidth={1.75} />
-                    </span>
-                    <span className="flex-1 font-medium">组织</span>
-                  </DropdownMenuItem>
-                )}
-                {showAdmin && (
-                  <DropdownMenuItem asChild data-product-control className="gap-2.5 rounded-md py-1.5">
-                    <a data-product-control href="/admin.html">
-                      <span className="oc-icon-badge oc-icon-badge-warning h-6 w-6 rounded-xs" aria-hidden>
-                        <ShieldCheck size={13} strokeWidth={1.75} />
-                      </span>
-                      <span className="flex-1 font-medium">管理后台</span>
-                    </a>
-                  </DropdownMenuItem>
-                )}
-                {onOpenStudio && (
-                  <DropdownMenuItem
-                    data-product-control
-                    onSelect={onOpenStudio}
-                    className="gap-2.5 rounded-md py-1.5"
-                  >
-                    <span className="oc-icon-badge oc-icon-badge-accent h-6 w-6 rounded-xs" aria-hidden>
-                      <Clapperboard size={13} strokeWidth={1.75} />
-                    </span>
-                    <span className="flex-1 font-medium">媒体工作台</span>
-                  </DropdownMenuItem>
-                )}
-                {onOpenMediaTasks && (
-                  <DropdownMenuItem
-                    data-product-control
-                    onSelect={onOpenMediaTasks}
-                    className="gap-2.5 rounded-md py-1.5"
-                  >
-                    <span className="oc-icon-badge oc-icon-badge-info h-6 w-6 rounded-xs" aria-hidden>
-                      <Film size={13} strokeWidth={1.75} />
-                    </span>
-                    <span className="flex-1 font-medium">视频任务</span>
-                  </DropdownMenuItem>
-                )}
-                {(onOpenChatGptProxy || onOpenApiAccess) &&
-                  (onOpenManage ||
-                    onOpenMarketplace ||
-                    onOpenOrg ||
-                    showAdmin ||
-                    onOpenStudio ||
-                    onOpenMediaTasks) && <DropdownMenuSeparator />}
-                {onOpenChatGptProxy && (
-                  <DropdownMenuItem
-                    data-product-control
-                    onSelect={onOpenChatGptProxy}
-                    className="gap-2.5 rounded-md py-1.5"
-                  >
-                    <span className="oc-icon-badge oc-icon-badge-success h-6 w-6 rounded-xs" aria-hidden>
-                      <Globe size={13} strokeWidth={1.75} />
-                    </span>
-                    <span className="flex-1 font-medium">ChatGPT 直连</span>
-                  </DropdownMenuItem>
-                )}
-                {onOpenApiAccess && (
-                  <DropdownMenuItem
-                    data-product-control
-                    onSelect={onOpenApiAccess}
-                    className="gap-2.5 rounded-md py-1.5"
-                  >
-                    <span className="oc-icon-badge oc-icon-badge-accent h-6 w-6 rounded-xs" aria-hidden>
-                      <KeyRound size={13} strokeWidth={1.75} />
-                    </span>
-                    <span className="flex-1 font-medium">API 接入</span>
-                    <span className="oc-badge-craft rounded-full bg-accent-soft px-1.5 py-0.5 text-caption font-medium text-accent">
-                      本地 Claude Code
-                    </span>
-                  </DropdownMenuItem>
-                )}
-                {(onOpenAccount || onOpenFeedback || onLogout) &&
-                  (onOpenManage ||
-                    onOpenMarketplace ||
-                    onOpenOrg ||
-                    showAdmin ||
-                    onOpenStudio ||
-                    onOpenMediaTasks ||
-                    onOpenChatGptProxy ||
-                    onOpenApiAccess) && <DropdownMenuSeparator />}
-                {onOpenAccount && (
-                  <DropdownMenuItem
-                    data-product-feature={PRODUCT_CAPABILITIES.billing.id}
-                    onSelect={onOpenAccount}
-                    className="gap-2.5 rounded-md py-1.5"
-                  >
-                    <span className="oc-icon-badge h-6 w-6 rounded-xs" aria-hidden>
-                      <Settings size={13} strokeWidth={1.75} />
-                    </span>
-                    <span className="flex-1 font-medium">设置</span>
-                  </DropdownMenuItem>
-                )}
-                {onOpenFeedback && (
-                  <DropdownMenuItem
-                    data-product-feature={PRODUCT_CAPABILITIES.feedback.id}
-                    onSelect={onOpenFeedback}
-                    className="gap-2.5 rounded-md py-1.5"
-                  >
-                    <span className="oc-icon-badge h-6 w-6 rounded-xs" aria-hidden>
-                      <MessageSquareText size={13} strokeWidth={1.75} />
-                    </span>
-                    <span className="flex-1 font-medium">意见反馈</span>
-                  </DropdownMenuItem>
-                )}
-                {onLogout && (onOpenAccount || onOpenFeedback) && <DropdownMenuSeparator />}
-                {onLogout && (
-                  <DropdownMenuItem
-                    data-product-control
-                    destructive
-                    onSelect={onLogout}
-                    className="gap-2.5 rounded-md py-1.5"
-                  >
-                    <span className="oc-icon-badge oc-icon-badge-danger h-6 w-6 rounded-xs" aria-hidden>
-                      <LogOut size={13} strokeWidth={1.75} />
-                    </span>
-                    <span className="flex-1 font-medium">退出登录</span>
-                  </DropdownMenuItem>
-                )}
-              </DropdownMenuContent>
+              {accountMenuOpened && (() => {
+                const AccountMenuComp = loadedAccountMenu?.AccountMenuContent ?? LazyAccountMenuContent;
+                return (
+                  <Suspense fallback={null}>
+                    <AccountMenuComp
+                      displayName={displayName}
+                      email={email}
+                      showSecondaryEmail={showSecondaryEmail}
+                      credits={credits}
+                      showAdmin={showAdmin}
+                      onOpenManage={onOpenManage}
+                      onOpenMarketplace={onOpenMarketplace}
+                      onOpenOrg={onOpenOrg}
+                      onOpenStudio={onOpenStudio}
+                      onOpenMediaTasks={onOpenMediaTasks}
+                      onOpenChatGptProxy={onOpenChatGptProxy}
+                      onOpenApiAccess={onOpenApiAccess}
+                      onOpenAccount={onOpenAccount}
+                      onOpenFeedback={onOpenFeedback}
+                      onLogout={onLogout}
+                    />
+                  </Suspense>
+                );
+              })()}
             </DropdownMenu>
           ) : (
             userChip
@@ -1523,11 +1385,11 @@ export function Sidebar({
               aria-label="打开案例展厅"
               title="案例展厅"
               className={cn(
-                "oc-btn-tactile h-7 shrink-0 gap-1 rounded-sm text-faint hover:text-fg [@media(hover:none)]:min-h-10 [@media(hover:none)]:min-w-10",
+                "oc-btn-tactile oc-spring-press h-7 shrink-0 gap-1 rounded-sm text-faint hover:text-fg [@media(hover:none)]:min-h-10 [@media(hover:none)]:min-w-10",
                 footerCompact ? "w-7 px-0" : "px-2",
               )}
             >
-              <BookOpen size={15} strokeWidth={1.75} />
+              <AtelierIcon name="blog" size={15} />
               {!footerCompact && <span className="text-caption font-medium">案例</span>}
             </Button>
           )}

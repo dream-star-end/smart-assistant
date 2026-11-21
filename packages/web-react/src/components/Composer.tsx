@@ -3,7 +3,6 @@ import type { MessageReplyQuote } from "@openclaude/protocol/browser";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import {
   ArrowUp,
-  Hexagon,
   ListPlus,
   Loader2,
   Mic,
@@ -48,6 +47,7 @@ import {
   StatusPill,
   useToast,
 } from "./ui";
+import { AtelierIcon } from "./ui/AtelierIcons";
 
 // Captured by one upload, not keyed by the reusable "new" draft name. Promotion
 // moves this exact attachment's owner without redirecting future new drafts.
@@ -793,7 +793,7 @@ export function Composer({
           title={visibleGoal.objective}
           onClick={() => setGoalOpen(true)}
           // 触屏 44px 命中(a11y-B composer#3);桌面精致雕塑胶囊。
-          className="oc-surface-card oc-surface-card-hover mb-2 inline-flex max-w-full items-center gap-2 rounded-full py-1 pl-1.5 pr-3 text-meta text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:pr-3.5"
+          className="oc-surface-card oc-surface-card-hover oc-spring-press mb-2 inline-flex max-w-full items-center gap-2 rounded-full py-1 pl-1.5 pr-3 text-meta text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:pr-3.5"
         >
           <span
             aria-hidden
@@ -859,6 +859,7 @@ export function Composer({
       )}
       <div
         data-testid="composer-shell"
+        data-swarm={swarmMode ? "true" : undefined}
         className={cn(
           "oc-composer-dock rounded-xl",
           dragActive && "ring-2 ring-ring",
@@ -1162,7 +1163,7 @@ export function Composer({
                 }}
                 className={cn(
                   iconButtonVariants({ shape: "square" }),
-                  "oc-btn-tactile cursor-pointer",
+                  "oc-btn-tactile oc-spring-press cursor-pointer",
                   disabled && "pointer-events-none opacity-50",
                 )}
               >
@@ -1202,16 +1203,16 @@ export function Composer({
                     : "开启 Antigravity 蜂群模式：多智能体并行拆解与互审（也可直接输入 /swarm）"
                 }
                 className={cn(
-                  "oc-btn-tactile inline-flex min-h-8 shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-caption font-medium transition-colors [@media(hover:none)]:min-h-10",
+                  "oc-btn-tactile oc-spring-press inline-flex min-h-8 shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-caption font-medium transition-colors [@media(hover:none)]:min-h-10",
                   "outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50",
                   swarmMode
-                    ? "border-accent/30 bg-accent-soft text-accent shadow-xs hover:bg-accent/15"
+                    ? "oc-breathe-aura border-accent/30 bg-accent-soft text-accent shadow-xs hover:bg-accent/15"
                     : "border-transparent text-muted hover:bg-hover hover:text-fg",
                 )}
               >
-                <Hexagon
-                  size={13}
-                  strokeWidth={2}
+                <AtelierIcon
+                  name="swarm"
+                  size={15}
                   className={cn("shrink-0", swarmMode && "text-accent")}
                 />
                 <span>蜂群</span>
@@ -1228,7 +1229,7 @@ export function Composer({
                   data-product-control
                   data-testid="composer-accept-prediction-touch"
                   onClick={acceptPrediction}
-                  className="oc-btn-tactile oc-btn-secondary-craft inline-flex min-h-11 shrink-0 items-center rounded-full px-3 text-caption font-medium text-accent"
+                  className="oc-btn-tactile oc-btn-secondary-craft oc-spring-press inline-flex min-h-11 shrink-0 items-center rounded-full px-3 text-caption font-medium text-accent"
                 >
                   填入建议
                 </button>
@@ -1274,7 +1275,7 @@ export function Composer({
                   data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
                   aria-label="排队发送"
                   title="本轮结束后自动发送"
-                  className="oc-btn-tactile text-accent hover:bg-accent-soft"
+                  className="oc-btn-tactile oc-spring-press text-accent hover:bg-accent-soft"
                   onClick={() => submit(false, () => toast("已加入队列，本轮结束后发送", "info"))}
                 >
                   <ListPlus size={18} strokeWidth={1.75} />
@@ -1290,7 +1291,7 @@ export function Composer({
                 disabled={disabled || voiceState === "transcribing"}
                 onClick={onVoiceClick}
                 className={cn(
-                  "oc-btn-tactile",
+                  "oc-btn-tactile oc-spring-press",
                   voiceState === "recording" && "oc-icon-badge-danger text-danger",
                   voiceUnavailableReason && "text-faint",
                 )}
@@ -1330,13 +1331,13 @@ export function Composer({
                 }}
                 disabled={stopping || (!canSend && !busy) || disabled}
                 className={cn(
-                  "oc-btn-tactile flex size-9 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface [@media(hover:none)]:size-10",
+                  "oc-btn-tactile oc-spring-press oc-icon-nudge flex size-9 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface [@media(hover:none)]:size-10",
                   busy
                     ? "oc-btn-primary-craft text-primary-fg"
                     : canSend
                       ? swarmMode
-                        ? "oc-btn-accent-craft text-accent-fg"
-                        : "oc-btn-primary-craft text-primary-fg"
+                        ? "oc-btn-accent-craft oc-shimmer-sheen text-accent-fg"
+                        : "oc-btn-primary-craft oc-shimmer-sheen text-primary-fg"
                       : swarmMode
                         ? "border border-accent/25 bg-accent-soft/75 text-accent/70"
                         : "oc-surface-recessed border border-border/80 text-muted",

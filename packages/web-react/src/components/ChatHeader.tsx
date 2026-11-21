@@ -6,9 +6,6 @@ import {
   Loader2,
   MessageCircleQuestion,
   MoreHorizontal,
-  PanelRight,
-  PanelRightClose,
-  PenSquare,
   Plus,
   RefreshCw,
   Search,
@@ -40,6 +37,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "./ui";
+import { AtelierIcon } from "./ui/AtelierIcons";
 import { HeaderCountBadge, WorkspaceShellHeader } from "./ui/WorkspaceShellHeader";
 
 /** 快捷键修饰键按平台显示:Mac 系 ⌘,其余 Ctrl(C-24:Windows/Linux 用户此前看到的是 Mac 符号)。 */
@@ -220,9 +218,9 @@ export function ChatHeader({
             onClick={onNew}
             aria-label="新建会话"
             shape="square"
-            className="oc-btn-tactile"
+            className="oc-btn-tactile oc-spring-press oc-icon-nudge"
           >
-            <PenSquare size={17} strokeWidth={1.75} />
+            <AtelierIcon name="newChat" size={17} />
           </IconButton>
         ) : undefined
       }
@@ -234,7 +232,7 @@ export function ChatHeader({
         data-product-feature={PRODUCT_CAPABILITIES.agents.id}
         onClick={onAgentClick}
         aria-label={`切换智能体，当前${agent.name}`}
-        className="oc-btn-tactile hidden min-h-11 min-w-0 shrink-0 items-center gap-2 rounded-lg px-2 py-1.5 outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:flex"
+        className="oc-btn-tactile oc-spring-press hidden min-h-11 min-w-0 shrink-0 items-center gap-2 rounded-lg px-2 py-1.5 outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:flex"
       >
         <AgentAvatar agent={agent} className="size-7 shrink-0 rounded-sm" iconSize={14} />
         <span className="max-w-[6.5rem] truncate whitespace-nowrap text-title font-semibold tracking-tight text-fg lg:max-w-[10rem]">
@@ -426,7 +424,7 @@ export function ChatHeader({
               role="status"
               data-testid="header-running-badge"
               aria-label="当前会话正在运行"
-              className="oc-badge-craft hidden shrink-0 items-center gap-1.5 rounded-full bg-accent-soft px-2.5 py-1 text-caption font-medium leading-none text-accent sm:inline-flex"
+              className="oc-badge-craft oc-breathe-aura hidden shrink-0 items-center gap-1.5 rounded-full bg-accent-soft px-2.5 py-1 text-caption font-medium leading-none text-accent sm:inline-flex"
             >
               <Loader2 size={11} strokeWidth={2} aria-hidden className="shrink-0 animate-spin" />
               <span>运行中</span>
@@ -440,7 +438,7 @@ export function ChatHeader({
               aria-label="有新版本，点击刷新页面"
               title="有新版本，点击刷新页面"
               onClick={onReloadForUpdate}
-              className="oc-btn-tactile group ml-1 hidden min-h-11 min-w-11 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:flex"
+              className="oc-btn-tactile oc-spring-press group ml-1 hidden min-h-11 min-w-11 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:flex"
             >
               <span className="oc-badge-craft flex items-center gap-1 rounded-full bg-accent-soft px-2.5 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15">
                 <RefreshCw size={11} strokeWidth={1.75} className="shrink-0" />
@@ -510,7 +508,7 @@ export function ChatHeader({
                 aria-label="账户与计费"
                 title={`账户余额：${formatCredits(credits)}`}
                 className={cn(
-                  "oc-btn-tactile flex min-h-9 min-w-9 items-center justify-center gap-1.5 rounded-full px-2.5 py-1 text-meta font-medium tabular-nums outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg lg:px-3",
+                  "oc-btn-tactile oc-spring-press flex min-h-9 min-w-9 items-center justify-center gap-1.5 rounded-full px-2.5 py-1 text-meta font-medium tabular-nums outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg lg:px-3",
                   low
                     ? "oc-badge-craft bg-danger-soft text-danger"
                     : "oc-btn-secondary-craft text-muted enabled:hover:text-fg",
@@ -541,7 +539,7 @@ export function ChatHeader({
                 title={`${quickAskOpen ? "收起" : "打开"}快问小窗：并行问答不打断主线 (${altKeyLabel()}K)`}
                 shape="square"
                 className={cn(
-                  "oc-btn-tactile hidden sm:flex",
+                  "oc-btn-tactile oc-spring-press oc-icon-nudge hidden sm:flex",
                   quickAskOpen
                     ? "oc-badge-craft bg-accent-soft text-accent"
                     : "text-muted hover:text-fg",
@@ -564,11 +562,11 @@ export function ChatHeader({
                 title={`${paneOpen ? "收起" : "打开"}详情面板：步骤、改动、计划 (${modKeyLabel()}\\)`}
                 shape="square"
                 className={cn(
-                  "oc-btn-tactile",
+                  "oc-btn-tactile oc-spring-press oc-icon-nudge",
                   paneOpen ? "oc-badge-craft bg-accent-soft text-accent" : "text-muted hover:text-fg",
                 )}
               >
-                {paneOpen ? <PanelRightClose size={17} strokeWidth={1.75} /> : <PanelRight size={17} strokeWidth={1.75} />}
+                <AtelierIcon name="workbench" size={17} />
               </IconButton>
             )}
           </div>
@@ -582,7 +580,7 @@ export function ChatHeader({
             aria-label="新建会话"
             title="新建会话"
             shape="square"
-            className="oc-btn-tactile text-muted hover:text-fg sm:hidden"
+            className="oc-btn-tactile oc-spring-press text-muted hover:text-fg sm:hidden"
           >
             <Plus size={18} strokeWidth={1.75} />
           </IconButton>
@@ -598,7 +596,7 @@ export function ChatHeader({
                   aria-label="更多操作"
                   title="更多操作"
                   shape="square"
-                  className="oc-btn-tactile text-faint hover:text-fg"
+                  className="oc-btn-tactile oc-spring-press text-faint hover:text-fg"
                 >
                   <MoreHorizontal size={18} strokeWidth={1.75} />
                 </IconButton>
