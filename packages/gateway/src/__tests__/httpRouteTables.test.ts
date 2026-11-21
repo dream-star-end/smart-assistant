@@ -38,6 +38,42 @@ const CURRENT_HTTP_DISPATCH: Record<string, LegacyGroup> = {
       match: (_req, url) => url.pathname === '/api/internal/system-help' }, ...LEGACY_HTTP_DISPATCH.PRE_AUTH_ROUTES.routes],
     samples: ['/api/internal/system-help', ...LEGACY_HTTP_DISPATCH.PRE_AUTH_ROUTES.samples],
   },
+  PLATFORM_ROUTES: {
+    ...LEGACY_HTTP_DISPATCH.PLATFORM_ROUTES,
+    routes: [
+      ...LEGACY_HTTP_DISPATCH.PLATFORM_ROUTES.routes,
+      {
+        id: 'INTERNAL /internal/office-preview',
+        line: 0,
+        calls: ['handleInternalOfficePreview'],
+        match: (req: { method?: string }, url: URL) =>
+          url.pathname === '/internal/office-preview' &&
+          (req.method === 'GET' || req.method === 'POST'),
+      },
+      {
+        id: 'GET /internal/office-preview/page',
+        line: 0,
+        calls: ['handleInternalOfficePreviewPage'],
+        match: (req: { method?: string }, url: URL) =>
+          url.pathname === '/internal/office-preview/page' && req.method === 'GET',
+      },
+      {
+        id: 'POST /internal/swarm/command',
+        line: 0,
+        calls: ['handleInternalSwarmCommand'],
+        match: (req: { method?: string }, url: URL) =>
+          /^\/internal\/swarm\/command(?:\/([^/]+))?\/?$/.test(url.pathname) &&
+          req.method === 'POST',
+      },
+    ],
+    samples: [
+      ...LEGACY_HTTP_DISPATCH.PLATFORM_ROUTES.samples,
+      '/internal/office-preview',
+      '/internal/office-preview/page',
+      '/internal/swarm/command',
+      '/internal/swarm/command/sess-1',
+    ],
+  },
   AGENT_ROUTES: (() => {
     const agents = LEGACY_HTTP_DISPATCH.AGENT_ROUTES
     const afterPersona = agents.routes.findIndex((r) => r.id === '/api/agents/:1/persona') + 1

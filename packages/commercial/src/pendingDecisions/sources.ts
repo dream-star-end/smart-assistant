@@ -574,7 +574,7 @@ export function createTaskboardSource(backend: TaskboardDecisionBackend): Pendin
           409,
         )
       }
-      const ticket = await backend.getTicket(parsed.ticketId)
+      const ticket = await backend.getTicket(parsed.ticketId, userId)
       if (!ticket) {
         throw new PendingDecisionError('NOT_FOUND', `taskboard ticket not found: ${parsed.ticketId}`)
       }

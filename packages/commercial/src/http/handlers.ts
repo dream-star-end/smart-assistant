@@ -131,6 +131,10 @@ import type { MediaGenerationService } from '../media-generation/service.js'
 import type { SitesService } from '../sites/service.js'
 import type { MuseBridgeHttpHandler } from '../muse/bridgeHttp.js'
 import type { StudioHttpDeps } from '../media-studio/http.js'
+import type { PendingDecisionsService } from '../pendingDecisions/index.js'
+import type { ResearchLibraryRouteDeps } from '../research/libraryRoutes.js'
+import type { CommercialOfficePreviewDeps } from './containerOfficePreviewProxy.js'
+import type { CommercialSwarmCommandDeps } from './containerSwarmCommandProxy.js'
 import { communityBlogEnabled } from "../tutorials/tutorialImages.js";
 import { tutorialModerationMode } from "../tutorials/tutorialModerationQueue.js";
 
@@ -155,6 +159,16 @@ export interface CommercialHttpDeps {
   studio?: StudioHttpDeps;
   /** Platform-authoritative session GoalState service. */
   goalStateService?: GoalStateService;
+  /** Unified pending decisions ("待拍板") aggregation service. */
+  pendingDecisionsService?: PendingDecisionsService;
+  /** Optional test overrides for research batch import & span locator routes. */
+  researchLibraryRouteDeps?: Omit<ResearchLibraryRouteDeps, 'jwtSecret'>;
+  /** Optional test overrides for zero-turn Office preview routes. */
+  officePreviewRouteDeps?: CommercialOfficePreviewDeps;
+  /** Optional test overrides for session Swarm control command proxy. */
+  swarmCommandRouteDeps?: CommercialSwarmCommandDeps;
+  /** Test seam ONLY: override DB active-account check for Wave 4 commercial user routes. */
+  verifyActiveAccount?: (userId: string) => Promise<boolean>;
   /** Short-lived one-time browser tickets for V5 container-local preview. */
   containerPreviewTickets?: ContainerPreviewTicketStore;
   /** Prevent issuing a ticket until the public WS bridge is fully assembled. */

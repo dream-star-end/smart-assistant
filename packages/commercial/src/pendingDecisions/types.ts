@@ -83,7 +83,7 @@ export interface TaskboardTicketRecord {
 
 export interface TaskboardDecisionBackend {
   listWaitingHuman(userId: string, limit: number): Promise<TaskboardTicketRecord[]>
-  getTicket(ticketId: string): Promise<TaskboardTicketRecord | null>
+  getTicket(ticketId: string, userId?: string): Promise<TaskboardTicketRecord | null>
   /**
    * Atomic CAS transition gated by `(ticketId, userId, expectedStatus='waiting_human', expectedVersion)`.
    * Same-decision replay against an already-decided `expectedVersion` returns `idempotentReplay: true`;

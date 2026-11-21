@@ -11,7 +11,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { requireAuth } from "../http/auth.js";
+import { requireAuth, type AuthedUser } from "../http/auth.js";
 import { HttpError, readJsonBody, sendJson } from "../http/util.js";
 import {
   type BatchImportDeps,
@@ -34,6 +34,8 @@ export const RESEARCH_SPAN_PATH_RE = /^\/api\/me\/research\/library\/([^/]+)\/sp
 
 export interface ResearchLibraryRouteDeps {
   jwtSecret: string | Uint8Array;
+  /** Optional authenticator (e.g. cookie+Bearer + active DB verification); defaults to `requireAuth`. */
+  authenticate?: (req: IncomingMessage) => Promise<AuthedUser>;
   importDeps?: BatchImportDeps;
   spanDeps?: SpanLocatorDeps;
   limiter?: UserImportLimiter;
@@ -68,7 +70,7 @@ export async function handleImportResearchIds(
   if (req.method && req.method !== "POST") {
     throw new HttpError(405, "METHOD_NOT_ALLOWED", "POST required");
   }
-  const user = await requireAuth(req, deps.jwtSecret);
+  const user = await (deps.authenticate ? deps.authenticate(req) : requireAuth(req, deps.jwtSecret));
   const raw = await readJsonBody(req, MAX_IMPORT_BODY_BYTES);
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new HttpError(400, "INVALID_IMPORT_INPUT", "JSON object body required");
@@ -178,7 +180,7 @@ export async function handleGetResearchSpan(
   if (req.method && req.method !== "GET") {
     throw new HttpError(405, "METHOD_NOT_ALLOWED", "GET required");
   }
-  const user = await requireAuth(req, deps.jwtSecret);
+  const user = await (deps.authenticate ? deps.authenticate(req) : requireAuth(req, deps.jwtSecret));
   const { docId, spanId, contextWindow, maxContextChars } = parseSpanParams(req.url);
 
   if (!docId || !isValidDocId(docId)) {

@@ -25,6 +25,8 @@ import { handleOpenAIRequest } from '../openaiCompat.js'
 import type { SessionManager } from '../sessionManager.js'
 import { RuntimeRecycleDrainCoordinator } from '../runtimeRecycleDrain.js'
 import type { Gateway, GatewayDeps } from '../server.js'
+import { OFFICE_PREVIEW_INTERNAL_ROUTES } from './officePreviewRoute.js'
+import { SWARM_COMMAND_INTERNAL_ROUTES } from './swarmCommandRoute.js'
 import { type HttpRoute, predicateRoute, regexRoute } from './routeTable.js'
 
 export interface PlatformRoutesIo {
@@ -502,4 +504,6 @@ export const PLATFORM_ROUTES: readonly HttpRoute<PlatformRoutesIo>[] = [
       return true
     },
   ),
+  ...OFFICE_PREVIEW_INTERNAL_ROUTES,
+  ...SWARM_COMMAND_INTERNAL_ROUTES,
 ]

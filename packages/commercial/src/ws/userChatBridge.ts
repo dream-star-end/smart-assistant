@@ -224,6 +224,7 @@ import {
   noteProducerFenceDrop,
   shouldForwardLiveFrameToBrowser,
 } from "../db/liveTurnFrames.js";
+import { OutboundBrowserHandoffFrameObserver } from "../pendingDecisions/pgBrowserHandoffStore.js";
 import {
   admitDurableControl,
   HELLO_PENDING_PERMISSION_MAX_SESSIONS,
@@ -1478,6 +1479,8 @@ export interface UserChatBridgeHandler {
   syncGoalToContainers(uid: bigint, goal: unknown): number;
   /** Trigger an immediate durable recovery drain pass for the given user. */
   drainRecoveryForUser(uid: bigint): Promise<void>;
+  /** Trigger an immediate durable control drain pass (e.g. pending decision approvals) for the given user. */
+  drainControlsForUser?(uid: bigint): Promise<void>;
   /** 给所有在线用户的每个 OPEN user WS 广播 JSON payload。不得用于用户事故通知。 */
   broadcastAll(payload: unknown): number;
   /**
@@ -1815,6 +1818,7 @@ export class _OutboundPersistQueueCoordinator {
 // ---------- 主入口 ----------------------------------------------------------
 
 export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHandler {
+  const browserHandoffObserver = new OutboundBrowserHandoffFrameObserver();
   // PR2 v1.0.66 — codex 真扣费三件套一致性强校验(Codex BLOCKER 3 修复)。
   // partial 注入(漏一个)在生产里会让 codex 帧 acquire 但不 settle,等于
   // 静默免费送 token。boot-time fail-closed 防漏注。
@@ -9119,6 +9123,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           } catch { /* ordinary non-JSON or malformed goal frame */ }
         }
       }
+      // OCV5-832 (B3): Reassemble streamed assistant `outbound.message` text frames and
+      // persist complete `browser_handoff` UI cards into PgBrowserHandoffStore.
+      if (!isBinary) {
+        browserHandoffObserver.observeOutboundFrame(uid.toString(), data);
+      }
       // Goal usage broadcasts are commit-driven by the PG tape/cost backend.
       // Do not guess durability with a one-shot terminal-frame timer: CCB cost
       // settlement and the GC late-fold can legitimately happen much later.
@@ -10558,6 +10567,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     broadcastToUser,
     syncGoalToContainers,
     drainRecoveryForUser: drainDurableRecoveryForUser,
+    drainControlsForUser: drainDurableControlsForUser,
     broadcastAll,
     broadcastToUsers,
     onlineUserSubset,

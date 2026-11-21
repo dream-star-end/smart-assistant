@@ -63,6 +63,7 @@ import {
 } from "../http/internalAutoDreamOptimizer.js";
 import { rootLogger } from "../logging/logger.js";
 import { wrapIoredis } from "../middleware/rateLimit.js";
+import type { ImRemoteControlHandler } from "../pendingDecisions/index.js";
 import type { QqBotConfig } from "../qqbot/config.js";
 import { makeSaveQqMediaToUserUploads } from "../qqbot/mediaIngest.js";
 import { makeQqOutboundMediaResolver } from "../qqbot/outboundMedia.js";
@@ -720,6 +721,7 @@ export function buildQqBotServiceAndReceivers(deps: {
     remotePath: string;
     content: Buffer;
   }) => Promise<void>;
+  remoteControl?: ImRemoteControlHandler;
 }): {
   qqBotService: QqBotService;
   qqOutbound: ReturnType<typeof makeQqOutboundReceiver>;
@@ -790,6 +792,7 @@ export function buildQqBotServiceAndReceivers(deps: {
         },
       });
     },
+    remoteControl: deps.remoteControl,
   });
   const qqIdentityRepo = createPgIdentityRepo();
   const qqOutbound = makeQqOutboundReceiver({
@@ -833,6 +836,7 @@ export function buildWechatBrokerDeps(deps: {
     content: Buffer;
   }) => Promise<void>;
   wechatLiveLinkKey: Buffer | undefined;
+  remoteControl?: ImRemoteControlHandler;
 }): {
   wechatProactive: ProactiveReceiverHandler;
   brokerConfig: Parameters<typeof makeWechatBroker>[0];
@@ -951,8 +955,14 @@ export function buildWechatBrokerDeps(deps: {
     getBinding: async (bindingUserId) => {
       const b = await getWechatBindingByUserId(bindingUserId);
       if (!b) return null;
-      return { botToken: b.botToken, contextTokens: b.contextTokens };
+      return {
+        botToken: b.botToken,
+        contextTokens: b.contextTokens,
+        status: b.status,
+        loginUserId: b.loginUserId,
+      };
     },
+    remoteControl: deps.remoteControl,
     brokerEnabled: () => true,
   };
 

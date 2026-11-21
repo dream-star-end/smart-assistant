@@ -214,7 +214,8 @@
     "0348_antigravity_gemini_4_neon",
     "0349_user_site_collaborators",
     "0350_perf_timeline_and_live_snapshot",
-    "0351_perf_timeline_and_live_snapshot_indexes"
+    "0351_perf_timeline_and_live_snapshot_indexes",
+    "0352_pending_browser_handoffs"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

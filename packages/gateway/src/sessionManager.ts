@@ -1246,6 +1246,50 @@ export class SessionManager {
    */
   private _sessionIdToKey = new Map<string, string>()
 
+  /** Resolve container-authoritative Antigravity swarm target for a sessionId (peerId). */
+  resolveAntigravitySwarmTarget(sessionId: string): {
+    sessionKey: string
+    brainDir?: string
+    conversationId?: string
+  } | null {
+    let sessionKey = this._sessionIdToKey.get(sessionId)
+    if (!sessionKey) {
+      const liveMatches: string[] = []
+      for (const s of this.sessions.values()) {
+        if (s.peerId === sessionId) {
+          liveMatches.push(s.sessionKey)
+        }
+      }
+      if (liveMatches.length > 1) return null
+      sessionKey = liveMatches[0]
+    }
+    if (!sessionKey) {
+      const suffix = `:${sessionId}`
+      const resumeMatches: string[] = []
+      for (const key of this._resumeMap.keys()) {
+        if (key.endsWith(suffix)) {
+          resumeMatches.push(key)
+        }
+      }
+      // B6 (OCV5-832 R2): Cold recovery without an active live binding MUST prove a unique
+      // agent sessionKey in `_resumeMap`. Multiple historical keys for the same peer are
+      // ambiguous and fail closed (`null` -> 404 SWARM_NOT_FOUND) rather than picking map order.
+      if (resumeMatches.length !== 1) return null
+      sessionKey = resumeMatches[0]
+    }
+    if (!sessionKey) return null
+    const live = this.sessions.get(sessionKey)
+    const runner = live?.runner as
+      | { getActiveSwarmTarget?: () => { brainDir: string; conversationId: string } | null }
+      | undefined
+    const activeTarget = runner?.getActiveSwarmTarget?.()
+    if (activeTarget) {
+      return { sessionKey, brainDir: activeTarget.brainDir, conversationId: activeTarget.conversationId }
+    }
+    const conversationId = live?.ccbSessionId ?? this._resumeMap.get(sessionKey)
+    return { sessionKey, ...(conversationId ? { conversationId } : {}) }
+  }
+
   /**
    * 由 server.ts 在 Gateway 构造器里调,把 _repoWorkspace.getRepoSnapshot 注入。
    * 必须在第一个 SubprocessRunner 创建之前调,否则首批 runner 会拿不到 snapshot。

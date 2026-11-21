@@ -164,6 +164,37 @@ export interface ProposedWrite {
   expiresAt: Date
 }
 
+export interface ConnectorWritePendingCreatedEvent {
+  id: string
+  userId: number
+  connectionId: string
+  provider: string
+  action: string
+  summary: string
+  createdAt: Date
+  expiresAt: Date
+}
+
+export type ConnectorWritePendingCreatedListener = (
+  evt: ConnectorWritePendingCreatedEvent,
+) => void | Promise<void>
+
+const connectorWritePendingCreatedListeners = new Set<ConnectorWritePendingCreatedListener>()
+
+/**
+ * Subscribe to newly created interactive `connector_write_ledger` confirmations
+ * (`status = 'pending'`, never `account_preapproval`). Used by pending-decisions
+ * bootstrap for proactive IM push notifications (OCV5-832 B3).
+ */
+export function onConnectorWritePendingCreated(
+  listener: ConnectorWritePendingCreatedListener,
+): () => void {
+  connectorWritePendingCreatedListeners.add(listener)
+  return () => {
+    connectorWritePendingCreatedListeners.delete(listener)
+  }
+}
+
 export async function proposeWrite(
   input: ProposeWriteInput,
   pool: Pool = getPool(),
@@ -248,7 +279,26 @@ export async function proposeWrite(
     )
     return r.rows[0]!.expires_at
   }, pool)
-  return { id, summary: input.summary.slice(0, 2000), expiresAt }
+  const summary = input.summary.slice(0, 2000)
+  if (
+    approval.source !== 'account_preapproval' &&
+    connectorWritePendingCreatedListeners.size > 0
+  ) {
+    const evt: ConnectorWritePendingCreatedEvent = {
+      id,
+      userId: input.userId,
+      connectionId: input.connectionId,
+      provider: input.provider,
+      action: input.action,
+      summary,
+      createdAt: new Date(),
+      expiresAt,
+    }
+    for (const listener of connectorWritePendingCreatedListeners) {
+      void Promise.resolve(listener(evt)).catch(() => {})
+    }
+  }
+  return { id, summary, expiresAt }
 }
 
 /**

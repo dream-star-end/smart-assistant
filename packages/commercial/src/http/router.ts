@@ -22,6 +22,7 @@ import {handleModelSwitchCost} from './modelSwitchCost.js'
 // x-trace-id alias). The WS bridge has its own connection trace flow.
 import { resolveRequestTrace } from './requestTrace.js'
 import { getClientSessionCollabParent } from '@openclaude/storage'
+import { SWARM_COMMAND_ROUTE_RE } from '@openclaude/gateway'
 import { incrGatewayRequest } from '../admin/metrics.js'
 import { handleCodexCommissioning } from './admin/codexCommissioning.js'
 import { handleAdminRemoteDriverV4 } from './admin/remoteDriverV4.js'
@@ -400,6 +401,18 @@ import {
 } from './util.js'
 import { handleWechatLivePage, handleWechatLiveSnapshot } from './wechatLive.js'
 import { dispatchGoalRoute } from './goalRoutes.js'
+import {
+  PENDING_DECISIONS_RESOLVE_RE,
+  handleListPendingDecisions,
+  handleResolvePendingDecision,
+} from './pendingDecisionsHandlers.js'
+import { dispatchResearchLibraryRoute } from '../research/libraryRoutes.js'
+import { authenticateActiveCommercialUser } from './activeUserAuth.js'
+import {
+  handleCommercialOfficePreview,
+  handleCommercialOfficePreviewPage,
+} from './containerOfficePreviewProxy.js'
+import { handleCommercialSwarmCommand } from './containerSwarmCommandProxy.js'
 
 /**
  * **P0 — v3 multi-tenant leak firewall** (2026-04-22)
@@ -814,16 +827,89 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'GET', path: '/api/me/api-keys/messages', handler: handleListMyApiKeyMessages },
     { method: 'DELETE', pathPrefix: '/api/me/api-keys/', handler: handleRevokeMyApiKey },
     { method: 'PATCH', pathPrefix: '/api/me/api-keys/', handler: handleUpdateMyApiKey },
-    // 用户文献库(research_documents 管理面):列表 / 上传入库(raw bytes) / 删单篇。
+    // 用户文献库(research_documents 管理面):列表 / 上传入库(raw bytes) / 批量导入 / Span 定位 / 删单篇。
     // GET 接受 ?projectId=(OC_RESEARCH_WORKSPACE 开时过滤;关时忽略)。
-    // 详见 handlers.ts 对应 handler 注释;数据逻辑在 research/library.ts。
+    // 详见 handlers.ts & research/libraryRoutes.ts 对应 handler 注释。
     { method: 'GET', path: '/api/me/research/library', handler: handleListResearchLibrary },
     { method: 'POST', path: '/api/me/research/library', handler: handleUploadResearchLibraryDoc },
+    {
+      method: 'POST',
+      path: '/api/me/research/library/import-ids',
+      handler: (req, res, _ctx, d) =>
+        dispatchResearchLibraryRoute(req, res, {
+          jwtSecret: d.jwtSecret,
+          authenticate: (r) =>
+            authenticateActiveCommercialUser(r, d.jwtSecret, {
+              pool: d.v3Supervisor?.pool,
+              verifyActiveAccount: d.verifyActiveAccount,
+            }),
+          ...d.researchLibraryRouteDeps,
+        }),
+    },
+    {
+      method: 'GET',
+      pathPrefix: '/api/me/research/library/',
+      handler: (req, res, _ctx, d) =>
+        dispatchResearchLibraryRoute(req, res, {
+          jwtSecret: d.jwtSecret,
+          authenticate: (r) =>
+            authenticateActiveCommercialUser(r, d.jwtSecret, {
+              pool: d.v3Supervisor?.pool,
+              verifyActiveAccount: d.verifyActiveAccount,
+            }),
+          ...d.researchLibraryRouteDeps,
+        }),
+    },
     {
       method: 'DELETE',
       pathPrefix: '/api/me/research/library/',
       handler: handleDeleteResearchLibraryDoc,
     },
+    // 统一「待拍板」收件箱 API(OCV5-827 / OCV5-832):聚合工具权限、连接器写确认、任务板 waiting_human、
+    // 与浏览器人工接管。统一走 Bearer / oc_session cookie + DB active account 复核(B2 fail-closed)。
+    {
+      method: 'GET',
+      path: '/api/me/pending-decisions',
+      handler: (req, res, _ctx, d) =>
+        handleListPendingDecisions(req, res, {
+          jwtSecret: d.jwtSecret,
+          service: d.pendingDecisionsService,
+          authenticate: (r) =>
+            authenticateActiveCommercialUser(r, d.jwtSecret, {
+              pool: d.v3Supervisor?.pool,
+              verifyActiveAccount: d.verifyActiveAccount,
+            }),
+        }),
+    },
+    {
+      method: 'POST',
+      pathPrefix: '/api/me/pending-decisions/',
+      handler: (req, res, _ctx, d) => {
+        const pathname = new URL(req.url ?? '/', 'http://x').pathname
+        const m = PENDING_DECISIONS_RESOLVE_RE.exec(pathname)
+        if (!m) throw new HttpError(404, 'NOT_FOUND', 'pending decision route not found')
+        return handleResolvePendingDecision(
+          req,
+          res,
+          {
+            jwtSecret: d.jwtSecret,
+            service: d.pendingDecisionsService,
+            authenticate: (r) =>
+              authenticateActiveCommercialUser(r, d.jwtSecret, {
+                pool: d.v3Supervisor?.pool,
+                verifyActiveAccount: d.verifyActiveAccount,
+              }),
+          },
+          m[1]!,
+        )
+      },
+    },
+    // Office 零轮次缓存预览(OCV5-828 / OCV5-832):按认证 uid 转发至用户容器 /internal/office-preview*，
+    // 页图经每租户句柄表鉴权隔离，绝不暴露宿主机文件系统路径。
+    { method: 'GET', path: '/api/file/office-preview', handler: handleCommercialOfficePreview },
+    { method: 'POST', path: '/api/file/office-preview', handler: handleCommercialOfficePreview },
+    { method: 'GET', path: '/api/file/office-preview/page', handler: handleCommercialOfficePreviewPage },
+    { method: 'GET', pathPrefix: '/api/file/office-preview/page/', handler: handleCommercialOfficePreviewPage },
     // ── 企业版(P3.1)org 成员管理面 ──
     // 全部转发到 dispatchOrgRoute:声明式路由表 + requireOrgRole 单一鉴权收口
     // (见 http/org/routes.ts)。org 由服务端从 caller membership 推导,不接受
@@ -1720,6 +1806,8 @@ export const COMMERCIAL_ROUTE_PREFIXES: readonly string[] = [
     // 实际 dispatch 由 pre-route adapter 处理(见下方 `CC 外接 endpoint` 块)。
     '/api/anthropic/',
     '/api/desktop',
+    // Office 零轮次缓存预览(精确覆盖 /api/file/office-preview 及 /page 子路径，不影响 /api/file)。
+    '/api/file/office-preview',
     // 切片②ⓐ:codex 修复回调命名空间(经 SSH 隧道 loopback 到达)。必须列此使 isOurs()=true,
     // 否则 commercialHandler 返回 false → fall through gateway 404。鉴权在 handler 内自理。
     SELFHEAL_REPAIRS_PREFIX,
@@ -1745,6 +1833,7 @@ export const COMMERCIAL_PRE_ROUTE_PATHS: readonly {
   { path: '/api/anthropic/v1/usage', kind: 'exact', requiresPrefix: true },
   { path: '/api/file', kind: 'prefix', requiresPrefix: false },
   { path: '/api/media/', kind: 'prefix', requiresPrefix: false },
+  { path: '/api/sessions/:id/swarm/command', kind: 'exact', requiresPrefix: false },
 ]
 
 export function sanitizeCommercialLogPath(pathname: string): string {
@@ -1795,7 +1884,9 @@ export function createCommercialHandler(
     //   - /api/auth/refresh   —— 不因短暂维护把所有在线用户强踢 token 过期
     //
     // 这里**先检查 isOurs**,把 "不关心的路径(如 /ws 、/healthz)" 留给下层。
-    const isOursForMaintenance = prefixes.some((p) => path === p || path.startsWith(p))
+    const isSwarmCommandPath = SWARM_COMMAND_ROUTE_RE.test(path)
+    const isOursForMaintenance =
+      prefixes.some((p) => path === p || path.startsWith(p)) || isSwarmCommandPath
     const isAllowlistForMaintenance =
       path.startsWith('/api/admin/') ||
       path === '/api/public/config' ||
@@ -1943,6 +2034,42 @@ export function createCommercialHandler(
         handleError(err, res, requestId, ccLog)
       }
       incrGatewayRequest('__cc_external__', method, res.statusCode)
+      return true
+    }
+
+    // ── Swarm 控制指令代理(OCV5-828 / OCV5-832)──────────────────────────
+    // POST /api/sessions/:id/swarm/command:预路由直发，不把 `/api/sessions/` 加进
+    // COMMERCIAL_ROUTE_PREFIXES(以免吞掉 gateway 负责的 /api/sessions/list 等路由)。
+    // handler 内强校验 JWT、session 归属并拒客户端 brainDir，转发至用户容器 /internal/swarm/command。
+    if (isSwarmCommandPath) {
+      setSecurityHeaders(res)
+      const requestId = ensureRequestId(req)
+      res.setHeader(REQUEST_ID_HEADER, requestId)
+      const { traceId, traceIdOrigin } = resolveRequestTrace(req.headers)
+      const swarmLog = httpLogger.child({
+        requestId,
+        route: '/api/sessions/:id/swarm/command',
+        method,
+        path: safeLogPath,
+        clientIp: clientIpOf(req),
+        traceId,
+        traceIdOrigin,
+      })
+      const swarmCtx: RequestContext = {
+        requestId,
+        clientIp: clientIpOf(req),
+        authBoundIp: req.socket.remoteAddress ?? 'unknown',
+        userAgent: userAgentOf(req),
+        log: swarmLog,
+      }
+      const startedAt = Date.now()
+      try {
+        await handleCommercialSwarmCommand(req, res, swarmCtx, deps)
+      } catch (err) {
+        handleError(err, res, requestId, swarmLog)
+      }
+      incrGatewayRequest('/api/sessions/:id/swarm/command', method, res.statusCode)
+      swarmLog.info('http_request', { status: res.statusCode, durationMs: Date.now() - startedAt })
       return true
     }
 

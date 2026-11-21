@@ -13,6 +13,7 @@ import {
   createAutoDreamOptimizerRuntime,
   createCommercialCodexAndWechatTurns,
 } from "./bootstrap/channelsAndAutoDreamBootstrap.js";
+import { createCommercialPendingDecisionsRuntime } from "./bootstrap/pendingDecisionsBootstrap.js";
 import {
   assembleV3SupervisorCore,
   bootstrapMailerBridgeAndAuthority,
@@ -1480,6 +1481,15 @@ export async function registerCommercial(
   const remoteDriverV4 = v4ExecutorDeps
     ? new RemoteDriverV4CommissioningService({ executorDeps: v4ExecutorDeps })
     : undefined;
+  const qqBotServiceRef: { current: QqBotService | undefined } = { current: undefined };
+  const pendingDecisionsRuntime = createCommercialPendingDecisionsRuntime({
+    pool: getPool(),
+    v3Supervisor: v3Deps,
+    bridgeSecret,
+    onControlAdmitted: (uid) => cronOriginBridgeRef?.drainControlsForUser?.(uid) ?? Promise.resolve(),
+    pushToWechat: (item) => wechatBrokerRef.current?.pushPendingDecision(item) ?? Promise.resolve(),
+    pushToQq: (item) => qqBotServiceRef.current?.pushPendingDecision(item) ?? Promise.resolve(),
+  });
   const handler = createCommercialHandler({
     codexCommissioning,
     remoteDriverV4,
@@ -1491,6 +1501,7 @@ export async function registerCommercial(
     museBridgeHttp,
     studio: studioHttp,
     goalStateService,
+    pendingDecisionsService: pendingDecisionsRuntime.service,
     containerPreviewTickets,
     containerPreviewAvailable: () => containerPreviewBridge !== undefined,
     directContainerPreview,
@@ -1810,8 +1821,10 @@ export async function registerCommercial(
       userMediaResolver,
       ensureContainerEndpointReady,
       pushRemoteHostUpload,
+      remoteControl: pendingDecisionsRuntime.qqRemoteControl,
     });
     qqBotService = qqBuilt.qqBotService;
+    qqBotServiceRef.current = qqBotService;
     qqOutboundRef.current = qqBuilt.qqOutbound;
     qqProactiveRef.current = qqBuilt.qqProactive;
     leaderBundle.add({
@@ -1840,6 +1853,7 @@ export async function registerCommercial(
       userMediaResolver,
       pushRemoteHostUpload,
       wechatLiveLinkKey,
+      remoteControl: pendingDecisionsRuntime.wechatRemoteControl,
     });
     wechatProactiveRef.current = wechatProactive;
     wechatBroker = trackScheduler("wechatBroker", "shared", makeWechatBroker(brokerConfig));

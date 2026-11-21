@@ -64,6 +64,7 @@ import { bindRouteTrace } from '../relayTrace.js'
 import {
   ANTIGRAVITY_PREAMBLE,
   antigravityRoot,
+  antigravitySessionBrainDir,
   cleanupAntigravityLaunch,
   projectAntigravityPlatform,
   type AntigravityPlatformProjection,
@@ -412,6 +413,19 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
 
   setAntigravityRoute(route: AntigravityRouteOverride | null | undefined): void {
     this.route = route ? { ...route } : null
+  }
+
+  /** Authoritative container-side swarm target for this Antigravity session (never client-supplied). */
+  getActiveSwarmTarget(): { brainDir: string; conversationId: string } | null {
+    const convId =
+      this.active?.conversationId ??
+      this.active?.requestedConversationId ??
+      this.nativeId
+    if (!convId || !CONVERSATION_ID_RE.test(convId)) return null
+    const brainDir =
+      this.active?.projection?.sessionBrainDir ??
+      antigravitySessionBrainDir(antigravityRoot(), this.opts.sessionKey)
+    return { brainDir, conversationId: convId }
   }
 
   submitTurn(params: TurnParams): EngineTurnRun {

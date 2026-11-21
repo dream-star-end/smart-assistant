@@ -32,7 +32,7 @@ export interface ImSessionSummary {
 export interface ImSessionController {
   listSessions: (userId: string, limit?: number) => Promise<ImSessionSummary[]>
   getCurrentSessionId: (userId: string) => Promise<string | null>
-  switchSession: (userId: string, sessionId: string, agentId?: string) => Promise<void>
+  switchSession: (userId: string, sessionId: string, agentId?: string) => Promise<void | boolean>
 }
 
 export type ParsedImRemoteCommand =
@@ -129,10 +129,26 @@ export interface ImRemoteControlHandler {
   readonly shortCodes: ShortCodeRegistry
 }
 
+export class ImSessionSwitchError extends Error {
+  constructor(
+    readonly code: 'UNSUPPORTED_SESSION' | 'SESSION_NOT_FOUND' | 'POINTER_CONFLICT',
+    message: string,
+  ) {
+    super(message)
+    this.name = 'ImSessionSwitchError'
+  }
+}
+
 export interface ImRemoteControlDeps {
   pendingDecisions?: PendingDecisionsService
   shortCodes?: ShortCodeRegistry
   sessions?: ImSessionController
+  /**
+   * B2 (OCV5-832): Fail-closed commercial account active check before executing any
+   * high-privilege IM remote-control command (/pending, /approve, /deny, /sessions, /switch).
+   * Returns true iff account is active; returning false or throwing blocks the command.
+   */
+  verifyAccountActive?: (userId: string) => Promise<boolean>
   now?: () => number
   maxPendingList?: number
   maxSessionsList?: number
@@ -189,12 +205,33 @@ export function createImRemoteControlHandler(deps: ImRemoteControlDeps): ImRemot
       const uid = userId.trim()
       const label = channelName ?? 'IM'
 
+      // B2 (OCV5-832): Verify active commercial account (fail-closed on inactive or DB error)
+      // before executing ANY remote-control read/write command.
+      if (deps.verifyAccountActive) {
+        let active: boolean
+        try {
+          active = await deps.verifyAccountActive(uid)
+        } catch {
+          return '账号状态校验暂时不可用，已拒绝本次远程操作，请稍后重试。'
+        }
+        if (!active) {
+          return '当前账号状态不可用（已停用或封禁），无法执行远程审批或会话切换指令。'
+        }
+      }
+
       if (parsed.kind === 'pending') {
         if (!deps.pendingDecisions) {
           return `当前${label}暂未启用待拍板查询服务，请稍后重试。`
         }
         const list = await deps.pendingDecisions.list(uid, { limit: maxPendingList })
+        const unavailableSources = (list.warnings ?? []).map(
+          (w) => PENDING_DECISION_SOURCE_LABELS[w.source] ?? w.source,
+        )
+        const uniqueUnavailable = [...new Set(unavailableSources)]
         if (list.items.length === 0) {
+          if (uniqueUnavailable.length > 0) {
+            return `暂未查到待拍板事项，但以下来源当前休眠或不可用（未计入本次统计）：${uniqueUnavailable.join('、')}。\n请唤醒工作区或在网页端确认后，再发送 /pending 重试。`
+          }
           return '当前没有待拍板事项。'
         }
         const nowMs = now()
@@ -206,6 +243,12 @@ export function createImRemoteControlHandler(deps: ImRemoteControlDeps): ImRemot
           const srcLabel = PENDING_DECISION_SOURCE_LABELS[item.source]
           lines.push(
             `${i + 1}. [${sc.code}] ${riskBadge(item.riskLevel)} ${srcLabel} · ${item.title}\n   ${item.summary.slice(0, 120)}（${formatExpiryRemaining(item.expiresAt, nowMs)}）`,
+          )
+        }
+        if (uniqueUnavailable.length > 0) {
+          lines.push('')
+          lines.push(
+            `⚠️ 注意：以下来源当前休眠或不可用（未计入本列表）：${uniqueUnavailable.join('、')}。`,
           )
         }
         lines.push('')
@@ -310,10 +353,24 @@ export function createImRemoteControlHandler(deps: ImRemoteControlDeps): ImRemot
         }
 
         if (!targetSession) {
-          return `未找到会话编号「${parsed.target}」，当前共有 ${sessions.length} 个会话。\n请发送 /sessions 查看列表。`
+          return `未找到可切换的会话「${parsed.target}」，当前共有 ${sessions.length} 个可续接会话。\n请发送 /sessions 查看列表（仅支持切换本渠道可续接的会话）。`
         }
 
-        await deps.sessions.switchSession(uid, targetSession.sessionId, targetSession.agentId)
+        try {
+          const switched = await deps.sessions.switchSession(
+            uid,
+            targetSession.sessionId,
+            targetSession.agentId,
+          )
+          if (switched === false) {
+            return `无法切换到会话「${targetSession.sessionId}」：会话指针未被更新，本次切换未生效。\n请发送 /sessions 查看当前可续接会话后重试。`
+          }
+        } catch (err) {
+          if (err instanceof ImSessionSwitchError) {
+            return `无法切换到会话「${targetSession.sessionId}」：${err.message}\n请发送 /sessions 查看当前可续接会话。`
+          }
+          throw err
+        }
         return `已切换到会话：${targetSession.title || targetSession.sessionId}\n会话ID：${targetSession.sessionId}\n下一条${label}消息将继续该会话上下文。`
       }
 

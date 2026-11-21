@@ -25,7 +25,7 @@ import {
 } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import path from "node:path";
-import { requireAuth } from "./auth.js";
+import { requireAuth, type AuthedUser } from "./auth.js";
 import { HttpError, readJsonBody, sendJson, setSecurityHeaders } from "./util.js";
 
 export const OFFICE_PREVIEW_PATH = "/api/file/office-preview";
@@ -173,6 +173,8 @@ const defaultHandleRegistry = new OfficePreviewHandleRegistry();
 
 export interface OfficePreviewRouteDeps {
   jwtSecret: string | Uint8Array;
+  /** Optional custom authenticator (e.g. cookie-or-bearer); defaults to Bearer `requireAuth`. */
+  authenticate?: (req: IncomingMessage) => Promise<AuthedUser>;
   /** 基础缓存目录(运行时自动按认证 uid 隔离到 `<cacheDir>/u-<uid>`)。 */
   cacheDir?: string;
   /** 可选自定义句柄注册表(测试隔离用)。 */
@@ -320,7 +322,7 @@ export async function handleOfficePreview(
   _ctx: unknown,
   deps: OfficePreviewRouteDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret);
+  const user = await (deps.authenticate ? deps.authenticate(req) : requireAuth(req, deps.jwtSecret));
   if (!deps.previewImpl) {
     throw new HttpError(503, "OFFICE_PREVIEW_UNAVAILABLE", "office preview service unavailable");
   }
@@ -452,7 +454,7 @@ export async function handleOfficePreviewPageImage(
   if (req.method && req.method !== "GET") {
     throw new HttpError(405, "METHOD_NOT_ALLOWED", "GET required");
   }
-  const user = await requireAuth(req, deps.jwtSecret);
+  const user = await (deps.authenticate ? deps.authenticate(req) : requireAuth(req, deps.jwtSecret));
   const { handle, pageIndex } = parsePageRequest(req.url);
   const registry = deps.handleRegistry ?? defaultHandleRegistry;
   const resolved = registry.resolveForUser(user.id, handle, pageIndex);
