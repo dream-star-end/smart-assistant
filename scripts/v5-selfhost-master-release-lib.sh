@@ -1518,6 +1518,38 @@ build_master_release() {
       return 1
     fi
   }
+  master_job_codex_chatgpt_ws() {
+    mlog "  codex-chatgpt-ws proof @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+        npx --no-install tsx scripts/check-v5-codex-chatgpt-ws.ts ); then
+      mlog "pinned imported codex-chatgpt-ws proof failed"
+      return 1
+    fi
+  }
+  master_job_platform_tool_proofs() {
+    mlog "  ocv5-376 platform tool proofs @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+        npx --no-install tsx scripts/check-v5-ocv5-376-platform-tool-proofs.ts ); then
+      mlog "pinned imported ocv5-376-platform-tool-proofs proof failed"
+      return 1
+    fi
+  }
+  master_job_terminal_unproven() {
+    mlog "  box terminal unproven probe proof @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+        npx --no-install tsx scripts/check-v5-box-terminal-unproven-probe.ts ); then
+      mlog "pinned imported box-terminal-unproven-probe proof failed"
+      return 1
+    fi
+  }
+  master_job_upload_retention() {
+    mlog "  upload retention HTTP responsiveness proof @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+        npx --no-install tsx scripts/check-v5-upload-retention-proof.ts ); then
+      mlog "pinned upload retention HTTP responsiveness proof failed"
+      return 1
+    fi
+  }
   # OCV5-545(第三阶段 P0b 列车步骤):架构护栏在 pinned staging 跑报告期,计数写进 summary.json。
   # 报告期不拦新增违规(和 PR CI 的 architecture job 一致);检查器 fail-closed(解析失败、modules.json
   # 或基线不合法,退出 2)照样让列车失败。转强制期时这里改 --enforce。
@@ -1627,6 +1659,10 @@ build_master_release() {
     C.system-executor:master_job_system_executor:system-executor-fencing \
     C.host-log-policy:master_job_host_log_policy \
     C.model-policy:master_job_model_policy \
+    C.codex-chatgpt-ws:master_job_codex_chatgpt_ws \
+    C.platform-tool-proofs:master_job_platform_tool_proofs \
+    C.terminal-unproven:master_job_terminal_unproven \
+    C.upload-retention:master_job_upload_retention \
     C.architecture:master_job_architecture \
   ; do
     IFS=: read -r job_id job_fn gate_id <<<"$job"
@@ -1756,6 +1792,7 @@ build_master_release() {
   fi
   # OCV5-763: reverse-imported commercial incidents need actual selfhost runners.
   # Existing train-isolated test DB only; no production credentials or model invocation.
+  tsum_mark C.master-incident-proofs 2>/dev/null || :
   if ! master_local_gate_has master-incident-proofs "$full_sha"; then
     master_ensure_box_host_idle
     master_ensure_gate_db
@@ -1767,43 +1804,7 @@ build_master_release() {
     fi
     master_local_gate_record master-incident-proofs "$full_sha"
   fi
-  if ! master_local_gate_has codex-chatgpt-ws "$full_sha"; then
-    master_ensure_box_host_idle
-    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
-        npx --no-install tsx scripts/check-v5-codex-chatgpt-ws.ts ); then
-      cleanup_master_staging
-      die "pinned imported codex-chatgpt-ws proof failed"
-    fi
-    master_local_gate_record codex-chatgpt-ws "$full_sha"
-  fi
-  if ! master_local_gate_has platform-tool-proofs "$full_sha"; then
-    master_ensure_box_host_idle
-    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
-        npx --no-install tsx scripts/check-v5-ocv5-376-platform-tool-proofs.ts ); then
-      cleanup_master_staging
-      die "pinned imported ocv5-376-platform-tool-proofs proof failed"
-    fi
-    master_local_gate_record platform-tool-proofs "$full_sha"
-  fi
-  if ! master_local_gate_has terminal-unproven "$full_sha"; then
-    master_ensure_box_host_idle
-    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
-        npx --no-install tsx scripts/check-v5-box-terminal-unproven-probe.ts ); then
-      cleanup_master_staging
-      die "pinned imported box-terminal-unproven-probe proof failed"
-    fi
-    master_local_gate_record terminal-unproven "$full_sha"
-  fi
   master_gate_db_drop
-  if ! master_local_gate_has upload-retention-http "$full_sha"; then
-    mlog "  upload retention HTTP responsiveness proof @ pinned staging"
-    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
-        npx --no-install tsx scripts/check-v5-upload-retention-proof.ts ); then
-      cleanup_master_staging
-      die "pinned upload retention HTTP responsiveness proof failed"
-    fi
-    master_local_gate_record upload-retention-http "$full_sha"
-  fi
   tsum_mark C.ccb-mcp 2>/dev/null || :
   if ! master_local_gate_has ccb-mcp-availability "$full_sha"; then
     mlog "  CCB MCP availability contract gate @ pinned staging"
@@ -1818,6 +1819,7 @@ build_master_release() {
     master_local_gate_record ccb-mcp-availability "$full_sha"
   fi
   # Before sealing: fresh same-candidate CCB and real late stop proof; no production DB.
+  tsum_mark C.codex-late-stop 2>/dev/null || :
   if ! master_local_gate_has codex-late-stop-closure "$full_sha"; then
     if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/check-v5-codex-late-stop-proof.sh ); then
       cleanup_master_staging

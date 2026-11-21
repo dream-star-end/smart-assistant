@@ -62,12 +62,15 @@ WATCH_REARM_INTERVAL_SEC="${WATCH_REARM_INTERVAL_SEC:-5}"
 # OCV5-410:告警脚本。显式 WATCH_ALERT_BIN,或安装目录里有可执行 alert.sh 才调用;
 # 仓库里跑的看护测试没有 alert.sh,不会去写宿主状态目录。
 WATCH_ALERT_BIN="${WATCH_ALERT_BIN:-}"
-# OCV5-444:宿主卫生检查(根盘剩余空间、PG 备份新鲜度)。只告警,不改健康判定、失败计数或退出码。
+# OCV5-444/OCV5-823:宿主卫生检查(根盘剩余空间、PG 核心/全备新鲜度与 over_cap 探针)。只告警,不改健康判定、失败计数或退出码。
 WATCH_DISK_PATH="${WATCH_DISK_PATH:-/}"
 WATCH_DISK_WARN_GIB="${WATCH_DISK_WARN_GIB:-15}"
 WATCH_DISK_CRIT_GIB="${WATCH_DISK_CRIT_GIB:-10}"
+WATCH_PG_BACKUP_PROBE_ENABLED="${WATCH_PG_BACKUP_PROBE_ENABLED:-1}"
 WATCH_PG_BACKUP_STATUS="${WATCH_PG_BACKUP_STATUS:-/var/lib/openclaude-v5-selfhost/pg-backup-status.json}"
 WATCH_PG_BACKUP_MAX_AGE_SEC="${WATCH_PG_BACKUP_MAX_AGE_SEC:-129600}"
+WATCH_PG_FULL_BACKUP_MAX_AGE_SEC="${WATCH_PG_FULL_BACKUP_MAX_AGE_SEC:-864000}"
+WATCH_PG_BACKUP_ALERT_OVER_CAP="${WATCH_PG_BACKUP_ALERT_OVER_CAP:-1}"
 WATCH_AUTOSAVE_STATUS="${WATCH_AUTOSAVE_STATUS:-/var/lib/openclaude-v5-selfhost/harness-autosave-status.json}"
 WATCH_AUTOSAVE_MAX_STALE_SEC="${WATCH_AUTOSAVE_MAX_STALE_SEC:-7200}"
 WATCH_STUB_DISK_AVAIL_BYTES="${WATCH_STUB_DISK_AVAIL_BYTES:-}"
@@ -1996,8 +1999,128 @@ host_autosave_check() {
   host_notify harness_autosave "$level" warning harness_autosave_unhealthy "$msg"
 }
 
+# OCV5-823: PG 备份健康探针（core/full 新鲜度 + skipped_over_cap/aborted_over_cap 异常告警）。
+# 纯只读告警，绝不改健康判定、失败计数或 watch 退出码。可通过 WATCH_PG_BACKUP_PROBE_ENABLED=0 关闭。
+host_pg_backup_check() {
+  case "${WATCH_PG_BACKUP_PROBE_ENABLED:-1}" in
+    0|false|no|off) return 0 ;;
+  esac
+  local f="$WATCH_PG_BACKUP_STATUS"
+  [[ -f "$f" && ! -L "$f" ]] || return 0
+
+  if ! jq -e 'type == "object"' "$f" >/dev/null 2>&1; then
+    host_notify pg_backup stale warning pg_backup_stale \
+      "个人版 PG 备份状态文件不可解析（${f}）。下一步：/opt/openclaude/openclaude-v5-selfhost-live/scripts/v5-selfhost-pg-backup.sh status；journalctl -u openclaude-v5-selfhost-pg-backup.service。"
+    return 0
+  fi
+
+  local now max_core_age max_full_age alert_over_cap=1
+  now="$(watch_now)"
+  max_core_age="${WATCH_PG_BACKUP_MAX_AGE_SEC:-129600}"
+  [[ "$max_core_age" =~ ^[0-9]+$ ]] || max_core_age=129600
+  max_full_age="${WATCH_PG_FULL_BACKUP_MAX_AGE_SEC:-864000}"
+  [[ "$max_full_age" =~ ^[0-9]+$ ]] || max_full_age=864000
+  case "${WATCH_PG_BACKUP_ALERT_OVER_CAP:-1}" in
+    0|false|no|off) alert_over_cap=0 ;;
+  esac
+
+  # 1) core 层新鲜度 + 异常
+  local age core_result core_level core_sev core_event desc
+  core_result="$(jq -r '.core.result // empty' "$f" 2>/dev/null || true)"
+  age="$(host_backup_age || true)"
+  if [[ -n "$age" ]]; then
+    core_level=ok
+    core_sev=warning
+    core_event=pg_backup_stale
+    if [[ "$age" == never ]]; then
+      core_level=stale
+      desc="从未成功"
+    else
+      (( age < 0 )) && age=0
+      desc="$(( age / 3600 )) 小时前"
+      (( age > max_core_age )) && core_level=stale
+    fi
+    if (( alert_over_cap )) && [[ "$core_result" == skipped_over_cap || "$core_result" == aborted_over_cap ]]; then
+      if [[ "$core_level" == stale ]]; then
+        core_level=over_cap_stale
+        core_sev=critical
+      else
+        core_level=over_cap
+        core_sev=warning
+      fi
+      core_event=pg_backup_over_cap
+    fi
+    host_notify pg_backup "$core_level" "$core_sev" "$core_event" \
+      "个人版 PG 备份 core 层最近成功：${desc}（result=${core_result:-unknown}，上限 $(( max_core_age / 3600 )) 小时）。下一步：/opt/openclaude/openclaude-v5-selfhost-live/scripts/v5-selfhost-pg-backup.sh status；journalctl -u openclaude-v5-selfhost-pg-backup.service。"
+  fi
+
+  # 2) full 全备层新鲜度 + skipped_over_cap / aborted_over_cap 异常（未配置/缺失则静默跳过）
+  if jq -e '.full | type == "object"' "$f" >/dev/null 2>&1; then
+    local full_result full_last_ok full_at full_compress full_epoch="" full_age=0 full_stale=0 full_over_cap=0
+    local full_level=ok full_sev=info full_event=pg_backup_full full_desc="" full_msg=""
+    full_result="$(jq -r '.full.result // empty' "$f" 2>/dev/null || true)"
+    if [[ "$full_result" != unconfigured ]]; then
+      full_last_ok="$(jq -r '.full.lastOkAt // empty' "$f" 2>/dev/null || true)"
+      full_at="$(jq -r '.full.at // empty' "$f" 2>/dev/null || true)"
+      full_compress="$(jq -r '.full.compress // empty' "$f" 2>/dev/null || true)"
+      if [[ -n "$full_last_ok" ]]; then
+        full_epoch="$(date -u -d "$full_last_ok" +%s 2>/dev/null || true)"
+      fi
+      if [[ "$full_epoch" =~ ^[0-9]+$ ]]; then
+        full_age=$(( now - full_epoch ))
+        (( full_age < 0 )) && full_age=0
+        full_desc="$(( full_age / 86400 )) 天前（$(( full_age / 3600 )) 小时）"
+        (( full_age > max_full_age )) && full_stale=1
+      else
+        full_stale=1
+        full_desc="从未成功"
+      fi
+      if (( alert_over_cap )) && [[ "$full_result" == skipped_over_cap || "$full_result" == aborted_over_cap ]]; then
+        full_over_cap=1
+      fi
+      if (( full_over_cap && full_stale )); then
+        full_level=over_cap_stale
+        full_sev=critical
+        full_event=pg_backup_full_over_cap
+      elif (( full_over_cap )); then
+        full_level=over_cap
+        full_sev=warning
+        full_event=pg_backup_full_over_cap
+      elif (( full_stale )); then
+        full_level=stale
+        full_sev=warning
+        full_event=pg_backup_full_stale
+      elif [[ "$full_result" == failed || "$full_result" == sink_missing ]]; then
+        full_level=failed
+        full_sev=warning
+        full_event=pg_backup_full_failed
+      fi
+      full_msg="个人版 PG 全备 full 层状态：result=${full_result:-unknown}，最近成功：${full_desc}（上限 $(( max_full_age / 86400 )) 天 / $(( max_full_age / 3600 )) 小时${full_at:+，最近尝试=${full_at}}${full_compress:+，compress=${full_compress}}）。下一步：/opt/openclaude/openclaude-v5-selfhost-live/scripts/v5-selfhost-pg-backup.sh status；检查 R2 桶配额与 V5SB_FULL_COMPRESS。"
+      host_notify pg_backup_full "$full_level" "$full_sev" "$full_event" "$full_msg"
+    fi
+  fi
+
+  # 3) coreOffsite 异地核心备份异常探针
+  if jq -e '.coreOffsite | type == "object"' "$f" >/dev/null 2>&1; then
+    local offsite_result offsite_last_ok
+    offsite_result="$(jq -r '.coreOffsite.result // empty' "$f" 2>/dev/null || true)"
+    offsite_last_ok="$(jq -r '.coreOffsite.lastOkAt // empty' "$f" 2>/dev/null || true)"
+    if (( alert_over_cap )) && [[ "$offsite_result" == skipped_over_cap || "$offsite_result" == aborted_over_cap ]]; then
+      host_notify pg_backup_offsite over_cap warning pg_backup_offsite_over_cap \
+        "个人版 PG 备份 coreOffsite 触发容量上限：result=${offsite_result}（lastOkAt=${offsite_last_ok:-never}）。下一步：检查 R2 桶配额与旧对象，/opt/openclaude/openclaude-v5-selfhost-live/scripts/v5-selfhost-pg-backup.sh status。"
+    elif [[ "$offsite_result" == failed ]]; then
+      host_notify pg_backup_offsite failed warning pg_backup_offsite_failed \
+        "个人版 PG 备份 coreOffsite 上传失败：result=${offsite_result}（lastOkAt=${offsite_last_ok:-never}）。下一步：/opt/openclaude/openclaude-v5-selfhost-live/scripts/v5-selfhost-pg-backup.sh status；journalctl -u openclaude-v5-selfhost-pg-backup.service。"
+    elif [[ "$offsite_result" == ok || "$offsite_result" == ok_usage_warn ]]; then
+      host_notify pg_backup_offsite ok info pg_backup_offsite \
+        "个人版 PG 备份 coreOffsite 状态正常（result=${offsite_result}，lastOkAt=${offsite_last_ok:-unknown}）。"
+    fi
+  fi
+  return 0
+}
+
 host_checks() {
-  local gib=1073741824 avail level sev age desc
+  local gib=1073741824 avail level sev
   avail="$(host_disk_avail_bytes || true)"
   if [[ "$avail" =~ ^[0-9]+$ ]]; then
     level=ok
@@ -2011,18 +2134,7 @@ host_checks() {
     fi
     host_notify disk "$level" "$sev" disk_low "根盘 ${WATCH_DISK_PATH} 剩余 $(( avail / gib )) GiB（warning <${WATCH_DISK_WARN_GIB}、critical <${WATCH_DISK_CRIT_GIB} GiB；发布门要 8 GiB）。下一步：du -xsh /opt/openclaude/tmp /var/lib/docker/volumes/* /var/backups/* 找增长源；只清自己建的 worktree 与临时文件。"
   fi
-  age="$(host_backup_age || true)"
-  if [[ -n "$age" ]]; then
-    level=ok
-    if [[ "$age" == never ]]; then
-      level=stale
-      desc="从未成功"
-    else
-      desc="$(( age / 3600 )) 小时前"
-      (( age > WATCH_PG_BACKUP_MAX_AGE_SEC )) && level=stale
-    fi
-    host_notify pg_backup "$level" warning pg_backup_stale "个人版 PG 备份 core 层最近成功：${desc}（上限 $(( WATCH_PG_BACKUP_MAX_AGE_SEC / 3600 )) 小时）。下一步：/opt/openclaude/openclaude-v5-selfhost-live/scripts/v5-selfhost-pg-backup.sh status；journalctl -u openclaude-v5-selfhost-pg-backup.service。"
-  fi
+  host_pg_backup_check || true
   host_autosave_check || true
   return 0
 }

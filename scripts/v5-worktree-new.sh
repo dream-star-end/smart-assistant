@@ -10,6 +10,7 @@ CANONICAL="${OC_V5_CANONICAL:-/opt/openclaude/openclaude-v5-aurora}"
 BASE_DIR="${OC_V5_WORKTREE_BASE_DIR:-/opt/openclaude}"
 CACHE_ROOT="${OC_V5_WORKTREE_CACHE:-/var/cache/openclaude-v5/worktree}"
 DEFAULT_BASE="${OC_V5_WORKTREE_BASE_BRANCH:-feat/v5-aurora-rewrite}"
+REGISTRY_FILE="${OC_V5_WORKTREE_REGISTRY:-}"
 STAMP_NAME=".v5-worktree-cache.json"
 
 usage() {
@@ -20,6 +21,7 @@ Usage:
   scripts/v5-worktree-new.sh --heal <worktree-path>
   scripts/v5-worktree-new.sh --self-check <worktree-path>
   scripts/v5-worktree-new.sh --report
+  scripts/v5-worktree-new.sh --gc-stale [--days 14] [--dry-run] [--apply]
   scripts/v5-worktree-new.sh --self-test-share
 
 Options:
@@ -32,11 +34,20 @@ Options:
   --heal PATH           拆整棵 donor 软链、把 @openclaude/* 自指回本树
   --self-check PATH     只跑工作区自指断言(不改树)
   --report              列出重复 node_modules 磁盘占用;绝不删除
+  --gc-stale            安全扫描并清理过期、干净且已推送的旧 worktree(默认 --dry-run)
+  --days N              --gc-stale 过期天数阈值(默认 14)
+  --dry-run             --gc-stale 仅列出候选项与预计回收字节数,不删除(默认)
+  --apply               --gc-stale 实际删除候选项并同步清理 worktrees-registry.json
+  --registry PATH       worktrees-registry.json 路径(默认 <base-dir>/worktrees-registry.json)
+  --protected-branch B  --gc-stale 额外保护分支(可多次传入)
+  --protected-name N    --gc-stale 额外保护目录名(可多次传入)
+  --json                --gc-stale 输出机器可读 JSON
   --self-test-share     在临时目录实测第三方共享 + 工作区自指
 
 环境:
   OC_V5_CANONICAL  OC_V5_WORKTREE_BASE_DIR  OC_V5_WORKTREE_CACHE
-  OC_V5_WORKTREE_BASE_BRANCH
+  OC_V5_WORKTREE_BASE_BRANCH  OC_V5_WORKTREE_REGISTRY
+  OC_V5_GC_PROTECTED_BRANCHES  OC_V5_GC_PROTECTED_NAMES
 EOF
 }
 
@@ -477,6 +488,480 @@ self_test_share() {
   echo "✓ self-test-share 完成(临时目录已清)"
 }
 
+gc_stale_worktrees() {
+  local base_dir="$1" donor="$2" days="$3" apply_mode="$4" registry="$5" json_out="$6"
+  local extra_branches="$7" extra_names="$8"
+  [[ -d "$base_dir" && ! -L "$base_dir" ]] || die "base-dir 不是真实目录:$base_dir"
+  [[ "$days" =~ ^[0-9]+$ ]] || die "--days 必须是非负整数:$days"
+  need_tool git
+  need_tool python3
+  if [[ -z "$registry" ]]; then
+    registry="$base_dir/worktrees-registry.json"
+  fi
+  python3 - "$base_dir" "$donor" "$CANONICAL" "$DEFAULT_BASE" "$days" "$apply_mode" "$registry" "$json_out" "$extra_branches" "$extra_names" "$STAMP_NAME" <<'PY'
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+(
+    raw_base,
+    raw_donor,
+    raw_canonical,
+    default_base,
+    raw_days,
+    raw_apply,
+    raw_registry,
+    raw_json,
+    raw_extra_branches,
+    raw_extra_names,
+    stamp_name,
+) = sys.argv[1:12]
+
+days = int(raw_days)
+apply_mode = raw_apply == "1"
+json_out = raw_json == "1"
+now_override = os.environ.get("OC_V5_GC_NOW_EPOCH", "").strip()
+now_epoch = int(now_override) if now_override.isdigit() else int(time.time())
+cutoff_epoch = now_epoch - days * 86400
+
+base_dir = Path(raw_base).resolve()
+cwd_real = Path(os.getcwd()).resolve()
+registry_path = Path(raw_registry)
+
+WHITELIST_NAMES = {
+    "sessions",
+    ".git",
+    "tmp",
+    ".cache",
+    "v5-selfhost-watch",
+    "v5-selfhost-breakglass",
+}
+WHITELIST_SUFFIXES = ("-live", "-releases")
+
+protected_names = set(WHITELIST_NAMES)
+for raw in (os.environ.get("OC_V5_GC_PROTECTED_NAMES", ""), raw_extra_names):
+    for tok in raw.replace(",", " ").split():
+        if tok:
+            protected_names.add(tok)
+
+protected_branches = {
+    "main",
+    "master",
+    "dev",
+    "develop",
+    "feat/v5-selfhost",
+    "feat/v5-aurora-rewrite",
+}
+if default_base:
+    protected_branches.add(default_base)
+for raw in (os.environ.get("OC_V5_GC_PROTECTED_BRANCHES", ""), raw_extra_branches):
+    for tok in raw.replace(",", " ").split():
+        if tok:
+            protected_branches.add(tok)
+
+protected_realpaths: set[Path] = set()
+
+
+def run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+
+def register_main_repo(raw_path: str) -> None:
+    if not raw_path:
+        return
+    p = Path(raw_path)
+    if not p.exists():
+        return
+    rp = p.resolve()
+    protected_realpaths.add(rp)
+    if (rp / ".git").exists():
+        br = run_git(rp, "symbolic-ref", "--quiet", "--short", "HEAD")
+        if br.returncode == 0 and br.stdout.strip():
+            protected_branches.add(br.stdout.strip())
+        wt_list = run_git(rp, "worktree", "list", "--porcelain")
+        if wt_list.returncode == 0:
+            for line in wt_list.stdout.splitlines():
+                if line.startswith("worktree "):
+                    first = Path(line.split(" ", 1)[1].strip())
+                    if first.exists():
+                        protected_realpaths.add(first.resolve())
+                    break
+
+
+register_main_repo(raw_donor)
+register_main_repo(raw_canonical)
+
+
+def parse_iso_epoch(raw: object) -> int | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    s = raw.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except ValueError:
+        return None
+
+
+registry_doc: dict | None = None
+registry_by_real: dict[Path, tuple[str, dict]] = {}
+if registry_path.exists() and not registry_path.is_symlink() and registry_path.is_file():
+    try:
+        loaded = json.loads(registry_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict) and isinstance(loaded.get("worktrees"), dict):
+            registry_doc = loaded
+            for k, v in loaded["worktrees"].items():
+                if isinstance(k, str) and isinstance(v, dict):
+                    try:
+                        registry_by_real[Path(k).resolve()] = (k, v)
+                    except OSError:
+                        pass
+    except Exception:
+        registry_doc = None
+
+
+def dir_size_bytes(root: Path) -> int:
+    total = 0
+    seen_inodes: set[tuple[int, int]] = set()
+    stack = [root]
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for entry in it:
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISLNK(st.st_mode):
+                        continue
+                    key = (st.st_dev, st.st_ino)
+                    if stat.S_ISDIR(st.st_mode):
+                        stack.append(Path(entry.path))
+                    elif stat.S_ISREG(st.st_mode):
+                        if key not in seen_inodes:
+                            seen_inodes.add(key)
+                            total += st.st_size
+        except OSError:
+            continue
+    return total
+
+
+def is_ancestor_or_same(candidate: Path, target: Path) -> bool:
+    return candidate == target or candidate in target.parents
+
+
+def inspect_entry(entry: Path) -> dict[str, object]:
+    name = entry.name
+    real = entry.resolve()
+    reg_info = registry_by_real.get(real)
+    reg_meta = reg_info[1] if reg_info else {}
+    rec: dict[str, object] = {
+        "path": str(entry),
+        "realpath": str(real),
+        "name": name,
+        "branch": "",
+        "ageDays": None,
+        "bytes": 0,
+        "eligible": False,
+        "reason": "",
+    }
+    if entry.is_symlink() or not entry.is_dir():
+        rec["reason"] = "not-a-directory"
+        return rec
+    if real.parent != base_dir:
+        rec["reason"] = "outside-base-dir"
+        return rec
+    if name in protected_names or any(name.endswith(sfx) for sfx in WHITELIST_SUFFIXES):
+        rec["reason"] = "whitelisted-name"
+        return rec
+    if real in protected_realpaths:
+        rec["reason"] = "main-repository"
+        return rec
+    if is_ancestor_or_same(real, cwd_real):
+        rec["reason"] = "current-working-directory"
+        return rec
+
+    dot_git = entry / ".git"
+    if dot_git.is_dir() and not dot_git.is_symlink():
+        rec["reason"] = "main-repository"
+        return rec
+    if not dot_git.is_file() or dot_git.is_symlink():
+        rec["reason"] = "not-a-worktree"
+        return rec
+
+    inside = run_git(entry, "rev-parse", "--is-inside-work-tree")
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        rec["reason"] = "invalid-git-worktree"
+        return rec
+
+    gitdir_proc = run_git(entry, "rev-parse", "--absolute-git-dir")
+    common_proc = run_git(entry, "rev-parse", "--git-common-dir")
+    if gitdir_proc.returncode != 0 or common_proc.returncode != 0:
+        rec["reason"] = "invalid-git-metadata"
+        return rec
+    gitdir = Path(gitdir_proc.stdout.strip()).resolve()
+    common_dir = Path(common_proc.stdout.strip())
+    if not common_dir.is_absolute():
+        common_dir = (entry / common_dir).resolve()
+    else:
+        common_dir = common_dir.resolve()
+    if gitdir == common_dir:
+        rec["reason"] = "main-repository"
+        return rec
+    if (gitdir / "locked").exists():
+        rec["reason"] = "worktree-locked"
+        return rec
+
+    for op_marker in ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "BISECT_LOG", "rebase-merge", "rebase-apply"):
+        if (gitdir / op_marker).exists():
+            rec["reason"] = f"git-op-in-progress:{op_marker}"
+            return rec
+
+    if reg_meta.get("protected") is True or reg_meta.get("pinned") is True:
+        rec["reason"] = "registry-protected"
+        return rec
+
+    br_proc = run_git(entry, "symbolic-ref", "--quiet", "--short", "HEAD")
+    branch = br_proc.stdout.strip() if br_proc.returncode == 0 else ""
+    rec["branch"] = branch or "(detached)"
+    if branch and branch in protected_branches:
+        rec["reason"] = f"protected-branch:{branch}"
+        return rec
+
+    # Check if the owning main repo itself currently has this branch checked out.
+    main_repo = common_dir.parent if common_dir.name == ".git" else common_dir
+    if main_repo.exists() and branch:
+        main_br = run_git(main_repo, "symbolic-ref", "--quiet", "--short", "HEAD")
+        if main_br.returncode == 0 and main_br.stdout.strip() == branch:
+            rec["reason"] = f"active-main-branch:{branch}"
+            return rec
+
+    # Activity age: conservative max of HEAD commit time, worktree dir/index mtime, and registry updated time.
+    timestamps: list[int] = []
+    commit_ts = run_git(entry, "log", "-1", "--format=%ct")
+    if commit_ts.returncode == 0 and commit_ts.stdout.strip().isdigit():
+        timestamps.append(int(commit_ts.stdout.strip()))
+    try:
+        timestamps.append(int(entry.lstat().st_mtime))
+    except OSError:
+        pass
+    idx_file = gitdir / "index"
+    if idx_file.exists():
+        try:
+            timestamps.append(int(idx_file.lstat().st_mtime))
+        except OSError:
+            pass
+    reg_updated = parse_iso_epoch(reg_meta.get("updated"))
+    if reg_updated is not None:
+        timestamps.append(reg_updated)
+        if reg_meta.get("status") == "active" and reg_updated > cutoff_epoch:
+            rec["ageDays"] = max(0, (now_epoch - reg_updated) // 86400)
+            rec["reason"] = "registry-active-recent"
+            return rec
+
+    if not timestamps:
+        rec["reason"] = "unknown-age"
+        return rec
+    latest_ts = max(timestamps)
+    age_sec = max(0, now_epoch - latest_ts)
+    age_days = age_sec // 86400
+    rec["ageDays"] = age_days
+    if latest_ts > cutoff_epoch:
+        rec["reason"] = f"recent:{age_days}d<{days}d"
+        return rec
+
+    # Mandatory cleanliness check (ignore only our own untracked cache stamp).
+    st_proc = run_git(entry, "status", "--porcelain", "--untracked-files=normal")
+    if st_proc.returncode != 0:
+        rec["reason"] = "git-status-failed"
+        return rec
+    dirty_lines = [
+        line for line in st_proc.stdout.splitlines()
+        if line and line != f"?? {stamp_name}"
+    ]
+    if dirty_lines:
+        rec["reason"] = f"dirty-working-tree:{len(dirty_lines)}"
+        return rec
+
+    # Mandatory no-unpushed-commits check (fail-closed).
+    head_proc = run_git(entry, "rev-parse", "--verify", "HEAD^{commit}")
+    if head_proc.returncode != 0:
+        rec["reason"] = "no-head-commit"
+        return rec
+    head_sha = head_proc.stdout.strip()
+
+    upstream_proc = run_git(entry, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+    if upstream_proc.returncode == 0 and upstream_proc.stdout.strip():
+        upstream_ref = upstream_proc.stdout.strip()
+        ahead_proc = run_git(entry, "rev-list", "--count", f"{upstream_ref}..HEAD")
+        if ahead_proc.returncode != 0 or not ahead_proc.stdout.strip().isdigit():
+            rec["reason"] = "unpushed-check-failed"
+            return rec
+        ahead = int(ahead_proc.stdout.strip())
+        if ahead > 0:
+            rec["reason"] = f"unpushed-commits:{ahead}"
+            return rec
+    else:
+        # No configured upstream: HEAD must be reachable from at least one remote-tracking ref.
+        remote_contains = run_git(entry, "for-each-ref", "--contains", head_sha, "refs/remotes/")
+        if remote_contains.returncode != 0 or not remote_contains.stdout.strip():
+            rec["reason"] = "unpushed-commits:no-remote-ref"
+            return rec
+
+    rec["bytes"] = dir_size_bytes(entry)
+    rec["eligible"] = True
+    rec["reason"] = "stale-clean-pushed"
+    rec["_main_repo"] = str(main_repo)
+    return rec
+
+
+entries = sorted(
+    (p for p in base_dir.iterdir() if not p.is_symlink() and p.is_dir()),
+    key=lambda p: p.name,
+)
+scanned = [inspect_entry(p) for p in entries]
+candidates = [r for r in scanned if r["eligible"]]
+skipped = [r for r in scanned if not r["eligible"]]
+estimated_bytes = sum(int(r["bytes"]) for r in candidates)
+
+deleted_paths: list[str] = []
+deleted_realpaths: set[Path] = set()
+reclaimed_bytes = 0
+errors: list[str] = []
+pruned_repos: set[str] = set()
+
+if apply_mode:
+    for item in candidates:
+        wt_path = Path(str(item["path"]))
+        wt_real = Path(str(item["realpath"]))
+        main_repo = Path(str(item.get("_main_repo", "")))
+        try:
+            # Remove only our own stamp file if present so git worktree remove stays clean.
+            stamp_file = wt_path / stamp_name
+            if stamp_file.is_file() and not stamp_file.is_symlink():
+                stamp_file.unlink()
+            rm_proc = run_git(main_repo, "worktree", "remove", str(wt_path))
+            if rm_proc.returncode != 0:
+                # Shared node_modules symlinks (gitignored) can block non-forced worktree remove;
+                # cleanliness + unpushed guards already passed above, so --force is safe here.
+                rm_proc = run_git(main_repo, "worktree", "remove", "--force", str(wt_path))
+            if rm_proc.returncode != 0:
+                errors.append(f"worktree remove failed for {wt_path}: {rm_proc.stderr.strip()}")
+                continue
+            if wt_path.exists():
+                shutil.rmtree(wt_path)
+            deleted_paths.append(str(wt_path))
+            deleted_realpaths.add(wt_real)
+            reclaimed_bytes += int(item["bytes"])
+            pruned_repos.add(str(main_repo))
+        except Exception as exc:
+            errors.append(f"failed removing {wt_path}: {exc}")
+    for repo_str in sorted(pruned_repos):
+        run_git(Path(repo_str), "worktree", "prune")
+
+registry_cleaned: list[str] = []
+if apply_mode and registry_doc is not None:
+    wt_map = registry_doc.get("worktrees", {})
+    to_remove: list[str] = []
+    for key in list(wt_map.keys()):
+        kp = Path(key)
+        try:
+            kr = kp.resolve()
+        except OSError:
+            kr = kp
+        in_base = kr.parent == base_dir or kp.parent == base_dir
+        if kr in deleted_realpaths or key in deleted_paths or (in_base and not kp.exists()):
+            to_remove.append(key)
+    if to_remove:
+        for key in to_remove:
+            wt_map.pop(key, None)
+            registry_cleaned.append(key)
+        orig_mode = stat.S_IMODE(registry_path.lstat().st_mode)
+        raw_out = (json.dumps(registry_doc, ensure_ascii=False, indent=1, sort_keys=True) + "\n").encode("utf-8")
+        fd, tmp_name = tempfile.mkstemp(prefix=".worktrees-registry.tmp-", dir=str(registry_path.parent))
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(raw_out)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp_path, orig_mode)
+            os.replace(tmp_path, registry_path)
+        except BaseException:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            raise
+
+for r in scanned:
+    r.pop("_main_repo", None)
+
+summary = {
+    "mode": "apply" if apply_mode else "dry-run",
+    "baseDir": str(base_dir),
+    "days": days,
+    "registryPath": str(registry_path),
+    "candidateCount": len(candidates),
+    "skippedCount": len(skipped),
+    "estimatedReclaimBytes": estimated_bytes,
+    "deletedCount": len(deleted_paths),
+    "reclaimedBytes": reclaimed_bytes,
+    "deletedPaths": deleted_paths,
+    "registryCleaned": registry_cleaned,
+    "errors": errors,
+    "candidates": candidates,
+    "skipped": skipped,
+}
+
+if json_out:
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+else:
+    mode_label = "APPLY(执行删除)" if apply_mode else "DRY-RUN(只列不删)"
+    print(f"══ V5 worktree GC [{mode_label}] base={base_dir} days>={days} ══")
+    print(f"{'STATUS':<10} {'AGE_D':>5} {'BYTES':>12}  {'BRANCH':<32} {'PATH'}  (REASON)")
+    for r in candidates:
+        tag = "DELETED" if str(r["path"]) in deleted_paths else "CANDIDATE"
+        age_str = "-" if r["ageDays"] is None else str(r["ageDays"])
+        print(f"{tag:<10} {age_str:>5} {int(r['bytes']):>12}  {str(r['branch']):<32} {r['path']}  ({r['reason']})")
+    for r in skipped:
+        age_str = "-" if r["ageDays"] is None else str(r["ageDays"])
+        print(f"{'SKIP':<10} {age_str:>5} {int(r['bytes']):>12}  {str(r['branch']):<32} {r['path']}  ({r['reason']})")
+    est_mib = estimated_bytes / (1024 * 1024)
+    rec_mib = reclaimed_bytes / (1024 * 1024)
+    print("")
+    print(
+        f"mode={summary['mode']} candidates={len(candidates)} skipped={len(skipped)} "
+        f"reclaimable_bytes={estimated_bytes} ({est_mib:.2f} MiB) "
+        f"deleted={len(deleted_paths)} reclaimed_bytes={reclaimed_bytes} ({rec_mib:.2f} MiB) "
+        f"registry_cleaned={len(registry_cleaned)}"
+    )
+    if errors:
+        for err in errors:
+            sys.stderr.write(f"✗ {err}\n")
+
+sys.exit(1 if errors else 0)
+PY
+}
+
 FRESH=0
 METHOD="${OC_V5_WORKTREE_METHOD:-symlink}"
 DONOR="$CANONICAL"
@@ -484,6 +969,13 @@ HEAL_PATH=""
 SELF_CHECK_PATH=""
 DO_REPORT=0
 DO_SELFTEST=0
+DO_GC_STALE=0
+GC_DAYS=14
+GC_APPLY=0
+GC_DRY_EXPLICIT=0
+GC_JSON=0
+GC_PROTECTED_BRANCHES=""
+GC_PROTECTED_NAMES=""
 BRANCH_OVERRIDE=""
 PATH_OVERRIDE=""
 NAME=""
@@ -495,6 +987,14 @@ while [[ $# -gt 0 ]]; do
     --heal) HEAL_PATH="${2:-}"; shift 2 ;;
     --self-check) SELF_CHECK_PATH="${2:-}"; shift 2 ;;
     --report) DO_REPORT=1; shift ;;
+    --gc-stale) DO_GC_STALE=1; shift ;;
+    --days) GC_DAYS="${2:-}"; shift 2 ;;
+    --dry-run) GC_DRY_EXPLICIT=1; shift ;;
+    --apply) GC_APPLY=1; shift ;;
+    --registry) REGISTRY_FILE="${2:-}"; shift 2 ;;
+    --protected-branch) GC_PROTECTED_BRANCHES="${GC_PROTECTED_BRANCHES} ${2:-}"; shift 2 ;;
+    --protected-name) GC_PROTECTED_NAMES="${GC_PROTECTED_NAMES} ${2:-}"; shift 2 ;;
+    --json) GC_JSON=1; shift ;;
     --self-test-share) DO_SELFTEST=1; shift ;;
     --donor) DONOR="${2:-}"; shift 2 ;;
     --method) METHOD="${2:-}"; shift 2 ;;
@@ -519,6 +1019,14 @@ done
 
 [[ "$METHOD" == symlink || "$METHOD" == hardlink ]] || die "--method 只接受 symlink|hardlink"
 
+if [[ "$DO_GC_STALE" == 1 ]]; then
+  if [[ "$GC_DRY_EXPLICIT" == 1 && "$GC_APPLY" == 1 ]]; then
+    die "--dry-run 与 --apply 不能同时指定"
+  fi
+  gc_stale_worktrees "$BASE_DIR" "$DONOR" "$GC_DAYS" "$GC_APPLY" "$REGISTRY_FILE" "$GC_JSON" \
+    "$GC_PROTECTED_BRANCHES" "$GC_PROTECTED_NAMES"
+  exit $?
+fi
 if [[ "$DO_REPORT" == 1 ]]; then
   report_duplicates
   exit 0

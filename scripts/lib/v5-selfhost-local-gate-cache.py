@@ -4,12 +4,17 @@
 Receipts are strictly evidence of a previous local rc=0 run on byte-identical
 immutable Git object inputs + toolchain versions. Any validation/IO/git error
 exits non-zero so the shell caller falls back to running the real gate locally.
+
+OCV5-823: Narrowed from coarse whole-scripts/ + monolithic-backend hashing to
+per-gate exact file/subtree closures with fail-closed conservative fallbacks
+(symlinks, submodules, unknown top-level entries, workspace dependency drift,
+and unresolvable dynamic imports promote conservatively).
 """
 from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import stat
 import subprocess
@@ -19,6 +24,7 @@ import tempfile
 SCHEMA = "oc.v5.selfhost.local-gate-receipt/1"
 PLAN_SCHEMA = "oc.v5.selfhost.local-gate-plan/1"
 MANIFEST_SCHEMA = "oc.v5.selfhost.release-gates/1"
+CLOSURE_VERSION = "closure-v2"
 PROD_DEFAULT_PREFIX = "/var/lib/openclaude-v5-selfhost"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -28,40 +34,85 @@ MAX_RECEIPT_BYTES = 65536
 MAX_RECEIPTS = 512
 
 # Every build-stage C gate in deploy/v5/selfhost-release-gates.json mapped to its
-# conservative, transitive-closed input scope.
+# precise, sound package/input scope (each gate additionally hashes its own exact
+# scripts/deploy/extra file closure rather than the entire scripts/ directory).
 GATE_SCOPES = {
+    # Pure policy/watch script gates (no whole packages/commercial or packages/gateway)
+    "host-log-policy": "policy_host_log",
+    "model-policy-recovery": "policy_model",
+    "watch-gate": "watch",
     # Pure storage + protocol
     "system-approval-fencing": "storage",
     # Gateway + non-commercial workspace packages + commercial/agent-sandbox prompts
     "upload-retention-http": "gateway",
     "session-workspace-boundary": "gateway",
     "cron-submit-boundary": "gateway",
-    "codex-late-stop-closure": "gateway",
-    # Full backend + scripts/ops/deploy (excludes web-react, e2e, docs, evals)
+    # Gateway + CCB source + Bun toolchain
+    "codex-late-stop-closure": "gateway_ccb",
+    # Gateway + static source-contract reads of two web-react regular files
+    "ccb-mcp-availability": "gateway_ccb_web",
+    # Gateway + narrowed commercial leaf module (fail-closed transitive closure)
+    "codex-chatgpt-ws": "gateway_codex_ws",
+    "terminal-unproven": "gateway_liveness",
+    # Full backend packages (excludes web-react) + per-gate exact scripts/deploy closure
     "box-success-recovery": "backend",
     "box-continuation": "backend",
     "box-incident-proofs": "backend",
     "box-longtask": "backend",
-    "codex-chatgpt-ws": "backend",
-    "terminal-unproven": "backend",
     "prompt-privacy-lifecycle": "backend",
     "cursor-sand-inference": "backend",
     "delegate-billing-requestid": "backend",
     "callback-payload-hash": "backend",
     "system-executor-fencing": "backend",
-    "host-log-policy": "backend",
-    "model-policy-recovery": "backend",
-    "watch-gate": "backend",
     "master-incident-proofs": "backend",
-    # Backend + static source-contract reads of two web-react regular files (no symlink/closure surface)
-    "ccb-mcp-availability": "backend_ccb",
-    # Full repo tree (imports web-react runtime modules, runs web-react vitest, or full-repo architecture graph)
-    "session-unavailable-rootfix": "full",
-    "platform-tool-proofs": "full",
+    # All workspace packages including web-react + per-gate exact scripts/deploy closure
+    "session-unavailable-rootfix": "backend_web",
+    "platform-tool-proofs": "backend_web",
+    # Full repo tree (architecture graph scans entire repository)
     "architecture": "full",
 }
 
 TOP_DOC_EXCLUDES = frozenset({"docs", "evals", "e2e"})
+# Top-level entries that never affect narrowed gate execution (full scope still hashes root_tree).
+TOP_NON_RUNTIME_EXCLUDES = frozenset({
+    "docs",
+    "evals",
+    "e2e",
+    "apps",
+    "ops",
+    "infra",
+    "arch",
+    ".github",
+    ".claude",
+    ".codex",
+    ".gitignore",
+    ".gitattributes",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "PLAN.md",
+    "README.md",
+    "biome.json",
+    "changelog.json",
+    "static-key-providers.snapshot.json",
+})
+# Top-level entries hashed per-gate (not wholesale in shared root_config_items).
+TOP_PER_GATE_SCOPED = frozenset({
+    "packages",
+    "scripts",
+    "deploy",
+    "claude-code-best",
+    "bun.lock",
+    "bunfig.toml",
+})
+# Shared root toolchain/config files hashed for every narrowed gate.
+ROOT_TOOLCHAIN_FILES = (
+    "package.json",
+    "package-lock.json",
+    "tsconfig.json",
+    "tsconfig.base.json",
+    "deploy/v5/selfhost-release-gates.json",
+)
+
 REGULAR_MODES = frozenset({"100644", "100755"})
 ALLOWED_TREE_OR_REG_MODES = frozenset({"040000", "100644", "100755"})
 BUN_REQUIRED_GATES = frozenset({"codex-late-stop-closure"})
@@ -84,6 +135,135 @@ STORAGE_ALLOWED_WORKSPACE_DEPS = frozenset({
     "@openclaude/protocol",
     "@openclaude/storage",
 })
+
+# Explicit per-gate seed files/subtrees in addition to the manifest script and
+# static transitive closure expansion.
+GATE_EXTRA_INPUTS: dict[str, tuple[str, ...]] = {
+    "host-log-policy": (
+        "deploy/v5-selfhost/host-log-policy.json",
+        "deploy/v5-selfhost/logrotate.d",
+        "deploy/v5-selfhost/model-availability.json",
+        "packages/commercial/src/billing/modelAvailability.ts",
+        "scripts/v5-selfhost-host-log-policy.py",
+        "scripts/lib/v5-selfhost-host-log-policy.sh",
+        "scripts/lib/v5-selfhost-model-policy.sh",
+        "scripts/lib/selfhost-model-policy.mjs",
+        "scripts/v5-selfhost-master-release-lib.sh",
+    ),
+    "model-policy-recovery": (
+        "deploy/v5-selfhost/model-availability.json",
+        "packages/commercial/src/billing/modelAvailability.ts",
+        "scripts/lib/selfhost-model-policy.mjs",
+        "scripts/lib/v5-selfhost-model-policy.sh",
+        "scripts/lib/user-contract.mjs",
+        "scripts/v5-user-contract-smoke.mjs",
+    ),
+    "watch-gate": (
+        "deploy/v5-selfhost",
+        "deploy/v5/release-metadata.json",
+        "packages/commercial/src/db/migrations",
+        "packages/cli/src/index.ts",
+        "packages/commercial/src/egress/main.ts",
+        "scripts/lib",
+        "scripts/v5-selfhost-watch.sh",
+        "scripts/v5-selfhost-watch-alert.sh",
+        "scripts/v5-selfhost-autorecover.sh",
+        "scripts/v5-selfhost-rollback.sh",
+        "scripts/v5-selfhost-env-drift.sh",
+        "scripts/v5-selfhost-env.sh",
+        "scripts/v5-selfhost-diagnostics.sh",
+        "scripts/v5-selfhost-cutover-survivor.sh",
+        "scripts/v5-selfhost-release-policy.sh",
+        "scripts/v5-selfhost-restore-worktree-units.sh",
+        "scripts/v5-selfhost-master-release-lib.sh",
+        "scripts/v5-runtime-release-lib.sh",
+        "scripts/deploy-v5-selfhost.sh",
+        "scripts/v5-lease-lib.sh",
+        "scripts/v5-lease-worker.sh",
+        "scripts/v5-migration-compat.py",
+        "scripts/v5-migration-ddl.sh",
+        "scripts/v5-alert-fanout.sql",
+    ),
+    "box-success-recovery": (
+        "scripts/lib/gateTestDb.mjs",
+        "scripts/lib/gateLoadScale.ts",
+        "scripts/ocv5-289",
+    ),
+    "box-incident-proofs": (
+        "scripts/lib/gateTestDb.mjs",
+        "scripts/lib/gateLoadScale.ts",
+        "scripts/cursor-sand-box-relay",
+    ),
+    "box-longtask": (
+        "scripts/lib/gateTestDb.mjs",
+        "scripts/lib/gateLoadScale.ts",
+        "scripts/check-v5-box-success-recovery.ts",
+        "scripts/ocv5-289",
+    ),
+    "master-incident-proofs": (
+        "scripts/lib/gateTestDb.mjs",
+    ),
+    "cursor-sand-inference": (
+        "scripts/cursor-sand-box-relay",
+        "scripts/deploy-v5.sh",
+        "scripts/v5-selfhost-master-release-lib.sh",
+    ),
+    "ccb-mcp-availability": (
+        "scripts/lib/advisorNoWriteProof.ts",
+        "scripts/lib/webSearchCliProof.ts",
+        "scripts/test-mutex.sh",
+        "scripts/deploy-v5.sh",
+        "scripts/v5-selfhost-master-release-lib.sh",
+    ),
+    "delegate-billing-requestid": (
+        "scripts/deploy-v5.sh",
+        "scripts/v5-selfhost-master-release-lib.sh",
+    ),
+    "callback-payload-hash": (
+        "scripts/test-mutex.sh",
+    ),
+    "codex-late-stop-closure": (
+        "scripts/ocv5-289/box_keeper.py",
+        "scripts/v5-runtime-release-lib.sh",
+        "scripts/lib/ccb-shared-inputs.mjs",
+        "claude-code-best",
+        "bun.lock",
+        "bunfig.toml",
+    ),
+    "codex-chatgpt-ws": (
+        "packages/commercial/src/http/codexUpstreamHeaders.ts",
+    ),
+    "terminal-unproven": (
+        "packages/commercial/src/http/proxy/boxRunLiveness.ts",
+    ),
+    "session-unavailable-rootfix": (
+        "scripts/lib/preparationLaneCoverage.ts",
+        "scripts/lib/proofTsxCache.ts",
+        "scripts/lib/turnDispatchReceiptCoverage.ts",
+        "scripts/ops/requeue-failed-tape-jobs.ts",
+        "scripts/__tests__/preparationLaneCoverage.test.ts",
+        "scripts/__tests__/requeueFailedTapeJobs.test.ts",
+        "scripts/__tests__/turnDispatchReceiptCoverage.test.ts",
+    ),
+}
+
+# Contract-inspected orchestrator scripts: hash their blobs, but do not transitively
+# expand all 24 gate scripts listed inside them.
+NON_EXPANDED_SCRIPT_LEAVES = frozenset({
+    "scripts/v5-selfhost-master-release-lib.sh",
+    "scripts/deploy-v5.sh",
+    "scripts/deploy-v5-selfhost.sh",
+    "scripts/v5-selfhost.sh",
+})
+
+JS_TS_EXTS = (".ts", ".tsx", ".mts", ".cts", ".js", ".mjs", ".cjs")
+JS_STATIC_REL_RE = re.compile(
+    r"""(?:\bfrom\s+|\bimport\s+(?:type\s+)?|\bimport\s*\(\s*|\brequire\s*\(\s*)(['"])(\.\.?/[^'"\n]+)\1"""
+)
+JS_DYNAMIC_IMPORT_RE = re.compile(r"""\b(?:import|require)\s*\(\s*(?!['"])""")
+REPO_SCRIPT_DEPLOY_REF_RE = re.compile(r"""\b((?:scripts|deploy)/[A-Za-z0-9_./-]+)""")
+SIBLING_V5_SCRIPT_RE = re.compile(r"""\b(v5-[a-z0-9_.-]+\.(?:sh|py|mjs|ts|json))\b""")
+USER_CONTRACT_PATTERN_RE = re.compile(r"""v5-user-contract-(?:\*|\{[^}]+\})\.mjs""")
 
 
 def check_node(path: Path, expect_dir: bool, uid: int) -> os.stat_result:
@@ -237,6 +417,172 @@ def validate_arch_report(raw: object) -> dict[str, object]:
     }
 
 
+def _normalize_posix(rel: str) -> str | None:
+    parts: list[str] = []
+    for seg in PurePosixPath(rel).parts:
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if not parts:
+                return None
+            parts.pop()
+        else:
+            parts.append(seg)
+    return "/".join(parts) if parts else None
+
+
+def _resolve_js_rel(
+    source_path: str, spec: str, all_entries: dict[str, tuple[str, str, str]]
+) -> str | None:
+    parent = str(PurePosixPath(source_path).parent)
+    joined = _normalize_posix(f"{parent}/{spec}" if parent != "." else spec)
+    if not joined:
+        return None
+    candidates: list[str] = [joined]
+    if joined.endswith(".js"):
+        stem = joined[:-3]
+        candidates.extend([f"{stem}.ts", f"{stem}.tsx", f"{stem}.mts", f"{stem}.mjs"])
+    elif joined.endswith(".mjs"):
+        stem = joined[:-4]
+        candidates.extend([f"{stem}.mts", f"{stem}.ts"])
+    elif joined.endswith(".cjs"):
+        stem = joined[:-4]
+        candidates.extend([f"{stem}.cts", f"{stem}.ts"])
+    else:
+        for ext in JS_TS_EXTS:
+            candidates.append(f"{joined}{ext}")
+        for ext in JS_TS_EXTS:
+            candidates.append(f"{joined}/index{ext}")
+    for cand in candidates:
+        ent = all_entries.get(cand)
+        if ent is not None and ent[1] == "blob":
+            return cand
+    return None
+
+
+def _ancestors_safe(rel_path: str, all_entries: dict[str, tuple[str, str, str]]) -> bool:
+    parts = rel_path.split("/")
+    for idx in range(1, len(parts)):
+        anc = "/".join(parts[:idx])
+        if anc in all_entries and all_entries[anc][:2] != ("040000", "tree"):
+            return False
+    return True
+
+
+def _expand_gate_closure(
+    repo: str,
+    seed_paths: list[str],
+    all_entries: dict[str, tuple[str, str, str]],
+    blob_cache: dict[str, bytes],
+    *,
+    expand_commercial_imports: bool,
+) -> tuple[list[str], bool, bool, bool]:
+    """Expand a gate's seed paths into a sorted list of closure tokens.
+
+    Returns (tokens, symlink_fail_closed, fallback_all_scripts, promote_to_backend).
+    """
+    visited_paths: set[str] = set()
+    queue: list[str] = []
+    expanded_files: set[str] = set()
+    symlink_fail_closed = False
+    fallback_all_scripts = False
+    promote_to_backend = False
+
+    def enqueue(rel: str) -> None:
+        clean = rel.strip().rstrip("/")
+        if not clean or clean in visited_paths:
+            return
+        visited_paths.add(clean)
+        queue.append(clean)
+
+    for seed in seed_paths:
+        enqueue(seed)
+
+    # Iterative BFS wave-reading blobs via git cat-file --batch.
+    cursor = 0
+    while cursor < len(queue):
+        wave = queue[cursor:]
+        cursor = len(queue)
+        to_read: list[tuple[str, str]] = []
+        for rel in wave:
+            if not _ancestors_safe(rel, all_entries):
+                symlink_fail_closed = True
+                continue
+            ent = all_entries.get(rel)
+            if ent is None:
+                continue
+            mode, otype, oid = ent
+            if mode not in ALLOWED_TREE_OR_REG_MODES:
+                symlink_fail_closed = True
+                continue
+            if otype != "blob" or rel in expanded_files:
+                continue
+            if rel in NON_EXPANDED_SCRIPT_LEAVES:
+                continue
+            is_script_file = rel.startswith("scripts/") and rel.endswith(
+                (*JS_TS_EXTS, ".sh", ".py")
+            )
+            is_comm_leaf = expand_commercial_imports and rel.startswith("packages/commercial/") and rel.endswith(
+                JS_TS_EXTS
+            )
+            if is_script_file or is_comm_leaf:
+                expanded_files.add(rel)
+                to_read.append((rel, oid))
+
+        missing_oids = [oid for _rel, oid in to_read if oid not in blob_cache]
+        if missing_oids:
+            blob_cache.update(read_blobs_batch(repo, list(dict.fromkeys(missing_oids))))
+
+        for rel, oid in to_read:
+            text = blob_cache[oid].decode("utf-8", errors="replace")
+            if rel.endswith(JS_TS_EXTS):
+                if rel.startswith("packages/commercial/") and JS_DYNAMIC_IMPORT_RE.search(text):
+                    promote_to_backend = True
+                for m in JS_STATIC_REL_RE.finditer(text):
+                    spec = m.group(2)
+                    resolved = _resolve_js_rel(rel, spec, all_entries)
+                    if resolved is None:
+                        if rel.startswith("packages/commercial/"):
+                            promote_to_backend = True
+                        elif rel.startswith("scripts/") and not spec.startswith("../packages/"):
+                            fallback_all_scripts = True
+                        continue
+                    if resolved.startswith("scripts/") or resolved.startswith("deploy/"):
+                        enqueue(resolved)
+                    elif expand_commercial_imports and resolved.startswith("packages/commercial/"):
+                        enqueue(resolved)
+                if rel.startswith("scripts/"):
+                    for ref_m in REPO_SCRIPT_DEPLOY_REF_RE.finditer(text):
+                        cand = ref_m.group(1).rstrip(".,;:")
+                        if cand in all_entries:
+                            enqueue(cand)
+            elif rel.startswith("scripts/") and (rel.endswith(".sh") or rel.endswith(".py")):
+                for ref_m in REPO_SCRIPT_DEPLOY_REF_RE.finditer(text):
+                    cand = ref_m.group(1).rstrip(".,;:")
+                    if cand in all_entries:
+                        enqueue(cand)
+                for sib_m in SIBLING_V5_SCRIPT_RE.finditer(text):
+                    sib = f"scripts/{sib_m.group(1)}"
+                    if sib in all_entries:
+                        enqueue(sib)
+                if USER_CONTRACT_PATTERN_RE.search(text):
+                    for path in sorted(all_entries):
+                        if path.startswith("scripts/v5-user-contract-") and path.endswith(".mjs"):
+                            enqueue(path)
+
+    tokens: list[str] = []
+    for rel in sorted(visited_paths):
+        ent = all_entries.get(rel)
+        if ent is None:
+            tokens.append(f"closure:{rel}=missing")
+        else:
+            mode, otype, oid = ent
+            if mode not in ALLOWED_TREE_OR_REG_MODES:
+                symlink_fail_closed = True
+            tokens.append(f"closure:{rel}={mode}:{otype}:{oid}")
+    return tokens, symlink_fail_closed, fallback_all_scripts, promote_to_backend
+
+
 def compute_scope_digests(
     repo: str, sha: str, node_ver: str, py_ver: str, runtime_img: str, bun_id: str
 ) -> dict[str, str]:
@@ -252,10 +598,13 @@ def compute_scope_digests(
     manifest = json.loads(manifest_raw.decode("utf-8"))
     if manifest.get("schema") != MANIFEST_SCHEMA:
         raise ValueError("unexpected release-gates manifest schema")
-    manifest_ids = {
-        g["id"] for g in manifest.get("gates", [])
-        if isinstance(g, dict) and isinstance(g.get("id"), str) and not g.get("stage")
-    }
+    manifest_scripts: dict[str, str] = {}
+    manifest_ids: set[str] = set()
+    for g in manifest.get("gates", []):
+        if isinstance(g, dict) and isinstance(g.get("id"), str) and not g.get("stage"):
+            manifest_ids.add(g["id"])
+            if isinstance(g.get("script"), str):
+                manifest_scripts[g["id"]] = g["script"]
     for gid in GATE_SCOPES:
         if gid not in manifest_ids:
             raise ValueError(f"cached gate {gid} missing from manifest")
@@ -356,35 +705,75 @@ def compute_scope_digests(
         )
     )
 
-    full_items = [f"root_tree={root_tree}"]
-    base_items: list[str] = []
-    for name, (mode, otype, oid) in sorted(top_entries.items()):
-        if name == "packages" or name in TOP_DOC_EXCLUDES:
-            continue
-        base_items.append(f"top:{name}={mode}:{otype}:{oid}")
-
     def format_entry(rel_path: str) -> str:
         ent = all_entries.get(rel_path)
         if ent is None:
             return "missing"
         return f"{ent[0]}:{ent[1]}:{ent[2]}"
 
+    full_items = [f"root_tree={root_tree}"]
+
+    # Shared minimal root config base: root toolchain files + conservative fallback for
+    # any UNKNOWN top-level entry (not in TOP_NON_RUNTIME_EXCLUDES or TOP_PER_GATE_SCOPED).
+    root_toolchain_top_names = {p for p in ROOT_TOOLCHAIN_FILES if "/" not in p}
+    root_config_items: list[str] = [
+        f"root_cfg:{p}={format_entry(p)}" for p in ROOT_TOOLCHAIN_FILES
+    ]
+    for name, (mode, otype, oid) in sorted(top_entries.items()):
+        if (
+            name in root_toolchain_top_names
+            or name in TOP_NON_RUNTIME_EXCLUDES
+            or name in TOP_PER_GATE_SCOPED
+        ):
+            continue
+        root_config_items.append(f"top_unknown:{name}={mode}:{otype}:{oid}")
+
     if backend_scope_ok:
-        backend_items = list(base_items)
+        backend_pkg_items: list[str] = list(root_config_items)
         for name, (mode, otype, oid) in sorted(pkg_entries.items()):
             if name == "web-react":
                 continue
-            backend_items.append(f"pkg:{name}={mode}:{otype}:{oid}")
-        ccb_extras_ok = True
-        ccb_extra_tokens: list[str] = []
+            backend_pkg_items.append(f"pkg:{name}={mode}:{otype}:{oid}")
+
+        all_pkg_items: list[str] = list(root_config_items)
+        for name, (mode, otype, oid) in sorted(pkg_entries.items()):
+            all_pkg_items.append(f"pkg:{name}={mode}:{otype}:{oid}")
+    else:
+        backend_pkg_items = full_items
+        all_pkg_items = full_items
+
+    if gateway_scope_ok:
+        gateway_pkg_items: list[str] = list(root_config_items)
+        for name, (mode, otype, oid) in sorted(pkg_entries.items()):
+            if name in ("web-react", "commercial", "cli"):
+                continue
+            gateway_pkg_items.append(f"pkg:{name}={mode}:{otype}:{oid}")
+        gateway_pkg_items.append(
+            f"extra:packages/commercial/agent-sandbox={format_entry('packages/commercial/agent-sandbox')}"
+        )
+        gateway_pkg_items.append(
+            f"extra:packages/commercial/package.json={format_entry('packages/commercial/package.json')}"
+        )
+    else:
+        gateway_pkg_items = backend_pkg_items
+
+    if storage_scope_ok:
+        storage_pkg_items: list[str] = list(root_config_items)
+        for name in ("protocol", "storage"):
+            if name not in pkg_entries:
+                raise ValueError(f"missing required package {name}")
+            mode, otype, oid = pkg_entries[name]
+            storage_pkg_items.append(f"pkg:{name}={mode}:{otype}:{oid}")
+    else:
+        storage_pkg_items = backend_pkg_items
+
+    # Validate CCB web-react extra paths (fail closed to full_items if symlink/ancestor symlink).
+    ccb_extras_ok = backend_scope_ok
+    ccb_extra_tokens: list[str] = []
+    if ccb_extras_ok:
         for extra_path in CCB_WEB_EXTRA_PATHS:
-            parts_p = extra_path.split("/")
-            for idx in range(1, len(parts_p)):
-                anc = "/".join(parts_p[:idx])
-                if anc in all_entries and all_entries[anc][:2] != ("040000", "tree"):
-                    ccb_extras_ok = False
-                    break
-            if not ccb_extras_ok:
+            if not _ancestors_safe(extra_path, all_entries):
+                ccb_extras_ok = False
                 break
             if extra_path not in all_entries:
                 ccb_extra_tokens.append(f"extra:{extra_path}=missing")
@@ -394,54 +783,81 @@ def compute_scope_digests(
                     ccb_extras_ok = False
                     break
                 ccb_extra_tokens.append(f"extra:{extra_path}={emode}:{eotype}:{eoid}")
-        backend_ccb_items = [*backend_items, *ccb_extra_tokens] if ccb_extras_ok else full_items
-    else:
-        backend_items = full_items
-        backend_ccb_items = full_items
 
-    if gateway_scope_ok:
-        gateway_items = list(base_items)
-        for name, (mode, otype, oid) in sorted(pkg_entries.items()):
-            if name in ("web-react", "commercial", "cli"):
-                continue
-            gateway_items.append(f"pkg:{name}={mode}:{otype}:{oid}")
-        gateway_items.append(f"extra:packages/commercial/agent-sandbox={format_entry('packages/commercial/agent-sandbox')}")
-        gateway_items.append(f"extra:packages/commercial/package.json={format_entry('packages/commercial/package.json')}")
+    if gateway_scope_ok and ccb_extras_ok:
+        gateway_ccb_web_items = [*gateway_pkg_items, *ccb_extra_tokens]
     else:
-        gateway_items = backend_items
+        gateway_ccb_web_items = full_items
 
-    if storage_scope_ok:
-        storage_items = list(base_items)
-        for name in ("protocol", "storage"):
-            if name not in pkg_entries:
-                raise ValueError(f"missing required package {name}")
-            mode, otype, oid = pkg_entries[name]
-            storage_items.append(f"pkg:{name}={mode}:{otype}:{oid}")
-    else:
-        storage_items = backend_items
+    policy_base_items = list(root_config_items) if backend_scope_ok else full_items
 
-    scope_lists = {
-        "storage": storage_items,
-        "gateway": gateway_items,
-        "backend": backend_items,
-        "backend_ccb": backend_ccb_items,
+    base_scope_lists = {
+        "policy_host_log": policy_base_items,
+        "policy_model": policy_base_items,
+        "watch": policy_base_items,
+        "storage": storage_pkg_items,
+        "gateway": gateway_pkg_items,
+        "gateway_ccb": gateway_pkg_items,
+        "gateway_ccb_web": gateway_ccb_web_items,
+        "gateway_codex_ws": gateway_pkg_items,
+        "gateway_liveness": gateway_pkg_items,
+        "backend": backend_pkg_items,
+        "backend_web": all_pkg_items,
         "full": full_items,
     }
 
+    commercial_leaf_scopes = frozenset({
+        "policy_host_log",
+        "policy_model",
+        "gateway_codex_ws",
+        "gateway_liveness",
+    })
+
+    blob_cache: dict[str, bytes] = dict(blobs)
     clean_bun = bun_id.strip()
     gate_digests: dict[str, str] = {}
+
     for gate_id, scope_name in sorted(GATE_SCOPES.items()):
         bun_token = f"bun={clean_bun}" if gate_id in BUN_REQUIRED_GATES else "bun=not-used"
+        if scope_name == "full":
+            tokens_for_gate = list(full_items)
+        else:
+            seeds: list[str] = []
+            m_script = manifest_scripts.get(gate_id)
+            if m_script:
+                seeds.append(m_script)
+            seeds.extend(GATE_EXTRA_INPUTS.get(gate_id, ()))
+            closure_tokens, sym_fail, fallback_scripts, promote_backend = _expand_gate_closure(
+                repo,
+                seeds,
+                all_entries,
+                blob_cache,
+                expand_commercial_imports=(scope_name in commercial_leaf_scopes),
+            )
+            if sym_fail or not backend_scope_ok:
+                tokens_for_gate = list(full_items)
+            elif scope_name == "gateway_ccb_web" and not ccb_extras_ok:
+                tokens_for_gate = list(full_items)
+            else:
+                if promote_backend:
+                    base_tokens = list(backend_pkg_items)
+                else:
+                    base_tokens = list(base_scope_lists[scope_name])
+                if fallback_scripts:
+                    base_tokens.append(f"fallback:scripts={format_entry('scripts')}")
+                tokens_for_gate = [*base_tokens, *closure_tokens]
+
         h = hashlib.sha256()
         for token in (
             SCHEMA,
+            CLOSURE_VERSION,
             f"gate={gate_id}",
             f"scope={scope_name}",
             f"node={node_ver.strip()}",
             f"python={py_ver.strip()}",
             f"runtime_image={runtime_img.strip()}",
             bun_token,
-            *scope_lists[scope_name],
+            *tokens_for_gate,
         ):
             h.update(token.encode("utf-8") + b"\0")
         gate_digests[gate_id] = h.hexdigest()
