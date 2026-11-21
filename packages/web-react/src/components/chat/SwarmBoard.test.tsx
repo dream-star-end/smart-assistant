@@ -272,7 +272,7 @@ describe("Antigravity native swarm reducer & UI (OCV5-809)", () => {
     expect(result.current.activeDrawerSwarm?.phase).toBe("completed");
   });
 
-  it("BLOCKER 3: isAntigravityModelForUi excludes remote_pool and -remote Antigravity routes", () => {
+  it("OCV5-835: isAntigravityModelForUi supports both local and remote_pool Antigravity routes", () => {
     const models = [
       { id: "antigravity-gemini-4-neon-high", engine: "antigravity", placement: "local" },
       { id: "antigravity-gemini-4-carbon-remote", engine: "antigravity", placement: "remote_pool" },
@@ -280,9 +280,9 @@ describe("Antigravity native swarm reducer & UI (OCV5-809)", () => {
       { id: "gpt-6.2-astra", engine: "codex", placement: "local" },
     ];
     expect(isAntigravityModelForUi("antigravity-gemini-4-neon-high", models)).toBe(true);
-    expect(isAntigravityModelForUi("antigravity-gemini-4-carbon-remote", models)).toBe(false);
-    expect(isAntigravityModelForUi("custom-agy-remote-alias", models)).toBe(false);
-    expect(isAntigravityModelForUi("antigravity-foo-remote", [])).toBe(false);
+    expect(isAntigravityModelForUi("antigravity-gemini-4-carbon-remote", models)).toBe(true);
+    expect(isAntigravityModelForUi("custom-agy-remote-alias", models)).toBe(true);
+    expect(isAntigravityModelForUi("antigravity-foo-remote", [])).toBe(true);
     expect(isAntigravityModelForUi("gpt-6.2-astra", models)).toBe(false);
   });
 

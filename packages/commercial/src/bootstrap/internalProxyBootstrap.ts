@@ -193,6 +193,11 @@ import {
   type DelegateEngineBillingRuntime,
 } from "../http/internalDelegateEngineBilling.js";
 import {
+  isDelegateRemoteLaneInternalPath,
+  makeDelegateRemoteLaneHandler,
+} from "../http/internalDelegateRemoteLane.js";
+import type { createMasterCc5Runtime } from "../agent-sandbox/cc5Runtime.js";
+import {
   isDelegateGrokRoutePath,
   makeDelegateGrokRouteHandler,
   type DelegateGrokRouteHandler,
@@ -453,6 +458,7 @@ export interface InternalProxyBootstrapDeps {
     }) => Promise<AdvisorCodexSelectorDecision>) | null;
   };
   delegateEngineBillingRuntimeRef: { current: DelegateEngineBillingRuntime | null };
+  cc5RuntimeRef: { current: ReturnType<typeof createMasterCc5Runtime> };
   wechatBrokerRef: { current: WechatBroker | null };
   wechatProactiveRef: { current: ProactiveReceiverHandler | null };
   qqOutboundRef: { current: ReturnType<typeof makeQqOutboundReceiver> | null };
@@ -836,6 +842,16 @@ export async function bootstrapInternalProxyAndListeners(
         identityRepo,
         runtimeRef: deps.delegateEngineBillingRuntimeRef,
       });
+      const delegateRemoteLaneHandler = makeDelegateRemoteLaneHandler({
+        identityRepo,
+        pool: getPool(),
+        flavorIdentity: deps.flavorIdentity,
+        env: process.env,
+        loadUserModelAuthz: deps.loadUserModelAuthz,
+        cc5RuntimeRef: deps.cc5RuntimeRef,
+        getModelAuthoritySigner: deps.getModelAuthoritySigner,
+        getModelCatalog: () => modelCatalogForProxy ?? peekModelCatalogCache(),
+      });
       if (deps.runtimeChannel === "v5") {
         deps.setSeedPlatformAgentsForLeadership(async () => {
           try {
@@ -1147,6 +1163,9 @@ export async function bootstrapInternalProxyAndListeners(
         if (path === DELEGATE_TRACE_PATH) return delegateTraceHandler(req, res, ctx);
         if (isDelegateEngineBillingInternalPath(path)) {
           return delegateEngineBillingHandler(req, res, ctx, path);
+        }
+        if (isDelegateRemoteLaneInternalPath(path)) {
+          return delegateRemoteLaneHandler(req, res, ctx, path);
         }
         if (path === CRON_INDEX_PATH) return cronIndexHandler(req, res, ctx);
         if (path === CRON_ORIGIN_INJECT_PATH) return cronOriginInjectHandler(req, res, ctx);

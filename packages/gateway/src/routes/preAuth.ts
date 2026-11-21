@@ -41,11 +41,13 @@ import {
 } from '../v3MarketplaceRelay.js'
 import { decideSkillLocalRelay, SKILL_LOCAL_RELAY_PREFIX } from '../ocSkillLocalRelay.js'
 import { handleProjectSearchLocal, PROJECT_SEARCH_LOCAL_PATH } from '../projectSearchLocal.js'
+import { REMOTE_SWARM_LOCAL_PREFIX } from '../remoteSwarmLocal.js'
 import type { Gateway, GatewayDeps } from '../server.js'
 import { type HttpRoute, predicateRoute, regexRoute } from './routeTable.js'
 
 export interface PreAuthRoutesIo {
   handleSystemHelp?(req: IncomingMessage, res: ServerResponse): Promise<void>
+  handleRemoteSwarmLocal?(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void>
   _handleSkillEvalGenStart(
     req: IncomingMessage,
     res: ServerResponse,
@@ -285,6 +287,20 @@ export const PRE_AUTH_ROUTES: readonly HttpRoute<PreAuthRoutesIo>[] = [
       })
         .then((r) => io.sendJson(res, r.status, r.body))
         .catch((err) => io.sendInternalError(res, err))
+      return true
+    },
+  ),
+  // Remote Antigravity Swarm local RPC (OCV5-835): loopback-only + raw gateway token.
+  // Never exposed on /api/* so the browser proxy never reaches it.
+  predicateRoute(
+    'REMOTE_SWARM_LOCAL_PREFIX',
+    (_req, url) => url.pathname.startsWith(`${REMOTE_SWARM_LOCAL_PREFIX}/`),
+    (io, req, res, url) => {
+      if (!io.handleRemoteSwarmLocal) {
+        io.sendJson(res, 503, { ok: false, error: 'remote swarm handler unavailable' })
+        return true
+      }
+      void io.handleRemoteSwarmLocal(req, res, url).catch((err) => io.sendInternalError(res, err))
       return true
     },
   ),

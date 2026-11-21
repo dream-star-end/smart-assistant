@@ -110,7 +110,12 @@ import {
   handleTaskList,
   handleTaskUpdate,
 } from './taskboardMcp.js'
-import { SKILL_PROPOSE_TOOL, TOOLS, normalizeAskUserQuestions } from './toolDefs.js'
+import { REMOTE_SWARM_TOOLS, SKILL_PROPOSE_TOOL, TOOLS, normalizeAskUserQuestions } from './toolDefs.js'
+import {
+  handleRemoteSwarmTool,
+  isRemoteSwarmEnabled,
+  isRemoteSwarmToolName,
+} from './remoteSwarmMcp.js'
 import {
   createPresentOptionsCallBudget,
   handlePresentOptions,
@@ -218,12 +223,12 @@ const server = new Server(
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   // Training session REMOVES authoritative-write tools (only skill_propose drafts).
-  let base = SKILL_TRAIN_RUN_ID
+  let base: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> = SKILL_TRAIN_RUN_ID
     ? [
         ...TOOLS.filter((t) => t.name !== 'skill_save' && t.name !== 'skill_delete'),
         SKILL_PROPOSE_TOOL,
       ]
-    : TOOLS
+    : [...TOOLS]
   // ask_user 默认不暴露(Cursor 已改走正文 ```options 围栏)。仅当
   // OC_ASK_USER_MCP=1 且本进程是 Cursor 主会话时才恢复暴露。
   // discovery 过滤不是授权边界,CallTool 侧还有短路兜底。
@@ -247,6 +252,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   // CallTool repeats the check; oc_bash never passes the read-only allowlist.
   if (!isLocalCliToolEnabled(ENGINE_ID)) {
     base = base.filter((t) => !isLocalCliToolName(t.name) || (ADVISOR_READ_ONLY && isAdvisorReadOnlyMcpTool(t.name)))
+  }
+  if (isRemoteSwarmEnabled() && !ADVISOR_READ_ONLY && !SKILL_EVAL_MODE) {
+    base = [...base, ...REMOTE_SWARM_TOOLS]
   }
   // Cursor's normal consult transport is Bash. Ask mode removes shell tools,
   // so this turn must retain the same authenticated no-tools consult over MCP.
@@ -285,7 +293,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     // Discovery filtering is not an authorization boundary: an MCP client can
     // still call a hidden tool by name. Reject before any gateway request,
     // persistent write, or delegation starts.
-    if (SKILL_EVAL_MODE && isSkillEvalBlockedTool(name)) {
+    if (SKILL_EVAL_MODE && (isSkillEvalBlockedTool(name) || isRemoteSwarmToolName(name))) {
       return toolError(`tool "${name}" is disabled in eval sessions`)
     }
     if (isCursorHiddenDelegateTool(name) && !(ADVISOR_READ_ONLY && name === 'consult_advisor')) {
@@ -353,6 +361,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleOcGrep(args)
       case 'oc_glob':
         return await handleOcGlob(args)
+      case 'swarm':
+      case 'post_message':
+      case 'read_board':
+      case 'swarm_wait':
+        return await handleRemoteSwarmTool(name, args as Record<string, unknown> | undefined)
       case 'ask_user':
         return await handleAskUser(args as any)
       case 'present_options': {

@@ -14,8 +14,12 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
-import { SKILL_PROPOSE_TOOL, TOOLS } from '../toolDefs.js'
-import { MEMORY_MCP_TOOL_NAMES, MEMORY_MCP_TRAIN_ONLY_TOOL_NAMES } from '../toolNames.js'
+import { REMOTE_SWARM_TOOLS, SKILL_PROPOSE_TOOL, TOOLS } from '../toolDefs.js'
+import {
+  MEMORY_MCP_REMOTE_SWARM_TOOL_NAMES,
+  MEMORY_MCP_TOOL_NAMES,
+  MEMORY_MCP_TRAIN_ONLY_TOOL_NAMES,
+} from '../toolNames.js'
 
 describe('TOOLS ↔ toolNames.ts 锁步', () => {
   it('consult_advisor verification instruction preserves the user no-write exception', () => {
@@ -49,8 +53,21 @@ describe('TOOLS ↔ toolNames.ts 锁步', () => {
     }
   })
 
+  it('REMOTE_SWARM_TOOLS 归远端蜂群专属,与 MEMORY_MCP_REMOTE_SWARM_TOOL_NAMES 锁步且不混入常规集', () => {
+    assert.deepEqual(
+      REMOTE_SWARM_TOOLS.map((t) => t.name),
+      [...MEMORY_MCP_REMOTE_SWARM_TOOL_NAMES],
+    )
+    for (const n of MEMORY_MCP_REMOTE_SWARM_TOOL_NAMES) {
+      assert.ok(
+        !MEMORY_MCP_TOOL_NAMES.includes(n as (typeof MEMORY_MCP_TOOL_NAMES)[number]),
+        `${n} 不应同时出现在常规工具集`,
+      )
+    }
+  })
+
   it('每个工具定义结构完整(name 为字符串 + 带 inputSchema)', () => {
-    for (const t of [...TOOLS, SKILL_PROPOSE_TOOL]) {
+    for (const t of [...TOOLS, SKILL_PROPOSE_TOOL, ...REMOTE_SWARM_TOOLS]) {
       assert.equal(typeof t.name, 'string')
       assert.ok(t.name.length > 0)
       assert.ok(t.inputSchema, `${t.name} 缺 inputSchema`)

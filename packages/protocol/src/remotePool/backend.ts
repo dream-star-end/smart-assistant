@@ -2,7 +2,6 @@
  * Generic versioned remote driver execution backend (`remote-driver-v4`).
  * Legacy `cc5-interactive-v1` and `codex-app-server-v1` wire formats remain dual-read compatible.
  */
-import { parseCc5ExecutionBackend } from '../cc5Backend.js'
 import type { ModelAuthorityEngine } from '../modelAuthority.js'
 
 export type RemoteDriverAuthorityEngine = ModelAuthorityEngine
@@ -16,6 +15,19 @@ const GENERATION_RE = /^[1-9][0-9]{0,15}$/
 const PROFILE_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
 const AUTH_EPOCH_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const REMOTE_CANONICAL_MODEL_RE = /^[a-z0-9][a-z0-9._-]{0,56}-remote$/
+const REMOTE_DRIVER_OPERATION_ID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\s\S])/
+// Allows normal webchat sessions (preserving the historical 8..50 peer bound)
+// as well as container-initiated delegate (`:delegate:<source>:<id>`) and remote
+// Antigravity swarm worker (`:swarm:dm:<id>`) child sessions (OCV5-835).
+export const REMOTE_DRIVER_CHILD_SESSION_KEY_RE =
+  /^agent:[A-Za-z0-9_-]{1,64}:(?:delegate:[A-Za-z0-9_-]{1,64}|swarm:dm):[A-Za-z0-9_.:-]{8,160}(?![\s\S])/
+const REMOTE_DRIVER_SESSION_KEY_RE =
+  /^agent:[A-Za-z0-9_-]{1,64}:(?:webchat:dm:[A-Za-z0-9_-]{8,50}|(?:delegate:[A-Za-z0-9_-]{1,64}|swarm:dm):[A-Za-z0-9_.:-]{8,160})(?![\s\S])/
+
+export function isRemoteDriverChildSessionKey(sessionKey: string): boolean {
+  return REMOTE_DRIVER_CHILD_SESSION_KEY_RE.test(sessionKey)
+}
 
 const AUTHORITY_ENGINES: ReadonlySet<ModelAuthorityEngine> = new Set<ModelAuthorityEngine>([
   'ccb',
@@ -95,11 +107,12 @@ export function parseRemoteDriverExecutionBackend(raw: unknown): RemoteDriverExe
   if (requiredAuthority !== undefined && b.authorityEngine !== requiredAuthority) {
     throw new Error('REMOTE_DRIVER_BACKEND_SCOPE_INVALID')
   }
-  parseCc5ExecutionBackend({
-    kind: 'cc5-interactive-v1',
-    sessionKey: b.sessionKey,
-    operationId: b.operationId,
-  })
+  if (
+    !REMOTE_DRIVER_SESSION_KEY_RE.test(b.sessionKey) ||
+    !REMOTE_DRIVER_OPERATION_ID_RE.test(b.operationId)
+  ) {
+    throw new Error('REMOTE_DRIVER_BACKEND_SCOPE_INVALID')
+  }
   return Object.freeze({
     kind: REMOTE_DRIVER_BACKEND,
     version: 4,

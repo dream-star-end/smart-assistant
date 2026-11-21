@@ -1,6 +1,7 @@
 import { withUserError } from '@openclaude/protocol'
 import { getSystemHelpRelay, installSystemHelpRelay } from './systemHelpRelay.js'
 import { handleSystemHelpLocal } from './systemHelpHttp.js'
+import { createGatewayRemoteSwarmRuntime, handleGatewayRemoteSwarmHttp, type RemoteSwarmRuntime } from './remoteSwarmLocal.js'
 import { createTaskboardPreflight } from './taskboard/stagePreflight.js'
 export { runSessionPreheat, validateEnginePreheatBody } from './sessionPreheat.js'
 export type { EnginePreheatBody, EnginePreheatValidation, SessionPreheatHost } from './sessionPreheat.js'
@@ -594,6 +595,7 @@ export class Gateway {
    * dispatch request. Local/personal WS peers can never receive a grant. */
   private _bridgeConnections = new WeakSet<WebSocket>()
   private _promptQueueCoordinator: PromptQueueCoordinator | null = null
+  private _remoteSwarmRuntime: RemoteSwarmRuntime | null = null
   private _promptQueueLifecycleByFrame = new WeakMap<object, PromptQueueTurnLifecycle>()
   private _promptQueueExecutionFenceByFrame = new WeakMap<object, PromptQueueExecutionFence>()
   private _promptQueueClientSessions = new WeakMap<WebSocket, Set<string>>()
@@ -834,13 +836,12 @@ export class Gateway {
     // 由此 callback 统一走 outboundRing.clear,防 ring 内存长期泄漏。server.ts
     // 其他已有的 destroySession 调用点仍然显式 clear(幂等 double-clear 无副作用)。
     this.sessions.onSessionDestroyed = (sessionKey) => {
-      try {
-        this._outboundRing.clear(sessionKey)
-        outboundRingSizeBytes.value = this._outboundRing.totalBytes()
-      } catch {}
+      try { this._outboundRing.clear(sessionKey); outboundRingSizeBytes.value = this._outboundRing.totalBytes() } catch {}
       clearCcbLocalAgentPendingForSession(sessionKey)
+      void this._remoteSwarmRuntime?.shutdownSession(sessionKey).catch(() => {})
     }
   }
+  private _ensureRemoteSwarmRuntime(): RemoteSwarmRuntime { return (this._remoteSwarmRuntime ??= createGatewayRemoteSwarmRuntime({ sessions: this.sessions, getAgentsConfig: () => this._getAgentsConfig(), defaultModel: this.deps.config.defaults.model, log: this.log })) }
 
   /** Feed `prune()` eviction counts into Prometheus counters. Called from
    *  every store/peekReplay site so age-on-read pruning is also reflected.
@@ -886,6 +887,7 @@ export class Gateway {
   /** Narrow view of the Gateway for routes/preAuth.ts (FINDINGS §7.5 2b, OCV5-468). */
   private readonly preAuthRoutesIo: PreAuthRoutesIo = ((gw: Gateway): PreAuthRoutesIo => ({
     handleSystemHelp: (req, res) => handleSystemHelpLocal(req, res, getSystemHelpRelay(gw.sessions)),
+    handleRemoteSwarmLocal: (req, res, url) => handleGatewayRemoteSwarmHttp({ req, res, url, extractToken: (r) => gw.extractToken(r), accessToken: gw.deps.config.gateway.accessToken, readBody: (r, m) => gw.readBody(r, m), sendJson: (r, c, b) => gw.sendJson(r, c, b), runtime: gw._ensureRemoteSwarmRuntime(), sessions: gw.sessions }),
     _handleSkillEvalGenStart: (...args) => gw._handleSkillEvalGenStart(...args),
     _handleSkillEvalGenStatus: (...args) => gw._handleSkillEvalGenStatus(...args),
     _handleSkillTrainRun: (...args) => gw._handleSkillTrainRun(...args),

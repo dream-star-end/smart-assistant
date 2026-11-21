@@ -19,8 +19,10 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import { antigravityRoot, antigravitySessionBrainDir } from '../engine/antigravityPlatform.js'
+import { lookupRemoteSwarmRuntimeForSession } from '../remoteSwarmRuntime.js'
 import {
   handleSwarmCommandRoute,
+  parseSwarmControlCommand,
   type ResolvedSessionSwarmTarget,
 } from '../swarmCommand.js'
 import {
@@ -231,6 +233,59 @@ export async function handleInternalSwarmCommand(
     return
   }
 
+  // If this session is an active Remote Antigravity Swarm coordinator, route trusted
+  // human kill commands directly through `RemoteSwarmRuntime.executeOperatorKill` (honest
+  // confirmed vs pending stop) and wake workers after `steer` board writes (OCV5-835).
+  const lookedUpSession = deps.lookupSessionTarget?.(sessionId) ?? null
+  const remoteRuntime = lookedUpSession?.sessionKey
+    ? lookupRemoteSwarmRuntimeForSession(lookedUpSession.sessionKey)
+    : undefined
+
+  if (remoteRuntime && lookedUpSession?.sessionKey) {
+    try {
+      const parsedBody = JSON.parse(rawBody.toString('utf8') || '{}') as Record<string, unknown>
+      let action = typeof parsedBody.action === 'string' ? parsedBody.action.trim().toLowerCase() : ''
+      let memberName =
+        typeof parsedBody.memberName === 'string'
+          ? parsedBody.memberName
+          : typeof parsedBody.target === 'string'
+            ? parsedBody.target
+            : ''
+      let reason = typeof parsedBody.reason === 'string' ? parsedBody.reason : undefined
+      if (!action && typeof parsedBody.command === 'string') {
+        const cmd = parseSwarmControlCommand(parsedBody.command)
+        if (cmd?.kind === 'kill') {
+          action = 'kill'
+          memberName = cmd.memberName
+          reason = cmd.reason
+        }
+      }
+      if ((action === 'kill' || action === 'terminate') && memberName.trim()) {
+        const killRes = await remoteRuntime.executeOperatorKill(
+          lookedUpSession.sessionKey,
+          memberName.trim(),
+          reason || `user:${userId}`,
+        )
+        if (killRes.notFound) {
+          sendJson(res, 404, { ok: false, code: 'MEMBER_NOT_FOUND', error: `member not found: ${memberName}` })
+          return
+        }
+        sendJson(res, 200, {
+          ok: true,
+          action: 'terminate',
+          status: killRes.confirmed ? 'confirmed' : 'requested',
+          killed: killRes.killed,
+          unconfirmed: killRes.unconfirmed,
+          alreadyKilled: killRes.alreadyKilled,
+          preservedDirtyWorktrees: killRes.preservedDirtyWorktrees,
+        })
+        return
+      }
+    } catch {
+      // Malformed JSON falls through to handleSwarmCommandRoute's standard 400 validation.
+    }
+  }
+
   // Feed the signature-verified bytes into `handleSwarmCommandRoute` with canonical URL
   // `/api/sessions/:id/swarm/command` so 100% of validation, brainDir rejection, steer,
   // terminate, playbook & locking stay authoritative.
@@ -247,6 +302,9 @@ export async function handleInternalSwarmCommand(
       (async (_uid, sid) => resolveAuthoritativeSessionSwarm(sid, deps)),
     now: deps.now,
   })
+  if (remoteRuntime && lookedUpSession?.sessionKey) {
+    remoteRuntime.onExternalBoardWrite(lookedUpSession.sessionKey)
+  }
 }
 
 export const SWARM_COMMAND_INTERNAL_ROUTES: readonly HttpRoute<PlatformRoutesIo>[] = [

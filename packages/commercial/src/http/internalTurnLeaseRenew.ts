@@ -188,6 +188,25 @@ export function makeTurnLeaseRenewHandler(deps: TurnLeaseRenewHandlerDeps): Turn
           [lease.authorityTurnId, identity.userId, identity.containerId],
         )
       }
+      if (active) {
+        // Extend lease_until for active delegate-remote dispatches alongside rolling turn lease
+        // renewal so >30 min remote delegate/swarm dispatches stay alive across renewals (OCV5-835).
+        await client.query(
+          `UPDATE turn_dispatches td
+              SET lease_until = GREATEST(
+                    COALESCE(td.lease_until, NOW()),
+                    NOW() + ($3::bigint * INTERVAL '1 millisecond')
+                  )
+             FROM authority_turn_dispatches atd
+            WHERE atd.authority_turn_id = $1
+              AND atd.user_id = $2
+              AND td.dispatch_id = atd.dispatch_id
+              AND td.owner_id LIKE 'delegate-remote:%'
+              AND td.status IN ('admitted', 'accepted')
+              AND td.terminal_at IS NULL`,
+          [lease.authorityTurnId, identity.userId, TURN_LEASE_TTL_MS],
+        )
+      }
       // Expired signatures authenticate identity only. A historical journal
       // can never reactivate a completed/revoked dispatch.
       if (!active && lease.expiresAt <= now) {

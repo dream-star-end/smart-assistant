@@ -120,6 +120,12 @@ export const DELEGATE_TRACE_PATH = '/internal/v3/delegate/trace'
 export const DELEGATE_ENGINE_BILLING_ADMIT_PATH = '/internal/v3/delegate/engine-billing/admit'
 export const DELEGATE_ENGINE_BILLING_SETTLE_PATH = '/internal/v3/delegate/engine-billing/settle'
 export const DELEGATE_ENGINE_BILLING_ABANDON_PATH = '/internal/v3/delegate/engine-billing/abandon'
+export const DELEGATE_REMOTE_LANE_ENSURE_PATH = '/internal/v3/delegate/remote-lane/ensure'
+export const DELEGATE_REMOTE_LANE_RELEASE_PATH = '/internal/v3/delegate/remote-lane/release'
+
+export function isDelegateRemoteLaneInternalPath(path: string): boolean {
+  return path === DELEGATE_REMOTE_LANE_ENSURE_PATH || path === DELEGATE_REMOTE_LANE_RELEASE_PATH
+}
 export const WECHAT_OUTBOUND_PATH = '/internal/v3/wechat-outbound'
 export const WECHAT_PROACTIVE_PATH = '/internal/v3/wechat-proactive'
 export const QQ_OUTBOUND_PATH = '/internal/v3/qq-outbound'
@@ -150,6 +156,8 @@ export const MARKETPLACE_LOCAL_RELAY_PREFIX = '/internal/v3/marketplace/agent-lo
 export const SKILL_LOCAL_RELAY_PREFIX = '/internal/v3/skill-local'
 /** project_search MCP tool → this container's gateway (loopback + gateway token), then master. */
 export const PROJECT_SEARCH_LOCAL_PATH = '/internal/v3/project-search-local'
+/** Remote Antigravity Swarm MCP tools → this container's gateway (loopback + gateway token). */
+export const REMOTE_SWARM_LOCAL_PREFIX = '/internal/v3/remote-swarm'
 
 export type InternalRoutePlane = 'v3' | 'v5'
 export type InternalRouteMatch = 'exact' | 'prefix'
@@ -672,6 +680,26 @@ export const INTERNAL_ROUTES = [
     match: 'exact',
     plane: 'v3',
     sources: ['gateway/src/projectSearchLocal.ts', 'mcp-memory/src/projectFileSearch.ts'],
+  },
+  {
+    path: REMOTE_SWARM_LOCAL_PREFIX,
+    match: 'prefix',
+    plane: 'v3',
+    sources: ['gateway/src/remoteSwarmRuntime.ts', 'mcp-memory/src/remoteSwarmMcp.ts'],
+  },
+  {
+    path: DELEGATE_REMOTE_LANE_ENSURE_PATH,
+    match: 'exact',
+    plane: 'v3',
+    selfhostOnly: true,
+    sources: ['gateway/src/delegateRemoteLane.ts', 'commercial/src/http/internalDelegateRemoteLane.ts'],
+  },
+  {
+    path: DELEGATE_REMOTE_LANE_RELEASE_PATH,
+    match: 'exact',
+    plane: 'v3',
+    selfhostOnly: true,
+    sources: ['gateway/src/delegateRemoteLane.ts', 'commercial/src/http/internalDelegateRemoteLane.ts'],
   },
 ] as const satisfies readonly InternalRouteEntry[]
 

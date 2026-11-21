@@ -32,12 +32,37 @@ const here = dirname(fileURLToPath(import.meta.url))
 // Preserve the frozen extraction baseline; specify later route additions independently.
 const CURRENT_HTTP_DISPATCH: Record<string, LegacyGroup> = {
   ...LEGACY_HTTP_DISPATCH,
-  PRE_AUTH_ROUTES: {
-    ...LEGACY_HTTP_DISPATCH.PRE_AUTH_ROUTES,
-    routes: [{ id: 'SYSTEM_HELP_LOCAL', line: 0, calls: ['handleSystemHelp'],
-      match: (_req, url) => url.pathname === '/api/internal/system-help' }, ...LEGACY_HTTP_DISPATCH.PRE_AUTH_ROUTES.routes],
-    samples: ['/api/internal/system-help', ...LEGACY_HTTP_DISPATCH.PRE_AUTH_ROUTES.samples],
-  },
+  PRE_AUTH_ROUTES: (() => {
+    const base = LEGACY_HTTP_DISPATCH.PRE_AUTH_ROUTES
+    const afterProjectSearch = base.routes.findIndex((r) => r.id === 'PROJECT_SEARCH_LOCAL_PATH') + 1
+    const remoteSwarmRoute = {
+      id: 'REMOTE_SWARM_LOCAL_PREFIX',
+      line: 0,
+      calls: ['handleRemoteSwarmLocal', 'sendInternalError'],
+      match: (_req: { method?: string }, url: URL) =>
+        url.pathname.startsWith('/internal/v3/remote-swarm/'),
+    }
+    return {
+      ...base,
+      routes: [
+        {
+          id: 'SYSTEM_HELP_LOCAL',
+          line: 0,
+          calls: ['handleSystemHelp'],
+          match: (_req: { method?: string }, url: URL) => url.pathname === '/api/internal/system-help',
+        },
+        ...base.routes.slice(0, afterProjectSearch),
+        remoteSwarmRoute,
+        ...base.routes.slice(afterProjectSearch),
+      ],
+      samples: [
+        '/api/internal/system-help',
+        '/internal/v3/remote-swarm/swarm',
+        '/internal/v3/remote-swarm/post_message',
+        ...base.samples,
+      ],
+    }
+  })(),
   PLATFORM_ROUTES: {
     ...LEGACY_HTTP_DISPATCH.PLATFORM_ROUTES,
     routes: [

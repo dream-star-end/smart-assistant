@@ -11,8 +11,12 @@
  *   to `RemoteContainerLane`.
  */
 import { EventEmitter } from 'node:events'
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import {
+  SWARM_BOARD_TOOL_NAME,
+  mergeSwarmSnapshots,
   parseRemoteDriverExecutionBackend,
   sameRemoteExecutionBackend,
   type GoalStateSnapshot,
@@ -21,9 +25,18 @@ import {
   type RemoteDriverExecutionBackend,
   type RemoteReceiptV4,
   type RemoteSecurityEvent,
+  type SwarmPhase,
+  type SwarmSnapshot,
   type TurnTokenUsageSnapshot,
 } from '@openclaude/protocol'
+import {
+  AntigravitySwarmWatcher,
+  buildDurableSwarmBoardInput,
+  formatSwarmWorkingDetail,
+  settleSwarmSnapshotTerminal,
+} from '../engine/antigravitySwarmWatcher.js'
 import { buildCodexBillingEvent } from '../engine/codexAdapter.js'
+import { remoteSwarmLocationForSession } from '../remoteSwarmRuntime.js'
 import type { IntelligentUiApplied } from '../promptSlots.js'
 import type {
   EngineAdapter,
@@ -51,6 +64,16 @@ import { remotePoolNeed } from './types.js'
 const DEFAULT_PHANTOM_SIGNALS: PhantomSignals = {
   apiState: 'called',
   skipReason: null,
+}
+
+const REMOTE_SWARM_TOOL_NAMES = new Set(['swarm', 'post_message', 'read_board', 'swarm_wait'])
+
+function isRemoteSwarmToolName(toolName: string): boolean {
+  if (REMOTE_SWARM_TOOL_NAMES.has(toolName)) return true
+  if (toolName.startsWith('mcp__openclaude-memory__')) {
+    return REMOTE_SWARM_TOOL_NAMES.has(toolName.slice('mcp__openclaude-memory__'.length))
+  }
+  return false
 }
 
 function renderToolResultText(content: unknown): string {
@@ -161,6 +184,19 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
     return this.lane.fenceError?.message
   }
 
+  /** Expose active container-side Remote Swarm board location for `POST /internal/swarm/command`. */
+  getActiveSwarmTarget(): { brainDir: string; conversationId: string } | null {
+    if (
+      this.engineId !== 'antigravity' ||
+      this.executionBackend.sessionKey.includes(':swarm:')
+    ) {
+      return null
+    }
+    const loc = remoteSwarmLocationForSession(this.executionBackend.sessionKey)
+    if (!existsSync(join(loc.swarmDir, 'members.json'))) return null
+    return { brainDir: loc.brainDir, conversationId: loc.swarmId }
+  }
+
   async start(): Promise<void> {
     // Admission occurs lazily on the first authorized turn (`beginTurn`/`executeTurn`).
   }
@@ -234,17 +270,144 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
       resolveSummary = res
     })
 
-    const getPartialSnapshot = (): PartialSnapshot => ({
-      assistantText: assistantBuf,
-      thinkingText: thinkingBuf,
-      completedTools: [...toolsById.values()].map((t) => structuredClone(t)),
-      assistantSegments: assistantSegments.map((s) => ({ ...s })),
-      thinkingSegments: thinkingSegments.map((s) => ({ ...s })),
-      runtimeEvents: runtimeEvents.map((e) => structuredClone(e)),
-    })
+    // Remote Antigravity coordinator sessions watch their container-side SwarmBoard
+    // directory (`remoteSwarmLocationForSession`) so SwarmBoard UI receives live
+    // snapshots, delta posts, and durable turn persistence identically to local AGY.
+    let swarmWatcher: AntigravitySwarmWatcher | null = null
+    let lastEmittedSwarmSnapshot: SwarmSnapshot | null = null
+    let swarmBlockId: string | undefined
+    let swarmEventOrdinal: number | undefined
+    let swarmCommitted = false
+
+    const swarmBlockIdFor = (swarmId: string): string => {
+      if (!swarmBlockId) {
+        swarmBlockId = `agy-swarm-${swarmId.slice(0, 8)}-t${params.sessionTotals.turns}`
+      }
+      return swarmBlockId
+    }
+
+    const emitSwarmSnapshot = (snapshot: SwarmSnapshot): void => {
+      if (finalized) return
+      lastEmittedSwarmSnapshot =
+        swarmWatcher?.latestSnapshot() ??
+        mergeSwarmSnapshots(lastEmittedSwarmSnapshot, snapshot) ??
+        structuredClone(snapshot)
+      this.lastActivityAt = Date.now()
+      this.emit('activity')
+      const blockId = swarmBlockIdFor(snapshot.swarmId)
+      if (swarmEventOrdinal === undefined) {
+        swarmEventOrdinal = nextOrdinal()
+      }
+      params.onEvent({
+        kind: 'block',
+        block: {
+          kind: 'swarm_snapshot',
+          blockId,
+          snapshot,
+        } as OutboundContentBlock,
+      })
+      if (snapshot.phase === 'running' || snapshot.phase === 'starting') {
+        params.onEvent({
+          kind: 'turn_status',
+          status: { status: 'working', detail: formatSwarmWorkingDetail(snapshot) },
+        })
+      }
+    }
+
+    const commitTerminalSwarmBoard = (
+      phase: SwarmPhase,
+      opts: { emitEvent: boolean; readDisk: boolean },
+    ): void => {
+      if (swarmCommitted) {
+        swarmWatcher?.stop()
+        swarmWatcher = null
+        return
+      }
+      const watcher = swarmWatcher
+      swarmWatcher = null
+      let finalSwarm: SwarmSnapshot | null = null
+      if (opts.readDisk && watcher) {
+        finalSwarm = watcher.stopAndReadFinal(phase)
+      } else {
+        watcher?.stop()
+        const hadActivity = (watcher?.hasTurnActivity() ?? false) || lastEmittedSwarmSnapshot !== null
+        const base = lastEmittedSwarmSnapshot ?? (hadActivity ? watcher?.latestSnapshot() ?? null : null)
+        if (hadActivity && base) {
+          finalSwarm = settleSwarmSnapshotTerminal(base, phase)
+        }
+      }
+      if (!finalSwarm) return
+      swarmCommitted = true
+      lastEmittedSwarmSnapshot = structuredClone(finalSwarm)
+      const blockId = swarmBlockIdFor(finalSwarm.swarmId)
+      if (opts.emitEvent && !finalized) {
+        params.onEvent({
+          kind: 'block',
+          block: {
+            kind: 'swarm_snapshot',
+            blockId,
+            snapshot: finalSwarm,
+          } as OutboundContentBlock,
+        })
+      }
+      const durableInput = buildDurableSwarmBoardInput(finalSwarm)
+      const swarmSummary = formatSwarmWorkingDetail(finalSwarm)
+      const swarmStartedAt = finalSwarm.startedAt ?? startedAtMs
+      toolsById.set(blockId, {
+        toolUseId: blockId,
+        blockId,
+        toolName: SWARM_BOARD_TOOL_NAME,
+        inputJson: durableInput,
+        inputPreview: durableInput.title.slice(0, 500),
+        output: swarmSummary,
+        completed: true,
+        isError: phase === 'error',
+        durationMs: Math.max(0, Date.now() - swarmStartedAt),
+        ts: Date.now(),
+        arrivedAt: swarmStartedAt,
+        eventOrdinal: swarmEventOrdinal ?? nextOrdinal(),
+      })
+    }
+
+    if (
+      this.engineId === 'antigravity' &&
+      !this.executionBackend.sessionKey.includes(':swarm:')
+    ) {
+      const loc = remoteSwarmLocationForSession(this.executionBackend.sessionKey)
+      swarmWatcher = new AntigravitySwarmWatcher({
+        brainDir: loc.brainDir,
+        conversationId: loc.swarmId,
+        seedBaselineOnStart: existsSync(loc.swarmDir),
+        onSnapshot: emitSwarmSnapshot,
+      })
+      swarmWatcher.start()
+    }
+
+    const getPartialSnapshot = (): PartialSnapshot => {
+      if (userCancelled || interruptReason !== null) {
+        commitTerminalSwarmBoard('interrupted', { emitEvent: false, readDisk: false })
+      }
+      return {
+        assistantText: assistantBuf,
+        thinkingText: thinkingBuf,
+        completedTools: [...toolsById.values()].map((t) => structuredClone(t)),
+        assistantSegments: assistantSegments.map((s) => ({ ...s })),
+        thinkingSegments: thinkingSegments.map((s) => ({ ...s })),
+        runtimeEvents: runtimeEvents.map((e) => structuredClone(e)),
+      }
+    }
 
     const finalizeWith = (value: TurnSummary | null): void => {
       if (finalized) return
+      if (!swarmCommitted) {
+        commitTerminalSwarmBoard(
+          userCancelled || interruptReason !== null ? 'interrupted' : 'error',
+          { emitEvent: false, readDisk: false },
+        )
+      } else {
+        swarmWatcher?.stop()
+        swarmWatcher = null
+      }
       finalized = true
       rejectPendingPermissions('TURN_FINALIZED')
       if (this._activeRun === activeHandle) {
@@ -336,6 +499,9 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
       if (payload.kind === 'toolCallObserved' && payload.phase === 'started') {
         const callId = payload.callId
         const toolName = this.lane.resolveClientToolName(payload.name)
+        if (isRemoteSwarmToolName(toolName)) {
+          swarmWatcher?.activateTurnSwarm()
+        }
         const inputPreview = formatInputPreview(payload.arguments)
         const nowMs = Date.now()
         params.toolUseIdToName.set(callId, toolName)
@@ -455,6 +621,12 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
 
       const isInterrupted = receipt.nativeStatus === 'interrupted' || userCancelled
       const isError = receipt.status === 'error' || isInterrupted
+      const finalSwarmPhase: SwarmPhase = isInterrupted
+        ? 'interrupted'
+        : isError
+          ? 'error'
+          : 'completed'
+      commitTerminalSwarmBoard(finalSwarmPhase, { emitEvent: true, readDisk: true })
 
       if (this.capabilities.billingMode === 'engine-reported' && params.requestId) {
         this.emit(
@@ -641,6 +813,9 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
               this.lastActivityAt = Date.now()
               this.emit('activity')
               completeToolResult(callId, clientToolName, result.content, result.isError)
+              if (isRemoteSwarmToolName(clientToolName)) {
+                swarmWatcher?.kick()
+              }
             },
           },
         )

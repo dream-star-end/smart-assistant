@@ -1051,6 +1051,9 @@ export async function registerCommercial(
   const delegateEngineBillingRuntimeRef: { current: DelegateEngineBillingRuntime | null } = {
     current: null,
   };
+  const cc5RuntimeRef: { current: ReturnType<typeof createMasterCc5Runtime> } = {
+    current: undefined,
+  };
   // 主动微信投递接收点(cron/提醒 → master 权威解析收件人 → outbox)。与 broker 同生命周期,
   // 同条件块内装配;未装配时 dispatchInternal 显式 404(同 wechat-outbound 语义)。
   const wechatProactiveRef: { current: ProactiveReceiverHandler | null } = { current: null };
@@ -1168,6 +1171,7 @@ export async function registerCommercial(
     autoDreamOptimizerRuntimeRef,
     commercialCodexRouteRef,
     delegateEngineBillingRuntimeRef,
+    cc5RuntimeRef,
     wechatBrokerRef,
     wechatProactiveRef,
     qqOutboundRef,
@@ -1245,6 +1249,7 @@ export async function registerCommercial(
     const v3Docker = assembled.v3Docker;
     v3Deps = assembled.v3Deps;
     cc5Runtime = assembled.cc5Runtime;
+    cc5RuntimeRef.current = cc5Runtime;
 
     if (dualMasterEnabled && controlPlaneEnabled) {
       const preheatOn = process.env.OC_PREHEAT_DISABLED !== "1";

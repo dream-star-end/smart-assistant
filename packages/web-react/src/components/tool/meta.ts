@@ -293,6 +293,10 @@ const MCP_OP_META: Record<string, ToolMeta> = {
   "openclaude-memory:oc_bash": { icon: Terminal, label: "执行命令" },
   "openclaude-memory:oc_grep": { icon: Search, label: "搜索内容" },
   "openclaude-memory:oc_glob": { icon: FolderOpen, label: "查找文件" },
+  "openclaude-memory:swarm": { icon: Users, label: "蜂群调度" },
+  "openclaude-memory:post_message": { icon: Send, label: "讨论板发言" },
+  "openclaude-memory:read_board": { icon: NotebookPen, label: "查看讨论板" },
+  "openclaude-memory:swarm_wait": { icon: Clock, label: "等待蜂群消息" },
   // codex 内建 MCP 资源清单(op 无摘要,空态即全部信息)。
   "codex:list_mcp_resources": { icon: Boxes, label: "MCP 资源列表" },
   "codex:list_mcp_resource_templates": { icon: Layers, label: "MCP 资源模板" },

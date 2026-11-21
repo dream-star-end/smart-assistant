@@ -38,19 +38,17 @@ export function extractSwarmSnapshotFromMessage(msg: ChatMessage | null | undefi
 }
 
 /**
- * UI-side check for local Antigravity models capable of native Swarm mode without
+ * UI-side check for Antigravity models capable of Swarm mode without
  * pulling the full Node model metadata table into the first-screen browser chunk.
- * Remote-pool Antigravity routes (`placement === 'remote_pool'` or `-remote` slug)
- * do not run local CLI swarm watchers and are excluded here AND fail-closed on the server.
+ * Both local Antigravity and remote-pool (`-remote`) Antigravity routes support
+ * Swarm mode (local uses CLI native swarm; remote uses container-side Swarm runtime).
  */
 export function isAntigravityModelForUi(
   modelId: string | null | undefined,
   models?: readonly { id: string; engine?: string; placement?: string }[],
 ): boolean {
   if (!modelId) return false;
-  if (modelId.endsWith("-remote")) return false;
   const hit = models?.find((m) => m.id === modelId);
-  if (hit?.placement === "remote_pool") return false;
   if (hit?.engine) return hit.engine === "antigravity";
   return /^antigravity-/i.test(modelId);
 }

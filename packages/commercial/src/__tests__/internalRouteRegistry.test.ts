@@ -37,6 +37,7 @@ import {
   type InternalRouteEntry,
   isDelegateAntigravityRoutePath,
   isDelegateGrokRoutePath,
+  isDelegateRemoteLaneInternalPath,
   isDelegateRouteForwardException,
   isRegisteredInternalPath,
 } from '@openclaude/protocol'
@@ -282,10 +283,24 @@ describe('internalRouteRegistry — dispatchInternal 挂载', () => {
       /OC_SELFHOST_ENGINE_LOCAL_TURNS === "1"/,
       'delegate antigravity-route 挂载的 selfhost 门控被改动(注册表 selfhostOnly 标记随之失真)',
     )
+    const remoteLaneHandler = await readFile(
+      new URL('../http/internalDelegateRemoteLane.ts', import.meta.url),
+      'utf8',
+    )
+    assert.match(
+      dispatch,
+      /isDelegateRemoteLaneInternalPath\(path\)/,
+      'dispatchInternal 里没有 delegate remote-lane 的挂载引用',
+    )
+    assert.match(
+      remoteLaneHandler,
+      /getRuntimeChannel\(\) === 'v5'[\s\S]{0,160}flavorIdentity\.flavor === 'selfhost'/,
+      'delegate remote-lane 的 selfhost 门控被改动(注册表 selfhostOnly 标记随之失真)',
+    )
     for (const entry of registryEntries) {
       if (entry.selfhostOnly) {
         assert.ok(
-          isDelegateRouteForwardException(entry.path),
+          isDelegateRouteForwardException(entry.path) || isDelegateRemoteLaneInternalPath(entry.path),
           `${entry.path}:标记了 selfhostOnly 但本测试不知道它的门控在哪 —— 请登记`,
         )
       }

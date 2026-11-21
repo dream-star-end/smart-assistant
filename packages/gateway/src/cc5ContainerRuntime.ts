@@ -171,6 +171,12 @@ export interface RemoteLaneRuntimePort {
   ensureLane(request: RemoteLaneRequest): Promise<RemoteExecutionBackend>
   /** A deleted chat frees its idle lanes (any agent); a lane mid-turn stays reclaimable as before. */
   releaseChat(uid: number, chatId: string): Promise<void>
+  /** Explicitly stops and reclaims a delegate/swarm lane keyed by full sessionKey. */
+  releaseSessionKey?(
+    uid: number,
+    sessionKey: string,
+    opts?: { containerDbId?: string; operationId?: string; generation?: string },
+  ): Promise<{ released: boolean; state: 'released' | 'not_found' | 'mismatch' | 'unknown' }>
 }
 
 interface RuntimeOptions {
@@ -431,6 +437,36 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       await this.stopLane(lane)
       if (owner.lane === lane) owner.lane = undefined
     })))
+  }
+
+  async releaseSessionKey(
+    uid: number,
+    sessionKey: string,
+    opts?: { containerDbId?: string; operationId?: string; generation?: string },
+  ): Promise<{ released: boolean; state: 'released' | 'not_found' | 'mismatch' | 'unknown' }> {
+    if (String(uid) !== this.uid || !sessionKey) return { released: false, state: 'not_found' }
+    const owner = this.chats.get(sessionKey)
+    if (!owner) return { released: true, state: 'not_found' }
+    return await this.serial(owner, async () => {
+      const lane = owner.lane
+      if (!lane) return { released: true, state: 'not_found' }
+      if (opts?.containerDbId && lane.binding.containerDbId !== opts.containerDbId) {
+        return { released: false, state: 'mismatch' }
+      }
+      if (opts?.operationId && lane.operationId !== opts.operationId) {
+        return { released: false, state: 'mismatch' }
+      }
+      if (opts?.generation && lane.generation !== opts.generation) {
+        return { released: false, state: 'mismatch' }
+      }
+      try {
+        await this.stopLane(lane)
+        if (owner.lane === lane) owner.lane = undefined
+        return { released: true, state: 'released' }
+      } catch {
+        return { released: false, state: 'unknown' }
+      }
+    })
   }
 
   private chat(sessionKey: string): ChatOwner {

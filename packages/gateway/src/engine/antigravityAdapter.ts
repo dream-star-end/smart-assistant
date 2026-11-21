@@ -32,7 +32,7 @@ import { dirname, join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import type { Readable, Writable } from 'node:stream'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import {
   ANTIGRAVITY_RELAY_PREFIX,
   SWARM_BOARD_TOOL_NAME,
@@ -83,6 +83,7 @@ import {
   formatSwarmWorkingDetail,
   settleSwarmSnapshotTerminal,
 } from './antigravitySwarmWatcher.js'
+import { lookupRemoteSwarmMcpContext } from '../remoteSwarmRuntime.js'
 import {
   prepareAntigravityNativeTrajectory,
   recoverAntigravityNativeTrajectory,
@@ -1767,6 +1768,32 @@ registerEngineRemoteContext('antigravity', async ({ opts, supportsVision, prompt
   const { learning, profile, env, cleanup } = await runner.prepareRemoteToolContext({
     supportsVision,
   })
+  const swarmCtx = lookupRemoteSwarmMcpContext(opts.sessionKey)
+  const swarmEnv: Record<string, string> = swarmCtx
+    ? {
+        OPENCLAUDE_REMOTE_SWARM_ENABLED: '1',
+        OPENCLAUDE_REMOTE_SWARM_SESSION_KEY: swarmCtx.coordinatorSessionKey,
+        OPENCLAUDE_REMOTE_SWARM_MEMBER: swarmCtx.memberName,
+        OPENCLAUDE_REMOTE_SWARM_TOKEN: swarmCtx.callerToken,
+      }
+    : {}
+  const mergedEnv: NodeJS.ProcessEnv = { ...env, ...swarmEnv }
+  if (!promptOnly && swarmCtx && profile.mcpConfigPath && existsSync(profile.mcpConfigPath)) {
+    try {
+      const rawCfg = JSON.parse(readFileSync(profile.mcpConfigPath, 'utf8')) as {
+        mcpServers?: Record<string, { env?: Record<string, string> }>
+      }
+      if (rawCfg?.mcpServers?.['openclaude-memory']) {
+        rawCfg.mcpServers['openclaude-memory'].env = {
+          ...(rawCfg.mcpServers['openclaude-memory'].env ?? {}),
+          ...swarmEnv,
+        }
+        writeFileSync(profile.mcpConfigPath, JSON.stringify(rawCfg, null, 2), { mode: 0o600 })
+      }
+    } catch {
+      // keep original mcp config if unreadable
+    }
+  }
   const platformPrompt = learning.extraPromptFile
     ? readFileSync(learning.extraPromptFile, 'utf8')
     : ''
@@ -1774,7 +1801,7 @@ registerEngineRemoteContext('antigravity', async ({ opts, supportsVision, prompt
     cleanup()
     return {
       profile,
-      env,
+      env: mergedEnv,
       platformPrompt,
       promptCwd: profile.cwd,
       promptPolicyFingerprint: runner.promptPolicyFingerprint,
@@ -1784,7 +1811,7 @@ registerEngineRemoteContext('antigravity', async ({ opts, supportsVision, prompt
   }
   return {
     profile,
-    env,
+    env: mergedEnv,
     platformPrompt,
     promptCwd: profile.cwd,
     promptPolicyFingerprint: runner.promptPolicyFingerprint,

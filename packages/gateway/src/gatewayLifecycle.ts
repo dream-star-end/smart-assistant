@@ -105,6 +105,7 @@ export interface GatewayLifecycleHost {
   _promptQueueCoordinator: Gateway['_promptQueueCoordinator']
   _reapCrashedSessionPendingPermissions: Gateway['_reapCrashedSessionPendingPermissions']
   _recoverTurnDispatchInbox: Gateway['_recoverTurnDispatchInbox']
+  _remoteSwarmRuntime: Gateway['_remoteSwarmRuntime']
   _retryDelegateNotifies: Gateway['_retryDelegateNotifies']
   _runLog: Gateway['_runLog']
   _runTaskboardDelegate: Gateway['_runTaskboardDelegate']
@@ -904,6 +905,10 @@ export async function _doShutdown(this: GatewayLifecycleHost, exit: boolean): Pr
   // ── Stage 0: start settling remote engine runs while the container's stop
   // grace still has room (sessions are only drained at Stage 4). ──
   this.sessions.beginPlannedShutdown()
+  if (this._remoteSwarmRuntime) {
+    await this._remoteSwarmRuntime.shutdownAll().catch(() => {})
+    this._remoteSwarmRuntime = null
+  }
 
   // ── Stage 1: stop accepting new traffic ──
   // `httpServer.close()` stops accepting new HTTP connections but lets
