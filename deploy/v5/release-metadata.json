@@ -212,7 +212,8 @@
     "0346_selfhost_gpt62_sol_astra_retire_legacy",
     "0347_user_sites_fullstack",
     "0348_antigravity_gemini_4_neon",
-    "0349_user_site_collaborators"
+    "0349_user_site_collaborators",
+    "0350_perf_timeline_and_live_snapshot"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

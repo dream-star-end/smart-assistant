@@ -60,10 +60,11 @@ export const BESPOKE_SWEEPER_TABLES: Readonly<Record<string, string>> = {
   session_goals: "auditRetentionSweeper.sweepTerminalSessionGoals (admin/auditRetention.ts)",
   // OCV5-537(DAT-8):0066 声明却从未实现的 7 天清理,现由同一 tick 执行。
   wechat_audit: "auditRetentionSweeper.sweepWechatAudit (admin/auditRetention.ts)",
-  // tape-projected live frames are unreachable once tape records exist;
-  // pruneProjectedLiveFrames is the dedicated DELETE path (not age-based TTL).
-  client_session_live_frames: "pruneProjectedLiveFrames (db/liveTurnFrames.ts)",
-  client_session_live_unit_checkpoints: "deleteLiveUnitCheckpoints via pruneProjectedLiveFrames (db/liveUnitCheckpoints.ts)",
+  // tape-projected live frames are unreachable once tape records exist, and
+  // retired dead gateway live streams expire after 7d (OCV5-824);
+  // pruneProjectedLiveFrames + pruneRetiredLiveFrames are the dedicated DELETE paths.
+  client_session_live_frames: "pruneProjectedLiveFrames + pruneRetiredLiveFrames (db/liveTurnFrames.ts)",
+  client_session_live_unit_checkpoints: "deleteLiveUnitCheckpoints via pruneProjectedLiveFrames/pruneRetiredLiveFrames (db/liveUnitCheckpoints.ts)",
   // OCV5-591: a write deletes its own hold on settle; holds left by a crashed writer expire and are
   // removed by the studio GC tick.
   studio_quota_holds: "StudioBlobStore.gc (media-studio/blobs.ts)",

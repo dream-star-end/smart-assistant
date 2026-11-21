@@ -273,6 +273,18 @@ import {
   settleStopControlsForTurn,
 } from "../dispatch/turnControlStore.js";
 import {
+  computeSessionLastPreviewRaw,
+  computeSupersededApiErrorFlags,
+  evaluateTimelinePartialFastPath,
+  parseHotTimelineMessages,
+  precomputedTapePayloadBytesSql,
+  precomputedTapeVisibleBytesSql,
+  serializeLastDispatchSummary,
+  summarizeHotTimelineMessages,
+  updateSessionLastDispatchSummaryInTx,
+  type PreloadedTimelineSession,
+} from "./pgTimelinePerf.js";
+import {
   isLeftoverRecoveryRecordsTruncated,
   sessionTurnHasSuccessfulUsage,
   loadLeftoverRecoveryRecords,
@@ -679,21 +691,26 @@ async function pgUnreadBySessionIds(
   const rows = (
     await pool.query<{ id: string; unread: boolean }>(
       `SELECT cs.id,
-              (last_d.outcome IN (${UNREAD_OUTCOME_SQL})
-               AND ${LAST_D_TERMINAL_MS_SQL} > ${LAST_READ_AT_MS_SQL}) AS unread
+              CASE WHEN cs.last_dispatch_summary IS NOT NULL
+                   THEN (
+                     (cs.last_dispatch_summary->>'outcome') IN (${UNREAD_OUTCOME_SQL})
+                     AND COALESCE((cs.last_dispatch_summary->>'terminalAtMs')::bigint, 0) > ${LAST_READ_AT_MS_SQL}
+                   )
+                   ELSE (
+                     last_d.outcome IN (${UNREAD_OUTCOME_SQL})
+                     AND ${LAST_D_TERMINAL_MS_SQL} > ${LAST_READ_AT_MS_SQL}
+                   ) END AS unread
          FROM client_sessions cs
-         LEFT JOIN (
-           SELECT session_id, outcome, terminal_at FROM (
-             SELECT session_id, outcome, terminal_at,
-                    ROW_NUMBER() OVER (
-                      PARTITION BY session_id
-                      ORDER BY terminal_at DESC NULLS LAST, admitted_at DESC, dispatch_id DESC
-                    ) AS rn
-               FROM turn_dispatches
-              WHERE user_id = $2 AND status = 'terminal'
-           ) ranked
-           WHERE rn = 1
-         ) last_d ON last_d.session_id = cs.id
+         LEFT JOIN LATERAL (
+           SELECT outcome, terminal_at
+             FROM turn_dispatches
+            WHERE cs.last_dispatch_summary IS NULL
+              AND user_id = $2
+              AND session_id = cs.id
+              AND status = 'terminal'
+            ORDER BY terminal_at DESC NULLS LAST, admitted_at DESC, dispatch_id DESC
+            LIMIT 1
+         ) last_d ON TRUE
         WHERE cs.user_id = $1 AND cs.deleted_at IS NULL AND cs.id = ANY($3::text[])`,
       [userId, dispatchUidForList(userId), ids],
     )
@@ -982,6 +999,7 @@ export async function advanceClientTimelineIdentityInTransaction(
     `UPDATE client_sessions
         SET history_revision = history_revision + 1,
             timeline_generation = timeline_generation + 1,
+            last_dispatch_summary = NULL,
             updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
     [sessionId, userId],
@@ -1309,14 +1327,30 @@ async function pgAppendServerAuthoredCore(
   const historyRevisionDelta =
     hasInvisibleMessageRemoval(msgs, tail) || archivedDelta > 0 ? 1 : 0;
 
+  const lastPreview = computeSessionLastPreviewRaw(tail);
+  const clearDispatchSummary = message.role === "user";
   const upd = await client.query(
     `UPDATE client_sessions
        SET messages = $1, message_count = $2, last_at = $3,
            updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
            next_seq = $4, archived_through_seq = $5, archived_count = $6,
-           history_revision = history_revision + $9
+           history_revision = history_revision + $9,
+           last_preview = $10,
+           last_dispatch_summary = CASE WHEN $11::boolean THEN NULL ELSE last_dispatch_summary END
      WHERE id = $7 AND user_id = $8 AND deleted_at IS NULL`,
-    [escapeNulInSessionMessagesJson(plan.finalJson), tail.length + newArchivedCount, now, plan.nextSeq, plan.archivedThroughSeq, newArchivedCount, sessId, userId, historyRevisionDelta],
+    [
+      escapeNulInSessionMessagesJson(plan.finalJson),
+      tail.length + newArchivedCount,
+      now,
+      plan.nextSeq,
+      plan.archivedThroughSeq,
+      newArchivedCount,
+      sessId,
+      userId,
+      historyRevisionDelta,
+      lastPreview,
+      clearDispatchSummary,
+    ],
   );
   if (upd.rowCount !== 1) {
     // 并发软删抢在 SELECT 与 UPDATE 之间(FOR UPDATE 下不可达;保留作最后防线,宁报终态不复活墓碑)。
@@ -1732,6 +1766,13 @@ async function convergeDispatchOnFinalize(
       conflictReason: "late_tape_after_fence",
       fromStatuses: ["admitted", "accepted", "rejecting", "terminal"],
     });
+    if (held) {
+      await updateSessionLastDispatchSummaryInTx(client, {
+        sessionId: held.sessionId,
+        userId: `c:${held.userId.toString()}`,
+        summaryJson: null,
+      });
+    }
     return { lateTape: held !== null, removedVisibleStatus: false };
   }
   const converged = await casToTerminal(client, {
@@ -1740,7 +1781,18 @@ async function convergeDispatchOnFinalize(
     failureCode: nextFailureCode,
     fromStatuses: ["admitted", "accepted", "rejecting"],
   });
-  if (converged !== null) return { lateTape: false, removedVisibleStatus: false };
+  if (converged !== null) {
+    await updateSessionLastDispatchSummaryInTx(client, {
+      sessionId: converged.sessionId,
+      userId: `c:${converged.userId.toString()}`,
+      summaryJson: serializeLastDispatchSummary({
+        outcome: converged.outcome,
+        failureCode: converged.failureCode,
+        terminalAtMs: converged.terminalAt?.getTime() ?? Date.now(),
+      }),
+    });
+    return { lateTape: false, removedVisibleStatus: false };
+  }
   const d = await getDispatch(client, dispatchId);
   if (
     d && d.status === "terminal" && d.outcome === "executed_error" &&
@@ -1751,15 +1803,29 @@ async function convergeDispatchOnFinalize(
     // finalize is the stronger authority. Replace only that exact sentinel;
     // other executed_error outcomes remain immutable and reviewable.
     // completed 才允许清 failure_code;真崩溃必须写下真实码,不许残留 SERVICE_RESTART。
-    await client.query(
-      `UPDATE turn_dispatches
-          SET outcome=$2, failure_code=$3, client_notified=FALSE,
-              terminal_at=clock_timestamp()
-        WHERE dispatch_id=$1 AND status='terminal'
-          AND outcome='executed_error'
-          AND failure_code IN ('RESULT_RECOVERY_PENDING','SERVICE_RESTART')`,
-      [dispatchId, outcome, nextFailureCode],
-    );
+    const replaced = (
+      await client.query<{ terminal_at: Date | null }>(
+        `UPDATE turn_dispatches
+            SET outcome=$2, failure_code=$3, client_notified=FALSE,
+                terminal_at=clock_timestamp()
+          WHERE dispatch_id=$1 AND status='terminal'
+            AND outcome='executed_error'
+            AND failure_code IN ('RESULT_RECOVERY_PENDING','SERVICE_RESTART')
+          RETURNING terminal_at`,
+        [dispatchId, outcome, nextFailureCode],
+      )
+    ).rows[0];
+    if (replaced) {
+      await updateSessionLastDispatchSummaryInTx(client, {
+        sessionId: d.sessionId,
+        userId: `c:${d.userId.toString()}`,
+        summaryJson: serializeLastDispatchSummary({
+          outcome,
+          failureCode: nextFailureCode ?? null,
+          terminalAtMs: replaced.terminal_at?.getTime() ?? Date.now(),
+        }),
+      });
+    }
     return { lateTape: false, removedVisibleStatus: d.clientNotified };
   }
   if (d && d.status === "terminal" && d.outcome === "not_accepted") {
@@ -1768,6 +1834,13 @@ async function convergeDispatchOnFinalize(
       conflictReason: "late_tape",
       fromStatuses: ["terminal"],
     });
+    if (held) {
+      await updateSessionLastDispatchSummaryInTx(client, {
+        sessionId: held.sessionId,
+        userId: `c:${held.userId.toString()}`,
+        summaryJson: null,
+      });
+    }
     return {
       lateTape: held !== null,
       removedVisibleStatus: held !== null && d.clientNotified,
@@ -4090,6 +4163,10 @@ export async function _stagePreparedLosslessTurnRecords(
     request,
     prepared,
   );
+  const allSidecars = prepared.turn.records.map((rec, ordinal) =>
+    preparedModelSidecarsForOrdinal(ordinal, rec.id, prepared.visible[ordinal]!),
+  );
+  const supersededFlags = computeSupersededApiErrorFlags(prepared.turn.records, allSidecars);
   for (const batch of _losslessTurnRecordStageBatches(prepared.turn.records.length, exactOrdinals)) {
     const staged = await withTx(pool, async (client): Promise<"staged" | "finalized" | "missing"> => {
       // One immutable-header lock covers a bounded batch rather than one
@@ -4261,28 +4338,28 @@ export async function _stagePreparedLosslessTurnRecords(
           await client.query<StagedRecordRow>(
             `INSERT INTO client_session_turn_tape_records
                (session_id,user_id,tape_id,msg_id,ordinal,role,ts,content_sha256,payload,
-                visible_payload,visible_content_sha256,model_sidecar_complete)
+                visible_payload,visible_content_sha256,model_sidecar_complete,
+                payload_bytes,visible_payload_bytes,is_superseded_api_error)
              SELECT $1,$2,$3,t.msg_id,t.ordinal,t.role,t.ts,t.content_sha256,t.payload,
-                    t.visible_payload,t.visible_content_sha256,FALSE
+                    t.visible_payload,t.visible_content_sha256,FALSE,
+                    t.payload_bytes,t.visible_payload_bytes,t.is_superseded_api_error
                FROM unnest(
                       $4::text[], $5::int[], $6::text[], $7::bigint[], $8::text[],
-                      $9::bytea[], $10::bytea[], $11::text[]
+                      $9::bytea[], $10::bytea[], $11::text[],
+                      $12::int[], $13::int[], $14::boolean[]
                     ) AS t(msg_id,ordinal,role,ts,content_sha256,payload,
-                           visible_payload,visible_content_sha256)
+                           visible_payload,visible_content_sha256,
+                           payload_bytes,visible_payload_bytes,is_superseded_api_error)
              RETURNING msg_id,ordinal,role,ts::text,content_sha256,payload,
                        visible_payload,visible_content_sha256,model_sidecar_complete`,
             [
-              request.sessionId,
-              userId,
-              request.tapeId,
-              rows.map((row) => row.item.id),
-              rows.map((row) => row.ordinal),
-              rows.map((row) => row.item.role),
-              rows.map((row) => row.item.ts),
-              rows.map((row) => row.item.payloadSha256),
-              rows.map((row) => row.item.payloadBytes),
-              rows.map((row) => row.visible.bytes),
-              rows.map((row) => row.visible.contentSha256),
+              request.sessionId, userId, request.tapeId,
+              rows.map((r) => r.item.id), rows.map((r) => r.ordinal),
+              rows.map((r) => r.item.role), rows.map((r) => r.item.ts),
+              rows.map((r) => r.item.payloadSha256), rows.map((r) => r.item.payloadBytes),
+              rows.map((r) => r.visible.bytes), rows.map((r) => r.visible.contentSha256),
+              rows.map((r) => r.item.payloadBytes.length), rows.map((r) => r.visible.bytes.length),
+              rows.map((r) => supersededFlags[r.ordinal] ?? false),
             ],
           )
         ).rows;
@@ -4308,27 +4385,27 @@ export async function _stagePreparedLosslessTurnRecords(
                 SET ordinal=t.ordinal, role=t.role, ts=t.ts, content_sha256=t.content_sha256,
                     payload=t.payload, visible_payload=t.visible_payload,
                     visible_content_sha256=t.visible_content_sha256,
+                    payload_bytes=t.payload_bytes, visible_payload_bytes=t.visible_payload_bytes,
+                    is_superseded_api_error=t.is_superseded_api_error,
                     model_sidecar_complete=FALSE
                FROM unnest(
                       $4::text[], $5::int[], $6::text[], $7::bigint[], $8::text[],
-                      $9::bytea[], $10::bytea[], $11::text[]
+                      $9::bytea[], $10::bytea[], $11::text[],
+                      $12::int[], $13::int[], $14::boolean[]
                     ) AS t(msg_id,ordinal,role,ts,content_sha256,payload,
-                           visible_payload,visible_content_sha256)
+                           visible_payload,visible_content_sha256,
+                           payload_bytes,visible_payload_bytes,is_superseded_api_error)
               WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=$3 AND r.msg_id=t.msg_id
               RETURNING r.msg_id,r.ordinal,r.role,r.ts::text,r.content_sha256,r.payload,
                         r.visible_payload,r.visible_content_sha256,r.model_sidecar_complete`,
             [
-              request.sessionId,
-              userId,
-              request.tapeId,
-              rows.map((row) => row.item.id),
-              rows.map((row) => row.ordinal),
-              rows.map((row) => row.item.role),
-              rows.map((row) => row.item.ts),
-              rows.map((row) => row.item.payloadSha256),
-              rows.map((row) => row.item.payloadBytes),
-              rows.map((row) => row.visible.bytes),
-              rows.map((row) => row.visible.contentSha256),
+              request.sessionId, userId, request.tapeId,
+              rows.map((r) => r.item.id), rows.map((r) => r.ordinal),
+              rows.map((r) => r.item.role), rows.map((r) => r.item.ts),
+              rows.map((r) => r.item.payloadSha256), rows.map((r) => r.item.payloadBytes),
+              rows.map((r) => r.visible.bytes), rows.map((r) => r.visible.contentSha256),
+              rows.map((r) => r.item.payloadBytes.length), rows.map((r) => r.visible.bytes.length),
+              rows.map((r) => supersededFlags[r.ordinal] ?? false),
             ],
           )
         ).rows;
@@ -4350,17 +4427,19 @@ export async function _stagePreparedLosslessTurnRecords(
         await client.query(
           `UPDATE client_session_turn_tape_records AS r
               SET visible_payload=COALESCE(r.visible_payload, t.visible_payload),
-                  visible_content_sha256=COALESCE(r.visible_content_sha256, t.visible_content_sha256)
-             FROM unnest($4::text[], $5::bytea[], $6::text[])
-               AS t(msg_id, visible_payload, visible_content_sha256)
+                  visible_content_sha256=COALESCE(r.visible_content_sha256, t.visible_content_sha256),
+                  payload_bytes=COALESCE(r.payload_bytes, t.payload_bytes),
+                  visible_payload_bytes=COALESCE(r.visible_payload_bytes, t.visible_payload_bytes),
+                  is_superseded_api_error=COALESCE(r.is_superseded_api_error, t.is_superseded_api_error)
+             FROM unnest($4::text[], $5::bytea[], $6::text[], $7::int[], $8::int[], $9::boolean[])
+               AS t(msg_id, visible_payload, visible_content_sha256, payload_bytes, visible_payload_bytes, is_superseded_api_error)
             WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=$3 AND r.msg_id=t.msg_id`,
           [
-            request.sessionId,
-            userId,
-            request.tapeId,
-            fillVisible.map((row) => row.item.id),
-            fillVisible.map((row) => row.visible.bytes),
-            fillVisible.map((row) => row.visible.contentSha256),
+            request.sessionId, userId, request.tapeId,
+            fillVisible.map((r) => r.item.id), fillVisible.map((r) => r.visible.bytes),
+            fillVisible.map((r) => r.visible.contentSha256),
+            fillVisible.map((r) => r.item.payloadBytes.length), fillVisible.map((r) => r.visible.bytes.length),
+            fillVisible.map((r) => supersededFlags[r.ordinal] ?? false),
           ],
         );
       }
@@ -4796,8 +4875,7 @@ async function readDirectTapeVisibleHeads(
   return (
     await pool.query<DirectTapeVisibleHead>(
       `SELECT r.tape_id, r.msg_id, r.ordinal, r.role, r.ts::text,
-              COALESCE(octet_length(r.visible_payload), octet_length(r.payload))::text
-                AS payload_bytes,
+              ${precomputedTapePayloadBytesSql("r")}::text AS payload_bytes,
               r.visible_content_sha256, t.billing_anchor_id,
               EXISTS (
                 SELECT 1 FROM turn_waivers w
@@ -6448,31 +6526,12 @@ async function readUnifiedTimelineOuterCandidates(
   client: PoolClient,
   sessionId: string,
   userId: string,
-  hotJson: string,
+  hotMessages: MessageLike[],
+  snapshotMaxSeq: number,
   archivedThroughSeq: number,
   cursor: ClientTimelineCursor | null,
   maxCandidates: number,
 ): Promise<{ messages: MessageLike[]; snapshotMaxSeq: number; hasOlderCandidates: boolean }> {
-  let hot: MessageLike[] = [];
-  try {
-    const parsed = JSON.parse(hotJson);
-    if (Array.isArray(parsed)) {
-      hot = deriveOrderSeqsForRead(parsed as MessageLike[], archivedThroughSeq);
-    }
-  } catch {
-    throw new Error(`[pgSessions] unified timeline hot row malformed: ${sessionId}`);
-  }
-  let snapshotMaxSeq = 0;
-  for (const message of hot) {
-    if (
-      typeof message._seq === "number" && Number.isSafeInteger(message._seq) &&
-      message._seq > snapshotMaxSeq
-    ) snapshotMaxSeq = message._seq;
-  }
-  // Old rows can have no `_seq`; the archive watermark is a conservative
-  // compatibility fallback, never a fabricated next_seq-derived snapshot.
-  if (snapshotMaxSeq === 0) snapshotMaxSeq = archivedThroughSeq;
-
   const beforeOrderSeq = cursor?.beforeOrderSeq ?? Number.MAX_SAFE_INTEGER;
   const resumeTape = typeof cursor?.tapeId === "string";
   const eligible = (message: MessageLike): boolean => {
@@ -6490,7 +6549,7 @@ async function readUnifiedTimelineOuterCandidates(
     const key = timelineOuterKey(message, orderSeq);
     if (!deduped.has(key)) deduped.set(key, message);
   };
-  for (const message of hot) addEligible(message);
+  for (const message of hotMessages) addEligible(message);
   let beforeLastSeq: number | null = null;
   let archiveExhausted = archivedThroughSeq <= 0;
   const archiveBefore = Math.min(Number.MAX_SAFE_INTEGER, beforeOrderSeq + (resumeTape ? 1 : 0));
@@ -6596,24 +6655,22 @@ async function readUnifiedTimelineTapeHeads(
          SELECT * FROM unnest($3::text[],$4::integer[])
        )
        SELECT requested.tape_id,r.msg_id,r.ordinal,r.role,r.ts::text,
-              r.content_sha256,
-              COALESCE(octet_length(r.visible_payload),octet_length(r.payload))::text AS payload_bytes,
-              r.visible_content_sha256
+              r.content_sha256,r.payload_bytes,r.visible_content_sha256
          FROM requested
          JOIN LATERAL (
-           SELECT msg_id,ordinal,role,ts,content_sha256,payload,visible_payload,
+           SELECT msg_id,ordinal,role,ts,content_sha256,
+                  ${precomputedTapePayloadBytesSql("r")}::text AS payload_bytes,
                   visible_content_sha256
              FROM client_session_turn_tape_records r
             WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=requested.tape_id
               AND r.ordinal < requested.before_ordinal
               AND r.role <> 'runtime-event'
-              -- SessionManager persists every retry attempt. Once any later
-              -- assistant result exists, the earlier provider API error is
-              -- audit evidence rather than a browser conversation record.
-              -- This keeps exactly the terminal API error when all attempts
-              -- fail, while a later successful result still hides all errors.
+              -- Precomputed flag skips double EXISTS LIKE on post-0350 rows;
+              -- NULL legacy rows fall back to the exact EXISTS predicate.
+              AND COALESCE(r.is_superseded_api_error, FALSE) = FALSE
               AND NOT (
-                r.role='assistant'
+                r.is_superseded_api_error IS NULL
+                AND r.role='assistant'
                 AND EXISTS (
                   SELECT 1 FROM client_session_turn_tape_model_records failed
                    WHERE failed.session_id=r.session_id AND failed.user_id=r.user_id
@@ -6677,7 +6734,7 @@ async function readUnifiedTimelineBashTailAuxiliaries(
        )
        SELECT requested.tape_id,r.msg_id,r.ordinal,r.role,r.ts::text,
               r.content_sha256,
-              COALESCE(octet_length(r.visible_payload),octet_length(r.payload))::text AS payload_bytes,
+              ${precomputedTapePayloadBytesSql("r")}::text AS payload_bytes,
               r.visible_content_sha256
          FROM requested
          JOIN client_session_turn_tape_records r
@@ -6715,7 +6772,7 @@ async function readUnifiedTimelineBashTailAuxiliaries(
        )
        SELECT requested.tape_id,r.msg_id,r.ordinal,r.role,r.ts::text,
               r.content_sha256,
-              COALESCE(octet_length(r.visible_payload),octet_length(r.payload))::text AS payload_bytes,
+              ${precomputedTapePayloadBytesSql("r")}::text AS payload_bytes,
               r.visible_content_sha256,
               COALESCE(r.visible_payload,r.payload) AS probe_bytes
          FROM requested
@@ -7341,13 +7398,14 @@ async function readClientTimelinePageImpl(
   cursor: ClientTimelineCursor | null = null,
   limit = 100,
   snapshotClient?: PoolClient,
+  preloaded?: PreloadedTimelineSession,
 ): Promise<ClientTimelinePage | null> {
   const cappedLimit = Math.max(1, Math.min(
     TAPE_RECORD_PAGE_MAX_ROWS,
     Number.isFinite(limit) ? Math.floor(limit) : 100,
   ));
   const readSnapshot = async (client: PoolClient): Promise<ClientTimelinePage | null> => {
-    const session = (
+    const session = preloaded ?? (
       await client.query<{
         messages: string;
         archived_through_seq: number | null;
@@ -7366,6 +7424,10 @@ async function readClientTimelinePageImpl(
       throw new ClientTimelineCursorStaleError();
     }
     const archivedThroughSeq = bigIntNumOr(session.archived_through_seq, 0);
+    // Parse hot messages ONCE before the candidate-expansion loop (OCV5-824).
+    const parsedHot = preloaded?.parsedHotMessages
+      ? summarizeHotTimelineMessages(preloaded.parsedHotMessages, archivedThroughSeq)
+      : parseHotTimelineMessages(session.messages, archivedThroughSeq, sessionId);
     let candidateLimit = cappedLimit + 1;
     let outer!: Awaited<ReturnType<typeof readUnifiedTimelineOuterCandidates>>;
     let selected: UnifiedTimelineSelectedUnit[] = [];
@@ -7384,7 +7446,8 @@ async function readClientTimelinePageImpl(
         client,
         sessionId,
         userId,
-        session.messages,
+        parsedHot.hot,
+        parsedHot.snapshotMaxSeq,
         archivedThroughSeq,
         cursor,
         candidateLimit,
@@ -7818,7 +7881,7 @@ export async function listTurnTapeRecordsImpl(
     const heads = (
       await pool.query<DirectTapePageHead>(
         `SELECT msg_id, ordinal, role, ts::text, content_sha256,
-                COALESCE(octet_length(visible_payload), octet_length(payload))::text AS payload_bytes,
+                ${precomputedTapePayloadBytesSql("")}::text AS payload_bytes,
                 visible_content_sha256
            FROM client_session_turn_tape_records
           WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
@@ -7874,7 +7937,7 @@ export async function listTurnTapeRecordsImpl(
     const heads = (
       await pool.query<DirectTapePageHead>(
         `SELECT msg_id, ordinal, role, ts::text, content_sha256,
-                COALESCE(octet_length(visible_payload), octet_length(payload))::text AS payload_bytes,
+                ${precomputedTapePayloadBytesSql("")}::text AS payload_bytes,
                 visible_content_sha256
           FROM client_session_turn_tape_records
           WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal >= $4
@@ -7991,8 +8054,7 @@ async function readTapeRecordPayloadImpl(
     }>(
       `SELECT t.tape_sha256, t.billing_anchor_id, r.msg_id, r.role, r.content_sha256,
               r.visible_content_sha256,
-              CASE WHEN r.visible_payload IS NULL THEN NULL
-                   ELSE octet_length(r.visible_payload)::text END AS visible_bytes
+              ${precomputedTapeVisibleBytesSql("r")}::text AS visible_bytes
          FROM client_session_turn_tapes t
          JOIN client_session_turn_tape_records r
            ON r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id
@@ -8034,9 +8096,10 @@ async function readTapeRecordPayloadImpl(
     await pool.query(
       `UPDATE client_session_turn_tape_records
           SET visible_payload=COALESCE(visible_payload,$5),
-              visible_content_sha256=COALESCE(visible_content_sha256,$6)
+              visible_content_sha256=COALESCE(visible_content_sha256,$6),
+              visible_payload_bytes=COALESCE(visible_payload_bytes,$7)
         WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=$4`,
-      [sessionId, userId, tapeId, recordOrdinal, visible.bytes, visible.contentSha256],
+      [sessionId, userId, tapeId, recordOrdinal, visible.bytes, visible.contentSha256, visible.bytes.length],
     );
     freshlyMaterialized = visible.bytes;
     visibleHead = {
@@ -8572,17 +8635,13 @@ export async function commitVisibleLosslessTurnPhaseA(
            updated_at=GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
            next_seq=$4, archived_through_seq=$5, archived_count=$6,
            history_revision=history_revision + 1,
-           timeline_generation=timeline_generation + 1
+           timeline_generation=timeline_generation + 1,
+           last_preview=$9
          WHERE id=$7 AND user_id=$8 AND deleted_at IS NULL`,
         [
-          escapeNulInSessionMessagesJson(plan.finalJson),
-          plan.tail.length + archivedCount,
-          nowMs,
-          plan.nextSeq,
-          plan.archivedThroughSeq,
-          archivedCount,
-          request.sessionId,
-          userId,
+          escapeNulInSessionMessagesJson(plan.finalJson), plan.tail.length + archivedCount, nowMs,
+          plan.nextSeq, plan.archivedThroughSeq, archivedCount,
+          request.sessionId, userId, computeSessionLastPreviewRaw(plan.tail),
         ],
       );
     }
@@ -10398,19 +10457,13 @@ export function createPgSessionsBackend(
                updated_at=GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
                next_seq=$4, archived_through_seq=$5, archived_count=$6,
                history_revision=history_revision + $9,
-               timeline_generation=timeline_generation + $10
+               timeline_generation=timeline_generation + $10,
+               last_preview=$11
              WHERE id=$7 AND user_id=$8 AND deleted_at IS NULL`,
             [
-              escapeNulInSessionMessagesJson(plan.finalJson),
-              plan.tail.length + archivedCount,
-              nowMs,
-              plan.nextSeq,
-              plan.archivedThroughSeq,
-              archivedCount,
-              request.sessionId,
-              userId,
-              historyRevisionDelta,
-              timelineGenerationDelta,
+              escapeNulInSessionMessagesJson(plan.finalJson), plan.tail.length + archivedCount, nowMs,
+              plan.nextSeq, plan.archivedThroughSeq, archivedCount, request.sessionId, userId,
+              historyRevisionDelta, timelineGenerationDelta, computeSessionLastPreviewRaw(plan.tail),
             ],
           );
           phaseBIdentityAdvanced = publishesVisiblePhaseARecords;
@@ -10793,8 +10846,8 @@ export function createPgSessionsBackend(
 
           const res = await client.query(
             `INSERT INTO client_sessions
-               (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at, next_seq, archived_through_seq, archived_count, model_id, history_revision, timeline_generation)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, GREATEST($10, ${CLOCK_MS_SQL}), $11, $12, $13, $15, 0, 1)
+               (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at, next_seq, archived_through_seq, archived_count, model_id, history_revision, timeline_generation, last_preview)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, GREATEST($10, ${CLOCK_MS_SQL}), $11, $12, $13, $15, 0, 1, $18)
              ON CONFLICT (id) DO UPDATE SET
                agent_id = EXCLUDED.agent_id,
                title = EXCLUDED.title,
@@ -10802,39 +10855,21 @@ export function createPgSessionsBackend(
                last_at = EXCLUDED.last_at,
                messages = EXCLUDED.messages,
                message_count = EXCLUDED.message_count,
-               -- model_id:PUT 未携带(NULL)= 保留既有(元数据权威写路径是 setClientSessionModel,
-               -- 全量 PUT 不得清空);携带则以 PUT 为准(建行场景)。
                model_id = COALESCE(EXCLUDED.model_id, client_sessions.model_id),
-               -- updated_at 逻辑版本(RFC D3b):冲突更新走 DB 计算 GREATEST。**首建(BLOCKER-1)**:
-               -- 新插入(无冲突)的 updated_at 也取 GREATEST(客户端 $10, 服务端时钟下限 clock_ms)——
-               -- 不再无条件信任客户端 $10(客户端可回传 0 / 旧值,首建后紧跟 baseSyncedAt=0 的第二个
-               -- PUT 会因 existing.updated_at 仍是 0 而击穿 stale 检测,造成双写静默覆盖)。
-               -- EXCLUDED.updated_at 即上面 VALUES 的 GREATEST 结果,故冲突路径口径不变。
                updated_at = GREATEST(client_sessions.updated_at + 1, ${CLOCK_MS_SQL}, EXCLUDED.updated_at),
                next_seq = EXCLUDED.next_seq,
                archived_through_seq = EXCLUDED.archived_through_seq,
                archived_count = EXCLUDED.archived_count,
                history_revision = client_sessions.history_revision + $16,
-               timeline_generation = client_sessions.timeline_generation + $17
+               timeline_generation = client_sessions.timeline_generation + $17,
+               last_preview = EXCLUDED.last_preview
              WHERE client_sessions.updated_at <= $14 AND client_sessions.user_id = $2`,
             [
-              session.id,
-              session.userId,
-              session.agentId,
-              session.title,
-              session.pinned ? 1 : 0,
-              session.createdAt,
-              session.lastAt,
-              finalJson,
-              tail.length + newArchivedCount,
-              session.updatedAt,
-              nextSeq,
-              plan.archivedThroughSeq,
-              newArchivedCount,
-              baseSyncedAt,
-              session.modelId ?? null,
-              historyRevisionDelta,
-              timelineGenerationDelta,
+              session.id, session.userId, session.agentId, session.title, session.pinned ? 1 : 0,
+              session.createdAt, session.lastAt, finalJson, tail.length + newArchivedCount,
+              session.updatedAt, nextSeq, plan.archivedThroughSeq, newArchivedCount, baseSyncedAt,
+              session.modelId ?? null, historyRevisionDelta, timelineGenerationDelta,
+              computeSessionLastPreviewRaw(tail),
             ],
           );
           if ((res.rowCount ?? 0) > 0) return "applied";
@@ -10892,8 +10927,8 @@ export function createPgSessionsBackend(
         const nextSeq = typeof rec.next_seq === "number" && rec.next_seq > 0 ? rec.next_seq : 1;
         msgs[idx] = { ...msgs[idx], ...patch, id: msgId, _source: "server", _seq: nextSeq };
         const upd = await client.query(
-          "UPDATE client_sessions SET messages = $1::jsonb, updated_at = GREATEST(updated_at + 1, $2), next_seq = $3, history_revision = history_revision + 1 WHERE id = $4 AND user_id = $5 AND deleted_at IS NULL",
-          [escapeNulInSessionMessagesJson(JSON.stringify(msgs)), Date.now(), nextSeq + 1, sessId, userId],
+          "UPDATE client_sessions SET messages = $1::jsonb, updated_at = GREATEST(updated_at + 1, $2), next_seq = $3, history_revision = history_revision + 1, last_preview = $6 WHERE id = $4 AND user_id = $5 AND deleted_at IS NULL",
+          [escapeNulInSessionMessagesJson(JSON.stringify(msgs)), Date.now(), nextSeq + 1, sessId, userId, computeSessionLastPreviewRaw(msgs)],
         );
         if (upd.rowCount !== 1) return { applied: false as const, reason: "session_deleted" as const };
         return { applied: true as const };
@@ -11252,18 +11287,12 @@ export function createPgSessionsBackend(
                      messages=$1,message_count=$2,last_at=$3,
                      updated_at=GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
                      next_seq=$4,archived_through_seq=$5,archived_count=$6,
-                     history_revision=history_revision + $9
+                     history_revision=history_revision + $9,last_preview=$10
                    WHERE id=$7 AND user_id=$8 AND deleted_at IS NULL`,
                   [
-                    finalJson,
-                    spill.tail.length + archivedCount,
-                    nowMs,
-                    nextSeq + 1,
-                    spill.archivedThroughSeq,
-                    archivedCount,
-                    map.session_id,
-                    userId,
-                    archivedDelta > 0 ? 1 : 0,
+                    finalJson, spill.tail.length + archivedCount, nowMs, nextSeq + 1,
+                    spill.archivedThroughSeq, archivedCount, map.session_id, userId,
+                    archivedDelta > 0 ? 1 : 0, computeSessionLastPreviewRaw(spill.tail),
                   ],
                 );
               } else {
@@ -11355,9 +11384,9 @@ export function createPgSessionsBackend(
                    SET messages = $1, message_count = $2, last_at = $3,
                        updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
                        next_seq = next_seq + 1, archived_through_seq = $4, archived_count = $5,
-                       history_revision = history_revision + $8
+                       history_revision = history_revision + $8, last_preview = $9
                  WHERE id = $6 AND user_id = $7`,
-                [escapeNulInSessionMessagesJson(plan.finalJson), plan.tail.length + newArchivedCount, nowMs, plan.archivedThroughSeq, newArchivedCount, mapRow.session_id, userId, historyRevisionDelta],
+                [escapeNulInSessionMessagesJson(plan.finalJson), plan.tail.length + newArchivedCount, nowMs, plan.archivedThroughSeq, newArchivedCount, mapRow.session_id, userId, historyRevisionDelta, computeSessionLastPreviewRaw(plan.tail)],
               );
               return { applied: "patched" };
             }
@@ -11617,7 +11646,8 @@ export function createPgSessionsBackend(
         }>(
           `SELECT cs.id, cs.agent_id, cs.title, cs.pinned, cs.created_at, cs.last_at, cs.updated_at,
                   cs.message_count AS msg_count, cs.model_id, cs.project_id, cs.archived_at,
-                  CASE WHEN octet_length(cs.messages) > ${SESSION_SEARCH_JSON_EXPAND_MAX_BYTES}
+                  CASE WHEN cs.last_preview IS NOT NULL THEN cs.last_preview
+                       WHEN octet_length(cs.messages) > ${SESSION_SEARCH_JSON_EXPAND_MAX_BYTES}
                             OR left(COALESCE(cs.messages, ''), 1) <> '['
                             OR position((chr(92) || 'u0000') in cs.messages) > 0 THEN NULL
                        ELSE (
@@ -11633,10 +11663,19 @@ export function createPgSessionsBackend(
                           LIMIT 1
                        ) END AS last_preview_raw,
                   CASE WHEN open_d.session_id IS NOT NULL THEN 'running' ELSE 'idle' END AS run_state,
-                  last_d.outcome AS last_outcome,
-                  last_d.failure_code AS last_error_code,
-                  (last_d.outcome IN (${UNREAD_OUTCOME_SQL})
-                   AND ${LAST_D_TERMINAL_MS_SQL} > ${LAST_READ_AT_MS_SQL}) AS unread
+                  COALESCE(cs.last_dispatch_summary->>'outcome', last_d.outcome) AS last_outcome,
+                  CASE WHEN cs.last_dispatch_summary IS NOT NULL
+                       THEN cs.last_dispatch_summary->>'failureCode'
+                       ELSE last_d.failure_code END AS last_error_code,
+                  CASE WHEN cs.last_dispatch_summary IS NOT NULL
+                       THEN (
+                         (cs.last_dispatch_summary->>'outcome') IN (${UNREAD_OUTCOME_SQL})
+                         AND COALESCE((cs.last_dispatch_summary->>'terminalAtMs')::bigint, 0) > ${LAST_READ_AT_MS_SQL}
+                       )
+                       ELSE (
+                         last_d.outcome IN (${UNREAD_OUTCOME_SQL})
+                         AND ${LAST_D_TERMINAL_MS_SQL} > ${LAST_READ_AT_MS_SQL}
+                       ) END AS unread
              FROM client_sessions cs
              LEFT JOIN (
                SELECT session_id FROM turn_dispatches
@@ -11644,18 +11683,16 @@ export function createPgSessionsBackend(
                   AND status IN ('admitted', 'accepted', 'rejecting')
                 GROUP BY session_id
              ) open_d ON open_d.session_id = cs.id
-             LEFT JOIN (
-               SELECT session_id, outcome, failure_code, terminal_at FROM (
-                 SELECT session_id, outcome, failure_code, terminal_at,
-                        ROW_NUMBER() OVER (
-                          PARTITION BY session_id
-                          ORDER BY terminal_at DESC NULLS LAST, admitted_at DESC, dispatch_id DESC
-                        ) AS rn
-                   FROM turn_dispatches
-                  WHERE user_id = $2 AND status = 'terminal'
-               ) ranked
-               WHERE rn = 1
-             ) last_d ON last_d.session_id = cs.id
+             LEFT JOIN LATERAL (
+               SELECT outcome, failure_code, terminal_at
+                 FROM turn_dispatches
+                WHERE cs.last_dispatch_summary IS NULL
+                  AND user_id = $2
+                  AND session_id = cs.id
+                  AND status = 'terminal'
+                ORDER BY terminal_at DESC NULLS LAST, admitted_at DESC, dispatch_id DESC
+                LIMIT 1
+             ) last_d ON TRUE
             WHERE ${where}
             ORDER BY cs.last_at DESC${limitSql}`,
           params,
@@ -11742,16 +11779,18 @@ export function createPgSessionsBackend(
         ).rows[0];
         if (!row) return null;
         const archivedThroughOrderSeq = bigIntNumOr(row.archived_through_seq, 0);
-        const parsedMessages = deriveOrderSeqsForRead(
-          JSON.parse(row.messages) as MessageLike[],
-          archivedThroughOrderSeq,
-        );
         const timelinePage = options.view === "timeline"
-          ? await readClientTimelinePageImpl(pool, row.id, row.user_id, null, 100, snapshotClient)
+          ? await readClientTimelinePageImpl(pool, row.id, row.user_id, null, 100, snapshotClient, row)
           : null;
         const messages = timelinePage
           ? timelinePage.messages
-          : await hydrateTurnTapeMessages(pool, row.id, row.user_id, parsedMessages, options);
+          : await hydrateTurnTapeMessages(
+              pool,
+              row.id,
+              row.user_id,
+              deriveOrderSeqsForRead(JSON.parse(row.messages) as MessageLike[], archivedThroughOrderSeq),
+              options,
+            );
         return {
           id: row.id,
           userId: row.user_id,
@@ -11893,20 +11932,47 @@ export function createPgSessionsBackend(
         const archivedThroughSeq = bigIntNumOr(row.archived_through_seq, 0);
 
         if (options.view === "timeline") {
+          const historyRevision = bigIntNum(row.history_revision, "history_revision");
+          const timelineGeneration = bigIntNum(row.timeline_generation, "timeline_generation");
+          const parsedHot = parseHotTimelineMessages(row.messages, archivedThroughSeq, row.id);
+          const sinceTimelineGeneration = (options as ClientSessionReadOptions & { sinceTimelineGeneration?: number }).sinceTimelineGeneration;
+          const fast = evaluateTimelinePartialFastPath({
+            sinceSeq,
+            sinceHistoryRevision: options.sinceHistoryRevision,
+            sinceTimelineGeneration,
+            historyRevision,
+            timelineGeneration,
+            snapshotMaxSeq: parsedHot.snapshotMaxSeq,
+            anyMissingSeq: parsedHot.anyMissingSeq,
+            hotCount: parsedHot.hot.length,
+          });
+          if (fast.hit) {
+            return {
+              id: row.id, userId: row.user_id, agentId: row.agent_id, title: row.title,
+              pinned: row.pinned === 1,
+              createdAt: bigIntNum(row.created_at, "created_at"),
+              lastAt: bigIntNum(row.last_at, "last_at"),
+              messages: [],
+              updatedAt: bigIntNum(row.updated_at, "updated_at"),
+              historyRevision,
+              ...(snapshotClient ? await readAutomaticRecoveriesForSession(snapshotClient, row.id, row.user_id) : {}),
+              ...(row.model_id ? { modelId: row.model_id } : {}),
+              totalMessageCount: fast.hotCount + archivedCount,
+              maxSeq: fast.snapshotMaxSeq,
+              isPartial: true,
+              archivedCount,
+              archivedThroughSeq,
+              ...(await readOpenDispatchForSession(queryable, row.id, row.user_id)),
+              ...(await readPermissionPromptsForSession(queryable, row.id, row.user_id, options.permissionLookupIds)),
+            };
+          }
           const page = await readClientTimelinePageImpl(
-            pool,
-            row.id,
-            row.user_id,
-            null,
-            100,
-            snapshotClient,
+            pool, row.id, row.user_id, null, 100, snapshotClient,
+            { ...row, parsedHotMessages: parsedHot.hot },
           );
           if (!page) return null;
           return {
-            id: row.id,
-            userId: row.user_id,
-            agentId: row.agent_id,
-            title: row.title,
+            id: row.id, userId: row.user_id, agentId: row.agent_id, title: row.title,
             pinned: row.pinned === 1,
             createdAt: bigIntNum(row.created_at, "created_at"),
             lastAt: bigIntNum(row.last_at, "last_at"),
@@ -11917,9 +11983,7 @@ export function createPgSessionsBackend(
             timelineCursor: page.nextCursor,
             timelineHasMore: page.hasMore,
             timelineSnapshotMaxSeq: page.snapshotMaxSeq,
-            ...(snapshotClient
-              ? await readAutomaticRecoveriesForSession(snapshotClient, row.id, row.user_id)
-              : {}),
+            ...(snapshotClient ? await readAutomaticRecoveriesForSession(snapshotClient, row.id, row.user_id) : {}),
             ...(row.model_id ? { modelId: row.model_id } : {}),
             totalMessageCount: page.messages.length + archivedCount,
             maxSeq: page.snapshotMaxSeq,
@@ -11927,12 +11991,7 @@ export function createPgSessionsBackend(
             archivedCount,
             archivedThroughSeq,
             ...(await readOpenDispatchForSession(queryable, row.id, row.user_id)),
-            ...(await readPermissionPromptsForSession(
-              queryable,
-              row.id,
-              row.user_id,
-              options.permissionLookupIds,
-            )),
+            ...(await readPermissionPromptsForSession(queryable, row.id, row.user_id, options.permissionLookupIds)),
           };
         }
 
@@ -12210,8 +12269,8 @@ export function createPgSessionsBackend(
       const deleted = await withTx(pool, async (client): Promise<boolean> => {
         // updated_at 逻辑版本推进(软删也让并发 stale PUT 因版本落后被拒)。deleted_at 仍是删除权威。
         const sql = userId
-          ? `UPDATE client_sessions SET deleted_at = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}), messages = '[]', message_count = 0 WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL`
-          : `UPDATE client_sessions SET deleted_at = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}), messages = '[]', message_count = 0 WHERE id = $2 AND deleted_at IS NULL`;
+          ? `UPDATE client_sessions SET deleted_at = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}), messages = '[]', message_count = 0, last_preview = '', last_dispatch_summary = NULL WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL`
+          : `UPDATE client_sessions SET deleted_at = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}), messages = '[]', message_count = 0, last_preview = '', last_dispatch_summary = NULL WHERE id = $2 AND deleted_at IS NULL`;
         const result = userId
           ? await client.query(sql, [now, id, userId])
           : await client.query(sql, [now, id]);
@@ -12590,7 +12649,7 @@ export function createPgSessionsBackend(
               `UPDATE client_sessions
                   SET deleted_at = ${CLOCK_MS_SQL},
                       updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
-                      messages = '[]', message_count = 0
+                      messages = '[]', message_count = 0, last_preview = '', last_dispatch_summary = NULL
                 WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
               [id, userId],
             );

@@ -188,6 +188,95 @@ function sha256(payload: Buffer): string {
   return createHash("sha256").update(payload).digest("hex");
 }
 
+function hasPgUnsafeJsonString(value: unknown): boolean {
+  if (typeof value === "string") {
+    for (let i = 0; i < value.length; i += 1) {
+      const code = value.charCodeAt(i);
+      if (code === 0) return true;
+      if (code >= 0xd800 && code <= 0xdbff) {
+        const next = value.charCodeAt(i + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          i += 1;
+          continue;
+        }
+        return true;
+      }
+      if (code >= 0xdc00 && code <= 0xdfff) return true;
+    }
+    return false;
+  }
+  if (Array.isArray(value)) {
+    return value.some(hasPgUnsafeJsonString);
+  }
+  if (value !== null && typeof value === "object") {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (hasPgUnsafeJsonString(k) || hasPgUnsafeJsonString(v)) return true;
+    }
+  }
+  return false;
+}
+
+function toPgSafeJsonString(value: unknown): string | null {
+  try {
+    if (hasPgUnsafeJsonString(value)) return null;
+    const serialized = JSON.stringify(value);
+    if (!serialized || serialized.includes("\\u0000")) return null;
+    return serialized;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Extract PG-JSONB-safe latest turn_status / turn_usage pointer snapshots from
+ * one outbound wire payload. Fast-paths out via substring probe so ordinary
+ * text/tool delta frames incur zero JSON.parse overhead. Payloads containing
+ * NUL or lone surrogates return null so BYTEA persistence never fails and
+ * sessionSnapshot safely falls back to bounded BYTEA scanning.
+ */
+export function extractSafeLiveStreamFactPointers(
+  payloadStr: string,
+  frameSeq: number,
+): { statusJson: string | null; usageJson: string | null } {
+  const maybeStatus = payloadStr.includes('"outbound.turn_status"');
+  const maybeUsage = payloadStr.includes('"outbound.turn_usage"');
+  if (!maybeStatus && !maybeUsage) {
+    return { statusJson: null, usageJson: null };
+  }
+  let parsed: Record<string, unknown>;
+  try {
+    const raw = JSON.parse(payloadStr) as unknown;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return { statusJson: null, usageJson: null };
+    }
+    parsed = raw as Record<string, unknown>;
+  } catch {
+    return { statusJson: null, usageJson: null };
+  }
+  if (parsed.type === "outbound.turn_status") {
+    const statusPayload: Record<string, unknown> = {
+      frameSeq,
+      type: "outbound.turn_status",
+      status: parsed.status ?? null,
+    };
+    if (parsed.retry !== undefined) statusPayload.retry = parsed.retry;
+    if (parsed.detail !== undefined) statusPayload.detail = parsed.detail;
+    return { statusJson: toPgSafeJsonString(statusPayload), usageJson: null };
+  }
+  if (
+    parsed.type === "outbound.turn_usage" &&
+    parsed.usage !== null &&
+    typeof parsed.usage === "object" &&
+    !Array.isArray(parsed.usage)
+  ) {
+    return {
+      statusJson: null,
+      usageJson: toPgSafeJsonString({ frameSeq, usage: parsed.usage }),
+    };
+  }
+  return { statusJson: null, usageJson: null };
+}
+
 /**
  * Retrying the same live-frame journal write cannot resolve an identity or
  * immutable-payload conflict. The bridge duck-types this exact flag so these
@@ -248,6 +337,7 @@ export async function persistGatewayLiveFrame(
   const payload = Buffer.from(input.payload, "utf8");
   const payloadSha256 = sha256(payload);
   const sessionUserId = `c:${input.uid.toString()}`;
+  const factPointers = extractSafeLiveStreamFactPointers(input.payload, input.frameSeq);
 
   const persisted = await retryOnSerializationFailure(() => withTx(pool, async (client) => {
     // Lock the dispatch row BEFORE reading tape state, in a SEPARATE statement:
@@ -323,10 +413,11 @@ export async function persistGatewayLiveFrame(
     const stream = await client.query(
       `INSERT INTO client_session_live_streams
          (stream_key,session_id,user_id,client_message_id,dispatch_id,attempt_no,
-          agent_container_id,source,projection_source,terminal_status,tape_id,tape_sha256)
+          agent_container_id,source,projection_source,terminal_status,tape_id,tape_sha256,
+          latest_turn_status_json,latest_turn_usage_json)
        VALUES (
          $1,$2,$3,$4,$5::uuid,$6,$7,'gateway',
-         $8,$9,$10,$11
+         $8,$9,$10,$11,$12::jsonb,$13::jsonb
        )
        ON CONFLICT (stream_key) DO UPDATE SET
          updated_at=NOW(),
@@ -334,6 +425,24 @@ export async function persistGatewayLiveFrame(
            WHEN EXCLUDED.dispatch_id IS NULL
              THEN COALESCE(EXCLUDED.client_message_id,client_session_live_streams.client_message_id)
            ELSE client_session_live_streams.client_message_id
+         END,
+         latest_turn_status_json=CASE
+           WHEN EXCLUDED.latest_turn_status_json IS NOT NULL
+             AND (
+               client_session_live_streams.latest_turn_status_json IS NULL
+               OR COALESCE((client_session_live_streams.latest_turn_status_json->>'frameSeq')::bigint, 0) <= $14::bigint
+             )
+             THEN EXCLUDED.latest_turn_status_json
+           ELSE client_session_live_streams.latest_turn_status_json
+         END,
+         latest_turn_usage_json=CASE
+           WHEN EXCLUDED.latest_turn_usage_json IS NOT NULL
+             AND (
+               client_session_live_streams.latest_turn_usage_json IS NULL
+               OR COALESCE((client_session_live_streams.latest_turn_usage_json->>'frameSeq')::bigint, 0) <= $14::bigint
+             )
+             THEN EXCLUDED.latest_turn_usage_json
+           ELSE client_session_live_streams.latest_turn_usage_json
          END
        WHERE client_session_live_streams.session_id=EXCLUDED.session_id
          AND client_session_live_streams.user_id=EXCLUDED.user_id
@@ -367,6 +476,9 @@ export async function persistGatewayLiveFrame(
         finalizedTape?.status ?? null,
         finalizedTape?.tape_id ?? null,
         finalizedTape?.tape_sha256 ?? null,
+        factPointers.statusJson,
+        factPointers.usageJson,
+        input.frameSeq,
       ],
     );
     if ((stream.rowCount ?? 0) !== 1) {
@@ -1602,4 +1714,106 @@ export async function retireDeadLiveStreams(
       RETURNING s.stream_key`,
   );
   return { retired: (aged.rowCount ?? 0) + (leftover.rowCount ?? 0) };
+}
+
+export const DEFAULT_RETIRED_PRUNE_OLDER_THAN_DAYS = 7;
+export const MIN_RETIRED_PRUNE_OLDER_THAN_DAYS = 1;
+export const MAX_RETIRED_PRUNE_OLDER_THAN_DAYS = 365;
+
+const RETIRED_STREAM_ELIGIBLE_SQL = `s.source='gateway'
+  AND s.provenance ? 'retired_at'
+  AND (
+    CASE
+      WHEN (s.provenance->>'retired_at') ~ '^\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}'
+        THEN (s.provenance->>'retired_at')::timestamptz
+      ELSE s.updated_at
+    END
+  ) < NOW() - ($2::integer * INTERVAL '1 day')
+  AND (
+    s.dispatch_id IS NULL
+    OR NOT EXISTS (
+      SELECT 1 FROM turn_dispatches d
+       WHERE d.dispatch_id=s.dispatch_id
+         AND d.status IN ('admitted','accepted','rejecting')
+    )
+  )`;
+
+/**
+ * Safely prune dead retired live streams and their frames after `olderThanDays`
+ * (default 7d) in bounded batches (OCV5-824).
+ *
+ * Eligibility (all required):
+ *   - source = 'gateway' (never rollout_import)
+ *   - provenance ? 'retired_at' (never unretired or active streams)
+ *   - retired_at timestamp (falling back to updated_at if malformed) older than
+ *     `olderThanDays` days
+ *   - dispatch_id IS NULL or dispatch is NOT open (admitted/accepted/rejecting)
+ *
+ * Deletes frames first in bounded batches, drops checkpoints for touched streams,
+ * then deletes now-empty retired `projection_source='live'` stream rows in bounded
+ * batches (never touching tape-projected rows so tapeProjectionVersion stays monotonic).
+ * Fully idempotent.
+ */
+export async function pruneRetiredLiveFrames(
+  pool: Pool,
+  options?: { olderThanDays?: number; batchSize?: number; maxBatches?: number },
+): Promise<{ deletedFrames: number; prunedStreams: number; deletedStreams: number }> {
+  const olderThanDays = asPositiveInt(
+    options?.olderThanDays,
+    DEFAULT_RETIRED_PRUNE_OLDER_THAN_DAYS,
+    MAX_RETIRED_PRUNE_OLDER_THAN_DAYS,
+  );
+  const batchSize = asPositiveInt(options?.batchSize, DEFAULT_PRUNE_BATCH_SIZE, 20_000);
+  const maxBatches = options?.maxBatches === undefined
+    ? Number.POSITIVE_INFINITY
+    : asPositiveInt(options.maxBatches, 1, 1_000_000);
+
+  const touched = new Set<string>();
+  let deletedFrames = 0;
+  for (let batch = 0; batch < maxBatches; batch += 1) {
+    const result = await pool.query<{ stream_key: string }>(
+      `DELETE FROM client_session_live_frames
+        WHERE record_id IN (
+          SELECT f.record_id
+            FROM client_session_live_frames f
+            JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+           WHERE ${RETIRED_STREAM_ELIGIBLE_SQL}
+           LIMIT $1
+        )
+        RETURNING stream_key`,
+      [batchSize, olderThanDays],
+    );
+    const count = result.rowCount ?? 0;
+    if (count === 0) break;
+    deletedFrames += count;
+    for (const row of result.rows) touched.add(row.stream_key);
+  }
+  if (touched.size > 0) {
+    await deleteLiveUnitCheckpoints(pool, [...touched]);
+  }
+
+  let deletedStreams = 0;
+  for (let batch = 0; batch < maxBatches; batch += 1) {
+    const result = await pool.query<{ stream_key: string }>(
+      `DELETE FROM client_session_live_streams
+        WHERE stream_key IN (
+          SELECT s.stream_key
+            FROM client_session_live_streams s
+           WHERE s.projection_source='live'
+             AND ${RETIRED_STREAM_ELIGIBLE_SQL}
+             AND NOT EXISTS (
+               SELECT 1 FROM client_session_live_frames f
+                WHERE f.stream_key=s.stream_key
+             )
+           LIMIT $1
+        )
+        RETURNING stream_key`,
+      [batchSize, olderThanDays],
+    );
+    const count = result.rowCount ?? 0;
+    if (count === 0) break;
+    deletedStreams += count;
+  }
+
+  return { deletedFrames, prunedStreams: touched.size, deletedStreams };
 }

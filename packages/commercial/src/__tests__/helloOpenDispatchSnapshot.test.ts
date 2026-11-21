@@ -36,11 +36,21 @@ test('hello snapshot logging omits unsafe error names and codes', async () => {
   assert.deepEqual(warnings, [{ uid: '3', sessionId: 'session', connId: 'conn', errorName: 'Error' }])
 })
 
-test('INC-20261115-CONTAINER-SWAP-FRAMESEQ: extends snapshot budget to 64 for positive-cursor sessions while keeping 8 for zero-cursor idle sessions', async () => {
+test('INC-20261115-CONTAINER-SWAP-FRAMESEQ: extends snapshot budget to 64 for positive-cursor sessions while keeping 8 for zero-cursor idle sessions (batched in 1 tx)', async () => {
+  let connectCount = 0
   const pool = {
     async connect() {
+      connectCount++
       return {
-        async query(sql: string) {
+        async query(sql: string, params?: unknown[]) {
+          if (sql.includes('session-snapshot-batch-owner')) {
+            const ids = (params?.[1] as string[]) ?? []
+            return { rows: ids.map((id) => ({ session_id: id, as_of: '1000' })) }
+          }
+          if (sql.includes('session-snapshot-batch-container-cursor')) {
+            const ids = (params?.[1] as string[]) ?? []
+            return { rows: ids.map((id) => ({ session_id: id, agent_container_id: '7246' })) }
+          }
           if (sql.includes('session-snapshot-owner')) return { rows: [{ as_of: '1000' }] }
           if (sql.includes('session-snapshot-container-cursor')) return { rows: [{ agent_container_id: '7246' }] }
           return { rows: [] }
@@ -53,24 +63,28 @@ test('INC-20261115-CONTAINER-SWAP-FRAMESEQ: extends snapshot budget to 64 for po
   const positivePeers = Array.from({ length: 10 }, (_, i) => ({
     peerId: `s${i + 1}`, lastFrameSeq: 500, inFlight: false,
   }))
+  connectCount = 0
   await sendHelloSessionSnapshots(
     pool,
     { readyState: WebSocket.OPEN, bufferedAmount: 0, send: (raw) => { sentPositive.push(JSON.parse(String(raw))) } },
     '3', positivePeers, null, 'conn-pos', 7247,
   )
   assert.equal(sentPositive.length, 10)
+  assert.equal(connectCount, 1, '10 non-inFlight sessions must be batched into 1 REPEATABLE READ transaction')
   for (const frame of sentPositive) assert.deepEqual(frame.snapshot.gap, { reason: 'cursor_reset' })
 
   const sentZero: Array<{ peer: { id: string } }> = []
   const zeroPeers = Array.from({ length: 10 }, (_, i) => ({
     peerId: `z${i + 1}`, lastFrameSeq: 0, inFlight: false,
   }))
+  connectCount = 0
   await sendHelloSessionSnapshots(
     pool,
     { readyState: WebSocket.OPEN, bufferedAmount: 0, send: (raw) => { sentZero.push(JSON.parse(String(raw))) } },
     '3', zeroPeers, null, 'conn-zero', 7247,
   )
   assert.equal(sentZero.length, 8)
+  assert.equal(connectCount, 1, '8 zero-cursor idle sessions must be batched into 1 transaction')
 
   const sentMixed: Array<{ peer: { id: string } }> = []
   const mixedPeers = [
@@ -78,6 +92,7 @@ test('INC-20261115-CONTAINER-SWAP-FRAMESEQ: extends snapshot budget to 64 for po
     { peerId: 'pos-1', lastFrameSeq: 500, inFlight: false },
     { peerId: 'inflight-1', lastFrameSeq: 0, inFlight: true, inFlightClientMessageId: 'm-run-1' },
   ]
+  connectCount = 0
   await sendHelloSessionSnapshots(
     pool,
     { readyState: WebSocket.OPEN, bufferedAmount: 0, send: (raw) => { sentMixed.push(JSON.parse(String(raw))) } },
@@ -86,6 +101,7 @@ test('INC-20261115-CONTAINER-SWAP-FRAMESEQ: extends snapshot budget to 64 for po
   assert.deepEqual(sentMixed.map((f) => f.peer.id), [
     'inflight-1', 'pos-1', 'zero-1', 'zero-2', 'zero-3', 'zero-4', 'zero-5', 'zero-6',
   ])
+  assert.equal(connectCount, 2, '1 dedicated tx for inFlight + 1 batched tx for remaining 7 idle/cursor sessions')
 
   const sentMulti: Array<{ peer: { id: string }; snapshot: { gap: unknown } }> = []
   const multiPeers = [
