@@ -28,16 +28,25 @@ import { clearFrozenPrompt } from './promptFreeze.js'
 import { type ExecutionTarget, RemoteTargetUnavailableError } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { log } from './sessionManagerLog.js'
+import {
+  readCgroupMemoryUsage,
+  resolveMaxResidentRunners,
+  resolveMemoryPressureThreshold,
+  type CgroupMemoryReading,
+} from './cgroupMemoryGuard.js'
 import { isTempSessionKey, resolveEnginePreheatDeadlineMs } from './sessionManager.js'
 import type { SessionManager, AgentSession, PreheatOutcome } from './sessionManager.js'
 
 export interface SessionLifecycleHost {
   _flushTailFolding: SessionManager['_flushTailFolding']
   _getRepoSnapshot: SessionManager['_getRepoSnapshot']
+  _maxResidentRunners?: number
+  _memoryPressureThreshold?: number
   _preheatActive: SessionManager['_preheatActive']
   _preheatInFlight: SessionManager['_preheatInFlight']
   _promptQueueHolds: SessionManager['_promptQueueHolds']
   _pruneResumeMap: SessionManager['_pruneResumeMap']
+  _readCgroupMemory?: () => Promise<CgroupMemoryReading | null>
   _remoteTargetController: SessionManager['_remoteTargetController']
   _resumeMap: SessionManager['_resumeMap']
   _resumeMapCostImprecise: SessionManager['_resumeMapCostImprecise']
@@ -57,6 +66,7 @@ export interface SessionLifecycleHost {
   maxIdleMsCron: SessionManager['maxIdleMsCron']
   onSessionDestroyed: SessionManager['onSessionDestroyed']
   releaseRuntimeRecycleDrain: SessionManager['releaseRuntimeRecycleDrain']
+  retireKeepResume: SessionManager['retireKeepResume']
   scheduleIdleDrain: SessionManager['scheduleIdleDrain']
   sessions: SessionManager['sessions']
   submit: SessionManager['submit']
@@ -351,16 +361,169 @@ export async function recyclePeerForRepoUnbind(
   }
 }
 
+/**
+ * True when a session has any active/in-flight turn, queued prompt, preheat,
+ * internal idle drain, or teardown/replacement in progress.
+ * Pressure/idle eviction MUST NEVER evict a busy session.
+ */
+export function isSessionInFlightOrBusy(
+  host: Pick<SessionLifecycleHost, '_preheatInFlight' | '_promptQueueHolds'>,
+  session: AgentSession,
+): boolean {
+  return (
+    (session._activeTurnCount ?? 0) > 0 ||
+    (session._activeClientTurnCount ?? 0) > 0 ||
+    (session._idleInternalTurns ?? 0) > 0 ||
+    Boolean(session._idleRunning) ||
+    Boolean(session._idlePreExpiryActive) ||
+    Boolean(session._admittingClientMessageId) ||
+    Boolean(session._runningClientMessageId) ||
+    Boolean(session._externalTurnAbort) ||
+    Boolean(session._replacing) ||
+    Boolean(session._plannedTeardown) ||
+    host._preheatInFlight.has(session.sessionKey) ||
+    host._promptQueueHolds(session)
+  )
+}
+
+export interface EvictionPassResult {
+  idleEvicted: number
+  pressureRetired: number
+  retiredKeys: string[]
+}
+
+/**
+ * Single pass of session eviction:
+ *  1. Idle TTL eviction (existing behavior; skips busy/in-flight sessions).
+ *  2. OCV5-825 container memory watermark (>75% cgroup v2/v1; safe no-op if
+ *     unreadable) + active resident runner cap (`OC_MAX_RESIDENT_RUNNERS`):
+ *     retires LRU idle resident runners via `retireKeepResume` (preserving
+ *     native resume-map) while strictly skipping any running/in-flight turn.
+ */
+export async function runEvictionPass(this: SessionLifecycleHost): Promise<EvictionPassResult> {
+  const now = Date.now()
+  const toEvict: string[] = []
+  for (const [key, s] of this.sessions) {
+    if (isSessionInFlightOrBusy(this, s)) continue
+    const isTempSession = isTempSessionKey(key)
+    const maxIdle = isTempSession ? this.maxIdleMsCron : this.maxIdleMsChat
+    const lastActive = Math.max(s.lastUsedAt, s.runner.lastActivityAt)
+    if (now - lastActive > maxIdle) {
+      toEvict.push(key)
+    }
+  }
+  let idleEvicted = 0
+  for (const key of toEvict) {
+    const s = this.sessions.get(key)
+    if (!s || isSessionInFlightOrBusy(this, s)) continue
+    // 先 await shutdown 完成(SIGTERM+SIGKILL 链走完),再清状态
+    try {
+      this.markPlannedServiceRestart(s)
+      await s.runner.shutdown()
+    } catch {}
+    // A1:底座已停产出,flush 折叠 tail 的 pending 并清定时器/状态。
+    await this._flushTailFolding(s)
+    // 释放 remote mux refcount(若为 remote)—— 与 destroySession 语义一致
+    if (s.executionTarget.kind === 'remote' && s.userId) {
+      await this._remoteTargetController
+        ?.releaseMux(key, s.userId, s.executionTarget.hostId)
+        .catch((err) => log.warn('evict releaseMux failed', { key, err: String(err) }))
+    }
+    this.sessions.delete(key)
+    // Phase 5:同步清 peer→sessionKey 反查索引(避免悬挂条目)。
+    this._sessionIdToKey.delete(s.peerId)
+    if (!key.includes(':webchat:')) {
+      this._resumeMap.delete(key)
+      this._resumeMapTimestamps.delete(key)
+      this._resumeMapLastCost.delete(key)
+      this._resumeMapCostImprecise.delete(key)
+      this._resumeMapProvider.delete(key)
+      this._resumeMapHistory.delete(key)
+    }
+    // Medium#G1 + N11:shutdown 完才清 ring,保证不会有"runner 已死但 ring 还能
+    // 接尾帧"的窗口。webchat 虽然 resume-map 留着等 reconnect,但 outboundRing
+    // 没必要留(重连时会重走 hello,server 按 lastFrameSeq=0 重建)。
+    try {
+      this.onSessionDestroyed?.(key)
+    } catch {}
+    idleEvicted++
+  }
+
+  // OCV5-825: cgroup memory watermark (>75%) + resident runner cap guardrail
+  const maxRunners = this._maxResidentRunners ?? resolveMaxResidentRunners()
+  const memThreshold = this._memoryPressureThreshold ?? resolveMemoryPressureThreshold()
+  const readMem = this._readCgroupMemory ?? readCgroupMemoryUsage
+
+  const resident: AgentSession[] = []
+  for (const s of this.sessions.values()) {
+    if (s.runner.isRunning) resident.push(s)
+  }
+  let residentCount = resident.length
+  const evictable = resident
+    .filter((s) => !isSessionInFlightOrBusy(this, s))
+    .sort(
+      (a, b) =>
+        Math.max(a.lastUsedAt, a.runner.lastActivityAt) -
+        Math.max(b.lastUsedAt, b.runner.lastActivityAt),
+    )
+
+  let mem: CgroupMemoryReading | null = null
+  if (evictable.length > 0) {
+    try {
+      mem = await readMem()
+    } catch {
+      mem = null
+    }
+  }
+
+  let overCap = maxRunners > 0 && residentCount > maxRunners
+  let overMem = mem !== null && mem.ratio > memThreshold
+  let pressureRetired = 0
+  const retiredKeys: string[] = []
+
+  while (evictable.length > 0 && (overCap || overMem)) {
+    const cand = evictable.shift()!
+    const current = this.sessions.get(cand.sessionKey)
+    // Re-check right before retiring so a newly started turn is never interrupted.
+    if (!current || current !== cand || !current.runner.isRunning || isSessionInFlightOrBusy(this, current)) {
+      continue
+    }
+    const reason = overCap && overMem ? 'memory+runner_cap' : overMem ? 'memory' : 'runner_cap'
+    try {
+      await this.retireKeepResume(current.sessionKey)
+    } catch (err) {
+      log.warn('pressure retireKeepResume failed', { sessionKey: current.sessionKey, reason }, err)
+      continue
+    }
+    residentCount = Math.max(0, residentCount - 1)
+    pressureRetired++
+    retiredKeys.push(current.sessionKey)
+    log.info('session_pressure_retired', {
+      sessionKey: current.sessionKey,
+      reason,
+      residentRemaining: residentCount,
+      maxRunners,
+      ...(mem ? { memRatio: Number(mem.ratio.toFixed(3)), memVersion: mem.version } : {}),
+    })
+    overCap = maxRunners > 0 && residentCount > maxRunners
+    if (overMem && evictable.length > 0) {
+      try {
+        mem = await readMem()
+      } catch {
+        mem = null
+      }
+      overMem = mem !== null && mem.ratio > memThreshold
+    }
+  }
+
+  if (idleEvicted > 0 || pressureRetired > 0) this._saveResumeMap()
+  this._pruneResumeMap()
+  return { idleEvicted, pressureRetired, retiredKeys }
+}
+
 // 周期性 LRU 驱逐 — webchat sessions survive much longer than cron/task sessions
 export function startEvictionLoop(this: SessionLifecycleHost, intervalMs = 60_000): () => void {
-  // 2026-04-22 Codex R1 N11:LRU 驱逐此前 fire-and-forget 调 runner.shutdown() 然后
-  // 立刻 `sessions.delete(key)` + `onSessionDestroyed(key)` 清 ring。问题是 shutdown
-  // 内部有 SIGTERM → 1s 等待 → SIGKILL 的异步链,在这期间 runner 仍可能从 stdout
-  // 读到残余字节并推给 server(通过 onFrame callback),而此刻 server 的 outboundRing
-  // 已被 onSessionDestroyed 清空 —— 这些尾帧会落到一个空 ring 上,下次 reconnect
-  // replay 时丢掉(数据不一致且无 warning)。
-  //
-  // 修复:await 每个 runner.shutdown() 完成后才 delete + onSessionDestroyed。
+  // 2026-04-22 Codex R1 N11:await 每个 runner.shutdown() 完成后才 delete + onSessionDestroyed。
   // 用 async IIFE 不阻塞 interval 队列(每轮 eviction 独立跑,上一轮若卡住不影响下一轮)。
   let _inFlight = false
   const t = setInterval(() => {
@@ -368,52 +531,7 @@ export function startEvictionLoop(this: SessionLifecycleHost, intervalMs = 60_00
     _inFlight = true
     ;(async () => {
       try {
-        const now = Date.now()
-        const toEvict: string[] = []
-        for (const [key, s] of this.sessions) {
-          const isTempSession = isTempSessionKey(key)
-          const maxIdle = isTempSession ? this.maxIdleMsCron : this.maxIdleMsChat
-          const lastActive = Math.max(s.lastUsedAt, s.runner.lastActivityAt)
-          if (now - lastActive > maxIdle) {
-            toEvict.push(key)
-          }
-        }
-        for (const key of toEvict) {
-          const s = this.sessions.get(key)
-          if (!s) continue
-          // 先 await shutdown 完成(SIGTERM+SIGKILL 链走完),再清状态
-          try {
-            this.markPlannedServiceRestart(s)
-            await s.runner.shutdown()
-          } catch {}
-          // A1:底座已停产出,flush 折叠 tail 的 pending 并清定时器/状态。
-          await this._flushTailFolding(s)
-          // 释放 remote mux refcount(若为 remote)—— 与 destroySession 语义一致
-          if (s.executionTarget.kind === 'remote' && s.userId) {
-            await this._remoteTargetController
-              ?.releaseMux(key, s.userId, s.executionTarget.hostId)
-              .catch((err) => log.warn('evict releaseMux failed', { key, err: String(err) }))
-          }
-          this.sessions.delete(key)
-          // Phase 5:同步清 peer→sessionKey 反查索引(避免悬挂条目)。
-          this._sessionIdToKey.delete(s.peerId)
-          if (!key.includes(':webchat:')) {
-            this._resumeMap.delete(key)
-            this._resumeMapTimestamps.delete(key)
-            this._resumeMapLastCost.delete(key)
-            this._resumeMapCostImprecise.delete(key)
-            this._resumeMapProvider.delete(key)
-            this._resumeMapHistory.delete(key)
-          }
-          // Medium#G1 + N11:shutdown 完才清 ring,保证不会有"runner 已死但 ring 还能
-          // 接尾帧"的窗口。webchat 虽然 resume-map 留着等 reconnect,但 outboundRing
-          // 没必要留(重连时会重走 hello,server 按 lastFrameSeq=0 重建)。
-          try {
-            this.onSessionDestroyed?.(key)
-          } catch {}
-        }
-        if (toEvict.length > 0) this._saveResumeMap()
-        this._pruneResumeMap()
+        await runEvictionPass.call(this)
       } finally {
         _inFlight = false
       }

@@ -108,6 +108,7 @@ import { V3_WECHAT_OUTBOUND_ADAPTER_ID, V3_QQBOT_OUTBOUND_ADAPTER_ID, liveSessio
 import { ALLOWED_INBOUND_MODELS } from './delegatePolicy.js'
 import { sessionStartFailureCode, sessionStartFailureMessage, userSentTurnFrames } from './turnFrames.js'
 import { MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_FILE, MAX_UPLOAD_SINGLE, MAX_UPLOAD_TOTAL, mimeFor } from './httpUploadStatic.js'
+import { formatLegacyBase64OversizeError, resolveLegacyBase64MaxBytes } from './wsPayloadPolicy.js'
 import type { Gateway, LocalExecutionDecision } from './server.js'
 
 export interface InboundDispatchHost {
@@ -996,19 +997,29 @@ export async function dispatchInbound(
       }
       const attachmentSizes: number[] = []
       let attachmentTotalOver = false
-      // First pass — validate base64 (legacy) entries the same way as before so
-      // old web bundles still get correct 4xx-style WS error frames.
+      // First pass — guard legacy inline base64 attachments against OOM and
+      // give an explicit migration error guiding large files to HTTP `/api/uploads`.
       // The total check happens after every attachment is counted. Rejecting at
       // the first prefix that crosses the cap would name the wrong total.
+      const legacyBase64Cap = Math.min(MAX_UPLOAD_SINGLE, resolveLegacyBase64MaxBytes())
+      let legacyBase64TotalBytes = 0
       for (const m of media) {
         if (!m.base64) continue
         const rawLen = m.base64.length
         const byteLen = Math.ceil(rawLen * 0.75) // base64 → bytes approx
-        if (byteLen > MAX_UPLOAD_SINGLE) {
-          rejectFrame(
-            `附件超过 ${MAX_UPLOAD_SINGLE / 1024 / 1024}MB 限制 (${(byteLen / 1024 / 1024).toFixed(1)}MB)`,
-            { byteLen },
-          )
+        if (byteLen > legacyBase64Cap) {
+          rejectFrame(formatLegacyBase64OversizeError(byteLen, legacyBase64Cap), {
+            byteLen,
+            limitBytes: legacyBase64Cap,
+          })
+          return
+        }
+        legacyBase64TotalBytes += byteLen
+        if (legacyBase64TotalBytes > legacyBase64Cap) {
+          rejectFrame(formatLegacyBase64OversizeError(legacyBase64TotalBytes, legacyBase64Cap), {
+            byteLen: legacyBase64TotalBytes,
+            limitBytes: legacyBase64Cap,
+          })
           return
         }
         attachmentSizes.push(byteLen)

@@ -177,6 +177,76 @@ export function buildCodexRelayLocalBaseUrl(
   return `${localOrigin.replace(/\/+$/, '')}${codexRelayBasePathForUpstream(upstreamBaseUrl)}`
 }
 
+const CODEX_OFFICIAL_RELAY_BASE_PATH = codexRelayBasePathForUpstream(CODEX_OFFICIAL_UPSTREAM_BASE_URL)
+
+export interface CodexBenignAuxStub {
+  readonly status: number
+  readonly body: string
+  readonly contentType?: string
+}
+
+/**
+ * OCV5-825: Benign auxiliary discovery/settings endpoints added by Codex CLI 0.170.0
+ * under `chatgpt_base_url` (`/backend-api/codex`).
+ *
+ * Security boundary:
+ *  - Never forwarded to upstream `chatgpt.com` (zero residential proxy traffic,
+ *    zero upstream credential exposure or failure marking).
+ *  - Exact method + decoded suffix match after traversal/encoding validation.
+ *  - Telemetry/identity/unknown paths (analytics-events, agent-identity, otlp,
+ *    files, etc.) remain fail-closed 404 `PATH_NOT_ALLOWED`.
+ */
+export function matchCodexBenignAuxStub(reqUrl: string, method: string): CodexBenignAuxStub | null {
+  let parsed: URL
+  try {
+    parsed = new URL(reqUrl, 'http://internal')
+  } catch {
+    return null
+  }
+  if (parsed.pathname.includes('://')) return null
+  if (
+    parsed.pathname !== CODEX_OFFICIAL_RELAY_BASE_PATH
+    && !parsed.pathname.startsWith(`${CODEX_OFFICIAL_RELAY_BASE_PATH}/`)
+  ) {
+    return null
+  }
+  const suffixRaw = parsed.pathname.slice(CODEX_OFFICIAL_RELAY_BASE_PATH.length)
+  if (!suffixRaw) return null
+  let decoded: string
+  try {
+    decoded = decodeURIComponent(suffixRaw)
+  } catch {
+    return null
+  }
+  if (
+    decoded.includes('..')
+    || decoded.includes('\\')
+    || decoded.startsWith('//')
+    || decoded.includes('\u0000')
+  ) {
+    return null
+  }
+  if (method === 'GET' && (decoded === '/ps/plugins/suggested/codex' || decoded === '/ps/plugins/installed')) {
+    return { status: 200, body: '{"plugins":[]}', contentType: 'application/json; charset=utf-8' }
+  }
+  if (method === 'GET' && (decoded === '/wham/accounts/check' || decoded === '/wham/settings/user')) {
+    return { status: 200, body: '{}', contentType: 'application/json; charset=utf-8' }
+  }
+  if (decoded === '/ps/mcp') {
+    if (method === 'POST') {
+      return {
+        status: 200,
+        body: '{"jsonrpc":"2.0","id":null,"error":{"code":-32601,"message":"mcp relay disabled"}}',
+        contentType: 'application/json; charset=utf-8',
+      }
+    }
+    if (method === 'GET' || method === 'DELETE') {
+      return { status: 204, body: '' }
+    }
+  }
+  return null
+}
+
 function validateRelaySuffix(method: string, suffixRaw: string): { ok: true } | { ok: false; status: number; code: string; message: string } {
   const suffix = suffixRaw.length === 0 ? '/' : suffixRaw
   let decoded: string
@@ -784,6 +854,13 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     }
     let mapped: ReturnType<typeof mapCodexRelayUrl> | null = null
     if (routeReq.route === false) {
+      const auxStub = matchCodexBenignAuxStub(req.url ?? '/', method)
+      if (auxStub) {
+        res.statusCode = auxStub.status
+        if (auxStub.contentType) res.setHeader('Content-Type', auxStub.contentType)
+        res.end(auxStub.body)
+        return
+      }
       mapped = mapCodexRelayUrlMulti(req.url ?? '/', method, upstreamBaseUrls)
       if ('error' in mapped) {
         if (mapped.error.code === 'PATH_NOT_ALLOWED' || mapped.error.code === 'BAD_PATH') {

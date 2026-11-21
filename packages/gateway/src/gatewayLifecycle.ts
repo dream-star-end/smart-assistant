@@ -8,8 +8,9 @@ import { startLogTimingReporter } from '@openclaude/protocol/nodeLogTiming'
  * `this.x` reads/writes are unchanged. GatewayLifecycleHost lists exactly the Gateway members this code
  * touches (typed from the class itself).
  */
-import { mkdirSync, readdirSync, realpathSync, statSync, unlinkSync } from 'node:fs'
 import { startUploadRetention, stopUploadRetention } from './uploadRetention.js'
+import { runStartupUploadTmpCleanup } from './uploadTmpCleanup.js'
+import { resolveWsMaxPayloadBytes } from './wsPayloadPolicy.js'
 import type { LogContext } from './logger.js'
 import { createServer } from 'node:http'
 import { join, resolve } from 'node:path'
@@ -353,83 +354,19 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
     )
   }
 
-  // Plan B (2026-05-09): clean up orphan `.tmp-*` files left in uploadsDir
-  // by handleUpload runs that crashed mid-stream (or were aborted by the
-  // client and the cleanup unlink raced past us). One-shot at startup —
-  // intentionally no periodic sweep; abort/error paths in handleUpload
-  // already unlink eagerly. Codex Plan B v2 review confirmed.
-  //
-  // V3 multi-tenant extension (2026-05-12): handleUpload writes land in
-  // per-user docker volume host paths, not the global paths.uploadsDir.
-  // We sweep both:
-  //   1. paths.uploadsDir (personal-version / legacy 'default' uploads)
-  //   2. /var/lib/docker/volumes/oc-v3-data-u<uid>/_data/uploads/* (commercial)
-  // Each block is wrapped in its own try/catch so a docker host without
-  // `/var/lib/docker/volumes` (e.g. dev box) doesn't fail the legacy sweep.
-  const cutoff = Date.now() - 60 * 60 * 1000 // 1h
-  const sweepTmpInDir = (dir: string): number => {
-    let cleaned = 0
-    try {
-      const baseReal = realpathSync(dir)
-      for (const fname of readdirSync(baseReal)) {
-        if (!fname.startsWith('.tmp-')) continue
-        try {
-          const st = statSync(join(baseReal, fname))
-          if (st.mtimeMs < cutoff) {
-            unlinkSync(join(baseReal, fname))
-            cleaned++
-          }
-        } catch {}
-      }
-    } catch {
-      // Directory missing or unreadable — caller decides whether to log.
-      return -1
-    }
-    return cleaned
-  }
-  try {
-    mkdirSync(paths.uploadsDir, { recursive: true })
-    const cleaned = sweepTmpInDir(paths.uploadsDir)
-    if (cleaned > 0) this.log.info('upload .tmp orphan cleanup', { cleaned, dir: 'legacy' })
-  } catch (err) {
-    this.log.warn('upload .tmp orphan cleanup (legacy) failed', undefined, err)
-  }
-  if (this.deps.commercial?.isUserVolumeMediaPath) {
-    // Multi-tenant mode — iterate /var/lib/docker/volumes/oc-v3-data-u*.
-    // No DB lookup needed; we accept stale uid dirs (e.g. volume deleted)
-    // because readdirSync skips them naturally.
-    // We only sweep uploads/, NOT generated/: gateway 自身上传走 .tmp-
-    // 协议(rename-after-fsync),codex image_gen 用 writeFile 直接落盘,
-    // 不会留 .tmp- 残留,所以 generated/ 没有 orphan 需要清。
-    // TODO: 若 generated/ 写入将来切到 .tmp-* publish 语义(例如 codex
-    // image_gen 改成 rename-after-fsync),把 generated/ 也加进 sweep 列表。
-    try {
-      const volsRoot = '/var/lib/docker/volumes'
-      let totalCleaned = 0
-      let dirsSwept = 0
-      for (const entry of readdirSync(volsRoot)) {
-        if (!/^oc-(v3|v5)-data-u[1-9][0-9]{0,18}$/.test(entry)) continue
-        const userUploads = join(volsRoot, entry, '_data', 'uploads')
-        const r = sweepTmpInDir(userUploads)
-        if (r >= 0) {
-          dirsSwept++
-          totalCleaned += r
-        }
-      }
-      if (totalCleaned > 0 || dirsSwept > 0) {
-        this.log.info('upload .tmp orphan cleanup', {
-          cleaned: totalCleaned,
-          dirsSwept,
-          dir: 'per-user',
-        })
-      }
-    } catch (err) {
-      // /var/lib/docker/volumes typically requires root (gateway runs as
-      // root in v3 commercial); ENOENT just means docker isn't installed
-      // (CI / dev). Log warn but don't fail startup.
-      this.log.warn('upload .tmp orphan cleanup (per-user) failed', undefined, err)
-    }
-  }
+  // OCV5-825: Non-blocking background `.tmp-*` orphan cleanup using fs/promises
+  // so directory walks never block `httpServer.listen()` or event-loop readiness.
+  void runStartupUploadTmpCleanup({
+    uploadsDir: paths.uploadsDir,
+    includePerUserVolumes: Boolean(this.deps.commercial?.isUserVolumeMediaPath),
+    shouldAbort: () => this._shuttingDown,
+    log: {
+      info: (msg, ctx) => this.log.info(msg, ctx as LogContext | undefined),
+      warn: (msg, ctx, err) => this.log.warn(msg, ctx as LogContext | undefined, err),
+    },
+  }).catch((err) => {
+    this.log.warn('upload .tmp orphan cleanup background task failed', undefined, err)
+  })
   try {
     startUploadRetention({
       info: (msg, ctx) => {
@@ -455,10 +392,10 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
   // V3 2H: 改用 noServer + 手动 upgrade dispatch,以便商业化模块的 /ws/user-chat-bridge
   // 与 /ws/agent 路径在 gateway 自身的 /ws 之前优先匹配。原 `path: '/ws'` 模式下
   // ws lib 会对所有非 /ws 请求 socket.destroy(),把商业化路径吃掉。
-  // 商用 v3:容器内 gateway 作为 server 接收 bridge client 转发的 user 帧。
-  // 用户允许单附件 200 MiB / 总 300 MiB,base64 后 ≈ 400 MiB + envelope → 448 MiB。
-  // ws 默认 maxPayload=100 MiB 会让 Receiver 对大附件帧直接 RangeError 关连接。
-  this.wss = new WebSocketServer({ noServer: true, maxPayload: 448 * 1024 * 1024 })
+  // OCV5-825: 现代客户端均走 HTTP `/api/uploads` + `/api/media/*` 引用,收紧 WS 单帧上限
+  // 从 448 MiB 至安全默认 16 MiB (支持 OC_WS_MAX_PAYLOAD_BYTES 紧急回退),拆除单帧堆 OOM 炸弹。
+  const wsMaxPayload = resolveWsMaxPayloadBytes()
+  this.wss = new WebSocketServer({ noServer: true, maxPayload: wsMaxPayload })
   this.httpServer.on('upgrade', (req, socket, head) => {
     // 1) 商业化模块优先(/ws/user-chat-bridge / /ws/agent / 未来私有路径)
     try {

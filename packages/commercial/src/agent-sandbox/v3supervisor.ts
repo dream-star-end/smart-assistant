@@ -1902,11 +1902,13 @@ async function ensureV3Volumes(docker: Docker, uid: number): Promise<V3VolumeBun
   const codex = v3CodexVolumeNameFor(uid);
   const userLocal = v3UserLocalVolumeNameFor(uid);
   const userConfig = v3UserConfigVolumeNameFor(uid);
-  await ensureSingleV3Volume(docker, uid, data, "data");
-  await ensureSingleV3Volume(docker, uid, projects, "projects");
-  await ensureSingleV3Volume(docker, uid, codex, "codex");
-  await ensureSingleV3Volume(docker, uid, userLocal, "userLocal");
-  await ensureSingleV3Volume(docker, uid, userConfig, "userConfig");
+  await Promise.all([
+    ensureSingleV3Volume(docker, uid, data, "data"),
+    ensureSingleV3Volume(docker, uid, projects, "projects"),
+    ensureSingleV3Volume(docker, uid, codex, "codex"),
+    ensureSingleV3Volume(docker, uid, userLocal, "userLocal"),
+    ensureSingleV3Volume(docker, uid, userConfig, "userConfig"),
+  ]);
   return { data, projects, codex, userLocal, userConfig };
 }
 
@@ -2622,36 +2624,6 @@ export async function provisionV3Container(
       );
     }
 
-    // ensureV3Volumes 必须在持 per-uid lock 期间调,防 GC race(见函数 doc)
-    try {
-      if (useRemote) {
-        // 远端路径:label 守护由 node-agent 侧负责;这里只确保 5 个 volume 存在。
-        // 顺序与 ensureV3Volumes 本地路径保持一致(diagnostic 一致性,部分失败时
-        // master log 与本地路径同形态 — data → proj → codex → userLocal → userConfig)。
-        const dataName = v3VolumeNameFor(uid);
-        const projectsName = v3ProjectsVolumeNameFor(uid);
-        const codexName = v3CodexVolumeNameFor(uid);
-        const userLocalName = v3UserLocalVolumeNameFor(uid);
-        const userConfigName = v3UserConfigVolumeNameFor(uid);
-        await deps.containerService!.ensureVolume(hostId!, dataName);
-        await deps.containerService!.ensureVolume(hostId!, projectsName);
-        await deps.containerService!.ensureVolume(hostId!, codexName);
-        await deps.containerService!.ensureVolume(hostId!, userLocalName);
-        await deps.containerService!.ensureVolume(hostId!, userConfigName);
-        volumeNames = {
-          data: dataName,
-          projects: projectsName,
-          codex: codexName,
-          userLocal: userLocalName,
-          userConfig: userConfigName,
-        };
-      } else {
-        volumeNames = await ensureV3Volumes(deps.docker, uid);
-      }
-    } catch (err) {
-      throw wrapDockerError(err);
-    }
-
     secret = mintSecret();
     if (!/^[0-9a-f]{64}$/.test(secret)) {
       throw new SupervisorError(
@@ -2665,7 +2637,7 @@ export async function provisionV3Container(
 
     await tx1Client.query("COMMIT");
   } catch (err) {
-    // Tx1 内任何失败(dup / cap / volume / INSERT / COMMIT)→ ROLLBACK 抹掉未提交状态。
+    // Tx1 内任何失败(dup / cap / INSERT / COMMIT)→ ROLLBACK 抹掉未提交状态。
     // 占位行未 COMMIT 前对外不可见,无残骸;docker 副作用尚未发生,无需清理。
     try {
       await tx1Client.query("ROLLBACK");
@@ -2676,10 +2648,10 @@ export async function provisionV3Container(
   } finally {
     tx1Client.release();
   }
-  // Tx1 已提交:占位行(state='active', cid=NULL)对外可见;此后不持任何 PG client /
-  // advisory lock。中段 cid=NULL 窗口的读者兼容性见函数 docstring。
+  // Tx1 已提交:占位行(state='active', cid=NULL)对外可见,GC(gcSingleUidLocked)在 per-uid 锁内
+  // 见 active 行必 skip 不删卷;此后不持任何 PG client / HOST_CAP_LOCK / USER_LIFECYCLE_LOCK。
 
-  // ═══ 中段:无事务、无 checked-out 连接、无锁 —— 慢 IO(docker create/start + codex 绑定)═══
+  // ═══ 中段:无事务、无 checked-out 连接、无锁 —— 慢 IO(5 卷并行 ensure + docker create/start + codex 绑定)═══
   // 失败走 catch → compensateProvisionFailure(翻 vanished + 清 docker 残骸)。
   const token = `oc-v3.${row.id}.${secret}`;
   let createdDockerId = "";
@@ -2693,6 +2665,35 @@ export async function provisionV3Container(
     SyntheticEvalOverlayRuntime["resolvePrepared"]
   > = null;
   try {
+    // OCV5-825: 5 个 volume 并行创建并移出 HOST_CAP_LOCK 事务锁窗口。占位行已在 Tx1 COMMIT
+    // 保护免受 GC 误删;任一 volume 建卷/校验失败进入下方 catch → compensateProvisionFailure 翻 vanished。
+    try {
+      if (useRemote) {
+        const dataName = v3VolumeNameFor(uid);
+        const projectsName = v3ProjectsVolumeNameFor(uid);
+        const codexName = v3CodexVolumeNameFor(uid);
+        const userLocalName = v3UserLocalVolumeNameFor(uid);
+        const userConfigName = v3UserConfigVolumeNameFor(uid);
+        await Promise.all([
+          deps.containerService!.ensureVolume(hostId!, dataName),
+          deps.containerService!.ensureVolume(hostId!, projectsName),
+          deps.containerService!.ensureVolume(hostId!, codexName),
+          deps.containerService!.ensureVolume(hostId!, userLocalName),
+          deps.containerService!.ensureVolume(hostId!, userConfigName),
+        ]);
+        volumeNames = {
+          data: dataName,
+          projects: projectsName,
+          codex: codexName,
+          userLocal: userLocalName,
+          userConfig: userConfigName,
+        };
+      } else {
+        volumeNames = await ensureV3Volumes(deps.docker, uid);
+      }
+    } catch (err) {
+      throw wrapDockerError(err);
+    }
     if (canUseCc5TestModel(uid, process.env)) {
       if (getRuntimeChannel() === "v5" && !useRemote && deps.cc5 && deps.modelAuthority?.required) {
         const assignment = deps.modelAuthority.keyringEnvAssignment;
