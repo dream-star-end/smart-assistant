@@ -9,7 +9,6 @@ dist-tutorial-capture/
 *.swo
 .env
 deploy/.env
-deploy/legacy-master/.env
 claude-code-best/node_modules/
 claude-code-best/dist/
 

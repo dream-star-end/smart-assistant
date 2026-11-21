@@ -4,7 +4,8 @@
 
 ## 当前内容
 
-- `legacy-master/` — 个人版(45.32 master / `openclaude`)早期 deploy 资产,2026-04-20 导入后无人维护。**与 v3 商用版无关**,归档在此仅保留 git 历史,后续也许会迁去个人版仓。
+- `v5/`、`v5-selfhost/` — v5 商用版与个人自托管版部署配置、systemd unit 与发布清单。
+- 原 `legacy-master/`（45.32 master 早期个人版 deploy 资产）已于 OCV5-829 清理移除，历史记录保留在 git 中。
 
 ## 注意
 

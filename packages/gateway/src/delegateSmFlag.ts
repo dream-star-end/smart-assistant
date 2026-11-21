@@ -15,14 +15,17 @@
  * Production semantics require both SM and durable on (design v3 §4).
  * Resume occupancy + idempotency is a bugfix and is always on.
  */
-export function isDelegateSmEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = String(env.OC_DELEGATE_SM ?? '').trim().toLowerCase()
+function envFlagOn(env: NodeJS.ProcessEnv, key: string): boolean {
+  const raw = String(env[key] ?? '').trim().toLowerCase()
   return raw === '1' || raw === 'true' || raw === 'on'
 }
 
+export function isDelegateSmEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return envFlagOn(env, 'OC_DELEGATE_SM')
+}
+
 export function isDelegateDurableEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = String(env.OC_DELEGATE_DURABLE ?? '').trim().toLowerCase()
-  return raw === '1' || raw === 'true' || raw === 'on'
+  return envFlagOn(env, 'OC_DELEGATE_DURABLE')
 }
 
 /** Production durable path is SM && DURABLE. A lone DURABLE=1 is a no-op flag. */
@@ -35,8 +38,7 @@ export function isDelegateDurableEffective(env: NodeJS.ProcessEnv = process.env)
  * && NOTIFIER so SM=0 or DURABLE=0 stays byte-equivalent to 38c70b490.
  */
 export function isDelegateNotifierEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = String(env.OC_DELEGATE_NOTIFIER ?? '').trim().toLowerCase()
-  return raw === '1' || raw === 'true' || raw === 'on'
+  return envFlagOn(env, 'OC_DELEGATE_NOTIFIER')
 }
 
 export function isDelegateNotifierEffective(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -48,8 +50,7 @@ export function isDelegateNotifierEffective(env: NodeJS.ProcessEnv = process.env
  * requires SM && DURABLE && NOTIFIER && CUTOVER so a lone CUTOVER=1 is a no-op.
  */
 export function isDelegateCutoverEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = String(env.OC_DELEGATE_CUTOVER ?? '').trim().toLowerCase()
-  return raw === '1' || raw === 'true' || raw === 'on'
+  return envFlagOn(env, 'OC_DELEGATE_CUTOVER')
 }
 
 export function isDelegateCutoverEffective(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -62,17 +63,11 @@ export function isDelegateCutoverEffective(env: NodeJS.ProcessEnv = process.env)
  * SM&&DURABLE). Flag-off is byte-equivalent to 653ef6339 for turn_status.
  */
 export function isDelegateInflightSurfaceEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = String(env.OC_DELEGATE_INFLIGHT_SURFACE ?? '').trim().toLowerCase()
-  return raw === '1' || raw === 'true' || raw === 'on'
+  return envFlagOn(env, 'OC_DELEGATE_INFLIGHT_SURFACE')
 }
 
 export function isDelegateInflightSurfaceEffective(env: NodeJS.ProcessEnv = process.env): boolean {
   return isDelegateInflightSurfaceEnabled(env)
-}
-
-function envFlagOn(env: NodeJS.ProcessEnv, key: string): boolean {
-  const raw = String(env[key] ?? '').trim().toLowerCase()
-  return raw === '1' || raw === 'true' || raw === 'on'
 }
 
 /**

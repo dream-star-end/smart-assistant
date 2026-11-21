@@ -335,7 +335,7 @@ export type LocalTurnKind = 'synthetic' | 'turn' | 'prewarm' | 'auto_dream' | 'b
  * delegate 委派)会**绕过入站校验**,在 SessionManager.getOrCreate 里直接作为 CCB `--model`
  * spawn。已下线模型(如某个 stale 已安装 agent 里残留的 claude-*)会让 CCB 用不可路由的
  * --model 启动 → spawn 失败 / session 卡死。runner 创建是唯一收口点,这里把任何不在白名单的
- * 模型降级到平台默认(glm-5.3-zai),使"Claude 官方模型下线"在 agent 级路径上也真正生效。
+ * 模型降级到平台默认(deepseek-v4-flash),使"Claude 官方模型下线"在 agent 级路径上也真正生效。
  */
 export function resolveExecutionModel(
   preferred: string | undefined | null,
@@ -378,10 +378,9 @@ export function resolveExecutionModel(
   return EXECUTION_MODEL_FALLBACK
 }
 
-/** 平台执行模型兜底:V5 当前合法的静态 key 平台默认。 */
+/** 平台执行模型兜底:V5 当前合法的静态 key 平台默认(2026-10-20 Z.AI 线路停用，OCV5-829 移除 glm-5.3-zai 死兜底)。 */
 export const EXECUTION_MODEL_FALLBACK_ROUTE = [
   'deepseek-v4-flash',
-  'glm-5.3-zai',
   'MiniMax-M3',
 ] as const
 
