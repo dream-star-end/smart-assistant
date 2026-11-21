@@ -70,6 +70,7 @@ import { classifyDelegateOutputError } from './errorClassify.js'
 // 优先采用 job.model / job.effort;不支持后台合成计费且未豁免的引擎返回显式可读错误。
 import { localExecutionOverride } from './server.js'
 import {
+  checkCronOriginModelConflict,
   normalizeCronEffortField,
   normalizeCronModelField,
   resolveCronJobExecution,
@@ -2376,6 +2377,32 @@ export class CronScheduler {
       source: project.source,
     })
 
+    const originConflict = checkCronOriginModelConflict(job)
+    if (originConflict) {
+      logger.error(`job ${job.id} origin-session model/effort conflict rejected`, {
+        jobId: job.id,
+        agent: agent.id,
+        model: job.model,
+        effort: job.effort,
+      })
+      if (isUserInitiatedCronJob(job)) {
+        const label = job.label || job.id
+        try {
+          await this.onDeliver(
+            `⚠️ 定时任务「${label}」未执行：${originConflict}。请移除该任务的 model/effort 或改用独立会话模式。`,
+            (job.deliver ?? 'local') === 'local' ? { ...job, deliver: 'webchat' } : job,
+            deliveryContext,
+          )
+        } catch (err) {
+          logger.warn(`origin conflict notice failed for ${job.id}`, {
+            jobId: job.id,
+            errorClass: stableCronErrorClass(err),
+          })
+        }
+      }
+      return { kind: 'terminal_failure', code: 'CRON_ORIGIN_MODEL_CONFLICT' }
+    }
+
     if (job.resume === 'origin-session' && job.sourceSessionKey && this.onOriginSessionFire) {
       return this.runOriginSessionJob(job, durability, deliveryContext, project)
     }
@@ -2753,6 +2780,8 @@ export class CronScheduler {
     }
     if (normalizedJob.model === undefined) delete normalizedJob.model
     if (normalizedJob.effort === undefined) delete normalizedJob.effort
+    const originConflict = checkCronOriginModelConflict(normalizedJob)
+    if (originConflict) throw new Error(originConflict)
     filtered.push(normalizedJob)
     file.jobs = filtered
     await atomicWriteYaml(paths.cronYaml, file)
@@ -2841,6 +2870,8 @@ export class CronScheduler {
       if (effortCheck.value !== undefined) job.effort = effortCheck.value
       else delete job.effort
     }
+    const originConflict = checkCronOriginModelConflict(job)
+    if (originConflict) throw new Error(originConflict)
     await atomicWriteYaml(paths.cronYaml, file)
     logger.info(`updated job ${id}`, { jobId: id })
     this.maybePushCronIndex(file)

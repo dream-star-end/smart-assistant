@@ -1618,16 +1618,22 @@ describe("provisionV3Container", () => {
     assert.equal(maxInFlight, 5, "5 个 volume 应由 Promise.all 并行发起而非串行");
   });
 
-  test("OCV5-825: 锁外 ensureV3Volumes 任一卷失败 → 补偿翻 vanished，绝不泄漏占位行", async () => {
+  test("OCV5-825: 锁外 ensureV3Volumes 任一卷失败 → 等待全部并行建卷 settle 后再补偿翻 vanished，绝不泄漏占位行", async () => {
     const { docker } = makeDocker();
     const origCreateVolume = docker.createVolume.bind(docker);
     let calls = 0;
+    let slowSiblingSettled = false;
     (docker as unknown as { createVolume: (opts: { Name?: string; Labels?: Record<string, string> }) => Promise<unknown> }).createVolume = async (opts) => {
       calls += 1;
-      if (calls === 3) {
+      const idx = calls;
+      if (idx === 3) {
         const err = new Error("disk quota exceeded") as Error & { statusCode?: number };
         err.statusCode = 500;
         throw err;
+      }
+      if (idx === 5) {
+        await new Promise((r) => setTimeout(r, 25));
+        slowSiblingSettled = true;
       }
       return await origCreateVolume(opts as never);
     };
@@ -1638,6 +1644,7 @@ describe("provisionV3Container", () => {
       ),
       (err: Error) => err instanceof SupervisorError,
     );
+    assert.equal(slowSiblingSettled, true, "Promise.allSettled 必须等待其余并行建卷 settle 后再触发补偿");
     assert.deepEqual(pool.clientLog, ["BEGIN", "COMMIT"]);
     assert.equal(pool.rows.length, 1);
     assert.equal(pool.rows[0]!.state, "vanished", "中段建卷失败必须通过 compensateProvisionFailure 释放占位行");

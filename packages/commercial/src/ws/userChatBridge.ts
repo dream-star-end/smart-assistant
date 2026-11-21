@@ -376,13 +376,9 @@ export const CLOSE_BRIDGE = {
   SERVER_RESTART: 4509,
 } as const;
 
-/** 入站 / 出站 帧的最大字节数(单帧)。
- * 前端允许附件单文件 200 MiB / 总量 300 MiB (raw),一条 inbound.message 帧一次性打包全部 media,
- * base64 膨胀 4/3 ≈ 400 MiB + JSON/dataURL prefix/文件名 envelope → 448 MiB 圆整。
- * 早期 1 MiB / 80 MiB 会让大附件被 ws 库 Receiver 以 RangeError 直接关连接,消息到不了业务层。
- *
- * 导出供 index.ts 装配 createTunnelContainerSocket 时复用,避免两处 magic number 漂移。 */
-export const DEFAULT_MAX_FRAME_BYTES = 448 * 1024 * 1024;
+import { DEFAULT_BRIDGE_MAX_FRAME_BYTES, resolveBridgeMaxFrameBytes } from "./bridgeFrameBudget.js";
+/** 入站 / 出站 帧的最大字节数(单帧，OCV5-825 B1 与容器 gateway 16 MiB 上限对齐)。 */
+export const DEFAULT_MAX_FRAME_BYTES = DEFAULT_BRIDGE_MAX_FRAME_BYTES;
 
 /** 单条 hello 最多从 PG 补齐这么多会话的在飞 live frames。 */
 const HELLO_LIVE_CATCHUP_MAX_SESSIONS = 8;
@@ -1840,7 +1836,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   const codexBillingEnabled = codexBillingDepsCount === 3;
 
   const maxPerUser = deps.maxPerUser ?? DEFAULT_MAX_PER_USER;
-  const maxFrameBytes = deps.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
+  const maxFrameBytes = deps.maxFrameBytes ?? resolveBridgeMaxFrameBytes();
   const maxBufferedBytes = deps.maxBufferedBytes ?? DEFAULT_MAX_BUFFERED_BYTES;
   const connectTimeoutMs = deps.containerConnectTimeoutMs ?? DEFAULT_CONTAINER_CONNECT_TIMEOUT_MS;
   const heartbeatIntervalMs = deps.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;

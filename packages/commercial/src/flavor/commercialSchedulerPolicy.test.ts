@@ -83,6 +83,37 @@ describe("commercialSchedulerPolicy (OCV5-825)", () => {
     }
   });
 
+  test("allows pendingOrdersExpirer in selfhost when payment is explicitly enabled, while still skipping moderation/aiReview", () => {
+    const selfhost = okFlavor("selfhost");
+    assert.equal(
+      shouldStartCommercialScheduler("pendingOrdersExpirer", {
+        flavorIdentity: selfhost,
+        runtimeChannel: "v5",
+        paymentEnabled: true,
+        env: {},
+      }),
+      true,
+    );
+    assert.equal(
+      shouldStartCommercialScheduler("tutorialModeration", {
+        flavorIdentity: selfhost,
+        runtimeChannel: "v5",
+        paymentEnabled: true,
+        env: {},
+      }),
+      false,
+    );
+    assert.equal(
+      shouldStartCommercialScheduler("marketplaceAiReview", {
+        flavorIdentity: selfhost,
+        runtimeChannel: "v5",
+        paymentEnabled: true,
+        env: {},
+      }),
+      false,
+    );
+  });
+
   test("allows explicit opt-in override in selfhost via OC_SELFHOST_RUN_COMMERCIAL_SCHEDULERS=1", () => {
     const selfhost = okFlavor("selfhost");
     assert.equal(

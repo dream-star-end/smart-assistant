@@ -129,6 +129,18 @@ export function handleWsConnection(
   ws: WebSocket,
   req: IncomingMessage,
 ): void {
+  // OCV5-825 B1: Always attach an error listener on the socket before any close/send
+  // or receiver frame arrives. Otherwise ws Receiver `RangeError: Max payload size exceeded`
+  // (ERR_WS_MSG_TOO_BIG) emits an unhandled 'error' event that triggers uncaughtException
+  // and kills the entire gateway process instead of closing only the offending connection.
+  ws.on('error', (err: Error & { code?: string }) => {
+    const traceId = (ws as any)._connectionTraceId as string | undefined
+    this.log.warn('ws.socket_error', {
+      ...(traceId ? { connectionTraceId: traceId } : {}),
+      code: err?.code,
+      message: err?.message ?? String(err),
+    })
+  })
   if (this._shuttingDown) {
     try {
       ws.close(1001, 'shutting down')

@@ -14,7 +14,11 @@ import { resolveChatRunWorkspace } from './projectWorkspace.js'
 import { appendServerAuthoredMessage } from '@openclaude/storage'
 import { filterUserVisibleByAgentField, isHiddenSystemAgentId } from './agentVisibility.js'
 import type { CronDeliveryContext, CronJob } from './cron.js'
-import { normalizeCronEffortField, normalizeCronModelField } from './cronModelPolicy.js'
+import {
+  checkCronOriginModelConflict,
+  normalizeCronEffortField,
+  normalizeCronModelField,
+} from './cronModelPolicy.js'
 import { listCronDeliverChannels } from './cronChannels.js'
 import {
   deriveFixedBoardProjectId,
@@ -508,6 +512,12 @@ export async function handleCronApi(
       createdAt: Date.now(),
     }
     if (parsed.resume === 'origin-session') {
+      const originConflict = checkCronOriginModelConflict({
+        resume: 'origin-session',
+        model: modelCheck.value,
+        effort: effortCheck.value,
+      })
+      if (originConflict) return this.sendError(res, 400, originConflict)
       const origin = parseOriginWebchatSessionKey(
         typeof parsed.originSessionKey === 'string' ? parsed.originSessionKey : '',
       )
@@ -585,16 +595,26 @@ export async function handleCronItem(
       parsed.projectMode = stamped.projectMode
       parsed.boardProjectId = stamped.boardProjectId
     }
+    let nextModelForCheck = existing?.model
     if (parsed.model !== undefined) {
       const modelCheck = normalizeCronModelField(parsed.model)
       if (!modelCheck.ok) return this.sendError(res, 400, modelCheck.error)
       parsed.model = modelCheck.value ?? ''
+      nextModelForCheck = modelCheck.value
     }
+    let nextEffortForCheck = existing?.effort
     if (parsed.effort !== undefined) {
       const effortCheck = normalizeCronEffortField(parsed.effort)
       if (!effortCheck.ok) return this.sendError(res, 400, effortCheck.error)
       parsed.effort = effortCheck.value ?? ''
+      nextEffortForCheck = effortCheck.value
     }
+    const originConflict = checkCronOriginModelConflict({
+      resume: existing?.resume,
+      model: nextModelForCheck,
+      effort: nextEffortForCheck,
+    })
+    if (originConflict) return this.sendError(res, 400, originConflict)
     const updated = await this.cron.updateJob(id, parsed)
     this.sendJson(res, updated ? 200 : 404, { ok: updated })
     return

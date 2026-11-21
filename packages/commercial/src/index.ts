@@ -6302,7 +6302,7 @@ export async function registerCommercial(
   // markOrderPaid 不在事务内对 expires_at 做硬防线(避免用户超时几秒扫码就硬失败
   // 的体验回归);过期清理由本 sweeper 负责,被推 expired 后 markOrderPaid 自然拒。
   // 非法 / 空 / NaN → 60s;下限 1s(防 typo 把 DB 打穿)
-  if (shouldStartCommercialScheduler("pendingOrdersExpirer", { flavorIdentity, runtimeChannel })) {
+  if (shouldStartCommercialScheduler("pendingOrdersExpirer", { flavorIdentity, runtimeChannel, paymentEnabled: Boolean(hupijiao) })) {
     leaderBundle.add({
       name: "pendingOrdersExpirer",
       domain: "shared",

@@ -2478,8 +2478,11 @@ export class SessionManager {
    * later getOrCreate(sessionKey) can native-resume. Awaited by resumable
    * delegate_task; fire-and-forget destroySession remains the one-shot path.
    */
-  retireKeepResume(sessionKey: string): Promise<void> {
-    return retireKeepResumeImpl.call(this as unknown as SessionLifecycleHost, sessionKey)
+  retireKeepResume(
+    sessionKey: string,
+    opts?: { expectedSession?: AgentSession; onlyIfIdle?: boolean },
+  ): Promise<void> {
+    return retireKeepResumeImpl.call(this as unknown as SessionLifecycleHost, sessionKey, opts)
   }
 
   hasLiveSession(sessionKey: string): boolean {

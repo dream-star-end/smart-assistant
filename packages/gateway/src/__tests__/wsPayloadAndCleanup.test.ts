@@ -1,8 +1,10 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
+import { createServer } from 'node:http'
 import { mkdtemp, mkdir, rm, utimes, writeFile, readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { WebSocket, WebSocketServer } from 'ws'
 import {
   DEFAULT_LEGACY_BASE64_MAX_BYTES,
   DEFAULT_WS_MAX_PAYLOAD_BYTES,
@@ -12,6 +14,7 @@ import {
   resolveWsMaxPayloadBytes,
 } from '../wsPayloadPolicy.js'
 import { runStartupUploadTmpCleanup } from '../uploadTmpCleanup.js'
+import { handleWsConnection, type WsConnectionHost } from '../wsConnection.js'
 
 describe('wsPayloadPolicy (OCV5-825)', () => {
   it('defaults WS maxPayload to 16 MiB and supports env override with safe bounds', () => {
@@ -37,6 +40,93 @@ describe('wsPayloadPolicy (OCV5-825)', () => {
     const disabledMsg = formatLegacyBase64OversizeError(2 * 1024 * 1024, 0)
     assert.match(disabledMsg, /已停用/)
     assert.match(disabledMsg, /\/api\/uploads/)
+  })
+
+  it('B1: oversized WS frame closes only the offending connection without uncaughtException, while other connections continue serving', async () => {
+    const warnings: Array<{ msg: string; ctx?: Record<string, unknown> }> = []
+    const wsClients = new Set<WebSocket>()
+    const host = {
+      _shuttingDown: false,
+      _bridgeConnections: new WeakSet<WebSocket>(),
+      _pendingRepoBinds: new Map(),
+      _recentHelloPeers: new WeakMap(),
+      wsClients,
+      checkHttpAuth: () => true,
+      getUserId: () => 'u-test',
+      log: {
+        info: () => {},
+        debug: () => {},
+        warn: (msg: string, ctx?: Record<string, unknown>) => warnings.push({ msg, ctx }),
+        error: () => {},
+      },
+    } as unknown as WsConnectionHost
+
+    const server = createServer()
+    const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 })
+    server.on('upgrade', (req, socket, head) => {
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        handleWsConnection.call(host, ws, req)
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+    const addr = server.address() as { port: number }
+    const url = `ws://127.0.0.1:${addr.port}/ws`
+
+    let uncaught: unknown = null
+    const onUncaught = (err: unknown) => {
+      uncaught = err
+    }
+    process.on('uncaughtException', onUncaught)
+
+    const clientA = new WebSocket(url)
+    const clientB = new WebSocket(url)
+    try {
+      await Promise.all([
+        new Promise<void>((resolve, reject) => {
+          clientA.once('open', () => resolve())
+          clientA.once('error', reject)
+        }),
+        new Promise<void>((resolve, reject) => {
+          clientB.once('open', () => resolve())
+          clientB.once('error', reject)
+        }),
+      ])
+
+      const closeCodePromise = new Promise<number>((resolve) => {
+        clientA.once('close', (code) => resolve(code))
+      })
+      clientA.on('error', () => {})
+      // Exceed maxPayload (1024 bytes) on clientA
+      clientA.send(JSON.stringify({ type: 'inbound.message', text: 'x'.repeat(4096) }))
+      const closeCode = await closeCodePromise
+      assert.equal(closeCode, 1009, 'oversized frame must close offending socket with 1009')
+      assert.equal(uncaught, null, 'must NOT trigger uncaughtException in gateway process')
+      assert.ok(
+        warnings.some((w) => w.msg === 'ws.socket_error'),
+        'server must isolate and log socket receiver error',
+      )
+
+      // clientB must remain unaffected and serve requests normally
+      const pongPromise = new Promise<Record<string, unknown>>((resolve, reject) => {
+        clientB.once('message', (data) => {
+          try {
+            resolve(JSON.parse(data.toString()))
+          } catch (err) {
+            reject(err)
+          }
+        })
+      })
+      clientB.send(JSON.stringify({ type: 'ping', id: 'healthy-sibling' }))
+      const pong = await pongPromise
+      assert.equal(pong.type, 'pong')
+      assert.equal(pong.id, 'healthy-sibling')
+    } finally {
+      process.off('uncaughtException', onUncaught)
+      try { clientA.terminate() } catch {}
+      try { clientB.terminate() } catch {}
+      wss.close()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
   })
 })
 

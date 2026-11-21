@@ -15,6 +15,10 @@ import {
   runEvictionPass,
   type SessionLifecycleHost,
 } from '../sessionLifecycle.js'
+import {
+  noteCcbTaskNotification,
+  resetCcbLocalAgentCallbackDedupeForTest,
+} from '../ccbLocalAgentCallback.js'
 import type { AgentSession } from '../sessionTypes.js'
 
 function makeSession(opts: {
@@ -305,5 +309,145 @@ describe('runEvictionPass — memory watermark & resident runner cap (OCV5-825)'
     assert.equal(res.idleEvicted, 0)
     assert.equal(res.pressureRetired, 0)
     assert.equal(host.sessions.has('agent:main:webchat:dm:s1'), true)
+  })
+
+  it('B5: never evicts sessions in preparing/unconsumed prepared model-switch transition, pending CCB callbacks, or pending agent groups', async () => {
+    const now = Date.now()
+    resetCcbLocalAgentCallbackDedupeForTest()
+    try {
+      const sPreparing = makeSession({ key: 'agent:main:webchat:dm:prep', peerId: 'prep', lastUsedAt: now - 90_000 })
+      sPreparing.session._modelSwitchTransition = {
+        id: 'sw-1',
+        sourceModel: 'glm-5.3',
+        targetModel: 'gpt-5.6-sol',
+        sourceEngine: 'ccb',
+        state: 'preparing',
+      }
+      const sPreparedFresh = makeSession({ key: 'agent:main:webchat:dm:handoff', peerId: 'handoff', lastUsedAt: now - 80_000 })
+      sPreparedFresh.session._modelSwitchTransition = {
+        id: 'sw-2',
+        sourceModel: 'glm-5.3',
+        targetModel: 'gpt-5.6-sol',
+        sourceEngine: 'ccb',
+        state: 'prepared',
+        summaryText: 'handoff summary',
+        expiresAt: now + 60_000,
+      }
+      const sPreparedExpired = makeSession({ key: 'agent:main:webchat:dm:expired', peerId: 'expired', lastUsedAt: now - 70_000 })
+      sPreparedExpired.session._modelSwitchTransition = {
+        id: 'sw-3',
+        sourceModel: 'glm-5.3',
+        targetModel: 'gpt-5.6-sol',
+        sourceEngine: 'ccb',
+        state: 'prepared',
+        summaryText: 'stale summary',
+        expiresAt: now - 1_000,
+      }
+      const sPendingCcb = makeSession({ key: 'agent:main:webchat:dm:ccb-parent', peerId: 'ccb-parent', lastUsedAt: now - 60_000 })
+      noteCcbTaskNotification({
+        sessionKey: sPendingCcb.session.sessionKey,
+        notification: {
+          taskId: 'task-1',
+          status: 'completed',
+          summary: 'done',
+          outputFile: '/tmp/out.txt',
+        },
+        hasInFlightTurn: false,
+      })
+      const sPendingGroups = makeSession({ key: 'agent:main:webchat:dm:group-parent', peerId: 'group-parent', lastUsedAt: now - 50_000 })
+      sPendingGroups.session._pendingAgentGroups = [{ runId: 'r1' } as any]
+
+      const { host } = makeHost({
+        sessions: [
+          sPreparing.session,
+          sPreparedFresh.session,
+          sPreparedExpired.session,
+          sPendingCcb.session,
+          sPendingGroups.session,
+        ],
+        maxRunners: 1,
+        readCgroupMemory: async () => ({ currentBytes: 950, maxBytes: 1000, ratio: 0.95, version: 'v2' }),
+      })
+
+      const res = await runEvictionPass.call(host)
+      // ONLY the expired prepared session is eligible!
+      assert.deepEqual(res.retiredKeys, ['agent:main:webchat:dm:expired'])
+      assert.equal(host.sessions.has('agent:main:webchat:dm:prep'), true)
+      assert.equal(host.sessions.has('agent:main:webchat:dm:handoff'), true)
+      assert.equal(host.sessions.has('agent:main:webchat:dm:ccb-parent'), true)
+      assert.equal(host.sessions.has('agent:main:webchat:dm:group-parent'), true)
+      assert.equal(sPreparing.shutdownCalls(), 0)
+      assert.equal(sPreparedFresh.shutdownCalls(), 0)
+      assert.equal(sPendingCcb.shutdownCalls(), 0)
+      assert.equal(sPendingGroups.shutdownCalls(), 0)
+    } finally {
+      resetCcbLocalAgentCallbackDedupeForTest()
+    }
+  })
+
+  it('B5: retireKeepResume serializes with per-key admission gate and deletes only matching object identity', async () => {
+    const now = Date.now()
+    const key = 'agent:main:webchat:dm:race-1'
+    let resolveShutdown!: () => void
+    const shutdownStarted = new Promise<void>((resolve) => {
+      // resolved when shutdown begins
+      void resolve
+    })
+    void shutdownStarted
+    const order: string[] = []
+    const sOld = makeSession({ key, peerId: 'race-1', lastUsedAt: now - 50_000 })
+    sOld.session.runner.shutdown = async () => {
+      order.push('retire-shutdown-start')
+      await new Promise<void>((r) => { resolveShutdown = r })
+      order.push('retire-shutdown-end')
+    }
+    const sNew = makeSession({ key, peerId: 'race-1', lastUsedAt: now })
+
+    const gates = new Map<string, Promise<void>>()
+    const enterGate = async <T>(k: string, work: () => Promise<T>): Promise<T> => {
+      const prev = gates.get(k) ?? Promise.resolve()
+      let rel!: () => void
+      const held = new Promise<void>((r) => { rel = r })
+      const tail = prev.then(() => held, () => held)
+      gates.set(k, tail)
+      try {
+        await prev
+        return await work()
+      } finally {
+        rel()
+        if (gates.get(k) === tail) gates.delete(k)
+      }
+    }
+
+    const { host, destroyedEvents } = makeHost({
+      sessions: [sOld.session],
+      maxRunners: 6,
+    })
+    host._enterSessionCreateGate = enterGate
+    host.retireKeepResume = async (k, opts) => retireKeepResume.call(host, k, opts)
+
+    // Start retireKeepResume on sOld; while shutdown is pending, concurrent getOrCreate queues behind gate
+    const retirePromise = host.retireKeepResume(key, { expectedSession: sOld.session, onlyIfIdle: true })
+    await new Promise((r) => setTimeout(r, 5))
+    const admitPromise = enterGate(key, async () => {
+      order.push('admit-start')
+      assert.equal(host.sessions.has(key), false, 'concurrent admission must not see half-retired session')
+      host.sessions.set(key, sNew.session)
+      host._sessionIdToKey.set('race-1', key)
+      order.push('admit-end')
+    })
+
+    resolveShutdown()
+    await Promise.all([retirePromise, admitPromise])
+
+    assert.deepEqual(order, ['retire-shutdown-start', 'retire-shutdown-end', 'admit-start', 'admit-end'])
+    assert.strictEqual(host.sessions.get(key), sNew.session, 'successor session must remain mounted')
+    assert.equal(host._sessionIdToKey.get('race-1'), key)
+    assert.deepEqual(destroyedEvents, [key])
+
+    // Calling retireKeepResume again with stale expectedSession=sOld must be a complete no-op
+    await host.retireKeepResume(key, { expectedSession: sOld.session, onlyIfIdle: true })
+    assert.strictEqual(host.sessions.get(key), sNew.session, 'stale retire must NOT delete successor object')
+    assert.equal(destroyedEvents.length, 1, 'stale retire must NOT fire onSessionDestroyed for successor')
   })
 })

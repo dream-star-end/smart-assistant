@@ -1896,13 +1896,19 @@ async function ensureSingleV3Volume(
  * userLocal / userConfig 三类只为出错时人能看懂哪个挂载点 fail,不落 label,
  * 与既有 data / projects 一致(靠名字前缀就能唯一区分)。
  */
+async function settleAllVolumesOrThrow(promises: Array<Promise<unknown>>): Promise<void> {
+  const results = await Promise.allSettled(promises);
+  const firstRejected = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
+  if (firstRejected) throw firstRejected.reason;
+}
+
 async function ensureV3Volumes(docker: Docker, uid: number): Promise<V3VolumeBundle> {
   const data = v3VolumeNameFor(uid);
   const projects = v3ProjectsVolumeNameFor(uid);
   const codex = v3CodexVolumeNameFor(uid);
   const userLocal = v3UserLocalVolumeNameFor(uid);
   const userConfig = v3UserConfigVolumeNameFor(uid);
-  await Promise.all([
+  await settleAllVolumesOrThrow([
     ensureSingleV3Volume(docker, uid, data, "data"),
     ensureSingleV3Volume(docker, uid, projects, "projects"),
     ensureSingleV3Volume(docker, uid, codex, "codex"),
@@ -2371,10 +2377,10 @@ async function compensateProvisionFailure(
  *   │   3. dup 复查(active 行存在 → NameConflict)
  *   │   4. acquireHostCapLock(per-host)                  ← per-host 串行,跨 host 并行
  *   │   5. cap query(active count ≥ max_containers → HostFull;锁随事务释放)
- *   │   6. ensureV3Volumes(**保留在 Tx1 内**:GC 互斥须在 per-uid 锁内;本地元数据 ~ms)
- *   │   7. INSERT agent_containers 占位行(state='active', cid=NULL,占 bound_ip)
- *   │   8. COMMIT(双锁释放)—— 此后不持任何 PG client / advisory lock
+ *   │   6. INSERT agent_containers 占位行(state='active', cid=NULL,占 bound_ip)
+ *   │   7. COMMIT(双锁释放)—— 此后不持任何 PG client / advisory lock
  *   ├─ 中段(无事务、无 checked-out 连接、无锁)
+ *   │   8. ensureV3Volumes 5 卷并行(Promise.allSettled;active 占位行防 GC 误删,失败走补偿)
  *   │   9. codex 账号绑定(pick/snapshot/write 或 putRemote;codex_account_id 记账留 Tx2)
  *   │  10. 组装 env / binds → docker create(NameConflict 409 三重校验自愈原样)→ start
  *   ├─ Tx2(短事务)
@@ -2674,7 +2680,7 @@ export async function provisionV3Container(
         const codexName = v3CodexVolumeNameFor(uid);
         const userLocalName = v3UserLocalVolumeNameFor(uid);
         const userConfigName = v3UserConfigVolumeNameFor(uid);
-        await Promise.all([
+        await settleAllVolumesOrThrow([
           deps.containerService!.ensureVolume(hostId!, dataName),
           deps.containerService!.ensureVolume(hostId!, projectsName),
           deps.containerService!.ensureVolume(hostId!, codexName),

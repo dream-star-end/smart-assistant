@@ -396,6 +396,9 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
   // 从 448 MiB 至安全默认 16 MiB (支持 OC_WS_MAX_PAYLOAD_BYTES 紧急回退),拆除单帧堆 OOM 炸弹。
   const wsMaxPayload = resolveWsMaxPayloadBytes()
   this.wss = new WebSocketServer({ noServer: true, maxPayload: wsMaxPayload })
+  this.wss.on('error', (err) => {
+    this.log.error('wss.server_error', undefined, err)
+  })
   this.httpServer.on('upgrade', (req, socket, head) => {
     // 1) 商业化模块优先(/ws/user-chat-bridge / /ws/agent / 未来私有路径)
     try {

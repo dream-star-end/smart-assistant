@@ -28,6 +28,7 @@ import { clearFrozenPrompt } from './promptFreeze.js'
 import { type ExecutionTarget, RemoteTargetUnavailableError } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { log } from './sessionManagerLog.js'
+import { hasCcbLocalAgentPendingForSession } from './ccbLocalAgentCallback.js'
 import {
   readCgroupMemoryUsage,
   resolveMaxResidentRunners,
@@ -38,6 +39,7 @@ import { isTempSessionKey, resolveEnginePreheatDeadlineMs } from './sessionManag
 import type { SessionManager, AgentSession, PreheatOutcome } from './sessionManager.js'
 
 export interface SessionLifecycleHost {
+  _enterSessionCreateGate?: SessionManager['_enterSessionCreateGate']
   _flushTailFolding: SessionManager['_flushTailFolding']
   _getRepoSnapshot: SessionManager['_getRepoSnapshot']
   _maxResidentRunners?: number
@@ -361,9 +363,20 @@ export async function recyclePeerForRepoUnbind(
   }
 }
 
+function hasActiveModelSwitchTransition(session: AgentSession, now = Date.now()): boolean {
+  const t = session._modelSwitchTransition
+  if (!t) return false
+  if (t.state === 'preparing' || t.state === 'consuming') return true
+  if (t.state === 'prepared') {
+    return t.expiresAt === undefined || t.expiresAt > now
+  }
+  return false
+}
+
 /**
  * True when a session has any active/in-flight turn, queued prompt, preheat,
- * internal idle drain, or teardown/replacement in progress.
+ * internal idle drain, model-switch handoff transition, pending CCB/delegate
+ * notification, or teardown/replacement in progress.
  * Pressure/idle eviction MUST NEVER evict a busy session.
  */
 export function isSessionInFlightOrBusy(
@@ -381,6 +394,9 @@ export function isSessionInFlightOrBusy(
     Boolean(session._externalTurnAbort) ||
     Boolean(session._replacing) ||
     Boolean(session._plannedTeardown) ||
+    hasActiveModelSwitchTransition(session) ||
+    Boolean(session._pendingAgentGroups?.length) ||
+    hasCcbLocalAgentPendingForSession(session.sessionKey) ||
     host._preheatInFlight.has(session.sessionKey) ||
     host._promptQueueHolds(session)
   )
@@ -490,9 +506,16 @@ export async function runEvictionPass(this: SessionLifecycleHost): Promise<Evict
     }
     const reason = overCap && overMem ? 'memory+runner_cap' : overMem ? 'memory' : 'runner_cap'
     try {
-      await this.retireKeepResume(current.sessionKey)
+      await this.retireKeepResume(current.sessionKey, {
+        expectedSession: current,
+        onlyIfIdle: true,
+      })
     } catch (err) {
       log.warn('pressure retireKeepResume failed', { sessionKey: current.sessionKey, reason }, err)
+      continue
+    }
+    if (this.sessions.get(current.sessionKey) === current) {
+      // Skipped inside the admission gate because the session became busy meanwhile.
       continue
     }
     residentCount = Math.max(0, residentCount - 1)
@@ -639,41 +662,69 @@ export async function destroySession(
   } catch {}
 }
 
+export interface RetireKeepResumeOptions {
+  /** Only retire if the live map entry is still this exact object identity. */
+  expectedSession?: AgentSession
+  /** Re-check `isSessionInFlightOrBusy` inside the per-key admission gate. */
+  onlyIfIdle?: boolean
+}
+
 /**
  * Stop the warm runner and drop the live session, but keep resume-map so a
- * later getOrCreate(sessionKey) can native-resume. Awaited by resumable
- * delegate_task; fire-and-forget destroySession remains the one-shot path.
+ * later getOrCreate(sessionKey) can native-resume. Serialized with same-key
+ * getOrCreate via `_enterSessionCreateGate` so concurrent admission can never
+ * observe a half-retired session or have its successor deleted from maps.
  */
 export async function retireKeepResume(
   this: SessionLifecycleHost,
   sessionKey: string,
+  opts?: RetireKeepResumeOptions,
 ): Promise<void> {
-  const s = this.sessions.get(sessionKey)
-  if (s) {
-    try {
-      this.markPlannedServiceRestart(s)
-      await s.runner.shutdown()
-    } catch (err) {
-      log.warn('retireKeepResume shutdown failed', { sessionKey }, err)
+  const runUnderGate = async (): Promise<void> => {
+    const s = this.sessions.get(sessionKey)
+    if (opts?.expectedSession !== undefined && s !== opts.expectedSession) {
+      return
     }
-    try {
-      await this._flushTailFolding(s)
-    } catch (err) {
-      log.warn('retireKeepResume flush failed', { sessionKey }, err)
+    if (opts?.onlyIfIdle && s && isSessionInFlightOrBusy(this, s)) {
+      return
     }
-    if (s.executionTarget.kind === 'remote' && s.userId) {
-      await this._remoteTargetController
-        ?.releaseMux(sessionKey, s.userId, s.executionTarget.hostId)
-        .catch((err) =>
-          log.warn('retireKeepResume releaseMux failed', { sessionKey, err: String(err) }),
-        )
+    if (s) {
+      try {
+        this.markPlannedServiceRestart(s)
+        await s.runner.shutdown()
+      } catch (err) {
+        log.warn('retireKeepResume shutdown failed', { sessionKey }, err)
+      }
+      try {
+        await this._flushTailFolding(s)
+      } catch (err) {
+        log.warn('retireKeepResume flush failed', { sessionKey }, err)
+      }
+      if (s.executionTarget.kind === 'remote' && s.userId) {
+        await this._remoteTargetController
+          ?.releaseMux(sessionKey, s.userId, s.executionTarget.hostId)
+          .catch((err) =>
+            log.warn('retireKeepResume releaseMux failed', { sessionKey, err: String(err) }),
+          )
+      }
+      if (this.sessions.get(sessionKey) === s) {
+        this.sessions.delete(sessionKey)
+      }
+      if (this._sessionIdToKey.get(s.peerId) === sessionKey && !this.sessions.has(sessionKey)) {
+        this._sessionIdToKey.delete(s.peerId)
+      }
     }
-    this.sessions.delete(sessionKey)
-    this._sessionIdToKey.delete(s.peerId)
+    if (!this.sessions.has(sessionKey)) {
+      try {
+        this.onSessionDestroyed?.(sessionKey)
+      } catch {}
+    }
   }
-  try {
-    this.onSessionDestroyed?.(sessionKey)
-  } catch {}
+  if (this._enterSessionCreateGate) {
+    await this._enterSessionCreateGate(sessionKey, runUnderGate)
+  } else {
+    await runUnderGate()
+  }
 }
 
 /**

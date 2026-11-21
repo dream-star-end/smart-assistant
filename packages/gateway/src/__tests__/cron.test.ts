@@ -672,6 +672,45 @@ describe('CronScheduler.runJob — 显式 model/effort 与严禁黑盒静默降�
     assert.equal(submitCalls[0].model, undefined)
     assert.equal(submitCalls[0].effort, undefined)
   })
+
+  it('B4: origin-session 与 model/effort 冲突 → addJob 拒收，已存冲突作业在触发前可见拒跑且不消费执行边界', async () => {
+    const { sched, getOrCreateOpts, submitCalls, delivered } = makeSchedulerWithSpies('glm-5.2')
+    let originFired = 0
+    let consumed = 0
+    ;(sched as any).onOriginSessionFire = async () => {
+      originFired++
+      return { kind: 'injected' }
+    }
+    const conflictJob = {
+      id: 'remind-origin-conflict',
+      schedule: '*/10 * * * *',
+      agent: 'main',
+      prompt: 'follow up',
+      enabled: true,
+      label: '原会话冲突测试',
+      resume: 'origin-session',
+      sourceSessionKey: 'agent:main:webchat:dm:sess-1',
+      model: 'glm-5.3',
+    } as any
+
+    await assert.rejects(
+      sched.addJob(conflictJob),
+      /origin-session/,
+      'addJob 必须拒绝 origin-session 同时携带 model/effort',
+    )
+
+    const outcome = await (sched as any).runJob(conflictJob, { id: 'main' }, {
+      ...NOOP_CRON_DURABILITY,
+      consumeOccurrence: async () => { consumed++ },
+    })
+    assert.deepEqual(outcome, { kind: 'terminal_failure', code: 'CRON_ORIGIN_MODEL_CONFLICT' })
+    assert.equal(originFired, 0, '冲突作业绝不能触发 origin-session 注入')
+    assert.equal(consumed, 0, '冲突作业必须在消费 occurrence 之前拒跑')
+    assert.equal(getOrCreateOpts.length, 0)
+    assert.equal(submitCalls.length, 0)
+    assert.equal(delivered.length, 1)
+    assert.match(delivered[0]!, /origin-session/)
+  })
 })
 
 describe('CronScheduler.runJob — 引擎 API 错误熔断(402 站内信轰炸根治)', () => {
