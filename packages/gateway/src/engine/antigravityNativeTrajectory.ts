@@ -8,12 +8,37 @@ import { open, readdir, realpath, stat } from 'node:fs/promises'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import protobuf from 'protobufjs'
+import { createLogger } from '../logger.js'
 import { antigravityNativeSchema } from './antigravityNativeSchema.js'
 
+const log = createLogger({ module: 'antigravityNativeTrajectory' })
+
 export const ANTIGRAVITY_NATIVE_CLI_SHA256 = '60e72242f07c131f75afcd9a9e425d6ee097a1a1b3190ea98ae78fa4180bbfa8'
+/** Controlled compatible SHA-256 allowlist for pinned Antigravity native CLI builds. */
+export const ANTIGRAVITY_NATIVE_CLI_SHA256_ALLOWLIST: readonly string[] = Object.freeze([
+  ANTIGRAVITY_NATIVE_CLI_SHA256,
+])
+export const ANTIGRAVITY_EXTRA_CLI_SHA256_ENV = 'OC_ANTIGRAVITY_EXTRA_CLI_SHA256'
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/
+
+export interface AntigravityNativeDegradationEvent {
+  stage: 'verify' | 'prepare' | 'recover'
+  reason: string
+  cliPath?: string
+  resolvedPath?: string
+  actualSha256?: string
+  allowlistSize?: number
+  extraEnvConfigured?: boolean
+  errorCode?: string
+}
+
 export interface AntigravityNativeDependencies {
   /** Explicit test seam for fakeCLI fixtures; never selected by an environment variable. */
   verifyBinary?: (cliPath: string, expectedSha256: string) => Promise<boolean>
+  /** Optional structured degradation observer (defaults to structured warn log). */
+  onDegraded?: (event: AntigravityNativeDegradationEvent) => void
+  /** Optional explicit extra SHA-256 allowlist string (overrides OC_ANTIGRAVITY_EXTRA_CLI_SHA256). */
+  extraAllowedCliSha256?: string
 }
 export interface AntigravityNativePrepareInput {
   cliPath: string
@@ -33,38 +58,134 @@ export type AntigravityNativeRecovery =
 
 type Identity = { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; ctimeNs: bigint; mode: bigint }
 const identity = (s: Identity) => [s.dev, s.ino, s.size, s.mtimeNs, s.ctimeNs, s.mode].join(':')
-const binaryCache = new Map<string, { identity: string; verified: boolean }>()
+const binaryCache = new Map<string, { identity: string; sha256: string }>()
 const sha256 = (text: string | Uint8Array) => createHash('sha256').update(text).digest('hex')
 const validId = (id: unknown): id is string => typeof id === 'string'
   && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)
 
+function emitDegradation(
+  event: AntigravityNativeDegradationEvent,
+  observer?: (event: AntigravityNativeDegradationEvent) => void,
+): void {
+  log.warn('antigravity_native_trajectory_degraded', { ...event })
+  try {
+    observer?.(event)
+  } catch { /* observer errors must never break fail-closed trajectory behavior */ }
+}
+
+function readExtraCliSha256Env(): string | undefined {
+  return process.env[ANTIGRAVITY_EXTRA_CLI_SHA256_ENV]
+}
+
+/** Resolve the effective compatible Antigravity CLI SHA-256 allowlist (built-in + optional env extension). */
+export function resolveAntigravityNativeCliSha256Allowlist(
+  extraRaw: string | undefined = readExtraCliSha256Env(),
+): ReadonlySet<string> {
+  const allowed = new Set<string>(ANTIGRAVITY_NATIVE_CLI_SHA256_ALLOWLIST.map((h) => h.toLowerCase()))
+  const trimmed = extraRaw?.trim()
+  if (!trimmed) return allowed
+  const invalidEntries: string[] = []
+  for (const token of trimmed.split(/[\s,;]+/)) {
+    if (!token) continue
+    const normalized = token.toLowerCase()
+    if (SHA256_HEX_RE.test(normalized)) {
+      allowed.add(normalized)
+    } else {
+      invalidEntries.push(token.slice(0, 16))
+    }
+  }
+  if (invalidEntries.length > 0) {
+    log.warn('antigravity_native_extra_cli_sha256_invalid', {
+      envVar: ANTIGRAVITY_EXTRA_CLI_SHA256_ENV,
+      invalidCount: invalidEntries.length,
+      sample: invalidEntries.slice(0, 3),
+    })
+  }
+  return allowed
+}
+
+function resolveExpectedSet(
+  expectedSha256?: string | Iterable<string>,
+  extraRaw?: string,
+): { allowed: ReadonlySet<string>; extraEnvConfigured: boolean } {
+  if (expectedSha256 === undefined || expectedSha256 === ANTIGRAVITY_NATIVE_CLI_SHA256) {
+    const raw = extraRaw !== undefined ? extraRaw : readExtraCliSha256Env()
+    return {
+      allowed: resolveAntigravityNativeCliSha256Allowlist(raw),
+      extraEnvConfigured: Boolean(raw?.trim()),
+    }
+  }
+  if (typeof expectedSha256 === 'string') {
+    const normalized = expectedSha256.trim().toLowerCase()
+    return {
+      allowed: SHA256_HEX_RE.test(normalized) ? new Set([normalized]) : new Set(),
+      extraEnvConfigured: false,
+    }
+  }
+  const set = new Set<string>()
+  for (const entry of expectedSha256) {
+    const normalized = entry.trim().toLowerCase()
+    if (SHA256_HEX_RE.test(normalized)) set.add(normalized)
+  }
+  return { allowed: set, extraEnvConfigured: false }
+}
+
 /** Async streaming hash, bound to both open-file and path stat identities. */
-export async function verifyAntigravityNativeBinary(cliPath: string, expectedSha256 = ANTIGRAVITY_NATIVE_CLI_SHA256): Promise<boolean> {
+export async function verifyAntigravityNativeBinary(
+  cliPath: string,
+  expectedSha256: string | Iterable<string> = ANTIGRAVITY_NATIVE_CLI_SHA256,
+  options?: { extraAllowedCliSha256?: string; onDegraded?: (event: AntigravityNativeDegradationEvent) => void },
+): Promise<boolean> {
   let handle: Awaited<ReturnType<typeof open>> | undefined
+  const { allowed, extraEnvConfigured } = resolveExpectedSet(expectedSha256, options?.extraAllowedCliSha256)
   try {
     const resolved = await realpath(cliPath)
     handle = await open(resolved, 'r')
     const before = await handle.stat({ bigint: true })
-    if (!before.isFile()) return false
+    if (!before.isFile()) {
+      emitDegradation({ stage: 'verify', reason: 'binary-not-regular-file', cliPath, resolvedPath: resolved }, options?.onDegraded)
+      return false
+    }
     const key = identity(before)
     const cached = binaryCache.get(resolved)
-    let verified: boolean
-    if (cached?.identity === key && expectedSha256 === ANTIGRAVITY_NATIVE_CLI_SHA256) {
-      verified = cached.verified
+    let actualSha256: string
+    if (cached?.identity === key) {
+      actualSha256 = cached.sha256
     } else {
       const hash = createHash('sha256')
       for await (const chunk of handle.createReadStream({ autoClose: false })) hash.update(chunk)
-      verified = hash.digest('hex') === expectedSha256
+      actualSha256 = hash.digest('hex')
     }
     if (identity(await handle.stat({ bigint: true })) !== key
       || await realpath(cliPath) !== resolved
-      || identity(await stat(resolved, { bigint: true })) !== key) return false
-    if (expectedSha256 === ANTIGRAVITY_NATIVE_CLI_SHA256) {
-      if (binaryCache.size >= 32) binaryCache.clear()
-      binaryCache.set(resolved, { identity: key, verified })
+      || identity(await stat(resolved, { bigint: true })) !== key) {
+      emitDegradation({ stage: 'verify', reason: 'binary-changed-during-verify', cliPath, resolvedPath: resolved }, options?.onDegraded)
+      return false
+    }
+    if (binaryCache.size >= 32) binaryCache.clear()
+    binaryCache.set(resolved, { identity: key, sha256: actualSha256 })
+    const verified = allowed.has(actualSha256)
+    if (!verified) {
+      emitDegradation({
+        stage: 'verify',
+        reason: 'binary-sha256-mismatch',
+        cliPath,
+        resolvedPath: resolved,
+        actualSha256,
+        allowlistSize: allowed.size,
+        extraEnvConfigured,
+      }, options?.onDegraded)
     }
     return verified
-  } catch { return false } finally { await handle?.close().catch(() => {}) }
+  } catch (error) {
+    emitDegradation({
+      stage: 'verify',
+      reason: 'binary-verify-io-error',
+      cliPath,
+      errorCode: (error as NodeJS.ErrnoException)?.code ?? 'UNKNOWN',
+    }, options?.onDegraded)
+    return false
+  } finally { await handle?.close().catch(() => {}) }
 }
 
 interface Launch {
@@ -73,6 +194,7 @@ interface Launch {
   requestedResumeId?: string
   inputHash: string
   verifier: NonNullable<AntigravityNativeDependencies['verifyBinary']>
+  onDegraded?: AntigravityNativeDependencies['onDegraded']
   existingFiles: Set<string>
   preparedAt: number
   databaseIdentity?: string
@@ -108,9 +230,17 @@ export async function prepareAntigravityNativeTrajectory(
   let baseline: number | null = null
   let binaryVerified = false
   try {
-    const verifier = deps.verifyBinary ?? verifyAntigravityNativeBinary
+    const verifier: NonNullable<AntigravityNativeDependencies['verifyBinary']> = deps.verifyBinary
+      ?? ((cliPath, expected) => verifyAntigravityNativeBinary(cliPath, expected, {
+        extraAllowedCliSha256: deps.extraAllowedCliSha256,
+        onDegraded: deps.onDegraded,
+      }))
     // A verifier failure must not prevent an otherwise safe stdout watermark read.
-    try { binaryVerified = await verifier(input.cliPath, ANTIGRAVITY_NATIVE_CLI_SHA256) } catch { /* fail closed */ }
+    try {
+      binaryVerified = await verifier(input.cliPath, ANTIGRAVITY_NATIVE_CLI_SHA256)
+    } catch {
+      emitDegradation({ stage: 'prepare', reason: 'binary-verifier-threw', cliPath: input.cliPath }, deps.onDegraded)
+    }
     let directory: string
     let existingFiles: string[]
     try {
@@ -134,6 +264,7 @@ export async function prepareAntigravityNativeTrajectory(
     const launch: Launch = {
       cliPath: input.cliPath, directory, requestedResumeId: input.requestedResumeId,
       inputHash: sha256(Buffer.from(input.message.content, 'utf8')), verifier,
+      onDegraded: deps.onDegraded,
       preparedAt: Date.now(), existingFiles: new Set(existingFiles),
     }
     if (input.requestedResumeId !== undefined) {
@@ -154,10 +285,19 @@ export async function prepareAntigravityNativeTrajectory(
     } else baseline = -1
     const reason = !binaryVerified ? 'binary-unverified'
       : baseline !== null && baseline >= 0 && !launch.baselineHash ? 'unsupported-baseline-schema' : undefined
+    if (reason) {
+      emitDegradation({ stage: 'prepare', reason, cliPath: input.cliPath }, deps.onDegraded)
+    }
     const binding = Object.freeze({ baseline, binaryVerified, ...(reason ? { reason } : {}) })
     launches.set(binding, launch)
     return binding
-  } catch {
+  } catch (error) {
+    emitDegradation({
+      stage: 'prepare',
+      reason: 'prepare-unavailable',
+      cliPath: input.cliPath,
+      errorCode: (error as NodeJS.ErrnoException)?.code ?? (error instanceof Error ? error.message : 'UNKNOWN'),
+    }, deps.onDegraded)
     return Object.freeze({ baseline, binaryVerified, reason: 'prepare-unavailable' })
   }
 }
@@ -264,7 +404,10 @@ export async function recoverAntigravityNativeTrajectory(
     if (!binding.binaryVerified || binding.reason) return fail(binding.reason ?? 'binary-unverified')
     if (!validId(initId) || initId !== resultId
       || (launch.requestedResumeId !== undefined && launch.requestedResumeId !== initId)) return fail('conversation-mismatch')
-    if (!await launch.verifier(launch.cliPath, ANTIGRAVITY_NATIVE_CLI_SHA256)) return fail('binary-unverified')
+    if (!await launch.verifier(launch.cliPath, ANTIGRAVITY_NATIVE_CLI_SHA256)) {
+      emitDegradation({ stage: 'recover', reason: 'binary-unverified', cliPath: launch.cliPath }, launch.onDegraded)
+      return fail('binary-unverified')
+    }
     if (!launch.requestedResumeId && launch.existingFiles.has(`${initId}.db`)) return fail('preexisting-conversation')
     return readOnly(launch.directory, initId, (db, file) => {
       if (launch.requestedResumeId) {

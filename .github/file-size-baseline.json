@@ -6,7 +6,6 @@
     "packages/commercial/src/db/pgSessionsBackend.ts": 13882,
     "packages/commercial/src/http/handlers.ts": 3193,
     "packages/commercial/src/http/proxy/boxDurableJournal.ts": 3528,
-    "packages/commercial/src/index.ts": 7700,
     "packages/commercial/src/marketplace/marketplaceDb.ts": 3621,
     "packages/commercial/src/ws/userChatBridge.ts": 10578,
     "packages/storage/src/sessionsDb.ts": 6184,

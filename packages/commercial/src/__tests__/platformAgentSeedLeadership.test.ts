@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 const source = readFileSync(new URL('../index.ts', import.meta.url), 'utf8')
+const bootstrapSource = readFileSync(new URL('../bootstrap/internalProxyBootstrap.ts', import.meta.url), 'utf8')
 
 test('V5 platform preset seed follows leadership acquire instead of standby startup', () => {
   assert.match(
@@ -11,8 +12,8 @@ test('V5 platform preset seed follows leadership acquire instead of standby star
     'dual-master acquire must await the idempotent platform preset seed',
   )
   assert.match(
-    source,
-    /if \(runtimeChannel === "v5"\) \{\s*seedPlatformAgentsForLeadership = async \(\) => \{/,
+    bootstrapSource,
+    /if \(deps\.runtimeChannel === "v5"\) \{\s*deps\.setSeedPlatformAgentsForLeadership\(async \(\) => \{/,
     'only V5 should install the marketplace preset seeder',
   )
   assert.match(
@@ -27,12 +28,12 @@ test('V5 platform preset seed follows leadership acquire instead of standby star
     'the seeder may run only from dual-master acquire or the single-leader path',
   )
   assert.equal(
-    source.match(/seedPlatformGeneralAgents\(\{/g)?.length,
+    bootstrapSource.match(/seedPlatformGeneralAgents\(\{/g)?.length,
     1,
     'general presets must have one leadership-gated seed call',
   )
   assert.equal(
-    source.match(/seedPlatformResearchAgents\(\{/g)?.length,
+    bootstrapSource.match(/seedPlatformResearchAgents\(\{/g)?.length,
     1,
     'research presets must have one leadership-gated seed call',
   )

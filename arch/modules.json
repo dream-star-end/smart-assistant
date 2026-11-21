@@ -803,7 +803,8 @@
   "commercial-bootstrap": {
    "layer": "L6",
    "match": [
-    "packages/commercial/src/index.ts"
+    "packages/commercial/src/index.ts",
+    "packages/commercial/src/bootstrap/**"
    ],
    "scope": [
     "master"

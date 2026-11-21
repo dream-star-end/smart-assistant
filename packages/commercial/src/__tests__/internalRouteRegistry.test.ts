@@ -47,7 +47,7 @@ const registryEntries: readonly InternalRouteEntry[] = INTERNAL_ROUTES
 const here = dirname(fileURLToPath(import.meta.url))
 const gatewaySrcDir = join(here, '..', '..', '..', 'gateway', 'src')
 const forwarderPath = join(here, '..', 'egress', 'forwarder.ts')
-const indexPath = join(here, '..', 'index.ts')
+const indexPath = join(here, '..', 'bootstrap', 'internalProxyBootstrap.ts')
 
 /** 递归列出 gateway 生产源码文件(跳过 __tests__;漂移面只在生产代码)。 */
 async function listGatewaySources(dir: string): Promise<string[]> {
