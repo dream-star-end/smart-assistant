@@ -251,7 +251,7 @@ export function SidebarLiveActivityStrip({
   auth?: AuthSession | null;
   onSelect: (sessionId: string) => void;
   onMarkRead?: (sessionId: string) => void;
-  onOpenBoard?: () => void;
+  onOpenBoard?: (ticketRef?: string) => void;
   onOpenLiveBrowser?: (opts?: { url?: string; sessionId?: string | null }) => void;
 }) {
   const summary = useMemo(() => {

@@ -12,7 +12,7 @@ import {
   Workflow,
   X,
 } from 'lucide-react'
-import { type ReactNode, useEffect, useMemo, useState } from 'react'
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import type { BoardViewParam } from '../../hooks/useAppRoute'
 import { useMdViewport } from '../../hooks/useMdViewport'
 import { useProjectScope } from '../../hooks/useProjectScope'
@@ -158,6 +158,25 @@ export function TaskboardView({
     (detailTicket.identifier === ticketId || detailTicket.id === ticketId) ? detailTicket : null
   const actionTicket = ownedDetail && (!selected || ownedDetail.version > selected.version)
     ? ownedDetail : selected
+
+  // 从「待拍板」或 URL 深链直达具体任务单时，若当前未选工作项目或停在别的项目，
+  // 详情到达后自动切到该任务单所属工作项目（每张单仅自动对齐一次，不抢用户的手动切换）。
+  const autoScopedTicketRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!ticketId) {
+      autoScopedTicketRef.current = null
+      return
+    }
+    if (!ownedDetail?.projectId || autoScopedTicketRef.current === ticketId) return
+    if (lockedProjectId === ownedDetail.projectId) {
+      autoScopedTicketRef.current = ticketId
+      return
+    }
+    if (projectScope.workProjects.some((p) => p.id === ownedDetail.projectId)) {
+      autoScopedTicketRef.current = ticketId
+      projectScope.setToken(ownedDetail.projectId)
+    }
+  }, [ticketId, ownedDetail?.projectId, lockedProjectId, projectScope])
 
   const openTicket = (ticket: Ticket) => onOpenTicket(ticket.identifier)
 

@@ -75,6 +75,7 @@ export type ChatCardActionsInput = {
   sendImplicitRatingRef: React.RefObject<((target: ImplicitTarget, opts: { reason: ImplicitReason; }) => void) | null>;
   sending: boolean;
   setBoardOpen: (open: boolean) => void;
+  setBoardTicketId?: (ticketId: string | null) => void;
   setBusy: React.Dispatch<React.SetStateAction<boolean>>;
   setChatError: React.Dispatch<React.SetStateAction<ChatError | null>>;
   setCollapsed: React.Dispatch<React.SetStateAction<boolean>>;
@@ -115,6 +116,7 @@ export function useChatCardActions({
   sendImplicitRatingRef,
   sending,
   setBoardOpen,
+  setBoardTicketId,
   setBusy,
   setChatError,
   setCollapsed,
@@ -225,7 +227,12 @@ export function useChatCardActions({
         },
       } : {}),
       ...(TASKBOARD_ENABLED ? {
-        onOpenTaskboard: () => { setCollapsed(false); setBoardOpen(true); },
+        onOpenTaskboard: (identifier?: string) => {
+          setCollapsed(false);
+          const ref = typeof identifier === 'string' ? identifier.trim() : '';
+          if (ref) setBoardTicketId?.(ref);
+          setBoardOpen(true);
+        },
         ...(verified ? {
           taskApproval: {
             getTicket: defer('taskGet'),
@@ -250,7 +257,7 @@ export function useChatCardActions({
         },
       } : {}),
     };
-  }, [demo, systemActions, identity, cardAuth, authRef, openManage, setCollapsed, setBoardOpen, communityBlogEnabled, openBlog, onOpenSwarmBoard]);
+  }, [demo, systemActions, identity, cardAuth, authRef, openManage, setCollapsed, setBoardOpen, setBoardTicketId, communityBlogEnabled, openBlog, onOpenSwarmBoard]);
 
   // 对话交互(```options 选择卡片等):点选即替用户发送。demo 不给发送能力(纯展示),
   // 但带上 reason 让交互块说清「演示模式仅供浏览」,而不是笼统的「此会话中不可交互」(misc-p3 D-08)。

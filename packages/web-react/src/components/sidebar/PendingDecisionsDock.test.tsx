@@ -8,7 +8,7 @@ import {
 } from "../../lib/api/wave4Api";
 import { createMemoryAuthSession } from "../../lib/authSession";
 import { ToastProvider } from "../ui";
-import { PendingDecisionsDock } from "./PendingDecisionsDock";
+import { PendingDecisionsDock, resolveTaskboardTicketRef } from "./PendingDecisionsDock";
 
 const origFetch = globalThis.fetch;
 
@@ -211,5 +211,92 @@ describe("PendingDecisionsDock · 统一待拍板聚合收件箱", () => {
       "已被其他终端处理",
     );
     await waitFor(() => expect(listCalls).toBe(2));
+  });
+
+  it("多条任务单待拍板全部渲染在可滚动列表内，且点击 ↗ 或标题直达对应任务单（含 identifier / ticketId / sourceId 回退）", async () => {
+    const auth = createMemoryAuthSession(() => {}, "jwt-pd-token");
+    const items: PendingDecisionItem[] = [
+      makeItem({
+        id: "taskboard:tk-145@v2",
+        source: "taskboard",
+        sourceId: "tk-145@v2",
+        sessionId: null,
+        title: "[OCV5-145] UX 持续迭代计划",
+        summary: "等待人工验收",
+        metadata: { ticketId: "tk-145", identifier: "OCV5-145", version: 2 },
+      }),
+      makeItem({
+        id: "taskboard:tk-154@v1",
+        source: "taskboard",
+        sourceId: "tk-154@v1",
+        sessionId: null,
+        title: "[OCV5-154] 教程改为成果先行",
+        summary: "等待人工验收",
+        metadata: { ticketId: "tk-154", version: 1 },
+      }),
+      makeItem({
+        id: "taskboard:tk-266@v4",
+        source: "taskboard",
+        sourceId: "tk-266@v4",
+        sessionId: null,
+        title: "[OCV5-266] 顾问模式对任意主模型可开",
+        summary: "等待人工验收",
+        metadata: {},
+      }),
+      makeItem({
+        id: "taskboard:tk-301@v1",
+        source: "taskboard",
+        sourceId: "tk-301@v1",
+        sessionId: null,
+        title: "[OCV5-301] 第 4 条任务单",
+        metadata: { ticketId: "tk-301", identifier: "OCV5-301", version: 1 },
+      }),
+      makeItem({
+        id: "taskboard:tk-302@v1",
+        source: "taskboard",
+        sourceId: "tk-302@v1",
+        sessionId: null,
+        title: "[OCV5-302] 第 5 条任务单",
+        metadata: { ticketId: "tk-302", identifier: "OCV5-302", version: 1 },
+      }),
+    ];
+
+    expect(resolveTaskboardTicketRef(items[0]!)).toBe("OCV5-145");
+    expect(resolveTaskboardTicketRef(items[1]!)).toBe("tk-154");
+    expect(resolveTaskboardTicketRef(items[2]!)).toBe("tk-266");
+
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith("/api/me/pending-decisions") && init?.method === "GET") {
+        return new Response(JSON.stringify(listPayload(items)), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    }) as typeof fetch;
+
+    const onOpenBoard = vi.fn();
+    render(
+      <ToastProvider>
+        <PendingDecisionsDock auth={auth} pollIntervalMs={0} onOpenBoard={onOpenBoard} />
+      </ToastProvider>,
+    );
+
+    expect(await screen.findByTestId("pending-decisions-count")).toHaveTextContent("5");
+    const cards = screen.getAllByTestId("pending-decision-item");
+    expect(cards).toHaveLength(5);
+
+    // 点击卡片 0 的 ↗ 按钮 → 直达 OCV5-145
+    fireEvent.click(within(cards[0]!).getByTestId("pending-decision-open-source"));
+    expect(onOpenBoard).toHaveBeenLastCalledWith("OCV5-145");
+
+    // 点击卡片 1 的标题区 → 回退 metadata.ticketId
+    fireEvent.click(within(cards[1]!).getByText("[OCV5-154] 教程改为成果先行"));
+    expect(onOpenBoard).toHaveBeenLastCalledWith("tk-154");
+
+    // 点击卡片 2 的 ↗ 按钮 → 从 sourceId 剥离 @v4
+    fireEvent.click(within(cards[2]!).getByTestId("pending-decision-open-source"));
+    expect(onOpenBoard).toHaveBeenLastCalledWith("tk-266");
   });
 });

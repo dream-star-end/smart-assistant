@@ -36,13 +36,26 @@ import { AtelierIcon } from "../ui/AtelierIcons";
 import "./pendingDecisions.css";
 
 const POLL_INTERVAL_MS = 30_000;
-const DEFAULT_VISIBLE_ITEMS = 4;
+const DEFAULT_VISIBLE_ITEMS = 12;
+
+/** 从 taskboard 待拍板条目解析任务单 identifier（优先）或 ticketId，供直达详情抽屉使用。 */
+export function resolveTaskboardTicketRef(item: PendingDecisionItem): string | null {
+  if (item.source !== "taskboard") return null;
+  const metaIdent =
+    typeof item.metadata?.identifier === "string" ? item.metadata.identifier.trim() : "";
+  if (metaIdent) return metaIdent;
+  const metaTicketId =
+    typeof item.metadata?.ticketId === "string" ? item.metadata.ticketId.trim() : "";
+  if (metaTicketId) return metaTicketId;
+  const stripped = item.sourceId.replace(/@v\d+$/, "").trim();
+  return stripped || null;
+}
 
 export type PendingDecisionsDockProps = {
   auth?: AuthSession | null;
   socketVersion?: number;
   onSelectSession?: (sessionId: string) => void;
-  onOpenBoard?: () => void;
+  onOpenBoard?: (ticketRef?: string) => void;
   onOpenLiveBrowser?: (opts?: { url?: string; sessionId?: string | null }) => void;
   /** 测试或外部控制轮询间隔（默认 30s；传 0 禁用定时轮询）。 */
   pollIntervalMs?: number;
@@ -224,7 +237,8 @@ export function PendingDecisionsDock({
       }
     }
     if (item.source === "taskboard" && onOpenBoard) {
-      onOpenBoard();
+      const ticketRef = resolveTaskboardTicketRef(item);
+      onOpenBoard(ticketRef ?? undefined);
       return;
     }
     if (item.sessionId && onSelectSession) {
@@ -299,7 +313,7 @@ export function PendingDecisionsDock({
           )}
 
           {conflictNotice && (
-            <div className="mt-1.5 px-0.5" data-testid="pending-decisions-conflict">
+            <div className="mt-1.5 shrink-0 px-0.5" data-testid="pending-decisions-conflict">
               <Alert tone="warning">{conflictNotice}</Alert>
             </div>
           )}
@@ -309,6 +323,10 @@ export function PendingDecisionsDock({
               const interactiveOnly = isInteractiveOnlyDecision(item);
               const busy = resolvingId === item.id;
               const canDeny = item.allowedActions.includes("deny");
+              const canGoto =
+                (item.source === "taskboard" && Boolean(onOpenBoard)) ||
+                (item.source === "browser_handoff" && Boolean(onOpenLiveBrowser || (item.sessionId && onSelectSession))) ||
+                Boolean(item.sessionId && onSelectSession);
               const gotoLabel =
                 item.source === "browser_handoff"
                   ? "直达接管"
@@ -333,16 +351,34 @@ export function PendingDecisionsDock({
                     {riskBadge(item.riskLevel)}
                   </div>
 
-                  <div className="min-w-0 space-y-0.5">
-                    <div className="truncate text-caption font-semibold text-fg" title={item.title}>
-                      {item.title}
+                  {canGoto ? (
+                    <button
+                      type="button"
+                      onClick={() => handleDirectGoto(item)}
+                      className="oc-pd-body-btn space-y-0.5"
+                      title={item.source === "taskboard" ? `打开任务详情：${item.title}` : item.title}
+                    >
+                      <div className="oc-pd-card-title truncate text-caption font-semibold text-fg transition-colors">
+                        {item.title}
+                      </div>
+                      {item.summary && (
+                        <p className="line-clamp-2 text-micro leading-relaxed text-muted">
+                          {item.summary}
+                        </p>
+                      )}
+                    </button>
+                  ) : (
+                    <div className="min-w-0 space-y-0.5">
+                      <div className="truncate text-caption font-semibold text-fg" title={item.title}>
+                        {item.title}
+                      </div>
+                      {item.summary && (
+                        <p className="line-clamp-2 text-micro leading-relaxed text-muted" title={item.summary}>
+                          {item.summary}
+                        </p>
+                      )}
                     </div>
-                    {item.summary && (
-                      <p className="line-clamp-2 text-micro leading-relaxed text-muted" title={item.summary}>
-                        {item.summary}
-                      </p>
-                    )}
-                  </div>
+                  )}
 
                   <div className="oc-pd-actions">
                     {interactiveOnly ? (
@@ -406,8 +442,9 @@ export function PendingDecisionsDock({
                           <IconButton
                             size="sm"
                             shape="square"
+                            data-testid="pending-decision-open-source"
                             aria-label={`前往查看 ${item.title}`}
-                            title="前往对应会话/看板"
+                            title={item.source === "taskboard" ? "查看该任务单详情" : "前往对应会话"}
                             onClick={() => handleDirectGoto(item)}
                             className="oc-spring-press size-7 shrink-0 [@media(hover:none)]:size-11"
                           >

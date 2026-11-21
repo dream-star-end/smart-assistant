@@ -1517,6 +1517,7 @@ export function App() {
     sendImplicitRatingRef,
     sending,
     setBoardOpen,
+    setBoardTicketId,
     setBusy,
     setChatError,
     setCollapsed,
@@ -2093,7 +2094,7 @@ export function App() {
       demo || !(user?.org && (user.org.role === "owner" || user.org.role === "admin"))
         ? undefined
         : closeMobileThen(() => openOrg()),
-    onOpenBoard: demo || !TASKBOARD_ENABLED ? undefined : closeMobileThen(() => setBoardOpen(true)),
+    onOpenBoard: demo || !TASKBOARD_ENABLED ? undefined : (ticketRef?: string) => { setMobileNavOpen(false); const ref = typeof ticketRef === "string" ? ticketRef.trim() : ""; if (ref) { setBoardTicketId(ref); setBoardView((cur) => (cur === "cost" || cur === "weekly" ? preferredBoardView() : cur)); } setBoardOpen(true); },
     boardActive: TASKBOARD_ENABLED && boardOpen,
     onOpenSites: demo ? undefined : closeMobileThen(() => openSites(null)),
     sitesActive: sitesOpen,

@@ -209,7 +209,7 @@ export type SidebarProps = {
   /** 经验分享（OCV5-577）：一级入口，打开教程中心的「经验分享」页签。 */
   onOpenBlog?: () => void;
   onOpenOrg?: () => void;
-  onOpenBoard?: () => void;
+  onOpenBoard?: (ticketRef?: string) => void;
   onOpenSites?: () => void;
   onOpenMediaTasks?: () => void;
   /** OCV5-593: shown only when /api/studio/providers answers 200 for this account. */
@@ -1028,7 +1028,7 @@ export function Sidebar({
     <aside
       className={cn(
         // 桌面加一道发丝分隔线与主区切开（移动抽屉自带遮罩，不需要）。
-        "relative flex h-full shrink-0 flex-col bg-sidebar md:border-r md:border-border/70",
+        "relative flex h-full min-h-0 shrink-0 flex-col bg-sidebar md:border-r md:border-border/70",
         width == null && "w-[268px]",
         resizing && "select-none",
       )}
@@ -1056,7 +1056,7 @@ export function Sidebar({
         />
       )}
       <div
-        className="flex flex-col border-b border-border/60 px-2 pb-2 sidebar-head-safe-t"
+        className="flex shrink-0 flex-col border-b border-border/60 px-2 pb-2 sidebar-head-safe-t"
         data-product-entry-scope="sidebar-primary"
       >
         <div className="mb-2 flex h-8 items-center justify-between pl-1.5 pr-0.5">
@@ -1230,7 +1230,7 @@ export function Sidebar({
                 type="button"
                 data-product-feature={PRODUCT_CAPABILITIES.taskboard.id}
                 data-testid="taskboard-nav"
-                onClick={onOpenBoard}
+                onClick={() => onOpenBoard()}
                 aria-current={boardActive ? "true" : undefined}
                 className={cn(NAV_ITEM_BASE, boardActive ? NAV_ITEM_ACTIVE : NAV_ITEM_IDLE)}
               >
@@ -1342,7 +1342,7 @@ export function Sidebar({
       ) : null}
 
       {/* 底栏：克制发丝边界，账号区 + 案例展厅 + 主题切换光学对齐。 */}
-      <div className="border-t border-border/60 px-2 pt-1.5 sidebar-foot-safe-b">
+      <div className="shrink-0 border-t border-border/60 px-2 pt-1.5 sidebar-foot-safe-b">
         <div className="flex items-center gap-0.5" data-product-entry-scope="sidebar-account">
           {hasAccountMenu ? (
             <DropdownMenu
