@@ -220,4 +220,31 @@ describe('Toast 追踪号(UI-SPEC §1.1 C6:跟踪号不进正文)', () => {
     expect(status.className).not.toContain('data-[state=open]:animate-in')
     expect(screen.getByRole('alert')).toHaveClass('bg-elevated', 'oc-toast-error', 'shadow-pop', 'animate-in')
   })
+
+  it('手动关闭先播 160ms oc-toast-out 收起退场，再从 DOM 移除（OCV5-838）', () => {
+    vi.useFakeTimers()
+    let toast: ReturnType<typeof useToast> = () => {}
+    render(
+      <ToastProvider>
+        <Probe onReady={(fn) => (toast = fn)} />
+      </ToastProvider>,
+    )
+    act(() => {
+      toast('保存失败', 'error')
+    })
+    const alert = screen.getByRole('alert')
+    expect(alert.getAttribute('data-state')).toBe('open')
+    fireEvent.click(screen.getByRole('button', { name: '关闭提示' }))
+    const closing = screen.getByRole('alert')
+    expect(closing.getAttribute('data-state')).toBe('closing')
+    expect(closing).toHaveClass('oc-toast-out')
+    act(() => {
+      vi.advanceTimersByTime(159)
+    })
+    expect(screen.queryByRole('alert')).not.toBeNull()
+    act(() => {
+      vi.advanceTimersByTime(2)
+    })
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
 })

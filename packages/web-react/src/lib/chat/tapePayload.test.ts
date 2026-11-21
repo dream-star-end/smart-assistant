@@ -1,5 +1,5 @@
 import { gzipSync } from "fflate";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import type { TapeRecordPayload } from "../types";
 import { parseTapeRecordPayload } from "./tapePayload";
 
@@ -160,5 +160,76 @@ describe("exact immutable tape payload parsing", () => {
       logical.map((record) => record._runtimeEvent),
     );
     expect(parsed.at(-1)?.usage).toEqual(batch.usage);
+  });
+
+  test("falls back to dynamic fflate gunzip when DecompressionStream is unavailable", async () => {
+    const logical = [0, 1].map((ordinal) => ({
+      id: `runtime-fallback-${ordinal}`,
+      role: "runtime-event",
+      text: "",
+      ts: 2_000 + ordinal,
+      _ocEventOrdinal: ordinal,
+      _runtimeSource: "gateway",
+      _runtimeEvent: { type: "progress", ordinal, exact: `回退解压-${ordinal}` },
+    }));
+    const logicalBytes = logical.map(bytesOf);
+    let offset = 0;
+    const manifest = [] as Array<Record<string, unknown>>;
+    for (let index = 0; index < logical.length; index++) {
+      const record = logical[index]!;
+      const bytes = logicalBytes[index]!;
+      manifest.push({
+        id: record.id,
+        eventOrdinal: record._ocEventOrdinal,
+        ts: record.ts,
+        source: record._runtimeSource,
+        offset,
+        length: bytes.length,
+        payloadSha256: await sha256(bytes),
+      });
+      offset += bytes.length;
+    }
+    const raw = new Uint8Array(offset);
+    let cursor = 0;
+    for (const bytes of logicalBytes) {
+      raw.set(bytes, cursor);
+      cursor += bytes.length;
+    }
+    const compressed = gzipSync(raw, { level: 6 });
+    const batch = {
+      id: "runtime-batch-fallback-0-1",
+      role: "runtime-event",
+      text: "",
+      ts: 2_000,
+      _runtimeEventBatch: {
+        version: 1,
+        encoding: "gzip+base64",
+        logicalCount: manifest.length,
+        uncompressedBytes: raw.length,
+        compressedBytes: compressed.length,
+        manifestSha256: await sha256(bytesOf(manifest)),
+        manifest,
+        data: base64(compressed),
+      },
+    };
+    const batchBytes = bytesOf(batch);
+    const contentSha256 = await sha256(batchBytes);
+
+    vi.stubGlobal("DecompressionStream", undefined);
+    try {
+      const parsed = await parseTapeRecordPayload({
+        bytes: arrayBufferOf(batchBytes),
+        contentSha256,
+        recordId: batch.id,
+        role: batch.role,
+      }, {
+        recordId: batch.id,
+        role: batch.role,
+        contentSha256,
+      });
+      expect(parsed).toEqual(logical);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

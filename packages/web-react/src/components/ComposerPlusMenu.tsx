@@ -12,6 +12,7 @@ import {
   DropdownMenuTrigger,
   IconButton,
 } from "./ui";
+import { AtelierIcon } from "./ui/AtelierIcons";
 
 export function ComposerPlusMenu({
   open,
@@ -22,6 +23,8 @@ export function ComposerPlusMenu({
   onOpenGoal,
   onOpenRepo,
   repoSelection,
+  hasSwarmPlaybooks = false,
+  onOpenSwarmPlaybooks,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -31,9 +34,13 @@ export function ComposerPlusMenu({
   onOpenGoal: () => void;
   onOpenRepo?: () => void;
   repoSelection?: RepoSelection | null;
+  /** 移动端 <640px 蜂群剧本入口收敛进「+」菜单，避免底栏溢出。 */
+  hasSwarmPlaybooks?: boolean;
+  onOpenSwarmPlaybooks?: () => void;
 }) {
   const hasBoundRepo = Boolean(onOpenRepo && repoSelection?.selected);
-  const hasMenu = canGoal || Boolean(onOpenRepo);
+  const showSwarmPlaybooks = Boolean(hasSwarmPlaybooks && onOpenSwarmPlaybooks);
+  const hasMenu = canGoal || Boolean(onOpenRepo) || showSwarmPlaybooks;
 
   const goalDot = visibleGoal ? (
     <span
@@ -135,6 +142,22 @@ export function ComposerPlusMenu({
                 ? `GitHub · ${repoSelection.repo}`
                 : "关联 GitHub 仓库"}
             </span>
+          </DropdownMenuItem>
+        )}
+        {showSwarmPlaybooks && (
+          <DropdownMenuItem
+            data-product-control
+            data-testid="composer-menu-swarm-playbooks"
+            onSelect={onOpenSwarmPlaybooks}
+            className="gap-2.5 sm:hidden"
+          >
+            <span
+              aria-hidden
+              className="oc-icon-badge oc-icon-badge-accent size-6 rounded-xs"
+            >
+              <AtelierIcon name="swarm" size={13} />
+            </span>
+            <span className="flex-1 font-medium">蜂群剧本模板</span>
           </DropdownMenuItem>
         )}
       </DropdownMenuContent>

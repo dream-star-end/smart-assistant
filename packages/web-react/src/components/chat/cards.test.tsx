@@ -304,21 +304,36 @@ describe("助手动作条(OCV5-359)", () => {
     return screen.getByTestId("assistant-actions");
   }
 
-  test("单行只有 复制 · 点赞 · 点踩 · 更多;没有引导语、没有常显药丸", () => {
-    const bar = renderBar(LATEST, { onRegenerate: vi.fn(), onSaveToProject: vi.fn() });
+  test("最新回复直露 复制 · 引用 · 重新生成 · 点赞 · 点踩 · 更多;没有引导语、没有常显药丸", () => {
+    const onQuote = vi.fn();
+    const onRegenerate = vi.fn();
+    const bar = renderBar(LATEST, { onQuote, onRegenerate, onSaveToProject: vi.fn() });
     const names = within(bar)
       .getAllByRole("button")
       .map((b) => b.getAttribute("aria-label"))
       .filter((n) => !n?.startsWith("复制请求ID"));
-    expect(names).toEqual(["复制", "点赞", "点踩", "更多操作"]);
+    expect(names).toEqual(["复制", "引用", "重新生成", "点赞", "点踩", "更多操作"]);
     expect(screen.queryByText("这条回复怎么样?")).toBeNull();
     expect(screen.queryByRole("button", { name: "记住这条" })).toBeNull();
     expect(screen.queryByRole("button", { name: "存为项目技能" })).toBeNull();
     expect(screen.queryByTestId("project-save-chips")).toBeNull();
     // 每个图标的触屏命中区都是 44px。
-    for (const name of ["复制", "点赞", "点踩", "更多操作"]) {
+    for (const name of ["复制", "引用", "重新生成", "点赞", "点踩", "更多操作"]) {
       expect(screen.getByRole("button", { name })).toHaveClass("[@media(hover:none)]:size-11");
     }
+    fireEvent.click(screen.getByRole("button", { name: "引用" }));
+    expect(onQuote).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "重新生成" }));
+    expect(onRegenerate).toHaveBeenCalledTimes(1);
+  });
+
+  test("更早的助手回复不平铺引用/重新生成，保持精简单行", () => {
+    const bar = renderBar(OLDER, { onQuote: vi.fn(), onRegenerate: vi.fn() });
+    const names = within(bar)
+      .getAllByRole("button")
+      .map((b) => b.getAttribute("aria-label"))
+      .filter((n) => !n?.startsWith("复制请求ID"));
+    expect(names).toEqual(["复制", "点赞", "点踩", "更多操作"]);
   });
 
   test("时间 · 积分 · 请求ID 默认不显:触屏 display:none,桌面 opacity-0 待 hover / 焦点", () => {

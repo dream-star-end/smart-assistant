@@ -192,7 +192,7 @@ describe("Composer environment preparing", () => {
     expect(bar).toHaveAttribute("data-overdue", "true");
     expect(bar).toHaveTextContent("仍在准备环境，请稍候…");
     expect(bar).not.toHaveTextContent("约 20 秒");
-    expect(bar.querySelector(".animate-pulse")).not.toBeNull();
+    expect(bar.querySelector(".oc-indeterminate-bar")).not.toBeNull();
   });
 });
 
@@ -463,5 +463,32 @@ describe("OCV5-831 Composer 蜂群占位符单行化与视觉重心", () => {
 
     rerender(<Composer onSend={() => {}} busy onStop={vi.fn()} swarmSupported swarmMode onToggleSwarmMode={vi.fn()} />);
     expect(screen.getByRole("button", { name: "停止" })).toHaveClass("oc-btn-primary-craft", "text-primary-fg");
+  });
+
+  test("OCV5-838 移动端防溢出：状态提示收敛至输入区上方轻提示条、剧本入口收入「+」菜单、textarea 软键盘高度上限与 16px 守卫", () => {
+    render(
+      <Composer
+        onSend={() => {}}
+        busy
+        stopping
+        onStop={vi.fn()}
+        swarmSupported
+        swarmMode
+        onToggleSwarmMode={vi.fn()}
+      />,
+    );
+    const ta = screen.getByLabelText("消息输入框");
+    expect(ta.className).toContain("max-h-[min(140px,28dvh)]");
+    expect(ta.className).toContain("sm:max-h-[240px]");
+    expect(ta).toHaveClass("text-base", "md:text-sm");
+
+    const statusStrip = screen.getByTestId("composer-status-strip");
+    expect(statusStrip).toContainElement(screen.getByTestId("composer-stopping-status"));
+    expect(screen.getByTestId("composer-tool-row")).not.toContainElement(screen.getByTestId("composer-stopping-status"));
+
+    const plusBtn = screen.getByRole("button", { name: "更多选项" });
+    fireEvent.pointerDown(plusBtn, { button: 0, pointerType: "mouse" });
+    fireEvent.click(plusBtn);
+    expect(screen.getByTestId("composer-menu-swarm-playbooks")).toHaveTextContent("蜂群剧本模板");
   });
 });

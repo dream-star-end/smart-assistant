@@ -92,6 +92,10 @@ describe("CopyChip", () => {
     expect(btn.className).toContain("[@media(hover:none)]:min-h-11");
     fireEvent.click(btn);
     expect(writeText).toHaveBeenCalledWith("u_123");
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(btn.querySelector("svg.oc-check-pop")).not.toBeNull();
   });
 });
 

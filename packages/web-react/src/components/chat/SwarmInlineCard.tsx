@@ -13,13 +13,13 @@ import {
   GitBranch,
   Hash,
   MessageSquare,
-  Sparkles,
   Users,
 } from "lucide-react";
 import { memo, useEffect, useState } from "react";
 import { cn } from "../../lib/utils";
 import { Badge, Button, Spinner } from "../ui";
 import { AtelierIcon } from "../ui/AtelierIcons";
+import { ModelFamilyIcon } from "../ui/ModelFamilyIcons";
 import {
   formatPostClock,
   formatSwarmElapsed,
@@ -182,7 +182,7 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
                 member.failed
                   ? "bg-danger"
                   : working
-                    ? "bg-accent animate-pulse"
+                    ? "oc-alive-dot"
                     : killed
                       ? "bg-faint"
                       : "bg-success",
@@ -209,7 +209,12 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
             </div>
             {(modelText || (member.stepCount > 0 && !killed)) && (
               <div className="flex items-center gap-1 truncate text-micro text-faint">
-                {modelText && <span className="truncate">{modelText}</span>}
+                {modelText && (
+                  <span className="inline-flex min-w-0 items-center gap-1 truncate">
+                    <ModelFamilyIcon model={member.model ?? modelText} size={13} className="shrink-0 text-muted" />
+                    <span className="truncate">{modelText}</span>
+                  </span>
+                )}
                 {member.stepCount > 0 && !killed && (
                   <span className="hidden shrink-0 font-mono text-faint/70 tabular-nums sm:inline">
                     {modelText ? "· " : ""}
@@ -371,7 +376,7 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
               )}
               data-testid="swarm-open-board-btn"
             >
-              <Sparkles size={12} strokeWidth={1.75} />
+              <AtelierIcon name="sparkles" size={13} />
               <span>沉浸看板</span>
               <ArrowUpRight size={12} strokeWidth={1.75} />
             </Button>

@@ -49,6 +49,8 @@ type ToastItem = {
   overflowCount?: number;
   /** 会自隐的提示(success / info 且无动作)。悬停 / 聚焦时暂停计时,离开后重新计满。 */
   autoDismiss: boolean;
+  /** 正在播放 160ms 收起退场动画。 */
+  exiting?: boolean;
 };
 
 const MAX_ERROR_TOASTS = 3;
@@ -143,39 +145,74 @@ const TONE_STYLE: Record<ToastTone, { icon: ReactNode; badge: string; cls: strin
 };
 
 const AUTO_DISMISS_MS = 3500;
+const TOAST_EXIT_MS = 160;
 
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [items, setItems] = useState<ToastItem[]>([]);
   const seq = useRef(0);
   const dismissTimers = useRef(new Map<number, number>());
+  const exitTimers = useRef(new Map<number, number>());
 
-  const dismiss = useCallback((id: number) => {
-    const timer = dismissTimers.current.get(id);
-    if (timer !== undefined) window.clearTimeout(timer);
-    dismissTimers.current.delete(id);
+  const removeNow = useCallback((id: number) => {
+    const exitTimer = exitTimers.current.get(id);
+    if (exitTimer !== undefined) window.clearTimeout(exitTimer);
+    exitTimers.current.delete(id);
     setItems((cur) => cur.filter((t) => t.id !== id));
   }, []);
 
+  const dismiss = useCallback(
+    (id: number) => {
+      const timer = dismissTimers.current.get(id);
+      if (timer !== undefined) window.clearTimeout(timer);
+      dismissTimers.current.delete(id);
+      if (exitTimers.current.has(id)) return;
+      setItems((cur) => cur.map((t) => (t.id === id ? { ...t, exiting: true } : t)));
+      exitTimers.current.set(
+        id,
+        window.setTimeout(() => removeNow(id), TOAST_EXIT_MS),
+      );
+    },
+    [removeNow],
+  );
+
   // 自隐计时的两个开关(a11y 走查 shell#10 / WCAG 2.2.1):鼠标停在提示上、或键盘把焦点移进
-  // 提示里(动作按钮 / 关闭键)时暂停;离开再从头计 3.5s,读得慢的人不会在读到一半时被收走。
+  // 提示里(动作按钮 / 关闭键)时暂停;离开再从头计满 3.5s(含末尾 160ms 平滑收起退场),读得慢的人不会在读到一半时被收走。
   const schedule = useCallback(
     (id: number) => {
       const prev = dismissTimers.current.get(id);
       if (prev !== undefined) window.clearTimeout(prev);
-      dismissTimers.current.set(id, window.setTimeout(() => dismiss(id), AUTO_DISMISS_MS));
+      const exitTimer = exitTimers.current.get(id);
+      if (exitTimer !== undefined) {
+        window.clearTimeout(exitTimer);
+        exitTimers.current.delete(id);
+        setItems((cur) => cur.map((t) => (t.id === id ? { ...t, exiting: false } : t)));
+      }
+      dismissTimers.current.set(
+        id,
+        window.setTimeout(() => dismiss(id), AUTO_DISMISS_MS - TOAST_EXIT_MS),
+      );
     },
     [dismiss],
   );
   const pause = useCallback((id: number) => {
     const timer = dismissTimers.current.get(id);
-    if (timer === undefined) return;
-    window.clearTimeout(timer);
-    dismissTimers.current.delete(id);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      dismissTimers.current.delete(id);
+    }
+    const exitTimer = exitTimers.current.get(id);
+    if (exitTimer !== undefined) {
+      window.clearTimeout(exitTimer);
+      exitTimers.current.delete(id);
+      setItems((cur) => cur.map((t) => (t.id === id ? { ...t, exiting: false } : t)));
+    }
   }, []);
 
   useEffect(() => () => {
     for (const timer of dismissTimers.current.values()) window.clearTimeout(timer);
     dismissTimers.current.clear();
+    for (const timer of exitTimers.current.values()) window.clearTimeout(timer);
+    exitTimers.current.clear();
   }, []);
 
   const toast = useCallback<ToastFn>(
@@ -248,6 +285,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               role={t.tone === "error" ? "alert" : "status"}
               aria-live={t.tone === "error" ? "assertive" : "polite"}
               data-auto-dismiss={t.autoDismiss ? "true" : undefined}
+              data-state={t.exiting ? "closing" : "open"}
               onMouseEnter={t.autoDismiss ? () => pause(t.id) : undefined}
               onMouseLeave={t.autoDismiss ? () => schedule(t.id) : undefined}
               onFocusCapture={t.autoDismiss ? () => pause(t.id) : undefined}
@@ -261,7 +299,8 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                   : undefined
               }
               className={cn(
-                "oc-toast-card pointer-events-auto flex max-w-[92vw] items-center gap-2.5 rounded-xl border px-3 py-2.5 text-body font-medium shadow-pop animate-in sm:max-w-md",
+                "oc-toast-card pointer-events-auto flex max-w-[92vw] items-center gap-2.5 rounded-xl border px-3 py-2.5 text-body font-medium shadow-pop sm:max-w-md",
+                t.exiting ? "oc-toast-out pointer-events-none" : "animate-in",
                 s.cls,
               )}
             >

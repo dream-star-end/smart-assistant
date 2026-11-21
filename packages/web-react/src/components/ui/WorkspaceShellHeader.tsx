@@ -31,7 +31,7 @@ export function HeaderCountBadge({
       aria-label={ariaLabel}
       className={cn(
         "pointer-events-none absolute right-1.5 top-1.5 size-1.5 rounded-full ring-2 ring-bg",
-        tone === "accent" ? "bg-accent motion-safe:animate-pulse" : "bg-danger",
+        tone === "accent" ? "bg-accent oc-alive-dot" : "bg-danger",
         className,
       )}
     />

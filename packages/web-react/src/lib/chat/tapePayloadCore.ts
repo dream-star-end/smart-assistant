@@ -1,5 +1,3 @@
-import { gunzipSync } from "fflate";
-
 type JsonObject = Record<string, unknown>;
 
 function asObject(value: unknown, label: string): JsonObject {
@@ -14,11 +12,34 @@ async function sha256Hex(bytes: BufferSource): Promise<string> {
   return [...new Uint8Array(digest)].map((part) => part.toString(16).padStart(2, "0")).join("");
 }
 
-function fromBase64(value: string): Uint8Array {
+function fromBase64(value: string): Uint8Array<ArrayBuffer> {
   const binary = atob(value);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes;
+}
+
+async function gunzipBytes(compressed: Uint8Array<ArrayBuffer>): Promise<Uint8Array<ArrayBuffer>> {
+  if (
+    typeof DecompressionStream === "function" &&
+    typeof ReadableStream === "function" &&
+    typeof Response === "function"
+  ) {
+    try {
+      const source = new ReadableStream<Uint8Array<ArrayBuffer>>({
+        start(controller) {
+          controller.enqueue(compressed);
+          controller.close();
+        },
+      });
+      const stream = source.pipeThrough(new DecompressionStream("gzip"));
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    } catch {
+      // Fall back to dynamically imported fflate when native streaming gunzip is unavailable or rejects.
+    }
+  }
+  const { gunzipSync } = await import("fflate");
+  return gunzipSync(compressed) as Uint8Array<ArrayBuffer>;
 }
 
 /** Parse and verify one exact immutable physical record. Runtime-batch
@@ -60,7 +81,7 @@ export async function decodeTapePayload(
   if (Number.isSafeInteger(compressedBytes) && compressed.length !== compressedBytes) {
     throw new Error("runtime batch compressed length mismatch");
   }
-  const raw = gunzipSync(compressed);
+  const raw = await gunzipBytes(compressed);
   if (raw.length !== uncompressedBytes) throw new Error("runtime batch raw length mismatch");
 
   const records: JsonObject[] = [];

@@ -160,15 +160,20 @@ describe("ProjectResearchTab · 批量导入与原文 Span 溯源闭环", () => 
     expect(screen.getByTestId("import-count-success")).toHaveTextContent("成功 1");
     expect(screen.getByTestId("import-count-duplicate")).toHaveTextContent("重复 1");
     expect(screen.getByTestId("import-count-failed")).toHaveTextContent("失败 1");
-    expect(screen.getByTestId("import-verified-badge")).toHaveTextContent("verifiedSource");
+    expect(screen.getByTestId("import-verified-badge")).toHaveTextContent("权威源已验");
 
     // 点击文献行打开原文 Span 抽屉
     fireEvent.click(screen.getByTestId("research-doc-open-doc:abc123"));
 
-    expect(await screen.findByTestId("citation-span-drawer")).toBeInTheDocument();
+    const drawer = await screen.findByTestId("citation-span-drawer");
+    expect(drawer).toBeInTheDocument();
+    expect(drawer.className).toContain("oc-sheet-in-right");
+    expect(drawer.className).toContain("pt-[env(safe-area-inset-top,0px)]");
     expect(await screen.findByTestId("citation-verbatim-quote")).toHaveTextContent(
       "The Transformer relies entirely on self-attention",
     );
+    expect(screen.getByTestId("citation-span-prev")).toHaveClass("oc-spring-press");
+    expect(screen.getByTestId("citation-span-next")).toHaveClass("oc-spring-press");
     expect(screen.getByTestId("citation-page-badge")).toHaveTextContent("第 2 页 · 原文页码");
     expect(screen.getByTestId("citation-verified-badge")).toHaveTextContent("权威出版源已验证");
     expect(screen.getByTestId("citation-context-before")).toHaveTextContent("Recurrent models");

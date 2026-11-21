@@ -127,8 +127,8 @@ function ToolButton({
       onClick={() => onSelect(value)}
       aria-pressed={active}
       className={cn(
-        'flex min-h-11 items-center gap-2 rounded-xl px-3 text-sm font-medium',
-        active ? 'bg-white text-black' : 'text-white hover:bg-white/10',
+        'oc-spring-press flex min-h-11 items-center gap-2 rounded-xl px-3 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring',
+        active ? 'bg-accent text-accent-fg' : 'text-fg hover:bg-white/10',
       )}
     >
       {icon}
@@ -149,7 +149,7 @@ function RoundBtn({
       aria-label={label}
       disabled={disabled}
       onClick={onClick}
-      className="flex size-11 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 disabled:opacity-35"
+      className="oc-spring-press flex size-11 items-center justify-center rounded-full bg-white/10 text-fg outline-none backdrop-blur transition-colors hover:bg-white/20 focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-35"
     >
       {icon}
     </button>
@@ -232,7 +232,7 @@ export function BrushSlider({ value, onChange }: { value: number; onChange: (n: 
       onPointerUp={endDrag}
       onPointerCancel={endDrag}
       onKeyDown={onKeyDown}
-      className="relative flex h-48 w-11 cursor-ns-resize touch-none select-none items-stretch justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-white/70"
+      className="relative flex h-48 w-11 cursor-ns-resize touch-none select-none items-stretch justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring"
     >
       {/* 锥形装饰轨道(粗上细下) */}
       <span
@@ -243,13 +243,13 @@ export function BrushSlider({ value, onChange }: { value: number; onChange: (n: 
       {/* 拖点圆头(跟手) */}
       <span
         aria-hidden
-        className="pointer-events-none absolute left-1/2 size-5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-black/25 bg-white shadow-float"
+        className="pointer-events-none absolute left-1/2 size-5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-bg/30 bg-fg shadow-float"
         style={{ top: `${(1 - frac) * 100}%` }}
       />
       {/* 拖动态数值气泡 */}
       {dragging && (
         <span
-          className="pointer-events-none absolute left-full ml-2 -translate-y-1/2 rounded-md bg-white px-2 py-0.5 text-xs font-semibold tabular-nums text-black shadow-float"
+          className="pointer-events-none absolute left-full ml-2 -translate-y-1/2 rounded-md bg-accent px-2 py-0.5 text-xs font-semibold tabular-nums text-accent-fg shadow-float"
           style={{ top: `${(1 - frac) * 100}%` }}
         >
           {value}
@@ -306,6 +306,7 @@ export function ImageAnnotationEditor({
   const historyRef = useRef<Blob[]>([])
   const redoRef = useRef<Blob[]>([])
   const generationRef = useRef(0)
+  const composingRef = useRef(false)
   const [tool, setTool] = useState<Tool>('brush')
   const [brushSize, setBrushSize] = useState(48)
   const [prompt, setPrompt] = useState('')
@@ -358,10 +359,18 @@ export function ImageAnnotationEditor({
     overlayCtx.globalCompositeOperation = 'source-over'
     overlayCtx.drawImage(mask, 0, 0)
     overlayCtx.globalCompositeOperation = 'source-in'
-    // 半透明蓝覆盖(对齐参考图选区视觉)。仅改显示层 tint 颜色,不影响 submit() 从
+    // 暖陶土半透明选区覆盖(对齐 Clarvy Atelier 语义体系)。仅改显示层 tint 颜色,不影响 submit() 从
     // mask canvas alpha 另建的二值 mask —— 选区/上传管线字节保真。
-    overlayCtx.fillStyle = 'rgba(56,132,255,.42)'
+    const accent =
+      (typeof getComputedStyle === 'function'
+        ? getComputedStyle(canvas).getPropertyValue('--accent').trim() ||
+          getComputedStyle(document.documentElement).getPropertyValue('--accent').trim()
+        : '') || 'hsl(16 68% 61%)'
+    overlayCtx.save()
+    overlayCtx.globalAlpha = 0.44
+    overlayCtx.fillStyle = accent
     overlayCtx.fillRect(0, 0, canvas.width, canvas.height)
+    overlayCtx.restore()
     ctx.drawImage(overlay, 0, 0)
   }, [])
 
@@ -553,7 +562,7 @@ export function ImageAnnotationEditor({
     if (!ctx) return
     ctx.save()
     ctx.globalCompositeOperation = tool === 'erase' ? 'destination-out' : 'source-over'
-    ctx.strokeStyle = '#fff'
+    ctx.strokeStyle = 'white'
     ctx.lineCap = 'round'
     ctx.lineJoin = 'round'
     ctx.lineWidth = brushSize
@@ -632,13 +641,13 @@ export function ImageAnnotationEditor({
     if (tool === 'rect') {
       ctx.clearRect(0, 0, drawing.snapshot.width, drawing.snapshot.height)
       ctx.drawImage(drawing.snapshot, 0, 0)
-      ctx.fillStyle = '#fff'
+      ctx.fillStyle = 'white'
       ctx.fillRect(drawing.start.x, drawing.start.y, p.x - drawing.start.x, p.y - drawing.start.y)
     } else if (tool === 'lasso') {
       drawing.points.push(p)
       ctx.clearRect(0, 0, drawing.snapshot.width, drawing.snapshot.height)
       ctx.drawImage(drawing.snapshot, 0, 0)
-      ctx.fillStyle = '#fff'
+      ctx.fillStyle = 'white'
       ctx.beginPath()
       ctx.moveTo(drawing.points[0]!.x, drawing.points[0]!.y)
       for (const point of drawing.points.slice(1)) ctx.lineTo(point.x, point.y)
@@ -734,7 +743,7 @@ export function ImageAnnotationEditor({
       binaryMask.height = mask.height
       const bctx = binaryMask.getContext('2d')
       if (!bctx) throw new Error('浏览器不支持图片编辑')
-      bctx.fillStyle = '#000'
+      bctx.fillStyle = 'black'
       bctx.fillRect(0, 0, binaryMask.width, binaryMask.height)
       bctx.imageSmoothingEnabled = false
       bctx.drawImage(mask, 0, 0)
@@ -773,12 +782,12 @@ export function ImageAnnotationEditor({
     <Dialog.Root open={open} onOpenChange={(next) => !submitting && onOpenChange(next)}>
       <Dialog.Portal>
         <Dialog.Overlay
-          className="fixed inset-x-0 z-[70] bg-black/95 backdrop-blur-sm"
+          className="dark fixed inset-x-0 z-[70] bg-bg/95 backdrop-blur-sm"
           style={{ top: 'var(--oc-visual-offset-top, 0px)', height: 'var(--oc-visual-height, 100dvh)' }}
         />
         <Dialog.Content
           aria-describedby="image-edit-help"
-          className="fixed inset-x-0 top-[var(--oc-visual-offset-top,0px)] z-[71] flex h-[var(--oc-visual-height,100dvh)] min-h-0 select-none flex-col bg-black text-white outline-none"
+          className="dark fixed inset-x-0 top-[var(--oc-visual-offset-top,0px)] z-[71] flex h-[var(--oc-visual-height,100dvh)] min-h-0 select-none flex-col bg-bg text-fg outline-none"
           // ESC 逐层退出 + 误触保护(需求 §5):菜单 → 确认层 → 脏则弹确认 → 干净才退。
           // 全程接管,不放行 Radix 直接关(否则脏状态会被直接丢弃)。
           onEscapeKeyDown={(e) => {
@@ -801,7 +810,7 @@ export function ImageAnnotationEditor({
               // 走 requestClose:脏状态先弹确认,空白直接退(需求 §5)。
               onClick={requestClose}
               // 触屏补到 44px(a11y-B media#2);桌面 40px 圆钮不变。
-              className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 [@media(hover:none)]:size-11"
+              className="oc-spring-press flex size-10 items-center justify-center rounded-full bg-white/10 text-fg outline-none backdrop-blur transition-colors hover:bg-white/20 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11"
             >
               <X size={20} />
             </button>
@@ -809,8 +818,8 @@ export function ImageAnnotationEditor({
               <Dialog.Title className="text-sm font-semibold">
                 {selectionPresent ? '已选中区域' : '圈选要修改的区域'}
               </Dialog.Title>
-              {/* 价格不在前端写死(审计 M-24):计费口径归后端/计费侧,前端没有可读的价格字段就不报数。 */}
-              <span className="text-caption text-white/60">Image 2</span>
+              {/* 价格不在前端写死(审计 M-24):计费口径归后端/计费侧,前端没有可读的价格字段就不报数;隐藏内部代号。 */}
+              <span className="text-caption text-muted">局部重绘</span>
             </div>
             <button
               type="button"
@@ -830,7 +839,7 @@ export function ImageAnnotationEditor({
                 }
               }}
               className={cn(
-                'flex min-h-10 items-center gap-1.5 rounded-full bg-white px-4 text-sm font-semibold text-black transition-opacity hover:opacity-90',
+                'oc-spring-press flex min-h-10 items-center gap-1.5 rounded-full bg-accent px-4 text-sm font-semibold text-accent-fg outline-none transition-opacity hover:opacity-90 focus-visible:ring-2 focus-visible:ring-ring',
                 !canSubmit && 'cursor-not-allowed opacity-40',
               )}
             >
@@ -864,13 +873,13 @@ export function ImageAnnotationEditor({
                 {loadPercent != null && (
                   <div aria-hidden className="absolute inset-x-0 top-0 h-0.5 bg-white/10">
                     <div
-                      className="h-full bg-white/80 transition-[width] duration-200"
+                      className="h-full bg-accent transition-[width] duration-200"
                       style={{ width: `${loadPercent}%` }}
                     />
                   </div>
                 )}
-                <div className="absolute inset-0 flex items-center justify-center gap-2 text-white/80">
-                  <Loader2 className="animate-spin" />
+                <div className="absolute inset-0 flex items-center justify-center gap-2 text-fg/80">
+                  <Loader2 className="animate-spin text-accent" />
                   <span className="text-sm tabular-nums">
                     {loadPercent != null ? `${loadPercent}%` : '正在打开图片…'}
                   </span>
@@ -883,16 +892,16 @@ export function ImageAnnotationEditor({
                 role="alert"
                 className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 px-6 text-center"
               >
-                <p className="max-w-xs text-sm text-white/85">{loadError}</p>
+                <p className="max-w-xs text-sm text-fg/85">{loadError}</p>
                 <button
                   type="button"
                   onClick={() => {
                     setLoadError(null)
                     setReloadKey((k) => k + 1)
                   }}
-                  className="flex min-h-10 items-center gap-1.5 rounded-full bg-white/10 px-4 text-sm font-medium text-white transition-colors hover:bg-white/20"
+                  className="oc-spring-press flex min-h-10 items-center gap-1.5 rounded-full bg-white/10 px-4 text-sm font-medium text-fg outline-none transition-colors hover:bg-white/20 focus-visible:ring-2 focus-visible:ring-ring"
                 >
-                  <RotateCcw size={16} /> 继续
+                  <RotateCcw size={16} /> 重试加载
                 </button>
               </div>
             )}
@@ -907,23 +916,23 @@ export function ImageAnnotationEditor({
               onPointerCancel={pointerUp}
               onWheel={wheelZoom}
               aria-busy={historyPending}
-              className="max-h-full max-w-full origin-center rounded-lg bg-neutral-900 object-contain shadow-float [touch-action:none]"
+              className="max-h-full max-w-full origin-center rounded-lg bg-surface object-contain shadow-float [touch-action:none]"
               style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})` }}
             />
           </div>
           {/* 底栏:提示词输入条 + 居中撤销/重做 + 更多工具/缩放(次级) */}
           <div className="flex shrink-0 flex-col gap-2 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-1">
             {error && (
-              <p role="alert" className="mx-auto max-w-2xl rounded-lg bg-danger/25 px-3 py-1.5 text-center text-sm text-white">
+              <p role="alert" className="mx-auto max-w-2xl rounded-lg bg-danger/25 px-3 py-1.5 text-center text-sm text-fg">
                 {error}
               </p>
             )}
             {submitHint && (
-              <p role="status" className="mx-auto w-full max-w-2xl text-center text-body text-amber-300">
+              <p role="status" className="mx-auto w-full max-w-2xl text-center text-body text-warning">
                 {submitHint}
               </p>
             )}
-            <div className="mx-auto flex w-full max-w-2xl items-end gap-2 rounded-2xl bg-white/10 px-3 py-2 backdrop-blur">
+            <div className="mx-auto flex w-full max-w-2xl items-end gap-2 rounded-2xl border border-white/10 bg-surface/90 px-3 py-2 backdrop-blur focus-within:border-accent/60">
               <textarea
                 id="image-edit-prompt"
                 aria-label="希望怎样修改"
@@ -933,8 +942,15 @@ export function ImageAnnotationEditor({
                   setSubmitHint(null)
                   autoGrowTextarea(e.currentTarget)
                 }}
-                // 桌面 Enter 提交、Shift+Enter 换行(需求 §5)。
+                onCompositionStart={() => {
+                  composingRef.current = true
+                }}
+                onCompositionEnd={() => {
+                  composingRef.current = false
+                }}
+                // 桌面 Enter 提交、Shift+Enter 换行(需求 §5);守卫中文 IME 选词回车防止误发扣费。
                 onKeyDown={(e) => {
+                  if (composingRef.current || e.nativeEvent.isComposing || e.keyCode === 229) return
                   if (e.key === 'Enter' && !e.shiftKey) {
                     e.preventDefault()
                     if (canSubmit) void submit()
@@ -943,8 +959,8 @@ export function ImageAnnotationEditor({
                 rows={1}
                 maxLength={1200}
                 placeholder="描述想要的修改，例如：把杯子改成透明玻璃材质"
-                // placeholder 40% 白叠在 bg-neutral-900 上只有 3.8:1(a11y-C 复扫);60% ≈ 7:1,仍比正文淡一档。
-                className="max-h-28 min-h-[1.5rem] w-full resize-none bg-transparent text-base leading-relaxed text-white outline-none placeholder:text-white/60"
+                // placeholder 40% 白叠在深炭底上只有 3.8:1(a11y-C 复扫);60% ≈ 7:1,仍比正文淡一档。
+                className="max-h-28 min-h-[1.5rem] w-full resize-none bg-transparent text-base leading-relaxed text-fg outline-none placeholder:text-white/60"
               />
             </div>
             <p id="image-edit-help" className="sr-only">
@@ -961,8 +977,8 @@ export function ImageAnnotationEditor({
                   title={`更多工具 · 当前：${activeTool.label}`}
                   onClick={() => setToolsOpen((v) => !v)}
                   className={cn(
-                    'flex size-11 items-center justify-center rounded-full backdrop-blur transition-colors',
-                    toolsOpen ? 'bg-white text-black' : 'bg-white/10 text-white hover:bg-white/20',
+                    'oc-spring-press flex size-11 items-center justify-center rounded-full outline-none backdrop-blur transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                    toolsOpen ? 'bg-accent text-accent-fg' : 'bg-white/10 text-fg hover:bg-white/20',
                   )}
                 >
                   {activeTool.icon}
@@ -977,7 +993,7 @@ export function ImageAnnotationEditor({
                       className="fixed inset-0 z-20 cursor-default"
                       onClick={() => setToolsOpen(false)}
                     />
-                    <div className="absolute bottom-14 left-0 z-30 flex w-40 flex-col gap-1 rounded-2xl bg-neutral-900/95 p-2 text-white shadow-float backdrop-blur">
+                    <div className="absolute bottom-14 left-0 z-30 flex w-40 flex-col gap-1 rounded-2xl border border-white/10 bg-elevated/95 p-2 text-fg shadow-float backdrop-blur">
                       {TOOLS.map((t) => (
                         <ToolButton
                           key={t.value}
@@ -995,7 +1011,7 @@ export function ImageAnnotationEditor({
                           setToolsOpen(false)
                           void clear()
                         }}
-                        className="flex min-h-11 items-center gap-2 rounded-xl px-3 text-sm text-white hover:bg-white/10 disabled:opacity-35"
+                        className="oc-spring-press flex min-h-11 items-center gap-2 rounded-xl px-3 text-sm text-fg outline-none hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-35"
                       >
                         <RotateCcw size={17} /> 清空
                       </button>
@@ -1018,13 +1034,13 @@ export function ImageAnnotationEditor({
               />
               {/* 次级:缩放 */}
               <RoundBtn label="缩小画布" icon={<Minus size={18} />} disabled={view.scale <= 1} onClick={() => zoomBy(1 / 1.2)} />
-              <span className="min-w-11 text-center text-xs text-white/60">{Math.round(view.scale * 100)}%</span>
+              <span className="min-w-11 text-center text-xs tabular-nums text-muted">{Math.round(view.scale * 100)}%</span>
               <RoundBtn label="放大画布" icon={<Plus size={18} />} disabled={view.scale >= 4} onClick={() => zoomBy(1.2)} />
               {(view.scale > 1 || Math.abs(view.x) > 1 || Math.abs(view.y) > 1) && (
                 <button
                   type="button"
                   onClick={() => setView({ scale: 1, x: 0, y: 0 })}
-                  className="min-h-11 rounded-full px-3 text-sm text-white hover:bg-white/10"
+                  className="oc-spring-press min-h-11 rounded-full px-3 text-sm text-fg outline-none hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-ring"
                 >
                   适应
                 </button>
@@ -1037,15 +1053,15 @@ export function ImageAnnotationEditor({
             <div
               role="alertdialog"
               aria-label="放弃编辑确认"
-              className="absolute inset-0 z-40 flex items-center justify-center bg-black/70 px-6 backdrop-blur-sm"
+              className="absolute inset-0 z-40 flex items-center justify-center bg-bg/75 px-6 backdrop-blur-sm"
             >
-              <div className="w-full max-w-xs rounded-2xl bg-neutral-900 p-5 text-center shadow-float">
-                <p className="text-sm text-white">放弃当前编辑？已圈选的区域和描述都不会保存。</p>
+              <div className="w-full max-w-xs rounded-2xl border border-white/10 bg-elevated p-5 text-center shadow-float">
+                <p className="text-sm text-fg">放弃当前编辑？已圈选的区域和描述都不会保存。</p>
                 <div className="mt-4 flex gap-2">
                   <button
                     type="button"
                     onClick={() => setConfirmClose(false)}
-                    className="min-h-10 flex-1 rounded-full bg-white/10 text-sm font-medium text-white transition-colors hover:bg-white/20"
+                    className="oc-spring-press min-h-10 flex-1 rounded-full bg-white/10 text-sm font-medium text-fg outline-none transition-colors hover:bg-white/20 focus-visible:ring-2 focus-visible:ring-ring"
                   >
                     继续编辑
                   </button>
@@ -1055,7 +1071,7 @@ export function ImageAnnotationEditor({
                       setConfirmClose(false)
                       onOpenChange(false)
                     }}
-                    className="min-h-10 flex-1 rounded-full bg-danger text-sm font-semibold text-danger-fg transition-opacity hover:opacity-90"
+                    className="oc-spring-press min-h-10 flex-1 rounded-full bg-danger text-sm font-semibold text-danger-fg outline-none transition-opacity hover:opacity-90 focus-visible:ring-2 focus-visible:ring-ring"
                   >
                     放弃
                   </button>

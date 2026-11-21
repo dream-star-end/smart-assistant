@@ -7,15 +7,7 @@ import { DialogFallback } from "./components/DialogFallback";
 import { useDraftSessionMaterialization } from "./hooks/useDraftSessionMaterialization";
 import { useDraftPreparation } from "./hooks/useDraftPreparation";
 import { createGoalStarter } from "./lib/goalStart";
-import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { appUpdate } from "./lib/appUpdate";
 import {
   type CursorContextTier,
@@ -48,7 +40,6 @@ import { EmptyState, greetingName } from "./components/EmptyState";
 import type { ChatError } from "./components/ErrorBanner";
 import { taskContinuationPrompt } from "./lib/chat/manualTaskContinuation";
 import { SessionTimelineBoundary } from "./components/SessionTimelineBoundary";
-import { AssistantMessage, UserMessage } from "./components/Message";
 import { sessionTitleFromText } from "./lib/sessionTitle";
 import { isDialogLayerOpen, resolveGlobalHotkey } from "./lib/hotkeys";
 import { pushPaletteRecent } from "./lib/paletteRecents";
@@ -204,7 +195,6 @@ import {
   type PrefsView,
   resolveSessionModel,
 } from "./lib/modelPreferences";
-import { DEMO_MESSAGES, DEMO_MESSAGES_BY_SESSION, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER } from "./lib/demo";
 import type { ChatProject, LockedPublicModel, Message, PublicConfig, PublicModel, Session, ToolCard } from "./lib/types";
 import type { LockedSelectInfo } from "./components/ModelSelector";
 import { lockedModelUnlockNotice } from "./lib/cursorModelPicker";
@@ -243,6 +233,22 @@ const EMPTY_WS_MESSAGES: ChatMessage[] = [];
 const EMPTY_CATALOG_MODELS: PublicModel[] = [];
 const EMPTY_LOCKED_CATALOG_MODELS: LockedPublicModel[] = [];
 
+// 仅 ?demo=1 时按需加载旧演示消息视图（components/Message.tsx），普通线上首屏零加载。
+const DemoMessageStream = lazy(() =>
+  import("./components/Message").then(({ AssistantMessage, UserMessage }) => ({
+    default: ({ messages, busy, streamText, toolCards, onRegenerate }: {
+      messages: Message[]; busy: boolean; streamText: string; toolCards: ToolCard[]; onRegenerate: () => void;
+    }) => (
+      <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8">
+        {messages.map((m, i) => m.role === "user"
+          ? <UserMessage key={m.id} content={m.content} />
+          : <AssistantMessage key={m.id} message={m} toolCards={[]} onRegenerate={i === messages.length - 1 && !busy ? onRegenerate : undefined} />)}
+        {busy && <AssistantMessage message={{ id: "streaming", role: "assistant", content: streamText, createdAt: new Date().toISOString() }} streaming toolCards={toolCards} />}
+      </div>
+    ),
+  })),
+);
+
 export function App() {
   const {
     urlRoute, params, demo, resetToken, desktopEnroll, studio, routingEnabled,
@@ -266,7 +272,8 @@ export function App() {
   const [publicCfgRetryNonce, setPublicCfgRetryNonce] = useState(0);
 
   // demo 展示消息（本地 fixture 流式回放用；非 demo 的消息权威在 WS service）。
-  const [messages, setMessages] = useState<Message[]>(demo ? DEMO_MESSAGES : []);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const demoModRef = useRef<typeof import("./lib/demo") | null>(null);
   const [busy, setBusy] = useState(false);
   const [streamText, setStreamText] = useState("");
   const [toolCards] = useState<ToolCard[]>([]);
@@ -283,10 +290,10 @@ export function App() {
   const [pickerOpen, setPickerOpen] = useState(false);
   // 对话模型/默认思考深度:模型能力来自 GET /api/public/models；用户默认来自
   // /api/me/preferences。两者同批 hydrate 后才决定初始值,避免迟到偏好覆盖人工选择。
-  const [catalogModels, setModels] = useState<PublicModel[]>(demo ? DEMO_MODELS : []);
+  const [catalogModels, setModels] = useState<PublicModel[]>([]);
   const [catalogLockedModels, setLockedModels] = useState<LockedPublicModel[]>([]);
   const [subscribeOpenSignal, setSubscribeOpenSignal] = useState(0);
-  const [modelId, setModelId] = useState<string | undefined>(demo ? DEMO_MODELS[0]?.id : undefined);
+  const [modelId, setModelId] = useState<string | undefined>(undefined);
   // 最近一次 preferences 快照(default_model 解析用):per-session 模型恢复的回落基准。
   // 写入点 = models 装载批 + SettingsCenter onPreferencesChange;下方 resolver effect 消费。
   const [modelPrefs, setModelPrefs] = useState<PrefsView>({});
@@ -504,7 +511,7 @@ export function App() {
   } = useAuth({
     demo,
     resetToken,
-    initialUser: demo ? DEMO_USER : null,
+    initialUser: demo ? { id: "demo", displayName: "rqmn", roles: ["user"] } : null,
     // auth 清空（静默刷新失败或主动登出）→ 清会话/消息/私有面板态,回首页。
     // help 是公开内容：若 URL 明确携带案例/功能深链，静默续期发现未登录时仍应保留。
     onClearAuth: () => {
@@ -568,6 +575,20 @@ export function App() {
       setMessages([]);
     },
   });
+
+  // 仅 ?demo=1 动态加载演示模型/初始消息，普通线上首屏不打进 lib/demo.ts。
+  useEffect(() => {
+    if (!demo) return;
+    let cancelled = false;
+    void import("./lib/demo").then((m) => {
+      if (cancelled) return;
+      demoModRef.current = m;
+      setModels((p) => (p.length ? p : m.DEMO_MODELS));
+      setModelId((p) => p ?? m.DEMO_MODELS[0]?.id);
+      setMessages((p) => (p.length ? p : (activeIdRef.current ? (m.DEMO_MESSAGES_BY_SESSION[activeIdRef.current] ?? []) : [])));
+    });
+    return () => { cancelled = true; };
+  }, [demo]);
 
   // AuthSession 整个生命周期是同一引用；token + epoch 在对象内部原子推进。
   // 经本地 useRef 再持有一次以保留 biome 的稳定 ref 推断 —— 直接使用 hook 返回的 ref 会在
@@ -670,10 +691,11 @@ export function App() {
     confirmDialog,
     promptText,
     clearChatError: () => setChatError(null),
-    // demo：切会话时换本地 fixture 消息。
-    // demo 会话按 id 取 fixture(misc-p3 D-02 接线):目前只有 s1 有消息,其余点开即空态;要给别的会话
-    // 补内容只需往 DEMO_MESSAGES_BY_SESSION 加 fixture 并同步 DEMO_SESSIONS 的 messageCount。
-    onDemoSelect: (id) => setMessages(DEMO_MESSAGES_BY_SESSION[id] ?? []),
+    // demo：切会话时换本地 fixture 消息（仅 ?demo=1 动态加载 lib/demo.ts）。
+    onDemoSelect: (id) => {
+      if (demoModRef.current) setMessages(demoModRef.current.DEMO_MESSAGES_BY_SESSION[id] ?? []);
+      else { setMessages([]); void import("./lib/demo").then((m) => { demoModRef.current = m; if (activeIdRef.current === id) setMessages(m.DEMO_MESSAGES_BY_SESSION[id] ?? []); }); }
+    },
     // 新建会话：停 demo 流式回放 + 清空展示消息 + 清错误（原 newSession 前置收尾）。
     onNewSessionReset: () => {
       interrupt();
@@ -2425,32 +2447,7 @@ export function App() {
               onOpenGoal={demo ? undefined : () => setGoalOpenNonce(Date.now())}
             />
           ) : demo ? (
-            <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8">
-              {messages.map((m, i) =>
-                m.role === "user" ? (
-                  <UserMessage key={m.id} content={m.content} />
-                ) : (
-                  <AssistantMessage
-                    key={m.id}
-                    message={m}
-                    toolCards={[]}
-                    onRegenerate={i === messages.length - 1 && !busy ? regenerate : undefined}
-                  />
-                ),
-              )}
-              {busy && (
-                <AssistantMessage
-                  message={{
-                    id: "streaming",
-                    role: "assistant",
-                    content: streamText,
-                    createdAt: new Date().toISOString(),
-                  }}
-                  streaming
-                  toolCards={toolCards}
-                />
-              )}
-            </div>
+            <Suspense fallback={null}><DemoMessageStream messages={messages} busy={busy} streamText={streamText} toolCards={toolCards} onRegenerate={regenerate} /></Suspense>
           ) : (
             // 非 demo：真实 WS 消息流 → P5 九类 Aurora 富卡（MessageList 按 role 分派、
             // 签名 memo 防闪；tool 委托 ToolCardSlot；权限审批经 onRespondPermission）。

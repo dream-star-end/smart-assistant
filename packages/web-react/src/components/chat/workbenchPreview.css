@@ -479,8 +479,16 @@
 
 @media (hover: none) {
   .wb-th-btn,
-  .wb-dir-row {
+  .wb-dir-row,
+  .wb-office-thumb,
+  .wb-office-qa-row,
+  .wb-slide-thumb {
     min-height: 2.75rem;
+  }
+  .wb-xlsx-sheet-tab,
+  .wb-xlsx-cell-btn,
+  .wb-xlsx-error-pill {
+    min-height: 2.5rem;
   }
 }
 

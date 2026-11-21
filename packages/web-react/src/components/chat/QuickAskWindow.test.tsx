@@ -848,4 +848,52 @@ describe("QuickAskWindow 并行问答与隔离行为", () => {
       expect(screen.getByText(/快问小窗暂不支持携带附件/)).toBeInTheDocument();
     });
   });
+
+  test("模型下拉清洗 (Antigravity) 冗余后缀并附家族图标，关联主线收敛为可展开单行胶囊(OCV5-838)", () => {
+    const { socket } = createConnectedSocket();
+    const auth = createMemoryAuthSession(() => {}, "tok");
+    const chat = (() => {
+      let bound!: UseChatSocket;
+      function Probe() {
+        bound = useBoundChatSocket(socket);
+        return (
+          <QuickAskWindow
+            open
+            onClose={vi.fn()}
+            seed={null}
+            chat={bound}
+            authRef={{ current: auth }}
+            user={USER}
+            demo={false}
+            agent={MAIN_AGENT}
+            models={[
+              { id: "claude-sonnet-4-6", display_name: "Claude Sonnet 4.6 (Antigravity)" },
+              { id: "gemini-3-pro", display_name: "Gemini 3 Pro (Antigravity)" },
+            ]}
+            mainlineSessionId="webmain-polish-1"
+            mainlineModelId="claude-sonnet-4-6"
+            mainlineTitle="重构鉴权"
+            mainlineGoalObjective="消除重复 refresh"
+            mainlineMessages={[{ id: "u1", role: "user", text: "如何排查 401", ts: 1 }]}
+            onPromoteSession={vi.fn()}
+          />
+        );
+      }
+      return Probe;
+    })();
+    const Probe = chat;
+    render(<Probe />);
+
+    // 触发钮清洗掉 (Antigravity) 且带模型家族图标
+    const trigger = screen.getByTestId("quick-ask-model-trigger");
+    expect(trigger).toHaveTextContent("Claude Sonnet 4.6");
+    expect(trigger).not.toHaveTextContent("Antigravity");
+    expect(trigger.querySelector("svg")).not.toBeNull();
+
+    // 关联主线摘要默认收起成单行胶囊，点击展开钮才展示预览行
+    expect(screen.getByTestId("quick-ask-context-hint")).toHaveTextContent("已关联主线：重构鉴权");
+    expect(screen.queryByTestId("quick-ask-context-preview")).toBeNull();
+    fireEvent.click(screen.getByTestId("quick-ask-context-expand"));
+    expect(screen.getByTestId("quick-ask-context-preview")).toHaveTextContent("目标：消除重复 refresh");
+  });
 });

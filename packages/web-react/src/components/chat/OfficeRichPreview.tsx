@@ -11,6 +11,7 @@
  *     + 点选单元格一键批注（{ kind: 'cell', sheet, ref }）
  *   - 任意错误、无预览或空内容时无缝回退原 BinaryOfficeCard，零白屏。
  */
+import * as RD from "@radix-ui/react-dialog";
 import {
   AlertTriangle,
   Calculator,
@@ -19,11 +20,14 @@ import {
   ChevronRight,
   FileSpreadsheet,
   FunctionSquare,
+  Maximize2,
   MessageSquarePlus,
   PencilLine,
   RefreshCw,
   ShieldAlert,
-  Sparkles,
+  X,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 import { type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -41,6 +45,7 @@ import {
 import type { AuthSession } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import { Badge, Button, IconButton, Skeleton, Spinner } from "../ui";
+import { AtelierIcon } from "../ui/AtelierIcons";
 import type { AnnotationAnchor } from "./deliverablePreview";
 
 export type OfficeRichPreviewProps = {
@@ -50,6 +55,13 @@ export type OfficeRichPreviewProps = {
   compact?: boolean;
   onAnnotate: (anchor: AnnotationAnchor, excerpt?: string) => void;
   fallback: ReactNode;
+  /** 原生高保真预览就绪态回调，供父容器合并重复顶栏。 */
+  onNativeReady?: (ready: boolean) => void;
+  /** 并入单行控制条右侧的文件溢出菜单。 */
+  fileOverflow?: ReactNode;
+  /** 整份文件批注切换（供 XLSX 单行顶栏复用）。 */
+  annotateOpen?: boolean;
+  onToggleFileAnnotate?: () => void;
 };
 
 /** 认证拉取单页预览图并管理 Blob URL 生命周期（组件卸载/切页自动 revoke，避免内存泄漏）。 */
@@ -98,6 +110,7 @@ function OfficePageThumb({
   issueCount,
   hasError,
   onSelect,
+  buttonRef,
 }: {
   auth: AuthSession;
   page: OfficePreviewPage;
@@ -105,15 +118,17 @@ function OfficePageThumb({
   issueCount: number;
   hasError: boolean;
   onSelect: () => void;
+  buttonRef?: (el: HTMLButtonElement | null) => void;
 }) {
   const { state } = useAuthenticatedPageImage(auth, page.pageUrl);
   return (
     <button
+      ref={buttonRef}
       type="button"
       onClick={onSelect}
       aria-current={active ? "true" : undefined}
       data-testid={`office-page-thumb-${page.index}`}
-      className="wb-office-thumb"
+      className="wb-office-thumb oc-spring-press"
     >
       <div className="wb-office-thumb-frame">
         {state.phase === "ready" ? (
@@ -156,6 +171,7 @@ function OfficePagesView({
   pages,
   qaIssues,
   compact,
+  fileOverflow,
   onAnnotate,
 }: {
   kind: "pptx" | "docx";
@@ -165,16 +181,38 @@ function OfficePagesView({
   pages: OfficePreviewPage[];
   qaIssues: OfficePreviewQaIssue[];
   compact: boolean;
+  fileOverflow?: ReactNode;
   onAnnotate: (anchor: AnnotationAnchor, excerpt?: string) => void;
 }) {
   const [pageIdx, setPageIdx] = useState(0);
   const [notesOpen, setNotesOpen] = useState(false);
   const [qaOpen, setQaOpen] = useState(false);
+  const [lightboxOpen, setLightboxOpen] = useState(false);
+  const [zoomed, setZoomed] = useState(false);
+  const thumbRefs = useRef(new Map<number, HTMLButtonElement>());
+  const didMountRef = useRef(false);
   const total = pages.length;
   const safeIdx = Math.max(0, Math.min(pageIdx, Math.max(0, total - 1)));
   const activePage = pages[safeIdx];
 
   const { state: mainImg, retry: retryMainImg } = useAuthenticatedPageImage(auth, activePage?.pageUrl);
+
+  // 切页时自动将当前缩略图平滑滚入视口（首次挂载跳过，避免越界滚动父容器）
+  useEffect(() => {
+    if (!didMountRef.current) {
+      didMountRef.current = true;
+      return;
+    }
+    thumbRefs.current.get(safeIdx)?.scrollIntoView?.({
+      behavior: "smooth",
+      block: "nearest",
+      inline: "center",
+    });
+  }, [safeIdx]);
+
+  useEffect(() => {
+    setZoomed(false);
+  }, [safeIdx, lightboxOpen]);
 
   const issuesByPage = useMemo(() => {
     const map = new Map<number, OfficePreviewQaIssue[]>();
@@ -192,6 +230,8 @@ function OfficePagesView({
   const totalErrors = qaIssues.filter((i) => i.severity === "error").length;
 
   const handleKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    const tag = (e.target as HTMLElement | null)?.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
     if (e.key === "ArrowLeft" && safeIdx > 0) {
       e.preventDefault();
       setPageIdx(safeIdx - 1);
@@ -205,20 +245,21 @@ function OfficePagesView({
 
   return (
     <div
-      className="wb-office-pages-shell"
+      tabIndex={0}
+      className="wb-office-pages-shell outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
       data-kind={kind}
       data-compact={compact ? "true" : undefined}
       data-testid="office-preview-pages"
       onKeyDown={handleKeyDown}
     >
-      {/* 顶部信息微条 */}
+      {/* 合并后的单行清爽控制条 */}
       <div className="wb-office-subbar">
         <div className="flex min-w-0 items-center gap-2">
-          <Badge tone="accent" size="sm">
-            <Sparkles size={10} aria-hidden />
+          <Badge tone="accent" size="sm" className="shrink-0">
+            <AtelierIcon name="sparkles" size={11} />
             {cached ? "零轮次缓存预览" : "原生保真预览"}
           </Badge>
-          <span className="text-caption tabular-nums text-muted" data-testid="office-page-counter">
+          <span className="shrink-0 text-caption tabular-nums text-muted" data-testid="office-page-counter">
             第 {activePage.index} / {total} 页
           </span>
         </div>
@@ -231,7 +272,7 @@ function OfficePagesView({
               aria-expanded={qaOpen}
               onClick={() => setQaOpen((v) => !v)}
               className={cn(
-                "inline-flex h-7 items-center gap-1 rounded-full px-2.5 text-caption font-medium transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                "oc-spring-press inline-flex h-7 items-center gap-1 rounded-full px-2.5 text-caption font-medium transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-10",
                 totalErrors > 0 ? "wb-office-qa-pill-error" : "bg-warning-soft text-warning",
               )}
             >
@@ -264,6 +305,7 @@ function OfficePagesView({
             size="sm"
             variant="accent"
             data-testid="office-annotate-page"
+            className="oc-spring-press [@media(hover:none)]:min-h-10"
             onClick={() =>
               onAnnotate(
                 { kind: "slide", page: activePage.index, title: `${name} 第 ${activePage.index} 页` },
@@ -274,6 +316,7 @@ function OfficePagesView({
             <PencilLine size={12} aria-hidden />
             批注此页
           </Button>
+          {fileOverflow}
         </div>
       </div>
 
@@ -315,20 +358,39 @@ function OfficePagesView({
                 issueCount={pIssues.length}
                 hasError={pIssues.some((i) => i.severity === "error")}
                 onSelect={() => setPageIdx(idx)}
+                buttonRef={(el) => {
+                  if (el) thumbRefs.current.set(idx, el);
+                  else thumbRefs.current.delete(idx);
+                }}
               />
             );
           })}
         </nav>
 
         <div className="wb-office-stage-col">
-          <div className="wb-office-stage" data-testid="office-preview-stage">
+          <div className="wb-office-stage group" data-testid="office-preview-stage">
             {mainImg.phase === "ready" ? (
-              <img
-                src={mainImg.url}
-                alt={`${name} 第 ${activePage.index} 页`}
-                data-testid="office-stage-image"
-                className="wb-office-stage-img"
-              />
+              <>
+                <img
+                  src={mainImg.url}
+                  alt={`${name} 第 ${activePage.index} 页`}
+                  data-testid="office-stage-image"
+                  onClick={() => setLightboxOpen(true)}
+                  title="点击全屏放大查看细节"
+                  className="wb-office-stage-img cursor-zoom-in"
+                />
+                <IconButton
+                  size="sm"
+                  shape="square"
+                  aria-label="全屏放大查看当前页"
+                  title="全屏放大查看"
+                  data-testid="office-stage-zoom-btn"
+                  onClick={() => setLightboxOpen(true)}
+                  className="oc-surface-glass oc-spring-press absolute right-2.5 top-2.5 opacity-80 transition-opacity hover:opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100"
+                >
+                  <Maximize2 size={13} />
+                </IconButton>
+              </>
             ) : mainImg.phase === "loading" ? (
               <div className="flex flex-col items-center gap-2 py-12 text-muted">
                 <Spinner size={18} />
@@ -377,6 +439,82 @@ function OfficePagesView({
           )}
         </div>
       </div>
+
+      {/* 全屏高清放大灯箱 */}
+      {lightboxOpen && mainImg.phase === "ready" && (
+        <RD.Root open onOpenChange={(o) => !o && setLightboxOpen(false)}>
+          <RD.Portal>
+            <RD.Overlay className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm data-[state=open]:oc-backdrop-in data-[state=closed]:oc-backdrop-out" />
+            <RD.Content
+              data-testid="office-stage-lightbox"
+              aria-describedby={undefined}
+              onKeyDown={handleKeyDown}
+              className="fixed inset-0 z-50 flex flex-col items-center justify-center p-4 pt-[calc(1rem+env(safe-area-inset-top,0px))] pb-[calc(1rem+env(safe-area-inset-bottom,0px))] outline-none"
+            >
+              <RD.Title className="sr-only">
+                {name} 第 {activePage.index} 页全屏预览
+              </RD.Title>
+              <div className="oc-surface-glass mb-3 flex items-center gap-1.5 rounded-full px-3 py-1.5 shadow-float">
+                <IconButton
+                  size="sm"
+                  shape="square"
+                  aria-label="上一页"
+                  disabled={safeIdx <= 0}
+                  onClick={() => setPageIdx((i) => Math.max(0, i - 1))}
+                >
+                  <ChevronLeft size={15} />
+                </IconButton>
+                <span className="px-1.5 text-caption font-semibold tabular-nums text-fg">
+                  第 {activePage.index} / {total} 页
+                </span>
+                <IconButton
+                  size="sm"
+                  shape="square"
+                  aria-label="下一页"
+                  disabled={safeIdx >= total - 1}
+                  onClick={() => setPageIdx((i) => Math.min(total - 1, i + 1))}
+                >
+                  <ChevronRight size={15} />
+                </IconButton>
+                <span aria-hidden className="mx-0.5 h-4 w-px bg-border" />
+                <IconButton
+                  size="sm"
+                  shape="square"
+                  aria-label={zoomed ? "还原适应屏幕" : "放大细节"}
+                  title={zoomed ? "还原 (100%)" : "放大 (175%)"}
+                  onClick={() => setZoomed((z) => !z)}
+                >
+                  {zoomed ? <ZoomOut size={15} /> : <ZoomIn size={15} />}
+                </IconButton>
+                <IconButton
+                  size="sm"
+                  shape="square"
+                  aria-label="关闭全屏预览"
+                  onClick={() => setLightboxOpen(false)}
+                >
+                  <X size={15} />
+                </IconButton>
+              </div>
+              <div
+                className="flex min-h-0 w-full flex-1 items-center justify-center overflow-auto"
+                onClick={(e) => {
+                  if (e.target === e.currentTarget) setLightboxOpen(false);
+                }}
+              >
+                <img
+                  src={mainImg.url}
+                  alt={`${name} 第 ${activePage.index} 页高清大图`}
+                  onClick={() => setZoomed((z) => !z)}
+                  className={cn(
+                    "rounded-xl object-contain shadow-float transition-transform duration-200",
+                    zoomed ? "max-w-none w-[min(1400px,160vw)] cursor-zoom-out" : "max-h-[82dvh] max-w-[94vw] cursor-zoom-in",
+                  )}
+                />
+              </div>
+            </RD.Content>
+          </RD.Portal>
+        </RD.Root>
+      )}
     </div>
   );
 }
@@ -397,11 +535,17 @@ function OfficeXlsxView({
   sheets,
   errorCells,
   cached,
+  fileOverflow,
+  annotateOpen,
+  onToggleFileAnnotate,
   onAnnotate,
 }: {
   sheets: OfficePreviewXlsxSheet[];
   errorCells: OfficePreviewXlsxErrorCell[];
   cached: boolean;
+  fileOverflow?: ReactNode;
+  annotateOpen?: boolean;
+  onToggleFileAnnotate?: () => void;
   onAnnotate: (anchor: AnnotationAnchor, excerpt?: string) => void;
 }) {
   const [sheetIdx, setSheetIdx] = useState(0);
@@ -465,7 +609,7 @@ function OfficeXlsxView({
                 data-testid={`office-xlsx-sheet-tab-${idx}`}
                 onClick={() => setSheetIdx(idx)}
                 className={cn(
-                  "inline-flex h-7 shrink-0 items-center gap-1.5 rounded-full border px-2.5 text-caption font-medium transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                  "wb-xlsx-sheet-tab oc-spring-press inline-flex h-7 shrink-0 items-center gap-1.5 rounded-full border px-2.5 text-caption font-medium transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring",
                   active
                     ? "border-accent bg-accent-soft text-accent"
                     : "border-transparent text-muted hover:bg-hover hover:text-fg",
@@ -523,6 +667,20 @@ function OfficeXlsxView({
               缓存
             </Badge>
           )}
+          {onToggleFileAnnotate && (
+            <Button
+              type="button"
+              size="sm"
+              variant={annotateOpen ? "accent" : "secondary"}
+              data-testid="deliverable-annotate-trigger"
+              onClick={onToggleFileAnnotate}
+              className="oc-spring-press h-7 gap-1 px-2 text-caption whitespace-nowrap [@media(hover:none)]:min-h-10"
+            >
+              <PencilLine size={12} aria-hidden />
+              批注修改
+            </Button>
+          )}
+          {fileOverflow}
         </div>
       </div>
 
@@ -673,12 +831,22 @@ export function OfficeRichPreview({
   compact = false,
   onAnnotate,
   fallback,
+  onNativeReady,
+  fileOverflow,
+  annotateOpen,
+  onToggleFileAnnotate,
 }: OfficeRichPreviewProps) {
   const [state, setState] = useState<
     | { phase: "loading" }
     | { phase: "ready"; payload: OfficePreviewPayload }
     | { phase: "fallback" }
   >({ phase: "loading" });
+
+  useEffect(() => {
+    onNativeReady?.(state.phase === "ready");
+  }, [state.phase, onNativeReady]);
+
+  useEffect(() => () => onNativeReady?.(false), [onNativeReady]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -730,6 +898,9 @@ export function OfficeRichPreview({
         sheets={state.payload.sheets}
         errorCells={state.payload.errorCells}
         cached={state.payload.cached}
+        fileOverflow={fileOverflow}
+        annotateOpen={annotateOpen}
+        onToggleFileAnnotate={onToggleFileAnnotate}
         onAnnotate={onAnnotate}
       />
     );
@@ -744,6 +915,7 @@ export function OfficeRichPreview({
       pages={state.payload.pages}
       qaIssues={state.payload.qaIssues}
       compact={compact}
+      fileOverflow={fileOverflow}
       onAnnotate={onAnnotate}
     />
   );

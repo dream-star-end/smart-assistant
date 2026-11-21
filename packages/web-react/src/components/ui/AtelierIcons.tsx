@@ -9,7 +9,10 @@ export type AtelierIconName =
   | "workbench"
   | "skills"
   | "newChat"
-  | "sparkles";
+  | "sparkles"
+  | "agent"
+  | "terminal"
+  | "shield";
 
 /**
  * 现代双色调几何 SVG 数据规格（24×24 光学网格，零硬编码色，全部走 currentColor + fillOpacity）：
@@ -72,6 +75,27 @@ const ATELIER_SPECS: Record<AtelierIconName, IconSpec> = {
     o: [["M10.5 3.6c.6 3.7 2.4 5.5 6.1 6.1-3.7.6-5.5 2.4-6.1 6.1-.6-3.7-2.4-5.5-6.1-6.1 3.7-.6 5.5-2.4 6.1-6.1Z", 0.2]],
     f: [["M17.6 14.4c.3 1.7 1.1 2.5 2.8 2.8-1.7.3-2.5 1.1-2.8 2.8-.3-1.7-1.1-2.5-2.8-2.8 1.7-.3 2.5-1.1 2.8-2.8Z", 1]],
   },
+  agent: {
+    r: [[4, 6.5, 16, 13, 4.5, 0.14]],
+    so: "M2.4 11.8v2.4M21.6 11.8v2.4",
+    s: "M12 4.3v2.2M9.6 16h4.8",
+    c: [[12, 3.2, 1.1], [9.2, 12.2, 1.25], [14.8, 12.2, 1.25]],
+  },
+  terminal: {
+    r: [[3.5, 4.5, 17, 15, 3.8, 0.13]],
+    s: "M7.8 9.5l2.8 2.5-2.8 2.5M12.4 14.5h3.8",
+  },
+  shield: {
+    o: [["M12 3.2l7.4 2.9v5.3c0 4.7-3.1 8.2-7.4 9.5-4.3-1.3-7.4-4.8-7.4-9.5V6.1Z", 0.12]],
+    f: [["M12 6.1l4.8 1.9v3.4c0 3.1-2 5.4-4.8 6.3-2.8-.9-4.8-3.2-4.8-6.3V8Z", 0.14]],
+    s: "M9.2 12.1l1.9 1.9 3.8-4",
+  },
+};
+
+export const ATELIER_SHARED_SPECS: Pick<Record<AtelierIconName, IconSpec>, "agent" | "terminal" | "shield"> = {
+  agent: ATELIER_SPECS.agent,
+  terminal: ATELIER_SPECS.terminal,
+  shield: ATELIER_SPECS.shield,
 };
 
 export function RenderIconSpec({

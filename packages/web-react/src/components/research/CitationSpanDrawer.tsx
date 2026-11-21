@@ -23,6 +23,7 @@ import {
   X,
 } from "lucide-react";
 import { useEffect, useState } from "react";
+import { useNarrowViewport } from "../../hooks/useMdViewport";
 import { useOptionalAuth } from "../../hooks/useProjectScope";
 import { type LocatedSpan, type SpanPageSource, fetchResearchSpan } from "../../lib/api/wave4Api";
 import type { AuthSession } from "../../lib/types";
@@ -66,6 +67,7 @@ export function CitationSpanDrawer({
   const ctxAuth = useOptionalAuth();
   const auth = authProp !== undefined ? authProp : ctxAuth;
   const toast = useToast();
+  const narrow = useNarrowViewport();
 
   const [activeSpanId, setActiveSpanId] = useState<string | null>(spanId);
   const [attempt, setAttempt] = useState(0);
@@ -141,17 +143,24 @@ export function CitationSpanDrawer({
   return (
     <RD.Root open={open} onOpenChange={onOpenChange}>
       <RD.Portal>
-        <RD.Overlay className="fixed inset-0 z-50 bg-black/35 backdrop-blur-sm data-[state=open]:animate-fade" />
+        <RD.Overlay className="fixed inset-0 z-50 bg-black/35 backdrop-blur-sm data-[state=open]:oc-backdrop-in data-[state=closed]:oc-backdrop-out" />
         <RD.Content
           data-testid="citation-span-drawer"
           aria-describedby={undefined}
           className={cn(
-            "oc-surface-popover fixed inset-y-0 right-0 z-50 flex w-full max-w-lg flex-col border-l border-border bg-surface text-fg shadow-float outline-none",
-            "pb-[env(safe-area-inset-bottom)] data-[state=open]:animate-in",
+            "oc-surface-popover fixed inset-x-0 bottom-0 top-auto z-50 flex h-[90dvh] max-h-[90dvh] w-full flex-col overflow-hidden rounded-t-2xl border-t border-border bg-surface text-fg shadow-float outline-none",
+            "pt-[env(safe-area-inset-top,0px)] pb-[env(safe-area-inset-bottom,0px)]",
+            "sm:inset-y-0 sm:left-auto sm:right-0 sm:top-0 sm:h-full sm:max-h-none sm:w-full sm:max-w-lg sm:rounded-none sm:border-l sm:border-t-0",
+            narrow ? "oc-sheet-in-bottom" : "oc-sheet-in-right",
           )}
         >
           {/* 顶部装饰线 */}
           <div aria-hidden className="h-0.5 w-full shrink-0 bg-grad-cta" />
+
+          {/* 移动端底部抽屉拖拽微条 */}
+          <div aria-hidden className="flex justify-center bg-surface pt-2 pb-0.5 sm:hidden">
+            <span className="h-1 w-9 rounded-full bg-border-strong/70" />
+          </div>
 
           {/* Header */}
           <div className="flex items-start gap-3 border-b border-border px-4 py-3.5">
@@ -344,7 +353,7 @@ export function CitationSpanDrawer({
                       onClick={() => void copyQuote(located.quote)}
                       className="h-7 px-2 text-caption"
                     >
-                      {copied ? <Check size={12} className="text-success" /> : <Copy size={12} />}
+                      {copied ? <Check size={12} className="oc-check-pop text-success" /> : <Copy size={12} />}
                       {copied ? "已复制" : "复制原文"}
                     </Button>
                   </div>
@@ -382,6 +391,7 @@ export function CitationSpanDrawer({
                 disabled={!prevSpanId}
                 data-testid="citation-span-prev"
                 onClick={() => prevSpanId && navigateTo(prevSpanId)}
+                className="oc-spring-press [@media(hover:none)]:min-h-11"
               >
                 <ChevronLeft size={14} aria-hidden />
                 上一段
@@ -396,6 +406,7 @@ export function CitationSpanDrawer({
                 disabled={!nextSpanId}
                 data-testid="citation-span-next"
                 onClick={() => nextSpanId && navigateTo(nextSpanId)}
+                className="oc-spring-press [@media(hover:none)]:min-h-11"
               >
                 下一段
                 <ChevronRight size={14} aria-hidden />

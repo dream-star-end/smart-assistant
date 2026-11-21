@@ -1,5 +1,5 @@
 import type { SwarmSnapshot } from "@openclaude/protocol/browser";
-import { ArrowUpRight, Bot, ChevronDown, ChevronUp, ListChecks, Target } from "lucide-react";
+import { ArrowUpRight, ChevronDown, ChevronUp, ListChecks, Target } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { isTerminalDelegateState, type InflightDelegateItem } from "../../lib/chat/inflightDelegates";
 import type { ChatMessage, LiveTurnTokenUsageSnapshot } from "../../lib/chat/model";
@@ -175,8 +175,7 @@ export default function LiveAgentCapsule({
     timer = formatDurationSeconds(goalMessage.timeUsedSeconds);
   }
 
-  const SecondaryIcon =
-    primaryKind === "delegate" ? Bot : primaryKind === "task" ? ListChecks : Target;
+  const SecondaryIcon = primaryKind === "task" ? ListChecks : Target;
 
   return (
     <div data-testid="pinned-hud-stack">
@@ -245,6 +244,8 @@ export default function LiveAgentCapsule({
             >
               {primaryKind === "swarm" ? (
                 <AtelierIcon name="swarm" size={12} className="oc-live-capsule-icon" />
+              ) : primaryKind === "delegate" ? (
+                <AtelierIcon name="agent" size={12} className="oc-live-capsule-icon" />
               ) : (
                 <SecondaryIcon size={11} strokeWidth={1.85} aria-hidden className="oc-live-capsule-icon" />
               )}

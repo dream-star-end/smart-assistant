@@ -156,7 +156,7 @@ export function BrowserStepCard({ step, tool }: { step: BrowserStep; tool: ToolL
             {step.error.slice(0, 240)}
           </p>
         )}
-        {step.running && <p className="animate-pulse px-1 text-meta text-faint">正在操作浏览器…</p>}
+        {step.running && <p className="oc-live-status-shine px-1 text-meta text-faint">正在操作浏览器…</p>}
       </div>
       {shot && (
         <div className="oc-surface-recessed rounded-none border-0 border-t border-border/75 p-2.5">

@@ -6,7 +6,7 @@ import { cn } from "../../lib/utils";
 const DOT_CLASS: Record<RepoDot, string> = {
   none: "bg-transparent",
   pending: "bg-warning",
-  cloning: "bg-warning animate-pulse",
+  cloning: "oc-alive-dot",
   ready: "bg-success",
   failed: "bg-danger",
 };
@@ -60,7 +60,7 @@ export function RepoPill({
       aria-label={sel ? `代码仓库 ${sel.owner}/${sel.repo}，点击管理` : "关联 GitHub 仓库"}
       title={sel ? `${sel.owner}/${sel.repo} @ ${sel.branch}` : "关联 GitHub 仓库"}
       className={cn(
-        "oc-btn-tactile inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full border font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg",
+        "oc-btn-tactile oc-spring-press inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full border font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:min-h-10",
         compact ? "px-2.5 py-0.5 text-caption" : "px-3 py-1 text-meta",
         sel
           ? "oc-badge-craft border-accent/35 bg-accent-soft text-accent hover:border-accent/55"
@@ -83,7 +83,10 @@ export function RepoPill({
             {sel.branch}
           </span>
           {statusText ? (
-            <span className="shrink-0 text-caption text-muted">· {statusText}</span>
+            <span className="inline-flex shrink-0 items-center gap-1 text-caption text-muted">
+              {dot === "cloning" && <span aria-hidden className="oc-alive-dot size-1.5 shrink-0" />}
+              <span>· {statusText}</span>
+            </span>
           ) : (
             dot !== "none" && (
               <span className={cn("size-1.5 shrink-0 rounded-full", DOT_CLASS[dot])} />

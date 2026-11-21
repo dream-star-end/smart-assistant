@@ -13,12 +13,12 @@ import {
   BookMarked,
   BookOpen,
   CheckCircle2,
+  ChevronRight,
   CopyCheck,
   FileUp,
   RefreshCw,
   Search,
   ShieldCheck,
-  Sparkles,
   Trash2,
 } from "lucide-react";
 import { type ChangeEvent, Component, type ReactNode, Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -44,6 +44,7 @@ import {
   useConfirm,
   useToast,
 } from "../ui";
+import { AtelierIcon } from "../ui/AtelierIcons";
 
 function createLazyCitationSpanDrawer() {
   return lazy(() =>
@@ -289,7 +290,7 @@ export function ProjectResearchTab({
             data-testid="research-import-submit"
             onClick={() => void handleBatchImport()}
           >
-            {importing ? <Spinner size={12} /> : <Sparkles size={13} aria-hidden />}
+            {importing ? <Spinner size={12} /> : <AtelierIcon name="sparkles" size={13} />}
             {importing ? "解析入库中…" : "批量解析并入库"}
           </Button>
         </div>
@@ -335,7 +336,7 @@ export function ProjectResearchTab({
                       {item.fulltextVerified || item.verified ? (
                         <Badge tone="success" size="sm" data-testid="import-verified-badge">
                           <ShieldCheck size={10} aria-hidden />
-                          verifiedSource
+                          权威源已验
                         </Badge>
                       ) : item.bibliographicResolved ? (
                         <Badge tone="warning" size="sm">
@@ -389,8 +390,8 @@ export function ProjectResearchTab({
               {docs.length} 篇
             </Badge>
           </div>
-          <div className="flex items-center gap-1.5">
-            <label className="relative flex items-center">
+          <div className="flex w-full items-center gap-1.5 sm:w-auto">
+            <label className="relative flex min-w-0 flex-1 items-center sm:flex-initial">
               <Search size={13} aria-hidden className="pointer-events-none absolute left-2.5 text-faint" />
               <input
                 type="search"
@@ -398,7 +399,7 @@ export function ProjectResearchTab({
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="筛选标题或 docId…"
                 aria-label="筛选文献库"
-                className="oc-field-control h-8 w-44 rounded-lg border border-border-control bg-surface pl-8 pr-2.5 text-base text-fg outline-none placeholder:text-faint focus:border-accent sm:w-56 md:text-sm"
+                className="oc-field-control h-8 w-full flex-1 rounded-lg border border-border-control bg-surface pl-8 pr-2.5 text-base text-fg outline-none placeholder:text-faint focus:border-accent sm:w-56 md:text-sm"
               />
             </label>
             <IconButton
@@ -476,10 +477,12 @@ export function ProjectResearchTab({
                     size="sm"
                     variant="ghost"
                     onClick={() => setSpanTarget({ docId: doc.docId, spanId: "s0", title: doc.title })}
+                    className="oc-spring-press hidden sm:inline-flex"
                   >
                     <BookOpen size={12} aria-hidden />
                     溯源
                   </Button>
+                  <ChevronRight size={15} aria-hidden className="shrink-0 text-faint sm:hidden" />
                   <IconButton
                     size="sm"
                     shape="square"
@@ -487,6 +490,7 @@ export function ProjectResearchTab({
                     title="删除"
                     disabled={deletingId === doc.docId}
                     onClick={() => void handleDeleteDoc(doc)}
+                    className="oc-spring-press"
                   >
                     {deletingId === doc.docId ? <Spinner size={12} /> : <Trash2 size={14} />}
                   </IconButton>

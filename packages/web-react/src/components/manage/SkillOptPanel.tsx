@@ -806,7 +806,7 @@ function PhaseSteps({ phase }: { phase: string }) {
           className={cn(
             "h-1.5 rounded-full transition-all duration-200",
             idx >= 0 && i < idx && "w-2.5 bg-accent",
-            idx >= 0 && i === idx && "w-4 animate-pulse bg-accent",
+            idx >= 0 && i === idx && "oc-alive-dot w-4 bg-accent",
             (idx < 0 || i > idx) && "w-1.5 bg-border-strong",
           )}
         />

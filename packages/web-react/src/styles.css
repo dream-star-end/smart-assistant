@@ -38,6 +38,8 @@
   --color-danger-fg: var(--danger-fg);
   --color-success: var(--success);
   --color-success-soft: var(--success-soft);
+  /* 压在 bg-success 填充块上的前景（iui/状态按钮等）。暗色 --success(#42c282) 配白字仅 ~2.3:1，配深底 #141416 达 8.4:1（OCV5-838）。 */
+  --color-success-fg: var(--success-fg);
   --color-warning: var(--warning);
   --color-warning-soft: var(--warning-soft);
   /* 压在 bg-warning / bg-status-attention 填充块上的前景（如 StatusPill 问号圆点）。
@@ -164,6 +166,7 @@
   --danger-fg: #ffffff;
   --success: #156e42;
   --success-soft: #156e4214;
+  --success-fg: #ffffff;
   --warning: #875310;
   --warning-soft: #87531014;
   --warning-fg: #ffffff;
@@ -193,7 +196,7 @@
   color-scheme: dark;
   --bg: #141416;
   --surface: #1b1b1f;
-  --sidebar: #1b1b1f;
+  --sidebar: #17171a;
   --sidebar-active: #f2f0ec12;
   --sidebar-active-shadow: inset 0 0 0 1px #f2f0ec0c;
   --sidebar-btn-shadow: inset 0 1px 0 #f2f0ec0f;
@@ -223,6 +226,7 @@
   --danger-fg: #141416;
   --success: #42c282;
   --success-soft: #42c2821f;
+  --success-fg: #141416;
   --warning: #e2a33e;
   --warning-soft: #e2a33e1f;
   --warning-fg: #141416;
@@ -953,6 +957,31 @@ body {
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25);
   }
 
+  /* 不确定进度条：横向丝滑暖陶土流光条，取代僵硬 animate-pulse（reduced-motion 下静态居中显示） */
+  .oc-indeterminate-bar {
+    position: relative;
+    overflow: hidden;
+    background-color: color-mix(in srgb, var(--accent) 16%, transparent);
+  }
+  .oc-indeterminate-bar::after {
+    content: "";
+    position: absolute;
+    inset-block: 0;
+    left: 0;
+    width: 42%;
+    border-radius: inherit;
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      color-mix(in srgb, var(--accent) 85%, transparent) 30%,
+      var(--accent) 55%,
+      color-mix(in srgb, var(--accent) 85%, transparent) 78%,
+      transparent 100%
+    );
+    transform: translateX(68%);
+    pointer-events: none;
+  }
+
   /* Toast 精致层叠卡 */
   .oc-toast-card {
     box-shadow:
@@ -1094,6 +1123,10 @@ body {
     }
     .oc-shimmer-sheen[data-active="true"]::after,
     .oc-shimmer-sheen[aria-pressed="true"]::after { animation: oc-sheen-sweep 1.2s var(--ease-emphasized-decel) 1; }
+    .oc-indeterminate-bar::after {
+      transform: translateX(-105%);
+      animation: oc-indeterminate-slide 1.45s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+    }
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -1179,7 +1212,6 @@ body {
   .oc-toast-error { background-color: var(--elevated); background-image: linear-gradient(var(--danger-soft), var(--danger-soft)); }
   .oc-toast-info { background-color: var(--elevated); background-image: linear-gradient(var(--info-soft), var(--info-soft)); }
   .animate-in { animation: fade-up 0.32s cubic-bezier(0.22, 1, 0.36, 1); }
-  .animate-pop { animation: oc-pop-in 0.14s var(--ease-spring) both; }
   .oc-sheet-in-left { animation: oc-sheet-in-left 220ms var(--ease-emphasized-decel) both; }
   .oc-sheet-out-left { animation: oc-sheet-out-left 180ms var(--ease-emphasized-accel) both; }
   .oc-sheet-in-right { animation: oc-sheet-in-right 220ms var(--ease-emphasized-decel) both; }
@@ -1197,6 +1229,48 @@ body {
   .bg-grad-cta { background-image: var(--grad-cta); }
 }
 
+/* Tailwind v4 @utility：支持 data-[state=open/closed]: 等变体前缀，且全部动画严格包在 prefers-reduced-motion: no-preference 内（OCV5-838）。 */
+@utility animate-pop {
+  @media (prefers-reduced-motion: no-preference) {
+    animation: oc-pop-in 0.14s var(--ease-spring) both;
+  }
+}
+@utility oc-dialog-in {
+  @media (prefers-reduced-motion: no-preference) {
+    animation: oc-dialog-in 210ms var(--ease-spring) both;
+  }
+}
+@utility oc-dialog-out {
+  @media (prefers-reduced-motion: no-preference) {
+    animation: oc-dialog-out 150ms var(--ease-emphasized-accel) both;
+  }
+}
+@utility oc-backdrop-in {
+  @media (prefers-reduced-motion: no-preference) {
+    animation: fade-in 180ms var(--ease-standard) both;
+  }
+}
+@utility oc-backdrop-out {
+  @media (prefers-reduced-motion: no-preference) {
+    animation: oc-fade-out 150ms var(--ease-standard) both;
+  }
+}
+@utility oc-pop-out {
+  @media (prefers-reduced-motion: no-preference) {
+    animation: oc-pop-out 120ms var(--ease-emphasized-accel) both;
+  }
+}
+@utility oc-check-pop {
+  @media (prefers-reduced-motion: no-preference) {
+    animation: oc-check-pop 220ms var(--ease-spring) both;
+  }
+}
+@utility oc-toast-out {
+  @media (prefers-reduced-motion: no-preference) {
+    animation: oc-toast-out 160ms var(--ease-emphasized-accel) both;
+  }
+}
+
 @keyframes fade-up { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 @keyframes oc-pop-in { from { opacity: 0; transform: scale(0.97) translateY(-4px); } to { opacity: 1; transform: none; } }
 @keyframes oc-sheet-in-left { from { transform: translateX(-100%); } to { transform: translateX(0); } }
@@ -1207,8 +1281,53 @@ body {
 @keyframes oc-sheet-out-bottom { from { transform: translateY(0); } to { transform: translateY(100%); } }
 @keyframes bar-grow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
-@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
-.caret-blink { animation: blink 1s step-end infinite; }
+/* 流式暖陶土呼吸光标：告别 step-end 硬闪，reduced-motion 下静态柔光显示（OCV5-838）。 */
+.caret-blink {
+  box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .caret-blink { animation: oc-caret-breathe 1.15s ease-in-out infinite; }
+  @keyframes oc-caret-breathe {
+    0%, 100% {
+      opacity: 1;
+      box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 45%, transparent);
+    }
+    50% {
+      opacity: 0.24;
+      box-shadow: 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
+    }
+  }
+  @keyframes oc-dialog-in {
+    from { opacity: 0; transform: scale(0.965) translateY(4px); }
+    to { opacity: 1; transform: none; }
+  }
+  @keyframes oc-dialog-out {
+    from { opacity: 1; transform: none; }
+    to { opacity: 0; transform: scale(0.965) translateY(2px); }
+  }
+  @keyframes oc-fade-out {
+    from { opacity: 1; }
+    to { opacity: 0; }
+  }
+  @keyframes oc-pop-out {
+    from { opacity: 1; transform: none; }
+    to { opacity: 0; transform: scale(0.96) translateY(-2px); }
+  }
+  @keyframes oc-check-pop {
+    0% { opacity: 0.4; transform: scale(0.55) rotate(-18deg); }
+    65% { opacity: 1; transform: scale(1.08) rotate(3deg); }
+    100% { opacity: 1; transform: scale(1) rotate(0deg); }
+  }
+  @keyframes oc-toast-out {
+    from { opacity: 1; transform: translateY(0) scale(1); }
+    to { opacity: 0; transform: translateY(-6px) scale(0.97); }
+  }
+  @keyframes oc-indeterminate-slide {
+    0% { transform: translateX(-105%) scaleX(0.85); }
+    50% { transform: translateX(75%) scaleX(1.15); }
+    100% { transform: translateX(250%) scaleX(0.85); }
+  }
+}
 @keyframes spin { to { transform: rotate(360deg); } }
 .spin { animation: spin 0.9s linear infinite; }
 

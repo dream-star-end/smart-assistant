@@ -5,8 +5,8 @@
  *   - imageGeneration:status==='failed' 显式「生成失败」,绝不「图片已生成」。
  */
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, test } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { MediaSignProvider } from "../chat/media";
 import { ToolBody } from "./bodies";
 import type { ToolLike } from "./format";
@@ -223,5 +223,38 @@ describe("TaskBody 隐藏内部指令", () => {
     );
     expect(screen.getByText("结论:根因在 reducer")).toBeInTheDocument();
     expect(screen.queryByText("调研登录流程")).not.toBeInTheDocument();
+  });
+});
+
+describe("OCV5-838 Edit Diff 词级高亮 / sticky +/- / 折行与复制新代码", () => {
+  test("高亮改动片段，提供 sticky +/- 符号列、自动折行开关与复制新代码按钮", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    render(
+      <ToolBody
+        name="Edit"
+        input={{
+          file_path: "src/app.ts",
+          old_string: "const mode = 'legacy';",
+          new_string: "const mode = 'atelier';",
+        }}
+        tool={tool({ output: "The file has been updated." })}
+      />,
+    );
+    const marks = document.querySelectorAll('mark[data-diff-inline-change="true"]');
+    expect(Array.from(marks).map((m) => m.textContent)).toEqual(["legacy", "atelier"]);
+    // 移动端 sticky +/- 符号列
+    const signCells = Array.from(document.querySelectorAll("span.sticky.left-0")).map((el) => el.textContent);
+    expect(signCells).toEqual(["-", "+"]);
+
+    const wrapBtn = screen.getByRole("button", { name: "自动折行" });
+    expect(wrapBtn).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(wrapBtn);
+    expect(wrapBtn).toHaveAttribute("aria-pressed", "true");
+
+    const copyBtn = screen.getByRole("button", { name: "复制新代码" });
+    fireEvent.click(copyBtn);
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("const mode = 'atelier';"));
+    expect(copyBtn.querySelector("svg")).toHaveClass("oc-check-pop");
   });
 });

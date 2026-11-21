@@ -177,94 +177,96 @@ export function WorkbenchBottomBar({
 }: WorkbenchBottomBarProps) {
   return (
     <div className={cn("wb-bottom-bar", className)} data-testid="workbench-bottom-bar">
-      {slide && (
-        <div className="oc-surface-recessed flex shrink-0 items-center gap-0.5 rounded-lg p-0.5">
-          <IconButton
+      <div className="no-scrollbar flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto">
+        {slide && (
+          <div className="oc-surface-recessed flex shrink-0 items-center gap-0.5 rounded-lg p-0.5">
+            <IconButton
+              size="sm"
+              shape="square"
+              aria-label="上一页"
+              title="上一页 (←)"
+              disabled={slide.page <= 1}
+              onClick={slide.onPrev}
+            >
+              <ChevronLeft size={15} />
+            </IconButton>
+            <span
+              className="px-2 text-caption font-semibold tabular-nums text-fg whitespace-nowrap"
+              data-testid="slide-counter"
+            >
+              <span className="sr-only sm:not-sr-only">第 </span>
+              {slide.page} / {slide.total}
+              <span className="sr-only sm:not-sr-only"> 页</span>
+            </span>
+            <IconButton
+              size="sm"
+              shape="square"
+              aria-label="下一页"
+              title="下一页 (→)"
+              disabled={slide.page >= slide.total}
+              onClick={slide.onNext}
+            >
+              <ChevronRight size={15} />
+            </IconButton>
+          </div>
+        )}
+
+        {outline && (
+          <Button
+            type="button"
             size="sm"
-            shape="square"
-            aria-label="上一页"
-            title="上一页 (←)"
-            disabled={slide.page <= 1}
-            onClick={slide.onPrev}
+            variant={outline.open ? "secondary" : "ghost"}
+            aria-expanded={outline.open}
+            onClick={outline.onToggle}
+            data-testid="doc-outline-toggle"
+            className="oc-spring-press h-8 shrink-0 px-2 text-meta whitespace-nowrap [@media(hover:none)]:min-h-10"
           >
-            <ChevronLeft size={15} />
-          </IconButton>
-          <span
-            className="px-2 text-caption font-semibold tabular-nums text-fg whitespace-nowrap"
-            data-testid="slide-counter"
-          >
-            <span className="sr-only sm:not-sr-only">第 </span>
-            {slide.page} / {slide.total}
-            <span className="sr-only sm:not-sr-only"> 页</span>
-          </span>
-          <IconButton
+            <ListTree size={13} aria-hidden />
+            <span>目录</span>
+            <span className="tabular-nums text-faint">({outline.count})</span>
+          </Button>
+        )}
+
+        {modeToggle && (
+          <Button
+            type="button"
             size="sm"
-            shape="square"
-            aria-label="下一页"
-            title="下一页 (→)"
-            disabled={slide.page >= slide.total}
-            onClick={slide.onNext}
+            variant="ghost"
+            onClick={modeToggle.onClick}
+            data-testid={modeToggle.testId}
+            className="oc-spring-press h-8 shrink-0 px-2 text-meta whitespace-nowrap [@media(hover:none)]:min-h-10"
           >
-            <ChevronRight size={15} />
-          </IconButton>
-        </div>
-      )}
+            {modeToggle.icon === "doc" ? (
+              <BookOpen size={13} aria-hidden />
+            ) : (
+              <Presentation size={13} aria-hidden />
+            )}
+            <span>{modeToggle.label}</span>
+          </Button>
+        )}
 
-      {outline && (
-        <Button
-          type="button"
-          size="sm"
-          variant={outline.open ? "secondary" : "ghost"}
-          aria-expanded={outline.open}
-          onClick={outline.onToggle}
-          data-testid="doc-outline-toggle"
-          className="h-8 shrink-0 px-2 text-meta whitespace-nowrap"
-        >
-          <ListTree size={13} aria-hidden />
-          <span>目录</span>
-          <span className="tabular-nums text-faint">({outline.count})</span>
-        </Button>
-      )}
+        {leading}
+      </div>
 
-      {modeToggle && (
-        <Button
-          type="button"
-          size="sm"
-          variant="ghost"
-          onClick={modeToggle.onClick}
-          data-testid={modeToggle.testId}
-          className="h-8 shrink-0 px-2 text-meta whitespace-nowrap"
-        >
-          {modeToggle.icon === "doc" ? (
-            <BookOpen size={13} aria-hidden />
-          ) : (
-            <Presentation size={13} aria-hidden />
-          )}
-          <span>{modeToggle.label}</span>
-        </Button>
-      )}
+      <div className="flex shrink-0 items-center gap-1.5">
+        {trailing}
 
-      {leading}
-
-      <span className="min-w-1 flex-1" />
-
-      {trailing}
-
-      {annotate && (
-        <Button
-          type="button"
-          size="sm"
-          variant={annotate.active ? "accent" : "secondary"}
-          aria-label={annotate.ariaLabel}
-          disabled={annotate.disabled}
-          onClick={annotate.onClick}
-          data-testid={annotate.testId ?? "deliverable-annotate-trigger"}
-          className="h-8 shrink-0 gap-1.5 px-2.5 text-meta font-medium whitespace-nowrap"
-        >
-          <PencilLine size={13} aria-hidden />
-          <span>{annotate.label ?? "批注修改"}</span>
-        </Button>
-      )}
+        {annotate && (
+          <Button
+            type="button"
+            size="sm"
+            variant={annotate.active ? "accent" : "secondary"}
+            aria-label={annotate.ariaLabel}
+            disabled={annotate.disabled}
+            onClick={annotate.onClick}
+            data-testid={annotate.testId ?? "deliverable-annotate-trigger"}
+            className="oc-spring-press h-8 shrink-0 gap-1.5 px-2.5 text-meta font-medium whitespace-nowrap [@media(hover:none)]:min-h-11"
+          >
+            <PencilLine size={13} aria-hidden />
+            <span>{annotate.label ?? "批注修改"}</span>
+          </Button>
+        )}
+      </div>
     </div>
   );
 }
@@ -358,13 +360,13 @@ export function AnnotationComposer({
         className="wb-annotate-input text-base md:text-sm"
       />
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="inline-flex items-center gap-1 text-caption text-faint">
+        <span className="hidden items-center gap-1 text-caption text-faint sm:inline-flex">
           <kbd className="oc-kbd">⌘ / Ctrl</kbd>
           <span>+</span>
           <kbd className="oc-kbd">Enter</kbd>
           <span>快捷提交</span>
         </span>
-        <div className="flex items-center gap-2">
+        <div className="ml-auto flex items-center gap-2 sm:ml-0">
           <Button type="button" size="sm" variant="ghost" onClick={onClose}>
             取消
           </Button>

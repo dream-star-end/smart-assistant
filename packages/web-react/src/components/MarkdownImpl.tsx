@@ -253,10 +253,11 @@ const CARET_CLASS = [
   "caret-blink",
   "ml-0.5",
   "inline-block",
-  "h-[1.1em]",
-  "w-[2px]",
-  "translate-y-[3px]",
-  "bg-current",
+  "h-[1.05em]",
+  "w-[3px]",
+  "translate-y-[2.5px]",
+  "rounded-full",
+  "bg-accent",
   "align-baseline",
 ];
 const CARET_INLINE_HOSTS = new Set(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "td", "th"]);

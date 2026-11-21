@@ -23,7 +23,8 @@ describe("HeaderCountBadge（OCV5-820 6px 克制状态点）", () => {
     expect(accentDot).toHaveTextContent("");
     expect(accentDot).toHaveAttribute("aria-label", "120 条未读会话");
     expect(accentDot).toHaveAttribute("data-unread-count", "120");
-    expect(accentDot).toHaveClass("size-1.5", "rounded-full", "bg-accent", "motion-safe:animate-pulse");
+    expect(accentDot).toHaveClass("size-1.5", "rounded-full", "bg-accent", "oc-alive-dot");
+    expect(accentDot).not.toHaveClass("motion-safe:animate-pulse");
 
     rerender(
       <HeaderCountBadge count={40} testId="dot" tone="danger" ariaLabel="40 条未读站内信" />,
@@ -32,7 +33,7 @@ describe("HeaderCountBadge（OCV5-820 6px 克制状态点）", () => {
     expect(dangerDot).toHaveTextContent("");
     expect(dangerDot).toHaveAttribute("data-unread-count", "40");
     expect(dangerDot).toHaveClass("size-1.5", "rounded-full", "bg-danger");
-    expect(dangerDot).not.toHaveClass("motion-safe:animate-pulse");
+    expect(dangerDot).not.toHaveClass("oc-alive-dot");
   });
 });
 
@@ -67,7 +68,8 @@ describe("WorkspaceShellHeader", () => {
     expect(dots).toHaveLength(2);
     for (const dot of dots) {
       expect(dot).toHaveTextContent("");
-      expect(dot).toHaveClass("size-1.5", "bg-accent", "motion-safe:animate-pulse");
+      expect(dot).toHaveClass("size-1.5", "bg-accent", "oc-alive-dot");
+      expect(dot).not.toHaveClass("motion-safe:animate-pulse");
     }
   });
 });

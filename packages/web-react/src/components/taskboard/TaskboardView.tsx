@@ -52,6 +52,7 @@ import { BoardColumns } from './BoardColumns'
 import { BoardSettingsPanel } from './BoardSettingsPanel'
 import { CostStatsView } from './CostStatsView'
 import { ProjectSettings } from './ProjectSettings'
+import { AtelierIcon } from '../ui/AtelierIcons'
 import { WorkspaceShellHeader } from '../ui/WorkspaceShellHeader'
 import { StageSettings } from './StageSettings'
 import { TemplateLibrary } from './TemplateLibrary'
@@ -854,7 +855,7 @@ export function TaskboardView({
       >
         <div className="order-1 flex min-w-0 items-center gap-2.5">
           <span className="oc-icon-badge oc-icon-badge-accent size-7 rounded-lg" aria-hidden>
-            <Kanban size={15} />
+            <AtelierIcon name="tasks" size={15} />
           </span>
           <h1 className="truncate text-title font-semibold tracking-tight text-fg">任务面板</h1>
         </div>

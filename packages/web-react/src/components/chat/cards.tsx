@@ -244,7 +244,7 @@ function CopyIconButton({
         }
       }}
     >
-      {done ? <Check size={15} strokeWidth={2} /> : icon}
+      {done ? <Check size={15} strokeWidth={2} className="oc-check-pop" /> : icon}
     </IconButton>
   );
 }
@@ -275,7 +275,7 @@ function ReqIdChip({ traceId }: { traceId: string }) {
           : "text-faint hover:border-border/70 hover:bg-hover hover:text-muted",
       )}
     >
-      {copied ? <Check size={11} strokeWidth={2} /> : null}
+      {copied ? <Check size={11} strokeWidth={2} className="oc-check-pop" /> : null}
       {copied ? "已复制" : `#${traceId.slice(0, 8)}`}
     </button>
   );
@@ -568,6 +568,32 @@ function MessageActions({
       )}
     >
       <CopyIconButton getText={() => body} label="复制" icon={<Copy size={15} strokeWidth={1.75} />} variant="muted" />
+      {latest && canQuote && (
+        <IconButton
+          aria-label="引用"
+          title="引用"
+          size="sm"
+          shape="square"
+          variant="muted"
+          className="oc-btn-tactile [@media(hover:none)]:size-11"
+          onClick={() => cb.onQuote?.(text !== undefined ? { ...msg, text } : msg)}
+        >
+          <Quote size={15} strokeWidth={1.75} />
+        </IconButton>
+      )}
+      {latest && canRegen && (
+        <IconButton
+          aria-label="重新生成"
+          title="重新生成"
+          size="sm"
+          shape="square"
+          variant="muted"
+          className="oc-btn-tactile [@media(hover:none)]:size-11"
+          onClick={() => cb.onRegenerate?.()}
+        >
+          <RotateCcw size={15} strokeWidth={1.75} />
+        </IconButton>
+      )}
       {rating}
       {speech.speaking && (
         <IconButton
@@ -1530,7 +1556,7 @@ export const ThinkingCard = memo(
 // ═══════════════ plan ═══════════════
 const STEP_DOT: Record<string, string> = {
   completed: "bg-success",
-  inProgress: "bg-accent animate-pulse",
+  inProgress: "oc-alive-dot bg-accent",
   pending: "bg-faint",
 };
 // 不外包 memo:只收 {msg} + reducer 就地 mutate → 默认浅比较永不重渲(plan 步骤流式更新会丢)。

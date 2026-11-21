@@ -1,4 +1,4 @@
-import { ArrowUpRight, CircleHelp, Layers, LogIn, Store } from 'lucide-react'
+import { ArrowUpRight, CircleHelp, LogIn } from 'lucide-react'
 import { useState } from 'react'
 import { useMdViewport } from '../hooks/useMdViewport'
 import { MANAGE_TABS, type ManageTab, SCOPED_MANAGE_TABS } from '../lib/manageTabs'
@@ -18,6 +18,7 @@ import {
   SectionNav,
   Tabs,
 } from './ui'
+import { AtelierLazyIcon } from './ui/AtelierLazyIcons'
 
 export type { ManageTab }
 
@@ -106,7 +107,7 @@ export function ManageCenter({
       title={
         <span className="inline-flex items-center gap-2.5">
           <span className="oc-icon-badge size-7 rounded-lg" aria-hidden="true">
-            <Layers size={14} strokeWidth={1.9} />
+            <AtelierLazyIcon name="manage" size={15} />
           </span>
           <span className="text-title font-semibold tracking-tight text-fg">管理中心</span>
         </span>
@@ -156,7 +157,7 @@ export function ManageCenter({
                         className="oc-icon-badge oc-icon-badge-accent size-6 shrink-0 rounded-md"
                         aria-hidden="true"
                       >
-                        <Store size={13} strokeWidth={1.9} />
+                        <AtelierLazyIcon name="market" size={14} />
                       </span>
                       <span className="flex-1 truncate">去市场添加</span>
                       <ArrowUpRight

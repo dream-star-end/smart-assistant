@@ -58,7 +58,7 @@ export function CopyChip({
       >
         <span className="truncate">{label ?? value}</span>
         {copied ? (
-          <Check size={13} strokeWidth={2.25} className="shrink-0 text-success" />
+          <Check size={13} strokeWidth={2.25} className="oc-check-pop shrink-0 text-success" />
         ) : (
           <Copy size={13} className="shrink-0 opacity-70" />
         )}

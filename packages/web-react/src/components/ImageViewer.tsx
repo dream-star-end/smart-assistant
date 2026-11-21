@@ -179,19 +179,19 @@ function ActionButton({
       title={disabled ? reason : label}
       aria-label={label}
       className={cn(
-        'group/action flex min-w-16 flex-col items-center gap-1.5 outline-none',
+        'oc-spring-press group/action flex min-w-16 flex-col items-center gap-1.5 rounded-2xl outline-none focus-visible:ring-2 focus-visible:ring-ring',
         disabled && 'cursor-not-allowed opacity-40',
       )}
     >
       <span
         className={cn(
-          'flex size-12 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors',
+          'flex size-12 items-center justify-center rounded-full bg-white/10 text-fg backdrop-blur transition-colors',
           !disabled && 'group-hover/action:bg-white/20',
         )}
       >
         {icon}
       </span>
-      <span className="text-xs font-medium text-white/90">{label}</span>
+      <span className="text-xs font-medium text-fg/90">{label}</span>
     </button>
   )
 }
@@ -242,6 +242,15 @@ export function ImageViewer({
   const [editSource, setEditSource] = useState<ImageAnnotationSource | null>(null)
   const [moreOpen, setMoreOpen] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
+  const [zoom, setZoom] = useState({ scale: 1, x: 0, y: 0 })
+  const [dragging, setDragging] = useState(false)
+  const dragRef = useRef<{
+    pointerId: number
+    startX: number
+    startY: number
+    originX: number
+    originY: number
+  } | null>(null)
   // 下载 pending 必须绑定逻辑图片身份,不能是裸 boolean。否则 A 原图迟到可能被保存成 B。
   const [pendingDownloadKey, setPendingDownloadKey] = useState<string | null>(null)
   const [nativeFallbackKey, setNativeFallbackKey] = useState<string | null>(null)
@@ -293,6 +302,9 @@ export function ImageViewer({
       setEditSource(null)
       setMoreOpen(false)
       setNotice(null)
+      setZoom({ scale: 1, x: 0, y: 0 })
+      setDragging(false)
+      dragRef.current = null
       setPendingDownloadKey(null)
       setNativeFallbackKey(null)
       autoEditRef.current = false
@@ -306,6 +318,80 @@ export function ImageViewer({
     // enterEdit 故意不入 deps:它每渲染重建但捕获当帧 get/src,ref 守卫保证每次开图只跑一次。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, initialMode])
+
+  // 切图或退出浏览态时重置缩放与平移。
+  useEffect(() => {
+    setZoom({ scale: 1, x: 0, y: 0 })
+    setDragging(false)
+    dragRef.current = null
+  }, [src, mode])
+
+  const resetZoom = useCallback(() => {
+    setZoom({ scale: 1, x: 0, y: 0 })
+    setDragging(false)
+    dragRef.current = null
+  }, [])
+
+  const toggleDoubleClickZoom = useCallback((e: React.MouseEvent<HTMLElement>) => {
+    setZoom((cur) => {
+      if (cur.scale > 1.05) return { scale: 1, x: 0, y: 0 }
+      const rect = e.currentTarget.getBoundingClientRect()
+      if (rect.width > 0 && rect.height > 0 && (e.clientX !== 0 || e.clientY !== 0)) {
+        const dx = Math.max(-rect.width * 0.5, Math.min(rect.width * 0.5, rect.left + rect.width / 2 - e.clientX))
+        const dy = Math.max(-rect.height * 0.5, Math.min(rect.height * 0.5, rect.top + rect.height / 2 - e.clientY))
+        return { scale: 2, x: dx, y: dy }
+      }
+      return { scale: 2, x: 0, y: 0 }
+    })
+  }, [])
+
+  const handleStageWheel = useCallback((e: React.WheelEvent<HTMLDivElement>) => {
+    e.preventDefault()
+    const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15
+    setZoom((cur) => {
+      const nextScale = Math.max(1, Math.min(4, cur.scale * factor))
+      if (nextScale <= 1.02) return { scale: 1, x: 0, y: 0 }
+      const ratio = nextScale / cur.scale
+      return { scale: nextScale, x: cur.x * ratio, y: cur.y * ratio }
+    })
+  }, [])
+
+  const handleStagePointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (zoom.scale <= 1.02) return
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      dragRef.current = {
+        pointerId: e.pointerId,
+        startX: e.clientX,
+        startY: e.clientY,
+        originX: zoom.x,
+        originY: zoom.y,
+      }
+      setDragging(true)
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId)
+      } catch {}
+    },
+    [zoom.scale, zoom.x, zoom.y],
+  )
+
+  const handleStagePointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current
+    if (!drag || drag.pointerId !== e.pointerId) return
+    const dx = e.clientX - drag.startX
+    const dy = e.clientY - drag.startY
+    setZoom((cur) => ({ ...cur, x: drag.originX + dx, y: drag.originY + dy }))
+  }, [])
+
+  const handleStagePointerEnd = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current
+    if (!drag || drag.pointerId !== e.pointerId) return
+    dragRef.current = null
+    setDragging(false)
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId)
+    } catch {}
+  }, [])
 
   // 提示定时器只留一个:新提示作废旧的,卸载时清掉。漏清的定时器会在组件(测试里是整个
   // jsdom)拆除后回写 state(OCV5-373)。
@@ -490,10 +576,10 @@ export function ImageViewer({
         }}
       >
         <Dialog.Portal>
-          <Dialog.Overlay className="fixed inset-0 z-[60] bg-black data-[state=open]:animate-fade" />
+          <Dialog.Overlay className="dark fixed inset-0 z-[60] bg-bg/95 backdrop-blur-sm data-[state=open]:animate-fade" />
           <Dialog.Content
             aria-describedby={undefined}
-            className="fixed inset-0 z-[61] flex select-none flex-col bg-black text-white outline-none"
+            className="dark fixed inset-0 z-[61] flex select-none flex-col bg-bg text-fg outline-none"
             onOpenAutoFocus={(e) => e.preventDefault()}
             // ESC 逐层退出(需求 §5):更多菜单 → 子模式(评论/调整大小)→ 查看器。edit 模式由
             // 上层编辑器 Dialog 自己捕获 ESC(topmost layer),这里不会触发。
@@ -547,7 +633,7 @@ export function ImageViewer({
                       data-product-feature={PRODUCT_CAPABILITIES.artifacts.id}
                       aria-label="关闭预览"
                       title="关闭 (Esc)"
-                      className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 [@media(hover:none)]:size-11"
+                      className="oc-spring-press flex size-10 items-center justify-center rounded-full bg-white/10 text-fg outline-none backdrop-blur transition-colors hover:bg-white/20 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11"
                     >
                       <X size={20} />
                     </button>
@@ -558,7 +644,7 @@ export function ImageViewer({
                       aria-label="下载"
                       title="下载"
                       onClick={() => void handleDownload()}
-                      className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 [@media(hover:none)]:size-11"
+                      className="oc-spring-press flex size-10 items-center justify-center rounded-full bg-white/10 text-fg outline-none backdrop-blur transition-colors hover:bg-white/20 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11"
                     >
                       <Download size={18} />
                     </button>
@@ -568,13 +654,13 @@ export function ImageViewer({
                         aria-label="分享"
                         title="分享"
                         onClick={() => void handleShare()}
-                        className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 [@media(hover:none)]:size-11"
+                        className="oc-spring-press flex size-10 items-center justify-center rounded-full bg-white/10 text-fg outline-none backdrop-blur transition-colors hover:bg-white/20 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11"
                       >
                         <Share2 size={18} />
                       </button>
                     )}
                     {/* 「更多」走 DropdownMenu 原语(审计 M-14):拿到 menu/menuitem 语义、方向键、
-                        打开即聚焦首项、关闭焦点回触发钮;黑底样式用 className 盖掉原语默认色。
+                        打开即聚焦首项、关闭焦点回触发钮;暗房暖炭底样式用 dark + elevated 盖掉原语默认色。
                         z-[62] 压过查看器自身的 z-[61],否则 Portal 出去的菜单会被查看器盖住。 */}
                     {!readOnly && (
                       <DropdownMenu open={moreOpen} onOpenChange={setMoreOpen}>
@@ -583,7 +669,7 @@ export function ImageViewer({
                             type="button"
                             aria-label="更多"
                             title="更多"
-                            className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 [@media(hover:none)]:size-11"
+                            className="oc-spring-press flex size-10 items-center justify-center rounded-full bg-white/10 text-fg outline-none backdrop-blur transition-colors hover:bg-white/20 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11"
                           >
                             <MoreHorizontal size={18} />
                           </button>
@@ -591,17 +677,17 @@ export function ImageViewer({
                         <DropdownMenuContent
                           align="end"
                           sideOffset={8}
-                          className="z-[62] w-44 min-w-0 rounded-2xl border-white/10 bg-neutral-900/95 p-1.5 text-white shadow-float backdrop-blur"
+                          className="dark z-[62] w-44 min-w-0 rounded-2xl border-white/10 bg-elevated/95 p-1.5 text-fg shadow-float backdrop-blur"
                         >
                           <DropdownMenuItem
                             onSelect={() => void openInTab()}
-                            className="gap-2 rounded-xl px-3 py-2 text-white data-[highlighted]:bg-white/10 [@media(hover:none)]:min-h-11"
+                            className="gap-2 rounded-xl px-3 py-2 text-fg data-[highlighted]:bg-white/10 [@media(hover:none)]:min-h-11"
                           >
                             <ArrowUpRight size={16} /> 新标签打开原图
                           </DropdownMenuItem>
                           <DropdownMenuItem
                             onSelect={() => void copyLink()}
-                            className="gap-2 rounded-xl px-3 py-2 text-white data-[highlighted]:bg-white/10 [@media(hover:none)]:min-h-11"
+                            className="gap-2 rounded-xl px-3 py-2 text-fg data-[highlighted]:bg-white/10 [@media(hover:none)]:min-h-11"
                           >
                             <Link2 size={16} /> 复制临时链接
                           </DropdownMenuItem>
@@ -612,15 +698,35 @@ export function ImageViewer({
                 </header>
 
                 {/* 图片居中:先复用气泡缩略字节做即时预览(零请求、非灰屏),原图流式到达无缝换;
-                    加载期顶部细进度条 + 百分比(禁纯白/白闪)。无预览时亮深色 shimmer 骨架。 */}
-                <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden px-4">
+                    支持双击 2× 缩放、滚轮缩放与放大态拖拽平移;无预览时亮深色 shimmer 骨架。 */}
+                <div
+                  data-testid="image-viewer-stage"
+                  onWheel={viewerUrl ? handleStageWheel : undefined}
+                  onPointerDown={viewerUrl ? handleStagePointerDown : undefined}
+                  onPointerMove={viewerUrl ? handleStagePointerMove : undefined}
+                  onPointerUp={viewerUrl ? handleStagePointerEnd : undefined}
+                  onPointerCancel={viewerUrl ? handleStagePointerEnd : undefined}
+                  className={cn(
+                    'relative flex min-h-0 flex-1 items-center justify-center overflow-hidden px-4',
+                    zoom.scale > 1.02
+                      ? cn('touch-none', dragging ? 'cursor-grabbing' : 'cursor-grab')
+                      : viewerUrl && 'cursor-zoom-in',
+                  )}
+                >
                   {viewerUrl ? (
                     <img
                       src={viewerUrl}
                       alt={alt}
                       decoding="async"
                       referrerPolicy={referrerPolicy}
-                      className="max-h-full max-w-full object-contain opacity-100 transition-opacity duration-200"
+                      onDoubleClick={toggleDoubleClickZoom}
+                      style={{
+                        transform: `translate3d(${zoom.x}px, ${zoom.y}px, 0) scale(${zoom.scale})`,
+                      }}
+                      className={cn(
+                        'max-h-full max-w-full origin-center object-contain opacity-100',
+                        !dragging && 'transition-transform duration-150 ease-out',
+                      )}
                       draggable={false}
                     />
                   ) : (
@@ -630,10 +736,39 @@ export function ImageViewer({
                     <div
                       role="status"
                       aria-live="polite"
-                      className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-full bg-black/55 px-3 py-1 text-xs font-medium tabular-nums text-white/90 backdrop-blur"
+                      className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-full border border-white/10 bg-elevated/85 px-3 py-1 text-xs font-medium tabular-nums text-fg/90 backdrop-blur"
                     >
                       {viewerPercent != null ? `加载原图 ${viewerPercent}%` : '加载原图…'}
                     </div>
+                  )}
+                  {viewerUrl && (
+                    <button
+                      type="button"
+                      data-testid="image-viewer-zoom-pill"
+                      aria-label={zoom.scale > 1.02 ? '还原图片缩放' : '缩放比例 100%，点击放大'}
+                      title={zoom.scale > 1.02 ? '点击还原 100%（也可双击图片）' : '双击图片或滚轮可缩放'}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        if (zoom.scale > 1.02) resetZoom()
+                        else setZoom({ scale: 2, x: 0, y: 0 })
+                      }}
+                      className={cn(
+                        'oc-spring-press absolute bottom-3 left-1/2 z-20 inline-flex -translate-x-1/2 items-center gap-1.5 rounded-full border px-3 py-1 text-caption font-medium tabular-nums outline-none backdrop-blur transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-10',
+                        zoom.scale > 1.02
+                          ? 'border-accent/45 bg-elevated/90 text-fg hover:bg-elevated'
+                          : 'border-white/10 bg-surface/75 text-muted hover:border-white/20 hover:text-fg',
+                      )}
+                    >
+                      <span>{Math.round(zoom.scale * 100)}%</span>
+                      {zoom.scale > 1.02 && (
+                        <>
+                          <span aria-hidden className="text-white/25">
+                            ·
+                          </span>
+                          <span className="text-accent">还原</span>
+                        </>
+                      )}
+                    </button>
                   )}
                 </div>
 
@@ -673,7 +808,7 @@ export function ImageViewer({
               <div
                 role="status"
                 aria-live="polite"
-                className="pointer-events-none absolute left-1/2 top-16 z-40 -translate-x-1/2 rounded-full bg-white/15 px-3 py-1.5 text-xs font-medium text-white backdrop-blur"
+                className="pointer-events-none absolute left-1/2 top-16 z-40 -translate-x-1/2 rounded-full border border-white/15 bg-elevated/90 px-3 py-1.5 text-xs font-medium text-fg shadow-pop backdrop-blur"
               >
                 {notice}
               </div>

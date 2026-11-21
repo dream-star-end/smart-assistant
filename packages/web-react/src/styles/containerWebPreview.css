@@ -1,27 +1,31 @@
 /* ── Container-local web preview ──
-   An immersive dark workspace built from the same Aurora primitives as the
-   rest of V5. Controls remain legible over arbitrary page content and all
-   primary mouse/touch targets keep a minimum 44px hit area. */
+   An immersive dark workspace aligned with Clarvy Atelier warm charcoal &
+   warm terracotta primitives. Controls remain legible over arbitrary page
+   content and all primary mouse/touch targets keep a minimum 44px hit area. */
+.preview-modal-root {
+  background: #141416;
+}
 .preview-shell, .preview-comments-modal {
-  --preview-canvas: #0c0c11;
-  --preview-surface: rgba(21, 21, 28, 0.82);
-  --preview-elevated: rgba(28, 28, 37, 0.96);
-  --preview-hover: rgba(255, 255, 255, 0.1);
-  --preview-border: rgba(242, 242, 246, 0.11);
-  --preview-border-strong: rgba(242, 242, 246, 0.18);
-  --preview-fg: #f2f2f6;
-  --preview-muted: #bcbcc7;
-  --preview-faint: #8b8b97;
-  --preview-primary: #f2f2f6;
-  --preview-primary-fg: #15151c;
+  --preview-canvas: #141416;
+  --preview-surface: rgba(27, 27, 31, 0.84);
+  --preview-elevated: rgba(34, 34, 39, 0.96);
+  --preview-hover: rgba(242, 240, 236, 0.1);
+  --preview-border: rgba(242, 240, 236, 0.11);
+  --preview-border-strong: rgba(242, 240, 236, 0.18);
+  --preview-fg: #f2f0ec;
+  --preview-muted: #b8b4ad;
+  --preview-faint: #918e88;
+  --preview-primary: #f2f0ec;
+  --preview-primary-fg: #141416;
   /* The preview is always dark, so its interactive tokens must not inherit
      the surrounding light theme's lower-luminance accent and translucent ring. */
-  --preview-accent: #9a8aff;
-  --preview-accent-soft: #9a8aff1f;
-  --preview-accent-fg: #15151c;
-  --preview-ring: #9a8aff;
-  --preview-warning: #e0a03a;
-  --preview-warning-soft: rgba(224, 160, 58, 0.13);
+  --preview-accent: #df7e59;
+  --preview-accent-soft: rgba(223, 126, 89, 0.16);
+  --preview-accent-fg: #141416;
+  --preview-ring: #df7e59;
+  --preview-success: #42c282;
+  --preview-warning: #e2a33e;
+  --preview-warning-soft: rgba(226, 163, 62, 0.15);
 }
 .preview-shell {
   isolation: isolate;
@@ -124,7 +128,7 @@
 .preview-primary-button:active:not(:disabled) { transform: scale(0.97); }
 .preview-primary-button:disabled { cursor: not-allowed; opacity: 0.34; box-shadow: none; }
 .preview-viewport {
-  border: 1px solid var(--preview-border); background: #15151c;
+  border: 1px solid var(--preview-border); background: #1b1b1f;
   box-shadow: 0 24px 80px rgba(0, 0, 0, 0.44), 0 0 0 1px rgba(0, 0, 0, 0.28);
   transition: box-shadow 180ms var(--ease-standard), border-color 180ms var(--ease-standard), background 180ms var(--ease-standard);
 }
@@ -139,12 +143,18 @@
   position: absolute; z-index: 30; top: calc(max(10px, env(safe-area-inset-top)) + 56px); left: 50%;
   display: flex; min-height: 28px; max-width: calc(100% - 24px); transform: translateX(-50%);
   align-items: center; gap: 7px; white-space: nowrap; padding: 0 10px;
-  border: 1px solid var(--preview-border); border-radius: 999px; background: rgba(12, 12, 17, 0.72);
-  color: var(--preview-muted); font-size: var(--text-caption); box-shadow: 0 5px 18px rgba(0, 0, 0, 0.16);
+  border: 1px solid var(--preview-border); border-radius: 999px; background: rgba(20, 20, 22, 0.78);
+  color: var(--preview-muted); font-size: var(--text-caption); box-shadow: 0 5px 18px rgba(0, 0, 0, 0.18);
   backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
 }
+.preview-status-dot {
+  width: 6px; height: 6px; flex: 0 0 auto; border-radius: 999px; background: var(--preview-warning);
+}
+.preview-status-dot-ready { background: var(--preview-success); }
+.preview-direct-badge { color: color-mix(in srgb, var(--preview-success) 72%, white 28%); }
+.preview-warning-copy { color: color-mix(in srgb, var(--preview-warning) 58%, white 42%); }
 .preview-loading-state {
-  gap: 10px; padding: 18px; background: linear-gradient(180deg, rgba(21, 21, 28, 0.96), rgba(12, 12, 17, 0.98));
+  gap: 10px; padding: 18px; background: linear-gradient(180deg, rgba(27, 27, 31, 0.96), rgba(20, 20, 22, 0.98));
 }
 .preview-state-icon {
   display: flex; width: 44px; height: 44px; align-items: center; justify-content: center;
@@ -179,14 +189,14 @@
 .preview-target-box {
   border: 2px solid color-mix(in srgb, var(--preview-accent) 88%, white 12%); border-radius: 5px;
   background: color-mix(in srgb, var(--preview-accent) 11%, transparent);
-  box-shadow: 0 0 0 1px rgba(7, 5, 18, 0.48), inset 0 0 18px color-mix(in srgb, var(--preview-accent) 8%, transparent);
+  box-shadow: 0 0 0 1px rgba(20, 20, 22, 0.52), inset 0 0 18px color-mix(in srgb, var(--preview-accent) 8%, transparent);
 }
 .preview-target-box-active {
   border-color: color-mix(in srgb, var(--preview-accent) 70%, white 30%);
   background: color-mix(in srgb, var(--preview-accent) 18%, transparent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--preview-accent) 22%, transparent), inset 0 0 24px color-mix(in srgb, var(--preview-accent) 12%, transparent);
 }
-.preview-target-box-missing { border-color: rgba(224, 160, 58, 0.9); border-style: dashed; background: rgba(224, 160, 58, 0.08); }
+.preview-target-box-missing { border-color: rgba(226, 163, 62, 0.9); border-style: dashed; background: rgba(226, 163, 62, 0.08); }
 .preview-anchor-hit {
   position: absolute; top: -22px; left: -22px; display: flex; width: 44px; height: 44px;
   align-items: center; justify-content: center; border-radius: 999px;
@@ -198,7 +208,7 @@
   transition: transform 150ms var(--ease-standard);
 }
 .preview-anchor-hit:hover .preview-anchor-dot { transform: scale(1.08); }
-.preview-anchor-dot-missing { background: var(--preview-warning); color: #15151c; }
+.preview-anchor-dot-missing { background: var(--preview-warning); color: #141416; }
 .preview-toast {
   width: max-content; max-width: calc(100% - 32px); padding: 9px 14px; border: 1px solid var(--preview-border);
   border-radius: 999px; background: var(--preview-elevated); color: var(--preview-muted);

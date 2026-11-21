@@ -111,6 +111,7 @@ export function CodeBlock({
             onClick={toggleWrap}
             aria-label="换行"
             aria-pressed={wrap}
+            title={wrap ? "取消换行" : "换行"}
             className={cn(
               "oc-btn-tactile flex items-center gap-1.5 rounded-md border px-2 py-1 text-caption font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3",
               wrap
@@ -118,20 +119,24 @@ export function CodeBlock({
                 : "border-transparent text-faint hover:bg-hover hover:text-fg",
             )}
           >
-            <WrapText size={13} strokeWidth={1.75} />
-            换行
+            <WrapText size={13} strokeWidth={1.75} aria-hidden="true" />
+            <span className="hidden sm:inline">换行</span>
           </button>
           <button
             type="button"
             onClick={copy}
             className={cn(
-              "oc-btn-tactile flex items-center gap-1.5 rounded-md border px-2 py-1 text-caption font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3",
+              "oc-btn-tactile flex min-w-[4.5rem] items-center justify-center gap-1.5 rounded-md border px-2 py-1 text-caption font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3",
               copied
                 ? "border-success/30 bg-success-soft text-success"
                 : "border-transparent text-faint hover:bg-hover hover:text-fg",
             )}
           >
-            {copied ? <Check size={13} strokeWidth={2} /> : <Copy size={13} strokeWidth={1.75} />}
+            {copied ? (
+              <Check size={13} strokeWidth={2} className="oc-check-pop" aria-hidden="true" />
+            ) : (
+              <Copy size={13} strokeWidth={1.75} aria-hidden="true" />
+            )}
             {copied ? "已复制" : "复制"}
           </button>
         </div>

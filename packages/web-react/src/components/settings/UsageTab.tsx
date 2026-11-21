@@ -1,4 +1,4 @@
-import { BarChart3, History, Sparkles } from "lucide-react";
+import { BarChart3, History } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ChartCard, barConfig, chartNum, donutConfig, lineConfig, useChart } from "../charts";
 import { api, apiErrorMessage } from "../../lib/api";
@@ -14,6 +14,8 @@ import { cn, formatCompactCount, formatCredits, groupDigits } from "../../lib/ut
 import { agentDisplayName } from "../chat/agentNames";
 import { useProjectScope } from "../../hooks/useProjectScope";
 import { Alert, Badge, Button, Progress, ProjectScopeSelect, Skeleton, Spinner, Tabs } from "../ui";
+import { AtelierIcon } from "../ui/AtelierIcons";
+import { ModelFamilyIcon } from "../ui/ModelFamilyIcons";
 import { formatReportBucket, REPORT_WINDOW_NOUN, shortTime } from "./labels";
 import { StatTile } from "./StatTile";
 
@@ -465,7 +467,12 @@ export function UsageTab({
                     <tbody>
                       {report.models.map((model) => (
                         <tr key={model.model} className="border-t border-border">
-                          <td className="px-3 py-2 font-mono text-fg">{model.model}</td>
+                          <td className="px-3 py-2 font-mono text-fg">
+                            <span className="inline-flex items-center gap-2">
+                              <ModelFamilyIcon model={model.model} size={14} className="text-muted" />
+                              <span>{model.model}</span>
+                            </span>
+                          </td>
                           <td className="px-3 py-2 text-right tabular-nums">{groupDigits(model.requests)}</td>
                           <td className="px-3 py-2 text-right tabular-nums">{formatCompactCount(model.input_tokens)}</td>
                           <td className="px-3 py-2 text-right tabular-nums">{formatCompactCount(model.output_tokens)}</td>
@@ -579,7 +586,7 @@ export function UsageTab({
         <section className="oc-surface-card rounded-2xl p-4">
           <div className="mb-3 flex items-center gap-2.5">
             <span className="oc-icon-badge oc-icon-badge-success h-7 w-7 rounded-sm" aria-hidden>
-              <Sparkles size={14} strokeWidth={1.75} />
+              <AtelierIcon name="sparkles" size={14} />
             </span>
             <div className="text-section font-semibold text-fg">累计 · 自开通以来</div>
           </div>

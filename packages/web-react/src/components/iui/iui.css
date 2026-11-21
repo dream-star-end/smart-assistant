@@ -774,9 +774,9 @@ figure.oc-iui, .oc-iui { margin: 14px 0 22px; font-size: 14.5px; line-height: 1.
 .oc-iui-quiz-option:disabled { cursor: default; }
 .oc-iui-quiz-letter { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; width: 26px; height: 26px; border-radius: 8px; background: var(--iui-sunken); box-shadow: inset 0 0 0 1px var(--iui-line); font-size: 12px; font-weight: 700; color: var(--muted); }
 .oc-iui-quiz-option.is-right { background: var(--success-soft); box-shadow: inset 0 0 0 1.5px var(--success); }
-.oc-iui-quiz-option.is-right .oc-iui-quiz-letter { background: var(--success); box-shadow: none; color: #fff; }
+.oc-iui-quiz-option.is-right .oc-iui-quiz-letter { background: var(--success); box-shadow: none; color: var(--success-fg); }
 .oc-iui-quiz-option.is-wrong { background: var(--danger-soft); box-shadow: inset 0 0 0 1.5px var(--danger); }
-.oc-iui-quiz-option.is-wrong .oc-iui-quiz-letter { background: var(--danger); box-shadow: none; color: #fff; }
+.oc-iui-quiz-option.is-wrong .oc-iui-quiz-letter { background: var(--danger); box-shadow: none; color: var(--danger-fg); }
 .oc-iui-quiz-option.is-dim { opacity: 0.55; }
 .oc-iui-quiz-explain { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; margin-top: 4px; padding: 12px 14px; border-radius: 14px; background: var(--iui-sunken); font-size: 14px; color: var(--muted); animation: oc-iui-in 0.25s ease both; }
 .oc-iui-quiz-explain .oc-iui-btn { margin-top: 6px; }
@@ -860,7 +860,7 @@ figure.oc-iui, .oc-iui { margin: 14px 0 22px; font-size: 14.5px; line-height: 1.
 .oc-iui-stop { position: relative; display: grid; grid-template-columns: 28px 1fr; gap: 12px; }
 .oc-iui-stop:not(:last-child)::before { content: ""; position: absolute; left: 13px; top: 30px; bottom: 2px; width: 2px; background: repeating-linear-gradient(to bottom, color-mix(in srgb, var(--iui-c1) 45%, transparent) 0 4px, transparent 4px 8px); }
 .oc-iui-stop-mark { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 999px; background: var(--iui-surface); box-shadow: inset 0 0 0 2px var(--iui-c1); font-size: 12.5px; font-weight: 700; color: var(--iui-c1); font-variant-numeric: tabular-nums; }
-.oc-iui-stop.is-end .oc-iui-stop-mark { background: var(--iui-c1); color: #fff; box-shadow: 0 4px 10px -4px color-mix(in srgb, var(--iui-c1) 80%, transparent); }
+.oc-iui-stop.is-end .oc-iui-stop-mark { background: var(--iui-c1); color: var(--accent-fg); box-shadow: 0 4px 10px -4px color-mix(in srgb, var(--iui-c1) 80%, transparent); }
 .oc-iui-stop.is-highlight .oc-iui-stop-mark { box-shadow: inset 0 0 0 2px var(--iui-c3); color: var(--iui-c3); }
 .oc-iui-stop-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 3px 0 16px; }
 .oc-iui-stop:last-child .oc-iui-stop-body { padding-bottom: 2px; }
@@ -999,9 +999,9 @@ figure.oc-iui, .oc-iui { margin: 14px 0 22px; font-size: 14.5px; line-height: 1.
 .oc-mkt-pct { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--mkt-flat); }
 .oc-mkt-pct.is-up { color: var(--mkt-up); }
 .oc-mkt-pct.is-down { color: var(--mkt-down); }
-.oc-mkt-pct.is-pill { display: inline-block; min-width: 68px; text-align: center; border-radius: 6px; padding: 2px 6px; color: #fff; background: color-mix(in srgb, var(--mkt-flat) 70%, transparent); }
-.oc-mkt-pct.is-pill.is-up { background: var(--mkt-up); color: #fff; }
-.oc-mkt-pct.is-pill.is-down { background: var(--mkt-down); color: #fff; }
+.oc-mkt-pct.is-pill { display: inline-block; min-width: 68px; text-align: center; border-radius: 6px; padding: 2px 6px; color: var(--primary-fg); background: var(--mkt-flat); }
+.oc-mkt-pct.is-pill.is-up { background: var(--mkt-up); color: var(--danger-fg); }
+.oc-mkt-pct.is-pill.is-down { background: var(--mkt-down); color: var(--success-fg); }
 .oc-mkt-name { font-weight: 650; color: var(--fg); }
 .oc-mkt-code { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .oc-mkt-status { display: inline-flex; align-items: center; gap: 5px; margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; }

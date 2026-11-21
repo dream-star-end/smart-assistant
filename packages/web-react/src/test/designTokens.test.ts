@@ -128,6 +128,7 @@ const FILL_PAIRS = [
   ["primary", "primary-fg"],
   ["accent", "accent-fg"],
   ["danger", "danger-fg"],
+  ["success", "success-fg"],
   ["warning", "warning-fg"],
 ] as const;
 

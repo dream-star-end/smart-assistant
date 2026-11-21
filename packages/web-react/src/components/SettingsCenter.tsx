@@ -4,8 +4,6 @@ import {
   ArrowUpRight,
   Lock,
   RefreshCw,
-  SlidersHorizontal,
-  Sparkles,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Theme } from "../hooks/useTheme";
@@ -30,6 +28,8 @@ import { BuiltinHotkeysTable, PreferencesTab } from "./settings/PreferencesTab";
 import { SubscriptionDialog } from "./settings/SubscriptionDialog";
 import { UsageTab } from "./settings/UsageTab";
 import { Avatar, Button, Modal, SectionNav, Spinner, Tabs } from "./ui";
+import { AtelierIcon } from "./ui/AtelierIcons";
+import { AtelierLazyIcon } from "./ui/AtelierLazyIcons";
 
 export type SettingsSection = SettingsDestinationSection;
 
@@ -221,7 +221,7 @@ export function SettingsCenter({
         title={
           <span className="inline-flex items-center gap-2.5">
             <span className="oc-icon-badge oc-icon-badge-accent size-7 rounded-lg" aria-hidden="true">
-              <SlidersHorizontal size={14} strokeWidth={1.9} />
+              <AtelierLazyIcon name="settings" size={15} />
             </span>
             <span className="text-title font-semibold tracking-tight text-fg">设置</span>
           </span>
@@ -601,7 +601,7 @@ function AboutSection() {
       <div className="oc-surface-card rounded-2xl p-5">
         <div className="flex items-center gap-3.5">
           <Avatar tone="brand" size="lg" shape="square" className="oc-icon-badge oc-icon-badge-accent shadow-soft">
-            <Sparkles size={21} />
+            <AtelierIcon name="sparkles" size={21} />
           </Avatar>
           <div className="min-w-0">
             <div className="text-title font-semibold tracking-tight text-fg">{BRAND.name}</div>

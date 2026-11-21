@@ -258,7 +258,7 @@ function Progress({ job }: { job: MediaGenerationJob }) {
         ) : (
           // 无步数时只是一条脉动的装饰条:没有可报的数值,状态由上面那行文字承担,对辅助技术隐藏。
           <div aria-hidden className="oc-surface-recessed h-1.5 overflow-hidden rounded-full">
-            <div className="h-full w-1/3 animate-pulse rounded-full bg-accent" />
+            <div className="oc-indeterminate-bar h-full w-1/3 rounded-full bg-accent" />
           </div>
         ))}
     </div>

@@ -38,7 +38,7 @@ export type ModalMobileLayout = "center" | "fullscreen" | "sheet";
  * 不依赖不同工具类在基础段内的相对顺序。
  */
 export const modalContentVariants = cva(
-  "oc-surface-popover fixed z-50 flex flex-col overflow-hidden bg-elevated shadow-float outline-none data-[state=open]:animate-in",
+  "oc-surface-popover fixed z-50 flex flex-col overflow-hidden bg-elevated shadow-float outline-none data-[state=open]:oc-dialog-in data-[state=closed]:oc-dialog-out",
   {
     // 轴顺序即类名输出顺序:size / fixedHeight 先出、mobile 后出 —— fullscreen / sheet
     // 才能用 max-w-none / h-auto 通过 twMerge 折掉前两轴的桌面值,再由 compoundVariants
@@ -153,7 +153,7 @@ export function Modal({
   return (
     <RD.Root open={open} onOpenChange={onOpenChange}>
       <RD.Portal>
-        <RD.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade" />
+        <RD.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:oc-backdrop-in data-[state=closed]:oc-backdrop-out" />
         <RD.Content
           {...(hasDescription ? {} : { "aria-describedby": undefined })}
           {...(dataProductFeature

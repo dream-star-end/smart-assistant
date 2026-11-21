@@ -148,9 +148,9 @@ describe("SwarmBoardDrawer · 遥测展示与交互式指挥操控台", () => {
     );
 
     // 切换目标到非 coordinator 成员 worker-ui → 展示请求终止按钮 → 二次确认
-    fireEvent.change(screen.getByTestId("swarm-command-target"), {
-      target: { value: "worker-ui" },
-    });
+    const targetTrigger = screen.getByTestId("swarm-command-target");
+    fireEvent.pointerDown(targetTrigger, { button: 0, ctrlKey: false, pointerType: "mouse" });
+    fireEvent.click(await screen.findByTestId("swarm-command-target-option-worker-ui"));
     fireEvent.click(screen.getByTestId("swarm-terminate-trigger"));
     expect(screen.getByTestId("swarm-terminate-confirm")).toBeInTheDocument();
     fireEvent.change(screen.getByTestId("swarm-terminate-reason"), {

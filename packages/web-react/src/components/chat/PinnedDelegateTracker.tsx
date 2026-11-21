@@ -8,7 +8,7 @@
  * 头部只有**一个**切换按钮（图标 / 计数 / 折叠摘要 / chevron 都在按钮里），
  * 「停止本轮」「全部知道了」是按钮外的同级动作 —— 不再有 aria-hidden 的假 chevron 按钮。
  */
-import { Bot, Check, ChevronDown, ChevronUp, Circle, LoaderCircle, Pause, X } from "lucide-react";
+import { Check, ChevronDown, ChevronUp, Circle, LoaderCircle, Pause, X } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   isTerminalDelegateState,
@@ -16,6 +16,7 @@ import {
 } from "../../lib/chat/inflightDelegates";
 import { cn } from "../../lib/utils";
 import { Button } from "../ui";
+import { AtelierIcon } from "../ui/AtelierIcons";
 import { agentDisplayName } from "./agentNames";
 import { HUD_LIST_CLS, HUD_TOGGLE_CLS, useHudListOverflow } from "./PinnedTaskTracker";
 
@@ -263,7 +264,7 @@ export function PinnedDelegateTracker({
             )}
           >
             <span className="oc-icon-badge oc-icon-badge-accent flex size-6 shrink-0 items-center justify-center rounded-sm">
-              <Bot className="size-3.5" strokeWidth={1.75} aria-hidden />
+              <AtelierIcon name="agent" size={14} />
             </span>
             <span className="sr-only">{expanded ? "折叠后台任务列表" : "展开后台任务列表"}</span>
             <span className="shrink-0 text-caption font-semibold text-muted">{headline}</span>

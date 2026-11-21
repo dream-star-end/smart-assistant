@@ -44,6 +44,8 @@ describe("DropdownMenu short-viewport height cap (OCV5-778)", () => {
       expect(menu.className).toContain("overflow-x-hidden");
       expect(menu.className).toContain("overscroll-contain");
       expect(menu.className).not.toContain("overflow-hidden");
+      expect(menu.className).toContain("origin-[var(--radix-popper-transform-origin)]");
+      expect(menu.className).toContain("data-[state=closed]:oc-pop-out");
     }
   });
 

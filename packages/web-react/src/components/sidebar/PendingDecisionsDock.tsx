@@ -13,12 +13,8 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
-  Globe,
   Plug,
   RefreshCw,
-  ShieldAlert,
-  SquareKanban,
-  Terminal,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -34,7 +30,9 @@ import {
   resolvePendingDecision,
 } from "../../lib/api/wave4Api";
 import type { AuthSession } from "../../lib/types";
+import { cn } from "../../lib/utils";
 import { Alert, Badge, Button, IconButton, Spinner, useToast } from "../ui";
+import { AtelierIcon } from "../ui/AtelierIcons";
 import "./pendingDecisions.css";
 
 const POLL_INTERVAL_MS = 30_000;
@@ -54,18 +52,24 @@ export type PendingDecisionsDockProps = {
 function sourceIcon(source: PendingDecisionSource) {
   switch (source) {
     case "turn_permission":
-      return <Terminal size={11} aria-hidden />;
+      return <AtelierIcon name="terminal" size={12} />;
     case "connector_write":
       return <Plug size={11} aria-hidden />;
     case "taskboard":
-      return <SquareKanban size={11} aria-hidden />;
+      return <AtelierIcon name="tasks" size={12} />;
     case "browser_handoff":
-      return <Globe size={11} aria-hidden />;
+      return <AtelierIcon name="sites" size={12} />;
   }
 }
 
 function riskBadge(risk: PendingDecisionItem["riskLevel"]) {
-  if (risk === "critical") return <Badge tone="danger" size="sm">极高风险</Badge>;
+  if (risk === "critical") {
+    return (
+      <Badge tone="danger" size="sm" className="oc-breathe-aura">
+        极高风险
+      </Badge>
+    );
+  }
   if (risk === "high") return <Badge tone="warning" size="sm">高风险</Badge>;
   return null;
 }
@@ -243,7 +247,7 @@ export function PendingDecisionsDock({
           className="oc-pd-title-btn"
         >
           <span className="oc-pd-icon" aria-hidden>
-            <ShieldAlert size={12} strokeWidth={2} />
+            <AtelierIcon name="shield" size={13} />
           </span>
           <span className="truncate">待拍板</span>
           <span className="oc-pd-count" data-testid="pending-decisions-count">
@@ -260,7 +264,7 @@ export function PendingDecisionsDock({
           title="刷新待拍板"
           disabled={refreshing}
           onClick={() => void fetchItems()}
-          className="size-6 shrink-0"
+          className="oc-spring-press size-7 shrink-0 [@media(hover:none)]:size-11"
         >
           <RefreshCw size={12} className={refreshing ? "animate-spin" : undefined} />
         </IconButton>
@@ -319,7 +323,7 @@ export function PendingDecisionsDock({
                   data-decision-id={item.id}
                   data-decision-source={item.source}
                   data-risk={item.riskLevel}
-                  className="oc-pd-card"
+                  className={cn("oc-pd-card", item.riskLevel === "critical" && "oc-breathe-aura")}
                 >
                   <div className="flex flex-wrap items-center gap-1">
                     <Badge tone="neutral" size="sm" className="gap-1">
@@ -350,7 +354,7 @@ export function PendingDecisionsDock({
                           disabled={busy}
                           data-testid="pending-decision-goto"
                           onClick={() => handleDirectGoto(item)}
-                          className="h-7 flex-1 gap-1 px-2 text-caption"
+                          className="oc-spring-press h-7 flex-1 gap-1 px-2 text-caption [@media(hover:none)]:h-11 [@media(hover:none)]:min-h-11"
                         >
                           <ArrowUpRight size={12} aria-hidden />
                           {gotoLabel}
@@ -363,7 +367,7 @@ export function PendingDecisionsDock({
                             disabled={busy || Boolean(resolvingId)}
                             data-testid="pending-decision-deny"
                             onClick={() => void handleResolve(item, "deny")}
-                            className="h-7 px-2 text-caption text-muted"
+                            className="oc-spring-press h-7 px-2 text-caption text-muted [@media(hover:none)]:h-11 [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
                           >
                             {busy ? <Spinner size={11} /> : <X size={12} aria-hidden />}
                             拒绝
@@ -379,7 +383,7 @@ export function PendingDecisionsDock({
                           disabled={busy || Boolean(resolvingId)}
                           data-testid="pending-decision-approve"
                           onClick={() => void handleResolve(item, "approve")}
-                          className="h-7 flex-1 gap-1 px-2 text-caption"
+                          className="oc-spring-press h-7 flex-1 gap-1 px-2 text-caption [@media(hover:none)]:h-11 [@media(hover:none)]:min-h-11"
                         >
                           {busy ? <Spinner size={11} /> : <Check size={12} aria-hidden />}
                           批准
@@ -392,7 +396,7 @@ export function PendingDecisionsDock({
                             disabled={busy || Boolean(resolvingId)}
                             data-testid="pending-decision-deny"
                             onClick={() => void handleResolve(item, "deny")}
-                            className="h-7 flex-1 gap-1 px-2 text-caption"
+                            className="oc-spring-press h-7 flex-1 gap-1 px-2 text-caption [@media(hover:none)]:h-11 [@media(hover:none)]:min-h-11"
                           >
                             <X size={12} aria-hidden />
                             拒绝
@@ -405,7 +409,7 @@ export function PendingDecisionsDock({
                             aria-label={`前往查看 ${item.title}`}
                             title="前往对应会话/看板"
                             onClick={() => handleDirectGoto(item)}
-                            className="size-7 shrink-0"
+                            className="oc-spring-press size-7 shrink-0 [@media(hover:none)]:size-11"
                           >
                             <ArrowUpRight size={12} />
                           </IconButton>

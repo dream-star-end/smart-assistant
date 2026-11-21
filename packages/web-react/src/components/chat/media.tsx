@@ -759,7 +759,7 @@ export function SignedFileCard({ src, filename, label }: { src?: string; filenam
             <span
               className={cn(
                 "block h-full rounded-full bg-accent transition-[width] duration-150",
-                pct == null && "w-1/3 animate-pulse",
+                pct == null && "oc-indeterminate-bar w-1/3",
               )}
               style={pct != null ? { width: `${pct}%` } : undefined}
             />

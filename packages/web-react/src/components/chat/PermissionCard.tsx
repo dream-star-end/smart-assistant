@@ -10,7 +10,7 @@
  *    modal 窄屏均为贴底 sheet(mobile="sheet")。
  *  - 全部经 props.onRespond（= useChatSocket.respondPermission，已绑 sessId）。
  */
-import { AlertTriangle, Check, Clock, HelpCircle, LoaderCircle, ShieldCheck, X } from "lucide-react";
+import { AlertTriangle, Check, Clock, HelpCircle, LoaderCircle, X } from "lucide-react";
 import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { ChatMessage } from "../../lib/chat/model";
@@ -32,6 +32,7 @@ import {
 } from "../../lib/chat/permissionPopupCoordinator";
 import { resolveToolMeta, toolSummary } from "../tool/meta";
 import { Alert, Button, Modal } from "../ui";
+import { AtelierIcon } from "../ui/AtelierIcons";
 import {
   DETACHED_ASK_USER_TTL_MS,
   PENDING_PERMISSION_TTL_MS,
@@ -376,10 +377,10 @@ export function PermissionCard({
         <span
           className={cn(
             "oc-icon-badge flex size-6 shrink-0 items-center justify-center rounded-sm",
-            resolved ? "text-muted" : "oc-icon-badge-accent",
+            resolved ? "text-muted" : "oc-icon-badge-accent oc-breathe-aura",
           )}
         >
-          {questions ? <HelpCircle size={13} strokeWidth={1.75} /> : <ShieldCheck size={13} strokeWidth={1.75} />}
+          {questions ? <HelpCircle size={13} strokeWidth={1.75} /> : <AtelierIcon name="shield" size={14} />}
         </span>
         <span className="whitespace-nowrap text-body font-semibold text-fg">
           {questions ? "用户问答" : isExitPlan ? "退出计划模式" : "权限请求"}
@@ -450,7 +451,7 @@ export function PermissionCard({
               size="sm"
               variant="accent"
               shape="pill"
-              className="oc-btn-tactile oc-btn-accent-craft"
+              className="oc-btn-tactile oc-btn-accent-craft oc-spring-press"
               onClick={() => continueAskUserQuestion(questions, input, msg.requestId!, onRespond)}
             >
               继续
@@ -460,7 +461,11 @@ export function PermissionCard({
             size="sm"
             variant={questions ? "secondary" : "accent"}
             shape="pill"
-            className={questions ? "oc-btn-tactile oc-btn-secondary-craft" : "oc-btn-tactile oc-btn-accent-craft"}
+            className={
+              questions
+                ? "oc-btn-tactile oc-btn-secondary-craft"
+                : "oc-btn-tactile oc-btn-accent-craft oc-spring-press"
+            }
             onClick={() => {
               if (msg.requestId) reopenPermissionUi(msg.requestId);
               setOpen(true);
@@ -758,7 +763,7 @@ function GenericPermissionModal({
           </Button>
           <Button
             variant="accent"
-            className="oc-btn-tactile oc-btn-accent-craft"
+            className="oc-btn-tactile oc-btn-accent-craft oc-spring-press"
             onClick={() => {
               onRespond({ requestId, behavior: "allow" });
               onOpenChange(false);
@@ -822,7 +827,11 @@ function ExitPlanModeModal({
           <Button variant="ghost" onClick={() => decide("deny")}>
             继续规划
           </Button>
-          <Button variant="accent" onClick={() => decide("allow")}>
+          <Button
+            variant="accent"
+            className="oc-btn-tactile oc-btn-accent-craft oc-spring-press"
+            onClick={() => decide("allow")}
+          >
             按此计划执行
           </Button>
         </>
@@ -994,7 +1003,11 @@ function AskUserQuestionModal({
           >
             暂不回答，让它继续
           </Button>
-          <Button variant="accent" onClick={submit}>
+          <Button
+            variant="accent"
+            className="oc-btn-tactile oc-btn-accent-craft oc-spring-press"
+            onClick={submit}
+          >
             提交
           </Button>
         </>

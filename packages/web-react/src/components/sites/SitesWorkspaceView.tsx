@@ -27,6 +27,7 @@ import {
   Skeleton,
   useToast,
 } from "../ui";
+import { AtelierIcon } from "../ui/AtelierIcons";
 import { WorkspaceShellHeader } from "../ui/WorkspaceShellHeader";
 import { SiteDetailView } from "./SiteDetailView";
 import { SitePreviewThumb } from "./SitePreviewThumb";
@@ -297,7 +298,7 @@ export function SitesWorkspaceView({
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-3">
               <span className="oc-icon-badge oc-icon-badge-accent size-10 rounded-xl" aria-hidden="true">
-                <Globe size={19} strokeWidth={1.75} />
+                <AtelierIcon name="sites" size={20} />
               </span>
               <div>
                 <div className="flex items-center gap-2">

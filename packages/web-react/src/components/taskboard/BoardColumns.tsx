@@ -1,9 +1,10 @@
-import { Archive, Bot, Columns3, Inbox, Plus, ShieldCheck, UserCheck, Workflow } from 'lucide-react'
+import { Archive, Columns3, Inbox, Plus, UserCheck, Workflow } from 'lucide-react'
 import { type DragEvent, type ReactNode, useEffect, useRef, useState } from 'react'
 import type { BoardColumn, Ticket } from '../../lib/taskboard'
 import { collectInboxTickets, stageColumnTickets } from '../../lib/taskboard'
 import { cn } from '../../lib/utils'
 import { Badge, Button, EmptyState } from '../ui'
+import { AtelierIcon } from '../ui/AtelierIcons'
 import { TicketCard } from './TicketCard'
 import {
   BACKLOG_DROP_ID,
@@ -456,11 +457,11 @@ function BoardColumnFrame({
     : inbox
       ? { cls: 'oc-icon-badge oc-icon-badge-warning', icon: <Inbox size={13} aria-hidden /> }
       : kind === 'ai'
-        ? { cls: 'oc-icon-badge oc-icon-badge-info', icon: <Bot size={13} aria-hidden /> }
+        ? { cls: 'oc-icon-badge oc-icon-badge-info', icon: <AtelierIcon name="agent" size={13} /> }
         : kind === 'human'
           ? { cls: 'oc-icon-badge oc-icon-badge-accent', icon: <UserCheck size={13} aria-hidden /> }
           : kind === 'gate'
-            ? { cls: 'oc-icon-badge oc-icon-badge-success', icon: <ShieldCheck size={13} aria-hidden /> }
+            ? { cls: 'oc-icon-badge oc-icon-badge-success', icon: <AtelierIcon name="shield" size={13} /> }
             : { cls: 'oc-icon-badge', icon: <Columns3 size={13} aria-hidden /> }
 
   return (

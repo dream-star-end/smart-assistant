@@ -383,7 +383,7 @@ function StepDetail({
             data-testid="pane-following"
             className="oc-badge-craft oc-breathe-aura inline-flex items-center gap-1.5 rounded-full bg-accent-soft px-2.5 py-0.5 text-caption font-medium text-accent"
           >
-            <span aria-hidden className="size-1.5 rounded-full bg-accent motion-safe:animate-pulse" />
+            <span aria-hidden className="oc-alive-dot size-1.5 rounded-full bg-accent" />
             跟随中
           </span>
         ) : showLatest ? (

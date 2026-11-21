@@ -13,13 +13,13 @@
 import * as RD from "@radix-ui/react-dialog";
 import type { SwarmBoardPost, SwarmMemberSnapshot, SwarmSnapshot } from "@openclaude/protocol/browser";
 import {
+  Activity,
   AlertTriangle,
   ArrowDown,
   Check,
   ChevronRight,
   Clock3,
   Copy,
-  Cpu,
   GitBranch,
   Hash,
   MessageSquare,
@@ -36,6 +36,7 @@ import { cn } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { Badge, IconButton, useToast } from "../ui";
 import { AtelierIcon } from "../ui/AtelierIcons";
+import { ModelFamilyIcon } from "../ui/ModelFamilyIcons";
 import { SwarmCommandBar } from "./SwarmCommandBar";
 import {
   formatPostClock,
@@ -234,7 +235,7 @@ function RosterMemberRow({
             member.failed
               ? "bg-danger"
               : working
-                ? "bg-accent animate-pulse"
+                ? "oc-alive-dot"
                 : killed
                   ? "bg-faint"
                   : "bg-success",
@@ -278,7 +279,12 @@ function RosterMemberRow({
             : member.activity || swarmStatusLabel(member.status)}
         </div>
         <div className="mt-1 flex items-center gap-2 text-micro text-faint">
-          {modelText && <span className="truncate">{modelText}</span>}
+          {modelText && (
+            <span className="inline-flex min-w-0 items-center gap-1 truncate">
+              <ModelFamilyIcon model={member.model ?? modelText} size={13} className="shrink-0 text-muted" />
+              <span className="truncate">{modelText}</span>
+            </span>
+          )}
           {member.stepCount > 0 && (
             <span className="shrink-0 font-mono tabular-nums">{member.stepCount} 步</span>
           )}
@@ -306,7 +312,7 @@ function RosterMemberRow({
                 className="inline-flex items-center gap-0.5 rounded bg-hover px-1.5 py-0.5 font-mono tabular-nums"
                 title="输入 / 输出 Token 用量"
               >
-                <Cpu size={9} aria-hidden className="text-faint" />
+                <Activity size={9} aria-hidden className="text-faint" />
                 {approxPrefix}
                 {tokensText}
               </span>
@@ -432,7 +438,7 @@ function PostRow({
             title="复制"
             className="flex size-7 items-center justify-center rounded-md text-faint opacity-0 transition-all hover:bg-hover hover:text-fg group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:size-11 [@media(hover:none)]:opacity-100"
           >
-            {copied ? <Check size={12} className="text-success" /> : <Copy size={12} />}
+            {copied ? <Check size={12} className="oc-check-pop text-success" /> : <Copy size={12} />}
           </button>
         </div>
       </div>

@@ -49,7 +49,7 @@ export default function ComposerPrediction({
       ref={ref}
       data-testid="composer-prediction"
       className={cn(
-        "pointer-events-none absolute inset-y-0 left-1 right-1 overflow-hidden whitespace-pre-wrap break-words py-1.5 leading-relaxed",
+        "pointer-events-none absolute inset-y-0 left-1 right-1 overflow-hidden whitespace-pre-wrap break-words py-1 leading-relaxed sm:py-1.5",
         large ? "text-[17.5px]" : "text-base md:text-sm",
       )}
     >

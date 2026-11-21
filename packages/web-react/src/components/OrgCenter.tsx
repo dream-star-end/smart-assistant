@@ -1,11 +1,12 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { Building2, Lock, X } from "lucide-react";
+import { Lock, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { canManageOrgBilling } from "../lib/orgBilling";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import type { AuthSession, OrgRole, OrgSubscriptionInfo, User } from "../lib/types";
 import { Badge, IconButton, Tabs } from "./ui";
+import { AtelierLazyIcon } from "./ui/AtelierLazyIcons";
 import { CreateOrgWizard } from "./org/CreateOrgWizard";
 import { InvoicesTab } from "./org/InvoicesTab";
 import { MembersTab } from "./org/MembersTab";
@@ -142,7 +143,7 @@ export function OrgCenter({
                   className="oc-icon-badge oc-icon-badge-accent size-7 shrink-0 rounded-lg"
                   aria-hidden="true"
                 >
-                  <Building2 size={14} strokeWidth={1.9} />
+                  <AtelierLazyIcon name="org" size={15} />
                 </span>
                 <Dialog.Title className="min-w-0 truncate text-title font-semibold tracking-tight text-fg">
                   {showWizard ? "创建组织" : (user?.org?.name ?? "组织")}

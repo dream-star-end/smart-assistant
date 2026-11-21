@@ -3,9 +3,11 @@
  * 二者都在 MarkdownImpl(懒加载 chunk)内按需用：mermaid 库再经 dynamic import 拆成
  * 独立 chunk(只有真出现 ```mermaid 才下载,不拖累首屏与普通对话)。
  */
+import * as Dialog from "@radix-ui/react-dialog";
+import { Check, Code2, Copy, Eye, Maximize2, X } from "lucide-react";
+import { type ReactNode, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { chatInteractionUnavailableText, useChatInteraction } from "./tool/context";
 import { OptionsGroupFooter, OptionsGroupProvider, useOptionsGroup, useOptionsGroupSnapshot } from "./optionsGroup";
-import { useMemo, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 
 /** 主题响应:观察 <html> class(useTheme 切换写入 .dark)。mermaid/chart 的配色在渲染时
  *  快照,若不进依赖,切明暗主题后已渲染的图配色错乱(暗底浅字/浅底暗字)。 */
@@ -21,10 +23,136 @@ function useIsDark(): boolean {
   return dark;
 }
 
+function readCssToken(name: string, fallback: string): string {
+  if (typeof document === "undefined" || typeof getComputedStyle !== "function") return fallback;
+  const val = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return val || fallback;
+}
+
+const toolbarBtnCls =
+  "oc-spring-press inline-flex items-center justify-center rounded-md p-1.5 text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11";
+
+function RichBlockToolbar({
+  code,
+  showSource,
+  onToggleSource,
+  onExpand,
+  canExpand = true,
+}: {
+  code: string;
+  showSource: boolean;
+  onToggleSource: () => void;
+  onExpand: () => void;
+  canExpand?: boolean;
+}) {
+  const [copied, setCopied] = useState(false);
+  const timerRef = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+    },
+    [],
+  );
+
+  const handleCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard?.writeText(code);
+      setCopied(true);
+      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+      timerRef.current = window.setTimeout(() => {
+        timerRef.current = null;
+        setCopied(false);
+      }, 1800);
+    } catch {
+      /* clipboard unavailable */
+    }
+  }, [code]);
+
+  return (
+    <div
+      data-testid="rich-block-toolbar"
+      className="oc-surface-glass absolute right-2.5 top-2.5 z-10 flex items-center gap-0.5 rounded-lg p-0.5 opacity-0 transition-opacity duration-150 group-hover/rich:opacity-100 group-focus-within/rich:opacity-100 [@media(hover:none)]:opacity-100"
+    >
+      <button
+        type="button"
+        aria-label={showSource ? "查看图表" : "查看源码"}
+        title={showSource ? "查看图表" : "查看源码"}
+        onClick={onToggleSource}
+        className={toolbarBtnCls}
+      >
+        {showSource ? <Eye size={14} /> : <Code2 size={14} />}
+      </button>
+      <button
+        type="button"
+        aria-label={copied ? "已复制源码" : "复制源码"}
+        title={copied ? "已复制" : "复制源码"}
+        onClick={() => void handleCopy()}
+        className={toolbarBtnCls}
+      >
+        {copied ? <Check size={14} className="oc-check-pop text-success" /> : <Copy size={14} />}
+      </button>
+      {canExpand && (
+        <button
+          type="button"
+          aria-label="全屏放大预览"
+          title="全屏放大预览"
+          onClick={onExpand}
+          className={toolbarBtnCls}
+        >
+          <Maximize2 size={14} />
+        </button>
+      )}
+    </div>
+  );
+}
+
+function RichFullscreenModal({
+  open,
+  onOpenChange,
+  title,
+  children,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  title: string;
+  children: ReactNode;
+}) {
+  return (
+    <Dialog.Root open={open} onOpenChange={onOpenChange}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 z-[60] bg-fg/35 backdrop-blur-xs data-[state=open]:animate-fade" />
+        <Dialog.Content
+          aria-describedby={undefined}
+          className="oc-surface-popover oc-dialog-in fixed inset-3 z-[61] flex flex-col overflow-hidden rounded-2xl outline-none sm:inset-6"
+        >
+          <div className="flex shrink-0 items-center justify-between border-b border-border/80 px-4 py-2.5">
+            <Dialog.Title className="text-section font-semibold text-fg">{title}</Dialog.Title>
+            <Dialog.Close asChild>
+              <button
+                type="button"
+                aria-label="关闭全屏预览"
+                className="oc-spring-press inline-flex size-9 items-center justify-center rounded-lg text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11"
+              >
+                <X size={18} />
+              </button>
+            </Dialog.Close>
+          </div>
+          <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto p-4 sm:p-6">
+            {children}
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
+
 /** ```mermaid 代码块 → 渲染成 SVG 流程图;失败回退源码。 */
 export function MermaidBlock({ code }: { code: string }) {
   const [svg, setSvg] = useState<string | null>(null);
   const [err, setErr] = useState(false);
+  const [showSource, setShowSource] = useState(false);
+  const [fullscreen, setFullscreen] = useState(false);
   const rawId = useId();
   const isDark = useIsDark();
 
@@ -35,10 +163,38 @@ export function MermaidBlock({ code }: { code: string }) {
     (async () => {
       try {
         const mermaid = (await import("mermaid")).default;
+        const accent = readCssToken("--accent", isDark ? "hsl(16, 68%, 61%)" : "hsl(16, 71%, 38%)");
+        const fg = readCssToken("--fg", isDark ? "hsl(40, 18%, 94%)" : "hsl(240, 6%, 10%)");
+        const surface = readCssToken("--surface", isDark ? "hsl(240, 7%, 11%)" : "hsl(0, 0%, 100%)");
+        const bg = readCssToken("--bg", isDark ? "hsl(240, 5%, 8%)" : "hsl(45, 25%, 97%)");
+        const bubble = readCssToken("--bubble", isDark ? "hsl(240, 7%, 14%)" : "hsl(43, 21%, 93%)");
+        const borderControl = readCssToken("--border-control", isDark ? "hsl(40, 4%, 44%)" : "hsl(40, 5%, 51%)");
+        const fontFamily = readCssToken("--font-sans", "sans-serif");
         mermaid.initialize({
           startOnLoad: false,
           securityLevel: "strict",
-          theme: isDark ? "dark" : "default",
+          theme: "base",
+          themeVariables: {
+            darkMode: isDark,
+            background: surface,
+            primaryColor: bubble,
+            primaryTextColor: fg,
+            primaryBorderColor: accent,
+            lineColor: accent,
+            secondaryColor: bg,
+            secondaryTextColor: fg,
+            secondaryBorderColor: borderControl,
+            tertiaryColor: surface,
+            tertiaryTextColor: fg,
+            mainBkg: bubble,
+            nodeBorder: accent,
+            clusterBkg: bg,
+            clusterBorder: borderControl,
+            edgeLabelBackground: surface,
+            titleColor: fg,
+            textColor: fg,
+            fontFamily,
+          },
         });
         // 先 parse 校验(suppressErrors→只返 bool,不向 document.body 注入错误图)。
         // 流式时代码常是半截 → parse=false → 回退源码,绝不调 render(render 对坏输入会把
@@ -67,18 +223,50 @@ export function MermaidBlock({ code }: { code: string }) {
   }
   if (!svg) {
     return (
-      <div className="oc-surface-card my-3 flex items-center justify-center rounded-xl px-4 py-7 text-meta text-faint">
-        图表渲染中…
+      <div
+        role="status"
+        aria-live="polite"
+        className="oc-surface-card my-3 flex flex-col items-center gap-3 rounded-xl px-5 py-6"
+      >
+        <div aria-hidden className="flex w-full max-w-sm items-center justify-center gap-3">
+          <span className="oc-img-skeleton h-9 flex-1 rounded-lg" />
+          <span className="h-0.5 w-6 rounded-full bg-border-strong" />
+          <span className="oc-img-skeleton h-9 flex-1 rounded-lg" />
+          <span className="h-0.5 w-6 rounded-full bg-border-strong" />
+          <span className="oc-img-skeleton h-9 flex-1 rounded-lg" />
+        </div>
+        <span className="text-caption text-faint">图表渲染中…</span>
       </div>
     );
   }
   return (
-    // mermaid securityLevel:'strict' 已清洗 SVG
-    <div
-      className="oc-surface-card my-3 flex justify-center overflow-x-auto rounded-xl p-4"
-      // biome-ignore lint/security/noDangerouslySetInnerHtml: mermaid strict-sanitized SVG
-      dangerouslySetInnerHTML={{ __html: svg }}
-    />
+    <div className="group/rich relative my-3 not-prose">
+      <RichBlockToolbar
+        code={code}
+        showSource={showSource}
+        onToggleSource={() => setShowSource((v) => !v)}
+        onExpand={() => setFullscreen(true)}
+      />
+      {showSource ? (
+        <pre className="oc-code-shell overflow-auto rounded-xl bg-code px-3.5 py-3 pr-28 font-mono text-meta text-fg">
+          {code}
+        </pre>
+      ) : (
+        // mermaid securityLevel:'strict' 已清洗 SVG
+        <div
+          className="oc-surface-card flex justify-center overflow-x-auto rounded-xl p-4"
+          // biome-ignore lint/security/noDangerouslySetInnerHtml: mermaid strict-sanitized SVG
+          dangerouslySetInnerHTML={{ __html: svg }}
+        />
+      )}
+      <RichFullscreenModal open={fullscreen} onOpenChange={setFullscreen} title="流程图预览">
+        <div
+          className="flex max-h-full max-w-full items-center justify-center [&_svg]:h-auto [&_svg]:max-h-[80dvh] [&_svg]:max-w-full"
+          // biome-ignore lint/security/noDangerouslySetInnerHtml: mermaid strict-sanitized SVG
+          dangerouslySetInnerHTML={{ __html: svg }}
+        />
+      </RichFullscreenModal>
+    </div>
   );
 }
 
@@ -442,7 +630,7 @@ function OptionsCardItem({ parsed, readOnly }: { parsed: ParsedOptionsItem; read
                     : "border-border-strong/70 bg-surface text-faint group-hover/opt:border-accent/50 group-hover/opt:text-accent")
                 }
               >
-                {chosen ? "✓" : badgeChar}
+                {chosen ? <Check size={11} strokeWidth={2.75} className="oc-check-pop" /> : badgeChar}
               </span>
               <span className="min-w-0 flex-1">
                 <span className="block text-body font-medium leading-snug text-fg">{o.label}</span>
@@ -576,21 +764,22 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
   return content;
 }
 
-/** ```chart 代码块(Chart.js config JSON）→ canvas 图表;无效/半截回退源码(对齐 v3 markdown.js）。 */
-export function ChartBlock({ code }: { code: string }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [err, setErr] = useState(false);
-  const isDark = useIsDark();
-
+function useChartInstance(
+  canvasRef: React.RefObject<HTMLCanvasElement | null>,
+  code: string,
+  isDark: boolean,
+  active: boolean,
+  onError?: () => void,
+) {
   useEffect(() => {
+    if (!active) return;
     let alive = true;
     let chart: { destroy: () => void } | null = null;
-    setErr(false);
     let config: Record<string, unknown>;
     try {
       config = JSON.parse(code);
     } catch {
-      setErr(true); // 流式半截 / 非法 JSON → 回退源码,不动 chart.js
+      onError?.(); // 流式半截 / 非法 JSON → 回退源码,不动 chart.js
       return;
     }
     (async () => {
@@ -599,10 +788,8 @@ export function ChartBlock({ code }: { code: string }) {
         Chart.register(...registerables);
         if (!alive || !canvasRef.current) return;
         // 从 CSS 变量读 token(权威=styles.css),不手抄 hex 副本 —— token 改版不漂移。
-        const text =
-          getComputedStyle(document.documentElement).getPropertyValue("--muted").trim() ||
-          (isDark ? "#bcbcc7" : "#51515c");
-        const grid = isDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.08)";
+        const text = readCssToken("--muted", isDark ? "hsl(40, 5%, 60%)" : "hsl(45, 5%, 35%)");
+        const grid = readCssToken("--border", isDark ? "hsla(40, 18%, 94%, 0.09)" : "hsla(24, 10%, 10%, 0.09)");
         const opts = (config.options ??= {}) as Record<string, any>;
         ((opts.plugins ??= {}).legend ??= {}).labels ??= {};
         opts.plugins.legend.labels.color ??= text;
@@ -617,7 +804,7 @@ export function ChartBlock({ code }: { code: string }) {
         // biome-ignore lint/suspicious/noExplicitAny: chart.js config 是动态 JSON
         chart = new Chart(canvasRef.current, config as any);
       } catch {
-        if (alive) setErr(true);
+        if (alive) onError?.();
       }
     })();
     return () => {
@@ -628,7 +815,29 @@ export function ChartBlock({ code }: { code: string }) {
         /* ignore */
       }
     };
+  }, [canvasRef, code, isDark, active, onError]);
+}
+
+function FullscreenChartCanvas({ code, isDark }: { code: string; isDark: boolean }) {
+  const fullCanvasRef = useRef<HTMLCanvasElement>(null);
+  useChartInstance(fullCanvasRef, code, isDark, true);
+  return <canvas ref={fullCanvasRef} className="max-h-[78dvh] w-full max-w-5xl" />;
+}
+
+/** ```chart 代码块(Chart.js config JSON）→ canvas 图表;无效/半截回退源码(对齐 v3 markdown.js）。 */
+export function ChartBlock({ code }: { code: string }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [err, setErr] = useState(false);
+  const [showSource, setShowSource] = useState(false);
+  const [fullscreen, setFullscreen] = useState(false);
+  const isDark = useIsDark();
+
+  useEffect(() => {
+    setErr(false);
   }, [code, isDark]);
+
+  const markError = useCallback(() => setErr(true), []);
+  useChartInstance(canvasRef, code, isDark, !showSource, markError);
 
   if (err) {
     return (
@@ -636,8 +845,25 @@ export function ChartBlock({ code }: { code: string }) {
     );
   }
   return (
-    <div className="oc-surface-card my-3 rounded-xl p-4">
-      <canvas ref={canvasRef} className="max-h-80 w-full" />
+    <div className="group/rich relative my-3 not-prose">
+      <RichBlockToolbar
+        code={code}
+        showSource={showSource}
+        onToggleSource={() => setShowSource((v) => !v)}
+        onExpand={() => setFullscreen(true)}
+      />
+      {showSource ? (
+        <pre className="oc-code-shell overflow-auto rounded-xl bg-code px-3.5 py-3 pr-28 font-mono text-meta text-fg">
+          {code}
+        </pre>
+      ) : (
+        <div className="oc-surface-card rounded-xl p-4">
+          <canvas ref={canvasRef} className="max-h-80 w-full" />
+        </div>
+      )}
+      <RichFullscreenModal open={fullscreen} onOpenChange={setFullscreen} title="图表预览">
+        {fullscreen && <FullscreenChartCanvas code={code} isDark={isDark} />}
+      </RichFullscreenModal>
     </div>
   );
 }

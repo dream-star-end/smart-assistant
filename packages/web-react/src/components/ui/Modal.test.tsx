@@ -43,4 +43,18 @@ describe("F4 Modal 最大高度 dvh 收口", () => {
     expect(dialog.className).toContain("pt-[env(safe-area-inset-top)]");
     expect(dialog.className).toContain("pb-[env(safe-area-inset-bottom)]");
   });
+
+  test("接入微焦距进退场与遮罩柔淡退场动画类（OCV5-838）", () => {
+    render(
+      <Modal open onOpenChange={() => {}} srTitle="动效弹层">
+        <p>body</p>
+      </Modal>,
+    );
+    const dialog = screen.getByRole("dialog", { name: "动效弹层" });
+    expect(dialog.className).toContain("data-[state=open]:oc-dialog-in");
+    expect(dialog.className).toContain("data-[state=closed]:oc-dialog-out");
+    const overlay = document.querySelector(".bg-black\\/40");
+    expect(overlay?.className).toContain("data-[state=open]:oc-backdrop-in");
+    expect(overlay?.className).toContain("data-[state=closed]:oc-backdrop-out");
+  });
 });

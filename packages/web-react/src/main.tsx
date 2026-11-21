@@ -1,7 +1,6 @@
-import { StrictMode } from 'react'
+import { lazy, StrictMode, Suspense } from 'react'
 import { createRoot } from 'react-dom/client'
 import { App, prefetchLazyCentersOnIdle } from './App'
-import { LegalPage } from './components/LegalPage'
 import { ToastProvider, TooltipProvider } from './components/ui'
 import { registerServiceWorker } from './registerSW'
 import { installGlobalClientFrictionHandlers } from './lib/clientFriction'
@@ -11,6 +10,11 @@ import './styles.css'
 // 法律文本静态页(/terms /privacy):纯静态、无任何 App 状态,在入口层短路,
 // 不走 App 的路由/鉴权/WS 体系(App 内的 /reset-password 特判需要 AuthGate,故留在 App)。
 // 依赖 gateway SPA fallback 对无扩展名路径回退 index.html。
+// 仅访问法务路径时按需加载 LegalPage 与 lib/legal.ts,不占首屏闭包。
+const LegalPage = lazy(() =>
+  import('./components/LegalPage').then((m) => ({ default: m.LegalPage })),
+)
+
 const legalKind =
   location.pathname === '/terms' ? 'terms' : location.pathname === '/privacy' ? 'privacy' : null
 
@@ -23,7 +27,13 @@ void waitForEntryStyles().then(() => {
     <StrictMode>
       <ToastProvider>
         <TooltipProvider>
-          {legalKind ? <LegalPage kind={legalKind} /> : <App />}
+          {legalKind ? (
+            <Suspense fallback={null}>
+              <LegalPage kind={legalKind} />
+            </Suspense>
+          ) : (
+            <App />
+          )}
         </TooltipProvider>
       </ToastProvider>
     </StrictMode>,

@@ -7,7 +7,7 @@
  *   - 对接 `POST /api/sessions/:id/swarm/command`，诚实清晰区分 `requested`、`confirmed` 与 `already_killed`。
  */
 import type { SwarmMemberSnapshot } from "@openclaude/protocol/browser";
-import { AlertTriangle, CheckCircle2, OctagonX, Send, ShieldAlert, X } from "lucide-react";
+import { AlertTriangle, Check, CheckCircle2, ChevronDown, OctagonX, Send, ShieldAlert, X } from "lucide-react";
 import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useMemo, useState } from "react";
 import {
   type SwarmTerminateStatus,
@@ -16,7 +16,18 @@ import {
 } from "../../lib/api/wave4Api";
 import type { AuthSession } from "../../lib/types";
 import { cn } from "../../lib/utils";
-import { Alert, Badge, Button, Spinner, useToast } from "../ui";
+import {
+  Alert,
+  Badge,
+  Button,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  IconButton,
+  Spinner,
+  useToast,
+} from "../ui";
 
 export type SwarmCommandBarProps = {
   sessionId?: string | null;
@@ -161,25 +172,28 @@ export function SwarmCommandBar({
             <Alert tone="danger">{feedback.message}</Alert>
           ) : feedback.kind === "steer" ? (
             <div className="flex items-center justify-between gap-2 rounded-lg border border-border bg-bg px-2.5 py-1.5 text-caption text-fg">
-              <span className="inline-flex items-center gap-1.5">
+              <span className="inline-flex min-w-0 items-center gap-1.5">
                 <CheckCircle2 size={13} className="shrink-0 text-success" aria-hidden />
-                已向 <strong className="font-mono">@{feedback.target}</strong> 注入纠偏指令（#{feedback.seq}）
+                <span className="truncate">
+                  已向 <strong className="font-mono">@{feedback.target}</strong> 注入纠偏指令（#{feedback.seq}）
+                </span>
               </span>
-              <button
-                type="button"
+              <IconButton
+                size="sm"
+                shape="square"
                 aria-label="关闭提示"
                 onClick={() => setFeedback(null)}
-                className="text-faint hover:text-fg"
+                className="oc-spring-press size-6 shrink-0"
               >
                 <X size={12} />
-              </button>
+              </IconButton>
             </div>
           ) : (
             <div
               data-terminate-status={feedback.status}
               className="flex items-center justify-between gap-2 rounded-lg border border-border bg-bg px-2.5 py-1.5 text-caption text-fg"
             >
-              <span className="inline-flex flex-wrap items-center gap-1.5">
+              <span className="inline-flex min-w-0 flex-wrap items-center gap-1.5">
                 {feedback.status === "confirmed" ? (
                   <>
                     <Badge tone="success" size="sm">已确认终止</Badge>
@@ -200,14 +214,15 @@ export function SwarmCommandBar({
                   </>
                 )}
               </span>
-              <button
-                type="button"
+              <IconButton
+                size="sm"
+                shape="square"
                 aria-label="关闭状态反馈"
                 onClick={() => setFeedback(null)}
-                className="text-faint hover:text-fg"
+                className="oc-spring-press size-6 shrink-0"
               >
                 <X size={12} />
-              </button>
+              </IconButton>
             </div>
           )}
         </div>
@@ -260,24 +275,40 @@ export function SwarmCommandBar({
         </div>
       )}
 
-      {/* 主操控输入行 */}
-      <div className="flex flex-wrap items-center gap-2">
-        <select
-          aria-label="选择纠偏目标成员"
-          data-testid="swarm-command-target"
-          value={target}
-          onChange={(e) => {
-            setTarget(e.target.value);
-            setConfirmKill(false);
-          }}
-          className="oc-field-control h-9 max-w-40 shrink-0 rounded-lg border border-border-control bg-surface px-2 text-base font-medium text-fg outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-ring md:h-8 md:text-sm"
-        >
-          {targetOptions.map((opt) => (
-            <option key={opt.value} value={opt.value}>
-              {opt.label}
-            </option>
-          ))}
-        </select>
+      {/* 主操控输入行：紧凑流式布局 + DropdownMenu 精致成员选择胶囊 */}
+      <div className="flex flex-wrap items-center gap-1.5 sm:flex-nowrap sm:gap-2">
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              aria-label="选择纠偏目标成员"
+              data-testid="swarm-command-target"
+              data-target-value={currentOpt?.value ?? target}
+              className="oc-btn-tactile oc-btn-secondary-craft oc-spring-press inline-flex h-9 max-w-[11rem] shrink-0 items-center gap-1 rounded-full px-2.5 text-caption font-medium text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-10 md:h-8"
+            >
+              <span className="truncate font-mono">@{currentOpt?.value ?? target}</span>
+              <ChevronDown size={12} strokeWidth={1.85} aria-hidden className="shrink-0 text-faint" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="start" side="top" className="max-h-[min(45dvh,16rem)] min-w-[12.5rem] overflow-y-auto">
+            {targetOptions.map((opt) => {
+              const selected = opt.value === target;
+              return (
+                <DropdownMenuItem
+                  key={opt.value}
+                  data-testid={`swarm-command-target-option-${opt.value}`}
+                  onSelect={() => {
+                    setTarget(opt.value);
+                    setConfirmKill(false);
+                  }}
+                >
+                  <span className="min-w-0 flex-1 truncate font-mono text-meta">{opt.label}</span>
+                  {selected && <Check size={13} strokeWidth={2.25} aria-hidden className="shrink-0 text-accent" />}
+                </DropdownMenuItem>
+              );
+            })}
+          </DropdownMenuContent>
+        </DropdownMenu>
 
         <input
           type="text"
@@ -294,10 +325,10 @@ export function SwarmCommandBar({
                 : `向 @${target} 补充指令（当前蜂群未运行）`
               : "仅在在线登录会话中支持实时下发蜂群控制指令"
           }
-          className="oc-field-control h-9 min-w-0 flex-1 rounded-lg border border-border-control bg-surface px-3 text-base text-fg outline-none placeholder:text-faint focus:border-accent focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 md:h-8 md:text-sm"
+          className="oc-field-control h-9 min-w-[9rem] flex-1 rounded-lg border border-border-control bg-surface px-3 text-base text-fg outline-none placeholder:text-faint focus:border-accent focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 md:h-8 md:text-sm"
         />
 
-        <div className="flex shrink-0 items-center gap-1.5">
+        <div className="ml-auto flex shrink-0 items-center gap-1.5 sm:ml-0">
           <Button
             type="button"
             size="sm"
@@ -305,7 +336,7 @@ export function SwarmCommandBar({
             disabled={!canDispatch || !message.trim() || sending}
             data-testid="swarm-command-send"
             onClick={() => void handleSendSteer()}
-            className="h-9 md:h-8"
+            className="oc-spring-press h-9 md:h-8"
           >
             {sending ? <Spinner size={12} /> : <Send size={12} aria-hidden />}
             发送指令
@@ -320,7 +351,7 @@ export function SwarmCommandBar({
               data-testid="swarm-terminate-trigger"
               onClick={() => setConfirmKill((v) => !v)}
               title={`向 @coordinator 请求单点终止 @${target}`}
-              className={cn("h-9 text-danger md:h-8", confirmKill && "ring-2 ring-ring")}
+              className={cn("oc-spring-press h-9 text-danger md:h-8", confirmKill && "ring-2 ring-ring")}
             >
               <AlertTriangle size={12} aria-hidden />
               请求终止

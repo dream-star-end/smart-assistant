@@ -169,7 +169,7 @@ describe('MarkdownImpl 流式光标(caret)', () => {
     expect(nodes).toHaveLength(1)
     const node = nodes[0]
     expect(node.tagName.toLowerCase()).toBe('span')
-    expect(node).toHaveClass('caret-blink', 'inline-block', 'bg-current')
+    expect(node).toHaveClass('caret-blink', 'inline-block', 'rounded-full', 'bg-accent')
     expect(node).toHaveAttribute('aria-hidden', 'true')
     const paragraphs = container.querySelectorAll('.prose > p')
     expect(paragraphs).toHaveLength(2)

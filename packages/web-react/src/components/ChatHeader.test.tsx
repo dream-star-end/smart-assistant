@@ -118,7 +118,7 @@ describe("ChatHeader 未读状态点降噪（OCV5-820 消灭 99+/40 红紫数字
     expect(sessionDot).toBeTruthy();
     expect(sessionDot).toHaveTextContent("");
     expect(sessionDot).toHaveAttribute("data-unread-count", "128");
-    expect(sessionDot).toHaveClass("size-1.5", "rounded-full", "bg-accent", "motion-safe:animate-pulse");
+    expect(sessionDot).toHaveClass("size-1.5", "rounded-full", "bg-accent", "oc-alive-dot");
     expect(menu.parentElement?.textContent).not.toContain("99+");
 
     const inboxBtn = screen.getByRole("button", { name: "站内信，40 条未读" });

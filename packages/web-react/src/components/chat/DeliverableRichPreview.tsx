@@ -24,7 +24,6 @@ import {
   Presentation,
   RotateCw,
   Search,
-  Sparkles,
 } from "lucide-react";
 import {
   Component,
@@ -53,6 +52,7 @@ import {
   looksLikePdf,
 } from "../project/outputPreview";
 import { Badge, Button, IconButton, Skeleton, Spinner, useToast } from "../ui";
+import { AtelierIcon } from "../ui/AtelierIcons";
 import {
   type AnnotationAnchor,
   type DeliverableMeta,
@@ -807,7 +807,7 @@ function BinaryOfficeCard({
             data-testid="binary-office-convert"
             onClick={() => void onDispatchPrompt(meta.agentConvertPrompt as string, "已将导出预览指令填入输入框")}
           >
-            <Sparkles size={14} aria-hidden />
+            <AtelierIcon name="sparkles" size={14} />
             {ctaLabel}
           </Button>
         )}
@@ -958,7 +958,7 @@ function PdfPreviewView({
               )
             }
           >
-            <Sparkles size={14} aria-hidden />
+            <AtelierIcon name="sparkles" size={14} />
             让 Agent 提炼摘要
           </Button>
         )}
@@ -1011,8 +1011,13 @@ export function DeliverableRichPreview({
 
   const [annotateOpen, setAnnotateOpen] = useState(false);
   const [previewFailed, setPreviewFailed] = useState(false);
+  const [nativeOfficeReady, setNativeOfficeReady] = useState(false);
   const [anchor, setAnchor] = useState<AnnotationAnchor>({ kind: "file" });
   const [excerpt, setExcerpt] = useState<string | undefined>(undefined);
+
+  useEffect(() => {
+    setNativeOfficeReady(false);
+  }, [path]);
 
   const handlePreviewError = useCallback(
     (failed: boolean) => {
@@ -1091,6 +1096,10 @@ export function DeliverableRichPreview({
                 auth={effectiveAuth}
                 compact={isCompact}
                 onAnnotate={openAnchoredAnnotate}
+                onNativeReady={setNativeOfficeReady}
+                fileOverflow={showActionBar ? <FileOverflowMenu path={path} name={name} /> : undefined}
+                annotateOpen={annotateOpen}
+                onToggleFileAnnotate={toggleFileAnnotate}
                 fallback={binaryCard}
               />
             </Suspense>
@@ -1159,7 +1168,7 @@ export function DeliverableRichPreview({
       data-compact={isCompact ? "true" : undefined}
       data-testid="deliverable-rich-preview"
     >
-      {showActionBar && !usesBottomBar && (
+      {showActionBar && !usesBottomBar && !nativeOfficeReady && (
         <UnifiedActionBar
           path={path}
           name={name}

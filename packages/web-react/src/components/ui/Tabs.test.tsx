@@ -85,4 +85,38 @@ describe("Tabs aria-controls 只指向真实挂载的面板", () => {
     expect(tab).not.toHaveAttribute("aria-controls");
     expect(tab).not.toHaveAttribute("id");
   });
+
+  it("单行测量态渲染平滑滑动高亮底板，切 tab 时沿 translate3d + width 滑动；多行/grid 态安全回退", () => {
+    const { container, rerender } = render(<Tabs value="a" onValueChange={() => {}} items={ITEMS} aria-label="演示" />);
+    const tabs = screen.getAllByRole("tab");
+    const rects = [
+      { left: 4, top: 4, width: 64, height: 32 },
+      { left: 72, top: 4, width: 72, height: 32 },
+      { left: 148, top: 4, width: 68, height: 32 },
+    ];
+    tabs.forEach((tab, idx) => {
+      Object.defineProperty(tab, "offsetLeft", { configurable: true, get: () => rects[idx].left });
+      Object.defineProperty(tab, "offsetTop", { configurable: true, get: () => rects[idx].top });
+      Object.defineProperty(tab, "offsetWidth", { configurable: true, get: () => rects[idx].width });
+      Object.defineProperty(tab, "offsetHeight", { configurable: true, get: () => rects[idx].height });
+    });
+
+    rerender(<Tabs value="b" onValueChange={() => {}} items={ITEMS} aria-label="演示" />);
+    const thumb = container.querySelector("[data-tab-indicator]") as HTMLElement | null;
+    expect(thumb).not.toBeNull();
+    expect(thumb?.style.transform).toBe("translate3d(72px, 4px, 0)");
+    expect(thumb?.style.width).toBe("72px");
+
+    rerender(<Tabs value="c" onValueChange={() => {}} items={ITEMS} aria-label="演示" />);
+    const movedThumb = container.querySelector("[data-tab-indicator]") as HTMLElement | null;
+    expect(movedThumb?.style.transform).toBe("translate3d(148px, 4px, 0)");
+    expect(movedThumb?.style.width).toBe("68px");
+    expect(movedThumb?.style.transition).toContain("220ms var(--ease-spring)");
+
+    // 模拟多行折行态：安全回退为单按钮静态高光，移除滑动底板
+    rects[2].top = 42;
+    rerender(<Tabs value="a" onValueChange={() => {}} items={ITEMS} aria-label="演示" />);
+    expect(container.querySelector("[data-tab-indicator]")).toBeNull();
+    expect(screen.getByRole("tab", { name: "概览" })).toHaveClass("oc-segmented-thumb");
+  });
 });

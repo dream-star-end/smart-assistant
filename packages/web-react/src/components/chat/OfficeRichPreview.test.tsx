@@ -111,8 +111,24 @@ describe("OfficeRichPreview · PPTX / DOCX 零轮次高保真预览", () => {
     );
 
     expect(await screen.findByTestId("office-preview-pages")).toBeInTheDocument();
+    // 原生保真预览就绪后自动合并重复顶栏，不再渲染外层 deliverable-action-bar
+    await waitFor(() => expect(screen.queryByTestId("deliverable-action-bar")).toBeNull());
     expect(screen.getByTestId("office-page-counter")).toHaveTextContent("第 1 / 2 页");
-    expect(await screen.findByTestId("office-stage-image")).toHaveAttribute("src", "blob:mock-office-page");
+    const stageImg = await screen.findByTestId("office-stage-image");
+    expect(stageImg).toHaveAttribute("src", "blob:mock-office-page");
+
+    // tabIndex=0 键盘左右翻页 + 点击主图全屏放大灯箱
+    const pagesShell = screen.getByTestId("office-preview-pages");
+    expect(pagesShell).toHaveAttribute("tabindex", "0");
+    fireEvent.keyDown(pagesShell, { key: "ArrowRight" });
+    expect(screen.getByTestId("office-page-counter")).toHaveTextContent("第 2 / 2 页");
+    fireEvent.keyDown(pagesShell, { key: "ArrowLeft" });
+    expect(screen.getByTestId("office-page-counter")).toHaveTextContent("第 1 / 2 页");
+
+    fireEvent.click(await screen.findByTestId("office-stage-image"));
+    expect(await screen.findByTestId("office-stage-lightbox")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "关闭全屏预览" }));
+    await waitFor(() => expect(screen.queryByTestId("office-stage-lightbox")).toBeNull());
 
     // 展开讲稿备注
     fireEvent.click(screen.getByRole("button", { name: "讲稿备注" }));

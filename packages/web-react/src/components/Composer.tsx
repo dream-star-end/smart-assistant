@@ -206,8 +206,8 @@ function EnvironmentPrepBar() {
       <div className="oc-surface-recessed h-1.5 overflow-hidden rounded-full" aria-hidden>
         <div
           className={cn(
-            "oc-progress-fill h-full rounded-full bg-accent transition-[width] duration-200",
-            overdue && "animate-pulse",
+            "h-full rounded-full transition-[width] duration-200",
+            overdue ? "oc-indeterminate-bar" : "oc-progress-fill bg-accent",
           )}
           style={{ width: overdue ? "100%" : `${pct}%` }}
         />
@@ -359,6 +359,7 @@ export function Composer({
   // 「+」菜单受控开合:附件项须在 onSelect 里 preventDefault 阻止 Radix 同步关菜单
   // (卸载会杀掉 label 的原生激活,见附件项注释),菜单关闭改由我们在宏任务里手动触发。
   const [plusMenuOpen, setPlusMenuOpen] = useState(false);
+  const [playbookOpen, setPlaybookOpen] = useState(false);
   const toast = useToast();
   const [voiceMsg, setVoiceMsg] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
@@ -984,6 +985,58 @@ export function Composer({
             </LazyBoundary>
           </div>
         )}
+        {/* 输入区上方轻提示条：承接触屏「填入建议」、停止/上传状态、超长草稿与字数，确保 375px 底栏发送键永不溢出。 */}
+        {((coarsePointer && ghostRest && !busy) ||
+          stopping ||
+          (!busy && (attachFailed || uploading)) ||
+          draftVolatile ||
+          value.length > 2000) && (
+          <div
+            data-testid="composer-status-strip"
+            className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 border-b border-border/40 px-3.5 py-1.5 text-caption"
+          >
+            {coarsePointer && ghostRest && !busy && (
+              <button
+                type="button"
+                data-product-control
+                data-testid="composer-accept-prediction-touch"
+                onClick={acceptPrediction}
+                className="oc-btn-tactile oc-btn-secondary-craft oc-spring-press inline-flex min-h-10 shrink-0 items-center rounded-full px-3 text-caption font-medium text-accent [@media(hover:none)]:min-h-11"
+              >
+                填入建议
+              </button>
+            )}
+            {stopping && (
+              <output
+                data-testid="composer-stopping-status"
+                className="inline-flex items-center gap-1 text-caption text-muted"
+                aria-live="polite"
+              >
+                正在停止…
+              </output>
+            )}
+            {!busy && (attachFailed || uploading) && (
+              <output
+                data-testid="composer-send-blocked-reason"
+                className={cn("text-caption", attachFailed ? "text-danger" : "text-faint")}
+              >
+                {attachFailed ? "有附件上传失败" : "附件上传中…"}
+              </output>
+            )}
+            {draftVolatile && (
+              <output
+                data-testid="composer-draft-volatile"
+                className="text-caption text-warning"
+                title="草稿超过本地保存上限，只保留在内存中；刷新或关闭页面后不再恢复"
+              >
+                草稿过长，刷新后不保留
+              </output>
+            )}
+            {value.length > 2000 && (
+              <span className="ml-auto shrink-0 text-caption text-faint tabular-nums">{value.length} 字</span>
+            )}
+          </div>
+        )}
         {/* 两行式布局(C-01/C-14):第一行 textarea 通栏,第二行工具行(左=附件/「+」/仓库,右=状态/语音/发送)。
             此前 4 个 44px 按钮与 textarea 同排:390px 下正文只剩约 138px、每行 8 个字;桌面多行草稿时
             按钮贴底、正文左侧空出一列。桌面也统一两行,附件区/引用块与正文左沿对齐。 */}
@@ -1105,7 +1158,7 @@ export function Composer({
               enterKeyHint={coarsePointer ? "enter" : "send"}
               placeholder={value === "" && ghostRest ? "" : effectivePlaceholder}
               className={cn(
-                "max-h-[240px] min-h-[24px] w-full flex-1 resize-none bg-transparent py-1 leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50 sm:py-1.5",
+                "max-h-[min(140px,28dvh)] min-h-[24px] w-full flex-1 resize-none bg-transparent py-1 leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50 sm:max-h-[240px] sm:py-1.5",
                 fontSize === "large" ? "text-[17.5px]" : "text-base md:text-sm",
               )}
             />
@@ -1180,6 +1233,11 @@ export function Composer({
               onOpenGoal={() => setGoalOpen(true)}
               onOpenRepo={onOpenRepo}
               repoSelection={repoSelection}
+              hasSwarmPlaybooks={Boolean(swarmSupported && onToggleSwarmMode)}
+              onOpenSwarmPlaybooks={() => {
+                setPlusMenuOpen(false);
+                window.setTimeout(() => setPlaybookOpen(true), 0);
+              }}
             />
             {((onOpenRepo && !hasBoundRepo) || (swarmSupported && onToggleSwarmMode)) && (
               <span aria-hidden className="mx-0.5 hidden h-4 w-px shrink-0 bg-border/70 sm:block" />
@@ -1191,7 +1249,7 @@ export function Composer({
               </span>
             )}
             {swarmSupported && onToggleSwarmMode && (
-              <div className="relative flex shrink-0 items-center gap-1">
+              <div className="relative flex min-w-0 shrink-0 items-center gap-1">
                 <button
                   type="button"
                   data-testid="composer-swarm-toggle"
@@ -1225,6 +1283,9 @@ export function Composer({
                 <SwarmPlaybookPopoverLazy
                   disabled={disabled}
                   currentText={value}
+                  open={playbookOpen}
+                  onOpenChange={setPlaybookOpen}
+                  triggerClassName="hidden sm:inline-flex"
                   onSelectPlaybook={(draft) => {
                     setValue(draft);
                     if (!swarmMode) onToggleSwarmMode();
@@ -1234,49 +1295,6 @@ export function Composer({
               </div>
             )}
             <div className="ml-auto flex shrink-0 items-center gap-1.5">
-              {/* 触屏端无 Tab/→ 键：有输入预测时在工具行提供可点击采纳胶囊（桌面不显示，保持无额外视觉噪点）。 */}
-              {coarsePointer && ghostRest && !busy && (
-                <button
-                  type="button"
-                  data-product-control
-                  data-testid="composer-accept-prediction-touch"
-                  onClick={acceptPrediction}
-                  className="oc-btn-tactile oc-btn-secondary-craft oc-spring-press inline-flex min-h-11 shrink-0 items-center rounded-full px-3 text-caption font-medium text-accent"
-                >
-                  填入建议
-                </button>
-              )}
-              {stopping && (
-                <output
-                  data-testid="composer-stopping-status"
-                  className="inline-flex items-center gap-1 text-caption text-muted"
-                  aria-live="polite"
-                >
-                  正在停止…
-                </output>
-              )}
-              {value.length > 2000 && (
-                <span className="text-caption text-faint tabular-nums">{value.length} 字</span>
-              )}
-              {/* 草稿超过 20KB 只留内存、刷新丢失,此前毫无预警(C-21)。 */}
-              {draftVolatile && (
-                <output
-                  data-testid="composer-draft-volatile"
-                  className="hidden text-caption text-warning sm:inline"
-                  title="草稿超过本地保存上限，只保留在内存中；刷新或关闭页面后不再恢复"
-                >
-                  草稿过长，刷新后不保留
-                </output>
-              )}
-              {/* 发送键禁用原因不再只放 hover title(触屏无 hover,C-10):可见 caption + role=status。 */}
-              {!busy && (attachFailed || uploading) && (
-                <output
-                  data-testid="composer-send-blocked-reason"
-                  className={cn("text-caption", attachFailed ? "text-danger" : "text-faint")}
-                >
-                  {attachFailed ? "有附件上传失败" : "附件上传中…"}
-                </output>
-              )}
               {/* 生成中排队发送(C-02):此前生成中唯一按钮是「停止」,桌面 Enter 排队无反馈,触屏 Enter=换行
                   → 根本没有排队入口。现在 busy 且有可发内容时给一个次级「排队发送」按钮;「停止」仍是唯一
                   Stop 控件(T35),本按钮 aria-label 不含「停止」。

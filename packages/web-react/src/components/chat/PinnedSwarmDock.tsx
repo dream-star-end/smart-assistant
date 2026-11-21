@@ -116,10 +116,7 @@ export function PinnedSwarmDock({
                     {memberInitial(m.name)}
                     {isWorking && (
                       <span
-                        className={cn(
-                          "absolute -bottom-0.5 -right-0.5 size-1.5 rounded-full ring-2 ring-elevated",
-                          "bg-accent animate-pulse",
-                        )}
+                        className="oc-alive-dot absolute -bottom-0.5 -right-0.5 size-1.5 rounded-full ring-2 ring-elevated"
                       />
                     )}
                   </span>

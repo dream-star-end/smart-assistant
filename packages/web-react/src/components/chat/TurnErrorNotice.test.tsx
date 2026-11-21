@@ -96,3 +96,59 @@ test("non-box_capacity_held errors keep Continue immediately clickable without c
   fireEvent.click(btn);
   expect(onContinue).toHaveBeenCalledTimes(1);
 });
+
+test("OCV5-838: box_capacity_held 倒计时期间展示极细进度条，释放后收起", () => {
+  vi.useFakeTimers();
+  const onContinueInterrupted = vi.fn();
+  const msg = {
+    id: "e-box-hold-bar",
+    role: "assistant",
+    text: "",
+    ts: 2,
+    _errorCode: "box_capacity_held",
+    _clientMessageId: "u-box-hold-bar",
+  } as ChatMessage;
+  const userMsg = {
+    id: "u-box-hold-bar",
+    role: "user",
+    text: "继续修",
+    ts: 1,
+    status: "error",
+  } as ChatMessage;
+
+  render(
+    <TurnStatusCard
+      msg={msg}
+      currentTurn={true}
+      cb={{
+        onContinueInterrupted,
+        resolveInterruptedContinuation: () => userMsg,
+      }}
+    />,
+  );
+
+  expect(screen.getByTestId("box-capacity-countdown-bar")).toBeInTheDocument();
+  for (let i = 0; i < BOX_CAPACITY_HELD_WAIT_SECONDS; i++) {
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+  }
+  expect(screen.queryByTestId("box-capacity-countdown-bar")).toBeNull();
+});
+
+test("OCV5-838: 限流/模型不可用错误提供次级 CTA「切换备用模型继续」并触发模型选择器", () => {
+  const onContinue = vi.fn();
+  const onOpenModelPicker = vi.fn();
+  render(
+    <TurnErrorNotice
+      role="alert"
+      tone="attention"
+      code="rate_limited"
+      actions={() => [{ label: "继续", onClick: onContinue }]}
+      onOpenModelPicker={onOpenModelPicker}
+    />,
+  );
+  const switchBtn = screen.getByRole("button", { name: "切换备用模型继续" });
+  fireEvent.click(switchBtn);
+  expect(onOpenModelPicker).toHaveBeenCalledTimes(1);
+});

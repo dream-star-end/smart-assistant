@@ -476,4 +476,66 @@ describe("CommandPalette", () => {
     fireEvent.click(screen.getByRole("option", { name: /切换工作台面板/ }));
     expect(onTogglePane).toHaveBeenCalledTimes(1);
   });
+
+  it("OCV5-838: > 与 @ 快捷前缀过滤、高频动作回调、以及触屏点筛选胶囊不回焦防弹键盘", () => {
+    const onSelectModel = vi.fn();
+    const onSelectAgent = vi.fn();
+    const onFindInSession = vi.fn();
+    const onShareSession = vi.fn();
+    const onOpenInbox = vi.fn();
+    const { input } = setup({
+      activeSession: SESSIONS[0],
+      models: [{ id: "claude-opus-4-6", display_name: "Claude Opus 4.6", cost_x: 3.5 }],
+      activeModelId: "claude-opus-4-6",
+      onSelectModel,
+      agents: [{ id: "coder", name: "代码专家" }],
+      onSelectAgent,
+      onFindInSession,
+      onShareSession,
+      onOpenInbox,
+    });
+
+    // `>` 仅滤命令
+    type(input, ">分享");
+    expect(keys()).toEqual(["action:share-session"]);
+    fireEvent.click(screen.getByRole("option", { name: /分享会话/ }));
+    expect(onShareSession).toHaveBeenCalledTimes(1);
+
+    type(input, ">站内信");
+    expect(keys()).toEqual(["action:open-inbox"]);
+    fireEvent.click(screen.getByRole("option", { name: /打开站内信/ }));
+    expect(onOpenInbox).toHaveBeenCalledTimes(1);
+
+    type(input, ">查找");
+    expect(keys()).toEqual(["action:find-in-session"]);
+    fireEvent.click(screen.getByRole("option", { name: /会话内查找/ }));
+    expect(onFindInSession).toHaveBeenCalledTimes(1);
+
+    // `@` 仅滤模型与智能体
+    type(input, "@代码");
+    expect(keys()).toEqual(["agent:coder"]);
+    fireEvent.click(screen.getByRole("option", { name: /代码专家/ }));
+    expect(onSelectAgent).toHaveBeenCalledWith("coder");
+
+    // 触屏设备（hover: none）点击筛选胶囊不主动回焦输入框，防止手机反复弹起软键盘
+    const origMatchMedia = window.matchMedia;
+    window.matchMedia = vi.fn().mockImplementation((q: string) => ({
+      matches: q === "(hover: none)",
+      media: q,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+    try {
+      const focusSpy = vi.spyOn(input, "focus");
+      focusSpy.mockClear();
+      fireEvent.click(screen.getByRole("button", { name: "项目" }));
+      expect(focusSpy).not.toHaveBeenCalled();
+    } finally {
+      window.matchMedia = origMatchMedia;
+    }
+  });
 });

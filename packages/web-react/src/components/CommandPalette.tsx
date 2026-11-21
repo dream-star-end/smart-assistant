@@ -1,6 +1,7 @@
 import * as RD from "@radix-ui/react-dialog";
 import {
   ArrowLeft,
+  Bell,
   Check,
   FileText,
   Folder,
@@ -11,6 +12,7 @@ import {
   Plug,
   Plus,
   Search,
+  Share2,
   Target,
 } from "lucide-react";
 import {
@@ -39,6 +41,7 @@ import { cn, relativeTime } from "../lib/utils";
 import {
   PALETTE_FILTERS,
   type PaletteActionId,
+  type PaletteAgentItem,
   type PaletteFilter,
   type PaletteGroup,
   type PaletteItem,
@@ -49,12 +52,14 @@ import {
   nextPaletteFilter,
   paletteActions,
   paletteLiveLabel,
+  parsePaletteQuery,
 } from "./palette/paletteModel";
 import "./palette/paletteUpgrade.css";
 import { HighlightedText } from "./sidebar/highlight";
 import { Badge, StatusPill, useToast } from "./ui";
 import { AtelierIcon } from "./ui/AtelierIcons";
 import { AtelierLazyIcon } from "./ui/AtelierLazyIcons";
+import { ModelFamilyIcon } from "./ui/ModelFamilyIcons";
 
 export const PALETTE_SEARCH_DEBOUNCE_MS = 200;
 const ASSET_SEARCH_LIMIT = 20;
@@ -99,6 +104,10 @@ export type CommandPaletteProps = {
   models?: readonly PublicModel[];
   activeModelId?: string | null;
   onSelectModel?: (modelId: string) => void;
+  /** 可选：智能体列表与快速切换回调（支持 `@` 快捷前缀）。 */
+  agents?: readonly PaletteAgentItem[];
+  activeAgentId?: string | null;
+  onSelectAgent?: (agentId: string) => void;
   /** 可选：工作区常用入口（记忆 / 技能 / 定时任务 / 插件 + 快问小窗 + OS 级操作）。 */
   onOpenManage?: (tab: ManageTab) => void;
   onOpenQuickAsk?: () => void;
@@ -107,6 +116,10 @@ export type CommandPaletteProps = {
   onTogglePane?: () => void;
   onToggleSwarm?: () => void;
   onOpenGoal?: () => void;
+  onSwitchAgent?: () => void;
+  onFindInSession?: () => void;
+  onShareSession?: () => void;
+  onOpenInbox?: () => void;
 };
 
 type RemoteResults = { q: string; hits: SessionSearchHit[]; assets: ProjectAsset[] };
@@ -156,12 +169,14 @@ export function CommandPalette(props: CommandPaletteProps) {
     activatedRef.current = false;
   }, [open]);
 
-  const q = query.trim();
+  const parsedQuery = useMemo(() => parsePaletteQuery(query), [query]);
+  const q = parsedQuery.term;
 
   // Message and file search are server side: debounce, abort the previous one.
   // Both always run (the type filter is applied locally, so Tab never refetches).
+  // `>` / `@` 前缀模式仅做本地命令/模型筛选，不触发远程消息与文件检索。
   useEffect(() => {
-    if (!open || mode !== "list" || !q || (!searchMessages && !searchAssets)) {
+    if (!open || mode !== "list" || parsedQuery.mode !== "none" || !q || (!searchMessages && !searchAssets)) {
       setSearching(false);
       return;
     }
@@ -185,7 +200,7 @@ export function CommandPalette(props: CommandPaletteProps) {
       ac.abort();
       window.clearTimeout(timer);
     };
-  }, [open, mode, q, searchMessages, searchAssets]);
+  }, [open, mode, parsedQuery.mode, q, searchMessages, searchAssets]);
 
   const currentProject = currentProjectId
     ? (projects.find((p) => p.id === currentProjectId) ?? null)
@@ -213,6 +228,9 @@ export function CommandPalette(props: CommandPaletteProps) {
       models: props.models,
       activeModelId: props.activeModelId,
       canSelectModel: Boolean(props.onSelectModel),
+      agents: props.agents,
+      activeAgentId: props.activeAgentId,
+      canSelectAgent: Boolean(props.onSelectAgent),
       actions: paletteActions({
         query,
         currentProject,
@@ -228,11 +246,16 @@ export function CommandPalette(props: CommandPaletteProps) {
         canTogglePane: !!props.onTogglePane,
         canToggleSwarm: !!props.onToggleSwarm,
         canOpenGoal: !!props.onOpenGoal,
+        canSwitchAgent: Boolean(props.onSwitchAgent || (props.agents?.length && props.onSelectAgent)),
+        canFindInSession: !!props.onFindInSession,
+        canShareSession: Boolean(props.onShareSession && activeSession),
+        canOpenInbox: !!props.onOpenInbox,
       }),
     });
   }, [
     mode,
     movable,
+    activeSession,
     projects,
     sessions,
     query,
@@ -250,6 +273,9 @@ export function CommandPalette(props: CommandPaletteProps) {
     props.models,
     props.activeModelId,
     props.onSelectModel,
+    props.agents,
+    props.activeAgentId,
+    props.onSelectAgent,
     props.onNewSessionInProject,
     props.onProjectHome,
     props.onOpenBoard,
@@ -261,6 +287,10 @@ export function CommandPalette(props: CommandPaletteProps) {
     props.onTogglePane,
     props.onToggleSwarm,
     props.onOpenGoal,
+    props.onSwitchAgent,
+    props.onFindInSession,
+    props.onShareSession,
+    props.onOpenInbox,
   ]);
   const flat = useMemo(() => flattenPalette(groups), [groups]);
 
@@ -367,6 +397,27 @@ export function CommandPalette(props: CommandPaletteProps) {
         close();
         props.onOpenGoal?.();
         return;
+      case "switch-agent":
+        if (props.onSwitchAgent) {
+          close();
+          props.onSwitchAgent();
+        } else {
+          setQuery("@");
+          inputRef.current?.focus();
+        }
+        return;
+      case "find-in-session":
+        close();
+        props.onFindInSession?.();
+        return;
+      case "share-session":
+        close();
+        props.onShareSession?.();
+        return;
+      case "open-inbox":
+        close();
+        props.onOpenInbox?.();
+        return;
     }
   };
 
@@ -405,6 +456,10 @@ export function CommandPalette(props: CommandPaletteProps) {
         }
         close();
         props.onSelectModel?.(item.model.id);
+        return;
+      case "agent":
+        close();
+        props.onSelectAgent?.(item.agent.id);
         return;
       case "action":
         runAction(item.action.id);
@@ -549,7 +604,9 @@ export function CommandPalette(props: CommandPaletteProps) {
                   aria-pressed={filter === f.id}
                   onClick={() => {
                     setFilter(f.id);
-                    inputRef.current?.focus();
+                    if (!window.matchMedia?.("(hover: none)").matches) {
+                      inputRef.current?.focus();
+                    }
                   }}
                   className={cn(
                     "oc-btn-tactile oc-spring-press min-h-11 shrink-0 rounded-full px-3 text-meta font-medium md:min-h-7 md:px-2.5",
@@ -629,6 +686,12 @@ export function CommandPalette(props: CommandPaletteProps) {
               <span className="inline-flex items-center gap-1">
                 <kbd className="oc-kbd">Tab</kbd> 限定类型
               </span>
+              <span className="hidden items-center gap-1 lg:inline-flex">
+                <kbd className="oc-kbd">&gt;</kbd> 命令
+              </span>
+              <span className="hidden items-center gap-1 lg:inline-flex">
+                <kbd className="oc-kbd">@</kbd> 模型/智能体
+              </span>
             </span>
             <span className="inline-flex items-center gap-1">
               <kbd className="oc-kbd">Esc</kbd> {mode === "move" ? "返回" : "关闭"}
@@ -685,6 +748,14 @@ function renderActionIcon(id: PaletteActionId): ReactNode {
       return <AtelierIcon name="swarm" size={15} />;
     case "open-goal":
       return <Target size={14} strokeWidth={1.75} />;
+    case "switch-agent":
+      return <AtelierIcon name="agent" size={15} />;
+    case "find-in-session":
+      return <Search size={14} strokeWidth={1.75} />;
+    case "share-session":
+      return <Share2 size={14} strokeWidth={1.75} />;
+    case "open-inbox":
+      return <Bell size={14} strokeWidth={1.75} />;
     default:
       return <AtelierIcon name="newChat" size={15} />;
   }
@@ -865,7 +936,7 @@ function PaletteRow({
                 : "",
           )}
         >
-          <AtelierLazyIcon name="model" size={15} />
+          <ModelFamilyIcon model={`${item.model.id} ${item.meta.label}`} size={15} />
         </span>
       );
       body = (
@@ -896,6 +967,36 @@ function PaletteRow({
         sub = <span className="block truncate text-caption text-faint">{item.model.id}</span>;
       }
       trail = item.meta.costLabel ?? "";
+      break;
+    case "agent":
+      lead = (
+        <span
+          aria-hidden
+          className={cn(
+            "oc-icon-badge size-7 rounded-sm",
+            item.isCurrent ? "oc-icon-badge-success" : "oc-icon-badge-accent",
+          )}
+        >
+          <AtelierIcon name="agent" size={15} />
+        </span>
+      );
+      body = (
+        <span className="flex min-w-0 items-center gap-1.5">
+          <span className="truncate font-medium">
+            <HighlightedText text={item.agent.name} query={query} />
+          </span>
+          {item.isCurrent && (
+            <span data-testid="palette-agent-current" className="oc-palette-model-current">
+              <Check size={11} strokeWidth={2.25} aria-hidden />
+              当前
+            </span>
+          )}
+        </span>
+      );
+      if (item.agent.description) {
+        sub = <span className="block truncate text-caption text-faint">{item.agent.description}</span>;
+      }
+      trail = "智能体";
       break;
     case "action": {
       lead = (
@@ -931,7 +1032,9 @@ function PaletteRow({
         ? item.disabled
           ? "暂不可选"
           : "切换"
-        : "打开";
+        : item.kind === "agent"
+          ? "切换"
+          : "打开";
   return (
     <div
       id={id}

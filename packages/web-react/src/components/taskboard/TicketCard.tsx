@@ -1,4 +1,4 @@
-import { Bot, Bug, FlaskConical, Sparkles, UserCheck, Wrench } from 'lucide-react'
+import { Bug, FlaskConical, Sparkles, UserCheck, Wrench } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import type { DragEvent, ReactNode } from 'react'
 import {
@@ -15,6 +15,7 @@ import {
 } from '../../lib/taskboard'
 import { cn } from '../../lib/utils'
 import { Badge, Card, StatusPill, TimeAgo } from '../ui'
+import { AtelierIcon } from '../ui/AtelierIcons'
 
 const TYPE_ICON: Record<TicketType, LucideIcon> = {
   bug: Bug,
@@ -135,7 +136,7 @@ export function TicketCard({
               className="oc-avatar-ring inline-flex size-4 shrink-0 items-center justify-center rounded-full bg-accent-soft text-accent"
               aria-hidden
             >
-              <Bot size={10} />
+              <AtelierIcon name="agent" size={11} />
             </span>
             <span className="sr-only">{'执行者 '}</span>
             <span className="truncate" title={agent}>

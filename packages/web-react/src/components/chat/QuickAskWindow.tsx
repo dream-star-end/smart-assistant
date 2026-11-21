@@ -38,6 +38,7 @@ import type { AuthSession, PublicModel, Session, User } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import { MessageList } from "../MessageRenderer";
 import { modelLabel } from "../ModelSelector";
+import { parseModelDisplayMeta } from "../ModelSelectorExtras";
 import { ChatInteractionContext, type ChatInteraction } from "../tool/context";
 import {
   DropdownMenu,
@@ -49,6 +50,7 @@ import {
   IconButton,
   useConfirm,
 } from "../ui";
+import { ModelFamilyIcon } from "../ui/ModelFamilyIcons";
 import type { CardCallbacks } from "./cards";
 import type { PermissionRespond } from "./permissionPromptState";
 
@@ -287,6 +289,7 @@ export function QuickAskWindow({
   );
   const [selectedModel, setSelectedModel] = useState<string | null>(() => readSavedQuickAskModel());
   const [attachContext, setAttachContext] = useState(true);
+  const [contextExpanded, setContextExpanded] = useState(false);
   const [modelHighlight, setModelHighlight] = useState(false);
   const [authorizing, setAuthorizing] = useState(false);
   const [demoBusyLanes, setDemoBusyLanes] = useState<Record<string, boolean>>({});
@@ -392,6 +395,10 @@ export function QuickAskWindow({
     [models, activeModelId],
   );
   const activeModelLabel = activeModelObj ? modelLabel(activeModelObj) : (activeModelId ?? "快问模型");
+  const activeModelMeta = useMemo(
+    () => parseModelDisplayMeta(activeModelLabel, activeModelId),
+    [activeModelLabel, activeModelId],
+  );
 
   const messages = demo ? activeLane.demoMessages : chat.getMessages(qaSessId);
   const sending = demo ? Boolean(demoBusyLanes[laneKey]) : chat.isSending(qaSessId);
@@ -838,6 +845,49 @@ export function QuickAskWindow({
   }, [hasMainlineContext, mainlineGoalObjective, mainlineMessages]);
   const sendKeyLabel = sendKey === "mod-enter" ? "⌘/Ctrl+↵" : "Enter";
 
+  const renderModelMenuItem = ({
+    itemKey,
+    modelId,
+    rawLabel,
+    cost,
+    active,
+    onSelect,
+  }: {
+    itemKey: string;
+    modelId: string;
+    rawLabel: string;
+    cost?: string | null;
+    active: boolean;
+    onSelect: () => void;
+  }) => {
+    const parsed = parseModelDisplayMeta(rawLabel, modelId);
+    return (
+      <DropdownMenuItem key={itemKey} title={rawLabel} onSelect={onSelect} className="gap-2">
+        <Check size={14} className={cn("shrink-0 text-accent", !active && "opacity-0")} />
+        <ModelFamilyIcon model={`${modelId} ${rawLabel}`} size={14} className="shrink-0 text-muted" />
+        <span className="flex min-w-0 flex-1 items-center gap-1.5">
+          <span className="truncate">{parsed.cleanName}</span>
+          {parsed.tags.map((tag) => (
+            <span
+              key={tag.label}
+              className={cn(
+                "shrink-0 rounded-full px-1.5 py-0.5 text-micro font-medium leading-none",
+                tag.tone === "accent"
+                  ? "bg-accent-soft text-accent"
+                  : tag.tone === "info"
+                    ? "bg-info-soft text-info"
+                    : "bg-hover text-muted",
+              )}
+            >
+              {tag.label}
+            </span>
+          ))}
+        </span>
+        {cost && <span className="shrink-0 tabular-nums text-caption text-faint">{cost}</span>}
+      </DropdownMenuItem>
+    );
+  };
+
   return (
     <>
     <section
@@ -871,20 +921,25 @@ export function QuickAskWindow({
               aria-label="选择快问模型"
               title={followingMainline ? `跟随主会话模型：${activeModelLabel}` : `当前快问模型：${activeModelLabel}`}
               className={cn(
-                "oc-btn-tactile inline-flex max-w-[185px] items-center gap-1 rounded-full px-2.5 py-1 text-caption font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+                "oc-btn-tactile oc-spring-press inline-flex max-w-[195px] items-center gap-1.5 rounded-full px-2.5 py-1 text-caption font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
                 modelHighlight
                   ? "border border-accent bg-accent-soft text-accent shadow-soft"
                   : "oc-btn-secondary-craft text-muted hover:text-fg",
               )}
             >
-              <span className="truncate">{activeModelLabel}</span>
+              <ModelFamilyIcon
+                model={`${activeModelId ?? ""} ${activeModelLabel}`}
+                size={13}
+                className="shrink-0 text-accent"
+              />
+              <span className="truncate">{activeModelMeta.cleanName}</span>
               {activeCostLabel && (
                 <span className="shrink-0 tabular-nums text-faint">{activeCostLabel}</span>
               )}
               <ChevronDown size={12} className="shrink-0 text-faint" />
             </button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="max-h-72 w-64 overflow-y-auto">
+          <DropdownMenuContent align="start" className="max-h-72 w-72 overflow-y-auto">
             <DropdownMenuLabel>选择快问模型</DropdownMenuLabel>
             {mainlineModelId && healthyModels.some((m) => m.id === mainlineModelId) && (
               <>
@@ -911,23 +966,17 @@ export function QuickAskWindow({
               groupedPickerRows.map((row) => {
                 if (row.kind === "plain") {
                   const m = row.model;
-                  const cost = modelCostLabel(m);
-                  return (
-                    <DropdownMenuItem
-                      key={m.id}
-                      onSelect={() => {
-                        setSelectedModel(m.id);
-                        writeSavedQuickAskModel(m.id);
-                      }}
-                    >
-                      <Check
-                        size={14}
-                        className={cn("shrink-0 text-accent", m.id !== activeModelId && "opacity-0")}
-                      />
-                      <span className="min-w-0 flex-1 truncate">{modelLabel(m)}</span>
-                      {cost && <span className="shrink-0 tabular-nums text-caption text-faint">{cost}</span>}
-                    </DropdownMenuItem>
-                  );
+                  return renderModelMenuItem({
+                    itemKey: m.id,
+                    modelId: m.id,
+                    rawLabel: modelLabel(m),
+                    cost: modelCostLabel(m),
+                    active: m.id === activeModelId,
+                    onSelect: () => {
+                      setSelectedModel(m.id);
+                      writeSavedQuickAskModel(m.id);
+                    },
+                  });
                 }
                 if (row.kind === "cursor-family") {
                   const repId =
@@ -935,24 +984,17 @@ export function QuickAskWindow({
                     row.row.members[0]?.id;
                   const rep = row.row.members.find((m) => m.id === repId);
                   if (!rep) return null;
-                  const cost = modelCostLabel(rep);
-                  const active = row.row.members.some((m) => m.id === activeModelId);
-                  return (
-                    <DropdownMenuItem
-                      key={`cursor-${row.row.family}`}
-                      onSelect={() => {
-                        setSelectedModel(rep.id);
-                        writeSavedQuickAskModel(rep.id);
-                      }}
-                    >
-                      <Check
-                        size={14}
-                        className={cn("shrink-0 text-accent", !active && "opacity-0")}
-                      />
-                      <span className="min-w-0 flex-1 truncate">{row.row.label}</span>
-                      {cost && <span className="shrink-0 tabular-nums text-caption text-faint">{cost}</span>}
-                    </DropdownMenuItem>
-                  );
+                  return renderModelMenuItem({
+                    itemKey: `cursor-${row.row.family}`,
+                    modelId: rep.id,
+                    rawLabel: row.row.label,
+                    cost: modelCostLabel(rep),
+                    active: row.row.members.some((m) => m.id === activeModelId),
+                    onSelect: () => {
+                      setSelectedModel(rep.id);
+                      writeSavedQuickAskModel(rep.id);
+                    },
+                  });
                 }
                 if (row.kind === "context-family") {
                   const repId =
@@ -960,46 +1002,32 @@ export function QuickAskWindow({
                     row.row.members[0]?.id;
                   const rep = row.row.members.find((m) => m.id === repId);
                   if (!rep) return null;
-                  const cost = modelCostLabel(rep);
-                  const active = row.row.members.some((m) => m.id === activeModelId);
-                  return (
-                    <DropdownMenuItem
-                      key={`ctx-${row.row.family}`}
-                      onSelect={() => {
-                        setSelectedModel(rep.id);
-                        writeSavedQuickAskModel(rep.id);
-                      }}
-                    >
-                      <Check
-                        size={14}
-                        className={cn("shrink-0 text-accent", !active && "opacity-0")}
-                      />
-                      <span className="min-w-0 flex-1 truncate">{row.row.label}</span>
-                      {cost && <span className="shrink-0 tabular-nums text-caption text-faint">{cost}</span>}
-                    </DropdownMenuItem>
-                  );
+                  return renderModelMenuItem({
+                    itemKey: `ctx-${row.row.family}`,
+                    modelId: rep.id,
+                    rawLabel: row.row.label,
+                    cost: modelCostLabel(rep),
+                    active: row.row.members.some((m) => m.id === activeModelId),
+                    onSelect: () => {
+                      setSelectedModel(rep.id);
+                      writeSavedQuickAskModel(rep.id);
+                    },
+                  });
                 }
                 if (row.kind === "grok-build-family") {
                   const rep = row.row.members[0];
                   if (!rep) return null;
-                  const cost = modelCostLabel(rep);
-                  const active = row.row.members.some((m) => m.id === activeModelId);
-                  return (
-                    <DropdownMenuItem
-                      key={`grok-${row.row.family}`}
-                      onSelect={() => {
-                        setSelectedModel(rep.id);
-                        writeSavedQuickAskModel(rep.id);
-                      }}
-                    >
-                      <Check
-                        size={14}
-                        className={cn("shrink-0 text-accent", !active && "opacity-0")}
-                      />
-                      <span className="min-w-0 flex-1 truncate">{row.row.label}</span>
-                      {cost && <span className="shrink-0 tabular-nums text-caption text-faint">{cost}</span>}
-                    </DropdownMenuItem>
-                  );
+                  return renderModelMenuItem({
+                    itemKey: `grok-${row.row.family}`,
+                    modelId: rep.id,
+                    rawLabel: row.row.label,
+                    cost: modelCostLabel(rep),
+                    active: row.row.members.some((m) => m.id === activeModelId),
+                    onSelect: () => {
+                      setSelectedModel(rep.id);
+                      writeSavedQuickAskModel(rep.id);
+                    },
+                  });
                 }
                 return null;
               })
@@ -1110,53 +1138,71 @@ export function QuickAskWindow({
       </div>
 
       {/* Footer composer */}
-      <footer className="shrink-0 border-t border-border/80 bg-bg/70 px-3 pt-2.5 pb-2.5">
-        <div className="oc-surface-recessed mb-2 rounded-lg px-2.5 py-1.5">
-          <div className="flex items-center justify-between gap-2 text-caption text-faint">
+      <footer className="shrink-0 border-t border-border/80 bg-bg/70 px-3 pt-2 pb-2">
+        <div className="mb-1.5">
+          <div className="flex items-center justify-between gap-2 text-caption">
             {hasMainlineContext ? (
-              <button
-                type="button"
-                data-testid="quick-ask-context-hint"
-                aria-pressed={attachContext}
-                title={
-                  attachContext
-                    ? `点击断开主线背景注入\n\n${contextPrefix}`
-                    : "当前不注入主线背景，点击重新关联"
-                }
-                onClick={() => setAttachContext((v) => !v)}
-                className={cn(
-                  "oc-btn-tactile flex min-w-0 items-center gap-1.5 rounded-md px-1 py-0.5 text-left hover:bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
-                  attachContext ? "text-fg" : "text-faint line-through",
-                )}
-              >
-                <span
-                  aria-hidden
+              <div className="inline-flex min-w-0 max-w-full items-center rounded-full border border-border/80 bg-surface/80 p-0.5 shadow-xs">
+                <button
+                  type="button"
+                  data-testid="quick-ask-context-hint"
+                  aria-pressed={attachContext}
+                  title={
+                    attachContext
+                      ? `点击断开主线背景注入\n\n${contextPrefix}`
+                      : "当前不注入主线背景，点击重新关联"
+                  }
+                  onClick={() => {
+                    setAttachContext((v) => {
+                      if (v) setContextExpanded(false);
+                      return !v;
+                    });
+                  }}
                   className={cn(
-                    "oc-icon-badge size-5 rounded-xs",
-                    attachContext ? "oc-icon-badge-accent" : undefined,
+                    "oc-btn-tactile flex min-w-0 items-center gap-1.5 rounded-full px-2 py-0.5 text-left transition-colors hover:bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-10",
+                    attachContext ? "text-fg" : "text-faint line-through",
                   )}
                 >
-                  {attachContext ? <Link2 size={11} /> : <Unlink size={11} />}
-                </span>
-                <span className="truncate font-medium">{contextLabel}</span>
-              </button>
+                  <span aria-hidden className={cn("shrink-0", attachContext ? "text-accent" : "text-faint")}>
+                    {attachContext ? <Link2 size={11} /> : <Unlink size={11} />}
+                  </span>
+                  <span className="truncate font-medium">{contextLabel}</span>
+                </button>
+                {attachContext && contextPreview && (
+                  <button
+                    type="button"
+                    data-testid="quick-ask-context-expand"
+                    aria-expanded={contextExpanded}
+                    aria-label={contextExpanded ? "收起主线摘要预览" : "展开主线摘要预览"}
+                    title={contextExpanded ? "收起主线摘要" : "查看关联的主线摘要"}
+                    onClick={() => setContextExpanded((v) => !v)}
+                    className="oc-spring-press inline-flex size-5 shrink-0 items-center justify-center rounded-full text-faint transition-colors hover:bg-hover hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-9"
+                  >
+                    <ChevronDown
+                      size={11}
+                      className={cn("transition-transform duration-150", contextExpanded && "rotate-180")}
+                    />
+                  </button>
+                )}
+              </div>
             ) : (
               <span
                 data-testid="quick-ask-context-hint"
-                className="flex min-w-0 items-center gap-1.5 truncate text-muted"
+                className="inline-flex min-w-0 items-center gap-1.5 rounded-full border border-border/70 bg-surface/70 px-2.5 py-0.5 text-muted"
               >
-                <span aria-hidden className="oc-icon-badge oc-icon-badge-accent size-5 rounded-xs">
-                  <Link2 size={11} />
-                </span>
+                <Link2 size={11} aria-hidden className="shrink-0 text-accent" />
                 <span className="truncate font-medium">{contextLabel}</span>
               </span>
             )}
-            <span className="shrink-0 rounded-full border border-border/70 bg-surface/80 px-2 py-0.5 text-micro font-medium text-faint">
-              不进主历史
-            </span>
+            <span className="shrink-0 text-micro font-medium text-faint">不进主历史</span>
           </div>
-          {hasMainlineContext && attachContext && contextPreview && (
-            <p className="mt-1 truncate pl-7 text-caption text-faint">{contextPreview}</p>
+          {contextExpanded && hasMainlineContext && attachContext && contextPreview && (
+            <p
+              data-testid="quick-ask-context-preview"
+              className="oc-surface-recessed animate-in mt-1.5 rounded-lg px-2.5 py-1.5 text-caption leading-relaxed text-muted"
+            >
+              {contextPreview}
+            </p>
           )}
         </div>
 

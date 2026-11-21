@@ -1218,7 +1218,7 @@ describe('Aurora v5 skeleton — demo mode (no network)', () => {
     vi.stubGlobal('fetch', noFetch as unknown as typeof fetch)
 
     render(<App />)
-    expect(screen.getByText(/帮我把商业版聊天界面基于 ChatGPT 的设计语言完全重做/)).toBeInTheDocument()
+    expect(await screen.findByText(/帮我把商业版聊天界面基于 ChatGPT 的设计语言完全重做/)).toBeInTheDocument()
 
     fireEvent.click(screen.getByText('锂金属负极枝晶抑制机理综述'))
     await waitFor(() =>

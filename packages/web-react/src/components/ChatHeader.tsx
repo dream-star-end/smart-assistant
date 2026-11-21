@@ -10,7 +10,6 @@ import {
   RefreshCw,
   Search,
   Share2,
-  ShieldCheck,
   Users,
   Wallet,
 } from "lucide-react";
@@ -296,7 +295,7 @@ export function ChatHeader({
       {/* 模型与运行态核心区：手机 <640px 居中紧凑胶囊（单行永不折行）；平板/桌面 sm+ 左对齐且优先保障模型全名宽度。 */}
       {(teamModeActive || advisorModeActive || (models && onSelectModel) || running || showUpdatePill) && (
         <div
-          className="flex min-w-0 flex-1 items-center justify-center gap-1 sm:justify-start sm:gap-1.5"
+          className="flex min-w-0 flex-1 items-center justify-center gap-0.5 sm:justify-start sm:gap-1.5"
           data-testid="chat-model-row"
         >
           <span aria-hidden className="hidden h-4 w-px shrink-0 bg-border/80 sm:block" />
@@ -307,11 +306,12 @@ export function ChatHeader({
                   type="button"
                   data-product-feature={PRODUCT_CAPABILITIES.advisorMode.id}
                   aria-label="顾问模式已开启"
-                  className="oc-btn-tactile group flex min-h-10 min-w-10 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:min-h-11 sm:min-w-11"
+                  title="顾问模式已开启"
+                  className="oc-btn-tactile oc-spring-press group flex min-h-10 min-w-9 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:min-h-11 sm:min-w-11"
                 >
-                  <span className="oc-badge-craft flex items-center gap-1 rounded-full bg-accent-soft px-2 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15 sm:px-2.5">
-                    <ShieldCheck size={12} strokeWidth={1.75} className="shrink-0" />
-                    <span className="sm:hidden">顾问</span>
+                  <span className="oc-badge-craft flex items-center gap-1 rounded-full bg-accent-soft px-1.5 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15 sm:px-2.5">
+                    <AtelierIcon name="shield" size={12} className="shrink-0" />
+                    <span className="sr-only min-[430px]:not-sr-only sm:hidden">顾问</span>
                     <span className="hidden sm:inline">顾问模式</span>
                     {advisorModelLabel ? (
                       <span className="hidden max-w-[8rem] truncate @[720px]:inline" title={advisorModelLabel}>
@@ -324,7 +324,7 @@ export function ChatHeader({
               <PopoverContent>
                 <div className="flex items-start gap-2.5">
                   <span aria-hidden className="oc-icon-badge oc-icon-badge-accent mt-0.5 size-7">
-                    <ShieldCheck size={14} strokeWidth={1.75} />
+                    <AtelierIcon name="shield" size={14} />
                   </span>
                   <div className="min-w-0 flex-1">
                     <p className="text-body font-semibold text-fg">顾问模式已开启</p>
@@ -359,11 +359,12 @@ export function ChatHeader({
                   type="button"
                   data-product-feature={PRODUCT_CAPABILITIES.teamMode.id}
                   aria-label="团队模式已开启"
-                  className="oc-btn-tactile group flex min-h-10 min-w-10 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:min-h-11 sm:min-w-11"
+                  title="团队模式已开启"
+                  className="oc-btn-tactile oc-spring-press group flex min-h-10 min-w-9 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:min-h-11 sm:min-w-11"
                 >
-                  <span className="oc-badge-craft flex items-center gap-1 rounded-full bg-accent-soft px-2 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15 sm:px-2.5">
+                  <span className="oc-badge-craft flex items-center gap-1 rounded-full bg-accent-soft px-1.5 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15 sm:px-2.5">
                     <Users size={12} strokeWidth={1.75} className="shrink-0" />
-                    <span className="sm:hidden">团队</span>
+                    <span className="sr-only min-[430px]:not-sr-only sm:hidden">团队</span>
                     <span className="hidden sm:inline">团队模式</span>
                   </span>
                 </button>

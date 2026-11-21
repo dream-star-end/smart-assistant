@@ -5,14 +5,19 @@
  * 含 v3/Codex 历史 item 的紧凑渲染；Codex MCP/dynamic wrapper 大多已在
  * format 层归一化为 native builtin/MCP 工具。
  */
-import { Sparkles, FileText } from "lucide-react";
+import { Check, Copy, FileText, Sparkles, WrapText } from "lucide-react";
 import { lazy, Suspense, useContext, useMemo, useState, type ReactNode } from "react";
 import { cn } from "../../lib/utils";
 import { SignedImg } from "../chat/media";
-import { Badge, Button, Spinner } from "../ui";
+import { Badge, Button, Spinner, useToast } from "../ui";
 import { ExpandControls, ExpandablePre, FULL_TEXT_CAP, useExpandableSlice } from "./expandable";
 import { languageForPath, useHighlighter } from "./highlight";
-import { diffLines, type DiffRow as LineDiffRow } from "./lineDiff";
+import {
+  computeInlineDiffMap,
+  diffLines,
+  type DiffRow as LineDiffRow,
+  type InlineDiffSpan,
+} from "./lineDiff";
 import { collapseDiffContext, diffStats, parseUnifiedDiffLines } from "./diffHunk";
 import { ReminderStatusCard, renderReminderListCard } from "./memoryReminderCards";
 import { renderSkillListCard, renderSkillSearchCard, renderSkillViewCard } from "./skillCards";
@@ -291,42 +296,161 @@ function DiffContainer({ children }: { children: ReactNode }) {
 const GUTTER_CLS =
   "w-9 shrink-0 select-none border-r border-border/60 bg-bg/35 pr-2 text-right font-mono text-micro leading-relaxed text-faint tabular-nums";
 
-/** diff 单行:行号(旧/新)+ 符号 + 内容(可选 hljs 着色;hljs 输出已转义)。
+/** 移动端 <640px 横滑代码时将 +/- 符号列固定在左侧，配实色底承托防止增删状态迷失。 */
+function diffSignStickyCls(sign: "-" | "+" | " "): string {
+  return cn(
+    "sticky left-0 z-[1] w-5 shrink-0 select-none border-r border-border/35 text-center font-semibold sm:static sm:border-r-0",
+    sign === "-"
+      ? "bg-[color-mix(in_srgb,var(--danger)_14%,var(--code))] text-danger sm:bg-transparent"
+      : sign === "+"
+        ? "bg-[color-mix(in_srgb,var(--success)_14%,var(--code))] text-success sm:bg-transparent"
+        : "bg-code text-faint sm:bg-transparent",
+  );
+}
+
+/** 渲染相邻 -/+ 行的词级改动片段高亮。 */
+function renderInlineSpans(spans: readonly InlineDiffSpan[], sign: "-" | "+"): ReactNode {
+  const markCls =
+    sign === "-"
+      ? "rounded-xs bg-[color-mix(in_srgb,var(--danger)_24%,transparent)] text-current"
+      : "rounded-xs bg-[color-mix(in_srgb,var(--success)_24%,transparent)] text-current";
+  return spans.map((sp, i) =>
+    sp.changed ? (
+      // biome-ignore lint/suspicious/noArrayIndexKey: 词段顺序由当前行静态划分决定
+      <mark key={i} data-diff-inline-change="true" className={markCls}>
+        {sp.text}
+      </mark>
+    ) : (
+      // biome-ignore lint/suspicious/noArrayIndexKey: 词段顺序由当前行静态划分决定
+      <span key={i}>{sp.text}</span>
+    ),
+  );
+}
+
+/** diff 顶部统计与快捷栏：+N/-M 徽标 + 自动折行 + 复制新代码。 */
+function DiffStatsBar({
+  path,
+  added,
+  removed,
+  wrap,
+  onToggleWrap,
+  copyText,
+}: {
+  path?: string;
+  added: number;
+  removed: number;
+  wrap: boolean;
+  onToggleWrap: () => void;
+  copyText?: string;
+}) {
+  const [copied, setCopied] = useState(false);
+  const toast = useToast();
+  const handleCopy = async () => {
+    if (!copyText) return;
+    try {
+      await navigator.clipboard.writeText(copyText);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      toast("复制失败，请手动选中文本复制", "error");
+    }
+  };
+  return (
+    <div
+      data-testid="diff-stats-bar"
+      className="oc-code-shell-header flex items-center gap-2 px-3 py-1.5 font-sans text-caption"
+    >
+      {path && <span className="min-w-0 truncate font-mono font-medium text-muted">{shortPath(path)}</span>}
+      <span className="ml-auto flex shrink-0 items-center gap-1.5 font-mono tabular-nums">
+        {added > 0 && (
+          <Badge tone="success" size="sm" className="font-mono">
+            +{added}
+          </Badge>
+        )}
+        {removed > 0 && (
+          <Badge tone="danger" size="sm" className="font-mono">
+            -{removed}
+          </Badge>
+        )}
+        <button
+          type="button"
+          onClick={onToggleWrap}
+          aria-label="自动折行"
+          aria-pressed={wrap}
+          title={wrap ? "取消自动折行" : "自动折行"}
+          className={cn(
+            "oc-btn-tactile inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 font-sans text-caption font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-8",
+            wrap
+              ? "border-accent/30 bg-accent-soft text-accent"
+              : "border-transparent text-faint hover:bg-hover hover:text-fg",
+          )}
+        >
+          <WrapText size={12} strokeWidth={1.75} aria-hidden="true" />
+          <span className="hidden sm:inline">自动折行</span>
+        </button>
+        {copyText !== undefined && (
+          <button
+            type="button"
+            onClick={() => void handleCopy()}
+            aria-label="复制新代码"
+            title="复制新代码"
+            className={cn(
+              "oc-btn-tactile inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 font-sans text-caption font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-8",
+              copied
+                ? "border-success/30 bg-success-soft text-success"
+                : "border-transparent text-faint hover:bg-hover hover:text-fg",
+            )}
+          >
+            {copied ? (
+              <Check size={12} strokeWidth={2} aria-hidden="true" className="oc-check-pop" />
+            ) : (
+              <Copy size={12} strokeWidth={1.75} aria-hidden="true" />
+            )}
+            <span className="hidden sm:inline">{copied ? "已复制" : "复制新代码"}</span>
+          </button>
+        )}
+      </span>
+    </div>
+  );
+}
+
+/** diff 单行:行号(旧/新)+ 符号 + 内容(可选词级高亮或 hljs 着色;hljs 输出已转义)。
  *  gutters:全新增/全删除 diff 隐藏恒空的那一列;窄屏只保留新行号列(T-10:390px 下 92px 固定 gutter
  *  把内容区挤到 ~230px)。 */
 function DiffRowView({
   row,
   html,
   gutters,
+  inlineSpans,
+  wrap = false,
 }: {
   row: LineDiffRow;
   html: string | null;
   gutters: { old: boolean; new: boolean };
+  inlineSpans?: readonly InlineDiffSpan[] | null;
+  wrap?: boolean;
 }) {
   return (
     <div
       className={cn(
-        "flex w-max min-w-full sm:w-auto",
+        "flex",
+        wrap ? "w-auto" : "w-max min-w-full sm:w-auto",
         row.sign === "-" ? "bg-danger-soft" : row.sign === "+" ? "bg-success-soft" : undefined,
       )}
     >
       {gutters.old && <span className={cn(GUTTER_CLS, gutters.new && "hidden sm:block")}>{row.oldNo ?? ""}</span>}
       {gutters.new && <span className={GUTTER_CLS}>{row.newNo ?? ""}</span>}
+      <span className={diffSignStickyCls(row.sign)}>{row.sign === " " ? "" : row.sign}</span>
       <span
         className={cn(
-          "w-5 shrink-0 select-none text-center font-semibold",
-          row.sign === "-" ? "text-danger" : row.sign === "+" ? "text-success" : "text-faint",
-        )}
-      >
-        {row.sign === " " ? "" : row.sign}
-      </span>
-      <span
-        className={cn(
-          "min-w-0 flex-1 whitespace-pre pr-3 sm:whitespace-pre-wrap sm:break-words",
+          "min-w-0 flex-1 pr-3",
+          wrap ? "whitespace-pre-wrap break-words" : "whitespace-pre sm:whitespace-pre-wrap sm:break-words",
           row.sign === "-" ? "text-danger" : row.sign === "+" ? "text-success" : "text-muted",
         )}
       >
-        {html ? (
+        {inlineSpans && (row.sign === "-" || row.sign === "+") ? (
+          renderInlineSpans(inlineSpans, row.sign)
+        ) : html ? (
           // biome-ignore lint/security/noDangerouslySetInnerHtml: hljs 输出对源码已做 HTML 转义
           <span dangerouslySetInnerHTML={{ __html: html }} />
         ) : (
@@ -338,14 +462,16 @@ function DiffRowView({
 }
 
 /**
- * Edit 工具的行级 diff(F2 / OCV5-817):LCS 求未变行为上下文,按 ±3 行折叠未改动片段(可原地展开),
- * 顶部给出 +N / -M 变更统计徽标;按文件后缀做 hljs 着色;超过行数上限时可「展开全部」。
+ * Edit 工具的行级 diff(F2 / OCV5-817 / OCV5-838):LCS 求未变行为上下文,相邻 -/+ 行做词级高亮,
+ * 按 ±3 行折叠未改动片段(可原地展开),顶部给出 +N / -M 统计、自动折行与复制新代码。
  */
 function DiffView({ oldStr, newStr, path }: { oldStr: string; newStr: string; path?: string }) {
   const full = useContext(ToolBodyFullContext);
   const [showAll, setShowAll] = useState(false);
+  const [wrap, setWrap] = useState(false);
   const [expandedGaps, setExpandedGaps] = useState<Set<number>>(() => new Set());
   const rows = useMemo(() => diffLines(oldStr, newStr), [oldStr, newStr]);
+  const inlineMap = useMemo(() => computeInlineDiffMap(rows), [rows]);
   const stats = useMemo(() => diffStats(rows), [rows]);
   const entries = useMemo(
     () => (full ? rows.map((row, index) => ({ kind: "row" as const, row, index })) : collapseDiffContext(rows, 3, expandedGaps)),
@@ -372,24 +498,14 @@ function DiffView({ oldStr, newStr, path }: { oldStr: string; newStr: string; pa
   return (
     <DiffContainer>
       {(stats.added > 0 || stats.removed > 0) && (
-        <div
-          data-testid="diff-stats-bar"
-          className="oc-code-shell-header flex items-center gap-2 px-3 py-1.5 font-sans text-caption"
-        >
-          {path && <span className="min-w-0 truncate font-mono font-medium text-muted">{shortPath(path)}</span>}
-          <span className="ml-auto flex shrink-0 items-center gap-1.5 font-mono tabular-nums">
-            {stats.added > 0 && (
-              <Badge tone="success" size="sm" className="font-mono">
-                +{stats.added}
-              </Badge>
-            )}
-            {stats.removed > 0 && (
-              <Badge tone="danger" size="sm" className="font-mono">
-                -{stats.removed}
-              </Badge>
-            )}
-          </span>
-        </div>
+        <DiffStatsBar
+          path={path}
+          added={stats.added}
+          removed={stats.removed}
+          wrap={wrap}
+          onToggleWrap={() => setWrap((v) => !v)}
+          copyText={newStr ? newStr : undefined}
+        />
       )}
       {entries.slice(0, maxLines).map((entry) =>
         entry.kind === "gap" ? (
@@ -408,6 +524,8 @@ function DiffView({ oldStr, newStr, path }: { oldStr: string; newStr: string; pa
             row={entry.row}
             html={highlight(entry.row.text)}
             gutters={gutters}
+            inlineSpans={inlineMap.get(entry.index)}
+            wrap={wrap}
           />
         ),
       )}
@@ -593,12 +711,31 @@ function parseCodexFileChanges(input: Input): CodexFileChange[] | null {
   });
 }
 
-/** codex update 的 unified diff：区分 +++/--- 文件头、@@ hunk 头与增删行并展示行号与 +N/-M 统计。 */
+/** codex update 的 unified diff：区分 +++/--- 文件头、@@ hunk 头与增删行并展示行号、词级高亮与 +N/-M 统计。 */
 function UnifiedDiffView({ diff, path }: { diff: string; path?: string }) {
   const full = useContext(ToolBodyFullContext);
   const [showAll, setShowAll] = useState(false);
+  const [wrap, setWrap] = useState(false);
   const maxLines = full || showAll ? MAX_DIFF_LINES_FULL : MAX_DIFF_LINES;
   const parsed = useMemo(() => parseUnifiedDiffLines(diff), [diff]);
+  const inlineMap = useMemo(
+    () =>
+      computeInlineDiffMap(
+        parsed.lines.map((l) => ({
+          sign: l.kind === "del" ? "-" : l.kind === "add" ? "+" : " ",
+          text: l.text,
+        })),
+      ),
+    [parsed.lines],
+  );
+  const newCode = useMemo(
+    () =>
+      parsed.lines
+        .filter((l) => l.kind === "context" || l.kind === "add")
+        .map((l) => l.text)
+        .join("\n"),
+    [parsed.lines],
+  );
   const highlight = useHighlighter(languageForPath(path ?? null));
   const hasOldNo = useMemo(() => parsed.lines.some((l) => l.oldNo !== null), [parsed.lines]);
   const hasNewNo = useMemo(() => parsed.lines.some((l) => l.newNo !== null), [parsed.lines]);
@@ -606,24 +743,14 @@ function UnifiedDiffView({ diff, path }: { diff: string; path?: string }) {
   return (
     <DiffContainer>
       {(parsed.added > 0 || parsed.removed > 0) && (
-        <div
-          data-testid="diff-stats-bar"
-          className="oc-code-shell-header flex items-center gap-2 px-3 py-1.5 font-sans text-caption"
-        >
-          {path && <span className="min-w-0 truncate font-mono font-medium text-muted">{shortPath(path)}</span>}
-          <span className="ml-auto flex shrink-0 items-center gap-1.5 font-mono tabular-nums">
-            {parsed.added > 0 && (
-              <Badge tone="success" size="sm" className="font-mono">
-                +{parsed.added}
-              </Badge>
-            )}
-            {parsed.removed > 0 && (
-              <Badge tone="danger" size="sm" className="font-mono">
-                -{parsed.removed}
-              </Badge>
-            )}
-          </span>
-        </div>
+        <DiffStatsBar
+          path={path}
+          added={parsed.added}
+          removed={parsed.removed}
+          wrap={wrap}
+          onToggleWrap={() => setWrap((v) => !v)}
+          copyText={newCode ? newCode : undefined}
+        />
       )}
       {parsed.lines.slice(0, maxLines).map((line, i) => {
         if (line.kind === "file-header") {
@@ -649,11 +776,14 @@ function UnifiedDiffView({ diff, path }: { diff: string; path?: string }) {
           );
         }
         const html = highlight(line.text);
+        const spans = inlineMap.get(i);
+        const sign: "-" | "+" | " " = line.kind === "del" ? "-" : line.kind === "add" ? "+" : " ";
         return (
           <div
             key={`${i}-${line.kind}`}
             className={cn(
-              "flex w-max min-w-full sm:w-auto",
+              "flex",
+              wrap ? "w-auto" : "w-max min-w-full sm:w-auto",
               line.kind === "del" ? "bg-danger-soft" : line.kind === "add" ? "bg-success-soft" : undefined,
             )}
           >
@@ -661,36 +791,23 @@ function UnifiedDiffView({ diff, path }: { diff: string; path?: string }) {
               <span className={cn(GUTTER_CLS, hasNewNo && "hidden sm:block")}>{line.oldNo ?? ""}</span>
             )}
             {hasNewNo && <span className={GUTTER_CLS}>{line.newNo ?? ""}</span>}
-            {html ? (
-              <>
-                <span
-                  className={cn(
-                    "w-5 shrink-0 select-none text-center",
-                    line.kind === "del" ? "text-danger" : line.kind === "add" ? "text-success" : "text-faint",
-                  )}
-                >
-                  {line.sign === " " ? "" : line.sign}
-                </span>
-                <span
-                  className={cn(
-                    "min-w-0 flex-1 whitespace-pre pr-3 sm:whitespace-pre-wrap sm:break-words",
-                    line.kind === "del" ? "text-danger" : line.kind === "add" ? "text-success" : "text-muted",
-                  )}
-                >
-                  {/* biome-ignore lint/security/noDangerouslySetInnerHtml: hljs 输出对源码已做 HTML 转义 */}
-                  <span dangerouslySetInnerHTML={{ __html: html }} />
-                </span>
-              </>
-            ) : (
-              <span
-                className={cn(
-                  "min-w-0 flex-1 whitespace-pre px-2 sm:whitespace-pre-wrap sm:break-words",
-                  line.kind === "del" ? "text-danger" : line.kind === "add" ? "text-success" : "text-muted",
-                )}
-              >
-                {line.kind === "del" || line.kind === "add" ? `${line.sign}${line.text}` : line.text || " "}
-              </span>
-            )}
+            <span className={diffSignStickyCls(sign)}>{sign === " " ? "" : sign}</span>
+            <span
+              className={cn(
+                "min-w-0 flex-1 pr-3",
+                wrap ? "whitespace-pre-wrap break-words" : "whitespace-pre sm:whitespace-pre-wrap sm:break-words",
+                line.kind === "del" ? "text-danger" : line.kind === "add" ? "text-success" : "text-muted",
+              )}
+            >
+              {spans && (sign === "-" || sign === "+") ? (
+                renderInlineSpans(spans, sign)
+              ) : html ? (
+                // biome-ignore lint/security/noDangerouslySetInnerHtml: hljs 输出对源码已做 HTML 转义
+                <span dangerouslySetInnerHTML={{ __html: html }} />
+              ) : (
+                line.text || " "
+              )}
+            </span>
           </div>
         );
       })}

@@ -5,6 +5,7 @@ import {
   type ReactNode,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
@@ -34,7 +35,7 @@ export type TabsLayout = "scroll" | "grid";
  * 工具类整体排在全部无变体工具类之后(已核对 dist 产物,首个 `.md\:` 规则位于基础段尾部之后),
  * 因此断点变体恒胜出,不依赖两个 display 工具类在基础段内的相对顺序。
  */
-const tabListVariants = cva("oc-surface-recessed no-scrollbar gap-1 overscroll-x-contain p-1", {
+const tabListVariants = cva("oc-surface-recessed relative no-scrollbar gap-1 overscroll-x-contain p-1", {
   variants: {
     layout: {
       scroll: "inline-flex max-w-full overflow-x-auto rounded-full",
@@ -50,7 +51,7 @@ const tabListVariants = cva("oc-surface-recessed no-scrollbar gap-1 overscroll-x
  * 调用方不必再逐处手写 `[@media(hover:none)]:min-h-11`(桌面端 hover 可用,渲染零变化)。
  */
 const tabVariants = cva(
-  "inline-flex items-center justify-center rounded-full text-body font-medium outline-none transition-[background-color,color,box-shadow] duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:min-h-11",
+  "relative z-[1] inline-flex items-center justify-center rounded-full text-body font-medium outline-none transition-[background-color,color,box-shadow] duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:min-h-11",
   {
     variants: {
       layout: {
@@ -59,11 +60,18 @@ const tabVariants = cva(
         grid: "min-w-0 px-2 py-1.5 md:shrink-0 md:px-4",
       },
       active: {
-        true: "oc-segmented-thumb text-fg",
+        true: "text-fg",
         false: "text-muted hover:text-fg",
       },
+      sliding: {
+        true: "",
+        false: "",
+      },
     },
-    defaultVariants: { layout: "scroll", active: false },
+    compoundVariants: [
+      { active: true, sliding: false, class: "oc-segmented-thumb" },
+    ],
+    defaultVariants: { layout: "scroll", active: false, sliding: false },
   },
 );
 
@@ -131,7 +139,15 @@ export function Tabs({
 }) {
   const refs = useRef<(HTMLButtonElement | null)[]>([]);
   const listRef = useRef<HTMLDivElement | null>(null);
+  const hasMeasuredRef = useRef(false);
   const [edge, setEdge] = useState<"none" | "left" | "right" | "both">("none");
+  const [indicator, setIndicator] = useState<{
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+    animate: boolean;
+  } | null>(null);
   // items 每次渲染都是新数组(调用方普遍写 TABS.map(...)),故用值序列做依赖键;
   // 直接依赖 items 会让下面两个 effect 每帧重跑。选中下标同理在渲染期算好,
   // effect 里就不必再引用 items 本身。
@@ -147,18 +163,68 @@ export function Tabs({
     setEdge((cur) => (cur === next ? cur : next));
   }, []);
 
-  // "能不能滚"同时取决于容器宽度和 tab 集合,所以用 ResizeObserver,而不是只监听 scroll。
+  const syncIndicator = useCallback(() => {
+    const list = listRef.current;
+    const activeEl = activeIndex >= 0 ? refs.current[activeIndex] : null;
+    if (!list || !activeEl || activeEl.offsetWidth <= 0) {
+      hasMeasuredRef.current = false;
+      setIndicator(null);
+      return;
+    }
+    // 窄屏 grid / 多行折行态安全回退到单按钮静态高光，不启用单行滑动底板。
+    const isGrid = typeof window !== "undefined" && window.getComputedStyle(list).display === "grid";
+    const firstEl = refs.current.find((el) => el != null && el.offsetWidth > 0);
+    const isMultiRow =
+      firstEl != null &&
+      refs.current.some((el) => el != null && el.offsetWidth > 0 && Math.abs(el.offsetTop - firstEl.offsetTop) > 2);
+    if (isGrid || isMultiRow) {
+      hasMeasuredRef.current = false;
+      setIndicator(null);
+      return;
+    }
+    const left = activeEl.offsetLeft;
+    const top = activeEl.offsetTop;
+    const width = activeEl.offsetWidth;
+    const height = activeEl.offsetHeight;
+    const animate = hasMeasuredRef.current;
+    hasMeasuredRef.current = true;
+    setIndicator((cur) =>
+      cur &&
+      cur.left === left &&
+      cur.top === top &&
+      cur.width === width &&
+      cur.height === height &&
+      cur.animate === animate
+        ? cur
+        : { left, top, width, height, animate },
+    );
+  }, [activeIndex]);
+
+  // 切换选中项或列表结构变化时，在首帧绘制前同步滑块几何位置，消除闪烁。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: itemsKey/layout 是重新测量的触发器
+  useLayoutEffect(() => {
+    syncIndicator();
+  }, [syncIndicator, itemsKey, layout]);
+
+  // "能不能滚"与滑动高亮底板宽度同时取决于容器宽度和 tab 集合，所以用 ResizeObserver 观测容器与各按钮。
   // ResizeObserver 只报被观测元素**自身**的尺寸变化 —— tab 增删导致的内容宽度变化不会触发,
   // 故 itemsKey / layout 必须进依赖重新测量(Biome 眼里是"多余依赖",实际是本 effect 的触发源)。
   // biome-ignore lint/correctness/useExhaustiveDependencies: itemsKey/layout 是重新测量的触发器,ResizeObserver 覆盖不到内容宽度变化
   useEffect(() => {
-    syncEdge();
+    const syncAll = () => {
+      syncEdge();
+      syncIndicator();
+    };
+    syncAll();
     const el = listRef.current;
     if (!el || typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(syncEdge);
+    const ro = new ResizeObserver(syncAll);
     ro.observe(el);
+    for (const btn of refs.current) {
+      if (btn) ro.observe(btn);
+    }
     return () => ro.disconnect();
-  }, [syncEdge, itemsKey, layout]);
+  }, [syncEdge, syncIndicator, itemsKey, layout]);
 
   // 受控 value 变化 → 把选中项滚进视口中央。容器不可滚时直接跳过:既省事,也避免
   // scrollIntoView 顺带滚动祖先滚动容器(整页跳动的经典来源)。
@@ -207,6 +273,21 @@ export function Tabs({
         className,
       )}
     >
+      {indicator && (
+        <span
+          aria-hidden="true"
+          data-tab-indicator
+          className="oc-segmented-thumb pointer-events-none absolute left-0 top-0 z-0 rounded-full"
+          style={{
+            transform: `translate3d(${indicator.left}px, ${indicator.top}px, 0)`,
+            width: `${indicator.width}px`,
+            height: `${indicator.height}px`,
+            transition: indicator.animate
+              ? "transform 220ms var(--ease-spring), width 220ms var(--ease-spring)"
+              : "none",
+          }}
+        />
+      )}
       {items.map((it, i) => {
         const active = it.value === value;
         // 面板真的挂载了才落 aria-controls(默认只有选中项挂载)。见组件头注释第 4 条。
@@ -227,7 +308,7 @@ export function Tabs({
             onClick={() => onValueChange(it.value)}
             onKeyDown={(e) => onKeyDown(e, i)}
             className={cn(
-              tabVariants({ layout, active }),
+              tabVariants({ layout, active, sliding: indicator !== null }),
             )}
           >
             {/* 宫格模式下列宽固定,需要一个可截断的块级容器承载省略号;

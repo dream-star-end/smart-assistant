@@ -1,6 +1,6 @@
 /** 行级 LCS diff(F2)的纯函数单测:上下文识别、行号、退化路径。 */
 import { describe, expect, test } from 'vitest'
-import { diffLines } from './lineDiff'
+import { computeInlineDiffMap, diffLines, inlineDiffSpans } from './lineDiff'
 import { collapseDiffContext, diffStats, parseUnifiedDiffLines } from './diffHunk'
 
 describe('diffLines', () => {
@@ -82,5 +82,60 @@ describe('OCV5-817 diffStats / collapseDiffContext / parseUnifiedDiffLines', () 
     expect(parsed.lines[3]).toMatchObject({ kind: 'context', oldNo: 10, newNo: 10, text: 'const keep = 1;' })
     expect(parsed.lines[4]).toMatchObject({ kind: 'del', oldNo: 11, newNo: null, text: 'const oldVal = 2;' })
     expect(parsed.lines[5]).toMatchObject({ kind: 'add', oldNo: null, newNo: 11, text: 'const newVal = 3;' })
+  })
+})
+
+describe('OCV5-838 inlineDiffSpans & computeInlineDiffMap (词级前后缀高亮)', () => {
+  test('高亮代码行中真正改动的词段，保留公共前后缀', () => {
+    const res = inlineDiffSpans('const count = 1;', 'const count = 2;')
+    expect(res).toEqual({
+      oldSpans: [
+        { text: 'const count = ', changed: false },
+        { text: '1', changed: true },
+        { text: ';', changed: false },
+      ],
+      newSpans: [
+        { text: 'const count = ', changed: false },
+        { text: '2', changed: true },
+        { text: ';', changed: false },
+      ],
+    })
+  })
+
+  test('支持中文逐字公共前后缀高亮', () => {
+    const res = inlineDiffSpans('你好旧世界', '你好新世界')
+    expect(res).toEqual({
+      oldSpans: [
+        { text: '你好', changed: false },
+        { text: '旧', changed: true },
+        { text: '世界', changed: false },
+      ],
+      newSpans: [
+        { text: '你好', changed: false },
+        { text: '新', changed: true },
+        { text: '世界', changed: false },
+      ],
+    })
+  })
+
+  test('完全重写无公共词或完全相同的行返回 null，避免整行噪音', () => {
+    expect(inlineDiffSpans('alpha()', 'beta[]')).toBeNull()
+    expect(inlineDiffSpans('same line', 'same line')).toBeNull()
+  })
+
+  test('computeInlineDiffMap 自动为相邻 -/+ 对生成行索引映射', () => {
+    const rows = diffLines('keep\nconst a = 1;\nend', 'keep\nconst a = 42;\nend')
+    const map = computeInlineDiffMap(rows)
+    expect(map.has(0)).toBe(false)
+    expect(map.get(1)).toEqual([
+      { text: 'const a = ', changed: false },
+      { text: '1', changed: true },
+      { text: ';', changed: false },
+    ])
+    expect(map.get(2)).toEqual([
+      { text: 'const a = ', changed: false },
+      { text: '42', changed: true },
+      { text: ';', changed: false },
+    ])
   })
 })

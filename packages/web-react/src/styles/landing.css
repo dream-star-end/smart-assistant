@@ -35,6 +35,7 @@
   --danger-fg: #0a0b09;
   --success: #8de68f;
   --success-soft: rgba(141, 230, 143, 0.1);
+  --success-fg: #0a0b09;
   --warning: #f6c66a;
   --warning-soft: rgba(246, 198, 106, 0.1);
   --warning-fg: #0a0b09;
@@ -80,6 +81,7 @@
   --color-danger-fg: #0a0b09;
   --color-success: #8de68f;
   --color-success-soft: rgba(141, 230, 143, 0.1);
+  --color-success-fg: #0a0b09;
   --color-warning: #f6c66a;
   --color-warning-soft: rgba(246, 198, 106, 0.1);
   --color-info: #79d8ff;

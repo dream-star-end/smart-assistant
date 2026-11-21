@@ -27,6 +27,26 @@ export function _resetBoxCapacityHoldAutoContinueForTest(): void {
   autoContinuedBoxHoldKeys.clear();
 }
 
+const RATE_LIMIT_OR_MODEL_UNAVAILABLE_CODES = new Set([
+  "rate_limited",
+  "rate_limit",
+  "model_capacity",
+  "model_not_available",
+  "model_unavailable",
+  "unresolved_agent_model",
+  "unauthorized_model",
+  "upstream_overloaded",
+  "provider_overloaded",
+  "service_unavailable",
+]);
+
+function isRateLimitOrModelUnavailable(userError: UserError, rawCode?: string): boolean {
+  const code = (userError.code || rawCode || "").toLowerCase();
+  if (code === "box_capacity_held") return false;
+  if (RATE_LIMIT_OR_MODEL_UNAVAILABLE_CODES.has(code)) return true;
+  return userError.category === "capacity" || userError.category === "model";
+}
+
 export type TurnErrorNoticeProps = {
   role: "alert" | "status";
   tone: NoticeTone;
@@ -45,6 +65,8 @@ export type TurnErrorNoticeProps = {
   details?: string | Parameters<typeof errorTechnicalDetails>[0];
   /** OCV5-734: 唯一消息键,保证 box_capacity_held 释放后自动继续至多触发一次。 */
   holdKey?: string;
+  /** 可选：限流 / 模型不可用时引导切换备用模型的回调（未传时优先复用 actions.cb.onOpenModelPicker）。 */
+  onOpenModelPicker?: () => void;
 };
 
 export function TurnErrorNotice(p: TurnErrorNoticeProps) {
@@ -86,7 +108,7 @@ export function TurnErrorNotice(p: TurnErrorNoticeProps) {
     return () => window.clearTimeout(timer);
   }, [canAutoWait, holdKey, secondsLeft]);
 
-  const effectiveActions = canAutoWait && secondsLeft > 0
+  const countdownActions = canAutoWait && secondsLeft > 0
     ? baseActions.map((a) =>
         a.label === "继续"
           ? {
@@ -98,6 +120,49 @@ export function TurnErrorNotice(p: TurnErrorNoticeProps) {
           : a,
       )
     : baseActions;
+
+  const openModelPicker =
+    p.onOpenModelPicker ??
+    (typeof p.actions !== "function" && p.actions.isLastTurn ? p.actions.cb.onOpenModelPicker : undefined);
+  const alreadyHasSwitchModel = countdownActions.some(
+    (a) => a.label === "切换模型" || a.label === "切换备用模型继续",
+  );
+  const wantFallbackModelCta =
+    Boolean(openModelPicker) &&
+    !alreadyHasSwitchModel &&
+    isRateLimitOrModelUnavailable(userError, p.code);
+
+  const effectiveActions =
+    wantFallbackModelCta && countdownActions.length < 2
+      ? [...countdownActions, { label: "切换备用模型继续", onClick: openModelPicker! }]
+      : countdownActions;
+  const inlineFallbackCta =
+    wantFallbackModelCta && countdownActions.length >= 2 ? (
+      <div className="mt-1.5">
+        <button
+          type="button"
+          onClick={openModelPicker}
+          className="oc-btn-tactile inline-flex items-center rounded-md text-caption font-medium text-accent underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          切换备用模型继续
+        </button>
+      </div>
+    ) : null;
+
+  const countdownBar =
+    canAutoWait && secondsLeft > 0 ? (
+      <div
+        data-testid="box-capacity-countdown-bar"
+        aria-hidden="true"
+        className="mt-2 h-1 w-full overflow-hidden rounded-full bg-hover/80"
+      >
+        <div
+          className="h-full rounded-full bg-accent transition-[width] duration-1000 ease-linear"
+          style={{ width: `${Math.max(0, Math.min(100, (secondsLeft / BOX_CAPACITY_HELD_WAIT_SECONDS) * 100))}%` }}
+        />
+      </div>
+    ) : null;
+
   const holdReleasedNote = canAutoWait && autoResumed ? (
     <p data-testid="box-capacity-released-notice" className="mt-1.5 text-meta text-fg/80">
       等待时间已结束，已为你自动尝试继续一次。
@@ -115,6 +180,8 @@ export function TurnErrorNotice(p: TurnErrorNoticeProps) {
     >
       {p.fixedBody ?? userError.message}
       {p.note}
+      {countdownBar}
+      {inlineFallbackCta}
       {holdReleasedNote}
     </Notice>
   );
@@ -153,6 +220,7 @@ export function TurnStatusCard({
       code={presented.code}
       fixedBody={presented.fixedMessage ? presented.message : undefined}
       actions={() => (currentTurn && retry ? [retry] : [])}
+      onOpenModelPicker={currentTurn ? cb.onOpenModelPicker : undefined}
       details={details}
       holdKey={msg.id}
     />

@@ -8,6 +8,7 @@ import {
   isFlagshipModel,
   paletteActions,
   paletteMatches,
+  parsePaletteQuery,
 } from "./paletteModel";
 
 const NOW = Date.parse("2026-11-20T04:00:00.000Z");
@@ -172,5 +173,85 @@ describe("paletteModel 模糊搜索与强模型显式标注", () => {
     expect(byModelFuzzy.find((g) => g.id === "models")?.items.map((i) => i.key)).toEqual([
       "model:claude-opus-4-6",
     ]);
+  });
+
+  it("OCV5-838: 支持 > 仅滤操作命令、@ 仅滤模型与智能体，以及补齐高频动作入口", () => {
+    expect(parsePaletteQuery(">设置")).toEqual({ mode: "commands", term: "设置" });
+    expect(parsePaletteQuery("@opus")).toEqual({ mode: "models", term: "opus" });
+    expect(parsePaletteQuery("周报")).toEqual({ mode: "none", term: "周报" });
+
+    const projects = [makeProject("p1", "设置中心项目")];
+    const sessions = [makeSession({ id: "s1", title: "讨论 opus 模型设置" })];
+    const models: PublicModel[] = [
+      { id: "claude-opus-4-6", display_name: "Claude Opus 4.6", cost_x: 3.5 },
+      { id: "gpt-5.4", display_name: "GPT-5.4", cost_x: 2.0 },
+    ];
+    const agents = [
+      { id: "main", name: "全能助手" },
+      { id: "coder", name: "代码专家", description: "专注工程开发" },
+    ];
+    const actions = paletteActions({
+      query: "",
+      currentProject: null,
+      canNewInProject: false,
+      canMoveSession: false,
+      canOpenHome: false,
+      canOpenBoard: true,
+      canOpenSettings: true,
+      canSwitchAgent: true,
+      canFindInSession: true,
+      canShareSession: true,
+      canOpenInbox: true,
+    });
+
+    const cmdOnly = buildPaletteGroups({
+      query: ">查找",
+      filter: "all",
+      projects,
+      sessions,
+      currentProjectId: null,
+      recents: [],
+      models,
+      canSelectModel: true,
+      agents,
+      canSelectAgent: true,
+      actions,
+    });
+    expect(cmdOnly.flatMap((g) => g.items).every((it) => it.kind === "action")).toBe(true);
+    expect(cmdOnly.flatMap((g) => g.items).map((it) => it.key)).toContain("action:find-in-session");
+
+    const modelAndAgentOnly = buildPaletteGroups({
+      query: "@",
+      filter: "all",
+      projects,
+      sessions,
+      currentProjectId: null,
+      recents: [],
+      models,
+      activeModelId: "gpt-5.4",
+      canSelectModel: true,
+      agents,
+      activeAgentId: "main",
+      canSelectAgent: true,
+      actions,
+    });
+    expect(modelAndAgentOnly.map((g) => g.id)).toEqual(["models", "agents"]);
+    expect(modelAndAgentOnly[0]!.items.map((i) => i.key)).toEqual(["model:gpt-5.4", "model:claude-opus-4-6"]);
+    expect(modelAndAgentOnly[1]!.items.map((i) => i.key)).toEqual(["agent:main", "agent:coder"]);
+
+    const agentFiltered = buildPaletteGroups({
+      query: "@代码",
+      filter: "all",
+      projects,
+      sessions,
+      currentProjectId: null,
+      recents: [],
+      models,
+      canSelectModel: true,
+      agents,
+      canSelectAgent: true,
+      actions,
+    });
+    expect(agentFiltered.flatMap((g) => g.items).map((i) => i.key)).toEqual(["agent:coder"]);
   });
 });

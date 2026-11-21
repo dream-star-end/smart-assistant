@@ -1,5 +1,5 @@
 import type { JSX } from "react";
-import { type IconSpec, RenderIconSpec } from "./AtelierIcons";
+import { ATELIER_SHARED_SPECS, type IconSpec, RenderIconSpec } from "./AtelierIcons";
 
 export type AtelierLazyIconName =
   | "manage"
@@ -17,7 +17,10 @@ export type AtelierLazyIconName =
   | "deliverables"
   | "memory"
   | "cron"
-  | "model";
+  | "model"
+  | "agent"
+  | "terminal"
+  | "shield";
 
 const LAZY_SPECS: Record<AtelierLazyIconName, IconSpec> = {
   manage: {
@@ -97,6 +100,7 @@ const LAZY_SPECS: Record<AtelierLazyIconName, IconSpec> = {
     ],
     c: [[12, 11.6, 1.2]],
   },
+  ...ATELIER_SHARED_SPECS,
 };
 
 export function AtelierLazyIcon({

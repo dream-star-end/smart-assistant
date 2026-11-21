@@ -1,5 +1,5 @@
 import * as Dialog from '@radix-ui/react-dialog'
-import { CheckCircle2, LogIn, Store, TriangleAlert, X } from 'lucide-react'
+import { CheckCircle2, LogIn, TriangleAlert, X } from 'lucide-react'
 import { type CSSProperties, useCallback, useEffect, useState } from 'react'
 import { PRODUCT_CAPABILITIES, type ProductFeatureId } from '../lib/productCapabilities'
 import { marketplaceArtifactKind } from '../lib/marketplace'
@@ -14,6 +14,7 @@ import {
 } from './marketplace/useMarketplacePublishes'
 import { useMarketplaceRevision } from './marketplace/useMarketplaceRevision'
 import { Alert, Badge, Button, EmptyState, IconButton, Tabs, useToast } from './ui'
+import { AtelierLazyIcon } from './ui/AtelierLazyIcons'
 
 export type MarketplaceTab = 'browse' | 'installed' | 'publish' | 'review'
 /** Legacy navigation/storage kind. Connector rows remain wire-compatible in PR1. */
@@ -158,7 +159,7 @@ export function MarketplaceCenter({
                 className="oc-icon-badge oc-icon-badge-accent size-7 shrink-0 rounded-lg"
                 aria-hidden="true"
               >
-                <Store size={14} strokeWidth={1.9} />
+                <AtelierLazyIcon name="market" size={15} />
               </span>
               <Dialog.Title className="truncate text-title font-semibold tracking-tight text-fg">
                 AI 市场

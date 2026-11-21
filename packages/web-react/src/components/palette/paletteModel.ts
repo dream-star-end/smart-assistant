@@ -34,6 +34,30 @@ export function nextPaletteFilter(cur: PaletteFilter, step: 1 | -1): PaletteFilt
   return PALETTE_FILTERS[(((i + step) % n) + n) % n]!.id;
 }
 
+export type PalettePrefixMode = "none" | "commands" | "models";
+
+/**
+ * 解析 ⌘K 快捷前缀：
+ * - `>` 仅过滤操作命令（workspace + actions）
+ * - `@` 仅过滤模型与智能体（models + agents + switch-agent）
+ */
+export function parsePaletteQuery(raw: string): { mode: PalettePrefixMode; term: string } {
+  const trimmed = raw.trimStart();
+  if (trimmed.startsWith(">")) {
+    return { mode: "commands", term: trimmed.slice(1).trim() };
+  }
+  if (trimmed.startsWith("@")) {
+    return { mode: "models", term: trimmed.slice(1).trim() };
+  }
+  return { mode: "none", term: trimmed.trim() };
+}
+
+export type PaletteAgentItem = {
+  id: string;
+  name: string;
+  description?: string;
+};
+
 export type PaletteActionId =
   | "new-in-project"
   | "new-session"
@@ -51,7 +75,11 @@ export type PaletteActionId =
   | "toggle-theme"
   | "toggle-pane"
   | "toggle-swarm"
-  | "open-goal";
+  | "open-goal"
+  | "switch-agent"
+  | "find-in-session"
+  | "share-session"
+  | "open-inbox";
 
 const WORKSPACE_ACTION_IDS: ReadonlySet<PaletteActionId> = new Set([
   "open-board",
@@ -66,6 +94,10 @@ const WORKSPACE_ACTION_IDS: ReadonlySet<PaletteActionId> = new Set([
   "toggle-pane",
   "toggle-swarm",
   "open-goal",
+  "switch-agent",
+  "find-in-session",
+  "share-session",
+  "open-inbox",
 ]);
 
 const UPGRADED_WORKSPACE_ACTION_IDS: ReadonlySet<PaletteActionId> = new Set([
@@ -118,6 +150,12 @@ export type PaletteItem =
       model: PublicModel;
       meta: PaletteModelMeta;
       disabled?: boolean;
+    }
+  | {
+      kind: "agent";
+      key: string;
+      agent: PaletteAgentItem;
+      isCurrent: boolean;
     }
   | { kind: "action"; key: string; action: PaletteAction }
   | { kind: "move-target"; key: string; projectId: string | null; label: string; color?: string | null };
@@ -321,6 +359,10 @@ export type BuildPaletteInput = {
   models?: readonly PublicModel[];
   activeModelId?: string | null;
   canSelectModel?: boolean;
+  /** 可选：智能体列表（支持 `@` 前缀或搜索直达切换）。 */
+  agents?: readonly PaletteAgentItem[];
+  activeAgentId?: string | null;
+  canSelectAgent?: boolean;
 };
 
 /** Rank inside one group: projects (active, then archived), chats (live first), then files/outputs. */
@@ -370,6 +412,7 @@ function buildModelItems(
   activeModelId: string | null | undefined,
   canSelectModel: boolean | undefined,
   q: string,
+  idleLimit = PALETTE_MODEL_IDLE_LIMIT,
 ): PaletteItem[] {
   if (!models?.length || !canSelectModel) return [];
   const described = models.map((model, idx) => ({
@@ -393,7 +436,7 @@ function buildModelItems(
     return described
       .slice()
       .sort(sortOrder)
-      .slice(0, PALETTE_MODEL_IDLE_LIMIT)
+      .slice(0, idleLimit)
       .map(({ model, meta }) => ({
         kind: "model",
         key: `model:${model.id}`,
@@ -423,9 +466,122 @@ function buildModelItems(
     }));
 }
 
+function buildAgentItems(
+  agents: readonly PaletteAgentItem[] | undefined,
+  activeAgentId: string | null | undefined,
+  canSelectAgent: boolean | undefined,
+  q: string,
+): PaletteItem[] {
+  if (!agents?.length || !canSelectAgent) return [];
+  const list = agents.map((agent, idx) => ({
+    agent,
+    idx,
+    isCurrent: Boolean(activeAgentId && agent.id === activeAgentId),
+    score: q ? fuzzyMatchScore(`${agent.name} ${agent.id} ${agent.description ?? ""} 智能体 agent`, q) : 1,
+  }));
+  return list
+    .filter((entry) => entry.score > 0)
+    .sort(
+      (a, b) =>
+        b.score - a.score ||
+        Number(b.isCurrent) - Number(a.isCurrent) ||
+        a.idx - b.idx,
+    )
+    .slice(0, PALETTE_MODEL_LIMIT)
+    .map(({ agent, isCurrent }) => ({
+      kind: "agent",
+      key: `agent:${agent.id}`,
+      agent,
+      isCurrent,
+    }));
+}
+
+function appendActionGroups(
+  groups: PaletteGroup[],
+  actions: readonly PaletteAction[],
+  q: string,
+  alwaysIncludeNewProject: boolean,
+): void {
+  const hasUpgradedWorkspace = actions.some((a) => UPGRADED_WORKSPACE_ACTION_IDS.has(a.id));
+  const matchedActions = actions.filter(
+    (a) =>
+      (alwaysIncludeNewProject && a.id === "new-project") ||
+      paletteMatches(`${a.label} ${a.keywords ?? ""} ${a.hint ?? ""}`, q),
+  );
+
+  if (hasUpgradedWorkspace) {
+    const workspaceActions = matchedActions.filter((a) => WORKSPACE_ACTION_IDS.has(a.id));
+    const generalActions = matchedActions.filter((a) => !WORKSPACE_ACTION_IDS.has(a.id));
+    if (workspaceActions.length) {
+      groups.push({
+        id: "workspace",
+        label: "工作区入口",
+        items: workspaceActions.map((a) => ({ kind: "action", key: `action:${a.id}`, action: a })),
+      });
+    }
+    if (generalActions.length) {
+      groups.push({
+        id: "actions",
+        label: "操作",
+        items: generalActions.map((a) => ({ kind: "action", key: `action:${a.id}`, action: a })),
+      });
+    }
+  } else if (matchedActions.length) {
+    groups.push({
+      id: "actions",
+      label: "操作",
+      items: matchedActions.map((a) => ({ kind: "action", key: `action:${a.id}`, action: a })),
+    });
+  }
+}
+
 export function buildPaletteGroups(input: BuildPaletteInput): PaletteGroup[] {
-  const q = input.query.trim();
+  const parsed = parsePaletteQuery(input.query);
+  const q = parsed.term;
   const groups: PaletteGroup[] = [];
+
+  // `>` 快捷前缀：仅过滤操作命令
+  if (parsed.mode === "commands") {
+    appendActionGroups(groups, input.actions, q, false);
+    return groups;
+  }
+
+  // `@` 快捷前缀：仅过滤模型与智能体
+  if (parsed.mode === "models") {
+    const modelItems = buildModelItems(
+      input.models,
+      input.activeModelId,
+      input.canSelectModel,
+      q,
+      PALETTE_MODEL_LIMIT,
+    );
+    if (modelItems.length) {
+      groups.push({ id: "models", label: "显式切换模型", items: modelItems });
+    }
+    const agentItems = buildAgentItems(
+      input.agents,
+      input.activeAgentId,
+      input.canSelectAgent,
+      q,
+    );
+    if (agentItems.length) {
+      groups.push({ id: "agents", label: "智能体", items: agentItems });
+    }
+    const switchAgentAction = input.actions.find(
+      (a) =>
+        a.id === "switch-agent" &&
+        (!q || paletteMatches(`${a.label} ${a.keywords ?? ""} ${a.hint ?? ""}`, q)),
+    );
+    if (switchAgentAction && agentItems.length === 0) {
+      groups.push({
+        id: "agents",
+        label: "智能体",
+        items: [{ kind: "action", key: `action:${switchAgentAction.id}`, action: switchAgentAction }],
+      });
+    }
+    return groups;
+  }
+
   const projectById = new Map(input.projects.map((p) => [p.id, p]));
   const sessionById = new Map(input.sessions.map((s) => [s.id, s]));
 
@@ -587,35 +743,14 @@ export function buildPaletteGroups(input: BuildPaletteInput): PaletteGroup[] {
       groups.push({ id: "models", label: "显式切换模型", items: modelItems });
     }
 
-    const hasUpgradedWorkspace = input.actions.some((a) => UPGRADED_WORKSPACE_ACTION_IDS.has(a.id));
-    const matchedActions = input.actions.filter(
-      (a) => a.id === "new-project" || paletteMatches(`${a.label} ${a.keywords ?? ""} ${a.hint ?? ""}`, q),
-    );
-
-    if (hasUpgradedWorkspace) {
-      const workspaceActions = matchedActions.filter((a) => WORKSPACE_ACTION_IDS.has(a.id));
-      const generalActions = matchedActions.filter((a) => !WORKSPACE_ACTION_IDS.has(a.id));
-      if (workspaceActions.length) {
-        groups.push({
-          id: "workspace",
-          label: "工作区入口",
-          items: workspaceActions.map((a) => ({ kind: "action", key: `action:${a.id}`, action: a })),
-        });
+    if (q) {
+      const agentItems = buildAgentItems(input.agents, input.activeAgentId, input.canSelectAgent, q);
+      if (agentItems.length) {
+        groups.push({ id: "agents", label: "智能体", items: agentItems });
       }
-      if (generalActions.length) {
-        groups.push({
-          id: "actions",
-          label: "操作",
-          items: generalActions.map((a) => ({ kind: "action", key: `action:${a.id}`, action: a })),
-        });
-      }
-    } else if (matchedActions.length) {
-      groups.push({
-        id: "actions",
-        label: "操作",
-        items: matchedActions.map((a) => ({ kind: "action", key: `action:${a.id}`, action: a })),
-      });
     }
+
+    appendActionGroups(groups, input.actions, q, true);
   }
   return groups;
 }
@@ -668,8 +803,14 @@ export function paletteActions(opts: {
   canTogglePane?: boolean;
   canToggleSwarm?: boolean;
   canOpenGoal?: boolean;
+  canSwitchAgent?: boolean;
+  canFindInSession?: boolean;
+  canShareSession?: boolean;
+  canOpenInbox?: boolean;
 }): PaletteAction[] {
-  const q = opts.query.trim();
+  const parsed = parsePaletteQuery(opts.query);
+  // `>` / `@` 快捷前缀模式下不把检索词拼进「新建项目「xxx」」，防止任意 `>命令` 误命中新建项目。
+  const q = parsed.mode === "none" ? parsed.term : "";
   const out: PaletteAction[] = [];
   if (opts.currentProject && opts.canNewInProject) {
     out.push({
@@ -758,6 +899,38 @@ export function paletteActions(opts: {
       label: "创建长期目标",
       keywords: "goal 目标 长期任务 自动推进 规划",
       hint: "长期目标",
+    });
+  }
+  if (opts.canSwitchAgent) {
+    out.push({
+      id: "switch-agent",
+      label: "切换智能体",
+      keywords: "agent switch 智能体 助手 角色",
+      hint: "@",
+    });
+  }
+  if (opts.canFindInSession) {
+    out.push({
+      id: "find-in-session",
+      label: "会话内查找",
+      keywords: "find search ctrl+f cmd+f 查找 搜索 消息",
+      hint: "⌘F",
+    });
+  }
+  if (opts.canShareSession) {
+    out.push({
+      id: "share-session",
+      label: "分享会话",
+      keywords: "share session link 分享 链接 公开",
+      hint: "分享",
+    });
+  }
+  if (opts.canOpenInbox) {
+    out.push({
+      id: "open-inbox",
+      label: "打开站内信",
+      keywords: "inbox notification message 站内信 通知 消息",
+      hint: "通知",
     });
   }
   if (opts.canToggleTheme) {
