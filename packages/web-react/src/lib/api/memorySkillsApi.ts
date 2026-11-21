@@ -357,7 +357,12 @@ export const memorySkillsApi = {
 
   /** 一键还原归档核心记忆（支持单条 id 或整批 batchId；POST /api/agents/:id/memory/archive/restore）。 */
   restoreArchivedMemories: (a: AuthSession, agentId: string, opts: { id?: string; batchId?: string }) =>
-    jsonOrThrow<{ ok: boolean; restored: ArchivedMemoryEntry[]; skipped: unknown[] }>(
+    jsonOrThrow<{
+      ok: boolean;
+      restored: ArchivedMemoryEntry[];
+      skipped: unknown[];
+      preservedEditedFiles?: string[];
+    }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/agents/${encodeURIComponent(agentId)}/memory/archive/restore`, {
           method: "POST",
@@ -391,7 +396,12 @@ export const memorySkillsApi = {
 
   /** 一键还原归档技能（支持单条 id/name 或整批 batchId；POST /api/skills/archive/restore）。 */
   restoreArchivedSkills: (a: AuthSession, opts: { id?: string; name?: string; batchId?: string }) =>
-    jsonOrThrow<{ ok: boolean; restored: ArchivedSkillEntry[]; skipped: unknown[] }>(
+    jsonOrThrow<{
+      ok: boolean;
+      restored: ArchivedSkillEntry[];
+      skipped: unknown[];
+      preservedEditedFiles?: string[];
+    }>(
       callWithRefresh(a, (t) =>
         fetch("/api/skills/archive/restore", {
           method: "POST",

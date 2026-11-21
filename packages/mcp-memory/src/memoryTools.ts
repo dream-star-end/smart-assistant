@@ -48,6 +48,7 @@ import {
   coverageAtLeastHalf,
   readMemoryTurnPolicy,
   reciprocalRankFusion,
+  searchArchivedMemories,
   searchSessions,
   upsertArchivalVector,
 } from '@openclaude/storage'
@@ -466,11 +467,31 @@ export async function handleCoreSearch(args: {
   }
   const page = hits.slice(offset, offset + limit)
   const retrievalMode = semanticFiles === null ? 'lexical' : 'semantic'
-  if (hits.length === 0) return toolOk(`No safe Core memories match "${query}".`, {
-    outcome: 'no_match',
-    retrievalMode,
-    resultCount: 0,
-  })
+  if (hits.length === 0) {
+    const archivedHits = await searchArchivedMemories(paths.agentDir(args.agentId), query, 3).catch(
+      () => [],
+    )
+    if (archivedHits.length > 0) {
+      const archivedLines = [
+        `No safe Core memories match "${query}".`,
+        '',
+        'Archived memories that match this topic (previously auto-archived; can be restored anytime via Archived Records or `/api/agents/:id/memory/archive/restore`):',
+        ...archivedHits.map(
+          (h) => `- **${h.title}** (${h.target}) — ${h.snippet || h.description || h.reason} (id: ${h.id})`,
+        ),
+      ]
+      return toolOk(archivedLines.join('\n'), {
+        outcome: 'no_match',
+        retrievalMode,
+        resultCount: 0,
+      })
+    }
+    return toolOk(`No safe Core memories match "${query}".`, {
+      outcome: 'no_match',
+      retrievalMode,
+      resultCount: 0,
+    })
+  }
   if (!page.length)
     return toolOk(
       `Found ${hits.length} safe Core matches for "${query}", but offset ${offset} is past the last result.`,

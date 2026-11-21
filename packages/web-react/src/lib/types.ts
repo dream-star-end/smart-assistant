@@ -1305,6 +1305,10 @@ export type ContextHygieneRunRecord = {
   bytesFreed: number;
   archivedMemoryFiles: string[];
   archivedSkillNames: string[];
+  /** OCV5-841: L2 语义级自动合并统计与人话摘要（可选）。 */
+  mergedMemoryGroups?: number;
+  mergedMemorySources?: number;
+  semanticSummary?: string;
   errors: string[];
 };
 

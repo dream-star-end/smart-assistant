@@ -6,15 +6,15 @@ import type {
 } from "./model";
 
 const STRATEGY_LABELS: Record<string, string> = {
-  native_summary: "模型原生摘要压缩",
-  checkpoint_reset: "检查点重置",
-  history_suffix: "保留近期对话尾巴",
-  file_reference: "超长内容外置文件引用",
+  native_summary: "自动摘要整理",
+  checkpoint_reset: "检查点整理",
+  history_suffix: "保留近期对话",
+  file_reference: "长内容自动收纳",
 };
 
 export function compactionStrategyLabel(strategy?: string): string {
-  if (!strategy) return "上下文压缩";
-  return STRATEGY_LABELS[strategy] ?? strategy;
+  if (!strategy) return "对话整理";
+  return STRATEGY_LABELS[strategy] ?? "对话整理";
 }
 
 export function computeCompactionSavedPct(detail: Pick<
@@ -150,11 +150,10 @@ export function contextCompactedRow(
       : {}),
   };
 
-  const savedPct = computeCompactionSavedPct(detail);
-  const text =
-    savedPct !== null && savedPct > 0
-      ? `已压缩模型上下文 · 释放约 ${savedPct}% · 原始对话完整保留`
-      : "已压缩模型上下文 · 原始对话完整保留";
+  const isManual = typeof frame.requestId === "string" && frame.requestId.trim().startsWith("compact:");
+  const text = isManual
+    ? "已整理较早对话，原始记录完整保留"
+    : "已自动整理较早对话，可继续无缝聊下去";
 
   return { id, text, detail };
 }

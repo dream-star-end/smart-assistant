@@ -1144,6 +1144,7 @@ export async function _runAutoDreamModel(
     defaultModel: this.deps.config.defaults.model,
   })
   if (execution && execution.engine !== 'ccb') throw new Error('AUTO_DREAM_MODEL_NOT_CCB')
+  if (input.signal?.aborted) throw new Error('AUTO_DREAM_ABORTED')
   const model = execution?.canonicalModel ?? input.model
   const sessionKey = `auto-dream:${input.attemptId}`
   const session = await this.sessions.getOrCreate({
@@ -1156,10 +1157,19 @@ export async function _runAutoDreamModel(
     effortLevel: 'medium',
     workload: 'auto-dream',
     hermeticNoTools: true,
-    structuredOutputSchema: AUTO_DREAM_PROPOSAL_JSON_SCHEMA,
+    // B6: Respect caller-specified L2 JSON schema while preserving v1 default.
+    structuredOutputSchema: input.outputSchema ?? AUTO_DREAM_PROPOSAL_JSON_SCHEMA,
   })
   const collector = new AutoDreamStructuredOutputCollector()
+  const onAbort = () => {
+    try {
+      this.sessions.interrupt(sessionKey)
+    } catch {}
+    void this.sessions.destroySession(sessionKey).catch(() => {})
+  }
+  input.signal?.addEventListener('abort', onAbort, { once: true })
   try {
+    if (input.signal?.aborted) throw new Error('AUTO_DREAM_ABORTED')
     await this.sessions.submit(
       session,
       input.prompt,
@@ -1167,8 +1177,10 @@ export async function _runAutoDreamModel(
       'medium',
       model,
     )
+    if (input.signal?.aborted) throw new Error('AUTO_DREAM_ABORTED')
     return collector.finish()
   } finally {
+    input.signal?.removeEventListener('abort', onAbort)
     await this.sessions.destroySession(sessionKey).catch(() => {})
   }
 }

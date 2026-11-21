@@ -44,6 +44,8 @@ import type {
 import { eventBus, createEvent } from './eventBus.js'
 import { contextCompactionsTotal, contextRebuildsTotal } from './metrics.js'
 import { markCheckpointTurnOutcome } from './sessionCheckpointStore.js'
+import { isSafeUniversalOverflowSummary, isUniversalOverflowError, recordTurnContextWatermarkForAutoCompact, SafeUniversalOverflowRetryError, tryUniversalOverflowAutoCompact } from './sessionAutoCompact.js'
+import type { SessionLifecycleHost } from './sessionLifecycle.js'
 import { beginMemoryTurnTracking } from './memoryTurnObserver.js'
 import {
   createTurnUsageRecorder,
@@ -1575,11 +1577,20 @@ export async function _runOneTurn(
       // the same engine session. Completed Bash is therefore safe here.
       const transientContinuationIsSafe =
         turnPermissionCount === 0 && (checkpointSafe || nativeContinuationSafe)
+      const universalOverflowIsSafeToRetry = isSafeUniversalOverflowSummary({
+        session, result, errorClass: transientErrorClass, hasUsage: contextOverflowHasUsage,
+        turnBlockCount, turnPermissionCount, turnToolCallCount, structuredBlockCount: structuredBlocks.length,
+        priorAssistantSegments: retryAssistantSegments.length,
+        stoppedOrAborted: Boolean(requestedTerminal || session._externalTurnAbort?.signal.aborted),
+        isCcbSingleDiagnostic: ccbContextDiagnostic,
+      })
+      const allowUniversalOverflowRetry =
+        universalOverflowIsSafeToRetry && (retryTransientErrors || Boolean(session.runner.executionBackend))
       if (
         result?.isError &&
-        retryTransientErrors &&
         transientContinuationIsSafe &&
-        (TRANSIENT_RETRY_ERROR_CODES.has(transientErrorClass) || contextOverflowIsSafeToRetry)
+        (allowUniversalOverflowRetry ||
+          (retryTransientErrors && (TRANSIENT_RETRY_ERROR_CODES.has(transientErrorClass) || contextOverflowIsSafeToRetry)))
       ) {
         retryRuntimeEvents.push(...result.runtimeEvents.map((event) => structuredClone(event)))
         const frozenAttemptAssistantSegments = freezeSegments(
@@ -1625,11 +1636,11 @@ export async function _runOneTurn(
         const retryError = result.errorDetail ?? `${transientErrorClass}: transient model failure`
         settle(() =>
           reject(
-            contextOverflowIsSafeToRetry && session.providerTag === 'ccb'
-              ? new SafeCcbContextRebuildRetryError(retryError)
-              : result.retryHint
-                ? new Upstream429RetryError(retryError, result.retryHint)
-                : new Error(retryError),
+            universalOverflowIsSafeToRetry && (session.runner.executionBackend || !contextOverflowIsSafeToRetry)
+              ? new SafeUniversalOverflowRetryError(retryError, true)
+              : contextOverflowIsSafeToRetry && session.providerTag === 'ccb'
+                ? new SafeCcbContextRebuildRetryError(retryError)
+                : result.retryHint ? new Upstream429RetryError(retryError, result.retryHint) : new Error(retryError),
           ),
         )
         return
@@ -1945,6 +1956,13 @@ export async function _runOneTurn(
         session.totalCacheReadTokens += result.usage.cacheReadTokens
         session.totalCacheCreationTokens += result.usage.cacheCreationTokens
         session.currentAssistantBuf = completedAssistant.text
+        recordTurnContextWatermarkForAutoCompact(session, {
+          usedTokens: lastCallContextTokens > 0 ? lastCallContextTokens : result.usage.inputTokens + result.usage.cacheReadTokens + result.usage.cacheCreationTokens,
+          modelContextWindow: modelAuthority?.executionDescriptor.contextWindow,
+          userText: session.currentUserText,
+          assistantText: completedAssistant.text,
+          toolsBytes: turnToolsBytes,
+        })
         // OCV5-840: Emit turn-level context pressure telemetry with real tokens & breakdown
         // when the engine did not already emit one during this turn.
         if (!emittedTurnPressure && session.channel === 'webchat') {
@@ -2807,6 +2825,7 @@ export async function runOneTurnWithRetry(
   const clearRetryStatus = (): void => onEvent({ kind: 'turn_status', status: null })
 
   let attemptOrdinal = 0
+  let overflowAutoCompactAttempted = false
   for (;;) {
     throwIfLogicalTurnCancelled(logicalTurnSignal)
     try {
@@ -2844,8 +2863,15 @@ export async function runOneTurnWithRetry(
       // retry attempt while the timeout path is persisting its exact tape.
       throwIfLogicalTurnCancelled(logicalTurnSignal)
       const msg = err?.message ?? String(err)
-      // An admitted/unknown remote prompt is never submitted again automatically.
-      if (session.runner.executionBackend) throw err
+      const isExplicitRemoteOverflow = err instanceof SafeUniversalOverflowRetryError && err.explicitPreAdmissionRejection
+      // B4: Never blind-retry unknown remote errors; ONLY allow proven pre-admission overflow rejections.
+      if (session.runner.executionBackend && !isExplicitRemoteOverflow) throw err
+      if (isExplicitRemoteOverflow && !overflowAutoCompactAttempted && retryAssistantSegments.length === 0) {
+        overflowAutoCompactAttempted = true
+        const recovered = await tryUniversalOverflowAutoCompact(this as unknown as SessionLifecycleHost, session, retryInput, onEvent)
+        if (recovered) { retryInput = recovered; attemptOrdinal += 1; continue }
+        if (session.runner.executionBackend) throw err
+      }
 
       // Phantom turn: CCB 返回了不调模型的空 result(usage/cost/blocks 全为 0)。
       // 通常是 CCB 子进程长闲置后内部状态卡死,重启子进程能恢复。
@@ -2903,6 +2929,12 @@ export async function runOneTurnWithRetry(
         clearRetryStatus()
         attemptOrdinal += 1
         continue
+      }
+      // OCV5-841: Universal overflow auto-recovery across all engines (once per turn, before visible output).
+      if (!overflowAutoCompactAttempted && isUniversalOverflowError(msg, errorClass) && retryAssistantSegments.length === 0) {
+        overflowAutoCompactAttempted = true
+        const recovered = await tryUniversalOverflowAutoCompact(this as unknown as SessionLifecycleHost, session, retryInput, onEvent)
+        if (recovered) { retryInput = recovered; attemptOrdinal += 1; continue }
       }
 
       // Only retry on transient errors (rate limit, server error, network)

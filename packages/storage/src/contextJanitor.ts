@@ -93,6 +93,12 @@ export interface ContextHygieneRunRecord {
   archivedMemoryFiles: string[]
   archivedSkillNames: string[]
   errors: string[]
+  /** Number of semantic merge groups applied in an L2 consolidation run. */
+  mergedMemoryGroups?: number
+  /** Total source memory files consolidated across all semantic merge groups. */
+  mergedMemorySources?: number
+  /** Plain-language summary of what background auto-consolidation did. */
+  semanticSummary?: string
 }
 
 export interface ContextHealthReport {
@@ -147,6 +153,8 @@ export interface RunContextJanitorInput {
   archiveExpiredMemories?: boolean
   archiveColdSkills?: boolean
   coldSkillDays?: number
+  /** Cap cold skills archived in a single run (defaults to 10 in `auto` mode). */
+  maxColdSkillsPerRun?: number
   pruneSkillHistory?: boolean
   /** When provided, ONLY prune history for these exact skill names (empty array = prune none). */
   pruneSkillHistoryNames?: readonly string[]
@@ -569,6 +577,23 @@ async function appendContextHygieneHistory(
     schemaVersion: 1,
     runs: next,
   })
+}
+
+/**
+ * Append a hygiene or L2 semantic consolidation run receipt to
+ * `<agentDir>/context-hygiene-history.json` under the per-agent hygiene lock.
+ */
+export async function appendContextHygieneRun(
+  agentDir: string,
+  record: ContextHygieneRunRecord,
+): Promise<void> {
+  await mkdir(agentDir, { recursive: true })
+  const release = await acquireFileLock(join(agentDir, '.context-hygiene.lock'))
+  try {
+    await appendContextHygieneHistory(agentDir, record)
+  } finally {
+    await release().catch(() => {})
+  }
 }
 
 /**
@@ -1001,16 +1026,33 @@ export async function runContextJanitor(
 
       if (archiveCold) {
         const usageMap = await readUsageMapReadonly(input.sessionsDb)
-        for (const skill of skills) {
-          if ((skill.priority ?? 0) >= PINNED_PRIORITY_THRESHOLD) continue
-          const usage = usageMap.get(skill.name)
-          const tier = classifySkillTier(usage, {
-            priority: skill.priority,
-            nowMs,
-            coldDays: coldSkillDays,
-            mtimeMs: skill.mtimeMs,
+        const coldCap =
+          input.maxColdSkillsPerRun !== undefined
+            ? Math.max(0, Math.floor(input.maxColdSkillsPerRun))
+            : mode === 'auto'
+              ? 10
+              : Number.POSITIVE_INFINITY
+        const coldCandidates = skills
+          .filter((skill) => {
+            if ((skill.priority ?? 0) >= PINNED_PRIORITY_THRESHOLD) return false
+            const usage = usageMap.get(skill.name)
+            return (
+              classifySkillTier(usage, {
+                priority: skill.priority,
+                nowMs,
+                coldDays: coldSkillDays,
+                mtimeMs: skill.mtimeMs,
+              }) === 'cold'
+            )
           })
-          if (tier !== 'cold') continue
+          .sort((a, b) => {
+            const aLast = usageMap.get(a.name)?.lastUsedAt ?? a.mtimeMs
+            const bLast = usageMap.get(b.name)?.lastUsedAt ?? b.mtimeMs
+            return aLast - bLast || a.name.localeCompare(b.name)
+          })
+          .slice(0, coldCap)
+
+        for (const skill of coldCandidates) {
           try {
             if (dryRun) {
               coldSkillsArchived += 1

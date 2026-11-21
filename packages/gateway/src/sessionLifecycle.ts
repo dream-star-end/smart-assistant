@@ -52,7 +52,7 @@ import {
   type CgroupMemoryReading,
 } from './cgroupMemoryGuard.js'
 import { isTempSessionKey, resolveEnginePreheatDeadlineMs } from './sessionManager.js'
-import type { SessionManager, AgentSession, PreheatOutcome } from './sessionManager.js'
+import type { SessionManager, AgentSession, PreheatOutcome, PromptQueueExecutionFence } from './sessionManager.js'
 
 export interface SessionLifecycleHost {
   _enterSessionCreateGate?: SessionManager['_enterSessionCreateGate']
@@ -663,6 +663,7 @@ export async function destroySession(
     cancelIdlePreExpiry(s)
   }
   clearPendingCheckpoint(sessionKey)
+  void import('./sessionAutoCompact.js').then((m) => m.clearSessionAutoCompactState(sessionKey)).catch(() => {})
   // OCV5-840 (B4): clean up ONLY artifacts and context references owned by this exact full sessionKey.
   {
     const candidateDirs = new Set<string>()
@@ -1102,6 +1103,16 @@ export async function prepareModelSwitch(
 export interface SessionCompactOptions {
   instructions?: string
   requestId?: string
+  /** 'manual' (default, user/WS initiated) or 'auto' (seamless background auto-compact). */
+  mode?: 'manual' | 'auto'
+  /** B3: Caller already holds its own single inbound clientTurn (allow _activeClientTurnCount <= 1, still reject >= 2). */
+  allowSingleSelfClientTurn?: boolean
+  /** B3: Active prompt-queue execution fence owned by caller so inner local CCB `/compact` shares the same owner. */
+  queueExecutionFence?: PromptQueueExecutionFence
+  /** Caller already holds `session.lock` (used ONLY by in-turn universal overflow auto-recovery). */
+  skipLock?: boolean
+  /** Force durable Rolling Checkpoint Reset regardless of engine native compact support. */
+  forceCheckpointReset?: boolean
   /** Optional test seam / override for loading persisted session history. */
   loadHistoryMessages?: () => Promise<unknown[] | null>
   /** Optional test seam / override for checkpoint persistence directory. */
@@ -1240,10 +1251,12 @@ export async function compactSession(
   if (isSessionCompacting(session.sessionKey)) {
     return { ok: false, supported: true, engine, error: 'SESSION_COMPACT_IN_PROGRESS' }
   }
+  const maxAllowedClientTurns = opts.allowSingleSelfClientTurn ? 1 : 0
   if (
-    (session._activeTurnCount ?? 0) > 0 ||
-    (session._activeClientTurnCount ?? 0) > 0 ||
-    (session._idleInternalTurns ?? 0) > 0
+    !opts.skipLock &&
+    ((session._activeTurnCount ?? 0) > 0 ||
+      (session._activeClientTurnCount ?? 0) > maxAllowedClientTurns ||
+      (session._idleInternalTurns ?? 0) > 0)
   ) {
     return { ok: false, supported: true, engine, error: 'SESSION_BUSY' }
   }
@@ -1265,6 +1278,8 @@ export async function compactSession(
     // 1. Local CCB native `/compact` (strictly local CCB with declared native compact support;
     //    never CursorSand or remote CCB lacking billing/modelAuthority identity).
     const isLocalCcbNativeSlash =
+      !opts.forceCheckpointReset &&
+      !opts.skipLock &&
       engine === 'ccb' &&
       session.runner.capabilities.supportsNativeCompact === true &&
       !hasRemoteBackend
@@ -1292,7 +1307,11 @@ export async function compactSession(
         undefined,
         undefined,
         undefined,
-        { serviceTier: null, _internalCompact: true },
+        {
+          serviceTier: null,
+          _internalCompact: true,
+          ...(opts.queueExecutionFence ? { queueExecutionFence: opts.queueExecutionFence } : {}),
+        },
       )
       const summary = (session._lastNativeCompactionSummary as string | undefined)?.trim() ?? ''
       if (sawTurnError || (!sawCompactedCompletion && !summary)) {
@@ -1322,23 +1341,27 @@ export async function compactSession(
 
     // Non-CCB paths share `session.lock` with normal `submit()` (B3) so in-flight turns settle
     // first and concurrent submits cannot race with history read + runner reset.
-    const prevLock = session.lock ?? Promise.resolve()
-    let releaseLock!: () => void
-    session.lock = new Promise<void>((r) => {
-      releaseLock = r
-    })
-    try {
+    let releaseLock: () => void = () => {}
+    if (!opts.skipLock) {
+      const prevLock = session.lock ?? Promise.resolve()
+      session.lock = new Promise<void>((r) => {
+        releaseLock = r
+      })
       await prevLock
+    }
+    try {
       if (
-        (session._activeTurnCount ?? 0) > 0 ||
-        (session._activeClientTurnCount ?? 0) > 0 ||
-        (session._idleInternalTurns ?? 0) > 0
+        !opts.skipLock &&
+        ((session._activeTurnCount ?? 0) > 0 ||
+          (session._activeClientTurnCount ?? 0) > maxAllowedClientTurns ||
+          (session._idleInternalTurns ?? 0) > 0)
       ) {
         return { ok: false, supported: true, engine, error: 'SESSION_BUSY' }
       }
 
       // 2. Codex Local: native JSON-RPC thread/compact/start
       if (
+        !opts.forceCheckpointReset &&
         engine === 'codex' &&
         !isRemoteCodex &&
         session.runner.capabilities.supportsNativeCompact === true &&

@@ -1,7 +1,6 @@
 import { AlertTriangle, Archive, CheckCircle2, ShieldCheck, Sparkles } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
-import { formatBytes } from "../../lib/chat/download";
 import type {
   AuthSession,
   ContextHealthReport,
@@ -27,11 +26,11 @@ const KIND_META: Record<
   { title: string; badge: string; tone: "warning" | "info" | "neutral" | "accent" | "danger" }
 > = {
   expired_memory: { title: "已过期记忆", badge: "已过期", tone: "warning" },
-  oversized_memory: { title: "超大核心记忆", badge: "偏大", tone: "accent" },
-  cold_skill: { title: "长期未用技能（60天+）", badge: "冷门", tone: "info" },
-  oversized_skill: { title: "超大技能", badge: "偏大", tone: "accent" },
-  skill_history: { title: "冗余技能历史快照", badge: "历史快照", tone: "neutral" },
-  stale_archival: { title: "陈旧归档检索条目", badge: "陈旧归档", tone: "neutral" },
+  oversized_memory: { title: "篇幅较长的记忆", badge: "较长", tone: "accent" },
+  cold_skill: { title: "久未使用的技能", badge: "久未用", tone: "info" },
+  oversized_skill: { title: "内容较多的技能", badge: "较大", tone: "accent" },
+  skill_history: { title: "旧版技能快照", badge: "历史快照", tone: "neutral" },
+  stale_archival: { title: "过期历史检索记录", badge: "旧记录", tone: "neutral" },
 };
 
 const REVERSIBLE_KIND_ORDER: ContextSlimCandidateKind[] = [
@@ -109,12 +108,6 @@ function groupByKind(
   return out;
 }
 
-function estimateTokens(bytes: number): string {
-  const tokens = Math.max(0, Math.round(bytes / 3));
-  if (tokens >= 1000) return `${(tokens / 1000).toFixed(1).replace(/\.0$/, "")}k`;
-  return String(tokens);
-}
-
 export type ContextSlimModalProps = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -126,8 +119,8 @@ export type ContextSlimModalProps = {
 };
 
 /**
- * 上下文瘦身向导（React.lazy 独立分块，零首屏开销）。
- * 严格区分「安全归档（可随时还原）」与「永久清理（不可撤销，默认不勾选）」，
+ * 手动整理向导（React.lazy 独立分块，零首屏开销；退居低调次入口）。
+ * 严格保留 B2 安全护栏：区分「安全收纳（可随时恢复）」与「永久清理（不可撤销，默认不勾选）」，
  * 且按用户精确勾选集合提交目标，绝不误删未勾选项。
  */
 export function ContextSlimModal({
@@ -163,7 +156,7 @@ export function ContextSlimModal({
   useEffect(() => {
     if (!open) return;
     setErr(null);
-    // 仅默认勾选低风险「可逆归档」项；永久清理项默认全部不勾选。
+    // 仅默认勾选低风险「可逆收纳」项；永久清理项默认全部不勾选。
     const defaults = new Set<string>();
     for (const c of reversibleActionable) {
       if (c.kind === "expired_memory" || c.safeAutoArchive) {
@@ -191,10 +184,6 @@ export function ContextSlimModal({
     [selectedList],
   );
   const selectedPermanentCount = selectedList.length - selectedReversibleCount;
-  const selectedBytes = useMemo(
-    () => selectedList.reduce((sum, c) => sum + Math.max(0, c.bytes), 0),
-    [selectedList],
-  );
 
   const allReversibleSelected =
     reversibleActionable.length > 0 && reversibleActionable.every((c) => selectedIds.has(c.id));
@@ -250,20 +239,17 @@ export function ContextSlimModal({
       const pruneSkillHistoryNames = Array.from(pruneSkillHistoryNamesSet);
       const pruneArchivalIds = Array.from(pruneArchivalIdsSet);
 
-      let totalSavedBytes = 0;
       let archivedCount = 0;
       let prunedCount = 0;
 
       if (memoryFiles.length > 0) {
         const res = await api.archiveMemoryFiles(auth, agentId, memoryFiles, "manual_slim");
-        totalSavedBytes += res.bytesSaved ?? 0;
         archivedCount += res.archived?.length || memoryFiles.length;
       }
 
       for (const skillName of skillNames) {
         const res = await api.archiveSkill(auth, skillName, "manual_slim");
         if (res.entry) {
-          totalSavedBytes += res.entry.bytes ?? 0;
           archivedCount += 1;
         }
       }
@@ -279,7 +265,6 @@ export function ContextSlimModal({
           ...(staleArchivalSelected && pruneArchivalIds.length > 0 ? { pruneArchivalIds } : {}),
         };
         const res = await api.runContextHygiene(auth, agentId, hygieneOptions);
-        totalSavedBytes += res.run?.bytesFreed ?? 0;
         const reportedPruned =
           (res.run?.skillHistoriesPruned ?? 0) + (res.run?.archivalCleaned ?? 0);
         prunedCount +=
@@ -290,18 +275,17 @@ export function ContextSlimModal({
 
       const parts: string[] = [];
       if (archivedCount > 0) {
-        parts.push(`已安全归档 ${archivedCount} 项（可随时在归档箱还原）`);
+        parts.push(`已安全收纳 ${archivedCount} 项（随时可在已收纳记录恢复原样）`);
       }
       if (prunedCount > 0) {
-        parts.push(`已永久清理 ${prunedCount} 项旧快照/过期归档`);
+        parts.push(`已永久清理 ${prunedCount} 项旧快照/过期记录`);
       }
-      const savedSuffix = totalSavedBytes > 0 ? `，共释放 ${formatBytes(totalSavedBytes)}` : "";
-      const summary = parts.length > 0 ? `${parts.join("；")}${savedSuffix}` : `已完成整理${savedSuffix}`;
+      const summary = parts.length > 0 ? parts.join("；") : "已完成整理";
       toast(summary, "success");
       onSlimmed();
       onOpenChange(false);
     } catch (e) {
-      setErr(apiErrorMessage(e, "瘦身执行失败，请稍后重试"));
+      setErr(apiErrorMessage(e, "整理执行失败，请稍后重试"));
     } finally {
       setSubmitting(false);
     }
@@ -309,10 +293,10 @@ export function ContextSlimModal({
 
   const submitLabel =
     selectedReversibleCount > 0 && selectedPermanentCount > 0
-      ? `归档 ${selectedReversibleCount} 项并永久清理 ${selectedPermanentCount} 项`
+      ? `收纳 ${selectedReversibleCount} 项并永久清理 ${selectedPermanentCount} 项`
       : selectedPermanentCount > 0
         ? `永久清理所选项（${selectedPermanentCount}）`
-        : `一键安全归档（${selectedReversibleCount}）`;
+        : `安全收纳所选项（${selectedReversibleCount}）`;
 
   const renderCandidateRows = (
     groups: Array<{ kind: ContextSlimCandidateKind; items: ContextSlimCandidate[] }>,
@@ -361,16 +345,13 @@ export function ContextSlimModal({
                         ) : (
                           item.safeAutoArchive && (
                             <Badge tone="success" size="sm" className="oc-badge-craft">
-                              推荐归档
+                              推荐收纳
                             </Badge>
                           )
                         )}
                       </div>
                       <p className="mt-0.5 text-caption text-muted">{item.reason}</p>
                     </div>
-                    <span className="oc-surface-recessed shrink-0 rounded-md px-2 py-0.5 text-caption font-medium tabular-nums text-muted">
-                      {formatBytes(item.bytes)}
-                    </span>
                   </ListRow>
                 );
               })}
@@ -394,7 +375,7 @@ export function ContextSlimModal({
           <span className="oc-icon-badge oc-icon-badge-accent size-6 rounded-md" aria-hidden="true">
             <Sparkles size={13} strokeWidth={1.8} />
           </span>
-          <span className="text-title font-semibold tracking-tight text-fg">上下文瘦身建议</span>
+          <span className="text-title font-semibold tracking-tight text-fg">手动整理</span>
         </span>
       }
       className="oc-surface-popover bg-surface"
@@ -402,9 +383,7 @@ export function ContextSlimModal({
         candidates.length > 0 ? (
           <div className="flex w-full flex-wrap items-center justify-between gap-3">
             <div className="min-w-0 text-caption tabular-nums text-muted">
-              已选 <strong className="text-fg">{selectedList.length}</strong> 项 · 预计释放{" "}
-              <strong className="text-fg">{formatBytes(selectedBytes) || "0 B"}</strong>
-              {selectedBytes > 0 && <span className="text-faint">（约 {estimateTokens(selectedBytes)} tokens）</span>}
+              已选 <strong className="text-fg">{selectedList.length}</strong> 项
             </div>
             <div className="flex items-center gap-2">
               {onOpenArchive && (
@@ -417,7 +396,7 @@ export function ContextSlimModal({
                     onOpenArchive();
                   }}
                 >
-                  查看归档箱
+                  查看已收纳记录
                 </Button>
               )}
               <Button
@@ -440,12 +419,12 @@ export function ContextSlimModal({
         <div className="oc-callout oc-callout-info flex items-start gap-2.5 rounded-xl px-3.5 py-2.5 text-caption leading-relaxed text-muted">
           <ShieldCheck size={15} strokeWidth={1.8} className="mt-0.5 shrink-0 text-info" aria-hidden="true" />
           <span>
-            <strong className="font-medium text-fg">安全归档</strong>项会移入
-            <strong className="font-medium text-fg">可逆归档箱</strong>
-            ，归档后不再占用每轮常驻上下文，随时可一键还原；
+            日常使用已由系统自动保持干净。如需手动调整，下方<strong className="font-medium text-fg">安全收纳</strong>项会移入
+            <strong className="font-medium text-fg">已收纳记录</strong>
+            ，随时可恢复原样；
             {permanentCandidates.length > 0
-              ? "下方的「永久清理」项不进归档箱且不可撤销，默认不勾选。"
-              : "绝不硬删你的记忆与技能。"}
+              ? "「永久清理」项不进已收纳记录且不可撤销，默认不勾选。"
+              : "绝不会误删你的记忆与技能。"}
           </span>
         </div>
 
@@ -459,17 +438,17 @@ export function ContextSlimModal({
           <div className="oc-surface-card rounded-2xl">
             <EmptyState
               icon={CheckCircle2}
-              title="常驻上下文非常干净"
-              hint="目前没有发现过期记忆、超大条目或超过 60 天未用的冷门技能。"
+              title="记忆与技能非常干净"
+              hint="后台自动整理运行良好，目前没有需要手动处理的项目。"
             />
           </div>
         ) : (
           <div className="space-y-5">
             {reversibleGrouped.length > 0 && (
-              <section aria-label="安全归档（可随时在归档箱还原）" className="space-y-2.5">
+              <section aria-label="安全收纳（可随时在已收纳记录恢复）" className="space-y-2.5">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <h3 className="text-section font-semibold tracking-tight text-fg">
-                    安全归档（可随时在归档箱还原）
+                    安全收纳（可随时在已收纳记录恢复）
                   </h3>
                   {reversibleActionable.length > 1 && (
                     <button
@@ -477,7 +456,7 @@ export function ContextSlimModal({
                       onClick={toggleAllReversible}
                       className="text-caption font-medium text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
                     >
-                      {allReversibleSelected ? "取消全选归档项" : "全选可安全归档项"}
+                      {allReversibleSelected ? "取消全选收纳项" : "全选可安全收纳项"}
                     </button>
                   )}
                 </div>
@@ -486,15 +465,15 @@ export function ContextSlimModal({
             )}
 
             {permanentGrouped.length > 0 && (
-              <section aria-label="永久清理（不可撤销，不进归档箱）" className="space-y-2.5">
+              <section aria-label="永久清理（不可撤销，不进已收纳记录）" className="space-y-2.5">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <h3 className="flex items-center gap-1.5 text-section font-semibold tracking-tight text-fg">
                     <AlertTriangle size={14} strokeWidth={1.9} className="text-warning" aria-hidden="true" />
-                    永久清理（不可撤销，不进归档箱）
+                    永久清理（不可撤销，不进已收纳记录）
                   </h3>
                 </div>
                 <div className="oc-callout oc-callout-warning rounded-xl px-3.5 py-2 text-caption leading-relaxed text-muted">
-                  以下项目为旧历史快照或过期检索记录的永久裁剪，不会进入归档箱，执行后无法撤销，因此默认不勾选。
+                  以下项目为旧版技能快照或过期历史记录的永久清理，不会进入已收纳记录，执行后无法撤销，因此默认不勾选。
                 </div>
                 {renderCandidateRows(permanentGrouped, true)}
               </section>

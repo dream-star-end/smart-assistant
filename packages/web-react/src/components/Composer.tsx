@@ -124,10 +124,10 @@ function availableSlashCommands(opts: {
 }): SlashCommandDef[] {
   const list: SlashCommandDef[] = [];
   if (opts.hasCompact) {
-    list.push({ cmd: "/compact", label: "/compact", desc: "压缩当前会话上下文，释放窗口并保留完整记录" });
+    list.push({ cmd: "/compact", label: "/compact", desc: "整理当前会话较早对话，完整记录仍保留" });
   }
   if (opts.hasContextHealth) {
-    list.push({ cmd: "/context", label: "/context", desc: "查看当前会话上下文水位与成分拆解" });
+    list.push({ cmd: "/context", label: "/context", desc: "查看当前对话空间使用情况" });
   }
   if (opts.hasQuickAsk) {
     list.push(
@@ -786,17 +786,12 @@ export function Composer({
   const isFileDrag = (e: { dataTransfer: DataTransfer | null }) =>
     Array.from(e.dataTransfer?.types ?? []).includes("Files");
 
-  const [dismissedPressureKey, setDismissedPressureKey] = useState<string | null>(null);
-  const pressureRatio =
-    typeof contextPressure?.usedRatio === "number" && Number.isFinite(contextPressure.usedRatio)
-      ? contextPressure.usedRatio
-      : null;
-  const pressurePct = pressureRatio !== null ? Math.min(100, Math.max(0, Math.round(pressureRatio * 100))) : null;
-  const pressureCritical = pressureRatio !== null && (pressureRatio >= 0.95 || contextPressure?.level === "critical");
-  const pressureHigh = pressureRatio !== null && (pressureRatio >= 0.8 || pressureCritical);
-  const pressureElevated = pressureRatio !== null && !pressureHigh && pressureRatio >= 0.65;
-  const pressureBannerKey = pressureHigh ? `${draftKey ?? ""}:${pressureCritical ? "crit" : "warn"}` : null;
-  const showPressureBanner = Boolean(pressureBannerKey && dismissedPressureKey !== pressureBannerKey && !disabled);
+  // OCV5-841: 对话主界面静默减负 —— 后台自动整理上下文，不再展示 80% 催促横幅或常驻水位胶囊；
+  // 保留 props 与 /compact、/context 命令供高阶用户主动键入。
+  void contextPressure;
+  void contextCompactBusy;
+  void hasActiveSession;
+  void onStartNewSession;
 
   const slashQuery =
     !disabled && value.startsWith("/") && !value.includes("\n") && !/\s/.test(value) ? value.toLowerCase() : null;
@@ -840,49 +835,6 @@ export function Composer({
   return (
     <div className="mx-auto w-full max-w-3xl px-4">
       {banner}
-      {showPressureBanner && pressurePct !== null && (
-        <div
-          role="status"
-          data-testid="composer-context-pressure-banner"
-          className={cn(
-            "oc-callout mb-2 flex flex-wrap items-center justify-between gap-2 rounded-xl px-3 py-2 text-caption animate-in",
-            pressureCritical ? "oc-callout-danger text-danger" : "oc-callout-warning text-warning",
-          )}
-        >
-          <span className="min-w-0 flex-1 leading-snug text-fg">
-            当前上下文已用 <strong className="tabular-nums">{pressurePct}%</strong>，建议一键瘦身以保持回复质量与速度。
-          </span>
-          <span className="flex shrink-0 items-center gap-1.5">
-            {onCompactCommand && (
-              <button
-                type="button"
-                disabled={contextCompactBusy}
-                onClick={() => onCompactCommand()}
-                className="oc-btn-tactile rounded-md bg-surface/90 px-2 py-1 font-medium text-fg ring-1 ring-border/80 outline-none hover:bg-surface focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
-              >
-                {contextCompactBusy ? "压缩中…" : "一键瘦身"}
-              </button>
-            )}
-            {onStartNewSession && (
-              <button
-                type="button"
-                onClick={onStartNewSession}
-                className="oc-btn-tactile rounded-md px-2 py-1 font-medium text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                新会话
-              </button>
-            )}
-            <button
-              type="button"
-              aria-label="关闭上下文提示"
-              onClick={() => setDismissedPressureKey(pressureBannerKey)}
-              className="oc-btn-tactile rounded-md p-1 text-faint outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              <X size={13} strokeWidth={1.75} aria-hidden />
-            </button>
-          </span>
-        </div>
-      )}
       {visibleGoal && canGoal && (
         <button
           type="button"
@@ -1391,64 +1343,6 @@ export function Composer({
               </div>
             )}
             <div className="ml-auto flex shrink-0 items-center gap-1.5">
-              {onOpenContextHealth && (pressurePct !== null || hasActiveSession) && (
-                <button
-                  type="button"
-                  data-testid="composer-context-pill"
-                  onClick={onOpenContextHealth}
-                  aria-label={
-                    pressurePct !== null
-                      ? `上下文健康：已用 ${pressurePct}%，点击查看详情`
-                      : "查看当前会话上下文健康"
-                  }
-                  title={
-                    pressurePct !== null
-                      ? `当前上下文已用 ${pressurePct}%（点击查看成分拆解与瘦身）`
-                      : "查看当前会话上下文健康（/context）"
-                  }
-                  className={cn(
-                    "oc-btn-tactile oc-spring-press items-center gap-1.5 rounded-full px-2 py-1 text-caption font-medium tabular-nums outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-9",
-                    pressurePct === null ? "hidden sm:inline-flex" : "inline-flex",
-                    pressureCritical
-                      ? "oc-badge-craft bg-danger-soft text-danger hover:bg-danger/15"
-                      : pressureHigh
-                        ? "oc-badge-craft bg-warning-soft text-warning hover:bg-warning/15"
-                        : pressureElevated
-                          ? "text-muted hover:bg-hover hover:text-fg"
-                          : "text-faint hover:bg-hover hover:text-muted",
-                  )}
-                >
-                  {contextCompactBusy ? (
-                    <Loader2 size={12} strokeWidth={2} className="animate-spin text-accent" aria-hidden />
-                  ) : (
-                    <svg viewBox="0 0 14 14" className="size-3.5 shrink-0 -rotate-90" aria-hidden="true">
-                      <circle
-                        cx="7"
-                        cy="7"
-                        r="5"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeOpacity="0.24"
-                        strokeWidth="1.75"
-                      />
-                      {pressurePct !== null && (
-                        <circle
-                          cx="7"
-                          cy="7"
-                          r="5"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="1.75"
-                          strokeLinecap="round"
-                          strokeDasharray="31.4"
-                          strokeDashoffset={31.4 * (1 - pressurePct / 100)}
-                        />
-                      )}
-                    </svg>
-                  )}
-                  <span>{pressurePct !== null ? `${pressurePct}%` : "上下文"}</span>
-                </button>
-              )}
               {/* 生成中排队发送(C-02):此前生成中唯一按钮是「停止」,桌面 Enter 排队无反馈,触屏 Enter=换行
                   → 根本没有排队入口。现在 busy 且有可发内容时给一个次级「排队发送」按钮;「停止」仍是唯一
                   Stop 控件(T35),本按钮 aria-label 不含「停止」。

@@ -40,8 +40,10 @@ import {
   SkillDraftStore,
   isPlatformReservedSkillName,
   parseSkillEvalsJson,
+  paths,
   recordLocalSkillSearchHits,
   recordLocalSkillView,
+  searchArchivedSkills,
   searchSkillMetadata,
   serializeSkillEvals,
   syncMarketplaceHub,
@@ -522,15 +524,28 @@ async function handleSkillSearch(args: { query: string; limit?: number } | undef
 
   const hits = searchSkillMetadata(list, query, args?.limit)
   if (hits.length === 0) {
+    const archivedHits = await searchArchivedSkills(paths.sharedSkillsDir, query, 3, {
+      agentId: AGENT_ID,
+    }).catch(() => [])
+    const baseLines = [
+      `No matching skills found for "${query}".`,
+      'Try a broader query or call `skill_list()` to browse all available skills.',
+      'If this was a reusable workflow you just validated, create it with `skill_save` after the task is complete.',
+    ]
+    if (archivedHits.length > 0) {
+      baseLines.push(
+        '',
+        'Archived skills that match this topic (previously auto-archived due to inactivity; can be restored anytime via Archived Records or `/api/skills/archive/restore`):',
+        ...archivedHits.map(
+          (h) => `- **${h.target}** — ${h.description || h.snippet || h.reason} (id: ${h.id})`,
+        ),
+      )
+    }
     return {
       content: [
         {
           type: 'text',
-          text: [
-            `No matching skills found for "${query}".`,
-            'Try a broader query or call `skill_list()` to browse all available skills.',
-            'If this was a reusable workflow you just validated, create it with `skill_save` after the task is complete.',
-          ].join('\n'),
+          text: baseLines.join('\n'),
         },
       ],
     }

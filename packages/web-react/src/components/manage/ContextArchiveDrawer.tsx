@@ -1,8 +1,8 @@
 import { Archive, Brain, RotateCcw, Sparkles } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
-import { formatBytes } from "../../lib/chat/download";
 import type { ArchivedMemoryEntry, ArchivedSkillEntry, AuthSession } from "../../lib/types";
+import { formatRestoreOutcomeFeedback } from "./MemoryContextHealthCard";
 import {
   Alert,
   Badge,
@@ -19,16 +19,27 @@ import {
 } from "../ui";
 
 const REASON_LABELS: Record<string, string> = {
-  expired: "自动过期归档",
-  manual_archive: "手动归档",
-  manual_slim: "一键瘦身归档",
-  cold_skill: "超过60天未用",
-  janitor_auto: "后台定时整理",
-  janitor_manual: "手动体检整理",
+  semantic_auto_merge: "已自动合并保留原件",
+  expired: "到期自动收纳",
+  manual_archive: "手动收纳",
+  manual_slim: "手动整理收纳",
+  cold_skill: "久未使用自动收纳",
+  janitor_auto: "后台自动整理",
+  janitor_manual: "手动整理",
 };
 
 function reasonLabel(reason: string): string {
-  return REASON_LABELS[reason] ?? reason;
+  return REASON_LABELS[reason] ?? "已收纳";
+}
+
+function batchHeading(items: Array<{ reason: string }>, unit: string): string {
+  const isSemanticMerge = items.some((i) => i.reason === "semantic_auto_merge");
+  if (isSemanticMerge) return `自动合并相似记忆 · 原件 ${items.length} ${unit}`;
+  const isCold = items.every((i) => i.reason === "cold_skill");
+  if (isCold) return `久未使用自动收纳 · ${items.length} ${unit}`;
+  const isExpired = items.every((i) => i.reason === "expired");
+  if (isExpired) return `到期自动收纳 · ${items.length} ${unit}`;
+  return `整理记录 · ${items.length} ${unit}`;
 }
 
 export type ContextArchiveDrawerProps = {
@@ -41,8 +52,8 @@ export type ContextArchiveDrawerProps = {
 };
 
 /**
- * 统一「上下文归档箱」（React.lazy 独立分块，零首屏开销）。
- * 展示已归档的核心记忆与技能，支持单条「一键还原」与按批次「撤销本次整理」。
+ * 「已收纳记录 · 随时可恢复」（React.lazy 独立分块，零首屏开销）。
+ * 展示后台自动合并原件、到期收纳记忆与久未使用技能，支持单条「恢复原样」与整批「撤销本次自动整理」。
  */
 export function ContextArchiveDrawer({
   open,
@@ -81,7 +92,7 @@ export function ContextArchiveDrawer({
         setSkills(s);
       })
       .catch((e) => {
-        if (alive) setErr(apiErrorMessage(e, "加载归档箱失败"));
+        if (alive) setErr(apiErrorMessage(e, "加载已收纳记录失败"));
       })
       .finally(() => {
         if (alive) setLoading(false);
@@ -116,16 +127,18 @@ export function ContextArchiveDrawer({
       const key = `mem:${opts.id ?? opts.batchId}`;
       setBusyKey(key);
       try {
-        const res = await api.restoreArchivedMemories(auth, agentId, {
-          ...(opts.id ? { id: opts.id } : {}),
-          ...(opts.batchId ? { batchId: opts.batchId } : {}),
-        });
-        const count = res.restored?.length ?? 0;
-        toast(count > 0 ? `已还原 ${opts.label}` : "未找到可还原的条目（可能已存在同名文件）", count > 0 ? "success" : "info");
-        setReloadKey((k) => k + 1);
-        onRestored();
-      } catch (e) {
-        toast(apiErrorMessage(e, "还原失败"), "error");
+        const settled = await Promise.allSettled([
+          api.restoreArchivedMemories(auth, agentId, {
+            ...(opts.id ? { id: opts.id } : {}),
+            ...(opts.batchId ? { batchId: opts.batchId } : {}),
+          }),
+        ]);
+        const outcome = formatRestoreOutcomeFeedback(settled);
+        toast(outcome.message, outcome.tone);
+        if (outcome.changed) {
+          setReloadKey((k) => k + 1);
+          onRestored();
+        }
       } finally {
         setBusyKey(null);
       }
@@ -138,17 +151,19 @@ export function ContextArchiveDrawer({
       const key = `skill:${opts.id ?? opts.name ?? opts.batchId}`;
       setBusyKey(key);
       try {
-        const res = await api.restoreArchivedSkills(auth, {
-          ...(opts.id ? { id: opts.id } : {}),
-          ...(opts.name ? { name: opts.name } : {}),
-          ...(opts.batchId ? { batchId: opts.batchId } : {}),
-        });
-        const count = res.restored?.length ?? 0;
-        toast(count > 0 ? `已还原技能 ${opts.label}` : "未找到可还原的技能（可能已存在同名技能）", count > 0 ? "success" : "info");
-        setReloadKey((k) => k + 1);
-        onRestored();
-      } catch (e) {
-        toast(apiErrorMessage(e, "还原技能失败"), "error");
+        const settled = await Promise.allSettled([
+          api.restoreArchivedSkills(auth, {
+            ...(opts.id ? { id: opts.id } : {}),
+            ...(opts.name ? { name: opts.name } : {}),
+            ...(opts.batchId ? { batchId: opts.batchId } : {}),
+          }),
+        ]);
+        const outcome = formatRestoreOutcomeFeedback(settled);
+        toast(outcome.message, outcome.tone);
+        if (outcome.changed) {
+          setReloadKey((k) => k + 1);
+          onRestored();
+        }
       } finally {
         setBusyKey(null);
       }
@@ -164,10 +179,10 @@ export function ContextArchiveDrawer({
       mobile="sheet"
       title={
         <span className="inline-flex items-center gap-2">
-          <span className="oc-icon-badge size-6 rounded-md" aria-hidden="true">
+          <span className="oc-icon-badge oc-icon-badge-accent size-6 rounded-md" aria-hidden="true">
             <Archive size={13} strokeWidth={1.8} />
           </span>
-          <span className="text-title font-semibold tracking-tight text-fg">上下文归档箱</span>
+          <span className="text-title font-semibold tracking-tight text-fg">已收纳记录 · 随时可恢复</span>
         </span>
       }
       className="oc-surface-popover bg-surface"
@@ -175,17 +190,17 @@ export function ContextArchiveDrawer({
       <div className="space-y-4" data-testid="context-archive-drawer">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <Tabs
-            aria-label="归档分类"
+            aria-label="已收纳分类"
             idBase="context-archive-tab"
             value={tab}
             onValueChange={(v) => setTab(v === "skills" ? "skills" : "memory")}
             className="oc-surface-recessed"
             items={[
-              { value: "memory", label: `核心记忆（${memories.length}）` },
+              { value: "memory", label: `长期记忆（${memories.length}）` },
               { value: "skills", label: `技能（${skills.length}）` },
             ]}
           />
-          <p className="text-caption text-faint">归档内容不占常驻上下文，可随时一键还原。</p>
+          <p className="text-caption text-faint">已收纳的内容不会打扰日常对话，需要时随时可以恢复原样。</p>
         </div>
 
         {err && (
@@ -210,81 +225,87 @@ export function ContextArchiveDrawer({
             <div className="oc-surface-card rounded-2xl">
               <EmptyState
                 icon={Brain}
-                title="暂无已归档的核心记忆"
-                hint="通过一键瘦身、自动整理或手动归档移出的记忆会安全保存在这里。"
+                title="暂无已收纳的长期记忆"
+                hint="后台自动合并的原始记忆、到期记忆或你手动收纳的内容都会安全保存在这里。"
               />
             </div>
           ) : (
             <div className="space-y-4">
-              {memoryBatches.map(([batchId, items]) => (
-                <section key={batchId} className="space-y-1.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-caption font-medium text-muted">
-                      批次 <code className="font-mono text-faint">{batchId.slice(0, 18)}</code> · {items.length} 条
-                    </span>
-                    {items.length > 1 && (
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        className="h-7 gap-1 px-2 text-caption text-accent"
-                        loading={busyKey === `mem:${batchId}`}
-                        disabled={busyKey !== null}
-                        onClick={() =>
-                          void restoreMemory({ batchId, label: `整批 ${items.length} 条记忆` })
-                        }
-                      >
-                        <RotateCcw size={12} strokeWidth={1.8} aria-hidden="true" />
-                        撤销本次整理
-                      </Button>
-                    )}
-                  </div>
-                  <ListGroup>
-                    {items.map((entry) => {
-                      const title = entry.title?.trim() || entry.slug || entry.file.replace(/\.md$/i, "");
-                      return (
-                        <ListRow
-                          key={entry.id}
-                          className="flex items-center justify-between gap-3 py-2.5"
+              {memoryBatches.map(([batchId, items]) => {
+                const isSemanticMerge = items.some((i) => i.reason === "semantic_auto_merge");
+                return (
+                  <section key={batchId} className="space-y-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-caption font-medium text-muted">
+                        {batchHeading(items, "条")}
+                      </span>
+                      {(items.length > 1 || isSemanticMerge) && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-7 gap-1 px-2 text-caption text-accent"
+                          loading={busyKey === `mem:${batchId}`}
+                          disabled={busyKey !== null}
+                          onClick={() =>
+                            void restoreMemory({ batchId, label: `整批 ${items.length} 条记忆` })
+                          }
                         >
-                          <div className="min-w-0 flex-1">
-                            <div className="flex flex-wrap items-center gap-1.5">
-                              <span className="truncate text-body font-medium text-fg">{title}</span>
-                              <Badge tone="neutral" size="sm" className="oc-badge-craft">
-                                {reasonLabel(entry.reason)}
-                              </Badge>
-                            </div>
-                            <MetaLine className="mt-1">
-                              <span>{formatBytes(entry.bytes)}</span>
-                              <span>
-                                归档于 <TimeAgo value={entry.archivedAt} className="text-meta text-faint" />
-                              </span>
-                            </MetaLine>
-                          </div>
-                          <Button
-                            size="sm"
-                            variant="secondary"
-                            className="oc-btn-tactile oc-btn-secondary-craft shrink-0 gap-1"
-                            loading={busyKey === `mem:${entry.id}`}
-                            disabled={busyKey !== null}
-                            onClick={() => void restoreMemory({ id: entry.id, label: `「${title}」` })}
+                          <RotateCcw size={12} strokeWidth={1.8} aria-hidden="true" />
+                          撤销本次自动整理
+                        </Button>
+                      )}
+                    </div>
+                    <ListGroup>
+                      {items.map((entry) => {
+                        const title = entry.title?.trim() || entry.slug || entry.file.replace(/\.md$/i, "");
+                        return (
+                          <ListRow
+                            key={entry.id}
+                            className="flex items-center justify-between gap-3 py-2.5"
                           >
-                            <RotateCcw size={12} strokeWidth={1.8} aria-hidden="true" />
-                            一键还原
-                          </Button>
-                        </ListRow>
-                      );
-                    })}
-                  </ListGroup>
-                </section>
-              ))}
+                            <div className="min-w-0 flex-1">
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <span className="truncate text-body font-medium text-fg">{title}</span>
+                                <Badge
+                                  tone={entry.reason === "semantic_auto_merge" ? "accent" : "neutral"}
+                                  size="sm"
+                                  className="oc-badge-craft"
+                                >
+                                  {reasonLabel(entry.reason)}
+                                </Badge>
+                              </div>
+                              <MetaLine className="mt-1">
+                                <span>
+                                  收纳于 <TimeAgo value={entry.archivedAt} className="text-meta text-faint" />
+                                </span>
+                              </MetaLine>
+                            </div>
+                            <Button
+                              size="sm"
+                              variant="secondary"
+                              className="oc-btn-tactile oc-btn-secondary-craft shrink-0 gap-1"
+                              loading={busyKey === `mem:${entry.id}`}
+                              disabled={busyKey !== null}
+                              onClick={() => void restoreMemory({ id: entry.id, label: `「${title}」` })}
+                            >
+                              <RotateCcw size={12} strokeWidth={1.8} aria-hidden="true" />
+                              恢复原样
+                            </Button>
+                          </ListRow>
+                        );
+                      })}
+                    </ListGroup>
+                  </section>
+                );
+              })}
             </div>
           )
         ) : skills.length === 0 ? (
           <div className="oc-surface-card rounded-2xl">
             <EmptyState
               icon={Sparkles}
-              title="暂无已归档的技能"
-              hint="长期未用的冷门技能或你手动归档的技能会保存在这里，随时可恢复启用。"
+              title="暂无已收纳的技能"
+              hint="久未使用的技能或你手动收纳的技能会保存在这里，随时可以重新启用。"
             />
           </div>
         ) : (
@@ -293,7 +314,7 @@ export function ContextArchiveDrawer({
               <section key={batchId} className="space-y-1.5">
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-caption font-medium text-muted">
-                    批次 <code className="font-mono text-faint">{batchId.slice(0, 18)}</code> · {items.length} 个技能
+                    {batchHeading(items, "个技能")}
                   </span>
                   {items.length > 1 && (
                     <Button
@@ -307,7 +328,7 @@ export function ContextArchiveDrawer({
                       }
                     >
                       <RotateCcw size={12} strokeWidth={1.8} aria-hidden="true" />
-                      撤销本次整理
+                      撤销本次自动整理
                     </Button>
                   )}
                 </div>
@@ -328,9 +349,8 @@ export function ContextArchiveDrawer({
                           <p className="mt-0.5 line-clamp-1 text-caption text-muted">{entry.description}</p>
                         )}
                         <MetaLine className="mt-1">
-                          <span>{formatBytes(entry.bytes)}</span>
                           <span>
-                            归档于 <TimeAgo value={entry.archivedAt} className="text-meta text-faint" />
+                            收纳于 <TimeAgo value={entry.archivedAt} className="text-meta text-faint" />
                           </span>
                         </MetaLine>
                       </div>
@@ -345,7 +365,7 @@ export function ContextArchiveDrawer({
                         }
                       >
                         <RotateCcw size={12} strokeWidth={1.8} aria-hidden="true" />
-                        一键还原
+                        恢复原样
                       </Button>
                     </ListRow>
                   ))}

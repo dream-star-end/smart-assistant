@@ -74,6 +74,7 @@ import type { GatewayStreamEvent } from './ccbMessageParser.js'
 import { noteForegroundBashToolResult } from './ccbLocalAgentCallback.js'
 import { parseDocument } from './documentParser.js'
 import { offloadPayloadIfOversized } from './payloadOffloadGate.js'
+import { markSelfClientTurnForAutoCompact } from './sessionAutoCompact.js'
 import { contextRebuildsTotal } from './metrics.js'
 import { EMPTY_COMPLETED_TURN_NOTICE, hasPlatedAssistantOutput } from './emptyCompletedTurn.js'
 import type { PromptQueueExternalTurnReservation } from './sessionManager.js'
@@ -2570,6 +2571,7 @@ export async function dispatchInbound(
         this._promptQueueExecutionFenceByFrame.delete(frame as object)
       }
       this.sessions.beginClientTurn(session)
+      markSelfClientTurnForAutoCompact(session, promptQueueExecutionFence)
       const clientTurnStartedAt = Date.now()
       let clientTurnThrew = false
       let clientTurnError: unknown | undefined

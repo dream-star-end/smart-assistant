@@ -144,6 +144,7 @@ import {
   RuntimeRecycleDrainingError,
 } from './sessionManager.js'
 import { ackPendingCheckpointIfTurnSucceeded, applyPendingCheckpointToSession, beginCheckpointTurnOutcome, isSessionCompacting, peekPendingCheckpoint, resetUnackedCheckpointSessionFlags, type PersistedCheckpointRecord } from './sessionCheckpointStore.js'
+import { beginTurnOverflowContext, clearTurnOverflowContext, getTurnActiveCheckpointGeneration, maybeAutoCompactBeforeTurn } from './sessionAutoCompact.js'
 import type {
   SessionManager,
   PromptQueueExternalTurnReservation,
@@ -607,6 +608,7 @@ export async function submit(
       (this._promptQueueDispatchFences.has(session.sessionKey) && !ownsDispatchFence),
   )
 
+  await maybeAutoCompactBeforeTurn(this as unknown as import('./sessionLifecycle.js').SessionLifecycleHost, session, userTextOrBlocks, onEvent, opts)
   const prev = session.lock
   let release: () => void = () => {}
   let memoryTurnBarrier: KernelFileLock | undefined
@@ -1392,6 +1394,7 @@ export async function submit(
       }, CHECK_INTERVAL)
     })
     log.info('turn_pipeline_timing', { traceId, stage: 'context_ready', elapsedMs: performance.now() - submitStartedAt })
+    beginTurnOverflowContext(session, userTextOrBlocks, pendingCheckpoint?.generation)
     logicalTurnRun = this.runOneTurnWithRetry(
       session,
       runnerPayload,
@@ -1411,7 +1414,8 @@ export async function submit(
     )
     try {
       await Promise.race([logicalTurnRun, livenessPromise])
-      if (pendingCheckpoint && ackPendingCheckpointIfTurnSucceeded(session, pendingCheckpoint.generation)) checkpointAcked = true
+      const activeCkptGen = getTurnActiveCheckpointGeneration(session) ?? pendingCheckpoint?.generation
+      if (activeCkptGen && ackPendingCheckpointIfTurnSucceeded(session, activeCkptGen)) checkpointAcked = true
     } finally {
       if (livenessTimer) clearInterval(livenessTimer)
     }
@@ -1469,7 +1473,9 @@ export async function submit(
       transition.state = 'prepared'
       transition.summaryInjected = false
     }
-    if (pendingCheckpoint && !checkpointAcked) resetUnackedCheckpointSessionFlags(session, pendingCheckpoint.generation)
+    const unackedCkptGen = !checkpointAcked ? (getTurnActiveCheckpointGeneration(session) ?? pendingCheckpoint?.generation) : undefined
+    if (unackedCkptGen) resetUnackedCheckpointSessionFlags(session, unackedCkptGen)
+    clearTurnOverflowContext(session)
     await finalizeEfficiencyTurn(session).catch((err) => {
       log.debug('efficiency guard finalize failed', {
         sessionKey: session.sessionKey,

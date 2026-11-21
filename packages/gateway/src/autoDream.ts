@@ -28,6 +28,7 @@ import {
 } from '@openclaude/storage'
 
 import { type AutoDreamPolicy, AutoDreamPolicyClient } from './autoDreamPolicy.js'
+import { runSemanticConsolidation } from './autoDreamSemanticConsolidator.js'
 import type { SessionStreamEvent } from './engine/engineEvents.js'
 
 const USER_CHANNELS = new Set(['webchat', 'wechat', 'telegram'])
@@ -246,6 +247,10 @@ export interface AutoDreamModelRun {
   userId: string
   model: string
   prompt: string
+  /** B6: Optional structured output JSON schema override (defaults to v1 Auto-Dream schema). */
+  outputSchema?: Record<string, unknown>
+  /** B7: Abort signal for real timeout/cancellation child-session teardown. */
+  signal?: AbortSignal
 }
 
 export interface AutoDreamDeps {
@@ -258,6 +263,10 @@ export interface AutoDreamDeps {
   hasStrongCoreHit?: typeof findStrongLexicalMemory
   /** Test seam for L1 deterministic context janitor. Production uses runContextJanitor. */
   runJanitor?: typeof runContextJanitor
+  /** Test seam for L2 semantic auto-consolidation. Production uses runSemanticConsolidation. */
+  runSemanticConsolidator?: typeof runSemanticConsolidation
+  /** Optional dedicated model runner for L2 semantic consolidation (defaults to runModel). */
+  runSemanticModel?: (input: AutoDreamModelRun) => Promise<string>
 }
 
 export interface AutoDreamTurnResult {
@@ -321,6 +330,8 @@ export class AutoDreamService {
   private readonly log: (event: string, fields: Record<string, unknown>) => void
   private readonly hasStrongCoreHit: typeof findStrongLexicalMemory
   private readonly runJanitor: typeof runContextJanitor
+  private readonly runSemanticConsolidator: typeof runSemanticConsolidation
+  private readonly runSemanticModel: (input: AutoDreamModelRun) => Promise<string>
   private readonly lastJanitorAtByAgent = new Map<string, number>()
 
   constructor(deps: AutoDreamDeps) {
@@ -331,6 +342,8 @@ export class AutoDreamService {
     this.log = deps.log ?? (() => {})
     this.hasStrongCoreHit = deps.hasStrongCoreHit ?? findStrongLexicalMemory
     this.runJanitor = deps.runJanitor ?? runContextJanitor
+    this.runSemanticConsolidator = deps.runSemanticConsolidator ?? runSemanticConsolidation
+    this.runSemanticModel = deps.runSemanticModel ?? deps.runModel
   }
 
   async maybeSchedule(trigger: AutoDreamTrigger): Promise<void> {
@@ -656,6 +669,9 @@ export class AutoDreamService {
       await lock.release().catch(() => {})
     }
     if (receipt) await this.notifyBestEffort(trigger.agentId, receipt)
+    if (receipt?.status === 'success') {
+      await this.maybeRunSemanticConsolidation(trigger, freshPolicy.modelId)
+    }
   }
 
   private async finishFailed(
@@ -847,26 +863,32 @@ export class AutoDreamService {
     if (lastAt !== undefined && now - lastAt < JANITOR_THROTTLE_MS) return
     this.lastJanitorAtByAgent.set(agentId, now)
     try {
+      // B2: Only the primary 'main' agent may run shared user-skill cold archival.
+      const allowSharedSkills = agentId === 'main'
       const record = await this.runJanitor({
         agentId,
         agentDir: paths.agentDir(agentId),
         skillsDir: paths.sharedSkillsDir,
         mode: 'auto',
         archiveExpiredMemories: true,
-        archiveColdSkills: false,
-        pruneSkillHistory: true,
+        archiveColdSkills: allowSharedSkills,
+        coldSkillDays: 60,
+        maxColdSkillsPerRun: 10,
+        pruneSkillHistory: allowSharedSkills,
         decayArchival: true,
         today: memoryCalendarDate(new Date(now)),
         nowMs: now,
       })
       if (
         record.expiredMemoriesArchived > 0 ||
+        record.coldSkillsArchived > 0 ||
         record.skillHistoriesPruned > 0 ||
         record.archivalCleaned > 0
       ) {
         this.log('auto_dream_janitor_completed', {
           agentId,
           expiredMemoriesArchived: record.expiredMemoriesArchived,
+          coldSkillsArchived: record.coldSkillsArchived,
           skillHistoriesPruned: record.skillHistoriesPruned,
           archivalDecayed: record.archivalDecayed,
           archivalCleaned: record.archivalCleaned,
@@ -876,6 +898,34 @@ export class AutoDreamService {
     } catch (err) {
       this.log('auto_dream_janitor_failed', {
         agentId,
+        error: safeError(err),
+      })
+    }
+  }
+
+  private async maybeRunSemanticConsolidation(
+    trigger: AutoDreamTrigger,
+    modelId: string,
+  ): Promise<void> {
+    try {
+      await this.runSemanticConsolidator({
+        agentId: trigger.agentId,
+        userId: trigger.userId,
+        agentDir: paths.agentDir(trigger.agentId),
+        skillsDir: paths.sharedSkillsDir,
+        model: modelId,
+        runModel: this.runSemanticModel,
+        allowSharedSkillMaintenance: trigger.agentId === 'main',
+        isStillAuthorized: async () => {
+          const fresh = await this.policyClient.get({ fresh: true })
+          return fresh.enabled && fresh.mode === 'legacy_memory_v1'
+        },
+        nowMs: this.now(),
+        log: this.log,
+      })
+    } catch (err) {
+      this.log('auto_dream_semantic_consolidation_failed', {
+        agentId: trigger.agentId,
         error: safeError(err),
       })
     }

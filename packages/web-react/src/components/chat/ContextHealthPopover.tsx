@@ -1,6 +1,5 @@
-import { ArrowUpRight, Gauge, Minimize2, Plus, Sparkles } from "lucide-react";
+import { ArrowUpRight, Minimize2, Plus, Sparkles } from "lucide-react";
 import type { SessionContextPressureState } from "../../lib/chat/model";
-import { formatBytes } from "../../lib/chat/download";
 import { cn } from "../../lib/utils";
 import { Badge, Button, Modal, StatusDot } from "../ui";
 
@@ -15,12 +14,6 @@ export type ContextHealthPopoverProps = {
   onOpenManageMemory?: () => void;
 };
 
-function formatCompactTokens(tokens: number): string {
-  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(2).replace(/\.?0+$/, "")}M`;
-  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(tokens >= 100_000 ? 0 : 1).replace(/\.0$/, "")}k`;
-  return String(tokens);
-}
-
 type SegmentDef = {
   key: string;
   label: string;
@@ -34,19 +27,19 @@ function buildSegments(pressure: SessionContextPressureState | null | undefined)
   const b = pressure?.breakdown;
   if (!b) return [];
   const raw: SegmentDef[] = [
-    { key: "system", label: "系统与人格", group: "resident", bytes: b.systemBytes ?? 0, barClass: "bg-accent", dotClass: "bg-accent" },
-    { key: "memory", label: "核心记忆", group: "resident", bytes: b.memoryBytes ?? 0, barClass: "bg-info", dotClass: "bg-info" },
-    { key: "skills", label: "技能清单", group: "resident", bytes: b.skillsBytes ?? 0, barClass: "bg-success", dotClass: "bg-success" },
-    { key: "project", label: "项目上下文", group: "resident", bytes: b.projectBytes ?? 0, barClass: "bg-warning", dotClass: "bg-warning" },
-    { key: "history", label: "对话历史", group: "session", bytes: b.historyBytes ?? 0, barClass: "bg-fg/55", dotClass: "bg-fg/55" },
-    { key: "tools", label: "工具与附件", group: "session", bytes: b.toolsBytes ?? 0, barClass: "bg-muted/70", dotClass: "bg-muted/70" },
+    { key: "system", label: "助手设定", group: "resident", bytes: b.systemBytes ?? 0, barClass: "bg-accent", dotClass: "bg-accent" },
+    { key: "memory", label: "长期记忆", group: "resident", bytes: b.memoryBytes ?? 0, barClass: "bg-info", dotClass: "bg-info" },
+    { key: "skills", label: "已启用技能", group: "resident", bytes: b.skillsBytes ?? 0, barClass: "bg-success", dotClass: "bg-success" },
+    { key: "project", label: "项目资料", group: "resident", bytes: b.projectBytes ?? 0, barClass: "bg-warning", dotClass: "bg-warning" },
+    { key: "history", label: "聊天记录", group: "session", bytes: b.historyBytes ?? 0, barClass: "bg-fg/55", dotClass: "bg-fg/55" },
+    { key: "tools", label: "文件与工具结果", group: "session", bytes: b.toolsBytes ?? 0, barClass: "bg-muted/70", dotClass: "bg-muted/70" },
   ];
   return raw.filter((s) => s.bytes > 0);
 }
 
 /**
- * 对话内「上下文健康与瘦身」弹层（懒加载 chunk，零首屏开销）。
- * 桌面居中轻量卡片、手机端自动切换贴底 Sheet；纯 CSS 分段堆叠条展示常驻底噪 vs 当前会话。
+ * 对话内「当前对话空间」弹层（懒加载 chunk，零首屏开销；仅高阶用户主动运行 `/context` 时打开）。
+ * 全文通俗人话，不展示底层引擎与字节/Token 工程师术语。
  */
 export function ContextHealthPopover({
   open,
@@ -70,14 +63,14 @@ export function ContextHealthPopover({
       ? "warning"
       : "success";
   const statusLabel = isCritical
-    ? "上下文已接近上限"
+    ? "对话内容较多，系统即将自动整理"
     : isWarning
-      ? "上下文偏高，建议瘦身"
+      ? "对话内容较长，后台会自动保持顺畅"
       : isElevated
-        ? "上下文使用中偏高"
+        ? "对话空间良好"
         : pct !== null
-          ? "上下文健康"
-          : "等待实时水位样本";
+          ? "当前对话空间充足"
+          : "开始聊天后自动更新";
 
   const segments = buildSegments(pressure);
   const totalBreakdownBytes = segments.reduce((sum, s) => sum + s.bytes, 0);
@@ -93,22 +86,20 @@ export function ContextHealthPopover({
       mobile="sheet"
       title={
         <span className="inline-flex items-center gap-2">
-          <span
-            className={cn(
-              "oc-icon-badge size-6 rounded-md",
-              isCritical ? "oc-icon-badge-danger" : isWarning ? "oc-icon-badge-warning" : "oc-icon-badge-accent",
-            )}
-            aria-hidden="true"
-          >
-            <Gauge size={13} strokeWidth={1.8} />
+          <span className="oc-icon-badge oc-icon-badge-accent size-6 rounded-md" aria-hidden="true">
+            <Sparkles size={13} strokeWidth={1.8} />
           </span>
-          <span className="text-title font-semibold tracking-tight text-fg">会话上下文健康</span>
+          <span className="text-title font-semibold tracking-tight text-fg">当前对话空间</span>
         </span>
       }
       className="oc-surface-popover bg-surface"
     >
       <div className="space-y-4" data-testid="context-health-popover">
-        {/* 水位总览 */}
+        <div className="oc-callout oc-callout-info rounded-xl px-3.5 py-2.5 text-caption leading-relaxed text-muted">
+          系统已开启自动整理，聊久了会自动帮你处理，无需手动操作。
+        </div>
+
+        {/* 空间使用概览 */}
         <section className="oc-surface-recessed rounded-xl p-3.5">
           <div className="flex items-center justify-between gap-2">
             <span className="inline-flex items-center gap-2 text-body font-medium text-fg">
@@ -129,7 +120,7 @@ export function ContextHealthPopover({
           <div
             className="mt-2.5 h-2 w-full overflow-hidden rounded-full bg-border/60"
             role="progressbar"
-            aria-label="当前上下文窗口占用率"
+            aria-label="当前对话空间占用比例"
             aria-valuenow={pct ?? 0}
             aria-valuemin={0}
             aria-valuemax={100}
@@ -143,27 +134,20 @@ export function ContextHealthPopover({
             />
           </div>
 
-          <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-caption tabular-nums text-muted">
-            {pressure?.usedTokens !== undefined && pressure?.windowTokens ? (
-              <span>
-                已用 {formatCompactTokens(pressure.usedTokens)} / {formatCompactTokens(pressure.windowTokens)} tokens
-              </span>
-            ) : pressure?.usedTokens !== undefined ? (
-              <span>当前窗口约 {formatCompactTokens(pressure.usedTokens)} tokens</span>
-            ) : (
-              <span>发出消息或到达阈值后自动更新实时窗口水位</span>
-            )}
-            {pressure?.engine && <span className="text-faint">{pressure.engine}</span>}
-          </div>
+          <p className="mt-2 text-caption text-muted">
+            {pct !== null
+              ? `当前对话大约占用了 ${pct}% 的记忆空间，接近上限时系统会自动整理较早记录。`
+              : "继续聊天后，这里会自动展示当前对话的空间使用情况。"}
+          </p>
         </section>
 
-        {/* 成分拆解：纯 CSS 分段堆叠条（常驻底噪 vs 当前会话） */}
-        <section className="space-y-2.5" aria-label="上下文成分拆解">
+        {/* 内容分布：纯 CSS 分段堆叠条 */}
+        <section className="space-y-2.5" aria-label="对话内容分布">
           <div className="flex items-baseline justify-between gap-2">
-            <h4 className="text-meta font-semibold text-fg">成分拆解</h4>
+            <h4 className="text-meta font-semibold text-fg">内容分布</h4>
             {totalBreakdownBytes > 0 && (
               <span className="text-caption tabular-nums text-faint">
-                常驻底噪 {residentPct}% · 本会话 {100 - residentPct}%
+                长期设定与记忆 {residentPct}% · 当前对话 {100 - residentPct}%
               </span>
             )}
           </div>
@@ -179,7 +163,7 @@ export function ContextHealthPopover({
                   return (
                     <span
                       key={seg.key}
-                      title={`${seg.label}：${formatBytes(seg.bytes)}`}
+                      title={`${seg.label}：约 ${Math.max(1, Math.round((seg.bytes / totalBreakdownBytes) * 100))}%`}
                       className={cn("h-full transition-[width] duration-300 first:rounded-l-full last:rounded-r-full", seg.barClass)}
                       style={{ width: `${widthPct}%` }}
                     />
@@ -187,33 +171,36 @@ export function ContextHealthPopover({
                 })}
               </div>
               <div className="grid grid-cols-2 gap-1.5 text-caption">
-                {segments.map((seg) => (
-                  <div
-                    key={seg.key}
-                    className="oc-surface-card flex items-center justify-between gap-2 rounded-lg px-2.5 py-1.5"
-                  >
-                    <span className="inline-flex min-w-0 items-center gap-1.5 text-muted">
-                      <span className={cn("size-2 shrink-0 rounded-full", seg.dotClass)} aria-hidden="true" />
-                      <span className="truncate">{seg.label}</span>
-                    </span>
-                    <span className="shrink-0 font-medium tabular-nums text-fg">{formatBytes(seg.bytes)}</span>
-                  </div>
-                ))}
+                {segments.map((seg) => {
+                  const share = Math.max(1, Math.round((seg.bytes / totalBreakdownBytes) * 100));
+                  return (
+                    <div
+                      key={seg.key}
+                      className="oc-surface-card flex items-center justify-between gap-2 rounded-lg px-2.5 py-1.5"
+                    >
+                      <span className="inline-flex min-w-0 items-center gap-1.5 text-muted">
+                        <span className={cn("size-2 shrink-0 rounded-full", seg.dotClass)} aria-hidden="true" />
+                        <span className="truncate">{seg.label}</span>
+                      </span>
+                      <span className="shrink-0 font-medium tabular-nums text-fg">{share}%</span>
+                    </div>
+                  );
+                })}
               </div>
               {residentBytes > sessionBytes && residentBytes > 12 * 1024 && (
-                <p className="oc-callout oc-callout-warning rounded-xl px-3 py-2 text-caption text-warning">
-                  常驻底噪（{formatBytes(residentBytes)}）占比较高，建议前往管理中心归档过期记忆或低频技能。
+                <p className="oc-callout oc-callout-info rounded-xl px-3 py-2 text-caption text-muted">
+                  长期记忆与技能占比较高，后台会自动合并相似内容并收纳久未使用的项目，也可在下方随时查看。
                 </p>
               )}
             </>
           ) : (
             <p className="oc-surface-recessed rounded-xl px-3 py-2.5 text-caption leading-relaxed text-muted">
-              当前引擎暂未回报细分字节占比，你仍可一键压缩本会话，或前往管理中心检查长期记忆与技能底噪。
+              当前对话刚起步，随着聊天深入，系统会自动为你平衡记忆与较早对话记录。
             </p>
           )}
         </section>
 
-        {/* 操作区 */}
+        {/* 手动兜底操作区 */}
         <section className="space-y-2 pt-1">
           <div className="flex flex-wrap gap-2">
             {onCompact && (
@@ -229,7 +216,7 @@ export function ContextHealthPopover({
                 }}
               >
                 <Minimize2 size={14} strokeWidth={1.8} aria-hidden="true" />
-                一键压缩当前会话
+                立即整理较早对话
               </Button>
             )}
             {onStartNewSession && (
@@ -248,7 +235,7 @@ export function ContextHealthPopover({
             )}
           </div>
           <p className="text-caption text-faint">
-            压缩仅精简发送给模型的上下文摘要，你的完整对话记录仍会保留在时间线中。
+            整理只会精简较早对话的摘要，你的完整聊天记录始终保留在上方。
           </p>
         </section>
 
@@ -266,7 +253,7 @@ export function ContextHealthPopover({
                 <span className="oc-icon-badge oc-icon-badge-accent size-6 rounded-md" aria-hidden="true">
                   <Sparkles size={13} strokeWidth={1.75} />
                 </span>
-                <span>治理长期记忆与技能</span>
+                <span>查看长期记忆与已收纳记录</span>
               </span>
               <ArrowUpRight
                 size={14}

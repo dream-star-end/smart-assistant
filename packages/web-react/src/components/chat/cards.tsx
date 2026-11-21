@@ -1757,24 +1757,6 @@ export function SystemCard({ msg }: { msg: ChatMessage }) {
       </div>
     );
   }
-  const strategyLabel =
-    compact.strategy === "native_summary"
-      ? "模型原生摘要压缩"
-      : compact.strategy === "history_suffix"
-        ? "保留近期对话尾巴"
-        : compact.strategy === "file_reference"
-          ? "超长内容外置文件引用"
-          : compact.strategy || "上下文压缩";
-  const fmtCount = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n));
-  const detailParts: string[] = [`策略：${strategyLabel}`];
-  if (typeof compact.beforeTokens === "number" && typeof compact.afterTokens === "number") {
-    detailParts.push(`Token：${fmtCount(compact.beforeTokens)} → ${fmtCount(compact.afterTokens)}`);
-  } else if (typeof compact.beforeBytes === "number" && typeof compact.afterBytes === "number") {
-    detailParts.push(`体积：${fmtCount(compact.beforeBytes)}B → ${fmtCount(compact.afterBytes)}B`);
-  }
-  if (typeof compact.droppedEntries === "number" && compact.droppedEntries > 0) {
-    detailParts.push(`已折叠 ${compact.droppedEntries} 段旧上下文`);
-  }
   return (
     <div className="flex min-w-0 justify-center animate-in" data-testid="context-compacted-receipt">
       <div className="oc-surface-recessed min-w-0 max-w-full rounded-xl border border-border/65 px-3.5 py-1.5 text-caption leading-relaxed text-faint sm:max-w-[80%]">
@@ -1794,7 +1776,7 @@ export function SystemCard({ msg }: { msg: ChatMessage }) {
         </button>
         {expanded && (
           <div className="mt-1.5 space-y-1 border-t border-border/60 pt-1.5 text-left text-caption text-muted">
-            <p className="tabular-nums">{detailParts.join(" · ")}</p>
+            <p>系统已自动保留近期对话与关键决策，完整聊天记录仍在上方可见。</p>
             {compact.summaryPreview && (
               <p className="line-clamp-3 whitespace-pre-wrap break-words text-faint">
                 {compact.summaryPreview}
