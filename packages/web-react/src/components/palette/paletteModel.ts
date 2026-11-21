@@ -79,7 +79,9 @@ export type PaletteActionId =
   | "switch-agent"
   | "find-in-session"
   | "share-session"
-  | "open-inbox";
+  | "open-inbox"
+  | "compact-session"
+  | "context-health";
 
 const WORKSPACE_ACTION_IDS: ReadonlySet<PaletteActionId> = new Set([
   "open-board",
@@ -98,6 +100,8 @@ const WORKSPACE_ACTION_IDS: ReadonlySet<PaletteActionId> = new Set([
   "find-in-session",
   "share-session",
   "open-inbox",
+  "compact-session",
+  "context-health",
 ]);
 
 const UPGRADED_WORKSPACE_ACTION_IDS: ReadonlySet<PaletteActionId> = new Set([
@@ -807,6 +811,8 @@ export function paletteActions(opts: {
   canFindInSession?: boolean;
   canShareSession?: boolean;
   canOpenInbox?: boolean;
+  canCompactSession?: boolean;
+  canOpenContextHealth?: boolean;
 }): PaletteAction[] {
   const parsed = parsePaletteQuery(opts.query);
   // `>` / `@` 快捷前缀模式下不把检索词拼进「新建项目「xxx」」，防止任意 `>命令` 误命中新建项目。
@@ -875,6 +881,22 @@ export function paletteActions(opts: {
       label: "打开快问小窗",
       keywords: "quick ask 快问 支线 小窗 速问",
       hint: "支线快问",
+    });
+  }
+  if (opts.canCompactSession) {
+    out.push({
+      id: "compact-session",
+      label: "压缩当前会话上下文",
+      keywords: "compact /compact 压缩 瘦身 上下文 清理 减负",
+      hint: "/compact",
+    });
+  }
+  if (opts.canOpenContextHealth) {
+    out.push({
+      id: "context-health",
+      label: "查看上下文健康",
+      keywords: "context /context health 上下文 体检 水位 成分",
+      hint: "/context",
     });
   }
   if (opts.canTogglePane) {

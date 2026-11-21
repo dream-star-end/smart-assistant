@@ -60,6 +60,7 @@ export class CodexNativeContext {
     this.emit({ kind: 'context_pressure', pressure: {
       engine: 'codex', scope: 'native_context', dimension: 'tokens',
       level: usedRatio >= 1 ? 'critical' : 'warning', usedRatio,
+      usedTokens: value.tokens, windowTokens: value.window,
     } })
   }
 

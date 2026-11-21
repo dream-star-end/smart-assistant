@@ -63,6 +63,7 @@ export type ChatCardActionsInput = {
   loadExactUserMessage: (message: ChatMessage) => Promise<ChatMessage | null>;
   messageFeedbackTriggerRef: React.RefObject<HTMLElement | null>;
   newSession: () => void;
+  onCompactSession?: () => void;
   openManage: (tab: ManageTab) => void;
   /** 经验分享开关（feature_community_blog）；关时对话卡只读。 */
   communityBlogEnabled: boolean;
@@ -105,6 +106,7 @@ export function useChatCardActions({
   loadExactUserMessage,
   messageFeedbackTriggerRef,
   newSession,
+  onCompactSession,
   openManage,
   communityBlogEnabled,
   openBlog,
@@ -388,6 +390,7 @@ export function useChatCardActions({
             setSubscribeOpenSignal((n) => n + 1);
           },
       onStartNewSession: demo ? undefined : newSession,
+      onCompactSession: demo ? undefined : onCompactSession,
       onFeedback,
       onFirstTextPaint: demo
         ? undefined

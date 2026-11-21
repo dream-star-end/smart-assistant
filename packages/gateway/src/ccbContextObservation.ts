@@ -7,15 +7,54 @@ export function parseCcbContextObservation(raw: unknown): ContextObservation | n
   if (!raw || typeof raw !== 'object') return null
   const event = raw as Record<string, unknown>
   if (event.kind === 'context_pressure' && Value.Check(ContextPressure, event.pressure)) {
-    const { engine, scope, dimension, level, usedRatio } = event.pressure
+    const { engine, scope, dimension, level, usedRatio, usedTokens, windowTokens, breakdown } = event.pressure
     if (engine !== 'claude-code' || scope !== 'native_context' || dimension !== 'transport_bytes') return null
-    return { kind: 'context_pressure', pressure: { engine, scope, dimension, level, usedRatio } }
+    return {
+      kind: 'context_pressure',
+      pressure: {
+        engine,
+        scope,
+        dimension,
+        level,
+        usedRatio,
+        ...(usedTokens !== undefined ? { usedTokens } : {}),
+        ...(windowTokens !== undefined ? { windowTokens } : {}),
+        ...(breakdown !== undefined ? { breakdown } : {}),
+      },
+    }
   }
   if (event.kind === 'context_compacted' && Value.Check(ContextCompaction, event.compaction)) {
     if (event.compaction.strategy !== 'file_reference') return null
-    const { engine, scope, strategy, beforeBytes, afterBytes, droppedEntries } = event.compaction
+    const {
+      engine,
+      scope,
+      strategy,
+      beforeBytes,
+      afterBytes,
+      droppedEntries,
+      beforeTokens,
+      afterTokens,
+      summaryPreview,
+      sessionId,
+      requestId,
+    } = event.compaction
     if (engine !== 'claude-code' || scope !== 'native_context' || droppedEntries !== 0) return null
-    return { kind: 'context_compacted', compaction: { engine, scope, strategy, beforeBytes, afterBytes, droppedEntries } }
+    return {
+      kind: 'context_compacted',
+      compaction: {
+        engine,
+        scope,
+        strategy,
+        beforeBytes,
+        afterBytes,
+        droppedEntries,
+        ...(beforeTokens !== undefined ? { beforeTokens } : {}),
+        ...(afterTokens !== undefined ? { afterTokens } : {}),
+        ...(summaryPreview !== undefined ? { summaryPreview } : {}),
+        ...(sessionId !== undefined ? { sessionId } : {}),
+        ...(requestId !== undefined ? { requestId } : {}),
+      },
+    }
   }
   return null
 }

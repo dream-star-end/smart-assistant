@@ -20,6 +20,7 @@ import {
   memoryCalendarDate,
   paths,
   pruneAutoDreamSuccessEvents,
+  runContextJanitor,
   scanAutoDreamSuccessfulSessions,
   scanMemoryContent,
   stampAutoMemoryFrontmatter,
@@ -31,6 +32,7 @@ import type { SessionStreamEvent } from './engine/engineEvents.js'
 
 const USER_CHANNELS = new Set(['webchat', 'wechat', 'telegram'])
 const SCAN_THROTTLE_MS = 10 * 60_000
+const JANITOR_THROTTLE_MS = 6 * 60 * 60_000
 const MAX_MEMORY_FILES = 50
 const MAX_MEMORY_CHARS = 30_000
 const MAX_MEMORY_FILE_CHARS = 8_000
@@ -254,6 +256,8 @@ export interface AutoDreamDeps {
   log?: (event: string, fields: Record<string, unknown>) => void
   /** Test seam for auto-write dedup. Production uses findStrongLexicalMemory. */
   hasStrongCoreHit?: typeof findStrongLexicalMemory
+  /** Test seam for L1 deterministic context janitor. Production uses runContextJanitor. */
+  runJanitor?: typeof runContextJanitor
 }
 
 export interface AutoDreamTurnResult {
@@ -316,6 +320,8 @@ export class AutoDreamService {
   private readonly now: () => number
   private readonly log: (event: string, fields: Record<string, unknown>) => void
   private readonly hasStrongCoreHit: typeof findStrongLexicalMemory
+  private readonly runJanitor: typeof runContextJanitor
+  private readonly lastJanitorAtByAgent = new Map<string, number>()
 
   constructor(deps: AutoDreamDeps) {
     this.policyClient = deps.policyClient ?? new AutoDreamPolicyClient()
@@ -324,6 +330,7 @@ export class AutoDreamService {
     this.now = deps.now ?? Date.now
     this.log = deps.log ?? (() => {})
     this.hasStrongCoreHit = deps.hasStrongCoreHit ?? findStrongLexicalMemory
+    this.runJanitor = deps.runJanitor ?? runContextJanitor
   }
 
   async maybeSchedule(trigger: AutoDreamTrigger): Promise<void> {
@@ -408,6 +415,7 @@ export class AutoDreamService {
     } catch {
       return
     }
+    let shouldProceedToModel = true
     try {
       const state = await readState(statePath)
       const now = this.now()
@@ -450,16 +458,25 @@ export class AutoDreamService {
           sessionsReviewed: state.counts?.sessionsReviewed,
         },
       })
-      if (sessionCount < policy.minNewSessions) return
       const lastAttempt = parseTime(state.lastAttemptAt)
-      if (lastAttempt !== null && now - lastAttempt < policy.minIntervalHours * 60 * 60_000) return
+      if (
+        sessionCount < policy.minNewSessions ||
+        (lastAttempt !== null && now - lastAttempt < policy.minIntervalHours * 60 * 60_000)
+      ) {
+        shouldProceedToModel = false
+      }
     } finally {
       await lock.release().catch(() => {})
     }
 
+    // OCV5-840: zero-LLM-cost L1 deterministic cleanup runs on its own throttle
+    // window outside the Auto-Dream lock (fail-open, never blocks main cadence).
+    await this.maybeRunJanitor(trigger.agentId)
+    if (!shouldProceedToModel) return
+
     // Non-paid bounded snapshot work happens before lastAttemptAt is advanced.
     // A local read failure must not consume the user's daily paid cadence.
-    const memory = await snapshotMemory(trigger.agentId)
+    const memory = await snapshotMemory(trigger.agentId, trigger.projectId)
     const excerpts = await buildExcerpts(trigger, recentSessions)
     const prompt = buildPrompt(memory, excerpts)
     const sessionsReviewed = excerpts.length
@@ -789,9 +806,13 @@ export class AutoDreamService {
         }).catch(() => {})
         continue
       }
+      const isProjectBound = Boolean(projectId && isProjectContextEnabled())
       creates.push({
         ...row,
-        content: stampAutoMemoryFrontmatter(row.content, today),
+        // OCV5-840: For project-bound writes, leave frontmatter unstamped here so
+        // ProjectMemoryDir.prepareCandidateBody applies the 14-day project TTL
+        // instead of inheriting Core's 30-day TTL.
+        content: isProjectBound ? row.content : stampAutoMemoryFrontmatter(row.content, today),
       })
     }
     return creates
@@ -817,6 +838,46 @@ export class AutoDreamService {
       return { hit: false }
     } catch {
       return { hit: false }
+    }
+  }
+
+  private async maybeRunJanitor(agentId: string): Promise<void> {
+    const now = this.now()
+    const lastAt = this.lastJanitorAtByAgent.get(agentId)
+    if (lastAt !== undefined && now - lastAt < JANITOR_THROTTLE_MS) return
+    this.lastJanitorAtByAgent.set(agentId, now)
+    try {
+      const record = await this.runJanitor({
+        agentId,
+        agentDir: paths.agentDir(agentId),
+        skillsDir: paths.sharedSkillsDir,
+        mode: 'auto',
+        archiveExpiredMemories: true,
+        archiveColdSkills: false,
+        pruneSkillHistory: true,
+        decayArchival: true,
+        today: memoryCalendarDate(new Date(now)),
+        nowMs: now,
+      })
+      if (
+        record.expiredMemoriesArchived > 0 ||
+        record.skillHistoriesPruned > 0 ||
+        record.archivalCleaned > 0
+      ) {
+        this.log('auto_dream_janitor_completed', {
+          agentId,
+          expiredMemoriesArchived: record.expiredMemoriesArchived,
+          skillHistoriesPruned: record.skillHistoriesPruned,
+          archivalDecayed: record.archivalDecayed,
+          archivalCleaned: record.archivalCleaned,
+          bytesFreed: record.bytesFreed,
+        })
+      }
+    } catch (err) {
+      this.log('auto_dream_janitor_failed', {
+        agentId,
+        error: safeError(err),
+      })
     }
   }
 
@@ -1030,7 +1091,7 @@ export function formatAutoDreamReceipt(report: AutoDreamLastReport): {
   return { title: 'Auto‑Dream 梦境报告', bodyMd: lines.join('\n') }
 }
 
-async function snapshotMemory(agentId: string): Promise<MemorySnapshot> {
+async function snapshotMemory(agentId: string, projectId?: string): Promise<MemorySnapshot> {
   const memdir = new MemoryDir(agentId)
   const all = await memdir.list()
   const files = all.slice(0, MAX_MEMORY_FILES)
@@ -1038,6 +1099,7 @@ async function snapshotMemory(agentId: string): Promise<MemorySnapshot> {
   const versions = new Map<string, string>()
   const metadata: MemorySnapshot['metadata'] = new Map()
   const index: MemoryIndexEntry[] = []
+  const indexedFiles = new Set<string>()
   let indexUsed = 0
   for (const meta of all.slice(0, MAX_INDEX_ENTRIES)) {
     const entry: MemoryIndexEntry = {
@@ -1051,6 +1113,7 @@ async function snapshotMemory(agentId: string): Promise<MemorySnapshot> {
     const cost = JSON.stringify(entry).length
     if (indexUsed + cost > MAX_INDEX_CHARS) break
     index.push(entry)
+    indexedFiles.add(meta.file)
     indexUsed += cost
   }
   let used = 0
@@ -1069,6 +1132,47 @@ async function snapshotMemory(agentId: string): Promise<MemorySnapshot> {
     })
     rendered.push({ file: meta.file, content: row.content })
     used += row.content.length
+  }
+  // OCV5-840: When bound to a project, also snapshot official project memories
+  // into index + rendered so Auto-Dream deduplicates against existing project facts.
+  if (projectId && isProjectContextEnabled()) {
+    try {
+      const { getTaskboardDb } = await import('./taskboard/db/index.js')
+      const ledger = new ProjectMemoryLedger(getTaskboardDb())
+      const dir = new ProjectMemoryDir(projectId)
+      const official = ledger.listOfficial(projectId)
+      for (const row of official) {
+        if (row.deprecated) continue
+        const read = await dir.readOfficial(row.slug, row.contentSha256)
+        if (!read || !scanMemoryContent(read.content).ok) continue
+        if (index.length < MAX_INDEX_ENTRIES && !indexedFiles.has(read.file)) {
+          const entry: MemoryIndexEntry = {
+            file: read.file,
+            type: 'project',
+            name: cleanReportText(read.name, MAX_INDEX_FIELD_CHARS),
+            description: cleanReportText(read.description, MAX_INDEX_FIELD_CHARS),
+            ...(read.source === 'auto' ? { auto: true as const } : {}),
+          }
+          if (scanMemoryContent(`${entry.name}\n${entry.description}`).ok) {
+            const cost = JSON.stringify(entry).length
+            if (indexUsed + cost <= MAX_INDEX_CHARS) {
+              index.push(entry)
+              indexedFiles.add(read.file)
+              indexUsed += cost
+            }
+          }
+        }
+        if (used < MAX_MEMORY_CHARS && !rendered.some((r) => r.file === read.file)) {
+          const remaining = MAX_MEMORY_CHARS - used
+          if (read.content.length <= MAX_MEMORY_FILE_CHARS && read.content.length <= remaining) {
+            rendered.push({ file: read.file, content: read.content })
+            used += read.content.length
+          }
+        }
+      }
+    } catch {
+      // Fail-open: unavailable taskboard DB must never abort Core snapshot.
+    }
   }
   return { rendered, versions, metadata, index }
 }

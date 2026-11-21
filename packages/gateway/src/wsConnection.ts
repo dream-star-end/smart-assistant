@@ -22,6 +22,7 @@ import {
   type OutboundMessage,
   type OutboundTurnStatus,
   type OutboundTurnUsage,
+  type OutboundSessionCompactResult,
   type SysContextRebuilt,
   type SessionContextPressure,
   type SysContextCompacted,
@@ -35,6 +36,7 @@ import {
   type PromptQueueDispatchControl,
 } from './promptQueueCoordinator.js'
 import type { PromptQueueExecutionFence } from './sessionManager.js'
+import type { AgentSession } from './sessionTypes.js'
 import { readV3MasterSinkConfig } from './v3MasterSink.js'
 import { isHiddenSystemAgentId } from './agentVisibility.js'
 import { WebSocket } from 'ws'
@@ -45,6 +47,7 @@ import {
   outboundRingReplayMissTotal,
   outboundRingSizeBytes,
 } from './metrics.js'
+import { compactSession, type SessionLifecycleHost } from './sessionLifecycle.js'
 import type { SessionRepoStatusOut } from './sessionRepoWorkspace.js'
 import {
   lookupRecentTerminal,
@@ -765,60 +768,15 @@ export function handleWsConnection(
           reply({ ...failure, status: 'failed' })
         }
       } else if ((frame as any).type === 'control.session.compact') {
-        // Compact: send a compaction request to the agent as a user message
-        const sessionKey = (frame as any).sessionKey
-        if (!sessionKey) return
-        const session = this.sessions.getByKey(sessionKey)
-        if (!session) {
-          ws.send(JSON.stringify(withUserError({ type: 'error', error: 'session not found' })))
-          return
-        }
-        this.log.info('compact session', { sessionKey })
-        try {
-          await this.sessions.submit(
-            session,
-            '/compact — 请压缩当前对话上下文,保留关键信息,删除冗余细节。',
-            (e) => {
-              if (e.kind === 'block') {
-                const out = {
-                  type: 'outbound.message',
-                  sessionKey,
-                  channel: 'webchat',
-                  peer: { id: sessionKey.split(':')[4] || '__compact__', kind: 'dm' },
-                  blocks: [e.block],
-                  isFinal: false,
-                }
-                // Single-ws send (compact progress goes only to the requester),
-                // so deliver() isn't appropriate here — stamp ts inline instead
-                // so the client's stale-final guard has a monotonic timestamp.
-                ws.send(JSON.stringify({ ...out, ts: Date.now() }))
-              } else if (e.kind === 'final') {
-                ws.send(
-                  JSON.stringify({
-                    type: 'outbound.message',
-                    sessionKey,
-                    channel: 'webchat',
-                    peer: { id: '__compact__', kind: 'dm' },
-                    blocks: [{ kind: 'text', text: '✅ 上下文压缩完成' }],
-                    isFinal: true,
-                    meta: e.meta,
-                    ts: Date.now(),
-                  }),
-                )
-              }
-            },
-            undefined,
-            undefined,
-            undefined,
-            undefined,
-            undefined,
-            { serviceTier: null },
-          )
-        } catch (err: any) {
-          // E5 — 原文进日志,ws 控制面错误帧只发受控文案。
-          this.log.error('compact session failed', { sessionKey }, err)
-          ws.send(JSON.stringify(withUserError({ type: 'error', error: '上下文压缩失败，请稍后重试' })))
-        }
+        await handleControlSessionCompactFrame({
+          ws,
+          userId: this.getWsUserId(ws),
+          frame: frame as Record<string, unknown>,
+          sessions: this.sessions,
+          clientsByPeer: this.clientsByPeer,
+          sendStampedSessionFrame: (sk, pk, f) => this._sendStampedSessionFrame(sk, pk, f),
+          log: this.log,
+        })
       }
     } catch (err: any) {
       this.log.error('ws-message unhandled error', undefined, err)
@@ -1458,6 +1416,7 @@ export type DeliverOut = | OutboundMessage
     | OutboundTurnStatus
     | OutboundTurnUsage
     | OutboundCallUsage
+    | OutboundSessionCompactResult
     | SysContextRebuilt
     | SessionContextPressure
     | SysContextCompacted
@@ -1541,6 +1500,7 @@ export function deliver(
     wire.type === 'outbound.turn_status' ||
     wire.type === 'outbound.turn_usage' ||
     wire.type === 'outbound.call_usage' ||
+    wire.type === 'outbound.session_compact_result' ||
     wire.type === 'sys.context_rebuilt' ||
     wire.type === 'session.context_pressure' ||
     wire.type === 'sys.context_compacted'
@@ -1562,7 +1522,10 @@ export function deliver(
   // connected ws registers under userId='default' anyway. On v2 cherry-pick
   // all non-stamped call sites will need updating to route correctly.
   const deliverUserId: string = typeof stampedUserId === 'string' ? stampedUserId : 'default'
-  const peerKey = makePeerKey(deliverUserId, wire.channel, wire.peer.id)
+  const deliverChannel = wire.channel ?? 'webchat'
+  const deliverPeerId =
+    wire.peer?.id ?? (wire as { sessionKey?: string }).sessionKey?.split(':').slice(4).join(':') ?? ''
+  const peerKey = makePeerKey(deliverUserId, deliverChannel, deliverPeerId)
   // ── Phase 0.3: stamp frameSeq + push to ring buffer ──
   // We stamp + store even if no clients are currently connected — that's
   // the whole point: a later autoResumeFromHello for this sessionKey needs
@@ -1760,5 +1723,229 @@ export function _consumeFrameAuthority(
         : new AuthorityRejected('bad_shape', (err as Error)?.message ?? String(err))
     this._rejectAuthority(ws, rejection.code, rejection.message, frame)
     return false
+  }
+}
+
+/**
+ * OCV5-840 (B5/B6): Authenticated, target-consistent, side-effect-free `control.session.compact` handler.
+ * - Explicit `sessionKey` MUST match directly (never falls back to another agent sharing `peerId`).
+ * - Conflicting `sessionKey` vs `sessionId`/`peer.id` is rejected with `SESSION_TARGET_MISMATCH`.
+ * - Missing `sessionKey` with multiple live sessions for `(userId, sessionId)` is rejected with `SESSION_AMBIGUOUS`.
+ * - All pre-execution rejections are sent directly to the requesting socket without writing to any
+ *   session's outbound replay ring or advancing any session's `frameSeq`.
+ */
+export async function handleControlSessionCompactFrame(deps: {
+  ws: { readyState: number; send(data: string): void }
+  userId: string
+  frame: Record<string, unknown>
+  sessions: {
+    getByKey(sessionKey: string): AgentSession | undefined
+    list(): Array<{ sessionKey: string }>
+  }
+  clientsByPeer: Map<string, Set<unknown>>
+  sendStampedSessionFrame: (sessionKey: string, peerKey: string, frame: Record<string, unknown>) => void
+  log: { info(msg: string, meta?: Record<string, unknown>): void; error(msg: string, meta?: Record<string, unknown>, err?: unknown): void }
+  compactImpl?: typeof compactSession
+}): Promise<void> {
+  const { ws, userId, frame, sessions, clientsByPeer, sendStampedSessionFrame, log } = deps
+  const rawSessionKey = typeof frame.sessionKey === 'string' ? frame.sessionKey.trim() : ''
+  const rawSessionId = typeof frame.sessionId === 'string' ? frame.sessionId.trim() : ''
+  const rawPeerObj = frame.peer && typeof frame.peer === 'object' ? (frame.peer as { id?: unknown }) : undefined
+  const rawPeerId = typeof rawPeerObj?.id === 'string' ? rawPeerObj.id.trim() : ''
+  const rawInstructions = typeof frame.instructions === 'string' ? frame.instructions.trim() : undefined
+  const rawRequestId = typeof frame.requestId === 'string' ? frame.requestId.trim() : undefined
+
+  const sendDirectToRequester = (payload: {
+    sessionKey: string
+    peerId: string
+    ok: boolean
+    supported: boolean
+    error: string
+  }) => {
+    if (ws.readyState !== WebSocket.OPEN) return
+    try {
+      ws.send(
+        JSON.stringify({
+          type: 'outbound.session_compact_result',
+          sessionKey: payload.sessionKey,
+          channel: 'webchat',
+          ...(payload.peerId ? { peer: { id: payload.peerId, kind: 'dm' } } : {}),
+          ...(rawRequestId ? { requestId: rawRequestId } : {}),
+          ok: payload.ok,
+          supported: payload.supported,
+          error: payload.error,
+          ts: Date.now(),
+        }),
+      )
+    } catch {
+      /* originating transport already gone */
+    }
+  }
+
+  let session: AgentSession | undefined
+  if (rawSessionKey) {
+    // B5: Explicit sessionKey NEVER falls back to scanning peerId across other agents.
+    session = sessions.getByKey(rawSessionKey)
+    const fallbackPeer = rawSessionId || rawPeerId || rawSessionKey.split(':').slice(4).join(':')
+    if (!session) {
+      sendDirectToRequester({
+        sessionKey: rawSessionKey,
+        peerId: fallbackPeer,
+        ok: false,
+        supported: false,
+        error: 'SESSION_NOT_FOUND',
+      })
+      return
+    }
+    if (session.userId !== userId) {
+      sendDirectToRequester({
+        sessionKey: rawSessionKey,
+        peerId: fallbackPeer,
+        ok: false,
+        supported: false,
+        error: 'SESSION_FORBIDDEN',
+      })
+      return
+    }
+    if (
+      (rawSessionId && session.peerId !== rawSessionId) ||
+      (rawPeerId && session.peerId !== rawPeerId)
+    ) {
+      sendDirectToRequester({
+        sessionKey: rawSessionKey,
+        peerId: fallbackPeer,
+        ok: false,
+        supported: false,
+        error: 'SESSION_TARGET_MISMATCH',
+      })
+      return
+    }
+  } else if (rawSessionId || rawPeerId) {
+    const targetPeer = rawSessionId || rawPeerId
+    if (rawSessionId && rawPeerId && rawSessionId !== rawPeerId) {
+      sendDirectToRequester({
+        sessionKey: '',
+        peerId: targetPeer,
+        ok: false,
+        supported: false,
+        error: 'SESSION_TARGET_MISMATCH',
+      })
+      return
+    }
+    const matches: AgentSession[] = []
+    for (const entry of sessions.list()) {
+      const candidate = sessions.getByKey(entry.sessionKey)
+      if (candidate && candidate.peerId === targetPeer && candidate.userId === userId) {
+        matches.push(candidate)
+      }
+    }
+    if (matches.length === 0) {
+      sendDirectToRequester({
+        sessionKey: '',
+        peerId: targetPeer,
+        ok: false,
+        supported: false,
+        error: 'SESSION_NOT_FOUND',
+      })
+      return
+    }
+    if (matches.length > 1) {
+      sendDirectToRequester({
+        sessionKey: '',
+        peerId: targetPeer,
+        ok: false,
+        supported: false,
+        error: 'SESSION_AMBIGUOUS',
+      })
+      return
+    }
+    session = matches[0]
+  } else {
+    return
+  }
+
+  const sessionKey = session.sessionKey
+  const peerId = session.peerId
+  const peerKey = makePeerKey(userId, 'webchat', peerId)
+  const sendCompactResult = (payload: {
+    ok: boolean
+    supported: boolean
+    strategy?: string
+    beforeTokens?: number
+    afterTokens?: number
+    beforeBytes?: number
+    afterBytes?: number
+    summaryPreview?: string
+    error?: string
+  }) => {
+    const resultFrame = {
+      type: 'outbound.session_compact_result' as const,
+      sessionKey,
+      channel: 'webchat',
+      peer: { id: peerId, kind: 'dm' as const },
+      ...(rawRequestId ? { requestId: rawRequestId } : {}),
+      ...payload,
+    }
+    sendStampedSessionFrame(sessionKey, peerKey, resultFrame)
+    if (ws.readyState === WebSocket.OPEN) {
+      const live = clientsByPeer.get(peerKey)
+      if (!live?.has(ws)) {
+        try {
+          ws.send(JSON.stringify({ ...resultFrame, ts: Date.now() }))
+        } catch {
+          /* originating transport already gone */
+        }
+      }
+    }
+  }
+
+  log.info('compact session', { sessionKey, engine: session.providerTag, requestId: rawRequestId })
+  const runCompact = deps.compactImpl ?? compactSession
+  try {
+    const outcome = await runCompact.call(
+      sessions as unknown as SessionLifecycleHost,
+      session,
+      { instructions: rawInstructions, requestId: rawRequestId },
+    )
+    if (outcome.ok && outcome.strategy) {
+      const compactedFrame = {
+        type: 'sys.context_compacted' as const,
+        sessionKey,
+        channel: 'webchat',
+        peer: { id: peerId, kind: 'dm' as const },
+        agentId: session.agentId,
+        engine: outcome.engine,
+        scope: 'native_context' as const,
+        strategy: outcome.strategy,
+        ...(outcome.beforeBytes !== undefined ? { beforeBytes: outcome.beforeBytes } : {}),
+        ...(outcome.afterBytes !== undefined ? { afterBytes: outcome.afterBytes } : {}),
+        ...(outcome.droppedEntries !== undefined ? { droppedEntries: outcome.droppedEntries } : {}),
+        ...(outcome.beforeTokens !== undefined ? { beforeTokens: outcome.beforeTokens } : {}),
+        ...(outcome.afterTokens !== undefined ? { afterTokens: outcome.afterTokens } : {}),
+        ...(outcome.summaryPreview ? { summaryPreview: outcome.summaryPreview } : {}),
+        sessionId: session.peerId,
+        ...(rawRequestId ? { requestId: rawRequestId } : {}),
+      }
+      sendStampedSessionFrame(sessionKey, peerKey, compactedFrame)
+    }
+    sendCompactResult({
+      ok: outcome.ok,
+      supported: outcome.supported,
+      ...(outcome.strategy ? { strategy: outcome.strategy } : {}),
+      ...(outcome.beforeTokens !== undefined ? { beforeTokens: outcome.beforeTokens } : {}),
+      ...(outcome.afterTokens !== undefined ? { afterTokens: outcome.afterTokens } : {}),
+      ...(outcome.beforeBytes !== undefined ? { beforeBytes: outcome.beforeBytes } : {}),
+      ...(outcome.afterBytes !== undefined ? { afterBytes: outcome.afterBytes } : {}),
+      ...(outcome.summaryPreview ? { summaryPreview: outcome.summaryPreview } : {}),
+      ...(outcome.error ? { error: outcome.error } : {}),
+    })
+  } catch (err: any) {
+    // E5 — 原文进日志,ws 控制面错误帧只发受控文案。
+    log.error('compact session failed', { sessionKey }, err)
+    sendCompactResult({
+      ok: false,
+      supported: true,
+      error: 'SESSION_COMPACT_FAILED',
+    })
   }
 }

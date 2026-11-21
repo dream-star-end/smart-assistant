@@ -87,6 +87,7 @@ export type UseChatSocket = {
   setSessionModel: (sessId: string, modelId: string, modelSwitchId?: string) => void;
   prepareModelSwitch: (sessId: string, sourceModel: string, targetModel: string) => Promise<string>;
   cancelPendingModelSwitches: (sessId: string) => void;
+  compactSession: (sessId: string, instructions?: string) => Promise<import("../lib/chat/frames").OutboundSessionCompactResultWire>;
   /** 切换会话 agent（§11 跨 agent 污染守卫的写入点）。*/
   switchAgent: (sessId: string, agentId: string) => void;
   send: (p: {
@@ -821,6 +822,10 @@ export function useChatSocket(opts: {
     (sessId: string) => socket.cancelPendingModelSwitches(sessId),
     [socket],
   );
+  const compactSession = useCallback(
+    (sessId: string, instructions?: string) => socket.compactSession(sessId, instructions),
+    [socket],
+  );
   const switchAgent = useCallback((sessId: string, agentId: string) => socket.switchAgent(sessId, agentId), [socket]);
   const send = useCallback<UseChatSocket["send"]>((p) => socket.sendMessage(p), [socket]);
   const stop = useCallback<UseChatSocket["stop"]>((sessId, expectedClientMessageId) => socket.stopTurn(sessId, expectedClientMessageId), [socket]);
@@ -1207,6 +1212,7 @@ export function useChatSocket(opts: {
       setSessionModel,
       prepareModelSwitch,
       cancelPendingModelSwitches,
+      compactSession,
       switchAgent,
       send,
       stop,
@@ -1251,6 +1257,7 @@ export function useChatSocket(opts: {
       setSessionModel,
       prepareModelSwitch,
       cancelPendingModelSwitches,
+      compactSession,
       switchAgent,
       send,
       stop,

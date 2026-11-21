@@ -1,5 +1,12 @@
-import { lstat, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { lstat, mkdtemp, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+
+export const CONTEXT_REFERENCE_DIR_PREFIX = '.openclaude-context-'
+
+export function contextReferenceSessionScope(sessionKey: string): string {
+  return `s-${createHash('sha256').update(sessionKey).digest('hex').slice(0, 24)}`
+}
 
 /** Publish only complete, private files. References live with the workspace;
  * ending a turn must not remove files still referenced by native history.
@@ -9,9 +16,13 @@ export async function writeContextReference(
   content: string | Uint8Array,
   filename: string,
   key?: string,
+  sessionKey?: string,
 ): Promise<{ file: string; remove: () => Promise<void> }> {
   if (key !== undefined && !/^[a-f0-9]{64}$/.test(key)) throw new Error('Invalid context reference key')
-  const destination = key ? join(cwd, `.openclaude-context-${key}`) : undefined
+  const scopePrefix = sessionKey
+    ? `${CONTEXT_REFERENCE_DIR_PREFIX}${contextReferenceSessionScope(sessionKey)}-`
+    : CONTEXT_REFERENCE_DIR_PREFIX
+  const destination = key ? join(cwd, `${scopePrefix}${key}`) : undefined
   const verifyExisting = async () => {
     const dirInfo = await lstat(destination!)
     const file = join(destination!, filename)
@@ -27,7 +38,7 @@ export async function writeContextReference(
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
   }
-  const dir = await mkdtemp(join(cwd, '.openclaude-context-'))
+  const dir = await mkdtemp(join(cwd, scopePrefix))
   const remove = () => rm(dir, { recursive: true, force: true })
   try {
     const file = join(dir, filename)
@@ -47,4 +58,36 @@ export async function writeContextReference(
     await remove()
     throw error
   }
+}
+
+/**
+ * Remove stale `.openclaude-context-*` directories from a workspace on session teardown.
+ * When `sessionKey` is provided (B4), ONLY removes directories owned by that exact
+ * full sessionKey (`s-<sha256(sessionKey).slice(0,24)>`), never touching sibling agents.
+ */
+export async function cleanupContextReferences(cwd: string, sessionKey?: string): Promise<number> {
+  if (!cwd) return 0
+  let entries: string[]
+  try {
+    entries = await readdir(cwd)
+  } catch {
+    return 0
+  }
+  const matchPrefix = sessionKey
+    ? `${CONTEXT_REFERENCE_DIR_PREFIX}${contextReferenceSessionScope(sessionKey)}-`
+    : CONTEXT_REFERENCE_DIR_PREFIX
+  let removed = 0
+  for (const name of entries) {
+    if (!name.startsWith(matchPrefix)) continue
+    try {
+      const target = join(cwd, name)
+      const info = await lstat(target)
+      if (!info.isDirectory() || info.isSymbolicLink()) continue
+      await rm(target, { recursive: true, force: true })
+      removed += 1
+    } catch {
+      // fail-open
+    }
+  }
+  return removed
 }

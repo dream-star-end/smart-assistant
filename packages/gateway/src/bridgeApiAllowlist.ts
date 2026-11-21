@@ -144,6 +144,36 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     proxyFromCommercial: true,
   },
   {
+    label: '/api/agents/:id/context-health',
+    re: /^\/api\/agents\/[A-Za-z0-9_-]+\/context-health$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/agents/:id/context-hygiene/run',
+    re: /^\/api\/agents\/[A-Za-z0-9_-]+\/context-hygiene\/run$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/agents/:id/context-hygiene/history',
+    re: /^\/api\/agents\/[A-Za-z0-9_-]+\/context-hygiene\/history$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/agents/:id/memory/archive',
+    re: /^\/api\/agents\/[A-Za-z0-9_-]+\/memory\/archive$/,
+    methods: M('GET', 'POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/agents/:id/memory/archive/restore',
+    re: /^\/api\/agents\/[A-Za-z0-9_-]+\/memory\/archive\/restore$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
+  {
     // memdir 单条记忆文件 CRUD。:file 用 [^/]+(容器 handler 再过 basename+MEMORY_FILE_RE
     // 双保险,拒 `..`/非法名),桥门不比 handler 更松。操作用户自己容器卷内的记忆文件,故 proxy。
     label: '/api/agents/:id/memory/files/:file',
@@ -203,6 +233,24 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     label: '/api/skills',
     re: /^\/api\/skills$/,
     methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/skills/archive',
+    re: /^\/api\/skills\/archive$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/skills/archive/restore',
+    re: /^\/api\/skills\/archive\/restore$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/skills/:name/archive',
+    re: /^\/api\/skills\/[a-z0-9-]+\/archive$/,
+    methods: M('POST'),
     proxyFromCommercial: true,
   },
   {
@@ -397,7 +445,7 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
   },
   {
     label: '/api/board/projects/:id/memories/:id/:action',
-    re: /^\/api\/board\/projects\/[^/]+\/memories\/[^/]+\/(promote|reject|deprecate)$/,
+    re: /^\/api\/board\/projects\/[^/]+\/memories\/[^/]+\/(promote|reject|deprecate|restore)$/,
     methods: M('POST'),
     proxyFromCommercial: true,
   },

@@ -7,8 +7,8 @@
  * touches (typed from the class itself).
  */
 import { fetchIdentityCompatProjection } from '@openclaude/storage'
-import { createHash, randomBytes } from 'node:crypto'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { createHash, createHmac, randomBytes } from 'node:crypto'
+import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { basename, dirname, resolve } from 'node:path'
 import type { DurableCodexBilling } from '@openclaude/protocol'
@@ -28,6 +28,9 @@ import {
   listAutoDreamAuditSessions,
   listAutoDreamSuccessfulSessionsBetween,
   getMemoryUsageDashboard,
+  getSessionsDb,
+  isMemoryExpired,
+  memoryCalendarDate,
   recordMemoryUsageEvent,
   updateAgentsConfig,
   isMarketplacePersonaTarget,
@@ -388,7 +391,61 @@ export async function handleMemory(
     // GET 前懒迁移:把旧 blob 版 MEMORY.md 拆成 memdir(幂等,锁内)。
     await md.ensureMigrated()
     // reconcileIndex 锁内双向对账后返回索引文本;list 逐文件解析 frontmatter。
-    const [text, files] = await Promise.all([md.reconcileIndex(), md.list()])
+    const [text, rawFiles] = await Promise.all([md.reconcileIndex(), md.list()])
+    const today = memoryCalendarDate()
+    // Fail-open 30d core_read hit counts from memory_usage_events.
+    let hmacKey: string | null = null
+    const hitByHash = new Map<string, number>()
+    try {
+      const db = await getSessionsDb()
+      const keyRow = db.prepare("SELECT value FROM memory_usage_kv WHERE key='hmac_key'").get() as
+        | { value?: string }
+        | undefined
+      if (keyRow?.value && /^[0-9a-f]{64}$/.test(keyRow.value)) {
+        hmacKey = keyRow.value
+        const sinceMs = Date.now() - 30 * 86_400_000
+        const rows = db
+          .prepare(
+            `SELECT top_match_hash AS h, COUNT(*) AS cnt
+               FROM memory_usage_events
+              WHERE agent_id = ? AND operation = 'core_read' AND outcome = 'success'
+                AND timestamp >= ? AND top_match_hash IS NOT NULL
+              GROUP BY top_match_hash`,
+          )
+          .all(agentId, sinceMs) as Array<{ h?: string; cnt?: number }>
+        for (const r of rows) {
+          if (typeof r.h === 'string') hitByHash.set(r.h, Number(r.cnt ?? 0))
+        }
+      }
+    } catch {
+      // fail-open
+    }
+    const files = await Promise.all(
+      rawFiles.map(async (f) => {
+        let bytes = 0
+        try {
+          const st = await stat(paths.agentMemoryFile(agentId, f.file))
+          bytes = st.size
+        } catch {
+          // fail-open
+        }
+        let hitCount30d = 0
+        if (hmacKey) {
+          const h1 = createHmac('sha256', hmacKey).update(f.file.normalize('NFKC').trim()).digest('hex')
+          const h2 = createHmac('sha256', hmacKey).update(`memory/${f.file}`.normalize('NFKC').trim()).digest('hex')
+          hitCount30d = (hitByHash.get(h1) ?? 0) + (hitByHash.get(h2) ?? 0)
+        }
+        const expiresAt = f.expires ?? null
+        const expired = Boolean(f.expires && isMemoryExpired(f.expires, today))
+        return {
+          ...f,
+          bytes,
+          expiresAt,
+          expired,
+          hitCount30d,
+        }
+      }),
+    )
     this.sendJson(res, 200, {
       kind: 'index',
       // text 保留兼容:UI 可直接展示索引原文(只读折叠预览)。

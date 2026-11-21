@@ -218,6 +218,70 @@ export type ContextRebuiltWire = {
   reason?: "engine-switch" | "native-resume-loss";
 } & WireRuntimeFields;
 
+export type ContextPressureBreakdown = {
+  systemBytes?: number;
+  memoryBytes?: number;
+  skillsBytes?: number;
+  projectBytes?: number;
+  historyBytes?: number;
+  toolsBytes?: number;
+};
+
+/** 实时上下文窗口水位/压力观察帧（OCV5-840）。向后兼容：所有新增字段均可选。 */
+export type SessionContextPressureWire = {
+  type: "session.context_pressure";
+  sessionKey?: string;
+  channel?: string;
+  peer?: Peer;
+  agentId?: string;
+  engine: string;
+  scope: "launch_prompt" | "native_context";
+  dimension: "transport_bytes" | "tokens";
+  level: "warning" | "critical";
+  usedRatio: number;
+  usedTokens?: number;
+  windowTokens?: number;
+  breakdown?: ContextPressureBreakdown;
+} & WireRuntimeFields;
+
+/** 上下文压缩完成回执帧（OCV5-840）。向后兼容：策略与明细字段均可选。 */
+export type SysContextCompactedWire = {
+  type: "sys.context_compacted";
+  sessionKey?: string;
+  sessionId?: string;
+  channel?: string;
+  peer?: Peer;
+  agentId?: string;
+  engine?: string;
+  scope?: "launch_prompt" | "native_context";
+  strategy?: "history_suffix" | "file_reference" | "native_summary" | "checkpoint_reset" | string;
+  beforeBytes?: number;
+  afterBytes?: number;
+  droppedEntries?: number;
+  beforeTokens?: number;
+  afterTokens?: number;
+  summaryPreview?: string;
+  requestId?: string;
+} & WireRuntimeFields;
+
+/** 手动压缩控制帧回执（对应 control.session.compact）。 */
+export type OutboundSessionCompactResultWire = {
+  type: "outbound.session_compact_result";
+  sessionKey: string;
+  sessionId?: string;
+  peer?: Peer;
+  requestId?: string;
+  ok: boolean;
+  supported: boolean;
+  strategy?: string;
+  beforeTokens?: number;
+  afterTokens?: number;
+  beforeBytes?: number;
+  afterBytes?: number;
+  summaryPreview?: string;
+  error?: string;
+} & WireRuntimeFields;
+
 export type GoalSnapshotWire = {
   type: "sys.goal_snapshot";
   goal: GoalStateSnapshot;
@@ -385,6 +449,9 @@ export type OutboundWire =
   | RelayReadyWire
   | FrontendBuildWire
   | ContextRebuiltWire
+  | SessionContextPressureWire
+  | SysContextCompactedWire
+  | OutboundSessionCompactResultWire
   | GoalSnapshotWire
   | IncidentWire
   | MuseResultWire
@@ -448,6 +515,15 @@ export type InboundRepoUnbindWire = {
   selectionVersion: number;
 };
 
+/** 手动压缩会话上下文控制帧（client→gateway）。 */
+export type ControlSessionCompactWire = {
+  type: "control.session.compact";
+  sessionKey?: string;
+  sessionId?: string;
+  instructions?: string;
+  requestId?: string;
+};
+
 export type InboundWire =
   | InboundMessage
   | InboundControlStop
@@ -456,7 +532,8 @@ export type InboundWire =
   | InboundHelloWire
   | InboundPingWire
   | InboundRepoBindWire
-  | InboundRepoUnbindWire;
+  | InboundRepoUnbindWire
+  | ControlSessionCompactWire;
 
 // ─── narrowing 守卫（onmessage 分发用）────────────────────────────────
 export function isOutboundFrame(f: unknown): f is OutboundWire {

@@ -127,9 +127,32 @@ const CURRENT_HTTP_DISPATCH: Record<string, LegacyGroup> = {
     // OpenViking B1 façade view (gateway-only), right after memory/usage.
     const memoryContext = { id: '/api/agents/:1/memory/context', line: 0, calls: ['handleMemoryContext', 'sendInternalError'],
       match: (_req: { method?: string }, url: URL) => /^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/context$/.test(url.pathname) }
+    // OCV5-840: Context governance control-plane routes right after memory/context.
+    const agentContextGovRoutes = [
+      { id: '/api/agents/:1/memory/archive/restore', line: 0, calls: ['handleAgentMemoryArchiveRestore'],
+        match: (_req: { method?: string }, url: URL) => /^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/archive\/restore$/.test(url.pathname) },
+      { id: '/api/agents/:1/memory/archive', line: 0, calls: ['handleAgentMemoryArchive'],
+        match: (_req: { method?: string }, url: URL) => /^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/archive$/.test(url.pathname) },
+      { id: '/api/agents/:1/context-health', line: 0, calls: ['handleAgentContextHealth'],
+        match: (_req: { method?: string }, url: URL) => /^\/api\/agents\/([a-zA-Z0-9_-]+)\/context-health$/.test(url.pathname) },
+      { id: '/api/agents/:1/context-hygiene/run', line: 0, calls: ['handleAgentContextHygieneRun'],
+        match: (_req: { method?: string }, url: URL) => /^\/api\/agents\/([a-zA-Z0-9_-]+)\/context-hygiene\/run$/.test(url.pathname) },
+      { id: '/api/agents/:1/context-hygiene/history', line: 0, calls: ['handleAgentContextHygieneHistory'],
+        match: (_req: { method?: string }, url: URL) => /^\/api\/agents\/([a-zA-Z0-9_-]+)\/context-hygiene\/history$/.test(url.pathname) },
+    ]
+    const withAgentGov = [...withBrowser.slice(0, at), memoryContext, ...agentContextGovRoutes, ...withBrowser.slice(at)]
+    const afterSkills = withAgentGov.findIndex((r) => r.id === '/api/skills') + 1
+    const skillArchiveRoutes = [
+      { id: '/api/skills/archive', line: 0, calls: ['handleSkillsArchiveList'],
+        match: (_req: { method?: string }, url: URL) => url.pathname === '/api/skills/archive' },
+      { id: '/api/skills/archive/restore', line: 0, calls: ['handleSkillsArchiveRestore'],
+        match: (_req: { method?: string }, url: URL) => url.pathname === '/api/skills/archive/restore' },
+      { id: '/api/skills/:1/archive', line: 0, calls: ['handleSkillArchiveItem'],
+        match: (_req: { method?: string }, url: URL) => /^\/api\/skills\/([a-z0-9-]+)\/archive$/.test(url.pathname) },
+    ]
     return {
       ...agents,
-      routes: [...withBrowser.slice(0, at), memoryContext, ...withBrowser.slice(at)],
+      routes: [...withAgentGov.slice(0, afterSkills), ...skillArchiveRoutes, ...withAgentGov.slice(afterSkills)],
       samples: [
         ...agents.samples,
         '/api/agents/a/browser/live',
@@ -138,6 +161,14 @@ const CURRENT_HTTP_DISPATCH: Record<string, LegacyGroup> = {
         '/api/agents/aaa/browser/action',
         '/api/agents/a/memory/context',
         '/api/agents/aaa/memory/context',
+        '/api/agents/a/memory/archive/restore',
+        '/api/agents/a/memory/archive',
+        '/api/agents/a/context-health',
+        '/api/agents/a/context-hygiene/run',
+        '/api/agents/a/context-hygiene/history',
+        '/api/skills/archive',
+        '/api/skills/archive/restore',
+        '/api/skills/demo-skill/archive',
       ],
     }
   })(),

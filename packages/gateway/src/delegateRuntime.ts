@@ -6,7 +6,8 @@
  * `this.x` reads/writes are unchanged. DelegateRuntimeHost lists exactly the Gateway members this code
  * touches (typed from the class itself).
  */
-import { fetchIdentityCompatProjection } from '@openclaude/storage'
+import { fetchIdentityCompatProjection, paths as storagePaths } from '@openclaude/storage'
+import { offloadPayloadIfOversized } from './payloadOffloadGate.js'
 import { resolveIdentityCompat, assertIdentityCompatReady } from '@openclaude/protocol'
 import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
@@ -953,6 +954,31 @@ export async function handleDelegateTask(
   }
 }
 
+export const SYNC_DELEGATE_INLINE_MAX_CHARS = 12_000
+
+export function boundSyncDelegateOutput(
+  output: string,
+  opts?: { targetAgentId?: string; sessionKey?: string; workspaceDir?: string },
+): { output: string; artifactPath?: string; offloaded: boolean } {
+  if (output.length <= SYNC_DELEGATE_INLINE_MAX_CHARS) {
+    return { output, offloaded: false }
+  }
+  const gated = offloadPayloadIfOversized({
+    workspaceDir: opts?.workspaceDir ?? join(storagePaths.home, 'workspace', 'delegate-artifacts'),
+    sessionKey: opts?.sessionKey,
+    sessionId: opts?.sessionKey,
+    category: `delegate-${opts?.targetAgentId ?? 'worker'}`,
+    label: opts?.targetAgentId ? `delegate:${opts.targetAgentId}` : 'delegate',
+    content: output,
+    inlineMaxChars: SYNC_DELEGATE_INLINE_MAX_CHARS,
+  })
+  return {
+    output: gated.text,
+    ...(gated.artifactPath ? { artifactPath: gated.artifactPath } : {}),
+    offloaded: gated.offloaded,
+  }
+}
+
 export function _delegateResultToHttp(
   this: DelegateRuntimeHost,
   result: DelegateTaskResult,
@@ -980,12 +1006,17 @@ export function _delegateResultToHttp(
       },
     }
   }
+  const bounded = boundSyncDelegateOutput(result.output, {
+    targetAgentId,
+    sessionKey: result.sessionKey,
+  })
   return {
     httpStatus: 200,
     body: {
       ok: result.ok,
       agentId: targetAgentId,
-      output: result.output,
+      output: bounded.output,
+      ...(bounded.artifactPath ? { artifactPath: bounded.artifactPath } : {}),
       error: result.error || undefined,
       ...(result.sessionKey ? { sessionKey: result.sessionKey } : {}),
     },

@@ -10,7 +10,23 @@ import { type PreheatPreparation, reserveUnusedPreheat, armUnusedPreheat, consum
  */
 import { existsSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { join } from 'node:path'
-import { paths } from '@openclaude/storage'
+import { getEngineContextMessages, paths } from '@openclaude/storage'
+import {
+  estimateModelHistoryTokens,
+  modelHistoryRoleLabel,
+  modelHistorySemanticText,
+  projectModelHistoryForReplay,
+} from '@openclaude/protocol'
+import { cleanupSessionArtifacts, safeSliceHead } from './payloadOffloadGate.js'
+import { contextCompactionsTotal } from './metrics.js'
+import {
+  clearPendingCheckpoint,
+  isSessionCompacting,
+  markSessionCompacting,
+  peekPendingCheckpoint,
+  savePendingCheckpoint,
+  unmarkSessionCompacting,
+} from './sessionCheckpointStore.js'
 import {
   abandonAllIdle,
   consumeIdleReset,
@@ -643,7 +659,28 @@ export async function destroySession(
   }
   // OCV5-755: a destroyed conversation must not inherit the old prompt snapshot.
   clearFrozenPrompt(paths.home, sessionKey)
-  if (s) cancelIdlePreExpiry(s)
+  if (s) {
+    cancelIdlePreExpiry(s)
+  }
+  clearPendingCheckpoint(sessionKey)
+  // OCV5-840 (B4): clean up ONLY artifacts and context references owned by this exact full sessionKey.
+  {
+    const candidateDirs = new Set<string>()
+    const peerFromKey = s?.peerId || sessionKey.split(':').slice(4).join(':')
+    if (peerFromKey) {
+      const slug = peerFromKey.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80)
+      if (slug) candidateDirs.add(join(paths.home, 'workspace', 'sessions', slug))
+    }
+    candidateDirs.add(join(paths.home, 'workspace', 'delegate-artifacts'))
+    candidateDirs.add(join(paths.home, 'workspace', 'web-context'))
+    const runnerCwd = (s?.runner as { cwd?: unknown } | undefined)?.cwd
+    if (typeof runnerCwd === 'string' && runnerCwd.trim()) {
+      candidateDirs.add(runnerCwd.trim())
+    }
+    for (const dir of candidateDirs) {
+      await cleanupSessionArtifacts(dir, sessionKey).catch(() => {})
+    }
+  }
   // Always clear resume-map (handles both live and evicted sessions)
   if (this._resumeMap.has(sessionKey)) {
     this._resumeMap.delete(sessionKey)
@@ -1059,6 +1096,386 @@ export async function prepareModelSwitch(
   } catch (error) {
     if (session._modelSwitchTransition === transition) session._modelSwitchTransition = undefined
     throw error
+  }
+}
+
+export interface SessionCompactOptions {
+  instructions?: string
+  requestId?: string
+  /** Optional test seam / override for loading persisted session history. */
+  loadHistoryMessages?: () => Promise<unknown[] | null>
+  /** Optional test seam / override for checkpoint persistence directory. */
+  checkpointDir?: string
+}
+
+export interface SessionCompactOutcome {
+  ok: boolean
+  supported: boolean
+  engine: string
+  strategy?: 'native_summary' | 'checkpoint_reset'
+  beforeTokens?: number
+  afterTokens?: number
+  beforeBytes?: number
+  afterBytes?: number
+  droppedEntries?: number
+  summaryPreview?: string
+  error?: string
+}
+
+const CHECKPOINT_MAX_CHARS = 8_000
+
+export { isSessionCompacting }
+
+/** Backward-compatible test/diagnostic helpers backed by durable checkpoint store (B7). */
+export function setPendingCheckpointSummary(session: AgentSession, summary: string): void {
+  const trimmed = summary.trim()
+  if (!trimmed) {
+    clearPendingCheckpoint(session.sessionKey)
+    return
+  }
+  savePendingCheckpoint(session.sessionKey, trimmed)
+}
+
+export function consumePendingCheckpointSummary(session: AgentSession): string | null {
+  const rec = peekPendingCheckpoint(session.sessionKey)
+  if (!rec) return null
+  clearPendingCheckpoint(session.sessionKey)
+  return rec.summary
+}
+
+export function peekPendingCheckpointSummary(session: AgentSession): string | null {
+  return peekPendingCheckpoint(session.sessionKey)?.summary ?? null
+}
+
+/** Build a bounded structured checkpoint summary (<=8K chars) from session history. */
+export function buildRollingCheckpointSummary(
+  messages: readonly unknown[],
+  instructions?: string,
+): {
+  summary: string
+  beforeBytes: number
+  afterBytes: number
+  beforeTokens: number
+  afterTokens: number
+  droppedEntries: number
+} {
+  const projected = projectModelHistoryForReplay(messages, { recentFullTurns: 2 })
+  let beforeBytes = 0
+  let beforeTokens = 0
+  for (const row of projected) {
+    const rawText = modelHistorySemanticText(row.raw) || row.text
+    beforeBytes += Buffer.byteLength(rawText, 'utf8')
+    beforeTokens += estimateModelHistoryTokens(rawText)
+  }
+  if (projected.length === 0) {
+    return {
+      summary: '',
+      beforeBytes: 0,
+      afterBytes: 0,
+      beforeTokens: 0,
+      afterTokens: 0,
+      droppedEntries: 0,
+    }
+  }
+  const userRows = projected.filter((r) => r.role === 'user')
+  const assistantRows = projected.filter((r) => r.role === 'assistant')
+  const goalOrPlanRows = projected.filter((r) => r.role === 'goal' || r.role === 'plan')
+  const recentTail = projected.slice(-6)
+  const keptSet = new Set<unknown>(recentTail.map((r) => r.raw))
+
+  const parts: string[] = [
+    '## Rolling Context Checkpoint',
+    ...(instructions?.trim() ? [`Focus: ${safeSliceHead(instructions.trim(), 240)}`] : []),
+  ]
+  if (userRows.length > 0) {
+    keptSet.add(userRows[0]!.raw)
+    parts.push('', '### Initial Goal / Request', safeSliceHead(userRows[0]!.text, 800))
+  }
+  if (goalOrPlanRows.length > 0) {
+    const latestPlan = goalOrPlanRows[goalOrPlanRows.length - 1]!
+    keptSet.add(latestPlan.raw)
+    parts.push('', '### Latest Plan / Goal', safeSliceHead(latestPlan.text, 1_000))
+  }
+  if (assistantRows.length > 1) {
+    const midAssistant = assistantRows[Math.max(0, assistantRows.length - 2)]!
+    if (!keptSet.has(midAssistant.raw)) {
+      keptSet.add(midAssistant.raw)
+      parts.push('', '### Prior Key Conclusion', safeSliceHead(midAssistant.text, 1_000))
+    }
+  }
+  parts.push('', '### Recent Exchanges')
+  for (const item of recentTail) {
+    parts.push(`- **${modelHistoryRoleLabel(item.role)}**: ${safeSliceHead(item.text, 900)}`)
+  }
+
+  let summary = parts.join('\n')
+  if (summary.length > CHECKPOINT_MAX_CHARS) {
+    summary = `${safeSliceHead(summary, CHECKPOINT_MAX_CHARS - 32)}\n… [checkpoint truncated]`
+  }
+  const afterBytes = Buffer.byteLength(summary, 'utf8')
+  const afterTokens = estimateModelHistoryTokens(summary)
+  const droppedEntries = Math.max(0, projected.length - keptSet.size)
+  return { summary, beforeBytes, afterBytes, beforeTokens, afterTokens, droppedEntries }
+}
+
+/**
+ * Unified cross-engine session compaction (OCV5-840 B3/B6/B7/B8):
+ * - Shared per-session compaction mutex + `session.lock` coordination (`try/finally` release).
+ * - Local CCB (only when `supportsNativeCompact === true` and no remote `executionBackend`):
+ *   real native `/compact` with strict completion confirmation (never treats `compacting` status
+ *   or an errored turn as success).
+ * - Local Codex (`supportsNativeCompact === true`, non-remote): direct JSON-RPC
+ *   `thread/compact/start` via `compactForHandoff()`.
+ * - Antigravity / Native Cursor / CursorSand / Remote Codex / Remote CCB:
+ *   zero-model-call Durable Rolling Checkpoint Reset (persist 0600 checkpoint BEFORE resetting
+ *   thread/resume handles; remote Codex uses non-terminal `restartForConfigChange()` /
+ *   `clearSessionId()` and NEVER calls terminal `shutdown()` that closes the remote lane).
+ */
+export async function compactSession(
+  this: SessionLifecycleHost,
+  session: AgentSession,
+  opts: SessionCompactOptions = {},
+): Promise<SessionCompactOutcome> {
+  const engine = session.providerTag || session.runner.engineId || 'unknown'
+  if (isSessionCompacting(session.sessionKey)) {
+    return { ok: false, supported: true, engine, error: 'SESSION_COMPACT_IN_PROGRESS' }
+  }
+  if (
+    (session._activeTurnCount ?? 0) > 0 ||
+    (session._activeClientTurnCount ?? 0) > 0 ||
+    (session._idleInternalTurns ?? 0) > 0
+  ) {
+    return { ok: false, supported: true, engine, error: 'SESSION_BUSY' }
+  }
+  if (!markSessionCompacting(session.sessionKey)) {
+    return { ok: false, supported: true, engine, error: 'SESSION_COMPACT_IN_PROGRESS' }
+  }
+  try {
+    const instructions = opts.instructions?.trim()
+    const runnerAny = session.runner as unknown as {
+      executionBackend?: { kind?: string }
+      restartForConfigChange?: () => Promise<void>
+    }
+    const isRemoteCodex =
+      engine === 'codex' &&
+      (runnerAny.executionBackend?.kind === 'codex-app-server-v1' ||
+        typeof runnerAny.restartForConfigChange === 'function')
+    const hasRemoteBackend = Boolean(runnerAny.executionBackend?.kind)
+
+    // 1. Local CCB native `/compact` (strictly local CCB with declared native compact support;
+    //    never CursorSand or remote CCB lacking billing/modelAuthority identity).
+    const isLocalCcbNativeSlash =
+      engine === 'ccb' &&
+      session.runner.capabilities.supportsNativeCompact === true &&
+      !hasRemoteBackend
+    if (isLocalCcbNativeSlash) {
+      const beforeTokens = session.totalInputTokens > 0 ? session.totalInputTokens : undefined
+      session._lastNativeCompactionSummary = undefined
+      let sawCompactedCompletion = false
+      let sawTurnError = false
+      const prompt = instructions
+        ? `/compact ${instructions}`
+        : '/compact preserve the user goal, decisions, constraints, current work, files, errors, and next steps'
+      await this.submit(
+        session,
+        prompt,
+        (e) => {
+          // B6: NEVER treat `turn_status === 'compacting'` progress or transport `file_reference`
+          // as native compaction completion! Only accept `strategy === 'native_summary'`.
+          if (e.kind === 'context_compacted' && e.compaction?.strategy === 'native_summary') {
+            sawCompactedCompletion = true
+          }
+          if (e.kind === 'error') sawTurnError = true
+        },
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { serviceTier: null, _internalCompact: true },
+      )
+      const summary = (session._lastNativeCompactionSummary as string | undefined)?.trim() ?? ''
+      if (sawTurnError || (!sawCompactedCompletion && !summary)) {
+        contextCompactionsTotal.inc({ engine, strategy: 'native_summary', outcome: 'unconfirmed' })
+        return {
+          ok: false,
+          supported: true,
+          engine,
+          strategy: 'native_summary',
+          error: 'COMPACTION_NOT_CONFIRMED',
+        }
+      }
+      const afterTokens = summary ? estimateModelHistoryTokens(summary) : undefined
+      const afterBytes = summary ? Buffer.byteLength(summary, 'utf8') : undefined
+      contextCompactionsTotal.inc({ engine, strategy: 'native_summary', outcome: 'ok' })
+      return {
+        ok: true,
+        supported: true,
+        engine,
+        strategy: 'native_summary',
+        ...(beforeTokens !== undefined ? { beforeTokens } : {}),
+        ...(afterTokens !== undefined ? { afterTokens } : {}),
+        ...(afterBytes !== undefined ? { afterBytes } : {}),
+        ...(summary ? { summaryPreview: safeSliceHead(summary, 280) } : {}),
+      }
+    }
+
+    // Non-CCB paths share `session.lock` with normal `submit()` (B3) so in-flight turns settle
+    // first and concurrent submits cannot race with history read + runner reset.
+    const prevLock = session.lock ?? Promise.resolve()
+    let releaseLock!: () => void
+    session.lock = new Promise<void>((r) => {
+      releaseLock = r
+    })
+    try {
+      await prevLock
+      if (
+        (session._activeTurnCount ?? 0) > 0 ||
+        (session._activeClientTurnCount ?? 0) > 0 ||
+        (session._idleInternalTurns ?? 0) > 0
+      ) {
+        return { ok: false, supported: true, engine, error: 'SESSION_BUSY' }
+      }
+
+      // 2. Codex Local: native JSON-RPC thread/compact/start
+      if (
+        engine === 'codex' &&
+        !isRemoteCodex &&
+        session.runner.capabilities.supportsNativeCompact === true &&
+        typeof session.runner.compactForHandoff === 'function'
+      ) {
+        const beforeTokens = session.totalInputTokens > 0 ? session.totalInputTokens : undefined
+        const artifact = await session.runner.compactForHandoff()
+        const summary = artifact?.summaryText?.trim() ?? ''
+        const afterTokens = summary ? estimateModelHistoryTokens(summary) : undefined
+        const afterBytes = summary ? Buffer.byteLength(summary, 'utf8') : undefined
+        contextCompactionsTotal.inc({ engine, strategy: 'native_summary', outcome: 'ok' })
+        return {
+          ok: true,
+          supported: true,
+          engine,
+          strategy: 'native_summary',
+          ...(beforeTokens !== undefined ? { beforeTokens } : {}),
+          ...(afterTokens !== undefined ? { afterTokens } : {}),
+          ...(afterBytes !== undefined ? { afterBytes } : {}),
+          ...(summary ? { summaryPreview: safeSliceHead(summary, 280) } : {}),
+        }
+      }
+
+      // 3. Antigravity / Native Cursor / CursorSand / Remote Codex / Remote CCB:
+      //    Zero-model-call Durable Rolling Checkpoint Reset (B6/B7/B8).
+      let messages: unknown[] | null
+      try {
+        if (opts.loadHistoryMessages) {
+          messages = await opts.loadHistoryMessages()
+        } else {
+          messages = await getEngineContextMessages(session.peerId, session.userId ?? 'default', {
+            engine,
+            currentUserText: '',
+          })
+        }
+      } catch (err) {
+        // B6: Never swallow history read errors as empty success, and never reset runner on error.
+        log.warn('checkpoint reset history load failed; aborting compaction', { sessionKey: session.sessionKey }, err)
+        return {
+          ok: false,
+          supported: true,
+          engine,
+          strategy: 'checkpoint_reset',
+          error: 'HISTORY_UNAVAILABLE',
+        }
+      }
+
+      if (messages === null || messages === undefined) {
+        return {
+          ok: false,
+          supported: true,
+          engine,
+          strategy: 'checkpoint_reset',
+          error: 'HISTORY_UNAVAILABLE',
+        }
+      }
+
+      const checkpoint = buildRollingCheckpointSummary(messages, instructions)
+      if (checkpoint.beforeBytes === 0) {
+        // B6: Distinguish unreadable/master-owned history from genuinely empty sessions;
+        // never fabricate ok:true or emit sys.context_compacted when nothing was compacted.
+        const likelyExternalHistory =
+          Boolean(session.ccbSessionId) ||
+          this._resumeMap.has(session.sessionKey) ||
+          (session.turns ?? 0) > 0
+        return {
+          ok: false,
+          supported: true,
+          engine,
+          strategy: 'checkpoint_reset',
+          error: likelyExternalHistory ? 'HISTORY_UNAVAILABLE' : 'NO_HISTORY_TO_COMPACT',
+        }
+      }
+
+      // B7: Persist durable checkpoint (0600) atomically BEFORE clearing native resume handles.
+      try {
+        savePendingCheckpoint(session.sessionKey, checkpoint.summary, {
+          instructions,
+          baseDir: opts.checkpointDir,
+        })
+      } catch (err) {
+        log.error('checkpoint reset failed to persist checkpoint; aborting reset', { sessionKey: session.sessionKey }, err)
+        return {
+          ok: false,
+          supported: true,
+          engine,
+          strategy: 'checkpoint_reset',
+          error: 'CHECKPOINT_PERSIST_FAILED',
+        }
+      }
+
+      // B8: Reset native runner handle safely.
+      // Remote Codex lanes MUST NOT call terminal `shutdown()` (which triggers `stopLane()`
+      // and causes `CODEX_LANE_CLOSED` on the next turn).
+      if (isRemoteCodex) {
+        if (typeof runnerAny.restartForConfigChange === 'function') {
+          await runnerAny.restartForConfigChange().catch(() => {})
+        }
+      } else if (session.runner.isRunning) {
+        await session.runner.shutdown().catch(() => {})
+      }
+
+      const key = session.sessionKey
+      this._resumeMap.delete(key)
+      this._resumeMapTimestamps.delete(key)
+      this._resumeMapProvider.delete(key)
+      this._resumeMapLastCost.delete(key)
+      this._resumeMapCostImprecise.delete(key)
+      this._resumeMapHistory.delete(key)
+      session.ccbSessionId = null
+      session.runner.clearSessionId?.()
+      this._saveResumeMap()
+      session._historicalContextInjected = false
+      session._historicalContextInjectedKey = undefined
+      session._forceHistoricalContextOnFirstTurn = true
+      session._contextRebuildNotice = undefined
+      contextCompactionsTotal.inc({ engine, strategy: 'checkpoint_reset', outcome: 'ok' })
+      return {
+        ok: true,
+        supported: true,
+        engine,
+        strategy: 'checkpoint_reset',
+        beforeBytes: checkpoint.beforeBytes,
+        afterBytes: checkpoint.afterBytes,
+        beforeTokens: checkpoint.beforeTokens,
+        afterTokens: checkpoint.afterTokens,
+        droppedEntries: checkpoint.droppedEntries,
+        summaryPreview: safeSliceHead(checkpoint.summary, 280),
+      }
+    } finally {
+      releaseLock()
+    }
+  } catch (err) {
+    contextCompactionsTotal.inc({ engine, strategy: 'failed', outcome: 'error' })
+    throw err
+  } finally {
+    unmarkSessionCompacting(session.sessionKey)
   }
 }
 

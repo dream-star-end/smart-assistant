@@ -20,7 +20,8 @@ import {
 import { LazyBoundary } from "./components/ChunkErrorBoundary";
 import type { AuthMode } from "./components/AuthGate";
 import { ChatHeader } from "./components/ChatHeader";
-import { applyIntelligentUiSnapshot, useInputPredictionEnabled } from "./lib/intelligentUi";
+import { applyIntelligentUiSnapshot } from "./lib/intelligentUi";
+import { findLastUserText, useContextCompactAction, useSessionInputPrediction } from "./hooks/useContextGovernance";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
 import { Composer, resetComposerAttachmentCache } from "./components/Composer";
 import { ComposerProjectPill } from "./components/ComposerProjectPill";
@@ -218,7 +219,6 @@ import { useAppNavigationActions } from "./hooks/useAppNavigationActions";
 import { useComposerSend } from "./hooks/useComposerSend";
 import { useSessionModelAndCollab } from "./hooks/useSessionModelAndCollab";
 
-type PredictInput = typeof import("./lib/inputPrediction").predictInput;
 import {
   IdentityRecoveryNotice, AccountSwitchNotice, AgentGate, AuthGate,
   RepoStatusBanner, ErrorBanner, UpdateBanner, BackgroundTurnBanner, TurnCostReminder, PinnedHudStack, AppDialogs,
@@ -1484,6 +1484,14 @@ export function App() {
     onSyncError: () => toast("操作已完成，页面显示暂未同步，请手动刷新。"),
   });
 
+  const { contextHealthOpen, setContextHealthOpen, handleCompactSession } = useContextCompactAction({
+    demo,
+    activeId,
+    wsSending,
+    chat,
+    toast,
+  });
+
   const {
     artifactInspect,
     cardCallbacks,
@@ -1504,6 +1512,7 @@ export function App() {
     chipsProjectName,
     communityBlogEnabled,
     demo,
+    onCompactSession: demo || !activeId ? undefined : () => void handleCompactSession(),
     loadExactUserMessage,
     messageFeedbackTriggerRef,
     newSession,
@@ -1544,45 +1553,9 @@ export function App() {
       ? messageReplyTarget.quote
       : null;
 
-  let lastUserText: string | undefined;
-  if (demo) {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === "user" && messages[i].content) {
-        lastUserText = messages[i].content;
-        break;
-      }
-    }
-  } else {
-    for (let i = wsMessages.length - 1; i >= 0; i--) {
-      const message = wsMessages[i];
-      if (message.role === "user" && message.status !== "queued" && message.text) {
-        lastUserText = message.text;
-        break;
-      }
-    }
-  }
-  // 输入预测(OCV5-375):回答末尾模型写的 next 块 → 输入框浅色预测;打字时按本会话说过的话补全。
-  // 设置里关掉时 master 也不再下发这段提示词。demo 不开。
-  // 解析器按需加载,不进首屏包(首屏只有输入框的补全和浮层);加载失败就没有预测。
-  const inputPredictionOn = useInputPredictionEnabled();
-  const [predictInput, setPredictInput] = useState<PredictInput | null>(null);
-  useEffect(() => {
-    if (demo || !inputPredictionOn || predictInput) return;
-    let alive = true;
-    void import("./lib/inputPrediction").then(
-      (m) => {
-        if (alive) setPredictInput(() => m.predictInput);
-      },
-      () => {},
-    );
-    return () => {
-      alive = false;
-    };
-  }, [demo, inputPredictionOn, predictInput]);
-  const inputPrediction = useMemo(
-    () => (demo || !inputPredictionOn || !predictInput ? null : predictInput(wsMessages)),
-    [demo, inputPredictionOn, predictInput, wsMessages],
-  );
+  const lastUserText = findLastUserText(demo, messages, wsMessages);
+  // 输入预测(OCV5-375):按需加载解析器,不进首屏包。
+  const inputPrediction = useSessionInputPrediction(demo, wsMessages);
   const timelineMessages = wsMessages.filter(
     (message) => message.role !== "user" || message.status !== "queued",
   );
@@ -2667,6 +2640,12 @@ export function App() {
             fontSize={composerPrefs.fontSize}
             goalOpenRequest={goalOpenNonce}
             onQuickAskCommand={gated ? undefined : (q) => setQuickAsk((s) => ({ ...s, open: true, mounted: true, seed: { text: q, nonce: ++quickAskSeedRef.current } }))}
+            contextPressure={demo ? null : (activeSess?._contextPressure ?? null)}
+            contextCompactBusy={Boolean(activeSess?._compactingManual || activeSess?._turnStatus === "compacting")}
+            hasActiveSession={Boolean(activeId && !demo)}
+            onCompactCommand={demo || gated || !activeId ? undefined : (ins) => void handleCompactSession(ins)}
+            onOpenContextHealth={demo || gated || !activeId ? undefined : () => setContextHealthOpen(true)}
+            onStartNewSession={demo ? undefined : handleNew}
             projectSlot={
               // 仍是未发首条的草稿时可改归属:包括被 GitHub/目标提前物化成空会话行的草稿。
               activeId && !sessions.some((x) => x.id === activeId && x.messageCount === 0 && !x.projectId) ? undefined : (
@@ -2888,6 +2867,9 @@ export function App() {
         selectModel={selectModel} liveTerminal={liveTerminal} sessionNeedsYou={sessionNeedsYou}
         unreadIds={unreadSessions.unreadIds} onMarkRead={unreadSessions.markRead}
         onOpenQuickAsk={gated ? undefined : () => setQuickAsk((s) => ({ ...s, open: true, mounted: true }))}
+        contextHealthOpen={contextHealthOpen}
+        onContextHealthOpenChange={setContextHealthOpen}
+        onCompactSession={demo || gated || !activeId ? undefined : () => void handleCompactSession()}
       />{tutorialOpen && (
         <LazyBoundary fallback={<DialogFallback />}>
           <TutorialCenter

@@ -26,6 +26,11 @@ import type {
   MemoryUsageDashboard,
   AutoDreamReportResponse,
   AutoDreamOptimizerState,
+  ArchivedMemoryEntry,
+  ArchivedSkillEntry,
+  ContextHealthReport,
+  ContextHygieneRunOptions,
+  ContextHygieneRunRecord,
   MemoryFileContent,
   PutMemoryFileResult,
   CommunityBlogPrecheck,
@@ -275,6 +280,127 @@ export const memorySkillsApi = {
     );
     return out.deleted ?? out.ok ?? true;
   },
+
+  // ── OCV5-840: 上下文健康体检、确定性清理与可逆归档箱 ────────────────────────
+
+  /** 常驻上下文健康体检报告（GET /api/agents/:id/context-health）。 */
+  getContextHealth: (a: AuthSession, agentId: string) =>
+    jsonOrThrow<ContextHealthReport>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/agents/${encodeURIComponent(agentId)}/context-health`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /**
+   * 立即执行一次确定性上下文体检/安全归档清理（POST /api/agents/:id/context-hygiene/run）。
+   * 支持 `pruneSkillHistoryNames` / `pruneArchivalIds` 精确选择集，避免误删未勾选项。
+   */
+  runContextHygiene: (a: AuthSession, agentId: string, options: ContextHygieneRunOptions = {}) => {
+    const body: ContextHygieneRunOptions = {
+      ...options,
+      ...(options.pruneSkillHistoryNames !== undefined
+        ? { pruneSkillHistoryNames: options.pruneSkillHistoryNames }
+        : {}),
+      ...(options.pruneArchivalIds !== undefined
+        ? { pruneArchivalIds: options.pruneArchivalIds }
+        : {}),
+    };
+    return jsonOrThrow<{ ok: boolean; run: ContextHygieneRunRecord }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/agents/${encodeURIComponent(agentId)}/context-hygiene/run`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(body),
+        }),
+      ),
+    );
+  },
+
+  /** 最近上下文清理回执列表（GET /api/agents/:id/context-hygiene/history）。 */
+  getContextHygieneHistory: (a: AuthSession, agentId: string, limit = 10) =>
+    jsonOrThrow<{ runs: ContextHygieneRunRecord[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(
+          `/api/agents/${encodeURIComponent(agentId)}/context-hygiene/history?limit=${Math.max(1, Math.min(50, Math.floor(limit)))}`,
+          { credentials: "include", headers: bearerHeaders(t) },
+        ),
+      ),
+    ),
+
+  /** 列出核心记忆归档箱（GET /api/agents/:id/memory/archive）。 */
+  listArchivedMemories: (a: AuthSession, agentId: string) =>
+    jsonOrThrow<{ items: ArchivedMemoryEntry[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/agents/${encodeURIComponent(agentId)}/memory/archive`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /** 批量安全归档核心记忆文件（POST /api/agents/:id/memory/archive）。 */
+  archiveMemoryFiles: (a: AuthSession, agentId: string, files: string[], reason?: string) =>
+    jsonOrThrow<{ ok: boolean; batchId: string; archived: ArchivedMemoryEntry[]; skipped: unknown[]; bytesSaved: number }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/agents/${encodeURIComponent(agentId)}/memory/archive`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ files, ...(reason ? { reason } : {}) }),
+        }),
+      ),
+    ),
+
+  /** 一键还原归档核心记忆（支持单条 id 或整批 batchId；POST /api/agents/:id/memory/archive/restore）。 */
+  restoreArchivedMemories: (a: AuthSession, agentId: string, opts: { id?: string; batchId?: string }) =>
+    jsonOrThrow<{ ok: boolean; restored: ArchivedMemoryEntry[]; skipped: unknown[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/agents/${encodeURIComponent(agentId)}/memory/archive/restore`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(opts),
+        }),
+      ),
+    ),
+
+  /** 列出技能归档箱（GET /api/skills/archive）。 */
+  listArchivedSkills: (a: AuthSession) =>
+    jsonOrThrow<{ items: ArchivedSkillEntry[] }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/skills/archive", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ),
+
+  /** 将指定用户技能移入可逆归档箱（POST /api/skills/:name/archive）。 */
+  archiveSkill: (a: AuthSession, name: string, reason?: string) =>
+    jsonOrThrow<{ ok: boolean; batchId: string; entry?: ArchivedSkillEntry; skippedReason?: string }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/skills/${encodeURIComponent(name)}/archive`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(reason ? { reason } : {}),
+        }),
+      ),
+    ),
+
+  /** 一键还原归档技能（支持单条 id/name 或整批 batchId；POST /api/skills/archive/restore）。 */
+  restoreArchivedSkills: (a: AuthSession, opts: { id?: string; name?: string; batchId?: string }) =>
+    jsonOrThrow<{ ok: boolean; restored: ArchivedSkillEntry[]; skipped: unknown[] }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/skills/archive/restore", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(opts),
+        }),
+      ),
+    ),
 
   /** 定时任务列表（GET /api/cron）。 */
   listCron: (a: AuthSession, q?: { boardProjectId?: string }) => {

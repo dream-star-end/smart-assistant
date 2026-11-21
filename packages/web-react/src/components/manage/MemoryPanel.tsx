@@ -1,4 +1,5 @@
 import {
+  Archive,
   BarChart3,
   Bookmark,
   Bot,
@@ -15,7 +16,7 @@ import {
   Trash2,
   User,
 } from "lucide-react";
-import { type ReactNode, useCallback, useEffect, useId, useState } from "react";
+import { lazy, type ReactNode, Suspense, useCallback, useEffect, useId, useMemo, useState } from "react";
 import { ApiError, api, apiErrorMessage } from "../../lib/api";
 import { useMdViewport } from "../../hooks/useMdViewport";
 import { useProjectScope } from "../../hooks/useProjectScope";
@@ -26,6 +27,7 @@ import type {
   AutoDreamLastReport,
   AutoDreamMemoryChange,
   AutoDreamReportResponse,
+  ContextHealthReport,
   MemoryFileMeta,
   MemoryContextRead,
   MemoryContextView,
@@ -33,11 +35,23 @@ import type {
   MemoryUsageDashboard,
 } from "../../lib/types";
 import { formatBytes } from "../../lib/chat/download";
-import { type AutoDreamFeatureView, extractAutoDreamFeature } from "../../lib/modelPreferences";
 import { cn } from "../../lib/utils";
 import { AgentProjectPreview } from "./AgentProjectPreview";
 import { IdentityManual, useIdentityManualAuthority } from "./IdentityManual";
+import {
+  AutoDreamToggleRow,
+  ContextHealthSummaryCard,
+  DeprecatedProjectMemoryDisclosure,
+} from "./MemoryContextHealthCard";
 import { ProjectAssetsManagePanel } from "./ProjectAssetsManagePanel";
+
+// OCV5-840: 重交互瘦身向导与归档箱独立分块，按需懒加载（零首屏开销）。
+const ContextSlimModal = lazy(() =>
+  import("./ContextSlimModal").then((m) => ({ default: m.ContextSlimModal })),
+);
+const ContextArchiveDrawer = lazy(() =>
+  import("./ContextArchiveDrawer").then((m) => ({ default: m.ContextArchiveDrawer })),
+);
 import {
   Alert,
   Badge,
@@ -446,6 +460,7 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
               </ListGroup>
             </>
           )}
+          <DeprecatedProjectMemoryDisclosure auth={auth} projectId={projectId} onRestored={reload} />
         </>
       )}
       {confirmEl}
@@ -881,6 +896,11 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
   const [index, setIndex] = useState<MemoryIndexResponse | null>(null);
   const [dream, setDream] = useState<AutoDreamReportResponse | null>(null);
   const [dreamLoading, setDreamLoading] = useState(true);
+  const [health, setHealth] = useState<ContextHealthReport | null>(null);
+  const [slimOpen, setSlimOpen] = useState(false);
+  const [archiveOpen, setArchiveOpen] = useState(false);
+  const [sortBy, setSortBy] = useState<"recent" | "size" | "expiring">("recent");
+  const [archivingFile, setArchivingFile] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [coldStart, setColdStart] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -936,7 +956,60 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
     };
   }, [auth, agentId, reloadKey]);
 
-  const files = index?.files ?? [];
+  // OCV5-840: 常驻上下文健康体检（fail-soft，旧容器或未启用时静默不阻断核心记忆）。
+  useEffect(() => {
+    void reloadKey;
+    if (typeof api.getContextHealth !== "function") return;
+    let alive = true;
+    api
+      .getContextHealth(auth, agentId)
+      .then((report) => {
+        if (alive && report && typeof report === "object" && "summary" in report) {
+          setHealth(report);
+        }
+      })
+      .catch(() => {
+        if (alive) setHealth(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [auth, agentId, reloadKey]);
+
+  const archiveSingleFile = useCallback(
+    async (file: MemoryFileMeta) => {
+      if (archivingFile || typeof api.archiveMemoryFiles !== "function") return;
+      setArchivingFile(file.file);
+      try {
+        await api.archiveMemoryFiles(auth, agentId, [file.file], "manual_archive");
+        toast(`已归档「${file.name?.trim() || file.file.replace(/\.md$/i, "")}」，随时可在归档箱还原`, "success");
+        reload();
+      } catch (e) {
+        toast(apiErrorMessage(e, "归档失败"), "error");
+      } finally {
+        setArchivingFile(null);
+      }
+    },
+    [archivingFile, auth, agentId, reload, toast],
+  );
+
+  const files = useMemo(() => {
+    const raw = index?.files ?? [];
+    if (sortBy === "recent") return raw;
+    const copy = [...raw];
+    if (sortBy === "size") {
+      copy.sort((a, b) => (b.bytes ?? b.size ?? 0) - (a.bytes ?? a.size ?? 0));
+    } else if (sortBy === "expiring") {
+      copy.sort((a, b) => {
+        const ae = a.expired ? 0 : a.expiresAt ? 1 : 2;
+        const be = b.expired ? 0 : b.expiresAt ? 1 : 2;
+        if (ae !== be) return ae - be;
+        if (a.expiresAt && b.expiresAt) return a.expiresAt.localeCompare(b.expiresAt);
+        return b.mtimeMs - a.mtimeMs;
+      });
+    }
+    return copy;
+  }, [index?.files, sortBy]);
   const indexText = (index?.text ?? "").trim();
   const q = query.trim().toLowerCase();
   const filtered = q
@@ -945,7 +1018,7 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
       )
     : files;
   const dense = files.length > LIST_DENSE_THRESHOLD;
-  const groups = dense ? groupByType(filtered) : [{ key: "all", label: "", items: filtered }];
+  const groups = dense && sortBy === "recent" ? groupByType(filtered) : [{ key: "all", label: "", items: filtered }];
   // 整表加载失败时不并排渲染空列表 —— "报错 + 暂无核心记忆"会让人以为记忆被清空了。
   const failedCold = Boolean(err) && !index;
 
@@ -971,11 +1044,20 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
         </Alert>
       )}
 
+      {/* OCV5-840: 常驻上下文健康体检卡（fail-soft，拿到 report 才渲染）。 */}
+      {health && (
+        <ContextHealthSummaryCard
+          report={health}
+          onOpenSlim={() => setSlimOpen(true)}
+          onOpenArchive={() => setArchiveOpen(true)}
+        />
+      )}
+
       {/* 梦境卡只在「有报告」或「正在整理」时出现 —— 没有报告时不渲染一张"还没有整理过"的卡,
           空记忆因此只剩一个空态(第 4 轮 §7)。占位只在列表已经出来、梦境还在路上时给:
           列表还在加载时它自己的骨架已经说明"在加载",再叠一块骨架只会多一次跳动;
           空记忆时占位会落在空态上方,读起来像第二个空态。 */}
-      <AutoDreamToggleRow auth={auth} onChanged={reload} />
+      <AutoDreamToggleRow auth={auth} agentId={agentId} recentHygieneRuns={health?.recentRuns} onChanged={reload} />
 
       {dreamLoading ? (
         !loading && files.length > 0 ? (
@@ -1021,18 +1103,34 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
             hint="该智能体自己的观察与经验，按智能体分别保存。"
             hideHintOnMobile
             action={
-              // 窄屏只写「新建」(+ 图标已说明动作),可访问名仍是「新建记忆」。
-              <Button
-                variant="secondary"
-                size="sm"
-                className="oc-btn-tactile oc-btn-secondary-craft gap-1.5 px-3"
-                onClick={() => setCreating(true)}
-              >
-                <Plus size={15} strokeWidth={1.9} aria-hidden="true" />
-                <span>
-                  新建<span className="max-md:sr-only">记忆</span>
-                </span>
-              </Button>
+              <div className="flex items-center gap-2">
+                {files.length > 1 && (
+                  <InlineSelect
+                    aria-label="记忆排序方式"
+                    value={sortBy}
+                    onValueChange={(v) =>
+                      setSortBy(v === "size" ? "size" : v === "expiring" ? "expiring" : "recent")
+                    }
+                    options={[
+                      { value: "recent", label: "最近更新" },
+                      { value: "size", label: "体积最大" },
+                      { value: "expiring", label: "即将过期" },
+                    ]}
+                  />
+                )}
+                {/* 窄屏只写「新建」(+ 图标已说明动作),可访问名仍是「新建记忆」。 */}
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="oc-btn-tactile oc-btn-secondary-craft gap-1.5 px-3"
+                  onClick={() => setCreating(true)}
+                >
+                  <Plus size={15} strokeWidth={1.9} aria-hidden="true" />
+                  <span>
+                    新建<span className="max-md:sr-only">记忆</span>
+                  </span>
+                </Button>
+              </div>
             }
           />
 
@@ -1094,6 +1192,8 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
                       file={f}
                       // 已按类型分组时,组标题就是类型 —— 行面的元信息不再重复它。
                       showType={!g.label}
+                      archiving={archivingFile === f.file}
+                      onArchive={health ? () => void archiveSingleFile(f) : undefined}
                       onOpen={() => setEditing(f)}
                     />
                   ))}
@@ -1138,6 +1238,31 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
             toast("记忆已创建", "success");
           }}
         />
+      )}
+      {slimOpen && (
+        <Suspense fallback={null}>
+          <ContextSlimModal
+            open={slimOpen}
+            onOpenChange={setSlimOpen}
+            auth={auth}
+            agentId={agentId}
+            report={health}
+            onSlimmed={reload}
+            onOpenArchive={() => setArchiveOpen(true)}
+          />
+        </Suspense>
+      )}
+      {archiveOpen && (
+        <Suspense fallback={null}>
+          <ContextArchiveDrawer
+            open={archiveOpen}
+            onOpenChange={setArchiveOpen}
+            auth={auth}
+            agentId={agentId}
+            initialTab="memory"
+            onRestored={reload}
+          />
+        </Suspense>
       )}
     </div>
   );
@@ -1311,91 +1436,6 @@ function Disclosure({
         </section>
       )}
     </div>
-  );
-}
-
-/** 自动新增记忆的保留天数（storage AUTO_MEMORY_TTL_DAYS）。 */
-const AUTO_MEMORY_TTL_DAYS = 30;
-
-/**
- * 自动整理记忆开关（OCV5-392）：只新增的后台整理（legacy_memory_v1）。
- * 只给能用的账号（订阅够、模型在线）和已经开着的账号显示；读偏好失败时不渲染，
- * 不阻断记忆列表。开 = 同时收回遗留的「全面优化」授权（后端 normalizeAutoDreamPreferencePatch）。
- */
-function AutoDreamToggleRow({ auth, onChanged }: { auth: AuthSession; onChanged: () => void }) {
-  const [feature, setFeature] = useState<AutoDreamFeatureView | null>(null);
-  const [saving, setSaving] = useState(false);
-  const toast = useToast();
-
-  useEffect(() => {
-    let alive = true;
-    api
-      .getPreferences(auth)
-      .then((snap) => {
-        if (alive) setFeature(extractAutoDreamFeature(snap));
-      })
-      .catch(() => {
-        if (alive) setFeature(null);
-      });
-    return () => {
-      alive = false;
-    };
-  }, [auth]);
-
-  if (!feature) return null;
-  const on = feature.legacy_enabled === true;
-  if (!on && !(feature.eligible && feature.available)) return null;
-
-  return (
-    <section
-      aria-label="自动整理记忆"
-      className="oc-surface-card flex items-start justify-between gap-4 rounded-xl px-4 py-3.5"
-    >
-      <div className="flex min-w-0 items-start gap-3">
-        <span
-          className={cn(
-            "oc-icon-badge mt-0.5 size-8 shrink-0 rounded-lg",
-            on && "oc-icon-badge-accent",
-          )}
-          aria-hidden="true"
-        >
-          <Sparkles size={15} strokeWidth={1.75} />
-        </span>
-        <div className="min-w-0">
-          <h4 className="text-section font-semibold leading-5 tracking-tight text-fg">自动整理记忆</h4>
-          <p className="mt-1 max-w-[68ch] text-body tabular-nums text-muted">
-            每 {feature.min_interval_hours} 小时最多一次，累计 {feature.min_new_sessions}{" "}
-            个新会话后，在后台从近期对话里提炼值得长期保留的信息。只新增，不改、不删已有记忆；自动新增的记忆保留{" "}
-            {AUTO_MEMORY_TTL_DAYS} 天。按实际用量扣积分。
-          </p>
-          {on && !feature.effective && (
-            <p className="mt-1.5 flex items-center gap-1.5 text-meta text-warning">
-              <StatusDot tone="warning" />
-              <span>当前暂不可用，整理已安全暂停。</span>
-            </p>
-          )}
-        </div>
-      </div>
-      <Switch
-        aria-label="自动整理记忆"
-        className="mt-0.5 shrink-0"
-        checked={on}
-        disabled={saving}
-        onCheckedChange={async (checked) => {
-          setSaving(true);
-          try {
-            const snap = await api.patchPreferences(auth, { auto_dream_enabled: checked });
-            setFeature(extractAutoDreamFeature(snap));
-            toast(checked ? "已开启自动整理记忆" : "已关闭自动整理记忆", "success");
-            onChanged();
-          } catch (e) {
-            toast(apiErrorMessage(e, checked ? "开启失败" : "关闭失败"), "error");
-          } finally {
-            setSaving(false);
-          }
-        }}
-      />
-    </section>
   );
 }
 
@@ -1602,22 +1642,27 @@ function memoryTypeVisual(type: string) {
 function MemoryFileCard({
   file,
   showType = true,
+  archiving = false,
+  onArchive,
   onOpen,
 }: {
   file: MemoryFileMeta;
   showType?: boolean;
+  archiving?: boolean;
+  onArchive?: () => void;
   onOpen: () => void;
 }) {
   const typeMeta = TYPE_META[file.type] ?? { label: file.type || "记忆", tone: "neutral" as const };
   const { Icon, badgeClass } = memoryTypeVisual(file.type);
   const title = file.name?.trim() || file.file.replace(/\.md$/i, "");
+  const fileBytes = typeof file.bytes === "number" ? file.bytes : file.size;
   return (
     // 分组容器里的一行:整行可点,左侧类型图标徽章 + 清晰内容层次 + 悬停微动效箭头。
-    <ListRow className="p-0">
+    <ListRow className="flex items-center p-0">
       <button
         type="button"
         onClick={onOpen}
-        className="group flex w-full items-start gap-3 px-4 py-3 text-left outline-none transition-colors duration-150 hover:bg-hover/80 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+        className="group flex min-w-0 flex-1 items-start gap-3 px-4 py-3 text-left outline-none transition-colors duration-150 hover:bg-hover/80 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11"
       >
         <span
           className={cn("oc-icon-badge mt-0.5 size-7 shrink-0 rounded-lg", badgeClass)}
@@ -1643,6 +1688,17 @@ function MemoryFileCard({
                 {typeMeta.label}
               </Badge>
             )}
+            {file.expired && (
+              <Badge tone="warning" size="sm" className="oc-badge-craft">
+                已过期
+              </Badge>
+            )}
+            {typeof fileBytes === "number" && fileBytes > 0 && (
+              <span className="tabular-nums">{formatBytes(fileBytes)}</span>
+            )}
+            {typeof file.hitCount30d === "number" && (
+              <span className="tabular-nums">近30天命中 {file.hitCount30d} 次</span>
+            )}
             <span>
               更新于 <TimeAgo value={file.mtimeMs} className="text-meta text-faint" />
             </span>
@@ -1655,6 +1711,23 @@ function MemoryFileCard({
           className="mt-1 shrink-0 text-faint transition-transform duration-150 group-hover:translate-x-0.5 group-hover:text-fg"
         />
       </button>
+      {onArchive && (
+        <div className="pr-2">
+          <IconButton
+            size="sm"
+            aria-label={`归档 ${title}`}
+            title="移入归档箱（随时可还原）"
+            disabled={archiving}
+            className="oc-icon-btn-tactile shrink-0 text-faint hover:text-fg"
+            onClick={(e) => {
+              e.stopPropagation();
+              onArchive();
+            }}
+          >
+            {archiving ? <Spinner size={13} /> : <Archive size={14} strokeWidth={1.75} aria-hidden="true" />}
+          </IconButton>
+        </div>
+      )}
     </ListRow>
   );
 }

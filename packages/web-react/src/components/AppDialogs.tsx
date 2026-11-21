@@ -52,6 +52,10 @@ const ProjectArchiveDialog = lazy(() =>
 const CommandPalette = lazy(() =>
   import("./CommandPalette").then((m) => ({ default: m.CommandPalette })),
 );
+// OCV5-840: 上下文健康与一键瘦身弹层，按需懒加载（零首屏开销）。
+const ContextHealthPopover = lazy(() =>
+  import("./chat/ContextHealthPopover").then((m) => ({ default: m.ContextHealthPopover })),
+);
 
 // P5b「记住这条 / 存为项目技能」弹窗：点了才下载（带 lib/taskboard）。
 const SaveToProjectDialog = lazy(() =>
@@ -235,6 +239,9 @@ export type AppDialogsProps = {
   unreadIds?: ReadonlySet<string>;
   onMarkRead?: (id: string) => void;
   onOpenQuickAsk?: () => void;
+  contextHealthOpen?: boolean;
+  onContextHealthOpenChange?: (open: boolean) => void;
+  onCompactSession?: () => void;
 };
 
 export function AppDialogs({
@@ -371,6 +378,9 @@ export function AppDialogs({
   unreadIds,
   onMarkRead,
   onOpenQuickAsk,
+  contextHealthOpen,
+  onContextHealthOpenChange,
+  onCompactSession,
 }: AppDialogsProps) {
   const mediaAuthEpoch = auth?.snapshot().epoch;
   return (
@@ -558,6 +568,22 @@ export function AppDialogs({
             onSelectModel={selectModel}
             onOpenManage={demo ? undefined : (tab) => openManage(tab)}
             onOpenQuickAsk={onOpenQuickAsk}
+            onCompactSession={demo ? undefined : onCompactSession}
+            onOpenContextHealth={demo || !onContextHealthOpenChange ? undefined : () => onContextHealthOpenChange(true)}
+          />
+        </LazyBoundary>
+      )}
+      {contextHealthOpen && onContextHealthOpenChange && (
+        <LazyBoundary fallback={null}>
+          <ContextHealthPopover
+            open={contextHealthOpen}
+            onOpenChange={onContextHealthOpenChange}
+            pressure={activeSess?._contextPressure ?? null}
+            compacting={Boolean(activeSess?._compactingManual || activeSess?._turnStatus === "compacting")}
+            canCompact={Boolean(activeId && !demo && onCompactSession)}
+            onCompact={onCompactSession}
+            onStartNewSession={demo ? undefined : handleNew}
+            onOpenManageMemory={demo ? undefined : () => openManage("memory")}
           />
         </LazyBoundary>
       )}

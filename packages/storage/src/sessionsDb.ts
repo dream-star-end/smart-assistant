@@ -334,6 +334,17 @@ export async function getSessionsDb(): Promise<Database.Database> {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+
+    -- Local per-container skill activity counters (cold/hot tiering + frecency ranking).
+    CREATE TABLE IF NOT EXISTS skill_usage_local (
+      slug TEXT NOT NULL,
+      layer TEXT NOT NULL DEFAULT 'user',
+      use_count INTEGER NOT NULL DEFAULT 0,
+      search_hit_count INTEGER NOT NULL DEFAULT 0,
+      last_used_at INTEGER,
+      last_search_hit_at INTEGER,
+      PRIMARY KEY (slug, layer)
+    );
   `)
 
   // ── Schema migrations (run BEFORE index creation) ──
@@ -5380,6 +5391,10 @@ async function _sqliteConvergeFinalizedTapeLiveStreams(): Promise<{ converged: n
   return { converged: 0 }
 }
 
+/** Conservative fallback context window when resolveModelHistoryContextWindow returns null,
+ *  preventing unbounded O(N^2) scans across every archive chunk. */
+const DEFAULT_SAFE_ENGINE_CONTEXT_WINDOW = 200_000
+
 /** 引擎上下文读(RFC §9)。个人版/容器按所选模型的真实上下文预算，从热行向归档
  * 逐页回读；不再叠加固定消息数或字符数截断。 */
 async function _sqliteGetEngineContextMessages(
@@ -5387,6 +5402,10 @@ async function _sqliteGetEngineContextMessages(
   userId: string,
   options: EngineContextReadOptions = {},
 ): Promise<MessageLike[] | null> {
+  const effectiveOptions: EngineContextReadOptions =
+    resolveModelHistoryContextWindow(options.contextWindow, options.engine) === null
+      ? { ...options, contextWindow: DEFAULT_SAFE_ENGINE_CONTEXT_WINDOW }
+      : options
   const db = await getSessionsDb()
   const row = db.prepare(
     'SELECT messages, archived_through_seq FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
@@ -5401,7 +5420,7 @@ async function _sqliteGetEngineContextMessages(
   }
   let selected = selectEngineContextSuffix(
     deriveOrderSeqsForRead(msgs, row.archived_through_seq ?? 0),
-    options,
+    effectiveOptions,
   )
   if (selected.truncated) return selected.messages
 
@@ -5420,7 +5439,7 @@ async function _sqliteGetEngineContextMessages(
     } catch { /* malformed legacy chunk contributes no synthetic context */ }
     const combined = [...archived, ...selected.messages]
     combined.sort(compareMessagesByOrder)
-    selected = selectEngineContextSuffix(combined, options)
+    selected = selectEngineContextSuffix(combined, effectiveOptions)
     if (selected.truncated) break
   }
   return selected.messages
@@ -6243,6 +6262,12 @@ export const softDeleteMasterSession: ClientSessionsBackend['softDeleteMasterSes
 
 export const claimSession: ClientSessionsBackend['claimSession'] =
   (...args) => getActiveBackend().claimSession(...args)
+
+export {
+  recordLocalSkillView,
+  recordLocalSkillSearchHits,
+  getLocalSkillUsageMap,
+} from './skillUsageLocal.js'
 
 export async function closeSessionsDb(): Promise<void> {
   if (_walTimer !== null) { clearInterval(_walTimer); _walTimer = null }

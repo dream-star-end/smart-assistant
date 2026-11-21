@@ -38,6 +38,7 @@ import {
   extractSwarmMentions,
 } from '@openclaude/protocol'
 import { antigravityRoot } from './engine/antigravityPlatform.js'
+import { offloadPayloadIfOversized, truncateUtf8Safe } from './payloadOffloadGate.js'
 
 const MEMBER_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/
 const CHANNEL_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/
@@ -47,6 +48,9 @@ const DEFAULT_WAIT_TIMEOUT_MS = 180_000
 const MAX_WAIT_TIMEOUT_MS = 300_000
 const DEFAULT_READ_BOARD_LIMIT = 50
 const MAX_READ_BOARD_LIMIT = 200
+export const DEFAULT_READ_BOARD_MAX_BYTES = 32 * 1024
+export const MAX_READ_BOARD_MAX_BYTES = 128 * 1024
+export const MAX_SWARM_POST_CHARS = 24_000
 const DEFAULT_CALLER_TOKEN_TTL_MS = 12 * 60 * 60_000
 const BOARD_LOCK_MAX_WAIT_MS = 5_000
 const BOARD_LOCK_STALE_MS = 30_000
@@ -1265,8 +1269,20 @@ export class RemoteSwarmRuntime {
     const caller = (input.callerMember || 'coordinator').trim() || 'coordinator'
 
     if (input.tool === 'post_message') {
-      const text = typeof input.args.text === 'string' ? input.args.text.trim() : ''
-      if (!text) throw new Error('SWARM_POST_EMPTY')
+      const rawText = typeof input.args.text === 'string' ? input.args.text.trim() : ''
+      if (!rawText) throw new Error('SWARM_POST_EMPTY')
+      const gatedPost =
+        rawText.length > MAX_SWARM_POST_CHARS
+          ? offloadPayloadIfOversized({
+              workspaceDir: state.location.swarmDir,
+              sessionId: state.location.swarmId,
+              category: `swarm-post-${caller}`,
+              label: `swarm:${caller}`,
+              content: rawText,
+              inlineMaxChars: MAX_SWARM_POST_CHARS,
+            })
+          : null
+      const text = gatedPost ? gatedPost.text : rawText
       const roster = this.ensureRoster(state)
       const requestedCh = typeof input.args.channel === 'string' ? input.args.channel.trim() : ''
       const defaultCh =
@@ -1278,7 +1294,19 @@ export class RemoteSwarmRuntime {
         throw new Error(`SWARM_CHANNEL_ARCHIVED:${channel}`)
       }
       const post = this.appendBoardPost(state, { agent: caller, channel, text })
-      return { ok: true, seq: post.seq, channel: post.channel, time: post.time }
+      return {
+        ok: true,
+        seq: post.seq,
+        channel: post.channel,
+        time: post.time,
+        ...(gatedPost?.offloaded
+          ? {
+              truncated: true,
+              warning: `Post exceeded ${MAX_SWARM_POST_CHARS} chars and was offloaded to disk.`,
+              ...(gatedPost.artifactPath ? { artifact_path: gatedPost.artifactPath } : {}),
+            }
+          : {}),
+      }
     }
 
     if (input.tool === 'read_board') {
@@ -1291,6 +1319,13 @@ export class RemoteSwarmRuntime {
           ? Math.floor(input.args.limit)
           : DEFAULT_READ_BOARD_LIMIT
       const limit = Math.max(1, Math.min(MAX_READ_BOARD_LIMIT, rawLimit))
+      const rawMaxBytes =
+        typeof input.args.maxBytes === 'number' && Number.isFinite(input.args.maxBytes)
+          ? Math.floor(input.args.maxBytes)
+          : typeof input.args.max_bytes === 'number' && Number.isFinite(input.args.max_bytes)
+            ? Math.floor(input.args.max_bytes)
+            : DEFAULT_READ_BOARD_MAX_BYTES
+      const maxBytes = Math.max(1_024, Math.min(MAX_READ_BOARD_MAX_BYTES, rawMaxBytes))
       const channelFilter = typeof input.args.channel === 'string' ? input.args.channel.trim() : ''
       const roster = this.ensureRoster(state)
       const memberChannels = roster.members[caller]?.channels ?? ['main']
@@ -1302,10 +1337,36 @@ export class RemoteSwarmRuntime {
         if (caller === 'coordinator') return true
         return p.channel === 'main' || memberChannels.includes(p.channel)
       })
-      const truncated = filtered.length > limit
-      const boundedPosts = truncated ? filtered.slice(filtered.length - limit) : filtered
+      const countTruncated = filtered.length > limit
+      const countBounded = countTruncated ? filtered.slice(filtered.length - limit) : filtered
+      // Apply UTF-8 byte budget from newest backwards, keeping complete messages without splitting UTF-8.
+      const byteBounded: typeof countBounded = []
+      let usedBytes = 0
+      let byteBudgetHit = false
+      for (let i = countBounded.length - 1; i >= 0; i -= 1) {
+        const post = countBounded[i]!
+        const postBytes = Buffer.byteLength(JSON.stringify(post), 'utf8')
+        if (byteBounded.length > 0 && usedBytes + postBytes > maxBytes) {
+          byteBudgetHit = true
+          break
+        }
+        if (byteBounded.length === 0 && postBytes > maxBytes) {
+          const textBudget = Math.max(256, maxBytes - 256)
+          const clipped = truncateUtf8Safe(post.text, textBudget)
+          byteBounded.unshift({
+            ...post,
+            text: clipped.truncated ? `${clipped.text}… [truncated to fit read_board maxBytes=${maxBytes}]` : clipped.text,
+          })
+          usedBytes += maxBytes
+          byteBudgetHit = true
+          break
+        }
+        byteBounded.unshift(post)
+        usedBytes += postBytes
+      }
+      const truncated = countTruncated || byteBudgetHit
       const headSeq = allPosts.reduce((m, p) => Math.max(m, p.seq), 0)
-      const readCursor = boundedPosts.reduce((m, p) => Math.max(m, p.seq), since)
+      const readCursor = byteBounded.reduce((m, p) => Math.max(m, p.seq), since)
       if (roster.members[caller]) {
         roster.members[caller]!.last_read_seq = Math.max(roster.members[caller]!.last_read_seq ?? 0, readCursor)
         this.saveRoster(state, roster)
@@ -1314,8 +1375,10 @@ export class RemoteSwarmRuntime {
         ok: true,
         head_seq: headSeq,
         truncated,
+        byte_budget_hit: byteBudgetHit,
+        max_bytes: maxBytes,
         total_matching: filtered.length,
-        posts: boundedPosts,
+        posts: byteBounded,
       }
     }
 

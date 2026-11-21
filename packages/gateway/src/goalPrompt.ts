@@ -23,10 +23,7 @@ export function renderCcbGoalPrompt(goal: GoalStateSnapshot | null): string {
     `objective_json: ${objectiveJson}`,
     'status: active',
     `token_budget: ${goal.tokenBudget ?? 'unset'}`,
-    `tokens_used: ${goal.tokensUsed}`,
     `credit_budget: ${goal.creditBudget ?? 'unset'}`,
-    `credits_used: ${goal.creditsUsed}`,
-    `time_used_seconds: ${goal.timeUsedSeconds}`,
     'Budgets are advisory. Continue working when a budget is reached; the platform will show a soft warning.',
     '</openclaude_active_goal>',
   ].join('\n')

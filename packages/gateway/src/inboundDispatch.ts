@@ -73,6 +73,8 @@ import {
 import type { GatewayStreamEvent } from './ccbMessageParser.js'
 import { noteForegroundBashToolResult } from './ccbLocalAgentCallback.js'
 import { parseDocument } from './documentParser.js'
+import { offloadPayloadIfOversized } from './payloadOffloadGate.js'
+import { contextRebuildsTotal } from './metrics.js'
 import { EMPTY_COMPLETED_TURN_NOTICE, hasPlatedAssistantOutput } from './emptyCompletedTurn.js'
 import type { PromptQueueExternalTurnReservation } from './sessionManager.js'
 import { inferAgentForModel } from './inferAgentForModel.js'
@@ -1587,16 +1589,62 @@ export async function dispatchInbound(
             }
           }
 
+          const ATTACHMENT_INLINE_PER_FILE_MAX_CHARS = 16_000
+          const ATTACHMENT_INLINE_TURN_MAX_CHARS = 32_000
+          let remainingAttachmentInlineChars = ATTACHMENT_INLINE_TURN_MAX_CHARS
+          const safePeerSlug =
+            frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80) || 'default'
+          const attachmentArtifactWorkspace = join(paths.home, 'workspace', 'sessions', safePeerSlug)
+
           for (const doc of parsedDocs) {
+            const perDocBudget = Math.min(
+              ATTACHMENT_INLINE_PER_FILE_MAX_CHARS,
+              remainingAttachmentInlineChars,
+            )
+            let projectedBody = doc.markdown
+            let offloaded = false
+            let artifactPath: string | undefined
+            if (doc.markdown.length > perDocBudget) {
+              const gated = offloadPayloadIfOversized({
+                workspaceDir: attachmentArtifactWorkspace,
+                sessionKey: out.sessionKey,
+                sessionId: frame.peer.id,
+                category: 'attachment',
+                label: doc.file.name,
+                content: doc.markdown,
+                inlineMaxChars: Math.max(1_024, perDocBudget),
+                ...(perDocBudget < 1_024 ? { headChars: 700, tailChars: 200 } : {}),
+              })
+              projectedBody = gated.text
+              offloaded = gated.offloaded
+              artifactPath = gated.artifactPath
+              remainingAttachmentInlineChars = Math.max(
+                0,
+                remainingAttachmentInlineChars - Math.min(perDocBudget, gated.inlineChars),
+              )
+            } else {
+              remainingAttachmentInlineChars = Math.max(
+                0,
+                remainingAttachmentInlineChars - doc.markdown.length,
+              )
+            }
+            const statusTag =
+              doc.truncated || offloaded
+                ? offloaded
+                  ? ' **(已外置节选)**'
+                  : ' **(已截断)**'
+                : ''
             lines.push(
               '',
               '---',
               `**用户上传的文档**:\`${doc.file.name}\` (${doc.file.mimeType}, ${doc.file.sizeHint})`,
-              `_已由 ${doc.parser} 在服务端预解析为 markdown,内容如下_${doc.truncated ? ' **(已截断)**' : ''}:`,
+              `_已由 ${doc.parser} 在服务端预解析为 markdown,内容如下_${statusTag}:`,
               '',
-              doc.markdown,
+              projectedBody,
               '',
-              `_(原文件保存在服务器:\`${doc.file.path}\`,如需访问图片/附件可用 Read)_`,
+              artifactPath
+                ? `_(完整解析文本已落盘:\`${artifactPath}\`,原文件:\`${doc.file.path}\`,按需用 Read/Grep 分段查看)_`
+                : `_(原文件保存在服务器:\`${doc.file.path}\`,如需访问图片/附件可用 Read)_`,
             )
           }
 
@@ -2455,6 +2503,7 @@ export async function dispatchInbound(
         // 内部子 turn 没有前台用户看)。gateway-authored 决策直接 deliver(),不绕 engine
         // event 流(那是底座上报通道)。frame 路由继承主 out(_inheritOutboundRouting)。
         emitContextRebuilt: (info: { messageCount: number; reason?: 'engine-switch' | 'native-resume-loss' }) => {
+          contextRebuildsTotal.inc({ reason: info.reason ?? 'native-resume-loss' })
           this.deliver(_buildContextRebuiltFrame(out, agent.id, info.messageCount, info.reason, safeClientMessageId), adapter)
         },
         ...(safeClientMessageId

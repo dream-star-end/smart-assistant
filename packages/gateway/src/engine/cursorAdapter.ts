@@ -37,7 +37,15 @@ import { atomicWriteJsonFile, buildCursorEfficiencyHooks } from '../efficiencyHo
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
 import { decideEngineCwd } from '../engineCwd.js'
 import { persistRunContextSnapshot } from '../runContextPersist.js'
-import { buildPromptContext } from '../promptSlots.js'
+import { buildPromptContext, memoryInstructionsFingerprint } from '../promptSlots.js'
+import { prepareBoundedPrompt } from './boundedPrompt.js'
+import {
+  buildResumedEnvelopeInputsKey,
+  clearResumedEnvelopeState,
+  decideResumedEnvelopeElision,
+  resumedEnvelopePreamble,
+  writeResumedEnvelopeState,
+} from './resumedEnvelopeDedup.js'
 import { issueParentCallerToken } from '../delegateContext.js'
 import { formatPresentOptionsFence } from './presentOptions.js'
 import { CursorRoutingAdapter } from './cursorRoutingAdapter.js'
@@ -715,6 +723,8 @@ interface TurnCtx {
   contextDir: string | null
   rawToSafeToolId: Map<string, string>; safeToRawToolId: Map<string, string>; fallbackToolSequence: number
   sessionIdEmitted: boolean
+  promptInputsKey: string | null
+  elidedPlatformContext: boolean
   resolve: (value: TurnSummary | null) => void
 }
 
@@ -1321,9 +1331,21 @@ function renderCursorPrompt(
   payload: string,
   preamble: string,
   goal: GoalStateSnapshot | null = null,
+  opts?: { elidePlatformContext?: boolean },
 ): string {
   const payloadJson = JSON.stringify(payload).replace(/</g, '\\u003c')
   const goalText = renderCcbGoalPrompt(goal)
+  if (opts?.elidePlatformContext) {
+    return [
+      resumedEnvelopePreamble('cursor'),
+      ...(goalText ? ['', goalText] : []),
+      '',
+      '<openclaude_current_turn_payload_json>',
+      'The next line is a JSON string containing the complete current OpenClaude turn payload.',
+      payloadJson,
+      '</openclaude_current_turn_payload_json>',
+    ].join('\n')
+  }
   return [
     preamble.trimEnd(),
     '<openclaude_platform_context>',
@@ -1854,7 +1876,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     this.stopPendingKeepalive()
     let resolve!: (value: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((r) => { resolve = r })
-    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), silentToolIds: new Set(), presentOptionsCount: 0, stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, creditExhausted: false, error: null, resultSeen: false, resultDetail: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, lastContentKind: null, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, sessionIdEmitted: false, resolve }
+    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), silentToolIds: new Set(), presentOptionsCount: 0, stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, creditExhausted: false, error: null, resultSeen: false, resultDetail: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, lastContentKind: null, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, sessionIdEmitted: false, promptInputsKey: null, elidedPlatformContext: false, resolve }
     this.active = ctx; this.lastActivityAt = Date.now(); this.drain = new Promise((r) => { ctx.resolveDrain = r })
     const submitted = this.spawnTurn(ctx).catch((err) => {
       // Only ever settle this turn's own barrier: shutdown() may have already
@@ -1937,8 +1959,11 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     const selected = CURSOR_ENGINE_MODELS.find((model) => model.id === this.currentModel)
     if (!selected) throw new Error(`Cursor model '${String(this.currentModel)}' is not allowlisted`)
 
-    const payload = promptOf(ctx.params.input)
-    const payloadBytes = validateCursorTurnPayload(payload)
+    const rawPayload = promptOf(ctx.params.input)
+    const isHistoricalPayload = rawPayload.startsWith('<openclaude_previous_context_json>\n')
+    if (!isHistoricalPayload) {
+      validateCursorTurnPayload(rawPayload)
+    }
 
     const contextDir = this.createContextDir(ctx)
     const discoveryCwd = ctx.params.readOnly ? join(contextDir, 'workspace') : cwd
@@ -1947,6 +1972,11 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       const mcpLaunch = resolveMcpMemoryLaunch(this.opts.config.auth.claudeCodePath, {
         fallback: 'node-tsx',
       })
+      const availableMcpTools = mcpLaunch
+        ? ctx.params.readOnly
+          ? [...OPENCLAUDE_MEMORY_MCP_TOOLS.filter(isAdvisorReadOnlyMcpTool), 'consult_advisor']
+          : [...OPENCLAUDE_MEMORY_MCP_TOOLS]
+        : []
       const platformResult = await buildPromptContext({
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
@@ -1955,11 +1985,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         provider: 'cursor',
         model: this.currentModel,
         repoSnapshot: repoSnapshot ?? undefined,
-        availableMcpTools: mcpLaunch
-          ? ctx.params.readOnly
-            ? [...OPENCLAUDE_MEMORY_MCP_TOOLS.filter(isAdvisorReadOnlyMcpTool), 'consult_advisor']
-            : [...OPENCLAUDE_MEMORY_MCP_TOOLS]
-          : [],
+        availableMcpTools,
         skillEvalExclude: this.opts.skillEvalExclude,
         skillEvalDraft: this.opts.skillEvalDraft,
         sessionId: this.opts.sessionId,
@@ -1985,15 +2011,106 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
           .slice(0, 12),
         board_project_id: this.opts.runContext?.boardProjectId ?? this.opts.projectId ?? null,
       })
-      const renderedPrompt = renderCursorPrompt(
-        platformResult.content,
-        payload,
-        getPlatformPrompt('cursor-preamble', CURSOR_PREAMBLE),
-        this.platformGoal,
+
+      this.prepareCursorChatsDir()
+      // Wrapper --workspace is `pwd -P` of this spawn cwd. A symlink cwd would
+      // hash differently from the CLI store path, so realpath before the check.
+      let workspaceForResume = discoveryCwd
+      try { workspaceForResume = realpathSync(discoveryCwd) } catch { /* keep cwd */ }
+      if (this.nativeId && !cursorResumeStoreExists(workspaceForResume, this.nativeId)) {
+        relocateCursorResumeStore({
+          resumeId: this.nativeId,
+          currentWorkspacePath: workspaceForResume,
+          previousWorkspacePaths: [cwd],
+          sessionKey: this.opts.sessionKey,
+        })
+      }
+      const resumeId = this.nativeId && cursorResumeStoreExists(workspaceForResume, this.nativeId) ? this.nativeId : null
+      // A stored id whose local store vanished would silently mint an empty chat.
+      if (this.nativeId && resumeId === null) this.nativeId = null
+
+      const cursorPreamble = getPlatformPrompt('cursor-preamble', CURSOR_PREAMBLE)
+      const ocHome = process.env.OPENCLAUDE_HOME?.trim() || paths.home
+      const inputsKey = buildResumedEnvelopeInputsKey({
+        engine: 'cursor',
+        preamble: cursorPreamble,
+        agentId: this.opts.agentId,
+        projectId: this.opts.projectId,
+        sessionId: this.opts.sessionId,
+        cwd: cwdDecision.cwd,
+        cwdSource: cwdDecision.source,
+        sessionRepoOverlay: cwdDecision.sessionRepoOverlay,
+        availableMcpTools,
+        identityCompatFingerprint: this.opts.identityCompat?.fingerprint,
+        repoSnapshot,
+        skillEvalMode: this.opts.skillEvalMode,
+        skillEvalExclude: this.opts.skillEvalExclude,
+        skillEvalDraft: this.opts.skillEvalDraft,
+        intelligentUi: platformResult.intelligentUi,
+        promptPolicyFingerprint: platformResult.promptPolicyFingerprint,
+        frozenProjectContext: platformResult.frozenProjectContext,
+        readOnly: ctx.params.readOnly,
+        applied: platformResult.applied,
+        memoryInstructionsFingerprint: memoryInstructionsFingerprint(this.opts.agentId),
+      })
+      ctx.promptInputsKey = inputsKey
+      const elideDecision = decideResumedEnvelopeElision({
+        openClaudeHome: ocHome,
+        engine: 'cursor',
+        sessionKey: this.opts.sessionKey,
+        requestedResumeId: resumeId,
+        inputsKey,
+      })
+      ctx.elidedPlatformContext = Boolean(resumeId) && elideDecision.elide
+      log.info('cursor_prompt_context_mode', {
+        sessionKey: this.opts.sessionKey,
+        traceId: ctx.params.traceId,
+        resumeId,
+        decision: ctx.elidedPlatformContext ? 'elide_resumed' : 'full_inject',
+        reason: elideDecision.reason,
+        savedBytes: ctx.elidedPlatformContext ? Buffer.byteLength(platformResult.content || '', 'utf8') : 0,
+      })
+
+      const serializeCursorPrompt = (turnPayload: string): string => {
+        const rendered = renderCursorPrompt(
+          platformResult.content,
+          turnPayload,
+          cursorPreamble,
+          this.platformGoal,
+          { elidePlatformContext: ctx.elidedPlatformContext },
+        )
+        return ctx.params.readOnly
+          ? `This turn is read-only. The user's workspace is ${JSON.stringify(cwd)}. Read and search it using absolute paths.\n\n${rendered}`
+          : rendered
+      }
+      const emptyEnvelopeBytes = Buffer.byteLength(serializeCursorPrompt(''), 'utf8')
+      const maxPromptArgBytes = Math.min(
+        CURSOR_MAX_PROMPT_ARG_BYTES,
+        emptyEnvelopeBytes + CURSOR_MAX_TURN_PAYLOAD_BYTES,
       )
-      const prompt = ctx.params.readOnly
-        ? `This turn is read-only. The user's workspace is ${JSON.stringify(cwd)}. Read and search it using absolute paths.\n\n${renderedPrompt}`
-        : renderedPrompt
+      let boundedInput = rawPayload
+      let prompt: string
+      try {
+        prompt = await prepareBoundedPrompt({
+          input: rawPayload,
+          serialize: (candidate) => {
+            boundedInput = candidate
+            return serializeCursorPrompt(candidate)
+          },
+          maxBytes: maxPromptArgBytes,
+          cwd: cwdDecision.cwd,
+          engine: this.engineId,
+          sessionKey: this.opts.sessionKey,
+          onEvent: (event) => { if (!ctx.terminal) ctx.params.onEvent(event) },
+        })
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        if (msg.includes('PAYLOAD_TOO_LARGE')) {
+          throw new Error(`PROMPT_TOO_LONG: ${msg}`)
+        }
+        throw err
+      }
+      const payloadBytes = validateCursorTurnPayload(boundedInput)
       validateCursorFinalPrompt(prompt, payloadBytes)
 
       // Cursor runs in Agent mode with unrestricted tools. Build its ambient
@@ -2064,22 +2181,6 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         })
       }
 
-      this.prepareCursorChatsDir()
-      // Wrapper --workspace is `pwd -P` of this spawn cwd. A symlink cwd would
-      // hash differently from the CLI store path, so realpath before the check.
-      let workspaceForResume = discoveryCwd
-      try { workspaceForResume = realpathSync(discoveryCwd) } catch { /* keep cwd */ }
-      if (this.nativeId && !cursorResumeStoreExists(workspaceForResume, this.nativeId)) {
-        relocateCursorResumeStore({
-          resumeId: this.nativeId,
-          currentWorkspacePath: workspaceForResume,
-          previousWorkspacePaths: [cwd],
-          sessionKey: this.opts.sessionKey,
-        })
-      }
-      const resumeId = this.nativeId && cursorResumeStoreExists(workspaceForResume, this.nativeId) ? this.nativeId : null
-      // A stored id whose local store vanished would silently mint an empty chat.
-      if (this.nativeId && resumeId === null) this.nativeId = null
       if (resumeId !== null) env.OPENCLAUDE_CURSOR_RESUME_ID = resumeId
       try {
         const hooks = buildCursorEfficiencyHooks()
@@ -2429,6 +2530,24 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     }
     if (ctx.usage) ctx.params.onEvent({ kind: 'usage', usage: { inputTokens: ctx.usage.input_tokens ?? 0, outputTokens: ctx.usage.output_tokens ?? 0, cacheReadTokens: ctx.usage.cache_read_input_tokens ?? 0, cacheCreationTokens: ctx.usage.cache_creation_input_tokens ?? 0, totalTokens: Object.values(ctx.usage).reduce((a, b) => a + (b ?? 0), 0) } })
     ctx.params.onEvent({ kind: 'final', meta: { ...finalUsageMeta(ctx.usage), ...(creditExhausted ? { stopReason: 'error' } : ctx.interrupted ? { stopReason: 'interrupted' } : {}) } })
+    if (
+      !creditExhausted &&
+      !detail &&
+      !ctx.interrupted &&
+      !ctx.abandoned &&
+      !ctx.elidedPlatformContext &&
+      this.nativeId &&
+      ctx.promptInputsKey
+    ) {
+      writeResumedEnvelopeState(process.env.OPENCLAUDE_HOME?.trim() || paths.home, {
+        v: 1,
+        engine: 'cursor',
+        sessionKey: this.opts.sessionKey,
+        resumeId: this.nativeId,
+        inputsKey: ctx.promptInputsKey,
+        updatedAt: Date.now(),
+      })
+    }
     ctx.params.sessionTotals.turns += 1
     const u = ctx.usage; ctx.resolve({ usage: { cost: 0, inputTokens: u?.input_tokens ?? 0, outputTokens: u?.output_tokens ?? 0, cacheReadTokens: u?.cache_read_input_tokens ?? 0, cacheCreationTokens: u?.cache_creation_input_tokens ?? 0, totalTokens: u ? Object.values(u).reduce((a, b) => a + (b ?? 0), 0) : 0 }, assistantText: ctx.assistantText, thinkingText: ctx.thinkingText, assistantSegments: ctx.assistantSegments.map((v) => ({ ...v })), thinkingSegments: ctx.thinkingSegments.map((v) => ({ ...v })), tools: [...ctx.tools.values()].map((v) => structuredClone(v)), runtimeEvents: [], stopReason: creditExhausted ? 'error' : ctx.interrupted ? 'interrupted' : null, numTurns: 1, isError: creditExhausted || !!detail, ...(creditExhausted || detail ? { errorKind: 'other' as const, errorClass, errorDetail: safeDetail! } : {}), staleResumeId: false, phantomSignals: { ...EMPTY_SIGNALS } })
   }
@@ -2736,7 +2855,10 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   }
   waitForOutputDrain(): Promise<void> { return this.drain }
   get nativeSessionId(): string | null { return this.nativeId }
-  clearSessionId(): void { this.nativeId = null }
+  clearSessionId(): void {
+    this.nativeId = null
+    clearResumedEnvelopeState(process.env.OPENCLAUDE_HOME?.trim() || paths.home, 'cursor', this.opts.sessionKey)
+  }
   setResumeSessionId(sessionId: string): void { this.nativeId = sessionId }
   setModel(model: string | undefined): void {
     const selected = model ?? DEFAULT_CURSOR_ENGINE_MODEL

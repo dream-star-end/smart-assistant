@@ -133,6 +133,7 @@ import {
   providerGapMessagesAfterOwnTurn,
   buildHistoricalContextPrompt,
   buildNativeModelHandoffPayload,
+  buildRollingCheckpointPayload,
   shouldAttemptHistoricalContextInjection,
   shouldEmitContextRebuilt,
   pickIdleTimeoutMs,
@@ -142,6 +143,7 @@ import {
   activeGoalAttribution,
   RuntimeRecycleDrainingError,
 } from './sessionManager.js'
+import { ackPendingCheckpointIfTurnSucceeded, applyPendingCheckpointToSession, beginCheckpointTurnOutcome, isSessionCompacting, peekPendingCheckpoint, resetUnackedCheckpointSessionFlags, type PersistedCheckpointRecord } from './sessionCheckpointStore.js'
 import type {
   SessionManager,
   PromptQueueExternalTurnReservation,
@@ -474,6 +476,8 @@ export async function submit(
     modelSwitchId?: string
     /** Native compact command authored by prepareModelSwitch itself. */
     modelSwitchInternal?: string
+    /** Internal manual `/compact` turn authorized by compactSession (B3). */
+    _internalCompact?: boolean
   },
 ): Promise<void> {
   const submitStartedAt = performance.now()
@@ -494,6 +498,7 @@ export async function submit(
     })
   }
   if (this.isRuntimeRecycleDraining()) throw new RuntimeRecycleDrainingError()
+  if (!opts?._internalCompact && isSessionCompacting(session.sessionKey)) throw Object.assign(new Error('SESSION_COMPACT_IN_PROGRESS'), { code: 'SESSION_COMPACT_IN_PROGRESS' })
   // Commercial PG is the only authoritative history. Never execute a paid
   // turn when the lossless container→master sink failed to initialize: the
   // legacy SQLite fallback is intentionally personal-only and is invisible
@@ -614,6 +619,8 @@ export async function submit(
   const logicalTurnAbort = new AbortController()
   let closeHelpLogical: (() => void) | undefined
   let logicalTurnRun: Promise<void> | null = null
+  let pendingCheckpoint: PersistedCheckpointRecord | null = null
+  let checkpointAcked = false
   if (queueTurn) {
     this._promptQueueExecutions.add(session)
     this._promptQueueExecutionKeys.add(session.sessionKey)
@@ -1240,8 +1247,13 @@ export async function submit(
       session._contextRebuildNotice = undefined
       session._forceHistoricalContextOnFirstTurn = false
     }
+    pendingCheckpoint =
+      !nativeHandoff && opts?.modelSwitchInternal === undefined && !isCcbSlashCommandPrompt(userTextOrBlocks)
+        ? peekPendingCheckpoint(session.sessionKey) : null
+    if (pendingCheckpoint) { beginCheckpointTurnOutcome(session); runnerPayload = applyPendingCheckpointToSession(session, pendingCheckpoint, buildRollingCheckpointPayload, userTextOrBlocks) }
     if (
       !nativeHandoff &&
+      !pendingCheckpoint &&
       opts?.modelSwitchInternal === undefined &&
       !isCcbSlashCommandPrompt(userTextOrBlocks) &&
       shouldAttemptHistoricalContextInjection({
@@ -1399,6 +1411,7 @@ export async function submit(
     )
     try {
       await Promise.race([logicalTurnRun, livenessPromise])
+      if (pendingCheckpoint && ackPendingCheckpointIfTurnSucceeded(session, pendingCheckpoint.generation)) checkpointAcked = true
     } finally {
       if (livenessTimer) clearInterval(livenessTimer)
     }
@@ -1456,6 +1469,7 @@ export async function submit(
       transition.state = 'prepared'
       transition.summaryInjected = false
     }
+    if (pendingCheckpoint && !checkpointAcked) resetUnackedCheckpointSessionFlags(session, pendingCheckpoint.generation)
     await finalizeEfficiencyTurn(session).catch((err) => {
       log.debug('efficiency guard finalize failed', {
         sessionKey: session.sessionKey,

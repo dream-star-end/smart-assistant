@@ -96,7 +96,7 @@ export interface SqlDb {
 }
 
 export type CandidateStatus = 'pending' | 'conflict' | 'rejected' | 'promoted'
-export type LedgerAction = 'create_candidate' | 'promote' | 'reject' | 'deprecate' | 'conflict'
+export type LedgerAction = 'create_candidate' | 'promote' | 'reject' | 'deprecate' | 'restore' | 'conflict'
 
 export interface ProjectMemoryCandidateRow {
   id: string
@@ -694,6 +694,69 @@ export class ProjectMemoryLedger {
     bumpProjectContextVersion(this.db, projectId, now)
     void incrementProjectContextVersion(projectId).catch(() => {})
     return { ok: true, official: this.getOfficial(projectId, opts.slug)! }
+  }
+
+  /**
+   * Safely restore a deprecated official project memory back to active official
+   * status and bump project context version so injected indexes rebuild.
+   * Idempotent: restoring an already-active official entry succeeds cleanly.
+   */
+  restoreDeprecated(
+    projectId: string,
+    slug: string,
+    actor = 'user',
+  ):
+    | { ok: true; restored: boolean; official: ProjectMemoryOfficialRow; idempotent?: boolean }
+    | { ok: false; error: 'not_found' | 'invalid_id' | 'invalid_slug' } {
+    const trimmedProjectId = projectId.trim()
+    if (!BOARD_PROJECT_ID_RE.test(trimmedProjectId)) {
+      return { ok: false, error: 'invalid_id' }
+    }
+    const id = assertBoardId(trimmedProjectId)
+    const normalizedSlug = slug.trim()
+    if (!MEMORY_FILE_RE.test(normalizedSlug)) {
+      return { ok: false, error: 'invalid_slug' }
+    }
+    const official = this.getOfficial(id, normalizedSlug)
+    if (!official) return { ok: false, error: 'not_found' }
+    if (!official.deprecated) {
+      return { ok: true, restored: false, official, idempotent: true }
+    }
+    const now = Date.now()
+    const apply = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE tb_project_memory_official SET deprecated = 0, version = version + 1, updated_at = ? WHERE project_id = ? AND slug = ?`,
+        )
+        .run(now, id, normalizedSlug)
+      this.db
+        .prepare(
+          `INSERT INTO tb_project_memory_event (
+            id, project_id, slug, action, content_sha256, actor,
+            source_agent, source_session, source_ticket, supersedes, expires,
+            idempotency_key, created_at
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        )
+        .run(
+          randomUUID(),
+          id,
+          normalizedSlug,
+          'restore',
+          official.contentSha256,
+          actor,
+          official.sourceAgent,
+          official.sourceSession,
+          official.sourceTicket,
+          official.supersedes,
+          official.expires,
+          `restore:${normalizedSlug}:${official.version}`,
+          now,
+        )
+    })
+    apply()
+    bumpProjectContextVersion(this.db, id, now)
+    void incrementProjectContextVersion(id).catch(() => {})
+    return { ok: true, restored: true, official: this.getOfficial(id, normalizedSlug)! }
   }
 }
 

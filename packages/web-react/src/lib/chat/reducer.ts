@@ -85,7 +85,14 @@ import type {
   OutboundTurnStatusWire,
   OutboundTurnUsageWire,
   OutboundCallUsageWire,
+  SessionContextPressureWire,
+  SysContextCompactedWire,
 } from "./frames";
+import {
+  buildContextPressureState,
+  contextCompactedRow,
+  nextPressureAfterCompaction,
+} from "./contextCompacted";
 
 const COST_CHARGED_LAST_FINAL_TTL_MS = 60_000;
 
@@ -2607,6 +2614,32 @@ export function applyCallUsage(sess: ChatSession, frame: OutboundCallUsageWire):
     if (!msg) continue;
     msg._callUsage = structuredClone(frame.call);
   }
+}
+
+// ═══════════════ 上下文水位与压缩回执（OCV5-840）═══════════════
+export function applyContextPressure(sess: ChatSession, frame: SessionContextPressureWire): boolean {
+  if (!acceptFrameSeq(sess, frame)) return false;
+  const next = buildContextPressureState(frame);
+  if (!next) return false;
+  markFrameReceived(sess);
+  sess._contextPressure = next;
+  return true;
+}
+
+export function applyContextCompacted(
+  sess: ChatSession,
+  frame: SysContextCompactedWire,
+  now: () => number = Date.now,
+): { id: string; text: string } | null {
+  if (!acceptFrameSeq(sess, frame)) return null;
+  markFrameReceived(sess);
+  sess._compactingManual = false;
+  const row = contextCompactedRow(sess, frame, now);
+  if (row) {
+    addMessage(sess, "system", row.text, { id: row.id, _source: "local", _contextCompaction: row.detail });
+  }
+  sess._contextPressure = nextPressureAfterCompaction(sess._contextPressure, frame, now);
+  return row ? { id: row.id, text: row.text } : null;
 }
 
 // ═══════════════ outbound.error 双帧（§11）═══════════════

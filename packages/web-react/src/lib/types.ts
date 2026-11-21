@@ -1063,6 +1063,11 @@ export type MemoryFileMeta = {
   mtimeMs: number;
   /** 文件字节大小。 */
   size: number;
+  /** OCV5-840: 兼容后端可选扩展字节数/过期/30天命中元数据。 */
+  bytes?: number;
+  expiresAt?: string | null;
+  expired?: boolean;
+  hitCount30d?: number;
 };
 
 /** GET .../memory/memory 响应：只读索引文本 + 文件列表（core 记忆改列表后不再是可编辑 blob）。 */
@@ -1215,6 +1220,137 @@ export type SkillSummary = {
   layer?: string;
   writable?: boolean;
   agentIds?: string[];
+  /** OCV5-840: 技能体量与冷热使用元数据（均可选，旧容器 fail-open）。 */
+  bytes?: number;
+  useCount30d?: number;
+  lastUsedAt?: number | null;
+  tier?: "hot" | "warm" | "cold";
+};
+
+// ── OCV5-840 上下文健康体检、确定性清理与可逆归档箱 ──────────────────────────
+
+export type ArchivedMemoryEntry = {
+  id: string;
+  batchId: string;
+  slug: string;
+  file: string;
+  originalRelPath: string;
+  archivedRelPath: string;
+  archivedAt: string;
+  reason: string;
+  actor: string;
+  bytes: number;
+  title?: string;
+  type?: string;
+};
+
+export type ArchivedSkillEntry = {
+  id: string;
+  batchId: string;
+  name: string;
+  archivedRelPath: string;
+  archivedAt: string;
+  reason: string;
+  actor: string;
+  bytes: number;
+  description?: string;
+};
+
+export type ContextHealthSlot = {
+  id: "claude_md" | "user_md" | "core_memory" | "skills" | "archival";
+  label: string;
+  bytes: number;
+  softLimitBytes: number;
+  hardLimitBytes: number;
+  itemCount: number;
+  status: "healthy" | "warning" | "critical";
+  detail?: string;
+};
+
+export type ContextSlimCandidateKind =
+  | "expired_memory"
+  | "oversized_memory"
+  | "cold_skill"
+  | "oversized_skill"
+  | "skill_history"
+  | "stale_archival";
+
+export type ContextSlimCandidate = {
+  id: string;
+  kind: ContextSlimCandidateKind;
+  target: string;
+  label: string;
+  bytes: number;
+  reason: string;
+  safeAutoArchive: boolean;
+  actionable: boolean;
+  /** false 表示永久裁剪（不可撤销，不进入归档箱）；缺省按 kind 兜底。 */
+  reversible?: boolean;
+  meta?: Record<string, unknown>;
+};
+
+export type ContextHygieneRunRecord = {
+  runId: string;
+  batchId: string | null;
+  agentId: string;
+  mode: "manual" | "auto";
+  dryRun: boolean;
+  startedAt: string;
+  finishedAt: string;
+  expiredMemoriesArchived: number;
+  coldSkillsArchived: number;
+  skillHistoriesPruned: number;
+  archivalDecayed: number;
+  archivalCleaned: number;
+  bytesFreed: number;
+  archivedMemoryFiles: string[];
+  archivedSkillNames: string[];
+  errors: string[];
+};
+
+export type ContextHealthReport = {
+  agentId: string;
+  generatedAt: string;
+  status: "healthy" | "warning" | "critical";
+  totalBytes: number;
+  reclaimableBytes: number;
+  slots: ContextHealthSlot[];
+  summary: {
+    coreMemoryCount: number;
+    coreMemoryBytes: number;
+    coreMemoryIndexBytes: number;
+    expiredMemoryCount: number;
+    oversizedMemoryCount: number;
+    activeSkillCount: number;
+    activeSkillBytes: number;
+    coldSkillCount: number;
+    oversizedSkillCount: number;
+    skillHistoryCount: number;
+    skillHistoryBytes: number;
+    claudeMdBytes: number;
+    userMdBytes: number;
+    archivalCount: number;
+    archivalBytes: number;
+    staleArchivalCount: number;
+    archivedMemoryCount: number;
+    archivedSkillCount: number;
+  };
+  slimCandidates: ContextSlimCandidate[];
+  recentRuns: ContextHygieneRunRecord[];
+};
+
+export type ContextHygieneRunOptions = {
+  dryRun?: boolean;
+  archiveExpiredMemories?: boolean;
+  archiveColdSkills?: boolean;
+  coldSkillDays?: number;
+  pruneSkillHistory?: boolean;
+  /** 仅裁剪指定技能的历史快照，严禁波及未勾选技能。 */
+  pruneSkillHistoryNames?: string[];
+  maxSkillHistoryVersions?: number;
+  decayArchival?: boolean;
+  /** 仅清理指定 ID 的过期归档检索条目。 */
+  pruneArchivalIds?: string[];
 };
 
 /** 评测用例(skill 目录 evals/evals.json)。 */

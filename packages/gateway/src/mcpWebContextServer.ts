@@ -19,6 +19,7 @@ import {
   parseBoundedInt,
 } from './webContextSafety.js'
 import { checkWebContextBrowserHealth, renderWebContextUrlWithBrowser } from './webContextBrowser.js'
+import { offloadPayloadIfOversized } from './payloadOffloadGate.js'
 
 export const OPENCLAUDE_WEB_CONTEXT_MCP_ID = 'web-context'
 export const WEB_CONTEXT_EXTRACT_URL_TOOL = 'web_context_extract_url'
@@ -34,8 +35,10 @@ const DEFAULT_BIN = '/usr/local/bin/oc-web-context'
 const DEFAULT_TIMEOUT_MS = 90_000
 const MIN_TIMEOUT_MS = 3_000
 const MAX_TIMEOUT_MS = 300_000
-const DEFAULT_MAX_OUTPUT_CHARS = 80_000
-const MAX_OUTPUT_CHARS = 500_000
+export const DEFAULT_MAX_OUTPUT_CHARS = 24_000
+export const MAX_OUTPUT_CHARS = 64_000
+/** B9: Decouple bounded child extraction limit from inline preview cap so Node receives full text to offload. */
+export const EXTRACTOR_HARD_MAX_CHARS = 200_000
 const DEFAULT_MAX_FILE_BYTES = 25 * 1024 * 1024
 const HARD_MAX_FILE_BYTES = 100 * 1024 * 1024
 const CHILD_STDOUT_CAP = 4 * 1024 * 1024
@@ -220,10 +223,36 @@ function runChild(payload: Record<string, unknown>, timeoutMs: number): Promise<
   })
 }
 
-function truncateText(value: unknown, maxChars: number): { text: string; truncated: boolean } {
+function webContextArtifactWorkspace(): string {
+  const home = process.env.OPENCLAUDE_HOME?.trim()
+  return home ? join(home, 'workspace', 'web-context') : join(tmpdir(), 'oc-web-context-artifacts')
+}
+
+function webContextSessionKey(): string | undefined {
+  const key = process.env.OPENCLAUDE_SESSION_KEY?.trim()
+  return key || undefined
+}
+
+function boundWebContextOutput(
+  value: unknown,
+  maxChars: number,
+  label: string,
+): { text: string; truncated: boolean; artifactPath?: string } {
   const raw = typeof value === 'string' ? value : ''
   if (raw.length <= maxChars) return { text: raw, truncated: false }
-  return { text: raw.slice(0, maxChars), truncated: true }
+  const gated = offloadPayloadIfOversized({
+    workspaceDir: webContextArtifactWorkspace(),
+    sessionKey: webContextSessionKey(),
+    category: 'web-context',
+    label,
+    content: raw,
+    inlineMaxChars: maxChars,
+  })
+  return {
+    text: gated.text,
+    truncated: true,
+    ...(gated.artifactPath ? { artifactPath: gated.artifactPath } : {}),
+  }
 }
 
 function jsonToolResult(obj: unknown, isError = false) {
@@ -279,11 +308,11 @@ async function runExtractorOnBody(params: {
         source_url: params.finalUrl,
         content_type: params.contentType,
         kind: params.kind,
-        max_chars: params.maxChars,
+        max_chars: Math.max(params.maxChars, EXTRACTOR_HARD_MAX_CHARS),
       },
       params.timeoutMs,
     )
-    const out = truncateText(child.markdown ?? child.text, params.maxChars)
+    const out = boundWebContextOutput(child.markdown ?? child.text, params.maxChars, params.finalUrl)
     const markerMiss = out.text.trim().length < 120 && params.kind === 'html'
     return {
       ...child,
@@ -298,6 +327,7 @@ async function runExtractorOnBody(params: {
       redirects: params.redirects,
       markdown: out.text,
       truncated: out.truncated || child.truncated === true,
+      ...(out.artifactPath ? { artifact_path: out.artifactPath } : {}),
       ...(markerMiss ? { error: 'extracted output is too small to be useful' } : {}),
     }
   } finally {
@@ -553,16 +583,17 @@ export async function parseFile(args: WebContextParseFileArgs): Promise<Record<s
       op: 'parse_document_file',
       file_path: input.filePath,
       kind: extname(input.filePath).toLowerCase().replace(/^\./, ''),
-      max_chars: input.maxChars,
+      max_chars: Math.max(input.maxChars, EXTRACTOR_HARD_MAX_CHARS),
     },
     input.timeoutMs,
   )
-  const out = truncateText(child.markdown ?? child.text, input.maxChars)
+  const out = boundWebContextOutput(child.markdown ?? child.text, input.maxChars, basename(input.filePath))
   return {
     ...child,
     file_path: input.filePath,
     markdown: out.text,
     truncated: out.truncated || child.truncated === true,
+    ...(out.artifactPath ? { artifact_path: out.artifactPath } : {}),
   }
 }
 

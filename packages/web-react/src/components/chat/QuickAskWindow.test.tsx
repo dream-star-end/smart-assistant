@@ -93,6 +93,7 @@ function useBoundChatSocket(socket: ChatSocket): UseChatSocket {
     cancelPendingModelSwitches: (id) => socket.cancelPendingModelSwitches(id),
     switchAgent: (id, agentId) => socket.switchAgent(id, agentId),
     send: (p) => socket.sendMessage(p),
+    compactSession: (id, instructions) => socket.compactSession(id, instructions),
     stop: (id, cmid) => socket.stopTurn(id, cmid),
     retryMessage: (p) => socket.retryMessage(p),
     continueInterruptedTurn: (p) => socket.continueInterruptedTurn(p),

@@ -8,7 +8,7 @@
  */
 import { resolveRuntimeExecutionAgent } from '@openclaude/storage'
 import { saveUserSkill } from './userSkillWrite.js'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { join } from 'node:path'
 import {
@@ -25,9 +25,12 @@ import {
   type AgentsConfig,
   buildAgentSkillStore,
   buildUserSkillStore,
+  classifySkillTier,
+  getLocalSkillUsageMap,
   validateSkillAgentScope,
   paths,
   loadSessionTurns,
+  type SkillMetadata,
 } from '@openclaude/storage'
 import { isHiddenSystemAgentId } from './agentVisibility.js'
 import { SkillTrainJobStore } from './skillTrainJobs.js'
@@ -94,6 +97,37 @@ export interface SkillHandlersHost {
   validateSkillAgentScopeInput: Gateway['validateSkillAgentScopeInput']
 }
 
+async function enrichSkillsWithUsageMeta(list: SkillMetadata[]) {
+  const usageMap = await getLocalSkillUsageMap().catch(() => new Map())
+  const nowMs = Date.now()
+  const thirtyDaysMs = 30 * 86_400_000
+  return await Promise.all(
+    list.map(async (s) => {
+      let bytes = 0
+      let mtimeMs: number | null = null
+      try {
+        const st = await stat(join(s.path, 'SKILL.md'))
+        bytes = st.size
+        mtimeMs = st.mtimeMs
+      } catch {
+        // fail-open
+      }
+      const usage = usageMap.get(s.name.toLowerCase())
+      const lastUsedAt = usage?.lastUsedAt ?? null
+      const useCount30d =
+        usage && lastUsedAt !== null && nowMs - lastUsedAt <= thirtyDaysMs ? usage.useCount : 0
+      const tier = classifySkillTier(usage, { priority: s.priority, nowMs, mtimeMs })
+      return {
+        ...s,
+        bytes,
+        useCount30d,
+        lastUsedAt,
+        tier,
+      }
+    }),
+  )
+}
+
 // GET /api/agents/:id/skills — list
 export async function handleSkillsList(
   this: SkillHandlersHost,
@@ -109,7 +143,7 @@ export async function handleSkillsList(
     identity.context.assets ? { profile: identity.context.assets.profile } : undefined,
   )
   // User-facing surface: never enumerate platform baseline/seed skills.
-  const list = await store.list({ includePlatform: false })
+  const list = await enrichSkillsWithUsageMeta(await store.list({ includePlatform: false }))
   this.sendJson(res, 200, { skills: list })
 }
 
@@ -169,7 +203,7 @@ export async function handleUserSkillsList(
   await this.syncMarketplaceHubForManagement()
   const store = buildUserSkillStore()
   // User-facing surface: never enumerate platform baseline/seed skills.
-  const list = await store.list({ includePlatform: false })
+  const list = await enrichSkillsWithUsageMeta(await store.list({ includePlatform: false }))
   this.sendJson(res, 200, { skills: list })
 }
 

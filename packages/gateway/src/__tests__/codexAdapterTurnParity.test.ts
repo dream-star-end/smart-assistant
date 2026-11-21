@@ -1756,7 +1756,7 @@ test('native context observations cross the Codex adapter only during their live
   h.proc().notify('item/started', { threadId: 'thr-new-1', turnId: 'internal-1', item });
   h.proc().notify('item/completed', { threadId: 'thr-new-1', turnId: 'internal-1', item });
   assert.deepEqual(h.events.filter((e) => e.kind === 'context_pressure' || e.kind === 'context_compacted'), [
-    { kind: 'context_pressure', pressure: { engine: 'codex', scope: 'native_context', dimension: 'tokens', level: 'warning', usedRatio: 0.85 } },
+    { kind: 'context_pressure', pressure: { engine: 'codex', scope: 'native_context', dimension: 'tokens', level: 'warning', usedRatio: 0.85, usedTokens: 850, windowTokens: 1000 } },
     { kind: 'context_compacted', compaction: { engine: 'codex', scope: 'native_context', strategy: 'native_summary', beforeTokens: 850 } },
   ]);
   h.proc().notify('turn/completed', { threadId: 'thr-new-1', turn: { id: 'turn-1', status: 'completed' } });

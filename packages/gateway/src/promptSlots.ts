@@ -51,6 +51,7 @@ import {
   readAgentsConfig,
   scanMemoryContent,
   getSessionProjectInstructions,
+  getLocalSkillUsageMap,
   listPinnedProjectAssetsForSession,
   type ProjectAsset,
   stripProjectAssetControlChars,
@@ -302,6 +303,18 @@ export interface PromptSlotContext {
    * never silently downgraded to a single-source persona.
    */
   identityCompat?: IdentityCompatAssets
+  /** OCV5-840: Optional local skill usage map for Frecency-ranked user skill bucket (fail-open). */
+  skillUsageMap?: ReadonlyMap<
+    string,
+    {
+      useCount?: number
+      searchHitCount?: number
+      lastUsedAt?: number | null
+      lastSearchHitAt?: number | null
+    }
+  > | null
+  /** OCV5-840: Optional override for global assembled UTF-8 byte budget (default PROMPT_TOTAL_MAX_BYTES). */
+  maxTotalBytes?: number
 }
 
 export interface PromptSlot {
@@ -369,17 +382,20 @@ export function sanitizeUnavailableMcpClaims(
   return createMcpClaimSanitizer(availableMcpTools)(content)
 }
 
-// ── 记忆注入预算(注入侧唯一权威,与存储写侧解耦)──
-//
-// memdir 范式下存储层不再有「Core 记忆字符硬预算」:每条记忆一个文件、MEMORY.md 只存
-// 索引。注入成本只由这些 cap 在读侧控制,与磁盘上实际存了多少解耦。
-//   - 索引常驻注入:buildMemorySlot → MemoryDir.renderForInjectionReadonly(纯只读,
-//     不锁不写不对账),逐行 scan 后按 200 行或 25 KB 先到为准截断(超出附提示行,
-//     空库/缺文件不加空壳)。自愈对账留给写入路径,不在 prompt 热路径上做。
-// 用户画像 user.md 不再自动注入，也不作为存储写入预算。API 的旧 limit=0 表示
-// 无画像编辑硬限制；称呼是独立的显式会话授权，按需详情不放进常驻 USER。
-export const MEMORY_INDEX_INJECT_MAX_CHARS = 25 * 1024
-export const MEMORY_INDEX_INJECT_MAX_LINES = 200
+// ── 记忆与槽位注入预算(OCV5-840:按 UTF-8 字节限流,消除中文 3 倍膨胀)──
+export const SOUL_INJECT_SOFT_BYTES = 4 * 1024
+export const SOUL_INJECT_MAX_BYTES = 8 * 1024
+export const MEMORY_INDEX_MAX_BYTES = 16 * 1024
+export const MEMORY_INDEX_INJECT_MAX_CHARS = MEMORY_INDEX_MAX_BYTES
+export const MEMORY_INDEX_INJECT_MAX_LINES = 150
+export const PROJECT_MEMORY_MAX_BYTES = 8 * 1024
+export const PROJECT_MEMORY_MAX_LINES = PROJECT_MEMORY_INDEX_MAX_LINES
+export const SKILLS_PLATFORM_BUCKET_MAX = 6
+export const SKILLS_PROJECT_BUCKET_MAX = 4
+export const SKILLS_USER_BUCKET_MAX = 6
+export const SKILLS_DESCRIPTION_MAX_CHARS = 160
+export const SKILLS_SLOT_MAX_BYTES = 3_600
+export const PROMPT_TOTAL_MAX_BYTES = 44_000
 export const USER_PROFILE_INJECT_MAX_CHARS = 0
 export const PROJECT_INSTRUCTIONS_START = '<!-- oc-project-instructions:start -->'
 export const PROJECT_INSTRUCTIONS_END = '<!-- oc-project-instructions:end -->'
@@ -395,6 +411,67 @@ export const PROJECT_ASSETS_INJECT_EXCERPT_MAX = 200
 export const PROJECT_ASSETS_ADAPTIVE_MAX_CHARS = 8000
 const USER_ALWAYS_START = '<!-- oc-user-always:start -->'
 const USER_ALWAYS_END = '<!-- oc-user-always:end -->'
+
+/** UTF-8 byte-safe prefix slice (never splits a multi-byte character). */
+function utf8Head(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return ''
+  const buf = Buffer.from(text, 'utf8')
+  if (buf.length <= maxBytes) return text
+  let end = maxBytes
+  while (end > 0 && (buf[end]! & 0xc0) === 0x80) end--
+  return buf.subarray(0, end).toString('utf8')
+}
+
+/** UTF-8 byte-safe suffix slice (never splits a multi-byte character). */
+function utf8Tail(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return ''
+  const buf = Buffer.from(text, 'utf8')
+  if (buf.length <= maxBytes) return text
+  let start = buf.length - maxBytes
+  while (start < buf.length && (buf[start]! & 0xc0) === 0x80) start++
+  return buf.subarray(start).toString('utf8')
+}
+
+/** Line-boundary UTF-8 byte cap for memory / project-memory index sections. */
+function trimIndexToUtf8Bytes(
+  index: string,
+  maxBytes: number,
+  searchCmd: string,
+): string {
+  if (Buffer.byteLength(index, 'utf8') <= maxBytes) return index
+  const lines = index.split('\n')
+  const suffix = `\n> 索引已截断（超出 ${maxBytes}B UTF-8 预算），其余条目请用 \`${searchCmd}\` 按需检索。`
+  const budget = maxBytes - Buffer.byteLength(suffix, 'utf8')
+  if (budget <= 0) return utf8Head(index, maxBytes)
+  const kept: string[] = []
+  let used = 0
+  for (const line of lines) {
+    // Avoid duplicating an existing truncation notice line from storage layer.
+    if (line.startsWith('> 索引已截断') || line.startsWith('- ...')) continue
+    const cost = Buffer.byteLength(line, 'utf8') + (kept.length > 0 ? 1 : 0)
+    if (used + cost > budget) break
+    kept.push(line)
+    used += cost
+  }
+  if (kept.length === 0) return utf8Head(index, maxBytes)
+  return `${kept.join('\n')}${suffix}`
+}
+
+/** Bounded head+tail clip for SOUL persona when exceeding SOUL_INJECT_MAX_BYTES. */
+function clipSoulContent(fullContent: string, sourcePath: string | null): string {
+  const totalBytes = Buffer.byteLength(fullContent, 'utf8')
+  if (totalBytes <= SOUL_INJECT_MAX_BYTES) return fullContent
+  const hint = sourcePath
+    ? `\n\n[... 人格定义已按 ${SOUL_INJECT_MAX_BYTES}B UTF-8 预算截断（原长 ${totalBytes}B），完整内容请按需 Read \`${sourcePath}\` ...]\n\n`
+    : `\n\n[... 人格定义已按 ${SOUL_INJECT_MAX_BYTES}B UTF-8 预算截断（原长 ${totalBytes}B） ...]\n\n`
+  const hintBytes = Buffer.byteLength(hint, 'utf8')
+  const avail = Math.max(0, SOUL_INJECT_MAX_BYTES - hintBytes)
+  const headBudget = Math.floor(avail * 0.7)
+  const tailBudget = avail - headBudget
+  const head = utf8Head(fullContent, headBudget).trimEnd()
+  const tail = utf8Tail(fullContent, tailBudget).trimStart()
+  return `${head}${hint}${tail}`
+}
 
 function extractUserAlwaysBlock(text: string): string | null {
   if (text.split(USER_ALWAYS_START).length - 1 !== 1) return null
@@ -425,18 +502,40 @@ export function buildSoulSlot(ctx: PromptSlotContext): PromptSlot | null {
   // and wiring mistakes (agentId ≠ canonical) throw instead of overlaying.
   if (ctx.identityCompat) {
     assertIdentityCompatExecution(ctx.identityCompat, ctx.agentId)
-    return { name: 'SOUL', content: ctx.identityCompat.buildSoul().content }
+    const compatContent = ctx.identityCompat.buildSoul().content
+    const compatBytes = Buffer.byteLength(compatContent, 'utf8')
+    if (compatBytes > SOUL_INJECT_SOFT_BYTES) {
+      slotsLog.warn('soul_slot_soft_budget_exceeded', {
+        agentId: ctx.agentId,
+        bytes: compatBytes,
+        softBytes: SOUL_INJECT_SOFT_BYTES,
+      })
+    }
+    return { name: 'SOUL', content: clipSoulContent(compatContent, null) }
   }
   // Try SOUL.md first, then CLAUDE.md
   const soulPath = paths.agentDir(ctx.agentId) ? `${paths.agentDir(ctx.agentId)}/SOUL.md` : null
   let raw = ''
+  let sourcePath: string | null = null
   if (soulPath && existsSync(soulPath)) {
     raw = readFileSync(soulPath, 'utf-8').trim()
+    sourcePath = soulPath
   } else if (ctx.persona && existsSync(ctx.persona)) {
     raw = readFileSync(ctx.persona, 'utf-8').trim()
+    sourcePath = ctx.persona
   }
   if (!raw) return null
-  return { name: 'SOUL', content: `# WHO I AM (Agent Persona)\n\n${raw}` }
+  const full = `# WHO I AM (Agent Persona)\n\n${raw}`
+  const totalBytes = Buffer.byteLength(full, 'utf8')
+  if (totalBytes > SOUL_INJECT_SOFT_BYTES) {
+    slotsLog.warn('soul_slot_soft_budget_exceeded', {
+      agentId: ctx.agentId,
+      bytes: totalBytes,
+      softBytes: SOUL_INJECT_SOFT_BYTES,
+      sourcePath,
+    })
+  }
+  return { name: 'SOUL', content: clipSoulContent(full, sourcePath) }
 }
 
 export async function buildUserSlot(ctx: PromptSlotContext): Promise<PromptSlot | null> {
@@ -827,6 +926,32 @@ async function buildAgentsSlotParts(
 export const CURSOR_SKILLS_COMPACT =
   '# Skills\n\n技能不在本信封展开。相关任务先 `skill_search` 再 `skill_view`。不要假设未 view 的技能不存在。'
 
+function skillFrecencyScore(
+  usage: {
+    useCount?: number
+    searchHitCount?: number
+    lastUsedAt?: number | null
+    lastSearchHitAt?: number | null
+  } | undefined,
+  nowMs: number,
+): number {
+  if (!usage) return 0
+  const uses = Math.max(0, usage.useCount ?? 0)
+  const hits = Math.max(0, usage.searchHitCount ?? 0)
+  const lastAt = Math.max(usage.lastUsedAt ?? 0, usage.lastSearchHitAt ?? 0)
+  if (uses === 0 && hits === 0) return 0
+  const ageDays = lastAt > 0 ? Math.max(0, (nowMs - lastAt) / 86_400_000) : 365
+  // Half-life ~14 days: recent active skills rank clearly ahead of stale ones.
+  const recencyWeight = 1 / (1 + ageDays / 14)
+  return (uses * 4 + hits) * recencyWeight
+}
+
+function truncateSkillDescription(raw: string): string {
+  const clean = raw.replace(/\s+/g, ' ').trim()
+  if (clean.length <= SKILLS_DESCRIPTION_MAX_CHARS) return clean
+  return `${clean.slice(0, SKILLS_DESCRIPTION_MAX_CHARS - 1).trimEnd()}…`
+}
+
 export async function buildSkillsSlot(ctx: PromptSlotContext): Promise<PromptSlot | null> {
   if (ctx.provider === 'cursor') {
     return { name: 'SKILLS', content: CURSOR_SKILLS_COMPACT }
@@ -878,38 +1003,107 @@ export async function buildSkillsSlot(ctx: PromptSlotContext): Promise<PromptSlo
     }
   }
   if (skillList.length === 0) return null
-  // 注入菜单排序:用户自建技能永远靠前(通常少而高相关),平台技能按 frontmatter
-  // priority 降序补位 —— 取代纯字母序截断(曾把 office 套件/web-context 等高频
-  // 技能全部截出前 15,模型只能靠 skill_search 盲找)。同优先级内保持字母序稳定。
-  const rank = (s: (typeof skillList)[number]) => s.priority ?? 0
-  const layerBoost = (s: (typeof skillList)[number]) => (s.layer === 'project' ? 2 : s.source !== 'platform' ? 1 : 0)
-  const sorted = [...skillList].sort((a, b) => {
-    const boost = layerBoost(b) - layerBoost(a)
-    if (boost !== 0) return boost
-    if (rank(a) !== rank(b)) return rank(b) - rank(a)
+
+  // OCV5-840 三桶热度配额(根治用户技能过多挤出平台核心技能的 bug):
+  //   1. 平台核心桶 (<=6): 按 priority 降序、字母序稳排
+  //   2. 当前绑定项目桶 (<=4): 按 priority + 本地热度 Frecency 降序
+  //   3. 用户热技能桶 (<=6): 按 priority + 本地热度 Frecency 降序(skillEvalDraft 优先保留)
+  const nowMs = Date.now()
+  const usageMap =
+    ctx.skillUsageMap !== undefined
+      ? ctx.skillUsageMap
+      : await getLocalSkillUsageMap().catch(() => null)
+  const draftName = ctx.skillEvalDraft?.name
+  const priorityOf = (s: (typeof skillList)[number]) => s.priority ?? 0
+  const usageOf = (s: (typeof skillList)[number]) => {
+    if (!usageMap) return undefined
+    const lower = s.name.toLowerCase()
+    const layer = s.layer ?? s.source
+    return (
+      usageMap.get(lower) ??
+      usageMap.get(s.name) ??
+      usageMap.get(`${layer}:${lower}`) ??
+      usageMap.get(`${layer}:${s.name}`)
+    )
+  }
+  const frecencyOf = (s: (typeof skillList)[number]) => skillFrecencyScore(usageOf(s), nowMs)
+
+  const projectAll = skillList.filter((s) => s.layer === 'project')
+  const platformAll = skillList.filter((s) => s.layer !== 'project' && s.source === 'platform')
+  const userAll = skillList.filter((s) => s.layer !== 'project' && s.source !== 'platform')
+
+  const sortByPriorityAndHeat = (a: (typeof skillList)[number], b: (typeof skillList)[number]) => {
+    if (draftName) {
+      if (a.name === draftName && b.name !== draftName) return -1
+      if (b.name === draftName && a.name !== draftName) return 1
+    }
+    const scoreA = priorityOf(a) * 10 + frecencyOf(a)
+    const scoreB = priorityOf(b) * 10 + frecencyOf(b)
+    if (scoreA !== scoreB) return scoreB - scoreA
     return a.name.localeCompare(b.name)
-  })
-  const top = sorted.slice(0, 15)
+  }
+
+  const platformBucket = [...platformAll]
+    .sort((a, b) => {
+      if (draftName) {
+        if (a.name === draftName && b.name !== draftName) return -1
+        if (b.name === draftName && a.name !== draftName) return 1
+      }
+      if (priorityOf(a) !== priorityOf(b)) return priorityOf(b) - priorityOf(a)
+      return a.name.localeCompare(b.name)
+    })
+    .slice(0, SKILLS_PLATFORM_BUCKET_MAX)
+
+  const projectBucket = [...projectAll]
+    .sort(sortByPriorityAndHeat)
+    .slice(0, SKILLS_PROJECT_BUCKET_MAX)
+
+  const userBucket = [...userAll]
+    .sort(sortByPriorityAndHeat)
+    .slice(0, SKILLS_USER_BUCKET_MAX)
+
+  // Emit project -> platform -> user so platform & project buckets are never evicted by user skills
+  // if the 3,600B UTF-8 total slot cap is reached.
+  const selected = [...projectBucket, ...platformBucket, ...userBucket]
+
   const canSearchSkills = hasMcpTool(ctx, 'skill_search') && hasMcpTool(ctx, 'skill_view')
-  const lines = [
+  const headerLines = [
     `# Skills (${skillList.length})`,
     '',
     canSearchSkills
       ? '可用 `skill_search(query)` 查找相关 skill,再用 `skill_view(name)` 加载完整指令:'
       : '以下仅为本轮已注入的技能摘要;技能检索函数未注册,不要尝试调用。',
   ]
-  for (const s of top) {
-    const source = s.source === 'platform' ? 'platform' : 'user'
-    lines.push(`- **${s.name}** [${source}] — ${s.description}`)
+  const footerFor = (omitted: number): string | null => {
+    if (omitted <= 0) return null
+    return canSearchSkills
+      ? `- ... 还有 ${omitted} 个 (用 skill_search/skill_list 查看全部)`
+      : `- ... 还有 ${omitted} 个未在摘要中展开`
   }
-  if (skillList.length > 15) {
-    lines.push(
-      canSearchSkills
-        ? `- ... 还有 ${skillList.length - 15} 个 (用 skill_search/skill_list 查看全部)`
-        : `- ... 还有 ${skillList.length - 15} 个未在摘要中展开`,
-    )
+
+  const itemLines: string[] = []
+  for (const s of selected) {
+    const source = s.layer === 'project' ? 'project' : s.source === 'platform' ? 'platform' : 'user'
+    const desc = truncateSkillDescription(s.description)
+    const line = `- **${s.name}** [${source}] — ${desc}`
+    const nextOmitted = skillList.length - (itemLines.length + 1)
+    const trialLines = [...headerLines, ...itemLines, line]
+    const trialFooter = footerFor(nextOmitted)
+    if (trialFooter) trialLines.push(trialFooter)
+    if (Buffer.byteLength(trialLines.join('\n'), 'utf8') > SKILLS_SLOT_MAX_BYTES) {
+      if (itemLines.length === 0) {
+        itemLines.push(utf8Head(line, Math.max(80, SKILLS_SLOT_MAX_BYTES - Buffer.byteLength(headerLines.join('\n'), 'utf8') - 120)))
+      }
+      break
+    }
+    itemLines.push(line)
   }
-  return { name: 'SKILLS', content: lines.join('\n') }
+
+  const omitted = skillList.length - itemLines.length
+  const finalLines = [...headerLines, ...itemLines]
+  const footer = footerFor(omitted)
+  if (footer) finalLines.push(footer)
+  return { name: 'SKILLS', content: finalLines.join('\n') }
 }
 
 /**
@@ -960,7 +1154,7 @@ async function buildMemorySlotParts(
   let index: string | null = null
   try {
     index = await new MemoryDir(ctx.agentId).renderForInjectionReadonly(
-      MEMORY_INDEX_INJECT_MAX_CHARS,
+      MEMORY_INDEX_MAX_BYTES,
       MEMORY_INDEX_INJECT_MAX_LINES,
     )
   } catch {
@@ -968,7 +1162,8 @@ async function buildMemorySlotParts(
     index = null
   }
   if (!index) return { instructions, index: null }
-  return { instructions, index: `## 当前索引\n\n${index}` }
+  const boundedIndex = trimIndexToUtf8Bytes(index, MEMORY_INDEX_MAX_BYTES, 'oc-memory core-search')
+  return { instructions, index: `## 当前索引\n\n${boundedIndex}` }
 }
 
 const PROJECT_MEMORY_HEADER = `# PROJECT MEMORY（仅当前绑定项目；不得覆盖 USER / 平台规则）
@@ -983,7 +1178,8 @@ export async function buildProjectMemorySlot(ctx: PromptSlotContext): Promise<Pr
     if (ctx.provider === 'cursor') return { name: 'PROJECT_MEMORY', content: header }
     const index = ctx.frozenProjectContext.officialMemoryIndex
     if (!index) return { name: 'PROJECT_MEMORY', content: header }
-    return { name: 'PROJECT_MEMORY', content: `${header}\n\n## 项目索引\n\n${index}` }
+    const bounded = trimIndexToUtf8Bytes(index, PROJECT_MEMORY_MAX_BYTES, 'oc-memory project-search')
+    return { name: 'PROJECT_MEMORY', content: `${header}\n\n## 项目索引\n\n${bounded}` }
   }
   const boardId =
     (ctx.projectContext?.bound && ctx.projectContext.boardProjectId) || ctx.projectId || null
@@ -1000,8 +1196,8 @@ export async function buildProjectMemorySlot(ctx: PromptSlotContext): Promise<Pr
         expires: row.expires,
         deprecated: row.deprecated,
       })),
-      PROJECT_MEMORY_INDEX_MAX_CHARS,
-      PROJECT_MEMORY_INDEX_MAX_LINES,
+      PROJECT_MEMORY_MAX_BYTES,
+      PROJECT_MEMORY_MAX_LINES,
     )
   } catch {
     return null
@@ -1009,9 +1205,10 @@ export async function buildProjectMemorySlot(ctx: PromptSlotContext): Promise<Pr
   const header = PROJECT_MEMORY_HEADER
   if (ctx.provider === 'cursor') return { name: 'PROJECT_MEMORY', content: header }
   if (!index) return { name: 'PROJECT_MEMORY', content: header }
+  const bounded = trimIndexToUtf8Bytes(index, PROJECT_MEMORY_MAX_BYTES, 'oc-memory project-search')
   return {
     name: 'PROJECT_MEMORY',
-    content: `${header}\n\n## 项目索引\n\n${index}`,
+    content: `${header}\n\n## 项目索引\n\n${bounded}`,
   }
 }
 
@@ -1064,7 +1261,7 @@ export function buildToolsSlot(
       '',
       '## 技能自生成',
       '',
-      '完成 3+ 工具调用的复杂任务、修好反复问题或验证出可复用流程后主动沉淀:先 `skill_search(query)` 查重,过时用同名 `skill_save(...)` 更新、没有再新建,保持泛化不写隐私/token/短期路径。结构与写法见 `skill_view("skill-authoring")`。',
+      '仅跨任务重复 ≥2 次的通用方法论才用 `skill_save` 沉淀；单次排障/临时脚本/个案记录请写 Archival 或工单，禁止建 Skill。沉淀前先 `skill_search(query)` 查重，过时用同名 `skill_save(...)` 更新、没有再新建，保持泛化不写隐私/token/短期路径。结构与写法见 `skill_view("skill-authoring")`。',
     )
   }
   if (promptEngineOf(ctx.provider) !== 'ccb') {
@@ -1634,6 +1831,36 @@ export interface PromptSlotApplied {
   meta?: Record<string, string>
 }
 
+export interface PromptSlotBreakdown {
+  systemBytes: number
+  memoryBytes: number
+  skillsBytes: number
+  projectBytes: number
+}
+
+/** OCV5-840: Aggregate applied prompt slot bytes into context-pressure breakdown categories. */
+export function summarizePromptSlotBreakdown(
+  applied: readonly Pick<PromptSlotApplied, 'name' | 'bytes'>[],
+): PromptSlotBreakdown {
+  let systemBytes = 0
+  let memoryBytes = 0
+  let skillsBytes = 0
+  let projectBytes = 0
+  for (const slot of applied) {
+    const bytes = Number.isFinite(slot.bytes) && slot.bytes > 0 ? slot.bytes : 0
+    if (slot.name === 'MEMORY' || slot.name === 'MEMORY_INDEX') {
+      memoryBytes += bytes
+    } else if (slot.name === 'SKILLS' || slot.name === 'SKILLS_LITERATURE') {
+      skillsBytes += bytes
+    } else if (slot.name === 'PROJECT' || slot.name === 'PROJECT_MEMORY') {
+      projectBytes += bytes
+    } else {
+      systemBytes += bytes
+    }
+  }
+  return { systemBytes, memoryBytes, skillsBytes, projectBytes }
+}
+
 export type { FrozenProjectContextDigests } from './runContextPersist.js'
 
 export interface PromptContextResult {
@@ -1691,6 +1918,138 @@ function staticFirstSlots(
     }
   }
   return { slots: [...staticPart, ...dynamicPart], staticCount: staticPart.length }
+}
+
+/**
+ * OCV5-840: Global prompt budget arbiter.
+ * When assembled UTF-8 bytes exceed `maxTotalBytes`, degrade low-priority dynamic
+ * slots in strict deterministic order:
+ *   SKILLS -> L0 compact
+ *   MEMORY_INDEX / MEMORY index -> half bytes
+ *   PROJECT_MEMORY index -> half bytes
+ *   PROJECT assets -> compact notice
+ *   AGENTS_DYNAMIC / AGENTS dynamic tail -> compact / drop
+ *   Remaining MEMORY/PROJECT_MEMORY index bodies -> drop (rules kept)
+ */
+export function enforceGlobalPromptBudget(
+  slots: readonly PromptSlot[],
+  staticCount: number,
+  maxTotalBytes: number,
+): { slots: PromptSlot[]; staticCount: number; degradedSteps: string[] } {
+  const assemble = (list: readonly PromptSlot[], sc: number): string =>
+    sc < 0
+      ? list.map((s) => s.content).join(SEPARATOR)
+      : [
+          ...list.slice(0, sc).map((s) => s.content),
+          PROMPT_SESSION_CONTEXT_MARKER,
+          ...list.slice(sc).map((s) => s.content),
+        ].join(SEPARATOR)
+
+  const out = slots.map((s) => ({ ...s }))
+  let sc = staticCount
+  const curBytes = () => Buffer.byteLength(assemble(out, sc), 'utf8')
+  if (curBytes() <= maxTotalBytes) return { slots: out, staticCount: sc, degradedSteps: [] }
+
+  const degradedSteps: string[] = []
+  const halveIndexInSlot = (slot: PromptSlot, heading: string, searchCmd: string): boolean => {
+    const idx = slot.content.indexOf(heading)
+    if (idx < 0) return false
+    const before = slot.content.slice(0, idx).trimEnd()
+    const body = slot.content.slice(idx + heading.length).trim()
+    const bodyBytes = Buffer.byteLength(body, 'utf8')
+    if (bodyBytes <= 256) return false
+    const half = Math.max(256, Math.floor(bodyBytes / 2))
+    const trimmed = trimIndexToUtf8Bytes(body, half, searchCmd)
+    slot.content = before ? `${before}\n\n${heading}\n\n${trimmed}` : `${heading}\n\n${trimmed}`
+    return true
+  }
+
+  // 1. SKILLS -> L0 compact
+  for (const slot of out) {
+    if (curBytes() <= maxTotalBytes) break
+    if (slot.name === 'SKILLS' && slot.content !== CURSOR_SKILLS_COMPACT) {
+      slot.content = CURSOR_SKILLS_COMPACT
+      degradedSteps.push('skills_l0')
+    }
+  }
+
+  // 2. MEMORY_INDEX / MEMORY index -> halve
+  for (const slot of out) {
+    if (curBytes() <= maxTotalBytes) break
+    if (slot.name === 'MEMORY_INDEX' || slot.name === 'MEMORY') {
+      if (halveIndexInSlot(slot, '## 当前索引', 'oc-memory core-search')) {
+        degradedSteps.push('memory_index_half')
+      }
+    }
+  }
+
+  // 3. PROJECT_MEMORY index -> halve
+  for (const slot of out) {
+    if (curBytes() <= maxTotalBytes) break
+    if (slot.name === 'PROJECT_MEMORY') {
+      if (halveIndexInSlot(slot, '## 项目索引', 'oc-memory project-search')) {
+        degradedSteps.push('project_memory_half')
+      }
+    }
+  }
+
+  // 4. PROJECT assets -> compact index-only notice
+  for (const slot of out) {
+    if (curBytes() <= maxTotalBytes) break
+    if (slot.name === 'PROJECT') {
+      const start = slot.content.indexOf(PROJECT_ASSETS_START)
+      const end = slot.content.indexOf(PROJECT_ASSETS_END)
+      if (start >= 0 && end > start) {
+        const before = slot.content.slice(0, start).trimEnd()
+        const after = slot.content.slice(end + PROJECT_ASSETS_END.length).trimStart()
+        const compact = [
+          PROJECT_ASSETS_START,
+          '参考资料清单已因总提示预算折叠；请用 `project_search` 或直接 Read 项目文件。',
+          PROJECT_ASSETS_END,
+        ].join('\n')
+        slot.content = [before, compact, after].filter(Boolean).join('\n\n')
+        degradedSteps.push('project_assets_compact')
+      }
+    }
+  }
+
+  // 5. AGENTS_DYNAMIC / AGENTS dynamic tail -> slim
+  for (let i = out.length - 1; i >= 0 && curBytes() > maxTotalBytes; i--) {
+    const slot = out[i]!
+    if (slot.name === 'AGENTS_DYNAMIC') {
+      out.splice(i, 1)
+      if (sc >= 0 && i < sc) sc--
+      degradedSteps.push('agents_dynamic_dropped')
+    } else if (slot.name === 'AGENTS') {
+      let cut = -1
+      for (const h of ['\n## 多 Agent 协作', '\n## 委派可用型号']) {
+        const pos = slot.content.indexOf(h)
+        if (pos >= 0 && (cut < 0 || pos < cut)) cut = pos
+      }
+      if (cut >= 0) {
+        slot.content = slot.content.slice(0, cut).trimEnd()
+        degradedSteps.push('agents_dynamic_trimmed')
+      }
+    }
+  }
+
+  // 6. Final fallback: drop remaining index bodies (keeping rule headers intact)
+  for (let i = out.length - 1; i >= 0 && curBytes() > maxTotalBytes; i--) {
+    const slot = out[i]!
+    if (slot.name === 'MEMORY_INDEX') {
+      out.splice(i, 1)
+      if (sc >= 0 && i < sc) sc--
+      degradedSteps.push('memory_index_dropped')
+    } else if (slot.name === 'MEMORY' && slot.content.includes('## 当前索引')) {
+      slot.content = slot.content.slice(0, slot.content.indexOf('## 当前索引')).trimEnd()
+      degradedSteps.push('memory_index_dropped')
+    } else if (slot.name === 'PROJECT_MEMORY' && slot.content.includes('## 项目索引')) {
+      slot.content = slot.content.slice(0, slot.content.indexOf('## 项目索引')).trimEnd()
+      degradedSteps.push('project_memory_dropped')
+    }
+  }
+
+  return { slots: out, staticCount: sc, degradedSteps }
 }
 
 export async function buildPromptContext(ctx: PromptSlotContext): Promise<PromptContextResult> {
@@ -1882,18 +2241,46 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
       ? staticFirstSlots(slots, agentsParts, memoryParts)
       : { slots, staticCount: -1 }
   const sanitizeMcpClaims = createMcpClaimSanitizer(ctx.availableMcpTools)
-  const effectiveSlots = ordered.slots.map((slot) => ({
+  const sanitizedSlots = ordered.slots.map((slot) => ({
     ...slot,
     content: sanitizeMcpClaims(slot.content),
   }))
-  let content =
+  const agentsStaticSanitized = sanitizeMcpClaims([agentsParts.header, ...agentsParts.tips].join('\n'))
+  const agentsStaticSha256 = createHash('sha256').update(agentsStaticSanitized, 'utf8').digest('hex')
+  const maxTotalBytes =
+    typeof ctx.maxTotalBytes === 'number' && Number.isSafeInteger(ctx.maxTotalBytes) && ctx.maxTotalBytes > 0
+      ? ctx.maxTotalBytes
+      : PROMPT_TOTAL_MAX_BYTES
+  const beforeBudgetBytes = Buffer.byteLength(
     ordered.staticCount < 0
+      ? sanitizedSlots.map((s) => s.content).join(SEPARATOR)
+      : [
+          ...sanitizedSlots.slice(0, ordered.staticCount).map((s) => s.content),
+          PROMPT_SESSION_CONTEXT_MARKER,
+          ...sanitizedSlots.slice(ordered.staticCount).map((s) => s.content),
+        ].join(SEPARATOR),
+    'utf8',
+  )
+  const budgeted = enforceGlobalPromptBudget(sanitizedSlots, ordered.staticCount, maxTotalBytes)
+  const effectiveSlots = budgeted.slots
+  let content =
+    budgeted.staticCount < 0
       ? effectiveSlots.map((s) => s.content).join(SEPARATOR)
       : [
-          ...effectiveSlots.slice(0, ordered.staticCount).map((s) => s.content),
+          ...effectiveSlots.slice(0, budgeted.staticCount).map((s) => s.content),
           PROMPT_SESSION_CONTEXT_MARKER,
-          ...effectiveSlots.slice(ordered.staticCount).map((s) => s.content),
+          ...effectiveSlots.slice(budgeted.staticCount).map((s) => s.content),
         ].join(SEPARATOR)
+  if (budgeted.degradedSteps.length > 0) {
+    slotsLog.warn('prompt_total_budget_degraded', {
+      agentId: ctx.agentId,
+      sessionKey: ctx.sessionKey,
+      beforeBytes: beforeBudgetBytes,
+      afterBytes: Buffer.byteLength(content, 'utf8'),
+      maxTotalBytes,
+      steps: budgeted.degradedSteps,
+    })
+  }
   if (resolvePromptUserRole(ctx) === 'admin') {
     content = stripBaselineRestrictions(content)
   }
@@ -1909,12 +2296,15 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
     if ((s as ModelHintSlot).canonicalId !== undefined) {
       base.meta = { model_id: (s as ModelHintSlot).canonicalId }
     }
+    if (s.name === 'AGENTS') {
+      base.meta = { ...(base.meta ?? {}), static_sha256: agentsStaticSha256 }
+    }
     return base
   }))
   const contentMetrics = promptContentMetrics.get(content)
   const slotTokensEstimate = Object.fromEntries(
-    ['ENV', 'SOUL', 'USER', 'PROJECT', 'INTELLIGENT_UI', 'AGENTS', 'SKILLS',
-      'SKILLS_LITERATURE', 'MEMORY', 'PROJECT_MEMORY', 'TOOLS', 'MODEL_HINT', 'RESEARCH', 'REPO']
+    ['ENV', 'SOUL', 'USER', 'PROJECT', 'INTELLIGENT_UI', 'AGENTS', 'AGENTS_DYNAMIC', 'SKILLS',
+      'SKILLS_LITERATURE', 'MEMORY', 'MEMORY_INDEX', 'PROJECT_MEMORY', 'TOOLS', 'MODEL_HINT', 'RESEARCH', 'REPO']
       .map(name => [name, effectiveSlots.reduce((sum, slot, index) =>
         sum + (slot.name === name ? metrics[index]!.tokensEstimate : 0), 0)]),
   )

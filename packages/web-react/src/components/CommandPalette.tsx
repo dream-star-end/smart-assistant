@@ -6,8 +6,10 @@ import {
   FileText,
   Folder,
   FolderInput,
+  Gauge,
   House,
   MessageSquare,
+  Minimize2,
   Moon,
   Plug,
   Plus,
@@ -120,6 +122,8 @@ export type CommandPaletteProps = {
   onFindInSession?: () => void;
   onShareSession?: () => void;
   onOpenInbox?: () => void;
+  onCompactSession?: () => void;
+  onOpenContextHealth?: () => void;
 };
 
 type RemoteResults = { q: string; hits: SessionSearchHit[]; assets: ProjectAsset[] };
@@ -250,6 +254,8 @@ export function CommandPalette(props: CommandPaletteProps) {
         canFindInSession: !!props.onFindInSession,
         canShareSession: Boolean(props.onShareSession && activeSession),
         canOpenInbox: !!props.onOpenInbox,
+        canCompactSession: Boolean(props.onCompactSession && activeSession),
+        canOpenContextHealth: Boolean(props.onOpenContextHealth && activeSession),
       }),
     });
   }, [
@@ -417,6 +423,14 @@ export function CommandPalette(props: CommandPaletteProps) {
       case "open-inbox":
         close();
         props.onOpenInbox?.();
+        return;
+      case "compact-session":
+        close();
+        props.onCompactSession?.();
+        return;
+      case "context-health":
+        close();
+        props.onOpenContextHealth?.();
         return;
     }
   };
@@ -756,6 +770,10 @@ function renderActionIcon(id: PaletteActionId): ReactNode {
       return <Share2 size={14} strokeWidth={1.75} />;
     case "open-inbox":
       return <Bell size={14} strokeWidth={1.75} />;
+    case "compact-session":
+      return <Minimize2 size={14} strokeWidth={1.75} />;
+    case "context-health":
+      return <Gauge size={14} strokeWidth={1.75} />;
     default:
       return <AtelierIcon name="newChat" size={15} />;
   }

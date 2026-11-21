@@ -334,6 +334,8 @@ export type ChatMessage = {
   /** Exact model call that produced this card/message. Display-only; billing
    * continues to use the turn-level `usage` field. */
   _callUsage?: CallTokenUsageSnapshot;
+  /** OCV5-840: structured detail for a `sys.context_compacted` receipt row. */
+  _contextCompaction?: SessionContextCompactionDetail;
   /** max_tokens / pause_turn 截断标记（渲染 “继续” 按钮）。*/
   _truncated?: string;
   /** error 红卡：归一化 code + 折叠区原始 detail。*/
@@ -625,6 +627,41 @@ export type ChatMessage = {
  * 一个对话会话的完整运行期状态。下划线字段是消费侧不变量的私有状态
  * （游标 / 流式指针 / 守卫时间戳），随 session 序列化进 IndexedDB（断点续传）。
  */
+export type SessionContextPressureBreakdown = {
+  systemBytes?: number;
+  memoryBytes?: number;
+  skillsBytes?: number;
+  projectBytes?: number;
+  historyBytes?: number;
+  toolsBytes?: number;
+};
+
+/** OCV5-840: latest context window occupancy / pressure sample (browser-only runtime state). */
+export type SessionContextPressureState = {
+  engine: string;
+  scope: "launch_prompt" | "native_context";
+  dimension: "transport_bytes" | "tokens";
+  level: "warning" | "critical";
+  usedRatio: number;
+  usedTokens?: number;
+  windowTokens?: number;
+  breakdown?: SessionContextPressureBreakdown;
+  updatedAt: number;
+};
+
+/** OCV5-840: structured detail persisted on a `sys.context_compacted` timeline row. */
+export type SessionContextCompactionDetail = {
+  engine: string;
+  scope?: string;
+  strategy?: string;
+  beforeBytes?: number;
+  afterBytes?: number;
+  droppedEntries?: number;
+  beforeTokens?: number;
+  afterTokens?: number;
+  summaryPreview?: string;
+};
+
 export type ChatSession = {
   id: string;
   agentId: string;
@@ -718,6 +755,10 @@ export type ChatSession = {
   /** OCV5-704: when the current `compacting` phase began (local clock). The
    * 「正在压缩上下文 (Ns)」 seconds count from here, not from turn start. */
   _turnStatusSince?: number;
+  /** OCV5-840: latest context window occupancy / pressure observation (memory-only). */
+  _contextPressure?: SessionContextPressureState;
+  /** OCV5-840: manual `/compact` request in-flight for this session (memory-only). */
+  _compactingManual?: boolean;
   /** Bridge hello snapshot (meta.detached) arrival time; stale once a newer frame lands. */
   _turnDetachedAt?: number;
   /** Stream of the last applied session snapshot. Hello / HTTP report it with the

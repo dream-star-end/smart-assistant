@@ -1,6 +1,7 @@
-import { ChevronRight, Lock, MessageSquarePlus, SearchX, Sparkles, Store } from "lucide-react";
-import { useCallback, useEffect, useId, useMemo, useState } from "react";
+import { Archive, ChevronRight, Lock, MessageSquarePlus, SearchX, Sparkles, Store } from "lucide-react";
+import { lazy, Suspense, useCallback, useEffect, useId, useMemo, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
+import { formatBytes } from "../../lib/chat/download";
 import { CHAT_CREATE_TEMPLATES } from "../../lib/chatCreateTemplates";
 import type { AuthSession, MarketplaceMyAgent, SkillSummary } from "../../lib/types";
 import { cn } from "../../lib/utils";
@@ -10,10 +11,12 @@ import {
   Button,
   EmptyState,
   GroupHeading,
+  IconButton,
   ListGroup,
   ListRow,
   ListSkeleton,
   PanelHeader,
+  Spinner,
   Toolbar,
   useConfirm,
   useToast,
@@ -23,6 +26,10 @@ import { SKILL_RUN_MODEL } from "./SkillOptPanel";
 import { SkillEditor } from "./SkillEditor";
 import { ProjectSkillOverlay } from "./ProjectSkillOverlay";
 import { skillDisplayTitle } from "./skillDisplay";
+
+const ContextArchiveDrawer = lazy(() =>
+  import("./ContextArchiveDrawer").then((m) => ({ default: m.ContextArchiveDrawer })),
+);
 
 /**
  * 技能库：列出用户可用技能（经容器代理 /api/skills），点行打开技能工作台；
@@ -67,6 +74,8 @@ export function SkillsPanel({
   const [reload, setReload] = useState(0);
   const [filter, setFilter] = useState("");
   const [rates, setRates] = useState<ModelRates | null>(null);
+  const [archiveOpen, setArchiveOpen] = useState(false);
+  const [archivingName, setArchivingName] = useState<string | null>(null);
   const [confirmDialog, confirmDialogEl] = useConfirm();
   const toast = useToast();
 
@@ -157,6 +166,24 @@ export function SkillsPanel({
   // 只有筛选中才在右侧给「12 / 282」—— 那时它才是新信息。
   const countLabel = q ? `${visible.length} / ${total}` : null;
 
+  const archive = useCallback(
+    async (sk: SkillSummary) => {
+      if (archivingName || typeof api.archiveSkill !== "function") return;
+      const { title } = skillDisplayTitle(sk);
+      setArchivingName(sk.name);
+      try {
+        await api.archiveSkill(auth, sk.name, "manual_archive");
+        setReload((n) => n + 1);
+        toast(`已归档技能「${title}」，随时可在归档箱恢复`, "success");
+      } catch (e) {
+        toast(apiErrorMessage(e, "归档失败"), "error");
+      } finally {
+        setArchivingName(null);
+      }
+    },
+    [archivingName, auth, toast],
+  );
+
   const renderRow = (sk: SkillSummary) => (
     <SkillRow
       key={sk.name}
@@ -164,6 +191,8 @@ export function SkillsPanel({
       skill={sk}
       agents={agents}
       rates={rates}
+      archiving={archivingName === sk.name}
+      onArchive={sk.writable ? () => void archive(sk) : undefined}
       onDelete={() => remove(sk)}
       onChanged={() => setReload((n) => n + 1)}
     />
@@ -176,16 +205,26 @@ export function SkillsPanel({
         title="技能"
         hint="完成复杂任务后智能体会把流程沉淀成可复用技能；也可从市场安装。"
         action={
-          onOpenMarketplace ? (
+          <div className="flex items-center gap-1">
             <Button
               size="sm"
               variant="ghost"
-              onClick={onOpenMarketplace}
+              onClick={() => setArchiveOpen(true)}
               className="oc-btn-tactile gap-1.5 rounded-lg px-2.5 text-muted hover:text-fg"
             >
-              <Store size={14} strokeWidth={1.75} aria-hidden="true" /> 市场
+              <Archive size={14} strokeWidth={1.75} aria-hidden="true" /> 归档箱
             </Button>
-          ) : undefined
+            {onOpenMarketplace && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={onOpenMarketplace}
+                className="oc-btn-tactile gap-1.5 rounded-lg px-2.5 text-muted hover:text-fg"
+              >
+                <Store size={14} strokeWidth={1.75} aria-hidden="true" /> 市场
+              </Button>
+            )}
+          </div>
         }
       />
       <ProjectSkillOverlay auth={auth} agents={agents} />
@@ -282,6 +321,18 @@ export function SkillsPanel({
           )}
         </>
       )}
+      {archiveOpen && (
+        <Suspense fallback={null}>
+          <ContextArchiveDrawer
+            open={archiveOpen}
+            onOpenChange={setArchiveOpen}
+            auth={auth}
+            agentId={agents[0]?.id ?? "main"}
+            initialTab="skills"
+            onRestored={() => setReload((n) => n + 1)}
+          />
+        </Suspense>
+      )}
     </div>
   );
 }
@@ -303,6 +354,8 @@ function SkillRow({
   skill,
   agents,
   rates,
+  archiving = false,
+  onArchive,
   onDelete,
   onChanged,
 }: {
@@ -310,6 +363,8 @@ function SkillRow({
   skill: SkillSummary;
   agents: MarketplaceMyAgent[];
   rates: ModelRates | null;
+  archiving?: boolean;
+  onArchive?: () => void;
   onDelete: () => Promise<boolean>;
   onChanged: () => void;
 }) {
@@ -326,14 +381,14 @@ function SkillRow({
   // 短标题(第一句,14/500,单行)/ 其余描述(13 灰,桌面单行、窄屏两行)/ 12 号元信息。
   // 改前是两行同色同字重的整句触发描述,282 条连成一面字墙。
   return (
-    <ListRow data-interactive="" className="p-0 transition-colors hover:bg-hover/70">
+    <ListRow data-interactive="" className="flex items-center p-0 transition-colors hover:bg-hover/70">
       <button
         type="button"
         onClick={() => setEditorOpen(true)}
         aria-haspopup="dialog"
         aria-label={`${skill.writable ? "打开" : "查看"} ${display.title}`}
         aria-describedby={descId}
-        className="group flex min-h-14 w-full min-w-0 items-center gap-3 px-4 py-3.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        className="group flex min-h-14 min-w-0 flex-1 items-center gap-3 px-4 py-3.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
       >
         <span
           aria-hidden="true"
@@ -371,12 +426,32 @@ function SkillRow({
                 {isHub ? "市场" : "自建"}
               </span>
             </span>
+            {skill.tier === "hot" && (
+              <span className="shrink-0">
+                <span className="oc-badge-craft inline-flex items-center rounded-full bg-success-soft px-1.5 py-0.5 text-caption font-medium text-success">
+                  常驻/热
+                </span>
+              </span>
+            )}
+            {skill.tier === "cold" && (
+              <span className="shrink-0">
+                <span className="oc-badge-craft inline-flex items-center rounded-full bg-warning-soft px-1.5 py-0.5 text-caption font-medium text-warning">
+                  冷门
+                </span>
+              </span>
+            )}
             {skill.writable === false && (
               <span className="shrink-0">
                 <span className="oc-badge-craft inline-flex items-center rounded-full bg-hover px-1.5 py-0.5 text-caption text-muted">
                   只读
                 </span>
               </span>
+            )}
+            {typeof skill.bytes === "number" && skill.bytes > 0 && (
+              <span className="shrink-0 tabular-nums text-faint">{formatBytes(skill.bytes)}</span>
+            )}
+            {typeof skill.useCount30d === "number" && skill.useCount30d > 0 && (
+              <span className="shrink-0 tabular-nums text-faint">近30天 {skill.useCount30d} 次</span>
             )}
             <span className="min-w-0 truncate text-muted">{scopeLabel}</span>
             {tags.length > 0 && (
@@ -397,6 +472,23 @@ function SkillRow({
           className="shrink-0 text-faint transition-transform duration-150 group-hover:translate-x-0.5 group-hover:text-fg"
         />
       </button>
+      {onArchive && (
+        <div className="pr-2">
+          <IconButton
+            size="sm"
+            aria-label={`归档技能 ${display.title}`}
+            title="移入归档箱（移出常驻注入，随时可恢复）"
+            disabled={archiving}
+            className="oc-icon-btn-tactile shrink-0 text-faint hover:text-fg"
+            onClick={(e) => {
+              e.stopPropagation();
+              onArchive();
+            }}
+          >
+            {archiving ? <Spinner size={13} /> : <Archive size={14} strokeWidth={1.75} aria-hidden="true" />}
+          </IconButton>
+        </div>
+      )}
       <SkillEditor
         auth={auth}
         skillName={skill.name}

@@ -40,6 +40,8 @@ import {
   SkillDraftStore,
   isPlatformReservedSkillName,
   parseSkillEvalsJson,
+  recordLocalSkillSearchHits,
+  recordLocalSkillView,
   searchSkillMetadata,
   serializeSkillEvals,
   syncMarketplaceHub,
@@ -500,6 +502,10 @@ async function handleSkillSearch(args: { query: string; limit?: number } | undef
     // If none of the ranked names map back to a known skill, treat as a miss
     // and fall through to keyword rather than emitting an empty "Found N".
     if (matched.length > 0) {
+      await recordLocalSkillSearchHits(
+        matched.map(({ r }) => r.name),
+        'user',
+      ).catch(() => {})
       const lines = [`Found ${matched.length} relevant skill(s) for "${query}" (semantic):`, '']
       for (const { r, s } of matched) {
         lines.push(`### ${r.name} [source: ${s!.source}, relevance: ${r.score.toFixed(3)}]`)
@@ -531,6 +537,10 @@ async function handleSkillSearch(args: { query: string; limit?: number } | undef
   }
 
   const lines = [`Found ${hits.length} matching skill(s) for "${query}":`, '']
+  await recordLocalSkillSearchHits(
+    hits.map((s) => s.name),
+    'user',
+  ).catch(() => {})
   for (const s of hits) {
     lines.push(`### ${s.name} [source: ${s.source}, score: ${s.score}]`)
     lines.push(s.description)
@@ -553,11 +563,14 @@ async function handleSkillView(args: { name: string; subfile?: string }) {
   const v = await skills.view(args.name, args.subfile)
   if (!v) return toolError('skill not found')
   if (typeof v === 'string') {
+    await recordLocalSkillView(args.name, 'user').catch(() => {})
     // Subfile read returns a bare string; we have no source metadata here without
     // a second lookup, but the containing skill_view call can be assumed to land
     // in whichever root actually owned the parent name (baseline-wins).
     return { content: [{ type: 'text', text: v }] }
   }
+  const usageLayer = v.layer === 'hub' ? 'hub' : v.source === 'platform' ? 'platform' : 'user'
+  await recordLocalSkillView(args.name, usageLayer).catch(() => {})
   const header = `[source: ${v.source}]`
   return { content: [{ type: 'text', text: `${header}\n\n${v.rawContent}` }] }
 }
@@ -663,7 +676,26 @@ async function handleSkillSave(rawArgs: unknown) {
     args.body,
   )
   if (!r.ok) return toolError(r.error ?? 'save failed')
-  return toolOk(`Saved skill "${args.name}".`)
+  const notices: string[] = []
+  const bodyBytes = Buffer.byteLength(args.body, 'utf8')
+  if (bodyBytes > 16 * 1024) {
+    notices.push(
+      `Notice: SKILL.md body is ${(bodyBytes / 1024).toFixed(1)} KB (>16 KB). Split detailed reference tables, examples, or long scripts into \`references/\` files so tier-2 loading stays compact.`,
+    )
+  }
+  try {
+    const activeUserSkills = (await skills.list({ includePlatform: false })).length
+    if (activeUserSkills > 60) {
+      notices.push(
+        `Notice: You now have ${activeUserSkills} active user skills (>60). Consider merging overlapping skills or archiving unused cold skills via Manage Center -> Skills Archive to keep context clean.`,
+      )
+    }
+  } catch {
+    // fail-open guardrail
+  }
+  return toolOk(
+    notices.length > 0 ? `Saved skill "${args.name}".\n\n${notices.join('\n')}` : `Saved skill "${args.name}".`,
+  )
 }
 
 async function handleSkillDelete(args: { name: string }) {

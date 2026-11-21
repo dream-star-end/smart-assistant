@@ -145,6 +145,17 @@ function slugify(s: string): string {
 export type CoreMemoryPaths = Pick<typeof paths,
   'agentMemoryDir' | 'agentMemoryMd' | 'agentMemoryLock' | 'agentMemoryBatchJournal' | 'agentMemoryBarrier'>
 
+/** Build a CoreMemoryPaths binding anchored to an explicit agent directory (tests & archive/janitor). */
+export function createMemoryDirForAgentDir(agentDir: string, agentId = 'main'): MemoryDir {
+  return new MemoryDir(agentId, {
+    agentMemoryDir: () => join(agentDir, 'memory'),
+    agentMemoryMd: () => join(agentDir, 'MEMORY.md'),
+    agentMemoryLock: () => join(agentDir, 'MEMORY.md.lock'),
+    agentMemoryBatchJournal: () => join(agentDir, '.memory-batch-journal.json'),
+    agentMemoryBarrier: () => join(agentDir, 'memory-barrier.lock'),
+  })
+}
+
 export class MemoryDir {
   constructor(private readonly agentId: string, private readonly locations: CoreMemoryPaths = paths) {}
 
@@ -262,6 +273,36 @@ export class MemoryDir {
     const barrier = await this.acquireSharedBarrier()
     try {
       return await this.withFileLock(fn)
+    } finally {
+      await barrier.release().catch(() => {})
+    }
+  }
+
+  /**
+   * Exclusive cross-process barrier + memdir file lock for atomic maintenance
+   * operations (e.g. reversible archive / restore). Recovers any in-flight batch
+   * and ensures memdir migration before running `fn`, and exposes `reconcileIndex`
+   * so callers can rebuild MEMORY.md while still holding the lock.
+   */
+  async withExclusiveMemoryLock<T>(
+    fn: (ctx: { dirPath: string; indexPath: string; reconcileIndex: () => Promise<string> }) => Promise<T>,
+    timeoutMs = 5_000,
+  ): Promise<T> {
+    const barrier = await acquireKernelFileLock(
+      this.locations.agentMemoryBarrier(this.agentId),
+      timeoutMs,
+      'exclusive',
+    )
+    try {
+      return await this.withFileLock(async () => {
+        await this.recoverBatchLocked()
+        await this.ensureMigratedLocked()
+        return await fn({
+          dirPath: this.dirPath(),
+          indexPath: this.indexPath(),
+          reconcileIndex: () => this.reconcileIndexLocked(),
+        })
+      })
     } finally {
       await barrier.release().catch(() => {})
     }

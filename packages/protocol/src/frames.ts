@@ -1661,8 +1661,30 @@ export const ControlListSessions = Type.Object({
 export const ControlHealth = Type.Object({ type: Type.Literal('control.health') })
 export const ControlCompact = Type.Object({
   type: Type.Literal('control.session.compact'),
-  sessionKey: Type.String(),
+  sessionKey: Type.Optional(Type.String()),
+  sessionId: Type.Optional(Type.String()),
+  instructions: Type.Optional(Type.String()),
+  requestId: Type.Optional(Type.String()),
 })
+export type ControlCompact = Static<typeof ControlCompact>
+export const OutboundSessionCompactResult = Type.Object({
+  type: Type.Literal('outbound.session_compact_result'),
+  sessionKey: Type.String(),
+  channel: Type.Optional(Type.String()),
+  peer: Type.Optional(Peer),
+  requestId: Type.Optional(Type.String()),
+  ok: Type.Boolean(),
+  supported: Type.Boolean(),
+  strategy: Type.Optional(Type.String()),
+  beforeTokens: Type.Optional(Type.Integer({ minimum: 0 })),
+  afterTokens: Type.Optional(Type.Integer({ minimum: 0 })),
+  beforeBytes: Type.Optional(Type.Integer({ minimum: 0 })),
+  afterBytes: Type.Optional(Type.Integer({ minimum: 0 })),
+  summaryPreview: Type.Optional(Type.String()),
+  error: Type.Optional(Type.String()),
+  ts: Type.Optional(Type.Number()),
+})
+export type OutboundSessionCompactResult = Static<typeof OutboundSessionCompactResult>
 export const ControlCancelModelSwitch = Type.Object({
   type: Type.Literal('control.session.cancel_model_switch'),
   sessionKey: Type.String(),
@@ -1724,6 +1746,7 @@ export const AnyFrame = Type.Union([
   OutboundPermissionSettled,
   OutboundControlReceipt,
   OutboundModelSwitchPrepared,
+  OutboundSessionCompactResult,
   OutboundResumeFailed,
   OutboundActiveTurnReplayStart,
   OutboundError,

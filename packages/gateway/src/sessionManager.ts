@@ -149,6 +149,7 @@ import {
   modelHistoryRoleLabel,
   modelHistorySemanticRole,
   modelHistorySemanticText,
+  projectModelHistoryForReplay,
   type ModelHistorySemanticRole,
   type TurnWaiveReason,
   type DurableAgentGroup,
@@ -459,28 +460,46 @@ export function buildHistoricalContextPrompt(
 ): string | null {
   const promptUserText = includeCurrentUserText ? currentUserText : ''
   const currentNorm = normForCompare(currentUserText)
-  const rows: Array<{ role: ModelHistorySemanticRole; text: string; status?: unknown }> = []
-  for (const raw of messages) {
-    if (!raw || typeof raw !== 'object') continue
+  // Drop trailing optimistic/duplicate current user message before replay decay so
+  // the last 2 prior user turns keep full tool outputs while older tool/delegate rows decay.
+  let end = messages.length
+  while (end > 0) {
+    const raw = messages[end - 1]
+    if (!raw || typeof raw !== 'object') {
+      end -= 1
+      continue
+    }
     const msg = raw as ChatHistoryMessage
-    if (msg.system === true) continue
+    if (msg.system === true) {
+      end -= 1
+      continue
+    }
     const role = modelHistorySemanticRole(msg)
-    if (!role) continue
+    if (!role) {
+      end -= 1
+      continue
+    }
     const text = modelHistorySemanticText(msg).trim()
-    if (!text) continue
-    rows.push({ role, text, status: msg.status })
-  }
-  while (rows.length > 0) {
-    const last = rows[rows.length - 1]
-    const lastNorm = normForCompare(last.text)
+    if (!text) {
+      end -= 1
+      continue
+    }
+    const lastNorm = normForCompare(text)
     const isCurrent =
-      last.role === 'user' &&
-      (last.status === 'sending' ||
-        last.status === 'queued' ||
+      role === 'user' &&
+      (msg.status === 'sending' ||
+        msg.status === 'queued' ||
         (currentNorm && (lastNorm === currentNorm || currentNorm.startsWith(lastNorm))))
     if (!isCurrent) break
-    rows.pop()
+    end -= 1
   }
+  const rows = projectModelHistoryForReplay(messages.slice(0, end), { recentFullTurns: 2 }).map(
+    (item) => ({
+      role: item.role,
+      text: item.text,
+      status: (item.raw as ChatHistoryMessage)?.status,
+    }),
+  )
   if (rows.length === 0) return null
   const renderPrompt = (
     selectedRows: Array<{ role: ModelHistorySemanticRole; text: string }>,
@@ -575,6 +594,23 @@ export function buildNativeModelHandoffPayload(
     { type: 'text', text: buildNativeModelHandoffContext(summaryText, mediaPathHints) },
     ...currentUserInput,
   ]
+}
+
+/** OCV5-840: Wrap a Rolling Checkpoint Reset summary for one-shot next-turn injection. */
+export function buildRollingCheckpointPayload(
+  summaryText: string,
+  currentUserInput: string | Array<{ type: string; [key: string]: unknown }>,
+): string | Array<{ type: string; [key: string]: unknown }> {
+  const ctx = [
+    '<openclaude_rolling_checkpoint>',
+    'The user compacted this session context. Use this bounded checkpoint summary as prior conversation context and continue from here without replaying earlier verbose outputs.',
+    summaryText.trim(),
+    '</openclaude_rolling_checkpoint>',
+  ].join('\n')
+  if (typeof currentUserInput === 'string') {
+    return [ctx, '', '<current_user_message>', currentUserInput, '</current_user_message>'].join('\n')
+  }
+  return [{ type: 'text', text: ctx }, ...currentUserInput]
 }
 
 export function shouldAttemptHistoricalContextInjection(opts: {
@@ -2198,6 +2234,7 @@ export class SessionManager {
       modelSwitchId?: string
       /** Native compact command authored by prepareModelSwitch itself. */
       modelSwitchInternal?: string
+      _internalCompact?: boolean
     }): Promise<void> {
     return submitImpl.call(this as unknown as SessionSubmitHost, session, userTextOrBlocks, onEvent, effortLevel, model, requestId, traceId, conversationMode, opts)
   }

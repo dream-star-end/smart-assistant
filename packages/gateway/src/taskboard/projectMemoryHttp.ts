@@ -217,6 +217,30 @@ export async function handleDeprecateProjectMemory(
   sendJson(res, 200, { ok: true, official: result.official, idempotent: result.idempotent ?? false })
 }
 
+export async function handleRestoreProjectMemory(
+  res: ServerResponse,
+  db: TaskboardDb,
+  actor: Actor,
+  idOrKey: string,
+  slug: string,
+): Promise<void> {
+  if (!requireHuman(res, actor)) return
+  const project = resolveProjectOrThrow(db, idOrKey)
+  const ledger = new ProjectMemoryLedger(db)
+  const result = ledger.restoreDeprecated(project.id, slug, actorLabel(actor))
+  if (!result.ok) {
+    const code = result.error === 'not_found' ? 404 : 400
+    sendError(res, code, result.error)
+    return
+  }
+  sendJson(res, 200, {
+    ok: true,
+    restored: result.restored,
+    official: result.official,
+    idempotent: result.idempotent ?? false,
+  })
+}
+
 export function isProjectMemoryPath(path: string): boolean {
   return /^\/api\/board\/projects\/[^/]+\/memories(\/|$)/.test(path)
 }
@@ -245,7 +269,7 @@ export async function dispatchProjectMemory(
     sendError(res, 405, 'method not allowed')
     return true
   }
-  const action = path.match(/^\/api\/board\/projects\/([^/]+)\/memories\/([^/]+)\/(promote|reject|deprecate)$/)
+  const action = path.match(/^\/api\/board\/projects\/([^/]+)\/memories\/([^/]+)\/(promote|reject|deprecate|restore)$/)
   if (action) {
     if (method !== 'POST') {
       sendError(res, 405, 'method not allowed')
@@ -254,6 +278,10 @@ export async function dispatchProjectMemory(
     const id = decodeURIComponent(action[1])
     const file = decodeURIComponent(action[2])
     const verb = action[3]
+    if (verb === 'restore') {
+      await handleRestoreProjectMemory(res, db, actor, id, file)
+      return true
+    }
     const raw = await readJson(req)
     if (verb === 'promote') await handlePromoteProjectMemory(res, raw, db, actor, id, file)
     else if (verb === 'reject') await handleRejectProjectMemory(res, raw, db, actor, id, file)

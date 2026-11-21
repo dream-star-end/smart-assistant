@@ -13,6 +13,7 @@ import { consumeUnusedPreheat } from './speculativePreheat.js'
  * touches (typed from the class itself).
  */
 import { createHash } from 'node:crypto'
+import { readdirSync, statSync } from 'node:fs'
 import { join, resolve as resolvePath } from 'node:path'
 import {
   indexTurn,
@@ -41,6 +42,8 @@ import type {
   TurnToolEntry,
 } from './engine/engineEvents.js'
 import { eventBus, createEvent } from './eventBus.js'
+import { contextCompactionsTotal, contextRebuildsTotal } from './metrics.js'
+import { markCheckpointTurnOutcome } from './sessionCheckpointStore.js'
 import { beginMemoryTurnTracking } from './memoryTurnObserver.js'
 import {
   createTurnUsageRecorder,
@@ -61,10 +64,14 @@ import { failClosedOnRunningCasMiss } from './turnDispatchInbox.js'
 import {
   AUTOMATIC_TURN_RETRY_MAX,
   assessTurnRecoveryTape,
+  resolveEffectiveModelHistoryContextWindow,
   type CallTokenUsageSnapshot,
+  type ContextBreakdown,
+  type ContextPressure,
   type TurnWaiveReason,
   type OutboundContentBlock,
 } from '@openclaude/protocol'
+import { summarizePromptSlotBreakdown } from './promptSlots.js'
 import { classifyRunError } from './errorClassify.js'
 import { triggerLocalCatalogRefreshOnConfigChanged } from './modelCatalogClient.js'
 import type {
@@ -291,6 +298,123 @@ class Upstream429RetryError extends Error {
   constructor(message: string, readonly hint: Readonly<UpstreamRetryHint>) { super(message) }
 }
 
+const PROMPT_BASELINE_TTL_MS = 30_000
+const promptBaselineCache = new Map<
+  string,
+  { at: number; systemBytes: number; memoryBytes: number; skillsBytes: number; projectBytes: number }
+>()
+
+function safeStatSize(filePath: string): number {
+  try {
+    const st = statSync(filePath)
+    return st.isFile() ? st.size : 0
+  } catch {
+    return 0
+  }
+}
+
+function readResidentPromptBreakdown(agentId: string): {
+  systemBytes: number
+  memoryBytes: number
+  skillsBytes: number
+  projectBytes: number
+} {
+  const now = Date.now()
+  const cached = promptBaselineCache.get(agentId)
+  if (cached && now - cached.at < PROMPT_BASELINE_TTL_MS) {
+    return {
+      systemBytes: cached.systemBytes,
+      memoryBytes: cached.memoryBytes,
+      skillsBytes: cached.skillsBytes,
+      projectBytes: cached.projectBytes,
+    }
+  }
+  let systemBytes = 0
+  let memoryBytes = 0
+  let skillsBytes = 0
+  const projectBytes = 0
+  try {
+    const dir = paths.agentDir(agentId)
+    systemBytes += safeStatSize(join(dir, 'SOUL.md'))
+    systemBytes += safeStatSize(join(dir, 'IDENTITY.md'))
+    systemBytes += safeStatSize(paths.sharedUserMd)
+    memoryBytes += safeStatSize(join(dir, 'MEMORY.md'))
+    try {
+      const memDir = join(dir, 'memory')
+      for (const entry of readdirSync(memDir, { withFileTypes: true })) {
+        if (entry.isFile() && entry.name.endsWith('.md')) {
+          memoryBytes += safeStatSize(join(memDir, entry.name))
+        }
+      }
+    } catch {
+      /* memory dir may not exist */
+    }
+    try {
+      for (const entry of readdirSync(paths.sharedSkillsDir, { withFileTypes: true })) {
+        if (!entry.isDirectory() || entry.name.startsWith('.')) continue
+        // Skill catalog injects name + description (~220B avg per skill) rather than full SKILL.md
+        const sz = safeStatSize(join(paths.sharedSkillsDir, entry.name, 'SKILL.md'))
+        if (sz > 0) skillsBytes += Math.min(sz, 320)
+      }
+    } catch {
+      /* skills dir may not exist */
+    }
+  } catch {
+    /* fail-open */
+  }
+  promptBaselineCache.set(agentId, { at: now, systemBytes, memoryBytes, skillsBytes, projectBytes })
+  return { systemBytes, memoryBytes, skillsBytes, projectBytes }
+}
+
+/** OCV5-840: Populate missing usedTokens / windowTokens / breakdown on ContextPressure. */
+export function enrichContextPressure(
+  pressure: ContextPressure,
+  ctx: {
+    agentId: string
+    engine: string
+    modelContextWindow?: number | null
+    observedTokens?: number
+    toolsBytes?: number
+    appliedSlots?: readonly { name: string; bytes: number }[]
+  },
+): ContextPressure {
+  const windowTokens =
+    pressure.windowTokens ??
+    resolveEffectiveModelHistoryContextWindow(ctx.modelContextWindow, ctx.engine)
+  const usedTokens =
+    pressure.usedTokens ??
+    (typeof ctx.observedTokens === 'number' && ctx.observedTokens > 0
+      ? Math.round(ctx.observedTokens)
+      : pressure.dimension === 'tokens' && windowTokens > 0
+        ? Math.round(pressure.usedRatio * windowTokens)
+        : undefined)
+  let breakdown: ContextBreakdown | undefined = pressure.breakdown
+  if (!breakdown) {
+    const resident = ctx.appliedSlots
+      ? summarizePromptSlotBreakdown(ctx.appliedSlots)
+      : readResidentPromptBreakdown(ctx.agentId)
+    const toolsBytes = Math.max(0, Math.floor(ctx.toolsBytes ?? 0))
+    const totalEstimatedBytes = usedTokens && usedTokens > 0 ? Math.round(usedTokens * 3.5) : 0
+    const residentSum =
+      resident.systemBytes + resident.memoryBytes + resident.skillsBytes + resident.projectBytes
+    const historyBytes = Math.max(0, totalEstimatedBytes - residentSum - toolsBytes)
+    breakdown = {
+      systemBytes: resident.systemBytes,
+      memoryBytes: resident.memoryBytes,
+      skillsBytes: resident.skillsBytes,
+      projectBytes: resident.projectBytes,
+      historyBytes,
+      toolsBytes,
+    }
+  }
+  return {
+    ...pressure,
+    ...(usedTokens !== undefined ? { usedTokens } : {}),
+    ...(windowTokens > 0 ? { windowTokens } : {}),
+    ...(breakdown ? { breakdown } : {}),
+  }
+}
+
 // (auth 错误关键字分类已下沉 engine/ccbAdapter.ts —— 错误字符串是 CCB 底座私有
 //  知识;本层只消费 TurnSummary.errorKind === 'auth'。)
 
@@ -323,10 +447,15 @@ export async function _runOneTurn(
   grokExecutionDescriptor?: GrokExecutionDescriptor,
 ): Promise<void> {
   const { runner } = session
+  // B7: Fail-closed default — only flipped to 'completed' when a real non-error completed terminal settles.
+  markCheckpointTurnOutcome(session, 'failed')
   const turnStartTime = Date.now()
   let turnToolCallCount = 0
   let turnBlockCount = 0
   let turnPermissionCount = 0
+  let turnToolsBytes = 0
+  let lastCallContextTokens = 0
+  let emittedTurnPressure = false
   const memoryReadTargets = new Map<string, string>()
   // Plan/goal blocks are paid structured model output but are not contained
   // in assistantText/thinkingText/tool snapshots. Keep every update (not
@@ -714,6 +843,9 @@ export async function _runOneTurn(
         // turnIndex is 1-indexed to match turn.completed semantics:
         // session.turns is still pre-increment during tool processing
         // (incremented inside parser._handleResult after this path runs).
+        turnToolsBytes +=
+          Buffer.byteLength(tr.preview ?? '', 'utf8') +
+          Buffer.byteLength(tr.inputPreview ?? '', 'utf8')
         eventBus.emit(
           'tool.called',
           createEvent('tool.called', session.agentId, {
@@ -734,15 +866,37 @@ export async function _runOneTurn(
         return
       }
       if (e.kind === 'context_pressure') {
+        const enrichedPressure = enrichContextPressure(e.pressure, {
+          agentId: session.agentId,
+          engine: e.pressure.engine || session.providerTag || session.runner.engineId || 'unknown',
+          modelContextWindow: modelAuthority?.executionDescriptor.contextWindow,
+          observedTokens: lastCallContextTokens > 0 ? lastCallContextTokens : undefined,
+          toolsBytes: turnToolsBytes,
+        })
+        emittedTurnPressure = true
         eventBus.emit('session.context_pressure', createEvent('session.context_pressure', session.agentId, {
-          sessionKey: session.sessionKey, ...e.pressure,
+          sessionKey: session.sessionKey, ...enrichedPressure,
         }))
+        onEvent({ kind: 'context_pressure', pressure: enrichedPressure })
+        return
+      }
+      if (e.kind === 'context_compacted') {
+        contextCompactionsTotal.inc({
+          engine: e.compaction.engine,
+          strategy: e.compaction.strategy,
+          outcome: 'ok',
+        })
       }
       if (e.kind === 'call_usage') {
         const call: CallTokenUsageSnapshot = {
           ...structuredClone(e.call),
           callId: `a${attemptOrdinal + 1}-${e.call.callId}`,
         }
+        const callCtxTokens =
+          (call.usage.inputTokens ?? 0) +
+          (call.usage.cacheReadTokens ?? 0) +
+          (call.usage.cacheCreationTokens ?? 0)
+        if (callCtxTokens > 0) lastCallContextTokens = callCtxTokens
         for (const targetId of call.targetIds) {
           callUsageByTarget.set(targetId, call)
         }
@@ -1791,6 +1945,52 @@ export async function _runOneTurn(
         session.totalCacheReadTokens += result.usage.cacheReadTokens
         session.totalCacheCreationTokens += result.usage.cacheCreationTokens
         session.currentAssistantBuf = completedAssistant.text
+        // OCV5-840: Emit turn-level context pressure telemetry with real tokens & breakdown
+        // when the engine did not already emit one during this turn.
+        if (!emittedTurnPressure && session.channel === 'webchat') {
+          const turnCtxTokens =
+            lastCallContextTokens > 0
+              ? lastCallContextTokens
+              : result.usage.inputTokens +
+                result.usage.cacheReadTokens +
+                result.usage.cacheCreationTokens
+          const engineTag = session.providerTag || session.runner.engineId || 'unknown'
+          const windowTokens = resolveEffectiveModelHistoryContextWindow(
+            modelAuthority?.executionDescriptor.contextWindow,
+            engineTag,
+          )
+          const usedRatio = windowTokens > 0 ? turnCtxTokens / windowTokens : 0
+          if (turnCtxTokens > 0 && windowTokens > 0 && usedRatio >= 0.5) {
+            const enrichedPressure = enrichContextPressure(
+              {
+                engine: engineTag,
+                scope: 'native_context',
+                dimension: 'tokens',
+                level: usedRatio >= 1 ? 'critical' : 'warning',
+                usedRatio: Number(usedRatio.toFixed(4)),
+                usedTokens: turnCtxTokens,
+                windowTokens,
+              },
+              {
+                agentId: session.agentId,
+                engine: engineTag,
+                modelContextWindow: windowTokens,
+                observedTokens: turnCtxTokens,
+                toolsBytes: turnToolsBytes,
+              },
+            )
+            if (usedRatio >= 0.8) {
+              eventBus.emit(
+                'session.context_pressure',
+                createEvent('session.context_pressure', session.agentId, {
+                  sessionKey: session.sessionKey,
+                  ...enrichedPressure,
+                }),
+              )
+            }
+            onEvent({ kind: 'context_pressure', pressure: enrichedPressure })
+          }
+        }
         // Persist cost-delta baseline after every successful turn so that
         // a gateway crash + restart can re-seed the correct baseline for
         // the resumed CCB (whose restoreCostStateForSession will target
@@ -2100,11 +2300,6 @@ export async function _runOneTurn(
       }
       if (persistenceAcknowledged) {
         if (terminalErrorForClient) {
-          // 审计 R3:errorClass 已是 TurnSummary 的权威字段(各 adapter 的
-          // buildTurnSummary 从 TurnResult 复制),直读即可 —— 不再 cast 穿透,
-          // 也不再靠 server 侧重新正则解析 errorDetail 兜底。runner 预分类在场
-          // 则透传给 server.ts 直接按码组 outbound.error;缺省 undefined →
-          // server 侧回落 classifyRunError,行为不变。
           const preClassified = result?.errorClass
           onEvent(
             _asEngineErrorEvent({
@@ -2115,7 +2310,12 @@ export async function _runOneTurn(
             }),
           )
         } else if (pendingFinal) {
+          if (result && !result.isError && result.errorDetail === undefined && terminalOverride === null) {
+            markCheckpointTurnOutcome(session, 'completed')
+          }
           onEvent(pendingFinal)
+        } else if (result && !result.isError && result.errorDetail === undefined && terminalOverride === null) {
+          markCheckpointTurnOutcome(session, 'completed')
         }
       } else if (persistenceQueuedToOutbox) {
         // E6 — 落库进 outbox(权威库暂不可用):不算 acknowledged,但必须向
@@ -2690,6 +2890,7 @@ export async function runOneTurnWithRetry(
         contextOverflowRetryIndex < contextOverflowRetryInputs.length
       ) {
         contextOverflowRetryIndex += 1
+        contextRebuildsTotal.inc({ reason: 'context_overflow_retry' })
         retryInput = contextOverflowRetryInputs[contextOverflowRetryIndex - 1]!
         log.warn('native context window exhausted; rebuilding with smaller history', {
           sessionKey: session.sessionKey,

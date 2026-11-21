@@ -636,6 +636,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       maxBytes: ANTIGRAVITY_MAX_PROMPT_BYTES,
       cwd: cwdDecision.cwd,
       engine: this.engineId,
+      sessionKey: this.opts.sessionKey,
       onEvent: (event) => { if (!ctx.terminal) ctx.params.onEvent(event) },
     })
     // Context-file IO can outlive the logical turn. Never launch a paid CLI

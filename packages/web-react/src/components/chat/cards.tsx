@@ -134,6 +134,8 @@ export type CardCallbacks = {
   getToken?: () => string | null | undefined;
   /** context_too_long 类:在新会话中延续目标(导航非重发,同 onTopUp 不受末轮门控)。 */
   onStartNewSession?: () => void;
+  /** OCV5-840: context_too_long 类主动作 — 一键压缩当前会话并继续。 */
+  onCompactSession?: () => void;
   onFeedback?: (ctx: FeedbackContext) => void;
   onFirstTextPaint?: (input: {
     traceId: string;
@@ -1743,11 +1745,63 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
 
 // ═══════════════ system ═══════════════
 export function SystemCard({ msg }: { msg: ChatMessage }) {
+  const [expanded, setExpanded] = useState(false);
   if (!msg.text) return null;
+  const compact = msg._contextCompaction;
+  if (!compact) {
+    return (
+      <div className="flex min-w-0 justify-center animate-in">
+        <div className="oc-surface-recessed min-w-0 max-w-full whitespace-pre-wrap break-words rounded-xl border border-border/65 px-3.5 py-1.5 text-left text-caption leading-relaxed text-faint sm:max-w-[80%] sm:text-center [overflow-wrap:anywhere]">
+          {msg.text}
+        </div>
+      </div>
+    );
+  }
+  const strategyLabel =
+    compact.strategy === "native_summary"
+      ? "模型原生摘要压缩"
+      : compact.strategy === "history_suffix"
+        ? "保留近期对话尾巴"
+        : compact.strategy === "file_reference"
+          ? "超长内容外置文件引用"
+          : compact.strategy || "上下文压缩";
+  const fmtCount = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n));
+  const detailParts: string[] = [`策略：${strategyLabel}`];
+  if (typeof compact.beforeTokens === "number" && typeof compact.afterTokens === "number") {
+    detailParts.push(`Token：${fmtCount(compact.beforeTokens)} → ${fmtCount(compact.afterTokens)}`);
+  } else if (typeof compact.beforeBytes === "number" && typeof compact.afterBytes === "number") {
+    detailParts.push(`体积：${fmtCount(compact.beforeBytes)}B → ${fmtCount(compact.afterBytes)}B`);
+  }
+  if (typeof compact.droppedEntries === "number" && compact.droppedEntries > 0) {
+    detailParts.push(`已折叠 ${compact.droppedEntries} 段旧上下文`);
+  }
   return (
-    <div className="flex min-w-0 justify-center animate-in">
-      <div className="oc-surface-recessed min-w-0 max-w-full whitespace-pre-wrap break-words rounded-xl border border-border/65 px-3.5 py-1.5 text-left text-caption leading-relaxed text-faint sm:max-w-[80%] sm:text-center [overflow-wrap:anywhere]">
-        {msg.text}
+    <div className="flex min-w-0 justify-center animate-in" data-testid="context-compacted-receipt">
+      <div className="oc-surface-recessed min-w-0 max-w-full rounded-xl border border-border/65 px-3.5 py-1.5 text-caption leading-relaxed text-faint sm:max-w-[80%]">
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          aria-expanded={expanded}
+          className="inline-flex max-w-full items-center gap-1.5 text-left outline-none transition-colors hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <span className="break-words [overflow-wrap:anywhere]">{msg.text}</span>
+          <ChevronRight
+            size={12}
+            strokeWidth={1.75}
+            aria-hidden
+            className={cn("shrink-0 transition-transform duration-150", expanded && "rotate-90")}
+          />
+        </button>
+        {expanded && (
+          <div className="mt-1.5 space-y-1 border-t border-border/60 pt-1.5 text-left text-caption text-muted">
+            <p className="tabular-nums">{detailParts.join(" · ")}</p>
+            {compact.summaryPreview && (
+              <p className="line-clamp-3 whitespace-pre-wrap break-words text-faint">
+                {compact.summaryPreview}
+              </p>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

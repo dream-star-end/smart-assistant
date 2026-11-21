@@ -35,6 +35,23 @@ export type ErrorNoticeActionsInput = {
 
 export function errorNoticeActions(input: ErrorNoticeActionsInput): ErrorNoticeAction[] {
   const { cb, isLastTurn, waived } = input;
+  // OCV5-840: context_too_long 优先提供「一键压缩并继续」与「开启新会话」闭环出口；
+  // 若调用方未提供这两个回调（历史测试/只读态），平滑回落到目录默认动作。
+  if (input.userError.code === "context_too_long") {
+    const contextActions: ErrorNoticeAction[] = [];
+    if (isLastTurn && !waived && cb.onCompactSession) {
+      contextActions.push({ label: "一键压缩并继续", onClick: cb.onCompactSession });
+    }
+    if (cb.onStartNewSession) {
+      contextActions.push({ label: "开启新会话", onClick: cb.onStartNewSession });
+    }
+    if (contextActions.length > 0) {
+      if (contextActions.length < 2 && isLastTurn && !waived && cb.onOpenModelPicker) {
+        contextActions.push({ label: "切换模型", onClick: cb.onOpenModelPicker });
+      }
+      return contextActions.slice(0, 2);
+    }
+  }
   const h: ErrorActionHandlers = {};
   if (isLastTurn) {
     if (input.continueInterrupted) h.retry = { label: "继续", onClick: input.continueInterrupted };

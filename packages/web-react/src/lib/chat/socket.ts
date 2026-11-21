@@ -14,7 +14,7 @@ import { readSessionServiceTier } from '../sessionServiceTier';
  * drain 逐条复刻；帧翻译委托 reducer.ts（§7-§11）。
  */
 import type { MessageReplyQuote } from "@openclaude/protocol/browser";
-import { MODEL_SWITCH_CANCELLED_MESSAGE } from "../modelSwitch";
+import { SocketContextCompactManager } from "./socketContextCompact";
 import { applyAutomaticRecoverySnapshot } from "./automaticRecoverySnapshot";
 import { confirmDispatchDelivery, confirmSnapshotDelivery } from "./deliveryConfirm";
 import {
@@ -182,6 +182,7 @@ import type {
   OutboundCallUsageWire,
   OutboundControlReceiptWire,
   OutboundModelSwitchPreparedWire,
+  OutboundSessionCompactResultWire,
   OutboundWire,
   GoalSnapshotWire,
   RecoveryDecisionWire,
@@ -189,7 +190,9 @@ import type {
   RepoBindErrorWire,
   RepoStatusWire,
   RelayReadyWire,
+  SessionContextPressureWire,
   StudioEventWire,
+  SysContextCompactedWire,
 } from "./frames";
 import { emitStudioPush } from "../studio/push";
 import { incidentStore } from "../incidentStore";
@@ -989,14 +992,12 @@ export class ChatSocket {
   private controlPumpScheduled = false;
   private readonly controlPersistRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-  private readonly abandonedModelSwitches = new Map<string, string>();
-  private readonly pendingModelSwitches = new Map<string, {
-    sessId: string;
-    targetModel: string;
-    resolve: (switchId: string) => void;
-    reject: (error: Error) => void;
-    timer: ReturnType<typeof setTimeout>;
-  }>();
+  private readonly contextCompact = new SocketContextCompactManager({
+    getSession: (id) => this.sessions.get(id),
+    safeWsSend: (raw) => this.safeWsSend(raw),
+    scheduleNotify: () => this.scheduleNotify(),
+    persistSession: (id) => this.deps.persistSession?.(id),
+  });
 
   // ── GitHub 仓库绑定待确认队列 ──
   // PUT 成功后试发 inbound.control.session_repo_bind;若 WS 未就绪/未投递,在 onopen(hello 之后)
@@ -1229,7 +1230,7 @@ export class ChatSocket {
     }
     if (this.boundBillingPaid) window.removeEventListener("openclaude:billing-paid", this.boundBillingPaid);
     if (this.boundModelFixed) window.removeEventListener("openclaude:model-policy-fixed", this.boundModelFixed);
-    this.rejectPendingModelSwitches("连接已断开，未切换模型", true);
+    this.contextCompact.rejectPendingModelSwitches("连接已断开，未切换模型", true);
     this.clearReconnectTimers();
     if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
     if (this.reconnectInFlightTimer) clearTimeout(this.reconnectInFlightTimer);
@@ -1807,7 +1808,7 @@ export class ChatSocket {
         /* ignore */
       }
       this.armSnapshotWatchdog();
-      this.flushAbandonedModelSwitches()
+      this.contextCompact.flushAbandonedModelSwitches()
 
       // hello 发完(peer 已注册)后补发积压的仓库绑定(reconnect 兜底,见 pendingRepoBind)。
       this.flushAllRepoBinds();
@@ -2259,6 +2260,15 @@ export class ChatSocket {
         if (sess) this.applyContextRebuilt(sess, frame);
         return;
       }
+      case "session.context_pressure":
+        this.contextCompact.handleContextPressure(f as SessionContextPressureWire);
+        return;
+      case "sys.context_compacted":
+        this.contextCompact.handleContextCompacted(f as SysContextCompactedWire);
+        return;
+      case "outbound.session_compact_result":
+        this.contextCompact.handleCompactResult(f as OutboundSessionCompactResultWire);
+        return;
       case "sys.goal_snapshot": {
         const frame = f as GoalSnapshotWire;
         this.setGoalState(frame.goal.sessionId, frame.goal);
@@ -2311,16 +2321,9 @@ export class ChatSocket {
         }
         return;
       }
-      case "outbound.model_switch.prepared": {
-        const frame = f as OutboundModelSwitchPreparedWire;
-        const pending = this.pendingModelSwitches.get(frame.requestId);
-        if (!pending || pending.sessId !== frame.sessionKey || pending.targetModel !== frame.targetModel) return;
-        this.pendingModelSwitches.delete(frame.requestId);
-        clearTimeout(pending.timer);
-        if (frame.status === "completed") pending.resolve(frame.requestId);
-        else pending.reject(new Error(frame.message || frame.errorCode || "上下文压缩失败"));
+      case "outbound.model_switch.prepared":
+        this.contextCompact.handleModelSwitchPrepared(f as OutboundModelSwitchPreparedWire);
         return;
-      }
       case "outbound.control.receipt": {
         this.applyControlReceipt(f as OutboundControlReceiptWire);
         return;
@@ -3604,7 +3607,7 @@ export class ChatSocket {
     const openedAgo = this.lastOpenAtMs > 0 ? Date.now() - this.lastOpenAtMs : Number.POSITIVE_INFINITY;
     if (
       openedAgo >= VISIBILITY_PROBE_GRACE_AFTER_OPEN_MS &&
-      this.pendingModelSwitches.size === 0
+      !this.contextCompact.hasPendingModelSwitches()
     ) {
       this.probeWsAlive(this.ws, PROBE_TIMEOUT_VISIBILITY_MS, "visibility");
     }
@@ -3656,56 +3659,16 @@ export class ChatSocket {
     if (changed || modelSwitchId) this.scheduleNotify();
   }
 
-  private cancelPreparedModelSwitch(requestId: string, sessionKey: string): void {
-    const sent = this.safeWsSend(JSON.stringify({
-      type: "control.session.cancel_model_switch",
-      sessionKey,
-      requestId,
-    }));
-    if (sent) this.abandonedModelSwitches.delete(requestId);
-    else this.abandonedModelSwitches.set(requestId, sessionKey);
-  }
-
-  private flushAbandonedModelSwitches(): void {
-    for (const [requestId, sessionKey] of this.abandonedModelSwitches) {
-      this.cancelPreparedModelSwitch(requestId, sessionKey);
-    }
-  }
-
   cancelPendingModelSwitches(sessId: string): void {
-    const sess = this.sessions.get(sessId);
-    if (sess) this.rejectPendingModelSwitches(MODEL_SWITCH_CANCELLED_MESSAGE, true, safeSessionKeyForAgent(sessId, sess.agentId));
-  }
-
-  private rejectPendingModelSwitches(message: string, canSendCancellation: boolean, onlySessionKey?: string): void {
-    for (const [id, pending] of [...this.pendingModelSwitches].filter(([, p]) => !onlySessionKey || p.sessId === onlySessionKey)) {
-      clearTimeout(pending.timer);
-      if (canSendCancellation) this.cancelPreparedModelSwitch(id, pending.sessId);
-      else this.abandonedModelSwitches.set(id, pending.sessId);
-      pending.reject(new Error(message));
-      this.pendingModelSwitches.delete(id);
-    }
+    this.contextCompact.cancelPendingModelSwitches(sessId);
   }
 
   prepareModelSwitch(sessId: string, sourceModel: string, targetModel: string): Promise<string> {
-    const sess = this.sessions.get(sessId);
-    if (!sess) return Promise.reject(new Error("会话不存在"));
-    const requestId = `model-switch:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 10)}`;
-    if (!this.safeWsSend(JSON.stringify({
-      type: "control.session.prepare_model_switch",
-      sessionKey: safeSessionKeyForAgent(sessId, sess.agentId),
-      requestId,
-      sourceModel,
-      targetModel,
-    }))) return Promise.reject(new Error("当前未连接，无法压缩上下文"));
-    return new Promise<string>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingModelSwitches.delete(requestId);
-        this.cancelPreparedModelSwitch(requestId, safeSessionKeyForAgent(sessId, sess.agentId));
-        reject(new Error("上下文压缩超时，仍保留原模型"));
-      }, 16 * 60_000);
-      this.pendingModelSwitches.set(requestId, { sessId: safeSessionKeyForAgent(sessId, sess.agentId), targetModel, resolve, reject, timer });
-    });
+    return this.contextCompact.prepareModelSwitch(sessId, sourceModel, targetModel);
+  }
+
+  compactSession(sessId: string, instructions?: string): Promise<OutboundSessionCompactResultWire> {
+    return this.contextCompact.compactSession(sessId, instructions);
   }
 
   removeSession(sessId: string): void {
@@ -3736,6 +3699,7 @@ export class ChatSocket {
     }
     this.maybePromoteToConnected();
     this.pendingRepoBind.delete(sessId);
+    this.contextCompact.cancelCompactsForSession(sessId);
     this.transientNotices.delete(sessId);
     const pendingRecoveryError = this.pendingRecoveryErrors.get(sessId);
     if (pendingRecoveryError) {
