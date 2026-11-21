@@ -145,7 +145,7 @@ export async function resolveCronJobExecution(args: {
       retryable: false,
     }
   }
-  const explicitJobModel = modelCheck.value
+  const explicitJobModel = normalizeIntendedModel(modelCheck.value)
   const explicitEffort = effortCheck.value
 
   // B2: Resolve the authoritative intended model (job -> agent -> config) FIRST.

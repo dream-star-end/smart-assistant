@@ -176,6 +176,33 @@ describe('resolveCronJobExecution — B2 zero inherited fallback & B3 master-rou
     }
   })
 
+  it('B2 (R2): job.model="auto" skips auto and inherits valid bound agent.model cleanly', async () => {
+    _setModelCatalogClientForTests({ getRoutingView: async () => mockCatalogView() } as any)
+    const resAuth = await resolveCronJobExecution({
+      jobId: 'auto-job-auth',
+      explicitModel: AGENT_MODEL_AUTO,
+      agent: { id: 'main', model: 'glm-5.3' },
+      defaultModel: 'deepseek-v4-flash',
+      env: { OC_MODEL_AUTHORITY: '1' },
+    })
+    assert.equal(resAuth.ok, true)
+    if (resAuth.ok) {
+      assert.equal(resAuth.model, 'glm-5.3')
+    }
+
+    const resFlagOff = await resolveCronJobExecution({
+      jobId: 'auto-job-flagoff',
+      explicitModel: AGENT_MODEL_AUTO,
+      agent: { id: 'main', model: 'glm-5.3' },
+      defaultModel: 'deepseek-v4-flash',
+      env: {},
+    })
+    assert.equal(resFlagOff.ok, true)
+    if (resFlagOff.ok) {
+      assert.equal(resFlagOff.model, undefined, 'auto job inherits agent model without injecting literal "auto"')
+    }
+  })
+
   it('authority=1 + selfhost exempt + explicit codex model & effort → runs exact model with zero downgrade', async () => {
     _setModelCatalogClientForTests({ getRoutingView: async () => mockCatalogView() } as any)
     const res = await resolveCronJobExecution({

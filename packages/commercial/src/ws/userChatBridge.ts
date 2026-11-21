@@ -2320,6 +2320,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       };
       ws.on("message", onEarlyMessage);
       ws.on("close", onEarlyClose);
+      ws.on("error", (err) => { log?.warn("user-chat-bridge: early user ws error", { err }); });
 
       // S12e CG4:connection-scoped trace id 在 handleUpgrade 早期生成。
       // 历史上这行 `randomUUID()` 在 startBridge 顶上(L1008),但 tunnel factory
@@ -9423,6 +9424,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     // ---------- user WS 生命周期 ----------
 
     userWs.on("message", onUserMessage);
+    userWs.removeAllListeners("error");
     userWs.on("error", (err) => {
       bridgeLog?.warn("user-chat-bridge: user ws error", { err });
     });
