@@ -31,6 +31,13 @@ export interface SwarmMemberSnapshot {
   unreadCount: number
   lastPostSeq?: number
   lastActiveAt?: number
+  /** Incremental member telemetry parsed from transcript (optional; 100% backwards-compatible). */
+  elapsedMs?: number
+  inputTokens?: number
+  outputTokens?: number
+  toolCalls?: number
+  /** True when telemetry scanning still has unread backlog or hit its per-file budget/line cap. */
+  telemetryPartial?: boolean
 }
 
 export interface SwarmChannelSnapshot {

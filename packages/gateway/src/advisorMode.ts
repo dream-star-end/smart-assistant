@@ -16,7 +16,7 @@ import type { MessageLike } from '@openclaude/storage'
 import { isPathWithinRoot } from './pathAcl.js'
 
 /** Any catalog main engine may turn advisor mode on. Unknown engines stay closed. */
-export const ADVISOR_CONSULT_PARENT_ENGINES = ['ccb', 'codex', 'grok', 'cursor'] as const
+export const ADVISOR_CONSULT_PARENT_ENGINES = ['ccb', 'codex', 'grok', 'cursor', 'antigravity'] as const
 export const ADVISOR_CONSULT_PARENT_REASON =
   '这个会话暂时不能开顾问。主模型不会被换掉。'
 const CONSULT_INVOCATION_RE = /^[A-Za-z0-9:_-]{8,128}$/
@@ -51,9 +51,22 @@ export type LiveConsultTool = {
   inputJson?: unknown
 }
 
+const EAGER_MCP_CONSULT_RE = /^mcp_[A-Za-z0-9][A-Za-z0-9.-]*_consult_advisor$/
+
 export function isConsultAdvisorToolName(name: string | undefined): boolean {
   const trimmed = (name ?? '').trim()
-  return trimmed === 'consult_advisor' || trimmed.endsWith('__consult_advisor')
+  return (
+    trimmed === 'consult_advisor' ||
+    trimmed.endsWith('__consult_advisor') ||
+    EAGER_MCP_CONSULT_RE.test(trimmed)
+  )
+}
+
+function isLazyMcpConsultCall(name: string | undefined, input: unknown): boolean {
+  if ((name ?? '').trim() !== 'call_mcp_tool') return false
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return false
+  const record = input as Record<string, unknown>
+  return typeof record.ToolName === 'string' && isConsultAdvisorToolName(record.ToolName)
 }
 
 function commandRequestsConsult(input: unknown): boolean {
@@ -63,7 +76,9 @@ function commandRequestsConsult(input: unknown): boolean {
     ? record.command
     : typeof record.cmd === 'string'
       ? record.cmd
-      : ''
+      : typeof record.CommandLine === 'string'
+        ? record.CommandLine
+        : ''
   return /(^|[\s;&|`(])oc-memory\s+consult-advisor(?:\s|$)/.test(command)
 }
 
@@ -75,7 +90,9 @@ export function uniquePendingConsultInvocationId(
     (tool) =>
       tool.completed !== true &&
       (isConsultAdvisorToolName(tool.toolName) ||
-        ((tool.toolName === 'Bash' || tool.toolName === 'Shell') && commandRequestsConsult(tool.inputJson))),
+        isLazyMcpConsultCall(tool.toolName, tool.inputJson) ||
+        ((tool.toolName === 'Bash' || tool.toolName === 'Shell' || tool.toolName === 'run_command') &&
+          commandRequestsConsult(tool.inputJson))),
   )
   if (pending.length > 1) return { ok: false, reason: 'ambiguous' }
   const id = pending.length === 1 && typeof pending[0]?.toolUseId === 'string'
@@ -340,10 +357,19 @@ export function historyFromSessionMessages(
 }
 
 const TRUSTED_FILE_TOOL_RE =
-  /^(read|read_file|write|edit|search_replace|oc-web parse|oc_web_parse)$/i
+  /^(read|read_file|view_file|write|write_file|write_to_file|edit|edit_file|replace_file_content|multi_replace_file_content|search_replace|oc-web parse|oc_web_parse)$/i
 
-/** Target path fields on Read/Write/Edit (not content/new_string/patch). */
-const TRUSTED_FILE_TARGET_KEYS = ['file_path', 'path', 'target_file', 'absolute_path', 'filePath'] as const
+/** Target path fields on Read/Write/Edit (not content/new_string/patch). Includes Antigravity PascalCase keys. */
+const TRUSTED_FILE_TARGET_KEYS = [
+  'file_path',
+  'path',
+  'target_file',
+  'absolute_path',
+  'filePath',
+  'Path',
+  'AbsolutePath',
+  'TargetFile',
+] as const
 
 /** Read/Write/Edit this turn are current-task file tools. Web/shell stdout is not. */
 export function isTrustedCurrentTaskFileTool(name?: string): boolean {
@@ -592,6 +618,141 @@ export function formatAdvisorConsultPrompt(snapshot: AdvisorSnapshot): string {
   ]
     .filter(Boolean)
     .join('\n\n')
+}
+
+export interface AdvisorToolPolicy {
+  toolsDisabled: boolean
+  allowedTools?: readonly string[]
+}
+
+const ADVISOR_WRITE_TOOL_RE =
+  /^(write|write_file|write_to_file|edit|edit_file|replace_file_content|multi_replace_file_content|sed_file|bash|shell|run_command|notebook_edit|delete|rm|swarm|post_message)$/i
+
+/**
+ * 硬约束:顾问会话严禁任何写入或执行工具(无工具只读契约)。
+ * 拒绝任何尝试向顾问开启工具或下放写入工具的策略。
+ */
+export function assertAdvisorReadOnlyNoTools(
+  policy: AdvisorToolPolicy,
+): { ok: true } | { ok: false; error: string } {
+  if (!policy.toolsDisabled) {
+    return { ok: false, error: '顾问必须运行在无工具只读模式(toolsDisabled=true)' }
+  }
+  const extra = (policy.allowedTools ?? []).map((t) => t.trim()).filter(Boolean)
+  if (extra.length > 0) {
+    const hasWrite = extra.some((t) => ADVISOR_WRITE_TOOL_RE.test(t))
+    return {
+      ok: false,
+      error: hasWrite
+        ? `顾问严禁持有写入/执行工具: ${extra.join(', ')}`
+        : `顾问严禁持有任何工具: ${extra.join(', ')}`,
+    }
+  }
+  return { ok: true }
+}
+
+function deepFreezeSnapshot<T>(value: T): Readonly<T> {
+  if (value && typeof value === 'object') {
+    Object.freeze(value)
+    for (const v of Object.values(value as Record<string, unknown>)) {
+      if (v && typeof v === 'object' && !Object.isFrozen(v)) {
+        deepFreezeSnapshot(v)
+      }
+    }
+  }
+  return value
+}
+
+export interface FreezeAdvisorConsultInput {
+  parentEngine: string | undefined | null
+  requestedAdvisorModel: string
+  advisorModels: readonly AdvisorModelOption[]
+  unavailableReason?: string
+  question: string
+  concern: string
+  source: AdvisorSnapshotInput
+  execution?: AdvisorConsultExecution
+  toolPolicy?: AdvisorToolPolicy
+}
+
+export type FreezeAdvisorConsultResult =
+  | {
+      ok: true
+      parentEngine: string
+      advisorModel: string
+      snapshot: Readonly<AdvisorSnapshot>
+      prompt: string
+    }
+  | { ok: false; code: 'PARENT_ENGINE_DENIED' | 'ADVISOR_MODEL_DENIED' | 'ADVISOR_TOOLS_FORBIDDEN'; error: string }
+
+/**
+ * 冻结主引擎(含 Antigravity)发起 consult_advisor 时的上下文快照与无工具只读契约:
+ *   1. 校验主引擎在 ADVISOR_CONSULT_PARENT_ENGINES 白名单内(含 antigravity);
+ *   2. 校验目标顾问型号在已证明 catalog 中,绝不静默降级到弱模型;
+ *   3. 校验无工具只读顾问硬约束(严禁写入/执行工具);
+ *   4. 深拷贝并深度冻结 AdvisorSnapshot,防止后续主会话变更污染已提交的互审证据。
+ */
+export function freezeAdvisorConsultContext(
+  input: FreezeAdvisorConsultInput,
+): FreezeAdvisorConsultResult {
+  const parentGate = advisorConsultParentGate(input.parentEngine)
+  if (!parentGate.allowed || !parentGate.engine) {
+    return {
+      ok: false,
+      code: 'PARENT_ENGINE_DENIED',
+      error: parentGate.reason || ADVISOR_CONSULT_PARENT_REASON,
+    }
+  }
+  const modelGate = assertAdvisorModelAllowed({
+    requested: input.requestedAdvisorModel,
+    advisorModels: input.advisorModels,
+    unavailableReason: input.unavailableReason,
+  })
+  if (!modelGate.ok) {
+    return {
+      ok: false,
+      code: 'ADVISOR_MODEL_DENIED',
+      error: modelGate.error,
+    }
+  }
+  const toolCheck = assertAdvisorReadOnlyNoTools(
+    input.toolPolicy ?? { toolsDisabled: true, allowedTools: [] },
+  )
+  if (!toolCheck.ok) {
+    return {
+      ok: false,
+      code: 'ADVISOR_TOOLS_FORBIDDEN',
+      error: toolCheck.error,
+    }
+  }
+
+  const built = buildAdvisorSnapshot({
+    question: input.question,
+    concern: input.concern,
+    advisorModel: modelGate.model,
+    source: {
+      ...input.source,
+      historyRecords: input.source.historyRecords
+        ? input.source.historyRecords.map((r) => ({ ...r }))
+        : undefined,
+      currentTools: input.source.currentTools
+        ? input.source.currentTools.map((t) => ({ ...t }))
+        : undefined,
+      authorizedArtifacts: input.source.authorizedArtifacts
+        ? input.source.authorizedArtifacts.map((a) => ({ ...a }))
+        : undefined,
+    },
+    execution: input.execution ? { ...input.execution } : undefined,
+  })
+  const frozenSnapshot = deepFreezeSnapshot(built)
+  const prompt = formatAdvisorConsultPrompt(frozenSnapshot)
+  return {
+    ok: true,
+    parentEngine: parentGate.engine,
+    advisorModel: modelGate.model,
+    snapshot: frozenSnapshot,
+    prompt,
+  }
 }
 
 export { ADVISOR_AGENT_ID }

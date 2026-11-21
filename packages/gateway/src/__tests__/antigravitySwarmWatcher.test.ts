@@ -31,6 +31,7 @@ import {
 } from '../engine/antigravityPlatform.js'
 import {
   AntigravitySwarmWatcher,
+  IncrementalTranscriptTelemetryCache,
   buildDurableSwarmBoardInput,
   compactSwarmSnapshotForPersistence,
   formatSwarmWorkingDetail,
@@ -799,4 +800,262 @@ test('swarm tool normalization strips local open_board URLs and parses /swarm sl
   )
   assert.equal(errSummary.failed, true)
   assert.equal(errSummary.stepCount, 5)
+})
+
+test('incremental transcript telemetry accumulates elapsedMs, inputTokens, outputTokens and toolCalls across appends without re-reading earlier bytes', async () => {
+  const brainDir = await mkdtemp(path.join(tmpdir(), 'oc-swarm-telemetry-'))
+  try {
+    await writeSwarmFixture(brainDir)
+    const workerLogPath = path.join(brainDir, WORKER_CONV, '.system_generated', 'logs', 'transcript.jsonl')
+
+    // Write initial steps with usage + 2 tool calls
+    const step0 = JSON.stringify({
+      step_index: 0,
+      type: 'USER_INPUT',
+      status: 'DONE',
+      created_at: '2026-11-20T00:10:00.000Z',
+    })
+    const step1 = JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      usage: { input_tokens: 1200, output_tokens: 340 },
+      tool_calls: [
+        { name: 'read_file', arguments: { Path: '/repo/a.ts' } },
+        { name: 'edit_file', arguments: { Path: '/repo/a.ts' } },
+      ],
+      created_at: '2026-11-20T00:10:15.000Z',
+    })
+    await writeFile(workerLogPath, `${step0}\n${step1}\n`)
+
+    const cache = new IncrementalTranscriptTelemetryCache()
+    const snap1 = readAntigravitySwarmSnapshot({
+      brainDir,
+      conversationId: COORD_CONV,
+      phase: 'running',
+      revision: 1,
+      now: Date.parse('2026-11-20T00:10:20.000Z'),
+      telemetryCache: cache,
+    })
+    const parser1 = snap1?.members.find((m) => m.name === 'parser')
+    assert.ok(parser1)
+    assert.equal(parser1.inputTokens, 1200)
+    assert.equal(parser1.outputTokens, 340)
+    assert.equal(parser1.toolCalls, 2)
+    assert.equal(parser1.elapsedMs, 20_000)
+
+    // Append a second planner step with camelCase token_usage + 1 tool call
+    const step2 = JSON.stringify({
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      token_usage: { promptTokens: 800, completionTokens: 210 },
+      tool_calls: [{ name: 'run_command', arguments: { CommandLine: 'npm test' } }],
+      created_at: '2026-11-20T00:10:45.000Z',
+    })
+    await writeFile(workerLogPath, `${step0}\n${step1}\n${step2}\n`)
+
+    const snap2 = readAntigravitySwarmSnapshot({
+      brainDir,
+      conversationId: COORD_CONV,
+      phase: 'running',
+      revision: 2,
+      now: Date.parse('2026-11-20T00:10:50.000Z'),
+      telemetryCache: cache,
+    })
+    const parser2 = snap2?.members.find((m) => m.name === 'parser')
+    assert.ok(parser2)
+    assert.equal(parser2.inputTokens, 2000)
+    assert.equal(parser2.outputTokens, 550)
+    assert.equal(parser2.toolCalls, 3)
+    assert.equal(parser2.elapsedMs, 50_000)
+
+    // Verifier has no usage/toolCalls -> optional telemetry fields stay omitted (100% backwards-compatible)
+    const verifier2 = snap2?.members.find((m) => m.name === 'verifier')
+    assert.ok(verifier2)
+    assert.equal(verifier2.inputTokens, undefined)
+    assert.equal(verifier2.outputTokens, undefined)
+    assert.equal(verifier2.toolCalls, undefined)
+  } finally {
+    await rm(brainDir, { recursive: true, force: true })
+  }
+})
+
+test('B7: 4,000-line / ~442KB quiet transcript with multi-byte UTF-8 drains to exact 4,000 total (never stuck at partial 1,190/2,371) and marks partial during backlog', async () => {
+  const brainDir = await mkdtemp(path.join(tmpdir(), 'oc-swarm-b7-4000-'))
+  try {
+    await writeSwarmFixture(brainDir)
+    const workerLogPath = path.join(brainDir, WORKER_CONV, '.system_generated', 'logs', 'transcript.jsonl')
+
+    // Build 4,000 lines (~440KB+), including multi-byte CJK chars so 128KiB chunks cut mid-character
+    const lines: string[] = []
+    const baseMs = Date.parse('2026-11-20T00:00:00.000Z')
+    for (let i = 0; i < 4000; i += 1) {
+      lines.push(
+        JSON.stringify({
+          step_index: i,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content: `中文遥测步-${i}`,
+          usage: { input_tokens: 1, output_tokens: 2 },
+          tool_calls: [{ name: 'read_file', arguments: { Path: `/repo/f${i}.ts` } }],
+          created_at: new Date(baseMs + i * 1000).toISOString(),
+        }),
+      )
+    }
+    const payload = `${lines.join('\n')}\n`
+    assert.ok(Buffer.byteLength(payload, 'utf8') > 400_000)
+    await writeFile(workerLogPath, payload)
+
+    const emitted: SwarmSnapshot[] = []
+    const watcher = new AntigravitySwarmWatcher({
+      brainDir,
+      conversationId: COORD_CONV,
+      pollMs: 60_000,
+      activityThrottleMs: 0,
+      onSnapshot: (snap) => emitted.push(snap),
+    })
+
+    // First tick scans 128KiB chunk → MUST honestly mark telemetryPartial=true while backlog remains
+    watcher.start()
+    assert.ok(emitted.length >= 1)
+    const firstParser = emitted[0]!.members.find((m) => m.name === 'parser')!
+    assert.ok((firstParser.inputTokens ?? 0) > 0 && (firstParser.inputTokens ?? 0) < 4000)
+    assert.equal(firstParser.telemetryPartial, true)
+
+    // Allow quiet-log backlog catch-up timers to advance even with ZERO file mtime changes
+    await new Promise((r) => setTimeout(r, 150))
+
+    // Terminal stopAndReadFinal drains remaining backlog to EOF and reports exact 4,000
+    const finalSnap = watcher.stopAndReadFinal('completed')
+    assert.ok(finalSnap)
+    const finalParser = finalSnap.members.find((m) => m.name === 'parser')!
+    assert.equal(finalParser.inputTokens, 4000)
+    assert.equal(finalParser.outputTokens, 8000)
+    assert.equal(finalParser.toolCalls, 4000)
+    assert.equal(finalParser.telemetryPartial, undefined)
+  } finally {
+    await rm(brainDir, { recursive: true, force: true })
+  }
+})
+
+test('B7: budget-capped telemetry scanner marks partial=true honestly and resets cleanly on file rotation', async () => {
+  const brainDir = await mkdtemp(path.join(tmpdir(), 'oc-swarm-b7-budget-'))
+  try {
+    await writeSwarmFixture(brainDir)
+    const workerLogPath = path.join(brainDir, WORKER_CONV, '.system_generated', 'logs', 'transcript.jsonl')
+    const chunk = Array.from({ length: 120 }, (_, i) =>
+      JSON.stringify({
+        step_index: i,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        usage: { input_tokens: 10 },
+      }),
+    ).join('\n') + '\n'
+    await writeFile(workerLogPath, chunk)
+
+    // Budget smaller than file size -> partial MUST stay true even when drainAll=true
+    const tinyCache = new IncrementalTranscriptTelemetryCache(4096, 4096)
+    const partialSnap = readAntigravitySwarmSnapshot({
+      brainDir,
+      conversationId: COORD_CONV,
+      phase: 'completed',
+      revision: 1,
+      telemetryCache: tinyCache,
+      drainTelemetry: true,
+    })
+    const pMember = partialSnap?.members.find((m) => m.name === 'parser')
+    assert.equal(pMember?.telemetryPartial, true)
+    assert.ok((pMember?.inputTokens ?? 0) < 1200)
+
+    // Truncate/rotate file -> cursor resets cleanly to new smaller file
+    await writeFile(
+      workerLogPath,
+      `${JSON.stringify({ step_index: 0, type: 'PLANNER_RESPONSE', status: 'DONE', usage: { input_tokens: 77 } })}\n`,
+    )
+    const afterRotate = readAntigravitySwarmSnapshot({
+      brainDir,
+      conversationId: COORD_CONV,
+      phase: 'running',
+      revision: 2,
+      telemetryCache: tinyCache,
+    })
+    const rMember = afterRotate?.members.find((m) => m.name === 'parser')
+    assert.equal(rMember?.inputTokens, 77)
+    assert.equal(rMember?.telemetryPartial, undefined)
+  } finally {
+    await rm(brainDir, { recursive: true, force: true })
+  }
+})
+
+test('B7: trailing half-written JSON at EOF marks telemetryPartial=true on both live and terminal drain; complete JSON without trailing newline does not false-positive', async () => {
+  const brainDir = await mkdtemp(path.join(tmpdir(), 'oc-swarm-b7-tail-'))
+  try {
+    await writeSwarmFixture(brainDir)
+    const workerLogPath = path.join(brainDir, WORKER_CONV, '.system_generated', 'logs', 'transcript.jsonl')
+    const line1 = JSON.stringify({
+      step_index: 0,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      usage: { input_tokens: 7 },
+    })
+
+    // 1) Complete JSON without trailing newline -> partial MUST be false/undefined
+    await writeFile(workerLogPath, line1)
+    const cacheNoNl = new IncrementalTranscriptTelemetryCache()
+    const snapNoNl = readAntigravitySwarmSnapshot({
+      brainDir,
+      conversationId: COORD_CONV,
+      phase: 'completed',
+      revision: 1,
+      telemetryCache: cacheNoNl,
+      drainTelemetry: true,
+    })
+    const mNoNl = snapNoNl?.members.find((m) => m.name === 'parser')
+    assert.equal(mNoNl?.inputTokens, 7)
+    assert.equal(mNoNl?.telemetryPartial, undefined)
+
+    // 2) Complete 7-token line + half-written trailing JSON -> partial MUST be true on BOTH live scan and terminal drain!
+    const halfLine = '{"step_index":1,"type":"PLANNER_RESPONSE","usage":{"input_tokens":'
+    await writeFile(workerLogPath, `${line1}\n${halfLine}`)
+    const cache = new IncrementalTranscriptTelemetryCache()
+    const liveSnap = readAntigravitySwarmSnapshot({
+      brainDir,
+      conversationId: COORD_CONV,
+      phase: 'running',
+      revision: 2,
+      telemetryCache: cache,
+    })
+    const liveMember = liveSnap?.members.find((m) => m.name === 'parser')
+    assert.equal(liveMember?.inputTokens, 7)
+    assert.equal(liveMember?.telemetryPartial, true)
+
+    const termSnap = readAntigravitySwarmSnapshot({
+      brainDir,
+      conversationId: COORD_CONV,
+      phase: 'completed',
+      revision: 3,
+      telemetryCache: cache,
+      drainTelemetry: true,
+    })
+    const termMember = termSnap?.members.find((m) => m.name === 'parser')
+    assert.equal(termMember?.inputTokens, 7)
+    assert.equal(termMember?.telemetryPartial, true)
+
+    // 3) Once writer finishes the half-written line -> subtotal advances to 12 and telemetryPartial clears!
+    await writeFile(workerLogPath, `${line1}\n${halfLine}5}}\n`)
+    const healedSnap = readAntigravitySwarmSnapshot({
+      brainDir,
+      conversationId: COORD_CONV,
+      phase: 'completed',
+      revision: 4,
+      telemetryCache: cache,
+      drainTelemetry: true,
+    })
+    const healedMember = healedSnap?.members.find((m) => m.name === 'parser')
+    assert.equal(healedMember?.inputTokens, 12)
+    assert.equal(healedMember?.telemetryPartial, undefined)
+  } finally {
+    await rm(brainDir, { recursive: true, force: true })
+  }
 })

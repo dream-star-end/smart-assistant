@@ -15,6 +15,7 @@
 import { createHash } from 'node:crypto'
 import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readSync, realpathSync, type Stats } from 'node:fs'
 import { basename, join, sep } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import {
   SWARM_MAX_CHANNELS,
   SWARM_MAX_MEMBERS,
@@ -34,6 +35,11 @@ import {
 const MAX_MEMBERS_JSON_BYTES = 512 * 1024
 const MAX_BOARD_JSONL_BYTES = 2 * 1024 * 1024
 const TRANSCRIPT_TAIL_BYTES = 64 * 1024
+/** Max bytes parsed per member per tick by the incremental telemetry scanner so large bursts never block the event loop. */
+const MAX_TELEMETRY_DELTA_BYTES = 128 * 1024
+/** Max total bytes drained per member during terminal `stopAndReadFinal` before marking `telemetryPartial: true`. */
+const MAX_TELEMETRY_DRAIN_BYTES = 16 * 1024 * 1024
+const MAX_TELEMETRY_REMAINDER_BYTES = 256 * 1024
 const DEFAULT_POLL_MS = 750
 /** Minimum interval between activity-only (`stepCount`/`activity`/`unreadCount`) emissions.
  * Structural changes (new posts, member status/role/error changes, channels, terminal phase)
@@ -68,7 +74,33 @@ interface TranscriptSummary {
   activity?: string
   failed?: boolean
   lastError?: string
+  firstStepAt?: number
   lastActiveAt?: number
+  inputTokens: number
+  outputTokens: number
+  toolCalls: number
+}
+
+export interface MemberTelemetrySnapshot {
+  firstStepAt?: number
+  lastActiveAt?: number
+  inputTokens: number
+  outputTokens: number
+  toolCalls: number
+  /** True when unread bytes remain (`byteOffset < fileSize`) or an oversized line/budget cap prevented complete counting. */
+  partial?: boolean
+  hasBacklog?: boolean
+}
+
+interface TelemetryCursor extends MemberTelemetrySnapshot {
+  dev: number
+  ino: number
+  byteOffset: number
+  lastSeenSize: number
+  remainder: string
+  decoder: StringDecoder
+  droppedOversizedLine: boolean
+  hadMalformedLine: boolean
 }
 
 function isSafePathSegment(seg: string): boolean {
@@ -256,15 +288,312 @@ function recordOf(v: unknown): Record<string, unknown> | null {
   return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null
 }
 
+function firstNonNegInt(...candidates: unknown[]): number {
+  for (const c of candidates) {
+    if (typeof c === 'number' && Number.isFinite(c) && c > 0) {
+      return Math.floor(c)
+    }
+  }
+  return 0
+}
+
+/** Extract token usage and tool-call counts from a single transcript JSONL step. */
+export function extractStepTelemetry(step: Record<string, unknown>): {
+  ts?: number
+  inputTokens: number
+  outputTokens: number
+  toolCalls: number
+} {
+  let ts: number | undefined
+  const createdAt = asStr(step.created_at)
+  if (createdAt) {
+    const parsedTs = Date.parse(createdAt)
+    if (Number.isFinite(parsedTs)) ts = parsedTs
+  }
+
+  const meta = recordOf(step.metadata)
+  const usage =
+    recordOf(step.usage) ??
+    recordOf(step.token_usage) ??
+    recordOf(step.metrics) ??
+    recordOf(meta?.usage) ??
+    recordOf(meta?.token_usage)
+
+  const inputTokens = firstNonNegInt(
+    usage?.input_tokens,
+    usage?.inputTokens,
+    usage?.prompt_tokens,
+    usage?.promptTokens,
+    usage?.promptTokenCount,
+    step.input_tokens,
+    step.inputTokens,
+  )
+  const outputTokens = firstNonNegInt(
+    usage?.output_tokens,
+    usage?.outputTokens,
+    usage?.completion_tokens,
+    usage?.completionTokens,
+    usage?.candidatesTokenCount,
+    step.output_tokens,
+    step.outputTokens,
+  )
+
+  let toolCalls = 0
+  const stepType = asStr(step.type).toUpperCase()
+  if (Array.isArray(step.tool_calls) && step.tool_calls.length > 0) {
+    toolCalls = step.tool_calls.length
+  } else if (stepType === 'TOOL_CALL' || stepType === 'TOOL_USE') {
+    toolCalls = 1
+  }
+
+  return { ts, inputTokens, outputTokens, toolCalls }
+}
+
+function applyTelemetryLine(cursor: MemberTelemetrySnapshot, line: string): boolean {
+  const trimmed = line.trim()
+  if (!trimmed) return true
+  try {
+    const obj = recordOf(JSON.parse(trimmed))
+    if (!obj) return false
+    const delta = extractStepTelemetry(obj)
+    if (delta.ts !== undefined) {
+      if (cursor.firstStepAt === undefined || delta.ts < cursor.firstStepAt) {
+        cursor.firstStepAt = delta.ts
+      }
+      if (cursor.lastActiveAt === undefined || delta.ts > cursor.lastActiveAt) {
+        cursor.lastActiveAt = delta.ts
+      }
+    }
+    cursor.inputTokens += delta.inputTokens
+    cursor.outputTokens += delta.outputTokens
+    cursor.toolCalls += delta.toolCalls
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Incremental byte-offset telemetry scanner for member `transcript.jsonl` files (B7).
+ *
+ * - Uses per-member `StringDecoder('utf8')` so multi-byte UTF-8 characters split across
+ *   chunk boundaries never corrupt into U+FFFD replacement characters.
+ * - Tracks `hasBacklog` (`byteOffset < fileSize`) and `partial` (unread backlog or oversized
+ *   line drop), so callers continue draining quiet large logs across ticks and NEVER emit a
+ *   partial count disguised as an exact terminal total.
+ */
+export class IncrementalTranscriptTelemetryCache {
+  private readonly cursors = new Map<string, TelemetryCursor>()
+  private readonly maxChunkBytes: number
+  private readonly maxDrainBytes: number
+
+  constructor(maxChunkBytes = MAX_TELEMETRY_DELTA_BYTES, maxDrainBytes = MAX_TELEMETRY_DRAIN_BYTES) {
+    this.maxChunkBytes = Math.max(4096, maxChunkBytes)
+    this.maxDrainBytes = Math.max(this.maxChunkBytes, maxDrainBytes)
+  }
+
+  hasAnyBacklog(): boolean {
+    for (const c of this.cursors.values()) {
+      if (c.hasBacklog) return true
+    }
+    return false
+  }
+
+  private createCursor(st: Stats): TelemetryCursor {
+    return {
+      dev: st.dev,
+      ino: st.ino,
+      byteOffset: 0,
+      lastSeenSize: st.size,
+      remainder: '',
+      decoder: new StringDecoder('utf8'),
+      droppedOversizedLine: false,
+      hadMalformedLine: false,
+      inputTokens: 0,
+      outputTokens: 0,
+      toolCalls: 0,
+      hasBacklog: st.size > 0,
+      partial: st.size > 0,
+    }
+  }
+
+  private computePartial(c: TelemetryCursor): boolean {
+    // B7: 区分“读到物理 EOF”与“最后一条记录完整”——只要仍有未闭合/不可解析尾行或损坏行，
+    // 必须诚实标记 partial=true，绝不将已解析小计伪装为完整总计。
+    return Boolean(
+      c.hasBacklog ||
+        c.droppedOversizedLine ||
+        c.hadMalformedLine ||
+        c.remainder.trim().length > 0,
+    )
+  }
+
+  private consumeTextChunk(cursor: TelemetryCursor, decoded: string, atEof: boolean): void {
+    const combined = cursor.remainder + decoded
+    const lastNewline = combined.lastIndexOf('\n')
+    if (lastNewline >= 0) {
+      const completePart = combined.slice(0, lastNewline)
+      const trailing = combined.slice(lastNewline + 1)
+      for (const line of completePart.split('\n')) {
+        if (!applyTelemetryLine(cursor, line)) {
+          cursor.hadMalformedLine = true
+        }
+      }
+      if (trailing.length > MAX_TELEMETRY_REMAINDER_BYTES) {
+        cursor.remainder = ''
+        cursor.droppedOversizedLine = true
+      } else {
+        cursor.remainder = trailing
+      }
+    } else if (combined.length > MAX_TELEMETRY_REMAINDER_BYTES) {
+      cursor.remainder = ''
+      cursor.droppedOversizedLine = true
+    } else {
+      cursor.remainder = combined
+    }
+
+    // Only attempt to parse a trailing line without newline when we have reached EOF
+    // and the trailing text is a complete JSON object (avoiding premature truncation mid-chunk).
+    if (atEof && cursor.remainder.trim().endsWith('}')) {
+      if (applyTelemetryLine(cursor, cursor.remainder)) {
+        cursor.remainder = ''
+      }
+    }
+  }
+
+  scan(
+    brainDir: string,
+    memberConvId: string,
+    opts?: { drainAll?: boolean; maxBytesBudget?: number },
+  ): MemberTelemetrySnapshot | null {
+    if (!CONVERSATION_ID_RE.test(memberConvId)) return null
+    const resolved = resolveRegularFileWithinRoot(brainDir, [
+      memberConvId,
+      '.system_generated',
+      'logs',
+      'transcript.jsonl',
+    ])
+    if (!resolved) {
+      this.cursors.delete(memberConvId)
+      return null
+    }
+
+    const st = resolved.stat
+    let cursor = this.cursors.get(memberConvId)
+    const rotated =
+      !cursor ||
+      cursor.dev !== st.dev ||
+      cursor.ino !== st.ino ||
+      st.size < cursor.byteOffset
+    if (rotated) {
+      cursor = this.createCursor(st)
+      this.cursors.set(memberConvId, cursor)
+    }
+    const c = cursor!
+    c.lastSeenSize = st.size
+
+    if (st.size === c.byteOffset) {
+      c.hasBacklog = false
+      c.partial = this.computePartial(c)
+      return {
+        firstStepAt: c.firstStepAt,
+        lastActiveAt: c.lastActiveAt,
+        inputTokens: c.inputTokens,
+        outputTokens: c.outputTokens,
+        toolCalls: c.toolCalls,
+        hasBacklog: false,
+        partial: c.partial,
+      }
+    }
+
+    let fd: number | null = null
+    try {
+      const flags =
+        fsConstants.O_RDONLY |
+        (typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0) |
+        (typeof fsConstants.O_NONBLOCK === 'number' ? fsConstants.O_NONBLOCK : 0)
+      fd = openSync(resolved.fullPath, flags)
+      const fst = fstatSync(fd)
+      if (!fst.isFile() || fst.dev !== st.dev || fst.ino !== st.ino) {
+        return null
+      }
+      const realRoot = realpathSync(brainDir)
+      const realFile = realpathSync(resolved.fullPath)
+      if (!realFile.startsWith(realRoot.endsWith(sep) ? realRoot : `${realRoot}${sep}`)) {
+        return null
+      }
+      c.lastSeenSize = fst.size
+
+      const budget = opts?.drainAll
+        ? Math.max(this.maxChunkBytes, opts.maxBytesBudget ?? this.maxDrainBytes)
+        : Math.max(4096, opts?.maxBytesBudget ?? this.maxChunkBytes)
+      let bytesBudgetLeft = budget
+
+      while (c.byteOffset < fst.size && bytesBudgetLeft > 0) {
+        const toRead = Math.min(fst.size - c.byteOffset, this.maxChunkBytes, bytesBudgetLeft)
+        if (toRead <= 0) break
+        const buf = Buffer.allocUnsafe(toRead)
+        let readTotal = 0
+        while (readTotal < toRead) {
+          const n = readSync(fd, buf, readTotal, toRead - readTotal, c.byteOffset + readTotal)
+          if (n <= 0) break
+          readTotal += n
+        }
+        if (readTotal <= 0) break
+        c.byteOffset += readTotal
+        bytesBudgetLeft -= readTotal
+        const atEof = c.byteOffset >= fst.size
+        const decoded = c.decoder.write(buf.subarray(0, readTotal))
+        this.consumeTextChunk(c, decoded, atEof)
+      }
+
+      if (opts?.drainAll && c.byteOffset >= fst.size) {
+        const flushed = c.decoder.end()
+        if (flushed) {
+          this.consumeTextChunk(c, flushed, true)
+        }
+        // Re-initialize fresh decoder in case more bytes are appended later.
+        c.decoder = new StringDecoder('utf8')
+      }
+
+      c.hasBacklog = c.byteOffset < fst.size
+      c.partial = this.computePartial(c)
+    } catch {
+      return null
+    } finally {
+      if (fd !== null) {
+        try { closeSync(fd) } catch { /* ignore */ }
+      }
+    }
+
+    return {
+      firstStepAt: c.firstStepAt,
+      lastActiveAt: c.lastActiveAt,
+      inputTokens: c.inputTokens,
+      outputTokens: c.outputTokens,
+      toolCalls: c.toolCalls,
+      hasBacklog: c.hasBacklog,
+      partial: c.partial,
+    }
+  }
+
+  prune(activeMemberConvIds: ReadonlySet<string>): void {
+    for (const key of this.cursors.keys()) {
+      if (!activeMemberConvIds.has(key)) this.cursors.delete(key)
+    }
+  }
+}
+
 /**
  * Inspect a member's compact `transcript.jsonl` tail to determine its live
- * status, step count, current activity, and error state (mirrors Antigravity
- * CLI `board.StateOf`).
+ * status, step count, current activity, error state, and lightweight telemetry
+ * (mirrors Antigravity CLI `board.StateOf`).
  */
 export function parseMemberTranscriptTail(text: string | null): TranscriptSummary {
-  if (!text) return { stepCount: 0, status: null }
+  const empty: TranscriptSummary = { stepCount: 0, status: null, inputTokens: 0, outputTokens: 0, toolCalls: 0 }
+  if (!text) return empty
   const lines = text.split('\n').filter((l) => l.trim().length > 0)
-  if (lines.length === 0) return { stepCount: 0, status: null }
+  if (lines.length === 0) return empty
 
   const steps: Array<Record<string, unknown>> = []
   for (const line of lines) {
@@ -276,19 +605,33 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
       // Ignore partial trailing line while CLI is appending.
     }
   }
-  if (steps.length === 0) return { stepCount: 0, status: null }
+  if (steps.length === 0) return empty
 
   let maxStepIndex = steps.length
+  let firstStepAt: number | undefined
   let lastActiveAt: number | undefined
+  let inputTokens = 0
+  let outputTokens = 0
+  let toolCalls = 0
   for (const step of steps) {
     if (typeof step.step_index === 'number' && Number.isFinite(step.step_index)) {
       maxStepIndex = Math.max(maxStepIndex, Math.floor(step.step_index) + 1)
     }
-    const createdAt = asStr(step.created_at)
-    if (createdAt) {
-      const parsedTs = Date.parse(createdAt)
-      if (Number.isFinite(parsedTs)) lastActiveAt = parsedTs
+    const tel = extractStepTelemetry(step)
+    if (tel.ts !== undefined) {
+      if (firstStepAt === undefined || tel.ts < firstStepAt) firstStepAt = tel.ts
+      if (lastActiveAt === undefined || tel.ts > lastActiveAt) lastActiveAt = tel.ts
     }
+    inputTokens += tel.inputTokens
+    outputTokens += tel.outputTokens
+    toolCalls += tel.toolCalls
+  }
+  const telBase = {
+    ...(firstStepAt !== undefined ? { firstStepAt } : {}),
+    ...(lastActiveAt !== undefined ? { lastActiveAt } : {}),
+    inputTokens,
+    outputTokens,
+    toolCalls,
   }
 
   // Locate the latest meaningful turn boundary (USER_INPUT) to inspect current turn only.
@@ -308,12 +651,12 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
   if (lastStatus === 'ERROR' || lastType === 'ERROR_MESSAGE') {
     const errText = clampText(asStr(last.content) || asStr(last.error) || '执行出错', 160)
     return {
+      ...telBase,
       stepCount: maxStepIndex,
       status: 'waiting',
       activity: '步骤异常',
       failed: true,
       lastError: errText,
-      lastActiveAt,
     }
   }
 
@@ -331,10 +674,10 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
     const calls = Array.isArray(last.tool_calls) ? last.tool_calls : []
     if (lastStatus === 'DONE' && calls.length === 0) {
       return {
+        ...telBase,
         stepCount: maxStepIndex,
         status: 'waiting',
         activity: '已完成本轮思考',
-        lastActiveAt,
       }
     }
     if (calls.length > 0) {
@@ -342,17 +685,17 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
       const callName = asStr(firstCall?.name)
       const callArgs = recordOf(firstCall?.arguments ?? firstCall?.args)
       return {
+        ...telBase,
         stepCount: maxStepIndex,
         status: 'working',
         activity: describeToolActivity(callName, callArgs),
-        lastActiveAt,
       }
     }
     return {
+      ...telBase,
       stepCount: maxStepIndex,
       status: 'working',
       activity: '思考与规划中…',
-      lastActiveAt,
     }
   }
 
@@ -364,10 +707,10 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
   })
   if (isSwarmWaitDone && lastStatus === 'DONE') {
     return {
+      ...telBase,
       stepCount: maxStepIndex,
       status: 'waiting',
       activity: '等待讨论板消息',
-      lastActiveAt,
     }
   }
 
@@ -375,26 +718,26 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
   const directTool = asStr(last.tool_name || last.name)
   if (directTool) {
     return {
+      ...telBase,
       stepCount: maxStepIndex,
       status: lastStatus === 'RUNNING' || lastStatus === 'PENDING' ? 'working' : 'working',
       activity: describeToolActivity(directTool, recordOf(last.arguments ?? last.args)),
-      lastActiveAt,
     }
   }
   if (lastPlanner && Array.isArray(lastPlanner.tool_calls) && lastPlanner.tool_calls.length > 0) {
     const latestCall = recordOf(lastPlanner.tool_calls[lastPlanner.tool_calls.length - 1])
     return {
+      ...telBase,
       stepCount: maxStepIndex,
       status: 'working',
       activity: describeToolActivity(asStr(latestCall?.name), recordOf(latestCall?.arguments ?? latestCall?.args)),
-      lastActiveAt,
     }
   }
   return {
+    ...telBase,
     stepCount: maxStepIndex,
     status: lastType === 'USER_INPUT' ? 'working' : 'waiting',
     activity: lastType === 'USER_INPUT' ? '启动处理中…' : '待命中',
-    lastActiveAt,
   }
 }
 
@@ -469,6 +812,10 @@ export function readAntigravitySwarmSnapshot(opts: {
   now?: number
   /** Internal collector so the watcher can stat member transcripts without exposing IDs on wire. */
   outMemberConvIds?: string[]
+  /** Optional incremental transcript telemetry cache (avoids re-scanning full transcripts). */
+  telemetryCache?: IncrementalTranscriptTelemetryCache
+  /** When true (terminal snapshot), drain unread telemetry backlog up to the terminal budget. */
+  drainTelemetry?: boolean
 }): SwarmSnapshot | null {
   if (!CONVERSATION_ID_RE.test(opts.conversationId)) return null
   const membersRaw = readBoundedFileWithinRoot(
@@ -524,6 +871,10 @@ export function readAntigravitySwarmSnapshot(opts: {
           )
         : null
     const transcript = parseMemberTranscriptTail(transcriptText)
+    const incTelemetry =
+      opts.telemetryCache && memberConvId && CONVERSATION_ID_RE.test(memberConvId)
+        ? opts.telemetryCache.scan(opts.brainDir, memberConvId, { drainAll: opts.drainTelemetry })
+        : null
     const wakeMode = asStr(m.wake_mode) || undefined
     let status: SwarmMemberStatus
     if (killed) {
@@ -536,6 +887,23 @@ export function readAntigravitySwarmSnapshot(opts: {
       status = 'waiting'
     } else {
       status = 'working'
+    }
+
+    const firstStepAt = incTelemetry?.firstStepAt ?? transcript.firstStepAt
+    const lastActiveAt = incTelemetry?.lastActiveAt ?? transcript.lastActiveAt
+    // When incremental cache is active, use its monotonic byte-0..offset counts directly (never Math.max with tail).
+    const inputTokens = incTelemetry ? incTelemetry.inputTokens : transcript.inputTokens
+    const outputTokens = incTelemetry ? incTelemetry.outputTokens : transcript.outputTokens
+    const toolCalls = incTelemetry ? incTelemetry.toolCalls : transcript.toolCalls
+    const telemetryPartial = incTelemetry?.partial === true
+    const snapshotNow = opts.now ?? Date.now()
+    let elapsedMs: number | undefined
+    if (firstStepAt !== undefined) {
+      const endTs =
+        status === 'working'
+          ? Math.max(snapshotNow, lastActiveAt ?? firstStepAt)
+          : (lastActiveAt ?? firstStepAt)
+      elapsedMs = Math.max(0, endTs - firstStepAt)
     }
 
     const memberChannels = Array.isArray(m.channels)
@@ -568,7 +936,12 @@ export function readAntigravitySwarmSnapshot(opts: {
       ...(transcript.lastError ? { lastError: transcript.lastError } : {}),
       unreadCount,
       ...(lastPostSeq !== undefined ? { lastPostSeq } : {}),
-      ...(transcript.lastActiveAt !== undefined ? { lastActiveAt: transcript.lastActiveAt } : {}),
+      ...(lastActiveAt !== undefined ? { lastActiveAt } : {}),
+      ...(elapsedMs !== undefined ? { elapsedMs } : {}),
+      ...(inputTokens > 0 ? { inputTokens } : {}),
+      ...(outputTokens > 0 ? { outputTokens } : {}),
+      ...(toolCalls > 0 ? { toolCalls } : {}),
+      ...(telemetryPartial ? { telemetryPartial: true } : {}),
     })
   }
 
@@ -624,7 +997,7 @@ export function readAntigravitySwarmSnapshot(opts: {
 }
 
 function stripVolatileMemberFields(m: SwarmMemberSnapshot) {
-  const { lastActiveAt: _la, ...rest } = m
+  const { lastActiveAt: _la, elapsedMs: _em, ...rest } = m
   return rest
 }
 
@@ -762,6 +1135,7 @@ export class AntigravitySwarmWatcher {
   private timer: NodeJS.Timeout | null = null
   private throttleTimer: NodeJS.Timeout | null = null
   private keyframeTimer: NodeJS.Timeout | null = null
+  private backlogTimer: NodeJS.Timeout | null = null
   private pendingActivitySnap: SwarmSnapshot | null = null
   private stopped = false
   private revision = 0
@@ -771,6 +1145,7 @@ export class AntigravitySwarmWatcher {
   private baselineActivationHash: string | null = null
   private lastStatSignature: string | null = null
   private trackedMemberConvIds: string[] = []
+  private readonly telemetryCache = new IncrementalTranscriptTelemetryCache()
   private lastSnapshot: SwarmSnapshot | null = null
   private emittedInTurn = false
   private turnActive = false
@@ -864,6 +1239,7 @@ export class AntigravitySwarmWatcher {
   private setTrackedMembers(ids: string[]): void {
     const uniq = Array.from(new Set(ids.filter((id) => CONVERSATION_ID_RE.test(id)))).sort()
     this.trackedMemberConvIds = uniq
+    this.telemetryCache.prune(new Set(uniq))
   }
 
   private captureBaseline(): void {
@@ -877,6 +1253,7 @@ export class AntigravitySwarmWatcher {
       revision: 0,
       now: this.now(),
       outMemberConvIds: memberConvIds,
+      telemetryCache: this.telemetryCache,
     })
     if (!snap) return
     this.setTrackedMembers(memberConvIds)
@@ -998,10 +1375,29 @@ export class AntigravitySwarmWatcher {
     this.throttleTimer.unref()
   }
 
+  private clearBacklogTimer(): void {
+    if (this.backlogTimer) {
+      clearTimeout(this.backlogTimer)
+      this.backlogTimer = null
+    }
+  }
+
+  private scheduleBacklogCatchup(): void {
+    if (this.stopped || this.backlogTimer || !this.telemetryCache.hasAnyBacklog()) return
+    this.backlogTimer = setTimeout(() => {
+      this.backlogTimer = null
+      if (!this.stopped && this.telemetryCache.hasAnyBacklog()) {
+        this.pollOnce(false)
+      }
+    }, 15)
+    this.backlogTimer.unref()
+  }
+
   private pollOnce(force: boolean): void {
     if (this.stopped) return
     const statSig = this.computeStatSignature()
-    if (!force && this.lastStatSignature !== null && statSig === this.lastStatSignature) {
+    const hasBacklog = this.telemetryCache.hasAnyBacklog()
+    if (!force && !hasBacklog && this.lastStatSignature !== null && statSig === this.lastStatSignature) {
       return
     }
     this.lastStatSignature = statSig
@@ -1016,10 +1412,14 @@ export class AntigravitySwarmWatcher {
       startedAt: this.startedAt,
       now: ts,
       outMemberConvIds: memberConvIds,
+      telemetryCache: this.telemetryCache,
     })
     if (!snap) return
     this.setTrackedMembers(memberConvIds)
     this.lastStatSignature = this.computeStatSignature()
+    if (this.telemetryCache.hasAnyBacklog()) {
+      this.scheduleBacklogCatchup()
+    }
     const hash = snapshotFingerprint(snap)
     const structHash = structuralFingerprint(snap)
     if (!this.turnActive && this.seedBaselineOnStart && this.baselineActivationHash !== null) {
@@ -1072,6 +1472,8 @@ export class AntigravitySwarmWatcher {
       revision: nextRev,
       startedAt: this.startedAt,
       now: this.now(),
+      telemetryCache: this.telemetryCache,
+      drainTelemetry: true,
     })
     if (!snap) {
       if (!this.lastSnapshot) return null
@@ -1089,6 +1491,7 @@ export class AntigravitySwarmWatcher {
     this.stopped = true
     this.clearThrottleTimer()
     this.clearKeyframeTimer()
+    this.clearBacklogTimer()
     if (this.timer) {
       clearInterval(this.timer)
       this.timer = null

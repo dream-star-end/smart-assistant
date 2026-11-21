@@ -911,6 +911,11 @@ export const OutboundContentBlock = Type.Union([
           unreadCount: Type.Integer({ minimum: 0 }),
           lastPostSeq: Type.Optional(Type.Integer({ minimum: 0 })),
           lastActiveAt: Type.Optional(Type.Number()),
+          elapsedMs: Type.Optional(Type.Number({ minimum: 0 })),
+          inputTokens: Type.Optional(Type.Integer({ minimum: 0 })),
+          outputTokens: Type.Optional(Type.Integer({ minimum: 0 })),
+          toolCalls: Type.Optional(Type.Integer({ minimum: 0 })),
+          telemetryPartial: Type.Optional(Type.Boolean()),
         }),
       ),
       channels: Type.Array(

@@ -515,6 +515,15 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private async spawnTurn(ctx: TurnContext): Promise<void> {
+    // B4 (OCV5-828): Antigravity CLI runs with `--dangerously-skip-permissions` and
+    // cannot enforce a hard read-only sandbox locally. Fail closed BEFORE projection
+    // or spawning so explicit read-only turns never execute with write capabilities
+    // and never silently swap the main model.
+    if (ctx.params.readOnly === true) {
+      throw new Error(
+        'ANTIGRAVITY_READ_ONLY_UNSUPPORTED: Antigravity 本地 CLI 暂不支持硬只读沙箱，已拒绝启动该只读回合（主模型未切换）。',
+      )
+    }
     const route = validateAntigravityRoute(this.route)
     const cliModel = antigravityCliModelId(this.currentModel, this.currentEffort)
     if (!cliModel) {
