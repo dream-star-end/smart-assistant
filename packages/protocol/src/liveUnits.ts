@@ -114,6 +114,8 @@ export type LiveUnitState = {
   units: LiveUnit[]
   throughFrameSeq: number
   throughRecordId: string
+  /** Stream key paired atomically with `throughFrameSeq` / `throughRecordId` (OCV5-837). */
+  throughStreamKey?: string
   sessionKey?: string
   reducerEpoch: string
   /** SessionKey-reuse generation. Independent of reducerEpoch. */
@@ -126,6 +128,8 @@ export type LiveUnitsResume = {
   sessionKey: string
   frameSeq: number
   recordId: string
+  /** Authoritative live stream identity matching this resume cursor (OCV5-837). */
+  streamKey?: string
 }
 
 export type LiveUnitsPage = {
@@ -635,6 +639,7 @@ function reduceLiveFramesOnto(
   }
   let throughFrameSeq = seed.throughFrameSeq
   let throughRecordId = seed.throughRecordId
+  let throughStreamKey: string | undefined = seed.throughStreamKey
   let sessionKey: string | undefined = seed.sessionKey
 
   for (let i = 0; i < frames.length; i++) {
@@ -644,9 +649,29 @@ function reduceLiveFramesOnto(
     const frame = frames[i]!
     const streamGeneration = genFor(frame.streamKey)
     const meta = frameMeta(frame)
-    if (meta.seq > throughFrameSeq) throughFrameSeq = meta.seq
+    if (frame.streamKey) {
+      if (throughStreamKey && frame.streamKey !== throughStreamKey) {
+        // Stream switched: reset cursor watermark atomically to this new stream's record so
+        // (throughStreamKey, throughFrameSeq, sessionKey) never mix an older stream's seq
+        // with a newer streamKey (OCV5-837).
+        throughStreamKey = frame.streamKey
+        throughFrameSeq = meta.seq
+        sessionKey = meta.sessionKey || undefined
+      } else if (!throughStreamKey) {
+        if (throughFrameSeq === 0 || meta.seq > throughFrameSeq) {
+          throughStreamKey = frame.streamKey
+          throughFrameSeq = meta.seq
+          if (meta.sessionKey) sessionKey = meta.sessionKey
+        }
+      } else {
+        if (meta.seq > throughFrameSeq) throughFrameSeq = meta.seq
+        if (meta.sessionKey) sessionKey = meta.sessionKey
+      }
+    } else {
+      if (meta.seq > throughFrameSeq) throughFrameSeq = meta.seq
+      if (meta.sessionKey) sessionKey = meta.sessionKey
+    }
     throughRecordId = frame.recordId
-    if (meta.sessionKey) sessionKey = meta.sessionKey
     // Permission lifecycle frames are user-blocking control state, not message
     // blocks. The compact live-unit schema cannot represent them. Advancing a
     // resume cursor past either frame would make the browser skip the raw
@@ -960,6 +985,7 @@ function reduceLiveFramesOnto(
       units,
       throughFrameSeq,
       throughRecordId,
+      ...(throughStreamKey ? { throughStreamKey } : {}),
       sessionKey,
       reducerEpoch: LIVE_UNITS_REDUCER_EPOCH,
       streamGeneration: streamKeyLineage.length > 0 ? streamKeyLineage.length - 1 : (seed.streamGeneration ?? 0),
@@ -1307,11 +1333,18 @@ export function serveLiveUnits(
       : `u:${state.throughFrameSeq + 1}`
   }
 
+  // Only emit resume.streamKey when proved atomically paired with throughFrameSeq (OCV5-837).
+  const resumeStreamKey =
+    typeof state.throughStreamKey === 'string' && state.throughStreamKey.length > 0
+      ? state.throughStreamKey
+      : undefined
+
   const resume: LiveUnitsResume | undefined = state.throughRecordId !== '0'
     ? {
       sessionKey: state.sessionKey || '',
       frameSeq: state.throughFrameSeq,
       recordId: state.throughRecordId,
+      ...(resumeStreamKey ? { streamKey: resumeStreamKey } : {}),
     }
     : undefined
 
@@ -1378,6 +1411,7 @@ function cloneState(state: LiveUnitState): LiveUnitState {
     units: state.units.map(cloneUnit),
     throughFrameSeq: state.throughFrameSeq,
     throughRecordId: state.throughRecordId,
+    ...(state.throughStreamKey ? { throughStreamKey: state.throughStreamKey } : {}),
     sessionKey: state.sessionKey,
     reducerEpoch: state.reducerEpoch,
     streamGeneration: state.streamGeneration,
@@ -1439,6 +1473,7 @@ export function foldLiveUnitStateForCheckpoint(
     }),
     throughFrameSeq: state.throughFrameSeq,
     throughRecordId: state.throughRecordId,
+    ...(state.throughStreamKey ? { throughStreamKey: state.throughStreamKey } : {}),
     sessionKey: state.sessionKey,
     reducerEpoch: state.reducerEpoch || LIVE_UNITS_REDUCER_EPOCH,
     streamGeneration: state.streamGeneration ?? 0,
@@ -1476,6 +1511,9 @@ export function parseLiveUnitCheckpoint(
     units,
     throughFrameSeq: obj.throughFrameSeq,
     throughRecordId: obj.throughRecordId,
+    ...(typeof obj.throughStreamKey === 'string' && obj.throughStreamKey.length > 0
+      ? { throughStreamKey: obj.throughStreamKey }
+      : {}),
     sessionKey: typeof obj.sessionKey === 'string' ? obj.sessionKey : undefined,
     reducerEpoch: expectedEpoch,
     streamGeneration: typeof obj.streamGeneration === 'number' ? obj.streamGeneration : 0,

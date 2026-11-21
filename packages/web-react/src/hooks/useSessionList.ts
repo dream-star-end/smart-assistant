@@ -7,6 +7,7 @@ import { DEMO_SESSIONS } from "../lib/demo";
 import type { StoredSession } from "../lib/persist";
 import { isHiddenQuickAskSession } from "../lib/quickAskSession";
 import { clearSessionServiceTier } from "../lib/sessionServiceTier";
+import { clearSessionSwarmMode } from "../lib/sessionSwarmMode";
 import type {
   AuthSession,
   Session,
@@ -755,6 +756,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     if (!ok) return;
     cbRef.current.onDeleteSession?.(s.id);
     clearSessionServiceTier(s.id);
+    clearSessionSwarmMode(s.id);
     historyFetchedAtRef.current.delete(s.id);
     historyFetchingRef.current.delete(s.id);
     setHistoryLoadingTokens((current) => {
@@ -827,6 +829,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
 
   const forgetSessionLocal = (id: string) => {
     clearSessionServiceTier(id);
+    clearSessionSwarmMode(id);
     historyFetchedAtRef.current.delete(id);
     historyFetchingRef.current.delete(id);
     const pendingAbort = historyAbortRef.current.get(id);

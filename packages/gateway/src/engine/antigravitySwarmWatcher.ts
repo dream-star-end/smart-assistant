@@ -45,9 +45,10 @@ const DEFAULT_POLL_MS = 750
  * Structural changes (new posts, member status/role/error changes, channels, terminal phase)
  * still emit with 0ms delay (OCV5-819). */
 export const SWARM_ACTIVITY_THROTTLE_MS = 2_500
-/** Force a periodic full-posts keyframe so partial replays self-heal quickly. */
-export const SWARM_FULL_KEYFRAME_INTERVAL_EMITS = 20
-export const SWARM_FULL_KEYFRAME_INTERVAL_MS = 30_000
+/** Force a periodic full-posts keyframe when new posts accumulated since the last full frame
+ *  so partial replays self-heal without bloating live_frames on activity-only churn (OCV5-837). */
+export const SWARM_FULL_KEYFRAME_INTERVAL_EMITS = 120
+export const SWARM_FULL_KEYFRAME_INTERVAL_MS = 300_000
 const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 interface RawRosterMember {
@@ -1152,6 +1153,7 @@ export class AntigravitySwarmWatcher {
   private lastEmitAt = 0
   private lastFullEmitAt = 0
   private emitsSinceFull = 0
+  private lastFullPostSeq = 0
   private lastEmittedPostSeq = 0
   private lastEmittedTotalPosts = 0
 
@@ -1279,15 +1281,17 @@ export class AntigravitySwarmWatcher {
     }
   }
 
-  /** Schedule a single bounded full-posts keyframe refresh after a delta emission so even
-   * a board that goes quiet after a delta self-heals within `fullKeyframeIntervalMs` (OCV5-819 B7). */
+  /** Schedule a single bounded full-posts keyframe refresh after a delta carrying new posts
+   * so even a board that goes quiet after a post delta self-heals within `fullKeyframeIntervalMs`,
+   * while activity-only churn (no new posts since last full keyframe) never bloats live_frames (OCV5-819/837). */
   private scheduleQuietKeyframe(): void {
     this.clearKeyframeTimer()
     if (this.stopped || this.fullKeyframeIntervalMs <= 0) return
+    if (this.lastEmittedPostSeq <= this.lastFullPostSeq) return
     const delayMs = Math.max(10, this.fullKeyframeIntervalMs)
     this.keyframeTimer = setTimeout(() => {
       this.keyframeTimer = null
-      if (this.stopped || !this.lastSnapshot || this.emitsSinceFull === 0) return
+      if (this.stopped || !this.lastSnapshot || this.lastEmittedPostSeq <= this.lastFullPostSeq) return
       const nextRev = this.revision + 1
       const snap: SwarmSnapshot = {
         ...structuredClone(this.lastSnapshot),
@@ -1309,11 +1313,12 @@ export class AntigravitySwarmWatcher {
     const postsShrank =
       fullSnap.totalPosts < this.lastEmittedTotalPosts ||
       headSeq < this.lastEmittedPostSeq
+    const hasUnkeyframedPosts = headSeq > this.lastFullPostSeq
     const keyframeDue =
       !this.emittedInTurn ||
       forceFull ||
       postsShrank ||
-      (fullSnap.posts.length > 0 &&
+      (hasUnkeyframedPosts &&
         (this.emitsSinceFull >= this.fullKeyframeIntervalEmits ||
           ts - this.lastFullEmitAt >= this.fullKeyframeIntervalMs))
 
@@ -1324,6 +1329,7 @@ export class AntigravitySwarmWatcher {
         postsMode: 'full',
       }
       this.lastFullEmitAt = ts
+      this.lastFullPostSeq = headSeq
       this.emitsSinceFull = 0
     } else {
       const deltaPosts = fullSnap.posts.filter((p) => p.seq > this.lastEmittedPostSeq)
@@ -1334,15 +1340,15 @@ export class AntigravitySwarmWatcher {
         deltaBaseSeq: this.lastEmittedPostSeq,
       }
       this.emitsSinceFull += 1
-      if (fullSnap.posts.length > 0) {
-        this.scheduleQuietKeyframe()
-      }
     }
 
     this.lastEmitAt = ts
     this.lastEmittedPostSeq = Math.max(this.lastEmittedPostSeq, headSeq)
     this.lastEmittedTotalPosts = fullSnap.totalPosts
     this.emittedInTurn = true
+    if (!keyframeDue && this.lastEmittedPostSeq > this.lastFullPostSeq) {
+      this.scheduleQuietKeyframe()
+    }
     try {
       this.onSnapshot(wireSnap)
     } catch {

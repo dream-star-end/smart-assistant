@@ -366,6 +366,10 @@ export function useChatSocket(opts: {
         const { limit, ...snapshot } = query;
         return (await api.getSessionLiveFrames(a, sessId, "0", limit ?? 200, { snapshot })).snapshot;
       },
+      readLiveUnits: (sessId) => {
+        const a = authRef.current;
+        return a ? api.getSessionLiveUnits(a, sessId, { n: 20 }) : Promise.reject(new Error("signed out"));
+      },
       readLiveFramePayload: (sessId, ref) => {
         const a = authRef.current;
         return a ? api.getLiveFramePayload(a, sessId, ref) : Promise.reject(new Error("signed out"));

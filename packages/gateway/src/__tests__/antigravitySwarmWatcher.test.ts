@@ -1059,3 +1059,67 @@ test('B7: trailing half-written JSON at EOF marks telemetryPartial=true on both 
     await rm(brainDir, { recursive: true, force: true })
   }
 })
+
+test('OCV5-837: activity-only churn does not emit redundant full keyframes when no new posts arrived', async () => {
+  const brainDir = await mkdtemp(path.join(tmpdir(), 'oc-swarm-no-bloat-'))
+  try {
+    const { swarmDir } = await writeSwarmFixture(brainDir)
+    const workerLog = path.join(brainDir, WORKER_CONV, '.system_generated', 'logs', 'transcript.jsonl')
+    const emitted: SwarmSnapshot[] = []
+    let fakeNow = 1_000_000
+    const watcher = new AntigravitySwarmWatcher({
+      brainDir,
+      conversationId: COORD_CONV,
+      pollMs: 60_000,
+      activityThrottleMs: 0,
+      fullKeyframeIntervalEmits: 2,
+      fullKeyframeIntervalMs: 30,
+      now: () => fakeNow,
+      onSnapshot: (snap) => emitted.push(snap),
+    })
+    watcher.start()
+    assert.equal(emitted.length, 1)
+    assert.equal(emitted[0]!.postsMode, 'full')
+
+    // 4 activity-only transcript steps spanning well past fullKeyframeIntervalEmits (2) & Ms (30)
+    // with ZERO new board posts -> must remain tiny deltas, zero redundant full frames!
+    for (let step = 10; step < 14; step += 1) {
+      fakeNow += 60_000
+      await writeFile(
+        workerLog,
+        `${readFileSync(workerLog, 'utf8')}${JSON.stringify({
+          step_index: step,
+          type: 'PLANNER_RESPONSE',
+          status: 'RUNNING',
+          tool_calls: [{ name: 'read_file', arguments: { Path: `/tmp/f${step}.ts` } }],
+        })}\n`,
+      )
+      watcher.kick()
+    }
+    await new Promise((r) => setTimeout(r, 60))
+    assert.equal(emitted.length, 5)
+    for (let i = 1; i < emitted.length; i += 1) {
+      assert.equal(emitted[i]!.postsMode, 'delta', `activity emission #${i} must stay delta`)
+      assert.equal(emitted[i]!.posts.length, 0, `activity emission #${i} must not repeat posts`)
+    }
+
+    // Now a genuine new board post arrives -> emits delta (or full if due) and heals on quiet timer.
+    fakeNow += 10
+    await writeFile(
+      path.join(swarmDir, 'board.jsonl'),
+      `${readFileSync(path.join(swarmDir, 'board.jsonl'), 'utf8')}${JSON.stringify({
+        seq: 3,
+        agent: 'parser',
+        channel: 'parser',
+        text: '新增第 3 条真实讨论',
+      })}\n`,
+    )
+    watcher.kick()
+    assert.equal(emitted.length, 6)
+    assert.equal(emitted[5]!.postsMode, 'full', 'new post after exceeded keyframe interval promotes to full keyframe')
+    assert.equal(emitted[5]!.posts.length, 3)
+    watcher.stop()
+  } finally {
+    await rm(brainDir, { recursive: true, force: true })
+  }
+})

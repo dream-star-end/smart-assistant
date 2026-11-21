@@ -952,3 +952,43 @@ describe('send_to_agent exact job correlation', () => {
     assert.equal(reduced.state.units.every((unit) => unit.completed === true), true)
   })
 })
+
+describe('OCV5-837: LiveUnitsResume atomic streamKey/frameSeq pairing', () => {
+  it('pairs streamKey and frameSeq from the exact same consumed stream record on multi-stream switch (A:900 -> B:1 => B:1)', () => {
+    const frames: LiveFrameInput[] = [
+      { ...frame('1', 900, { kind: 'text', text: 'old stream high seq' }), streamKey: 'dispatch:old:1' },
+      { ...frame('2', 1, { kind: 'text', text: 'new stream seq 1' }), streamKey: 'dispatch:new:1' },
+    ]
+    const reduced = reduceLiveFrames(frames)
+    assert.equal(reduced.ok, true)
+    if (!reduced.ok) return
+    const page = serveLiveUnits(reduced.state, META)
+    assert.equal(page.resume?.streamKey, 'dispatch:new:1')
+    assert.equal(page.resume?.frameSeq, 1, 'must reset frameSeq on stream switch instead of emitting B:900')
+
+    // Checkpoint round-trip preserves atomic throughStreamKey
+    const folded = foldLiveUnitStateForCheckpoint(reduced.state)
+    assert.ok(folded)
+    const parsed = parseLiveUnitCheckpoint(JSON.parse(folded.json))
+    assert.ok(parsed)
+    assert.equal(parsed.throughStreamKey, 'dispatch:new:1')
+    assert.equal(serveLiveUnits(parsed, META).resume?.streamKey, 'dispatch:new:1')
+  })
+
+  it('never mixes pre-seeded lineage tail [A, B] with folded A:7 and omits streamKey on legacy checkpoints without throughStreamKey', () => {
+    const reduced = reduceLiveFrames(
+      [{ ...frame('7', 7, { kind: 'text', text: 'only A' }), streamKey: 'dispatch:A:1' }],
+      { streamKeyLineage: ['dispatch:A:1', 'dispatch:B:1'] },
+    )
+    assert.equal(reduced.ok, true)
+    if (!reduced.ok) return
+    const page = serveLiveUnits(reduced.state, META)
+    assert.equal(page.resume?.streamKey, 'dispatch:A:1')
+    assert.equal(page.resume?.frameSeq, 7)
+
+    // Legacy checkpoint without throughStreamKey must not guess streamKey
+    const legacyState = { ...reduced.state, throughStreamKey: undefined }
+    const legacyPage = serveLiveUnits(legacyState, META)
+    assert.equal(legacyPage.resume?.streamKey, undefined)
+  })
+})

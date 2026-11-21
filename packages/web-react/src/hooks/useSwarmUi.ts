@@ -8,21 +8,78 @@ import {
 } from "../components/chat/swarmDetect";
 import type { ChatMessage } from "../lib/chat/model";
 import { isDialogLayerOpen } from "../lib/hotkeys";
+import {
+  readSessionSwarmMode,
+  subscribeSessionSwarmMode,
+  writeSessionSwarmMode,
+} from "../lib/sessionSwarmMode";
 import type { PublicModel } from "../lib/types";
 
 export function useSwarmMode(opts: {
   demo: boolean;
   sessionKey: string;
+  /** Persisted session id when viewing a materialized session; undefined on a fresh draft. */
+  activeSessionId?: string;
+  /** True when the active session already contains a live or historical SwarmBoard card. */
+  hasSessionSwarm?: boolean;
+  /** Optional session messages + monotonic version to detect existing SwarmBoard cards without extra caller wiring. */
+  wsMessages?: readonly ChatMessage[];
+  messagesVersion?: number;
   modelId: string | undefined;
   models: PublicModel[];
 }) {
-  const { demo, sessionKey, modelId, models } = opts;
-  const [swarmModeBySession, setSwarmModeBySession] = useState<Record<string, boolean>>({});
+  const { demo, sessionKey, activeSessionId, hasSessionSwarm = false, wsMessages, messagesVersion = 0, modelId, models } = opts;
+  const persistedId = !demo ? activeSessionId : undefined;
+  const [draftSwarm, setDraftSwarm] = useState<Record<string, boolean>>({});
+  const [persistedMap, setPersistedMap] = useState<Record<string, boolean | null>>({});
+
+  const detectedSwarm = useMemo(() => {
+    void messagesVersion;
+    return hasSessionSwarm || Boolean(persistedId && wsMessages?.length && latestSwarmCard(wsMessages));
+  }, [hasSessionSwarm, persistedId, wsMessages, messagesVersion]);
+
+  useEffect(() => {
+    if (!persistedId) return;
+    const set = (v: boolean | undefined) => {
+      const next = v ?? null;
+      setPersistedMap((prev) => (prev[persistedId] === next ? prev : { ...prev, [persistedId]: next }));
+    };
+    const stored = readSessionSwarmMode(persistedId);
+    if (stored === undefined && draftSwarm[persistedId] === true) {
+      writeSessionSwarmMode(persistedId, true);
+      set(true);
+      setDraftSwarm((prev) => {
+        if (!(persistedId in prev)) return prev;
+        const copy = { ...prev };
+        delete copy[persistedId];
+        return copy;
+      });
+    } else {
+      set(stored);
+    }
+    return subscribeSessionSwarmMode(persistedId, set);
+  }, [persistedId, draftSwarm]);
+
   const swarmSupported = !demo && isAntigravityModelForUi(modelId, models);
-  const swarmMode = swarmSupported && Boolean(swarmModeBySession[sessionKey]);
+  const explicitValue = persistedId
+    ? persistedId in persistedMap
+      ? (persistedMap[persistedId] ?? undefined)
+      : readSessionSwarmMode(persistedId)
+    : undefined;
+  const promotedDraft = persistedId && draftSwarm[persistedId] === true ? true : undefined;
+  const effectiveEnabled = persistedId ? (explicitValue ?? promotedDraft ?? detectedSwarm) : Boolean(draftSwarm[sessionKey]);
+  const swarmMode = swarmSupported && effectiveEnabled;
+
   const toggleSwarmMode = useCallback(() => {
-    setSwarmModeBySession((prev) => ({ ...prev, [sessionKey]: !prev[sessionKey] }));
-  }, [sessionKey]);
+    const next = !effectiveEnabled;
+    if (persistedId) {
+      writeSessionSwarmMode(persistedId, next);
+      setPersistedMap((prev) => ({ ...prev, [persistedId]: next }));
+    } else {
+      setDraftSwarm((prev) => ({ ...prev, [sessionKey]: next }));
+    }
+  }, [effectiveEnabled, persistedId, sessionKey]);
+
   return { swarmSupported, swarmMode, toggleSwarmMode };
 }
 

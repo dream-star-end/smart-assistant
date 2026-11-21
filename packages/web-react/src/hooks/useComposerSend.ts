@@ -19,6 +19,7 @@ import { prepareAdvisorSend, saveInitialCollaboration, persistRecoveredAdvisor }
 import { writeSessionEffort } from "../lib/sessionEffort";
 import { writeContextTier } from "../lib/sessionContextTier";
 import { writeSessionServiceTier } from "../lib/sessionServiceTier";
+import { writeSessionSwarmMode } from "../lib/sessionSwarmMode";
 import { docToUiState, keepCollabChoiceOnSaveFailure, sendCollabFields } from "../lib/collaborationConfig";
 import { apiErrorMessage, api } from "../lib/api";
 import { effortForModel, effectiveEffortModelId } from "../lib/modelPreferences";
@@ -378,6 +379,9 @@ export function useComposerSend({
         ...(effectiveTurnTier ? { serviceTier: effectiveTurnTier } : {}),
       });
       if(sent===false)return false;
+      if (effectiveSwarmMode && (!originalSessionId || Boolean(slashSwarm?.matched))) {
+        writeSessionSwarmMode(sessionId, true);
+      }
       // Fee confirmation keeps ownership of the draft until the send is accepted.
       if (createdSession && recoveryIsCurrent()) {
         promoteDraftCollab(sessionId, latestCollab, false);

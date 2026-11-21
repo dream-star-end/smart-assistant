@@ -138,6 +138,90 @@ export function prependLiveUnitMessages(
   return [...messages.slice(0, insertAt), ...fresh, ...messages.slice(insertAt)];
 }
 
+/**
+ * Resolve the authoritative `{ streamKey, agentId }` for a `view=units` pack ONLY when
+ * `resume.streamKey` is explicitly present (atomically paired with `resume.frameSeq` by
+ * the protocol reducer). Never guess from arbitrary unit payloadRefs (OCV5-837).
+ */
+export function resolveLiveUnitsSnapshotStream(
+  _units: readonly LiveUnit[],
+  resume: { sessionKey?: string; streamKey?: string } | undefined,
+  fallbackAgentId?: string,
+): { streamKey: string; agentId: string } | null {
+  const streamKey = typeof resume?.streamKey === "string" ? resume.streamKey : "";
+  if (!streamKey) return null;
+  const sessionKey = typeof resume?.sessionKey === "string" ? resume.sessionKey : "";
+  const match = /^agent:([^:]+):/.exec(sessionKey);
+  const agentId = (match?.[1] && match[1].trim()) || fallbackAgentId || "main";
+  return { streamKey, agentId };
+}
+
+/**
+ * Update a session's frameSeq watermark and `_snapshotStream` from a `view=units`
+ * pack so subsequent WS `inbound.hello` reconnects report the matching streamKey
+ * instead of triggering spurious `cursor_reset` rebuilds (OCV5-837).
+ */
+export function applyLiveUnitsResumeStream(
+  sess: {
+    agentId?: string;
+    _activeAgentId?: string;
+    _lastFrameSeqByKey?: Record<string, number>;
+    _lastFrameSeq?: number;
+    _snapshotStream?: { streamKey: string; agentId: string };
+  },
+  units: readonly LiveUnit[],
+  resume: { sessionKey: string; frameSeq: number; recordId: string; streamKey?: string } | undefined,
+  defaultAgentId?: string,
+): void {
+  if (!resume?.sessionKey || resume.frameSeq <= 0) return;
+  if (!sess._lastFrameSeqByKey || typeof sess._lastFrameSeqByKey !== "object") {
+    sess._lastFrameSeqByKey = {};
+  }
+  const resolvedStream = resolveLiveUnitsSnapshotStream(
+    units,
+    resume,
+    sess._activeAgentId || sess.agentId || defaultAgentId || "main",
+  );
+  if (resolvedStream) {
+    const prevSeq = sess._lastFrameSeqByKey[resume.sessionKey] ?? 0;
+    const sameKnownStream = sess._snapshotStream?.streamKey === resolvedStream.streamKey;
+    sess._lastFrameSeqByKey[resume.sessionKey] = sameKnownStream
+      ? Math.max(prevSeq, resume.frameSeq)
+      : resume.frameSeq;
+    sess._lastFrameSeq = sameKnownStream
+      ? Math.max(sess._lastFrameSeq || 0, resume.frameSeq)
+      : resume.frameSeq;
+    sess._snapshotStream = resolvedStream;
+    return;
+  }
+  sess._lastFrameSeqByKey[resume.sessionKey] = resume.frameSeq;
+  sess._lastFrameSeq = Math.max(sess._lastFrameSeq || 0, resume.frameSeq);
+}
+
+/**
+ * Attempt self-healing recovery via `view=units` when a full snapshot rebuild hits the page cap (OCV5-837).
+ * Strictly verifies the returned pack belongs to the target open dispatch/stream and carries
+ * non-empty units + a valid resume cursor, so a post-completion empty pack or another turn's pack
+ * can never wipe local cards or falsely clear `_liveJournalDegraded`.
+ */
+export async function fetchRecoverableLiveUnits(
+  readLiveUnits: ((sessId: string) => Promise<unknown>) | undefined,
+  sessId: string,
+  expected: { clientMessageId: string; streamKey?: string | null },
+): Promise<LiveUnitsPage | null> {
+  if (!readLiveUnits) return null;
+  const raw = await readLiveUnits(sessId).catch(() => null);
+  if (!isLiveUnitsPage(raw) || raw.degraded === "fallback") return null;
+  if (!raw.openDispatch || raw.units.length === 0) return null;
+  if (!raw.streamClientMessageIds.includes(expected.clientMessageId)) return null;
+  if (!raw.units.some((u) => u.clientMessageId === expected.clientMessageId)) return null;
+  if (!raw.resume || !raw.resume.sessionKey || !(raw.resume.frameSeq > 0)) return null;
+  if (expected.streamKey && raw.resume.streamKey !== expected.streamKey) {
+    return null;
+  }
+  return raw;
+}
+
 /** Restore WS continuation pointers so the next delta appends the hydrated row. */
 export function restoreLiveUnitStreamingState(
   sess: {

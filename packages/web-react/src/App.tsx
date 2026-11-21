@@ -138,7 +138,6 @@ import { useInflightDelegates } from "./hooks/useInflightDelegates";
 import { useRepoBinding } from "./hooks/useRepoBinding";
 import { useTheme } from "./hooks/useTheme";
 import { useToast } from "./components/ui";
-import { githubErrorText } from "./lib/github";
 import { imageByteCache } from "./lib/chat/imageBytes";
 import { containerPreviewHrefFromTarget } from "./lib/containerPreview";
 import type { MediaJobWire, RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
@@ -185,6 +184,7 @@ import { prepareAdvisorSend, persistRecoveredAdvisor, saveInitialCollaboration }
 import { clearSessionEffort, writeSessionEffort } from "./lib/sessionEffort";
 import { clearContextTierForSession, writeContextTier } from "./lib/sessionContextTier";
 import { writeSessionServiceTier } from "./lib/sessionServiceTier";
+import { clearSessionSwarmMode } from "./lib/sessionSwarmMode";
 import { DEFAULT_AGENT, agentFromApiRow, type Agent } from "./lib/agents";
 import {
   PRODUCT_CAPABILITIES,
@@ -204,7 +204,7 @@ import {
   type PrefsView,
   resolveSessionModel,
 } from "./lib/modelPreferences";
-import { DEMO_MESSAGES, DEMO_MESSAGES_BY_SESSION, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
+import { DEMO_MESSAGES, DEMO_MESSAGES_BY_SESSION, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER } from "./lib/demo";
 import type { ChatProject, LockedPublicModel, Message, PublicConfig, PublicModel, Session, ToolCard } from "./lib/types";
 import type { LockedSelectInfo } from "./components/ModelSelector";
 import { lockedModelUnlockNotice } from "./lib/cursorModelPicker";
@@ -214,7 +214,6 @@ import {
   modelSwitchCompactionReason,
 } from "./lib/modelSwitch";
 import { TASKBOARD_ENABLED } from "./lib/taskboardFeature";
-import { probeStudio } from "./hooks/useStudioProviders";
 import { useServerFeatures } from "./hooks/useServerFeatures";
 import { dismissSuggestion, readDismissedSuggestions, suggestProjectForChat } from "./lib/unfiledSuggest";
 import { projectChipsBoardId } from "./lib/projectChips";
@@ -689,6 +688,7 @@ export function App() {
       clearSessionEffort(id); // 同上:思考档位 per-session 键
       clearContextTierForSession(id); // 同上:Cursor 上下文档位 per-session 键
       writeSessionServiceTier(id, null); // OCV5-434 GPT Fast per-session 键
+      clearSessionSwarmMode(id); // OCV5-837 蜂群模式 per-session 键
     },
     onActiveSessionDeleted: () => {
       setMessages([]);
@@ -931,7 +931,12 @@ export function App() {
   // Async goal saves can finish after navigation; only consume the selected draft's project.
   const selectedSessionIdRef = useRef(activeId);
   selectedSessionIdRef.current = activeId;
-  const { swarmSupported, swarmMode, toggleSwarmMode } = useSwarmMode({ demo, sessionKey: activeId ?? draftSessionId, modelId, models });
+  const { swarmSupported, swarmMode, toggleSwarmMode } = useSwarmMode({
+    demo, sessionKey: activeId ?? draftSessionId, activeSessionId: activeId,
+    wsMessages: !demo && activeId ? (sockRef.current?.getMessages(activeId) ?? EMPTY_WS_MESSAGES) : EMPTY_WS_MESSAGES,
+    messagesVersion: sockRef.current?.version ?? 0,
+    modelId, models,
+  });
 
   const {
     image2Available,
@@ -1594,7 +1599,8 @@ export function App() {
       return;
     }
     let cancelled = false;
-    probeStudio(authRef.current)
+    import("./hooks/useStudioProviders")
+      .then((m) => m.probeStudio(authRef.current))
       .then((view) => {
         if (!cancelled) setStudioAvailable(view !== null);
       })

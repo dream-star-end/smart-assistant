@@ -71,6 +71,8 @@ import {
   shouldApplyGoalSnapshot,
 } from "./model";
 import {
+  applyLiveUnitsResumeStream,
+  fetchRecoverableLiveUnits,
   isDurableFramesPage,
   isLiveUnitsPage,
   liveUnitToMessage,
@@ -88,6 +90,7 @@ import {
   reconcileOpenSnapshotRelayContainer,
   reconcileSessionRelayContainer,
   rememberTerminalSnapshotDispatch,
+  shouldKeepLocalRowsOnDegradedRebuild,
   SNAPSHOT_ACK_TIMEOUT_MS,
   SNAPSHOT_MAX_PAGES,
   SNAPSHOT_PAGE_LIMIT,
@@ -374,6 +377,8 @@ export type ChatSocketDeps = {
   /** HTTP face of the session snapshot (live-frames `snapshot`): B3 fallback,
    * paging past a WS snapshot page, and recovery-grace verification. */
   readSessionSnapshot?: (sessId: string, query: SnapshotQuery) => Promise<SessionSnapshot | null | undefined>;
+  /** Bounded `view=units` tail pack for degraded snapshot-rebuild fallback (OCV5-837). */
+  readLiveUnits?: (sessId: string) => Promise<unknown>;
   /** Exact bytes of one oversized journal frame (snapshot gap `byte_limit`). */
   readLiveFramePayload?: (sessId: string, ref: { recordId: string; sha256?: string }) => Promise<{ payload: unknown }>;
   /** Bounded requestId lookup when a permission snapshot page is truncated. */
@@ -3258,16 +3263,26 @@ export class ChatSocket {
       const activeKey = d ? safeSessionKeyForAgent(sess.id, d.agentId || "main") : undefined;
       const cutoff = ctx.requestedOrder ?? 0;
       const rebuildActive = rebuild && !!d && !!activeKey && (sess._snapshotStream?.streamKey !== pages.last.streamKey || (sess._lastAcceptedFrameSeqOrderByKey?.[activeKey] ?? 0) <= cutoff || !snapshotIsStale(sess, pages.last));
-      if (pages.records.length > 0) {
-        if (rebuildActive && activeKey) { this.noteAuthoritativeFrameSeqReset(sess, { sessionKey: activeKey }); resetFrameSeqCursor(sess, { sessionKey: activeKey }); }
-        this.applyDurableLiveFrames(sessId, pages.records, rebuildActive && d ? [d.clientMessageId] : []);
-      } else if (!fenced && rebuild) {
-        if (d && activeKey) {
-          if ((sess._lastAcceptedFrameSeqOrderByKey?.[activeKey] ?? 0) <= cutoff) {
-            this.noteAuthoritativeFrameSeqReset(sess, { sessionKey: activeKey }); resetFrameSeqCursor(sess, { sessionKey: activeKey });
-            this.resetOwnerLocalRows(sess, [d.clientMessageId], new Set());
-          }
-        } else resetAgentFrameSeqCursorsForSession(sess, { keepAcceptedAfterOrder: cutoff, onResetKey: (sessionKey) => this.noteAuthoritativeFrameSeqReset(sess, { sessionKey }) });
+      let recoveredViaUnits = false;
+      if (rebuildActive && pages.degraded && !fenced && d && activeKey) {
+        const rawUnits = await fetchRecoverableLiveUnits(this.deps.readLiveUnits, sessId, { clientMessageId: d.clientMessageId, streamKey: pages.last.streamKey });
+        if (!current()) return;
+        if (rawUnits) {
+          if (pages.last.streamKey && sess._snapshotStream?.streamKey && sess._snapshotStream.streamKey !== pages.last.streamKey) { this.noteAuthoritativeFrameSeqReset(sess, { sessionKey: activeKey }); resetFrameSeqCursor(sess, { sessionKey: activeKey }); this.resetOwnerLocalRows(sess, [d.clientMessageId], liveProcessOwnersFromUnits(rawUnits.units)); }
+          this.applyLiveUnits(sessId, rawUnits.units, [d.clientMessageId], rawUnits.resume, rawUnits.streamGeneration);
+          sess._liveUnitsPackApplied = true; sess._liveUnitsHasMoreBefore = rawUnits.hasMoreBefore; sess._liveUnitsBeforeCursor = rawUnits.beforeCursor; sess._liveJournalDegraded = false; recoveredViaUnits = true;
+        }
+      }
+      if (!recoveredViaUnits) {
+        const keepLocal = shouldKeepLocalRowsOnDegradedRebuild(sess, pages.last.streamKey, d?.clientMessageId, rebuildActive, pages.degraded);
+        if (pages.records.length > 0) {
+          if (rebuildActive && activeKey && !keepLocal) { this.noteAuthoritativeFrameSeqReset(sess, { sessionKey: activeKey }); resetFrameSeqCursor(sess, { sessionKey: activeKey }); }
+          this.applyDurableLiveFrames(sessId, pages.records, rebuildActive && d && !keepLocal ? [d.clientMessageId] : []);
+        } else if (!keepLocal && !fenced && rebuild) {
+          if (d && activeKey) {
+            if ((sess._lastAcceptedFrameSeqOrderByKey?.[activeKey] ?? 0) <= cutoff) { this.noteAuthoritativeFrameSeqReset(sess, { sessionKey: activeKey }); resetFrameSeqCursor(sess, { sessionKey: activeKey }); this.resetOwnerLocalRows(sess, [d.clientMessageId], new Set()); }
+          } else resetAgentFrameSeqCursorsForSession(sess, { keepAcceptedAfterOrder: cutoff, onResetKey: (sessionKey) => this.noteAuthoritativeFrameSeqReset(sess, { sessionKey }) });
+        }
       }
       // A final among the frames settles the turn like a live final: one history read for its tape.
       const settled = running && !(sess._sendingInFlight && sess._activeClientMessageId === running) ? running : undefined;
@@ -3275,14 +3290,14 @@ export class ChatSocket {
       if (last.streamKey && last.dispatch) {
         sess._snapshotStream = { streamKey: last.streamKey, agentId: last.dispatch.agentId || "main" };
       }
-      if (pages.degraded) sess._liveJournalDegraded = true;
+      if (pages.degraded && !recoveredViaUnits) sess._liveJournalDegraded = true;
       if (!this.applySnapshotHead(sess, last, fresh, true, ctx.asked) && settled) {
         this.syncHistory(sessId, { clientMessageId: settled });
       }
       if (!fenced && this.relayContainerId && this.relayContainerId > 0) {
         const opts = { keepAcceptedAfterOrder: this.relayContainerBoundOrder, onResetKey: (sessionKey: string) => this.noteAuthoritativeFrameSeqReset(sess, { sessionKey }) };
         this.reconcileContainerForSession(sess);
-        if (fresh && isOpenSnapshotDispatch(last.dispatch) && !pages.degraded) {
+        if (fresh && isOpenSnapshotDispatch(last.dispatch) && (!pages.degraded || recoveredViaUnits)) {
           reconcileOpenSnapshotRelayContainer(sess, this.relayContainerId, last.dispatch.agentId || "main", opts);
         }
       }
@@ -4836,7 +4851,7 @@ export class ChatSocket {
     sessId: string,
     units: import("@openclaude/protocol").LiveUnit[],
     resetClientMessageIds: string[] = [],
-    resume?: { sessionKey: string; frameSeq: number; recordId: string },
+    resume?: { sessionKey: string; frameSeq: number; recordId: string; streamKey?: string },
     streamGeneration = 0,
   ): void {
     const sess = this.sessions.get(sessId);
@@ -4877,13 +4892,7 @@ export class ChatSocket {
     }
     sess.messages = prependLiveUnitMessages(sess.messages, mapped);
     restoreLiveUnitStreamingState(sess, units);
-    if (resume?.sessionKey && resume.frameSeq > 0) {
-      if (!sess._lastFrameSeqByKey || typeof sess._lastFrameSeqByKey !== "object") {
-        sess._lastFrameSeqByKey = {};
-      }
-      sess._lastFrameSeqByKey[resume.sessionKey] = resume.frameSeq;
-      sess._lastFrameSeq = Math.max(sess._lastFrameSeq || 0, resume.frameSeq);
-    }
+    applyLiveUnitsResumeStream(sess, units, resume, this.deps.defaultAgentId);
     rebuildIndexes(sess);
     normalizeDelegateCards(sess);
     normalizeGoalCards(sess);
