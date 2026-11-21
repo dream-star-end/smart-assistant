@@ -1,5 +1,5 @@
 import type { SwarmSnapshot } from "@openclaude/protocol/browser";
-import { ArrowUpRight, Bot, ChevronDown, ChevronUp, Hexagon, ListChecks, Target, X } from "lucide-react";
+import { ArrowUpRight, Bot, ChevronDown, ChevronUp, Hexagon, ListChecks, Target } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { isTerminalDelegateState, type InflightDelegateItem } from "../../lib/chat/inflightDelegates";
 import type { ChatMessage, LiveTurnTokenUsageSnapshot } from "../../lib/chat/model";
@@ -73,7 +73,7 @@ export default function LiveAgentCapsule({
   const delegateStartRef = useRef(new Map<string, number>());
 
   const swarmActive = latestSwarm ? isSwarmActive(latestSwarm.phase) : false;
-  const hasSwarm = Boolean(latestSwarm && (swarmActive || dismissedSwarmKey !== latestSwarmKey));
+  const hasSwarm = swarmActive;
   const hasDelegate = delegateItems.length > 0;
   const hasIncompleteTodo = todos.some((t) => t.status !== "completed");
   const hasTask = hasIncompleteTodo && (!settled || wsSending);
@@ -218,7 +218,7 @@ export default function LiveAgentCapsule({
 
       <div className="oc-live-capsule-wrap">
         <div
-          className="oc-live-capsule"
+          className="oc-live-capsule flex min-w-0 max-w-full items-center gap-2 overflow-hidden"
           data-testid="live-agent-capsule"
           data-primary-kind={primaryKind}
           data-running={isRunning ? "true" : "false"}
@@ -229,26 +229,46 @@ export default function LiveAgentCapsule({
             aria-expanded={expanded}
             aria-label={expanded ? `收起运行状态：${label}` : `展开运行状态：${label}`}
             onClick={() => setExpanded((v) => !v)}
-            className="oc-live-capsule-main"
+            className="oc-live-capsule-main min-w-0 flex-1 overflow-hidden"
           >
             <span
               aria-hidden
               data-testid="live-agent-capsule-dot"
               data-running={isRunning ? "true" : "false"}
-              className="oc-live-capsule-dot"
+              className="oc-live-capsule-dot shrink-0"
             />
             <span className="oc-icon-badge oc-icon-badge-accent flex size-5 shrink-0 items-center justify-center rounded-full">
               <PrimaryIcon size={11} strokeWidth={1.85} aria-hidden className="oc-live-capsule-icon" />
             </span>
-            <span className="oc-live-capsule-label">{label}</span>
-            {detail && <span className="oc-live-capsule-detail">{detail}</span>}
+            <span
+              title={label}
+              className={
+                primaryKind === "swarm"
+                  ? "oc-live-capsule-label min-w-0 flex-1 truncate"
+                  : "oc-live-capsule-label max-w-36 shrink-0 truncate"
+              }
+            >
+              {label}
+            </span>
+            {detail && (
+              <span
+                title={detail}
+                className={
+                  primaryKind === "swarm"
+                    ? "oc-live-capsule-detail hidden max-w-44 shrink-0 truncate sm:inline"
+                    : "oc-live-capsule-detail min-w-0 flex-1 truncate"
+                }
+              >
+                {detail}
+              </span>
+            )}
             {timer && (
-              <span data-testid="live-agent-capsule-timer" className="oc-live-capsule-timer">
+              <span data-testid="live-agent-capsule-timer" className="oc-live-capsule-timer shrink-0">
                 {timer}
               </span>
             )}
             {extraCount > 0 && (
-              <span data-testid="live-agent-capsule-more" className="oc-live-capsule-more">
+              <span data-testid="live-agent-capsule-more" className="oc-live-capsule-more shrink-0">
                 +{extraCount}
               </span>
             )}
@@ -270,22 +290,10 @@ export default function LiveAgentCapsule({
                   blockId: latestSwarmBlockId,
                 })
               }
-              className="oc-live-capsule-action"
+              className="oc-live-capsule-action shrink-0"
             >
               <span>看板</span>
-              <ArrowUpRight size={11} aria-hidden />
-            </button>
-          )}
-
-          {primaryKind === "swarm" && !swarmActive && extraCount === 0 && latestSwarmKey && (
-            <button
-              type="button"
-              aria-label="收起蜂群胶囊"
-              title="收起"
-              onClick={() => onDismissSwarm(latestSwarmKey)}
-              className="oc-live-capsule-dismiss"
-            >
-              <X size={13} />
+              <ArrowUpRight size={11} aria-hidden className="shrink-0" />
             </button>
           )}
         </div>

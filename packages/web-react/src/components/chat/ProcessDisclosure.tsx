@@ -1,7 +1,7 @@
 import { ChevronDown, PanelRight, Pencil } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
-import { type ChatMessage, isRetryingTurnStatus, isServerAuthoredRow } from "../../lib/chat/model";
-import { agentTerminalStatus, isErrorCardHeldWithAnswer } from "../../lib/chat/render";
+import { type ChatMessage, isRetryingTurnStatus } from "../../lib/chat/model";
+import { isErrorCardHeldWithAnswer } from "../../lib/chat/render";
 import { agentDisplayName } from "./agentNames";
 import { STATUS } from "../../lib/ui/statusTone";
 import { StatusPill } from "../ui";
@@ -970,26 +970,12 @@ export function rawAuditCommand(message: ChatMessage): string {
   return original;
 }
 
-/** Name plus a one-line status. Never the raw tool JSON or the full thinking trace.
- * A later completed sibling must not hide a tool that is still running.
- * `pending` is only the still-running status phrase. Finished and failed lines stay still. */
-export function isDelegateRow(message: ChatMessage): boolean {
-  return message.role === "agent-group" || message.role === "delegate-progress";
-}
-
 /** 「委派给 质量审查员：检查报告格式」;并行委派列出各自接手的子代理与子任务数。 */
 export function delegateTitle(rows: readonly ChatMessage[]): string {
   const names = [...new Set(rows.map((message) => agentDisplayName(message._delegateAgentId) || "子代理"))];
   if (rows.length > 1) return `委派给 ${names.join("、")}（${rows.length} 个子任务）`;
   const goal = (rows[0]?._delegateGoal || rows[0]?.text || "").replace(/\s+/g, " ").trim();
   return goal ? `委派给 ${names[0]}：${goal}` : `委派给 ${names[0]}`;
-}
-
-/** 委派步骤右侧的状态:有一个还在跑就是「进行中」,否则取最差的终态(超时 / 失败 / 完成)。 */
-export function delegateState(rows: readonly ChatMessage[]): { label: string; running: boolean } {
-  if (rows.some((message) => !message._completed && !isServerAuthoredRow(message))) return { label: "进行中", running: true };
-  const states = rows.map((message) => agentTerminalStatus(message));
-  return { label: (states.find((state) => state.tone === "danger") ?? states.find((state) => state.tone === "warning") ?? states[0])?.label ?? "完成", running: false };
 }
 
 function stepLiveStatus(messages: readonly ChatMessage[]): { text: string; pending: boolean } {
@@ -1372,10 +1358,10 @@ export function ProcessDisclosure<T>({
           隐藏容器立即下载并整段渲染,看不见却付全部流量与解析成本。 */}
       {(olderSteps || open) ? (
           <div
-            className={`oc-rail relative mt-1 space-y-0.5 pb-1 ${open ? "oc-reveal" : ""}`}
+            className={open ? "oc-surface-card oc-reveal mt-1.5 rounded-xl px-3 py-2" : "oc-rail relative mt-1 space-y-0.5 pb-1"}
             data-testid={open ? "process-stages" : "process-older-steps"}
           >
-            {olderSteps ? <div className="pl-9">{olderSteps}</div> : null}
+            {olderSteps ? <div className="pb-1 pl-9">{olderSteps}</div> : null}
             {open ? (
               <ProcessStages
                 sections={sections}

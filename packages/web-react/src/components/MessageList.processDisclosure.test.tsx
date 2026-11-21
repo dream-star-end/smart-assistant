@@ -441,7 +441,7 @@ describe("MessageList Manus 过程披露", () => {
     const done = cards().find((card) => card.getAttribute("data-permission-request") === "req-done");
     expect(done?.closest("[data-testid=process-card]")).not.toBeNull();
     expect(done?.className).toContain("border-border/80");
-    expect(open?.className).toContain("border-accent/40");
+    expect(open?.className).toContain("border-accent/45");
   });
 
   test("已回答的问答卡和它同一次调用的 AskUserQuestion 工具行：工具行不再漏在过程外", () => {

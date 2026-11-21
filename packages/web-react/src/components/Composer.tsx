@@ -215,6 +215,9 @@ function EnvironmentPrepBar() {
   );
 }
 
+/** 蜂群模式紧凑单行占位文案（375–390px 手机不折出孤立省略号）。 */
+export const SWARM_PLACEHOLDER = "输入蜂群协作任务，或用 /swarm 编排…";
+
 export function Composer({
   onSend,
   busy,
@@ -222,8 +225,7 @@ export function Composer({
   onStop,
   disabled,
   banner,
-  // 品牌名取 lib/brand 单一权威,不写死(M-16)。
-  placeholder = `给${BRAND.name}发消息…`,
+  placeholder,
   onUpload,
   getVoiceToken,
   prefill,
@@ -778,6 +780,8 @@ export function Composer({
       <span className="text-faint">正在转写…</span>
     ) : null;
 
+  const effectivePlaceholder =
+    placeholder ?? (swarmMode ? SWARM_PLACEHOLDER : `给${BRAND.name}发消息…`);
   return (
     <div className="mx-auto w-full max-w-3xl px-4">
       {banner}
@@ -982,7 +986,7 @@ export function Composer({
             此前 4 个 44px 按钮与 textarea 同排:390px 下正文只剩约 138px、每行 8 个字;桌面多行草稿时
             按钮贴底、正文左侧空出一列。桌面也统一两行,附件区/引用块与正文左沿对齐。 */}
         <div
-          className="px-3 pb-2 pt-2.5"
+          className="px-3 pb-1.5 pt-2 sm:pb-2 sm:pt-2.5"
           data-product-entry-scope="composer-primary"
           data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
         >
@@ -1097,9 +1101,9 @@ export function Composer({
                 }
               }}
               enterKeyHint={coarsePointer ? "enter" : "send"}
-              placeholder={value === "" && ghostRest ? "" : placeholder}
+              placeholder={value === "" && ghostRest ? "" : effectivePlaceholder}
               className={cn(
-                "max-h-[240px] min-h-[24px] w-full flex-1 resize-none bg-transparent py-1.5 leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50",
+                "max-h-[240px] min-h-[24px] w-full flex-1 resize-none bg-transparent py-1 leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50 sm:py-1.5",
                 fontSize === "large" ? "text-[17.5px]" : "text-base md:text-sm",
               )}
             />
@@ -1117,7 +1121,7 @@ export function Composer({
             )}
           </div>
           <div
-            className="mt-1.5 flex items-center gap-1 border-t border-border/50 pt-2"
+            className="mt-1 flex items-center gap-1 border-t border-border/50 pt-1.5 sm:mt-1.5 sm:pt-2"
             data-testid="composer-tool-row"
           >
             {/* file input 用 sr-only(视觉隐藏但非 display:none)+ tabindex=-1,配合工具条
@@ -1198,11 +1202,11 @@ export function Composer({
                     : "开启 Antigravity 蜂群模式：多智能体并行拆解与互审（也可直接输入 /swarm）"
                 }
                 className={cn(
-                  "oc-btn-tactile inline-flex min-h-8 shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-caption font-medium [@media(hover:none)]:min-h-11",
+                  "oc-btn-tactile inline-flex min-h-8 shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-caption font-medium transition-colors [@media(hover:none)]:min-h-10",
                   "outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50",
                   swarmMode
-                    ? "oc-badge-craft bg-accent-soft text-accent shadow-xs hover:bg-accent/15"
-                    : "oc-btn-secondary-craft text-muted hover:text-fg",
+                    ? "border-accent/30 bg-accent-soft text-accent shadow-xs hover:bg-accent/15"
+                    : "border-transparent text-muted hover:bg-hover hover:text-fg",
                 )}
               >
                 <Hexagon
@@ -1326,12 +1330,16 @@ export function Composer({
                 }}
                 disabled={stopping || (!canSend && !busy) || disabled}
                 className={cn(
-                  "oc-btn-tactile flex size-9 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface [@media(hover:none)]:size-11",
+                  "oc-btn-tactile flex size-9 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface [@media(hover:none)]:size-10",
                   busy
                     ? "oc-btn-primary-craft text-primary-fg"
                     : canSend
-                      ? "oc-btn-primary-craft text-primary-fg"
-                      : "oc-surface-recessed text-faint opacity-75",
+                      ? swarmMode
+                        ? "oc-btn-accent-craft text-accent-fg"
+                        : "oc-btn-primary-craft text-primary-fg"
+                      : swarmMode
+                        ? "border border-accent/25 bg-accent-soft/75 text-accent/70"
+                        : "oc-surface-recessed border border-border/80 text-muted",
                 )}
               >
                 {stopping || submitting ? (

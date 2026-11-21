@@ -6,6 +6,7 @@ import { loadBeforeAll } from "../../test/moduleLoad";
 import { preloadProcessStages } from "./lazyProcessStages";
 import { ProcessDisclosure, preloadPhaseTimelineSummary, processSections } from "./ProcessDisclosure";
 import { formatPhaseDuration } from "./PhaseTimelineSummary";
+import { extractStepSubtitle } from "./processStageList";
 import { useState } from "react";
 
 loadBeforeAll(preloadProcessStages);
@@ -135,5 +136,119 @@ describe("PhaseTimelineSummary integration in ProcessDisclosure", () => {
     expect(formatPhaseDuration(425_000)).toBe("07:05");
     expect(formatPhaseDuration(1_294_000)).toBe("21:34");
     expect(formatPhaseDuration(3_785_000)).toBe("1:03:05");
+  });
+
+  test("OCV5-831 #7a/#7b/#9c: renders human step subtitles, single-line compact durations, and surface card wrapper", () => {
+    const t0 = 1_700_000_000_000;
+    const realMessages: ChatMessage[] = [
+      msg("b1", "tool", {
+        toolName: "mcp_openclaude-memory_oc_bash",
+        inputJson: { command: "curl -s https://example.com/version", toolSummary: "核验线上版本与样式" },
+        _completed: true,
+        ts: t0 + 26_000,
+        completedAt: t0 + 32_600,
+        durationMs: 6_600,
+      }),
+      msg("c1", "tool", {
+        toolName: "call_mcp_tool",
+        inputJson: {
+          ServerName: "openclaude-memory",
+          ToolName: "task_comment",
+          Arguments: { id: "OCV5-826", body: "已验证通过" },
+        },
+        _completed: true,
+        ts: t0 + 33_000,
+        completedAt: t0 + 34_800,
+        durationMs: 1_800,
+      }),
+      msg("c2", "tool", {
+        toolName: "mcp__openclaude-memory__task_comment",
+        inputJson: { id: "OCV5-831", body: "补充截图" },
+        _completed: true,
+        ts: t0 + 35_000,
+        completedAt: t0 + 36_200,
+        durationMs: 1_200,
+      }),
+      msg("b2", "tool", {
+        toolName: "mcp__openclaude-memory__oc_bash",
+        inputJson: { command: "cd /app && pnpm vitest run --secret-flag" },
+        _completed: true,
+        ts: t0 + 37_000,
+        completedAt: t0 + 48_000,
+        durationMs: 11_000,
+      }),
+    ];
+
+    render(
+      <ProcessDisclosure
+        sections={processSections(realMessages, (m) => [m], (m) => m.id)}
+        active={false}
+        open
+        setOpen={() => {}}
+        detailOpen={() => false}
+        setDetailOpen={() => {}}
+        renderItem={(item) => <div data-testid={`raw-${item.id}`}>{item.toolName}</div>}
+        keyOf={(item) => item.id}
+        messagesOf={(item) => [item]}
+        bounds={{ startedAt: t0, endedAt: t0 + 49_000 }}
+      />,
+    );
+
+    // #9c: expanded process list wrapped in refined surface card container
+    const stages = screen.getByTestId("process-stages");
+    expect(stages.className).toContain("oc-surface-card");
+    expect(stages.className).toContain("rounded-xl");
+
+    // #7a: every step row displays action title + concise single-line muted subtitle
+    const rows = screen.getAllByTestId("process-step-row");
+    expect(rows).toHaveLength(4);
+
+    const summaries = rows.map((row) => within(row).getByTestId("process-step-summary"));
+    expect(summaries.map((node) => node.textContent)).toEqual([
+      "核验线上版本与样式",
+      "OCV5-826",
+      "OCV5-831",
+      "pnpm vitest",
+    ]);
+    for (const node of summaries) {
+      expect(node.className).toContain("min-w-0");
+      expect(node.className).toContain("truncate");
+    }
+    // Never leaks command flags
+    expect(stages.textContent ?? "").not.toContain("--secret-flag");
+
+    // #7b: split execution/wait duration stays strictly single-line (no flex-col) with full breakdown in title & tech details
+    const firstDuration = within(rows[0]!).getByTestId("step-duration");
+    expect(firstDuration.className).not.toContain("flex-col");
+    expect(firstDuration.className).toContain("whitespace-nowrap");
+    expect(firstDuration.className).toContain("tabular-nums");
+    expect(firstDuration).toHaveTextContent("6.6s");
+    expect(firstDuration.getAttribute("title")).toContain("工具执行 6.6 秒");
+    expect(firstDuration.getAttribute("title")).toContain("此前生成与等待 26 秒");
+
+    // Opening the step shows full split breakdown in tech detail header without duplicating step-duration testid
+    fireEvent.click(within(rows[0]!).getAllByRole("button")[0]!);
+    const tech = within(rows[0]!).getByTestId("process-step-tech");
+    expect(within(tech).getByTestId("process-step-timing-detail")).toHaveTextContent("执行 6.6 秒 · 等待 26 秒");
+    expect(within(tech).queryByTestId("step-duration")).toBeNull();
+  });
+
+  test("extractStepSubtitle avoids duplicating file names and ignores internal prompts", () => {
+    const readMsg = msg("r1", "tool", { toolName: "Read", inputJson: { file_path: "/repo/src/index.ts" } });
+    expect(extractStepSubtitle("Read", { file_path: "/repo/src/index.ts" }, "读取 index.ts", readMsg)).toBe("");
+
+    const strArgsMsg = msg("c1", "tool", {
+      toolName: "call_mcp_tool",
+      inputJson: { ServerName: "openclaude-memory", ToolName: "task_comment", Arguments: '{"id":"OCV5-900"}' },
+    });
+    expect(extractStepSubtitle("mcp__openclaude-memory__task_comment", null, "任务单评论", strArgsMsg)).toBe("OCV5-900");
+
+    const promptLeakMsg = msg("t1", "tool", {
+      toolName: "Bash",
+      inputJson: { command: "echo hi", description: "You are an internal prompt /home/agent/secret" },
+    });
+    expect(
+      extractStepSubtitle("Bash", { command: "echo hi", description: "You are an internal prompt /home/agent/secret" }, "运行命令", promptLeakMsg),
+    ).toBe("");
   });
 });

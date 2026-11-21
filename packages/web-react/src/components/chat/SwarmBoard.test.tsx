@@ -1,6 +1,6 @@
 import { SWARM_BOARD_TOOL_NAME, reduceLiveFrames, type SwarmSnapshot } from "@openclaude/protocol/browser";
-import { act, fireEvent, render, renderHook, screen, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, renderHook, screen, within } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { useSwarmBoard } from "../../hooks/useSwarmUi";
 import { liveUnitToMessage, restoreLiveUnitStreamingState } from "../../lib/chat/liveUnitsHydrate";
 import { createSession, type ChatMessage } from "../../lib/chat/model";
@@ -11,6 +11,8 @@ import { SwarmBoardDrawer } from "./SwarmBoardDrawer";
 import { SwarmInlineCard } from "./SwarmInlineCard";
 import { isAntigravityModelForUi } from "./swarmDetect";
 import { extractSwarmSnapshotFromMessage, latestSwarmSnapshot } from "./swarmUtils";
+
+afterEach(cleanup);
 
 function makeSnapshot(overrides: Partial<SwarmSnapshot> = {}): SwarmSnapshot {
   return {
@@ -435,5 +437,101 @@ describe("Antigravity native swarm reducer & UI (OCV5-809)", () => {
     expect(screen.getByText("1 独立 worktree")).toBeTruthy();
     expect(screen.getByTestId("swarm-worktree-notice")).toBeTruthy();
     expect(screen.getAllByText("worktree").length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("OCV5-831 #1 & #4: PinnedSwarmDock hides completed swarms and enforces overflow-hidden truncation on long titles", () => {
+    const completed = makeSnapshot({ phase: "completed" });
+    const { container, rerender } = render(
+      <PinnedSwarmDock
+        snapshot={completed}
+        cardId="m-done"
+        blockId="b-done"
+        dismissed={false}
+        onOpenBoard={vi.fn()}
+        onDismiss={vi.fn()}
+      />,
+    );
+    expect(container.firstChild).toBeNull();
+
+    const longTitle = "Wave 1 并行交付：P0 止血 + PG/WS 性能攻坚 + 提效与合规加固";
+    rerender(
+      <PinnedSwarmDock
+        snapshot={makeSnapshot({ phase: "running", title: longTitle })}
+        cardId="m-run"
+        blockId="b-run"
+        dismissed={false}
+        onOpenBoard={vi.fn()}
+        onDismiss={vi.fn()}
+      />,
+    );
+    const dock = screen.getByTestId("pinned-swarm-dock");
+    const titleEl = within(dock).getByText(longTitle);
+    expect(titleEl.className).toContain("min-w-0");
+    expect(titleEl.className).toContain("flex-1");
+    expect(titleEl.className).toContain("truncate");
+  });
+
+  it("OCV5-831 #5: folds killed members by default with expand toggle and keeps crisp cutout ring on avatar dots", () => {
+    const onOpenBoard = vi.fn();
+    const snap = makeSnapshot({
+      phase: "running",
+      members: [
+        { name: "coordinator", role: "coordinator", status: "waiting", stepCount: 12, activity: "统筹中", unreadCount: 0 },
+        { name: "parser", role: "worker", status: "working", stepCount: 124, activity: "编辑 parser.ts", unreadCount: 0 },
+        { name: "worker-1", role: "worker", status: "killed", stepCount: 40, activity: "已回收", unreadCount: 0 },
+        { name: "worker-2", role: "worker", status: "killed", stepCount: 38, activity: "已回收", unreadCount: 0 },
+        { name: "worker-3", role: "worker", status: "killed", stepCount: 19, activity: "已回收", unreadCount: 0 },
+      ],
+    });
+    render(<SwarmInlineCard snapshot={snap} cardId="m-k" blockId="b-k" onOpenBoard={onOpenBoard} />);
+
+    const activeGrid = screen.getByTestId("swarm-member-grid");
+    expect(within(activeGrid).getByText("@parser")).toBeTruthy();
+    expect(within(activeGrid).queryByText("@worker-1")).toBeNull();
+
+    // Avatar status dot retains ring-2 ring-surface cutout border
+    const parserDot = screen.getByTestId("swarm-member-dot-parser");
+    expect(parserDot.className).toContain("ring-2");
+    expect(parserDot.className).toContain("ring-surface");
+
+    // Killed members start folded into compact disclosure bar
+    const killedToggle = screen.getByTestId("swarm-killed-toggle");
+    expect(killedToggle.getAttribute("aria-expanded")).toBe("false");
+    expect(killedToggle.textContent).toContain("已回收 3 名成员");
+    expect(screen.queryByTestId("swarm-killed-grid")).toBeNull();
+
+    // Expanding reveals all killed cards and preserves member click focus
+    fireEvent.click(killedToggle);
+    expect(killedToggle.getAttribute("aria-expanded")).toBe("true");
+    const killedGrid = screen.getByTestId("swarm-killed-grid");
+    fireEvent.click(within(killedGrid).getByText("@worker-1"));
+    expect(onOpenBoard).toHaveBeenCalledWith({
+      snapshot: snap,
+      cardId: "m-k",
+      blockId: "b-k",
+      focusMember: "worker-1",
+    });
+  });
+
+  it("OCV5-831 #9a & #10: replaces heavy black icon with semantic oc-icon-badge and restores CTA visual focus", () => {
+    const { rerender } = render(
+      <SwarmInlineCard snapshot={makeSnapshot({ phase: "running" })} cardId="m-v" blockId="b-v" onOpenBoard={vi.fn()} />,
+    );
+    const runIcon = screen.getByTestId("swarm-header-icon");
+    expect(runIcon.className).toContain("oc-icon-badge");
+    expect(runIcon.className).toContain("oc-icon-badge-accent");
+    expect(runIcon.className).not.toContain("bg-primary");
+    expect(screen.getByTestId("swarm-open-board-btn").className).toContain("oc-btn-accent-craft");
+
+    rerender(
+      <SwarmInlineCard snapshot={makeSnapshot({ phase: "completed" })} cardId="m-v" blockId="b-v" onOpenBoard={vi.fn()} />,
+    );
+    const doneIcon = screen.getByTestId("swarm-header-icon");
+    expect(doneIcon.className).toContain("oc-icon-badge");
+    expect(doneIcon.className).toContain("oc-icon-badge-success");
+    expect(doneIcon.className).not.toContain("bg-primary");
+    const doneBtn = screen.getByTestId("swarm-open-board-btn");
+    expect(doneBtn.className).toContain("bg-accent-soft");
+    expect(doneBtn.className).toContain("text-accent");
   });
 });

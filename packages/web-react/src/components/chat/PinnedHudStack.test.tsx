@@ -183,4 +183,87 @@ describe("PinnedHudStack — unified Live Agent capsule", () => {
     expect(capsule).toHaveTextContent("后台 1 进行中");
     expect(capsule).toHaveTextContent("核验单测与构建");
   });
+
+  test("已完成蜂群自动收起底部 HUD，不再与时间线内联卡片重复常驻（OCV5-831 #4）", () => {
+    const completedSwarm = makeSwarm({
+      phase: "completed",
+      members: [
+        { name: "coordinator", role: "coordinator", status: "waiting", stepCount: 4, unreadCount: 0 },
+        { name: "worker-a", role: "worker", status: "killed", stepCount: 12, unreadCount: 0 },
+      ],
+    });
+    const { container } = render(
+      <PinnedHudStack
+        timelineMessages={[]}
+        chatVersion={1}
+        wsSending={false}
+        delegateItems={[]}
+        onDismissDelegate={vi.fn()}
+        latestSwarm={completedSwarm}
+        latestSwarmKey="sw-1"
+        dismissedSwarmKey={null}
+        onOpenSwarmBoard={vi.fn()}
+        onDismissSwarm={vi.fn()}
+      />,
+    );
+    expect(container.firstChild).toBeNull();
+  });
+
+  test("已完成蜂群与其他活态任务共存时，底部 HUD 仅展示活态任务而不占坑位（OCV5-831 #4）", async () => {
+    const completedSwarm = makeSwarm({ phase: "completed" });
+    render(
+      <PinnedHudStack
+        timelineMessages={[makeTodoMsg()]}
+        chatVersion={1}
+        wsSending
+        delegateItems={[]}
+        onDismissDelegate={vi.fn()}
+        latestSwarm={completedSwarm}
+        latestSwarmKey="sw-1"
+        dismissedSwarmKey={null}
+        onOpenSwarmBoard={vi.fn()}
+        onDismissSwarm={vi.fn()}
+      />,
+    );
+    const capsule = await screen.findByTestId("live-agent-capsule");
+    expect(capsule).toHaveAttribute("data-primary-kind", "task");
+    expect(screen.queryByTestId("live-agent-capsule-action")).toBeNull();
+    expect(screen.queryByTestId("live-agent-capsule-more")).toBeNull();
+  });
+
+  test("超长蜂群标题强制单行省略且右侧按钮不可压缩，杜绝穿模爆框（OCV5-831 #1）", async () => {
+    const longTitle = "Wave 1 并行交付：P0 止血 + PG/WS 性能攻坚 + 提效与合规加固";
+    render(
+      <PinnedHudStack
+        timelineMessages={[]}
+        chatVersion={1}
+        wsSending
+        delegateItems={[makeDelegate()]}
+        onDismissDelegate={vi.fn()}
+        latestSwarm={makeSwarm({ title: longTitle })}
+        latestSwarmKey="sw-long"
+        dismissedSwarmKey={null}
+        onOpenSwarmBoard={vi.fn()}
+        onDismissSwarm={vi.fn()}
+      />,
+    );
+    const capsule = await screen.findByTestId("live-agent-capsule");
+    expect(capsule.className).toContain("min-w-0");
+    expect(capsule.className).toContain("max-w-full");
+    expect(capsule.className).toContain("overflow-hidden");
+
+    const toggle = within(capsule).getByTestId("live-agent-capsule-toggle");
+    expect(toggle.className).toContain("min-w-0");
+    expect(toggle.className).toContain("flex-1");
+    expect(toggle.className).toContain("overflow-hidden");
+
+    const titleEl = within(toggle).getByText(longTitle);
+    expect(titleEl.className).toContain("min-w-0");
+    expect(titleEl.className).toContain("flex-1");
+    expect(titleEl.className).toContain("truncate");
+
+    const action = within(capsule).getByTestId("live-agent-capsule-action");
+    expect(action.className).toContain("shrink-0");
+    expect(within(capsule).getByTestId("live-agent-capsule-more").className).toContain("shrink-0");
+  });
 });

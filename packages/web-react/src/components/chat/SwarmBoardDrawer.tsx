@@ -575,11 +575,17 @@ export function SwarmBoardDrawer({
           <div className="flex flex-wrap items-center gap-2.5 border-b border-border bg-surface px-4 py-3">
             <span
               className={cn(
-                "relative flex size-8 shrink-0 items-center justify-center rounded-xl shadow-soft",
-                active ? "bg-grad-cta text-white" : "bg-primary text-primary-fg",
+                "oc-icon-badge relative size-8 shrink-0 rounded-xl",
+                active
+                  ? "oc-icon-badge-accent"
+                  : snapshot.phase === "completed"
+                    ? "oc-icon-badge-success"
+                    : snapshot.phase === "error"
+                      ? "oc-icon-badge-danger"
+                      : "oc-icon-badge-warning",
               )}
             >
-              <Hexagon size={16} strokeWidth={2.2} />
+              <Hexagon size={16} strokeWidth={2} />
             </span>
 
             <div className="min-w-0 flex-1">

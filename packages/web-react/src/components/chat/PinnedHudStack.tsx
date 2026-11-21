@@ -42,7 +42,7 @@ export type PinnedHudStackProps = {
  * at least one live signal (Swarm / Delegate / Task / Goal) is active.
  */
 export function PinnedHudStack(props: PinnedHudStackProps) {
-  const { timelineMessages, chatVersion, wsSending, delegateItems, latestSwarm, latestSwarmKey, dismissedSwarmKey } = props;
+  const { timelineMessages, chatVersion, wsSending, delegateItems, latestSwarm } = props;
 
   const { todos, settled, goalMessage } = useMemo(() => {
     void chatVersion;
@@ -53,8 +53,8 @@ export function PinnedHudStack(props: PinnedHudStackProps) {
     };
   }, [timelineMessages, chatVersion]);
 
-  const swarmActive = latestSwarm ? latestSwarm.phase === "starting" || latestSwarm.phase === "running" : false;
-  const hasSwarm = Boolean(latestSwarm && (swarmActive || dismissedSwarmKey !== latestSwarmKey));
+  // Only keep the floating HUD pinned while a swarm is actively running; completed swarms stay in the timeline card.
+  const hasSwarm = Boolean(latestSwarm && (latestSwarm.phase === "starting" || latestSwarm.phase === "running"));
   const hasDelegate = delegateItems.length > 0;
   const hasTask = todos.some((t) => t.status !== "completed") && (!settled || wsSending);
   const hasGoal = goalMessage !== null;

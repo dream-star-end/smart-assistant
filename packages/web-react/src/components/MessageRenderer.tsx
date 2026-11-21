@@ -3161,6 +3161,7 @@ export function MessageList({
         ) : null}
       </div>
     ) : null}
+    {!find && pendingPrompts.length === 0 ? <div aria-hidden data-testid="timeline-top-fade" className="pointer-events-none sticky top-0 z-10 -mb-3 h-3 bg-gradient-to-b from-bg to-transparent" /> : null}
     <div
       ref={listRootRef}
       className="mx-auto max-w-3xl space-y-4 px-5 py-8"

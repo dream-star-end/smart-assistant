@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import '@testing-library/jest-dom/vitest'
 import type { LockedPublicModel, PublicModel } from '../lib/types'
 import { loadBeforeAll } from '../test/moduleLoad'
-import { ModelSelector, modelLabel, preloadModelSelectorPanel, teamEngineLabel } from './ModelSelector'
+import { ModelSelector, compactMobileModelLabel, modelLabel, preloadModelSelectorPanel, teamEngineLabel } from './ModelSelector'
 import { EFFORT_OPTIONS } from './settings/labels'
 
 loadBeforeAll(preloadModelSelectorPanel)
@@ -1394,5 +1394,32 @@ describe('ModelSelector OCV5-820 响应式根治（<640 Sheet / ≥640 双栏 / 
     } finally {
       restore()
     }
+  })
+
+  it('OCV5-831：手机紧凑胶囊自动去除末尾括号来源后缀，桌面触发器、title 与模型选择面板保留完整名称', async () => {
+    const antigravityModels: PublicModel[] = [
+      { id: 'gemini-4-neon-ag', display_name: 'Gemini 4 Neon (Antigravity)', cost_x: 2.7 },
+      { id: 'glm-5.2', display_name: 'GLM-5.2' },
+    ]
+    expect(compactMobileModelLabel('Gemini 4 Neon (Antigravity)')).toBe('Gemini 4 Neon')
+
+    render(
+      <ModelSelector
+        models={antigravityModels}
+        selectedId="gemini-4-neon-ag"
+        onSelect={() => {}}
+      />,
+    )
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(trigger).toHaveAttribute('title', 'Gemini 4 Neon (Antigravity)')
+    const mobileSpan = screen.getByTestId('model-trigger-label-mobile')
+    expect(mobileSpan).toHaveTextContent('Gemini 4 Neon')
+    expect(mobileSpan).toHaveClass('sm:hidden')
+    expect(trigger.textContent).toContain('Gemini 4 Neon (Antigravity)')
+    expect(trigger.textContent).toContain('2.7')
+
+    openMenu(trigger)
+    const items = await screen.findAllByRole('menuitem')
+    expect(items.some((i) => i.textContent?.includes('Gemini 4 Neon (Antigravity)'))).toBe(true)
   })
 })

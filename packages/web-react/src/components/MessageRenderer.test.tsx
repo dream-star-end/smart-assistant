@@ -3667,7 +3667,12 @@ describe("主时间线回到底部 FAB", () => {
     expect(btn.className).toContain("bg-elevated/90");
     expect(btn.className).toContain("border-border-control");
     expect(btn.className).toContain("backdrop-blur-md");
+    expect(btn.className).toContain("left-1/2");
+    expect(btn.className).toContain("-translate-x-1/2");
+    expect(btn.className).not.toContain("right-0");
     expect(btn.className).not.toContain("bg-fg");
+    const topFade = screen.getByTestId("timeline-top-fade");
+    expect(topFade).toHaveClass("pointer-events-none", "sticky", "top-0", "h-3", "-mb-3", "bg-gradient-to-b", "from-bg");
     expect(screen.getByTestId("scroll-to-bottom-dock")).toHaveAttribute("data-visible", "true");
     jumpToBottom.mockClear();
     fireEvent.click(btn);

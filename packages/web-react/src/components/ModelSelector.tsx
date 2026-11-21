@@ -46,10 +46,16 @@ export function modelLabel(m: PublicModel): string {
   return typeof dn === 'string' && dn.trim() ? dn : m.id
 }
 
+/** 手机紧凑模型胶囊去除末尾括号平台/通道后缀（如 ` (Antigravity)`、`（Codex）`），保留核心型号名。 */
+export function compactMobileModelLabel(label: string): string {
+  const stripped = label.replace(/\s*(?:\([^()]*\)|（[^（）]*）)\s*$/, '').trim()
+  return stripped || label
+}
+
 function CostMark({ model, multiplier = 1 }: { model?: { cost_x?: number }; multiplier?: number }) {
   const label = modelCostLabel(model, multiplier)
   if (!label) return null
-  return <span className="text-caption font-normal tabular-nums text-faint">{label}</span>
+  return <span className="shrink-0 text-caption font-normal tabular-nums text-faint">{label}</span>
 }
 
 function promoLabelOf(model: { promo_label?: unknown } | undefined): string | undefined {
@@ -197,6 +203,8 @@ export function ModelSelector({
     : serviceTierBillingMultiplierNumber(selectedId, effectiveServiceTier)
   const baseLabel = triggerLabel(models, selectedId, loading)
   const label = teamEngineActive ? engineLabel : baseLabel
+  const mobileLabel = compactMobileModelLabel(label)
+  const hasCompactLabel = mobileLabel !== label
   const fastTierMult = serviceTierBillingMultiplierNumber(selectedId, 'fast')
   const ultraTierMult = serviceTierBillingMultiplierNumber(selectedId, 'ultrafast')
   const mobileSpeedBadge = (() => {
@@ -272,7 +280,9 @@ export function ModelSelector({
             ? `团队模式固定由队长模型 ${engineLabel} 执行与计费，关闭团队模式后可切换模型`
             : selectedDegraded
               ? '当前模型暂不可用，点击更换'
-              : undefined
+              : hasCompactLabel
+                ? label
+                : undefined
       }
       aria-busy={loading || undefined}
       data-degraded={selectedDegraded && !teamEngineActive ? 'true' : undefined}
@@ -307,7 +317,21 @@ export function ModelSelector({
           data-testid="model-trigger-degraded"
         />
       )}
-      <span className="min-w-0 truncate font-medium sm:max-w-[220px] lg:max-w-[260px]">{label}</span>
+      {hasCompactLabel ? (
+        <>
+          <span
+            data-testid="model-trigger-label-mobile"
+            className="min-w-0 truncate font-medium sm:hidden"
+          >
+            {mobileLabel}
+          </span>
+          <span className="hidden min-w-0 truncate font-medium sm:inline sm:max-w-[220px] lg:max-w-[260px]">
+            {label}
+          </span>
+        </>
+      ) : (
+        <span className="min-w-0 truncate font-medium sm:max-w-[220px] lg:max-w-[260px]">{label}</span>
+      )}
       {loading && selected && !teamEngineActive ? (
         <span className="shrink-0 text-faint" data-testid="model-trigger-loading">
           · 切换中…

@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { MAIN_AGENT } from "../lib/agents";
 import type { PublicModel } from "../lib/types";
-import { ChatHeader, modKeyLabel } from "./ChatHeader";
+import { ChatHeader, compactMobileModelLabel, modKeyLabel } from "./ChatHeader";
 
 // 本仓 vitest 未开 globals 自动 cleanup,显式隔离每个用例的 DOM。
 afterEach(cleanup);
@@ -126,7 +126,7 @@ describe("ChatHeader 未读状态点降噪（OCV5-820 消灭 99+/40 红紫数字
     const inboxDot = screen.getByTestId("inbox-unread-badge");
     expect(inboxDot).toHaveTextContent("");
     expect(inboxDot).toHaveAttribute("data-unread-count", "40");
-    expect(inboxDot).toHaveClass("size-1.5", "rounded-full", "bg-danger");
+    expect(inboxDot).toHaveClass("size-1.5", "rounded-full", "bg-accent", "ring-2", "ring-bg");
     expect(inboxBtn.parentElement?.textContent).not.toContain("40");
   });
 
@@ -298,7 +298,7 @@ describe("ChatHeader 移动端单行化与平板宽度分配（OCV5-820）", () 
     // 移动端站内信、钱包、快问在顶栏隐藏，收纳进「···」溢出菜单且精准展示计数/余额
     expect(screen.getByTestId("header-secondary-actions")).toHaveClass("hidden", "sm:flex");
     expect(screen.getByTestId("quick-ask-toggle")).toHaveClass("hidden", "sm:flex");
-    expect(screen.getByTestId("overflow-inbox-dot")).toHaveClass("size-1.5", "bg-danger", "sm:hidden");
+    expect(screen.getByTestId("overflow-inbox-dot")).toHaveClass("size-1.5", "bg-accent", "ring-2", "ring-bg", "sm:hidden");
 
     const more = screen.getByTestId("header-overflow-trigger");
     fireEvent.pointerDown(more, { button: 0, pointerType: "mouse" });
@@ -414,5 +414,35 @@ describe("ChatHeader 视觉层次与运行态焦点（OCV5-811）", () => {
     renderHeader({ sessionTitle: "新对话", running: false });
     expect(screen.queryByTestId("chat-session-title")).toBeNull();
     expect(screen.queryByTestId("header-running-badge")).toBeNull();
+  });
+});
+
+describe("OCV5-831 ChatHeader 顶栏遮挡层、手机模型名去括号与统一未读点", () => {
+  it("顶栏具备高不透明度磨砂遮挡与轻阴影以消除下方残影裁切", () => {
+    const { container } = renderHeader();
+    const header = container.querySelector("header");
+    expect(header).toHaveClass("bg-bg/95", "backdrop-blur-md", "border-b", "border-border/80", "shadow-xs");
+  });
+
+  it("compactMobileModelLabel 去除末尾括号平台后缀并保留核心名，纯括号文案兜底返回原串", () => {
+    expect(compactMobileModelLabel("Gemini 4 Neon (Antigravity)")).toBe("Gemini 4 Neon");
+    expect(compactMobileModelLabel("GPT-5.6-Sol (Codex)")).toBe("GPT-5.6-Sol");
+    expect(compactMobileModelLabel("Claude Opus 4（Cursor）")).toBe("Claude Opus 4");
+    expect(compactMobileModelLabel("GLM-5.2")).toBe("GLM-5.2");
+    expect(compactMobileModelLabel("(Antigravity)")).toBe("(Antigravity)");
+  });
+
+  it("左右顶栏未读点统一使用暖陶土 bg-accent + ring-2 ring-bg，不再出现左右红/陶土色值割裂", () => {
+    renderHeader({
+      onOpenMobileNav: vi.fn(),
+      onOpenInbox: vi.fn(),
+      unreadCount: 5,
+      sessionUnreadCount: 3,
+    });
+    const leftDot = screen.getByTestId("session-unread-badge");
+    const rightDot = screen.getByTestId("overflow-inbox-dot");
+    expect(leftDot).toHaveClass("bg-accent", "ring-2", "ring-bg");
+    expect(rightDot).toHaveClass("bg-accent", "ring-2", "ring-bg");
+    expect(rightDot).not.toHaveClass("bg-danger");
   });
 });

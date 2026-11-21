@@ -2,7 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { BRAND } from "../lib/brand";
-import { Composer, ENV_PREP_EXPECTED_MS } from "./Composer";
+import { Composer, ENV_PREP_EXPECTED_MS, SWARM_PLACEHOLDER } from "./Composer";
 import { ToastProvider } from "./ui";
 
 afterEach(cleanup);
@@ -418,5 +418,37 @@ describe("OCV5-817 Composer prefill append / slash menu / stopping indicator", (
   test("stopping 为 true 时展示可见的「正在停止…」状态提示", () => {
     render(<Composer onSend={() => {}} busy stopping onStop={vi.fn()} />);
     expect(screen.getByTestId("composer-stopping-status")).toHaveTextContent("正在停止");
+  });
+});
+
+describe("OCV5-831 Composer 蜂群占位符单行化与视觉重心", () => {
+  test("swarmMode 开启时展示紧凑单行占位文案，未开启时回落默认品牌文案", () => {
+    const { rerender } = render(<Composer onSend={() => {}} swarmSupported swarmMode />);
+    const ta = screen.getByLabelText("消息输入框");
+    expect(ta).toHaveAttribute("placeholder", SWARM_PLACEHOLDER);
+    expect(SWARM_PLACEHOLDER.length).toBeLessThanOrEqual(22);
+
+    rerender(<Composer onSend={() => {}} swarmSupported swarmMode={false} />);
+    expect(ta).toHaveAttribute("placeholder", `给${BRAND.name}发消息…`);
+  });
+
+  test("蜂群开关与发送/停止按钮具备清晰主次对比：激活暖陶土软底描边、未激活轻盈无框、发送钮随状态切换高光工艺类", () => {
+    const { rerender } = render(
+      <Composer onSend={() => {}} swarmSupported swarmMode={false} onToggleSwarmMode={vi.fn()} />,
+    );
+    const swarmBtn = screen.getByTestId("composer-swarm-toggle");
+    expect(swarmBtn).toHaveClass("border-transparent", "text-muted");
+    expect(swarmBtn).not.toHaveClass("bg-accent-soft");
+
+    const ta = screen.getByLabelText("消息输入框");
+    fireEvent.change(ta, { target: { value: "写一个计划" } });
+    expect(screen.getByRole("button", { name: "发送" })).toHaveClass("oc-btn-primary-craft", "text-primary-fg");
+
+    rerender(<Composer onSend={() => {}} swarmSupported swarmMode onToggleSwarmMode={vi.fn()} />);
+    expect(swarmBtn).toHaveClass("bg-accent-soft", "text-accent", "border-accent/30");
+    expect(screen.getByRole("button", { name: "发送" })).toHaveClass("oc-btn-accent-craft", "text-accent-fg");
+
+    rerender(<Composer onSend={() => {}} busy onStop={vi.fn()} swarmSupported swarmMode onToggleSwarmMode={vi.fn()} />);
+    expect(screen.getByRole("button", { name: "停止" })).toHaveClass("oc-btn-primary-craft", "text-primary-fg");
   });
 });

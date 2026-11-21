@@ -24,7 +24,9 @@ import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import type { LockedPublicModel, PublicModel } from "../lib/types";
 import { cn, formatCredits } from "../lib/utils";
 import { AgentAvatar } from "./AgentAvatar";
-import { type LockedSelectInfo, ModelSelector, teamEngineLabel } from "./ModelSelector";
+import { type LockedSelectInfo, ModelSelector, compactMobileModelLabel, teamEngineLabel } from "./ModelSelector";
+
+export { compactMobileModelLabel };
 import {
   Badge,
   Button,
@@ -210,7 +212,7 @@ export function ChatHeader({
       sidebarCollapsed={sidebarCollapsed}
       onExpandSidebar={onExpandSidebar}
       sessionUnreadCount={sessionUnreadCount}
-      className="oc-surface-glass border-x-0 border-t-0 shadow-none"
+      className="relative z-20 border-x-0 border-t-0 border-b border-border/80 bg-bg/95 backdrop-blur-md shadow-xs"
       collapsedExtra={
         onNew ? (
           <IconButton
@@ -493,7 +495,8 @@ export function ChatHeader({
                 <HeaderCountBadge
                   count={unreadCount}
                   testId="inbox-unread-badge"
-                  tone="danger"
+                  tone="accent"
+                  className="motion-safe:animate-none"
                   ariaLabel={hasUnreadInbox ? `${unreadCount} 条未读站内信` : undefined}
                 />
               </div>
@@ -611,7 +614,7 @@ export function ChatHeader({
                     <Bell size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
                     <span className="flex-1">站内信</span>
                     {hasUnreadInbox && (
-                      <Badge tone="danger" className="tabular-nums">
+                      <Badge tone="accent" className="tabular-nums">
                         {unreadCount}
                       </Badge>
                     )}
@@ -699,8 +702,8 @@ export function ChatHeader({
               <HeaderCountBadge
                 count={unreadCount}
                 testId="overflow-inbox-dot"
-                tone="danger"
-                className="sm:hidden"
+                tone="accent"
+                className="motion-safe:animate-none sm:hidden"
               />
             )}
           </div>

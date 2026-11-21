@@ -58,7 +58,9 @@ export function ToolCard({
   const renderTool = display.tool;
   const meta = resolveToolMeta(name, input);
   const Icon = meta.icon;
-  const summary = toolSummary(name, input);
+  const summary =
+    (typeof input?.toolSummary === "string" && input.toolSummary.trim()) ||
+    toolSummary(name, input);
   // 表头各段的 id:按钮可及名走 aria-labelledby 拼「标签 + 摘要 + 错误首行 + 状态」(T-22),
   // 不再用 aria-label 把按钮内的可见文本全部覆盖掉。
   const uid = useId();

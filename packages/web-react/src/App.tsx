@@ -2642,7 +2642,7 @@ export function App() {
                 <BackgroundTurnBanner notice={backgroundTurn.notice} />
               ) : undefined
             }
-            placeholder={swarmMode ? "描述需要蜂群并行协作的任务，或直接输入 /swarm …" : `和「${agent.name}」对话…`}
+            placeholder={swarmMode ? undefined : `和「${agent.name}」对话…`}
             swarmSupported={swarmSupported}
             swarmMode={swarmMode}
             onToggleSwarmMode={toggleSwarmMode}
