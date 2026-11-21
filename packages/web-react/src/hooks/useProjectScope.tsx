@@ -32,9 +32,15 @@ type ProjectScopeContextValue = {
   selectOptions: { value: string; label: string; disabled?: boolean }[];
   loading: boolean;
   refreshWorkProjects: () => Promise<WorkProjectLike[]>;
+  auth: AuthSession | null;
 };
 
 const ProjectScopeContext = createContext<ProjectScopeContextValue | null>(null);
+
+/** Workspace-scoped authenticated session (null in demo / unauthenticated / standalone test mounts). */
+export function useOptionalAuth(): AuthSession | null {
+  return useContext(ProjectScopeContext)?.auth ?? null;
+}
 
 function readStoredToken(userId: string | undefined): ProjectScopeToken | null {
   if (!userId || typeof localStorage === "undefined") return null;
@@ -196,8 +202,9 @@ export function ProjectScopeProvider({
       selectOptions,
       loading,
       refreshWorkProjects,
+      auth,
     }),
-    [scope, setToken, workProjects, chatProjects, selectOptions, loading, refreshWorkProjects],
+    [scope, setToken, workProjects, chatProjects, selectOptions, loading, refreshWorkProjects, auth],
   );
 
   return <ProjectScopeContext.Provider value={value}>{children}</ProjectScopeContext.Provider>;
@@ -215,6 +222,7 @@ export function useProjectScope(): ProjectScopeContextValue {
       selectOptions: projectScopeSelectOptions({ chatProjects: [], workProjects: [] }),
       loading: false,
       refreshWorkProjects: async () => [],
+      auth: null,
     };
   }
   return ctx;

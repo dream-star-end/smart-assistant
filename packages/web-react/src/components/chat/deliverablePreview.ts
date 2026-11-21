@@ -796,6 +796,7 @@ export function extractMarkdownOutline(markdown: string): DocumentAnalysis {
 
 export type AnnotationAnchor =
   | { kind: "slide"; page: number; title?: string }
+  | { kind: "cell"; sheet: string; ref: string; value?: string; formula?: string }
   | { kind: "table-row"; rowNumber: number; columnsSummary?: string }
   | { kind: "section"; heading: string; line?: number }
   | { kind: "code-line"; lineStart: number; lineEnd?: number }
@@ -817,6 +818,8 @@ export function formatAnchorLabel(anchor: AnnotationAnchor): string {
       return anchor.title && anchor.title !== `第 ${anchor.page} 页`
         ? `第 ${anchor.page} 页（${anchor.title}）`
         : `第 ${anchor.page} 页`;
+    case "cell":
+      return `工作表「${anchor.sheet}」单元格 ${anchor.ref}`;
     case "table-row":
       return anchor.columnsSummary
         ? `第 ${anchor.rowNumber} 行（${anchor.columnsSummary}）`

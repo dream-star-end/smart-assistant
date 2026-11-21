@@ -151,6 +151,47 @@ export function formatSwarmElapsed(startedAt?: number, nowMs: number = Date.now(
   return h > 0 ? `${h}:${mmss}` : mmss;
 }
 
+/** 将成员增量遥测耗时（ms）格式化为紧凑可读时长。 */
+export function formatTelemetryDuration(elapsedMs?: number): string {
+  if (typeof elapsedMs !== "number" || !Number.isFinite(elapsedMs) || elapsedMs < 0) return "";
+  if (elapsedMs < 1_000) return `${Math.round(elapsedMs)}ms`;
+  const totalSec = elapsedMs / 1_000;
+  if (totalSec < 60) return `${totalSec < 10 ? totalSec.toFixed(1) : Math.round(totalSec)}s`;
+  const mins = Math.floor(totalSec / 60);
+  const secs = Math.round(totalSec % 60);
+  if (mins < 60) return secs > 0 ? `${mins}m${secs}s` : `${mins}m`;
+  const hrs = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  return remMins > 0 ? `${hrs}h${remMins}m` : `${hrs}h`;
+}
+
+/** 将 token 数量格式化为紧凑数值（如 1.2k / 1.4M）。 */
+export function formatCompactTokenCount(tokens?: number): string {
+  if (typeof tokens !== "number" || !Number.isFinite(tokens) || tokens < 0) return "";
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
+  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}k`;
+  return String(Math.round(tokens));
+}
+
+export function formatTelemetryTokens(inputTokens?: number, outputTokens?: number): string {
+  const hasIn = typeof inputTokens === "number" && Number.isFinite(inputTokens) && inputTokens >= 0;
+  const hasOut = typeof outputTokens === "number" && Number.isFinite(outputTokens) && outputTokens >= 0;
+  if (!hasIn && !hasOut) return "";
+  const parts: string[] = [];
+  if (hasIn) parts.push(`${formatCompactTokenCount(inputTokens)}↑`);
+  if (hasOut) parts.push(`${formatCompactTokenCount(outputTokens)}↓`);
+  return parts.join(" ");
+}
+
+export function hasMemberTelemetry(member: SwarmMemberSnapshot): boolean {
+  return (
+    (typeof member.elapsedMs === "number" && Number.isFinite(member.elapsedMs)) ||
+    (typeof member.inputTokens === "number" && Number.isFinite(member.inputTokens)) ||
+    (typeof member.outputTokens === "number" && Number.isFinite(member.outputTokens)) ||
+    (typeof member.toolCalls === "number" && Number.isFinite(member.toolCalls))
+  );
+}
+
 export function formatPostClock(time?: string): string {
   if (!time) return "";
   const ms = Date.parse(time);

@@ -26,8 +26,21 @@ import {
   Search,
   Sparkles,
 } from "lucide-react";
-import { type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Component,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+  Suspense,
+  lazy,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useViewportClass } from "../../hooks/useMdViewport";
+import { useOptionalAuth } from "../../hooks/useProjectScope";
+import type { AuthSession } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import {
@@ -57,6 +70,31 @@ import { AnnotationComposer, FileOverflowMenu, WorkbenchBottomBar, useWorkbenchS
 import { baseName, displayDir } from "./workbench";
 import "./workbenchPreview.css";
 
+const OFFICE_NATIVE_EXT_RE = /\.(pptx|docx|xlsx)$/i;
+
+function createLazyOfficeRichPreview() {
+  return lazy(() =>
+    import("./OfficeRichPreview").catch((err) => {
+      LazyOfficeRichPreview = createLazyOfficeRichPreview();
+      throw err;
+    }),
+  );
+}
+let LazyOfficeRichPreview = createLazyOfficeRichPreview();
+
+class OfficePreviewFallbackBoundary extends Component<
+  { fallback: ReactNode; children: ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  render() {
+    return this.state.failed ? this.props.fallback : this.props.children;
+  }
+}
+
 export type DeliverableRichPreviewProps = {
   path: string;
   name?: string;
@@ -64,6 +102,8 @@ export type DeliverableRichPreviewProps = {
   text?: string | null;
   /** 外部明确指定的元信息（缺省自动按路径与正文分类）。 */
   meta?: DeliverableMeta;
+  /** 可选认证会话（缺省取工作区上下文，供 Office 零轮次预览调用受保护 API）。 */
+  auth?: AuthSession | null;
   /** 可选回调：将生成的结构化批注修改指令直接注入左侧 Composer 输入框。 */
   onAnnotateToComposer?: (draft: string) => void;
   /** 是否显示顶部统一交付物操作条（默认 true）。 */
@@ -946,12 +986,15 @@ export function DeliverableRichPreview({
   name: nameProp,
   text,
   meta: metaProp,
+  auth: authProp,
   onAnnotateToComposer,
   showActionBar = true,
   onBackToList,
   onPreviewError,
 }: DeliverableRichPreviewProps) {
   const name = nameProp ?? baseName(path);
+  const ctxAuth = useOptionalAuth();
+  const effectiveAuth = authProp !== undefined ? authProp : ctxAuth;
   const viewportClass = useViewportClass();
   const isSheet = useWorkbenchSheet();
   const isCompact = isSheet || viewportClass === "compact";
@@ -1016,7 +1059,7 @@ export function DeliverableRichPreview({
 
   const renderBody = () => {
     if (meta.isBinaryOffice) {
-      return (
+      const binaryCard = (
         <BinaryOfficeCard
           path={path}
           name={name}
@@ -1026,6 +1069,35 @@ export function DeliverableRichPreview({
           onOpenAnnotate={() => openAnchoredAnnotate({ kind: "file" })}
         />
       );
+      const canNativeOffice =
+        Boolean(effectiveAuth) &&
+        path.startsWith("/") &&
+        !path.startsWith("/api/") &&
+        OFFICE_NATIVE_EXT_RE.test(path);
+      if (canNativeOffice && effectiveAuth) {
+        return (
+          <OfficePreviewFallbackBoundary key={path} fallback={binaryCard}>
+            <Suspense
+              fallback={
+                <div className="space-y-3 px-5 py-6" data-testid="office-preview-loading">
+                  <Skeleton className="h-3 w-1/3" />
+                  <Skeleton className="h-44 w-full rounded-xl" />
+                </div>
+              }
+            >
+              <LazyOfficeRichPreview
+                path={path}
+                name={name}
+                auth={effectiveAuth}
+                compact={isCompact}
+                onAnnotate={openAnchoredAnnotate}
+                fallback={binaryCard}
+              />
+            </Suspense>
+          </OfficePreviewFallbackBoundary>
+        );
+      }
+      return binaryCard;
     }
 
     if (meta.format === "pdf") {

@@ -22,8 +22,11 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import {
+  Component,
   type KeyboardEvent,
   type ReactNode,
+  Suspense,
+  lazy,
   useEffect,
   useId,
   useMemo,
@@ -132,6 +135,50 @@ const SURFACES: Array<{ id: ProjectSurface; label: string; hint: string; icon: L
 
 const OVERVIEW_SESSION_LIMIT = 5;
 const OVERVIEW_OUTPUT_LIMIT = 6;
+
+function createLazyProjectResearchTab() {
+  return lazy(() =>
+    import("./ProjectResearchTab").catch((err) => {
+      LazyProjectResearchTab = createLazyProjectResearchTab();
+      throw err;
+    }),
+  );
+}
+let LazyProjectResearchTab = createLazyProjectResearchTab();
+
+class ResearchTabErrorBoundary extends Component<
+  { onRetry: () => void; children: ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  render() {
+    if (this.state.failed) {
+      return (
+        <Alert
+          tone="danger"
+          action={
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => {
+                this.props.onRetry();
+                this.setState({ failed: false });
+              }}
+            >
+              重试
+            </Button>
+          }
+        >
+          文献库模块加载失败，请重试。
+        </Alert>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 /**
  * 项目主页（`/p/<id>[/<tab>]`）：一个项目的所有东西在一处 —— 开始新会话、最近会话、
@@ -249,6 +296,7 @@ export function ProjectHome(props: ProjectHomeProps) {
       ),
     },
     { value: "files", label: "文件" },
+    { value: "research", label: "文献" },
     {
       value: "outputs",
       label: (
@@ -417,6 +465,29 @@ export function ProjectHome(props: ProjectHomeProps) {
                   />
                 )}
               </div>
+            )}
+            {tab === "research" && (
+              <ResearchTabErrorBoundary
+                onRetry={() => {
+                  LazyProjectResearchTab = createLazyProjectResearchTab();
+                }}
+              >
+                <Suspense
+                  fallback={
+                    <div className="space-y-3 py-2">
+                      <Skeleton className="h-36 w-full rounded-xl" />
+                      <Skeleton className="h-24 w-full rounded-xl" />
+                    </div>
+                  }
+                >
+                  <LazyProjectResearchTab
+                    projectId={project.id}
+                    projectName={project.name}
+                    demo={demo}
+                    authSession={authSession}
+                  />
+                </Suspense>
+              </ResearchTabErrorBoundary>
             )}
             {tab === "outputs" && (
               <OutputsTab

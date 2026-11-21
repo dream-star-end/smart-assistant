@@ -17,23 +17,32 @@ import {
   ArrowDown,
   Check,
   ChevronRight,
+  Clock3,
   Copy,
+  Cpu,
   GitBranch,
   Hash,
   MessageSquare,
   Quote,
   Search,
   Users,
+  Wrench,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useOptionalAuth } from "../../hooks/useProjectScope";
+import type { AuthSession } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { Badge, IconButton, useToast } from "../ui";
 import { AtelierIcon } from "../ui/AtelierIcons";
+import { SwarmCommandBar } from "./SwarmCommandBar";
 import {
   formatPostClock,
   formatSwarmElapsed,
+  formatTelemetryDuration,
+  formatTelemetryTokens,
+  hasMemberTelemetry,
   humanizeSwarmModel,
   isSwarmActive,
   memberInitial,
@@ -191,6 +200,10 @@ function RosterMemberRow({
   const killed = member.status === "killed";
   const modelText = humanizeSwarmModel(member.model);
   const wsBadge = swarmWorkspaceBadge(member.workspace);
+  const showTelemetry = hasMemberTelemetry(member);
+  const elapsedText = formatTelemetryDuration(member.elapsedMs);
+  const tokensText = formatTelemetryTokens(member.inputTokens, member.outputTokens);
+  const approxPrefix = member.telemetryPartial ? "~" : "";
 
   return (
     <button
@@ -273,6 +286,52 @@ function RosterMemberRow({
             <span className="shrink-0 font-mono tabular-nums">最近 #{member.lastPostSeq}</span>
           )}
         </div>
+        {showTelemetry && (
+          <div
+            className="mt-1.5 flex flex-wrap items-center gap-1 text-micro text-muted"
+            data-testid={`swarm-member-telemetry-${member.name}`}
+          >
+            {elapsedText && (
+              <span
+                className="inline-flex items-center gap-0.5 rounded bg-hover px-1.5 py-0.5 font-mono tabular-nums"
+                title="成员累计运行耗时"
+              >
+                <Clock3 size={9} aria-hidden className="text-faint" />
+                {approxPrefix}
+                {elapsedText}
+              </span>
+            )}
+            {tokensText && (
+              <span
+                className="inline-flex items-center gap-0.5 rounded bg-hover px-1.5 py-0.5 font-mono tabular-nums"
+                title="输入 / 输出 Token 用量"
+              >
+                <Cpu size={9} aria-hidden className="text-faint" />
+                {approxPrefix}
+                {tokensText}
+              </span>
+            )}
+            {typeof member.toolCalls === "number" && (
+              <span
+                className="inline-flex items-center gap-0.5 rounded bg-hover px-1.5 py-0.5 font-mono tabular-nums"
+                title="工具调用次数"
+              >
+                <Wrench size={9} aria-hidden className="text-faint" />
+                {approxPrefix}
+                {member.toolCalls} 次
+              </span>
+            )}
+            {member.telemetryPartial && (
+              <span
+                data-testid={`swarm-telemetry-partial-${member.name}`}
+                title="遥测仍在增量扫描或已触及采样预算，当前数值为近似值"
+                className="inline-flex items-center rounded bg-warning-soft px-1.5 py-0.5 font-mono font-semibold text-warning"
+              >
+                ~ 近似
+              </span>
+            )}
+          </div>
+        )}
       </div>
     </button>
   );
@@ -402,6 +461,8 @@ export function SwarmBoardDrawer({
   open,
   onOpenChange,
   snapshot,
+  sessionId = null,
+  auth: authProp,
   initialFocusMember = null,
   initialFocusChannel = null,
   initialFocusSeq = null,
@@ -410,11 +471,15 @@ export function SwarmBoardDrawer({
   open: boolean;
   onOpenChange: (open: boolean) => void;
   snapshot: SwarmSnapshot | null;
+  sessionId?: string | null;
+  auth?: AuthSession | null;
   initialFocusMember?: string | null;
   initialFocusChannel?: string | null;
   initialFocusSeq?: number | null;
   onQuoteToComposer?: (text: string) => void;
 }) {
+  const ctxAuth = useOptionalAuth();
+  const effectiveAuth = authProp !== undefined ? authProp : ctxAuth;
   const [selectedMember, setSelectedMember] = useState<string | null>(initialFocusMember);
   const [selectedChannel, setSelectedChannel] = useState<string | null>(initialFocusChannel);
   const [search, setSearch] = useState("");
@@ -1017,80 +1082,92 @@ export function SwarmBoardDrawer({
                 </div>
               )}
 
-              <div
-                ref={feedRef}
-                onScroll={(e) => {
-                  const el = e.currentTarget;
-                  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
-                  setIsNearBottom(nearBottom);
-                  if (!nearBottom && followLatest) setFollowLatest(false);
-                  else if (nearBottom && !followLatest) setFollowLatest(true);
-                }}
-                className="flex-1 space-y-2.5 overflow-y-auto px-3.5 py-3 sm:px-4 sm:py-3.5"
-                data-testid="swarm-board-feed"
-              >
-                {snapshot.truncatedPosts && snapshot.truncatedPosts > 0 && (
-                  <div className="rounded-xl border border-dashed border-border bg-surface/60 px-3 py-2 text-center text-caption text-faint">
-                    已省略较早的 {snapshot.truncatedPosts} 条历史记录，仅展示最近 {snapshot.posts.length} 条
-                  </div>
-                )}
+              <div className="relative flex min-h-0 flex-1 flex-col">
+                <div
+                  ref={feedRef}
+                  onScroll={(e) => {
+                    const el = e.currentTarget;
+                    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+                    setIsNearBottom(nearBottom);
+                    if (!nearBottom && followLatest) setFollowLatest(false);
+                    else if (nearBottom && !followLatest) setFollowLatest(true);
+                  }}
+                  className="flex-1 space-y-2.5 overflow-y-auto px-3.5 py-3 sm:px-4 sm:py-3.5"
+                  data-testid="swarm-board-feed"
+                >
+                  {snapshot.truncatedPosts && snapshot.truncatedPosts > 0 && (
+                    <div className="rounded-xl border border-dashed border-border bg-surface/60 px-3 py-2 text-center text-caption text-faint">
+                      已省略较早的 {snapshot.truncatedPosts} 条历史记录，仅展示最近 {snapshot.posts.length} 条
+                    </div>
+                  )}
 
-                {filteredPosts.length === 0 ? (
-                  <div className="flex h-48 flex-col items-center justify-center gap-2 text-center">
-                    <span className="oc-icon-badge oc-icon-badge-accent flex size-10 items-center justify-center rounded-2xl">
-                      <AtelierIcon name="swarm" size={20} />
-                    </span>
-                    <p className="text-body font-medium text-fg">
-                      {snapshot.posts.length === 0
-                        ? "蜂群讨论板尚未产生消息"
-                        : "当前筛选条件下暂无匹配讨论"}
-                    </p>
-                    <p className="text-caption text-faint">
-                      {snapshot.posts.length === 0
-                        ? "协调者完成分工后，各成员的汇报与互审会在此实时呈现"
-                        : "尝试切换频道、取消成员聚焦或清空关键词"}
-                    </p>
-                  </div>
-                ) : (
-                  filteredPosts.map((post) => (
-                    <PostRow
-                      key={post.seq}
-                      post={post}
-                      highlighted={highlightedSeq === post.seq}
-                      onMention={(name) => setSelectedMember(name)}
-                      onChannel={(ch) => setSelectedChannel(ch)}
-                      onJumpSeq={jumpToSeq}
-                      onQuote={onQuoteToComposer ? quotePostToMainline : undefined}
-                      setRowRef={setRowRef}
-                    />
-                  ))
+                  {filteredPosts.length === 0 ? (
+                    <div className="flex h-48 flex-col items-center justify-center gap-2 text-center">
+                      <span className="oc-icon-badge oc-icon-badge-accent flex size-10 items-center justify-center rounded-2xl">
+                        <AtelierIcon name="swarm" size={20} />
+                      </span>
+                      <p className="text-body font-medium text-fg">
+                        {snapshot.posts.length === 0
+                          ? "蜂群讨论板尚未产生消息"
+                          : "当前筛选条件下暂无匹配讨论"}
+                      </p>
+                      <p className="text-caption text-faint">
+                        {snapshot.posts.length === 0
+                          ? "协调者完成分工后，各成员的汇报与互审会在此实时呈现"
+                          : "尝试切换频道、取消成员聚焦或清空关键词"}
+                      </p>
+                    </div>
+                  ) : (
+                    filteredPosts.map((post) => (
+                      <PostRow
+                        key={post.seq}
+                        post={post}
+                        highlighted={highlightedSeq === post.seq}
+                        onMention={(name) => setSelectedMember(name)}
+                        onChannel={(ch) => setSelectedChannel(ch)}
+                        onJumpSeq={jumpToSeq}
+                        onQuote={onQuoteToComposer ? quotePostToMainline : undefined}
+                        setRowRef={setRowRef}
+                      />
+                    ))
+                  )}
+                </div>
+
+                {/* Floating jump-to-bottom micro button when scrolled away from bottom */}
+                {!isNearBottom && filteredPosts.length > 0 && (
+                  <button
+                    type="button"
+                    data-testid="swarm-scroll-bottom-btn"
+                    aria-label="回到底部最新讨论"
+                    onClick={() => {
+                      setFollowLatest(true);
+                      setIsNearBottom(true);
+                      const el = feedRef.current;
+                      if (el) {
+                        if (typeof el.scrollTo === "function") {
+                          el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+                        } else {
+                          el.scrollTop = el.scrollHeight;
+                        }
+                      }
+                    }}
+                    className="oc-surface-glass oc-spring-press oc-hover-lift absolute bottom-3 right-3 z-10 inline-flex items-center gap-1 rounded-full border border-border-strong/70 px-2.5 py-1.5 text-caption font-medium text-fg shadow-float sm:bottom-3.5 sm:right-4"
+                  >
+                    <ArrowDown size={13} strokeWidth={2} className="text-accent" />
+                    <span>回到底部</span>
+                  </button>
                 )}
               </div>
 
-              {/* Floating jump-to-bottom micro button when scrolled away from bottom */}
-              {!isNearBottom && filteredPosts.length > 0 && (
-                <button
-                  type="button"
-                  data-testid="swarm-scroll-bottom-btn"
-                  aria-label="回到底部最新讨论"
-                  onClick={() => {
-                    setFollowLatest(true);
-                    setIsNearBottom(true);
-                    const el = feedRef.current;
-                    if (el) {
-                      if (typeof el.scrollTo === "function") {
-                        el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-                      } else {
-                        el.scrollTop = el.scrollHeight;
-                      }
-                    }
-                  }}
-                  className="oc-surface-glass oc-spring-press oc-hover-lift absolute bottom-3 right-3 z-10 inline-flex items-center gap-1 rounded-full border border-border-strong/70 px-2.5 py-1.5 text-caption font-medium text-fg shadow-float sm:bottom-11 sm:right-4"
-                >
-                  <ArrowDown size={13} strokeWidth={2} className="text-accent" />
-                  <span>回到底部</span>
-                </button>
-              )}
+              {/* Interactive Swarm Command Console */}
+              <SwarmCommandBar
+                sessionId={sessionId}
+                auth={effectiveAuth}
+                members={snapshot.members}
+                selectedMember={selectedMember}
+                selectedChannel={selectedChannel}
+                active={active}
+              />
 
               {/* Subtle keyboard legend footer */}
               <div className="hidden items-center justify-between border-t border-border/70 bg-surface/60 px-4 py-2 text-micro text-faint sm:flex">

@@ -40,6 +40,7 @@ import type { MediaRef } from "../lib/chat/frames";
 import type { RepoSelection } from "../lib/types";
 import { cn } from "../lib/utils";
 import { ComposerPlusMenu } from "./ComposerPlusMenu";
+import { SwarmPlaybookPopoverLazy } from "./chat/lazyTimelineCards";
 import { RepoPill } from "./github/RepoPill";
 import {
   IconButton,
@@ -1190,36 +1191,47 @@ export function Composer({
               </span>
             )}
             {swarmSupported && onToggleSwarmMode && (
-              <button
-                type="button"
-                data-testid="composer-swarm-toggle"
-                data-product-control
-                aria-pressed={swarmMode}
-                disabled={disabled}
-                onClick={onToggleSwarmMode}
-                title={
-                  swarmMode
-                    ? "已开启 Antigravity 蜂群模式：多智能体并行协作与实时讨论板（各成员请求按当前模型路由实际用量计费）。点击关闭"
-                    : "开启 Antigravity 蜂群模式：多智能体并行拆解与互审（也可直接输入 /swarm）"
-                }
-                className={cn(
-                  "oc-btn-tactile oc-spring-press inline-flex min-h-8 shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-caption font-medium transition-colors [@media(hover:none)]:min-h-10",
-                  "outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50",
-                  swarmMode
-                    ? "oc-breathe-aura border-accent/30 bg-accent-soft text-accent shadow-xs hover:bg-accent/15"
-                    : "border-transparent text-muted hover:bg-hover hover:text-fg",
-                )}
-              >
-                <AtelierIcon
-                  name="swarm"
-                  size={15}
-                  className={cn("shrink-0", swarmMode && "text-accent")}
+              <div className="relative flex shrink-0 items-center gap-1">
+                <button
+                  type="button"
+                  data-testid="composer-swarm-toggle"
+                  data-product-control
+                  aria-pressed={swarmMode}
+                  disabled={disabled}
+                  onClick={onToggleSwarmMode}
+                  title={
+                    swarmMode
+                      ? "已开启 Antigravity 蜂群模式：多智能体并行协作与实时讨论板（各成员请求按当前模型路由实际用量计费）。点击关闭"
+                      : "开启 Antigravity 蜂群模式：多智能体并行拆解与互审（也可直接输入 /swarm）"
+                  }
+                  className={cn(
+                    "oc-btn-tactile oc-spring-press inline-flex min-h-8 shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-caption font-medium transition-colors [@media(hover:none)]:min-h-10",
+                    "outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50",
+                    swarmMode
+                      ? "oc-breathe-aura border-accent/30 bg-accent-soft text-accent shadow-xs hover:bg-accent/15"
+                      : "border-transparent text-muted hover:bg-hover hover:text-fg",
+                  )}
+                >
+                  <AtelierIcon
+                    name="swarm"
+                    size={15}
+                    className={cn("shrink-0", swarmMode && "text-accent")}
+                  />
+                  <span>蜂群</span>
+                  {swarmMode && (
+                    <StatusPill status="running" variant="dot" size="sm" decorative />
+                  )}
+                </button>
+                <SwarmPlaybookPopoverLazy
+                  disabled={disabled}
+                  currentText={value}
+                  onSelectPlaybook={(draft) => {
+                    setValue(draft);
+                    if (!swarmMode) onToggleSwarmMode();
+                    window.requestAnimationFrame(() => ref.current?.focus());
+                  }}
                 />
-                <span>蜂群</span>
-                {swarmMode && (
-                  <StatusPill status="running" variant="dot" size="sm" decorative />
-                )}
-              </button>
+              </div>
             )}
             <div className="ml-auto flex shrink-0 items-center gap-1.5">
               {/* 触屏端无 Tab/→ 键：有输入预测时在工具行提供可点击采纳胶囊（桌面不显示，保持无额外视觉噪点）。 */}

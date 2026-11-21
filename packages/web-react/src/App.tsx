@@ -139,7 +139,6 @@ import { useRepoBinding } from "./hooks/useRepoBinding";
 import { useTheme } from "./hooks/useTheme";
 import { useToast } from "./components/ui";
 import { githubErrorText } from "./lib/github";
-import { connectorErrorText } from "./lib/connectors";
 import { imageByteCache } from "./lib/chat/imageBytes";
 import { containerPreviewHrefFromTarget } from "./lib/containerPreview";
 import type { MediaJobWire, RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
@@ -2096,6 +2095,7 @@ export function App() {
     loadingArchived,
     onSearchMessages: searchSessionMessages,
     onOpenPalette: closeMobileThen(() => setPaletteOpen(true)),
+    onOpenLiveBrowser: demo ? undefined : (opts?: { url?: string; sessionId?: string | null }) => { setMobileNavOpen(false); if (opts?.sessionId && sessions.some((s) => s.id === opts.sessionId)) selectSession(opts.sessionId); openPane("browser", null, opts?.url ? { url: opts.url } : undefined); },
   };
   return (
     <MediaSignProvider
@@ -2956,7 +2956,7 @@ export function App() {
         </LazyBoundary>
       )}
       {swarmUi.boardOpen && swarmUi.activeDrawerSwarm && (
-        <SwarmBoardDrawer open={swarmUi.boardOpen} onOpenChange={swarmUi.setBoardOpen} snapshot={swarmUi.activeDrawerSwarm} initialFocusMember={swarmUi.boardFocus.member} initialFocusChannel={swarmUi.boardFocus.channel} onQuoteToComposer={appendToComposer} />
+        <SwarmBoardDrawer open={swarmUi.boardOpen} onOpenChange={swarmUi.setBoardOpen} snapshot={swarmUi.activeDrawerSwarm} sessionId={activeId} initialFocusMember={swarmUi.boardFocus.member} initialFocusChannel={swarmUi.boardFocus.channel} onQuoteToComposer={appendToComposer} />
       )}
       {containerPreviewUrl && (
         <LazyBoundary fallback={<DialogFallback />}>

@@ -9,8 +9,8 @@
  * 历史:曾按 role="research-report" 消息驱动(ResearchReportCard),但 WS 引擎从不产出
  * 该角色帧,死代码已删;现改为工具产物驱动,这才是真实会话里走得到的路径。
  */
-import { BookOpen, Check, Copy, Download, TriangleAlert } from 'lucide-react'
-import { useState } from 'react'
+import { BookOpen, Check, Copy, Download, FileSearch, TriangleAlert } from 'lucide-react'
+import { Component, type ReactNode, Suspense, lazy, useState } from 'react'
 import type {
   Claim,
   EvidenceManifest,
@@ -20,6 +20,26 @@ import type {
 import { exportLibrary } from '../../lib/research/cite'
 import { cn } from '../../lib/utils'
 import { Badge, Button } from '../ui'
+
+function createLazyCitationSpanDrawer() {
+  return lazy(() =>
+    import('../research/CitationSpanDrawer').catch((err) => {
+      LazyCitationSpanDrawer = createLazyCitationSpanDrawer()
+      throw err
+    }),
+  )
+}
+let LazyCitationSpanDrawer = createLazyCitationSpanDrawer()
+
+class CitationDrawerBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+  state = { failed: false }
+  static getDerivedStateFromError() {
+    return { failed: true }
+  }
+  render() {
+    return this.state.failed ? null : this.props.children
+  }
+}
 
 export function CoverageBadge({ coverage }: { coverage: EvidenceManifest['coverage'] }) {
   const { verifiedClaims, totalClaims } = coverage
@@ -63,6 +83,12 @@ export function GatesRow({ manifest }: { manifest: EvidenceManifest }) {
 // ── claim 列表 + EvidencePopover(内联展开) ─────────────────────────
 
 export function ClaimList({ manifest }: { manifest: EvidenceManifest }) {
+  const [traceTarget, setTraceTarget] = useState<{
+    docId: string
+    spanId: string
+    title?: string
+    quote?: string
+  } | null>(null)
   // 每渲染重算(不 useMemo):调用方可能就地 mutate,useMemo 会 stale。
   // 引用顺序编号:sourceId → [N](仅 verified claim 的支撑来源参与)。
   const sourceById = new Map(manifest.sources.map((s) => [s.id, s]))
@@ -77,17 +103,44 @@ export function ClaimList({ manifest }: { manifest: EvidenceManifest }) {
   }
 
   return (
-    <ul className="mt-2 space-y-2">
-      {manifest.claims.map((c) => (
-        <ClaimRow
-          key={c.id}
-          claim={c}
-          refNum={refNum}
-          sourceById={sourceById}
-          quoteById={quoteById}
-        />
-      ))}
-    </ul>
+    <>
+      <ul className="mt-2 space-y-2">
+        {manifest.claims.map((c) => (
+          <ClaimRow
+            key={c.id}
+            claim={c}
+            refNum={refNum}
+            sourceById={sourceById}
+            quoteById={quoteById}
+            onTraceSpan={(quote, source) =>
+              setTraceTarget({
+                docId: quote.docId,
+                spanId: quote.spanId,
+                title: source?.title,
+                quote: quote.text,
+              })
+            }
+          />
+        ))}
+      </ul>
+      {traceTarget && (
+        <CitationDrawerBoundary>
+          <Suspense fallback={null}>
+            <LazyCitationSpanDrawer
+              open
+              onOpenChange={(open) => !open && setTraceTarget(null)}
+              docId={traceTarget.docId}
+              spanId={traceTarget.spanId}
+              fallbackTitle={traceTarget.title}
+              fallbackQuote={traceTarget.quote}
+              onNavigateSpan={(nextSpanId) =>
+                setTraceTarget((prev) => (prev ? { ...prev, spanId: nextSpanId } : null))
+              }
+            />
+          </Suspense>
+        </CitationDrawerBoundary>
+      )}
+    </>
   )
 }
 
@@ -96,11 +149,13 @@ function ClaimRow({
   refNum,
   sourceById,
   quoteById,
+  onTraceSpan,
 }: {
   claim: Claim
   refNum: Map<string, number>
   sourceById: Map<string, SourceRecord>
   quoteById: Map<string, QuoteHandle>
+  onTraceSpan?: (quote: QuoteHandle, source?: SourceRecord) => void
 }) {
   const [open, setOpen] = useState(false)
   const verified = claim.status === 'verified'
@@ -148,7 +203,7 @@ function ClaimRow({
                 const q = quoteById.get(ref.quoteId)
                 if (!q) return null
                 const src = sourceById.get(q.sourceId)
-                return <EvidenceItem key={ref.quoteId} quote={q} source={src} />
+                return <EvidenceItem key={ref.quoteId} quote={q} source={src} onTraceSpan={onTraceSpan} />
               })}
             </div>
           )}
@@ -158,50 +213,71 @@ function ClaimRow({
   )
 }
 
-function EvidenceItem({ quote, source }: { quote: QuoteHandle; source?: SourceRecord }) {
+function EvidenceItem({
+  quote,
+  source,
+  onTraceSpan,
+}: {
+  quote: QuoteHandle
+  source?: SourceRecord
+  onTraceSpan?: (quote: QuoteHandle, source?: SourceRecord) => void
+}) {
   return (
     <div className="text-meta">
       <blockquote className="border-l-2 border-accent/40 pl-2 italic text-muted">
         “{quote.text}”
       </blockquote>
-      {source && (
-        <div className="mt-1 flex flex-wrap items-center gap-1.5 text-caption text-faint">
-          <span className="text-muted">{source.title}</span>
-          {source.authors.length > 0 && (
-            <span>
-              ·{' '}
-              {source.authors
-                .map((a) => a.name)
-                .slice(0, 3)
-                .join(', ')}
-            </span>
-          )}
-          {source.year && <span>· {source.year}</span>}
-          {source.doi ? (
-            <a
-              href={`https://doi.org/${source.doi}`}
-              target="_blank"
-              rel="noreferrer"
-              className="text-accent hover:underline"
-            >
-              DOI:{source.doi}
-            </a>
-          ) : source.identifiersVerified === false ? (
-            <Badge tone="neutral">上传文档</Badge>
-          ) : null}
-          {source.oa?.isOA && source.oa.url && (
-            <a
-              href={source.oa.url}
-              target="_blank"
-              rel="noreferrer"
-              className="text-success hover:underline"
-            >
-              开放获取
-            </a>
-          )}
-          {source.retracted === true && <Badge tone="danger">已撤稿</Badge>}
-        </div>
-      )}
+      <div className="mt-1 flex flex-wrap items-center gap-1.5 text-caption text-faint">
+        {source && (
+          <>
+            <span className="text-muted">{source.title}</span>
+            {source.authors.length > 0 && (
+              <span>
+                ·{' '}
+                {source.authors
+                  .map((a) => a.name)
+                  .slice(0, 3)
+                  .join(', ')}
+              </span>
+            )}
+            {source.year && <span>· {source.year}</span>}
+            {source.doi ? (
+              <a
+                href={`https://doi.org/${source.doi}`}
+                target="_blank"
+                rel="noreferrer"
+                className="text-accent hover:underline"
+              >
+                DOI:{source.doi}
+              </a>
+            ) : source.identifiersVerified === false ? (
+              <Badge tone="neutral">上传文档</Badge>
+            ) : null}
+            {source.oa?.isOA && source.oa.url && (
+              <a
+                href={source.oa.url}
+                target="_blank"
+                rel="noreferrer"
+                className="text-success hover:underline"
+              >
+                开放获取
+              </a>
+            )}
+            {source.retracted === true && <Badge tone="danger">已撤稿</Badge>}
+          </>
+        )}
+        {onTraceSpan && quote.docId && quote.spanId && (
+          <button
+            type="button"
+            data-testid={`evidence-trace-span-${quote.spanId}`}
+            onClick={() => onTraceSpan(quote, source)}
+            className="ml-auto inline-flex items-center gap-1 rounded-md bg-accent-soft px-1.5 py-0.5 text-caption font-medium text-accent transition-colors hover:bg-accent/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <FileSearch size={11} aria-hidden />
+            原文溯源
+          </button>
+        )}
+      </div>
     </div>
   )
 }

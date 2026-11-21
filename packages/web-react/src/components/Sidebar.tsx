@@ -22,7 +22,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import { archivedExpandedStorageKey } from "../hooks/useChatProjects";
-import { useProjectScope } from "../hooks/useProjectScope";
+import { useOptionalAuth, useProjectScope } from "../hooks/useProjectScope";
 import { SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN } from "../hooks/useSidebarWidth";
 import type { Theme } from "../hooks/useTheme";
 import { BRAND } from "../lib/brand";
@@ -69,7 +69,7 @@ import { AtelierIcon } from "./ui/AtelierIcons";
 
 /** 多选批量条只在进入多选后出现，懒加载，不进首屏（UI-1 用它抵掉本片首屏增量）。 */
 const BatchBar = lazy(() => import("./sidebar/BatchBar").then((m) => ({ default: m.BatchBar })));
-/** 活态指挥条只在存在待拍板/运行中/未读完成会话时按需懒加载，不进首屏静态闭包。 */
+/** 活态指挥条（含统一「待拍板」聚合区）按需懒加载，不进首屏静态闭包。 */
 const SidebarLiveActivityStrip = lazy(() =>
   import("./sidebar/LiveActivityStrip").then((m) => ({ default: m.SidebarLiveActivityStrip })),
 );
@@ -263,6 +263,8 @@ export type SidebarProps = {
   swarmSessionIds?: ReadonlySet<string>;
   /** 可选：是否展示侧栏顶部活态指挥区；默认 true（无活态项时自动零占位折叠）。 */
   showLiveActivityStrip?: boolean;
+  /** 可选：从待拍板聚合区一键直达实时浏览器接管视口。 */
+  onOpenLiveBrowser?: (opts?: { url?: string; sessionId?: string | null }) => void;
 };
 
 export function Sidebar({
@@ -338,6 +340,7 @@ export function Sidebar({
   onOpenPalette,
   swarmSessionIds,
   showLiveActivityStrip = true,
+  onOpenLiveBrowser,
 }: SidebarProps) {
   const [q, setQ] = useState("");
   const [now, setNow] = useState(() => Date.now());
@@ -373,6 +376,7 @@ export function Sidebar({
   }, [archivedExpanded]);
   const searching = q.trim().length > 0;
   const projectScope = useProjectScope();
+  const optionalAuth = useOptionalAuth();
   // 全局项目范围(在看板/管理中心选的)也会收窄侧栏搜索:必须看得见,也能一键放开。
   // 放开只对本侧栏搜索生效,范围本身一变就恢复跟随。
   const [ignoreScopeForSearch, setIgnoreScopeForSearch] = useState(false);
@@ -1275,7 +1279,7 @@ export function Sidebar({
         )}
       </div>
 
-      {hasLiveCandidate && (
+      {showLiveActivityStrip && (hasLiveCandidate || Boolean(optionalAuth)) && (
         <Suspense fallback={null}>
           <SidebarLiveActivityStrip
             sessions={activeSessions}
@@ -1287,8 +1291,11 @@ export function Sidebar({
             swarmSessionIds={swarmSessionIds}
             socketVersion={socketVersion}
             activeId={activeId}
+            auth={optionalAuth}
             onSelect={rowActions.select}
             onMarkRead={onMarkRead ? rowActions.markRead : undefined}
+            onOpenBoard={onOpenBoard}
+            onOpenLiveBrowser={onOpenLiveBrowser}
           />
         </Suspense>
       )}

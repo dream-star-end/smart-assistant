@@ -9,7 +9,6 @@ import type { ResolvedIdentity } from '../lib/resolvedIdentity'
 import { useRef, useEffect, useCallback, useState } from "react";
 import { useInbox } from "./useInbox";
 import { githubErrorText } from "../lib/github";
-import { connectorErrorText } from "../lib/connectors";
 import { replaceSearchParams } from "./useAppRoute";
 import { api, apiErrorMessage } from "../lib/api";
 import type { PrefsView } from "../lib/modelPreferences";
@@ -144,9 +143,12 @@ export function useAppDeepLinks({
       touched = true;
     }
     if (sp.has("connector_error")) {
-      toast(`插件连接失败：${connectorErrorText(sp.get("connector_error"))}`, "error");
+      const code = sp.get("connector_error");
       sp.delete("connector_error");
       touched = true;
+      void import("../lib/connectors")
+        .then((m) => toast(`插件连接失败：${m.connectorErrorText(code)}`, "error"))
+        .catch(() => toast("插件连接失败：操作失败，请重试", "error"));
     }
     if (touched) replaceSearchParams(sp);
   }, [demo, toast]);

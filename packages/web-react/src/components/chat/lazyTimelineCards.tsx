@@ -27,6 +27,7 @@ type SwarmViewsModule = typeof import('./SwarmViews')
 type SwarmInlineCardProps = ComponentProps<SwarmViewsModule['SwarmInlineCard']>
 type PinnedSwarmDockProps = ComponentProps<SwarmViewsModule['PinnedSwarmDock']>
 type SwarmBoardDrawerProps = ComponentProps<SwarmViewsModule['SwarmBoardDrawer']>
+type SwarmPlaybookPopoverProps = ComponentProps<SwarmViewsModule['SwarmPlaybookPopover']>
 type PinnedDelegateModule = typeof import('./PinnedDelegateTracker')
 type PinnedDelegateProps = ComponentProps<PinnedDelegateModule['PinnedDelegateTracker']>
 type PinnedTaskModule = typeof import('./PinnedTaskTracker')
@@ -411,6 +412,7 @@ function lazySwarm<K extends keyof SwarmViewsModule>(key: K) {
 let LazySwarmInlineCard = lazySwarm('SwarmInlineCard')
 let LazyPinnedSwarmDock = lazySwarm('PinnedSwarmDock')
 let LazySwarmBoardDrawer = lazySwarm('SwarmBoardDrawer')
+let LazySwarmPlaybookPopover = lazySwarm('SwarmPlaybookPopover')
 const LazyPinnedDelegateTracker = lazy(() =>
   import('./PinnedDelegateTracker').then((m) => ({ default: m.PinnedDelegateTracker })),
 )
@@ -484,6 +486,19 @@ export function SwarmBoardDrawer(props: SwarmBoardDrawerProps) {
       renderChildren={() => (
         <Suspense fallback={null}>
           <LazySwarmBoardDrawer {...props} />
+        </Suspense>
+      )}
+    />
+  )
+}
+
+export function SwarmPlaybookPopoverLazy(props: SwarmPlaybookPopoverProps) {
+  return (
+    <SwarmLazyErrorBoundary
+      onRebuild={() => { if (!loadedSwarm) LazySwarmPlaybookPopover = lazySwarm('SwarmPlaybookPopover') }}
+      renderChildren={() => (
+        <Suspense fallback={null}>
+          <LazySwarmPlaybookPopover {...props} />
         </Suspense>
       )}
     />

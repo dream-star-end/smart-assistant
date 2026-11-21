@@ -5,7 +5,9 @@ import {
   requestDesktopNotifyToggle,
   subscribeDesktopNotifyState,
 } from "../../lib/desktopNotifyPref";
+import type { AuthSession } from "../../lib/types";
 import { StatusPill } from "../ui";
+import { PendingDecisionsDock } from "./PendingDecisionsDock";
 import {
   type CollectLiveActivityInput,
   LIVE_ACTIVITY_BUCKETS,
@@ -238,13 +240,19 @@ export function SidebarLiveActivityStrip({
   swarmSessionIds,
   socketVersion,
   activeId,
+  auth,
   onSelect,
   onMarkRead,
+  onOpenBoard,
+  onOpenLiveBrowser,
 }: CollectLiveActivityInput & {
   socketVersion?: number;
   activeId?: string;
+  auth?: AuthSession | null;
   onSelect: (sessionId: string) => void;
   onMarkRead?: (sessionId: string) => void;
+  onOpenBoard?: () => void;
+  onOpenLiveBrowser?: (opts?: { url?: string; sessionId?: string | null }) => void;
 }) {
   const summary = useMemo(() => {
     void socketVersion;
@@ -270,11 +278,22 @@ export function SidebarLiveActivityStrip({
   ]);
 
   return (
-    <LiveActivityStrip
-      summary={summary}
-      activeId={activeId}
-      onSelect={onSelect}
-      onMarkRead={onMarkRead}
-    />
+    <>
+      {auth && (
+        <PendingDecisionsDock
+          auth={auth}
+          socketVersion={socketVersion}
+          onSelectSession={onSelect}
+          onOpenBoard={onOpenBoard}
+          onOpenLiveBrowser={onOpenLiveBrowser}
+        />
+      )}
+      <LiveActivityStrip
+        summary={summary}
+        activeId={activeId}
+        onSelect={onSelect}
+        onMarkRead={onMarkRead}
+      />
+    </>
   );
 }
