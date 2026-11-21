@@ -31,8 +31,8 @@ export function Tooltip({
           side={side}
           sideOffset={sideOffset}
           className={cn(
-            "z-50 max-w-xs select-none rounded-md bg-primary px-2.5 py-1.5 text-xs font-medium text-primary-fg shadow-pop",
-            "data-[state=delayed-open]:animate-fade",
+            "oc-tooltip-card z-50 max-w-xs select-none rounded-md px-2.5 py-1.5 text-meta font-medium leading-snug",
+            "data-[state=delayed-open]:animate-pop data-[state=instant-open]:animate-pop",
           )}
         >
           {content}

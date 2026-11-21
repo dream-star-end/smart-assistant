@@ -37,13 +37,18 @@ export function CostMark({
   const label = modelCostLabel(model, multiplier)
   if (!label) return null
   return (
-    <span className={cn('text-caption font-normal tabular-nums text-faint', className)}>
+    <span
+      className={cn(
+        'rounded-xs bg-hover/70 px-1.5 py-px text-caption font-normal tabular-nums text-faint',
+        className,
+      )}
+    >
       {label}
     </span>
   )
 }
 
-/** 底部参数坞 / 双栏右栏 / 矮屏 Tab 共用的横向分段胶囊按钮：触屏维持 ≥44px。 */
+/** 底部参数坞 / 双栏右栏 / 矮屏 Tab 共用的横向分段滑块按钮：置于 .oc-surface-recessed 轨道内，触屏维持 ≥44px。 */
 export function SegmentPill({
   active,
   disabled,
@@ -74,15 +79,15 @@ export function SegmentPill({
       title={title}
       onClick={onClick}
       className={cn(
-        'inline-flex min-h-8 flex-1 items-center justify-center gap-1 whitespace-nowrap rounded-lg border px-2 py-1 text-caption font-medium outline-none transition-colors',
+        'oc-btn-tactile inline-flex min-h-8 flex-1 items-center justify-center gap-1 whitespace-nowrap rounded-sm px-2.5 py-1 text-caption font-medium outline-none',
         'focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-45 [@media(hover:none)]:min-h-11',
         active
-          ? 'border-accent/45 bg-accent-soft text-accent'
-          : 'border-transparent bg-hover/60 text-muted hover:bg-hover hover:text-fg',
+          ? 'oc-segmented-thumb font-semibold text-accent ring-1 ring-inset ring-accent/30'
+          : 'bg-transparent text-muted hover:bg-hover/70 hover:text-fg',
       )}
       {...rest}
     >
-      {active && <Check size={12} className="shrink-0 text-accent" aria-hidden />}
+      {active && <Check size={12} strokeWidth={2.25} className="shrink-0 text-accent" aria-hidden />}
       {children}
     </button>
   )
@@ -100,12 +105,12 @@ function SectionHeading({
   return (
     <div
       className={cn(
-        'flex items-center justify-between gap-2 px-1 text-xs font-medium text-faint',
+        'flex items-center justify-between gap-2 px-1 text-caption font-semibold tracking-wide text-faint',
         compact ? 'pb-1' : 'pb-1.5',
       )}
     >
       <span>{title}</span>
-      <span className="shrink-0 whitespace-nowrap text-caption font-normal tabular-nums text-faint">
+      <span className="shrink-0 whitespace-nowrap rounded-xs bg-hover/65 px-1.5 py-px text-caption font-medium tabular-nums text-muted">
         {summary}
       </span>
     </div>
@@ -228,20 +233,20 @@ export function ModelSelectorExtras({
       {layout === 'column' && (
         <div
           data-testid="model-picker-extras-summary"
-          className="shrink-0 border-b border-border/60 px-3 py-2"
+          className="shrink-0 border-b border-border/70 px-3 py-2.5"
         >
           <div className="flex items-center justify-between gap-2">
-            <span className="text-xs font-medium text-faint">执行参数</span>
+            <span className="text-caption font-semibold tracking-wider text-faint">执行参数</span>
             {activeCostLabel && (
               <span
                 data-testid="model-picker-active-cost"
-                className="rounded-full bg-accent-soft px-2 py-0.5 text-caption font-semibold tabular-nums text-accent"
+                className="oc-badge-craft rounded-full bg-accent-soft px-2 py-0.5 text-caption font-semibold tabular-nums text-accent"
               >
                 {activeCostLabel}
               </span>
             )}
           </div>
-          <p className="mt-0.5 truncate text-meta font-medium text-fg">
+          <p className="mt-1 truncate text-meta font-semibold text-fg">
             {label}
             {tierLabel ? <span className="font-normal text-muted"> · {tierLabel}</span> : null}
           </p>
@@ -251,16 +256,16 @@ export function ModelSelectorExtras({
       <div
         className={cn(
           layout === 'column'
-            ? 'min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain p-2.5'
+            ? 'min-h-0 flex-1 space-y-3.5 overflow-y-auto overscroll-contain p-3'
             : compact
-              ? 'space-y-1.5'
-              : 'space-y-2.5',
+              ? 'space-y-2'
+              : 'space-y-3',
         )}
       >
         {showCursorFast && selectedCursor && (
           <div>
             <SectionHeading title="速度" summary={speedSummary} compact={compact} />
-            <div role="group" aria-label="速度档位" className="flex flex-wrap gap-1">
+            <div role="group" aria-label="速度档位" className="oc-surface-recessed flex flex-wrap gap-1 rounded-md p-1">
               <SegmentPill
                 data-fast="false"
                 active={!selectedCursor.fast}
@@ -286,7 +291,7 @@ export function ModelSelectorExtras({
         {showGrokFast && (
           <div>
             <SectionHeading title="速度" summary={speedSummary} compact={compact} />
-            <div role="group" aria-label="速度档位" className="flex flex-wrap gap-1">
+            <div role="group" aria-label="速度档位" className="oc-surface-recessed flex flex-wrap gap-1 rounded-md p-1">
               <SegmentPill
                 data-fast="false"
                 active={!grokBuildFastSelected(selectedId)}
@@ -310,7 +315,7 @@ export function ModelSelectorExtras({
         {showServiceTiers && onSelectServiceTier && (
           <div>
             <SectionHeading title="速度" summary={speedSummary} compact={compact} />
-            <div role="group" aria-label="速度档位" className="flex flex-wrap gap-1">
+            <div role="group" aria-label="速度档位" className="oc-surface-recessed flex flex-wrap gap-1 rounded-md p-1">
               <SegmentPill
                 data-gpt-fast="false"
                 data-service-tier="standard"
@@ -364,7 +369,7 @@ export function ModelSelectorExtras({
               summary={activeCursorContextTier === '1m' ? '1M' : '300k'}
               compact={compact}
             />
-            <div role="group" aria-label="上下文长度" className="flex flex-wrap gap-1">
+            <div role="group" aria-label="上下文长度" className="oc-surface-recessed flex flex-wrap gap-1 rounded-md p-1">
               <SegmentPill
                 data-cursor-context="300k"
                 active={activeCursorContextTier === '300k'}
@@ -397,7 +402,7 @@ export function ModelSelectorExtras({
               summary={selectedId === selectedContext.longId ? '1M' : '标准'}
               compact={compact}
             />
-            <div role="group" aria-label="上下文长度" className="flex flex-wrap gap-1">
+            <div role="group" aria-label="上下文长度" className="oc-surface-recessed flex flex-wrap gap-1 rounded-md p-1">
               <SegmentPill
                 data-context="standard"
                 active={selectedId === selectedContext.standardId}
@@ -435,7 +440,7 @@ export function ModelSelectorExtras({
               }
               compact={compact}
             />
-            <div role="group" aria-label="思考档位" className="flex flex-wrap gap-1">
+            <div role="group" aria-label="思考档位" className="oc-surface-recessed flex flex-wrap gap-1 rounded-md p-1">
               {EFFORT_OPTIONS.filter((o) => cursorEfforts.includes(o.value)).map((o) => (
                 <SegmentPill
                   key={o.value}
@@ -468,7 +473,7 @@ export function ModelSelectorExtras({
                 较低档偏重响应速度，较高档偏重复杂任务。
               </p>
             )}
-            <div role="group" aria-label="思考档位" className="flex flex-wrap gap-1">
+            <div role="group" aria-label="思考档位" className="oc-surface-recessed flex flex-wrap gap-1 rounded-md p-1">
               <SegmentPill
                 data-effort="follow"
                 active={effortActive == null}

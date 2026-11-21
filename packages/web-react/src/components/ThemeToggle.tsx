@@ -51,10 +51,21 @@ export function ThemeToggle({
       aria-label={ariaLabel}
       shape="square"
       {...(compact
-        ? { size: "sm" as const, variant: "muted" as const, className: "rounded-xs" }
-        : {})}
+        ? {
+            size: "sm" as const,
+            variant: "muted" as const,
+            className: "group oc-btn-tactile rounded-sm hover:text-fg",
+          }
+        : {
+            className:
+              "group oc-btn-tactile oc-btn-secondary-craft rounded-md text-muted hover:text-fg",
+          })}
     >
-      <Icon size={compact ? 16 : 18} />
+      <Icon
+        size={compact ? 15 : 17}
+        strokeWidth={1.75}
+        className="transition-transform duration-200 ease-spring group-hover:scale-110 group-hover:-rotate-12"
+      />
     </IconButton>
   );
 }

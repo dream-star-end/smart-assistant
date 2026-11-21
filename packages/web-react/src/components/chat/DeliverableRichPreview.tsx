@@ -235,7 +235,7 @@ function SpreadsheetView({
             placeholder="筛选表格行…"
             aria-label="筛选表格内容"
             data-testid="spreadsheet-filter"
-            className="h-8 w-full rounded-md border border-border-control bg-surface pr-2.5 pl-8 text-base text-fg outline-none placeholder:text-faint focus:border-accent focus:ring-2 focus:ring-ring/25 md:text-sm"
+            className="oc-field-control h-8 w-full rounded-lg pr-2.5 pl-8 text-base text-fg outline-none placeholder:text-faint md:text-sm"
           />
         </label>
         <span className="text-caption tabular-nums text-muted" data-testid="spreadsheet-counts">

@@ -237,7 +237,9 @@ export default function LiveAgentCapsule({
               data-running={isRunning ? "true" : "false"}
               className="oc-live-capsule-dot"
             />
-            <PrimaryIcon size={13} strokeWidth={2.1} aria-hidden className="oc-live-capsule-icon" />
+            <span className="oc-icon-badge oc-icon-badge-accent flex size-5 shrink-0 items-center justify-center rounded-full">
+              <PrimaryIcon size={11} strokeWidth={1.85} aria-hidden className="oc-live-capsule-icon" />
+            </span>
             <span className="oc-live-capsule-label">{label}</span>
             {detail && <span className="oc-live-capsule-detail">{detail}</span>}
             {timer && (

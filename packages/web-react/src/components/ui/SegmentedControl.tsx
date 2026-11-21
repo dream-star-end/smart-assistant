@@ -21,11 +21,11 @@ export interface SegmentedOption<V extends string = string> {
  * 选项多时可横滑而不撑破父级。字号走 text-meta / text-body 语义档,不写任意值。
  */
 const groupClass =
-  "no-scrollbar inline-flex max-w-full items-center gap-0.5 overflow-x-auto overscroll-x-contain rounded-full bg-hover p-0.5";
+  "oc-surface-recessed no-scrollbar inline-flex max-w-full items-center gap-0.5 overflow-x-auto overscroll-x-contain rounded-full p-0.5";
 
 const itemVariants = cva(
   // 触屏命中高与 Button / IconButton / Chip 同一标准 44px(a11y 走查 shell#9:此前 min-h-9 = 36px)。
-  "inline-flex shrink-0 items-center justify-center whitespace-nowrap rounded-full font-medium outline-none transition-colors duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg disabled:cursor-not-allowed disabled:opacity-50 [@media(hover:none)]:min-h-11",
+  "inline-flex shrink-0 items-center justify-center whitespace-nowrap rounded-full font-medium outline-none transition-[background-color,color,box-shadow] duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg disabled:cursor-not-allowed disabled:opacity-50 [@media(hover:none)]:min-h-11",
   {
     variants: {
       size: {
@@ -33,7 +33,7 @@ const itemVariants = cva(
         sm: "px-2.5 py-0.5 text-meta",
       },
       checked: {
-        true: "bg-surface text-fg shadow-soft",
+        true: "oc-segmented-thumb text-fg",
         false: "text-muted hover:text-fg",
       },
     },

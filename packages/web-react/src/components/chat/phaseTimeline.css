@@ -29,9 +29,9 @@
   align-items: center;
   gap: 0.25rem;
   height: 1.5rem;
-  padding: 0 0.3125rem;
-  border-radius: var(--radius-xs);
-  border: 0;
+  padding: 0 0.4375rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
   background: transparent;
   color: var(--faint);
   font-size: var(--text-caption);
@@ -41,12 +41,21 @@
   white-space: nowrap;
   cursor: pointer;
   outline: none;
-  transition: background-color 150ms var(--ease-standard), color 150ms var(--ease-standard);
+  transition:
+    background-color 150ms var(--ease-standard),
+    border-color 150ms var(--ease-standard),
+    color 150ms var(--ease-standard),
+    transform 120ms var(--ease-standard);
 }
 
 .oc-phase-crumb:hover {
-  background: var(--hover);
+  background: color-mix(in srgb, var(--surface) 75%, var(--hover));
+  border-color: color-mix(in srgb, var(--fg) 8%, transparent);
   color: var(--fg);
+}
+
+.oc-phase-crumb:active {
+  transform: scale(0.975);
 }
 
 .oc-phase-crumb:focus-visible {
@@ -61,6 +70,8 @@
 }
 
 .oc-phase-crumb[aria-pressed="true"] {
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 28%, transparent);
   color: var(--accent);
   font-weight: 600;
 }
@@ -71,8 +82,8 @@
   align-items: center;
   gap: 0.25rem;
   height: 1.75rem;
-  padding: 0 0.5rem;
-  border-radius: var(--radius-xs);
+  padding: 0 0.5625rem;
+  border-radius: var(--radius-sm);
   border: 1px solid transparent;
   background: transparent;
   color: var(--muted);
@@ -86,12 +97,19 @@
   transition:
     background-color 150ms var(--ease-standard),
     border-color 150ms var(--ease-standard),
-    color 150ms var(--ease-standard);
+    color 150ms var(--ease-standard),
+    box-shadow 150ms var(--ease-standard),
+    transform 120ms var(--ease-standard);
 }
 
 .oc-phase-pill:hover {
-  background: var(--hover);
+  background: color-mix(in srgb, var(--surface) 80%, var(--hover));
+  border-color: color-mix(in srgb, var(--fg) 8%, transparent);
   color: var(--fg);
+}
+
+.oc-phase-pill:active {
+  transform: scale(0.975);
 }
 
 .oc-phase-pill:focus-visible {
@@ -109,11 +127,13 @@
 
 /* 用户当前选中的筛选 Tab：唯一高对比清晰选中态，杜绝与运行中阶段双高亮。 */
 .oc-phase-pill[aria-pressed="true"] {
-  background: var(--accent-soft);
-  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  background: color-mix(in srgb, var(--accent) 11%, var(--surface));
+  border-color: color-mix(in srgb, var(--accent) 34%, transparent);
   color: var(--accent);
   font-weight: 600;
-  box-shadow: 0 1px 2px color-mix(in srgb, var(--fg) 4%, transparent);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--surface) 70%, transparent),
+    0 1px 3px color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
 .oc-phase-active-dot {

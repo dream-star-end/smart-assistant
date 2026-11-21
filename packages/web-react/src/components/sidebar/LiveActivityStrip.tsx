@@ -140,7 +140,7 @@ export function LiveActivityStrip({
             }}
             className="oc-live-strip-toggle oc-live-strip-notify"
           >
-            {notifyActive ? <Bell size={13} aria-hidden /> : <BellOff size={13} aria-hidden />}
+            {notifyActive ? <Bell size={13} strokeWidth={1.75} aria-hidden /> : <BellOff size={13} strokeWidth={1.75} aria-hidden />}
           </button>
         )}
         <button
@@ -152,7 +152,7 @@ export function LiveActivityStrip({
           onClick={() => setCollapsed((v) => !v)}
           className="oc-live-strip-toggle"
         >
-          {collapsed ? <ChevronRight size={14} aria-hidden /> : <ChevronDown size={14} aria-hidden />}
+          {collapsed ? <ChevronRight size={14} strokeWidth={1.75} aria-hidden /> : <ChevronDown size={14} strokeWidth={1.75} aria-hidden />}
         </button>
       </div>
 

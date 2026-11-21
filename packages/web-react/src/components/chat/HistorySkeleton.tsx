@@ -53,19 +53,21 @@ export function shouldShowHistorySkeleton(p: {
 /** 单条骨架气泡：左（助手正文）/右（用户）交替形态，不再留头像列。 */
 function SkeletonBubble({ side }: { side: "left" | "right" }) {
   if (side === "right") {
-    // 用户消息：右对齐，单块圆角气泡。
+    // 用户消息：右对齐，精致圆角气泡骨架。
     return (
       <div className="flex justify-end">
-        <Skeleton className="h-10 w-1/2 max-w-[280px] rounded-2xl" />
+        <div className="w-1/2 max-w-[280px] rounded-2xl rounded-br-sm border border-border/60 bg-bubble/65 px-4 py-3">
+          <Skeleton className="h-3.5 w-4/5 rounded-md" />
+        </div>
       </div>
     );
   }
   return (
-    <div className="min-w-0">
-      <div className="min-w-0 space-y-2">
-        <Skeleton className="h-4 w-4/5" />
-        <Skeleton className="h-4 w-full" />
-        <Skeleton className="h-4 w-2/3" />
+    <div className="min-w-0 py-1">
+      <div className="min-w-0 space-y-2.5">
+        <Skeleton className="h-3.5 w-4/5 rounded-md" />
+        <Skeleton className="h-3.5 w-full rounded-md" />
+        <Skeleton className="h-3.5 w-2/3 rounded-md" />
       </div>
     </div>
   );
@@ -85,7 +87,7 @@ export function MessageListSkeleton({
 } = {}) {
   return (
     <div
-      className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8"
+      className="mx-auto flex max-w-3xl flex-col gap-5 px-5 py-8"
       aria-busy="true"
       aria-label="正在加载会话历史"
     >
@@ -95,14 +97,14 @@ export function MessageListSkeleton({
       {slow && onRetry && (
         <output
           data-testid="history-skeleton-slow-retry"
-          className="mt-2 flex items-center justify-between gap-3 rounded-xl border border-border/70 bg-surface/80 px-3.5 py-2 text-xs text-muted"
+          className="oc-surface-glass mt-2 flex items-center justify-between gap-3 rounded-xl px-4 py-2.5 text-caption text-muted animate-in"
           aria-live="polite"
         >
           <span>加载较慢，网络可能存在波动</span>
           <button
             type="button"
             onClick={onRetry}
-            className="shrink-0 rounded-full bg-hover px-3 py-1 font-medium text-fg transition-colors hover:text-accent [@media(hover:none)]:min-h-11"
+            className="oc-btn-tactile oc-btn-secondary-craft shrink-0 rounded-full border border-border bg-surface px-3 py-1 font-medium text-fg transition-colors hover:border-border-strong hover:text-accent [@media(hover:none)]:min-h-11"
           >
             重试
           </button>
@@ -116,16 +118,16 @@ export function MessageListSkeleton({
 export function PartialHistorySkeleton() {
   return (
     <output
-      className="py-1 text-muted"
+      className="py-1.5 text-muted"
       aria-label="正在加载会话内容"
       aria-live="polite"
       aria-busy="true"
       data-testid="partial-history-skeleton"
     >
       <div className="min-w-0 flex-1 space-y-2">
-        <span className="block text-xs">正在加载会话内容…</span>
-        <Skeleton className="h-4 w-4/5" />
-        <Skeleton className="h-4 w-2/3" />
+        <span className="block text-caption text-faint">正在加载会话内容…</span>
+        <Skeleton className="h-3.5 w-4/5 rounded-md" />
+        <Skeleton className="h-3.5 w-2/3 rounded-md" />
       </div>
     </output>
   );
@@ -135,16 +137,16 @@ export function PartialHistorySkeleton() {
 export function JournalHydrationRetry({ onRetry }: { onRetry: () => void }) {
   return (
     <output
-      className="flex items-center justify-between gap-3 py-2 text-muted"
+      className="oc-callout oc-callout-info flex items-center justify-between gap-3 rounded-xl px-3.5 py-2.5 text-muted"
       aria-label="实时内容未完全加载"
       data-testid="journal-hydration-retry"
     >
-      <span className="min-w-0 text-xs">实时内容未完全加载，已显示已有记录。</span>
+      <span className="min-w-0 text-caption">实时内容未完全加载，已显示已有记录。</span>
       {/* text-foreground 不是本仓 token(会回落到父级 text-muted,与说明文字同色):改 text-fg +
           常显下划线,让动作按钮看得出是可点的;触屏下加高到 44px。 */}
       <button
         type="button"
-        className="shrink-0 text-xs font-medium text-fg underline underline-offset-2 hover:text-accent [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-2"
+        className="oc-btn-tactile shrink-0 rounded-md px-2 py-0.5 text-caption font-medium text-fg underline underline-offset-2 transition-colors hover:text-accent [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-2"
         onClick={onRetry}
       >
         继续

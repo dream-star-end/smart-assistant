@@ -157,14 +157,12 @@ describe("Composer 语音不可用原因", () => {
 });
 
 describe("Composer 控件边框 token", () => {
-  test("外壳非聚焦用 border-border-control，聚焦用 border-border-strong，不用分隔线 border-border", () => {
+  test("外壳使用悬浮输入坞工艺类 oc-composer-dock，不用浮层 --shadow-float 或分隔线 border-border", () => {
     render(<Composer onSend={() => {}} />);
-    // OCV5-295:用稳定 testid 取外壳,不再拿圆角类当选择器;外壳改轻阴影,不再用浮层 --shadow-float。
+    // OCV5-822:外壳收敛为共享材质类 oc-composer-dock（内含双层景深、发丝高光与 focus-within 暖光晕）。
     const shell = screen.getByTestId("composer-shell");
-    expect(shell.className).toContain("shadow-[var(--shadow-soft)]");
+    expect(shell.className).toContain("oc-composer-dock");
     expect(shell.className).not.toContain("--shadow-float");
-    expect(shell?.className).toContain("border-border-control");
-    expect(shell?.className).toContain("focus-within:border-border-strong");
     expect(shell?.className).not.toMatch(/(?:^|\s)border-border(?:\s|$)/);
   });
 });

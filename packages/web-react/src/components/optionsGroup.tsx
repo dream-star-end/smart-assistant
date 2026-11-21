@@ -203,11 +203,15 @@ export function OptionsGroupFooter() {
         ? `未答的 ${unanswered} 题会标为「未答」一并发出`
         : null;
   return (
-    <div className="mt-2 flex flex-col gap-2 rounded-xl border border-border bg-surface px-3.5 py-2.5">
-      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5">
+    <div className="oc-surface-card mt-2.5 flex flex-col gap-2.5 rounded-2xl px-4 py-3">
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
         {/* 计数走 live region:读屏用户点选后能听到进度,而不是只看得见。 */}
         <output aria-live="polite" className="min-w-0 text-meta text-muted">
-          已作答 <span className="font-medium text-fg">{snap.answered}</span> / {snap.count} 题
+          已作答{" "}
+          <span className="inline-flex items-center rounded-md bg-accent-soft px-1.5 py-0.5 font-mono text-caption font-semibold tabular-nums text-accent">
+            {snap.answered} / {snap.count}
+          </span>{" "}
+          题
           {hint ? <span className="text-faint"> —— {hint}</span> : null}
         </output>
         <div className="flex shrink-0 items-center gap-2">
@@ -216,7 +220,7 @@ export function OptionsGroupFooter() {
             aria-expanded={noteOpen}
             disabled={blockedByBusy}
             onClick={() => setNoteOpen((v) => !v)}
-            className="text-caption font-medium text-muted transition-colors hover:text-fg disabled:opacity-40 [@media(hover:none)]:min-h-11"
+            className="oc-btn-tactile rounded-md px-2 py-1 text-caption font-medium text-muted transition-colors hover:bg-hover hover:text-fg disabled:opacity-40 [@media(hover:none)]:min-h-11"
           >
             {noteOpen ? "收起补充说明" : "补充说明"}
           </button>
@@ -224,6 +228,7 @@ export function OptionsGroupFooter() {
             type="button"
             variant="accent"
             size="sm"
+            className="oc-btn-tactile oc-btn-accent-craft"
             disabled={!ready || blockedByBusy}
             title={blockedByBusy ? "等待当前回合结束后可发送" : undefined}
             onClick={() => {
@@ -244,7 +249,7 @@ export function OptionsGroupFooter() {
           disabled={blockedByBusy}
           onChange={(e) => setGroupNote(e.target.value)}
           placeholder="选填：输入统一补充要求，随选择一并发出"
-          className="w-full rounded-lg border border-border bg-elevated px-2.5 py-1.5 text-meta text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="oc-surface-recessed w-full rounded-lg border border-border-control/70 bg-elevated px-3 py-1.5 text-base text-fg outline-none transition-[border-color,box-shadow] focus:border-accent focus-visible:ring-2 focus-visible:ring-ring md:text-meta"
         />
       )}
     </div>

@@ -13,7 +13,7 @@ import {
   serviceTierBillingMultiplierNumber,
   supportedServiceTiers,
 } from '@openclaude/protocol/browser'
-import { AlertTriangle, Check, ChevronDown, ChevronRight, Lock } from 'lucide-react'
+import { AlertTriangle, Check, ChevronDown, ChevronRight, Cpu, Lock, Sparkles } from 'lucide-react'
 import { type ReactNode, useEffect, useState } from 'react'
 import {
   GROK_BUILD_FAST_MODEL_ID,
@@ -357,6 +357,35 @@ export function ModelSelectorPanel({
   }
 
   const renderRow = (row: (typeof rows)[number], keyPrefix = '') => {
+    const rowBadge = (active: boolean, locked = false) => (
+      <span
+        aria-hidden
+        className={cn(
+          'oc-icon-badge size-6 rounded-xs',
+          active && !locked && 'oc-icon-badge-accent',
+          locked && 'opacity-75',
+        )}
+      >
+        {locked ? (
+          <Lock size={12} strokeWidth={1.75} />
+        ) : active ? (
+          <Sparkles size={12} strokeWidth={1.75} />
+        ) : (
+          <Cpu size={12} strokeWidth={1.75} />
+        )}
+      </span>
+    )
+    const activeRowCls =
+      'bg-accent-soft/75 font-medium text-fg ring-1 ring-inset ring-accent/25'
+    const checkMark = (
+      <span
+        aria-hidden
+        className="flex size-5 shrink-0 items-center justify-center rounded-full bg-accent-soft text-accent ring-1 ring-inset ring-accent/25"
+      >
+        <Check size={12} strokeWidth={2.25} />
+      </span>
+    )
+
     if (row.kind === 'plain') {
       const m = row.model
       const active = m.id === selectedId
@@ -368,14 +397,17 @@ export function ModelSelectorPanel({
           data-model-id={m.id}
           disabled={degraded}
           onSelect={degraded ? undefined : () => rememberAndSelect(m.id)}
-          className="justify-between"
+          className={cn('justify-between gap-2 rounded-sm', active && !degraded && activeRowCls)}
         >
-          <span className="truncate">{modelLabel(m)}</span>
+          <span className="flex min-w-0 items-center gap-2">
+            {rowBadge(active && !degraded)}
+            <span className="truncate">{modelLabel(m)}</span>
+          </span>
           <span className="flex shrink-0 items-center gap-1.5">
             <CostMark model={m} />
             <PromoBadge label={promoLabelOf(m)} />
             {degraded && <Badge tone="danger">暂不可用</Badge>}
-            {active && !degraded && <Check size={14} className="shrink-0 text-accent" />}
+            {active && !degraded && checkMark}
           </span>
         </PickerItem>
       )
@@ -401,14 +433,17 @@ export function ModelSelectorPanel({
                   void selectContext(row.row.spec, row.row.members)
                 }
           }
-          className="justify-between"
+          className={cn('justify-between gap-2 rounded-sm', familyActive && !degraded && activeRowCls)}
         >
-          <span className="truncate">{row.row.label}</span>
+          <span className="flex min-w-0 items-center gap-2">
+            {rowBadge(familyActive && !degraded)}
+            <span className="truncate">{row.row.label}</span>
+          </span>
           <span className="flex shrink-0 items-center gap-1.5">
             <CostMark model={representativeModel} />
             <PromoBadge label={promoLabelOf(representativeModel)} />
             {degraded && <Badge tone="danger">暂不可用</Badge>}
-            {familyActive && !degraded && <Check size={14} className="shrink-0 text-accent" />}
+            {familyActive && !degraded && checkMark}
           </span>
         </PickerItem>
       )
@@ -431,10 +466,10 @@ export function ModelSelectorPanel({
             })
             onOpenChange(false)
           }}
-          className="justify-between text-muted"
+          className="justify-between gap-2 rounded-sm text-muted"
         >
-          <span className="flex min-w-0 items-center gap-1.5">
-            <Lock size={14} className="shrink-0" aria-hidden />
+          <span className="flex min-w-0 items-center gap-2">
+            {rowBadge(false, true)}
             <span className="truncate">{labelText}</span>
             <span className="sr-only">（需升级解锁）</span>
           </span>
@@ -467,14 +502,17 @@ export function ModelSelectorPanel({
                   if (representative) rememberAndSelect(representative)
                 }
           }
-          className="justify-between"
+          className={cn('justify-between gap-2 rounded-sm', familyActive && !degraded && activeRowCls)}
         >
-          <span className="truncate">{row.row.label}</span>
+          <span className="flex min-w-0 items-center gap-2">
+            {rowBadge(familyActive && !degraded)}
+            <span className="truncate">{row.row.label}</span>
+          </span>
           <span className="flex shrink-0 items-center gap-1.5">
             <CostMark model={representativeModel} />
             <PromoBadge label={promoLabelOf(representativeModel)} />
             {degraded && <Badge tone="danger">暂不可用</Badge>}
-            {familyActive && !degraded && <Check size={14} className="shrink-0 text-accent" />}
+            {familyActive && !degraded && checkMark}
           </span>
         </PickerItem>
       )
@@ -496,10 +534,10 @@ export function ModelSelectorPanel({
             })
             onOpenChange(false)
           }}
-          className="justify-between text-muted"
+          className="justify-between gap-2 rounded-sm text-muted"
         >
-          <span className="flex min-w-0 items-center gap-1.5">
-            <Lock size={14} className="shrink-0" aria-hidden />
+          <span className="flex min-w-0 items-center gap-2">
+            {rowBadge(false, true)}
             <span className="truncate">{row.row.label}</span>
             <span className="sr-only">（需升级解锁）</span>
           </span>
@@ -524,14 +562,17 @@ export function ModelSelectorPanel({
         data-cursor-family={row.row.family}
         disabled={degraded}
         onSelect={degraded ? undefined : () => selectCursor(row.row.family, row.row.members)}
-        className="justify-between"
+        className={cn('justify-between gap-2 rounded-sm', familyActive && !degraded && activeRowCls)}
       >
-        <span className="truncate">{row.row.label}</span>
+        <span className="flex min-w-0 items-center gap-2">
+          {rowBadge(familyActive && !degraded)}
+          <span className="truncate">{row.row.label}</span>
+        </span>
         <span className="flex shrink-0 items-center gap-1.5">
           <CostMark model={representativeModel} />
           <PromoBadge label={promoLabelOf(representativeModel)} />
           {degraded && <Badge tone="danger">暂不可用</Badge>}
-          {familyActive && !degraded && <Check size={14} className="shrink-0 text-accent" />}
+          {familyActive && !degraded && checkMark}
         </span>
       </PickerItem>
     )
@@ -540,10 +581,10 @@ export function ModelSelectorPanel({
   const notes = selectedDegraded && !teamEngineActive ? (
     <div
       role="note"
-      className="mx-1 mb-1 shrink-0 rounded-md bg-danger-soft px-2.5 py-2 text-xs leading-relaxed"
+      className="oc-callout oc-callout-danger mx-2 my-1.5 shrink-0 rounded-md px-3 py-2 text-xs leading-relaxed"
     >
-      <span className="flex items-center gap-1.5 font-medium text-danger">
-        <AlertTriangle size={12} className="shrink-0" /> 当前模型暂不可用
+      <span className="flex items-center gap-1.5 font-semibold text-danger">
+        <AlertTriangle size={13} strokeWidth={1.75} className="shrink-0" /> 当前模型暂不可用
       </span>
       <span className="mt-0.5 block text-muted">
         {hasAlternatives
@@ -580,9 +621,9 @@ export function ModelSelectorPanel({
           >
             <span className="flex items-center gap-1.5">
               {collapsedOpen ? (
-                <ChevronDown size={14} className="shrink-0" aria-hidden />
+                <ChevronDown size={14} strokeWidth={1.75} className="shrink-0" aria-hidden />
               ) : (
-                <ChevronRight size={14} className="shrink-0" aria-hidden />
+                <ChevronRight size={14} strokeWidth={1.75} className="shrink-0" aria-hidden />
               )}
               <span>{COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL}</span>
             </span>
@@ -648,61 +689,68 @@ export function ModelSelectorPanel({
           )}
         >
           <div className="flex min-h-0 flex-1 flex-col" data-testid="model-picker-sheet">
-            <div className="shrink-0 border-b border-border px-4 pb-2.5 pt-1 pr-12">
-              <p className="text-title font-semibold text-fg">选择对话模型</p>
-              <p className="mt-0.5 flex items-center gap-1.5 truncate text-meta text-muted">
-                <span className="truncate">
-                  {label}
-                  {tierLabel ? ` · ${tierLabel}` : ''}
-                </span>
-                <CostMark model={selected} multiplier={effectiveMultiplier} />
-              </p>
+            <div className="flex shrink-0 items-center gap-2.5 border-b border-border/80 px-4 pb-3 pt-1.5 pr-12">
+              <span aria-hidden className="oc-icon-badge oc-icon-badge-accent size-8 rounded-sm">
+                <Cpu size={15} strokeWidth={1.75} />
+              </span>
+              <div className="min-w-0 flex-1">
+                <p className="text-title font-semibold tracking-tight text-fg">选择对话模型</p>
+                <p className="mt-0.5 flex items-center gap-1.5 truncate text-meta text-muted">
+                  <span className="truncate">
+                    {label}
+                    {tierLabel ? ` · ${tierLabel}` : ''}
+                  </span>
+                  <CostMark model={selected} multiplier={effectiveMultiplier} />
+                </p>
+              </div>
             </div>
 
             {useShortTabs ? (
               <>
-                <div
-                  role="tablist"
-                  aria-label="模型选择器分区"
-                  data-testid="model-picker-short-tabs"
-                  className="flex shrink-0 gap-1 border-b border-border bg-surface/50 px-3 py-1.5"
-                >
-                  <button
-                    type="button"
-                    role="tab"
-                    data-testid="model-picker-tab-models"
-                    aria-selected={shortTab === 'models'}
-                    onClick={() => setShortTab('models')}
-                    className={cn(
-                      'min-h-9 flex-1 rounded-lg px-3 py-1 text-meta font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
-                      shortTab === 'models'
-                        ? 'bg-elevated text-fg shadow-soft'
-                        : 'text-muted hover:text-fg',
-                    )}
+                <div className="shrink-0 border-b border-border/70 px-3 py-2">
+                  <div
+                    role="tablist"
+                    aria-label="模型选择器分区"
+                    data-testid="model-picker-short-tabs"
+                    className="oc-surface-recessed flex gap-1 rounded-md p-1"
                   >
-                    模型
-                  </button>
-                  <button
-                    type="button"
-                    role="tab"
-                    data-testid="model-picker-tab-extras"
-                    aria-selected={shortTab === 'extras'}
-                    onClick={() => setShortTab('extras')}
-                    className={cn(
-                      'min-h-9 flex-1 rounded-lg px-3 py-1 text-meta font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
-                      shortTab === 'extras'
-                        ? 'bg-elevated text-fg shadow-soft'
-                        : 'text-muted hover:text-fg',
-                    )}
-                  >
-                    执行参数
-                  </button>
+                    <button
+                      type="button"
+                      role="tab"
+                      data-testid="model-picker-tab-models"
+                      aria-selected={shortTab === 'models'}
+                      onClick={() => setShortTab('models')}
+                      className={cn(
+                        'oc-btn-tactile min-h-9 flex-1 rounded-sm px-3 py-1 text-meta font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                        shortTab === 'models'
+                          ? 'oc-segmented-thumb text-fg'
+                          : 'text-muted hover:text-fg',
+                      )}
+                    >
+                      模型
+                    </button>
+                    <button
+                      type="button"
+                      role="tab"
+                      data-testid="model-picker-tab-extras"
+                      aria-selected={shortTab === 'extras'}
+                      onClick={() => setShortTab('extras')}
+                      className={cn(
+                        'oc-btn-tactile min-h-9 flex-1 rounded-sm px-3 py-1 text-meta font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                        shortTab === 'extras'
+                          ? 'oc-segmented-thumb text-fg'
+                          : 'text-muted hover:text-fg',
+                      )}
+                    >
+                      执行参数
+                    </button>
+                  </div>
                 </div>
                 {shortTab === 'models' ? (
                   <div
                     role="menu"
                     data-testid="model-picker-sheet-scroll"
-                    className="model-picker-sheet-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 py-1.5"
+                    className="model-picker-sheet-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 py-2"
                   >
                     {notes}
                     {list}
@@ -711,7 +759,7 @@ export function ModelSelectorPanel({
                   <div
                     role="tabpanel"
                     data-testid="model-picker-extras-panel"
-                    className="model-picker-sheet-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain px-2.5 py-2"
+                    className="model-picker-sheet-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 py-2.5"
                   >
                     <ModelSelectorExtras layout="tab" {...sharedExtrasProps} />
                   </div>
@@ -722,7 +770,7 @@ export function ModelSelectorPanel({
                 <div
                   role="menu"
                   data-testid="model-picker-sheet-scroll"
-                  className="model-picker-sheet-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 py-1.5"
+                  className="model-picker-sheet-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 py-2"
                 >
                   {notes}
                   {list}
@@ -732,7 +780,7 @@ export function ModelSelectorPanel({
                     role="region"
                     aria-label="执行参数"
                     data-testid="model-picker-extras-dock"
-                    className="max-h-[42%] shrink-0 overflow-y-auto overscroll-contain border-t border-border bg-surface/60 px-2.5 py-2"
+                    className="max-h-[42%] shrink-0 overflow-y-auto overscroll-contain border-t border-border/80 bg-bg/70 px-3 py-2.5"
                   >
                     <ModelSelectorExtras layout="dock" {...sharedExtrasProps} />
                   </div>
@@ -752,27 +800,27 @@ export function ModelSelectorPanel({
         <DropdownMenuContent
           align="start"
           data-testid="model-picker-two-col"
-          className="model-picker-popover flex w-[min(620px,calc(100vw-24px))] flex-col overflow-hidden p-0"
+          className="model-picker-popover oc-surface-popover flex w-[min(620px,calc(100vw-24px))] flex-col overflow-hidden p-0"
         >
-          <div className="flex min-h-0 flex-1 flex-row divide-x divide-border">
+          <div className="flex min-h-0 flex-1 flex-row divide-x divide-border/80">
             <div
               data-testid="model-picker-list-col"
               className="flex min-h-[14rem] min-w-0 flex-[56_1_0%] flex-col"
             >
-              <PickerLabel mode="menu" className="shrink-0 border-b border-border/60 px-3 py-2">
+              <PickerLabel mode="menu" className="shrink-0 border-b border-border/70 px-3 py-2 text-caption font-semibold tracking-wider text-faint">
                 对话模型
               </PickerLabel>
               {notes}
               <div
                 data-testid="model-picker-list-scroll"
-                className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-1.5"
+                className="min-h-0 flex-1 space-y-0.5 overflow-y-auto overscroll-contain p-1.5"
               >
                 {list}
               </div>
             </div>
             <div
               data-testid="model-picker-extras-col"
-              className="flex min-h-[14rem] min-w-0 flex-[44_1_0%] flex-col bg-surface/40"
+              className="flex min-h-[14rem] min-w-0 flex-[44_1_0%] flex-col bg-bg/45"
             >
               <ModelSelectorExtras layout="column" {...sharedExtrasProps} />
             </div>
@@ -788,15 +836,15 @@ export function ModelSelectorPanel({
       <DropdownMenuContent
         align="start"
         data-testid="model-picker-single-col"
-        className="model-picker-popover flex w-[min(320px,calc(100vw-24px))] min-w-[15rem] flex-col overflow-hidden p-1"
+        className="model-picker-popover oc-surface-popover flex w-[min(320px,calc(100vw-24px))] min-w-[15rem] flex-col overflow-hidden p-1.5"
       >
-        <PickerLabel mode="menu" className="shrink-0">
+        <PickerLabel mode="menu" className="shrink-0 text-caption font-semibold tracking-wider text-faint">
           对话模型
         </PickerLabel>
         {notes}
         <div
           data-testid="model-picker-list-scroll"
-          className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
+          className="min-h-0 flex-1 space-y-0.5 overflow-y-auto overscroll-contain"
         >
           {list}
         </div>

@@ -183,9 +183,9 @@ export const SessionRow = memo(function SessionRow({
           "group relative flex h-full items-center gap-2 rounded-sm pl-2.5 pr-1 text-section transition-[background-color,color,box-shadow] duration-150 ease-standard",
           "[-webkit-touch-callout:none] [@media(hover:none)]:select-none",
           active
-            ? "bg-sidebar-active text-fg shadow-sidebar-active"
+            ? "bg-sidebar-active text-fg shadow-sidebar-active before:absolute before:bottom-1.5 before:left-0.5 before:top-1.5 before:w-0.5 before:rounded-xs before:bg-accent"
             : selected
-              ? "bg-accent-soft text-fg"
+              ? "bg-accent-soft text-fg ring-1 ring-inset ring-accent/20"
               : "text-muted hover:bg-hover hover:text-fg",
           menuOpen && !active && "bg-hover text-fg",
         )}
@@ -274,14 +274,14 @@ export const SessionRow = memo(function SessionRow({
                 size="xs"
                 shape="square"
                 className={cn(
-                  "absolute right-0 top-1/2 -translate-y-1/2 rounded-xs opacity-0 transition-opacity duration-150 data-[state=open]:opacity-100",
+                  "oc-btn-tactile absolute right-0 top-1/2 -translate-y-1/2 rounded-xs opacity-0 transition-[opacity,background-color,color] duration-150 data-[state=open]:opacity-100",
                   "[@media(hover:hover)]:group-hover:opacity-100 [@media(hover:hover)]:group-focus-within:opacity-100",
                   active
                     ? "[@media(hover:none)]:static [@media(hover:none)]:translate-y-0 [@media(hover:none)]:opacity-100"
                     : "[@media(hover:none)]:invisible",
                 )}
               >
-                <MoreHorizontal size={14} />
+                <MoreHorizontal size={14} strokeWidth={1.75} />
               </IconButton>
             </DropdownMenuTrigger>
             <DropdownMenuContent
@@ -312,25 +312,25 @@ export const SessionRow = memo(function SessionRow({
                 </>
               )}
               <DropdownMenuItem onSelect={() => onRename(s)}>
-                <Pencil size={14} className="shrink-0 text-muted" />
+                <Pencil size={14} strokeWidth={1.75} className="shrink-0 text-muted" />
                 重命名
               </DropdownMenuItem>
               {onTogglePin && (
                 <DropdownMenuItem onSelect={() => onTogglePin(s)}>
-                  <Pin size={14} className="shrink-0 text-muted" />
+                  <Pin size={14} strokeWidth={1.75} className="shrink-0 text-muted" />
                   {s.pinned ? "取消置顶" : "置顶"}
                 </DropdownMenuItem>
               )}
               {onArchive && (
                 <DropdownMenuItem onSelect={() => onArchive(s)}>
-                  <Archive size={14} className="shrink-0 text-muted" />
+                  <Archive size={14} strokeWidth={1.75} className="shrink-0 text-muted" />
                   {s.archived ? "取消归档" : "归档"}
                 </DropdownMenuItem>
               )}
               {onMoveToProject && (
                 <DropdownMenuSub>
                   <DropdownMenuSubTrigger>
-                    <FolderInput size={14} className="shrink-0 text-muted" />
+                    <FolderInput size={14} strokeWidth={1.75} className="shrink-0 text-muted" />
                     移动到项目
                   </DropdownMenuSubTrigger>
                   <DropdownMenuSubContent className="w-44">
@@ -366,12 +366,12 @@ export const SessionRow = memo(function SessionRow({
                 </DropdownMenuSub>
               )}
               <DropdownMenuItem onSelect={() => onEnterMultiSelect(s.id)}>
-                <SquareCheck size={14} className="shrink-0 text-muted" />
+                <SquareCheck size={14} strokeWidth={1.75} className="shrink-0 text-muted" />
                 多选
               </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem destructive onSelect={() => onDelete(s)}>
-                <Trash2 size={14} className="shrink-0" />
+                <Trash2 size={14} strokeWidth={1.75} className="shrink-0" />
                 删除
               </DropdownMenuItem>
             </DropdownMenuContent>

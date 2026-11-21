@@ -1037,9 +1037,9 @@ function ShellGlyph({ active, outcome }: { active: boolean; outcome: "done" | "s
       aria-hidden
       data-testid="process-glyph-done"
       data-outcome={outcome}
-      className="flex size-6 shrink-0 items-center justify-center rounded-full bg-hover text-muted"
+      className="oc-icon-badge flex size-6 shrink-0 items-center justify-center rounded-full text-muted"
     >
-      {Icon ? <Icon size={13} strokeWidth={2.25} fill={filled ? "currentColor" : "none"} /> : null}
+      {Icon ? <Icon size={13} strokeWidth={2.1} fill={filled ? "currentColor" : "none"} /> : null}
     </span>
   );
 }
@@ -1117,7 +1117,7 @@ function shellLivePhrase<T>(
 
 
 const shellToggleClass =
-  "group/shell -mx-1.5 flex min-h-10 w-[calc(100%+0.75rem)] items-center gap-2.5 rounded-lg px-1.5 py-1.5 text-left transition-colors duration-150 hover:bg-hover/60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-11";
+  "group/shell -mx-1.5 flex min-h-10 w-[calc(100%+0.75rem)] items-center gap-2.5 rounded-xl px-2 py-1.5 text-left transition-colors duration-150 hover:bg-hover/70 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-11";
 
 
 /** Sum of assistant cost labels. Zero and non-digits are skipped. */
@@ -1330,12 +1330,12 @@ export function ProcessDisclosure<T>({
         <button
           type="button"
           data-testid="process-pane-changes"
-          className="group/changes inline-flex shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+          className="group/changes oc-btn-tactile inline-flex shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
           title="在详情面板查看这一轮的产出"
           onClick={() => openPane("outputs", processRows[0])}
         >
-          <span className="inline-flex h-7 items-center gap-1 rounded-full border border-border/80 px-2.5 text-caption font-medium text-muted transition-colors group-hover/changes:bg-hover group-hover/changes:text-fg">
-            <Pencil size={11.5} aria-hidden className="text-faint" />
+          <span className="oc-btn-secondary-craft inline-flex h-7 items-center gap-1.5 rounded-full border border-border/80 bg-surface px-2.5 text-caption font-medium text-muted transition-colors group-hover/changes:border-border-strong group-hover/changes:text-fg">
+            <Pencil size={11.5} strokeWidth={1.75} aria-hidden className="text-accent" />
             {/* 手机上省掉「改动」二字,给左边的步骤统计留位置;读屏仍念全句。 */}
             <span className="sr-only sm:not-sr-only">改动 </span>
             {changedFiles} 个文件
@@ -1347,10 +1347,10 @@ export function ProcessDisclosure<T>({
           data-testid="process-pane-steps"
           aria-label="在详情面板查看步骤"
           title="在详情面板查看步骤"
-          className="flex size-8 shrink-0 items-center justify-center rounded-md text-faint opacity-0 outline-none transition-opacity hover:bg-hover hover:text-fg focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover/shellrow:opacity-100 [@media(hover:none)]:size-11 [@media(hover:none)]:opacity-100"
+          className="oc-btn-tactile flex size-8 shrink-0 items-center justify-center rounded-lg text-faint opacity-0 outline-none transition-all hover:bg-hover hover:text-fg focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover/shellrow:opacity-100 [@media(hover:none)]:size-11 [@media(hover:none)]:opacity-100"
           onClick={() => openPane("steps")}
         >
-          <PanelRight size={15} />
+          <PanelRight size={15} strokeWidth={1.75} />
         </button>
       ) : null}
       </div>

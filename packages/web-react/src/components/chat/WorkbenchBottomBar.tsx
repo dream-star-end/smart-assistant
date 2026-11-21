@@ -177,7 +177,7 @@ export function WorkbenchBottomBar({
   return (
     <div className={cn("wb-bottom-bar", className)} data-testid="workbench-bottom-bar">
       {slide && (
-        <div className="flex shrink-0 items-center gap-0.5">
+        <div className="oc-surface-recessed flex shrink-0 items-center gap-0.5 rounded-lg p-0.5">
           <IconButton
             size="sm"
             shape="square"
@@ -189,7 +189,7 @@ export function WorkbenchBottomBar({
             <ChevronLeft size={15} />
           </IconButton>
           <span
-            className="px-1 text-meta font-medium tabular-nums text-fg whitespace-nowrap"
+            className="px-2 text-caption font-semibold tabular-nums text-fg whitespace-nowrap"
             data-testid="slide-counter"
           >
             <span className="sr-only sm:not-sr-only">第 </span>
@@ -356,7 +356,12 @@ export function AnnotationComposer({
         className="wb-annotate-input text-base md:text-sm"
       />
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="text-caption text-faint">⌘ / Ctrl + Enter 快捷提交</span>
+        <span className="inline-flex items-center gap-1 text-caption text-faint">
+          <kbd className="oc-kbd">⌘ / Ctrl</kbd>
+          <span>+</span>
+          <kbd className="oc-kbd">Enter</kbd>
+          <span>快捷提交</span>
+        </span>
         <div className="flex items-center gap-2">
           <Button type="button" size="sm" variant="ghost" onClick={onClose}>
             取消

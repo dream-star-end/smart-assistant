@@ -57,20 +57,19 @@ type BodyProps = { input: Input; tool: ToolLike };
 
 /** 等宽块共用类:pre-wrap + break-words,内容再长也不产生横向滚动,纵向由字符上限 + 展开原语控制。 */
 const PRE_CLS =
-  "mt-1.5 whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-xs leading-relaxed text-fg";
+  "oc-surface-recessed mt-1.5 whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2.5 font-mono text-meta leading-relaxed text-fg";
 
 /**
  * 等宽预格式化块（引用串 / 代码）。
- * 无边框——卡壳本身（ToolCard 的 border-t 体区）已是容器，再加边框会变"框中框"（设计 `.out` 即无边框）。
- * 仅用 bg-code 这层极淡表面做区隔。不再设 max-h 嵌套滚动区(T-09):时间线里的嵌套滚动在移动端
- * 会劫持手势,长度一律靠调用方的字符上限 + 「展开全部」控制。
+ * 依托 Clarvy Atelier 微凹代码井质感（.oc-surface-recessed + bg-code）建立清晰层次。
+ * 不再设 max-h 嵌套滚动区(T-09):时间线里的嵌套滚动在移动端会劫持手势,长度一律靠调用方的字符上限 + 「展开全部」控制。
  */
 function Pre({ children, className }: { children: ReactNode; className?: string }) {
   return <pre className={cn(PRE_CLS, className)}>{children}</pre>;
 }
 
 function FileMeta({ children }: { children: ReactNode }) {
-  return <div className="mt-1.5 text-xs text-faint">{children}</div>;
+  return <div className="mt-1.5 font-mono text-caption text-faint tabular-nums">{children}</div>;
 }
 
 type StatusTone = "success" | "danger" | "muted";
@@ -82,7 +81,7 @@ function StatusLine({ text, error, tone }: { text: string; error?: boolean; tone
   return (
     <div
       className={cn(
-        "mt-1.5 text-xs",
+        "mt-1.5 text-meta font-medium",
         resolved === "danger" ? "text-danger" : resolved === "muted" ? "text-muted" : "text-success",
       )}
     >
@@ -185,7 +184,7 @@ const OUTPUT_MODE_LABELS: Record<string, string> = {
 
 function PromptBlock({ children }: { children: ReactNode }) {
   return (
-    <div className="mt-1.5 whitespace-pre-wrap break-words rounded-md bg-hover px-3 py-2 text-body text-fg">
+    <div className="oc-surface-recessed mt-1.5 whitespace-pre-wrap break-words rounded-md px-3 py-2 text-body leading-relaxed text-fg">
       {children}
     </div>
   );
@@ -198,10 +197,10 @@ function KvList({ obj, skip, maxValueLen = 240 }: { obj: Input; skip?: string[];
   const rows = Object.entries(obj).filter(([k, v]) => !skipSet.has(k) && v != null && v !== "");
   if (rows.length === 0) return null;
   return (
-    <div className="mt-1.5 flex flex-col gap-1 text-xs">
+    <div className="mt-1.5 flex flex-col gap-1.5 text-meta">
       {rows.map(([k, v]) => (
-        <div key={k} className="flex gap-2">
-          <span className="shrink-0 font-medium text-faint">{kvKeyLabel(k)}</span>
+        <div key={k} className="flex items-baseline gap-2.5">
+          <span className="min-w-14 shrink-0 text-caption font-medium text-faint">{kvKeyLabel(k)}</span>
           <span className="min-w-0 break-words font-mono text-muted">{clampStr(kvValueText(v), maxValueLen)}</span>
         </div>
       ))}
@@ -265,7 +264,7 @@ function DiffTruncationRow({
 }) {
   const open = useContext(ToolInspectOpenContext);
   return (
-    <div className="flex flex-wrap items-center gap-x-3 border-t border-border/60 px-3 py-1">
+    <div className="flex flex-wrap items-center gap-x-3 border-t border-border/70 bg-hover/30 px-3 py-1.5 font-sans text-caption tabular-nums">
       <span className="text-faint">已显示前 {shown.toLocaleString()} 行</span>
       {onShowAll && (
         <InlineAction onClick={onShowAll}>展开全部（共 {total.toLocaleString()} 行）</InlineAction>
@@ -282,7 +281,7 @@ function DiffContainer({ children }: { children: ReactNode }) {
     <div
       // biome-ignore lint/a11y/noNoninteractiveTabindex: 可横向滚动的容器必须能聚焦,键盘用户才能滚动(T-23)
       tabIndex={0}
-      className="mt-1.5 overflow-x-auto rounded-md border border-border font-mono text-xs leading-relaxed outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      className="oc-code-shell mt-1.5 overflow-x-auto rounded-md font-mono text-meta leading-relaxed outline-none focus-visible:ring-2 focus-visible:ring-ring"
     >
       {children}
     </div>
@@ -290,7 +289,7 @@ function DiffContainer({ children }: { children: ReactNode }) {
 }
 
 const GUTTER_CLS =
-  "w-9 shrink-0 select-none border-r border-border/60 pr-1.5 text-right text-micro leading-relaxed text-faint";
+  "w-9 shrink-0 select-none border-r border-border/60 bg-bg/35 pr-2 text-right font-mono text-micro leading-relaxed text-faint tabular-nums";
 
 /** diff 单行:行号(旧/新)+ 符号 + 内容(可选 hljs 着色;hljs 输出已转义)。
  *  gutters:全新增/全删除 diff 隐藏恒空的那一列;窄屏只保留新行号列(T-10:390px 下 92px 固定 gutter
@@ -315,7 +314,7 @@ function DiffRowView({
       {gutters.new && <span className={GUTTER_CLS}>{row.newNo ?? ""}</span>}
       <span
         className={cn(
-          "w-5 shrink-0 select-none text-center",
+          "w-5 shrink-0 select-none text-center font-semibold",
           row.sign === "-" ? "text-danger" : row.sign === "+" ? "text-success" : "text-faint",
         )}
       >
@@ -375,12 +374,20 @@ function DiffView({ oldStr, newStr, path }: { oldStr: string; newStr: string; pa
       {(stats.added > 0 || stats.removed > 0) && (
         <div
           data-testid="diff-stats-bar"
-          className="flex items-center gap-2 border-b border-border/60 bg-hover/40 px-3 py-1 font-sans text-caption"
+          className="oc-code-shell-header flex items-center gap-2 px-3 py-1.5 font-sans text-caption"
         >
-          {path && <span className="min-w-0 truncate font-mono text-muted">{shortPath(path)}</span>}
+          {path && <span className="min-w-0 truncate font-mono font-medium text-muted">{shortPath(path)}</span>}
           <span className="ml-auto flex shrink-0 items-center gap-1.5 font-mono tabular-nums">
-            {stats.added > 0 && <span className="text-success">+{stats.added}</span>}
-            {stats.removed > 0 && <span className="text-danger">-{stats.removed}</span>}
+            {stats.added > 0 && (
+              <Badge tone="success" size="sm" className="font-mono">
+                +{stats.added}
+              </Badge>
+            )}
+            {stats.removed > 0 && (
+              <Badge tone="danger" size="sm" className="font-mono">
+                -{stats.removed}
+              </Badge>
+            )}
           </span>
         </div>
       )}
@@ -391,7 +398,7 @@ function DiffView({ oldStr, newStr, path }: { oldStr: string; newStr: string; pa
             type="button"
             data-testid="diff-context-gap"
             onClick={() => expandGap(entry.start)}
-            className="flex w-full items-center gap-2 border-y border-border/50 bg-hover/40 px-3 py-1 text-left font-sans text-caption text-faint transition-colors hover:bg-hover hover:text-fg [@media(hover:none)]:min-h-11"
+            className="flex w-full items-center gap-2 border-y border-border/60 bg-hover/55 px-3 py-1.5 text-left font-sans text-caption font-medium text-faint transition-colors hover:bg-hover hover:text-fg [@media(hover:none)]:min-h-11"
           >
             <span>⋯ 展开 {entry.count} 行未改动上下文</span>
           </button>
@@ -468,7 +475,7 @@ function TerminalBlock({ command, output }: { command: string; output: string | 
       <Pre>
         {command && (
           <>
-            <span className="text-success">$ </span>
+            <span className="select-none font-semibold text-success">$ </span>
             {command}
             {nodes.length > 0 ? "\n" : ""}
           </>
@@ -527,7 +534,12 @@ function BashBody({ input, tool }: BodyProps) {
     return (
       <>
         <StatusLine text={status} error={tool.error} tone={tool.error || tool._completed ? undefined : "muted"} />
-        <div className={cn("mt-1.5 rounded-md px-3 py-2 text-xs", tool.error ? "bg-danger-soft" : "bg-success-soft")}>
+        <div
+          className={cn(
+            "oc-callout mt-1.5 rounded-md px-3 py-2 text-meta",
+            tool.error ? "oc-callout-danger" : "oc-callout-success",
+          )}
+        >
           <div className={cn("font-medium", tool.error ? "text-danger" : "text-success")}>文件</div>
           <ul className="mt-1 flex flex-col gap-0.5">
             {fileWrite.paths.map((path) => (
@@ -596,12 +608,20 @@ function UnifiedDiffView({ diff, path }: { diff: string; path?: string }) {
       {(parsed.added > 0 || parsed.removed > 0) && (
         <div
           data-testid="diff-stats-bar"
-          className="flex items-center gap-2 border-b border-border/60 bg-hover/40 px-3 py-1 font-sans text-caption"
+          className="oc-code-shell-header flex items-center gap-2 px-3 py-1.5 font-sans text-caption"
         >
-          {path && <span className="min-w-0 truncate font-mono text-muted">{shortPath(path)}</span>}
+          {path && <span className="min-w-0 truncate font-mono font-medium text-muted">{shortPath(path)}</span>}
           <span className="ml-auto flex shrink-0 items-center gap-1.5 font-mono tabular-nums">
-            {parsed.added > 0 && <span className="text-success">+{parsed.added}</span>}
-            {parsed.removed > 0 && <span className="text-danger">-{parsed.removed}</span>}
+            {parsed.added > 0 && (
+              <Badge tone="success" size="sm" className="font-mono">
+                +{parsed.added}
+              </Badge>
+            )}
+            {parsed.removed > 0 && (
+              <Badge tone="danger" size="sm" className="font-mono">
+                -{parsed.removed}
+              </Badge>
+            )}
           </span>
         </div>
       )}
@@ -866,14 +886,17 @@ function FileList({ text }: { text: string }) {
   const limit = showAll ? files.length : 30;
   return (
     <div className="mt-1.5">
-      <ul className="flex flex-col gap-0.5">
-        {files.slice(0, limit).map((f) => (
-          <li key={f} className="flex items-center gap-1.5 font-mono text-xs text-muted">
-            <FileText size={12} className="shrink-0 text-faint" aria-hidden="true" />
-            <span className="min-w-0 break-all">{shortPath(f)}</span>
-          </li>
-        ))}
-      </ul>
+        <ul className="flex flex-col gap-0.5">
+          {files.slice(0, limit).map((f) => (
+            <li
+              key={f}
+              className="flex items-center gap-1.5 rounded-xs px-1.5 py-0.5 font-mono text-meta text-muted transition-colors hover:bg-hover/60"
+            >
+              <FileText size={12} strokeWidth={1.75} className="shrink-0 text-faint" aria-hidden="true" />
+              <span className="min-w-0 break-all">{shortPath(f)}</span>
+            </li>
+          ))}
+        </ul>
       {files.length > limit && (
         <InlineAction className="mt-1" onClick={() => setShowAll(true)}>
           展开全部（共 {files.length.toLocaleString()} 个文件）
@@ -1054,7 +1077,7 @@ function CodexBody({ type, input, tool }: BodyProps & { type: string }) {
             <SignedImg
               src={safeImg}
               alt="查看的图片"
-              className="max-h-56 min-h-16 min-w-16 rounded-md border border-border bg-code object-contain"
+              className="max-h-56 min-h-16 min-w-16 rounded-lg border border-border/80 bg-code object-contain shadow-soft"
             />
           </div>
         )}
@@ -1189,9 +1212,9 @@ function SkillWriteCard({ op, input, tool }: BodyProps & { op: string }) {
   const done = !!tool._completed && !tool.error;
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex items-start gap-2.5 rounded-lg border border-border bg-elevated p-3">
-        <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
-          <Sparkles size={15} />
+      <div className="oc-surface-card flex items-start gap-2.5 rounded-lg p-3">
+        <span className="oc-icon-badge oc-icon-badge-accent size-8">
+          <Sparkles size={15} strokeWidth={1.75} />
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
@@ -1199,11 +1222,11 @@ function SkillWriteCard({ op, input, tool }: BodyProps & { op: string }) {
             <Badge tone="accent">{op === "skill_propose" ? "训练草稿" : "技能"}</Badge>
             {done && <Badge tone="success">{op === "skill_propose" ? "已暂存" : "已保存"}</Badge>}
           </div>
-          {description && <p className="mt-0.5 text-[12px] leading-snug text-muted">{description}</p>}
+          {description && <p className="mt-0.5 text-meta leading-snug text-muted">{description}</p>}
           {tags.length > 0 && (
-            <div className="mt-1 flex flex-wrap gap-1">
+            <div className="mt-1.5 flex flex-wrap gap-1">
               {tags.slice(0, 6).map((t) => (
-                <Badge key={t} tone="neutral">
+                <Badge key={t} tone="neutral" size="sm">
                   {t}
                 </Badge>
               ))}
@@ -1218,7 +1241,7 @@ function SkillWriteCard({ op, input, tool }: BodyProps & { op: string }) {
           <pre
             // biome-ignore lint/a11y/noNoninteractiveTabindex: 有 max-h 的滚动区要能聚焦,键盘才能滚(T-23)
             tabIndex={0}
-            className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="oc-surface-recessed mt-1.5 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2.5 font-mono text-caption leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             {body}
           </pre>
@@ -1451,13 +1474,13 @@ function ScanSciResults({
           .filter(Boolean)
           .map(String);
         return (
-          <div key={i} className="rounded-md border border-border bg-surface px-3 py-2">
+          <div key={i} className="oc-surface-card rounded-lg px-3 py-2.5">
             <div className="break-words text-body font-medium text-fg">
               {asStr(r.title) || asStr(r.display_name) || asStr(r.identifier) || asStr(r.doi) || "无标题论文"}
             </div>
-            {parts.length > 0 && <div className="mt-0.5 text-xs text-faint">{parts.join(" · ")}</div>}
+            {parts.length > 0 && <div className="mt-0.5 text-caption text-faint">{parts.join(" · ")}</div>}
             {onPaper && identifier && (
-              <div className="mt-1.5 flex flex-wrap gap-2">
+              <div className="mt-2 flex flex-wrap gap-2">
                 <Button variant="ghost" size="sm" onClick={() => onPaper("download", identifier)}>
                   下载 PDF
                 </Button>
@@ -1485,7 +1508,7 @@ function ScanSciChecks({ checks }: { checks: Record<string, unknown> }) {
           <span
             key={name}
             className={cn(
-              "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs",
+              "oc-badge-craft inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-caption",
               ok ? "bg-success-soft text-success" : "bg-warning-soft text-warning",
             )}
           >
@@ -1500,9 +1523,9 @@ function ScanSciChecks({ checks }: { checks: Record<string, unknown> }) {
 
 function PdfChip({ path }: { path: string }) {
   return (
-    <div className="mt-1.5 inline-flex items-center gap-2 rounded-md border border-border bg-hover px-3 py-2 text-xs text-fg">
-      <FileText size={14} className="text-accent" />
-      <span className="break-all">{shortPath(path)}</span>
+    <div className="oc-surface-recessed mt-1.5 inline-flex items-center gap-2 rounded-md px-3 py-2 text-meta text-fg">
+      <FileText size={14} strokeWidth={1.75} className="shrink-0 text-accent" />
+      <span className="break-all font-mono">{shortPath(path)}</span>
     </div>
   );
 }

@@ -55,10 +55,10 @@ export function PinnedSwarmDock({
     <div className="mx-auto mb-2 w-full max-w-3xl px-4" data-testid="pinned-swarm-dock">
       <div
         className={cn(
-          "flex min-h-11 items-center gap-2.5 overflow-hidden rounded-xl border px-3 py-2 backdrop-blur-md transition-all",
+          "oc-surface-glass flex min-h-11 items-center gap-2.5 overflow-hidden rounded-2xl px-3.5 py-2 transition-all",
           active
-            ? "border-accent/35 bg-elevated/95 shadow-float"
-            : "border-border bg-elevated/95 shadow-soft",
+            ? "border-accent/40 shadow-float"
+            : "shadow-soft",
         )}
       >
         {/* Main clickable area opens the immersive Swarm Board */}
@@ -142,14 +142,14 @@ export function PinnedSwarmDock({
           )}
 
           {/* Post counter + shortcut cue */}
-          <span className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-accent-soft px-2 py-1 text-caption font-medium text-accent transition-colors hover:bg-accent/15">
-            <MessageSquare size={11} />
+          <span className="oc-btn-tactile inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-accent/25 bg-accent-soft px-2.5 py-1 text-caption font-medium text-accent transition-colors hover:bg-accent/15">
+            <MessageSquare size={11} strokeWidth={1.75} />
             <span className="tabular-nums">{snapshot.totalPosts}</span>
             <span className="hidden md:inline">看板</span>
-            <kbd className="hidden rounded bg-surface/80 px-1 py-0 font-mono text-micro text-muted lg:inline">
+            <kbd className="oc-kbd hidden px-1 py-0 text-micro lg:inline">
               {altKeyLabel()}S
             </kbd>
-            <ArrowUpRight size={11} />
+            <ArrowUpRight size={11} strokeWidth={1.75} />
           </span>
         </button>
 
@@ -159,9 +159,9 @@ export function PinnedSwarmDock({
             onClick={onDismiss}
             aria-label="收起蜂群底栏"
             title="收起"
-            className="flex size-7 shrink-0 items-center justify-center rounded-lg text-faint transition-colors hover:bg-hover hover:text-fg"
+            className="oc-btn-tactile flex size-7 shrink-0 items-center justify-center rounded-lg text-faint transition-colors hover:bg-hover hover:text-fg"
           >
-            <X size={14} />
+            <X size={14} strokeWidth={1.75} />
           </button>
         )}
       </div>

@@ -277,34 +277,37 @@ export function ModelSelector({
       aria-busy={loading || undefined}
       data-degraded={selectedDegraded && !teamEngineActive ? 'true' : undefined}
       className={cn(
-        'flex min-h-10 min-w-0 max-w-full items-center gap-1.5 rounded-full border border-border/70 bg-surface/80 px-2.5 py-1 text-section font-medium text-fg outline-none transition-colors sm:min-h-11 sm:rounded-xl sm:border-transparent sm:bg-transparent sm:py-1.5 sm:text-muted',
-        'hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]',
+        'oc-btn-tactile flex min-h-10 min-w-0 max-w-full items-center gap-1.5 rounded-full border border-border/80 bg-surface/85 px-3 py-1 text-section font-medium text-fg shadow-xs outline-none sm:min-h-10 sm:rounded-lg sm:border-border/60 sm:bg-surface/65 sm:px-2.5 sm:py-1.5',
+        'hover:border-border-strong hover:bg-surface hover:text-fg hover:shadow-soft focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
         'disabled:pointer-events-none disabled:opacity-50',
-        teamEngineActive && 'text-accent hover:text-accent disabled:opacity-100',
+        sheetOpen && 'border-accent/45 bg-surface shadow-soft',
+        teamEngineActive && 'border-accent/25 bg-accent-soft/70 text-accent hover:text-accent disabled:opacity-100',
       )}
     >
       {loading ? (
         <Loader2
           size={14}
-          className="shrink-0 animate-spin text-faint"
+          strokeWidth={1.75}
+          className="shrink-0 animate-spin text-accent"
           aria-hidden
           data-testid="model-trigger-spinner"
         />
       ) : teamEngineActive ? (
-        <Users size={14} className="shrink-0 text-accent" />
+        <Users size={14} strokeWidth={1.75} className="shrink-0 text-accent" />
       ) : (
-        <Cpu size={14} className="hidden shrink-0 text-faint sm:block" />
+        <Cpu size={14} strokeWidth={1.75} className="hidden shrink-0 text-muted sm:block" />
       )}
       {teamEngineActive && <span className="hidden sm:inline">{'队长引擎 · '}</span>}
       {selectedDegraded && !teamEngineActive && (
         <AlertTriangle
           size={13}
+          strokeWidth={1.75}
           className="shrink-0 text-danger"
           aria-label="当前模型暂不可用"
           data-testid="model-trigger-degraded"
         />
       )}
-      <span className="min-w-0 truncate sm:max-w-[220px] lg:max-w-[260px]">{label}</span>
+      <span className="min-w-0 truncate font-medium sm:max-w-[220px] lg:max-w-[260px]">{label}</span>
       {loading && selected && !teamEngineActive ? (
         <span className="shrink-0 text-faint" data-testid="model-trigger-loading">
           · 切换中…
@@ -312,14 +315,14 @@ export function ModelSelector({
       ) : (
         <>
           {tierLabel && (
-            <span className="hidden shrink-0 text-faint sm:inline" data-testid="model-trigger-tier">
+            <span className="hidden shrink-0 text-meta font-normal text-muted sm:inline" data-testid="model-trigger-tier">
               · {tierLabel}
             </span>
           )}
           {mobileSpeedBadge && (
             <span
               data-testid="model-trigger-speed-mobile"
-              className="inline-flex shrink-0 items-center rounded-full bg-accent-soft px-1.5 py-0.5 text-micro font-semibold tabular-nums text-accent sm:hidden"
+              className="oc-badge-craft inline-flex shrink-0 items-center rounded-full bg-accent-soft px-1.5 py-0.5 text-micro font-semibold tabular-nums text-accent sm:hidden"
             >
               {mobileSpeedBadge}
             </span>
@@ -328,7 +331,16 @@ export function ModelSelector({
       )}
       <CostMark model={teamEngineActive ? leaderModel : selected} multiplier={triggerCostMultiplier} />
       {!teamEngineActive && <PromoBadge label={selectedPromo} className="hidden sm:inline-flex" />}
-      {!teamEngineActive && <ChevronDown size={14} className="shrink-0 text-faint" />}
+      {!teamEngineActive && (
+        <ChevronDown
+          size={14}
+          strokeWidth={1.75}
+          className={cn(
+            'shrink-0 text-faint transition-transform duration-200 ease-spring',
+            sheetOpen && 'rotate-180 text-accent',
+          )}
+        />
+      )}
     </button>
   )
 

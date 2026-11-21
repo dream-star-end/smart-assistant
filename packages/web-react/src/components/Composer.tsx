@@ -202,10 +202,10 @@ function EnvironmentPrepBar() {
       <div className="mb-1.5 text-meta text-muted">
         {overdue ? "仍在准备环境，请稍候…" : "环境准备中，约 20 秒"}
       </div>
-      <div className="h-1 overflow-hidden rounded-full bg-hover" aria-hidden>
+      <div className="oc-surface-recessed h-1.5 overflow-hidden rounded-full" aria-hidden>
         <div
           className={cn(
-            "h-full rounded-full bg-accent transition-[width] duration-200",
+            "oc-progress-fill h-full rounded-full bg-accent transition-[width] duration-200",
             overdue && "animate-pulse",
           )}
           style={{ width: overdue ? "100%" : `${pct}%` }}
@@ -788,15 +788,21 @@ export function Composer({
           aria-label={`会话目标：${visibleGoal.objective}`}
           title={visibleGoal.objective}
           onClick={() => setGoalOpen(true)}
-          // 触屏 44px 命中(a11y-B composer#3);桌面 28px 胶囊不变。
-          className="mb-2 inline-flex max-w-full items-center gap-1.5 rounded-full border border-border bg-surface px-2.5 py-1 text-meta text-fg hover:bg-hover [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3.5"
+          // 触屏 44px 命中(a11y-B composer#3);桌面精致雕塑胶囊。
+          className="oc-surface-card oc-surface-card-hover mb-2 inline-flex max-w-full items-center gap-2 rounded-full py-1 pl-1.5 pr-3 text-meta text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:pr-3.5"
         >
-          <Target
-            size={13}
-            className={cn("shrink-0", goalNearBudget(visibleGoal) ? "text-warning" : "text-accent")}
-          />
-          <span className="min-w-0 truncate">{visibleGoal.objective}</span>
-          <span className="shrink-0 text-muted">{STATUS_LABEL[visibleGoal.status]}</span>
+          <span
+            aria-hidden
+            className={cn(
+              "oc-icon-badge size-5 rounded-full",
+              goalNearBudget(visibleGoal) ? "oc-icon-badge-warning" : "oc-icon-badge-accent",
+            )}
+          >
+            <Target size={11} strokeWidth={2} />
+          </span>
+          <span className="min-w-0 truncate font-medium">{visibleGoal.objective}</span>
+          <span aria-hidden className="h-3 w-px shrink-0 bg-border" />
+          <span className="shrink-0 text-caption font-medium text-muted">{STATUS_LABEL[visibleGoal.status]}</span>
         </button>
       )}
       <div className="relative">
@@ -805,7 +811,7 @@ export function Composer({
           role="listbox"
           aria-label="快捷指令"
           data-testid="composer-slash-menu"
-          className="absolute inset-x-0 bottom-full z-30 mb-1.5 overflow-hidden rounded-xl border border-border bg-elevated p-1 shadow-pop animate-in"
+          className="oc-surface-popover absolute inset-x-0 bottom-full z-30 mb-2 overflow-hidden rounded-lg p-1.5 animate-in"
         >
           {slashMatches.map((item, idx) => {
             const active = idx === activeSlashIndex;
@@ -820,12 +826,28 @@ export function Composer({
                 onMouseEnter={() => setSlashIndex(idx)}
                 onClick={() => applySlashCommand(item.cmd)}
                 className={cn(
-                  "flex min-h-9 w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-meta transition-colors [@media(hover:none)]:min-h-11",
-                  active ? "bg-hover text-fg" : "text-muted hover:bg-hover/60 hover:text-fg",
+                  "flex min-h-9 w-full items-center gap-2.5 rounded-sm px-2.5 py-1.5 text-left text-meta transition-colors [@media(hover:none)]:min-h-11",
+                  active
+                    ? "bg-accent-soft/80 text-fg ring-1 ring-inset ring-accent/20"
+                    : "text-muted hover:bg-hover/70 hover:text-fg",
                 )}
               >
+                <span
+                  aria-hidden
+                  className={cn(
+                    "oc-icon-badge size-6 rounded-xs font-mono text-caption font-semibold",
+                    active && "oc-icon-badge-accent",
+                  )}
+                >
+                  /
+                </span>
                 <span className="shrink-0 font-mono font-semibold text-accent">{item.label}</span>
                 <span className="min-w-0 flex-1 truncate text-caption text-muted">{item.desc}</span>
+                {active && (
+                  <kbd aria-hidden className="oc-kbd hidden shrink-0 sm:inline-flex">
+                    ↵
+                  </kbd>
+                )}
               </button>
             );
           })}
@@ -834,8 +856,7 @@ export function Composer({
       <div
         data-testid="composer-shell"
         className={cn(
-          "rounded-[18px] border border-border-control bg-surface shadow-[var(--shadow-soft)] transition-all",
-          "focus-within:border-border-strong focus-within:shadow-[0_1px_2px_rgba(0,0,0,0.04),0_4px_16px_rgba(0,0,0,0.06)] focus-within:ring-[3px] focus-within:ring-accent/[0.08]",
+          "oc-composer-dock rounded-xl",
           dragActive && "ring-2 ring-ring",
         )}
         onDragEnter={(e) => {
@@ -879,12 +900,12 @@ export function Composer({
           </output>
         )}
         {replyTo && (
-          <div className="mx-3.5 mt-3 flex items-start gap-2 rounded-xl bg-hover px-3 py-2 text-left">
-            <div className="min-w-0 flex-1 border-l-2 border-accent/60 pl-2.5">
-              <div className="mb-0.5 text-caption font-medium text-muted">
+          <div className="oc-surface-recessed mx-3.5 mt-3 flex items-start gap-2 rounded-md px-3 py-2 text-left">
+            <div className="min-w-0 flex-1 border-l-2 border-accent pl-2.5">
+              <div className="mb-0.5 text-caption font-semibold text-muted">
                 正在引用 {replyTo.role === "assistant" ? BRAND.name : "你"}
               </div>
-              <div className="line-clamp-2 whitespace-pre-wrap break-words text-[12.5px] leading-5 text-fg/75">
+              <div className="line-clamp-2 whitespace-pre-wrap break-words text-meta leading-5 text-fg/80">
                 {replyTo.text}
               </div>
             </div>
@@ -893,10 +914,10 @@ export function Composer({
               title="取消引用"
               size="sm"
               shape="square"
-              className="shrink-0 [@media(hover:none)]:size-11"
+              className="oc-btn-tactile shrink-0 [@media(hover:none)]:size-11"
               onClick={onCancelReply}
             >
-              <X size={15} />
+              <X size={14} strokeWidth={1.75} />
             </IconButton>
           </div>
         )}
@@ -1095,7 +1116,10 @@ export function Composer({
               </Suspense>
             )}
           </div>
-          <div className="mt-1 flex items-center gap-1.5" data-testid="composer-tool-row">
+          <div
+            className="mt-1.5 flex items-center gap-1 border-t border-border/50 pt-2"
+            data-testid="composer-tool-row"
+          >
             {/* file input 用 sr-only(视觉隐藏但非 display:none)+ tabindex=-1,配合工具条
                 <label htmlFor> 原生激活。国产内核(鸿蒙/华为/Quark)会把 display:none input 上的
                 合成 click 静默吞掉,原生 label 激活是跨内核唯一可靠路径(实证 61de46e2/de16e2be)。
@@ -1134,11 +1158,11 @@ export function Composer({
                 }}
                 className={cn(
                   iconButtonVariants({ shape: "square" }),
-                  "cursor-pointer",
+                  "oc-btn-tactile cursor-pointer",
                   disabled && "pointer-events-none opacity-50",
                 )}
               >
-                <Paperclip size={18} />
+                <Paperclip size={17} strokeWidth={1.75} />
               </label>
             )}
             <ComposerPlusMenu
@@ -1151,6 +1175,9 @@ export function Composer({
               onOpenRepo={onOpenRepo}
               repoSelection={repoSelection}
             />
+            {((onOpenRepo && !hasBoundRepo) || (swarmSupported && onToggleSwarmMode)) && (
+              <span aria-hidden className="mx-0.5 hidden h-4 w-px shrink-0 bg-border/70 sm:block" />
+            )}
             {/* 未绑定仓库时：移动端收纳在「+」菜单内，桌面 sm+ 保留无框轻量入口；已绑定则统一展示于顶部微上下文条。 */}
             {onOpenRepo && !hasBoundRepo && (
               <span className="hidden min-w-0 items-center sm:flex" data-testid="composer-repo-slot">
@@ -1171,16 +1198,16 @@ export function Composer({
                     : "开启 Antigravity 蜂群模式：多智能体并行拆解与互审（也可直接输入 /swarm）"
                 }
                 className={cn(
-                  "inline-flex min-h-9 shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-caption font-medium transition-all duration-150 [@media(hover:none)]:min-h-11",
+                  "oc-btn-tactile inline-flex min-h-8 shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-caption font-medium [@media(hover:none)]:min-h-11",
                   "outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50",
                   swarmMode
-                    ? "border-accent/40 bg-accent-soft text-accent shadow-soft hover:bg-accent/15"
-                    : "border-border bg-surface/80 text-muted hover:border-border-strong hover:bg-hover hover:text-fg",
+                    ? "oc-badge-craft bg-accent-soft text-accent shadow-xs hover:bg-accent/15"
+                    : "oc-btn-secondary-craft text-muted hover:text-fg",
                 )}
               >
                 <Hexagon
                   size={13}
-                  strokeWidth={2.2}
+                  strokeWidth={2}
                   className={cn("shrink-0", swarmMode && "text-accent")}
                 />
                 <span>蜂群</span>
@@ -1197,7 +1224,7 @@ export function Composer({
                   data-product-control
                   data-testid="composer-accept-prediction-touch"
                   onClick={acceptPrediction}
-                  className="inline-flex min-h-11 shrink-0 items-center rounded-full border border-border bg-bg px-3 text-caption font-medium text-accent transition-colors hover:bg-hover"
+                  className="oc-btn-tactile oc-btn-secondary-craft inline-flex min-h-11 shrink-0 items-center rounded-full px-3 text-caption font-medium text-accent"
                 >
                   填入建议
                 </button>
@@ -1243,10 +1270,10 @@ export function Composer({
                   data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
                   aria-label="排队发送"
                   title="本轮结束后自动发送"
-                  className="text-accent"
+                  className="oc-btn-tactile text-accent hover:bg-accent-soft"
                   onClick={() => submit(false, () => toast("已加入队列，本轮结束后发送", "info"))}
                 >
-                  <ListPlus size={19} />
+                  <ListPlus size={18} strokeWidth={1.75} />
                 </IconButton>
               )}
               {/* 不支持/未登录时不再 disabled 灰掉了事(C-20):保持可聚焦可点,点了用 toast 说明原因。 */}
@@ -1259,16 +1286,17 @@ export function Composer({
                 disabled={disabled || voiceState === "transcribing"}
                 onClick={onVoiceClick}
                 className={cn(
-                  voiceState === "recording" && "text-danger",
+                  "oc-btn-tactile",
+                  voiceState === "recording" && "oc-icon-badge-danger text-danger",
                   voiceUnavailableReason && "text-faint",
                 )}
               >
                 {voiceState === "transcribing" ? (
-                  <Loader2 size={19} className="animate-spin" />
+                  <Loader2 size={18} strokeWidth={1.75} className="animate-spin" />
                 ) : voiceState === "recording" ? (
-                  <Square size={16} className="fill-current" />
+                  <Square size={15} strokeWidth={1.75} className="fill-current" />
                 ) : (
-                  <Mic size={19} />
+                  <Mic size={18} strokeWidth={1.75} />
                 )}
               </IconButton>
               <button
@@ -1298,20 +1326,20 @@ export function Composer({
                 }}
                 disabled={stopping || (!canSend && !busy) || disabled}
                 className={cn(
-                  "flex size-9 shrink-0 items-center justify-center rounded-xl transition-all [@media(hover:none)]:size-11",
+                  "oc-btn-tactile flex size-9 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface [@media(hover:none)]:size-11",
                   busy
-                    ? "bg-primary text-primary-fg shadow-soft hover:opacity-90 active:scale-[0.97]"
+                    ? "oc-btn-primary-craft text-primary-fg"
                     : canSend
-                      ? "bg-primary text-primary-fg shadow-soft hover:opacity-90 active:scale-[0.97]"
-                      : "bg-hover text-faint",
+                      ? "oc-btn-primary-craft text-primary-fg"
+                      : "oc-surface-recessed text-faint opacity-75",
                 )}
               >
                 {stopping || submitting ? (
-                  <Loader2 size={17} className="animate-spin" />
+                  <Loader2 size={17} strokeWidth={2} className="animate-spin" />
                 ) : busy ? (
-                  <Square size={15} className="fill-current" />
+                  <Square size={14} strokeWidth={2} className="fill-current" />
                 ) : (
-                  <ArrowUp size={19} />
+                  <ArrowUp size={18} strokeWidth={2.25} />
                 )}
               </button>
             </div>

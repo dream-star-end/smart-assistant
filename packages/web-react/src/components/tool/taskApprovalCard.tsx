@@ -171,20 +171,20 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
   const approveLabel = status === "backlog" ? "批准开工" : "通过";
 
   return (
-    <div className="mt-1.5 rounded-lg border border-accent/40 bg-surface not-prose">
-      <div className="flex min-h-10 items-center gap-2 border-b border-border px-3 py-2">
-        <span className="text-accent">
-          <ClipboardCheck className="size-4" />
+    <div className="oc-surface-card mt-1.5 overflow-hidden rounded-lg border-accent/35 not-prose">
+      <div className="flex min-h-11 items-center gap-2.5 border-b border-border/75 bg-bg/40 px-3 py-2">
+        <span className="oc-icon-badge oc-icon-badge-accent size-6">
+          <ClipboardCheck size={13} strokeWidth={1.75} />
         </span>
-        <span className="font-medium text-sm text-fg">任务待你确认</span>
+        <span className="text-body font-semibold tracking-[-0.005em] text-fg">任务待你确认</span>
         <span className="ml-auto">
           {loading ? (
             <Spinner />
           ) : loadError ? (
-            <span className="inline-flex items-center gap-1 rounded bg-danger/10 px-1.5 py-0.5 text-caption text-danger">
-              <AlertTriangle className="size-2.5" />
+            <Badge tone="danger" size="sm">
+              <AlertTriangle className="size-3" strokeWidth={1.75} />
               无法核验
-            </span>
+            </Badge>
           ) : status ? (
             <Badge tone={statusTone(status)} size="sm">
               {TICKET_STATUS_LABEL[status]}
@@ -193,13 +193,13 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
         </span>
       </div>
 
-      <div className="px-3 py-2">
+      <div className="px-3 py-2.5">
         {loading ? (
           <div className="flex items-center gap-2 py-1 text-body text-faint">
             <Spinner /> 正在核验任务单…
           </div>
         ) : loadError ? (
-          <div className="flex flex-wrap items-center justify-between gap-2 py-1">
+          <div className="oc-callout oc-callout-danger flex flex-wrap items-center justify-between gap-2 rounded-md px-3 py-2">
             <span className="text-body text-danger">{loadError}</span>
             {taskApproval && (
               <Button
@@ -209,7 +209,7 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
                 data-testid="task-approval-retry-load"
                 onClick={() => setReloadTick((n) => n + 1)}
               >
-                <RotateCcw className="size-3.5" />
+                <RotateCcw className="size-3.5" strokeWidth={1.75} />
                 重试加载
               </Button>
             )}
@@ -218,24 +218,24 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
           <div className="py-1 text-body text-muted">此会话中不可交互，请打开任务面板处理。</div>
         ) : ticket ? (
           <>
-            <p className="text-caption text-faint">
+            <p className="font-mono text-caption text-faint tabular-nums">
               {ticket.identifier}
               {ticket.type ? ` · ${TICKET_TYPE_LABEL[ticket.type as TicketType] ?? ticket.type}` : ""}
               {ticket.priority ? ` · ${ticket.priority}` : ""}
             </p>
-            <p className="mt-1 text-body font-medium text-fg">{ticket.title}</p>
-            {prompt ? <p className="mt-1 text-[13px] leading-snug text-muted">{prompt}</p> : null}
+            <p className="mt-1 text-section font-semibold text-fg">{ticket.title}</p>
+            {prompt ? <p className="mt-1 text-body leading-snug text-muted">{prompt}</p> : null}
             {ticket.body ? (
-              <div className="mt-1.5">
+              <div className="mt-2">
                 {bodyExpanded ? (
                   <div
                     data-testid="task-approval-body-expanded"
-                    className="rounded-md bg-bg/50 px-2.5 py-2 text-meta leading-relaxed text-muted [&_.prose]:text-meta [&_.prose]:leading-relaxed"
+                    className="oc-surface-recessed rounded-md px-3 py-2.5 text-meta leading-relaxed text-muted [&_.prose]:text-meta [&_.prose]:leading-relaxed"
                   >
                     <Markdown readOnly>{ticket.body}</Markdown>
                   </div>
                 ) : (
-                  <p className="line-clamp-3 whitespace-pre-wrap text-[13px] leading-snug text-muted">
+                  <p className="oc-surface-recessed line-clamp-3 whitespace-pre-wrap rounded-md px-3 py-2 text-body leading-snug text-muted">
                     {ticket.body}
                   </p>
                 )}
@@ -245,9 +245,9 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
                     data-testid="task-approval-body-toggle"
                     aria-expanded={bodyExpanded}
                     onClick={() => setBodyExpanded((v) => !v)}
-                    className="mt-1 inline-flex items-center gap-1 text-caption font-medium text-accent hover:underline [@media(hover:none)]:min-h-11"
+                    className="mt-1.5 inline-flex items-center gap-1 rounded-xs text-caption font-medium text-accent outline-none transition-colors hover:text-accent-strong hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
                   >
-                    <ChevronDown className={cn("size-3.5 transition-transform", bodyExpanded && "rotate-180")} />
+                    <ChevronDown className={cn("size-3.5 transition-transform duration-150", bodyExpanded && "rotate-180")} strokeWidth={1.75} />
                     {bodyExpanded ? "收起详情" : "展开完整详情"}
                   </button>
                 )}
@@ -258,21 +258,23 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
           <div className="py-1 text-body text-muted">未找到任务单 {id}</div>
         )}
 
-        {error ? <p className="mt-2 text-caption text-danger">{error}</p> : null}
+        {error ? (
+          <p className="oc-callout oc-callout-danger mt-2 rounded-md px-2.5 py-1.5 text-caption text-danger">{error}</p>
+        ) : null}
         {chatBusy && approvable && !loading && !loadError ? (
           <output data-testid="task-approval-busy-hint" className="mt-2 block text-caption text-faint">
             等待当前回合结束后可操作
           </output>
         ) : null}
         {settled === "approve" ? (
-          <p className="mt-2 text-caption text-success">已在对话中确认</p>
+          <p className="mt-2 text-caption font-medium text-success">已在对话中确认</p>
         ) : null}
-        {settled === "reject" ? <p className="mt-2 text-caption text-danger">已打回</p> : null}
+        {settled === "reject" ? <p className="mt-2 text-caption font-medium text-danger">已打回</p> : null}
         {settled === "defer" ? <p className="mt-2 text-caption text-faint">已暂不处理</p> : null}
         {manualFollowUp ? <p className="mt-1 text-caption text-faint">{manualFollowUp}</p> : null}
 
         {rejectOpen && approvable && (
-          <div className="mt-2">
+          <div className="mt-2.5">
             <Textarea
               value={rejectReason}
               onChange={(e) => setRejectReason(e.target.value)}
@@ -283,7 +285,7 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
           </div>
         )}
 
-        <div className="mt-2 flex flex-wrap items-center gap-2">
+        <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/60 pt-2.5">
           {taskApproval && (loading || approvable) && !loadError ? (
             <>
               <Button

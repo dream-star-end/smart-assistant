@@ -5,9 +5,13 @@ import {
   Check,
   Clock,
   Cpu,
+  FileOutput,
+  FileText,
+  Folder,
   FolderInput,
   Globe,
   House,
+  MessageSquare,
   MessageSquarePlus,
   Moon,
   PanelRight,
@@ -467,7 +471,7 @@ export function CommandPalette(props: CommandPaletteProps) {
   return (
     <RD.Root open={open} onOpenChange={onOpenChange}>
       <RD.Portal>
-        <RD.Overlay className="fixed inset-0 z-50 bg-black/30 data-[state=open]:animate-fade" />
+        <RD.Overlay className="fixed inset-0 z-50 bg-black/35 backdrop-blur-xs data-[state=open]:animate-fade" />
         <RD.Content
           aria-describedby={undefined}
           data-testid="command-palette"
@@ -492,8 +496,8 @@ export function CommandPalette(props: CommandPaletteProps) {
             }
           }}
           className={cn(
-            "oc-palette-shell fixed inset-0 top-[var(--oc-visual-offset-top,0px)] bottom-auto z-50 flex h-[var(--oc-visual-height,100dvh)] flex-col overflow-hidden bg-elevated outline-none pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] data-[state=open]:animate-in",
-            "md:inset-auto md:left-1/2 md:top-[12vh] md:h-auto md:max-h-[min(74vh,38rem)] md:w-[min(42rem,calc(100vw-2rem))] md:-translate-x-1/2 md:rounded-xl md:border md:border-border md:pb-0 md:pt-0 md:shadow-float",
+            "oc-palette-shell oc-surface-popover fixed inset-0 top-[var(--oc-visual-offset-top,0px)] bottom-auto z-50 flex h-[var(--oc-visual-height,100dvh)] flex-col overflow-hidden outline-none pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] data-[state=open]:animate-in",
+            "md:inset-auto md:left-1/2 md:top-[11vh] md:h-auto md:max-h-[min(74vh,39rem)] md:w-[min(42rem,calc(100vw-2rem))] md:-translate-x-1/2 md:rounded-xl md:pb-0 md:pt-0",
           )}
         >
           <RD.Title className="sr-only">快速跳转</RD.Title>
@@ -503,12 +507,14 @@ export function CommandPalette(props: CommandPaletteProps) {
                 type="button"
                 aria-label="返回"
                 onClick={backToList}
-                className="flex h-11 w-9 shrink-0 items-center justify-center rounded-sm text-muted hover:text-fg focus-visible:ring-2 focus-visible:ring-ring md:h-8"
+                className="oc-btn-tactile flex h-11 w-9 shrink-0 items-center justify-center rounded-sm text-muted hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring md:h-8"
               >
-                <ArrowLeft size={16} />
+                <ArrowLeft size={16} strokeWidth={1.75} />
               </button>
             ) : (
-              <Search size={16} aria-hidden className="shrink-0 text-faint" />
+              <span aria-hidden className="oc-icon-badge oc-icon-badge-accent size-7 rounded-sm">
+                <Search size={14} strokeWidth={1.75} />
+              </span>
             )}
             <input
               ref={inputRef}
@@ -524,12 +530,15 @@ export function CommandPalette(props: CommandPaletteProps) {
               placeholder={placeholder}
               autoComplete="off"
               spellCheck={false}
-              className="h-14 min-w-0 flex-1 bg-transparent text-base text-fg outline-none placeholder:text-faint md:h-12"
+              className="h-14 min-w-0 flex-1 bg-transparent text-base text-fg outline-none placeholder:text-faint md:h-13"
             />
+            <kbd aria-hidden className="oc-kbd hidden shrink-0 md:inline-flex">
+              Esc
+            </kbd>
             <RD.Close asChild>
               <button
                 type="button"
-                className="flex h-11 shrink-0 items-center rounded-sm px-2 text-sm text-muted hover:text-fg focus-visible:ring-2 focus-visible:ring-ring md:hidden"
+                className="oc-btn-tactile flex h-11 shrink-0 items-center rounded-sm px-2 text-sm text-muted hover:text-fg focus-visible:ring-2 focus-visible:ring-ring md:hidden"
               >
                 取消
               </button>
@@ -552,8 +561,10 @@ export function CommandPalette(props: CommandPaletteProps) {
                     inputRef.current?.focus();
                   }}
                   className={cn(
-                    "min-h-11 shrink-0 rounded-full px-3 text-meta transition-colors md:min-h-7 md:px-2.5",
-                    filter === f.id ? "bg-accent-soft text-accent" : "text-muted hover:bg-hover hover:text-fg",
+                    "oc-btn-tactile min-h-11 shrink-0 rounded-full px-3 text-meta font-medium md:min-h-7 md:px-2.5",
+                    filter === f.id
+                      ? "oc-badge-craft bg-accent-soft text-accent"
+                      : "text-muted hover:bg-hover hover:text-fg",
                   )}
                 >
                   {f.label}
@@ -567,10 +578,10 @@ export function CommandPalette(props: CommandPaletteProps) {
             id={listId}
             role="listbox"
             aria-label="结果"
-            className="min-h-0 flex-1 overflow-y-auto px-2 py-2"
+            className="min-h-0 flex-1 space-y-1 overflow-y-auto px-2 py-2"
           >
             {groups.map((g) => (
-              <div key={g.id} role="group" aria-label={g.label} className="mb-1">
+              <div key={g.id} role="group" aria-label={g.label} className="mb-1.5 last:mb-0">
                 <div className="oc-palette-group-head">
                   <span>{g.label}</span>
                   {g.items.length > 1 && (
@@ -579,36 +590,51 @@ export function CommandPalette(props: CommandPaletteProps) {
                     </span>
                   )}
                 </div>
-                {g.items.map((item) => {
-                  const idx = flat.indexOf(item);
-                  return (
-                    <PaletteRow
-                      key={item.key}
-                      id={paletteOptionId(listId, item.key)}
-                      item={item}
-                      selected={idx === activeIndex}
-                      query={mode === "list" ? q : ""}
-                      inCurrentGroup={g.id === "current"}
-                      projectName={projectName}
-                      onHover={() => setActiveKeyState(item.key)}
-                      onClick={() => activate(item)}
-                    />
-                  );
-                })}
+                <div className="space-y-0.5">
+                  {g.items.map((item) => {
+                    const idx = flat.indexOf(item);
+                    return (
+                      <PaletteRow
+                        key={item.key}
+                        id={paletteOptionId(listId, item.key)}
+                        item={item}
+                        selected={idx === activeIndex}
+                        query={mode === "list" ? q : ""}
+                        inCurrentGroup={g.id === "current"}
+                        projectName={projectName}
+                        onHover={() => setActiveKeyState(item.key)}
+                        onClick={() => activate(item)}
+                      />
+                    );
+                  })}
+                </div>
               </div>
             ))}
             {flat.length === 0 && (
-              <div className="px-3 py-8 text-center text-sm text-muted">
-                {searching ? "正在搜索…" : mode === "move" ? "没有可移入的项目" : "没有找到匹配的结果"}
+              <div className="flex flex-col items-center justify-center gap-2 px-3 py-10 text-center">
+                <span aria-hidden className="oc-icon-badge size-9 rounded-md">
+                  <Search size={16} strokeWidth={1.75} />
+                </span>
+                <span className="text-sm text-muted">
+                  {searching ? "正在搜索…" : mode === "move" ? "没有可移入的项目" : "没有找到匹配的结果"}
+                </span>
               </div>
             )}
           </div>
           <div className="oc-palette-footer">
-            <span>
-              <kbd className="oc-palette-kbd">↑↓</kbd> 选择 ·{" "}
-              <kbd className="oc-palette-kbd">Enter</kbd> 执行 ·{" "}
-              <kbd className="oc-palette-kbd">Tab</kbd> 限定类型 ·{" "}
-              <kbd className="oc-palette-kbd">Esc</kbd> {mode === "move" ? "返回" : "关闭"}
+            <span className="flex items-center gap-3">
+              <span className="inline-flex items-center gap-1">
+                <kbd className="oc-kbd">↑↓</kbd> 选择
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <kbd className="oc-kbd">↵</kbd> 执行
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <kbd className="oc-kbd">Tab</kbd> 限定类型
+              </span>
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <kbd className="oc-kbd">Esc</kbd> {mode === "move" ? "返回" : "关闭"}
             </span>
           </div>
         </RD.Content>
@@ -677,6 +703,26 @@ function liveIndicator(bucket: "needs_you" | "running" | "unread_done") {
   return <StatusPill status="done" variant="dot" size="sm" decorative />;
 }
 
+function actionBadgeTone(id: PaletteActionId): string {
+  switch (id) {
+    case "open-quick-ask":
+    case "toggle-swarm":
+    case "new-session":
+    case "new-in-project":
+      return "oc-icon-badge-accent";
+    case "open-goal":
+      return "oc-icon-badge-warning";
+    case "open-sites":
+    case "open-board":
+      return "oc-icon-badge-info";
+    case "open-memory":
+    case "open-skills":
+      return "oc-icon-badge-success";
+    default:
+      return "";
+  }
+}
+
 function PaletteRow({
   id,
   item,
@@ -708,11 +754,15 @@ function PaletteRow({
   };
   switch (item.kind) {
     case "project":
-      lead = <Badge size="sm" tone="neutral">项目</Badge>;
+      lead = (
+        <span aria-hidden className="oc-icon-badge size-7 rounded-sm">
+          <Folder size={14} strokeWidth={1.75} />
+        </span>
+      );
       body = (
         <span className="flex min-w-0 items-center gap-2">
           <ProjectDot color={item.project.color} />
-          <span className="truncate">
+          <span className="truncate font-medium">
             <HighlightedText text={item.project.name} query={query} />
           </span>
           {item.project.archivedAt ? <Badge size="sm" tone="warning">已归档</Badge> : null}
@@ -728,10 +778,12 @@ function PaletteRow({
           <span>{liveText}</span>
         </span>
       ) : (
-        <Badge size="sm" tone="accent">会话</Badge>
+        <span aria-hidden className="oc-icon-badge oc-icon-badge-accent size-7 rounded-sm">
+          <MessageSquare size={13.5} strokeWidth={1.75} />
+        </span>
       );
       body = (
-        <span className="truncate">
+        <span className="truncate font-medium">
           {prefix(item.projectId)}
           <HighlightedText text={item.title} query={query} />
         </span>
@@ -748,14 +800,29 @@ function PaletteRow({
     }
     case "asset":
       lead = (
-        <Badge size="sm" tone={item.asset.source === "output" ? "info" : "neutral"}>
-          {item.asset.source === "output" ? "产出" : "文件"}
-        </Badge>
+        <span
+          aria-hidden
+          className={cn(
+            "oc-icon-badge size-7 rounded-sm",
+            item.asset.source === "output" && "oc-icon-badge-info",
+          )}
+        >
+          {item.asset.source === "output" ? (
+            <FileOutput size={14} strokeWidth={1.75} />
+          ) : (
+            <FileText size={14} strokeWidth={1.75} />
+          )}
+        </span>
       );
       body = (
-        <span className="truncate">
-          {prefix(item.asset.projectId)}
-          <HighlightedText text={item.asset.name} query={query} />
+        <span className="flex min-w-0 items-center gap-1.5">
+          <span className="truncate font-medium">
+            {prefix(item.asset.projectId)}
+            <HighlightedText text={item.asset.name} query={query} />
+          </span>
+          <Badge size="sm" tone={item.asset.source === "output" ? "info" : "neutral"}>
+            {item.asset.source === "output" ? "产出" : "文件"}
+          </Badge>
         </span>
       );
       if (item.asset.excerpt && query && !item.asset.name.toLowerCase().includes(query.toLowerCase())) {
@@ -768,10 +835,14 @@ function PaletteRow({
       trail = when(item.asset.createdAt);
       break;
     case "site":
-      lead = <Badge size="sm" tone="info">站点</Badge>;
+      lead = (
+        <span aria-hidden className="oc-icon-badge oc-icon-badge-info size-7 rounded-sm">
+          <Globe size={14} strokeWidth={1.75} />
+        </span>
+      );
       body = (
         <span className="flex min-w-0 items-center gap-2">
-          <span className="truncate">
+          <span className="truncate font-medium">
             <HighlightedText text={item.site.title || item.site.slug} query={query} />
           </span>
           {item.site.hasServerApi ? <Badge size="sm" tone="neutral">全栈</Badge> : null}
@@ -785,7 +856,21 @@ function PaletteRow({
       trail = item.site.visibility === "password" ? "密码保护" : item.site.visibility === "disabled" ? "已停用" : "在线";
       break;
     case "model":
-      lead = <Cpu size={15} aria-hidden className="shrink-0 text-muted" />;
+      lead = (
+        <span
+          aria-hidden
+          className={cn(
+            "oc-icon-badge size-7 rounded-sm",
+            item.meta.isCurrent
+              ? "oc-icon-badge-success"
+              : item.meta.isFlagship
+                ? "oc-icon-badge-accent"
+                : "",
+          )}
+        >
+          <Cpu size={14} strokeWidth={1.75} />
+        </span>
+      );
       body = (
         <span className="flex min-w-0 items-center gap-1.5">
           <span className="truncate font-medium">
@@ -798,7 +883,7 @@ function PaletteRow({
           )}
           {item.meta.isCurrent && (
             <span data-testid="palette-model-current" className="oc-palette-model-current">
-              <Check size={11} aria-hidden />
+              <Check size={11} strokeWidth={2.25} aria-hidden />
               当前
             </span>
           )}
@@ -817,32 +902,40 @@ function PaletteRow({
       break;
     case "action": {
       const Icon = actionIcon(item.action.id);
-      lead = <Icon size={15} aria-hidden className="shrink-0 text-muted" />;
-      body = <span className="truncate">{item.action.label}</span>;
-      trail = item.action.hint ?? null;
+      lead = (
+        <span aria-hidden className={cn("oc-icon-badge size-7 rounded-sm", actionBadgeTone(item.action.id))}>
+          <Icon size={14} strokeWidth={1.75} />
+        </span>
+      );
+      body = <span className="truncate font-medium">{item.action.label}</span>;
+      trail = item.action.hint ? <kbd className="oc-kbd">{item.action.hint}</kbd> : null;
       break;
     }
     case "move-target":
-      lead = item.projectId ? (
-        <ProjectDot color={item.color} />
-      ) : (
-        <span aria-hidden className="size-2 shrink-0 rounded-full border border-border" />
+      lead = (
+        <span aria-hidden className="oc-icon-badge size-7 rounded-sm">
+          {item.projectId ? (
+            <ProjectDot color={item.color} />
+          ) : (
+            <Folder size={14} strokeWidth={1.75} />
+          )}
+        </span>
       );
       body = (
-        <span className="truncate">
+        <span className="truncate font-medium">
           <HighlightedText text={item.label} query={query} />
         </span>
       );
       break;
   }
-  const enterHint =
+  const enterLabel =
     item.kind === "action" && item.action.id === "move-session"
-      ? "Enter 选择"
+      ? "选择"
       : item.kind === "model"
         ? item.disabled
           ? "暂不可选"
-          : "Enter 切换"
-        : "Enter 打开";
+          : "切换"
+        : "打开";
   return (
     <div
       id={id}
@@ -855,8 +948,7 @@ function PaletteRow({
       onMouseDown={(e) => e.preventDefault()}
       onClick={onClick}
       className={cn(
-        "oc-palette-row flex min-h-11 cursor-pointer items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm text-fg md:min-h-9",
-        selected && "bg-hover",
+        "oc-palette-row flex min-h-11 cursor-pointer items-center gap-2.5 rounded-md px-2.5 py-2 text-sm text-fg md:min-h-10",
       )}
     >
       {lead}
@@ -865,13 +957,14 @@ function PaletteRow({
         {sub}
       </span>
       {selected ? (
-        <span aria-hidden className="hidden shrink-0 text-caption text-muted md:inline">
-          {enterHint}
+        <span aria-hidden className="hidden shrink-0 items-center gap-1.5 text-caption font-medium text-accent md:inline-flex">
+          <span>{enterLabel}</span>
+          {!disabled && <kbd className="oc-kbd">↵</kbd>}
         </span>
       ) : trail ? (
         <span
           aria-hidden={item.kind === "action" ? true : undefined}
-          className="shrink-0 text-caption text-faint"
+          className="shrink-0 text-caption tabular-nums text-faint"
         >
           {trail}
         </span>

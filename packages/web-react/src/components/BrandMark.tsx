@@ -6,26 +6,26 @@
 export function BrandMark({
   className = 'size-9',
   glow = false,
-  fontSize = 'text-[19px]',
-  rounded = 'rounded-[11px]',
+  fontSize = 'text-lg',
+  rounded = 'rounded-md',
   flat = false,
 }: {
   className?: string
   glow?: boolean
   fontSize?: string
-  /** 小尺寸（侧栏 28px）按比例收圆角，避免 11px 圆角在小方块上糊成圆形。 */
+  /** 小尺寸（侧栏 26px）按比例收圆角，避免大圆角在小方块上糊成圆形。 */
   rounded?: string
-  /** 不带投影（工作区内的小尺寸品牌位，大投影会显脏）。 */
+  /** 不带外投影（工作区内的小尺寸品牌位，大投影会显脏；仍保留内高光雕塑感）。 */
   flat?: boolean
 }) {
   return (
     <span
       aria-hidden
-      className={`${className} grid shrink-0 place-items-center ${rounded} bg-brand ${fontSize} font-black leading-none text-brand-fg${
-        glow ? ' shadow-brand-glow' : flat ? '' : ' shadow-float'
+      className={`${className} relative grid shrink-0 select-none place-items-center overflow-hidden ${rounded} bg-brand ${fontSize} font-black leading-none tracking-tight text-brand-fg ring-1 ring-inset ring-black/15 before:pointer-events-none before:absolute before:inset-0 before:bg-gradient-to-b before:from-white/40 before:via-white/5 before:to-black/10${
+        glow ? ' shadow-brand-glow' : flat ? ' shadow-xs' : ' shadow-float'
       }`}
     >
-      从
+      <span className="relative z-[1] drop-shadow-xs">从</span>
     </span>
   )
 }

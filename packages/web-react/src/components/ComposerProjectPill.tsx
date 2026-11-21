@@ -12,14 +12,14 @@ import {
 } from "./ui/DropdownMenu";
 
 const PILL =
-  "inline-flex min-w-0 max-w-[11rem] items-center gap-1.5 rounded-full border px-2.5 py-1 text-meta font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98] sm:max-w-[16rem]";
+  "oc-btn-tactile inline-flex min-w-0 max-w-[11rem] items-center gap-1.5 rounded-full px-2.5 py-1 text-caption font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:max-w-[16rem]";
 
 function ProjectDot({ color }: { color: string | null | undefined }) {
   const swatch = PROJECT_COLORS.find((c) => c.key === color);
   return swatch ? (
-    <span aria-hidden className={cn("size-2 shrink-0 rounded-full", swatch.dotClass)} />
+    <span aria-hidden className={cn("size-2 shrink-0 rounded-full ring-1 ring-inset ring-black/10", swatch.dotClass)} />
   ) : (
-    <FolderOpen size={14} aria-hidden className="shrink-0" />
+    <FolderOpen size={13} strokeWidth={1.75} aria-hidden className="shrink-0" />
   );
 }
 
@@ -50,7 +50,7 @@ export function ComposerProjectPill({
       <button
         type="button"
         data-testid="composer-project-pill"
-        className={cn(PILL, "border-accent/40 bg-accent-soft text-accent hover:border-accent/60")}
+        className={cn(PILL, "oc-badge-craft bg-accent-soft text-accent hover:bg-accent/15")}
         aria-label={`所在项目：${current.name}，点击打开项目`}
         title={`所在项目：${current.name}`}
         onClick={() => onOpen?.(current.id)}
@@ -71,30 +71,30 @@ export function ComposerProjectPill({
           className={cn(
             PILL,
             current
-              ? "border-accent/40 bg-accent-soft text-accent hover:border-accent/60"
-              : "border-border text-muted hover:border-border-strong hover:bg-hover hover:text-fg",
+              ? "oc-badge-craft bg-accent-soft text-accent hover:bg-accent/15"
+              : "oc-btn-secondary-craft text-muted hover:text-fg",
           )}
           aria-label={current ? `这条会话会放进项目「${current.name}」，点击更改` : "选择项目（当前不放进项目）"}
           title={current ? `会放进项目「${current.name}」` : "选择项目"}
         >
-          {current ? <ProjectDot color={current.color} /> : <Folder size={14} aria-hidden className="shrink-0" />}
+          {current ? <ProjectDot color={current.color} /> : <Folder size={13} strokeWidth={1.75} aria-hidden className="shrink-0" />}
           <span className="truncate">{current ? current.name : "不放进项目"}</span>
         </button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" side="top" className="max-h-[50vh] min-w-[12rem] overflow-y-auto">
+      <DropdownMenuContent align="start" side="top" className="max-h-[50vh] min-w-[12.5rem] overflow-y-auto">
         <DropdownMenuLabel>这条新会话放进</DropdownMenuLabel>
         {projects.map((p) => (
           <DropdownMenuItem key={p.id} onSelect={() => onPick?.(p.id)}>
             <ProjectDot color={p.color} />
             <span className="min-w-0 flex-1 truncate">{p.name}</span>
-            {p.id === current?.id && <Check size={14} aria-hidden className="shrink-0 text-accent" />}
+            {p.id === current?.id && <Check size={14} strokeWidth={2.25} aria-hidden className="shrink-0 text-accent" />}
           </DropdownMenuItem>
         ))}
         {projects.length > 0 && <DropdownMenuSeparator />}
         <DropdownMenuItem onSelect={() => onPick?.(null)}>
-          <Folder size={14} aria-hidden className="shrink-0 text-muted" />
+          <Folder size={14} strokeWidth={1.75} aria-hidden className="shrink-0 text-muted" />
           <span className="flex-1">不放进项目</span>
-          {!current && <Check size={14} aria-hidden className="shrink-0 text-accent" />}
+          {!current && <Check size={14} strokeWidth={2.25} aria-hidden className="shrink-0 text-accent" />}
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

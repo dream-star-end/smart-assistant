@@ -21,7 +21,8 @@
   --border-strong: rgba(28, 25, 23, 0.16);
   --success: #156e42;
   --danger: #b4232c;
-  --shadow: 0 12px 34px rgba(24, 24, 27, 0.1), 0 2px 8px rgba(24, 24, 27, 0.06);
+  --shadow: 0 12px 34px -4px rgba(24, 24, 27, 0.11), 0 2px 8px rgba(24, 24, 27, 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.82);
+  --specular: rgba(255, 255, 255, 0.78);
   --focus: #a5421c;
 }
 
@@ -47,7 +48,8 @@
   --border-strong: rgba(242, 240, 236, 0.16);
   --success: #42c282;
   --danger: #f06e75;
-  --shadow: 0 14px 40px rgba(0, 0, 0, 0.36), 0 2px 10px rgba(0, 0, 0, 0.22);
+  --shadow: 0 16px 42px -4px rgba(0, 0, 0, 0.46), 0 2px 10px rgba(0, 0, 0, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.075);
+  --specular: rgba(255, 255, 255, 0.08);
   --focus: #df7e59;
 }
 
@@ -239,9 +241,14 @@ button:focus-visible,
   align-items: center;
   justify-content: center;
   border: 1px solid transparent;
-  border-radius: 7px;
+  border-radius: 8px;
   background: transparent;
-  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+  transition:
+    transform 140ms cubic-bezier(0.22, 1, 0.36, 1),
+    background-color 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease,
+    box-shadow 160ms ease;
   -webkit-app-region: no-drag;
   app-region: no-drag;
 }
@@ -258,6 +265,7 @@ button:focus-visible,
 .show-download-button:hover {
   border-color: var(--border);
   background: var(--surface-hover);
+  box-shadow: inset 0 1px 0 var(--specular);
 }
 
 .icon-button:not(:disabled):active,
@@ -265,6 +273,7 @@ button:focus-visible,
 .text-button:active,
 .show-download-button:active {
   background: var(--surface-pressed);
+  transform: scale(0.96);
 }
 
 .icon-button:disabled,
@@ -395,8 +404,8 @@ button:focus-visible,
   min-width: 300px;
   flex-direction: column;
   overflow: hidden;
-  border: 1px solid var(--border);
-  border-radius: 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 16px;
   background: var(--surface);
   box-shadow: var(--shadow);
 }
@@ -459,7 +468,8 @@ button:focus-visible,
   align-items: center;
   gap: 10px;
   padding: 8px;
-  border-radius: 8px;
+  border-radius: 10px;
+  transition: background-color 140ms ease;
 }
 
 .download-item + .download-item {
@@ -474,13 +484,16 @@ button:focus-visible,
 
 .download-icon {
   display: grid;
-  width: 32px;
-  height: 32px;
+  width: 34px;
+  height: 34px;
   place-items: center;
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
+  border-radius: 9px;
   color: var(--accent);
   background: var(--accent-soft);
+  box-shadow:
+    inset 0 1px 0 var(--specular),
+    0 1px 2px color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
 .download-icon .fluent-icon {
@@ -577,10 +590,10 @@ button:focus-visible,
   top: 50%;
   left: 50%;
   width: min(430px, calc(100% - 48px));
-  padding: 30px;
+  padding: 32px;
   transform: translate(-50%, -50%);
-  border: 1px solid var(--border);
-  border-radius: 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 16px;
   background: var(--surface);
   box-shadow: var(--shadow);
   text-align: center;
@@ -588,14 +601,17 @@ button:focus-visible,
 
 .offline-symbol {
   display: grid;
-  width: 52px;
-  height: 52px;
+  width: 54px;
+  height: 54px;
   margin: 0 auto 14px;
   place-items: center;
-  border: 1px solid var(--border);
-  border-radius: 13px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
+  border-radius: 14px;
   color: var(--accent);
   background: var(--accent-soft);
+  box-shadow:
+    inset 0 1px 0 var(--specular),
+    0 4px 12px -4px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 
 .offline-symbol .fluent-icon {
@@ -617,23 +633,35 @@ button:focus-visible,
 }
 
 .primary-button {
-  min-height: 36px;
+  min-height: 38px;
   gap: 7px;
-  padding: 0 15px;
+  padding: 0 16px;
   border-color: var(--text);
   color: var(--canvas);
-  background: var(--text);
+  background-color: var(--text);
+  background-image: linear-gradient(180deg, color-mix(in srgb, #ffffff 10%, var(--text)) 0%, var(--text) 100%);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.2),
+    0 4px 12px -3px rgba(0, 0, 0, 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.16);
   font-weight: 600;
 }
 
 .primary-button:hover {
   border-color: var(--accent-hover);
-  background: var(--accent-hover);
+  background-color: var(--accent-hover);
+  background-image: linear-gradient(180deg, color-mix(in srgb, #ffffff 12%, var(--accent-hover)) 0%, var(--accent-hover) 100%);
+  box-shadow:
+    0 2px 5px color-mix(in srgb, var(--accent) 32%, transparent),
+    0 8px 18px -4px color-mix(in srgb, var(--accent) 28%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.22);
 }
 
 .primary-button:active {
   border-color: var(--accent-pressed);
-  background: var(--accent-pressed);
+  background-color: var(--accent-pressed);
+  background-image: none;
+  transform: scale(0.97);
 }
 
 .offline-network {
@@ -757,6 +785,14 @@ body[data-shell-mode="downloads"] .downloads-layer {
     transition-duration: 0.01ms !important;
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
+  }
+
+  .icon-button:not(:disabled):active,
+  .downloads-button:not(:disabled):active,
+  .text-button:active,
+  .show-download-button:active,
+  .primary-button:active {
+    transform: none;
   }
 }
 

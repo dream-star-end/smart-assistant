@@ -34,20 +34,19 @@ import { Spinner } from "./Spinner";
  * 调用方不必再逐处手写这条。
  */
 export const buttonVariants = cva(
-  "inline-flex select-none items-center justify-center gap-2 whitespace-nowrap font-medium outline-none transition-[background-color,color,box-shadow,transform,opacity] duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.97] disabled:pointer-events-none disabled:opacity-50",
+  "oc-btn-tactile inline-flex select-none items-center justify-center gap-2 whitespace-nowrap font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg disabled:pointer-events-none disabled:opacity-50 [&_svg]:shrink-0",
   {
     variants: {
       variant: {
-        primary: "bg-primary text-primary-fg hover:opacity-90",
+        primary: "bg-primary text-primary-fg oc-btn-primary-craft",
         gradient: "bg-grad-cta text-white shadow-soft hover:brightness-110",
-        accent: "bg-accent text-accent-fg shadow-soft hover:bg-accent-strong",
-        secondary:
-          "border border-border bg-surface text-fg hover:border-border-strong hover:bg-hover",
-        ghost: "text-fg hover:bg-hover",
+        accent: "bg-accent text-accent-fg oc-btn-accent-craft hover:bg-accent-strong",
+        secondary: "bg-surface text-fg oc-btn-secondary-craft",
+        ghost: "text-fg hover:bg-hover active:bg-active",
         subtle: "bg-hover text-fg hover:bg-active",
         // 前景走 --danger-fg 而不是写死白字:暗色主题的 --danger 是为前景用途调亮过的
         // #f0666e,配白字只有 3.07:1(shell 审计 S-03);明暗各配一档由 designTokens.test 守住。
-        danger: "bg-danger text-danger-fg hover:opacity-90",
+        danger: "bg-danger text-danger-fg oc-btn-danger-craft",
         link: "text-accent underline-offset-4 hover:underline",
       },
       // 字号走语义档位(text-body=13px / text-title=15px),像素与原 text-[13px]/text-[15px]

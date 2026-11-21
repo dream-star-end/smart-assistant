@@ -51,6 +51,22 @@ const GLYPH_DOT: Record<SemanticTone, string> = {
   idle: "bg-status-idle",
 };
 
+const CALLOUT_TONE: Record<SemanticTone, string> = {
+  running: "oc-callout oc-callout-info",
+  attention: "oc-callout oc-callout-warning",
+  done: "oc-callout oc-callout-success",
+  failed: "oc-callout oc-callout-danger",
+  idle: "oc-callout",
+};
+
+const ICON_BADGE_TONE: Record<SemanticTone, string> = {
+  running: "oc-icon-badge oc-icon-badge-accent",
+  attention: "oc-icon-badge oc-icon-badge-warning",
+  done: "oc-icon-badge oc-icon-badge-success",
+  failed: "oc-icon-badge oc-icon-badge-danger",
+  idle: "oc-icon-badge",
+};
+
 export function Notice({
   tone = "info",
   title,
@@ -71,17 +87,18 @@ export function Notice({
     <div
       data-notice-tone={tone}
       className={cn(
-        "flex items-start gap-2.5 rounded-md border border-border bg-surface px-3.5 py-3 text-body",
+        "flex items-start gap-3 rounded-xl px-3.5 py-3 text-body",
+        CALLOUT_TONE[spec.tone],
         className,
       )}
       {...rest}
     >
-      {/* 图标框与标题首行等高(13px × 1.55 ≈ 20px),多行标题时图标仍对齐第一行。 */}
-      <span aria-hidden="true" className="flex h-5 w-3.5 shrink-0 items-center justify-center">
+      {/* 图标徽章容器与标题首行光学对齐,多行标题时图标仍稳居左上。 */}
+      <span aria-hidden="true" className={cn("mt-0.5 size-6 rounded-md", ICON_BADGE_TONE[spec.tone])}>
         {Icon ? (
           <Icon
             size={14}
-            strokeWidth={1.75}
+            strokeWidth={1.85}
             fill={spec.filled ? "currentColor" : "none"}
             className={GLYPH_TEXT[spec.tone]}
           />
@@ -97,14 +114,16 @@ export function Notice({
       </span>
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline gap-2">
-          <div className="min-w-0 font-medium text-fg">{title}</div>
+          <div className="min-w-0 font-semibold text-fg">{title}</div>
           {count != null && count > 1 && (
-            <span className="shrink-0 text-meta tabular-nums text-faint">×{count}</span>
+            <span className="oc-badge-craft shrink-0 rounded-full bg-hover px-1.5 py-0.5 text-caption font-medium tabular-nums text-faint">
+              ×{count}
+            </span>
           )}
         </div>
-        {children != null && <div className="mt-0.5 text-muted">{children}</div>}
+        {children != null && <div className="mt-0.5 leading-relaxed text-muted">{children}</div>}
         {hasFooter && (
-          <div className="mt-2 flex flex-wrap items-center gap-2">
+          <div className="mt-2.5 flex flex-wrap items-center gap-2">
             {actions?.map((a, i) => (
               <Button
                 key={a.label}
@@ -123,13 +142,13 @@ export function Notice({
                 aria-expanded={open}
                 aria-controls={detailsId}
                 onClick={() => setOpen((v) => !v)}
-                className="inline-flex items-center gap-0.5 rounded-sm px-1 text-meta text-faint outline-none transition-colors hover:text-muted focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+                className="inline-flex items-center gap-0.5 rounded-md px-1.5 py-1 text-meta font-medium text-faint outline-none transition-colors hover:bg-hover hover:text-muted focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
               >
                 {detailsLabel}
                 <ChevronRight
                   aria-hidden="true"
                   size={12}
-                  className={cn("transition-transform", open && "rotate-90")}
+                  className={cn("transition-transform duration-150", open && "rotate-90")}
                 />
               </button>
             )}
@@ -139,7 +158,7 @@ export function Notice({
           <div
             id={detailsId}
             hidden={!open}
-            className="mt-2 max-h-48 select-text overflow-auto whitespace-pre-wrap break-all rounded-sm bg-hover px-2.5 py-2 font-mono text-meta text-muted"
+            className="oc-surface-recessed mt-2.5 max-h-48 select-text overflow-auto whitespace-pre-wrap break-all rounded-md px-3 py-2 font-mono text-meta text-muted"
           >
             {details}
           </div>

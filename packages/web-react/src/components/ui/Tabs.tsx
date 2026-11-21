@@ -34,7 +34,7 @@ export type TabsLayout = "scroll" | "grid";
  * 工具类整体排在全部无变体工具类之后(已核对 dist 产物,首个 `.md\:` 规则位于基础段尾部之后),
  * 因此断点变体恒胜出,不依赖两个 display 工具类在基础段内的相对顺序。
  */
-const tabListVariants = cva("no-scrollbar gap-1 overscroll-x-contain bg-hover p-1", {
+const tabListVariants = cva("oc-surface-recessed no-scrollbar gap-1 overscroll-x-contain p-1", {
   variants: {
     layout: {
       scroll: "inline-flex max-w-full overflow-x-auto rounded-full",
@@ -50,7 +50,7 @@ const tabListVariants = cva("no-scrollbar gap-1 overscroll-x-contain bg-hover p-
  * 调用方不必再逐处手写 `[@media(hover:none)]:min-h-11`(桌面端 hover 可用,渲染零变化)。
  */
 const tabVariants = cva(
-  "inline-flex items-center justify-center rounded-full text-body font-medium outline-none transition-colors duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:min-h-11",
+  "inline-flex items-center justify-center rounded-full text-body font-medium outline-none transition-[background-color,color,box-shadow] duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:min-h-11",
   {
     variants: {
       layout: {
@@ -59,7 +59,7 @@ const tabVariants = cva(
         grid: "min-w-0 px-2 py-1.5 md:shrink-0 md:px-4",
       },
       active: {
-        true: "bg-surface text-fg shadow-soft",
+        true: "oc-segmented-thumb text-fg",
         false: "text-muted hover:text-fg",
       },
     },

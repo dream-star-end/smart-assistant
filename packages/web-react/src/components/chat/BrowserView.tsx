@@ -57,36 +57,52 @@ function Window({ item, steps, index }: { item: BrowserTurnStep; steps: readonly
   const page = pageAt(steps, index);
   const title = step.title || page.title;
   return (
-    <div className="mx-4 overflow-hidden rounded-xl border border-border/80 bg-surface shadow-soft" data-testid="browser-window">
-      <div className="flex items-center gap-2 border-b border-border/70 bg-hover/50 px-3 py-2">
-        <span aria-hidden className="flex shrink-0 gap-1">
-          <span className="size-2 rounded-full bg-border" />
-          <span className="size-2 rounded-full bg-border" />
-          <span className="size-2 rounded-full bg-border" />
+    <div className="oc-surface-card mx-4 overflow-hidden rounded-lg" data-testid="browser-window">
+      <div className="lb-window-chrome">
+        <span aria-hidden className="lb-chrome-dots">
+          <span />
+          <span />
+          <span />
         </span>
         {page.url ? (
-          <AddressBar url={page.url} className="flex-1 bg-surface" />
+          <AddressBar url={page.url} className="flex-1" />
         ) : (
-          <span className="flex-1 truncate px-2 text-meta text-faint">还没有打开网页</span>
+          <span className="oc-surface-recessed flex-1 truncate rounded-full px-3 py-1.5 text-caption text-faint">
+            还没有打开网页
+          </span>
         )}
       </div>
       {title && (
-        <p className="truncate border-b border-border/50 px-4 py-2 text-meta font-medium text-fg" title={title} data-testid="browser-window-title">
+        <p
+          className="truncate border-b border-border/60 bg-surface px-4 py-2 text-meta font-medium text-fg"
+          title={title}
+          data-testid="browser-window-title"
+        >
           {title}
         </p>
       )}
       {shot ? (
-        <div className="flex justify-center bg-hover/40" data-testid="browser-window-shot">
-          <SignedImg src={shot} alt={title ? `${title} 截图` : "页面截图"} className="block max-h-[62vh] w-auto max-w-full object-contain" />
+        <div className="lb-window-stage-well" data-testid="browser-window-shot">
+          <div className="overflow-hidden rounded-xs border border-border/70 bg-surface shadow-soft">
+            <SignedImg src={shot} alt={title ? `${title} 截图` : "页面截图"} className="block max-h-[62vh] w-auto max-w-full object-contain" />
+          </div>
         </div>
       ) : (
-        <div className="flex flex-col items-center gap-2 px-6 py-10 text-center text-meta text-faint" data-testid="browser-window-noshot">
-          <ImageOff size={18} aria-hidden />
-          {step.running ? "正在操作浏览器…" : step.error ? "这一步没有成功，没有截图。" : "这一步没有截图。"}
+        <div className="flex flex-col items-center gap-2.5 bg-bg/40 px-6 py-10 text-center text-meta text-muted" data-testid="browser-window-noshot">
+          <span
+            aria-hidden
+            className={cn(
+              "oc-icon-badge size-10 rounded-md",
+              step.error ? "oc-icon-badge-danger" : step.running ? "oc-icon-badge-accent" : undefined,
+            )}
+          >
+            {step.running ? <Spinner size={16} /> : <ImageOff size={17} />}
+          </span>
+          <span>{step.running ? "正在操作浏览器…" : step.error ? "这一步没有成功，没有截图。" : "这一步没有截图。"}</span>
         </div>
       )}
       {shots.length > 1 && (
-        <div className="border-t border-border/70 px-3 py-2">
+        <div className="border-t border-border/70 bg-bg/60 px-3 py-2">
           <fieldset className="m-0 flex min-w-0 gap-1.5 overflow-x-auto border-0 p-0">
             <legend className="sr-only">这一步的截图</legend>
             {shots.map((s, i) => (
@@ -95,9 +111,9 @@ function Window({ item, steps, index }: { item: BrowserTurnStep; steps: readonly
           </fieldset>
         </div>
       )}
-      <div className="border-t border-border/70 px-4 py-2.5">
+      <div className="border-t border-border/70 bg-surface px-4 py-2.5">
         <ActionTrail step={step} />
-        {step.error && <p className="mt-1 break-words text-meta text-danger">{step.error.slice(0, 240)}</p>}
+        {step.error && <p className="mt-1.5 break-words text-meta text-danger">{step.error.slice(0, 240)}</p>}
       </div>
     </div>
   );
@@ -119,11 +135,14 @@ function LogRow({
   const { step } = item;
   const thumb = step.shots.at(-1) ?? step.requestedShots.at(-1) ?? null;
   const where = step.url ? displayAddress(step.url) : null;
+  const badgeState = step.error ? "error" : active ? "active" : "idle";
   return (
     <li
       className={cn(
-        "group relative flex items-center gap-3 rounded-lg px-2 py-2 transition-colors",
-        active ? "bg-accent-soft/60" : "hover:bg-hover",
+        "group relative flex items-center gap-3 rounded-md border px-2.5 py-2 transition-all",
+        active
+          ? "oc-surface-card border-accent/35 bg-accent-soft/40"
+          : "border-transparent hover:border-border/70 hover:bg-hover/70",
       )}
       data-testid="browser-log-row"
       aria-current={active || undefined}
@@ -131,19 +150,15 @@ function LogRow({
       <button
         type="button"
         onClick={onPick}
-        className="flex min-w-0 flex-1 items-center gap-3 text-left outline-none after:absolute after:inset-0 after:rounded-lg focus-visible:after:ring-2 focus-visible:after:ring-ring"
+        className="flex min-w-0 flex-1 items-center gap-3 text-left outline-none after:absolute after:inset-0 after:rounded-md focus-visible:after:ring-2 focus-visible:after:ring-ring"
       >
-        <span
-          aria-hidden
-          className={cn(
-            "flex size-6 shrink-0 items-center justify-center rounded-full text-[11px] font-semibold tabular-nums",
-            step.error ? "bg-danger-soft text-danger" : active ? "bg-accent text-accent-fg" : "bg-hover text-muted",
-          )}
-        >
+        <span aria-hidden className="lb-step-badge" data-state={badgeState}>
           {n}
         </span>
         <span className="min-w-0 flex-1">
-          <span className="block truncate text-meta text-fg">{step.actions.map((a) => a.label).join(" → ") || "浏览器操作"}</span>
+          <span className="block truncate text-meta font-medium text-fg">
+            {step.actions.map((a) => a.label).join(" → ") || "浏览器操作"}
+          </span>
           {where && (
             <span className="block truncate font-mono text-caption text-faint">
               {where.host}
@@ -152,7 +167,7 @@ function LogRow({
           )}
         </span>
         {thumb && (
-          <span className="h-9 w-14 shrink-0 overflow-hidden rounded border border-border/70 bg-surface">
+          <span className="h-9 w-14 shrink-0 overflow-hidden rounded-xs border border-border/80 bg-surface shadow-soft">
             <PlainSignedImg src={thumb} className="h-full w-full object-cover object-top" />
           </span>
         )}
@@ -162,7 +177,7 @@ function LogRow({
         onClick={onOpenStep}
         aria-label={`第 ${n} 步的详情`}
         title="在步骤里看完整输入输出"
-        className="relative z-10 shrink-0 rounded p-1 text-faint opacity-0 outline-none transition-opacity hover:text-fg focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover:opacity-100 [@media(hover:none)]:opacity-100"
+        className="oc-btn-tactile relative z-10 shrink-0 rounded-xs p-1 text-faint opacity-0 outline-none transition-opacity hover:bg-hover hover:text-fg focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover:opacity-100 [@media(hover:none)]:opacity-100"
       >
         <ChevronRight size={14} aria-hidden />
       </button>
@@ -214,7 +229,14 @@ function TurnBrowser({
       {item ? (
         <>
           <div
-            className="mx-4 mb-2.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 rounded-lg border border-border/70 bg-hover/40 px-3 py-2 text-caption text-muted"
+            className={cn(
+              "oc-callout mx-4 mb-3 flex flex-wrap items-center gap-x-2.5 gap-y-1.5 rounded-md px-3.5 py-2 text-caption text-muted",
+              isLive && !viewingHistory
+                ? "oc-callout-info"
+                : viewingHistory
+                  ? "oc-callout-warning"
+                  : "oc-callout-success",
+            )}
             data-testid="browser-status-banner"
           >
             {isLive && !viewingHistory ? (
@@ -232,7 +254,7 @@ function TurnBrowser({
                   type="button"
                   onClick={() => setPickedId(null)}
                   data-testid="browser-back-latest"
-                  className="inline-flex min-h-7 shrink-0 items-center gap-1 rounded-md px-2 text-caption font-medium text-accent outline-none hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+                  className="oc-btn-tactile oc-btn-secondary-craft inline-flex min-h-7 shrink-0 items-center gap-1 rounded-full px-2.5 text-caption font-medium text-accent outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
                 >
                   <ArrowDownToLine size={12} aria-hidden />
                   回到最新
@@ -250,12 +272,14 @@ function TurnBrowser({
           {/* key:换一步时缩略图选择从头来。 */}
           <Window key={idOf(item.message) || current} item={item} steps={steps} index={current} />
           <section className="px-4 pt-5 pb-6" data-testid="browser-log">
-            <h3 className="mb-2 flex items-center gap-1.5 text-caption font-medium uppercase tracking-wide text-faint">
-              <Globe size={12} aria-hidden />
+            <h3 className="mb-2.5 flex items-center gap-2 text-caption font-semibold uppercase tracking-wide text-muted">
+              <span aria-hidden className="oc-icon-badge size-5 rounded-xs">
+                <Globe size={11} />
+              </span>
               操作记录
-              <span className="tabular-nums">{steps.length}</span>
+              <span className="lb-seg-count">{steps.length}</span>
             </h3>
-            <ol className="-mx-2 space-y-0.5">
+            <ol className="-mx-2 space-y-1">
               {steps.map((s, i) => (
                 <LogRow
                   key={idOf(s.message) || i}
@@ -270,8 +294,10 @@ function TurnBrowser({
           </section>
         </>
       ) : (
-        <div className="flex flex-col items-center gap-2 px-8 py-12 text-center" data-testid="browser-empty">
-          <Globe size={20} className="text-faint" aria-hidden />
+        <div className="oc-surface-card mx-4 my-4 flex flex-col items-center gap-2.5 rounded-lg px-8 py-12 text-center" data-testid="browser-empty">
+          <span aria-hidden className="oc-icon-badge size-10 rounded-md">
+            <Globe size={18} />
+          </span>
           <p className="text-meta text-muted">这一轮没有用到浏览器。</p>
         </div>
       )}
@@ -338,13 +364,13 @@ export function BrowserView({
     <div className="min-h-0 flex-1 overflow-y-auto" data-testid="browser-view">
       {liveEnabled && stepCount > 0 && (
         <div className="lb-mode-bar" data-testid="browser-mode-switcher">
-          <div className="lb-segmented" role="tablist" aria-label="浏览器视图模式">
+          <div className="lb-segmented oc-surface-recessed" role="tablist" aria-label="浏览器视图模式">
             <button
               type="button"
               role="tab"
               aria-selected={effectiveMode === "live"}
               data-active={effectiveMode === "live" ? "true" : "false"}
-              className="lb-seg-btn"
+              className="lb-seg-btn oc-btn-tactile"
               data-testid="browser-mode-live"
               onClick={() => setMode("live")}
             >
@@ -356,7 +382,7 @@ export function BrowserView({
               role="tab"
               aria-selected={effectiveMode === "steps"}
               data-active={effectiveMode === "steps" ? "true" : "false"}
-              className="lb-seg-btn"
+              className="lb-seg-btn oc-btn-tactile"
               data-testid="browser-mode-steps"
               onClick={() => setMode("steps")}
             >
@@ -370,9 +396,13 @@ export function BrowserView({
       {effectiveMode === "live" && liveBrowserAgentId && liveBrowserAuth ? (
         <Suspense
           fallback={
-            <div className="flex items-center gap-2 px-4 py-4 text-meta text-muted">
-              <Spinner size={13} className="text-accent" />
-              正在加载实时浏览器…
+            <div className="lb-root">
+              <div className="oc-surface-card flex items-center justify-center gap-2.5 rounded-lg px-4 py-8 text-meta text-muted">
+                <span aria-hidden className="oc-icon-badge oc-icon-badge-accent size-8 rounded-md">
+                  <Spinner size={14} />
+                </span>
+                正在加载实时浏览器…
+              </div>
             </div>
           }
         >

@@ -210,6 +210,7 @@ export function ChatHeader({
       sidebarCollapsed={sidebarCollapsed}
       onExpandSidebar={onExpandSidebar}
       sessionUnreadCount={sessionUnreadCount}
+      className="oc-surface-glass border-x-0 border-t-0 shadow-none"
       collapsedExtra={
         onNew ? (
           <IconButton
@@ -217,8 +218,9 @@ export function ChatHeader({
             onClick={onNew}
             aria-label="新建会话"
             shape="square"
+            className="oc-btn-tactile"
           >
-            <PenSquare size={18} />
+            <PenSquare size={17} strokeWidth={1.75} />
           </IconButton>
         ) : undefined
       }
@@ -230,13 +232,13 @@ export function ChatHeader({
         data-product-feature={PRODUCT_CAPABILITIES.agents.id}
         onClick={onAgentClick}
         aria-label={`切换智能体，当前${agent.name}`}
-        className="hidden min-h-11 min-w-0 shrink-0 items-center gap-1.5 rounded-xl px-2 py-1.5 outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98] sm:flex"
+        className="oc-btn-tactile hidden min-h-11 min-w-0 shrink-0 items-center gap-2 rounded-lg px-2 py-1.5 outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:flex"
       >
-        <AgentAvatar agent={agent} className="size-7 shrink-0 rounded-lg" iconSize={15} />
-        <span className="max-w-[6.5rem] truncate whitespace-nowrap text-title font-semibold text-fg lg:max-w-[10rem]">
+        <AgentAvatar agent={agent} className="size-7 shrink-0 rounded-sm" iconSize={14} />
+        <span className="max-w-[6.5rem] truncate whitespace-nowrap text-title font-semibold tracking-tight text-fg lg:max-w-[10rem]">
           {agent.name}
         </span>
-        <ChevronDown size={15} className="hidden shrink-0 text-faint lg:block" />
+        <ChevronDown size={14} strokeWidth={1.75} className="hidden shrink-0 text-faint lg:block" />
       </button>
 
       {showSessionTitle && (
@@ -257,16 +259,16 @@ export function ChatHeader({
           data-product-control="project-breadcrumb"
           onClick={onOpenProjectScope}
           aria-label={`所在项目：${projectBreadcrumb.chatName}，点击打开项目`}
-          className="hidden min-w-0 max-w-[11rem] shrink items-center gap-1 rounded-full px-2 py-1 text-caption text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring lg:inline-flex"
+          className="oc-btn-tactile hidden min-w-0 max-w-[11rem] shrink items-center gap-1.5 rounded-full border border-transparent px-2.5 py-1 text-caption font-medium text-faint outline-none hover:border-border hover:bg-surface/80 hover:text-fg focus-visible:ring-2 focus-visible:ring-ring lg:inline-flex"
           title={`所在项目：${projectBreadcrumb.chatName}`}
         >
-          <FolderOpen size={12.5} aria-hidden className="shrink-0" />
+          <FolderOpen size={12.5} strokeWidth={1.75} aria-hidden className="shrink-0" />
           <span className="truncate">{projectBreadcrumb.chatName}</span>
         </button>
       ) : projectSuggestion ? (
         <span
           data-testid="chat-project-suggestion"
-          className="hidden min-w-0 max-w-[18rem] shrink items-center gap-0.5 rounded-lg border border-dashed border-border text-caption text-muted sm:inline-flex"
+          className="oc-surface-recessed hidden min-w-0 max-w-[18rem] shrink items-center gap-0.5 rounded-full px-1 py-0.5 text-caption text-muted sm:inline-flex"
         >
           <button
             type="button"
@@ -274,9 +276,9 @@ export function ChatHeader({
             data-product-control="project-suggestion-accept"
             aria-label={`移入项目「${projectSuggestion.name}」`}
             title={`这个会话可能属于「${projectSuggestion.name}」，点一下移入`}
-            className="inline-flex min-w-0 items-center gap-1 rounded-lg px-1.5 py-1 outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            className="oc-btn-tactile inline-flex min-w-0 items-center gap-1 rounded-full px-2 py-0.5 font-medium outline-none hover:bg-surface hover:text-accent focus-visible:ring-2 focus-visible:ring-ring"
           >
-            <FolderOpen size={13} aria-hidden className="shrink-0" />
+            <FolderOpen size={12.5} strokeWidth={1.75} aria-hidden className="shrink-0 text-accent" />
             <span className="truncate">移入「{projectSuggestion.name}」?</span>
           </button>
           <button
@@ -284,7 +286,7 @@ export function ChatHeader({
             onClick={projectSuggestion.onDismiss}
             data-product-control="project-suggestion-dismiss"
             aria-label="不用移入"
-            className="inline-flex shrink-0 items-center rounded-lg px-1.5 py-1 outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            className="oc-btn-tactile inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-faint outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
             不用
           </button>
@@ -297,7 +299,7 @@ export function ChatHeader({
           className="flex min-w-0 flex-1 items-center justify-center gap-1 sm:justify-start sm:gap-1.5"
           data-testid="chat-model-row"
         >
-          <span aria-hidden className="hidden h-4 w-px shrink-0 bg-border sm:block" />
+          <span aria-hidden className="hidden h-4 w-px shrink-0 bg-border/80 sm:block" />
           {advisorModeActive && (
             <Popover open={advisorPopoverOpen} onOpenChange={setAdvisorPopoverOpen}>
               <PopoverTrigger asChild>
@@ -305,10 +307,10 @@ export function ChatHeader({
                   type="button"
                   data-product-feature={PRODUCT_CAPABILITIES.advisorMode.id}
                   aria-label="顾问模式已开启"
-                  className="group flex min-h-10 min-w-10 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98] sm:min-h-11 sm:min-w-11"
+                  className="oc-btn-tactile group flex min-h-10 min-w-10 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:min-h-11 sm:min-w-11"
                 >
-                  <span className="flex items-center gap-1 rounded-full bg-accent-soft px-2 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15 sm:px-2.5">
-                    <ShieldCheck size={11} className="shrink-0" />
+                  <span className="oc-badge-craft flex items-center gap-1 rounded-full bg-accent-soft px-2 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15 sm:px-2.5">
+                    <ShieldCheck size={12} strokeWidth={1.75} className="shrink-0" />
                     <span className="sm:hidden">顾问</span>
                     <span className="hidden sm:inline">顾问模式</span>
                     {advisorModelLabel ? (
@@ -320,17 +322,25 @@ export function ChatHeader({
                 </button>
               </PopoverTrigger>
               <PopoverContent>
-                <p className="text-body leading-relaxed text-muted">
-                  顾问模式已开启：主模型不切换
-                  {advisorModelLabel ? `；本回合固定使用 ${advisorModelLabel}` : ""}
-                  。主模型可以向顾问提问；建议必须自行验证，不能替代审批或正式审查。咨询按实际顾问型号计费，不承诺更省。
-                </p>
+                <div className="flex items-start gap-2.5">
+                  <span aria-hidden className="oc-icon-badge oc-icon-badge-accent mt-0.5 size-7">
+                    <ShieldCheck size={14} strokeWidth={1.75} />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-body font-semibold text-fg">顾问模式已开启</p>
+                    <p className="mt-1 text-meta leading-relaxed text-muted">
+                      顾问模式已开启：主模型不切换
+                      {advisorModelLabel ? `；本回合固定使用 ${advisorModelLabel}` : ""}
+                      。主模型可以向顾问提问；建议必须自行验证，不能替代审批或正式审查。咨询按实际顾问型号计费，不承诺更省。
+                    </p>
+                  </div>
+                </div>
                 {onDisableAdvisorMode && (
                   <Button
                     data-product-control
                     size="sm"
                     variant="secondary"
-                    className="mt-2.5 w-full"
+                    className="mt-3 w-full"
                     onClick={() => {
                       setAdvisorPopoverOpen(false);
                       onDisableAdvisorMode();
@@ -349,25 +359,33 @@ export function ChatHeader({
                   type="button"
                   data-product-feature={PRODUCT_CAPABILITIES.teamMode.id}
                   aria-label="团队模式已开启"
-                  className="group flex min-h-10 min-w-10 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98] sm:min-h-11 sm:min-w-11"
+                  className="oc-btn-tactile group flex min-h-10 min-w-10 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:min-h-11 sm:min-w-11"
                 >
-                  <span className="flex items-center gap-1 rounded-full bg-accent-soft px-2 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15 sm:px-2.5">
-                    <Users size={11} className="shrink-0" />
+                  <span className="oc-badge-craft flex items-center gap-1 rounded-full bg-accent-soft px-2 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15 sm:px-2.5">
+                    <Users size={12} strokeWidth={1.75} className="shrink-0" />
                     <span className="sm:hidden">团队</span>
                     <span className="hidden sm:inline">团队模式</span>
                   </span>
                 </button>
               </PopoverTrigger>
               <PopoverContent>
-                <p className="text-body leading-relaxed text-muted">
-                  团队模式已开启：队长引擎为 {engineLabel}（计费高于默认模型），并会按需委派已安装智能体协作、按对应模型计费。
-                </p>
+                <div className="flex items-start gap-2.5">
+                  <span aria-hidden className="oc-icon-badge oc-icon-badge-accent mt-0.5 size-7">
+                    <Users size={14} strokeWidth={1.75} />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-body font-semibold text-fg">团队模式已开启</p>
+                    <p className="mt-1 text-meta leading-relaxed text-muted">
+                      团队模式已开启：队长引擎为 {engineLabel}（计费高于默认模型），并会按需委派已安装智能体协作、按对应模型计费。
+                    </p>
+                  </div>
+                </div>
                 {onDisableTeamMode && (
                   <Button
                     data-product-control
                     size="sm"
                     variant="secondary"
-                    className="mt-2.5 w-full"
+                    className="mt-3 w-full"
                     onClick={() => {
                       setTeamPopoverOpen(false);
                       onDisableTeamMode();
@@ -406,9 +424,9 @@ export function ChatHeader({
               role="status"
               data-testid="header-running-badge"
               aria-label="当前会话正在运行"
-              className="hidden shrink-0 items-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-caption font-medium leading-none text-accent sm:inline-flex"
+              className="oc-badge-craft hidden shrink-0 items-center gap-1.5 rounded-full bg-accent-soft px-2.5 py-1 text-caption font-medium leading-none text-accent sm:inline-flex"
             >
-              <Loader2 size={11} aria-hidden className="shrink-0 animate-spin" />
+              <Loader2 size={11} strokeWidth={2} aria-hidden className="shrink-0 animate-spin" />
               <span>运行中</span>
             </span>
           )}
@@ -420,10 +438,10 @@ export function ChatHeader({
               aria-label="有新版本，点击刷新页面"
               title="有新版本，点击刷新页面"
               onClick={onReloadForUpdate}
-              className="group ml-1 hidden min-h-11 min-w-11 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98] sm:flex"
+              className="oc-btn-tactile group ml-1 hidden min-h-11 min-w-11 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:flex"
             >
-              <span className="flex items-center gap-1 rounded-full bg-accent-soft px-2.5 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15">
-                <RefreshCw size={11} className="shrink-0" />
+              <span className="oc-badge-craft flex items-center gap-1 rounded-full bg-accent-soft px-2.5 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15">
+                <RefreshCw size={11} strokeWidth={1.75} className="shrink-0" />
                 <span className="@[720px]:hidden">新版本</span>
                 <span className="hidden @[720px]:inline">有新版本 · 刷新</span>
               </span>
@@ -443,9 +461,9 @@ export function ChatHeader({
                 aria-label="会话内查找"
                 title={`会话内查找 (${modKeyLabel()}F)`}
                 shape="square"
-                className="hidden text-faint hover:text-fg @[720px]:flex"
+                className="oc-btn-tactile hidden text-faint hover:text-fg @[720px]:flex"
               >
-                <Search size={17} />
+                <Search size={17} strokeWidth={1.75} />
               </IconButton>
             )}
             {onShare && (
@@ -455,9 +473,9 @@ export function ChatHeader({
                 aria-label="分享会话"
                 title="分享会话"
                 shape="square"
-                className="hidden text-faint hover:text-fg @[720px]:flex"
+                className="oc-btn-tactile hidden text-faint hover:text-fg @[720px]:flex"
               >
-                <Share2 size={17} />
+                <Share2 size={17} strokeWidth={1.75} />
               </IconButton>
             )}
             {onOpenInbox && (
@@ -468,8 +486,9 @@ export function ChatHeader({
                   aria-label={hasUnreadInbox ? `站内信，${unreadCount} 条未读` : "站内信"}
                   title={hasUnreadInbox ? `站内信（${unreadCount} 条未读）` : "站内信"}
                   shape="square"
+                  className="oc-btn-tactile"
                 >
-                  <Bell size={18} />
+                  <Bell size={17} strokeWidth={1.75} />
                 </IconButton>
                 <HeaderCountBadge
                   count={unreadCount}
@@ -488,14 +507,14 @@ export function ChatHeader({
                 aria-label="账户与计费"
                 title={`账户余额：${formatCredits(credits)}`}
                 className={cn(
-                  "flex min-h-9 min-w-9 items-center justify-center gap-1.5 rounded-full border px-2 py-1 text-meta font-medium tabular-nums outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg lg:px-2.5",
+                  "oc-btn-tactile flex min-h-9 min-w-9 items-center justify-center gap-1.5 rounded-full px-2.5 py-1 text-meta font-medium tabular-nums outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg lg:px-3",
                   low
-                    ? "border-danger/40 bg-danger-soft text-danger hover:bg-danger-soft"
-                    : "border-border text-muted enabled:hover:bg-hover enabled:hover:text-fg",
+                    ? "oc-badge-craft bg-danger-soft text-danger"
+                    : "oc-btn-secondary-craft text-muted enabled:hover:text-fg",
                   "disabled:cursor-default",
                 )}
               >
-                <Wallet size={13} className="shrink-0" />
+                <Wallet size={13.5} strokeWidth={1.75} className="shrink-0" />
                 {/* 平板 640-1023px 仅留图标避免挤压模型名，lg+ 展开余额数字。 */}
                 <span className="hidden lg:inline">{formatCredits(credits)}</span>
               </button>
@@ -504,7 +523,7 @@ export function ChatHeader({
         )}
 
         {hasSecondaryActions && hasWorkspaceToggles && (
-          <span aria-hidden className="mx-0.5 hidden h-4 w-px shrink-0 bg-border sm:block" />
+          <span aria-hidden className="mx-0.5 hidden h-4 w-px shrink-0 bg-border/80 sm:block" />
         )}
 
         {hasWorkspaceToggles && (
@@ -519,14 +538,16 @@ export function ChatHeader({
                 title={`${quickAskOpen ? "收起" : "打开"}快问小窗：并行问答不打断主线 (${altKeyLabel()}K)`}
                 shape="square"
                 className={cn(
-                  "hidden sm:flex",
-                  quickAskOpen ? "bg-accent-soft text-accent" : "text-muted hover:text-fg",
+                  "oc-btn-tactile hidden sm:flex",
+                  quickAskOpen
+                    ? "oc-badge-craft bg-accent-soft text-accent"
+                    : "text-muted hover:text-fg",
                 )}
               >
                 {quickAskSending && !quickAskOpen ? (
-                  <Loader2 size={18} className="animate-spin text-accent" />
+                  <Loader2 size={17} strokeWidth={1.75} className="animate-spin text-accent" />
                 ) : (
-                  <MessageCircleQuestion size={18} />
+                  <MessageCircleQuestion size={17} strokeWidth={1.75} />
                 )}
               </IconButton>
             )}
@@ -539,9 +560,12 @@ export function ChatHeader({
                 aria-pressed={paneOpen}
                 title={`${paneOpen ? "收起" : "打开"}详情面板：步骤、改动、计划 (${modKeyLabel()}\\)`}
                 shape="square"
-                className={paneOpen ? "bg-accent-soft text-accent" : "text-muted hover:text-fg"}
+                className={cn(
+                  "oc-btn-tactile",
+                  paneOpen ? "oc-badge-craft bg-accent-soft text-accent" : "text-muted hover:text-fg",
+                )}
               >
-                {paneOpen ? <PanelRightClose size={18} /> : <PanelRight size={18} />}
+                {paneOpen ? <PanelRightClose size={17} strokeWidth={1.75} /> : <PanelRight size={17} strokeWidth={1.75} />}
               </IconButton>
             )}
           </div>
@@ -555,9 +579,9 @@ export function ChatHeader({
             aria-label="新建会话"
             title="新建会话"
             shape="square"
-            className="text-muted hover:text-fg sm:hidden"
+            className="oc-btn-tactile text-muted hover:text-fg sm:hidden"
           >
-            <Plus size={18} />
+            <Plus size={18} strokeWidth={1.75} />
           </IconButton>
         )}
 
@@ -571,12 +595,12 @@ export function ChatHeader({
                   aria-label="更多操作"
                   title="更多操作"
                   shape="square"
-                  className="text-faint hover:text-fg"
+                  className="oc-btn-tactile text-faint hover:text-fg"
                 >
-                  <MoreHorizontal size={18} />
+                  <MoreHorizontal size={18} strokeWidth={1.75} />
                 </IconButton>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="min-w-[13rem]">
+              <DropdownMenuContent align="end" className="min-w-[13.5rem]">
                 {onOpenInbox && (
                   <DropdownMenuItem
                     data-product-control
@@ -584,7 +608,7 @@ export function ChatHeader({
                     onSelect={onOpenInbox}
                     className="sm:hidden"
                   >
-                    <Bell size={16} className="shrink-0 text-muted" />
+                    <Bell size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
                     <span className="flex-1">站内信</span>
                     {hasUnreadInbox && (
                       <Badge tone="danger" className="tabular-nums">
@@ -601,7 +625,7 @@ export function ChatHeader({
                     onSelect={onOpenBilling}
                     className="sm:hidden"
                   >
-                    <Wallet size={16} className="shrink-0 text-muted" />
+                    <Wallet size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
                     <span className="flex-1">账户与计费</span>
                     <span
                       className={cn(
@@ -620,7 +644,7 @@ export function ChatHeader({
                     onSelect={onToggleQuickAsk}
                     className="sm:hidden"
                   >
-                    <MessageCircleQuestion size={16} className="shrink-0 text-muted" />
+                    <MessageCircleQuestion size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
                     <span className="flex-1">{quickAskOpen ? "收起快问小窗" : "快问小窗"}</span>
                   </DropdownMenuItem>
                 )}
@@ -630,7 +654,7 @@ export function ChatHeader({
                   onSelect={onAgentClick}
                   className="sm:hidden"
                 >
-                  <Users size={16} className="shrink-0 text-muted" />
+                  <Users size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
                   <span className="flex-1">切换智能体</span>
                   <span className="max-w-[6rem] truncate text-caption text-faint">{agent.name}</span>
                 </DropdownMenuItem>
@@ -641,7 +665,7 @@ export function ChatHeader({
                     onSelect={onOpenProjectScope}
                     className="sm:hidden"
                   >
-                    <FolderOpen size={16} className="shrink-0 text-muted" />
+                    <FolderOpen size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
                     <span className="flex-1 truncate">项目：{projectBreadcrumb.chatName}</span>
                   </DropdownMenuItem>
                 )}
@@ -652,20 +676,20 @@ export function ChatHeader({
                     onSelect={onReloadForUpdate}
                     className="text-accent sm:hidden"
                   >
-                    <RefreshCw size={16} className="shrink-0" />
+                    <RefreshCw size={15} strokeWidth={1.75} className="shrink-0" />
                     <span className="flex-1">有新版本 · 刷新</span>
                   </DropdownMenuItem>
                 )}
                 {hasDesktopOverflow && <DropdownMenuSeparator className="sm:hidden" />}
                 {onOpenFind && (
                   <DropdownMenuItem data-product-control onSelect={onOpenFind}>
-                    <Search size={16} className="shrink-0 text-muted" />
+                    <Search size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
                     <span className="flex-1">会话内查找</span>
                   </DropdownMenuItem>
                 )}
                 {onShare && (
                   <DropdownMenuItem data-product-control onSelect={onShare}>
-                    <Share2 size={16} className="shrink-0 text-muted" />
+                    <Share2 size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
                     <span className="flex-1">分享</span>
                   </DropdownMenuItem>
                 )}

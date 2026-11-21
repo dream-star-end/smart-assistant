@@ -53,9 +53,9 @@ export function ComposerPlusMenu({
         aria-label="更多选项"
         title="更多选项暂不可用"
         disabled
-        className="relative"
+        className="oc-btn-tactile relative"
       >
-        <Plus size={20} />
+        <Plus size={18} strokeWidth={1.75} />
         {goalDot}
       </IconButton>
     );
@@ -69,20 +69,40 @@ export function ComposerPlusMenu({
           aria-label="更多选项"
           title="更多选项"
           disabled={disabled}
-          className="relative"
+          className={cn(
+            "oc-btn-tactile relative",
+            open && "bg-accent-soft text-accent",
+          )}
         >
-          <Plus size={20} />
+          <Plus
+            size={18}
+            strokeWidth={1.75}
+            className={cn("transition-transform duration-200 ease-spring", open && "rotate-45")}
+          />
           {goalDot}
         </IconButton>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" side="top">
+      <DropdownMenuContent align="start" side="top" className="min-w-[13rem]">
         {canGoal && (
           <DropdownMenuItem
             data-product-feature={PRODUCT_CAPABILITIES.sessionGoal.id}
             onSelect={onOpenGoal}
+            className="gap-2.5"
           >
-            <Target size={16} className="shrink-0 text-muted" />
-            <span className="flex-1">{visibleGoal ? "目标" : "设定目标"}</span>
+            <span
+              aria-hidden
+              className={cn(
+                "oc-icon-badge size-6 rounded-xs",
+                visibleGoal
+                  ? goalNearBudget(visibleGoal)
+                    ? "oc-icon-badge-warning"
+                    : "oc-icon-badge-accent"
+                  : "oc-icon-badge-accent",
+              )}
+            >
+              <Target size={13} strokeWidth={1.75} />
+            </span>
+            <span className="flex-1 font-medium">{visibleGoal ? "目标" : "设定目标"}</span>
             {visibleGoal && (
               <span
                 aria-hidden
@@ -99,9 +119,18 @@ export function ComposerPlusMenu({
             data-product-feature={PRODUCT_CAPABILITIES.github.id}
             data-testid="composer-menu-repo"
             onSelect={onOpenRepo}
+            className="gap-2.5"
           >
-            <GithubMark size={15} />
-            <span className="min-w-0 flex-1 truncate">
+            <span
+              aria-hidden
+              className={cn(
+                "oc-icon-badge size-6 rounded-xs",
+                hasBoundRepo && "oc-icon-badge-info",
+              )}
+            >
+              <GithubMark size={13} />
+            </span>
+            <span className="min-w-0 flex-1 truncate font-medium">
               {hasBoundRepo && repoSelection?.selected
                 ? `GitHub · ${repoSelection.repo}`
                 : "关联 GitHub 仓库"}

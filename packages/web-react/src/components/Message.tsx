@@ -5,9 +5,9 @@ import { Markdown } from "./Markdown";
 import { OptionsGroupFooter, OptionsGroupProvider } from "./optionsGroup";
 import { IconButton, useToast } from "./ui";
 
-// demo 通道动作条:桌面 hover 露出;触屏没有 hover,常显并给 44px 触控靶(与 chat/cards 的口径一致)。
+// demo 通道动作条:桌面 hover 露出轻磨砂浮条;触屏没有 hover,常显并给 44px 触控靶(与 chat/cards 的口径一致)。
 const DEMO_ACTIONS_CLASS =
-  "mt-1.5 flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 [@media(hover:none)]:opacity-100";
+  "oc-surface-glass mt-1.5 inline-flex items-center gap-0.5 rounded-lg p-0.5 opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-within:opacity-100 [@media(hover:none)]:opacity-100";
 
 function CopyBtn({ text }: { text: string }) {
   const [done, setDone] = useState(false);
@@ -18,7 +18,11 @@ function CopyBtn({ text }: { text: string }) {
       title="复制"
       size="sm"
       shape="square"
-      className="[@media(hover:none)]:size-11"
+      className={
+        done
+          ? "oc-btn-tactile text-success hover:text-success [@media(hover:none)]:size-11"
+          : "oc-btn-tactile [@media(hover:none)]:size-11"
+      }
       onClick={async () => {
         try {
           await navigator.clipboard.writeText(text);
@@ -29,7 +33,7 @@ function CopyBtn({ text }: { text: string }) {
         }
       }}
     >
-      {done ? <Check size={15} /> : <Copy size={15} />}
+      {done ? <Check size={15} strokeWidth={2} /> : <Copy size={15} strokeWidth={1.75} />}
     </IconButton>
   );
 }
@@ -37,7 +41,7 @@ function CopyBtn({ text }: { text: string }) {
 export function UserMessage({ content }: { content: string }) {
   return (
     <div className="group flex flex-col items-end animate-in">
-      <div className="max-w-[78%] whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-[15.5px] leading-relaxed text-fg">
+      <div className="max-w-[78%] whitespace-pre-wrap break-words rounded-2xl rounded-br-sm border border-border/75 bg-bubble px-4 py-2.5 text-title leading-relaxed text-fg shadow-soft">
         {content}
       </div>
       {content && (
@@ -95,10 +99,10 @@ export function AssistantMessage({
                 title="重新生成"
                 size="sm"
                 shape="square"
-                className="[@media(hover:none)]:size-11"
+                className="oc-btn-tactile [@media(hover:none)]:size-11"
                 onClick={onRegenerate}
               >
-                <RotateCcw size={15} />
+                <RotateCcw size={15} strokeWidth={1.75} />
               </IconButton>
             )}
           </div>

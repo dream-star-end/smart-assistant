@@ -111,22 +111,23 @@ export function ProjectRow({
   const icon = (
     <span className="flex size-3.5 shrink-0 items-center justify-center text-faint">
       {swatch ? (
-        <span aria-hidden className={cn("size-2.5 rounded-full", swatch.dotClass)} />
+        <span aria-hidden className={cn("size-2.5 rounded-full ring-1 ring-inset ring-black/10", swatch.dotClass)} />
       ) : immutable ? (
-        <Inbox size={14} aria-hidden />
+        <Inbox size={14} strokeWidth={1.75} aria-hidden />
       ) : collapsed ? (
-        <Folder size={14} aria-hidden />
+        <Folder size={14} strokeWidth={1.75} aria-hidden />
       ) : (
-        <FolderOpen size={14} aria-hidden />
+        <FolderOpen size={14} strokeWidth={1.75} aria-hidden />
       )}
     </span>
   );
   const chevron = (
     <ChevronRight
       size={12}
+      strokeWidth={1.75}
       aria-hidden
       className={cn(
-        "shrink-0 text-faint transition-transform duration-200 ease-standard",
+        "shrink-0 text-faint transition-transform duration-200 ease-spring",
         !collapsed && "rotate-90",
       )}
     />
@@ -147,13 +148,13 @@ export function ProjectRow({
           data-project-running={runningCount}
           title={`${runningCount} 个运行中`}
           aria-label={`${runningCount} 个运行中`}
-          className="flex shrink-0 items-center gap-1 rounded-full bg-status-running/10 px-1.5 py-px"
+          className="flex shrink-0 items-center gap-1 rounded-full bg-status-running/10 px-1.5 py-px ring-1 ring-inset ring-status-running/20"
         >
           <SessionStatusDot running />
-          <span className="tabular-nums text-caption text-status-running">{runningCount}</span>
+          <span className="tabular-nums text-caption font-medium text-status-running">{runningCount}</span>
         </span>
       )}
-      <span className="tabular-nums text-caption text-faint">{count}</span>
+      <span className="rounded-xs bg-hover/65 px-1.5 py-px tabular-nums text-caption text-faint">{count}</span>
     </span>
   );
   return (
@@ -192,7 +193,7 @@ export function ProjectRow({
           dropActive
             ? "bg-accent-soft text-fg ring-1 ring-accent/40"
             : active
-              ? "bg-sidebar-active text-fg shadow-sidebar-active"
+              ? "bg-sidebar-active text-fg shadow-sidebar-active before:absolute before:bottom-1.5 before:left-0.5 before:top-1.5 before:w-0.5 before:rounded-xs before:bg-accent"
               : "text-fg hover:bg-hover",
         )}
       >
@@ -260,10 +261,10 @@ export function ProjectRow({
               variant="muted"
               size="xs"
               shape="square"
-              className="shrink-0 rounded-xs [@media(hover:none)]:hidden"
+              className="oc-btn-tactile shrink-0 rounded-xs [@media(hover:none)]:hidden"
               onClick={onNewSession}
             >
-              <Plus size={14} />
+              <Plus size={14} strokeWidth={1.75} />
             </IconButton>
           )}
           {showMenu && (
@@ -274,9 +275,9 @@ export function ProjectRow({
                   variant="muted"
                   size="xs"
                   shape="square"
-                  className="rounded-xs"
+                  className="oc-btn-tactile rounded-xs"
                 >
-                  <MoreHorizontal size={14} />
+                  <MoreHorizontal size={14} strokeWidth={1.75} />
                 </IconButton>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-44">
@@ -285,7 +286,7 @@ export function ProjectRow({
                     className="[@media(hover:none)]:min-h-11"
                     onSelect={() => onNewSession()}
                   >
-                    <Plus size={14} className="shrink-0 text-muted" />
+                    <Plus size={14} strokeWidth={1.75} className="shrink-0 text-muted" />
                     新建会话
                   </DropdownMenuItem>
                 )}
@@ -297,30 +298,30 @@ export function ProjectRow({
                     className="[@media(hover:none)]:min-h-11"
                     onSelect={() => onOpenAssets?.(p)}
                   >
-                    <Paperclip size={14} className="shrink-0 text-muted" />
+                    <Paperclip size={14} strokeWidth={1.75} className="shrink-0 text-muted" />
                     未分类的文件
                   </DropdownMenuItem>
                 )}
                 {onOpenSettings && (
                   <DropdownMenuItem onSelect={() => onOpenSettings(p)}>
-                    <Settings2 size={14} className="shrink-0 text-muted" />
+                    <Settings2 size={14} strokeWidth={1.75} className="shrink-0 text-muted" />
                     项目设置
                   </DropdownMenuItem>
                 )}
                 {onRename && (
                   <DropdownMenuItem onSelect={() => onRename(p)}>
-                    <Pencil size={14} className="shrink-0 text-muted" />
+                    <Pencil size={14} strokeWidth={1.75} className="shrink-0 text-muted" />
                     重命名
                   </DropdownMenuItem>
                 )}
                 {showMoveInMenu && (
                   <>
                     <DropdownMenuItem disabled={!canMoveUp} onSelect={() => onMoveUp?.()}>
-                      <ArrowUp size={14} className="shrink-0 text-muted" />
+                      <ArrowUp size={14} strokeWidth={1.75} className="shrink-0 text-muted" />
                       上移
                     </DropdownMenuItem>
                     <DropdownMenuItem disabled={!canMoveDown} onSelect={() => onMoveDown?.()}>
-                      <ArrowDown size={14} className="shrink-0 text-muted" />
+                      <ArrowDown size={14} strokeWidth={1.75} className="shrink-0 text-muted" />
                       下移
                     </DropdownMenuItem>
                   </>
@@ -328,16 +329,16 @@ export function ProjectRow({
                 {onTogglePin && (
                   <DropdownMenuItem onSelect={() => onTogglePin(p)}>
                     {p.pinnedAt ? (
-                      <PinOff size={14} className="shrink-0 text-muted" />
+                      <PinOff size={14} strokeWidth={1.75} className="shrink-0 text-muted" />
                     ) : (
-                      <Pin size={14} className="shrink-0 text-muted" />
+                      <Pin size={14} strokeWidth={1.75} className="shrink-0 text-muted" />
                     )}
                     {p.pinnedAt ? "取消置顶" : "置顶"}
                   </DropdownMenuItem>
                 )}
                 {onArchive && (
                   <DropdownMenuItem onSelect={() => onArchive(p)}>
-                    <Archive size={14} className="shrink-0 text-muted" />
+                    <Archive size={14} strokeWidth={1.75} className="shrink-0 text-muted" />
                     归档
                   </DropdownMenuItem>
                 )}
@@ -346,7 +347,7 @@ export function ProjectRow({
                 )}
                 {onDelete && (
                   <DropdownMenuItem destructive onSelect={() => onDelete(p)}>
-                    <Trash2 size={14} className="shrink-0" />
+                    <Trash2 size={14} strokeWidth={1.75} className="shrink-0" />
                     删除
                   </DropdownMenuItem>
                 )}

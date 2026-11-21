@@ -65,10 +65,10 @@ export function useExpandableSlice(text: string, collapsedMax: number): Expandab
 export function ExpandControls({ slice }: { slice: ExpandableSlice }) {
   if (!slice.truncated && !slice.expanded) return null
   return (
-    <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+    <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-caption tabular-nums">
       {!slice.expanded && slice.truncated && (
         <>
-          <span className="text-faint">已截断</span>
+          <span className="rounded-xs bg-hover px-1.5 py-0.5 text-faint">已截断</span>
           <InlineAction onClick={slice.expand}>
             展开全部（共 {slice.totalChars.toLocaleString()} 字）
           </InlineAction>
@@ -115,7 +115,7 @@ export function ExpandablePre({
     <>
       <pre
         className={cn(
-          'mt-1.5 whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-xs leading-relaxed text-fg',
+          'oc-surface-recessed mt-1.5 whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2.5 font-mono text-meta leading-relaxed text-fg',
           className,
         )}
       >

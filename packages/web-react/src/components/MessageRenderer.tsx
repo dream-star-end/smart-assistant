@@ -81,9 +81,9 @@ import {
   TurnStatusCard,
   UserCard,
 } from "./chat/cards";
-import { AgentGroupCard } from "./chat/AgentGroupCard";
 import { TimelineEagerMediaContext } from "./chat/timelineEager";
 import {
+  AgentGroupCard,
   GeneratingPlaceholderCard,
   PermissionCard,
   PermissionPromptHost,
@@ -408,15 +408,15 @@ function ExactTapeRecordDisclosure({
         {open ? `收起原始${label}记录` : `查看原始${label}记录`}
       </button>
       {open && (
-        <div className="mt-1 rounded-md border border-border bg-surface px-3 py-2">
-          <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-muted">
+        <div className="oc-surface-recessed mt-1 rounded-lg border border-border/70 px-3 py-2">
+          <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words font-mono text-caption leading-relaxed text-muted">
             {serialized.slice(0, visibleChars)}
           </pre>
           {visibleChars < serialized.length && (
             <button
               type="button"
               onClick={() => setVisibleChars((value) => value + RUNTIME_TEXT_STEP)}
-              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+              className="oc-btn-tactile mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
             >
               继续显示原始记录
             </button>
@@ -442,28 +442,28 @@ function RuntimeEventCard({ message }: { message: ChatMessage }) {
   const [visibleChars, setVisibleChars] = useState(RUNTIME_TEXT_STEP);
   const serialized = open ? JSON.stringify(raw, null, 2) : "";
   return (
-    <div className="overflow-hidden rounded-lg border border-border bg-surface animate-in">
+    <div className="oc-surface-card overflow-hidden rounded-xl animate-in">
       <button
         type="button"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
-        className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-meta hover:bg-hover [@media(hover:none)]:min-h-11"
+        className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-meta transition-colors hover:bg-hover/70 [@media(hover:none)]:min-h-11"
       >
         <span className="size-1.5 shrink-0 rounded-full bg-faint" />
         <span className="min-w-0 flex-1 truncate text-muted">{label}</span>
         {message._runtimeSource && <span className="shrink-0 text-caption text-faint">{message._runtimeSource}</span>}
-        <span className="text-faint">{open ? "收起" : "查看原始记录"}</span>
+        <span className="text-caption text-faint">{open ? "收起" : "查看原始记录"}</span>
       </button>
       {open && (
-        <div className="border-t border-border px-3.5 py-2.5">
-          <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-muted">
+        <div className="oc-surface-recessed border-t border-border/70 px-3.5 py-2.5">
+          <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words font-mono text-caption leading-relaxed text-muted">
             {serialized.slice(0, visibleChars)}
           </pre>
           {visibleChars < serialized.length && (
             <button
               type="button"
               onClick={() => setVisibleChars((value) => value + RUNTIME_TEXT_STEP)}
-              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+              className="oc-btn-tactile mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
             >
               继续显示原始记录
             </button>
@@ -2686,7 +2686,7 @@ export function MessageList({
         }}
         disabled={liveUnitsBusy}
         aria-busy={liveUnitsBusy}
-        className="inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
+        className="oc-btn-tactile oc-btn-secondary-craft inline-flex items-center gap-1.5 rounded-full border border-border/80 bg-surface px-3.5 py-1 text-caption font-medium text-muted shadow-soft transition-colors hover:border-border-strong hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
       >
         {liveUnitsBusy
           ? <><Spinner size={12} /> 加载中…</>
@@ -2868,7 +2868,7 @@ export function MessageList({
         onClick={windowStart > 0 ? expandLocalWindow : hasOlderHistory ? requestOlderArchive : undefined}
         disabled={!canRevealOlder || Boolean(archive?.loading) || archiveQueued}
         aria-busy={hasOlderHistory && windowStart === 0 && (Boolean(archive?.loading) || archiveQueued)}
-        className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
+        className="oc-btn-tactile oc-btn-secondary-craft mx-auto inline-flex items-center gap-1.5 rounded-full border border-border/80 bg-surface px-3.5 py-1 text-caption font-medium text-muted shadow-soft transition-colors hover:border-border-strong hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
       >
         {!canRevealOlder
           ? "已到最早记录"
@@ -3032,14 +3032,14 @@ export function MessageList({
     {pendingPrompts.length > 0 ? (
       <div
         data-testid="pending-permission-dock"
-        className="sticky top-0 z-10 mx-auto flex max-w-3xl flex-wrap items-center gap-2 bg-bg/95 px-5 py-2"
+        className="oc-surface-glass sticky top-0 z-10 mx-auto flex max-w-3xl flex-wrap items-center gap-2 rounded-b-xl px-5 py-2"
       >
-        <span className="text-caption text-muted">待回答</span>
+        <span className="text-caption font-medium text-muted">待回答</span>
         {pendingPrompts.map((message) => (
           <button
             key={message.requestId ?? message.id}
             type="button"
-            className="rounded-full bg-accent-soft px-2.5 py-1 text-caption text-accent [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+            className="oc-btn-tactile rounded-full border border-accent/25 bg-accent-soft px-3 py-1 text-caption font-medium text-accent transition-colors hover:bg-accent/15 [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
             onClick={() => {
               if (message.requestId) {
                 dockReopenedRef.current = { sessionId, requestId: message.requestId };
@@ -3058,7 +3058,7 @@ export function MessageList({
     ) : null}
     {find ? (
       <div
-        className="sticky top-0 z-10 mx-auto flex max-w-3xl flex-wrap items-center gap-1.5 bg-bg/95 px-5 py-2"
+        className="oc-surface-glass sticky top-0 z-10 mx-auto flex max-w-3xl flex-wrap items-center gap-1.5 rounded-b-xl px-5 py-2 shadow-soft"
         onKeyDown={stopFindKeys}
         onPointerDown={stopFindKeys}
         onTouchStart={stopFindKeys}

@@ -22,25 +22,21 @@ export const cardVariants = cva(
       /** 内距。none = 旧行为(调用方自己写 p-*),保证向后兼容。 */
       padding: { none: "", sm: "p-3", md: "p-4", lg: "p-5" },
       /**
-       * default : 常规抬升表面(surface + soft 阴影)
-       * sunken  : 卡内嵌套的次级容器,取页面底色形成下沉感,不再叠阴影
-       * accent  : 强调 / 选中态,品牌软底 + 品牌描边
+       * default : 精雕卡片表面(Clarvy Atelier: surface + 发丝描边 + 顶缘高光 + 双层柔影)
+       * sunken  : 卡内嵌套的次级微凹容器,取页面底色形成下沉感
+       * accent  : 强调 / 选中态,品牌软底 + 品牌发丝描边
        */
       tone: {
-        default: "border-border bg-surface shadow-soft",
-        sunken: "border-border bg-bg",
-        accent: "border-accent/30 bg-accent-soft",
+        default: "oc-surface-card bg-surface",
+        sunken: "oc-surface-recessed bg-bg",
+        accent: "border-accent/35 bg-accent-soft shadow-soft",
       },
       /**
-       * 可点卡片:手型 + hover 抬升 + 焦点环 + 触控靶(≥44px)一次给全,
+       * 可点卡片:手型 + 暖陶土微光悬停抬升 + 触感按压 + 焦点环 + 触控靶(≥44px)一次给全,
        * 调用方不必再手工补 `[@media(hover:none)]:min-h-11`。
-       * 抬升不必再手工排除触屏:Tailwind v4 的 `hover:` 本身就编译进
-       * `@media (hover:hover)`(已核对构建产物),触屏上不会出现"点完粘住不落回"。
-       * 注意:role/tabIndex 这类语义本组件不代劳(可能是 <button> 包着,也可能内部还有
-       * 链接,自动加 role 反而制造嵌套可交互元素),由调用方按场景给。
        */
       interactive: {
-        true: "cursor-pointer outline-none transition-[border-color,box-shadow,transform] duration-150 ease-standard hover:-translate-y-0.5 hover:border-border-strong hover:shadow-float focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:min-h-11",
+        true: "oc-surface-card-hover cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:min-h-11",
         false: "",
       },
     },

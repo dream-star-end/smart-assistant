@@ -20,15 +20,15 @@ export default function ComposerImageLightbox({
           <img
             src={preview.url}
             alt={preview.name}
-            className="max-h-[90vh] max-w-[92vw] rounded-lg object-contain shadow-float"
+            className="max-h-[90vh] max-w-[92vw] rounded-lg object-contain ring-1 ring-white/15 shadow-float"
           />
           <Dialog.Close asChild>
             <button
               type="button"
               aria-label="关闭预览"
-              className="absolute -right-2 -top-2 flex size-8 items-center justify-center rounded-full bg-surface text-fg shadow-float outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+              className="oc-surface-glass oc-btn-tactile absolute -right-2 -top-2 flex size-9 items-center justify-center rounded-full text-fg outline-none hover:text-accent focus-visible:ring-2 focus-visible:ring-ring"
             >
-              <X size={16} />
+              <X size={16} strokeWidth={1.75} />
             </button>
           </Dialog.Close>
         </Dialog.Content>

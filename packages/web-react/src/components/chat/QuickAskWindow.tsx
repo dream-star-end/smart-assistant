@@ -824,6 +824,19 @@ export function QuickAskWindow({
     : attachContext
       ? `已关联主线：${clipText(!isDefaultSessionTitle(mainlineTitle) ? mainlineTitle : "当前会话", 20)}`
       : "已断开主线上下文";
+  const contextPreview = useMemo(() => {
+    if (!hasMainlineContext) return "";
+    const goal = clipText(mainlineGoalObjective, 60);
+    if (goal) return `目标：${goal}`;
+    for (let i = mainlineMessages.length - 1; i >= 0; i -= 1) {
+      const m = mainlineMessages[i];
+      if (!m || m.role === "tool" || m._recoveryOfClientMessageId) continue;
+      const txt = clipText(m.text, 60);
+      if (txt) return txt;
+    }
+    return "";
+  }, [hasMainlineContext, mainlineGoalObjective, mainlineMessages]);
+  const sendKeyLabel = sendKey === "mod-enter" ? "⌘/Ctrl+↵" : "Enter";
 
   return (
     <>
@@ -835,16 +848,18 @@ export function QuickAskWindow({
       data-quick-ask-session={qaSessId}
       style={isMdViewport ? { right: rightOffsetPx } : undefined}
       className={cn(
-        "fixed inset-x-3 bottom-[max(0.75rem,env(safe-area-inset-bottom))] z-40 flex h-[min(68dvh,calc(var(--oc-visual-height,100dvh)-1.5rem))] max-h-[min(560px,calc(var(--oc-visual-height,100dvh)-1.5rem))] flex-col overflow-hidden rounded-xl border border-border bg-elevated shadow-float",
+        "oc-surface-popover fixed inset-x-3 bottom-[max(0.75rem,env(safe-area-inset-bottom))] z-40 flex h-[min(68dvh,calc(var(--oc-visual-height,100dvh)-1.5rem))] max-h-[min(560px,calc(var(--oc-visual-height,100dvh)-1.5rem))] flex-col overflow-hidden rounded-2xl",
         "sm:inset-x-auto sm:bottom-4 sm:w-[430px]",
-        !open && "hidden",
+        open ? "animate-pop" : "hidden",
       )}
     >
       {/* Header */}
-      <header className="flex shrink-0 items-center gap-1.5 border-b border-border px-3 py-2">
-        <div className="flex min-w-0 items-center gap-1.5">
-          <Zap size={15} className="shrink-0 text-accent" />
-          <span className="truncate text-title font-semibold text-fg">快问</span>
+      <header className="oc-surface-glass flex shrink-0 items-center gap-2 rounded-none border-0 border-b border-border/80 px-3 py-2.5 shadow-none">
+        <div className="flex min-w-0 items-center gap-2">
+          <span aria-hidden className="oc-icon-badge oc-icon-badge-accent size-7 rounded-sm">
+            <Zap size={14} />
+          </span>
+          <span className="truncate text-section font-semibold tracking-tight text-fg">快问</span>
         </div>
 
         <DropdownMenu>
@@ -856,10 +871,10 @@ export function QuickAskWindow({
               aria-label="选择快问模型"
               title={followingMainline ? `跟随主会话模型：${activeModelLabel}` : `当前快问模型：${activeModelLabel}`}
               className={cn(
-                "ml-1 inline-flex max-w-[195px] items-center gap-1 rounded-full border px-2.5 py-1 text-caption font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+                "oc-btn-tactile inline-flex max-w-[185px] items-center gap-1 rounded-full px-2.5 py-1 text-caption font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
                 modelHighlight
-                  ? "border-accent bg-accent-soft text-accent"
-                  : "border-border bg-bg text-muted hover:bg-hover hover:text-fg",
+                  ? "border border-accent bg-accent-soft text-accent shadow-soft"
+                  : "oc-btn-secondary-craft text-muted hover:text-fg",
               )}
             >
               <span className="truncate">{activeModelLabel}</span>
@@ -992,11 +1007,12 @@ export function QuickAskWindow({
           </DropdownMenuContent>
         </DropdownMenu>
 
-        <div className="ml-auto flex shrink-0 items-center gap-0.5">
+        <div className="oc-surface-recessed ml-auto flex shrink-0 items-center gap-0.5 rounded-lg p-0.5">
           {onQuoteToComposer && latestAssistantReply && !sending && (
             <IconButton
               size="sm"
               shape="square"
+              className="oc-btn-tactile"
               aria-label="引用最新回答到主线"
               title="将最新快问回答引用到主输入框"
               data-testid="quick-ask-quote-mainline"
@@ -1008,6 +1024,7 @@ export function QuickAskWindow({
           <IconButton
             size="sm"
             shape="square"
+            className="oc-btn-tactile"
             aria-label="转为正式对话"
             title="转为正式对话并显示在左侧列表"
             disabled={messages.length === 0 || sending}
@@ -1018,6 +1035,7 @@ export function QuickAskWindow({
           <IconButton
             size="sm"
             shape="square"
+            className="oc-btn-tactile"
             aria-label="清空重问"
             title="清空当前快问，重新开始"
             onClick={handleClear}
@@ -1027,6 +1045,7 @@ export function QuickAskWindow({
           <IconButton
             size="sm"
             shape="square"
+            className="oc-btn-tactile"
             aria-label="收起快问小窗"
             title="收起 (Esc / Alt+K)"
             onClick={onClose}
@@ -1047,13 +1066,31 @@ export function QuickAskWindow({
       >
         {open &&
           (messages.length === 0 && !sending ? (
-            <div className="flex h-full flex-col items-center justify-center gap-2 px-4 text-center">
-              <MessageCircleQuestion size={24} className="text-accent" />
-              <p className="text-body font-medium text-fg">并行快问，不打断主线任务</p>
-              <p className="text-meta text-muted">
+            <div className="flex h-full flex-col items-center justify-center gap-2.5 px-5 text-center">
+              <span aria-hidden className="oc-icon-badge oc-icon-badge-accent size-11 rounded-xl">
+                <MessageCircleQuestion size={20} />
+              </span>
+              <p className="text-section font-semibold tracking-tight text-fg">并行快问，不打断主线任务</p>
+              <p className="max-w-xs text-meta leading-relaxed text-muted">
                 按当前主会话隔离车道，默认沿用主模型（可随时在上方切换）；也可在主输入框直接发送{" "}
-                <span className="font-mono text-fg">/btw 问题</span>
+                <kbd className="oc-kbd mx-0.5">/btw</kbd> 提问
               </p>
+              {!coarsePointer && (
+                <div className="oc-surface-recessed mt-1 flex flex-wrap items-center justify-center gap-x-3 gap-y-1.5 rounded-lg px-3 py-1.5 text-caption text-muted">
+                  <span className="inline-flex items-center gap-1">
+                    <kbd className="oc-kbd">Alt+K</kbd>
+                    <span>唤起/收起</span>
+                  </span>
+                  <span className="inline-flex items-center gap-1">
+                    <kbd className="oc-kbd">{sendKeyLabel}</kbd>
+                    <span>发送</span>
+                  </span>
+                  <span className="inline-flex items-center gap-1">
+                    <kbd className="oc-kbd">Esc</kbd>
+                    <span>收起</span>
+                  </span>
+                </div>
+              )}
             </div>
           ) : (
             <ChatInteractionContext.Provider value={qaChatInteraction}>
@@ -1073,44 +1110,57 @@ export function QuickAskWindow({
       </div>
 
       {/* Footer composer */}
-      <footer className="shrink-0 border-t border-border bg-bg/60 px-3 py-2.5">
-        <div className="mb-2 flex items-center justify-between gap-2 text-caption text-faint">
-          {hasMainlineContext ? (
-            <button
-              type="button"
-              data-testid="quick-ask-context-hint"
-              aria-pressed={attachContext}
-              title={
-                attachContext
-                  ? `点击断开主线背景注入\n\n${contextPrefix}`
-                  : "当前不注入主线背景，点击重新关联"
-              }
-              onClick={() => setAttachContext((v) => !v)}
-              className={cn(
-                "flex min-w-0 items-center gap-1 rounded-full px-1.5 py-0.5 text-left transition-colors hover:bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
-                attachContext ? "text-muted" : "text-faint line-through",
-              )}
-            >
-              {attachContext ? (
-                <Link2 size={12} className="shrink-0 text-accent" />
-              ) : (
-                <Unlink size={12} className="shrink-0 text-faint" />
-              )}
-              <span className="truncate">{contextLabel}</span>
-            </button>
-          ) : (
-            <span
-              data-testid="quick-ask-context-hint"
-              className="flex min-w-0 items-center gap-1 truncate text-muted"
-            >
-              <Link2 size={12} className="shrink-0 text-accent" />
-              <span className="truncate">{contextLabel}</span>
+      <footer className="shrink-0 border-t border-border/80 bg-bg/70 px-3 pt-2.5 pb-2.5">
+        <div className="oc-surface-recessed mb-2 rounded-lg px-2.5 py-1.5">
+          <div className="flex items-center justify-between gap-2 text-caption text-faint">
+            {hasMainlineContext ? (
+              <button
+                type="button"
+                data-testid="quick-ask-context-hint"
+                aria-pressed={attachContext}
+                title={
+                  attachContext
+                    ? `点击断开主线背景注入\n\n${contextPrefix}`
+                    : "当前不注入主线背景，点击重新关联"
+                }
+                onClick={() => setAttachContext((v) => !v)}
+                className={cn(
+                  "oc-btn-tactile flex min-w-0 items-center gap-1.5 rounded-md px-1 py-0.5 text-left hover:bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+                  attachContext ? "text-fg" : "text-faint line-through",
+                )}
+              >
+                <span
+                  aria-hidden
+                  className={cn(
+                    "oc-icon-badge size-5 rounded-xs",
+                    attachContext ? "oc-icon-badge-accent" : undefined,
+                  )}
+                >
+                  {attachContext ? <Link2 size={11} /> : <Unlink size={11} />}
+                </span>
+                <span className="truncate font-medium">{contextLabel}</span>
+              </button>
+            ) : (
+              <span
+                data-testid="quick-ask-context-hint"
+                className="flex min-w-0 items-center gap-1.5 truncate text-muted"
+              >
+                <span aria-hidden className="oc-icon-badge oc-icon-badge-accent size-5 rounded-xs">
+                  <Link2 size={11} />
+                </span>
+                <span className="truncate font-medium">{contextLabel}</span>
+              </span>
+            )}
+            <span className="shrink-0 rounded-full border border-border/70 bg-surface/80 px-2 py-0.5 text-micro font-medium text-faint">
+              不进主历史
             </span>
+          </div>
+          {hasMainlineContext && attachContext && contextPreview && (
+            <p className="mt-1 truncate pl-7 text-caption text-faint">{contextPreview}</p>
           )}
-          <span className="shrink-0">不进主历史</span>
         </div>
 
-        <div className="flex items-end gap-2 rounded-lg border border-border-control bg-surface px-2.5 py-1.5 focus-within:border-border-strong">
+        <div className="oc-composer-dock flex items-end gap-2 rounded-xl px-2.5 py-1.5">
           <textarea
             ref={textareaRef}
             rows={1}
@@ -1146,11 +1196,11 @@ export function QuickAskWindow({
               else void handleSubmit();
             }}
             className={cn(
-              "flex size-9 shrink-0 items-center justify-center rounded-full transition-colors [@media(hover:none)]:size-11",
+              "oc-btn-tactile flex size-9 shrink-0 items-center justify-center rounded-full [@media(hover:none)]:size-11",
               sending
-                ? "bg-fg text-bg"
+                ? "oc-btn-accent-craft text-accent-fg"
                 : input.trim() && !authorizing
-                  ? "bg-primary text-primary-fg hover:opacity-90"
+                  ? "oc-btn-primary-craft text-primary-fg"
                   : "bg-hover text-faint",
             )}
           >
@@ -1163,6 +1213,19 @@ export function QuickAskWindow({
             )}
           </button>
         </div>
+
+        {!coarsePointer && (
+          <div className="mt-1.5 flex items-center justify-between px-0.5 text-micro text-faint">
+            <span className="inline-flex items-center gap-1">
+              <kbd className="oc-kbd">{sendKeyLabel}</kbd>
+              <span>发送</span>
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <kbd className="oc-kbd">Esc</kbd>
+              <span>{sending ? "停止生成" : "收起小窗"}</span>
+            </span>
+          </div>
+        )}
       </footer>
     </section>
     {confirmClearEl}

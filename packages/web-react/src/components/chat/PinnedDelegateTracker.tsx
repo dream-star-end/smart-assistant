@@ -250,21 +250,23 @@ export function PinnedDelegateTracker({
 
   return (
     <div className="mx-auto mb-2 w-full max-w-3xl px-4">
-      <div className="overflow-hidden rounded-lg border border-border bg-elevated shadow-soft">
-        <div className="flex min-h-11 w-full items-center gap-2 px-3 py-2 transition-colors hover:bg-hover">
+      <div className="oc-surface-glass overflow-hidden rounded-xl shadow-soft">
+        <div className="flex min-h-11 w-full items-center gap-2 px-3 py-2 transition-colors hover:bg-hover/70">
           <button
             type="button"
             onClick={toggle}
             aria-expanded={expanded}
             aria-controls={expanded ? listId : undefined}
             className={cn(
-              "flex min-h-11 min-w-0 flex-1 items-center gap-2 rounded-md text-left",
+              "flex min-h-11 min-w-0 flex-1 items-center gap-2.5 rounded-md text-left",
               HUD_TOGGLE_CLS,
             )}
           >
-            <Bot className="size-4 shrink-0 text-accent" aria-hidden />
+            <span className="oc-icon-badge oc-icon-badge-accent flex size-6 shrink-0 items-center justify-center rounded-sm">
+              <Bot className="size-3.5" strokeWidth={1.75} aria-hidden />
+            </span>
             <span className="sr-only">{expanded ? "折叠后台任务列表" : "展开后台任务列表"}</span>
-            <span className="shrink-0 text-xs font-medium text-muted">{headline}</span>
+            <span className="shrink-0 text-caption font-semibold text-muted">{headline}</span>
             {/* 折叠摘要(H-02):状态标 → 名字(窄屏隐藏)→ 目标(唯一可收缩项)→ 计时(在 truncate 之外)。 */}
             {!expanded && summaryItem && (
               <span className="flex min-w-0 flex-1 items-center gap-1.5 text-body text-fg">
@@ -276,7 +278,7 @@ export function PinnedDelegateTracker({
                 {/* 计时在窄屏让位给目标文本(390px 下头部同时挤着计数 / 目标 / 停止本轮)。 */}
                 {elapsed ? (
                   <span
-                    className="hidden shrink-0 tabular-nums text-faint sm:inline"
+                    className="hidden shrink-0 font-mono text-caption tabular-nums text-faint sm:inline"
                     title="运行时长（自本页观察到该任务起算）"
                   >
                     {elapsed}
@@ -286,17 +288,17 @@ export function PinnedDelegateTracker({
             )}
             {expanded && <span className="flex-1" />}
             {expanded ? (
-              <ChevronDown className="size-4 shrink-0 text-faint" aria-hidden />
+              <ChevronDown className="size-4 shrink-0 text-faint" strokeWidth={1.75} aria-hidden />
             ) : (
-              <ChevronUp className="size-4 shrink-0 text-faint" aria-hidden />
+              <ChevronUp className="size-4 shrink-0 text-faint" strokeWidth={1.75} aria-hidden />
             )}
           </button>
           {hasRunning && onStop ? (
             <Button
               type="button"
               size="sm"
-              variant="ghost"
-              className="shrink-0"
+              variant="secondary"
+              className="oc-btn-tactile oc-btn-secondary-craft shrink-0"
               onClick={(e) => {
                 e.stopPropagation();
                 onStop();
@@ -313,7 +315,7 @@ export function PinnedDelegateTracker({
               type="button"
               size="sm"
               variant="ghost"
-              className="shrink-0"
+              className="oc-btn-tactile shrink-0"
               onClick={(e) => {
                 e.stopPropagation();
                 dismissAll();

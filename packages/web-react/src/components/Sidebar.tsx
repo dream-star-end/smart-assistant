@@ -676,12 +676,12 @@ export function Sidebar({
       data-product-feature={PRODUCT_CAPABILITIES.billing.id}
       disabled={!hasAccountMenu}
       aria-label={hasAccountMenu ? "账号菜单" : undefined}
-      className="flex min-w-0 flex-1 items-center gap-2.5 rounded-sm py-1.5 pl-1.5 pr-2 text-left outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring enabled:hover:bg-hover data-[state=open]:bg-hover [@media(hover:none)]:min-h-11"
+      className="oc-btn-tactile flex min-w-0 flex-1 items-center gap-2.5 rounded-sm py-1.5 pl-1.5 pr-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring enabled:hover:bg-hover data-[state=open]:bg-hover [@media(hover:none)]:min-h-11"
     >
       <Avatar
         size="sm"
         tone="neutral"
-        className="bg-accent-soft text-[12px] text-accent ring-1 ring-inset ring-accent/15"
+        className="bg-accent-soft text-meta font-semibold text-accent ring-1 ring-inset ring-accent/20 shadow-xs"
       >
         {(user?.displayName || "U").slice(0, 1).toUpperCase()}
       </Avatar>
@@ -706,6 +706,7 @@ export function Sidebar({
         // 触屏两侧各有 44px 图标钮，省掉这枚纯装饰箭头把宽度还给余额。
         <ChevronsUpDown
           size={14}
+          strokeWidth={1.75}
           aria-hidden
           className="shrink-0 text-faint [@media(hover:none)]:hidden"
         />
@@ -719,7 +720,7 @@ export function Sidebar({
       return (
         <h2
           className={cn(
-            "m-0 flex h-full items-center pl-2.5 pr-1 text-caption font-medium tracking-[0.04em] text-faint",
+            "m-0 flex h-full items-center pl-2.5 pr-1 text-caption font-semibold tracking-[0.06em] text-faint",
             // 桌面 32px 行：文字压在下部、贴近其所属分组；触屏带按钮的标题行升到 44px（拍平层同步加高），
             // 文字与 44px 按钮垂直居中对齐（S-04）。
             !(withAction && coarse) && "pt-2.5",
@@ -733,10 +734,10 @@ export function Sidebar({
               variant="muted"
               size="xs"
               shape="square"
-              className="ml-auto rounded-xs"
+              className="oc-btn-tactile ml-auto rounded-xs"
               onClick={onCreateProject}
             >
-              <Plus size={14} />
+              <Plus size={14} strokeWidth={1.75} />
             </IconButton>
           )}
           {withAction && onOpenProjectArchive && (
@@ -746,10 +747,10 @@ export function Sidebar({
               variant="muted"
               size="xs"
               shape="square"
-              className="rounded-xs"
+              className="oc-btn-tactile rounded-xs"
               onClick={onOpenProjectArchive}
             >
-              <Archive size={14} />
+              <Archive size={14} strokeWidth={1.75} />
             </IconButton>
           )}
         </h2>
@@ -763,12 +764,12 @@ export function Sidebar({
             data-testid="sidebar-empty-all"
             className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center"
           >
-            <span className="flex size-10 items-center justify-center rounded-full bg-hover text-faint">
-              <MessageSquareText size={18} />
+            <span className="oc-icon-badge oc-icon-badge-accent size-10 rounded-md">
+              <MessageSquareText size={18} strokeWidth={1.75} />
             </span>
             <div className="flex flex-col gap-1">
-              <span className="text-body font-medium text-fg">{item.text}</span>
-              <span className="text-caption text-faint">
+              <span className="text-body font-semibold text-fg">{item.text}</span>
+              <span className="text-caption leading-relaxed text-faint">
                 新建一个会话开始聊天；相关会话多了，可以建项目归到一起。
               </span>
             </div>
@@ -1015,13 +1016,13 @@ export function Sidebar({
           )}
         />
       )}
-      <div className="flex flex-col px-2 pb-1 sidebar-head-safe-t" data-product-entry-scope="sidebar-primary">
-        <div className="mb-2.5 flex h-8 items-center justify-between pl-2 pr-0.5">
+      <div className="flex flex-col px-2 pb-1.5 sidebar-head-safe-t" data-product-entry-scope="sidebar-primary">
+        <div className="mb-3 flex h-8 items-center justify-between pl-1.5 pr-0.5">
           <div className="flex min-w-0 items-center gap-2.5">
             <BrandMark
               className="size-[26px]"
-              rounded="rounded-[8px]"
-              fontSize="text-[14px]"
+              rounded="rounded-sm"
+              fontSize="text-section"
               flat
             />
             <span className="truncate text-title font-semibold tracking-tight text-fg">
@@ -1037,59 +1038,60 @@ export function Sidebar({
               variant="muted"
               size="sm"
               shape="square"
-              className="rounded-xs"
+              className="oc-btn-tactile rounded-sm"
             >
-              <PanelLeftClose size={16} />
+              <PanelLeftClose size={16} strokeWidth={1.75} />
             </IconButton>
           )}
         </div>
 
-        {/* 主操作：一张带发丝描边的浮起卡片，左侧墨色圆形「+」是整栏唯一的强视觉锚点；
+        {/* 主操作：雕塑感浮起卡片，左侧墨色圆形「+」是整栏唯一的强视觉锚点；
             有智能体选择时右侧以细分隔线切出下拉，而不是两块拼接的按钮（SIDEBAR-R1）。 */}
         <div
           data-sidebar-new
-          className="mb-2 flex h-9 w-full items-stretch rounded-sm border border-border bg-surface text-section shadow-sidebar-btn transition-[border-color,box-shadow] duration-150 ease-standard hover:border-border-strong [@media(hover:none)]:h-11"
+          className="group/new oc-btn-tactile mb-2.5 flex h-9 w-full items-stretch rounded-sm border border-border bg-surface text-section shadow-sidebar-btn transition-[border-color,box-shadow,transform] duration-150 ease-standard hover:border-border-strong hover:shadow-soft [@media(hover:none)]:h-11"
         >
           <button
             type="button"
             data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
             onClick={onNew}
             className={cn(
-              "flex min-w-0 flex-1 items-center gap-2.5 pl-2 pr-2 text-left font-medium text-fg outline-none transition-colors duration-150 hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-              onNewWithAgent ? "rounded-l-[8px]" : "rounded-[8px]",
+              "flex min-w-0 flex-1 items-center gap-2.5 pl-2 pr-2.5 text-left font-medium text-fg outline-none transition-colors duration-150 hover:bg-hover/70 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+              onNewWithAgent ? "rounded-l-sm" : "rounded-sm",
             )}
           >
             <span
               aria-hidden
-              className="flex size-[22px] shrink-0 items-center justify-center rounded-full bg-primary text-primary-fg"
+              className="oc-btn-primary-craft flex size-[22px] shrink-0 items-center justify-center rounded-full text-primary-fg transition-transform duration-200 ease-spring group-hover/new:scale-105"
             >
-              <Plus size={14} strokeWidth={2.5} />
+              <Plus size={13} strokeWidth={2.25} />
             </span>
             <span className="truncate">新建会话</span>
           </button>
           {onNewWithAgent && (
             <>
-              <span aria-hidden className="my-2 w-px shrink-0 bg-border" />
+              <span aria-hidden className="my-2 w-px shrink-0 bg-border/80" />
               <button
                 type="button"
                 data-product-feature={PRODUCT_CAPABILITIES.agents.id}
                 aria-label="选择智能体后新建"
                 title="选择智能体后新建"
                 onClick={onNewWithAgent}
-                className="flex w-9 shrink-0 items-center justify-center rounded-r-[8px] text-faint outline-none transition-colors duration-150 hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:w-11"
+                className="flex w-9 shrink-0 items-center justify-center rounded-r-sm text-faint outline-none transition-colors duration-150 hover:bg-hover/70 hover:text-fg focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:w-11"
               >
-                <ChevronDown size={15} />
+                <ChevronDown size={15} strokeWidth={1.75} />
               </button>
             </>
           )}
         </div>
 
-        {/* 搜索与「任务」同一导航行骨架（图标列 / 文字 / 尾部操作）：静息时像导航项，聚焦时浮起成输入卡。 */}
-        <label className="group/search flex h-8 min-w-0 items-center gap-2.5 rounded-sm pl-2.5 pr-1 text-muted transition-[background-color,box-shadow] duration-150 hover:bg-hover focus-within:bg-sidebar-active focus-within:shadow-sidebar-active focus-within:ring-1 focus-within:ring-ring [@media(hover:none)]:min-h-11">
+        {/* 搜索井：微凹槽容器，静息克制，聚焦时浮起成带暖陶土微光的雕塑搜索卡。 */}
+        <label className="group/search oc-surface-recessed flex h-8 min-w-0 items-center gap-2 rounded-sm pl-2.5 pr-1 text-muted transition-[background-color,box-shadow,border-color] duration-150 hover:border-border-strong/60 focus-within:border-accent/45 focus-within:bg-sidebar-active focus-within:shadow-sidebar-active focus-within:ring-1 focus-within:ring-ring/60 [@media(hover:none)]:min-h-11">
           <Search
-            size={15}
+            size={14}
+            strokeWidth={1.75}
             aria-hidden
-            className="shrink-0 text-faint transition-colors group-focus-within/search:text-fg"
+            className="shrink-0 text-faint transition-colors group-focus-within/search:text-accent"
           />
           <input
             data-product-feature={PRODUCT_CAPABILITIES.sessions.id}
@@ -1107,7 +1109,7 @@ export function Sidebar({
             placeholder="搜索标题或消息"
             // 输入字号移动端保持 16px（iOS 输入框 <16px 聚焦会整页放大）；占位符单独取导航行字号，
             // 静息态与下方「任务」同一视觉重量（iOS 缩放只看输入框本身字号，不看 placeholder）。
-            className="h-full w-full min-w-0 bg-transparent text-base text-fg outline-none placeholder:text-section placeholder:text-muted md:text-section"
+            className="h-full w-full min-w-0 bg-transparent text-base text-fg outline-none placeholder:text-body placeholder:text-faint md:text-body"
           />
           {q && (
             <IconButton
@@ -1119,7 +1121,7 @@ export function Sidebar({
               shape="round"
               onClick={() => setQ("")}
             >
-              <X size={13} />
+              <X size={13} strokeWidth={1.75} />
             </IconButton>
           )}
           {onOpenPalette && !q && (
@@ -1133,10 +1135,10 @@ export function Sidebar({
                 e.preventDefault();
                 onOpenPalette();
               }}
-              className="flex h-6 shrink-0 items-center justify-center rounded-xs px-1.5 text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11 [@media(hover:none)]:px-0"
+              className="oc-btn-tactile flex h-6 shrink-0 items-center justify-center rounded-xs px-0.5 text-faint outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11 [@media(hover:none)]:px-0"
             >
-              <kbd className="font-sans text-caption [@media(hover:none)]:hidden">{paletteKeyLabel()}</kbd>
-              <Command size={15} aria-hidden className="hidden [@media(hover:none)]:block" />
+              <kbd className="oc-kbd [@media(hover:none)]:hidden">{paletteKeyLabel()}</kbd>
+              <Command size={15} strokeWidth={1.75} aria-hidden className="hidden [@media(hover:none)]:block" />
             </button>
           )}
           {onBatch && !multiSelect && (
@@ -1148,17 +1150,17 @@ export function Sidebar({
               variant="muted"
               size="xs"
               shape="square"
-              className="rounded-xs"
+              className="oc-btn-tactile rounded-xs"
               onClick={() => setMultiSelect(true)}
             >
-              <ListChecks size={15} />
+              <ListChecks size={15} strokeWidth={1.75} />
             </IconButton>
           )}
         </label>
         {searching && scopeFilterForSearch !== undefined && (
           <div
             data-testid="sidebar-search-scope"
-            className="mt-1 flex min-w-0 items-center gap-1 rounded-sm bg-accent-soft py-0.5 pl-2.5 pr-1 text-caption text-accent"
+            className="mt-1.5 flex min-w-0 items-center gap-1 rounded-sm bg-accent-soft py-0.5 pl-2.5 pr-1 text-caption font-medium text-accent ring-1 ring-inset ring-accent/20"
           >
             <span className="min-w-0 flex-1 truncate">
               仅在「
@@ -1176,7 +1178,7 @@ export function Sidebar({
               shape="round"
               onClick={() => setIgnoreScopeForSearch(true)}
             >
-              <X size={12} />
+              <X size={12} strokeWidth={1.75} />
             </IconButton>
           </div>
         )}
@@ -1189,16 +1191,17 @@ export function Sidebar({
             onClick={onOpenBoard}
             aria-current={boardActive ? "true" : undefined}
             className={cn(
-              "mt-0.5 flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section outline-none transition-[background-color,color,box-shadow] duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+              "relative mt-1 flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section outline-none transition-[background-color,color,box-shadow] duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
               boardActive
-                ? "bg-sidebar-active font-medium text-fg shadow-sidebar-active"
+                ? "bg-sidebar-active font-medium text-fg shadow-sidebar-active before:absolute before:bottom-1.5 before:left-0.5 before:top-1.5 before:w-0.5 before:rounded-xs before:bg-accent"
                 : "text-muted hover:bg-hover hover:text-fg",
             )}
           >
             <SquareKanban
               size={15}
+              strokeWidth={1.75}
               aria-hidden
-              className={boardActive ? "text-fg" : "text-faint"}
+              className={boardActive ? "text-accent" : "text-faint"}
             />
             任务
           </button>
@@ -1211,16 +1214,17 @@ export function Sidebar({
             onClick={onOpenSites}
             aria-current={sitesActive ? "true" : undefined}
             className={cn(
-              "mt-0.5 flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section outline-none transition-[background-color,color,box-shadow] duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+              "relative mt-0.5 flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section outline-none transition-[background-color,color,box-shadow] duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
               sitesActive
-                ? "bg-sidebar-active font-medium text-fg shadow-sidebar-active"
+                ? "bg-sidebar-active font-medium text-fg shadow-sidebar-active before:absolute before:bottom-1.5 before:left-0.5 before:top-1.5 before:w-0.5 before:rounded-xs before:bg-accent"
                 : "text-muted hover:bg-hover hover:text-fg",
             )}
           >
             <Globe
               size={15}
+              strokeWidth={1.75}
               aria-hidden
-              className={sitesActive ? "text-fg" : "text-faint"}
+              className={sitesActive ? "text-accent" : "text-faint"}
             />
             站点
           </button>
@@ -1233,7 +1237,7 @@ export function Sidebar({
             onClick={onOpenBlog}
             className="mt-0.5 flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section text-muted outline-none transition-[background-color,color,box-shadow] duration-150 hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
           >
-            <PenLine size={15} aria-hidden className="text-faint" />
+            <PenLine size={15} strokeWidth={1.75} aria-hidden className="text-faint" />
             经验分享
           </button>
         )}
@@ -1298,10 +1302,9 @@ export function Sidebar({
         </div>
       ) : null}
 
-      {/* 底栏：账号区，右侧是案例展厅与主题切换。任务 / 经验分享在搜索下方以文字行呈现；
-          管理 / 市场仍在账号菜单里（T41 契约）。 */}
-      <div className="border-t border-border/70 px-2 pt-1 sidebar-foot-safe-b">
-        <div className="flex items-center" data-product-entry-scope="sidebar-account">
+      {/* 底栏：精致分隔与浮面层级，账号区 + 案例展厅 + 主题切换光学对齐。 */}
+      <div className="border-t border-border/80 bg-sidebar/95 px-2 pt-1.5 sidebar-foot-safe-b">
+        <div className="flex items-center gap-0.5" data-product-entry-scope="sidebar-account">
           {hasAccountMenu ? (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>{userChip}</DropdownMenuTrigger>
@@ -1312,21 +1315,21 @@ export function Sidebar({
                 className="w-64 p-1.5"
                 data-product-entry-scope="account-menu"
               >
-                <div className="flex items-center gap-2.5 px-2 py-2">
+                <div className="oc-surface-recessed mb-1 flex items-center gap-2.5 rounded-sm px-2.5 py-2">
                   <Avatar
                     tone="neutral"
-                    className="bg-accent-soft text-body text-accent ring-1 ring-inset ring-accent/15"
+                    className="bg-accent-soft text-body font-semibold text-accent ring-1 ring-inset ring-accent/20"
                   >
                     {(user?.displayName || "U").slice(0, 1).toUpperCase()}
                   </Avatar>
                   <div className="min-w-0 flex-1">
-                    <p className="truncate text-section font-medium text-fg">
+                    <p className="truncate text-section font-semibold text-fg">
                       {user?.displayName || "未登录"}
                     </p>
                     {/* 登录邮箱始终在菜单头部（体验官：有余额时账号区看不到邮箱）。 */}
                     {email && <p className="truncate text-caption text-faint">{email}</p>}
                     {credits != null && (
-                      <p className="truncate text-caption text-faint">{`${formatCredits(credits)} 积分`}</p>
+                      <p className="mt-0.5 truncate text-caption font-medium tabular-nums text-accent">{`${formatCredits(credits)} 积分`}</p>
                     )}
                   </div>
                 </div>
@@ -1336,7 +1339,7 @@ export function Sidebar({
                     data-product-feature={PRODUCT_CAPABILITIES.memory.id}
                     onSelect={onOpenManage}
                   >
-                    <LayoutGrid size={16} className="shrink-0 text-muted" />
+                    <LayoutGrid size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
                     <span className="flex-1">管理中心</span>
                     <span className="text-caption text-faint">记忆 · 技能 · 定时 · 插件</span>
                   </DropdownMenuItem>
@@ -1346,7 +1349,7 @@ export function Sidebar({
                     data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}
                     onSelect={onOpenMarketplace}
                   >
-                    <Store size={16} className="shrink-0 text-muted" />
+                    <Store size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
                     市场
                   </DropdownMenuItem>
                 )}
@@ -1355,39 +1358,39 @@ export function Sidebar({
                     data-product-feature={PRODUCT_CAPABILITIES.organization.id}
                     onSelect={onOpenOrg}
                   >
-                    <Building2 size={16} className="shrink-0 text-muted" />
+                    <Building2 size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
                     组织
                   </DropdownMenuItem>
                 )}
                 {showAdmin && (
                   <DropdownMenuItem asChild data-product-control>
                     <a data-product-control href="/admin.html">
-                      <ShieldCheck size={16} className="shrink-0 text-muted" />
+                      <ShieldCheck size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
                       管理后台
                     </a>
                   </DropdownMenuItem>
                 )}
                 {onOpenStudio && (
                   <DropdownMenuItem data-product-control onSelect={onOpenStudio}>
-                    <Clapperboard size={16} className="shrink-0 text-muted" />
+                    <Clapperboard size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
                     媒体工作台
                   </DropdownMenuItem>
                 )}
                 {onOpenMediaTasks && (
                   <DropdownMenuItem data-product-control onSelect={onOpenMediaTasks}>
-                    <Film size={16} className="shrink-0 text-muted" />
+                    <Film size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
                     视频任务
                   </DropdownMenuItem>
                 )}
                 {onOpenChatGptProxy && (
                   <DropdownMenuItem data-product-control onSelect={onOpenChatGptProxy}>
-                    <Globe size={16} className="shrink-0 text-muted" />
+                    <Globe size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
                     ChatGPT 直连
                   </DropdownMenuItem>
                 )}
                 {onOpenApiAccess && (
                   <DropdownMenuItem data-product-control onSelect={onOpenApiAccess}>
-                    <KeyRound size={16} className="shrink-0 text-muted" />
+                    <KeyRound size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
                     <span className="flex-1">API 接入</span>
                     <span className="text-caption text-faint">本地 Claude Code</span>
                   </DropdownMenuItem>
@@ -1406,7 +1409,7 @@ export function Sidebar({
                     data-product-feature={PRODUCT_CAPABILITIES.billing.id}
                     onSelect={onOpenAccount}
                   >
-                    <Settings size={16} className="shrink-0 text-muted" />
+                    <Settings size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
                     设置
                   </DropdownMenuItem>
                 )}
@@ -1415,13 +1418,13 @@ export function Sidebar({
                     data-product-feature={PRODUCT_CAPABILITIES.feedback.id}
                     onSelect={onOpenFeedback}
                   >
-                    <MessageSquareText size={16} className="shrink-0 text-muted" />
+                    <MessageSquareText size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
                     意见反馈
                   </DropdownMenuItem>
                 )}
                 {onLogout && (
                   <DropdownMenuItem data-product-control destructive onSelect={onLogout}>
-                    <LogOut size={16} className="shrink-0" />
+                    <LogOut size={15} strokeWidth={1.75} className="shrink-0" />
                     退出登录
                   </DropdownMenuItem>
                 )}
@@ -1440,11 +1443,11 @@ export function Sidebar({
               aria-label="打开案例展厅"
               title="案例展厅"
               className={cn(
-                "h-7 shrink-0 gap-1 rounded-xs text-faint hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11",
+                "oc-btn-tactile h-7 shrink-0 gap-1 rounded-sm text-faint hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11",
                 footerCompact ? "w-7 px-0" : "px-2",
               )}
             >
-              <BookOpen size={16} />
+              <BookOpen size={15} strokeWidth={1.75} />
               {!footerCompact && <span className="text-caption font-medium">案例</span>}
             </Button>
           )}

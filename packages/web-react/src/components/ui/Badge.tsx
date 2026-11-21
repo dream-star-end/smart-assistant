@@ -12,7 +12,7 @@ import { StatusDot, useQuiet } from "./Quiet";
  * 各调用方只好一处处补 shrink-0 —— 这条属于徽章本身的不变量,应该长在原语里。
  */
 export const badgeVariants = cva(
-  "inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full font-medium",
+  "oc-badge-craft inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full font-medium tabular-nums",
   {
     variants: {
       tone: {
@@ -25,8 +25,8 @@ export const badgeVariants = cva(
       },
       /** md = 常规;sm 给密集列表(一行里挂 3 个以上徽章时)用。 */
       size: {
-        md: "px-2 py-0.5 text-meta",
-        sm: "px-1.5 py-0.5 text-caption",
+        md: "px-2.5 py-0.5 text-meta",
+        sm: "px-2 py-0.5 text-caption",
       },
     },
     defaultVariants: { tone: "neutral", size: "md" },

@@ -62,12 +62,12 @@ export function MermaidBlock({ code }: { code: string }) {
 
   if (err) {
     return (
-      <pre className="my-3 overflow-auto rounded-lg bg-code px-3 py-2 font-mono text-xs text-fg">{code}</pre>
+      <pre className="oc-code-shell my-3 overflow-auto rounded-xl bg-code px-3.5 py-2.5 font-mono text-meta text-fg">{code}</pre>
     );
   }
   if (!svg) {
     return (
-      <div className="my-3 flex items-center justify-center rounded-lg border border-border bg-surface px-3 py-6 text-meta text-faint">
+      <div className="oc-surface-card my-3 flex items-center justify-center rounded-xl px-4 py-7 text-meta text-faint">
         图表渲染中…
       </div>
     );
@@ -75,7 +75,7 @@ export function MermaidBlock({ code }: { code: string }) {
   return (
     // mermaid securityLevel:'strict' 已清洗 SVG
     <div
-      className="my-3 flex justify-center overflow-x-auto rounded-lg border border-border bg-surface p-3"
+      className="oc-surface-card my-3 flex justify-center overflow-x-auto rounded-xl p-4"
       // biome-ignore lint/security/noDangerouslySetInnerHtml: mermaid strict-sanitized SVG
       dangerouslySetInnerHTML={{ __html: svg }}
     />
@@ -398,58 +398,69 @@ function OptionsCardItem({ parsed, readOnly }: { parsed: ParsedOptionsItem; read
     sendUserText?.(trimmedNote);
   };
   return (
-    <div ref={cardRef} className="my-2 flex flex-col gap-2 rounded-2xl border border-border bg-surface p-3 not-prose shadow-[0_1px_2px_rgba(15,23,42,0.03)]">
+    <div ref={cardRef} className="oc-surface-card my-2.5 flex flex-col gap-3 rounded-2xl p-3.5 not-prose">
       {(parsed.question || parsed.options.length > 0) && (
-        <div className="flex items-start justify-between gap-2 px-1">
-          {parsed.question ? <p className="text-body font-medium text-fg">{parsed.question}</p> : <span />}
-          <span className="shrink-0 rounded-full bg-elevated px-2 py-0.5 text-micro font-medium text-muted border border-border">
+        <div className="flex items-start justify-between gap-3 px-0.5">
+          {parsed.question ? (
+            <p className="text-section font-semibold leading-snug text-fg">{parsed.question}</p>
+          ) : (
+            <span />
+          )}
+          <span className="oc-surface-recessed shrink-0 rounded-full border border-border/70 px-2.5 py-0.5 text-micro font-medium text-muted">
             {parsed.multi ? "可多选" : "单选"}
           </span>
         </div>
       )}
-      <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
         {parsed.options.map((o, i) => {
           const chosen = parsed.multi || grouped ? picked.has(i) : sentText === o.label || (trimmedNote ? sentText === formatPick(o.label) : false);
+          const canClick = interactive && !blockedByBusy;
+          const badgeChar = i < 26 ? String.fromCharCode(65 + i) : String(i + 1);
           return (
             <button
               key={`${i}-${o.label}`}
               type="button"
-              disabled={!interactive || blockedByBusy}
+              disabled={!canClick}
               onClick={() => choose(i)}
               className={
-                "flex items-start gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 " +
+                "group/opt relative flex items-start gap-2.5 rounded-xl border px-3.5 py-2.5 text-left transition-all duration-150 outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 " +
                 (chosen
-                  ? "border-accent bg-accent-soft"
-                  : "border-border bg-elevated hover:border-accent/40 hover:bg-hover") +
-                (!interactive || blockedByBusy ? " cursor-default opacity-80" : "")
+                  ? "border-accent bg-accent-soft shadow-soft ring-1 ring-accent/20"
+                  : canClick
+                    ? "oc-surface-card-hover border-border bg-elevated/90 hover:border-accent/45 hover:bg-surface"
+                    : "border-border/80 bg-elevated/70") +
+                (!canClick ? " cursor-default opacity-80" : " oc-btn-tactile cursor-pointer")
               }
             >
               <span
+                aria-hidden="true"
                 className={
-                  "mt-0.5 flex size-4 shrink-0 items-center justify-center border text-micro " +
-                  (parsed.multi ? "rounded " : "rounded-full ") +
-                  (chosen ? "border-accent bg-accent text-accent-fg" : "border-border text-transparent")
+                  "mt-0.5 flex size-4 shrink-0 items-center justify-center border font-mono text-micro font-semibold transition-all duration-150 " +
+                  (parsed.multi ? "rounded-xs " : "rounded-full ") +
+                  (chosen
+                    ? "border-accent bg-accent text-accent-fg shadow-soft"
+                    : "border-border-strong/70 bg-surface text-faint group-hover/opt:border-accent/50 group-hover/opt:text-accent")
                 }
               >
-                ✓
+                {chosen ? "✓" : badgeChar}
               </span>
-              <span className="min-w-0">
-                <span className="block text-body font-medium text-fg">{o.label}</span>
-                {o.desc && <span className="mt-0.5 block text-[11.5px] leading-snug text-muted">{o.desc}</span>}
+              <span className="min-w-0 flex-1">
+                <span className="block text-body font-medium leading-snug text-fg">{o.label}</span>
+                {o.desc && <span className="mt-0.5 block text-caption leading-snug text-muted">{o.desc}</span>}
               </span>
             </button>
           );
         })}
       </div>
       {interactive && !grouped && (
-        <div className="flex flex-col gap-1.5 px-1">
+        <div className="flex flex-col gap-2 border-t border-border/60 px-0.5 pt-2.5">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <button
               type="button"
               aria-expanded={noteOpen}
               disabled={blockedByBusy}
               onClick={() => setNoteOpen((v) => !v)}
-              className="text-caption font-medium text-muted hover:text-fg transition-colors disabled:opacity-40 [@media(hover:none)]:min-h-11"
+              className="rounded-md px-1.5 py-1 text-caption font-medium text-muted transition-colors hover:bg-hover hover:text-fg disabled:opacity-40 [@media(hover:none)]:min-h-11"
             >
               {noteOpen ? "收起补充说明" : "补充说明后再发"}
             </button>
@@ -458,7 +469,7 @@ function OptionsCardItem({ parsed, readOnly }: { parsed: ParsedOptionsItem; read
                 type="button"
                 disabled={picked.size === 0 || blockedByBusy}
                 onClick={confirmMulti}
-                className="ml-auto rounded-lg bg-accent px-3.5 py-1.5 text-meta font-medium text-accent-fg transition-opacity disabled:opacity-40 [@media(hover:none)]:min-h-11"
+                className="oc-btn-tactile oc-btn-accent-craft ml-auto rounded-lg bg-accent px-3.5 py-1.5 text-meta font-medium text-accent-fg transition-opacity disabled:opacity-40 [@media(hover:none)]:min-h-11"
               >
                 确认选择{picked.size > 0 ? `(${picked.size})` : ""}
               </button>
@@ -486,14 +497,14 @@ function OptionsCardItem({ parsed, readOnly }: { parsed: ParsedOptionsItem; read
                   }
                 }}
                 placeholder="选填：输入补充要求，点上方选项将一并带出"
-                className="min-w-0 flex-1 rounded-lg border border-border bg-elevated px-2.5 py-1.5 text-meta text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="oc-surface-recessed min-w-0 flex-1 rounded-lg border border-border-control/70 bg-elevated px-3 py-1.5 text-base text-fg outline-none transition-[border-color,box-shadow] focus:border-accent focus-visible:ring-2 focus-visible:ring-ring md:text-meta"
               />
               {trimmedNote && (
                 <button
                   type="button"
                   disabled={blockedByBusy}
                   onClick={sendCustomNote}
-                  className="shrink-0 rounded-lg border border-border bg-elevated px-3 py-1.5 text-caption font-medium text-fg hover:bg-hover disabled:opacity-40 [@media(hover:none)]:min-h-11"
+                  className="oc-btn-tactile oc-btn-secondary-craft shrink-0 rounded-lg border border-border bg-surface px-3 py-1.5 text-caption font-medium text-fg hover:bg-hover disabled:opacity-40 [@media(hover:none)]:min-h-11"
                 >
                   直接发送说明
                 </button>
@@ -503,14 +514,14 @@ function OptionsCardItem({ parsed, readOnly }: { parsed: ParsedOptionsItem; read
         </div>
       )}
       {sent && sentText && (
-        <div className="flex flex-wrap items-center justify-between gap-2 px-1 text-caption text-faint">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/60 px-0.5 pt-2 text-caption text-faint">
           <p className="min-w-0 truncate">已选择:{sentText}</p>
           {lockedByHistory && !readOnly && !!sendUserText && !busy && (
             <button
               type="button"
               data-testid="options-reopen-history"
               onClick={() => setReopenedHistory(true)}
-              className="shrink-0 font-medium text-muted transition-colors hover:text-fg [@media(hover:none)]:min-h-11"
+              className="oc-btn-tactile shrink-0 rounded-md px-2 py-0.5 font-medium text-accent transition-colors hover:bg-accent-soft [@media(hover:none)]:min-h-11"
             >
               重新选择
             </button>
@@ -518,15 +529,15 @@ function OptionsCardItem({ parsed, readOnly }: { parsed: ParsedOptionsItem; read
         </div>
       )}
       {grouped && !sent && (groupEntry?.labels.length ?? 0) > 0 && (
-        <p className="px-1 text-caption text-faint">已选:{groupEntry?.labels.join("、")}(可在下方发送选择)</p>
+        <p className="border-t border-border/60 px-0.5 pt-2 text-caption text-faint">已选:{groupEntry?.labels.join("、")}(可在下方发送选择)</p>
       )}
       {/* 没有发送能力时说清原因:demo 是「演示模式仅供浏览」,不再笼统一句「此会话中不可交互」(D-08)。 */}
       {!readOnly && !sendUserText && (
-        <p className="px-1 text-caption text-faint">{chatInteractionUnavailableText(reason)}</p>
+        <p className="px-0.5 text-caption text-faint">{chatInteractionUnavailableText(reason)}</p>
       )}
       {/* 新回合进行中历史选项卡不可点:说明原因,而不是只把选项压成 opacity-80 让人干等。 */}
       {interactive && blockedByBusy && (
-        <output className="block px-1 text-caption text-faint">等待当前回合结束后可选择</output>
+        <output className="block px-0.5 text-caption text-faint">等待当前回合结束后可选择</output>
       )}
     </div>
   );
@@ -621,11 +632,11 @@ export function ChartBlock({ code }: { code: string }) {
 
   if (err) {
     return (
-      <pre className="my-3 overflow-auto rounded-lg bg-code px-3 py-2 font-mono text-xs text-fg">{code}</pre>
+      <pre className="oc-code-shell my-3 overflow-auto rounded-xl bg-code px-3.5 py-2.5 font-mono text-meta text-fg">{code}</pre>
     );
   }
   return (
-    <div className="my-3 rounded-lg border border-border bg-surface p-3">
+    <div className="oc-surface-card my-3 rounded-xl p-4">
       <canvas ref={canvasRef} className="max-h-80 w-full" />
     </div>
   );

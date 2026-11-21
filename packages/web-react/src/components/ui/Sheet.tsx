@@ -25,9 +25,9 @@ const sheetVariants = cva(
         right:
           "inset-y-0 right-0 w-[19rem] max-w-[84vw] border-l border-border pr-[env(safe-area-inset-right)] pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] [--oc-sheet-safe-t:0px] data-[state=open]:oc-sheet-in-right data-[state=closed]:oc-sheet-out-right",
         // 贴底:高度按内容自适应到 85dvh 封顶(dvh 收口移动端动态工具栏);顶部圆角 22px(--radius-2xl),
-        // 底部补安全区,底色取 elevated + 细发丝顶边区分浮层与画布。
+        // 底部补安全区,底色取 elevated + 雕塑感浮面顶缘高光区分浮层与画布。
         bottom:
-          "inset-x-0 bottom-0 max-h-[85dvh] w-full overflow-y-auto overscroll-contain rounded-t-2xl border-t border-border bg-elevated pb-[env(safe-area-inset-bottom)] data-[state=open]:oc-sheet-in-bottom data-[state=closed]:oc-sheet-out-bottom",
+          "oc-surface-popover inset-x-0 bottom-0 max-h-[85dvh] w-full overflow-y-auto overscroll-contain rounded-t-2xl border-t border-border bg-elevated pb-[env(safe-area-inset-bottom)] data-[state=open]:oc-sheet-in-bottom data-[state=closed]:oc-sheet-out-bottom",
       },
     },
     defaultVariants: { side: "left" },
@@ -71,7 +71,7 @@ export function Sheet({
       <RD.Portal>
         <RD.Overlay
           className={cn(
-            "fixed inset-0 z-40 bg-black/35 backdrop-blur-sm data-[state=open]:animate-fade",
+            "fixed inset-0 z-40 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade",
             overlayClassName,
           )}
         />

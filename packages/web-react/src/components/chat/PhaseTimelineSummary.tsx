@@ -226,13 +226,15 @@ export function PhaseGroupHeader({
   const duration = formatPhaseDuration(phase.durationMs);
   return (
     <div data-testid="phase-group-header" data-phase-kind={phase.kind} className="oc-phase-group-head">
-      <Icon size={12} strokeWidth={2} aria-hidden className="text-accent" />
-      <span>{phase.label}</span>
+      <span className="oc-icon-badge oc-icon-badge-accent flex size-5 shrink-0 items-center justify-center rounded-sm">
+        <Icon size={11} strokeWidth={1.85} aria-hidden />
+      </span>
+      <span className="font-semibold text-fg">{phase.label}</span>
       <span className="tabular-nums text-faint">· {phase.stepCount} 项</span>
       {phase.changedFileCount > 0 ? (
         <span className="tabular-nums text-faint">· 改动 {phase.changedFileCount} 个文件</span>
       ) : null}
-      {duration ? <span className="ml-auto tabular-nums text-faint">{duration}</span> : null}
+      {duration ? <span className="ml-auto font-mono tabular-nums text-faint">{duration}</span> : null}
     </div>
   );
 }

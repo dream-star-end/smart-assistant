@@ -1,7 +1,8 @@
+import { ChevronDown, Target } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import { formatDurationSeconds } from "../../lib/chat/pure";
-import { groupDigits } from "../../lib/utils";
+import { cn, groupDigits } from "../../lib/utils";
 
 const STATUS_LABEL: Record<string, string> = {
   active: "进行中",
@@ -55,16 +56,25 @@ export function PinnedGoalBar({ messages }: { messages: ChatMessage[] }) {
     >
       <button
         type="button"
-        className="flex min-h-9 w-full items-center gap-2 rounded-xl border border-border bg-surface px-3 py-1.5 text-left"
+        className="oc-surface-glass oc-btn-tactile flex min-h-10 w-full items-center gap-2.5 rounded-xl px-3 py-1.5 text-left outline-none transition-colors hover:border-border-strong focus-visible:ring-2 focus-visible:ring-ring"
         aria-expanded={open}
         onClick={() => setOpen((value) => !value)}
       >
-        <span className="shrink-0 rounded-full bg-accent-soft px-2 py-0.5 text-xs text-accent">{label}</span>
-        <span className="min-w-0 flex-1 truncate text-sm text-fg">{text}</span>
-        <span className="shrink-0 text-xs tabular-nums text-muted">{stat}</span>
+        <span className="oc-icon-badge oc-icon-badge-accent flex size-6 shrink-0 items-center justify-center rounded-sm">
+          <Target size={13} strokeWidth={1.75} aria-hidden="true" />
+        </span>
+        <span className="shrink-0 rounded-full bg-accent-soft px-2 py-0.5 text-caption font-medium text-accent">{label}</span>
+        <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">{text}</span>
+        <span className="shrink-0 font-mono text-caption tabular-nums text-muted">{stat}</span>
+        <ChevronDown
+          size={14}
+          strokeWidth={1.75}
+          aria-hidden="true"
+          className={cn("shrink-0 text-faint transition-transform duration-200 ease-[var(--ease-spring)]", open && "rotate-180")}
+        />
       </button>
       {open ? (
-        <p className="mt-1 rounded-xl border border-border bg-surface px-3 py-2 text-sm leading-6 text-fg">{text}</p>
+        <p className="oc-surface-card mt-1.5 rounded-xl px-3.5 py-2.5 text-body leading-relaxed text-fg animate-in">{text}</p>
       ) : null}
     </div>
   );

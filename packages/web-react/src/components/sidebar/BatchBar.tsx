@@ -31,21 +31,20 @@ export function BatchBar({
   const disabled = count === 0;
   return (
     <div
-      // 与顶部「新建会话」同一张浮起卡片语言（发丝描边 + 极轻投影），不再是一块灰底色块（SIDEBAR-R1）。
-      className="mx-2 mb-1.5 flex flex-col gap-0.5 rounded-sm border border-border bg-surface px-1.5 py-1 text-caption shadow-sidebar-btn"
+      className="oc-surface-card mx-2 mb-2 flex flex-col gap-1 rounded-md px-2 py-1.5 text-caption"
       data-testid="sidebar-batch-bar"
       role="toolbar"
       aria-label="批量操作"
     >
-      <div className="flex items-center gap-1">
+      <div className="flex items-center gap-1 border-b border-border/60 pb-1">
         <span className="min-w-0 flex-1 truncate pl-1 font-medium text-fg">
-          已选 <span className="tabular-nums text-accent">{count}</span> 条
+          已选 <span className="tabular-nums font-semibold text-accent">{count}</span> 条
         </span>
         <Button
           type="button"
           variant="ghost"
           size="sm"
-          className="h-7 shrink-0 rounded-xs px-2 text-caption"
+          className="h-6 shrink-0 rounded-xs px-2 text-caption"
           onClick={onCancel}
         >
           取消
@@ -60,9 +59,10 @@ export function BatchBar({
           aria-label="归档"
           title="归档"
           disabled={disabled}
+          className="oc-btn-tactile"
           onClick={() => onAction("archive")}
         >
-          <Archive size={15} />
+          <Archive size={15} strokeWidth={1.75} />
         </IconButton>
         {hasArchivedSelected && (
           <IconButton
@@ -73,9 +73,10 @@ export function BatchBar({
             aria-label="取消归档"
             title="取消归档"
             disabled={disabled}
+            className="oc-btn-tactile"
             onClick={() => onAction("unarchive")}
           >
-            <ArchiveRestore size={15} />
+            <ArchiveRestore size={15} strokeWidth={1.75} />
           </IconButton>
         )}
         <DropdownMenu>
@@ -88,8 +89,9 @@ export function BatchBar({
               aria-label="移动到项目"
               title="移动到项目"
               disabled={disabled}
+              className="oc-btn-tactile"
             >
-              <FolderInput size={15} />
+              <FolderInput size={15} strokeWidth={1.75} />
             </IconButton>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="start" className="w-44">
@@ -110,10 +112,10 @@ export function BatchBar({
           aria-label="删除"
           title="删除"
           disabled={disabled}
-          className="ml-auto"
+          className="oc-btn-tactile ml-auto"
           onClick={() => onAction("delete")}
         >
-          <Trash2 size={15} />
+          <Trash2 size={15} strokeWidth={1.75} />
         </IconButton>
       </div>
     </div>

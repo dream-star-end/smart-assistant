@@ -124,10 +124,22 @@ function TraceIdButton({ traceId }: { traceId: string }) {
 
 const ToastContext = createContext<ToastFn | null>(null);
 
-const TONE_STYLE: Record<ToastTone, { icon: ReactNode; cls: string }> = {
-  success: { icon: <CheckCircle2 size={16} />, cls: "border-success/40 bg-elevated oc-toast-success text-success" },
-  error: { icon: <TriangleAlert size={16} />, cls: "border-danger/40 bg-elevated oc-toast-error text-danger" },
-  info: { icon: <Info size={16} />, cls: "border-info/40 bg-elevated oc-toast-info text-info" },
+const TONE_STYLE: Record<ToastTone, { icon: ReactNode; badge: string; cls: string }> = {
+  success: {
+    icon: <CheckCircle2 size={14} strokeWidth={2.1} />,
+    badge: "oc-icon-badge oc-icon-badge-success",
+    cls: "border-success/35 bg-elevated oc-toast-success text-success",
+  },
+  error: {
+    icon: <TriangleAlert size={14} strokeWidth={2.1} />,
+    badge: "oc-icon-badge oc-icon-badge-danger",
+    cls: "border-danger/35 bg-elevated oc-toast-error text-danger",
+  },
+  info: {
+    icon: <Info size={14} strokeWidth={2.1} />,
+    badge: "oc-icon-badge oc-icon-badge-info",
+    cls: "border-info/35 bg-elevated oc-toast-info text-info",
+  },
 };
 
 const AUTO_DISMISS_MS = 3500;
@@ -249,11 +261,13 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                   : undefined
               }
               className={cn(
-                "pointer-events-auto flex max-w-[92vw] items-center gap-2 rounded-xl border px-3.5 py-2.5 text-body font-medium shadow-pop animate-in sm:max-w-md",
+                "oc-toast-card pointer-events-auto flex max-w-[92vw] items-center gap-2.5 rounded-xl border px-3 py-2.5 text-body font-medium shadow-pop animate-in sm:max-w-md",
                 s.cls,
               )}
             >
-              <span className="shrink-0">{s.icon}</span>
+              <span aria-hidden="true" className={cn("size-6 rounded-md", s.badge)}>
+                {s.icon}
+              </span>
               <span className="min-w-0 flex-1 break-words">{t.message}</span>
               {t.traceId && <TraceIdButton traceId={t.traceId} />}
               {t.actionLabel && (
@@ -264,7 +278,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                     // 动作触发即收起:提示已经完成使命,留着只会挡住动作的结果。
                     dismiss(t.id);
                   }}
-                  className="shrink-0 rounded-md px-2 py-1 font-semibold underline underline-offset-2 outline-none transition-opacity hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:min-h-11"
+                  className="shrink-0 rounded-md bg-surface/65 px-2.5 py-1 text-meta font-semibold outline-none transition-[background-color,opacity] hover:bg-surface focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:min-h-11"
                 >
                   {t.actionLabel}
                 </button>
@@ -274,7 +288,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                 aria-label="关闭提示"
                 onClick={() => dismiss(t.id)}
                 // 触控靶:原来 p-0.5 的关闭键只有 ~22px,在触屏上属于"看得见点不中"。
-                className="-mr-1 flex shrink-0 items-center justify-center rounded-md p-0.5 opacity-70 outline-none transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:size-11"
+                className="-mr-1 flex shrink-0 items-center justify-center rounded-md p-1 opacity-70 outline-none transition-[background-color,opacity] hover:bg-hover hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:size-11"
               >
                 <X size={14} />
               </button>

@@ -58,18 +58,28 @@ type HeroView = "preview" | "source" | "changes";
 /** 参考来源默认只列前几条,其余收在「显示全部」里:一次搜索常带回十来条,全列会把面板拉得很长。 */
 const SOURCES_PREVIEW = 5;
 
-const sectionLabel = "mb-2 flex items-center gap-1.5 text-caption font-medium uppercase tracking-wide text-faint";
+const sectionLabel = "mb-2 flex items-center gap-1.5 text-caption font-semibold uppercase tracking-wide text-faint";
 const quietRow =
-  "group flex w-full min-w-0 items-center gap-3 rounded-lg px-2 py-2 text-left outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11";
+  "group flex w-full min-w-0 items-center gap-3 rounded-lg px-2.5 py-2 text-left outline-none transition-colors hover:bg-hover/80 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11";
 
 function ExtTile({ path, kind, className }: { path: string; kind: OutputKind; className?: string }) {
   const ext = extOf(path).slice(0, 4).toUpperCase() || "FILE";
+  const badgeTone =
+    kind === "html"
+      ? "oc-icon-badge-accent"
+      : kind === "markdown"
+        ? "oc-icon-badge-info"
+        : ext === "CSV" || ext === "TSV" || ext === "XLSX"
+          ? "oc-icon-badge-success"
+          : ext === "PDF"
+            ? "oc-icon-badge-warning"
+            : "oc-icon-badge";
   return (
     <span
       aria-hidden
       className={cn(
-        "flex size-8 shrink-0 items-center justify-center rounded-md border border-border/70 bg-surface font-mono text-[9.5px] font-semibold tracking-tight",
-        kind === "html" ? "text-accent" : kind === "markdown" ? "text-info" : "text-muted",
+        "flex size-8 shrink-0 items-center justify-center rounded-md font-mono text-micro font-bold tracking-tight",
+        badgeTone,
         className,
       )}
     >
@@ -104,43 +114,45 @@ export function TurnBar({
   if (s.steps > 0) parts.push(`${s.steps} 步${s.failedSteps > 0 ? `（${s.failedSteps} 步失败）` : ""}`);
   if (fileCount > 0) parts.push(`${fileCount} 个文件`);
   return (
-    <div className="px-4 pt-4 pb-3" data-testid="outputs-turn">
-      <div className="mb-1.5 flex items-center gap-1 text-caption text-faint">
-        <button
-          type="button"
-          aria-label="上一轮"
-          disabled={index <= 0}
-          onClick={onPrev}
-          className="rounded-full p-1 outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30"
-        >
-          <ChevronLeft size={14} />
-        </button>
-        <span className="tabular-nums" data-testid="outputs-turn-counter">
-          第 {index + 1} / {total} 轮
-        </span>
-        <button
-          type="button"
-          aria-label="下一轮"
-          disabled={index >= total - 1}
-          onClick={onNext}
-          className="rounded-full p-1 outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30"
-        >
-          <ChevronRight size={14} />
-        </button>
+    <div className="px-4 pt-3.5 pb-3" data-testid="outputs-turn">
+      <div className="mb-2 flex items-center gap-1.5 text-caption text-faint">
+        <div className="oc-surface-recessed inline-flex items-center gap-0.5 rounded-full p-0.5">
+          <button
+            type="button"
+            aria-label="上一轮"
+            disabled={index <= 0}
+            onClick={onPrev}
+            className="oc-btn-tactile inline-flex size-5 items-center justify-center rounded-full outline-none transition-colors hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30"
+          >
+            <ChevronLeft size={13} />
+          </button>
+          <span className="px-1.5 font-medium tabular-nums text-muted" data-testid="outputs-turn-counter">
+            第 {index + 1} / {total} 轮
+          </span>
+          <button
+            type="button"
+            aria-label="下一轮"
+            disabled={index >= total - 1}
+            onClick={onNext}
+            className="oc-btn-tactile inline-flex size-5 items-center justify-center rounded-full outline-none transition-colors hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30"
+          >
+            <ChevronRight size={13} />
+          </button>
+        </div>
         <span className="flex-1" />
         {s.status === "running" ? (
-          <span className="inline-flex items-center gap-1.5 rounded-full bg-accent-soft px-2 py-0.5 text-accent">
+          <span className="oc-badge-craft inline-flex items-center gap-1.5 rounded-full bg-accent-soft px-2.5 py-0.5 font-medium text-accent">
             <Spinner size={11} />
             进行中
           </span>
         ) : s.status === "error" ? (
-          <span className="rounded-full bg-danger-soft px-2 py-0.5 text-danger">出错</span>
+          <span className="oc-badge-craft rounded-full px-2.5 py-0.5 font-medium text-danger">出错</span>
         ) : null}
       </div>
-      <h3 className="line-clamp-2 text-section font-semibold leading-snug text-fg" title={turn.title}>
+      <h3 className="line-clamp-2 text-section font-semibold leading-snug tracking-tight text-fg" title={turn.title}>
         {turn.title}
       </h3>
-      <p className="mt-1 flex flex-wrap items-center gap-x-1.5 text-meta text-faint" data-testid="outputs-summary">
+      <p className="mt-1.5 flex flex-wrap items-center gap-x-1.5 text-meta text-faint" data-testid="outputs-summary">
         {parts.map((p, i) => (
           // biome-ignore lint/suspicious/noArrayIndexKey: 摘要片段按位置
           <span key={i} className="inline-flex items-center gap-1.5">
@@ -154,8 +166,8 @@ export function TurnBar({
             onClick={onOpenSteps}
             data-testid="outputs-open-steps"
             className={cn(
-              "inline-flex items-center rounded text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring",
-              parts.length > 0 && "ml-1",
+              "oc-btn-tactile inline-flex items-center gap-0.5 rounded-md px-1.5 py-0.5 font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring",
+              parts.length > 0 && "ml-0.5",
             )}
           >
             查看步骤
@@ -323,17 +335,17 @@ function FileHero({
 
   return (
     <article
-      className="overflow-hidden rounded-xl border border-border/70 bg-surface shadow-soft"
+      className="oc-surface-card overflow-hidden rounded-xl"
       data-testid="outputs-hero"
       aria-label={`${meta.label} ${file.name}`}
     >
-      <header className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border/60 px-3.5 py-2.5">
+      <header className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border/70 bg-gradient-to-b from-hover/35 to-transparent px-3.5 py-2.5">
         <ExtTile path={file.path} kind={file.kind} />
         <div className="min-w-32 flex-1" title={file.path}>
-          <div className="truncate text-body font-medium text-fg" data-testid="outputs-hero-name">
+          <div className="truncate text-body font-semibold text-fg" data-testid="outputs-hero-name">
             {file.name}
           </div>
-          {dir && <div className="truncate text-caption text-faint">{dir}</div>}
+          {dir && <div className="truncate font-mono text-caption text-faint">{dir}</div>}
         </div>
         {options.length > 1 && (
           <SegmentedControl
@@ -356,7 +368,7 @@ function FileHero({
           onClose={() => setQuickAnnotateOpen(false)}
         />
       )}
-      <footer className="flex items-center gap-2 border-t border-border/60 px-3.5 py-1.5 text-caption text-faint">
+      <footer className="flex items-center gap-2 border-t border-border/70 bg-hover/20 px-3.5 py-2 text-caption text-faint">
         <span className="min-w-0 flex-1 truncate" data-testid="outputs-hero-origin">
           {view === "changes"
             ? `${change?.entries.length ?? 0} 次改动`
@@ -374,7 +386,7 @@ function FileHero({
             type="button"
             data-testid="hero-quick-annotate"
             onClick={() => setQuickAnnotateOpen((v) => !v)}
-            className="inline-flex min-h-7 items-center gap-1 rounded-md px-2 text-caption font-medium text-accent outline-none transition-colors hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+            className="oc-btn-tactile inline-flex min-h-7 items-center gap-1 rounded-md px-2 text-caption font-medium text-accent outline-none transition-colors hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
           >
             <MessageSquarePlus size={12} aria-hidden />
             批注修改
@@ -429,7 +441,7 @@ function MediaHero({
     );
   }
   return (
-    <article className="overflow-hidden rounded-xl border border-border/70 bg-surface shadow-soft" data-testid="outputs-hero" aria-label={`图片 ${media.name}`}>
+    <article className="oc-surface-card overflow-hidden rounded-xl" data-testid="outputs-hero" aria-label={`图片 ${media.name}`}>
       <Suspense fallback={<PreviewFallback />}>
         <MediaPreview src={media.src} kind={media.kind} name={media.name} />
       </Suspense>
@@ -442,15 +454,15 @@ function MediaHero({
           onClose={() => setAnnotateOpen(false)}
         />
       )}
-      <footer className="flex items-center gap-2 border-t border-border/60 px-3.5 py-1.5 text-caption text-faint">
-        <span className="min-w-0 flex-1 truncate" data-testid="outputs-hero-name" title={media.src}>
+      <footer className="flex items-center gap-2 border-t border-border/70 bg-hover/20 px-3.5 py-2 text-caption text-faint">
+        <span className="min-w-0 flex-1 truncate font-medium text-fg" data-testid="outputs-hero-name" title={media.src}>
           {media.name}
         </span>
         <button
           type="button"
           data-testid="hero-quick-annotate"
           onClick={() => setAnnotateOpen((v) => !v)}
-          className="inline-flex min-h-7 items-center gap-1 rounded-md px-2 text-caption font-medium text-accent outline-none transition-colors hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+          className="oc-btn-tactile inline-flex min-h-7 items-center gap-1 rounded-md px-2 text-caption font-medium text-accent outline-none transition-colors hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
         >
           <MessageSquarePlus size={12} aria-hidden />
           批注修改
@@ -521,42 +533,44 @@ function DeliverableSummaryStrip({
       aria-label="交付物按类型汇总与筛选"
       data-testid="outputs-summary-strip"
     >
-      <button
-        type="button"
-        aria-pressed={activeCategory === "all"}
-        data-testid="outputs-filter-all"
-        onClick={() => onSelectCategory("all")}
-        className={cn(
-          "inline-flex h-7 shrink-0 items-center gap-1 rounded-xs px-2.5 text-caption font-medium whitespace-nowrap outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
-          activeCategory === "all"
-            ? "bg-accent-soft text-accent"
-            : "text-muted hover:bg-hover hover:text-fg",
-        )}
-      >
-        全部
-        <span className="tabular-nums opacity-80">{total}</span>
-      </button>
-      {counts.map((c) => {
-        const active = activeCategory === c.category;
-        return (
-          <button
-            key={c.category}
-            type="button"
-            aria-pressed={active}
-            data-testid={`outputs-filter-${c.category}`}
-            onClick={() => onSelectCategory(active ? "all" : c.category)}
-            className={cn(
-              "inline-flex h-7 shrink-0 items-center gap-1 rounded-xs px-2.5 text-caption font-medium whitespace-nowrap outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
-              active
-                ? "bg-accent-soft text-accent"
-                : "text-muted hover:bg-hover hover:text-fg",
-            )}
-          >
-            {c.label}
-            <span className="tabular-nums opacity-80">{c.count}</span>
-          </button>
-        );
-      })}
+      <div className="oc-surface-recessed inline-flex items-center gap-0.5 rounded-lg p-0.5">
+        <button
+          type="button"
+          aria-pressed={activeCategory === "all"}
+          data-testid="outputs-filter-all"
+          onClick={() => onSelectCategory("all")}
+          className={cn(
+            "oc-btn-tactile inline-flex h-7 shrink-0 items-center gap-1 rounded-sm px-2.5 text-caption font-medium whitespace-nowrap outline-none transition-all focus-visible:ring-2 focus-visible:ring-ring",
+            activeCategory === "all"
+              ? "oc-segmented-thumb text-accent"
+              : "text-muted hover:text-fg",
+          )}
+        >
+          全部
+          <span className="tabular-nums opacity-80">{total}</span>
+        </button>
+        {counts.map((c) => {
+          const active = activeCategory === c.category;
+          return (
+            <button
+              key={c.category}
+              type="button"
+              aria-pressed={active}
+              data-testid={`outputs-filter-${c.category}`}
+              onClick={() => onSelectCategory(active ? "all" : c.category)}
+              className={cn(
+                "oc-btn-tactile inline-flex h-7 shrink-0 items-center gap-1 rounded-sm px-2.5 text-caption font-medium whitespace-nowrap outline-none transition-all focus-visible:ring-2 focus-visible:ring-ring",
+                active
+                  ? "oc-segmented-thumb text-accent"
+                  : "text-muted hover:text-fg",
+              )}
+            >
+              {c.label}
+              <span className="tabular-nums opacity-80">{c.count}</span>
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -587,7 +601,7 @@ function OtherOutputs({
     <div className="space-y-5 px-4 pt-5 pb-6">
       {filteredFiles.length > 0 && (
         <Section icon={FileCode2} title="文件" count={filteredFiles.length} testId="outputs-files">
-          <ul className="-mx-2">
+          <ul className="space-y-1.5">
             {filteredFiles.map((f) => {
               const active = hero?.type === "file" && hero.path === f.path;
               const meta = classifyDeliverable(f.path);
@@ -597,13 +611,16 @@ function OtherOutputs({
                     type="button"
                     data-testid="outputs-file"
                     aria-current={active ? "true" : undefined}
-                    className={cn(quietRow, active && "bg-accent-soft hover:bg-accent-soft")}
+                    className={cn(
+                      "oc-surface-card oc-surface-card-hover group flex w-full min-w-0 items-center gap-3 rounded-xl px-3 py-2.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+                      active && "border-accent/50 bg-accent-soft/60 ring-1 ring-inset ring-accent/25",
+                    )}
                     onClick={() => onPick({ type: "file", path: f.path })}
                     title={f.path}
                   >
                     <ExtTile path={f.path} kind={f.kind} />
                     <span className="min-w-0 flex-1">
-                      <span className="block truncate text-body text-fg">{f.name}</span>
+                      <span className="block truncate text-body font-medium text-fg">{f.name}</span>
                       <span className="block truncate text-caption text-faint">
                         {f.change
                           ? `${meta.label} · ${f.change.entries.length} 次改动`
@@ -640,16 +657,20 @@ function OtherOutputs({
       )}
       {links.length > 0 && (
         <Section icon={MonitorPlay} title="本机预览" count={links.length} testId="outputs-links">
-          <ul className="-mx-2">
+          <ul className="space-y-1.5">
             {links.map((l) => (
               <li key={l.url}>
                 {/* 普通链接:App 的全局点击监听会把容器回环地址交给「容器预览」打开。 */}
-                <a href={l.url} className={quietRow} data-testid="outputs-link">
-                  <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent">
-                    <MonitorPlay size={15} />
+                <a
+                  href={l.url}
+                  className="oc-surface-card oc-surface-card-hover group flex w-full min-w-0 items-center gap-3 rounded-xl px-3 py-2.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+                  data-testid="outputs-link"
+                >
+                  <span className="oc-icon-badge-accent flex size-8 shrink-0 items-center justify-center rounded-md">
+                    <MonitorPlay size={15} strokeWidth={1.75} />
                   </span>
-                  <span className="min-w-0 flex-1 truncate font-mono text-meta text-fg">{l.label}</span>
-                  <span className="shrink-0 text-caption text-faint">打开预览</span>
+                  <span className="min-w-0 flex-1 truncate font-mono text-meta font-medium text-fg">{l.label}</span>
+                  <span className="shrink-0 text-caption font-medium text-accent">打开预览</span>
                 </a>
               </li>
             ))}
@@ -658,18 +679,18 @@ function OtherOutputs({
       )}
       {sources.length > 0 && (
         <Section icon={Globe} title="参考来源" count={sources.length} testId="outputs-sources">
-          <ul className="-mx-2">
+          <ul className="oc-surface-card divide-y divide-border/60 overflow-hidden rounded-xl p-1">
             {shownSources.map((s) => (
               <li key={s.url} data-container-preview-ignore="">
                 <a href={s.url} target="_blank" rel="noopener noreferrer" className={quietRow} data-testid="outputs-source" title={s.url}>
                   <span
                     aria-hidden
-                    className="flex size-6 shrink-0 items-center justify-center rounded-full bg-hover text-caption font-semibold uppercase text-muted"
+                    className="oc-icon-badge flex size-6 shrink-0 items-center justify-center rounded-full text-caption font-semibold uppercase text-muted"
                   >
                     {s.domain.slice(0, 1)}
                   </span>
                   <span className="min-w-0 flex-1">
-                    <span className="block truncate text-body text-fg">{s.title}</span>
+                    <span className="block truncate text-body font-medium text-fg">{s.title}</span>
                     <span className="block truncate text-caption text-faint">{s.domain}</span>
                   </span>
                   <ExternalLink size={13} className="shrink-0 text-faint opacity-0 transition-opacity group-hover:opacity-100" aria-hidden />
@@ -683,7 +704,7 @@ function OtherOutputs({
               onClick={() => setAllSources((v) => !v)}
               aria-expanded={allSources}
               data-testid="outputs-sources-more"
-              className="mt-1 rounded-full px-2 py-1 text-meta text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+              className="oc-btn-tactile mt-2 rounded-full px-2.5 py-1 text-meta font-medium text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
             >
               {allSources ? "收起" : `显示全部 ${sources.length} 条`}
             </button>
@@ -776,10 +797,14 @@ export function OutputsView({
       );
     }
     return (
-      <div className="flex flex-1 flex-col items-center justify-center gap-2 px-8 text-center" data-testid="outputs-empty">
-        <Inbox size={22} className="text-faint" aria-hidden />
-        <p className="text-body font-medium text-fg">还没有产出</p>
-        <p className="text-meta text-muted">助手写的文件、生成的图片、查过的网页会按轮汇总在这里。</p>
+      <div className="flex flex-1 flex-col items-center justify-center px-6 text-center" data-testid="outputs-empty">
+        <div className="oc-surface-card flex max-w-xs flex-col items-center gap-2.5 rounded-2xl px-6 py-7">
+          <span className="oc-icon-badge flex size-11 items-center justify-center rounded-xl text-faint" aria-hidden>
+            <Inbox size={20} strokeWidth={1.75} />
+          </span>
+          <p className="text-body font-semibold text-fg">还没有产出</p>
+          <p className="text-meta leading-relaxed text-muted">助手写的文件、生成的图片、查过的网页会按轮汇总在这里。</p>
+        </div>
       </div>
     );
   }
@@ -953,14 +978,16 @@ function TurnOutputsBody({
       ) : empty && !activeManifestSrc ? (
         <div
           className={cn(
-            "flex flex-col items-center gap-2 rounded-xl border border-dashed border-border px-6 py-10 text-center",
+            "oc-surface-card flex flex-col items-center gap-2.5 rounded-2xl px-6 py-10 text-center",
             compact ? "m-4" : "mx-4",
           )}
           data-testid="outputs-none"
         >
-          {running ? <Spinner size={18} className="text-accent" /> : <FileText size={20} className="text-faint" aria-hidden />}
-          <p className="text-body font-medium text-fg">{running ? "这一轮还在进行" : "这一轮没有产出文件"}</p>
-          <p className="text-meta text-muted">
+          <span className={cn("flex size-10 items-center justify-center rounded-xl", running ? "oc-icon-badge-accent" : "oc-icon-badge text-faint")} aria-hidden>
+            {running ? <Spinner size={18} className="text-accent" /> : <FileText size={19} strokeWidth={1.75} />}
+          </span>
+          <p className="text-body font-semibold text-fg">{running ? "这一轮还在进行" : "这一轮没有产出文件"}</p>
+          <p className="max-w-xs text-meta leading-relaxed text-muted">
             {running ? "写出的文件、生成的图片和查过的网页会出现在这里。" : "回答在左侧对话里；想看助手做了什么，可以查看步骤。"}
           </p>
         </div>

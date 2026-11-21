@@ -23,6 +23,7 @@ import {
   Power,
   RotateCw,
   Send,
+  ShieldAlert,
   X,
 } from "lucide-react";
 import {
@@ -905,8 +906,11 @@ export function LiveBrowserStage({
   if (initialLoading && !state) {
     return (
       <div className="lb-root" data-testid="live-browser-loading">
-        <div className="lb-idle-surface">
-          <Spinner size={18} className="text-accent" />
+        <div className="lb-idle-surface oc-surface-card">
+          <span className="lb-idle-icon oc-icon-badge oc-icon-badge-accent" aria-hidden>
+            <Spinner size={18} />
+          </span>
+          <h3 className="lb-idle-title">云端实时浏览器</h3>
           <p className="lb-idle-desc">正在连接云端浏览器视口…</p>
         </div>
       </div>
@@ -917,9 +921,9 @@ export function LiveBrowserStage({
     const customReason = state.reason && state.reason !== "unavailable" ? state.reason : null;
     return (
       <div className="lb-root" data-testid="live-browser-unavailable">
-        <div className="lb-idle-surface">
-          <span className="lb-idle-icon" aria-hidden>
-            <Globe size={18} />
+        <div className="lb-idle-surface oc-surface-card" data-tone="warning">
+          <span className="lb-idle-icon oc-icon-badge oc-icon-badge-warning" aria-hidden>
+            <ShieldAlert size={18} />
           </span>
           <h3 className="lb-idle-title">当前环境未启用云端浏览器</h3>
           <p className="lb-idle-desc">
@@ -929,7 +933,7 @@ export function LiveBrowserStage({
           </p>
           <button
             type="button"
-            className="lb-preset-chip"
+            className="lb-preset-chip oc-btn-tactile oc-btn-secondary-craft"
             data-testid="live-browser-retry-available"
             onClick={handleRetryConnection}
           >
@@ -945,12 +949,12 @@ export function LiveBrowserStage({
     return (
       <div className="lb-root" data-testid="live-browser-idle">
         {error && (
-          <div className="lb-error-banner" role="alert" data-testid="live-browser-error">
+          <div className="lb-error-banner oc-callout oc-callout-danger" role="alert" data-testid="live-browser-error">
             <span>{error}</span>
             <div className="lb-error-actions">
               <button
                 type="button"
-                className="lb-error-retry"
+                className="lb-error-retry oc-btn-tactile oc-btn-secondary-craft"
                 data-testid="live-browser-error-retry"
                 onClick={handleRetryConnection}
               >
@@ -963,12 +967,15 @@ export function LiveBrowserStage({
           </div>
         )}
         {handoffWaiting && (
-          <div className="lb-handoff-banner" role="status" data-testid="live-browser-handoff-waiting">
-            <span>助手正在操作浏览器，当前步骤完成后将自动为你开启接管…</span>
+          <div className="lb-handoff-banner oc-callout oc-callout-info" role="status" data-testid="live-browser-handoff-waiting">
+            <span className="lb-handoff-body">
+              <Spinner size={13} className="shrink-0 text-accent" />
+              <span>助手正在操作浏览器，当前步骤完成后将自动为你开启接管…</span>
+            </span>
           </div>
         )}
-        <div className="lb-idle-surface">
-          <span className="lb-idle-icon" aria-hidden>
+        <div className="lb-idle-surface oc-surface-card">
+          <span className="lb-idle-icon oc-icon-badge oc-icon-badge-accent" aria-hidden>
             <Globe size={18} />
           </span>
           <h3 className="lb-idle-title">云端实时浏览器</h3>
@@ -983,13 +990,13 @@ export function LiveBrowserStage({
               onChange={(e) => setLaunchUrl(e.target.value)}
               placeholder="输入网址，例如 https://arxiv.org"
               aria-label="启动网址"
-              className="lb-launch-input"
+              className="lb-launch-input oc-surface-recessed"
               data-testid="live-browser-launch-input"
             />
             <button
               type="submit"
               disabled={busy || lockedByAssistant}
-              className="lb-launch-btn"
+              className="lb-launch-btn oc-btn-tactile oc-btn-primary-craft"
               data-testid="live-browser-launch-btn"
             >
               {busy ? <Spinner size={13} /> : <Globe size={13} />}
@@ -1002,7 +1009,7 @@ export function LiveBrowserStage({
                 key={preset.url}
                 type="button"
                 disabled={busy || lockedByAssistant}
-                className="lb-preset-chip"
+                className="lb-preset-chip oc-btn-tactile oc-btn-secondary-craft"
                 onClick={() => {
                   setLaunchUrl(preset.url);
                   void runAction({ action: "open", url: preset.url });
@@ -1023,12 +1030,12 @@ export function LiveBrowserStage({
   const browserShell = (
     <>
       {error && (
-        <div className="lb-error-banner" role="alert" data-testid="live-browser-error">
+        <div className="lb-error-banner oc-callout oc-callout-danger" role="alert" data-testid="live-browser-error">
           <span>{error}</span>
           <div className="lb-error-actions">
             <button
               type="button"
-              className="lb-error-retry"
+              className="lb-error-retry oc-btn-tactile oc-btn-secondary-craft"
               data-testid="live-browser-error-retry"
               onClick={handleRetryConnection}
             >
@@ -1042,21 +1049,29 @@ export function LiveBrowserStage({
       )}
 
       {handoffWaiting && (
-        <div className="lb-handoff-banner" role="status" data-testid="live-browser-handoff-waiting">
-          <span>助手正在操作浏览器，当前步骤完成后将自动为你开启接管…</span>
+        <div className="lb-handoff-banner oc-callout oc-callout-info" role="status" data-testid="live-browser-handoff-waiting">
+          <span className="lb-handoff-body">
+            <Spinner size={13} className="shrink-0 text-accent" />
+            <span>助手正在操作浏览器，当前步骤完成后将自动为你开启接管…</span>
+          </span>
         </div>
       )}
 
       {originMismatch && !effectiveTakeover && (
-        <div className="lb-handoff-banner" role="alert" data-testid="live-browser-origin-mismatch">
-          <span>
-            当前实时页面域名为 <strong>{originMismatch.actualHost}</strong>（卡片指向{" "}
-            <strong>{originMismatch.expectedHost}</strong>）。请核对地址栏；如为正常跳转（如第三方 SSO 登录），确认后再开启接管。
+        <div className="lb-handoff-banner oc-callout oc-callout-warning" role="alert" data-testid="live-browser-origin-mismatch">
+          <span className="lb-handoff-body">
+            <span className="oc-icon-badge oc-icon-badge-warning size-6 rounded-xs" aria-hidden>
+              <ShieldAlert size={13} />
+            </span>
+            <span>
+              当前实时页面域名为 <strong>{originMismatch.actualHost}</strong>（卡片指向{" "}
+              <strong>{originMismatch.expectedHost}</strong>）。请核对地址栏；如为正常跳转（如第三方 SSO 登录），确认后再开启接管。
+            </span>
           </span>
           <div className="lb-handoff-actions">
             <button
               type="button"
-              className="lb-cta-btn"
+              className="lb-cta-btn oc-btn-tactile"
               data-variant="watch"
               disabled={lockedByAssistant}
               data-testid="live-browser-confirm-mismatch"
@@ -1079,7 +1094,7 @@ export function LiveBrowserStage({
             </button>
             <button
               type="button"
-              className="lb-icon-btn"
+              className="lb-icon-btn oc-btn-tactile"
               aria-label="关闭域名核对提示"
               onClick={() => setOriginMismatch(null)}
             >
@@ -1092,10 +1107,17 @@ export function LiveBrowserStage({
       <div className="lb-shell" data-takeover={effectiveTakeover ? "true" : "false"}>
         {/* Top Chrome Toolbar */}
         <div className="lb-toolbar">
+          {expanded && (
+            <span className="lb-chrome-dots" aria-hidden>
+              <span />
+              <span />
+              <span />
+            </span>
+          )}
           <div className="lb-nav-group">
             <button
               type="button"
-              className="lb-icon-btn"
+              className="lb-icon-btn oc-btn-tactile"
               aria-label="后退"
               title={lockedByAssistant ? "助手执行中，暂不可操作" : "后退"}
               disabled={busy || lockedByAssistant}
@@ -1105,7 +1127,7 @@ export function LiveBrowserStage({
             </button>
             <button
               type="button"
-              className="lb-icon-btn"
+              className="lb-icon-btn oc-btn-tactile"
               aria-label="前进"
               title={lockedByAssistant ? "助手执行中，暂不可操作" : "前进"}
               disabled={busy || lockedByAssistant}
@@ -1115,7 +1137,7 @@ export function LiveBrowserStage({
             </button>
             <button
               type="button"
-              className="lb-icon-btn"
+              className="lb-icon-btn oc-btn-tactile"
               aria-label="刷新页面"
               title={lockedByAssistant ? "助手执行中，暂不可操作" : "刷新页面"}
               disabled={busy || lockedByAssistant}
@@ -1125,8 +1147,8 @@ export function LiveBrowserStage({
             </button>
           </div>
 
-          <form className="lb-address-form" onSubmit={handleAddressSubmit}>
-            <span className="lb-address-icon" aria-hidden>
+          <form className="lb-address-form oc-surface-recessed" onSubmit={handleAddressSubmit}>
+            <span className="lb-address-icon" data-secure={isHttps ? "true" : "false"} aria-hidden>
               {isHttps ? <Lock size={11} /> : <Globe size={11} />}
             </span>
             <input
@@ -1149,7 +1171,7 @@ export function LiveBrowserStage({
             {effectiveTakeover ? (
               <button
                 type="button"
-                className="lb-cta-btn"
+                className="lb-cta-btn oc-btn-tactile oc-btn-accent-craft"
                 data-variant="takeover"
                 data-testid="live-browser-handback-btn"
                 onClick={handleHandBack}
@@ -1160,7 +1182,7 @@ export function LiveBrowserStage({
             ) : lockedByAssistant && running && effectiveStopTurn ? (
               <button
                 type="button"
-                className="lb-cta-btn"
+                className="lb-cta-btn oc-btn-tactile"
                 data-variant="watch"
                 title="暂停当前助手回合，并自动进入人工接管"
                 data-testid="live-browser-pause-takeover-btn"
@@ -1172,7 +1194,7 @@ export function LiveBrowserStage({
             ) : (
               <button
                 type="button"
-                className="lb-cta-btn"
+                className="lb-cta-btn oc-btn-tactile"
                 data-variant="watch"
                 disabled={lockedByAssistant || Boolean(originMismatch)}
                 title={
@@ -1196,7 +1218,7 @@ export function LiveBrowserStage({
             <button
               ref={expanded ? undefined : expandBtnRef}
               type="button"
-              className="lb-icon-btn"
+              className="lb-icon-btn oc-btn-tactile"
               aria-label={expanded ? "退出放大视图" : "放大浏览器视图"}
               title={expanded ? "缩小回侧栏 (Esc)" : "放大为沉浸全屏视口"}
               data-testid="live-browser-expand-btn"
@@ -1206,7 +1228,7 @@ export function LiveBrowserStage({
             </button>
             <button
               type="button"
-              className="lb-icon-btn"
+              className="lb-icon-btn oc-btn-tactile"
               aria-label="关闭云端浏览器"
               title={lockedByAssistant ? "助手执行中，暂不可关闭" : "关闭云端浏览器"}
               disabled={busy || lockedByAssistant}
@@ -1256,7 +1278,7 @@ export function LiveBrowserStage({
             ))}
             <button
               type="button"
-              className="lb-icon-btn"
+              className="lb-icon-btn oc-btn-tactile"
               aria-label="新建标签页"
               title="新建标签页"
               disabled={busy || lockedByAssistant}
@@ -1274,18 +1296,31 @@ export function LiveBrowserStage({
           data-testid="live-browser-status"
         >
           <div className="lb-status-left">
-            <span className="lb-live-dot" data-takeover={effectiveTakeover ? "true" : "false"} aria-hidden />
+            <span
+              className="lb-live-dot"
+              data-takeover={effectiveTakeover ? "true" : "false"}
+              data-busy={lockedByAssistant ? "true" : "false"}
+              aria-hidden
+            />
             <span className="lb-status-text">
               {lockedByAssistant
                 ? "助手正在操作浏览器 · 实时观看中（本轮结束或停止后可一键接管）"
                 : effectiveTakeover
-                  ? "已接管 · 点击画面交互，Esc 退出键盘捕获，完成后点「交还助手」"
+                  ? "已接管 · 点击画面交互，完成后点「交还助手」"
                   : state.title
                     ? `实时画面 · ${state.title}`
                     : "实时画面同步中 · 点击「接管」可直接操作"}
             </span>
           </div>
-          {state.capturedAt && <span className="lb-status-meta">{formatSyncTime(state.capturedAt)}</span>}
+          <div className="lb-status-right">
+            {effectiveTakeover && (
+              <span className="lb-status-kbd-hint">
+                <kbd className="oc-kbd">Esc</kbd>
+                <span>退出捕获</span>
+              </span>
+            )}
+            {state.capturedAt && <span className="lb-status-meta">{formatSyncTime(state.capturedAt)}</span>}
+          </div>
         </div>
 
         {/* Viewport Canvas */}
@@ -1328,7 +1363,9 @@ export function LiveBrowserStage({
             </div>
           ) : (
             <div className="lb-stage-placeholder">
-              <Spinner size={16} className="text-accent" />
+              <span className="oc-icon-badge oc-icon-badge-accent size-9 rounded-md" aria-hidden>
+                <Spinner size={15} />
+              </span>
               <span>正在捕获页面画面…</span>
             </div>
           )}
@@ -1350,13 +1387,13 @@ export function LiveBrowserStage({
                 onChange={(e) => setTypeDraft(e.target.value)}
                 placeholder="输入文字或验证码发送到页面焦点…"
                 aria-label="向云端浏览器输入文字"
-                className="lb-type-input"
+                className="lb-type-input oc-surface-recessed"
                 data-testid="live-browser-type-input"
               />
               <button
                 type="button"
                 disabled={busy || !typeDraft}
-                className="lb-type-btn"
+                className="lb-type-btn oc-btn-tactile oc-btn-secondary-craft"
                 data-testid="live-browser-type-send"
                 onClick={() => handleSendText(false)}
               >
@@ -1366,7 +1403,7 @@ export function LiveBrowserStage({
               <button
                 type="submit"
                 disabled={busy || !typeDraft}
-                className="lb-type-btn"
+                className="lb-type-btn oc-btn-tactile oc-btn-primary-craft"
                 data-primary="true"
                 title="输入并按回车"
                 aria-label="输入并按回车"
@@ -1381,7 +1418,7 @@ export function LiveBrowserStage({
                   key={item.key}
                   type="button"
                   disabled={busy}
-                  className="lb-key-chip"
+                  className="lb-key-chip oc-kbd oc-btn-tactile"
                   onClick={() => void runAction({ action: "press", key: item.key })}
                 >
                   {item.label}
@@ -1398,14 +1435,14 @@ export function LiveBrowserStage({
     <>
       {expanded ? (
         <div className="lb-root" data-testid="live-browser-docked">
-          <div className="lb-docked-placeholder">
-            <span className="lb-idle-icon" aria-hidden>
-              <Maximize2 size={16} />
+          <div className="lb-docked-placeholder oc-surface-card">
+            <span className="lb-idle-icon oc-icon-badge oc-icon-badge-accent" aria-hidden>
+              <Maximize2 size={17} />
             </span>
             <p className="lb-idle-desc">云端浏览器正在全屏放大视图中运行</p>
             <button
               type="button"
-              className="lb-preset-chip"
+              className="lb-preset-chip oc-btn-tactile oc-btn-secondary-craft"
               onClick={() => setExpanded(false)}
             >
               <Minimize2 size={12} />
@@ -1441,7 +1478,28 @@ export function LiveBrowserStage({
             }}
           >
             <RD.Title className="sr-only">云端实时浏览器放大视图</RD.Title>
-            {expanded ? browserShell : null}
+            {expanded ? (
+              <>
+                <div className="lb-theater-bar oc-surface-glass">
+                  <div className="lb-theater-bar-left">
+                    <span
+                      className="lb-live-dot"
+                      data-takeover={effectiveTakeover ? "true" : "false"}
+                      data-busy={lockedByAssistant ? "true" : "false"}
+                      aria-hidden
+                    />
+                    <span className="lb-theater-bar-title">
+                      {state.title || "云端实时浏览器 · 沉浸视口"}
+                    </span>
+                  </div>
+                  <div className="lb-theater-bar-right">
+                    <kbd className="oc-kbd">Esc</kbd>
+                    <span>返回侧栏</span>
+                  </div>
+                </div>
+                {browserShell}
+              </>
+            ) : null}
           </RD.Content>
         </RD.Portal>
       </RD.Root>

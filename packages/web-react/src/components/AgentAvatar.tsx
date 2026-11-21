@@ -30,17 +30,19 @@ export function AgentAvatar({
     <span
       {...a11y}
       className={cn(
-        'flex shrink-0 items-center justify-center overflow-hidden bg-gradient-to-br leading-none text-white',
+        'relative flex shrink-0 select-none items-center justify-center overflow-hidden bg-gradient-to-br leading-none text-white ring-1 ring-inset ring-white/25 shadow-xs before:pointer-events-none before:absolute before:inset-0 before:bg-gradient-to-b before:from-white/20 before:via-transparent before:to-black/15',
         grad,
         className,
       )}
     >
       {agent.avatarEmoji ? (
-        <span style={{ fontSize: iconSize + 2, lineHeight: 1 }}>{agent.avatarEmoji}</span>
+        <span className="relative z-[1]" style={{ fontSize: iconSize + 2, lineHeight: 1 }}>
+          {agent.avatarEmoji}
+        </span>
       ) : Icon ? (
-        <Icon size={iconSize} aria-hidden="true" />
+        <Icon size={iconSize} strokeWidth={1.75} className="relative z-[1]" aria-hidden="true" />
       ) : (
-        <Sparkles size={iconSize} aria-hidden="true" />
+        <Sparkles size={iconSize} strokeWidth={1.75} className="relative z-[1]" aria-hidden="true" />
       )}
     </span>
   )

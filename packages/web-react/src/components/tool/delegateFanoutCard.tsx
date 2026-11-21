@@ -65,31 +65,38 @@ function FanoutItemCard({ item }: { item: FanoutItem }) {
   return (
     <li
       className={cn(
-        "rounded-lg border px-3 py-2",
-        item.isError ? "border-danger-soft bg-danger-soft/40" : "border-border/70 bg-surface",
+        "rounded-lg px-3 py-2.5",
+        item.isError ? "oc-callout oc-callout-danger" : "oc-surface-card",
       )}
     >
-      <div className="flex min-w-0 items-start gap-2">
-        <span className="mt-px shrink-0">
+      <div className="flex min-w-0 items-start gap-2.5">
+        <span
+          className={cn(
+            "oc-icon-badge mt-0.5 size-6",
+            item.isError ? "oc-icon-badge-danger" : "oc-icon-badge-success",
+          )}
+        >
           {item.isError ? (
-            <XCircle size={14} aria-hidden="true" className="text-danger" />
+            <XCircle size={13} strokeWidth={1.75} aria-hidden="true" />
           ) : (
-            <CheckCircle2 size={14} aria-hidden="true" className="text-success" />
+            <CheckCircle2 size={13} strokeWidth={1.75} aria-hidden="true" />
           )}
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 flex-wrap items-center gap-1.5">
             <span className="min-w-0 truncate text-body font-medium text-fg">{name}</span>
-            <Badge tone={item.isError ? "danger" : "success"}>{item.isError ? "失败" : "完成"}</Badge>
+            <Badge tone={item.isError ? "danger" : "success"} size="sm">
+              {item.isError ? "失败" : "完成"}
+            </Badge>
           </div>
-          {item.goal && <p className="mt-0.5 line-clamp-2 text-[12px] leading-snug text-muted">{item.goal}</p>}
+          {item.goal && <p className="mt-0.5 line-clamp-2 text-meta leading-snug text-muted">{item.goal}</p>}
           {item.body && (
-            <details className="mt-1">
+            <details className="mt-1.5">
               <summary className={INLINE_SUMMARY_CLS}>查看结果</summary>
               <pre
                 // biome-ignore lint/a11y/noNoninteractiveTabindex: 有 max-h 的滚动区要能聚焦,键盘才能滚(T-23)
                 tabIndex={0}
-                className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="oc-surface-recessed mt-1.5 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2.5 font-mono text-caption leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
                 {item.body}
               </pre>
@@ -105,12 +112,20 @@ export function renderDelegateFanoutCard(output?: string | null): ReactNode | nu
   const parse = parseDelegateFanout(output);
   if (!parse) return null;
   return (
-    <div className="flex flex-col gap-2">
-      <div className="flex items-center gap-2 text-meta font-medium text-fg">
-        <Users size={14} className="text-accent" />
+    <div className="flex flex-col gap-2.5">
+      <div className="flex flex-wrap items-center gap-2 text-meta font-medium text-fg tabular-nums">
+        <span className="oc-icon-badge oc-icon-badge-accent size-6">
+          <Users size={13} strokeWidth={1.75} />
+        </span>
         并行委派 {parse.total} 个子任务
-        <Badge tone="success">{parse.ok} 成功</Badge>
-        {parse.fail > 0 && <Badge tone="danger">{parse.fail} 失败</Badge>}
+        <Badge tone="success" size="sm">
+          {parse.ok} 成功
+        </Badge>
+        {parse.fail > 0 && (
+          <Badge tone="danger" size="sm">
+            {parse.fail} 失败
+          </Badge>
+        )}
       </div>
       <ul className="flex flex-col gap-2">
         {parse.items.map((item) => (

@@ -162,22 +162,21 @@ function SourceBadge({ source }: { source?: SkillSource }) {
 
 function SkillCard({ entry }: { entry: SkillEntry }) {
   return (
-    // 条目已在 ToolCard(边框 + 体区底色)内,再套 rounded-xl + 阴影就是三层卡中卡(T-14):收成轻边框行。
-    <li className="rounded-lg border border-border/70 bg-surface px-3 py-2">
+    <li className="oc-surface-card rounded-lg px-3 py-2.5">
       <div className="flex items-start gap-2.5">
-        <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
-          <Sparkles size={14} />
+        <span className="oc-icon-badge oc-icon-badge-accent mt-0.5 size-7">
+          <Sparkles size={14} strokeWidth={1.75} />
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 flex-wrap items-center gap-1.5">
             <span className="min-w-0 max-w-full truncate font-mono text-body font-semibold text-fg">{entry.name}</span>
             <SourceBadge source={entry.source} />
           </div>
-          {entry.description && <p className="mt-0.5 line-clamp-2 text-[12px] leading-snug text-muted">{entry.description}</p>}
+          {entry.description && <p className="mt-0.5 line-clamp-2 text-meta leading-snug text-muted">{entry.description}</p>}
           {entry.tags.length > 0 && (
-            <div className="mt-1 flex flex-wrap gap-1">
+            <div className="mt-1.5 flex flex-wrap gap-1">
               {entry.tags.slice(0, 6).map((t) => (
-                <Badge key={t} tone="neutral">
+                <Badge key={t} tone="neutral" size="sm">
                   {t}
                 </Badge>
               ))}
@@ -229,9 +228,11 @@ function SkillListInner({ parse, mode }: { parse: SkillListParse; mode: "list" |
     .filter((sec) => sec.entries.length > 0);
 
   return (
-    <div className="flex flex-col gap-2">
-      <div className="flex items-center gap-2 text-meta font-medium text-fg">
-        <Sparkles size={14} className="text-accent" />
+    <div className="flex flex-col gap-2.5">
+      <div className="flex items-center gap-2 text-meta font-medium text-fg tabular-nums">
+        <span className="oc-icon-badge oc-icon-badge-accent size-6">
+          <Sparkles size={13} strokeWidth={1.75} />
+        </span>
         {mode === "search"
           ? `找到 ${parse.declaredCount ?? total} 个相关技能`
           : `共有 ${parse.declaredCount ?? total} 个技能`}
@@ -257,9 +258,11 @@ function SkillListInner({ parse, mode }: { parse: SkillListParse; mode: "list" |
 
 function SkillSearchEmpty({ query }: { query?: string }) {
   return (
-    <div className="rounded-xl border border-dashed border-border bg-elevated px-3 py-4 text-center">
-      <Sparkles size={18} className="mx-auto text-faint" />
-      <div className="mt-1 text-body font-medium text-fg">没有找到匹配技能</div>
+    <div className="oc-surface-recessed rounded-xl border-dashed px-4 py-5 text-center">
+      <span className="oc-icon-badge mx-auto size-9">
+        <Sparkles size={16} strokeWidth={1.75} />
+      </span>
+      <div className="mt-2 text-body font-medium text-fg">没有找到匹配技能</div>
       {query && <p className="mt-0.5 text-meta text-faint">关键词:{query}</p>}
       <p className="mt-0.5 text-meta text-faint">换个说法再搜,或让智能体列出全部可用技能。</p>
     </div>
@@ -271,21 +274,21 @@ function SkillViewInner({ v }: { v: SkillViewParse }) {
   const sourceBadge: SkillSource | undefined = source === "platform" ? "platform" : source === "user" ? "user" : undefined;
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex items-start gap-2.5 rounded-lg border border-border bg-elevated p-3">
-        <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
-          <Sparkles size={15} />
+      <div className="oc-surface-card flex items-start gap-2.5 rounded-lg p-3">
+        <span className="oc-icon-badge oc-icon-badge-accent size-8">
+          <Sparkles size={15} strokeWidth={1.75} />
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
             <span className="truncate font-mono text-body font-semibold text-fg">{v.name || "(未命名技能)"}</span>
-            {v.version && <Badge tone="neutral">v{v.version.replace(/^v/i, "")}</Badge>}
+            {v.version && <Badge tone="neutral" size="sm">v{v.version.replace(/^v/i, "")}</Badge>}
             <SourceBadge source={sourceBadge} />
           </div>
-          {v.description && <p className="mt-0.5 text-[12px] leading-snug text-muted">{v.description}</p>}
+          {v.description && <p className="mt-0.5 text-meta leading-snug text-muted">{v.description}</p>}
           {v.tags.length > 0 && (
-            <div className="mt-1 flex flex-wrap gap-1">
+            <div className="mt-1.5 flex flex-wrap gap-1">
               {v.tags.slice(0, 8).map((t) => (
-                <Badge key={t} tone="neutral">
+                <Badge key={t} tone="neutral" size="sm">
                   {t}
                 </Badge>
               ))}
@@ -299,7 +302,7 @@ function SkillViewInner({ v }: { v: SkillViewParse }) {
           <pre
             // biome-ignore lint/a11y/noNoninteractiveTabindex: 有 max-h 的滚动区要能聚焦,键盘才能滚(T-23)
             tabIndex={0}
-            className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="oc-surface-recessed mt-1.5 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2.5 font-mono text-caption leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             {v.body}
           </pre>

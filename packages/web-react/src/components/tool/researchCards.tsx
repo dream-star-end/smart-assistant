@@ -193,7 +193,7 @@ function CardShell({ title, subtitle, children }: {
         <div className="flex min-w-0 items-center gap-2">
           {showTitle && <span className="min-w-0 truncate text-caption font-medium text-faint">{title}</span>}
           {subtitle && (
-            <span className="ml-auto shrink-0 rounded-full bg-hover px-2 py-0.5 text-caption font-medium text-faint">
+            <span className="ml-auto shrink-0 rounded-full border border-border/60 bg-hover/70 px-2 py-0.5 text-caption font-medium text-faint tabular-nums">
               {subtitle}
             </span>
           )}
@@ -285,7 +285,7 @@ function LiteratureCard({ data, partial }: { data: Record<string, unknown>; part
         subtitle={partial ? `已加载 ${sources.length} 篇` : `${sources.length} 篇`}
       >
         {sources.length > 0 && (
-          <ul className="flex flex-col divide-y divide-border">
+          <ul className="flex flex-col divide-y divide-border/70">
             {sources.slice(0, 50).map((s, i) => {
               const meta = [authorsLine(s.authors), s.year ? String(s.year) : "", asStr(s.venue)]
                 .filter(Boolean)
@@ -294,13 +294,13 @@ function LiteratureCard({ data, partial }: { data: Record<string, unknown>; part
               const arxiv = asStr(s.arxivId);
               const oaUrl = asStr(s.oa?.url);
               return (
-                <li key={s.id || `${i}`} className="py-2 first:pt-0 last:pb-0">
-                  <div className="text-[13px] leading-snug text-fg">{asStr(s.title) || "(无标题)"}</div>
-                  {meta && <div className="mt-0.5 text-xs text-faint">{meta}</div>}
-                  <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                <li key={s.id || `${i}`} className="py-2.5 first:pt-0 last:pb-0">
+                  <div className="text-body font-medium leading-snug text-fg">{asStr(s.title) || "(无标题)"}</div>
+                  {meta && <div className="mt-0.5 text-caption text-faint">{meta}</div>}
+                  <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
                     {s.retracted === true && (
                       <Chip tone="danger">
-                        <AlertTriangle className="size-2.5" />
+                        <AlertTriangle className="size-2.5" strokeWidth={1.75} />
                         已撤稿
                       </Chip>
                     )}
@@ -319,8 +319,8 @@ function LiteratureCard({ data, partial }: { data: Record<string, unknown>; part
           </ul>
         )}
         {warnings.length > 0 && (
-          <div className="mt-2 flex items-start gap-1.5 text-xs text-warning">
-            <AlertTriangle className="mt-0.5 size-3 shrink-0" />
+          <div className="oc-callout oc-callout-warning mt-2 flex items-start gap-1.5 rounded-md px-2.5 py-1.5 text-caption text-warning">
+            <AlertTriangle className="mt-0.5 size-3 shrink-0" strokeWidth={1.75} />
             <span>部分来源暂不可用:{warnings.join(";")}</span>
           </div>
         )}
@@ -364,20 +364,20 @@ function CitationCard({ data, partial }: { data: Record<string, unknown>; partia
   if (verdicts.length > 0) {
     return (
       <CardShell icon={<Quote className="size-4" />} title="引用核验" subtitle={`${verdicts.length} 条`}>
-        <ul className="flex flex-col divide-y divide-border">
+        <ul className="flex flex-col divide-y divide-border/70">
           {verdicts.slice(0, 50).map((v, i) => {
             const cite = asStr(v.gbt7714) || asStr(v.apa);
             const ok = v.resolved === true && v.retracted !== true;
             return (
-              <li key={v.identifier || `${i}`} className="flex items-start gap-2 py-2 first:pt-0 last:pb-0">
+              <li key={v.identifier || `${i}`} className="flex items-start gap-2 py-2.5 first:pt-0 last:pb-0">
                 {ok ? (
-                  <CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-success" />
+                  <CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-success" strokeWidth={1.75} />
                 ) : (
-                  <XCircle className="mt-0.5 size-3.5 shrink-0 text-danger" />
+                  <XCircle className="mt-0.5 size-3.5 shrink-0 text-danger" strokeWidth={1.75} />
                 )}
                 <div className="min-w-0">
-                  <div className="text-[13px] leading-snug text-fg">{cite || asStr(v.identifier)}</div>
-                  <div className="mt-0.5 flex flex-wrap gap-1.5">
+                  <div className="text-body leading-snug text-fg">{cite || asStr(v.identifier)}</div>
+                  <div className="mt-1 flex flex-wrap gap-1.5">
                     <Chip tone={v.resolved ? "ok" : "danger"}>{v.resolved ? "已接地" : "未命中可信记录"}</Chip>
                     {v.retracted === true && <Chip tone="danger">已撤稿</Chip>}
                   </div>
@@ -404,14 +404,14 @@ function CitationCard({ data, partial }: { data: Record<string, unknown>; partia
         title="引用格式化"
         subtitle={asStr(rec?.doi) || asStr(single.identifier)}
       >
-        <div className="text-[13px] leading-snug text-fg">{asStr(rec?.title) || asStr(single.identifier)}</div>
-        {meta && <div className="mt-0.5 text-xs text-faint">{meta}</div>}
-        <div className="mt-1 flex flex-wrap gap-1.5">
+        <div className="text-body font-medium leading-snug text-fg">{asStr(rec?.title) || asStr(single.identifier)}</div>
+        {meta && <div className="mt-0.5 text-caption text-faint">{meta}</div>}
+        <div className="mt-1.5 flex flex-wrap gap-1.5">
           <Chip tone={ok ? "ok" : "danger"}>{single.resolved ? "已接地" : "未命中可信记录"}</Chip>
           {single.retracted === true && <Chip tone="danger">已撤稿</Chip>}
         </div>
         {cite && (
-          <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-words rounded bg-code px-2.5 py-2 font-mono text-meta text-muted">
+          <pre className="oc-surface-recessed mt-2 overflow-x-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-meta text-muted">
             {cite}
           </pre>
         )}
@@ -432,19 +432,19 @@ function CitationCard({ data, partial }: { data: Record<string, unknown>; partia
       unsupported > 0 ? `${claims.length} 条 · ${verified} 已接地 · ${unsupported} 未支撑` : `${claims.length} 条 · ${verified} 已接地`;
     return (
       <CardShell icon={<Quote className="size-4" />} title="引用接地校验" subtitle={subtitle}>
-        <ul className="flex flex-col divide-y divide-border">
+        <ul className="flex flex-col divide-y divide-border/70">
           {claims.slice(0, 50).map((c, i) => {
             const q = quoteById.get(asStr(c.supports?.[0]?.quoteId));
             const tone = c.status === "verified" ? "ok" : c.status === "unsupported" ? "danger" : "muted";
             const label = c.status === "verified" ? "已接地" : c.status === "unsupported" ? "未支撑" : "未校验";
             return (
-              <li key={c.id || `${i}`} className="py-2 first:pt-0 last:pb-0">
+              <li key={c.id || `${i}`} className="py-2.5 first:pt-0 last:pb-0">
                 <div className="flex items-start gap-2">
                   <Chip tone={tone}>{label}</Chip>
-                  <div className="min-w-0 text-[13px] leading-snug text-fg">{asStr(c.text)}</div>
+                  <div className="min-w-0 text-body leading-snug text-fg">{asStr(c.text)}</div>
                 </div>
                 {q?.text && (
-                  <div className="mt-1 border-l-2 border-border pl-2 text-xs text-faint italic">
+                  <div className="mt-1.5 border-l-2 border-border-strong pl-2.5 text-caption text-faint italic">
                     “{asStr(q.text).slice(0, 240)}”
                   </div>
                 )}
@@ -465,8 +465,8 @@ function IngestCard({ data }: { data: Record<string, unknown> }) {
   if (data.needsOcr === true) {
     return (
       <CardShell icon={<Database className="size-4" />} title="文档入库">
-        <div className="flex items-start gap-1.5 text-xs text-warning">
-          <AlertTriangle className="mt-0.5 size-3 shrink-0" />
+        <div className="oc-callout oc-callout-warning flex items-start gap-1.5 rounded-md px-2.5 py-1.5 text-caption text-warning">
+          <AlertTriangle className="mt-0.5 size-3 shrink-0" strokeWidth={1.75} />
           <span>需要 OCR(扫描件无文本层):{asStr(data.reason) || "未提供原因"}</span>
         </div>
       </CardShell>
@@ -479,7 +479,7 @@ function IngestCard({ data }: { data: Record<string, unknown> }) {
     .join(" · ");
   return (
     <CardShell icon={<Database className="size-4" />} title="文档已入库" subtitle={meta}>
-      <div className="text-body text-fg">{asStr(data.title) || "(无标题)"}</div>
+      <div className="text-body font-medium text-fg">{asStr(data.title) || "(无标题)"}</div>
       <div className="mt-0.5 font-mono text-caption text-faint">{docId}</div>
     </CardShell>
   );
@@ -500,8 +500,8 @@ function LitragCard({ data, partial }: { data: Record<string, unknown>; partial?
       {quotes.length > 0 && (
         <ul className="flex flex-col gap-2">
           {quotes.slice(0, 30).map((q, i) => (
-            <li key={q.id || `${i}`} className="border-l-2 border-accent/40 pl-2">
-              <div className="text-[13px] leading-snug text-fg">“{asStr(q.text).slice(0, 300)}”</div>
+            <li key={q.id || `${i}`} className="oc-surface-recessed rounded-md border-l-2 border-l-accent/50 px-3 py-2">
+              <div className="text-body leading-snug text-fg">“{asStr(q.text).slice(0, 300)}”</div>
               {q.sourceId && <div className="mt-0.5 font-mono text-caption text-faint">{asStr(q.sourceId)}</div>}
             </li>
           ))}
@@ -542,10 +542,10 @@ function ArtifactPreviewLink({ src }: { src: string }) {
       href={signed}
       target="_blank"
       rel="noreferrer noopener"
-      className="inline-flex items-center gap-1 rounded bg-accent-soft px-2 py-1 text-meta text-accent hover:underline [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+      className="oc-btn-tactile inline-flex items-center gap-1 rounded-md border border-accent/25 bg-accent-soft px-2.5 py-1 text-meta font-medium text-accent transition-colors hover:border-accent/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
     >
       预览
-      <ExternalLink className="size-3" />
+      <ExternalLink className="size-3" strokeWidth={1.75} />
     </a>
   );
 }
@@ -587,46 +587,48 @@ function EvidenceSection({ src, coverage }: {
 
   const sources = manifest?.sources ?? [];
   return (
-    <div className="mt-2 rounded-md border border-border">
+    <div className="oc-surface-card mt-2 overflow-hidden rounded-lg">
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-meta text-fg hover:bg-hover"
+        className="flex w-full items-center gap-1.5 px-3 py-2 text-meta font-medium text-fg outline-none transition-colors hover:bg-hover/60 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
       >
-        {open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+        {open ? <ChevronDown className="size-3.5 text-faint" strokeWidth={1.75} /> : <ChevronRight className="size-3.5 text-faint" strokeWidth={1.75} />}
         引用接地详情
         {coverage && <CoverageBadge coverage={coverage} />}
       </button>
       {open && (
-        <div className="border-t border-border">
-          {error && <div className="px-2.5 py-2 text-xs text-faint">证据清单不可用(可能已过期或被清理)。</div>}
-          {!error && !manifest && <div className="px-2.5 py-2 text-xs text-faint">加载证据清单…</div>}
+        <div className="border-t border-border/75">
+          {error && <div className="px-3 py-2 text-caption text-faint">证据清单不可用(可能已过期或被清理)。</div>}
+          {!error && !manifest && <div className="px-3 py-2 text-caption text-faint">加载证据清单…</div>}
           {manifest && (
             <>
-              <div className="flex items-center gap-1 px-2.5 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setTab("evidence")}
-                  className={cn(
-                    "rounded-md px-2 py-0.5 text-meta",
-                    tab === "evidence" ? "bg-accent-soft text-accent" : "text-muted hover:text-fg",
-                  )}
-                >
-                  证据
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setTab("library")}
-                  className={cn(
-                    "rounded-md px-2 py-0.5 text-meta",
-                    tab === "library" ? "bg-accent-soft text-accent" : "text-muted hover:text-fg",
-                  )}
-                >
-                  文献库 {sources.length}
-                </button>
+              <div className="px-3 pt-2">
+                <div className="oc-surface-recessed inline-flex items-center gap-0.5 rounded-md p-0.5">
+                  <button
+                    type="button"
+                    onClick={() => setTab("evidence")}
+                    className={cn(
+                      "rounded-xs px-2.5 py-0.5 text-meta font-medium transition-colors",
+                      tab === "evidence" ? "oc-segmented-thumb text-fg" : "text-muted hover:text-fg",
+                    )}
+                  >
+                    证据
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setTab("library")}
+                    className={cn(
+                      "rounded-xs px-2.5 py-0.5 text-meta font-medium transition-colors tabular-nums",
+                      tab === "library" ? "oc-segmented-thumb text-fg" : "text-muted hover:text-fg",
+                    )}
+                  >
+                    文献库 {sources.length}
+                  </button>
+                </div>
               </div>
               {tab === "evidence" && (
-                <div className="px-2.5 pb-2 pt-1.5">
+                <div className="px-3 pb-2.5 pt-2">
                   <GatesRow manifest={manifest} />
                   <ClaimList manifest={manifest} />
                 </div>
@@ -685,9 +687,9 @@ function ArtifactCard({ data }: { data: Record<string, unknown> }) {
                 tab: "outputs",
               })
             }
-            className="inline-flex items-center gap-1 rounded bg-accent px-2.5 py-1 text-meta font-medium text-accent-fg transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+            className="oc-btn-tactile oc-btn-accent-craft inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-meta font-medium text-accent-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
           >
-            <PanelRightOpen className="size-3.5" aria-hidden />
+            <PanelRightOpen className="size-3.5" strokeWidth={1.75} aria-hidden />
             工作台预览
           </button>
           <SignedFileCard src={safeOut} filename={fileName} />
@@ -733,13 +735,18 @@ function RankCard({ data, partial }: { data: Record<string, unknown>; partial?: 
       title="候选排名"
       subtitle={partial ? `已加载 ${ranked.length} 项` : `${ranked.length} 项`}
     >
-      <ol className="flex flex-col divide-y divide-border">
+      <ol className="flex flex-col divide-y divide-border/70">
         {ranked.slice(0, 30).map((r, i) => (
-          <li key={r.id || `${i}`} className="flex items-center gap-2 py-1.5 first:pt-0 last:pb-0">
-            <span className={cn("w-5 text-center text-xs", i === 0 ? "text-accent font-semibold" : "text-faint")}>
+          <li key={r.id || `${i}`} className="flex items-center gap-2 py-2 first:pt-0 last:pb-0 tabular-nums">
+            <span
+              className={cn(
+                "flex size-5 shrink-0 items-center justify-center rounded-full text-caption",
+                i === 0 ? "oc-icon-badge oc-icon-badge-accent rounded-full font-semibold" : "text-faint",
+              )}
+            >
               {i + 1}
             </span>
-            <span className="min-w-0 flex-1 truncate text-body text-fg">{asStr(r.id)}</span>
+            <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">{asStr(r.id)}</span>
             {typeof r.rating === "number" && <Chip>Elo {Math.round(r.rating)}</Chip>}
             {(r.wins != null || r.losses != null) && (
               <span className="text-caption text-faint">
@@ -860,7 +867,7 @@ function MarketItems({ items }: { items: MarketItem[] }) {
           type="button"
           onClick={() => setVisible((value) => value + 12)}
           // 触屏下与其它卡内操作同一 44px 命中标准(T-08);桌面保持 32px 药丸。
-          className="mt-2.5 min-h-8 rounded-full bg-hover px-3 text-xs font-medium text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+          className="oc-btn-tactile oc-btn-secondary-craft mt-2.5 min-h-8 rounded-full px-3 text-meta font-medium text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
         >
           查看更多（还有 {items.length - shown} 项）
         </button>
@@ -920,10 +927,12 @@ function MarketToolCard({ command, tool }: { command: string; tool: ToolLike }):
   if (!title[action]) return null;
   return (
     <CardShell icon={<Package className="size-4" />} title={title[action]} subtitle={target || undefined}>
-      <div className={cn(
-        "rounded-lg px-3 py-2.5 text-[13px] leading-relaxed",
-        tool._completed ? "bg-success-soft text-success" : "bg-accent-soft text-accent",
-      )}>
+      <div
+        className={cn(
+          "oc-callout rounded-lg px-3 py-2.5 text-body leading-relaxed",
+          tool._completed ? "oc-callout-success text-success" : "oc-callout-info text-info",
+        )}
+      >
         {tool._completed
           ? target
             ? `已完成对「${target}」的操作。`
@@ -951,14 +960,14 @@ export function WebSearchResultsCard({ tool }: { tool: ToolLike }): ReactNode | 
   if (hits.length === 0) return null;
   return (
     <CardShell icon={<Search className="size-4" />} title="网页搜索" subtitle={`${hits.length} 条来源`}>
-      <ul className="flex flex-col divide-y divide-border">
+      <ul className="flex flex-col divide-y divide-border/70">
         {hits.slice(0, 20).map((h, i) => {
           const domain = domainOf(h.url);
           return (
-            <li key={`${i}-${h.url}`} className="py-2 first:pt-0 last:pb-0">
+            <li key={`${i}-${h.url}`} className="py-2.5 first:pt-0 last:pb-0">
               {isSafeHttpUrl(h.url) ? (
                 <a
-                  className="text-[13px] leading-snug text-accent hover:underline break-words"
+                  className="break-words text-body font-medium leading-snug text-accent hover:underline"
                   href={h.url}
                   target="_blank"
                   rel="noreferrer noopener"
@@ -966,10 +975,10 @@ export function WebSearchResultsCard({ tool }: { tool: ToolLike }): ReactNode | 
                   {h.title || h.url}
                 </a>
               ) : (
-                <div className="text-[13px] leading-snug text-fg break-words">{h.title || h.url}</div>
+                <div className="break-words text-body font-medium leading-snug text-fg">{h.title || h.url}</div>
               )}
-              {domain && <div className="mt-0.5 text-xs text-faint">{domain}</div>}
-              {h.snippet && <div className="mt-1 text-xs text-faint line-clamp-2">{h.snippet}</div>}
+              {domain && <div className="mt-0.5 font-mono text-caption text-faint">{domain}</div>}
+              {h.snippet && <div className="mt-1 line-clamp-2 text-meta text-muted">{h.snippet}</div>}
             </li>
           );
         })}
@@ -1020,9 +1029,9 @@ function OcWebExtractCard({ tool }: { tool: ToolLike }): ReactNode | null {
     const reason = blocked[1]?.replace(/^blocked_phrase:/i, "").trim();
     return (
       <CardShell icon={<AlertTriangle className="size-4" />} title="网页提取受阻">
-        <div className="rounded-lg bg-warning-soft px-3 py-2.5">
+        <div className="oc-callout oc-callout-warning rounded-lg px-3 py-2.5">
           <div className="text-body font-medium text-warning">站点阻止了自动内容提取</div>
-          <div className="mt-1 text-xs leading-relaxed text-muted">
+          <div className="mt-1 text-meta leading-relaxed text-muted">
             {reason?.toLowerCase().includes("cloudflare")
               ? "该页面启用了 Cloudflare 访问保护，可改用浏览器方式打开并读取页面。"
               : "页面拒绝了自动抓取，可尝试使用浏览器访问。"}
@@ -1038,9 +1047,9 @@ function OcWebExtractCard({ tool }: { tool: ToolLike }): ReactNode | null {
   const domain = url ? domainOf(url) : undefined;
   return (
     <CardShell icon={<Globe className="size-4" />} title="网页/文档提取" subtitle={domain}>
-      <div className="whitespace-pre-wrap break-words text-[13px] leading-snug text-fg">{summary}</div>
+      <div className="whitespace-pre-wrap break-words text-body leading-snug text-fg">{summary}</div>
       {(url || truncated) && (
-        <div className="mt-1 flex flex-wrap items-center gap-1.5">
+        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
           {url && <Chip href={url}>{domain ?? "来源"}</Chip>}
           {truncated && <Chip tone="muted">已截断</Chip>}
         </div>
@@ -1051,7 +1060,7 @@ function OcWebExtractCard({ tool }: { tool: ToolLike }): ReactNode | null {
           <pre
             // biome-ignore lint/a11y/noNoninteractiveTabindex: 有 max-h 的滚动区要能聚焦,键盘才能滚(T-23)
             tabIndex={0}
-            className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="oc-surface-recessed mt-1.5 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2.5 font-mono text-caption leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             {body}
           </pre>
@@ -1112,7 +1121,7 @@ function FriendlyObjectPreview({ value }: { value: Record<string, unknown> }) {
     const stderr = shellResultMessage(unwrapped);
     if (stderr) {
       return (
-        <div className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-fg">
+        <div className="whitespace-pre-wrap break-words text-body leading-relaxed text-fg">
           {friendlyOcFailureText(stderr)}
         </div>
       );
@@ -1120,27 +1129,27 @@ function FriendlyObjectPreview({ value }: { value: Record<string, unknown> }) {
     const stdout = shellResultString(unwrapped, "stdout");
     if (stdout) {
       return (
-        <div className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-fg">
+        <div className="whitespace-pre-wrap break-words text-body leading-relaxed text-fg">
           {stdout}
         </div>
       );
     }
     return (
-      <div className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-fg">
+      <div className="whitespace-pre-wrap break-words text-body leading-relaxed text-fg">
         工具执行失败。
       </div>
     );
   }
   const entries = Object.entries(unwrapped);
-  if (entries.length === 0) return <div className="text-xs text-faint">没有返回内容。</div>;
+  if (entries.length === 0) return <div className="text-meta text-faint">没有返回内容。</div>;
   const rows = showAllFields ? entries : entries.slice(0, 6);
   return (
     <>
       <dl className="grid gap-2 sm:grid-cols-2">
         {rows.map(([key, item]) => (
-          <div key={key} className="min-w-0 rounded-lg bg-hover/70 px-3 py-2">
+          <div key={key} className="oc-surface-card min-w-0 rounded-lg px-3 py-2">
             <dt className="text-caption font-medium text-faint">{key.replaceAll("_", " ")}</dt>
-            <dd className="mt-0.5 break-words text-[12.5px] leading-relaxed text-fg">
+            <dd className="mt-0.5 break-words text-meta leading-relaxed text-fg">
               {typeof item === "string"
                 ? firstParagraph(item)
                 : typeof item === "number" || typeof item === "boolean"
@@ -1175,7 +1184,7 @@ function OutputDetails({ text, label }: { text: string | null; label: string }) 
       <pre
         // biome-ignore lint/a11y/noNoninteractiveTabindex: 有 max-h 的滚动区要能聚焦,键盘才能滚(T-23)
         tabIndex={0}
-        className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className="oc-surface-recessed mt-1.5 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2.5 font-mono text-caption leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         {slice.shown}
         {slice.truncated ? "\n…" : null}
@@ -1191,7 +1200,7 @@ function ResultText({ text }: { text: string }) {
   const slice = useExpandableSlice(text, 4000);
   return (
     <>
-      <div className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-fg">
+      <div className="whitespace-pre-wrap break-words text-body leading-relaxed text-fg">
         {slice.shown}
         {slice.truncated ? "…" : null}
       </div>
@@ -1202,7 +1211,7 @@ function ResultText({ text }: { text: string }) {
 
 /** 提示/查询回显块(不是命令,是用户的问题/查询词)。 */
 function PromptChip({ text }: { text: string }) {
-  return <div className="rounded-md bg-hover px-3 py-2 text-[13px] leading-snug text-fg">{text}</div>;
+  return <div className="oc-surface-recessed rounded-md px-3 py-2 text-body leading-snug text-fg">{text}</div>;
 }
 
 /**
@@ -1240,17 +1249,17 @@ function GenericOcCard({
       stripped: clean,
     });
   return (
-    <div className={cn("rounded-lg px-3 py-2.5", error ? "bg-danger-soft" : "bg-hover/70") }>
+    <div className={cn("rounded-lg px-3 py-2.5", error ? "oc-callout oc-callout-danger" : "oc-surface-recessed")}>
       {delegateRunning ? (
-        <div className="text-xs text-faint">委派运行中…</div>
+        <div className="text-meta text-faint">委派运行中…</div>
       ) : object ? (
         <FriendlyObjectPreview value={object} />
       ) : clean ? (
-        <div className={cn("whitespace-pre-wrap break-words text-[13px] leading-relaxed", error ? "text-danger" : "text-fg") }>
+        <div className={cn("whitespace-pre-wrap break-words text-body leading-relaxed", error ? "text-danger" : "text-fg")}>
           {error ? friendlyOcFailureText(clean) : firstParagraph(clean)}
         </div>
       ) : (
-        <div className="text-xs text-faint">{error ? "工具执行失败。" : "操作已完成。"}</div>
+        <div className="text-meta text-faint">{error ? "工具执行失败。" : "操作已完成。"}</div>
       )}
     </div>
   );
@@ -1260,11 +1269,11 @@ function GenericOcCard({
 function MediaPreview({ path, kind }: { path: string; kind: "image" | "audio" | "video" }) {
   const safe = safeArtifactSrc(path);
   const name = path.split("/").pop() || path;
-  if (!safe) return <div className="mt-1 text-xs text-faint">已生成:{name}(可在文件区查看)</div>;
+  if (!safe) return <div className="mt-1 text-meta text-faint">已生成:{name}(可在文件区查看)</div>;
   if (kind === "image")
     return (
       <div className="mt-2">
-        <SignedImg src={safe} alt={name} className="max-h-56 rounded-md border border-border" />
+        <SignedImg src={safe} alt={name} className="max-h-56 rounded-lg border border-border/80 shadow-soft" />
       </div>
     );
   if (kind === "video")
@@ -1564,8 +1573,8 @@ function LiteraturePluginDownloadCard({
       title={expired ? "文献 PDF 已过期" : "文献全文已就绪"}
       subtitle={`${formatLiteraturePdfBytes(bytes)}${deadline}`}
     >
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="min-w-0 flex-1 truncate text-[13px] font-medium text-fg" title={filename}>
+      <div className="oc-surface-card flex flex-wrap items-center justify-between gap-2 rounded-lg px-3 py-2.5">
+        <div className="min-w-0 flex-1 truncate text-body font-medium text-fg" title={filename}>
           {filename}
         </div>
         {downloadLiteratureArtifact && !expired && (
@@ -1573,18 +1582,20 @@ function LiteraturePluginDownloadCard({
             type="button"
             disabled={busy}
             onClick={() => void onSave()}
-            className="shrink-0 rounded-md bg-accent px-2.5 py-1 text-xs font-medium text-white transition hover:opacity-90 disabled:opacity-50"
+            className="oc-btn-tactile oc-btn-accent-craft shrink-0 rounded-md px-2.5 py-1 text-meta font-medium text-accent-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 [@media(hover:none)]:min-h-11"
           >
             {busy ? "下载中…" : "保存 PDF"}
           </button>
         )}
       </div>
       {expired && (
-        <div className="mt-1.5 text-xs text-muted">
+        <div className="mt-1.5 text-meta text-muted">
           平台暂存的文件已过期或已被清理，请让助手用同一编号重新下载（编号 24 小时内有效）。
         </div>
       )}
-      {err && !expired && <div className="mt-1.5 text-xs text-danger">{err}</div>}
+      {err && !expired && (
+        <div className="oc-callout oc-callout-danger mt-1.5 rounded-md px-2.5 py-1.5 text-meta text-danger">{err}</div>
+      )}
     </CardShell>
   );
 }

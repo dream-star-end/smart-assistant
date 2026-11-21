@@ -81,7 +81,7 @@ export function Field({
 
   return (
     <div className={cn("flex flex-col gap-1.5", className)}>
-      <label htmlFor={controlId} className="text-meta font-medium text-muted">
+      <label htmlFor={controlId} className="text-meta font-medium text-fg/85">
         {label}
         {required ? (
           // 星号只是视觉标记,语义由控件的 aria-required 承载,故对读屏隐藏。
@@ -92,12 +92,12 @@ export function Field({
       </label>
       {control}
       {hint ? (
-        <p id={hintId} className="text-caption text-faint">
+        <p id={hintId} className="text-caption leading-relaxed text-faint">
           {hint}
         </p>
       ) : null}
       {error ? (
-        <p id={errorId} className="text-caption text-danger">
+        <p id={errorId} className="text-caption font-medium text-danger">
           {error}
         </p>
       ) : null}

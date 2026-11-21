@@ -138,10 +138,10 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
       data-testid="swarm-inline-card"
       data-swarm-id={snapshot.swarmId}
       className={cn(
-        "group relative overflow-hidden rounded-2xl border bg-surface transition-all duration-200 animate-in",
+        "oc-surface-card group relative overflow-hidden rounded-2xl transition-all duration-200 animate-in",
         active
-          ? "border-accent/35 shadow-float"
-          : "border-border shadow-soft hover:border-border-strong",
+          ? "border-accent/40 shadow-float ring-1 ring-accent/15"
+          : "hover:border-border-strong",
       )}
     >
       {/* Top luminous aurora hairline when swarm is actively coordinating */}
@@ -232,19 +232,22 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
             variant={active ? "gradient" : "secondary"}
             size="sm"
             onClick={() => openWith()}
-            className="shrink-0 gap-1 rounded-lg px-2.5 text-caption font-medium"
+            className={cn(
+              "oc-btn-tactile shrink-0 gap-1 rounded-lg px-2.5 text-caption font-medium",
+              active ? "oc-btn-accent-craft" : "oc-btn-secondary-craft",
+            )}
             data-testid="swarm-open-board-btn"
           >
-            <Sparkles size={12} />
+            <Sparkles size={12} strokeWidth={1.75} />
             <span>沉浸看板</span>
-            <ArrowUpRight size={12} />
+            <ArrowUpRight size={12} strokeWidth={1.75} />
           </Button>
         )}
       </div>
 
       {/* Expanded body: Bento Member Grid + Live Board Pulse */}
       {!collapsed && (
-        <div className="space-y-3 border-t border-border/80 bg-bg/45 px-3.5 py-3">
+        <div className="oc-surface-recessed space-y-3 border-t border-border/80 px-3.5 py-3">
           {/* Member Matrix */}
           {snapshot.members.length > 0 ? (
             <div
@@ -264,13 +267,13 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
                     onClick={() => openWith({ focusMember: member.name })}
                     disabled={!onOpenBoard}
                     className={cn(
-                      "flex flex-col gap-1.5 rounded-xl border p-2.5 text-left transition-all duration-150",
+                      "oc-surface-card oc-surface-card-hover flex flex-col gap-1.5 rounded-xl p-2.5 text-left transition-all duration-150",
                       "outline-none focus-visible:ring-2 focus-visible:ring-ring",
                       working
-                        ? "border-accent/30 bg-surface shadow-soft hover:border-accent/50"
+                        ? "border-accent/35 ring-1 ring-accent/15 hover:border-accent/55"
                         : killed
-                          ? "border-border/60 bg-surface/50 opacity-60 hover:opacity-80"
-                          : "border-border/80 bg-surface hover:border-border-strong hover:bg-hover/40",
+                          ? "opacity-60 hover:opacity-85"
+                          : "",
                     )}
                   >
                     <div className="flex items-center gap-2">
@@ -363,10 +366,12 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
 
           {/* Live Board Pulse Strip */}
           {recentPosts.length > 0 && (
-            <div className="overflow-hidden rounded-xl border border-border/80 bg-surface">
+            <div className="oc-surface-card overflow-hidden rounded-xl">
               <div className="flex items-center justify-between border-b border-border/60 px-3 py-1.5">
                 <span className="flex items-center gap-1.5 text-caption font-medium text-muted">
-                  <MessageSquare size={11} className="text-accent" />
+                  <span className="oc-icon-badge oc-icon-badge-accent flex size-4 items-center justify-center rounded-xs">
+                    <MessageSquare size={10} strokeWidth={1.75} />
+                  </span>
                   实时协作讨论板
                 </span>
                 {onOpenBoard && snapshot.totalPosts > recentPosts.length && (

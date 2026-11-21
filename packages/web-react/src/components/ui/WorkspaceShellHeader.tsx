@@ -82,9 +82,9 @@ export function WorkspaceShellHeader({
       ref={headerRef}
       data-product-entry-scope={productEntryScope}
       className={cn(
-        "@container shrink-0 header-safe-t",
-        backdrop ? "bg-bg/90 backdrop-blur-sm" : "bg-bg",
-        border === "subtle" && "border-b border-border/60",
+        "@container shrink-0 header-safe-t transition-colors duration-150",
+        backdrop ? "bg-bg/85 backdrop-blur-md saturate-125" : "bg-bg",
+        border === "subtle" && "border-b border-border/70",
         className,
       )}
     >

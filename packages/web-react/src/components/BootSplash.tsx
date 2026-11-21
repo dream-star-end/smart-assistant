@@ -1,4 +1,6 @@
+import { RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
+import { BrandMark } from "./BrandMark";
 import { Spinner } from "./ui";
 
 /** 慢网提示出现的时机:正常网络下启动续期 / 懒块远小于这个值,看不到任何变化。 */
@@ -43,22 +45,37 @@ export function BootSplash({ slowHint = "网络较慢，正在加载…" }: { sl
     };
   }, [since]);
   return (
-    <output className="flex h-full flex-col items-center justify-center gap-3 bg-bg text-muted" aria-live="polite">
-      <Spinner size={22} />
-      {stage >= 1 && (
-        <p className="text-meta text-faint" data-testid="boot-slow-hint">
-          {slowHint}
-        </p>
-      )}
-      {stage >= 2 && (
-        <button
-          type="button"
-          onClick={() => window.location.reload()}
-          className="rounded-full px-3 py-1 text-meta text-muted underline-offset-2 hover:text-fg hover:underline [@media(hover:none)]:min-h-11"
-        >
-          刷新重试
-        </button>
-      )}
+    <output
+      className="relative flex h-full flex-col items-center justify-center gap-4 overflow-hidden bg-bg px-4 text-muted"
+      aria-live="polite"
+    >
+      <div
+        aria-hidden="true"
+        className="oc-home-glow pointer-events-none absolute left-1/2 top-1/2 h-[220px] w-[min(420px,90vw)] -translate-x-1/2 -translate-y-1/2 opacity-80"
+      />
+      <div className="relative flex flex-col items-center gap-4">
+        <div className="oc-surface-card flex items-center gap-3 rounded-2xl px-4 py-3">
+          <BrandMark className="size-9" fontSize="text-title" rounded="rounded-sm" flat />
+          <div className="flex items-center gap-2.5 pr-1">
+            <Spinner size={18} />
+          </div>
+        </div>
+        {stage >= 1 && (
+          <p className="text-meta font-medium text-muted animate-fade" data-testid="boot-slow-hint">
+            {slowHint}
+          </p>
+        )}
+        {stage >= 2 && (
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="oc-btn-tactile oc-btn-secondary-craft inline-flex items-center gap-1.5 rounded-full px-4 py-1.5 text-meta font-medium text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+          >
+            <RefreshCw size={13} strokeWidth={1.75} aria-hidden="true" />
+            刷新重试
+          </button>
+        )}
+      </div>
     </output>
   );
 }

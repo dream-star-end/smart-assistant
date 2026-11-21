@@ -139,9 +139,9 @@
   --sidebar-active: #ffffff;
   --sidebar-active-shadow: 0 1px 2px rgba(24, 24, 27, 0.05), 0 0 0 1px rgba(24, 24, 27, 0.06);
   --sidebar-btn-shadow: 0 1px 2px rgba(24, 24, 27, 0.05), 0 1px 0 rgba(255, 255, 255, 0.7) inset;
-  --shadow-soft-val: 0 1px 2px rgba(24, 24, 27, 0.04), 0 4px 16px rgba(24, 24, 27, 0.06);
-  --shadow-pop-val: 0 8px 30px rgba(24, 24, 27, 0.12), 0 2px 6px rgba(24, 24, 27, 0.06);
-  --shadow-float-val: 0 2px 6px rgba(24, 24, 27, 0.05), 0 12px 36px rgba(24, 24, 27, 0.09);
+  --shadow-soft-val: 0 1px 2px rgba(24, 24, 27, 0.045), 0 4px 14px -2px rgba(24, 24, 27, 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  --shadow-pop-val: 0 10px 32px -4px rgba(24, 24, 27, 0.13), 0 2px 8px rgba(24, 24, 27, 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.85);
+  --shadow-float-val: 0 2px 6px rgba(24, 24, 27, 0.05), 0 16px 40px -6px rgba(24, 24, 27, 0.11), inset 0 1px 0 rgba(255, 255, 255, 0.85);
   --elevated: #ffffff;
   --hover: #1c19170a;
   --active: #1c191714;
@@ -294,6 +294,730 @@ body {
   .oc-dropdown-max-h {
     max-height: min(80vh, var(--radix-dropdown-menu-content-available-height));
     max-height: min(80dvh, var(--radix-dropdown-menu-content-available-height));
+  }
+
+  /* ── Clarvy Atelier — Tactile Editorial Craftsmanship 材质系统 (OCV5-822) ──
+     所有材质全部基于语义 token + color-mix 构建，明暗双主题与局部换肤容器天然兼容。
+     全部置于 @layer components，使组件调用处的 @layer utilities 可无冲突覆盖。 */
+
+  /* 1. 精雕卡片面：发丝描边 + 顶部 1px 内高光 + 接触/环境双层景深 */
+  .oc-surface-card {
+    background-color: var(--surface);
+    border: 1px solid color-mix(in srgb, var(--fg) 9%, transparent);
+    box-shadow:
+      0 1px 2px color-mix(in srgb, var(--fg) 4.5%, transparent),
+      0 4px 14px -4px color-mix(in srgb, var(--fg) 5.5%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.82);
+  }
+  .dark .oc-surface-card {
+    border-color: color-mix(in srgb, var(--fg) 10%, transparent);
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.36),
+      0 6px 20px -6px rgba(0, 0, 0, 0.48),
+      inset 0 1px 0 rgba(255, 255, 255, 0.065);
+  }
+
+  /* 2. 交互卡片悬停质感：微抬升 -1px + 暖陶土微光描边 + 景深柔和加深 */
+  .oc-surface-card-hover {
+    transition:
+      transform 180ms var(--ease-spring),
+      border-color 180ms var(--ease-standard),
+      box-shadow 200ms var(--ease-standard),
+      background-color 150ms var(--ease-standard);
+  }
+  @media (hover: hover) {
+    .oc-surface-card-hover:hover {
+      transform: translateY(-1px);
+      border-color: color-mix(in srgb, var(--accent) 30%, var(--border-strong));
+      box-shadow:
+        0 2px 6px color-mix(in srgb, var(--fg) 6%, transparent),
+        0 10px 26px -6px color-mix(in srgb, var(--accent) 10%, color-mix(in srgb, var(--fg) 9%, transparent)),
+        inset 0 1px 0 rgba(255, 255, 255, 0.9);
+    }
+    .dark .oc-surface-card-hover:hover {
+      border-color: color-mix(in srgb, var(--accent) 36%, var(--border-strong));
+      box-shadow:
+        0 3px 8px rgba(0, 0, 0, 0.45),
+        0 14px 32px -8px rgba(0, 0, 0, 0.62),
+        0 0 0 1px color-mix(in srgb, var(--accent) 14%, transparent),
+        inset 0 1px 0 rgba(255, 255, 255, 0.09);
+    }
+  }
+  .oc-surface-card-hover:active {
+    transform: translateY(0) scale(0.994);
+  }
+
+  /* 3. 磨砂玻璃浮层：半透表面 + 高饱和背景虚化 + 发丝高光边框 */
+  .oc-surface-glass {
+    background-color: color-mix(in srgb, var(--surface) 80%, transparent);
+    -webkit-backdrop-filter: blur(14px) saturate(1.4);
+    backdrop-filter: blur(14px) saturate(1.4);
+    border: 1px solid color-mix(in srgb, var(--fg) 10%, transparent);
+    box-shadow:
+      0 2px 8px color-mix(in srgb, var(--fg) 5%, transparent),
+      0 12px 32px -8px color-mix(in srgb, var(--fg) 9%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.72);
+  }
+  .dark .oc-surface-glass {
+    background-color: color-mix(in srgb, var(--elevated) 78%, transparent);
+    border-color: color-mix(in srgb, var(--fg) 12%, transparent);
+    box-shadow:
+      0 4px 12px rgba(0, 0, 0, 0.42),
+      0 16px 38px -8px rgba(0, 0, 0, 0.56),
+      inset 0 1px 0 rgba(255, 255, 255, 0.085);
+  }
+
+  /* 4. 微凹槽容器：分段控件轨道、搜索底槽、代码块顶栏、数据井 */
+  .oc-surface-recessed {
+    background-color: color-mix(in srgb, var(--fg) 4%, var(--bg));
+    border: 1px solid color-mix(in srgb, var(--fg) 7.5%, transparent);
+    box-shadow:
+      inset 0 1px 2px color-mix(in srgb, var(--fg) 6%, transparent),
+      0 1px 0 rgba(255, 255, 255, 0.65);
+  }
+  .dark .oc-surface-recessed {
+    background-color: color-mix(in srgb, var(--bg) 62%, var(--surface));
+    border-color: color-mix(in srgb, var(--fg) 8%, transparent);
+    box-shadow:
+      inset 0 1px 3px rgba(0, 0, 0, 0.44),
+      0 1px 0 rgba(255, 255, 255, 0.04);
+  }
+
+  /* 5. 雕塑感浮层面板：Popover / Dropdown / Modal / Sheet 专用 */
+  .oc-surface-popover {
+    background-color: var(--elevated);
+    border: 1px solid color-mix(in srgb, var(--fg) 11%, transparent);
+    box-shadow:
+      var(--shadow-pop),
+      inset 0 1px 0 rgba(255, 255, 255, 0.78);
+  }
+  .dark .oc-surface-popover {
+    border-color: color-mix(in srgb, var(--fg) 13%, transparent);
+    box-shadow:
+      var(--shadow-pop),
+      inset 0 1px 0 rgba(255, 255, 255, 0.085);
+  }
+
+  /* 6. 精致圆角方形图标徽章容器：光学居中 + 轻柔染色底 + 1px 内环高光 */
+  .oc-icon-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    border-radius: var(--radius-sm);
+    background-color: color-mix(in srgb, var(--fg) 5.5%, var(--surface));
+    color: var(--muted);
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--fg) 9%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.7),
+      0 1px 2px color-mix(in srgb, var(--fg) 4%, transparent);
+  }
+  .dark .oc-icon-badge {
+    background-color: color-mix(in srgb, var(--fg) 7%, var(--surface));
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--fg) 11%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.07);
+  }
+  .oc-icon-badge-accent {
+    background-color: color-mix(in srgb, var(--accent) 11%, var(--surface));
+    color: var(--accent);
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.5),
+      0 1px 2px color-mix(in srgb, var(--accent) 8%, transparent);
+  }
+  .dark .oc-icon-badge-accent {
+    background-color: color-mix(in srgb, var(--accent) 16%, var(--surface));
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--accent) 28%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  }
+  .oc-icon-badge-success {
+    background-color: color-mix(in srgb, var(--success) 11%, var(--surface));
+    color: var(--success);
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--success) 22%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.5),
+      0 1px 2px color-mix(in srgb, var(--success) 8%, transparent);
+  }
+  .dark .oc-icon-badge-success {
+    background-color: color-mix(in srgb, var(--success) 16%, var(--surface));
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--success) 28%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  }
+  .oc-icon-badge-warning {
+    background-color: color-mix(in srgb, var(--warning) 11%, var(--surface));
+    color: var(--warning);
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--warning) 24%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.5),
+      0 1px 2px color-mix(in srgb, var(--warning) 8%, transparent);
+  }
+  .dark .oc-icon-badge-warning {
+    background-color: color-mix(in srgb, var(--warning) 16%, var(--surface));
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--warning) 28%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  }
+  .oc-icon-badge-danger {
+    background-color: color-mix(in srgb, var(--danger) 11%, var(--surface));
+    color: var(--danger);
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--danger) 24%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.5),
+      0 1px 2px color-mix(in srgb, var(--danger) 8%, transparent);
+  }
+  .dark .oc-icon-badge-danger {
+    background-color: color-mix(in srgb, var(--danger) 16%, var(--surface));
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--danger) 28%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  }
+  .oc-icon-badge-info {
+    background-color: color-mix(in srgb, var(--info) 11%, var(--surface));
+    color: var(--info);
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--info) 22%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.5),
+      0 1px 2px color-mix(in srgb, var(--info) 8%, transparent);
+  }
+  .dark .oc-icon-badge-info {
+    background-color: color-mix(in srgb, var(--info) 16%, var(--surface));
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--info) 28%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  }
+
+  /* 7. 实体雕塑感快捷键键帽 */
+  .oc-kbd {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.4em;
+    padding: 0.08rem 0.38rem;
+    border-radius: var(--radius-xs);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 550;
+    line-height: 1.35;
+    letter-spacing: -0.01em;
+    color: var(--muted);
+    background: linear-gradient(
+      180deg,
+      var(--surface) 0%,
+      color-mix(in srgb, var(--fg) 3.5%, var(--surface)) 100%
+    );
+    border: 1px solid color-mix(in srgb, var(--fg) 14%, transparent);
+    box-shadow:
+      0 1px 0 color-mix(in srgb, var(--fg) 14%, transparent),
+      0 1.5px 2px color-mix(in srgb, var(--fg) 6%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.85);
+  }
+  .dark .oc-kbd {
+    background: linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--fg) 8%, var(--elevated)) 0%,
+      var(--elevated) 100%
+    );
+    border-color: color-mix(in srgb, var(--fg) 16%, transparent);
+    box-shadow:
+      0 1px 0 rgba(0, 0, 0, 0.65),
+      0 2px 4px rgba(0, 0, 0, 0.35),
+      inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  }
+
+  /* 8. 触感按钮工艺：弹性回弹 + 顶部高光 + 克制微渐变光泽 */
+  .oc-btn-tactile {
+    transition:
+      transform 140ms var(--ease-spring),
+      background-color 150ms var(--ease-standard),
+      border-color 150ms var(--ease-standard),
+      box-shadow 180ms var(--ease-standard),
+      color 150ms var(--ease-standard),
+      opacity 150ms var(--ease-standard);
+  }
+  .oc-btn-tactile:active:not(:disabled):not([aria-disabled="true"]) {
+    transform: scale(0.975);
+  }
+
+  .oc-btn-primary-craft {
+    background-image: linear-gradient(
+      180deg,
+      color-mix(in srgb, #ffffff 10%, var(--primary)) 0%,
+      var(--primary) 100%
+    );
+    box-shadow:
+      0 1px 2px color-mix(in srgb, var(--primary) 26%, transparent),
+      0 3px 8px -2px color-mix(in srgb, var(--primary) 20%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.18),
+      inset 0 0 0 1px color-mix(in srgb, var(--primary) 92%, transparent);
+  }
+  @media (hover: hover) {
+    .oc-btn-primary-craft:hover:not(:disabled) {
+      background-image: linear-gradient(
+        180deg,
+        color-mix(in srgb, #ffffff 16%, var(--primary)) 0%,
+        color-mix(in srgb, #ffffff 6%, var(--primary)) 100%
+      );
+      box-shadow:
+        0 2px 4px color-mix(in srgb, var(--primary) 28%, transparent),
+        0 6px 14px -3px color-mix(in srgb, var(--primary) 24%, transparent),
+        inset 0 1px 0 rgba(255, 255, 255, 0.24),
+        inset 0 0 0 1px color-mix(in srgb, var(--primary) 95%, transparent);
+    }
+  }
+  .dark .oc-btn-primary-craft {
+    background-image: linear-gradient(
+      180deg,
+      color-mix(in srgb, #ffffff 35%, var(--primary)) 0%,
+      var(--primary) 100%
+    );
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.42),
+      0 4px 12px -2px rgba(0, 0, 0, 0.5),
+      inset 0 1px 0 rgba(255, 255, 255, 0.92);
+  }
+  @media (hover: hover) {
+    .dark .oc-btn-primary-craft:hover:not(:disabled) {
+      background-image: linear-gradient(180deg, #ffffff 0%, color-mix(in srgb, #ffffff 25%, var(--primary)) 100%);
+      box-shadow:
+        0 2px 6px rgba(0, 0, 0, 0.48),
+        0 6px 16px -3px rgba(0, 0, 0, 0.55),
+        inset 0 1px 0 #ffffff;
+    }
+  }
+
+  .oc-btn-accent-craft {
+    background-image: linear-gradient(
+      180deg,
+      color-mix(in srgb, #ffffff 12%, var(--accent)) 0%,
+      var(--accent) 100%
+    );
+    box-shadow:
+      0 1px 2px color-mix(in srgb, var(--accent) 30%, transparent),
+      0 4px 12px -2px color-mix(in srgb, var(--accent) 28%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.24),
+      inset 0 0 0 1px color-mix(in srgb, var(--accent-strong) 45%, transparent);
+  }
+  @media (hover: hover) {
+    .oc-btn-accent-craft:hover:not(:disabled) {
+      background-image: linear-gradient(
+        180deg,
+        color-mix(in srgb, #ffffff 10%, var(--accent-strong)) 0%,
+        var(--accent-strong) 100%
+      );
+      box-shadow:
+        0 2px 5px color-mix(in srgb, var(--accent) 34%, transparent),
+        0 8px 18px -4px color-mix(in srgb, var(--accent) 32%, transparent),
+        inset 0 1px 0 rgba(255, 255, 255, 0.28),
+        inset 0 0 0 1px color-mix(in srgb, var(--accent-strong) 60%, transparent);
+    }
+  }
+
+  .oc-btn-secondary-craft {
+    background-image: linear-gradient(
+      180deg,
+      var(--surface) 0%,
+      color-mix(in srgb, var(--fg) 2.2%, var(--surface)) 100%
+    );
+    border: 1px solid color-mix(in srgb, var(--fg) 13%, transparent);
+    box-shadow:
+      0 1px 1.5px color-mix(in srgb, var(--fg) 5.5%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.88);
+  }
+  @media (hover: hover) {
+    .oc-btn-secondary-craft:hover:not(:disabled) {
+      border-color: color-mix(in srgb, var(--fg) 21%, transparent);
+      background-image: linear-gradient(
+        180deg,
+        var(--surface) 0%,
+        color-mix(in srgb, var(--fg) 4%, var(--surface)) 100%
+      );
+      box-shadow:
+        0 1.5px 3px color-mix(in srgb, var(--fg) 8%, transparent),
+        inset 0 1px 0 rgba(255, 255, 255, 0.92);
+    }
+  }
+  .dark .oc-btn-secondary-craft {
+    background-image: linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--fg) 5%, var(--elevated)) 0%,
+      var(--elevated) 100%
+    );
+    border-color: color-mix(in srgb, var(--fg) 14%, transparent);
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.36),
+      inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  }
+  @media (hover: hover) {
+    .dark .oc-btn-secondary-craft:hover:not(:disabled) {
+      border-color: color-mix(in srgb, var(--fg) 22%, transparent);
+      background-image: linear-gradient(
+        180deg,
+        color-mix(in srgb, var(--fg) 9%, var(--elevated)) 0%,
+        color-mix(in srgb, var(--fg) 4%, var(--elevated)) 100%
+      );
+      box-shadow:
+        0 2px 5px rgba(0, 0, 0, 0.45),
+        inset 0 1px 0 rgba(255, 255, 255, 0.12);
+    }
+  }
+
+  .oc-btn-danger-craft {
+    background-image: linear-gradient(
+      180deg,
+      color-mix(in srgb, #ffffff 10%, var(--danger)) 0%,
+      var(--danger) 100%
+    );
+    box-shadow:
+      0 1px 2px color-mix(in srgb, var(--danger) 30%, transparent),
+      0 3px 10px -2px color-mix(in srgb, var(--danger) 24%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.22);
+  }
+  @media (hover: hover) {
+    .oc-btn-danger-craft:hover:not(:disabled) {
+      filter: brightness(1.06);
+      box-shadow:
+        0 2px 5px color-mix(in srgb, var(--danger) 34%, transparent),
+        0 6px 16px -3px color-mix(in srgb, var(--danger) 28%, transparent),
+        inset 0 1px 0 rgba(255, 255, 255, 0.26);
+    }
+  }
+
+  /* 9. 高级悬浮提示框：高对比浮面 + 发丝内高光 + 弹簧入场 */
+  .oc-tooltip-card {
+    background-image: linear-gradient(
+      180deg,
+      color-mix(in srgb, #ffffff 8%, var(--primary)) 0%,
+      var(--primary) 100%
+    );
+    background-color: var(--primary);
+    color: var(--primary-fg);
+    border: 1px solid color-mix(in srgb, var(--primary-fg) 10%, transparent);
+    box-shadow:
+      0 4px 14px color-mix(in srgb, var(--fg) 18%, transparent),
+      0 1px 3px color-mix(in srgb, var(--fg) 12%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.14);
+  }
+  .dark .oc-tooltip-card {
+    background-image: linear-gradient(
+      180deg,
+      #ffffff 0%,
+      var(--primary) 100%
+    );
+    border-color: rgba(255, 255, 255, 0.4);
+    box-shadow:
+      0 6px 20px rgba(0, 0, 0, 0.52),
+      0 1px 3px rgba(0, 0, 0, 0.36),
+      inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  }
+
+  /* 10. 编辑风提示/通知卡基底：细腻边框 + 轻柔层次底衬 + 语义左装饰线 */
+  .oc-callout {
+    position: relative;
+    background-color: var(--surface);
+    border: 1px solid color-mix(in srgb, var(--fg) 10%, transparent);
+    box-shadow:
+      inset 3px 0 0 color-mix(in srgb, var(--fg) 26%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.72),
+      0 1px 2px color-mix(in srgb, var(--fg) 3.5%, transparent);
+  }
+  .dark .oc-callout {
+    box-shadow:
+      inset 3px 0 0 color-mix(in srgb, var(--fg) 30%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.06),
+      0 2px 6px rgba(0, 0, 0, 0.28);
+  }
+  .oc-callout-info {
+    background-color: color-mix(in srgb, var(--info) 6%, var(--surface));
+    border-color: color-mix(in srgb, var(--info) 24%, transparent);
+    box-shadow:
+      inset 3px 0 0 var(--info),
+      inset 0 1px 0 rgba(255, 255, 255, 0.65),
+      0 1px 2px color-mix(in srgb, var(--info) 6%, transparent);
+  }
+  .dark .oc-callout-info {
+    background-color: color-mix(in srgb, var(--info) 9%, var(--surface));
+    border-color: color-mix(in srgb, var(--info) 28%, transparent);
+    box-shadow:
+      inset 3px 0 0 var(--info),
+      inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  }
+  .oc-callout-success {
+    background-color: color-mix(in srgb, var(--success) 6%, var(--surface));
+    border-color: color-mix(in srgb, var(--success) 24%, transparent);
+    box-shadow:
+      inset 3px 0 0 var(--success),
+      inset 0 1px 0 rgba(255, 255, 255, 0.65),
+      0 1px 2px color-mix(in srgb, var(--success) 6%, transparent);
+  }
+  .dark .oc-callout-success {
+    background-color: color-mix(in srgb, var(--success) 9%, var(--surface));
+    border-color: color-mix(in srgb, var(--success) 28%, transparent);
+    box-shadow:
+      inset 3px 0 0 var(--success),
+      inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  }
+  .oc-callout-warning {
+    background-color: color-mix(in srgb, var(--warning) 6.5%, var(--surface));
+    border-color: color-mix(in srgb, var(--warning) 26%, transparent);
+    box-shadow:
+      inset 3px 0 0 var(--warning),
+      inset 0 1px 0 rgba(255, 255, 255, 0.65),
+      0 1px 2px color-mix(in srgb, var(--warning) 6%, transparent);
+  }
+  .dark .oc-callout-warning {
+    background-color: color-mix(in srgb, var(--warning) 9.5%, var(--surface));
+    border-color: color-mix(in srgb, var(--warning) 30%, transparent);
+    box-shadow:
+      inset 3px 0 0 var(--warning),
+      inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  }
+  .oc-callout-danger {
+    background-color: color-mix(in srgb, var(--danger) 6%, var(--surface));
+    border-color: color-mix(in srgb, var(--danger) 26%, transparent);
+    box-shadow:
+      inset 3px 0 0 var(--danger),
+      inset 0 1px 0 rgba(255, 255, 255, 0.65),
+      0 1px 2px color-mix(in srgb, var(--danger) 6%, transparent);
+  }
+  .dark .oc-callout-danger {
+    background-color: color-mix(in srgb, var(--danger) 10%, var(--surface));
+    border-color: color-mix(in srgb, var(--danger) 30%, transparent);
+    box-shadow:
+      inset 3px 0 0 var(--danger),
+      inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  }
+
+  /* 11. 悬浮输入坞质感：双层景深 + 顶部发丝高光 + focus-within 柔暖陶土光晕 */
+  .oc-composer-dock {
+    background-color: var(--surface);
+    border: 1px solid color-mix(in srgb, var(--fg) 11%, transparent);
+    box-shadow:
+      0 2px 6px color-mix(in srgb, var(--fg) 4.5%, transparent),
+      0 12px 32px -10px color-mix(in srgb, var(--fg) 9%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.88);
+    transition:
+      border-color 180ms var(--ease-standard),
+      box-shadow 220ms var(--ease-standard),
+      background-color 160ms var(--ease-standard);
+  }
+  .oc-composer-dock:focus-within {
+    border-color: color-mix(in srgb, var(--accent) 46%, var(--border-strong));
+    box-shadow:
+      0 0 0 3px color-mix(in srgb, var(--accent) 13%, transparent),
+      0 4px 16px -4px color-mix(in srgb, var(--accent) 14%, transparent),
+      0 14px 36px -10px color-mix(in srgb, var(--fg) 10%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.92);
+  }
+  .dark .oc-composer-dock {
+    background-color: color-mix(in srgb, var(--elevated) 88%, var(--surface));
+    border-color: color-mix(in srgb, var(--fg) 12%, transparent);
+    box-shadow:
+      0 4px 12px rgba(0, 0, 0, 0.42),
+      0 16px 40px -10px rgba(0, 0, 0, 0.58),
+      inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  }
+  .dark .oc-composer-dock:focus-within {
+    border-color: color-mix(in srgb, var(--accent) 52%, var(--border-strong));
+    box-shadow:
+      0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent),
+      0 6px 20px -4px color-mix(in srgb, var(--accent) 16%, transparent),
+      0 18px 44px -10px rgba(0, 0, 0, 0.65),
+      inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  }
+
+  /* 12. IDE 级代码块外壳：精致边框 + 微凹顶栏 + 圆角裁切 + 柔和投影 */
+  .oc-code-shell {
+    background-color: var(--code);
+    border: 1px solid color-mix(in srgb, var(--fg) 9.5%, transparent);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    box-shadow:
+      0 1px 2px color-mix(in srgb, var(--fg) 4%, transparent),
+      0 4px 14px -6px color-mix(in srgb, var(--fg) 6%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.6);
+  }
+  .dark .oc-code-shell {
+    border-color: color-mix(in srgb, var(--fg) 10%, transparent);
+    box-shadow:
+      0 2px 6px rgba(0, 0, 0, 0.36),
+      0 8px 24px -8px rgba(0, 0, 0, 0.5),
+      inset 0 1px 0 rgba(255, 255, 255, 0.055);
+  }
+  .oc-code-shell-header {
+    background-color: color-mix(in srgb, var(--fg) 3.5%, var(--code));
+    border-bottom: 1px solid color-mix(in srgb, var(--fg) 8%, transparent);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45);
+  }
+  .dark .oc-code-shell-header {
+    background-color: color-mix(in srgb, var(--fg) 4.5%, var(--code));
+    border-bottom-color: color-mix(in srgb, var(--fg) 9%, transparent);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.045);
+  }
+
+  /* ── 基础原语质感辅类 (components/ui/** 共享) ── */
+
+  /* 表单控件触感底面 */
+  .oc-field-control {
+    background-color: var(--surface);
+    box-shadow:
+      inset 0 1px 2px color-mix(in srgb, var(--fg) 4.5%, transparent),
+      0 1px 0 rgba(255, 255, 255, 0.65);
+    transition:
+      border-color 150ms var(--ease-standard),
+      box-shadow 180ms var(--ease-standard),
+      background-color 150ms var(--ease-standard);
+  }
+  .oc-field-control:focus {
+    border-color: var(--accent);
+    box-shadow:
+      0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent),
+      inset 0 1px 1px color-mix(in srgb, var(--fg) 3%, transparent);
+  }
+  .oc-field-control[aria-invalid="true"] {
+    border-color: var(--danger);
+  }
+  .oc-field-control[aria-invalid="true"]:focus {
+    border-color: var(--danger);
+    box-shadow:
+      0 0 0 3px color-mix(in srgb, var(--danger) 15%, transparent),
+      inset 0 1px 1px color-mix(in srgb, var(--fg) 3%, transparent);
+  }
+  .dark .oc-field-control {
+    background-color: color-mix(in srgb, var(--bg) 42%, var(--surface));
+    box-shadow:
+      inset 0 1px 2.5px rgba(0, 0, 0, 0.4),
+      0 1px 0 rgba(255, 255, 255, 0.04);
+  }
+  .dark .oc-field-control:focus {
+    background-color: color-mix(in srgb, var(--bg) 28%, var(--surface));
+    box-shadow:
+      0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent),
+      inset 0 1px 2px rgba(0, 0, 0, 0.3);
+  }
+
+  /* 发丝内描边胶囊徽章 */
+  .oc-badge-craft {
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, currentColor 18%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.35);
+  }
+  .dark .oc-badge-craft {
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, currentColor 24%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  }
+
+  /* 浮起白/亮卡分段滑块 */
+  .oc-segmented-thumb {
+    background-color: var(--surface);
+    box-shadow:
+      0 1px 2px color-mix(in srgb, var(--fg) 9%, transparent),
+      0 2px 6px -1px color-mix(in srgb, var(--fg) 6%, transparent),
+      inset 0 0 0 1px color-mix(in srgb, var(--fg) 7%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.88);
+  }
+  .dark .oc-segmented-thumb {
+    background-color: var(--elevated);
+    box-shadow:
+      0 1px 3px rgba(0, 0, 0, 0.45),
+      inset 0 0 0 1px color-mix(in srgb, var(--fg) 12%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.09);
+  }
+
+  /* 精雕开关滑块阴影 */
+  .oc-switch-thumb {
+    box-shadow:
+      0 1px 2.5px rgba(0, 0, 0, 0.24),
+      0 0 0 0.5px rgba(0, 0, 0, 0.06),
+      inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  }
+
+  /* 进度条光泽填充 */
+  .oc-progress-fill {
+    background-image: linear-gradient(
+      180deg,
+      rgba(255, 255, 255, 0.22) 0%,
+      transparent 55%,
+      rgba(0, 0, 0, 0.08) 100%
+    );
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  }
+
+  /* Toast 精致层叠卡 */
+  .oc-toast-card {
+    box-shadow:
+      var(--shadow-pop),
+      inset 0 1px 0 rgba(255, 255, 255, 0.72);
+  }
+  .dark .oc-toast-card {
+    box-shadow:
+      var(--shadow-pop),
+      inset 0 1px 0 rgba(255, 255, 255, 0.09);
+  }
+
+  /* 精雕开关轨道微凹槽 */
+  .oc-switch-track {
+    box-shadow: inset 0 1px 2px color-mix(in srgb, var(--fg) 14%, transparent);
+  }
+  .oc-switch-track[data-state="checked"] {
+    box-shadow:
+      inset 0 1px 2px rgba(0, 0, 0, 0.16),
+      0 0 0 1px color-mix(in srgb, var(--accent) 24%, transparent);
+  }
+
+  /* 精雕复选框触感盒 */
+  .oc-checkbox-box {
+    box-shadow:
+      inset 0 1px 1.5px color-mix(in srgb, var(--fg) 6%, transparent),
+      0 1px 0 rgba(255, 255, 255, 0.7);
+  }
+  .dark .oc-checkbox-box {
+    box-shadow:
+      inset 0 1px 2px rgba(0, 0, 0, 0.35),
+      0 1px 0 rgba(255, 255, 255, 0.05);
+  }
+  .oc-checkbox-box:checked,
+  .oc-checkbox-box:indeterminate {
+    box-shadow:
+      0 1px 2px color-mix(in srgb, var(--accent) 32%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.24);
+  }
+
+  /* 头像微内描边光泽 */
+  .oc-avatar-ring {
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--fg) 10%, transparent),
+      0 1px 2px color-mix(in srgb, var(--fg) 6%, transparent);
+  }
+  .dark .oc-avatar-ring {
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 255, 255, 0.12),
+      0 1px 3px rgba(0, 0, 0, 0.36);
+  }
+
+  /* 悬停微弹性图标按钮 */
+  .oc-icon-btn-tactile {
+    transition:
+      transform 140ms var(--ease-spring),
+      background-color 150ms var(--ease-standard),
+      border-color 150ms var(--ease-standard),
+      color 150ms var(--ease-standard),
+      box-shadow 160ms var(--ease-standard);
+  }
+  .oc-icon-btn-tactile:active:not(:disabled) {
+    transform: scale(0.93);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .oc-surface-card-hover:hover,
+    .oc-surface-card-hover:active,
+    .oc-btn-tactile:active:not(:disabled):not([aria-disabled="true"]),
+    .oc-icon-btn-tactile:active:not(:disabled) {
+      transform: none;
+    }
   }
 }
 
@@ -746,46 +1470,94 @@ body {
   }
 }
 
-/* ── Markdown prose (assistant body) ── */
-.prose { font-size: 15.5px; line-height: 1.7; color: var(--fg); word-break: break-word; }
+/* ── Markdown prose (assistant body) — Clarvy Atelier Editorial Typography ── */
+.prose { font-size: 15.5px; line-height: 1.72; color: var(--fg); word-break: break-word; }
 .prose > :first-child { margin-top: 0; }
 .prose > :last-child { margin-bottom: 0; }
-.prose p { margin: 0 0 12px; }
-.prose ul, .prose ol { margin: 0 0 12px; padding-left: 24px; }
+.prose p { margin: 0 0 13px; }
+.prose ul, .prose ol { margin: 0 0 13px; padding-left: 24px; }
 .prose ul { list-style: disc; }
 .prose ol { list-style: decimal; }
-.prose li { margin: 4px 0; }
-.prose li::marker { color: var(--faint); }
+.prose li { margin: 4.5px 0; }
+.prose li::marker { color: color-mix(in srgb, var(--accent) 55%, var(--faint)); }
 /* 标题:上距大于下距,让标题贴住它统领的段落;h1/h2 收紧字距,读起来更"排过版"。 */
-.prose h1, .prose h2, .prose h3, .prose h4 { font-weight: 650; line-height: 1.35; margin: 28px 0 10px; letter-spacing: -0.012em; }
-.prose h1 { font-size: 1.45em; letter-spacing: -0.02em; }
-.prose h2 { font-size: 1.24em; letter-spacing: -0.016em; }
-.prose h3 { font-size: 1.1em; }
+.prose h1, .prose h2, .prose h3, .prose h4 { font-weight: 650; line-height: 1.32; margin: 28px 0 10px; letter-spacing: -0.015em; color: var(--fg); }
+.prose h1 { font-size: 1.45em; letter-spacing: -0.024em; }
+.prose h2 { font-size: 1.24em; letter-spacing: -0.018em; padding-bottom: 6px; border-bottom: 1px solid color-mix(in srgb, var(--fg) 7%, transparent); }
+.prose h3 { font-size: 1.1em; letter-spacing: -0.012em; }
 .prose h4 { font-size: 1em; }
-.prose a { color: var(--accent); text-decoration: none; border-bottom: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); transition: border-color 0.15s; }
-.prose a:hover { border-bottom-color: var(--accent); }
+.prose a {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 36%, transparent);
+  border-radius: 2px 2px 0 0;
+  transition: border-color 150ms var(--ease-standard), background-color 150ms var(--ease-standard), color 150ms var(--ease-standard);
+}
+.prose a:hover {
+  border-bottom-color: var(--accent);
+  background-color: color-mix(in srgb, var(--accent) 8%, transparent);
+}
 .prose strong { font-weight: 650; }
-/* 引用:细竖线 + 正文色降一档,不再是 3px 灰柱。 */
-.prose blockquote { margin: 0 0 16px; padding: 1px 0 1px 14px; border-left: 2px solid color-mix(in srgb, var(--fg) 18%, transparent); color: var(--muted); }
+/* 引用:编辑风暖陶土细竖线 + 轻柔暖纸底衬,更有呼吸感与层次。 */
+.prose blockquote {
+  margin: 0 0 16px;
+  padding: 9px 14px 9px 15px;
+  border-left: 2.5px solid color-mix(in srgb, var(--accent) 55%, var(--border-strong));
+  border-radius: 0 10px 10px 0;
+  background: color-mix(in srgb, var(--fg) 2.5%, transparent);
+  color: var(--muted);
+}
 .prose blockquote > :last-child { margin-bottom: 0; }
-.prose hr { border: none; border-top: 1px solid var(--border); margin: 28px 0; }
-/* 表格:外圈一道圆角细框 + 只留横向分隔线(去掉满格竖线),表头小一号、降为 muted,
+.prose hr {
+  border: none;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--border-strong) 18%, var(--border-strong) 82%, transparent);
+  margin: 28px 0;
+}
+/* 表格:外圈精雕圆角细框 + 柔影 + 只留横向分隔线 + 悬停微暖底,表头小一号、降为 muted,
    数字等宽对齐。整表仍在 .markdown-table-region 内横滑(不撑宽时间线)。 */
 .prose .markdown-table-wrap { margin: 4px 0 18px; }
 .prose .markdown-table-hint { margin: 0 0 6px; font-size: 11px; color: var(--faint); }
-.prose .markdown-table-region { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); outline: none; }
+.prose .markdown-table-region {
+  overflow-x: auto;
+  border: 1px solid color-mix(in srgb, var(--fg) 10%, transparent);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow:
+    0 1px 2px color-mix(in srgb, var(--fg) 4%, transparent),
+    0 4px 12px -4px color-mix(in srgb, var(--fg) 5%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.72);
+  outline: none;
+}
+.dark .prose .markdown-table-region {
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.36),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
 .prose .markdown-table-region:focus-visible { box-shadow: 0 0 0 2px var(--ring); }
 .prose table { width: 100%; border-collapse: separate; border-spacing: 0; margin: 0; font-size: 14.5px; font-variant-numeric: tabular-nums; }
 .prose th, .prose td { border: 0; border-bottom: 1px solid var(--border); padding: 9px 14px; text-align: left; vertical-align: top; }
+.prose tbody tr { transition: background-color 130ms var(--ease-standard); }
+@media (hover: hover) {
+  .prose tbody tr:hover > td { background: color-mix(in srgb, var(--fg) 2.6%, transparent); }
+}
 .prose tr:last-child > td { border-bottom: 0; }
-.prose th { background: color-mix(in srgb, var(--fg) 2.5%, transparent); font-size: 13px; font-weight: 600; color: var(--muted); }
+.prose th {
+  background: color-mix(in srgb, var(--fg) 3.2%, var(--surface));
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--muted);
+}
 .prose :not(pre) > code {
   font-family: var(--font-mono);
-  font-size: 0.86em;
-  background: color-mix(in srgb, var(--fg) 6%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fg) 5%, transparent);
-  padding: 0.12em 0.38em;
-  border-radius: 5px;
+  font-size: 0.855em;
+  background: color-mix(in srgb, var(--fg) 5.5%, var(--surface));
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--fg) 8.5%, transparent),
+    0 1px 0 color-mix(in srgb, var(--fg) 3%, transparent);
+  padding: 0.14em 0.42em;
+  border-radius: 6px;
   white-space: break-spaces;
 }
 .prose pre { margin: 0 0 16px; }

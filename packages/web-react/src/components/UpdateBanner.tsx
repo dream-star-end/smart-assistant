@@ -19,13 +19,23 @@ export function UpdateBanner() {
     <div className="mx-auto mb-2 max-w-3xl px-4">
       <Alert
         tone="info"
-        icon={<RefreshCw size={16} />}
+        className="oc-callout shadow-soft"
+        icon={
+          <span className="oc-icon-badge oc-icon-badge-info flex size-6 items-center justify-center rounded-md">
+            <RefreshCw size={13} strokeWidth={1.75} />
+          </span>
+        }
         action={
           <>
-            <Button size="sm" variant="ghost" onClick={() => appUpdate.dismissBanner()}>
+            <Button size="sm" variant="ghost" className="oc-btn-tactile" onClick={() => appUpdate.dismissBanner()}>
               稍后
             </Button>
-            <Button size="sm" variant="link" onClick={() => appUpdate.reloadNow()}>
+            <Button
+              size="sm"
+              variant="secondary"
+              className="oc-btn-tactile oc-btn-secondary-craft text-accent"
+              onClick={() => appUpdate.reloadNow()}
+            >
               立即刷新
             </Button>
           </>

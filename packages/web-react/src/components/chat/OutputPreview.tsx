@@ -94,14 +94,16 @@ function PreviewSkeleton() {
 
 function Notice({ text, onRetry }: { text: string; onRetry?: () => void }) {
   return (
-    <div className="flex flex-col items-center gap-2 px-6 py-12 text-center text-meta text-muted" data-testid="output-preview-notice">
-      <AlertCircle size={18} className="text-faint" aria-hidden />
-      <p>{text}</p>
+    <div className="flex flex-col items-center gap-3 px-6 py-12 text-center text-meta text-muted" data-testid="output-preview-notice">
+      <span className="oc-icon-badge flex size-10 items-center justify-center rounded-xl text-faint" aria-hidden>
+        <AlertCircle size={18} strokeWidth={1.75} />
+      </span>
+      <p className="max-w-sm leading-relaxed">{text}</p>
       {onRetry && (
         <button
           type="button"
           onClick={onRetry}
-          className="inline-flex items-center gap-1 rounded-full px-3 py-1 text-accent outline-none hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring"
+          className="oc-btn-tactile oc-btn-secondary-craft inline-flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-caption font-medium text-accent outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           <RotateCw size={12} aria-hidden />
           继续
@@ -240,10 +242,10 @@ export function MediaPreview({ src, kind, name }: { src: string; kind: "image" |
   }
   return (
     <div
-      className="flex justify-center bg-hover/40 p-4 [&_img]:max-h-[64vh] [&_img]:rounded-md [&_img]:object-contain"
+      className="oc-surface-recessed flex justify-center p-4 [&_img]:max-h-[64vh] [&_img]:rounded-lg [&_img]:object-contain [&_img]:shadow-soft"
       data-testid="output-preview-image"
     >
-      <SignedImg src={src} alt={name} className="max-h-[64vh] w-auto rounded-md object-contain" />
+      <SignedImg src={src} alt={name} className="max-h-[64vh] w-auto rounded-lg object-contain shadow-soft" />
     </div>
   );
 }

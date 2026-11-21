@@ -38,10 +38,10 @@ export function Pagination({
 
   return (
     <div className={cn("flex items-center justify-between gap-3 px-1 py-2", className)}>
-      <p className="text-meta text-faint tabular-nums">
+      <p className="text-meta font-medium text-faint tabular-nums">
         {total !== undefined ? `${from}–${to} / 共 ${total}` : `${from}–${to}`}
       </p>
-      <div className="flex items-center gap-1">
+      <div className="oc-surface-recessed inline-flex items-center gap-0.5 rounded-lg p-0.5">
         <IconButton
           size="sm"
           shape="square"
@@ -49,6 +49,7 @@ export function Pagination({
           onClick={() => onChange(Math.max(0, offset - limit))}
           title="上一页"
           aria-label="上一页"
+          className="hover:bg-surface hover:shadow-soft"
         >
           <ChevronLeft size={16} />
         </IconButton>
@@ -59,6 +60,7 @@ export function Pagination({
           onClick={() => onChange(offset + limit)}
           title="下一页"
           aria-label="下一页"
+          className="hover:bg-surface hover:shadow-soft"
         >
           <ChevronRight size={16} />
         </IconButton>

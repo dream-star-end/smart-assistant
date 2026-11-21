@@ -184,7 +184,7 @@ export function GeneratingPlaceholderCard({
           className={cn(
             // 深色底：粒子发光基面（贴 image viewer 黑底质感，明暗主题一致）。
             // 色值收编为 styles.css 的 .gen-placeholder-canvas 单一权威。
-            "relative overflow-hidden rounded-lg border gen-placeholder-canvas",
+            "relative overflow-hidden rounded-xl border shadow-soft gen-placeholder-canvas",
             failed ? "border-danger/60" : "border-border",
           )}
           style={{
@@ -206,29 +206,31 @@ export function GeneratingPlaceholderCard({
             <div className="absolute inset-0 animate-pulse gen-placeholder-pulse" aria-hidden="true" />
           )}
 
-          {/* 失败态：danger 图标 + 原因 + 可选重试。 */}
+          {/* 失败态：danger 图标徽章 + 原因 + 可选重试。 */}
           {failed && (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-4 text-center">
-              <TriangleAlert size={22} className="text-danger" aria-hidden="true" />
-              <div className="text-body font-medium text-danger">图片生成失败</div>
+              <span className="oc-icon-badge oc-icon-badge-danger flex size-9 items-center justify-center rounded-xl">
+                <TriangleAlert size={18} strokeWidth={1.75} aria-hidden="true" />
+              </span>
+              <div className="text-body font-semibold text-danger">图片生成失败</div>
               {reason && <div className="max-w-full truncate text-caption text-muted">{reason}</div>}
               {onRetry && (
                 <button
                   type="button"
                   onClick={onRetry}
-                  className="mt-1 inline-flex items-center gap-1 rounded-full bg-hover px-2.5 py-1 text-caption text-fg hover:opacity-90"
+                  className="oc-btn-tactile oc-btn-secondary-craft mt-1 inline-flex items-center gap-1.5 rounded-full border border-border bg-surface px-3 py-1 text-caption font-medium text-fg hover:border-border-strong"
                 >
-                  <RotateCcw size={12} /> 继续
+                  <RotateCcw size={12} strokeWidth={1.75} /> 继续
                 </button>
               )}
             </div>
           )}
 
-          {/* 生成中角标（左下小字胶囊）。 */}
+          {/* 生成中角标（左下轻磨砂胶囊）。 */}
           {badge && (
-            <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center gap-1.5 p-2">
-              <span className="inline-flex items-center gap-1.5 rounded-full bg-black/45 px-2 py-1 text-caption font-medium text-white/90 backdrop-blur-sm">
-                <ImageIcon size={12} className="opacity-80" aria-hidden="true" />
+            <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center gap-1.5 p-2.5">
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-black/50 px-2.5 py-1 text-caption font-medium text-white/95 backdrop-blur-md">
+                <ImageIcon size={12} strokeWidth={1.75} className="opacity-85" aria-hidden="true" />
                 {badge}
               </span>
             </div>

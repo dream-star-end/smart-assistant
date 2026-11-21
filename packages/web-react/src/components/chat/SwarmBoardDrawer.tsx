@@ -318,12 +318,12 @@ function PostRow({
       ref={(el) => setRowRef(post.seq, el)}
       data-swarm-post-seq={post.seq}
       className={cn(
-        "group rounded-2xl border px-3.5 py-3 transition-all duration-200",
+        "oc-surface-card group rounded-2xl px-3.5 py-3 transition-all duration-200",
         highlighted
           ? "border-accent bg-accent-soft/40 ring-2 ring-accent/30"
           : isDoneMarker
-            ? "border-success/35 bg-success-soft/25"
-            : "border-border/80 bg-surface hover:border-border-strong",
+            ? "oc-callout oc-callout-success"
+            : "hover:border-border-strong",
       )}
     >
       <div className="mb-2 flex flex-wrap items-center gap-2">
@@ -561,8 +561,8 @@ export function SwarmBoardDrawer({
           data-testid="swarm-board-drawer"
           aria-describedby={undefined}
           className={cn(
-            "fixed left-1/2 top-1/2 z-50 flex -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden data-[state=open]:animate-in",
-            "h-[min(90dvh,calc(var(--oc-visual-height,100dvh)-1rem))] w-[calc(100vw-1rem)] max-w-5xl rounded-xl border border-border bg-elevated pb-[env(safe-area-inset-bottom)] text-fg shadow-float outline-none sm:h-[min(84dvh,calc(var(--oc-visual-height,100dvh)-2rem))] sm:w-[calc(100vw-2.5rem)]",
+            "oc-surface-popover fixed left-1/2 top-1/2 z-50 flex -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden data-[state=open]:animate-in",
+            "h-[min(90dvh,calc(var(--oc-visual-height,100dvh)-1rem))] w-[calc(100vw-1rem)] max-w-5xl rounded-2xl pb-[env(safe-area-inset-bottom)] text-fg outline-none sm:h-[min(84dvh,calc(var(--oc-visual-height,100dvh)-2rem))] sm:w-[calc(100vw-2.5rem)]",
           )}
         >
           {/* Top accent ribbon */}
@@ -613,14 +613,14 @@ export function SwarmBoardDrawer({
             {/* Search & Controls */}
             <div className="flex w-full items-center gap-1.5 sm:w-auto">
               <div className="relative flex-1 sm:w-52">
-                <Search size={13} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" />
+                <Search size={13} strokeWidth={1.75} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" />
                 <input
                   type="search"
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
                   placeholder="搜索讨论、@成员或 #序号"
                   aria-label="搜索蜂群讨论"
-                  className="h-8 w-full rounded-lg border border-border-control/60 bg-bg pl-8 pr-2.5 text-base text-fg outline-none transition-colors placeholder:text-faint focus:border-accent md:text-meta"
+                  className="oc-field-control h-8 w-full rounded-lg border border-border-control/60 pl-8 pr-2.5 text-base text-fg outline-none transition-colors placeholder:text-faint focus:border-accent focus-visible:ring-2 focus-visible:ring-ring md:text-meta"
                 />
               </div>
               <Button
@@ -629,21 +629,21 @@ export function SwarmBoardDrawer({
                 size="sm"
                 onClick={() => setFollowLatest((v) => !v)}
                 className={cn(
-                  "h-8 shrink-0 gap-1 px-2 text-caption",
-                  followLatest && "text-accent",
+                  "oc-btn-tactile h-8 shrink-0 gap-1 px-2 text-caption",
+                  followLatest && "oc-btn-secondary-craft text-accent",
                 )}
                 title="自动滚动到最新讨论"
               >
-                <ArrowDown size={12} />
+                <ArrowDown size={12} strokeWidth={1.75} />
                 <span className="hidden md:inline">跟随</span>
               </Button>
               <IconButton
                 onClick={() => onOpenChange(false)}
                 aria-label="关闭蜂群看板"
                 shape="square"
-                className="size-8 shrink-0"
+                className="oc-btn-tactile size-8 shrink-0"
               >
-                <X size={16} />
+                <X size={16} strokeWidth={1.75} />
               </IconButton>
             </div>
           </div>
@@ -685,26 +685,26 @@ export function SwarmBoardDrawer({
             </div>
 
             {/* Mobile Roster / Board tab switcher */}
-            <div className="flex shrink-0 items-center rounded-lg border border-border bg-bg p-0.5 md:hidden">
+            <div className="oc-surface-recessed flex shrink-0 items-center rounded-lg border border-border p-0.5 md:hidden">
               <button
                 type="button"
                 onClick={() => setMobileTab("board")}
                 className={cn(
-                  "flex items-center gap-1 rounded-md px-2.5 py-1 text-caption font-medium [@media(hover:none)]:min-h-11",
-                  mobileTab === "board" ? "bg-surface text-fg shadow-soft" : "text-muted",
+                  "flex items-center gap-1 rounded-md px-2.5 py-1 text-caption font-medium transition-all [@media(hover:none)]:min-h-11",
+                  mobileTab === "board" ? "oc-segmented-thumb text-fg" : "text-muted",
                 )}
               >
-                <MessageSquare size={11} /> 讨论 ({filteredPosts.length})
+                <MessageSquare size={11} strokeWidth={1.75} /> 讨论 ({filteredPosts.length})
               </button>
               <button
                 type="button"
                 onClick={() => setMobileTab("roster")}
                 className={cn(
-                  "flex items-center gap-1 rounded-md px-2.5 py-1 text-caption font-medium [@media(hover:none)]:min-h-11",
-                  mobileTab === "roster" ? "bg-surface text-fg shadow-soft" : "text-muted",
+                  "flex items-center gap-1 rounded-md px-2.5 py-1 text-caption font-medium transition-all [@media(hover:none)]:min-h-11",
+                  mobileTab === "roster" ? "oc-segmented-thumb text-fg" : "text-muted",
                 )}
               >
-                <Users size={11} /> 成员 ({snapshot.members.length})
+                <Users size={11} strokeWidth={1.75} /> 成员 ({snapshot.members.length})
               </button>
             </div>
           </div>
@@ -876,9 +876,16 @@ export function SwarmBoardDrawer({
               </div>
 
               {/* Subtle keyboard legend footer */}
-              <div className="hidden items-center justify-between border-t border-border/70 bg-surface/50 px-4 py-1.5 text-micro text-faint sm:flex">
+              <div className="hidden items-center justify-between border-t border-border/70 bg-surface/60 px-4 py-2 text-micro text-faint sm:flex">
                 <span>点击 @成员 可聚焦协作流 · 点击 #序号 快速定位引用</span>
-                <span className="font-mono">[ / ] 上下条 · Esc 关闭</span>
+                <span className="inline-flex items-center gap-1.5">
+                  <kbd className="oc-kbd px-1 py-0 text-micro">[</kbd>
+                  <kbd className="oc-kbd px-1 py-0 text-micro">]</kbd>
+                  <span>上下条</span>
+                  <span aria-hidden="true">·</span>
+                  <kbd className="oc-kbd px-1 py-0 text-micro">Esc</kbd>
+                  <span>关闭</span>
+                </span>
               </div>
             </section>
           </div>

@@ -15,12 +15,12 @@ import { cn } from "../../lib/utils";
  * 在触屏上两套命中标准,而 Chip 恰恰是筛选行里最密集、最需要命中面积的那个。
  */
 export const chipVariants = cva(
-  "inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border font-medium outline-none transition-colors duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg disabled:cursor-not-allowed disabled:opacity-50 [@media(hover:none)]:min-h-11",
+  "oc-btn-tactile inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg disabled:cursor-not-allowed disabled:opacity-50 [@media(hover:none)]:min-h-11",
   {
     variants: {
       selected: {
-        true: "border-accent bg-accent-soft text-accent",
-        false: "border-border bg-surface text-muted hover:border-fg/30 hover:text-fg",
+        true: "oc-badge-craft border-accent/60 bg-accent-soft text-accent shadow-soft",
+        false: "oc-btn-secondary-craft bg-surface text-muted hover:text-fg",
       },
       size: {
         md: "px-2.5 py-1 text-meta",

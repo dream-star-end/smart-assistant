@@ -48,7 +48,8 @@ export function CopyChip({
         type="button"
         onClick={copy}
         className={cn(
-          "inline-flex max-w-full items-center gap-1.5 rounded-md bg-hover px-2 py-1 text-meta text-muted transition-colors hover:bg-active hover:text-fg",
+          "oc-surface-recessed oc-btn-tactile inline-flex max-w-full items-center gap-1.5 rounded-md px-2 py-1 text-meta text-muted hover:border-border-strong hover:text-fg",
+          copied && "border-success/35 bg-success-soft text-success",
           mono && "font-mono",
           "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg",
           "[@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3",
@@ -57,7 +58,7 @@ export function CopyChip({
       >
         <span className="truncate">{label ?? value}</span>
         {copied ? (
-          <Check size={13} className="shrink-0 text-success" />
+          <Check size={13} strokeWidth={2.25} className="shrink-0 text-success" />
         ) : (
           <Copy size={13} className="shrink-0 opacity-70" />
         )}

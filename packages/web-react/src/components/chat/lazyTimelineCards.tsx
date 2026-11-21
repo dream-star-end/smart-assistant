@@ -10,6 +10,10 @@
  */
 import { Component, lazy, Suspense, type ComponentProps, type ReactNode } from 'react'
 
+type AgentGroupModule = typeof import('./AgentGroupCard')
+type AgentGroupCardProps = ComponentProps<AgentGroupModule['AgentGroupCard']>
+type DelegateProcessListModule = typeof import('./delegateProcessList')
+type DelegateProcessListProps = ComponentProps<DelegateProcessListModule['DelegateProcessList']>
 type TeamPanelModule = typeof import('./TeamPanel')
 type TeamPanelProps = ComponentProps<TeamPanelModule['TeamPanel']>
 type GeneratingPlaceholderModule = typeof import('./GeneratingPlaceholderCard')
@@ -35,6 +39,12 @@ export type PermissionCardLoader = () => Promise<PermissionCardModule>
 
 const defaultPermissionCardLoader: PermissionCardLoader = () => import('./PermissionCard')
 let permissionCardLoader: PermissionCardLoader = defaultPermissionCardLoader
+
+let loadedAgentGroup: AgentGroupModule | null = null
+let pendingAgentGroup: Promise<AgentGroupModule> | null = null
+
+let loadedDelegateProcessList: DelegateProcessListModule | null = null
+let pendingDelegateProcessList: Promise<DelegateProcessListModule> | null = null
 
 let loadedTeam: TeamPanelModule | null = null
 let pendingTeam: Promise<TeamPanelModule> | null = null
@@ -95,6 +105,38 @@ export function _setPermissionCardLoaderForTest(loader?: PermissionCardLoader | 
   LazyPermissionPromptHost = makeLazyPermissionPromptHost()
 }
 
+export function preloadAgentGroupCard(): Promise<AgentGroupModule> {
+  if (!pendingAgentGroup) {
+    pendingAgentGroup = import('./AgentGroupCard').then(
+      (module) => {
+        loadedAgentGroup = module
+        return module
+      },
+      (error: unknown) => {
+        pendingAgentGroup = null
+        throw error
+      },
+    )
+  }
+  return pendingAgentGroup
+}
+
+export function preloadDelegateProcessList(): Promise<DelegateProcessListModule> {
+  if (!pendingDelegateProcessList) {
+    pendingDelegateProcessList = import('./delegateProcessList').then(
+      (module) => {
+        loadedDelegateProcessList = module
+        return module
+      },
+      (error: unknown) => {
+        pendingDelegateProcessList = null
+        throw error
+      },
+    )
+  }
+  return pendingDelegateProcessList
+}
+
 export function preloadTeamPanel(): Promise<TeamPanelModule> {
   if (!pendingTeam) {
     pendingTeam = import('./TeamPanel').then(
@@ -147,11 +189,46 @@ export function preloadPermissionCard(): Promise<PermissionCardModule> {
 
 export function preloadTimelineCards(): Promise<unknown> {
   return Promise.all([
+    preloadAgentGroupCard(),
+    preloadDelegateProcessList(),
     preloadTeamPanel(),
     preloadGeneratingPlaceholderCard(),
     preloadPermissionCard(),
   ])
 }
+
+/** 动态读取模块命名空间上的 AgentGroupCard，确保预热后 vi.spyOn(AgentGroupMod, 'AgentGroupCard') 仍能命中。 */
+function AgentGroupCardProxy(props: AgentGroupCardProps) {
+  const Comp = loadedAgentGroup!.AgentGroupCard
+  return <Comp {...props} />
+}
+
+const LazyAgentGroupCard = lazy(() => {
+  if (loadedAgentGroup) {
+    const sync = {
+      // biome-ignore lint/suspicious/noThenProperty: synchronous thenable for React.lazy once preloaded
+      then(resolve: (value: { default: typeof AgentGroupCardProxy }) => void) {
+        resolve({ default: AgentGroupCardProxy })
+      },
+    }
+    return sync as unknown as Promise<{ default: typeof AgentGroupCardProxy }>
+  }
+  return preloadAgentGroupCard().then(() => ({ default: AgentGroupCardProxy }))
+})
+
+const LazyDelegateProcessList = lazy(() => {
+  const ready = loadedDelegateProcessList
+  if (ready) {
+    const sync = {
+      // biome-ignore lint/suspicious/noThenProperty: synchronous thenable for React.lazy once preloaded
+      then(resolve: (value: { default: DelegateProcessListModule['DelegateProcessList'] }) => void) {
+        resolve({ default: ready.DelegateProcessList })
+      },
+    }
+    return sync as unknown as Promise<{ default: DelegateProcessListModule['DelegateProcessList'] }>
+  }
+  return preloadDelegateProcessList().then((module) => ({ default: module.DelegateProcessList }))
+})
 
 const LazyTeamPanel = lazy(() => {
   const ready = loadedTeam
@@ -251,6 +328,22 @@ if (typeof window !== 'undefined') {
     .requestIdleCallback
   if (idle) idle(prefetchWhenIdle)
   else window.setTimeout(prefetchWhenIdle, 1500)
+}
+
+export function AgentGroupCard(props: AgentGroupCardProps) {
+  return (
+    <Suspense fallback={<div className="py-1 text-caption text-faint">加载中…</div>}>
+      <LazyAgentGroupCard {...props} />
+    </Suspense>
+  )
+}
+
+export function DelegateProcessListLazy(props: DelegateProcessListProps) {
+  return (
+    <Suspense fallback={<div className="px-3.5 py-2 text-caption text-faint">加载中…</div>}>
+      <LazyDelegateProcessList {...props} />
+    </Suspense>
+  )
 }
 
 export function TeamPanel(props: TeamPanelProps) {

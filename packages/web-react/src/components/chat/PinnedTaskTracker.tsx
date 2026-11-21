@@ -184,7 +184,7 @@ export function PinnedTaskTracker({
 
   return (
     <div className="mx-auto mb-2 w-full max-w-3xl px-4">
-      <div className="overflow-hidden rounded-lg border border-border bg-elevated shadow-soft">
+      <div className="oc-surface-glass overflow-hidden rounded-xl shadow-soft">
         {/* 头部:进度 + 折叠态显示「正在执行的一条」+ 展开/折叠 chevron */}
         <button
           type="button"
@@ -192,14 +192,16 @@ export function PinnedTaskTracker({
           aria-expanded={expanded}
           aria-controls={expanded ? listId : undefined}
           className={cn(
-            "flex min-h-11 w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-hover",
+            "flex min-h-11 w-full items-center gap-2.5 px-3 py-2 text-left transition-colors hover:bg-hover/70",
             HUD_TOGGLE_CLS,
           )}
         >
-          <ListChecks className="size-4 shrink-0 text-accent" aria-hidden />
+          <span className="oc-icon-badge oc-icon-badge-accent flex size-6 shrink-0 items-center justify-center rounded-sm">
+            <ListChecks className="size-3.5" strokeWidth={1.75} aria-hidden />
+          </span>
           {/* 读屏补齐动作名(H-09);术语与 inline 工具卡(tool/meta.ts「任务列表」)一致(H-10)。 */}
           <span className="sr-only">{expanded ? "折叠任务列表" : "展开任务列表"}</span>
-          <span className="shrink-0 text-xs font-medium text-muted">
+          <span className="shrink-0 text-caption font-semibold tabular-nums text-muted">
             任务列表 {doneCount}/{total}
           </span>
           {!expanded && activeTodo && (
@@ -217,9 +219,9 @@ export function PinnedTaskTracker({
           {expanded && <span className="flex-1" />}
           <TokenUsageBadge usage={tokenUsage} />
           {expanded ? (
-            <ChevronDown className="size-4 shrink-0 text-faint" aria-hidden />
+            <ChevronDown className="size-4 shrink-0 text-faint" strokeWidth={1.75} aria-hidden />
           ) : (
-            <ChevronUp className="size-4 shrink-0 text-faint" aria-hidden />
+            <ChevronUp className="size-4 shrink-0 text-faint" strokeWidth={1.75} aria-hidden />
           )}
         </button>
         {/* 展开:全部任务 */}
