@@ -62,6 +62,7 @@ import {
 import { promptPrivacyFingerprint } from '../promptPrivacyPolicy.js'
 import type { IntelligentUiApplied } from '../promptSlots.js'
 import { isRemoteResourceCode, nodeMemoryError } from '../remoteNodeMemory.js'
+import { lookupRemoteSwarmMcpContext } from '../remoteSwarmRuntime.js'
 import { SubprocessRunner } from '../subprocessRunner.js'
 import { RemoteObservationGate } from './observationGate.js'
 import {
@@ -595,6 +596,7 @@ export class RemoteContainerLane {
   private catalog?: Cc5ToolCatalog
   private clientNameByRemoteName: Readonly<Record<string, string>> = {}
   private toolsInit?: Promise<Cc5ToolCatalog>
+  private appliedRemoteSwarmMcpKey?: string
 
   private stagedPromptPrivacy?: PromptPrivacyPolicy
   private appliedPromptPolicyFingerprint?: string
@@ -698,10 +700,10 @@ export class RemoteContainerLane {
 
   async recycleForConfigChange(): Promise<void> {
     this.configEpoch += 1
-    await this.recycleInternal()
+    await this.recycleInternal(false)
   }
 
-  private async recycleInternal(): Promise<void> {
+  private async recycleInternal(allowPreAdmitTurn = false): Promise<void> {
     this.promptRefreshRequired = true
     if (this.laneStopCompleted) {
       this.remoteAppStoppedProven = true
@@ -710,7 +712,10 @@ export class RemoteContainerLane {
       return
     }
     remotePoolNeed(!this.failure && this.stopRun === undefined, this.failure?.message ?? 'REMOTE_LANE_CLOSED')
-    remotePoolNeed(!this.activeTurn, 'REMOTE_CONFIG_RESTART_DURING_ACTIVE_TURN')
+    remotePoolNeed(
+      !this.activeTurn || (allowPreAdmitTurn && !this.activeTurn.dispatched),
+      'REMOTE_CONFIG_RESTART_DURING_ACTIVE_TURN',
+    )
     if (!this.remoteAdmissionAttempted) {
       this.remoteAppStoppedProven = true
       this.appliedPromptPolicyFingerprint = undefined
@@ -832,11 +837,31 @@ export class RemoteContainerLane {
     }
   }
 
+  private currentRemoteSwarmMcpKey(): string {
+    if (this.binding.authorityEngine !== 'antigravity') return ''
+    const ctx = lookupRemoteSwarmMcpContext(this.opts.sessionKey)
+    return ctx ? `${ctx.coordinatorSessionKey}:${ctx.memberName}:${ctx.callerToken}` : ''
+  }
+
+  private async resetToolsInternal(): Promise<void> {
+    await this.toolsInit?.catch(() => {})
+    this.toolsInit = undefined
+    await this.host?.close().catch(() => {})
+    this.host = undefined
+    this.cleanupContext?.()
+    this.cleanupContext = undefined
+    this.catalog = undefined
+    this.clientNameByRemoteName = {}
+    this.allowedAliases.clear()
+    this.appliedRemoteSwarmMcpKey = undefined
+  }
+
   private async ensureTools(
     supportsVision?: boolean,
     frozenPolicy?: PromptPrivacyPolicy,
   ): Promise<Cc5ToolCatalog> {
     return (this.toolsInit ??= (async () => {
+      const swarmMcpKeyAtBuild = this.currentRemoteSwarmMcpKey()
       privateDir(this.executionRoot)
       const lifecycleId = randomUUID()
       const root = join(this.executionRoot, `remotev4-${this.binding.driverId}-${lifecycleId}`)
@@ -870,15 +895,18 @@ export class RemoteContainerLane {
         const compiled = compileCc5ToolCatalog(await host.tools())
         this.catalog = compiled
         this.clientNameByRemoteName = compiled.clientNameByRemoteName
+        this.allowedAliases.clear()
         for (const remoteName of Object.keys(compiled.clientNameByRemoteName)) {
           this.allowedAliases.add(remoteName.slice('mcp__ocbridge__'.length))
         }
+        this.appliedRemoteSwarmMcpKey = swarmMcpKeyAtBuild
         return compiled
       } catch (err) {
         await this.host?.close().catch(() => {})
         this.host = undefined
         context.cleanup()
         this.cleanupContext = undefined
+        this.appliedRemoteSwarmMcpKey = undefined
         throw err
       }
     })().catch((err) => {
@@ -1040,12 +1068,20 @@ export class RemoteContainerLane {
       const policyChanged =
         frozenPolicy !== undefined && desiredFingerprint !== this.appliedPromptPolicyFingerprint
 
+      const desiredSwarmMcpKey = this.currentRemoteSwarmMcpKey()
+      const toolsRefreshRequired =
+        this.catalog !== undefined && desiredSwarmMcpKey !== this.appliedRemoteSwarmMcpKey
+
       if (
         this.remoteAdmissionAttempted &&
         !this.remoteAppStoppedProven &&
-        (this.promptRefreshRequired || policyChanged)
+        (this.promptRefreshRequired || policyChanged || toolsRefreshRequired)
       ) {
-        await this.recycleInternal()
+        await this.recycleInternal(true)
+      }
+
+      if (toolsRefreshRequired) {
+        await this.resetToolsInternal()
       }
 
       const hadToolsBefore = this.catalog !== undefined
@@ -1058,7 +1094,7 @@ export class RemoteContainerLane {
         return { kind: 'abandoned', nativeSessionId: this.boundNativeSessionId ?? 'unassigned' }
       }
       remotePoolNeed(this.configEpoch === epochAtStart, 'PROMPT_PRIVACY_TURN_SUPERSEDED')
-      if ((policyChanged || this.promptRefreshRequired) && this.remoteAdmissionAttempted) {
+      if ((policyChanged || this.promptRefreshRequired || toolsRefreshRequired) && this.remoteAdmissionAttempted) {
         remotePoolNeed(this.remoteAppStoppedProven, 'REMOTE_APP_STOP_UNPROVEN')
       }
 
@@ -1464,6 +1500,7 @@ export class RemoteContainerLane {
       this.remoteAppStoppedProven = true
       this.appliedPromptPolicyFingerprint = undefined
       this.appliedPromptIntelligentUi = undefined
+      this.appliedRemoteSwarmMcpKey = undefined
       if (localErr) throw localErr
     })().catch((err) => {
       this.stopRun = undefined

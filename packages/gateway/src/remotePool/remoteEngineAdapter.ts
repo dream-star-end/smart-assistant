@@ -36,7 +36,10 @@ import {
   settleSwarmSnapshotTerminal,
 } from '../engine/antigravitySwarmWatcher.js'
 import { buildCodexBillingEvent } from '../engine/codexAdapter.js'
-import { remoteSwarmLocationForSession } from '../remoteSwarmRuntime.js'
+import {
+  lookupRemoteSwarmMcpContext,
+  remoteSwarmLocationForSession,
+} from '../remoteSwarmRuntime.js'
 import type { IntelligentUiApplied } from '../promptSlots.js'
 import type {
   EngineAdapter,
@@ -499,7 +502,10 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
       if (payload.kind === 'toolCallObserved' && payload.phase === 'started') {
         const callId = payload.callId
         const toolName = this.lane.resolveClientToolName(payload.name)
-        if (isRemoteSwarmToolName(toolName)) {
+        if (
+          isRemoteSwarmToolName(toolName) &&
+          lookupRemoteSwarmMcpContext(this.executionBackend.sessionKey) !== undefined
+        ) {
           swarmWatcher?.activateTurnSwarm()
         }
         const inputPreview = formatInputPreview(payload.arguments)

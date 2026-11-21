@@ -83,6 +83,11 @@ import { projectCcbExecutionDescriptor } from './subprocessRunner.js'
 import { readV3CodexRelayConfig, V3_CODEX_RELAY_PREFIX } from './v3CodexRelay.js'
 import { resolveEngine } from './engine/registry.js'
 import {
+  applyAntigravitySwarmTurnDirective,
+  hasHistoricalAntigravitySwarm,
+} from './engine/antigravitySwarmDirective.js'
+import { disableRemoteSwarmCoordinatorMcp } from './remoteSwarmRuntime.js'
+import {
   getTurnAuthority,
   isEngineLocalTurnExempt,
   isModelAuthorityRequired,
@@ -1780,9 +1785,11 @@ export async function dispatchInbound(
         })
         finalText = teamPreamble + finalText
       }
-      // Antigravity swarm mode (OCV5-809 local + OCV5-835 remote parity): activated
-      // either by explicit `swarmMode: true` toggle or by leading `/swarm` on any
-      // Antigravity route (local CLI native swarm or remote container-side Swarm runtime).
+      // Antigravity swarm mode (OCV5-809 local + OCV5-835 remote parity + OCV5-842 off-toggle guard):
+      // activated only by explicit `swarmMode: true` toggle or leading `/swarm`.
+      // When turned OFF on a session with a historical swarm, revoke remote coordinator MCP
+      // and inject an explicit single-agent suppression directive so resumed coordinators do
+      // not keep waking prior swarm workers.
       const effectiveModelForSwarm =
         safeModelForRouting ?? agent.model ?? this.deps.config.defaults.model
       const isAntigravityTurn =
@@ -1795,46 +1802,56 @@ export async function dispatchInbound(
       const slashSwarm = parseSwarmSlashCommand(rawUserText)
       const swarmRequested = swarmMode || Boolean(slashSwarm?.matched)
       if (isRemoteAntigravity && effectiveModelForSwarm) {
-        this._ensureRemoteSwarmRuntime().registerSession({
-          sessionKey,
-          model: effectiveModelForSwarm,
-          effort: safeEffortLevel ?? undefined,
-          workspaceCwd: session.workspaceCwd || agent.cwd || process.cwd(),
-          parentAgentId: agent.id,
-          allowedToolsets: agent.toolsets,
-        })
-      }
-      if (isAntigravityTurn && swarmRequested) {
-        if (slashSwarm?.matched && rawUserText && finalText.endsWith(rawUserText)) {
-          const prefixPart = finalText.slice(0, finalText.length - rawUserText.length)
-          const taskBody =
-            slashSwarm.task ||
-            '请先了解当前工作区与上下文，并告知我可以如何拆分为并行蜂群任务。'
-          finalText = `${prefixPart}${taskBody}`
+        if (swarmRequested) {
+          this._ensureRemoteSwarmRuntime().registerSession({
+            sessionKey,
+            model: effectiveModelForSwarm,
+            effort: safeEffortLevel ?? undefined,
+            workspaceCwd: session.workspaceCwd || agent.cwd || process.cwd(),
+            parentAgentId: agent.id,
+            allowedToolsets: agent.toolsets,
+          })
+        } else {
+          disableRemoteSwarmCoordinatorMcp(sessionKey)
         }
-        const swarmToolsIntro = isRemoteAntigravity
-          ? '用户已显式开启远端 Antigravity 蜂群（Swarm）模式（由容器侧蜂群运行时驱动，通过 `swarm`、`post_message`、`read_board`、`swarm_wait` 四个 MCP 工具编排并行成员，每个成员同样运行在远端 Gemini 并拥有完整的本地工作区工具与 Git Worktree 隔离）。请按以下规则作为 Coordinator 编排蜂群：'
-          : '用户已显式开启 Antigravity 原生蜂群（Swarm）模式。请按以下规则作为 Coordinator 编排蜂群：'
-        const swarmDirective = [
-          '[OpenClaude Antigravity 蜂群模式已激活]',
-          swarmToolsIntro,
-          isRemoteAntigravity
-            ? '1. 若任务可拆分为 2 个及以上可并行推进的独立子方向（或需要独立校验者 review），先用 `swarm{action:"title", title:"..."}` 命名蜂群，再用 `swarm{action:"add", name:"...", brief:"..."}` 招募精简、职责不重叠的成员（必要时配备 `verifier` 校验者），随后调用 `swarm_wait{since:...}` 等待成员汇报并用 `read_board` 审阅结果。'
-            : '1. 若任务可拆分为 2 个及以上可并行推进的独立子方向（或需要独立校验者 review），请立即读取内置 `swarm` skill，先用 `swarm{action:"title", title:"..."}` 命名蜂群，再用 `swarm{action:"add", name:"...", brief:"..."}` 招募精简、职责不重叠的成员（必要时配备 `verifier` 校验者，若有 `swarm_monitor` 技能可配 `monitor`）。',
-          '2. 招募成员时**不要指定 `model` 参数**（留空以继承当前会话模型，确保计费与权限一致）。',
-          '3. **生命周期边界（续聊复用 vs 换任务清场）**：若本轮是同一任务的续聊或追问，可复用既有蜂群继续推进；若用户切换到全新无关任务，先确认旧成员无未合入改动后再用 `swarm{action:"kill"}` 回收旧 worker（或开独立频道隔离）并更新 `swarm{action:"title"}`，避免旧讨论串扰。',
-          '4. **Git 仓库并行写手与防丢合入**：在 git 仓库中安排多个写手并行改码时，默认给写手成员传 `workspace:"share"`（独立 worktree 隔离）同时在 `brief` 中按文件/模块划分清晰所有权规避语义冲突（只读调研/校验成员保留默认 `inherit`）；收尾前必须检查并合入所有 `share`/`branch` 成员的改动到主工作区，确认无改动遗漏在孤儿 worktree 里后再 `kill` 回收。',
-          '5. OpenClaude 网页端会实时原生渲染蜂群看板（成员矩阵、实时活动、worktree 隔离标识、频道与讨论流），**切勿**在回复中输出本地 `open_board` 链接或终端 `/swarm board` 命令。',
-          '6. 所有成员收口后，先在讨论板发一行 `[done] <总结>` 让监控停止，再向用户交付清晰、完整的最终汇总（含各独立 worktree 的合入确认结果）。',
-          '',
-        ].join('\n')
-        finalText = `${swarmDirective}\n${finalText}`
+      }
+      const boundSwarmConversationId =
+        isAntigravityTurn && !swarmRequested && !isRemoteAntigravity
+          ? (session.ccbSessionId ??
+              session.runner?.nativeSessionId ??
+              this.sessions.resolveAntigravitySwarmTarget?.(frame.peer.id)?.conversationId ??
+              undefined)
+          : undefined
+      const hasHistoricalSwarm =
+        isAntigravityTurn && !swarmRequested
+          ? hasHistoricalAntigravitySwarm({
+              sessionKey,
+              isRemote: isRemoteAntigravity,
+              conversationId: boundSwarmConversationId,
+            })
+          : false
+      const swarmDirectiveResult = applyAntigravitySwarmTurnDirective({
+        finalText,
+        rawUserText,
+        isAntigravityTurn,
+        isRemoteAntigravity,
+        swarmMode,
+        hasHistoricalSwarm,
+      })
+      finalText = swarmDirectiveResult.text
+      if (swarmDirectiveResult.mode === 'on') {
         this.log.info('antigravity_swarm_mode_turn', {
           sessionKey,
           model: effectiveModelForSwarm,
           remote: isRemoteAntigravity,
-          viaSlash: Boolean(slashSwarm?.matched),
-          viaToggle: swarmMode,
+          viaSlash: swarmDirectiveResult.viaSlash,
+          viaToggle: swarmDirectiveResult.viaToggle,
+        })
+      } else if (swarmDirectiveResult.mode === 'off_with_history') {
+        this.log.info('antigravity_swarm_mode_suppressed', {
+          sessionKey,
+          model: effectiveModelForSwarm,
+          remote: isRemoteAntigravity,
         })
       }
       // Pass as plain text. No image content blocks — safer for non-multimodal providers.

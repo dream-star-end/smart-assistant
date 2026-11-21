@@ -71,6 +71,19 @@ export function lookupRemoteSwarmMcpContext(sessionKey: string): RemoteSwarmMcpC
   return activeMcpContexts.get(sessionKey.trim())
 }
 
+/**
+ * Revoke the coordinator's MCP swarm context when the user turns OFF the Swarm
+ * toggle on a follow-up turn (OCV5-842). Leaves worker MCP contexts and session
+ * state intact so existing SwarmBoard views and later re-enabling still work.
+ */
+export function disableRemoteSwarmCoordinatorMcp(sessionKey: string): void {
+  const key = sessionKey.trim()
+  const existing = activeMcpContexts.get(key)
+  if (existing && existing.memberName === 'coordinator') {
+    activeMcpContexts.delete(key)
+  }
+}
+
 export function lookupRemoteSwarmRuntimeForSession(
   sessionKey: string,
 ): RemoteSwarmRuntime | undefined {
@@ -606,13 +619,24 @@ export class RemoteSwarmRuntime {
       if (input.allowedToolsets !== undefined) state.allowedToolsets = [...input.allowedToolsets]
       state.shuttingDown = false
     }
-    activeMcpContexts.set(key, {
-      coordinatorSessionKey: key,
-      memberName: 'coordinator',
-      callerToken: this.mintCallerToken(key, 'coordinator'),
-    })
+    const existingCtx = activeMcpContexts.get(key)
+    const reuseExisting =
+      existingCtx !== undefined &&
+      existingCtx.memberName === 'coordinator' &&
+      this.verifyCallerToken(existingCtx.callerToken, key, 'coordinator', Date.now() + 60 * 60_000)
+    if (!reuseExisting) {
+      activeMcpContexts.set(key, {
+        coordinatorSessionKey: key,
+        memberName: 'coordinator',
+        callerToken: this.mintCallerToken(key, 'coordinator'),
+      })
+    }
     activeRuntimeBySession.set(key, this)
     return state
+  }
+
+  disableCoordinatorMcp(sessionKey: string): void {
+    disableRemoteSwarmCoordinatorMcp(sessionKey)
   }
 
   getActiveSwarmLocation(sessionKey: string): RemoteSwarmLocation | null {

@@ -1123,3 +1123,119 @@ test('OCV5-837: activity-only churn does not emit redundant full keyframes when 
     await rm(brainDir, { recursive: true, force: true })
   }
 })
+
+test('OCV5-842: seedBaselineOnStart stays dormant when historical worker transcripts exceed 128KB telemetry chunk cap', async () => {
+  const brainDir = await mkdtemp(path.join(tmpdir(), 'oc-swarm-large-baseline-'))
+  try {
+    const { swarmDir } = await writeSwarmFixture(brainDir)
+    const workerLog = path.join(brainDir, WORKER_CONV, '.system_generated', 'logs', 'transcript.jsonl')
+    // Write ~300 KB of historical worker steps (> 128 KB MAX_TELEMETRY_DELTA_BYTES)
+    // so incremental scanning previously left `hasAnyBacklog() === true` after captureBaseline()
+    // and falsely flipped `turnActive = true` on the very next poll tick.
+    const stepCount = 320
+    const pad = 'x'.repeat(850)
+    const lines: string[] = []
+    for (let i = 0; i < stepCount; i += 1) {
+      lines.push(
+        JSON.stringify({
+          step_index: i,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: new Date(1_763_600_000_000 + i * 1_000).toISOString(),
+          usage: { input_tokens: 100, output_tokens: 25 },
+          tool_calls: [{ name: 'read_file', arguments: { Path: `/tmp/doc-${i}.md`, note: pad } }],
+        }),
+      )
+    }
+    await writeFile(workerLog, `${lines.join('\n')}\n`, 'utf8')
+    assert.ok(Buffer.byteLength(readFileSync(workerLog, 'utf8'), 'utf8') > 256 * 1024)
+
+    // 1. Ordinary follow-up turn with Swarm toggle OFF: must stay completely dormant
+    // across multiple poll intervals + coordinator USER_INPUT append + explicit kick().
+    const emitted: SwarmSnapshot[] = []
+    const watcher = new AntigravitySwarmWatcher({
+      brainDir,
+      conversationId: COORD_CONV,
+      pollMs: 25,
+      activityThrottleMs: 0,
+      seedBaselineOnStart: true,
+      onSnapshot: (snap) => emitted.push(snap),
+    })
+    watcher.start()
+    await new Promise((r) => setTimeout(r, 120))
+    const coordLogDir = path.join(brainDir, COORD_CONV, '.system_generated', 'logs')
+    await mkdir(coordLogDir, { recursive: true })
+    await writeFile(
+      path.join(coordLogDir, 'transcript.jsonl'),
+      `${JSON.stringify({
+        step_index: 99,
+        type: 'USER_INPUT',
+        status: 'DONE',
+        created_at: '2026-11-22T03:18:11.000Z',
+      })}\n`,
+      'utf8',
+    )
+    watcher.kick()
+    await new Promise((r) => setTimeout(r, 80))
+    assert.equal(emitted.length, 0, 'dormant resumed turn with >128KB worker logs must never emit fake SwarmBoard')
+    assert.equal(watcher.hasTurnActivity(), false)
+    assert.equal(watcher.stopAndReadFinal('completed'), null)
+
+    // 2. Explicit activateTurnSwarm() on the same >256KB fixture wakes immediately
+    // and terminal stopAndReadFinal() still drains full historical telemetry accurately.
+    const emittedActive: SwarmSnapshot[] = []
+    const watcher2 = new AntigravitySwarmWatcher({
+      brainDir,
+      conversationId: COORD_CONV,
+      pollMs: 60_000,
+      activityThrottleMs: 0,
+      seedBaselineOnStart: true,
+      onSnapshot: (snap) => emittedActive.push(snap),
+    })
+    watcher2.start()
+    assert.equal(emittedActive.length, 0)
+    watcher2.activateTurnSwarm()
+    assert.ok(emittedActive.length >= 1, 'activateTurnSwarm must emit immediately')
+    assert.equal(watcher2.hasTurnActivity(), true)
+    const settled2 = watcher2.stopAndReadFinal('completed')
+    assert.ok(settled2)
+    const workerMember2 = settled2.members.find((m) => m.name === 'parser')
+    assert.ok(workerMember2)
+    assert.equal(workerMember2.toolCalls, stepCount)
+    assert.equal(workerMember2.inputTokens, stepCount * 100)
+    assert.equal(workerMember2.outputTokens, stepCount * 25)
+
+    // 3. Genuine board mutation on the >256KB fixture wakes the dormant watcher and
+    // preserves full terminal telemetry drain.
+    const emittedMutated: SwarmSnapshot[] = []
+    const watcher3 = new AntigravitySwarmWatcher({
+      brainDir,
+      conversationId: COORD_CONV,
+      pollMs: 60_000,
+      activityThrottleMs: 0,
+      seedBaselineOnStart: true,
+      onSnapshot: (snap) => emittedMutated.push(snap),
+    })
+    watcher3.start()
+    assert.equal(emittedMutated.length, 0)
+    await writeFile(
+      path.join(swarmDir, 'board.jsonl'),
+      `${readFileSync(path.join(swarmDir, 'board.jsonl'), 'utf8')}${JSON.stringify({
+        seq: 3,
+        agent: 'coordinator',
+        text: '@parser resume',
+      })}\n`,
+      'utf8',
+    )
+    watcher3.kick()
+    assert.equal(emittedMutated.length, 1)
+    assert.equal(emittedMutated[0]!.totalPosts, 3)
+    assert.equal(watcher3.hasTurnActivity(), true)
+    const settled3 = watcher3.stopAndReadFinal('completed')
+    assert.ok(settled3)
+    const workerMember3 = settled3.members.find((m) => m.name === 'parser')
+    assert.equal(workerMember3?.toolCalls, stepCount)
+  } finally {
+    await rm(brainDir, { recursive: true, force: true })
+  }
+})

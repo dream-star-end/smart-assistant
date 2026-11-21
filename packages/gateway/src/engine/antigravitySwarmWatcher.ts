@@ -1002,6 +1002,24 @@ function stripVolatileMemberFields(m: SwarmMemberSnapshot) {
   return rest
 }
 
+/**
+ * Exclude volatile timestamps AND incremental historical telemetry counters from
+ * dormant activation comparison so draining a >128KB historical worker transcript
+ * never falsely flips a non-swarm follow-up turn into `turnActive = true` (OCV5-842).
+ */
+function stripActivationVolatileMemberFields(m: SwarmMemberSnapshot) {
+  const {
+    lastActiveAt: _la,
+    elapsedMs: _em,
+    inputTokens: _it,
+    outputTokens: _ot,
+    toolCalls: _tc,
+    telemetryPartial: _tp,
+    ...rest
+  } = m
+  return rest
+}
+
 function snapshotFingerprint(snap: SwarmSnapshot): string {
   const {
     revision: _r,
@@ -1076,7 +1094,7 @@ function swarmActivationFingerprint(snap: SwarmSnapshot): string {
             unreadCount: m.unreadCount,
             lastPostSeq: m.lastPostSeq,
           }
-        : stripVolatileMemberFields(m),
+        : stripActivationVolatileMemberFields(m),
     ),
   }
   return createHash('sha256').update(JSON.stringify(normalized), 'utf8').digest('hex')
@@ -1248,6 +1266,9 @@ export class AntigravitySwarmWatcher {
     const statSig = this.computeStatSignature()
     this.lastStatSignature = statSig
     const memberConvIds: string[] = []
+    // Intentionally omit `telemetryCache` while capturing a dormant baseline:
+    // incremental 128 KB chunk draining on historical >128 KB worker transcripts
+    // would otherwise create backlog ticks and burn I/O on non-swarm follow-ups.
     const snap = readAntigravitySwarmSnapshot({
       brainDir: this.brainDir,
       conversationId: this.conversationId,
@@ -1255,7 +1276,6 @@ export class AntigravitySwarmWatcher {
       revision: 0,
       now: this.now(),
       outMemberConvIds: memberConvIds,
-      telemetryCache: this.telemetryCache,
     })
     if (!snap) return
     this.setTrackedMembers(memberConvIds)
@@ -1401,8 +1421,10 @@ export class AntigravitySwarmWatcher {
 
   private pollOnce(force: boolean): void {
     if (this.stopped) return
+    const isDormantBaseline =
+      !this.turnActive && this.seedBaselineOnStart && this.baselineActivationHash !== null
     const statSig = this.computeStatSignature()
-    const hasBacklog = this.telemetryCache.hasAnyBacklog()
+    const hasBacklog = !isDormantBaseline && this.telemetryCache.hasAnyBacklog()
     if (!force && !hasBacklog && this.lastStatSignature !== null && statSig === this.lastStatSignature) {
       return
     }
@@ -1410,7 +1432,7 @@ export class AntigravitySwarmWatcher {
     const nextRev = this.revision + 1
     const memberConvIds: string[] = []
     const ts = this.now()
-    const snap = readAntigravitySwarmSnapshot({
+    let snap = readAntigravitySwarmSnapshot({
       brainDir: this.brainDir,
       conversationId: this.conversationId,
       phase: 'running',
@@ -1418,27 +1440,46 @@ export class AntigravitySwarmWatcher {
       startedAt: this.startedAt,
       now: ts,
       outMemberConvIds: memberConvIds,
-      telemetryCache: this.telemetryCache,
+      ...(isDormantBaseline ? {} : { telemetryCache: this.telemetryCache }),
     })
     if (!snap) return
     this.setTrackedMembers(memberConvIds)
     this.lastStatSignature = this.computeStatSignature()
+    if (isDormantBaseline) {
+      const actHash = swarmActivationFingerprint(snap)
+      if (actHash === this.baselineActivationHash) {
+        // Coordinator-only transcript advance on an ordinary resumed turn:
+        // keep baseline fresh without activating or emitting the historical board.
+        this.lastHash = snapshotFingerprint(snap)
+        this.lastStructuralHash = structuralFingerprint(snap)
+        this.lastSnapshot = snap
+        return
+      }
+      // Genuine non-coordinator / board mutation woke the dormant board:
+      // transition to active and re-read with incremental telemetry enabled.
+      this.turnActive = true
+      const activeMemberConvIds: string[] = []
+      const activeSnap = readAntigravitySwarmSnapshot({
+        brainDir: this.brainDir,
+        conversationId: this.conversationId,
+        phase: 'running',
+        revision: nextRev,
+        startedAt: this.startedAt,
+        now: ts,
+        outMemberConvIds: activeMemberConvIds,
+        telemetryCache: this.telemetryCache,
+      })
+      if (activeSnap) {
+        snap = activeSnap
+        this.setTrackedMembers(activeMemberConvIds)
+        this.lastStatSignature = this.computeStatSignature()
+      }
+    }
     if (this.telemetryCache.hasAnyBacklog()) {
       this.scheduleBacklogCatchup()
     }
     const hash = snapshotFingerprint(snap)
     const structHash = structuralFingerprint(snap)
-    if (!this.turnActive && this.seedBaselineOnStart && this.baselineActivationHash !== null) {
-      const actHash = swarmActivationFingerprint(snap)
-      if (actHash === this.baselineActivationHash) {
-        // Coordinator-only transcript advance on an ordinary resumed turn:
-        // keep baseline fresh without activating or emitting the historical board.
-        this.lastHash = hash
-        this.lastStructuralHash = structHash
-        this.lastSnapshot = snap
-        return
-      }
-    }
     if (this.startedAt === undefined) {
       this.startedAt = snap.updatedAt
       snap.startedAt = this.startedAt

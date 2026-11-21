@@ -138,17 +138,21 @@ catalog slug from the "委派可用型号" list (never guess or shorten); delega
 to yourself needs \`allowSelf: true\`. Do not use Antigravity-native knowledge,
 schedule, or inbox features as a second source of truth; use the platform
 channels above.
-When the user asks for Swarm mode / 蜂群模式 / \`/swarm\` (or parallel multi-agent
-coordination), you MAY use Antigravity's native \`swarm\` tool and \`swarm\` skill:
+When the current turn explicitly activates Swarm mode (\`[OpenClaude Antigravity 蜂群模式已激活]\`,
+or the user explicitly asks for Swarm mode / 蜂群模式 / \`/swarm\` in the current message),
+you MAY use Antigravity's native \`swarm\` tool and \`swarm\` skill:
+- If the user turned OFF the Swarm toggle on a follow-up turn (\`[OpenClaude 蜂群模式已关闭]\`
+  or no active swarm directive on a resumed conversation), stay in single-agent mode and do NOT
+  call \`swarm\` / \`post_message\` / \`read_board\` / \`swarm_wait\` or wake prior swarm members.
 - OpenClaude renders the live Swarm Board natively in the web UI (members, live
   status, worktree isolation badges, channels, and message feed). Never print raw
   localhost \`open_board\` URLs or terminal \`/swarm board\` commands in your reply.
 - Leave \`model\` omitted on \`swarm{action:"add"}\` so every worker inherits this
   session's active model (the relay enforces the route model for billing).
-- Lifecycle boundary on follow-up turns: reuse the active swarm for the same
-  task, but when switching to an unrelated new task, verify no unmerged changes
-  remain, \`kill\` stale workers (or isolate in a fresh channel), and update
-  \`swarm{action:"title"}\`.
+- Lifecycle boundary on follow-up turns (only while Swarm mode remains enabled):
+  reuse the active swarm for the same task, or when switching to an unrelated new
+  task, verify no unmerged changes remain, \`kill\` stale workers (or isolate in a
+  fresh channel), and update \`swarm{action:"title"}\`.
 - Parallel writers in a git repo: default to \`workspace:"share"\` (isolated
   worktree) paired with explicit file/module ownership in each brief (keep
   readers/verifiers on default \`inherit\`). Always verify and merge every

@@ -34,6 +34,7 @@ import {
   RemoteSwarmRuntime,
   type RemoteSwarmWorkerExecutor,
   type RemoteSwarmWorkerTurnInput,
+  disableRemoteSwarmCoordinatorMcp,
   lookupRemoteSwarmMcpContext,
   remoteSwarmLocationForSession,
 } from '../remoteSwarmRuntime.js'
@@ -729,6 +730,40 @@ describe('RemoteSwarmRuntime & Admission (OCV5-835)', () => {
       }
     } finally {
       await rt1.shutdownAll()
+    }
+  })
+
+  it('OCV5-842: disableRemoteSwarmCoordinatorMcp revokes coordinator MCP without touching unrelated sessions and re-enables cleanly', async () => {
+    const rootBase = makeTempDir('oc-rswarm-disable-')
+    const ws = makeTempDir('oc-rswarm-disable-ws-')
+    const rt = new RemoteSwarmRuntime({
+      rootBase,
+      executor: {
+        async runWorkerTurn() {
+          return { text: 'ok' }
+        },
+        async releaseWorkerSession() {},
+      },
+    })
+    try {
+      const s1 = 'agent:main:webchat:dm:toggle-off-1'
+      const s2 = 'agent:main:webchat:dm:toggle-off-2'
+      rt.registerSession({ sessionKey: s1, model: 'antigravity-gemini-4-neon-remote', workspaceCwd: ws })
+      rt.registerSession({ sessionKey: s2, model: 'antigravity-gemini-4-neon-remote', workspaceCwd: ws })
+      assert.equal(lookupRemoteSwarmMcpContext(s1)?.memberName, 'coordinator')
+      assert.equal(lookupRemoteSwarmMcpContext(s2)?.memberName, 'coordinator')
+
+      // Disabling s1 revokes coordinator MCP only for s1; s2 stays active.
+      disableRemoteSwarmCoordinatorMcp(s1)
+      assert.equal(lookupRemoteSwarmMcpContext(s1), undefined)
+      assert.equal(lookupRemoteSwarmMcpContext(s2)?.memberName, 'coordinator')
+
+      // Idempotent second call + re-enabling restores coordinator MCP with a fresh token.
+      disableRemoteSwarmCoordinatorMcp(s1)
+      rt.registerSession({ sessionKey: s1, model: 'antigravity-gemini-4-neon-remote', workspaceCwd: ws })
+      assert.equal(lookupRemoteSwarmMcpContext(s1)?.memberName, 'coordinator')
+    } finally {
+      await rt.shutdownAll()
     }
   })
 })
