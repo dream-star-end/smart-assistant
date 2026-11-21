@@ -239,12 +239,12 @@ export function BoxClaudeProfilesModal({
       className="max-w-3xl"
     >
       <div className="flex flex-col gap-3">
-        <p className="text-caption text-muted">
+        <div className="oc-callout oc-callout-info rounded-xl px-3.5 py-2.5 text-caption leading-relaxed text-muted">
           勾选的登录用于 Box Claude 的交互会话(box-claude-* 模型,一律交互模式,不走 claude -p);box-api-claude-* 只用默认登录。
           同一用户的新对话尽量落在同一个登录;进行中的对话会一直留在原登录(复用提示缓存和 --resume),
           直到该登录额度用尽、登录失效或 Box 检查未通过才换到其它已勾选的登录,换号后接着原对话继续。
           新对话在登录用到 {Math.round(ceiling * 100)}% 时就改用其它登录。
-        </p>
+        </div>
         {error && <Alert tone="danger">{error}</Alert>}
         {data?.available === false && (
           <Alert tone="warning">这个版本没有 Box 多账号功能(缺少 box_claude_profiles 表),只使用默认登录。</Alert>
@@ -261,20 +261,20 @@ export function BoxClaudeProfilesModal({
         ) : (
           rows.length > 0 && <DataTable columns={columns} rows={rows} rowKey={(p) => p.profile} />
         )}
-        <details className="text-caption text-muted">
-          <summary className="cursor-pointer">如何新增一个 Claude Code 账号</summary>
-          <ol className="mt-1 list-decimal pl-5">
-            <li>在这个 Box 的终端里:mkdir -p ~/.claude-名称(名称只含小写字母、数字和连字符)</li>
-            <li>CLAUDE_CONFIG_DIR=~/.claude-名称 claude,按提示 /login 登录要加入的账号。</li>
+        <details className="oc-surface-recessed rounded-xl px-3.5 py-2.5 text-caption text-muted">
+          <summary className="cursor-pointer font-medium text-fg">如何新增一个 Claude Code 账号</summary>
+          <ol className="mt-2 list-decimal space-y-1 pl-5 leading-relaxed">
+            <li>在这个 Box 的终端里:<code className="font-mono text-fg">mkdir -p ~/.claude-名称</code>(名称只含小写字母、数字和连字符)</li>
+            <li><code className="font-mono text-fg">CLAUDE_CONFIG_DIR=~/.claude-名称 claude</code>,按提示 <code className="font-mono text-fg">/login</code> 登录要加入的账号。</li>
             <li>
-              在 /workspace 里信任一次:cd /workspace &amp;&amp; CLAUDE_CONFIG_DIR=~/.claude-名称 claude,出现“trust this folder”时选
+              在 /workspace 里信任一次:<code className="font-mono text-fg">cd /workspace &amp;&amp; CLAUDE_CONFIG_DIR=~/.claude-名称 claude</code>,出现“trust this folder”时选
               “Yes, I trust this folder”,然后退出。不做这一步,交互会话会在启动时停在这个确认框上而失败。
             </li>
             <li>回到这里点“扫描”,勾选新出现的登录并保存。不要把含有自己会话记录的目录(如开发用的账号目录)勾进来。</li>
           </ol>
         </details>
-        <div className="flex items-center justify-end gap-2">
-          {saved && <span className="text-caption text-success">已保存</span>}
+        <div className="flex items-center justify-end gap-2 border-t border-border/70 pt-3">
+          {saved && <span className="text-caption font-medium text-success">已保存</span>}
           <Button size="sm" variant="secondary" onClick={() => void scan()} disabled={busy !== null || data?.available === false}>
             {busy === "scan" ? "扫描中…" : "扫描 Box"}
           </Button>

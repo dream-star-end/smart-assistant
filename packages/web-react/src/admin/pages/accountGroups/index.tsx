@@ -1,4 +1,4 @@
-import { KeyRound, Layers, MoreHorizontal, Plus, RefreshCw, Server } from "lucide-react";
+import { CheckCircle2, KeyRound, Layers, MoreHorizontal, Plus, RefreshCw, Server } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import {
   Badge,
@@ -106,6 +106,7 @@ export default function AccountGroupsPage() {
   return (
     <div className="flex flex-col gap-5">
       <PageHeader
+        icon={Layers}
         title={meta.title}
         desc={loading ? "加载中…" : `共 ${total} 组`}
         actions={
@@ -121,24 +122,24 @@ export default function AccountGroupsPage() {
       />
 
       <StatCardRow>
-        <StatCard label="分组总数" value={total.toLocaleString()} icon={Layers} loading={loading} />
-        <StatCard label="启用中" value={enabledN.toLocaleString()} tone="success" loading={loading} />
-        <StatCard label="API 中转站" value={relayN.toLocaleString()} icon={Server} loading={loading} />
+        <StatCard label="分组总数" value={total.toLocaleString()} icon={Layers} tone="accent" loading={loading} />
+        <StatCard label="启用中" value={enabledN.toLocaleString()} icon={CheckCircle2} tone="success" loading={loading} />
+        <StatCard label="API 中转站" value={relayN.toLocaleString()} icon={Server} tone="info" loading={loading} />
         <StatCard label="官方订阅" value={oauthN.toLocaleString()} icon={KeyRound} loading={loading} />
       </StatCardRow>
 
       {error ? (
-        <div className="rounded-xl border border-danger/40 bg-danger-soft/40 px-4 py-6 text-center text-sm text-danger">
+        <div className="oc-callout oc-callout-danger rounded-xl px-4 py-6 text-center text-sm text-danger">
           加载失败:{error}
         </div>
       ) : loading ? (
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
           {[0, 1].map((i) => (
-            <div key={i} className="h-44 animate-pulse rounded-xl border border-border bg-surface" />
+            <div key={i} className="oc-surface-card h-44 animate-pulse rounded-xl" />
           ))}
         </div>
       ) : total === 0 ? (
-        <div className="rounded-xl border border-border bg-surface">
+        <div className="oc-surface-card rounded-xl">
           <EmptyState
             icon={Layers}
             title="暂无分组"
@@ -200,6 +201,9 @@ function GroupCard({
     <SectionCard
       title={g.label}
       hint={`#${g.id} · ${ACCOUNT_GROUP_KIND_LABEL[g.kind] ?? g.kind}`}
+      icon={isRelay ? Server : KeyRound}
+      iconTone={isRelay ? "info" : "accent"}
+      className="oc-surface-card-hover"
       action={
         <div className="flex items-center gap-2">
           <Switch checked={g.enabled} onCheckedChange={onToggle} aria-label="启用分组" />
@@ -230,8 +234,8 @@ function GroupCard({
           value={<Badge tone={g.enabled ? "success" : "neutral"}>{g.enabled ? "enabled" : "disabled"}</Badge>}
         />
       </div>
-      <div>
-        <p className="mb-1.5 text-meta font-medium text-faint">
+      <div className="oc-surface-recessed rounded-xl p-3">
+        <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-faint">
           模型路由边界{g.models.length > 0 ? `(${g.models.length})` : ""}
         </p>
         {g.models.length === 0 ? (
@@ -239,14 +243,14 @@ function GroupCard({
         ) : (
           <div className="flex flex-wrap gap-1.5">
             {g.models.map((m) => (
-              <span key={m} className="rounded-md bg-hover px-2 py-0.5 font-mono text-caption text-muted">
+              <span key={m} className="oc-badge-craft rounded-md bg-surface px-2 py-0.5 font-mono text-caption text-fg">
                 {m}
               </span>
             ))}
           </div>
         )}
       </div>
-      <div className="flex flex-wrap gap-2 border-t border-border pt-3">
+      <div className="flex flex-wrap gap-2 border-t border-border/70 pt-3">
         <Button size="sm" variant="secondary" onClick={onEdit}>
           编辑
         </Button>

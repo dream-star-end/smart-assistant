@@ -60,13 +60,13 @@ export function RepoPill({
       aria-label={sel ? `代码仓库 ${sel.owner}/${sel.repo}，点击管理` : "关联 GitHub 仓库"}
       title={sel ? `${sel.owner}/${sel.repo} @ ${sel.branch}` : "关联 GitHub 仓库"}
       className={cn(
-        "inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full border font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]",
-        compact ? "px-2 py-0.5 text-caption" : "px-2.5 py-1 text-meta",
+        "oc-btn-tactile inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full border font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg",
+        compact ? "px-2.5 py-0.5 text-caption" : "px-3 py-1 text-meta",
         sel
-          ? "border-accent/35 bg-accent-soft text-accent hover:border-accent/55"
+          ? "oc-badge-craft border-accent/35 bg-accent-soft text-accent hover:border-accent/55"
           : quiet
             ? "border-transparent bg-transparent px-2 text-caption text-faint hover:bg-hover hover:text-fg"
-            : "border-border text-muted hover:border-border-strong hover:bg-hover hover:text-fg",
+            : "oc-surface-card border-border text-muted hover:border-border-strong hover:text-fg",
       )}
     >
       <GithubMark size={compact || quiet ? 13 : 14} />

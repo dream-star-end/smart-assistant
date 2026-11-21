@@ -352,10 +352,12 @@ export function SiteSettingsTab({
   const primaryHost = `${site.slug}.${baseDomain}`;
 
   return (
-    <div className="space-y-8">
-      <section className="space-y-2">
-        <h3 className="text-section font-semibold text-fg">常规</h3>
-        <div className="divide-y divide-border/70 border-y border-border/70">
+    <div className="space-y-6">
+      <section className="oc-surface-card overflow-hidden rounded-2xl">
+        <div className="border-b border-border/70 bg-bg/50 px-5 py-3">
+          <h3 className="text-section font-semibold text-fg">常规</h3>
+        </div>
+        <div className="divide-y divide-border/60 px-5">
           <div className="flex flex-col gap-3 py-4 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <p className="text-body font-medium text-fg">名称</p>
@@ -383,8 +385,10 @@ export function SiteSettingsTab({
               <p className="text-body font-medium text-fg">URL</p>
               <p className="text-caption text-muted">网址{!isOwner ? "（仅所有者可更改）" : ""}</p>
             </div>
-            <div className="flex flex-wrap items-center gap-3">
-              <span className="font-mono text-body text-muted">{primaryHost}</span>
+            <div className="flex flex-wrap items-center gap-2.5">
+              <span className="oc-surface-recessed rounded-lg px-2.5 py-1 font-mono text-meta text-fg">
+                {primaryHost}
+              </span>
               {isOwner && (
                 <Button
                   variant="secondary"
@@ -414,14 +418,16 @@ export function SiteSettingsTab({
               <div className="flex flex-wrap items-center gap-2.5">
                 {site.customDomain && (
                   <>
-                    <span className="font-mono text-body text-fg">{site.customDomain}</span>
+                    <span className="oc-surface-recessed rounded-lg px-2.5 py-1 font-mono text-meta text-fg">
+                      {site.customDomain}
+                    </span>
                     {site.customDomainStatus === "verified" ? (
-                      <span className="inline-flex items-center gap-1 rounded-full bg-success-soft px-2.5 py-0.5 text-caption font-medium text-success">
+                      <span className="oc-badge-craft inline-flex items-center gap-1 rounded-full bg-success-soft px-2.5 py-0.5 text-caption font-medium text-success">
                         <CheckCircle2 size={12} aria-hidden="true" />
                         已验证
                       </span>
                     ) : (
-                      <span className="rounded-full bg-warning-soft px-2.5 py-0.5 text-caption font-medium text-warning">
+                      <span className="oc-badge-craft rounded-full bg-warning-soft px-2.5 py-0.5 text-caption font-medium text-warning">
                         待验证 DNS
                       </span>
                     )}
@@ -460,14 +466,14 @@ export function SiteSettingsTab({
               site.customDomainStatus !== "verified" &&
               site.customDomainTxtName &&
               site.customDomainTxtValue && (
-                <div className="rounded-lg border border-border/80 bg-bg-subtle/60 px-3.5 py-2.5 text-caption text-muted">
+                <div className="oc-callout oc-callout-info rounded-xl px-4 py-3 text-caption text-muted">
                   <p className="font-medium text-fg">
                     验证所有权后才会启用路由与 TLS 证书。请添加以下 DNS 记录：
                   </p>
-                  <p className="mt-1 font-mono text-caption">
+                  <p className="mt-1.5 font-mono text-caption text-fg">
                     1) TXT 记录名：{site.customDomainTxtName} → 值：{site.customDomainTxtValue}
                   </p>
-                  <p className="font-mono text-caption">
+                  <p className="font-mono text-caption text-fg">
                     2) CNAME 记录：{site.customDomain} → {primaryHost}
                   </p>
                 </div>
@@ -498,13 +504,13 @@ export function SiteSettingsTab({
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-3">
-              <span className="inline-flex items-center gap-1.5 text-body text-muted">
+              <span className="oc-badge-craft inline-flex items-center gap-1.5 rounded-full bg-hover px-2.5 py-1 text-caption font-medium text-muted">
                 {site.visibility === "public" ? (
-                  <Globe size={14} aria-hidden="true" />
+                  <Globe size={13} aria-hidden="true" />
                 ) : site.visibility === "password" ? (
-                  <Lock size={14} aria-hidden="true" />
+                  <Lock size={13} aria-hidden="true" />
                 ) : (
-                  <PauseCircle size={14} aria-hidden="true" />
+                  <PauseCircle size={13} aria-hidden="true" />
                 )}
                 {sharingLabel(site.visibility)}
               </span>
@@ -531,7 +537,7 @@ export function SiteSettingsTab({
       </section>
 
       {isOwner ? (
-        <section className="space-y-4">
+        <section className="oc-surface-card space-y-4 rounded-2xl p-5">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <h3 className="text-section font-semibold text-fg">环境变量</h3>
@@ -550,12 +556,12 @@ export function SiteSettingsTab({
           </div>
 
         {envVars.length === 0 && !addingEnv ? (
-          <p className="rounded-lg border border-dashed border-border px-4 py-6 text-center text-body text-muted">
+          <p className="oc-surface-recessed rounded-xl px-4 py-6 text-center text-body text-muted">
             暂无环境变量 — 点击右上角「添加变量」或在命令行运行 `oc-site env-set` 配置密钥。
           </p>
         ) : (
           <div className="space-y-2.5">
-            <div className="hidden grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)_56px_40px] items-center gap-3 px-1 text-caption text-muted sm:grid">
+            <div className="hidden grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)_56px_40px] items-center gap-3 px-2 text-caption font-medium text-faint sm:grid">
               <span>键</span>
               <span>值</span>
               <span className="text-center">机密</span>
@@ -568,7 +574,7 @@ export function SiteSettingsTab({
               return (
                 <div
                   key={envVar.key}
-                  className="grid grid-cols-1 items-center gap-3 rounded-lg border border-border/70 bg-bg-subtle/40 p-2.5 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)_56px_40px] sm:border-0 sm:bg-transparent sm:p-0"
+                  className="oc-surface-recessed grid grid-cols-1 items-center gap-3 rounded-xl p-2.5 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)_56px_40px]"
                 >
                   <Input
                     value={envVar.key}
@@ -696,7 +702,7 @@ export function SiteSettingsTab({
                     void saveEnvVar(newEnvKey.trim(), newEnvVal, newEnvSecret);
                   }
                 }}
-                className="grid grid-cols-1 items-center gap-3 rounded-lg border border-border bg-surface p-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)_56px_auto]"
+                className="oc-surface-card grid grid-cols-1 items-center gap-3 rounded-xl p-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)_56px_auto]"
               >
                 <Input
                   value={newEnvKey}
@@ -748,18 +754,18 @@ export function SiteSettingsTab({
         )}
       </section>
       ) : (
-        <section className="space-y-2 border-t border-border/70 pt-6">
+        <section className="oc-surface-card space-y-2 rounded-2xl p-5">
           <h3 className="text-section font-semibold text-fg">环境变量</h3>
-          <p className="rounded-lg border border-dashed border-border px-4 py-5 text-body text-muted">
+          <p className="oc-surface-recessed rounded-xl px-4 py-5 text-body text-muted">
             环境变量与机密密钥仅归站点所有者查看和管理。如需新增接口密钥，请联系所有者配置。
           </p>
         </section>
       )}
 
       {isOwner && (
-        <section className="space-y-3 border-t border-border/70 pt-6">
-          <h3 className="text-section font-semibold text-fg">危险操作区</h3>
-          <div className="flex flex-wrap items-center justify-between gap-4 py-2">
+        <section className="oc-callout oc-callout-danger space-y-3 rounded-2xl p-5">
+          <h3 className="text-section font-semibold text-danger">危险操作区</h3>
+          <div className="flex flex-wrap items-center justify-between gap-4">
             <div>
               <p className="text-body font-medium text-fg">删除站点</p>
               <p className="text-caption text-muted">永久删除此站点</p>

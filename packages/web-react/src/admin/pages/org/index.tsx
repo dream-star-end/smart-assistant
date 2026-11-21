@@ -1,4 +1,4 @@
-import { Building2, Inbox, Plus, RotateCw, X } from "lucide-react";
+import { Building2, Inbox, Plus, Receipt, RotateCw, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import {
   Badge,
@@ -168,18 +168,18 @@ function CreateOrgModal({
         </>
       }
     >
-      <div className="flex flex-col gap-3">
-        <label className="flex flex-col gap-1 text-meta text-faint">
+      <div className="flex flex-col gap-3.5">
+        <label className="flex flex-col gap-1.5 text-meta font-medium text-fg">
           组织名称
-          <Input value={name} onChange={(e) => setName(e.target.value)} />
+          <Input className="oc-field-control" value={name} onChange={(e) => setName(e.target.value)} />
         </label>
-        <label className="flex flex-col gap-1 text-meta text-faint">
+        <label className="flex flex-col gap-1.5 text-meta font-medium text-fg">
           owner 邮箱
-          <Input value={owner} onChange={(e) => setOwner(e.target.value)} placeholder="owner@example.com" />
+          <Input className="oc-field-control" value={owner} onChange={(e) => setOwner(e.target.value)} placeholder="owner@example.com" />
         </label>
-        <label className="flex flex-col gap-1 text-meta text-faint">
+        <label className="flex flex-col gap-1.5 text-meta font-medium text-fg">
           成员上限(可选)
-          <Input type="number" min={1} value={maxMembers} onChange={(e) => setMaxMembers(e.target.value)} />
+          <Input className="oc-field-control tabular-nums" type="number" min={1} value={maxMembers} onChange={(e) => setMaxMembers(e.target.value)} />
         </label>
       </div>
     </Modal>
@@ -252,12 +252,12 @@ function EditOrgModal({
         </>
       }
     >
-      <div className="flex flex-col gap-3">
-        <label className="flex flex-col gap-1 text-meta text-faint">
+      <div className="flex flex-col gap-3.5">
+        <label className="flex flex-col gap-1.5 text-meta font-medium text-fg">
           名称
-          <Input value={name} onChange={(e) => setName(e.target.value)} />
+          <Input className="oc-field-control" value={name} onChange={(e) => setName(e.target.value)} />
         </label>
-        <div className="flex flex-col gap-1 text-meta text-faint">
+        <div className="flex flex-col gap-1.5 text-meta font-medium text-fg">
           状态
           <SelectFilter
             value={status}
@@ -265,9 +265,9 @@ function EditOrgModal({
             onChange={setStatus}
           />
         </div>
-        <label className="flex flex-col gap-1 text-meta text-faint">
+        <label className="flex flex-col gap-1.5 text-meta font-medium text-fg">
           成员上限(留空=不改)
-          <Input type="number" min={1} value={maxMembers} onChange={(e) => setMaxMembers(e.target.value)} />
+          <Input className="oc-field-control tabular-nums" type="number" min={1} value={maxMembers} onChange={(e) => setMaxMembers(e.target.value)} />
         </label>
       </div>
     </Modal>
@@ -342,18 +342,30 @@ function CreditsModal({
         </>
       }
     >
-      <div className="flex flex-col gap-3">
-        <KeyValue label="当前余额" value={<span className="tabular-nums">{fmtCents(org?.credits)}</span>} />
-        <label className="flex flex-col gap-1 text-meta text-faint">
+      <div className="flex flex-col gap-3.5">
+        <div className="oc-surface-recessed rounded-xl px-3.5 py-1">
+          <KeyValue label="当前余额" value={<span className="font-semibold tabular-nums">{fmtCents(org?.credits)}</span>} />
+        </div>
+        <label className="flex flex-col gap-1.5 text-meta font-medium text-fg">
           变动金额(¥,正数入账 / 负数扣减,如 1.50 或 -0.25)
-          <Input value={delta} onChange={(e) => setDelta(e.target.value)} placeholder="¥ 金额" />
-          <span className={`text-[11.5px] ${cents == null && delta.trim() !== "" ? "text-danger" : "text-faint"}`}>
-            {preview}
-          </span>
+          <Input className="oc-field-control font-mono tabular-nums" value={delta} onChange={(e) => setDelta(e.target.value)} placeholder="¥ 金额" />
         </label>
-        <label className="flex flex-col gap-1 text-meta text-faint">
+        <div
+          className={`oc-callout rounded-lg px-3 py-2 text-caption font-medium tabular-nums ${
+            delta.trim() === ""
+              ? "text-faint"
+              : cents == null
+                ? "oc-callout-danger text-danger"
+                : cents > 0
+                  ? "oc-callout-success text-success"
+                  : "oc-callout-warning text-warning"
+          }`}
+        >
+          {preview}
+        </div>
+        <label className="flex flex-col gap-1.5 text-meta font-medium text-fg">
           备注(memo)
-          <Input value={memo} onChange={(e) => setMemo(e.target.value)} placeholder="调整原因" />
+          <Input className="oc-field-control" value={memo} onChange={(e) => setMemo(e.target.value)} placeholder="调整原因" />
         </label>
       </div>
     </Modal>
@@ -415,10 +427,15 @@ function RejectInvoiceModal({
         </>
       }
     >
-      <label className="flex flex-col gap-1 text-meta text-faint">
-        拒绝理由(admin_note,会记录并展示)
-        <Textarea value={note} onChange={(e) => setNote(e.target.value)} rows={3} placeholder="填写拒绝原因" />
-      </label>
+      <div className="flex flex-col gap-3">
+        <div className="oc-callout oc-callout-danger rounded-xl px-3.5 py-2.5 text-caption text-danger">
+          拒绝后申请状态将变为已拒绝，填写的拒绝理由将记录并展示给组织管理员。
+        </div>
+        <label className="flex flex-col gap-1.5 text-meta font-medium text-fg">
+          拒绝理由(admin_note,会记录并展示)
+          <Textarea className="oc-field-control" value={note} onChange={(e) => setNote(e.target.value)} rows={3} placeholder="填写拒绝原因" />
+        </label>
+      </div>
     </Modal>
   );
 }
@@ -571,6 +588,7 @@ export default function OrgPage() {
   return (
     <div className="flex flex-col gap-5">
       <PageHeader
+        icon={Building2}
         title={meta.title}
         desc={meta.desc}
         actions={
@@ -588,7 +606,13 @@ export default function OrgPage() {
       />
 
       {/* 组织列表 */}
-      <SectionCard title="组织" hint={orgLoading ? "加载中…" : `共 ${orgs.length} 个`} bodyClassName="p-4">
+      <SectionCard
+        title="组织"
+        hint={orgLoading ? "加载中…" : `共 ${orgs.length} 个`}
+        icon={Building2}
+        iconTone="accent"
+        bodyClassName="p-4"
+      >
         {orgError ? (
           <EmptyState
             icon={Inbox}
@@ -603,7 +627,7 @@ export default function OrgPage() {
         ) : orgLoading ? (
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
             {Array.from({ length: 3 }).map((_, i) => (
-              <div key={i} className="h-40 animate-pulse rounded-xl border border-border bg-surface" />
+              <div key={i} className="oc-surface-card h-40 animate-pulse rounded-xl" />
             ))}
           </div>
         ) : orgs.length === 0 ? (
@@ -611,15 +635,20 @@ export default function OrgPage() {
         ) : (
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
             {orgs.map((o) => (
-              <Card key={o.id} className="flex flex-col gap-2.5 p-4">
+              <Card key={o.id} className="oc-surface-card-hover flex flex-col gap-3 rounded-xl p-4">
                 <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0">
-                    <p className="truncate text-title font-semibold text-fg">{o.name}</p>
-                    <span className="font-mono text-caption text-faint">#{o.id}</span>
+                  <div className="flex min-w-0 items-center gap-2.5">
+                    <span className="oc-icon-badge oc-icon-badge-accent size-9 rounded-lg">
+                      <Building2 size={16} strokeWidth={1.9} />
+                    </span>
+                    <div className="min-w-0">
+                      <p className="truncate text-title font-semibold tracking-tight text-fg">{o.name}</p>
+                      <span className="font-mono text-caption text-faint">#{o.id}</span>
+                    </div>
                   </div>
                   <Badge tone={ORG_STATUS_TONE[o.status] ?? "neutral"}>{o.status || "—"}</Badge>
                 </div>
-                <div className="flex flex-col gap-0.5">
+                <div className="oc-surface-recessed flex flex-col gap-0.5 rounded-xl px-3 py-1">
                   <KeyValue
                     label="成员"
                     value={
@@ -645,9 +674,9 @@ export default function OrgPage() {
                       )
                     }
                   />
-                  <KeyValue label="余额" value={<span className="tabular-nums">{fmtCents(o.credits)}</span>} />
+                  <KeyValue label="余额" value={<span className="font-semibold tabular-nums">{fmtCents(o.credits)}</span>} />
                 </div>
-                <div className="flex flex-wrap justify-end gap-1.5 border-t border-border pt-3">
+                <div className="flex flex-wrap justify-end gap-1.5 border-t border-border/70 pt-3">
                   <Button variant="ghost" size="sm" onClick={() => setEditOrg(o)}>
                     编辑
                   </Button>
@@ -675,6 +704,8 @@ export default function OrgPage() {
       <SectionCard
         title="开票申请"
         hint={`共 ${filteredInvoices.length} 条`}
+        icon={Receipt}
+        iconTone="info"
         bodyClassName="flex flex-col gap-3 p-4"
       >
         <FilterBar>
@@ -690,13 +721,13 @@ export default function OrgPage() {
             onChange={setInvStatus}
           />
           {invOrgFilter && (
-            <span className="inline-flex items-center gap-1.5 rounded-md bg-accent-soft px-2 py-1 text-meta text-accent">
+            <span className="oc-badge-craft inline-flex items-center gap-1.5 rounded-lg bg-accent-soft px-2.5 py-1 text-meta text-accent">
               已筛选组织:<strong>{invOrgFilter.name}</strong>
               <button
                 type="button"
                 aria-label="清除组织筛选"
                 onClick={() => setInvOrgFilter(null)}
-                className="rounded p-0.5 hover:bg-accent/10"
+                className="oc-icon-btn-tactile rounded p-0.5 hover:bg-accent/10"
               >
                 <X size={13} />
               </button>

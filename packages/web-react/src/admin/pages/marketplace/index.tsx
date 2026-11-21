@@ -1,4 +1,14 @@
-import { Clock3, Eye, PackageCheck, Repeat2, ScanSearch, Users } from "lucide-react";
+import {
+  Clock3,
+  Eye,
+  PackageCheck,
+  PackageX,
+  Repeat2,
+  ScanSearch,
+  Store,
+  TriangleAlert,
+  Users,
+} from "lucide-react";
 import { useEffect, useState } from "react";
 import { FeaturedPanel } from "../../../components/marketplace/FeaturedPanel";
 import { ReviewPanel } from "../../../components/marketplace/ReviewPanel";
@@ -107,14 +117,14 @@ function FunnelPanel() {
   const cohortAvailable = cohort?.availability === "available";
   const skillColumns: Column<SkillFunnelRow>[] = [
     { key: "skill_slug", title: "技能", render: (row) => <span className="font-mono text-meta">{row.skill_slug}</span> },
-    { key: "exposure_pairs", title: "曝光对", align: "right" },
-    { key: "installed_pairs", title: "安装对", align: "right" },
-    { key: "first_use_pairs", title: "首用对", align: "right" },
-    { key: "repeat_pairs", title: "复用对", align: "right" },
+    { key: "exposure_pairs", title: "曝光对", align: "right", cellClassName: "tabular-nums" },
+    { key: "installed_pairs", title: "安装对", align: "right", cellClassName: "tabular-nums" },
+    { key: "first_use_pairs", title: "首用对", align: "right", cellClassName: "tabular-nums" },
+    { key: "repeat_pairs", title: "复用对", align: "right", cellClassName: "tabular-nums" },
   ];
   return (
-    <div className="flex flex-col gap-4 p-4">
-      <div className="flex items-center justify-between gap-3">
+    <div className="flex flex-col gap-4 p-4 sm:p-5">
+      <div className="oc-surface-recessed flex flex-wrap items-center justify-between gap-3 rounded-xl px-3.5 py-2.5">
         <p className="text-sm text-muted">近 30 天；默认只统计真实用户。</p>
         <SelectFilter
           label="流量"
@@ -126,7 +136,7 @@ function FunnelPanel() {
       {error && <Alert tone="danger">{error}</Alert>}
       {data && !cohortAvailable && (
         <Alert tone="warning" title="历史数据不可计算漏斗">
-          {cohort?.unavailable_events ?? 0} 条历史阶段事件缺少同一 user + skill 的前向旅程依据。以下只展示各阶段观测量，不计算或暗示转化率。
+          <span className="tabular-nums">{cohort?.unavailable_events ?? 0}</span> 条历史阶段事件缺少同一 user + skill 的前向旅程依据。以下只展示各阶段观测量，不计算或暗示转化率。
         </Alert>
       )}
       {cohortAvailable ? (
@@ -150,18 +160,32 @@ function FunnelPanel() {
         </StatCardRow>
       )}
       <div className="grid gap-3 md:grid-cols-2">
-        <div className="rounded-xl border border-border bg-elevated p-4">
-          <h3 className="text-sm font-semibold text-fg">市场中心曝光（hub-only）</h3>
+        <div className="oc-surface-card oc-surface-card-hover rounded-xl p-4">
+          <h3 className="flex items-center gap-2 text-sm font-semibold text-fg">
+            <span className="oc-icon-badge oc-icon-badge-info size-7 rounded-lg">
+              <Eye size={14} />
+            </span>
+            市场中心曝光（hub-only）
+          </h3>
           {data?.hub_only ? (
-            <p className="mt-3 text-sm text-muted">{data.hub_only.exposure_users} 位用户 · {data.hub_only.exposure_events} 次目录展示</p>
+            <p className="mt-3 text-sm tabular-nums text-muted">
+              {data.hub_only.exposure_users} 位用户 · {data.hub_only.exposure_events} 次目录展示
+            </p>
           ) : (
             <p className="mt-3 text-sm text-faint">当前 API 未提供 hub-only 口径，暂不推算。</p>
           )}
         </div>
-        <div className="rounded-xl border border-border bg-elevated p-4">
-          <h3 className="flex items-center gap-2 text-sm font-semibold text-fg"><Clock3 size={15} />安装到首次成功使用</h3>
+        <div className="oc-surface-card oc-surface-card-hover rounded-xl p-4">
+          <h3 className="flex items-center gap-2 text-sm font-semibold text-fg">
+            <span className="oc-icon-badge oc-icon-badge-accent size-7 rounded-lg">
+              <Clock3 size={14} />
+            </span>
+            安装到首次成功使用
+          </h3>
           {data?.time_to_first_use ? (
-            <p className="mt-3 text-sm text-muted">中位数 {duration(data.time_to_first_use.median_seconds)} · p95 {duration(data.time_to_first_use.p95_seconds)} · n={data.time_to_first_use.sample_size}</p>
+            <p className="mt-3 text-sm tabular-nums text-muted">
+              中位数 {duration(data.time_to_first_use.median_seconds)} · p95 {duration(data.time_to_first_use.p95_seconds)} · n={data.time_to_first_use.sample_size}
+            </p>
           ) : (
             <p className="mt-3 text-sm text-faint">当前 API 未提供可关联样本，暂不可用。</p>
           )}
@@ -174,28 +198,42 @@ function FunnelPanel() {
         emptyTitle="暂无技能级 journey"
         emptyHint="接口未返回 skill-level 数据时不从独立阶段数推算。"
       />
-      <div className="rounded-xl border border-border bg-elevated p-4">
-        <h3 className="text-sm font-semibold text-fg">卸载原因</h3>
-        <div className="mt-3 flex flex-wrap gap-2">
-          {(data?.uninstall_reasons ?? []).length === 0 ? (
-            <span className="text-sm text-faint">近 30 天暂无卸载</span>
-          ) : (
-            data?.uninstall_reasons.map((row) => (
-              <Badge key={row.reason} tone="neutral">
+      <div className="grid gap-3 md:grid-cols-2">
+        <div className="oc-surface-card rounded-xl p-4">
+          <h3 className="flex items-center gap-2 text-sm font-semibold text-fg">
+            <span className="oc-icon-badge size-7 rounded-lg">
+              <PackageX size={14} />
+            </span>
+            卸载原因
+          </h3>
+          <div className="mt-3 flex flex-wrap gap-2">
+            {(data?.uninstall_reasons ?? []).length === 0 ? (
+              <span className="text-sm text-faint">近 30 天暂无卸载</span>
+            ) : (
+              data?.uninstall_reasons.map((row) => (
+                <Badge key={row.reason} tone="neutral" className="tabular-nums">
+                  {REASON_LABEL[row.reason] ?? row.reason} · {row.count}
+                </Badge>
+              ))
+            )}
+          </div>
+        </div>
+        <div className="oc-surface-card rounded-xl p-4">
+          <h3 className="flex items-center gap-2 text-sm font-semibold text-fg">
+            <span className="oc-icon-badge oc-icon-badge-warning size-7 rounded-lg">
+              <TriangleAlert size={14} />
+            </span>
+            安装失败原因
+          </h3>
+          <div className="mt-3 flex flex-wrap gap-2">
+            {(data?.install_failures ?? []).length === 0 ? (
+              <span className="text-sm text-faint">无数据；不将卸载原因替代为安装失败原因。</span>
+            ) : data?.install_failures?.map((row) => (
+              <Badge key={row.reason} tone="warning" className="tabular-nums">
                 {REASON_LABEL[row.reason] ?? row.reason} · {row.count}
               </Badge>
-            ))
-          )}
-        </div>
-      </div>
-      <div className="rounded-xl border border-border bg-elevated p-4">
-        <h3 className="text-sm font-semibold text-fg">安装失败原因</h3>
-        <div className="mt-3 flex flex-wrap gap-2">
-          {(data?.install_failures ?? []).length === 0 ? (
-            <span className="text-sm text-faint">无数据；不将卸载原因替代为安装失败原因。</span>
-          ) : data?.install_failures?.map((row) => (
-            <Badge key={row.reason} tone="warning">{REASON_LABEL[row.reason] ?? row.reason} · {row.count}</Badge>
-          ))}
+            ))}
+          </div>
         </div>
       </div>
     </div>
@@ -218,9 +256,9 @@ export default function MarketplacePage() {
   const [tab, setTab] = useState("review");
   return (
     <div className="flex flex-col gap-5">
-      <PageHeader title={meta.title} desc={meta.desc} />
+      <PageHeader icon={Store} title={meta.title} desc={meta.desc} />
       <Tabs value={tab} onValueChange={setTab} items={TAB_ITEMS} aria-label="AI 市场分区" />
-      <div className="overflow-hidden rounded-xl border border-border bg-surface">
+      <div className="oc-surface-card overflow-hidden rounded-2xl">
         {tab === "review" && <ReviewPanel auth={adminSession} />}
         {tab === "featured" && <FeaturedPanel auth={adminSession} />}
         {tab === "funnel" && <FunnelPanel />}

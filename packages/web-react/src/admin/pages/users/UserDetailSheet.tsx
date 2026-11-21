@@ -1,21 +1,28 @@
 import {
+  Activity,
   Ban,
   ChevronRight,
   Container,
   ExternalLink,
+  KeyRound,
+  Link2,
+  type LucideIcon,
   MessageSquareText,
+  Receipt,
+  Shield,
   ShieldCheck,
   ShieldOff,
   Undo2,
+  User as UserIcon,
   Wallet,
 } from 'lucide-react'
 import { type ReactNode, useEffect, useState } from 'react'
-import { Badge, Button, Sheet, Switch, useConfirm, useToast } from '../../../components/ui'
+import { Avatar, Badge, Button, Sheet, Switch, useConfirm, useToast } from '../../../components/ui'
 import { KeyValue, LevelBadge, SectionCard, TimeAgo } from '../../components'
 import { adminGet, adminSend, apiErrorMessage } from '../../lib/adminApi'
 import { fmtDateTime, fmtInt, fmtYuan } from './format'
 import { SessionViewerModal } from './SessionViewerModal'
-import type { ModelGrant, UserDetail, UserRow, UserSessionSummary } from './types'
+import type { ModelGrant, UserDetail, UserSessionSummary } from './types'
 import { useLoad } from './useLoad'
 
 const STATUS_TONE: Record<string, 'success' | 'danger' | 'warning' | 'neutral'> = {
@@ -112,12 +119,17 @@ export function UserDetailSheet({
     >
       {confirmEl}
       {/* 头部 */}
-      <div className="flex h-14 shrink-0 items-center justify-between gap-2 border-b border-border px-5">
-        <div className="min-w-0">
-          <p className="truncate text-title font-semibold text-fg">
-            {u?.email || (userId ? `用户 #${userId}` : '用户详情')}
-          </p>
-          {u && <p className="truncate text-caption text-faint">#{u.id}</p>}
+      <div className="oc-surface-glass flex h-14 shrink-0 items-center justify-between gap-2 border-x-0 border-t-0 px-5">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <span className="oc-icon-badge oc-icon-badge-accent size-8 rounded-lg">
+            <UserIcon size={15} strokeWidth={2} />
+          </span>
+          <div className="min-w-0">
+            <p className="truncate text-title font-semibold tracking-tight text-fg">
+              {u?.email || (userId ? `用户 #${userId}` : '用户详情')}
+            </p>
+            {u && <p className="truncate font-mono text-caption text-faint">#{u.id}</p>}
+          </div>
         </div>
         <Button variant="ghost" size="sm" onClick={onClose}>
           关闭
@@ -128,17 +140,41 @@ export function UserDetailSheet({
         {detail.loading && !detail.data ? (
           <div className="flex flex-col gap-3">
             {['a', 'b', 'c', 'd', 'e'].map((k) => (
-              <div key={k} className="h-16 w-full animate-pulse rounded-lg bg-hover" />
+              <div key={k} className="oc-surface-card h-16 w-full animate-pulse rounded-xl bg-hover/60" />
             ))}
           </div>
         ) : detail.error ? (
-          <div className="rounded-lg border border-danger/40 bg-danger-soft px-4 py-6 text-center text-body text-danger">
+          <div className="oc-callout oc-callout-danger rounded-xl px-4 py-6 text-center text-body text-danger">
             加载失败：{errMsg(detail.error)}
           </div>
         ) : u ? (
           <div className="flex flex-col gap-4">
+            {/* 顶部用户资料卡 */}
+            <div className="oc-surface-card flex items-center gap-3.5 rounded-xl p-4">
+              <span className="oc-avatar-ring shrink-0 rounded-full">
+                <Avatar
+                  size="md"
+                  src={u.avatar_url ?? undefined}
+                  fallback={(u.display_name || u.email || '?').slice(0, 1).toUpperCase()}
+                />
+              </span>
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="truncate text-section font-semibold tracking-tight text-fg">
+                    {u.display_name || u.email}
+                  </span>
+                  <Badge tone={STATUS_TONE[u.status] ?? 'neutral'}>{u.status}</Badge>
+                  <Badge tone={u.role === 'admin' ? 'warning' : 'neutral'}>{u.role}</Badge>
+                </div>
+                <p className="mt-1 truncate text-caption text-muted">
+                  ID <span className="font-mono text-faint">#{u.id}</span> ·{' '}
+                  {u.email_verified ? '邮箱已验证' : '邮箱未验证'}
+                </p>
+              </div>
+            </div>
+
             {/* 基本信息 */}
-            <SectionCard title="基本信息" bodyClassName="py-2">
+            <SectionCard title="基本信息" icon={UserIcon} iconTone="accent" bodyClassName="py-2">
               <KeyValue
                 label="邮箱"
                 value={
@@ -207,7 +243,7 @@ export function UserDetailSheet({
             </SectionCard>
 
             {/* 账号操作 */}
-            <SectionCard title="账号操作" hint="破坏性操作需二次确认">
+            <SectionCard title="账号操作" hint="破坏性操作需二次确认" icon={Shield} iconTone="warning">
               <div className="flex flex-col gap-3">
                 <div className="flex flex-wrap items-center gap-2">
                   <Button
@@ -289,8 +325,8 @@ export function UserDetailSheet({
                     </Button>
                   )}
                 </div>
-                <div className="flex items-center justify-between rounded-lg bg-hover px-3 py-2">
-                  <span className="text-meta text-muted">标记邮箱已验证</span>
+                <div className="oc-surface-recessed flex items-center justify-between rounded-xl px-3.5 py-2.5">
+                  <span className="text-meta font-medium text-muted">标记邮箱已验证</span>
                   <Switch
                     checked={u.email_verified}
                     disabled={busy}
@@ -307,7 +343,7 @@ export function UserDetailSheet({
             </SectionCard>
 
             {/* 关联数据深链 */}
-            <SectionCard title="关联数据">
+            <SectionCard title="关联数据" icon={Link2} iconTone="info">
               <div className="flex flex-wrap gap-2">
                 <Button
                   variant="secondary"
@@ -331,7 +367,12 @@ export function UserDetailSheet({
             </SectionCard>
 
             {/* 模型授权列表 */}
-            <SectionCard title="模型授权" hint="该用户被显式授予的模型（白名单外额外授权）">
+            <SectionCard
+              title="模型授权"
+              hint="该用户被显式授予的模型（白名单外额外授权）"
+              icon={KeyRound}
+              iconTone="accent"
+            >
               {grants.loading && !grants.data ? (
                 <div className="h-10 w-full animate-pulse rounded-lg bg-hover" />
               ) : grants.error ? (
@@ -342,7 +383,7 @@ export function UserDetailSheet({
                 <ul className="flex flex-col divide-y divide-border/60">
                   {grants.data?.rows.map((g) => (
                     <li key={g.id} className="flex items-center justify-between gap-2 py-2">
-                      <code className="truncate text-meta text-fg">{g.model_id}</code>
+                      <code className="truncate font-mono text-meta text-fg">{g.model_id}</code>
                       <TimeAgo value={g.granted_at} className="shrink-0 text-caption text-faint" />
                     </li>
                   ))}
@@ -353,6 +394,8 @@ export function UserDetailSheet({
             {/* 最近充值 */}
             <MiniTableCard
               title={`最近充值（${detail.data?.topups.length ?? 0}）`}
+              icon={Receipt}
+              iconTone="success"
               empty="暂无充值记录"
               rows={detail.data?.topups ?? []}
             >
@@ -364,7 +407,7 @@ export function UserDetailSheet({
                   <span className="shrink-0 text-faint tabular-nums">
                     {fmtDateTime(t.created_at)}
                   </span>
-                  <span className="tabular-nums text-success">+{fmtYuan(t.delta)}</span>
+                  <span className="font-medium tabular-nums text-success">+{fmtYuan(t.delta)}</span>
                   <span className="min-w-0 flex-1 truncate text-right text-muted">
                     {t.memo || '—'}
                   </span>
@@ -375,6 +418,8 @@ export function UserDetailSheet({
             {/* 最近请求 */}
             <MiniTableCard
               title={`最近请求（${detail.data?.recent_requests.length ?? 0}）`}
+              icon={Activity}
+              iconTone="info"
               empty="暂无请求记录"
               rows={detail.data?.recent_requests ?? []}
             >
@@ -386,7 +431,7 @@ export function UserDetailSheet({
                   <span className="shrink-0 text-faint tabular-nums">
                     {fmtDateTime(r.created_at)}
                   </span>
-                  <code className="min-w-0 flex-1 truncate text-fg">{r.model || '—'}</code>
+                  <code className="min-w-0 flex-1 truncate font-mono text-fg">{r.model || '—'}</code>
                   <span className="tabular-nums text-muted">{fmtYuan(r.cost_credits)}</span>
                   <LevelBadge
                     level={r.status === 'success' ? 'success' : 'warning'}
@@ -399,6 +444,8 @@ export function UserDetailSheet({
             {/* 最近会话（90 天摘要） */}
             <MiniTableCard
               title={`最近会话 · 90 天（${detail.data?.recent_sessions.length ?? 0}）`}
+              icon={MessageSquareText}
+              iconTone="accent"
               empty="90 天内暂无会话"
               rows={detail.data?.recent_sessions ?? []}
             >
@@ -438,17 +485,21 @@ export function UserDetailSheet({
 
 function MiniTableCard<T>({
   title,
+  icon,
+  iconTone = 'neutral',
   empty,
   rows,
   children,
 }: {
   title: string
+  icon?: LucideIcon
+  iconTone?: 'neutral' | 'accent' | 'success' | 'warning' | 'danger' | 'info'
   empty: string
   rows: T[]
   children: (row: T) => ReactNode
 }) {
   return (
-    <SectionCard title={title} bodyClassName="py-2">
+    <SectionCard title={title} icon={icon} iconTone={iconTone} bodyClassName="py-2">
       {rows.length === 0 ? (
         <p className="py-1 text-meta text-faint">{empty}</p>
       ) : (

@@ -114,20 +114,26 @@ export function PendingPaymentRecovery({
 
   return (
     <div
-      className="fixed inset-x-4 bottom-[calc(1rem+env(safe-area-inset-bottom))] z-[70] mx-auto flex max-w-md items-center gap-3 rounded-xl border border-border bg-elevated px-4 py-3 shadow-float"
+      className="oc-surface-popover fixed inset-x-4 bottom-[calc(1rem+env(safe-area-inset-bottom))] z-[70] mx-auto flex max-w-md items-center gap-3 rounded-2xl px-4 py-3"
       role="status"
       aria-live="polite"
       data-testid={pending ? "payment-recovery-pending" : `payment-recovery-${result?.kind}`}
     >
       {pending ? (
-        <Spinner size={18} className="shrink-0" />
+        <span className="oc-icon-badge oc-icon-badge-accent h-8 w-8 rounded-sm" aria-hidden>
+          <Spinner size={16} />
+        </span>
       ) : result?.kind === "paid" ? (
-        <Check size={20} className="shrink-0 text-success" />
+        <span className="oc-icon-badge oc-icon-badge-success h-8 w-8 rounded-sm" aria-hidden>
+          <Check size={16} strokeWidth={2} />
+        </span>
       ) : (
-        <CircleAlert size={20} className="shrink-0 text-warning" />
+        <span className="oc-icon-badge oc-icon-badge-warning h-8 w-8 rounded-sm" aria-hidden>
+          <CircleAlert size={16} strokeWidth={1.75} />
+        </span>
       )}
       <div className="min-w-0 flex-1">
-        <div className="text-section font-medium text-fg">
+        <div className="text-section font-semibold text-fg">
           {pending
             ? `正在确认${pending.label}结果…`
             : result?.kind === "paid"
@@ -143,7 +149,7 @@ export function PendingPaymentRecovery({
         </div>
       </div>
       {result && (
-        <Button variant="ghost" size="sm" onClick={() => setResult(null)} className="shrink-0">
+        <Button variant="secondary" size="sm" onClick={() => setResult(null)} className="shrink-0">
           知道了
         </Button>
       )}

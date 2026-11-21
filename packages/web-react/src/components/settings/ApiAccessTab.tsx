@@ -1,4 +1,5 @@
 import { publicCursorModelId } from "@openclaude/protocol/browser";
+import { Activity, FileSearch, Terminal } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ApiError,
@@ -17,9 +18,9 @@ import type {
   UsageReportModel,
   UsageReportWindow,
 } from "../../lib/types";
-import { cn, formatCompactCount, formatCredits, groupDigits } from "../../lib/utils";
+import { formatCompactCount, formatCredits, groupDigits } from "../../lib/utils";
 import { ChartCard, chartNum, lineConfig, useChart } from "../charts";
-import { Alert, Button, Select, Skeleton, Switch, Tabs } from "../ui";
+import { Alert, Badge, Button, Select, Skeleton, Switch, Tabs } from "../ui";
 import { ApiKeysSection } from "./ApiKeysSection";
 import { apiRequestStatusLabel, formatReportBucket, REPORT_WINDOW_NOUN, shortTime } from "./labels";
 import { StatTile } from "./StatTile";
@@ -144,11 +145,16 @@ export function ApiAccessTab({ auth }: { auth: AuthSession }) {
 
   return (
     <div className="flex min-w-0 flex-col">
-      <div className="px-5 pt-5">
-        <h2 className="text-[20px] font-semibold tracking-tight text-fg">把模型接到你的工具</h2>
-        <p className="mt-1 text-caption text-muted">
-          通过 API Key 连接 Claude Code 或 CC Switch，沿用本站模型与积分。
-        </p>
+      <div className="flex items-start gap-3 px-5 pt-5">
+        <span className="oc-icon-badge oc-icon-badge-accent h-9 w-9 rounded-md" aria-hidden>
+          <Terminal size={17} strokeWidth={1.75} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <h2 className="text-xl font-semibold tracking-tight text-fg">把模型接到你的工具</h2>
+          <p className="mt-1 text-caption text-muted">
+            通过 API Key 连接 Claude Code 或 CC Switch，沿用本站模型与积分。
+          </p>
+        </div>
       </div>
 
       {/* 区块顺序 = 用户动线：快速接入 → 密钥管理(以上在 ApiKeysSection 内)→ 用量概览 →
@@ -282,9 +288,14 @@ export function ApiKeyUsagePanel({ auth, keys }: { auth: AuthSession; keys: ApiK
 
   return (
     <div className="min-w-0 border-t border-border px-5 py-5" data-api-key-usage>
-      <div className="flex flex-wrap items-center gap-2 pb-3">
-        <div className="text-section font-semibold text-fg">
-          消耗统计 · 近 {REPORT_WINDOW_NOUN[window]}
+      <div className="flex flex-wrap items-center gap-2.5 pb-3">
+        <div className="flex items-center gap-2">
+          <span className="oc-icon-badge oc-icon-badge-accent h-7 w-7 rounded-sm" aria-hidden>
+            <Activity size={14} strokeWidth={1.75} />
+          </span>
+          <div className="text-section font-semibold text-fg">
+            消耗统计 · 近 {REPORT_WINDOW_NOUN[window]}
+          </div>
         </div>
         <div className="flex w-full flex-wrap items-center gap-2">
           <Tabs
@@ -652,8 +663,13 @@ export function ApiKeyAuditPanel({ auth, keys }: { auth: AuthSession; keys: ApiK
 
   return (
     <div className="min-w-0 border-t border-border px-5 py-5" data-api-key-audit>
-      <div className="flex flex-wrap items-center gap-2 pb-1">
-        <div className="text-section font-semibold text-fg">请求审计</div>
+      <div className="flex flex-wrap items-center gap-2.5 pb-1.5">
+        <div className="flex items-center gap-2">
+          <span className="oc-icon-badge h-7 w-7 rounded-sm" aria-hidden>
+            <FileSearch size={14} strokeWidth={1.75} />
+          </span>
+          <div className="text-section font-semibold text-fg">请求审计</div>
+        </div>
         <div className="flex w-full flex-wrap items-center gap-3">
           <Select
             aria-label="审计按密钥过滤"
@@ -823,39 +839,53 @@ function StatusChip({
   children: React.ReactNode;
 }) {
   return (
-    <span
+    <Badge
+      tone={ok ? "success" : "danger"}
+      size="sm"
       title={title ?? undefined}
-      className={cn(
-        "inline-flex whitespace-nowrap rounded px-1.5 py-0.5 text-caption",
-        ok ? "bg-success-soft text-success" : "bg-danger-soft text-danger",
-      )}
+      className="whitespace-nowrap"
     >
       {children}
-    </span>
+    </Badge>
   );
 }
 
 function KeyStatus({ revoked, disabled }: { revoked: boolean; disabled: boolean }) {
-  const cls = "inline-flex whitespace-nowrap rounded px-1.5 py-0.5 text-caption";
   if (revoked) {
-    return <span className={cn(cls, "bg-hover text-faint")}>已撤销</span>;
+    return (
+      <Badge tone="neutral" size="sm" className="whitespace-nowrap">
+        已撤销
+      </Badge>
+    );
   }
   if (disabled) {
-    return <span className={cn(cls, "bg-warning-soft text-warning")}>已禁用</span>;
+    return (
+      <Badge tone="warning" size="sm" className="whitespace-nowrap">
+        已禁用
+      </Badge>
+    );
   }
-  return <span className={cn(cls, "bg-success-soft text-success")}>启用中</span>;
+  return (
+    <Badge tone="success" size="sm" className="whitespace-nowrap">
+      启用中
+    </Badge>
+  );
 }
 
 function SubHeading({ children }: { children: React.ReactNode }) {
   return (
-    <div className="mt-4 pb-2 text-caption font-medium uppercase tracking-wide text-faint">
+    <div className="mt-5 pb-2 text-caption font-semibold uppercase tracking-wider text-faint">
       {children}
     </div>
   );
 }
 
 function EmptyRow({ children }: { children: React.ReactNode }) {
-  return <p className="py-4 text-center text-meta text-faint">{children}</p>;
+  return (
+    <div className="oc-surface-recessed rounded-xl px-4 py-5 text-center text-meta text-faint">
+      {children}
+    </div>
+  );
 }
 
 /**
@@ -864,7 +894,7 @@ function EmptyRow({ children }: { children: React.ReactNode }) {
  * `[&_th]:whitespace-nowrap`：表头是短标签，压窄时不许「状态」竖排成「状 / 态」(审计 SET-07)。
  */
 const THEAD_CLS =
-  "sticky top-0 z-10 bg-hover text-caption font-medium uppercase tracking-wide text-faint [&_th]:whitespace-nowrap";
+  "sticky top-0 z-10 bg-bg/95 text-caption font-medium uppercase tracking-wide text-faint [&_th]:whitespace-nowrap";
 
 /**
  * 表格外壳。
@@ -886,10 +916,10 @@ function TableShell({
 }) {
   return (
     <div
-      className="overflow-auto rounded-xl border border-border"
+      className="oc-surface-card overflow-auto rounded-xl"
       style={maxHeight ? { maxHeight } : undefined}
     >
-      <table className="w-full text-left text-meta" style={{ minWidth }}>
+      <table className="w-full text-left text-meta [&_tbody_tr]:transition-colors [&_tbody_tr:hover]:bg-hover/60" style={{ minWidth }}>
         <caption className="sr-only">{caption}</caption>
         {children}
       </table>

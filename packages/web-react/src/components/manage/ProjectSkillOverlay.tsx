@@ -1,4 +1,4 @@
-import { ChevronRight, FileText } from "lucide-react";
+import { ChevronRight, FileText, Layers, Lock } from "lucide-react";
 import { useCallback, useEffect, useId, useMemo, useState } from "react";
 import { useProjectScope } from "../../hooks/useProjectScope";
 import { api, apiErrorMessage } from "../../lib/api";
@@ -115,7 +115,10 @@ export function ProjectSkillOverlay({
     // 与下方技能列表同一种分组容器(OCV5-362):改前是一条通栏发丝线 + 悬在线下的折叠按钮,
     // 夹在上下文行与搜索框之间像一道多余的分隔。
     <section
-      className="mx-4 mb-3 rounded-xl border border-border bg-surface px-4 py-1.5"
+      className={cn(
+        "oc-surface-card mx-4 mb-3 rounded-xl bg-surface px-4 py-2",
+        !open && "oc-surface-card-hover",
+      )}
       data-testid="project-skill-overlay"
       aria-label="项目专属技能"
     >
@@ -128,10 +131,17 @@ export function ProjectSkillOverlay({
           // 折叠区只在展开时挂载:收起态不能留一个指向空气的 IDREF(t-762 manage#2;同 SkillsPanel 写法)。
           aria-controls={open ? `${uid}-body` : undefined}
           data-testid="project-skill-overlay-toggle"
-          className="-ml-3 gap-1 font-medium"
+          className="oc-btn-tactile -ml-2.5 gap-2 rounded-lg px-2.5 font-medium"
         >
-          <ChevronRight size={14} aria-hidden="true" className={cn("transition-transform", open && "rotate-90")} />
-          项目专属技能
+          <span className="oc-icon-badge oc-icon-badge-accent size-6 rounded-md" aria-hidden="true">
+            <Layers size={13} strokeWidth={1.85} />
+          </span>
+          <ChevronRight
+            size={14}
+            aria-hidden="true"
+            className={cn("text-faint transition-transform duration-150", open && "rotate-90 text-fg")}
+          />
+          <span>项目专属技能</span>
           {summaryCount !== null && (
             <Badge tone={summaryCount > 0 ? "accent" : "neutral"} size="sm">
               已启用 {summaryCount}
@@ -139,14 +149,21 @@ export function ProjectSkillOverlay({
           )}
         </Button>
         {open && (
-          <Button size="sm" className="ml-auto" loading={saving} disabled={!dirty || loading} onClick={() => void save()}>
+          <Button
+            variant={dirty ? "primary" : "secondary"}
+            size="sm"
+            className="ml-auto"
+            loading={saving}
+            disabled={!dirty || loading}
+            onClick={() => void save()}
+          >
             保存
           </Button>
         )}
       </div>
       {open && (
-        <div id={`${uid}-body`} className="mt-1 flex flex-col gap-2">
-          <p className="text-caption text-muted">
+        <div id={`${uid}-body`} className="mt-2 flex flex-col gap-2.5 pb-1">
+          <p className="oc-callout oc-callout-info rounded-lg px-3 py-2 text-caption text-muted">
             只对当前项目生效；与全局设置不一致时，以项目内为准。持有账号凭据的密钥类技能不能按项目启用。
           </p>
           {saveErr && (
@@ -180,7 +197,7 @@ export function ProjectSkillOverlay({
           ) : skills.length === 0 ? (
             <EmptyState icon={FileText} title="没有可启用的技能" hint="先在上方技能列表里创建或从市场安装。" />
           ) : (
-            <ul className="flex flex-col divide-y divide-border">
+            <ul className="oc-surface-recessed flex flex-col divide-y divide-border rounded-xl px-3">
               {skills.map((s) => {
                 const blocked = isSecretSkill(s);
                 const on = selected.includes(s.name) && !blocked;
@@ -192,7 +209,7 @@ export function ProjectSkillOverlay({
                     : `已限定 ${s.agentIds.length} 个智能体`
                   : null;
                 return (
-                  <li key={s.name} className="flex items-center gap-3 py-2">
+                  <li key={s.name} className={cn("flex items-center gap-3 py-2.5", blocked && "opacity-75")}>
                     <Switch
                       id={id}
                       data-testid={`project-skill-${s.name}`}
@@ -204,14 +221,15 @@ export function ProjectSkillOverlay({
                     />
                     <label htmlFor={id} className={cn("min-w-0 flex-1", blocked ? "cursor-not-allowed" : "cursor-pointer")}>
                       <span className="flex min-w-0 flex-wrap items-center gap-1.5">
-                        <span className={cn("truncate text-body", blocked ? "text-faint" : "text-fg")}>{title}</span>
+                        <span className={cn("truncate text-body font-medium", blocked ? "text-faint" : "text-fg")}>{title}</span>
                         {blocked && (
                           <Badge tone="neutral" size="sm">
+                            <Lock size={11} strokeWidth={1.8} aria-hidden="true" />
                             密钥类，不可用于项目
                           </Badge>
                         )}
                       </span>
-                      <span className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-2 text-caption text-faint">
+                      <span className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-2 text-caption tabular-nums text-faint">
                         {caption && <span className="truncate font-mono">{caption}</span>}
                         {scopeText && <span>{scopeText}</span>}
                       </span>

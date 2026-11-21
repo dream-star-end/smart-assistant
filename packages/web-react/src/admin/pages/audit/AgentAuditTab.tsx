@@ -1,6 +1,17 @@
-import { CheckCircle2, Percent, RadioTower, RotateCw, XCircle } from "lucide-react";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Info,
+  Percent,
+  RadioTower,
+  RotateCw,
+  Terminal,
+  Wrench,
+  XCircle,
+} from "lucide-react";
 import { useEffect, useState } from "react";
 import { Badge, Button, Input, Modal } from "../../../components/ui";
+import { cn } from "../../../lib/utils";
 import {
   type Column,
   CopyChip,
@@ -8,13 +19,14 @@ import {
   FilterBar,
   KeyValue,
   Pagination,
+  SectionCard,
   SelectFilter,
   StatCard,
   StatCardRow,
   TimeAgo,
 } from "../../components";
 import { adminGet, apiErrorMessage } from "../../lib/adminApi";
-import { FormatJsonValue } from "./diff";
+import { PayloadShell } from "./diff";
 
 const PAGE_SIZE = 50;
 
@@ -141,33 +153,28 @@ function errorClassLabel(row: AgentAuditRow): string {
   return errorClassText(errorClassOf(row));
 }
 
-/** 单次工具调用详情:元信息 + input_meta / hash。 */
+/** 单次工具调用详情:元信息 + 错误摘要 + IDE 级 input_meta 载荷。 */
 function DetailBody({ row }: { row: AgentAuditRow }) {
+  const errClass = errorClassOf(row);
+  const errTone = errorClassTone(errClass);
+
   return (
     <div className="flex flex-col gap-4">
-      <div className="rounded-lg border border-border bg-surface px-4 py-2">
+      <div className="oc-surface-recessed divide-y divide-border/60 rounded-xl px-4 py-1">
         <KeyValue label="工具" value={<Badge tone="accent">{row.tool}</Badge>} />
-        <KeyValue
-          label="用户"
-          value={<span className="font-mono text-meta">{row.user_id}</span>}
-        />
-        <KeyValue
-          label="会话"
-          value={<span className="font-mono text-meta break-all">{row.session_id}</span>}
-        />
+        <KeyValue label="用户" value={<CopyChip value={row.user_id} />} />
+        <KeyValue label="会话" value={<CopyChip value={row.session_id} />} />
         <KeyValue
           label="耗时"
           value={
-            <span className="tabular-nums">
+            <span className="font-mono text-meta tabular-nums">
               {row.duration_ms == null ? "—" : `${row.duration_ms}ms`}
             </span>
           }
         />
         <KeyValue
           label="错误分类"
-          value={
-            <Badge tone={errorClassTone(errorClassOf(row))}>{errorClassLabel(row)}</Badge>
-          }
+          value={<Badge tone={errTone}>{errorClassLabel(row)}</Badge>}
         />
         <KeyValue
           label="input_hash"
@@ -177,12 +184,31 @@ function DetailBody({ row }: { row: AgentAuditRow }) {
           label="output_hash"
           value={<span className="font-mono text-meta break-all">{row.output_hash ?? "—"}</span>}
         />
-        <KeyValue label="时间" value={<TimeAgo value={row.created_at} />} />
+        <KeyValue
+          label="时间"
+          value={
+            <span className="tabular-nums">
+              <TimeAgo value={row.created_at} />
+            </span>
+          }
+        />
       </div>
-      <div>
-        <p className="mb-1.5 text-meta font-medium text-faint">input_meta</p>
-        <FormatJsonValue value={row.input_meta} />
-      </div>
+
+      {row.error_msg && (
+        <div className="oc-callout oc-callout-danger flex items-start gap-3 rounded-xl px-3.5 py-2.5">
+          <span className="oc-icon-badge oc-icon-badge-danger mt-0.5 size-7 rounded-lg">
+            <XCircle size={14} />
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="text-caption font-semibold uppercase tracking-wide text-danger">
+              error_msg
+            </p>
+            <p className="mt-0.5 break-all font-mono text-meta text-fg">{row.error_msg}</p>
+          </div>
+        </div>
+      )}
+
+      <PayloadShell title="input_meta" value={row.input_meta} />
     </div>
   );
 }
@@ -315,7 +341,7 @@ export function AgentAuditTab() {
       key: "duration_ms",
       title: "耗时",
       align: "right",
-      cellClassName: "tabular-nums text-muted",
+      cellClassName: "font-mono text-meta tabular-nums text-muted",
       render: (r) => (r.duration_ms == null ? "—" : `${r.duration_ms}ms`),
     },
     {
@@ -328,6 +354,7 @@ export function AgentAuditTab() {
     {
       key: "created_at",
       title: "时间",
+      cellClassName: "tabular-nums",
       render: (r) => <TimeAgo value={r.created_at} />,
     },
   ];
@@ -342,26 +369,59 @@ export function AgentAuditTab() {
       key: "success_calls",
       title: "成功",
       align: "right",
-      cellClassName: "tabular-nums",
+      cellClassName: "tabular-nums text-success font-medium",
       render: (row) => formatCount(row.success_calls),
     },
     {
       key: "failure_calls",
       title: "失败",
       align: "right",
-      cellClassName: "tabular-nums",
-      render: (row) => formatCount(row.failure_calls),
+      cellClassName: "tabular-nums font-medium",
+      render: (row) => (
+        <span className={row.failure_calls > 0 ? "text-warning" : "text-muted"}>
+          {formatCount(row.failure_calls)}
+        </span>
+      ),
     },
     {
       key: "failure_rate",
       title: "失败率",
       align: "right",
       cellClassName: "tabular-nums",
-      render: (row) => (
-        <span className={row.failure_rate && row.failure_rate > 0.05 ? "text-warning" : "text-muted"}>
-          {formatRate(row.failure_rate)}
-        </span>
-      ),
+      render: (row) => {
+        const rate = row.failure_rate;
+        const pctWidth = rate == null ? 0 : Math.min(100, Math.max(0, rate * 100));
+        return (
+          <div className="inline-flex items-center justify-end gap-2">
+            {rate != null && (
+              <span
+                aria-hidden="true"
+                className="hidden h-1.5 w-14 overflow-hidden rounded-full bg-hover sm:inline-block"
+              >
+                <span
+                  className={cn(
+                    "oc-progress-fill block h-full rounded-full",
+                    rate > 0.15 ? "bg-danger" : rate > 0.05 ? "bg-warning" : "bg-success",
+                  )}
+                  style={{ width: `${pctWidth}%` }}
+                />
+              </span>
+            )}
+            <span
+              className={cn(
+                "font-mono text-meta tabular-nums",
+                rate && rate > 0.15
+                  ? "font-semibold text-danger"
+                  : rate && rate > 0.05
+                    ? "font-semibold text-warning"
+                    : "text-muted",
+              )}
+            >
+              {formatRate(rate)}
+            </span>
+          </div>
+        );
+      },
     },
   ];
 
@@ -384,7 +444,7 @@ export function AgentAuditTab() {
       key: "events",
       title: "失败事件",
       align: "right",
-      cellClassName: "tabular-nums",
+      cellClassName: "tabular-nums font-semibold text-fg",
       render: (group) => formatCount(group.events),
     },
     {
@@ -405,7 +465,7 @@ export function AgentAuditTab() {
       key: "latency",
       title: "耗时 P50 / P95",
       align: "right",
-      cellClassName: "tabular-nums text-muted",
+      cellClassName: "font-mono text-meta tabular-nums text-muted",
       render: (group) =>
         group.p50_ms == null || group.p95_ms == null
           ? "—"
@@ -414,7 +474,7 @@ export function AgentAuditTab() {
   ];
 
   return (
-    <div className="flex flex-col gap-3">
+    <div className="flex flex-col gap-4">
       <FilterBar>
         <SelectFilter
           label="统计窗口"
@@ -448,13 +508,19 @@ export function AgentAuditTab() {
           onClick={() => setReloadTick((t) => t + 1)}
           title="刷新"
           aria-label="刷新"
+          className="oc-icon-btn-tactile"
         >
-          <RotateCw size={15} />
+          <RotateCw size={15} className={loading || statsLoading ? "animate-spin" : undefined} />
         </Button>
       </FilterBar>
 
-      <div className="rounded-lg border border-info/40 bg-info-soft px-4 py-3 text-[12.5px] leading-relaxed text-info">
-        下方明细只记录失败调用，日志行数不等于平台事故数。成功/失败调用量及比例来自容器侧隐私安全聚合；不采集命令、路径或工具输出原文。覆盖值只描述当前在线 V5 容器，不证明所选历史窗口完整，也不是服务等级协议（SLA）。
+      <div className="oc-callout oc-callout-info flex items-start gap-3 rounded-xl px-4 py-3 text-body leading-relaxed">
+        <span className="oc-icon-badge oc-icon-badge-info mt-0.5 size-7 rounded-lg">
+          <Info size={14} />
+        </span>
+        <p className="min-w-0 flex-1 text-muted">
+          下方明细只记录失败调用，日志行数不等于平台事故数。成功/失败调用量及比例来自容器侧隐私安全聚合；不采集命令、路径或工具输出原文。覆盖值只描述当前在线 V5 容器，不证明所选历史窗口完整，也不是服务等级协议（SLA）。
+        </p>
       </div>
 
       <StatCardRow>
@@ -497,80 +563,124 @@ export function AgentAuditTab() {
       </StatCardRow>
 
       {stats?.coverage.partial && (
-        <div className="rounded-lg border border-warning/40 bg-warning-soft px-4 py-3 text-[12.5px] leading-relaxed text-warning">
-          当前在线容器上报覆盖 {stats.coverage.covered_containers}/
-          {stats.coverage.expected_containers}；该比例仅基于已上报聚合与心跳，不是服务等级协议（SLA），也不代表历史数据完整覆盖。
+        <div
+          role="alert"
+          className="oc-callout oc-callout-warning flex items-start gap-3 rounded-xl px-4 py-3 text-body leading-relaxed"
+        >
+          <span className="oc-icon-badge oc-icon-badge-warning mt-0.5 size-7 rounded-lg">
+            <AlertTriangle size={14} />
+          </span>
+          <p className="min-w-0 flex-1 text-fg tabular-nums">
+            当前在线容器上报覆盖 {stats.coverage.covered_containers}/
+            {stats.coverage.expected_containers}；该比例仅基于已上报聚合与心跳，不是服务等级协议（SLA），也不代表历史数据完整覆盖。
+          </p>
         </div>
       )}
 
       {statsError && (
-        <p className="text-sm text-danger">
-          统计加载失败：{apiErrorMessage(statsError, "加载失败")}
-        </p>
-      )}
-
-      <div>
-        <h3 className="text-body font-semibold text-fg">按工具成败率</h3>
-        <p className="mt-0.5 text-meta text-faint">
-          成功/失败均来自容器侧聚合上报；失败明细流只含失败,不能直接当失败率看。
-        </p>
-      </div>
-
-      <DataTable
-        columns={toolRateColumns}
-        rows={stats?.rollup.tools ?? []}
-        rowKey={(row) => row.tool}
-        loading={statsLoading && !stats}
-        emptyTitle="当前窗口暂无聚合上报"
-        emptyHint="容器侧聚合按窗口批量上报,稍后再试。"
-      />
-
-      <div className="flex items-end justify-between gap-3">
-        <div>
-          <h3 className="text-body font-semibold text-fg">失败原因聚合</h3>
-          <p className="mt-0.5 text-meta text-faint">
-            {stats
-              ? `${formatCount(stats.failures.events)} 条失败事件 · ${formatCount(stats.failures.affected_users)} 位涉及用户`
-              : "按工具与安全错误分类汇总"}
+        <div
+          role="alert"
+          className="oc-callout oc-callout-danger flex items-start gap-3 rounded-xl px-4 py-3 text-body"
+        >
+          <span className="oc-icon-badge oc-icon-badge-danger mt-0.5 size-7 rounded-lg">
+            <AlertTriangle size={14} />
+          </span>
+          <p className="min-w-0 flex-1 text-danger">
+            统计加载失败：{apiErrorMessage(statsError, "加载失败")}
           </p>
         </div>
-      </div>
+      )}
 
-      <DataTable
-        columns={groupColumns}
-        rows={stats?.failures.groups ?? []}
-        rowKey={(group) => `${group.tool}:${group.error_class}`}
-        loading={statsLoading && !stats}
-        emptyTitle="当前窗口暂无失败聚合"
-        emptyHint="没有已上报失败，或当前统计覆盖仍未建立。"
-      />
+      <SectionCard
+        title="按工具成败率"
+        hint="成功/失败均来自容器侧聚合上报；失败明细流只含失败,不能直接当失败率看。"
+        icon={Wrench}
+        iconTone="info"
+        bodyClassName="p-0"
+      >
+        <DataTable
+          columns={toolRateColumns}
+          rows={stats?.rollup.tools ?? []}
+          rowKey={(row) => row.tool}
+          loading={statsLoading && !stats}
+          emptyTitle="当前窗口暂无聚合上报"
+          emptyHint="容器侧聚合按窗口批量上报,稍后再试。"
+          className="rounded-none border-0 shadow-none"
+        />
+      </SectionCard>
 
-      {error && <p className="text-sm text-danger">加载失败：{apiErrorMessage(error, "加载失败")}</p>}
+      <SectionCard
+        title="失败原因聚合"
+        hint={
+          stats
+            ? `${formatCount(stats.failures.events)} 条失败事件 · ${formatCount(stats.failures.affected_users)} 位涉及用户`
+            : "按工具与安全错误分类汇总"
+        }
+        icon={AlertTriangle}
+        iconTone="warning"
+        bodyClassName="p-0"
+      >
+        <DataTable
+          columns={groupColumns}
+          rows={stats?.failures.groups ?? []}
+          rowKey={(group) => `${group.tool}:${group.error_class}`}
+          loading={statsLoading && !stats}
+          emptyTitle="当前窗口暂无失败聚合"
+          emptyHint="没有已上报失败，或当前统计覆盖仍未建立。"
+          className="rounded-none border-0 shadow-none"
+        />
+      </SectionCard>
 
-      <div>
-        <h3 className="text-body font-semibold text-fg">失败调用明细</h3>
-        <p className="mt-0.5 text-meta text-faint">仅失败事件，用于定位具体工具与会话。</p>
-      </div>
+      {error && (
+        <div
+          role="alert"
+          className="oc-callout oc-callout-danger flex items-start gap-3 rounded-xl px-4 py-3 text-body"
+        >
+          <span className="oc-icon-badge oc-icon-badge-danger mt-0.5 size-7 rounded-lg">
+            <AlertTriangle size={14} />
+          </span>
+          <p className="min-w-0 flex-1 text-danger">
+            加载失败：{apiErrorMessage(error, "加载失败")}
+          </p>
+        </div>
+      )}
 
-      <DataTable
-        columns={columns}
-        rows={rows}
-        rowKey={(r) => r.id}
-        loading={loading}
-        onRowClick={(r) => setDetail(r)}
-        emptyTitle="暂无工具失败记录"
-        emptyHint="调整过滤条件或稍后再试。"
-      />
-
-      <Pagination
-        offset={history.length * PAGE_SIZE}
-        limit={PAGE_SIZE}
-        count={rows.length}
-        onChange={(nextOffset) => {
-          if (nextOffset > history.length * PAGE_SIZE) goNext();
-          else goPrev();
-        }}
-      />
+      <SectionCard
+        title="失败调用明细"
+        hint="仅失败事件，用于定位具体工具与会话。点击行查看 input_meta 载荷。"
+        icon={Terminal}
+        iconTone="danger"
+        action={
+          !loading && (
+            <span className="oc-badge-craft rounded-full bg-hover px-2.5 py-0.5 font-mono text-caption text-muted tabular-nums">
+              本页 {rows.length.toLocaleString("zh-CN")} 条
+            </span>
+          )
+        }
+        bodyClassName="p-0"
+      >
+        <DataTable
+          columns={columns}
+          rows={rows}
+          rowKey={(r) => r.id}
+          loading={loading}
+          onRowClick={(r) => setDetail(r)}
+          emptyTitle="暂无工具失败记录"
+          emptyHint="调整过滤条件或稍后再试。"
+          className="rounded-none border-0 shadow-none"
+          footer={
+            <Pagination
+              offset={history.length * PAGE_SIZE}
+              limit={PAGE_SIZE}
+              count={rows.length}
+              onChange={(nextOffset) => {
+                if (nextOffset > history.length * PAGE_SIZE) goNext();
+                else goPrev();
+              }}
+            />
+          }
+        />
+      </SectionCard>
 
       <Modal
         open={detail !== null}

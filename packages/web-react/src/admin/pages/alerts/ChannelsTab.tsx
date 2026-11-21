@@ -1,8 +1,10 @@
 import {
+  AlertTriangle,
   Bot,
   MessageSquare,
   Plus,
   QrCode,
+  Radio,
   RefreshCw,
   Send,
   type LucideIcon,
@@ -23,6 +25,15 @@ const TYPE_ICON: Record<ChannelType, LucideIcon> = {
   wecom_bot: MessageSquare,
   wecom_aibot: Bot,
 };
+
+const BADGE_TONE_CLASS = {
+  success: "oc-icon-badge oc-icon-badge-success",
+  warning: "oc-icon-badge oc-icon-badge-warning",
+  danger: "oc-icon-badge oc-icon-badge-danger",
+  info: "oc-icon-badge oc-icon-badge-info",
+  neutral: "oc-icon-badge oc-icon-badge-accent",
+  accent: "oc-icon-badge oc-icon-badge-accent",
+} as const;
 
 export function ChannelsTab({ events }: { events: EventMeta[] }) {
   const toast = useToast();
@@ -116,34 +127,40 @@ export function ChannelsTab({ events }: { events: EventMeta[] }) {
   return (
     <div className="flex flex-col gap-4">
       {confirmEl}
-      <div className="flex items-center justify-between gap-2">
-        <p className="text-body text-muted">
-          微信 iLink / Telegram / 企业微信群机器人 / 企业微信智能机器人 —— 只发给绑定了的超管。
-        </p>
-        <div className="flex items-center gap-2">
-          <Button variant="secondary" size="sm" onClick={reload} disabled={loading}>
+      <div className="oc-surface-card flex flex-wrap items-center justify-between gap-3 rounded-xl px-4 py-3">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <span className="oc-icon-badge oc-icon-badge-accent size-8 rounded-lg">
+            <Radio size={15} strokeWidth={1.95} />
+          </span>
+          <p className="text-body text-muted">
+            微信 iLink / Telegram / 企业微信群机器人 / 企业微信智能机器人 —— 只发给绑定了的超管。
+          </p>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button variant="secondary" size="sm" onClick={reload} disabled={loading} className="oc-btn-tactile">
             <RefreshCw size={14} className={loading ? "animate-spin" : undefined} /> 刷新
           </Button>
-          <Button variant="primary" size="sm" onClick={() => setWizardOpen(true)}>
+          <Button variant="primary" size="sm" onClick={() => setWizardOpen(true)} className="oc-btn-tactile">
             <Plus size={15} /> 新建通道
           </Button>
         </div>
       </div>
 
       {error && (
-        <div className="rounded-lg border border-danger/40 bg-danger-soft px-3 py-2.5 text-body text-danger">
+        <div className="oc-callout oc-callout-danger flex items-center gap-2 rounded-xl px-4 py-3 text-body text-danger">
+          <AlertTriangle size={15} className="shrink-0" />
           加载通道失败: {errText(error)}
         </div>
       )}
 
       {!loading && rows.length === 0 && !error && (
-        <SectionCard title="暂无通道">
+        <SectionCard title="暂无通道" icon={QrCode} iconTone="neutral">
           <EmptyState
             icon={QrCode}
             title="还没有告警通道"
             hint="点右上「新建通道」绑定微信 / Telegram / 企业微信,开始接收系统告警。"
             action={
-              <Button variant="primary" size="sm" onClick={() => setWizardOpen(true)}>
+              <Button variant="primary" size="sm" onClick={() => setWizardOpen(true)} className="oc-btn-tactile">
                 <Plus size={15} /> 新建通道
               </Button>
             }
@@ -151,12 +168,12 @@ export function ChannelsTab({ events }: { events: EventMeta[] }) {
         </SectionCard>
       )}
 
-      <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+      <div className="grid grid-cols-1 gap-3.5 lg:grid-cols-2">
         {(loading && rows.length === 0 ? Array.from({ length: 2 }) : rows).map((row, i) => {
           const c = row as AlertChannel | undefined;
           if (!c) {
             return (
-              <div key={`sk-${i}`} className="h-40 animate-pulse rounded-xl border border-border bg-surface" />
+              <div key={`sk-${i}`} className="oc-surface-card h-44 animate-pulse rounded-xl" />
             );
           }
           return (
@@ -212,26 +229,27 @@ function ChannelCard({
   const subCount = c.event_types.length;
   const showRebind = c.activation_status === "error" && c.channel_type === "ilink_wechat";
   const aibotUnbound = c.channel_type === "wecom_aibot" && !c.aibot_bound;
+  const iconCls = BADGE_TONE_CLASS[act.tone] ?? "oc-icon-badge oc-icon-badge-accent";
 
   return (
-    <div className="flex flex-col gap-3 rounded-xl border border-border bg-surface p-4">
+    <div className="oc-surface-card oc-surface-card-hover flex flex-col gap-3 rounded-xl p-4">
       <div className="flex items-start justify-between gap-3">
         <div className="flex min-w-0 items-start gap-3">
-          <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-hover text-muted">
-            <Icon size={18} />
+          <span className={`${iconCls} size-10 rounded-xl`}>
+            <Icon size={18} strokeWidth={1.9} />
           </span>
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <span className="truncate text-title font-medium text-fg" title={c.label}>
+              <span className="truncate text-title font-semibold tracking-tight text-fg" title={c.label}>
                 {c.label}
               </span>
               <span className="shrink-0 font-mono text-caption text-faint">#{c.id}</span>
             </div>
-            <span className="text-meta text-faint">{CHANNEL_TYPE_LABEL[c.channel_type]}</span>
+            <span className="text-meta text-muted">{CHANNEL_TYPE_LABEL[c.channel_type]}</span>
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <span className="text-caption text-faint">{c.enabled ? "启用" : "停用"}</span>
+          <span className="text-caption font-medium text-faint">{c.enabled ? "启用" : "停用"}</span>
           <Switch checked={c.enabled} disabled={busy} onCheckedChange={onToggle} aria-label="启用/停用" />
         </div>
       </div>
@@ -241,41 +259,48 @@ function ChannelCard({
           {act.text}
         </Badge>
         <Badge tone={SEVERITY_TONE[c.severity_min]}>≥ {c.severity_min}</Badge>
-        <Badge tone={subCount === 0 ? "success" : "neutral"}>
+        <Badge tone={subCount === 0 ? "success" : "neutral"} className="tabular-nums">
           {subCount === 0 ? "订阅全部" : `订阅 ${subCount} 种`}
         </Badge>
       </div>
 
       {aibotUnbound && act.tone !== "danger" && (
-        <div className="rounded-lg border border-warning/40 bg-warning-soft px-3 py-2 text-meta text-warning">
+        <div className="oc-callout oc-callout-warning rounded-xl px-3.5 py-2.5 text-meta leading-relaxed text-warning">
           尚未绑定推送会话 —— 请在企业微信里<strong>给该机器人发一条消息</strong>完成绑定。
         </div>
       )}
 
-      <div className="flex items-center justify-between gap-2 text-meta text-faint">
+      <div className="oc-surface-recessed flex items-center justify-between gap-2 rounded-lg px-3 py-1.5 text-meta tabular-nums text-muted">
         <span>
           最近发送:{c.last_send_at ? <TimeAgo value={c.last_send_at} /> : "—"}
         </span>
       </div>
       {c.last_error && (
-        <p className="truncate text-meta text-danger" title={c.last_error}>
-          最近错误:{c.last_error}
-        </p>
+        <div className="oc-callout oc-callout-danger rounded-xl px-3 py-2 text-meta text-danger" title={c.last_error}>
+          <p className="truncate">最近错误:{c.last_error}</p>
+        </div>
       )}
 
-      <div className="flex flex-wrap items-center gap-2 border-t border-border/70 pt-3">
-        <Button variant="secondary" size="sm" onClick={onTest} disabled={busy}>
+      <div className="mt-auto flex flex-wrap items-center gap-2 border-t border-border/70 pt-3">
+        <Button variant="secondary" size="sm" onClick={onTest} disabled={busy} className="oc-btn-tactile">
           测试送达
         </Button>
-        <Button variant="secondary" size="sm" onClick={onEdit} disabled={busy}>
+        <Button variant="secondary" size="sm" onClick={onEdit} disabled={busy} className="oc-btn-tactile">
           编辑
         </Button>
         {showRebind && (
-          <Button variant="secondary" size="sm" onClick={onRebind} disabled={busy} title="把 error 推回 pending,worker 重新 long-poll(不重新扫码)">
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={onRebind}
+            disabled={busy}
+            className="oc-btn-tactile"
+            title="把 error 推回 pending,worker 重新 long-poll(不重新扫码)"
+          >
             重新激活
           </Button>
         )}
-        <Button variant="danger" size="sm" onClick={onDelete} disabled={busy} className="ml-auto">
+        <Button variant="danger" size="sm" onClick={onDelete} disabled={busy} className="oc-btn-tactile ml-auto">
           删除
         </Button>
       </div>

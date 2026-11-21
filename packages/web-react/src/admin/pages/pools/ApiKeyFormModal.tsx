@@ -7,7 +7,7 @@ function Field({ label, hint, children }: { label: ReactNode; hint?: ReactNode; 
   return (
     // biome-ignore lint/a11y/noLabelWithoutControl: label 经 children 隐式关联表单控件
     <label className="flex flex-col gap-1.5">
-      <span className="text-meta font-medium text-muted">{label}</span>
+      <span className="text-meta font-medium text-fg">{label}</span>
       {children}
       {hint && <span className="text-[11.5px] leading-snug text-faint">{hint}</span>}
     </label>
@@ -77,9 +77,12 @@ export function ApiKeyFormModal({
       }
     >
       <div className="flex flex-col gap-4">
+        <div className="oc-callout oc-callout-info rounded-xl px-3.5 py-2.5 text-caption leading-relaxed text-muted">
+          API key 提交后以密文入库并立即参与该服务池调度；明文仅传输一次，后续列表仅展示末 4 位。
+        </div>
         <Field label="服务池">
           <select
-            className="h-10 w-full rounded-lg border border-border bg-surface px-3 text-base md:text-sm text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
+            className="oc-field-control h-10 w-full rounded-lg border border-border bg-surface px-3 text-base md:text-sm text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
             value={service}
             onChange={(e) => setService(e.target.value)}
           >
@@ -91,10 +94,10 @@ export function ApiKeyFormModal({
           </select>
         </Field>
         <Field label="API key" hint="加密保存;提交后页面只显示末 4 位。">
-          <Input type="password" autoComplete="off" value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
+          <Input className="oc-field-control font-mono" type="password" autoComplete="off" value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
         </Field>
         <Field label="备注名(可选)">
-          <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="例:备用 key 2" />
+          <Input className="oc-field-control" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="例:备用 key 2" />
         </Field>
       </div>
     </Modal>

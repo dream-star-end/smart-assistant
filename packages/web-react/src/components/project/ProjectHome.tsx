@@ -276,41 +276,47 @@ export function ProjectHome(props: ProjectHomeProps) {
 
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
         <div className="@container mx-auto flex w-full max-w-3xl flex-col gap-4 px-4 pb-10 pt-1 md:px-5 md:pt-4">
-          {/* 标题行：颜色点 · 名称 · ⋯ */}
-          <div className="flex min-w-0 flex-col gap-1">
-            <div className="flex min-w-0 items-center gap-2">
+          {/* 标题行：图标徽章 · 名称 · ⋯ */}
+          <div className="flex min-w-0 items-start gap-3">
+            <span className="oc-icon-badge mt-0.5 size-10 shrink-0 rounded-xl" aria-hidden>
               {swatch ? (
-                <span aria-hidden className={cn("size-3 shrink-0 rounded-full", swatch.dotClass)} />
+                <span className={cn("size-3.5 rounded-full shadow-soft", swatch.dotClass)} />
               ) : (
-                <FolderOpen size={18} aria-hidden className="shrink-0 text-faint" />
+                <FolderOpen size={18} strokeWidth={1.75} className="text-muted" />
               )}
-              <h1 className="min-w-0 truncate text-title font-semibold md:text-xl">{project.name}</h1>
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <IconButton aria-label={`项目 ${project.name} 更多`} size="sm" shape="square">
-                    <MoreHorizontal size={16} />
-                  </IconButton>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="start" className="w-44">
-                  <DropdownMenuItem onSelect={onOpenSettings}>
-                    <Settings2 size={14} className="shrink-0 text-muted" />
-                    项目设置
-                  </DropdownMenuItem>
-                  <DropdownMenuItem onSelect={onRename}>
-                    <Pencil size={14} className="shrink-0 text-muted" />
-                    重命名
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem destructive onSelect={onDelete}>
-                    <Trash2 size={14} className="shrink-0" />
-                    删除
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
+            </span>
+            <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+              <div className="flex min-w-0 items-center gap-2">
+                <h1 className="min-w-0 truncate text-title font-semibold tracking-tight md:text-xl">
+                  {project.name}
+                </h1>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <IconButton aria-label={`项目 ${project.name} 更多`} size="sm" shape="square">
+                      <MoreHorizontal size={16} />
+                    </IconButton>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="w-44">
+                    <DropdownMenuItem onSelect={onOpenSettings}>
+                      <Settings2 size={14} className="shrink-0 text-muted" />
+                      项目设置
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onSelect={onRename}>
+                      <Pencil size={14} className="shrink-0 text-muted" />
+                      重命名
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem destructive onSelect={onDelete}>
+                      <Trash2 size={14} className="shrink-0" />
+                      删除
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+              <p data-testid="project-home-summary" className="text-meta text-muted">
+                {summary}
+              </p>
             </div>
-            <p data-testid="project-home-summary" className="text-meta text-muted">
-              {summary}
-            </p>
           </div>
 
           <StartBox projectName={project.name} onStart={onStart} />
@@ -464,7 +470,7 @@ function StartBox({ projectName, onStart }: { projectName: string; onStart: (tex
   };
   return (
     <form
-      className="flex items-end gap-2 rounded-2xl border border-border bg-surface p-3 shadow-soft focus-within:border-border-strong"
+      className="oc-composer-dock flex items-end gap-2 rounded-2xl p-3"
       onSubmit={(e) => {
         e.preventDefault();
         submit();
@@ -644,7 +650,7 @@ function OverviewTab({
       >
         {instructions ? (
           <>
-            <p className="line-clamp-4 whitespace-pre-wrap rounded-lg bg-hover px-3 py-2 text-body text-fg">
+            <p className="oc-surface-recessed line-clamp-4 whitespace-pre-wrap rounded-xl px-3.5 py-2.5 text-body text-fg">
               {instructions}
             </p>
             <p className="text-caption text-faint">这个项目里的所有会话都会遵守这些指令。</p>
@@ -686,7 +692,7 @@ function OverviewTab({
               <span
                 key={a.id}
                 title={a.name}
-                className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-border bg-surface px-2.5 py-1 text-meta text-fg"
+                className="oc-badge-craft inline-flex max-w-full items-center gap-1.5 rounded-full bg-hover px-2.5 py-1 text-meta text-fg"
               >
                 <Pin size={12} aria-hidden className="shrink-0 text-warning" />
                 <span className="min-w-0 truncate">{a.name}</span>
@@ -1084,7 +1090,7 @@ function ProjectSurfaceLinks({
       <h2 id={`${id}-title`} className="text-meta font-medium text-faint">
         项目空间
       </h2>
-      <ul className="grid grid-cols-2 gap-px overflow-hidden rounded-[10px] border border-border bg-border @2xl:grid-cols-4">
+      <ul className="oc-surface-card grid grid-cols-2 gap-px overflow-hidden rounded-xl bg-border/60 @2xl:grid-cols-4">
         {SURFACES.map((s) => {
           const Icon = s.icon;
           const busy = opening === s.id;
@@ -1097,12 +1103,14 @@ function ProjectSurfaceLinks({
                 aria-describedby={`${id}-${s.id}`}
                 aria-busy={busy || undefined}
                 data-surface={s.id}
-                className="group flex min-h-12 w-full min-w-0 items-center gap-2.5 px-3.5 py-2.5 text-left outline-none transition-colors duration-100 hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                className="group flex min-h-12 w-full min-w-0 items-center gap-2.5 px-3.5 py-2.5 text-left outline-none transition-colors duration-100 hover:bg-hover/70 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
               >
-                <Icon size={16} strokeWidth={1.75} aria-hidden className="shrink-0 text-muted" />
+                <span className="oc-icon-badge size-7 shrink-0 rounded-md" aria-hidden>
+                  <Icon size={14} strokeWidth={1.75} />
+                </span>
                 <span className="flex min-w-0 flex-1 flex-col">
                   <span className="truncate text-body font-medium text-fg">{s.label}</span>
-                  <span id={`${id}-${s.id}`} className="hidden truncate text-meta text-faint @md:block">
+                  <span id={`${id}-${s.id}`} className="hidden truncate text-caption text-faint @md:block">
                     {s.hint}
                   </span>
                 </span>
@@ -1113,7 +1121,7 @@ function ProjectSurfaceLinks({
                     size={15}
                     strokeWidth={1.75}
                     aria-hidden
-                    className="shrink-0 text-faint transition-colors group-hover:text-muted"
+                    className="shrink-0 text-faint transition-transform duration-150 group-hover:translate-x-0.5 group-hover:text-muted"
                   />
                 )}
               </button>
@@ -1160,16 +1168,19 @@ function useProjectActivity(
 
 function ActivityLine({ item, onOpen }: { item: Exclude<ActivityItem, { kind: "chat" }>; onOpen?: () => void }) {
   const tag = item.kind === "ticket" ? "任务" : "定时";
-  const tone = item.kind === "ticket" ? "bg-[#fdf2f8] text-[#be185d]" : "bg-[#fff7ed] text-[#c2410c]";
+  const tone =
+    item.kind === "ticket"
+      ? "oc-badge-craft bg-accent-soft text-accent"
+      : "oc-badge-craft bg-warning-soft text-warning";
   return (
     <button
       type="button"
       onClick={onOpen}
       disabled={!onOpen}
       data-testid={`activity-${item.kind}`}
-      className="flex min-h-11 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left hover:bg-hover disabled:cursor-default disabled:hover:bg-transparent"
+      className="flex min-h-11 w-full min-w-0 items-center gap-2 rounded-lg px-2 text-left transition-colors hover:bg-hover disabled:cursor-default disabled:hover:bg-transparent"
     >
-      <span className={cn("shrink-0 rounded px-1.5 py-0.5 text-caption", tone)}>{tag}</span>
+      <span className={cn("shrink-0 rounded-full px-2 py-0.5 text-caption font-medium", tone)}>{tag}</span>
       <span className="min-w-0 flex-1 truncate text-body">
         {item.kind === "ticket" ? `${item.identifier} ${item.title}` : item.title}
       </span>

@@ -548,17 +548,17 @@ export function KnowledgePlanetAutomationPanel({
       ? `每个账号最多 ${MAX_RULES} 条规则，已达上限。`
       : null
   const groupName = (groupId: string) => groupById.get(groupId)?.name ?? `星球 ${groupId}`
-  /** 校验标红:aria-invalid 给辅助技术,红描边给眼睛;文案在底部 Alert 里,不重复。 */
+  /** 校验标红:aria-invalid 给辅助技术,.oc-field-control 原语自带红描边与焦点环;文案在底部 Alert 里,不重复。 */
   const invalidProps = (field: RuleField) =>
     invalidField === field
-      ? { 'aria-invalid': true as const, className: 'border-danger focus-visible:ring-danger' }
+      ? { 'aria-invalid': true as const }
       : {}
 
   return (
-    <div className="mt-2 rounded-xl border border-warning/30 bg-warning-soft/30 p-3 sm:p-4">
+    <div className="oc-callout oc-callout-warning mt-2.5 rounded-2xl p-3.5 sm:p-4">
       <div className="flex flex-wrap items-start gap-2.5">
-        <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-warning-soft text-warning">
-          <Bot size={17} aria-hidden="true" />
+        <span className="oc-icon-badge oc-icon-badge-warning h-9 w-9 rounded-md" aria-hidden="true">
+          <Bot size={17} strokeWidth={1.75} />
         </span>
         <div className="min-w-0 flex-1 basis-40">
           <div className="text-section font-semibold text-fg">无人值守自动回复</div>
@@ -718,7 +718,7 @@ export function KnowledgePlanetAutomationPanel({
               return (
                 <li
                   key={run.id}
-                  className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg bg-surface px-2.5 py-2"
+                  className="oc-surface-card flex flex-wrap items-center gap-x-2 gap-y-1 rounded-xl px-3 py-2.5"
                 >
                   <Badge tone={runStatusTone(run.status)} size="sm">
                     {RUN_STATUS[run.status] ?? run.status}

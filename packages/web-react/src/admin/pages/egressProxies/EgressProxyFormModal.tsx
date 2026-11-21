@@ -91,14 +91,18 @@ export function EgressProxyFormModal({
       }
     >
       <div className="flex flex-col gap-4">
+        <div className="oc-callout oc-callout-info rounded-xl px-3.5 py-2.5 text-caption leading-relaxed text-muted">
+          代理凭据加密保存；创建后列表与编辑框仅展示遮蔽后的 URL，留空即保持原出口不变。
+        </div>
         <Field label="label(展示名,唯一)">
-          <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="例:tokyo-residential-1" />
+          <Input className="oc-field-control" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="例:tokyo-residential-1" />
         </Field>
         <Field
           label={isCreate ? "URL(明文,创建后只展示遮蔽串)" : "当前 URL(已遮蔽,留空即不改)"}
           hint={isCreate ? "http://user:pass@host:port 或 socks5://…" : undefined}
         >
           <Input
+            className="oc-field-control font-mono"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
             placeholder={isCreate ? "http://user:pass@host:port 或 socks5://…" : row?.url_masked}
@@ -111,7 +115,7 @@ export function EgressProxyFormModal({
           </Select>
         </Field>
         <Field label="notes(可选)">
-          <Input value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="备注" />
+          <Input className="oc-field-control" value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="备注" />
         </Field>
       </div>
     </Modal>

@@ -124,11 +124,16 @@ function ConfirmScheduledRecipe({
           void submit();
         }}
       >
-        <div className="flex flex-col gap-1">
-          <span className="text-meta text-muted">什么时候</span>
-          <span className="text-body text-fg" data-testid="scheduled-recipe-when">
-            {recipe.when}
+        <div className="oc-surface-recessed flex items-center gap-3 rounded-xl px-3.5 py-3">
+          <span className="oc-icon-badge oc-icon-badge-accent size-8 rounded-lg" aria-hidden="true">
+            <CalendarClock size={15} strokeWidth={1.75} />
           </span>
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <span className="text-caption font-medium text-muted">什么时候</span>
+            <span className="text-body font-medium text-fg" data-testid="scheduled-recipe-when">
+              {recipe.when}
+            </span>
+          </div>
         </div>
         <Field label="要做什么" error={prompt.trim() ? undefined : "请填写要做什么"}>
           <Textarea value={prompt} rows={5} onChange={(e) => setPrompt(e.target.value)} aria-label="定时任务指令" />

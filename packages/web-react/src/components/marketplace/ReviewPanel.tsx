@@ -144,7 +144,7 @@ function PendingHumanMeta({ r }: { r: MarketplacePending }) {
     : [];
   const humanMd = r.humanMd?.trim();
   return (
-    <div className="mb-2 flex flex-col gap-1.5 rounded-lg border border-border bg-surface px-2.5 py-2 text-meta leading-relaxed">
+    <div className="oc-surface-recessed mb-2.5 flex flex-col gap-2 rounded-xl px-3.5 py-3 text-meta leading-relaxed">
       <div>
         <span className="font-medium text-muted">分类：</span>
         <span className="text-fg">{marketplaceCategoryLabel(r.category)}</span>
@@ -385,9 +385,14 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
 
   return (
     <div className="marketplace-review mx-auto flex w-full min-w-0 max-w-[860px] flex-col gap-4 px-4 py-4 sm:px-6">
-      <header className="pt-1">
-        <h2 className="text-title font-semibold text-fg">审核</h2>
-        <p className="mt-1 text-meta text-muted">审阅待上架的内容和风险。</p>
+      <header className="flex items-center gap-3 pt-1">
+        <span aria-hidden="true" className="oc-icon-badge oc-icon-badge-accent size-9 rounded-xl">
+          <Inbox size={17} strokeWidth={1.85} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <h2 className="text-title font-semibold tracking-tight text-fg">审核</h2>
+          <p className="mt-0.5 text-meta text-muted">审阅待上架的内容和风险。</p>
+        </div>
       </header>
       {promptTextEl}
       {confirmEl}
@@ -467,7 +472,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
               </Alert>
             )}
 
-            <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2">
+            <div className="oc-surface-recessed flex flex-wrap items-center gap-2 rounded-xl px-3.5 py-2.5">
               {/* K-27:ui/Checkbox 原语(此前原生 accent-accent 方块与 Switch / Chip 视觉语言不一致);
                   部分勾选 → indeterminate(读屏 mixed、视觉减号),触控靶由原语的 label 自带。 */}
               <Checkbox
@@ -477,7 +482,9 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                 indeterminate={selectedVisibleIds.length > 0 && !allSelected}
                 onChange={(e) => toggleAll(e.currentTarget.checked)}
               />
-              <span className="text-meta text-faint">已选 {selectedVisibleIds.length}</span>
+              <span className="oc-badge-craft rounded-full bg-surface px-2 py-0.5 text-caption font-medium tabular-nums text-muted">
+                已选 {selectedVisibleIds.length}
+              </span>
               {selectedHasConnector && (
                 // 禁用原因不能只写在 native title:disabled 元素多数浏览器不触发它,触屏则完全无从呈现。
                 <span className="text-caption text-warning">
@@ -508,7 +515,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
               </div>
             </div>
 
-            <ul className="flex flex-col gap-2">
+            <ul className="flex flex-col gap-2.5">
               {rows.map((r) => {
                 const isOpen = open === r.versionId;
                 const flags = friendlyRiskFlags(r.riskFlags);
@@ -525,11 +532,12 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                   <li
                     key={r.versionId}
                     className={cn(
-                      "overflow-hidden rounded-xl border border-border bg-elevated transition-opacity",
+                      "oc-surface-card overflow-hidden rounded-xl transition-[opacity,border-color,box-shadow]",
+                      isOpen && "border-accent/30",
                       otherBusy && "opacity-60",
                     )}
                   >
-                    <div className="flex flex-wrap items-start gap-2 px-3.5 py-3">
+                    <div className="flex flex-wrap items-start gap-2.5 px-4 py-3.5">
                       {/* 触控靶必须挂在**真正接收点击的元素**上:裸 checkbox 的命中区只有
                           十几像素,而卡片的 px-3.5/py-3 扩的是卡片、不是 input。ui/Checkbox 的外层
                           就是 label,无文字时自带 44×44(点 label 即切换);桌面端渲染零变化。 */}
@@ -551,18 +559,21 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                       >
                         <ChevronRight
                           size={15}
+                          strokeWidth={1.85}
                           className={cn(
-                            "mt-0.5 shrink-0 text-faint transition-transform",
+                            "mt-0.5 shrink-0 text-faint transition-transform duration-150",
                             isOpen && "rotate-90",
                           )}
                         />
                         <div className="min-w-0">
                           <div className="flex flex-wrap items-center gap-1.5">
-                            <span className="truncate text-section font-medium text-fg">
+                            <span className="truncate text-section font-semibold tracking-tight text-fg">
                               {r.name}
                             </span>
                             {/* 版本号是中性事实,不占徽章位 —— 徽章留给需要判断的信号。 */}
-                            <span className="shrink-0 text-caption text-faint">v{r.version}</span>
+                            <span className="shrink-0 text-caption tabular-nums text-faint">
+                              v{r.version}
+                            </span>
                             {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
                             {r.kind === "connector" && (
                               <Badge tone="info">插件 · 人工安全审</Badge>
@@ -575,7 +586,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                             {hasEvals && (
                               <Tooltip content={EVALS_HINT}>
                                 <Badge tone="info">
-                                  <FlaskConical size={11} />带 evals
+                                  <FlaskConical size={11} strokeWidth={1.9} />带 evals
                                 </Badge>
                               </Tooltip>
                             )}
@@ -608,7 +619,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                           loading={rejecting}
                           disabled={otherBusy}
                         >
-                          {rejecting ? null : <X size={14} />}
+                          {rejecting ? null : <X size={14} strokeWidth={1.9} />}
                           拒绝
                         </Button>
                         {needsReview ? (
@@ -628,7 +639,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                             loading={approving}
                             disabled={otherBusy}
                           >
-                            {approving ? null : <Check size={14} />}
+                            {approving ? null : <Check size={14} strokeWidth={2} />}
                             批准
                           </Button>
                         )}
@@ -636,7 +647,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                     </div>
 
                     {rowErr && (
-                      <div className="border-t border-border px-3.5 py-2">
+                      <div className="border-t border-border/80 px-4 py-2.5">
                         <Alert
                           tone="danger"
                           density="compact"
@@ -650,11 +661,11 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                     {isOpen && (
                       <div
                         id={`review-detail-${r.versionId}`}
-                        className="border-t border-border px-3.5 py-3"
+                        className="border-t border-border/80 bg-bg/35 px-4 py-3.5"
                       >
                         {/* 行头徽章的解释在这里明文再写一遍(K-14):触屏 / 读屏用户也拿得到。 */}
                         {(hasEvals || (suspect && r.benchmark)) && (
-                          <ul className="mb-2 flex flex-col gap-1 text-meta leading-relaxed text-muted">
+                          <ul className="mb-2.5 flex flex-col gap-1 text-meta leading-relaxed text-muted">
                             {hasEvals && (
                               <li>
                                 <span className="font-medium text-fg">带 evals：</span>
@@ -669,11 +680,11 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                             )}
                           </ul>
                         )}
-                        <p className="mb-2 text-body text-fg">{r.description}</p>
+                        <p className="mb-2.5 text-body leading-relaxed text-fg">{r.description}</p>
                         {/* 人向商品元数据:审核要点=分类名实相符、用例与正文一致、效果不夸大。 */}
                         <PendingHumanMeta r={r} />
                         {r.kind === "connector" && (
-                          <div className="mb-3 flex flex-col gap-2 rounded-lg border border-warning/30 bg-warning-soft/40 p-3">
+                          <div className="oc-callout oc-callout-warning mb-3 flex flex-col gap-2.5 rounded-xl p-3.5">
                             <Field
                               label="实际 SecurityDecision"
                               hint="下方初值来自发布者建议，不是平台事实。请核对每个 origin 与 action effect 后再批准。"
@@ -718,16 +729,21 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                         {/* AI 意见(供参考):escalate/warn 降级/解析失败时 AI 给出的转人工原因。
                           仅在待审队列里出现的项 = AI 未直接放行,人审据此复核。 */}
                         {r.aiNote && (
-                          <div className="mb-2 flex items-start gap-1.5 rounded-lg border border-accent/30 bg-accent-soft/40 px-2.5 py-2">
-                            <Sparkles size={14} className="mt-0.5 shrink-0 text-accent" />
+                          <div className="oc-callout oc-callout-info mb-2.5 flex items-start gap-2.5 rounded-xl px-3.5 py-2.5">
+                            <span
+                              aria-hidden="true"
+                              className="oc-icon-badge oc-icon-badge-accent mt-0.5 size-6 rounded-md"
+                            >
+                              <Sparkles size={13} strokeWidth={1.85} />
+                            </span>
                             <p className="text-meta leading-relaxed text-fg">
-                              <span className="font-medium text-accent">AI 意见（供参考）：</span>
+                              <span className="font-semibold text-accent">AI 意见（供参考）：</span>
                               {r.aiNote}
                             </p>
                           </div>
                         )}
                         {flags.length > 0 && (
-                          <div className="mb-2 flex flex-col gap-1.5">
+                          <div className="mb-2.5 flex flex-col gap-1.5">
                             {flags.map((f) => (
                               <Alert key={f.label} tone={f.tone} density="compact">
                                 <span className="font-medium">{f.label}：</span>
@@ -741,20 +757,22 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                             ))}
                           </div>
                         )}
-                        <div className="mb-1 flex items-center justify-between gap-2">
-                          <span className="text-meta font-medium text-muted">原始工件</span>
-                          <CopyChip value={r.rawArtifact} label="复制全文" mono={false} />
+                        <div className="oc-code-shell">
+                          <div className="oc-code-shell-header flex items-center justify-between gap-2 px-3 py-2">
+                            <span className="text-caption font-semibold text-muted">原始工件</span>
+                            <CopyChip value={r.rawArtifact} label="复制全文" mono={false} />
+                          </div>
+                          <pre
+                            aria-label="原始工件内容，可滚动"
+                            // biome-ignore lint/a11y/noNoninteractiveTabindex: 嵌套滚动区必须能被键盘聚焦后滚动。
+                            tabIndex={0}
+                            className="max-h-72 overflow-auto whitespace-pre-wrap break-words px-3.5 py-2.5 font-mono text-meta leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                          >
+                            {r.rawArtifact}
+                          </pre>
                         </div>
-                        <pre
-                          aria-label="原始工件内容，可滚动"
-                          // biome-ignore lint/a11y/noNoninteractiveTabindex: 嵌套滚动区必须能被键盘聚焦后滚动。
-                          tabIndex={0}
-                          className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-code px-3 py-2 font-mono text-meta leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-                        >
-                          {r.rawArtifact}
-                        </pre>
                         {r.benchmark && (
-                          <p className="mt-2 text-meta text-muted">
+                          <p className="mt-2.5 text-meta tabular-nums text-muted">
                             发布者自报实测：通过率{" "}
                             {Math.round(r.benchmark.withoutPassRate * 100)}% →{" "}
                             {Math.round(r.benchmark.withPassRate * 100)}%（{r.benchmark.cases}{" "}
@@ -763,17 +781,17 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                         )}
                         {r.rawBundle &&
                           Object.entries(r.rawBundle).map(([path, content]) => (
-                            <details key={path} className="mt-2">
+                            <details key={path} className="oc-code-shell mt-2.5">
                               {/* 同上:summary 自己就是点击目标,一行 text-caption ≈16px。
                                   只加 min-h(不改 display),原生展开三角保持可见。 */}
-                              <summary className="cursor-pointer rounded-md font-mono text-caption text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11">
+                              <summary className="oc-code-shell-header cursor-pointer px-3 py-2 font-mono text-caption text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11">
                                 附属文件：{path}（{content.length} 字）
                               </summary>
                               <pre
                                 aria-label={`${path} 内容，可滚动`}
                                 // biome-ignore lint/a11y/noNoninteractiveTabindex: 同上,嵌套滚动区需可键盘聚焦。
                                 tabIndex={0}
-                                className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-code px-3 py-2 font-mono text-caption text-fg outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                                className="max-h-56 overflow-auto whitespace-pre-wrap break-words px-3.5 py-2.5 font-mono text-caption leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                               >
                                 {content}
                               </pre>
@@ -830,13 +848,16 @@ function AiReviewLog({ auth, reloadKey }: { auth: AuthSession; reloadKey: number
         // 同上:记录区展开才挂载,收起时不落 IDREF。
         aria-controls={open ? "ai-review-log" : undefined}
         // 手写折叠头(非 Button 原语)→ 触控靶兜不到它:一行 text-body 只有 ~20px 高。
-        className="flex w-full items-center gap-1.5 rounded-md text-left text-body font-medium text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+        className="flex w-full items-center gap-2 rounded-md text-left text-section font-semibold tracking-tight text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
       >
         <ChevronRight
           size={15}
-          className={cn("shrink-0 text-faint transition-transform", open && "rotate-90")}
+          strokeWidth={1.85}
+          className={cn("shrink-0 text-faint transition-transform duration-150", open && "rotate-90")}
         />
-        <Sparkles size={15} className="text-accent" />
+        <span aria-hidden="true" className="oc-icon-badge oc-icon-badge-accent size-6 rounded-md">
+          <Sparkles size={13} strokeWidth={1.85} />
+        </span>
         AI 审批记录
         <span className="ml-1 text-caption font-normal text-faint">
           （AI 自动批准/拒绝的版本；转人工的项见上方待审队列）
@@ -871,15 +892,19 @@ function AiReviewLog({ auth, reloadKey }: { auth: AuthSession; reloadKey: number
               }
             />
           ) : (
-            <ul className="flex flex-col gap-1.5">
+            <ul className="flex flex-col gap-2">
               {rows.map((r) => (
                 <li
                   key={r.versionId}
-                  className="rounded-lg border border-border bg-elevated px-3 py-2"
+                  className="oc-surface-recessed rounded-xl px-3.5 py-2.5"
                 >
                   <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="truncate text-body font-medium text-fg">{r.name}</span>
-                    <span className="shrink-0 text-caption text-faint">v{r.version}</span>
+                    <span className="truncate text-body font-semibold tracking-tight text-fg">
+                      {r.name}
+                    </span>
+                    <span className="shrink-0 text-caption tabular-nums text-faint">
+                      v{r.version}
+                    </span>
                     {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
                     <Badge tone={r.status === "approved" ? "success" : "danger"}>
                       {r.status === "approved" ? "已批准" : "已拒绝"}
@@ -887,14 +912,14 @@ function AiReviewLog({ auth, reloadKey }: { auth: AuthSession; reloadKey: number
                     {r.reviewedAt && (
                       <TimeAgo
                         value={r.reviewedAt}
-                        className="ml-auto shrink-0 text-caption text-faint"
+                        className="ml-auto shrink-0 text-caption tabular-nums text-faint"
                       />
                     )}
                   </div>
-                  <p className="mt-0.5 text-caption text-muted">{r.slug}</p>
+                  <p className="mt-0.5 font-mono text-caption text-muted">{r.slug}</p>
                   {r.aiNote && (
-                    <p className="mt-1 text-meta leading-relaxed text-fg">
-                      <span className="font-medium text-accent">AI：</span>
+                    <p className="mt-1.5 text-meta leading-relaxed text-fg">
+                      <span className="font-semibold text-accent">AI：</span>
                       {r.aiNote}
                     </p>
                   )}
@@ -975,11 +1000,14 @@ function RevokeBox({ auth }: { auth: AuthSession }) {
   };
 
   return (
-    <div className="rounded-xl border border-danger/30 bg-danger-soft/40 p-3.5">
+    <div className="oc-callout oc-callout-danger rounded-xl p-4">
       {confirmDialogEl}
       <div className="flex items-center justify-between gap-2">
-        <div className="flex items-center gap-1.5 text-body font-medium text-danger">
-          <ShieldX size={15} /> 紧急下架已上架条目（kill-switch）
+        <div className="flex items-center gap-2 text-section font-semibold tracking-tight text-danger">
+          <span aria-hidden="true" className="oc-icon-badge oc-icon-badge-danger size-7 rounded-lg">
+            <ShieldX size={15} strokeWidth={1.85} />
+          </span>
+          紧急下架已上架条目（kill-switch）
         </div>
         <Button
           variant="ghost"
@@ -992,8 +1020,8 @@ function RevokeBox({ auth }: { auth: AuthSession }) {
           {mobileOpen ? "收起" : "展开"}
         </Button>
       </div>
-      <div id={bodyId} className={cn("mt-1", !mobileOpen && "max-sm:hidden")}>
-        <p className="mb-2 text-caption text-muted">
+      <div id={bodyId} className={cn("mt-2", !mobileOpen && "max-sm:hidden")}>
+        <p className="mb-2.5 text-caption text-muted">
           撤销一个已上架条目：所有已安装用户在下次会话同步时被移除。
         </p>
         {msg && (

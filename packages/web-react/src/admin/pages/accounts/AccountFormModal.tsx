@@ -534,7 +534,9 @@ export function AccountFormModal({
           <Spinner className="size-4" /> 加载表单依赖…
         </div>
       ) : depsError ? (
-        <div className="py-8 text-center text-sm text-danger">加载失败:{depsError}</div>
+        <div className="oc-callout oc-callout-danger rounded-xl px-4 py-6 text-center text-sm text-danger">
+          加载失败:{depsError}
+        </div>
       ) : isCreate && provider !== "cursor" && proxies.length === 0 ? (
         <div className="flex flex-col gap-4">
           <Field label="provider">
@@ -545,7 +547,7 @@ export function AccountFormModal({
               <option value="grok">Grok Build</option>
             </Select>
           </Field>
-          <div className="py-6 text-center text-sm text-warning">
+          <div className="oc-callout oc-callout-warning rounded-xl px-4 py-5 text-center text-sm text-warning">
             该 provider 需要代理池 active 条目。可先切到 Cursor，或到「代理池」页新建并启用一条。
           </div>
         </div>
@@ -588,9 +590,12 @@ export function AccountFormModal({
           </Field>}
 
           {isCreate && provider === "cursor" && (
-            <div className="rounded-lg border border-accent/40 bg-accent-soft/50 p-3.5">
-              <div className="mb-2 flex items-center gap-1.5 text-body font-semibold text-fg">
-                <KeyRound size={15} className="text-accent" /> 登录 Cursor 账号（Sand 会话，无需 API Key）
+            <div className="oc-callout oc-callout-info rounded-xl p-4">
+              <div className="mb-2.5 flex items-center gap-2 text-body font-semibold text-fg">
+                <span className="oc-icon-badge oc-icon-badge-accent size-7 rounded-lg">
+                  <KeyRound size={14} strokeWidth={2} />
+                </span>
+                登录 Cursor 账号（Sand 会话，无需 API Key）
               </div>
               <div className="flex flex-wrap items-center gap-2">
                 <Button
@@ -606,13 +611,15 @@ export function AccountFormModal({
                 </span>
               </div>
               {cursorSessionUrl && cursorSessionId && (
-                <p className="mt-2 break-all font-mono text-caption text-muted">{cursorSessionUrl}</p>
+                <div className="oc-code-shell mt-2.5 px-3 py-2">
+                  <p className="break-all font-mono text-caption text-muted">{cursorSessionUrl}</p>
+                </div>
               )}
               {oauthHint && <p className="mt-2 text-meta text-muted">{oauthHint}</p>}
               {isCursorSession && tokenFilled && (
-                <div className="mt-2 flex flex-col gap-1 text-meta">
-                  <p className="flex items-center gap-1 text-success">
-                    <CheckCircle2 size={13} /> 会话凭证已写入下方表单
+                <div className="oc-surface-recessed mt-2.5 flex flex-col gap-1.5 rounded-lg p-3 text-meta">
+                  <p className="flex items-center gap-1.5 font-medium text-success">
+                    <CheckCircle2 size={14} /> 会话凭证已写入下方表单
                     {cursorSessionEmail ? `（${cursorSessionEmail}）` : cursorAuthId ? `（${cursorAuthId}）` : ""}
                     ，核对 label/plan 后点"创建"。
                   </p>
@@ -635,16 +642,19 @@ export function AccountFormModal({
           )}
 
           {!isCreate && isCursorSession && (
-            <div className="rounded-lg border border-accent/40 bg-accent-soft/50 p-3.5 text-body text-muted">
+            <div className="oc-callout oc-callout-info rounded-xl p-3.5 text-body text-muted">
               该账号为 Cursor 账号登录会话凭证（Sand）{account?.cursor_auth_id ? `，auth id ${account.cursor_auth_id}` : ""}。
               Sand 模式固定开启；如需换 token，请粘贴同一账号重新登录得到的 accessToken / refreshToken。
             </div>
           )}
 
           {isCreate && provider !== "cursor" && (
-            <div className="rounded-lg border border-accent/40 bg-accent-soft/50 p-3.5">
-              <div className="mb-2 flex items-center gap-1.5 text-body font-semibold text-fg">
-                <KeyRound size={15} className="text-accent" /> OAuth 授权(推荐)
+            <div className="oc-callout oc-callout-info rounded-xl p-4">
+              <div className="mb-2.5 flex items-center gap-2 text-body font-semibold text-fg">
+                <span className="oc-icon-badge oc-icon-badge-accent size-7 rounded-lg">
+                  <KeyRound size={14} strokeWidth={2} />
+                </span>
+                OAuth 授权(推荐)
               </div>
               {provider === "grok" ? (
                 <>
@@ -655,11 +665,13 @@ export function AccountFormModal({
                     <span className="text-meta text-muted">使用 xAI 订阅账号登录，完成后自动回填。授权请求直连 x.ai，不走上方 egress（后续对话仍走该代理）。</span>
                   </div>
                   {grokVerificationUrl && (
-                    <p className="mt-2 break-all font-mono text-caption text-muted">{grokVerificationUrl}</p>
+                    <div className="oc-code-shell mt-2.5 px-3 py-2">
+                      <p className="break-all font-mono text-caption text-muted">{grokVerificationUrl}</p>
+                    </div>
                   )}
                   {grokUserCode && (
                     <p className="mt-2 text-meta text-muted">
-                      页面确认码: <strong className="font-mono text-fg">{grokUserCode}</strong>
+                      页面确认码: <strong className="oc-kbd px-2 py-0.5 font-mono text-fg">{grokUserCode}</strong>
                     </p>
                   )}
                 </>
@@ -672,7 +684,9 @@ export function AccountFormModal({
                     <span className="text-meta text-muted">新页签授权 → 复制回调 URL 里的 code</span>
                   </div>
                   {authUrlFallback && (
-                    <p className="mt-2 break-all font-mono text-caption text-muted">{authUrlFallback}</p>
+                    <div className="oc-code-shell mt-2.5 px-3 py-2">
+                      <p className="break-all font-mono text-caption text-muted">{authUrlFallback}</p>
+                    </div>
                   )}
                   {step2 && (
                     <div className="mt-3 flex flex-col gap-1.5">
@@ -682,7 +696,7 @@ export function AccountFormModal({
                           value={oauthCode}
                           onChange={(e) => setOauthCode(e.target.value)}
                           placeholder="粘 code 或 URL"
-                          className="flex-1"
+                          className="oc-field-control flex-1"
                         />
                         <Button size="sm" variant="accent" onClick={exchangeOAuth} disabled={exchanging}>
                           {exchanging ? <Spinner className="size-4" /> : "③ 换 token"}
@@ -694,15 +708,15 @@ export function AccountFormModal({
               )}
               {oauthHint && <p className="mt-2 text-meta text-muted">{oauthHint}</p>}
               {tokenFilled && (
-                <p className="mt-2 flex items-center gap-1 text-meta text-success">
-                  <CheckCircle2 size={13} /> token 已写入下方表单,核对 label/plan 后点"创建"。
+                <p className="mt-2 flex items-center gap-1.5 text-meta font-medium text-success">
+                  <CheckCircle2 size={14} /> token 已写入下方表单,核对 label/plan 后点"创建"。
                 </p>
               )}
             </div>
           )}
 
           {provider === "cursor" && (
-            <div className="flex items-center justify-between rounded-lg border border-border bg-subtle p-3">
+            <div className="oc-surface-recessed flex items-center justify-between gap-3 rounded-xl p-3.5">
               <div className="flex flex-col">
                 <span className="text-body font-medium text-fg">启用 Sand 客户端模式</span>
                 <span className="text-caption text-muted">
@@ -740,7 +754,7 @@ export function AccountFormModal({
           )}
 
           <Field label="label(账号标签,必填)">
-            <Input value={label} maxLength={120} onChange={(e) => setLabel(e.target.value)} />
+            <Input className="oc-field-control" value={label} maxLength={120} onChange={(e) => setLabel(e.target.value)} />
           </Field>
 
           <div className="grid grid-cols-2 gap-3">
@@ -772,6 +786,7 @@ export function AccountFormModal({
               : `Cursor API Key ${isCreate ? "(必填)" : "(留空则不修改)"}`)
             : `oauth_token ${isCreate ? "(必填)" : "(留空则不修改)"}`}>
             <Textarea
+              className="oc-field-control font-mono"
               value={token}
               rows={2}
               onChange={(e) => setToken(e.target.value)}
@@ -790,6 +805,7 @@ export function AccountFormModal({
               : `oauth_refresh_token ${isCreate ? "(可选)" : "(留空不改;输入 NULL 清空)"}`}
           >
             <Input
+              className="oc-field-control font-mono"
               value={refresh}
               onChange={(e) => setRefresh(e.target.value)}
               readOnly={isCreate && isCursorSession}
@@ -799,6 +815,7 @@ export function AccountFormModal({
 
           {(provider !== "cursor" || isCursorSession) && <Field label={`oauth_expires_at ${isCreate ? "(可选 ISO 时间)" : "(留空不动;输入 NULL 清空)"}`}>
             <Input
+              className="oc-field-control font-mono"
               value={expires}
               onChange={(e) => setExpires(e.target.value)}
               placeholder="如 2026-12-31T00:00:00Z 或 NULL"
@@ -810,6 +827,7 @@ export function AccountFormModal({
             hint="管理员手填;NULL = 未知(调度器中性 1.0)。快到期账号 WRH 自动加权,订阅到期前榨干额度。"
           >
             <Input
+              className="oc-field-control font-mono"
               value={subEnd}
               onChange={(e) => setSubEnd(e.target.value)}
               placeholder="如 2026-12-31 或 2026-12-31T00:00:00Z 或 NULL"

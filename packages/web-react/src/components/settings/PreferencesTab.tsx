@@ -1,5 +1,5 @@
 import type { PromptPrivacySupport } from '@openclaude/protocol/browser'
-import { Monitor, Moon, Sun } from 'lucide-react'
+import { Bell, Keyboard, Monitor, Moon, Palette, SlidersHorizontal, Sparkles, Sun } from 'lucide-react'
 import { useEffect, useState, useSyncExternalStore } from 'react'
 import { useLocalComposerPrefs } from '../../hooks/useLocalComposerPrefs'
 import type { Theme } from '../../hooks/useTheme'
@@ -195,9 +195,9 @@ export function PreferencesTab({
   const mod = modifierKeyLabel()
 
   return (
-    <div className="flex flex-col">
+    <div className="flex flex-col gap-3 py-3">
       {err && (
-        <div className="px-5 pt-3">
+        <div className="px-5">
           <Alert tone="danger" className="text-meta">
             {err}
           </Alert>
@@ -205,233 +205,281 @@ export function PreferencesTab({
       )}
 
       {/* 外观主题 */}
-      <div className="px-5 py-4">
-        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
-          外观主题
-        </div>
-        <div className="grid grid-cols-3 gap-2">
-          {THEME_OPTIONS.map((o) => (
-            <button
-              key={o.value}
-              onClick={() => changeTheme(o.value)}
-              aria-pressed={theme === o.value}
-              className={cn(
-                'flex flex-col items-center gap-1.5 rounded-xl border px-3 py-3 text-body outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
-                theme === o.value
-                  ? 'border-accent bg-accent-soft text-accent'
-                  : 'border-border text-muted hover:bg-hover hover:text-fg',
-              )}
-            >
-              <o.icon size={18} />
-              {o.label}
-            </button>
-          ))}
-        </div>
+      <div className="px-5">
+        <section className="oc-surface-card rounded-2xl p-4">
+          <div className="mb-3 flex items-center gap-2.5">
+            <span className="oc-icon-badge oc-icon-badge-accent h-7 w-7 rounded-sm" aria-hidden>
+              <Palette size={14} strokeWidth={1.75} />
+            </span>
+            <div className="text-section font-semibold text-fg">外观主题</div>
+          </div>
+          <div className="grid grid-cols-3 gap-2.5">
+            {THEME_OPTIONS.map((o) => {
+              const active = theme === o.value
+              return (
+                <button
+                  key={o.value}
+                  onClick={() => changeTheme(o.value)}
+                  aria-pressed={active}
+                  className={cn(
+                    'oc-btn-tactile flex flex-col items-center gap-2 rounded-xl border px-3 py-3 text-body font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
+                    active
+                      ? 'border-accent/45 bg-accent-soft text-accent shadow-soft'
+                      : 'border-border bg-bg/50 text-muted hover:border-border-strong hover:bg-hover hover:text-fg',
+                  )}
+                >
+                  <span
+                    className={cn(
+                      'oc-icon-badge h-8 w-8 rounded-sm',
+                      active && 'oc-icon-badge-accent',
+                    )}
+                    aria-hidden
+                  >
+                    <o.icon size={16} strokeWidth={1.75} />
+                  </span>
+                  {o.label}
+                </button>
+              )
+            })}
+          </div>
+        </section>
       </div>
 
       {/* 默认模型 + 思考深度 */}
-      <div className="border-t border-border px-5 py-4">
-        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
-          对话默认
-        </div>
-        {/* 下拉统一走 ui/Select(与 API 接入页同源),不再自绘一套原生 select(审计 SET-21)。 */}
-        <label className="flex items-center justify-between gap-3 py-1.5">
-          <span className="text-section text-fg">默认模型</span>
-          <Select
-            aria-label="默认模型"
-            inputSize="sm"
-            className="w-auto max-w-[55%]"
-            value={prefs.default_model ?? ''}
-            onValueChange={(v) => {
-              void changeDefaultModel(v)
-            }}
-            options={modelOptions}
-          />
-        </label>
-        <label className="flex items-center justify-between gap-3 py-1.5">
-          <span className="text-section text-fg">思考深度</span>
-          <Select
-            aria-label="思考深度"
-            inputSize="sm"
-            className="w-auto max-w-[55%]"
-            value={selectedEffort}
-            onValueChange={(v) => patch({ default_effort: v === '' ? null : v })}
-            disabled={effortDisabled}
-            options={effortSelectOptions}
-          />
-        </label>
+      <div className="px-5">
+        <section className="oc-surface-card rounded-2xl p-4">
+          <div className="mb-2.5 flex items-center gap-2.5">
+            <span className="oc-icon-badge h-7 w-7 rounded-sm" aria-hidden>
+              <SlidersHorizontal size={14} strokeWidth={1.75} />
+            </span>
+            <div className="text-section font-semibold text-fg">对话默认</div>
+          </div>
+          {/* 下拉统一走 ui/Select(与 API 接入页同源),不再自绘一套原生 select(审计 SET-21)。 */}
+          <div className="divide-y divide-border/60">
+            <label className="flex items-center justify-between gap-3 py-2.5">
+              <span className="text-section font-medium text-fg">默认模型</span>
+              <Select
+                aria-label="默认模型"
+                inputSize="sm"
+                className="w-auto max-w-[55%]"
+                value={prefs.default_model ?? ''}
+                onValueChange={(v) => {
+                  void changeDefaultModel(v)
+                }}
+                options={modelOptions}
+              />
+            </label>
+            <label className="flex items-center justify-between gap-3 py-2.5">
+              <span className="text-section font-medium text-fg">思考深度</span>
+              <Select
+                aria-label="思考深度"
+                inputSize="sm"
+                className="w-auto max-w-[55%]"
+                value={selectedEffort}
+                onValueChange={(v) => patch({ default_effort: v === '' ? null : v })}
+                disabled={effortDisabled}
+                options={effortSelectOptions}
+              />
+            </label>
+          </div>
+        </section>
       </div>
 
       {/* 回答样式：Intelligent UI(OCV5-361)。偏好存服务端,跨设备生效;服务端总开关关闭时不可切换。 */}
-      <div className="border-t border-border px-5 py-4">
-        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
-          回答样式
-        </div>
-        <div className="flex items-start justify-between gap-4 py-1.5">
-          <div className="min-w-0">
-            <div className="text-section text-fg">交互式回答</div>
-            <p className="mt-0.5 text-meta leading-relaxed text-muted">
-              回答里直接给出表格、图表、清单、对比卡和可调的计算器,可以点选、排序、改数。关闭后只用文字回答,已有的组件也按文字显示。
-            </p>
-            {!iui.available && (
-              <p className="mt-1 text-meta text-warning">服务端已暂停此功能。</p>
-            )}
+      <div className="px-5">
+        <section className="oc-surface-card rounded-2xl p-4">
+          <div className="mb-2.5 flex items-center gap-2.5">
+            <span className="oc-icon-badge oc-icon-badge-accent h-7 w-7 rounded-sm" aria-hidden>
+              <Sparkles size={14} strokeWidth={1.75} />
+            </span>
+            <div className="text-section font-semibold text-fg">回答样式</div>
           </div>
-          <Switch
-            aria-label="交互式回答"
-            checked={iui.available && iui.pref}
-            disabled={!iui.available}
-            onCheckedChange={(checked) => {
-              void changeIntelligentUi(checked)
-            }}
-          />
-        </div>
-        <div className="flex items-start justify-between gap-4 py-1.5">
-          <div className="min-w-0">
-            <div className="text-section text-fg">输入预测</div>
-            <p className="mt-0.5 text-meta leading-relaxed text-muted">
-              每条回答的末尾，助手会预测你接下来可能要说的话，用浅色字显示在输入框里：不打字直接点发送就发出这句，想改就按 Tab 或 → 填入后再改。每条回答约多写几十个字，按正常回答计费。打字时也会按本会话说过的话补全。
-            </p>
-            {!iui.predictAvailable && (
-              <p className="mt-1 text-meta text-warning">服务端已暂停此功能。</p>
-            )}
+          <div className="divide-y divide-border/60">
+            <div className="flex items-start justify-between gap-4 py-2.5">
+              <div className="min-w-0">
+                <div className="text-section font-medium text-fg">交互式回答</div>
+                <p className="mt-0.5 text-meta leading-relaxed text-muted">
+                  回答里直接给出表格、图表、清单、对比卡和可调的计算器,可以点选、排序、改数。关闭后只用文字回答,已有的组件也按文字显示。
+                </p>
+                {!iui.available && (
+                  <p className="mt-1 text-meta text-warning">服务端已暂停此功能。</p>
+                )}
+              </div>
+              <Switch
+                aria-label="交互式回答"
+                checked={iui.available && iui.pref}
+                disabled={!iui.available}
+                onCheckedChange={(checked) => {
+                  void changeIntelligentUi(checked)
+                }}
+              />
+            </div>
+            <div className="flex items-start justify-between gap-4 py-2.5">
+              <div className="min-w-0">
+                <div className="text-section font-medium text-fg">输入预测</div>
+                <p className="mt-0.5 text-meta leading-relaxed text-muted">
+                  每条回答的末尾，助手会预测你接下来可能要说的话，用浅色字显示在输入框里：不打字直接点发送就发出这句，想改就按 Tab 或 → 填入后再改。每条回答约多写几十个字，按正常回答计费。打字时也会按本会话说过的话补全。
+                </p>
+                {!iui.predictAvailable && (
+                  <p className="mt-1 text-meta text-warning">服务端已暂停此功能。</p>
+                )}
+              </div>
+              <Switch
+                aria-label="输入预测"
+                checked={iui.predictAvailable && iui.predict}
+                disabled={!iui.predictAvailable}
+                onCheckedChange={(checked) => {
+                  void changeInputPrediction(checked)
+                }}
+              />
+            </div>
           </div>
-          <Switch
-            aria-label="输入预测"
-            checked={iui.predictAvailable && iui.predict}
-            disabled={!iui.predictAvailable}
-            onCheckedChange={(checked) => {
-              void changeInputPrediction(checked)
-            }}
-          />
-        </div>
+        </section>
       </div>
 
       <AssistantPrivacyPreferences key={`${auth.snapshot().epoch}:${activeSessionId ?? "none"}`} auth={auth} privacySupport={privacySupport} sessionId={activeSessionId} profile={prefs.system_assistant_profile} onPatch={onPatch} />
 
       {/* 输入：仅本设备 */}
-      <div className="border-t border-border px-5 py-4">
-        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
-          输入
-        </div>
-        <p className="pb-3 text-meta text-muted">仅本设备生效</p>
-        <div className="pb-2 text-section text-fg">发送键</div>
-        <div className="mb-3 grid grid-cols-2 gap-2">
-          {(
-            [
-              { value: 'enter' as const, label: 'Enter 发送' },
-              // 修饰键随平台(审计 SET-20):Windows / Linux 用户看到的是 Ctrl,不是 ⌘。
-              { value: 'mod-enter' as const, label: `${mod}+Enter 发送` },
-            ] as const
-          ).map((o) => (
-            <button
-              key={o.value}
-              type="button"
-              onClick={() => composerPrefs.setSendKey(o.value)}
-              aria-pressed={composerPrefs.sendKey === o.value}
-              className={cn(
-                'flex items-center justify-center rounded-xl border px-3 py-3 text-body outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
-                composerPrefs.sendKey === o.value
-                  ? 'border-accent bg-accent-soft text-accent'
-                  : 'border-border text-muted hover:bg-hover hover:text-fg',
-              )}
-            >
-              {o.label}
-            </button>
-          ))}
-        </div>
-        <div className="pb-2 text-section text-fg">字号</div>
-        <div className="grid grid-cols-2 gap-2">
-          {(
-            [
-              { value: 'default' as const, label: '默认' },
-              { value: 'large' as const, label: '大' },
-            ] as const
-          ).map((o) => (
-            <button
-              key={o.value}
-              type="button"
-              onClick={() => composerPrefs.setFontSize(o.value)}
-              aria-pressed={composerPrefs.fontSize === o.value}
-              className={cn(
-                'flex items-center justify-center rounded-xl border px-3 py-3 text-body outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
-                composerPrefs.fontSize === o.value
-                  ? 'border-accent bg-accent-soft text-accent'
-                  : 'border-border text-muted hover:bg-hover hover:text-fg',
-              )}
-            >
-              {o.label}
-            </button>
-          ))}
-        </div>
+      <div className="px-5">
+        <section className="oc-surface-card rounded-2xl p-4">
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2.5">
+              <span className="oc-icon-badge h-7 w-7 rounded-sm" aria-hidden>
+                <Keyboard size={14} strokeWidth={1.75} />
+              </span>
+              <div className="text-section font-semibold text-fg">输入</div>
+            </div>
+            <span className="text-caption text-faint">仅本设备生效</span>
+          </div>
+          <div className="pb-2 text-meta font-medium text-muted">发送键</div>
+          <div className="mb-3.5 grid grid-cols-2 gap-2">
+            {(
+              [
+                { value: 'enter' as const, label: 'Enter 发送' },
+                // 修饰键随平台(审计 SET-20):Windows / Linux 用户看到的是 Ctrl,不是 ⌘。
+                { value: 'mod-enter' as const, label: `${mod}+Enter 发送` },
+              ] as const
+            ).map((o) => (
+              <button
+                key={o.value}
+                type="button"
+                onClick={() => composerPrefs.setSendKey(o.value)}
+                aria-pressed={composerPrefs.sendKey === o.value}
+                className={cn(
+                  'oc-btn-tactile flex items-center justify-center rounded-xl border px-3 py-2.5 text-body font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
+                  composerPrefs.sendKey === o.value
+                    ? 'border-accent/45 bg-accent-soft text-accent shadow-soft'
+                    : 'border-border bg-bg/50 text-muted hover:border-border-strong hover:bg-hover hover:text-fg',
+                )}
+              >
+                {o.label}
+              </button>
+            ))}
+          </div>
+          <div className="pb-2 text-meta font-medium text-muted">字号</div>
+          <div className="grid grid-cols-2 gap-2">
+            {(
+              [
+                { value: 'default' as const, label: '默认' },
+                { value: 'large' as const, label: '大' },
+              ] as const
+            ).map((o) => (
+              <button
+                key={o.value}
+                type="button"
+                onClick={() => composerPrefs.setFontSize(o.value)}
+                aria-pressed={composerPrefs.fontSize === o.value}
+                className={cn(
+                  'oc-btn-tactile flex items-center justify-center rounded-xl border px-3 py-2.5 text-body font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
+                  composerPrefs.fontSize === o.value
+                    ? 'border-accent/45 bg-accent-soft text-accent shadow-soft'
+                    : 'border-border bg-bg/50 text-muted hover:border-border-strong hover:bg-hover hover:text-fg',
+                )}
+              >
+                {o.label}
+              </button>
+            ))}
+          </div>
+        </section>
       </div>
 
       {/* 全面优化已下线：仍开着的账号只给一个关闭出口（关 = 收回授权，无需同意弹窗）；
           未开启时什么都不渲染。后端会把 auto_dream_enabled 一并置 false（normalizeAutoDreamPreferencePatch）。 */}
       {prefs.auto_optimizer_enabled === true && (
-        <div className="flex items-center justify-between gap-3 border-t border-border px-5 py-4">
-          <span className="min-w-0">
-            <span className="block text-section text-fg">全面优化已下线</span>
-            <span className="block text-caption text-faint">关闭后不再在后台审计你的会话</span>
-          </span>
-          <Button
-            size="sm"
-            variant="secondary"
-            loading={optimizerClosing}
-            onClick={async () => {
-              setOptimizerClosing(true)
-              try {
-                await patch({ auto_optimizer_enabled: false })
-              } finally {
-                setOptimizerClosing(false)
-              }
-            }}
-          >
-            关闭
-          </Button>
+        <div className="px-5">
+          <div className="oc-callout oc-callout-warning flex items-center justify-between gap-3 rounded-xl px-4 py-3.5">
+            <span className="min-w-0">
+              <span className="block text-section font-medium text-fg">全面优化已下线</span>
+              <span className="block text-caption text-faint">关闭后不再在后台审计你的会话</span>
+            </span>
+            <Button
+              size="sm"
+              variant="secondary"
+              loading={optimizerClosing}
+              onClick={async () => {
+                setOptimizerClosing(true)
+                try {
+                  await patch({ auto_optimizer_enabled: false })
+                } finally {
+                  setOptimizerClosing(false)
+                }
+              }}
+            >
+              关闭
+            </Button>
+          </div>
         </div>
       )}
 
       {/* 通知 */}
-      <div className="border-t border-border px-5 py-4">
-        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">通知</div>
-        <div className="mb-3">
-          <QqBindingCard auth={auth} prefs={prefs} onPatch={patch} />
-        </div>
-        <label className="flex items-center justify-between gap-3 py-2" data-testid="desktop-notify-pref">
-          <span className="min-w-0">
-            <span className="block text-section text-fg">桌面通知</span>
-            <span className="block text-caption text-faint">
-              {desktopNotify.permission === 'unsupported'
-                ? '当前浏览器不支持系统桌面通知'
-                : desktopNotify.permission === 'denied'
-                  ? '浏览器已拦截通知权限，请在地址栏站点设置中允许后重新开启'
-                  : '后台会话完成、出错或等待你拍板时发送系统通知'}
+      <div className="px-5 pb-2">
+        <section className="oc-surface-card rounded-2xl p-4">
+          <div className="mb-3 flex items-center gap-2.5">
+            <span className="oc-icon-badge oc-icon-badge-info h-7 w-7 rounded-sm" aria-hidden>
+              <Bell size={14} strokeWidth={1.75} />
             </span>
-          </span>
-          <Switch
-            aria-label="桌面通知"
-            checked={desktopNotify.enabled}
-            disabled={
-              desktopNotify.permission === 'unsupported' || desktopNotify.permission === 'denied'
-            }
-            onCheckedChange={(checked) => {
-              void requestDesktopNotifyToggle(checked)
-            }}
-          />
-        </label>
-        {NOTIF_FIELDS.map((f) => (
-          <label key={String(f.key)} className="flex items-center justify-between gap-3 py-2">
-            <span className="min-w-0">
-              <span className="block text-section text-fg">{f.label}</span>
-              {f.hint && <span className="block text-caption text-faint">{f.hint}</span>}
-            </span>
-            <Switch
-              checked={prefs[f.key] === true}
-              onCheckedChange={(c) => patch({ [f.key]: c })}
-            />
-          </label>
-        ))}
+            <div className="text-section font-semibold text-fg">通知</div>
+          </div>
+          <div className="mb-3">
+            <QqBindingCard auth={auth} prefs={prefs} onPatch={patch} />
+          </div>
+          <div className="divide-y divide-border/60">
+            <label className="flex items-center justify-between gap-3 py-2.5" data-testid="desktop-notify-pref">
+              <span className="min-w-0">
+                <span className="block text-section font-medium text-fg">桌面通知</span>
+                <span className="block text-caption text-faint">
+                  {desktopNotify.permission === 'unsupported'
+                    ? '当前浏览器不支持系统桌面通知'
+                    : desktopNotify.permission === 'denied'
+                      ? '浏览器已拦截通知权限，请在地址栏站点设置中允许后重新开启'
+                      : '后台会话完成、出错或等待你拍板时发送系统通知'}
+                </span>
+              </span>
+              <Switch
+                aria-label="桌面通知"
+                checked={desktopNotify.enabled}
+                disabled={
+                  desktopNotify.permission === 'unsupported' || desktopNotify.permission === 'denied'
+                }
+                onCheckedChange={(checked) => {
+                  void requestDesktopNotifyToggle(checked)
+                }}
+              />
+            </label>
+            {NOTIF_FIELDS.map((f) => (
+              <label key={String(f.key)} className="flex items-center justify-between gap-3 py-2.5">
+                <span className="min-w-0">
+                  <span className="block text-section font-medium text-fg">{f.label}</span>
+                  {f.hint && <span className="block text-caption text-faint">{f.hint}</span>}
+                </span>
+                <Switch
+                  checked={prefs[f.key] === true}
+                  onCheckedChange={(c) => patch({ [f.key]: c })}
+                />
+              </label>
+            ))}
+          </div>
+        </section>
       </div>
 
       {confirmLongContextEl}
@@ -453,19 +501,25 @@ export function BuiltinHotkeysTable() {
   ]
   return (
     <div className="px-5 py-4">
-      <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
-        内置快捷键
-      </div>
-      <ul className="flex flex-col gap-1">
-        {rows.map((row) => (
-          <li key={row.action} className="flex items-center gap-3 rounded-lg px-2 py-1.5">
-            <kbd className="shrink-0 rounded-md border border-border bg-bg px-1.5 py-0.5 font-mono text-caption text-muted">
-              {row.keys}
-            </kbd>
-            <span className="min-w-0 flex-1 text-body text-fg">{row.action}</span>
-          </li>
-        ))}
-      </ul>
+      <section className="oc-surface-card rounded-2xl p-4">
+        <div className="mb-3 flex items-center gap-2.5">
+          <span className="oc-icon-badge oc-icon-badge-accent h-7 w-7 rounded-sm" aria-hidden>
+            <Keyboard size={14} strokeWidth={1.75} />
+          </span>
+          <div className="text-section font-semibold text-fg">内置快捷键</div>
+        </div>
+        <ul className="flex flex-col divide-y divide-border/60">
+          {rows.map((row) => (
+            <li
+              key={row.action}
+              className="flex items-center justify-between gap-3 py-2.5"
+            >
+              <span className="min-w-0 flex-1 text-body text-fg">{row.action}</span>
+              <kbd className="oc-kbd shrink-0">{row.keys}</kbd>
+            </li>
+          ))}
+        </ul>
+      </section>
     </div>
   )
 }

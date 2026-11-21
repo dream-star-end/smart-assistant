@@ -1,6 +1,20 @@
-import { FlaskConical, RefreshCw, Save } from "lucide-react";
+import {
+  Activity,
+  AlertCircle,
+  BookOpen,
+  CheckCircle2,
+  FlaskConical,
+  KeyRound,
+  Power,
+  RefreshCw,
+  Save,
+  Settings2,
+  Timer,
+  TriangleAlert,
+} from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { Badge, Button, Input, Skeleton, Spinner, Switch, useToast } from "../../../components/ui";
+import { cn } from "../../../lib/utils";
 import { PageHeader, SectionCard, StatCard, StatCardRow, TimeAgo } from "../../components";
 import { adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { useAdminPoll } from "../../lib/useAdminPoll";
@@ -189,8 +203,16 @@ export default function LiteraturePage() {
   return (
     <div className="flex flex-col gap-5">
       <PageHeader
+        icon={BookOpen}
         title={meta.title}
         desc={meta.desc}
+        badge={
+          c ? (
+            <Badge tone={c.enabled ? "success" : "neutral"}>
+              {c.enabled ? "已启用" : "已停用"}
+            </Badge>
+          ) : undefined
+        }
         actions={
           <Button variant="secondary" size="sm" onClick={config.refresh} disabled={config.loading}>
             <RefreshCw size={14} className={config.loading ? "animate-spin" : undefined} />刷新运行数据
@@ -200,29 +222,44 @@ export default function LiteraturePage() {
 
       <LiteratureOps operations={config.data?.operations ?? null} loading={config.loading && !config.data} />
 
-      <SectionCard title="DeepXiv 文献检索" hint="平台级单例配置 · 改完点保存立即生效">
+      <SectionCard
+        title="DeepXiv 文献检索"
+        hint="平台级单例配置 · 改完点保存立即生效"
+        icon={Settings2}
+        iconTone="accent"
+      >
         {!ready && config.error ? (
-          <p className="py-8 text-center text-body text-danger">
+          <div className="oc-callout oc-callout-danger rounded-xl px-4 py-3 text-body text-danger">
             加载失败：
             {apiErrorMessage(config.error, "加载失败")}
-          </p>
+          </div>
         ) : !ready ? (
           <LoadingSkeleton />
         ) : (
-          <div className="flex max-w-2xl flex-col gap-6">
-            <p className="text-[12px] leading-relaxed text-muted">
+          <div className="flex max-w-2xl flex-col gap-5">
+            <div className="oc-callout oc-callout-info rounded-xl px-3.5 py-2.5 text-[12px] leading-relaxed text-muted">
               启用后，容器 LLM 系统 prompt 会注入文献检索技能段，引导其调用检索接口；关闭时检索端点
               直接 503。token 在 DB 端 AEAD 加密，本页永远只显示 <code className="font-mono">****last4</code>{" "}
               掩码，不回显明文。
-            </p>
+            </div>
 
-            {/* 启用开关 */}
-            <div className="flex items-start justify-between gap-4">
-              <div className="min-w-0">
-                <div className="text-body font-medium text-fg">启用文献检索</div>
-                <p className="mt-0.5 text-meta text-faint">
-                  关闭时检索端点直接 503，容器侧 prompt 不注入文献检索技能段。
-                </p>
+            {/* 启用开关 / 连接状态卡 */}
+            <div className="oc-surface-card oc-surface-card-hover flex items-start justify-between gap-4 rounded-xl p-4">
+              <div className="flex min-w-0 items-start gap-3">
+                <span
+                  className={cn(
+                    "oc-icon-badge mt-0.5 size-9 rounded-xl",
+                    form.enabled ? "oc-icon-badge-success" : undefined,
+                  )}
+                >
+                  <Power size={16} />
+                </span>
+                <div className="min-w-0">
+                  <div className="text-body font-medium text-fg">启用文献检索</div>
+                  <p className="mt-0.5 text-meta text-faint">
+                    关闭时检索端点直接 503，容器侧 prompt 不注入文献检索技能段。
+                  </p>
+                </div>
               </div>
               <Switch
                 checked={form.enabled}
@@ -242,27 +279,39 @@ export default function LiteraturePage() {
                 value={form.baseUrl}
                 onChange={(e) => setForm({ ...form, baseUrl: e.target.value })}
                 placeholder="https://data.rag.ac.cn"
-                className="max-w-md"
+                className="oc-field-control max-w-md font-mono"
               />
             </Field>
 
             {/* Token 区 */}
-            <div className="flex flex-col gap-2.5">
-              <div className="text-body font-medium text-fg">
-                Token <span className="font-normal text-faint">（AEAD 加密存储，永不明文回显）</span>
+            <div className="oc-surface-recessed flex flex-col gap-3 rounded-xl p-4">
+              <div className="flex items-center gap-2.5">
+                <span
+                  className={cn(
+                    "oc-icon-badge size-8 rounded-lg",
+                    c.token_set ? "oc-icon-badge-success" : "oc-icon-badge-warning",
+                  )}
+                >
+                  <KeyRound size={14} />
+                </span>
+                <div className="text-body font-medium text-fg">
+                  Token <span className="font-normal text-faint">（AEAD 加密存储，永不明文回显）</span>
+                </div>
               </div>
-              <div className="flex items-center gap-2 text-body">
+              <div className="flex flex-wrap items-center gap-2 text-body">
                 <span className="text-faint">当前：</span>
                 {c.token_set ? (
                   <span className="inline-flex items-center gap-2">
                     <Badge tone="success">已配置</Badge>
-                    <code className="font-mono text-meta text-muted">{c.token_hint ?? "****????"}</code>
+                    <code className="rounded-md bg-surface px-2 py-0.5 font-mono text-meta text-muted">
+                      {c.token_hint ?? "****????"}
+                    </code>
                   </span>
                 ) : (
                   <Badge tone="neutral">未设置</Badge>
                 )}
               </div>
-              <div className="flex flex-col gap-2 pt-0.5">
+              <div className="flex flex-col gap-2.5 pt-0.5">
                 <RadioRow label="保持不变" value="keep" current={tokenAction} onSelect={selectTokenAction} />
                 <RadioRow label="写入新值" value="set" current={tokenAction} onSelect={selectTokenAction}>
                   <Input
@@ -272,7 +321,7 @@ export default function LiteraturePage() {
                     disabled={tokenAction !== "set"}
                     onChange={(e) => setTokenValue(e.target.value)}
                     placeholder="新 token（8..256 可见 ASCII）"
-                    className="max-w-xs flex-1"
+                    className="oc-field-control max-w-xs flex-1"
                     aria-label="新 token"
                   />
                 </RadioRow>
@@ -296,7 +345,7 @@ export default function LiteraturePage() {
                   step={1}
                   value={form.dailyCap}
                   onChange={(e) => setForm({ ...form, dailyCap: e.target.value })}
-                  className="w-40"
+                  className="oc-field-control w-40 tabular-nums"
                 />
               </Field>
               <Field label="缺省条数 (default_size)" htmlFor="lit-size" desc="LLM 缺省条数，1..100">
@@ -308,7 +357,7 @@ export default function LiteraturePage() {
                   step={1}
                   value={form.defaultSize}
                   onChange={(e) => setForm({ ...form, defaultSize: e.target.value })}
-                  className="w-40"
+                  className="oc-field-control w-40 tabular-nums"
                 />
               </Field>
               <Field label="超时秒数 (timeout_sec)" htmlFor="lit-timeout" desc="upstream 超时，3..120">
@@ -320,13 +369,13 @@ export default function LiteraturePage() {
                   step={1}
                   value={form.timeoutSec}
                   onChange={(e) => setForm({ ...form, timeoutSec: e.target.value })}
-                  className="w-40"
+                  className="oc-field-control w-40 tabular-nums"
                 />
               </Field>
             </div>
 
             {/* 操作区 + 测试结果 + 最后更新 */}
-            <div className="flex flex-col gap-3 border-t border-border pt-5">
+            <div className="flex flex-col gap-3 border-t border-border/80 pt-5">
               <div className="flex flex-wrap items-center gap-2">
                 <Button variant="primary" onClick={handleSave} disabled={saving}>
                   {saving ? <Spinner size={14} /> : <Save size={14} />}
@@ -342,7 +391,7 @@ export default function LiteraturePage() {
                 <TestResultSummary result={testResult} />
               </div>
 
-              <div className="text-meta text-faint">
+              <div className="text-meta tabular-nums text-faint">
                 最后更新：
                 {updatedTs > 0 && c.updated_at ? <TimeAgo value={c.updated_at} /> : <span>—</span>}
                 {c.updated_by ? (
@@ -368,12 +417,14 @@ function LiteratureOps({
   loading: boolean;
 }) {
   if (loading) {
-    return <div className="h-28 animate-pulse rounded-xl bg-hover" />;
+    return <div className="oc-surface-card h-28 animate-pulse rounded-2xl bg-hover/60" />;
   }
   if (!operations) {
     return (
-      <SectionCard title="运行数据" hint="数据窗口：不可用">
-        <p className="text-body text-muted">当前版本未返回文献检索运行指标；不会把配置值当作真实使用量。</p>
+      <SectionCard title="运行数据" hint="数据窗口：不可用" icon={Activity} iconTone="neutral">
+        <div className="oc-callout oc-callout-info rounded-xl px-3.5 py-2.5 text-body text-muted">
+          当前版本未返回文献检索运行指标；不会把配置值当作真实使用量。
+        </div>
       </SectionCard>
     );
   }
@@ -387,22 +438,41 @@ function LiteratureOps({
     : "不可用";
   const pct = daily.used !== null && daily.cap > 0 ? Math.min(100, (daily.used / daily.cap) * 100) : 0;
   return (
-    <SectionCard title="运行数据" hint={`请求指标窗口：${windowLabel}`} bodyClassName="flex flex-col gap-4">
-      <div>
+    <SectionCard
+      title="运行数据"
+      hint={`请求指标窗口：${windowLabel}`}
+      icon={Activity}
+      iconTone="info"
+      bodyClassName="flex flex-col gap-4"
+    >
+      <div className="oc-surface-recessed rounded-xl p-3.5">
         <div className="flex flex-wrap items-center justify-between gap-2 text-body">
           <span className="font-medium text-fg">今日用量（UTC {daily.utc_day}）</span>
-          <span className="tabular-nums text-muted">{daily.used === null ? "不可用" : daily.used.toLocaleString("en-US")} / {daily.cap.toLocaleString("en-US")} · {daily.source}</span>
+          <span className="tabular-nums text-muted">
+            {daily.used === null ? "不可用" : daily.used.toLocaleString("en-US")} / {daily.cap.toLocaleString("en-US")} · {daily.source}
+          </span>
         </div>
-        <div className="mt-2 h-2 overflow-hidden rounded-full bg-hover" role="progressbar" tabIndex={0} aria-label="今日文献检索用量" aria-valuemin={0} aria-valuemax={daily.cap} aria-valuenow={daily.used ?? undefined}>
-          <div className="h-full rounded-full bg-accent" style={{ width: `${pct}%` }} />
+        <div
+          className="mt-2.5 h-2.5 overflow-hidden rounded-full bg-hover"
+          role="progressbar"
+          tabIndex={0}
+          aria-label="今日文献检索用量"
+          aria-valuemin={0}
+          aria-valuemax={daily.cap}
+          aria-valuenow={daily.used ?? undefined}
+        >
+          <div
+            className="oc-progress-fill h-full rounded-full bg-accent transition-[width] duration-300"
+            style={{ width: `${pct}%` }}
+          />
         </div>
       </div>
       <StatCardRow cols={3}>
-        <StatCard label="成功" value={success.toLocaleString("en-US")} hint="allowed" tone="success" />
-        <StatCard label="错误" value={errors.toLocaleString("en-US")} hint="上游、Redis 或配置读取" tone={errors > 0 ? "danger" : "neutral"} />
-        <StatCard label="超时" value={timeout.toLocaleString("en-US")} hint="upstream timeout" tone={timeout > 0 ? "danger" : "neutral"} />
+        <StatCard label="成功" value={success.toLocaleString("en-US")} hint="allowed" icon={CheckCircle2} tone="success" />
+        <StatCard label="错误" value={errors.toLocaleString("en-US")} hint="上游、Redis 或配置读取" icon={AlertCircle} tone={errors > 0 ? "danger" : "neutral"} />
+        <StatCard label="超时" value={timeout.toLocaleString("en-US")} hint="upstream timeout" icon={Timer} tone={timeout > 0 ? "danger" : "neutral"} />
       </StatCardRow>
-      <div className="flex flex-wrap gap-x-6 gap-y-1 text-meta text-muted">
+      <div className="oc-surface-recessed flex flex-wrap gap-x-6 gap-y-1.5 rounded-xl px-3.5 py-2.5 text-meta tabular-nums text-muted">
         <span>最近成功：{metrics.last_success_at ? <TimeAgo value={metrics.last_success_at} /> : "暂无"}</span>
         <span>延迟 p50：{metrics.latency_ms?.p50 == null ? "—" : `${Math.round(metrics.latency_ms.p50)} ms`}</span>
         <span>延迟 p95：{metrics.latency_ms?.p95 == null ? "—" : `${Math.round(metrics.latency_ms.p95)} ms`}</span>
@@ -467,7 +537,7 @@ function RadioRow({
 function Metric({ label, value }: { label: string; value: string | number | null | undefined }) {
   if (value === null || value === undefined || value === "") return null;
   return (
-    <span className="text-muted">
+    <span className="tabular-nums text-muted">
       {label}=<code className="font-mono text-fg">{value}</code>
     </span>
   );
@@ -479,11 +549,21 @@ function TestResultSummary({
   result: TestResult | { exception: string } | "probing" | null;
 }) {
   if (result === null) return null;
-  if (result === "probing") return <p className="text-body text-faint">探测中…</p>;
+  if (result === "probing") {
+    return (
+      <div className="oc-callout oc-callout-info flex items-center gap-2 rounded-xl px-3.5 py-2.5 text-body text-muted">
+        <Spinner size={14} />
+        <span>探测中…</span>
+      </div>
+    );
+  }
 
   if ("exception" in result) {
     return (
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-body">
+      <div className="oc-callout oc-callout-danger flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-xl px-3.5 py-2.5 text-body">
+        <span className="oc-icon-badge oc-icon-badge-danger size-6 rounded-md">
+          <AlertCircle size={13} />
+        </span>
         <Badge tone="danger">异常</Badge>
         <span className="break-all text-muted">{result.exception}</span>
       </div>
@@ -492,7 +572,10 @@ function TestResultSummary({
 
   if (result.ok) {
     return (
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-body">
+      <div className="oc-callout oc-callout-success flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-xl px-3.5 py-2.5 text-body">
+        <span className="oc-icon-badge oc-icon-badge-success size-6 rounded-md">
+          <CheckCircle2 size={13} />
+        </span>
         <Badge tone="success">连接正常</Badge>
         <Metric label="status" value={result.status} />
         <Metric label="result_count" value={result.result_count} />
@@ -505,7 +588,10 @@ function TestResultSummary({
   }
 
   return (
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-body">
+    <div className="oc-callout oc-callout-warning flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-xl px-3.5 py-2.5 text-body">
+      <span className="oc-icon-badge oc-icon-badge-warning size-6 rounded-md">
+        <TriangleAlert size={13} />
+      </span>
       <Badge tone="neutral">失败</Badge>
       <Metric label="error" value={result.error ?? "unknown"} />
       {result.status != null && <Metric label="status" value={result.status} />}

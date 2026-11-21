@@ -1,4 +1,4 @@
-import { FolderCog, FolderPlus, Pencil } from 'lucide-react'
+import { AlertOctagon, Archive, Brain, FolderCog, FolderPlus, Layers, Pencil } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { AuthEpochStaleError } from '../../lib/api'
 import {
@@ -13,7 +13,7 @@ import {
   taskboardErrorMessage,
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
-import { Button, Field, IconButton, Input, Textarea, useConfirm, useToast } from '../ui'
+import { Badge, Button, Field, IconButton, Input, Textarea, useConfirm, useToast } from '../ui'
 import { PanelSheet } from './PanelSheet'
 import { StageAgentSelect } from './StageAgentSelect'
 
@@ -286,119 +286,137 @@ export function ProjectSettings({
           ) : undefined
         }
       >
-        <Field
-          label="项目前缀"
-          required={mode === 'create'}
-          hint={mode === 'edit' ? '创建后不可改' : '2–12 位大写字母或数字，以字母开头，例如 OCV5'}
-        >
-          <Input
-            aria-label="项目前缀"
-            data-testid="project-key"
-            inputSize="sm"
-            value={key}
-            maxLength={12}
-            disabled={mode === 'edit'}
-            placeholder="OCV5"
-            onChange={(e) => setKey(e.target.value.toUpperCase())}
-          />
-        </Field>
-        <Field label="项目名称" required>
-          <Input
-            aria-label="项目名称"
-            data-testid="project-name"
-            inputSize="sm"
-            value={name}
-            placeholder="V5 自用"
-            onChange={(e) => setName(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') void (mode === 'edit' ? submitEdit() : submitCreate())
-            }}
-          />
-        </Field>
-        <Field label="说明" hint="可选">
-          <Textarea
-            aria-label="项目说明"
-            data-testid="project-description"
-            rows={3}
-            value={description}
-            onChange={(e) => setDescription(e.target.value)}
-          />
-        </Field>
-        <Field
-          label="工作区"
-          hint="绑定到本项目的会话默认在这个目录里干活；若会话绑定了 GitHub 仓库且仓库已就绪，会改用仓库目录。"
-          error={workspaceError || undefined}
-        >
-          <div className="flex flex-col gap-1.5" data-testid="project-workspace-spec">
-            {WORKSPACE_OPTIONS.map((opt) => (
-              <label
-                key={opt.kind}
-                className="flex items-start gap-2 rounded-lg bg-hover px-3 py-2 text-body text-fg"
-              >
-                <input
-                  type="radio"
-                  name="project-workspace-kind"
-                  className="mt-1"
-                  data-testid={`project-workspace-${opt.kind}`}
-                  checked={workspaceKind === opt.kind}
-                  onChange={() => {
-                    setWorkspaceKind(opt.kind)
-                    setWorkspaceError('')
-                  }}
-                />
-                <span className="flex min-w-0 flex-col">
-                  <span>{opt.label}</span>
-                  <span className="text-caption text-muted">{opt.hint}</span>
-                </span>
-              </label>
-            ))}
-            {workspaceKind === 'container_path' && (
-              <Input
-                aria-label="容器工作区路径"
-                data-testid="project-workspace-path"
-                inputSize="sm"
-                placeholder="/home/agent/.openclaude/workspace/..."
-                value={workspacePath}
-                onChange={(e) => setWorkspacePath(e.target.value)}
-              />
-            )}
-          </div>
-        </Field>
-        {mode === 'create' && (
+        <div className="oc-surface-card flex flex-col gap-3 rounded-xl p-3.5">
           <Field
-            label="流水线模板"
-            hint="默认全选四条内置线。内置模板不能删除，可在「流水线模板」里对已有项目再套用。"
+            label="项目前缀"
+            required={mode === 'create'}
+            hint={mode === 'edit' ? '创建后不可改' : '2–12 位大写字母或数字，以字母开头，例如 OCV5'}
           >
-            <div className="flex flex-col gap-1.5" data-testid="project-templates">
-              {BUILTIN_TEMPLATE_OPTIONS.map((t) => {
-                const checked = templateIds.includes(t.id)
+            <Input
+              aria-label="项目前缀"
+              data-testid="project-key"
+              inputSize="sm"
+              value={key}
+              maxLength={12}
+              disabled={mode === 'edit'}
+              placeholder="OCV5"
+              onChange={(e) => setKey(e.target.value.toUpperCase())}
+            />
+          </Field>
+          <Field label="项目名称" required>
+            <Input
+              aria-label="项目名称"
+              data-testid="project-name"
+              inputSize="sm"
+              value={name}
+              placeholder="V5 自用"
+              onChange={(e) => setName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void (mode === 'edit' ? submitEdit() : submitCreate())
+              }}
+            />
+          </Field>
+          <Field label="说明" hint="可选">
+            <Textarea
+              aria-label="项目说明"
+              data-testid="project-description"
+              rows={3}
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+            />
+          </Field>
+          <Field
+            label="工作区"
+            hint="绑定到本项目的会话默认在这个目录里干活；若会话绑定了 GitHub 仓库且仓库已就绪，会改用仓库目录。"
+            error={workspaceError || undefined}
+          >
+            <div className="flex flex-col gap-2" data-testid="project-workspace-spec">
+              {WORKSPACE_OPTIONS.map((opt) => {
+                const selected = workspaceKind === opt.kind
                 return (
                   <label
-                    key={t.id}
-                    className="flex items-center gap-2 rounded-lg bg-hover px-3 py-2 text-body text-fg"
+                    key={opt.kind}
+                    className={`flex cursor-pointer items-start gap-2.5 rounded-xl px-3 py-2.5 text-body text-fg transition-all ${
+                      selected
+                        ? 'oc-surface-card ring-1 ring-accent/55'
+                        : 'oc-surface-recessed hover:border-border-strong'
+                    }`}
                   >
                     <input
-                      type="checkbox"
-                      data-testid={`project-template-${t.id}`}
-                      checked={checked}
+                      type="radio"
+                      name="project-workspace-kind"
+                      className="mt-1 accent-accent"
+                      data-testid={`project-workspace-${opt.kind}`}
+                      checked={selected}
                       onChange={() => {
-                        setTemplateIds((cur) =>
-                          checked ? cur.filter((id) => id !== t.id) : [...cur, t.id],
-                        )
+                        setWorkspaceKind(opt.kind)
+                        setWorkspaceError('')
                       }}
                     />
-                    <span className="min-w-0 flex-1 truncate">{t.name}</span>
-                    <span className="text-caption text-faint">内置</span>
+                    <span className="flex min-w-0 flex-col gap-0.5">
+                      <span className="font-medium">{opt.label}</span>
+                      <span className="text-caption leading-snug text-muted">{opt.hint}</span>
+                    </span>
                   </label>
                 )
               })}
+              {workspaceKind === 'container_path' && (
+                <Input
+                  aria-label="容器工作区路径"
+                  data-testid="project-workspace-path"
+                  inputSize="sm"
+                  placeholder="/home/agent/.openclaude/workspace/..."
+                  value={workspacePath}
+                  onChange={(e) => setWorkspacePath(e.target.value)}
+                />
+              )}
             </div>
           </Field>
+        </div>
+        {mode === 'create' && (
+          <div className="oc-surface-card flex flex-col gap-2.5 rounded-xl p-3.5">
+            <Field
+              label="流水线模板"
+              hint="默认全选四条内置线。内置模板不能删除，可在「流水线模板」里对已有项目再套用。"
+            >
+              <div className="flex flex-col gap-1.5" data-testid="project-templates">
+                {BUILTIN_TEMPLATE_OPTIONS.map((t) => {
+                  const checked = templateIds.includes(t.id)
+                  return (
+                    <label
+                      key={t.id}
+                      className={`flex cursor-pointer items-center gap-2.5 rounded-xl px-3 py-2 text-body text-fg transition-all ${
+                        checked
+                          ? 'oc-surface-card ring-1 ring-accent/40'
+                          : 'oc-surface-recessed hover:border-border-strong'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        className="oc-checkbox-box accent-accent"
+                        data-testid={`project-template-${t.id}`}
+                        checked={checked}
+                        onChange={() => {
+                          setTemplateIds((cur) =>
+                            checked ? cur.filter((id) => id !== t.id) : [...cur, t.id],
+                          )
+                        }}
+                      />
+                      <span className="min-w-0 flex-1 truncate font-medium">{t.name}</span>
+                      <Badge size="sm" tone="info">
+                        内置
+                      </Badge>
+                    </label>
+                  )
+                })}
+              </div>
+            </Field>
+          </div>
         )}
         {mode === 'create' && templateIds.length > 0 && (
           <StageAgentSelect auth={auth} agents={agents} value={executionAgentId} onValueChange={setExecutionAgentId} />
         )}
-        <div className="flex flex-wrap gap-1">
+        <div className="flex flex-wrap gap-1.5">
           {mode === 'create' ? (
             <Button
               type="button"
@@ -431,15 +449,20 @@ export function ProjectSettings({
           </>
         )}
         {mode === 'edit' && archived.length > 0 && (
-          <div className="mt-2 flex flex-col gap-2 border-t border-border pt-3">
-            <h3 className="text-section font-semibold text-fg">已归档项目</h3>
+          <div className="oc-surface-card flex flex-col gap-2.5 rounded-xl p-3.5">
+            <div className="flex items-center gap-2">
+              <span className="oc-icon-badge size-7 rounded-lg" aria-hidden>
+                <Archive size={14} />
+              </span>
+              <h3 className="text-section font-semibold tracking-tight text-fg">已归档项目</h3>
+            </div>
             <p className="text-caption text-muted">默认不出现在顶栏下拉里。</p>
             {archived.map((p) => (
               <div
                 key={p.id}
-                className="flex items-center justify-between gap-2 rounded-lg bg-hover px-3 py-2"
+                className="oc-surface-recessed flex items-center justify-between gap-2 rounded-lg px-3 py-2"
               >
-                <span className="min-w-0 truncate text-body text-fg">
+                <span className="min-w-0 truncate text-body font-medium text-fg">
                   {p.key} {p.name}
                 </span>
                 <Button
@@ -462,19 +485,23 @@ export function ProjectSettings({
         {mode === 'edit' && current && !current.archivedAt && (
           // 危险操作单独放在最底部,不再和「保存」并排(审计 T-23)。
           <section
-            className="mt-2 flex flex-col gap-2 border-t border-border pt-3"
+            className="oc-callout oc-callout-danger flex flex-col gap-2.5 rounded-xl p-3.5"
             data-testid="project-danger-zone"
           >
-            <h3 className="text-section font-semibold text-danger">危险操作</h3>
-            <p className="text-caption text-muted">
+            <div className="flex items-center gap-2">
+              <span className="oc-icon-badge oc-icon-badge-danger size-7 rounded-lg" aria-hidden>
+                <AlertOctagon size={14} />
+              </span>
+              <h3 className="text-section font-semibold tracking-tight text-danger">危险操作</h3>
+            </div>
+            <p className="text-caption leading-relaxed text-muted">
               归档后项目从下拉里消失，单据仍保留，随时可以取消归档。
             </p>
             <div>
               <Button
                 type="button"
                 size="sm"
-                variant="secondary"
-                className="border-danger text-danger hover:border-danger hover:bg-danger-soft"
+                variant="danger"
                 loading={saving}
                 data-testid="project-archive"
                 onClick={() => void archiveCurrent()}
@@ -538,14 +565,19 @@ function ProjectContextPanel({ auth, project }: { auth: AuthSession; project: Pr
   }, [auth, project.id, toast])
   const version = summary?.version ?? project.contextVersion ?? 0
   return (
-    <div className="mt-2 flex flex-col gap-2 border-t border-border pt-3" data-testid="project-context-panel">
-      <h3 className="text-section font-semibold text-fg">项目上下文</h3>
-      <p className="text-caption text-muted">
+    <div className="oc-surface-card flex flex-col gap-2.5 rounded-xl p-3.5" data-testid="project-context-panel">
+      <div className="flex items-center gap-2">
+        <span className="oc-icon-badge oc-icon-badge-info size-7 rounded-lg" aria-hidden>
+          <Layers size={14} />
+        </span>
+        <h3 className="text-section font-semibold tracking-tight text-fg">项目上下文</h3>
+      </div>
+      <p className="text-caption leading-relaxed text-muted">
         agent 开工时会带上这些项目信息；其中的实时信息（如 git 状态）每次执行时重新读取。
       </p>
       {summary && (
-        <p className="text-caption text-muted" title={`上下文版本 v${String(version)}`}>
-          工作区：<span className="text-fg">{describeWorkspace(summary.workspaceSpec ?? project.workspaceSpec)}</span>
+        <p className="oc-surface-recessed rounded-lg px-2.5 py-1.5 text-caption text-muted" title={`上下文版本 v${String(version)}`}>
+          工作区：<span className="font-medium text-fg">{describeWorkspace(summary.workspaceSpec ?? project.workspaceSpec)}</span>
         </p>
       )}
       <div>
@@ -565,12 +597,17 @@ function ProjectContextPanel({ auth, project }: { auth: AuthSession; project: Pr
         </Button>
       </div>
       {preview && Array.isArray(preview.slots) && (
-        <ul className="flex flex-col gap-1 text-caption text-muted" data-testid="project-context-slots">
+        <ul className="flex flex-col gap-1.5 text-caption text-muted" data-testid="project-context-slots">
           {(preview.slots as Array<{ name: string; bytes: number; redacted?: boolean; volatile?: boolean }>).map(
             (s) => (
-              <li key={s.name} className="flex flex-wrap items-center gap-x-2 rounded-lg bg-hover px-3 py-1.5">
-                <span className="text-fg">{SLOT_LABEL[s.name] ?? s.name}</span>
-                <span>{formatBytes(s.bytes)}</span>
+              <li
+                key={s.name}
+                className="oc-surface-recessed flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg px-3 py-2"
+              >
+                <span className="font-medium text-fg">{SLOT_LABEL[s.name] ?? s.name}</span>
+                <span className="rounded bg-surface px-1.5 py-0.5 font-mono tabular-nums text-muted">
+                  {formatBytes(s.bytes)}
+                </span>
                 {s.volatile ? <span>· 每次执行时实时读取</span> : null}
                 {s.redacted ? <span>· 已隐去敏感内容</span> : null}
               </li>
@@ -637,24 +674,30 @@ function ProjectMemoryReview({
   // 候选队列只剩存量:自动晋升之前写下的 pending/conflict 还需要人工消化,之后这一段消失。
   const leftover = items.candidates.filter((c) => c.status === 'pending' || c.status === 'conflict')
   return (
-    <div className="mt-2 flex flex-col gap-2 border-t border-border pt-3" data-testid="project-memory-review">
-      <h3 className="text-section font-semibold text-fg">项目记忆</h3>
-      <p className="text-caption text-muted">
+    <div className="oc-surface-card flex flex-col gap-2.5 rounded-xl p-3.5" data-testid="project-memory-review">
+      <div className="flex items-center gap-2">
+        <span className="oc-icon-badge oc-icon-badge-accent size-7 rounded-lg" aria-hidden>
+          <Brain size={14} />
+        </span>
+        <h3 className="text-section font-semibold tracking-tight text-fg">项目记忆</h3>
+      </div>
+      <p className="text-caption leading-relaxed text-muted">
         agent 整理出的项目记忆会在下一次执行时自动带上；不再需要的可以在下方废弃。
       </p>
       {leftover.length > 0 && (
         <p className="text-caption text-muted">以下条目写于改为自动生效之前，还没有生效：</p>
       )}
       {leftover.map((c) => (
-        <div key={c.id ?? c.file} className="rounded-lg bg-hover px-3 py-2 text-body">
-          <div className="font-medium">{c.slug}</div>
-          <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap text-caption text-muted">
+        <div key={c.id ?? c.file} className="oc-surface-recessed flex flex-col gap-2 rounded-xl p-3 text-body">
+          <div className="font-medium text-fg">{c.slug}</div>
+          <pre className="oc-code-shell max-h-32 overflow-auto p-2.5 whitespace-pre-wrap text-caption text-muted">
             {(c.content ?? '').slice(0, 800)}
           </pre>
-          <div className="mt-2 flex gap-1">
+          <div className="flex gap-1.5">
             <Button
               type="button"
               size="sm"
+              variant="primary"
               data-testid={`project-memory-promote-${c.id}`}
               onClick={() => {
                 void taskboardApi
@@ -681,30 +724,35 @@ function ProjectMemoryReview({
           </div>
         </div>
       ))}
-      <h4 className="text-meta font-semibold text-fg">生效中的记忆</h4>
+      <h4 className="pt-1 text-meta font-semibold text-fg">生效中的记忆</h4>
       {items.official.length === 0 ? (
         <p className="text-caption text-muted">还没有项目记忆。</p>
       ) : (
-        items.official.map((o) => (
-          <div key={o.slug} className="flex items-center justify-between gap-2 text-body">
-            <span>
-              {o.slug}
-              {o.deprecated ? '（已废弃）' : ''}
-              {o.tampered ? '（文件被改动过，未注入）' : ''}
-            </span>
-            {!o.deprecated && (
-              <Button
-                type="button"
-                size="sm"
-                variant="secondary"
-                data-testid={`project-memory-deprecate-${o.slug}`}
-                onClick={() => void deprecate(o)}
-              >
-                废弃
-              </Button>
-            )}
-          </div>
-        ))
+        <div className="flex flex-col gap-1.5">
+          {items.official.map((o) => (
+            <div
+              key={o.slug}
+              className="oc-surface-recessed flex items-center justify-between gap-2 rounded-lg px-3 py-2 text-body"
+            >
+              <span className="min-w-0 truncate text-fg">
+                {o.slug}
+                {o.deprecated ? '（已废弃）' : ''}
+                {o.tampered ? '（文件被改动过，未注入）' : ''}
+              </span>
+              {!o.deprecated && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  data-testid={`project-memory-deprecate-${o.slug}`}
+                  onClick={() => void deprecate(o)}
+                >
+                  废弃
+                </Button>
+              )}
+            </div>
+          ))}
+        </div>
       )}
     </div>
   )

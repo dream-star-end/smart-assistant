@@ -1,4 +1,15 @@
-import { Check, RotateCcw, Save, Search, X } from "lucide-react";
+import {
+  Check,
+  CheckCircle2,
+  ClipboardList,
+  Code2,
+  MessageSquareText,
+  RotateCcw,
+  Save,
+  Search,
+  Sparkles,
+  X,
+} from "lucide-react";
 import { useEffect, useState } from "react";
 import { Alert, Badge, Button, IconButton, Input, Sheet, Textarea, useToast } from "../../../components/ui";
 import { CopyChip, KeyValue, TimeAgo } from "../../components";
@@ -121,31 +132,69 @@ export function FeedbackDetailSheet({
   const metaText =
     current?.meta && Object.keys(current.meta).length > 0 ? JSON.stringify(current.meta, null, 2) : "（无 meta）";
 
+  const statusCallout =
+    current?.status === "open"
+      ? {
+          cls: "oc-callout oc-callout-warning",
+          text: "该反馈尚待确认，建议核对上下文后指派负责人或点击底部「确认收到」。",
+        }
+      : current?.status === "acked"
+        ? {
+            cls: "oc-callout oc-callout-info",
+            text: "已确认受理中，补充解决结论后即可关闭闭环。",
+          }
+        : {
+            cls: "oc-callout oc-callout-success",
+            text: "该反馈已关闭闭环；如有后续回归可随时重新打开。",
+          };
+
   return (
     <Sheet
       open={open}
       onOpenChange={onOpenChange}
       side="right"
       srTitle="反馈详情"
-      className="w-[34rem] max-w-[94vw] bg-surface"
+      className="oc-surface-popover w-[36rem] max-w-[94vw] bg-surface"
     >
       {current && (
         <>
-          <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-4">
-            <div className="flex items-center gap-2">
-              <h2 className="text-title font-semibold text-fg">反馈 #{current.id}</h2>
-              <Badge tone={FEEDBACK_STATUS_TONE[current.status]}>
-                {FEEDBACK_STATUS_LABELS[current.status]}
-              </Badge>
+          <div className="flex items-center justify-between gap-3 border-b border-border/80 bg-sidebar/45 px-5 py-4 dark:bg-elevated/45">
+            <div className="flex min-w-0 items-center gap-2.5">
+              <span className="oc-icon-badge oc-icon-badge-accent size-9 shrink-0 rounded-xl">
+                <MessageSquareText size={16} strokeWidth={1.95} />
+              </span>
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h2 className="text-title font-semibold tracking-tight text-fg">
+                    反馈 #{current.id}
+                  </h2>
+                  <Badge tone={FEEDBACK_STATUS_TONE[current.status]}>
+                    {FEEDBACK_STATUS_LABELS[current.status]}
+                  </Badge>
+                </div>
+                <p className="mt-0.5 text-caption tabular-nums text-muted">
+                  提交于 {fmt(current.created_at)}
+                </p>
+              </div>
             </div>
-            <IconButton size="sm" aria-label="关闭" onClick={() => onOpenChange(false)}>
+            <IconButton
+              size="sm"
+              aria-label="关闭"
+              onClick={() => onOpenChange(false)}
+              className="oc-icon-btn-tactile"
+            >
               <X size={16} />
             </IconButton>
           </div>
 
-          <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
-            <div className="divide-y divide-border">
-              <KeyValue label="提交时间" value={fmt(current.created_at)} />
+          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
+            <div className={`${statusCallout.cls} flex items-start gap-2.5 rounded-xl px-3.5 py-2.5 text-meta text-fg`}>
+              <CheckCircle2 size={15} className="mt-0.5 shrink-0 text-muted" />
+              <span className="leading-relaxed">{statusCallout.text}</span>
+            </div>
+
+            <div className="oc-surface-card divide-y divide-border/70 rounded-xl px-4 py-1">
+              <KeyValue label="提交时间" value={<span className="tabular-nums">{fmt(current.created_at)}</span>} />
               <KeyValue
                 label="用户"
                 value={
@@ -164,7 +213,7 @@ export function FeedbackDetailSheet({
                 <KeyValue
                   label="确认操作人"
                   value={
-                    <span>
+                    <span className="tabular-nums">
                       admin <span className="font-mono text-faint">#{current.handled_by}</span> ·{" "}
                       {fmt(current.handled_at)}
                     </span>
@@ -173,16 +222,20 @@ export function FeedbackDetailSheet({
               )}
             </div>
 
-            <div className="mt-4">
-              <p className="mb-1.5 text-meta font-medium text-faint">描述</p>
-              <pre className="max-h-52 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-surface px-3 py-2 text-[13px] leading-relaxed text-fg">
+            <div>
+              <p className="mb-1.5 text-caption font-semibold uppercase tracking-wider text-faint">
+                描述
+              </p>
+              <pre className="oc-surface-recessed max-h-52 overflow-auto whitespace-pre-wrap break-words rounded-xl px-3.5 py-3 text-body leading-relaxed text-fg">
                 {current.description}
               </pre>
             </div>
 
-            <div className="mt-4">
-              <p className="mb-1.5 text-meta font-medium text-faint">上下文</p>
-              <div className="flex flex-col gap-1.5">
+            <div>
+              <p className="mb-1.5 text-caption font-semibold uppercase tracking-wider text-faint">
+                上下文
+              </p>
+              <div className="oc-surface-recessed flex flex-col gap-2 rounded-xl px-3.5 py-3">
                 {current.request_id && (
                   <div className="flex items-center gap-2 text-meta">
                     <span className="w-20 shrink-0 text-faint">request_id</span>
@@ -198,7 +251,7 @@ export function FeedbackDetailSheet({
                 {current.version && (
                   <div className="flex items-center gap-2 text-meta">
                     <span className="w-20 shrink-0 text-faint">version</span>
-                    <span className="font-mono text-muted">{current.version}</span>
+                    <span className="font-mono text-fg">{current.version}</span>
                   </div>
                 )}
                 {current.user_agent && (
@@ -207,32 +260,51 @@ export function FeedbackDetailSheet({
                     <span className="break-all font-mono text-muted">{current.user_agent}</span>
                   </div>
                 )}
+                {!current.request_id && !current.session_id && !current.version && !current.user_agent && (
+                  <span className="text-meta text-faint">（无附加上下文）</span>
+                )}
               </div>
             </div>
 
-            <div className="mt-4">
-              <p className="mb-1.5 text-meta font-medium text-faint">meta（JSON）</p>
-              <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-surface px-3 py-2 font-mono text-[11.5px] leading-relaxed text-muted">
-                {metaText}
-              </pre>
+            <div>
+              <p className="mb-1.5 text-caption font-semibold uppercase tracking-wider text-faint">
+                meta（JSON）
+              </p>
+              <div className="oc-code-shell">
+                <div className="oc-code-shell-header flex items-center justify-between px-3 py-1.5 text-caption text-muted">
+                  <span className="inline-flex items-center gap-1.5 font-mono">
+                    <Code2 size={12} />
+                    payload.json
+                  </span>
+                  <span className="font-mono text-micro text-faint">
+                    {current.meta ? `${Object.keys(current.meta).length} keys` : "empty"}
+                  </span>
+                </div>
+                <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-words px-3.5 py-2.5 font-mono text-caption leading-relaxed text-fg/90">
+                  {metaText}
+                </pre>
+              </div>
             </div>
 
             {current.request_id && (
-              <div className="mt-4">
+              <div>
                 <div className="mb-2 flex items-center justify-between gap-3">
-                  <p className="text-meta font-medium text-faint">请求归属</p>
+                  <p className="text-caption font-semibold uppercase tracking-wider text-faint">
+                    请求归属
+                  </p>
                   <Button
                     variant="secondary"
                     size="sm"
                     disabled={traceBusy}
                     onClick={lookupTrace}
+                    className="oc-btn-tactile"
                   >
                     <Search size={14} />
                     {traceBusy ? "反查中…" : "一键反查"}
                   </Button>
                 </div>
                 {traceResult?.status === "found" && (
-                  <div className="divide-y divide-border rounded-lg border border-border bg-surface px-3 py-1">
+                  <div className="oc-surface-card divide-y divide-border/70 rounded-xl px-3.5 py-1">
                     <KeyValue
                       label="用户"
                       value={
@@ -255,11 +327,17 @@ export function FeedbackDetailSheet({
                     />
                     <KeyValue
                       label="模型"
-                      value={traceResult.trace.model ?? <span className="text-faint">—</span>}
+                      value={
+                        traceResult.trace.model ? (
+                          <span className="font-mono text-fg">{traceResult.trace.model}</span>
+                        ) : (
+                          <span className="text-faint">—</span>
+                        )
+                      }
                     />
                     <KeyValue
                       label="时间"
-                      value={<TimeAgo value={traceResult.trace.created_at} />}
+                      value={<TimeAgo value={traceResult.trace.created_at} className="tabular-nums" />}
                     />
                   </div>
                 )}
@@ -272,11 +350,18 @@ export function FeedbackDetailSheet({
               </div>
             )}
 
-            <div className="mt-5 rounded-xl border border-border bg-elevated p-4">
-              <h3 className="text-body font-semibold text-fg">处理闭环</h3>
-              <p className="mt-1 text-meta text-faint">
-                负责人独立于确认操作人；优先级和解决结论可分别维护。
-              </p>
+            <div className="oc-surface-card rounded-xl p-4">
+              <div className="flex items-start gap-2.5">
+                <span className="oc-icon-badge oc-icon-badge-info mt-0.5 size-8 rounded-lg">
+                  <ClipboardList size={15} strokeWidth={1.95} />
+                </span>
+                <div className="min-w-0">
+                  <h3 className="text-body font-semibold text-fg">处理闭环</h3>
+                  <p className="mt-0.5 text-caption text-muted">
+                    负责人独立于确认操作人；优先级和解决结论可分别维护。
+                  </p>
+                </div>
+              </div>
               <div className="mt-4 grid gap-4 sm:grid-cols-2">
                 <label className="flex flex-col gap-1.5 text-meta font-medium text-muted">
                   负责人
@@ -294,6 +379,7 @@ export function FeedbackDetailSheet({
                       variant="secondary"
                       disabled={busy || owner.trim() === (current.assigned_to ?? "")}
                       onClick={saveOwner}
+                      className="oc-btn-tactile"
                     >
                       <Save size={14} />保存
                     </Button>
@@ -307,7 +393,7 @@ export function FeedbackDetailSheet({
                       value={priority}
                       onChange={(event) => setPriority(event.target.value as FeedbackPriority | "")}
                       disabled={busy}
-                      className="h-9 min-w-0 flex-1 rounded-md border border-border bg-surface px-2.5 text-meta text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
+                      className="oc-field-control h-9 min-w-0 flex-1 rounded-lg border border-border px-2.5 text-meta text-fg outline-none"
                     >
                       <option value="">未设置</option>
                       <option value="low">低</option>
@@ -320,6 +406,7 @@ export function FeedbackDetailSheet({
                       variant="secondary"
                       disabled={busy || priority === (current.priority ?? "")}
                       onClick={() => void mutate("priority", { priority: priority || null }, "优先级已更新")}
+                      className="oc-btn-tactile"
                     >
                       <Save size={14} />保存
                     </Button>
@@ -337,12 +424,13 @@ export function FeedbackDetailSheet({
                   disabled={busy}
                 />
               </label>
-              <div className="mt-2 flex justify-end">
+              <div className="mt-2.5 flex justify-end">
                 <Button
                   size="sm"
                   variant="secondary"
                   disabled={busy || resolution.trim() === (current.resolution ?? "")}
                   onClick={() => void mutate("resolution", { resolution: resolution.trim() || null }, "解决结论已更新")}
+                  className="oc-btn-tactile"
                 >
                   <Save size={14} />保存结论
                 </Button>
@@ -350,28 +438,40 @@ export function FeedbackDetailSheet({
             </div>
           </div>
 
-          <div className="flex flex-wrap justify-end gap-2 border-t border-border px-5 py-4">
-            <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={busy}>
-              退出详情
-            </Button>
-            {current.status === "open" && (
-              <Button variant="secondary" onClick={ack} disabled={busy}>
-                <Check size={15} />确认收到
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/80 bg-sidebar/50 px-5 py-3.5 dark:bg-elevated/50">
+            <span className="inline-flex items-center gap-1.5 text-caption text-faint">
+              <Sparkles size={13} className="text-accent" />
+              操作将即时同步至队列
+            </span>
+            <div className="flex flex-wrap justify-end gap-2">
+              <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={busy} className="oc-btn-tactile">
+                退出详情
               </Button>
-            )}
-            {current.status !== "closed" ? (
-              <Button
-                variant="primary"
-                onClick={() => void mutate("close", resolution.trim() ? { resolution: resolution.trim() } : {}, "反馈已关闭")}
-                disabled={busy}
-              >
-                <Check size={15} />关闭反馈
-              </Button>
-            ) : (
-              <Button variant="primary" onClick={() => void mutate("reopen", {}, "反馈已重新打开")} disabled={busy}>
-                <RotateCcw size={15} />重新打开
-              </Button>
-            )}
+              {current.status === "open" && (
+                <Button variant="secondary" onClick={ack} disabled={busy} className="oc-btn-tactile">
+                  <Check size={15} />确认收到
+                </Button>
+              )}
+              {current.status !== "closed" ? (
+                <Button
+                  variant="primary"
+                  onClick={() => void mutate("close", resolution.trim() ? { resolution: resolution.trim() } : {}, "反馈已关闭")}
+                  disabled={busy}
+                  className="oc-btn-tactile"
+                >
+                  <Check size={15} />关闭反馈
+                </Button>
+              ) : (
+                <Button
+                  variant="primary"
+                  onClick={() => void mutate("reopen", {}, "反馈已重新打开")}
+                  disabled={busy}
+                  className="oc-btn-tactile"
+                >
+                  <RotateCcw size={15} />重新打开
+                </Button>
+              )}
+            </div>
           </div>
         </>
       )}

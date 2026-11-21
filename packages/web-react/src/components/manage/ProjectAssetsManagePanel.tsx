@@ -16,24 +16,35 @@ export function ProjectAssetsManagePanel({ auth }: { auth: AuthSession }) {
   if (!isWorkScope(scope) && scope.kind !== 'chat') return null
 
   return (
-    <div data-testid="project-assets-manage" className="border-t border-border">
+    <div data-testid="project-assets-manage" className="border-t border-border/80">
       {/* 这是「项目记忆」页签里的一个小节,不是页面:不用 PanelHeader(它在手机管理中心里只留给
           读屏、操作 portal 进上下文行),标题必须一直可见。 */}
-      <div className="px-4 pb-1 pt-5">
-        <h4 className="text-[14px] font-semibold leading-5 text-fg">项目资产</h4>
-        <p className="mt-0.5 text-meta text-muted">
-          上传给这个项目的参考文件；含密钥或二维码的文件会标记为敏感。
-        </p>
+      <div className="flex items-start gap-2.5 px-4 pb-2 pt-5">
+        <span className="oc-icon-badge mt-0.5 size-7 shrink-0 rounded-lg" aria-hidden="true">
+          <Folder size={14} strokeWidth={1.75} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <h4 className="text-section font-semibold leading-5 tracking-tight text-fg">项目资产</h4>
+          <p className="mt-0.5 text-meta text-muted">
+            上传给这个项目的参考文件；含密钥或二维码的文件会标记为敏感。
+          </p>
+        </div>
       </div>
       {!chatId ? (
-        <EmptyState
-          icon={Folder}
-          title="这个工作项目还没有绑定会话组"
-          hint="把一个会话组绑定到这个工作项目后，就能在这里管理它的文件。"
-        />
+        <div className="px-4 pb-4 pt-1">
+          <div className="oc-surface-card rounded-2xl">
+            <EmptyState
+              icon={Folder}
+              title="这个工作项目还没有绑定会话组"
+              hint="把一个会话组绑定到这个工作项目后，就能在这里管理它的文件。"
+            />
+          </div>
+        </div>
       ) : (
-        <div className="px-4 py-3">
-          <ProjectAssetsPanel projectId={chatId} auth={auth} authSession={auth} />
+        <div className="px-4 pb-4 pt-1">
+          <div className="oc-surface-card rounded-xl p-3.5">
+            <ProjectAssetsPanel projectId={chatId} auth={auth} authSession={auth} />
+          </div>
         </div>
       )}
     </div>

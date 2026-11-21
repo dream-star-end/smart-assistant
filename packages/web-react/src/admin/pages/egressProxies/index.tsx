@@ -1,4 +1,4 @@
-import { CircleSlash, Network, Plus, RefreshCw } from "lucide-react";
+import { CheckCircle2, CircleSlash, Network, Plus, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button, useConfirm, useToast } from "../../../components/ui";
 import {
@@ -103,11 +103,11 @@ export default function EgressProxiesPage() {
       width: 96,
       render: (r) =>
         r.status === "active" ? (
-          <span className="inline-flex items-center gap-1 rounded-full bg-success-soft px-2 py-0.5 text-xs font-medium text-success">
+          <span className="oc-badge-craft inline-flex items-center gap-1 rounded-full bg-success-soft px-2 py-0.5 text-xs font-medium text-success">
             active
           </span>
         ) : (
-          <span className="inline-flex items-center gap-1 rounded-full bg-hover px-2 py-0.5 text-xs font-medium text-muted">
+          <span className="oc-badge-craft inline-flex items-center gap-1 rounded-full bg-hover px-2 py-0.5 text-xs font-medium text-muted">
             disabled
           </span>
         ),
@@ -135,6 +135,7 @@ export default function EgressProxiesPage() {
   return (
     <div className="flex flex-col gap-5">
       <PageHeader
+        icon={Network}
         title={meta.title}
         desc={loading ? "加载中…" : `共 ${filtered.length} 条`}
         actions={
@@ -149,9 +150,9 @@ export default function EgressProxiesPage() {
         }
       />
 
-      <StatCardRow>
-        <StatCard label="总数" value={total.toLocaleString()} icon={Network} loading={loading} />
-        <StatCard label="active" value={activeN.toLocaleString()} tone="success" loading={loading} />
+      <StatCardRow cols={3}>
+        <StatCard label="总数" value={total.toLocaleString()} icon={Network} tone="accent" loading={loading} />
+        <StatCard label="active" value={activeN.toLocaleString()} icon={CheckCircle2} tone="success" loading={loading} />
         <StatCard
           label="disabled"
           value={disabledN.toLocaleString()}
@@ -176,7 +177,7 @@ export default function EgressProxiesPage() {
       </FilterBar>
 
       {error ? (
-        <div className="rounded-xl border border-danger/40 bg-danger-soft/40 px-4 py-6 text-center text-sm text-danger">
+        <div className="oc-callout oc-callout-danger rounded-xl px-4 py-6 text-center text-sm text-danger">
           加载失败:{error}
         </div>
       ) : (

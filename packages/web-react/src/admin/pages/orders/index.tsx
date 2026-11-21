@@ -1,4 +1,13 @@
-import { Download, Inbox, RotateCw } from "lucide-react";
+import {
+  AlertCircle,
+  CheckCircle2,
+  Clock,
+  Download,
+  Inbox,
+  RotateCw,
+  ShoppingCart,
+  TriangleAlert,
+} from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Badge,
@@ -168,57 +177,70 @@ function OrderDetailModal({
           <Spinner />
         </div>
       ) : error ? (
-        <p className="py-6 text-center text-body text-danger">加载失败：{error}</p>
+        <div className="oc-callout oc-callout-danger rounded-xl px-4 py-6 text-center text-body text-danger">
+          加载失败：{error}
+        </div>
       ) : order ? (
-        <div className="flex flex-col gap-1 divide-y divide-border/60">
-          <KeyValue
-            label="状态"
-            value={
-              <Badge tone={ORDER_STATUS_TONE[order.status] ?? "neutral"}>
-                {ORDER_STATUS_LABELS[order.status] ?? order.status}
-              </Badge>
-            }
-          />
-          <KeyValue
-            label="用户"
-            value={
-              <span>
-                {order.username ? `${order.username} ` : ""}
-                <span className="font-mono text-muted">#{order.user_id}</span>
-              </span>
-            }
-          />
-          <KeyValue
-            label="支付通道"
-            value={
-              <span className="flex items-center justify-end gap-2">
-                <Badge tone="neutral">{order.provider}</Badge>
-                {order.provider_order && <CopyChip value={order.provider_order} />}
-              </span>
-            }
-          />
-          <KeyValue
-            label="金额 / 积分"
-            value={`${fmtCents(order.amount_cents)} → ${order.credits} 积分`}
-          />
-          <KeyValue label="创建时间" value={fmtDateTime(order.created_at)} />
-          <KeyValue label="支付时间" value={fmtDateTime(order.paid_at)} />
-          <KeyValue label="过期时间" value={fmtDateTime(order.expires_at)} />
-          <KeyValue label="更新时间" value={fmtDateTime(order.updated_at)} />
-          {order.ledger_id && (
+        <div className="flex flex-col gap-4">
+          <div className="oc-surface-card divide-y divide-border/60 rounded-xl px-4 py-1">
             <KeyValue
-              label="积分流水"
+              label="状态"
               value={
-                <span className="font-mono text-meta">
-                  #{order.ledger_id}
-                  {order.refunded_ledger_id ? ` · 退款 #${order.refunded_ledger_id}` : ""}
+                <Badge tone={ORDER_STATUS_TONE[order.status] ?? "neutral"}>
+                  {ORDER_STATUS_LABELS[order.status] ?? order.status}
+                </Badge>
+              }
+            />
+            <KeyValue
+              label="用户"
+              value={
+                <span>
+                  {order.username ? `${order.username} ` : ""}
+                  <span className="font-mono text-muted">#{order.user_id}</span>
                 </span>
               }
             />
-          )}
-          <div className="pt-3">
-            <p className="mb-1.5 text-meta text-faint">callback_payload(支付方原始回调)</p>
-            <pre className="max-h-72 overflow-auto rounded-lg bg-hover p-3 font-mono text-[11px] leading-relaxed text-muted">
+            <KeyValue
+              label="支付通道"
+              value={
+                <span className="flex items-center justify-end gap-2">
+                  <Badge tone="neutral">{order.provider}</Badge>
+                  {order.provider_order && <CopyChip value={order.provider_order} />}
+                </span>
+              }
+            />
+            <KeyValue
+              label="金额 / 积分"
+              value={
+                <span className="font-medium tabular-nums">
+                  {fmtCents(order.amount_cents)} → {order.credits} 积分
+                </span>
+              }
+            />
+            <KeyValue label="创建时间" value={<span className="font-mono tabular-nums">{fmtDateTime(order.created_at)}</span>} />
+            <KeyValue label="支付时间" value={<span className="font-mono tabular-nums">{fmtDateTime(order.paid_at)}</span>} />
+            <KeyValue label="过期时间" value={<span className="font-mono tabular-nums">{fmtDateTime(order.expires_at)}</span>} />
+            <KeyValue label="更新时间" value={<span className="font-mono tabular-nums">{fmtDateTime(order.updated_at)}</span>} />
+            {order.ledger_id && (
+              <KeyValue
+                label="积分流水"
+                value={
+                  <span className="font-mono text-meta">
+                    #{order.ledger_id}
+                    {order.refunded_ledger_id ? ` · 退款 #${order.refunded_ledger_id}` : ""}
+                  </span>
+                }
+              />
+            )}
+          </div>
+          <div className="oc-code-shell">
+            <div className="oc-code-shell-header flex items-center justify-between px-3.5 py-2">
+              <span className="text-caption font-medium text-muted">callback_payload(支付方原始回调)</span>
+              <span className="oc-badge-craft rounded-md bg-surface px-1.5 py-0.5 font-mono text-micro text-faint">
+                JSON
+              </span>
+            </div>
+            <pre className="max-h-72 overflow-auto p-3.5 font-mono text-caption leading-relaxed text-fg">
               {payloadText}
             </pre>
           </div>
@@ -442,6 +464,7 @@ export default function OrdersPage() {
   return (
     <div className="flex flex-col gap-5">
       <PageHeader
+        icon={ShoppingCart}
         title={meta.title}
         desc={meta.desc}
         actions={
@@ -460,24 +483,28 @@ export default function OrdersPage() {
 
       <StatCardRow>
         <StatCard
+          icon={Clock}
           label="24h 卡单"
           value={kpi ? kpi.pending_overdue_24h : "—"}
           hint="超时未支付"
           tone={kpi && kpi.pending_overdue_24h > 0 ? "warning" : "success"}
         />
         <StatCard
+          icon={AlertCircle}
           label="累计卡单"
           value={kpi ? kpi.pending_overdue : "—"}
           hint="pending 超时"
           tone={kpi && kpi.pending_overdue > 0 ? "warning" : "success"}
         />
         <StatCard
+          icon={TriangleAlert}
           label="24h 回调冲突"
           value={kpi ? kpi.callback_conflicts_24h : "—"}
           hint="需人工核对"
           tone={kpi && kpi.callback_conflicts_24h > 0 ? "danger" : "success"}
         />
         <StatCard
+          icon={CheckCircle2}
           label="24h 已付"
           value={kpi ? kpi.paid_24h_count : "—"}
           hint={kpi ? fmtCents(kpi.paid_24h_amount_cents) : undefined}
@@ -505,7 +532,7 @@ export default function OrdersPage() {
             value={dUser}
             onChange={(e) => setDUser(e.target.value)}
             placeholder="user_id 过滤"
-            className="h-9 w-full sm:w-44"
+            className="oc-field-control h-9 w-full font-mono sm:w-44"
             onKeyDown={(e) => {
               if (e.key === "Enter") apply();
             }}
@@ -519,16 +546,18 @@ export default function OrdersPage() {
         </FilterBar>
 
         {error ? (
-          <EmptyState
-            icon={Inbox}
-            title="加载失败"
-            hint={apiErrorMessage(error, "加载失败")}
-            action={
-              <Button variant="secondary" size="sm" onClick={() => setReloadTick((t) => t + 1)}>
-                重试
-              </Button>
-            }
-          />
+          <div className="oc-surface-card rounded-xl">
+            <EmptyState
+              icon={Inbox}
+              title="加载失败"
+              hint={apiErrorMessage(error, "加载失败")}
+              action={
+                <Button variant="secondary" size="sm" onClick={() => setReloadTick((t) => t + 1)}>
+                  重试
+                </Button>
+              }
+            />
+          </div>
         ) : (
           <>
             <DataTable

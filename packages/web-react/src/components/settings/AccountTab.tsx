@@ -1,4 +1,4 @@
-import { Building2, Crown, Plus, Wallet } from "lucide-react";
+import { Building2, Crown, Plus, ReceiptText, TrendingUp, Wallet } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ChartCard, barConfig, chartNum, donutConfig, useChart } from "../charts";
 import { api, apiErrorMessage } from "../../lib/api";
@@ -11,7 +11,7 @@ import type {
   User,
 } from "../../lib/types";
 import { cn, formatCredits } from "../../lib/utils";
-import { Alert, Button, Progress, Skeleton, Spinner, Tabs } from "../ui";
+import { Alert, Badge, Button, Progress, Skeleton, Spinner, Tabs } from "../ui";
 import { insufficientCreditsCopy } from "../../lib/chat/pure";
 import { CreateOrgDialog } from "../org/CreateOrgWizard";
 import { rememberSubscriptionPaid, requestSubscribeIntent } from "./SubscriptionDialog";
@@ -244,91 +244,106 @@ export function AccountTab({
   );
 
   return (
-    <div className="flex flex-col">
+    <div className="flex flex-col gap-3.5 px-5 py-4">
       {/* 我的组织(只读展示；管理功能在组织中心，仅 owner/admin 有入口) */}
       {org && (
-        <div className="border-b border-border px-5 py-4">
-          <div className="flex items-center gap-1.5 text-meta text-faint">
-            <Building2 size={13} /> 我的组织
-          </div>
-          <div className="mt-1 flex flex-wrap items-center gap-2">
-            <span className="text-[16px] font-semibold text-fg">{org.name}</span>
-            <span className="rounded-full bg-hover px-2 py-0.5 text-caption font-medium text-muted">
-              {orgRoleLabel}
+        <section className="oc-surface-card rounded-2xl p-4">
+          <div className="flex items-start gap-3">
+            <span className="oc-icon-badge oc-icon-badge-info h-9 w-9 rounded-md" aria-hidden>
+              <Building2 size={17} strokeWidth={1.75} />
             </span>
-            {org.billing_delegate && (
-              <span className="rounded-full bg-accent-soft px-2 py-0.5 text-caption font-medium text-accent">
-                财务委派
-              </span>
-            )}
+            <div className="min-w-0 flex-1">
+              <div className="text-caption font-medium text-faint">我的组织</div>
+              <div className="mt-0.5 flex flex-wrap items-center gap-2">
+                <span className="text-base font-semibold text-fg">{org.name}</span>
+                <Badge tone="neutral" size="sm">
+                  {orgRoleLabel}
+                </Badge>
+                {org.billing_delegate && (
+                  <Badge tone="accent" size="sm">
+                    财务委派
+                  </Badge>
+                )}
+              </div>
+              {org.status === "suspended" ? (
+                <Alert tone="warning" className="mt-2.5 text-meta">
+                  该组织已被暂停，组织钱包与共享技能暂不可用。
+                </Alert>
+              ) : (
+                <p className="mt-1 text-meta text-faint">
+                  {org.billing_enabled
+                    ? "你的对话用量可由组织钱包统一结算。"
+                    : "该组织未对你开启统一结算，用量按个人账户计费。"}
+                </p>
+              )}
+            </div>
           </div>
-          {org.status === "suspended" ? (
-            <Alert tone="warning" className="mt-2 text-meta">
-              该组织已被暂停，组织钱包与共享技能暂不可用。
-            </Alert>
-          ) : (
-            <p className="mt-1 text-meta text-faint">
-              {org.billing_enabled
-                ? "你的对话用量可由组织钱包统一结算。"
-                : "该组织未对你开启统一结算，用量按个人账户计费。"}
-            </p>
-          )}
-        </div>
+        </section>
       )}
 
       {/* 无 org：自助开通入口(Claude/GPT 式)。 */}
       {!org && (
-        <div className="border-b border-border px-5 py-4">
-          <div className="flex items-center gap-1.5 text-meta text-faint">
-            <Building2 size={13} /> 组织
-          </div>
-          <p className="mt-1 text-body text-muted">
-            创建组织，按席位订阅企业套餐，团队共享积分池、技能与统一发票。
-          </p>
-          <div className="mt-3">
-            <Button variant="primary" size="sm" onClick={() => setCreateOrgOpen(true)}>
-              <Building2 size={15} /> 创建组织
+        <section className="oc-surface-card rounded-2xl p-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex min-w-0 flex-1 items-start gap-3">
+              <span className="oc-icon-badge oc-icon-badge-info h-9 w-9 rounded-md" aria-hidden>
+                <Building2 size={17} strokeWidth={1.75} />
+              </span>
+              <div className="min-w-0 flex-1">
+                <div className="text-section font-semibold text-fg">组织</div>
+                <p className="mt-0.5 text-meta text-muted">
+                  创建组织，按席位订阅企业套餐，团队共享积分池、技能与统一发票。
+                </p>
+              </div>
+            </div>
+            <Button variant="primary" size="sm" onClick={() => setCreateOrgOpen(true)} className="shrink-0">
+              <Building2 size={14} strokeWidth={1.75} /> 创建组织
             </Button>
           </div>
-        </div>
+        </section>
       )}
 
       {/* 当前套餐 */}
-      <div className="border-b border-border px-5 py-4">
-        <div className="flex items-center justify-between gap-3">
-          <div className="min-w-0">
-            <div className="flex items-center gap-1.5 text-meta text-faint">
-              <Crown size={13} /> 当前套餐
-            </div>
-            <div className="mt-1 flex items-center gap-2">
-              {subLoading ? (
-                <Skeleton className="h-7 w-28" />
-              ) : subErr ? (
-                <button
-                  type="button"
-                  className="rounded text-body text-danger outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
-                  onClick={() => setSubReloadTick((tick) => tick + 1)}
-                >
-                  套餐信息加载失败 · 重试
-                </button>
-              ) : (
-                <span className="text-[18px] font-semibold text-fg">{sub?.planName ?? "—"}</span>
-              )}
-              {sub?.paid && (
-                <span className="rounded-full bg-accent-soft px-2 py-0.5 text-caption font-medium text-accent">
-                  到期 {fmtDate(sub.periodEnd)}
-                </span>
-              )}
-            </div>
-            <div className="mt-1 text-meta text-faint">
-              {subLoading ? (
-                <Skeleton className="h-4 w-40" />
-              ) : subErr ? null : (
-                <>
-                  每月 {sub ? formatCredits(sub.monthlyCredits) : "—"} 积分
-                  {sub ? ` · 本期剩余 ${formatCredits(sub.periodCredits)}` : ""}
-                </>
-              )}
+      <section className="oc-surface-card rounded-2xl p-4">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex min-w-0 flex-1 items-start gap-3">
+            <span className="oc-icon-badge oc-icon-badge-accent h-9 w-9 rounded-md" aria-hidden>
+              <Crown size={17} strokeWidth={1.75} />
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="text-caption font-medium text-faint">当前套餐</div>
+              <div className="mt-0.5 flex flex-wrap items-center gap-2">
+                {subLoading ? (
+                  <Skeleton className="h-7 w-28" />
+                ) : subErr ? (
+                  <button
+                    type="button"
+                    className="rounded text-body text-danger outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+                    onClick={() => setSubReloadTick((tick) => tick + 1)}
+                  >
+                    套餐信息加载失败 · 重试
+                  </button>
+                ) : (
+                  <span className="text-lg font-semibold tracking-tight text-fg">
+                    {sub?.planName ?? "—"}
+                  </span>
+                )}
+                {sub?.paid && (
+                  <Badge tone="accent" size="sm" className="tabular-nums">
+                    到期 {fmtDate(sub.periodEnd)}
+                  </Badge>
+                )}
+              </div>
+              <div className="mt-1 text-meta tabular-nums text-faint">
+                {subLoading ? (
+                  <Skeleton className="h-4 w-40" />
+                ) : subErr ? null : (
+                  <>
+                    每月 {sub ? formatCredits(sub.monthlyCredits) : "—"} 积分
+                    {sub ? ` · 本期剩余 ${formatCredits(sub.periodCredits)}` : ""}
+                  </>
+                )}
+              </div>
             </div>
           </div>
           {/* 套餐行是「管理套餐」的唯一常驻入口(含续费 / 升档 / 加量包)。余额耗尽时下方红卡会
@@ -340,15 +355,27 @@ export function AccountTab({
             </Button>
           )}
         </div>
-      </div>
+      </section>
 
-      <div className="px-5 py-4">
-        <div className="flex items-center gap-1.5 text-meta text-faint">
-          <Wallet size={13} /> {user?.displayName || "账户"} · 总可用余额
+      {/* 总可用余额 Hero 卡 */}
+      <section className="oc-surface-card rounded-2xl p-4">
+        <div className="flex items-center gap-2.5">
+          <span
+            className={cn(
+              "oc-icon-badge h-8 w-8 rounded-sm",
+              low ? "oc-icon-badge-danger" : "oc-icon-badge-accent",
+            )}
+            aria-hidden
+          >
+            <Wallet size={15} strokeWidth={1.75} />
+          </span>
+          <div className="text-meta font-medium text-muted">
+            {user?.displayName || "账户"} · 总可用余额
+          </div>
         </div>
         <div
           className={cn(
-            "mt-1 flex items-baseline gap-1.5 text-[28px] font-semibold tracking-tight tabular-nums",
+            "mt-2 flex items-baseline gap-1.5 text-3xl font-semibold tracking-tight tabular-nums",
             low ? "text-danger" : "text-fg",
           )}
         >
@@ -356,16 +383,16 @@ export function AccountTab({
           <span className="text-title font-normal text-faint">积分</span>
         </div>
         {sub && (
-          <div className="mt-1 text-meta text-faint">
+          <div className="oc-surface-recessed mt-2.5 inline-flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg px-3 py-1.5 text-meta tabular-nums text-muted">
             套餐期内 {formatCredits(sub.balance.period)} + 钱包 {formatCredits(sub.balance.wallet)}
           </div>
         )}
         {/* 本期套餐积分进度（仅订阅有月度额度时显示） */}
         {sub && showQuota && (
-          <div className="mt-3">
+          <div className="mt-3.5 border-t border-border/70 pt-3">
             <div className="flex items-center justify-between pb-1.5 text-meta">
               <span className="text-muted">本期套餐积分</span>
-              <span className="tabular-nums text-fg">
+              <span className="font-medium tabular-nums text-fg">
                 本期剩余 {formatCredits(sub.balance.period)} / {formatCredits(sub.monthlyCredits)}
               </span>
             </div>
@@ -377,7 +404,7 @@ export function AccountTab({
         )}
         {low && (
           <>
-            <Alert tone="danger" className="mt-2 text-meta">
+            <Alert tone="danger" className="mt-3 text-meta">
               {insufficientCreditsCopy(sub?.paid === true).message}
             </Alert>
             <div className="mt-3 flex flex-wrap gap-2">
@@ -389,7 +416,7 @@ export function AccountTab({
                   onManageSub();
                 }}
               >
-                {sub?.paid ? <Plus size={15} /> : <Crown size={15} />}
+                {sub?.paid ? <Plus size={15} strokeWidth={1.75} /> : <Crown size={15} strokeWidth={1.75} />}
                 {sub?.paid ? "购买加量包" : "开通 Lite"}
               </Button>
               <Button
@@ -400,22 +427,27 @@ export function AccountTab({
                   onManageSub();
                 }}
               >
-                {sub?.paid ? <Crown size={15} /> : <Plus size={15} />}
+                {sub?.paid ? <Crown size={15} strokeWidth={1.75} /> : <Plus size={15} strokeWidth={1.75} />}
                 {sub?.paid ? "升级套餐" : "加量包"}
               </Button>
             </div>
           </>
         )}
-        <p className="mt-2 text-meta text-faint">
+        <p className="mt-3 text-caption leading-relaxed text-faint">
           按实际用量计量扣费，扣费优先消耗套餐期内积分。加量包仅在当前套餐有效期内可用；
           存量钱包余额永久有效、扣完期内桶后继续使用。
         </p>
-      </div>
+      </section>
 
       {/* 积分收支（窗口口径图表，独立于用量 Tab） */}
-      <div className="border-t border-border px-5 py-4">
-        <div className="flex flex-col gap-2 pb-3">
-          <div className="text-section font-medium text-fg">积分收支</div>
+      <section className="oc-surface-card rounded-2xl p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2 pb-3">
+          <div className="flex items-center gap-2">
+            <span className="oc-icon-badge oc-icon-badge-accent h-7 w-7 rounded-sm" aria-hidden>
+              <TrendingUp size={14} strokeWidth={1.75} />
+            </span>
+            <div className="text-section font-semibold text-fg">积分收支</div>
+          </div>
           <Tabs
             aria-label="收支统计窗口"
             value={acctWindow}
@@ -495,15 +527,20 @@ export function AccountTab({
             </ChartCard>
           </div>
         )}
-      </div>
+      </section>
 
-      <div className="border-t border-border px-5 py-3">
-        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
-          账单流水
+      <section className="oc-surface-card rounded-2xl p-4">
+        <div className="mb-1 flex items-center gap-2">
+          <span className="oc-icon-badge h-7 w-7 rounded-sm" aria-hidden>
+            <ReceiptText size={14} strokeWidth={1.75} />
+          </span>
+          <div>
+            <div className="text-section font-semibold text-fg">账单流水</div>
+            <p className="text-caption text-faint">对话结束后结算入账，时间为北京时间</p>
+          </div>
         </div>
-        <p className="-mt-1 pb-2 text-caption text-faint">对话结束后结算入账，时间为北京时间</p>
         {err && (
-          <div className="mb-2">
+          <div className="my-2">
             <Alert tone="danger" className="text-meta">
               {err}
             </Alert>
@@ -523,34 +560,36 @@ export function AccountTab({
             <Spinner /> 加载中…
           </div>
         ) : err && rows.length === 0 ? null : rows.length === 0 ? (
-          <p className="py-6 text-center text-body text-faint">暂无账单记录</p>
+          <div className="oc-surface-recessed mt-3 rounded-xl py-6 text-center text-body text-faint">
+            暂无账单记录
+          </div>
         ) : (
           <>
-            <ul className="flex flex-col gap-0.5">
+            <ul className="mt-2.5 flex flex-col divide-y divide-border/60">
               {rows.map((r) => {
                 const neg = r.delta.trim().startsWith("-");
                 const reason = ledgerRowView(r);
                 return (
                   <li
                     key={r.id}
-                    className="flex items-center gap-3 rounded-lg px-2 py-2 hover:bg-hover"
+                    className="flex items-center gap-3 rounded-lg px-2 py-2.5 transition-colors hover:bg-hover/70"
                   >
                     <span className="min-w-0 flex-1">
                       {/* 未知 reason 显示「其他」，原枚举值留在 title 里(审计 SET-16)。 */}
                       <span
-                        className="block truncate text-section text-fg"
+                        className="block truncate text-section font-medium text-fg"
                         title={reason.raw ?? undefined}
                       >
                         {reason.label}
-                        {reason.memo ? <span className="text-faint"> · {reason.memo}</span> : null}
+                        {reason.memo ? <span className="font-normal text-faint"> · {reason.memo}</span> : null}
                       </span>
-                      <span className="block truncate text-caption text-faint">
+                      <span className="mt-0.5 block truncate text-caption tabular-nums text-faint">
                         {shortTime(r.created_at)} · 余额 {formatCredits(r.balance_after)} 积分
                       </span>
                     </span>
                     <span
                       className={cn(
-                        "shrink-0 text-section font-medium tabular-nums",
+                        "shrink-0 text-section font-semibold tabular-nums",
                         neg ? "text-fg" : "text-success",
                       )}
                     >
@@ -562,13 +601,12 @@ export function AccountTab({
               })}
             </ul>
             {nextBefore && (
-              <div className="pt-2 text-center">
+              <div className="pt-3 text-center">
                 <Button
-                  variant="ghost"
+                  variant="secondary"
                   size="sm"
                   onClick={loadMore}
                   disabled={loadingMore}
-                  className="text-muted"
                 >
                   {loadingMore ? "加载中…" : "加载更多"}
                 </Button>
@@ -576,7 +614,7 @@ export function AccountTab({
             )}
           </>
         )}
-      </div>
+      </section>
 
       <CreateOrgDialog
         open={createOrgOpen}

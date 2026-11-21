@@ -475,17 +475,17 @@ export function TutorialCenter({
             }
             dialogRef.current?.focus();
           }}
-          className="tutorial-shell tut-shell fixed inset-x-2 bottom-2 top-2 z-50 flex min-h-0 flex-col overflow-hidden rounded-xl border border-border bg-bg shadow-float focus:outline-none data-[state=open]:animate-in sm:inset-x-4 sm:bottom-4 sm:top-4 sm:rounded-xl2 lg:left-1/2 lg:w-[min(1280px,calc(100vw-2rem))] lg:-translate-x-1/2"
+          className="tutorial-shell tut-shell oc-surface-popover fixed inset-x-2 bottom-2 top-2 z-50 flex min-h-0 flex-col overflow-hidden rounded-xl bg-bg focus:outline-none data-[state=open]:animate-in sm:inset-x-4 sm:bottom-4 sm:top-4 sm:rounded-xl2 lg:left-1/2 lg:w-[min(1280px,calc(100vw-2rem))] lg:-translate-x-1/2"
         >
           {/* 一条统一的顶栏(OCV5-342 教程重构):标题 · 分段式页签 · 搜索 · 关闭。<lg 自动折成
               「标题+关闭 / 页签 / 搜索」三行;DOM 只有一份,读屏顺序与视觉一致。 */}
-          <header className="relative z-10 flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2.5 border-b border-border/80 bg-surface/80 px-3 py-3 backdrop-blur-xl sm:px-5 lg:min-h-[68px] lg:flex-nowrap lg:py-2.5">
+          <header className="oc-surface-glass relative z-10 flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2.5 rounded-none border-x-0 border-t-0 px-3 py-3 sm:px-5 lg:min-h-[68px] lg:flex-nowrap lg:py-2.5">
             <div className="order-1 flex min-w-0 flex-1 items-center gap-3 lg:w-[248px] lg:flex-none">
-              <span className={cn("tut-mark flex size-10 shrink-0 items-center justify-center rounded-lg", mode === "cases" ? "bg-accent text-accent-fg" : "bg-grad-cta text-white")}>
-                {mode === "blog" ? <PenLine size={19} /> : <GraduationCap size={19} />}
+              <span className={cn("tut-mark oc-avatar-ring flex size-10 shrink-0 items-center justify-center rounded-xl", mode === "cases" ? "bg-accent text-accent-fg" : "bg-grad-cta text-white")}>
+                {mode === "blog" ? <PenLine size={19} strokeWidth={1.75} /> : <GraduationCap size={19} strokeWidth={1.75} />}
               </span>
               <div className="min-w-0">
-                <Dialog.Title className="truncate text-[16px] font-semibold tracking-tight text-fg sm:text-[17px]">
+                <Dialog.Title className="truncate text-base font-semibold tracking-tight text-fg sm:text-lg">
                   {headerCopy.title}
                 </Dialog.Title>
                 <p className="hidden truncate text-caption text-faint sm:block">
@@ -495,7 +495,7 @@ export function TutorialCenter({
             </div>
 
             <nav aria-label="案例与帮助" className="order-3 flex min-w-0 basis-full items-center justify-between gap-2 lg:order-2 lg:basis-auto lg:flex-1 lg:justify-start">
-              <div ref={tabStripRef} className="no-scrollbar flex min-w-0 items-center gap-0.5 overflow-x-auto rounded-full border border-border/70 bg-hover p-1">
+              <div ref={tabStripRef} className="oc-surface-recessed no-scrollbar flex min-w-0 items-center gap-0.5 overflow-x-auto rounded-full p-1">
                 <ViewTab active={mode === "showcase" || (mode === "cases" && Boolean(selectedShowcase))} onClick={showShowroom} icon={Sparkles}>
                   案例展厅
                 </ViewTab>
@@ -508,7 +508,7 @@ export function TutorialCenter({
                 {blogEnabled && (
                   <ViewTab active={mode === "blog"} onClick={showBlog} icon={PenLine}>
                     经验分享
-                    <span className="rounded-full bg-accent px-1.5 text-[10px] font-bold leading-4 text-accent-fg">新</span>
+                    <span className="oc-badge-craft rounded-full bg-accent px-1.5 text-micro font-bold leading-4 text-accent-fg">新</span>
                   </ViewTab>
                 )}
               </div>
@@ -716,8 +716,8 @@ function ViewTab({
       // 触屏下补到 44px 命中高(审计 TU-11),桌面态零变化。
       aria-current={active ? "page" : undefined}
       className={cn(
-        "inline-flex shrink-0 items-center gap-1.5 rounded-full px-3 py-1.5 text-meta font-semibold outline-none transition-[background-color,color,box-shadow] duration-200 focus-visible:ring-2 focus-visible:ring-ring sm:px-3.5 [@media(hover:none)]:min-h-11",
-        active ? "bg-surface text-fg shadow-sidebar-active" : "text-muted hover:text-fg",
+        "oc-btn-tactile inline-flex shrink-0 items-center gap-1.5 rounded-full px-3 py-1.5 text-meta font-semibold outline-none focus-visible:ring-2 focus-visible:ring-ring sm:px-3.5 [@media(hover:none)]:min-h-11",
+        active ? "oc-segmented-thumb text-fg" : "text-muted hover:text-fg",
       )}
     >
       {/* 390px 下三个页签 + 「帮助与创作」放不下带图标的版本，第三个会被裁掉一半；窄屏只留文字。 */}
@@ -760,7 +760,7 @@ function TutorialSearch({
   className?: string;
 }) {
   return (
-    <label className={cn("flex h-10 min-w-0 items-center gap-2 rounded-xl bg-hover px-3 focus-within:ring-2 focus-within:ring-ring lg:h-9", className)}>
+    <label className={cn("oc-field-control flex h-10 min-w-0 items-center gap-2 rounded-xl border border-border-control px-3 focus-within:border-accent focus-within:ring-2 focus-within:ring-ring lg:h-9", className)}>
       <Search size={15} className="shrink-0 text-faint" />
       <span className="sr-only">搜索教程</span>
       <input
@@ -777,7 +777,7 @@ function TutorialSearch({
 
 function PendingCaptureBadge() {
   return (
-    <span className="rounded-full bg-warning-soft px-2.5 py-1 text-caption font-semibold text-warning">
+    <span className="oc-badge-craft rounded-full bg-warning-soft px-2.5 py-1 text-caption font-semibold text-warning">
       {TUTORIAL_PENDING_CAPTURE_LABEL}
     </span>
   );
@@ -823,24 +823,24 @@ function QuickstartView({
   return (
     <section className="mx-auto max-w-4xl px-4 pb-14 pt-6 sm:px-8 sm:pt-9">
       {/* 进度 hero:一眼看到「走到哪了、下一步做什么」(OCV5-342 教程重构)。 */}
-      <div className="tut-hero relative overflow-hidden rounded-[24px] border border-border p-5 sm:rounded-[28px] sm:p-9">
+      <div className="tut-hero oc-surface-card relative overflow-hidden rounded-3xl p-5 sm:p-9">
         <div className="relative flex flex-col gap-7 md:flex-row md:items-end md:justify-between">
           <div className="max-w-xl">
-            <p className="inline-flex items-center gap-1.5 rounded-full border border-accent/20 bg-surface/70 px-3 py-1 text-caption font-semibold text-accent backdrop-blur">
+            <p className="oc-badge-craft inline-flex items-center gap-1.5 rounded-full bg-accent-soft px-3 py-1 text-caption font-semibold text-accent">
               <Clock3 size={12} aria-hidden /> 约 {TUTORIAL_QUICKSTART.estimatedMinutes} 分钟 · {steps.length} 步
             </p>
-            <h1 className="mt-4 text-balance text-[28px] font-bold leading-[1.12] tracking-[-0.03em] text-fg sm:text-[40px]">
+            <h1 className="mt-4 text-balance text-3xl font-bold leading-tight tracking-tight text-fg sm:text-4xl">
               {TUTORIAL_QUICKSTART.title}
             </h1>
-            <p className="mt-3 text-[15px] leading-7 text-muted">{TUTORIAL_QUICKSTART.summary}</p>
+            <p className="mt-3 text-base leading-7 text-muted">{TUTORIAL_QUICKSTART.summary}</p>
           </div>
-          <div className="flex shrink-0 items-center gap-4 rounded-2xl border border-border bg-surface/80 p-4 shadow-soft backdrop-blur md:w-[300px]">
+          <div className="oc-surface-glass flex shrink-0 items-center gap-4 rounded-2xl p-4 md:w-[300px]">
             <ProgressRing value={doneCount} total={steps.length} />
             <div className="min-w-0">
               <p className="text-caption text-faint">学习进度</p>
-              <p className="mt-0.5 text-[20px] font-semibold tabular-nums text-fg">
+              <p className="mt-0.5 text-xl font-semibold tabular-nums text-fg">
                 {doneCount}
-                <span className="text-[14px] font-medium text-faint"> / {steps.length}</span>
+                <span className="text-sm font-medium text-faint"> / {steps.length}</span>
               </p>
               {allDone ? (
                 <p className="mt-1 inline-flex items-center gap-1 text-caption font-medium text-success">
@@ -874,12 +874,12 @@ function QuickstartView({
               {/* 步骤对应的教程已读就打勾,不再六步永远一个样(审计 TU-19)。 */}
               <span
                 className={cn(
-                  "relative z-10 mt-4 flex size-10 shrink-0 items-center justify-center rounded-full text-meta font-semibold ring-4 ring-bg sm:size-12 sm:text-body",
+                  "relative z-10 mt-4 flex size-10 shrink-0 items-center justify-center rounded-full text-meta font-semibold tabular-nums ring-4 ring-bg sm:size-12 sm:text-body",
                   done
                     ? "bg-success text-white"
                     : isNext
-                      ? "bg-grad-cta text-white shadow-[0_8px_24px_color-mix(in_srgb,var(--accent)_35%,transparent)]"
-                      : "border border-border bg-surface text-muted",
+                      ? "bg-grad-cta text-white shadow-pop"
+                      : "oc-surface-card text-muted",
                 )}
                 aria-label={done ? `第 ${index + 1} 步，已读` : `第 ${index + 1} 步`}
               >
@@ -887,28 +887,28 @@ function QuickstartView({
               </span>
               <div
                 className={cn(
-                  "min-w-0 flex-1 rounded-[20px] border bg-surface p-4 shadow-sm transition-[border-color,box-shadow] sm:p-5",
-                  isNext ? "border-accent/35 shadow-soft" : "border-border",
+                  "oc-surface-card oc-surface-card-hover min-w-0 flex-1 rounded-2xl p-4 sm:p-5",
+                  isNext && "border-accent/40",
                 )}
               >
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
-                    <p className="font-mono text-micro font-semibold uppercase tracking-[0.16em] text-faint">
+                    <p className="font-mono text-micro font-semibold uppercase tracking-widest text-faint">
                       Step {String(index + 1).padStart(2, "0")}
-                      {isNext && <span className="ml-2 rounded-full bg-accent-soft px-2 py-0.5 font-sans tracking-normal text-accent normal-case">下一步</span>}
+                      {isNext && <span className="oc-badge-craft ml-2 rounded-full bg-accent-soft px-2 py-0.5 font-sans tracking-normal text-accent normal-case">下一步</span>}
                     </p>
-                    <h2 className="mt-1.5 text-[16px] font-semibold leading-snug text-fg sm:text-[17px]">{step.title}</h2>
+                    <h2 className="mt-1.5 text-base font-semibold leading-snug text-fg sm:text-lg">{step.title}</h2>
                   </div>
-                  <span aria-hidden className="hidden size-9 shrink-0 items-center justify-center rounded-xl bg-accent-soft text-accent sm:flex">
-                    <FeatureGlyph size={16} />
+                  <span aria-hidden className="oc-icon-badge oc-icon-badge-accent hidden size-9 shrink-0 rounded-xl sm:flex">
+                    <FeatureGlyph size={16} strokeWidth={1.75} />
                   </span>
                 </div>
-                <p className="mt-2 text-[13.5px] leading-6 text-muted">{step.body}</p>
+                <p className="mt-2 text-body leading-6 text-muted">{step.body}</p>
                 <button
                   type="button"
                   onClick={() => onOpenTopic(step.topicId)}
                   aria-label={`打开步骤：${step.title}`}
-                  className="mt-3.5 inline-flex items-center gap-1.5 rounded-full border border-border bg-bg px-3 py-1.5 text-meta font-semibold text-fg outline-none transition-colors hover:border-accent/40 hover:text-accent focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+                  className="oc-btn-secondary-craft oc-btn-tactile mt-3.5 inline-flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-meta font-semibold text-fg outline-none hover:text-accent focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
                 >
                   查看「{feature.shortTitle}」
                   <ArrowRight size={13} />
@@ -921,26 +921,26 @@ function QuickstartView({
 
       {/* 5 条「按场景学习」路径此前只有数据和测试、没有渲染(审计 TU-14),在主线之后兑现。 */}
       <section className="mt-14" aria-labelledby="scenario-paths-title">
-        <p className="inline-flex items-center gap-1.5 text-micro font-semibold uppercase tracking-[0.14em] text-accent">
+        <p className="inline-flex items-center gap-1.5 text-micro font-semibold uppercase tracking-widest text-accent">
           <Route size={12} aria-hidden /> 按场景学习
         </p>
-        <h2 id="scenario-paths-title" className="mt-2 text-[21px] font-semibold tracking-tight text-fg sm:text-[26px]">
+        <h2 id="scenario-paths-title" className="mt-2 text-xl font-semibold tracking-tight text-fg sm:text-2xl">
           走完主线后，挑一条和你工作最像的路
         </h2>
         <div className="mt-6 grid gap-4 sm:grid-cols-2">
           {TUTORIAL_SCENARIO_PATHS.map((path) => {
             const read = path.topicIds.filter((topicId) => tutorialIsRead(progress, topicId)).length;
             return (
-              <article key={path.id} className="tut-card group rounded-[22px] border border-border bg-surface p-5 shadow-sm">
+              <article key={path.id} className="tut-card oc-surface-card oc-surface-card-hover group rounded-2xl p-5">
                 <div className="flex items-start justify-between gap-3">
-                  <h3 className="text-[16px] font-semibold text-fg">{path.title}</h3>
-                  <span className="shrink-0 rounded-full bg-hover px-2.5 py-0.5 text-caption tabular-nums text-faint">
+                  <h3 className="text-base font-semibold text-fg">{path.title}</h3>
+                  <span className="oc-badge-craft shrink-0 rounded-full bg-hover px-2.5 py-0.5 text-caption font-medium tabular-nums text-faint">
                     {read}/{path.topicIds.length}
                   </span>
                 </div>
                 <p className="mt-1.5 text-caption leading-5 text-muted">{path.description}</p>
-                <div aria-hidden className="mt-3 h-1 overflow-hidden rounded-full bg-hover">
-                  <div className="h-full rounded-full bg-accent" style={{ width: `${(read / Math.max(1, path.topicIds.length)) * 100}%` }} />
+                <div aria-hidden className="oc-surface-recessed mt-3 h-1.5 overflow-hidden rounded-full">
+                  <div className="oc-progress-fill h-full rounded-full bg-accent" style={{ width: `${(read / Math.max(1, path.topicIds.length)) * 100}%` }} />
                 </div>
                 <ol className="mt-3 flex flex-col gap-0.5">
                   {path.topicIds.map((topicId, index) => {
@@ -952,7 +952,7 @@ function QuickstartView({
                           onClick={() => onOpenTopic(topicId)}
                           className="flex w-full items-center gap-2.5 rounded-xl px-2 py-1.5 text-left text-meta text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
                         >
-                          <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-hover text-micro tabular-nums text-faint">{index + 1}</span>
+                          <span className="oc-surface-recessed flex size-5 shrink-0 items-center justify-center rounded-full text-micro tabular-nums text-faint">{index + 1}</span>
                           <span className="min-w-0 flex-1 truncate">{step.shortTitle}</span>
                           {tutorialIsRead(progress, topicId) && (
                             <Check size={13} className="shrink-0 text-success" aria-label="已读" />
@@ -993,10 +993,10 @@ function CaseGallery({
           案例脚本
         </p>
         {/* 「待采集」是采集流水线的内部词,用户看不懂;口径改成人话,且同屏只说一次(审计 TU-10)。 */}
-        <h1 className="mt-2 max-w-2xl text-balance text-[25px] font-bold leading-tight tracking-tight sm:text-[34px]">
+        <h1 className="mt-2 max-w-2xl text-balance text-2xl font-bold leading-tight tracking-tight sm:text-3xl">
           这些是任务脚本，还没有真实运行记录
         </h1>
-        <p className="mt-3 max-w-2xl text-[13px] leading-6 text-white/72 sm:text-[14px]">
+        <p className="mt-3 max-w-2xl text-meta leading-6 text-white/72 sm:text-body">
           步骤和材料已经写好，但还没有真实运行回放。记录补齐前，只把它们当参考，不当成品。
         </p>
         <div className="mt-5 flex flex-wrap gap-2 text-micro font-medium text-white/85 sm:text-caption">
@@ -1006,7 +1006,7 @@ function CaseGallery({
       </div>
 
       <div className="mt-7 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <fieldset className="no-scrollbar flex min-w-0 gap-2 overflow-x-auto border-0 p-0" aria-label="案例分类">
+        <fieldset className="oc-surface-recessed no-scrollbar flex min-w-0 gap-1 overflow-x-auto rounded-full p-1" aria-label="案例分类">
           <CategoryChip active={category === "all"} onClick={() => setCategory("all")}>
             全部
           </CategoryChip>
@@ -1016,7 +1016,7 @@ function CaseGallery({
             </CategoryChip>
           ))}
         </fieldset>
-        <label className="flex h-10 min-w-0 items-center gap-2 rounded-xl bg-hover px-3 focus-within:ring-2 focus-within:ring-ring sm:w-64 lg:h-9">
+        <label className="oc-field-control flex h-10 min-w-0 items-center gap-2 rounded-xl border border-border-control px-3 focus-within:border-accent focus-within:ring-2 focus-within:ring-ring sm:w-64 lg:h-9">
           <Search size={15} className="shrink-0 text-faint" />
           <span className="sr-only">搜索案例</span>
           <input
@@ -1030,7 +1030,7 @@ function CaseGallery({
       </div>
 
       {visible.length === 0 ? (
-        <output className="mt-7 block rounded-2xl border border-dashed border-border px-5 py-12 text-center text-section text-faint">
+        <output className="oc-surface-recessed mt-7 block rounded-2xl border border-dashed border-border px-5 py-12 text-center text-section text-faint">
           没有匹配案例，试试“文献”“引用”“回归测试”或清空筛选。
         </output>
       ) : (
@@ -1038,11 +1038,11 @@ function CaseGallery({
           <div className="mb-4 flex items-baseline justify-between gap-3">
             <h2
               id="case-template-title"
-              className="text-[19px] font-semibold tracking-tight text-fg sm:text-[22px]"
+              className="text-lg font-semibold tracking-tight text-fg sm:text-xl"
             >
               {filtering ? "匹配的案例脚本" : "全部案例脚本"}
             </h2>
-            <output className="text-caption text-faint">
+            <output className="oc-badge-craft rounded-full bg-hover px-2.5 py-0.5 text-caption tabular-nums text-faint">
               {visible.length} / {items.length} 条
             </output>
           </div>
@@ -1089,17 +1089,15 @@ function CaseGalleryCard({
           : `${storyLabel}：${presentation.pain} ${item.title}。完成后得到${presentation.result}。看它怎么完成`
       }
       className={cn(
-        "group overflow-hidden rounded-3xl border bg-surface text-left shadow-sm outline-none transition-[border-color,box-shadow,transform] hover:-translate-y-1 hover:shadow-float focus-visible:ring-2 focus-visible:ring-ring",
-        featured
-          ? "border-accent/30 hover:border-accent/55"
-          : "border-border hover:border-accent/40",
+        "oc-surface-card oc-surface-card-hover group overflow-hidden rounded-3xl text-left outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        featured && "border-accent/35",
       )}
     >
       <CaseArtwork caseId={item.id} fieldReport={report} pendingCapture={item.replay.status === "pending_capture"} />
       <div className="p-4 sm:p-5">
         <div className="flex flex-wrap items-center gap-2">
           {item.replay.status === "pending_capture" && <PendingCaptureBadge />}
-          <span className="rounded-full bg-accent-soft px-2.5 py-1 text-micro font-semibold text-accent">
+          <span className="oc-badge-craft rounded-full bg-accent-soft px-2.5 py-1 text-micro font-semibold text-accent">
             {report
               ? `${storyLabel} · 案例脚本`
               : `${caseCategoryLabel(item.category)} · ${item.difficulty}`}
@@ -1108,16 +1106,16 @@ function CaseGalleryCard({
             item.artifacts.slice(0, 2).map((artifact) => (
               <span
                 key={artifact.title}
-                className="rounded-full bg-hover px-2 py-1 text-micro text-faint"
+                className="oc-badge-craft rounded-full bg-hover px-2 py-1 text-micro text-faint"
               >
                 {artifact.format}
               </span>
             ))}
         </div>
-        <p className="mt-3 text-[13px] font-semibold leading-5 text-accent">
+        <p className="mt-3 text-meta font-semibold leading-5 text-accent">
           {presentation.pain}
         </p>
-        <h3 className="mt-1.5 text-[18px] font-semibold leading-6 text-fg">
+        <h3 className="mt-1.5 text-lg font-semibold leading-6 text-fg">
           {item.title}
         </h3>
         {report && item.replay.status !== "pending_capture" ? (
@@ -1125,9 +1123,9 @@ function CaseGalleryCard({
             {report.metrics.map((metric) => (
               <li
                 key={metric.label}
-                className="rounded-xl bg-sidebar px-2 py-2.5 text-center"
+                className="oc-surface-recessed rounded-xl px-2 py-2.5 text-center"
               >
-                <strong className="block text-title font-bold text-fg">
+                <strong className="block text-title font-bold tabular-nums text-fg">
                   {metric.value}
                 </strong>
                 <span className="mt-1 block text-caption leading-4 text-faint">
@@ -1137,7 +1135,7 @@ function CaseGalleryCard({
             ))}
           </ul>
         ) : (
-          <p className="mt-2 line-clamp-2 text-[12.5px] leading-5 text-muted">
+          <p className="mt-2 line-clamp-2 text-caption leading-5 text-muted">
             {presentation.result}
           </p>
         )}
@@ -1186,12 +1184,12 @@ function CaseDetail({
 
       {/* 详情页的「尚无真实运行记录」只在这条横幅说一次;卡头徽章与回放区不再重复(审计 TU-10)。 */}
       {item.replay.status === "pending_capture" && (
-        <p className="mt-3 rounded-xl bg-warning-soft px-3 py-2 text-meta font-medium text-warning">
+        <p className="oc-callout oc-callout-warning mt-3 rounded-xl px-4 py-2.5 text-meta font-medium text-warning">
           {TUTORIAL_PENDING_CAPTURE_LABEL}。下面是人工编写的任务脚本与观察记录，不是平台验证过的运行回放。
         </p>
       )}
 
-      <section className="mt-3 overflow-hidden rounded-3xl border border-border bg-surface shadow-sm md:grid md:grid-cols-[1.02fr_.98fr]">
+      <section className="oc-surface-card mt-3 overflow-hidden rounded-3xl md:grid md:grid-cols-[1.02fr_.98fr]">
         <CaseArtwork
           caseId={item.id}
           fieldReport={item.fieldReport}
@@ -1200,24 +1198,24 @@ function CaseDetail({
         />
         <div className="order-1 flex flex-col p-4 sm:p-6 md:order-2">
           <div className="flex flex-wrap items-center gap-2">
-            <span className="rounded-full bg-accent-soft px-2.5 py-1 text-micro font-semibold text-accent">
+            <span className="oc-badge-craft rounded-full bg-accent-soft px-2.5 py-1 text-micro font-semibold text-accent">
               {storyLabel} · 案例脚本
             </span>
-            <span className="rounded-full bg-hover px-2.5 py-1 text-micro text-muted">
+            <span className="oc-badge-craft rounded-full bg-hover px-2.5 py-1 text-micro text-muted">
               {item.difficulty}
             </span>
           </div>
-          <p className="mt-3 text-[12.5px] font-semibold leading-5 text-accent">
+          <p className="mt-3 text-caption font-semibold leading-5 text-accent">
             {presentation.pain}
           </p>
-          <h1 className="mt-1 text-balance text-[23px] font-bold leading-[1.18] tracking-tight text-fg sm:text-[30px]">
+          <h1 className="mt-1 text-balance text-2xl font-bold leading-tight tracking-tight text-fg sm:text-3xl">
             {item.title}
           </h1>
-          <div className="mt-3 rounded-2xl bg-accent-soft p-3 sm:p-3.5">
-            <p className="text-micro font-semibold uppercase tracking-[0.12em] text-accent">
+          <div className="oc-callout oc-callout-info mt-3 rounded-2xl p-3.5">
+            <p className="text-micro font-semibold uppercase tracking-widest text-accent">
               最后你会拿到
             </p>
-            <p className="mt-1 text-[13px] font-semibold leading-5 text-fg">
+            <p className="mt-1 text-meta font-semibold leading-5 text-fg">
               {presentation.result}
             </p>
           </div>
@@ -1249,12 +1247,12 @@ function CaseDetail({
       <ArtifactShowcase key={item.id} item={item} />
 
       <section className="mt-10" aria-labelledby="case-process-title">
-        <p className="text-micro font-semibold uppercase tracking-[0.14em] text-accent">
+        <p className="text-micro font-semibold uppercase tracking-widest text-accent">
           过程看得见
         </p>
         <h2
           id="case-process-title"
-          className="mt-1 text-[21px] font-semibold tracking-tight text-fg"
+          className="mt-1 text-xl font-semibold tracking-tight text-fg"
         >
           它实际怎样推进
         </h2>
@@ -1262,17 +1260,17 @@ function CaseDetail({
           {item.stages.map((stage, index) => (
             <article
               key={stage.id}
-              className="rounded-2xl border border-border bg-surface p-4 shadow-sm"
+              className="oc-surface-card rounded-2xl p-4"
             >
               <div className="flex items-center gap-3">
-                <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-grad-cta text-meta font-bold text-white">
+                <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-grad-cta text-meta font-bold tabular-nums text-white">
                   {index + 1}
                 </span>
                 <h3 className="text-title font-semibold text-fg">
                   {stage.title}
                 </h3>
               </div>
-              <p className="mt-3 rounded-xl bg-accent-soft p-3 text-[12px] font-medium leading-5 text-fg">
+              <p className="oc-surface-recessed mt-3 rounded-xl p-3 text-caption font-medium leading-5 text-fg">
                 {stage.output}
               </p>
               <div
@@ -1282,7 +1280,7 @@ function CaseDetail({
                 {stage.visibleProcess.map((process) => (
                   <span
                     key={process}
-                    className="rounded-full border border-border bg-bg px-2.5 py-1 text-micro text-muted"
+                    className="oc-badge-craft rounded-full bg-hover px-2.5 py-1 text-micro text-muted"
                   >
                     {process}
                   </span>
@@ -1296,12 +1294,12 @@ function CaseDetail({
       <CaseMethodDetails item={item} copied={copied} onCopy={onCopy} />
 
       {onRun && (
-        <section className={cn("mt-10 rounded-3xl px-5 py-6 sm:flex sm:items-center sm:justify-between sm:gap-6 sm:px-7", HERO_SURFACE_CLASS)} data-tutorial-hero="case-cta">
+        <section className={cn("mt-10 rounded-3xl px-5 py-6 shadow-pop sm:flex sm:items-center sm:justify-between sm:gap-6 sm:px-7", HERO_SURFACE_CLASS)} data-tutorial-hero="case-cta">
           <div>
-            <p className="text-micro font-semibold uppercase tracking-[0.14em] text-cyan-200">
+            <p className="text-micro font-semibold uppercase tracking-widest text-cyan-200">
               轮到你的任务
             </p>
-            <h2 className="mt-1 text-[20px] font-semibold">
+            <h2 className="mt-1 text-xl font-semibold">
               不用照抄案例，换成你的材料就能开始
             </h2>
           </div>
@@ -1341,12 +1339,12 @@ function StoryOverview({ item }: { item: TutorialCase }) {
   ] as const;
   return (
     <section className="mt-9" aria-labelledby="story-overview-title">
-      <p className="text-micro font-semibold uppercase tracking-[0.14em] text-accent">
+      <p className="text-micro font-semibold uppercase tracking-widest text-accent">
         一眼看懂
       </p>
       <h2
         id="story-overview-title"
-        className="mt-1 text-[21px] font-semibold tracking-tight text-fg"
+        className="mt-1 text-xl font-semibold tracking-tight text-fg"
       >
         从材料到成果，只看这三步
       </h2>
@@ -1356,13 +1354,13 @@ function StoryOverview({ item }: { item: TutorialCase }) {
           return (
             <li
               key={act.title}
-              className="relative rounded-2xl border border-border bg-surface p-4 shadow-sm"
+              className="oc-surface-card relative rounded-2xl p-4"
             >
               <div className="flex items-center justify-between gap-3">
-                <span className="flex size-10 items-center justify-center rounded-xl bg-accent-soft text-accent">
-                  <Icon size={18} />
+                <span className="oc-icon-badge oc-icon-badge-accent size-10 rounded-xl">
+                  <Icon size={18} strokeWidth={1.75} />
                 </span>
-                <span className="text-micro font-semibold text-faint">
+                <span className="font-mono text-micro font-semibold tabular-nums text-faint">
                   0{index + 1}
                 </span>
               </div>
@@ -1403,19 +1401,19 @@ function ArtifactShowcase({ item }: { item: TutorialCase }) {
   const artifact = item.artifacts[selectedIndex];
   return (
     <section className="mt-10" aria-labelledby="artifact-showcase-title">
-      <p className="text-micro font-semibold uppercase tracking-[0.14em] text-accent">
+      <p className="text-micro font-semibold uppercase tracking-widest text-accent">
         先看成品
       </p>
       {/* 预览区是装饰性示意,不是本案例真实产物,标题与图区都要说清(审计 TU-16)。 */}
       <h2
         id="artifact-showcase-title"
-        className="mt-1 text-[21px] font-semibold tracking-tight text-fg"
+        className="mt-1 text-xl font-semibold tracking-tight text-fg"
       >
         你会拿到这些成果
       </h2>
-      <div className="mt-5 overflow-hidden rounded-3xl border border-border bg-surface shadow-sm lg:grid lg:grid-cols-[1.35fr_.65fr]">
+      <div className="oc-surface-card mt-5 overflow-hidden rounded-3xl lg:grid lg:grid-cols-[1.35fr_.65fr]">
         <ArtifactPreview item={item} artifactIndex={selectedIndex} />
-        <div className="border-t border-border p-3 lg:border-l lg:border-t-0 lg:p-4">
+        <div className="border-t border-border/70 p-3 lg:border-l lg:border-t-0 lg:p-4">
           <p className="px-1 pb-2 text-micro font-semibold text-faint">
             点击查看成果
           </p>
@@ -1427,17 +1425,17 @@ function ArtifactShowcase({ item }: { item: TutorialCase }) {
                 aria-pressed={selectedIndex === index}
                 onClick={() => setSelectedIndex(index)}
                 className={cn(
-                  "rounded-xl border px-3 py-3 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                  "oc-btn-tactile rounded-xl border px-3 py-3 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring",
                   selectedIndex === index
-                    ? "border-accent/40 bg-accent-soft"
-                    : "border-transparent bg-sidebar hover:border-border hover:bg-hover",
+                    ? "border-accent/40 bg-accent-soft shadow-soft"
+                    : "oc-surface-recessed border-transparent hover:border-border",
                 )}
               >
                 <span className="flex items-center justify-between gap-2">
                   <strong className="text-meta font-semibold text-fg">
                     {entry.title}
                   </strong>
-                  <span className="rounded-full bg-surface px-2 py-0.5 text-caption text-faint">
+                  <span className="oc-badge-craft rounded-full bg-surface px-2 py-0.5 text-caption text-faint">
                     {entry.format}
                   </span>
                 </span>
@@ -1490,7 +1488,7 @@ function ArtifactPreview({
       <div className="mt-4 grid min-h-[190px] gap-3 sm:mt-6 sm:grid-cols-[.72fr_1.28fr]">
         <div className="rounded-2xl bg-white/[0.07] p-4">
           <FileOutput size={18} className="text-cyan-200" />
-          <p className="mt-3 text-[15px] font-semibold leading-5">
+          <p className="mt-3 text-base font-semibold leading-5">
             {artifact.title}
           </p>
           <p className="mt-2 text-caption leading-5 text-white/58">
@@ -1553,8 +1551,8 @@ function CaseMethodDetails({
   onCopy: () => void;
 }) {
   return (
-    <details className="group mt-10 overflow-hidden rounded-3xl border border-border bg-surface">
-      <summary className="flex cursor-pointer list-none items-center justify-between gap-4 px-4 py-4 outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-6 sm:py-5">
+    <details className="oc-surface-card group mt-10 overflow-hidden rounded-3xl">
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-4 px-4 py-4 outline-none transition-colors hover:bg-hover/60 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-6 sm:py-5">
         <div>
           <p className="text-title font-semibold text-fg">案例资料与方法</p>
           <p className="mt-1 text-caption leading-4 text-faint">
@@ -1566,17 +1564,17 @@ function CaseMethodDetails({
           className="shrink-0 text-faint transition-transform group-open:rotate-180"
         />
       </summary>
-      <div className="space-y-8 border-t border-border px-4 py-5 sm:px-6 sm:py-6">
+      <div className="space-y-8 border-t border-border/70 px-4 py-5 sm:px-6 sm:py-6">
         <section className="grid gap-3 sm:grid-cols-3">
-          <div className="rounded-2xl bg-sidebar p-4 sm:col-span-2">
+          <div className="oc-surface-recessed rounded-2xl p-4 sm:col-span-2">
             <h3 className="text-caption font-semibold text-faint">案例说明</h3>
             <p className="mt-1.5 text-caption leading-5 text-muted">{item.summary}</p>
           </div>
-          <div className="rounded-2xl bg-sidebar p-4">
+          <div className="oc-surface-recessed rounded-2xl p-4">
             <h3 className="text-caption font-semibold text-faint">适合谁</h3>
             <p className="mt-1.5 text-caption leading-5 text-muted">{item.audience}</p>
           </div>
-          <div className="rounded-2xl bg-sidebar p-4 sm:col-span-3">
+          <div className="oc-surface-recessed rounded-2xl p-4 sm:col-span-3">
             <h3 className="text-caption font-semibold text-faint">完整交付目标</h3>
             <p className="mt-1.5 text-caption leading-5 text-muted">{item.outcome}</p>
           </div>
@@ -1753,26 +1751,28 @@ function CaseMethodDetails({
         </section>
 
         <section>
-          <div className="flex items-center justify-between gap-3">
-            <h3 className="text-title font-semibold text-fg">完整开工指令</h3>
-            <Button variant="ghost" size="sm" onClick={onCopy}>
-              {copied ? <Check size={14} /> : <Copy size={14} />}
-              {copied ? "已复制" : "复制指令"}
-            </Button>
+          <div className="oc-code-shell">
+            <div className="oc-code-shell-header flex items-center justify-between gap-3 px-4 py-2.5">
+              <h3 className="text-meta font-semibold text-fg">完整开工指令</h3>
+              <Button variant="ghost" size="sm" onClick={onCopy}>
+                {copied ? <Check size={14} /> : <Copy size={14} />}
+                {copied ? "已复制" : "复制指令"}
+              </Button>
+            </div>
+            <blockquote className="max-h-72 overflow-y-auto whitespace-pre-wrap p-4 text-meta leading-6 text-muted">
+              {item.starterPrompt}
+            </blockquote>
           </div>
-          <blockquote className="mt-3 max-h-72 overflow-y-auto whitespace-pre-wrap rounded-2xl bg-sidebar p-4 text-meta leading-6 text-muted">
-            {item.starterPrompt}
-          </blockquote>
         </section>
 
         <section className="grid gap-4 lg:grid-cols-2">
           <div>
             <h3 className="text-title font-semibold text-fg">怎么验收成果</h3>
-            <div className="mt-3 space-y-2">
+            <div className="mt-3 space-y-2.5">
               {item.checks.map((check) => (
                 <article
                   key={check.title}
-                  className="rounded-2xl bg-success-soft p-4"
+                  className="oc-callout oc-callout-success rounded-2xl p-4"
                 >
                   <h4 className="flex items-center gap-2 text-meta font-semibold text-fg">
                     <Check size={13} className="text-success" />
@@ -1792,27 +1792,27 @@ function CaseMethodDetails({
             <h3 className="text-title font-semibold text-fg">
               推荐配置与能力
             </h3>
-            <div className="mt-3 rounded-2xl bg-accent-soft p-4">
+            <div className="oc-callout oc-callout-info mt-3 rounded-2xl p-4">
               <p className="text-meta font-semibold text-fg">
                 {item.suggestion.agentName}
               </p>
               <p className="mt-1 text-caption leading-5 text-muted">
                 {item.suggestion.why}
               </p>
-              <p className="mt-2 text-micro text-faint">
+              <p className="mt-2 font-mono text-micro text-faint">
                 {item.suggestion.agentId} · {item.suggestion.modelId} ·{" "}
                 {item.suggestion.modelGuidance}
               </p>
               <div className="mt-3 flex flex-wrap gap-1.5">
                 {item.capabilityIds.map((id) => (
-                  <span key={id} className="rounded-full bg-surface px-2 py-1 text-caption text-muted">
+                  <span key={id} className="oc-badge-craft rounded-full bg-surface px-2.5 py-0.5 text-caption text-muted">
                     {capabilityById(id).shortTitle}
                   </span>
                 ))}
               </div>
             </div>
             {item.fieldReport && (
-              <div className="mt-3 rounded-2xl bg-warning-soft p-4">
+              <div className="oc-callout oc-callout-warning mt-3 rounded-2xl p-4">
                 <h4 className="flex items-center gap-2 text-meta font-semibold text-fg">
                   <TriangleAlert size={13} className="text-warning" />
                   适用边界
@@ -1923,31 +1923,31 @@ function FeatureSidebar({
   const readCount = PRODUCT_CAPABILITY_LIST.filter((item) => tutorialIsRead(progress, item.id as ProductFeatureId)).length;
   return (
     <aside className="hidden w-[300px] shrink-0 flex-col border-r border-border bg-sidebar lg:flex">
-      <div aria-hidden className="mx-3 mt-3 rounded-2xl border border-border bg-surface p-3.5 shadow-sm">
+      <div aria-hidden className="oc-surface-card mx-3 mt-3 rounded-2xl p-3.5">
         <div className="flex items-center justify-between text-caption">
           <span className="font-semibold text-fg">学习进度</span>
-          <span className="tabular-nums text-faint">{Math.round((readCount / PRODUCT_CAPABILITY_LIST.length) * 100)}%</span>
+          <span className="font-medium tabular-nums text-faint">{Math.round((readCount / PRODUCT_CAPABILITY_LIST.length) * 100)}%</span>
         </div>
-        <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-hover">
-          <div className="h-full rounded-full bg-grad-cta transition-[width] duration-700 ease-standard" style={{ width: `${(readCount / PRODUCT_CAPABILITY_LIST.length) * 100}%` }} />
+        <div className="oc-surface-recessed mt-2 h-1.5 overflow-hidden rounded-full">
+          <div className="oc-progress-fill h-full rounded-full bg-grad-cta transition-[width] duration-700 ease-standard" style={{ width: `${(readCount / PRODUCT_CAPABILITY_LIST.length) * 100}%` }} />
         </div>
       </div>
       <div className="flex flex-col gap-0.5 p-3">
-        <button type="button" onClick={() => onCategoryChange("all")} aria-pressed={category === "all"} className={cn("rounded-xl px-3 py-2 text-left text-meta font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring", category === "all" ? "bg-surface text-fg shadow-sm ring-1 ring-border" : "text-muted hover:bg-hover hover:text-fg")}>
+        <button type="button" onClick={() => onCategoryChange("all")} aria-pressed={category === "all"} className={cn("oc-btn-tactile rounded-xl px-3 py-2 text-left text-meta font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring", category === "all" ? "oc-segmented-thumb text-fg" : "text-muted hover:bg-hover hover:text-fg")}>
           全部功能
           {/* 总进度(审计 TU-19):此前只有每行一个勾,看不出「读了几篇」。 */}
-          <span className="float-right text-faint">{readCount > 0 ? `已读 ${readCount}/${PRODUCT_CAPABILITY_LIST.length}` : PRODUCT_CAPABILITY_LIST.length}</span>
+          <span className="float-right tabular-nums text-faint">{readCount > 0 ? `已读 ${readCount}/${PRODUCT_CAPABILITY_LIST.length}` : PRODUCT_CAPABILITY_LIST.length}</span>
         </button>
         {PRODUCT_FEATURE_CATEGORIES.map((item) => (
-          <button type="button" key={item.id} onClick={() => onCategoryChange(item.id)} aria-pressed={category === item.id} title={item.description} className={cn("rounded-xl px-3 py-2 text-left text-meta font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring", category === item.id ? "bg-surface text-fg shadow-sm ring-1 ring-border" : "text-muted hover:bg-hover hover:text-fg")}>
-            {item.label}<span className="float-right text-faint">{PRODUCT_CAPABILITY_LIST.filter((entry) => entry.category === item.id).length}</span>
+          <button type="button" key={item.id} onClick={() => onCategoryChange(item.id)} aria-pressed={category === item.id} title={item.description} className={cn("oc-btn-tactile rounded-xl px-3 py-2 text-left text-meta font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring", category === item.id ? "oc-segmented-thumb text-fg" : "text-muted hover:bg-hover hover:text-fg")}>
+            {item.label}<span className="float-right tabular-nums text-faint">{PRODUCT_CAPABILITY_LIST.filter((entry) => entry.category === item.id).length}</span>
           </button>
         ))}
       </div>
       <nav ref={listRef} aria-label="教程目录" className="no-scrollbar min-h-0 flex-1 overflow-y-auto px-2 pb-3">
         {!activeInList && (
           // 筛选后当前教程不在列表里时给个位置提示,别让高亮凭空消失(审计 TU-18)。
-          <output className="mx-2 mb-1 block rounded-lg bg-accent-soft px-3 py-2 text-caption text-accent">
+          <output className="oc-callout oc-callout-info mx-2 mb-1.5 block rounded-xl px-3 py-2 text-caption text-accent">
             正在看：{capabilityById(activeId).shortTitle}（不在当前筛选内）
           </output>
         )}
@@ -1993,20 +1993,20 @@ function FeatureDetail({
           <div className="mb-3 flex flex-wrap items-center gap-2">
             {/* 「内容版本 N」对用户没有含义,收进 data 属性供排障(审计 TU-26)。 */}
             <Badge tone="accent" data-content-version={topic.contentVersion}>{featureCategoryLabel(feature.category)}</Badge>
-            <span className="text-caption text-faint">{topic.steps.length} 个步骤</span>
-            {tutorialIsRead(progress, topicId) && <span className="inline-flex items-center gap-1 rounded-full bg-success-soft px-2 py-0.5 text-caption font-medium text-success"><Check size={11} /> 已读</span>}
+            <span className="oc-badge-craft rounded-full bg-hover px-2 py-0.5 text-caption tabular-nums text-faint">{topic.steps.length} 个步骤</span>
+            {tutorialIsRead(progress, topicId) && <span className="oc-badge-craft inline-flex items-center gap-1 rounded-full bg-success-soft px-2 py-0.5 text-caption font-medium text-success"><Check size={11} /> 已读</span>}
           </div>
-          <h1 className="text-balance text-[28px] font-bold leading-[1.12] tracking-[-0.03em] text-fg sm:text-[38px]">{feature.title}</h1>
-          <p className="mt-3.5 text-[15px] leading-7 text-muted">{topic.intro}</p>
+          <h1 className="text-balance text-3xl font-bold leading-tight tracking-tight text-fg sm:text-4xl">{feature.title}</h1>
+          <p className="mt-3.5 text-base leading-7 text-muted">{topic.intro}</p>
         </div>
       </div>
 
-      <section className="tut-frame mt-8 overflow-hidden rounded-[24px] border border-border bg-surface">
-        <div className="flex items-center gap-1.5 border-b border-border px-4 py-2.5" aria-hidden>
+      <section className="tut-frame oc-surface-card mt-8 overflow-hidden rounded-3xl">
+        <div className="oc-code-shell-header flex items-center gap-1.5 px-4 py-2.5" aria-hidden>
           <span className="size-2.5 rounded-full bg-border-strong" />
           <span className="size-2.5 rounded-full bg-border-strong" />
           <span className="size-2.5 rounded-full bg-border-strong" />
-          <span className="ml-2 truncate text-caption text-faint">{feature.shortTitle}</span>
+          <span className="ml-2 truncate text-caption font-medium text-faint">{feature.shortTitle}</span>
         </div>
         <div className="aspect-video w-full bg-sidebar">
           {videoFailed[topic.media] ? (
@@ -2020,21 +2020,21 @@ function FeatureDetail({
             </video>
           )}
         </div>
-        <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-t border-border px-4 py-3 text-caption text-faint">
-          <p>{media.caption}</p><span className="shrink-0 rounded-full bg-success-soft px-2 py-0.5 font-medium text-success">真实界面录制 · 脱敏示例</span>
+        <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-t border-border/70 px-4 py-3 text-caption text-faint">
+          <p>{media.caption}</p><span className="oc-badge-craft shrink-0 rounded-full bg-success-soft px-2.5 py-0.5 font-medium text-success">真实界面录制 · 脱敏示例</span>
         </div>
       </section>
 
-      <section className="tut-hero mt-8 rounded-[24px] border border-border p-5 sm:p-6">
+      <section className="tut-hero oc-surface-card mt-8 rounded-3xl p-5 sm:p-6">
         <div className="relative">
-          <div className="inline-flex items-center gap-1.5 text-caption font-semibold uppercase tracking-[0.14em] text-accent"><Target size={13} aria-hidden /> 完成后你能</div>
-          <p className="mt-2 text-[17px] font-semibold leading-7 text-fg">{topic.outcome}</p>
-          <div className="mt-4 flex flex-wrap gap-2">{topic.scenarios.map((scenario) => <span key={scenario} className="rounded-full border border-border bg-surface/80 px-3 py-1 text-caption text-muted backdrop-blur">{scenario}</span>)}</div>
+          <div className="inline-flex items-center gap-1.5 text-caption font-semibold uppercase tracking-widest text-accent"><Target size={13} aria-hidden /> 完成后你能</div>
+          <p className="mt-2 text-lg font-semibold leading-7 text-fg">{topic.outcome}</p>
+          <div className="mt-4 flex flex-wrap gap-2">{topic.scenarios.map((scenario) => <span key={scenario} className="oc-surface-recessed rounded-full px-3 py-1 text-caption text-muted">{scenario}</span>)}</div>
         </div>
       </section>
 
       <section className="mt-11">
-        <h2 className="text-[21px] font-semibold tracking-tight text-fg">跟着做</h2>
+        <h2 className="text-xl font-semibold tracking-tight text-fg">跟着做</h2>
         {/* 每一步都是深链落点(`?panel=help&topic=…&step=N`,TU-17):tabIndex=-1 让父级把焦点放到这一步,
             scroll-mt 留出顶部空隙;目标步骤带 aria-current 与浅色底,读屏 / 视觉都知道"链接指的是这一步"。 */}
         <ol className="relative mt-5 flex flex-col gap-2">
@@ -2050,13 +2050,13 @@ function FeatureDetail({
                 aria-current={current ? "step" : undefined}
                 className={cn(
                   "relative flex gap-4 scroll-mt-4 rounded-2xl py-3 pr-3 outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                  current && "bg-accent-soft/60",
+                  current && "oc-callout oc-callout-info pl-2",
                 )}
               >
-                <span className="relative z-10 flex size-9 shrink-0 items-center justify-center rounded-full bg-grad-cta text-meta font-semibold text-white ring-4 ring-bg">{index + 1}</span>
+                <span className="relative z-10 flex size-9 shrink-0 items-center justify-center rounded-full bg-grad-cta text-meta font-semibold tabular-nums text-white ring-4 ring-bg">{index + 1}</span>
                 <div className="min-w-0 pt-1">
-                  <h3 className="text-[15.5px] font-semibold text-fg">{step.title}</h3>
-                  <p className="mt-1 text-[14px] leading-6 text-muted">{step.body}</p>
+                  <h3 className="text-base font-semibold text-fg">{step.title}</h3>
+                  <p className="mt-1 text-body leading-6 text-muted">{step.body}</p>
                 </div>
               </li>
             );
@@ -2064,34 +2064,34 @@ function FeatureDetail({
         </ol>
       </section>
 
-      {topic.example && <section className="mt-10 rounded-[22px] border border-border bg-surface p-5 shadow-sm sm:p-6"><div className="flex items-center justify-between gap-3"><h2 className="flex items-center gap-2 text-title font-semibold text-fg"><Quote size={15} className="text-accent" aria-hidden /> 可以直接参考的说法</h2><Button variant="secondary" size="sm" shape="pill" onClick={onCopy}>{copied ? <Check size={14} /> : <Copy size={14} />}{copied ? "已复制" : "复制示例"}</Button></div><blockquote className="mt-4 rounded-xl bg-hover px-4 py-3.5 text-[14px] leading-7 text-fg/85">{topic.example}</blockquote></section>}
+      {topic.example && <section className="oc-surface-card mt-10 rounded-2xl p-5 sm:p-6"><div className="flex items-center justify-between gap-3"><h2 className="flex items-center gap-2 text-title font-semibold text-fg"><span className="oc-icon-badge oc-icon-badge-accent size-7 rounded-md" aria-hidden><Quote size={14} /></span> 可以直接参考的说法</h2><Button variant="secondary" size="sm" shape="pill" onClick={onCopy}>{copied ? <Check size={14} /> : <Copy size={14} />}{copied ? "已复制" : "复制示例"}</Button></div><blockquote className="oc-surface-recessed mt-4 rounded-xl px-4 py-3.5 text-body leading-7 text-fg/90">{topic.example}</blockquote></section>}
 
       <div className="mt-10 grid gap-4 sm:grid-cols-2"><InfoBox icon={Lightbulb} title="实用建议" tone="accent" items={topic.tips} /><InfoBox icon={TriangleAlert} title="使用前留意" tone="warning" items={topic.cautions} /></div>
 
-      <section className="tut-cta relative mt-10 overflow-hidden rounded-xl p-6 text-white sm:p-7"><div className="relative flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between"><div><h2 className="text-[19px] font-semibold">现在去真实功能里试一遍</h2><p className="mt-1.5 text-meta text-white/75">教程不会替你发送消息、修改设置或执行付费操作。</p>{!cta.enabled && cta.disabledReason && <p className="mt-2 inline-block rounded-lg bg-white/90 px-2.5 py-1 text-meta text-warning">{cta.disabledReason}</p>}</div><Button variant="secondary" shape="pill" size="lg" disabled={!cta.enabled} onClick={() => onRunAction(feature)} className="shrink-0 border-transparent bg-white text-brand-fg hover:bg-white/90">{cta.label} <ArrowRight size={15} /></Button></div></section>
+      <section className="tut-cta relative mt-10 overflow-hidden rounded-2xl p-6 text-white shadow-pop sm:p-7"><div className="relative flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between"><div><h2 className="text-lg font-semibold">现在去真实功能里试一遍</h2><p className="mt-1.5 text-meta text-white/75">教程不会替你发送消息、修改设置或执行付费操作。</p>{!cta.enabled && cta.disabledReason && <p className="mt-2 inline-block rounded-lg bg-white/90 px-2.5 py-1 text-meta text-warning">{cta.disabledReason}</p>}</div><Button variant="secondary" shape="pill" size="lg" disabled={!cta.enabled} onClick={() => onRunAction(feature)} className="shrink-0 border-transparent bg-white text-brand-fg hover:bg-white/90">{cta.label} <ArrowRight size={15} /></Button></div></section>
 
-      <section className="mt-10"><h2 className="text-title font-semibold text-fg">接着了解</h2><div className="mt-3 grid gap-2.5 sm:grid-cols-3">{topic.related.map((relatedId) => { const related = capabilityById(relatedId); const RelatedIcon = ICONS[related.icon] ?? Sparkles; return <button key={relatedId} type="button" onClick={() => onTopicChange(relatedId)} className="tut-card group flex items-center gap-2.5 rounded-2xl border border-border bg-surface px-3.5 py-3 text-left text-meta text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"><span className="flex size-8 shrink-0 items-center justify-center rounded-xl bg-accent-soft text-accent"><RelatedIcon size={14} /></span><span className="min-w-0 flex-1 truncate font-medium">{related.shortTitle}</span><ArrowRight size={13} className="text-faint transition-transform group-hover:translate-x-0.5" /></button>; })}</div></section>
+      <section className="mt-10"><h2 className="text-title font-semibold text-fg">接着了解</h2><div className="mt-3 grid gap-2.5 sm:grid-cols-3">{topic.related.map((relatedId) => { const related = capabilityById(relatedId); const RelatedIcon = ICONS[related.icon] ?? Sparkles; return <button key={relatedId} type="button" onClick={() => onTopicChange(relatedId)} className="tut-card oc-surface-card oc-surface-card-hover group flex items-center gap-2.5 rounded-2xl px-3.5 py-3 text-left text-meta text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"><span className="oc-icon-badge oc-icon-badge-accent size-8 shrink-0 rounded-xl"><RelatedIcon size={14} strokeWidth={1.75} /></span><span className="min-w-0 flex-1 truncate font-medium text-fg">{related.shortTitle}</span><ArrowRight size={13} className="text-faint transition-transform group-hover:translate-x-0.5" /></button>; })}</div></section>
     </article>
   );
 }
 
 // 分类 chip / 目录行 / 页签都不走 Button 原语,触屏 44px 规则要自己补(审计 TU-11);chip 补选中态语义(TU-24)。
 function CategoryChip({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
-  return <button type="button" onClick={onClick} aria-pressed={active} className={cn("shrink-0 rounded-full px-3 py-1.5 text-meta font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11", active ? "bg-accent-soft text-accent" : "text-muted hover:bg-hover hover:text-fg")}>{children}</button>;
+  return <button type="button" onClick={onClick} aria-pressed={active} className={cn("oc-btn-tactile shrink-0 rounded-full px-3 py-1.5 text-meta font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11", active ? "oc-segmented-thumb text-fg" : "text-muted hover:text-fg")}>{children}</button>;
 }
 
 function TopicList({ items, activeId, isRead, onSelect }: { items: ProductCapability[]; activeId: ProductFeatureId; isRead: (id: ProductFeatureId) => boolean; onSelect: (id: ProductFeatureId) => void }) {
   if (items.length === 0) return <output className="block px-4 py-8 text-center text-meta text-faint">没有匹配的教程，换个关键词试试。</output>;
-  return <div className="flex flex-col gap-0.5">{items.map((item) => { const id = item.id as ProductFeatureId; const Icon = ICONS[item.icon] ?? Sparkles; return <button key={id} type="button" aria-current={id === activeId ? "page" : undefined} onClick={() => onSelect(id)} className={cn("group flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11", id === activeId ? "bg-surface text-fg shadow-sm ring-1 ring-border" : "text-muted hover:bg-hover hover:text-fg")}><span className={cn("flex size-7 shrink-0 items-center justify-center rounded-lg shadow-sm group-hover:text-accent", id === activeId ? "bg-accent-soft text-accent" : "bg-surface text-faint")}><Icon size={14} /></span><span className="min-w-0 flex-1 truncate text-meta font-medium">{item.shortTitle}</span>{isRead(id) && <Check size={13} className="shrink-0 text-success" aria-label="已读" />}</button>; })}</div>;
+  return <div className="flex flex-col gap-0.5">{items.map((item) => { const id = item.id as ProductFeatureId; const Icon = ICONS[item.icon] ?? Sparkles; return <button key={id} type="button" aria-current={id === activeId ? "page" : undefined} onClick={() => onSelect(id)} className={cn("oc-btn-tactile group flex items-center gap-2.5 rounded-xl px-3 py-2.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11", id === activeId ? "oc-segmented-thumb text-fg" : "text-muted hover:bg-hover hover:text-fg")}><span className={cn("oc-icon-badge size-7 shrink-0 rounded-lg", id === activeId && "oc-icon-badge-accent")}><Icon size={14} strokeWidth={1.75} /></span><span className="min-w-0 flex-1 truncate text-meta font-medium">{item.shortTitle}</span>{isRead(id) && <Check size={13} className="shrink-0 text-success" aria-label="已读" />}</button>; })}</div>;
 }
 
 function FeatureIcon({ feature, className }: { feature: ProductCapability; className?: string }) {
   const Icon = ICONS[feature.icon] ?? Sparkles;
-  return <span className={cn("tut-mark size-14 shrink-0 items-center justify-center rounded-[18px] bg-grad-cta text-white", className)}><Icon size={24} /></span>;
+  return <span className={cn("tut-mark oc-avatar-ring size-14 shrink-0 items-center justify-center rounded-2xl bg-grad-cta text-white", className)}><Icon size={24} strokeWidth={1.75} /></span>;
 }
 
 function InfoBox({ icon: Icon, title, tone, items }: { icon: LucideIcon; title: string; tone: "accent" | "warning"; items: readonly string[] }) {
-  return <section className={cn("rounded-[20px] border p-5", tone === "accent" ? "border-accent/20 bg-accent-soft" : "border-warning/20 bg-warning-soft")}><h2 className={cn("flex items-center gap-1.5 text-body font-semibold", tone === "accent" ? "text-accent" : "text-warning")}><Icon size={15} /> {title}</h2><ul className="mt-2.5 flex list-disc flex-col gap-1.5 pl-4 text-[12.5px] leading-5 text-muted">{items.map((item) => <li key={item}>{item}</li>)}</ul></section>;
+  return <section className={cn("oc-callout rounded-2xl p-5", tone === "accent" ? "oc-callout-info" : "oc-callout-warning")}><h2 className={cn("flex items-center gap-2 text-body font-semibold", tone === "accent" ? "text-accent" : "text-warning")}><span className={cn("oc-icon-badge size-6 rounded-md", tone === "accent" ? "oc-icon-badge-accent" : "oc-icon-badge-warning")} aria-hidden><Icon size={13} strokeWidth={1.85} /></span> {title}</h2><ul className="mt-2.5 flex list-disc flex-col gap-1.5 pl-4 text-caption leading-5 text-muted">{items.map((item) => <li key={item}>{item}</li>)}</ul></section>;
 }
 
 function featureCategoryLabel(id: ProductFeatureCategory): string {

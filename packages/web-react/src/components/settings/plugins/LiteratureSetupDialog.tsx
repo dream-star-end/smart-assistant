@@ -369,32 +369,41 @@ export function LiteratureSetupDialog({
                 onChange={(e) => setPassword(e.target.value)}
               />
             </label>
-            <label className="text-sm">
-              <input type="checkbox" checked={terms} onChange={(e) => setTerms(e.target.checked)} />{' '}
-              我同意插件代为登录、检索及下载。该网站通过 HTTP 接收登录信息；平台加密保存凭据。
+            <label className="oc-surface-recessed flex cursor-pointer items-start gap-2.5 rounded-xl px-3.5 py-2.5 text-meta leading-relaxed text-muted">
+              <input
+                type="checkbox"
+                className="mt-0.5 size-4 shrink-0 accent-accent"
+                checked={terms}
+                onChange={(e) => setTerms(e.target.checked)}
+              />
+              <span>
+                我同意插件代为登录、检索及下载。该网站通过 HTTP 接收登录信息；平台加密保存凭据。
+              </span>
             </label>
           </>
         )}
         {view?.status === 'running' && (
-          <p>
+          <p className="oc-surface-recessed flex items-center gap-2 rounded-xl px-3.5 py-3 text-meta text-muted">
             <Spinner /> 正在自动登录或安全保存，请稍候…
           </p>
         )}
         {view?.status === 'manual_required' && (
           <>
-            <p>
+            <p className="text-meta text-muted">
               {view.automaticSubmissions > 0
                 ? '自动识别多次未通过，请输入这一次验证码。'
                 : '请输入下方图形验证码完成登录。'}
             </p>
             {image && run.current.epoch === epoch && (
-              <img
-                src={image}
-                alt="网站登录验证码"
-                width={188}
-                height={80}
-                className="h-20 w-[188px] rounded border border-border-control bg-surface object-contain"
-              />
+              <div className="oc-surface-card w-fit rounded-xl bg-white p-2">
+                <img
+                  src={image}
+                  alt="网站登录验证码"
+                  width={188}
+                  height={80}
+                  className="h-20 w-[188px] rounded object-contain"
+                />
+              </div>
             )}
             <label htmlFor="literature-setup-captcha" className="flex flex-col gap-1.5 text-sm font-medium text-fg">
               验证码

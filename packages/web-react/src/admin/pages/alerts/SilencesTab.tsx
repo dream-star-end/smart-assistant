@@ -1,4 +1,4 @@
-import { Plus, RefreshCw } from "lucide-react";
+import { AlertTriangle, Plus, RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Badge, Button, Input, Modal, useConfirm, useToast } from "../../../components/ui";
 import { type Column, DataTable, FilterBar, TimeAgo } from "../../components";
@@ -82,16 +82,18 @@ export function SilencesTab({
         return m.empty ? (
           <Badge tone="danger">空 matcher</Badge>
         ) : (
-          <span className="font-mono text-meta">{m.text}</span>
+          <span className="oc-surface-recessed inline-block rounded-md px-2 py-0.5 font-mono text-caption text-fg">
+            {m.text}
+          </span>
         );
       },
     },
-    { key: "starts_at", title: "开始", width: 96, render: (s) => <TimeAgo value={s.starts_at} /> },
+    { key: "starts_at", title: "开始", width: 96, render: (s) => <TimeAgo value={s.starts_at} className="tabular-nums" /> },
     {
       key: "ends_at",
       title: "结束 / 剩余",
       width: 110,
-      render: (s) => <TimeAgo value={s.ends_at} />,
+      render: (s) => <TimeAgo value={s.ends_at} className="tabular-nums" />,
     },
     {
       key: "reason",
@@ -115,7 +117,13 @@ export function SilencesTab({
       align: "right",
       render: (s) =>
         s.active ? (
-          <Button variant="danger" size="sm" onClick={() => onDelete(s)} disabled={deleting.has(s.id)}>
+          <Button
+            variant="danger"
+            size="sm"
+            onClick={() => onDelete(s)}
+            disabled={deleting.has(s.id)}
+            className="oc-btn-tactile"
+          >
             撤销
           </Button>
         ) : (
@@ -125,22 +133,23 @@ export function SilencesTab({
   ];
 
   return (
-    <div className="flex flex-col gap-3">
+    <div className="flex flex-col gap-3.5">
       {confirmEl}
       <FilterBar className="justify-between">
         <p className="text-body text-muted">matcher 三字段任选(AND 关系,命中则不发);窗口最长 7 天。</p>
         <div className="flex items-center gap-2">
-          <Button variant="secondary" size="sm" onClick={reload} disabled={loading}>
+          <Button variant="secondary" size="sm" onClick={reload} disabled={loading} className="oc-btn-tactile">
             <RefreshCw size={14} className={loading ? "animate-spin" : undefined} /> 刷新
           </Button>
-          <Button variant="primary" size="sm" onClick={() => setCreating(true)}>
+          <Button variant="primary" size="sm" onClick={() => setCreating(true)} className="oc-btn-tactile">
             <Plus size={15} /> 新建静默
           </Button>
         </div>
       </FilterBar>
 
       {error && (
-        <div className="rounded-lg border border-danger/40 bg-danger-soft px-3 py-2.5 text-body text-danger">
+        <div className="oc-callout oc-callout-danger flex items-center gap-2 rounded-xl px-4 py-3 text-body text-danger">
+          <AlertTriangle size={15} className="shrink-0" />
           加载静默失败: {errText(error)}
         </div>
       )}
@@ -244,10 +253,10 @@ function CreateSilenceModal({
       description="命中 matcher(AND)的事件在窗口内不发送。最长 7 天。"
       footer={
         <>
-          <Button variant="ghost" onClick={() => onOpenChange(false)}>
+          <Button variant="ghost" onClick={() => onOpenChange(false)} className="oc-btn-tactile">
             取消
           </Button>
-          <Button variant="primary" onClick={submit} disabled={submitting}>
+          <Button variant="primary" onClick={submit} disabled={submitting} className="oc-btn-tactile">
             {submitting ? "创建中…" : "创建"}
           </Button>
         </>

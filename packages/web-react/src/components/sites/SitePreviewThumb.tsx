@@ -18,9 +18,9 @@ function slugHueIndex(slug: string): number {
 }
 
 const ACCENT_SURFACE_CLASSES = [
-  "bg-accent-soft/50 text-accent",
-  "bg-info-soft/60 text-info",
-  "bg-success-soft/50 text-success",
+  "oc-icon-badge oc-icon-badge-accent",
+  "oc-icon-badge oc-icon-badge-info",
+  "oc-icon-badge oc-icon-badge-success",
 ] as const;
 
 export function SitePreviewThumb({
@@ -43,35 +43,38 @@ export function SitePreviewThumb({
     <div
       data-testid="site-preview-thumb"
       className={cn(
-        "relative flex aspect-[16/10] w-full flex-col overflow-hidden rounded-lg border border-border bg-bg-subtle",
+        "oc-surface-recessed relative flex aspect-[16/10] w-full flex-col overflow-hidden rounded-lg",
         className,
       )}
     >
       {/* 微型浏览器顶栏 */}
-      <div className="flex shrink-0 items-center gap-1.5 border-b border-border/70 bg-surface/90 px-2 py-1">
-        <span aria-hidden="true" className="flex shrink-0 items-center gap-0.5">
+      <div className="flex shrink-0 items-center gap-1.5 border-b border-border/70 bg-surface/95 px-2.5 py-1.5">
+        <span aria-hidden="true" className="flex shrink-0 items-center gap-1">
           <span className="size-1.5 rounded-full bg-border-strong" />
           <span className="size-1.5 rounded-full bg-border-strong" />
           <span className="size-1.5 rounded-full bg-border-strong" />
         </span>
-        <span className="min-w-0 flex-1 truncate font-mono text-micro text-faint" title={hostLabel}>
+        <span
+          className="min-w-0 flex-1 truncate rounded bg-bg/70 px-1.5 py-0.5 font-mono text-micro text-faint"
+          title={hostLabel}
+        >
           {hostLabel}
         </span>
       </div>
 
       {/* 静态内容画布 */}
       {site.visibility === "public" ? (
-        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-1.5 px-2.5 text-center">
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 px-2.5 text-center">
           <span
             aria-hidden="true"
             className={cn(
-              "flex size-7 items-center justify-center rounded-md text-caption font-semibold",
+              "size-8 rounded-lg text-section font-semibold",
               accentTone,
             )}
           >
             {monogram}
           </span>
-          <span className="inline-flex items-center gap-1 text-micro text-faint">
+          <span className="oc-badge-craft inline-flex items-center gap-1 rounded-full bg-surface/90 px-2 py-0.5 text-micro font-medium text-muted">
             {site.hasServerApi ? (
               <>
                 <Server size={10} aria-hidden="true" />
@@ -86,13 +89,15 @@ export function SitePreviewThumb({
           </span>
         </div>
       ) : (
-        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-1 px-2 text-center">
-          {site.visibility === "password" ? (
-            <Lock size={15} className="text-faint" aria-hidden="true" />
-          ) : (
-            <PauseCircle size={15} className="text-faint" aria-hidden="true" />
-          )}
-          <span className="max-w-full truncate text-caption text-faint">
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-1.5 px-2 text-center">
+          <span className="oc-icon-badge size-8 rounded-lg" aria-hidden="true">
+            {site.visibility === "password" ? (
+              <Lock size={14} className="text-muted" />
+            ) : (
+              <PauseCircle size={14} className="text-muted" />
+            )}
+          </span>
+          <span className="max-w-full truncate text-caption font-medium text-faint">
             {site.visibility === "password" ? "口令保护" : "已下线"}
           </span>
         </div>

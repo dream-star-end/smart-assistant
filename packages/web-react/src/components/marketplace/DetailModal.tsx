@@ -65,8 +65,17 @@ function SectionTitle({
   children: ReactNode
 }) {
   return (
-    <div className={cn('flex items-center gap-1.5 text-section font-semibold text-fg', className)}>
-      {Icon ? <Icon size={13} className="shrink-0 text-muted" aria-hidden="true" /> : null}
+    <div
+      className={cn(
+        'flex items-center gap-2 text-section font-semibold tracking-tight text-fg',
+        className,
+      )}
+    >
+      {Icon ? (
+        <span aria-hidden="true" className="oc-icon-badge size-5 rounded-xs">
+          <Icon size={12} strokeWidth={1.9} />
+        </span>
+      ) : null}
       <span>{children}</span>
     </div>
   )
@@ -74,7 +83,7 @@ function SectionTitle({
 
 /** 决策漏斗的一段。段间用分隔线而非等距 gap —— 读者要能看出「这里换了一件事」。 */
 function Section({ className, children }: { className?: string; children: ReactNode }) {
-  return <section className={cn('border-t border-border pt-3', className)}>{children}</section>
+  return <section className={cn('border-t border-border/80 pt-3.5', className)}>{children}</section>
 }
 
 /** ② 它能帮你做什么:简介 + 适用场景 + 效果示例(缺则整块不渲染)。 */
@@ -88,18 +97,18 @@ function WhatItDoes({
   outcomes: string[]
 }) {
   return (
-    <Section className="flex flex-col gap-3">
+    <Section className="flex flex-col gap-3.5">
       <p className="text-section leading-relaxed text-fg">{description}</p>
       {useCases.length > 0 && (
         <div>
-          <SectionTitle icon={Layers} className="mb-1.5">
+          <SectionTitle icon={Layers} className="mb-2">
             适用场景
           </SectionTitle>
-          <ul className="flex flex-col gap-1">
+          <ul className="flex flex-col gap-1.5">
             {useCases.map((u, i) => (
-              <li key={i} className="flex gap-2 text-body leading-relaxed text-fg">
+              <li key={i} className="flex gap-2.5 text-body leading-relaxed text-fg">
                 <span
-                  className="mt-1.5 size-1 shrink-0 rounded-full bg-accent"
+                  className="mt-2.5 h-0.5 w-2 shrink-0 rounded-xs bg-accent/75"
                   aria-hidden="true"
                 />
                 <span>{u}</span>
@@ -110,16 +119,16 @@ function WhatItDoes({
       )}
       {outcomes.length > 0 && (
         <div>
-          <SectionTitle icon={Target} className="mb-1.5">
+          <SectionTitle icon={Target} className="mb-2">
             能达成什么效果
           </SectionTitle>
-          <ul className="flex flex-col gap-1.5">
+          <ul className="flex flex-col gap-2">
             {outcomes.map((o, i) => (
               <li
                 key={i}
                 className={cn(
                   cardVariants({ padding: 'sm', tone: 'sunken' }),
-                  'text-body leading-relaxed text-fg',
+                  'rounded-lg text-body leading-relaxed text-fg',
                 )}
               >
                 {o}
@@ -161,16 +170,51 @@ function reviewBadgeLabel(source: MarketplaceDetail['reviewSource']): string {
 function CodeScroll({
   id,
   label,
+  header,
+  embedded = false,
   className,
+  scrollClassName,
   preClassName,
   children,
 }: {
   id?: string
   label: string
+  /** 可选 IDE 顶栏标签(文件名 / 块名)。 */
+  header?: ReactNode
+  /** 嵌入外层 oc-code-shell(如 details)时省去外框阴影。 */
+  embedded?: boolean
   className?: string
+  scrollClassName?: string
   preClassName?: string
   children: ReactNode
 }) {
+  if (header) {
+    return (
+      <div id={id} className={cn('oc-code-shell', className)}>
+        <div className="oc-code-shell-header flex items-center justify-between gap-2 px-3 py-1.5 text-caption font-medium text-muted">
+          {header}
+        </div>
+        <section
+          aria-label={label}
+          // biome-ignore lint/a11y/noNoninteractiveTabindex: 可滚动的原文块必须能被键盘聚焦并滚动。
+          tabIndex={0}
+          className={cn(
+            'overflow-auto outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
+            scrollClassName,
+          )}
+        >
+          <pre
+            className={cn(
+              'whitespace-pre-wrap break-words px-3.5 py-2.5 font-mono text-meta leading-relaxed text-fg',
+              preClassName,
+            )}
+          >
+            {children}
+          </pre>
+        </section>
+      </div>
+    )
+  }
   return (
     <section
       id={id}
@@ -178,13 +222,14 @@ function CodeScroll({
       // biome-ignore lint/a11y/noNoninteractiveTabindex: 可滚动的原文块必须能被键盘聚焦并滚动。
       tabIndex={0}
       className={cn(
-        'overflow-auto rounded-lg border border-border bg-code outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
+        embedded ? 'bg-code' : 'oc-code-shell',
+        'overflow-auto outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
         className,
       )}
     >
       <pre
         className={cn(
-          'whitespace-pre-wrap break-words px-3 py-2 font-mono text-meta leading-relaxed text-fg',
+          'whitespace-pre-wrap break-words px-3.5 py-2.5 font-mono text-meta leading-relaxed text-fg',
           preClassName,
         )}
       >
@@ -228,9 +273,9 @@ function AgentManifestView({
   const persona = m.persona?.trim()
   return (
     <div className="flex flex-col gap-3">
-      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+      <div className="oc-surface-card grid grid-cols-1 gap-3 rounded-xl p-3.5 sm:grid-cols-2">
         <div>
-          <FieldLabel className="mb-1">模型</FieldLabel>
+          <FieldLabel className="mb-1.5">模型</FieldLabel>
           <Badge tone="neutral">
             {m.model === 'auto' ? '任意模型 · 跟随会话选择' : m.model || '平台默认'}
           </Badge>
@@ -238,8 +283,8 @@ function AgentManifestView({
         {/* 无数据不占位不噪音:空工具集此前渲染一个孤零零的「—」,像加载失败。 */}
         {toolsets.length > 0 && (
           <div>
-            <FieldLabel className="mb-1">能力（工具集）</FieldLabel>
-            <div className="flex flex-wrap gap-1">
+            <FieldLabel className="mb-1.5">能力（工具集）</FieldLabel>
+            <div className="flex flex-wrap gap-1.5">
               {toolsets.map((t) => (
                 <Badge key={t} tone="info">
                   {TOOLSET_LABEL[t] ?? t}
@@ -250,11 +295,11 @@ function AgentManifestView({
         )}
       </div>
       {capabilities.length > 0 && (
-        <div>
-          <FieldLabel className="mb-1">
+        <div className="oc-surface-recessed rounded-xl p-3.5">
+          <FieldLabel className="mb-1.5">
             组合能力（{capabilities.length} 项，必需能力与智能体原子安装）
           </FieldLabel>
-          <div className="flex flex-wrap gap-1">
+          <div className="flex flex-wrap gap-1.5">
             {capabilities.map((capability) => {
               const state = readiness?.requirements.find(
                 (item) => item.kind === capability.kind && item.slug === capability.slug,
@@ -281,7 +326,7 @@ function AgentManifestView({
               )
             })}
           </div>
-          <p className="mt-1.5 text-meta leading-relaxed text-faint">
+          <p className="mt-2 text-meta leading-relaxed text-faint">
             能力绑定用于组合与就绪检查，不是逐智能体的插件权限隔离；插件账号仍按当前用户授权。
           </p>
         </div>
@@ -291,7 +336,8 @@ function AgentManifestView({
           <FieldLabel className="mb-1.5">人设</FieldLabel>
           <CodeScroll
             label="智能体人设原文"
-            className="max-h-56"
+            header="人设原文"
+            scrollClassName="max-h-56"
             preClassName="font-sans text-body"
           >
             {persona}
@@ -324,11 +370,11 @@ function BundleFilesView({
   const scriptCount = paths.filter((p) => p.startsWith('scripts/')).length
   return (
     <Section>
-      <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
         <SectionTitle icon={FileText}>包含内容（{paths.length} 个文件）</SectionTitle>
         {scriptCount > 0 && (
-          <Badge tone="warning">
-            <Terminal size={12} aria-hidden="true" />含 {scriptCount} 个可执行脚本
+          <Badge tone="warning" className="tabular-nums">
+            <Terminal size={12} strokeWidth={1.9} aria-hidden="true" />含 {scriptCount} 个可执行脚本
           </Badge>
         )}
       </div>
@@ -349,24 +395,32 @@ function BundleFilesView({
                 isScript && !active && 'border-warning/50 text-warning',
               )}
             >
-              {isScript && <Terminal size={12} className="shrink-0" aria-hidden="true" />}
+              {isScript && <Terminal size={12} strokeWidth={1.9} className="shrink-0" aria-hidden="true" />}
               <span className="truncate">{p}</span>
             </Button>
           )
         })}
       </div>
       {open && (
-        <CodeScroll id="bundle-file-view" label={`${open} 的文件内容`} className="mt-2 max-h-56">
+        <CodeScroll
+          id="bundle-file-view"
+          label={`${open} 的文件内容`}
+          header={<span className="truncate font-mono text-caption text-fg">{open}</span>}
+          className="mt-2.5"
+          scrollClassName="max-h-56"
+        >
           {bundle[open]}
         </CodeScroll>
       )}
-      <p className="mt-1.5 text-meta leading-relaxed text-faint">
-        {scriptCount > 0 ? (
-          <>脚本会在智能体调用技能时执行；{reviewCopy}点开文件名可逐个查看内容。</>
-        ) : (
-          '点开文件名可查看每个文件的完整内容。'
-        )}
-      </p>
+      {scriptCount > 0 ? (
+        <p className="oc-callout oc-callout-warning mt-2.5 rounded-lg px-3 py-2 text-meta leading-relaxed text-muted">
+          脚本会在智能体调用技能时执行；{reviewCopy}点开文件名可逐个查看内容。
+        </p>
+      ) : (
+        <p className="mt-2 text-meta leading-relaxed text-faint">
+          点开文件名可查看每个文件的完整内容。
+        </p>
+      )}
     </Section>
   )
 }
@@ -879,22 +933,22 @@ export function DetailModal({
 
           {/* ① 身份与信任 + 真实使用信号:驱动「装不装」的东西必须紧贴标题,不能压在长介绍之后。
               色彩预算按语义分配:身份/信任 success、分类 info、标签与统计一律 neutral。 */}
-          <div className="flex flex-col gap-1.5 rounded-md border border-border p-3">
+          <div className="oc-surface-card flex flex-col gap-2 rounded-xl p-3.5">
             <div className="flex flex-wrap items-center gap-1.5">
               {isPreset && (
                 <Badge tone="success">
-                  <ShieldCheck size={12} aria-hidden="true" />
+                  <ShieldCheck size={12} strokeWidth={1.9} aria-hidden="true" />
                   平台预设 · 开箱即用
                 </Badge>
               )}
               {isPreinstalledConnector ? (
                 <Badge tone="success">
-                  <ShieldCheck size={12} aria-hidden="true" />
+                  <ShieldCheck size={12} strokeWidth={1.9} aria-hidden="true" />
                   官方插件 · 已预装
                 </Badge>
               ) : detail.official ? (
                 <Badge tone="success">
-                  <ShieldCheck size={12} aria-hidden="true" />
+                  <ShieldCheck size={12} strokeWidth={1.9} aria-hidden="true" />
                   官方
                 </Badge>
               ) : null}
@@ -907,13 +961,13 @@ export function DetailModal({
                   tabIndex={0}
                   className="outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
-                  <ShieldCheck size={12} aria-hidden="true" />
+                  <ShieldCheck size={12} strokeWidth={1.9} aria-hidden="true" />
                   {reviewBadgeLabel(detail.reviewSource)}
                 </Badge>
               </Tooltip>
               {isMarketplaceCategoryId(detail.category) && (
                 <Badge tone="info">
-                  <Layers size={12} aria-hidden="true" />{' '}
+                  <Layers size={12} strokeWidth={1.9} aria-hidden="true" />{' '}
                   {marketplaceCategoryLabel(detail.category)}
                 </Badge>
               )}
@@ -925,42 +979,49 @@ export function DetailModal({
               {/* 真实使用信号(旧后端缺字段则整枚不渲染,优雅降级)。使用 > 安装,故
                   优先呈现「近30天真的在用」的强信号,安装数作为弱信号如实标注为「已安装」。 */}
               {(detail.usage30d ?? 0) > 0 && (
-                <Badge tone="neutral">
-                  <Activity size={12} aria-hidden="true" /> 30天{' '}
+                <Badge tone="neutral" className="tabular-nums">
+                  <Activity size={12} strokeWidth={1.9} aria-hidden="true" /> 30天{' '}
                   {formatInstallCount(detail.usage30d)} 次使用
                 </Badge>
               )}
               {(detail.users30d ?? 0) > 0 && (
-                <Badge tone="neutral">
-                  <Users size={12} aria-hidden="true" /> 30天 {formatInstallCount(detail.users30d)}{' '}
-                  人在用
+                <Badge tone="neutral" className="tabular-nums">
+                  <Users size={12} strokeWidth={1.9} aria-hidden="true" /> 30天{' '}
+                  {formatInstallCount(detail.users30d)} 人在用
                 </Badge>
               )}
-              <Badge tone="neutral">
-                <Download size={12} aria-hidden="true" /> 已安装 {detail.installCount}
+              <Badge tone="neutral" className="tabular-nums">
+                <Download size={12} strokeWidth={1.9} aria-hidden="true" /> 已安装{' '}
+                {detail.installCount}
               </Badge>
               {/* 评分:服务端已保证样本≥5 才非 null(前端不做二次阈值),不做背书式好评率大字。 */}
               {detail.rating && (
                 <Badge
                   tone="neutral"
+                  className="tabular-nums"
                   aria-label={`好评 ${detail.rating.up}，共 ${ratingTotal} 次反馈`}
                 >
-                  <ThumbsUp size={12} aria-hidden="true" /> {detail.rating.up}/{ratingTotal}
+                  <ThumbsUp size={12} strokeWidth={1.9} aria-hidden="true" /> {detail.rating.up}/
+                  {ratingTotal}
                 </Badge>
               )}
-              {bench && <Badge tone="info">{bench.label}</Badge>}
+              {bench && (
+                <Badge tone="info" className="tabular-nums">
+                  {bench.label}
+                </Badge>
+              )}
             </div>
             {/* 免责与出处落地成明文注脚 —— 详情页正是用户最容易把自报数据当平台背书的地方。
                 评分 / 实测的 title 已删:同一句话就在这里,不必再藏一份只有鼠标能看的。 */}
-            <div className="flex flex-col gap-0.5">
+            <div className="flex flex-col gap-0.5 border-t border-border/70 pt-2">
               <p className="text-meta text-faint">
                 {reviewBadgeLabel(detail.reviewSource)}：{scriptReviewCopy(detail.reviewSource)}
               </p>
               {detail.rating && (
-                <p className="text-meta text-faint">来自 {ratingTotal} 次使用反馈</p>
+                <p className="text-meta tabular-nums text-faint">来自 {ratingTotal} 次使用反馈</p>
               )}
               {bench && detail.benchmark && (
-                <p className="text-meta text-faint">
+                <p className="text-meta tabular-nums text-faint">
                   实测 {detail.benchmark.cases} 个用例，由发布者提供、未经平台验证
                 </p>
               )}
@@ -1017,21 +1078,23 @@ export function DetailModal({
             </Section>
           ) : detail.kind === 'connector' ? (
             <Section>
-              <SectionTitle className="mb-1.5">插件 · 平台已签安全范围</SectionTitle>
+              <SectionTitle icon={ShieldCheck} className="mb-2">
+                插件 · 平台已签安全范围
+              </SectionTitle>
               <div
                 className={cn(
                   cardVariants({ padding: 'sm', tone: 'sunken' }),
-                  'flex flex-col gap-2',
+                  'flex flex-col gap-2.5 rounded-xl p-3.5',
                 )}
               >
                 {detail.connectorContract ? (
                   <>
                     {/* authMode 枚举与动作 id 是开发者词汇,翻成人话再给用户(K-19);
                         原始值仍在下方「发布者提交的技术声明」里,想核对的人能找到。 */}
-                    <div className="text-body text-fg">
+                    <div className="text-body font-medium text-fg">
                       认证方式：{connectorAuthModeLabel(detail.connectorContract.authMode)}
                     </div>
-                    <div className="flex flex-wrap gap-1">
+                    <div className="flex flex-wrap gap-1.5">
                       {detail.connectorContract.actions.map((a) => (
                         <Badge key={a.id} tone={a.effect === 'read' ? 'neutral' : 'warning'}>
                           {connectorActionLabel(a.id)} · {connectorActionEffectLabel(a.effect)}
@@ -1055,7 +1118,12 @@ export function DetailModal({
                   <summary className="cursor-pointer rounded-md text-meta text-faint outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2">
                     查看发布者提交的技术声明
                   </summary>
-                  <CodeScroll label="发布者提交的技术声明" className="mt-2 max-h-72">
+                  <CodeScroll
+                    label="发布者提交的技术声明"
+                    header="ConnectorSpec 原文"
+                    className="mt-2"
+                    scrollClassName="max-h-72"
+                  >
                     {detail.rawArtifact}
                   </CodeScroll>
                 </details>
@@ -1065,19 +1133,13 @@ export function DetailModal({
             // 技能 SKILL.md 原文归模型、非人向 —— 默认折叠进「技术详情」,想看的人点开;
             // 但发布者一句商品介绍都没写时,不能让用户对着空白弹层做决定 → 默认展开原文。
             <Section>
-              <details
-                open={!hasStorefront}
-                className={cn(cardVariants({ tone: 'sunken' }), 'overflow-hidden')}
-              >
-                <summary className="cursor-pointer select-none rounded-md px-3 py-2 text-section font-semibold text-fg outline-none hover:text-accent focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-3">
+              <details open={!hasStorefront} className="oc-code-shell">
+                <summary className="oc-code-shell-header cursor-pointer select-none px-3.5 py-2.5 text-section font-semibold text-fg outline-none hover:text-accent focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-3">
                   {hasStorefront
                     ? '技术详情（SKILL.md 原文）'
                     : '技能说明（发布者未填写商品介绍，以下为原文）'}
                 </summary>
-                <CodeScroll
-                  label="SKILL.md 原文"
-                  className="max-h-72 rounded-none border-x-0 border-b-0"
-                >
+                <CodeScroll embedded label="SKILL.md 原文" className="max-h-72">
                   {detail.rawArtifact}
                 </CodeScroll>
               </details>

@@ -15,7 +15,7 @@ export function Field({
     <div className="flex flex-col gap-1.5">
       <label className="text-body font-medium text-fg">{label}</label>
       {children}
-      {hint && <p className="text-[11.5px] leading-snug text-faint">{hint}</p>}
+      {hint && <p className="text-caption leading-snug text-faint">{hint}</p>}
     </div>
   );
 }
@@ -28,7 +28,7 @@ export const NativeSelect = forwardRef<
   <select
     ref={ref}
     className={cn(
-      "h-10 w-full rounded-lg border border-border bg-surface px-3 text-base md:text-sm text-fg outline-none transition-[border-color,box-shadow] duration-150 ease-standard focus:border-accent focus:ring-2 focus:ring-ring disabled:opacity-50",
+      "oc-field-control h-10 w-full rounded-lg border border-border px-3 text-base md:text-sm text-fg outline-none disabled:opacity-50",
       className,
     )}
     {...props}
@@ -39,7 +39,7 @@ NativeSelect.displayName = "NativeSelect";
 /** 分步操作指引(建 Telegram/群机器人/智能机器人 通道时的前置说明)。 */
 export function StepHint({ steps }: { steps: ReactNode[] }) {
   return (
-    <ol className="space-y-1 rounded-lg bg-hover px-4 py-3 text-[12px] leading-relaxed text-muted">
+    <ol className="oc-callout oc-callout-info space-y-1.5 rounded-xl py-3 pl-7 pr-4 text-meta leading-relaxed text-muted">
       {steps.map((s, i) => (
         // biome-ignore lint/suspicious/noArrayIndexKey: 静态步骤文案,顺序稳定
         <li key={i} className="list-decimal">

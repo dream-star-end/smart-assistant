@@ -167,7 +167,7 @@ function UsageLine({ usage, rates, label }: { usage?: SkillRunUsage; rates: Mode
   if (!usage || usage.turns === 0) return null;
   const credits = rates ? creditsForUsage(usage, rates) : null;
   return (
-    <p className="text-meta text-muted">
+    <p className="text-meta tabular-nums text-muted">
       {label ?? "本次消耗"}：输入 {usage.inputTokens.toLocaleString()} / 输出{" "}
       {usage.outputTokens.toLocaleString()} tokens（{usage.turns} 轮）
       {credits !== null && (
@@ -455,9 +455,12 @@ export function SkillEvalSection({
           还没有用例时整条不出现(OCV5-362):改前是「0/5 + 加用例 + 灰掉的保存用例 + 灰掉的运行评测」
           压在空态上方,两颗点不了的按钮比空态本身还显眼。空态自己给「AI 生成 / 手动添加」两个出口。 */}
       {cases.length > 0 && (
-      <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-        <div className="flex items-center gap-1.5">
-          <span className="text-meta font-medium text-muted">评测用例</span>
+      <div className="oc-surface-recessed flex flex-col gap-2 rounded-xl px-3 py-2 md:flex-row md:items-center md:justify-between">
+        <div className="flex items-center gap-2">
+          <span className="oc-icon-badge oc-icon-badge-accent size-7 rounded-lg" aria-hidden="true">
+            <FlaskConical size={13} strokeWidth={1.85} />
+          </span>
+          <span className="text-meta font-semibold text-fg">评测用例</span>
           <Badge tone="neutral" size="sm">
             {cases.length}/5
           </Badge>
@@ -512,11 +515,15 @@ export function SkillEvalSection({
 
       {/* 生成中进度(禁用运行评测与再次生成期间的可见反馈)。 */}
       {generating && (
-        <Card tone="sunken" padding="sm" aria-live="polite" aria-atomic="true">
+        <div
+          className="oc-callout oc-callout-info rounded-xl px-3.5 py-2.5"
+          aria-live="polite"
+          aria-atomic="true"
+        >
           <p className="flex items-center gap-2 text-body text-muted">
             <Spinner size={14} /> AI 正在起草评测用例…（约一个对话轮次，请稍候）
           </p>
-        </Card>
+        </div>
       )}
       {cases.length === 0 ? (
         <EmptyState
@@ -550,12 +557,18 @@ export function SkillEvalSection({
           }
         />
       ) : (
-        <ul className="flex flex-col gap-2">
+        <ul className="flex flex-col gap-2.5">
           {cases.map((c, i) => (
             // biome-ignore lint/suspicious/noArrayIndexKey: 用例可增删且 id 可为空,下标是此处唯一稳定键
             <li key={i}>
-              <Card tone="sunken" padding="sm" className="flex flex-col gap-2">
+              <Card padding="sm" className="flex flex-col gap-2.5">
                 <div className="flex items-center gap-2">
+                  <span
+                    aria-hidden="true"
+                    className="oc-icon-badge size-6 rounded-md text-caption font-semibold tabular-nums"
+                  >
+                    {i + 1}
+                  </span>
                   <Input
                     value={c.id}
                     disabled={!writable}
@@ -620,19 +633,19 @@ export function SkillEvalSection({
 
       {/* 运行进度 / 结果 */}
       {run && (
-        <Card tone="sunken" padding="sm" className="flex flex-col gap-2">
+        <Card padding="sm" className="flex flex-col gap-2.5">
           {running ? (
-            <div className="flex flex-col gap-1.5" aria-live="polite" aria-atomic="true">
+            <div className="flex flex-col gap-2" aria-live="polite" aria-atomic="true">
               <Progress
                 value={runPct}
                 size="sm"
                 aria-label="评测进度"
                 aria-valuetext={`${run.progress.done} / ${run.progress.total} 组`}
               />
-              <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-body text-muted">
+              <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-body tabular-nums text-muted">
                 <Spinner size={14} />
                 {run.status === "grading" ? "评分中" : "评测中"}（{run.progress.done}/{run.progress.total} 组）…
-                <span className="text-meta text-muted">本次运行不可中止</span>
+                <span className="text-meta text-faint">本次运行不可中止</span>
               </p>
             </div>
           ) : run.status === "failed" ? (
@@ -648,15 +661,20 @@ export function SkillEvalSection({
 
       {/* 上次结果(无进行中 run 时) */}
       {!run && lastRun?.benchmark && (
-        <Card tone="sunken" padding="sm" className="flex flex-col gap-1">
-          <p className="text-body font-medium text-fg">上次评测：{lastRun.benchmark.verdict}</p>
+        <Card padding="sm" className="flex flex-col gap-1.5">
+          <div className="flex items-center gap-2">
+            <span className="oc-icon-badge oc-icon-badge-success size-6 rounded-md" aria-hidden="true">
+              <Check size={13} strokeWidth={2} />
+            </span>
+            <p className="text-body font-medium text-fg">上次评测：{lastRun.benchmark.verdict}</p>
+          </div>
           <UsageLine usage={lastRun.usage} rates={rates} label="上次消耗" />
         </Card>
       )}
 
       {/* P3:自动回归 opt-in(每日持续扣费,故 label 必须写清代价) */}
       {writable && cases.length > 0 && (
-        <Card tone="sunken" padding="sm" className="flex items-start gap-3">
+        <Card padding="sm" className="flex items-start gap-3">
           <Switch
             id={autoId}
             checked={autoRegression}
@@ -665,7 +683,7 @@ export function SkillEvalSection({
           />
           <label htmlFor={autoId} className="min-w-0 flex-1 cursor-pointer">
             <span className="block text-body font-medium text-fg">每日自动回归</span>
-            <span className="block text-meta text-muted">
+            <span className="block text-meta tabular-nums text-muted">
               每天约消耗 {perDay}，通过率下降时推送提醒；默认关闭。
             </span>
           </label>
@@ -698,39 +716,42 @@ function EvalResultView({ run, rates }: { run: SkillEvalRun; rates: ModelRates |
           </Badge>
         )}
       </div>
-      <ul className="flex flex-col gap-1">
+      <ul className="oc-surface-recessed flex flex-col divide-y divide-border overflow-hidden rounded-xl">
         {run.cases.map((c) => {
           const rs = run.results.filter((r) => r.caseId === c.id);
           const open = openCase === c.id;
           const panelId = `${idBase}-case-${c.id}`;
           return (
-            <li key={c.id} className="rounded-md border border-border">
+            <li key={c.id}>
               <button
                 type="button"
                 onClick={() => setOpenCase(open ? null : c.id)}
                 aria-expanded={open}
                 // 用例详情只在展开时挂载:收起态不留悬空 IDREF(t-762 manage#2)。
                 aria-controls={open ? panelId : undefined}
-                className="flex w-full items-center gap-1.5 rounded-md px-2.5 py-1.5 text-left text-meta text-muted outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+                className="flex w-full items-center gap-2 px-3 py-2 text-left text-meta text-muted outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11"
               >
-                <ChevronRight size={13} className={cn("shrink-0 transition-transform", open && "rotate-90")} />
-                <span className="min-w-0 flex-1 truncate font-mono">{c.id}</span>
+                <ChevronRight
+                  size={13}
+                  className={cn("shrink-0 text-faint transition-transform duration-150", open && "rotate-90 text-fg")}
+                />
+                <span className="min-w-0 flex-1 truncate font-mono text-fg">{c.id}</span>
                 {rs.map((r) => (
-                  <span key={r.arm} className="shrink-0 text-caption text-muted">
+                  <span key={r.arm} className="shrink-0 text-caption tabular-nums text-muted">
                     {ARM_LABEL[r.arm]}{" "}
                     {r.error ? "出错" : `${r.assertions.filter((a) => a.passed).length}/${r.assertions.length}`}
                   </span>
                 ))}
               </button>
               {open && (
-                <div id={panelId} className="border-t border-border px-2.5 py-2 text-meta">
+                <div id={panelId} className="border-t border-border bg-surface/70 px-3 py-2.5 text-meta">
                   {rs.map((r) => (
-                    <div key={r.arm} className="mb-2">
-                      <p className="mb-0.5 font-medium text-fg">{ARM_LABEL[r.arm]}</p>
+                    <div key={r.arm} className="mb-2 last:mb-0">
+                      <p className="mb-1 font-medium text-fg">{ARM_LABEL[r.arm]}</p>
                       {r.error ? (
                         <p className="text-danger">{r.error}</p>
                       ) : (
-                        <ul className="flex flex-col gap-0.5">
+                        <ul className="flex flex-col gap-1">
                           {r.assertions.map((a, i) => (
                             // biome-ignore lint/suspicious/noArrayIndexKey: 断言无稳定 id,顺序即身份
                             <li key={i} className="flex items-start gap-1.5">
@@ -783,10 +804,10 @@ function PhaseSteps({ phase }: { phase: string }) {
         <li
           key={p}
           className={cn(
-            "size-1.5 rounded-full",
-            idx >= 0 && i < idx && "bg-accent",
-            idx >= 0 && i === idx && "animate-pulse bg-accent",
-            (idx < 0 || i > idx) && "bg-border-strong",
+            "h-1.5 rounded-full transition-all duration-200",
+            idx >= 0 && i < idx && "w-2.5 bg-accent",
+            idx >= 0 && i === idx && "w-4 animate-pulse bg-accent",
+            (idx < 0 || i > idx) && "w-1.5 bg-border-strong",
           )}
         />
       ))}
@@ -944,35 +965,46 @@ export function SkillTrainSection({
               {mergedNotice}
             </Alert>
           )}
-          <div className="flex flex-col items-start gap-3 md:flex-row md:items-start md:justify-between">
-            <p className="text-meta leading-relaxed text-muted">
-              AI 复盘你近期的真实使用，起草这个技能的改进；草稿先过评测门（草稿 vs 现版实测），
-              再由你决定是否合并 —— 技能库永远不会被自动改动。
-            </p>
+          <Card padding="md" className="flex flex-col items-start gap-3.5 md:flex-row md:items-center md:justify-between">
+            <div className="flex min-w-0 items-start gap-3">
+              <span className="oc-icon-badge oc-icon-badge-accent mt-0.5 size-9 rounded-lg" aria-hidden="true">
+                <GraduationCap size={17} strokeWidth={1.8} />
+              </span>
+              <p className="text-meta leading-relaxed text-muted">
+                AI 复盘你近期的真实使用，起草这个技能的改进；草稿先过评测门（草稿 vs 现版实测），
+                再由你决定是否合并 —— 技能库永远不会被自动改动。
+              </p>
+            </div>
             <Button variant="primary" size="sm" onClick={start} className="shrink-0 max-md:w-full">
               <GraduationCap size={14} /> 训练优化
             </Button>
-          </div>
+          </Card>
         </>
       )}
 
       {run && (
-        <Card tone="sunken" padding="sm" className="flex flex-col gap-2">
+        <Card padding="md" className="flex flex-col gap-2.5">
           <div className="flex flex-wrap items-center gap-2" aria-live="polite" aria-atomic="true">
             {isActive(run) ? (
-              <Spinner size={14} />
+              <span className="oc-icon-badge oc-icon-badge-accent size-7 rounded-lg" aria-hidden="true">
+                <Spinner size={14} />
+              </span>
             ) : run.status === "failed" ? (
-              <X size={14} className="shrink-0 text-danger" />
+              <span className="oc-icon-badge oc-icon-badge-danger size-7 rounded-lg" aria-hidden="true">
+                <X size={14} />
+              </span>
             ) : (
-              <Check size={14} className="shrink-0 text-success" />
+              <span className="oc-icon-badge oc-icon-badge-success size-7 rounded-lg" aria-hidden="true">
+                <Check size={14} />
+              </span>
             )}
-            <span className="text-body font-medium text-fg">
+            <span className="text-body font-medium tabular-nums text-fg">
               {PHASE_LABEL[run.phase] ?? run.phase}
               {isActive(run) && `（已 ${run.toolCalls} 步）`}
             </span>
             <PhaseSteps phase={run.phase} />
             {isActive(run) && (
-              <span className="text-meta text-muted">
+              <span className="text-meta tabular-nums text-muted">
                 已运行 {fmtElapsed(Date.now() - run.startedAt)} · 不可中止
               </span>
             )}
@@ -1081,16 +1113,16 @@ function DraftDiff({ current, draft }: { current: string; draft: string }) {
   if (!lines || !groups) {
     // 体量超预算:退回并排原文(md+ 左右两栏),仍然默认展开、仍然一屏可比。
     return (
-      <div className="grid gap-2 md:grid-cols-2">
-        <div className="flex min-w-0 flex-col gap-1">
-          <span className="text-caption font-medium text-muted">现版</span>
-          <pre className="whitespace-pre-wrap break-words rounded-md bg-code px-2.5 py-2 font-mono text-meta text-muted">
+      <div className="grid gap-2.5 md:grid-cols-2">
+        <div className="oc-code-shell flex min-w-0 flex-col">
+          <div className="oc-code-shell-header px-3 py-1.5 text-caption font-medium text-muted">现版</div>
+          <pre className="whitespace-pre-wrap break-words bg-code px-3 py-2.5 font-mono text-meta text-muted">
             {current || "（空）"}
           </pre>
         </div>
-        <div className="flex min-w-0 flex-col gap-1">
-          <span className="text-caption font-medium text-muted">草稿</span>
-          <pre className="whitespace-pre-wrap break-words rounded-md bg-code px-2.5 py-2 font-mono text-meta text-fg">
+        <div className="oc-code-shell flex min-w-0 flex-col">
+          <div className="oc-code-shell-header px-3 py-1.5 text-caption font-medium text-fg">草稿</div>
+          <pre className="whitespace-pre-wrap break-words bg-code px-3 py-2.5 font-mono text-meta text-fg">
             {draft || "（空）"}
           </pre>
         </div>
@@ -1102,17 +1134,20 @@ function DraftDiff({ current, draft }: { current: string; draft: string }) {
   const removed = lines.filter((l) => l.type === "del").length;
 
   return (
-    <div className="flex flex-col gap-1.5">
-      <div className="flex flex-wrap items-center gap-1.5">
-        <Badge tone="success" size="sm">
-          +{added} 行
-        </Badge>
-        <Badge tone="danger" size="sm">
-          -{removed} 行
-        </Badge>
-        {added === 0 && removed === 0 && <span className="text-caption text-muted">正文没有变化</span>}
+    <div className="oc-code-shell flex flex-col">
+      <div className="oc-code-shell-header flex flex-wrap items-center justify-between gap-2 px-3 py-2">
+        <span className="text-caption font-medium text-muted">行级变更</span>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <Badge tone="success" size="sm">
+            +{added} 行
+          </Badge>
+          <Badge tone="danger" size="sm">
+            -{removed} 行
+          </Badge>
+          {added === 0 && removed === 0 && <span className="text-caption text-muted">正文没有变化</span>}
+        </div>
       </div>
-      <div className="overflow-hidden rounded-md bg-code py-1 font-mono text-meta leading-relaxed">
+      <div className="overflow-hidden bg-code py-1 font-mono text-meta leading-relaxed">
         {groups.map((g, gi) =>
           g.same && g.lines.length > CONTEXT_FOLD_MIN && !expanded.has(gi) ? (
             <button
@@ -1126,7 +1161,7 @@ function DraftDiff({ current, draft }: { current: string; draft: string }) {
                   return next;
                 })
               }
-              className="block w-full px-2.5 py-1 text-left text-caption text-accent outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+              className="oc-surface-recessed my-0.5 block w-full border-x-0 px-3 py-1 text-left text-caption tabular-nums text-accent outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11"
             >
               … {g.lines.length} 行未变更（点击展开）
             </button>
@@ -1136,9 +1171,9 @@ function DraftDiff({ current, draft }: { current: string; draft: string }) {
                 // biome-ignore lint/suspicious/noArrayIndexKey: diff 行无稳定 id,位置即身份
                 key={`${gi}-${li}`}
                 className={cn(
-                  "whitespace-pre-wrap break-words px-2.5",
-                  l.type === "add" && "bg-success-soft text-success",
-                  l.type === "del" && "bg-danger-soft text-danger",
+                  "whitespace-pre-wrap break-words px-3",
+                  l.type === "add" && "oc-callout-success border-0 text-success",
+                  l.type === "del" && "oc-callout-danger border-0 text-danger",
                   l.type === "same" && "text-muted",
                 )}
               >
@@ -1332,9 +1367,11 @@ function TrainDraftView({
           {err}
         </Alert>
       )}
-      <div className="flex flex-wrap items-center gap-1.5">
-        <FlaskConical size={14} className="shrink-0 text-accent" />
-        <span className="text-body font-medium text-fg">草稿：{d.record.name}</span>
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="oc-icon-badge oc-icon-badge-accent size-7 rounded-lg" aria-hidden="true">
+          <FlaskConical size={13} strokeWidth={1.85} />
+        </span>
+        <span className="text-body font-semibold text-fg">草稿：{d.record.name}</span>
         <Badge tone="accent">{OP_LABEL[d.record.op] ?? d.record.op}</Badge>
         {drafts.length > 1 && <Badge tone="neutral">共 {drafts.length} 份草稿</Badge>}
         {d.evalsJson && <Badge tone="info">附带评测用例</Badge>}
@@ -1365,7 +1402,11 @@ function TrainDraftView({
         />
       )}
 
-      {d.record.rationale && <p className="text-meta text-muted">理由：{d.record.rationale}</p>}
+      {d.record.rationale && (
+        <p className="oc-callout oc-callout-info rounded-lg px-3 py-2 text-meta text-muted">
+          理由：{d.record.rationale}
+        </p>
+      )}
 
       <div className="flex flex-col gap-1.5">
         <div className="flex flex-wrap items-center gap-2">
@@ -1383,9 +1424,12 @@ function TrainDraftView({
         ) : detail.current ? (
           showDiff && <DraftDiff current={detail.current.body ?? ""} draft={d.body} />
         ) : (
-          <pre className="whitespace-pre-wrap break-words rounded-md bg-code px-2.5 py-2 font-mono text-meta text-fg">
-            {d.body}
-          </pre>
+          <div className="oc-code-shell flex flex-col">
+            <div className="oc-code-shell-header px-3 py-1.5 font-mono text-caption text-muted">SKILL.md</div>
+            <pre className="whitespace-pre-wrap break-words bg-code px-3 py-2.5 font-mono text-meta text-fg">
+              {d.body}
+            </pre>
+          </div>
         )}
       </div>
 

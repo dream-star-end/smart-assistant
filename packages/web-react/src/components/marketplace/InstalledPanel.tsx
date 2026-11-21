@@ -55,8 +55,11 @@ const UNINSTALL_REASON_OPTIONS: Array<{ value: UninstallReason; label: string }>
 function RowMark({ name, slug, revoked }: { name: string; slug: string; revoked?: boolean }) {
   if (revoked)
     return (
-      <span aria-hidden="true" className="flex size-10 shrink-0 items-center justify-center rounded-md bg-warning-soft text-warning">
-        <AlertTriangle size={16} />
+      <span
+        aria-hidden="true"
+        className="oc-icon-badge oc-icon-badge-warning size-10 rounded-lg"
+      >
+        <AlertTriangle size={16} strokeWidth={1.85} />
       </span>
     )
   return <CardMark name={name} category={BUILTIN_PLUGIN_CATEGORY[slug]} />
@@ -124,9 +127,11 @@ function Group({
   children: ReactNode
 }) {
   return (
-    <section className="flex flex-col">
-      <PanelHeader title={title} hint={hint} action={action} />
-      <ul className="flex flex-col gap-2 px-4 pb-4">{children}</ul>
+    <section className="flex flex-col border-t border-border/60 pt-1 first:border-t-0 first:pt-0">
+      <div className="sm:px-2">
+        <PanelHeader title={title} hint={hint} action={action} />
+      </div>
+      <ul className="flex flex-col gap-2.5 px-4 pb-4 sm:px-6">{children}</ul>
     </section>
   )
 }
@@ -318,24 +323,35 @@ export function InstalledPanel({
         <CardRow
           icon={<RowMark name={r.name} slug={r.slug} revoked={revoked} />}
           title={r.name}
+          className={
+            revoked
+              ? 'oc-surface-card-hover border-warning/35'
+              : canUpdate
+                ? 'oc-surface-card-hover border-accent/25'
+                : 'oc-surface-card-hover'
+          }
           meta={
             <>
               {/* 种类不再重复挂徽章:行已经按「智能体 / 技能 / API 连接插件」分组,左侧图标芯片
                   也按种类配色;徽章位留给需要判断的信号(K-22)。 */}
               {readiness?.badge && <Badge tone={readiness.badge.tone}>{readiness.badge.text}</Badge>}
-              <Badge tone="neutral">v{r.version}</Badge>
+              <Badge tone="neutral" className="tabular-nums">
+                v{r.version}
+              </Badge>
               {canUpdate &&
                 r.latestVersion &&
                 // 休眠技能点不了「更新」,徽章就不能用最强调的 accent 喊「有新版本」而不给出口。
                 (dormant ? (
-                  <Badge tone="neutral">新版本 v{r.latestVersion} · 启用后可更新</Badge>
+                  <Badge tone="neutral" className="tabular-nums">
+                    新版本 v{r.latestVersion} · 启用后可更新
+                  </Badge>
                 ) : (
-                  <Badge tone="accent">
-                    <ArrowUpCircle size={11} aria-hidden="true" /> 新版本 v{r.latestVersion}
+                  <Badge tone="accent" className="tabular-nums">
+                    <ArrowUpCircle size={11} strokeWidth={2} aria-hidden="true" /> 新版本 v{r.latestVersion}
                   </Badge>
                 ))}
               {revoked && <Badge tone="warning">已被下架</Badge>}
-              <span className="text-meta text-faint">
+              <span className="text-meta tabular-nums text-faint">
                 安装于 <TimeAgo value={r.installedAt} />
               </span>
               {/* slug 从描述位挪到 meta 行:它对普通用户不是"描述",只是个可核对的标识。 */}
@@ -398,9 +414,14 @@ export function InstalledPanel({
 
   return (
     <div className="flex flex-col pb-5">
-      <header className="px-4 pb-2 pt-5">
-        <h2 className="text-title font-semibold text-fg">我的能力库</h2>
-        <p className="mt-1 text-meta text-muted">已安装的智能体、技能和插件都在这里。</p>
+      <header className="flex items-center gap-3 px-4 pb-3 pt-5 sm:px-6">
+        <span aria-hidden="true" className="oc-icon-badge oc-icon-badge-accent size-9 rounded-xl">
+          <PackageOpen size={17} strokeWidth={1.85} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <h2 className="text-title font-semibold tracking-tight text-fg">我的能力库</h2>
+          <p className="mt-0.5 text-meta text-muted">已安装的智能体、技能和插件都在这里。</p>
+        </div>
       </header>
       <Modal
         open={pendingUninstall !== null}
@@ -558,9 +579,16 @@ export function InstalledPanel({
                   <CardRow
                     icon={<RowMark name={r.name} slug={r.slug} revoked={r.listingState === 'revoked'} />}
                     title={r.name}
+                    className={
+                      r.listingState === 'revoked'
+                        ? 'oc-surface-card-hover border-warning/35'
+                        : 'oc-surface-card-hover'
+                    }
                     meta={
                       <>
-                        <Badge tone="neutral">v{r.version}</Badge>
+                        <Badge tone="neutral" className="tabular-nums">
+                          v{r.version}
+                        </Badge>
                         {r.listingState === 'revoked' && <Badge tone="warning">已被下架</Badge>}
                         {state && (
                           <StatusPill
@@ -570,7 +598,7 @@ export function InstalledPanel({
                             data-testid="plugin-state"
                           />
                         )}
-                        <span className="text-meta text-faint">
+                        <span className="text-meta tabular-nums text-faint">
                           安装于 <TimeAgo value={r.installedAt} />
                         </span>
                         <span className="font-mono text-caption text-faint">{r.slug}</span>

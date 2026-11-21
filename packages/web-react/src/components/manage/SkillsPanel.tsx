@@ -1,4 +1,4 @@
-import { ChevronRight, MessageSquarePlus, SearchX, Sparkles, Store } from "lucide-react";
+import { ChevronRight, Lock, MessageSquarePlus, SearchX, Sparkles, Store } from "lucide-react";
 import { useCallback, useEffect, useId, useMemo, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
 import { CHAT_CREATE_TEMPLATES } from "../../lib/chatCreateTemplates";
@@ -177,7 +177,12 @@ export function SkillsPanel({
         hint="完成复杂任务后智能体会把流程沉淀成可复用技能；也可从市场安装。"
         action={
           onOpenMarketplace ? (
-            <Button size="sm" variant="ghost" onClick={onOpenMarketplace} className="gap-1.5 px-2.5">
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={onOpenMarketplace}
+              className="oc-btn-tactile gap-1.5 rounded-lg px-2.5 text-muted hover:text-fg"
+            >
               <Store size={14} strokeWidth={1.75} aria-hidden="true" /> 市场
             </Button>
           ) : undefined
@@ -242,7 +247,9 @@ export function SkillsPanel({
             className="flex-nowrap border-b-0 bg-transparent px-4 pb-4 pt-1"
             actions={
               countLabel ? (
-                <span className="whitespace-nowrap text-meta tabular-nums text-faint">{countLabel}</span>
+                <span className="oc-badge-craft inline-flex items-center whitespace-nowrap rounded-full bg-accent-soft px-2.5 py-0.5 text-caption font-medium tabular-nums text-accent">
+                  {countLabel}
+                </span>
               ) : undefined
             }
           />
@@ -319,39 +326,76 @@ function SkillRow({
   // 短标题(第一句,14/500,单行)/ 其余描述(13 灰,桌面单行、窄屏两行)/ 12 号元信息。
   // 改前是两行同色同字重的整句触发描述,282 条连成一面字墙。
   return (
-    <ListRow data-interactive="" className="p-0">
+    <ListRow data-interactive="" className="p-0 transition-colors hover:bg-hover/70">
       <button
         type="button"
         onClick={() => setEditorOpen(true)}
         aria-haspopup="dialog"
         aria-label={`${skill.writable ? "打开" : "查看"} ${display.title}`}
         aria-describedby={descId}
-        className="flex min-h-14 w-full min-w-0 items-center gap-3 px-4 py-3.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        className="group flex min-h-14 w-full min-w-0 items-center gap-3 px-4 py-3.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
       >
+        <span
+          aria-hidden="true"
+          className={cn(
+            "oc-icon-badge size-8 rounded-lg",
+            isHub ? "oc-icon-badge-info" : skill.writable === false ? "" : "oc-icon-badge-accent",
+          )}
+        >
+          {isHub ? (
+            <Store size={14} strokeWidth={1.8} />
+          ) : skill.writable === false ? (
+            <Lock size={14} strokeWidth={1.8} />
+          ) : (
+            <Sparkles size={14} strokeWidth={1.8} />
+          )}
+        </span>
         <span className="min-w-0 flex-1">
-          <span data-skill-title="" className="block truncate text-[14px] font-medium leading-5 text-fg">
+          <span data-skill-title="" className="block truncate text-sm font-medium leading-5 tracking-tight text-fg">
             {display.title}
           </span>
           <span id={descId} className="contents">
           {display.rest && (
-            <span data-skill-desc="" className="mt-0.5 line-clamp-2 text-body leading-[19px] text-muted md:line-clamp-1">
+            <span data-skill-desc="" className="mt-0.5 line-clamp-2 text-body leading-5 text-muted md:line-clamp-1">
               {display.rest}
             </span>
           )}
           <span data-skill-meta="" className={cn(META_CLASS, "mt-1.5 flex-nowrap overflow-hidden whitespace-nowrap")}>
-            <span className="shrink-0">{isHub ? "市场" : "自建"}</span>
-            {skill.writable === false && <span className="shrink-0">只读</span>}
-            <span className="min-w-0 truncate">{scopeLabel}</span>
+            <span className="shrink-0">
+              <span
+                className={cn(
+                  "oc-badge-craft inline-flex items-center rounded-full px-1.5 py-0.5 text-caption font-medium",
+                  isHub ? "bg-info-soft text-info" : "bg-accent-soft text-accent",
+                )}
+              >
+                {isHub ? "市场" : "自建"}
+              </span>
+            </span>
+            {skill.writable === false && (
+              <span className="shrink-0">
+                <span className="oc-badge-craft inline-flex items-center rounded-full bg-hover px-1.5 py-0.5 text-caption text-muted">
+                  只读
+                </span>
+              </span>
+            )}
+            <span className="min-w-0 truncate text-muted">{scopeLabel}</span>
             {tags.length > 0 && (
               <span className="shrink-0">
-                {tags.slice(0, META_TAGS).map((t) => `#${t}`).join(" ")}
-                {tags.length > META_TAGS && ` +${tags.length - META_TAGS}`}
+                <span className="oc-badge-craft inline-flex items-center rounded-full bg-hover px-1.5 py-0.5 text-caption text-muted">
+                  {tags.slice(0, META_TAGS).map((t) => `#${t}`).join(" ")}
+                  {tags.length > META_TAGS && ` +${tags.length - META_TAGS}`}
+                </span>
               </span>
             )}
           </span>
           </span>
         </span>
-        <ChevronRight size={16} strokeWidth={1.75} aria-hidden="true" className="shrink-0 text-faint" />
+        <ChevronRight
+          size={16}
+          strokeWidth={1.75}
+          aria-hidden="true"
+          className="shrink-0 text-faint transition-transform duration-150 group-hover:translate-x-0.5 group-hover:text-fg"
+        />
       </button>
       <SkillEditor
         auth={auth}

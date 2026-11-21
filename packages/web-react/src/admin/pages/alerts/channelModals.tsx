@@ -53,20 +53,20 @@ export function CreateChannelWizard({
   return (
     <Modal open={open} onOpenChange={(o) => (o ? onOpenChange(true) : close())} title={title}>
       {type === null && (
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+        <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
           {TYPE_OPTIONS.map((o) => (
             <button
               key={o.type}
               type="button"
               onClick={() => setType(o.type)}
-              className="flex items-start gap-3 rounded-xl border border-border bg-surface p-3.5 text-left outline-none transition-colors hover:border-border-strong hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+              className="oc-surface-card oc-surface-card-hover flex items-start gap-3 rounded-xl p-3.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
-              <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
-                <o.icon size={18} />
+              <span className="oc-icon-badge oc-icon-badge-accent size-9 shrink-0 rounded-xl">
+                <o.icon size={17} strokeWidth={1.9} />
               </span>
               <span className="min-w-0">
-                <span className="block text-section font-medium text-fg">{o.label}</span>
-                <span className="block text-meta text-faint">{o.desc}</span>
+                <span className="block text-section font-semibold text-fg">{o.label}</span>
+                <span className="mt-0.5 block text-meta text-muted">{o.desc}</span>
               </span>
             </button>
           ))}
@@ -78,7 +78,7 @@ export function CreateChannelWizard({
           <button
             type="button"
             onClick={() => setType(null)}
-            className="inline-flex w-fit items-center gap-1 text-meta text-muted outline-none hover:text-fg focus-visible:underline"
+            className="oc-btn-tactile inline-flex w-fit items-center gap-1 rounded-md px-1.5 py-0.5 text-meta font-medium text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
             <ArrowLeft size={13} /> 换一种通道类型
           </button>
@@ -227,7 +227,7 @@ function SecretChannelForm({
       </Field>
 
       <div className="flex justify-end">
-        <Button variant="primary" onClick={submit} disabled={submitting}>
+        <Button variant="primary" onClick={submit} disabled={submitting} className="oc-btn-tactile">
           {submitting ? "创建中…" : "创建"}
         </Button>
       </div>
@@ -317,28 +317,28 @@ function IlinkBindFlow({ onConfirmed }: { onConfirmed: () => void }) {
   }, []);
 
   return (
-    <div className="flex flex-col items-center gap-3 py-2 text-center">
-      <p className="text-[12.5px] leading-relaxed text-muted">
+    <div className="flex flex-col items-center gap-3.5 py-2 text-center">
+      <div className="oc-callout oc-callout-info w-full rounded-xl px-4 py-2.5 text-left text-meta leading-relaxed text-muted">
         用<strong>已注册该机器人的微信</strong>扫码,确认后请再向机器人发任意一句话以捕获 context_token。
-      </p>
+      </div>
       {phase === "loading" && (
         <div className="flex items-center gap-2 py-8 text-body text-faint">
           <Spinner size={15} /> 正在向 iLink 申请二维码…
         </div>
       )}
       {phase === "error" && (
-        <div className="w-full rounded-lg border border-danger/40 bg-danger-soft px-3 py-2.5 text-meta text-danger">
+        <div className="oc-callout oc-callout-danger w-full rounded-xl px-3.5 py-2.5 text-left text-meta text-danger">
           {errMsg}
         </div>
       )}
       {phase === "ready" && (
         <>
           {imgSrc ? (
-            <div className="rounded-xl border border-border bg-white p-3">
+            <div className="oc-surface-card rounded-2xl bg-white p-3.5">
               <img src={imgSrc} alt="iLink 绑定二维码" width={220} height={220} className="size-[220px] object-contain" />
             </div>
           ) : (
-            <div className="rounded-lg border border-danger/40 bg-danger-soft px-3 py-2.5 text-meta text-danger">
+            <div className="oc-callout oc-callout-danger w-full rounded-xl px-3.5 py-2.5 text-left text-meta text-danger">
               iLink 没返回可渲染的二维码内容
             </div>
           )}
@@ -406,10 +406,10 @@ export function EditChannelModal({
       title={channel ? `编辑通道 #${channel.id} · ${channel.label}` : "编辑通道"}
       footer={
         <>
-          <Button variant="ghost" onClick={() => onOpenChange(false)}>
+          <Button variant="ghost" onClick={() => onOpenChange(false)} className="oc-btn-tactile">
             取消
           </Button>
-          <Button variant="primary" onClick={submit} disabled={submitting}>
+          <Button variant="primary" onClick={submit} disabled={submitting} className="oc-btn-tactile">
             {submitting ? "保存中…" : "保存"}
           </Button>
         </>

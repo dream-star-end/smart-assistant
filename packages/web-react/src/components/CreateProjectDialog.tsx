@@ -138,7 +138,12 @@ export function CreateProjectDialog({
           label={
             <span className="flex items-center justify-between gap-2">
               <span>项目指令（可选）</span>
-              <span className={cn("text-caption font-normal tabular-nums", instructionsOver ? "text-danger" : "text-faint")}>
+              <span
+                className={cn(
+                  "oc-badge-craft rounded-full bg-hover px-2 py-0.5 text-caption font-medium tabular-nums",
+                  instructionsOver ? "text-danger" : "text-faint",
+                )}
+              >
                 {instructions.length} / {INSTRUCTIONS_MAX}
               </span>
             </span>
@@ -170,8 +175,8 @@ export function CreateProjectDialog({
                 addFiles(Array.from(e.dataTransfer.files));
               }}
               className={cn(
-                "flex min-h-16 cursor-pointer items-center justify-center rounded-lg border border-dashed px-3 py-3 text-center text-meta text-muted transition-colors hover:border-border-strong hover:bg-hover",
-                dragOver ? "border-accent bg-accent-soft" : "border-border-control",
+                "oc-surface-recessed flex min-h-16 cursor-pointer items-center justify-center rounded-xl border border-dashed px-4 py-4 text-center text-meta text-muted transition-colors hover:border-border-strong hover:text-fg",
+                dragOver ? "border-accent bg-accent-soft text-accent" : "border-border-control",
               )}
             >
               点击或拖拽文件到这里
@@ -188,11 +193,16 @@ export function CreateProjectDialog({
               }}
             />
             {files.length > 0 && (
-              <ul className="mt-2 flex flex-col gap-1" aria-label="待上传文件">
+              <ul className="mt-2.5 flex flex-col gap-1.5" aria-label="待上传文件">
                 {files.map((f) => (
-                  <li key={`${f.name}:${f.size}`} className="flex items-center gap-2 rounded-md bg-surface px-2 py-1 text-meta">
-                    <FileText size={14} aria-hidden className="shrink-0 text-muted" />
-                    <span className="min-w-0 flex-1 truncate">{f.name}</span>
+                  <li
+                    key={`${f.name}:${f.size}`}
+                    className="oc-surface-card flex items-center gap-2.5 rounded-xl px-3 py-1.5 text-meta"
+                  >
+                    <span className="oc-icon-badge size-6 rounded-md" aria-hidden>
+                      <FileText size={13} />
+                    </span>
+                    <span className="min-w-0 flex-1 truncate font-medium text-fg">{f.name}</span>
                     <IconButton
                       size="sm"
                       aria-label={`移除 ${f.name}`}
@@ -208,7 +218,11 @@ export function CreateProjectDialog({
         </Field>
 
         <Field label="颜色（可选）">
-          <div role="radiogroup" aria-label="项目颜色" className="flex flex-wrap items-center gap-2">
+          <div
+            role="radiogroup"
+            aria-label="项目颜色"
+            className="oc-surface-recessed flex flex-wrap items-center gap-2 rounded-xl p-2.5"
+          >
             <button
               type="button"
               role="radio"
@@ -217,8 +231,8 @@ export function CreateProjectDialog({
               title="无颜色"
               onClick={() => setColor(null)}
               className={cn(
-                "flex size-8 items-center justify-center rounded-full border outline-none transition-shadow focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11",
-                color === null ? "border-accent ring-2 ring-ring" : "border-border-control hover:border-border-strong",
+                "oc-btn-tactile flex size-8 items-center justify-center rounded-full border outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11",
+                color === null ? "border-accent bg-surface ring-2 ring-ring" : "border-border-control hover:border-border-strong",
               )}
             >
               <span className="size-4 rounded-full border border-dashed border-muted bg-surface" />
@@ -233,11 +247,11 @@ export function CreateProjectDialog({
                 title={c.label}
                 onClick={() => setColor(c.key)}
                 className={cn(
-                  "flex size-8 items-center justify-center rounded-full border outline-none transition-shadow focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11",
-                  color === c.key ? "border-accent ring-2 ring-ring" : "border-transparent hover:border-border-strong",
+                  "oc-btn-tactile flex size-8 items-center justify-center rounded-full border outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11",
+                  color === c.key ? "border-accent bg-surface ring-2 ring-ring" : "border-transparent hover:border-border-strong",
                 )}
               >
-                <span className={cn("size-5 rounded-full", c.dotClass)} />
+                <span className={cn("size-5 rounded-full shadow-soft", c.dotClass)} />
               </button>
             ))}
           </div>

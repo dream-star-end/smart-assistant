@@ -193,11 +193,11 @@ function OutputThumb({ asset, visible, compact }: { asset: ProjectAsset; visible
       aria-hidden
       data-testid="output-thumb"
       className={cn(
-        "relative flex shrink-0 items-center justify-center overflow-hidden rounded-md border border-border bg-hover",
+        "oc-icon-badge relative flex shrink-0 items-center justify-center overflow-hidden rounded-lg",
         compact ? "size-9" : "size-11",
       )}
     >
-      <span className="font-mono text-[10px] font-semibold leading-none tracking-wide text-muted">
+      <span className="font-mono text-micro font-semibold leading-none tracking-wide text-muted">
         {extBadgeOf(asset.name)}
       </span>
       {isImage && src && visible && <ImageThumb src={src} />}
@@ -236,13 +236,13 @@ export function OutputRow({
       data-testid="output-row"
       data-output-kind={outputKind(asset)}
       className={cn(
-        "group flex w-full min-w-0 gap-3 text-left outline-none transition-colors duration-100 hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-        compact ? "min-h-11 items-center rounded-md px-2 py-2" : "min-h-12 items-start px-4 py-3",
+        "group flex w-full min-w-0 gap-3 text-left outline-none transition-colors duration-100 hover:bg-hover/70 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+        compact ? "min-h-11 items-center rounded-lg px-2 py-2" : "min-h-12 items-start px-4 py-3",
       )}
     >
       <OutputThumb asset={asset} visible={visible} compact={compact} />
       <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <span className="truncate text-[14px] font-medium leading-5 text-fg" title={asset.name}>
+        <span className="truncate text-body font-medium leading-5 text-fg" title={asset.name}>
           {asset.name}
         </span>
         {snippet && (
@@ -263,15 +263,22 @@ export function OutputRow({
             <span>{OUTPUT_KIND_LABELS[outputKind(asset)]}</span>
           )}
           <TimeAgo value={asset.createdAt} tooltip={false} />
-          {!compact && size && <span>{size}</span>}
-          {versions > 1 && <span data-testid="output-version-badge">v{versions}</span>}
+          {!compact && size && <span className="tabular-nums">{size}</span>}
+          {versions > 1 && (
+            <span
+              data-testid="output-version-badge"
+              className="oc-badge-craft rounded-full bg-accent-soft px-1.5 py-0.5 text-micro font-medium tabular-nums text-accent"
+            >
+              v{versions}
+            </span>
+          )}
         </MetaLine>
       </span>
       <ChevronRight
         size={15}
         strokeWidth={1.75}
         aria-hidden="true"
-        className="shrink-0 self-center text-faint transition-colors group-hover:text-muted"
+        className="shrink-0 self-center text-faint transition-transform duration-150 group-hover:translate-x-0.5 group-hover:text-muted"
       />
     </button>
   );
@@ -539,19 +546,19 @@ function LoadedImagePreview({ asset, onDownload }: { asset: ProjectAsset; onDown
     return <PreviewFallback title="图片加载失败" hint="可以重试，或直接下载。" onDownload={onDownload} onRetry={reload} />;
   }
   return (
-    <div className="flex min-h-0 flex-1 items-center justify-center bg-hover p-3">
+    <div className="oc-surface-recessed flex min-h-0 flex-1 items-center justify-center p-4">
       {objectUrl && status === "loaded" ? (
         <button
           type="button"
           onClick={openZoom}
           aria-label={`放大查看 ${asset.name}`}
-          className="flex max-h-full max-w-full cursor-zoom-in items-center justify-center rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="flex max-h-full max-w-full cursor-zoom-in items-center justify-center rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           <img
             data-testid="output-preview-image"
             src={objectUrl}
             alt={asset.name}
-            className="max-h-[calc(100dvh-14rem)] max-w-full rounded-md object-contain md:max-h-[min(60dvh,32rem)]"
+            className="max-h-[calc(100dvh-14rem)] max-w-full rounded-xl object-contain shadow-pop md:max-h-[min(60dvh,32rem)]"
           />
         </button>
       ) : (

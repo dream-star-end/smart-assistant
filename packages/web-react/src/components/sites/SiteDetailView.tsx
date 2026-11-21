@@ -101,12 +101,12 @@ export function SiteDetailView({
 
   return (
     <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-4 py-6 sm:px-8 sm:py-8">
-      <div className="flex flex-wrap items-center justify-between gap-3">
+      <div className="oc-surface-glass sticky top-3 z-10 flex flex-wrap items-center justify-between gap-3 rounded-2xl px-3.5 py-2.5">
         <Button
           variant="ghost"
           size="sm"
           onClick={onBack}
-          className="-ml-2 gap-1.5 text-muted hover:text-fg"
+          className="gap-1.5 text-muted hover:text-fg"
         >
           <ArrowLeft size={15} aria-hidden="true" />
           站点
@@ -118,7 +118,7 @@ export function SiteDetailView({
               href={visitHref}
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex h-8 items-center gap-1.5 rounded-full border border-border bg-surface px-3.5 text-body font-medium text-fg transition-colors hover:bg-hover"
+              className="oc-btn-secondary-craft oc-btn-tactile inline-flex h-8 items-center gap-1.5 rounded-full px-3.5 text-body font-medium text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               <ExternalLink size={14} aria-hidden="true" />
               访问
@@ -166,36 +166,38 @@ export function SiteDetailView({
         </div>
       ) : site ? (
         <>
-          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:gap-5">
-            <div className="w-32 shrink-0 sm:w-36">
+          <div className="oc-surface-card flex flex-col gap-4 rounded-2xl p-5 sm:flex-row sm:items-center sm:gap-5">
+            <div className="w-32 shrink-0 sm:w-40">
               <SitePreviewThumb site={site} baseDomain={baseDomain} />
             </div>
-            <div className="min-w-0 flex-1 space-y-1.5">
+            <div className="min-w-0 flex-1 space-y-2">
               <div className="flex flex-wrap items-center gap-2">
-                <h1 className="truncate text-2xl font-semibold text-fg sm:text-3xl">
+                <h1 className="truncate text-2xl font-semibold tracking-tight text-fg sm:text-3xl">
                   {site.title}
                 </h1>
                 {site.hasServerApi && (
-                  <span className="rounded-full border border-border bg-bg-subtle px-2.5 py-0.5 text-caption font-medium text-muted">
+                  <span className="oc-badge-craft rounded-full bg-accent-soft px-2.5 py-0.5 text-caption font-medium text-accent">
                     全栈 API
                   </span>
                 )}
                 {accessRole !== "owner" && (
-                  <span className="inline-flex items-center gap-1 rounded-full border border-info/30 bg-info-soft px-2.5 py-0.5 text-caption font-medium text-info">
+                  <span className="oc-badge-craft inline-flex items-center gap-1 rounded-full bg-info-soft px-2.5 py-0.5 text-caption font-medium text-info">
                     <Users size={12} aria-hidden="true" />
                     共享 · {roleLabel(accessRole)}
                   </span>
                 )}
               </div>
-              <p className="flex flex-wrap items-center gap-1.5 truncate text-body text-muted">
-                {site.visibility === "public" ? (
-                  <Globe size={14} aria-hidden="true" />
-                ) : site.visibility === "password" ? (
-                  <Lock size={14} aria-hidden="true" />
-                ) : (
-                  <PauseCircle size={14} aria-hidden="true" />
-                )}
-                <span className="truncate">{activeHost}</span>
+              <p className="flex flex-wrap items-center gap-2 text-body text-muted">
+                <span className="oc-surface-recessed inline-flex max-w-full items-center gap-1.5 rounded-full px-3 py-1 font-mono text-meta text-fg">
+                  {site.visibility === "public" ? (
+                    <Globe size={13} className="shrink-0 text-success" aria-hidden="true" />
+                  ) : site.visibility === "password" ? (
+                    <Lock size={13} className="shrink-0 text-warning" aria-hidden="true" />
+                  ) : (
+                    <PauseCircle size={13} className="shrink-0 text-faint" aria-hidden="true" />
+                  )}
+                  <span className="truncate">{activeHost}</span>
+                </span>
                 {accessRole !== "owner" && site.ownerEmail && (
                   <span className="text-caption text-faint">· 所有者 {site.ownerEmail}</span>
                 )}
@@ -203,7 +205,11 @@ export function SiteDetailView({
             </div>
           </div>
 
-          <div role="tablist" aria-label="站点详情标签页" className="flex flex-wrap items-center gap-2">
+          <div
+            role="tablist"
+            aria-label="站点详情标签页"
+            className="oc-surface-recessed inline-flex w-fit flex-wrap items-center gap-1 rounded-full p-1"
+          >
             {(
               [
                 { id: "settings", label: "设置" },
@@ -221,10 +227,10 @@ export function SiteDetailView({
                   aria-selected={selected}
                   onClick={() => setTab(item.id)}
                   className={cn(
-                    "rounded-full px-4 py-1.5 text-body transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                    "oc-btn-tactile rounded-full px-4 py-1.5 text-body transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring",
                     selected
-                      ? "bg-hover font-medium text-fg"
-                      : "text-muted hover:bg-hover/60 hover:text-fg",
+                      ? "oc-segmented-thumb font-medium text-fg"
+                      : "text-muted hover:text-fg",
                   )}
                 >
                   {item.label}

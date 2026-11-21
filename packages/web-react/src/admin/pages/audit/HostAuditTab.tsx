@@ -1,4 +1,4 @@
-import { RotateCw } from "lucide-react";
+import { AlertTriangle, RotateCw, Server } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Badge, Button, Input, Modal, useToast } from "../../../components/ui";
 import {
@@ -7,10 +7,11 @@ import {
   DataTable,
   FilterBar,
   KeyValue,
+  SectionCard,
   TimeAgo,
 } from "../../components";
 import { adminGet, apiErrorMessage } from "../../lib/adminApi";
-import { FormatJsonValue } from "./diff";
+import { PayloadShell } from "./diff";
 import type { HostAuditResp, HostAuditRow } from "./types";
 
 const PAGE_SIZE = 100;
@@ -23,11 +24,11 @@ function shortHost(hostId: string): string {
   return `${hostId.slice(0, 8)}…`;
 }
 
-/** 主机审计详情：元信息 + 完整 detail JSON。 */
+/** 主机审计详情：元信息 + IDE 级 detail 载荷。 */
 function HostAuditDetail({ row }: { row: HostAuditRow }) {
   return (
     <div className="flex flex-col gap-4">
-      <div className="rounded-lg border border-border bg-surface px-4 py-2">
+      <div className="oc-surface-recessed divide-y divide-border/60 rounded-xl px-4 py-1">
         <KeyValue label="operation" value={<Badge tone="accent">{row.operation}</Badge>} />
         <KeyValue
           label="host"
@@ -57,18 +58,23 @@ function HostAuditDetail({ row }: { row: HostAuditRow }) {
           label="operation_id"
           value={
             row.operationId ? (
-              <span className="font-mono text-meta break-all">{row.operationId}</span>
+              <CopyChip value={row.operationId} />
             ) : (
               <span className="text-faint">—</span>
             )
           }
         />
-        <KeyValue label="时间" value={<TimeAgo value={row.ts} />} />
+        <KeyValue
+          label="时间"
+          value={
+            <span className="tabular-nums">
+              <TimeAgo value={row.ts} />
+            </span>
+          }
+        />
       </div>
-      <div>
-        <p className="mb-1.5 text-meta font-medium text-faint">detail</p>
-        <FormatJsonValue value={row.detail} />
-      </div>
+
+      <PayloadShell title="detail" value={row.detail} />
     </div>
   );
 }
@@ -169,6 +175,7 @@ export function HostAuditTab() {
     {
       key: "ts",
       title: "时间",
+      cellClassName: "tabular-nums",
       render: (r) => <TimeAgo value={r.ts} />,
     },
     {
@@ -189,7 +196,7 @@ export function HostAuditTab() {
     {
       key: "actor",
       title: "actor",
-      cellClassName: "font-mono text-[12px] text-muted",
+      cellClassName: "font-mono text-meta text-muted",
       render: (r) => <span className="break-all">{r.actor}</span>,
     },
     {
@@ -217,15 +224,16 @@ export function HostAuditTab() {
   ];
 
   return (
-    <div className="flex flex-col gap-3">
+    <div className="flex flex-col gap-4">
       <FilterBar>
         <Input
           value={dHost}
           onChange={(e) => setDHost(e.target.value)}
           onKeyDown={onKey}
           placeholder="host_id（UUID）"
-          className="h-9 w-full sm:w-80"
+          className="h-9 w-full font-mono sm:w-80"
           aria-label="host_id 过滤"
+          aria-invalid={invalid || undefined}
         />
         <Button variant="primary" size="sm" onClick={apply}>
           查询
@@ -239,31 +247,72 @@ export function HostAuditTab() {
           onClick={() => setReloadTick((t) => t + 1)}
           title="刷新"
           aria-label="刷新"
+          className="oc-icon-btn-tactile"
         >
-          <RotateCw size={15} />
+          <RotateCw size={15} className={loading ? "animate-spin" : undefined} />
         </Button>
       </FilterBar>
 
-      {invalid && <p className="text-sm text-warning">host_id 需为 UUID 格式。</p>}
-      {error && <p className="text-sm text-danger">加载失败：{apiErrorMessage(error, "加载失败")}</p>}
-
-      <DataTable
-        columns={columns}
-        rows={rows}
-        rowKey={(r) => String(r.id)}
-        loading={loading}
-        onRowClick={(r) => setSelected(r)}
-        emptyTitle="暂无主机审计记录"
-        emptyHint="调整过滤条件或稍后再试。"
-      />
-
-      {cursor && (
-        <div className="flex justify-center py-1">
-          <Button variant="secondary" size="sm" onClick={loadMore} disabled={loadingMore}>
-            {loadingMore ? "加载中…" : "加载更多"}
-          </Button>
+      {invalid && (
+        <div
+          role="alert"
+          className="oc-callout oc-callout-warning flex items-start gap-3 rounded-xl px-4 py-3 text-body"
+        >
+          <span className="oc-icon-badge oc-icon-badge-warning mt-0.5 size-7 rounded-lg">
+            <AlertTriangle size={14} />
+          </span>
+          <p className="min-w-0 flex-1 text-warning">host_id 需为 UUID 格式。</p>
         </div>
       )}
+
+      {error && (
+        <div
+          role="alert"
+          className="oc-callout oc-callout-danger flex items-start gap-3 rounded-xl px-4 py-3 text-body"
+        >
+          <span className="oc-icon-badge oc-icon-badge-danger mt-0.5 size-7 rounded-lg">
+            <AlertTriangle size={14} />
+          </span>
+          <p className="min-w-0 flex-1 text-danger">
+            加载失败：{apiErrorMessage(error, "加载失败")}
+          </p>
+        </div>
+      )}
+
+      <SectionCard
+        title="主机操作审计"
+        hint="compute_host_audit 全量操作流，点击任意行查看完整 detail 载荷"
+        icon={Server}
+        iconTone="info"
+        action={
+          !loading && (
+            <span className="oc-badge-craft rounded-full bg-hover px-2.5 py-0.5 font-mono text-caption text-muted tabular-nums">
+              已加载 {rows.length.toLocaleString("zh-CN")} 条
+            </span>
+          )
+        }
+        bodyClassName="p-0"
+      >
+        <DataTable
+          columns={columns}
+          rows={rows}
+          rowKey={(r) => String(r.id)}
+          loading={loading}
+          onRowClick={(r) => setSelected(r)}
+          emptyTitle="暂无主机审计记录"
+          emptyHint="调整过滤条件或稍后再试。"
+          className="rounded-none border-0 shadow-none"
+          footer={
+            cursor ? (
+              <div className="flex justify-center">
+                <Button variant="secondary" size="sm" onClick={loadMore} disabled={loadingMore}>
+                  {loadingMore ? "加载中…" : "加载更多"}
+                </Button>
+              </div>
+            ) : undefined
+          }
+        />
+      </SectionCard>
 
       <Modal
         open={selected !== null}

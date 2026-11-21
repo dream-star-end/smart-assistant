@@ -669,29 +669,31 @@ export function Sidebar({
   // 商业化营销文案出现在不计费的部署形态里（S-14）。改为有邮箱显邮箱、没有就不占这一行；
   // 最小改动、可回退、不引入新的能力开关判断，计费形态下仍显示余额。
   const email = user?.email?.trim() || null;
-  const accountSubtitle = credits != null ? null : email;
+  const displayName = user?.displayName?.trim() || "未登录";
+  const showSecondaryEmail = Boolean(email && email.toLowerCase() !== displayName.toLowerCase());
+  const accountSubtitle = credits != null ? null : showSecondaryEmail ? email : null;
   const userChip = (
     <button
       type="button"
       data-product-feature={PRODUCT_CAPABILITIES.billing.id}
       disabled={!hasAccountMenu}
       aria-label={hasAccountMenu ? "账号菜单" : undefined}
-      className="oc-btn-tactile flex min-w-0 flex-1 items-center gap-2.5 rounded-sm py-1.5 pl-1.5 pr-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring enabled:hover:bg-hover data-[state=open]:bg-hover [@media(hover:none)]:min-h-11"
+      className="oc-btn-tactile group flex min-w-0 flex-1 items-center gap-2.5 rounded-md border border-transparent py-1.5 pl-1.5 pr-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring enabled:hover:border-border/80 enabled:hover:bg-surface/80 data-[state=open]:border-border data-[state=open]:bg-surface data-[state=open]:shadow-soft [@media(hover:none)]:min-h-11"
     >
       <Avatar
         size="sm"
         tone="neutral"
-        className="bg-accent-soft text-meta font-semibold text-accent ring-1 ring-inset ring-accent/20 shadow-xs"
+        className="oc-avatar-ring bg-accent-soft text-meta font-semibold text-accent ring-1 ring-inset ring-accent/20"
       >
-        {(user?.displayName || "U").slice(0, 1).toUpperCase()}
+        {displayName.slice(0, 1).toUpperCase()}
       </Avatar>
       <span className="min-w-0 flex-1 leading-tight">
         <span className="block truncate text-body font-medium text-fg">
-          {user?.displayName || "未登录"}
+          {displayName}
         </span>
         {credits != null ? (
           <span
-            className="mt-0.5 block truncate text-caption tabular-nums text-faint"
+            className="mt-0.5 block truncate text-caption font-medium tabular-nums text-faint"
             title={creditsExact ? `余额 ${creditsExact}` : undefined}
           >
             {`余额 ${formatCompactCount(credits)} 积分`}
@@ -708,7 +710,7 @@ export function Sidebar({
           size={14}
           strokeWidth={1.75}
           aria-hidden
-          className="shrink-0 text-faint [@media(hover:none)]:hidden"
+          className="shrink-0 text-faint transition-colors group-hover:text-muted [@media(hover:none)]:hidden"
         />
       )}
     </button>
@@ -1312,24 +1314,36 @@ export function Sidebar({
                 side="top"
                 align="start"
                 sideOffset={8}
-                className="w-64 p-1.5"
+                className="oc-surface-popover w-72 rounded-lg p-1.5"
                 data-product-entry-scope="account-menu"
               >
-                <div className="oc-surface-recessed mb-1 flex items-center gap-2.5 rounded-sm px-2.5 py-2">
+                <div className="oc-surface-recessed mb-1.5 flex items-center gap-2.5 rounded-md px-2.5 py-2.5">
                   <Avatar
+                    size="md"
                     tone="neutral"
-                    className="bg-accent-soft text-body font-semibold text-accent ring-1 ring-inset ring-accent/20"
+                    className="oc-avatar-ring bg-accent-soft text-body font-semibold text-accent ring-1 ring-inset ring-accent/20"
                   >
-                    {(user?.displayName || "U").slice(0, 1).toUpperCase()}
+                    {displayName.slice(0, 1).toUpperCase()}
                   </Avatar>
                   <div className="min-w-0 flex-1">
-                    <p className="truncate text-section font-semibold text-fg">
-                      {user?.displayName || "未登录"}
+                    <p
+                      className="truncate text-section font-semibold leading-snug text-fg"
+                      title={displayName}
+                    >
+                      {displayName}
                     </p>
-                    {/* 登录邮箱始终在菜单头部（体验官：有余额时账号区看不到邮箱）。 */}
-                    {email && <p className="truncate text-caption text-faint">{email}</p>}
+                    {/* 当显示名与邮箱相同时只显示一行主标题，避免重复两遍邮箱；不同时保留登录邮箱副标题。 */}
+                    {showSecondaryEmail && (
+                      <p className="mt-0.5 truncate text-caption text-faint" title={email ?? undefined}>
+                        {email}
+                      </p>
+                    )}
                     {credits != null && (
-                      <p className="mt-0.5 truncate text-caption font-medium tabular-nums text-accent">{`${formatCredits(credits)} 积分`}</p>
+                      <div className="mt-1.5 flex items-center">
+                        <span className="oc-badge-craft inline-flex max-w-full items-center truncate rounded-full bg-accent-soft px-2 py-0.5 text-caption font-semibold tabular-nums text-accent">
+                          {`${formatCredits(credits)} 积分`}
+                        </span>
+                      </div>
                     )}
                   </div>
                 </div>
@@ -1338,61 +1352,109 @@ export function Sidebar({
                   <DropdownMenuItem
                     data-product-feature={PRODUCT_CAPABILITIES.memory.id}
                     onSelect={onOpenManage}
+                    className="gap-2.5 rounded-md py-1.5"
                   >
-                    <LayoutGrid size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
-                    <span className="flex-1">管理中心</span>
-                    <span className="text-caption text-faint">记忆 · 技能 · 定时 · 插件</span>
+                    <span className="oc-icon-badge oc-icon-badge-accent h-6 w-6 rounded-xs" aria-hidden>
+                      <LayoutGrid size={13} strokeWidth={1.75} />
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-body font-medium leading-tight text-fg">管理中心</span>
+                      <span className="mt-0.5 block truncate text-caption leading-tight text-faint">
+                        记忆 · 技能 · 定时 · 插件
+                      </span>
+                    </span>
                   </DropdownMenuItem>
                 )}
                 {onOpenMarketplace && (
                   <DropdownMenuItem
                     data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}
                     onSelect={onOpenMarketplace}
+                    className="gap-2.5 rounded-md py-1.5"
                   >
-                    <Store size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
-                    市场
+                    <span className="oc-icon-badge oc-icon-badge-info h-6 w-6 rounded-xs" aria-hidden>
+                      <Store size={13} strokeWidth={1.75} />
+                    </span>
+                    <span className="flex-1 font-medium">市场</span>
                   </DropdownMenuItem>
                 )}
                 {onOpenOrg && (
                   <DropdownMenuItem
                     data-product-feature={PRODUCT_CAPABILITIES.organization.id}
                     onSelect={onOpenOrg}
+                    className="gap-2.5 rounded-md py-1.5"
                   >
-                    <Building2 size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
-                    组织
+                    <span className="oc-icon-badge h-6 w-6 rounded-xs" aria-hidden>
+                      <Building2 size={13} strokeWidth={1.75} />
+                    </span>
+                    <span className="flex-1 font-medium">组织</span>
                   </DropdownMenuItem>
                 )}
                 {showAdmin && (
-                  <DropdownMenuItem asChild data-product-control>
+                  <DropdownMenuItem asChild data-product-control className="gap-2.5 rounded-md py-1.5">
                     <a data-product-control href="/admin.html">
-                      <ShieldCheck size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
-                      管理后台
+                      <span className="oc-icon-badge oc-icon-badge-warning h-6 w-6 rounded-xs" aria-hidden>
+                        <ShieldCheck size={13} strokeWidth={1.75} />
+                      </span>
+                      <span className="flex-1 font-medium">管理后台</span>
                     </a>
                   </DropdownMenuItem>
                 )}
                 {onOpenStudio && (
-                  <DropdownMenuItem data-product-control onSelect={onOpenStudio}>
-                    <Clapperboard size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
-                    媒体工作台
+                  <DropdownMenuItem
+                    data-product-control
+                    onSelect={onOpenStudio}
+                    className="gap-2.5 rounded-md py-1.5"
+                  >
+                    <span className="oc-icon-badge oc-icon-badge-accent h-6 w-6 rounded-xs" aria-hidden>
+                      <Clapperboard size={13} strokeWidth={1.75} />
+                    </span>
+                    <span className="flex-1 font-medium">媒体工作台</span>
                   </DropdownMenuItem>
                 )}
                 {onOpenMediaTasks && (
-                  <DropdownMenuItem data-product-control onSelect={onOpenMediaTasks}>
-                    <Film size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
-                    视频任务
+                  <DropdownMenuItem
+                    data-product-control
+                    onSelect={onOpenMediaTasks}
+                    className="gap-2.5 rounded-md py-1.5"
+                  >
+                    <span className="oc-icon-badge oc-icon-badge-info h-6 w-6 rounded-xs" aria-hidden>
+                      <Film size={13} strokeWidth={1.75} />
+                    </span>
+                    <span className="flex-1 font-medium">视频任务</span>
                   </DropdownMenuItem>
                 )}
+                {(onOpenChatGptProxy || onOpenApiAccess) &&
+                  (onOpenManage ||
+                    onOpenMarketplace ||
+                    onOpenOrg ||
+                    showAdmin ||
+                    onOpenStudio ||
+                    onOpenMediaTasks) && <DropdownMenuSeparator />}
                 {onOpenChatGptProxy && (
-                  <DropdownMenuItem data-product-control onSelect={onOpenChatGptProxy}>
-                    <Globe size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
-                    ChatGPT 直连
+                  <DropdownMenuItem
+                    data-product-control
+                    onSelect={onOpenChatGptProxy}
+                    className="gap-2.5 rounded-md py-1.5"
+                  >
+                    <span className="oc-icon-badge oc-icon-badge-success h-6 w-6 rounded-xs" aria-hidden>
+                      <Globe size={13} strokeWidth={1.75} />
+                    </span>
+                    <span className="flex-1 font-medium">ChatGPT 直连</span>
                   </DropdownMenuItem>
                 )}
                 {onOpenApiAccess && (
-                  <DropdownMenuItem data-product-control onSelect={onOpenApiAccess}>
-                    <KeyRound size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
-                    <span className="flex-1">API 接入</span>
-                    <span className="text-caption text-faint">本地 Claude Code</span>
+                  <DropdownMenuItem
+                    data-product-control
+                    onSelect={onOpenApiAccess}
+                    className="gap-2.5 rounded-md py-1.5"
+                  >
+                    <span className="oc-icon-badge oc-icon-badge-accent h-6 w-6 rounded-xs" aria-hidden>
+                      <KeyRound size={13} strokeWidth={1.75} />
+                    </span>
+                    <span className="flex-1 font-medium">API 接入</span>
+                    <span className="oc-badge-craft rounded-full bg-accent-soft px-1.5 py-0.5 text-caption font-medium text-accent">
+                      本地 Claude Code
+                    </span>
                   </DropdownMenuItem>
                 )}
                 {(onOpenAccount || onOpenFeedback || onLogout) &&
@@ -1408,24 +1470,38 @@ export function Sidebar({
                   <DropdownMenuItem
                     data-product-feature={PRODUCT_CAPABILITIES.billing.id}
                     onSelect={onOpenAccount}
+                    className="gap-2.5 rounded-md py-1.5"
                   >
-                    <Settings size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
-                    设置
+                    <span className="oc-icon-badge h-6 w-6 rounded-xs" aria-hidden>
+                      <Settings size={13} strokeWidth={1.75} />
+                    </span>
+                    <span className="flex-1 font-medium">设置</span>
                   </DropdownMenuItem>
                 )}
                 {onOpenFeedback && (
                   <DropdownMenuItem
                     data-product-feature={PRODUCT_CAPABILITIES.feedback.id}
                     onSelect={onOpenFeedback}
+                    className="gap-2.5 rounded-md py-1.5"
                   >
-                    <MessageSquareText size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
-                    意见反馈
+                    <span className="oc-icon-badge h-6 w-6 rounded-xs" aria-hidden>
+                      <MessageSquareText size={13} strokeWidth={1.75} />
+                    </span>
+                    <span className="flex-1 font-medium">意见反馈</span>
                   </DropdownMenuItem>
                 )}
+                {onLogout && (onOpenAccount || onOpenFeedback) && <DropdownMenuSeparator />}
                 {onLogout && (
-                  <DropdownMenuItem data-product-control destructive onSelect={onLogout}>
-                    <LogOut size={15} strokeWidth={1.75} className="shrink-0" />
-                    退出登录
+                  <DropdownMenuItem
+                    data-product-control
+                    destructive
+                    onSelect={onLogout}
+                    className="gap-2.5 rounded-md py-1.5"
+                  >
+                    <span className="oc-icon-badge oc-icon-badge-danger h-6 w-6 rounded-xs" aria-hidden>
+                      <LogOut size={13} strokeWidth={1.75} />
+                    </span>
+                    <span className="flex-1 font-medium">退出登录</span>
                   </DropdownMenuItem>
                 )}
               </DropdownMenuContent>

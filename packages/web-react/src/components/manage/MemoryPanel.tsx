@@ -1,4 +1,20 @@
-import { BarChart3, Bot, Brain, Check, ChevronRight, MoreHorizontal, Plus, Search, Trash2 } from "lucide-react";
+import {
+  BarChart3,
+  Bookmark,
+  Bot,
+  Brain,
+  Check,
+  ChevronRight,
+  FileCode2,
+  FolderKanban,
+  MessageSquare,
+  MoreHorizontal,
+  Plus,
+  Search,
+  Sparkles,
+  Trash2,
+  User,
+} from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useId, useState } from "react";
 import { ApiError, api, apiErrorMessage } from "../../lib/api";
 import { useMdViewport } from "../../hooks/useMdViewport";
@@ -43,6 +59,7 @@ import {
   PanelHeader,
   Skeleton,
   Spinner,
+  StatusDot,
   Switch,
   Tabs,
   Textarea,
@@ -122,12 +139,12 @@ export function MemoryPanel({
         }
       />
       {/* 二级页签:app 统一的药丸页签(与设置「7 天 / 30 天」同款,OCV5-362)。 */}
-      <div className="min-w-0 px-4">
+      <div className="min-w-0 px-4 pt-1">
         <Tabs
           aria-label="记忆分区"
           idBase={TAB_ID_BASE}
           layout="scroll"
-          className="max-w-full"
+          className="oc-surface-recessed max-w-full"
           value={tab}
           onValueChange={(v) =>
             setTab(
@@ -296,8 +313,13 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
 
   if (!isWorkScope(scope) || !projectId) {
     return (
-      <div className="px-4 pt-5 text-body text-muted" data-testid="project-memory-panel">
-        选择工作项目后，这里显示该项目的记忆。
+      <div className="px-4 pt-5" data-testid="project-memory-panel">
+        <div className="oc-surface-recessed flex items-center gap-3 rounded-xl px-4 py-3.5 text-body text-muted">
+          <span className="oc-icon-badge size-7 shrink-0 rounded-lg" aria-hidden="true">
+            <FolderKanban size={14} strokeWidth={1.75} />
+          </span>
+          <span>选择工作项目后，这里显示该项目的记忆。</span>
+        </div>
       </div>
     );
   }
@@ -315,8 +337,14 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
         <Alert
           tone="danger"
           density="compact"
+          className="oc-callout oc-callout-danger rounded-xl"
           action={
-            <Button size="sm" variant="secondary" onClick={reload}>
+            <Button
+              size="sm"
+              variant="secondary"
+              className="oc-btn-tactile oc-btn-secondary-craft"
+              onClick={reload}
+            >
               重试
             </Button>
           }
@@ -326,7 +354,7 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
       ) : (
         <>
           {official.length === 0 ? (
-            <div className="-mx-4">
+            <div className="oc-surface-card rounded-2xl">
               <EmptyState
                 icon={Brain}
                 title="还没有项目记忆"
@@ -337,27 +365,35 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
             <ListGroup aria-label="生效中的项目记忆">
               {official.map((o) => (
                 // 行面只有标题(+ 状态);「废弃」收进行尾唯一一枚安静的 ⋯ 菜单,不再是行内按钮。
-                <ListRow key={o.slug} className="flex items-center justify-between gap-3 py-2 pr-2">
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate text-[14px] font-medium leading-5 text-fg">
-                      {memoryTitle(o.slug)}
+                <ListRow
+                  key={o.slug}
+                  className="group flex items-center justify-between gap-3 py-2.5 pr-2 transition-colors hover:bg-hover/70"
+                >
+                  <div className="flex min-w-0 flex-1 items-center gap-3">
+                    <span className="oc-icon-badge oc-icon-badge-accent size-7 shrink-0 rounded-lg" aria-hidden="true">
+                      <Brain size={14} strokeWidth={1.75} />
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-section font-medium leading-5 text-fg">
+                        {memoryTitle(o.slug)}
+                      </div>
+                      {o.tampered && (
+                        <MetaLine className="mt-0.5">
+                          <Badge tone="warning" size="sm" className="oc-badge-craft">
+                            文件被改动，未注入
+                          </Badge>
+                        </MetaLine>
+                      )}
                     </div>
-                    {o.tampered && (
-                      <MetaLine className="mt-0.5">
-                        <Badge tone="warning" size="sm">
-                          文件被改动，未注入
-                        </Badge>
-                      </MetaLine>
-                    )}
                   </div>
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
                       <IconButton
                         size="sm"
                         aria-label={`${memoryTitle(o.slug)} 更多操作`}
-                        className="shrink-0 text-faint hover:text-fg"
+                        className="oc-icon-btn-tactile shrink-0 text-faint hover:text-fg"
                       >
-                        <MoreHorizontal size={16} aria-hidden="true" />
+                        <MoreHorizontal size={16} strokeWidth={1.75} aria-hidden="true" />
                       </IconButton>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
@@ -381,12 +417,14 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
               />
               <ListGroup aria-label="待确认的项目记忆">
               {leftover.map((c) => (
-                <ListRow key={c.id ?? c.file}>
-                  <div className="text-[14px] font-medium leading-5 text-fg">{memoryTitle(c.slug)}</div>
+                <ListRow key={c.id ?? c.file} className="transition-colors hover:bg-hover/60">
+                  <div className="text-section font-medium leading-5 text-fg">{memoryTitle(c.slug)}</div>
                   <LeftoverBody text={c.content ?? ""} />
-                  <div className="mt-2.5 flex gap-2">
+                  <div className="mt-3 flex gap-2">
                     <Button
                       size="sm"
+                      variant="primary"
+                      className="oc-btn-tactile oc-btn-primary-craft"
                       loading={busyId === (c.id ?? "")}
                       disabled={busyId !== null}
                       onClick={() => void decide(c, "promote")}
@@ -396,6 +434,7 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
                     <Button
                       size="sm"
                       variant="secondary"
+                      className="oc-btn-tactile oc-btn-secondary-craft"
                       disabled={busyId !== null}
                       onClick={() => void decide(c, "reject")}
                     >
@@ -437,7 +476,7 @@ export function LeftoverBody({ text }: { text: string }) {
           type="button"
           aria-expanded={open}
           onClick={() => setOpen((v) => !v)}
-          className="mt-1 rounded-[6px] text-meta font-medium text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+          className="mt-1 rounded-xs text-meta font-medium text-accent outline-none transition-colors hover:text-accent-strong focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
         >
           {open ? "收起" : "展开全文"}
         </button>
@@ -479,9 +518,13 @@ function SectionHeading({
       )}
     >
       <div className="min-w-0 flex-1 basis-40">
-        <Tag className="flex items-baseline gap-2 text-[14px] font-semibold leading-5 tabular-nums text-fg">
-          {title}
-          {count !== undefined && <span className="text-meta font-normal text-faint">{count}</span>}
+        <Tag className="flex items-center gap-2 text-section font-semibold leading-5 tracking-tight tabular-nums text-fg">
+          <span>{title}</span>
+          {count !== undefined && (
+            <span className="oc-surface-recessed rounded-full px-2 py-0.5 text-caption font-medium tabular-nums text-muted">
+              {count}
+            </span>
+          )}
         </Tag>
         {hint && (
           <p className={cn("mt-0.5 text-meta text-muted", hideHintOnMobile && "max-md:hidden")}>{hint}</p>
@@ -560,8 +603,14 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
         <Alert
           tone="danger"
           density="compact"
+          className="oc-callout oc-callout-danger rounded-xl"
           action={
-            <Button size="sm" variant="secondary" onClick={reload}>
+            <Button
+              size="sm"
+              variant="secondary"
+              className="oc-btn-tactile oc-btn-secondary-craft"
+              onClick={reload}
+            >
               重试
             </Button>
           }
@@ -572,7 +621,7 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
       {loading ? (
         <ListSkeleton rows={4} />
       ) : err ? null : !value || !totals || totals.events === 0 ? (
-        <div className="-mx-4">
+        <div className="oc-surface-card rounded-2xl">
           <EmptyState
             icon={BarChart3}
             title="还没有可统计的记忆操作"
@@ -582,24 +631,30 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
       ) : (
         <>
           {totals.freshnessGaps > 0 && (
-            // 警告是一行带圆点的彩色文字,不是一块着色的框。
-            <p className="flex items-start gap-2 text-body text-warning">
-              <span aria-hidden="true" className="mt-[7px] size-1.5 shrink-0 rounded-full bg-warning" />
-              发现 {totals.freshnessGaps} 次“询问当前状态但仅使用历史记忆、未见实时证据”的影子风险。
-            </p>
+            <div className="oc-callout oc-callout-warning flex items-start gap-2.5 rounded-xl px-3.5 py-2.5 text-body text-warning">
+              <StatusDot tone="warning" className="mt-1.5 shrink-0" />
+              <span>
+                发现 {totals.freshnessGaps} 次“询问当前状态但仅使用历史记忆、未见实时证据”的影子风险。
+              </span>
+            </div>
           )}
 
-          {/* 四个指标是一条分格的统计带(一个容器 + 发丝分隔),不是四张下沉小卡。 */}
-          <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-border bg-border lg:grid-cols-4">
+          {/* 四个指标是一条分格的统计带(一个容器 + 发丝分隔),兼具 Clarvy Atelier 立体卡片质感。 */}
+          <dl className="oc-surface-card grid grid-cols-2 gap-px overflow-hidden rounded-xl bg-border/80 lg:grid-cols-4">
             {[
-              ["使用会话", totals.sessions],
-              ["记忆操作", totals.events],
-              ["检索命中率", `${hitRate}%`],
-              ["新鲜度风险", totals.freshnessGaps],
-            ].map(([label, metric]) => (
-              <div key={String(label)} className="flex flex-col gap-1 bg-surface px-4 py-3">
+              { label: "使用会话", metric: totals.sessions, warn: false },
+              { label: "记忆操作", metric: totals.events, warn: false },
+              { label: "检索命中率", metric: `${hitRate}%`, warn: false },
+              { label: "新鲜度风险", metric: totals.freshnessGaps, warn: totals.freshnessGaps > 0 },
+            ].map(({ label, metric, warn }) => (
+              <div key={label} className="flex flex-col gap-1 bg-surface px-4 py-3.5">
                 <dt className="text-meta text-faint">{label}</dt>
-                <dd className="text-[20px] font-semibold leading-7 tabular-nums tracking-[-0.01em] text-fg">
+                <dd
+                  className={cn(
+                    "text-xl font-semibold leading-7 tabular-nums tracking-tight",
+                    warn ? "text-warning" : "text-fg",
+                  )}
+                >
                   {metric}
                 </dd>
               </div>
@@ -612,10 +667,10 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
               {value.byOperation.map((row) => (
                 <ListRow
                   key={`${row.operation}:${row.memoryType}`}
-                  className="grid grid-cols-[1fr_auto] items-center gap-4"
+                  className="grid grid-cols-[1fr_auto] items-center gap-4 transition-colors hover:bg-hover/60"
                 >
                   <div className="min-w-0">
-                    <div className="truncate text-[14px] font-medium leading-5 text-fg">
+                    <div className="truncate text-section font-medium leading-5 text-fg">
                       {OPERATION_LABELS[row.operation] ?? row.operation}
                     </div>
                     <MetaLine className="mt-0.5">
@@ -624,7 +679,9 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
                       <span>p95 {row.p95Ms}ms</span>
                     </MetaLine>
                   </div>
-                  <div className="text-right text-body tabular-nums text-fg">{row.events} 次</div>
+                  <div className="oc-surface-recessed rounded-md px-2.5 py-1 text-right text-caption font-medium tabular-nums text-fg">
+                    {row.events} 次
+                  </div>
                 </ListRow>
               ))}
             </ListGroup>
@@ -634,9 +691,9 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
             <SectionHeading title="最近会话" />
             <ListGroup>
               {value.recentSessions.slice(0, 20).map((row) => (
-                <ListRow key={row.sessionKey}>
+                <ListRow key={row.sessionKey} className="transition-colors hover:bg-hover/60">
                   <div className="flex items-baseline justify-between gap-3">
-                    <div className="min-w-0 truncate text-[14px] font-medium leading-5 text-fg">{row.title}</div>
+                    <div className="min-w-0 truncate text-section font-medium leading-5 text-fg">{row.title}</div>
                     <TimeAgo value={row.lastAt} className="shrink-0 text-meta tabular-nums text-faint" />
                   </div>
                   <MetaLine className="mt-0.5">
@@ -898,8 +955,14 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
         <Alert
           tone="danger"
           density="compact"
+          className="oc-callout oc-callout-danger rounded-xl"
           action={
-            <Button size="sm" variant="secondary" onClick={reload}>
+            <Button
+              size="sm"
+              variant="secondary"
+              className="oc-btn-tactile oc-btn-secondary-craft"
+              onClick={reload}
+            >
               重试
             </Button>
           }
@@ -916,7 +979,7 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
 
       {dreamLoading ? (
         !loading && files.length > 0 ? (
-          <Skeleton data-testid="dream-placeholder" className="h-[88px] rounded-[10px]" />
+          <Skeleton data-testid="dream-placeholder" className="h-[88px] rounded-xl" />
         ) : null
       ) : hasDreamCard(dream) ? (
         <AutoDreamReportCard value={dream} files={files} onOpenMemory={setEditing} />
@@ -925,27 +988,32 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
       {loading ? (
         <div className="flex flex-col gap-3">
           {coldStart && (
-            <Alert tone="info" density="compact">
+            <Alert tone="info" density="compact" className="oc-callout oc-callout-info rounded-xl">
               正在唤醒你的智能体，首次打开大约需要 10 秒。
             </Alert>
           )}
           <ListSkeleton rows={3} />
         </div>
       ) : failedCold ? null : files.length === 0 ? (
-        <div className="-mx-4">
+        <div className="oc-surface-card rounded-2xl">
           <EmptyState
             icon={Brain}
             title="还没有核心记忆"
             hint="智能体会在对话中自动记下值得长期保留的信息；你也可以现在手动补充一条。"
             action={
-              <Button variant="secondary" size="sm" onClick={() => setCreating(true)}>
-                <Plus size={14} /> 新建记忆
+              <Button
+                variant="secondary"
+                size="sm"
+                className="oc-btn-tactile oc-btn-secondary-craft gap-1.5"
+                onClick={() => setCreating(true)}
+              >
+                <Plus size={14} strokeWidth={1.9} /> 新建记忆
               </Button>
             }
           />
         </div>
       ) : (
-        <div className="flex flex-col gap-3">
+        <div className="flex flex-col gap-3.5">
           {/* 分组标题 = 条数 + 一句作用域说明 + 新建;说明不再单独悬在页签下面。 */}
           <SectionHeading
             className="pb-0"
@@ -954,8 +1022,13 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
             hideHintOnMobile
             action={
               // 窄屏只写「新建」(+ 图标已说明动作),可访问名仍是「新建记忆」。
-              <Button variant="ghost" size="sm" className="gap-1 px-2.5" onClick={() => setCreating(true)}>
-                <Plus size={15} aria-hidden="true" />
+              <Button
+                variant="secondary"
+                size="sm"
+                className="oc-btn-tactile oc-btn-secondary-craft gap-1.5 px-3"
+                onClick={() => setCreating(true)}
+              >
+                <Plus size={15} strokeWidth={1.9} aria-hidden="true" />
                 <span>
                   新建<span className="max-md:sr-only">记忆</span>
                 </span>
@@ -967,31 +1040,37 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
             <div className="relative">
               <Search
                 size={15}
+                strokeWidth={1.75}
                 aria-hidden="true"
                 className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint"
               />
-              {/* 安静的搜索框:无边框的淡填充圆角条,悬停加深一档,聚焦才出描边。
-                  字号沿用 Input 的 text-base(16px,iOS 不放大);触屏高度 40px。 */}
+              {/* 微凹搜索条：安静嵌入槽中，聚焦浮出表面并呈现暖陶土光环。
+                  保留 border-transparent bg-hover 契约；字号沿用 Input 的 text-base(16px,iOS 不放大);触屏高度 40px。 */}
               <Input
                 type="search"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="搜索记忆"
                 aria-label="搜索核心记忆"
-                className="h-9 border-transparent bg-hover pl-9 transition-colors hover:bg-active focus:bg-surface max-md:h-10"
+                className="oc-surface-recessed h-9 rounded-xl border-transparent bg-hover pl-9 transition-colors hover:bg-active focus:bg-surface max-md:h-10"
                 autoComplete="off"
               />
             </div>
           )}
 
           {filtered.length === 0 ? (
-            <div className="-mx-4">
+            <div className="oc-surface-card rounded-2xl">
               <EmptyState
                 icon={Search}
                 title="没有匹配的记忆"
                 hint="换个关键词，或清除搜索看看全部记忆。"
                 action={
-                  <Button variant="secondary" size="sm" onClick={() => setQuery("")}>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    className="oc-btn-tactile oc-btn-secondary-craft"
+                    onClick={() => setQuery("")}
+                  >
                     清除搜索
                   </Button>
                 }
@@ -1001,9 +1080,11 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
             groups.map((g) => (
               <div key={g.key} className={cn("flex flex-col", g.label && "pt-2")}>
                 {g.label && (
-                  <p className="pb-2 text-meta font-medium text-muted">
-                    {g.label}
-                    <span className="ml-2 font-normal tabular-nums text-faint">{g.items.length}</span>
+                  <p className="flex items-center gap-2 pb-2 text-meta font-semibold tracking-tight text-muted">
+                    <span>{g.label}</span>
+                    <span className="oc-surface-recessed rounded-full px-1.5 py-0.5 text-caption font-medium tabular-nums text-faint">
+                      {g.items.length}
+                    </span>
                   </p>
                 )}
                 <ListGroup>
@@ -1142,7 +1223,7 @@ function MemoryContextDisclosure({ auth, agentId }: { auth: AuthSession; agentId
         <section
           aria-label="记忆使用情况"
           aria-busy={loading}
-          className="mt-1.5 flex flex-col gap-1.5 rounded-lg bg-code px-3 py-2.5 text-caption leading-relaxed text-fg"
+          className="oc-surface-recessed mt-1.5 flex flex-col gap-2 rounded-xl px-3.5 py-3 text-caption leading-relaxed text-fg"
         >
           {err ? (
             <p className="text-muted">{err}</p>
@@ -1152,13 +1233,13 @@ function MemoryContextDisclosure({ auth, agentId }: { auth: AuthSession; agentId
             <p className="text-muted">这项查看功能没有开启。</p>
           ) : (
             <>
-              <p>可读取：{contextReadText(view.panel)}</p>
+              <p className="font-medium text-fg">可读取：{contextReadText(view.panel)}</p>
               {view.turns.length === 0 ? (
                 <p className="text-muted">现在没有进行中的对话。</p>
               ) : (
-                <ul className="flex flex-col gap-1">
+                <ul className="flex flex-col gap-1.5 border-t border-border/70 pt-2">
                   {view.turns.map((t, i) => (
-                    <li key={`${t.startedAt}-${i}`}>
+                    <li key={`${t.startedAt}-${i}`} className="text-muted">
                       进行中的对话（<TimeAgo value={t.startedAt} />
                       开始{t.projectBound ? "，已绑定项目" : ""}）：
                       {MEMORY_POLICY_LABEL[t.memoryPolicy.reason] ??
@@ -1172,9 +1253,9 @@ function MemoryContextDisclosure({ auth, agentId }: { auth: AuthSession; agentId
           )}
           <div>
             <Button
-              variant="ghost"
+              variant="secondary"
               size="sm"
-              className="-ml-3 font-normal text-muted"
+              className="oc-btn-tactile oc-btn-secondary-craft"
               disabled={loading}
               onClick={() => setReloadKey((k) => k + 1)}
             >
@@ -1222,9 +1303,9 @@ function Disclosure({
           // biome-ignore lint/a11y/noNoninteractiveTabindex: 规则只认交互角色,不认"可滚动区需可聚焦"这条 WCAG 要求
           tabIndex={0}
           aria-label={srLabel}
-          className="mt-1.5 max-h-52 overflow-auto rounded-lg bg-code outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="oc-code-shell mt-1.5 max-h-52 overflow-auto rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
-          <pre className="whitespace-pre-wrap break-words px-3 py-2.5 font-mono text-caption leading-relaxed text-fg">
+          <pre className="whitespace-pre-wrap break-words px-3.5 py-3 font-mono text-caption leading-relaxed text-fg">
             {text}
           </pre>
         </section>
@@ -1268,22 +1349,36 @@ function AutoDreamToggleRow({ auth, onChanged }: { auth: AuthSession; onChanged:
   return (
     <section
       aria-label="自动整理记忆"
-      className="flex items-start justify-between gap-4 rounded-xl border border-border bg-surface px-4 py-3.5 shadow-soft"
+      className="oc-surface-card flex items-start justify-between gap-4 rounded-xl px-4 py-3.5"
     >
-      <div className="min-w-0">
-        <h4 className="text-[14px] font-semibold leading-5 text-fg">自动整理记忆</h4>
-        <p className="mt-1 max-w-[68ch] text-body text-muted">
-          每 {feature.min_interval_hours} 小时最多一次，累计 {feature.min_new_sessions}{" "}
-          个新会话后，在后台从近期对话里提炼值得长期保留的信息。只新增，不改、不删已有记忆；自动新增的记忆保留{" "}
-          {AUTO_MEMORY_TTL_DAYS} 天。按实际用量扣积分。
-        </p>
-        {on && !feature.effective && (
-          <p className="mt-1 text-meta text-warning">当前暂不可用，整理已安全暂停。</p>
-        )}
+      <div className="flex min-w-0 items-start gap-3">
+        <span
+          className={cn(
+            "oc-icon-badge mt-0.5 size-8 shrink-0 rounded-lg",
+            on && "oc-icon-badge-accent",
+          )}
+          aria-hidden="true"
+        >
+          <Sparkles size={15} strokeWidth={1.75} />
+        </span>
+        <div className="min-w-0">
+          <h4 className="text-section font-semibold leading-5 tracking-tight text-fg">自动整理记忆</h4>
+          <p className="mt-1 max-w-[68ch] text-body tabular-nums text-muted">
+            每 {feature.min_interval_hours} 小时最多一次，累计 {feature.min_new_sessions}{" "}
+            个新会话后，在后台从近期对话里提炼值得长期保留的信息。只新增，不改、不删已有记忆；自动新增的记忆保留{" "}
+            {AUTO_MEMORY_TTL_DAYS} 天。按实际用量扣积分。
+          </p>
+          {on && !feature.effective && (
+            <p className="mt-1.5 flex items-center gap-1.5 text-meta text-warning">
+              <StatusDot tone="warning" />
+              <span>当前暂不可用，整理已安全暂停。</span>
+            </p>
+          )}
+        </div>
       </div>
       <Switch
         aria-label="自动整理记忆"
-        className="mt-0.5"
+        className="mt-0.5 shrink-0"
         checked={on}
         disabled={saving}
         onCheckedChange={async (checked) => {
@@ -1343,22 +1438,32 @@ function AutoDreamReportCard({
     <section
       aria-label="Auto-Dream 梦境报告"
       aria-busy={running || undefined}
-      className="overflow-hidden rounded-xl border border-border bg-surface shadow-soft"
+      className="oc-surface-card overflow-hidden rounded-xl"
     >
       <div className="px-4 py-3.5">
-        <div className="flex items-baseline justify-between gap-3">
-          <h4 className="flex min-w-0 items-center gap-2 text-[14px] font-semibold leading-5 text-fg">
+        <div className="flex items-center justify-between gap-3">
+          <h4 className="flex min-w-0 items-center gap-2.5 text-section font-semibold leading-5 tracking-tight text-fg">
+            <span
+              className={cn(
+                "oc-icon-badge size-6 shrink-0 rounded-md",
+                running ? "oc-icon-badge-accent" : "oc-icon-badge-info",
+              )}
+              aria-hidden="true"
+            >
+              {running ? <Spinner size={12} /> : <Sparkles size={13} strokeWidth={1.75} />}
+            </span>
             <span className="truncate">Auto‑Dream 梦境报告</span>
-            {running && <Spinner size={13} className="shrink-0 text-muted" />}
           </h4>
           {running ? (
-            <span className="shrink-0 text-meta text-muted">正在整理近期对话</span>
+            <Badge tone="accent" size="sm" className="oc-badge-craft shrink-0">
+              正在整理近期对话
+            </Badge>
           ) : report ? (
             <TimeAgo value={report.finishedAt} className="shrink-0 text-meta tabular-nums text-faint" />
           ) : null}
         </div>
         {running ? (
-          <p className="mt-1 text-body text-muted">
+          <p className="mt-2 text-body text-muted">
             正在提炼值得长期保留的信息。完成后会在这里显示变化，并发送一封站内梦境报告。
           </p>
         ) : report ? (
@@ -1366,7 +1471,7 @@ function AutoDreamReportCard({
         ) : null}
         {(report && !running) || (!running && value.pendingSessions > 0) ? (
           // 两条元信息在窄屏会折行:分隔点自己画、窄屏隐藏,避免第二行以「·」开头。
-          <p className="mt-2 flex flex-wrap gap-x-1.5 gap-y-0.5 text-meta tabular-nums text-faint max-sm:flex-col">
+          <p className="oc-surface-recessed mt-2.5 flex flex-wrap gap-x-1.5 gap-y-0.5 rounded-lg px-2.5 py-1.5 text-meta tabular-nums text-faint max-sm:flex-col">
             {report && !running && <span>已参考 {report.sessionsReviewed} 个近期会话</span>}
             {report && !running && value.pendingSessions > 0 && (
               <span aria-hidden="true" className="max-sm:hidden">
@@ -1387,7 +1492,7 @@ function AutoDreamReportCard({
           type="button"
           aria-expanded={changesOpen}
           onClick={() => setShowChanges(!changesOpen)}
-          className="flex min-h-11 w-full items-center justify-between gap-3 border-t border-border px-4 py-2.5 text-left text-body text-muted outline-none transition-colors duration-100 hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+          className="flex min-h-11 w-full items-center justify-between gap-3 border-t border-border/80 px-4 py-2.5 text-left text-body font-medium text-muted outline-none transition-colors duration-100 hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
         >
           <span>{changesOpen ? "收起变化" : `查看 ${total} 项变化`}</span>
           <ChevronRight
@@ -1399,7 +1504,7 @@ function AutoDreamReportCard({
         </button>
       )}
       {!running && changes.length > 0 && changesOpen && (
-        <ul className="oc-list border-t border-border">
+        <ul className="oc-list border-t border-border/80">
           {changes.map((change, index) => {
             const meta =
               change.action === "deleted"
@@ -1409,9 +1514,18 @@ function AutoDreamReportCard({
             const title = meta?.name?.trim() || change.file.replace(/\.md$/i, "");
             const content = (
               <>
-                <span className="w-8 shrink-0 text-meta text-faint">{action.label}</span>
-                <span className="min-w-0 flex-1 truncate text-body text-fg">{title}</span>
-                {meta && <ChevronRight size={15} strokeWidth={1.75} aria-hidden="true" className="shrink-0 text-faint" />}
+                <span className="oc-surface-recessed w-10 shrink-0 rounded-md py-0.5 text-center text-caption font-medium text-muted">
+                  {action.label}
+                </span>
+                <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">{title}</span>
+                {meta && (
+                  <ChevronRight
+                    size={15}
+                    strokeWidth={1.75}
+                    aria-hidden="true"
+                    className="shrink-0 text-faint transition-transform duration-150 group-hover:translate-x-0.5 group-hover:text-fg"
+                  />
+                )}
               </>
             );
             return (
@@ -1420,7 +1534,7 @@ function AutoDreamReportCard({
                   <button
                     type="button"
                     onClick={() => onOpenMemory(meta)}
-                    className="flex min-h-11 w-full items-center gap-3 px-4 py-2.5 text-left outline-none transition-colors duration-100 hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                    className="group flex min-h-11 w-full items-center gap-3 px-4 py-2.5 text-left outline-none transition-colors duration-100 hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                   >
                     {content}
                   </button>
@@ -1450,15 +1564,15 @@ function DreamReportResult({ report, total }: { report: AutoDreamLastReport; tot
       ? report.summary
       : "本次整理未完成，记忆没有改动。";
     return (
-      <p className="mt-1 flex items-center gap-2 text-body text-warning">
-        <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-warning" />
+      <p className="mt-2 flex items-center gap-2 text-body text-warning">
+        <StatusDot tone="warning" className="shrink-0" />
         {outcome}
       </p>
     );
   }
   return (
     <>
-      <p className="mt-1 text-body text-fg">
+      <p className="mt-2 text-body font-medium text-fg">
         {total === 0
           ? "已完成检查，没有发现值得长期保存的新信息。"
           : dreamChangeSentence(report)}
@@ -1468,6 +1582,21 @@ function DreamReportResult({ report, total }: { report: AutoDreamLastReport; tot
       )}
     </>
   );
+}
+
+function memoryTypeVisual(type: string) {
+  switch (type) {
+    case "user":
+      return { Icon: User, badgeClass: "oc-icon-badge-info" };
+    case "project":
+      return { Icon: FolderKanban, badgeClass: "oc-icon-badge-accent" };
+    case "feedback":
+      return { Icon: MessageSquare, badgeClass: "oc-icon-badge-warning" };
+    case "reference":
+      return { Icon: Bookmark, badgeClass: "" };
+    default:
+      return { Icon: Brain, badgeClass: "" };
+  }
 }
 
 function MemoryFileCard({
@@ -1480,17 +1609,26 @@ function MemoryFileCard({
   onOpen: () => void;
 }) {
   const typeMeta = TYPE_META[file.type] ?? { label: file.type || "记忆", tone: "neutral" as const };
+  const { Icon, badgeClass } = memoryTypeVisual(file.type);
   const title = file.name?.trim() || file.file.replace(/\.md$/i, "");
   return (
-    // 分组容器里的一行(不是一张卡):整行可点,悬停给极淡底,右侧弱化的 › 提示可进入。
+    // 分组容器里的一行:整行可点,左侧类型图标徽章 + 清晰内容层次 + 悬停微动效箭头。
     <ListRow className="p-0">
       <button
         type="button"
         onClick={onOpen}
-        className="group flex w-full items-start gap-3 px-4 py-3 text-left outline-none transition-colors duration-100 hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+        className="group flex w-full items-start gap-3 px-4 py-3 text-left outline-none transition-colors duration-150 hover:bg-hover/80 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11"
       >
+        <span
+          className={cn("oc-icon-badge mt-0.5 size-7 shrink-0 rounded-lg", badgeClass)}
+          aria-hidden="true"
+        >
+          <Icon size={14} strokeWidth={1.75} />
+        </span>
         <span className="min-w-0 flex-1">
-          <span className="block truncate text-[14px] font-medium leading-5 text-fg">{title}</span>
+          <span className="block truncate text-section font-medium leading-5 text-fg transition-colors group-hover:text-accent">
+            {title}
+          </span>
           {file.description?.trim() && (
             // 不能再加 `block`:它排在 line-clamp 的 display:-webkit-box 之后,会把截断整个取消
             // (线上一条记忆占半屏的根因)。line-clamp 自带 display,span 也能截断。
@@ -1499,9 +1637,9 @@ function MemoryFileCard({
             </span>
           )}
           {/* 文件名不再上卡面:它是存储实现,对用户没有含义(要看走编辑器的「编辑源码」)。 */}
-          <MetaLine className="mt-1">
+          <MetaLine className="mt-1.5">
             {showType && (
-              <Badge tone={typeMeta.tone} size="sm" className="text-meta text-faint">
+              <Badge tone={typeMeta.tone} size="sm" className="oc-badge-craft">
                 {typeMeta.label}
               </Badge>
             )}
@@ -1514,7 +1652,7 @@ function MemoryFileCard({
           size={15}
           strokeWidth={1.75}
           aria-hidden="true"
-          className="mt-0.5 shrink-0 text-faint transition-colors group-hover:text-muted"
+          className="mt-1 shrink-0 text-faint transition-transform duration-150 group-hover:translate-x-0.5 group-hover:text-fg"
         />
       </button>
     </ListRow>
@@ -1544,6 +1682,10 @@ function TypeChips({ value, onChange }: { value: string; onChange: (v: string) =
               size="sm"
               shape="pill"
               variant={active ? "primary" : "secondary"}
+              className={cn(
+                "oc-btn-tactile",
+                active ? "oc-btn-primary-craft" : "oc-btn-secondary-craft",
+              )}
               aria-pressed={active}
               onClick={() => onChange(o.value)}
             >
@@ -1571,12 +1713,13 @@ function MemoryDocFields({
   onBody: (v: string) => void;
 }) {
   return (
-    <div className="flex flex-col gap-3">
+    <div className="flex flex-col gap-3.5">
       <Field label="记忆名称" required>
         <Input
           value={front.name}
           onChange={(e) => onFront({ name: e.target.value })}
           placeholder="例如：常用项目栈"
+          className="oc-field-control"
           autoComplete="off"
         />
       </Field>
@@ -1589,6 +1732,7 @@ function MemoryDocFields({
           value={front.description}
           onChange={(e) => onFront({ description: e.target.value })}
           placeholder="例如：我常用的项目栈与部署约定"
+          className="oc-field-control"
           autoComplete="off"
         />
       </Field>
@@ -1599,7 +1743,7 @@ function MemoryDocFields({
           onChange={(e) => onBody(e.target.value)}
           rows={bodyRows}
           placeholder="写下希望智能体长期记住的内容…"
-          className="resize-y"
+          className="oc-field-control resize-y rounded-xl"
         />
       </Field>
     </div>
@@ -1812,14 +1956,14 @@ function MemoryFileEditor({
               // 刻意**不**随 loadErr 禁用：读不到正文的记忆更需要一个清理出口,而删除是
               // 显式且带确认的操作,不属于本批要堵的"盲写覆盖"路径（那条只堵 PUT）。
               disabled={saving}
-              className="text-danger hover:bg-danger-soft max-sm:mr-0 sm:mr-auto"
+              className="oc-btn-tactile text-danger hover:bg-hover max-sm:mr-0 sm:mr-auto"
             >
-              <Trash2 size={14} /> 删除
+              <Trash2 size={14} strokeWidth={1.75} /> 删除
             </Button>
             {(dirty || saved) && (
               <span
                 className={cn(
-                  "self-center text-caption max-sm:text-center",
+                  "self-center text-caption font-medium max-sm:text-center",
                   saved ? "text-success" : "text-warning",
                 )}
               >
@@ -1828,11 +1972,12 @@ function MemoryFileEditor({
             )}
             <Button
               variant="primary"
+              className="oc-btn-tactile oc-btn-primary-craft"
               onClick={save}
               loading={saving}
               disabled={!dirty || loading || deleting || Boolean(conflict) || Boolean(loadErr)}
             >
-              {saved ? <Check size={14} /> : null}
+              {saved ? <Check size={14} strokeWidth={1.9} /> : null}
               {saved ? "已保存" : "保存"}
             </Button>
           </>
@@ -1847,9 +1992,15 @@ function MemoryFileEditor({
         ) : loadErr ? (
           <Alert
             tone="danger"
+            className="oc-callout oc-callout-danger rounded-xl"
             title="没能读到这条记忆的内容"
             action={
-              <Button size="sm" variant="secondary" onClick={() => setRetryKey((k) => k + 1)}>
+              <Button
+                size="sm"
+                variant="secondary"
+                className="oc-btn-tactile oc-btn-secondary-craft"
+                onClick={() => setRetryKey((k) => k + 1)}
+              >
                 重试
               </Button>
             }
@@ -1859,7 +2010,12 @@ function MemoryFileEditor({
         ) : (
           <>
             {err && (
-              <Alert tone="danger" density="compact" className="mb-3" onDismiss={() => setErr(null)}>
+              <Alert
+                tone="danger"
+                density="compact"
+                className="oc-callout oc-callout-danger mb-3 rounded-xl"
+                onDismiss={() => setErr(null)}
+              >
                 {err}
               </Alert>
             )}
@@ -1867,7 +2023,7 @@ function MemoryFileEditor({
               <Alert
                 tone="warning"
                 density="compact"
-                className="mb-3"
+                className="oc-callout oc-callout-warning mb-3 rounded-xl"
                 title="这条记忆在你编辑期间被智能体更新了"
               >
                 <p>你可以用自己的版本覆盖，或载入最新内容重新编辑。</p>
@@ -1876,31 +2032,47 @@ function MemoryFileEditor({
                   srLabel="服务端最新内容"
                   text={conflict.content}
                 />
-                <div className="mt-1 flex flex-wrap gap-2">
-                  <Button variant="primary" size="sm" onClick={overwriteWithMine}>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    className="oc-btn-tactile oc-btn-primary-craft"
+                    onClick={overwriteWithMine}
+                  >
                     用我的版本覆盖
                   </Button>
-                  <Button variant="secondary" size="sm" onClick={loadLatest}>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    className="oc-btn-tactile oc-btn-secondary-craft"
+                    onClick={loadLatest}
+                  >
                     放弃我的修改，载入最新
                   </Button>
                 </div>
               </Alert>
             )}
             {sourceMode ? (
-              <>
-                <Textarea
-                  value={content}
-                  onChange={(e) => setContent(e.target.value)}
-                  rows={16}
-                  spellCheck={false}
-                  aria-label="记忆源码"
-                  placeholder={"---\nname: …\ndescription: …\ntype: project\n---\n正文…"}
-                  className="min-h-64 resize-y font-mono"
-                />
-                <p className="mt-1.5 text-caption text-muted">
+              <div className="flex flex-col gap-2">
+                <div className="oc-code-shell rounded-xl">
+                  <div className="oc-code-shell-header flex items-center gap-2 px-3.5 py-2 text-caption font-medium text-muted">
+                    <FileCode2 size={13} strokeWidth={1.75} aria-hidden="true" className="text-accent" />
+                    <span>存储原文（源码模式）</span>
+                  </div>
+                  <Textarea
+                    value={content}
+                    onChange={(e) => setContent(e.target.value)}
+                    rows={16}
+                    spellCheck={false}
+                    aria-label="记忆源码"
+                    placeholder={"---\nname: …\ndescription: …\ntype: project\n---\n正文…"}
+                    className="min-h-64 resize-y rounded-none border-0 bg-transparent font-mono shadow-none focus:ring-0"
+                  />
+                </div>
+                <p className="text-caption text-muted">
                   源码模式直接编辑存储原文（含首部字段块）。改坏了字段块会让这条记忆失去标题与召回描述。
                 </p>
-              </>
+              </div>
             ) : (
               <MemoryDocFields
                 front={front}
@@ -1910,8 +2082,8 @@ function MemoryFileEditor({
                 onBody={setBody}
               />
             )}
-            <div className="mt-4 flex items-center justify-between gap-3 border-t border-border pt-3">
-              <label htmlFor={sourceId} className="text-caption text-muted">
+            <div className="oc-surface-recessed mt-4 flex items-center justify-between gap-3 rounded-xl px-3.5 py-2.5">
+              <label htmlFor={sourceId} className="cursor-pointer text-caption font-medium text-muted">
                 编辑源码
               </label>
               <Switch id={sourceId} checked={sourceMode} onCheckedChange={setSourceMode} />
@@ -2031,17 +2203,28 @@ function NewMemoryFileDialog({
         mobile="fullscreen"
         footer={
           <>
-            <Button variant="ghost" onClick={requestClose} disabled={saving}>
+            <Button variant="ghost" className="oc-btn-tactile" onClick={requestClose} disabled={saving}>
               取消
             </Button>
-            <Button variant="primary" onClick={submit} loading={saving} disabled={!canSubmit}>
+            <Button
+              variant="primary"
+              className="oc-btn-tactile oc-btn-primary-craft"
+              onClick={submit}
+              loading={saving}
+              disabled={!canSubmit}
+            >
               创建
             </Button>
           </>
         }
       >
         {err && (
-          <Alert tone="danger" density="compact" className="mb-3" onDismiss={() => setErr(null)}>
+          <Alert
+            tone="danger"
+            density="compact"
+            className="oc-callout oc-callout-danger mb-3 rounded-xl"
+            onDismiss={() => setErr(null)}
+          >
             {err}
           </Alert>
         )}
@@ -2052,7 +2235,7 @@ function NewMemoryFileDialog({
           onFront={setFront}
           onBody={setBody}
         />
-        <div className="mt-4 border-t border-border pt-3">
+        <div className="mt-4 border-t border-border/80 pt-3">
           <Button
             variant="ghost"
             size="sm"
@@ -2068,20 +2251,22 @@ function NewMemoryFileDialog({
             高级
           </Button>
           {showAdvanced && (
-            <Field
-              label="存储标识"
-              className="mt-1.5"
-              hint={`留空则自动使用 ${filename.replace(/\.md$/i, "")}。仅影响存储，不影响智能体如何理解这条记忆。`}
-              error={fileError ?? undefined}
-            >
-              <Input
-                value={customFile}
-                onChange={(e) => setCustomFile(e.target.value)}
-                placeholder="例如 user-preferences"
-                autoComplete="off"
-                spellCheck={false}
-              />
-            </Field>
+            <div className="oc-surface-recessed mt-2 rounded-xl p-3">
+              <Field
+                label="存储标识"
+                hint={`留空则自动使用 ${filename.replace(/\.md$/i, "")}。仅影响存储，不影响智能体如何理解这条记忆。`}
+                error={fileError ?? undefined}
+              >
+                <Input
+                  value={customFile}
+                  onChange={(e) => setCustomFile(e.target.value)}
+                  placeholder="例如 user-preferences"
+                  className="oc-field-control"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              </Field>
+            </div>
           )}
         </div>
       </Modal>
@@ -2195,7 +2380,7 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
   }, [serverLatest]);
 
   return (
-    <div className="flex flex-col gap-3 px-4 pb-6 pt-5">
+    <div className="flex flex-col gap-4 px-4 pb-6 pt-5">
       <SectionHeading
         className="pb-0"
         title="所有智能体共享"
@@ -2203,7 +2388,12 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
       />
 
       {notice && (
-        <Alert tone="info" density="compact" onDismiss={() => setNotice(null)}>
+        <Alert
+          tone="info"
+          density="compact"
+          className="oc-callout oc-callout-info rounded-xl"
+          onDismiss={() => setNotice(null)}
+        >
           <p>{notice}</p>
           {serverLatest !== null && (
             <>
@@ -2212,11 +2402,22 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
                 srLabel="服务端最新画像"
                 text={serverLatest || "（空）"}
               />
-              <div className="mt-1 flex flex-wrap gap-2">
-                <Button variant="primary" size="sm" onClick={save} loading={saving}>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <Button
+                  variant="primary"
+                  size="sm"
+                  className="oc-btn-tactile oc-btn-primary-craft"
+                  onClick={save}
+                  loading={saving}
+                >
                   用我的版本覆盖
                 </Button>
-                <Button variant="secondary" size="sm" onClick={loadLatest}>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="oc-btn-tactile oc-btn-secondary-craft"
+                  onClick={loadLatest}
+                >
                   放弃我的修改，载入最新
                 </Button>
               </div>
@@ -2228,16 +2429,22 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
       {loading ? (
         <output aria-busy="true" className="block">
           <span className="sr-only">加载中…</span>
-          <Skeleton className="h-32 w-full rounded-lg" />
+          <Skeleton className="h-36 w-full rounded-xl" />
         </output>
       ) : !loaded ? (
         // 读失败(或任何"没读成功"的状态)只给重试出口。渲染出可编辑框 = 邀请用户用一段
         // 凭空敲出来的文本整体覆盖服务端上真实存在的画像。
         <Alert
           tone="danger"
+          className="oc-callout oc-callout-danger rounded-xl"
           title="没能读到你的用户画像"
           action={
-            <Button size="sm" variant="secondary" onClick={reload}>
+            <Button
+              size="sm"
+              variant="secondary"
+              className="oc-btn-tactile oc-btn-secondary-craft"
+              onClick={reload}
+            >
               重试
             </Button>
           }
@@ -2245,13 +2452,20 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
           {loadErr ?? "加载用户画像失败"}（可能是智能体正在启动）。为避免覆盖你已有的画像，加载成功前不能编辑。
         </Alert>
       ) : (
-        <>
+        <div className="oc-surface-card flex flex-col gap-3.5 rounded-2xl p-4">
           {err && (
-            <Alert tone="danger" density="compact" onDismiss={() => setErr(null)}>
+            <Alert
+              tone="danger"
+              density="compact"
+              className="oc-callout oc-callout-danger rounded-xl"
+              onDismiss={() => setErr(null)}
+            >
               {err}
             </Alert>
           )}
-          <p className="text-meta leading-relaxed text-muted">画像保留供查阅。是否自动加载取决于当前运行环境；旧版仍可能加载标记内容，请在“偏好 → 隐私与助手”核验支持状态。此处保存不更改称呼授权。</p>
+          <p className="oc-callout oc-callout-info rounded-xl px-3.5 py-2.5 text-meta leading-relaxed text-muted">
+            画像保留供查阅。是否自动加载取决于当前运行环境；旧版仍可能加载标记内容，请在“偏好 → 隐私与助手”核验支持状态。此处保存不更改称呼授权。
+          </p>
           <Textarea
             value={text}
             onChange={(e) => setText(e.target.value)}
@@ -2259,12 +2473,13 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
             rows={8}
             aria-label="用户画像"
             placeholder="例如：称呼、职业背景、常用项目与偏好、沟通风格…"
-            className="min-h-32 resize-y"
+            className="oc-field-control min-h-36 resize-y rounded-xl"
           />
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
             <Button
               variant="primary"
               size="sm"
+              className="oc-btn-tactile oc-btn-primary-craft"
               onClick={save}
               loading={saving}
               disabled={!dirty || overLimit}
@@ -2272,10 +2487,15 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
                 overLimit ? `已超出字符预算（${chars}/${limit}），请精简后再保存` : undefined
               }
             >
-              {saved ? <Check size={14} /> : null}
+              {saved ? <Check size={14} strokeWidth={1.9} /> : null}
               {saved ? "已保存" : "保存"}
             </Button>
-            <span className={cn("text-caption", overLimit ? "font-medium text-danger" : "text-muted")}>
+            <span
+              className={cn(
+                "oc-surface-recessed rounded-full px-2.5 py-0.5 text-caption tabular-nums",
+                overLimit ? "font-medium text-danger" : "text-muted",
+              )}
+            >
               {chars}
               {limit > 0 ? `/${limit}` : ""} 字符
             </span>
@@ -2283,7 +2503,7 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
               {saved ? "已保存" : ""}
             </span>
           </div>
-        </>
+        </div>
       )}
     </div>
   );

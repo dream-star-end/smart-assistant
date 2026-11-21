@@ -294,7 +294,24 @@ export function SitesWorkspaceView({
         />
       ) : (
         <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-4 py-6 sm:px-8 sm:py-8">
-          <h1 className="text-2xl font-semibold text-fg sm:text-3xl">站点</h1>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <span className="oc-icon-badge oc-icon-badge-accent size-10 rounded-xl" aria-hidden="true">
+                <Globe size={19} strokeWidth={1.75} />
+              </span>
+              <div>
+                <div className="flex items-center gap-2">
+                  <h1 className="text-2xl font-semibold tracking-tight text-fg sm:text-3xl">站点</h1>
+                  {allSites.length > 0 && (
+                    <span className="oc-badge-craft rounded-full bg-hover px-2.5 py-0.5 text-caption font-medium tabular-nums text-muted">
+                      {allSites.length}
+                    </span>
+                  )}
+                </div>
+                <p className="text-caption text-muted">静态与全栈应用持久托管工作区</p>
+              </div>
+            </div>
+          </div>
 
           <div className="flex flex-wrap items-center gap-3">
             <label className="relative min-w-[200px] flex-1">
@@ -309,7 +326,7 @@ export function SitesWorkspaceView({
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="搜索站点"
                 aria-label="搜索站点"
-                className="h-10 w-full rounded-full border border-border bg-surface pl-9 pr-4 text-body text-fg placeholder:text-faint outline-none transition-colors focus:border-accent"
+                className="oc-field-control h-10 w-full rounded-full border border-border-control pl-9 pr-4 text-body text-fg placeholder:text-faint outline-none"
               />
             </label>
 
@@ -317,7 +334,7 @@ export function SitesWorkspaceView({
               <DropdownMenuTrigger asChild>
                 <button
                   type="button"
-                  className="inline-flex h-10 shrink-0 items-center gap-1.5 rounded-full bg-fg px-4 text-body font-medium text-bg transition-opacity hover:opacity-90 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  className="oc-btn-primary-craft oc-btn-tactile inline-flex h-10 shrink-0 items-center gap-1.5 rounded-full bg-primary px-4 text-body font-medium text-primary-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
                   创建
                   <ChevronDown size={14} aria-hidden="true" />
@@ -356,7 +373,7 @@ export function SitesWorkspaceView({
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex flex-wrap items-center gap-1.5">
+            <div className="oc-surface-recessed flex flex-wrap items-center gap-1 rounded-full p-1">
               {(
                 [
                   { id: "all", label: "全部" },
@@ -374,10 +391,10 @@ export function SitesWorkspaceView({
                   type="button"
                   onClick={() => setFilter(item.id)}
                   className={cn(
-                    "rounded-full px-3.5 py-1.5 text-body transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                    "oc-btn-tactile rounded-full px-3.5 py-1.5 text-meta transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring",
                     filter === item.id
-                      ? "bg-hover font-medium text-fg"
-                      : "text-muted hover:bg-hover/60 hover:text-fg",
+                      ? "oc-segmented-thumb font-medium text-fg"
+                      : "text-muted hover:text-fg",
                   )}
                 >
                   {item.label}
@@ -385,7 +402,7 @@ export function SitesWorkspaceView({
               ))}
             </div>
 
-            <div className="inline-flex items-center gap-1 rounded-full bg-bg-subtle p-1">
+            <div className="oc-surface-recessed inline-flex items-center gap-1 rounded-full p-1">
               <IconButton
                 variant={viewMode === "grid" ? "subtle" : "ghost"}
                 size="sm"
@@ -393,6 +410,7 @@ export function SitesWorkspaceView({
                 aria-label="网格视图"
                 aria-pressed={viewMode === "grid"}
                 onClick={() => setViewMode("grid")}
+                className={viewMode === "grid" ? "oc-segmented-thumb text-fg" : undefined}
               >
                 <LayoutGrid size={15} />
               </IconButton>
@@ -403,6 +421,7 @@ export function SitesWorkspaceView({
                 aria-label="列表视图"
                 aria-pressed={viewMode === "list"}
                 onClick={() => setViewMode("list")}
+                className={viewMode === "list" ? "oc-segmented-thumb text-fg" : undefined}
               >
                 <List size={15} />
               </IconButton>
@@ -471,23 +490,24 @@ export function SitesWorkspaceView({
                   key={site.id}
                   type="button"
                   onClick={() => onSelectSlug(site.slug)}
-                  className="group flex flex-col overflow-hidden rounded-xl border border-border bg-surface text-left transition-colors hover:border-border-strong hover:bg-hover/30 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  className="oc-surface-card oc-surface-card-hover group flex flex-col overflow-hidden rounded-2xl text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
-                  <SitePreviewThumb
-                    site={site}
-                    baseDomain={baseDomain}
-                    className="rounded-none border-0 border-b border-border/60"
-                  />
-                  <div className="space-y-1 p-3.5">
+                  <div className="p-2.5 pb-0">
+                    <SitePreviewThumb site={site} baseDomain={baseDomain} />
+                  </div>
+                  <div className="space-y-1.5 p-3.5">
                     <div className="flex items-center justify-between gap-2">
-                      <p className="truncate text-body font-medium text-fg">{site.title}</p>
-                      <VisibilityIcon visibility={site.visibility} />
+                      <p className="truncate text-section font-semibold text-fg">{site.title}</p>
+                      <span className="oc-badge-craft inline-flex shrink-0 items-center gap-1 rounded-full bg-hover px-2 py-0.5 text-micro text-muted">
+                        <VisibilityIcon visibility={site.visibility} />
+                      </span>
                     </div>
                     <p className="truncate font-mono text-caption text-muted">
                       {site.customDomain || `${site.slug}.${baseDomain}`}
                     </p>
                     {(site.accessRole ?? "owner") !== "owner" && (
-                      <p className="truncate text-micro font-medium text-info">
+                      <p className="oc-badge-craft inline-flex max-w-full items-center gap-1 truncate rounded-full bg-info-soft px-2 py-0.5 text-micro font-medium text-info">
+                        <Users size={11} aria-hidden="true" />
                         共享 · {roleLabel(site.accessRole ?? "editor")}
                         {site.ownerEmail ? ` · ${site.ownerEmail}` : ""}
                       </p>
@@ -497,61 +517,63 @@ export function SitesWorkspaceView({
               ))}
             </div>
           ) : (
-            <div className="divide-y divide-border/70">
-              <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-4 px-1 pb-2.5 text-caption text-muted sm:grid-cols-[minmax(0,1fr)_180px]">
+            <div className="oc-surface-card overflow-hidden rounded-2xl">
+              <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-4 border-b border-border/70 bg-bg/60 px-4 py-2.5 text-caption font-medium text-faint sm:grid-cols-[minmax(0,1fr)_190px]">
                 <span>站点</span>
                 <span>共享对象</span>
               </div>
-              {filtered.map((site) => (
-                <button
-                  key={site.id}
-                  type="button"
-                  onClick={() => onSelectSlug(site.slug)}
-                  className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-4 px-1 py-3.5 text-left transition-colors hover:bg-hover/40 outline-none focus-visible:ring-2 focus-visible:ring-ring sm:grid-cols-[minmax(0,1fr)_180px]"
-                >
-                  <div className="flex min-w-0 items-center gap-3.5">
-                    <div className="w-20 shrink-0 sm:w-24">
-                      <SitePreviewThumb site={site} baseDomain={baseDomain} />
-                    </div>
-                    <div className="min-w-0 space-y-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <p className="truncate text-body font-medium text-fg">{site.title}</p>
-                        {(site.accessRole ?? "owner") !== "owner" && (
-                          <span className="inline-flex items-center gap-1 rounded-full bg-info-soft px-2 py-0.5 text-micro font-medium text-info">
-                            <Users size={11} aria-hidden="true" />
-                            共享 · {roleLabel(site.accessRole ?? "editor")}
-                          </span>
-                        )}
-                        {site.customDomain && (
-                          <span className="hidden truncate rounded bg-bg-subtle px-1.5 py-0.5 font-mono text-micro text-muted sm:inline">
-                            {site.customDomain}
-                          </span>
-                        )}
+              <div className="divide-y divide-border/60">
+                {filtered.map((site) => (
+                  <button
+                    key={site.id}
+                    type="button"
+                    onClick={() => onSelectSlug(site.slug)}
+                    className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-4 px-4 py-3.5 text-left transition-colors hover:bg-hover/50 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:grid-cols-[minmax(0,1fr)_190px]"
+                  >
+                    <div className="flex min-w-0 items-center gap-3.5">
+                      <div className="w-20 shrink-0 sm:w-24">
+                        <SitePreviewThumb site={site} baseDomain={baseDomain} />
                       </div>
-                      <p className="text-caption text-muted">
-                        {formatMonthDay(site.updatedAt)} ·{" "}
-                        <span className="font-mono">{site.slug}</span>
-                        {(site.accessRole ?? "owner") !== "owner" && site.ownerEmail && (
-                          <span> · 来自 {site.ownerEmail}</span>
-                        )}
-                      </p>
+                      <div className="min-w-0 space-y-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <p className="truncate text-section font-semibold text-fg">{site.title}</p>
+                          {(site.accessRole ?? "owner") !== "owner" && (
+                            <span className="oc-badge-craft inline-flex items-center gap-1 rounded-full bg-info-soft px-2 py-0.5 text-micro font-medium text-info">
+                              <Users size={11} aria-hidden="true" />
+                              共享 · {roleLabel(site.accessRole ?? "editor")}
+                            </span>
+                          )}
+                          {site.customDomain && (
+                            <span className="oc-badge-craft hidden truncate rounded-full bg-hover px-2 py-0.5 font-mono text-micro text-muted sm:inline">
+                              {site.customDomain}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-caption text-muted">
+                          {formatMonthDay(site.updatedAt)} ·{" "}
+                          <span className="font-mono">{site.slug}</span>
+                          {(site.accessRole ?? "owner") !== "owner" && site.ownerEmail && (
+                            <span> · 来自 {site.ownerEmail}</span>
+                          )}
+                        </p>
+                      </div>
                     </div>
-                  </div>
-                  <div className="flex flex-col items-end gap-0.5 text-body text-muted sm:items-start">
-                    <span className="flex items-center gap-1.5">
-                      <VisibilityIcon visibility={site.visibility} />
-                      <span>{sharingLabel(site.visibility)}</span>
-                    </span>
-                    {(site.accessRole ?? "owner") === "owner" &&
-                      (site.collaboratorCount ?? 0) > 0 && (
-                        <span className="inline-flex items-center gap-1 text-caption text-faint">
-                          <Users size={12} aria-hidden="true" />
-                          协作 {site.collaboratorCount} 人
-                        </span>
-                      )}
-                  </div>
-                </button>
-              ))}
+                    <div className="flex flex-col items-end gap-1 text-meta text-muted sm:items-start">
+                      <span className="oc-badge-craft inline-flex items-center gap-1.5 rounded-full bg-hover px-2.5 py-0.5 text-caption font-medium text-muted">
+                        <VisibilityIcon visibility={site.visibility} />
+                        <span>{sharingLabel(site.visibility)}</span>
+                      </span>
+                      {(site.accessRole ?? "owner") === "owner" &&
+                        (site.collaboratorCount ?? 0) > 0 && (
+                          <span className="inline-flex items-center gap-1 pl-1 text-caption tabular-nums text-faint">
+                            <Users size={12} aria-hidden="true" />
+                            协作 {site.collaboratorCount} 人
+                          </span>
+                        )}
+                    </div>
+                  </button>
+                ))}
+              </div>
             </div>
           )}
         </div>
@@ -569,7 +591,7 @@ export function SitesWorkspaceView({
           ) : inviteErr ? (
             <Alert tone="danger">{inviteErr}</Alert>
           ) : invitePreview ? (
-            <div className="space-y-2 rounded-xl border border-border bg-bg-subtle/60 p-4 text-body">
+            <div className="oc-surface-recessed space-y-2 rounded-xl p-4 text-body">
               <p className="font-semibold text-fg">{invitePreview.site.title}</p>
               <p className="font-mono text-caption text-muted">{invitePreview.site.url}</p>
               <p className="text-caption text-muted">

@@ -1,6 +1,7 @@
-import { Archive, RefreshCw, Users } from 'lucide-react'
+import { Archive, CheckCircle2, RefreshCw, Sparkles, Users, UserX, WandSparkles } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Alert, Badge, Button, Input, Modal } from '../../../components/ui'
+import { cn } from '../../../lib/utils'
 import { type Column, DataTable, PageHeader, StatCard, StatCardRow, TimeAgo } from '../../components'
 import { adminGet, adminSend, apiErrorMessage } from '../../lib/adminApi'
 import { getAdminPage } from '../../registry'
@@ -238,9 +239,13 @@ export default function AutoDreamFindingsPage() {
     .filter((row) => Date.now() - new Date(row.last_seen_at).getTime() > 30 * 24 * 60 * 60 * 1000)
     .map((row) => row.id)
 
+  const selectClass =
+    'oc-field-control h-9 rounded-lg border border-border-control bg-surface px-3 text-base md:text-sm text-fg outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-ring'
+
   return (
     <div className="flex flex-col gap-5">
       <PageHeader
+        icon={WandSparkles}
         title={meta.title}
         desc={`${meta.desc} · 共 ${total} 项`}
         actions={
@@ -251,7 +256,7 @@ export default function AutoDreamFindingsPage() {
                 setTraffic(event.target.value)
                 setPage(0)
               }}
-              className="rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg"
+              className={selectClass}
             >
               <option value="production_user">真实用户</option>
               <option value="all">全部流量</option>
@@ -266,7 +271,7 @@ export default function AutoDreamFindingsPage() {
                 setSeenWithin(event.target.value as SeenWithin)
                 setPage(0)
               }}
-              className="rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
+              className={selectClass}
             >
               <option value="1h">最近 1 小时</option>
               <option value="24h">最近 24 小时</option>
@@ -281,7 +286,7 @@ export default function AutoDreamFindingsPage() {
                 setMinAffectedUsers(event.target.value)
                 setPage(0)
               }}
-              className="rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
+              className={selectClass}
             >
               <option value="1">至少 1 位用户</option>
               <option value="2">至少 2 位用户</option>
@@ -292,7 +297,7 @@ export default function AutoDreamFindingsPage() {
               value={ownerFilter}
               onChange={(event) => { setOwnerFilter(event.target.value); setPage(0) }}
               placeholder="负责人筛选"
-              className="w-36"
+              className="oc-field-control h-9 w-36"
             />
             <select
               value={model}
@@ -300,7 +305,7 @@ export default function AutoDreamFindingsPage() {
                 setModel(event.target.value)
                 setPage(0)
               }}
-              className="rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
+              className={selectClass}
             >
               <option value="current">当前模型{resolvedModel ? ` · ${resolvedModel}` : ''}</option>
               <option value="all">全部模型（含历史）</option>
@@ -311,7 +316,7 @@ export default function AutoDreamFindingsPage() {
                 setStatus(event.target.value)
                 setPage(0)
               }}
-              className="rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg"
+              className={selectClass}
             >
               <option value="all">全部状态</option>
               {Object.entries(STATUS_LABEL).map(([value, label]) => (
@@ -326,6 +331,7 @@ export default function AutoDreamFindingsPage() {
             </span>
             <Button
               variant="ghost"
+              size="sm"
               disabled={page === 0}
               onClick={() => setPage((value) => value - 1)}
             >
@@ -333,35 +339,32 @@ export default function AutoDreamFindingsPage() {
             </Button>
             <Button
               variant="ghost"
+              size="sm"
               disabled={(page + 1) * 100 >= total}
               onClick={() => setPage((value) => value + 1)}
             >
               下一页
             </Button>
-            <Button variant="ghost" onClick={() => void load()}>
+            <Button variant="secondary" size="sm" onClick={() => void load()}>
               <RefreshCw size={14} /> 刷新
             </Button>
           </div>
         }
       />
-      {error && (
-        <div className="rounded-xl border border-danger/25 bg-danger-soft px-4 py-3 text-sm text-danger">
-          {error}
-        </div>
-      )}
+      {error && <Alert tone="danger">{error}</Alert>}
       {seenWithin === 'all' && (
         <Alert tone="warning">
           已展开全部历史积压。默认视图只看当前模型最近 30 天，避免陈旧单一来源淹没近期多用户信号。
         </Alert>
       )}
       <StatCardRow>
-        <StatCard label="当前筛选总数" value={total} icon={RefreshCw} tone="neutral" loading={loading} />
+        <StatCard label="当前筛选总数" value={total} icon={Sparkles} tone="accent" loading={loading} />
         <StatCard label="当前页影响用户" value={summary.affected} icon={Users} tone="info" hint="聚合计数，可能跨 finding 重复" loading={loading} />
-        <StatCard label="多源印证" value={summary.corroborated} icon={Users} tone="success" loading={loading} />
-        <StatCard label="当前页未指派" value={summary.unowned} icon={Users} tone={summary.unowned > 0 ? 'warning' : 'success'} loading={loading} />
+        <StatCard label="多源印证" value={summary.corroborated} icon={CheckCircle2} tone="success" loading={loading} />
+        <StatCard label="当前页未指派" value={summary.unowned} icon={UserX} tone={summary.unowned > 0 ? 'warning' : 'success'} loading={loading} />
       </StatCardRow>
-      <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-surface px-3 py-2">
-        <span className="text-meta text-muted">已选择 {selectedIds.size} 项</span>
+      <div className="oc-surface-recessed flex flex-wrap items-center gap-2.5 rounded-xl px-3.5 py-2.5">
+        <span className="text-meta font-medium tabular-nums text-muted">已选择 {selectedIds.size} 项</span>
         <Button size="sm" variant="secondary" disabled={selectedIds.size === 0 || updating} onClick={() => void updateBatch([...selectedIds], { status: 'triaged' })}>
           批量分诊
         </Button>
@@ -370,7 +373,8 @@ export default function AutoDreamFindingsPage() {
         </Button>
         {seenWithin === 'all' && (
           <Button size="sm" variant="secondary" disabled={staleSingleSourceIds.length === 0 || updating} onClick={() => void updateBatch(staleSingleSourceIds, { status: 'dismissed' })}>
-            <Archive size={14} />归档当前页陈旧单源（{staleSingleSourceIds.length}）
+            <Archive size={14} />
+            <span className="tabular-nums">归档当前页陈旧单源（{staleSingleSourceIds.length}）</span>
           </Button>
         )}
         <span className="text-caption text-faint">“归档”复用既有「已忽略」状态，不创建第二套生命周期。</span>
@@ -424,20 +428,30 @@ export default function AutoDreamFindingsPage() {
             </>
           }
         >
-          <div className="space-y-4 text-sm leading-relaxed">
+          <div className="space-y-3.5 text-sm leading-relaxed">
             <Field title="问题" value={selected.problem} />
             <Field title="用户影响" value={selected.impact} />
-            <Field title="建议" value={selected.recommendation} />
-            <Field
-              title="证据置信"
-              value={
+            <div className="oc-callout oc-callout-info rounded-xl px-3.5 py-3">
+              <div className="mb-1 text-xs font-semibold text-faint">建议</div>
+              <p className="text-fg">{selected.recommendation}</p>
+            </div>
+            <div
+              className={cn(
+                'oc-callout rounded-xl px-3.5 py-3',
                 selected.evidence_confidence === 'corroborated'
+                  ? 'oc-callout-success'
+                  : 'oc-callout-warning',
+              )}
+            >
+              <div className="mb-1 text-xs font-semibold text-faint">证据置信</div>
+              <p className="text-fg">
+                {selected.evidence_confidence === 'corroborated'
                   ? '来自至少 2 位匿名用户、2 次独立运行；与严重级别分开判断。'
-                  : '当前仅有单一来源；保留信号但不据此放大结论。'
-              }
-            />
-            <div>
-              <div className="mb-1 text-xs font-semibold text-faint">负责人</div>
+                  : '当前仅有单一来源；保留信号但不据此放大结论。'}
+              </p>
+            </div>
+            <div className="oc-surface-recessed rounded-xl p-3.5">
+              <div className="mb-1.5 text-xs font-semibold text-faint">负责人</div>
               <div className="flex gap-2">
                 <Input
                   aria-label="发现负责人"
@@ -445,13 +459,21 @@ export default function AutoDreamFindingsPage() {
                   onChange={(event) => setEditOwner(event.target.value)}
                   placeholder="留空取消指派"
                   disabled={updating}
+                  className="oc-field-control"
                 />
                 <Button variant="secondary" disabled={updating || editOwner.trim() === (selected.owner ?? '')} onClick={() => void updateFinding({ owner: editOwner.trim() || null })}>
                   保存负责人
                 </Button>
               </div>
             </div>
-            <Field title="聚类指纹" value={selected.fingerprint} />
+            <div className="oc-code-shell">
+              <div className="oc-code-shell-header px-3.5 py-1.5 text-xs font-semibold text-faint">
+                聚类指纹
+              </div>
+              <p className="select-all break-all px-3.5 py-2.5 font-mono text-meta text-fg">
+                {selected.fingerprint}
+              </p>
+            </div>
             <p className="text-xs text-faint">
               仅展示匿名闭集摘要，不含用户 ID、原始会话、日志正文、工具参数或凭证。
             </p>
@@ -464,7 +486,7 @@ export default function AutoDreamFindingsPage() {
 
 function Field({ title, value }: { title: string; value: string }) {
   return (
-    <div>
+    <div className="oc-surface-recessed rounded-xl px-3.5 py-3">
       <div className="mb-1 text-xs font-semibold text-faint">{title}</div>
       <p className="text-fg">{value}</p>
     </div>

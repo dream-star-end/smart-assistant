@@ -1,16 +1,31 @@
-import { X } from 'lucide-react'
+import {
+  Bot,
+  ChevronDown,
+  ExternalLink,
+  Pencil,
+  Play,
+  RotateCcw,
+  Send,
+  Square,
+  UserCheck,
+  Wrench,
+  X,
+} from 'lucide-react'
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AuthEpochStaleError } from '../../lib/api'
 import {
   type BoardAgent,
   type PipelineStage,
   TICKET_PRIORITIES,
+  TICKET_PRIORITY_TONE,
   TICKET_STATUS_LABEL,
   TICKET_TYPE_LABEL,
   type Ticket,
   type TicketComment,
   type TicketPriority,
   type TicketRun,
+  type TicketStatus,
+  type TicketType,
   type TimelineItem,
   assigneeLabel,
   boardErrorCode,
@@ -22,10 +37,23 @@ import {
   taskboardErrorMessage,
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
+import { cn } from '../../lib/utils'
 import { Markdown } from '../Markdown'
-import { Button, Field, IconButton, Input, ListSkeleton, Select, Sheet, useToast } from '../ui'
+import { Badge, Button, Field, IconButton, Input, ListSkeleton, Select, Sheet, useToast } from '../ui'
+import { ticketTypeBadgeClass, ticketTypeIcon } from './TicketCard'
 import { LOCAL_COMMENT_ID_PREFIX, TicketTimeline } from './TicketTimeline'
 import { useTimelineHistory } from './timelineHistory'
+
+function drawerStatusTone(
+  status: TicketStatus,
+): 'danger' | 'success' | 'warning' | 'info' | 'accent' | 'neutral' {
+  if (status === 'blocked') return 'danger'
+  if (status === 'done') return 'success'
+  if (status === 'waiting_human') return 'warning'
+  if (status === 'running') return 'info'
+  if (status === 'ready') return 'accent'
+  return 'neutral'
+}
 
 // Share reads from background, initial and post-write reconciliation. A slow
 // response may be shared, but its owner/version is checked before it is applied.
@@ -86,21 +114,27 @@ function TicketMarkdown({
 
 /** 抽屉顶部常驻的一行:编号 + 关闭。移动端贴底抽屉没有 Esc,遮罩只剩顶部 15%,必须有它(审计 T-05)。 */
 function DrawerBar({
-  desktop,
   label,
+  ticketType,
   onClose,
 }: {
-  desktop: boolean
   label: string
+  ticketType?: TicketType
   onClose: () => void
 }) {
+  const Icon = ticketType ? ticketTypeIcon(ticketType) : null
   return (
-    <div
-      className={`sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 px-4 pt-3 pb-1 ${
-        desktop ? 'bg-sidebar' : 'bg-elevated'
-      }`}
-    >
-      <p className="min-w-0 truncate font-mono text-caption text-faint">{label}</p>
+    <div className="oc-surface-glass sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 border-x-0 border-t-0 border-b border-border/70 px-4 py-2.5">
+      <div className="flex min-w-0 items-center gap-2">
+        {ticketType && Icon ? (
+          <span className={cn('size-6 rounded-md', ticketTypeBadgeClass(ticketType))} aria-hidden>
+            <Icon size={12} />
+          </span>
+        ) : null}
+        <p className="inline-flex min-w-0 items-center truncate rounded-md bg-hover px-2 py-0.5 font-mono text-caption font-medium tracking-tight text-muted tabular-nums">
+          {label}
+        </p>
+      </div>
       <IconButton
         type="button"
         size="sm"
@@ -803,19 +837,22 @@ export function TicketDrawer({
       className={desktop ? 'w-[36rem] max-w-[96vw]' : 'h-[94dvh] max-h-[94dvh]'}
     >
       <DrawerBar
-        desktop={desktop}
         label={current?.identifier ?? ticketRef ?? '单据详情'}
+        ticketType={current?.type}
         onClose={onClose}
       />
       {current ? (
         <div
           data-testid="ticket-drawer"
           ref={scrollContainer}
-          className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 pb-4 pt-1"
+          className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto px-4 pt-3 pb-5"
         >
           <div>
             {editing ? (
-              <div className="flex flex-col gap-2" data-testid="ticket-drawer-edit-form">
+              <div
+                className="oc-surface-card flex flex-col gap-3 rounded-xl p-3.5"
+                data-testid="ticket-drawer-edit-form"
+              >
                 <Field label="标题" required>
                   <Input
                     aria-label="单据标题"
@@ -827,12 +864,12 @@ export function TicketDrawer({
                   <textarea
                     aria-label="单据描述"
                     placeholder="写清复现步骤、验收标准、范围内外"
-                    className="min-h-28 w-full rounded-lg border border-border-control bg-surface px-3.5 py-2.5 text-base leading-relaxed text-fg outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-ring md:text-sm"
+                    className="oc-field-control min-h-28 w-full rounded-lg border border-border-control bg-surface px-3.5 py-2.5 text-base leading-relaxed text-fg outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-ring md:text-sm"
                     value={draftBody}
                     onChange={(e) => setDraftBody(e.target.value)}
                   />
                 </Field>
-                <div className="grid grid-cols-2 gap-2">
+                <div className="grid grid-cols-2 gap-2.5">
                   <Field label="优先级">
                     <Select
                       aria-label="优先级"
@@ -853,14 +890,15 @@ export function TicketDrawer({
                   </Field>
                 </div>
                 {editVersion !== null && editVersion !== current.version && (
-                  <output className="block text-caption text-warning">
+                  <output className="oc-callout oc-callout-warning block rounded-lg px-3 py-2 text-caption text-warning">
                     任务已被更新，当前草稿已保留。保存时会检查冲突；可放弃修改后重新编辑最新内容。
                   </output>
                 )}
-                <div className="flex flex-wrap gap-1">
+                <div className="flex flex-wrap gap-1.5 border-t border-border/60 pt-2.5">
                   <Button
                     type="button"
                     size="sm"
+                    variant="primary"
                     loading={saving}
                     data-testid="ticket-drawer-save"
                     onClick={() => void saveEdit()}
@@ -873,17 +911,53 @@ export function TicketDrawer({
                 </div>
               </div>
             ) : (
-              <>
-                <h2 className="mt-1 text-title font-semibold text-fg">{current.title}</h2>
-                <p className="mt-1 text-meta text-muted">
-                  {TICKET_TYPE_LABEL[current.type]} · {current.priority} ·{' '}
-                  {TICKET_STATUS_LABEL[current.status]}
-                  {stageName ? ` · ${stageName}` : ''}
-                  {current.approvedBy
-                    ? ` · 批准人 ${assigneeLabel(current.approvedBy) ?? current.approvedBy}`
-                    : ''}
-                </p>
-              </>
+              <div className="oc-surface-card flex flex-col gap-2.5 rounded-xl p-3.5">
+                <h2 className="text-title font-semibold leading-snug tracking-tight text-fg">
+                  {current.title}
+                </h2>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <Badge tone="neutral" size="sm">
+                    {TICKET_TYPE_LABEL[current.type]}
+                  </Badge>
+                  <Badge tone={TICKET_PRIORITY_TONE[current.priority]} size="sm">
+                    {current.priority}
+                  </Badge>
+                  <Badge tone={drawerStatusTone(current.status)} size="sm">
+                    {TICKET_STATUS_LABEL[current.status]}
+                  </Badge>
+                  {stageName && (
+                    <Badge tone="info" size="sm">
+                      {stageName}
+                    </Badge>
+                  )}
+                </div>
+                {(assigneeLabel(current.assignee) || current.approvedBy) && (
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-border/60 pt-2 text-caption text-muted">
+                    {assigneeLabel(current.assignee) && (
+                      <span className="inline-flex items-center gap-1.5">
+                        <span
+                          className="oc-avatar-ring inline-flex size-4 shrink-0 items-center justify-center rounded-full bg-accent-soft text-accent"
+                          aria-hidden
+                        >
+                          <Bot size={10} />
+                        </span>
+                        <span>{assigneeLabel(current.assignee)}</span>
+                      </span>
+                    )}
+                    {current.approvedBy && (
+                      <span className="inline-flex items-center gap-1.5">
+                        <span
+                          className="oc-avatar-ring inline-flex size-4 shrink-0 items-center justify-center rounded-full bg-hover text-muted"
+                          aria-hidden
+                        >
+                          <UserCheck size={10} />
+                        </span>
+                        <span>批准人 {assigneeLabel(current.approvedBy) ?? current.approvedBy}</span>
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
             )}
           </div>
 
@@ -892,46 +966,60 @@ export function TicketDrawer({
               <details
                 open={descriptionOpen}
                 onToggle={(event) => setDescriptionOpen(event.currentTarget.open)}
-                className="rounded-lg border border-border px-3 py-2"
+                className="oc-surface-card group rounded-xl px-3.5 py-2"
               >
-                <summary className="flex min-h-11 cursor-pointer items-center text-caption font-medium text-muted">
-                  任务说明
+                <summary className="flex min-h-11 cursor-pointer select-none items-center justify-between gap-2 text-caption font-medium text-muted [&::-webkit-details-marker]:hidden">
+                  <span>任务说明</span>
+                  <ChevronDown
+                    size={14}
+                    className="shrink-0 text-faint transition-transform duration-150 group-open:rotate-180"
+                    aria-hidden
+                  />
                 </summary>
                 {descriptionOpen && (
-                  <div className="mt-2">
+                  <div className="mt-1 border-t border-border/60 pt-2.5 pb-1">
                     <TicketMarkdown testId="ticket-body-md">{current.body}</TicketMarkdown>
                   </div>
                 )}
               </details>
             ) : (
-              <p className="text-meta text-faint">还没有描述</p>
+              <p className="oc-surface-recessed rounded-xl px-3.5 py-2.5 text-meta text-faint">
+                还没有描述
+              </p>
             ))}
 
           {current.status === 'blocked' && current.blockedReason && (
-            <p className="rounded-lg bg-danger-soft px-3 py-2 text-body text-danger">
+            <p className="oc-callout oc-callout-danger rounded-xl px-3.5 py-2.5 text-body text-danger">
               受阻：{current.blockedReason}
             </p>
           )}
 
-          {actions}
           {needsSetup && (
-            <div className="rounded-lg border border-border bg-hover px-3 py-2 text-body">
-              <p>执行助手待配置，请先选择已安装且可用的助手。</p>
+            <div className="oc-callout oc-callout-warning flex flex-col gap-2 rounded-xl px-3.5 py-3 text-body">
+              <div className="flex items-start gap-2.5">
+                <span className="oc-icon-badge oc-icon-badge-warning mt-0.5 size-7 rounded-lg" aria-hidden>
+                  <Wrench size={14} />
+                </span>
+                <p className="min-w-0 flex-1 text-fg">执行助手待配置，请先选择已安装且可用的助手。</p>
+              </div>
               {onConfigureStage && (
-                <Button
-                  type="button"
-                  className="mt-2 min-h-11"
-                  variant="secondary"
-                  data-testid="ticket-configure-execution"
-                  onClick={onConfigureStage}
-                >
-                  配置执行助手
-                </Button>
+                <div>
+                  <Button
+                    type="button"
+                    className="min-h-11"
+                    variant="secondary"
+                    data-testid="ticket-configure-execution"
+                    onClick={onConfigureStage}
+                  >
+                    配置执行助手
+                  </Button>
+                </div>
               )}
             </div>
           )}
 
-          <div className="flex flex-wrap gap-1">
+          <div className="oc-surface-recessed flex flex-wrap items-center gap-1.5 rounded-xl p-2">
+            {actions}
             {!editing && current.status !== 'done' && current.status !== 'canceled' && (
               <Button
                 type="button"
@@ -940,6 +1028,7 @@ export function TicketDrawer({
                 data-testid="ticket-drawer-edit"
                 onClick={() => beginEdit(current)}
               >
+                <Pencil size={13} />
                 改需求
               </Button>
             )}
@@ -954,6 +1043,7 @@ export function TicketDrawer({
                 disabled={stopState !== null}
                 onClick={() => void stopRun()}
               >
+                <Square size={12} />
                 {stopState === 'requesting'
                   ? '请求停止…'
                   : stopState === 'stopping'
@@ -971,6 +1061,7 @@ export function TicketDrawer({
                 data-testid="ticket-drawer-retry"
                 onClick={() => void runPatrol(true)}
               >
+                <RotateCcw size={13} />
                 重新执行本阶段
               </Button>
             )}
@@ -984,6 +1075,7 @@ export function TicketDrawer({
                 className="min-h-11"
                 onClick={() => void runPatrol()}
               >
+                <Play size={13} />
                 {current.status === 'waiting_human' ? '重新执行本阶段' : '开始执行'}
               </Button>
             )}
@@ -999,6 +1091,7 @@ export function TicketDrawer({
                 }
                 onClick={openOrigin}
               >
+                <ExternalLink size={13} />
                 回到来源会话
               </Button>
             )}
@@ -1007,7 +1100,7 @@ export function TicketDrawer({
           {historyStatus.initialized &&
             (historyStatus.hasMore || !historyStatus.supported || historyStatus.error) && (
               <div
-                className="flex flex-wrap items-center gap-2 text-caption text-muted"
+                className="oc-surface-recessed flex flex-wrap items-center justify-between gap-2 rounded-xl px-3 py-2 text-caption text-muted"
                 data-testid="timeline-history-controls"
               >
                 <span>
@@ -1021,6 +1114,7 @@ export function TicketDrawer({
                   <Button
                     type="button"
                     variant="secondary"
+                    size="sm"
                     className="min-h-11"
                     data-testid="timeline-load-earlier"
                     loading={historyStatus.loading}
@@ -1051,23 +1145,29 @@ export function TicketDrawer({
             stageName={stageName}
             stageById={stageById}
             composer={
-              <div className="flex flex-col gap-2 pt-1" data-testid="ticket-drawer-composer">
+              <div
+                className="oc-composer-dock flex flex-col gap-2 rounded-xl p-2.5"
+                data-testid="ticket-drawer-composer"
+              >
                 <textarea
                   aria-label="评论"
                   data-testid="ticket-drawer-comment"
-                  className="min-h-20 w-full rounded-lg border border-border-control bg-surface px-3.5 py-2.5 text-base leading-relaxed text-fg outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-ring md:text-sm"
+                  className="min-h-20 w-full resize-y bg-transparent px-1.5 py-1 text-base leading-relaxed text-fg outline-none placeholder:text-faint md:text-sm"
                   placeholder="写一条拍板意见，支持 Markdown"
                   value={comment}
                   onChange={(e) => setComment(e.target.value)}
                 />
-                <div>
+                <div className="flex items-center justify-between gap-2 border-t border-border/60 pt-2">
+                  <span className="text-caption text-faint">支持 Markdown</span>
                   <Button
                     type="button"
                     size="sm"
+                    variant="primary"
                     loading={commenting}
                     data-testid="ticket-drawer-comment-submit"
                     onClick={() => void submitComment()}
                   >
+                    <Send size={13} />
                     发表评论
                   </Button>
                 </div>

@@ -177,14 +177,16 @@ function MemoryForm({ request, guard, onClose, onOutcome }: FormProps) {
           void submit();
         }}
       >
-        <Field label="名称" required hint={`保存为 ${slug.trim() || "…"}.md；只能用英文字母、数字、- 和 _。`} error={slugError ?? undefined}>
-          <Input value={slug} onChange={(e) => setSlug(e.target.value)} autoComplete="off" spellCheck={false} />
-        </Field>
+        <div className="oc-surface-recessed rounded-xl p-3.5">
+          <Field label="名称" required hint={`保存为 ${slug.trim() || "…"}.md；只能用英文字母、数字、- 和 _。`} error={slugError ?? undefined}>
+            <Input value={slug} onChange={(e) => setSlug(e.target.value)} autoComplete="off" spellCheck={false} className="font-mono" />
+          </Field>
+        </div>
         <Field
           label={
             <span className="flex items-center justify-between gap-2">
               <span>内容</span>
-              <span className={cn("text-caption font-normal tabular-nums", over ? "text-danger" : "text-faint")}>
+              <span className={cn("oc-badge-craft rounded-full bg-hover px-2 py-0.5 text-caption font-medium tabular-nums", over ? "text-danger" : "text-faint")}>
                 {content.length} / {MEMORY_CONTENT_MAX}
               </span>
             </span>
@@ -258,18 +260,21 @@ function SkillForm({ request, guard, onClose, onOutcome }: FormProps) {
           void submit();
         }}
       >
-        <Field label="技能名" required hint="小写英文字母、数字和 -，例如 weekly-report。" error={nameError ?? undefined}>
-          <Input
-            value={name}
-            onChange={(e) => setName(e.target.value.toLowerCase())}
-            maxLength={80}
-            autoComplete="off"
-            spellCheck={false}
-          />
-        </Field>
-        <Field label="什么时候用" required hint="一句话说明，智能体靠它判断要不要用这个技能。" error={descriptionError ?? undefined}>
-          <Input value={description} onChange={(e) => setDescription(e.target.value)} autoComplete="off" />
-        </Field>
+        <div className="oc-surface-recessed flex flex-col gap-3 rounded-xl p-3.5">
+          <Field label="技能名" required hint="小写英文字母、数字和 -，例如 weekly-report。" error={nameError ?? undefined}>
+            <Input
+              value={name}
+              onChange={(e) => setName(e.target.value.toLowerCase())}
+              maxLength={80}
+              autoComplete="off"
+              spellCheck={false}
+              className="font-mono"
+            />
+          </Field>
+          <Field label="什么时候用" required hint="一句话说明，智能体靠它判断要不要用这个技能。" error={descriptionError ?? undefined}>
+            <Input value={description} onChange={(e) => setDescription(e.target.value)} autoComplete="off" />
+          </Field>
+        </div>
         <Field label="技能内容" error={body.trim() ? undefined : "请填写技能内容"}>
           <Textarea value={body} rows={10} onChange={(e) => setBody(e.target.value)} aria-label="技能内容" />
         </Field>

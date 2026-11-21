@@ -43,9 +43,12 @@ export function Meter({
           {has ? (display ?? `${value}%`) : '—'}
         </span>
       </div>
-      <div className="h-1.5 w-full overflow-hidden rounded-full bg-hover">
+      <div className="h-2 w-full overflow-hidden rounded-full bg-hover/90 shadow-inner">
         <div
-          className={cn('h-full rounded-full transition-[width] duration-300', FILL[tone])}
+          className={cn(
+            'oc-progress-fill h-full rounded-full transition-[width] duration-300',
+            FILL[tone],
+          )}
           style={{ width: `${pct}%` }}
         />
       </div>

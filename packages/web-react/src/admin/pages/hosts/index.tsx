@@ -124,6 +124,7 @@ export default function HostsPage() {
   return (
     <div className="flex flex-col gap-5">
       <PageHeader
+        icon={Server}
         title={meta.title}
         desc={meta.desc}
         actions={
@@ -277,7 +278,12 @@ export default function HostsPage() {
 /** baseline 版本卡：master 版本 + 每台 remote host 已同步版本 chip（match/mismatch/err）。 */
 function BaselineCard({ baseline, loading }: { baseline: BaselineView | null; loading: boolean }) {
   return (
-    <SectionCard title="Baseline 版本" hint="master 当前 baseline 与各 host 已同步版本对比">
+    <SectionCard
+      icon={PackageCheck}
+      iconTone="info"
+      title="Baseline 版本"
+      hint="master 当前 baseline 与各 host 已同步版本对比"
+    >
       {loading && !baseline ? (
         <div className="flex items-center gap-2 text-body text-muted">
           <Spinner size={14} /> 加载中…
@@ -285,19 +291,20 @@ function BaselineCard({ baseline, loading }: { baseline: BaselineView | null; lo
       ) : !baseline ? (
         <p className="text-body text-faint">—</p>
       ) : (
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-body">
-          <span className="text-faint">master</span>
-          {baseline.master_version ? (
-            <code className="rounded bg-hover px-1.5 py-0.5 font-mono text-meta text-fg">
-              {baseline.master_version}
-            </code>
-          ) : (
-            <span className="text-danger">
-              未初始化{baseline.master_err ? ` · ${baseline.master_err}` : ''}
-            </span>
-          )}
-          <span className="text-border">|</span>
-          <span className="text-faint">per-host</span>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2.5 text-body">
+          <div className="oc-surface-recessed flex items-center gap-2 rounded-lg px-2.5 py-1.5">
+            <span className="text-caption font-semibold uppercase tracking-wide text-faint">master</span>
+            {baseline.master_version ? (
+              <code className="font-mono text-meta font-medium text-fg">
+                {baseline.master_version}
+              </code>
+            ) : (
+              <span className="text-meta font-medium text-danger">
+                未初始化{baseline.master_err ? ` · ${baseline.master_err}` : ''}
+              </span>
+            )}
+          </div>
+          <span className="text-caption font-semibold uppercase tracking-wide text-faint">per-host</span>
           {baseline.per_host.length === 0 ? (
             <span className="text-faint">（暂无远程虚机）</span>
           ) : (

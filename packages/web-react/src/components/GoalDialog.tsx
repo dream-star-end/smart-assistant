@@ -1,11 +1,11 @@
 import {STATUS_LABEL,goalNearBudget,visibleGoalOf,type GoalSetInput} from '../lib/goalPresentation';
 export {STATUS_LABEL,goalNearBudget,visibleGoalOf,type GoalSetInput} from '../lib/goalPresentation';
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
-import { Check, Pause, Play, Trash2 } from "lucide-react";
+import { Check, Pause, Play, Target, Trash2 } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { apiErrorMessage } from "../lib/api";
 import { groupDigits } from "../lib/utils";
-import { Badge, Button, Input, Modal, Textarea, useConfirm } from "./ui";
+import { Alert, Badge, Button, Input, Modal, Textarea, useConfirm } from "./ui";
 
 function elapsed(seconds: number): string {
   const h = Math.floor(seconds / 3600);
@@ -154,8 +154,11 @@ export function GoalDialog({
       onOpenChange={onOpenChange}
       className="max-w-md"
       title={
-        <span className="flex items-center gap-2">
-          会话目标
+        <span className="flex items-center gap-2.5">
+          <span className="oc-icon-badge oc-icon-badge-accent h-7 w-7 rounded-sm" aria-hidden>
+            <Target size={14} strokeWidth={1.75} />
+          </span>
+          <span>会话目标</span>
           {visibleGoal && (
             // 「受阻」是需要处理的负向状态,用 warning 而不是 accent(C-31)。
             <Badge
@@ -174,17 +177,29 @@ export function GoalDialog({
       }
     >
       {visibleGoal && (
-        <div className="mb-3 grid grid-cols-2 gap-2 rounded-lg bg-hover p-2.5 text-caption text-muted tabular-nums">
-          <span>Token：{groupDigits(String(visibleGoal.tokensUsed))}{visibleGoal.tokenBudget == null ? "" : ` / ${groupDigits(String(visibleGoal.tokenBudget))}`}</span>
-          <span>积分：{groupDigits(visibleGoal.creditsUsed)}{visibleGoal.creditBudget == null ? "" : ` / ${groupDigits(visibleGoal.creditBudget)}`}</span>
-          <span className="col-span-2">累计运行：{elapsed(displayedTimeUsed)}</span>
-          {warning && <span className="col-span-2 text-warning">预算已接近或达到；这是软提醒，不会停止或阻断执行。</span>}
+        <div className="oc-surface-recessed mb-3.5 grid grid-cols-2 gap-2.5 rounded-xl p-3 text-caption text-muted tabular-nums">
+          <div className="oc-surface-card rounded-lg px-2.5 py-2 font-medium text-fg">
+            Token：{groupDigits(String(visibleGoal.tokensUsed))}
+            {visibleGoal.tokenBudget == null ? "" : ` / ${groupDigits(String(visibleGoal.tokenBudget))}`}
+          </div>
+          <div className="oc-surface-card rounded-lg px-2.5 py-2 font-medium text-fg">
+            积分：{groupDigits(visibleGoal.creditsUsed)}
+            {visibleGoal.creditBudget == null ? "" : ` / ${groupDigits(visibleGoal.creditBudget)}`}
+          </div>
+          <span className="col-span-2 px-0.5 text-caption text-muted">
+            累计运行：{elapsed(displayedTimeUsed)}
+          </span>
+          {warning && (
+            <span className="oc-callout oc-callout-warning col-span-2 rounded-lg px-2.5 py-1.5 text-caption text-warning">
+              预算已接近或达到；这是软提醒，不会停止或阻断执行。
+            </span>
+          )}
         </div>
       )}
       {staleFromServer && (
         <output
           data-testid="goal-stale-hint"
-          className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-warning-soft px-2.5 py-2 text-caption text-warning"
+          className="oc-callout oc-callout-warning mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl px-3 py-2.5 text-caption text-warning"
         >
           <span>目标已在别处更新。保存会覆盖服务端版本；也可以放弃本地修改重新载入。</span>
           <Button size="sm" variant="secondary" onClick={() => loadForm(visibleGoal)}>
@@ -192,7 +207,7 @@ export function GoalDialog({
           </Button>
         </output>
       )}
-      <label htmlFor={`${fieldId}-objective`} className="mb-2 block text-caption text-muted">
+      <label htmlFor={`${fieldId}-objective`} className="mb-2.5 block text-meta font-medium text-fg">
         目标
         {/* 表单控件走 ui/Textarea(与 Input 同一外观权威),不再手写边框/焦点环(C-31)。 */}
         <Textarea
@@ -204,21 +219,65 @@ export function GoalDialog({
           }}
           rows={3}
           maxLength={8000}
-          className="mt-1 w-full resize-y"
+          className="mt-1.5 w-full resize-y"
           placeholder="这次会话要达成什么？"
         />
       </label>
-      <div className="grid grid-cols-2 gap-2">
-        <label htmlFor={`${fieldId}-token`} className="text-caption text-muted">Token 预算<Input id={`${fieldId}-token`} className="mt-1" inputMode="numeric" value={tokenBudget} onChange={(e) => { setTokenBudget(e.target.value); setDirty(true); }} placeholder="可选" /></label>
-        <label htmlFor={`${fieldId}-credit`} className="text-caption text-muted">积分预算<Input id={`${fieldId}-credit`} className="mt-1" inputMode="numeric" value={creditBudget} onChange={(e) => { setCreditBudget(e.target.value); setDirty(true); }} placeholder="可选" /></label>
+      <div className="grid grid-cols-2 gap-2.5">
+        <label htmlFor={`${fieldId}-token`} className="text-caption font-medium text-muted">
+          Token 预算
+          <Input
+            id={`${fieldId}-token`}
+            className="mt-1"
+            inputMode="numeric"
+            value={tokenBudget}
+            onChange={(e) => {
+              setTokenBudget(e.target.value);
+              setDirty(true);
+            }}
+            placeholder="可选"
+          />
+        </label>
+        <label htmlFor={`${fieldId}-credit`} className="text-caption font-medium text-muted">
+          积分预算
+          <Input
+            id={`${fieldId}-credit`}
+            className="mt-1"
+            inputMode="numeric"
+            value={creditBudget}
+            onChange={(e) => {
+              setCreditBudget(e.target.value);
+              setDirty(true);
+            }}
+            placeholder="可选"
+          />
+        </label>
       </div>
-      <p className="mt-2 text-caption text-muted">保存已启用的目标后，空闲会话会自动开始；正在执行时只更新目标。</p>
-      {error && <p role="alert" className="mt-2 text-caption text-danger">{error}</p>}
-      <div className="mt-3 flex flex-wrap gap-1.5">
-        <Button size="sm" disabled={busy} onClick={submit}>{visibleGoal && visibleGoal.status !== "completed" ? "保存" : "设置并开始"}</Button>
-        {visibleGoal?.status === "active" && <Button size="sm" variant="secondary" disabled={busy} onClick={() => run(() => onAction("pause"))}><Pause size={13} />暂停</Button>}
-        {(visibleGoal?.status === "paused" || visibleGoal?.status === "blocked") && <Button size="sm" variant="secondary" disabled={busy} onClick={() => run(() => onAction("resume"))}><Play size={13} />继续</Button>}
-        {visibleGoal && !["completed", "cleared"].includes(visibleGoal.status) && <Button size="sm" variant="secondary" disabled={busy} onClick={() => run(() => onAction("complete"))}><Check size={13} />完成</Button>}
+      <p className="mt-2.5 text-caption text-faint">保存已启用的目标后，空闲会话会自动开始；正在执行时只更新目标。</p>
+      {error && (
+        <Alert tone="danger" density="compact" className="mt-2.5 text-caption">
+          {error}
+        </Alert>
+      )}
+      <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-border/70 pt-3">
+        <Button size="sm" variant="primary" disabled={busy} onClick={submit}>
+          {visibleGoal && visibleGoal.status !== "completed" ? "保存" : "设置并开始"}
+        </Button>
+        {visibleGoal?.status === "active" && (
+          <Button size="sm" variant="secondary" disabled={busy} onClick={() => run(() => onAction("pause"))}>
+            <Pause size={13} strokeWidth={1.75} />暂停
+          </Button>
+        )}
+        {(visibleGoal?.status === "paused" || visibleGoal?.status === "blocked") && (
+          <Button size="sm" variant="secondary" disabled={busy} onClick={() => run(() => onAction("resume"))}>
+            <Play size={13} strokeWidth={1.75} />继续
+          </Button>
+        )}
+        {visibleGoal && !["completed", "cleared"].includes(visibleGoal.status) && (
+          <Button size="sm" variant="secondary" disabled={busy} onClick={() => run(() => onAction("complete"))}>
+            <Check size={13} strokeWidth={1.75} />完成
+          </Button>
+        )}
         {visibleGoal && (
           <Button
             size="sm"
@@ -227,7 +286,7 @@ export function GoalDialog({
             disabled={busy}
             onClick={() => void clear()}
           >
-            <Trash2 size={13} />清除
+            <Trash2 size={13} strokeWidth={1.75} />清除
           </Button>
         )}
       </div>

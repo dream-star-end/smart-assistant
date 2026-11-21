@@ -1,4 +1,13 @@
-import { Code2, Eye, MessageSquare, Trash2, TriangleAlert, Users } from "lucide-react";
+import {
+  BarChart3,
+  Code2,
+  Eye,
+  Inbox,
+  MessageSquare,
+  Trash2,
+  TriangleAlert,
+  Users,
+} from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { Markdown } from "../../../components/Markdown";
 import {
@@ -233,17 +242,24 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
 
   const breakdownColumns: Column<MessageStatsBreakdown>[] = [
     { key: "name", title: "来源 / 分类", render: (row) => <span className="font-mono text-meta">{row.source_type ?? (row.category ? CATEGORY_LABEL[row.category] : "未知")}</span> },
-    { key: "messages", title: "消息", align: "right" },
-    { key: "recipients", title: "收件", align: "right" },
-    { key: "reads", title: "已读", align: "right" },
-    { key: "read_rate", title: "已读率", align: "right", render: (row) => rate(row.read_rate) },
+    { key: "messages", title: "消息", align: "right", cellClassName: "tabular-nums" },
+    { key: "recipients", title: "收件", align: "right", cellClassName: "tabular-nums" },
+    { key: "reads", title: "已读", align: "right", cellClassName: "tabular-nums" },
+    { key: "read_rate", title: "已读率", align: "right", cellClassName: "tabular-nums", render: (row) => rate(row.read_rate) },
   ];
 
   return (
-    <div className="flex flex-col gap-4">
-      <SectionCard title="30 天触达效果" hint="仅使用发送时不可变受众快照；历史缺失不猜测">
+    <div className="flex flex-col gap-5">
+      <SectionCard
+        title="30 天触达效果"
+        hint="仅使用发送时不可变受众快照；历史缺失不猜测"
+        icon={BarChart3}
+        iconTone="info"
+      >
         {statsError ? (
-          <p className="text-body text-danger">加载失败：{apiErrorMessage(statsError, "统计加载失败")}</p>
+          <div className="oc-callout oc-callout-danger rounded-xl px-3.5 py-2.5 text-body text-danger">
+            加载失败：{apiErrorMessage(statsError, "统计加载失败")}
+          </div>
         ) : (
           <div className="flex flex-col gap-4">
             <StatCardRow>
@@ -253,16 +269,16 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
               <StatCard label="后续行动" value="不可用" icon={TriangleAlert} tone="neutral" hint="尚无可靠 action 归因，不伪造转化" loading={statsLoading} />
             </StatCardRow>
             {stats && stats.snapshot_coverage.legacy_unavailable_messages > 0 && (
-              <p className="text-meta text-faint">
+              <div className="oc-callout oc-callout-info rounded-xl px-3.5 py-2.5 text-meta tabular-nums text-muted">
                 快照覆盖：{stats.snapshot_coverage.captured_messages} 条已固化；{stats.snapshot_coverage.legacy_unavailable_messages} 条历史消息不可计算收件/已读率。
-              </p>
+              </div>
             )}
             {stats && (stats.recipient_load.over_20 > 0 || stats.recipient_load.over_100 > 0) && (
-              <div className="rounded-lg border border-warning/30 bg-warning-soft px-3 py-2 text-meta text-fg">
+              <div className="oc-callout oc-callout-warning rounded-xl px-3.5 py-2.5 text-meta tabular-nums text-fg">
                 高负荷提示：{stats.recipient_load.over_20} 位用户近30天收到超过20条，{stats.recipient_load.over_100} 位超过100条；p50 {stats.recipient_load.p50}、p90 {stats.recipient_load.p90}、最高 {stats.recipient_load.max}。仅透明提示，不自动硬频控。
               </div>
             )}
-            <div className="grid min-w-0 gap-3 lg:grid-cols-2">
+            <div className="grid min-w-0 gap-4 lg:grid-cols-2">
               <div className="min-w-0">
                 <p className="mb-2 text-meta font-semibold text-fg">按来源</p>
                 <DataTable columns={breakdownColumns} rows={stats?.by_source ?? []} rowKey={(row) => `source:${row.source_type}`} loading={statsLoading} emptyTitle="暂无来源统计" />
@@ -276,122 +292,138 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
         )}
       </SectionCard>
       <SectionCard
-      title="历史消息"
-      hint={loading ? "加载中…" : `共 ${total} 条`}
-      bodyClassName="px-0 py-0"
-    >
-      {confirmEl}
-      <div className="flex flex-wrap gap-3 border-b border-border px-4 py-3">
-        <SelectFilter label="分类" value={category} options={[{ label: "全部分类", value: "" }, ...Object.entries(CATEGORY_LABEL).map(([value, label]) => ({ value: value as InboxCategory, label }))]} onChange={(value) => { setOffset(0); setCategory(value as InboxCategory | ""); }} />
-        <Input
-          aria-label="按消息来源筛选"
-          value={sourceType}
-          onChange={(event) => { setOffset(0); setSourceType(event.target.value); }}
-          placeholder="来源，如 cron_delivery / unattributed"
-          className="w-full sm:w-56"
-        />
-      </div>
-      {error ? (
-        <div className="px-5 py-4">
-          <p className="text-body text-danger">加载失败：{apiErrorMessage(error, "加载失败")}</p>
+        title="历史消息"
+        hint={loading ? "加载中…" : `共 ${total} 条`}
+        icon={Inbox}
+        iconTone="neutral"
+        bodyClassName="px-0 py-0"
+      >
+        {confirmEl}
+        <div className="border-b border-border/80 bg-sidebar/35 px-4 py-3 dark:bg-elevated/35">
+          <div className="oc-surface-recessed flex flex-wrap items-center gap-2.5 rounded-xl p-2">
+            <SelectFilter label="分类" value={category} options={[{ label: "全部分类", value: "" }, ...Object.entries(CATEGORY_LABEL).map(([value, label]) => ({ value: value as InboxCategory, label }))]} onChange={(value) => { setOffset(0); setCategory(value as InboxCategory | ""); }} />
+            <Input
+              aria-label="按消息来源筛选"
+              value={sourceType}
+              onChange={(event) => { setOffset(0); setSourceType(event.target.value); }}
+              placeholder="来源，如 cron_delivery / unattributed"
+              className="oc-field-control h-9 w-full sm:w-64"
+            />
+          </div>
         </div>
-      ) : (
-        <>
+        {error ? (
+          <div className="px-5 py-4">
+            <div className="oc-callout oc-callout-danger rounded-xl px-3.5 py-2.5 text-body text-danger">
+              加载失败：{apiErrorMessage(error, "加载失败")}
+            </div>
+          </div>
+        ) : (
           <DataTable
             columns={columns}
             rows={rows}
             rowKey={(m) => String(m.id)}
             loading={loading}
-            className="rounded-none border-0"
+            className="rounded-none border-0 shadow-none"
             emptyTitle="暂无消息"
+            footer={
+              total > PAGE_SIZE ? (
+                <Pagination
+                  offset={offset}
+                  limit={PAGE_SIZE}
+                  count={rows.length}
+                  total={total}
+                  onChange={setOffset}
+                />
+              ) : undefined
+            }
           />
-          {total > PAGE_SIZE && (
-            <div className="border-t border-border px-3">
-              <Pagination
-                offset={offset}
-                limit={PAGE_SIZE}
-                count={rows.length}
-                total={total}
-                onChange={setOffset}
-              />
+        )}
+
+        <Modal
+          open={detail !== null}
+          onOpenChange={(o) => !o && setDetail(null)}
+          title={detail ? `站内信 #${detail.id}` : undefined}
+          className="max-w-3xl"
+        >
+          {detail && (
+            <div className="flex flex-col gap-4">
+              <div className="oc-surface-recessed divide-y divide-border/70 rounded-xl px-3.5 py-1">
+                <KeyValue label="受众" value={<AudienceBadge m={detail} />} />
+                <KeyValue
+                  label="级别"
+                  value={
+                    <Badge tone={INBOX_LEVEL_TONE[detail.level]}>
+                      {INBOX_LEVEL_LABELS[detail.level] ?? detail.level}
+                    </Badge>
+                  }
+                />
+                <KeyValue label="创建时间" value={<TimeAgo value={detail.created_at} />} />
+                <KeyValue
+                  label="过期"
+                  value={detail.expires_at ? <TimeAgo value={detail.expires_at} /> : "永不过期"}
+                />
+                <KeyValue
+                  label="站内已读 / 收件人"
+                  value={
+                    detail.audience_snapshot_status === "captured" ? (
+                      <span className="tabular-nums">{detail.read_count} / {detail.recipients}</span>
+                    ) : (
+                      "历史无受众快照，无法计算"
+                    )
+                  }
+                />
+                <KeyValue label="发送时受众快照" value={detail.audience_snapshot_status === "captured" ? "已固化" : "历史不可用"} />
+                <KeyValue label="分类" value={CATEGORY_LABEL[detail.category]} />
+                {detail.thread_key && (
+                  <KeyValue
+                    label="线程"
+                    value={<span className="tabular-nums">{detail.thread_key}（共 {detail.thread_count} 条）</span>}
+                  />
+                )}
+                {detail.source_type && (
+                  <KeyValue
+                    label="来源"
+                    value={[detail.source_type, detail.source_id, detail.source_phase]
+                      .filter(Boolean)
+                      .join(" / ")}
+                  />
+                )}
+                {detail.notify_email && (
+                  <KeyValue label="邮件推送" value={<EmailChip m={detail} />} />
+                )}
+              </div>
+              <div>
+                <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-title font-semibold text-fg">{detail.title}</p>
+                  <Tabs
+                    value={detailMode}
+                    onValueChange={(value) => setDetailMode(value as "preview" | "source")}
+                    items={[
+                      { value: "preview", label: <span className="inline-flex items-center gap-1"><Eye size={12} />预览</span> },
+                      { value: "source", label: <span className="inline-flex items-center gap-1"><Code2 size={12} />源码</span> },
+                    ]}
+                    aria-label="正文显示方式"
+                  />
+                </div>
+                {detailMode === "preview" ? (
+                  <div className="oc-surface-recessed max-h-[55vh] min-h-40 overflow-auto rounded-xl px-4 py-4 text-body text-fg">
+                    <Markdown signMedia readOnly>{detail.body_md}</Markdown>
+                  </div>
+                ) : (
+                  <div className="oc-code-shell">
+                    <div className="oc-code-shell-header flex items-center justify-between px-3.5 py-2 text-caption text-faint">
+                      <span className="font-mono">Markdown 源码</span>
+                      <span className="tabular-nums">{detail.body_md.length.toLocaleString("en-US")} chars</span>
+                    </div>
+                    <pre className="max-h-[50vh] overflow-auto whitespace-pre-wrap break-words px-4 py-3 font-mono text-[12px] leading-relaxed text-fg">
+                      {detail.body_md}
+                    </pre>
+                  </div>
+                )}
+              </div>
             </div>
           )}
-        </>
-      )}
-
-      <Modal
-        open={detail !== null}
-        onOpenChange={(o) => !o && setDetail(null)}
-        title={detail ? `站内信 #${detail.id}` : undefined}
-        className="max-w-3xl"
-      >
-        {detail && (
-          <div className="flex flex-col gap-3">
-            <div className="divide-y divide-border">
-              <KeyValue label="受众" value={<AudienceBadge m={detail} />} />
-              <KeyValue
-                label="级别"
-                value={
-                  <Badge tone={INBOX_LEVEL_TONE[detail.level]}>
-                    {INBOX_LEVEL_LABELS[detail.level] ?? detail.level}
-                  </Badge>
-                }
-              />
-              <KeyValue label="创建时间" value={<TimeAgo value={detail.created_at} />} />
-              <KeyValue
-                label="过期"
-                value={detail.expires_at ? <TimeAgo value={detail.expires_at} /> : "永不过期"}
-              />
-              <KeyValue
-                label="站内已读 / 收件人"
-                value={detail.audience_snapshot_status === "captured" ? `${detail.read_count} / ${detail.recipients}` : "历史无受众快照，无法计算"}
-              />
-              <KeyValue label="发送时受众快照" value={detail.audience_snapshot_status === "captured" ? "已固化" : "历史不可用"} />
-              <KeyValue label="分类" value={CATEGORY_LABEL[detail.category]} />
-              {detail.thread_key && (
-                <KeyValue
-                  label="线程"
-                  value={`${detail.thread_key}（共 ${detail.thread_count} 条）`}
-                />
-              )}
-              {detail.source_type && (
-                <KeyValue
-                  label="来源"
-                  value={[detail.source_type, detail.source_id, detail.source_phase]
-                    .filter(Boolean)
-                    .join(" / ")}
-                />
-              )}
-              {detail.notify_email && (
-                <KeyValue label="邮件推送" value={<EmailChip m={detail} />} />
-              )}
-            </div>
-            <div>
-              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                <p className="text-title font-semibold text-fg">{detail.title}</p>
-                <Tabs
-                  value={detailMode}
-                  onValueChange={(value) => setDetailMode(value as "preview" | "source")}
-                  items={[
-                    { value: "preview", label: <span className="inline-flex items-center gap-1"><Eye size={12} />预览</span> },
-                    { value: "source", label: <span className="inline-flex items-center gap-1"><Code2 size={12} />源码</span> },
-                  ]}
-                  aria-label="正文显示方式"
-                />
-              </div>
-              {detailMode === "preview" ? (
-                <div className="max-h-[55vh] min-h-40 overflow-auto rounded-xl border border-border bg-surface px-4 py-4 text-body text-fg">
-                  <Markdown signMedia readOnly>{detail.body_md}</Markdown>
-                </div>
-              ) : (
-                <pre className="max-h-[55vh] overflow-auto whitespace-pre-wrap break-words rounded-xl border border-border bg-code px-4 py-3 text-[12px] leading-relaxed text-fg">
-                  {detail.body_md}
-                </pre>
-              )}
-            </div>
-          </div>
-        )}
-      </Modal>
+        </Modal>
       </SectionCard>
     </div>
   );
