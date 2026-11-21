@@ -24,7 +24,7 @@ export interface SessionSnapshotOptions {
 export const SESSION_SNAPSHOT_MAX_BYTES = 1024 * 1024
 /** Upper bound on fallback BYTEA fact scan pages for legacy NULL-seq streams. */
 export const SESSION_SNAPSHOT_FACTS_MAX_PAGES = 8
-/** Physically scanned rows per fallback window in (stream_key, record_id DESC) order (max 8 * 256 = 2048 rows). */
+/** Physically scanned rows per fallback window in (stream_key, frame_seq DESC, record_id DESC) order (max 8 * 256 = 2048 rows). */
 export const SESSION_SNAPSHOT_FACTS_SCAN_WINDOW = 256
 
 type Queryable = Pick<PoolClient, 'query'>
@@ -263,8 +263,13 @@ export async function buildSessionSnapshot(
 
   const needLegacyStatus = needStatus && !latestStatus && statusSeq === null
   const needLegacyUsage = !snapshot.usage && usageSeq === null
+  let latestStatusSeq = -1
+  let legacyFactsTruncated = false
+  let legacyFactsOldestScannedSeq: number | null = null
   if (hasFrames && (needLegacyStatus || needLegacyUsage)) {
-    let beforeRecordId: string | null = null
+    let beforeCursor: [string, string] | null = null
+    let lastHasMoreEarlier = false
+    let lastMinFrameSeq: number | null = null
     for (
       let pageNo = 0;
       pageNo < SESSION_SNAPSHOT_FACTS_MAX_PAGES &&
@@ -276,40 +281,64 @@ export async function buildSessionSnapshot(
         frame_seq: string | null
         payload: Buffer | null
         scanned_count: number
+        has_more_earlier: boolean
+        min_frame_seq: string | null
         min_record_id: string | null
       }
       const facts: { rows: BoundedFactRow[] } = await q.query<BoundedFactRow>(
         `/* session-snapshot-facts */
-         WITH win AS MATERIALIZED (
+         WITH win_plus AS MATERIALIZED (
            SELECT record_id, frame_seq, payload
              FROM client_session_live_frames
             WHERE stream_key=$1
-              AND ($2::bigint IS NULL OR record_id < $2::bigint)
-            ORDER BY record_id DESC
-            LIMIT $3
+              AND frame_seq IS NOT NULL
+              AND ($2::bigint IS NULL OR (frame_seq, record_id) < ($2::bigint, $3::bigint))
+            ORDER BY frame_seq DESC, record_id DESC
+            LIMIT $4
+         ), win AS (
+           SELECT record_id, frame_seq, payload
+             FROM win_plus
+            ORDER BY frame_seq DESC, record_id DESC
+            LIMIT $5
          ), meta AS (
-           SELECT COUNT(*)::int AS scanned_count, MIN(record_id)::text AS min_record_id
-             FROM win
+           SELECT (SELECT COUNT(*)::int FROM win) AS scanned_count,
+                  ((SELECT COUNT(*) FROM win_plus) > $5) AS has_more_earlier,
+                  tail.frame_seq::text AS min_frame_seq,
+                  tail.record_id::text AS min_record_id
+             FROM (SELECT 1) AS one
+             LEFT JOIN LATERAL (
+               SELECT frame_seq, record_id
+                 FROM win
+                ORDER BY frame_seq ASC, record_id ASC
+                LIMIT 1
+             ) tail ON TRUE
          )
          SELECT w.record_id::text, w.frame_seq::text, w.payload,
-                m.scanned_count, m.min_record_id
+                m.scanned_count, m.has_more_earlier, m.min_frame_seq, m.min_record_id
            FROM meta m
            LEFT JOIN win w
              ON octet_length(w.payload) <= 65536
-            AND (position($4::bytea IN w.payload) > 0 OR position($5::bytea IN w.payload) > 0)
+            AND (position($6::bytea IN w.payload) > 0 OR position($7::bytea IN w.payload) > 0)
           ORDER BY w.frame_seq DESC NULLS LAST, w.record_id DESC NULLS LAST`,
         [
           streamKey,
-          beforeRecordId,
+          beforeCursor?.[0] ?? null,
+          beforeCursor?.[1] ?? null,
+          SESSION_SNAPSHOT_FACTS_SCAN_WINDOW + 1,
           SESSION_SNAPSHOT_FACTS_SCAN_WINDOW,
           Buffer.from('"outbound.turn_status"'),
           Buffer.from('"outbound.turn_usage"'),
         ],
       )
       const metaRow = facts.rows[0]
-      if (!metaRow || metaRow.scanned_count === 0) break
+      if (!metaRow || metaRow.scanned_count === 0) {
+        lastHasMoreEarlier = false
+        break
+      }
       for (const fact of facts.rows) {
         if (fact.record_id === null || fact.frame_seq === null || fact.payload === null) continue
+        const factSeq = Number(fact.frame_seq)
+        if (!Number.isSafeInteger(factSeq)) continue
         let payload: Record<string, unknown>
         try {
           const raw = JSON.parse(fact.payload.toString('utf8')) as unknown
@@ -318,14 +347,22 @@ export async function buildSessionSnapshot(
         } catch {
           continue
         }
-        if (needLegacyUsage && !snapshot.usage && payload.type === 'outbound.turn_usage') {
-          snapshot.usage = { frameSeq: Number(fact.frame_seq), usage: payload.usage as TurnTokenUsageSnapshot }
-        } else if (needLegacyStatus && !latestStatus && payload.type === 'outbound.turn_status') {
+        if (needLegacyUsage && payload.type === 'outbound.turn_usage' && (!snapshot.usage || factSeq > snapshot.usage.frameSeq)) {
+          snapshot.usage = { frameSeq: factSeq, usage: payload.usage as TurnTokenUsageSnapshot }
+        } else if (needLegacyStatus && payload.type === 'outbound.turn_status' && (!latestStatus || factSeq > latestStatusSeq)) {
           latestStatus = payload
+          latestStatusSeq = factSeq
         }
       }
-      if (metaRow.scanned_count < SESSION_SNAPSHOT_FACTS_SCAN_WINDOW || !metaRow.min_record_id) break
-      beforeRecordId = metaRow.min_record_id
+      lastHasMoreEarlier = metaRow.has_more_earlier === true
+      lastMinFrameSeq = metaRow.min_frame_seq != null ? Number(metaRow.min_frame_seq) : null
+      if (!lastHasMoreEarlier || !metaRow.min_frame_seq || !metaRow.min_record_id) break
+      beforeCursor = [metaRow.min_frame_seq, metaRow.min_record_id]
+    }
+    const stillMissingLegacyFact = (needLegacyStatus && !latestStatus) || (needLegacyUsage && !snapshot.usage)
+    if (stillMissingLegacyFact && lastHasMoreEarlier) {
+      legacyFactsTruncated = true
+      legacyFactsOldestScannedSeq = lastMinFrameSeq !== null && Number.isSafeInteger(lastMinFrameSeq) ? lastMinFrameSeq : 1
     }
   }
   if (needStatus) {
@@ -394,7 +431,12 @@ export async function buildSessionSnapshot(
     snapshot.nextAfterSeq = Number(frame.frame_seq)
   }
   snapshot.hasMore ||= page.rows.length > limit
-  snapshot.gap ??= reset ? { reason: 'cursor_reset' } : containerLinkGap ?? sequenceGap ?? (snapshot.hasMore ? { reason: 'page_limit' } : null)
+  const legacyFactsGap: SessionSnapshot['gap'] = legacyFactsTruncated
+    ? { reason: 'sequence_gap', afterSeq: 0, beforeSeq: legacyFactsOldestScannedSeq ?? 1 }
+    : null
+  snapshot.gap ??= reset
+    ? { reason: 'cursor_reset' }
+    : containerLinkGap ?? sequenceGap ?? (snapshot.hasMore ? { reason: 'page_limit' } : legacyFactsGap)
   return snapshot
 }
 

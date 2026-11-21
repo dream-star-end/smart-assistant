@@ -14,6 +14,8 @@ import { before, beforeEach, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
 import { WebSocket } from "ws";
+import { Value } from "@sinclair/typebox/value";
+import { OutboundSessionSnapshot } from "@openclaude/protocol";
 import type { ClientSession } from "@openclaude/storage";
 import { getPool } from "../db/index.js";
 import {
@@ -27,6 +29,7 @@ import {
   SESSION_SNAPSHOT_FACTS_MAX_PAGES,
   SESSION_SNAPSHOT_FACTS_SCAN_WINDOW,
 } from "../db/sessionSnapshot.js";
+import { enqueueAutomaticRecoveryJob } from "../dispatch/turnRecoveryStore.js";
 import { sendHelloSessionSnapshots } from "../ws/helloOpenDispatchSnapshot.js";
 import { useDedicatedTestDatabase } from "./helpers/db.js";
 
@@ -82,10 +85,10 @@ describe("OCV5-824 R2 real-PG verification (B1-B8 + N1)", () => {
     );
   });
 
-  test("B1: 0351 CONCURRENTLY indexes are valid, runnable outside tx while another connection reads/writes, and fail-loud on INVALID index", async (t) => {
+  test("B1: 0351 CONCURRENTLY indexes are valid, runnable outside tx while another connection reads/writes, and preflight fails loud on a real INVALID index", async (t) => {
     if (db.skipIfUnavailable(t)) return;
 
-    // 1. All 3 indexes created by migration 0351 exist and are indisvalid = true.
+    // 1. All 4 indexes created by migration 0351 exist and are indisvalid = true.
     const idxRows = (
       await pool.query<{ relname: string; indisvalid: boolean }>(
         `SELECT c.relname, i.indisvalid
@@ -94,6 +97,7 @@ describe("OCV5-824 R2 real-PG verification (B1-B8 + N1)", () => {
           WHERE c.relname = ANY($1::text[])
           ORDER BY c.relname`,
         [[
+          "idx_live_frames_stream_frame_seq",
           "idx_live_streams_retired_updated",
           "idx_turn_dispatches_user_session_open",
           "idx_turn_dispatches_user_session_terminal",
@@ -101,13 +105,14 @@ describe("OCV5-824 R2 real-PG verification (B1-B8 + N1)", () => {
       )
     ).rows;
     assert.deepEqual(idxRows, [
+      { relname: "idx_live_frames_stream_frame_seq", indisvalid: true },
       { relname: "idx_live_streams_retired_updated", indisvalid: true },
       { relname: "idx_turn_dispatches_user_session_open", indisvalid: true },
       { relname: "idx_turn_dispatches_user_session_terminal", indisvalid: true },
     ]);
 
     // 2. Concurrent DDL test: drop & rebuild CONCURRENTLY on one connection while
-    //    a second connection executes SELECT/INSERT/UPDATE on turn_dispatches.
+    //    a second connection executes SELECT/INSERT on turn_dispatches.
     const connA = await pool.connect();
     const connB = await pool.connect();
     try {
@@ -141,10 +146,48 @@ describe("OCV5-824 R2 real-PG verification (B1-B8 + N1)", () => {
       connB.release();
     }
 
-    // 3. Re-running 0351 preflight/idempotent statements outside a transaction succeeds cleanly.
+    // 3. Actually manufacture a real indisvalid=false index via failed UNIQUE
+    //    CONCURRENTLY build on duplicate status='terminal' rows, prove 0351
+    //    preflight aborts loudly, then recover via runbook DROP + rebuild.
     const rawClient = await pool.connect();
     try {
-      for (const stmt of SQL_0351.split(/\n(?=DO \$\$|CREATE INDEX CONCURRENTLY)/).map((s) => s.trim()).filter((s) => /^(DO \$\$|CREATE INDEX CONCURRENTLY)/.test(s))) {
+      const d2 = randomUUID();
+      await rawClient.query(
+        `INSERT INTO turn_dispatches
+           (dispatch_id, user_id, session_id, client_message_id, agent_id, request_hash,
+            billing_request_id, status, outcome, terminal_at, admitted_at)
+         VALUES ($1, $2, 'sess-b1', 'cm-b1-2', 'main', $3, $4, 'terminal', 'completed', NOW(), NOW())`,
+        [d2, UID, "b".repeat(64), `bill-${d2}`],
+      );
+      await rawClient.query("DROP INDEX CONCURRENTLY IF EXISTS idx_turn_dispatches_user_session_terminal");
+      await assert.rejects(
+        rawClient.query(
+          "CREATE UNIQUE INDEX CONCURRENTLY idx_turn_dispatches_user_session_terminal ON turn_dispatches (status)",
+        ),
+        /23505|could not create unique index/i,
+      );
+      const invalidCheck = (
+        await rawClient.query<{ indisvalid: boolean }>(
+          `SELECT i.indisvalid
+             FROM pg_index i
+             JOIN pg_class c ON c.oid = i.indexrelid
+            WHERE c.relname = 'idx_turn_dispatches_user_session_terminal'`,
+        )
+      ).rows[0];
+      assert.equal(invalidCheck?.indisvalid, false, "must have real indisvalid=false index in catalog");
+
+      const stmts = SQL_0351
+        .split(/\n(?=DO \$\$|CREATE INDEX CONCURRENTLY)/)
+        .map((s) => s.trim())
+        .filter((s) => /^(DO \$\$|CREATE INDEX CONCURRENTLY)/.test(s));
+      // Preflight (stmts[0]) MUST fail loud!
+      await assert.rejects(
+        rawClient.query(stmts[0]!),
+        /0351 fail-loud: invalid index\(es\) detected \(idx_turn_dispatches_user_session_terminal\)/,
+      );
+      // Runbook recovery: DROP INDEX CONCURRENTLY then run full 0351 cleanly.
+      await rawClient.query("DROP INDEX CONCURRENTLY idx_turn_dispatches_user_session_terminal");
+      for (const stmt of stmts) {
         await rawClient.query(stmt);
       }
     } finally {
@@ -356,6 +399,167 @@ describe("OCV5-824 R2 real-PG verification (B1-B8 + N1)", () => {
       )
     ).rows[0];
     assert.equal(provRow?.has_retired, false, "legacy stream reuse must clear provenance.retired_at");
+
+    // B2 Counterexample A (R2 audit): Reused legacy stream with turns A & B
+    // written via real persistGatewayLiveFrame (no dispatch), where ONLY B has
+    // a finalized non-empty tape. Prune MUST NOT delete the reused legacy stream
+    // or turn A's unique frame!
+    const reuseSid = "sess-b2-reuse-ab";
+    assert.equal(await backend.upsertClientSession(mkSession({ id: reuseSid })), "applied");
+    const reuseSk = `agent:main:webchat:dm:${reuseSid}`;
+    await persistGatewayLiveFrame(pool, {
+      uid: BigInt(UID),
+      sessionId: reuseSid,
+      clientMessageId: "cm-leg-A",
+      agentContainerId: 2,
+      sessionKey: reuseSk,
+      frameSeq: 1,
+      payload: JSON.stringify({ type: "outbound.message", text: "unique-turn-A" }),
+    });
+    await persistGatewayLiveFrame(pool, {
+      uid: BigInt(UID),
+      sessionId: reuseSid,
+      clientMessageId: "cm-leg-B",
+      agentContainerId: 2,
+      sessionKey: reuseSk,
+      frameSeq: 2,
+      payload: JSON.stringify({ type: "outbound.message", text: "taped-turn-B" }),
+    });
+    const reuseKey = `legacy:2:${reuseSk}`;
+    // Give ONLY turn B a completed finalized non-empty tape; backdate frames + retired_at.
+    await pool.query(
+      `INSERT INTO client_session_turn_tapes
+         (session_id, user_id, tape_id, agent_id, turn_index, status, turn_key,
+          tape_sha256, total_bytes, part_count, created_at, finalized_at, client_message_id)
+       VALUES ($1, $2, 'tape-leg-B', 'main', 1, 'completed', $3, $4, 32, 1, $5, $5, 'cm-leg-B')`,
+      [reuseSid, USER_ID, "a".repeat(64), "b".repeat(64), finalizedAtMs],
+    );
+    await pool.query(
+      `INSERT INTO client_session_turn_tape_records
+         (session_id, user_id, tape_id, msg_id, ordinal, role, ts, content_sha256, payload, payload_bytes)
+       VALUES ($1, $2, 'tape-leg-B', 'msg-leg-B', 0, 'assistant', $3, $4, $5, 32)`,
+      [reuseSid, USER_ID, finalizedAtMs, "c".repeat(64), Buffer.from('{"role":"assistant","text":"B"}')],
+    );
+    await pool.query(
+      `UPDATE client_session_live_frames SET created_at=$2 WHERE stream_key=$1`,
+      [reuseKey, frameTimeBeforeFinalize],
+    );
+    await pool.query(
+      `UPDATE client_session_live_streams
+          SET provenance = jsonb_build_object('retired_at', $2::text),
+              updated_at = $3
+        WHERE stream_key=$1`,
+      [reuseKey, oldIso, oldDate],
+    );
+    const reusePrune = await pruneRetiredLiveFrames(pool, { olderThanDays: 7, batchSize: 100, nowMs });
+    assert.equal(reusePrune.deletedFrames, 0, "reused legacy stream MUST NEVER be pruned by last cmid");
+    assert.equal(reusePrune.deletedStreams, 0);
+    assert.ok(reusePrune.retainedStreams >= 1);
+    const reuseFrameCount = Number(
+      (await pool.query<{ cnt: string }>("SELECT COUNT(*)::text AS cnt FROM client_session_live_frames WHERE stream_key=$1", [reuseKey])).rows[0]?.cnt,
+    );
+    assert.equal(reuseFrameCount, 2, "turn A unique frame and turn B frame both remain intact");
+
+    // B2 Counterexample B (R2 audit): Two-connection concurrency race where
+    // enqueueAutomaticRecoveryJob acquires lockRecoveryRoot and commits a queued
+    // recovery job while pruneRetiredLiveFrames is attempting to prune.
+    // Frames, checkpoints, and parent stream MUST all stay intact!
+    const raceSid = "sess-b2-race";
+    assert.equal(await backend.upsertClientSession(mkSession({ id: raceSid })), "applied");
+    const dRace = randomUUID();
+    const raceKey = `dispatch:${dRace}:1`;
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id, user_id, session_id, client_message_id, agent_id, request_hash,
+          billing_request_id, status, outcome, terminal_at, admitted_at)
+       VALUES ($1, $2, $3, 'cm-race', 'main', $4, $5, 'terminal', 'interrupted', $6, $6)`,
+      [dRace, UID, raceSid, "1".repeat(64), `bill-${dRace}`, oldDate],
+    );
+    await pool.query(
+      `INSERT INTO client_session_turn_tapes
+         (session_id, user_id, tape_id, agent_id, turn_index, status, turn_key,
+          tape_sha256, total_bytes, part_count, created_at, finalized_at,
+          client_message_id, dispatch_id, attempt_no)
+       VALUES ($1, $2, 'tape-race', 'main', 1, 'completed', $3, $4, 32, 1, $5, $5, 'cm-race', $6::uuid, 1)`,
+      [raceSid, USER_ID, "2".repeat(64), "3".repeat(64), finalizedAtMs, dRace],
+    );
+    await pool.query(
+      `INSERT INTO client_session_turn_tape_records
+         (session_id, user_id, tape_id, msg_id, ordinal, role, ts, content_sha256, payload, payload_bytes)
+       VALUES ($1, $2, 'tape-race', 'msg-race', 0, 'assistant', $3, $4, $5, 32)`,
+      [raceSid, USER_ID, finalizedAtMs, "4".repeat(64), Buffer.from('{"role":"assistant","text":"partial"}')],
+    );
+    await pool.query(
+      `INSERT INTO client_session_live_streams
+         (stream_key, session_id, user_id, client_message_id, dispatch_id, attempt_no,
+          agent_container_id, source, projection_source, tape_id, provenance, updated_at)
+       VALUES ($1, $2, $3, 'cm-race', $4::uuid, 1, 1, 'gateway', 'live', 'tape-race',
+               jsonb_build_object('retired_at', $5::text), $6)`,
+      [raceKey, raceSid, USER_ID, dRace, oldIso, oldDate],
+    );
+    const insertedFrame = (
+      await pool.query<{ record_id: string }>(
+        `INSERT INTO client_session_live_frames
+           (stream_key, source, agent_container_id, session_key, frame_seq, payload, payload_sha256, created_at)
+         VALUES ($1, 'gateway', 1, $2, 1, $3, $4, $5)
+         RETURNING record_id::text`,
+        [raceKey, `sk:${raceKey}`, Buffer.from('{"type":"outbound.message","text":"race-evidence"}'), "5".repeat(64), frameTimeBeforeFinalize],
+      )
+    ).rows[0]!;
+    await pool.query(
+      `INSERT INTO client_session_live_unit_checkpoints
+         (stream_key, session_id, user_id, reducer_epoch, through_frame_seq, through_record_id, units_jsonb, session_key)
+       VALUES ($1, $2, $3, 'v1', 1, $4::bigint, '[]'::jsonb, $5)`,
+      [raceKey, raceSid, USER_ID, insertedFrame.record_id, `sk:${raceKey}`],
+    );
+
+    const connRecovery = await pool.connect();
+    try {
+      await connRecovery.query("BEGIN");
+      const enqueued = await enqueueAutomaticRecoveryJob(connRecovery, {
+        userId: BigInt(UID),
+        sessionId: raceSid,
+        rootClientMessageId: "cm-race",
+        sourceClientMessageId: "cm-race",
+        sourceTurnKey: "2".repeat(64),
+        errorCode: "INTERRUPTED",
+        recoveryMode: "replay",
+        semanticRecoveryAttempt: 1,
+        request: { clientMessageId: "cm-race-retry" },
+        tapeSha256: "3".repeat(64),
+      });
+      assert.equal(enqueued, true);
+
+      // Start prune concurrently while connRecovery holds lockRecoveryRoot (oc_recovery_session:<uid>:<raceSid>).
+      // Prune's initial candidate SELECT sees tape_recoverable=true (uncommitted recovery job invisible),
+      // then its destructive tx blocks on the advisory lock until connRecovery commits!
+      const prunePromise = pruneRetiredLiveFrames(pool, { olderThanDays: 7, batchSize: 100, nowMs });
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      await connRecovery.query("COMMIT");
+
+      const raceResult = await prunePromise;
+      assert.equal(raceResult.deletedFrames, 0, "concurrently queued recovery job MUST protect frames under advisory lock");
+      assert.equal(raceResult.deletedStreams, 0);
+      assert.ok(raceResult.retainedStreams >= 1);
+    } catch (err) {
+      try { await connRecovery.query("ROLLBACK"); } catch { /* ignore */ }
+      throw err;
+    } finally {
+      connRecovery.release();
+    }
+
+    const raceFramesAfter = Number(
+      (await pool.query<{ cnt: string }>("SELECT COUNT(*)::text AS cnt FROM client_session_live_frames WHERE stream_key=$1", [raceKey])).rows[0]?.cnt,
+    );
+    const raceCkptAfter = Number(
+      (await pool.query<{ cnt: string }>("SELECT COUNT(*)::text AS cnt FROM client_session_live_unit_checkpoints WHERE stream_key=$1", [raceKey])).rows[0]?.cnt,
+    );
+    const raceStreamAfter = Number(
+      (await pool.query<{ cnt: string }>("SELECT COUNT(*)::text AS cnt FROM client_session_live_streams WHERE stream_key=$1", [raceKey])).rows[0]?.cnt,
+    );
+    assert.equal(raceFramesAfter, 1, "frames preserved on concurrent recovery enqueue");
+    assert.equal(raceCkptAfter, 1, "checkpoint preserved on concurrent recovery enqueue");
+    assert.equal(raceStreamAfter, 1, "stream preserved on concurrent recovery enqueue");
   });
 
   test("B3: getClientSessionPartial(view='timeline') returns full paginated timeline (isPartial=false) in 1 client_sessions SELECT", async (t) => {
@@ -507,7 +711,9 @@ describe("OCV5-824 R2 real-PG verification (B1-B8 + N1)", () => {
     assert.equal(snap2.turnStatus?.status, "retrying");
     assert.equal(snap2.turnStatus?.detail, "new\u0000nul");
 
-    // Case 3: Legacy stream (NULL seqs) with 2,500 non-matching frames -> bounded strictly to MAX_PAGES * SCAN_WINDOW.
+    // Case 3 (B5 Audit Fixture 1): Legacy NULL-seq stream with seq=1 valid usage (totalTokens=42)
+    // followed by 2,048 normal frames (seq=2..2049), read with caught-up cursor afterSeq=2049.
+    // Scan MUST stay bounded at MAX_PAGES * SCAN_WINDOW AND MUST NOT pretend usage=null, gap=null, hasMore=false!
     const dLegacy = randomUUID();
     const sidLegacy = "sess-b5-legacy";
     assert.equal(await backend.upsertClientSession(mkSession({ id: sidLegacy })), "applied");
@@ -526,12 +732,22 @@ describe("OCV5-824 R2 real-PG verification (B1-B8 + N1)", () => {
        VALUES ($1, $2, $3, 'cm-b5-leg', $4::uuid, 1, 1, 'gateway', 'live')`,
       [legKey, sidLegacy, USER_ID, dLegacy],
     );
-    // Bulk-insert 2500 non-matching frames (> 8 * 256 = 2048).
+    await pool.query(
+      `INSERT INTO client_session_live_frames
+         (stream_key, source, agent_container_id, session_key, frame_seq, payload, payload_sha256)
+       VALUES ($1, 'gateway', 1, $2, 1, $3::bytea, $4)`,
+      [
+        legKey,
+        `sk:${dLegacy}`,
+        Buffer.from(JSON.stringify({ type: "outbound.turn_usage", usage: { totalTokens: 42, inputTokens: 20, outputTokens: 22 } })),
+        "2".repeat(64),
+      ],
+    );
     await pool.query(
       `INSERT INTO client_session_live_frames
          (stream_key, source, agent_container_id, session_key, frame_seq, payload, payload_sha256)
        SELECT $1, 'gateway', 1, $2, g, $3::bytea, $4
-         FROM generate_series(1, 2500) AS g`,
+         FROM generate_series(2, 2049) AS g`,
       [legKey, `sk:${dLegacy}`, Buffer.from('{"type":"outbound.stream_delta","text":"x"}'), "2".repeat(64)],
     );
     let legacyFactQueries = 0;
@@ -547,9 +763,92 @@ describe("OCV5-824 R2 real-PG verification (B1-B8 + N1)", () => {
         };
       },
     } as unknown as Pool;
-    const snapLegacy = await readSessionSnapshot(spyPoolLegacy, String(UID), sidLegacy, { clientMessageId: "cm-b5-leg" });
+    const snapLegacy = await readSessionSnapshot(spyPoolLegacy, String(UID), sidLegacy, {
+      clientMessageId: "cm-b5-leg",
+      streamKey: legKey,
+      afterSeq: 2049,
+    });
     assert.ok(snapLegacy);
-    assert.equal(legacyFactQueries, SESSION_SNAPSHOT_FACTS_MAX_PAGES, `legacy scan capped at ${SESSION_SNAPSHOT_FACTS_MAX_PAGES} windows of ${SESSION_SNAPSHOT_FACTS_SCAN_WINDOW} rows`);
+    assert.equal(
+      legacyFactQueries,
+      SESSION_SNAPSHOT_FACTS_MAX_PAGES,
+      `legacy scan capped at ${SESSION_SNAPSHOT_FACTS_MAX_PAGES} windows of ${SESSION_SNAPSHOT_FACTS_SCAN_WINDOW} rows`,
+    );
+    assert.deepEqual(
+      snapLegacy.gap,
+      { reason: "sequence_gap", afterSeq: 0, beforeSeq: 2 },
+      "exhausted budget with unscanned earlier frames MUST emit explicit gap (never usage=null, gap=null, hasMore=false)",
+    );
+    assert.equal(
+      Value.Check(OutboundSessionSnapshot, {
+        type: "outbound.session_snapshot",
+        channel: "webchat",
+        peer: { id: sidLegacy, kind: "dm" },
+        snapshot: snapLegacy,
+      }),
+      true,
+      "emitted gap must stay strictly protocol-schema valid",
+    );
+
+    // Case 4 (B5 Audit Fixture 2): Legacy NULL-seq stream with 300 frames out-of-order:
+    // higher logical frame_seq=300 usage (totalTokens=300) arrives FIRST (lowest record_id),
+    // followed by normal frames, followed by lower logical frame_seq=100 usage (totalTokens=100)
+    // arriving LAST (highest record_id). Snapshot MUST return frameSeq=300 / totalTokens=300!
+    const dOoo = randomUUID();
+    const sidOoo = "sess-b5-ooo";
+    assert.equal(await backend.upsertClientSession(mkSession({ id: sidOoo })), "applied");
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id, user_id, session_id, client_message_id, agent_id, request_hash,
+          billing_request_id, status, outcome, attempt_no, admitted_at, accepted_at)
+       VALUES ($1, $2, $3, 'cm-b5-ooo', 'main', $4, $5, 'accepted', NULL, 1, NOW(), NOW())`,
+      [dOoo, UID, sidOoo, "6".repeat(64), `bill-${dOoo}`],
+    );
+    const oooKey = `dispatch:${dOoo}:1`;
+    await pool.query(
+      `INSERT INTO client_session_live_streams
+         (stream_key, session_id, user_id, client_message_id, dispatch_id, attempt_no,
+          agent_container_id, source, projection_source)
+       VALUES ($1, $2, $3, 'cm-b5-ooo', $4::uuid, 1, 1, 'gateway', 'live')`,
+      [oooKey, sidOoo, USER_ID, dOoo],
+    );
+    // Insert seq=300 usage FIRST (lowest record_id).
+    await pool.query(
+      `INSERT INTO client_session_live_frames
+         (stream_key, source, agent_container_id, session_key, frame_seq, payload, payload_sha256)
+       VALUES ($1, 'gateway', 1, $2, 300, $3::bytea, $4)`,
+      [
+        oooKey,
+        `sk:${dOoo}`,
+        Buffer.from(JSON.stringify({ type: "outbound.turn_usage", usage: { totalTokens: 300, inputTokens: 200, outputTokens: 100 } })),
+        "6".repeat(64),
+      ],
+    );
+    // Insert 298 normal frames (seq 1..99 and 101..299).
+    await pool.query(
+      `INSERT INTO client_session_live_frames
+         (stream_key, source, agent_container_id, session_key, frame_seq, payload, payload_sha256)
+       SELECT $1, 'gateway', 1, $2, g, $3::bytea, $4
+         FROM generate_series(1, 299) AS g
+        WHERE g <> 100`,
+      [oooKey, `sk:${dOoo}`, Buffer.from('{"type":"outbound.stream_delta","text":"mid"}'), "6".repeat(64)],
+    );
+    // Insert seq=100 usage LAST (highest record_id — later physically, earlier logically!).
+    await pool.query(
+      `INSERT INTO client_session_live_frames
+         (stream_key, source, agent_container_id, session_key, frame_seq, payload, payload_sha256)
+       VALUES ($1, 'gateway', 1, $2, 100, $3::bytea, $4)`,
+      [
+        oooKey,
+        `sk:${dOoo}`,
+        Buffer.from(JSON.stringify({ type: "outbound.turn_usage", usage: { totalTokens: 100, inputTokens: 60, outputTokens: 40 } })),
+        "6".repeat(64),
+      ],
+    );
+    const snapOoo = await readSessionSnapshot(pool, String(UID), sidOoo, { clientMessageId: "cm-b5-ooo" });
+    assert.ok(snapOoo);
+    assert.equal(snapOoo.usage?.frameSeq, 300, "must select highest logical frame_seq=300 despite lower record_id");
+    assert.equal(snapOoo.usage?.usage.totalTokens, 300);
   });
 
   test("B6: 32 idle sessions where 1 session has 3 valid ask-user pending prompts returns all 3 (never silently drops 3rd under complete)", async (t) => {

@@ -1,10 +1,8 @@
 -- order-dependency: 0349_user_site_collaborators
--- compat: purely additive nullable columns and single-table preview-invalidation
---   trigger in a short bounded-lock transaction (NO index builds here; indexes
---   live in 0351_perf_timeline_and_live_snapshot_indexes.sql with -- no-transaction
---   and CREATE INDEX CONCURRENTLY). Pre-0350 binaries ignore the new columns and
---   the BEFORE UPDATE OF messages trigger auto-invalidates last_preview whenever
---   any legacy or external writer modifies client_sessions.messages.
+-- Purely additive nullable columns and single-table preview-invalidation
+-- trigger in a short bounded-lock transaction (NO index builds here; indexes
+-- live in 0351_perf_timeline_and_live_snapshot_indexes.sql with -- no-transaction
+-- and CREATE INDEX CONCURRENTLY).
 
 SET LOCAL lock_timeout = '5s';
 
@@ -21,6 +19,7 @@ ALTER TABLE client_session_turn_tape_records
 ALTER TABLE client_sessions
   ADD COLUMN IF NOT EXISTS last_preview TEXT;
 
+-- compat: purely additive trigger function that only clears the new nullable last_preview column when messages changes without updating last_preview; pre-0350 writers ignore last_preview and rollback drops the trigger and function cleanly
 CREATE OR REPLACE FUNCTION trg_client_sessions_invalidate_last_preview()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -34,7 +33,9 @@ BEGIN
 END;
 $$;
 
+-- compat: idempotent re-run guard scoped exclusively to the new 0350 trigger; never touches pre-0350 triggers or blocks old writers
 DROP TRIGGER IF EXISTS trg_client_sessions_invalidate_last_preview ON client_sessions;
+-- compat: single-table BEFORE UPDATE OF messages trigger auto-invalidates new nullable last_preview to NULL when pre-0350 or external writers update messages; rollback drops trigger cleanly without affecting old binaries
 CREATE TRIGGER trg_client_sessions_invalidate_last_preview
   BEFORE UPDATE OF messages ON client_sessions
   FOR EACH ROW
@@ -42,7 +43,7 @@ CREATE TRIGGER trg_client_sessions_invalidate_last_preview
 
 -- 3. O(1) latest turn_status / turn_usage pointer & sequence tracking columns on
 --    client_session_live_streams:
---      seq IS NULL  => legacy un-tracked stream (fall back to bounded record_id scan)
+--      seq IS NULL  => legacy un-tracked stream (fall back to bounded frame_seq scan)
 --      seq = 0      => tracked stream with no fact of this kind yet (O(1) skip scan)
 --      seq > 0      => latest fact frame_seq; if *_json IS NULL (e.g. NUL/surrogate
 --                      payload not representable in JSONB), fetch exact frame_seq row.

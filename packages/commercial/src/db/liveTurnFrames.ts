@@ -1820,18 +1820,88 @@ export interface PruneRetiredLiveFramesResult {
   skippedInvalidRetiredAt: number;
 }
 
+const RETIRED_PRUNE_TAPE_RECOVERABLE_SQL = `(
+  s.dispatch_id IS NOT NULL
+  AND s.attempt_no IS NOT NULL
+  AND s.stream_key = ('dispatch:' || s.dispatch_id::text || ':' || s.attempt_no::text)
+  AND EXISTS (
+    SELECT 1 FROM turn_dispatches d
+     WHERE d.dispatch_id=s.dispatch_id
+       AND ('c:' || d.user_id::text)=s.user_id
+       AND d.session_id=s.session_id
+       AND d.status='terminal'
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM turn_recovery_jobs rj
+     WHERE ('c:' || rj.user_id::text)=s.user_id
+       AND rj.session_id=s.session_id
+       AND rj.status IN ('queued','leased','sent','forwarded')
+       AND (
+         s.client_message_id IS NULL
+         OR rj.source_client_message_id=s.client_message_id
+         OR rj.root_client_message_id=s.client_message_id
+         OR rj.dispatch_id=s.dispatch_id
+       )
+  )
+  AND (
+    (
+      s.tape_id IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM client_session_turn_tapes t
+         WHERE t.session_id=s.session_id
+           AND t.user_id=s.user_id
+           AND t.tape_id=s.tape_id
+           AND t.finalized_at IS NOT NULL
+           AND EXISTS (
+             SELECT 1 FROM client_session_turn_tape_records r
+              WHERE r.session_id=t.session_id
+                AND r.user_id=t.user_id
+                AND r.tape_id=t.tape_id
+                AND COALESCE(r.payload_bytes, octet_length(r.payload)) > 0
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM client_session_live_frames fr
+              WHERE fr.stream_key=s.stream_key
+                AND floor(EXTRACT(EPOCH FROM fr.created_at)*1000)::bigint > t.finalized_at
+           )
+      )
+    )
+    OR EXISTS (
+      SELECT 1 FROM client_session_turn_tapes t
+       WHERE t.session_id=s.session_id
+         AND t.user_id=s.user_id
+         AND t.dispatch_id=s.dispatch_id
+         AND t.attempt_no=s.attempt_no
+         AND t.finalized_at IS NOT NULL
+         AND EXISTS (
+           SELECT 1 FROM client_session_turn_tape_records r
+            WHERE r.session_id=t.session_id
+              AND r.user_id=t.user_id
+              AND r.tape_id=t.tape_id
+              AND COALESCE(r.payload_bytes, octet_length(r.payload)) > 0
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM client_session_live_frames fr
+            WHERE fr.stream_key=s.stream_key
+              AND floor(EXTRACT(EPOCH FROM fr.created_at)*1000)::bigint > t.finalized_at
+         )
+    )
+  )
+)`;
+
 /**
- * Safely prune retired gateway live streams and their frames ONLY when an
- * authoritative, finalized, non-empty tape replica is proven for the same
- * (session_id, user_id) and turn identity (OCV5-824 B2 + N1).
- *
- * Strictly preserves (never deletes) and independently counts:
- *   - uniqueCopy streams (no tape, unfinalized tape, or empty tape with 0 records)
- *   - streams belonging to open or `manual_reconcile` dispatches
- *   - streams referenced by any active `turn_recovery_jobs` row
- *   - reused legacy streams with frames newer than tape finalization or updated_at
- *   - `rollout_import` streams
- *   - streams with malformed / unparseable `provenance.retired_at`
+ * Safely prune retired gateway live streams and their frames ONLY when:
+ *   1. The stream has immutable single-turn dispatch identity
+ *      (`dispatch:<dispatch_id>:<attempt_no>`). Reusable `legacy:*` streams
+ *      without per-turn identity are NEVER deleted and are counted in
+ *      `retainedStreams`.
+ *   2. Inside a destructive transaction holding the exact same session-level
+ *      `pg_advisory_xact_lock('oc_recovery_session:' || uid || ':' || sessionId)`
+ *      as `turnRecoveryStore.lockRecoveryRoot`, we lock the stream row(s)
+ *      `FOR UPDATE` and atomically re-verify terminal dispatch status, absence
+ *      of active `turn_recovery_jobs`, and an authoritative finalized non-empty
+ *      tape replica before deleting frames, checkpoints, and the empty stream
+ *      (OCV5-824 B2 + N1).
  */
 export async function pruneRetiredLiveFrames(
   pool: Pool,
@@ -1860,119 +1930,23 @@ export async function pruneRetiredLiveFrames(
   for (let scanPage = 0; scanPage < maxBatches; scanPage += 1) {
     const candidates: Array<{
       stream_key: string;
+      user_id: string;
+      session_id: string;
       retired_at_raw: string | null;
       tape_recoverable: boolean;
     }> = (
       await pool.query<{
         stream_key: string;
+        user_id: string;
+        session_id: string;
         retired_at_raw: string | null;
         tape_recoverable: boolean;
       }>(
         `SELECT s.stream_key,
+                s.user_id,
+                s.session_id,
                 s.provenance->>'retired_at' AS retired_at_raw,
-                (
-                  (
-                    (
-                      s.dispatch_id IS NOT NULL
-                      AND EXISTS (
-                        SELECT 1 FROM turn_dispatches d
-                         WHERE d.dispatch_id=s.dispatch_id
-                           AND d.status='terminal'
-                      )
-                    )
-                    OR (
-                      s.dispatch_id IS NULL
-                      AND NOT EXISTS (
-                        SELECT 1 FROM turn_dispatches d
-                         WHERE ('c:' || d.user_id::text)=s.user_id
-                           AND d.session_id=s.session_id
-                           AND d.status IN ('admitted','accepted','rejecting','manual_reconcile')
-                      )
-                    )
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM turn_recovery_jobs rj
-                     WHERE ('c:' || rj.user_id::text)=s.user_id
-                       AND rj.session_id=s.session_id
-                       AND rj.status IN ('queued','leased','sent','forwarded')
-                       AND (
-                         s.client_message_id IS NULL
-                         OR rj.source_client_message_id=s.client_message_id
-                         OR rj.root_client_message_id=s.client_message_id
-                       )
-                  )
-                  AND (
-                    (
-                      s.tape_id IS NOT NULL
-                      AND EXISTS (
-                        SELECT 1 FROM client_session_turn_tapes t
-                         WHERE t.session_id=s.session_id
-                           AND t.user_id=s.user_id
-                           AND t.tape_id=s.tape_id
-                           AND t.finalized_at IS NOT NULL
-                           AND EXISTS (
-                             SELECT 1 FROM client_session_turn_tape_records r
-                              WHERE r.session_id=t.session_id
-                                AND r.user_id=t.user_id
-                                AND r.tape_id=t.tape_id
-                                AND COALESCE(r.payload_bytes, octet_length(r.payload)) > 0
-                           )
-                           AND NOT EXISTS (
-                             SELECT 1 FROM client_session_live_frames fr
-                              WHERE fr.stream_key=s.stream_key
-                                AND floor(EXTRACT(EPOCH FROM fr.created_at)*1000)::bigint > t.finalized_at
-                           )
-                      )
-                    )
-                    OR (
-                      s.dispatch_id IS NOT NULL
-                      AND EXISTS (
-                        SELECT 1 FROM client_session_turn_tapes t
-                         WHERE t.session_id=s.session_id
-                           AND t.user_id=s.user_id
-                           AND t.dispatch_id=s.dispatch_id
-                           AND t.attempt_no=s.attempt_no
-                           AND t.finalized_at IS NOT NULL
-                           AND EXISTS (
-                             SELECT 1 FROM client_session_turn_tape_records r
-                              WHERE r.session_id=t.session_id
-                                AND r.user_id=t.user_id
-                                AND r.tape_id=t.tape_id
-                                AND COALESCE(r.payload_bytes, octet_length(r.payload)) > 0
-                           )
-                           AND NOT EXISTS (
-                             SELECT 1 FROM client_session_live_frames fr
-                              WHERE fr.stream_key=s.stream_key
-                                AND floor(EXTRACT(EPOCH FROM fr.created_at)*1000)::bigint > t.finalized_at
-                           )
-                      )
-                    )
-                    OR (
-                      s.dispatch_id IS NULL
-                      AND s.client_message_id IS NOT NULL
-                      AND EXISTS (
-                        SELECT 1 FROM client_session_turn_tapes t
-                         WHERE t.session_id=s.session_id
-                           AND t.user_id=s.user_id
-                           AND t.client_message_id=s.client_message_id
-                           AND t.status='completed'
-                           AND t.finalized_at IS NOT NULL
-                           AND EXISTS (
-                             SELECT 1 FROM client_session_turn_tape_records r
-                              WHERE r.session_id=t.session_id
-                                AND r.user_id=t.user_id
-                                AND r.tape_id=t.tape_id
-                                AND COALESCE(r.payload_bytes, octet_length(r.payload)) > 0
-                           )
-                           AND NOT EXISTS (
-                             SELECT 1 FROM client_session_live_frames fr
-                              WHERE fr.stream_key=s.stream_key
-                                AND floor(EXTRACT(EPOCH FROM fr.created_at)*1000)::bigint > t.finalized_at
-                           )
-                      )
-                    )
-                  )
-                ) AS tape_recoverable
+                ${RETIRED_PRUNE_TAPE_RECOVERABLE_SQL} AS tape_recoverable
            FROM client_session_live_streams s
           WHERE s.source='gateway'
             AND s.provenance ? 'retired_at'
@@ -1986,7 +1960,7 @@ export async function pruneRetiredLiveFrames(
     if (candidates.length === 0) break;
     afterStreamKey = candidates[candidates.length - 1]!.stream_key;
 
-    const eligibleKeys: string[] = [];
+    const groupsBySession = new Map<string, { numericUid: string; sessionId: string; streamKeys: string[] }>();
     for (const row of candidates) {
       const retiredAtMs = parseStrictRetiredAtMs(row.retired_at_raw);
       if (retiredAtMs === null) {
@@ -1998,55 +1972,109 @@ export async function pruneRetiredLiveFrames(
         retainedStreams += 1;
         continue;
       }
-      eligibleKeys.push(row.stream_key);
+      const uidMatch = /^c:([1-9][0-9]*)$/.exec(row.user_id);
+      if (!uidMatch) {
+        retainedStreams += 1;
+        continue;
+      }
+      const groupKey = `${uidMatch[1]}:${row.session_id}`;
+      let group = groupsBySession.get(groupKey);
+      if (!group) {
+        group = { numericUid: uidMatch[1]!, sessionId: row.session_id, streamKeys: [] };
+        groupsBySession.set(groupKey, group);
+      }
+      group.streamKeys.push(row.stream_key);
     }
 
-    if (eligibleKeys.length > 0) {
-      const pageTouched = new Set<string>();
-      while (frameBatchesUsed < maxBatches) {
-        const res = await pool.query<{ stream_key: string }>(
-          `DELETE FROM client_session_live_frames
-            WHERE record_id IN (
-              SELECT f.record_id
-                FROM client_session_live_frames f
-                JOIN client_session_live_streams s ON s.stream_key=f.stream_key
-               WHERE f.stream_key = ANY($1::text[])
-                 AND s.source='gateway'
-                 AND s.provenance ? 'retired_at'
-                 AND s.updated_at < NOW() - ($3::integer * INTERVAL '1 day')
-               LIMIT $2
-            )
-            RETURNING stream_key`,
-          [eligibleKeys, batchSize, olderThanDays],
+    for (const group of groupsBySession.values()) {
+      if (frameBatchesUsed >= maxBatches) break;
+      await withTx(pool, async (client) => {
+        // Coordinate strictly with turnRecoveryStore.lockRecoveryRoot / turnControlStore
+        // on the exact same session-level advisory xact lock before re-verifying & deleting.
+        await client.query(
+          `SELECT pg_advisory_xact_lock(hashtextextended(
+             'oc_recovery_session:' || $1::text || ':' || $2, 0
+           ))`,
+          [group.numericUid, group.sessionId],
         );
-        const count = res.rowCount ?? 0;
-        if (count === 0) break;
-        frameBatchesUsed += 1;
-        deletedFrames += count;
-        for (const r of res.rows) {
-          touched.add(r.stream_key);
-          pageTouched.add(r.stream_key);
+
+        const locked = (
+          await client.query<{
+            stream_key: string;
+            retired_at_raw: string | null;
+            tape_recoverable: boolean;
+          }>(
+            `SELECT s.stream_key,
+                    s.provenance->>'retired_at' AS retired_at_raw,
+                    ${RETIRED_PRUNE_TAPE_RECOVERABLE_SQL} AS tape_recoverable
+               FROM client_session_live_streams s
+              WHERE s.stream_key = ANY($1::text[])
+                AND s.source='gateway'
+                AND s.provenance ? 'retired_at'
+                AND s.updated_at < NOW() - ($2::integer * INTERVAL '1 day')
+              ORDER BY s.stream_key ASC
+              FOR UPDATE`,
+            [group.streamKeys, olderThanDays],
+          )
+        ).rows;
+
+        const verifiedKeys: string[] = [];
+        for (const row of locked) {
+          const retiredAtMs = parseStrictRetiredAtMs(row.retired_at_raw);
+          if (retiredAtMs === null) {
+            skippedInvalidRetiredAt += 1;
+            continue;
+          }
+          if (retiredAtMs >= cutoffMs) continue;
+          if (row.tape_recoverable !== true) {
+            retainedStreams += 1;
+            continue;
+          }
+          verifiedKeys.push(row.stream_key);
         }
-        if (count < batchSize) break;
-      }
-      if (pageTouched.size > 0) {
-        await deleteLiveUnitCheckpoints(pool, [...pageTouched]);
-      }
-      const delStreams = await pool.query<{ stream_key: string }>(
-        `DELETE FROM client_session_live_streams s
-          WHERE s.stream_key = ANY($1::text[])
-            AND s.source='gateway'
-            AND s.projection_source='live'
-            AND s.provenance ? 'retired_at'
-            AND s.updated_at < NOW() - ($2::integer * INTERVAL '1 day')
-            AND NOT EXISTS (
-              SELECT 1 FROM client_session_live_frames f
-               WHERE f.stream_key=s.stream_key
-            )
-          RETURNING s.stream_key`,
-        [eligibleKeys, olderThanDays],
-      );
-      deletedStreams += delStreams.rowCount ?? 0;
+        if (verifiedKeys.length === 0) return;
+
+        const txTouched = new Set<string>();
+        while (frameBatchesUsed < maxBatches) {
+          const res = await client.query<{ stream_key: string }>(
+            `DELETE FROM client_session_live_frames
+              WHERE record_id IN (
+                SELECT f.record_id
+                  FROM client_session_live_frames f
+                 WHERE f.stream_key = ANY($1::text[])
+                 LIMIT $2
+              )
+              RETURNING stream_key`,
+            [verifiedKeys, batchSize],
+          );
+          const count = res.rowCount ?? 0;
+          if (count === 0) break;
+          frameBatchesUsed += 1;
+          deletedFrames += count;
+          for (const r of res.rows) {
+            touched.add(r.stream_key);
+            txTouched.add(r.stream_key);
+          }
+          if (count < batchSize) break;
+        }
+        if (txTouched.size > 0) {
+          await deleteLiveUnitCheckpoints(client, [...txTouched]);
+        }
+        const delStreams = await client.query<{ stream_key: string }>(
+          `DELETE FROM client_session_live_streams s
+            WHERE s.stream_key = ANY($1::text[])
+              AND s.source='gateway'
+              AND s.projection_source='live'
+              AND s.provenance ? 'retired_at'
+              AND NOT EXISTS (
+                SELECT 1 FROM client_session_live_frames f
+                 WHERE f.stream_key=s.stream_key
+              )
+            RETURNING s.stream_key`,
+          [verifiedKeys],
+        );
+        deletedStreams += delStreams.rowCount ?? 0;
+      });
     }
 
     if (frameBatchesUsed >= maxBatches || candidates.length < streamScanLimit) break;

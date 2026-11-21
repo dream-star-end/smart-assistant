@@ -329,7 +329,7 @@ describe("sessionSnapshot O(1) 3-state pointers, bounded fallback & single-tx ba
     assert.equal(sqls.some((s) => s.includes("session-snapshot-facts")), false, "exact-seq avoids legacy scan");
   });
 
-  test("legacy NULL-seq fallback caps scanned rows via MATERIALIZED record_id window at SESSION_SNAPSHOT_FACTS_MAX_PAGES", async () => {
+  test("legacy NULL-seq fallback caps scanned rows via MATERIALIZED frame_seq DESC window and emits explicit gap when budget exhausted", async () => {
     let factPages = 0;
     let factSql = "";
     const client = {
@@ -367,13 +367,15 @@ describe("sessionSnapshot O(1) 3-state pointers, bounded fallback & single-tx ba
         if (sql.includes("session-snapshot-facts")) {
           factPages += 1;
           factSql = sql;
-          // Sentinel row: full 256-row window scanned with 0 matching facts.
+          // Sentinel row: full 256-row window scanned with 0 matching facts and more earlier rows remaining.
           return {
             rows: [{
               record_id: null,
               frame_seq: null,
               payload: null,
               scanned_count: SESSION_SNAPSHOT_FACTS_SCAN_WINDOW,
+              has_more_earlier: true,
+              min_frame_seq: String(99999 - factPages * SESSION_SNAPSHOT_FACTS_SCAN_WINDOW),
               min_record_id: String(100000 - factPages * SESSION_SNAPSHOT_FACTS_SCAN_WINDOW),
             }],
           };
@@ -385,8 +387,9 @@ describe("sessionSnapshot O(1) 3-state pointers, bounded fallback & single-tx ba
     const snap = await buildSessionSnapshot(client, "3", "s-legacy-unbounded");
     assert.ok(snap);
     assert.equal(factPages, SESSION_SNAPSHOT_FACTS_MAX_PAGES, "fallback BYTEA scan must be strictly bounded");
-    assert.match(factSql, /WITH win AS MATERIALIZED/);
-    assert.match(factSql, /ORDER BY record_id DESC/);
+    assert.match(factSql, /WITH win_plus AS MATERIALIZED/);
+    assert.match(factSql, /ORDER BY frame_seq DESC, record_id DESC/);
+    assert.equal(snap.gap?.reason, "sequence_gap", "budget exhaustion with earlier unscanned frames must emit explicit gap");
   });
 
   test("readSessionSnapshotsBatch executes strictly sequentially in 1 tx and releases on error", async () => {
@@ -508,6 +511,7 @@ describe("0350 + 0351 migration split contract (B1)", () => {
       "idx_turn_dispatches_user_session_terminal",
       "idx_turn_dispatches_user_session_open",
       "idx_live_streams_retired_updated",
+      "idx_live_frames_stream_frame_seq",
     ]) {
       assert.ok(mig351.includes(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${idx}`), `0351 missing CONCURRENTLY ${idx}`);
       assert.ok(rb351.includes(`DROP INDEX CONCURRENTLY IF EXISTS ${idx}`), `0351 rollback missing ${idx}`);
