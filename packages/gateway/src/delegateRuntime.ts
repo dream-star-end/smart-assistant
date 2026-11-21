@@ -1006,6 +1006,10 @@ export function _delegateResultToHttp(
       },
     }
   }
+  // Paid child replies must be delivered verbatim in `body.output`
+  // (lossless contract in memberDelegateLimit.test.ts); keep companion
+  // `artifactPath` offloaded for oversized replies so downstream pruning
+  // and on-demand reads have a stable handle.
   const bounded = boundSyncDelegateOutput(result.output, {
     targetAgentId,
     sessionKey: result.sessionKey,
@@ -1015,7 +1019,7 @@ export function _delegateResultToHttp(
     body: {
       ok: result.ok,
       agentId: targetAgentId,
-      output: bounded.output,
+      output: result.output,
       ...(bounded.artifactPath ? { artifactPath: bounded.artifactPath } : {}),
       error: result.error || undefined,
       ...(result.sessionKey ? { sessionKey: result.sessionKey } : {}),
