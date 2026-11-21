@@ -674,3 +674,44 @@ test("OCV5-819 R2-B5: synchronous deadline check rejects expired queued frame ev
     await registry.shutdown();
   }
 });
+
+test("OCV5-821: origin executor availability respects candidate isAvailable on detached keepAlive/open links", async () => {
+  const registry = new ContainerLinkRegistry(pool);
+  const physical = new Transport();
+  const maps = { recovery: new Map<string, Set<RecoveryExecutor>>(), origin: new Map<string, Set<CronOriginExecutor>>() };
+  try {
+    const sock = await registry.attach(9n, 11, () => physical as unknown as WebSocket);
+    const handle = getContainerLinkHandle(sock)!;
+    handle.keepAlive = true;
+    handle.activate();
+    let originReady = false;
+    let originCalls = 0;
+    const originFn: CronOriginExecutor = () => {
+      originCalls++;
+      return originReady ? { kind: "claimed" } : { kind: "not_claimed" };
+    };
+    originFn.agentContainerId = 11;
+    originFn.runtimeKind = "docker";
+    (originFn as CronOriginExecutor & { isAvailable?: () => boolean }).isAvailable = () => originReady;
+    registerBridgeExecutors(9n, sock, {
+      recovery: () => {},
+      origin: originFn,
+    }, maps);
+    handle.detach();
+
+    // When detached keepAlive link's origin reports unavailable (e.g. draining), availableExecutors must hide it
+    // instead of advertising transport before admitUserTurn and then returning not_claimed.
+    assert.equal(availableExecutors(maps.recovery.get("9")).length, 1, "recovery remains available on keepAlive link");
+    assert.equal(availableExecutors(maps.origin.get("9")).length, 0, "origin unavailable when candidate isAvailable() is false");
+
+    // When origin reports ready on the detached keepAlive link, availableExecutors exposes it and invokes it cleanly.
+    originReady = true;
+    const avail = availableExecutors(maps.origin.get("9"));
+    assert.equal(avail.length, 1);
+    assert.equal(avail[0]!.agentContainerId, 11);
+    assert.deepEqual(await avail[0]!({} as Parameters<CronOriginExecutor>[0]), { kind: "claimed" });
+    assert.equal(originCalls, 1);
+  } finally {
+    await registry.shutdown();
+  }
+});

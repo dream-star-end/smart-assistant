@@ -12,6 +12,7 @@ import { assembleSystemActions, type SystemSessionReadBackend } from './system-a
 import { INTERNAL_SYSTEM_ACTIONS_PATH } from './system-assistant/internalHttp.js'
 import { makePromptPrivacySupportResolver } from './user/promptPrivacySupport.js'
 import { getV3ContainerStatus } from './agent-sandbox/v3supervisor.js'
+import { RUNTIME_BUNDLE_REV_LABEL_KEY } from './agent-sandbox/platformBundle.js'
 import { makeDraftPreparation, makePreparationReady, type DraftPreparationHint } from './agent-sandbox/draftPreparation.js';
 import { makeEnginePreheatPreparation, makeDraftEnginePreparation } from './dispatch/enginePreheatPreparation.js';
 import { makeWorkspacePreparation } from './agent-sandbox/workspacePreparation.js';
@@ -5857,7 +5858,13 @@ export async function registerCommercial(
       getRuntimeChannel() === "v5" && flavorIdentity.status === "ok" && flavorIdentity.flavor === "selfhost",
       process.env),
     containerLinkEnabled: containerLinkOn,
-    resolveContainerLinkEndpoint: (uid, cid) => resolveContainerLinkEndpoint(getPool(), runtimeChannel, uid, cid),
+    resolveContainerLinkEndpoint: async (uid, cid) => {
+      const ep = await resolveContainerLinkEndpoint(getPool(), runtimeChannel, uid, cid);
+      if (!ep || ep === "pending" || ep.desktop || ep.bundleRev || !v3Deps) return ep;
+      const status = await getV3ContainerStatus(v3Deps, Number(uid)).catch(() => null);
+      const rev = status?.containerId === cid ? status.labels?.[RUNTIME_BUNDLE_REV_LABEL_KEY] : undefined;
+      return typeof rev === "string" && rev !== "" ? { ...ep, bundleRev: rev } : ep;
+    },
     containerLinkRecovery: { channel: runtimeChannel },
     modelSwitchCost,
     jwtSecret,
