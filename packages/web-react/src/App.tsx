@@ -528,6 +528,7 @@ export function App() {
       setQuickAsk({ open: false, mounted: false, sending: false, seed: null });
       setContainerPreviewUrl(null);
       setSettingsOpen(false);
+      setSubscribeOpenSignal(0);
       setMediaTasksOpen(false);
       clearLiveMediaJobs();
       setManageAutoAuthorizePluginSlug(null);
@@ -555,6 +556,7 @@ export function App() {
       clearModelCatalog();
       setContainerPreviewUrl(null);
       setSettingsOpen(false);
+      setSubscribeOpenSignal(0);
       setMediaTasksOpen(false);
       clearLiveMediaJobs();
       setManageAutoAuthorizePluginSlug(null);
@@ -1716,6 +1718,7 @@ export function App() {
     activeTutorialWork: tutorialOpen ? tutorialWork : null,
     activeTutorialStep: tutorialOpen ? tutorialStep : null,
     onPopPanel: (panel, topic, caseId, communityId, extras) => {
+      setSubscribeOpenSignal(0);
       setSettingsOpen(panel === "settings");
       setMarketplaceOpen(panel === "market");
       setManageOpen(panel === "manage");
@@ -2864,6 +2867,7 @@ export function App() {
         setSaveToProject={setSaveToProject}
         setSettingsOpen={setSettingsOpen}
         setShareOpen={setShareOpen}
+        setSubscribeOpenSignal={setSubscribeOpenSignal}
         setTeamMode={setTeamMode}
         setTheme={setTheme}
         setUngroupedAssetsOpen={setUngroupedAssetsOpen}

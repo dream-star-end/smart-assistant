@@ -211,9 +211,12 @@ export function useAppNavigationActions({
   }, [demo, messages, activeId, send, loadExactUserMessage, toast]);
 
   // 打开设置中心并顺带刷新余额（顶栏 pill / 侧栏 / AgentGate 充值入口统一走此）。
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); setSettingsOpen, setSettingsSection are App useState setter/useRef passed in, stable
+  // 先清零旧的 subscribeOpenSignal，确保普通点「设置」不会误弹订阅弹窗；紧随其后的
+  // setSubscribeOpenSignal((n) => n + 1) 在同一批里会将其置为 1（OCV5-845）。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); setSettingsOpen, setSettingsSection, setSubscribeOpenSignal are App useState setter/useRef passed in, stable
   const openSettings = useCallback((section: SettingsSection = "account") => {
     void refreshMe();
+    setSubscribeOpenSignal(0);
     setSettingsSection(section);
     setSettingsOpen(true);
   }, [refreshMe]);

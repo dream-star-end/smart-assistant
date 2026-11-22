@@ -19,7 +19,13 @@ vi.mock('./settings/PreferencesTab', () => ({
   },
   BuiltinHotkeysTable: () => <div>快捷键页</div>,
 }))
-vi.mock('./settings/SubscriptionDialog', () => ({ SubscriptionDialog: () => null }))
+const subscriptionDialogProps = vi.hoisted(() => vi.fn())
+vi.mock('./settings/SubscriptionDialog', () => ({
+  SubscriptionDialog: (props: { open: boolean; onClose: () => void }) => {
+    subscriptionDialogProps(props)
+    return props.open ? <div data-testid="mock-sub-dialog">模拟订阅弹窗</div> : null
+  },
+}))
 vi.mock('./settings/ApiAccessTab', () => ({ ApiAccessTab: () => <div>API 接入页</div> }))
 
 const auth: AuthSession = createMemoryAuthSession(() => {}, 'token')
@@ -341,4 +347,45 @@ test('偏好首次加载失败可原地重试，成功后恢复完整偏好页',
   fireEvent.click(screen.getByRole('button', { name: '重试' }))
   expect(await screen.findByText('偏好页')).toBeInTheDocument()
   expect(api.getPreferences).toHaveBeenCalledTimes(2)
+})
+
+test('subscribeOpenSignal 是一次性信号：消费后回调归零，不重置用户所选分区且重挂不再误弹（OCV5-845）', () => {
+  const onConsumed = vi.fn()
+  const { rerender, unmount } = render(
+    <SettingsCenter
+      {...base}
+      initialSection="account"
+      subscribeOpenSignal={1}
+      onSubscribeSignalConsumed={onConsumed}
+    />,
+  )
+  expect(screen.getByTestId('mock-sub-dialog')).toBeInTheDocument()
+  expect(onConsumed).toHaveBeenCalledTimes(1)
+
+  // 切到快捷键分区后，父级把 subscribeOpenSignal 归零：不得把分区拉回 account，且订阅弹层保持打开。
+  fireEvent.click(screen.getByRole('tab', { name: '快捷键' }))
+  expect(screen.getByRole('tab', { name: '快捷键' })).toHaveAttribute('aria-selected', 'true')
+  rerender(
+    <SettingsCenter
+      {...base}
+      initialSection="account"
+      subscribeOpenSignal={0}
+      onSubscribeSignalConsumed={onConsumed}
+    />,
+  )
+  expect(screen.getByRole('tab', { name: '快捷键' })).toHaveAttribute('aria-selected', 'true')
+  expect(screen.getByTestId('mock-sub-dialog')).toBeInTheDocument()
+
+  // 卸载重挂（模拟 AppDialogs 关闭再打开设置）传入归零后的 0：不再弹出订阅弹层。
+  unmount()
+  render(
+    <SettingsCenter
+      {...base}
+      initialSection="hotkeys"
+      subscribeOpenSignal={0}
+      onSubscribeSignalConsumed={onConsumed}
+    />,
+  )
+  expect(screen.queryByTestId('mock-sub-dialog')).toBeNull()
+  expect(screen.getByRole('tab', { name: '快捷键' })).toHaveAttribute('aria-selected', 'true')
 })

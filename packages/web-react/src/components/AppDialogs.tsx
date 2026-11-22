@@ -216,6 +216,7 @@ export type AppDialogsProps = {
   setSaveToProject: React.Dispatch<React.SetStateAction<SaveToProjectRequest | null>>;
   setSettingsOpen: React.Dispatch<React.SetStateAction<boolean>>;
   setShareOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  setSubscribeOpenSignal?: React.Dispatch<React.SetStateAction<number>>;
   setTeamMode: (enabled: boolean) => void;
   setTheme: React.Dispatch<React.SetStateAction<Theme>>;
   setUngroupedAssetsOpen: React.Dispatch<React.SetStateAction<boolean>>;
@@ -354,6 +355,7 @@ export function AppDialogs({
   setSaveToProject,
   setSettingsOpen,
   setShareOpen,
+  setSubscribeOpenSignal,
   setTeamMode,
   setTheme,
   setUngroupedAssetsOpen,
@@ -465,7 +467,10 @@ export function AppDialogs({
             user={user}
             theme={theme}
             demo={demo}
-            onClose={() => setSettingsOpen(false)}
+            onClose={() => {
+              setSubscribeOpenSignal?.(0);
+              setSettingsOpen(false);
+            }}
             onSetTheme={setTheme}
             onRefreshMe={refreshMe}
             onPreferencesChange={applyConversationPreferences}
@@ -480,6 +485,7 @@ export function AppDialogs({
               setProjectSettings(p);
             }}
             subscribeOpenSignal={subscribeOpenSignal}
+            onSubscribeSignalConsumed={() => setSubscribeOpenSignal?.(0)}
           />
         </LazyBoundary>
       )}

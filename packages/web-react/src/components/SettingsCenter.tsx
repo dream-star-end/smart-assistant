@@ -94,6 +94,7 @@ export function SettingsCenter({
   feedbackContext,
   initialSection = "account",
   subscribeOpenSignal = 0,
+  onSubscribeSignalConsumed,
   preferencesRevision = 0,
 }: {
   activeSessionId?: string;
@@ -116,6 +117,8 @@ export function SettingsCenter({
   initialSection?: SettingsSection;
   /** Increment to programmatically open SubscriptionDialog on the account tab. */
   subscribeOpenSignal?: number;
+  /** 消费完一次性 subscribeOpenSignal 后通知父级归零，避免组件卸载重挂时重复弹出订阅弹窗。 */
+  onSubscribeSignalConsumed?: () => void;
 }) {
   const desktop = useMdViewport();
   const { sections, groups } = useVisibleSections(user);
@@ -135,20 +138,32 @@ export function SettingsCenter({
   // 只有偏好页真的读 prefs;快捷键是静态表,不该被偏好接口的加载 / 失败挡住(审计 SET-02)。
   const needsPreferences = section === "preferences";
 
+  const onSubscribeSignalConsumedRef = useRef(onSubscribeSignalConsumed);
+  onSubscribeSignalConsumedRef.current = onSubscribeSignalConsumed;
+
   useEffect(() => {
     if (open) {
       // 深链到本角色不可见的分区(如普通用户 → api-access)→ 回落账户页。
       setSection(sections.some((s) => s.id === initialSection) ? initialSection : "account");
-      if (subscribeOpenSignal > 0 && subscribeOpenSignal !== lastSubscribeSignal.current) {
-        lastSubscribeSignal.current = subscribeOpenSignal;
-        setSubOpen(true);
-      }
     } else {
       setSection("account");
       setSubOpen(false);
       setPrivacySupport({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT });
     }
-  }, [open, initialSection, subscribeOpenSignal, sections]);
+  }, [open, initialSection, sections]);
+
+  // 独立消费一次性订阅直达信号：归零时不重置当前分区，且避免卸载重挂后重放历史信号（OCV5-845）。
+  useEffect(() => {
+    if (!open || subscribeOpenSignal <= 0) {
+      lastSubscribeSignal.current = 0;
+      return;
+    }
+    if (subscribeOpenSignal !== lastSubscribeSignal.current) {
+      lastSubscribeSignal.current = subscribeOpenSignal;
+      setSubOpen(true);
+      onSubscribeSignalConsumedRef.current?.();
+    }
+  }, [open, subscribeOpenSignal]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: prefsReloadTick 是显式重试触发器。
   useEffect(() => {

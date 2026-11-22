@@ -1,7 +1,7 @@
 import * as RD from "@radix-ui/react-dialog";
 import { cva, type VariantProps } from "class-variance-authority";
 import { X } from "lucide-react";
-import { type ReactNode, useRef } from "react";
+import { type ReactNode, useLayoutEffect, useRef } from "react";
 import { cn } from "../../lib/utils";
 import { revealFocusedElement, useScrollBodyTabbable } from "./a11y";
 import { IconButton } from "./IconButton";
@@ -111,6 +111,8 @@ export interface ModalProps extends VariantProps<typeof modalContentVariants> {
   headerActions?: ReactNode;
   /** Optional layered-Escape handler. Omit to keep Radix's default close behavior. */
   onEscapeKeyDown?: RD.DialogContentProps["onEscapeKeyDown"];
+  /** Optional outside-pointerdown handler; only invoked when this Modal is topmost. */
+  onPointerDownOutside?: RD.DialogContentProps["onPointerDownOutside"];
   /** Let immersive dialogs place initial focus on their primary interaction surface. */
   onOpenAutoFocus?: RD.DialogContentProps["onOpenAutoFocus"];
   /** Controlled dialogs opened by an external action can explicitly restore that action's focus. */
@@ -118,6 +120,15 @@ export interface ModalProps extends VariantProps<typeof modalContentVariants> {
   /** 教程/产品能力锚点，透传到 role=dialog 节点。 */
   "data-product-feature"?: string;
 }
+
+// 活跃 Modal 栈（按打开顺序，栈顶在末尾）。
+// Radix Dialog 1.1.18 启用了 deferPointerDownOutside: true：当两层 Modal 叠开时，
+// 点顶层关闭按钮会在 pointerdown 阶段为底层注册延后到 click 的 outside 监听；
+// click 阶段顶层先同步卸载并退出 Radix 层栈，紧接着延后的 outside 监听触发底层 onDismiss，
+// 导致关闭顶层 Modal 时把底层 Modal 一并关闭（OCV5-845）。
+// 在 document 捕获阶段快照每次 pointerdown 时本 Modal 是否位于栈顶，按下时非栈顶（或当前非栈顶）
+// 一律拦截该次 outside dismiss。
+const openModalStack: symbol[] = [];
 
 /**
  * 居中模态。基于 Radix Dialog,免费获得焦点陷阱 / Escape / aria-modal。
@@ -141,6 +152,7 @@ export function Modal({
   hideClose,
   headerActions,
   onEscapeKeyDown,
+  onPointerDownOutside,
   onOpenAutoFocus,
   onCloseAutoFocus,
   "data-product-feature": dataProductFeature,
@@ -150,6 +162,32 @@ export function Modal({
   // 正文滚动区:只在「溢出且没有可聚焦子孙」时进入 Tab 序(a11y shell#7),让纯文本长内容也能键盘滚动。
   const bodyRef = useRef<HTMLDivElement>(null);
   const bodyTabbable = useScrollBodyTabbable(bodyRef, open);
+  const modalIdRef = useRef<symbol | null>(null);
+  if (modalIdRef.current === null) {
+    modalIdRef.current = Symbol("modal");
+  }
+  const modalId = modalIdRef.current;
+  const wasTopAtPointerDownRef = useRef(true);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    wasTopAtPointerDownRef.current = true;
+    const prevIdx = openModalStack.indexOf(modalId);
+    if (prevIdx !== -1) openModalStack.splice(prevIdx, 1);
+    openModalStack.push(modalId);
+
+    const onDocPointerDown = () => {
+      wasTopAtPointerDownRef.current = openModalStack[openModalStack.length - 1] === modalId;
+    };
+    document.addEventListener("pointerdown", onDocPointerDown, true);
+
+    return () => {
+      document.removeEventListener("pointerdown", onDocPointerDown, true);
+      const idx = openModalStack.indexOf(modalId);
+      if (idx !== -1) openModalStack.splice(idx, 1);
+    };
+  }, [open, modalId]);
+
   return (
     <RD.Root open={open} onOpenChange={onOpenChange}>
       <RD.Portal>
@@ -160,6 +198,16 @@ export function Modal({
             ? { "data-product-feature": dataProductFeature }
             : {})}
           onEscapeKeyDown={onEscapeKeyDown}
+          onPointerDownOutside={(event) => {
+            if (
+              !wasTopAtPointerDownRef.current ||
+              openModalStack[openModalStack.length - 1] !== modalId
+            ) {
+              event.preventDefault();
+              return;
+            }
+            onPointerDownOutside?.(event);
+          }}
           onOpenAutoFocus={onOpenAutoFocus}
           onCloseAutoFocus={onCloseAutoFocus}
           // Tab 回绕时 Radix 用 preventScroll 聚焦,目标若滚出了弹层可视区要自己滚回来(a11y shell#8)。
