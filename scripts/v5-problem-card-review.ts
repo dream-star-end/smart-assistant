@@ -33,6 +33,13 @@ const PATH_RE = /^[a-z0-9_]{1,32}$/;
 const REASON_RE = /^[a-z0-9_]{1,48}$/;
 const STAGES = ["problem_card", "recovery_decision", "recovery_job", "visible_fallback"] as const;
 const CLOSED_STATUSES = new Set(["done", "cancelled", "canceled"]);
+const NON_ACTIONABLE_TICKET_FINGERPRINTS = new Set([
+  "recovery_decision:user_cancelled:decision:not_recoverable",
+]);
+
+export function isNonActionableTicketFingerprint(fp: string): boolean {
+  return NON_ACTIONABLE_TICKET_FINGERPRINTS.has(fp);
+}
 const OC_TASK_BIN = "/home/agent/.local/bin/oc-task";
 const DEFAULT_ENV_FILE = "/etc/openclaude/commercial-v5-selfhost.env";
 const DEFAULT_STATE_DIR = "/opt/openclaude/var/problem-card-review";
@@ -374,6 +381,8 @@ export function nextActions(
 
     const open = findOpenTicket(fp, todayTickets);
     if (open) entry.identifier = open.identifier;
+
+    if (isNonActionableTicketFingerprint(fp)) continue;
 
     if (row && shouldOpenTicket(row.h24)) {
       if (!open) {
