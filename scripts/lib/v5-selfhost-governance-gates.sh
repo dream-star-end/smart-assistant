@@ -3,15 +3,27 @@
 # 由 v5-selfhost-master-release-lib.sh source；在无 .git 的 pinned staging archive 中运行，
 # 严格只读且强制封堵外部逃生环境变量(docs/V5_SELFHOST_PLAYBOOK.md §6.2 防线 3)。
 
-# 解析本次候选 commit 的只读非自身对比基线：
-#   1. 显式 OC_V5_GOVERNANCE_BASE_REF（无效或与目标 commit 相同均 fail-closed）
-#   2. 当前 live release 的 .complete sourceCommit（有效、非自身且存在共同祖先）
-#   3. origin/feat/v5-selfhost（有效、非自身且存在共同祖先）
+# 校验候选基线与目标 commit 的 merge-base：
+# 必须存在共同祖先且 merge-base != full_sha（排除自身以及领先于 full_sha 的未来提交，
+# 避免 `git diff base...full_sha` 退化为 `full_sha..full_sha` 空集）。
+_master_governance_valid_merge_base() { # <cand-sha> <full-sha> → stdout 40-hex merge-base sha
+  local cand_sha="$1" full_sha="$2" mb=""
+  local -a g=(env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory 'GIT_CONFIG_VALUE_0=*' git -C "$REPO_ROOT")
+  [[ -n "$cand_sha" && "$cand_sha" != "$full_sha" ]] || return 1
+  mb="$("${g[@]}" merge-base "$cand_sha" "$full_sha" 2>/dev/null || true)"
+  [[ "$mb" =~ ^[0-9a-f]{40}$ && "$mb" != "$full_sha" ]] || return 1
+  printf '%s\n' "$mb"
+}
+
+# 解析本次候选 commit 的只读非自身对比基线（输出核验后的真实 merge-base 40-hex SHA）：
+#   1. 显式 OC_V5_GOVERNANCE_BASE_REF（无效、等于自身或超前于 full_sha 均 fail-closed）
+#   2. 当前 live release 的 .complete sourceCommit（有效且 merge-base != full_sha）
+#   3. origin/feat/v5-selfhost（有效且 merge-base != full_sha）
 #   4. 目标 commit 的父提交 ${full_sha}^
-#   5. 孤立根提交无父提交时 fail-closed，拒绝自比较静默放行
+#   5. 孤立根提交无父提交时 fail-closed，拒绝空比较静默放行
 master_resolve_governance_base_ref() { # <full-sha>
   local full_sha="$1" explicit="${OC_V5_GOVERNANCE_BASE_REF:-}"
-  local explicit_sha="" live_root="" live_sha="" origin_sha="" parent_sha=""
+  local explicit_sha="" live_root="" live_sha="" origin_sha="" parent_sha="" mb=""
   local -a g=(env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory 'GIT_CONFIG_VALUE_0=*' git -C "$REPO_ROOT")
 
   if [[ -n "$explicit" ]]; then
@@ -20,11 +32,12 @@ master_resolve_governance_base_ref() { # <full-sha>
       mlog "✗ governance fast gate: OC_V5_GOVERNANCE_BASE_REF=$explicit 不是有效 commit"
       return 1
     fi
-    if [[ "$explicit_sha" == "$full_sha" ]]; then
-      mlog "✗ governance fast gate: OC_V5_GOVERNANCE_BASE_REF=$explicit 与目标 commit ${full_sha:0:12} 相同，禁止自比较"
+    mb="$(_master_governance_valid_merge_base "$explicit_sha" "$full_sha" || true)"
+    if [[ -z "$mb" ]]; then
+      mlog "✗ governance fast gate: OC_V5_GOVERNANCE_BASE_REF=$explicit 与目标 commit ${full_sha:0:12} 相同、无共同祖先或超前（merge-base 退化为空集），禁止空比较"
       return 1
     fi
-    printf '%s\n' "$explicit"
+    printf '%s\n' "$mb"
     return 0
   fi
 
@@ -33,26 +46,32 @@ master_resolve_governance_base_ref() { # <full-sha>
     if [[ -n "$live_root" && -f "$live_root/.complete" ]]; then
       live_sha="$(jq -er '.sourceCommit // empty' "$live_root/.complete" 2>/dev/null || true)"
       if [[ "$live_sha" =~ ^[0-9a-f]{40}$ ]] \
-        && [[ "$live_sha" != "$full_sha" ]] \
-        && "${g[@]}" cat-file -e "${live_sha}^{commit}" 2>/dev/null \
-        && "${g[@]}" merge-base "$live_sha" "$full_sha" >/dev/null 2>&1; then
-        printf '%s\n' "$live_sha"
-        return 0
+        && "${g[@]}" cat-file -e "${live_sha}^{commit}" 2>/dev/null; then
+        mb="$(_master_governance_valid_merge_base "$live_sha" "$full_sha" || true)"
+        if [[ -n "$mb" ]]; then
+          printf '%s\n' "$mb"
+          return 0
+        fi
       fi
     fi
   fi
 
   origin_sha="$("${g[@]}" rev-parse --verify --quiet 'origin/feat/v5-selfhost^{commit}' 2>/dev/null || true)"
-  if [[ -n "$origin_sha" && "$origin_sha" != "$full_sha" ]] \
-    && "${g[@]}" merge-base "$origin_sha" "$full_sha" >/dev/null 2>&1; then
-    printf '%s\n' 'origin/feat/v5-selfhost'
-    return 0
+  if [[ -n "$origin_sha" ]]; then
+    mb="$(_master_governance_valid_merge_base "$origin_sha" "$full_sha" || true)"
+    if [[ -n "$mb" ]]; then
+      printf '%s\n' "$mb"
+      return 0
+    fi
   fi
 
   parent_sha="$("${g[@]}" rev-parse --verify --quiet "${full_sha}^^{commit}" 2>/dev/null || true)"
-  if [[ -n "$parent_sha" && "$parent_sha" != "$full_sha" ]]; then
-    printf '%s\n' "$parent_sha"
-    return 0
+  if [[ -n "$parent_sha" ]]; then
+    mb="$(_master_governance_valid_merge_base "$parent_sha" "$full_sha" || true)"
+    if [[ -n "$mb" ]]; then
+      printf '%s\n' "$mb"
+      return 0
+    fi
   fi
 
   mlog "✗ governance fast gate: 无法为目标 commit ${full_sha:0:12} 解析非自身基线（无可用 live/origin 基线且无父提交），请显式传非自身 OC_V5_GOVERNANCE_BASE_REF"
@@ -102,10 +121,12 @@ master_run_governance_fast_gates() { # <pinned-staging> <full-sha>
 
   base_ref="$(master_resolve_governance_base_ref "$full_sha")" || return 1
   base_sha="$("${g[@]}" rev-parse --verify --quiet "${base_ref}^{commit}" 2>/dev/null || true)"
-  if [[ -z "$base_sha" || "$base_sha" == "$full_sha" ]]; then
-    mlog "✗ governance fast gate: 解析出的基线无效或等于目标 commit (base=$base_ref full=${full_sha:0:12})"
+  base_sha="$(_master_governance_valid_merge_base "$base_sha" "$full_sha" || true)"
+  if [[ -z "$base_sha" ]]; then
+    mlog "✗ governance fast gate: 解析出的基线无效、等于目标 commit 或超前导致 merge-base 退化 (base=$base_ref full=${full_sha:0:12})"
     return 1
   fi
+  base_ref="$base_sha"
   git_dir="$("${g[@]}" rev-parse --absolute-git-dir 2>/dev/null || true)"
   if [[ -z "$git_dir" || ! -d "$git_dir" ]]; then
     mlog "✗ governance fast gate: 无法解析 REPO_ROOT=$REPO_ROOT 的 git-dir"

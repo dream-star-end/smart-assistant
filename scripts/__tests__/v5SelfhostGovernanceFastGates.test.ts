@@ -152,9 +152,28 @@ describe('master_resolve_governance_base_ref (OCV5-859)', () => {
     assert.equal(r.status, 0, r.stderr)
     assert.equal(
       r.stdout.trim(),
-      'origin/feat/v5-selfhost',
-      'must skip self-matching live sourceCommit and fall back to non-self origin/feat/v5-selfhost',
+      c2,
+      'must skip self-matching live sourceCommit and fall back to verified merge-base of origin/feat/v5-selfhost (c2)',
     )
+
+    // 3b) When origin/feat/v5-selfhost is AHEAD of pinned candidate c2 (c2 is ancestor of c3),
+    // merge-base(c3, c2) == c2 would make `c3...c2` an empty 0-file diff! Must skip origin and fall back to c2^ (c1).
+    f.git('update-ref', 'refs/remotes/origin/feat/v5-selfhost', c3)
+    r = runBash(
+      `REPO_ROOT=${q(f.repo)}; MASTER_LIVE_LINK=${q(join(f.dir, 'missing-live'))}; master_resolve_governance_base_ref ${q(c2)}`,
+      f.env,
+    )
+    assert.equal(r.status, 0, r.stderr)
+    assert.equal(r.stdout.trim(), c1, 'must skip origin/feat/v5-selfhost when it is ahead of pinned candidate')
+
+    // Explicit override pointing ahead of pinned candidate (c3 > c2) must fail closed
+    r = runBash(
+      `REPO_ROOT=${q(f.repo)}; OC_V5_GOVERNANCE_BASE_REF=${q(c3)}; master_resolve_governance_base_ref ${q(c2)}`,
+      f.env,
+    )
+    assert.notEqual(r.status, 0, 'explicit ahead-of-candidate base must fail closed')
+    assert.match(r.stderr, /禁止空比较/)
+    f.git('update-ref', 'refs/remotes/origin/feat/v5-selfhost', c2)
 
     // 4) Non-self live .complete sourceCommit (c1) takes priority over origin/feat/v5-selfhost (c2)
     writeFileSync(join(liveRel, '.complete'), JSON.stringify({ sourceCommit: c1 }))
@@ -178,7 +197,7 @@ describe('master_resolve_governance_base_ref (OCV5-859)', () => {
       f.env,
     )
     assert.notEqual(r.status, 0, 'explicit self-comparison override must fail closed')
-    assert.match(r.stderr, /禁止自比较/)
+    assert.match(r.stderr, /禁止空比较/)
 
     r = runBash(
       `REPO_ROOT=${q(f.repo)}; OC_V5_GOVERNANCE_BASE_REF=nonexistent-ref-xyz; master_resolve_governance_base_ref ${q(c3)}`,
@@ -291,6 +310,24 @@ describe('build_master_release wiring & zero-side-effect execution (OCV5-859)', 
     res = invoke(unsafeMigSha, { OC_PG_MIGRATION_BOSS_APPROVED: '1' })
     assert.notEqual(res.status, 0, 'DROP COLUMN migration must fail closed even when parent env sets OC_PG_MIGRATION_BOSS_APPROVED=1')
     assert.match(res.stderr + res.stdout, /PG-BAN-DROP-COLUMN/)
+
+    // Case 2b (RED): without live .complete and with origin/feat/v5-selfhost AHEAD of pinned candidate by 1 commit,
+    // resolver skips ahead origin, falls back to unsafeMigSha^ (safeSha), and still catches PG-BAN-DROP-COLUMN!
+    writeFileSync(join(f.repo, 'ahead-note.txt'), 'later commit on origin\n')
+    f.git('add', 'ahead-note.txt')
+    f.git('commit', '-qm', 'origin-ahead')
+    const aheadSha = f.git('rev-parse', 'HEAD')
+    f.git('update-ref', 'refs/remotes/origin/feat/v5-selfhost', aheadSha)
+    const resAhead = runBash(
+      `REPO_ROOT=${q(f.repo)}; MASTER_LIVE_LINK=${q(join(f.dir, 'no-live'))}; MASTER_GATE_TMPDIR=${q(gateTmp)}; master_run_governance_fast_gates ${q(staging)} ${q(unsafeMigSha)}`,
+      f.env,
+    )
+    assert.notEqual(
+      resAhead.status,
+      0,
+      'must catch DROP COLUMN even when origin/feat/v5-selfhost is 1 commit ahead of pinned candidate',
+    )
+    assert.match(resAhead.stderr + resAhead.stdout, /PG-BAN-DROP-COLUMN/)
 
     // Case 3 (RED): raised monotonic budget blocks
     f.git('reset', '--hard', safeSha)
