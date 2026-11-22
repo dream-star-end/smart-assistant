@@ -2,29 +2,22 @@
  * Swarm 交互式指挥台操控栏（OCV5-833 · Clarvy Atelier）。
  *
  * 位于 SwarmBoardDrawer 底部：
- *   - 支持选择目标 `@coordinator` / `@<member>` / `@all` 发送人工纠偏指令；
- *   - 支持对非 coordinator 存活成员发起二次确认的「请求终止」；
- *   - 对接 `POST /api/sessions/:id/swarm/command`，诚实清晰区分 `requested`、`confirmed` 与 `already_killed`。
+ *   - 支持选择目标 `@coordinator` / `@<member>` / `@all` 发送协作消息或指令；
+ *   - 支持对非 coordinator 存活成员发起二次确认的「停止该成员」；
+ *   - 操作结果统一由 Toast 轻反馈，不重复占位内联反馈条。
  */
 import type { SwarmMemberSnapshot } from "@openclaude/protocol/browser";
-import { AlertTriangle, Check, CheckCircle2, ChevronDown, OctagonX, Send, ShieldAlert, X } from "lucide-react";
+import { AlertTriangle, Check, ChevronDown, OctagonX, Send, ShieldAlert } from "lucide-react";
 import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useMemo, useState } from "react";
-import {
-  type SwarmTerminateStatus,
-  requestSwarmTerminate,
-  sendSwarmSteer,
-} from "../../lib/api/wave4Api";
+import { requestSwarmTerminate, sendSwarmSteer } from "../../lib/api/wave4Api";
 import type { AuthSession } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import {
-  Alert,
-  Badge,
   Button,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
-  IconButton,
   Spinner,
   useToast,
 } from "../ui";
@@ -37,11 +30,6 @@ export type SwarmCommandBarProps = {
   selectedChannel?: string | null;
   active: boolean;
 };
-
-type CommandFeedback =
-  | { kind: "steer"; seq: number; target: string }
-  | { kind: "terminate"; status: SwarmTerminateStatus; memberName: string; noticeSeq?: number }
-  | { kind: "error"; message: string };
 
 export function SwarmCommandBar({
   sessionId,
@@ -79,7 +67,6 @@ export function SwarmCommandBar({
   const [confirmKill, setConfirmKill] = useState(false);
   const [killReason, setKillReason] = useState("");
   const [killing, setKilling] = useState(false);
-  const [feedback, setFeedback] = useState<CommandFeedback | null>(null);
 
   // 点击左侧花名册成员时自动联动操控栏目标
   useEffect(() => {
@@ -101,7 +88,6 @@ export function SwarmCommandBar({
     const trimmed = message.trim();
     if (!trimmed || sending || !canDispatch || !auth || !sessionId) return;
     setSending(true);
-    setFeedback(null);
     try {
       const res = await sendSwarmSteer(auth, sessionId, {
         target,
@@ -109,11 +95,9 @@ export function SwarmCommandBar({
         channel: selectedChannel || "main",
       });
       setMessage("");
-      setFeedback({ kind: "steer", seq: res.seq, target: res.target });
-      toast(`已向 @${res.target} 注入人工纠偏指令（#${res.seq}）`, "success");
+      toast(`已向 @${res.target} 发送指令（#${res.seq}）`, "success");
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "发送纠偏指令失败，请稍后重试";
-      setFeedback({ kind: "error", message: msg });
+      const msg = err instanceof Error ? err.message : "发送指令失败，请稍后重试";
       toast(msg, "error");
     } finally {
       setSending(false);
@@ -123,7 +107,6 @@ export function SwarmCommandBar({
   const handleConfirmTerminate = async () => {
     if (!canTerminateTarget || killing || !canDispatch || !auth || !sessionId) return;
     setKilling(true);
-    setFeedback(null);
     try {
       const res = await requestSwarmTerminate(auth, sessionId, {
         memberName: target,
@@ -131,22 +114,15 @@ export function SwarmCommandBar({
       });
       setConfirmKill(false);
       setKillReason("");
-      setFeedback({
-        kind: "terminate",
-        status: res.status,
-        memberName: res.memberName,
-        noticeSeq: res.noticeSeq,
-      });
       if (res.status === "confirmed") {
-        toast(`执行器已确认终止 @${res.memberName}`, "success");
+        toast(`已停止 @${res.memberName}`, "success");
       } else if (res.status === "already_killed") {
-        toast(`@${res.memberName} 已处于终止状态`, "info");
+        toast(`@${res.memberName} 已停止`, "info");
       } else {
-        toast(`已向 @coordinator 提交终止 @${res.memberName} 的控制请求（待确认）`, "info");
+        toast(`已请求停止 @${res.memberName}`, "info");
       }
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "提交终止请求失败";
-      setFeedback({ kind: "error", message: msg });
+      const msg = err instanceof Error ? err.message : "停止成员失败，请稍后重试";
       toast(msg, "error");
     } finally {
       setKilling(false);
@@ -165,70 +141,7 @@ export function SwarmCommandBar({
       className="border-t border-border bg-surface px-3.5 py-2.5"
       data-testid="swarm-command-bar"
     >
-      {/* 状态反馈条（清晰区分 steer / requested / confirmed / already_killed / error） */}
-      {feedback && (
-        <div className="mb-2" data-testid="swarm-command-feedback">
-          {feedback.kind === "error" ? (
-            <Alert tone="danger">{feedback.message}</Alert>
-          ) : feedback.kind === "steer" ? (
-            <div className="flex items-center justify-between gap-2 rounded-lg border border-border bg-bg px-2.5 py-1.5 text-caption text-fg">
-              <span className="inline-flex min-w-0 items-center gap-1.5">
-                <CheckCircle2 size={13} className="shrink-0 text-success" aria-hidden />
-                <span className="truncate">
-                  已向 <strong className="font-mono">@{feedback.target}</strong> 注入纠偏指令（#{feedback.seq}）
-                </span>
-              </span>
-              <IconButton
-                size="sm"
-                shape="square"
-                aria-label="关闭提示"
-                onClick={() => setFeedback(null)}
-                className="oc-spring-press size-6 shrink-0"
-              >
-                <X size={12} />
-              </IconButton>
-            </div>
-          ) : (
-            <div
-              data-terminate-status={feedback.status}
-              className="flex items-center justify-between gap-2 rounded-lg border border-border bg-bg px-2.5 py-1.5 text-caption text-fg"
-            >
-              <span className="inline-flex min-w-0 flex-wrap items-center gap-1.5">
-                {feedback.status === "confirmed" ? (
-                  <>
-                    <Badge tone="success" size="sm">已确认终止</Badge>
-                    <span>权威执行器已确认停止 @{feedback.memberName}</span>
-                  </>
-                ) : feedback.status === "already_killed" ? (
-                  <>
-                    <Badge tone="neutral" size="sm">已终止</Badge>
-                    <span>@{feedback.memberName} 此前已完成回收</span>
-                  </>
-                ) : (
-                  <>
-                    <Badge tone="warning" size="sm">已提交请求</Badge>
-                    <span>
-                      已向 @coordinator 发送终止 @{feedback.memberName} 请求
-                      {feedback.noticeSeq ? `（#${feedback.noticeSeq}）` : ""}，等待执行器确认回收
-                    </span>
-                  </>
-                )}
-              </span>
-              <IconButton
-                size="sm"
-                shape="square"
-                aria-label="关闭状态反馈"
-                onClick={() => setFeedback(null)}
-                className="oc-spring-press size-6 shrink-0"
-              >
-                <X size={12} />
-              </IconButton>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* 二次确认单点终止条 */}
+      {/* 二次确认停止成员 */}
       {confirmKill && canTerminateTarget && (
         <div
           data-testid="swarm-terminate-confirm"
@@ -236,14 +149,14 @@ export function SwarmCommandBar({
         >
           <span className="inline-flex items-center gap-1.5 text-caption font-semibold text-warning">
             <ShieldAlert size={13} aria-hidden />
-            确认请求终止 @{target}？
+            确认停止 @{target}？
           </span>
           <input
             type="text"
             value={killReason}
             onChange={(e) => setKillReason(e.target.value)}
-            placeholder="可选：填写终止原因（将发送给 @coordinator）"
-            aria-label="终止原因"
+            placeholder="可选：填写停止原因"
+            aria-label="停止原因"
             data-testid="swarm-terminate-reason"
             className="oc-field-control h-8 min-w-0 flex-1 rounded-lg border border-border-control bg-surface px-2.5 text-base text-fg outline-none placeholder:text-faint focus:border-accent md:text-sm"
           />
@@ -269,7 +182,7 @@ export function SwarmCommandBar({
               onClick={() => void handleConfirmTerminate()}
             >
               {killing ? <Spinner size={11} /> : <OctagonX size={12} aria-hidden />}
-              确认请求终止
+              确认停止
             </Button>
           </div>
         </div>
@@ -281,7 +194,7 @@ export function SwarmCommandBar({
           <DropdownMenuTrigger asChild>
             <button
               type="button"
-              aria-label="选择纠偏目标成员"
+              aria-label="选择发送目标"
               data-testid="swarm-command-target"
               data-target-value={currentOpt?.value ?? target}
               className="oc-btn-tactile oc-btn-secondary-craft oc-spring-press inline-flex h-9 max-w-[11rem] shrink-0 items-center gap-1 rounded-full px-2.5 text-caption font-medium text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-10 md:h-8"
@@ -316,14 +229,14 @@ export function SwarmCommandBar({
           onChange={(e) => setMessage(e.target.value)}
           onKeyDown={onInputKeyDown}
           disabled={!canDispatch || sending}
-          aria-label="人工纠偏指令内容"
+          aria-label="指令内容"
           data-testid="swarm-command-input"
           placeholder={
             canDispatch
               ? active
-                ? `向 @${target} 发送人工纠偏指令…`
-                : `向 @${target} 补充指令（当前蜂群未运行）`
-              : "仅在在线登录会话中支持实时下发蜂群控制指令"
+                ? `向 @${target} 发送消息或指令…`
+                : `向 @${target} 补充说明（当前协作已结束）`
+              : "仅在在线会话中支持发送指令"
           }
           className="oc-field-control h-9 min-w-[9rem] flex-1 rounded-lg border border-border-control bg-surface px-3 text-base text-fg outline-none placeholder:text-faint focus:border-accent focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 md:h-8 md:text-sm"
         />
@@ -350,11 +263,11 @@ export function SwarmCommandBar({
               disabled={!canDispatch || killing}
               data-testid="swarm-terminate-trigger"
               onClick={() => setConfirmKill((v) => !v)}
-              title={`向 @coordinator 请求单点终止 @${target}`}
+              title={`停止 @${target}`}
               className={cn("oc-spring-press h-9 text-danger md:h-8", confirmKill && "ring-2 ring-ring")}
             >
               <AlertTriangle size={12} aria-hidden />
-              请求终止
+              停止该成员
             </Button>
           )}
         </div>

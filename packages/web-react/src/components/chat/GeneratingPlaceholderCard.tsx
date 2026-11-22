@@ -220,7 +220,7 @@ export function GeneratingPlaceholderCard({
                   onClick={onRetry}
                   className="oc-btn-tactile oc-btn-secondary-craft mt-1 inline-flex items-center gap-1.5 rounded-full border border-border bg-surface px-3 py-1 text-caption font-medium text-fg hover:border-border-strong"
                 >
-                  <RotateCcw size={12} strokeWidth={1.75} /> 继续
+                  <RotateCcw size={12} strokeWidth={1.75} /> 重新生成
                 </button>
               )}
             </div>

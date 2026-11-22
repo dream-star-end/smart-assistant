@@ -28,6 +28,7 @@ describe("待发送列表", () => {
     const waiting = user({ id: "wait", text: "等上一轮结束再发", status: "queued" });
     render(<QueuedSendList messages={[waiting]} onEdit={onEdit} onDelete={onDelete} onSendNow={onSendNow} />);
     expect(screen.getByTestId("queued-send-list")).toBeInTheDocument();
+    expect(screen.getByTestId("queued-send-billing-note")).toHaveTextContent("本轮结束后自动发出，另行计费");
     expect(screen.getByText("等上一轮结束再发")).toBeInTheDocument();
     const buttons = screen.getAllByRole("button");
     expect(buttons.map((button) => button.getAttribute("aria-label"))).toEqual(["修改", "删除", "立即发送"]);

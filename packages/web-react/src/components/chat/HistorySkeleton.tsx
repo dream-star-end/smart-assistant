@@ -114,43 +114,7 @@ export function MessageListSkeleton({
   );
 }
 
-/** 已有部分真实消息时的轻量尾部占位：不遮内容，只说明剩余内容仍在加载。 */
+/** 已有部分真实消息时的后台同步静默合并：不在消息尾部闪烁假回复骨架，避免打断阅读。 */
 export function PartialHistorySkeleton() {
-  return (
-    <output
-      className="py-1.5 text-muted"
-      aria-label="正在加载会话内容"
-      aria-live="polite"
-      aria-busy="true"
-      data-testid="partial-history-skeleton"
-    >
-      <div className="min-w-0 flex-1 space-y-2">
-        <span className="block text-caption text-faint">正在加载会话内容…</span>
-        <Skeleton className="h-3.5 w-4/5 rounded-md" />
-        <Skeleton className="h-3.5 w-2/3 rounded-md" />
-      </div>
-    </output>
-  );
-}
-
-/** Journal hydrate hit a page/time cap. Do not cover history; offer retry. */
-export function JournalHydrationRetry({ onRetry }: { onRetry: () => void }) {
-  return (
-    <output
-      className="oc-callout oc-callout-info flex items-center justify-between gap-3 rounded-xl px-3.5 py-2.5 text-muted"
-      aria-label="实时内容未完全加载"
-      data-testid="journal-hydration-retry"
-    >
-      <span className="min-w-0 text-caption">实时内容未完全加载，已显示已有记录。</span>
-      {/* text-foreground 不是本仓 token(会回落到父级 text-muted,与说明文字同色):改 text-fg +
-          常显下划线,让动作按钮看得出是可点的;触屏下加高到 44px。 */}
-      <button
-        type="button"
-        className="oc-btn-tactile shrink-0 rounded-md px-2 py-0.5 text-caption font-medium text-fg underline underline-offset-2 transition-colors hover:text-accent [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-2"
-        onClick={onRetry}
-      >
-        继续
-      </button>
-    </output>
-  );
+  return null;
 }

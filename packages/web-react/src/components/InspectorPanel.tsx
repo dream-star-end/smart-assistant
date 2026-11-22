@@ -248,7 +248,7 @@ function DeferredNotice({ hydrated }: { hydrated: Hydrated }) {
         className="rounded text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
         onClick={hydrated.retry}
       >
-        继续
+        重新加载
       </button>
     </div>
   );

@@ -109,37 +109,15 @@ describe("WorkspaceShellHeader", () => {
     expect(onDesktopAction).toHaveBeenCalledTimes(1);
   });
 
-  it("updateAvailable + onReloadForUpdate 在壳层统一展示轻刷新条，缺任一条件时不渲染", () => {
+  it("updateAvailable + onReloadForUpdate 不再渲染常驻全宽新版本通栏（依赖后台无感软刷）", () => {
     const onReload = vi.fn();
-    const { rerender, container } = render(
-      <WorkspaceShellHeader onReloadForUpdate={onReload}>
+    render(
+      <WorkspaceShellHeader updateAvailable onReloadForUpdate={onReload}>
         <span>内容</span>
       </WorkspaceShellHeader>,
     );
     expect(screen.queryByTestId("shell-update-banner")).toBeNull();
     expect(screen.queryByTestId("update-pill")).toBeNull();
-
-    rerender(
-      <WorkspaceShellHeader updateAvailable>
-        <span>内容</span>
-      </WorkspaceShellHeader>,
-    );
-    expect(screen.queryByTestId("shell-update-banner")).toBeNull();
-
-    rerender(
-      <WorkspaceShellHeader updateAvailable onReloadForUpdate={onReload}>
-        <span>内容</span>
-      </WorkspaceShellHeader>,
-    );
-    const header = container.querySelector("header");
-    const banner = screen.getByTestId("shell-update-banner");
-    const pill = screen.getByTestId("update-pill");
-    expect(header).toContainElement(banner);
-    expect(banner).toContainElement(pill);
-    expect(pill).toHaveAttribute("aria-label", "有新版本，点击刷新页面");
-    expect(pill).toHaveTextContent("发现新版本 · 立即刷新");
-
-    fireEvent.click(pill);
-    expect(onReload).toHaveBeenCalledTimes(1);
+    expect(onReload).not.toHaveBeenCalled();
   });
 });

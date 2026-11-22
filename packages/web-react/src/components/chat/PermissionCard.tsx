@@ -337,6 +337,7 @@ export function PermissionCard({
   let statusText = "等待审批…";
   if (!resolved) {
     if (pending) statusText = "正在提交…";
+    else if (expired && livePrompt && canAnswer) statusText = "等待时间较长";
     else if (expired) statusText = "已过期";
     else if (inputTruncated) statusText = "正在加载完整问题…";
     else if (questions) statusText = "等待回答…";
@@ -443,29 +444,14 @@ export function PermissionCard({
         </div>
       ) : null)}
 
-      {/* 待审批：内联快捷 + 打开审批框。历史未答卡不自动弹，但保留这颗显式按钮。 */}
+      {/* 待审批：主按钮打开回答/审阅/审批框；问答卡跳过提问降级为次要 ghost 按钮。 */}
       {canAnswer && (
         <div className="flex flex-wrap items-center gap-2 border-t border-border/70 bg-surface/60 px-3.5 py-2.5">
-          {questions && msg.requestId && (
-            <Button
-              size="sm"
-              variant="accent"
-              shape="pill"
-              className="oc-btn-tactile oc-btn-accent-craft oc-spring-press"
-              onClick={() => continueAskUserQuestion(questions, input, msg.requestId!, onRespond)}
-            >
-              继续
-            </Button>
-          )}
           <Button
             size="sm"
-            variant={questions ? "secondary" : "accent"}
+            variant="accent"
             shape="pill"
-            className={
-              questions
-                ? "oc-btn-tactile oc-btn-secondary-craft"
-                : "oc-btn-tactile oc-btn-accent-craft oc-spring-press"
-            }
+            className="oc-btn-tactile oc-btn-accent-craft oc-spring-press"
             onClick={() => {
               if (msg.requestId) reopenPermissionUi(msg.requestId);
               setOpen(true);
@@ -473,6 +459,17 @@ export function PermissionCard({
           >
             {questions ? "回答" : isExitPlan ? "审阅计划" : "审批"}
           </Button>
+          {questions && msg.requestId && (
+            <Button
+              size="sm"
+              variant="ghost"
+              shape="pill"
+              className="oc-btn-tactile text-muted hover:text-fg"
+              onClick={() => continueAskUserQuestion(questions, input, msg.requestId!, onRespond)}
+            >
+              跳过提问
+            </Button>
+          )}
           {!questions && !isExitPlan && (
             // 拒绝是不可撤销动作,却长得像一段灰字(PC-08):改成描边按钮,触屏 44px 由 Button 原语兜底。
             <Button
@@ -497,14 +494,13 @@ export function PermissionCard({
           提问已过期，无法再作答
         </div>
       )}
-      {/* 活提问的过期 fail-safe(PC-03):按本机时钟已过 TTL 但仍留着「审批」入口(时钟偏差时服务端可能还在等)。
-          此前卡头写「已过期」、下面却挂着可点的按钮,两句自相矛盾;补一行说明把这层「可能」讲清楚。 */}
+      {/* 活提问的超时 fail-safe：任务仍在等待时保留可作答提交能力，避免误锁卡死。 */}
       {!resolved && !readOnly && expired && livePrompt && canAnswer && (
         <div
           data-testid="permission-expired-failsafe"
           className="border-t border-border/70 px-3 py-2 text-caption text-faint"
         >
-          按本机时间已超过等待时限；若智能体仍在等待（时钟可能有偏差），仍可作答。
+          等待时间较长，仍可作答提交。
         </div>
       )}
 
@@ -632,18 +628,39 @@ function PendingApprovalBar({
   return slot ? createPortal(bar, slot) : bar;
 }
 
+function isInlinePermissionCardVisible(
+  scrollParent: HTMLElement | null | undefined,
+  requestId: string | undefined,
+): boolean {
+  if (!scrollParent || !requestId) return false;
+  const escaped =
+    typeof CSS !== "undefined" && typeof CSS.escape === "function"
+      ? CSS.escape(requestId)
+      : requestId.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const card = scrollParent.querySelector(
+    `[data-testid="permission-card"][data-permission-request="${escaped}"]`,
+  );
+  if (!(card instanceof HTMLElement)) return false;
+  const view = scrollParent.getBoundingClientRect();
+  const rect = card.getBoundingClientRect();
+  if (view.height <= 0 || rect.height <= 0) return false;
+  return rect.bottom > view.top + 4 && rect.top < view.bottom - 4;
+}
+
 export function PermissionPromptHost({
   messages,
   onRespond,
   readOnly = false,
   sending = false,
   sessionId,
+  scrollParent,
 }: {
   messages: ChatMessage[];
   onRespond: PermissionRespond;
   readOnly?: boolean;
   sending?: boolean;
   sessionId?: string;
+  scrollParent?: HTMLElement | null;
 }) {
   const [tick, setTick] = useState(0);
   useEffect(() => subscribePermissionCoordinator(() => {
@@ -663,14 +680,15 @@ export function PermissionPromptHost({
     const timer = setTimeout(() => setTick((n) => n + 1), Math.min(next - now, 2_147_483_647));
     return () => clearTimeout(timer);
   }, [messages, readOnly, tick]);
-  if (readOnly) return null;
-  const pending = messages.filter(
-    (message) =>
-      message.role === "permission" &&
-      isAwaitingPermissionPrompt(message) &&
-      typeof message.requestId === "string" &&
-      message.requestId.length > 0,
-  );
+  const pending = readOnly
+    ? []
+    : messages.filter(
+        (message) =>
+          message.role === "permission" &&
+          isAwaitingPermissionPrompt(message) &&
+          typeof message.requestId === "string" &&
+          message.requestId.length > 0,
+      );
   const active = activeModalRequest();
   const activeMsg = pending.find((message) => message.requestId === active);
   const isLive = (message: ChatMessage) =>
@@ -679,13 +697,33 @@ export function PermissionPromptHost({
     isLive(message) && shouldAutoOpenPermission({ requestId: message.requestId!, livePrompt: true }),
   );
   const msg = activeMsg ?? autoMsg;
-  // 没有弹框在开时的待答入口。除了用户主动关掉的,还要接住**被顶掉的活提问**(PC-04):
-  // A 自动弹出后用户点了 B 卡的「审批」,A 的弹框被 singleton 收掉但没记 dismissed;
-  // 答完 B 之后 A 已被标「展示过」不再自动弹 —— 没有这条兜底就只剩时间线里一张静默的卡。
-  const minimized = !msg ? pending.find((message) =>
-    !isExitPlanModeTool(message.toolName) &&
-    (isPermissionUiDismissed(message.requestId) || isLive(message))
-  ) : undefined;
+  const minimizedCandidate = !msg
+    ? pending.find((message) =>
+        (!isExitPlanModeTool(message.toolName) || Boolean(scrollParent)) &&
+        (isPermissionUiDismissed(message.requestId) || isLive(message) || Boolean(scrollParent)),
+      )
+    : undefined;
+  const minimizedId = minimizedCandidate?.requestId;
+  const [inlineVisible, setInlineVisible] = useState(false);
+  useEffect(() => {
+    if (!scrollParent || !minimizedId) {
+      setInlineVisible(false);
+      return;
+    }
+    const sync = () => {
+      const next = isInlinePermissionCardVisible(scrollParent, minimizedId);
+      setInlineVisible((prev) => (prev === next ? prev : next));
+    };
+    sync();
+    scrollParent.addEventListener("scroll", sync, { passive: true });
+    window.addEventListener("resize", sync, { passive: true });
+    return () => {
+      scrollParent.removeEventListener("scroll", sync);
+      window.removeEventListener("resize", sync);
+    };
+  }, [scrollParent, minimizedId, messages.length, tick]);
+  if (readOnly) return null;
+  const minimized = minimizedCandidate && !inlineVisible ? minimizedCandidate : undefined;
   return (
     <>
     {msg && <PermissionCard

@@ -830,7 +830,7 @@ export type ChatSession = {
     ts: number;
   };
   /** Background live-journal hydrate hit a page/time cap or request timeout.
-   * Not persisted; UI offers an explicit retry. */
+   * Not persisted; cleared automatically on recovery, live WS frames, or turn completion. */
   _liveJournalDegraded?: boolean;
   /** First view=units pack applied; recovery chrome can drop without waiting for WS. */
   _liveUnitsPackApplied?: boolean;

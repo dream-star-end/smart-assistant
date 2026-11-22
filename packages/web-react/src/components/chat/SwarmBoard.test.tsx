@@ -407,7 +407,7 @@ describe("Antigravity native swarm reducer & UI (OCV5-809)", () => {
     expect(snap?.posts.map((p) => p.seq)).toEqual([1, 2]);
   });
 
-  it("OCV5-819: renders isolated worktree badges and merge-safety notice for workspace=share members", () => {
+  it("OCV5-819: renders isolated worktree badges on member rows without exposing worktree cleanup notice", () => {
     const snap = makeSnapshot({
       members: [
         {
@@ -435,7 +435,7 @@ describe("Antigravity native swarm reducer & UI (OCV5-809)", () => {
       </div>,
     );
     expect(screen.getByText("1 独立 worktree")).toBeTruthy();
-    expect(screen.getByTestId("swarm-worktree-notice")).toBeTruthy();
+    expect(screen.queryByTestId("swarm-worktree-notice")).toBeNull();
     expect(screen.getAllByText("worktree").length).toBeGreaterThanOrEqual(2);
   });
 

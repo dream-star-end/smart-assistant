@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { SessionTimelineBoundary } from "./SessionTimelineBoundary";
 
@@ -41,6 +41,20 @@ describe("SessionTimelineBoundary", () => {
     );
     await waitFor(() => expect(screen.getByText("恢复后的会话内容")).toBeInTheDocument());
     expect(screen.queryByTestId("timeline-fatal-error")).toBeNull();
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    err.mockRestore();
+  });
+
+  test("渲染失败占位按钮正名为「重新加载」并触发 onRetry", () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const onRetry = vi.fn();
+    render(
+      <SessionTimelineBoundary resetKey="sess-btn" onRetry={onRetry}>
+        <Boom />
+      </SessionTimelineBoundary>,
+    );
+    expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "重新加载" }));
     expect(onRetry).toHaveBeenCalledTimes(1);
     err.mockRestore();
   });

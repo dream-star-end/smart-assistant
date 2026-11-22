@@ -9,9 +9,9 @@ export const RELEASE_JOB_ID_RE = /^rel-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$/;
 
 export const RELEASE_PHASE_LABELS = {
   queued: "排队中",
-  acquiring_lease: "获取 lease",
+  acquiring_lease: "准备发布中",
   deploying: "部署中",
-  smoking: "冒烟中",
+  smoking: "上线验收中",
   completed: "完成",
   failed: "失败",
   rolled_back: "已回滚",
@@ -240,7 +240,7 @@ export function renderReleaseJobCard(command: string, tool: ToolLike) {
   if (looksLikeReleaseWorkerCommand(command) && tool.error) {
     return (
       <div className="oc-callout oc-callout-danger rounded-lg px-3.5 py-2.5 text-meta text-danger">
-        发布任务未能启动。不要改走旁路；先读报错再查 queue / lease。
+        发布任务未能启动，请查看下方报错信息后再排查。
       </div>
     );
   }

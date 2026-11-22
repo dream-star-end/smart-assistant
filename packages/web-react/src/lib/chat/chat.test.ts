@@ -297,7 +297,7 @@ describe("classifyClose / nonAuthPolicyCloseInfo (§5)", () => {
   });
   test("known error reason still maps to its label", () => {
     const d = classifyClose(4503, JSON.stringify({ retryAfterSec: 3, reason: "image_outdated" }));
-    expect(d.closeReasonLabel).toBe("运行镜像更新中，稍后自动重试");
+    expect(d.closeReasonLabel).toBe("运行环境更新中，稍后自动重试");
   });
   test("4509 服务重启 → 瞬态 reconnect + 「服务更新中」横幅,绝不落 policy/错误路径", () => {
     const d = classifyClose(4509, "server_restart");
@@ -730,14 +730,16 @@ describe("模型思考阶段(空思考也要让用户感知 agent 在响应)", (
     expect(long.cls).toBe("long-thinking");
   });
 
-  test("keepalive 断了(真静默)仍按静默升级,不假装在动", () => {
+  test("keepalive 断了(真静默)仍按静默升级,但不再展示焦虑的「无新数据」", () => {
     const out = computeTypingLabel({
       name: "助手",
       secs: 136,
       silenceMs: STALE_WARN_MS,
       progressHint: MODEL_THINKING_WORKING_DETAIL,
     });
-    expect(out.text).toContain("无新数据");
+    expect(out.cls).toBe("stale-warn");
+    expect(out.text).toContain("深度思考中");
+    expect(out.text).not.toContain("无新数据");
   });
 
   test("null 复位帧丢失:正文内容帧兜底清 thinking hint,思考增量帧不清", () => {
@@ -765,14 +767,16 @@ describe("computeTypingLabel progressHint vs stall", () => {
     expect(out.text).not.toContain("无新数据");
   });
 
-  test("stall 文案盖过 leftover progressHint，不假装在动", () => {
+  test("stall 文案盖过 leftover progressHint，不假装在动且不展示「无新数据」", () => {
     const out = computeTypingLabel({
       name: "助手",
       secs: 120,
       silenceMs: STALE_WARN_MS,
       progressHint: "Read foo.ts",
     });
-    expect(out.text).toContain("无新数据");
+    expect(out.cls).toBe("stale-warn");
+    expect(out.text).toContain("深度思考中");
+    expect(out.text).not.toContain("无新数据");
     expect(out.text).not.toContain("Read foo.ts");
     expect(out.text).not.toContain("读取文件");
   });
@@ -8283,8 +8287,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       return frame.type === "inbound.message" && frame.clientMessageId === user.id;
     })).toHaveLength(1));
     expect(persistPendingDispatch).toHaveBeenCalledTimes(1);
-    expect(sock.getTransientNotice("s1")?.text).toBe("正在确认发送…");
-    expect(sock.getTransientNotice("s1")?.text).not.toContain("浏览器");
+    expect(sock.getTransientNotice("s1")).toBeNull();
     expect(user.status).toBe("sending");
     expect(sock.sessions.get("s1")?._sendingInFlight).toBe(true);
     ws.onmessage?.({ data: JSON.stringify({
@@ -9755,7 +9758,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       type: "outbound.control.receipt", controlId: stop.controlId, controlKind: "stop", status: "terminal",
       peer: { id: "s1", kind: "dm" }, clientMessageId: user.id, errorCode: "TURN_ALREADY_ENDED",
     }) });
-    expect(sock.getTransientNotice("s1")?.text).toBe("该回合已结束");
+    expect(sock.getTransientNotice("s1")).toBeNull();
     expect(syncSession).toHaveBeenCalledWith("s1", { clientMessageId: user.id });
     expect(deletePendingControl).toHaveBeenCalledWith("s1", stop.controlId);
     expect(session._sendingInFlight).toBe(false);
@@ -10813,8 +10816,8 @@ describe("sys.context_rebuilt 帧处理", () => {
     expect(sysRows).toHaveLength(1);
     expect(sysRows[0].text).toBe(contextRebuiltNotice(40));
     expect(isServerAuthoredRow(sysRows[0])).toBe(false); // client-owned
-    // 同文案的会话级 transient 软提示(live flash)。
-    expect(sock.getTransientNotice("s1")?.text).toBe(contextRebuiltNotice(40));
+    // P0-5: 不再额外写入同文案 transientNotice，避免与 SystemCard 同屏双卡重复。
+    expect(sock.getTransientNotice("s1")).toBeNull();
     sock.stop();
   });
 

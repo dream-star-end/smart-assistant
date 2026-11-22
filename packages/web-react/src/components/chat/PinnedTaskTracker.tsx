@@ -23,7 +23,6 @@ import type { TurnTokenUsageSnapshot } from "@openclaude/protocol/frames";
 import { Check, ChevronDown, ChevronUp, Circle, ListChecks, LoaderCircle } from "lucide-react";
 import { type RefObject, useCallback, useEffect, useId, useRef, useState } from "react";
 import { cn } from "../../lib/utils";
-import { TokenUsageBadge } from "./tokenUsage";
 
 /**
  * 两枚 HUD 共用的头部切换按钮样式(H-05):外层容器 `overflow-hidden rounded-lg` 会把画在
@@ -113,6 +112,8 @@ export function PinnedTaskTracker({
   settled?: boolean;
   tokenUsage?: TurnTokenUsageSnapshot;
 }) {
+  // HUD 不展示裸 tok 工程数字，保留 prop 兼容上游调用。
+  void tokenUsage;
   const total = todos.length;
   const doneCount = todos.filter(isDone).length;
   const hasIncomplete = todos.some((t) => !isDone(t));
@@ -217,7 +218,6 @@ export function PinnedTaskTracker({
             </span>
           )}
           {expanded && <span className="flex-1" />}
-          <TokenUsageBadge usage={tokenUsage} />
           {expanded ? (
             <ChevronDown className="size-4 shrink-0 text-faint" strokeWidth={1.75} aria-hidden />
           ) : (

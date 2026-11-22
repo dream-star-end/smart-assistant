@@ -12,11 +12,11 @@ describe("AgentGate 标题层级与数字格式", () => {
   it.each([
     { kind: "runtime-unavailable" },
     { kind: "error", message: "暂时无法读取状态" },
-  ] as const)("$kind 的继续只重新检查前置状态", (phase) => {
+  ] as const)("$kind 的重试只重新检查前置状态", (phase) => {
     const onRetry = vi.fn();
     const onOpen = vi.fn();
     render(<AgentGate phase={phase} onOpen={onOpen} onRetry={onRetry} onTopUp={noop} />);
-    screen.getByRole("button", { name: "继续" }).click();
+    screen.getByRole("button", { name: "重试" }).click();
     expect(onRetry).toHaveBeenCalledTimes(1);
     expect(onOpen).not.toHaveBeenCalled();
   });

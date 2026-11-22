@@ -160,7 +160,7 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
     (recoveryKind === "waiting-service" || recoveryKind === "retrying") &&
     !info.hasVisibleProcess
   ) {
-    text = "正在恢复实时内容…";
+    text = "正在同步进展…";
     cls = "recovering";
   } else if (info.turnStatus === "engine_starting" || info.turnStatus === "engine_resuming") {
     // 引擎冷启动可见化:进程 spawn / 会话恢复期间不再显示误导性的「思考中」。

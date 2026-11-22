@@ -272,7 +272,7 @@ describe("InspectorPanel 端到端集成（产物分类汇总筛选 + 批注透�
     expect(onAnnotate).toHaveBeenCalledWith(expect.stringContaining("results.csv"));
   });
 
-  test("BrowserView 展示清晰的快照/回放状态引导提示，切换历史步骤可点击「回到最新」", async () => {
+  test("BrowserView 常规最新态不渲染常驻说明书横幅，切换历史步骤才展示紧凑「回到最新」", async () => {
     const page = (url: string, title: string, shot: string) =>
       `- Page URL: ${url}\n- Page Title: ${title}\n- [Screenshot of viewport](${shot})`;
     const messages: ChatMessage[] = [
@@ -293,15 +293,14 @@ describe("InspectorPanel 端到端集成（产物分类汇总筛选 + 批注透�
       />,
     );
 
-    const banner = await screen.findByTestId("browser-status-banner");
-    expect(banner).toHaveTextContent("会话快照回放");
+    const rows = await screen.findAllByTestId("browser-log-row");
+    expect(screen.queryByTestId("browser-status-banner")).toBeNull();
 
-    // 点第一条历史操作 → 提示历史快照并出「回到最新」
-    const rows = screen.getAllByTestId("browser-log-row");
+    // 点第一条历史操作 → 展示紧凑历史步骤提示与「回到最新」
     fireEvent.click(within(rows[0]).getAllByRole("button")[0]);
-    expect(screen.getByTestId("browser-status-banner")).toHaveTextContent("历史快照 · 第 1 / 2 步");
+    expect(screen.getByTestId("browser-status-banner")).toHaveTextContent("正在查看历史步骤（第 1 / 2 步）");
     fireEvent.click(screen.getByTestId("browser-back-latest"));
-    expect(screen.getByTestId("browser-status-banner")).toHaveTextContent("会话快照回放");
+    expect(screen.queryByTestId("browser-status-banner")).toBeNull();
   });
 
   test("长文档点击大纲章节真实滚动到目标标题，且流式内容增长会自动解开幻灯片/目录锁死", async () => {

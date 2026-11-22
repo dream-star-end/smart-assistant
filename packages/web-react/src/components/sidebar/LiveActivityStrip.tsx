@@ -1,10 +1,5 @@
-import { Bell, BellOff, ChevronDown, ChevronRight } from "lucide-react";
-import { useMemo, useState, useSyncExternalStore } from "react";
-import {
-  getDesktopNotifyState,
-  requestDesktopNotifyToggle,
-  subscribeDesktopNotifyState,
-} from "../../lib/desktopNotifyPref";
+import { ChevronDown, ChevronRight } from "lucide-react";
+import { useMemo, useState } from "react";
 import type { AuthSession } from "../../lib/types";
 import { StatusPill } from "../ui";
 import { PendingDecisionsDock } from "./PendingDecisionsDock";
@@ -58,28 +53,17 @@ export function LiveActivityStrip({
   defaultCollapsed = false,
 }: LiveActivityStripProps) {
   const [requestedFilter, setRequestedFilter] = useState<LiveActivityFilter>("all");
-  const [collapseOverride, setCollapseOverride] = useState<boolean | null>(
-    defaultCollapsed ? true : null,
-  );
+  const [collapsed, setCollapsed] = useState<boolean>(defaultCollapsed);
   const [showAll, setShowAll] = useState(false);
-  const notifyState = useSyncExternalStore(
-    subscribeDesktopNotifyState,
-    getDesktopNotifyState,
-    getDesktopNotifyState,
-  );
-  const notifyActive = notifyState.enabled && notifyState.permission === "granted";
-  const notifyDenied = notifyState.permission === "denied";
 
-  if (summary.total === 0) return null;
-
-  // 仅有 1 条运行中会话且正好是当前正在查看的会话时，默认收起明细行，
-  // 避免与下方项目第一行同屏重复呈现两张完全一样的活跃条；点展开或切到其它会话即恢复直达行。
+  // 仅有 1 条运行中会话且正好是当前正在查看的会话时直接隐藏空壳标题栏，避免与主区和会话列表重复。
   const onlyActiveRunning =
     summary.total === 1 &&
     summary.items[0]?.bucket === "running" &&
     Boolean(activeId) &&
     summary.items[0]?.session.id === activeId;
-  const collapsed = collapseOverride ?? onlyActiveRunning;
+
+  if (summary.total === 0 || onlyActiveRunning) return null;
 
   const activeFilter = resolveEffectiveLiveFilter(summary, requestedFilter);
   const items = filterLiveActivityItems(summary, activeFilter);
@@ -92,7 +76,7 @@ export function LiveActivityStrip({
       const effective = resolveEffectiveLiveFilter(summary, cur);
       return effective === bucket ? "all" : bucket;
     });
-    setCollapseOverride(false);
+    setCollapsed(false);
     setShowAll(false);
   };
 
@@ -101,7 +85,6 @@ export function LiveActivityStrip({
       aria-label="活态指挥区"
       data-testid="sidebar-live-strip"
       data-has-attention={summary.counts.needs_you > 0 ? "true" : undefined}
-      data-compact-active={onlyActiveRunning && collapsed ? "true" : undefined}
       className="oc-live-strip"
     >
       <div className="oc-live-strip-head">
@@ -128,42 +111,13 @@ export function LiveActivityStrip({
             );
           })}
         </div>
-        {notifyState.permission !== "unsupported" && (
-          <button
-            type="button"
-            data-testid="live-strip-notify-toggle"
-            data-enabled={notifyActive ? "true" : undefined}
-            aria-pressed={notifyActive}
-            disabled={notifyDenied}
-            aria-label={
-              notifyDenied
-                ? "桌面通知已被浏览器阻止"
-                : notifyActive
-                  ? "关闭桌面通知"
-                  : "开启桌面通知"
-            }
-            title={
-              notifyDenied
-                ? "浏览器已阻止桌面通知，请在站点设置中允许"
-                : notifyActive
-                  ? "已开启桌面通知（点击关闭）"
-                  : "开启桌面通知：待拍板或后台任务完成时提醒"
-            }
-            onClick={() => {
-              void requestDesktopNotifyToggle(!notifyState.enabled);
-            }}
-            className="oc-live-strip-toggle oc-live-strip-notify"
-          >
-            {notifyActive ? <Bell size={13} strokeWidth={1.75} aria-hidden /> : <BellOff size={13} strokeWidth={1.75} aria-hidden />}
-          </button>
-        )}
         <button
           type="button"
           data-testid="live-strip-collapse-toggle"
           aria-expanded={!collapsed}
           aria-label={collapsed ? `展开活态列表（${summary.total}）` : "收起活态列表"}
           title={collapsed ? "展开活态列表" : "收起活态列表"}
-          onClick={() => setCollapseOverride(!collapsed)}
+          onClick={() => setCollapsed((v) => !v)}
           className="oc-live-strip-toggle"
         >
           {collapsed ? <ChevronRight size={14} strokeWidth={1.75} aria-hidden /> : <ChevronDown size={14} strokeWidth={1.75} aria-hidden />}
@@ -277,19 +231,41 @@ export function SidebarLiveActivityStrip({
     socketVersion,
   ]);
 
+  // 侧栏「待拍板」统一收敛至 PendingDecisionsDock 唯一入口，活态条仅承接后台运行中/未读项避免双「待拍板」叠放。
+  const stripSummary = useMemo<LiveActivitySummary>(() => {
+    if (summary.counts.needs_you === 0) return summary;
+    const items = summary.items.filter((item) => item.bucket !== "needs_you");
+    return {
+      items,
+      byBucket: {
+        needs_you: [],
+        running: summary.byBucket.running,
+        unread_done: summary.byBucket.unread_done,
+      },
+      counts: {
+        all: items.length,
+        needs_you: 0,
+        running: summary.counts.running,
+        unread_done: summary.counts.unread_done,
+      },
+      total: items.length,
+    };
+  }, [summary]);
+
   return (
     <>
-      {auth && (
+      {(auth || summary.byBucket.needs_you.length > 0) && (
         <PendingDecisionsDock
           auth={auth}
           socketVersion={socketVersion}
+          sessionNeedsYouItems={summary.byBucket.needs_you}
           onSelectSession={onSelect}
           onOpenBoard={onOpenBoard}
           onOpenLiveBrowser={onOpenLiveBrowser}
         />
       )}
       <LiveActivityStrip
-        summary={summary}
+        summary={stripSummary}
         activeId={activeId}
         onSelect={onSelect}
         onMarkRead={onMarkRead}

@@ -136,9 +136,9 @@ describe("context_too_long fallback & SystemCard receipt (OCV5-841)", () => {
     expect(onStartNewSession).toHaveBeenCalledTimes(1);
   });
 
-  it("renders jargon-free compaction receipt divider inside SystemCard", () => {
-    const receiptMsg: ChatMessage = {
-      id: "sys-ctxcompact-s1-r1",
+  it("hides automatic compaction cards while keeping manual compaction receipt inside SystemCard", () => {
+    const autoMsg: ChatMessage = {
+      id: "sys-ctxcompact-s1-f1",
       role: "system",
       text: "已自动整理较早对话，可继续无缝聊下去",
       ts: 1_700_000_000_000,
@@ -147,15 +147,20 @@ describe("context_too_long fallback & SystemCard receipt (OCV5-841)", () => {
         strategy: "checkpoint_reset",
         beforeTokens: 150_000,
         afterTokens: 60_000,
-        beforeBytes: 240_000,
-        afterBytes: 40_000,
-        droppedEntries: 9,
         summaryPreview: "已保留当前架构决策与待办清单",
       },
     };
-    render(<SystemCard msg={receiptMsg} />);
+    const { rerender } = render(<SystemCard msg={autoMsg} />);
+    expect(screen.queryByTestId("context-compacted-receipt")).toBeNull();
+
+    const manualMsg: ChatMessage = {
+      ...autoMsg,
+      id: "sys-ctxcompact-s1-rcompact:1",
+      text: "已整理较早对话，原始记录完整保留",
+    };
+    rerender(<SystemCard msg={manualMsg} />);
     const receipt = screen.getByTestId("context-compacted-receipt");
-    const toggle = screen.getByRole("button", { name: /已自动整理较早对话，可继续无缝聊下去/ });
+    const toggle = screen.getByRole("button", { name: /已整理较早对话，原始记录完整保留/ });
     expect(screen.queryByText(/系统已自动保留近期对话与关键决策/)).toBeNull();
     expect(receipt.textContent).not.toMatch(/checkpoint_reset|native_summary|beforeBytes|afterBytes|droppedEntries|Token/i);
 

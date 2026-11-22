@@ -215,17 +215,19 @@ export function ChatHeader({
   /** 会话未读数（侧栏折叠/移动抽屉入口 6px 呼吸点）。 */
   sessionUnreadCount?: number;
   projectBreadcrumb?: { chatName?: string | null; workName?: string | null } | null;
-  /** 未分类会话的项目建议（P5，开关控制）。只提示，移入由用户点。 */
+  /** @deprecated 顶栏不再展示未分类会话推荐胶囊，保留可选类型兼容旧调用方。 */
   projectSuggestion?: { name: string; onAccept: () => void; onDismiss: () => void } | null;
   onOpenProjectScope?: () => void;
   /** 可选当前会话标题（桌面宽屏在模型区旁以安静层次展示，省略则不占空间）。 */
   sessionTitle?: string | null;
-  /** 可选运行态标记：true 时在强模型选择器旁展示精简运行态徽章。 */
+  /** @deprecated 顶栏不再展示纯展示型运行中胶囊，保留可选类型兼容旧调用方。 */
   running?: boolean;
-  /** 服务端已是新前端(appUpdate.getPillVisible)。透传至 WorkspaceShellHeader 统一轻提示条。 */
+  /** @deprecated 顶栏不再渲染常驻新版本通栏，保留可选类型兼容旧调用方。 */
   updateAvailable?: boolean;
   onReloadForUpdate?: () => void;
 }) {
+  void projectSuggestion;
+  void running;
   const trimmedSessionTitle = typeof sessionTitle === "string" ? sessionTitle.trim() : "";
   const showSessionTitle = Boolean(trimmedSessionTitle && trimmedSessionTitle !== "新对话");
   const isNonDefaultAgent = agent.id !== "main";
@@ -251,8 +253,8 @@ export function ChatHeader({
       className="relative z-20 border-x-0 border-t-0 border-b border-border/80 bg-bg/95 backdrop-blur-md shadow-xs"
       contentClassName="min-h-12 flex-nowrap items-center gap-1 px-2 py-1 sm:min-h-[52px] sm:gap-1.5 sm:px-4 sm:py-1.5"
     >
-      {/* 模型与运行态核心区：手机 <640px 居中紧凑胶囊（对称留白）；桌面 sm+ 左对齐且优先保障模型与蜂群态宽度。 */}
-      {((models && onSelectModel) || advisorModeActive || teamModeActive || running) && (
+      {/* 模型与协作态核心区：手机 <640px 居中紧凑胶囊（对称留白）；桌面 sm+ 左对齐且优先保障模型与蜂群态宽度。 */}
+      {((models && onSelectModel) || advisorModeActive || teamModeActive) && (
         <div
           className="flex min-w-0 flex-1 items-center justify-center gap-0.5 sm:flex-initial sm:justify-start sm:gap-1.5"
           data-testid="chat-model-row"
@@ -382,17 +384,6 @@ export function ChatHeader({
               </PopoverContent>
             </Popover>
           )}
-          {running && (
-            <span
-              role="status"
-              data-testid="header-running-badge"
-              aria-label="当前会话正在运行"
-              className="oc-badge-craft oc-breathe-aura hidden shrink-0 items-center gap-1.5 rounded-full bg-accent-soft px-2.5 py-1 text-caption font-medium leading-none text-accent sm:inline-flex"
-            >
-              <Loader2 size={11} strokeWidth={2} aria-hidden className="shrink-0 animate-spin" />
-              <span>运行中</span>
-            </span>
-          )}
         </div>
       )}
 
@@ -437,32 +428,6 @@ export function ChatHeader({
           <FolderOpen size={12.5} strokeWidth={1.75} aria-hidden className="shrink-0" />
           <span className="truncate">{projectBreadcrumb.chatName}</span>
         </button>
-      ) : projectSuggestion ? (
-        <span
-          data-testid="chat-project-suggestion"
-          className="oc-surface-recessed hidden min-w-0 max-w-[18rem] shrink items-center gap-0.5 rounded-full px-1 py-0.5 text-caption text-muted sm:inline-flex"
-        >
-          <button
-            type="button"
-            onClick={projectSuggestion.onAccept}
-            data-product-control="project-suggestion-accept"
-            aria-label={`移入项目「${projectSuggestion.name}」`}
-            title={`这个会话可能属于「${projectSuggestion.name}」，点一下移入`}
-            className="oc-btn-tactile inline-flex min-w-0 items-center gap-1 rounded-full px-2 py-0.5 font-medium outline-none hover:bg-surface hover:text-accent focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <FolderOpen size={12.5} strokeWidth={1.75} aria-hidden className="shrink-0 text-accent" />
-            <span className="truncate">移入「{projectSuggestion.name}」?</span>
-          </button>
-          <button
-            type="button"
-            onClick={projectSuggestion.onDismiss}
-            data-product-control="project-suggestion-dismiss"
-            aria-label="不用移入"
-            className="oc-btn-tactile inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-faint outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            不用
-          </button>
-        </span>
       ) : null}
 
       {/* 右侧当前会话操作区：桌面 [订阅] + [快问] + [◫ 工作台] + [···]；移动 [订阅] + [◫ 工作台(对话态)] + [···]（零红点）。 */}

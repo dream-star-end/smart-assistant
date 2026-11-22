@@ -1,6 +1,8 @@
 import type { MediaGenerationJob } from "@openclaude/protocol/mediaGeneration";
 import {
   Check,
+  ChevronDown,
+  ChevronUp,
   Clock,
   Film,
   Image as ImageIcon,
@@ -10,7 +12,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { cronHuman } from "../../lib/cron";
 import {
   firstLinePreview,
@@ -26,12 +28,17 @@ import { cn } from "../../lib/utils";
 import { Button } from "../ui";
 import { AtelierIcon } from "../ui/AtelierIcons";
 
+/** 成功终态条目短暂展示后自动静默收起，不再强迫用户手动点「知道了」。 */
+export const AUTO_DISMISS_SUCCEEDED_MS = 4_000;
+
 export type PinnedBackgroundTasksPanelProps = {
   museJobs: SessionMuseJobItem[];
   mediaJobs: MediaGenerationJob[];
   bgCommands: SessionBgCommandItem[];
   sessionCrons: SessionCronItem[];
   now: number;
+  /** 为 false 时由外层容器（如 LiveAgentCapsule）统一管理成功终态自动收起，避免重复计时。 */
+  autoDismissSucceeded?: boolean;
   onCancelMuseJob?: (jobId: string) => Promise<boolean>;
   onDismissMuseJob?: (jobId: string) => void;
   onCancelMediaJob?: (jobId: string) => Promise<boolean>;
@@ -39,6 +46,100 @@ export type PinnedBackgroundTasksPanelProps = {
   onToggleSessionCron?: (cronId: string, enabled: boolean) => Promise<boolean>;
   onDeleteSessionCron?: (cronId: string) => Promise<boolean>;
 };
+
+const MEDIA_ERROR_LABEL: Record<string, string> = {
+  worker_lost: "生成服务意外断开，请稍后重试",
+  worker_unreachable: "生成服务暂时不可用，请稍后重试",
+  invalid_job_contract: "任务参数无法处理，请重新发起",
+  worker_contract_mismatch: "生成结果异常，请稍后重试",
+  media_job_execution_failed: "生成过程中出错，请稍后重试",
+  upstream_failed: "生成服务暂时出错，请稍后重试",
+  generation_failed: "生成失败，请稍后重试",
+  h3_oom: "资源不足，请缩短时长或降低分辨率后重试",
+  oom: "资源不足，请缩短时长或降低分辨率后重试",
+  out_of_memory: "资源不足，请缩短时长或降低分辨率后重试",
+  timeout: "生成超时，请稍后重试",
+  upstream_timeout: "生成超时，请稍后重试",
+  timed_out: "生成超时，请稍后重试",
+  invalid_input: "输入素材无法处理，请调整后重试",
+  content_policy: "内容不符合生成规范，请调整描述后重试",
+  safety_blocked: "内容不符合生成规范，请调整描述后重试",
+  policy_violation: "内容不符合生成规范，请调整描述后重试",
+  quota_exceeded: "额度不足，请稍后重试",
+  insufficient_credits: "积分不足，请充值后重试",
+  rate_limited: "请求过于频繁，请稍后重试",
+  canceled: "任务已取消",
+  cancelled: "任务已取消",
+};
+
+/** 把底层 errorCode / 技术堆栈翻译成用户能理解的中文提示，绝不透出裸错误码。 */
+export function humanizeMediaError(
+  errorCode?: string | null,
+  errorMessage?: string | null,
+): string | null {
+  const code = (errorCode ?? "").trim();
+  const message = (errorMessage ?? "").trim();
+  if (!code && !message) return null;
+  if (code) {
+    const mapped = MEDIA_ERROR_LABEL[code.toLowerCase()];
+    if (mapped) return mapped;
+  }
+  if (message) {
+    const line = firstLinePreview(message);
+    const hasCjk = /[\u4e00-\u9fff]/.test(line);
+    const looksTechnical =
+      /\b(cuda|oom|econn|etimedout|err_|http\s*\d{3}|stack|exception|traceback|errno)\b/i.test(line) ||
+      /^[A-Z0-9_:-]{3,}$/.test(line);
+    if (hasCjk && !looksTechnical) return line;
+  }
+  return "生成失败，请稍后重试";
+}
+
+/** 将原始 Shell 命令归类为干净的人话任务标签，主视图彻底隐藏原始命令、环境变量、路径与 jobId。 */
+export function summarizeBgCommand(cmd: Pick<SessionBgCommandItem, "commandPreview">): string {
+  const raw = (cmd.commandPreview ?? "").trim();
+  if (!raw) return "独立后台任务";
+  // 去掉行首环境变量赋值（如 HOST_WT="/var/lib/..." FOO=1），只基于实际动作分类
+  const normalized = raw
+    .replace(/^(?:\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;]+)\s*;?\s*)+/, "")
+    .toLowerCase();
+  const text = normalized || raw.toLowerCase();
+  if (
+    /\b(vitest|pytest|jest|playwright|mocha|ava|unittest|rspec|cypress)\b/.test(text) ||
+    /\b(npm|pnpm|yarn|bun|cargo|go|uv)\s+(run\s+)?test\b/.test(text)
+  ) {
+    return "测试任务";
+  }
+  if (
+    /\b(tsc|vite\s+build|webpack|next\s+build|esbuild|rollup|turbo\s+build|docker\s+build|make|cmake|gradle|mvn)\b/.test(text) ||
+    /\b(npm|pnpm|yarn|bun|cargo|go)\s+(run\s+)?(build|typecheck|check)\b/.test(text)
+  ) {
+    return "构建检查";
+  }
+  if (
+    /\b(eslint|biome|ruff|prettier|flake8|mypy|pyright|clippy|gofmt|golangci-lint)\b/.test(text) ||
+    /\b(npm|pnpm|yarn|bun)\s+(run\s+)?(lint|format)\b/.test(text)
+  ) {
+    return "代码检查";
+  }
+  if (
+    /\b(npm|pnpm|yarn|bun)\s+(install|ci|add|update)\b/.test(text) ||
+    /\b(pip|pip3|uv)\s+(install|sync)\b/.test(text) ||
+    /\b(apt|apt-get|brew|apk)\s+install\b/.test(text)
+  ) {
+    return "依赖安装";
+  }
+  if (/\b(git\s+(clone|fetch|pull|push)|rsync|scp|curl|wget)\b/.test(text)) {
+    return "数据同步";
+  }
+  if (
+    /\b(uvicorn|gunicorn|next\s+dev|vite(\s|$)|webpack-dev-server|flask\s+run|manage\.py\s+runserver)\b/.test(text) ||
+    /\b(npm|pnpm|yarn|bun)\s+(run\s+)?(dev|start|preview|serve)\b/.test(text)
+  ) {
+    return "后台服务";
+  }
+  return "独立后台任务";
+}
 
 function museStatusBadge(job: SessionMuseJobItem): {
   label: string;
@@ -86,7 +187,7 @@ function mediaJobStatusBadge(job: MediaGenerationJob): {
       }
       return { label: "生成中", tone: "accent" };
     case "reconnecting":
-      return { label: "重连中", tone: "accent" };
+      return { label: "恢复中", tone: "accent" };
     case "completed":
       return { label: "已完成", tone: "success" };
     case "failed":
@@ -143,6 +244,7 @@ export function PinnedBackgroundTasksPanel({
   bgCommands,
   sessionCrons,
   now,
+  autoDismissSucceeded = true,
   onCancelMuseJob,
   onDismissMuseJob,
   onCancelMediaJob,
@@ -151,12 +253,73 @@ export function PinnedBackgroundTasksPanel({
   onDeleteSessionCron,
 }: PinnedBackgroundTasksPanelProps) {
   const [busyKeys, setBusyKeys] = useState<ReadonlySet<string>>(() => new Set());
+  const [autoHiddenIds, setAutoHiddenIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [expandedDetails, setExpandedDetails] = useState<ReadonlySet<string>>(() => new Set());
+  const dismissTimersRef = useRef(new Map<string, number>());
+  const onDismissMuseJobRef = useRef(onDismissMuseJob);
+  onDismissMuseJobRef.current = onDismissMuseJob;
 
-  const hasMedia = museJobs.length > 0 || mediaJobs.length > 0;
+  useEffect(() => {
+    const timers = dismissTimersRef.current;
+    if (!autoDismissSucceeded) {
+      for (const timer of timers.values()) window.clearTimeout(timer);
+      timers.clear();
+      return;
+    }
+    const succeededIds = new Set<string>();
+    for (const job of museJobs) {
+      if (job.status === "succeeded") succeededIds.add(job.id);
+    }
+    for (const job of mediaJobs) {
+      if (job.status === "completed") succeededIds.add(job.id);
+    }
+    for (const [id, timer] of timers) {
+      if (!succeededIds.has(id)) {
+        window.clearTimeout(timer);
+        timers.delete(id);
+      }
+    }
+    for (const id of succeededIds) {
+      if (autoHiddenIds.has(id) || timers.has(id)) continue;
+      const timer = window.setTimeout(() => {
+        timers.delete(id);
+        setAutoHiddenIds((prev) => {
+          if (prev.has(id)) return prev;
+          const next = new Set(prev);
+          next.add(id);
+          return next;
+        });
+        onDismissMuseJobRef.current?.(id);
+      }, AUTO_DISMISS_SUCCEEDED_MS);
+      timers.set(id, timer);
+    }
+  }, [autoDismissSucceeded, museJobs, mediaJobs, autoHiddenIds]);
+
+  useEffect(
+    () => () => {
+      for (const timer of dismissTimersRef.current.values()) window.clearTimeout(timer);
+      dismissTimersRef.current.clear();
+    },
+    [],
+  );
+
+  const visibleMuseJobs = museJobs.filter((j) => !(j.status === "succeeded" && autoHiddenIds.has(j.id)));
+  const visibleMediaJobs = mediaJobs.filter((j) => !(j.status === "completed" && autoHiddenIds.has(j.id)));
+
+  const hasMedia = visibleMuseJobs.length > 0 || visibleMediaJobs.length > 0;
   const hasCmds = bgCommands.length > 0;
   const hasCrons = sessionCrons.length > 0;
 
   if (!hasMedia && !hasCmds && !hasCrons) return null;
+
+  const toggleDetails = (id: string) => {
+    setExpandedDetails((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
 
   const runAction = async (key: string, fn: () => Promise<unknown> | void) => {
     if (busyKeys.has(key)) return;
@@ -184,18 +347,20 @@ export function PinnedBackgroundTasksPanel({
             <div className="oc-bg-tasks-section-head">
               <span className="oc-bg-tasks-section-title">异步媒体</span>
               <span className="oc-bg-tasks-section-count">
-                {museJobs.length + mediaJobs.length}
+                {visibleMuseJobs.length + visibleMediaJobs.length}
               </span>
             </div>
             <div className="flex flex-col gap-1.5">
-              {museJobs.map((job) => {
+              {visibleMuseJobs.map((job) => {
                 const terminal = isTerminalMuseJobStatus(job.status);
+                const succeeded = job.status === "succeeded";
                 const badge = museStatusBadge(job);
                 const anchor = job.startedAt ?? job.queuedAt;
                 const elapsed =
                   !terminal && anchor > 0 ? formatCompactElapsed(Math.max(0, now - anchor)) : "";
                 const busy = busyKeys.has(`muse:${job.id}`);
                 const prompt = firstLinePreview(job.promptPreview) || (job.kind === "video" ? "视频生成" : "图片生成");
+                const errorText = job.status === "failed" ? humanizeMediaError(job.errorCode) : null;
                 return (
                   <div
                     key={job.id}
@@ -226,15 +391,15 @@ export function PinnedBackgroundTasksPanel({
                             {elapsed}
                           </span>
                         ) : null}
-                        {job.errorCode ? (
-                          <span className="truncate text-caption text-danger" title={job.errorCode}>
-                            {job.errorCode}
+                        {errorText ? (
+                          <span className="truncate text-caption text-danger" title={errorText}>
+                            {errorText}
                           </span>
                         ) : null}
                       </div>
                     </div>
                     {terminal ? (
-                      onDismissMuseJob ? (
+                      !succeeded && onDismissMuseJob ? (
                         <Button
                           type="button"
                           variant="ghost"
@@ -262,8 +427,9 @@ export function PinnedBackgroundTasksPanel({
                 );
               })}
 
-              {mediaJobs.map((job) => {
+              {visibleMediaJobs.map((job) => {
                 const terminal = isTerminalMediaJobStatus(job.status);
+                const succeeded = job.status === "completed";
                 const badge = mediaJobStatusBadge(job);
                 const createdMs = parseIsoMs(job.createdAt);
                 const elapsed =
@@ -274,6 +440,8 @@ export function PinnedBackgroundTasksPanel({
                 const prompt =
                   firstLinePreview(job.prompt ?? "") ||
                   (job.kind === "video_compose" ? "视频合成" : "视频生成");
+                const errorText =
+                  job.status === "failed" ? humanizeMediaError(job.errorCode, job.errorMessage) : null;
                 return (
                   <div
                     key={job.id}
@@ -300,15 +468,15 @@ export function PinnedBackgroundTasksPanel({
                             {elapsed}
                           </span>
                         ) : null}
-                        {job.errorMessage ? (
-                          <span className="truncate text-caption text-danger" title={job.errorMessage}>
-                            {firstLinePreview(job.errorMessage)}
+                        {errorText ? (
+                          <span className="truncate text-caption text-danger" title={errorText}>
+                            {errorText}
                           </span>
                         ) : null}
                       </div>
                     </div>
                     {terminal ? (
-                      onDismissMuseJob ? (
+                      !succeeded && onDismissMuseJob ? (
                         <Button
                           type="button"
                           variant="ghost"
@@ -342,9 +510,9 @@ export function PinnedBackgroundTasksPanel({
         )}
 
         {hasCmds && (
-          <section className="oc-bg-tasks-section" aria-label="后台命令">
+          <section className="oc-bg-tasks-section" aria-label="后台任务">
             <div className="oc-bg-tasks-section-head">
-              <span className="oc-bg-tasks-section-title">后台命令</span>
+              <span className="oc-bg-tasks-section-title">后台任务</span>
               <span className="oc-bg-tasks-section-count">{bgCommands.length}</span>
             </div>
             <div className="flex flex-col gap-1.5">
@@ -354,7 +522,9 @@ export function PinnedBackgroundTasksPanel({
                     ? formatCompactElapsed(Math.max(0, now - cmd.startedAt))
                     : "";
                 const busy = busyKeys.has(`cmd:${cmd.id}`);
-                const preview = firstLinePreview(cmd.commandPreview) || cmd.jobId;
+                const summary = summarizeBgCommand(cmd);
+                const hasTechDetails = Boolean(cmd.commandPreview || cmd.cwd || cmd.jobId);
+                const detailsOpen = expandedDetails.has(cmd.id);
                 return (
                   <div
                     key={cmd.id}
@@ -365,23 +535,54 @@ export function PinnedBackgroundTasksPanel({
                       <AtelierIcon name="terminal" size={14} />
                     </span>
                     <div className="min-w-0 flex-1">
-                      <div
-                        className="truncate font-mono text-meta text-fg"
-                        title={cmd.commandPreview}
-                      >
-                        {preview}
-                      </div>
-                      <div className="mt-0.5 flex items-center gap-2 text-caption text-faint">
+                      <div className="truncate text-body text-fg">{summary}</div>
+                      <div className="mt-0.5 flex flex-wrap items-center gap-2 text-caption text-faint">
                         <StatusPill label="运行中" tone="accent" />
                         {elapsed ? (
                           <span className="font-mono tabular-nums">{elapsed}</span>
                         ) : null}
-                        {cmd.cwd ? (
-                          <span className="hidden truncate sm:inline" title={cmd.cwd}>
-                            {cmd.cwd}
-                          </span>
+                        {hasTechDetails ? (
+                          <button
+                            type="button"
+                            data-testid={`bg-cmd-details-toggle-${cmd.id}`}
+                            aria-expanded={detailsOpen}
+                            onClick={() => toggleDetails(cmd.id)}
+                            className="inline-flex items-center gap-0.5 text-caption text-muted underline-offset-2 hover:text-fg hover:underline"
+                          >
+                            <span>技术详情</span>
+                            {detailsOpen ? (
+                              <ChevronUp className="size-3" aria-hidden />
+                            ) : (
+                              <ChevronDown className="size-3" aria-hidden />
+                            )}
+                          </button>
                         ) : null}
                       </div>
+                      {detailsOpen && hasTechDetails ? (
+                        <div
+                          data-testid={`bg-cmd-details-${cmd.id}`}
+                          className="oc-surface-recessed mt-1.5 space-y-1 rounded-md px-2.5 py-1.5 font-mono text-caption text-muted"
+                        >
+                          {cmd.commandPreview ? (
+                            <div className="break-all">
+                              <span className="text-faint">命令：</span>
+                              {cmd.commandPreview}
+                            </div>
+                          ) : null}
+                          {cmd.cwd ? (
+                            <div className="break-all">
+                              <span className="text-faint">目录：</span>
+                              {cmd.cwd}
+                            </div>
+                          ) : null}
+                          {cmd.jobId ? (
+                            <div className="break-all">
+                              <span className="text-faint">编号：</span>
+                              {cmd.jobId}
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
                     </div>
                     {onCancelBgCommand ? (
                       <Button
@@ -389,7 +590,7 @@ export function PinnedBackgroundTasksPanel({
                         variant="ghost"
                         size="sm"
                         disabled={busy}
-                        aria-label={`终止后台命令：${preview}`}
+                        aria-label={`终止后台任务：${summary}`}
                         className="shrink-0 text-muted hover:bg-danger/10 hover:text-danger"
                         onClick={() =>
                           void runAction(`cmd:${cmd.id}`, () => onCancelBgCommand(cmd.id))

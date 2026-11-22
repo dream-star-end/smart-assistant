@@ -108,7 +108,6 @@ function useBoundChatSocket(socket: ChatSocket): UseChatSocket {
     applyDurableLiveFrames: () => {},
     runDurableLiveFrameHydration: async () => {},
     hydrateDurableLiveFrameJournal: async () => {},
-    retryLiveJournalHydration: async () => {},
     storedMaxSeq: () => 0,
     storedHistoryRevision: () => undefined,
     loadOlderHistory: async () => ({ ok: true, loaded: 0, hasMore: false }),

@@ -959,17 +959,6 @@ function actionPhrase(message: ChatMessage): string {
   }
 }
 
-export function rawAuditCommand(message: ChatMessage): string {
-  if (message.role !== "tool") return "";
-  const original = commandText(message).trim();
-  if (!original) return "";
-  // Classify the unwrapped head, but show the command the transcript actually stored.
-  const head = reliableHeadCall(stripShellWrapperForDisplay(original).trim());
-  if (head?.bin !== "oc-memory") return "";
-  if (head.op !== "delegate" && head.op !== "delegate-wait" && head.op !== "request-review") return "";
-  return original;
-}
-
 /** 「委派给 质量审查员：检查报告格式」;并行委派列出各自接手的子代理与子任务数。 */
 export function delegateTitle(rows: readonly ChatMessage[]): string {
   const names = [...new Set(rows.map((message) => agentDisplayName(message._delegateAgentId) || "子代理"))];

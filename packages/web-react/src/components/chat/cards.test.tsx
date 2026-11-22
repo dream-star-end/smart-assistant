@@ -906,12 +906,11 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
   });
 
-  // W3(#1206 错误目录):上下文超限的建议是精简这条消息或换更长上下文的模型,不再引导新建会话。
+  // W3(#1206 错误目录) / OCV5-841:上下文超限在未提供 onStartNewSession 时回落「修改消息」+「切换模型」,无重试类按钮。
   test("context_too_long →「修改消息」+「切换模型」,无重试类按钮", () => {
     const onEditResend = vi.fn();
     const onOpenModelPicker = vi.fn();
     renderErr(errMsg({ _errorCode: "context_too_long", _clientMessageId: "u1" }), {
-      onStartNewSession: vi.fn(),
       onEditResend,
       onOpenModelPicker,
       onRetrySend: vi.fn(),
@@ -1348,7 +1347,7 @@ describe("AssistantCard 中断轮展示（requestId / 正文 / 空窗占位）",
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
-  test("records_unpublished 且无可显示正文时给出过程整理占位", () => {
+  test("records_unpublished 静默补齐，不在错误/中断卡旁叠显「过程记录整理中…」", () => {
     renderErr(errMsg({
       _errorCode: "USER_CANCELLED",
       text: "",
@@ -1356,11 +1355,11 @@ describe("AssistantCard 中断轮展示（requestId / 正文 / 空窗占位）",
       _displayDegraded: true,
     }), {});
     expect(screen.getByRole("status", { name: "已停止生成" })).toBeInTheDocument();
-    expect(screen.getByRole("status", { name: "过程记录整理中" })).toBeInTheDocument();
-    expect(screen.getByText("过程记录整理中…")).toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "过程记录整理中" })).toBeNull();
+    expect(screen.queryByText("过程记录整理中…")).toBeNull();
   });
 
-  test("records_unpublished 但已有正文时不再占位", () => {
+  test("records_unpublished 但已有正文时不插整理占位", () => {
     renderErr(errMsg({
       _errorCode: "USER_CANCELLED",
       text: "终稿可见的一段话。",
@@ -1371,7 +1370,7 @@ describe("AssistantCard 中断轮展示（requestId / 正文 / 空窗占位）",
     expect(screen.queryByRole("status", { name: "过程记录整理中" })).toBeNull();
   });
 
-  test("物化完成后没有 degrade 字段则占位消失（刷新后仍只看服务端字段）", () => {
+  test("物化完成后没有 degrade 字段则保持正常终态与用量显示", () => {
     renderErr(errMsg({
       _errorCode: "USER_CANCELLED",
       text: "",
@@ -1384,7 +1383,7 @@ describe("AssistantCard 中断轮展示（requestId / 正文 / 空窗占位）",
     expect(screen.getByLabelText("消耗 12 积分")).toBeInTheDocument();
   });
 
-  test("空窗 fallback 有 usage 时露出 requestId/积分，占位不是正文气泡", () => {
+  test("空窗 fallback 有 usage 时静默补齐过程记录且保留 requestId/积分", () => {
     renderErr(errMsg({
       _errorCode: "USER_CANCELLED",
       text: "",
@@ -1392,15 +1391,34 @@ describe("AssistantCard 中断轮展示（requestId / 正文 / 空窗占位）",
       _displayDegraded: true,
       usage: { traceId: "req-gap-window", costCredits: "256" },
     }), {});
-    const pending = screen.getByRole("status", { name: "过程记录整理中" });
-    expect(pending.tagName.toLowerCase()).toBe("output");
-    expect(pending).toHaveTextContent("过程记录整理中…");
-    expect(screen.queryByText("过程记录正在整理，稍后会自动补齐思考与工具卡片。")).toBeNull();
+    expect(screen.queryByRole("status", { name: "过程记录整理中" })).toBeNull();
+    expect(screen.queryByText("过程记录整理中…")).toBeNull();
     expect(screen.getByRole("button", { name: "复制请求ID req-gap-window" })).toBeInTheDocument();
     expect(screen.getByLabelText("消耗 256 积分")).toBeInTheDocument();
     const row = screen.getByTestId("assistant-row");
     expect(row.querySelector("[data-testid=message-text]")).toBeNull();
-    expect(pending.closest("[data-testid=assistant-row]")).toBe(row);
+  });
+
+  test("合并空回复兜底：存量 _emptyTurnTimeout 非末轮隐藏，末轮不提示「刷新或同步后可见」", () => {
+    const { rerender } = render(
+      <AssistantCard
+        msg={errMsg({ _errorCode: undefined, _isError: false, text: "", _emptyTurn: true, _emptyTurnTimeout: true })}
+        ctx={{ isLast: false, sending: false, inActiveTurn: false }}
+        cb={{}}
+      />,
+    );
+    expect(screen.queryByTestId("empty-turn-notice")).toBeNull();
+
+    rerender(
+      <AssistantCard
+        msg={errMsg({ _errorCode: undefined, _isError: false, text: "", _emptyTurn: true, _emptyTurnTimeout: true })}
+        ctx={{ isLast: true, sending: false, inActiveTurn: true }}
+        cb={{}}
+      />,
+    );
+    const notice = screen.getByTestId("empty-turn-notice");
+    expect(notice).toBeInTheDocument();
+    expect(notice.textContent ?? "").not.toContain("刷新或同步后可见");
   });
 });
 

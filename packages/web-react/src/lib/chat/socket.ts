@@ -19,6 +19,7 @@ import { applyAutomaticRecoverySnapshot } from "./automaticRecoverySnapshot";
 import { confirmDispatchDelivery, confirmSnapshotDelivery } from "./deliveryConfirm";
 import {
   applyControlReceipt,
+  DegradedJournalRetryTracker,
   hydrateStoredControls,
   persistControlWithFallback,
   reconcileOrphanControlPending,
@@ -27,7 +28,7 @@ import {
   type PendingControlItem,
 } from "./controlReceipts";
 import { contextRebuiltRow } from "./contextRebuilt";
-import { SocketMetaTracker, STOP_SETTLEMENT_TIMEOUT_NOTICE } from "./socketMeta";
+import { SocketMetaTracker } from "./socketMeta";
 import { applyRecoveryStatusFrame, rememberRetryStatus } from "./retryStatus";
 import {
   ensureFirstTextPaintVisibilityTracking,
@@ -358,6 +359,8 @@ export type ChatSocketDeps = {
       isCurrent?: () => boolean;
       /** Phase-B projection healing does not replay a terminal live journal. */
       tapeProjectionOnly?: boolean;
+      /** Notifies bounded background retry that the error is permanent (400/401/403/404/410). */
+      onPermanentError?: () => void;
     },
   ) => Promise<boolean | void> | boolean | void;
   /** Every successful WS open (initial or reconnect) refreshes the selected
@@ -933,6 +936,7 @@ export class ChatSocket {
     timer: ReturnType<typeof setTimeout> | null;
     inFlight: boolean;
   }>();
+  private readonly degradedJournalRetries = new DegradedJournalRetryTracker();
   /** Sessions this WS has subscribed with a hello. Each subscription is answered by
    * one `outbound.session_snapshot`; a session loaded later subscribes once. */
   private readonly subscribedSessions = new Set<string>();
@@ -1250,6 +1254,7 @@ export class ChatSocket {
       if (state.timer) clearTimeout(state.timer);
     }
     this.unpublishedTapeRetries.clear();
+    this.degradedJournalRetries.clearAll();
     for (const t of this.controlPersistRetryTimers.values()) clearTimeout(t);
     this.controlPersistRetryTimers.clear();
     this.metaTracker.clearAllStopTimers();
@@ -1366,7 +1371,6 @@ export class ChatSocket {
     const row = contextRebuiltRow(sess, frame); // 按 noticeId 去重(旧帧退回 frameSeq/ts)
     if (!row) return;
     addMessage(sess, "system", row.text, { id: row.id, _source: "local" });
-    this.setTransientNotice(sess.id, row.text); // 仅 turn 进行中显示的 live flash
     this.deps.persistSession?.(sess.id); // durable:落 IndexedDB
     this.scheduleNotify();
   }
@@ -1624,6 +1628,14 @@ export class ChatSocket {
     this.kickDispatchPump();
   }
 
+  private clearLiveJournalDegraded(sess: ChatSession): void {
+    if (sess._liveJournalDegraded) sess._liveJournalDegraded = false;
+    this.degradedJournalRetries.clear(sess.id);
+  }
+  private scheduleDegradedJournalRetry(sessId: string): void {
+    this.degradedJournalRetries.schedule(sessId, { getSession: (id) => this.sessions.get(id), getEpoch: () => this.lifecycleEpoch, syncSession: this.deps.syncSession });
+  }
+
   private clearSendingState(
     sess: ChatSession,
     opts: {
@@ -1635,6 +1647,7 @@ export class ChatSocket {
     sess._sendingInFlight = false;
     sess._activeClientMessageId = undefined;
     sess._activeAgentId = undefined;
+    this.clearLiveJournalDegraded(sess);
     if (opts.clearTiming !== false) clearTurnTiming(sess);
     if (opts.resetTracker !== false) resetReplyTracker(sess);
     sess._localTeardownAt = typeof sess._trackerResetAt === "number" ? sess._trackerResetAt : Date.now();
@@ -1648,7 +1661,7 @@ export class ChatSocket {
   private effects(): FrameEffects {
     return {
       onFinal: (sess, frame, isCronOrHeartbeat, clientMessageId) => {
-        if (!isCronOrHeartbeat) this.reportRecoveredProblemCard(sess, frame, clientMessageId);
+        if (!isCronOrHeartbeat) { this.reportRecoveredProblemCard(sess, frame, clientMessageId); this.clearLiveJournalDegraded(sess); }
         this.clearTransientNotice(sess.id); // turn 收尾：清 transient 软提示
         if (!isCronOrHeartbeat) {
           settleTurnStopSettlement(sess, frame.clientMessageId ?? clientMessageId, (id, s) => this.settleControl(id, s));
@@ -1691,7 +1704,9 @@ export class ChatSocket {
         }
       },
       onLiveFrame: (sess) => {
-        if (sess._sendingInFlight) this.clearTransientNotice(sess.id); // 有新 live 帧 = 内容仍在流，清软提示
+        if (!sess._sendingInFlight) return;
+        this.clearTransientNotice(sess.id); // 有新 live 帧 = 内容仍在流，清软提示
+        if (!this.durableHydrationStates.has(sess.id)) this.clearLiveJournalDegraded(sess);
       },
       scheduleAutoContinue: (sessId, targetMsgId, cls) => {
         setTimeout(() => this.autoContinueEmptyTurn(sessId, targetMsgId, cls), 0);
@@ -2104,6 +2119,7 @@ export class ChatSocket {
           const ownsActiveTurn = !frame.clientMessageId ||
             activeClientMessageId === frame.clientMessageId;
           applyOutboundError(sess, frame, this.effects());
+          if (!sess._sendingInFlight) this.clearLiveJournalDegraded(sess);
           // 释放 peer slot(恢复子轮要占同一 slot)。红卡若被延后,由恢复宽限按快照收口。
           this.finishDispatch(sess.id, frame.clientMessageId ?? (ownsActiveTurn ? activeClientMessageId : undefined));
           // 错误终态也不经 onFinal/clearSendingState → 同样要收口恢复条。
@@ -2126,6 +2142,7 @@ export class ChatSocket {
           const ownsActiveTurn = !frame.clientMessageId ||
             activeClientMessageId === frame.clientMessageId;
           applyLegacyBridgeError(sess, frame, this.effects());
+          if (!sess._sendingInFlight) this.clearLiveJournalDegraded(sess);
           this.finishDispatch(sess.id, frame.clientMessageId ?? (ownsActiveTurn ? activeClientMessageId : undefined));
           // 错误终态也不经 onFinal/clearSendingState → 同样要收口恢复条。
           // 红卡被延后时本轮仍是软在飞状态，owner 未清，横幅不会被误摘。
@@ -3303,7 +3320,8 @@ export class ChatSocket {
       if (last.streamKey && last.dispatch) {
         sess._snapshotStream = { streamKey: last.streamKey, agentId: last.dispatch.agentId || "main" };
       }
-      if (pages.degraded && !recoveredViaUnits) sess._liveJournalDegraded = true;
+      if (pages.degraded && !recoveredViaUnits) { sess._liveJournalDegraded = true; this.scheduleDegradedJournalRetry(sessId); }
+      else this.clearLiveJournalDegraded(sess);
       if (!this.applySnapshotHead(sess, last, fresh, true, ctx.asked) && settled) {
         this.syncHistory(sessId, { clientMessageId: settled });
       }
@@ -3699,6 +3717,7 @@ export class ChatSocket {
       void this.deps.deletePendingControl?.(sessId, item.controlId).catch(() => {});
     }
     this.clearUnpublishedTapeRetry(sessId);
+    this.degradedJournalRetries.clear(sessId);
     this.durableLiveJournalCheckpoints.delete(sessId);
     const safeId = String(sessId).replace(/[^a-zA-Z0-9_-]/g, "_");
     const suffix = `:webchat:dm:${safeId}`;
@@ -3748,6 +3767,7 @@ export class ChatSocket {
       if (state.timer) clearTimeout(state.timer);
     }
     this.unpublishedTapeRetries.clear();
+    this.degradedJournalRetries.clearAll();
     for (const timer of this.controlPersistRetryTimers.values()) clearTimeout(timer);
     this.controlPersistRetryTimers.clear();
     for (const pending of this.pendingRecoveryErrors.values()) clearTimeout(pending.timer);
@@ -4329,6 +4349,7 @@ export class ChatSocket {
     reconcileOrphanControlPending(s, this.controlQueue);
     // 终态收敛(RFC §5 M5):载荷自证已收尾的 turn → 清发送态 + 落 user 行终态(显式,不巧合)。
     this.convergeTerminalTurns(s, terminalTurns);
+    if (!s._sendingInFlight) this.clearLiveJournalDegraded(s);
     this.reconcileUnpublishedTapeRetry(sessId);
     this.scheduleNotify();
     const tailRecoverableError = [...s.messages].reverse().find((message) =>
@@ -4546,35 +4567,24 @@ export class ChatSocket {
               }
               if (firstPage.nextCursor) cursor = firstPage.nextCursor;
               if (firstPage.hasMore) await readPages(stagedFrames);
-              this.applyDurableLiveFrames(
-                sessId,
-                stagedFrames,
-                [...resetOwnerIds],
-                lastDurableFrameSeqBySessionKey,
-              );
+              const sessRaw = this.sessions.get(sessId);
+              const safeResets = degraded && sessRaw ? [...resetOwnerIds].filter((id) => !shouldKeepLocalRowsOnDegradedRebuild(sessRaw, latestSnapshot?.streamKey, id, true, degraded)) : [...resetOwnerIds];
+              this.applyDurableLiveFrames(sessId, stagedFrames, safeResets, lastDurableFrameSeqBySessionKey);
               if (!degraded) await readPages(null);
               usedUnits = true;
             }
           } catch (error) {
-            if (isLiveJournalAbort(error)) {
-              degraded = true;
-            } else {
-              usedUnits = false;
-            }
+            if (isLiveJournalAbort(error)) degraded = true;
+            else usedUnits = false;
           }
         }
         if (!usedUnits) {
           const stagedFrames: DurableLiveFrame[] = [];
           await readPages(stagedFrames);
-          this.applyDurableLiveFrames(
-            sessId,
-            stagedFrames,
-            [...resetOwnerIds],
-            lastDurableFrameSeqBySessionKey,
-          );
-          if (!degraded) {
-            await readPages(null);
-          }
+          const sessRaw = this.sessions.get(sessId);
+          const safeResets = degraded && sessRaw ? [...resetOwnerIds].filter((id) => !shouldKeepLocalRowsOnDegradedRebuild(sessRaw, latestSnapshot?.streamKey, id, true, degraded)) : [...resetOwnerIds];
+          this.applyDurableLiveFrames(sessId, stagedFrames, safeResets, lastDurableFrameSeqBySessionKey);
+          if (!degraded) await readPages(null);
         }
       } else {
         await readPages(null);
@@ -4633,7 +4643,8 @@ export class ChatSocket {
       }
 
       if (sess) {
-        sess._liveJournalDegraded = degraded;
+        if (degraded) { sess._liveJournalDegraded = true; this.scheduleDegradedJournalRetry(sessId); }
+        else this.clearLiveJournalDegraded(sess);
         this.scheduleNotify();
       }
 
@@ -6027,7 +6038,6 @@ export class ChatSocket {
       item.state = "persisting";
       // Claimed = being sent. 「待发送」只留给真正排在别的回合后面的消息。
       this.setUserRowStatus(item, "sending");
-      this.setTransientNotice(sess.id, "正在发送…");
       if(this.deps.authorizeSwitch&&item.payload.model&&!item.payload.content.imageEdit){
         void authorizeQueuedModelSwitch(item,this.deps.authorizeSwitch,{
           queue:this.offlineQueue,slots:this.dispatchSlots,sessions:this.sessions,
@@ -6049,10 +6059,10 @@ export class ChatSocket {
     if (!this.offlineQueue.includes(item) || item.state !== "persisting") return;
     // Local recovery storage is an enhancement, not a delivery gate. Keep the
     // exact in-memory identity until the server ACK and send immediately.
-    this.sendPersistedDispatch(item, false);
+    this.sendPersistedDispatch(item);
   }
 
-  private sendPersistedDispatch(item: OfflineItem, journalCommitted = true): void {
+  private sendPersistedDispatch(item: OfflineItem): void {
     if (!this.offlineQueue.includes(item) || item.state !== "persisting") return;
     if (
       !this.ws || this.ws.readyState !== 1 || !this.relayReady ||
@@ -6081,8 +6091,7 @@ export class ChatSocket {
       sess._streamingAssistant = null;
       sess._streamingThinking = null;
     }
-    if (journalCommitted) this.clearTransientNotice(sess.id);
-    else this.setTransientNotice(sess.id, "正在确认发送…");
+    this.clearTransientNotice(sess.id);
     this.scheduleNotify();
     this.deps.persistSession?.(sess.id);
   }
@@ -6317,7 +6326,6 @@ export class ChatSocket {
         void this.deps.deletePendingControl?.(sess.id, controlId)?.catch(() => {});
         if (activeClientMessageId) this.finishDispatch(sess.id, activeClientMessageId);
         cur._stopSettlement = undefined; this.clearSendingState(cur); cur._recoveryStatus = { kind: "completed" };
-        this.transientNotices.set(sess.id, { text: STOP_SETTLEMENT_TIMEOUT_NOTICE, ts: Date.now() });
         this.deps.persistSession?.(sess.id); this.scheduleNotify(); void this.deps.syncSession?.(sess.id);
       });
       this.enqueueControl({

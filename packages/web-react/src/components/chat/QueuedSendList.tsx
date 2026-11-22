@@ -22,11 +22,16 @@ export function QueuedSendList({
   return (
     <div className="mx-auto mb-2 w-full max-w-3xl px-4" data-testid="queued-send-list">
       <div className="oc-surface-glass overflow-hidden rounded-2xl shadow-soft">
-        <div className="flex items-center gap-2 border-b border-border/60 px-3.5 py-2 text-caption font-medium text-muted">
-          <span className="oc-icon-badge oc-icon-badge-accent flex size-5 items-center justify-center rounded-sm">
-            <Clock3 size={11} strokeWidth={1.75} aria-hidden="true" />
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 border-b border-border/60 px-3.5 py-2 text-caption">
+          <span className="inline-flex items-center gap-2 font-medium text-muted">
+            <span className="oc-icon-badge oc-icon-badge-accent flex size-5 shrink-0 items-center justify-center rounded-sm">
+              <Clock3 size={11} strokeWidth={1.75} aria-hidden="true" />
+            </span>
+            <span className="tabular-nums">待发送 {messages.length}</span>
           </span>
-          <span className="tabular-nums">待发送 {messages.length}</span>
+          <span className="text-faint" data-testid="queued-send-billing-note">
+            本轮结束后自动发出，另行计费
+          </span>
         </div>
         <ul className="flex max-h-[min(13rem,30dvh)] flex-col gap-0.5 overflow-y-auto p-1.5">
           {messages.map((message) => {

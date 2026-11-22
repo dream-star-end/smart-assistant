@@ -12,7 +12,7 @@ import { cn } from "../../lib/utils";
 import { ActionTrail, AddressBar, PlainSignedImg, ShotThumb } from "../tool/BrowserStepCard";
 import { type BrowserTurnStep, collectBrowserSteps, displayAddress } from "../tool/browserSteps";
 import type { ToolLike } from "../tool/format";
-import { Spinner, StatusPill } from "../ui";
+import { Spinner } from "../ui";
 import type { LiveBrowserHandoffRequest } from "./inspectorState";
 import { SignedImg } from "./media";
 import { TurnBar } from "./OutputsView";
@@ -210,7 +210,6 @@ function TurnBrowser({
   const item = steps[current];
   const latestIdx = defaultIndex(steps, null);
   const viewingHistory = steps.length > 1 && pickedIndex >= 0 && current !== latestIdx;
-  const isLive = running || Boolean(item?.step.running);
 
   return (
     <>
@@ -225,47 +224,25 @@ function TurnBrowser({
       />
       {item ? (
         <>
-          <div
-            className={cn(
-              "oc-callout mx-4 mb-3 flex flex-wrap items-center gap-x-2.5 gap-y-1.5 rounded-md px-3.5 py-2 text-caption text-muted",
-              isLive && !viewingHistory
-                ? "oc-callout-info"
-                : viewingHistory
-                  ? "oc-callout-warning"
-                  : "oc-callout-success",
-            )}
-            data-testid="browser-status-banner"
-          >
-            {isLive && !viewingHistory ? (
-              <>
-                <StatusPill variant="pill" tone="running" mark="ring" label="实时快照跟随中" className="text-caption font-medium text-fg" />
-                <span className="min-w-0 flex-1">
-                  助手正在操作浏览器，截图随新步骤自动更新；点击下方记录可回看历史快照。
-                </span>
-              </>
-            ) : viewingHistory ? (
-              <>
-                <StatusPill variant="pill" tone="attention" label={`历史快照 · 第 ${current + 1} / ${steps.length} 步`} className="text-caption font-medium text-fg" />
-                <span className="min-w-0 flex-1">当前为只读快照回放，点击右侧可恢复最新画面。</span>
-                <button
-                  type="button"
-                  onClick={() => setPickedId(null)}
-                  data-testid="browser-back-latest"
-                  className="oc-btn-tactile oc-btn-secondary-craft inline-flex min-h-7 shrink-0 items-center gap-1 rounded-full px-2.5 text-caption font-medium text-accent outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
-                >
-                  <ArrowDownToLine size={12} aria-hidden />
-                  回到最新
-                </button>
-              </>
-            ) : (
-              <>
-                <StatusPill variant="pill" tone="done" label="会话快照回放" className="text-caption font-medium text-fg" />
-                <span className="min-w-0 flex-1">
-                  展示本轮浏览器最新页面快照（只读回放）；点击下方记录切换步骤，或点击地址栏打开页面。
-                </span>
-              </>
-            )}
-          </div>
+          {viewingHistory && (
+            <div
+              className="oc-callout oc-callout-warning mx-4 mb-3 flex items-center justify-between gap-2 rounded-md px-3 py-1.5 text-caption text-muted"
+              data-testid="browser-status-banner"
+            >
+              <span className="min-w-0 truncate">
+                正在查看历史步骤（第 {current + 1} / {steps.length} 步）
+              </span>
+              <button
+                type="button"
+                onClick={() => setPickedId(null)}
+                data-testid="browser-back-latest"
+                className="oc-btn-tactile oc-btn-secondary-craft inline-flex min-h-7 shrink-0 items-center gap-1 rounded-full px-2.5 text-caption font-medium text-accent outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+              >
+                <ArrowDownToLine size={12} aria-hidden />
+                回到最新
+              </button>
+            </div>
+          )}
           {/* key:换一步时缩略图选择从头来。 */}
           <Window key={idOf(item.message) || current} item={item} steps={steps} index={current} />
           <section className="px-4 pt-5 pb-6" data-testid="browser-log">

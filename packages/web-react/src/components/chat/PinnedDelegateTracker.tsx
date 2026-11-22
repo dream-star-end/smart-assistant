@@ -21,6 +21,8 @@ import { agentDisplayName } from "./agentNames";
 import { HUD_LIST_CLS, HUD_TOGGLE_CLS, useHudListOverflow } from "./PinnedTaskTracker";
 
 const AUTO_COLLAPSE_MS = 3000;
+/** 成功终态条目短暂展示后自动静默收起，不再强迫用户点「知道了」。 */
+export const AUTO_DISMISS_SUCCEEDED_MS = 4000;
 const MAX_TERMINAL = 5;
 
 function firstLine(text: string): string {
@@ -45,7 +47,7 @@ function isFailureState(state: string): boolean {
   return state === "failed" || state === "cancelled" || state === "killed_by_cutover";
 }
 
-/** 终态 / 非终态的人话标签(状态标的 title / aria-label,H-07)。 */
+/** 终态 / 非终态的人话标签(状态标的 title / aria-label,H-07)，不外泄 cutover 等内部词。 */
 export function delegateStateLabel(state: string): string {
   switch (state) {
     case "running":
@@ -53,7 +55,7 @@ export function delegateStateLabel(state: string): string {
     case "queued":
       return "排队中";
     case "paused_for_cutover":
-      return "已暂停（等待切换）";
+      return "已暂停，稍后自动恢复";
     case "completed":
       return "已完成";
     case "failed":
@@ -61,10 +63,26 @@ export function delegateStateLabel(state: string): string {
     case "cancelled":
       return "已取消";
     case "killed_by_cutover":
-      return "因切换被终止";
+      return "服务更新时已中断";
     default:
-      return state;
+      return "处理中";
   }
+}
+
+/** 将内部状态词 / 裸错误码型的结果摘要翻成人话，保留自然语言摘要。 */
+function humanizeDelegateSummary(state: string, rawSummary?: string): string {
+  const line = firstLine(rawSummary ?? "");
+  if (!line) {
+    return state === "killed_by_cutover" ? "服务更新时任务已中断，如需可重新发起" : "";
+  }
+  const lower = line.toLowerCase();
+  if (lower.includes("cutover") || line.includes("切换时被终止")) {
+    return "服务更新时任务已中断，如需可重新发起";
+  }
+  if (/^[a-z0-9_:-]{3,}$/i.test(line) && (line.includes("_") || line === line.toUpperCase())) {
+    return isFailureState(state) ? "任务未能完成，请稍后重试" : "";
+  }
+  return line;
 }
 
 function visibleDelegateItems(items: InflightDelegateItem[]): InflightDelegateItem[] {
@@ -112,10 +130,11 @@ function DelegateRow({
 }) {
   const [cancelling, setCancelling] = useState(false);
   const terminal = isTerminalDelegateState(item.state);
+  const succeeded = item.state === "completed";
   const goalLine = firstLine(item.goal);
   const hint = item.liveHint.trim();
-  // 终态一律显示摘要(H-01):失败 / 取消 / 被终止的原因就在 resultSummary 里,以前只给 completed 看。
-  const summary = terminal ? firstLine(item.resultSummary ?? "") : "";
+  // 终态一律显示人话摘要(H-01):失败 / 取消 / 被终止的原因翻译后展示，避免暴露内部状态词。
+  const summary = terminal ? humanizeDelegateSummary(item.state, item.resultSummary) : "";
   const name = agentDisplayName(item.agentId) || item.agentId;
   const handleCancel = async (e: React.MouseEvent<HTMLButtonElement>) => {
     e.stopPropagation();
@@ -147,25 +166,27 @@ function DelegateRow({
         {summary ? (
           <div
             className={cn("truncate", isFailureState(item.state) ? "text-danger" : "text-faint")}
-            title={item.resultSummary}
+            title={summary}
           >
             {summary}
           </div>
         ) : null}
       </div>
       {terminal ? (
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="shrink-0"
-          onClick={(e) => {
-            e.stopPropagation();
-            onDismiss(item.jobId);
-          }}
-        >
-          知道了
-        </Button>
+        !succeeded ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="shrink-0"
+            onClick={(e) => {
+              e.stopPropagation();
+              onDismiss(item.jobId);
+            }}
+          >
+            知道了
+          </Button>
+        ) : null
       ) : onCancel ? (
         <Button
           type="button"
@@ -185,18 +206,74 @@ function DelegateRow({
 
 export function PinnedDelegateTracker({
   items,
+  autoDismissSucceeded = true,
   onDismiss,
   onCancel,
   onStop,
 }: {
   items: InflightDelegateItem[];
+  /** 为 false 时由外层容器（如 LiveAgentCapsule）统一管理成功终态自动收起，避免重复计时。 */
+  autoDismissSucceeded?: boolean;
   onDismiss: (jobId: string) => void;
   onCancel?: (jobId: string) => Promise<boolean> | void;
   onStop?: () => void;
 }) {
-  const visible = useMemo(() => visibleDelegateItems(items), [items]);
+  const [autoHiddenIds, setAutoHiddenIds] = useState<ReadonlySet<string>>(() => new Set());
+  const autoTimersRef = useRef(new Map<string, number>());
+  const onDismissRef = useRef(onDismiss);
+  onDismissRef.current = onDismiss;
+
+  useEffect(() => {
+    const timers = autoTimersRef.current;
+    if (!autoDismissSucceeded) {
+      for (const timer of timers.values()) window.clearTimeout(timer);
+      timers.clear();
+      return;
+    }
+    const succeededIds = new Set<string>();
+    for (const item of items) {
+      if (item.state === "completed") succeededIds.add(item.jobId);
+    }
+    for (const [id, timer] of timers) {
+      if (!succeededIds.has(id)) {
+        window.clearTimeout(timer);
+        timers.delete(id);
+      }
+    }
+    for (const id of succeededIds) {
+      if (autoHiddenIds.has(id) || timers.has(id)) continue;
+      const timer = window.setTimeout(() => {
+        timers.delete(id);
+        setAutoHiddenIds((prev) => {
+          if (prev.has(id)) return prev;
+          const next = new Set(prev);
+          next.add(id);
+          return next;
+        });
+        onDismissRef.current(id);
+      }, AUTO_DISMISS_SUCCEEDED_MS);
+      timers.set(id, timer);
+    }
+  }, [autoDismissSucceeded, items, autoHiddenIds]);
+
+  useEffect(
+    () => () => {
+      for (const timer of autoTimersRef.current.values()) window.clearTimeout(timer);
+      autoTimersRef.current.clear();
+    },
+    [],
+  );
+
+  const visible = useMemo(
+    () =>
+      visibleDelegateItems(items).filter(
+        (item) => !(item.state === "completed" && autoHiddenIds.has(item.jobId)),
+      ),
+    [items, autoHiddenIds],
+  );
   const live = visible.filter((item) => !isTerminalDelegateState(item.state));
   const terminal = visible.filter((item) => isTerminalDelegateState(item.state));
+  const dismissibleTerminal = terminal.filter((item) => item.state !== "completed");
   const running = live.filter((item) => isRunningState(item.state));
   const latestRunning =
     (running.length > 0 ? running : live).slice().sort((a, b) => b.updatedAt - a.updatedAt)[0] ??
@@ -261,7 +338,7 @@ export function PinnedDelegateTracker({
     setExpanded((v) => !v);
   };
   const dismissAll = () => {
-    for (const item of terminal) onDismiss(item.jobId);
+    for (const item of dismissibleTerminal) onDismiss(item.jobId);
   };
 
   const elapsedMs = latestRunning
@@ -337,8 +414,8 @@ export function PinnedDelegateTracker({
               <span className="hidden sm:inline">停止本轮</span>
             </Button>
           ) : null}
-          {/* 全部结束且 ≥2 条时一键清除(H-13):逐个 onDismiss,不改 App 接线。 */}
-          {!hasRunning && live.length === 0 && terminal.length >= 2 ? (
+          {/* 全部结束且 ≥2 条需人工确认的失败/取消项时一键清除(H-13):逐个 onDismiss,不改 App 接线。 */}
+          {!hasRunning && live.length === 0 && dismissibleTerminal.length >= 2 ? (
             <Button
               type="button"
               size="sm"

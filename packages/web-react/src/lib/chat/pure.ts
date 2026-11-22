@@ -438,20 +438,20 @@ export function summarizeSystemCallbackUserTurn(
       /\bsurvivor committed\b/.test(text) ||
       (text.includes("已满足") && text.includes("已在线"))
     ) {
-      return "系统回调 · 发布列车已上线";
+      return "发布已上线";
     }
     if (/终态:\s*failed\b/.test(text) || text.includes("未通过") || text.includes("失败")) {
-      return "系统回调 · 发布列车未通过，Agent 正在处理";
+      return "发布未通过，正在处理";
     }
-    return "系统回调 · 发布列车状态已更新";
+    return "发布状态已更新";
   }
   if (id.startsWith("dlgcb-") || text.includes("子任务已完成") || text.includes("后台子任务")) {
-    return "系统回调 · 后台子任务已返回结果";
+    return "后台任务已完成";
   }
   if (id.startsWith("cron-origin-") || text.startsWith("⏰")) {
-    return "系统回调 · 定时任务已触发";
+    return "定时任务已触发";
   }
-  return "系统回调 · 系统通知已送达";
+  return "系统通知已送达";
 }
 
 /** Walk newest-first to the last user utterance that is not a recovery control row. */
@@ -577,31 +577,26 @@ export function computeTypingLabel(p: {
   // 启动态只在帧仍在流动时可信:断线/切后台期间收不到 gateway 的清态帧,超过 STALE_WARN_MS
   // 无新数据就落到下方诚实文案,不再宣称「正在启动引擎 (1184s)」(INC-20261028-STALE-ENGINE-STARTING)。
   const startupFresh = silenceMs < STALE_WARN_MS && !detached;
-  if (turnStatus === "engine_starting" && startupFresh) {
-    return { text: `${name} 正在启动引擎${secs >= 3 ? ` (${secs}s)` : ""}…`, cls: "engine-starting" };
-  }
-  if (turnStatus === "engine_resuming" && startupFresh) {
-    return { text: `${name} 正在恢复会话${secs >= 3 ? ` (${secs}s)` : ""}…`, cls: "engine-starting" };
+  if ((turnStatus === "engine_starting" || turnStatus === "engine_resuming") && startupFresh) {
+    return { text: `${name} 正在准备中${secs >= 3 ? ` (${secs}s)` : ""}…`, cls: "engine-starting" };
   }
   if (transport !== "connected" && silenceMs >= STALE_WARN_MS) {
     return {
-      text: `${name} 连接已断开，正在重连…回合可能仍在后台运行 (已发送 ${formatSentElapsed(secs)})`,
+      text: `${name} 正在后台处理中 (已发送 ${formatSentElapsed(secs)})`,
       cls: "stale-danger",
     };
   }
   if (detached) {
     return {
-      text: `${name} 后台运行中，断线期间的过程可能未同步，完成后将显示完整答复 (已发送 ${formatSentElapsed(secs)})`,
+      text: `${name} 正在后台处理中 (已发送 ${formatSentElapsed(secs)})`,
       cls: "stale-warn",
     };
   }
   if (silenceMs >= STALE_DANGER_MS) {
-    const sil = Math.round(silenceMs / 1000);
-    return { text: `${name} 处理时间较长,仍在思考中 (${secs}s · ${sil}s 无新数据)`, cls: "stale-danger" };
+    return { text: `${name} 处理时间较长，仍在思考中 (${secs}s)`, cls: "stale-danger" };
   }
   if (silenceMs >= STALE_WARN_MS) {
-    const sil = Math.round(silenceMs / 1000);
-    return { text: `${name} 深度思考中 (${secs}s · ${sil}s 无新数据)`, cls: "stale-warn" };
+    return { text: `${name} 深度思考中 (${secs}s)`, cls: "stale-warn" };
   }
   // 模型已开始应答、思考块进行中(gateway 权威):明确告诉用户在深度思考,不是在启动。
   if (progressHint === MODEL_THINKING_WORKING_DETAIL) {
@@ -729,13 +724,13 @@ const CLOSE_REASON_LABELS: Record<string, string> = {
   server_restart: "服务更新中，正在自动重连…",
   host_full: "资源繁忙，正在排队重试",
   migration_in_progress: "环境迁移中，稍后自动重试",
-  image_missing: "运行镜像未就绪，管理员处理中",
-  image_outdated: "运行镜像更新中，稍后自动重试",
-  baseline_missing: "基础环境未就绪，管理员处理中",
-  data_host_unavailable: "数据节点暂不可用，正在保护你的工作区",
+  image_missing: "运行环境维护中，请稍候",
+  image_outdated: "运行环境更新中，稍后自动重试",
+  baseline_missing: "基础环境准备中，请稍候",
+  data_host_unavailable: "存储服务暂不可用，正在保护你的工作区",
   supervisor_error: "环境启动异常，稍后自动重试",
   desktop_offline: "桌面端未在线",
-  desktop_owned_elsewhere: "会话钉在其他实例，请重连",
+  desktop_owned_elsewhere: "会话已在其他设备打开，请重连",
 };
 
 export type CloseDecision = {
@@ -798,6 +793,11 @@ export function classifyClose(code: number, reason: unknown): CloseDecision {
  *   3. 其余未连接 → 直接呈现 `label`（socket 已把 closeReasonLabel + 倒计时组装进 status.label）。
  *  `cls === "connected"` 返回 null（不显条）。tone 贴 Alert：disconnected=warning，connecting=info。*/
 export type ConnBanner = { tone: "info" | "warning"; text: string } | null;
+const FRIENDLY_CONN_BANNER_LABELS: Record<string, string> = {
+  "会话续期中…": "正在重新连接…",
+  "正在恢复上一轮…": "正在同步最新进展…",
+};
+
 export function deriveConnBanner(input: {
   cls: ChatStatusClass;
   label: string;
@@ -807,7 +807,17 @@ export function deriveConnBanner(input: {
   if (input.cls === "connected") return null;
   if (!input.browserOnline) return { tone: "warning", text: "网络已断开，恢复后自动重连" };
   if (input.provisioning) return { tone: "info", text: "环境启动中，正在为你准备工作区…" };
-  return { tone: input.cls === "disconnected" ? "warning" : "info", text: input.label };
+  const text = FRIENDLY_CONN_BANNER_LABELS[input.label] ?? input.label;
+  return { tone: input.cls === "disconnected" ? "warning" : "info", text };
+}
+
+/** 降级 live-journal 后台静默补拉退避阶梯（有限次，不在 onopen 重置）。 */
+export const DEGRADED_JOURNAL_RETRY_DELAYS_MS: readonly number[] = [5_000, 15_000, 30_000];
+
+/** 400/401/403/404/410 视为永久错误，后台静默补拉不再重试，避免断连风暴。 */
+export function isPermanentJournalError(error: unknown): boolean {
+  const status = (error as { status?: unknown } | null)?.status;
+  return status === 400 || status === 401 || status === 403 || status === 404 || status === 410;
 }
 
 /** 标准指数退避 + jitter（websocket.js:2313）：2/4/8/16/30s 上限 + 0–1000ms。*/
@@ -855,7 +865,7 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   engine_error: "任务执行时遇到内部错误，你的消息已保留，可以在当前会话继续。",
   internal_error: "服务遇到内部错误，你的消息已保留，可以在当前会话继续。",
   auth_error: "认证状态异常，本轮未正常完成，可以继续。",
-  box_capacity_held: "当前会话在 Box 上的前一步执行仍在收尾，本轮暂时中断；已有进度已保留，请稍后继续。",
+  box_capacity_held: "前一步执行仍在收尾，已有进度已保留，请稍后继续。",
   antigravity_start_observation_failed: "执行进度同步失败，本轮可能已有操作完成，已停止自动重试。请先核对执行结果，再决定是否继续。",
   platform_credential_expired: "平台为本轮签发的模型临时凭证已过期，本轮已停止，不会自动重试，也不是你的账号或登录问题。请直接再发一条消息继续。",
   service_restart: "服务正在更新，本轮已中断，可以继续。",

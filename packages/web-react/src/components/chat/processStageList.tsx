@@ -44,7 +44,6 @@ import {
   isClearedGoalRecord,
   isErroredAssistant,
   normalizeToolForDisplay,
-  rawAuditCommand,
   resolveToolMeta,
   resolveToolStatus,
   stripShellWrapperForDisplay,
@@ -525,22 +524,7 @@ export function ProcessStageList<T>({
     // 只有工具 / 思考行换成人话步骤行(原卡进「技术详情」);子任务、计划等仍用原卡(它们自带结构)。
     const inline = !deferred && rows.length > 0 && rows.every((message) => message.role === "tool" || message.role === "thinking");
     const body = (
-      <>
-        <ProcessStepContext.Provider value={inline}>{renderItem(item)}</ProcessStepContext.Provider>
-        {rows.map((message) => {
-          const raw = rawAuditCommand(message);
-          if (!raw) return null;
-          return (
-            <pre
-              key={`${message.id}:raw`}
-              data-testid="process-raw-command"
-              className="mb-1 mt-0.5 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-md bg-hover/60 px-2 py-1 font-mono text-xs text-muted"
-            >
-              {raw}
-            </pre>
-          );
-        })}
-      </>
+      <ProcessStepContext.Provider value={inline}>{renderItem(item)}</ProcessStepContext.Provider>
     );
     const head = rows[0];
     // 委派:谁接了、做什么、进行中 / 完成一眼可见;原委派卡(子代理的过程)在技术详情里。
@@ -725,11 +709,12 @@ export function ProcessStageList<T>({
             {sections.map((section, index) => {
               const isLastSection = index === sections.length - 1;
               if (section.card) {
-                // 过程里常显的整卡步骤:已回答的问答/审批(用户的选择是这轮的关键事实)、
-                // 本轮已越过的中途错误(模型不可用等)。用原卡渲染,不藏在「N 项」后面。
+                // 已恢复的轮中错误静默隐藏，只保留已回答的问答/审批卡片。
+                if (section.messages.every((m) => isErroredAssistant(m) && !(m.text && m.text.trim()))) {
+                  return null;
+                }
                 return (
                   <div key={section.key} data-testid="process-card" className="min-w-0 space-y-1.5 py-1">
-                    {/* 能进过程的错误卡都已被本轮越过:不再给重试/切换模型/从断点继续(会重复开工)。 */}
                     <RecoveredStepContext.Provider value>
                       {section.items.map((item) => (
                         <div key={keyOf(item)}>{renderItem(item)}</div>

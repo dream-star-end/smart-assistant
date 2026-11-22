@@ -1362,7 +1362,7 @@ export function Sidebar({
             onClick={onLoadMore}
             className="rounded-md px-2 py-1 text-caption font-medium text-danger outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
           >
-            加载更早会话失败，点击继续
+            加载更早会话失败，点击重试
           </button>
         </div>
       ) : null}

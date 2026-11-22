@@ -302,7 +302,7 @@ describe("MessageList Manus 过程披露", () => {
       usage: { traceId: "trace-mid-err" },
     });
 
-  test("OCV5-307: 本轮越过的中途错误卡收进过程，作为常显卡片步骤", () => {
+  test("OCV5-307 / P1-8: 本轮越过的中途错误收进过程后静默隐藏，不再用黄色安慰卡打扰用户", () => {
     renderList([
       row("u", "user", "继续合并", { status: "replied" }),
       row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
@@ -316,13 +316,9 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByText("已合并并推送").closest("[data-testid=process-disclosure]")).toBeNull();
     fireEvent.click(screen.getByTestId("process-toggle"));
     const card = screen.getByTestId("process-card");
-    expect(within(card).getByText("模型暂不可用")).toBeInTheDocument();
-    expect(card.closest("[data-testid=process-disclosure]")).not.toBeNull();
-    // OCV5-307:已越过的错误只留一行说明,不再是叫用户「切换模型后重发」的整张警示卡。
-    const note = within(card).getByTestId("recovered-error-note");
-    expect(note).toHaveTextContent("本轮已继续");
+    expect(within(card).queryByTestId("recovered-error-note")).toBeNull();
     expect(within(card).queryByRole("alert")).toBeNull();
-    expect(card.textContent ?? "").not.toMatch(/切换一个模型|后重发/);
+    expect(card.textContent ?? "").not.toMatch(/本轮已继续|切换一个模型|后重发/);
   });
 
   test("OCV5-307: 以 model_not_available 收尾的轮次，错误卡仍在顶层", () => {
@@ -364,7 +360,7 @@ describe("MessageList Manus 过程披露", () => {
     );
     fireEvent.click(screen.getByTestId("process-toggle"));
     const card = screen.getByTestId("process-card");
-    // OCV5-390: an automatically retried error the turn got past leaves nothing behind.
+    // OCV5-390 / P1-8: a recovered error the turn got past leaves no error note behind.
     expect(within(card).queryByTestId("recovered-error-note")).toBeNull();
     expect(card.textContent ?? "").not.toMatch(/任务执行失败|本轮已继续|出错了/);
     expect(within(card).queryByRole("alert")).toBeNull();
@@ -908,13 +904,13 @@ describe("MessageList Manus 过程披露", () => {
     ];
     const view = renderList(messages, { cb: { onFetchTapeRecordPayload } });
     await waitFor(() => {
-      expect(screen.getAllByText(/真实/).length).toBeGreaterThanOrEqual(1);
+      expect(screen.getAllByText(/正在加载内容/).length).toBeGreaterThanOrEqual(1);
     });
     expect(screen.queryByText("deferred-hidden-tool")).not.toBeInTheDocument();
     const fetchedOrdinals = () => onFetchTapeRecordPayload.mock.calls.map((call) => (call as unknown[])[1]);
     expect(fetchedOrdinals()).toEqual([9]);
     expect(screen.queryByTestId("process-deferred-hydrate")).toBeNull();
-    for (const node of screen.getAllByText(/真实/)) {
+    for (const node of screen.getAllByText(/正在加载内容/)) {
       expect(node.closest("[data-testid=process-disclosure]")).toBeNull();
     }
 
@@ -922,7 +918,7 @@ describe("MessageList Manus 过程披露", () => {
     await waitFor(() => {
       expect(fetchedOrdinals()).toContain(4);
     });
-    const inside = screen.getAllByText(/真实/).filter((node) => node.closest("[data-testid=process-disclosure]"));
+    const inside = screen.getAllByText(/正在加载内容/).filter((node) => node.closest("[data-testid=process-disclosure]"));
     expect(inside.length).toBeGreaterThanOrEqual(1);
     const hydrated = messages.map((message) =>
       message.id === "mid" ? { ...message, _payloadDeferred: undefined, text: "水合后的阶段说明" } : message,
@@ -2394,11 +2390,11 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByTestId("process-step-live")).toHaveTextContent("等待子任务完成");
     expect(screen.getByTestId("process-step-live")).toHaveAttribute("data-live-pending", "true");
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
-    // UI-3:步骤行是人话标题,原始命令收在点开后的「技术详情」里。
+    // UI-3 / P2-2:步骤行是人话标题，展开后不再冗余裸露 process-raw-command CLI 命令块。
     expect(screen.getByTestId("process-step-row")).toHaveTextContent("等待子任务完成");
     expect(screen.queryByTestId("process-raw-command")).not.toBeInTheDocument();
     fireEvent.click(within(screen.getByTestId("process-step-row")).getAllByRole("button")[0]!);
-    expect(screen.getByTestId("process-raw-command")).toHaveTextContent("oc-memory delegate-wait dlgjob-audit-SECRET");
+    expect(screen.queryByTestId("process-raw-command")).not.toBeInTheDocument();
     expect(screen.getByTestId("process-step-live").textContent ?? "").not.toMatch(/dlgjob/);
 
     cleanup();
@@ -2416,7 +2412,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByTestId("process-step-live").textContent ?? "").not.toMatch(/\/bin\/bash|dlgjob/);
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
     fireEvent.click(within(screen.getByTestId("process-step-row")).getAllByRole("button")[0]!);
-    expect(screen.getByTestId("process-raw-command").textContent ?? "").toBe(wrapped);
+    expect(screen.queryByTestId("process-raw-command")).not.toBeInTheDocument();
   });
 
   test("UI-3 人话摘要：按工具类别或命令首词归类，不扫参数；思考、准备工作、目标不算；最多三类", () => {
@@ -2536,11 +2532,8 @@ describe("MessageList Manus 过程披露", () => {
     fireEvent.click(goalToggle);
     const historical = screen.getByTestId("process-goal");
     expect(within(historical).getByText("做完的目标")).toBeInTheDocument();
-    const rawToggle = within(historical).getByRole("button", { name: "查看原始目标记录" });
-    expect(historical.querySelector("pre")).toBeNull();
-    fireEvent.click(rawToggle);
-    expect(historical.querySelector("pre")?.textContent).toBe(JSON.stringify(completedGoal, null, 2));
-    fireEvent.click(within(historical).getByRole("button", { name: "收起原始目标记录" }));
+    // P0-6: 普通对话流直接隐藏「查看原始目标记录」JSON 调试开关
+    expect(within(historical).queryByRole("button", { name: "查看原始目标记录" })).toBeNull();
     expect(historical.querySelector("pre")).toBeNull();
     const stage = screen.getByTestId("process-stage");
     expect(stage.className).not.toMatch(/\btext-sm\b|\bleading-6\b|\btext-muted\b/);

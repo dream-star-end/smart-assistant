@@ -27,7 +27,7 @@ import {
   Wand2,
   X,
 } from "lucide-react";
-import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol/browser";
+import { normalizeTurnErrorCode } from "@openclaude/protocol/browser";
 import { createContext, memo, useContext, useEffect, useId, useRef, useState } from "react";
 import type { BlankProbeReport as TimelineBlankReport } from "../../lib/chat/timelineBlankProbe";
 import type { ChatMessage } from "../../lib/chat/model";
@@ -738,29 +738,39 @@ function ReplyQuoteBlock({
 // reducer/socket 对 msg 就地 mutate(同引用),叶子层 {msg} 浅比较要么永不重渲(状态标签
 // 卡死在首帧,如 user status),要么因 ctx 每帧新对象而形同虚设 —— 三种 memo 策略并存徒增
 // 认知负担。sig 层已捕获全部渲染所读字段(render.ts messageSignature),叶子直接裸函数。
-function SystemCallbackNoticeCard({ msg }: { msg: ChatMessage }) {
+function SystemCallbackNoticeCard({ msg, readOnly = false }: { msg: ChatMessage; readOnly?: boolean }) {
   const [expanded, setExpanded] = useState(false);
-  const summary = summarizeSystemCallbackUserTurn(msg);
+  const summary = summarizeSystemCallbackUserTurn(msg).replace(/^系统回调\s*·\s*/, "");
   return (
     <div
       className="flex min-w-0 flex-col items-center py-2 animate-in"
       data-testid="system-callback-row"
     >
-      <button
-        type="button"
-        onClick={() => setExpanded((prev) => !prev)}
-        aria-expanded={expanded}
-        className="oc-btn-tactile inline-flex max-w-full items-center gap-1.5 rounded-full border border-border/65 bg-surface/75 px-3 py-1 text-caption leading-snug text-faint transition-colors hover:border-border-strong hover:bg-hover hover:text-muted"
-        data-testid="system-callback-summary"
-      >
-        <span className="truncate">{summary}</span>
-        <ChevronRight
-          size={12}
-          strokeWidth={1.75}
-          className={cn("shrink-0 transition-transform duration-200 ease-[var(--ease-spring)]", expanded && "rotate-90")}
-        />
-      </button>
-      {expanded && msg.text && (
+      <div className="flex w-full max-w-[85%] items-center gap-3 text-caption text-faint">
+        <span aria-hidden className="h-px flex-1 bg-border/60" />
+        {readOnly && msg.text ? (
+          <button
+            type="button"
+            onClick={() => setExpanded((prev) => !prev)}
+            aria-expanded={expanded}
+            className="inline-flex min-w-0 items-center gap-1 text-caption leading-snug text-faint transition-colors hover:text-muted"
+            data-testid="system-callback-summary"
+          >
+            <span className="truncate">{summary}</span>
+            <ChevronRight
+              size={12}
+              strokeWidth={1.75}
+              className={cn("shrink-0 transition-transform duration-200 ease-[var(--ease-spring)]", expanded && "rotate-90")}
+            />
+          </button>
+        ) : (
+          <span className="truncate leading-snug" data-testid="system-callback-summary">
+            {summary}
+          </span>
+        )}
+        <span aria-hidden className="h-px flex-1 bg-border/60" />
+      </div>
+      {readOnly && expanded && msg.text && (
         <div
           className="oc-surface-recessed mt-1.5 min-w-0 max-w-full whitespace-pre-wrap break-words rounded-xl border border-border/70 px-3.5 py-2 text-left text-caption leading-relaxed text-muted sm:max-w-[80%] [overflow-wrap:anywhere]"
           data-testid="message-text"
@@ -789,7 +799,7 @@ export function UserCard({
   awaitingReply?: boolean;
 }) {
   if (isSystemCallbackUserTurn(msg)) {
-    return <SystemCallbackNoticeCard msg={msg} />;
+    return <SystemCallbackNoticeCard msg={msg} readOnly={readOnly} />;
   }
   const status = msg.status;
   // 终态标签(replied/read)不在 USER_STATUS_LABEL 里 → 不渲染。
@@ -1040,7 +1050,6 @@ export function AssistantCard({
   const normalizedCode = normalizeTurnErrorCode(effectiveCode);
   const isEmptyNoReply =
     normalizedCode === "no_response" || normalizedCode === "phantom_turn";
-  const sem = turnErrorSemantics(normalizedCode);
   // Same narrow exception as legacy size: a sealed failure must not keep
   // a frozen「结果正在收尾」title. Every other snapshot stays monotone.
   const ignoreStaleSoftSnapshot =
@@ -1061,10 +1070,6 @@ export function AssistantCard({
   const hasDisplayableBody = Boolean(
     (msg.text && !hasError) || (hasError && presentedError?.bodyText),
   );
-  // Phase-A 降级页只给 visible_head。中断轮的 head 经常是空正文，过程行还在物化。
-  // 判定只看服务端回显的 _displayDegradeReason，刷新后仍成立；物化完成后该字段消失，占位自动让位。
-  const showUnpublishedProcessPending =
-    msg._displayDegradeReason === "records_unpublished" && !hasDisplayableBody && !live;
   const isInsufficient = normalizedCode === "insufficient_credits";
   const shownTitle = isEmptyNoReply
     ? "这轮没有回复"
@@ -1187,17 +1192,22 @@ export function AssistantCard({
           ctx.turnActivity ? <TurnActivity info={ctx.turnActivity} /> : <TypingDots />
         ) : null}
 
-        {isSyntheticEmptyNotice && !live && (
+        {/* 合并空回复兜底卡；存量历史 _emptyTurnTimeout 若非末轮直接隐藏，不再提示过时的「刷新或同步后可见」。 */}
+        {!live && (isSyntheticEmptyNotice || (msg._emptyTurn && (!msg._emptyTurnTimeout || isLastTurn))) && (
           <Alert
-            tone="warning"
+            tone="info"
             density="compact"
             className="oc-callout mt-2.5"
-            icon={<AlertTriangle size={17} strokeWidth={1.75} />}
-            title="这轮没有回复"
+            icon={<Info size={16} strokeWidth={1.75} />}
+            data-testid="empty-turn-notice"
           >
             <div className="min-w-0">
-              <p className="text-body leading-5 text-fg/90">模型没有生成内容。可以在当前会话继续。</p>
-              {isLastTurn && showInterruptedContinuation && (
+              <p className="text-body leading-5 text-fg/90">
+                {msg._emptyTurnTimeout
+                  ? "本轮连接曾短暂中断，未收到新回复，可直接继续对话。"
+                  : "模型本轮没有产生新内容，可直接继续对话。"}
+              </p>
+              {isSyntheticEmptyNotice && isLastTurn && showInterruptedContinuation && (
                 <div className="mt-2.5">
                   <Button
                     size="sm"
@@ -1238,17 +1248,6 @@ export function AssistantCard({
           </Alert>
         )}
 
-        {/* 空轮提示。_emptyTurnTimeout 仅存量落库消息会命中（新代码不再产生此类消息，改用
-            非持久 transient 软提示）；文案改诚实版：不再断言"无响应"，而是提示内容可能已在
-            服务端生成、刷新/同步后可见，避免与真实内容同屏矛盾。 */}
-        {msg._emptyTurn && (
-          <Alert tone="info" className="oc-callout mt-2.5" icon={<Info size={16} strokeWidth={1.75} />}>
-            {msg._emptyTurnTimeout
-              ? "当时与服务器的连接中断，内容可能已在服务端生成（刷新或同步后可见）。"
-              : "模型本轮没有产生新内容。"}
-          </Alert>
-        )}
-
         {/* 终态错误卡：自动免单用温和提示，不把平台 JSON/英文堆栈甩给用户。 */}
         {errorCardHeld ? null : isUserCancelled ? (
           // UI-3:已停止是本轮末尾的一条时间线提示(实心停止块)。当前未完成轮的「继续」留在同一条状态上。
@@ -1262,38 +1261,9 @@ export function AssistantCard({
               </div>
             )}
           </output>
-        ) : recoveredStep && sem.automaticRecovery === true ? (
-          // OCV5-390: an error the platform retries by itself and that the turn got past is not the
-          // user's business: nothing stays in the process view. Only an error the turn ended on (or
-          // one that is not retried automatically) is shown.
+        ) : recoveredStep ? (
+          // 本轮已恢复/越过的过程错误不再用黄色安慰横幅打扰用户。
           null
-        ) : recoveredStep && !suppressErrorAlert && presentedError ? (
-          // OCV5-307:本轮已越过的错误(例:上游满载的 turn 终态错误被记在较早的正文段上,随后同一轮又
-          // 继续并给出回复)。它是历史事实而非待办 —— 只留一行低调说明 + 可展开的请求信息,不再用整张
-          // 警示卡叫用户「切换模型后重发」。真正以错误收尾的轮次不进这里,仍是完整错误卡。
-          <div
-            role="status"
-            data-testid="recovered-error-note"
-            className="oc-callout oc-callout-warning mt-2.5 flex max-w-full flex-wrap items-center gap-x-2 gap-y-1 rounded-xl px-3.5 py-2 text-meta text-muted"
-          >
-            <span className="oc-icon-badge oc-icon-badge-warning flex size-5 shrink-0 items-center justify-center rounded-sm">
-              <AlertTriangle size={11} strokeWidth={1.75} aria-hidden="true" />
-            </span>
-            <span className="font-medium text-fg/85">
-              {isInsufficient && !frozenCard ? creditsCopy.title : shownTitle}
-            </span>
-            <span>· 本轮已继续，无需处理</span>
-            {shownDetail && (
-              <details className="basis-full">
-                <summary className="w-fit cursor-pointer select-none text-caption font-medium text-faint hover:text-fg [@media(hover:none)]:py-3.5">
-                  查看请求信息
-                </summary>
-                <pre className="oc-surface-recessed mt-1.5 max-h-28 max-w-full overflow-auto whitespace-pre-wrap rounded-lg border border-border/70 px-2.5 py-2 font-mono text-caption text-muted [overflow-wrap:anywhere]">
-                  {shownDetail}
-                </pre>
-              </details>
-            )}
-          </div>
         ) : suppressErrorAlert && msg._recoverySkippedNotice ? (
           <ErrorNotice
             role="alert"
@@ -1332,15 +1302,6 @@ export function AssistantCard({
             details={technicalDetails}
           />
         ) : null}
-
-        {showUnpublishedProcessPending && (
-          <output
-            className="mt-2.5 flex items-center gap-2 py-1 text-body text-muted"
-            aria-label="过程记录整理中"
-          >
-            <span>过程记录整理中…</span>
-          </output>
-        )}
 
         {/* 动作条（流式中不显示，避免抖动）。OCV5-359:一条安静的图标行 —— 复制 · 👍 · 👎 · 更多;
             存到项目、时间 · 积分 · 请求ID 都收进「更多」菜单(桌面 hover 时 meta 另在行尾淡显)。
@@ -1754,47 +1715,75 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
   );
 }
 
+function contextRebuiltDividerLabel(msg: ChatMessage): string | null {
+  const text = msg.text ?? "";
+  const isRebuilt =
+    (typeof msg.id === "string" && msg.id.startsWith("sys-ctxrebuild-")) ||
+    /^(?:换了模型引擎，已用最近|原会话没能直接续上，已用最近|已重新加载会话上下文)/.test(text);
+  if (!isRebuilt) return null;
+  return text.includes("换了模型引擎") ? "已切换模型，保留近期对话" : "已衔接近期对话，可继续交流";
+}
+
 // ═══════════════ system ═══════════════
 export function SystemCard({ msg }: { msg: ChatMessage }) {
   const [expanded, setExpanded] = useState(false);
   if (!msg.text) return null;
   const compact = msg._contextCompaction;
-  if (!compact) {
+  if (compact) {
+    // P2-3: 自动上下文压缩后台静默，仅保留用户手动触发的整理回执。
+    const isManual =
+      (typeof msg.id === "string" && msg.id.includes("-rcompact:")) ||
+      !msg.text.includes("已自动整理");
+    if (!isManual) return null;
     return (
-      <div className="flex min-w-0 justify-center animate-in">
-        <div className="oc-surface-recessed min-w-0 max-w-full whitespace-pre-wrap break-words rounded-xl border border-border/65 px-3.5 py-1.5 text-left text-caption leading-relaxed text-faint sm:max-w-[80%] sm:text-center [overflow-wrap:anywhere]">
-          {msg.text}
+      <div className="flex min-w-0 justify-center animate-in" data-testid="context-compacted-receipt">
+        <div className="oc-surface-recessed min-w-0 max-w-full rounded-xl border border-border/65 px-3.5 py-1.5 text-caption leading-relaxed text-faint sm:max-w-[80%]">
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            aria-expanded={expanded}
+            className="inline-flex max-w-full items-center gap-1.5 text-left outline-none transition-colors hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <span className="break-words [overflow-wrap:anywhere]">{msg.text}</span>
+            <ChevronRight
+              size={12}
+              strokeWidth={1.75}
+              aria-hidden
+              className={cn("shrink-0 transition-transform duration-150", expanded && "rotate-90")}
+            />
+          </button>
+          {expanded && (
+            <div className="mt-1.5 space-y-1 border-t border-border/60 pt-1.5 text-left text-caption text-muted">
+              <p>系统已自动保留近期对话与关键决策，完整聊天记录仍在上方可见。</p>
+              {compact.summaryPreview && (
+                <p className="line-clamp-3 whitespace-pre-wrap break-words text-faint">
+                  {compact.summaryPreview}
+                </p>
+              )}
+            </div>
+          )}
         </div>
       </div>
     );
   }
+  const rebuiltLabel = contextRebuiltDividerLabel(msg);
+  if (rebuiltLabel) {
+    return (
+      <div
+        className="flex min-w-0 items-center gap-3 py-1.5 text-caption text-faint animate-in"
+        role="separator"
+        data-testid="context-rebuilt-divider"
+      >
+        <span aria-hidden className="h-px flex-1 bg-border/60" />
+        <span className="shrink-0">{rebuiltLabel}</span>
+        <span aria-hidden className="h-px flex-1 bg-border/60" />
+      </div>
+    );
+  }
   return (
-    <div className="flex min-w-0 justify-center animate-in" data-testid="context-compacted-receipt">
-      <div className="oc-surface-recessed min-w-0 max-w-full rounded-xl border border-border/65 px-3.5 py-1.5 text-caption leading-relaxed text-faint sm:max-w-[80%]">
-        <button
-          type="button"
-          onClick={() => setExpanded((v) => !v)}
-          aria-expanded={expanded}
-          className="inline-flex max-w-full items-center gap-1.5 text-left outline-none transition-colors hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          <span className="break-words [overflow-wrap:anywhere]">{msg.text}</span>
-          <ChevronRight
-            size={12}
-            strokeWidth={1.75}
-            aria-hidden
-            className={cn("shrink-0 transition-transform duration-150", expanded && "rotate-90")}
-          />
-        </button>
-        {expanded && (
-          <div className="mt-1.5 space-y-1 border-t border-border/60 pt-1.5 text-left text-caption text-muted">
-            <p>系统已自动保留近期对话与关键决策，完整聊天记录仍在上方可见。</p>
-            {compact.summaryPreview && (
-              <p className="line-clamp-3 whitespace-pre-wrap break-words text-faint">
-                {compact.summaryPreview}
-              </p>
-            )}
-          </div>
-        )}
+    <div className="flex min-w-0 justify-center animate-in">
+      <div className="oc-surface-recessed min-w-0 max-w-full whitespace-pre-wrap break-words rounded-xl border border-border/65 px-3.5 py-1.5 text-left text-caption leading-relaxed text-faint sm:max-w-[80%] sm:text-center [overflow-wrap:anywhere]">
+        {msg.text}
       </div>
     </div>
   );

@@ -219,23 +219,32 @@ describe("浏览器页", () => {
     expect(await screen.findByTestId(/^outputs-(view|empty)$/)).toBeInTheDocument();
   });
 
-  test("非浏览器轮次 running=true 时，浏览器步骤页不误报「助手正在操作浏览器」", async () => {
+  test("常规态隐藏常驻说明书横幅，仅回看历史步骤时展示紧凑「回到最新」条", async () => {
     const messages = [
       user("u1", "先打开网页看看"),
       bash("b1", "oc-browser open https://github.com/login && oc-browser screenshot", page("https://github.com/login", "GitHub", ".playwright-cli/login.png")),
-      assistant("a1", "已打开登录页", TS + 5_000),
-      user("u2", "顺便写一段总结", TS + 10_000),
+      bash("b2", "oc-browser click e1 && oc-browser screenshot", page("https://github.com/home", "GitHub Home", ".playwright-cli/home.png")),
+      assistant("a1", "已打开页面", TS + 5_000),
     ];
     render(
       <InspectorPanelContent
         messages={messages}
         running={true}
-        request={{ tab: "browser", message: messages[1], nonce: 1 }}
+        request={{ tab: "browser", message: messages[2], nonce: 1 }}
         onClose={() => {}}
       />,
     );
     await browserReady();
-    expect(screen.getByTestId("browser-status-banner")).not.toHaveTextContent("助手正在操作浏览器");
+    // 常规停在最新一步时不展示说明书横幅
+    expect(screen.queryByTestId("browser-status-banner")).toBeNull();
+
+    // 切到历史第 1 步时展示紧凑单行「回到最新」条，点按后恢复最新并隐藏
+    const rows = screen.getAllByTestId("browser-log-row");
+    fireEvent.click(within(rows[0] as HTMLElement).getAllByRole("button")[0] as HTMLElement);
+    const banner = screen.getByTestId("browser-status-banner");
+    expect(banner).toHaveTextContent("正在查看历史步骤");
+    fireEvent.click(screen.getByTestId("browser-back-latest"));
+    expect(screen.queryByTestId("browser-status-banner")).toBeNull();
   });
 
   test("handoff 消费后切换「步骤记录」再切回「实时视口」不会重放全屏接管", async () => {

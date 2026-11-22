@@ -2,7 +2,6 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import {
-  JournalHydrationRetry,
   MessageListSkeleton,
   PartialHistorySkeleton,
   shouldShowHistorySkeleton,
@@ -103,29 +102,9 @@ describe("MessageListSkeleton", () => {
 });
 
 describe("PartialHistorySkeleton", () => {
-  test("已有部分内容时保留真实消息，并用轻量尾部占位明确告知仍在加载", () => {
-    render(<PartialHistorySkeleton />);
-    const status = screen.getByRole("status", { name: "正在加载会话内容" });
-    expect(status).toHaveAttribute("aria-live", "polite");
-    expect(status).toHaveAttribute("aria-busy", "true");
-    expect(screen.getByText("正在加载会话内容…")).toBeInTheDocument();
-  });
-});
-
-describe("JournalHydrationRetry", () => {
-  test("renders an explicit retry without covering history", () => {
-    const onRetry = vi.fn();
-    render(<JournalHydrationRetry onRetry={onRetry} />);
-    expect(screen.getByLabelText("实时内容未完全加载")).toBeInTheDocument();
-    screen.getByRole("button", { name: "继续" }).click();
-    expect(onRetry).toHaveBeenCalledTimes(1);
-  });
-
-  // M-15:text-foreground 不是本仓 token,按钮颜色回落到父级 text-muted,与说明文字同色不可辨。
-  test("「重新加载」用本仓 token 且常显下划线,与说明文字区分开;触屏 44px", () => {
-    render(<JournalHydrationRetry onRetry={vi.fn()} />);
-    const button = screen.getByRole("button", { name: "继续" });
-    expect(button).toHaveClass("text-fg", "underline", "[@media(hover:none)]:min-h-11");
-    expect(button).not.toHaveClass("text-foreground");
+  test("已有部分内容时后台静默合并，不在消息尾部闪烁假回复骨架", () => {
+    const { container } = render(<PartialHistorySkeleton />);
+    expect(container.firstChild).toBeNull();
+    expect(screen.queryByTestId("partial-history-skeleton")).toBeNull();
   });
 });

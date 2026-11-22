@@ -950,7 +950,7 @@ describe("INC-20261115-CONTAINER-SWAP-FRAMESEQ: 跨容器游标归零与租约�
     expect(s.messages.some((m) => m.role === "tool" && m.blockId === "blk-1")).toBe(true);
     expect(assistantText(s.messages, lscId)).toBe("已核验在线");
     const userRow = s.messages.find((m) => m.role === "user" && m.id === lscId)!;
-    expect(summarizeSystemCallbackUserTurn(userRow)).toBe("系统回调 · 发布列车已上线");
+    expect(summarizeSystemCallbackUserTurn(userRow)).toBe("发布已上线");
     sock.stop();
   });
 
@@ -1705,5 +1705,167 @@ describe("INC-20261115-CONTAINER-SWAP-FRAMESEQ: 跨容器游标归零与租约�
     await flush();
     expect(assistantText(s4.messages)).toContain("stream-B-13");
     sock4.stop();
+  });
+
+  test("P0-1: _liveJournalDegraded auto-clears on live WS frame, non-degraded snapshot, and turn final/tape cutover", async () => {
+    vi.useFakeTimers();
+    const readSessionSnapshot = vi.fn(async () => { throw new Error("page-2 failed"); });
+    const syncSession = vi.fn(async () => false);
+    const { sock, ws, s } = boot({ readSessionSnapshot, syncSession });
+    s._snapshotStream = { streamKey: STREAM, agentId: "main" };
+
+    // 1) Degraded snapshot sets _liveJournalDegraded = true
+    pushSnapshot(
+      ws,
+      openSnapshot({
+        frames: [record(1, "part-1")],
+        lastFrameSeq: 10,
+        nextAfterSeq: 1,
+        hasMore: true,
+        gap: { reason: "cursor_reset" },
+      }),
+    );
+    await flush();
+    expect(s._liveJournalDegraded).toBe(true);
+
+    // 2) Normal live WS frame automatically clears _liveJournalDegraded
+    ws.push(textFrame(2, " + live-2"));
+    await flush();
+    expect(s._liveJournalDegraded).toBe(false);
+
+    // 3) Re-degrade, then non-degraded snapshot clears _liveJournalDegraded via else branch
+    s._liveJournalDegraded = true;
+    pushSnapshot(
+      ws,
+      openSnapshot({
+        frames: [record(3, " + snap-3")],
+        lastFrameSeq: 3,
+        nextAfterSeq: 3,
+        hasMore: false,
+      }),
+    );
+    await flush();
+    expect(s._liveJournalDegraded).toBe(false);
+
+    // 4) Re-degrade, then isFinal clears _liveJournalDegraded
+    s._liveJournalDegraded = true;
+    ws.push({
+      type: "outbound.message",
+      sessionKey: SK,
+      channel: "webchat",
+      peer,
+      clientMessageId: CMID,
+      blocks: [{ kind: "text", text: "done" }],
+      isFinal: true,
+      frameSeq: 4,
+      ts: 1_700_000_000_010,
+    });
+    await flush();
+    expect(s._liveJournalDegraded).toBe(false);
+
+    // 5) Authoritative tape applyServerMessages when idle also clears _liveJournalDegraded
+    s._liveJournalDegraded = true;
+    sock.applyServerMessages(s.id, "main", [
+      { id: CMID, role: "user", text: "hi", ts: 1, _seq: 1 },
+      { id: "srv-a1", role: "assistant", text: "done", ts: 2, _seq: 2, _clientMessageId: CMID },
+    ], true, 2);
+    expect(s._liveJournalDegraded).toBe(false);
+    sock.stop();
+  });
+
+  test("P0-1: hydrateDurableLiveFrameJournal degraded fallback preserves existing local live rows (no resetOwnerIds wipe)", async () => {
+    vi.useFakeTimers();
+    const { sock, ws, s } = boot({});
+    // Local live rows already received over WS for CMID
+    ws.push(textFrame(10, "latest local progress"));
+    await flush();
+    expect(assistantText(s.messages)).toContain("latest local progress");
+
+    // Cold hydrateDurableLiveFrameJournal falls back from view=units to raw frames and aborts on page 2 (degraded=true)
+    const fetchUnits = vi.fn(async () => ({
+      view: "units" as const,
+      degraded: "fallback" as const,
+      units: [],
+      n: 20,
+      hasMoreBefore: false,
+      beforeCursor: null,
+      streamClientMessageIds: [CMID],
+      openDispatch: true,
+      hasTapeProjection: false,
+      tapeProjectionVersion: 0,
+      reducerEpoch: "1",
+      resume: null,
+      streamGeneration: 1,
+    }));
+    const abortErr = Object.assign(new Error("aborted"), { name: "AbortError" });
+    let pageCalls = 0;
+    const fetchPage = vi.fn(async () => {
+      pageCalls += 1;
+      if (pageCalls === 1) {
+        return {
+          frames: [
+            {
+              recordId: "1",
+              streamKey: STREAM,
+              source: "gateway" as const,
+              clientMessageId: CMID,
+              payload: {
+                type: "outbound.message",
+                sessionKey: SK,
+                channel: "webchat",
+                peer,
+                clientMessageId: CMID,
+                blocks: [{ kind: "text", text: "older truncated frame" }],
+                isFinal: false,
+                frameSeq: 1,
+                ts: 1_700_000_000_001,
+              },
+            },
+          ],
+          hasMore: true,
+          nextCursor: "1",
+          streamClientMessageIds: [CMID],
+          hasTapeProjection: false,
+        };
+      }
+      throw abortErr;
+    });
+
+    await sock.hydrateDurableLiveFrameJournal(s.id, fetchPage, async () => {}, fetchUnits);
+    // Local live rows MUST NOT be wiped by degraded raw-frame fallback
+    expect(assistantText(s.messages)).toContain("latest local progress");
+    expect(s._liveJournalDegraded).toBe(true);
+    sock.stop();
+  });
+
+  test("P0-1: degraded journal runs bounded silent background retry and cleans up timer on stop()", async () => {
+    vi.useFakeTimers();
+    const readSessionSnapshot = vi.fn(async () => { throw new Error("page-2 timeout"); });
+    const syncSession = vi.fn(async () => false);
+    const { sock, ws, s } = boot({ readSessionSnapshot, syncSession });
+    s._snapshotStream = { streamKey: STREAM, agentId: "main" };
+
+    pushSnapshot(
+      ws,
+      openSnapshot({
+        frames: [record(1, "p1")],
+        lastFrameSeq: 10,
+        nextAfterSeq: 1,
+        hasMore: true,
+        gap: { reason: "cursor_reset" },
+      }),
+    );
+    await flush();
+    expect(s._liveJournalDegraded).toBe(true);
+    syncSession.mockClear();
+
+    // First backoff tick (5s) triggers silent syncSession
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(syncSession).toHaveBeenCalledTimes(1);
+
+    // Stop cancels remaining backoff timers so no further syncSession fires
+    sock.stop();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(syncSession).toHaveBeenCalledTimes(1);
   });
 });

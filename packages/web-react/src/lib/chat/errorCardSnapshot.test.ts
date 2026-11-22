@@ -134,6 +134,28 @@ const softBoxSnapshot = {
 };
 
 describe("sealed crashed tape does not keep a BOX_REPLAY_PENDING soft card", () => {
+  test("open unsealed BOX_REPLAY_PENDING commits silent disposition and upgrades to card once sealed", () => {
+    const open = message({
+      _clientMessageId: "u-open-box",
+      _errorCode: "ENGINE_ERROR",
+      text: BOX_PARTIAL,
+      _errorDetail: BOX_DETAIL,
+    });
+    commitErrorCardSnapshot(open);
+    expect(open._errorCardSnapshot).toEqual({ disposition: "silent" });
+
+    // Once the same row seals as a crashed dispatch, recompute into the real failure card.
+    open._turnTapeComplete = true;
+    open._dispatchOutcome = "crashed";
+    freezeErrorCardSnapshots([open]);
+    expect(open._errorCardSnapshot).toMatchObject({
+      disposition: "card",
+      tone: "red",
+      title: errorLabel("engine_error"),
+      message: friendlyBridgeErrorMessage("engine_error"),
+    });
+  });
+
   test("commit recomputes a soft snapshot once the tape is a sealed failure", () => {
     const row = message({
       _clientMessageId: "u1",

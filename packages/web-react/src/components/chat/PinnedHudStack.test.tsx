@@ -11,8 +11,12 @@ import type {
   SessionMuseJobItem,
 } from "../../lib/chat/sessionBackgroundTasks";
 import { PinnedHudStack } from "./PinnedHudStack";
+import { AUTO_DISMISS_SUCCEEDED_MS } from "./PinnedBackgroundTasksPanel";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 function makeSwarm(over: Partial<SwarmSnapshot> = {}): SwarmSnapshot {
   return {
@@ -120,7 +124,8 @@ describe("PinnedHudStack — unified Live Agent capsule", () => {
     expect(capsule).toHaveAttribute("data-running", "true");
     expect(capsule).toHaveTextContent("UI 统一重构");
     expect(within(capsule).getByTestId("live-agent-capsule-dot")).toHaveAttribute("data-running", "true");
-    expect(within(capsule).getByTestId("live-agent-capsule-more")).toHaveTextContent("+3");
+    // goal 已收敛至 Composer 单入口，不再占 HUD +N 计数（仅 delegate + task = +2）
+    expect(within(capsule).getByTestId("live-agent-capsule-more")).toHaveTextContent("+2");
     expect(within(capsule).getByTestId("live-agent-capsule-timer")).toBeInTheDocument();
     // 默认折叠，不叠罗汉渲染完整卡片栈
     expect(screen.queryByTestId("live-agent-expanded")).toBeNull();
@@ -139,12 +144,31 @@ describe("PinnedHudStack — unified Live Agent capsule", () => {
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByTestId("live-agent-expanded")).toBeInTheDocument();
+    expect(screen.queryByTestId("pinned-goal")).toBeNull();
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByTestId("live-agent-expanded")).toBeNull();
   });
 
-  test("仅有任务清单时展示进度与正在执行的任务，无多余 +N 徽标", async () => {
+  test("仅有会话目标消息时 HUD 不渲染重复胶囊（统一由 Composer goal chip 承载）", () => {
+    const { container } = render(
+      <PinnedHudStack
+        timelineMessages={[makeGoalMsg()]}
+        chatVersion={1}
+        wsSending={false}
+        delegateItems={[]}
+        onDismissDelegate={vi.fn()}
+        latestSwarm={null}
+        latestSwarmKey={null}
+        dismissedSwarmKey={null}
+        onOpenSwarmBoard={vi.fn()}
+        onDismissSwarm={vi.fn()}
+      />,
+    );
+    expect(container.firstChild).toBeNull();
+  });
+
+  test("仅有任务清单时展示进度与正在执行的任务，隐藏裸 tok 计数且无多余 +N 徽标", async () => {
     render(
       <PinnedHudStack
         timelineMessages={[makeTodoMsg()]}
@@ -164,7 +188,8 @@ describe("PinnedHudStack — unified Live Agent capsule", () => {
     expect(capsule).toHaveAttribute("data-primary-kind", "task");
     expect(capsule).toHaveTextContent("任务 1/2");
     expect(capsule).toHaveTextContent("正在收敛胶囊");
-    expect(within(capsule).getByTestId("live-agent-capsule-timer")).toHaveTextContent("128 tok");
+    expect(within(capsule).queryByTestId("live-agent-capsule-timer")).toBeNull();
+    expect(capsule).not.toHaveTextContent(/tok/i);
     expect(screen.queryByTestId("live-agent-capsule-more")).toBeNull();
   });
 
@@ -273,15 +298,42 @@ describe("PinnedHudStack — unified Live Agent capsule", () => {
     expect(within(capsule).getByTestId("live-agent-capsule-more").className).toContain("shrink-0");
   });
 
-  test("活跃后台命令优先级高于待触发定时续跑，单行胶囊显示 +1 并在展开面板支持终止/暂停/删除", async () => {
+  test("当前回合运行中（wsSending=true）时不重复弹出后台命令胶囊（P0-2）", () => {
+    const bgCmd: SessionBgCommandItem = {
+      id: "99-ocb_1",
+      jobId: "ocb_1",
+      commandPreview: 'HOST_WT="/var/lib/docker/volumes/oc-v5/_data" pytest -q tests/e2e',
+      cwd: "/var/lib/docker/app",
+      startedAt: Date.now() - 45_000,
+      updatedAt: Date.now() - 1_000,
+    };
+    const { container } = render(
+      <PinnedHudStack
+        timelineMessages={[]}
+        chatVersion={1}
+        wsSending={true}
+        delegateItems={[]}
+        onDismissDelegate={vi.fn()}
+        latestSwarm={null}
+        latestSwarmKey={null}
+        dismissedSwarmKey={null}
+        onOpenSwarmBoard={vi.fn()}
+        onDismissSwarm={vi.fn()}
+        bgCommands={[bgCmd]}
+      />,
+    );
+    expect(container.firstChild).toBeNull();
+  });
+
+  test("独立残留后台任务隐藏原始 Shell/路径/jobId，主视图展示人话摘要且明细收入「技术详情」", async () => {
     const onCancelBgCommand = vi.fn(async () => true);
     const onToggleSessionCron = vi.fn(async () => true);
     const onDeleteSessionCron = vi.fn(async () => true);
     const bgCmd: SessionBgCommandItem = {
       id: "99-ocb_1",
       jobId: "ocb_1",
-      commandPreview: "pytest -q tests/e2e",
-      cwd: "/app",
+      commandPreview: 'HOST_WT="/var/lib/docker/volumes/oc-v5/_data" pytest -q tests/e2e',
+      cwd: "/var/lib/docker/app",
       startedAt: Date.now() - 45_000,
       updatedAt: Date.now() - 1_000,
     };
@@ -318,17 +370,34 @@ describe("PinnedHudStack — unified Live Agent capsule", () => {
     const capsule = await screen.findByTestId("live-agent-capsule");
     expect(capsule).toHaveAttribute("data-primary-kind", "bg_cmd");
     expect(capsule).toHaveAttribute("data-running", "true");
-    expect(capsule).toHaveTextContent("后台命令");
-    expect(capsule).toHaveTextContent("pytest -q tests/e2e");
+    expect(capsule).toHaveTextContent("后台任务运行中");
+    expect(capsule).toHaveTextContent("测试任务");
+    expect(capsule).not.toHaveTextContent("HOST_WT");
+    expect(capsule).not.toHaveTextContent("/var/lib/docker");
+    expect(capsule).not.toHaveTextContent("ocb_1");
     expect(within(capsule).getByTestId("live-agent-capsule-more")).toHaveTextContent("+1");
 
-    // 展开面板展示后台命令与定时续跑并可执行行内干预
+    // 展开面板主视图仅展示人话摘要，默认不暴露原始命令、cwd 与 jobId
     fireEvent.click(screen.getByTestId("live-agent-capsule-toggle"));
     const panel = screen.getByTestId("pinned-background-tasks-panel");
     expect(within(panel).getByText("12 分钟后")).toBeInTheDocument();
+    expect(within(panel).getByText("测试任务")).toBeInTheDocument();
+    expect(within(panel).queryByText(/HOST_WT/)).toBeNull();
+    expect(within(panel).queryByText(/\/var\/lib\/docker\/app/)).toBeNull();
+    expect(within(panel).queryByText(/ocb_1/)).toBeNull();
+
+    // 按需展开「技术详情」后可查看命令、目录与编号
+    const detailsToggle = within(panel).getByTestId("bg-cmd-details-toggle-99-ocb_1");
+    expect(detailsToggle).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(detailsToggle);
+    expect(detailsToggle).toHaveAttribute("aria-expanded", "true");
+    const details = within(panel).getByTestId("bg-cmd-details-99-ocb_1");
+    expect(details).toHaveTextContent('HOST_WT="/var/lib/docker/volumes/oc-v5/_data" pytest -q tests/e2e');
+    expect(details).toHaveTextContent("/var/lib/docker/app");
+    expect(details).toHaveTextContent("ocb_1");
 
     await act(async () => {
-      fireEvent.click(within(panel).getByRole("button", { name: "终止后台命令：pytest -q tests/e2e" }));
+      fireEvent.click(within(panel).getByRole("button", { name: "终止后台任务：测试任务" }));
     });
     expect(onCancelBgCommand).toHaveBeenCalledWith("99-ocb_1");
 
@@ -343,7 +412,7 @@ describe("PinnedHudStack — unified Live Agent capsule", () => {
     expect(onDeleteSessionCron).toHaveBeenCalledWith("cron-1");
   });
 
-  test("异步媒体（Muse + H3）与仅定时续跑场景正确渲染单行胶囊及展开操作", async () => {
+  test("异步媒体：失败错误码翻译为人话并保留「知道了」，成功终态不强迫点击且几秒后自动收起", async () => {
     const onCancelMuseJob = vi.fn(async () => true);
     const onDismissMuseJob = vi.fn();
     const museQueued: SessionMuseJobItem = {
@@ -354,6 +423,14 @@ describe("PinnedHudStack — unified Live Agent capsule", () => {
       queuePosition: 2,
       queueLength: 5,
       queuedAt: Date.now() - 8_000,
+    };
+    const museFailed: SessionMuseJobItem = {
+      id: "muse-f1",
+      kind: "image",
+      status: "failed",
+      promptPreview: "赛博朋克夜景",
+      queuedAt: Date.now() - 12_000,
+      errorCode: "H3_OOM",
     };
     const h3Done: MediaGenerationJob = {
       id: "h3-done",
@@ -380,7 +457,7 @@ describe("PinnedHudStack — unified Live Agent capsule", () => {
         dismissedSwarmKey={null}
         onOpenSwarmBoard={vi.fn()}
         onDismissSwarm={vi.fn()}
-        museJobs={[museQueued]}
+        museJobs={[museQueued, museFailed]}
         mediaJobs={[h3Done]}
         onCancelMuseJob={onCancelMuseJob}
         onDismissMuseJob={onDismissMuseJob}
@@ -397,14 +474,20 @@ describe("PinnedHudStack — unified Live Agent capsule", () => {
     const panel = screen.getByTestId("pinned-background-tasks-panel");
     expect(within(panel).getByText("排队第 2/5 位")).toBeInTheDocument();
     expect(within(panel).getByText("已完成")).toBeInTheDocument();
+    // 裸 H3_OOM 被翻译为人话，不暴露内部 errorCode
+    expect(within(panel).queryByText("H3_OOM")).toBeNull();
+    expect(within(panel).getByText("资源不足，请缩短时长或降低分辨率后重试")).toBeInTheDocument();
+    // 成功项不强制显示「知道了」，仅失败项有「知道了」按钮
+    const ackButtons = within(panel).getAllByRole("button", { name: "知道了" });
+    expect(ackButtons).toHaveLength(1);
 
     await act(async () => {
       fireEvent.click(within(panel).getByRole("button", { name: "取消媒体任务：雪山日出无人机航拍" }));
     });
     expect(onCancelMuseJob).toHaveBeenCalledWith("muse-q1");
 
-    fireEvent.click(within(panel).getByRole("button", { name: "知道了" }));
-    expect(onDismissMuseJob).toHaveBeenCalledWith("h3-done");
+    fireEvent.click(ackButtons[0]!);
+    expect(onDismissMuseJob).toHaveBeenCalledWith("muse-f1");
 
     // 仅剩定时续跑时展示 schedule 胶囊与倒计时
     view.rerender(
@@ -438,5 +521,68 @@ describe("PinnedHudStack — unified Live Agent capsule", () => {
     expect(schedCapsule).toHaveTextContent("定时续跑");
     expect(schedCapsule).toHaveTextContent("晚间总结提醒");
     expect(within(schedCapsule).getByTestId("live-agent-capsule-timer")).toHaveTextContent("25 分钟后");
+  });
+
+  test("成功终态的后台子任务与媒体任务无需点「知道了」，几秒后静默自动隐藏", async () => {
+    const onDismissDelegate = vi.fn();
+    const onDismissMuseJob = vi.fn();
+    const doneDelegate = makeDelegate({ jobId: "dlg-done", state: "completed", resultSummary: "已整理完毕" });
+    const doneMuse: SessionMuseJobItem = {
+      id: "muse-done",
+      kind: "image",
+      status: "succeeded",
+      promptPreview: "晨雾山谷",
+      queuedAt: Date.now() - 10_000,
+    };
+
+    const { container } = render(
+      <PinnedHudStack
+        timelineMessages={[]}
+        chatVersion={1}
+        wsSending={false}
+        delegateItems={[doneDelegate]}
+        onDismissDelegate={onDismissDelegate}
+        museJobs={[doneMuse]}
+        onDismissMuseJob={onDismissMuseJob}
+        latestSwarm={null}
+        latestSwarmKey={null}
+        dismissedSwarmKey={null}
+        onOpenSwarmBoard={vi.fn()}
+        onDismissSwarm={vi.fn()}
+      />,
+    );
+
+    // 先等 lazy chunk 加载完成
+    await screen.findByTestId("live-agent-capsule");
+    vi.useFakeTimers();
+    // 重新挂载进入假时钟窗口验证自动静默收起
+    cleanup();
+    const view2 = render(
+      <PinnedHudStack
+        timelineMessages={[]}
+        chatVersion={1}
+        wsSending={false}
+        delegateItems={[doneDelegate]}
+        onDismissDelegate={onDismissDelegate}
+        museJobs={[doneMuse]}
+        onDismissMuseJob={onDismissMuseJob}
+        latestSwarm={null}
+        latestSwarmKey={null}
+        dismissedSwarmKey={null}
+        onOpenSwarmBoard={vi.fn()}
+        onDismissSwarm={vi.fn()}
+      />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId("live-agent-capsule")).toBeInTheDocument();
+    act(() => {
+      vi.advanceTimersByTime(AUTO_DISMISS_SUCCEEDED_MS + 50);
+    });
+    expect(onDismissDelegate).toHaveBeenCalledWith("dlg-done");
+    expect(onDismissMuseJob).toHaveBeenCalledWith("muse-done");
+    expect(view2.container.querySelector('[data-testid="live-agent-capsule"]')).toBeNull();
+    void container;
   });
 });

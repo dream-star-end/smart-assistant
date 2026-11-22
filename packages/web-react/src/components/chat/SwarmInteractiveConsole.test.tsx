@@ -76,7 +76,7 @@ describe("SwarmBoardDrawer · 遥测展示与交互式指挥操控台", () => {
     expect(formatTelemetryTokens(18_500, 3_200)).toBe("18.5k↑ 3.2k↓");
   });
 
-  it("在成员矩阵中渲染 elapsedMs/tokens/toolCalls 与 telemetryPartial 近似徽标，并支持纠偏与二步确认终止", async () => {
+  it("在成员矩阵中隐藏 ~ 近似 工程徽标，操控栏使用通俗文案并通过 Toast 反馈（不叠内联反馈条）", async () => {
     const auth = createMemoryAuthSession(() => {}, "jwt-swarm-token");
     let terminateMode: "requested" | "confirmed" = "requested";
 
@@ -128,26 +128,25 @@ describe("SwarmBoardDrawer · 遥测展示与交互式指挥操控台", () => {
       </ToastProvider>,
     );
 
-    // 校验成员遥测呈现与 telemetryPartial 诚实 ~ 近似徽标
+    // 校验成员遥测呈现且不再展示「~ 近似」工程徽标
     expect(screen.getByTestId("swarm-member-telemetry-coordinator")).toHaveTextContent("18.5k↑ 3.2k↓");
     expect(screen.queryByTestId("swarm-telemetry-partial-coordinator")).toBeNull();
     expect(screen.getByTestId("swarm-member-telemetry-worker-ui")).toHaveTextContent("~1m14s");
     expect(screen.getByTestId("swarm-member-telemetry-worker-ui")).toHaveTextContent("~14 次");
-    expect(screen.getByTestId("swarm-telemetry-partial-worker-ui")).toHaveTextContent("~ 近似");
+    expect(screen.queryByTestId("swarm-telemetry-partial-worker-ui")).toBeNull();
 
-    // 默认目标是 coordinator，不显示单点终止按钮
+    // 默认目标是 coordinator，不显示停止成员按钮
     expect(screen.queryByTestId("swarm-terminate-trigger")).toBeNull();
 
-    // 发送纠偏指令给 coordinator
+    // 发送指令给 coordinator → Toast 提示，不出现重复内联反馈条
     fireEvent.change(screen.getByTestId("swarm-command-input"), {
       target: { value: "请优先核验 bundle 体积预算" },
     });
     fireEvent.click(screen.getByTestId("swarm-command-send"));
-    expect(await screen.findByTestId("swarm-command-feedback")).toHaveTextContent(
-      "已向 @coordinator 注入纠偏指令（#2）",
-    );
+    expect(await screen.findByText("已向 @coordinator 发送指令（#2）")).toBeInTheDocument();
+    expect(screen.queryByTestId("swarm-command-feedback")).toBeNull();
 
-    // 切换目标到非 coordinator 成员 worker-ui → 展示请求终止按钮 → 二次确认
+    // 切换目标到非 coordinator 成员 worker-ui → 展示停止该成员按钮 → 二次确认
     const targetTrigger = screen.getByTestId("swarm-command-target");
     fireEvent.pointerDown(targetTrigger, { button: 0, ctrlKey: false, pointerType: "mouse" });
     fireEvent.click(await screen.findByTestId("swarm-command-target-option-worker-ui"));
@@ -158,18 +157,16 @@ describe("SwarmBoardDrawer · 遥测展示与交互式指挥操控台", () => {
     });
     fireEvent.click(screen.getByTestId("swarm-terminate-confirm-btn"));
 
-    // 诚实反馈 requested 状态
-    const feedbackRequested = await screen.findByTestId("swarm-command-feedback");
-    expect(feedbackRequested).toHaveTextContent("已提交请求");
-    expect(feedbackRequested).toHaveTextContent("等待执行器确认回收");
+    // Toast 通俗反馈 requested 状态，且不出现重复内联条
+    expect(await screen.findByText("已请求停止 @worker-ui")).toBeInTheDocument();
+    expect(screen.queryByTestId("swarm-command-feedback")).toBeNull();
 
-    // 再次请求并返回 confirmed 状态，验证前端明确区分 confirmed
+    // 再次请求并返回 confirmed 状态，验证 Toast 明确区分已停止
     terminateMode = "confirmed";
     fireEvent.click(screen.getByTestId("swarm-terminate-trigger"));
     fireEvent.click(screen.getByTestId("swarm-terminate-confirm-btn"));
-    await waitFor(() =>
-      expect(screen.getByTestId("swarm-command-feedback")).toHaveTextContent("已确认终止"),
-    );
+    await waitFor(() => expect(screen.getByText("已停止 @worker-ui")).toBeInTheDocument());
+    expect(screen.queryByTestId("swarm-command-feedback")).toBeNull();
   });
 });
 

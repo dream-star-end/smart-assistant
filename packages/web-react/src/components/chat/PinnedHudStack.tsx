@@ -14,17 +14,6 @@ import { currentTurnSettled } from "./turnSegment";
 
 const LiveAgentCapsuleLazy = lazy(() => import("./LiveAgentCapsule"));
 
-function findVisibleGoalMessage(messages: ChatMessage[]): ChatMessage | null {
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const message = messages[i];
-    if (message?.role !== "goal") continue;
-    const status = (message.goalStatus ?? "").trim().toLowerCase();
-    if (message.cleared === true || status === "cleared") return null;
-    return message;
-  }
-  return null;
-}
-
 export type PinnedHudStackProps = {
   timelineMessages: ChatMessage[];
   chatVersion: number;
@@ -56,7 +45,7 @@ export type PinnedHudStackProps = {
 /**
  * Zero-cost gatekeeper above the Composer: stays out of the first-screen modulepreload
  * graph while idle and lazy-loads LiveAgentCapsule (plus swarmUtils/icons/CSS) only when
- * at least one live signal (Swarm / Delegate / Media / BgCmd / Schedule / Task / Goal) is active.
+ * at least one live signal (Swarm / Delegate / Media / BgCmd / Schedule / Task) is active.
  */
 export function PinnedHudStack(props: PinnedHudStackProps) {
   const {
@@ -71,12 +60,11 @@ export function PinnedHudStack(props: PinnedHudStackProps) {
     sessionCrons = [],
   } = props;
 
-  const { todos, settled, goalMessage } = useMemo(() => {
+  const { todos, settled } = useMemo(() => {
     void chatVersion;
     return {
       todos: extractLatestTodos(timelineMessages),
       settled: currentTurnSettled(timelineMessages),
-      goalMessage: findVisibleGoalMessage(timelineMessages),
     };
   }, [timelineMessages, chatVersion]);
 
@@ -84,12 +72,13 @@ export function PinnedHudStack(props: PinnedHudStackProps) {
   const hasSwarm = Boolean(latestSwarm && (latestSwarm.phase === "starting" || latestSwarm.phase === "running"));
   const hasDelegate = delegateItems.length > 0;
   const hasMedia = museJobs.length > 0 || mediaJobs.length > 0;
-  const hasBgCmd = bgCommands.length > 0;
+  // 当前回合正在执行时不重复弹出后台命令胶囊，仅对脱离当前回合的独立/残留后台任务展示
+  const visibleBgCommands = wsSending ? [] : bgCommands;
+  const hasBgCmd = visibleBgCommands.length > 0;
   const hasSchedule = sessionCrons.length > 0;
   const hasTask = todos.some((t) => t.status !== "completed") && (!settled || wsSending);
-  const hasGoal = goalMessage !== null;
 
-  if (!hasSwarm && !hasDelegate && !hasMedia && !hasBgCmd && !hasSchedule && !hasTask && !hasGoal) {
+  if (!hasSwarm && !hasDelegate && !hasMedia && !hasBgCmd && !hasSchedule && !hasTask) {
     return null;
   }
 
@@ -99,11 +88,10 @@ export function PinnedHudStack(props: PinnedHudStackProps) {
         {...props}
         museJobs={museJobs}
         mediaJobs={mediaJobs}
-        bgCommands={bgCommands}
+        bgCommands={visibleBgCommands}
         sessionCrons={sessionCrons}
         todos={todos}
         settled={settled}
-        goalMessage={goalMessage}
       />
     </Suspense>
   );

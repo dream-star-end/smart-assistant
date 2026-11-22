@@ -40,10 +40,10 @@ export function ErrorBanner({
           variant="secondary"
           size="sm"
           onClick={onRetry}
-          aria-label="继续"
+          aria-label="重新发送"
           className="oc-btn-tactile oc-btn-secondary-craft text-accent [@media(hover:none)]:h-11"
         >
-          <RotateCcw size={13} strokeWidth={1.75} /> 继续
+          <RotateCcw size={13} strokeWidth={1.75} /> 重新发送
         </Button>
         {onSwitchModel && (
           <Button

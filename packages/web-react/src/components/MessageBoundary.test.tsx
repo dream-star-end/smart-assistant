@@ -42,9 +42,9 @@ describe("MessageBoundary per-message 错误边界", () => {
         onRespondPermission={() => {}}
       />,
     );
-    // 坏消息 → 一行紧凑占位(含消息 id 前缀小字)
-    expect(screen.getByText("此条消息渲染失败")).toBeInTheDocument();
-    expect(screen.getByText("#bad")).toBeInTheDocument();
+    // 坏消息 → 一行紧凑人话占位（不暴露研发报错语与消息 ID）
+    expect(screen.getByText("该条内容暂时无法显示")).toBeInTheDocument();
+    expect(screen.queryByText("#bad")).toBeNull();
     // 相邻消息照常渲染(React 未卸载整棵树)
     expect(screen.getByText("前一条消息")).toBeInTheDocument();
     expect(screen.getByText("后一条消息")).toBeInTheDocument();
@@ -64,14 +64,14 @@ describe("MessageBoundary per-message 错误边界", () => {
         <MaybeThrow ok={false} />
       </MessageBoundary>,
     );
-    expect(screen.getByText("此条消息渲染失败")).toBeInTheDocument();
+    expect(screen.getByText("该条内容暂时无法显示")).toBeInTheDocument();
     // 同签名重渲 → 不反复抛,维持占位
     rerender(
       <MessageBoundary messageId="m1" sig="s1">
         <MaybeThrow ok={false} />
       </MessageBoundary>,
     );
-    expect(screen.getByText("此条消息渲染失败")).toBeInTheDocument();
+    expect(screen.getByText("该条内容暂时无法显示")).toBeInTheDocument();
     // 签名变化(流式补全坏中间态)→ 重试渲染成功,占位消失
     rerender(
       <MessageBoundary messageId="m1" sig="s2">
@@ -79,7 +79,7 @@ describe("MessageBoundary per-message 错误边界", () => {
       </MessageBoundary>,
     );
     expect(screen.getByText("已恢复")).toBeInTheDocument();
-    expect(screen.queryByText("此条消息渲染失败")).toBeNull();
+    expect(screen.queryByText("该条内容暂时无法显示")).toBeNull();
     err.mockRestore();
   });
 
@@ -99,7 +99,7 @@ describe("MessageBoundary per-message 错误边界", () => {
     );
     expect(screen.getByText("前一条消息")).toBeInTheDocument();
     expect(screen.getByText("后一条消息")).toBeInTheDocument();
-    expect(screen.getByText("此条消息数据结构异常，已跳过渲染")).toBeInTheDocument();
+    expect(screen.getByText("该条内容暂时无法显示")).toBeInTheDocument();
     expect(screen.queryByText("坏计划")).toBeNull();
     err.mockRestore();
   });

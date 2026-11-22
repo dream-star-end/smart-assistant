@@ -93,8 +93,7 @@ import {
   type PermissionRespond,
   isAwaitingPermissionPrompt,
 } from "./chat/permissionPromptState";
-import { PermissionToolReopenContext, ToolCardSlot } from "./chat/toolCardSlot";
-import { reopenPermissionUi, yieldActiveModal } from "../lib/chat/permissionPopupCoordinator";
+import { ToolCardSlot } from "./chat/toolCardSlot";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
 import { currentTurnStartIndex, projectVisibleAssistantRows, splitStoppedNarration, turnFinalAssistantFlags, turnRatingFlags, turnRecoveryParents } from "./chat/turnSegment";
 import {
@@ -104,7 +103,7 @@ import {
   loadedArchivedMetrics,
   type VisibleVirtualRowAnchor,
 } from "./chat/archivePaging";
-import { JournalHydrationRetry, PartialHistorySkeleton } from "./chat/HistorySkeleton";
+import { PartialHistorySkeleton } from "./chat/HistorySkeleton";
 import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput } from "./tool/format";
 import { Alert, IconButton, Input, Spinner } from "./ui";
@@ -301,7 +300,7 @@ const MessageRendererInner = memo(
         return (
           <TapeBackedCard>
             <PlanCard msg={message} tokenUsage={tokenUsage} />
-            <ExactTapeRecordDisclosure messages={[message]} label="计划" />
+            {readOnly && <ExactTapeRecordDisclosure messages={[message]} label="计划" />}
           </TapeBackedCard>
         );
       case "goal":
@@ -311,7 +310,7 @@ const MessageRendererInner = memo(
         return (
           <TapeBackedCard>
             <p className="whitespace-pre-wrap break-words text-sm text-fg">{message.text || "会话目标"}</p>
-            <ExactTapeRecordDisclosure messages={[message]} label="目标" />
+            {readOnly && <ExactTapeRecordDisclosure messages={[message]} label="目标" />}
           </TapeBackedCard>
         );
       case "permission": {
@@ -720,10 +719,10 @@ function DeferredTapeRecordCard({
           }}
           className="text-muted underline-offset-2 hover:text-fg hover:underline"
         >
-          {isUserPayload ? "完整用户消息加载失败，点击继续" : "真实记录加载失败，点击继续"}
+          {isUserPayload ? "完整消息加载失败，点击重新加载" : "内容加载失败，点击重新加载"}
         </button>
       ) : (
-        <span>{isUserPayload ? "正在读取完整用户消息…" : "正在读取真实 Agent 记录…"}</span>
+        <span>{isUserPayload ? "正在加载完整消息…" : "正在加载内容…"}</span>
       )}
     </div>
   );
@@ -1523,7 +1522,7 @@ export type MessageListArchive = {
   archivedThroughSeq?: number;
   /** 云端加载进行中(按钮转 loading 态、禁用)。 */
   loading: boolean;
-  /** 上次云端加载失败(按钮转「加载失败，点击继续」,点击即重试)。 */
+  /** 上次云端加载失败(按钮转「加载失败，点击重试」,点击即重试)。 */
   error: boolean;
   /** 拉更早一页归档(App 接线 loadOlderHistory + 前插后视口保持)。 */
   onLoadOlder: () => void | Promise<void>;
@@ -1561,8 +1560,6 @@ export function MessageList({
   turnActivity,
   transientNotice,
   historyLoading = false,
-  journalDegraded = false,
-  onRetryJournal,
   archive,
   cb,
   onRespondPermission,
@@ -1581,13 +1578,10 @@ export function MessageList({
   liveTurnUsage?: { clientMessageId: string; usage: LiveTurnTokenUsageSnapshot };
   /** 本轮活动快照（TurnActivity 阶段反馈）；null=无活跃轮。*/
   turnActivity?: TurnActivityInfo | null;
-  /** 会话级 transient 软提示（"正在发送…"等，非消息卡片，末尾 info 条渲染）。*/
+  /** 会话级 transient 软提示（非消息卡片，末尾 info 条渲染）。*/
   transientNotice?: { text: string } | null;
-  /** 已有部分消息可见，但 canonical history 仍在加载。Journal 水合不再占用此位。 */
+  /** 已有部分消息可见，但 canonical history 仍在加载。 */
   historyLoading?: boolean;
-  /** Background live-journal hydrate degraded; show an explicit retry. */
-  journalDegraded?: boolean;
-  onRetryJournal?: () => void;
   /** 归档分页上下文；缺省=无归档(仅本地翻页)。*/
   archive?: MessageListArchive | null;
   cb: CardCallbacks;
@@ -2691,7 +2685,7 @@ export function MessageList({
         {liveUnitsBusy
           ? <><Spinner size={12} /> 加载中…</>
           : liveAttention === "error"
-            ? <span className="text-danger">加载失败，点击继续</span>
+            ? <span className="text-danger">加载失败，点击重试</span>
             : "加载更早的处理步骤"}
       </button>
     </div>
@@ -2827,7 +2821,7 @@ export function MessageList({
             className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3.5 py-2 text-meta text-muted"
             data-testid="corrupt-message-placeholder"
           >
-            此条消息数据结构异常，已跳过渲染
+            该条内容暂时无法显示
           </div>
         </MessageBoundary>
       );
@@ -2875,7 +2869,7 @@ export function MessageList({
           : windowStart === 0 && (archive?.loading || archiveQueued)
           ? <><Spinner size={12} /> 加载中…</>
           : windowStart === 0 && archive?.error
-            ? <span className="text-danger">加载失败，点击继续</span>
+            ? <span className="text-danger">加载失败，点击重试</span>
             : windowStart > 0
               ? `查看更早历史记录（还有 ${windowStart} 条）`
               : legacyArchivedRemaining > 0
@@ -2904,9 +2898,6 @@ export function MessageList({
         </Alert>
       )}
       {historyLoading && <PartialHistorySkeleton />}
-      {journalDegraded && !historyLoading && onRetryJournal && (
-        <JournalHydrationRetry onRetry={onRetryJournal} />
-      )}
     </div>
   );
 
@@ -2915,58 +2906,18 @@ export function MessageList({
     .filter((message) => message.role === "permission")
     .map((message) => `${message.requestId}:${message._resolved}:${message._controlPending}:${message._inputTruncated}`)
     .join("|");
-  const pendingPrompts = useMemo(
-    () => (readOnly ? [] : messages.filter((message) => isAwaitingPermissionPrompt(message))),
-    [pendingSig, readOnly, messages],
-  );
-  const dockReopenedRef = useRef<{ sessionId: string | undefined; requestId: string } | null>(null);
-  useEffect(() => {
-    const active = dockReopenedRef.current;
-    if (!active) return;
-    if (
-      active.sessionId !== sessionId ||
-      !pendingPrompts.some((message) => message.requestId === active.requestId)
-    ) {
-      yieldActiveModal(active.requestId);
-      dockReopenedRef.current = null;
-    }
-  }, [sessionId, pendingPrompts]);
-  useEffect(() => () => {
-    if (dockReopenedRef.current) {
-      yieldActiveModal(dockReopenedRef.current.requestId);
-      dockReopenedRef.current = null;
-    }
-  }, []);
-  // OCV5-421: pendingPrompts 依赖每次渲染新过滤出的 messages,本身不缓存;以前 Context value 也跟着
-  // 每个流式 notify 换新,所有已挂载的工具卡一起重渲。value 只按映射内容换新。
-  const reopenKey = pendingPrompts
-    .map((message) => (message.requestId && message.toolUseId ? `${message.toolUseId}=${message.requestId}` : ""))
-    .join("|");
-  const permissionReopen = useMemo(() => {
-    const requestIdByToolUseId = new Map<string, string>();
-    for (const pair of reopenKey.split("|")) {
-      const at = pair.indexOf("=");
-      if (at > 0) requestIdByToolUseId.set(pair.slice(0, at), pair.slice(at + 1));
-    }
-    return { requestIdByToolUseId };
-  }, [reopenKey]);
 
   // App/admin pass an explicit null during the callback-ref's first commit.
   // Do not mount the transcript in that frame; omitted/undefined remains the
   // lightweight test/non-scroll surface contract.
   if (scrollParent === null) {
-    return (
-      <div className="mx-auto flex max-w-3xl items-center justify-center px-5 py-8 text-muted" role="status">
-        <Spinner size={14} />
-        <span className="ml-2 text-xs">正在准备会话…</span>
-      </div>
-    );
+    return null;
   }
 
   // Empty data must still show loading/activity chrome. A cold mobile tab can
   // have a real history request or active turn with no canonical row yet.
   if (scrollParent && visibleItems.length === 0 && (
-    sending || historyLoading || transientNotice || (journalDegraded && onRetryJournal)
+    sending || historyLoading || transientNotice
   )) {
     return <div className="mx-auto max-w-3xl px-5 py-8">{footer}</div>;
   }
@@ -3024,37 +2975,16 @@ export function MessageList({
   };
   return (
     <ReadOnlySystemActionsBoundary readOnly={readOnly}>
-    <PermissionToolReopenContext.Provider value={permissionReopen}>
     <>
     {!readOnly && pendingSig.length > 0 ? (
-      <PermissionPromptHost messages={messages} onRespond={onRespondPermission} readOnly={readOnly} sending={sending} sessionId={sessionId} />
-    ) : null}
-    {pendingPrompts.length > 0 ? (
-      <div
-        data-testid="pending-permission-dock"
-        className="oc-surface-glass sticky top-0 z-10 mx-auto flex max-w-3xl flex-wrap items-center gap-2 rounded-b-xl px-5 py-2"
-      >
-        <span className="text-caption font-medium text-muted">待回答</span>
-        {pendingPrompts.map((message) => (
-          <button
-            key={message.requestId ?? message.id}
-            type="button"
-            className="oc-btn-tactile rounded-full border border-accent/25 bg-accent-soft px-3 py-1 text-caption font-medium text-accent transition-colors hover:bg-accent/15 [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
-            onClick={() => {
-              if (message.requestId) {
-                dockReopenedRef.current = { sessionId, requestId: message.requestId };
-                reopenPermissionUi(message.requestId);
-              }
-            }}
-          >
-            {message.toolName === "AskUserQuestion"
-              ? "打开提问"
-              : message.toolName === "ExitPlanMode"
-                ? "打开计划"
-                : "打开审批"}
-          </button>
-        ))}
-      </div>
+      <PermissionPromptHost
+        messages={messages}
+        onRespond={onRespondPermission}
+        readOnly={readOnly}
+        sending={sending}
+        sessionId={sessionId}
+        scrollParent={scrollParent}
+      />
     ) : null}
     {find ? (
       <div
@@ -3154,14 +3084,14 @@ export function MessageList({
               {archive?.loading || archiveQueued
                 ? <><Spinner size={12} /> 加载中…</>
                 : archive?.error
-                  ? <span className="text-danger">加载失败，点击继续</span>
+                  ? <span className="text-danger">加载失败，点击重试</span>
                   : "搜更早"}
             </button>
           </div>
         ) : null}
       </div>
     ) : null}
-    {!find && pendingPrompts.length === 0 ? <div aria-hidden data-testid="timeline-top-fade" className="pointer-events-none sticky top-0 z-10 -mb-3 h-3 bg-gradient-to-b from-bg to-transparent" /> : null}
+    {!find ? <div aria-hidden data-testid="timeline-top-fade" className="pointer-events-none sticky top-0 z-10 -mb-3 h-3 bg-gradient-to-b from-bg to-transparent" /> : null}
     <div
       ref={listRootRef}
       className="mx-auto max-w-3xl space-y-4 px-5 py-8"
@@ -3245,7 +3175,6 @@ export function MessageList({
       )}
     </div>
     </>
-    </PermissionToolReopenContext.Provider>
     </ReadOnlySystemActionsBoundary>
   );
 }

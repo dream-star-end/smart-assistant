@@ -8,12 +8,10 @@ import {
   Film,
   Image as ImageIcon,
   ListChecks,
-  Target,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { isTerminalDelegateState, type InflightDelegateItem } from "../../lib/chat/inflightDelegates";
 import type { ChatMessage, LiveTurnTokenUsageSnapshot } from "../../lib/chat/model";
-import { formatDurationSeconds } from "../../lib/chat/pure";
 import {
   firstLinePreview,
   formatCompactElapsed,
@@ -27,17 +25,20 @@ import {
 import { AtelierIcon } from "../ui/AtelierIcons";
 import {
   PinnedDelegateTrackerLazy,
-  PinnedGoalBarLazy,
   PinnedSwarmDock,
   PinnedTaskTrackerLazy,
 } from "./lazyTimelineCards";
-import { PinnedBackgroundTasksPanel } from "./PinnedBackgroundTasksPanel";
+import {
+  AUTO_DISMISS_SUCCEEDED_MS,
+  PinnedBackgroundTasksPanel,
+  summarizeBgCommand,
+} from "./PinnedBackgroundTasksPanel";
 import type { SwarmOpenRequest } from "./swarmDetect";
 import { formatSwarmElapsed, isSwarmActive, summarizeSwarmCounts, swarmPhaseMeta } from "./swarmUtils";
 import type { TodoItem } from "./todoExtract";
 import "./liveActivity.css";
 
-export type HudKind = "swarm" | "delegate" | "media" | "bg_cmd" | "schedule" | "task" | "goal";
+export type HudKind = "swarm" | "delegate" | "media" | "bg_cmd" | "schedule" | "task";
 
 function parseIsoMs(iso: string | undefined): number {
   if (!iso) return 0;
@@ -46,10 +47,9 @@ function parseIsoMs(iso: string | undefined): number {
 }
 
 export type LiveAgentCapsuleProps = {
-  timelineMessages: ChatMessage[];
+  timelineMessages?: ChatMessage[];
   todos: TodoItem[];
   settled: boolean;
-  goalMessage: ChatMessage | null;
   wsSending: boolean;
   tokenUsage?: LiveTurnTokenUsageSnapshot;
   delegateItems: InflightDelegateItem[];
@@ -79,7 +79,6 @@ export default function LiveAgentCapsule({
   timelineMessages,
   todos,
   settled,
-  goalMessage,
   wsSending,
   tokenUsage,
   delegateItems,
@@ -104,27 +103,121 @@ export default function LiveAgentCapsule({
   onToggleSessionCron,
   onDeleteSessionCron,
 }: LiveAgentCapsuleProps) {
+  void timelineMessages;
+  void tokenUsage;
   const [expanded, setExpanded] = useState(false);
   const [now, setNow] = useState(() => Date.now());
+  const [autoHiddenDelegates, setAutoHiddenDelegates] = useState<ReadonlySet<string>>(() => new Set());
+  const [autoHiddenMedia, setAutoHiddenMedia] = useState<ReadonlySet<string>>(() => new Set());
   const delegateStartRef = useRef(new Map<string, number>());
+  const delegateAutoTimersRef = useRef(new Map<string, number>());
+  const mediaAutoTimersRef = useRef(new Map<string, number>());
+  const onDismissDelegateRef = useRef(onDismissDelegate);
+  onDismissDelegateRef.current = onDismissDelegate;
+  const onDismissMuseJobRef = useRef(onDismissMuseJob);
+  onDismissMuseJobRef.current = onDismissMuseJob;
+
+  // 成功终态自动短暂展示后静默隐藏，不再强迫用户点「知道了」
+  useEffect(() => {
+    const timers = delegateAutoTimersRef.current;
+    const succeededIds = new Set<string>();
+    for (const item of delegateItems) {
+      if (item.state === "completed") succeededIds.add(item.jobId);
+    }
+    for (const [id, timer] of timers) {
+      if (!succeededIds.has(id)) {
+        window.clearTimeout(timer);
+        timers.delete(id);
+      }
+    }
+    for (const id of succeededIds) {
+      if (autoHiddenDelegates.has(id) || timers.has(id)) continue;
+      const timer = window.setTimeout(() => {
+        timers.delete(id);
+        setAutoHiddenDelegates((prev) => {
+          if (prev.has(id)) return prev;
+          const next = new Set(prev);
+          next.add(id);
+          return next;
+        });
+        onDismissDelegateRef.current(id);
+      }, AUTO_DISMISS_SUCCEEDED_MS);
+      timers.set(id, timer);
+    }
+  }, [delegateItems, autoHiddenDelegates]);
+
+  useEffect(() => {
+    const timers = mediaAutoTimersRef.current;
+    const succeededIds = new Set<string>();
+    for (const job of museJobs) {
+      if (job.status === "succeeded") succeededIds.add(job.id);
+    }
+    for (const job of mediaJobs) {
+      if (job.status === "completed") succeededIds.add(job.id);
+    }
+    for (const [id, timer] of timers) {
+      if (!succeededIds.has(id)) {
+        window.clearTimeout(timer);
+        timers.delete(id);
+      }
+    }
+    for (const id of succeededIds) {
+      if (autoHiddenMedia.has(id) || timers.has(id)) continue;
+      const timer = window.setTimeout(() => {
+        timers.delete(id);
+        setAutoHiddenMedia((prev) => {
+          if (prev.has(id)) return prev;
+          const next = new Set(prev);
+          next.add(id);
+          return next;
+        });
+        onDismissMuseJobRef.current?.(id);
+      }, AUTO_DISMISS_SUCCEEDED_MS);
+      timers.set(id, timer);
+    }
+  }, [museJobs, mediaJobs, autoHiddenMedia]);
+
+  useEffect(
+    () => () => {
+      for (const timer of delegateAutoTimersRef.current.values()) window.clearTimeout(timer);
+      delegateAutoTimersRef.current.clear();
+      for (const timer of mediaAutoTimersRef.current.values()) window.clearTimeout(timer);
+      mediaAutoTimersRef.current.clear();
+    },
+    [],
+  );
+
+  const visibleDelegates = useMemo(
+    () => delegateItems.filter((item) => !(item.state === "completed" && autoHiddenDelegates.has(item.jobId))),
+    [delegateItems, autoHiddenDelegates],
+  );
+  const visibleMuseJobs = useMemo(
+    () => museJobs.filter((j) => !(j.status === "succeeded" && autoHiddenMedia.has(j.id))),
+    [museJobs, autoHiddenMedia],
+  );
+  const visibleMediaJobs = useMemo(
+    () => mediaJobs.filter((j) => !(j.status === "completed" && autoHiddenMedia.has(j.id))),
+    [mediaJobs, autoHiddenMedia],
+  );
+  // 当前回合正在执行时不重复弹出后台命令胶囊，仅对脱离当前回合的独立/残留后台任务展示
+  const visibleBgCommands = wsSending ? [] : bgCommands;
 
   const swarmActive = latestSwarm ? isSwarmActive(latestSwarm.phase) : false;
   const hasSwarm = swarmActive;
-  const hasDelegate = delegateItems.length > 0;
-  const hasMedia = museJobs.length > 0 || mediaJobs.length > 0;
-  const hasBgCmd = bgCommands.length > 0;
+  const hasDelegate = visibleDelegates.length > 0;
+  const hasMedia = visibleMuseJobs.length > 0 || visibleMediaJobs.length > 0;
+  const hasBgCmd = visibleBgCommands.length > 0;
   const hasSchedule = sessionCrons.length > 0;
   const hasIncompleteTodo = todos.some((t) => t.status !== "completed");
   const hasTask = hasIncompleteTodo && (!settled || wsSending);
-  const hasGoal = goalMessage !== null;
 
   const runningDelegates = useMemo(
-    () => delegateItems.filter((item) => item.state === "running"),
-    [delegateItems],
+    () => visibleDelegates.filter((item) => item.state === "running"),
+    [visibleDelegates],
   );
   const liveDelegates = useMemo(
-    () => delegateItems.filter((item) => !isTerminalDelegateState(item.state)),
-    [delegateItems],
+    () => visibleDelegates.filter((item) => !isTerminalDelegateState(item.state)),
+    [visibleDelegates],
   );
   const primaryDelegate = useMemo(() => {
     const pool =
@@ -132,30 +225,28 @@ export default function LiveAgentCapsule({
         ? runningDelegates
         : liveDelegates.length > 0
           ? liveDelegates
-          : delegateItems;
+          : visibleDelegates;
     return pool.slice().sort((a, b) => b.updatedAt - a.updatedAt)[0] ?? null;
-  }, [delegateItems, liveDelegates, runningDelegates]);
+  }, [visibleDelegates, liveDelegates, runningDelegates]);
 
   const activeMuseJobs = useMemo(
-    () => museJobs.filter((j) => !isTerminalMuseJobStatus(j.status)),
-    [museJobs],
+    () => visibleMuseJobs.filter((j) => !isTerminalMuseJobStatus(j.status)),
+    [visibleMuseJobs],
   );
   const activeMediaJobs = useMemo(
-    () => mediaJobs.filter((j) => !isTerminalMediaJobStatus(j.status)),
-    [mediaJobs],
+    () => visibleMediaJobs.filter((j) => !isTerminalMediaJobStatus(j.status)),
+    [visibleMediaJobs],
   );
   const mediaActiveCount = activeMuseJobs.length + activeMediaJobs.length;
-  const mediaTotalCount = museJobs.length + mediaJobs.length;
+  const mediaTotalCount = visibleMuseJobs.length + visibleMediaJobs.length;
   const mediaRunning = mediaActiveCount > 0;
 
-  const primaryBgCmd = bgCommands[0] ?? null;
+  const primaryBgCmd = visibleBgCommands[0] ?? null;
   const enabledCrons = useMemo(
     () => sessionCrons.filter((c) => c.enabled),
     [sessionCrons],
   );
   const primaryCron = enabledCrons[0] ?? sessionCrons[0] ?? null;
-  const goalActive =
-    hasGoal && (goalMessage.goalStatus ?? "active").trim().toLowerCase() === "active";
 
   // 活跃运行态优先于待触发定时/已终态提示，保持单行胶囊只聚焦此刻最关键的运行态
   const activeOrder: HudKind[] = [];
@@ -164,26 +255,24 @@ export default function LiveAgentCapsule({
   if (hasMedia && mediaRunning) activeOrder.push("media");
   if (hasBgCmd) activeOrder.push("bg_cmd");
   if (hasTask) activeOrder.push("task");
-  if (hasGoal && goalActive) activeOrder.push("goal");
   if (hasDelegate && liveDelegates.length === 0) activeOrder.push("delegate");
   if (hasMedia && !mediaRunning) activeOrder.push("media");
   if (hasSchedule) activeOrder.push("schedule");
-  if (hasGoal && !goalActive) activeOrder.push("goal");
 
   useEffect(() => {
     const seen = Date.now();
-    const ids = new Set(delegateItems.map((item) => item.jobId));
+    const ids = new Set(visibleDelegates.map((item) => item.jobId));
     for (const id of delegateStartRef.current.keys()) {
       if (!ids.has(id)) delegateStartRef.current.delete(id);
     }
-    for (const item of delegateItems) {
+    for (const item of visibleDelegates) {
       if (isTerminalDelegateState(item.state)) continue;
       if (!delegateStartRef.current.has(item.jobId)) {
         const anchor = item.updatedAt > 0 ? Math.min(seen, item.updatedAt) : seen;
         delegateStartRef.current.set(item.jobId, anchor);
       }
     }
-  }, [delegateItems]);
+  }, [visibleDelegates]);
 
   const fastTimerRunning =
     swarmActive || runningDelegates.length > 0 || mediaRunning || hasBgCmd;
@@ -232,7 +321,7 @@ export default function LiveAgentCapsule({
   } else if (primaryKind === "delegate" && primaryDelegate) {
     const liveCount = liveDelegates.length;
     isRunning = runningDelegates.length > 0;
-    label = liveCount > 0 ? `后台 ${liveCount} 进行中` : `后台 ${delegateItems.length} 已结束`;
+    label = liveCount > 0 ? `后台 ${liveCount} 进行中` : `后台 ${visibleDelegates.length} 已结束`;
     detail = firstLinePreview(primaryDelegate.goal) || primaryDelegate.goal;
     if (isRunning) {
       const start = delegateStartRef.current.get(primaryDelegate.jobId) ?? now;
@@ -240,8 +329,8 @@ export default function LiveAgentCapsule({
     }
   } else if (primaryKind === "media") {
     isRunning = mediaRunning;
-    const primaryMuse = activeMuseJobs[0] ?? museJobs[0] ?? null;
-    const primaryMedia = activeMediaJobs[0] ?? mediaJobs[0] ?? null;
+    const primaryMuse = activeMuseJobs[0] ?? visibleMuseJobs[0] ?? null;
+    const primaryMedia = activeMediaJobs[0] ?? visibleMediaJobs[0] ?? null;
     if (primaryMuse && (activeMuseJobs.length > 0 || activeMediaJobs.length === 0)) {
       primaryMediaIsImage = primaryMuse.kind === "image";
       const kindWord = primaryMuse.kind === "image" ? "图片" : "视频";
@@ -286,8 +375,8 @@ export default function LiveAgentCapsule({
     }
   } else if (primaryKind === "bg_cmd" && primaryBgCmd) {
     isRunning = true;
-    label = bgCommands.length > 1 ? `后台命令 ${bgCommands.length}` : "后台命令";
-    detail = firstLinePreview(primaryBgCmd.commandPreview) || primaryBgCmd.jobId;
+    label = visibleBgCommands.length > 1 ? `后台任务 ${visibleBgCommands.length}` : "后台任务运行中";
+    detail = summarizeBgCommand(primaryBgCmd);
     if (primaryBgCmd.startedAt > 0) {
       timer = formatCompactElapsed(Math.max(0, now - primaryBgCmd.startedAt));
     }
@@ -312,14 +401,6 @@ export default function LiveAgentCapsule({
         ? activeTodo.activeForm
         : activeTodo.content
       : "";
-    if (tokenUsage?.totalTokens) {
-      timer = `${tokenUsage.totalTokens.toLocaleString()} tok`;
-    }
-  } else if (primaryKind === "goal" && goalMessage) {
-    isRunning = goalActive;
-    label = "目标";
-    detail = goalMessage.text || "会话目标";
-    timer = formatDurationSeconds(goalMessage.timeUsedSeconds);
   }
 
   const hasBackgroundPanel = hasMedia || hasBgCmd || hasSchedule;
@@ -342,8 +423,6 @@ export default function LiveAgentCapsule({
         return <Clock size={11} strokeWidth={1.85} aria-hidden className="oc-live-capsule-icon" />;
       case "task":
         return <ListChecks size={11} strokeWidth={1.85} aria-hidden className="oc-live-capsule-icon" />;
-      case "goal":
-        return <Target size={11} strokeWidth={1.85} aria-hidden className="oc-live-capsule-icon" />;
     }
   };
 
@@ -351,22 +430,21 @@ export default function LiveAgentCapsule({
     <div data-testid="pinned-hud-stack">
       {expanded && (
         <div className="oc-live-expanded-stack" data-testid="live-agent-expanded">
-          {hasGoal && <PinnedGoalBarLazy messages={timelineMessages} />}
           {hasTask && (
             <PinnedTaskTrackerLazy
               todos={todos}
               active={wsSending}
               settled={settled}
-              tokenUsage={tokenUsage}
             />
           )}
           {hasBackgroundPanel && (
             <PinnedBackgroundTasksPanel
-              museJobs={museJobs}
-              mediaJobs={mediaJobs}
-              bgCommands={bgCommands}
+              museJobs={visibleMuseJobs}
+              mediaJobs={visibleMediaJobs}
+              bgCommands={visibleBgCommands}
               sessionCrons={sessionCrons}
               now={now}
+              autoDismissSucceeded={false}
               onCancelMuseJob={onCancelMuseJob}
               onDismissMuseJob={onDismissMuseJob}
               onCancelMediaJob={onCancelMediaJob}
@@ -377,7 +455,8 @@ export default function LiveAgentCapsule({
           )}
           {hasDelegate && (
             <PinnedDelegateTrackerLazy
-              items={delegateItems}
+              items={visibleDelegates}
+              autoDismissSucceeded={false}
               onDismiss={onDismissDelegate}
               onCancel={onCancelDelegate}
               onStop={onStopTurn}

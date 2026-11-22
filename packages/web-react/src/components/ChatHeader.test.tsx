@@ -397,48 +397,25 @@ describe("ChatHeader 极简左侧与顶栏订阅入口（OCV5-844）", () => {
   });
 });
 
-describe("ChatHeader 全局新版本条委派至 WorkspaceShellHeader（OCV5-843）", () => {
-  it("updateAvailable=false 或缺 onReloadForUpdate 时不渲染", () => {
-    renderHeader({ onReloadForUpdate: vi.fn() });
-    expect(screen.queryByTestId("shell-update-banner")).toBeNull();
-    expect(screen.queryByTestId("update-pill")).toBeNull();
-    cleanup();
-    renderHeader({ updateAvailable: true });
-    expect(screen.queryByTestId("shell-update-banner")).toBeNull();
-  });
-
-  it("可见时由壳层统一承接（不挤占模型行与右侧图标组），无模型列表时同样展示", () => {
-    const onReloadForUpdate = vi.fn();
-    const { container } = render(
+describe("ChatHeader 顶栏精简（无全宽版本通栏、无未分类推荐胶囊、无纯展示运行徽章）", () => {
+  it("updateAvailable + onReloadForUpdate 不渲染全宽新版本通栏", () => {
+    render(
       <ChatHeader
         agent={MAIN_AGENT}
         onAgentClick={() => {}}
         updateAvailable
-        onReloadForUpdate={onReloadForUpdate}
+        onReloadForUpdate={vi.fn()}
       />,
     );
-    const header = container.querySelector("header");
-    const banner = screen.getByTestId("shell-update-banner");
-    const pill = screen.getByRole("button", { name: "有新版本，点击刷新页面" });
-    expect(header).toContainElement(banner);
-    expect(banner).toContainElement(pill);
-    expect(pill).toHaveTextContent("发现新版本 · 立即刷新");
-    fireEvent.click(pill);
-    expect(onReloadForUpdate).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("shell-update-banner")).toBeNull();
+    expect(screen.queryByTestId("update-pill")).toBeNull();
   });
-});
 
-describe("ChatHeader 未分类会话的项目建议", () => {
-  it("显示建议；移入与不用各自回调；已在项目里时显示所在项目而不是建议", () => {
+  it("未分类会话不再渲染顶栏猜测推荐胶囊，已归属项目仍保留项目面包屑", () => {
     const onAccept = vi.fn();
     const onDismiss = vi.fn();
     renderHeader({ projectSuggestion: { name: "论文综述", onAccept, onDismiss } });
-    const suggestion = screen.getByTestId("chat-project-suggestion");
-    expect(suggestion).toHaveClass("hidden", "sm:inline-flex");
-    fireEvent.click(screen.getByRole("button", { name: "移入项目「论文综述」" }));
-    fireEvent.click(screen.getByRole("button", { name: "不用移入" }));
-    expect(onAccept).toHaveBeenCalledTimes(1);
-    expect(onDismiss).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("chat-project-suggestion")).toBeNull();
     cleanup();
     renderHeader({
       projectBreadcrumb: { chatName: "别的项目" },
@@ -447,10 +424,8 @@ describe("ChatHeader 未分类会话的项目建议", () => {
     expect(screen.queryByTestId("chat-project-suggestion")).toBeNull();
     expect(screen.getByTestId("chat-project-breadcrumb")).toHaveTextContent("别的项目");
   });
-});
 
-describe("ChatHeader 视觉层次与运行态焦点（OCV5-811）", () => {
-  it("展示可选会话标题与运行态徽章，同时显式保留强模型选择器", () => {
+  it("展示可选会话标题与强模型选择器，不再渲染纯展示型运行中胶囊", () => {
     renderHeader({
       sessionTitle: "性能回归排查",
       running: true,
@@ -460,9 +435,7 @@ describe("ChatHeader 视觉层次与运行态焦点（OCV5-811）", () => {
       paneOpen: true,
     });
     expect(screen.getByTestId("chat-session-title")).toHaveTextContent("性能回归排查");
-    const runningBadge = screen.getByTestId("header-running-badge");
-    expect(runningBadge).toHaveTextContent("运行中");
-    expect(screen.getByTestId("chat-model-row")).toContainElement(runningBadge);
+    expect(screen.queryByTestId("header-running-badge")).toBeNull();
     expect(screen.getByTestId("chat-model-row")).toContainElement(
       screen.getByRole("button", { name: "选择对话模型" }),
     );
@@ -471,7 +444,7 @@ describe("ChatHeader 视觉层次与运行态焦点（OCV5-811）", () => {
     );
   });
 
-  it("默认标题「新对话」与 running=false 时不额外渲染噪声徽章", () => {
+  it("默认标题「新对话」与 running=false 时不额外渲染噪声标题", () => {
     renderHeader({ sessionTitle: "新对话", running: false });
     expect(screen.queryByTestId("chat-session-title")).toBeNull();
     expect(screen.queryByTestId("header-running-badge")).toBeNull();

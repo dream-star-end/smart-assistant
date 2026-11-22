@@ -5,6 +5,7 @@ import { ApiError, api } from "../lib/api";
 import { reportClientFriction } from "../lib/clientFriction";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import { isLiveUnitsPage } from "../lib/chat/liveUnitsHydrate";
+import { isPermanentJournalError } from "../lib/chat/pure";
 import { ChatSocket, type ChatSnapshot, type DispatchStatus } from "../lib/chat/socket";
 import { DeferredPayloadQueue } from "../lib/chat/deferredPayloadQueue";
 import { parseTapeRecordPayload, type TapePayloadExpectation } from "../lib/chat/tapePayload";
@@ -188,8 +189,6 @@ export type UseChatSocket = {
     applyTapeProjection: () => Promise<void>,
     fetchUnits?: (query?: { before?: string | null }) => Promise<unknown>,
   ) => Promise<void>;
-  /** Re-run background journal hydrate after a page/time-cap degrade. */
-  retryLiveJournalHydration: (sessId: string) => Promise<void>;
   /** server 增量游标（getSession 的 sinceSeq；无则 0=全量）。*/
   storedMaxSeq: (sessId: string | undefined) => number;
   /** History revision paired with storedMaxSeq; absent forces a full fallback. */
@@ -539,7 +538,8 @@ export function useChatSocket(opts: {
           if (!isCurrent()) return false;
           persistRef.current(sessId); // server-wins 合并后落地新 tape + 游标
           return true;
-        } catch {
+        } catch (err) {
+          if (isPermanentJournalError(err)) context?.onPermanentError?.();
           /* sync 失败：保留现状，下次重连/前台再试 */
           return false;
         }
@@ -899,43 +899,6 @@ export function useChatSocket(opts: {
       socket.hydrateDurableLiveFrameJournal(sessId, fetchPage, applyTapeProjection, fetchUnits),
     [socket],
   );
-  const retryLiveJournalHydration = useCallback<UseChatSocket["retryLiveJournalHydration"]>(
-    async (sessId) => {
-      const a = authRef.current;
-      const live = socketRef.current;
-      if (!a || !live) return;
-      const sess = live.sessions.get(sessId);
-      if (sess) sess._liveJournalDegraded = false;
-      await live.hydrateDurableLiveFrameJournal(
-        sessId,
-        (after) => api.getSessionLiveFrames(a, sessId, after, 500),
-        async () => {
-          const tapeDetail = await api.getSession(a, sessId, 0);
-          live.applyServerMessages(
-            sessId,
-            tapeDetail.agentId || sess?.agentId || "main",
-            Array.isArray(tapeDetail.messages) ? tapeDetail.messages as ChatMessage[] : [],
-            !tapeDetail.isPartial,
-            tapeDetail.maxSeq,
-            {
-              archivedThroughSeq: tapeDetail.archivedThroughSeq,
-              archivedCount: tapeDetail.archivedCount,
-              serverUpdatedAt: tapeDetail.updatedAt,
-              historyRevision: tapeDetail.historyRevision,
-              timelineGeneration: tapeDetail.timelineGeneration,
-              timelineCursor: tapeDetail.timelineCursor,
-              timelineHasMore: tapeDetail.timelineHasMore,
-              timelineSnapshotMaxSeq: tapeDetail.timelineSnapshotMaxSeq,
-              automaticRecoveries: tapeDetail.automaticRecoveries,
-              invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
-            },
-          );
-        },
-        (query) => api.getSessionLiveUnits(a, sessId, { n: 20, ...query }),
-      );
-    },
-    [socket],
-  );
   // 统一时间线点击加载并发闸。同一页只能由显式按钮触发一次；滚动与重渲染
   // 都不会进入这里，成功页在刷新前一直驻留内存。
   const olderHistoryFetchingRef = useRef<Set<string>>(new Set());
@@ -1229,7 +1192,6 @@ export function useChatSocket(opts: {
       applyDurableLiveFrames,
       runDurableLiveFrameHydration,
       hydrateDurableLiveFrameJournal,
-      retryLiveJournalHydration,
       storedMaxSeq,
       storedHistoryRevision,
       loadOlderHistory,
@@ -1274,7 +1236,6 @@ export function useChatSocket(opts: {
       applyDurableLiveFrames,
       runDurableLiveFrameHydration,
       hydrateDurableLiveFrameJournal,
-      retryLiveJournalHydration,
       storedMaxSeq,
       storedHistoryRevision,
       loadOlderHistory,

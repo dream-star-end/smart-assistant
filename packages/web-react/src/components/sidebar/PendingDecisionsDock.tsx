@@ -32,6 +32,7 @@ import type { AuthSession } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import { Alert, Badge, Button, IconButton, Spinner, useToast } from "../ui";
 import { AtelierIcon } from "../ui/AtelierIcons";
+import type { LiveActivityItem } from "./liveActivity";
 import "./pendingDecisions.css";
 
 const POLL_INTERVAL_MS = 30_000;
@@ -75,6 +76,8 @@ export function resolveTaskboardTicketRef(item: PendingDecisionItem): string | n
 export type PendingDecisionsDockProps = {
   auth?: AuthSession | null;
   socketVersion?: number;
+  /** 本地实时态中处于待拍板/待回复的会话，用于与服务端聚合收件箱去重合并为唯一「待拍板」入口。 */
+  sessionNeedsYouItems?: readonly LiveActivityItem[];
   onSelectSession?: (sessionId: string) => void;
   onOpenBoard?: (ticketRef?: string) => void;
   onOpenLiveBrowser?: (opts?: { url?: string; sessionId?: string | null }) => void;
@@ -111,6 +114,7 @@ function riskBadge(risk: PendingDecisionItem["riskLevel"]) {
 export function PendingDecisionsDock({
   auth: authProp,
   socketVersion,
+  sessionNeedsYouItems,
   onSelectSession,
   onOpenBoard,
   onOpenLiveBrowser,
@@ -200,13 +204,42 @@ export function PendingDecisionsDock({
     return () => window.clearInterval(id);
   }, [auth, pollIntervalMs, fetchItems]);
 
+  // 合并服务端聚合待拍板与本地实时态待回复/待审批会话（按 sessionId 去重），确保侧栏仅有唯一「待拍板」总入口
+  const mergedItems = useMemo(() => {
+    if (!sessionNeedsYouItems?.length) return items;
+    const existingSessionIds = new Set(items.map((i) => i.sessionId).filter(Boolean));
+    const extras: PendingDecisionItem[] = [];
+    for (const entry of sessionNeedsYouItems) {
+      if (existingSessionIds.has(entry.session.id)) continue;
+      extras.push({
+        id: `session_needs_you:${entry.session.id}`,
+        source: "turn_permission",
+        sourceId: entry.session.id,
+        userId: "",
+        sessionId: entry.session.id,
+        title: entry.session.title || "新对话",
+        summary: entry.needsYouKind === "approval" ? "等待你的审批确认" : "助手正在等待你的回复",
+        riskLevel: "medium",
+        status: "pending",
+        metadata: {
+          requiresInteractiveAnswer: entry.needsYouKind !== "approval",
+          localSessionFallback: true,
+        },
+        createdAt: entry.session.updatedAt ?? "",
+        expiresAt: "",
+        allowedActions: [],
+      });
+    }
+    return extras.length > 0 ? [...items, ...extras] : items;
+  }, [items, sessionNeedsYouItems]);
+
   const countsBySource = useMemo(() => {
     const counts: Partial<Record<PendingDecisionSource, number>> = {};
-    for (const item of items) {
+    for (const item of mergedItems) {
       counts[item.source] = (counts[item.source] ?? 0) + 1;
     }
     return counts;
-  }, [items]);
+  }, [mergedItems]);
 
   const activeSources = useMemo(
     () => (Object.keys(countsBySource) as PendingDecisionSource[]),
@@ -217,21 +250,21 @@ export function PendingDecisionsDock({
     sourceFilter !== "all" && (countsBySource[sourceFilter] ?? 0) > 0 ? sourceFilter : "all";
 
   const filteredItems = useMemo(
-    () => (effectiveFilter === "all" ? items : items.filter((i) => i.source === effectiveFilter)),
-    [items, effectiveFilter],
+    () => (effectiveFilter === "all" ? mergedItems : mergedItems.filter((i) => i.source === effectiveFilter)),
+    [mergedItems, effectiveFilter],
   );
 
   const highestRisk = useMemo<"critical" | "high" | null>(() => {
     let hasHigh = false;
-    for (const item of items) {
+    for (const item of mergedItems) {
       if (item.riskLevel === "critical") return "critical";
       if (item.riskLevel === "high") hasHigh = true;
     }
     return hasHigh ? "high" : null;
-  }, [items]);
+  }, [mergedItems]);
 
   // 无待拍板时零噪音收起
-  if (items.length === 0) return null;
+  if (mergedItems.length === 0) return null;
 
   const visibleItems = showAll ? filteredItems : filteredItems.slice(0, DEFAULT_VISIBLE_ITEMS);
   const hiddenCount = filteredItems.length - visibleItems.length;
@@ -288,7 +321,7 @@ export function PendingDecisionsDock({
   };
 
   const toggleTitle = collapsed
-    ? `展开待拍板（${items.length} 项${highestRisk ? "，含高风险" : ""}）`
+    ? `展开待拍板（${mergedItems.length} 项${highestRisk ? "，含高风险" : ""}）`
     : "收起待拍板";
 
   return (
@@ -326,7 +359,7 @@ export function PendingDecisionsDock({
             </span>
           )}
           <span className="oc-pd-count" data-testid="pending-decisions-count">
-            {items.length}
+            {mergedItems.length}
           </span>
           <span
             className="oc-pd-chevron"
@@ -336,7 +369,7 @@ export function PendingDecisionsDock({
             <ChevronRight size={13} strokeWidth={1.85} />
           </span>
         </button>
-        {!collapsed && (
+        {!collapsed && auth && (
           <IconButton
             size="sm"
             shape="square"
@@ -361,7 +394,7 @@ export function PendingDecisionsDock({
                 onClick={() => setSourceFilter("all")}
                 className="oc-pd-filter-pill"
               >
-                全部 {items.length}
+                全部 {mergedItems.length}
               </button>
               {activeSources.map((src) => (
                 <button
@@ -387,7 +420,8 @@ export function PendingDecisionsDock({
 
           <div className="oc-pd-list" data-testid="pending-decisions-list">
             {visibleItems.map((item) => {
-              const interactiveOnly = isInteractiveOnlyDecision(item);
+              const interactiveOnly =
+                isInteractiveOnlyDecision(item) || !item.allowedActions.includes("approve");
               const busy = resolvingId === item.id;
               const canDeny = item.allowedActions.includes("deny");
               const canGoto =

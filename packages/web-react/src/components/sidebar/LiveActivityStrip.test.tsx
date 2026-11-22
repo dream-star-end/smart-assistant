@@ -1,13 +1,10 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import {
-  publishDesktopNotifyState,
-  registerDesktopNotifyToggle,
-} from "../../lib/desktopNotifyPref";
 import type { ChatProject, Session, User } from "../../lib/types";
 import { Sidebar } from "../Sidebar";
-import { LiveActivityStrip } from "./LiveActivityStrip";
+import { ToastProvider } from "../ui";
+import { LiveActivityStrip, SidebarLiveActivityStrip } from "./LiveActivityStrip";
 import { collectLiveActivity } from "./liveActivity";
 
 afterEach(cleanup);
@@ -153,33 +150,15 @@ describe("LiveActivityStrip", () => {
     expect(screen.queryByTestId("sidebar-live-strip")).toBeNull();
   });
 
-  it("提供桌面通知轻量开关并联动 desktopNotifyPref（OCV5-817）", () => {
-    const toggle = vi.fn();
-    const unregister = registerDesktopNotifyToggle(toggle);
-    publishDesktopNotifyState({ enabled: false, permission: "default" });
-    try {
-      const summary = collectLiveActivity({
-        sessions: [makeSession({ id: "s-run", title: "跑单测", runState: "running" })],
-      });
-      render(<LiveActivityStrip summary={summary} onSelect={vi.fn()} />);
-      const btn = screen.getByTestId("live-strip-notify-toggle");
-      expect(btn).toHaveAttribute("aria-pressed", "false");
-      fireEvent.click(btn);
-      expect(toggle).toHaveBeenCalledWith(true);
-
-      act(() => {
-        publishDesktopNotifyState({ enabled: true, permission: "granted" });
-      });
-      expect(screen.getByTestId("live-strip-notify-toggle")).toHaveAttribute("aria-pressed", "true");
-    } finally {
-      unregister();
-      act(() => {
-        publishDesktopNotifyState({ enabled: false, permission: "unsupported" });
-      });
-    }
+  it("活动条不再内嵌桌面通知开关（由设置中心统一承接）", () => {
+    const summary = collectLiveActivity({
+      sessions: [makeSession({ id: "s-run", title: "跑单测", runState: "running" })],
+    });
+    render(<LiveActivityStrip summary={summary} onSelect={vi.fn()} />);
+    expect(screen.queryByTestId("live-strip-notify-toggle")).toBeNull();
   });
 
-  it("仅有 1 条运行中且就是当前选中会话时自动收起明细行避免同屏重复，切走后自动展开直达", () => {
+  it("仅有 1 条运行中且就是当前选中会话时直接隐藏空壳标题栏，切走后自动展开直达", () => {
     const summary = collectLiveActivity({
       sessions: [
         makeSession({ id: "s-run", title: "正在重构侧栏", runState: "running" }),
@@ -191,23 +170,49 @@ describe("LiveActivityStrip", () => {
       <LiveActivityStrip summary={summary} activeId="s-run" onSelect={onSelect} />,
     );
 
-    const strip = screen.getByTestId("sidebar-live-strip");
-    expect(strip).toHaveAttribute("data-compact-active", "true");
-    expect(screen.queryByTestId("live-strip-list")).toBeNull();
-    expect(screen.getByTestId("live-strip-filter-running")).toBeInTheDocument();
-    expect(screen.getByTestId("live-strip-collapse-toggle")).toHaveAttribute("aria-expanded", "false");
+    // 仅当前正在看的 1 条在运行时完全隐藏，不留空壳标题栏
+    expect(screen.queryByTestId("sidebar-live-strip")).toBeNull();
 
-    // 切到其他会话后，后台运行项自动展开，便于一键跳回
+    // 切到其他会话后，后台运行项自动出现并展开，便于一键跳回
     rerender(<LiveActivityStrip summary={summary} activeId="s-other" onSelect={onSelect} />);
-    expect(strip).not.toHaveAttribute("data-compact-active");
+    expect(screen.getByTestId("sidebar-live-strip")).toBeInTheDocument();
     expect(screen.getByTestId("live-strip-list")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "运行中 · 正在重构侧栏" }));
     expect(onSelect).toHaveBeenCalledWith("s-run");
 
-    // 回到当前运行会话后自动再次收起；手动点击展开仍可查看
+    // 回到当前运行会话后再次隐藏
     rerender(<LiveActivityStrip summary={summary} activeId="s-run" onSelect={onSelect} />);
-    expect(screen.queryByTestId("live-strip-list")).toBeNull();
-    fireEvent.click(screen.getByTestId("live-strip-collapse-toggle"));
-    expect(screen.getByTestId("live-strip-list")).toBeInTheDocument();
+    expect(screen.queryByTestId("sidebar-live-strip")).toBeNull();
+  });
+
+  it("SidebarLiveActivityStrip 将待拍板统一收敛到 PendingDecisionsDock 唯一入口，不再与活动条双显「待拍板」", () => {
+    const onSelect = vi.fn();
+    const sessions = [
+      makeSession({ id: "s-app", title: "审批生产迁移" }),
+      makeSession({ id: "s-run", title: "后台编译任务", runState: "running" }),
+    ];
+    render(
+      <ToastProvider>
+        <SidebarLiveActivityStrip
+          sessions={sessions}
+          activeId="s-other"
+          sessionNeedsYou={(id) => (id === "s-app" ? "approval" : null)}
+          onSelect={onSelect}
+        />
+      </ToastProvider>,
+    );
+
+    // 侧栏唯一「待拍板」入口由 PendingDecisionsDock 承接，且不丢审批项
+    expect(screen.getByTestId("pending-decisions-dock")).toBeInTheDocument();
+    expect(screen.getByTestId("pending-decisions-count")).toHaveTextContent("1");
+    // 活动条仅承接运行中会话，不再重复渲染「待拍板」筛选胶囊
+    expect(screen.getByTestId("sidebar-live-strip")).toBeInTheDocument();
+    expect(screen.queryByTestId("live-strip-filter-needs_you")).toBeNull();
+    expect(screen.getByTestId("live-strip-filter-running")).toBeInTheDocument();
+
+    // 展开唯一「待拍板」可直达对应会话
+    fireEvent.click(screen.getByTestId("pending-decisions-toggle"));
+    fireEvent.click(screen.getByTestId("pending-decision-goto"));
+    expect(onSelect).toHaveBeenCalledWith("s-app");
   });
 });

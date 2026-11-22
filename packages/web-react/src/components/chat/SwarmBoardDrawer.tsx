@@ -327,15 +327,6 @@ function RosterMemberRow({
                 {member.toolCalls} 次
               </span>
             )}
-            {member.telemetryPartial && (
-              <span
-                data-testid={`swarm-telemetry-partial-${member.name}`}
-                title="遥测仍在增量扫描或已触及采样预算，当前数值为近似值"
-                className="inline-flex items-center rounded bg-warning-soft px-1.5 py-0.5 font-mono font-semibold text-warning"
-              >
-                ~ 近似
-              </span>
-            )}
           </div>
         )}
       </div>
@@ -1004,27 +995,6 @@ export function SwarmBoardDrawer({
                       ))}
                     </div>
                   )}
-                </div>
-              )}
-
-              {counts.isolatedWorktrees > 0 && (
-                <div
-                  className="mt-3 rounded-xl border border-info/25 bg-info-soft/45 px-2.5 py-2 text-caption text-muted"
-                  data-testid="swarm-worktree-notice"
-                >
-                  <div className="flex items-center gap-1.5 font-medium text-info">
-                    <GitBranch size={12} />
-                    <span>
-                      {active
-                        ? `${counts.activeIsolatedWorktrees || counts.isolatedWorktrees} 个独立 worktree 并行中`
-                        : `已启用 ${counts.isolatedWorktrees} 个独立 worktree`}
-                    </span>
-                  </div>
-                  <p className="mt-0.5 text-micro leading-relaxed text-faint">
-                    {active
-                      ? "写手在独立工作区隔离修改，收尾前将核对并合入主工作区，避免改动遗漏。"
-                      : "请确认上述独立工作区的改动已全部合入主工作区并清理孤儿 worktree。"}
-                  </p>
                 </div>
               )}
             </aside>

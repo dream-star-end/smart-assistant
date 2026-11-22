@@ -39,7 +39,6 @@ import { useSwarmBoard, useSwarmMode } from "./hooks/useSwarmUi";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
 import { EmptyState, greetingName } from "./components/EmptyState";
 import type { ChatError } from "./components/ErrorBanner";
-import { taskContinuationPrompt } from "./lib/chat/manualTaskContinuation";
 import { SessionTimelineBoundary } from "./components/SessionTimelineBoundary";
 import { sessionTitleFromText } from "./lib/sessionTitle";
 import { isDialogLayerOpen, resolveGlobalHotkey } from "./lib/hotkeys";
@@ -206,7 +205,6 @@ import {
 } from "./lib/modelSwitch";
 import { TASKBOARD_ENABLED } from "./lib/taskboardFeature";
 import { useServerFeatures } from "./hooks/useServerFeatures";
-import { dismissSuggestion, readDismissedSuggestions, suggestProjectForChat } from "./lib/unfiledSuggest";
 import { projectChipsBoardId } from "./lib/projectChips";
 import type { SaveToProjectRequest } from "./components/project/SaveToProjectDialog";
 import { useChatScroll } from "./hooks/useChatScroll";
@@ -221,7 +219,7 @@ import { useSessionModelAndCollab } from "./hooks/useSessionModelAndCollab";
 
 import {
   IdentityRecoveryNotice, AccountSwitchNotice, AgentGate, AuthGate,
-  RepoStatusBanner, ErrorBanner, UpdateBanner, BackgroundTurnBanner, TurnCostReminder, PinnedHudStack, AppDialogs,
+  RepoStatusBanner, ErrorBanner, UpdateBanner, TurnCostReminder, PinnedHudStack, AppDialogs,
   Landing, DesktopEnrollPage,
   TutorialCenter, ContainerWebPreview, StudioApp, TaskboardView, SitesWorkspaceView, InspectorPanel,
   InspectorPanelContent, ImageAnnotationEditor, ProjectHome, QuickAskWindow,
@@ -232,6 +230,7 @@ export { prefetchLazyCentersOnIdle } from "./appLazyViews";
 const EMPTY_WS_MESSAGES: ChatMessage[] = [];
 const EMPTY_CATALOG_MODELS: PublicModel[] = [];
 const EMPTY_LOCKED_CATALOG_MODELS: LockedPublicModel[] = [];
+const CACHED_HISTORY_RETRY_DELAYS_MS = [2_000, 5_000] as const;
 
 // 仅 ?demo=1 时按需加载旧演示消息视图（components/Message.tsx），普通线上首屏零加载。
 const DemoMessageStream = lazy(() =>
@@ -315,8 +314,6 @@ export function App() {
   const [bannersExpanded, setBannersExpanded] = useState(false);
   // UpdateBanner 自己订阅 governor,这里再订一份只为把它算进横幅栈的条数。
   const updateBannerVisible = useSyncExternalStore(appUpdate.subscribe, appUpdate.getBannerVisible);
-  // 版本不一致即亮的顶栏 pill(OCV5-626);横幅出现时 governor 自己把它熄掉。
-  const updatePillVisible = useSyncExternalStore(appUpdate.subscribe, appUpdate.getPillVisible);
   const [imageAnnotationSource, setImageAnnotationSource] = useState<ImageAnnotationSource | null>(null);
   const [containerPreviewUrl, setContainerPreviewUrl] = useState<string | null>(null);
   // 详情面板：1024-1199px(expanded)自动折侧栏双栏，≥1200px(wide)允许三栏；更窄走贴底 Sheet。
@@ -815,10 +812,6 @@ export function App() {
   useEffect(() => {
     setTimelineLifecycleServerShadow(serverFeatures.timelineShadow);
   }, [serverFeatures.timelineShadow]);
-  const [dismissedSuggestions, setDismissedSuggestions] = useState<Set<string>>(() => new Set());
-  useEffect(() => {
-    setDismissedSuggestions(user?.id ? readDismissedSuggestions(user.id) : new Set());
-  }, [user?.id]);
   // 当前会话所属项目的看板：P5b 两个入口只在会话属于有看板的项目时出现。
   const activeProjectId = activeId ? sessions.find((s) => s.id === activeId)?.projectId : undefined;
   const activeChatProject = activeProjectId ? projects.find((p) => p.id === activeProjectId) : undefined;
@@ -1454,19 +1447,60 @@ export function App() {
 
   // 会话级 transient 软提示（"正在发送…"等）：非消息卡片、不落库；随快照读回。
   const transientNotice = !demo && activeId ? chat.getTransientNotice(activeId) : null;
-  // 弱网/重连状态条三态分流（离线 / 环境启动中 / 服务端重连中）。文案与 tone 收口在
-  // deriveConnBanner（纯函数，单测锁定）；返回 null 时不显条。demo 恒不显（本地回放无 WS）。
-  const rawConnBanner = demo
-    ? null
-    : deriveConnBanner({
-        cls: chat.status.cls,
-        label: chat.status.label,
-        browserOnline: chat.browserOnline,
-        provisioning: chat.provisioning,
-      });
+  // 弱网/重连状态条三态分流（离线 / 环境启动中 / 服务端重连中）。
+  // Composer 内已有 EnvironmentPrepBar 时抑制重复的 provisioning 横幅；纯离线态隐藏无效的「立即重连」按钮。
+  const environmentPrepVisible = !demo && !gated && chat.provisioning;
+  const rawConnBanner =
+    demo || (environmentPrepVisible && chat.browserOnline)
+      ? null
+      : deriveConnBanner({
+          cls: chat.status.cls,
+          label: chat.status.label,
+          browserOnline: chat.browserOnline,
+          provisioning: chat.provisioning,
+        });
   // 横幅 2s 延迟（P3 RFC D6）：断开 >2s 才点亮，2s 内重连成功零闪烁。只作用于横幅显示——
   // deriveConnBanner 仍即时反映断线真相，断线排队/禁发等发送语义不受影响。
   const connBanner = useDelayedConnBanner(rawConnBanner);
+  const canRetryConnect =
+    connBanner?.tone === "warning" &&
+    chat.browserOnline &&
+    (typeof navigator === "undefined" || navigator.onLine !== false);
+  // 已有本地缓存消息时历史同步失败先后台静默退避重试，连续失败后再温和提示（空列表无缓存仍即时展示 session-history-error）。
+  const hasCachedWsMessages = wsMessages.length > 0;
+  const cachedHistoryFailRef = useRef<{ sessionId: string; lastToken: number; count: number }>({
+    sessionId: "",
+    lastToken: -1,
+    count: 0,
+  });
+  const [cachedHistoryBannerVisible, setCachedHistoryBannerVisible] = useState(false);
+  useEffect(() => {
+    const id = activeId ?? "";
+    if (cachedHistoryFailRef.current.sessionId !== id) {
+      cachedHistoryFailRef.current = { sessionId: id, lastToken: -1, count: 0 };
+      setCachedHistoryBannerVisible(false);
+    }
+    if (demo || !activeId || !historyError || !hasCachedWsMessages) {
+      if (!historyError && historySettled) {
+        cachedHistoryFailRef.current = { sessionId: id, lastToken: -1, count: 0 };
+        setCachedHistoryBannerVisible(false);
+      }
+      return;
+    }
+    const state = cachedHistoryFailRef.current;
+    if (state.lastToken !== historyError.token) {
+      state.lastToken = historyError.token;
+      state.count += 1;
+    }
+    const delayMs = CACHED_HISTORY_RETRY_DELAYS_MS[state.count - 1];
+    if (delayMs === undefined) {
+      setCachedHistoryBannerVisible(true);
+      return;
+    }
+    if (!chat.browserOnline) return;
+    const timer = window.setTimeout(() => retryHistory(activeId), delayMs);
+    return () => window.clearTimeout(timer);
+  }, [demo, activeId, historyError, historySettled, hasCachedWsMessages, chat.browserOnline, retryHistory]);
   useEffect(() => {
     if (!tutorialOpen) setBlogRequest(null);
   }, [tutorialOpen]);
@@ -1958,17 +1992,12 @@ export function App() {
 
   const showEmpty = demo ? messages.length === 0 && !busy : wsMessages.length === 0 && !wsSending;
   // ── 输入框上方的全局横幅栈(shell 审计 S-06)──────────────────────────────
-  // 五种横幅原先各自按条件挂载、互不知情,断线 + 休眠 + 新版本 + 发送失败同时成立时 390px
-  // 屏上横幅吃掉 ~560px。这里先算出"此刻成立的有哪些",交给 resolveBanners 按优先级裁决:
-  // 同屏最多 2 条,其余折叠成一行「还有 N 条提示」。移动端(<md)的连接条走 Composer 的
-  // banner 插槽钉在输入框上方(软键盘不会把它顶走),不进这个栈。
+  // 统一裁决当前成立的横幅，同屏最多 2 条；移动端(<md)的连接条走 Composer 的 banner 插槽。
   const activeBannerKinds: BannerKind[] = [];
   if (chatError) activeBannerKinds.push("error");
   if (!gated && connBanner && isMdViewport) activeBannerKinds.push("connection");
-  if (!demo && gate.phase.kind === "dormant") activeBannerKinds.push("dormant");
   if (!demo && updateBannerVisible) activeBannerKinds.push("update");
-  if (backgroundTurn.notice && isMdViewport) activeBannerKinds.push("turn");
-  if (!demo && !gated && activeSess?._turnCostReminderCredits && !backgroundTurn.notice) activeBannerKinds.push("cost");
+  if (!demo && !gated && activeSess?._turnCostReminderCredits) activeBannerKinds.push("cost");
   const bannerStack = resolveBanners(activeBannerKinds, bannersExpanded);
   const showBanner = (kind: BannerKind) => bannerStack.visible.includes(kind);
 
@@ -2165,8 +2194,6 @@ export function App() {
               sidebarCollapsed={collapsed}
               onExpandSidebar={() => setCollapsed(false)}
               sessionUnreadCount={unreadSessions.unreadIds.size}
-              updateAvailable={!demo && updatePillVisible}
-              onReloadForUpdate={demo ? undefined : () => appUpdate.reloadNow()}
               sessionIds={sessions.map((s) => s.id)}
               onOpenSession={(id) => {
                 // originSessionKey 是 agent:<id>:webchat:dm:<peerId>，不能当 Session.id。
@@ -2211,8 +2238,6 @@ export function App() {
               sidebarCollapsed={collapsed}
               onExpandSidebar={() => setCollapsed(false)}
               sessionUnreadCount={unreadSessions.unreadIds.size}
-              updateAvailable={!demo && updatePillVisible}
-              onReloadForUpdate={demo ? undefined : () => appUpdate.reloadNow()}
             />
           </LazyBoundary>
         ) : homeProject && projectHome ? (
@@ -2259,8 +2284,6 @@ export function App() {
               sidebarCollapsed={collapsed}
               onExpandSidebar={() => setCollapsed(false)}
               sessionUnreadCount={unreadSessions.unreadIds.size}
-              updateAvailable={!demo && updatePillVisible}
-              onReloadForUpdate={demo ? undefined : () => appUpdate.reloadNow()}
             />
           </LazyBoundary>
         ) : (
@@ -2270,30 +2293,12 @@ export function App() {
         <ChatHeader
           agent={agent}
           sessionTitle={activeSess?.title}
-          running={wsSending}
           onAgentClick={() => setPickerOpen(true)}
           projectBreadcrumb={(() => {
             const pid = sessions.find((s) => s.id === activeId)?.projectId;
             if (!pid) return null;
             const chat = projects.find((p) => p.id === pid);
             return chat ? { chatName: chat.name } : null;
-          })()}
-          projectSuggestion={(() => {
-            if (!serverFeatures.unfiledSuggest || !user?.id || !activeId) return null;
-            const active = sessions.find((s) => s.id === activeId);
-            if (!active || active.projectId || active.archived || dismissedSuggestions.has(active.id)) return null;
-            const hit = suggestProjectForChat(active, sessions, projects);
-            const target = hit ? projects.find((p) => p.id === hit.projectId) : undefined;
-            if (!target) return null;
-            const uid = user.id;
-            return {
-              name: target.name,
-              onAccept: () => moveSessionToProject(active, target.id),
-              onDismiss: () => {
-                dismissSuggestion(uid, active.id);
-                setDismissedSuggestions((cur) => new Set(cur).add(active.id));
-              },
-            };
           })()}
           onOpenProjectScope={() => {
             const pid = sessions.find((s) => s.id === activeId)?.projectId;
@@ -2346,8 +2351,6 @@ export function App() {
           sessionUnreadCount={unreadSessions.unreadIds.size}
           subscriptionSummary={demo ? null : subscriptionSummary}
           onOpenSubscription={demo ? undefined : () => { openSettings("account"); setSubscribeOpenSignal((n) => n + 1); }}
-          updateAvailable={!demo && updatePillVisible}
-          onReloadForUpdate={demo ? undefined : () => appUpdate.reloadNow()}
         />
         {!demo && auth && authRecoveryAvailable && <LazyBoundary fallback={null}>
           <IdentityRecoveryNotice onRetry={retryBoot} />
@@ -2446,11 +2449,11 @@ export function App() {
                 resetKey={activeId ?? "none"}
                 onRetry={activeId ? () => retryHistory(activeId) : undefined}
               >
-                {historyError && wsMessages.length > 0 && (
+                {cachedHistoryBannerVisible && historyError && wsMessages.length > 0 && (
                   <div className="mx-auto mb-2 max-w-3xl px-5 pt-4" data-testid="session-history-error-banner">
                     <Alert
-                      tone="danger"
-                      title="会话加载失败"
+                      tone="warning"
+                      title="历史记录暂未同步"
                       action={
                         <button
                           type="button"
@@ -2461,7 +2464,7 @@ export function App() {
                         </button>
                       }
                     >
-                      {historyError.message}
+                      {historyError.message || "当前展示本地记录，稍后可重试同步。"}
                     </Alert>
                   </div>
                 )}
@@ -2474,8 +2477,6 @@ export function App() {
                   turnActivity={turnActivity}
                   transientNotice={transientNotice}
                   historyLoading={historyLoading}
-                  journalDegraded={activeSess?._liveJournalDegraded === true}
-                  onRetryJournal={activeId ? () => { void chat.retryLiveJournalHydration(activeId); } : undefined}
                   archive={messageListArchive}
                   cb={cardCallbacks}
                   onRespondPermission={onRespondPermission}
@@ -2497,7 +2498,7 @@ export function App() {
               null(收口后由 MessageRenderer 的 inline 只读 TodoWrite/plan 卡兜底)。 */}
           {!demo && !gated && (
             <>
-              {(wsSending || inflightDelegates.items.length > 0 || bgTasks.hasAny || Boolean(swarmUi.latestSwarm) || timelineMessages.some((m) => m.role === "goal" || m.role === "tool")) && (
+              {(wsSending || inflightDelegates.items.length > 0 || bgTasks.hasAny || Boolean(swarmUi.latestSwarm) || timelineMessages.some((m) => m.role === "tool")) && (
                 <PinnedHudStack
                   timelineMessages={timelineMessages} chatVersion={chat.version} wsSending={wsSending}
                   tokenUsage={activeSess?._liveTurnUsage?.usage}
@@ -2514,8 +2515,7 @@ export function App() {
               <div id="pending-approval-bar-slot" className="mx-auto mb-2 max-w-3xl px-4 empty:mb-0 empty:hidden" />
             </>
           )}
-          {/* 以下六条横幅的显隐由 bannerStack(resolveBanners)统一裁决,渲染顺序即优先级:
-              发送失败 > 连接状态 > 本轮运行 > 容器休眠 > 新版本 > 成本提醒;超出 2 条的折叠成一行。 */}
+          {/* 全局横幅栈按优先级展示（发送失败 > 连接状态 > 新版本 > 成本提醒），超出 2 条折叠。 */}
           {showBanner("error") && chatError && (
             <ErrorBanner
               error={chatError}
@@ -2523,21 +2523,19 @@ export function App() {
                 if (!activeId) return;
                 const t = chatError.retryText;
                 setChatError(null);
-                send(taskContinuationPrompt(t), undefined, undefined, "继续", undefined, { sessionId: activeId });
+                if (t.trim()) void send(t, undefined, undefined, undefined, undefined, { sessionId: activeId });
               }}
               onDismiss={() => setChatError(null)}
               onSwitchModel={demo ? undefined : () => setModelPickerOpen(true)}
             />
           )}
-          {/* WS 连接状态条三态（离线 / 环境启动中 / 服务端重连中，见 deriveConnBanner）。仅非 demo。
-              移动端(< md)软键盘弹出会压缩可视视口,流式布局里的横幅会被顶出屏幕;改走
-              Composer 的 banner 插槽钉在输入框上方,始终可见。桌面(md+)保持原流式位置。 */}
+          {/* WS 连接状态条（离线 / 重连中；桌面流式位，移动端走 Composer banner 插槽）。 */}
           {showBanner("connection") && connBanner && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
               <Alert
                 tone={connBanner.tone}
                 action={
-                  connBanner.tone === "warning" ? (
+                  canRetryConnect ? (
                     <Button
                       size="sm"
                       variant="secondary"
@@ -2552,12 +2550,6 @@ export function App() {
               </Alert>
             </div>
           )}
-          {showBanner("turn") && backgroundTurn.notice && <BackgroundTurnBanner notice={backgroundTurn.notice} />}
-          {showBanner("dormant") && (
-            <div className="mx-auto mb-2 max-w-3xl px-4">
-              <Alert tone="info">容器已休眠，发送消息后将自动唤醒。</Alert>
-            </div>
-          )}
           {/* 版本更新横幅:仅 governor 判定不能自动软刷时出现(自动刷成功的用户无感)。*/}
           {showBanner("update") && <UpdateBanner />}
           {showBanner("cost") && activeSess?._turnCostReminderCredits && (
@@ -2565,24 +2557,19 @@ export function App() {
               <TurnCostReminder credits={activeSess._turnCostReminderCredits} />
             </div>
           )}
-          {(bannerStack.hidden.length > 0 || bannerStack.canCollapse) && (
+          {bannerStack.hidden.length > 0 && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
-              {/* 折叠条不走 Alert 的 action 槽:那个槽在 <sm 会整行换到第二行右对齐(给「重试」类
-                  动作设计的),折叠条要的是"一行文字 + 行内切换键",在 390px 上两行会把省下来的
-                  高度又吃回去。 */}
               <Alert tone="info" density="compact" live="off" data-testid="banner-stack-collapsed">
                 <div className="flex items-center justify-between gap-3">
-                  <span>
-                    {bannersExpanded ? "已展开全部提示" : collapsedBannersLabel(bannerStack.hidden.length)}
-                  </span>
+                  <span>{collapsedBannersLabel(bannerStack.hidden.length)}</span>
                   <Button
                     size="sm"
                     variant="ghost"
                     className="-my-1.5 -mr-1.5 shrink-0"
                     aria-expanded={bannersExpanded}
-                    onClick={() => setBannersExpanded((v) => !v)}
+                    onClick={() => setBannersExpanded(true)}
                   >
-                    {bannersExpanded ? "收起" : "展开"}
+                    展开
                   </Button>
                 </div>
               </Alert>
@@ -2621,7 +2608,7 @@ export function App() {
                   <Alert
                     tone={connBanner.tone}
                     action={
-                      connBanner.tone === "warning" ? (
+                      canRetryConnect ? (
                         <Button
                           size="sm"
                           variant="secondary"
@@ -2635,8 +2622,6 @@ export function App() {
                     {connBanner.text}
                   </Alert>
                 </div>
-              ) : backgroundTurn.notice && !isMdViewport ? (
-                <BackgroundTurnBanner notice={backgroundTurn.notice} />
               ) : undefined
             }
             placeholder={swarmMode ? undefined : `和「${agent.name}」对话…`}

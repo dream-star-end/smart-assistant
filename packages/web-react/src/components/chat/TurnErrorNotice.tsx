@@ -69,6 +69,14 @@ export type TurnErrorNoticeProps = {
   onOpenModelPicker?: () => void;
 };
 
+function sanitizeTurnErrorCopy(text: string | undefined, isBoxCapacityHeld: boolean): string | undefined {
+  if (!text) return text;
+  if (isBoxCapacityHeld) {
+    return "前一步执行仍在收尾，已有进度已保留，请稍后继续。";
+  }
+  return text.replace(/在\s*Box\s*上的?/gi, "").replace(/\bBox\b/gi, "服务端");
+}
+
 export function TurnErrorNotice(p: TurnErrorNoticeProps) {
   const userError = resolveUserError(p.userError, p.code);
   const details = typeof p.details === "string" ? p.details : p.details ? errorTechnicalDetails(p.details) : undefined;
@@ -85,20 +93,15 @@ export function TurnErrorNotice(p: TurnErrorNoticeProps) {
   const [secondsLeft, setSecondsLeft] = useState(() =>
     canAutoWait && !autoContinuedBoxHoldKeys.has(holdKey) ? BOX_CAPACITY_HELD_WAIT_SECONDS : 0,
   );
-  const [autoResumed, setAutoResumed] = useState(() =>
-    canAutoWait && autoContinuedBoxHoldKeys.has(holdKey),
-  );
 
   useEffect(() => {
     if (!canAutoWait) return;
     if (autoContinuedBoxHoldKeys.has(holdKey)) {
       setSecondsLeft(0);
-      setAutoResumed(true);
       return;
     }
     if (secondsLeft <= 0) {
       autoContinuedBoxHoldKeys.add(holdKey);
-      setAutoResumed(true);
       retryOnClickRef.current?.();
       return;
     }
@@ -108,23 +111,29 @@ export function TurnErrorNotice(p: TurnErrorNoticeProps) {
     return () => window.clearTimeout(timer);
   }, [canAutoWait, holdKey, secondsLeft]);
 
-  const countdownActions = canAutoWait && secondsLeft > 0
-    ? baseActions.map((a) =>
-        a.label === "继续"
-          ? {
-              label: `正在等待上一轮释放（${secondsLeft}s）`,
-              onClick: () => {},
-              disabled: true,
-              loading: true,
-            }
-          : a,
-      )
-    : baseActions;
+  // 短暂自动等待期不弹中断告警卡，改为静默轻等待；仅自动继续仍未恢复或已过自动重试时才展示温和提示。
+  if (canAutoWait && secondsLeft > 0) {
+    return (
+      <div
+        role="status"
+        aria-live="polite"
+        data-testid="box-capacity-waiting-status"
+        className="flex items-center gap-2.5 py-1.5 text-body text-muted"
+      >
+        <span className="oc-dots" aria-hidden>
+          <span />
+          <span />
+          <span />
+        </span>
+        <span className="min-w-0 break-words">上一步仍在收尾，马上自动继续…</span>
+      </div>
+    );
+  }
 
   const openModelPicker =
     p.onOpenModelPicker ??
     (typeof p.actions !== "function" && p.actions.isLastTurn ? p.actions.cb.onOpenModelPicker : undefined);
-  const alreadyHasSwitchModel = countdownActions.some(
+  const alreadyHasSwitchModel = baseActions.some(
     (a) => a.label === "切换模型" || a.label === "切换备用模型继续",
   );
   const wantFallbackModelCta =
@@ -133,11 +142,11 @@ export function TurnErrorNotice(p: TurnErrorNoticeProps) {
     isRateLimitOrModelUnavailable(userError, p.code);
 
   const effectiveActions =
-    wantFallbackModelCta && countdownActions.length < 2
-      ? [...countdownActions, { label: "切换备用模型继续", onClick: openModelPicker! }]
-      : countdownActions;
+    wantFallbackModelCta && baseActions.length < 2
+      ? [...baseActions, { label: "切换备用模型继续", onClick: openModelPicker! }]
+      : baseActions;
   const inlineFallbackCta =
-    wantFallbackModelCta && countdownActions.length >= 2 ? (
+    wantFallbackModelCta && baseActions.length >= 2 ? (
       <div className="mt-1.5">
         <button
           type="button"
@@ -149,40 +158,20 @@ export function TurnErrorNotice(p: TurnErrorNoticeProps) {
       </div>
     ) : null;
 
-  const countdownBar =
-    canAutoWait && secondsLeft > 0 ? (
-      <div
-        data-testid="box-capacity-countdown-bar"
-        aria-hidden="true"
-        className="mt-2 h-1 w-full overflow-hidden rounded-full bg-hover/80"
-      >
-        <div
-          className="h-full rounded-full bg-accent transition-[width] duration-1000 ease-linear"
-          style={{ width: `${Math.max(0, Math.min(100, (secondsLeft / BOX_CAPACITY_HELD_WAIT_SECONDS) * 100))}%` }}
-        />
-      </div>
-    ) : null;
-
-  const holdReleasedNote = canAutoWait && autoResumed ? (
-    <p data-testid="box-capacity-released-notice" className="mt-1.5 text-meta text-fg/80">
-      等待时间已结束，已为你自动尝试继续一次。
-    </p>
-  ) : null;
+  const bodyText = sanitizeTurnErrorCopy(p.fixedBody ?? userError.message, isBoxCapacityHeld);
 
   return (
     <Notice
-      role={p.role}
-      tone={p.tone}
+      role={isBoxCapacityHeld ? "status" : p.role}
+      tone={isBoxCapacityHeld ? "progress" : p.tone}
       className={p.className}
       title={p.title ?? standaloneErrorTitle(userError)}
       actions={noticeActions(effectiveActions)}
       details={details ? <ErrorTechDetails text={details} /> : undefined}
     >
-      {p.fixedBody ?? userError.message}
+      {bodyText}
       {p.note}
-      {countdownBar}
       {inlineFallbackCta}
-      {holdReleasedNote}
     </Notice>
   );
 }
