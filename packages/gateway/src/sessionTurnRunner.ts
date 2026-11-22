@@ -44,7 +44,7 @@ import type {
 import { eventBus, createEvent } from './eventBus.js'
 import { contextCompactionsTotal, contextRebuildsTotal } from './metrics.js'
 import { markCheckpointTurnOutcome } from './sessionCheckpointStore.js'
-import { isSafeUniversalOverflowSummary, isUniversalOverflowError, recordTurnContextWatermarkForAutoCompact, SafeUniversalOverflowRetryError, tryUniversalOverflowAutoCompact } from './sessionAutoCompact.js'
+import { hasCompactableSessionHistory, isSafeUniversalOverflowSummary, isUniversalOverflowError, recordTurnContextWatermarkForAutoCompact, SafeUniversalOverflowRetryError, tryUniversalOverflowAutoCompact } from './sessionAutoCompact.js'
 import type { SessionLifecycleHost } from './sessionLifecycle.js'
 import { beginMemoryTurnTracking } from './memoryTurnObserver.js'
 import {
@@ -1585,7 +1585,7 @@ export async function _runOneTurn(
         isCcbSingleDiagnostic: ccbContextDiagnostic,
       })
       const allowUniversalOverflowRetry =
-        universalOverflowIsSafeToRetry && (retryTransientErrors || Boolean(session.runner.executionBackend))
+        universalOverflowIsSafeToRetry && (retryTransientErrors || Boolean(session.runner.executionBackend)) && (await hasCompactableSessionHistory(session))
       if (
         result?.isError &&
         transientContinuationIsSafe &&

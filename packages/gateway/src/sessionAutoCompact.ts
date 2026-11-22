@@ -14,6 +14,7 @@
  *     original raw user input and exact checkpoint generation ACK (B5).
  */
 import { resolveEffectiveModelHistoryContextWindow } from '@openclaude/protocol'
+import { getEngineContextMessages } from '@openclaude/storage'
 import { isCcbSlashCommandPrompt } from './ccbNativeCompaction.js'
 import type { SessionStreamEvent, TurnSummary } from './engine/engineEvents.js'
 import type { HistoricalTurnInput } from './historicalContextPayload.js'
@@ -254,12 +255,32 @@ export function recordAutoCompactRun(sessionKey: string, nowMs = Date.now()): vo
 }
 
 const OVERFLOW_ERR_RE =
-  /context_too_long|prompt_too_long|prompt is too long|context length exceeded|maximum context length|context window exceeded|request too large|payload too large|\b413\b/i
+  /context_too_long|prompt_too_long|prompt is too long|context length exceeded|maximum context length|context window exceeded|payload too large|\b413\b/i
 
-/** Detect context overflow errors across ALL engines (Antigravity/Cursor/Grok/ZCode/CCB/Codex). */
+/** Detect context overflow errors across ALL engines (Antigravity/Cursor/Grok/ZCode/CCB/Codex).
+ * Excludes deterministic media/body-size `request_too_large` rejections (compacting chat history
+ * cannot shrink an oversized uploaded attachment). */
 export function isUniversalOverflowError(message: string, errorClass?: string): boolean {
+  if (errorClass === 'request_too_large') return false
   if (errorClass === 'context_too_long') return true
   return OVERFLOW_ERR_RE.test(message)
+}
+
+/** Check whether the session actually has persisted conversation history that can be compacted
+ * into a rolling checkpoint. Fail-closed (`false`) on empty/unavailable history so `_runOneTurn`
+ * preserves the authoritative error tape instead of discarding it on a hopeless retry. */
+export async function hasCompactableSessionHistory(session: AgentSession): Promise<boolean> {
+  if (!session.peerId) return false
+  try {
+    const engine = session.providerTag || session.runner.engineId || 'ccb'
+    const messages = await getEngineContextMessages(session.peerId, session.userId ?? 'default', {
+      engine,
+      currentUserText: '',
+    })
+    return Array.isArray(messages) && messages.length > 0
+  } catch {
+    return false
+  }
 }
 
 const AMBIGUOUS_REMOTE_ERR_RE =
