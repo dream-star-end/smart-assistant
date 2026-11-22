@@ -26,10 +26,11 @@
  * 因此"再次 open"要 DO UPDATE 重置字段。volume 名永远 `agent-u{uid}-*`,保持 stable。
  */
 
+import { randomBytes } from "node:crypto";
 import type { PoolClient } from "pg";
 import { tx, query } from "../db/queries.js";
 import { volumeNamesFor } from "../agent-sandbox/volumes.js";
-import { isV5Channel } from "../runtimeChannel.js";
+import { getRuntimeChannel, isV5Channel } from "../runtimeChannel.js";
 
 /** agent_subscriptions.status */
 export type AgentSubscriptionStatus = "active" | "expired" | "canceled" | "suspended";
@@ -253,17 +254,24 @@ export async function openAgentSubscription(
     );
     const ledgerId = BigInt(ledgerRow.rows[0].id);
 
-    // (6) UPSERT 容器记录。user_id UNIQUE → ON CONFLICT DO UPDATE 重置字段,
-    //     subscription_id 指到新订阅;volume 名复用旧值(若此用户上次 GC 已删 volume,
-    //     下次 provision 会重新 ensureUserVolumes,docker 层幂等)
+    // (6) UPSERT 容器记录。0018 将全表 user_id UNIQUE 改为 partial unique WHERE state='active',
+    //     随后 0089/0090 与 0265/0266 演进为 uniq_ac_user_channel_kind_active
+    //     ON (user_id, runtime_channel, runtime_kind) WHERE state = 'active';
+    //     0023/0024 要求 secret_hash NOT NULL 且为 32-byte BYTEA。
+    //     本函数上方已由 isV5Channel() 拦住,runtime_channel 恒为 'v3';
+    //     新建行写入随机 32-byte secret_hash(永不匹配任何真实容器密钥),冲突复用现有 active 行时保留原 secret_hash。
+    const runtimeChannel = getRuntimeChannel();
+    const placeholderSecretHash = randomBytes(32);
     const conRow = await client.query<{ id: string }>(
       `INSERT INTO agent_containers
           (user_id, subscription_id, docker_id, docker_name,
-           workspace_volume, home_volume, image, status, runtime_kind,
+           workspace_volume, home_volume, image, status, state,
+           runtime_channel, runtime_kind, secret_hash,
            last_started_at, last_stopped_at, volume_gc_at, last_error)
-       VALUES ($1, $2, NULL, $3, $4, $5, $6, 'provisioning', 'docker',
+       VALUES ($1, $2, NULL, $3, $4, $5, $6, 'provisioning', 'active',
+               $7, 'docker', $8,
                NULL, NULL, NULL, NULL)
-       ON CONFLICT (user_id) DO UPDATE SET
+       ON CONFLICT (user_id, runtime_channel, runtime_kind) WHERE state = 'active' DO UPDATE SET
            subscription_id = EXCLUDED.subscription_id,
            docker_id = NULL,
            docker_name = EXCLUDED.docker_name,
@@ -284,6 +292,8 @@ export async function openAgentSubscription(
         volNames.workspace,
         volNames.home,
         input.image,
+        runtimeChannel,
+        placeholderSecretHash,
       ],
     );
 
@@ -353,6 +363,7 @@ export async function getAgentStatus(
     [uidStr],
   );
 
+  const runtimeChannel = getRuntimeChannel();
   const conR = await query<{
     id: string; subscription_id: string; docker_id: string | null;
     docker_name: string; image: string; status: string;
@@ -363,9 +374,9 @@ export async function getAgentStatus(
             docker_id, docker_name, image, status,
             last_started_at, last_stopped_at, volume_gc_at, last_error
        FROM agent_containers
-      WHERE user_id = $1 AND runtime_kind = 'docker'
+      WHERE user_id = $1 AND runtime_channel = $2 AND runtime_kind = 'docker' AND state = 'active'
       LIMIT 1`,
-    [uidStr],
+    [uidStr, runtimeChannel],
   );
 
   return {
@@ -452,9 +463,10 @@ export async function checkAgentAccess(
     return { ok: false, code: "SUBSCRIPTION_EXPIRED", message: "subscription end_at is in the past" };
   }
 
+  const runtimeChannel = getRuntimeChannel();
   const conR = await query<{ id: string; status: string }>(
-    "SELECT id::text AS id, status FROM agent_containers WHERE user_id = $1 AND runtime_kind = 'docker' LIMIT 1",
-    [uidStr],
+    "SELECT id::text AS id, status FROM agent_containers WHERE user_id = $1 AND runtime_channel = $2 AND runtime_kind = 'docker' AND state = 'active' LIMIT 1",
+    [uidStr, runtimeChannel],
   );
   if (conR.rows.length === 0) {
     return { ok: false, code: "NO_CONTAINER", message: "no agent container row for user" };
@@ -529,6 +541,7 @@ export async function markContainerRunning(
   dockerId: string,
 ): Promise<void> {
   const uidStr = normUid(userId);
+  const runtimeChannel = getRuntimeChannel();
   await query(
     `UPDATE agent_containers
         SET docker_id = $2,
@@ -536,8 +549,8 @@ export async function markContainerRunning(
             last_started_at = NOW(),
             last_error = NULL,
             updated_at = NOW()
-      WHERE user_id = $1 AND runtime_kind = 'docker'`,
-    [uidStr, dockerId],
+      WHERE user_id = $1 AND runtime_channel = $3 AND runtime_kind = 'docker' AND state = 'active'`,
+    [uidStr, dockerId, runtimeChannel],
   );
 }
 
@@ -547,6 +560,7 @@ export async function markContainerError(
   errorMsg: string,
 ): Promise<void> {
   const uidStr = normUid(userId);
+  const runtimeChannel = getRuntimeChannel();
   // last_error 列无长度约束(TEXT),但我们截一刀免得 LLM 吐 1MB 错信息
   const trimmed = errorMsg.length > 2048 ? errorMsg.slice(0, 2048) + "…" : errorMsg;
   await query(
@@ -554,8 +568,8 @@ export async function markContainerError(
         SET status = 'error',
             last_error = $2,
             updated_at = NOW()
-      WHERE user_id = $1 AND runtime_kind = 'docker'`,
-    [uidStr, trimmed],
+      WHERE user_id = $1 AND runtime_channel = $3 AND runtime_kind = 'docker' AND state = 'active'`,
+    [uidStr, trimmed, runtimeChannel],
   );
 }
 
@@ -615,14 +629,15 @@ export async function markContainerStoppedAfterExpiry(
     throw new TypeError(`gcDays must be in (0, 365], got ${gcDays}`);
   }
   const uidStr = normUid(userId);
+  const runtimeChannel = getRuntimeChannel();
   await query(
     `UPDATE agent_containers
         SET status = 'stopped',
             last_stopped_at = NOW(),
             volume_gc_at = NOW() + ($2::int || ' days')::interval,
             updated_at = NOW()
-      WHERE user_id = $1 AND status IN ('provisioning','running','error') AND runtime_kind = 'docker'`,
-    [uidStr, gcDays],
+      WHERE user_id = $1 AND runtime_channel = $3 AND status IN ('provisioning','running','error') AND runtime_kind = 'docker' AND state = 'active'`,
+    [uidStr, gcDays, runtimeChannel],
   );
 }
 
@@ -656,6 +671,7 @@ export async function listVolumeGcCandidates(
   if (!Number.isInteger(limit) || limit <= 0 || limit > 10_000) {
     throw new TypeError(`limit must be in (0, 10000], got ${limit}`);
   }
+  const runtimeChannel = getRuntimeChannel();
   const r = await query<{
     id: string; user_id: string;
     workspace_volume: string; home_volume: string;
@@ -663,10 +679,12 @@ export async function listVolumeGcCandidates(
   }>(
     `UPDATE agent_containers
         SET volume_gc_at = NULL, updated_at = NOW()
-      WHERE runtime_kind = 'docker' AND id IN (
+      WHERE runtime_channel = $2 AND runtime_kind = 'docker' AND state = 'active' AND id IN (
         SELECT id FROM agent_containers
          WHERE status = 'stopped'
+           AND runtime_channel = $2
            AND runtime_kind = 'docker'
+           AND state = 'active'
            AND volume_gc_at IS NOT NULL
            AND volume_gc_at < NOW()
          ORDER BY volume_gc_at ASC
@@ -678,7 +696,7 @@ export async function listVolumeGcCandidates(
               workspace_volume,
               home_volume,
               (updated_at - INTERVAL '0 second') AS volume_gc_at`,
-    [limit],
+    [limit, runtimeChannel],
   );
   return r.rows.map((row) => ({
     container_id: BigInt(row.id),
@@ -698,6 +716,7 @@ export async function restoreVolumeGcAfterFailure(
   retryAfterSeconds: number,
 ): Promise<void> {
   const uidStr = normUid(userId);
+  const runtimeChannel = getRuntimeChannel();
   if (!Number.isInteger(retryAfterSeconds) || retryAfterSeconds <= 0) {
     throw new TypeError(`retryAfterSeconds must be > 0, got ${retryAfterSeconds}`);
   }
@@ -705,8 +724,8 @@ export async function restoreVolumeGcAfterFailure(
     `UPDATE agent_containers
         SET volume_gc_at = NOW() + ($2::int || ' seconds')::interval,
             updated_at = NOW()
-      WHERE user_id = $1 AND status = 'stopped' AND volume_gc_at IS NULL AND runtime_kind = 'docker'`,
-    [uidStr, retryAfterSeconds],
+      WHERE user_id = $1 AND runtime_channel = $3 AND status = 'stopped' AND volume_gc_at IS NULL AND runtime_kind = 'docker' AND state = 'active'`,
+    [uidStr, retryAfterSeconds, runtimeChannel],
   );
 }
 
@@ -715,11 +734,12 @@ export async function markContainerRemoved(
   userId: bigint | number | string,
 ): Promise<void> {
   const uidStr = normUid(userId);
+  const runtimeChannel = getRuntimeChannel();
   await query(
     `UPDATE agent_containers
         SET status = 'removed', docker_id = NULL, updated_at = NOW()
-      WHERE user_id = $1 AND status = 'stopped' AND runtime_kind = 'docker'`,
-    [uidStr],
+      WHERE user_id = $1 AND runtime_channel = $2 AND status = 'stopped' AND runtime_kind = 'docker' AND state = 'active'`,
+    [uidStr, runtimeChannel],
   );
 }
 

@@ -634,3 +634,83 @@ describe("listVolumeGcCandidates + restoreVolumeGcAfterFailure", () => {
     assert.equal(r.length, 0);
   });
 });
+
+// ============================================================
+//  OCV5-136: partial unique index (state='active', runtime_channel, runtime_kind) + v5 guard
+// ============================================================
+
+describe("OCV5-136 partial unique index & channel/kind isolation", () => {
+  test("historical vanished row does not collide with openAgentSubscription and is ignored by readers", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("vanished-resub@x.com", 5000n);
+    const vanished = await query<{ id: string }>(
+      `INSERT INTO agent_containers
+          (user_id, docker_name, workspace_volume, home_volume, image, status, state,
+           runtime_channel, runtime_kind, secret_hash)
+       VALUES ($1, $2, $3, $4, $5, 'removed', 'vanished', 'v3', 'docker', $6)
+       RETURNING id::text AS id`,
+      [uid.toString(), `agent-u${uid}-old`, "w-old", "h-old", IMAGE, Buffer.alloc(32, 0xaa)],
+    );
+    const opened = await openAgentSubscription({ userId: uid, image: IMAGE });
+    assert.notEqual(opened.container_id, BigInt(vanished.rows[0].id));
+
+    const status = await getAgentStatus(uid);
+    assert.equal(status.container?.id, opened.container_id.toString());
+    assert.equal(status.container?.status, "provisioning");
+
+    const access = await checkAgentAccess(uid);
+    assert.equal(access.ok, true);
+    if (access.ok) {
+      assert.equal(access.container_id, opened.container_id.toString());
+    }
+  });
+
+  test("active v5 or desktop rows for the same user do not collide with v3/docker openAgentSubscription", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("multi-channel-kind@x.com", 5000n);
+    const v5Row = await query<{ id: string }>(
+      `INSERT INTO agent_containers
+          (user_id, docker_name, workspace_volume, home_volume, image, status, state,
+           runtime_channel, runtime_kind, secret_hash)
+       VALUES ($1, $2, $3, $4, $5, 'running', 'active', 'v5', 'docker', $6)
+       RETURNING id::text AS id`,
+      [uid.toString(), `agent-v5-u${uid}`, "w-v5", "h-v5", IMAGE, Buffer.alloc(32, 0xbb)],
+    );
+    const desktopRow = await query<{ id: string }>(
+      `INSERT INTO agent_containers
+          (user_id, docker_name, workspace_volume, home_volume, image, status, state,
+           runtime_channel, runtime_kind, secret_hash)
+       VALUES ($1, $2, $3, $4, $5, 'running', 'active', 'v3', 'desktop', $6)
+       RETURNING id::text AS id`,
+      [uid.toString(), `agent-desktop-u${uid}`, "w-dt", "h-dt", IMAGE, Buffer.alloc(32, 0xcc)],
+    );
+
+    const opened = await openAgentSubscription({ userId: uid, image: IMAGE });
+    assert.notEqual(opened.container_id, BigInt(v5Row.rows[0].id));
+    assert.notEqual(opened.container_id, BigInt(desktopRow.rows[0].id));
+
+    // v5 and desktop rows remain untouched
+    const intact = await query<{ id: string; status: string }>(
+      "SELECT id::text AS id, status FROM agent_containers WHERE id IN ($1, $2) ORDER BY id",
+      [v5Row.rows[0].id, desktopRow.rows[0].id],
+    );
+    assert.equal(intact.rows.length, 2);
+    assert.ok(intact.rows.every((row) => row.status === "running"));
+  });
+
+  test("v5 channel fails closed before touching DB", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("v5-blocked@x.com", 5000n);
+    const prev = process.env.OC_RUNTIME_CHANNEL;
+    process.env.OC_RUNTIME_CHANNEL = "v5";
+    try {
+      await assert.rejects(
+        () => openAgentSubscription({ userId: uid, image: IMAGE }),
+        /forbidden on v5 channel/,
+      );
+    } finally {
+      if (prev === undefined) Reflect.deleteProperty(process.env, "OC_RUNTIME_CHANNEL");
+      else process.env.OC_RUNTIME_CHANNEL = prev;
+    }
+  });
+});
