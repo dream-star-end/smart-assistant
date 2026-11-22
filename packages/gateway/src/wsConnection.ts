@@ -68,7 +68,6 @@ import {
 } from './turnDispatchInbox.js'
 import { readUploadUserFailureCode } from './uploadTotalRejection.js'
 import { _pendingPermissionCatchupFrames } from './pendingPermissionSnapshot.js'
-import { lookupRemoteSwarmRuntimeForSession } from './remoteSwarmRuntime.js'
 import { resolveLocalExecutionIfEnforced, localExecutionOverride, makePeerKey, _parseConnectionTraceIdFromUpgrade, _stripPrivateRoutingFields, _turnStatusWireFields, _helloTurnStatusResendPhase, preparedModelSwitchCatchupFrame, _matchActiveTurnReplayCandidate, _unservedActiveTurnReplay, _noteActiveTurnReplayServed, _shouldPushTurnInterruptedFinal, _shouldInterruptUnknownInFlight } from './server.js'
 import type { Gateway } from './server.js'
 
@@ -1302,14 +1301,9 @@ async function interruptRemoteSwarmForSession(
   sessionKey: string,
   reason: string,
 ): Promise<boolean> {
-  if (host._interruptRemoteSwarmForSession) {
-    return host._interruptRemoteSwarmForSession(sessionKey, reason)
-  }
-  const rt = lookupRemoteSwarmRuntimeForSession(sessionKey)
-  if (!rt) return false
+  if (!host._interruptRemoteSwarmForSession) return false
   try {
-    const res = await rt.interruptSessionWorkers(sessionKey, reason)
-    return res.interrupted
+    return await host._interruptRemoteSwarmForSession(sessionKey, reason)
   } catch {
     return false
   }

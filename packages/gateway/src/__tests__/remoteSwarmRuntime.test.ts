@@ -1102,6 +1102,8 @@ describe('RemoteSwarmRuntime & Admission (OCV5-835)', () => {
           fencePreStartStop: () => {},
         },
         _interruptDelegationsForParent: () => false,
+        _interruptRemoteSwarmForSession: (sk: string, reason = 'user_stop') =>
+          rt.interruptSessionWorkers(sk, reason).then((r) => r.interrupted),
         _settlePendingPermissionsForStop: () => {},
         router: { route: () => ({ sessionKey }) },
         log: { info: () => {}, warn: () => {} },
@@ -1989,6 +1991,8 @@ describe('RemoteSwarmRuntime & Admission (OCV5-835)', () => {
         },
         _admittedClientTurns: new Set([`${peerId}\0${betaCmid}`]),
         _interruptDelegationsForParent: () => false,
+        _interruptRemoteSwarmForSession: (sk: string, reason = 'user_stop') =>
+          rt.interruptSessionWorkers(sk, reason).then((r) => r.interrupted),
         _settlePendingPermissionsForStop: () => {},
         router: { route: () => ({ sessionKey: betaKey }) },
         log: { info: () => {}, warn: () => {} },

@@ -19,6 +19,7 @@ import type { AgentDef, AgentsConfig } from '@openclaude/storage'
 import { listClientSessions } from '@openclaude/storage'
 import type { GatewayStreamEvent } from './ccbMessageParser.js'
 import { checkToken } from './auth.js'
+import { probeEnvFacts } from './envProbe.js'
 import {
   acquireDelegateRemoteLane,
   releaseDelegateRemoteLaneSession,
@@ -465,6 +466,7 @@ export async function interruptGatewayRemoteSwarmSession(
 
 export async function reconcileGatewayRemoteSwarmOnBoot(deps: {
   agentsConfig?: AgentsConfig | null
+  candidateUserIds?: string[]
   log: {
     info?: (msg: string, fields?: Record<string, unknown>) => void
     warn: (msg: string, fields?: Record<string, unknown>) => void
@@ -481,13 +483,12 @@ export async function reconcileGatewayRemoteSwarmOnBoot(deps: {
     let archivedIdsPromise: Promise<Set<string>> | null = null
     const getArchivedSessionIds = (): Promise<Set<string>> => {
       if (!archivedIdsPromise) {
+        const probedUid = probeEnvFacts().uid
         const candidateUserIds = [
           ...new Set([
             'default',
-            ...(process.env.OC_USER_ID ? [`c:${process.env.OC_USER_ID}`, process.env.OC_USER_ID] : []),
-            ...(process.env.OPENCLAUDE_USER_ID
-              ? [`c:${process.env.OPENCLAUDE_USER_ID}`, process.env.OPENCLAUDE_USER_ID]
-              : []),
+            ...(probedUid ? [`c:${probedUid}`, probedUid] : []),
+            ...(deps.candidateUserIds ?? []),
           ]),
         ]
         archivedIdsPromise = Promise.all(
