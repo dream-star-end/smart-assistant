@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { Button } from "../../../components/ui";
+import { Badge, Button } from "../../../components/ui";
 import { groupLabel, orderedGroups } from "./constants";
 import type { EventMeta } from "./types";
 
@@ -37,28 +37,32 @@ export function EventPicker({
   };
 
   if (events.length === 0) {
-    return <div className="text-meta text-faint">事件目录未加载。</div>;
+    return (
+      <div className="oc-callout rounded-xl px-3.5 py-2.5 text-meta text-muted">
+        事件目录未加载。
+      </div>
+    );
   }
 
   const allChecked = selected.size === allTypes.length && allTypes.length > 0;
 
   return (
-    <div className="rounded-lg border border-border">
-      <div className="flex items-center gap-2 border-b border-border px-3 py-2">
-        <Button variant="secondary" size="sm" onClick={() => onChange([...allTypes])}>
+    <div className="oc-surface-recessed overflow-hidden rounded-xl">
+      <div className="flex flex-wrap items-center gap-2 border-b border-border/80 bg-surface/60 px-3 py-2">
+        <Button variant="secondary" size="sm" onClick={() => onChange([...allTypes])} className="oc-btn-tactile">
           全选
         </Button>
-        <Button variant="secondary" size="sm" onClick={() => onChange([])}>
+        <Button variant="secondary" size="sm" onClick={() => onChange([])} className="oc-btn-tactile">
           全不选
         </Button>
-        <span className="text-meta text-faint">
+        <Badge tone={selected.size === 0 || allChecked ? "success" : "info"} className="ml-auto tabular-nums">
           {selected.size === 0 || allChecked ? "全部订阅" : `已选 ${selected.size} / ${allTypes.length}`}
-        </span>
+        </Badge>
       </div>
-      <div className="max-h-[240px] space-y-3 overflow-y-auto p-3">
+      <div className="max-h-[240px] space-y-2.5 overflow-y-auto p-3">
         {orderedGroups(Object.keys(grouped)).map((g) => (
-          <fieldset key={g} className="rounded-md border border-border/70 px-3 py-2">
-            <legend className="px-1 text-caption font-medium text-faint">{groupLabel(g)}</legend>
+          <fieldset key={g} className="oc-surface-card rounded-lg px-3 py-2.5">
+            <legend className="px-1.5 text-caption font-semibold text-muted">{groupLabel(g)}</legend>
             <div className="flex flex-wrap gap-x-4 gap-y-1.5">
               {grouped[g].map((e) => (
                 <label
@@ -68,7 +72,7 @@ export function EventPicker({
                 >
                   <input
                     type="checkbox"
-                    className="size-3.5 accent-accent"
+                    className="size-3.5 rounded accent-accent"
                     checked={selected.has(e.event_type)}
                     onChange={(ev) => toggle(e.event_type, ev.target.checked)}
                   />

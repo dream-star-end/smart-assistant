@@ -42,3 +42,25 @@ test("closeButton 不传 closeLabel → 默认「关闭」", () => {
   );
   expect(screen.getByRole("button", { name: "关闭" })).toBeInTheDocument();
 });
+
+test("left / bottom 抽屉具备安全区与 CSS keyframes 滑入滑出类（OCV5-817）", () => {
+  const { rerender } = render(
+    <Sheet open onOpenChange={() => {}} side="left" srTitle="左抽屉">
+      <p>左</p>
+    </Sheet>,
+  );
+  const leftDialog = screen.getByRole("dialog", { name: "左抽屉" });
+  expect(leftDialog.className).toContain("pt-[env(safe-area-inset-top)]");
+  expect(leftDialog.className).toContain("pl-[env(safe-area-inset-left)]");
+  expect(leftDialog.className).toContain("data-[state=open]:oc-sheet-in-left");
+  expect(leftDialog.className).toContain("data-[state=closed]:oc-sheet-out-left");
+
+  rerender(
+    <Sheet open onOpenChange={() => {}} side="bottom" srTitle="底抽屉">
+      <p>底</p>
+    </Sheet>,
+  );
+  const bottomDialog = screen.getByRole("dialog", { name: "底抽屉" });
+  expect(bottomDialog.className).toContain("data-[state=open]:oc-sheet-in-bottom");
+  expect(bottomDialog.className).toContain("data-[state=closed]:oc-sheet-out-bottom");
+});

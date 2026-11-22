@@ -3,47 +3,58 @@ import type { ClaimedRecoveryJob } from "../dispatch/turnRecoveryStore.js";
 import type { CronOriginExecutor } from "./userChatBridge.js";
 import { getContainerLinkHandle, type ContainerLinkHandle } from "./containerLink.js";
 
-export type RecoveryExecutor = (job: ClaimedRecoveryJob) => void;
+export type RecoveryExecutor = (job: ClaimedRecoveryJob, epoch?: number) => void;
 export type BridgeExecutors = { recovery: RecoveryExecutor | null; origin: CronOriginExecutor | null };
 type ExecutorMaps = { recovery: Map<string, Set<RecoveryExecutor>>; origin: Map<string, Set<CronOriginExecutor>> };
 type Executor = (...args: never[]) => unknown;
 const availability = new WeakMap<Executor, () => boolean>();
 export function availableExecutors<T extends Executor>(values: Iterable<T> | undefined): T[] {
-  return [...(values ?? [])].filter((value) => availability.get(value)?.() ?? true);
+  return [...(values ?? [])].filter((value) => {
+    const check = availability.get(value);
+    if (check) return check();
+    const live = (value as { isAvailable?: () => boolean }).isAvailable;
+    return live ? live() : true;
+  });
 }
 
 /** One registration per physical link; callbacks retain existing admission and billing code. */
 export class ContainerLinkExecutors {
   private readonly candidates = new Map<ContainerLinkHandle, BridgeExecutors>();
   private unmount: (() => void) | null = null;
-  private current(): BridgeExecutors | undefined {
+  private isEligible(kind: "recovery" | "origin", value: BridgeExecutors): boolean {
+    if (kind === "recovery") return value.recovery !== null;
+    return value.origin !== null && (value.origin.isAvailable?.() ?? true);
+  }
+  private currentFor(kind: "recovery" | "origin"): BridgeExecutors | undefined {
     for (const [handle, value] of this.candidates) {
-      if (handle.active && !handle.detached && !handle.disposed) return value;
+      if (handle.active && !handle.detached && !handle.disposed && this.isEligible(kind, value)) return value;
     }
     for (const [handle, value] of this.candidates) {
-      if (handle.active && !handle.disposed && (handle.hasOpenDispatches || handle.keepAlive)) return value;
+      if (handle.active && !handle.disposed && (handle.hasOpenDispatches || handle.keepAlive) && this.isEligible(kind, value)) {
+        return value;
+      }
     }
     return undefined;
   }
-  readonly recovery: RecoveryExecutor = (job) => {
-    const executor = this.current()?.recovery;
+  readonly recovery: RecoveryExecutor = (job, epoch) => {
+    const executor = this.currentFor("recovery")?.recovery;
     if (!executor) throw new Error("container link has no execution context");
-    executor(job);
+    executor(job, epoch);
   };
   readonly origin: CronOriginExecutor = (payload) => {
-    return this.current()?.origin?.(payload) ?? { kind: "not_claimed" };
+    return this.currentFor("origin")?.origin?.(payload) ?? { kind: "not_claimed" };
   };
   constructor() {
-    availability.set(this.recovery, () => this.current()?.recovery != null);
-    availability.set(this.origin, () => this.current()?.origin != null);
+    availability.set(this.recovery, () => this.currentFor("recovery")?.recovery != null);
+    availability.set(this.origin, () => this.currentFor("origin")?.origin != null);
     Object.defineProperties(this.origin, {
       agentContainerId: {
         enumerable: true,
-        get: () => this.current()?.origin?.agentContainerId,
+        get: () => this.currentFor("origin")?.origin?.agentContainerId,
       },
       runtimeKind: {
         enumerable: true,
-        get: () => this.current()?.origin?.runtimeKind,
+        get: () => this.currentFor("origin")?.origin?.runtimeKind,
       },
     });
   }

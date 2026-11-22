@@ -1,3 +1,4 @@
+import { BarChart3, History } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ChartCard, barConfig, chartNum, donutConfig, lineConfig, useChart } from "../charts";
 import { api, apiErrorMessage } from "../../lib/api";
@@ -12,7 +13,9 @@ import type {
 import { cn, formatCompactCount, formatCredits, groupDigits } from "../../lib/utils";
 import { agentDisplayName } from "../chat/agentNames";
 import { useProjectScope } from "../../hooks/useProjectScope";
-import { Alert, Button, Progress, ProjectScopeSelect, Skeleton, Spinner, Tabs } from "../ui";
+import { Alert, Badge, Button, Progress, ProjectScopeSelect, Skeleton, Spinner, Tabs } from "../ui";
+import { AtelierIcon } from "../ui/AtelierIcons";
+import { ModelFamilyIcon } from "../ui/ModelFamilyIcons";
 import { formatReportBucket, REPORT_WINDOW_NOUN, shortTime } from "./labels";
 import { StatTile } from "./StatTile";
 
@@ -350,9 +353,14 @@ export function UsageTab({
   return (
     <div className="flex flex-col">
       {/* 标题 + 项目范围；窗口/视图分两行，避免窄 Modal 截断 */}
-      <div className="flex flex-col gap-2 px-5 pt-4">
+      <div className="flex flex-col gap-2.5 px-5 pt-4">
         <div className="flex items-center justify-between gap-3">
-          <div className="text-section font-medium text-fg">用量统计</div>
+          <div className="flex items-center gap-2.5">
+            <span className="oc-icon-badge oc-icon-badge-accent h-7 w-7 rounded-sm" aria-hidden>
+              <BarChart3 size={14} strokeWidth={1.75} />
+            </span>
+            <div className="text-section font-semibold text-fg">用量统计</div>
+          </div>
           <ProjectScopeSelect className="w-44 shrink-0" />
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -436,14 +444,16 @@ export function UsageTab({
             {usageView === "by-model" ? (
             <div className="px-5 pb-4">
               {report.models.length === 0 ? (
-                <p className="py-8 text-center text-meta text-faint">该时段暂无模型用量。</p>
+                <div className="oc-surface-recessed rounded-xl py-8 text-center text-meta text-faint">
+                  该时段暂无模型用量。
+                </div>
               ) : (
-                <div className="overflow-x-auto rounded-xl border border-border">
-                  <table className="w-full min-w-[40rem] text-left text-meta">
+                <div className="oc-surface-card overflow-x-auto rounded-xl">
+                  <table className="w-full min-w-[40rem] text-left text-meta [&_tbody_tr]:transition-colors [&_tbody_tr:hover]:bg-hover/60">
                     <caption className="sr-only">
                       {`按模型用量，近 ${REPORT_WINDOW_NOUN[window]}`}
                     </caption>
-                    <thead className="bg-hover text-caption font-medium uppercase tracking-wide text-faint">
+                    <thead className="bg-bg/95 text-caption font-medium uppercase tracking-wide text-faint">
                       <tr>
                         <th className="px-3 py-2">模型</th>
                         <th className="px-3 py-2 text-right">请求</th>
@@ -457,13 +467,18 @@ export function UsageTab({
                     <tbody>
                       {report.models.map((model) => (
                         <tr key={model.model} className="border-t border-border">
-                          <td className="px-3 py-2 font-mono text-fg">{model.model}</td>
+                          <td className="px-3 py-2 font-mono text-fg">
+                            <span className="inline-flex items-center gap-2">
+                              <ModelFamilyIcon model={model.model} size={14} className="text-muted" />
+                              <span>{model.model}</span>
+                            </span>
+                          </td>
                           <td className="px-3 py-2 text-right tabular-nums">{groupDigits(model.requests)}</td>
                           <td className="px-3 py-2 text-right tabular-nums">{formatCompactCount(model.input_tokens)}</td>
                           <td className="px-3 py-2 text-right tabular-nums">{formatCompactCount(model.output_tokens)}</td>
                           <td className="px-3 py-2 text-right tabular-nums">{formatCompactCount(model.cache_read_tokens)}</td>
                           <td className="px-3 py-2 text-right tabular-nums">{formatCompactCount(model.cache_write_tokens)}</td>
-                          <td className="px-3 py-2 text-right tabular-nums font-medium">{formatCredits(model.credits)}</td>
+                          <td className="px-3 py-2 text-right font-medium tabular-nums">{formatCredits(model.credits)}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -567,165 +582,177 @@ export function UsageTab({
       )}
 
       {/* 累计口径（全生命周期，独立于窗口） */}
-      <div className="border-t border-border px-5 py-4">
-        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
-          累计 · 自开通以来
-        </div>
-        <div className="flex items-center justify-between pb-1.5">
-          <span className="text-meta text-muted">缓存命中率</span>
-          <span className="text-meta font-medium tabular-nums text-fg">
-            {hitPct != null ? `${hitPct}%` : "—"}
-          </span>
-        </div>
-        <Progress value={hitPct ?? 0} aria-label="缓存命中率" />
-        <div className="mt-3 flex items-center justify-between">
-          <span className="text-meta text-muted">缓存为你节省</span>
-          <span className="text-section font-semibold text-success">
-            {data.savings.savings_unavailable || data.savings.savings_credits == null
-              ? "—"
-              : `${formatCredits(data.savings.savings_credits)} 积分`}
-            {data.savings.savings_is_estimate ? (
-              <span className="ml-1 text-caption font-normal text-faint">（估算）</span>
-            ) : null}
-          </span>
-        </div>
-        {data.savings.savings_unavailable && (
-          <p className="mt-1 text-caption text-faint">数据量较大，暂不展示节省精算值。</p>
-        )}
-        {/* 累计口径不回退：全生命周期请求 + 实际扣费 */}
-        <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 border-t border-border pt-3 text-meta">
-          <div className="flex items-center justify-between">
-            <span className="text-muted">累计请求</span>
-            <span className="tabular-nums text-fg">{groupDigits(s.requests_total)}</span>
+      <div className="px-5 py-2">
+        <section className="oc-surface-card rounded-2xl p-4">
+          <div className="mb-3 flex items-center gap-2.5">
+            <span className="oc-icon-badge oc-icon-badge-success h-7 w-7 rounded-sm" aria-hidden>
+              <AtelierIcon name="sparkles" size={14} />
+            </span>
+            <div className="text-section font-semibold text-fg">累计 · 自开通以来</div>
           </div>
-          <div className="flex items-center justify-between">
-            <span className="text-muted">累计实际扣费</span>
-            <span className="tabular-nums text-fg">{formatCredits(s.debited_credits)}</span>
+          <div className="flex items-center justify-between pb-1.5">
+            <span className="text-meta text-muted">缓存命中率</span>
+            <span className="text-meta font-semibold tabular-nums text-fg">
+              {hitPct != null ? `${hitPct}%` : "—"}
+            </span>
           </div>
-        </div>
+          <Progress value={hitPct ?? 0} aria-label="缓存命中率" />
+          <div className="mt-3 flex items-center justify-between">
+            <span className="text-meta text-muted">缓存为你节省</span>
+            <span className="text-section font-semibold tabular-nums text-success">
+              {data.savings.savings_unavailable || data.savings.savings_credits == null
+                ? "—"
+                : `${formatCredits(data.savings.savings_credits)} 积分`}
+              {data.savings.savings_is_estimate ? (
+                <span className="ml-1 text-caption font-normal text-faint">（估算）</span>
+              ) : null}
+            </span>
+          </div>
+          {data.savings.savings_unavailable && (
+            <p className="mt-1 text-caption text-faint">数据量较大，暂不展示节省精算值。</p>
+          )}
+          {/* 累计口径不回退：全生命周期请求 + 实际扣费 */}
+          <div className="oc-surface-recessed mt-3.5 grid grid-cols-2 gap-3 rounded-xl px-3.5 py-2.5 text-meta">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-muted">累计请求</span>
+              <span className="font-medium tabular-nums text-fg">{groupDigits(s.requests_total)}</span>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-muted">累计实际扣费</span>
+              <span className="font-medium tabular-nums text-fg">{formatCredits(s.debited_credits)}</span>
+            </div>
+          </div>
+        </section>
       </div>
 
       {/* 会话维度明细 */}
-      <div className="border-t border-border px-5 py-4">
-        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
-          会话用量明细
-        </div>
-        {sessions.length === 0 ? (
-          <p className="py-3 text-center text-meta text-faint">
-            暂无会话维度用量{data.cutoff_started_at ? "" : "（功能上线后开始记录）"}。
-          </p>
-        ) : (
-          <>
-            <ul className="flex flex-col gap-0.5">
-              {sessions.map((row) => {
-                const tok = sumBig(row.input_tokens, row.output_tokens);
-                // 组队(delegate)归组:后端只对含 delegate 行的会话下发 delegates
-                // 明细;无组队数据时以下分支全部关闭,行渲染与旧版一致。
-                const delegates = row.delegates ?? [];
-                const hasDelegate = delegates.length > 0;
-                const isOpen = hasDelegate && expandedDelegates.has(row.session_id);
-                const title = sessionTitles.get(row.session_id);
-                const hasTitle = Boolean(title);
-                return (
-                  <li key={row.session_id} className="rounded-lg px-2 py-2 hover:bg-hover">
-                    <div className="flex items-center gap-3">
-                      <span className="min-w-0 flex-1">
-                        <span className="flex min-w-0 items-center gap-1.5">
-                          {hasTitle ? (
-                            <span className="truncate text-body text-fg">{title}</span>
-                          ) : (
-                            <span className="truncate font-mono text-meta text-fg">
-                              {row.session_id}
-                            </span>
-                          )}
-                          {row.delegate_only ? (
-                            <span className="shrink-0 rounded-full bg-hover px-1.5 py-px text-micro text-muted">
-                              组队
-                            </span>
-                          ) : null}
+      <div className="px-5 py-3 pb-5">
+        <section className="oc-surface-card rounded-2xl p-4">
+          <div className="mb-2.5 flex items-center gap-2.5">
+            <span className="oc-icon-badge h-7 w-7 rounded-sm" aria-hidden>
+              <History size={14} strokeWidth={1.75} />
+            </span>
+            <div className="text-section font-semibold text-fg">会话用量明细</div>
+          </div>
+          {sessions.length === 0 ? (
+            <div className="oc-surface-recessed rounded-xl py-5 text-center text-meta text-faint">
+              暂无会话维度用量{data.cutoff_started_at ? "" : "（功能上线后开始记录）"}。
+            </div>
+          ) : (
+            <>
+              <ul className="flex flex-col divide-y divide-border/60">
+                {sessions.map((row) => {
+                  const tok = sumBig(row.input_tokens, row.output_tokens);
+                  // 组队(delegate)归组:后端只对含 delegate 行的会话下发 delegates
+                  // 明细;无组队数据时以下分支全部关闭,行渲染与旧版一致。
+                  const delegates = row.delegates ?? [];
+                  const hasDelegate = delegates.length > 0;
+                  const isOpen = hasDelegate && expandedDelegates.has(row.session_id);
+                  const title = sessionTitles.get(row.session_id);
+                  const hasTitle = Boolean(title);
+                  return (
+                    <li
+                      key={row.session_id}
+                      className="rounded-lg px-2 py-2.5 transition-colors hover:bg-hover/70"
+                    >
+                      <div className="flex items-center gap-3">
+                        <span className="min-w-0 flex-1">
+                          <span className="flex min-w-0 items-center gap-1.5">
+                            {hasTitle ? (
+                              <span className="truncate text-body font-medium text-fg">{title}</span>
+                            ) : (
+                              <span className="truncate font-mono text-meta text-fg">
+                                {row.session_id}
+                              </span>
+                            )}
+                            {row.delegate_only ? (
+                              <Badge tone="neutral" size="sm" className="shrink-0">
+                                组队
+                              </Badge>
+                            ) : null}
+                          </span>
+                          <span className="mt-0.5 block truncate text-caption tabular-nums text-faint">
+                            {groupDigits(row.requests)} 次 · {formatCompactCount(tok)} token ·{" "}
+                            {shortTime(row.last_used_at)}
+                            {hasTitle ? (
+                              <>
+                                {" · "}
+                                <span className="font-mono">{row.session_id.slice(0, 12)}</span>
+                              </>
+                            ) : null}
+                          </span>
                         </span>
-                        <span className="block truncate text-caption text-faint">
-                          {groupDigits(row.requests)} 次 · {formatCompactCount(tok)} token ·{" "}
-                          {shortTime(row.last_used_at)}
-                          {hasTitle ? (
-                            <>
-                              {" · "}
-                              <span>{row.session_id.slice(0, 12)}</span>
-                            </>
-                          ) : null}
+                        <span className="shrink-0 text-body font-semibold tabular-nums text-fg">
+                          <span>{formatCredits(row.billed_credits)}</span>
+                          <span className="ml-0.5 text-caption font-normal text-faint">积分</span>
                         </span>
-                      </span>
-                      <span className="shrink-0 text-body font-medium tabular-nums text-fg">
-                        <span>{formatCredits(row.billed_credits)}</span>
-                        <span className="ml-0.5 text-caption text-faint">积分</span>
-                      </span>
-                    </div>
-                    {hasDelegate && (
-                      <button
-                        type="button"
-                        onClick={() => toggleDelegates(row.session_id)}
-                        aria-expanded={isOpen}
-                        // 触屏补 44px 命中高(t-762 settings#5:此前 22px);桌面 hover 可用时零变化。
-                        className="mt-1 inline-flex items-center gap-1 rounded-full border border-border bg-surface px-2 py-0.5 text-caption text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
-                      >
-                        含组队 {formatCredits(row.delegate_credits ?? "0")} 积分
-                        <span
-                          aria-hidden
-                          className={cn("transition-transform", isOpen && "rotate-180")}
+                      </div>
+                      {hasDelegate && (
+                        <button
+                          type="button"
+                          onClick={() => toggleDelegates(row.session_id)}
+                          aria-expanded={isOpen}
+                          // 触屏补 44px 命中高(t-762 settings#5:此前 22px);桌面 hover 可用时零变化。
+                          className="oc-btn-tactile oc-badge-craft mt-1.5 inline-flex items-center gap-1 rounded-full bg-bg px-2.5 py-0.5 text-caption font-medium tabular-nums text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
                         >
-                          ▾
-                        </span>
-                      </button>
-                    )}
-                    {isOpen && (
-                      <ul className="mt-1.5 flex flex-col gap-1 border-l-2 border-border pl-3">
-                        {delegates.map((d, i) => (
-                          <li
-                            key={`${d.delegate_agent_id ?? "unknown"}:${d.model}:${i}`}
-                            className="flex items-center gap-2 text-caption"
+                          含组队 {formatCredits(row.delegate_credits ?? "0")} 积分
+                          <span
+                            aria-hidden
+                            className={cn("transition-transform", isOpen && "rotate-180")}
                           >
-                            <span className="min-w-0 flex-1 truncate">
-                              <span className="text-fg">
-                                {agentDisplayName(d.delegate_agent_id) || "未知成员"}
+                            ▾
+                          </span>
+                        </button>
+                      )}
+                      {isOpen && (
+                        <ul className="mt-2 flex flex-col gap-1.5 border-l-2 border-accent/35 pl-3">
+                          {delegates.map((d, i) => (
+                            <li
+                              key={`${d.delegate_agent_id ?? "unknown"}:${d.model}:${i}`}
+                              className="flex items-center gap-2 text-caption"
+                            >
+                              <span className="min-w-0 flex-1 truncate">
+                                <span className="font-medium text-fg">
+                                  {agentDisplayName(d.delegate_agent_id) || "未知成员"}
+                                </span>
+                                <span className="text-faint">
+                                  {" "}
+                                  · {d.model} · {groupDigits(d.requests)} 次
+                                </span>
                               </span>
-                              <span className="text-faint">
-                                {" "}
-                                · {d.model} · {groupDigits(d.requests)} 次
+                              <span className="shrink-0 tabular-nums text-muted">
+                                <span>{formatCredits(d.billed_credits)}</span>
+                                <span className="ml-0.5 text-caption text-faint">积分</span>
                               </span>
-                            </span>
-                            <span className="shrink-0 tabular-nums text-muted">
-                              <span>{formatCredits(d.billed_credits)}</span>
-                              <span className="ml-0.5 text-caption text-faint">积分</span>
-                            </span>
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </li>
-                );
-              })}
-            </ul>
-            {hasMore && (
-              <div className="pt-2 text-center">
-                {/* 与账户页流水的「加载更多」同一原语,触屏下自动补到 44px(审计 SET-11)。 */}
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={loadMore}
-                  disabled={loadingMore}
-                  className="text-muted"
-                >
-                  {loadingMore ? "加载中…" : "加载更多"}
-                </Button>
-              </div>
-            )}
-            {/[1-9]/.test(data.legacy_unattributed.requests) && (
-              <p className="mt-2 text-caption text-faint">
-                另有 {groupDigits(data.legacy_unattributed.requests)} 次早期请求未归属到具体会话。
-              </p>
-            )}
-          </>
-        )}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+              {hasMore && (
+                <div className="pt-3 text-center">
+                  {/* 与账户页流水的「加载更多」同一原语,触屏下自动补到 44px(审计 SET-11)。 */}
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={loadMore}
+                    disabled={loadingMore}
+                  >
+                    {loadingMore ? "加载中…" : "加载更多"}
+                  </Button>
+                </div>
+              )}
+              {/[1-9]/.test(data.legacy_unattributed.requests) && (
+                <p className="mt-2.5 text-caption text-faint">
+                  另有 {groupDigits(data.legacy_unattributed.requests)} 次早期请求未归属到具体会话。
+                </p>
+              )}
+            </>
+          )}
+        </section>
       </div>
     </div>
   );

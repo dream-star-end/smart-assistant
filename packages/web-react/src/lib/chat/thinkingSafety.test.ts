@@ -159,9 +159,9 @@ describe("transient 软提示：不落 IndexedDB / 清除时机", () => {
     return sock;
   }
 
-  test("transient 不进 messages、不进 toStored（不落盘）", () => {
+  test("发送阶段不再重复挂「正在发送…」transient 蓝框（由 UserCard + TurnActivity 承载）", () => {
     const sock = sendingNotice();
-    expect(sock.getTransientNotice("s1")?.text).toBe("正在发送…");
+    expect(sock.getTransientNotice("s1")).toBeNull();
     const stored = sock.toStored("s1")!;
     expect(JSON.stringify(stored)).not.toContain("正在发送…");
     expect((stored as Record<string, unknown>)._transientNotice).toBeUndefined();
@@ -202,9 +202,8 @@ describe("transient 软提示：不落 IndexedDB / 清除时机", () => {
     }
   });
 
-  test("用户手动停止 → 清除 transient 软提示", () => {
+  test("用户手动停止 → 保持无残留 transient 软提示", () => {
     const sock = sendingNotice();
-    expect(sock.getTransientNotice("s1")).not.toBeNull();
     sock.stopTurn("s1");
     expect(sock.getTransientNotice("s1")).toBeNull();
     sock.stop();

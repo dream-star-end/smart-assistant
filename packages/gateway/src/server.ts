@@ -1,6 +1,7 @@
 import { withUserError } from '@openclaude/protocol'
 import { getSystemHelpRelay, installSystemHelpRelay } from './systemHelpRelay.js'
 import { handleSystemHelpLocal } from './systemHelpHttp.js'
+import { createGatewayRemoteSwarmRuntime, handleGatewayRemoteSwarmHttp, interruptGatewayRemoteSwarmSession, reconcileGatewayRemoteSwarmOnBoot, setDefaultRemoteSwarmRuntimeFactory, type RemoteSwarmRuntime } from './remoteSwarmLocal.js'
 import { createTaskboardPreflight } from './taskboard/stagePreflight.js'
 export { runSessionPreheat, validateEnginePreheatBody } from './sessionPreheat.js'
 export type { EnginePreheatBody, EnginePreheatValidation, SessionPreheatHost } from './sessionPreheat.js'
@@ -211,6 +212,7 @@ import { type AskUserPermissionsHost, handlePermissionResponse as handlePermissi
 import { type CronTaskWebhookHost, _drainFlagOffCronOriginNotifies as _drainFlagOffCronOriginNotifiesImpl, _handleWebhook as _handleWebhookImpl, _handleTasksApi as _handleTasksApiImpl, _handleTaskItem as _handleTaskItemImpl, _triggerTask as _triggerTaskImpl, injectCronOriginFromTerminal as injectCronOriginFromTerminalImpl, injectCronOriginSession as injectCronOriginSessionImpl, cronProjectPorts as cronProjectPortsImpl, stampCronProject as stampCronProjectImpl, handleCronChannels as handleCronChannelsImpl, handleCronApi as handleCronApiImpl, handleCronItem as handleCronItemImpl } from './cronTaskWebhook.js'
 import { type HttpMiscHandlersHost, _resolveMediaDirs as _resolveMediaDirsImpl, _sendMediaResolveError as _sendMediaResolveErrorImpl, handleApiFile as handleApiFileImpl, handleMediaGet as handleMediaGetImpl, handleUpload as handleUploadImpl, handleCollaborationConfig as handleCollaborationConfigImpl, handleSearch as handleSearchImpl, handleOAuthStart as handleOAuthStartImpl, handleOAuthCallback as handleOAuthCallbackImpl, refreshClaudeOAuthIfNeeded as refreshClaudeOAuthIfNeededImpl } from './httpMiscHandlers.js'
 import { handleChunkedUpload as handleChunkedUploadImpl } from './httpUploadChunks.js'
+import { LiveBrowserController, handleLiveBrowserActionHttp, handleLiveBrowserLiveHttp } from './liveBrowserController.js'
 import { type ChannelHandlersHost, _updateWechatIdempotency as _updateWechatIdempotencyImpl, checkInboundBypass as checkInboundBypassImpl, handleTurnCancelIfQueued as handleTurnCancelIfQueuedImpl, handleTurnRejectIfAbsent as handleTurnRejectIfAbsentImpl, handleTurnDispatchState as handleTurnDispatchStateImpl, handleWechatInbound as handleWechatInboundImpl, handleWechatStop as handleWechatStopImpl, handleWechatInboundCompensate as handleWechatInboundCompensateImpl, _handleWechat as _handleWechatImpl, handleEnginePreheat as handleEnginePreheatImpl } from './channelHandlers.js'
 import { type InboundDispatchHost, dispatchInbound as dispatchInboundImpl } from './inboundDispatch.js'
 import { type WsConnectionHost, handleWsConnection as handleWsConnectionImpl, autoResumeFromHello as autoResumeFromHelloImpl, handleStop as handleStopImpl, deliver as deliverImpl, _sendStatusFrame as _sendStatusFrameImpl, _sendStampedSessionFrame as _sendStampedSessionFrameImpl, _consumeFrameAuthority as _consumeFrameAuthorityImpl } from './wsConnection.js'
@@ -396,6 +398,7 @@ export class Gateway {
   private channels = new Map<string, ChannelAdapter>()
   private log = createLogger({ module: 'gateway' })
   private _containerPreview: ContainerPreviewHandler
+  private readonly liveBrowser = new LiveBrowserController()
   private rateLimiter = new RateLimiter()
   private _wsKeepaliveTimer: ReturnType<typeof setInterval> | null = null
   private _taskSchedulerTimer: ReturnType<typeof setInterval> | null = null
@@ -592,6 +595,7 @@ export class Gateway {
    * dispatch request. Local/personal WS peers can never receive a grant. */
   private _bridgeConnections = new WeakSet<WebSocket>()
   private _promptQueueCoordinator: PromptQueueCoordinator | null = null
+  private _remoteSwarmRuntime: RemoteSwarmRuntime | null = null
   private _promptQueueLifecycleByFrame = new WeakMap<object, PromptQueueTurnLifecycle>()
   private _promptQueueExecutionFenceByFrame = new WeakMap<object, PromptQueueExecutionFence>()
   private _promptQueueClientSessions = new WeakMap<WebSocket, Set<string>>()
@@ -641,6 +645,8 @@ export class Gateway {
     pendingPermissions: this._pendingPermissions,
     delegateJobs: () => this._delegateJobs,
     ensureDelegateInflightSurface: () => this._ensureDelegateInflightSurface(),
+    delegateCancelHost: () => this._delegateCancelHost(),
+    listCronJobsWithMeta: () => this.cron?.listJobsWithMeta() ?? Promise.resolve([]),
     advisorConfigStore: () => this.advisorConfigStore(),
   }
   /**
@@ -714,11 +720,9 @@ export class Gateway {
   // ── Phase 4 GitHub workspace: per-WS recent hello peers cache + pending binds ──
   // bind 帧到达时,sessionId 必须出现在 clientsByPeer 注册表 OR 该 ws 最近 5s 内
   // 收到的 hello peers。否则入 pending 队列(5s timeout 后 fail)。
-  // Map keyed by ws → { peerIds: Set<sessionId>, recordedAt: ms }
-  private _recentHelloPeers = new WeakMap<
-    WebSocket,
-    { peerIds: Set<string>; recordedAt: number }
-  >()
+  // Map keyed by ws → Map<peerId, recordedAtMs> so split per-peer hellos on a
+  // shared ContainerLink never overwrite another peer's 5s repo-bind grace window (OCV5-819 B6).
+  private _recentHelloPeers = new WeakMap<WebSocket, Map<string, number>>()
   private _pendingRepoBinds = new Map<
     string /* sessionId|version */,
     {
@@ -803,8 +807,11 @@ export class Gateway {
             this._sendPromptQueueSnapshotToClient(context, requester as WebSocket, snapshot)
           },
           sendDispatch: (context, frame) => this._sendPromptQueueDispatch(context, frame),
-          interruptExact: async (context, turnId) =>
-            this.sessions.interruptExact(context.owner.sessionKey, turnId),
+          interruptExact: async (context, turnId) => {
+            const ok = this.sessions.interruptExact(context.owner.sessionKey, turnId)
+            if (ok) await this._interruptRemoteSwarmForSession(context.owner.sessionKey, 'prompt_queue_interrupt')
+            return ok
+          },
           persistInterrupted: async ({ context, detail, turnId, turnIndex }) => {
             await persistInterruptedPromptQueueTurn({
               sessionKey: context.owner.sessionKey,
@@ -834,28 +841,21 @@ export class Gateway {
     // 由此 callback 统一走 outboundRing.clear,防 ring 内存长期泄漏。server.ts
     // 其他已有的 destroySession 调用点仍然显式 clear(幂等 double-clear 无副作用)。
     this.sessions.onSessionDestroyed = (sessionKey) => {
-      try {
-        this._outboundRing.clear(sessionKey)
-        outboundRingSizeBytes.value = this._outboundRing.totalBytes()
-      } catch {}
+      try { this._outboundRing.clear(sessionKey); outboundRingSizeBytes.value = this._outboundRing.totalBytes() } catch {}
       clearCcbLocalAgentPendingForSession(sessionKey)
+      void this._remoteSwarmRuntime?.shutdownSession(sessionKey).catch(() => {})
     }
+    setDefaultRemoteSwarmRuntimeFactory(() => this._ensureRemoteSwarmRuntime())
   }
-
-  /** Feed `prune()` eviction counts into Prometheus counters. Called from
-   *  every store/peekReplay site so age-on-read pruning is also reflected.
-   *  Also refreshes the ring size gauge — single source of truth for the
-   *  `oc_outbound_ring_size_bytes` value. */
+  private _ensureRemoteSwarmRuntime(): RemoteSwarmRuntime { return (this._remoteSwarmRuntime ??= createGatewayRemoteSwarmRuntime({ sessions: this.sessions, getAgentsConfig: () => this._getAgentsConfig(), defaultModel: this.deps.config.defaults.model, log: this.log })) }
+  private _interruptRemoteSwarmForSession(sessionKey: string, reason = 'user_stop'): Promise<boolean> { return interruptGatewayRemoteSwarmSession(this._remoteSwarmRuntime, sessionKey, reason) }
   private _recordRingEvictions(stats: EvictionStats): void {
     if (stats.entries) outboundRingEvictedTotal.inc({ cause: 'entries' }, stats.entries)
     if (stats.age) outboundRingEvictedTotal.inc({ cause: 'age' }, stats.age)
     if (stats.bytes) outboundRingEvictedTotal.inc({ cause: 'bytes' }, stats.bytes)
     outboundRingSizeBytes.value = this._outboundRing.totalBytes()
   }
-
-  start(): Promise<void> {
-    return startImpl.call(this as unknown as GatewayLifecycleHost)
-  }
+  async start(): Promise<void> { await reconcileGatewayRemoteSwarmOnBoot({ agentsConfig: this.deps.agentsConfig, log: this.log }); return startImpl.call(this as unknown as GatewayLifecycleHost) }
 
   /**
    * Public, idempotent shutdown. Safe to call from signal handlers, fatal
@@ -880,12 +880,13 @@ export class Gateway {
   }
 
   // ───────── HTTP ─────────
-  private handleHttp(req: IncomingMessage, res: ServerResponse): void {
-    handleHttpImpl.call(this as unknown as GatewayHttpHost, req, res)
-  }
+  private handleHttp(req: IncomingMessage, res: ServerResponse): void { handleHttpImpl.call(this as unknown as GatewayHttpHost, req, res) }
+  private _delegateCancelHost() { return { traceHost: this, delegateJobs: () => this._delegateJobs, delegateInflightSurface: () => this._ensureDelegateInflightSurface(), sessions: this.sessions, _delegateQueueWaiters: this._delegateQueueWaiters, _activeDelegationsByParent: this._activeDelegationsByParent, _interruptDelegationsForParent: (k: string) => this._interruptDelegationsForParent(k) } }
   /** Narrow view of the Gateway for routes/preAuth.ts (FINDINGS §7.5 2b, OCV5-468). */
   private readonly preAuthRoutesIo: PreAuthRoutesIo = ((gw: Gateway): PreAuthRoutesIo => ({
     handleSystemHelp: (req, res) => handleSystemHelpLocal(req, res, getSystemHelpRelay(gw.sessions)),
+    handleRemoteSwarmLocal: (req, res, url) => handleGatewayRemoteSwarmHttp({ req, res, url, extractToken: (r) => gw.extractToken(r), accessToken: gw.deps.config.gateway.accessToken, readBody: (r, m) => gw.readBody(r, m), sendJson: (r, c, b) => gw.sendJson(r, c, b), runtime: gw._ensureRemoteSwarmRuntime(), sessions: gw.sessions }),
+    delegateJobs: () => gw._delegateJobs, ensureDelegateInflightSurface: () => gw._ensureDelegateInflightSurface(), delegateCancelHost: () => gw._delegateCancelHost(), listCronJobsWithMeta: () => gw.cron?.listJobsWithMeta() ?? Promise.resolve([]),
     _handleSkillEvalGenStart: (...args) => gw._handleSkillEvalGenStart(...args),
     _handleSkillEvalGenStatus: (...args) => gw._handleSkillEvalGenStatus(...args),
     _handleSkillTrainRun: (...args) => gw._handleSkillTrainRun(...args),
@@ -1025,6 +1026,8 @@ export class Gateway {
     handleDelegateWait: (...args) => gw.handleDelegateWait(...args),
     handleEngineAskUser: (...args) => gw.handleEngineAskUser(...args),
     handleMemory: (...args) => gw.handleMemory(...args),
+    handleLiveBrowserAction: (...args) => gw.handleLiveBrowserAction(...args),
+    handleLiveBrowserLive: (...args) => gw.handleLiveBrowserLive(...args),
     handleMemoryFile: (...args) => gw.handleMemoryFile(...args),
     handleMemoryUsage: (...args) => gw.handleMemoryUsage(...args),
     handleMemoryContext: (...args) => gw.handleMemoryContext(...args),
@@ -1525,6 +1528,16 @@ export class Gateway {
   // PUT /api/agents/:id/persona  → { text }
   private handlePersona(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
     return handlePersonaImpl.call(this as unknown as AgentHandlersHost, req, res, id)
+  }
+
+  private handleLiveBrowserLive(req: IncomingMessage, res: ServerResponse, agentId: string, url: URL): Promise<void> {
+    return handleLiveBrowserLiveHttp(this.liveBrowserHttpHost(), req, res, agentId, url)
+  }
+  private handleLiveBrowserAction(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
+    return handleLiveBrowserActionHttp(this.liveBrowserHttpHost(), req, res, agentId)
+  }
+  private liveBrowserHttpHost() {
+    return { controller: this.liveBrowser, hasAgent: async (id: string) => (await this._getAgentsConfig()).agents.some((a) => a.id === id), sendJson: (r: ServerResponse, c: number, b: unknown) => this.sendJson(r, c, b), sendError: (r: ServerResponse, c: number, m: string) => this.sendError(r, c, m) }
   }
 
   // memdir 范式下的记忆读写面(单一权威在 storage 的 MemoryDir / userProfile):

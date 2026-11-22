@@ -2,17 +2,23 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 
 import {
   boundedErrorLocation,
+  boundedErrorReasonFromMessage,
+  boundedRenderErrorLocation,
   errorLocationFingerprint,
   installGlobalClientFrictionHandlers,
+  parseComponentStackSummary,
+  parseTopStackFrame,
   reportClientFriction,
   reportClientFrictionBatch,
   reportClientFrictionOnce,
   resetClientFrictionOnceForTests,
   scriptRefFromSource,
+  sessionIdFromPathname,
 } from "./clientFriction";
 
 afterEach(() => {
   document.querySelector('meta[name="oc-build"]')?.remove();
+  window.history.replaceState({}, "", "/");
   resetClientFrictionOnceForTests();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -229,6 +235,206 @@ describe("client friction reporter", () => {
     const body = JSON.parse(String((fetchMock.mock.calls[0]![1] as RequestInit).body));
     expect(body).toMatchObject({
       surface: "billing", stage: "pricing_exposure", code: "PRICING_EXPOSURE", outcome: "succeeded",
+    });
+  });
+
+  test("OCV5-39: rejects document URLs, /s/<id> SPA routes, and non-script refs from scriptRef", () => {
+    expect(sessionIdFromPathname("/s/webmtd63p5mm747zh")).toBe("webmtd63p5mm747zh");
+    expect(sessionIdFromPathname("/s/webmtd63p5mm747zh/")).toBe("webmtd63p5mm747zh");
+    expect(sessionIdFromPathname("/s/webmtd63p5mm747zh?token=secret#frag")).toBe("webmtd63p5mm747zh");
+    expect(sessionIdFromPathname("/")).toBeUndefined();
+    expect(sessionIdFromPathname("/board")).toBeUndefined();
+    expect(sessionIdFromPathname("/p/proj-1")).toBeUndefined();
+    expect(sessionIdFromPathname("/s/bad space")).toBeUndefined();
+    expect(sessionIdFromPathname("/s/nested/extra")).toBeUndefined();
+
+    const docHref = "https://oc.example/s/webmtd63p5mm747zh?token=secret#frag";
+    expect(scriptRefFromSource("https://oc.example/s/webmtd63p5mm747zh", docHref)).toBeUndefined();
+    expect(scriptRefFromSource("https://oc.example/s/webmtd63p5mm747zh?foo=1", docHref)).toBeUndefined();
+    expect(scriptRefFromSource("https://oc.example/s/fake-session.js", docHref)).toBeUndefined();
+    expect(scriptRefFromSource("webmtd63p5mm747zh", docHref)).toBeUndefined();
+    expect(scriptRefFromSource("https://oc.example/p/proj_1", docHref)).toBeUndefined();
+    expect(scriptRefFromSource("https://oc.example/index.html", docHref)).toBeUndefined();
+    expect(scriptRefFromSource("blob:https://oc.example/550e8400-e29b.js", docHref)).toBeUndefined();
+    expect(scriptRefFromSource("chrome-extension://ext/inject.js", docHref)).toBeUndefined();
+    expect(scriptRefFromSource("https://oc.example/assets/index-Ab3xY9.mjs?v=2#h", docHref)).toBe(
+      "index-Ab3xY9.mjs",
+    );
+  });
+
+  test("OCV5-39: Safari mobile /s/<id> ErrorEvent attaches session_id, drops fake script_ref/fingerprint, keeps bounded reason", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("matchMedia", vi.fn(() => ({ matches: true })));
+    window.history.replaceState({}, "", "/s/webmtd63p5mm747zh?token=SECRET_TOKEN#hash");
+
+    vi.resetModules();
+    const fresh = await import("./clientFriction");
+    fresh.installGlobalClientFrictionHandlers();
+
+    // Exact Safari mobile shape observed on OCV5-39 (f26ae76a): document URL as filename, lineno=0, error=null.
+    const safariEvent = Object.assign(new Event("error"), {
+      message: "ResizeObserver loop completed with undelivered notifications.",
+      filename: `${window.location.origin}/s/webmtd63p5mm747zh?token=SECRET_TOKEN`,
+      lineno: 0,
+      colno: 0,
+      error: null,
+    });
+    window.dispatchEvent(safariEvent);
+
+    const body = fetchMock.mock.calls
+      .map((call) => JSON.parse(String((call[1] as RequestInit).body)))
+      .find((item) => item.code === "JS_ERROR");
+    expect(body).toBeDefined();
+    expect(body.session_id).toBe("webmtd63p5mm747zh");
+    expect(body.reason).toBe("resize_observer_loop");
+    expect(body.script_ref).toBeUndefined();
+    expect(body.line_no).toBeUndefined();
+    expect(body.col_no).toBeUndefined();
+    expect(body.error_name).toBeUndefined();
+    expect(body.error_fingerprint).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain("SECRET_TOKEN");
+    expect(JSON.stringify(body)).not.toContain("undelivered notifications");
+  });
+
+  test("OCV5-39: same error across two /s/<id> sessions produces distinct session_id and identical error_fingerprint", async () => {
+    const capture = async (sessionId: string) => {
+      const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+      vi.stubGlobal("fetch", fetchMock);
+      vi.stubGlobal("matchMedia", vi.fn(() => ({ matches: true })));
+      window.history.replaceState({}, "", `/s/${sessionId}?invite=PRIVATE`);
+
+      vi.resetModules();
+      const fresh = await import("./clientFriction");
+      fresh.installGlobalClientFrictionHandlers();
+
+      const err = new TypeError("undefined is not an object (evaluating 'msg.PRIVATE_TEXT')");
+      err.stack = [
+        `global code@${window.location.origin}/s/${sessionId}:1:1`,
+        "renderRow@https://oc.example/assets/index-Ab3xY9.js:120:7",
+      ].join("\n");
+      const event = Object.assign(new Event("error"), {
+        message: err.message,
+        filename: `${window.location.origin}/s/${sessionId}`,
+        lineno: 0,
+        colno: 0,
+        error: err,
+      });
+      window.dispatchEvent(event);
+      return fetchMock.mock.calls
+        .map((call) => JSON.parse(String((call[1] as RequestInit).body)))
+        .find((item) => item.code === "JS_ERROR");
+    };
+
+    const first = await capture("webmt_alpha_1");
+    const second = await capture("webmt_beta_2");
+    expect(first.session_id).toBe("webmt_alpha_1");
+    expect(second.session_id).toBe("webmt_beta_2");
+    expect(first).toMatchObject({
+      error_name: "TypeError",
+      script_ref: "index-Ab3xY9.js",
+      line_no: 120,
+      col_no: 7,
+      reason: "undefined_dereference",
+    });
+    expect(first.error_fingerprint).toMatch(/^[a-f0-9]{8}$/);
+    expect(second.error_fingerprint).toBe(first.error_fingerprint);
+    expect(JSON.stringify(first)).not.toContain("PRIVATE");
+  });
+
+  test("OCV5-39: Safari sourceURL/line/col fallback, message-only class allowlist, and UNHANDLED_REJECTION stack extraction", async () => {
+    const safariErr = Object.assign(new RangeError("Maximum call stack size exceeded"), {
+      stack: undefined,
+      sourceURL: "https://oc.example/assets/chat-9z.js?v=3",
+      line: 88,
+      column: 14,
+    });
+    expect(
+      boundedErrorLocation({
+        filename: "https://oc.example/s/webmt123",
+        lineno: 0,
+        colno: 0,
+        error: safariErr,
+      }),
+    ).toEqual({
+      errorName: "RangeError",
+      scriptRef: "chat-9z.js",
+      lineNo: 88,
+      colNo: 14,
+      reason: "max_call_stack",
+    });
+
+    expect(
+      boundedErrorLocation({
+        filename: "",
+        lineno: 0,
+        colno: 0,
+        error: null,
+        message: "Uncaught TypeError: Cannot read properties of null (reading 'SECRET_KEY')",
+      }),
+    ).toEqual({
+      errorName: "TypeError",
+      scriptRef: undefined,
+      lineNo: undefined,
+      colNo: undefined,
+      reason: "null_dereference",
+    });
+    expect(boundedErrorReasonFromMessage("Script error.")).toBe("cross_origin_script_error");
+    expect(boundedErrorReasonFromMessage("random user prompt text")).toBeUndefined();
+    expect(
+      parseTopStackFrame("at fn (https://oc.example/assets/chunk-1.js:33:9)\n", "https://oc.example/s/x"),
+    ).toEqual({ scriptRef: "chunk-1.js", lineNo: 33, colNo: 9 });
+
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("matchMedia", vi.fn(() => ({ matches: false })));
+    window.history.replaceState({}, "", "/s/webmt_rej_1");
+    vi.resetModules();
+    const fresh = await import("./clientFriction");
+    fresh.installGlobalClientFrictionHandlers();
+
+    const rejErr = new TypeError("Failed to fetch dynamically imported module: https://oc.example/assets/lazy.js");
+    rejErr.stack = "TypeError: ...\n    at loadChunk (https://oc.example/assets/main-abc.js:55:12)";
+    window.dispatchEvent(Object.assign(new Event("unhandledrejection"), { reason: rejErr }));
+
+    const rejBody = fetchMock.mock.calls
+      .map((call) => JSON.parse(String((call[1] as RequestInit).body)))
+      .find((item) => item.code === "UNHANDLED_REJECTION");
+    expect(rejBody).toMatchObject({
+      session_id: "webmt_rej_1",
+      error_name: "TypeError",
+      script_ref: "main-abc.js",
+      line_no: 55,
+      col_no: 12,
+      reason: "chunk_load_failed",
+    });
+    expect(rejBody.error_fingerprint).toMatch(/^[a-f0-9]{8}$/);
+  });
+
+  test("OCV5-77: boundedRenderErrorLocation extracts component path, stack frame, and avoids fake fingerprints on empty input", () => {
+    const err = new TypeError("Cannot read properties of undefined (reading 'USER_PII')");
+    err.stack = "TypeError: ...\n    at ToolCardSlot (https://oc.example/assets/cards-123.js:210:15)";
+    const componentStack = "\n    at div\n    at ToolCardSlot\n    at MessageRenderer\n    at SessionTimelineBoundary";
+    const loc = boundedRenderErrorLocation(err, componentStack);
+    expect(loc).toMatchObject({
+      errorName: "TypeError",
+      scriptRef: "cards-123.js",
+      lineNo: 210,
+      colNo: 15,
+      path: "tool_card_slot",
+      reason: "undefined_dereference",
+    });
+    expect(loc.errorFingerprint).toMatch(/^[a-f0-9]{8}$/);
+    expect(JSON.stringify(loc)).not.toContain("USER_PII");
+
+    // Empty/null error + empty componentStack must NOT emit a fake fingerprint.
+    expect(boundedRenderErrorLocation(null, "")).toEqual({});
+    expect(
+      parseComponentStackSummary("\n    at span\n    at ProcessDisclosure (https://oc.example/assets/pd-1.js:9:4)"),
+    ).toEqual({
+      topComponentPath: "process_disclosure",
+      componentChain: "ProcessDisclosure",
+      scriptFrame: { scriptRef: "pd-1.js", lineNo: 9, colNo: 4 },
     });
   });
 });

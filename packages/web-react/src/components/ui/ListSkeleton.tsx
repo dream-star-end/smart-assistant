@@ -53,7 +53,7 @@ export function ListSkeleton({
     return (
       <output
         aria-busy="true"
-        className={cn("oc-list block overflow-hidden rounded-xl border border-border bg-surface shadow-soft", className)}
+        className={cn("oc-list oc-surface-card block overflow-hidden rounded-xl bg-surface", className)}
       >
         <span className="sr-only">加载中…</span>
         {items.map((i) => {

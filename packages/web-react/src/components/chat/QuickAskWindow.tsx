@@ -7,8 +7,10 @@ import {
   Loader2,
   MessageCircleQuestion,
   Minimize2,
+  Quote,
   RotateCcw,
   Square,
+  Unlink,
   Zap,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -19,6 +21,12 @@ import { api } from "../../lib/api";
 import { mintMsgId, type ChatMessage } from "../../lib/chat/model";
 import { CONTINUE_PROMPT } from "../../lib/chat/render";
 import { preciseRetryEligible } from "../../lib/chat/socket";
+import {
+  modelCostLabel,
+  modelPickerRows,
+  resolveContextPickerSelection,
+  resolveCursorPickerSelection,
+} from "../../lib/cursorModelPicker";
 import { demoReply } from "../../lib/demo";
 import { isDialogLayerOpen } from "../../lib/hotkeys";
 import {
@@ -30,15 +38,19 @@ import type { AuthSession, PublicModel, Session, User } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import { MessageList } from "../MessageRenderer";
 import { modelLabel } from "../ModelSelector";
+import { parseModelDisplayMeta } from "../ModelSelectorExtras";
 import { ChatInteractionContext, type ChatInteraction } from "../tool/context";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
   IconButton,
+  useConfirm,
 } from "../ui";
+import { ModelFamilyIcon } from "../ui/ModelFamilyIcons";
 import type { CardCallbacks } from "./cards";
 import type { PermissionRespond } from "./permissionPromptState";
 
@@ -48,17 +60,11 @@ const MAX_STORED_LANES = 32;
 const MAX_CONTEXT_PREFIX_CHARS = 1200;
 const DEFAULT_LANE_KEY = "__draft__";
 
-export const FAST_MODEL_PRIORITY = [
-  "deepseek-v4-flash",
-  "gpt-6-luna",
-  "antigravity-gemini-4-hydrogen",
-  "box-claude-haiku-5-5",
-  "mimo-v2.6-flash-go",
-  "glm-5.3-flash-go",
-  "minimax-m3.1-flash-free-go",
-  "cursor-grok-4.7-low-fast",
-] as const;
-
+/**
+ * 强模型透明可控红线（OCV5-817）：快问默认继承当前主会话模型，绝不静默黑盒降级至弱模型。
+ * 仅在用户显式手动选择了快问模型（savedModelId）且该模型健康时采用用户指定模型；
+ * 否则严格沿用 mainlineModelId，主模型不可用/缺失时再按目录顺序回退至首个健康模型。
+ */
 export function pickDefaultQuickAskModel(
   models: PublicModel[],
   mainlineModelId?: string,
@@ -68,12 +74,9 @@ export function pickDefaultQuickAskModel(
   if (savedModelId && healthy.some((m) => m.id === savedModelId)) {
     return savedModelId;
   }
-  for (const candidate of FAST_MODEL_PRIORITY) {
-    if (healthy.some((m) => m.id === candidate)) return candidate;
+  if (mainlineModelId && healthy.some((m) => m.id === mainlineModelId)) {
+    return mainlineModelId;
   }
-  const fastFallback = healthy.find((m) => /flash|haiku|luna|hydrogen|fast|mini/i.test(m.id));
-  if (fastFallback) return fastFallback.id;
-  if (mainlineModelId && healthy.some((m) => m.id === mainlineModelId)) return mainlineModelId;
   return healthy[0]?.id ?? models[0]?.id ?? mainlineModelId;
 }
 
@@ -154,10 +157,11 @@ function readSavedQuickAskModel(): string | null {
   }
 }
 
-function writeSavedQuickAskModel(modelId: string): void {
+function writeSavedQuickAskModel(modelId: string | null): void {
   try {
     if (typeof localStorage !== "undefined") {
-      localStorage.setItem(QUICK_ASK_MODEL_STORAGE_KEY, modelId);
+      if (modelId) localStorage.setItem(QUICK_ASK_MODEL_STORAGE_KEY, modelId);
+      else localStorage.removeItem(QUICK_ASK_MODEL_STORAGE_KEY);
     }
   } catch {
     /* ignore storage unavailable */
@@ -248,6 +252,10 @@ export type QuickAskWindowProps = {
   mainlineMessages: ChatMessage[];
   rightOffsetPx?: number;
   isMdViewport?: boolean;
+  /** 发送快捷键偏好，与主输入框保持一致。 */
+  sendKey?: "enter" | "mod-enter";
+  /** 将快问回复引用回主输入框（append 模式，不覆盖现有草稿）。 */
+  onQuoteToComposer?: (text: string) => void;
   onPromoteSession: (sess: Session, demoMessages?: ChatMessage[]) => void;
 };
 
@@ -269,6 +277,8 @@ export function QuickAskWindow({
   mainlineMessages,
   rightOffsetPx = 16,
   isMdViewport = true,
+  sendKey = "enter",
+  onQuoteToComposer,
   onPromoteSession,
 }: QuickAskWindowProps) {
   const laneKey = mainlineSessionId?.trim() || DEFAULT_LANE_KEY;
@@ -278,8 +288,18 @@ export function QuickAskWindow({
     initLanesForUser(userId, laneKey),
   );
   const [selectedModel, setSelectedModel] = useState<string | null>(() => readSavedQuickAskModel());
+  const [attachContext, setAttachContext] = useState(true);
+  const [contextExpanded, setContextExpanded] = useState(false);
+  const [modelHighlight, setModelHighlight] = useState(false);
   const [authorizing, setAuthorizing] = useState(false);
   const [demoBusyLanes, setDemoBusyLanes] = useState<Record<string, boolean>>({});
+  const [coarsePointer] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(pointer: coarse)").matches,
+  );
+  const [confirmClear, confirmClearEl] = useConfirm();
 
   const demoAbortRef = useRef<Record<string, boolean>>({});
   const demoTimersRef = useRef<Record<string, number>>({});
@@ -375,6 +395,10 @@ export function QuickAskWindow({
     [models, activeModelId],
   );
   const activeModelLabel = activeModelObj ? modelLabel(activeModelObj) : (activeModelId ?? "快问模型");
+  const activeModelMeta = useMemo(
+    () => parseModelDisplayMeta(activeModelLabel, activeModelId),
+    [activeModelLabel, activeModelId],
+  );
 
   const messages = demo ? activeLane.demoMessages : chat.getMessages(qaSessId);
   const sending = demo ? Boolean(demoBusyLanes[laneKey]) : chat.isSending(qaSessId);
@@ -434,7 +458,7 @@ export function QuickAskWindow({
       const targetSessId = qaSessId;
       const model = activeModelId;
       const shouldInjectContext =
-        contextPrefix.length > 0 && contextPrefix !== activeLane.lastInjectedContext;
+        attachContext && contextPrefix.length > 0 && contextPrefix !== activeLane.lastInjectedContext;
       const finalPrompt = shouldInjectContext ? `${contextPrefix}${rawQuestion}` : rawQuestion;
 
       if (demo) {
@@ -562,6 +586,7 @@ export function QuickAskWindow({
       laneKey,
       qaSessId,
       activeModelId,
+      attachContext,
       contextPrefix,
       activeLane.lastInjectedContext,
       activeLane.lastSentModel,
@@ -587,11 +612,14 @@ export function QuickAskWindow({
     lastHandledSeedRef.current = seed.nonce;
     const text = seed.text.trim();
     if (!text) return;
+    setModelHighlight(true);
+    const timer = window.setTimeout(() => setModelHighlight(false), 2400);
     if (!sending && !authorizing) {
       void sendQuestion(text);
     } else {
       setInput((cur) => cur || text);
     }
+    return () => window.clearTimeout(timer);
   }, [seed, sending, authorizing, sendQuestion, setInput]);
 
   // Auto-scroll isolated quick-ask feed when user is pinned to bottom.
@@ -619,7 +647,7 @@ export function QuickAskWindow({
     if (ok) setInput("");
   }, [input, sendQuestion, setInput]);
 
-  const handleClear = useCallback(() => {
+  const executeClear = useCallback(() => {
     const prevId = qaSessId;
     if (demo) {
       clearDemoTimer(laneKey);
@@ -641,6 +669,27 @@ export function QuickAskWindow({
       [laneKey]: createLaneState(),
     }));
   }, [qaSessId, demo, laneKey, clearDemoTimer, chat, authRef]);
+
+  const userTurnCount = useMemo(
+    () => messages.filter((m) => m.role === "user").length,
+    [messages],
+  );
+
+  const handleClear = useCallback(() => {
+    if (userTurnCount >= 2) {
+      void confirmClear({
+        title: "清空当前快问记录？",
+        body: `当前快问包含 ${userTurnCount} 轮对话，清空后将无法恢复。如需留存，可先点击右上角「转为正式对话」。`,
+        confirmText: "清空重问",
+        cancelText: "保留",
+        danger: true,
+      }).then((ok) => {
+        if (ok) executeClear();
+      });
+      return;
+    }
+    executeClear();
+  }, [userTurnCount, confirmClear, executeClear]);
 
   const handlePromote = useCallback(() => {
     if (messages.length === 0 || sending) return;
@@ -695,6 +744,27 @@ export function QuickAskWindow({
   ]);
 
   const healthyModels = useMemo(() => models.filter((m) => !m.degraded), [models]);
+  const groupedPickerRows = useMemo(() => modelPickerRows(healthyModels), [healthyModels]);
+  const activeCostLabel = modelCostLabel(activeModelObj);
+  const followingMainline = !selectedModel && Boolean(mainlineModelId && activeModelId === mainlineModelId);
+
+  const latestAssistantReply = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const m = messages[i];
+      if (m && m.role === "assistant" && m.text?.trim() && !m._errorCode) return m;
+    }
+    return null;
+  }, [messages]);
+
+  const quoteTextToMainline = useCallback(
+    (rawText: string) => {
+      if (!onQuoteToComposer) return;
+      const trimmed = rawText.trim();
+      if (!trimmed) return;
+      onQuoteToComposer(`> [快问摘录]\n> ${trimmed.replace(/\n/g, "\n> ")}`);
+    },
+    [onQuoteToComposer],
+  );
 
   const qaChatInteraction = useMemo<ChatInteraction>(
     () =>
@@ -720,6 +790,11 @@ export function QuickAskWindow({
   const qaCardCallbacks = useMemo<CardCallbacks>(
     () => ({
       onContinue: demo ? undefined : () => { void sendQuestion(CONTINUE_PROMPT); },
+      onQuote: onQuoteToComposer
+        ? (msg) => {
+            if (msg.text?.trim()) quoteTextToMainline(msg.text);
+          }
+        : undefined,
       onRetrySend: demo
         ? undefined
         : (msg) => {
@@ -746,15 +821,75 @@ export function QuickAskWindow({
         ? undefined
         : (mid, exp) => chat.peekUserMessagePayload(qaSessId, mid, exp),
     }),
-    [demo, chat, qaSessId, sendQuestion],
+    [demo, chat, qaSessId, sendQuestion, onQuoteToComposer, quoteTextToMainline],
   );
 
   const qaSess = demo ? undefined : chat.getSession(qaSessId);
-  const contextLabel = contextPrefix
-    ? `已关联主线：${clipText(!isDefaultSessionTitle(mainlineTitle) ? mainlineTitle : "当前会话", 20)}`
-    : "独立支线快问";
+  const hasMainlineContext = contextPrefix.length > 0;
+  const contextLabel = !hasMainlineContext
+    ? "独立支线快问"
+    : attachContext
+      ? `已关联主线：${clipText(!isDefaultSessionTitle(mainlineTitle) ? mainlineTitle : "当前会话", 20)}`
+      : "已断开主线上下文";
+  const contextPreview = useMemo(() => {
+    if (!hasMainlineContext) return "";
+    const goal = clipText(mainlineGoalObjective, 60);
+    if (goal) return `目标：${goal}`;
+    for (let i = mainlineMessages.length - 1; i >= 0; i -= 1) {
+      const m = mainlineMessages[i];
+      if (!m || m.role === "tool" || m._recoveryOfClientMessageId) continue;
+      const txt = clipText(m.text, 60);
+      if (txt) return txt;
+    }
+    return "";
+  }, [hasMainlineContext, mainlineGoalObjective, mainlineMessages]);
+  const sendKeyLabel = sendKey === "mod-enter" ? "⌘/Ctrl+↵" : "Enter";
+
+  const renderModelMenuItem = ({
+    itemKey,
+    modelId,
+    rawLabel,
+    cost,
+    active,
+    onSelect,
+  }: {
+    itemKey: string;
+    modelId: string;
+    rawLabel: string;
+    cost?: string | null;
+    active: boolean;
+    onSelect: () => void;
+  }) => {
+    const parsed = parseModelDisplayMeta(rawLabel, modelId);
+    return (
+      <DropdownMenuItem key={itemKey} title={rawLabel} onSelect={onSelect} className="gap-2">
+        <Check size={14} className={cn("shrink-0 text-accent", !active && "opacity-0")} />
+        <ModelFamilyIcon model={`${modelId} ${rawLabel}`} size={14} className="shrink-0 text-muted" />
+        <span className="flex min-w-0 flex-1 items-center gap-1.5">
+          <span className="truncate">{parsed.cleanName}</span>
+          {parsed.tags.map((tag) => (
+            <span
+              key={tag.label}
+              className={cn(
+                "shrink-0 rounded-full px-1.5 py-0.5 text-micro font-medium leading-none",
+                tag.tone === "accent"
+                  ? "bg-accent-soft text-accent"
+                  : tag.tone === "info"
+                    ? "bg-info-soft text-info"
+                    : "bg-hover text-muted",
+              )}
+            >
+              {tag.label}
+            </span>
+          ))}
+        </span>
+        {cost && <span className="shrink-0 tabular-nums text-caption text-faint">{cost}</span>}
+      </DropdownMenuItem>
+    );
+  };
 
   return (
+    <>
     <section
       ref={sectionRef}
       aria-label="快问小窗"
@@ -763,16 +898,18 @@ export function QuickAskWindow({
       data-quick-ask-session={qaSessId}
       style={isMdViewport ? { right: rightOffsetPx } : undefined}
       className={cn(
-        "fixed bottom-3 inset-x-3 z-40 flex h-[68dvh] max-h-[560px] flex-col overflow-hidden rounded-xl border border-border-control bg-surface shadow-float",
+        "oc-surface-popover fixed inset-x-3 bottom-[max(0.75rem,env(safe-area-inset-bottom))] z-40 flex h-[min(68dvh,calc(var(--oc-visual-height,100dvh)-1.5rem))] max-h-[min(560px,calc(var(--oc-visual-height,100dvh)-1.5rem))] flex-col overflow-hidden rounded-2xl",
         "sm:inset-x-auto sm:bottom-4 sm:w-[430px]",
-        !open && "hidden",
+        open ? "animate-pop" : "hidden",
       )}
     >
       {/* Header */}
-      <header className="flex shrink-0 items-center gap-1.5 border-b border-border px-3 py-2">
-        <div className="flex min-w-0 items-center gap-1.5">
-          <Zap size={15} className="shrink-0 text-accent" />
-          <span className="truncate text-title font-semibold text-fg">快问</span>
+      <header className="oc-surface-glass flex shrink-0 items-center gap-2 rounded-none border-0 border-b border-border/80 px-3 py-2.5 shadow-none">
+        <div className="flex min-w-0 items-center gap-2">
+          <span aria-hidden className="oc-icon-badge oc-icon-badge-accent size-7 rounded-sm">
+            <Zap size={14} />
+          </span>
+          <span className="truncate text-section font-semibold tracking-tight text-fg">快问</span>
         </div>
 
         <DropdownMenu>
@@ -780,41 +917,142 @@ export function QuickAskWindow({
             <button
               type="button"
               data-testid="quick-ask-model-trigger"
+              data-model-highlight={modelHighlight ? "true" : undefined}
               aria-label="选择快问模型"
-              className="ml-1 inline-flex max-w-[165px] items-center gap-1 rounded-full border border-border bg-bg px-2.5 py-1 text-caption font-medium text-muted transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+              title={followingMainline ? `跟随主会话模型：${activeModelLabel}` : `当前快问模型：${activeModelLabel}`}
+              className={cn(
+                "oc-btn-tactile oc-spring-press inline-flex max-w-[195px] items-center gap-1.5 rounded-full px-2.5 py-1 text-caption font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+                modelHighlight
+                  ? "border border-accent bg-accent-soft text-accent shadow-soft"
+                  : "oc-btn-secondary-craft text-muted hover:text-fg",
+              )}
             >
-              <span className="truncate">{activeModelLabel}</span>
+              <ModelFamilyIcon
+                model={`${activeModelId ?? ""} ${activeModelLabel}`}
+                size={13}
+                className="shrink-0 text-accent"
+              />
+              <span className="truncate">{activeModelMeta.cleanName}</span>
+              {activeCostLabel && (
+                <span className="shrink-0 tabular-nums text-faint">{activeCostLabel}</span>
+              )}
               <ChevronDown size={12} className="shrink-0 text-faint" />
             </button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="max-h-72 w-60 overflow-y-auto">
+          <DropdownMenuContent align="start" className="max-h-72 w-72 overflow-y-auto">
             <DropdownMenuLabel>选择快问模型</DropdownMenuLabel>
-            {healthyModels.length === 0 ? (
-              <DropdownMenuItem disabled>暂无可选模型</DropdownMenuItem>
-            ) : (
-              healthyModels.map((m) => (
+            {mainlineModelId && healthyModels.some((m) => m.id === mainlineModelId) && (
+              <>
                 <DropdownMenuItem
-                  key={m.id}
+                  data-quick-ask-follow-mainline="true"
                   onSelect={() => {
-                    setSelectedModel(m.id);
-                    writeSavedQuickAskModel(m.id);
+                    setSelectedModel(null);
+                    writeSavedQuickAskModel(null);
                   }}
                 >
                   <Check
                     size={14}
-                    className={cn("shrink-0 text-accent", m.id !== activeModelId && "opacity-0")}
+                    className={cn("shrink-0 text-accent", !followingMainline && "opacity-0")}
                   />
-                  <span className="min-w-0 flex-1 truncate">{modelLabel(m)}</span>
+                  <span className="min-w-0 flex-1 truncate">跟随主会话模型</span>
+                  <span className="shrink-0 text-caption text-faint">默认</span>
                 </DropdownMenuItem>
-              ))
+                <DropdownMenuSeparator />
+              </>
+            )}
+            {groupedPickerRows.length === 0 ? (
+              <DropdownMenuItem disabled>暂无可选模型</DropdownMenuItem>
+            ) : (
+              groupedPickerRows.map((row) => {
+                if (row.kind === "plain") {
+                  const m = row.model;
+                  return renderModelMenuItem({
+                    itemKey: m.id,
+                    modelId: m.id,
+                    rawLabel: modelLabel(m),
+                    cost: modelCostLabel(m),
+                    active: m.id === activeModelId,
+                    onSelect: () => {
+                      setSelectedModel(m.id);
+                      writeSavedQuickAskModel(m.id);
+                    },
+                  });
+                }
+                if (row.kind === "cursor-family") {
+                  const repId =
+                    resolveCursorPickerSelection(row.row.members, row.row.family, activeModelId) ??
+                    row.row.members[0]?.id;
+                  const rep = row.row.members.find((m) => m.id === repId);
+                  if (!rep) return null;
+                  return renderModelMenuItem({
+                    itemKey: `cursor-${row.row.family}`,
+                    modelId: rep.id,
+                    rawLabel: row.row.label,
+                    cost: modelCostLabel(rep),
+                    active: row.row.members.some((m) => m.id === activeModelId),
+                    onSelect: () => {
+                      setSelectedModel(rep.id);
+                      writeSavedQuickAskModel(rep.id);
+                    },
+                  });
+                }
+                if (row.kind === "context-family") {
+                  const repId =
+                    resolveContextPickerSelection(row.row.members, row.row.spec, activeModelId) ??
+                    row.row.members[0]?.id;
+                  const rep = row.row.members.find((m) => m.id === repId);
+                  if (!rep) return null;
+                  return renderModelMenuItem({
+                    itemKey: `ctx-${row.row.family}`,
+                    modelId: rep.id,
+                    rawLabel: row.row.label,
+                    cost: modelCostLabel(rep),
+                    active: row.row.members.some((m) => m.id === activeModelId),
+                    onSelect: () => {
+                      setSelectedModel(rep.id);
+                      writeSavedQuickAskModel(rep.id);
+                    },
+                  });
+                }
+                if (row.kind === "grok-build-family") {
+                  const rep = row.row.members[0];
+                  if (!rep) return null;
+                  return renderModelMenuItem({
+                    itemKey: `grok-${row.row.family}`,
+                    modelId: rep.id,
+                    rawLabel: row.row.label,
+                    cost: modelCostLabel(rep),
+                    active: row.row.members.some((m) => m.id === activeModelId),
+                    onSelect: () => {
+                      setSelectedModel(rep.id);
+                      writeSavedQuickAskModel(rep.id);
+                    },
+                  });
+                }
+                return null;
+              })
             )}
           </DropdownMenuContent>
         </DropdownMenu>
 
-        <div className="ml-auto flex shrink-0 items-center gap-0.5">
+        <div className="oc-surface-recessed ml-auto flex shrink-0 items-center gap-0.5 rounded-lg p-0.5">
+          {onQuoteToComposer && latestAssistantReply && !sending && (
+            <IconButton
+              size="sm"
+              shape="square"
+              className="oc-btn-tactile"
+              aria-label="引用最新回答到主线"
+              title="将最新快问回答引用到主输入框"
+              data-testid="quick-ask-quote-mainline"
+              onClick={() => quoteTextToMainline(latestAssistantReply.text ?? "")}
+            >
+              <Quote size={14} />
+            </IconButton>
+          )}
           <IconButton
             size="sm"
             shape="square"
+            className="oc-btn-tactile"
             aria-label="转为正式对话"
             title="转为正式对话并显示在左侧列表"
             disabled={messages.length === 0 || sending}
@@ -825,6 +1063,7 @@ export function QuickAskWindow({
           <IconButton
             size="sm"
             shape="square"
+            className="oc-btn-tactile"
             aria-label="清空重问"
             title="清空当前快问，重新开始"
             onClick={handleClear}
@@ -834,6 +1073,7 @@ export function QuickAskWindow({
           <IconButton
             size="sm"
             shape="square"
+            className="oc-btn-tactile"
             aria-label="收起快问小窗"
             title="收起 (Esc / Alt+K)"
             onClick={onClose}
@@ -854,13 +1094,31 @@ export function QuickAskWindow({
       >
         {open &&
           (messages.length === 0 && !sending ? (
-            <div className="flex h-full flex-col items-center justify-center gap-2 px-4 text-center">
-              <MessageCircleQuestion size={24} className="text-accent" />
-              <p className="text-body font-medium text-fg">并行快问，不打断主线任务</p>
-              <p className="text-meta text-muted">
-                按当前主会话隔离车道与轻模型快答；也可在主输入框直接发送{" "}
-                <span className="font-mono text-fg">/btw 问题</span>
+            <div className="flex h-full flex-col items-center justify-center gap-2.5 px-5 text-center">
+              <span aria-hidden className="oc-icon-badge oc-icon-badge-accent size-11 rounded-xl">
+                <MessageCircleQuestion size={20} />
+              </span>
+              <p className="text-section font-semibold tracking-tight text-fg">并行快问，不打断主线任务</p>
+              <p className="max-w-xs text-meta leading-relaxed text-muted">
+                按当前主会话隔离车道，默认沿用主模型（可随时在上方切换）；也可在主输入框直接发送{" "}
+                <kbd className="oc-kbd mx-0.5">/btw</kbd> 提问
               </p>
+              {!coarsePointer && (
+                <div className="oc-surface-recessed mt-1 flex flex-wrap items-center justify-center gap-x-3 gap-y-1.5 rounded-lg px-3 py-1.5 text-caption text-muted">
+                  <span className="inline-flex items-center gap-1">
+                    <kbd className="oc-kbd">Alt+K</kbd>
+                    <span>唤起/收起</span>
+                  </span>
+                  <span className="inline-flex items-center gap-1">
+                    <kbd className="oc-kbd">{sendKeyLabel}</kbd>
+                    <span>发送</span>
+                  </span>
+                  <span className="inline-flex items-center gap-1">
+                    <kbd className="oc-kbd">Esc</kbd>
+                    <span>收起</span>
+                  </span>
+                </div>
+              )}
             </div>
           ) : (
             <ChatInteractionContext.Provider value={qaChatInteraction}>
@@ -880,36 +1138,98 @@ export function QuickAskWindow({
       </div>
 
       {/* Footer composer */}
-      <footer className="shrink-0 border-t border-border bg-bg/60 px-3 py-2.5">
-        <div className="mb-2 flex items-center justify-between gap-2 text-caption text-faint">
-          <span
-            data-testid="quick-ask-context-hint"
-            className="flex min-w-0 items-center gap-1 truncate text-muted"
-          >
-            <Link2 size={12} className="shrink-0 text-accent" />
-            <span className="truncate">{contextLabel}</span>
-          </span>
-          <span className="shrink-0">不进主历史</span>
+      <footer className="shrink-0 border-t border-border/80 bg-bg/70 px-3 pt-2 pb-2">
+        <div className="mb-1.5">
+          <div className="flex items-center justify-between gap-2 text-caption">
+            {hasMainlineContext ? (
+              <div className="inline-flex min-w-0 max-w-full items-center rounded-full border border-border/80 bg-surface/80 p-0.5 shadow-xs">
+                <button
+                  type="button"
+                  data-testid="quick-ask-context-hint"
+                  aria-pressed={attachContext}
+                  title={
+                    attachContext
+                      ? `点击断开主线背景注入\n\n${contextPrefix}`
+                      : "当前不注入主线背景，点击重新关联"
+                  }
+                  onClick={() => {
+                    setAttachContext((v) => {
+                      if (v) setContextExpanded(false);
+                      return !v;
+                    });
+                  }}
+                  className={cn(
+                    "oc-btn-tactile flex min-w-0 items-center gap-1.5 rounded-full px-2 py-0.5 text-left transition-colors hover:bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-10",
+                    attachContext ? "text-fg" : "text-faint line-through",
+                  )}
+                >
+                  <span aria-hidden className={cn("shrink-0", attachContext ? "text-accent" : "text-faint")}>
+                    {attachContext ? <Link2 size={11} /> : <Unlink size={11} />}
+                  </span>
+                  <span className="truncate font-medium">{contextLabel}</span>
+                </button>
+                {attachContext && contextPreview && (
+                  <button
+                    type="button"
+                    data-testid="quick-ask-context-expand"
+                    aria-expanded={contextExpanded}
+                    aria-label={contextExpanded ? "收起主线摘要预览" : "展开主线摘要预览"}
+                    title={contextExpanded ? "收起主线摘要" : "查看关联的主线摘要"}
+                    onClick={() => setContextExpanded((v) => !v)}
+                    className="oc-spring-press inline-flex size-5 shrink-0 items-center justify-center rounded-full text-faint transition-colors hover:bg-hover hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-9"
+                  >
+                    <ChevronDown
+                      size={11}
+                      className={cn("transition-transform duration-150", contextExpanded && "rotate-180")}
+                    />
+                  </button>
+                )}
+              </div>
+            ) : (
+              <span
+                data-testid="quick-ask-context-hint"
+                className="inline-flex min-w-0 items-center gap-1.5 rounded-full border border-border/70 bg-surface/70 px-2.5 py-0.5 text-muted"
+              >
+                <Link2 size={11} aria-hidden className="shrink-0 text-accent" />
+                <span className="truncate font-medium">{contextLabel}</span>
+              </span>
+            )}
+            <span className="shrink-0 text-micro font-medium text-faint">不进主历史</span>
+          </div>
+          {contextExpanded && hasMainlineContext && attachContext && contextPreview && (
+            <p
+              data-testid="quick-ask-context-preview"
+              className="oc-surface-recessed animate-in mt-1.5 rounded-lg px-2.5 py-1.5 text-caption leading-relaxed text-muted"
+            >
+              {contextPreview}
+            </p>
+          )}
         </div>
 
-        <div className="flex items-end gap-2 rounded-lg border border-border-control bg-surface px-2.5 py-1.5 focus-within:border-border-strong">
+        <div className="oc-composer-dock flex items-end gap-2 rounded-xl px-2.5 py-1.5">
           <textarea
             ref={textareaRef}
             rows={1}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
-              if (
-                e.key === "Enter" &&
-                !e.shiftKey &&
-                !e.nativeEvent.isComposing &&
-                e.nativeEvent.keyCode !== 229
-              ) {
+              if (e.key === "Enter" && !e.nativeEvent.isComposing && e.nativeEvent.keyCode !== 229) {
+                if (coarsePointer) return;
+                const mod = e.metaKey || e.ctrlKey;
+                const shouldSend = sendKey === "mod-enter" ? mod : !e.shiftKey;
+                if (!shouldSend) return;
                 e.preventDefault();
                 void handleSubmit();
               }
             }}
-            placeholder="输入技术问题（Enter 发送）…"
+            enterKeyHint={coarsePointer ? "enter" : "send"}
+            placeholder={
+              coarsePointer
+                ? "输入技术问题…"
+                : sendKey === "mod-enter"
+                  ? "输入技术问题（⌘/Ctrl+Enter 发送）…"
+                  : "输入技术问题（Enter 发送）…"
+            }
             aria-label="快问输入框"
             className="max-h-28 min-h-9 flex-1 resize-none bg-transparent py-1.5 text-base leading-relaxed text-fg outline-none placeholder:text-faint md:text-sm"
           />
@@ -922,11 +1242,11 @@ export function QuickAskWindow({
               else void handleSubmit();
             }}
             className={cn(
-              "flex size-9 shrink-0 items-center justify-center rounded-full transition-colors [@media(hover:none)]:size-11",
+              "oc-btn-tactile flex size-9 shrink-0 items-center justify-center rounded-full [@media(hover:none)]:size-11",
               sending
-                ? "bg-fg text-bg"
+                ? "oc-btn-accent-craft text-accent-fg"
                 : input.trim() && !authorizing
-                  ? "bg-primary text-primary-fg hover:opacity-90"
+                  ? "oc-btn-primary-craft text-primary-fg"
                   : "bg-hover text-faint",
             )}
           >
@@ -939,7 +1259,22 @@ export function QuickAskWindow({
             )}
           </button>
         </div>
+
+        {!coarsePointer && (
+          <div className="mt-1.5 flex items-center justify-between px-0.5 text-micro text-faint">
+            <span className="inline-flex items-center gap-1">
+              <kbd className="oc-kbd">{sendKeyLabel}</kbd>
+              <span>发送</span>
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <kbd className="oc-kbd">Esc</kbd>
+              <span>{sending ? "停止生成" : "收起小窗"}</span>
+            </span>
+          </div>
+        )}
       </footer>
     </section>
+    {confirmClearEl}
+    </>
   );
 }

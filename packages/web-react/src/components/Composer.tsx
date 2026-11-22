@@ -1,4 +1,3 @@
-import * as Dialog from "@radix-ui/react-dialog";
 import { MAX_ATTACHMENTS_PER_MESSAGE, MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_TOTAL_BYTES, attachmentTotalLimitMessage, uploadFailureCanContinue, uploadFileLimitMessage } from "@openclaude/protocol/browser";
 import type { MessageReplyQuote } from "@openclaude/protocol/browser";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
@@ -8,7 +7,6 @@ import {
   Loader2,
   Mic,
   Paperclip,
-  Plus,
   Square,
   Target,
   X,
@@ -25,7 +23,7 @@ import {
   type ReactNode,
   type SetStateAction,
 } from "react";
-import { useVoiceInput } from "../hooks/useVoiceInput";
+import type { VoiceState } from "../hooks/useVoiceInput";
 import { useComposerDraft } from "../hooks/useComposerDraft";
 import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
@@ -39,14 +37,13 @@ import {STATUS_LABEL,goalNearBudget,visibleGoalOf,type GoalSetInput} from '../li
 import {LazyBoundary} from './ChunkErrorBoundary';
 import {DialogFallback} from './DialogFallback';
 import type { MediaRef } from "../lib/chat/frames";
+import type { SessionContextPressureState } from "../lib/chat/model";
 import type { RepoSelection } from "../lib/types";
 import { cn } from "../lib/utils";
+import { ComposerPlusMenu } from "./ComposerPlusMenu";
+import { SwarmPlaybookPopoverLazy } from "./chat/lazyTimelineCards";
 import { RepoPill } from "./github/RepoPill";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
   IconButton,
   iconButtonVariants,
   useToast,
@@ -85,9 +82,62 @@ const NoPrediction: typeof import("./ComposerPrediction").default = () => null;
 const GoalDialog=lazy(()=>import('./GoalDialog').then(module=>({default:module.GoalDialog})));
 const AttachChip = lazy(() => import("./ComposerAttachChip").then((module) => ({ default: module.AttachChip })));
 const ComposerPrediction = lazy(() => import("./ComposerPrediction").catch(() => ({ default: NoPrediction })));
+const ComposerImageLightbox = lazy(() => import("./ComposerImageLightbox"));
+const ComposerVoiceController = lazy(() => import("./ComposerVoiceController"));
+
+function isVoiceRecordingSupported(): boolean {
+  if (
+    typeof window === "undefined" ||
+    !navigator.mediaDevices?.getUserMedia ||
+    typeof window.MediaRecorder === "undefined" ||
+    typeof window.WebSocket === "undefined"
+  ) {
+    return false;
+  }
+  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
+  return candidates.some((t) => {
+    try {
+      return MediaRecorder.isTypeSupported(t);
+    } catch {
+      return false;
+    }
+  });
+}
 
 // 已经盖进输入框的预填(按对象认,跨卸载重挂保留;见预填 effect)。
-const appliedPrefills = new WeakSet<{ text: string; nonce: number }>();
+export type ComposerPrefill = { text: string; nonce: number; mode?: "replace" | "append" };
+const appliedPrefills = new WeakSet<ComposerPrefill>();
+
+type SlashCommandDef = {
+  cmd: string;
+  label: string;
+  desc: string;
+};
+
+function availableSlashCommands(opts: {
+  hasQuickAsk: boolean;
+  swarmSupported: boolean;
+  hasCompact: boolean;
+  hasContextHealth: boolean;
+}): SlashCommandDef[] {
+  const list: SlashCommandDef[] = [];
+  if (opts.hasCompact) {
+    list.push({ cmd: "/compact", label: "/compact", desc: "整理当前会话较早对话，完整记录仍保留" });
+  }
+  if (opts.hasContextHealth) {
+    list.push({ cmd: "/context", label: "/context", desc: "查看当前对话空间使用情况" });
+  }
+  if (opts.hasQuickAsk) {
+    list.push(
+      { cmd: "/btw", label: "/btw", desc: "在支线快问小窗快速提问，不打断主线" },
+      { cmd: "/ask", label: "/ask", desc: "同 /btw，打开支线快问小窗" },
+    );
+  }
+  if (opts.swarmSupported) {
+    list.push({ cmd: "/swarm", label: "/swarm", desc: "以 Antigravity 蜂群多智能体协作执行本轮" });
+  }
+  return list;
+}
 
 function mediaKindOf(mime: string): MediaRef["kind"] {
   if (mime.startsWith("image/")) return "image";
@@ -121,13 +171,13 @@ export function resetComposerAttachmentCache(): void {
   attachEpoch += 1;
 }
 
-function clipboardImages(data: DataTransfer): File[] {
-  const itemImages = Array.from(data.items)
-    .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+function clipboardFiles(data: DataTransfer): File[] {
+  const fromItems = Array.from(data.items ?? [])
+    .filter((item) => item.kind === "file")
     .map((item) => item.getAsFile())
     .filter((file): file is File => file != null);
-  if (itemImages.length > 0) return itemImages;
-  return Array.from(data.files).filter((file) => file.type.startsWith("image/"));
+  if (fromItems.length > 0) return fromItems;
+  return Array.from(data.files ?? []);
 }
 
 /** 时间假进度的预期时长;超过后不再假装「快好了」,切成不确定态(C-09)。 */
@@ -163,11 +213,11 @@ function EnvironmentPrepBar() {
       <div className="mb-1.5 text-meta text-muted">
         {overdue ? "仍在准备环境，请稍候…" : "环境准备中，约 20 秒"}
       </div>
-      <div className="h-1 overflow-hidden rounded-full bg-hover" aria-hidden>
+      <div className="oc-surface-recessed h-1.5 overflow-hidden rounded-full" aria-hidden>
         <div
           className={cn(
-            "h-full rounded-full bg-accent transition-[width] duration-200",
-            overdue && "animate-pulse",
+            "h-full rounded-full transition-[width] duration-200",
+            overdue ? "oc-indeterminate-bar" : "oc-progress-fill bg-accent",
           )}
           style={{ width: overdue ? "100%" : `${pct}%` }}
         />
@@ -176,6 +226,9 @@ function EnvironmentPrepBar() {
   );
 }
 
+/** 蜂群模式紧凑单行占位文案（375–390px 手机不折出孤立省略号）。 */
+export const SWARM_PLACEHOLDER = "输入蜂群协作任务，或用 /swarm 编排…";
+
 export function Composer({
   onSend,
   busy,
@@ -183,8 +236,7 @@ export function Composer({
   onStop,
   disabled,
   banner,
-  // 品牌名取 lib/brand 单一权威,不写死(M-16)。
-  placeholder = `给${BRAND.name}发消息…`,
+  placeholder,
   onUpload,
   getVoiceToken,
   prefill,
@@ -203,6 +255,15 @@ export function Composer({
   goalOpenRequest,
   projectSlot,
   prediction, onQuickAskCommand,
+  swarmSupported = false,
+  swarmMode = false,
+  onToggleSwarmMode,
+  contextPressure,
+  contextCompactBusy = false,
+  hasActiveSession = false,
+  onCompactCommand,
+  onOpenContextHealth,
+  onStartNewSession,
 }: {
   /** 发送：当前正文 + 可选已上传媒体 + 可选精确引用快照。 */
   onSend: (text: string, media?: MediaRef[], replyTo?: MessageReplyQuote) => unknown;
@@ -219,8 +280,8 @@ export function Composer({
   onUpload?: (file: File, onProgress?: (sent: number, total: number) => void) => Promise<MediaRef>;
   /** 语音输入取 token（demo / 未登录省略 → 麦克风禁用）。 */
   getVoiceToken?: () => string | null;
-  /** 外部预填(如「在对话中创建」模板):nonce 变化即覆盖输入框并聚焦。 */
-  prefill?: { text: string; nonce: number } | null;
+  /** 外部预填(如「在对话中创建」模板或「引用到主线」):nonce 变化即触发；mode="append" 时追加而不覆盖现有草稿。 */
+  prefill?: ComposerPrefill | null;
   /** 当前会话的 GitHub 仓库绑定（省略 onOpenRepo 则不渲染底部仓库入口，如 demo）。 */
   repoSelection?: RepoSelection | null;
   /** 打开 GitHub 仓库绑定 modal（入口在底部左侧）。 */
@@ -253,6 +314,17 @@ export function Composer({
    *  省略或 null = 关闭(设置里关掉、demo)。onQuickAskCommand 拦截 `/btw`、`/ask` 到同屏快问小窗。 */
   prediction?: InputPrediction | null;
   onQuickAskCommand?: (question: string) => void;
+  /** Antigravity native swarm mode pill (only visible when an Antigravity model is selected). */
+  swarmSupported?: boolean;
+  swarmMode?: boolean;
+  onToggleSwarmMode?: () => void;
+  /** OCV5-840: 实时上下文窗口水位与治理入口（零重依赖，点击按需加载 ContextHealthPopover）。 */
+  contextPressure?: SessionContextPressureState | null;
+  contextCompactBusy?: boolean;
+  hasActiveSession?: boolean;
+  onCompactCommand?: (instructions?: string) => void;
+  onOpenContextHealth?: () => void;
+  onStartNewSession?: () => void;
 }) {
   // 图片编辑入口收口到 ImageEditActionsContext 单一权威(与聊天内图同源门控),
   // 不再经 App→Composer prop 平行下传 onAnnotateImage/reason(消除并行机制)。
@@ -310,6 +382,8 @@ export function Composer({
   // 「+」菜单受控开合:附件项须在 onSelect 里 preventDefault 阻止 Radix 同步关菜单
   // (卸载会杀掉 label 的原生激活,见附件项注释),菜单关闭改由我们在宏任务里手动触发。
   const [plusMenuOpen, setPlusMenuOpen] = useState(false);
+  const [playbookOpen, setPlaybookOpen] = useState(false);
+  const plusAnchorRef = useRef<HTMLSpanElement>(null);
   const toast = useToast();
   const [voiceMsg, setVoiceMsg] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
@@ -326,6 +400,9 @@ export function Composer({
   // 整句预测(空输入框)直接点发送就发出去;带附件或引用时不显示,免得发送按钮的含义说不清。
   // 打字后的补全只是提示,发送只发已输入的部分。
   const [ghostShown, setGhostShown] = useState<{ rest: string; px: number } | null>(null);
+  const [textareaScrollTop, setTextareaScrollTop] = useState(0);
+  const [slashIndex, setSlashIndex] = useState(0);
+  const [slashDismissedFor, setSlashDismissedFor] = useState<string | null>(null);
   const predictionHintId = useId();
   const [composing, setComposing] = useState(false);
   const [caretAtEnd, setCaretAtEnd] = useState(true);
@@ -410,7 +487,11 @@ export function Composer({
   useLayoutEffect(() => {
     if (!prefill || appliedPrefills.has(prefill)) return;
     appliedPrefills.add(prefill);
-    setValue(prefill.text);
+    if (prefill.mode === "append") {
+      setValue((cur) => (cur.trim() ? `${cur}\n\n${prefill.text}` : prefill.text));
+    } else {
+      setValue(prefill.text);
+    }
     requestAnimationFrame(() => ref.current?.focus());
   }, [prefill, setValue]);
 
@@ -442,10 +523,12 @@ export function Composer({
     },
     [],
   );
-  const voice = useVoiceInput({ getToken: getVoiceToken, onText: onVoiceText, onError: onVoiceErr });
-  const voiceEnabled = voice.supported && !!getVoiceToken;
+  const [voiceState, setVoiceState] = useState<VoiceState>("idle");
+  const [voiceToggleNonce, setVoiceToggleNonce] = useState(0);
+  const voiceSupported = isVoiceRecordingSupported();
+  const voiceEnabled = voiceSupported && !!getVoiceToken;
   // 不可用原因要说得出来(C-20):触屏没有 hover title,灰掉的麦克风等于没解释。
-  const voiceUnavailableReason = !voice.supported
+  const voiceUnavailableReason = !voiceSupported
     ? "当前浏览器不支持语音输入，请用 HTTPS 打开并允许使用麦克风"
     : !getVoiceToken
       ? "语音输入需登录后在正式会话中使用"
@@ -460,7 +543,7 @@ export function Composer({
       voiceMsgTimerRef.current = null;
     }
     setVoiceMsg(null);
-    voice.toggle();
+    setVoiceToggleNonce((n) => n + 1);
   };
 
   useEffect(() => {
@@ -491,11 +574,9 @@ export function Composer({
   // 草稿超过 sessionStorage 上限后只留内存、刷新即丢,此前没有任何预警(C-21)。
   const draftVolatile = !!draftKey && draftExceedsStorage(value);
 
-  // 「+」菜单只保留目标(有 onSetGoal+onGoalAction)。附件已提到工具条一级回形针。
-  // 无目标时(如 demo)退化为禁用的「+」按钮,保留原视觉锚点而不弹空菜单。
   const canAttach = !!onUpload;
   const canGoal = !!onSetGoal && !!onGoalAction;
-  const hasPlusMenu = canGoal;
+  const hasBoundRepo = Boolean(onOpenRepo && repoSelection?.selected);
   const visibleGoal = visibleGoalOf(goal);
 
   const removeAttach = useCallback(
@@ -551,6 +632,19 @@ export function Composer({
     const text = typed ? value.trim() : (sendablePrediction ?? "").trim();
     const qa = typed && onQuickAskCommand ? parseQuickAskSlashCommand(text) : null;
     if (qa?.matched) { if (attachments.length > 0) { toast("快问小窗暂不支持携带附件，请先移除附件", "info"); return; } setValue(""); if (draftKey) clearDraft(draftKey); onQuickAskCommand?.(qa.question); return; }
+    if (typed && onCompactCommand && /^\/compact(?:\s+[\s\S]*)?$/i.test(text)) {
+      const instructions = text.replace(/^\/compact\s*/i, "").trim();
+      setValue("");
+      if (draftKey) clearDraft(draftKey);
+      onCompactCommand(instructions || undefined);
+      return;
+    }
+    if (typed && onOpenContextHealth && /^\/context\s*$/i.test(text)) {
+      setValue("");
+      if (draftKey) clearDraft(draftKey);
+      onOpenContextHealth();
+      return;
+    }
     const snapshot = latestSubmitRef.current;
     submittingKeysRef.current.add(ownerKey);
     const resetSubmit = () => {
@@ -686,21 +780,57 @@ export function Composer({
     }
   };
 
-  const canAcceptDrop = !disabled && !busy && !!onUpload;
+  // 生成中也允许拖拽文件准备排队消息（与回形针选择、粘贴图片保持一致，不改变 <label htmlFor> 机制）。
+  const canAcceptDrop = !disabled && !!onUpload;
   const isFileDrag = (e: { dataTransfer: DataTransfer | null }) =>
     Array.from(e.dataTransfer?.types ?? []).includes("Files");
+
+  // OCV5-841: 对话主界面静默减负 —— 后台自动整理上下文，不再展示 80% 催促横幅或常驻水位胶囊；
+  // 保留 props 与 /compact、/context 命令供高阶用户主动键入。
+  void contextPressure;
+  void contextCompactBusy;
+  void hasActiveSession;
+  void onStartNewSession;
+
+  const slashQuery =
+    !disabled && value.startsWith("/") && !value.includes("\n") && !/\s/.test(value) ? value.toLowerCase() : null;
+  const slashMatches =
+    slashQuery !== null && slashDismissedFor !== value
+      ? availableSlashCommands({
+          hasQuickAsk: Boolean(onQuickAskCommand),
+          swarmSupported,
+          hasCompact: Boolean(onCompactCommand),
+          hasContextHealth: Boolean(onOpenContextHealth),
+        }).filter((item) => item.cmd.startsWith(slashQuery))
+      : [];
+  const slashMenuOpen = slashMatches.length > 0;
+  const activeSlashIndex = slashMenuOpen ? Math.min(slashIndex, slashMatches.length - 1) : 0;
+
+  const applySlashCommand = (cmd: string) => {
+    const next = `${cmd} `;
+    setValue(next);
+    setSlashDismissedFor(null);
+    requestAnimationFrame(() => {
+      const el = ref.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(next.length, next.length);
+    });
+  };
 
   const voiceStatus =
     voiceMsg != null ? (
       <span className="text-danger">{voiceMsg}</span>
-    ) : voice.state === "recording" ? (
+    ) : voiceState === "recording" ? (
       <span className="text-danger">● 正在录音，点击麦克风停止</span>
-    ) : voice.state === "connecting" ? (
+    ) : voiceState === "connecting" ? (
       <span className="text-faint">正在打开麦克风…</span>
-    ) : voice.state === "transcribing" ? (
+    ) : voiceState === "transcribing" ? (
       <span className="text-faint">正在转写…</span>
     ) : null;
 
+  const effectivePlaceholder =
+    placeholder ?? (swarmMode ? SWARM_PLACEHOLDER : `给${BRAND.name}发消息…`);
   return (
     <div className="mx-auto w-full max-w-3xl px-4">
       {banner}
@@ -711,26 +841,76 @@ export function Composer({
           aria-label={`会话目标：${visibleGoal.objective}`}
           title={visibleGoal.objective}
           onClick={() => setGoalOpen(true)}
-          // 触屏 44px 命中(a11y-B composer#3);桌面 28px 胶囊不变。
-          className="mb-2 inline-flex max-w-full items-center gap-1.5 rounded-full border border-border bg-surface px-2.5 py-1 text-meta text-fg hover:bg-hover [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3.5"
+          // 触屏 44px 命中(a11y-B composer#3);桌面精致雕塑胶囊。
+          className="oc-surface-card oc-surface-card-hover oc-spring-press mb-2 inline-flex max-w-full items-center gap-2 rounded-full py-1 pl-1.5 pr-3 text-meta text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:pr-3.5"
         >
-          <Target
-            size={13}
-            className={cn("shrink-0", goalNearBudget(visibleGoal) ? "text-warning" : "text-accent")}
-          />
-          <span className="min-w-0 truncate">{visibleGoal.objective}</span>
-          <span className="shrink-0 text-muted">{STATUS_LABEL[visibleGoal.status]}</span>
+          <span
+            aria-hidden
+            className={cn(
+              "oc-icon-badge size-5 rounded-full",
+              goalNearBudget(visibleGoal) ? "oc-icon-badge-warning" : "oc-icon-badge-accent",
+            )}
+          >
+            <Target size={11} strokeWidth={2} />
+          </span>
+          <span className="min-w-0 truncate font-medium">{visibleGoal.objective}</span>
+          <span aria-hidden className="h-3 w-px shrink-0 bg-border" />
+          <span className="shrink-0 text-caption font-medium text-muted">{STATUS_LABEL[visibleGoal.status]}</span>
         </button>
+      )}
+      <div className="relative">
+      {slashMenuOpen && (
+        <div
+          role="listbox"
+          aria-label="快捷指令"
+          data-testid="composer-slash-menu"
+          className="oc-surface-popover absolute inset-x-0 bottom-full z-30 mb-2 overflow-hidden rounded-lg p-1.5 animate-in"
+        >
+          {slashMatches.map((item, idx) => {
+            const active = idx === activeSlashIndex;
+            return (
+              <button
+                key={item.cmd}
+                type="button"
+                role="option"
+                aria-selected={active}
+                data-slash-cmd={item.cmd}
+                onMouseDown={(e) => e.preventDefault()}
+                onMouseEnter={() => setSlashIndex(idx)}
+                onClick={() => applySlashCommand(item.cmd)}
+                className={cn(
+                  "flex min-h-9 w-full items-center gap-2.5 rounded-sm px-2.5 py-1.5 text-left text-meta transition-colors [@media(hover:none)]:min-h-11",
+                  active
+                    ? "bg-accent-soft/80 text-fg ring-1 ring-inset ring-accent/20"
+                    : "text-muted hover:bg-hover/70 hover:text-fg",
+                )}
+              >
+                <span
+                  aria-hidden
+                  className={cn(
+                    "oc-icon-badge size-6 rounded-xs font-mono text-caption font-semibold",
+                    active && "oc-icon-badge-accent",
+                  )}
+                >
+                  /
+                </span>
+                <span className="shrink-0 font-mono font-semibold text-accent">{item.label}</span>
+                <span className="min-w-0 flex-1 truncate text-caption text-muted">{item.desc}</span>
+                {active && (
+                  <kbd aria-hidden className="oc-kbd hidden shrink-0 sm:inline-flex">
+                    ↵
+                  </kbd>
+                )}
+              </button>
+            );
+          })}
+        </div>
       )}
       <div
         data-testid="composer-shell"
+        data-swarm={swarmMode ? "true" : undefined}
         className={cn(
-          // OCV5-295:外壳减负 —— 20px 圆角 + 轻阴影 --shadow-soft(原 26px + --shadow-float 浮层阴影)。
-          "rounded-[20px] border border-border-control bg-surface shadow-[var(--shadow-soft)] transition-all",
-          "focus-within:border-border-strong",
-          // OCV5-307:聚焦时只"浮起一点"——比 soft 略深的投影 + 极淡强调色光晕,不再只是边框变浅。
-          // 刻意不用 --shadow-float(OCV5-295 已把外壳从浮层阴影降下来,测试锁定)。
-          "focus-within:shadow-[0_1px_2px_rgba(0,0,0,0.05),0_6px_22px_rgba(0,0,0,0.08)] focus-within:ring-4 focus-within:ring-accent/[0.06]",
+          "oc-composer-dock rounded-xl",
           dragActive && "ring-2 ring-ring",
         )}
         onDragEnter={(e) => {
@@ -774,12 +954,12 @@ export function Composer({
           </output>
         )}
         {replyTo && (
-          <div className="mx-3.5 mt-3 flex items-start gap-2 rounded-xl bg-hover px-3 py-2 text-left">
-            <div className="min-w-0 flex-1 border-l-2 border-accent/60 pl-2.5">
-              <div className="mb-0.5 text-caption font-medium text-muted">
+          <div className="oc-surface-recessed mx-3.5 mt-3 flex items-start gap-2 rounded-md px-3 py-2 text-left">
+            <div className="min-w-0 flex-1 border-l-2 border-accent pl-2.5">
+              <div className="mb-0.5 text-caption font-semibold text-muted">
                 正在引用 {replyTo.role === "assistant" ? BRAND.name : "你"}
               </div>
-              <div className="line-clamp-2 whitespace-pre-wrap break-words text-[12.5px] leading-5 text-fg/75">
+              <div className="line-clamp-2 whitespace-pre-wrap break-words text-meta leading-5 text-fg/80">
                 {replyTo.text}
               </div>
             </div>
@@ -788,16 +968,34 @@ export function Composer({
               title="取消引用"
               size="sm"
               shape="square"
-              className="shrink-0 [@media(hover:none)]:size-11"
+              className="oc-btn-tactile shrink-0 [@media(hover:none)]:size-11"
               onClick={onCancelReply}
             >
-              <X size={15} />
+              <X size={14} strokeWidth={1.75} />
             </IconButton>
+          </div>
+        )}
+        {/* 按需微上下文条：仅当存在项目或已绑定 GitHub 仓库时显现（empty:hidden 零空占位）。 */}
+        {(hasBoundRepo || projectSlot) && (
+          <div
+            data-testid="composer-context-bar"
+            className="flex flex-wrap items-center gap-1.5 px-3.5 pt-2.5 empty:hidden"
+          >
+            {projectSlot && (
+              <span className="inline-flex min-w-0 max-w-full items-center empty:hidden" data-testid="composer-project-slot">
+                {projectSlot}
+              </span>
+            )}
+            {hasBoundRepo && onOpenRepo && (
+              <span className="inline-flex min-w-0 max-w-full items-center" data-testid="composer-repo-slot">
+                <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} compact />
+              </span>
+            )}
           </div>
         )}
         {/* 附件 chips */}
         {attachments.length > 0 && (
-          <div className="flex flex-wrap gap-2 px-3.5 pt-3">
+          <div className="flex flex-wrap gap-2 px-3.5 pt-2.5">
             <LazyBoundary fallback={attachments.map((a) => (
               <div key={a.id} aria-busy="true" className="flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1.5 text-meta">
                 <span className="max-w-[160px] truncate">{a.name}</span>
@@ -834,11 +1032,63 @@ export function Composer({
             </LazyBoundary>
           </div>
         )}
+        {/* 输入区上方轻提示条：承接触屏「填入建议」、停止/上传状态、超长草稿与字数，确保 375px 底栏发送键永不溢出。 */}
+        {((coarsePointer && ghostRest && !busy) ||
+          stopping ||
+          (!busy && (attachFailed || uploading)) ||
+          draftVolatile ||
+          value.length > 2000) && (
+          <div
+            data-testid="composer-status-strip"
+            className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 border-b border-border/40 px-3.5 py-1.5 text-caption"
+          >
+            {coarsePointer && ghostRest && !busy && (
+              <button
+                type="button"
+                data-product-control
+                data-testid="composer-accept-prediction-touch"
+                onClick={acceptPrediction}
+                className="oc-btn-tactile oc-btn-secondary-craft oc-spring-press inline-flex min-h-10 shrink-0 items-center rounded-full px-3 text-caption font-medium text-accent [@media(hover:none)]:min-h-11"
+              >
+                填入建议
+              </button>
+            )}
+            {stopping && (
+              <output
+                data-testid="composer-stopping-status"
+                className="inline-flex items-center gap-1 text-caption text-muted"
+                aria-live="polite"
+              >
+                正在停止…
+              </output>
+            )}
+            {!busy && (attachFailed || uploading) && (
+              <output
+                data-testid="composer-send-blocked-reason"
+                className={cn("text-caption", attachFailed ? "text-danger" : "text-faint")}
+              >
+                {attachFailed ? "有附件上传失败" : "附件上传中…"}
+              </output>
+            )}
+            {draftVolatile && (
+              <output
+                data-testid="composer-draft-volatile"
+                className="text-caption text-warning"
+                title="草稿超过本地保存上限，只保留在内存中；刷新或关闭页面后不再恢复"
+              >
+                草稿过长，刷新后不保留
+              </output>
+            )}
+            {value.length > 2000 && (
+              <span className="ml-auto shrink-0 text-caption text-faint tabular-nums">{value.length} 字</span>
+            )}
+          </div>
+        )}
         {/* 两行式布局(C-01/C-14):第一行 textarea 通栏,第二行工具行(左=附件/「+」/仓库,右=状态/语音/发送)。
             此前 4 个 44px 按钮与 textarea 同排:390px 下正文只剩约 138px、每行 8 个字;桌面多行草稿时
             按钮贴底、正文左侧空出一列。桌面也统一两行,附件区/引用块与正文左沿对齐。 */}
         <div
-          className="px-3 pb-2 pt-2.5"
+          className="px-3 pb-1.5 pt-2 sm:pb-2 sm:pt-2.5"
           data-product-entry-scope="composer-primary"
           data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
         >
@@ -853,9 +1103,14 @@ export function Composer({
               aria-describedby={ghostRest ? predictionHintId : undefined}
               onChange={(e) => {
                 setValue(e.target.value);
+                setSlashIndex(0);
+                setSlashDismissedFor(null);
                 setCaretAtEnd(e.target.selectionEnd === e.target.value.length);
                 const inputType = (e.nativeEvent as InputEvent).inputType ?? "";
                 setDeletedTo(inputType.startsWith("delete") ? { key: draftKey, value: e.target.value } : null);
+              }}
+              onScroll={(e) => {
+                setTextareaScrollTop(e.currentTarget.scrollTop);
               }}
               onSelect={(e) => {
                 const el = e.currentTarget;
@@ -865,12 +1120,38 @@ export function Composer({
               onCompositionEnd={() => setComposing(false)}
               onPaste={(e) => {
                 if (!onUpload) return;
-                const images = clipboardImages(e.clipboardData);
-                if (images.length === 0) return;
+                const files = clipboardFiles(e.clipboardData);
+                if (files.length === 0) return;
                 e.preventDefault();
-                void onFiles(images);
+                void onFiles(files);
               }}
               onKeyDown={(e) => {
+                if (slashMenuOpen && !e.nativeEvent.isComposing && e.keyCode !== 229) {
+                  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                    e.preventDefault();
+                    const step = e.key === "ArrowDown" ? 1 : -1;
+                    setSlashIndex((i) => (i + step + slashMatches.length) % slashMatches.length);
+                    return;
+                  }
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    setSlashDismissedFor(value);
+                    return;
+                  }
+                  if ((e.key === "Tab" || e.key === "Enter") && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
+                    const hit = slashMatches[activeSlashIndex];
+                    if (hit && hit.cmd !== value.toLowerCase()) {
+                      e.preventDefault();
+                      applySlashCommand(hit.cmd);
+                      return;
+                    }
+                    if (e.key === "Tab" && hit) {
+                      e.preventDefault();
+                      applySlashCommand(hit.cmd);
+                      return;
+                    }
+                  }
+                }
                 // 采用预测:Tab,或光标在末尾时按 →。没有预测时 Tab 照常移动焦点。
                 if (
                   ghostRest &&
@@ -922,10 +1203,10 @@ export function Composer({
                 }
               }}
               enterKeyHint={coarsePointer ? "enter" : "send"}
-              placeholder={value === "" && ghostRest ? "" : placeholder}
+              placeholder={value === "" && ghostRest ? "" : effectivePlaceholder}
               className={cn(
-                "max-h-[240px] min-h-[24px] w-full flex-1 resize-none bg-transparent py-1.5 leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50",
-                fontSize === "large" ? "text-[17.5px]" : "text-[16px]",
+                "max-h-[min(140px,28dvh)] min-h-[24px] w-full flex-1 resize-none bg-transparent py-1 leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50 sm:max-h-[240px] sm:py-1.5",
+                fontSize === "large" ? "text-[17.5px]" : "text-base md:text-sm",
               )}
             />
             {ghostRest && (
@@ -935,12 +1216,16 @@ export function Composer({
                   rest={ghostRest}
                   large={fontSize === "large"}
                   hintId={predictionHintId}
+                  scrollTop={textareaScrollTop}
                   onShown={onPredictionShown}
                 />
               </Suspense>
             )}
           </div>
-          <div className="mt-1 flex items-center gap-1.5" data-testid="composer-tool-row">
+          <div
+            className="mt-1 flex items-center gap-1 border-t border-border/50 pt-1.5 sm:mt-1.5 sm:pt-2"
+            data-testid="composer-tool-row"
+          >
             {/* file input 用 sr-only(视觉隐藏但非 display:none)+ tabindex=-1,配合工具条
                 <label htmlFor> 原生激活。国产内核(鸿蒙/华为/Quark)会把 display:none input 上的
                 合成 click 静默吞掉,原生 label 激活是跨内核唯一可靠路径(实证 61de46e2/de16e2be)。
@@ -979,127 +1264,54 @@ export function Composer({
                 }}
                 className={cn(
                   iconButtonVariants({ shape: "square" }),
-                  "cursor-pointer",
+                  "oc-btn-tactile oc-spring-press cursor-pointer",
                   disabled && "pointer-events-none opacity-50",
                 )}
               >
-                <Paperclip size={18} />
+                <Paperclip size={17} strokeWidth={1.75} />
               </label>
             )}
-            {/* 「+」选项菜单:仅「设定目标」(附件已提到一级回形针)。
-                菜单在移动端同样以触屏打开,DropdownMenu 原语已含 py-2 触控目标与向上翻转;
-                无目标时(demo)退化为禁用按钮,不弹空菜单。 */}
-            {hasPlusMenu ? (
-              <DropdownMenu open={plusMenuOpen} onOpenChange={setPlusMenuOpen}>
-                <DropdownMenuTrigger asChild>
-                  <IconButton
-                    data-product-feature={PRODUCT_CAPABILITIES.files.id}
-                    aria-label="更多选项"
-                    title="更多选项"
-                    disabled={disabled}
-                    className="relative"
-                  >
-                    <Plus size={20} />
-                    {/* 闭合态目标可见性:有活跃目标时在触发按钮右上角显小圆点,近预算转 warning 色,
-                        不点开菜单也能感知目标存在/临界(与菜单项内状态点同判定权威 goalNearBudget)。 */}
-                    {visibleGoal && (
-                      <span
-                        aria-hidden
-                        data-testid="composer-goal-dot"
-                        className={cn(
-                          "absolute right-1 top-1 size-1.5 rounded-full",
-                          goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent",
-                        )}
-                      />
-                    )}
-                  </IconButton>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="start" side="top">
-                  {canGoal && (
-                    <DropdownMenuItem
-                      data-product-feature={PRODUCT_CAPABILITIES.sessionGoal.id}
-                      onSelect={() => setGoalOpen(true)}
-                    >
-                      <Target size={16} className="shrink-0 text-muted" />
-                      <span className="flex-1">{visibleGoal ? "目标" : "设定目标"}</span>
-                      {visibleGoal && (
-                        <span
-                          aria-hidden
-                          className={cn(
-                            "size-1.5 shrink-0 rounded-full",
-                            goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent",
-                          )}
-                        />
-                      )}
-                    </DropdownMenuItem>
-                  )}
-                </DropdownMenuContent>
-              </DropdownMenu>
-            ) : (
-              <IconButton
-                data-product-feature={PRODUCT_CAPABILITIES.files.id}
-                aria-label="更多选项"
-                // 「+」菜单早已只剩「设定目标」(附件在一级回形针),禁用态文案跟着改,不再说「附件暂不可用」(C-15)。
-                title="会话目标暂不可用"
-                disabled
-                className="relative"
-              >
-                <Plus size={20} />
-                {visibleGoal && (
-                  <span
-                    aria-hidden
-                    data-testid="composer-goal-dot"
-                    className={cn(
-                      "absolute right-1 top-1 size-1.5 rounded-full",
-                      goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent",
-                    )}
-                  />
-                )}
-              </IconButton>
+            <span ref={plusAnchorRef} className="inline-flex shrink-0 items-center">
+              <ComposerPlusMenu
+                open={plusMenuOpen}
+                onOpenChange={setPlusMenuOpen}
+                disabled={disabled}
+                canGoal={canGoal}
+                visibleGoal={visibleGoal}
+                onOpenGoal={() => setGoalOpen(true)}
+                onOpenRepo={onOpenRepo}
+                repoSelection={repoSelection}
+                hasSwarmPlaybooks={Boolean(swarmSupported)}
+                onOpenSwarmPlaybooks={() => {
+                  setPlusMenuOpen(false);
+                  window.setTimeout(() => setPlaybookOpen(true), 0);
+                }}
+              />
+              {swarmSupported && playbookOpen && (
+                <SwarmPlaybookPopoverLazy
+                  disabled={disabled}
+                  currentText={value}
+                  open={playbookOpen}
+                  onOpenChange={setPlaybookOpen}
+                  anchorRef={plusAnchorRef}
+                  onSelectPlaybook={(draft) => {
+                    setValue(draft);
+                    if (!swarmMode) onToggleSwarmMode?.();
+                    window.requestAnimationFrame(() => ref.current?.focus());
+                  }}
+                />
+              )}
+            </span>
+            {onOpenRepo && !hasBoundRepo && (
+              <span aria-hidden className="mx-0.5 hidden h-4 w-px shrink-0 bg-border/70 sm:block" />
             )}
-            {/* GitHub 仓库入口在 sm+ 并入工具行左侧(与附件/「+」同组,少一层视觉层级)。
-                390px 下 5 个 44px 按钮(含生成中的「排队发送」)加未绑定态不可截断的「关联 GitHub 仓库」会撑爆一行
-                (after 截图实测 pill 压在排队键上),窄屏仍放在外壳下方的底栏(见下)。 */}
-            {projectSlot && (
-              <span className="hidden min-w-0 items-center sm:flex" data-testid="composer-project-slot">
-                {projectSlot}
-              </span>
-            )}
-            {onOpenRepo && (
+            {/* 未绑定仓库时：移动端收纳在「+」菜单内，桌面 sm+ 保留无框轻量入口；已绑定则统一展示于顶部微上下文条。 */}
+            {onOpenRepo && !hasBoundRepo && (
               <span className="hidden min-w-0 items-center sm:flex" data-testid="composer-repo-slot">
-                <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />
+                <RepoPill selection={null} onClick={onOpenRepo} quiet />
               </span>
             )}
             <div className="ml-auto flex shrink-0 items-center gap-1.5">
-              {/* 「正在停止…」占位符已由 App 传入 placeholder 承载,角落再写一遍是冗余(C-17);
-                  这里只保留给读屏的状态播报,不再占视觉位。 */}
-              {stopping && (
-                <output className="sr-only" aria-live="polite">
-                  正在停止…
-                </output>
-              )}
-              {value.length > 2000 && (
-                <span className="text-caption text-faint tabular-nums">{value.length} 字</span>
-              )}
-              {/* 草稿超过 20KB 只留内存、刷新丢失,此前毫无预警(C-21)。 */}
-              {draftVolatile && (
-                <output
-                  data-testid="composer-draft-volatile"
-                  className="hidden text-caption text-warning sm:inline"
-                  title="草稿超过本地保存上限，只保留在内存中；刷新或关闭页面后不再恢复"
-                >
-                  草稿过长，刷新后不保留
-                </output>
-              )}
-              {/* 发送键禁用原因不再只放 hover title(触屏无 hover,C-10):可见 caption + role=status。 */}
-              {!busy && (attachFailed || uploading) && (
-                <output
-                  data-testid="composer-send-blocked-reason"
-                  className={cn("text-caption", attachFailed ? "text-danger" : "text-faint")}
-                >
-                  {attachFailed ? "有附件上传失败" : "附件上传中…"}
-                </output>
-              )}
               {/* 生成中排队发送(C-02):此前生成中唯一按钮是「停止」,桌面 Enter 排队无反馈,触屏 Enter=换行
                   → 根本没有排队入口。现在 busy 且有可发内容时给一个次级「排队发送」按钮;「停止」仍是唯一
                   Stop 控件(T35),本按钮 aria-label 不含「停止」。
@@ -1110,32 +1322,33 @@ export function Composer({
                   data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
                   aria-label="排队发送"
                   title="本轮结束后自动发送"
-                  className="text-accent"
+                  className="oc-btn-tactile oc-spring-press text-accent hover:bg-accent-soft"
                   onClick={() => submit(false, () => toast("已加入队列，本轮结束后发送", "info"))}
                 >
-                  <ListPlus size={19} />
+                  <ListPlus size={18} strokeWidth={1.75} />
                 </IconButton>
               )}
               {/* 不支持/未登录时不再 disabled 灰掉了事(C-20):保持可聚焦可点,点了用 toast 说明原因。 */}
               <IconButton
                 data-product-feature={PRODUCT_CAPABILITIES.voice.id}
-                aria-label={voice.state === "recording" ? "停止录音" : "语音输入"}
-                title={voiceUnavailableReason ?? (voice.state === "recording" ? "停止录音" : "语音输入")}
+                aria-label={voiceState === "recording" ? "停止录音" : "语音输入"}
+                title={voiceUnavailableReason ?? (voiceState === "recording" ? "停止录音" : "语音输入")}
                 aria-disabled={voiceUnavailableReason ? true : undefined}
                 data-voice-unavailable={voiceUnavailableReason ? "true" : undefined}
-                disabled={disabled || voice.state === "transcribing"}
+                disabled={disabled || voiceState === "transcribing"}
                 onClick={onVoiceClick}
                 className={cn(
-                  voice.state === "recording" && "text-danger",
+                  "oc-btn-tactile oc-spring-press",
+                  voiceState === "recording" && "oc-icon-badge-danger text-danger",
                   voiceUnavailableReason && "text-faint",
                 )}
               >
-                {voice.state === "transcribing" ? (
-                  <Loader2 size={19} className="animate-spin" />
-                ) : voice.state === "recording" ? (
-                  <Square size={16} className="fill-current" />
+                {voiceState === "transcribing" ? (
+                  <Loader2 size={18} strokeWidth={1.75} className="animate-spin" />
+                ) : voiceState === "recording" ? (
+                  <Square size={15} strokeWidth={1.75} className="fill-current" />
                 ) : (
-                  <Mic size={19} />
+                  <Mic size={18} strokeWidth={1.75} />
                 )}
               </IconButton>
               <button
@@ -1165,36 +1378,31 @@ export function Composer({
                 }}
                 disabled={stopping || (!canSend && !busy) || disabled}
                 className={cn(
-                  "flex size-9 shrink-0 items-center justify-center rounded-full transition-all [@media(hover:none)]:size-11",
+                  "oc-btn-tactile oc-spring-press oc-icon-nudge flex size-9 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface [@media(hover:none)]:size-10",
                   busy
-                    ? "bg-fg text-bg"
+                    ? "oc-btn-primary-craft text-primary-fg"
                     : canSend
-                      ? "bg-primary text-primary-fg hover:opacity-90"
-                      : "bg-hover text-faint",
+                      ? swarmMode
+                        ? "oc-btn-accent-craft oc-shimmer-sheen text-accent-fg"
+                        : "oc-btn-primary-craft oc-shimmer-sheen text-primary-fg"
+                      : swarmMode
+                        ? "border border-accent/25 bg-accent-soft/75 text-accent/70"
+                        : "oc-surface-recessed border border-border/80 text-muted",
                 )}
               >
                 {stopping || submitting ? (
-                  <Loader2 size={17} className="animate-spin" />
+                  <Loader2 size={17} strokeWidth={2} className="animate-spin" />
                 ) : busy ? (
-                  <Square size={15} className="fill-current" />
+                  <Square size={14} strokeWidth={2} className="fill-current" />
                 ) : (
-                  <ArrowUp size={19} />
+                  <ArrowUp size={18} strokeWidth={2.25} />
                 )}
               </button>
             </div>
           </div>
         </div>
       </div>
-      {/* 窄屏底栏:GitHub 仓库入口(sm+ 已并入工具行,这里只在 <sm 渲染)。 */}
-      {(onOpenRepo || projectSlot) && (
-        <div
-          className="flex min-h-[30px] min-w-0 items-center gap-2 px-1.5 py-1.5 sm:hidden"
-          data-testid="composer-repo-slot-mobile"
-        >
-          {projectSlot}
-          {onOpenRepo && <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />}
-        </div>
-      )}
+      </div>
       {/* 语音状态(录音/转写/错误)常驻 live region(C-19):容器随 voiceEnabled 常在、内容变化才被读屏播报;
           无内容时 sr-only 不占位。 */}
       {voiceEnabled && (
@@ -1210,34 +1418,23 @@ export function Composer({
         </output>
       )}
 
-      {/* 图片附件灯箱:点击缩略图看全图。 */}
-      <Dialog.Root open={!!preview} onOpenChange={(o) => !o && setPreview(null)}>
-        <Dialog.Portal>
-          <Dialog.Overlay className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm data-[state=open]:animate-fade" />
-          <Dialog.Content
-            aria-describedby={undefined}
-            className="fixed left-1/2 top-1/2 z-50 max-h-[90vh] max-w-[92vw] -translate-x-1/2 -translate-y-1/2 focus:outline-none"
-          >
-            <Dialog.Title className="sr-only">{preview?.name ?? "图片预览"}</Dialog.Title>
-            {preview && (
-              <img
-                src={preview.url}
-                alt={preview.name}
-                className="max-h-[90vh] max-w-[92vw] rounded-lg object-contain shadow-float"
-              />
-            )}
-            <Dialog.Close asChild>
-              <button
-                type="button"
-                aria-label="关闭预览"
-                className="absolute -right-2 -top-2 flex size-8 items-center justify-center rounded-full bg-surface text-fg shadow-float outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                <X size={16} />
-              </button>
-            </Dialog.Close>
-          </Dialog.Content>
-        </Dialog.Portal>
-      </Dialog.Root>
+      {voiceToggleNonce > 0 && (
+        <Suspense fallback={null}>
+          <ComposerVoiceController
+            toggleNonce={voiceToggleNonce}
+            getToken={getVoiceToken}
+            onText={onVoiceText}
+            onError={onVoiceErr}
+            onStateChange={setVoiceState}
+          />
+        </Suspense>
+      )}
+      {/* 图片附件灯箱:点击缩略图才按需加载，不进首屏包。 */}
+      {preview && (
+        <Suspense fallback={null}>
+          <ComposerImageLightbox preview={preview} onClose={() => setPreview(null)} />
+        </Suspense>
+      )}
 
       {/* 会话目标对话框:由「+」菜单里的目标项打开(入口自会话头部迁入,功能本身不变)。 */}
       {canGoal && onSetGoal && onGoalAction && goalOpen && (

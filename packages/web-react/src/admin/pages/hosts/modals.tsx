@@ -31,7 +31,7 @@ async function sendVoid(method: 'POST', path: string, body?: unknown): Promise<v
 
 // ─── 添加虚机 ──────────────────────────────────────────────────────────
 
-const FIELD_LABEL = 'text-[12px] font-medium text-faint'
+const FIELD_LABEL = 'text-meta font-medium text-muted'
 
 /** 表单字段：label(htmlFor) 绑定内部控件 id，满足 a11y + biome noLabelWithoutControl。 */
 function Field({
@@ -318,10 +318,15 @@ export function BootstrapLogModal({
             }
           />
           <div>
-            <p className="mb-1 text-meta text-faint">最近错误</p>
-            <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-hover p-3 font-mono text-meta text-fg">
-              {data.last_bootstrap_err || '(无)'}
-            </pre>
+            <p className="mb-1.5 text-meta font-medium text-muted">最近错误</p>
+            <div className="oc-code-shell">
+              <div className="oc-code-shell-header px-3 py-1.5 text-caption font-medium text-faint">
+                bootstrap.log
+              </div>
+              <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-meta leading-relaxed text-fg">
+                {data.last_bootstrap_err || '(无)'}
+              </pre>
+            </div>
           </div>
         </div>
       )}
@@ -391,9 +396,9 @@ export function DiagnosticModal({
       ) : (
         <div className="flex flex-col gap-4">
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <div className="rounded-lg border border-border bg-surface p-3">
-              <p className="text-meta text-faint">调度状态</p>
-              <div className="mt-1.5 flex items-center gap-2">
+            <div className="oc-surface-recessed rounded-xl p-3.5">
+              <p className="text-caption font-semibold uppercase tracking-wide text-faint">调度状态</p>
+              <div className="mt-2 flex items-center gap-2">
                 <Badge tone={hostStatusTone(String(host.status ?? 'unknown'))}>
                   {String(host.status ?? 'unknown')}
                 </Badge>
@@ -407,9 +412,9 @@ export function DiagnosticModal({
                 {String(host.id ?? hostId)}
               </p>
             </div>
-            <div className="rounded-lg border border-border bg-surface p-3">
-              <p className="text-meta text-faint">运行镜像</p>
-              <p className="mt-1.5 break-all font-mono text-caption text-muted">
+            <div className="oc-surface-recessed rounded-xl p-3.5">
+              <p className="text-caption font-semibold uppercase tracking-wide text-faint">运行镜像</p>
+              <p className="mt-2 break-all font-mono text-caption text-muted">
                 desired: {String(data.pool.desiredImageId ?? host.desired_image_id ?? '—')}
               </p>
               <p className="mt-1 break-all font-mono text-caption text-muted">
@@ -419,20 +424,20 @@ export function DiagnosticModal({
           </div>
 
           <div>
-            <p className="mb-2 text-meta text-faint">最近 host audit（最多 20 条）</p>
-            <div className="overflow-x-auto rounded-lg border border-border">
+            <p className="mb-2 text-meta font-medium text-muted">最近 host audit（最多 20 条）</p>
+            <div className="oc-surface-card overflow-x-auto rounded-xl">
               <table className="w-full border-collapse text-meta">
-                <thead className="bg-surface">
+                <thead className="bg-sidebar/80 dark:bg-elevated/80">
                   <tr className="border-b border-border text-faint">
-                    <th className="px-2 py-1.5 text-left font-medium">时间</th>
-                    <th className="px-2 py-1.5 text-left font-medium">事件</th>
-                    <th className="px-2 py-1.5 text-left font-medium">详情</th>
+                    <th className="px-3 py-2 text-left text-caption font-semibold uppercase tracking-wide">时间</th>
+                    <th className="px-3 py-2 text-left text-caption font-semibold uppercase tracking-wide">事件</th>
+                    <th className="px-3 py-2 text-left text-caption font-semibold uppercase tracking-wide">详情</th>
                   </tr>
                 </thead>
-                <tbody>
+                <tbody className="divide-y divide-border/60">
                   {audit.length === 0 ? (
                     <tr>
-                      <td colSpan={3} className="px-2 py-3 text-center text-faint">
+                      <td colSpan={3} className="px-3 py-4 text-center text-faint">
                         暂无 audit
                       </td>
                     </tr>
@@ -441,12 +446,12 @@ export function DiagnosticModal({
                       const details = JSON.stringify(a.details ?? a.after ?? a.before ?? {})
                       const rowKey = `${a.created_at || a.createdAt || ''}-${a.action || a.event || ''}-${i}`
                       return (
-                        <tr key={rowKey} className="border-b border-border/60 last:border-0">
-                          <td className="px-2 py-1.5 font-mono text-faint">
+                        <tr key={rowKey} className="transition-colors hover:bg-hover/60">
+                          <td className="px-3 py-2 font-mono text-faint">
                             {a.created_at || a.createdAt || ''}
                           </td>
-                          <td className="px-2 py-1.5 text-fg">{a.action || a.event || ''}</td>
-                          <td className="px-2 py-1.5 font-mono text-muted">
+                          <td className="px-3 py-2 font-medium text-fg">{a.action || a.event || ''}</td>
+                          <td className="px-3 py-2 font-mono text-muted">
                             {details.slice(0, 300)}
                           </td>
                         </tr>
@@ -459,10 +464,17 @@ export function DiagnosticModal({
           </div>
 
           <details>
-            <summary className="cursor-pointer text-meta text-muted">原始诊断 JSON</summary>
-            <pre className="mt-2 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-hover p-3 font-mono text-caption text-fg">
-              {JSON.stringify(data, null, 2)}
-            </pre>
+            <summary className="cursor-pointer select-none text-meta font-medium text-muted hover:text-fg">
+              原始诊断 JSON
+            </summary>
+            <div className="oc-code-shell mt-2">
+              <div className="oc-code-shell-header px-3 py-1.5 text-caption font-medium text-faint">
+                diagnostic.json
+              </div>
+              <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-caption leading-relaxed text-fg">
+                {JSON.stringify(data, null, 2)}
+              </pre>
+            </div>
           </details>
         </div>
       )}
@@ -650,8 +662,16 @@ export function DistributeImageModal({
           <SelectFilter value={target} options={options} onChange={setTarget} />
         </div>
 
-        {busy && <p className="text-meta text-muted">正在通过 SSH stream 镜像，请勿关闭页面…</p>}
-        {err && <p className="text-body text-danger">分发失败：{err}</p>}
+        {busy && (
+          <div className="oc-callout oc-callout-info rounded-xl px-3.5 py-2.5 text-meta text-info">
+            正在通过 SSH stream 镜像，请勿关闭页面…
+          </div>
+        )}
+        {err && (
+          <div className="oc-callout oc-callout-danger rounded-xl px-3.5 py-2.5 text-body text-danger">
+            分发失败：{err}
+          </div>
+        )}
 
         {results && (
           <div className="flex flex-col gap-2">
@@ -661,7 +681,7 @@ export function DistributeImageModal({
               results.map((r) => (
                 <div
                   key={r.hostId}
-                  className="flex items-center justify-between gap-2 rounded-lg border border-border bg-surface px-3 py-2 text-body"
+                  className="oc-surface-card flex items-center justify-between gap-2 rounded-xl px-3.5 py-2.5 text-body"
                 >
                   <span className="truncate font-medium text-fg">{r.hostName}</span>
                   <div className="flex shrink-0 items-center gap-2">

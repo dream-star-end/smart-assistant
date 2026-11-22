@@ -2905,6 +2905,25 @@ function helloTerminalBillingTrio(opts: {
           await opts.beforeSnapshotRead?.();
           return { rows: [{ as_of: String(Date.now()) }], rowCount: 1 };
         }
+        if (/session-snapshot-watermark/.test(text)) {
+          const rows = opts.readyScanRows ?? [];
+          if (rows.length > 0) {
+            return {
+              rows: [{
+                projection_source: "live",
+                provenance: {},
+                latest_turn_status_json: null,
+                latest_turn_usage_json: null,
+                latest_turn_status_seq: 0,
+                latest_turn_usage_seq: 0,
+                frame_seq: String(rows.length),
+                created_at: new Date(),
+              }],
+              rowCount: 1,
+            };
+          }
+          return { rows: [], rowCount: 0 };
+        }
         if (/open-dispatch-engine-ready/.test(text)) {
           opts.readyScans?.push(params ?? []);
           const rows = opts.readyScanRows ?? [];

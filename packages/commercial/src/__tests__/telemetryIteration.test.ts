@@ -122,6 +122,10 @@ describe("telemetry iteration primitives", () => {
       ["3", "webchat", "first_thinking_frame", "FIRST_THINKING_FRAME", "succeeded", 1, 500],
       ["3", "webchat", "first_text_frame", "FIRST_TEXT_FRAME", "succeeded", 1, 1200],
     ]);
+    assert.deepEqual(calls.map((call) => call.params.slice(11, 13)), [
+      [null, null],
+      [null, null],
+    ]);
   });
 
   test("turn observation insert is event-id idempotent and updates linked trace", async () => {

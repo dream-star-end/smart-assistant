@@ -49,10 +49,7 @@ export class MessageBoundary extends Component<Props, State> {
       return (
         <div className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3.5 py-2 text-meta text-muted">
           <AlertTriangle size={13} className="shrink-0 text-warning" aria-hidden="true" />
-          <span>此条消息渲染失败</span>
-          <span className="font-mono text-caption text-faint" title={this.props.messageId}>
-            #{this.props.messageId.slice(0, 8)}
-          </span>
+          <span>该条内容暂时无法显示</span>
         </div>
       );
     }

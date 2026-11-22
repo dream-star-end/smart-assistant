@@ -50,6 +50,8 @@ export interface ControlListener {
   start(): Promise<void>;
   close(): Promise<void>;
   status(): { privateBound: boolean; vipBound: boolean; vipDesired: boolean };
+  /** 当前实例是否已持有 18894 控制口 VIP。 */
+  isVipOwner(): boolean;
 }
 
 const noopLogger = { info: () => {}, warn: () => {}, error: () => {} };
@@ -58,7 +60,7 @@ export function createControlListener(opts: ControlListenerOptions): ControlList
   const log = opts.logger ?? noopLogger;
   const vipAddr = opts.vip ?? DEFAULT_VIP;
   const privAddr = opts.privateAddr ?? { host: "127.0.0.1", port: privatePortForSlot(opts.slot) };
-  const retryMs = opts.eaddrInUseRetryMs ?? 2_000;
+  const retryMs = opts.eaddrInUseRetryMs ?? 150;
 
   let privateServer: Server | null = null;
   let vipServer: Server | null = null;
@@ -283,5 +285,6 @@ export function createControlListener(opts: ControlListenerOptions): ControlList
       vipBound: vipServer !== null,
       vipDesired: desiredIsSelf(),
     }),
+    isVipOwner: () => vipServer !== null,
   };
 }

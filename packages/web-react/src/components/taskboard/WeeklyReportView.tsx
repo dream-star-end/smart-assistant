@@ -1,4 +1,18 @@
-import { CalendarRange, ChevronLeft, ChevronRight, RefreshCw } from 'lucide-react'
+import {
+  AlertOctagon,
+  AlertTriangle,
+  ArrowRightLeft,
+  CalendarRange,
+  CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
+  Clock,
+  Coins,
+  PlusCircle,
+  RefreshCw,
+  Timer,
+  XCircle,
+} from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { useProjectScope } from '../../hooks/useProjectScope'
 import { AuthEpochStaleError } from '../../lib/api'
@@ -13,6 +27,7 @@ import {
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
 import {
+  Badge,
   Button,
   Card,
   DescriptionList,
@@ -88,18 +103,23 @@ export function WeeklyReportView({ auth }: { auth: AuthSession }) {
   return (
     <div
       data-testid="weekly-report"
-      className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 pb-4"
+      className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto px-4 pb-5"
       aria-busy={loading || undefined}
     >
-      <div>
-        <h2 className="text-title font-semibold text-fg">周报</h2>
-        <p className="mt-1 text-caption text-muted">
-          按周一到周日（上海时间）统计。这里的成本只算任务面板里 agent 执行的用量，不含对话里的模型用量。
-        </p>
+      <div className="flex items-start gap-3">
+        <span className="oc-icon-badge oc-icon-badge-accent mt-0.5 size-9 rounded-xl" aria-hidden>
+          <CalendarRange size={18} />
+        </span>
+        <div className="min-w-0">
+          <h2 className="text-title font-semibold tracking-tight text-fg">周报</h2>
+          <p className="mt-0.5 text-caption leading-relaxed text-muted">
+            按周一到周日（上海时间）统计。这里的成本只算任务面板里 agent 执行的用量，不含对话里的模型用量。
+          </p>
+        </div>
       </div>
       <div className="flex flex-wrap items-center gap-2">
         {/* 上一周 / 区间 / 下一周包成一组,窄屏下不再被换行拆散(审计 T-21 ③)。 */}
-        <div className="flex shrink-0 items-center gap-1 rounded-lg border border-border bg-surface p-0.5">
+        <div className="oc-surface-recessed flex shrink-0 items-center gap-1 rounded-xl p-1">
           <Button
             type="button"
             size="sm"
@@ -112,7 +132,10 @@ export function WeeklyReportView({ auth }: { auth: AuthSession }) {
             <ChevronLeft size={14} />
             <span className="hidden sm:inline">上一周</span>
           </Button>
-          <span data-testid="weekly-period" className="px-1 text-body font-medium tabular-nums text-fg">
+          <span
+            data-testid="weekly-period"
+            className="oc-segmented-thumb rounded-lg px-2.5 py-1 text-body font-medium tabular-nums text-fg"
+          >
             {report ? `${report.period.week} · ${report.period.fromYmd} → ${report.period.toYmd}` : '本周'}
           </span>
           <Button
@@ -132,7 +155,7 @@ export function WeeklyReportView({ auth }: { auth: AuthSession }) {
         <Button
           type="button"
           size="sm"
-          variant="ghost"
+          variant="secondary"
           loading={loading && !!report}
           disabled={!scopedProjectId}
           onClick={() => void load()}
@@ -164,19 +187,29 @@ export function WeeklyReportView({ auth }: { auth: AuthSession }) {
         <EmptyState icon={CalendarRange} title="没有周报" hint="换一周或换个项目再试。" />
       ) : (
         <>
-          <div className="grid grid-cols-2 gap-2 md:grid-cols-5">
-            <StatCard label="新建" value={report.flow.created} />
-            <StatCard label="完成" value={report.flow.completed} tone="success" />
-            <StatCard label="取消" value={report.flow.canceled} />
-            <StatCard label="待确认" value={report.flow.waitingHuman} tone="accent" />
-            <StatCard label="受阻" value={report.flow.blockedNow} tone="danger" />
+          <div className="grid grid-cols-2 gap-2.5 md:grid-cols-5">
+            <StatCard label="新建" value={report.flow.created} icon={PlusCircle} />
+            <StatCard label="完成" value={report.flow.completed} tone="success" icon={CheckCircle2} />
+            <StatCard label="取消" value={report.flow.canceled} icon={XCircle} />
+            <StatCard label="待确认" value={report.flow.waitingHuman} tone="accent" icon={Clock} />
+            <StatCard label="受阻" value={report.flow.blockedNow} tone="danger" icon={AlertOctagon} />
           </div>
-          <Card padding="md" className="flex flex-col gap-2">
-            <h3 className="text-section font-semibold text-fg">成本</h3>
+          <Card padding="md" className="flex flex-col gap-2.5">
+            <div className="flex items-center gap-2">
+              <span className="oc-icon-badge oc-icon-badge-info size-7 rounded-lg" aria-hidden>
+                <Coins size={14} />
+              </span>
+              <h3 className="text-section font-semibold tracking-tight text-fg">成本</h3>
+            </div>
             <CostCoverageBlock totals={report.cost} testId="weekly-cost" />
           </Card>
-          <Card padding="md" className="flex flex-col gap-2">
-            <h3 className="text-section font-semibold text-fg">各阶段耗时</h3>
+          <Card padding="md" className="flex flex-col gap-2.5">
+            <div className="flex items-center gap-2">
+              <span className="oc-icon-badge oc-icon-badge-accent size-7 rounded-lg" aria-hidden>
+                <Timer size={14} />
+              </span>
+              <h3 className="text-section font-semibold tracking-tight text-fg">各阶段耗时</h3>
+            </div>
             {report.stages.length === 0 ? (
               <p className="text-caption text-muted">本周还没有记上耗时的执行。</p>
             ) : (
@@ -193,8 +226,13 @@ export function WeeklyReportView({ auth }: { auth: AuthSession }) {
             )}
           </Card>
           {report.flow.statusTransitions.length > 0 && (
-            <Card padding="md" className="flex flex-col gap-2">
-              <h3 className="text-section font-semibold text-fg">状态流转</h3>
+            <Card padding="md" className="flex flex-col gap-2.5">
+              <div className="flex items-center gap-2">
+                <span className="oc-icon-badge size-7 rounded-lg" aria-hidden>
+                  <ArrowRightLeft size={14} />
+                </span>
+                <h3 className="text-section font-semibold tracking-tight text-fg">状态流转</h3>
+              </div>
               <DescriptionList divided>
                 {report.flow.statusTransitions.map((row) => (
                   <DescriptionRow
@@ -206,41 +244,78 @@ export function WeeklyReportView({ auth }: { auth: AuthSession }) {
               </DescriptionList>
             </Card>
           )}
-          <Card padding="md" className="flex flex-col gap-2" data-testid="weekly-blocked">
-            <h3 className="text-section font-semibold text-fg">受阻单</h3>
+          <Card padding="md" className="flex flex-col gap-2.5" data-testid="weekly-blocked">
+            <div className="flex items-center gap-2">
+              <span className="oc-icon-badge oc-icon-badge-warning size-7 rounded-lg" aria-hidden>
+                <AlertOctagon size={14} />
+              </span>
+              <h3 className="text-section font-semibold tracking-tight text-fg">受阻单</h3>
+              {report.blocked.length > 0 && (
+                <Badge tone="warning" size="sm" className="ml-auto tabular-nums">
+                  {report.blocked.length}
+                </Badge>
+              )}
+            </div>
             {report.blocked.length === 0 ? (
               <p className="text-caption text-muted">当前没有受阻单据。</p>
             ) : (
-              report.blocked.map((item) => (
-                <div key={item.identifier} className="rounded-lg bg-hover px-3 py-2">
-                  <p className="text-body text-fg">
-                    {item.identifier} {item.title}
-                  </p>
-                  {item.blockedReason && (
-                    <p className="text-caption text-muted">{item.blockedReason}</p>
-                  )}
-                </div>
-              ))
+              <div className="flex flex-col gap-2">
+                {report.blocked.map((item) => (
+                  <div
+                    key={item.identifier}
+                    className="oc-callout oc-callout-warning flex flex-col gap-1 rounded-xl px-3.5 py-2.5"
+                  >
+                    <p className="flex flex-wrap items-center gap-1.5 text-body font-medium text-fg">
+                      <span className="inline-flex items-center rounded-md bg-hover px-1.5 py-0.5 font-mono text-caption text-muted tabular-nums">
+                        {item.identifier}
+                      </span>
+                      <span>{item.title}</span>
+                    </p>
+                    {item.blockedReason && (
+                      <p className="text-caption text-muted">{item.blockedReason}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
             )}
           </Card>
-          <Card padding="md" className="flex flex-col gap-2" data-testid="weekly-failed-runs">
-            <h3 className="text-section font-semibold text-fg">失败的执行</h3>
+          <Card padding="md" className="flex flex-col gap-2.5" data-testid="weekly-failed-runs">
+            <div className="flex items-center gap-2">
+              <span className="oc-icon-badge oc-icon-badge-danger size-7 rounded-lg" aria-hidden>
+                <AlertTriangle size={14} />
+              </span>
+              <h3 className="text-section font-semibold tracking-tight text-fg">失败的执行</h3>
+              {report.failedRuns.length > 0 && (
+                <Badge tone="danger" size="sm" className="ml-auto tabular-nums">
+                  {report.failedRuns.length}
+                </Badge>
+              )}
+            </div>
             {report.failedRuns.length === 0 ? (
               <p className="text-caption text-muted">本周没有失败或超时的执行。</p>
             ) : (
-              report.failedRuns.map((run) => (
-                <div key={run.runId} className="rounded-lg bg-hover px-3 py-2">
-                  <p className="text-body text-fg">
-                    {run.identifier}
-                    {run.stageName ? ` · ${run.stageName}` : ''} ·{' '}
-                    {run.status === 'timeout' ? '超时' : run.status === 'failed' ? '失败' : run.status}
-                  </p>
-                  {run.error && <p className="text-caption text-danger">{run.error}</p>}
-                  <p className="text-caption text-faint">
-                    <TimeAgo value={run.createdAt} />
-                  </p>
-                </div>
-              ))
+              <div className="flex flex-col gap-2">
+                {report.failedRuns.map((run) => (
+                  <div
+                    key={run.runId}
+                    className="oc-callout oc-callout-danger flex flex-col gap-1 rounded-xl px-3.5 py-2.5"
+                  >
+                    <div className="flex flex-wrap items-center gap-1.5 text-body font-medium text-fg">
+                      <span className="inline-flex items-center rounded-md bg-hover px-1.5 py-0.5 font-mono text-caption text-muted tabular-nums">
+                        {run.identifier}
+                      </span>
+                      {run.stageName ? <span className="text-body text-fg">· {run.stageName}</span> : null}
+                      <Badge tone="danger" size="sm">
+                        {run.status === 'timeout' ? '超时' : run.status === 'failed' ? '失败' : run.status}
+                      </Badge>
+                      <span className="ml-auto text-caption tabular-nums text-faint">
+                        <TimeAgo value={run.createdAt} />
+                      </span>
+                    </div>
+                    {run.error && <p className="text-caption break-words text-danger">{run.error}</p>}
+                  </div>
+                ))}
+              </div>
             )}
           </Card>
         </>

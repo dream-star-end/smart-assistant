@@ -33,8 +33,13 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http"
 import type { Pool } from "pg"
+import type { PendingDecisionItem } from "@openclaude/protocol"
 
 import { type Logger, rootLogger } from "../logging/logger.js"
+import {
+  parseImRemoteCommand,
+  type ImRemoteControlHandler,
+} from "../pendingDecisions/index.js"
 import {
   REQUEST_ID_HEADER,
   ensureRequestId,
@@ -51,6 +56,11 @@ import {
   type SendTextFn,
   runHousekeeping,
 } from "./outboxWorker.js"
+import {
+  pushWechatPendingDecision,
+  type WechatPendingDecisionPushResult,
+} from "./pendingDecisionPush.js"
+import { canonicalWechatSenderId } from "./proactiveReceiver.js"
 import {
   type PgConn,
   RECONCILE_GRACE_MS_DEFAULT,
@@ -225,6 +235,14 @@ export interface WechatBroker {
    * outbound_id idempotency tombstones remain intact.
    */
   cleanupBinding(bindingUserId: string): Promise<{ pointerDeleted: boolean; outboxFailed: number }>
+  /**
+   * Proactively format and push a Pending Decision card (with 4-digit short code)
+   * to the bound WeChat user.
+   */
+  pushPendingDecision(
+    item: PendingDecisionItem,
+    opts?: { bindingUserId?: string; senderId?: string },
+  ): Promise<WechatPendingDecisionPushResult>
   /** 启动 outboxWorker + reconcile + housekeeping 三条 timer。幂等(已 start 再 start 是 no-op)。 */
   start(): void
   /** 平滑停。await 所有 inFlight tick + outboxWorker.stop()。 */
@@ -272,6 +290,13 @@ export interface BrokerDeps {
     handleModelCommand: (evt: InboundEvent) => Promise<string>
     helpText?: () => string
   }
+  /**
+   * Stage-4 IM light remote control & async approval handler:
+   * `/pending`, `/approve <code> [附言]`, `/deny <code> [理由]`, `/sessions`, `/switch <n>`.
+   */
+  remoteControl?: ImRemoteControlHandler
+  /** Per-user proactive push preference (fail-closed when false or lookup throws). */
+  isProactiveEnabled?: (userId: string) => Promise<boolean>
   /**
    * 微信内过程显示开关。与前端绑定窗口使用同一个 `wechat_show_tool_calls`
    * 偏好,控制工具调用公告和思考过程是否下发到微信。
@@ -652,6 +677,63 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       }
     }
 
+    if (parseImRemoteCommand(text)) {
+      if (!deps.remoteControl) {
+        return {
+          kind: "command_echo",
+          reply: "微信远程审批与会话切换暂未启用，请稍后再试或在网页端操作。",
+        }
+      }
+      // B7: High-privilege commands (/pending, /approve, /deny, /sessions, /switch) MUST query
+      // ONLY the canonical commercial binding (`c:<uid>`), require explicit `status === 'active'`,
+      // and verify `senderId === binding.loginUserId` (never fall back to legacy bare-uid namespace).
+      try {
+        const canonicalBindingKey = `${MASTER_USER_PREFIX}${dispatchBindingUserId}`
+        const binding = await deps.getBinding(canonicalBindingKey)
+        if (!binding || binding.status !== "active") {
+          return {
+            kind: "command_echo",
+            reply: "当前微信绑定未激活，无法执行审批或会话遥控指令。",
+          }
+        }
+        const ownerLogin = binding.loginUserId?.trim()
+        if (
+          !ownerLogin ||
+          canonicalWechatSenderId(evt.senderId) !== canonicalWechatSenderId(ownerLogin)
+        ) {
+          log.warn("wechat_remote_control_non_owner_rejected", {
+            bindingUserId: evt.bindingUserId,
+            dispatchBindingUserId,
+            idempotencyKey: evt.idempotencyKey,
+          })
+          return {
+            kind: "command_echo",
+            reply: "仅限当前已绑定的微信账号本人可执行待拍板查询、审批与会话切换指令。",
+          }
+        }
+        const reply = await deps.remoteControl.tryHandleCommand({
+          userId: dispatchBindingUserId,
+          text,
+          originChannel: "wechat",
+          channelName: "微信",
+        })
+        if (reply !== null) {
+          return { kind: "command_echo", reply }
+        }
+      } catch (err) {
+        log.error("wechat_remote_control_command_failed", {
+          bindingUserId: evt.bindingUserId,
+          dispatchBindingUserId,
+          idempotencyKey: evt.idempotencyKey,
+          errMessage: (err as Error)?.message ?? String(err),
+        })
+        return {
+          kind: "command_echo",
+          reply: "远程控制命令暂时执行失败，请稍后重试。",
+        }
+      }
+    }
+
     return null
   }
 
@@ -829,6 +911,9 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       "• 直接发消息:继续当前会话",
       "• /stop 或“停止”:中断正在执行的任务",
       "• /new:开启新会话",
+      "• /sessions 与 /switch <序号>:查看并切换会话",
+      "• /pending:查看待拍板审批事项与 4 位短码",
+      "• /approve <短码> [附言] 或 /deny <短码> [理由]:远程审批",
       "• /model:查看可用模型",
       "• /model 2 或 /model <模型ID>:切换默认模型",
       "• 实时过程会通过每轮开始时的链接在网页端查看",
@@ -1247,5 +1332,20 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
     }
   }
 
-  return { outboundHandler, onInbound, cleanupBinding, start, stop }
+  async function pushPendingDecision(
+    item: PendingDecisionItem,
+    opts?: { bindingUserId?: string },
+  ): Promise<WechatPendingDecisionPushResult> {
+    return pushWechatPendingDecision({
+      item,
+      bindingUserId: opts?.bindingUserId,
+      getBinding: deps.getBinding,
+      sendText: deps.sendText,
+      isProactiveEnabled: deps.isProactiveEnabled,
+      remoteControl: deps.remoteControl,
+      nowMs: now(),
+    })
+  }
+
+  return { outboundHandler, onInbound, cleanupBinding, pushPendingDecision, start, stop }
 }

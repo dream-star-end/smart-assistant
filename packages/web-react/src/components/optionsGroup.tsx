@@ -21,7 +21,7 @@
  * assistant 消息包一个 Provider(store 挂 useRef,随消息实例存活),RichBlocks 的
  * OptionsBlock 经 useOptionsGroup 注册/上报,Footer 用 useSyncExternalStore 订阅。
  */
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 import { useChatInteraction } from "./tool/context";
 import { Button } from "./ui";
@@ -167,13 +167,17 @@ export function OptionsGroupFooter() {
   const store = useOptionsGroup();
   const snap = useOptionsGroupSnapshot();
   const { sendUserText, busy } = useChatInteraction();
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [groupNote, setGroupNote] = useState("");
+  const trimmedNote = groupNote.trim();
   const text = useMemo(() => {
     if (!snap) return "";
     const lines = snap.entries.map(
       (e, i) => `${i + 1}. ${e.question ?? `第 ${i + 1} 题`}:${e.labels.join("、") || "(未答)"}`,
     );
-    return `我的选择:\n${lines.join("\n")}`;
-  }, [snap]);
+    const base = `我的选择:\n${lines.join("\n")}`;
+    return trimmedNote ? `${base}\n补充说明：${trimmedNote}` : base;
+  }, [snap, trimmedNote]);
   // 没有已解析的 options 块时不渲染空页脚(避免思考过程出现「已作答 0/0」)。
   // 流式期只要有 ≥1 块就必须出页脚(禁止点击即发);非流式 ≥2 块出页脚;
   // 单块流式结束后若还有未发送的点选,页脚留着让用户显式发出(见 Snapshot.grouped)。
@@ -199,25 +203,55 @@ export function OptionsGroupFooter() {
         ? `未答的 ${unanswered} 题会标为「未答」一并发出`
         : null;
   return (
-    <div className="mt-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 rounded-xl border border-border bg-surface px-3.5 py-2.5">
-      {/* 计数走 live region:读屏用户点选后能听到进度,而不是只看得见。 */}
-      <output aria-live="polite" className="min-w-0 text-meta text-muted">
-        已作答 <span className="font-medium text-fg">{snap.answered}</span> / {snap.count} 题
-        {hint ? <span className="text-faint"> —— {hint}</span> : null}
-      </output>
-      <Button
-        type="button"
-        variant="accent"
-        size="sm"
-        disabled={!ready || blockedByBusy}
-        title={blockedByBusy ? "等待当前回合结束后可发送" : undefined}
-        onClick={() => {
-          store.markSent();
-          sendUserText(text);
-        }}
-      >
-        发送选择
-      </Button>
+    <div className="oc-surface-card mt-2.5 flex flex-col gap-2.5 rounded-2xl px-4 py-3">
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+        {/* 计数走 live region:读屏用户点选后能听到进度,而不是只看得见。 */}
+        <output aria-live="polite" className="min-w-0 text-meta text-muted">
+          已作答{" "}
+          <span className="inline-flex items-center rounded-md bg-accent-soft px-1.5 py-0.5 font-mono text-caption font-semibold tabular-nums text-accent">
+            {snap.answered} / {snap.count}
+          </span>{" "}
+          题
+          {hint ? <span className="text-faint"> —— {hint}</span> : null}
+        </output>
+        <div className="flex shrink-0 items-center gap-2">
+          <button
+            type="button"
+            aria-expanded={noteOpen}
+            disabled={blockedByBusy}
+            onClick={() => setNoteOpen((v) => !v)}
+            className="oc-btn-tactile rounded-md px-2 py-1 text-caption font-medium text-muted transition-colors hover:bg-hover hover:text-fg disabled:opacity-40 [@media(hover:none)]:min-h-11"
+          >
+            {noteOpen ? "收起补充说明" : "补充说明"}
+          </button>
+          <Button
+            type="button"
+            variant="accent"
+            size="sm"
+            className="oc-btn-tactile oc-btn-accent-craft"
+            disabled={!ready || blockedByBusy}
+            title={blockedByBusy ? "等待当前回合结束后可发送" : undefined}
+            onClick={() => {
+              store.markSent();
+              sendUserText(text);
+            }}
+          >
+            发送选择
+          </Button>
+        </div>
+      </div>
+      {noteOpen && (
+        <input
+          type="text"
+          aria-label="多题补充说明"
+          data-testid="options-group-note-input"
+          value={groupNote}
+          disabled={blockedByBusy}
+          onChange={(e) => setGroupNote(e.target.value)}
+          placeholder="选填：输入统一补充要求，随选择一并发出"
+          className="oc-surface-recessed w-full rounded-lg border border-border-control/70 bg-elevated px-3 py-1.5 text-base text-fg outline-none transition-[border-color,box-shadow] focus:border-accent focus-visible:ring-2 focus-visible:ring-ring md:text-meta"
+        />
+      )}
     </div>
   );
 }

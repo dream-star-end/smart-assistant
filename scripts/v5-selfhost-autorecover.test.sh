@@ -274,5 +274,118 @@ if [[ -z "$tk23_early" && "$(inc ticket)" == OCV5-900 && "$(inc attempts)" == 0 
   ok "A23 legacy incident.env without lock_skip_* fields is backward-compatible"
 else bad "A23 early=$tk23_early tk=$(inc ticket) at=$(inc attempts) tasks=$(cat "$C/task.calls" 2>/dev/null)"; fi
 
+# ── OCV5-818 Stage 4: 发布列车 / survivor 阻塞期间不空耗 1800s 升级时钟,仍受 AR_LOCK_SKIP_MAX_SEC 上限约束 ──
+setup a24; printf 'reason=deps-pg\n' >"$C/watch/watch-disarmed"; echo 1 >"$C/watch.rc"
+tick 1000; tick 1010            # attempt 1 → rc=1
+tick 1310; tick 1320            # attempt 2 → rc=1
+touch "$C/deploy.running"
+tick 2000; tick 2810; tick 4200 # 37 分钟发布列车占住不抢分支
+rm -f "$C/deploy.running"
+echo 0 >"$C/watch.rc"
+tick 4242                       # wall-clock 3242s (>1800s), 但扣除 2242s 发布阻塞后有效 1000s → 不升级,立即发第 3 次
+tk24_mid="$(inc ticket)"; lsec24="$(inc lock_skip_sec)"; at24="$(inc attempts)"
+tick 4252; tick 4262
+if [[ -z "$tk24_mid" && "$lsec24" == 2242 && "$at24" == 3 && ! -f "$C/task.calls" && ! -f "$C/state/incident.env" ]]; then
+  ok "A24 long deploy train (>30m) is excluded from 1800s escalation clock; attempt 3 recovers with zero false tickets"
+else
+  bad "A24 mid_tk=$tk24_mid lsec=$lsec24 at=$at24 tasks=$(cat "$C/task.calls" 2>/dev/null) inc=$(cat "$C/state/incident.env" 2>/dev/null)"
+fi
+
+setup a25; printf 'reason=deps-pg\n' >"$C/watch/watch-disarmed"; echo 1 >"$C/watch.rc"
+touch "$C/active.openclaude-v5-selfhost-cutover-watch.service"
+tick 1000; tick 2900            # survivor 占住 1900s (>1800s, <7200s) → 不升级
+tk25_early="$(inc ticket)"
+rm -f "$C/active.openclaude-v5-selfhost-cutover-watch.service"
+tick 3000                       # survivor 结束 → 扣除 2000s, 启动第 1 次恢复
+lsec25="$(inc lock_skip_sec)"; at25="$(inc attempts)"; tk25_after="$(inc ticket)"
+# 发布持续卡死超 AR_LOCK_SKIP_MAX_SEC 仍触发有界升级
+setup a25b; printf 'reason=deps-pg\n' >"$C/watch/watch-disarmed"; touch "$C/deploy.running"
+AR_LOCK_SKIP_MAX_SEC=600 tick 1000; AR_LOCK_SKIP_MAX_SEC=600 tick 1600
+if [[ -z "$tk25_early" && -z "$tk25_after" && "$lsec25" == 2000 && "$at25" == 1 \
+  && "$(inc ticket)" == OCV5-900 ]] && grep -q '恢复锁持续占用超过 600s' "$C/task.calls"; then
+  ok "A25 survivor wait excluded from 1800s clock; stuck deploy still escalates at AR_LOCK_SKIP_MAX_SEC"
+else
+  bad "A25 early=$tk25_early after=$tk25_after lsec=$lsec25 at=$at25 b_tk=$(inc ticket) tasks=$(cat "$C/task.calls" 2>/dev/null)"
+fi
+
+setup a26; printf 'reason=deps-pg\n' >"$C/watch/watch-disarmed"; echo 1 >"$C/watch.rc"
+tick 1000                       # attempt 1 写了 AR_RESULT(rc=1), 下拍还没读时发布启动
+touch "$C/deploy.running"
+tick 1330; tick 3530            # 2200s 发布阻塞期间 AR_RESULT 留在盘上
+rm -f "$C/deploy.running"
+tick 3540                       # 先结算 2210s wait 再读 AR_RESULT, 不因陈旧 last=1000 丢掉等待时长
+if [[ "$(inc lock_skip_sec)" == 2210 && -z "$(inc ticket)" ]]; then
+  ok "A26 pending AR_RESULT across deploy wait preserves full wait duration without stale-last truncation"
+else
+  bad "A26 lsec=$(inc lock_skip_sec) tk=$(inc ticket) inc=$(cat "$C/state/incident.env" 2>/dev/null)"
+fi
+
+# ── OCV5-818 Stage 4 (Audit #4 Order 1): 待消费 rc=75 + deploy.running 重叠不得重复计费误开 P1 ──
+setup a27; printf 'reason=deps-pg\n' >"$C/watch/watch-disarmed"; echo 75 >"$C/watch.rc"
+tick 1000                       # 发动作(last=1000), AR_RESULT 写入 rc=75
+touch "$C/deploy.running"
+tick 1010                       # 发布开始(wait 开窗 1010)
+rm -f "$C/deploy.running"
+tick 4700                       # 实际只过 3700s(<7200s); 区间并集 [1000,4700] 不得算成 3690+3700=7390
+if [[ -z "$(inc ticket)" && ! -f "$C/task.calls" && "$(inc attempts)" == 0 \
+  && "$(inc lock_skip_sec)" == 0 && "$(inc lock_skip_since)" == 1000 ]]; then
+  ok "A27 overlapping pending rc=75 and deploy wait merges as interval union (3700s, no double-count escalation)"
+else
+  bad "A27 tk=$(inc ticket) at=$(inc attempts) lsec=$(inc lock_skip_sec) lsince=$(inc lock_skip_since) tasks=$(cat "$C/task.calls" 2>/dev/null)"
+fi
+
+# ── OCV5-818 Stage 4 (Audit #4 Order 2): 反向交接 rc=75 → rc=1 待消费 → deploy.running 不得用旧 last 截掉发布等待 ──
+setup a28; printf 'reason=deps-pg\n' >"$C/watch/watch-disarmed"; echo 75 >"$C/watch.rc"
+tick 1000; tick 1010            # 消费 rc=75 → lock_skip_since=1000, last=0
+echo 1 >"$C/watch.rc"
+tick 2000                       # 发动作(last=2000), AR_RESULT 写入 rc=1
+touch "$C/deploy.running"
+tick 2010                       # 发布开始,保留 lock_skip_since=1000 并标记 had_wait=1
+rm -f "$C/deploy.running"
+tick 5000                       # 发布结束消费 rc=1: 按 now=5000 结算整段 4000s,不截成 last=2000(1000s)
+if [[ -z "$(inc ticket)" && "$(inc lock_skip_sec)" == 4000 && "$(inc lock_skip_since)" == 0 ]]; then
+  ok "A28 reverse handoff (rc=75 then pending rc=1 then deploy wait) credits full 4000s without truncation"
+else
+  bad "A28 tk=$(inc ticket) lsec=$(inc lock_skip_sec) lsince=$(inc lock_skip_since) inc=$(cat "$C/state/incident.env" 2>/dev/null)"
+fi
+
+# ── OCV5-818 Stage 4 (Audit #5): 前两次失败 + 第三次待消费 rc=75 遇发布阻塞不得用未结算 attempts 误开 P1 ──
+setup a29; printf 'reason=deps-pg\n' >"$C/watch/watch-disarmed"; echo 1 >"$C/watch.rc"
+tick 1000; tick 1010            # 第 1 次失败 (settled=1, last_rc=1)
+tick 1310; tick 1320            # 第 2 次失败 (settled=2, last_rc=1)
+echo 75 >"$C/watch.rc"
+tick 2220                       # 第 3 次发出 (attempts=3), AR_RESULT=75 尚未消费
+touch "$C/deploy.running"
+tick 2230                       # 遇发布阻塞: settled_attempts=2 < 3, 绝不能凭旧 last_rc=1 误开 P1
+tk29_during="$(inc ticket)"
+rm -f "$C/deploy.running"
+tick 2500                       # 解阻消费 rc=75 → attempts 退回 2, 仍不开单
+if [[ -z "$tk29_during" && -z "$(inc ticket)" && ! -f "$C/task.calls" && "$(inc attempts)" == 2 ]]; then
+  ok "A29 unsettled 3rd attempt (pending rc=75) during deploy wait does not trigger false AR_RESTORE_MAX escalation"
+else
+  bad "A29 during=$tk29_during tk=$(inc ticket) at=$(inc attempts) tasks=$(cat "$C/task.calls" 2>/dev/null)"
+fi
+
+# ── OCV5-818 Stage 4 (Audit R2 #5): 动作在 is-active 瞬时窗口写完 rc=75 并退出,ar_settled_attempts 仍必须判为未结算(2而非3) ──
+setup a30; printf 'reason=deps-pg\n' >"$C/watch/watch-disarmed"
+printf 'id=ar-race\nstarted=1000\nattempts=3\nlast=2220\nlast_rc=1\nlast_out=AUTORECOVER_STILL_RED\nlock_skip_sec=0\nlock_skip_since=0\n' >"$C/state/incident.env"
+cat >"$C/race-systemctl" <<EOS
+#!/usr/bin/env bash
+if [[ "\$1" == is-active && "\$2" == openclaude-v5-selfhost-autorecover-action.service ]]; then
+  # 模拟动作恰在 is-active 观察窗口内原子发布 AR_RESULT(rc=75) 并退出
+  printf 'rc=75\nout=AUTORECOVER_SKIP lock\nat=2230\n' >"$C/state/action.result"
+  echo inactive; exit 3
+fi
+echo inactive; exit 3
+EOS
+chmod 0755 "$C/race-systemctl"
+touch "$C/deploy.running"
+OC_V5_AUTORECOVER_SYSTEMCTL="$C/race-systemctl" tick 2230
+if [[ -z "$(inc ticket)" && ! -f "$C/task.calls" && -f "$C/state/action.result" ]]; then
+  ok "A30 action finishing with rc=75 mid-check during deploy wait still counts as settled=2 (race-free order)"
+else
+  bad "A30 tk=$(inc ticket) tasks=$(cat "$C/task.calls" 2>/dev/null) res=$([[ -f "$C/state/action.result" ]] && echo y || echo n)"
+fi
+
 echo "autorecover: pass=$pass fail=$fail"
 [[ "$fail" == 0 ]]

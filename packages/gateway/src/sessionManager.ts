@@ -149,6 +149,7 @@ import {
   modelHistoryRoleLabel,
   modelHistorySemanticRole,
   modelHistorySemanticText,
+  projectModelHistoryForReplay,
   type ModelHistorySemanticRole,
   type TurnWaiveReason,
   type DurableAgentGroup,
@@ -197,7 +198,7 @@ import { type TurnRunnerHost, _runOneTurn as _runOneTurnImpl, runOneTurnWithRetr
 import { type SessionSubmitHost, submit as submitImpl, _getOrCreateExclusive as _getOrCreateExclusiveImpl, getOrCreate as getOrCreateImpl, finishIdleUnderLock as finishIdleUnderLockImpl, recordExternalTurn as recordExternalTurnImpl, beginExternalTurn as beginExternalTurnImpl, _resumeIdFor as _resumeIdForImpl, _resolveDurableResumeId as _resolveDurableResumeIdImpl } from './sessionSubmit.js'
 import { type SessionTailHost, _persistTailBatch as _persistTailBatchImpl, _dispatchPostTerminalRuntimeEvent as _dispatchPostTerminalRuntimeEventImpl, _foldPostTerminalTail as _foldPostTerminalTailImpl, _drainTailFolding as _drainTailFoldingImpl, _drainTailPersistQueue as _drainTailPersistQueueImpl, _buildTailCapMarker as _buildTailCapMarkerImpl, _scheduleTailPersistWorker as _scheduleTailPersistWorkerImpl, _chainTailPersist as _chainTailPersistImpl, _trackPersistence as _trackPersistenceImpl, _warnMissingPostTerminalOwner as _warnMissingPostTerminalOwnerImpl } from './sessionTail.js'
 import { type SessionAgentGroupsHost, deliverLateDelegateAgentGroup as deliverLateDelegateAgentGroupImpl, bufferPendingAgentGroup as bufferPendingAgentGroupImpl, drainPendingAgentGroups as drainPendingAgentGroupsImpl, _settleDrainedOwnerGroups as _settleDrainedOwnerGroupsImpl, _claimDrainedOwnerGroups as _claimDrainedOwnerGroupsImpl, _sealOwnerTurn as _sealOwnerTurnImpl, _runOnOwnerChain as _runOnOwnerChainImpl, _admitExactOwnerRun as _admitExactOwnerRunImpl, _matchLiveSessionsOwnerRun as _matchLiveSessionsOwnerRunImpl, _matchLiveOwnerRun as _matchLiveOwnerRunImpl, _trimExactOwnerRuns as _trimExactOwnerRunsImpl } from './sessionAgentGroups.js'
-import { type SessionLifecycleHost, preheatRunner as preheatRunnerImpl, recyclePeerForRepoChange as recyclePeerForRepoChangeImpl, recyclePeerForRepoUnbind as recyclePeerForRepoUnbindImpl, startEvictionLoop as startEvictionLoopImpl, shutdownAll as shutdownAllImpl, destroySession as destroySessionImpl, retireKeepResume as retireKeepResumeImpl, scheduleIdleDrain as scheduleIdleDrainImpl, applyIdleResetIfRequested as applyIdleResetIfRequestedImpl, _ccbJsonlExists as _ccbJsonlExistsImpl, _cursorWorkspacePath as _cursorWorkspacePathImpl, setExecutionTarget as setExecutionTargetImpl, prepareModelSwitch as prepareModelSwitchImpl, armRuntimeRecycleDrain as armRuntimeRecycleDrainImpl } from './sessionLifecycle.js'
+import { type SessionLifecycleHost, type EvictionPassResult, preheatRunner as preheatRunnerImpl, recyclePeerForRepoChange as recyclePeerForRepoChangeImpl, recyclePeerForRepoUnbind as recyclePeerForRepoUnbindImpl, runEvictionPass as runEvictionPassImpl, startEvictionLoop as startEvictionLoopImpl, shutdownAll as shutdownAllImpl, destroySession as destroySessionImpl, retireKeepResume as retireKeepResumeImpl, scheduleIdleDrain as scheduleIdleDrainImpl, applyIdleResetIfRequested as applyIdleResetIfRequestedImpl, _ccbJsonlExists as _ccbJsonlExistsImpl, _cursorWorkspacePath as _cursorWorkspacePathImpl, setExecutionTarget as setExecutionTargetImpl, prepareModelSwitch as prepareModelSwitchImpl, armRuntimeRecycleDrain as armRuntimeRecycleDrainImpl } from './sessionLifecycle.js'
 // Moved to ./sessionTypes.js (FINDINGS §7.6, OCV5-480); re-exported for existing importers.
 export type { AgentSession } from './sessionTypes.js'
 import type { AgentSession } from './sessionTypes.js'
@@ -459,28 +460,46 @@ export function buildHistoricalContextPrompt(
 ): string | null {
   const promptUserText = includeCurrentUserText ? currentUserText : ''
   const currentNorm = normForCompare(currentUserText)
-  const rows: Array<{ role: ModelHistorySemanticRole; text: string; status?: unknown }> = []
-  for (const raw of messages) {
-    if (!raw || typeof raw !== 'object') continue
+  // Drop trailing optimistic/duplicate current user message before replay decay so
+  // the last 2 prior user turns keep full tool outputs while older tool/delegate rows decay.
+  let end = messages.length
+  while (end > 0) {
+    const raw = messages[end - 1]
+    if (!raw || typeof raw !== 'object') {
+      end -= 1
+      continue
+    }
     const msg = raw as ChatHistoryMessage
-    if (msg.system === true) continue
+    if (msg.system === true) {
+      end -= 1
+      continue
+    }
     const role = modelHistorySemanticRole(msg)
-    if (!role) continue
+    if (!role) {
+      end -= 1
+      continue
+    }
     const text = modelHistorySemanticText(msg).trim()
-    if (!text) continue
-    rows.push({ role, text, status: msg.status })
-  }
-  while (rows.length > 0) {
-    const last = rows[rows.length - 1]
-    const lastNorm = normForCompare(last.text)
+    if (!text) {
+      end -= 1
+      continue
+    }
+    const lastNorm = normForCompare(text)
     const isCurrent =
-      last.role === 'user' &&
-      (last.status === 'sending' ||
-        last.status === 'queued' ||
+      role === 'user' &&
+      (msg.status === 'sending' ||
+        msg.status === 'queued' ||
         (currentNorm && (lastNorm === currentNorm || currentNorm.startsWith(lastNorm))))
     if (!isCurrent) break
-    rows.pop()
+    end -= 1
   }
+  const rows = projectModelHistoryForReplay(messages.slice(0, end), { recentFullTurns: 2 }).map(
+    (item) => ({
+      role: item.role,
+      text: item.text,
+      status: (item.raw as ChatHistoryMessage)?.status,
+    }),
+  )
   if (rows.length === 0) return null
   const renderPrompt = (
     selectedRows: Array<{ role: ModelHistorySemanticRole; text: string }>,
@@ -575,6 +594,23 @@ export function buildNativeModelHandoffPayload(
     { type: 'text', text: buildNativeModelHandoffContext(summaryText, mediaPathHints) },
     ...currentUserInput,
   ]
+}
+
+/** OCV5-840: Wrap a Rolling Checkpoint Reset summary for one-shot next-turn injection. */
+export function buildRollingCheckpointPayload(
+  summaryText: string,
+  currentUserInput: string | Array<{ type: string; [key: string]: unknown }>,
+): string | Array<{ type: string; [key: string]: unknown }> {
+  const ctx = [
+    '<openclaude_rolling_checkpoint>',
+    'The user compacted this session context. Use this bounded checkpoint summary as prior conversation context and continue from here without replaying earlier verbose outputs.',
+    summaryText.trim(),
+    '</openclaude_rolling_checkpoint>',
+  ].join('\n')
+  if (typeof currentUserInput === 'string') {
+    return [ctx, '', '<current_user_message>', currentUserInput, '</current_user_message>'].join('\n')
+  }
+  return [{ type: 'text', text: ctx }, ...currentUserInput]
 }
 
 export function shouldAttemptHistoricalContextInjection(opts: {
@@ -1245,6 +1281,50 @@ export class SessionManager {
    * 所以一对一,Map<sessionId, sessionKey>。
    */
   private _sessionIdToKey = new Map<string, string>()
+
+  /** Resolve container-authoritative Antigravity swarm target for a sessionId (peerId). */
+  resolveAntigravitySwarmTarget(sessionId: string): {
+    sessionKey: string
+    brainDir?: string
+    conversationId?: string
+  } | null {
+    let sessionKey = this._sessionIdToKey.get(sessionId)
+    if (!sessionKey) {
+      const liveMatches: string[] = []
+      for (const s of this.sessions.values()) {
+        if (s.peerId === sessionId) {
+          liveMatches.push(s.sessionKey)
+        }
+      }
+      if (liveMatches.length > 1) return null
+      sessionKey = liveMatches[0]
+    }
+    if (!sessionKey) {
+      const suffix = `:${sessionId}`
+      const resumeMatches: string[] = []
+      for (const key of this._resumeMap.keys()) {
+        if (key.endsWith(suffix)) {
+          resumeMatches.push(key)
+        }
+      }
+      // B6 (OCV5-832 R2): Cold recovery without an active live binding MUST prove a unique
+      // agent sessionKey in `_resumeMap`. Multiple historical keys for the same peer are
+      // ambiguous and fail closed (`null` -> 404 SWARM_NOT_FOUND) rather than picking map order.
+      if (resumeMatches.length !== 1) return null
+      sessionKey = resumeMatches[0]
+    }
+    if (!sessionKey) return null
+    const live = this.sessions.get(sessionKey)
+    const runner = live?.runner as
+      | { getActiveSwarmTarget?: () => { brainDir: string; conversationId: string } | null }
+      | undefined
+    const activeTarget = runner?.getActiveSwarmTarget?.()
+    if (activeTarget) {
+      return { sessionKey, brainDir: activeTarget.brainDir, conversationId: activeTarget.conversationId }
+    }
+    const conversationId = live?.ccbSessionId ?? this._resumeMap.get(sessionKey)
+    return { sessionKey, ...(conversationId ? { conversationId } : {}) }
+  }
 
   /**
    * 由 server.ts 在 Gateway 构造器里调,把 _repoWorkspace.getRepoSnapshot 注入。
@@ -2154,6 +2234,7 @@ export class SessionManager {
       modelSwitchId?: string
       /** Native compact command authored by prepareModelSwitch itself. */
       modelSwitchInternal?: string
+      _internalCompact?: boolean
     }): Promise<void> {
     return submitImpl.call(this as unknown as SessionSubmitHost, session, userTextOrBlocks, onEvent, effortLevel, model, requestId, traceId, conversationMode, opts)
   }
@@ -2478,8 +2559,11 @@ export class SessionManager {
    * later getOrCreate(sessionKey) can native-resume. Awaited by resumable
    * delegate_task; fire-and-forget destroySession remains the one-shot path.
    */
-  retireKeepResume(sessionKey: string): Promise<void> {
-    return retireKeepResumeImpl.call(this as unknown as SessionLifecycleHost, sessionKey)
+  retireKeepResume(
+    sessionKey: string,
+    opts?: { expectedSession?: AgentSession; onlyIfIdle?: boolean },
+  ): Promise<void> {
+    return retireKeepResumeImpl.call(this as unknown as SessionLifecycleHost, sessionKey, opts)
   }
 
   hasLiveSession(sessionKey: string): boolean {
@@ -2532,6 +2616,10 @@ export class SessionManager {
   }
 
   // 周期性 LRU 驱逐 — webchat sessions survive much longer than cron/task sessions
+  runEvictionPass(): Promise<EvictionPassResult> {
+    return runEvictionPassImpl.call(this as unknown as SessionLifecycleHost)
+  }
+
   startEvictionLoop(intervalMs = 60_000): () => void {
     return startEvictionLoopImpl.call(this as unknown as SessionLifecycleHost, intervalMs)
   }

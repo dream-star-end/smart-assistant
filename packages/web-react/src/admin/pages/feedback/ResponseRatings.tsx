@@ -1,4 +1,4 @@
-import { Link2, MessageSquare, ThumbsDown, ThumbsUp, TrendingUp, Users } from "lucide-react";
+import { BarChart3, Link2, MessageSquare, ThumbsDown, ThumbsUp, TrendingUp, Users } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, Badge, Button } from "../../../components/ui";
 import {
@@ -46,6 +46,13 @@ function rateTone(
   if (rate >= 0.9) return "success";
   if (rate >= 0.7) return "warning";
   return "danger";
+}
+
+function rateBarColor(rate: number | null): string {
+  if (rate === null) return "bg-muted";
+  if (rate >= 0.9) return "bg-success";
+  if (rate >= 0.7) return "bg-warning";
+  return "bg-danger";
 }
 
 function interval(bucket: RatingBucket | undefined): string {
@@ -132,36 +139,47 @@ export function ResponseRatings() {
       key: "model",
       title: "模型",
       render: (m) => (
-        <span className="font-mono text-meta text-fg">{m.model ?? "（未标注）"}</span>
+        <span className="font-mono text-meta font-medium text-fg">{m.model ?? "（未标注）"}</span>
       ),
     },
     {
       key: "up",
       title: "好评",
       align: "right",
-      width: 72,
-      cellClassName: "tabular-nums",
+      width: 68,
+      cellClassName: "tabular-nums text-success font-medium",
       render: (m) => m.up,
     },
     {
       key: "down",
       title: "差评",
       align: "right",
-      width: 72,
-      cellClassName: "tabular-nums",
+      width: 68,
+      cellClassName: "tabular-nums text-danger font-medium",
       render: (m) => m.down,
     },
     {
       key: "up_rate",
       title: "好评率",
       align: "right",
-      width: 96,
-      render: (m) => (
-        <Badge tone={rateTone(m.up_rate, m.sample_note)} title={interval(m)}>
-          {pct(m.up_rate)}
-          {m.sample_note === "small_sample" ? " · 样本少" : ""}
-        </Badge>
-      ),
+      width: 210,
+      render: (m) => {
+        const fillWidth = m.up_rate === null ? 0 : Math.max(0, Math.min(100, m.up_rate * 100));
+        return (
+          <div className="flex items-center justify-end gap-2.5" title={interval(m)}>
+            <div className="oc-surface-recessed hidden h-2 w-20 overflow-hidden rounded-full sm:block">
+              <div
+                className={`oc-progress-fill h-full rounded-full ${rateBarColor(m.up_rate)}`}
+                style={{ width: `${fillWidth}%` }}
+              />
+            </div>
+            <Badge tone={rateTone(m.up_rate, m.sample_note)} className="tabular-nums">
+              {pct(m.up_rate)}
+              {m.sample_note === "small_sample" ? " · 样本少" : ""}
+            </Badge>
+          </div>
+        );
+      },
     },
   ];
 
@@ -180,14 +198,14 @@ export function ResponseRatings() {
       render: (r) => (
         <div className="min-w-0">
           {r.comment ? (
-            <span className="line-clamp-2 max-w-[26rem] text-muted" title={r.comment}>
+            <span className="line-clamp-2 max-w-[26rem] text-body text-muted" title={r.comment}>
               {r.comment}
             </span>
           ) : (
             <span className="text-faint">（无评论）</span>
           )}
           {r.tags.length > 0 && (
-            <div className="mt-1 flex flex-wrap gap-1">
+            <div className="mt-1.5 flex flex-wrap gap-1">
               {r.tags.map((t) => (
                 <Badge key={t} tone="neutral">
                   {t}
@@ -229,7 +247,7 @@ export function ResponseRatings() {
       key: "created_at",
       title: "时间",
       width: 96,
-      render: (r) => <TimeAgo value={r.created_at} className="text-meta text-muted" />,
+      render: (r) => <TimeAgo value={r.created_at} className="text-meta tabular-nums text-muted" />,
     },
   ];
 
@@ -237,8 +255,14 @@ export function ResponseRatings() {
     return <Alert tone="danger">加载评分统计失败：{apiErrorMessage(error, "加载失败")}</Alert>;
   }
 
+  const periods: { key: string; label: string; bucket: RatingBucket | undefined }[] = [
+    { key: "7d", label: "近 7 天", bucket: stats?.last_7d },
+    { key: "30d", label: "近 30 天", bucket: stats?.last_30d },
+    { key: "all", label: "全部时间", bucket: stats?.overall },
+  ];
+
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-5">
       <FilterBar>
         <SelectFilter
           label="流量"
@@ -330,24 +354,68 @@ export function ResponseRatings() {
         />
       </StatCardRow>
 
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
-        <ChartCard title="好评 / 差评构成" hint="全部时间" height={240}>
-          {(overall?.total ?? 0) === 0 ? (
-            <div className="flex h-full items-center justify-center text-meta text-faint">
-              暂无评分
-            </div>
-          ) : (
-            <canvas ref={chartRef} />
-          )}
-        </ChartCard>
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[340px_minmax(0,1fr)]">
+        <div className="flex flex-col gap-4">
+          <ChartCard title="好评 / 差评构成" hint="全部时间" height={220}>
+            {(overall?.total ?? 0) === 0 ? (
+              <div className="flex h-full items-center justify-center text-meta text-faint">
+                暂无评分
+              </div>
+            ) : (
+              <canvas ref={chartRef} />
+            )}
+          </ChartCard>
 
-        <SectionCard title="分模型好评率" hint="按评分总量降序" bodyClassName="px-0 py-0">
+          <div className="oc-surface-card rounded-xl p-4">
+            <div className="mb-3 flex items-center gap-2">
+              <span className="oc-icon-badge oc-icon-badge-success size-7 rounded-lg">
+                <BarChart3 size={14} strokeWidth={2} />
+              </span>
+              <span className="text-body font-semibold text-fg">窗口好评率分布</span>
+            </div>
+            <div className="flex flex-col gap-3">
+              {periods.map(({ key, label, bucket }) => {
+                const fillWidth =
+                  bucket && bucket.up_rate !== null
+                    ? Math.max(0, Math.min(100, bucket.up_rate * 100))
+                    : 0;
+                return (
+                  <div key={key}>
+                    <div className="mb-1 flex items-center justify-between text-caption">
+                      <span className="font-medium text-muted">{label}</span>
+                      <span className="font-mono tabular-nums text-fg">
+                        {pct(bucket?.up_rate ?? null)}
+                        <span className="ml-1.5 text-faint">
+                          ({bucket?.up ?? 0}/{bucket?.total ?? 0})
+                        </span>
+                      </span>
+                    </div>
+                    <div className="oc-surface-recessed h-2 w-full overflow-hidden rounded-full">
+                      <div
+                        className={`oc-progress-fill h-full rounded-full transition-[width] duration-300 ${rateBarColor(bucket?.up_rate ?? null)}`}
+                        style={{ width: `${fillWidth}%` }}
+                      />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+
+        <SectionCard
+          title="分模型好评率"
+          hint="按评分总量降序"
+          icon={ThumbsUp}
+          iconTone="success"
+          bodyClassName="px-0 py-0"
+        >
           <DataTable
             columns={modelColumns}
             rows={stats?.by_model ?? []}
             rowKey={(m) => m.model ?? "__null__"}
             loading={loading}
-            className="rounded-none border-0"
+            className="rounded-none border-0 shadow-none"
             emptyTitle="暂无评分"
           />
         </SectionCard>
@@ -355,6 +423,8 @@ export function ResponseRatings() {
 
       <SectionCard
         title="最近差评"
+        icon={ThumbsDown}
+        iconTone="danger"
         hint={
           source === "explicit"
             ? "用户主动点踩，可复制 trace_id 反查全链路"
@@ -370,7 +440,7 @@ export function ResponseRatings() {
               requestSeqRef.current += 1;
               setSource(event.target.value as DownRatingSource);
             }}
-            className="h-8 rounded-md border border-border bg-surface px-2.5 text-meta text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
+            className="oc-field-control h-8 rounded-lg border border-border px-2.5 text-meta text-fg outline-none"
           >
             <option value="explicit">用户主动点踩</option>
             <option value="implicit">行为弱信号</option>
@@ -384,17 +454,25 @@ export function ResponseRatings() {
           rows={downRows}
           rowKey={(r) => r.id}
           loading={loading}
-          className="rounded-none border-0"
+          className="rounded-none border-0 shadow-none"
           emptyTitle="暂无差评"
           emptyHint="没有收到差评，继续保持。"
+          footer={
+            !done && downRows.length > 0 ? (
+              <div className="flex justify-center">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => fetchPage(false)}
+                  disabled={loadingMore}
+                  className="oc-btn-tactile"
+                >
+                  {loadingMore ? "加载中…" : "加载更多"}
+                </Button>
+              </div>
+            ) : undefined
+          }
         />
-        {!done && downRows.length > 0 && (
-          <div className="flex justify-center border-t border-border py-3">
-            <Button variant="secondary" size="sm" onClick={() => fetchPage(false)} disabled={loadingMore}>
-              {loadingMore ? "加载中…" : "加载更多"}
-            </Button>
-          </div>
-        )}
       </SectionCard>
     </div>
   );

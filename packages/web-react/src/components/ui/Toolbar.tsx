@@ -68,25 +68,25 @@ export function Toolbar({
   return (
     <div
       className={cn(
-        "flex flex-wrap items-center gap-2 border-b border-border bg-surface px-4 py-2.5",
+        "flex flex-wrap items-center gap-2 border-b border-border bg-surface/92 px-4 py-2.5 backdrop-blur-md",
         sticky && "sticky top-0 z-10",
         className,
       )}
     >
       {(title || count != null) && (
         <div className="flex min-w-0 shrink-0 items-center gap-1.5">
-          {title && <h3 className="truncate text-section font-semibold text-fg">{title}</h3>}
+          {title && <h3 className="truncate text-section font-semibold tracking-tight text-fg">{title}</h3>}
           {count != null && <Badge size="sm">{groupDigits(String(count))}</Badge>}
         </div>
       )}
 
       {onSearchChange && (
         // 安静表面(管理中心)里搜索框占满内容列 —— 64 宽的半截框右侧留一大片空白(OCV5-362)。
-        <div className={cn("relative min-w-0 flex-1", !quiet && "sm:max-w-64")}>
+        <div className={cn("group relative min-w-0 flex-1", !quiet && "sm:max-w-64")}>
           <Search
             size={15}
             aria-hidden="true"
-            className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint"
+            className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint transition-colors duration-150 group-focus-within:text-accent"
           />
           <Input
             // type=search 让浏览器给出原生清除按钮 —— 自绘一个 ✕ 在触屏上要占满
@@ -98,11 +98,11 @@ export function Toolbar({
             aria-label={typeof title === "string" ? `搜索${title}` : searchPlaceholder}
             // 触控靶不在这里补:Input 的 controlSurfaceClass 自带
             // `[@media(hover:none)]:min-h-11`,调用方再补一遍就是本批要消灭的那种补丁。
-            // 安静表面(管理中心):无边框的浅填充搜索框,与记忆分区的搜索同一形态。
+            // 安静表面(管理中心):微凹浅填充搜索框,与记忆分区的搜索同一形态。
             className={cn(
               "w-full pl-9",
               quiet &&
-                "h-9 border-transparent bg-hover transition-colors hover:bg-active focus:bg-surface max-md:h-10",
+                "oc-surface-recessed h-9 border-transparent bg-hover transition-[background-color,border-color,box-shadow] hover:bg-active focus:border-accent/40 focus:bg-surface max-md:h-10",
             )}
           />
         </div>

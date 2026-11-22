@@ -1,4 +1,12 @@
-import { Download, Inbox, RotateCw } from "lucide-react";
+import {
+  ArrowDownLeft,
+  ArrowUpRight,
+  Download,
+  Inbox,
+  RotateCw,
+  Scale,
+  ScrollText,
+} from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button, EmptyState, Input, useToast } from "../../../components/ui";
 import {
@@ -313,6 +321,7 @@ export default function LedgerPage() {
   return (
     <div className="flex flex-col gap-5">
       <PageHeader
+        icon={ScrollText}
         title={meta.title}
         desc={meta.desc}
         actions={
@@ -329,8 +338,9 @@ export default function LedgerPage() {
         }
       />
 
-      <StatCardRow className="lg:grid-cols-3">
+      <StatCardRow cols={3}>
         <StatCard
+          icon={ArrowDownLeft}
           label="总入账"
           value={fmtCents(agg.totalIn)}
           hint={`当前 ${rows.length} 条${done ? "" : "+"}`}
@@ -338,6 +348,7 @@ export default function LedgerPage() {
           loading={loading}
         />
         <StatCard
+          icon={ArrowUpRight}
           label="总扣减"
           value={fmtCents(-agg.totalOut)}
           hint="支出合计"
@@ -345,6 +356,7 @@ export default function LedgerPage() {
           loading={loading}
         />
         <StatCard
+          icon={Scale}
           label="净额"
           value={fmtCents(agg.net)}
           hint="入账 − 扣减"
@@ -367,7 +379,7 @@ export default function LedgerPage() {
             value={dUser}
             onChange={(e) => setDUser(e.target.value)}
             placeholder="user_id 过滤"
-            className="h-9 w-full sm:w-44"
+            className="oc-field-control h-9 w-full font-mono sm:w-44"
             onKeyDown={(e) => {
               if (e.key === "Enter") apply();
             }}
@@ -384,7 +396,7 @@ export default function LedgerPage() {
               type="datetime-local"
               value={dFrom}
               onChange={(e) => setDFrom(e.target.value)}
-              className="h-9 w-auto"
+              className="oc-field-control h-9 w-auto tabular-nums"
             />
           </label>
           <label className="flex items-center gap-1.5 text-meta text-muted">
@@ -393,7 +405,7 @@ export default function LedgerPage() {
               type="datetime-local"
               value={dTo}
               onChange={(e) => setDTo(e.target.value)}
-              className="h-9 w-auto"
+              className="oc-field-control h-9 w-auto tabular-nums"
             />
           </label>
           <Button variant="primary" size="sm" onClick={apply}>
@@ -405,16 +417,18 @@ export default function LedgerPage() {
         </FilterBar>
 
         {error ? (
-          <EmptyState
-            icon={Inbox}
-            title="加载失败"
-            hint={apiErrorMessage(error, "加载失败")}
-            action={
-              <Button variant="secondary" size="sm" onClick={() => setReloadTick((t) => t + 1)}>
-                重试
-              </Button>
-            }
-          />
+          <div className="oc-surface-card rounded-xl">
+            <EmptyState
+              icon={Inbox}
+              title="加载失败"
+              hint={apiErrorMessage(error, "加载失败")}
+              action={
+                <Button variant="secondary" size="sm" onClick={() => setReloadTick((t) => t + 1)}>
+                  重试
+                </Button>
+              }
+            />
+          </div>
         ) : (
           <>
             <DataTable

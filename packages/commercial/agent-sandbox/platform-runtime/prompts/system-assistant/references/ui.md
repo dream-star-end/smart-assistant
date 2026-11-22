@@ -44,6 +44,7 @@
 - prompt_template:{"type":"prompt_template","template":"含{{slot}}的模板","slots":[{"id","label","value"?,"options"?:[],"placeholder"?}],"submit"?} —— 可点选填空的提示词/公文模板卡
 - storyboard:{"type":"storyboard","cps"?:4.5,"shots":[{"no"?,"shotType"?,"line","prompt"?,"image"?,"duration"?}]} —— 视频分镜脚本卡(按语速重算时长、可编辑台词)
 - flashcards:{"type":"flashcards","cards":[{"front","back","tag"?,"hint"?}]} —— 双面记忆闪卡(正反翻面与掌握进度)
+- browser_handoff:{"type":"browser_handoff","title"?,"url"?,"reason"?,"action_label"?,"continue_label"?,"continue_prompt"?} —— 云端浏览器人工接管卡(遇登录/2FA/验证码/敏感确认时保持 oc-browser 打开并输出此卡,用户一键放大接管、完成后自动带登录态交还继续)
 
 ## 示例
 ```ui

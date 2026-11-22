@@ -43,6 +43,10 @@ jobs:
       - name: Run web-react unit tests
         run: npm run test:web-react
 
+      # OCV5-847 (Wave 2): 预览台场景独立类型检查（直调 tsc 绕过未锁 package.json）。
+      - name: Typecheck ui-preview scenes (typecheck:preview)
+        run: npx tsc -p packages/web-react/tsconfig.browser-tests.json --noEmit
+
   web-react-browser:
     # 与 v5-ci 的 web-react-browser 同一命令与同样的 runner 准备(CJK 字体 + 产物目录)。OCV5-355 清绿后加入:
     # 首次托管失败里 OCV5-265 正文高度断言就是缺 CJK 字体按回退字形排版造成的。
@@ -112,3 +116,7 @@ jobs:
       # continuation) live in scripts/lib and were never run by CI; same runner and browser.
       - name: Contract gate browser tests (scripts/lib)
         run: node --test scripts/lib/user-contract-*.test.mjs
+
+      # OCV5-847 (Wave 2): L2/L3 真实 Chromium 多视口×双主题布局不变量硬门（直调 A 类脚本，B 类基线只降不升）。
+      - name: L2/L3 layout invariants gate (core tier)
+        run: node packages/web-react/browser-tests/layout-invariants.mjs --tier core --baseline packages/web-react/layout-invariants-baseline.json

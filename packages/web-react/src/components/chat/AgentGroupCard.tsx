@@ -46,96 +46,6 @@ export function ProgressivePlainText({ text, className }: { text: string; classN
   );
 }
 
-function ProgressiveChildRaw({ text }: { text: string }) {
-  const [visibleChars, setVisibleChars] = useState(RAW_CHILD_STEP);
-  return (
-    <>
-      <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-xs leading-relaxed text-fg">
-        {text.slice(0, visibleChars)}
-      </pre>
-      {visibleChars < text.length && (
-        <button
-          type="button"
-          onClick={() => setVisibleChars((value) => value + RAW_CHILD_STEP)}
-          className="mx-auto mt-2 block rounded-full bg-hover px-3 py-1 text-xs text-muted hover:text-fg"
-        >
-          继续显示原始事件（还有 {(text.length - visibleChars).toLocaleString()} 个字符）
-        </button>
-      )}
-    </>
-  );
-}
-
-/** Records that are not a tool-use shell remain first-class process rows.
- * They are never dropped or summarized; large string fields mount in chunks. */
-const RAW_CHILD_FIELD_LABELS: Record<string, string> = {
-  output: "输出",
-  preview: "预览",
-  tail: "尾部输出",
-  error: "错误",
-  text: "正文",
-  explanation: "说明",
-  objective: "目标",
-};
-
-function RawChildEventView({ child }: { child: ChildBlock }) {
-  const [open, setOpen] = useState(false);
-  const source = child as ChildBlock & Record<string, unknown>;
-  const bulkFields = ["output", "preview", "tail", "error", "text", "explanation", "objective"];
-  const bulk: Array<{ name: string; text: string }> = [];
-  const metadata: Record<string, unknown> = { ...source };
-  for (const name of bulkFields) {
-    const value = source[name];
-    if (typeof value !== "string") continue;
-    bulk.push({ name, text: value });
-    delete metadata[name];
-  }
-  let serialized = "{}";
-  try {
-    serialized = JSON.stringify(metadata, null, 2) ?? "{}";
-  } catch {
-    serialized = "{}";
-  }
-  const label = child.kind === "tool_result"
-    ? `${child.toolName || "工具"} · 原始结果`
-    : child.kind === "tool_output_tail"
-      ? "终端输出快照"
-      : child.kind === "plan"
-        ? "子智能体计划事件"
-        : child.kind === "goal"
-          ? "子智能体目标事件"
-          : child.kind === "error"
-            ? "子智能体错误事件"
-            : child.kind === "final"
-              ? "子智能体终态事件"
-              : `原始事件 · ${child.kind}`;
-  return (
-    <div className="overflow-hidden rounded-lg border border-border/70 bg-bg">
-      <button
-        type="button"
-        onClick={() => setOpen((value) => !value)}
-        aria-expanded={open}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-muted hover:bg-hover"
-      >
-        <ChevronRight size={13} className={cn("shrink-0 transition-transform", open && "rotate-90")} />
-        <span className="min-w-0 flex-1 truncate">{label}</span>
-        {child.isError && <Badge tone="danger">失败</Badge>}
-      </button>
-      {open && (
-        <div className="space-y-3 border-t border-border/70 px-3 py-2.5">
-          {serialized !== "{}" && <ProgressiveChildRaw text={serialized} />}
-          {bulk.map((field) => (
-            <section key={field.name}>
-              <div className="mb-1 text-caption font-medium text-faint">{RAW_CHILD_FIELD_LABELS[field.name] ?? field.name}</div>
-              <ProgressiveChildRaw text={field.text} />
-            </section>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
 export const ChildBlockView = memo(
   function ChildBlockView({
     child,
@@ -167,13 +77,13 @@ export const ChildBlockView = memo(
     if (child.kind === "thinking") {
       if (!child.text) return null;
       return (
-        <div className="whitespace-pre-wrap break-words rounded-md bg-surface/60 px-3 py-2 text-[12.5px] leading-relaxed text-muted">
+        <div className="oc-surface-recessed whitespace-pre-wrap break-words rounded-lg border border-border/60 px-3 py-2 text-meta leading-relaxed text-muted">
           {child.text.slice(0, visibleChars)}
           {visibleChars < child.text.length && (
             <button
               type="button"
               onClick={() => setVisibleChars((value) => value + 64 * 1024)}
-              className="mt-2 block rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg"
+              className="oc-btn-tactile mt-2 block rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg"
             >
               继续显示思考内容
             </button>
@@ -189,10 +99,49 @@ export const ChildBlockView = memo(
         </div>
       );
     }
-    // Hydrated immutable transcripts intentionally retain result/tail/plan/
-    // goal/error/final event boundaries. Render every one rather than relying
-    // on the live reducer's combined tool card representation.
-    return <RawChildEventView child={child} />;
+    if (child.kind === "tool_result") {
+      return (
+        <ToolCardSlot
+          message={{
+            ...child,
+            kind: "tool_use",
+            toolName: child.toolName || "工具",
+            _completed: true,
+            error: child.isError,
+            output: child.output ?? child.preview,
+          }}
+        />
+      );
+    }
+    if (child.kind === "plan" && Array.isArray(child.steps) && child.steps.length > 0) {
+      return (
+        <ul className="oc-surface-recessed space-y-1 rounded-lg border border-border/60 px-3 py-2 text-meta text-muted">
+          {child.steps.map((s, idx) => (
+            <li key={`${idx}-${s.step}`} className="flex items-start gap-2">
+              <span className="mt-0.5 shrink-0 text-caption text-faint">
+                {s.status === "completed" ? "✓" : s.status === "in_progress" ? "●" : "○"}
+              </span>
+              <span className="min-w-0 break-words">{s.step}</span>
+            </li>
+          ))}
+        </ul>
+      );
+    }
+    if (child.kind === "error") {
+      const msgText = (child.text || child.preview || "").trim();
+      if (!msgText) return null;
+      return (
+        <div className="oc-callout oc-callout-danger rounded-lg px-3 py-2 text-meta text-danger">
+          {msgText}
+        </div>
+      );
+    }
+    if (child.kind === "goal") {
+      const goalText = (child.text || child.explanation || "").trim();
+      if (!goalText) return null;
+      return <div className="text-meta text-muted">{goalText}</div>;
+    }
+    return null;
   },
   (a, b) => a.sig === b.sig,
 );
@@ -217,23 +166,23 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
   const bodyId = useId();
 
   return (
-    <div className="rounded-lg border border-border bg-surface animate-in">
+    <div className="oc-surface-card overflow-hidden rounded-xl animate-in">
       {/* 折叠开关暴露展开态(aria-expanded/aria-controls,与 DelegateProgressCard 一致)。 */}
       <button
         type="button"
         onClick={() => setUserCollapsed(!collapsed)}
         aria-expanded={!collapsed}
         aria-controls={collapsed ? undefined : bodyId}
-        className="flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left hover:bg-hover [@media(hover:none)]:min-h-11"
+        className="flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left transition-colors hover:bg-hover/70 [@media(hover:none)]:min-h-11"
       >
-        <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent">
+        <span className="oc-icon-badge oc-icon-badge-accent flex size-6 shrink-0 items-center justify-center rounded-sm">
           {running ? <Spinner size={13} /> : <TerminalIcon tone={status.tone} size={13} />}
         </span>
         {/* 团队模式:谁接了这件事先写出来(体验官 P3「看不出委派」)。 */}
         {msg._delegateAgentId ? (
           <span data-testid="agent-group-assignee" className="shrink-0 text-body text-muted">{`委派给 ${agentDisplayName(msg._delegateAgentId)}`}</span>
         ) : null}
-        <span className="min-w-0 truncate text-body font-medium text-fg">{msg.text || "子任务"}</span>
+        <span className="min-w-0 truncate text-body font-semibold text-fg">{msg.text || "子任务"}</span>
         <span className="ml-auto flex max-w-[55%] flex-wrap items-center justify-end gap-x-2 gap-y-1">
           {running ? (
             <Badge tone="accent">运行中</Badge>
@@ -248,17 +197,18 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
           {verdict && <Badge tone={verdict.tone}>{verdict.label}</Badge>}
           <TokenUsageBadge usage={tokenUsage} label="子 Agent 合计" />
           {delegateCost && (
-            <span className="text-caption font-medium text-faint">{groupDigits(delegateCost)} 积分</span>
+            <span className="font-mono text-caption font-medium tabular-nums text-faint">{groupDigits(delegateCost)} 积分</span>
           )}
           <ChevronRight
             size={15}
-            className={cn("text-faint transition-transform", !collapsed && "rotate-90")}
+            strokeWidth={1.75}
+            className={cn("text-faint transition-transform duration-200 ease-[var(--ease-spring)]", !collapsed && "rotate-90")}
           />
         </span>
       </button>
 
       {!collapsed && (
-        <div id={bodyId} className="border-t border-border">
+        <div id={bodyId} className="border-t border-border/70">
           {children.length === 0 && running && (
             <div className="flex items-center gap-2 px-3.5 py-2.5 text-meta text-faint">
               <Spinner size={12} /> 子智能体启动中…
@@ -270,7 +220,7 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
               {typeof msg._resultPreview === "string" && msg._resultPreview && (
                 <ProgressivePlainText
                   text={msg._resultPreview}
-                  className="text-[12.5px] leading-relaxed text-muted"
+                  className="text-meta leading-relaxed text-muted"
                 />
               )}
             </div>
@@ -282,7 +232,7 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
       {/* 折叠态下展示结果摘要(完成后)。图标跟终态 tone 走:成功 ✓ / 失败 ✕ / 超时 ⏱,
           不再对着「失败 · 61s」徽记画一个绿勾。 */}
       {collapsed && !running && typeof msg._resultPreview === "string" && msg._resultPreview && (
-        <div className="flex items-start gap-1.5 border-t border-border px-3.5 py-2 text-meta text-muted">
+        <div className="flex items-start gap-1.5 border-t border-border/70 bg-bg/35 px-3.5 py-2 text-meta text-muted">
           <span
             className={cn(
               "mt-0.5 shrink-0",
@@ -291,7 +241,7 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
             data-testid="agent-summary-icon"
             data-tone={status.tone}
           >
-            {status.tone === "success" ? <Check size={13} /> : <TerminalIcon tone={status.tone} size={13} />}
+            {status.tone === "success" ? <Check size={13} strokeWidth={2} /> : <TerminalIcon tone={status.tone} size={13} />}
           </span>
           <span className="line-clamp-2">
             {msg._resultPreview.slice(0, 500)}{msg._resultPreview.length > 500 ? "…" : ""}

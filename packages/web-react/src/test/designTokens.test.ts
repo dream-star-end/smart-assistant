@@ -36,7 +36,11 @@ function locateStylesheet(): string {
 }
 
 const STYLESHEET = locateStylesheet();
+const LANDING_STYLESHEET = resolve(dirname(STYLESHEET), "styles/landing.css");
 const CSS = readFileSync(STYLESHEET, "utf8");
+const THEME_CSS = existsSync(LANDING_STYLESHEET)
+  ? `${CSS}\n${readFileSync(LANDING_STYLESHEET, "utf8")}`
+  : CSS;
 
 /**
  * 取某个主题块({ ... })内的 token 表。light = `:root`,dark = `.dark`,landing = `.congjian-landing`。
@@ -45,9 +49,9 @@ const CSS = readFileSync(STYLESHEET, "utf8");
  * 只看底层 token。
  */
 function tokensOf(selector: string): Record<string, string> {
-  const start = CSS.indexOf(`${selector} {`);
-  if (start === -1) throw new Error(`styles.css 缺少 ${selector} 块`);
-  const body = CSS.slice(start, CSS.indexOf("\n}", start));
+  const start = THEME_CSS.indexOf(`${selector} {`);
+  if (start === -1) throw new Error(`主题样式表缺少 ${selector} 块`);
+  const body = THEME_CSS.slice(start, THEME_CSS.indexOf("\n}", start));
   const out: Record<string, string> = {};
   for (const m of body.matchAll(/--([\w-]+):\s*(#[0-9a-fA-F]{6,8}|rgba?\([^)]*\));/g)) {
     if (m[1].startsWith("color-")) continue;
@@ -124,6 +128,8 @@ const FILL_PAIRS = [
   ["primary", "primary-fg"],
   ["accent", "accent-fg"],
   ["danger", "danger-fg"],
+  ["success", "success-fg"],
+  ["warning", "warning-fg"],
 ] as const;
 
 describe("四套主题 token 键集合一致(漏写一个 token 就会回落到别的主题)", () => {
@@ -155,8 +161,13 @@ describe.each(THEMES)("设计 token 对比度契约 · $name", ({ selector }) =>
   it.each(BADGE_TONES)("--%s 在自身 -soft 徽章底上 ≥ 4.5:1", (tone) => {
     const fg = parseHex(t[tone]).rgb;
     const soft = parseHex(t[`${tone}-soft`]);
-    // -soft 是同色低 alpha,徽章渲染在 surface/elevated 上。
+    const sidebar = parseHex(t.sidebar).rgb;
+    const hover = parseHex(t.hover);
+    const hoverSurface = composite(hover.rgb, hover.alpha, surface);
+    // -soft 是同色低 alpha,徽章渲染在 surface / sidebar / hover 叠底上都必须达 WCAG AA。
     expect(contrast(fg, composite(soft.rgb, soft.alpha, surface))).toBeGreaterThanOrEqual(4.5);
+    expect(contrast(fg, composite(soft.rgb, soft.alpha, sidebar))).toBeGreaterThanOrEqual(4.5);
+    expect(contrast(fg, composite(soft.rgb, soft.alpha, hoverSurface))).toBeGreaterThanOrEqual(4.5);
   });
 
   it("--ring 是实色且 ≥ 3:1(半透明焦点环等于没有焦点环)", () => {
@@ -176,6 +187,20 @@ describe.each(THEMES)("设计 token 对比度契约 · $name", ({ selector }) =>
     // 骨架不是文本,不适用 AA;要的是"一眼看出这里有东西在加载"。
     // 原实现复用 --hover(浅色 4% 墨)合成后仅 1.05:1,等于白屏。
     expect(contrast(parseHex(t.skeleton).rgb, surface)).toBeGreaterThanOrEqual(1.2);
+  });
+});
+
+describe("双主题空间景深投影契约（OCV5-817）", () => {
+  it("@theme 投影引用语义变量，且 .dark 提供暗部投影与顶部高光描边", () => {
+    const themeBlock = CSS.slice(CSS.indexOf("@theme {"), CSS.indexOf("\n}", CSS.indexOf("@theme {")));
+    expect(themeBlock).toMatch(/--shadow-soft:\s*var\(--shadow-soft-val\);/);
+    expect(themeBlock).toMatch(/--shadow-pop:\s*var\(--shadow-pop-val\);/);
+    expect(themeBlock).toMatch(/--shadow-float:\s*var\(--shadow-float-val\);/);
+
+    const darkBlock = CSS.slice(CSS.indexOf(".dark {"), CSS.indexOf("\n}", CSS.indexOf(".dark {")));
+    expect(darkBlock).toMatch(/--shadow-soft-val:[^;]*inset 0 1px 0 rgba\(255,\s*255,\s*255,/);
+    expect(darkBlock).toMatch(/--shadow-pop-val:[^;]*inset 0 1px 0 rgba\(255,\s*255,\s*255,/);
+    expect(darkBlock).toMatch(/--shadow-float-val:[^;]*inset 0 1px 0 rgba\(255,\s*255,\s*255,/);
   });
 });
 
@@ -238,30 +263,136 @@ describe("中文字体栈(UI-SPEC §4.1)", () => {
   });
 });
 
+function formatGateError(ruleId: string, target: string, violation: string, why: string, howToFix: string): string {
+  return [
+    `[GATE-ERROR] ${ruleId} at ${target}`,
+    `  Violation : ${violation}`,
+    `  Why       : ${why}`,
+    `  How to Fix: ${howToFix}`,
+    "  Re-verify : npx vitest run packages/web-react/src/test/designTokens.test.ts",
+  ].join("\n");
+}
+
+function zIndexTokensOfRoot(): Record<string, number> {
+  const start = CSS.indexOf(":root {");
+  if (start === -1) throw new Error("styles.css 缺少 :root 块");
+  const body = CSS.slice(start, CSS.indexOf("\n}", start));
+  const out: Record<string, number> = {};
+  for (const m of body.matchAll(/--(z-[\w-]+):\s*(-?\d+);/g)) {
+    out[m[1]] = Number.parseInt(m[2], 10);
+  }
+  return out;
+}
+
+describe("集中 11 档 --z-* 语义层级阶梯契约（OCV5-847）", () => {
+  const EXPECTED_Z_LADDER = [
+    ["z-base", 0],
+    ["z-sticky", 10],
+    ["z-sidebar", 20],
+    ["z-header", 30],
+    ["z-popover-inline", 40],
+    ["z-drawer", 50],
+    ["z-modal", 60],
+    ["z-viewer", 70],
+    ["z-popover-portal", 80],
+    ["z-tooltip", 90],
+    ["z-toast", 100],
+  ] as const;
+
+  const zTokens = zIndexTokensOfRoot();
+
+  it(":root 定义全部 11 档 --z-* 层级 Token 且严格单调递增", () => {
+    const missing = EXPECTED_Z_LADDER.filter(([key]) => zTokens[key] === undefined).map(([key]) => `--${key}`);
+    expect(
+      missing,
+      formatGateError(
+        "UI-ZINDEX-TOKENS",
+        "packages/web-react/src/styles.css",
+        `缺失层级 Token: ${missing.join(", ")}`,
+        "全站层叠顺序以 styles.css :root 的 11 档 --z-* 为单一权威，杜绝裸 z-[60..999] 竞价",
+        "在 packages/web-react/src/styles.css 的 :root 块中补齐全部 11 档 --z-* 声明",
+      ),
+    ).toEqual([]);
+
+    for (const [key, expectedVal] of EXPECTED_Z_LADDER) {
+      expect(
+        zTokens[key],
+        formatGateError(
+          "UI-ZINDEX-TOKENS",
+          "packages/web-react/src/styles.css",
+          `--${key} 当前值 ${zTokens[key]} 与契约档位 ${expectedVal} 不一致`,
+          "11 档 --z-* 阶梯间距为 10，便于清晰分层且避免跨组件层叠冲突",
+          `将 styles.css :root 中的 --${key} 设为 ${expectedVal}`,
+        ),
+      ).toBe(expectedVal);
+    }
+
+    for (let i = 0; i < EXPECTED_Z_LADDER.length - 1; i += 1) {
+      const [loKey] = EXPECTED_Z_LADDER[i];
+      const [hiKey] = EXPECTED_Z_LADDER[i + 1];
+      expect(
+        zTokens[loKey],
+        formatGateError(
+          "UI-ZINDEX-ORDER",
+          "packages/web-react/src/styles.css",
+          `--${loKey}(${zTokens[loKey]}) 未严格小于 --${hiKey}(${zTokens[hiKey]})`,
+          "11 档 --z-* 必须严格单调递增，确保高阶浮层不被低阶容器遮挡",
+          `调整 :root 中 --${loKey} < --${hiKey}`,
+        ),
+      ).toBeLessThan(zTokens[hiKey]);
+    }
+  });
+
+  it("Radix Portal 浮层严格高于查看器/弹窗/抽屉/页内浮层（popover-portal > viewer > modal > drawer > popover-inline）", () => {
+    const chain = ["z-popover-inline", "z-drawer", "z-modal", "z-viewer", "z-popover-portal"] as const;
+    for (let i = 0; i < chain.length - 1; i += 1) {
+      const lower = chain[i];
+      const higher = chain[i + 1];
+      expect(
+        zTokens[higher],
+        formatGateError(
+          "UI-ZINDEX-PORTAL-PRECEDENCE",
+          "packages/web-react/src/styles.css",
+          `--${higher}(${zTokens[higher]}) 必须严格大于 --${lower}(${zTokens[lower]})`,
+          "全屏图片查看器/弹窗/抽屉内打开的 Radix Portal 下拉菜单不可被父浮层遮挡",
+          "保持 --z-popover-portal > --z-viewer > --z-modal > --z-drawer > --z-popover-inline",
+        ),
+      ).toBeGreaterThan(zTokens[lower]);
+    }
+  });
+});
+
 /**
  * 防回潮计数门(UI-SPEC §4.1 / §4.4):按目录数「绕过 token 的写法」,**只准降不准升**。
  *
- * 为什么是计数而不是禁止:存量还有几百处,一次清不完;但新代码不能再往上加。每片 UI 改造合入后
- * 把下面的基线改成新的(更小的)数字。新目录没有基线 = 0。
- *
- * 数的是去掉注释后的 src 下 .ts/.tsx/.css(不含测试、styles.css 这个 token 权威源):
- *   - pxText        `text-[13px]` 任意字号(用 text-title/section/body/meta/caption)
- *   - rawColor      `#hex`、`rgb()/rgba()` 硬编码颜色(用语义 token)
- *   - paletteColor  `bg-gray-500` 这类 Tailwind 原色(用语义 token)
- *   - radius        `rounded-[10px]` 任意圆角(用 rounded-sm/md/lg/xl/full)
- *   - adhocDot      手写状态点:同一串类名里有 rounded-full + 小尺寸 + 状态底色(用 ui/StatusPill)
- *   - adhocError    私有错误样式:`bg-danger-soft` / `border-danger` 自己拼错误框(用 Alert / ui/Notice)
- * 豁免:落地页、教程、admin(UI-SPEC §4.1)。
+ * 豁免表拆入 A 类受保护文件 packages/web-react/design-tokens-exempt.json（CODEOWNERS 锁定）；
+ * 计数基线拆入 B 类棘轮文件 packages/web-react/design-tokens-counts.json（允许清债递减，CI --base 阻断抬升）。
  */
-const DRIFT_EXEMPT = [
-  /^admin\//,
-  /^components\/tutorials\//,
-  /^components\/landing\//,
-  /^components\/Landing\.tsx$/,
-  /^test\//,
-  /\.test\.tsx?$/,
-  /^styles\.css$/,
-];
+const WEB_REACT_PKG_DIR = resolve(dirname(STYLESHEET), "..");
+const DRIFT_EXEMPT_PATH = resolve(WEB_REACT_PKG_DIR, "design-tokens-exempt.json");
+const DRIFT_COUNTS_PATH = resolve(WEB_REACT_PKG_DIR, "design-tokens-counts.json");
+
+type ExemptFileShape = {
+  patterns: Array<string | { regex: string; reason?: string }>;
+};
+
+function loadDriftExempt(): RegExp[] {
+  const raw = JSON.parse(readFileSync(DRIFT_EXEMPT_PATH, "utf8")) as ExemptFileShape;
+  if (!raw || !Array.isArray(raw.patterns)) {
+    throw new Error(
+      formatGateError(
+        "UI-TOKEN-EXEMPT-SCHEMA",
+        "packages/web-react/design-tokens-exempt.json",
+        "缺少 patterns 数组",
+        "豁免表属于 A 类受保护门禁配置",
+        "恢复 design-tokens-exempt.json 的 { patterns: [{ regex, reason }] } 结构",
+      ),
+    );
+  }
+  return raw.patterns.map((entry) => new RegExp(typeof entry === "string" ? entry : entry.regex));
+}
+
+const DRIFT_EXEMPT = loadDriftExempt();
 const PALETTE =
   "slate|gray|zinc|neutral|stone|red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose";
 const count = (code: string, re: RegExp) => code.match(re)?.length ?? 0;
@@ -304,61 +435,34 @@ const DRIFT_METRICS = {
 
 type DriftMetric = keyof typeof DRIFT_METRICS;
 
-/** 基线(2026-10-29 UI-0,base 29d7af504)。数字只能改小;新目录不写 = 0。 */
-const DRIFT_BASELINE: Record<DriftMetric, Record<string, number>> = {
-  pxText: {
-    "components/*": 110,
-    "components/chat": 29,
-    "components/manage": 14,
-    "components/org": 8,
-    "components/payment": 1,
-    "components/project": 2,
-    "components/settings": 14,
-    "components/tool": 36,
-    "components/ui": 4,
-  },
-  rawColor: {
-    "components/*": 31,
-    "components/chat": 2,
-    "components/iui": 3,
-    "components/marketplace": 0,
-    "components/org": 1,
-    "components/project": 4,
-    "components/settings": 1,
-    // Commercial Studio is absent from selfhost. Freeze its unchanged
-    // 15ff7638b inventory when importing this new ratchet; only decreases follow.
-    "components/studio": 147,
-    "components/ui": 4,
-    "hooks": 2,
-    "lib": 17,
-  },
-  paletteColor: { "components/*": 31, "lib": 22 },
-  radius: {
-    "components/*": 25,
-    "components/chat": 4,
-    "components/manage": 2,
-    "components/project": 1,
-    "components/ui": 1,
-  },
-  adhocDot: {
-    "components/*": 6,
-    "components/chat": 1,
-    "components/manage": 3,
-    "components/marketplace": 1,
-    "components/taskboard": 2,
-  },
-  adhocError: {
-    "components/*": 15,
-    "components/chat": 8,
-    "components/github": 2,
-    "components/manage": 1,
-    "components/marketplace": 2,
-    "components/settings": 3,
-    "components/taskboard": 6,
-    "components/tool": 10,
-    "components/ui": 6,
-  },
+const DRIFT_REMEDIATION: Record<DriftMetric, string> = {
+  pxText: "用语义字号类 text-title / text-section / text-body / text-meta / text-caption 替代 text-[Npx]（或运行 scripts/codemod-text-size-tokens.mjs）；严禁覆写 text-base",
+  rawColor: "改用 styles.css 语义 Token（bg-surface / bg-bg / text-fg / text-muted / var(--accent) / color-mix(...)），严禁新增硬编码 #hex 或 rgba()",
+  paletteColor: "改用语义颜色类（text-muted / bg-surface / border-border / text-danger 等）替代 Tailwind 原始调色板类",
+  radius: "改用设计系统圆角档位 rounded-xs / rounded-sm / rounded-md / rounded-lg / rounded-xl / rounded-full 替代 rounded-[Npx]",
+  adhocDot: "复用 components/ui/StatusPill.tsx 状态指示原语，勿手写 rounded-full 状态圆点",
+  adhocError: "复用 components/ui/Notice 或 Alert 原语呈现错误提示，勿手拼 bg-danger-soft / border-danger",
 };
+
+function loadDriftBaseline(): Record<DriftMetric, Record<string, number>> {
+  const parsed = JSON.parse(readFileSync(DRIFT_COUNTS_PATH, "utf8")) as Record<string, Record<string, number>>;
+  for (const metric of Object.keys(DRIFT_METRICS) as DriftMetric[]) {
+    if (!parsed || typeof parsed[metric] !== "object" || parsed[metric] === null) {
+      throw new Error(
+        formatGateError(
+          "UI-TOKEN-COUNTS-SCHEMA",
+          "packages/web-react/design-tokens-counts.json",
+          `缺少指标 ${metric} 的目录计数表`,
+          "B 类计数棘轮必须完整覆盖全部 6 项指标且仅允许清债递减",
+          `检查 packages/web-react/design-tokens-counts.json 的 ${metric} 键`,
+        ),
+      );
+    }
+  }
+  return parsed as Record<DriftMetric, Record<string, number>>;
+}
+
+const DRIFT_BASELINE = loadDriftBaseline();
 
 function stripComments(code: string): string {
   return code.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:\\"'`])\/\/.*$/gm, "$1");
@@ -404,7 +508,16 @@ describe("防回潮计数门(只准降不准升)", () => {
       .filter(([bucket, n]) => n > (DRIFT_BASELINE[metric][bucket] ?? 0))
       .map(([bucket, n]) => `${bucket}: ${n} > 基线 ${DRIFT_BASELINE[metric][bucket] ?? 0}`);
     // 超了 = 新代码又绕过了 token / 原语:改用语义 token、StatusPill、Notice,不要调高基线。
-    // 现值整表打在失败信息里,清掉一批之后照它把基线改小。
-    expect(over, `现值 ${metric} = ${JSON.stringify(now[metric])}`).toEqual([]);
+    // 现值整表打在失败信息里,清掉一批之后照它把 design-tokens-counts.json 改小。
+    expect(
+      over,
+      formatGateError(
+        `UI-TOKEN-DRIFT-${metric.toUpperCase()}`,
+        "packages/web-react/design-tokens-counts.json",
+        `${over.join("; ")} (现值 ${metric} = ${JSON.stringify(now[metric])})`,
+        "设计 Token 防回潮棘轮只降不升，禁止新代码绕过 Clarvy Atelier 语义原语",
+        `${DRIFT_REMEDIATION[metric]}；切勿调高 design-tokens-counts.json`,
+      ),
+    ).toEqual([]);
   });
 });

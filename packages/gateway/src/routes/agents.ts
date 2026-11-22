@@ -13,6 +13,16 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { type HttpRoute, predicateRoute, regexRoute } from './routeTable.js'
+import {
+  handleAgentContextHealth,
+  handleAgentContextHygieneHistory,
+  handleAgentContextHygieneRun,
+  handleAgentMemoryArchive,
+  handleAgentMemoryArchiveRestore,
+  handleSkillArchiveItem,
+  handleSkillsArchiveList,
+  handleSkillsArchiveRestore,
+} from '../contextHealthApi.js'
 
 export interface AgentRoutesIo {
   _handleReleaseJobStatus(req: IncomingMessage, res: ServerResponse, id: string): void
@@ -115,6 +125,8 @@ export interface AgentRoutesIo {
   ): Promise<void>
   handleMemoryContext(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void>
   handlePersona(req: IncomingMessage, res: ServerResponse, id: string): Promise<void>
+  handleLiveBrowserLive(req: IncomingMessage, res: ServerResponse, agentId: string, url: URL): Promise<void>
+  handleLiveBrowserAction(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void>
   handleSkillItem(
     req: IncomingMessage,
     res: ServerResponse,
@@ -153,6 +165,22 @@ export const AGENT_ROUTES: readonly HttpRoute<AgentRoutesIo>[] = [
     },
   ),
   regexRoute(
+    '/api/agents/:1/browser/live',
+    (_req, url) => url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/browser\/live$/),
+    (io, req, res, url, m) => {
+      io.handleLiveBrowserLive(req, res, m[1], url).catch((err) => io.sendInternalError(res, err))
+      return true
+    },
+  ),
+  regexRoute(
+    '/api/agents/:1/browser/action',
+    (_req, url) => url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/browser\/action$/),
+    (io, req, res, _url, m) => {
+      io.handleLiveBrowserAction(req, res, m[1]).catch((err) => io.sendInternalError(res, err))
+      return true
+    },
+  ),
+  regexRoute(
     '/api/agents/:1/memory/:2',
     (_req, url) => url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/(memory|user)$/),
     (io, req, res, _url, memoryMatch) => {
@@ -177,6 +205,48 @@ export const AGENT_ROUTES: readonly HttpRoute<AgentRoutesIo>[] = [
     (_req, url) => url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/context$/),
     (io, req, res, _url, memoryContextMatch) => {
       io.handleMemoryContext(req, res, memoryContextMatch[1]).catch((err) =>
+        io.sendInternalError(res, err),
+      )
+      return true
+    },
+  ),
+  regexRoute(
+    '/api/agents/:1/memory/archive/restore',
+    (_req, url) => url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/archive\/restore$/),
+    (io, req, res, _url, m) => {
+      handleAgentMemoryArchiveRestore(req, res, m[1]).catch((err) => io.sendInternalError(res, err))
+      return true
+    },
+  ),
+  regexRoute(
+    '/api/agents/:1/memory/archive',
+    (_req, url) => url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/archive$/),
+    (io, req, res, _url, m) => {
+      handleAgentMemoryArchive(req, res, m[1]).catch((err) => io.sendInternalError(res, err))
+      return true
+    },
+  ),
+  regexRoute(
+    '/api/agents/:1/context-health',
+    (_req, url) => url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/context-health$/),
+    (io, req, res, url, m) => {
+      handleAgentContextHealth(req, res, m[1], url).catch((err) => io.sendInternalError(res, err))
+      return true
+    },
+  ),
+  regexRoute(
+    '/api/agents/:1/context-hygiene/run',
+    (_req, url) => url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/context-hygiene\/run$/),
+    (io, req, res, _url, m) => {
+      handleAgentContextHygieneRun(req, res, m[1]).catch((err) => io.sendInternalError(res, err))
+      return true
+    },
+  ),
+  regexRoute(
+    '/api/agents/:1/context-hygiene/history',
+    (_req, url) => url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/context-hygiene\/history$/),
+    (io, req, res, url, m) => {
+      handleAgentContextHygieneHistory(req, res, m[1], url).catch((err) =>
         io.sendInternalError(res, err),
       )
       return true
@@ -247,6 +317,30 @@ export const AGENT_ROUTES: readonly HttpRoute<AgentRoutesIo>[] = [
     (_req, url) => url.pathname === '/api/skills',
     (io, req, res, _url) => {
       io.handleUserSkillsList(req, res).catch((err) => io.sendInternalError(res, err))
+      return true
+    },
+  ),
+  predicateRoute(
+    '/api/skills/archive',
+    (_req, url) => url.pathname === '/api/skills/archive',
+    (io, req, res, _url) => {
+      handleSkillsArchiveList(req, res).catch((err) => io.sendInternalError(res, err))
+      return true
+    },
+  ),
+  predicateRoute(
+    '/api/skills/archive/restore',
+    (_req, url) => url.pathname === '/api/skills/archive/restore',
+    (io, req, res, _url) => {
+      handleSkillsArchiveRestore(req, res).catch((err) => io.sendInternalError(res, err))
+      return true
+    },
+  ),
+  regexRoute(
+    '/api/skills/:1/archive',
+    (_req, url) => url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)\/archive$/),
+    (io, req, res, _url, m) => {
+      handleSkillArchiveItem(req, res, m[1]).catch((err) => io.sendInternalError(res, err))
       return true
     },
   ),

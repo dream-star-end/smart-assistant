@@ -150,11 +150,14 @@ export default function ModelGrantsPage() {
 
   return (
     <div className="flex flex-col gap-5">
-      <PageHeader title={meta.title} desc={meta.desc} />
+      <PageHeader icon={ShieldCheck} title={meta.title} desc={meta.desc} />
 
       <FilterBar>
-        <div className="relative">
-          <Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint" />
+        <div className="group relative">
+          <Search
+            size={15}
+            className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint transition-colors group-focus-within:text-accent"
+          />
           <Input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
@@ -162,38 +165,45 @@ export default function ModelGrantsPage() {
               if (e.key === "Enter") search();
             }}
             placeholder="用户邮箱 或 UID"
-            className="h-9 w-full pl-9 sm:w-64"
+            className="oc-field-control h-9 w-full pl-9 sm:w-64"
           />
         </div>
         <Button variant="primary" size="sm" onClick={search} disabled={searching}>
           {searching ? "查询中…" : "查询"}
         </Button>
         {selected && (
-          <span className="text-meta text-muted">
-            当前:{selected.email || "—"} <span className="font-mono">(uid={selected.uid})</span>
+          <span className="oc-badge-craft inline-flex items-center gap-1.5 rounded-lg bg-accent-soft/75 px-2.5 py-1 text-meta text-fg">
+            当前:<span className="font-medium">{selected.email || "—"}</span>{" "}
+            <span className="font-mono text-muted">(uid={selected.uid})</span>
           </span>
         )}
       </FilterBar>
 
       {!selected ? (
-        <EmptyState icon={ShieldCheck} title="输入用户邮箱或 UID 开始" hint="visibility = admin / hidden 的模型按用户灰度授权" />
+        <div className="oc-surface-card rounded-xl">
+          <EmptyState icon={ShieldCheck} title="输入用户邮箱或 UID 开始" hint="visibility = admin / hidden 的模型按用户灰度授权" />
+        </div>
       ) : loadingGrants ? (
-        <div className="flex items-center justify-center py-16">
+        <div className="oc-surface-card flex items-center justify-center rounded-xl py-16">
           <Spinner />
         </div>
       ) : error ? (
-        <EmptyState
-          icon={Inbox}
-          title="加载失败"
-          hint={error}
-          action={
-            <Button variant="secondary" size="sm" onClick={() => loadGrants(selected.uid)}>
-              重试
-            </Button>
-          }
-        />
+        <div className="oc-surface-card rounded-xl">
+          <EmptyState
+            icon={Inbox}
+            title="加载失败"
+            hint={error}
+            action={
+              <Button variant="secondary" size="sm" onClick={() => loadGrants(selected.uid)}>
+                重试
+              </Button>
+            }
+          />
+        </div>
       ) : restricted.length === 0 ? (
-        <EmptyState icon={ShieldCheck} title="无受限模型" hint="所有定价均为 visibility=public,无需授权" />
+        <div className="oc-surface-card rounded-xl">
+          <EmptyState icon={ShieldCheck} title="无受限模型" hint="所有定价均为 visibility=public,无需授权" />
+        </div>
       ) : (
         <DataTable columns={columns} rows={restricted} rowKey={(r) => r.model_id} />
       )}

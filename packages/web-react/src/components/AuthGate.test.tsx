@@ -708,3 +708,26 @@ describe("AuthGate — 协议弹窗副标题(L-04 / L-14)", () => {
     expect(dialog.textContent).not.toContain(`生效日期:${TERMS_VERSION}`);
   });
 });
+
+describe("AuthGate — 实时密码匹配提示与安全区流式顶栏(OCV5-838)", () => {
+  test("注册页输入确认密码时给出轻量实时匹配反馈", () => {
+    render(
+      <AuthGate {...base} onLogin={vi.fn()} onRegister={vi.fn()} initialMode="register" turnstileBypass={true} />,
+    );
+    expect(screen.queryByTestId("register-password-match")).toBeNull();
+    fireEvent.change(screen.getByPlaceholderText("至少 8 位"), { target: { value: "password123" } });
+    fireEvent.change(screen.getByPlaceholderText("再输一次密码"), { target: { value: "pass" } });
+    expect(screen.getByTestId("register-password-match")).toHaveTextContent("密码暂不一致");
+    fireEvent.change(screen.getByPlaceholderText("再输一次密码"), { target: { value: "password123" } });
+    expect(screen.getByTestId("register-password-match")).toHaveTextContent("两次密码一致");
+  });
+
+  test("顶栏走流式安全区布局而非 absolute 悬浮遮挡", () => {
+    render(<AuthGate {...base} onLogin={vi.fn()} onBack={vi.fn()} turnstileBypass={true} />);
+    const backBtn = screen.getByRole("button", { name: "返回首页" });
+    expect(backBtn.className).not.toContain("absolute");
+    const header = backBtn.closest("header");
+    expect(header).not.toBeNull();
+    expect(header?.className).toContain("pt-[env(safe-area-inset-top,0px)]");
+  });
+});

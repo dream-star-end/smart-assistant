@@ -103,7 +103,7 @@ export function SkillsTab({ auth }: { auth: AuthSession }) {
   }
 
   return (
-    <div className="flex flex-col">
+    <div className="flex flex-col gap-5 p-5">
       <Section
         title="已安装"
         empty="组织尚未安装任何技能。"
@@ -124,7 +124,6 @@ export function SkillsTab({ auth }: { auth: AuthSession }) {
         title="可安装"
         empty="没有可安装的技能。"
         skills={available}
-        border
         // 可安装项不用 ✓（看起来像已安装，审计 SET-36），用中性的技能图标。
         icon="available"
         renderAction={(s) => (
@@ -148,48 +147,55 @@ function Section({
   empty,
   skills,
   renderAction,
-  border,
   icon = "installed",
 }: {
   title: string;
   empty: string;
   skills: OrgSkill[];
   renderAction: (s: OrgSkill) => ReactNode;
-  border?: boolean;
   /** installed = ✓ 强调色（已在组织内）；available = 中性技能图标（尚未安装）。 */
   icon?: "installed" | "available";
 }) {
   return (
-    <div className={border ? "border-t border-border px-5 py-4" : "px-5 py-4"}>
-      <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">{title}</div>
+    <div>
+      <div className="flex items-center justify-between pb-2.5">
+        <span className="text-caption font-semibold uppercase tracking-wide text-faint">
+          {title}
+        </span>
+        <span className="oc-badge-craft rounded-full bg-hover px-2 py-0.5 text-caption font-medium tabular-nums text-muted">
+          {skills.length}
+        </span>
+      </div>
       {skills.length === 0 ? (
-        <p className="py-3 text-center text-meta text-faint">{empty}</p>
+        <div className="oc-surface-recessed rounded-xl py-5 text-center text-meta text-faint">
+          {empty}
+        </div>
       ) : (
-        <ul className="flex flex-col gap-1.5">
+        <ul className="flex flex-col gap-2">
           {skills.map((s) => (
             <li
               key={s.slug}
-              className="flex items-center gap-3 rounded-lg border border-border px-3 py-2.5"
+              className="oc-surface-card oc-surface-card-hover flex items-center gap-3 rounded-xl px-3.5 py-3"
             >
               {icon === "installed" ? (
                 <span
-                  className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent"
+                  className="oc-icon-badge oc-icon-badge-accent size-9 rounded-lg"
                   data-testid="org-skill-icon-installed"
                 >
-                  <Check size={16} />
+                  <Check size={16} strokeWidth={2} />
                 </span>
               ) : (
                 <span
-                  className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-hover text-muted"
+                  className="oc-icon-badge size-9 rounded-lg"
                   data-testid="org-skill-icon-available"
                 >
-                  <Boxes size={16} />
+                  <Boxes size={16} strokeWidth={1.75} />
                 </span>
               )}
               <span className="min-w-0 flex-1">
-                <span className="block truncate text-section font-medium text-fg">{s.name}</span>
+                <span className="block truncate text-section font-semibold text-fg">{s.name}</span>
                 {s.summary && (
-                  <span className="block truncate text-caption text-faint">{s.summary}</span>
+                  <span className="mt-0.5 block truncate text-caption text-muted">{s.summary}</span>
                 )}
               </span>
               <span className="shrink-0">{renderAction(s)}</span>

@@ -18,10 +18,10 @@ afterEach(cleanup);
  * 全仓 38 处存量调用外加即将并回来的 39 处手抄都压在这个字符串上,它一变就是全站视觉漂移。
  */
 describe("ui surfaces", () => {
-  it("Card default renders byte-identical to the pre-change primitive", () => {
+  it("Card default renders the Clarvy Atelier tactile surface primitive", () => {
     const { container } = render(<Card />);
     expect((container.firstChild as HTMLElement).className).toBe(
-      "rounded-xl border border-border bg-surface shadow-soft",
+      "rounded-xl border oc-surface-card bg-surface",
     );
   });
 

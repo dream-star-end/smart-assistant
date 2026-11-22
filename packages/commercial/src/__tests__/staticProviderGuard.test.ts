@@ -65,12 +65,12 @@ describe("assertPlatformDefaultModelConfigured", () => {
   // 否则缺 key 的 throw 会被该 try 的 catch("internal proxy ... disabling")降级吞掉 → 变成
   // "internal proxy 禁用但 master 照跑",违反 loud-fail。这里用源码文本结构断言钉死调用位置。
   test("index.ts 把 assertPlatformDefaultModelConfigured(cfg) 放在 internal-proxy try 之外(之前)", () => {
-    const indexPath = fileURLToPath(new URL("../index.ts", import.meta.url));
+    const indexPath = fileURLToPath(new URL("../bootstrap/internalProxyBootstrap.ts", import.meta.url));
     const src = readFileSync(indexPath, "utf-8");
 
     // OCV5-424:调用多了第二参数(服务池也算已配置),按调用前缀定位。
-    const guardIdx = src.indexOf("assertPlatformDefaultModelConfigured(cfg");
-    assert.ok(guardIdx >= 0, "必须存在 assertPlatformDefaultModelConfigured(cfg, …) 调用");
+    const guardIdx = src.indexOf("assertPlatformDefaultModelConfigured(deps.cfg");
+    assert.ok(guardIdx >= 0, "必须存在 assertPlatformDefaultModelConfigured(deps.cfg, …) 调用");
 
     const handlerIdx = src.indexOf("internalProxyHandler = makeAnthropicProxyHandler({");
     assert.ok(handlerIdx > guardIdx, "internal proxy 装配应在 guard 之后");

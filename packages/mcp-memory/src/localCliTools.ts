@@ -31,10 +31,17 @@ export {
   OC_BASH_MAX_ACTIVE_JOBS,
   OC_BASH_MAX_JOB_LIFETIME_MS,
   OC_BASH_MAX_OUTPUT_BYTES,
+  OC_BASH_SNAPSHOT_PREVIEW_MAX_CHARS,
   OC_BASH_TAIL_BYTES,
   OcBashJobManager,
+  parseProcStatStartTimeTicks,
+  readProcStartTimeTicks,
+  resolveOcBashRegistryDir,
+  resolveOcBashSessionIdentity,
+  sanitizeOcBashCommandPreview,
   type OcBashAction,
   type OcBashCallOutcome,
+  type OcBashJobSnapshot,
 } from './ocBashJobManager.js'
 
 export const OC_BASH_DEFAULT_TIMEOUT_MS = 60_000
@@ -201,10 +208,12 @@ function installProcessGroupCleanup(): void {
   if (processGroupCleanupInstalled) return
   processGroupCleanupInstalled = true
   process.on('exit', () => {
+    defaultOcBashManager.cleanupSnapshotsSync()
     killTrackedProcessGroups('SIGKILL')
   })
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
     const onSignal = () => {
+      defaultOcBashManager.cleanupSnapshotsSync()
       killTrackedProcessGroups('SIGKILL')
       process.removeListener(sig, onSignal)
       process.kill(process.pid, sig)

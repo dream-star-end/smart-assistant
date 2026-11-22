@@ -49,6 +49,7 @@ import {
 import { CcbAdapter } from '../engine/ccbAdapter.js'
 import { CodexAdapter } from '../engine/codexAdapter.js'
 import {
+  RESULT_REF_MAX,
   buildJobTerminalFromSnapshot,
   formatJobTerminalMarkdown,
   injectPayloadFromJobTerminal,
@@ -3187,8 +3188,8 @@ describe('stage 2 review blockers: cron generation migration + continuation', ()
       const { snap } = await seedCronTerminal(store, { output: prompt })
       const event = buildJobTerminalFromSnapshot(snap, { parentEngine: 'cursor' })
       assert.ok(event)
-      assert.equal((event.resultRef ?? '').length, 8_000)
-      assert.equal(event.resultRef?.includes('UNIQUE_SUFFIX'), false)
+      assert.ok((event.resultRef ?? '').length > 0 && (event.resultRef ?? '').length <= RESULT_REF_MAX)
+      assert.match(event.resultRef ?? '', /Full content offloaded to:/)
       assert.ok(event.cronContinuation?.resumeText.includes('UNIQUE_SUFFIX'))
       assert.ok(event.cronContinuation!.resumeText.length > 8_000)
       const payload = resolveCronOriginInjectPayload(event)

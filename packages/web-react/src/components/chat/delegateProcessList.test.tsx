@@ -58,7 +58,8 @@ describe("DelegateProcessList", () => {
     expect(mounted.length).toBe(DELEGATE_PROCESS_TAIL_SIZE);
     const scroller = screen.getByTestId("delegate-process-scroller");
     expect(scroller.className).toMatch(/h-\[min\(420px,50vh\)\]/);
-    expect(screen.getByText(/已加载 30 \/ 300 步/)).toBeInTheDocument();
+    expect(screen.queryByTestId("delegate-process-progress")).toBeNull();
+    expect(screen.queryByText(/已加载 30 \/ 300 步/)).toBeNull();
   });
 
   test("贴底时追加 child 后仍贴底", () => {
@@ -96,7 +97,19 @@ describe("DelegateProcessList", () => {
       <DelegateProcessList childBlocks={Array.from({ length: 300 }, (_, i) => child(i))} />,
     );
     expect(screen.getAllByTestId("delegate-process-child")).toHaveLength(DELEGATE_PROCESS_TAIL_SIZE);
-    expect(screen.getByText(/已加载 30 \/ 300 步/)).toBeInTheDocument();
+    expect(screen.queryByTestId("delegate-process-progress")).toBeNull();
+    expect(screen.queryByText(/已加载 30 \/ 300 步/)).toBeNull();
+  });
+
+  test("合并匹配 tool_result 回所属 tool_use 并隐藏协议终态事件", () => {
+    const children: ChildBlock[] = [
+      { kind: "tool_use", blockId: "call-1", toolName: "Read", inputJson: { file_path: "a.ts" }, _completed: false },
+      { kind: "tool_result", toolUseBlockId: "call-1", toolName: "Read", output: "file-body", isError: false },
+      { kind: "final" },
+    ];
+    render(<DelegateProcessList childBlocks={children} />);
+    expect(screen.getAllByTestId("delegate-process-child")).toHaveLength(1);
+    expect(screen.queryByText(/原始结果|终态事件/)).toBeNull();
   });
 
   test("上滑扩窗后视口锚定：scrollTop 增量约等于新增高度", () => {

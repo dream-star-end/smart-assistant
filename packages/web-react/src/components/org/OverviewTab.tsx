@@ -119,34 +119,126 @@ export function OverviewTab({
   const seats = seatsUsage(sub, org.member_count, org.max_members);
 
   return (
-    <div className="flex flex-col">
-      <div className="px-5 py-4">
-        <div className="flex items-center gap-1.5 text-meta text-faint">
-          <Building2 size={13} /> 组织
-        </div>
-        <div className="mt-1 flex flex-wrap items-center gap-2">
-          <span className="text-[18px] font-semibold text-fg">{org.name}</span>
-          <Badge tone={sm.tone}>{sm.label}</Badge>
-          <Badge tone="neutral">我是{orgRoleLabel(org.role)}</Badge>
+    <div className="flex flex-col gap-3.5 p-5">
+      {/* 组织身份头卡 */}
+      <div className="oc-surface-card flex items-center gap-3.5 rounded-xl p-4">
+        <span className="oc-icon-badge oc-icon-badge-accent size-10 rounded-xl">
+          <Building2 size={18} strokeWidth={1.75} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="text-caption font-medium text-faint">组织</div>
+          <div className="mt-0.5 flex flex-wrap items-center gap-2">
+            <span className="truncate text-lg font-semibold tracking-tight text-fg">{org.name}</span>
+            <Badge tone={sm.tone}>{sm.label}</Badge>
+            <Badge tone="neutral">我是{orgRoleLabel(org.role)}</Badge>
+          </div>
         </div>
       </div>
 
       {suspended && (
-        <div className="px-5 pb-2">
-          <Alert tone="warning" className="text-meta">
-            该组织已被暂停，组织钱包与共享技能暂不可用。请联系平台客服处理。
-          </Alert>
-        </div>
+        <Alert tone="warning" className="text-meta">
+          该组织已被暂停，组织钱包与共享技能暂不可用。请联系平台客服处理。
+        </Alert>
       )}
 
+      {/* 核心 KPI：组织钱包余额 + 成员席位 */}
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div className="oc-surface-card flex flex-col justify-between rounded-xl p-4">
+          <div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-meta font-medium text-muted">组织钱包余额</span>
+              <span className="oc-icon-badge oc-icon-badge-accent size-8 rounded-lg">
+                <Wallet size={15} strokeWidth={1.75} />
+              </span>
+            </div>
+            <div
+              className={cn(
+                "mt-2.5 flex items-baseline gap-1.5 text-3xl font-semibold tracking-tight tabular-nums text-fg",
+              )}
+            >
+              {formatCredits(org.credits)}
+              <span className="text-meta font-normal text-faint">积分</span>
+            </div>
+          </div>
+          <div className="mt-3">
+            {canManageBilling ? (
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={() => setTopupOpen(true)}
+                  disabled={suspended}
+                >
+                  <Plus size={15} /> 组织充值
+                </Button>
+              </div>
+            ) : (
+              <p className="text-caption text-faint">如需充值，请联系组织拥有者或财务委派人。</p>
+            )}
+            {/* 单行书写：JSX 文本换行会在「统一结算」与「（按成员…」之间渲染出一个多余空格（审计 SET-33）。 */}
+            <p className="mt-2 text-caption leading-relaxed text-faint">
+              组织钱包承接期内池超额与非订阅用量，永久有效。成员对话用量可由组织钱包统一结算（按成员的「组织结算」开关生效）。
+            </p>
+          </div>
+        </div>
+
+        <div className="oc-surface-card flex flex-col justify-between rounded-xl p-4">
+          <div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-meta font-medium text-muted">成员</span>
+              <span className="oc-icon-badge oc-icon-badge-info size-8 rounded-lg">
+                <Users size={15} strokeWidth={1.75} />
+              </span>
+            </div>
+            <div className="mt-2.5 flex items-baseline gap-1 text-3xl font-semibold tracking-tight tabular-nums text-fg">
+              {org.member_count}
+              <span className="text-base font-normal text-faint">
+                / {sub ? seats.total : org.max_members}
+              </span>
+            </div>
+          </div>
+          <div className="mt-3">
+            <Progress
+              value={
+                (sub ? seats.total : org.max_members) > 0
+                  ? (org.member_count / (sub ? seats.total : org.max_members)) * 100
+                  : 0
+              }
+              aria-label="成员占用"
+            />
+            <p className="mt-2 text-caption leading-relaxed text-faint">
+              {sub
+                ? seats.full
+                  ? "席位已满，如需邀请更多成员请加席。"
+                  : `当前已使用 ${seats.used} / ${seats.total} 个企业席位。`
+                : `当前组织上限 ${org.max_members} 位成员。`}
+            </p>
+          </div>
+        </div>
+      </div>
+
       {/* 订阅面板 */}
-      <div className="border-t border-border px-5 py-4">
-        <div className="flex items-center gap-1.5 text-meta text-faint">
-          <Crown size={13} /> 企业套餐
+      <div className="oc-surface-card rounded-xl p-4">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <span className="oc-icon-badge oc-icon-badge-warning size-8 rounded-lg">
+              <Crown size={15} strokeWidth={1.75} />
+            </span>
+            <span className="text-section font-semibold text-fg">企业套餐</span>
+          </div>
+          {sub && (
+            sub.status === "active" ? (
+              <span className="oc-badge-craft inline-flex items-center gap-1 rounded-full bg-accent-soft px-2.5 py-0.5 text-caption font-medium tabular-nums text-accent">
+                <CalendarClock size={11} /> 到期 {fmtDate(sub.periodEnd)}
+              </span>
+            ) : (
+              <Badge tone="warning">已到期</Badge>
+            )
+          )}
         </div>
 
         {subErr ? (
-          <Alert tone="warning" className="mt-2 text-meta">
+          <Alert tone="warning" className="mt-3 text-meta">
             {subErr}
           </Alert>
         ) : subLoading ? (
@@ -155,56 +247,55 @@ export function OverviewTab({
           </div>
         ) : sub ? (
           <>
-            <div className="mt-1 flex flex-wrap items-center gap-2">
+            <div className="mt-3 flex flex-wrap items-center gap-2">
               {/* F 的 subscription 无 plan_name,优先用 plans 列表里的展示名。 */}
-              <span className="text-[16px] font-semibold text-fg">{plan?.name ?? sub.planName}</span>
-              {sub.status === "active" ? (
-                <span className="inline-flex items-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-caption font-medium text-accent">
-                  <CalendarClock size={11} /> 到期 {fmtDate(sub.periodEnd)}
-                </span>
-              ) : (
-                <Badge tone="warning">已到期</Badge>
-              )}
+              <span className="text-base font-semibold tracking-tight text-fg">
+                {plan?.name ?? sub.planName}
+              </span>
             </div>
 
-            {/* 席位 used / total */}
-            <div className="mt-3">
-              <div className="flex items-center justify-between text-meta">
-                <span className="text-muted">席位</span>
-                <span className="tabular-nums text-fg">
-                  {seats.used}
-                  <span className="text-faint"> / {seats.total}</span>
-                </span>
+            <div className="mt-3 grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+              {/* 席位 used / total */}
+              <div className="oc-surface-recessed rounded-lg p-3">
+                <div className="flex items-center justify-between text-meta">
+                  <span className="text-muted">席位</span>
+                  <span className="font-medium tabular-nums text-fg">
+                    {seats.used}
+                    <span className="font-normal text-faint"> / {seats.total}</span>
+                  </span>
+                </div>
+                <Progress
+                  value={seats.total > 0 ? (seats.used / seats.total) * 100 : 0}
+                  className="mt-2"
+                  aria-label="席位占用"
+                />
+                {seats.full && (
+                  <p className="mt-1.5 text-caption text-warning">席位已满，如需邀请更多成员请加席。</p>
+                )}
               </div>
-              <Progress
-                value={seats.total > 0 ? (seats.used / seats.total) * 100 : 0}
-                className="mt-1.5"
-                aria-label="席位占用"
-              />
-              {seats.full && (
-                <p className="mt-1 text-caption text-warning">席位已满，如需邀请更多成员请加席。</p>
-              )}
-            </div>
 
-            {/* 期内池余额 + 进度 */}
-            <div className="mt-3">
-              <div className="flex items-center justify-between text-meta">
-                <span className="text-muted">期内池余额</span>
-                <span className="tabular-nums text-fg">
-                  {formatCredits(sub.periodCredits)}
-                  {grantedPool && <span className="text-faint"> / {formatCredits(grantedPool)}</span>}
-                </span>
+              {/* 期内池余额 + 进度 */}
+              <div className="oc-surface-recessed rounded-lg p-3">
+                <div className="flex items-center justify-between text-meta">
+                  <span className="text-muted">期内池余额</span>
+                  <span className="font-medium tabular-nums text-fg">
+                    {formatCredits(sub.periodCredits)}
+                    {grantedPool && (
+                      <span className="font-normal text-faint"> / {formatCredits(grantedPool)}</span>
+                    )}
+                  </span>
+                </div>
+                {grantedPool && (
+                  <Progress value={poolPct} className="mt-2" aria-label="期内池余额占比" />
+                )}
+                <p className="mt-1.5 text-caption text-faint">
+                  期内池由席位积分汇集，扣费优先消耗；到期清零，超额由组织钱包承接。
+                </p>
               </div>
-              {grantedPool && (
-                <Progress value={poolPct} className="mt-1.5" aria-label="期内池余额占比" />
-              )}
-              <p className="mt-1 text-caption text-faint">
-                期内池由席位积分汇集，扣费优先消耗；到期清零，超额由组织钱包承接。
-              </p>
             </div>
 
             {canManageBilling && (
-              <div className="mt-3 flex flex-wrap gap-2">
+              <div className="mt-3.5 flex flex-wrap gap-2">
                 <Button variant="secondary" size="sm" onClick={onSubscribe} disabled={suspended}>
                   <Crown size={15} /> 续费 / 变更
                 </Button>
@@ -215,8 +306,8 @@ export function OverviewTab({
             )}
           </>
         ) : (
-          <>
-            <p className="mt-1 text-body text-muted">
+          <div className="oc-surface-recessed mt-3 rounded-lg p-3.5">
+            <p className="text-body text-muted">
               尚未订阅企业套餐。订阅后按席位获得可汇集的期内积分池，闲置席位积分不浪费。
             </p>
             {canManageBilling ? (
@@ -228,54 +319,8 @@ export function OverviewTab({
             ) : (
               <p className="mt-2 text-caption text-faint">如需订阅，请联系组织拥有者。</p>
             )}
-          </>
-        )}
-      </div>
-
-      {/* 成员数 */}
-      <div className="border-t border-border px-5 py-4">
-        <div className="flex items-center justify-between">
-          <span className="flex items-center gap-1.5 text-meta text-muted">
-            <Users size={14} /> 成员
-          </span>
-          <span className="text-section font-medium tabular-nums text-fg">
-            {org.member_count}
-            <span className="text-faint"> / {sub ? seats.total : org.max_members}</span>
-          </span>
-        </div>
-      </div>
-
-      {/* 组织钱包余额 */}
-      <div className="border-t border-border px-5 py-4">
-        <div className="flex items-center gap-1.5 text-meta text-faint">
-          <Wallet size={13} /> 组织钱包余额
-        </div>
-        <div
-          className={cn(
-            "mt-1 flex items-baseline gap-1.5 text-[28px] font-semibold tracking-tight tabular-nums text-fg",
-          )}
-        >
-          {formatCredits(org.credits)}
-          <span className="text-title font-normal text-faint">积分</span>
-        </div>
-        {canManageBilling ? (
-          <div className="mt-3 flex flex-wrap gap-2">
-            <Button
-              variant="primary"
-              size="sm"
-              onClick={() => setTopupOpen(true)}
-              disabled={suspended}
-            >
-              <Plus size={15} /> 组织充值
-            </Button>
           </div>
-        ) : (
-          <p className="mt-2 text-caption text-faint">如需充值，请联系组织拥有者或财务委派人。</p>
         )}
-        {/* 单行书写：JSX 文本换行会在「统一结算」与「（按成员…」之间渲染出一个多余空格（审计 SET-33）。 */}
-        <p className="mt-2 text-meta text-faint">
-          组织钱包承接期内池超额与非订阅用量，永久有效。成员对话用量可由组织钱包统一结算（按成员的「组织结算」开关生效）。
-        </p>
       </div>
 
       <OrgTopupDialog

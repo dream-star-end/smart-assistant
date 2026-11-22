@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
-import { TASKBOARD_ENABLED_ENV, taskboardContainerEnv } from "../agent-sandbox/taskboardEnv.js";
+import {
+  isMasterTaskboardEnabled,
+  TASKBOARD_ENABLED_ENV,
+  taskboardContainerEnv,
+} from "../agent-sandbox/taskboardEnv.js";
 import { type FlavorIdentity, FlavorIdentityError, type FlavorManifest } from "../flavor/assertFlavor.js";
 
 function identity(flavor: "commercial" | "selfhost"): FlavorIdentity {
@@ -75,6 +79,34 @@ describe("taskboardContainerEnv", () => {
     assert.deepEqual(
       taskboardContainerEnv({ env: { [TASKBOARD_ENABLED_ENV]: "yes" }, identity: () => identity("selfhost") }),
       [],
+    );
+  });
+});
+
+describe("isMasterTaskboardEnabled", () => {
+  test("mirrors commercial/selfhost/env/fail-closed semantics of taskboardContainerEnv", () => {
+    assert.equal(isMasterTaskboardEnabled({ env: {}, identity: () => identity("commercial") }), false);
+    assert.equal(
+      isMasterTaskboardEnabled({
+        env: {},
+        identity: () => {
+          throw new FlavorIdentityError("manifest missing");
+        },
+      }),
+      false,
+    );
+    assert.equal(isMasterTaskboardEnabled({ env: {}, identity: () => identity("selfhost") }), true);
+    assert.equal(
+      isMasterTaskboardEnabled({ env: {}, identity: () => ({ status: "skipped", reason: "no-manifest" }) }),
+      true,
+    );
+    assert.equal(
+      isMasterTaskboardEnabled({ env: { [TASKBOARD_ENABLED_ENV]: "0" }, identity: () => identity("selfhost") }),
+      false,
+    );
+    assert.equal(
+      isMasterTaskboardEnabled({ env: { [TASKBOARD_ENABLED_ENV]: "1" }, identity: () => identity("commercial") }),
+      true,
     );
   });
 });

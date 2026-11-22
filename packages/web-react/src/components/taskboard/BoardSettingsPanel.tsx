@@ -1,4 +1,4 @@
-import { Settings } from 'lucide-react'
+import { Activity, AlertOctagon, Gauge, Settings, ShieldAlert } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { AuthEpochStaleError } from '../../lib/api'
 import {
@@ -267,8 +267,17 @@ export function BoardSettingsPanel({
         ) : (
           <>
             {usage && (
-              <div className="rounded-lg bg-hover px-3 py-1" data-testid="board-settings-usage">
-                <DescriptionList>
+              <div
+                className="oc-surface-card flex flex-col gap-2 rounded-xl p-3.5"
+                data-testid="board-settings-usage"
+              >
+                <div className="flex items-center gap-2">
+                  <span className="oc-icon-badge oc-icon-badge-info size-7 rounded-lg" aria-hidden>
+                    <Activity size={14} />
+                  </span>
+                  <h3 className="text-section font-semibold tracking-tight text-fg">今日运行概览</h3>
+                </div>
+                <DescriptionList divided>
                   <DescriptionRow
                     label="今天已执行"
                     value={`${usage.runsToday} / ${numbers.maxRunsPerDay || '—'} 次`}
@@ -285,12 +294,17 @@ export function BoardSettingsPanel({
               </div>
             )}
             {draft.patrolPaused && (
-              <p className="rounded-lg bg-danger-soft px-3 py-2 text-body text-danger">
+              <p className="oc-callout oc-callout-danger rounded-xl px-3.5 py-2.5 text-body text-danger">
                 全局巡检已急停，恢复前不会自动启动新的执行。
               </p>
             )}
-            <section className="flex flex-col gap-3">
-              <h3 className="text-section font-semibold text-fg">额度</h3>
+            <section className="oc-surface-card flex flex-col gap-3 rounded-xl p-3.5">
+              <div className="flex items-center gap-2">
+                <span className="oc-icon-badge oc-icon-badge-accent size-7 rounded-lg" aria-hidden>
+                  <Gauge size={14} />
+                </span>
+                <h3 className="text-section font-semibold tracking-tight text-fg">额度</h3>
+              </div>
               {NUMERIC_FIELDS.slice(0, 2).map((field) => (
                 <Field key={field.key} label={field.label} hint={field.hint}>
                   <Input
@@ -324,8 +338,13 @@ export function BoardSettingsPanel({
                 />
               </Field>
             </section>
-            <section className="flex flex-col gap-3">
-              <h3 className="text-section font-semibold text-fg">节奏与保护</h3>
+            <section className="oc-surface-card flex flex-col gap-3 rounded-xl p-3.5">
+              <div className="flex items-center gap-2">
+                <span className="oc-icon-badge oc-icon-badge-warning size-7 rounded-lg" aria-hidden>
+                  <ShieldAlert size={14} />
+                </span>
+                <h3 className="text-section font-semibold tracking-tight text-fg">节奏与保护</h3>
+              </div>
               {NUMERIC_FIELDS.slice(2).map((field) => (
                 <Field key={field.key} label={field.label} hint={field.hint}>
                   <Input
@@ -341,7 +360,7 @@ export function BoardSettingsPanel({
                   />
                 </Field>
               ))}
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-2 gap-2.5">
                 <Field label="静默开始">
                   <Select
                     aria-label="静默开始"
@@ -363,13 +382,16 @@ export function BoardSettingsPanel({
                   />
                 </Field>
               </div>
-              <p className="text-caption text-muted" data-testid="board-settings-quiet-hint">
+              <p
+                className="oc-surface-recessed rounded-lg px-2.5 py-1.5 text-caption text-muted"
+                data-testid="board-settings-quiet-hint"
+              >
                 {quietSame
                   ? '开始与结束相同，表示不设静默时段，全天都可能自动执行。'
                   : `${String(draft.quietHoursStart).padStart(2, '0')}:00 到 ${String(draft.quietHoursEnd).padStart(2, '0')}:00 之间不会自动启动新的执行。`}
               </p>
             </section>
-            <div className="pt-1">
+            <div className="pt-0.5">
               <Button
                 type="button"
                 size="sm"
@@ -381,9 +403,14 @@ export function BoardSettingsPanel({
                 保存设置
               </Button>
             </div>
-            <section className="mt-2 flex flex-col gap-2 border-t border-border pt-3">
-              <h3 className="text-section font-semibold text-danger">紧急</h3>
-              <p className="text-caption text-muted">
+            <section className="oc-callout oc-callout-danger flex flex-col gap-2.5 rounded-xl p-3.5">
+              <div className="flex items-center gap-2">
+                <span className="oc-icon-badge oc-icon-badge-danger size-7 rounded-lg" aria-hidden>
+                  <AlertOctagon size={14} />
+                </span>
+                <h3 className="text-section font-semibold tracking-tight text-danger">紧急</h3>
+              </div>
+              <p className="text-caption leading-relaxed text-muted">
                 {draft.patrolPaused
                   ? '恢复后将按上面的护栏配置继续自动巡检。'
                   : '急停后不再启动新的执行；正在跑的任务不受影响。'}
@@ -392,12 +419,7 @@ export function BoardSettingsPanel({
                 <Button
                   type="button"
                   size="sm"
-                  variant="secondary"
-                  className={
-                    draft.patrolPaused
-                      ? undefined
-                      : 'border-danger text-danger hover:border-danger hover:bg-danger-soft'
-                  }
+                  variant={draft.patrolPaused ? 'secondary' : 'danger'}
                   loading={pausing}
                   data-testid="board-settings-pause"
                   onClick={() => void togglePause()}

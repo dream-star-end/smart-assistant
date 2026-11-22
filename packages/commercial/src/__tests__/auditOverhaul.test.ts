@@ -251,9 +251,15 @@ describe("auditRetention — 政策注册表与 sweeper", () => {
       "product_friction_events",
       "image_generation_attempts",
       "prompt_queue_mutations",
+      "pending_browser_handoffs",
     ]) {
       assert.ok(tables.includes(t), `缺 retention 政策: ${t}`);
     }
+    assert.equal(
+      AUDIT_RETENTION_POLICIES.find((p) => p.table === "pending_browser_handoffs")?.column,
+      "expires_at",
+      "pending_browser_handoffs retention must expire relative to expires_at",
+    );
     assert.equal(
       AUDIT_RETENTION_POLICIES.find((p) => p.table === "product_friction_events")?.column,
       "updated_at",

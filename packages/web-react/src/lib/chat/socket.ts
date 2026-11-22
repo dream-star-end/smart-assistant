@@ -14,11 +14,12 @@ import { readSessionServiceTier } from '../sessionServiceTier';
  * drain 逐条复刻；帧翻译委托 reducer.ts（§7-§11）。
  */
 import type { MessageReplyQuote } from "@openclaude/protocol/browser";
-import { MODEL_SWITCH_CANCELLED_MESSAGE } from "../modelSwitch";
+import { SocketContextCompactManager } from "./socketContextCompact";
 import { applyAutomaticRecoverySnapshot } from "./automaticRecoverySnapshot";
 import { confirmDispatchDelivery, confirmSnapshotDelivery } from "./deliveryConfirm";
 import {
   applyControlReceipt,
+  DegradedJournalRetryTracker,
   hydrateStoredControls,
   persistControlWithFallback,
   reconcileOrphanControlPending,
@@ -27,7 +28,12 @@ import {
   type PendingControlItem,
 } from "./controlReceipts";
 import { contextRebuiltRow } from "./contextRebuilt";
+import { SocketMetaTracker } from "./socketMeta";
 import { applyRecoveryStatusFrame, rememberRetryStatus } from "./retryStatus";
+import {
+  ensureFirstTextPaintVisibilityTracking,
+  measureHiddenWindow,
+} from "./firstTextPaintVisibility";
 import {
   applyCostCharged,
   applyCostWaived,
@@ -70,6 +76,8 @@ import {
   shouldApplyGoalSnapshot,
 } from "./model";
 import {
+  applyLiveUnitsResumeStream,
+  fetchRecoverableLiveUnits,
   isDurableFramesPage,
   isLiveUnitsPage,
   liveUnitToMessage,
@@ -87,6 +95,7 @@ import {
   reconcileOpenSnapshotRelayContainer,
   reconcileSessionRelayContainer,
   rememberTerminalSnapshotDispatch,
+  shouldKeepLocalRowsOnDegradedRebuild,
   SNAPSHOT_ACK_TIMEOUT_MS,
   SNAPSHOT_MAX_PAGES,
   SNAPSHOT_PAGE_LIMIT,
@@ -132,6 +141,8 @@ import {
   backoffDelay,
   type ChatStatusClass,
   classifyClose,
+  nextReconnectDelay,
+  RECONNECT_BACKOFF_RESET_MS,
   COST_CHARGED_LAST_FINAL_TTL_MS,
   type EmptyTurnDecision,
   emptyTurnNoticeText,
@@ -178,6 +189,7 @@ import type {
   OutboundCallUsageWire,
   OutboundControlReceiptWire,
   OutboundModelSwitchPreparedWire,
+  OutboundSessionCompactResultWire,
   OutboundWire,
   GoalSnapshotWire,
   RecoveryDecisionWire,
@@ -185,7 +197,9 @@ import type {
   RepoBindErrorWire,
   RepoStatusWire,
   RelayReadyWire,
+  SessionContextPressureWire,
   StudioEventWire,
+  SysContextCompactedWire,
 } from "./frames";
 import { emitStudioPush } from "../studio/push";
 import { incidentStore } from "../incidentStore";
@@ -347,6 +361,8 @@ export type ChatSocketDeps = {
       isCurrent?: () => boolean;
       /** Phase-B projection healing does not replay a terminal live journal. */
       tapeProjectionOnly?: boolean;
+      /** Notifies bounded background retry that the error is permanent (400/401/403/404/410). */
+      onPermanentError?: () => void;
     },
   ) => Promise<boolean | void> | boolean | void;
   /** Every successful WS open (initial or reconnect) refreshes the selected
@@ -373,6 +389,8 @@ export type ChatSocketDeps = {
   /** HTTP face of the session snapshot (live-frames `snapshot`): B3 fallback,
    * paging past a WS snapshot page, and recovery-grace verification. */
   readSessionSnapshot?: (sessId: string, query: SnapshotQuery) => Promise<SessionSnapshot | null | undefined>;
+  /** Bounded `view=units` tail pack for degraded snapshot-rebuild fallback (OCV5-837). */
+  readLiveUnits?: (sessId: string) => Promise<unknown>;
   /** Exact bytes of one oversized journal frame (snapshot gap `byte_limit`). */
   readLiveFramePayload?: (sessId: string, ref: { recordId: string; sha256?: string }) => Promise<{ payload: unknown }>;
   /** Bounded requestId lookup when a permission snapshot page is truncated. */
@@ -605,6 +623,8 @@ export function automaticTurnRecoveryTarget(
 
 export type ChatSnapshot = {
   version: number;
+  /** Low-frequency version: bumps only on sidebar/shell metadata changes, not plain text deltas. */
+  metaVersion: number;
   status: { label: string; cls: ChatStatusClass };
   /** 容器初始化期 banner（4503 provisioning）。*/
   provisioning: boolean;
@@ -850,6 +870,7 @@ export class ChatSocket {
   private lastOpenAtMs = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectCountdown: ReturnType<typeof setInterval> | null = null;
+  private backoffResetTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ── 1008 续期闸门（§5）──
   private wsAuthRefreshInFlight = false;
@@ -918,6 +939,7 @@ export class ChatSocket {
     timer: ReturnType<typeof setTimeout> | null;
     inFlight: boolean;
   }>();
+  private readonly degradedJournalRetries = new DegradedJournalRetryTracker();
   /** Sessions this WS has subscribed with a hello. Each subscription is answered by
    * one `outbound.session_snapshot`; a session loaded later subscribes once. */
   private readonly subscribedSessions = new Set<string>();
@@ -981,14 +1003,12 @@ export class ChatSocket {
   private controlPumpScheduled = false;
   private readonly controlPersistRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-  private readonly abandonedModelSwitches = new Map<string, string>();
-  private readonly pendingModelSwitches = new Map<string, {
-    sessId: string;
-    targetModel: string;
-    resolve: (switchId: string) => void;
-    reject: (error: Error) => void;
-    timer: ReturnType<typeof setTimeout>;
-  }>();
+  private readonly contextCompact = new SocketContextCompactManager({
+    getSession: (id) => this.sessions.get(id),
+    safeWsSend: (raw) => this.safeWsSend(raw),
+    scheduleNotify: () => this.scheduleNotify(),
+    persistSession: (id) => this.deps.persistSession?.(id),
+  });
 
   // ── GitHub 仓库绑定待确认队列 ──
   // PUT 成功后试发 inbound.control.session_repo_bind;若 WS 未就绪/未投递,在 onopen(hello 之后)
@@ -997,6 +1017,7 @@ export class ChatSocket {
   // 注:容器重启后 bridge 还有"自动重绑"(从 DB active selection 重发),此队列只覆盖
   // "PUT 时 WS 未就绪"与"reconnect"两场景,故省去 v3 的 30s GET 轮询。
   private pendingRepoBind = new Map<string, { agentId: string; version: number }>();
+  private metaTracker = new SocketMetaTracker();
 
   // ── 生命周期事件绑定句柄 ──
   private boundOnline?: () => void;
@@ -1010,6 +1031,7 @@ export class ChatSocket {
     this.deps = deps;
     this.snapshot = {
       version: 0,
+      metaVersion: 0,
       status: { label: this.statusLabel, cls: this.statusCls },
       provisioning: this.provisioning,
       browserOnline: this.isBrowserOnline,
@@ -1067,9 +1089,13 @@ export class ChatSocket {
     return { phase: "sending", queued: pending.length, serviceStarting: false };
   }
 
+  consumeDirtyPersistIds(): string[] { return this.metaTracker.consumeDirtyPersistIds(); }
+  markPersisted(sessId: string): void { this.metaTracker.markPersisted(sessId, this.sessions.get(sessId)); }
+
   private rebuildSnapshot(): void {
     this.snapshot = {
       version: this.version,
+      metaVersion: this.metaTracker.metaVersion,
       status: { label: this.statusLabel, cls: this.statusCls },
       provisioning: this.provisioning,
       browserOnline: this.isBrowserOnline,
@@ -1148,6 +1174,7 @@ export class ChatSocket {
     this.clearNotifyTimers();
     this.version++;
     this.lastNotifyAt = Date.now();
+    this.metaTracker.onFlush({ sessions: this.sessions, offlineQueue: this.offlineQueue, statusCls: this.statusCls, provisioning: this.provisioning, browserOnline: this.isBrowserOnline });
     this.rebuildSnapshot();
     const measure = this.anyTurnInFlight() && typeof performance !== "undefined" && typeof queueMicrotask === "function";
     const started = measure ? performance.now() : 0;
@@ -1214,7 +1241,7 @@ export class ChatSocket {
     }
     if (this.boundBillingPaid) window.removeEventListener("openclaude:billing-paid", this.boundBillingPaid);
     if (this.boundModelFixed) window.removeEventListener("openclaude:model-policy-fixed", this.boundModelFixed);
-    this.rejectPendingModelSwitches("连接已断开，未切换模型", true);
+    this.contextCompact.rejectPendingModelSwitches("连接已断开，未切换模型", true);
     this.clearReconnectTimers();
     if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
     if (this.reconnectInFlightTimer) clearTimeout(this.reconnectInFlightTimer);
@@ -1230,8 +1257,10 @@ export class ChatSocket {
       if (state.timer) clearTimeout(state.timer);
     }
     this.unpublishedTapeRetries.clear();
+    this.degradedJournalRetries.clearAll();
     for (const t of this.controlPersistRetryTimers.values()) clearTimeout(t);
     this.controlPersistRetryTimers.clear();
+    this.metaTracker.clearAllStopTimers();
     this.everOpened = false;
     this.lastOpenAtMs = 0;
     const ws = this.ws;
@@ -1345,7 +1374,6 @@ export class ChatSocket {
     const row = contextRebuiltRow(sess, frame); // 按 noticeId 去重(旧帧退回 frameSeq/ts)
     if (!row) return;
     addMessage(sess, "system", row.text, { id: row.id, _source: "local" });
-    this.setTransientNotice(sess.id, row.text); // 仅 turn 进行中显示的 live flash
     this.deps.persistSession?.(sess.id); // durable:落 IndexedDB
     this.scheduleNotify();
   }
@@ -1456,6 +1484,7 @@ export class ChatSocket {
       (synced) => {
         const sess = this.sessions.get(sessId);
         if (synced !== true || sess?._stopSettlement !== settlement) return;
+        this.metaTracker.clearStopTimeout(sessId);
         sess._stopSettlement = undefined;
         this.deps.persistSession?.(sessId);
         this.scheduleNotify();
@@ -1602,6 +1631,14 @@ export class ChatSocket {
     this.kickDispatchPump();
   }
 
+  private clearLiveJournalDegraded(sess: ChatSession): void {
+    if (sess._liveJournalDegraded) sess._liveJournalDegraded = false;
+    this.degradedJournalRetries.clear(sess.id);
+  }
+  private scheduleDegradedJournalRetry(sessId: string): void {
+    this.degradedJournalRetries.schedule(sessId, { getSession: (id) => this.sessions.get(id), getEpoch: () => this.lifecycleEpoch, syncSession: this.deps.syncSession });
+  }
+
   private clearSendingState(
     sess: ChatSession,
     opts: {
@@ -1613,6 +1650,7 @@ export class ChatSocket {
     sess._sendingInFlight = false;
     sess._activeClientMessageId = undefined;
     sess._activeAgentId = undefined;
+    this.clearLiveJournalDegraded(sess);
     if (opts.clearTiming !== false) clearTurnTiming(sess);
     if (opts.resetTracker !== false) resetReplyTracker(sess);
     sess._localTeardownAt = typeof sess._trackerResetAt === "number" ? sess._trackerResetAt : Date.now();
@@ -1626,7 +1664,7 @@ export class ChatSocket {
   private effects(): FrameEffects {
     return {
       onFinal: (sess, frame, isCronOrHeartbeat, clientMessageId) => {
-        if (!isCronOrHeartbeat) this.reportRecoveredProblemCard(sess, frame, clientMessageId);
+        if (!isCronOrHeartbeat) { this.reportRecoveredProblemCard(sess, frame, clientMessageId); this.clearLiveJournalDegraded(sess); }
         this.clearTransientNotice(sess.id); // turn 收尾：清 transient 软提示
         if (!isCronOrHeartbeat) {
           settleTurnStopSettlement(sess, frame.clientMessageId ?? clientMessageId, (id, s) => this.settleControl(id, s));
@@ -1669,7 +1707,9 @@ export class ChatSocket {
         }
       },
       onLiveFrame: (sess) => {
-        if (sess._sendingInFlight) this.clearTransientNotice(sess.id); // 有新 live 帧 = 内容仍在流，清软提示
+        if (!sess._sendingInFlight) return;
+        this.clearTransientNotice(sess.id); // 有新 live 帧 = 内容仍在流，清软提示
+        if (!this.durableHydrationStates.has(sess.id)) this.clearLiveJournalDegraded(sess);
       },
       scheduleAutoContinue: (sessId, targetMsgId, cls) => {
         setTimeout(() => this.autoContinueEmptyTurn(sessId, targetMsgId, cls), 0);
@@ -1739,7 +1779,6 @@ export class ChatSocket {
     this.ws = ws;
     ws.onopen = () => {
       const reconnected = this.everOpened;
-      this.reconnectAttempts = 0;
       this.isBrowserOnline = true;
       this.pendingBrowserOfflineAt = 0;
       this.everOpened = true;
@@ -1790,7 +1829,7 @@ export class ChatSocket {
         /* ignore */
       }
       this.armSnapshotWatchdog();
-      this.flushAbandonedModelSwitches()
+      this.contextCompact.flushAbandonedModelSwitches()
 
       // hello 发完(peer 已注册)后补发积压的仓库绑定(reconnect 兜底,见 pendingRepoBind)。
       this.flushAllRepoBinds();
@@ -1893,6 +1932,7 @@ export class ChatSocket {
       // the prepared generation or send cancel — reconnect + ring replay
       // (or live fanout onto the new socket) delivers outbound.model_switch.prepared.
       this.relayReady = false; // 连接关闭:relay 失效,待下次 sys.relay_ready
+      if (this.backoffResetTimer) { clearTimeout(this.backoffResetTimer); this.backoffResetTimer = null; }
       this.masterOwnsAutomaticRecovery = false; this.helloSentAt.clear();
       this.resetControlsForReplay();
       if (this.reconnectInFlightTimer) {
@@ -1943,8 +1983,8 @@ export class ChatSocket {
         return;
       }
       this.setProvisioningBanner(decision.provisioning);
-      const delay = decision.serverHintedDelay > 0 ? decision.serverHintedDelay : backoffDelay(this.reconnectAttempts);
-      if (decision.serverHintedDelay === 0) this.reconnectAttempts++; // server hint 不计入 client 退避（§1）
+      const { delay, nextAttempts } = nextReconnectDelay(decision, this.reconnectAttempts);
+      this.reconnectAttempts = nextAttempts;
       const label = decision.closeReasonLabel;
       const bannerCls = this.everOpened ? "disconnected" : "connecting";
       if (delay >= 4000) {
@@ -2006,12 +2046,18 @@ export class ChatSocket {
     if (alreadyVisible) return null;
     const user = sess.messages.find((message) => message.role === "user" && message.id === clientMessageId);
     if (!user || !Number.isFinite(user.ts)) return null;
+    const frameAt = Date.now();
+    const backgroundAtFrame = typeof document !== "undefined" && document.visibilityState !== "visible";
+    ensureFirstTextPaintVisibilityTracking();
+    const preFrame = measureHiddenWindow(user.ts, frameAt, undefined, backgroundAtFrame);
     return {
       traceId,
       sessionId,
       clientMessageId,
       startedAt: user.ts,
-      backgroundAtFrame: typeof document !== "undefined" && document.visibilityState !== "visible",
+      backgroundAtFrame,
+      frameAt,
+      hiddenBeforeFrame: preFrame.wasHidden,
     };
   }
 
@@ -2076,6 +2122,7 @@ export class ChatSocket {
           const ownsActiveTurn = !frame.clientMessageId ||
             activeClientMessageId === frame.clientMessageId;
           applyOutboundError(sess, frame, this.effects());
+          if (!sess._sendingInFlight) this.clearLiveJournalDegraded(sess);
           // 释放 peer slot(恢复子轮要占同一 slot)。红卡若被延后,由恢复宽限按快照收口。
           this.finishDispatch(sess.id, frame.clientMessageId ?? (ownsActiveTurn ? activeClientMessageId : undefined));
           // 错误终态也不经 onFinal/clearSendingState → 同样要收口恢复条。
@@ -2098,6 +2145,7 @@ export class ChatSocket {
           const ownsActiveTurn = !frame.clientMessageId ||
             activeClientMessageId === frame.clientMessageId;
           applyLegacyBridgeError(sess, frame, this.effects());
+          if (!sess._sendingInFlight) this.clearLiveJournalDegraded(sess);
           this.finishDispatch(sess.id, frame.clientMessageId ?? (ownsActiveTurn ? activeClientMessageId : undefined));
           // 错误终态也不经 onFinal/clearSendingState → 同样要收口恢复条。
           // 红卡被延后时本轮仍是软在飞状态，owner 未清，横幅不会被误摘。
@@ -2242,6 +2290,15 @@ export class ChatSocket {
         if (sess) this.applyContextRebuilt(sess, frame);
         return;
       }
+      case "session.context_pressure":
+        this.contextCompact.handleContextPressure(f as SessionContextPressureWire);
+        return;
+      case "sys.context_compacted":
+        this.contextCompact.handleContextCompacted(f as SysContextCompactedWire);
+        return;
+      case "outbound.session_compact_result":
+        this.contextCompact.handleCompactResult(f as OutboundSessionCompactResultWire);
+        return;
       case "sys.goal_snapshot": {
         const frame = f as GoalSnapshotWire;
         this.setGoalState(frame.goal.sessionId, frame.goal);
@@ -2259,6 +2316,9 @@ export class ChatSocket {
           for (const sess of this.sessions.values()) this.reconcileContainerForSession(sess);
         }
         this.relayReady = true;
+        if (this.reconnectAttempts > 0 && !this.backoffResetTimer) {
+          this.backoffResetTimer = setTimeout(() => { this.backoffResetTimer = null; if (this.ws?.readyState === 1 && this.relayReady) this.reconnectAttempts = 0; }, RECONNECT_BACKOFF_RESET_MS);
+        }
         this.kickDispatchPump();
         this.kickControlPump();
         this.maybePromoteToConnected();
@@ -2294,16 +2354,9 @@ export class ChatSocket {
         }
         return;
       }
-      case "outbound.model_switch.prepared": {
-        const frame = f as OutboundModelSwitchPreparedWire;
-        const pending = this.pendingModelSwitches.get(frame.requestId);
-        if (!pending || pending.sessId !== frame.sessionKey || pending.targetModel !== frame.targetModel) return;
-        this.pendingModelSwitches.delete(frame.requestId);
-        clearTimeout(pending.timer);
-        if (frame.status === "completed") pending.resolve(frame.requestId);
-        else pending.reject(new Error(frame.message || frame.errorCode || "上下文压缩失败"));
+      case "outbound.model_switch.prepared":
+        this.contextCompact.handleModelSwitchPrepared(f as OutboundModelSwitchPreparedWire);
         return;
-      }
       case "outbound.control.receipt": {
         this.applyControlReceipt(f as OutboundControlReceiptWire);
         return;
@@ -3246,16 +3299,26 @@ export class ChatSocket {
       const activeKey = d ? safeSessionKeyForAgent(sess.id, d.agentId || "main") : undefined;
       const cutoff = ctx.requestedOrder ?? 0;
       const rebuildActive = rebuild && !!d && !!activeKey && (sess._snapshotStream?.streamKey !== pages.last.streamKey || (sess._lastAcceptedFrameSeqOrderByKey?.[activeKey] ?? 0) <= cutoff || !snapshotIsStale(sess, pages.last));
-      if (pages.records.length > 0) {
-        if (rebuildActive && activeKey) { this.noteAuthoritativeFrameSeqReset(sess, { sessionKey: activeKey }); resetFrameSeqCursor(sess, { sessionKey: activeKey }); }
-        this.applyDurableLiveFrames(sessId, pages.records, rebuildActive && d ? [d.clientMessageId] : []);
-      } else if (!fenced && rebuild) {
-        if (d && activeKey) {
-          if ((sess._lastAcceptedFrameSeqOrderByKey?.[activeKey] ?? 0) <= cutoff) {
-            this.noteAuthoritativeFrameSeqReset(sess, { sessionKey: activeKey }); resetFrameSeqCursor(sess, { sessionKey: activeKey });
-            this.resetOwnerLocalRows(sess, [d.clientMessageId], new Set());
-          }
-        } else resetAgentFrameSeqCursorsForSession(sess, { keepAcceptedAfterOrder: cutoff, onResetKey: (sessionKey) => this.noteAuthoritativeFrameSeqReset(sess, { sessionKey }) });
+      let recoveredViaUnits = false;
+      if (rebuildActive && pages.degraded && !fenced && d && activeKey) {
+        const rawUnits = await fetchRecoverableLiveUnits(this.deps.readLiveUnits, sessId, { clientMessageId: d.clientMessageId, streamKey: pages.last.streamKey });
+        if (!current()) return;
+        if (rawUnits) {
+          if (pages.last.streamKey && sess._snapshotStream?.streamKey && sess._snapshotStream.streamKey !== pages.last.streamKey) { this.noteAuthoritativeFrameSeqReset(sess, { sessionKey: activeKey }); resetFrameSeqCursor(sess, { sessionKey: activeKey }); this.resetOwnerLocalRows(sess, [d.clientMessageId], liveProcessOwnersFromUnits(rawUnits.units)); }
+          this.applyLiveUnits(sessId, rawUnits.units, [d.clientMessageId], rawUnits.resume, rawUnits.streamGeneration);
+          sess._liveUnitsPackApplied = true; sess._liveUnitsHasMoreBefore = rawUnits.hasMoreBefore; sess._liveUnitsBeforeCursor = rawUnits.beforeCursor; sess._liveJournalDegraded = false; recoveredViaUnits = true;
+        }
+      }
+      if (!recoveredViaUnits) {
+        const keepLocal = shouldKeepLocalRowsOnDegradedRebuild(sess, pages.last.streamKey, d?.clientMessageId, rebuildActive, pages.degraded);
+        if (pages.records.length > 0) {
+          if (rebuildActive && activeKey && !keepLocal) { this.noteAuthoritativeFrameSeqReset(sess, { sessionKey: activeKey }); resetFrameSeqCursor(sess, { sessionKey: activeKey }); }
+          this.applyDurableLiveFrames(sessId, pages.records, rebuildActive && d && !keepLocal ? [d.clientMessageId] : []);
+        } else if (!keepLocal && !fenced && rebuild) {
+          if (d && activeKey) {
+            if ((sess._lastAcceptedFrameSeqOrderByKey?.[activeKey] ?? 0) <= cutoff) { this.noteAuthoritativeFrameSeqReset(sess, { sessionKey: activeKey }); resetFrameSeqCursor(sess, { sessionKey: activeKey }); this.resetOwnerLocalRows(sess, [d.clientMessageId], new Set()); }
+          } else resetAgentFrameSeqCursorsForSession(sess, { keepAcceptedAfterOrder: cutoff, onResetKey: (sessionKey) => this.noteAuthoritativeFrameSeqReset(sess, { sessionKey }) });
+        }
       }
       // A final among the frames settles the turn like a live final: one history read for its tape.
       const settled = running && !(sess._sendingInFlight && sess._activeClientMessageId === running) ? running : undefined;
@@ -3263,14 +3326,15 @@ export class ChatSocket {
       if (last.streamKey && last.dispatch) {
         sess._snapshotStream = { streamKey: last.streamKey, agentId: last.dispatch.agentId || "main" };
       }
-      if (pages.degraded) sess._liveJournalDegraded = true;
+      if (pages.degraded && !recoveredViaUnits) { sess._liveJournalDegraded = true; this.scheduleDegradedJournalRetry(sessId); }
+      else this.clearLiveJournalDegraded(sess);
       if (!this.applySnapshotHead(sess, last, fresh, true, ctx.asked) && settled) {
         this.syncHistory(sessId, { clientMessageId: settled });
       }
       if (!fenced && this.relayContainerId && this.relayContainerId > 0) {
         const opts = { keepAcceptedAfterOrder: this.relayContainerBoundOrder, onResetKey: (sessionKey: string) => this.noteAuthoritativeFrameSeqReset(sess, { sessionKey }) };
         this.reconcileContainerForSession(sess);
-        if (fresh && isOpenSnapshotDispatch(last.dispatch) && !pages.degraded) {
+        if (fresh && isOpenSnapshotDispatch(last.dispatch) && (!pages.degraded || recoveredViaUnits)) {
           reconcileOpenSnapshotRelayContainer(sess, this.relayContainerId, last.dispatch.agentId || "main", opts);
         }
       }
@@ -3494,6 +3558,7 @@ export class ChatSocket {
       clearInterval(this.reconnectCountdown);
       this.reconnectCountdown = null;
     }
+    if (this.backoffResetTimer) { clearTimeout(this.backoffResetTimer); this.backoffResetTimer = null; }
   }
 
   private schedulePolicyReconnect(status: string): void {
@@ -3577,7 +3642,7 @@ export class ChatSocket {
     const openedAgo = this.lastOpenAtMs > 0 ? Date.now() - this.lastOpenAtMs : Number.POSITIVE_INFINITY;
     if (
       openedAgo >= VISIBILITY_PROBE_GRACE_AFTER_OPEN_MS &&
-      this.pendingModelSwitches.size === 0
+      !this.contextCompact.hasPendingModelSwitches()
     ) {
       this.probeWsAlive(this.ws, PROBE_TIMEOUT_VISIBILITY_MS, "visibility");
     }
@@ -3629,56 +3694,16 @@ export class ChatSocket {
     if (changed || modelSwitchId) this.scheduleNotify();
   }
 
-  private cancelPreparedModelSwitch(requestId: string, sessionKey: string): void {
-    const sent = this.safeWsSend(JSON.stringify({
-      type: "control.session.cancel_model_switch",
-      sessionKey,
-      requestId,
-    }));
-    if (sent) this.abandonedModelSwitches.delete(requestId);
-    else this.abandonedModelSwitches.set(requestId, sessionKey);
-  }
-
-  private flushAbandonedModelSwitches(): void {
-    for (const [requestId, sessionKey] of this.abandonedModelSwitches) {
-      this.cancelPreparedModelSwitch(requestId, sessionKey);
-    }
-  }
-
   cancelPendingModelSwitches(sessId: string): void {
-    const sess = this.sessions.get(sessId);
-    if (sess) this.rejectPendingModelSwitches(MODEL_SWITCH_CANCELLED_MESSAGE, true, safeSessionKeyForAgent(sessId, sess.agentId));
-  }
-
-  private rejectPendingModelSwitches(message: string, canSendCancellation: boolean, onlySessionKey?: string): void {
-    for (const [id, pending] of [...this.pendingModelSwitches].filter(([, p]) => !onlySessionKey || p.sessId === onlySessionKey)) {
-      clearTimeout(pending.timer);
-      if (canSendCancellation) this.cancelPreparedModelSwitch(id, pending.sessId);
-      else this.abandonedModelSwitches.set(id, pending.sessId);
-      pending.reject(new Error(message));
-      this.pendingModelSwitches.delete(id);
-    }
+    this.contextCompact.cancelPendingModelSwitches(sessId);
   }
 
   prepareModelSwitch(sessId: string, sourceModel: string, targetModel: string): Promise<string> {
-    const sess = this.sessions.get(sessId);
-    if (!sess) return Promise.reject(new Error("会话不存在"));
-    const requestId = `model-switch:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 10)}`;
-    if (!this.safeWsSend(JSON.stringify({
-      type: "control.session.prepare_model_switch",
-      sessionKey: safeSessionKeyForAgent(sessId, sess.agentId),
-      requestId,
-      sourceModel,
-      targetModel,
-    }))) return Promise.reject(new Error("当前未连接，无法压缩上下文"));
-    return new Promise<string>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingModelSwitches.delete(requestId);
-        this.cancelPreparedModelSwitch(requestId, safeSessionKeyForAgent(sessId, sess.agentId));
-        reject(new Error("上下文压缩超时，仍保留原模型"));
-      }, 16 * 60_000);
-      this.pendingModelSwitches.set(requestId, { sessId: safeSessionKeyForAgent(sessId, sess.agentId), targetModel, resolve, reject, timer });
-    });
+    return this.contextCompact.prepareModelSwitch(sessId, sourceModel, targetModel);
+  }
+
+  compactSession(sessId: string, instructions?: string): Promise<OutboundSessionCompactResultWire> {
+    return this.contextCompact.compactSession(sessId, instructions);
   }
 
   removeSession(sessId: string): void {
@@ -3699,6 +3724,7 @@ export class ChatSocket {
       void this.deps.deletePendingControl?.(sessId, item.controlId).catch(() => {});
     }
     this.clearUnpublishedTapeRetry(sessId);
+    this.degradedJournalRetries.clear(sessId);
     this.durableLiveJournalCheckpoints.delete(sessId);
     const safeId = String(sessId).replace(/[^a-zA-Z0-9_-]/g, "_");
     const suffix = `:webchat:dm:${safeId}`;
@@ -3709,6 +3735,7 @@ export class ChatSocket {
     }
     this.maybePromoteToConnected();
     this.pendingRepoBind.delete(sessId);
+    this.contextCompact.cancelCompactsForSession(sessId);
     this.transientNotices.delete(sessId);
     const pendingRecoveryError = this.pendingRecoveryErrors.get(sessId);
     if (pendingRecoveryError) {
@@ -3721,6 +3748,7 @@ export class ChatSocket {
     this.snapshotAckAt.delete(sessId);
     this.wsSnapshotAt.delete(sessId);
     this.helloAskedCmid.delete(sessId);
+    this.metaTracker.removeSession(sessId);
     if (this.sessions.delete(sessId)) this.scheduleNotify();
   }
 
@@ -3746,6 +3774,7 @@ export class ChatSocket {
       if (state.timer) clearTimeout(state.timer);
     }
     this.unpublishedTapeRetries.clear();
+    this.degradedJournalRetries.clearAll();
     for (const timer of this.controlPersistRetryTimers.values()) clearTimeout(timer);
     this.controlPersistRetryTimers.clear();
     for (const pending of this.pendingRecoveryErrors.values()) clearTimeout(pending.timer);
@@ -3756,6 +3785,7 @@ export class ChatSocket {
     this.snapshotAckAt.clear();
     this.wsSnapshotAt.clear();
     this.helloAskedCmid.clear();
+    this.metaTracker.reset();
     this.activeSessionId = undefined;
     if (this.sessions.size === 0) return;
     this.sessions.clear();
@@ -4326,6 +4356,7 @@ export class ChatSocket {
     reconcileOrphanControlPending(s, this.controlQueue);
     // 终态收敛(RFC §5 M5):载荷自证已收尾的 turn → 清发送态 + 落 user 行终态(显式,不巧合)。
     this.convergeTerminalTurns(s, terminalTurns);
+    if (!s._sendingInFlight) this.clearLiveJournalDegraded(s);
     this.reconcileUnpublishedTapeRetry(sessId);
     this.scheduleNotify();
     const tailRecoverableError = [...s.messages].reverse().find((message) =>
@@ -4543,35 +4574,24 @@ export class ChatSocket {
               }
               if (firstPage.nextCursor) cursor = firstPage.nextCursor;
               if (firstPage.hasMore) await readPages(stagedFrames);
-              this.applyDurableLiveFrames(
-                sessId,
-                stagedFrames,
-                [...resetOwnerIds],
-                lastDurableFrameSeqBySessionKey,
-              );
+              const sessRaw = this.sessions.get(sessId);
+              const safeResets = degraded && sessRaw ? [...resetOwnerIds].filter((id) => !shouldKeepLocalRowsOnDegradedRebuild(sessRaw, latestSnapshot?.streamKey, id, true, degraded)) : [...resetOwnerIds];
+              this.applyDurableLiveFrames(sessId, stagedFrames, safeResets, lastDurableFrameSeqBySessionKey);
               if (!degraded) await readPages(null);
               usedUnits = true;
             }
           } catch (error) {
-            if (isLiveJournalAbort(error)) {
-              degraded = true;
-            } else {
-              usedUnits = false;
-            }
+            if (isLiveJournalAbort(error)) degraded = true;
+            else usedUnits = false;
           }
         }
         if (!usedUnits) {
           const stagedFrames: DurableLiveFrame[] = [];
           await readPages(stagedFrames);
-          this.applyDurableLiveFrames(
-            sessId,
-            stagedFrames,
-            [...resetOwnerIds],
-            lastDurableFrameSeqBySessionKey,
-          );
-          if (!degraded) {
-            await readPages(null);
-          }
+          const sessRaw = this.sessions.get(sessId);
+          const safeResets = degraded && sessRaw ? [...resetOwnerIds].filter((id) => !shouldKeepLocalRowsOnDegradedRebuild(sessRaw, latestSnapshot?.streamKey, id, true, degraded)) : [...resetOwnerIds];
+          this.applyDurableLiveFrames(sessId, stagedFrames, safeResets, lastDurableFrameSeqBySessionKey);
+          if (!degraded) await readPages(null);
         }
       } else {
         await readPages(null);
@@ -4630,7 +4650,8 @@ export class ChatSocket {
       }
 
       if (sess) {
-        sess._liveJournalDegraded = degraded;
+        if (degraded) { sess._liveJournalDegraded = true; this.scheduleDegradedJournalRetry(sessId); }
+        else this.clearLiveJournalDegraded(sess);
         this.scheduleNotify();
       }
 
@@ -4822,7 +4843,7 @@ export class ChatSocket {
     sessId: string,
     units: import("@openclaude/protocol").LiveUnit[],
     resetClientMessageIds: string[] = [],
-    resume?: { sessionKey: string; frameSeq: number; recordId: string },
+    resume?: { sessionKey: string; frameSeq: number; recordId: string; streamKey?: string },
     streamGeneration = 0,
   ): void {
     const sess = this.sessions.get(sessId);
@@ -4863,13 +4884,7 @@ export class ChatSocket {
     }
     sess.messages = prependLiveUnitMessages(sess.messages, mapped);
     restoreLiveUnitStreamingState(sess, units);
-    if (resume?.sessionKey && resume.frameSeq > 0) {
-      if (!sess._lastFrameSeqByKey || typeof sess._lastFrameSeqByKey !== "object") {
-        sess._lastFrameSeqByKey = {};
-      }
-      sess._lastFrameSeqByKey[resume.sessionKey] = resume.frameSeq;
-      sess._lastFrameSeq = Math.max(sess._lastFrameSeq || 0, resume.frameSeq);
-    }
+    applyLiveUnitsResumeStream(sess, units, resume, this.deps.defaultAgentId);
     rebuildIndexes(sess);
     normalizeDelegateCards(sess);
     normalizeGoalCards(sess);
@@ -5292,6 +5307,7 @@ export class ChatSocket {
     model?: string;
     effortLevel?: InboundMessage["effortLevel"];
     teamMode?: boolean;
+    swarmMode?: boolean;
     collabMode?: "solo" | "advisor" | "team";
     advisorModel?: string;
     collabConfigVersion?: string;
@@ -5333,6 +5349,7 @@ export class ChatSocket {
       ...(authorization?.consent?{modelSwitchConsent:authorization.consent}:{}),
       ...(preparedSwitch ? { modelSwitchId: preparedSwitch.id } : {}),
       teamMode: !!p.teamMode,
+      ...(p.swarmMode ? { swarmMode: true } : {}),
       ...(p.collabMode ? { collabMode: p.collabMode } : {}),
       ...(p.advisorModel ? { advisorModel: p.advisorModel } : {}),
       ...(p.collabConfigVersion ? { collabConfigVersion: p.collabConfigVersion } : {}),
@@ -5374,6 +5391,7 @@ export class ChatSocket {
       ...(preparedSwitch ? { modelSwitchId: preparedSwitch.id } : {}),
       // 团队模式(v5 轻量组队):只在开启时带上顶层 teamMode flag;后端仅 main 队长消费。
       ...(p.teamMode ? { teamMode: true } : {}),
+      ...(p.swarmMode ? { swarmMode: true } : {}),
       ...(p.collabMode ? { collabMode: p.collabMode } : {}),
       ...(p.advisorModel ? { advisorModel: p.advisorModel } : {}),
       ...(p.collabConfigVersion ? { collabConfigVersion: p.collabConfigVersion } : {}),
@@ -5394,6 +5412,7 @@ export class ChatSocket {
       _routing: { ...routing },
       _sendAttempt: 0,
     });
+    ensureFirstTextPaintVisibilityTracking(userMsg.ts);
     payload.clientMessageId = userMsg.id;
     payload.idempotencyKey = messageAttemptIdempotencyKey(userMsg.id, 0);
     // 生成占位卡（需求 C）：imageEdit 提交紧随乐观 user 行注入一条**本地专属**占位行
@@ -5584,6 +5603,7 @@ export class ChatSocket {
       ...(routing.modelSwitchId ? { modelSwitchId: routing.modelSwitchId } : {}),
       ...(routing.modelSwitchConsent ? { modelSwitchConsent:routing.modelSwitchConsent } : {}),
       ...(routing.teamMode ? { teamMode: true } : {}),
+      ...(routing.swarmMode ? { swarmMode: true } : {}),
       ...(routing.collabMode ? { collabMode: routing.collabMode } : {}),
       ...(routing.advisorModel ? { advisorModel: routing.advisorModel } : {}),
       ...(routing.collabConfigVersion ? { collabConfigVersion: routing.collabConfigVersion } : {}),
@@ -5808,6 +5828,7 @@ export class ChatSocket {
       ...(routing?.modelSwitchId ? { modelSwitchId: routing.modelSwitchId } : {}),
       ...(routing?.modelSwitchConsent ? { modelSwitchConsent:routing.modelSwitchConsent } : {}),
       ...(routing?.teamMode ? { teamMode: true } : {}),
+      ...(routing?.swarmMode ? { swarmMode: true } : {}),
       ...(routing?.collabMode ? { collabMode: routing.collabMode } : {}),
       ...(routing?.advisorModel ? { advisorModel: routing.advisorModel } : {}),
       ...(routing?.collabConfigVersion ? { collabConfigVersion: routing.collabConfigVersion } : {}),
@@ -5958,6 +5979,7 @@ export class ChatSocket {
     }
     if (item.controlKind === "stop") {
       this.finishDispatch(sess.id, item.clientMessageId);
+      this.metaTracker.clearStopTimeout(sess.id);
       sess._stopSettlement = undefined;
       this.clearSendingState(sess);
     } else if (item.requestId) {
@@ -6023,7 +6045,6 @@ export class ChatSocket {
       item.state = "persisting";
       // Claimed = being sent. 「待发送」只留给真正排在别的回合后面的消息。
       this.setUserRowStatus(item, "sending");
-      this.setTransientNotice(sess.id, "正在发送…");
       if(this.deps.authorizeSwitch&&item.payload.model&&!item.payload.content.imageEdit){
         void authorizeQueuedModelSwitch(item,this.deps.authorizeSwitch,{
           queue:this.offlineQueue,slots:this.dispatchSlots,sessions:this.sessions,
@@ -6045,10 +6066,10 @@ export class ChatSocket {
     if (!this.offlineQueue.includes(item) || item.state !== "persisting") return;
     // Local recovery storage is an enhancement, not a delivery gate. Keep the
     // exact in-memory identity until the server ACK and send immediately.
-    this.sendPersistedDispatch(item, false);
+    this.sendPersistedDispatch(item);
   }
 
-  private sendPersistedDispatch(item: OfflineItem, journalCommitted = true): void {
+  private sendPersistedDispatch(item: OfflineItem): void {
     if (!this.offlineQueue.includes(item) || item.state !== "persisting") return;
     if (
       !this.ws || this.ws.readyState !== 1 || !this.relayReady ||
@@ -6077,8 +6098,7 @@ export class ChatSocket {
       sess._streamingAssistant = null;
       sess._streamingThinking = null;
     }
-    if (journalCommitted) this.clearTransientNotice(sess.id);
-    else this.setTransientNotice(sess.id, "正在确认发送…");
+    this.clearTransientNotice(sess.id);
     this.scheduleNotify();
     this.deps.persistSession?.(sess.id);
   }
@@ -6302,12 +6322,19 @@ export class ChatSocket {
       sess._sendingInFlight = true;
       sess._activeClientMessageId = activeClientMessageId;
       sess._activeAgentId = agentId;
-      sess._stopSettlement = {
-        ...(activeClientMessageId ? { clientMessageId: activeClientMessageId } : {}),
-        controlId,
-        phase: "persisting",
-      };
+      sess._stopSettlement = { ...(activeClientMessageId ? { clientMessageId: activeClientMessageId } : {}), controlId, phase: "persisting" };
       sess._recoveryStatus = { kind: "stopping" };
+      const settlement = sess._stopSettlement;
+      this.metaTracker.armStopTimeout(sess.id, () => {
+        const cur = this.sessions.get(sess.id);
+        if (!cur || cur._stopSettlement !== settlement) return;
+        const idx = this.controlQueue.findIndex((i) => i.controlId === controlId);
+        if (idx >= 0) this.controlQueue.splice(idx, 1);
+        void this.deps.deletePendingControl?.(sess.id, controlId)?.catch(() => {});
+        if (activeClientMessageId) this.finishDispatch(sess.id, activeClientMessageId);
+        cur._stopSettlement = undefined; this.clearSendingState(cur); cur._recoveryStatus = { kind: "completed" };
+        this.deps.persistSession?.(sess.id); this.scheduleNotify(); void this.deps.syncSession?.(sess.id);
+      });
       this.enqueueControl({
         kind: "control",
         sessId: sess.id,
@@ -6429,6 +6456,7 @@ export class ChatSocket {
       ...(routing && Object.prototype.hasOwnProperty.call(routing, "effortLevel") ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] } : {}),
       ...(routing?.model ? { model: routing.model } : {}),
       ...(routing?.teamMode ? { teamMode: true } : {}),
+      ...(routing?.swarmMode ? { swarmMode: true } : {}),
       ...(routing?.collabMode ? { collabMode: routing.collabMode } : {}),
       ...(routing?.advisorModel ? { advisorModel: routing.advisorModel } : {}),
       ...(routing?.collabConfigVersion ? { collabConfigVersion: routing.collabConfigVersion } : {}),

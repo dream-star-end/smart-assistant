@@ -20,8 +20,8 @@
 //     读侧扫描才是安全权威兜底。
 
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { basename, join } from 'node:path'
+import { lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import {
   collectIndexContentLines,
   existingIndexLinesPreserved,
@@ -112,6 +112,21 @@ export class MemoryBarrierTimeoutError extends Error {
   }
 }
 
+export class MemoryBoundaryError extends Error {
+  readonly code = 'UNSAFE_MEMORY_BOUNDARY'
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'MemoryBoundaryError'
+  }
+}
+
+export interface ExclusiveMemoryLockOptions {
+  timeoutMs?: number
+  /** Extra directories under the trusted agent root (e.g. `memory-archive`) that must also be non-symlink and contained if present. */
+  checkDirs?: readonly string[]
+}
+
 /** sha256 前 16 位十六进制:内容指纹,用于乐观并发 version。空串也可算(确定值)。 */
 function sha16(s: string): string {
   return createHash('sha256').update(s).digest('hex').slice(0, 16)
@@ -144,6 +159,17 @@ function slugify(s: string): string {
 
 export type CoreMemoryPaths = Pick<typeof paths,
   'agentMemoryDir' | 'agentMemoryMd' | 'agentMemoryLock' | 'agentMemoryBatchJournal' | 'agentMemoryBarrier'>
+
+/** Build a CoreMemoryPaths binding anchored to an explicit agent directory (tests & archive/janitor). */
+export function createMemoryDirForAgentDir(agentDir: string, agentId = 'main'): MemoryDir {
+  return new MemoryDir(agentId, {
+    agentMemoryDir: () => join(agentDir, 'memory'),
+    agentMemoryMd: () => join(agentDir, 'MEMORY.md'),
+    agentMemoryLock: () => join(agentDir, 'MEMORY.md.lock'),
+    agentMemoryBatchJournal: () => join(agentDir, '.memory-batch-journal.json'),
+    agentMemoryBarrier: () => join(agentDir, 'memory-barrier.lock'),
+  })
+}
 
 export class MemoryDir {
   constructor(private readonly agentId: string, private readonly locations: CoreMemoryPaths = paths) {}
@@ -267,6 +293,129 @@ export class MemoryDir {
     }
   }
 
+  /**
+   * Verify trusted agent root boundary before any WAL recovery, legacy migration,
+   * or maintenance callback runs (B11). Rejects symlinked or escaping `memory/`,
+   * `MEMORY.md`, `.memory-batch-journal.json`, or any optional `checkDirs`
+   * (such as `memory-archive`). Missing directories/files are allowed (they have
+   * not been created yet), whereas dangling symlinks are rejected via `lstat`.
+   */
+  private async assertSafeMemoryBoundary(checkDirs: readonly string[] = []): Promise<void> {
+    const indexResolved = resolve(this.indexPath())
+    const rootResolved = dirname(indexResolved)
+
+    let rootStat
+    try {
+      rootStat = await lstat(rootResolved)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return
+      throw new MemoryBoundaryError(`unreadable memory root: ${rootResolved}`)
+    }
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+      throw new MemoryBoundaryError(`unsafe memory root (symlink or non-directory): ${rootResolved}`)
+    }
+    const realRoot = await realpath(rootResolved)
+
+    const verifyOptionalRegularFile = async (filePath: string, label: string): Promise<void> => {
+      const target = resolve(filePath)
+      if (!target.startsWith(rootResolved + sep)) {
+        throw new MemoryBoundaryError(`${label} escapes trusted agent root`)
+      }
+      let st
+      try {
+        st = await lstat(target)
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return
+        throw new MemoryBoundaryError(`unreadable ${label}`)
+      }
+      if (st.isSymbolicLink() || !st.isFile()) {
+        throw new MemoryBoundaryError(`unsafe ${label} (symlink or non-file)`)
+      }
+      const realFile = await realpath(target)
+      if (!realFile.startsWith(realRoot + sep)) {
+        throw new MemoryBoundaryError(`${label} realpath escapes trusted agent root`)
+      }
+    }
+
+    const verifyOptionalSubdirChain = async (dirPath: string, label: string): Promise<void> => {
+      const target = resolve(dirPath)
+      if (target !== rootResolved && !target.startsWith(rootResolved + sep)) {
+        throw new MemoryBoundaryError(`${label} escapes trusted agent root`)
+      }
+      const rel = relative(rootResolved, target)
+      if (!rel) return
+      const segments = rel.split(sep).filter(Boolean)
+      let cur = rootResolved
+      for (const seg of segments) {
+        if (seg === '.' || seg === '..') {
+          throw new MemoryBoundaryError(`invalid path segment in ${label}`)
+        }
+        cur = join(cur, seg)
+        let st
+        try {
+          st = await lstat(cur)
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return
+          throw new MemoryBoundaryError(`unreadable ${label}`)
+        }
+        if (st.isSymbolicLink() || !st.isDirectory()) {
+          throw new MemoryBoundaryError(`unsafe ${label} (symlink or non-directory)`)
+        }
+        const realCur = await realpath(cur)
+        if (realCur !== realRoot && !realCur.startsWith(realRoot + sep)) {
+          throw new MemoryBoundaryError(`${label} realpath escapes trusted agent root`)
+        }
+      }
+    }
+
+    await verifyOptionalRegularFile(this.indexPath(), 'MEMORY.md')
+    await verifyOptionalRegularFile(this.batchJournalPath(), '.memory-batch-journal.json')
+    await verifyOptionalSubdirChain(this.dirPath(), 'memory/')
+    for (const extra of checkDirs) {
+      await verifyOptionalSubdirChain(extra, basename(extra) || 'extra-dir')
+    }
+  }
+
+  /**
+   * Exclusive cross-process barrier + memdir file lock for atomic maintenance
+   * operations (e.g. reversible archive / restore). Validates trusted directory
+   * boundaries BEFORE any WAL recovery or legacy migration runs, then exposes
+   * `reconcileIndex` so callers can rebuild MEMORY.md while still holding the lock.
+   */
+  async withExclusiveMemoryLock<T>(
+    fn: (ctx: { dirPath: string; indexPath: string; reconcileIndex: () => Promise<string> }) => Promise<T>,
+    timeoutOrOptions: number | ExclusiveMemoryLockOptions = 5_000,
+  ): Promise<T> {
+    const timeoutMs =
+      typeof timeoutOrOptions === 'number' ? timeoutOrOptions : (timeoutOrOptions.timeoutMs ?? 5_000)
+    const checkDirs =
+      typeof timeoutOrOptions === 'number' ? [] : (timeoutOrOptions.checkDirs ?? [])
+
+    // Fail-closed BEFORE touching lockfiles, WAL recovery, or legacy migration
+    await this.assertSafeMemoryBoundary(checkDirs)
+
+    const barrier = await acquireKernelFileLock(
+      this.locations.agentMemoryBarrier(this.agentId),
+      timeoutMs,
+      'exclusive',
+    )
+    try {
+      return await this.withFileLock(async () => {
+        // Re-verify inside the exclusive lock (TOCTOU guard) BEFORE WAL recovery / migration
+        await this.assertSafeMemoryBoundary(checkDirs)
+        await this.recoverBatchLocked()
+        await this.ensureMigratedLocked()
+        return await fn({
+          dirPath: this.dirPath(),
+          indexPath: this.indexPath(),
+          reconcileIndex: () => this.reconcileIndexLocked(),
+        })
+      })
+    } finally {
+      await barrier.release().catch(() => {})
+    }
+  }
+
   /** 原子写:temp + rename,避免并发读者看到半写文件 / 崩溃残留。 */
   private async atomicWrite(fullPath: string, content: string): Promise<void> {
     await mkdir(this.dirPath(), { recursive: true })
@@ -313,6 +462,7 @@ export class MemoryDir {
    * idempotent, so another crash during recovery is safe to retry.
    */
   private async recoverBatchLocked(): Promise<void> {
+    await this.assertSafeMemoryBoundary()
     let raw: string
     try {
       raw = await readFile(this.batchJournalPath(), 'utf-8')
@@ -390,6 +540,7 @@ export class MemoryDir {
    *    写 marker 索引,原 blob 改名 `MEMORY.md.pre-memdir.bak`(留回滚)。
    */
   private async ensureMigratedLocked(): Promise<void> {
+    await this.assertSafeMemoryBoundary()
     const idxPath = this.indexPath()
     let raw: string | null = null
     try {

@@ -56,40 +56,16 @@ describe("turnSilenceMs", () => {
   });
 });
 
-describe("decideBackgroundTurnNotice(B4-SPEC §3.2)", () => {
-  test("不在飞 → 隐藏;在飞但无排队 → 隐藏(detached / 静默 ≥30s / 实扣积分均不单独弹出横幅)", () => {
-    expect(decide({ turnOpen: false, detached: true, queuedCount: 1 }).visible).toBe(false);
-    expect(decide().visible).toBe(false);
-    expect(decide({ detached: true }).visible).toBe(false);
-    expect(decide({ silenceMs: STALE_WARN_MS - 1 }).visible).toBe(false);
-    expect(decide({ silenceMs: STALE_WARN_MS }).visible).toBe(false);
-    expect(decide({ silenceMs: 31_000 }).visible).toBe(false);
-    expect(decide({ creditsSettled: "500" }).visible).toBe(false);
-  });
-
-  test("已有排队消息 → 显示", () => {
-    expect(decide({ queuedCount: 1 })).toEqual({ visible: true, lastTriggerAt: NOW });
-  });
-
-  test("断线 / 连接中 → 立即隐藏并清保持期(断线期间说「仍在运行」会撒谎)", () => {
-    for (const transport of ["disconnected", "connecting"] as const) {
-      expect(decide({ transport, detached: true, queuedCount: 2 }, NOW - 1000)).toEqual({
-        visible: false,
-        lastTriggerAt: null,
-      });
-    }
-  });
-
-  test("回合结束 → 立即隐藏,不走保持期", () => {
-    expect(decide({ turnOpen: false }, NOW - 1000)).toEqual({ visible: false, lastTriggerAt: null });
-  });
-
-  test("触发消失后保持 10 秒才消失", () => {
-    expect(decide({}, NOW - (BACKGROUND_TURN_HOLD_MS - 1))).toEqual({
-      visible: true,
-      lastTriggerAt: NOW - (BACKGROUND_TURN_HOLD_MS - 1),
-    });
-    expect(decide({}, NOW - BACKGROUND_TURN_HOLD_MS)).toEqual({ visible: false, lastTriggerAt: null });
+describe("decideBackgroundTurnNotice(独立横幅已退场，无 10 秒残影)", () => {
+  test("BACKGROUND_TURN_HOLD_MS 为 0，无论排队或历史触发都不再弹出独立横幅", () => {
+    expect(BACKGROUND_TURN_HOLD_MS).toBe(0);
+    expect(decide({ turnOpen: false, detached: true, queuedCount: 1 })).toEqual({ visible: false, lastTriggerAt: null });
+    expect(decide()).toEqual({ visible: false, lastTriggerAt: null });
+    expect(decide({ detached: true })).toEqual({ visible: false, lastTriggerAt: null });
+    expect(decide({ silenceMs: STALE_WARN_MS })).toEqual({ visible: false, lastTriggerAt: null });
+    expect(decide({ creditsSettled: "500" })).toEqual({ visible: false, lastTriggerAt: null });
+    expect(decide({ queuedCount: 1 })).toEqual({ visible: false, lastTriggerAt: null });
+    expect(decide({}, NOW - 1000)).toEqual({ visible: false, lastTriggerAt: null });
   });
 });
 

@@ -103,7 +103,7 @@ function fmtDateTime(value?: string): string {
 
 function SmallMeta({ icon, children }: { icon?: ReactNode; children: ReactNode }) {
   return (
-    <span className="inline-flex min-w-0 items-center gap-1 rounded-full bg-hover px-2 py-0.5 text-caption text-muted">
+    <span className="inline-flex min-w-0 items-center gap-1 rounded-full border border-border/60 bg-hover/70 px-2 py-0.5 text-caption text-muted tabular-nums">
       {icon}
       <span className="min-w-0 truncate">{children}</span>
     </span>
@@ -114,25 +114,24 @@ function ReminderJobCard({ job }: { job: ReminderJob }) {
   const human = job.schedule ? cronHuman(job.schedule) : "自定义时间";
   const Icon = job.isSystem ? Settings : Clock;
   return (
-    // 条目已在 ToolCard 内,不再套 rounded-xl + 阴影的第三层卡(T-14)。
-    <li className="rounded-lg border border-border/70 bg-surface px-3 py-2">
+    <li className="oc-surface-card rounded-lg px-3 py-2.5">
       <div className="flex items-start gap-2.5">
-        <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
-          <Icon size={14} />
+        <span className={cn("oc-icon-badge mt-0.5 size-7", !job.isSystem && "oc-icon-badge-accent")}>
+          <Icon size={14} strokeWidth={1.75} />
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 flex-wrap items-center gap-1.5">
             <span className="min-w-0 max-w-full truncate text-body font-semibold text-fg">{job.title}</span>
-            {job.isSystem && <Badge tone="neutral">系统</Badge>}
-            {job.enabled === false ? <Badge tone="warning">已停用</Badge> : <Badge tone="success">启用中</Badge>}
+            {job.isSystem && <Badge tone="neutral" size="sm">系统</Badge>}
+            {job.enabled === false ? <Badge tone="warning" size="sm">已停用</Badge> : <Badge tone="success" size="sm">启用中</Badge>}
           </div>
-          <div className="mt-1 flex flex-wrap gap-1.5">
-            <SmallMeta icon={<CalendarClock size={11} />}>{human}</SmallMeta>
+          <div className="mt-1.5 flex flex-wrap gap-1.5">
+            <SmallMeta icon={<CalendarClock size={11} strokeWidth={1.75} />}>{human}</SmallMeta>
             {job.schedule && <SmallMeta>{job.schedule}</SmallMeta>}
             <SmallMeta>{job.oneshot ? "一次性" : "重复"}</SmallMeta>
             {job.deliver && <SmallMeta>{job.deliver}</SmallMeta>}
             {job.nextRunAt && <SmallMeta>下次 {fmtDateTime(job.nextRunAt)}</SmallMeta>}
-            <SmallMeta icon={<Hash size={10} />}>{job.id}</SmallMeta>
+            <SmallMeta icon={<Hash size={10} strokeWidth={1.75} />}>{job.id}</SmallMeta>
           </div>
         </div>
       </div>
@@ -145,18 +144,22 @@ export function renderReminderListCard(output?: string | null): ReactNode | null
   if (!parsed) return null;
   if (parsed.kind === "empty") {
     return (
-      <div className="rounded-xl border border-dashed border-border bg-elevated px-3 py-4 text-center">
-        <Clock size={18} className="mx-auto text-faint" />
-        <div className="mt-1 text-body font-medium text-fg">还没有定时任务</div>
+      <div className="oc-surface-recessed rounded-xl border-dashed px-4 py-5 text-center">
+        <span className="oc-icon-badge mx-auto size-9">
+          <Clock size={16} strokeWidth={1.75} />
+        </span>
+        <div className="mt-2 text-body font-medium text-fg">还没有定时任务</div>
         <p className="mt-0.5 text-meta text-faint">可以直接对智能体说“每天 9 点提醒我…”来创建。</p>
       </div>
     );
   }
   return (
-    <div className="flex flex-col gap-2">
+    <div className="flex flex-col gap-2.5">
       <div className="flex items-center justify-between gap-2">
-        <div className="flex items-center gap-2 text-meta font-medium text-fg">
-          <ListChecks size={14} className="text-accent" />
+        <div className="flex items-center gap-2 text-meta font-medium text-fg tabular-nums">
+          <span className="oc-icon-badge oc-icon-badge-accent size-6">
+            <ListChecks size={13} strokeWidth={1.75} />
+          </span>
           当前共有 {parsed.declaredCount ?? parsed.jobs.length} 个定时任务
         </div>
       </div>
@@ -234,23 +237,23 @@ export function ReminderStatusCard({ op, input, output, error }: { op: string; i
   // desc 与标题同句(如「创建提醒失败」)时不重复第二遍(T-29)。
   const desc = status.desc && status.desc.trim() !== status.title ? status.desc : "";
   return (
-    <div className={cn("rounded-lg border px-3 py-2", status.ok === false ? "border-danger-soft bg-danger-soft/40" : "border-border/70 bg-surface")}>
+    <div className={cn("rounded-lg px-3 py-2.5", status.ok === false ? "oc-callout oc-callout-danger" : "oc-surface-card")}>
       <div className="flex items-start gap-2.5">
-        <span className={cn("mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg", status.ok === false ? "bg-danger-soft text-danger" : "bg-accent-soft text-accent")}>
-          <Icon size={14} />
+        <span className={cn("oc-icon-badge mt-0.5 size-7", status.ok === false ? "oc-icon-badge-danger" : "oc-icon-badge-accent")}>
+          <Icon size={14} strokeWidth={1.75} />
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
             <span className="text-body font-semibold text-fg">{status.title}</span>
             {/* 与 ToolCard F1 口径一致:「未成功」而非「失败」(T-29)。 */}
-            <Badge tone={statusTone(status.ok)}>{status.ok === false ? "未成功" : "完成"}</Badge>
+            <Badge tone={statusTone(status.ok)} size="sm">{status.ok === false ? "未成功" : "完成"}</Badge>
           </div>
-          {desc && <p className="mt-0.5 whitespace-pre-wrap break-words text-[12px] leading-snug text-muted">{desc}</p>}
-          <div className="mt-1 flex flex-wrap gap-1.5">
-            {status.schedule && <SmallMeta icon={<CalendarClock size={11} />}>{cronHuman(status.schedule)}</SmallMeta>}
+          {desc && <p className="mt-0.5 whitespace-pre-wrap break-words text-meta leading-snug text-muted">{desc}</p>}
+          <div className="mt-1.5 flex flex-wrap gap-1.5">
+            {status.schedule && <SmallMeta icon={<CalendarClock size={11} strokeWidth={1.75} />}>{cronHuman(status.schedule)}</SmallMeta>}
             {status.schedule && <SmallMeta>{status.schedule}</SmallMeta>}
             {status.chips.map((chip) => <SmallMeta key={chip}>{chip}</SmallMeta>)}
-            {status.id && <SmallMeta icon={<Hash size={10} />}>{status.id}</SmallMeta>}
+            {status.id && <SmallMeta icon={<Hash size={10} strokeWidth={1.75} />}>{status.id}</SmallMeta>}
           </div>
         </div>
       </div>

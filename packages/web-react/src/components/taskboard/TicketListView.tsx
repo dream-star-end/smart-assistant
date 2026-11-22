@@ -1,4 +1,4 @@
-import { ListFilter, Plus, SlidersHorizontal, X } from 'lucide-react'
+import { Bot, ListFilter, Plus, SlidersHorizontal, X } from 'lucide-react'
 import { type ReactNode, useEffect, useRef, useState } from 'react'
 import { useMdViewport } from '../../hooks/useMdViewport'
 import {
@@ -12,11 +12,21 @@ import {
   TICKET_TYPE_LABEL,
   type Ticket,
   type TicketListQuery,
+  type TicketStatus,
   assigneeLabel,
 } from '../../lib/taskboard'
 import { cn } from '../../lib/utils'
 import { Badge, Button, EmptyState, Input, Select, TimeAgo } from '../ui'
-import { TicketCard, ticketTypeIcon, ticketTypeIconClass } from './TicketCard'
+import { TicketCard, ticketTypeBadgeClass, ticketTypeIcon } from './TicketCard'
+
+function ticketStatusTone(status: TicketStatus): 'danger' | 'success' | 'warning' | 'info' | 'accent' | 'neutral' {
+  if (status === 'blocked') return 'danger'
+  if (status === 'done') return 'success'
+  if (status === 'waiting_human') return 'warning'
+  if (status === 'running') return 'info'
+  if (status === 'ready') return 'accent'
+  return 'neutral'
+}
 
 const PRIORITY_LABEL = {
   P0: 'P0 紧急',
@@ -276,7 +286,7 @@ export function TicketListView({
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3 px-4 pb-4">
       {hideFilters ? null : (
-        <div className="flex flex-col gap-2">
+        <div className="oc-surface-card flex flex-col gap-2.5 rounded-xl p-3">
           <div className="flex items-center gap-2">
             <Input
               aria-label="搜索单据"
@@ -313,73 +323,105 @@ export function TicketListView({
       ) : (
         <div ref={listScrollRef} className="min-h-0 flex-1 overflow-y-auto">
           {desktop ? (
-            <table aria-rowcount={tickets.length + 1} className="w-full border-collapse text-left text-body">
-              <thead className="sticky top-0 bg-bg text-caption text-faint">
-                <tr>
-                  <th className="px-2 py-2 font-medium">编号</th>
-                  <th className="px-2 py-2 font-medium">标题</th>
-                  <th className="px-2 py-2 font-medium">类型</th>
-                  <th className="px-2 py-2 font-medium">优先级</th>
-                  <th className="px-2 py-2 font-medium">状态</th>
-                  <th className="px-2 py-2 font-medium">执行者</th>
-                  <th className="px-2 py-2 font-medium">更新</th>
-                  <th className="px-2 py-2 font-medium">
-                    <span className="sr-only">操作</span>
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {pageTickets.map((ticket, index) => {
-                  const Icon = ticketTypeIcon(ticket.type)
-                  return (
-                    <tr
-                      key={ticket.id}
-                      data-testid="ticket-card"
-                      aria-rowindex={pageStart + index + 2}
-                      className={cn('border-t border-border', onOpenTicket && 'hover:bg-hover')}
-                    >
-                      <td className="px-2 py-2 font-mono text-caption text-faint">
-                        {ticket.identifier}
-                      </td>
-                      <td className="max-w-[18rem] truncate px-2 py-2 font-medium text-fg">
-                        {onOpenTicket ? (
-                          <button
-                            type="button"
-                            className="truncate text-left outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
-                            onClick={() => onOpenTicket(ticket)}
-                          >
-                            {ticket.title}
-                          </button>
-                        ) : (
-                          ticket.title
+            <div className="oc-surface-card overflow-hidden rounded-xl">
+              <table aria-rowcount={tickets.length + 1} className="w-full border-collapse text-left text-body">
+                <thead className="sticky top-0 z-10 border-b border-border/80 bg-hover/80 text-caption font-medium text-faint backdrop-blur-sm">
+                  <tr>
+                    <th className="px-3 py-2.5 font-medium">编号</th>
+                    <th className="px-3 py-2.5 font-medium">标题</th>
+                    <th className="px-3 py-2.5 font-medium">类型</th>
+                    <th className="px-3 py-2.5 font-medium">优先级</th>
+                    <th className="px-3 py-2.5 font-medium">状态</th>
+                    <th className="px-3 py-2.5 font-medium">执行者</th>
+                    <th className="px-3 py-2.5 font-medium">更新</th>
+                    <th className="px-3 py-2.5 text-right font-medium">
+                      <span className="sr-only">操作</span>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pageTickets.map((ticket, index) => {
+                    const Icon = ticketTypeIcon(ticket.type)
+                    const agent = assigneeLabel(ticket.assignee)
+                    return (
+                      <tr
+                        key={ticket.id}
+                        data-testid="ticket-card"
+                        aria-rowindex={pageStart + index + 2}
+                        className={cn(
+                          'border-t border-border/65 transition-colors duration-150',
+                          (ticket.status === 'canceled' || ticket.status === 'done') && 'opacity-70',
+                          onOpenTicket && 'hover:bg-hover/70',
                         )}
-                      </td>
-                      <td className="px-2 py-2">
-                        <span className="inline-flex items-center gap-1">
-                          <Icon size={13} className={ticketTypeIconClass(ticket.type)} aria-hidden />
-                          {TICKET_TYPE_LABEL[ticket.type]}
-                        </span>
-                      </td>
-                      <td className="px-2 py-2">
-                        <Badge tone={TICKET_PRIORITY_TONE[ticket.priority]} size="sm">
-                          {ticket.priority}
-                        </Badge>
-                      </td>
-                      <td className="px-2 py-2">{TICKET_STATUS_LABEL[ticket.status]}</td>
-                      <td className="max-w-[10rem] truncate px-2 py-2 text-muted">
-                        {assigneeLabel(ticket.assignee) || '—'}
-                      </td>
-                      <td className="px-2 py-2 text-muted">
-                        <TimeAgo value={ticket.updatedAt} format="short" />
-                      </td>
-                      <td className="px-2 py-2">{renderActions?.(ticket)}</td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
+                      >
+                        <td className="px-3 py-2.5 whitespace-nowrap">
+                          <span className="inline-flex items-center rounded-md bg-hover px-1.5 py-0.5 font-mono text-caption font-medium tracking-tight text-muted tabular-nums">
+                            {ticket.identifier}
+                          </span>
+                        </td>
+                        <td className="max-w-[18rem] truncate px-3 py-2.5 font-medium text-fg">
+                          {onOpenTicket ? (
+                            <button
+                              type="button"
+                              className={cn(
+                                'max-w-full truncate text-left outline-none transition-colors hover:text-accent focus-visible:rounded-sm focus-visible:ring-2 focus-visible:ring-ring',
+                                ticket.status === 'canceled' && 'line-through',
+                              )}
+                              onClick={() => onOpenTicket(ticket)}
+                            >
+                              {ticket.title}
+                            </button>
+                          ) : (
+                            <span className={ticket.status === 'canceled' ? 'line-through' : undefined}>
+                              {ticket.title}
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-3 py-2.5 whitespace-nowrap">
+                          <span className="inline-flex items-center gap-1.5 text-meta text-muted">
+                            <span className={cn('size-5 rounded-md', ticketTypeBadgeClass(ticket.type))} aria-hidden>
+                              <Icon size={11} />
+                            </span>
+                            {TICKET_TYPE_LABEL[ticket.type]}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2.5 whitespace-nowrap">
+                          <Badge tone={TICKET_PRIORITY_TONE[ticket.priority]} size="sm">
+                            {ticket.priority}
+                          </Badge>
+                        </td>
+                        <td className="px-3 py-2.5 whitespace-nowrap">
+                          <Badge tone={ticketStatusTone(ticket.status)} size="sm">
+                            {TICKET_STATUS_LABEL[ticket.status]}
+                          </Badge>
+                        </td>
+                        <td className="max-w-[10rem] truncate px-3 py-2.5 text-muted">
+                          {agent ? (
+                            <span className="inline-flex min-w-0 items-center gap-1.5">
+                              <span
+                                className="oc-avatar-ring inline-flex size-4 shrink-0 items-center justify-center rounded-full bg-accent-soft text-accent"
+                                aria-hidden
+                              >
+                                <Bot size={10} />
+                              </span>
+                              <span className="truncate">{agent}</span>
+                            </span>
+                          ) : (
+                            <span className="text-faint">—</span>
+                          )}
+                        </td>
+                        <td className="px-3 py-2.5 whitespace-nowrap text-caption tabular-nums text-muted">
+                          <TimeAgo value={ticket.updatedAt} format="short" />
+                        </td>
+                        <td className="px-3 py-2.5 text-right whitespace-nowrap">{renderActions?.(ticket)}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
           ) : (
-            <div className="flex flex-col gap-2" data-testid="ticket-list-cards">
+            <div className="flex flex-col gap-2.5" data-testid="ticket-list-cards">
               {pageTickets.map((ticket) => (
                 <TicketCard
                   key={ticket.id}
@@ -394,8 +436,11 @@ export function TicketListView({
         </div>
       )}
       {tickets.length > pageSize && (
-        <nav aria-label="任务列表分页" className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-t border-border pt-3">
-          <output className="text-caption text-muted" aria-live="polite" data-testid="ticket-list-page-range">
+        <nav
+          aria-label="任务列表分页"
+          className="oc-surface-recessed flex shrink-0 flex-wrap items-center justify-between gap-2 rounded-xl px-3.5 py-2"
+        >
+          <output className="text-caption tabular-nums text-muted" aria-live="polite" data-testid="ticket-list-page-range">
             第 {pageStart + 1}–{Math.min(pageStart + pageSize, tickets.length)} 条 · 已加载 {tickets.length} 条
           </output>
           <div className="flex gap-2">
@@ -407,7 +452,7 @@ export function TicketListView({
       {typeof total === 'number' && total > (loadedCount ?? tickets.length) && (
         <div
           data-testid="ticket-list-truncated"
-          className="mt-3 flex flex-wrap items-center justify-between gap-2 text-caption text-muted"
+          className="oc-surface-recessed mt-1 flex flex-wrap items-center justify-between gap-2 rounded-xl px-3.5 py-2 text-caption tabular-nums text-muted"
         >
           <p>
             {loadedCount == null && tickets.length <= pageSize ? '已显示' : '已加载'} {loadedCount ?? tickets.length} / {total} 条

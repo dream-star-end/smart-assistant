@@ -1,3 +1,4 @@
+import { Activity, Eye, Users } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { apiErrorMessage } from "../../lib/api";
 import { type SiteAnalyticsData, sitesApi } from "../../lib/sitesApi";
@@ -108,29 +109,12 @@ export function SiteAnalyticsTab({
   const activePoint = hoverIdx !== null ? (chart.series[hoverIdx] ?? null) : null;
 
   return (
-    <div className="space-y-6">
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div className="flex flex-wrap items-center gap-8 sm:gap-12">
-          <div>
-            <p className="text-meta text-muted">独立访客数</p>
-            <p className="mt-1 text-2xl font-semibold tabular-nums text-fg">
-              {loading && !data ? "—" : (data?.totals.uniqueVisitors ?? 0)}
-            </p>
-          </div>
-          <div>
-            <p className="text-meta text-muted">请求数</p>
-            <p className="mt-1 text-2xl font-semibold tabular-nums text-fg">
-              {loading && !data ? "—" : (data?.totals.requests ?? 0)}
-            </p>
-          </div>
-          <div>
-            <p className="text-meta text-muted">页面浏览量</p>
-            <p className="mt-1 text-2xl font-semibold tabular-nums text-fg">
-              {loading && !data ? "—" : (data?.totals.pageViews ?? 0)}
-            </p>
-          </div>
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h3 className="text-section font-semibold text-fg">流量概览</h3>
+          <p className="text-caption text-muted">实时统计独立访客、请求与页面浏览量</p>
         </div>
-
         <SegmentedControl<string>
           aria-label="统计周期"
           size="sm"
@@ -141,6 +125,42 @@ export function SiteAnalyticsTab({
             { value: "30", label: "30 天" },
           ]}
         />
+      </div>
+
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <div className="oc-surface-card flex items-start justify-between gap-3 rounded-xl p-4">
+          <div className="min-w-0">
+            <p className="text-meta font-medium text-muted">独立访客数</p>
+            <p className="mt-2 text-2xl font-semibold leading-none tracking-tight tabular-nums text-fg">
+              {loading && !data ? "—" : (data?.totals.uniqueVisitors ?? 0)}
+            </p>
+          </div>
+          <span className="oc-icon-badge oc-icon-badge-info size-9 rounded-lg" aria-hidden="true">
+            <Users size={17} strokeWidth={1.75} />
+          </span>
+        </div>
+        <div className="oc-surface-card flex items-start justify-between gap-3 rounded-xl p-4">
+          <div className="min-w-0">
+            <p className="text-meta font-medium text-muted">请求数</p>
+            <p className="mt-2 text-2xl font-semibold leading-none tracking-tight tabular-nums text-fg">
+              {loading && !data ? "—" : (data?.totals.requests ?? 0)}
+            </p>
+          </div>
+          <span className="oc-icon-badge oc-icon-badge-accent size-9 rounded-lg" aria-hidden="true">
+            <Activity size={17} strokeWidth={1.75} />
+          </span>
+        </div>
+        <div className="oc-surface-card flex items-start justify-between gap-3 rounded-xl p-4">
+          <div className="min-w-0">
+            <p className="text-meta font-medium text-muted">页面浏览量</p>
+            <p className="mt-2 text-2xl font-semibold leading-none tracking-tight tabular-nums text-fg">
+              {loading && !data ? "—" : (data?.totals.pageViews ?? 0)}
+            </p>
+          </div>
+          <span className="oc-icon-badge oc-icon-badge-warning size-9 rounded-lg" aria-hidden="true">
+            <Eye size={17} strokeWidth={1.75} />
+          </span>
+        </div>
       </div>
 
       {err && (
@@ -154,33 +174,35 @@ export function SiteAnalyticsTab({
         </Alert>
       )}
 
-      <div className="rounded-xl border border-border bg-surface p-5">
+      <div className="oc-surface-card rounded-2xl p-5">
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
           <div>
             <h3 className="text-section font-semibold text-fg">流量趋势</h3>
             <p className="text-caption text-muted">每日</p>
           </div>
-          <div className="flex flex-wrap items-center gap-4 text-caption text-muted">
-            <span className="inline-flex items-center gap-1.5">
+          <div className="flex flex-wrap items-center gap-2 text-caption text-muted">
+            <span className="oc-surface-recessed inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 tabular-nums">
               <svg width="8" height="8" aria-hidden="true" className="shrink-0">
                 <circle cx="4" cy="4" r="4" fill="var(--info)" />
               </svg>
               独立访客{activePoint ? ` ${activePoint.uniqueVisitors}` : ""}
             </span>
-            <span className="inline-flex items-center gap-1.5">
+            <span className="oc-surface-recessed inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 tabular-nums">
               <svg width="8" height="8" aria-hidden="true" className="shrink-0">
                 <circle cx="4" cy="4" r="4" fill="var(--accent)" />
               </svg>
               请求数{activePoint ? ` ${activePoint.requests}` : ""}
             </span>
-            <span className="inline-flex items-center gap-1.5">
+            <span className="oc-surface-recessed inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 tabular-nums">
               <svg width="8" height="8" aria-hidden="true" className="shrink-0">
                 <circle cx="4" cy="4" r="4" fill="var(--warning)" />
               </svg>
               页面浏览量{activePoint ? ` ${activePoint.pageViews}` : ""}
             </span>
             {activePoint && (
-              <span className="font-medium text-fg">{formatShortDate(activePoint.date)}</span>
+              <span className="oc-badge-craft rounded-full bg-accent-soft px-2.5 py-1 font-medium text-accent">
+                {formatShortDate(activePoint.date)}
+              </span>
             )}
           </div>
         </div>

@@ -159,20 +159,20 @@ class LocalGateCacheTest(unittest.TestCase):
         self.assertEqual(d1["system-approval-fencing"], d_docs["system-approval-fencing"])
         self.assertNotEqual(d1["architecture"], d_docs["architecture"])
 
-        # Pure web-react App.tsx change (OCV5-775): 21 gates (storage/gateway/backend/backend_ccb)
-        # stay identical; the 3 full-scope gates (session-unavailable-rootfix, platform-tool-proofs, architecture) change!
+        # Pure web-react App.tsx change (OCV5-775 / OCV5-823): 21 non-web gates stay identical;
+        # the 3 web-touching gates (session-unavailable-rootfix, platform-tool-proofs, architecture) change!
         self.write_repo("packages/web-react/src/App.tsx", "export const W = 2;\n")
         sha_web = self.commit_all("web")
         d_web = cache_mod.compute_scope_digests(
             str(self.repo), sha_web, "v20.20.2", "Python 3.11", "img:1", "/usr/bin/bun:1.2.0"
         )
         for gid, scope in cache_mod.GATE_SCOPES.items():
-            if scope in ("storage", "gateway", "backend", "backend_ccb"):
+            if scope not in ("backend_web", "full"):
                 self.assertEqual(d_docs[gid], d_web[gid], gid)
             else:
                 self.assertNotEqual(d_docs[gid], d_web[gid], gid)
 
-        # OCV5-775: editing CCB_WEB_EXTRA_PATHS invalidates ccb-mcp-availability + full, while backend stays unchanged.
+        # OCV5-775: editing CCB_WEB_EXTRA_PATHS invalidates ccb-mcp-availability + backend_web/full, while backend stays unchanged.
         self.write_repo("packages/web-react/src/components/tool/format.ts", "export const F = 1;\n")
         sha_ccb_web = self.commit_all("web-ccb-format")
         d_ccb_web = cache_mod.compute_scope_digests(
@@ -185,7 +185,8 @@ class LocalGateCacheTest(unittest.TestCase):
         sha_web = sha_ccb_web
         d_web = d_ccb_web
 
-        # commercial/src change: storage & gateway scopes stay identical; backend & full change.
+        # commercial/src/ws/bridge.ts change: storage, gateway, policy, watch, ccb, and commercial-leaf gates
+        # stay identical; full backend & backend_web & full gates change!
         self.write_repo("packages/commercial/src/ws/bridge.ts", "export const C = 2;\n")
         sha_comm = self.commit_all("commercial-src")
         d_comm = cache_mod.compute_scope_digests(
@@ -193,8 +194,13 @@ class LocalGateCacheTest(unittest.TestCase):
         )
         self.assertEqual(d_web["system-approval-fencing"], d_comm["system-approval-fencing"])
         self.assertEqual(d_web["upload-retention-http"], d_comm["upload-retention-http"])
+        self.assertEqual(d_web["ccb-mcp-availability"], d_comm["ccb-mcp-availability"])
+        self.assertEqual(d_web["watch-gate"], d_comm["watch-gate"])
+        self.assertEqual(d_web["host-log-policy"], d_comm["host-log-policy"])
+        self.assertEqual(d_web["codex-chatgpt-ws"], d_comm["codex-chatgpt-ws"])
+        self.assertEqual(d_web["terminal-unproven"], d_comm["terminal-unproven"])
         self.assertNotEqual(d_web["box-longtask"], d_comm["box-longtask"])
-        self.assertNotEqual(d_web["ccb-mcp-availability"], d_comm["ccb-mcp-availability"])
+        self.assertNotEqual(d_web["master-incident-proofs"], d_comm["master-incident-proofs"])
 
         # commercial/agent-sandbox prompt change MUST invalidate gateway scope too!
         self.write_repo("packages/commercial/agent-sandbox/platform-runtime/prompts/p.md", "prompt v2\n")
@@ -544,9 +550,9 @@ printf 'EVENT sealed\\n' >>"$EVENTS"
         self.assertEqual(notes2["arch.grown"], "1")
         self.assertEqual(notes2["arch.unmapped"], "2")
 
-        # Run 3 (cross-commit pure web-react fixup, like OCV5-773 e0c1f1ee1! OCV5-775 narrowed scopes):
-        # 21/24 gates STILL hit receipts; ONLY D + the 3 full-scope gates (session-rootfix, architecture, platform-tool-proofs) run!
-        # db-create does NOT run because master-incident-proofs is now in backend scope!
+        # Run 3 (cross-commit pure web-react fixup, like OCV5-773 e0c1f1ee1! OCV5-775 + OCV5-823):
+        # 21/24 gates STILL hit receipts; ONLY D + the 3 web-touching gates (all in C.parallel!) run!
+        # Neither idle-box-gates nor db-create runs because platform-tool-proofs is now in C.parallel!
         self.write_repo("packages/web-react/src/App.tsx", "export const W = 99;\n")
         sha_web_fix = self.commit_all("fix(v5): lazy split web-react bundle")
         rc3, ev3, notes3, err3 = execute_train(sha_web_fix, "tr-run3", fail_at="")
@@ -562,7 +568,7 @@ printf 'EVENT sealed\\n' >>"$EVENTS"
             ]),
         )
         self.assertEqual(notes3["localGateCache.hits"], "21/24")
-        self.assertIn("EVENT idle-box-gates", ev3)
+        self.assertNotIn("EVENT idle-box-gates", ev3)
         self.assertNotIn("EVENT db-create", ev3)
         self.assertEqual((self.base / "tsc-cache/web-react.tsbuildinfo").read_text(encoding="utf-8"), "buildinfo-from-D\n")
 
@@ -757,6 +763,122 @@ printf 'EVENT sealed\\n' >>"$EVENTS"
         d_bsym2 = cache_mod.compute_scope_digests(str(self.repo), sha_bsym2, "v20", "py3", "", "bun:1")
         self.assertNotEqual(d_bsym1["upload-retention-http"], d_bsym2["upload-retention-http"])
         self.assertNotEqual(d_bsym1["system-approval-fencing"], d_bsym2["system-approval-fencing"])
+
+    def test_ocv5_823_per_gate_file_closure_isolation_and_conservative_fallbacks(self) -> None:
+        # Seed representative gate scripts + transitive helpers + commercial leaf modules + deploy configs.
+        self.write_repo("scripts/v5-worktree-new.sh", "#!/usr/bin/env bash\necho v1\n")
+        self.write_repo("scripts/v5-selfhost-watch.sh", "#!/usr/bin/env bash\necho watch v1\n")
+        self.write_repo("scripts/v5-selfhost-watch-gate.sh", "WATCH_GATE_TESTS=(v5-selfhost-watch-selftest.sh)\n")
+        self.write_repo("scripts/v5-selfhost-watch-selftest.sh", "source scripts/v5-selfhost-watch.sh\n")
+        self.write_repo("scripts/check-v5-box-longtask.ts", 'import "./lib/gateLoadScale.js";\n')
+        self.write_repo("scripts/check-v5-box-incident-proofs.ts", 'import "./lib/boxCustomHelper.js";\n')
+        self.write_repo("scripts/lib/gateLoadScale.ts", "export const SCALE = 1;\n")
+        self.write_repo("scripts/lib/boxCustomHelper.ts", "export const HELPER = 1;\n")
+        self.write_repo("deploy/v5-selfhost/host-log-policy.json", '{"v":1}\n')
+        self.write_repo("packages/commercial/src/http/proxy/boxRunLiveness.ts", "export const LIVE = 1;\n")
+        self.write_repo("packages/commercial/src/http/codexUpstreamHeaders.ts", "export const HDR = 1;\n")
+        self.write_repo("claude-code-best/src/index.ts", "export const CCB = 1;\n")
+        self.write_repo(".github/workflows/ci.yml", "name: ci\n")
+        sha0 = self.commit_all("seed-closures")
+        d0 = cache_mod.compute_scope_digests(str(self.repo), sha0, "v20", "py3", "img:1", "bun:1")
+
+        # 1) Editing a single UNRELATED script must NOT bust the 24 gates: 23/24 keep identical digests!
+        self.write_repo("scripts/v5-worktree-new.sh", "#!/usr/bin/env bash\necho v2\n")
+        sha_unrel = self.commit_all("edit-unrelated-script")
+        d_unrel = cache_mod.compute_scope_digests(str(self.repo), sha_unrel, "v20", "py3", "img:1", "bun:1")
+        changed_unrel = sorted(gid for gid in d0 if d0[gid] != d_unrel[gid])
+        self.assertEqual(changed_unrel, ["architecture"])
+
+        # Editing .github/workflows/ci.yml also keeps 23/24 gates unchanged!
+        self.write_repo(".github/workflows/ci.yml", "name: ci-v2\n")
+        sha_ci = self.commit_all("edit-ci")
+        d_ci = cache_mod.compute_scope_digests(str(self.repo), sha_ci, "v20", "py3", "img:1", "bun:1")
+        self.assertEqual(sorted(gid for gid in d_unrel if d_unrel[gid] != d_ci[gid]), ["architecture"])
+
+        # 2) Editing a gate-specific script MUST miss that gate while leaving unrelated gates intact!
+        self.write_repo("scripts/v5-selfhost-watch.sh", "#!/usr/bin/env bash\necho watch v2\n")
+        sha_watch = self.commit_all("edit-watch")
+        d_watch = cache_mod.compute_scope_digests(str(self.repo), sha_watch, "v20", "py3", "img:1", "bun:1")
+        self.assertEqual(sorted(gid for gid in d_ci if d_ci[gid] != d_watch[gid]), ["architecture", "watch-gate"])
+
+        self.write_repo("scripts/check-v5-box-longtask.ts", 'import "./lib/gateLoadScale.js";\n// v2\n')
+        sha_lt = self.commit_all("edit-box-longtask")
+        d_lt = cache_mod.compute_scope_digests(str(self.repo), sha_lt, "v20", "py3", "img:1", "bun:1")
+        self.assertEqual(sorted(gid for gid in d_watch if d_watch[gid] != d_lt[gid]), ["architecture", "box-longtask"])
+
+        # Transitive helper discovered automatically via static import closure:
+        self.write_repo("scripts/lib/boxCustomHelper.ts", "export const HELPER = 2;\n")
+        sha_helper = self.commit_all("edit-box-custom-helper")
+        d_helper = cache_mod.compute_scope_digests(str(self.repo), sha_helper, "v20", "py3", "img:1", "bun:1")
+        self.assertNotEqual(d_lt["box-incident-proofs"], d_helper["box-incident-proofs"])
+        self.assertEqual(d_lt["box-continuation"], d_helper["box-continuation"])
+        self.assertEqual(d_lt["upload-retention-http"], d_helper["upload-retention-http"])
+
+        # 3) Deploy config file change misses ONLY dependent gates (host-log-policy, watch-gate, architecture)!
+        self.write_repo("deploy/v5-selfhost/host-log-policy.json", '{"v":2}\n')
+        sha_hlp = self.commit_all("edit-host-log-policy")
+        d_hlp = cache_mod.compute_scope_digests(str(self.repo), sha_hlp, "v20", "py3", "img:1", "bun:1")
+        self.assertEqual(
+            sorted(gid for gid in d_helper if d_helper[gid] != d_hlp[gid]),
+            ["architecture", "host-log-policy", "watch-gate"],
+        )
+
+        # 4) Narrowed commercial leaf module changes miss their owning gate + backend/web/full, not sibling leaves!
+        self.write_repo("packages/commercial/src/http/proxy/boxRunLiveness.ts", "export const LIVE = 2;\n")
+        sha_live = self.commit_all("edit-box-run-liveness")
+        d_live = cache_mod.compute_scope_digests(str(self.repo), sha_live, "v20", "py3", "img:1", "bun:1")
+        self.assertNotEqual(d_hlp["terminal-unproven"], d_live["terminal-unproven"])
+        self.assertNotEqual(d_hlp["box-longtask"], d_live["box-longtask"])
+        self.assertEqual(d_hlp["codex-chatgpt-ws"], d_live["codex-chatgpt-ws"])
+        self.assertEqual(d_hlp["watch-gate"], d_live["watch-gate"])
+        self.assertEqual(d_hlp["host-log-policy"], d_live["host-log-policy"])
+
+        self.write_repo("packages/commercial/src/http/codexUpstreamHeaders.ts", "export const HDR = 2;\n")
+        sha_hdr = self.commit_all("edit-codex-headers")
+        d_hdr = cache_mod.compute_scope_digests(str(self.repo), sha_hdr, "v20", "py3", "img:1", "bun:1")
+        self.assertNotEqual(d_live["codex-chatgpt-ws"], d_hdr["codex-chatgpt-ws"])
+        self.assertEqual(d_live["terminal-unproven"], d_hdr["terminal-unproven"])
+        self.assertEqual(d_live["host-log-policy"], d_hdr["host-log-policy"])
+
+        # 5) CCB source change misses ONLY codex-late-stop-closure + architecture!
+        self.write_repo("claude-code-best/src/index.ts", "export const CCB = 2;\n")
+        sha_ccb = self.commit_all("edit-ccb")
+        d_ccb = cache_mod.compute_scope_digests(str(self.repo), sha_ccb, "v20", "py3", "img:1", "bun:1")
+        self.assertEqual(
+            sorted(gid for gid in d_hdr if d_hdr[gid] != d_ccb[gid]),
+            ["architecture", "codex-late-stop-closure"],
+        )
+
+        # 6) Conservative fallback: dynamic import in narrowed commercial leaf promotes it to backend!
+        self.write_repo(
+            "packages/commercial/src/http/proxy/boxRunLiveness.ts",
+            "export async function load(p: string) { return import(p); }\n",
+        )
+        sha_dyn1 = self.commit_all("leaf-dynamic-import")
+        d_dyn1 = cache_mod.compute_scope_digests(str(self.repo), sha_dyn1, "v20", "py3", "img:1", "bun:1")
+        self.write_repo("packages/commercial/src/ws/bridge.ts", "export const C = 1234;\n")
+        sha_dyn2 = self.commit_all("bridge-after-leaf-dynamic")
+        d_dyn2 = cache_mod.compute_scope_digests(str(self.repo), sha_dyn2, "v20", "py3", "img:1", "bun:1")
+        self.assertNotEqual(d_dyn1["terminal-unproven"], d_dyn2["terminal-unproven"])
+
+        # 7) Conservative fallback: unknown brand-new top-level directory invalidates ALL 24 gates!
+        self.write_repo("mystery-top/config.json", '{"x":1}\n')
+        sha_unk = self.commit_all("add-unknown-top")
+        d_unk = cache_mod.compute_scope_digests(str(self.repo), sha_unk, "v20", "py3", "img:1", "bun:1")
+        for gid in d_dyn2:
+            self.assertNotEqual(d_dyn2[gid], d_unk[gid], gid)
+
+        # 8) Smoke check on the real repository HEAD: produces 24 valid 64-hex digests cleanly.
+        real_head = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        real_digests = cache_mod.compute_scope_digests(str(ROOT), real_head, "v20", "py3", "img:1", "bun:1")
+        self.assertEqual(len(real_digests), 24)
+        for gid, digest in real_digests.items():
+            self.assertRegex(digest, r"^[0-9a-f]{64}$", gid)
 
 
 if __name__ == "__main__":

@@ -95,13 +95,18 @@ describe("浏览器页", () => {
     expect(screen.getByTestId("browser-window-noshot")).toHaveTextContent("没有成功");
   });
 
-  test("操作记录里的「详情」进步骤页那一步", async () => {
+  test("操作记录里的「详情」下钻到 StepDetail 全文，点「返回浏览器」回到浏览器页", async () => {
     const messages = session();
     render(<InspectorPanelContent messages={messages} request={{ tab: "browser", message: messages[2], nonce: 1 }} onClose={() => {}} />);
     await browserReady();
+    expect(screen.queryByTestId("outputs-open-steps")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "第 2 步的详情" }));
-    expect(screen.getByRole("tab", { name: /步骤/ })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("tab", { name: /过程|步骤/ })).not.toBeInTheDocument();
     expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("3 / 5");
+    expect(screen.getByRole("button", { name: /返回浏览器/ })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /返回浏览器/ }));
+    await browserReady();
+    expect(screen.getByRole("tab", { name: /浏览器/ })).toHaveAttribute("aria-selected", "true");
   });
 
   test("大记录定位桩:用点击带来的完整消息,或页面缓存里的正文", async () => {
@@ -204,9 +209,105 @@ describe("浏览器页", () => {
     });
   });
 
-  test("不在顶层轮里的浏览器步(子任务等)退回步骤详情", () => {
+  test("不在顶层轮里的浏览器步(子任务等)退回按需步骤详情", async () => {
     const child = bash("child", "oc-browser open https://a.example", page("https://a.example/", "A"));
     render(<InspectorPanelContent messages={session()} request={{ tab: "browser", message: child, nonce: 1 }} onClose={() => {}} />);
-    expect(screen.getByRole("tab", { name: /步骤/ })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("tab", { name: /过程|步骤/ })).not.toBeInTheDocument();
+    expect(screen.getByTestId("pane-stepper")).toBeInTheDocument();
+    expect(screen.getByTestId("pane-step-body")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /返回产出/ }));
+    expect(await screen.findByTestId(/^outputs-(view|empty)$/)).toBeInTheDocument();
+  });
+
+  test("常规态隐藏常驻说明书横幅，仅回看历史步骤时展示紧凑「回到最新」条", async () => {
+    const messages = [
+      user("u1", "先打开网页看看"),
+      bash("b1", "oc-browser open https://github.com/login && oc-browser screenshot", page("https://github.com/login", "GitHub", ".playwright-cli/login.png")),
+      bash("b2", "oc-browser click e1 && oc-browser screenshot", page("https://github.com/home", "GitHub Home", ".playwright-cli/home.png")),
+      assistant("a1", "已打开页面", TS + 5_000),
+    ];
+    render(
+      <InspectorPanelContent
+        messages={messages}
+        running={true}
+        request={{ tab: "browser", message: messages[2], nonce: 1 }}
+        onClose={() => {}}
+      />,
+    );
+    await browserReady();
+    // 常规停在最新一步时不展示说明书横幅
+    expect(screen.queryByTestId("browser-status-banner")).toBeNull();
+
+    // 切到历史第 1 步时展示紧凑单行「回到最新」条，点按后恢复最新并隐藏
+    const rows = screen.getAllByTestId("browser-log-row");
+    fireEvent.click(within(rows[0] as HTMLElement).getAllByRole("button")[0] as HTMLElement);
+    const banner = screen.getByTestId("browser-status-banner");
+    expect(banner).toHaveTextContent("正在查看历史步骤");
+    fireEvent.click(screen.getByTestId("browser-back-latest"));
+    expect(screen.queryByTestId("browser-status-banner")).toBeNull();
+  });
+
+  test("handoff 消费后切换「步骤记录」再切回「实时视口」不会重放全屏接管", async () => {
+    const payload = JSON.stringify({
+      available: true,
+      active: true,
+      agentBusy: false,
+      url: "https://github.com/login",
+      title: "Sign in to GitHub",
+      viewport: { width: 1280, height: 720 },
+      tabs: [{ index: 0, title: "Sign in to GitHub", url: "https://github.com/login", active: true }],
+      imageBase64: "AAAA",
+      mimeType: "image/jpeg",
+      capturedAt: Date.now(),
+    });
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async () => new Response(payload, { status: 200, headers: { "Content-Type": "application/json" } }));
+    try {
+      const messages = [
+        user("u1", "登录 GitHub"),
+        bash("b1", "oc-browser open https://github.com/login && oc-browser screenshot", page("https://github.com/login", "GitHub", ".playwright-cli/login.png")),
+        assistant("a1", "请接管登录", TS + 5_000),
+      ];
+      const mockAuth = {
+        snapshot: () => ({ token: "tok", username: "u", role: "user" as const }),
+        refresh: async () => "tok",
+        logout: () => {},
+      };
+      render(
+        <InspectorPanelContent
+          messages={messages}
+          liveBrowserAgentId="main"
+          liveBrowserAuth={mockAuth as never}
+          request={{
+            tab: "browser",
+            message: null,
+            liveBrowser: { takeover: true, expand: true, url: "https://github.com/login" },
+            nonce: 777,
+          }}
+          onClose={() => {}}
+        />,
+      );
+
+      // Initial handoff enters fullscreen theater + takeover
+      await screen.findByTestId("live-browser-theater-dialog");
+      expect(screen.getByTestId("live-browser-takeover-dock")).toBeInTheDocument();
+
+      // Hand back -> closes fullscreen theater
+      fireEvent.click(screen.getByTestId("live-browser-handback-btn"));
+      await waitFor(() => expect(screen.queryByTestId("live-browser-theater-dialog")).toBeNull());
+
+      // Switch to 步骤记录 then back to 实时视口 (remounts LiveBrowserStage)
+      fireEvent.click(screen.getByTestId("browser-mode-steps"));
+      expect(await screen.findByTestId("browser-window")).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("browser-mode-live"));
+      await screen.findByTestId("live-browser-active");
+
+      // Must NOT replay fullscreen theater or takeover
+      expect(screen.queryByTestId("live-browser-theater-dialog")).toBeNull();
+      expect(screen.queryByTestId("live-browser-takeover-dock")).toBeNull();
+    } finally {
+      fetchMock.mockRestore();
+    }
   });
 });

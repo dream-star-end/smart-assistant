@@ -66,10 +66,10 @@ export function TablePager({
   if (pageCount <= 1) return null;
   return (
     <div
-      className={cn("flex items-center justify-end gap-1 pt-2", className)}
+      className={cn("flex items-center justify-end gap-1.5 pt-2.5", className)}
       data-testid={`pager-${label}`}
     >
-      <span className="mr-1 text-caption text-faint tabular-nums">
+      <span className="oc-surface-recessed mr-1 rounded-full px-2.5 py-0.5 text-caption font-medium text-muted tabular-nums">
         第 {page + 1}/{pageCount} 页
       </span>
       <IconButton
@@ -79,8 +79,9 @@ export function TablePager({
         onClick={() => onPageChange(page - 1)}
         title={`${label}·上一页`}
         aria-label={`${label}·上一页`}
+        className="oc-icon-btn-tactile"
       >
-        <ChevronLeft size={16} />
+        <ChevronLeft size={16} strokeWidth={1.75} />
       </IconButton>
       <IconButton
         size="sm"
@@ -89,8 +90,9 @@ export function TablePager({
         onClick={() => onPageChange(page + 1)}
         title={`${label}·下一页`}
         aria-label={`${label}·下一页`}
+        className="oc-icon-btn-tactile"
       >
-        <ChevronRight size={16} />
+        <ChevronRight size={16} strokeWidth={1.75} />
       </IconButton>
     </div>
   );

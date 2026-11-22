@@ -37,6 +37,15 @@ export const MEMORY_MCP_TOOL_NAMES = [
 /** 技能训练会话(OPENCLAUDE_SKILL_TRAIN_RUN_ID)条件注册,替换 skill_save/skill_delete。 */
 export const MEMORY_MCP_TRAIN_ONLY_TOOL_NAMES = ['skill_propose'] as const
 
+/** 远端 Antigravity 蜂群模式(OPENCLAUDE_REMOTE_SWARM_ENABLED=1)条件注册。 */
+export const MEMORY_MCP_REMOTE_SWARM_TOOL_NAMES = [
+  'swarm',
+  'post_message',
+  'read_board',
+  'swarm_wait',
+] as const
+
 export type MemoryMcpToolName =
   | (typeof MEMORY_MCP_TOOL_NAMES)[number]
   | (typeof MEMORY_MCP_TRAIN_ONLY_TOOL_NAMES)[number]
+  | (typeof MEMORY_MCP_REMOTE_SWARM_TOOL_NAMES)[number]

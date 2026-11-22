@@ -2,7 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach } from "vitest";
 import { describe, expect, it, vi } from "vitest";
-import { HtmlPreview, OptionsBlock } from "./RichBlocks";
+import { ChartBlock, HtmlPreview, OptionsBlock } from "./RichBlocks";
 import { ChatInteractionContext } from "./tool/context";
 import { OptionsGroupFooter, OptionsGroupProvider } from "./optionsGroup";
 
@@ -89,6 +89,8 @@ describe("OptionsBlock", () => {
     const mark = (option as HTMLButtonElement).querySelector("span.size-4");
     expect(mark).toHaveClass("bg-accent", "text-accent-fg");
     expect(mark).not.toHaveClass("text-white");
+    expect(mark?.querySelector("svg")).not.toBeNull();
+    expect(mark?.textContent).not.toContain("✓");
     const confirm = screen.getByText(/确认选择/).closest("button");
     expect(confirm).toHaveClass("bg-accent", "text-accent-fg");
     expect(confirm).not.toHaveClass("text-white");
@@ -545,6 +547,32 @@ describe("HtmlPreview 导出", () => {
   it("RichBlocks 仍导出 HtmlPreview(实现已移到 HtmlEmbed,调用方不变)", async () => {
     const embed = await import("./HtmlEmbed");
     expect(HtmlPreview).toBe(embed.HtmlPreview);
+  });
+});
+
+describe("ChartBlock 悬浮微工具条(OCV5-838)", () => {
+  it("支持切换源码、复制源码与全屏放大预览", async () => {
+    const writeText = vi.fn(async () => {});
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const cfg = JSON.stringify({ type: "bar", data: { labels: ["A"], datasets: [{ data: [1] }] } });
+    const { container } = render(<ChartBlock code={cfg} />);
+
+    expect(screen.getByTestId("rich-block-toolbar")).toBeInTheDocument();
+    // 切换源码
+    fireEvent.click(screen.getByRole("button", { name: "查看源码" }));
+    expect(container.querySelector("pre")).toHaveTextContent('"type":"bar"');
+    fireEvent.click(screen.getByRole("button", { name: "查看图表" }));
+    expect(container.querySelector("canvas")).not.toBeNull();
+
+    // 一键复制
+    fireEvent.click(screen.getByRole("button", { name: "复制源码" }));
+    expect(writeText).toHaveBeenCalledWith(cfg);
+
+    // 全屏放大预览
+    fireEvent.click(screen.getByRole("button", { name: "全屏放大预览" }));
+    expect(await screen.findByRole("dialog", { name: "图表预览" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "关闭全屏预览" }));
+    expect(screen.queryByRole("dialog", { name: "图表预览" })).toBeNull();
   });
 });
 

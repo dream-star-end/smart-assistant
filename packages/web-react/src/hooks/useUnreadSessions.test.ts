@@ -366,4 +366,78 @@ describe("useUnreadSessions", () => {
     expect(result.current.unreadIds.has("s1")).toBe(true);
     expect(result.current.unreadIds.has("s2")).toBe(false);
   });
+
+  test("rebuildUnread 内容相等时保持同一 Set 引用，不触发无意义重渲", () => {
+    const { result, rerender } = hook({
+      sessions: [{ id: "s1", title: "A", unread: true }],
+      activeId: null,
+      userId: "u1",
+    });
+    const firstSet = result.current.unreadIds;
+    expect(firstSet.has("s1")).toBe(true);
+    rerender({
+      sessions: [{ id: "s1", title: "A", unread: true }],
+      activeId: null,
+      userId: "u1",
+    });
+    expect(result.current.unreadIds).toBe(firstSet);
+  });
+
+  test("needs_you 上升沿发送桌面通知并动态维护 document.title 角标", () => {
+    const created: Array<{ title: string; options?: NotificationOptions }> = [];
+    class FakeNotification {
+      static permission: NotificationPermission = "granted";
+      static requestPermission = vi.fn(async () => "granted" as NotificationPermission);
+      onclick: (() => void) | null = null;
+      close = vi.fn();
+      constructor(title: string, options?: NotificationOptions) {
+        created.push({ title, options });
+      }
+    }
+    vi.stubGlobal("Notification", FakeNotification);
+    localStorage.setItem(unreadNotifyStorageKey("u1"), "1");
+    document.title = "OpenClaude";
+
+    let needsMap: Record<string, "approval" | "answer" | null> = { s1: null };
+    const sessionNeedsYou = (id: string) => needsMap[id] ?? null;
+
+    const { rerender, unmount } = renderHook(
+      (p: Parameters<typeof useUnreadSessions>[0]) => useUnreadSessions(p),
+      {
+        initialProps: {
+          sessions: [{ id: "s1", title: "部署脚本", runState: "running" }],
+          activeId: "other",
+          userId: "u1",
+          sessionNeedsYou,
+          metaVersion: 1,
+        },
+      },
+    );
+    expect(document.title).toBe("OpenClaude");
+    expect(created).toHaveLength(0);
+
+    needsMap = { s1: "approval" };
+    rerender({
+      sessions: [{ id: "s1", title: "部署脚本", runState: "running" }],
+      activeId: "other",
+      userId: "u1",
+      sessionNeedsYou,
+      metaVersion: 2,
+    });
+    expect(document.title).toBe("[待拍板 1] OpenClaude");
+    expect(created).toHaveLength(1);
+    expect(created[0]!.options?.body).toBe("等待你批准");
+    expect(created[0]!.options?.tag).toBe("oc-needs-you-s1");
+
+    needsMap = { s1: null };
+    rerender({
+      sessions: [{ id: "s1", title: "部署脚本", runState: "running" }],
+      activeId: "other",
+      userId: "u1",
+      sessionNeedsYou,
+      metaVersion: 3,
+    });
+    expect(document.title).toBe("OpenClaude");
+    unmount();
+  });
 });

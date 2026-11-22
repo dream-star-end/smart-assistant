@@ -1,16 +1,27 @@
-import { ArrowLeftRight, ArrowUpRight, Lightbulb, ListChecks, PenLine, Sparkles, Target } from "lucide-react";
+import { ArrowLeftRight, ArrowUpRight, Target } from "lucide-react";
+import type { CSSProperties } from "react";
 import type { Agent } from "../lib/agents";
 import type { User } from "../lib/types";
 import { AgentAvatar } from "./AgentAvatar";
 import { Button } from "./ui";
+import { AtelierIcon, type AtelierIconName } from "./ui/AtelierIcons";
 
 const FALLBACK_STARTERS = [
   "帮我把下面这段内容整理成要点",
   "用一句话说明你能帮我做什么",
 ];
 
-/** 起步卡的装饰图标:按位置轮换,纯视觉(starters 是自由文本,不做语义归类)。 */
-const STARTER_ICONS = [Sparkles, PenLine, Lightbulb, ListChecks];
+/** 起步卡的装饰图标、徽章色阶与编辑风短眉（均 aria-hidden，不影响按钮可访问名）。 */
+const STARTER_SLOTS: ReadonlyArray<{
+  icon: AtelierIconName;
+  badge: string;
+  eyebrow: string;
+}> = [
+  { icon: "sparkles", badge: "oc-icon-badge-accent", eyebrow: "灵感切入" },
+  { icon: "newChat", badge: "oc-icon-badge-info", eyebrow: "写作润色" },
+  { icon: "skills", badge: "oc-icon-badge-warning", eyebrow: "深度探索" },
+  { icon: "tasks", badge: "oc-icon-badge-success", eyebrow: "高效拆解" },
+];
 
 /** 按本地时间问候;凌晨单独一档,不在 3 点说「早上好」。 */
 export function greetingFor(date: Date): string {
@@ -53,82 +64,92 @@ export function EmptyState({
   const title = name ? `${greetingFor(now ?? new Date())}，${name}` : agent.name;
   const starters = agent.starters?.length ? agent.starters : FALLBACK_STARTERS;
   return (
-    <div className="relative flex min-h-full flex-col items-center justify-center overflow-hidden px-4 py-12 text-center animate-fade">
+    <div className="relative flex min-h-full flex-col items-center justify-center overflow-hidden px-4 py-10 text-center animate-fade sm:py-14">
       <div
         aria-hidden="true"
-        className="oc-home-glow pointer-events-none absolute left-1/2 top-[18%] h-[300px] w-[min(640px,100%)] -translate-x-1/2"
+        className="oc-home-glow pointer-events-none absolute left-1/2 top-[14%] h-[320px] w-[min(680px,100%)] -translate-x-1/2"
       />
-      <div className="relative flex w-full flex-col items-center">
-        {/* 当前智能体身份 + 切换入口收成一枚胶囊,让问候成为视觉主角(参考主流 AI 产品的新会话页)。 */}
-        <div className="inline-flex items-center gap-1.5 rounded-full border border-border bg-surface/80 py-1 pl-1 pr-1 shadow-soft backdrop-blur">
-          <AgentAvatar agent={agent} className="size-7 rounded-full" iconSize={15} />
-          <span className="max-w-[40vw] truncate pl-0.5 text-[13px] font-medium text-fg">{agent.name}</span>
+      <div className="relative flex w-full max-w-3xl flex-col items-center">
+        {/* 当前智能体身份 + 切换入口收成一枚雕塑磨砂胶囊，轻盈漂浮 + 柔和暖陶土呼吸光晕。 */}
+        <div className="oc-surface-glass oc-float-gentle oc-breathe-aura oc-shimmer-sheen inline-flex items-center gap-1.5 rounded-full py-1 pl-1.5 pr-1">
+          <AgentAvatar agent={agent} className="size-7 rounded-full" iconSize={14} />
+          <span className="max-w-[40vw] truncate pl-1 text-body font-semibold tracking-tight text-fg">
+            {agent.name}
+          </span>
+          <span aria-hidden="true" className="mx-0.5 h-3.5 w-px bg-border-strong/70" />
           <Button
             variant="ghost"
             size="sm"
             shape="pill"
             onClick={onChangeAgent}
-            className="h-7 gap-1 px-2.5 text-[12.5px] text-muted"
+            className="oc-spring-press h-7 gap-1 px-2.5 text-caption font-medium text-muted hover:bg-accent-soft hover:text-accent"
           >
-            <ArrowLeftRight size={12} aria-hidden="true" />
+            <ArrowLeftRight size={12} strokeWidth={1.75} aria-hidden="true" />
             换一个智能体
           </Button>
         </div>
         {/* h2 而非 h1:文档唯一的 h1 是 App 里给读屏定位的 sr-only 会话标题,欢迎页标题在
             语义上从属于当前会话;两个并列 h1 会稀释"我在哪个会话"的定位(shell 审计 S-10)。 */}
-        <h2 className="oc-home-title mt-6 max-w-2xl text-balance text-[30px] font-semibold leading-tight tracking-[-0.03em] sm:text-[38px]">
+        <h2 className="oc-home-title mt-7 max-w-2xl text-balance text-3xl font-semibold leading-[1.16] tracking-[-0.035em] sm:text-4xl">
           {title}
         </h2>
         {/* text-balance:两行均分,不再留一个孤零零的「行。」挂在第二行。 */}
-        <p className="mt-3 max-w-md text-balance text-[15px] leading-relaxed text-muted">
+        <p className="mt-3 max-w-lg text-balance text-title font-normal leading-relaxed text-muted">
           {name ? `今天想让${agent.name}帮你完成什么？` : agent.description}
         </p>
 
         {/* 恰好 3 条时桌面一排三张,不在 2 列网格里留一个空洞。 */}
         <div
-          className={`mt-9 grid w-full grid-cols-1 gap-2.5 sm:grid-cols-2 ${
+          className={`mt-9 grid w-full grid-cols-1 gap-3 sm:grid-cols-2 ${
             starters.length === 3 ? "max-w-3xl md:grid-cols-3" : "max-w-2xl"
           }`}
         >
           {starters.map((s, i) => {
-            const Icon = STARTER_ICONS[i % STARTER_ICONS.length];
+            const slot = STARTER_SLOTS[i % STARTER_SLOTS.length];
             return (
               <button
                 key={s}
                 type="button"
                 onClick={() => onPrefill(s)}
+                style={{ "--stagger-i": i } as CSSProperties}
                 // 手机竖屏放不下 4 张卡(占满整屏视口):前 2 张足以下手,其余 md 起恢复。
-                // OCV5-307:14px 圆角卡;右上角箭头 hover 才浮出,提示"点了会填进输入框"。
-                className={`group flex items-start gap-3 rounded-[16px] border border-border bg-surface/85 px-4 py-3.5 text-left text-[14px] leading-relaxed text-muted outline-none backdrop-blur transition-[transform,box-shadow,border-color,color] duration-200 ease-standard hover:-translate-y-0.5 hover:border-border-strong hover:text-fg hover:shadow-soft focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg${
+                // 装饰性眉标与箭头均 aria-hidden，保证按钮可访问名精确等于 starter 文本。
+                className={`oc-surface-card oc-hover-lift oc-spring-press oc-shimmer-sheen oc-stagger-in oc-icon-nudge group flex flex-col justify-between gap-3 rounded-lg p-4 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg${
                   i >= 2 ? " hidden md:flex" : ""
                 }`}
               >
-                <span
-                  aria-hidden="true"
-                  className="mt-0.5 grid size-7 shrink-0 place-items-center rounded-lg bg-accent-soft text-accent"
-                >
-                  <Icon size={14} />
+                <div aria-hidden="true" className="flex w-full items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className={`oc-icon-badge ${slot.badge} size-7`}>
+                      <AtelierIcon name={slot.icon} size={15} />
+                    </span>
+                    <span className="text-caption font-medium tracking-wide text-faint transition-colors group-hover:text-muted">
+                      {slot.eyebrow}
+                    </span>
+                  </div>
+                  <ArrowUpRight
+                    size={15}
+                    strokeWidth={1.75}
+                    className="shrink-0 text-faint opacity-55 transition-[opacity,transform,color] duration-200 ease-spring group-hover:translate-x-0.5 group-hover:-translate-y-0.5 group-hover:text-accent group-hover:opacity-100 group-focus-visible:opacity-100"
+                  />
+                </div>
+                <span className="min-w-0 text-body font-medium leading-relaxed text-fg/90 transition-colors group-hover:text-fg">
+                  {s}
                 </span>
-                <span className="min-w-0 flex-1">{s}</span>
-                <ArrowUpRight
-                  size={15}
-                  aria-hidden="true"
-                  className="mt-1 shrink-0 text-faint opacity-0 transition-opacity duration-200 group-hover:opacity-100 group-focus-visible:opacity-100"
-                />
               </button>
             );
           })}
         </div>
         {onOpenGoal && (
           // 走 Button 原语而不是裸 <button>:11px 纯文字链接的命中区远低于 44px,原语在触屏下
-          // 自带 min-h-11 兜底(shell 审计 S-09);视觉仍是文字链接。
+          // 自带 min-h-11 兜底(shell 审计 S-09);视觉保持克制的微胶囊链接。
           <Button
             variant="link"
             size="sm"
-            className="mt-5 gap-1.5 px-0 text-caption font-normal text-muted"
+            className="oc-spring-press oc-icon-nudge mt-6 gap-1.5 rounded-full px-3 text-caption font-medium text-muted no-underline hover:bg-accent-soft hover:text-accent hover:no-underline"
             onClick={onOpenGoal}
           >
-            <Target size={12} aria-hidden="true" />
+            <Target size={13} strokeWidth={1.75} aria-hidden="true" />
             为这次会话设定目标
           </Button>
         )}

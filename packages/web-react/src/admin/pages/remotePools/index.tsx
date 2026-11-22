@@ -1,4 +1,4 @@
-import { CheckCircle2, Copy, Plus, RefreshCw, Server, ShieldAlert, Sparkles, Trash2 } from "lucide-react";
+import { Activity, CheckCircle2, Copy, Cpu, Plus, RefreshCw, Server, ShieldAlert, Sparkles, Trash2 } from "lucide-react";
 import { useCallback, useState } from "react";
 import { Badge, Button, Checkbox, Field, Input, Modal, useConfirm, useToast } from "../../../components/ui";
 import { cn } from "../../../lib/utils";
@@ -274,9 +274,9 @@ export default function RemotePoolsPage() {
     }
   }
 
-  const th = "px-3 py-2.5 text-left text-meta font-medium text-muted";
-  const td = "px-3 py-2.5 align-top";
-  const codeCls = "rounded bg-hover px-1.5 py-0.5 font-mono text-xs text-fg";
+  const th = "whitespace-nowrap px-3.5 py-2.5 text-left text-caption font-semibold uppercase tracking-wide text-faint";
+  const td = "px-3.5 py-3 align-top";
+  const codeCls = "oc-surface-recessed rounded-md px-1.5 py-0.5 font-mono text-xs text-fg";
 
   const existingEnabledByUpstream = new Map<string, boolean>(
     selectedProfile
@@ -308,9 +308,10 @@ export default function RemotePoolsPage() {
   }
 
   return (
-    <div>
+    <div className="flex flex-col gap-5">
       {confirmEl}
       <PageHeader
+        icon={Server}
         title={meta.title}
         desc={meta.desc}
         actions={
@@ -327,30 +328,40 @@ export default function RemotePoolsPage() {
 
       <StatCardRow>
         <StatCard
+          icon={Server}
+          tone="accent"
           label="在线远端节点"
           value={`${nodes.filter((n) => n.status === "active").length} / ${nodes.length}`}
           hint="SSH ControlMaster 常驻通道"
         />
         <StatCard
+          icon={Cpu}
+          tone="info"
           label="已探测底座 Profile"
           value={String(profiles.length)}
           hint="支持 cc / codex / antigravity / grok-build"
         />
         <StatCard
+          icon={Sparkles}
+          tone="success"
           label="已上架「远端」模型"
           value={String(offers.filter((o) => o.enabled).length)}
           hint="过渡期前端显示名自动带「远端」后缀"
         />
         <StatCard
+          icon={Activity}
+          tone="neutral"
           label="活跃热驻留会话"
           value={String(bindings.length)}
           hint="24h 滑动租约 · Stop 仅中断回合不杀会话"
         />
       </StatCardRow>
 
-      <div className="my-3.5 flex items-start gap-2.5 rounded-lg border border-success/30 bg-success-soft px-4 py-3 text-sm text-fg">
-        <CheckCircle2 size={16} className="mt-0.5 shrink-0 text-success" />
-        <div>
+      <div className="oc-callout oc-callout-success flex items-start gap-2.5 rounded-xl px-4 py-3 text-sm text-fg">
+        <span className="oc-icon-badge oc-icon-badge-success mt-0.5 size-6 rounded-md">
+          <CheckCircle2 size={14} strokeWidth={2} />
+        </span>
+        <div className="min-w-0 flex-1 leading-relaxed">
           <strong>CC 交互模式铁律门禁已开启：</strong>
           所有远端 <code className={codeCls}>cc</code> (Claude Code) 节点 100% 强制通过{" "}
           <code className={codeCls}>tmux PTY + oc-bridge Hook</code> 交互式终端会话驱动，严禁退化为{" "}
@@ -360,21 +371,29 @@ export default function RemotePoolsPage() {
       </div>
 
       {/* 1. 远端节点列表 */}
-      <section className="mt-5">
-        <h3 className="mb-2.5 flex items-center gap-1.5 text-base font-semibold text-fg">
-          <Server size={16} /> 远端主机节点 ({nodes.length})
-        </h3>
+      <section className="flex flex-col gap-3">
+        <div className="flex items-center gap-2.5">
+          <span className="oc-icon-badge oc-icon-badge-accent size-7 rounded-lg">
+            <Server size={14} strokeWidth={2} />
+          </span>
+          <h3 className="text-base font-semibold tracking-tight text-fg tabular-nums">
+            远端主机节点 ({nodes.length})
+          </h3>
+        </div>
         {nodes.length === 0 ? (
-          <div className="rounded-lg border border-dashed border-border bg-surface p-6 text-center text-sm text-muted">
+          <div className="oc-surface-card rounded-xl border-dashed p-6 text-center text-sm text-muted">
             暂无远端节点，点击右上角「添加远端节点」接入谷歌云或海外开发机（如 cc5-us）。
           </div>
         ) : (
           <div className="grid gap-3">
             {nodes.map((n) => (
-              <div key={n.id} className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-3.5">
+              <div key={n.id} className="oc-surface-card oc-surface-card-hover flex flex-col gap-3 rounded-xl p-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex flex-wrap items-center gap-2.5">
-                    <strong className="text-base text-fg">{n.label}</strong>
+                    <span className={cn("oc-icon-badge size-8 rounded-lg", n.status === "active" ? "oc-icon-badge-success" : "oc-icon-badge-warning")}>
+                      <Server size={15} strokeWidth={1.9} />
+                    </span>
+                    <strong className="text-base font-semibold tracking-tight text-fg">{n.label}</strong>
                     <code className={codeCls}>
                       {n.ssh_user}@{n.ssh_host}:{n.ssh_port}
                     </code>
@@ -382,7 +401,7 @@ export default function RemotePoolsPage() {
                       {n.status === "active" ? "在线 (active)" : n.status}
                     </Badge>
                     {n.rtt_ms_p50 != null && (
-                      <span className="text-xs text-muted">
+                      <span className="text-xs text-muted tabular-nums">
                         RTT p50: {n.rtt_ms_p50}ms / p95: {n.rtt_ms_p95 ?? "-"}ms
                       </span>
                     )}
@@ -401,17 +420,19 @@ export default function RemotePoolsPage() {
                     </Button>
                   </div>
                 </div>
-                <div className="flex flex-wrap items-center gap-2 text-xs text-muted">
+                <div className="oc-code-shell flex flex-wrap items-center gap-2 px-3 py-2 text-xs text-muted">
                   <span>
                     HostKey: <code className="font-mono text-fg">{n.host_key_fp}</code>
                   </span>
-                  <span>· 受限公钥一键部署命令：</span>
-                  <code className="max-w-[520px] truncate rounded bg-hover px-1.5 py-0.5 font-mono text-[11px] text-fg">
+                  <span className="text-faint">·</span>
+                  <span>受限公钥一键部署命令：</span>
+                  <code className="max-w-[520px] truncate font-mono text-[11px] text-fg">
                     {n.install_command}
                   </code>
                   <Button
                     variant="ghost"
                     size="sm"
+                    className="ml-auto"
                     onClick={() => {
                       void navigator.clipboard?.writeText(n.install_command);
                       toast("已复制受限 authorized_keys 安装命令", "success");
@@ -427,112 +448,135 @@ export default function RemotePoolsPage() {
       </section>
 
       {/* 2. 已探测的四大底座 Profile 与模型勾选上架 */}
-      <section className="mt-6">
-        <h3 className="mb-2.5 text-base font-semibold text-fg">
-          已探测远端底座 Profile 与额度窗口 ({profiles.length})
-        </h3>
+      <section className="flex flex-col gap-3">
+        <div className="flex items-center gap-2.5">
+          <span className="oc-icon-badge oc-icon-badge-info size-7 rounded-lg">
+            <Cpu size={14} strokeWidth={2} />
+          </span>
+          <h3 className="text-base font-semibold tracking-tight text-fg tabular-nums">
+            已探测远端底座 Profile 与额度窗口 ({profiles.length})
+          </h3>
+        </div>
         {profiles.length === 0 ? (
-          <div className="rounded-lg border border-dashed border-border bg-surface p-5 text-sm text-muted">
+          <div className="oc-surface-card rounded-xl border-dashed p-5 text-sm text-muted">
             添加节点后点击「自动探测底座与模型」，系统将自动识别节点上的{" "}
             <code className={codeCls}>cc</code>、<code className={codeCls}>codex</code>、
             <code className={codeCls}>antigravity</code>、<code className={codeCls}>grok-build</code>{" "}
             登录态与可用模型。
           </div>
         ) : (
-          <div className="overflow-x-auto rounded-lg border border-border bg-surface">
-            <table className="w-full border-collapse text-sm text-fg">
-              <thead>
-                <tr className="border-b border-border bg-elevated">
-                  <th className={th}>节点 / 底座</th>
-                  <th className={th}>账号 / 套餐</th>
-                  <th className={th}>运行模式</th>
-                  <th className={th}>5h / 7d 额度窗口</th>
-                  <th className={th}>热驻留 / 活跃槽位</th>
-                  <th className={th}>状态</th>
-                  <th className={th}>操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {profiles.map((p) => (
-                  <tr key={p.id} className="border-b border-border last:border-b-0">
-                    <td className={td}>
-                      <div>
-                        <strong>{p.node_label ?? p.node_id.slice(0, 8)}</strong>
-                      </div>
-                      <div className="text-xs text-muted">
-                        {ENGINE_LABELS[p.engine] ?? p.engine} · <code className="font-mono">{p.profile_name}</code>
-                      </div>
-                    </td>
-                    <td className={td}>
-                      <div>{p.account_hint ?? "-"}</div>
-                      <div className="text-xs text-muted">
-                        {p.plan_type ?? "pro"} · {p.cli_version ?? ""}
-                      </div>
-                    </td>
-                    <td className={td}>
-                      <Badge tone="success">
-                        {p.engine === "cc" ? "interactive (tmux+oc-bridge)" : p.runner_mode}
-                      </Badge>
-                    </td>
-                    <td className={td}>
-                      {p.quota_windows.length === 0 ? (
-                        <span className="text-muted">待上报</span>
-                      ) : (
-                        <div className="flex gap-2">
-                          {p.quota_windows.map((w) => (
-                            <Badge key={w.label} tone="neutral">
-                              {w.label}: {w.usedPct != null ? `${w.usedPct}%` : "-"}
-                            </Badge>
-                          ))}
-                        </div>
-                      )}
-                    </td>
-                    <td className={td}>
-                      <code className="font-mono text-xs">
-                        hot {p.hot_slots}/{p.max_hot_slots}
-                      </code>{" "}
-                      ·{" "}
-                      <code className="font-mono text-xs">
-                        act {p.active_slots}/{p.max_active_slots}
-                      </code>
-                    </td>
-                    <td className={td}>
-                      <Badge tone={p.status === "active" ? "success" : "neutral"}>{p.status}</Badge>
-                    </td>
-                    <td className={td}>
-                      <div className="flex gap-1.5">
-                        <Button variant="primary" size="sm" onClick={() => openPublishModal(p)}>
-                          勾选模型上架 ({p.discovered_models.length})
-                        </Button>
-                        <Button variant="secondary" size="sm" onClick={() => handleToggleProfileStatus(p)}>
-                          {p.status === "disabled" ? "启用" : "停用"}
-                        </Button>
-                      </div>
-                    </td>
+          <div className="oc-surface-card overflow-hidden rounded-xl">
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse text-sm text-fg">
+                <thead className="bg-sidebar/85 dark:bg-elevated/85">
+                  <tr className="border-b border-border">
+                    <th className={th}>节点 / 底座</th>
+                    <th className={th}>账号 / 套餐</th>
+                    <th className={th}>运行模式</th>
+                    <th className={th}>5h / 7d 额度窗口</th>
+                    <th className={th}>热驻留 / 活跃槽位</th>
+                    <th className={th}>状态</th>
+                    <th className={th}>操作</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody className="divide-y divide-border/60">
+                  {profiles.map((p) => (
+                    <tr key={p.id} className="transition-colors hover:bg-hover/65">
+                      <td className={td}>
+                        <div>
+                          <strong>{p.node_label ?? p.node_id.slice(0, 8)}</strong>
+                        </div>
+                        <div className="text-xs text-muted">
+                          {ENGINE_LABELS[p.engine] ?? p.engine} · <code className="font-mono">{p.profile_name}</code>
+                        </div>
+                      </td>
+                      <td className={td}>
+                        <div>{p.account_hint ?? "-"}</div>
+                        <div className="text-xs text-muted">
+                          {p.plan_type ?? "pro"} · {p.cli_version ?? ""}
+                        </div>
+                      </td>
+                      <td className={td}>
+                        <Badge tone="success">
+                          {p.engine === "cc" ? "interactive (tmux+oc-bridge)" : p.runner_mode}
+                        </Badge>
+                      </td>
+                      <td className={td}>
+                        {p.quota_windows.length === 0 ? (
+                          <span className="text-muted">待上报</span>
+                        ) : (
+                          <div className="flex flex-wrap gap-2">
+                            {p.quota_windows.map((w) => {
+                              const fill = w.usedPct != null ? Math.max(0, Math.min(100, w.usedPct)) : null;
+                              const barTone = fill != null && fill >= 95 ? "bg-danger" : fill != null && fill >= 80 ? "bg-warning" : "bg-accent";
+                              return (
+                                <div key={w.label} className="flex flex-col gap-1">
+                                  <Badge tone="neutral" className="tabular-nums">
+                                    {w.label}: {w.usedPct != null ? `${w.usedPct}%` : "-"}
+                                  </Badge>
+                                  {fill != null && (
+                                    <div className="h-1 w-20 overflow-hidden rounded-full bg-hover/90">
+                                      <div className={`oc-progress-fill h-full rounded-full ${barTone}`} style={{ width: `${fill}%` }} />
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </td>
+                      <td className={td}>
+                        <code className="font-mono text-xs tabular-nums">
+                          hot {p.hot_slots}/{p.max_hot_slots}
+                        </code>{" "}
+                        ·{" "}
+                        <code className="font-mono text-xs tabular-nums">
+                          act {p.active_slots}/{p.max_active_slots}
+                        </code>
+                      </td>
+                      <td className={td}>
+                        <Badge tone={p.status === "active" ? "success" : "neutral"}>{p.status}</Badge>
+                      </td>
+                      <td className={td}>
+                        <div className="flex gap-1.5">
+                          <Button variant="primary" size="sm" onClick={() => openPublishModal(p)}>
+                            勾选模型上架 ({p.discovered_models.length})
+                          </Button>
+                          <Button variant="secondary" size="sm" onClick={() => handleToggleProfileStatus(p)}>
+                            {p.status === "disabled" ? "启用" : "停用"}
+                          </Button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
         )}
       </section>
 
       {/* 3. 已上架的过渡期远端模型预览 */}
       {offers.length > 0 && (
-        <section className="mt-6">
-          <h3 className="mb-2.5 text-base font-semibold text-fg">
-            已上架远端模型（前端模型选择器自动带「远端」后缀）
-          </h3>
+        <section className="flex flex-col gap-3">
+          <div className="flex items-center gap-2.5">
+            <span className="oc-icon-badge oc-icon-badge-success size-7 rounded-lg">
+              <Sparkles size={14} strokeWidth={2} />
+            </span>
+            <h3 className="text-base font-semibold tracking-tight text-fg">
+              已上架远端模型（前端模型选择器自动带「远端」后缀）
+            </h3>
+          </div>
           <div className="flex flex-wrap gap-2.5">
             {offers.map((o) => (
-              <div key={o.id} className="rounded-lg border border-border bg-surface px-3 py-2 text-sm">
+              <div key={o.id} className="oc-surface-card oc-surface-card-hover rounded-xl px-3.5 py-2.5 text-sm">
                 <div className="flex items-center gap-2">
                   <strong className="text-fg">{o.remote_display_name}</strong>
                   <Badge tone={o.enabled ? "success" : "neutral"} size="sm">
                     {o.enabled ? "已上架" : "已下架"}
                   </Badge>
                 </div>
-                <div className="mt-0.5 text-xs text-muted">
+                <div className="mt-1 text-xs text-muted">
                   Catalog ID: <code className="font-mono text-fg">{o.canonical_model_id}</code> · 节点:{" "}
                   {o.node_label ?? "-"} ({o.engine})
                 </div>
@@ -544,45 +588,54 @@ export default function RemotePoolsPage() {
 
       {/* 4. 活跃会话绑定运维表 */}
       {bindings.length > 0 && (
-        <section className="mt-6">
-          <h3 className="mb-2.5 text-base font-semibold text-fg">活跃远端会话绑定 ({bindings.length})</h3>
-          <div className="overflow-x-auto rounded-lg border border-border bg-surface">
-            <table className="w-full border-collapse text-sm text-fg">
-              <thead>
-                <tr className="border-b border-border bg-elevated">
-                  <th className={th}>Operation ID</th>
-                  <th className={th}>UID / SessionKey</th>
-                  <th className={th}>节点 / 模型</th>
-                  <th className={th}>状态 / Generation</th>
-                  <th className={th}>租约到期</th>
-                  <th className={th}>操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {bindings.map((b) => (
-                  <tr key={b.operation_id} className="border-b border-border last:border-b-0">
-                    <td className={td}>
-                      <code className="font-mono text-xs">{b.operation_id.slice(0, 8)}</code>
-                    </td>
-                    <td className={td}>
-                      UID {b.uid} · <code className="font-mono text-xs">{b.session_key}</code>
-                    </td>
-                    <td className={td}>
-                      {b.node_label ?? "-"} · <code className="font-mono text-xs">{b.canonical_model_id}</code>
-                    </td>
-                    <td className={td}>
-                      {b.state} (gen {b.generation})
-                    </td>
-                    <td className={td}>{new Date(b.expires_at).toLocaleString()}</td>
-                    <td className={td}>
-                      <Button variant="secondary" size="sm" onClick={() => handleRevokeBinding(b)}>
-                        <ShieldAlert size={13} /> 强制销毁
-                      </Button>
-                    </td>
+        <section className="flex flex-col gap-3">
+          <div className="flex items-center gap-2.5">
+            <span className="oc-icon-badge oc-icon-badge-warning size-7 rounded-lg">
+              <Activity size={14} strokeWidth={2} />
+            </span>
+            <h3 className="text-base font-semibold tracking-tight text-fg tabular-nums">
+              活跃远端会话绑定 ({bindings.length})
+            </h3>
+          </div>
+          <div className="oc-surface-card overflow-hidden rounded-xl">
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse text-sm text-fg">
+                <thead className="bg-sidebar/85 dark:bg-elevated/85">
+                  <tr className="border-b border-border">
+                    <th className={th}>Operation ID</th>
+                    <th className={th}>UID / SessionKey</th>
+                    <th className={th}>节点 / 模型</th>
+                    <th className={th}>状态 / Generation</th>
+                    <th className={th}>租约到期</th>
+                    <th className={th}>操作</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody className="divide-y divide-border/60">
+                  {bindings.map((b) => (
+                    <tr key={b.operation_id} className="transition-colors hover:bg-hover/65">
+                      <td className={td}>
+                        <code className="font-mono text-xs">{b.operation_id.slice(0, 8)}</code>
+                      </td>
+                      <td className={td}>
+                        UID {b.uid} · <code className="font-mono text-xs">{b.session_key}</code>
+                      </td>
+                      <td className={td}>
+                        {b.node_label ?? "-"} · <code className="font-mono text-xs">{b.canonical_model_id}</code>
+                      </td>
+                      <td className={td}>
+                        {b.state} (gen {b.generation})
+                      </td>
+                      <td className={`${td} tabular-nums`}>{new Date(b.expires_at).toLocaleString()}</td>
+                      <td className={td}>
+                        <Button variant="secondary" size="sm" onClick={() => handleRevokeBinding(b)}>
+                          <ShieldAlert size={13} /> 强制销毁
+                        </Button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
         </section>
       )}
@@ -608,21 +661,22 @@ export default function RemotePoolsPage() {
       >
         <div className="grid gap-3">
           <Field label="节点标签 (Label)">
-            <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="例如：cc5-us-gcp-1" />
+            <Input className="oc-field-control" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="例如：cc5-us-gcp-1" />
           </Field>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-[2fr_1fr_1fr]">
             <Field label="SSH 主机 (IP / 域名)">
-              <Input value={sshHost} onChange={(e) => setSshHost(e.target.value)} placeholder="136.86.172.84" />
+              <Input className="oc-field-control font-mono" value={sshHost} onChange={(e) => setSshHost(e.target.value)} placeholder="136.86.172.84" />
             </Field>
             <Field label="SSH 端口">
-              <Input value={sshPort} onChange={(e) => setSshPort(e.target.value)} placeholder="22" />
+              <Input className="oc-field-control font-mono tabular-nums" value={sshPort} onChange={(e) => setSshPort(e.target.value)} placeholder="22" />
             </Field>
             <Field label="SSH 用户名">
-              <Input value={sshUser} onChange={(e) => setSshUser(e.target.value)} placeholder="box" />
+              <Input className="oc-field-control font-mono" value={sshUser} onChange={(e) => setSshUser(e.target.value)} placeholder="box" />
             </Field>
           </div>
           <Field label="SSH 登录密码（选填，推荐：一键自动部署受限密钥与守护脚本，密码用后即焚不落库）">
             <Input
+              className="oc-field-control"
               type="password"
               value={sshPassword}
               onChange={(e) => setSshPassword(e.target.value)}
@@ -632,6 +686,7 @@ export default function RemotePoolsPage() {
           </Field>
           <Field label="SSH HostKey SHA256 指纹（选填，留空将自动通过 ssh-keyscan 扫描并锁定）">
             <Input
+              className="oc-field-control font-mono"
               value={hostKeyFp}
               onChange={(e) => setHostKeyFp(e.target.value)}
               placeholder="选填：留空自动获取，或手动指定 SHA256:44charactersBase64HostKeyFingerprint="
@@ -660,15 +715,16 @@ export default function RemotePoolsPage() {
           </>
         }
         toolbar={
-          <div className="flex flex-col gap-2.5 px-1 pb-3">
+          <div className="oc-surface-recessed mx-1 mb-3 flex flex-col gap-2.5 rounded-xl p-3">
             <Input
+              className="oc-field-control"
               value={modelQuery}
               onChange={(e) => setModelQuery(e.target.value)}
               placeholder="搜索模型名 / 上游 ID / 目录 ID"
               aria-label="搜索模型"
             />
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <span className="text-sm text-muted">
+              <span className="text-sm text-muted tabular-nums">
                 已选 <strong className="text-fg">{checkedCount}</strong> / 共 {allModels.length} 个模型
                 {q && <> · 筛选出 {filteredModels.length} 个</>}
               </span>
@@ -709,7 +765,7 @@ export default function RemotePoolsPage() {
       >
         <div className="grid gap-2">
           {filteredModels.length === 0 && (
-            <div className="rounded-lg border border-dashed border-border bg-surface p-6 text-center text-sm text-muted">
+            <div className="oc-surface-card rounded-xl border-dashed p-6 text-center text-sm text-muted">
               {allModels.length === 0 ? "该底座尚未探测到可用模型。" : "没有匹配的模型，换个关键词试试。"}
             </div>
           )}
@@ -722,10 +778,8 @@ export default function RemotePoolsPage() {
               <label
                 key={m.upstream_model_id}
                 className={cn(
-                  "flex cursor-pointer items-center justify-between gap-3 rounded-lg border px-3.5 py-2.5 transition-colors",
-                  checked
-                    ? "border-accent/50 bg-accent/5 hover:bg-accent/10"
-                    : "border-border bg-elevated hover:bg-hover",
+                  "oc-surface-card oc-surface-card-hover flex cursor-pointer items-center justify-between gap-3 rounded-xl px-3.5 py-2.5 transition-colors",
+                  checked && "border-accent/50 bg-accent-soft/35",
                 )}
               >
                 <div className="flex min-w-0 items-center gap-3">

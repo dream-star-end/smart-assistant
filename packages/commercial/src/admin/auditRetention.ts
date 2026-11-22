@@ -120,6 +120,14 @@ export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
     days: 90,
     predicate: "status IN ('sent','failed')",
   },
+  // OCV5-832 / OCV5-856: browser_handoff 待拍板持久表(默认 30min 过期)。
+  // 过期后保留 30 天(覆盖幂等重放与排障回溯)，随后由 auditRetentionSweeper 定期清理；
+  // 未过期的活跃 pending 行绝不删除(expires_at < NOW() - 30d 自然兜底)。
+  {
+    table: "pending_browser_handoffs",
+    column: "expires_at",
+    days: 30,
+  },
 ] as const;
 
 /** 显式声明永久保留的审计表——出现在删除政策里=编程错误。 */

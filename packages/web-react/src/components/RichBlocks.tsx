@@ -3,9 +3,11 @@
  * 二者都在 MarkdownImpl(懒加载 chunk)内按需用：mermaid 库再经 dynamic import 拆成
  * 独立 chunk(只有真出现 ```mermaid 才下载,不拖累首屏与普通对话)。
  */
+import * as Dialog from "@radix-ui/react-dialog";
+import { Check, Code2, Copy, Eye, Maximize2, X } from "lucide-react";
+import { type ReactNode, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { chatInteractionUnavailableText, useChatInteraction } from "./tool/context";
 import { OptionsGroupFooter, OptionsGroupProvider, useOptionsGroup, useOptionsGroupSnapshot } from "./optionsGroup";
-import { useMemo, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 
 /** 主题响应:观察 <html> class(useTheme 切换写入 .dark)。mermaid/chart 的配色在渲染时
  *  快照,若不进依赖,切明暗主题后已渲染的图配色错乱(暗底浅字/浅底暗字)。 */
@@ -21,10 +23,136 @@ function useIsDark(): boolean {
   return dark;
 }
 
+function readCssToken(name: string, fallback: string): string {
+  if (typeof document === "undefined" || typeof getComputedStyle !== "function") return fallback;
+  const val = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return val || fallback;
+}
+
+const toolbarBtnCls =
+  "oc-spring-press inline-flex items-center justify-center rounded-md p-1.5 text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11";
+
+function RichBlockToolbar({
+  code,
+  showSource,
+  onToggleSource,
+  onExpand,
+  canExpand = true,
+}: {
+  code: string;
+  showSource: boolean;
+  onToggleSource: () => void;
+  onExpand: () => void;
+  canExpand?: boolean;
+}) {
+  const [copied, setCopied] = useState(false);
+  const timerRef = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+    },
+    [],
+  );
+
+  const handleCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard?.writeText(code);
+      setCopied(true);
+      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+      timerRef.current = window.setTimeout(() => {
+        timerRef.current = null;
+        setCopied(false);
+      }, 1800);
+    } catch {
+      /* clipboard unavailable */
+    }
+  }, [code]);
+
+  return (
+    <div
+      data-testid="rich-block-toolbar"
+      className="oc-surface-glass absolute right-2.5 top-2.5 z-10 flex items-center gap-0.5 rounded-lg p-0.5 opacity-0 transition-opacity duration-150 group-hover/rich:opacity-100 group-focus-within/rich:opacity-100 [@media(hover:none)]:opacity-100"
+    >
+      <button
+        type="button"
+        aria-label={showSource ? "查看图表" : "查看源码"}
+        title={showSource ? "查看图表" : "查看源码"}
+        onClick={onToggleSource}
+        className={toolbarBtnCls}
+      >
+        {showSource ? <Eye size={14} /> : <Code2 size={14} />}
+      </button>
+      <button
+        type="button"
+        aria-label={copied ? "已复制源码" : "复制源码"}
+        title={copied ? "已复制" : "复制源码"}
+        onClick={() => void handleCopy()}
+        className={toolbarBtnCls}
+      >
+        {copied ? <Check size={14} className="oc-check-pop text-success" /> : <Copy size={14} />}
+      </button>
+      {canExpand && (
+        <button
+          type="button"
+          aria-label="全屏放大预览"
+          title="全屏放大预览"
+          onClick={onExpand}
+          className={toolbarBtnCls}
+        >
+          <Maximize2 size={14} />
+        </button>
+      )}
+    </div>
+  );
+}
+
+function RichFullscreenModal({
+  open,
+  onOpenChange,
+  title,
+  children,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  title: string;
+  children: ReactNode;
+}) {
+  return (
+    <Dialog.Root open={open} onOpenChange={onOpenChange}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 z-[60] bg-fg/35 backdrop-blur-xs data-[state=open]:animate-fade" />
+        <Dialog.Content
+          aria-describedby={undefined}
+          className="oc-surface-popover oc-dialog-in fixed inset-3 z-[61] flex flex-col overflow-hidden rounded-2xl outline-none sm:inset-6"
+        >
+          <div className="flex shrink-0 items-center justify-between border-b border-border/80 px-4 py-2.5">
+            <Dialog.Title className="text-section font-semibold text-fg">{title}</Dialog.Title>
+            <Dialog.Close asChild>
+              <button
+                type="button"
+                aria-label="关闭全屏预览"
+                className="oc-spring-press inline-flex size-9 items-center justify-center rounded-lg text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11"
+              >
+                <X size={18} />
+              </button>
+            </Dialog.Close>
+          </div>
+          <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto p-4 sm:p-6">
+            {children}
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
+
 /** ```mermaid 代码块 → 渲染成 SVG 流程图;失败回退源码。 */
 export function MermaidBlock({ code }: { code: string }) {
   const [svg, setSvg] = useState<string | null>(null);
   const [err, setErr] = useState(false);
+  const [showSource, setShowSource] = useState(false);
+  const [fullscreen, setFullscreen] = useState(false);
   const rawId = useId();
   const isDark = useIsDark();
 
@@ -35,10 +163,38 @@ export function MermaidBlock({ code }: { code: string }) {
     (async () => {
       try {
         const mermaid = (await import("mermaid")).default;
+        const accent = readCssToken("--accent", isDark ? "hsl(16, 68%, 61%)" : "hsl(16, 71%, 38%)");
+        const fg = readCssToken("--fg", isDark ? "hsl(40, 18%, 94%)" : "hsl(240, 6%, 10%)");
+        const surface = readCssToken("--surface", isDark ? "hsl(240, 7%, 11%)" : "hsl(0, 0%, 100%)");
+        const bg = readCssToken("--bg", isDark ? "hsl(240, 5%, 8%)" : "hsl(45, 25%, 97%)");
+        const bubble = readCssToken("--bubble", isDark ? "hsl(240, 7%, 14%)" : "hsl(43, 21%, 93%)");
+        const borderControl = readCssToken("--border-control", isDark ? "hsl(40, 4%, 44%)" : "hsl(40, 5%, 51%)");
+        const fontFamily = readCssToken("--font-sans", "sans-serif");
         mermaid.initialize({
           startOnLoad: false,
           securityLevel: "strict",
-          theme: isDark ? "dark" : "default",
+          theme: "base",
+          themeVariables: {
+            darkMode: isDark,
+            background: surface,
+            primaryColor: bubble,
+            primaryTextColor: fg,
+            primaryBorderColor: accent,
+            lineColor: accent,
+            secondaryColor: bg,
+            secondaryTextColor: fg,
+            secondaryBorderColor: borderControl,
+            tertiaryColor: surface,
+            tertiaryTextColor: fg,
+            mainBkg: bubble,
+            nodeBorder: accent,
+            clusterBkg: bg,
+            clusterBorder: borderControl,
+            edgeLabelBackground: surface,
+            titleColor: fg,
+            textColor: fg,
+            fontFamily,
+          },
         });
         // 先 parse 校验(suppressErrors→只返 bool,不向 document.body 注入错误图)。
         // 流式时代码常是半截 → parse=false → 回退源码,绝不调 render(render 对坏输入会把
@@ -62,23 +218,55 @@ export function MermaidBlock({ code }: { code: string }) {
 
   if (err) {
     return (
-      <pre className="my-3 overflow-auto rounded-lg bg-code px-3 py-2 font-mono text-xs text-fg">{code}</pre>
+      <pre className="oc-code-shell my-3 overflow-auto rounded-xl bg-code px-3.5 py-2.5 font-mono text-meta text-fg">{code}</pre>
     );
   }
   if (!svg) {
     return (
-      <div className="my-3 flex items-center justify-center rounded-lg border border-border bg-surface px-3 py-6 text-meta text-faint">
-        图表渲染中…
+      <div
+        role="status"
+        aria-live="polite"
+        className="oc-surface-card my-3 flex flex-col items-center gap-3 rounded-xl px-5 py-6"
+      >
+        <div aria-hidden className="flex w-full max-w-sm items-center justify-center gap-3">
+          <span className="oc-img-skeleton h-9 flex-1 rounded-lg" />
+          <span className="h-0.5 w-6 rounded-full bg-border-strong" />
+          <span className="oc-img-skeleton h-9 flex-1 rounded-lg" />
+          <span className="h-0.5 w-6 rounded-full bg-border-strong" />
+          <span className="oc-img-skeleton h-9 flex-1 rounded-lg" />
+        </div>
+        <span className="text-caption text-faint">图表渲染中…</span>
       </div>
     );
   }
   return (
-    // mermaid securityLevel:'strict' 已清洗 SVG
-    <div
-      className="my-3 flex justify-center overflow-x-auto rounded-lg border border-border bg-surface p-3"
-      // biome-ignore lint/security/noDangerouslySetInnerHtml: mermaid strict-sanitized SVG
-      dangerouslySetInnerHTML={{ __html: svg }}
-    />
+    <div className="group/rich relative my-3 not-prose">
+      <RichBlockToolbar
+        code={code}
+        showSource={showSource}
+        onToggleSource={() => setShowSource((v) => !v)}
+        onExpand={() => setFullscreen(true)}
+      />
+      {showSource ? (
+        <pre className="oc-code-shell overflow-auto rounded-xl bg-code px-3.5 py-3 pr-28 font-mono text-meta text-fg">
+          {code}
+        </pre>
+      ) : (
+        // mermaid securityLevel:'strict' 已清洗 SVG
+        <div
+          className="oc-surface-card flex justify-center overflow-x-auto rounded-xl p-4"
+          // biome-ignore lint/security/noDangerouslySetInnerHtml: mermaid strict-sanitized SVG
+          dangerouslySetInnerHTML={{ __html: svg }}
+        />
+      )}
+      <RichFullscreenModal open={fullscreen} onOpenChange={setFullscreen} title="流程图预览">
+        <div
+          className="flex max-h-full max-w-full items-center justify-center [&_svg]:h-auto [&_svg]:max-h-[80dvh] [&_svg]:max-w-full"
+          // biome-ignore lint/security/noDangerouslySetInnerHtml: mermaid strict-sanitized SVG
+          dangerouslySetInnerHTML={{ __html: svg }}
+        />
+      </RichFullscreenModal>
+    </div>
   );
 }
 
@@ -284,16 +472,48 @@ function parseOptionsBlocks(
   }
 }
 
+function detectFollowingUserAnswer(el: HTMLElement | null): string | null {
+  const assistantRow = el?.closest<HTMLElement>('[data-testid="assistant-row"]');
+  if (!assistantRow) return null;
+  const root =
+    assistantRow.closest<HTMLElement>('[data-testid="timeline-short-list"], [data-testid="message-list"]') ??
+    assistantRow.parentElement?.parentElement;
+  if (!root) return null;
+  const rows = Array.from(root.querySelectorAll<HTMLElement>('[data-testid="assistant-row"], [data-testid="user-row"]'));
+  const idx = rows.indexOf(assistantRow);
+  if (idx < 0) return null;
+  for (let i = idx + 1; i < rows.length; i += 1) {
+    const row = rows[i]!;
+    if (row.getAttribute("data-testid") === "user-row") {
+      const text = row.querySelector<HTMLElement>('[data-testid="message-text"]')?.textContent?.trim() ?? "";
+      if (/^我选择[:：]/.test(text)) return text.replace(/^我选择[:：]/, "").trim() || text;
+      if (/^我的选择[:：]/.test(text)) return text.replace(/^我的选择[:：]/, "").trim() || "已作答";
+      return text ? "已通过后续消息回复" : "已作答";
+    }
+  }
+  return null;
+}
+
 function OptionsCardItem({ parsed, readOnly }: { parsed: ParsedOptionsItem; readOnly?: boolean }) {
   const { sendUserText, busy, reason } = useChatInteraction();
   const group = useOptionsGroup();
   const groupSnap = useOptionsGroupSnapshot();
   const blockKey = useId();
+  const cardRef = useRef<HTMLDivElement>(null);
   const [picked, setPicked] = useState<Set<number>>(new Set());
   const [sentLocal, setSentLocal] = useState<string | null>(null);
+  const [historyAnswer, setHistoryAnswer] = useState<string | null>(null);
+  const [reopenedHistory, setReopenedHistory] = useState(false);
   const [noteOpen, setNoteOpen] = useState(false);
   const [customNote, setCustomNote] = useState("");
   const composingRef = useRef(false);
+
+  // 刷新或切回历史会话时，若该条助手消息后方已存在用户回复，则默认判定为历史已作答态，防止单选误触重发。
+  useEffect(() => {
+    if (readOnly || sentLocal !== null) return;
+    const found = detectFollowingUserAnswer(cardRef.current);
+    setHistoryAnswer(found);
+  }, [readOnly, sentLocal, busy]);
 
   // 注册到消息级分组(多题聚合作答的前提;流式半截时不注册,解析成功即补登)。
   // 用 layout effect:passive effect 在 commit 之后才跑,中间那帧里块已可点、分组还没数到它,
@@ -313,8 +533,12 @@ function OptionsCardItem({ parsed, readOnly }: { parsed: ParsedOptionsItem; read
   const streaming = groupSnap?.live === true;
   const grouped = !!group && (groupSnap?.grouped ?? false);
   const groupEntry = groupSnap?.entries.find((e) => e.key === blockKey);
-  const sent = sentLocal !== null || (groupSnap?.sent ?? false);
-  const sentText = sentLocal ?? (groupEntry?.labels.length ? groupEntry.labels.join("、") : null);
+  const lockedByHistory = !streaming && historyAnswer !== null && !reopenedHistory;
+  const sent = sentLocal !== null || (groupSnap?.sent ?? false) || lockedByHistory;
+  const sentText =
+    sentLocal ??
+    (groupEntry?.labels.length ? groupEntry.labels.join("、") : null) ??
+    (lockedByHistory ? historyAnswer : null);
   const interactive = !readOnly && !!sendUserText && !sent;
   // 生产里 busy===sending===live;流式期忽略 busy,否则长回合选项卡仍不可点。
   // 非流式仍尊重 busy(历史卡在新回合进行中不可点)。
@@ -362,58 +586,69 @@ function OptionsCardItem({ parsed, readOnly }: { parsed: ParsedOptionsItem; read
     sendUserText?.(trimmedNote);
   };
   return (
-    <div className="my-2 flex flex-col gap-2 rounded-2xl border border-border bg-surface p-3 not-prose shadow-[0_1px_2px_rgba(15,23,42,0.03)]">
+    <div ref={cardRef} className="oc-surface-card my-2.5 flex flex-col gap-3 rounded-2xl p-3.5 not-prose">
       {(parsed.question || parsed.options.length > 0) && (
-        <div className="flex items-start justify-between gap-2 px-1">
-          {parsed.question ? <p className="text-body font-medium text-fg">{parsed.question}</p> : <span />}
-          <span className="shrink-0 rounded-full bg-elevated px-2 py-0.5 text-micro font-medium text-muted border border-border">
+        <div className="flex items-start justify-between gap-3 px-0.5">
+          {parsed.question ? (
+            <p className="text-section font-semibold leading-snug text-fg">{parsed.question}</p>
+          ) : (
+            <span />
+          )}
+          <span className="oc-surface-recessed shrink-0 rounded-full border border-border/70 px-2.5 py-0.5 text-micro font-medium text-muted">
             {parsed.multi ? "可多选" : "单选"}
           </span>
         </div>
       )}
-      <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
         {parsed.options.map((o, i) => {
           const chosen = parsed.multi || grouped ? picked.has(i) : sentText === o.label || (trimmedNote ? sentText === formatPick(o.label) : false);
+          const canClick = interactive && !blockedByBusy;
+          const badgeChar = i < 26 ? String.fromCharCode(65 + i) : String(i + 1);
           return (
             <button
               key={`${i}-${o.label}`}
               type="button"
-              disabled={!interactive || blockedByBusy}
+              disabled={!canClick}
               onClick={() => choose(i)}
               className={
-                "flex items-start gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 " +
+                "group/opt relative flex items-start gap-2.5 rounded-xl border px-3.5 py-2.5 text-left transition-all duration-150 outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 " +
                 (chosen
-                  ? "border-accent bg-accent-soft"
-                  : "border-border bg-elevated hover:border-accent/40 hover:bg-hover") +
-                (!interactive || blockedByBusy ? " cursor-default opacity-80" : "")
+                  ? "border-accent bg-accent-soft shadow-soft ring-1 ring-accent/20"
+                  : canClick
+                    ? "oc-surface-card-hover border-border bg-elevated/90 hover:border-accent/45 hover:bg-surface"
+                    : "border-border/80 bg-elevated/70") +
+                (!canClick ? " cursor-default opacity-80" : " oc-btn-tactile cursor-pointer")
               }
             >
               <span
+                aria-hidden="true"
                 className={
-                  "mt-0.5 flex size-4 shrink-0 items-center justify-center border text-micro " +
-                  (parsed.multi ? "rounded " : "rounded-full ") +
-                  (chosen ? "border-accent bg-accent text-accent-fg" : "border-border text-transparent")
+                  "mt-0.5 flex size-4 shrink-0 items-center justify-center border font-mono text-micro font-semibold transition-all duration-150 " +
+                  (parsed.multi ? "rounded-xs " : "rounded-full ") +
+                  (chosen
+                    ? "border-accent bg-accent text-accent-fg shadow-soft"
+                    : "border-border-strong/70 bg-surface text-faint group-hover/opt:border-accent/50 group-hover/opt:text-accent")
                 }
               >
-                ✓
+                {chosen ? <Check size={11} strokeWidth={2.75} className="oc-check-pop" /> : badgeChar}
               </span>
-              <span className="min-w-0">
-                <span className="block text-body font-medium text-fg">{o.label}</span>
-                {o.desc && <span className="mt-0.5 block text-[11.5px] leading-snug text-muted">{o.desc}</span>}
+              <span className="min-w-0 flex-1">
+                <span className="block text-body font-medium leading-snug text-fg">{o.label}</span>
+                {o.desc && <span className="mt-0.5 block text-caption leading-snug text-muted">{o.desc}</span>}
               </span>
             </button>
           );
         })}
       </div>
       {interactive && !grouped && (
-        <div className="flex flex-col gap-1.5 px-1">
+        <div className="flex flex-col gap-2 border-t border-border/60 px-0.5 pt-2.5">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <button
               type="button"
               aria-expanded={noteOpen}
               disabled={blockedByBusy}
               onClick={() => setNoteOpen((v) => !v)}
-              className="text-caption font-medium text-muted hover:text-fg transition-colors disabled:opacity-40 [@media(hover:none)]:min-h-11"
+              className="rounded-md px-1.5 py-1 text-caption font-medium text-muted transition-colors hover:bg-hover hover:text-fg disabled:opacity-40 [@media(hover:none)]:min-h-11"
             >
               {noteOpen ? "收起补充说明" : "补充说明后再发"}
             </button>
@@ -422,7 +657,7 @@ function OptionsCardItem({ parsed, readOnly }: { parsed: ParsedOptionsItem; read
                 type="button"
                 disabled={picked.size === 0 || blockedByBusy}
                 onClick={confirmMulti}
-                className="ml-auto rounded-lg bg-accent px-3.5 py-1.5 text-meta font-medium text-accent-fg transition-opacity disabled:opacity-40 [@media(hover:none)]:min-h-11"
+                className="oc-btn-tactile oc-btn-accent-craft ml-auto rounded-lg bg-accent px-3.5 py-1.5 text-meta font-medium text-accent-fg transition-opacity disabled:opacity-40 [@media(hover:none)]:min-h-11"
               >
                 确认选择{picked.size > 0 ? `(${picked.size})` : ""}
               </button>
@@ -450,14 +685,14 @@ function OptionsCardItem({ parsed, readOnly }: { parsed: ParsedOptionsItem; read
                   }
                 }}
                 placeholder="选填：输入补充要求，点上方选项将一并带出"
-                className="min-w-0 flex-1 rounded-lg border border-border bg-elevated px-2.5 py-1.5 text-meta text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="oc-surface-recessed min-w-0 flex-1 rounded-lg border border-border-control/70 bg-elevated px-3 py-1.5 text-base text-fg outline-none transition-[border-color,box-shadow] focus:border-accent focus-visible:ring-2 focus-visible:ring-ring md:text-meta"
               />
               {trimmedNote && (
                 <button
                   type="button"
                   disabled={blockedByBusy}
                   onClick={sendCustomNote}
-                  className="shrink-0 rounded-lg border border-border bg-elevated px-3 py-1.5 text-caption font-medium text-fg hover:bg-hover disabled:opacity-40 [@media(hover:none)]:min-h-11"
+                  className="oc-btn-tactile oc-btn-secondary-craft shrink-0 rounded-lg border border-border bg-surface px-3 py-1.5 text-caption font-medium text-fg hover:bg-hover disabled:opacity-40 [@media(hover:none)]:min-h-11"
                 >
                   直接发送说明
                 </button>
@@ -466,17 +701,31 @@ function OptionsCardItem({ parsed, readOnly }: { parsed: ParsedOptionsItem; read
           )}
         </div>
       )}
-      {sent && sentText && <p className="px-1 text-caption text-faint">已选择:{sentText}</p>}
+      {sent && sentText && (
+        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/60 px-0.5 pt-2 text-caption text-faint">
+          <p className="min-w-0 truncate">已选择:{sentText}</p>
+          {lockedByHistory && !readOnly && !!sendUserText && !busy && (
+            <button
+              type="button"
+              data-testid="options-reopen-history"
+              onClick={() => setReopenedHistory(true)}
+              className="oc-btn-tactile shrink-0 rounded-md px-2 py-0.5 font-medium text-accent transition-colors hover:bg-accent-soft [@media(hover:none)]:min-h-11"
+            >
+              重新选择
+            </button>
+          )}
+        </div>
+      )}
       {grouped && !sent && (groupEntry?.labels.length ?? 0) > 0 && (
-        <p className="px-1 text-caption text-faint">已选:{groupEntry?.labels.join("、")}(可在下方发送选择)</p>
+        <p className="border-t border-border/60 px-0.5 pt-2 text-caption text-faint">已选:{groupEntry?.labels.join("、")}(可在下方发送选择)</p>
       )}
       {/* 没有发送能力时说清原因:demo 是「演示模式仅供浏览」,不再笼统一句「此会话中不可交互」(D-08)。 */}
       {!readOnly && !sendUserText && (
-        <p className="px-1 text-caption text-faint">{chatInteractionUnavailableText(reason)}</p>
+        <p className="px-0.5 text-caption text-faint">{chatInteractionUnavailableText(reason)}</p>
       )}
       {/* 新回合进行中历史选项卡不可点:说明原因,而不是只把选项压成 opacity-80 让人干等。 */}
       {interactive && blockedByBusy && (
-        <output className="block px-1 text-caption text-faint">等待当前回合结束后可选择</output>
+        <output className="block px-0.5 text-caption text-faint">等待当前回合结束后可选择</output>
       )}
     </div>
   );
@@ -515,21 +764,22 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
   return content;
 }
 
-/** ```chart 代码块(Chart.js config JSON）→ canvas 图表;无效/半截回退源码(对齐 v3 markdown.js）。 */
-export function ChartBlock({ code }: { code: string }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [err, setErr] = useState(false);
-  const isDark = useIsDark();
-
+function useChartInstance(
+  canvasRef: React.RefObject<HTMLCanvasElement | null>,
+  code: string,
+  isDark: boolean,
+  active: boolean,
+  onError?: () => void,
+) {
   useEffect(() => {
+    if (!active) return;
     let alive = true;
     let chart: { destroy: () => void } | null = null;
-    setErr(false);
     let config: Record<string, unknown>;
     try {
       config = JSON.parse(code);
     } catch {
-      setErr(true); // 流式半截 / 非法 JSON → 回退源码,不动 chart.js
+      onError?.(); // 流式半截 / 非法 JSON → 回退源码,不动 chart.js
       return;
     }
     (async () => {
@@ -538,10 +788,8 @@ export function ChartBlock({ code }: { code: string }) {
         Chart.register(...registerables);
         if (!alive || !canvasRef.current) return;
         // 从 CSS 变量读 token(权威=styles.css),不手抄 hex 副本 —— token 改版不漂移。
-        const text =
-          getComputedStyle(document.documentElement).getPropertyValue("--muted").trim() ||
-          (isDark ? "#bcbcc7" : "#51515c");
-        const grid = isDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.08)";
+        const text = readCssToken("--muted", isDark ? "hsl(40, 5%, 60%)" : "hsl(45, 5%, 35%)");
+        const grid = readCssToken("--border", isDark ? "hsla(40, 18%, 94%, 0.09)" : "hsla(24, 10%, 10%, 0.09)");
         const opts = (config.options ??= {}) as Record<string, any>;
         ((opts.plugins ??= {}).legend ??= {}).labels ??= {};
         opts.plugins.legend.labels.color ??= text;
@@ -556,7 +804,7 @@ export function ChartBlock({ code }: { code: string }) {
         // biome-ignore lint/suspicious/noExplicitAny: chart.js config 是动态 JSON
         chart = new Chart(canvasRef.current, config as any);
       } catch {
-        if (alive) setErr(true);
+        if (alive) onError?.();
       }
     })();
     return () => {
@@ -567,16 +815,55 @@ export function ChartBlock({ code }: { code: string }) {
         /* ignore */
       }
     };
+  }, [canvasRef, code, isDark, active, onError]);
+}
+
+function FullscreenChartCanvas({ code, isDark }: { code: string; isDark: boolean }) {
+  const fullCanvasRef = useRef<HTMLCanvasElement>(null);
+  useChartInstance(fullCanvasRef, code, isDark, true);
+  return <canvas ref={fullCanvasRef} className="max-h-[78dvh] w-full max-w-5xl" />;
+}
+
+/** ```chart 代码块(Chart.js config JSON）→ canvas 图表;无效/半截回退源码(对齐 v3 markdown.js）。 */
+export function ChartBlock({ code }: { code: string }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [err, setErr] = useState(false);
+  const [showSource, setShowSource] = useState(false);
+  const [fullscreen, setFullscreen] = useState(false);
+  const isDark = useIsDark();
+
+  useEffect(() => {
+    setErr(false);
   }, [code, isDark]);
+
+  const markError = useCallback(() => setErr(true), []);
+  useChartInstance(canvasRef, code, isDark, !showSource, markError);
 
   if (err) {
     return (
-      <pre className="my-3 overflow-auto rounded-lg bg-code px-3 py-2 font-mono text-xs text-fg">{code}</pre>
+      <pre className="oc-code-shell my-3 overflow-auto rounded-xl bg-code px-3.5 py-2.5 font-mono text-meta text-fg">{code}</pre>
     );
   }
   return (
-    <div className="my-3 rounded-lg border border-border bg-surface p-3">
-      <canvas ref={canvasRef} className="max-h-80 w-full" />
+    <div className="group/rich relative my-3 not-prose">
+      <RichBlockToolbar
+        code={code}
+        showSource={showSource}
+        onToggleSource={() => setShowSource((v) => !v)}
+        onExpand={() => setFullscreen(true)}
+      />
+      {showSource ? (
+        <pre className="oc-code-shell overflow-auto rounded-xl bg-code px-3.5 py-3 pr-28 font-mono text-meta text-fg">
+          {code}
+        </pre>
+      ) : (
+        <div className="oc-surface-card rounded-xl p-4">
+          <canvas ref={canvasRef} className="max-h-80 w-full" />
+        </div>
+      )}
+      <RichFullscreenModal open={fullscreen} onOpenChange={setFullscreen} title="图表预览">
+        {fullscreen && <FullscreenChartCanvas code={code} isDark={isDark} />}
+      </RichFullscreenModal>
     </div>
   );
 }

@@ -66,19 +66,16 @@ import {
 // 引擎 API 错误识别的单一权威(delegate 输出错误同款):CCB 把上游失败以
 // "API Error: …" 文本块流出而不抛,cron 侧必须把这类"产出"当失败而非结果。
 import { classifyDelegateOutputError } from './errorClassify.js'
-// 合成首帧执行模型解析(codex 计费旁路封堵的对偶面):cron 无 per-user 计费主体,
-// 落 codex 会被 CODEX_BILLING_GUARD fail-closed 拒 —— 解析为 codex 时改用显式非 codex
-// 兜底模型。与 sessionManager.getOrCreate 的 engine 判定同点收口(单一权威)。
-// 注:server.ts ↔ cron.ts 已存在被容忍的模块循环(server import CronScheduler;
-// sessionManager 亦 `import { resolveExecutionModel } from './server.js'`),本函数只在
-// runJob 运行期调用,非模块初始化期,live-binding 安全,沿用既有模式。
+// 显式模型与 effort 解析(OCV5-825):严禁黑盒静默将 Codex 等强模型降级为其他模型。
+// 优先采用 job.model / job.effort;不支持后台合成计费且未豁免的引擎返回显式可读错误。
+import { localExecutionOverride } from './server.js'
 import {
-  localExecutionOverride,
-  resolveLocalExecutionIfEnforced,
-  resolveSyntheticTurnModel,
-  type LocalExecutionDecision,
-} from './server.js'
-import { localExecutionRejectCode, type LocalExecutionRejectCode } from './modelCatalogClient.js'
+  checkCronOriginModelConflict,
+  normalizeCronEffortField,
+  normalizeCronModelField,
+  resolveCronJobExecution,
+} from './cronModelPolicy.js'
+import type { LocalExecutionRejectCode } from './modelCatalogClient.js'
 import {
   claimCronDelegateExecution,
   enqueueCronOccurrenceJob,
@@ -481,6 +478,10 @@ export interface CronJob {
   projectMode?: 'follow_session' | 'fixed'
   /** Set only when projectMode=fixed. Snapshot of tb_project.id at create. */
   boardProjectId?: string | null
+  /** Explicit model slug for this cron job (optional; legacy JSON without this field inherits agent/default). */
+  model?: string
+  /** Explicit reasoning effort level for this cron job (optional; omitted uses model default). */
+  effort?: string
 }
 
 /**
@@ -2376,6 +2377,32 @@ export class CronScheduler {
       source: project.source,
     })
 
+    const originConflict = checkCronOriginModelConflict(job)
+    if (originConflict) {
+      logger.error(`job ${job.id} origin-session model/effort conflict rejected`, {
+        jobId: job.id,
+        agent: agent.id,
+        model: job.model,
+        effort: job.effort,
+      })
+      if (isUserInitiatedCronJob(job)) {
+        const label = job.label || job.id
+        try {
+          await this.onDeliver(
+            `⚠️ 定时任务「${label}」未执行：${originConflict}。请移除该任务的 model/effort 或改用独立会话模式。`,
+            (job.deliver ?? 'local') === 'local' ? { ...job, deliver: 'webchat' } : job,
+            deliveryContext,
+          )
+        } catch (err) {
+          logger.warn(`origin conflict notice failed for ${job.id}`, {
+            jobId: job.id,
+            errorClass: stableCronErrorClass(err),
+          })
+        }
+      }
+      return { kind: 'terminal_failure', code: 'CRON_ORIGIN_MODEL_CONFLICT' }
+    }
+
     if (job.resume === 'origin-session' && job.sourceSessionKey && this.onOriginSessionFire) {
       return this.runOriginSessionJob(job, durability, deliveryContext, project)
     }
@@ -2388,50 +2415,47 @@ export class CronScheduler {
     // (see onDeliver), which reads lastActiveChannel independently.
     const sessionKey = `agent:${agent.id}:cron:dm:${job.id}:${deliveryContext.deliveryId}`
 
-    // 合成首帧路由字段补齐:cron 是进程内直接派发的会话首帧,完全绕过 master bridge
-    // 的 codex 计费编排(preCheck / server-owned requestId / inflight journal)。host
-    // 平台 agent(如 `main`)的 cron 又无 per-user 计费主体,因此**不能落 codex engine**
-    // (会被 CODEX_BILLING_GUARD 100% fail-closed 拒)。这里显式解析出非 codex 执行模型,
-    // 与 agent 交互态默认(可能是 gpt-5.5=codex)解耦;非 codex agent 返回 undefined,
-    // 沿用原默认(行为不变)。同点传入 getOrCreate(决定 runner engine)+ submit(路由字段)。
+    // OCV5-825: 显式模型与 effort 解析 — 严禁黑盒静默将 Codex 等模型降级为其他模型。
+    // 优先采用用户显式指定的 job.model / job.effort;未指定时沿用 agent/config 默认。
+    // 若最终落到不支持非交互计费且未豁免的引擎,显式报错提示(不静默偷换模型)。
     const executionAgent = (await resolveRuntimeExecutionAgent(agent)).agent
-    const cronRoute = resolveSyntheticTurnModel(executionAgent, this.config.defaults.model)
-    // ── 模型权威 §3:cron 是**无 envelope 的本地路径** ────────────────────────
-    // flag 开(托管)→ 判定源换成 master 的 per-uid catalog 投影:归一 / 可用性(active)/
-    // engine **全取投影**,容器镜像里 baked 的两张表不再参与(它们与 catalog 必然漂移)。
-    // codex 意图仍按真值表**降级为非 codex**(既有语义,cron 无 server-owned requestId)。
-    // 投影拉不到 → 抛 → 本 job 本次不执行(**无 baked 回落**,R1-B1)。
-    // flag 未开(个人版/过渡期)→ undefined → 完全沿用上面的 baked 合成降级,零变化。
-    // 判定失败用结构化 outcome 返回:catalog 临时不可用不消费本次 schedule,
-    // 永久不支持则消费；tick 对每个 job 独立处理，单项失败不会饿死后续任务。
-    let cronExec: LocalExecutionDecision | undefined
-    try {
-      cronExec = await resolveLocalExecutionIfEnforced({
-        agent: executionAgent,
-        kind: 'synthetic',
-        model: cronRoute?.model,
-        defaultModel: this.config.defaults.model,
-      })
-    } catch (err) {
-      const code = localExecutionRejectCode(err)
-      if (!code) throw err
-      logger.error(`job ${job.id} rejected by model catalog`, {
+    const modelResolution = await resolveCronJobExecution({
+      jobId: job.id,
+      explicitModel: job.model,
+      explicitEffort: job.effort,
+      agent: executionAgent,
+      defaultModel: this.config.defaults.model,
+    })
+    if (!modelResolution.ok) {
+      logger.error(`job ${job.id} model resolution rejected (no silent downgrade)`, {
         jobId: job.id,
         agent: agent.id,
-        code,
+        code: modelResolution.code,
+        reason: modelResolution.message,
       })
-      return catalogRejectOutcome(code)
+      if (!modelResolution.retryable && isUserInitiatedCronJob(job)) {
+        const label = job.label || job.id
+        try {
+          await this.onDeliver(
+            `⚠️ 定时任务「${label}」未执行：${modelResolution.message}`,
+            (job.deliver ?? 'local') === 'local' ? { ...job, deliver: 'webchat' } : job,
+            deliveryContext,
+          )
+        } catch (err) {
+          logger.warn(`model rejection notice failed for ${job.id}`, {
+            jobId: job.id,
+            errorClass: stableCronErrorClass(err),
+          })
+        }
+      }
+      return {
+        kind: modelResolution.retryable ? 'retryable_failure' : 'terminal_failure',
+        code: modelResolution.code,
+      }
     }
-    const cronModel = cronExec?.canonicalModel ?? cronRoute?.model
-    // MAJOR-2 透明化:cron 是 host 平台维护 turn(无用户面),降级记 runLog/日志即可,不需用户可见。
-    const downgradedFrom = cronExec?.downgradedFrom ?? (cronRoute?.downgraded ? cronRoute.originalModel : undefined)
-    if (downgradedFrom) {
-      logger.info(`job ${job.id} synthetic model downgraded off codex`, {
-        jobId: job.id,
-        from: downgradedFrom,
-        to: cronModel,
-      })
-    }
+    const cronExec = modelResolution.execution
+    const cronModel = modelResolution.model
+    const cronEffort = modelResolution.effort
 
     let session: Awaited<ReturnType<SessionManager['getOrCreate']>>
     try {
@@ -2515,9 +2539,9 @@ export class CronScheduler {
           durability.recordEvent?.(e)
           if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
         },
-        // effortLevel: 不指定(cron 用模型默认档位)
-        undefined,
-        // model: 与 getOrCreate 同源;非 codex agent 为 undefined(不覆盖)。
+        // effortLevel: 优先采用 job.effort,未指定则用模型默认档位
+        cronEffort,
+        // model: 与 getOrCreate 同源;未显式指定且非权威覆写时为 undefined(沿用 agent 默认)。
         cronModel,
       )
     } catch (err) {
@@ -2745,7 +2769,20 @@ export class CronScheduler {
     if (job.deliver !== undefined) {
       this.assertDeliverValue(job.deliver)
     }
-    filtered.push(job)
+    const modelCheck = normalizeCronModelField(job.model)
+    if (!modelCheck.ok) throw new Error(`Invalid cron model: ${modelCheck.error}`)
+    const effortCheck = normalizeCronEffortField(job.effort)
+    if (!effortCheck.ok) throw new Error(`Invalid cron effort: ${effortCheck.error}`)
+    const normalizedJob: CronJob = {
+      ...job,
+      ...(modelCheck.value !== undefined ? { model: modelCheck.value } : { model: undefined }),
+      ...(effortCheck.value !== undefined ? { effort: effortCheck.value } : { effort: undefined }),
+    }
+    if (normalizedJob.model === undefined) delete normalizedJob.model
+    if (normalizedJob.effort === undefined) delete normalizedJob.effort
+    const originConflict = checkCronOriginModelConflict(normalizedJob)
+    if (originConflict) throw new Error(originConflict)
+    filtered.push(normalizedJob)
     file.jobs = filtered
     await atomicWriteYaml(paths.cronYaml, file)
     logger.info(`added job ${job.id}`, { jobId: job.id, schedule: job.schedule })
@@ -2777,6 +2814,8 @@ export class CronScheduler {
         | 'oneshot'
         | 'projectMode'
         | 'boardProjectId'
+        | 'model'
+        | 'effort'
       >
     >,
   ): Promise<boolean> {
@@ -2819,6 +2858,20 @@ export class CronScheduler {
     // oneshot 可改:重复→一次性(下次触发后自动停用)或反向。改为重复时若任务曾因
     // oneshot 触发被自动停用,调用方应同时传 enabled=true 重新启用(UI 已这么做)。
     if (updates.oneshot !== undefined) job.oneshot = !!updates.oneshot
+    if (updates.model !== undefined) {
+      const modelCheck = normalizeCronModelField(updates.model)
+      if (!modelCheck.ok) throw new Error(`Invalid cron model: ${modelCheck.error}`)
+      if (modelCheck.value !== undefined) job.model = modelCheck.value
+      else delete job.model
+    }
+    if (updates.effort !== undefined) {
+      const effortCheck = normalizeCronEffortField(updates.effort)
+      if (!effortCheck.ok) throw new Error(`Invalid cron effort: ${effortCheck.error}`)
+      if (effortCheck.value !== undefined) job.effort = effortCheck.value
+      else delete job.effort
+    }
+    const originConflict = checkCronOriginModelConflict(job)
+    if (originConflict) throw new Error(originConflict)
     await atomicWriteYaml(paths.cronYaml, file)
     logger.info(`updated job ${id}`, { jobId: id })
     this.maybePushCronIndex(file)

@@ -133,6 +133,7 @@ import {
   providerGapMessagesAfterOwnTurn,
   buildHistoricalContextPrompt,
   buildNativeModelHandoffPayload,
+  buildRollingCheckpointPayload,
   shouldAttemptHistoricalContextInjection,
   shouldEmitContextRebuilt,
   pickIdleTimeoutMs,
@@ -142,6 +143,8 @@ import {
   activeGoalAttribution,
   RuntimeRecycleDrainingError,
 } from './sessionManager.js'
+import { ackPendingCheckpointIfTurnSucceeded, applyPendingCheckpointToSession, beginCheckpointTurnOutcome, isSessionCompacting, peekPendingCheckpoint, resetUnackedCheckpointSessionFlags, type PersistedCheckpointRecord } from './sessionCheckpointStore.js'
+import { beginTurnOverflowContext, clearTurnOverflowContext, getTurnActiveCheckpointGeneration, maybeAutoCompactBeforeTurn } from './sessionAutoCompact.js'
 import type {
   SessionManager,
   PromptQueueExternalTurnReservation,
@@ -474,6 +477,8 @@ export async function submit(
     modelSwitchId?: string
     /** Native compact command authored by prepareModelSwitch itself. */
     modelSwitchInternal?: string
+    /** Internal manual `/compact` turn authorized by compactSession (B3). */
+    _internalCompact?: boolean
   },
 ): Promise<void> {
   const submitStartedAt = performance.now()
@@ -494,6 +499,7 @@ export async function submit(
     })
   }
   if (this.isRuntimeRecycleDraining()) throw new RuntimeRecycleDrainingError()
+  if (!opts?._internalCompact && isSessionCompacting(session.sessionKey)) throw Object.assign(new Error('SESSION_COMPACT_IN_PROGRESS'), { code: 'SESSION_COMPACT_IN_PROGRESS' })
   // Commercial PG is the only authoritative history. Never execute a paid
   // turn when the lossless container→master sink failed to initialize: the
   // legacy SQLite fallback is intentionally personal-only and is invisible
@@ -602,6 +608,7 @@ export async function submit(
       (this._promptQueueDispatchFences.has(session.sessionKey) && !ownsDispatchFence),
   )
 
+  await maybeAutoCompactBeforeTurn(this as unknown as import('./sessionLifecycle.js').SessionLifecycleHost, session, userTextOrBlocks, onEvent, opts)
   const prev = session.lock
   let release: () => void = () => {}
   let memoryTurnBarrier: KernelFileLock | undefined
@@ -614,6 +621,8 @@ export async function submit(
   const logicalTurnAbort = new AbortController()
   let closeHelpLogical: (() => void) | undefined
   let logicalTurnRun: Promise<void> | null = null
+  let pendingCheckpoint: PersistedCheckpointRecord | null = null
+  let checkpointAcked = false
   if (queueTurn) {
     this._promptQueueExecutions.add(session)
     this._promptQueueExecutionKeys.add(session.sessionKey)
@@ -845,7 +854,7 @@ export async function submit(
       // 同步更新 session.model,outbound 帧 / metrics / audit 都靠它,避免
       // 下次 spawn 前的窗口期 stale。runner.model 要等 spawn 才生效;但 shutdown
       // 已让 runner 死,窗口期内不会产生新 metrics —— session.model 提前对齐安全。
-      // 最后兜底用 glm-5.3-zai(平台默认、v5 合法的静态 key 模型)。
+      // 最后兜底用 deepseek-v4-flash(平台默认、v5 合法的静态 key 模型)。
       // 不再硬编码 claude-opus-4-7 —— Claude 官方模型已下线,那会造出非法默认 → spawn 失败。
       session.model = desiredModel ?? this.config.defaults.model ?? 'deepseek-v4-flash'
     }
@@ -1240,8 +1249,13 @@ export async function submit(
       session._contextRebuildNotice = undefined
       session._forceHistoricalContextOnFirstTurn = false
     }
+    pendingCheckpoint =
+      !nativeHandoff && opts?.modelSwitchInternal === undefined && !isCcbSlashCommandPrompt(userTextOrBlocks)
+        ? peekPendingCheckpoint(session.sessionKey) : null
+    if (pendingCheckpoint) { beginCheckpointTurnOutcome(session); runnerPayload = applyPendingCheckpointToSession(session, pendingCheckpoint, buildRollingCheckpointPayload, userTextOrBlocks) }
     if (
       !nativeHandoff &&
+      !pendingCheckpoint &&
       opts?.modelSwitchInternal === undefined &&
       !isCcbSlashCommandPrompt(userTextOrBlocks) &&
       shouldAttemptHistoricalContextInjection({
@@ -1380,6 +1394,7 @@ export async function submit(
       }, CHECK_INTERVAL)
     })
     log.info('turn_pipeline_timing', { traceId, stage: 'context_ready', elapsedMs: performance.now() - submitStartedAt })
+    beginTurnOverflowContext(session, userTextOrBlocks, pendingCheckpoint?.generation)
     logicalTurnRun = this.runOneTurnWithRetry(
       session,
       runnerPayload,
@@ -1399,6 +1414,8 @@ export async function submit(
     )
     try {
       await Promise.race([logicalTurnRun, livenessPromise])
+      const activeCkptGen = getTurnActiveCheckpointGeneration(session) ?? pendingCheckpoint?.generation
+      if (activeCkptGen && ackPendingCheckpointIfTurnSucceeded(session, activeCkptGen)) checkpointAcked = true
     } finally {
       if (livenessTimer) clearInterval(livenessTimer)
     }
@@ -1456,6 +1473,9 @@ export async function submit(
       transition.state = 'prepared'
       transition.summaryInjected = false
     }
+    const unackedCkptGen = !checkpointAcked ? (getTurnActiveCheckpointGeneration(session) ?? pendingCheckpoint?.generation) : undefined
+    if (unackedCkptGen) resetUnackedCheckpointSessionFlags(session, unackedCkptGen)
+    clearTurnOverflowContext(session)
     await finalizeEfficiencyTurn(session).catch((err) => {
       log.debug('efficiency guard finalize failed', {
         sessionKey: session.sessionKey,

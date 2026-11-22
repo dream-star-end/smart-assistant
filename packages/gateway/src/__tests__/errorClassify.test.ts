@@ -444,6 +444,23 @@ describe('classifyRunError', () => {
     assert.equal(r.message, '')
   })
 
+  it('legacy OC_ERRORCLASSIFY_JEV_SHADOW env var is safely ignored as a no-op (OCV5-829)', () => {
+    const prevFlag = process.env.OC_ERRORCLASSIFY_JEV_SHADOW
+    const prevKey = process.env.OC_JEV_API_KEY
+    process.env.OC_ERRORCLASSIFY_JEV_SHADOW = '1'
+    process.env.OC_JEV_API_KEY = 'legacy-unused-key'
+    try {
+      const r = classifyRunError('TypeError: unrecognized error under retired shadow env')
+      assert.equal(r.code, 'unknown')
+      assert.equal(r.message, '')
+    } finally {
+      if (prevFlag === undefined) delete process.env.OC_ERRORCLASSIFY_JEV_SHADOW
+      else process.env.OC_ERRORCLASSIFY_JEV_SHADOW = prevFlag
+      if (prevKey === undefined) delete process.env.OC_JEV_API_KEY
+      else process.env.OC_JEV_API_KEY = prevKey
+    }
+  })
+
   it('unknown: 空 / null / undefined', () => {
     assert.equal(classifyRunError('').code, 'unknown')
     assert.equal(classifyRunError(null).code, 'unknown')

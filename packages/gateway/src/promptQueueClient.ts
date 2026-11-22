@@ -65,6 +65,7 @@ export interface PromptQueueDetail {
     modelSwitchConsent?: string
     effortLevel?: string | null
     teamMode?: boolean
+    swarmMode?: boolean
     collabMode?: 'solo' | 'advisor' | 'team'
     advisorModel?: string
     collabConfigVersion?: string
@@ -488,7 +489,7 @@ function assertOwner(value: unknown, expected: PromptQueueWireOwner, userId: str
 
 function assertRequestedExecution(value: unknown, agentId: string): void {
   const execution = record(value, 'requestedExecution')
-  assertOnlyKeys(execution, ['agentId', 'model', 'modelSwitchId', 'modelSwitchConsent', 'effortLevel', 'teamMode', 'collabMode', 'advisorModel', 'collabConfigVersion', 'contextTier', 'serviceTier'], 'requestedExecution')
+  assertOnlyKeys(execution, ['agentId', 'model', 'modelSwitchId', 'modelSwitchConsent', 'effortLevel', 'teamMode', 'swarmMode', 'collabMode', 'advisorModel', 'collabConfigVersion', 'contextTier', 'serviceTier'], 'requestedExecution')
   if (execution.agentId !== agentId) invalidResponse('requestedExecution.agentId mismatch')
   if (execution.model !== undefined && typeof execution.model !== 'string')
     invalidResponse('requestedExecution.model invalid')
@@ -506,6 +507,9 @@ function assertRequestedExecution(value: unknown, agentId: string): void {
   }
   if (execution.teamMode !== undefined && typeof execution.teamMode !== 'boolean') {
     invalidResponse('requestedExecution.teamMode invalid')
+  }
+  if (execution.swarmMode !== undefined && typeof execution.swarmMode !== 'boolean') {
+    invalidResponse('requestedExecution.swarmMode invalid')
   }
   if (
     execution.collabMode !== undefined &&

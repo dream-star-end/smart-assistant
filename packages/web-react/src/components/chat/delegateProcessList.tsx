@@ -2,11 +2,9 @@
  * 委派过程树的卡内窗口：固定高度 + 贴底 + 上滑扩窗。
  * 状态全部在本组件内，childBlocks 仍以 reducer 为唯一权威。
  */
-import { useCallback, useLayoutEffect, useRef, useState, type UIEvent, type WheelEvent } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState, type UIEvent, type WheelEvent } from "react";
 import type { ChildBlock } from "../../lib/chat/model";
 import { childSignature } from "../../lib/chat/render";
-import { formatBytes } from "../../lib/chat/download";
-import { groupDigits } from "../../lib/utils";
 import { ChildBlockView } from "./AgentGroupCard";
 
 export const DELEGATE_PROCESS_TAIL_SIZE = 30;
@@ -41,8 +39,53 @@ function lastBashTailBytes(children: ChildBlock[]): number | null {
   return null;
 }
 
+function normalizeChildBlocks(children: ChildBlock[]): ChildBlock[] {
+  const toolIndexById = new Map<string, number>();
+  const out: ChildBlock[] = [];
+  for (const child of children) {
+    if (child.kind === "tool_use") {
+      const idx = out.length;
+      out.push(child);
+      if (child.blockId) toolIndexById.set(child.blockId, idx);
+      continue;
+    }
+    if (child.kind === "tool_result") {
+      const parentIdx = child.toolUseBlockId ? toolIndexById.get(child.toolUseBlockId) : undefined;
+      if (parentIdx !== undefined) {
+        const prev = out[parentIdx]!;
+        out[parentIdx] = {
+          ...prev,
+          _completed: true,
+          error: prev.error || child.isError,
+          output: child.output ?? child.preview ?? prev.output,
+        };
+        continue;
+      }
+      out.push(child);
+      continue;
+    }
+    if (child.kind === "tool_output_tail") {
+      const parentIdx = child.toolUseBlockId ? toolIndexById.get(child.toolUseBlockId) : undefined;
+      if (parentIdx !== undefined && child.tail) {
+        const prev = out[parentIdx]!;
+        if (!prev.output) out[parentIdx] = { ...prev, output: child.tail };
+      }
+      continue;
+    }
+    if (child.kind === "final") continue;
+    if (child.kind === "plan" && (!Array.isArray(child.steps) || child.steps.length === 0)) continue;
+    if (child.kind === "goal" && !(child.text || child.explanation)?.trim()) continue;
+    if (child.kind === "error" && !(child.text || child.preview)?.trim()) continue;
+    out.push(child);
+  }
+  return out;
+}
+
 export function DelegateProcessList({ childBlocks }: { childBlocks: ChildBlock[] }) {
-  const blocks = Array.isArray(childBlocks) ? childBlocks : [];
+  const blocks = useMemo(
+    () => (Array.isArray(childBlocks) ? normalizeChildBlocks(childBlocks) : []),
+    [childBlocks],
+  );
   const total = blocks.length;
   const [windowStart, setWindowStart] = useState(() => windowStartForTail(total));
   const [followBottom, setFollowBottom] = useState(true);
@@ -61,8 +104,6 @@ export function DelegateProcessList({ childBlocks }: { childBlocks: ChildBlock[]
 
   const start = Math.min(windowStart, windowStartForTail(total));
   const mounted = blocks.slice(start);
-  const mountedCount = mounted.length;
-  const progress = total === 0 ? 0 : mountedCount / total;
   const tailBytes = lastBashTailBytes(blocks);
   // 末条 output/bashTail 变长时 total 不变，也要贴底。
   const lastChild = total > 0 ? blocks[total - 1] : undefined;
@@ -112,21 +153,6 @@ export function DelegateProcessList({ childBlocks }: { childBlocks: ChildBlock[]
 
   return (
     <div className="relative">
-      <div className="border-b border-border px-3.5 py-1.5">
-        <div className="flex items-center justify-between gap-2 text-caption text-muted">
-          <span>
-            已加载 {groupDigits(String(mountedCount))} / {groupDigits(String(total))} 步
-          </span>
-          {tailBytes != null && <span>输出 {formatBytes(tailBytes)}</span>}
-        </div>
-        <div className="mt-1 h-0.5 overflow-hidden rounded-full bg-hover">
-          <div
-            className="h-full rounded-full bg-accent/70"
-            style={{ width: `${Math.max(0, Math.min(100, progress * 100))}%` }}
-            data-testid="delegate-process-progress"
-          />
-        </div>
-      </div>
       <div
         ref={scrollerRef}
         className="delegate-process-scroller h-[min(420px,50vh)] overflow-y-auto overscroll-contain"

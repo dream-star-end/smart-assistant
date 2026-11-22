@@ -58,7 +58,9 @@ export function ToolCard({
   const renderTool = display.tool;
   const meta = resolveToolMeta(name, input);
   const Icon = meta.icon;
-  const summary = toolSummary(name, input);
+  const summary =
+    (typeof input?.toolSummary === "string" && input.toolSummary.trim()) ||
+    toolSummary(name, input);
   // 表头各段的 id:按钮可及名走 aria-labelledby 拼「标签 + 摘要 + 错误首行 + 状态」(T-22),
   // 不再用 aria-label 把按钮内的可见文本全部覆盖掉。
   const uid = useId();
@@ -88,23 +90,17 @@ export function ToolCard({
 
   // 运行中（流式）默认展开以便边流边看 diff/输出；历史（挂载即完成）默认折叠。
   // 未成功的卡也默认展开:错误详情是用户此刻最需要的信息,不该多一次点击。
-  // 初值只在挂载求一次，之后用户手动 toggle 为权威（依赖稳定 key 保持实例）。
-  // 过程时间轴行(step):运行中 / 未成功都不自动摊开输出(输出只在点开这一步后出现),
-  // 未成功只标首行原因。用户在运行中点开过的,跑完自动收起(手动开合过则以用户为准)。
+  // 过程时间轴行(step, OCV5-817):ToolCard 只在用户主动点开外层步骤行(process-step-row)后挂载,
+  // 因此挂载即默认展开 ToolBody,消除「点开步骤 → 技术详情 → 再点一次折叠 ToolCard」的多余层级。
   const [open, setOpen] = useState(
-    () => (isRunning && !step) || isBlocked || status.isConfirmation || (hasError && !step),
+    () => step || isRunning || isBlocked || status.isConfirmation || hasError,
   );
   const userToggled = useRef(false);
   // 挂载时还是「完成/折叠」、随后归并成 error:true 的历史消息,同样按 F1 展开(T-07);
   // 用户已手动折叠过则尊重用户,不再跳动。
   useEffect(() => {
-    if (hasError && !step && !userToggled.current) setOpen(true);
-  }, [hasError, step]);
-  const wasRunning = useRef(isRunning);
-  useEffect(() => {
-    if (step && wasRunning.current && !isRunning && !isBlocked && !userToggled.current) setOpen(false);
-    wasRunning.current = isRunning;
-  }, [isRunning, isBlocked, step]);
+    if (hasError && !userToggled.current) setOpen(true);
+  }, [hasError]);
 
   // 无 body 的卡表头不渲染成 button(L5):没有可展开的内容,不该有可点语义。
   const HeaderTag = hasBody ? ("button" as const) : ("div" as const);
@@ -159,7 +155,7 @@ export function ToolCard({
               <span
                 id={summaryId}
                 className={cn(
-                  "min-w-0 truncate font-mono text-[12px]",
+                  "min-w-0 truncate font-mono text-meta",
                   commandRow ? (isRunning ? "text-muted" : "text-faint") : "text-faint",
                 )}
                 title={summary}
@@ -167,7 +163,7 @@ export function ToolCard({
                 {summary}
               </span>
             )}
-            <span className="ml-auto flex shrink-0 items-center gap-2 pl-1">
+            <span className="ml-auto flex shrink-0 items-center gap-2 pl-1 tabular-nums">
               <StepMetaBadge ids={[stepId]} tokenUsage={tokenUsage} />
               <span id={statusId} aria-live="polite" className="flex items-center text-meta">
                 {/* 过程行里的未成功/受阻/取消是中途常态:如实标注,但与其他过程文字同为安静灰字。 */}
@@ -180,6 +176,7 @@ export function ToolCard({
               {hasBody && (
                 <ChevronRight
                   size={14}
+                  strokeWidth={1.75}
                   aria-hidden="true"
                   className={cn(
                     "text-faint transition-[transform,opacity] duration-200 ease-[var(--ease-spring)]",
@@ -202,7 +199,7 @@ export function ToolCard({
                   openInspect();
                 }}
               >
-                <PanelRight size={14} />
+                <PanelRight size={14} strokeWidth={1.75} />
               </IconButton>
             </div>
           )}
@@ -215,9 +212,8 @@ export function ToolCard({
         {body && (
           <div
             className={cn(
-              "oc-reveal mb-1.5 mt-0.5 overflow-hidden rounded-lg border bg-surface px-3 py-2 [&>*:first-child]:mt-0",
-              "border-border/80",
-              isActive && "ring-1 ring-accent/40",
+              "oc-reveal oc-surface-card mb-1.5 mt-1 overflow-hidden rounded-lg px-3 py-2.5 [&>*:first-child]:mt-0",
+              isActive && "ring-1 ring-accent/45",
             )}
           >
             {/* 体内若再挂工具卡(扇出/子任务明细)用完整卡,不继承时间轴行样式。 */}
@@ -233,36 +229,35 @@ export function ToolCard({
       className={cn(
         // 不带外边距——间距交由容器（MessageList 的 gap / AgentGroupCard 的 space-y）统一控制，
         // 避免 margin 与父级 gap 叠加导致卡片间距过大（boss 反馈"卡片间距好大"的根因之一）。
-        // 无投影:一列工具卡靠 1px 细框 + 圆角成组,投影叠起来会显脏。
-        "overflow-hidden rounded-md border bg-surface transition-colors",
+        "oc-surface-card overflow-hidden rounded-md transition-[border-color,box-shadow] duration-150",
         hasError
           ? "border-danger/25"
           : isBlocked
             ? "border-warning/35"
             : isRunning
-              ? "border-accent/30"
-              : "border-border/80 hover:border-border-strong",
-        isActive && "ring-1 ring-accent/40",
+              ? "border-accent/35"
+              : "hover:border-border-strong",
+        isActive && "ring-1 ring-accent/45",
       )}
     >
       <div className="flex items-stretch">
       <HeaderTag
         {...toggle}
         className={cn(
-          "flex min-h-11 min-w-0 flex-1 items-center gap-2.5 px-3 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11",
-          hasBody && "cursor-pointer hover:bg-hover/60 active:bg-active/60",
+          "flex min-h-11 min-w-0 flex-1 items-center gap-2.5 px-3 py-2 text-left outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+          hasBody && "cursor-pointer hover:bg-hover/55 active:bg-active/55",
         )}
       >
         <span
           className={cn(
-            "flex size-6 shrink-0 items-center justify-center rounded-[7px]",
+            "size-6 shrink-0 rounded-sm",
             toneTileClass(meta.tone),
           )}
         >
-          <Icon size={13} />
+          <Icon size={13} strokeWidth={1.75} aria-hidden="true" />
         </span>
         {/* 窄屏(L7):标题限宽、摘要优先截断,右侧徽章区 shrink-0 保持完整可见。 */}
-        <span id={labelId} className="min-w-0 max-w-[45%] shrink-0 truncate text-body font-medium text-fg">
+        <span id={labelId} className="min-w-0 max-w-[45%] shrink-0 truncate text-body font-medium tracking-[-0.005em] text-fg">
           {meta.label}
         </span>
         {summary && (
@@ -270,7 +265,7 @@ export function ToolCard({
             id={summaryId}
             // 有错误首行时,窄屏把整行让给错误(T-11):摘要藏起来,错误首行单独占表头下一行。
             className={cn(
-              "min-w-0 truncate font-mono text-[12px] text-muted",
+              "min-w-0 truncate font-mono text-meta text-muted",
               errorFirstLine && "hidden sm:inline",
             )}
             title={summary}
@@ -281,13 +276,13 @@ export function ToolCard({
         {errorFirstLine && (
           <span
             id={errorId}
-            className="hidden min-w-0 truncate text-xs text-danger sm:inline"
+            className="hidden min-w-0 truncate text-meta text-danger sm:inline"
             title={errorFirstLine}
           >
             {errorFirstLine}
           </span>
         )}
-        <span className="ml-auto flex shrink-0 items-center gap-2">
+        <span className="ml-auto flex shrink-0 items-center gap-2 tabular-nums">
           <StepMetaBadge ids={[stepId]} tokenUsage={tokenUsage} />
           {/* 状态区 aria-live:运行中→完成/未成功的迁移会被读屏播报(T-22)。
               运行态 spinner 是 aria-hidden，需 sr-only 播报；其余状态均有可见 Badge 文案。 */}
@@ -302,9 +297,12 @@ export function ToolCard({
             ) : isCancelled ? (
               <Badge tone="neutral">{status.label}</Badge>
             ) : (
-              // 成功是常态,不再每行挂一枚绿色胶囊:只留一个低调对勾,文案给读屏(sr-only)。
-              <span className="flex size-5 items-center justify-center text-success" title={status.label}>
-                <Check size={14} strokeWidth={2.25} aria-hidden="true" />
+              // 成功是常态,不再每行挂一枚绿色胶囊:只留一个低调对勾印记,文案给读屏(sr-only)。
+              <span
+                className="flex size-5 items-center justify-center rounded-full bg-success-soft/65 text-success"
+                title={status.label}
+              >
+                <Check size={12} strokeWidth={2.25} aria-hidden="true" />
                 <span className="sr-only">{status.label}</span>
               </span>
             )}
@@ -312,6 +310,7 @@ export function ToolCard({
           {hasBody && (
             <ChevronRight
               size={15}
+              strokeWidth={1.75}
               aria-hidden="true"
               className={cn("text-faint transition-transform duration-200 ease-[var(--ease-spring)]", open && "rotate-90")}
             />
@@ -331,7 +330,7 @@ export function ToolCard({
               openInspect();
             }}
           >
-            <PanelRight size={14} />
+            <PanelRight size={14} strokeWidth={1.75} />
           </IconButton>
         </div>
       )}
@@ -340,14 +339,14 @@ export function ToolCard({
       {errorFirstLine && (
         <div
           aria-hidden="true"
-          className="truncate px-3 pb-1.5 text-xs text-danger sm:hidden"
+          className="truncate px-3 pb-1.5 text-meta text-danger sm:hidden"
           title={errorFirstLine}
         >
           {errorFirstLine}
         </div>
       )}
       {body && (
-        <div className="border-t border-border/70 bg-bg/40 px-3 py-2 [&>*:first-child]:mt-0">
+        <div className="oc-surface-recessed rounded-none border-0 border-t border-border/75 px-3 py-2 [&>*:first-child]:mt-0">
           {body}
         </div>
       )}

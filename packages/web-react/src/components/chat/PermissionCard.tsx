@@ -10,7 +10,7 @@
  *    modal 窄屏均为贴底 sheet(mobile="sheet")。
  *  - 全部经 props.onRespond（= useChatSocket.respondPermission，已绑 sessId）。
  */
-import { AlertTriangle, Check, Clock, HelpCircle, LoaderCircle, ShieldCheck, X } from "lucide-react";
+import { AlertTriangle, Check, Clock, HelpCircle, LoaderCircle, X } from "lucide-react";
 import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { ChatMessage } from "../../lib/chat/model";
@@ -32,6 +32,7 @@ import {
 } from "../../lib/chat/permissionPopupCoordinator";
 import { resolveToolMeta, toolSummary } from "../tool/meta";
 import { Alert, Button, Modal } from "../ui";
+import { AtelierIcon } from "../ui/AtelierIcons";
 import {
   DETACHED_ASK_USER_TTL_MS,
   PENDING_PERMISSION_TTL_MS,
@@ -158,19 +159,19 @@ function PermissionInputSummary({
   }
   if (json.length > 4000) json = `${json.slice(0, 4000)}\n…`;
   return (
-    <div className="space-y-2">
+    <div className="space-y-2.5">
       {command && (
-        <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-meta text-fg">
-          <span className="text-success">$ </span>
+        <pre className="oc-code-shell max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-code px-3 py-2.5 font-mono text-meta text-fg">
+          <span className="select-none text-success">$ </span>
           {command.slice(0, 2000)}
         </pre>
       )}
       {rows.length > 0 && (
-        <dl className="flex flex-col gap-1 text-meta">
+        <dl className="oc-surface-recessed flex flex-col gap-1.5 rounded-lg border border-border/70 px-3 py-2 text-meta">
           {rows.map((row) => (
             <div key={row.label} className="flex gap-2">
               <dt className="shrink-0 font-medium text-faint">{row.label}</dt>
-              <dd className="min-w-0 break-all font-mono text-muted">{row.value}</dd>
+              <dd className="min-w-0 break-all font-mono text-fg/90">{row.value}</dd>
             </div>
           ))}
         </dl>
@@ -179,10 +180,10 @@ function PermissionInputSummary({
         <details open={!hasStructured}>
           {/* 触屏下 summary 只有一行字高(16px,QA t-1232 复扫 permission-card-settled ×6 / pending-modal ×1):
               与 media#2 / messages#2 / taskboard#2 同一约定,hover:none 时补 py-3.5 撑到 44px,桌面零变化。 */}
-          <summary className="cursor-pointer rounded text-caption text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:py-3.5">
+          <summary className="cursor-pointer rounded text-caption font-medium text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:py-3.5">
             查看完整参数
           </summary>
-          <pre className="mt-1 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-meta text-muted">
+          <pre className="oc-code-shell mt-1.5 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-code px-3 py-2 font-mono text-meta text-muted">
             {json}
           </pre>
         </details>
@@ -336,6 +337,7 @@ export function PermissionCard({
   let statusText = "等待审批…";
   if (!resolved) {
     if (pending) statusText = "正在提交…";
+    else if (expired && livePrompt && canAnswer) statusText = "等待时间较长";
     else if (expired) statusText = "已过期";
     else if (inputTruncated) statusText = "正在加载完整问题…";
     else if (questions) statusText = "等待回答…";
@@ -364,30 +366,30 @@ export function PermissionCard({
       data-permission-request={msg.requestId}
       className={cn(
         // OCV5-307:已处理的卡与工具卡同一套中性外框(结果由状态图标的绿/红表达),
-        // 不再用整圈绿/红边框跳出过程流;只有仍需用户操作的卡保留强调色边框。
-        showCard && "rounded-md border bg-surface animate-in",
-        showCard && (resolved ? "border-border/80" : "border-accent/40"),
+        // 不再用整圈绿/红边框跳出过程流;只有仍需用户操作的卡保留强调色边框与 Clarvy Atelier 审阅质感。
+        showCard && "oc-surface-card overflow-hidden rounded-xl animate-in",
+        showCard && (resolved ? "border-border/80" : "border-accent/45 ring-1 ring-accent/15"),
       )}
     >
       {showCard ? <>
       {/* 卡头(审计 PC-01):390px 下标题 / 工具片 / 状态 / 倒计时四段挤一行会把「退出计划模式」竖排、
           把工具片截成半个字。改成可换行:标题与工具片不折字,状态 + 倒计时 ml-auto 整组挤不下就整组换到下一行右对齐。 */}
-      <div className="flex min-h-10 flex-wrap items-center gap-x-2.5 gap-y-1 px-3 py-2">
+      <div className="flex min-h-11 flex-wrap items-center gap-x-2.5 gap-y-1.5 px-3.5 py-2.5">
         <span
           className={cn(
-            "flex size-6 shrink-0 items-center justify-center rounded-[7px]",
-            resolved ? "bg-hover text-muted" : "bg-accent-soft text-accent",
+            "oc-icon-badge flex size-6 shrink-0 items-center justify-center rounded-sm",
+            resolved ? "text-muted" : "oc-icon-badge-accent oc-breathe-aura",
           )}
         >
-          {questions ? <HelpCircle size={13} /> : <ShieldCheck size={13} />}
+          {questions ? <HelpCircle size={13} strokeWidth={1.75} /> : <AtelierIcon name="shield" size={14} />}
         </span>
-        <span className="whitespace-nowrap text-body font-medium text-fg">
+        <span className="whitespace-nowrap text-body font-semibold text-fg">
           {questions ? "用户问答" : isExitPlan ? "退出计划模式" : "权限请求"}
         </span>
         {/* ExitPlanMode 的工具标签与卡标题是同一句「退出计划模式」(PC-17):一行里连写两遍,窄屏还要为它折行,去掉工具片。 */}
         {!questions && !isExitPlan && (
-          <span className="inline-flex min-w-0 max-w-full items-center gap-1 rounded bg-hover px-1.5 py-0.5 text-meta text-muted">
-            {ToolIcon && <ToolIcon size={12} aria-hidden="true" className="shrink-0" />}
+          <span className="oc-surface-recessed inline-flex min-w-0 max-w-full items-center gap-1 rounded-md border border-border/70 px-2 py-0.5 text-caption font-medium text-muted">
+            {ToolIcon && <ToolIcon size={12} strokeWidth={1.75} aria-hidden="true" className="shrink-0" />}
             <span className="truncate">{toolLabel}</span>
           </span>
         )}
@@ -395,19 +397,19 @@ export function PermissionCard({
         <span className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-x-2.5 gap-y-1">
           {/* <output>(隐含 role=status,PC-05):等待审批 → 正在提交 → 已允许 的状态切换让读屏用户也能听到。 */}
           <output className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-meta text-muted">
-            <StatusIcon size={13} aria-hidden="true" className={statusIconCls} />
+            <StatusIcon size={13} strokeWidth={1.85} aria-hidden="true" className={statusIconCls} />
             {statusText}
           </output>
           {remainingMs > 0 && (
             <span
               className={cn(
-                "flex shrink-0 items-center gap-1 whitespace-nowrap text-meta",
+                "flex shrink-0 items-center gap-1 whitespace-nowrap font-mono text-caption tabular-nums",
                 remainingUrgent ? "font-medium text-warning" : "text-muted",
               )}
               title={remainingUrgent ? "即将过期，请尽快处理" : undefined}
             >
               {/* 临期不只靠颜色(PC-07):补一枚警示图标。 */}
-              {remainingUrgent && <AlertTriangle size={12} aria-hidden="true" className="shrink-0" />}
+              {remainingUrgent && <AlertTriangle size={12} strokeWidth={1.75} aria-hidden="true" className="shrink-0" />}
               {formatPermissionRemaining(remainingMs)}
             </span>
           )}
@@ -419,7 +421,7 @@ export function PermissionCard({
       {!resolved && !isExitPlan && !inputTruncated && (questions ? (
         <div
           data-testid="permission-pending-question"
-          className="border-t border-border/70 px-3 py-2 text-body text-fg"
+          className="border-t border-border/70 px-3.5 py-2.5 text-body text-fg"
         >
           <span className="line-clamp-2">{questions[0].question}</span>
           {questions.length > 1 && (
@@ -427,38 +429,29 @@ export function PermissionCard({
           )}
         </div>
       ) : pendingSummary ? (
-        <div data-testid="permission-pending-summary" className="border-t border-border/70 px-3 py-2">
+        <div data-testid="permission-pending-summary" className="border-t border-border/70 bg-bg/45 px-3.5 py-2.5">
           {pendingSummary.kind === "command" ? (
-            <pre className="line-clamp-2 whitespace-pre-wrap break-all font-mono text-meta text-fg">
-              <span className="text-success">$ </span>
+            <pre className="oc-surface-recessed line-clamp-2 whitespace-pre-wrap break-all rounded-lg border border-border/70 px-3 py-2 font-mono text-meta text-fg">
+              <span className="select-none text-success">$ </span>
               {pendingSummary.value.slice(0, 400)}
             </pre>
           ) : (
-            <div className="flex gap-2 text-meta">
+            <div className="oc-surface-recessed flex gap-2 rounded-lg border border-border/70 px-3 py-1.5 text-meta">
               <span className="shrink-0 font-medium text-faint">{pendingSummary.label}</span>
-              <span className="min-w-0 truncate font-mono text-muted">{pendingSummary.value}</span>
+              <span className="min-w-0 truncate font-mono text-fg/90">{pendingSummary.value}</span>
             </div>
           )}
         </div>
       ) : null)}
 
-      {/* 待审批：内联快捷 + 打开审批框。历史未答卡不自动弹，但保留这颗显式按钮。 */}
+      {/* 待审批：主按钮打开回答/审阅/审批框；问答卡跳过提问降级为次要 ghost 按钮。 */}
       {canAnswer && (
-        <div className="flex items-center gap-2 border-t border-border/70 px-3 py-2">
-          {questions && msg.requestId && (
-            <Button
-              size="sm"
-              variant="accent"
-              shape="pill"
-              onClick={() => continueAskUserQuestion(questions, input, msg.requestId!, onRespond)}
-            >
-              继续
-            </Button>
-          )}
+        <div className="flex flex-wrap items-center gap-2 border-t border-border/70 bg-surface/60 px-3.5 py-2.5">
           <Button
             size="sm"
-            variant={questions ? "secondary" : "accent"}
+            variant="accent"
             shape="pill"
+            className="oc-btn-tactile oc-btn-accent-craft oc-spring-press"
             onClick={() => {
               if (msg.requestId) reopenPermissionUi(msg.requestId);
               setOpen(true);
@@ -466,12 +459,24 @@ export function PermissionCard({
           >
             {questions ? "回答" : isExitPlan ? "审阅计划" : "审批"}
           </Button>
+          {questions && msg.requestId && (
+            <Button
+              size="sm"
+              variant="ghost"
+              shape="pill"
+              className="oc-btn-tactile text-muted hover:text-fg"
+              onClick={() => continueAskUserQuestion(questions, input, msg.requestId!, onRespond)}
+            >
+              跳过提问
+            </Button>
+          )}
           {!questions && !isExitPlan && (
             // 拒绝是不可撤销动作,却长得像一段灰字(PC-08):改成描边按钮,触屏 44px 由 Button 原语兜底。
             <Button
               size="sm"
               variant="secondary"
               shape="pill"
+              className="oc-btn-tactile oc-btn-secondary-craft"
               onClick={() => onRespond({ requestId: msg.requestId!, behavior: "deny" })}
             >
               拒绝
@@ -489,14 +494,13 @@ export function PermissionCard({
           提问已过期，无法再作答
         </div>
       )}
-      {/* 活提问的过期 fail-safe(PC-03):按本机时钟已过 TTL 但仍留着「审批」入口(时钟偏差时服务端可能还在等)。
-          此前卡头写「已过期」、下面却挂着可点的按钮,两句自相矛盾;补一行说明把这层「可能」讲清楚。 */}
+      {/* 活提问的超时 fail-safe：任务仍在等待时保留可作答提交能力，避免误锁卡死。 */}
       {!resolved && !readOnly && expired && livePrompt && canAnswer && (
         <div
           data-testid="permission-expired-failsafe"
           className="border-t border-border/70 px-3 py-2 text-caption text-faint"
         >
-          按本机时间已超过等待时限；若智能体仍在等待（时钟可能有偏差），仍可作答。
+          等待时间较长，仍可作答提交。
         </div>
       )}
 
@@ -624,18 +628,39 @@ function PendingApprovalBar({
   return slot ? createPortal(bar, slot) : bar;
 }
 
+function isInlinePermissionCardVisible(
+  scrollParent: HTMLElement | null | undefined,
+  requestId: string | undefined,
+): boolean {
+  if (!scrollParent || !requestId) return false;
+  const escaped =
+    typeof CSS !== "undefined" && typeof CSS.escape === "function"
+      ? CSS.escape(requestId)
+      : requestId.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const card = scrollParent.querySelector(
+    `[data-testid="permission-card"][data-permission-request="${escaped}"]`,
+  );
+  if (!(card instanceof HTMLElement)) return false;
+  const view = scrollParent.getBoundingClientRect();
+  const rect = card.getBoundingClientRect();
+  if (view.height <= 0 || rect.height <= 0) return false;
+  return rect.bottom > view.top + 4 && rect.top < view.bottom - 4;
+}
+
 export function PermissionPromptHost({
   messages,
   onRespond,
   readOnly = false,
   sending = false,
   sessionId,
+  scrollParent,
 }: {
   messages: ChatMessage[];
   onRespond: PermissionRespond;
   readOnly?: boolean;
   sending?: boolean;
   sessionId?: string;
+  scrollParent?: HTMLElement | null;
 }) {
   const [tick, setTick] = useState(0);
   useEffect(() => subscribePermissionCoordinator(() => {
@@ -655,14 +680,15 @@ export function PermissionPromptHost({
     const timer = setTimeout(() => setTick((n) => n + 1), Math.min(next - now, 2_147_483_647));
     return () => clearTimeout(timer);
   }, [messages, readOnly, tick]);
-  if (readOnly) return null;
-  const pending = messages.filter(
-    (message) =>
-      message.role === "permission" &&
-      isAwaitingPermissionPrompt(message) &&
-      typeof message.requestId === "string" &&
-      message.requestId.length > 0,
-  );
+  const pending = readOnly
+    ? []
+    : messages.filter(
+        (message) =>
+          message.role === "permission" &&
+          isAwaitingPermissionPrompt(message) &&
+          typeof message.requestId === "string" &&
+          message.requestId.length > 0,
+      );
   const active = activeModalRequest();
   const activeMsg = pending.find((message) => message.requestId === active);
   const isLive = (message: ChatMessage) =>
@@ -671,13 +697,33 @@ export function PermissionPromptHost({
     isLive(message) && shouldAutoOpenPermission({ requestId: message.requestId!, livePrompt: true }),
   );
   const msg = activeMsg ?? autoMsg;
-  // 没有弹框在开时的待答入口。除了用户主动关掉的,还要接住**被顶掉的活提问**(PC-04):
-  // A 自动弹出后用户点了 B 卡的「审批」,A 的弹框被 singleton 收掉但没记 dismissed;
-  // 答完 B 之后 A 已被标「展示过」不再自动弹 —— 没有这条兜底就只剩时间线里一张静默的卡。
-  const minimized = !msg ? pending.find((message) =>
-    !isExitPlanModeTool(message.toolName) &&
-    (isPermissionUiDismissed(message.requestId) || isLive(message))
-  ) : undefined;
+  const minimizedCandidate = !msg
+    ? pending.find((message) =>
+        (!isExitPlanModeTool(message.toolName) || Boolean(scrollParent)) &&
+        (isPermissionUiDismissed(message.requestId) || isLive(message) || Boolean(scrollParent)),
+      )
+    : undefined;
+  const minimizedId = minimizedCandidate?.requestId;
+  const [inlineVisible, setInlineVisible] = useState(false);
+  useEffect(() => {
+    if (!scrollParent || !minimizedId) {
+      setInlineVisible(false);
+      return;
+    }
+    const sync = () => {
+      const next = isInlinePermissionCardVisible(scrollParent, minimizedId);
+      setInlineVisible((prev) => (prev === next ? prev : next));
+    };
+    sync();
+    scrollParent.addEventListener("scroll", sync, { passive: true });
+    window.addEventListener("resize", sync, { passive: true });
+    return () => {
+      scrollParent.removeEventListener("scroll", sync);
+      window.removeEventListener("resize", sync);
+    };
+  }, [scrollParent, minimizedId, messages.length, tick]);
+  if (readOnly) return null;
+  const minimized = minimizedCandidate && !inlineVisible ? minimizedCandidate : undefined;
   return (
     <>
     {msg && <PermissionCard
@@ -744,7 +790,8 @@ function GenericPermissionModal({
       footer={
         <>
           <Button
-            variant="ghost"
+            variant="secondary"
+            className="oc-btn-tactile oc-btn-secondary-craft"
             onClick={() => {
               onRespond({ requestId, behavior: "deny" });
               onOpenChange(false);
@@ -754,6 +801,7 @@ function GenericPermissionModal({
           </Button>
           <Button
             variant="accent"
+            className="oc-btn-tactile oc-btn-accent-craft oc-spring-press"
             onClick={() => {
               onRespond({ requestId, behavior: "allow" });
               onOpenChange(false);
@@ -764,9 +812,13 @@ function GenericPermissionModal({
         </>
       }
     >
-      <div className="space-y-2.5">
-        <div className="inline-flex items-center gap-1.5 rounded bg-hover px-2 py-1 text-body text-fg">
-          {ToolIcon && <ToolIcon size={14} aria-hidden="true" className="shrink-0 text-muted" />}
+      <div className="space-y-3">
+        <div className="oc-surface-recessed inline-flex items-center gap-2 rounded-lg border border-border/70 px-2.5 py-1.5 text-body font-medium text-fg">
+          {ToolIcon && (
+            <span className="oc-icon-badge oc-icon-badge-accent flex size-5 shrink-0 items-center justify-center rounded-sm">
+              <ToolIcon size={12} strokeWidth={1.75} aria-hidden="true" />
+            </span>
+          )}
           {toolLabel}
         </div>
         <PermissionInputSummary toolName={toolName} input={input} inputPreview={inputPreview} />
@@ -813,7 +865,11 @@ function ExitPlanModeModal({
           <Button variant="ghost" onClick={() => decide("deny")}>
             继续规划
           </Button>
-          <Button variant="accent" onClick={() => decide("allow")}>
+          <Button
+            variant="accent"
+            className="oc-btn-tactile oc-btn-accent-craft oc-spring-press"
+            onClick={() => decide("allow")}
+          >
             按此计划执行
           </Button>
         </>
@@ -985,7 +1041,11 @@ function AskUserQuestionModal({
           >
             暂不回答，让它继续
           </Button>
-          <Button variant="accent" onClick={submit}>
+          <Button
+            variant="accent"
+            className="oc-btn-tactile oc-btn-accent-craft oc-spring-press"
+            onClick={submit}
+          >
             提交
           </Button>
         </>
@@ -1039,23 +1099,25 @@ function AskUserQuestionModal({
                       tabIndex={optionTabIndex(q, qs, opt.label, optIdx === 0)}
                       onClick={() => toggle(q, opt.label)}
                       className={cn(
-                        "flex min-h-11 items-start gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors",
-                        sel ? "border-accent bg-accent-soft" : "border-border bg-surface hover:bg-hover",
+                        "oc-btn-tactile flex min-h-11 items-start gap-2.5 rounded-xl border px-3.5 py-2.5 text-left transition-all duration-150",
+                        sel
+                          ? "border-accent bg-accent-soft shadow-soft ring-1 ring-accent/20"
+                          : "oc-surface-card-hover border-border bg-surface hover:border-accent/40 hover:bg-hover/60",
                       )}
                     >
                       <span
                         className={cn(
-                          "mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border",
+                          "mt-0.5 flex size-4 shrink-0 items-center justify-center border transition-colors",
                           sel ? "border-accent bg-accent text-accent-fg" : "border-border-strong",
-                          q.multiSelect ? "rounded-[5px]" : "rounded-full",
+                          q.multiSelect ? "rounded-xs" : "rounded-full",
                         )}
                       >
-                        {sel && <Check size={11} />}
+                        {sel && <Check size={11} strokeWidth={2.2} />}
                       </span>
                       <span className="min-w-0">
-                        <span className="block text-section text-fg">{opt.label}</span>
+                        <span className="block text-section font-medium text-fg">{opt.label}</span>
                         {opt.description && (
-                          <span className="block text-meta text-muted">{opt.description}</span>
+                          <span className="mt-0.5 block text-meta text-muted">{opt.description}</span>
                         )}
                       </span>
                     </button>
@@ -1070,21 +1132,21 @@ function AskUserQuestionModal({
                     tabIndex={optionTabIndex(q, qs, OTHER, safeOptions.length === 0)}
                     onClick={() => toggle(q, OTHER)}
                     className={cn(
-                      "flex min-h-11 items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors",
+                      "oc-btn-tactile flex min-h-11 items-center gap-2.5 rounded-xl border px-3.5 py-2.5 text-left transition-all duration-150",
                       qs.selected.includes(OTHER)
-                        ? "border-accent bg-accent-soft"
-                        : "border-border bg-surface hover:bg-hover",
+                        ? "border-accent bg-accent-soft shadow-soft ring-1 ring-accent/20"
+                        : "oc-surface-card-hover border-border bg-surface hover:border-accent/40 hover:bg-hover/60",
                     )}
                   >
                     <span
                       className={cn(
-                        "flex size-4 shrink-0 items-center justify-center rounded-full border",
+                        "flex size-4 shrink-0 items-center justify-center rounded-full border transition-colors",
                         qs.selected.includes(OTHER) ? "border-accent bg-accent text-accent-fg" : "border-border-strong",
                       )}
                     >
-                      {qs.selected.includes(OTHER) && <Check size={11} />}
+                      {qs.selected.includes(OTHER) && <Check size={11} strokeWidth={2.2} />}
                     </span>
-                    <span className="text-section text-fg">其他（自行输入）</span>
+                    <span className="text-section font-medium text-fg">其他（自行输入）</span>
                   </button>
                 )}
               </div>
@@ -1103,7 +1165,7 @@ function AskUserQuestionModal({
                   // placeholder 不构成可访问名(探针 label=null),读屏需要显式名字。
                   aria-label="其他答案"
                   placeholder="输入你的答案…"
-                  className="w-full rounded-lg border border-border bg-bg px-3 py-2 text-section text-fg outline-none focus-visible:border-accent"
+                  className="oc-field-control w-full rounded-lg border border-border-control/70 bg-bg px-3 py-2 text-base text-fg outline-none transition-[border-color,box-shadow] focus-visible:border-accent focus-visible:ring-2 focus-visible:ring-ring md:text-section"
                 />
               )}
               {hasPreview && preview && (

@@ -51,6 +51,7 @@ EGRESS_HEALTH_URL="${EGRESS_HEALTH_URL:-http://${EGRESS_BIND}:${EGRESS_PORT}/int
 DO_RELOAD=1
 DO_RESTART=1
 DO_HEALTHZ=1
+ALLOW_MISSING_COMPLETE=0
 UNITS_RESTORED=0
 
 die() {
@@ -95,6 +96,7 @@ while [[ $# -gt 0 ]]; do
     --no-reload) DO_RELOAD=0; shift ;;
     --no-restart) DO_RESTART=0; shift ;;
     --no-healthz) DO_HEALTHZ=0; shift ;;
+    --allow-missing-complete) ALLOW_MISSING_COMPLETE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "未知参数: $1" ;;
   esac
@@ -140,6 +142,59 @@ assert_worktree_wd() {
 
 assert_worktree_wd "$MASTER_SRC"
 assert_worktree_wd "$EGRESS_SRC"
+
+# OCV5-818: 与 packages/commercial/src/agent-sandbox/syntheticEvalOverlayRuntime.ts
+# readSyntheticEvalReleaseSourceCommit + assertRootOwnedSafe 保持同一契约(fail-closed):
+# 真恢复(DO_RESTART=1)前先核验工作树目录与 .complete 均为 root:0、不可 group/other 写、
+# 非符号链接、严格 JSON 且 sourceCommit 为 40 位 hex;缺 python3 一律拒绝。--no-restart 演练/测试不受影响。
+assert_worktree_complete_for_restart() {
+  local f="$1" wd
+  [[ "$DO_RESTART" == 1 && "$ALLOW_MISSING_COMPLETE" != 1 ]] || return 0
+  wd="$(awk -F= '/^WorkingDirectory=/{print $2; exit}' "$f" | tr -d '[:space:]')"
+  command -v python3 >/dev/null 2>&1 \
+    || die "拒绝恢复工作树 unit: 缺少 python3 无法核验 $wd/.complete 运行时契约(OCV5-818)。"
+  if ! python3 - "$wd" <<'PY'
+import json, os, re, stat, sys
+wd = sys.argv[1]
+if not os.path.isabs(wd):
+    sys.exit(1)
+real_wd = os.path.realpath(wd)
+try:
+    st_dir = os.lstat(real_wd)
+except OSError:
+    sys.exit(1)
+if not stat.S_ISDIR(st_dir.st_mode) or stat.S_ISLNK(st_dir.st_mode):
+    sys.exit(1)
+if st_dir.st_uid != 0 or (st_dir.st_mode & 0o022) != 0:
+    sys.exit(1)
+marker = os.path.join(real_wd, ".complete")
+try:
+    st_m = os.lstat(marker)
+except OSError:
+    sys.exit(1)
+if not stat.S_ISREG(st_m.st_mode) or stat.S_ISLNK(st_m.st_mode):
+    sys.exit(1)
+if st_m.st_uid != 0 or (st_m.st_mode & 0o022) != 0:
+    sys.exit(1)
+try:
+    def _reject_constant(tok):
+        raise ValueError(f"non-standard JSON constant: {tok}")
+    with open(marker, "r", encoding="utf-8") as fh:
+        data = json.loads(fh.read(), parse_constant=_reject_constant)
+except Exception:
+    sys.exit(1)
+if not isinstance(data, dict):
+    sys.exit(1)
+sc = data.get("sourceCommit")
+if not isinstance(sc, str) or not re.fullmatch(r"[0-9a-f]{40}", sc):
+    sys.exit(1)
+PY
+  then
+    die "拒绝恢复工作树 unit: $wd/.complete 未通过运行时安全契约(需 root:0、不可 go+w、非符号链接、非空 JSON 且 40 位 sourceCommit),V5+runtimeTuple 启动必崩溃循环(OCV5-818)。应急覆盖需 --allow-missing-complete。"
+  fi
+}
+
+assert_worktree_complete_for_restart "$MASTER_SRC"
 
 TXN="$SYSTEMD_DIR/.openclaude-v5-selfhost-restore.txn"
 MASTER_TMP=""

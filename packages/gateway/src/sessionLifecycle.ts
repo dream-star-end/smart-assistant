@@ -10,7 +10,23 @@ import { type PreheatPreparation, reserveUnusedPreheat, armUnusedPreheat, consum
  */
 import { existsSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { join } from 'node:path'
-import { paths } from '@openclaude/storage'
+import { getEngineContextMessages, paths } from '@openclaude/storage'
+import {
+  estimateModelHistoryTokens,
+  modelHistoryRoleLabel,
+  modelHistorySemanticText,
+  projectModelHistoryForReplay,
+} from '@openclaude/protocol'
+import { cleanupSessionArtifacts, safeSliceHead } from './payloadOffloadGate.js'
+import { contextCompactionsTotal } from './metrics.js'
+import {
+  clearPendingCheckpoint,
+  isSessionCompacting,
+  markSessionCompacting,
+  peekPendingCheckpoint,
+  savePendingCheckpoint,
+  unmarkSessionCompacting,
+} from './sessionCheckpointStore.js'
 import {
   abandonAllIdle,
   consumeIdleReset,
@@ -28,16 +44,27 @@ import { clearFrozenPrompt } from './promptFreeze.js'
 import { type ExecutionTarget, RemoteTargetUnavailableError } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { log } from './sessionManagerLog.js'
+import { hasCcbLocalAgentPendingForSession } from './ccbLocalAgentCallback.js'
+import {
+  readCgroupMemoryUsage,
+  resolveMaxResidentRunners,
+  resolveMemoryPressureThreshold,
+  type CgroupMemoryReading,
+} from './cgroupMemoryGuard.js'
 import { isTempSessionKey, resolveEnginePreheatDeadlineMs } from './sessionManager.js'
-import type { SessionManager, AgentSession, PreheatOutcome } from './sessionManager.js'
+import type { SessionManager, AgentSession, PreheatOutcome, PromptQueueExecutionFence } from './sessionManager.js'
 
 export interface SessionLifecycleHost {
+  _enterSessionCreateGate?: SessionManager['_enterSessionCreateGate']
   _flushTailFolding: SessionManager['_flushTailFolding']
   _getRepoSnapshot: SessionManager['_getRepoSnapshot']
+  _maxResidentRunners?: number
+  _memoryPressureThreshold?: number
   _preheatActive: SessionManager['_preheatActive']
   _preheatInFlight: SessionManager['_preheatInFlight']
   _promptQueueHolds: SessionManager['_promptQueueHolds']
   _pruneResumeMap: SessionManager['_pruneResumeMap']
+  _readCgroupMemory?: () => Promise<CgroupMemoryReading | null>
   _remoteTargetController: SessionManager['_remoteTargetController']
   _resumeMap: SessionManager['_resumeMap']
   _resumeMapCostImprecise: SessionManager['_resumeMapCostImprecise']
@@ -57,6 +84,7 @@ export interface SessionLifecycleHost {
   maxIdleMsCron: SessionManager['maxIdleMsCron']
   onSessionDestroyed: SessionManager['onSessionDestroyed']
   releaseRuntimeRecycleDrain: SessionManager['releaseRuntimeRecycleDrain']
+  retireKeepResume: SessionManager['retireKeepResume']
   scheduleIdleDrain: SessionManager['scheduleIdleDrain']
   sessions: SessionManager['sessions']
   submit: SessionManager['submit']
@@ -351,16 +379,190 @@ export async function recyclePeerForRepoUnbind(
   }
 }
 
+function hasActiveModelSwitchTransition(session: AgentSession, now = Date.now()): boolean {
+  const t = session._modelSwitchTransition
+  if (!t) return false
+  if (t.state === 'preparing' || t.state === 'consuming') return true
+  if (t.state === 'prepared') {
+    return t.expiresAt === undefined || t.expiresAt > now
+  }
+  return false
+}
+
+/**
+ * True when a session has any active/in-flight turn, queued prompt, preheat,
+ * internal idle drain, model-switch handoff transition, pending CCB/delegate
+ * notification, or teardown/replacement in progress.
+ * Pressure/idle eviction MUST NEVER evict a busy session.
+ */
+export function isSessionInFlightOrBusy(
+  host: Pick<SessionLifecycleHost, '_preheatInFlight' | '_promptQueueHolds'>,
+  session: AgentSession,
+): boolean {
+  return (
+    (session._activeTurnCount ?? 0) > 0 ||
+    (session._activeClientTurnCount ?? 0) > 0 ||
+    (session._idleInternalTurns ?? 0) > 0 ||
+    Boolean(session._idleRunning) ||
+    Boolean(session._idlePreExpiryActive) ||
+    Boolean(session._admittingClientMessageId) ||
+    Boolean(session._runningClientMessageId) ||
+    Boolean(session._externalTurnAbort) ||
+    Boolean(session._replacing) ||
+    Boolean(session._plannedTeardown) ||
+    hasActiveModelSwitchTransition(session) ||
+    Boolean(session._pendingAgentGroups?.length) ||
+    hasCcbLocalAgentPendingForSession(session.sessionKey) ||
+    host._preheatInFlight.has(session.sessionKey) ||
+    host._promptQueueHolds(session)
+  )
+}
+
+export interface EvictionPassResult {
+  idleEvicted: number
+  pressureRetired: number
+  retiredKeys: string[]
+}
+
+/**
+ * Single pass of session eviction:
+ *  1. Idle TTL eviction (existing behavior; skips busy/in-flight sessions).
+ *  2. OCV5-825 container memory watermark (>75% cgroup v2/v1; safe no-op if
+ *     unreadable) + active resident runner cap (`OC_MAX_RESIDENT_RUNNERS`):
+ *     retires LRU idle resident runners via `retireKeepResume` (preserving
+ *     native resume-map) while strictly skipping any running/in-flight turn.
+ */
+export async function runEvictionPass(this: SessionLifecycleHost): Promise<EvictionPassResult> {
+  const now = Date.now()
+  const toEvict: string[] = []
+  for (const [key, s] of this.sessions) {
+    if (isSessionInFlightOrBusy(this, s)) continue
+    const isTempSession = isTempSessionKey(key)
+    const maxIdle = isTempSession ? this.maxIdleMsCron : this.maxIdleMsChat
+    const lastActive = Math.max(s.lastUsedAt, s.runner.lastActivityAt)
+    if (now - lastActive > maxIdle) {
+      toEvict.push(key)
+    }
+  }
+  let idleEvicted = 0
+  for (const key of toEvict) {
+    const s = this.sessions.get(key)
+    if (!s || isSessionInFlightOrBusy(this, s)) continue
+    // 先 await shutdown 完成(SIGTERM+SIGKILL 链走完),再清状态
+    try {
+      this.markPlannedServiceRestart(s)
+      await s.runner.shutdown()
+    } catch {}
+    // A1:底座已停产出,flush 折叠 tail 的 pending 并清定时器/状态。
+    await this._flushTailFolding(s)
+    // 释放 remote mux refcount(若为 remote)—— 与 destroySession 语义一致
+    if (s.executionTarget.kind === 'remote' && s.userId) {
+      await this._remoteTargetController
+        ?.releaseMux(key, s.userId, s.executionTarget.hostId)
+        .catch((err) => log.warn('evict releaseMux failed', { key, err: String(err) }))
+    }
+    this.sessions.delete(key)
+    // Phase 5:同步清 peer→sessionKey 反查索引(避免悬挂条目)。
+    this._sessionIdToKey.delete(s.peerId)
+    if (!key.includes(':webchat:')) {
+      this._resumeMap.delete(key)
+      this._resumeMapTimestamps.delete(key)
+      this._resumeMapLastCost.delete(key)
+      this._resumeMapCostImprecise.delete(key)
+      this._resumeMapProvider.delete(key)
+      this._resumeMapHistory.delete(key)
+    }
+    // Medium#G1 + N11:shutdown 完才清 ring,保证不会有"runner 已死但 ring 还能
+    // 接尾帧"的窗口。webchat 虽然 resume-map 留着等 reconnect,但 outboundRing
+    // 没必要留(重连时会重走 hello,server 按 lastFrameSeq=0 重建)。
+    try {
+      this.onSessionDestroyed?.(key)
+    } catch {}
+    idleEvicted++
+  }
+
+  // OCV5-825: cgroup memory watermark (>75%) + resident runner cap guardrail
+  const maxRunners = this._maxResidentRunners ?? resolveMaxResidentRunners()
+  const memThreshold = this._memoryPressureThreshold ?? resolveMemoryPressureThreshold()
+  const readMem = this._readCgroupMemory ?? readCgroupMemoryUsage
+
+  const resident: AgentSession[] = []
+  for (const s of this.sessions.values()) {
+    if (s.runner.isRunning) resident.push(s)
+  }
+  let residentCount = resident.length
+  const evictable = resident
+    .filter((s) => !isSessionInFlightOrBusy(this, s))
+    .sort(
+      (a, b) =>
+        Math.max(a.lastUsedAt, a.runner.lastActivityAt) -
+        Math.max(b.lastUsedAt, b.runner.lastActivityAt),
+    )
+
+  let mem: CgroupMemoryReading | null = null
+  if (evictable.length > 0) {
+    try {
+      mem = await readMem()
+    } catch {
+      mem = null
+    }
+  }
+
+  let overCap = maxRunners > 0 && residentCount > maxRunners
+  let overMem = mem !== null && mem.ratio > memThreshold
+  let pressureRetired = 0
+  const retiredKeys: string[] = []
+
+  while (evictable.length > 0 && (overCap || overMem)) {
+    const cand = evictable.shift()!
+    const current = this.sessions.get(cand.sessionKey)
+    // Re-check right before retiring so a newly started turn is never interrupted.
+    if (!current || current !== cand || !current.runner.isRunning || isSessionInFlightOrBusy(this, current)) {
+      continue
+    }
+    const reason = overCap && overMem ? 'memory+runner_cap' : overMem ? 'memory' : 'runner_cap'
+    try {
+      await this.retireKeepResume(current.sessionKey, {
+        expectedSession: current,
+        onlyIfIdle: true,
+      })
+    } catch (err) {
+      log.warn('pressure retireKeepResume failed', { sessionKey: current.sessionKey, reason }, err)
+      continue
+    }
+    if (this.sessions.get(current.sessionKey) === current) {
+      // Skipped inside the admission gate because the session became busy meanwhile.
+      continue
+    }
+    residentCount = Math.max(0, residentCount - 1)
+    pressureRetired++
+    retiredKeys.push(current.sessionKey)
+    log.info('session_pressure_retired', {
+      sessionKey: current.sessionKey,
+      reason,
+      residentRemaining: residentCount,
+      maxRunners,
+      ...(mem ? { memRatio: Number(mem.ratio.toFixed(3)), memVersion: mem.version } : {}),
+    })
+    overCap = maxRunners > 0 && residentCount > maxRunners
+    if (overMem && evictable.length > 0) {
+      try {
+        mem = await readMem()
+      } catch {
+        mem = null
+      }
+      overMem = mem !== null && mem.ratio > memThreshold
+    }
+  }
+
+  if (idleEvicted > 0 || pressureRetired > 0) this._saveResumeMap()
+  this._pruneResumeMap()
+  return { idleEvicted, pressureRetired, retiredKeys }
+}
+
 // 周期性 LRU 驱逐 — webchat sessions survive much longer than cron/task sessions
 export function startEvictionLoop(this: SessionLifecycleHost, intervalMs = 60_000): () => void {
-  // 2026-04-22 Codex R1 N11:LRU 驱逐此前 fire-and-forget 调 runner.shutdown() 然后
-  // 立刻 `sessions.delete(key)` + `onSessionDestroyed(key)` 清 ring。问题是 shutdown
-  // 内部有 SIGTERM → 1s 等待 → SIGKILL 的异步链,在这期间 runner 仍可能从 stdout
-  // 读到残余字节并推给 server(通过 onFrame callback),而此刻 server 的 outboundRing
-  // 已被 onSessionDestroyed 清空 —— 这些尾帧会落到一个空 ring 上,下次 reconnect
-  // replay 时丢掉(数据不一致且无 warning)。
-  //
-  // 修复:await 每个 runner.shutdown() 完成后才 delete + onSessionDestroyed。
+  // 2026-04-22 Codex R1 N11:await 每个 runner.shutdown() 完成后才 delete + onSessionDestroyed。
   // 用 async IIFE 不阻塞 interval 队列(每轮 eviction 独立跑,上一轮若卡住不影响下一轮)。
   let _inFlight = false
   const t = setInterval(() => {
@@ -368,52 +570,7 @@ export function startEvictionLoop(this: SessionLifecycleHost, intervalMs = 60_00
     _inFlight = true
     ;(async () => {
       try {
-        const now = Date.now()
-        const toEvict: string[] = []
-        for (const [key, s] of this.sessions) {
-          const isTempSession = isTempSessionKey(key)
-          const maxIdle = isTempSession ? this.maxIdleMsCron : this.maxIdleMsChat
-          const lastActive = Math.max(s.lastUsedAt, s.runner.lastActivityAt)
-          if (now - lastActive > maxIdle) {
-            toEvict.push(key)
-          }
-        }
-        for (const key of toEvict) {
-          const s = this.sessions.get(key)
-          if (!s) continue
-          // 先 await shutdown 完成(SIGTERM+SIGKILL 链走完),再清状态
-          try {
-            this.markPlannedServiceRestart(s)
-            await s.runner.shutdown()
-          } catch {}
-          // A1:底座已停产出,flush 折叠 tail 的 pending 并清定时器/状态。
-          await this._flushTailFolding(s)
-          // 释放 remote mux refcount(若为 remote)—— 与 destroySession 语义一致
-          if (s.executionTarget.kind === 'remote' && s.userId) {
-            await this._remoteTargetController
-              ?.releaseMux(key, s.userId, s.executionTarget.hostId)
-              .catch((err) => log.warn('evict releaseMux failed', { key, err: String(err) }))
-          }
-          this.sessions.delete(key)
-          // Phase 5:同步清 peer→sessionKey 反查索引(避免悬挂条目)。
-          this._sessionIdToKey.delete(s.peerId)
-          if (!key.includes(':webchat:')) {
-            this._resumeMap.delete(key)
-            this._resumeMapTimestamps.delete(key)
-            this._resumeMapLastCost.delete(key)
-            this._resumeMapCostImprecise.delete(key)
-            this._resumeMapProvider.delete(key)
-            this._resumeMapHistory.delete(key)
-          }
-          // Medium#G1 + N11:shutdown 完才清 ring,保证不会有"runner 已死但 ring 还能
-          // 接尾帧"的窗口。webchat 虽然 resume-map 留着等 reconnect,但 outboundRing
-          // 没必要留(重连时会重走 hello,server 按 lastFrameSeq=0 重建)。
-          try {
-            this.onSessionDestroyed?.(key)
-          } catch {}
-        }
-        if (toEvict.length > 0) this._saveResumeMap()
-        this._pruneResumeMap()
+        await runEvictionPass.call(this)
       } finally {
         _inFlight = false
       }
@@ -502,7 +659,29 @@ export async function destroySession(
   }
   // OCV5-755: a destroyed conversation must not inherit the old prompt snapshot.
   clearFrozenPrompt(paths.home, sessionKey)
-  if (s) cancelIdlePreExpiry(s)
+  if (s) {
+    cancelIdlePreExpiry(s)
+  }
+  clearPendingCheckpoint(sessionKey)
+  void import('./sessionAutoCompact.js').then((m) => m.clearSessionAutoCompactState(sessionKey)).catch(() => {})
+  // OCV5-840 (B4): clean up ONLY artifacts and context references owned by this exact full sessionKey.
+  {
+    const candidateDirs = new Set<string>()
+    const peerFromKey = s?.peerId || sessionKey.split(':').slice(4).join(':')
+    if (peerFromKey) {
+      const slug = peerFromKey.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80)
+      if (slug) candidateDirs.add(join(paths.home, 'workspace', 'sessions', slug))
+    }
+    candidateDirs.add(join(paths.home, 'workspace', 'delegate-artifacts'))
+    candidateDirs.add(join(paths.home, 'workspace', 'web-context'))
+    const runnerCwd = (s?.runner as { cwd?: unknown } | undefined)?.cwd
+    if (typeof runnerCwd === 'string' && runnerCwd.trim()) {
+      candidateDirs.add(runnerCwd.trim())
+    }
+    for (const dir of candidateDirs) {
+      await cleanupSessionArtifacts(dir, sessionKey).catch(() => {})
+    }
+  }
   // Always clear resume-map (handles both live and evicted sessions)
   if (this._resumeMap.has(sessionKey)) {
     this._resumeMap.delete(sessionKey)
@@ -521,41 +700,69 @@ export async function destroySession(
   } catch {}
 }
 
+export interface RetireKeepResumeOptions {
+  /** Only retire if the live map entry is still this exact object identity. */
+  expectedSession?: AgentSession
+  /** Re-check `isSessionInFlightOrBusy` inside the per-key admission gate. */
+  onlyIfIdle?: boolean
+}
+
 /**
  * Stop the warm runner and drop the live session, but keep resume-map so a
- * later getOrCreate(sessionKey) can native-resume. Awaited by resumable
- * delegate_task; fire-and-forget destroySession remains the one-shot path.
+ * later getOrCreate(sessionKey) can native-resume. Serialized with same-key
+ * getOrCreate via `_enterSessionCreateGate` so concurrent admission can never
+ * observe a half-retired session or have its successor deleted from maps.
  */
 export async function retireKeepResume(
   this: SessionLifecycleHost,
   sessionKey: string,
+  opts?: RetireKeepResumeOptions,
 ): Promise<void> {
-  const s = this.sessions.get(sessionKey)
-  if (s) {
-    try {
-      this.markPlannedServiceRestart(s)
-      await s.runner.shutdown()
-    } catch (err) {
-      log.warn('retireKeepResume shutdown failed', { sessionKey }, err)
+  const runUnderGate = async (): Promise<void> => {
+    const s = this.sessions.get(sessionKey)
+    if (opts?.expectedSession !== undefined && s !== opts.expectedSession) {
+      return
     }
-    try {
-      await this._flushTailFolding(s)
-    } catch (err) {
-      log.warn('retireKeepResume flush failed', { sessionKey }, err)
+    if (opts?.onlyIfIdle && s && isSessionInFlightOrBusy(this, s)) {
+      return
     }
-    if (s.executionTarget.kind === 'remote' && s.userId) {
-      await this._remoteTargetController
-        ?.releaseMux(sessionKey, s.userId, s.executionTarget.hostId)
-        .catch((err) =>
-          log.warn('retireKeepResume releaseMux failed', { sessionKey, err: String(err) }),
-        )
+    if (s) {
+      try {
+        this.markPlannedServiceRestart(s)
+        await s.runner.shutdown()
+      } catch (err) {
+        log.warn('retireKeepResume shutdown failed', { sessionKey }, err)
+      }
+      try {
+        await this._flushTailFolding(s)
+      } catch (err) {
+        log.warn('retireKeepResume flush failed', { sessionKey }, err)
+      }
+      if (s.executionTarget.kind === 'remote' && s.userId) {
+        await this._remoteTargetController
+          ?.releaseMux(sessionKey, s.userId, s.executionTarget.hostId)
+          .catch((err) =>
+            log.warn('retireKeepResume releaseMux failed', { sessionKey, err: String(err) }),
+          )
+      }
+      if (this.sessions.get(sessionKey) === s) {
+        this.sessions.delete(sessionKey)
+      }
+      if (this._sessionIdToKey.get(s.peerId) === sessionKey && !this.sessions.has(sessionKey)) {
+        this._sessionIdToKey.delete(s.peerId)
+      }
     }
-    this.sessions.delete(sessionKey)
-    this._sessionIdToKey.delete(s.peerId)
+    if (!this.sessions.has(sessionKey)) {
+      try {
+        this.onSessionDestroyed?.(sessionKey)
+      } catch {}
+    }
   }
-  try {
-    this.onSessionDestroyed?.(sessionKey)
-  } catch {}
+  if (this._enterSessionCreateGate) {
+    await this._enterSessionCreateGate(sessionKey, runUnderGate)
+  } else {
+    await runUnderGate()
+  }
 }
 
 /**
@@ -890,6 +1097,408 @@ export async function prepareModelSwitch(
   } catch (error) {
     if (session._modelSwitchTransition === transition) session._modelSwitchTransition = undefined
     throw error
+  }
+}
+
+export interface SessionCompactOptions {
+  instructions?: string
+  requestId?: string
+  /** 'manual' (default, user/WS initiated) or 'auto' (seamless background auto-compact). */
+  mode?: 'manual' | 'auto'
+  /** B3: Caller already holds its own single inbound clientTurn (allow _activeClientTurnCount <= 1, still reject >= 2). */
+  allowSingleSelfClientTurn?: boolean
+  /** B3: Active prompt-queue execution fence owned by caller so inner local CCB `/compact` shares the same owner. */
+  queueExecutionFence?: PromptQueueExecutionFence
+  /** Caller already holds `session.lock` (used ONLY by in-turn universal overflow auto-recovery). */
+  skipLock?: boolean
+  /** Force durable Rolling Checkpoint Reset regardless of engine native compact support. */
+  forceCheckpointReset?: boolean
+  /** Optional test seam / override for loading persisted session history. */
+  loadHistoryMessages?: () => Promise<unknown[] | null>
+  /** Optional test seam / override for checkpoint persistence directory. */
+  checkpointDir?: string
+}
+
+export interface SessionCompactOutcome {
+  ok: boolean
+  supported: boolean
+  engine: string
+  strategy?: 'native_summary' | 'checkpoint_reset'
+  beforeTokens?: number
+  afterTokens?: number
+  beforeBytes?: number
+  afterBytes?: number
+  droppedEntries?: number
+  summaryPreview?: string
+  error?: string
+}
+
+const CHECKPOINT_MAX_CHARS = 8_000
+
+export { isSessionCompacting }
+
+/** Backward-compatible test/diagnostic helpers backed by durable checkpoint store (B7). */
+export function setPendingCheckpointSummary(session: AgentSession, summary: string): void {
+  const trimmed = summary.trim()
+  if (!trimmed) {
+    clearPendingCheckpoint(session.sessionKey)
+    return
+  }
+  savePendingCheckpoint(session.sessionKey, trimmed)
+}
+
+export function consumePendingCheckpointSummary(session: AgentSession): string | null {
+  const rec = peekPendingCheckpoint(session.sessionKey)
+  if (!rec) return null
+  clearPendingCheckpoint(session.sessionKey)
+  return rec.summary
+}
+
+export function peekPendingCheckpointSummary(session: AgentSession): string | null {
+  return peekPendingCheckpoint(session.sessionKey)?.summary ?? null
+}
+
+/** Build a bounded structured checkpoint summary (<=8K chars) from session history. */
+export function buildRollingCheckpointSummary(
+  messages: readonly unknown[],
+  instructions?: string,
+): {
+  summary: string
+  beforeBytes: number
+  afterBytes: number
+  beforeTokens: number
+  afterTokens: number
+  droppedEntries: number
+} {
+  const projected = projectModelHistoryForReplay(messages, { recentFullTurns: 2 })
+  let beforeBytes = 0
+  let beforeTokens = 0
+  for (const row of projected) {
+    const rawText = modelHistorySemanticText(row.raw) || row.text
+    beforeBytes += Buffer.byteLength(rawText, 'utf8')
+    beforeTokens += estimateModelHistoryTokens(rawText)
+  }
+  if (projected.length === 0) {
+    return {
+      summary: '',
+      beforeBytes: 0,
+      afterBytes: 0,
+      beforeTokens: 0,
+      afterTokens: 0,
+      droppedEntries: 0,
+    }
+  }
+  const userRows = projected.filter((r) => r.role === 'user')
+  const assistantRows = projected.filter((r) => r.role === 'assistant')
+  const goalOrPlanRows = projected.filter((r) => r.role === 'goal' || r.role === 'plan')
+  const recentTail = projected.slice(-6)
+  const keptSet = new Set<unknown>(recentTail.map((r) => r.raw))
+
+  const parts: string[] = [
+    '## Rolling Context Checkpoint',
+    ...(instructions?.trim() ? [`Focus: ${safeSliceHead(instructions.trim(), 240)}`] : []),
+  ]
+  if (userRows.length > 0) {
+    keptSet.add(userRows[0]!.raw)
+    parts.push('', '### Initial Goal / Request', safeSliceHead(userRows[0]!.text, 800))
+  }
+  if (goalOrPlanRows.length > 0) {
+    const latestPlan = goalOrPlanRows[goalOrPlanRows.length - 1]!
+    keptSet.add(latestPlan.raw)
+    parts.push('', '### Latest Plan / Goal', safeSliceHead(latestPlan.text, 1_000))
+  }
+  if (assistantRows.length > 1) {
+    const midAssistant = assistantRows[Math.max(0, assistantRows.length - 2)]!
+    if (!keptSet.has(midAssistant.raw)) {
+      keptSet.add(midAssistant.raw)
+      parts.push('', '### Prior Key Conclusion', safeSliceHead(midAssistant.text, 1_000))
+    }
+  }
+  parts.push('', '### Recent Exchanges')
+  for (const item of recentTail) {
+    parts.push(`- **${modelHistoryRoleLabel(item.role)}**: ${safeSliceHead(item.text, 900)}`)
+  }
+
+  let summary = parts.join('\n')
+  if (summary.length > CHECKPOINT_MAX_CHARS) {
+    summary = `${safeSliceHead(summary, CHECKPOINT_MAX_CHARS - 32)}\n… [checkpoint truncated]`
+  }
+  const afterBytes = Buffer.byteLength(summary, 'utf8')
+  const afterTokens = estimateModelHistoryTokens(summary)
+  const droppedEntries = Math.max(0, projected.length - keptSet.size)
+  return { summary, beforeBytes, afterBytes, beforeTokens, afterTokens, droppedEntries }
+}
+
+/**
+ * Unified cross-engine session compaction (OCV5-840 B3/B6/B7/B8):
+ * - Shared per-session compaction mutex + `session.lock` coordination (`try/finally` release).
+ * - Local CCB (only when `supportsNativeCompact === true` and no remote `executionBackend`):
+ *   real native `/compact` with strict completion confirmation (never treats `compacting` status
+ *   or an errored turn as success).
+ * - Local Codex (`supportsNativeCompact === true`, non-remote): direct JSON-RPC
+ *   `thread/compact/start` via `compactForHandoff()`.
+ * - Antigravity / Native Cursor / CursorSand / Remote Codex / Remote CCB:
+ *   zero-model-call Durable Rolling Checkpoint Reset (persist 0600 checkpoint BEFORE resetting
+ *   thread/resume handles; remote Codex uses non-terminal `restartForConfigChange()` /
+ *   `clearSessionId()` and NEVER calls terminal `shutdown()` that closes the remote lane).
+ */
+export async function compactSession(
+  this: SessionLifecycleHost,
+  session: AgentSession,
+  opts: SessionCompactOptions = {},
+): Promise<SessionCompactOutcome> {
+  const engine = session.providerTag || session.runner.engineId || 'unknown'
+  if (isSessionCompacting(session.sessionKey)) {
+    return { ok: false, supported: true, engine, error: 'SESSION_COMPACT_IN_PROGRESS' }
+  }
+  const maxAllowedClientTurns = opts.allowSingleSelfClientTurn ? 1 : 0
+  if (
+    !opts.skipLock &&
+    ((session._activeTurnCount ?? 0) > 0 ||
+      (session._activeClientTurnCount ?? 0) > maxAllowedClientTurns ||
+      (session._idleInternalTurns ?? 0) > 0)
+  ) {
+    return { ok: false, supported: true, engine, error: 'SESSION_BUSY' }
+  }
+  if (!markSessionCompacting(session.sessionKey)) {
+    return { ok: false, supported: true, engine, error: 'SESSION_COMPACT_IN_PROGRESS' }
+  }
+  try {
+    const instructions = opts.instructions?.trim()
+    const runnerAny = session.runner as unknown as {
+      executionBackend?: { kind?: string }
+      restartForConfigChange?: () => Promise<void>
+    }
+    const isRemoteCodex =
+      engine === 'codex' &&
+      (runnerAny.executionBackend?.kind === 'codex-app-server-v1' ||
+        typeof runnerAny.restartForConfigChange === 'function')
+    const hasRemoteBackend = Boolean(runnerAny.executionBackend?.kind)
+
+    // 1. Local CCB native `/compact` (strictly local CCB with declared native compact support;
+    //    never CursorSand or remote CCB lacking billing/modelAuthority identity).
+    const isLocalCcbNativeSlash =
+      !opts.forceCheckpointReset &&
+      !opts.skipLock &&
+      engine === 'ccb' &&
+      session.runner.capabilities.supportsNativeCompact === true &&
+      !hasRemoteBackend
+    if (isLocalCcbNativeSlash) {
+      const beforeTokens = session.totalInputTokens > 0 ? session.totalInputTokens : undefined
+      session._lastNativeCompactionSummary = undefined
+      let sawCompactedCompletion = false
+      let sawTurnError = false
+      const prompt = instructions
+        ? `/compact ${instructions}`
+        : '/compact preserve the user goal, decisions, constraints, current work, files, errors, and next steps'
+      await this.submit(
+        session,
+        prompt,
+        (e) => {
+          // B6: NEVER treat `turn_status === 'compacting'` progress or transport `file_reference`
+          // as native compaction completion! Only accept `strategy === 'native_summary'`.
+          if (e.kind === 'context_compacted' && e.compaction?.strategy === 'native_summary') {
+            sawCompactedCompletion = true
+          }
+          if (e.kind === 'error') sawTurnError = true
+        },
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        {
+          serviceTier: null,
+          _internalCompact: true,
+          ...(opts.queueExecutionFence ? { queueExecutionFence: opts.queueExecutionFence } : {}),
+        },
+      )
+      const summary = (session._lastNativeCompactionSummary as string | undefined)?.trim() ?? ''
+      if (sawTurnError || (!sawCompactedCompletion && !summary)) {
+        contextCompactionsTotal.inc({ engine, strategy: 'native_summary', outcome: 'unconfirmed' })
+        return {
+          ok: false,
+          supported: true,
+          engine,
+          strategy: 'native_summary',
+          error: 'COMPACTION_NOT_CONFIRMED',
+        }
+      }
+      const afterTokens = summary ? estimateModelHistoryTokens(summary) : undefined
+      const afterBytes = summary ? Buffer.byteLength(summary, 'utf8') : undefined
+      contextCompactionsTotal.inc({ engine, strategy: 'native_summary', outcome: 'ok' })
+      return {
+        ok: true,
+        supported: true,
+        engine,
+        strategy: 'native_summary',
+        ...(beforeTokens !== undefined ? { beforeTokens } : {}),
+        ...(afterTokens !== undefined ? { afterTokens } : {}),
+        ...(afterBytes !== undefined ? { afterBytes } : {}),
+        ...(summary ? { summaryPreview: safeSliceHead(summary, 280) } : {}),
+      }
+    }
+
+    // Non-CCB paths share `session.lock` with normal `submit()` (B3) so in-flight turns settle
+    // first and concurrent submits cannot race with history read + runner reset.
+    let releaseLock: () => void = () => {}
+    if (!opts.skipLock) {
+      const prevLock = session.lock ?? Promise.resolve()
+      session.lock = new Promise<void>((r) => {
+        releaseLock = r
+      })
+      await prevLock
+    }
+    try {
+      if (
+        !opts.skipLock &&
+        ((session._activeTurnCount ?? 0) > 0 ||
+          (session._activeClientTurnCount ?? 0) > maxAllowedClientTurns ||
+          (session._idleInternalTurns ?? 0) > 0)
+      ) {
+        return { ok: false, supported: true, engine, error: 'SESSION_BUSY' }
+      }
+
+      // 2. Codex Local: native JSON-RPC thread/compact/start
+      if (
+        !opts.forceCheckpointReset &&
+        engine === 'codex' &&
+        !isRemoteCodex &&
+        session.runner.capabilities.supportsNativeCompact === true &&
+        typeof session.runner.compactForHandoff === 'function'
+      ) {
+        const beforeTokens = session.totalInputTokens > 0 ? session.totalInputTokens : undefined
+        const artifact = await session.runner.compactForHandoff()
+        const summary = artifact?.summaryText?.trim() ?? ''
+        const afterTokens = summary ? estimateModelHistoryTokens(summary) : undefined
+        const afterBytes = summary ? Buffer.byteLength(summary, 'utf8') : undefined
+        contextCompactionsTotal.inc({ engine, strategy: 'native_summary', outcome: 'ok' })
+        return {
+          ok: true,
+          supported: true,
+          engine,
+          strategy: 'native_summary',
+          ...(beforeTokens !== undefined ? { beforeTokens } : {}),
+          ...(afterTokens !== undefined ? { afterTokens } : {}),
+          ...(afterBytes !== undefined ? { afterBytes } : {}),
+          ...(summary ? { summaryPreview: safeSliceHead(summary, 280) } : {}),
+        }
+      }
+
+      // 3. Antigravity / Native Cursor / CursorSand / Remote Codex / Remote CCB:
+      //    Zero-model-call Durable Rolling Checkpoint Reset (B6/B7/B8).
+      let messages: unknown[] | null
+      try {
+        if (opts.loadHistoryMessages) {
+          messages = await opts.loadHistoryMessages()
+        } else {
+          messages = await getEngineContextMessages(session.peerId, session.userId ?? 'default', {
+            engine,
+            currentUserText: '',
+          })
+        }
+      } catch (err) {
+        // B6: Never swallow history read errors as empty success, and never reset runner on error.
+        log.warn('checkpoint reset history load failed; aborting compaction', { sessionKey: session.sessionKey }, err)
+        return {
+          ok: false,
+          supported: true,
+          engine,
+          strategy: 'checkpoint_reset',
+          error: 'HISTORY_UNAVAILABLE',
+        }
+      }
+
+      if (messages === null || messages === undefined) {
+        return {
+          ok: false,
+          supported: true,
+          engine,
+          strategy: 'checkpoint_reset',
+          error: 'HISTORY_UNAVAILABLE',
+        }
+      }
+
+      const checkpoint = buildRollingCheckpointSummary(messages, instructions)
+      if (checkpoint.beforeBytes === 0) {
+        // B6: Distinguish unreadable/master-owned history from genuinely empty sessions;
+        // never fabricate ok:true or emit sys.context_compacted when nothing was compacted.
+        const likelyExternalHistory =
+          Boolean(session.ccbSessionId) ||
+          this._resumeMap.has(session.sessionKey) ||
+          (session.turns ?? 0) > 0
+        return {
+          ok: false,
+          supported: true,
+          engine,
+          strategy: 'checkpoint_reset',
+          error: likelyExternalHistory ? 'HISTORY_UNAVAILABLE' : 'NO_HISTORY_TO_COMPACT',
+        }
+      }
+
+      // B7: Persist durable checkpoint (0600) atomically BEFORE clearing native resume handles.
+      try {
+        savePendingCheckpoint(session.sessionKey, checkpoint.summary, {
+          instructions,
+          baseDir: opts.checkpointDir,
+        })
+      } catch (err) {
+        log.error('checkpoint reset failed to persist checkpoint; aborting reset', { sessionKey: session.sessionKey }, err)
+        return {
+          ok: false,
+          supported: true,
+          engine,
+          strategy: 'checkpoint_reset',
+          error: 'CHECKPOINT_PERSIST_FAILED',
+        }
+      }
+
+      // B8: Reset native runner handle safely.
+      // Remote Codex lanes MUST NOT call terminal `shutdown()` (which triggers `stopLane()`
+      // and causes `CODEX_LANE_CLOSED` on the next turn).
+      if (isRemoteCodex) {
+        if (typeof runnerAny.restartForConfigChange === 'function') {
+          await runnerAny.restartForConfigChange().catch(() => {})
+        }
+      } else if (session.runner.isRunning) {
+        await session.runner.shutdown().catch(() => {})
+      }
+
+      const key = session.sessionKey
+      this._resumeMap.delete(key)
+      this._resumeMapTimestamps.delete(key)
+      this._resumeMapProvider.delete(key)
+      this._resumeMapLastCost.delete(key)
+      this._resumeMapCostImprecise.delete(key)
+      this._resumeMapHistory.delete(key)
+      session.ccbSessionId = null
+      session.runner.clearSessionId?.()
+      this._saveResumeMap()
+      session._historicalContextInjected = false
+      session._historicalContextInjectedKey = undefined
+      session._forceHistoricalContextOnFirstTurn = true
+      session._contextRebuildNotice = undefined
+      contextCompactionsTotal.inc({ engine, strategy: 'checkpoint_reset', outcome: 'ok' })
+      return {
+        ok: true,
+        supported: true,
+        engine,
+        strategy: 'checkpoint_reset',
+        beforeBytes: checkpoint.beforeBytes,
+        afterBytes: checkpoint.afterBytes,
+        beforeTokens: checkpoint.beforeTokens,
+        afterTokens: checkpoint.afterTokens,
+        droppedEntries: checkpoint.droppedEntries,
+        summaryPreview: safeSliceHead(checkpoint.summary, 280),
+      }
+    } finally {
+      releaseLock()
+    }
+  } catch (err) {
+    contextCompactionsTotal.inc({ engine, strategy: 'failed', outcome: 'error' })
+    throw err
+  } finally {
+    unmarkSessionCompacting(session.sessionKey)
   }
 }
 

@@ -10,6 +10,7 @@
  *
  * 漏掉本文件任一守卫 = 重现一类历史已修 bug（每条都标了 §）。
  */
+import { applySwarmSnapshotBlock, finalizeSwarmMessageOnTurnEnd } from "./swarmReducer";
 import {
   AUTO_CONTINUE_PROMPT,
   applyPartialJsonDelta,
@@ -84,7 +85,14 @@ import type {
   OutboundTurnStatusWire,
   OutboundTurnUsageWire,
   OutboundCallUsageWire,
+  SessionContextPressureWire,
+  SysContextCompactedWire,
 } from "./frames";
+import {
+  buildContextPressureState,
+  contextCompactedRow,
+  nextPressureAfterCompaction,
+} from "./contextCompacted";
 
 const COST_CHARGED_LAST_FINAL_TTL_MS = 60_000;
 
@@ -1841,7 +1849,9 @@ export function applyOutboundMessage(
   // 计时器触发时按 _lastFrameAt(markFrameReceived 推进)做 liveness 复检,长 bash 只发 tail 也不误超时。
   const nonFinalBlocks = !frame.isFinal && hasBlocks ? (frame.blocks as Array<{ kind?: string }>) : null;
   const tailOnlyFrame = !!nonFinalBlocks?.every((b) => b?.kind === "tool_output_tail");
-  const progressOnlyFrame = !!nonFinalBlocks?.every((b) => b?.kind === "delegate_progress");
+  const progressOnlyFrame = !!nonFinalBlocks?.every(
+    (b) => b?.kind === "delegate_progress" || b?.kind === "swarm_snapshot",
+  );
   const leftoverProgressSideband =
     progressOnlyFrame && (!sess._sendingInFlight || (!!sess._activeClientMessageId && !frame.clientMessageId));
   if (leftoverProgressSideband) frameTurnOwnerId = undefined;
@@ -2335,6 +2345,21 @@ export function applyOutboundMessage(
       const prev = existing.bashTail?.totalBytes ?? 0;
       if (totalBytes < prev) continue;
       existing.bashTail = { tail, totalBytes, truncatedHead };
+    } else if (b.kind === "swarm_snapshot") {
+      const swarmRes = applySwarmSnapshotBlock(
+        sess,
+        b as { blockId?: string; snapshot?: unknown },
+        planTurnStart(sess.messages, sess.messages.length),
+        frameTurnOwnerId,
+        isFrozenLiveTarget,
+      );
+      if (swarmRes === "missing_base") {
+        const nowMs = Date.now();
+        if (!sess._swarmResyncLastAt || nowMs - sess._swarmResyncLastAt >= 5_000) {
+          sess._swarmResyncLastAt = nowMs;
+          effects.forceSync?.(sess.id);
+        }
+      }
     }
   }
 
@@ -2444,6 +2469,8 @@ export function applyOutboundMessage(
         // OCV5-421: 停止 / 中断收尾时这一步没拿到任何结果,它没跑完 —— 显示「已取消」而不是绿勾「完成」。
         if (interrupted && !m.output && !m.bashTail) m.cancelled = true;
       }
+      finalizeSwarmMessageOnTurnEnd(m, Boolean(interrupted), isFrozenLiveTarget);
+      if (sess._swarmSyncStale) sess._swarmSyncStale = false;
       // agent-group / delegate-progress：turn 收尾仍未完成 → 标完成。turn 已结束就不该再
       // "运行中/子智能体启动中…"(委托帧 runId 绑定缺位时会卡住,这里兜底收口)。
       // send_to_agent 是真后台：父回合结束后子任务仍在跑，组卡必须保持运行中直到
@@ -2595,6 +2622,32 @@ export function applyCallUsage(sess: ChatSession, frame: OutboundCallUsageWire):
     if (!msg) continue;
     msg._callUsage = structuredClone(frame.call);
   }
+}
+
+// ═══════════════ 上下文水位与压缩回执（OCV5-840）═══════════════
+export function applyContextPressure(sess: ChatSession, frame: SessionContextPressureWire): boolean {
+  if (!acceptFrameSeq(sess, frame)) return false;
+  const next = buildContextPressureState(frame);
+  if (!next) return false;
+  markFrameReceived(sess);
+  sess._contextPressure = next;
+  return true;
+}
+
+export function applyContextCompacted(
+  sess: ChatSession,
+  frame: SysContextCompactedWire,
+  now: () => number = Date.now,
+): { id: string; text: string } | null {
+  if (!acceptFrameSeq(sess, frame)) return null;
+  markFrameReceived(sess);
+  sess._compactingManual = false;
+  const row = contextCompactedRow(sess, frame, now);
+  if (row) {
+    addMessage(sess, "system", row.text, { id: row.id, _source: "local", _contextCompaction: row.detail });
+  }
+  sess._contextPressure = nextPressureAfterCompaction(sess._contextPressure, frame, now);
+  return row ? { id: row.id, text: row.text } : null;
 }
 
 // ═══════════════ outbound.error 双帧（§11）═══════════════

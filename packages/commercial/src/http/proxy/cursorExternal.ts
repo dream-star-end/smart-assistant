@@ -46,6 +46,10 @@ import {
   type TerminalEvidence,
 } from "@openclaude/gateway";
 import type { Logger } from "../../logging/logger.js";
+import {
+  defaultCutoverInFlightTracker,
+  rejectIfCutoverFencing,
+} from "../../logging/cutoverInFlight.js";
 import type { ProxyIdentity } from "../../auth/proxyIdentity.js";
 import { AuthzDeniedError, AuthzLoadError } from "../../auth/proxyIdentity.js";
 import type { ModelPricing, PricingCache } from "../../billing/pricing.js";
@@ -867,7 +871,15 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
   }
 
   return {
-    handle,
+    handle: async (args: CursorExternalHandleArgs): Promise<void> => {
+      if (rejectIfCutoverFencing(args.res)) return;
+      const release = defaultCutoverInFlightTracker.begin("cursorExternal", args.res);
+      try {
+        await handle(args);
+      } finally {
+        release();
+      }
+    },
     close,
     _cooledAccountIds: () => [...cooled.keys()].map((id) => BigInt(id)),
   };

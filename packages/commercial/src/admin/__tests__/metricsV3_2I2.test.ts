@@ -260,8 +260,15 @@ describe('V3 2I-2 — anthropicProxy + bridge histograms/counters', () => {
       // OCV5-653: additive Box compatibility and rejection counters.
       assert.ok(text.includes('# HELP box_continuation_shape_compatible_total'))
       assert.ok(text.includes('# HELP box_continuation_rejected_total'))
-      // OCV5-657: startup recovery, bounded reconnect and durable replay gaps.
-      for (const name of ['container_link_rebuilt_total', 'container_link_reconnect_total', 'container_link_gap_total', 'container_link_control_delivered_total']) {
+      // OCV5-657 / OCV5-824: startup recovery, bounded reconnect, durable replay gaps, send events, and live unit checkpoints.
+      for (const name of [
+        'container_link_rebuilt_total',
+        'container_link_reconnect_total',
+        'container_link_gap_total',
+        'container_link_send_events_total',
+        'live_unit_checkpoint_events_total',
+        'container_link_control_delivered_total',
+      ]) {
         assert.equal(text.split(`# HELP ${name} `).length - 1, 1)
         assert.ok(text.includes(`# TYPE ${name} counter`))
       }
@@ -269,12 +276,12 @@ describe('V3 2I-2 — anthropicProxy + bridge histograms/counters', () => {
       assert.ok(text.includes('# HELP account_pool_health'))
       assert.ok(text.includes('# HELP agent_containers_running'))
       assert.ok(text.endsWith('\n'))
-      // 控制投递新增一个 counter；所有 HELP 仍各出现一次
+      // 所有 HELP 仍各出现一次
       const helpCount = (text.match(/^# HELP /gm) ?? []).length
       assert.equal(
         helpCount,
-        25,
-        `HELP 行总数 = 25 (原21系列 + 4 ContainerLink counter), got ${helpCount}`,
+        27,
+        `HELP 行总数 = 27 (原21系列 + 6 ContainerLink/LiveUnit counter), got ${helpCount}`,
       )
     })
   })

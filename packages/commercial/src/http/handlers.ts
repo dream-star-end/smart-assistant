@@ -130,7 +130,13 @@ import type { GoalStateService } from '../goal/goalStateService.js'
 import type { MediaGenerationService } from '../media-generation/service.js'
 import type { SitesService } from '../sites/service.js'
 import type { MuseBridgeHttpHandler } from '../muse/bridgeHttp.js'
+import type { MuseBridgeHub } from '../muse/hub.js'
 import type { StudioHttpDeps } from '../media-studio/http.js'
+import type { PendingDecisionsService } from '../pendingDecisions/index.js'
+import type { ResearchLibraryRouteDeps } from '../research/libraryRoutes.js'
+import type { CommercialOfficePreviewDeps } from './containerOfficePreviewProxy.js'
+import type { CommercialSwarmCommandDeps } from './containerSwarmCommandProxy.js'
+import type { CommercialSessionBackgroundTasksDeps } from './sessionBackgroundTasksProxy.js'
 import { communityBlogEnabled } from "../tutorials/tutorialImages.js";
 import { tutorialModerationMode } from "../tutorials/tutorialModerationQueue.js";
 
@@ -151,10 +157,24 @@ export interface CommercialHttpDeps {
   sites?: SitesService;
   /** OCV5-561 Muse bridge endpoints; undefined (→ 404) unless OC_MUSE_BRIDGE_ENABLED=1. */
   museBridgeHttp?: MuseBridgeHttpHandler;
+  /** OCV5-844 Muse hub for session-scoped background job query & cancel. */
+  museHub?: MuseBridgeHub;
   /** OCV5-591 media studio; undefined or disabled (→ 404) unless OC_STUDIO_ENABLED=1. */
   studio?: StudioHttpDeps;
   /** Platform-authoritative session GoalState service. */
   goalStateService?: GoalStateService;
+  /** Unified pending decisions ("待拍板") aggregation service. */
+  pendingDecisionsService?: PendingDecisionsService;
+  /** Optional test overrides for research batch import & span locator routes. */
+  researchLibraryRouteDeps?: Omit<ResearchLibraryRouteDeps, 'jwtSecret'>;
+  /** Optional test overrides for zero-turn Office preview routes. */
+  officePreviewRouteDeps?: CommercialOfficePreviewDeps;
+  /** Optional test overrides for session Swarm control command proxy. */
+  swarmCommandRouteDeps?: CommercialSwarmCommandDeps;
+  /** Optional test overrides for session background tasks proxy (OCV5-844). */
+  sessionBackgroundTasksRouteDeps?: CommercialSessionBackgroundTasksDeps;
+  /** Test seam ONLY: override DB active-account check for Wave 4 commercial user routes. */
+  verifyActiveAccount?: (userId: string) => Promise<boolean>;
   /** Short-lived one-time browser tickets for V5 container-local preview. */
   containerPreviewTickets?: ContainerPreviewTicketStore;
   /** Prevent issuing a ticket until the public WS bridge is fully assembled. */

@@ -54,6 +54,7 @@ const STATE_KEEP_MS = 7 * 24 * 60 * 60_000
 
 /** Slots whose change alters active instructions/capabilities and requires re-injection.
  *  Excludes `ENV` (container snap SHA), `MEMORY` (rules fingerprinted separately; index churns),
+ *  `MEMORY_INDEX`, `AGENTS_DYNAMIC` (collaborator roster / delegate model catalog churn),
  *  `PROJECT_MEMORY`, and `SKILLS` index churn. */
 const INSTRUCTION_SLOT_NAMES = new Set([
   'SOUL',
@@ -61,6 +62,7 @@ const INSTRUCTION_SLOT_NAMES = new Set([
   'PROJECT',
   'INTELLIGENT_UI',
   'AGENTS',
+  'AGENTS_STATIC',
   'SKILLS_LITERATURE',
   'TOOLS',
   'MODEL_HINT',
@@ -87,6 +89,8 @@ export interface AntigravityPromptInputsKeyArgs {
   applied: readonly PromptSlotApplied[]
   /** Fingerprint of the MEMORY rules (index churn excluded). */
   memoryInstructionsFingerprint?: string | null
+  /** Optional explicit fingerprint of AGENTS static capabilities (dynamic roster/catalog excluded). */
+  agentsStaticFingerprint?: string | null
 }
 
 export interface AntigravityInjectedContextState {
@@ -146,7 +150,18 @@ export function resolveAntigravityDedupMode(
 export function buildAntigravityPromptInputsKey(args: AntigravityPromptInputsKeyArgs): string {
   const instructionSlots = args.applied
     .filter((slot) => INSTRUCTION_SLOT_NAMES.has(slot.name))
-    .map((slot) => [slot.name, slot.sha256, slot.meta ?? null] as const)
+    .map((slot) => {
+      if (slot.name === 'AGENTS') {
+        const staticSha = args.agentsStaticFingerprint ?? slot.meta?.static_sha256
+        if (staticSha) {
+          return ['AGENTS', staticSha, null] as const
+        }
+      }
+      if (slot.name === 'AGENTS_STATIC') {
+        return ['AGENTS', slot.sha256, null] as const
+      }
+      return [slot.name, slot.sha256, slot.meta ?? null] as const
+    })
   return sha256Hex(
     JSON.stringify([
       'ocv5-781-v1',

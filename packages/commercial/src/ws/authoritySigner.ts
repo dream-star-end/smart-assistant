@@ -92,6 +92,7 @@ import type { AuthorityKeyCoverage } from './authorityKeyCensus.js'
 
 import {
   AUTHORITY_TTL_MS,
+  type AuthorityBillingAttribution,
   type AuthorityKeyring,
   type RemoteExecutionBackend,
   type DispatchAuthorityPayload,
@@ -535,6 +536,7 @@ export interface AuthorityMintInput {
   auxModels: readonly string[]
   /** codex 的 server-owned 计费 requestId(绑定字段,可缺席)。 */
   billingRequestId?: string
+  billingAttribution?: AuthorityBillingAttribution
   /** Trusted supervisor selection, never copied from a browser frame. */
   executionBackend?: RemoteExecutionBackend
 }
@@ -712,6 +714,9 @@ export class AuthoritySigner {
       expiresAt: now + (opts.authorityTtlMs ?? AUTHORITY_TTL_MS),
       auxModels,
       ...(input.billingRequestId === undefined ? {} : { billingRequestId: input.billingRequestId }),
+      ...(input.billingAttribution === undefined
+        ? {}
+        : { billingAttribution: input.billingAttribution }),
       ...(input.executionBackend === undefined ? {} : { executionBackend: input.executionBackend }),
     }
 

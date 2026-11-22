@@ -1,4 +1,4 @@
-import { Check, ChevronDown, Search } from "lucide-react";
+import { Check, ChevronDown, Search, X } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import {
   Button,
@@ -10,7 +10,7 @@ import {
 } from "../../components/ui";
 import { cn } from "../../lib/utils";
 
-/** 过滤区容器：把 SearchInput / SelectFilter / RangePreset 横向组合，窄屏自动换行。 */
+/** 微凹筛选工具条容器：把 SearchInput / SelectFilter / RangePreset 横向组合，窄屏自动换行。 */
 export function FilterBar({
   children,
   className,
@@ -19,7 +19,14 @@ export function FilterBar({
   className?: string;
 }) {
   return (
-    <div className={cn("flex flex-wrap items-center gap-2", className)}>{children}</div>
+    <div
+      className={cn(
+        "oc-surface-recessed flex flex-wrap items-center gap-2 rounded-xl p-2",
+        className,
+      )}
+    >
+      {children}
+    </div>
   );
 }
 
@@ -55,10 +62,10 @@ export function SearchInput({
   }, [draft, debounceMs, value]);
 
   return (
-    <div className={cn("relative", className)}>
+    <div className={cn("group relative", className)}>
       <Search
         size={15}
-        className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint"
+        className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint transition-colors group-focus-within:text-accent"
       />
       <Input
         value={draft}
@@ -69,8 +76,22 @@ export function SearchInput({
         //    这里原先硬写 text-sm 会把这道防线击穿;
         // 2. 触控靶 —— Input 的 controlSurfaceClass 已带 `[@media(hover:none)]:min-h-11`,
         //    min-height 会盖过这里的 h-9,调用方不必再补。
-        className="h-9 w-full pl-9 sm:w-56"
+        className={cn("oc-field-control h-9 w-full pl-9 sm:w-60", draft && "pr-8")}
       />
+      {draft && (
+        <button
+          type="button"
+          onClick={() => {
+            setDraft("");
+            onChangeRef.current("");
+          }}
+          aria-label="清空搜索"
+          title="清空搜索"
+          className="oc-icon-btn-tactile absolute right-2 top-1/2 flex size-5 -translate-y-1/2 items-center justify-center rounded-full text-faint hover:bg-hover hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <X size={12.5} />
+        </button>
+      )}
     </div>
   );
 }
@@ -98,9 +119,16 @@ export function SelectFilter<V extends string = string>({
       {/* 触发器触控靶不在这里补:Button 的 sm 档已带 `[@media(hover:none)]:min-h-11`。
           注意 asChild 走 Children.only,槽位里只能有这一个元素。 */}
       <DropdownMenuTrigger asChild>
-        <Button variant="secondary" size="sm" className={cn("gap-1.5", className)}>
-          {label && <span className="text-faint">{label}</span>}
-          <span className="max-w-[10rem] truncate text-fg">{current?.label ?? "全部"}</span>
+        <Button variant="secondary" size="sm" className={cn("h-9 gap-1.5 rounded-lg px-3", className)}>
+          {label && (
+            <span className="text-caption font-medium text-faint">
+              {label}
+              <span className="ml-1 text-border-strong">·</span>
+            </span>
+          )}
+          <span className="max-w-[10rem] truncate font-medium text-fg">
+            {current?.label ?? "全部"}
+          </span>
           <ChevronDown size={14} className="text-faint" />
         </Button>
       </DropdownMenuTrigger>
@@ -109,9 +137,11 @@ export function SelectFilter<V extends string = string>({
           <DropdownMenuItem
             key={o.value}
             onSelect={() => onChange(o.value)}
-            className="justify-between"
+            className="justify-between gap-3"
           >
-            <span className="truncate">{o.label}</span>
+            <span className={cn("truncate", o.value === value && "font-medium text-accent")}>
+              {o.label}
+            </span>
             {o.value === value && <Check size={15} className="shrink-0 text-accent" />}
           </DropdownMenuItem>
         ))}
@@ -140,7 +170,7 @@ export function RangePreset({
 }) {
   return (
     <div
-      className={cn("inline-flex items-center gap-0.5 rounded-lg border border-border bg-surface p-0.5", className)}
+      className={cn("oc-surface-recessed inline-flex items-center gap-0.5 rounded-lg p-0.5", className)}
       role="group"
     >
       {options.map((o) => {
@@ -152,10 +182,12 @@ export function RangePreset({
             aria-pressed={active}
             onClick={() => onChange(o.value)}
             className={cn(
-              "rounded-md px-2.5 py-1 text-meta font-medium transition-colors",
+              "oc-btn-tactile rounded-md px-2.5 py-1 text-meta transition-all",
               "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg",
               "[@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3",
-              active ? "bg-accent-soft text-accent" : "text-muted hover:bg-hover hover:text-fg",
+              active
+                ? "oc-segmented-thumb font-semibold text-accent"
+                : "font-medium text-muted hover:text-fg",
             )}
           >
             {o.label}

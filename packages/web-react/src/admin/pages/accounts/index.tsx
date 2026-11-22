@@ -1,4 +1,13 @@
-import { KeyRound, MoreHorizontal, Plus, RefreshCw } from "lucide-react";
+import {
+  Activity,
+  Boxes,
+  CheckCircle2,
+  KeyRound,
+  MoreHorizontal,
+  Plus,
+  RefreshCw,
+  ShieldAlert,
+} from "lucide-react";
 import { useCallback, useRef, useState } from "react";
 import {
   Button,
@@ -393,6 +402,7 @@ export default function AccountsPage() {
   return (
     <div className="flex flex-col gap-5">
       <PageHeader
+        icon={Boxes}
         title={meta.title}
         desc={
           loading && !data
@@ -419,7 +429,7 @@ export default function AccountsPage() {
           label="总账号"
           value={stats ? stats.total.toLocaleString() : "—"}
           hint={stats ? `disabled ${stats.disabled} · banned ${stats.banned}` : "加载中…"}
-          tone={stats && stats.banned > 0 ? "warning" : "neutral"}
+          tone={stats && stats.banned > 0 ? "warning" : "accent"}
           icon={KeyRound}
           loading={loading && !stats}
         />
@@ -428,6 +438,7 @@ export default function AccountsPage() {
           value={stats ? `${stats.active} / ${stats.cooldown}` : "—"}
           hint={stats ? (stats.cooldown > 0 ? `有 ${stats.cooldown} 个冷却中` : "全部可用") : "加载中…"}
           tone={stats ? (stats.cooldown > 0 ? "warning" : "success") : "neutral"}
+          icon={CheckCircle2}
           loading={loading && !stats}
         />
         <StatCard
@@ -447,6 +458,7 @@ export default function AccountsPage() {
                   : "success"
               : "neutral"
           }
+          icon={ShieldAlert}
           loading={loading && !stats}
         />
         <StatCard
@@ -465,6 +477,7 @@ export default function AccountsPage() {
                 })()
               : "neutral"
           }
+          icon={Activity}
           loading={loading && !stats}
         />
       </StatCardRow>
@@ -498,7 +511,7 @@ export default function AccountsPage() {
       </FilterBar>
 
       {error ? (
-        <div className="rounded-xl border border-danger/40 bg-danger-soft/40 px-4 py-6 text-center text-sm text-danger">
+        <div className="oc-callout oc-callout-danger rounded-xl px-4 py-6 text-center text-sm text-danger">
           加载失败:{errMsg(error)}
         </div>
       ) : (
@@ -509,10 +522,15 @@ export default function AccountsPage() {
             const sectionColumns = columns.filter((c) => !hidden.has(c.key));
             return (
               <section key={section.id} className="flex flex-col gap-3">
-                <div className="flex items-end justify-between gap-3">
-                  <div>
-                    <h2 className="text-title font-semibold text-fg">{section.title}</h2>
-                    <p className="text-meta text-muted">{section.desc} · {sectionRows.length} 条</p>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2.5">
+                    <span className="oc-icon-badge oc-icon-badge-accent size-8 rounded-lg">
+                      <Boxes size={15} strokeWidth={1.9} />
+                    </span>
+                    <div>
+                      <h2 className="text-title font-semibold tracking-tight text-fg">{section.title}</h2>
+                      <p className="text-meta text-muted tabular-nums">{section.desc} · {sectionRows.length} 条</p>
+                    </div>
                   </div>
                 </div>
                 <DataTable

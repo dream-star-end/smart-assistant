@@ -11,7 +11,7 @@ import { reportClientFriction } from "../lib/clientFriction";
 import type { AuthSession, User } from "../lib/types";
 import { teardownComposerDrafts } from "../lib/composerDraft";
 import { useLaneGate } from "./useLaneGate";
-import { clearAllBlogLocalDrafts } from '../components/tutorials/blog/blogLib';
+import { clearAllBlogLocalDrafts } from "../lib/blogDraftClear";
 
 const AUTH_RECOVERY_BACKOFF_MS = [500, 1_000, 2_000, 5_000, 10_000] as const;
 

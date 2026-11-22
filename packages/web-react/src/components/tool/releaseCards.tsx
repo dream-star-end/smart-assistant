@@ -9,9 +9,9 @@ export const RELEASE_JOB_ID_RE = /^rel-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$/;
 
 export const RELEASE_PHASE_LABELS = {
   queued: "排队中",
-  acquiring_lease: "获取 lease",
+  acquiring_lease: "准备发布中",
   deploying: "部署中",
-  smoking: "冒烟中",
+  smoking: "上线验收中",
   completed: "完成",
   failed: "失败",
   rolled_back: "已回滚",
@@ -160,48 +160,66 @@ export function ReleaseProgressCard({
   }, [current.id, done, loadJob, poll]);
 
   const tone = phaseTone(current.phase);
+  const iconBadgeTone =
+    current.phase === "failed"
+      ? "oc-icon-badge-danger"
+      : current.phase === "rolled_back"
+        ? "oc-icon-badge-warning"
+        : current.phase === "completed"
+          ? "oc-icon-badge-success"
+          : "oc-icon-badge-accent";
   return (
-    <div className="rounded-lg border border-border bg-surface animate-in">
+    <div className="oc-surface-card overflow-hidden rounded-lg animate-in">
       <button
         type="button"
         onClick={() => setUserCollapsed(!collapsed)}
         aria-expanded={!collapsed}
-        className="flex w-full items-center gap-2 px-3.5 py-2.5 text-left hover:bg-hover"
+        className="flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left outline-none transition-colors duration-150 hover:bg-hover/60 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
       >
-        <span className="flex size-6 items-center justify-center rounded-md bg-accent-soft text-accent">
-          {current.phase === "failed" ? <AlertTriangle size={13} /> : current.phase === "rolled_back" ? <RotateCcw size={13} /> : <Rocket size={13} />}
+        <span className={cn("oc-icon-badge size-6", iconBadgeTone)}>
+          {current.phase === "failed" ? (
+            <AlertTriangle size={13} strokeWidth={1.75} />
+          ) : current.phase === "rolled_back" ? (
+            <RotateCcw size={13} strokeWidth={1.75} />
+          ) : (
+            <Rocket size={13} strokeWidth={1.75} />
+          )}
         </span>
         <span className="min-w-0 truncate text-body font-medium text-fg">{current.title || "发布任务"}</span>
-        <span className="ml-auto flex items-center gap-2">
-          <span className="inline-flex items-center gap-1 text-caption text-muted">
-            <Clock size={11} />
+        <span className="ml-auto flex shrink-0 items-center gap-2 tabular-nums">
+          <span className="inline-flex items-center gap-1 font-mono text-caption text-muted">
+            <Clock size={11} strokeWidth={1.75} />
             {formatElapsed(elapsedMs(current, now))}
           </span>
-          <Badge tone={tone}>{RELEASE_PHASE_LABELS[current.phase]}</Badge>
-          <ChevronRight size={15} className={cn("text-faint transition-transform", !collapsed && "rotate-90")} />
+          <Badge tone={tone} size="sm">{RELEASE_PHASE_LABELS[current.phase]}</Badge>
+          <ChevronRight
+            size={15}
+            strokeWidth={1.75}
+            className={cn("text-faint transition-transform duration-200 ease-[var(--ease-spring)]", !collapsed && "rotate-90")}
+          />
         </span>
       </button>
       {!collapsed && current.entries.length > 0 && (
-        <ul className="border-t border-border px-3.5 py-2 text-meta text-muted">
+        <ul className="oc-surface-recessed space-y-1 rounded-none border-0 border-t border-border/75 px-3.5 py-2.5 text-meta text-muted">
           {current.entries.map((entry, index) => (
             <li key={`${entry.phase}-${index}`} className="whitespace-pre-wrap break-words">
-              <span className="text-faint">[{RELEASE_PHASE_LABELS[entry.phase as ReleasePhase] ?? entry.phase}]</span> {entry.text}
+              <span className="font-mono text-caption text-faint">[{RELEASE_PHASE_LABELS[entry.phase as ReleasePhase] ?? entry.phase}]</span> {entry.text}
             </li>
           ))}
         </ul>
       )}
       {!collapsed && current.phase === "failed" && (
-        <div className="space-y-1 border-t border-border px-3.5 py-2 text-meta">
-          <p className="text-danger">{current.error || "发布失败"}</p>
+        <div className="oc-callout oc-callout-danger space-y-1 rounded-none border-0 border-t px-3.5 py-2.5 text-meta">
+          <p className="font-medium text-danger">{current.error || "发布失败"}</p>
           {current.nextStep && <p className="text-muted">下一步：{current.nextStep}</p>}
         </div>
       )}
       {collapsed && done && (
-        <div className="flex items-start gap-1.5 border-t border-border px-3.5 py-2 text-meta text-muted">
+        <div className="flex items-start gap-1.5 border-t border-border/75 bg-bg/40 px-3.5 py-2 text-meta text-muted">
           {current.phase === "failed" ? (
-            <AlertTriangle size={13} className="mt-0.5 shrink-0 text-danger" />
+            <AlertTriangle size={13} strokeWidth={1.75} className="mt-0.5 shrink-0 text-danger" />
           ) : (
-            <Check size={13} className="mt-0.5 shrink-0 text-success" />
+            <Check size={13} strokeWidth={2} className="mt-0.5 shrink-0 text-success" />
           )}
           <span className="line-clamp-2">
             {current.phase === "failed"
@@ -221,8 +239,8 @@ export function renderReleaseJobCard(command: string, tool: ToolLike) {
   if (fromOutput) return <ReleaseProgressCard job={fromOutput} />;
   if (looksLikeReleaseWorkerCommand(command) && tool.error) {
     return (
-      <div className="rounded-lg border border-danger/40 bg-danger-soft px-3.5 py-2.5 text-meta text-danger">
-        发布任务未能启动。不要改走旁路；先读报错再查 queue / lease。
+      <div className="oc-callout oc-callout-danger rounded-lg px-3.5 py-2.5 text-meta text-danger">
+        发布任务未能启动，请查看下方报错信息后再排查。
       </div>
     );
   }

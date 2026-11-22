@@ -45,18 +45,26 @@ const expectedSuffix = [
         ...(existsSync(new URL('../db/migrations/0349_user_site_collaborators.sql', import.meta.url))
           ? ['0349_user_site_collaborators']
           : []),
+        ...(existsSync(new URL('../db/migrations/0350_perf_timeline_and_live_snapshot.sql', import.meta.url))
+          ? ['0350_perf_timeline_and_live_snapshot']
+          : []),
+        ...(existsSync(new URL('../db/migrations/0351_perf_timeline_and_live_snapshot_indexes.sql', import.meta.url))
+          ? ['0351_perf_timeline_and_live_snapshot_indexes']
+          : []),
+        ...(existsSync(new URL('../db/migrations/0352_pending_browser_handoffs.sql', import.meta.url))
+          ? ['0352_pending_browser_handoffs']
+          : []),
       ]
     : [
         '0340_commercial_sync_compat',
         '0341_commercial_antigravity_gemini_4_models',
         '0342_commercial_user_sites',
         '0343_commercial_gpt62_sol_astra_models',
-        ...(existsSync(new URL('../db/migrations/0344_commercial_antigravity_gemini_4_neon.sql', import.meta.url))
-          ? ['0344_commercial_antigravity_gemini_4_neon']
-          : []),
-        ...(existsSync(new URL('../db/migrations/0345_commercial_user_site_collaborators.sql', import.meta.url))
-          ? ['0345_commercial_user_site_collaborators']
-          : []),
+        '0344_commercial_antigravity_gemini_4_neon',
+        '0345_commercial_user_site_collaborators',
+        '0346_commercial_perf_timeline_and_live_snapshot',
+        '0347_commercial_perf_timeline_and_live_snapshot_indexes',
+        '0348_commercial_pending_browser_handoffs',
       ]),
 ].sort()
 const url = process.env.TEST_DATABASE_URL

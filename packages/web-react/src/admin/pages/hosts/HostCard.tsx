@@ -1,3 +1,4 @@
+import { Server } from 'lucide-react'
 import { useEffect, useRef } from 'react'
 import { Badge, Button, Card, Tooltip } from '../../../components/ui'
 import { cn } from '../../../lib/utils'
@@ -58,28 +59,49 @@ export function HostCard({
   const okN = h.consecutive_health_ok | 0
   const failN = h.consecutive_health_fail | 0
 
+  const statusTone = hostStatusTone(h.status)
+  const iconBadgeTone =
+    statusTone === 'success'
+      ? 'oc-icon-badge-success'
+      : statusTone === 'danger'
+        ? 'oc-icon-badge-danger'
+        : statusTone === 'warning'
+          ? 'oc-icon-badge-warning'
+          : 'oc-icon-badge-accent'
+
   return (
     <div ref={ref}>
       <Card
         className={cn(
-          'flex flex-col gap-3.5 p-4 transition-shadow',
+          'oc-surface-card-hover flex flex-col gap-3.5 p-4',
           focused && 'ring-2 ring-accent',
         )}
       >
         {/* 头部 */}
         <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <div className="flex items-center gap-1.5">
-              <span className="truncate font-semibold text-fg">{h.name}</span>
-              {isSelf && <span className="shrink-0 text-caption text-faint">(master)</span>}
+          <div className="flex min-w-0 items-start gap-2.5">
+            <span className={cn('oc-icon-badge mt-0.5 size-9 shrink-0 rounded-lg', iconBadgeTone)}>
+              <Server size={16} strokeWidth={1.9} />
+            </span>
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5">
+                <span className="truncate text-section font-semibold tracking-tight text-fg">
+                  {h.name}
+                </span>
+                {isSelf && (
+                  <span className="oc-badge-craft shrink-0 rounded-full bg-hover px-1.5 py-0.5 text-micro font-semibold text-faint">
+                    master
+                  </span>
+                )}
+              </div>
+              <p className="mt-0.5 truncate font-mono text-caption text-faint">
+                {h.host}:{h.ssh_port}
+                {h.agent_port && h.agent_port !== 9443 ? ` · agent ${h.agent_port}` : ''}
+              </p>
             </div>
-            <p className="mt-0.5 truncate font-mono text-caption text-faint">
-              {h.host}:{h.ssh_port}
-              {h.agent_port && h.agent_port !== 9443 ? ` · agent ${h.agent_port}` : ''}
-            </p>
           </div>
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
-            <Badge tone={hostStatusTone(h.status)}>{h.status}</Badge>
+            <Badge tone={statusTone}>{h.status}</Badge>
             {h.placement_gate_open === true && (
               <Tooltip content="placement gate 通过 — 调度会考虑这台 host">
                 <span>
@@ -104,7 +126,7 @@ export function HostCard({
         </div>
 
         {/* 资源水位 */}
-        <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
+        <div className="oc-surface-recessed grid grid-cols-1 gap-3 rounded-xl p-3 sm:grid-cols-3">
           <Meter
             label="磁盘"
             value={h.disk_pct}

@@ -335,7 +335,7 @@ export function ManagedBrowserSetupDialog({
         )}
         {setup && !terminalFailure && (
           <ol
-            className="grid grid-cols-4 gap-1 rounded-lg border border-border bg-surface px-2 py-2"
+            className="oc-surface-recessed grid grid-cols-4 gap-1 rounded-xl px-2.5 py-2.5"
             aria-label={`${label}授权进度`}
           >
             {['生成二维码', `${scanner}确认`, '加密保存', '授权完成'].map((stepLabel, index) => {
@@ -381,11 +381,11 @@ export function ManagedBrowserSetupDialog({
           // 说明文字与链接一律留在主题面上，扫码这条一次性关键路径才不会失去指引。
           <div className="flex flex-col items-center gap-3">
             {qrUrl ? (
-              <div className="flex justify-center rounded-xl border border-border bg-white p-4">
-                <img src={qrUrl} alt={qrAlt} className="size-56 object-contain" />
+              <div className="oc-surface-card flex justify-center rounded-2xl bg-white p-4">
+                <img src={qrUrl} alt={qrAlt} className="size-56 rounded-md object-contain" />
               </div>
             ) : (
-              <div className="flex min-h-64 w-full items-center justify-center rounded-xl border border-border bg-hover p-4">
+              <div className="oc-surface-recessed flex min-h-64 w-full items-center justify-center rounded-2xl p-4">
                 <Skeleton className="size-56 rounded-lg" />
               </div>
             )}

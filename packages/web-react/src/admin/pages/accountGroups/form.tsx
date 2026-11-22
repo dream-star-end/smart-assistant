@@ -15,7 +15,7 @@ export function Field({
   return (
     // biome-ignore lint/a11y/noLabelWithoutControl: label 经 children 隐式关联表单控件(Input/Select/Textarea)
     <label className="flex flex-col gap-1.5">
-      <span className="text-meta font-medium text-muted">{label}</span>
+      <span className="text-meta font-medium text-fg">{label}</span>
       {children}
       {hint && <span className="text-[11.5px] leading-snug text-faint">{hint}</span>}
     </label>
@@ -29,7 +29,7 @@ export const Select = forwardRef<HTMLSelectElement, SelectHTMLAttributes<HTMLSel
       <select
         ref={ref}
         className={cn(
-          "h-10 w-full appearance-none rounded-lg border border-border bg-surface pl-3.5 pr-9 text-base md:text-sm text-fg outline-none transition-[border-color,box-shadow] duration-150 ease-standard focus:border-accent focus:ring-2 focus:ring-ring disabled:opacity-50",
+          "oc-field-control h-10 w-full appearance-none rounded-lg border border-border bg-surface pl-3.5 pr-9 text-base md:text-sm text-fg outline-none transition-[border-color,box-shadow] duration-150 ease-standard focus:border-accent focus:ring-2 focus:ring-ring disabled:opacity-50",
           className,
         )}
         {...props}

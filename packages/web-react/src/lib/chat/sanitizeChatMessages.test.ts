@@ -14,6 +14,8 @@ describe("sanitizeChatMessages", () => {
     expect(out[1]?.id).toMatch(/^corrupt:sess-1:/);
     expect(out[1]?.role).toBe("system");
     expect(out[1]?._corruptPlaceholder).toBe(true);
+    expect(out[1]?.text).toBe("该条内容暂时无法显示");
+    expect(out[1]?.text).not.toMatch(/id|数据结构/i);
     expect(out[2]?.id).toBe("ok-2");
     expect(out[2]?.text).toBe("after");
   });
@@ -28,7 +30,8 @@ describe("sanitizeChatMessages", () => {
     expect(out[0]?.id).toBe("ok-1");
     expect(out[1]?.role).toBe("system");
     expect(out[1]?._corruptPlaceholder).toBe(true);
-    expect(out[1]?.text).toContain("数据结构异常");
+    expect(out[1]?.text).toBe("该条内容暂时无法显示");
+    expect(out[1]?.text).not.toMatch(/id|数据结构/i);
     expect(out[2]?.id).toBe("ok-2");
     expect(out[2]?.text).toBe("after");
   });

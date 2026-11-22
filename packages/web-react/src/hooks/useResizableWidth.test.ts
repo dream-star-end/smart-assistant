@@ -22,7 +22,7 @@ describe("useResizableWidth(详情面板:把手在左缘)", () => {
     expect(renderHook(() => useResizableWidth(DETAIL_PANE_WIDTH)).result.current.width).toBe(440);
     cleanup();
     localStorage.setItem(DETAIL_PANE_WIDTH.storageKey, "9999");
-    expect(renderHook(() => useResizableWidth(DETAIL_PANE_WIDTH)).result.current.width).toBe(720);
+    expect(renderHook(() => useResizableWidth(DETAIL_PANE_WIDTH)).result.current.width).toBe(DETAIL_PANE_WIDTH.max);
   });
 
   test("往左拖变宽、松手落盘;键盘 ← 变宽 → 变窄;双击复位", () => {

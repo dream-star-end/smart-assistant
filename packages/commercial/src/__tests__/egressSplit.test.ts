@@ -407,16 +407,16 @@ describe("internalCostEvent — 秘钥闸", () => {
 });
 
 test("V5 dual-master cost broadcast 经 slot relay fanout，非 dual-master 保留本地 bridge", () => {
-  const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../bootstrap/internalProxyBootstrap.ts", import.meta.url), "utf8");
   const start = source.indexOf("const costEventHandler: CostEventHandler");
   const end = source.indexOf("const cronIndexHandler:", start);
   assert.ok(start >= 0 && end > start);
   const wiring = source.slice(start, end);
   assert.match(
     wiring,
-    /if \(dualMasterEnabled\) \{\s*await slotRelayClient\.broadcastToUsers\(\[uid\.toString\(\)\], payload\);\s*return;\s*\}/,
+    /if \(deps\.dualMasterEnabled\) \{\s*await deps\.slotRelayClient\.broadcastToUsers\(\[uid\.toString\(\)\], payload\);\s*return;\s*\}/,
   );
-  assert.match(wiring, /bridgeBroadcastRef\.current\(uid, payload\);/);
+  assert.match(wiring, /deps\.bridgeBroadcastRef\.current\(uid, payload\);/);
 });
 
 // ─── forwarder deny-list ────────────────────────────────────────────────────

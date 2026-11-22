@@ -73,11 +73,12 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     expect(text).not.toContain("1943s");
   });
 
-  test("engine_starting → 正在启动引擎(不误标思考中)", () => {
+  test("engine_starting → 正在准备中(不暴露启动引擎，不误标思考中)", () => {
     renderTA({ startedAt: Date.now() - 8000, turnStatus: "engine_starting" });
     const text = screen.getByLabelText("生成中").textContent ?? "";
-    expect(text).toContain("正在启动引擎");
+    expect(text).toContain("正在准备中");
     expect(text).toContain("8s");
+    expect(text).not.toContain("启动引擎");
     expect(text).not.toContain("思考中");
   });
 
@@ -98,11 +99,13 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     const now = Date.now();
     renderTA({ startedAt: now - 1_184_000, lastFrameAt: now - 1_163_000, turnStatus: "engine_starting" });
     const text = screen.getByLabelText("生成中").textContent ?? "";
-    expect(text).not.toContain("正在启动引擎");
-    expect(text).toContain("无新数据");
+    expect(text).not.toContain("正在准备中");
+    expect(text).not.toContain("启动引擎");
+    expect(text).not.toContain("无新数据");
+    expect(text).toContain("仍在思考中");
   });
 
-  test("切回且连接未恢复 → 连接已断开,已发送计时不进读屏", () => {
+  test("切回且连接未恢复 → 正在后台处理中(断线由全局连接条承载),已发送计时不进读屏", () => {
     const now = Date.now();
     renderTA({
       startedAt: now - 1_184_000,
@@ -111,19 +114,22 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
       transport: "connecting",
     });
     const node = screen.getByLabelText("生成中");
-    expect(node.textContent ?? "").toContain("连接已断开");
+    expect(node.textContent ?? "").toContain("正在后台处理中");
+    expect(node.textContent ?? "").not.toContain("连接已断开");
     expect(node.querySelector("[data-elapsed]")?.textContent ?? "").toContain("已发送 19 分钟");
   });
 
-  test("hello detached 快照 → 后台运行中", () => {
+  test("hello detached 快照 → 正在后台处理中（不提示过程可能未同步）", () => {
     renderTA({ startedAt: Date.now() - 600_000, lastFrameAt: Date.now(), turnStatus: null, detached: true });
-    expect(screen.getByLabelText("生成中").textContent ?? "").toContain("后台运行中");
+    const text = screen.getByLabelText("生成中").textContent ?? "";
+    expect(text).toContain("正在后台处理中");
+    expect(text).not.toContain("过程可能未同步");
   });
 
-  test("engine_resuming → 正在恢复会话(长等待也不升级成深度思考)", () => {
+  test("engine_resuming → 正在准备中(长等待也不升级成深度思考)", () => {
     renderTA({ startedAt: Date.now() - 35_000, turnStatus: "engine_resuming" });
     const text = screen.getByLabelText("生成中").textContent ?? "";
-    expect(text).toContain("正在恢复会话");
+    expect(text).toContain("正在准备中");
     expect(text).not.toContain("深度思考");
   });
 
@@ -173,8 +179,8 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
         recoveryStatus: { kind: "retrying", attempt: 4 },
       }} />,
     );
-    expect(screen.getByLabelText("生成中")).toHaveTextContent("正在恢复实时内容…");
-    expect(screen.queryByText(/模型繁忙/)).not.toBeInTheDocument();
+    expect(screen.getByLabelText("生成中")).toHaveTextContent("正在同步进展…");
+    expect(screen.queryByText(/模型繁忙|实时内容/)).not.toBeInTheDocument();
     unmount();
 
     renderTA({
@@ -236,12 +242,12 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     expect(t).not.toContain("思考中");
   });
 
-  test("units 首包后 retrying 不再显示正在恢复实时内容", () => {
+  test("units 首包后 retrying 不再显示正在同步进展", () => {
     renderTA({
       recoveryStatus: { kind: "retrying", attempt: 2 },
       hasVisibleProcess: true,
     });
-    expect(screen.queryByText("正在恢复实时内容…")).not.toBeInTheDocument();
+    expect(screen.queryByText("正在同步进展…")).not.toBeInTheDocument();
   });
 });
 

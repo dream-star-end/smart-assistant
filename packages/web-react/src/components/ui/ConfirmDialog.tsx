@@ -102,7 +102,9 @@ export function useConfirm(): [(opts: ConfirmOpts) => Promise<ConfirmChoice>, Re
         </>
       }
     >
-      {zhPunct(opts?.body) ?? null}
+      {opts?.body ? (
+        <div className="text-body leading-relaxed text-muted">{zhPunct(opts.body)}</div>
+      ) : null}
     </Modal>
   );
 
@@ -167,7 +169,9 @@ export function usePrompt(): [(opts: PromptOpts) => Promise<string | null>, Reac
         </>
       }
     >
-      {zhPunct(opts?.body)}
+      {opts?.body ? (
+        <div className="mb-3 text-body leading-relaxed text-muted">{zhPunct(opts.body)}</div>
+      ) : null}
       <Input
         ref={inputRef}
         value={value}

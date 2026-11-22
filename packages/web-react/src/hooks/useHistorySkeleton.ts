@@ -24,6 +24,7 @@ export { countSubstantiveHistoryMessages, isSubstantiveHistoryMessage };
 //  - GRACE：meta 未知（深链/列表未落定）时的兜底窗，过后放行 EmptyState。
 //  - CAP：确知有历史但迟迟不到（getSession 慢/失败）的安全封顶，防骨架永停。
 export const HISTORY_SKELETON_GRACE_MS = 800;
+export const HISTORY_SKELETON_SLOW_MS = 5000;
 export const HISTORY_SKELETON_CAP_MS = 8000;
 
 export interface HistorySkeletonInput {
@@ -39,6 +40,8 @@ export interface HistorySkeletonInput {
   demoBusy: boolean;
   serverListSettled: boolean;
   historyLoading: boolean;
+  /** 当前会话 canonical history 是否已至少落定一次（成功或 404）。 */
+  historySettled?: boolean;
   /** 非 null = 当前会话 canonical history 读取失败。 */
   historyError: unknown;
 }
@@ -46,25 +49,30 @@ export interface HistorySkeletonInput {
 export function useHistorySkeleton(input: HistorySkeletonInput): {
   loadingHistory: boolean;
   historySurface: HistorySurface;
+  slowHistory: boolean;
 } {
   const { demo, activeId, sessions } = input;
-  // activeId 变化即重置两个截止标记；GRACE 用于 meta 未知（深链）分支，CAP 是安全封顶。
-  // 骨架本身随 wsMessages 到达（cachedCount>0）立即隐藏，计时器只做「永不停」兜底。
+  // activeId 变化即重置截止标记；GRACE 用于 meta 未知（深链）分支，CAP 是安全封顶，SLOW 触发慢网重试条。
   const [historyGraceExpired, setHistoryGraceExpired] = useState(false);
   const [historyCapExpired, setHistoryCapExpired] = useState(false);
+  const [historySlow, setHistorySlow] = useState(false);
   useEffect(() => {
     setHistoryGraceExpired(false);
     setHistoryCapExpired(false);
+    setHistorySlow(false);
     if (demo || !activeId) return;
     const t1 = setTimeout(() => setHistoryGraceExpired(true), HISTORY_SKELETON_GRACE_MS);
     const t2 = setTimeout(() => setHistoryCapExpired(true), HISTORY_SKELETON_CAP_MS);
+    const t3 = setTimeout(() => setHistorySlow(true), HISTORY_SKELETON_SLOW_MS);
     return () => {
       clearTimeout(t1);
       clearTimeout(t2);
+      clearTimeout(t3);
     };
   }, [demo, activeId]);
 
   const activeMeta = !demo && activeId ? sessions.find((s) => s.id === activeId) : undefined;
+  const hasHistoryError = !demo && input.historyError !== null;
   const loadingHistory =
     !demo &&
     shouldShowHistorySkeleton({
@@ -77,6 +85,8 @@ export function useHistorySkeleton(input: HistorySkeletonInput): {
       loading: input.historyLoading,
       graceExpired: historyGraceExpired,
       capExpired: historyCapExpired,
+      historyError: hasHistoryError,
+      settledEmpty: !demo && input.historySettled === true,
     });
   const historySurface = sessionHistorySurface({
     gated: input.gated,
@@ -86,5 +96,5 @@ export function useHistorySkeleton(input: HistorySkeletonInput): {
     knownNonEmpty: (activeMeta?.messageCount ?? 0) > 0,
     historyError: !demo && input.historyError !== null,
   });
-  return { loadingHistory, historySurface };
+  return { loadingHistory, historySurface, slowHistory: loadingHistory && historySlow };
 }

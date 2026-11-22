@@ -34,30 +34,45 @@ export function markGlyph(name: string): string {
   return (Array.from(name.trim())[0] ?? "?").toUpperCase();
 }
 
+export type CardMarkTone = "default" | "accent" | "success" | "warning" | "danger" | "info";
+
+const TONE_BADGE_CLASS: Record<Exclude<CardMarkTone, "default">, string> = {
+  accent: "oc-icon-badge-accent",
+  success: "oc-icon-badge-success",
+  warning: "oc-icon-badge-warning",
+  danger: "oc-icon-badge-danger",
+  info: "oc-icon-badge-info",
+};
+
 export function CardMark({
   name,
   category,
   size = "md",
+  tone = "default",
   className,
 }: {
   name: string;
   category?: string | null;
   /** md = 40px（卡片、列表行）；lg = 44px（详情页标题）。 */
   size?: "md" | "lg";
+  /** 语义色调变体；传入非 default 时优先走 Clarvy Atelier 语义图标徽章。 */
+  tone?: CardMarkTone;
   className?: string;
 }) {
-  const hue = category ? CATEGORY_HUE[category] : undefined;
+  const hue = tone === "default" && category ? CATEGORY_HUE[category] : undefined;
   return (
     <span
       aria-hidden="true"
       data-category={category ?? undefined}
       style={hue ? ({ "--mark-hue": hue } as CSSProperties) : undefined}
       className={cn(
-        "flex shrink-0 select-none items-center justify-center rounded-md font-semibold",
-        size === "lg" ? "size-11 text-title" : "size-10 text-section",
-        hue
-          ? "bg-[color:color-mix(in_srgb,var(--mark-hue)_14%,var(--surface))] text-[color:color-mix(in_srgb,var(--mark-hue)_70%,var(--fg))]"
-          : "bg-hover text-muted",
+        "oc-icon-badge select-none font-semibold tracking-tight",
+        size === "lg" ? "size-11 rounded-xl text-title" : "size-10 rounded-lg text-section",
+        tone !== "default"
+          ? TONE_BADGE_CLASS[tone]
+          : hue
+            ? "bg-[linear-gradient(180deg,color-mix(in_srgb,var(--mark-hue)_19%,var(--surface))_0%,color-mix(in_srgb,var(--mark-hue)_9%,var(--surface))_100%)] text-[color:color-mix(in_srgb,var(--mark-hue)_76%,var(--fg))] ring-1 ring-inset ring-[color:color-mix(in_srgb,var(--mark-hue)_26%,transparent)]"
+            : undefined,
         className,
       )}
     >

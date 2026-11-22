@@ -132,6 +132,13 @@ export interface ModelExecutionDescriptor {
  * - `securityEpoch`:容器侧维护「已见最大 epoch」,低于它 = 安全变更后的旧签名 → 拒;
  * - `billingRequestId?`:codex 的 server-owned requestId(绑定用,不是身份)。
  */
+export interface AuthorityBillingAttribution {
+  readonly mode: 'delegate'
+  readonly parentTurnKey?: string
+  readonly parentSessionId?: string
+  readonly delegateAgentId?: string
+}
+
 export interface ModelAuthorityPayload {
   readonly v: typeof MODEL_AUTHORITY_VERSION
   readonly keyId: string
@@ -170,6 +177,7 @@ export interface ModelAuthorityPayload {
    */
   readonly auxModels?: readonly string[]
   readonly billingRequestId?: string
+  readonly billingAttribution?: AuthorityBillingAttribution
 }
 
 /**
@@ -738,6 +746,9 @@ function parseAuthorityPayload(raw: unknown): ModelAuthorityPayload {
     expiresAt: int(o, 'expiresAt'),
     ...(o.auxModels === undefined ? {} : { auxModels: modelList(o, 'auxModels') }),
     ...(o.billingRequestId === undefined ? {} : { billingRequestId: str(o, 'billingRequestId') }),
+    ...(o.billingAttribution === undefined
+      ? {}
+      : { billingAttribution: parseBillingAttribution(o.billingAttribution) }),
     ...(o.executionBackend === undefined ? {} : { executionBackend: parseExecutionBackend(o.executionBackend) }),
   }
   // 重建对象后必须与 wire 载荷**字段集完全一致**:多出的未知字段一律拒 —— 否则
@@ -758,12 +769,49 @@ function parseAuthorityPayload(raw: unknown): ModelAuthorityPayload {
     'expiresAt',
     'auxModels',
     'billingRequestId',
+    'billingAttribution',
     'executionBackend',
   ])
   if (payload.executionBackend !== undefined && !isRemoteBackendAuthority(payload)) {
     throw new ModelAuthorityError('BadShape', 'payload: execution backend/model/engine mismatch')
   }
   return payload
+}
+
+function parseBillingAttribution(value: unknown): AuthorityBillingAttribution {
+  const o = asObject(value, 'billingAttribution')
+  if (o.mode !== 'delegate') {
+    throw new ModelAuthorityError('BadShape', 'billingAttribution: unsupported mode')
+  }
+  assertNoExtraKeys(o, ['mode', 'parentTurnKey', 'parentSessionId', 'delegateAgentId'])
+  const out: {
+    mode: 'delegate'
+    parentTurnKey?: string
+    parentSessionId?: string
+    delegateAgentId?: string
+  } = { mode: 'delegate' }
+  if (o.parentTurnKey !== undefined) {
+    const k = str(o, 'parentTurnKey')
+    if (!/^[0-9a-f]{64}$/.test(k)) {
+      throw new ModelAuthorityError('BadShape', 'billingAttribution: invalid parentTurnKey')
+    }
+    out.parentTurnKey = k
+  }
+  if (o.parentSessionId !== undefined) {
+    const s = str(o, 'parentSessionId')
+    if (s.length > 256) {
+      throw new ModelAuthorityError('BadShape', 'billingAttribution: invalid parentSessionId')
+    }
+    out.parentSessionId = s
+  }
+  if (o.delegateAgentId !== undefined) {
+    const a = str(o, 'delegateAgentId')
+    if (a.length > 128) {
+      throw new ModelAuthorityError('BadShape', 'billingAttribution: invalid delegateAgentId')
+    }
+    out.delegateAgentId = a
+  }
+  return out
 }
 
 function parseExecutionBackend(value: unknown): RemoteExecutionBackend {

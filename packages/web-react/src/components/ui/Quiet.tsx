@@ -66,7 +66,7 @@ export function GroupHeading({
 }) {
   return (
     <div className={cn("flex min-h-8 items-end justify-between gap-3 pb-2", className)}>
-      <Tag className="flex items-baseline gap-2 text-[14px] font-semibold leading-5 text-fg">
+      <Tag className="flex items-baseline gap-2 text-sm font-semibold leading-5 tracking-tight text-fg">
         {title}
         {count !== undefined && (
           <span className="text-meta font-normal tabular-nums text-faint">{count}</span>
@@ -79,7 +79,7 @@ export function GroupHeading({
 
 /**
  * 分组列表容器:一个容器装一组行,行与行之间是发丝线 —— 不是「每条一张卡」。
- * 外形与 Card 默认一致(app 的 rounded-xl + 描边 + soft 阴影,OCV5-362),不再另起 10px 平板。
+ * 外形与 Card 默认一致(Clarvy Atelier 精雕卡片面 + 发丝描边 + 顶缘高光),不再另起 10px 平板。
  * shrink-0:放进定高的 flex 列(工作台历史页签)时不许被压缩 —— overflow-hidden 会把后面的行
  * 裁掉,外层滚动也够不着(Codex r1)。
  * 渲染成 <ul>;行用 ListRow(<li>)。
@@ -88,7 +88,7 @@ export function ListGroup({ className, ...props }: HTMLAttributes<HTMLUListEleme
   return (
     <ul
       className={cn(
-        "oc-list shrink-0 overflow-hidden rounded-xl border border-border bg-surface shadow-soft",
+        "oc-list oc-surface-card shrink-0 overflow-hidden rounded-xl bg-surface",
         className,
       )}
       {...props}

@@ -36,8 +36,8 @@ test('native pressure uses latest context tokens, never cumulative billing or ca
   h.record(usage(800))
   h.record(usage(1100))
   assert.deepEqual(h.observations.map((e) => e.kind === 'context_pressure' && e.pressure), [
-    { engine: 'codex', scope: 'native_context', dimension: 'tokens', level: 'warning', usedRatio: 0.8 },
-    { engine: 'codex', scope: 'native_context', dimension: 'tokens', level: 'critical', usedRatio: 1.1 },
+    { engine: 'codex', scope: 'native_context', dimension: 'tokens', level: 'warning', usedRatio: 0.8, usedTokens: 800, windowTokens: 1000 },
+    { engine: 'codex', scope: 'native_context', dimension: 'tokens', level: 'critical', usedRatio: 1.1, usedTokens: 1100, windowTokens: 1000 },
   ])
 })
 

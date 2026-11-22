@@ -77,3 +77,68 @@ export function diffLines(oldStr: string, newStr: string): DiffRow[] {
   }
   return rows
 }
+
+export interface InlineDiffSpan {
+  text: string
+  changed: boolean
+}
+
+const INLINE_TOKEN_RE = /[A-Za-z0-9_$]+|[\u4e00-\u9fff]|[^\sA-Za-z0-9_$\u4e00-\u9fff]+|\s+/g
+const MAX_INLINE_DIFF_CHARS = 2000
+
+/**
+ * 零依赖词级前后缀公共子串高亮：对相邻的 `-` / `+` 行求出公共词前缀与公共词后缀，
+ * 仅高亮中间真正改动的片段；若整行毫无公共词（如完全重写）或超长则返回 null，避免整行双重涂色。
+ */
+export function inlineDiffSpans(
+  oldText: string,
+  newText: string,
+): { oldSpans: InlineDiffSpan[]; newSpans: InlineDiffSpan[] } | null {
+  if (oldText === newText) return null
+  if (oldText.length > MAX_INLINE_DIFF_CHARS || newText.length > MAX_INLINE_DIFF_CHARS) return null
+  const a = oldText.match(INLINE_TOKEN_RE) ?? []
+  const b = newText.match(INLINE_TOKEN_RE) ?? []
+  let prefix = 0
+  const minLen = Math.min(a.length, b.length)
+  while (prefix < minLen && a[prefix] === b[prefix]) prefix++
+  let suffix = 0
+  while (suffix < minLen - prefix && a[a.length - 1 - suffix] === b[b.length - 1 - suffix]) suffix++
+  if (prefix === 0 && suffix === 0) return null
+
+  const build = (tokens: string[]): InlineDiffSpan[] => {
+    const out: InlineDiffSpan[] = []
+    if (prefix > 0) out.push({ text: tokens.slice(0, prefix).join(''), changed: false })
+    const midEnd = tokens.length - suffix
+    if (midEnd > prefix) out.push({ text: tokens.slice(prefix, midEnd).join(''), changed: true })
+    if (suffix > 0) out.push({ text: tokens.slice(midEnd).join(''), changed: false })
+    return out
+  }
+  return { oldSpans: build(a), newSpans: build(b) }
+}
+
+/** 为 diff 行序列中相邻的 `-` 块与 `+` 块按行配对计算词级高亮，返回 rowIndex → InlineDiffSpan[]。 */
+export function computeInlineDiffMap(rows: readonly Pick<DiffRow, 'sign' | 'text'>[]): Map<number, InlineDiffSpan[]> {
+  const map = new Map<number, InlineDiffSpan[]>()
+  let i = 0
+  while (i < rows.length) {
+    if (rows[i]!.sign !== '-') {
+      i++
+      continue
+    }
+    const delStart = i
+    while (i < rows.length && rows[i]!.sign === '-') i++
+    const delCount = i - delStart
+    const addStart = i
+    while (i < rows.length && rows[i]!.sign === '+') i++
+    const addCount = i - addStart
+    const pairs = Math.min(delCount, addCount)
+    for (let k = 0; k < pairs; k++) {
+      const res = inlineDiffSpans(rows[delStart + k]!.text, rows[addStart + k]!.text)
+      if (res) {
+        map.set(delStart + k, res.oldSpans)
+        map.set(addStart + k, res.newSpans)
+      }
+    }
+  }
+  return map
+}

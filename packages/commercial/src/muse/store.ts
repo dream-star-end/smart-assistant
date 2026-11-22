@@ -51,6 +51,16 @@ export interface MuseJobRecord {
   debitedCredits: string | null
 }
 
+export interface MuseSessionJobRecord {
+  id: string
+  kind: MuseKind
+  status: MuseJobStatus
+  promptPreview: string
+  queuedAt: number
+  startedAt?: number
+  errorCode?: string | null
+}
+
 export interface MuseStore {
   insertJob(row: MuseJobInsert): Promise<void>
   markRunning(id: string, credentialId: string | null, fence?: MuseFence): Promise<void>
@@ -62,6 +72,14 @@ export interface MuseStore {
    * (0 = all) and not among `ownIds`, this process's open jobs. */
   failOrphans(graceMs: number, ownIds: readonly string[]): Promise<number>
   findJob(userId: string, id: string): Promise<MuseJobRecord | null>
+  /** Session-scoped active + recently finished (10 min) durable Muse jobs (OCV5-844). */
+  listSessionJobs?(userId: string, sessionId: string): Promise<MuseSessionJobRecord[]>
+  /** Conditionally cancel a queued/running session-scoped durable Muse job in PG (zero billing). */
+  cancelSessionJob?(
+    userId: string,
+    sessionId: string,
+    jobId: string,
+  ): Promise<{ cancelled: boolean; status: MuseJobStatus } | null>
   /** Sum of the quoted credits of this account's open (queued/running) jobs, across processes. */
   openCredits(userId: string): Promise<bigint>
   findCredential(tokenSha256: Buffer): Promise<{ id: string } | null>
@@ -241,6 +259,68 @@ export function createPgMuseStore(pool: Pool): MuseStore {
         debitedCredits:
           typeof debited === 'number' || typeof debited === 'string' ? String(debited) : null,
       }
+    },
+    async listSessionJobs(userId, sessionId) {
+      const r = await pool.query<{
+        id: string
+        kind: string
+        status: string
+        prompt_preview: string
+        error_code: string | null
+        queued_at_ms: string | number
+        started_at_ms: string | number | null
+      }>(
+        `SELECT id, kind, status, prompt_preview, error_code,
+                (EXTRACT(EPOCH FROM queued_at) * 1000)::bigint AS queued_at_ms,
+                CASE WHEN started_at IS NOT NULL
+                     THEN (EXTRACT(EPOCH FROM started_at) * 1000)::bigint
+                     ELSE NULL END AS started_at_ms
+           FROM muse_media_jobs
+          WHERE user_id = $1
+            AND durable->>'sessionId' = $2
+            AND (status IN ('queued', 'running') OR finished_at > NOW() - INTERVAL '10 minutes')
+          ORDER BY queued_at DESC
+          LIMIT 10`,
+        [userId, sessionId],
+      )
+      return r.rows.map((row) => ({
+        id: String(row.id),
+        kind: row.kind as MuseKind,
+        status: row.status as MuseJobStatus,
+        promptPreview: typeof row.prompt_preview === 'string' ? row.prompt_preview.slice(0, 240) : '',
+        queuedAt: Number(row.queued_at_ms) || 0,
+        ...(row.started_at_ms !== null && row.started_at_ms !== undefined
+          ? { startedAt: Number(row.started_at_ms) }
+          : {}),
+        ...(typeof row.error_code === 'string' && row.error_code ? { errorCode: row.error_code } : {}),
+      }))
+    },
+    async cancelSessionJob(userId, sessionId, jobId) {
+      const updated = await pool.query<{ status: string }>(
+        `UPDATE muse_media_jobs
+            SET status = 'cancelled', error_code = 'MUSE_CANCELLED', finished_at = NOW()
+          WHERE id = $1
+            AND user_id = $2
+            AND durable->>'sessionId' = $3
+            AND status IN ('queued', 'running')
+          RETURNING status`,
+        [jobId, userId, sessionId],
+      )
+      if ((updated.rowCount ?? 0) === 1) {
+        return { cancelled: true, status: 'cancelled' }
+      }
+      const existing = await pool.query<{ status: string }>(
+        `SELECT status
+           FROM muse_media_jobs
+          WHERE id = $1
+            AND user_id = $2
+            AND durable->>'sessionId' = $3
+          LIMIT 1`,
+        [jobId, userId, sessionId],
+      )
+      const row = existing.rows[0]
+      if (!row) return null
+      return { cancelled: false, status: row.status as MuseJobStatus }
     },
     async openCredits(userId) {
       const r = await pool.query<{ n: string }>(

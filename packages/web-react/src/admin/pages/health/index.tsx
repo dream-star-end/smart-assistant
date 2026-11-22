@@ -139,6 +139,7 @@ export default function HealthPage() {
   return (
     <div className="flex flex-col gap-5">
       <PageHeader
+        icon={Activity}
         title="健康面板"
         desc="聚合自 /api/admin/metrics · 30s 刷新"
         actions={
@@ -161,11 +162,13 @@ export default function HealthPage() {
       />
 
       {failed ? (
-        <Card className="flex flex-col items-center gap-2 px-6 py-12 text-center">
-          <AlertTriangle size={28} className="text-danger" />
-          <p className="text-title font-medium text-fg">拉取 /api/admin/metrics 失败</p>
-          <p className="max-w-md text-meta text-faint">{apiErrorMessage(poll.error, "未知错误")}</p>
-          <Button variant="secondary" size="sm" onClick={() => poll.refresh()} className="mt-2 gap-1.5">
+        <Card className="flex flex-col items-center gap-3 px-6 py-12 text-center">
+          <span className="oc-icon-badge oc-icon-badge-danger size-12 rounded-xl">
+            <AlertTriangle size={22} />
+          </span>
+          <p className="text-title font-semibold text-fg">拉取 /api/admin/metrics 失败</p>
+          <p className="max-w-md text-meta text-muted">{apiErrorMessage(poll.error, "未知错误")}</p>
+          <Button variant="secondary" size="sm" onClick={() => poll.refresh()} className="mt-1 gap-1.5">
             <RefreshCw size={14} />
             重试
           </Button>
@@ -186,10 +189,10 @@ export default function HealthPage() {
 
 function CurrentActions({ overview, loading }: { overview: OpsOverview | null; loading: boolean }) {
   const actions = overview?.current_actions;
-  if (loading) return <div className="h-24 animate-pulse rounded-xl bg-hover" />;
+  if (loading) return <div className="h-24 animate-pulse rounded-xl bg-skeleton" />;
   if (!actions) {
     return (
-      <SectionCard title="当前行动" hint="告警与事故的待处理入口">
+      <SectionCard icon={BellRing} title="当前行动" hint="告警与事故的待处理入口">
         <p className="text-body text-muted">行动汇总暂不可用，请分别进入告警和自愈修复查看。</p>
       </SectionCard>
     );
@@ -197,29 +200,51 @@ function CurrentActions({ overview, loading }: { overview: OpsOverview | null; l
   const active = actions.firing_alerts.length + actions.open_incidents.length;
   return (
     <SectionCard
+      icon={BellRing}
+      iconTone={active > 0 ? "danger" : "success"}
       title="当前行动"
       hint={active > 0 ? `${active} 项当前需要处理` : "当前没有 firing 告警或 open 事故"}
       bodyClassName="grid grid-cols-1 gap-3 sm:grid-cols-2"
     >
       <a
         href="#tab=alerts"
-        className="rounded-lg border border-border p-4 outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+        className="oc-surface-card oc-surface-card-hover rounded-xl p-4 outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         <div className="flex items-center justify-between gap-3">
-          <span className="flex items-center gap-2 text-body font-medium text-fg"><BellRing size={16} /> 告警行动队列</span>
+          <span className="flex items-center gap-2.5 text-body font-semibold text-fg">
+            <span
+              className={cn(
+                "oc-icon-badge size-8 rounded-lg",
+                actions.firing_alerts.length > 0 ? "oc-icon-badge-danger" : "oc-icon-badge-success",
+              )}
+            >
+              <BellRing size={15} />
+            </span>
+            告警行动队列
+          </span>
           <Badge tone={actions.firing_alerts.length > 0 ? "danger" : "success"}>{actions.firing_alerts.length} firing</Badge>
         </div>
-        <p className="mt-2 text-meta text-muted">已恢复 {actions.recovered_alerts.length} · 陈旧 {actions.stale_alerts.length} · 查看确认、静默与 runbook</p>
+        <p className="mt-2.5 text-meta text-muted">已恢复 {actions.recovered_alerts.length} · 陈旧 {actions.stale_alerts.length} · 查看确认、静默与 runbook</p>
       </a>
       <a
         href="#tab=selfheal"
-        className="rounded-lg border border-border p-4 outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+        className="oc-surface-card oc-surface-card-hover rounded-xl p-4 outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         <div className="flex items-center justify-between gap-3">
-          <span className="flex items-center gap-2 text-body font-medium text-fg"><Wrench size={16} /> 自愈事故</span>
+          <span className="flex items-center gap-2.5 text-body font-semibold text-fg">
+            <span
+              className={cn(
+                "oc-icon-badge size-8 rounded-lg",
+                actions.open_incidents.length > 0 ? "oc-icon-badge-danger" : "oc-icon-badge-success",
+              )}
+            >
+              <Wrench size={15} />
+            </span>
+            自愈事故
+          </span>
           <Badge tone={actions.open_incidents.length > 0 ? "danger" : "success"}>{actions.open_incidents.length} open</Badge>
         </div>
-        <p className="mt-2 text-meta text-muted">查看持续时间、修复状态与完整事件时间线</p>
+        <p className="mt-2.5 text-meta text-muted">查看持续时间、修复状态与完整事件时间线</p>
       </a>
     </SectionCard>
   );
@@ -242,23 +267,23 @@ function SloSection({ overview, loading }: { overview: OpsOverview | null; loadi
       ? "仅自本进程启动"
       : "不可用";
   return (
-    <SectionCard title="Agent Turn SLO" hint={`数据窗口：${sourceLabel}`} bodyClassName="p-0">
+    <SectionCard icon={Activity} iconTone="info" title="Agent Turn SLO" hint={`数据窗口：${sourceLabel}`} bodyClassName="p-0">
       {loading ? (
         <div className="grid grid-cols-1 gap-3 p-4 sm:grid-cols-3">
-          {[0, 1, 2].map((i) => <div key={i} className="h-28 animate-pulse rounded-lg bg-hover" />)}
+          {[0, 1, 2].map((i) => <div key={i} className="h-28 animate-pulse rounded-lg bg-skeleton" />)}
         </div>
       ) : !slo || slo.source === "unavailable" ? (
-        <div className="px-4 py-5 text-body text-muted">时间窗口 SLO 暂不可用；不会用进程累计 counter 伪装历史数据。</div>
+        <div className="px-5 py-5 text-body text-muted">时间窗口 SLO 暂不可用；不会用进程累计 counter 伪装历史数据。</div>
       ) : (
-        <div className="grid grid-cols-1 divide-y divide-border sm:grid-cols-3 sm:divide-x sm:divide-y-0">
+        <div className="grid grid-cols-1 divide-y divide-border/80 sm:grid-cols-3 sm:divide-x sm:divide-y-0">
           {entries.map(([label, w]) => (
             <div key={label} className="p-4">
-              <div className="text-meta font-medium text-faint">{label}</div>
+              <div className="text-caption font-semibold uppercase tracking-wide text-faint">{label}</div>
               <div className="mt-2 flex flex-wrap items-baseline gap-x-3 gap-y-1">
-                <span className="text-[20px] font-semibold tabular-nums text-success">{fmtInt(w?.success ?? 0)} 成功</span>
-                <span className={(w?.failure ?? 0) > 0 ? "text-body text-danger" : "text-body text-muted"}>{fmtInt(w?.failure ?? 0)} 失败</span>
+                <span className="text-xl font-semibold tracking-tight tabular-nums text-success">{fmtInt(w?.success ?? 0)} 成功</span>
+                <span className={(w?.failure ?? 0) > 0 ? "text-body font-medium tabular-nums text-danger" : "text-body tabular-nums text-muted"}>{fmtInt(w?.failure ?? 0)} 失败</span>
               </div>
-              <div className="mt-2 text-[12px] leading-relaxed text-muted">
+              <div className="mt-2.5 text-meta leading-relaxed text-muted tabular-nums">
                 受影响用户 {fmtInt(w?.affected_users ?? 0)}<br />
                 延迟 p50 {fmtLatencyMs(w?.latency_ms.p50 ?? null)} · p95 {fmtLatencyMs(w?.latency_ms.p95 ?? null)}
               </div>
@@ -274,18 +299,20 @@ function SloSection({ overview, loading }: { overview: OpsOverview | null; loadi
 function DiagnosticsSection({ diag, loading }: { diag: Diagnostics | null; loading: boolean }) {
   return (
     <SectionCard
+      icon={Database}
+      iconTone="accent"
       title="运维排障快照"
       hint="来自 /api/admin/diagnostics"
-      bodyClassName="flex flex-col gap-3"
+      bodyClassName="flex flex-col gap-3.5"
     >
       {loading ? (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
           {[0, 1, 2, 3].map((i) => (
-            <div key={i} className="h-[92px] animate-pulse rounded-xl bg-hover" />
+            <div key={i} className="h-[96px] animate-pulse rounded-xl bg-skeleton" />
           ))}
         </div>
       ) : !diag ? (
-        <div className="flex items-center gap-2 rounded-lg bg-warning-soft px-3 py-2.5 text-body text-warning">
+        <div className="oc-callout oc-callout-warning flex items-center gap-2 rounded-xl px-3.5 py-2.5 text-body text-warning">
           <AlertTriangle size={15} className="shrink-0" />
           /api/admin/diagnostics 加载失败；下方 metrics 仍可查看。
         </div>
@@ -294,12 +321,18 @@ function DiagnosticsSection({ diag, loading }: { diag: Diagnostics | null; loadi
       )}
       {diag && (
         <details className="text-meta">
-          <summary className="cursor-pointer select-none text-faint transition-colors hover:text-fg">
+          <summary className="cursor-pointer select-none font-medium text-faint transition-colors hover:text-fg">
             查看原始 diagnostics JSON
           </summary>
-          <pre className="mt-2 max-h-80 overflow-auto rounded-lg border border-border bg-hover p-3 font-mono text-[11.5px] leading-relaxed text-muted">
-            {JSON.stringify(diag, null, 2)}
-          </pre>
+          <div className="oc-code-shell mt-2.5">
+            <div className="oc-code-shell-header flex items-center justify-between px-3.5 py-1.5 text-caption font-medium text-faint">
+              <span>diagnostics.json</span>
+              <span>/api/admin/diagnostics</span>
+            </div>
+            <pre className="max-h-80 overflow-auto p-3.5 font-mono text-caption leading-relaxed text-muted">
+              {JSON.stringify(diag, null, 2)}
+            </pre>
+          </div>
         </details>
       )}
     </SectionCard>
@@ -390,21 +423,23 @@ function DiagCard({
   hint?: string;
 }) {
   return (
-    <Card className="flex flex-col gap-2 p-4">
+    <Card className="flex flex-col gap-2.5 p-4">
       <div className="flex items-center justify-between gap-2">
-        <span className="flex items-center gap-1.5 text-meta font-medium text-faint">
-          <Icon size={13} className="shrink-0" />
+        <span className="flex items-center gap-2 text-meta font-medium text-muted">
+          <span className="oc-icon-badge size-6 rounded-md">
+            <Icon size={13} className="shrink-0" />
+          </span>
           {label}
         </span>
         <span className="shrink-0">{badge}</span>
       </div>
       <p
-        className="truncate text-[18px] font-semibold leading-tight text-fg tabular-nums"
+        className="truncate text-title font-semibold leading-tight tracking-tight text-fg tabular-nums"
         title={typeof value === "string" ? value : undefined}
       >
         {value}
       </p>
-      {hint && <p className="line-clamp-2 text-[12px] leading-snug text-faint">{hint}</p>}
+      {hint && <p className="line-clamp-2 text-meta leading-snug text-faint">{hint}</p>}
     </Card>
   );
 }
@@ -535,7 +570,7 @@ function ChartPanel({
   return (
     <ChartCard title={title} hint={hint} height={height}>
       {loading ? (
-        <div className="h-full w-full animate-pulse rounded-lg bg-hover" />
+        <div className="h-full w-full animate-pulse rounded-lg bg-skeleton" />
       ) : empty ? (
         <div className="flex h-full w-full items-center justify-center text-body text-faint">
           无数据
@@ -643,7 +678,7 @@ function KvTable({
       rowKey={(r) => r.k}
       loading={loading}
       emptyTitle="无数据"
-      className="rounded-none border-0"
+      className="rounded-none border-0 shadow-none"
     />
   );
 }
@@ -703,7 +738,7 @@ function AccountPoolTable({ rows, loading }: { rows: AcctRow[]; loading?: boolea
       rowKey={(r) => r.account_id}
       loading={loading}
       emptyTitle="无数据"
-      className="rounded-none border-0"
+      className="rounded-none border-0 shadow-none"
     />
   );
 }

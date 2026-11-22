@@ -195,7 +195,7 @@ export const WORKSPACE_API_ROUTES: readonly HttpRoute<WorkspaceApiRoutesIo>[] = 
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/memories$/) ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/memories\/([^/]+)$/) ||
       url.pathname.match(
-        /^\/api\/board\/projects\/([^/]+)\/memories\/([^/]+)\/(promote|reject|deprecate)$/,
+        /^\/api\/board\/projects\/([^/]+)\/memories\/([^/]+)\/(promote|reject|deprecate|restore)$/,
       ) ||
       url.pathname.match(/^\/api\/board\/runs\/([^/]+)\/context$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)$/) ||

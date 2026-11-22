@@ -69,6 +69,10 @@ export type SendMediaFn = (params: {
 export type GetBindingFn = (bindingUserId: string) => Promise<{
   botToken: string
   contextTokens: Record<string, string>
+  /** Bound owner iLink user id (e.g. `<id>@im.wechat` or canonical). Required for high-privilege remote control & proactive push. */
+  loginUserId?: string
+  /** Binding status (`active` | `unbound` | `expired`). Omitted defaults to active for legacy stubs. */
+  status?: string
 } | null>
 
 export type LogFn = (level: 'info' | 'warn' | 'error', message: string) => void

@@ -12,12 +12,15 @@ import {
   DEFAULT_INTERVAL_MS,
   DEFAULT_PRUNE_MAX_BATCHES,
   DEFAULT_RETIRE_MIN_AGE_MS,
+  DEFAULT_RETIRED_RETENTION_DAYS,
   MAX_PRUNE_MAX_BATCHES,
+  MAX_RETIRED_RETENTION_DAYS,
   MIN_INTERVAL_MS,
   resolveLiveFrameMaintenanceDisabled,
   resolveLiveFrameMaintenanceIntervalMs,
   resolvePruneMaxBatches,
   resolveRetireMinAgeMs,
+  resolveRetiredRetentionDays,
   startLiveFrameMaintenanceScheduler,
 } from "../db/liveFrameMaintenanceScheduler.js";
 
@@ -60,13 +63,22 @@ describe("resolvePruneMaxBatches / resolveRetireMinAgeMs", () => {
     assert.equal(resolveRetireMinAgeMs("abc"), DEFAULT_RETIRE_MIN_AGE_MS);
     assert.equal(resolveRetireMinAgeMs(3 * 60 * 60 * 1000), 3 * 60 * 60 * 1000);
   });
+  test("retiredRetentionDays 缺省/非法 → 7d,封到 365d", () => {
+    assert.equal(resolveRetiredRetentionDays(undefined), DEFAULT_RETIRED_RETENTION_DAYS);
+    assert.equal(resolveRetiredRetentionDays(0), DEFAULT_RETIRED_RETENTION_DAYS);
+    assert.equal(resolveRetiredRetentionDays(-3), DEFAULT_RETIRED_RETENTION_DAYS);
+    assert.equal(resolveRetiredRetentionDays("abc"), DEFAULT_RETIRED_RETENTION_DAYS);
+    assert.equal(resolveRetiredRetentionDays(14), 14);
+    assert.equal(resolveRetiredRetentionDays(9999), MAX_RETIRED_RETENTION_DAYS);
+  });
 });
 
 describe("startLiveFrameMaintenanceScheduler", () => {
-  test("runOnStart 默认 true,boot 立即调用 prune 与 retire", async () => {
+  test("runOnStart 默认 true,boot 立即调用 prune、retire 与 pruneRetired", async () => {
     const calls: string[] = [];
     let pruneOpts: { batchSize?: number; maxBatches?: number } | undefined;
     let retireOpts: { minAgeMs?: number } | undefined;
+    let retiredOpts: { olderThanDays?: number; batchSize?: number; maxBatches?: number } | undefined;
     const h = startLiveFrameMaintenanceScheduler({
       pool: fakePool,
       intervalMs: 60_000,
@@ -80,21 +92,30 @@ describe("startLiveFrameMaintenanceScheduler", () => {
         retireOpts = options;
         return { retired: 1 };
       },
+      pruneRetiredFn: async (_pool, options) => {
+        calls.push("pruneRetired");
+        retiredOpts = options;
+        return { deletedFrames: 10, prunedStreams: 3, deletedStreams: 3 };
+      },
     });
     await new Promise((r) => setTimeout(r, 20));
-    assert.deepEqual(calls, ["prune", "retire"]);
+    assert.deepEqual(calls, ["prune", "retire", "pruneRetired"]);
     assert.equal(pruneOpts?.maxBatches, DEFAULT_PRUNE_MAX_BATCHES);
     assert.equal(pruneOpts?.batchSize, 5000);
     assert.equal(retireOpts?.minAgeMs, DEFAULT_RETIRE_MIN_AGE_MS);
+    assert.equal(retiredOpts?.olderThanDays, DEFAULT_RETIRED_RETENTION_DAYS);
+    assert.equal(retiredOpts?.maxBatches, DEFAULT_PRUNE_MAX_BATCHES);
+    assert.equal(retiredOpts?.batchSize, 5000);
     h.stop();
   });
 
-  test("runNow 调用这两个函数并返回计数", async () => {
+  test("runNow 调用这三个函数并返回计数", async () => {
     const calls: string[] = [];
     const h = startLiveFrameMaintenanceScheduler({
       pool: fakePool,
       runOnStart: false,
       pruneMaxBatches: 11,
+      retiredRetentionDays: 14,
       pruneFn: async (_pool, options) => {
         calls.push("prune");
         assert.equal(options?.maxBatches, 11);
@@ -104,10 +125,23 @@ describe("startLiveFrameMaintenanceScheduler", () => {
         calls.push("retire");
         return { retired: 2 };
       },
+      pruneRetiredFn: async (_pool, options) => {
+        calls.push("pruneRetired");
+        assert.equal(options?.olderThanDays, 14);
+        assert.equal(options?.maxBatches, 11);
+        return { deletedFrames: 9, prunedStreams: 2, deletedStreams: 2 };
+      },
     });
     const out = await h.runNow();
-    assert.deepEqual(calls, ["prune", "retire"]);
-    assert.deepEqual(out, { deletedFrames: 3, prunedStreams: 1, retired: 2 });
+    assert.deepEqual(calls, ["prune", "retire", "pruneRetired"]);
+    assert.deepEqual(out, {
+      deletedFrames: 3,
+      prunedStreams: 1,
+      retired: 2,
+      deletedRetiredFrames: 9,
+      prunedRetiredStreams: 2,
+      deletedRetiredStreams: 2,
+    });
     h.stop();
   });
 
@@ -127,21 +161,30 @@ describe("startLiveFrameMaintenanceScheduler", () => {
         return { deletedFrames: 0, prunedStreams: 0 };
       },
       retireFn: async () => ({ retired: 0 }),
+      pruneRetiredFn: async () => ({ deletedFrames: 0, prunedStreams: 0, deletedStreams: 0 }),
     });
     const p1 = h.runNow();
     await new Promise((r) => setTimeout(r, 10));
     const r2 = await h.runNow();
-    assert.deepEqual(r2, { deletedFrames: 0, prunedStreams: 0, retired: 0 });
+    assert.deepEqual(r2, {
+      deletedFrames: 0,
+      prunedStreams: 0,
+      retired: 0,
+      deletedRetiredFrames: 0,
+      prunedRetiredStreams: 0,
+      deletedRetiredStreams: 0,
+    });
     assert.equal(calls, 1, "重叠 tick 不应二次调用 prune");
     release();
     await p1;
     h.stop();
   });
 
-  test("prune 抛错走 onError,retire 仍跑,下一轮不停摆", async () => {
+  test("prune 抛错走 onError,retire 与 pruneRetired 仍跑,下一轮不停摆", async () => {
     const errs: unknown[] = [];
     let pruneCalls = 0;
     let retireCalls = 0;
+    let retiredPruneCalls = 0;
     const h = startLiveFrameMaintenanceScheduler({
       pool: fakePool,
       runOnStart: false,
@@ -154,19 +197,25 @@ describe("startLiveFrameMaintenanceScheduler", () => {
         retireCalls += 1;
         return { retired: 0 };
       },
+      pruneRetiredFn: async () => {
+        retiredPruneCalls += 1;
+        return { deletedFrames: 0, prunedStreams: 0, deletedStreams: 0 };
+      },
       onError: (e) => errs.push(e),
     });
     await h.runNow();
     assert.equal(errs.length, 1);
     assert.equal((errs[0] as Error).message, "prune-boom");
     assert.equal(retireCalls, 1, "prune 失败不应阻断 retire");
+    assert.equal(retiredPruneCalls, 1, "prune 失败不应阻断 pruneRetired");
     await h.runNow();
     assert.equal(pruneCalls, 2);
     assert.equal(retireCalls, 2, "失败后循环必须继续");
+    assert.equal(retiredPruneCalls, 2);
     h.stop();
   });
 
-  test("retire 抛错走 onError,循环不挂", async () => {
+  test("retire / pruneRetired 抛错走 onError,循环不挂", async () => {
     const errs: unknown[] = [];
     let pruneCalls = 0;
     const h = startLiveFrameMaintenanceScheduler({
@@ -179,19 +228,24 @@ describe("startLiveFrameMaintenanceScheduler", () => {
       retireFn: async () => {
         throw new Error("retire-boom");
       },
+      pruneRetiredFn: async () => {
+        throw new Error("prune-retired-boom");
+      },
       onError: (e) => errs.push(e),
     });
     const out = await h.runNow();
     assert.equal(out.deletedFrames, 1);
     assert.equal(out.retired, 0);
-    assert.equal(errs.length, 1);
+    assert.equal(out.deletedRetiredFrames, 0);
+    assert.equal(errs.length, 2);
     assert.equal((errs[0] as Error).message, "retire-boom");
+    assert.equal((errs[1] as Error).message, "prune-retired-boom");
     await h.runNow();
     assert.equal(pruneCalls, 2);
     h.stop();
   });
 
-  test("disabled:true → 不建 timer、不跑 prune/retire", async () => {
+  test("disabled:true → 不建 timer、不跑 prune/retire/pruneRetired", async () => {
     let n = 0;
     const h = startLiveFrameMaintenanceScheduler({
       pool: fakePool,
@@ -205,11 +259,22 @@ describe("startLiveFrameMaintenanceScheduler", () => {
         n += 1;
         return { retired: 0 };
       },
+      pruneRetiredFn: async () => {
+        n += 1;
+        return { deletedFrames: 0, prunedStreams: 0, deletedStreams: 0 };
+      },
     });
     await new Promise((r) => setTimeout(r, 20));
     const out = await h.runNow();
     assert.equal(n, 0);
-    assert.deepEqual(out, { deletedFrames: 0, prunedStreams: 0, retired: 0 });
+    assert.deepEqual(out, {
+      deletedFrames: 0,
+      prunedStreams: 0,
+      retired: 0,
+      deletedRetiredFrames: 0,
+      prunedRetiredStreams: 0,
+      deletedRetiredStreams: 0,
+    });
     h.stop();
   });
 

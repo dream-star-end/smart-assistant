@@ -22,6 +22,25 @@ export const CODEX_NATIVE_HISTORY_CONTEXT_WINDOW_TOKENS = 258_400
  * the runner still compacts against its real limit. */
 export const CURSOR_NATIVE_HISTORY_CONTEXT_WINDOW_TOKENS = 200_000
 
+/** Antigravity CLI / unknown-window engines still need a finite transport bound
+ * so archive chunk walks never materialize hundreds of MB in memory. */
+export const ANTIGRAVITY_NATIVE_HISTORY_CONTEXT_WINDOW_TOKENS = 200_000
+export const DEFAULT_FALLBACK_HISTORY_CONTEXT_WINDOW_TOKENS = 200_000
+
+/** Default preview cap when decaying older tool/delegate records on replay. */
+export const DECAYED_TOOL_OUTPUT_MAX_CHARS = 500
+export const DECAYED_TOOL_INPUT_MAX_CHARS = 240
+export const DEFAULT_RECENT_FULL_TURNS = 2
+
+export interface ModelHistorySemanticOptions {
+  /** Collapse heavy tool / delegate outputs for turns older than the hot tail. */
+  decayToolOutput?: boolean
+  /** Max characters kept for decayed tool output preview (default 500). */
+  maxDecayedToolOutputChars?: number
+  /** Max characters kept for decayed tool input summary (default 240). */
+  maxDecayedToolInputChars?: number
+}
+
 export const MODEL_HISTORY_EXACT_SUFFIX_MARKER =
   '[Earlier bytes of this exact message exceed the current model context window; exact suffix follows.]\n'
 
@@ -358,27 +377,56 @@ function appendSection(parts: string[], label: string, value: unknown): void {
   if (!parts.includes(section)) parts.push(section)
 }
 
-function childBlockSemanticText(value: unknown): string {
+function truncateUtf16Safe(text: string, maxChars: number): string {
+  if (maxChars <= 0) return ''
+  if (text.length <= maxChars) return text
+  let end = maxChars
+  const last = text.charCodeAt(end - 1)
+  if (last >= 0xd800 && last <= 0xdbff && end > 1) end -= 1
+  return text.slice(0, end)
+}
+
+function decaySerializedValue(value: unknown, maxChars: number): string {
+  const raw = serialized(value).trim()
+  if (!raw) return ''
+  if (raw.length <= maxChars) return raw
+  return `${truncateUtf16Safe(raw, maxChars)}… [older output decayed; original ${raw.length} chars]`
+}
+
+function childBlockSemanticText(value: unknown, options?: ModelHistorySemanticOptions): string {
   const block = asRecord(value)
   if (!block || typeof block.kind !== 'string' || block.kind === 'thinking') return ''
+  const decay = options?.decayToolOutput === true
+  const maxOut = Math.max(64, options?.maxDecayedToolOutputChars ?? DECAYED_TOOL_OUTPUT_MAX_CHARS)
+  const maxIn = Math.max(64, options?.maxDecayedToolInputChars ?? DECAYED_TOOL_INPUT_MAX_CHARS)
   const parts: string[] = []
   switch (block.kind) {
     case 'text':
-      appendSection(parts, '', block.text)
+      appendSection(parts, '', decay ? decaySerializedValue(block.text, maxOut) : block.text)
       break
     case 'tool_use':
       appendSection(parts, 'Tool', block.toolName)
-      appendSection(parts, 'Input', block.inputJson ?? block.inputPreview)
+      {
+        const inp = block.inputJson ?? block.inputPreview
+        appendSection(parts, 'Input', decay ? decaySerializedValue(inp, maxIn) : inp)
+      }
       break
     case 'tool_result':
-      appendSection(
-        parts,
-        block.isError === true ? 'Tool error' : 'Tool result',
-        block.output ?? block.outputJson ?? block.preview,
-      )
+      {
+        const out = block.output ?? block.outputJson ?? block.preview
+        appendSection(
+          parts,
+          block.isError === true ? 'Tool error' : 'Tool result',
+          decay ? decaySerializedValue(out, maxOut) : out,
+        )
+      }
       break
     case 'tool_output_tail':
-      appendSection(parts, block.truncatedHead === true ? 'Exact tool output tail' : 'Tool output', block.tail)
+      appendSection(
+        parts,
+        block.truncatedHead === true ? 'Exact tool output tail' : 'Tool output',
+        decay ? decaySerializedValue(block.tail, maxOut) : block.tail,
+      )
       break
     case 'plan':
       appendSection(parts, 'Plan', block.text)
@@ -392,8 +440,8 @@ function childBlockSemanticText(value: unknown): string {
     case 'delegate_progress':
       appendSection(parts, 'Delegate', block.agentId)
       appendSection(parts, 'Delegate goal', block.goal)
-      appendSection(parts, 'Delegate progress', block.text)
-      appendSection(parts, '', childBlockSemanticText(block.block))
+      appendSection(parts, 'Delegate progress', decay ? decaySerializedValue(block.text, maxOut) : block.text)
+      appendSection(parts, '', childBlockSemanticText(block.block, options))
       break
     case 'error':
       appendSection(parts, 'Error', block.error)
@@ -425,10 +473,16 @@ export function modelHistorySemanticRole(value: unknown): ModelHistorySemanticRo
  * explicitly labelled exact suffix solely when the physical provider context
  * cannot hold the whole transcript; browser history remains untouched.
  */
-export function modelHistorySemanticText(value: unknown): string {
+export function modelHistorySemanticText(
+  value: unknown,
+  options?: ModelHistorySemanticOptions,
+): string {
   const message = asRecord(value)
   const role = modelHistorySemanticRole(message)
   if (!message || !role || message.system === true) return ''
+  const decay = options?.decayToolOutput === true
+  const maxOut = Math.max(64, options?.maxDecayedToolOutputChars ?? DECAYED_TOOL_OUTPUT_MAX_CHARS)
+  const maxIn = Math.max(64, options?.maxDecayedToolInputChars ?? DECAYED_TOOL_INPUT_MAX_CHARS)
   const parts: string[] = []
   const body = textContent(message)
   switch (role) {
@@ -446,8 +500,17 @@ export function modelHistorySemanticText(value: unknown): string {
       break
     case 'tool':
       appendSection(parts, 'Tool', message.toolName)
-      appendSection(parts, 'Input', message.inputJson ?? message.toolInput ?? message.inputPreview)
       {
+        const inp = message.inputJson ?? message.toolInput ?? message.inputPreview
+        appendSection(parts, 'Input', decay ? decaySerializedValue(inp, maxIn) : inp)
+      }
+      if (decay) {
+        const status = message.isError === true || message.error ? 'error' : 'ok'
+        appendSection(parts, 'Status', status)
+        const output = message.output ?? message.outputJson ?? message.bashTail ?? body
+        appendSection(parts, 'Output', decaySerializedValue(output, maxOut))
+        appendSection(parts, 'Error', decaySerializedValue(message.error, maxOut))
+      } else {
         const output = message.output ?? message.outputJson ?? message.bashTail
         // Materialized tool rows commonly carry the exact same bytes in both
         // `text` and `output`. Labels make the final sections unequal, so the
@@ -456,8 +519,8 @@ export function modelHistorySemanticText(value: unknown): string {
         // in the finite model window.
         if (body !== serialized(output)) appendSection(parts, 'Summary', body)
         appendSection(parts, 'Output', output)
+        appendSection(parts, 'Error', message.error)
       }
-      appendSection(parts, 'Error', message.error)
       break
     case 'plan':
       appendSection(parts, 'Plan', body)
@@ -471,14 +534,34 @@ export function modelHistorySemanticText(value: unknown): string {
       appendSection(parts, 'Tokens used', message.tokensUsed)
       break
     case 'agent-group':
-      appendSection(parts, 'Delegation', body)
+      appendSection(parts, 'Delegation', decay ? decaySerializedValue(body, maxOut) : body)
       appendSection(parts, 'Agent', message._delegateAgentId ?? message.agentId)
       appendSection(parts, 'Goal', message._delegateGoal)
       appendSection(parts, 'Status', message._delegateStatus ?? message.status)
-      appendSection(parts, 'Result', message._resultPreview)
+      appendSection(
+        parts,
+        'Result',
+        decay ? decaySerializedValue(message._resultPreview, maxOut) : message._resultPreview,
+      )
       if (Array.isArray(message.childBlocks)) {
-        for (const child of message.childBlocks) {
-          appendSection(parts, '', childBlockSemanticText(child))
+        if (decay) {
+          // Older delegated runs collapse child tool chatter to compact summaries.
+          const toolNames: string[] = []
+          for (const child of message.childBlocks) {
+            const rec = asRecord(child)
+            if (rec?.kind === 'tool_use' && typeof rec.toolName === 'string' && toolNames.length < 12) {
+              toolNames.push(rec.toolName)
+            } else if (rec?.kind === 'error' || rec?.kind === 'text') {
+              appendSection(parts, '', childBlockSemanticText(child, options))
+            }
+          }
+          if (toolNames.length > 0) {
+            appendSection(parts, 'Tools used', `${toolNames.join(', ')} (${message.childBlocks.length} child blocks decayed)`)
+          }
+        } else {
+          for (const child of message.childBlocks) {
+            appendSection(parts, '', childBlockSemanticText(child))
+          }
         }
       }
       break
@@ -488,6 +571,68 @@ export function modelHistorySemanticText(value: unknown): string {
       break
   }
   return parts.join('\n')
+}
+
+export interface ProjectedModelHistoryRow {
+  role: ModelHistorySemanticRole
+  text: string
+  decayed: boolean
+  raw: unknown
+}
+
+/**
+ * Project a full chronological message sequence for replay/handoff.
+ * Keeps the most recent `recentFullTurns` user-turn segments at full fidelity
+ * while decaying older `tool` and `agent-group` rows to compact summaries so
+ * historical tool noise never floods the replay window. Browser/lossless storage
+ * is untouched.
+ */
+export function projectModelHistoryForReplay(
+  messages: readonly unknown[],
+  options?: {
+    recentFullTurns?: number
+    maxDecayedToolOutputChars?: number
+    maxDecayedToolInputChars?: number
+  },
+): ProjectedModelHistoryRow[] {
+  const recentFullTurns = Math.max(0, Math.floor(options?.recentFullTurns ?? DEFAULT_RECENT_FULL_TURNS))
+  // Identify index of the Nth-from-last user message; anything before it is "older".
+  let cutoffIndex = 0
+  if (recentFullTurns > 0) {
+    let seenUsers = 0
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (modelHistorySemanticRole(messages[i]) === 'user') {
+        seenUsers += 1
+        if (seenUsers === recentFullTurns) {
+          cutoffIndex = i
+          break
+        }
+      }
+    }
+  } else {
+    cutoffIndex = messages.length
+  }
+
+  const out: ProjectedModelHistoryRow[] = []
+  for (let i = 0; i < messages.length; i += 1) {
+    const raw = messages[i]
+    const role = modelHistorySemanticRole(raw)
+    if (!role) continue
+    const shouldDecay = i < cutoffIndex && (role === 'tool' || role === 'agent-group')
+    const text = modelHistorySemanticText(
+      raw,
+      shouldDecay
+        ? {
+            decayToolOutput: true,
+            maxDecayedToolOutputChars: options?.maxDecayedToolOutputChars,
+            maxDecayedToolInputChars: options?.maxDecayedToolInputChars,
+          }
+        : undefined,
+    ).trim()
+    if (!text) continue
+    out.push({ role, text, decayed: shouldDecay, raw })
+  }
+  return out
 }
 
 export function modelHistoryRoleLabel(role: ModelHistorySemanticRole): string {
@@ -535,7 +680,21 @@ export function resolveModelHistoryContextWindow(
   if (declaredContextWindow !== null) return null
   if (engine === 'codex' || engine === 'grok') return CODEX_NATIVE_HISTORY_CONTEXT_WINDOW_TOKENS
   if (engine === 'cursor') return CURSOR_NATIVE_HISTORY_CONTEXT_WINDOW_TOKENS
+  if (engine === 'antigravity' || engine === 'ccb' || engine === 'zcode') {
+    return ANTIGRAVITY_NATIVE_HISTORY_CONTEXT_WINDOW_TOKENS
+  }
   return null
+}
+
+/** Always returns a finite context window (200k default) for bounded archive walks. */
+export function resolveEffectiveModelHistoryContextWindow(
+  declaredContextWindow: number | null | undefined,
+  engine?: string,
+): number {
+  return (
+    resolveModelHistoryContextWindow(declaredContextWindow, engine) ??
+    DEFAULT_FALLBACK_HISTORY_CONTEXT_WINDOW_TOKENS
+  )
 }
 
 /** Tokens available to prior conversation after bytes and runner-specific
@@ -561,9 +720,13 @@ export function availableModelHistoryTokens(
  * buffer that the runners need, plus the existing 256-token transport
  * allowance. A rebuilt Codex thread also needs this headroom: otherwise its
  * first compact request can itself exceed the window.
+ * Antigravity / Cursor / ZCode also inject platform prompt + tool schemas,
+ * so reserve 16k + 256 instead of only 256.
  */
 export function modelHistoryReservedTokens(engine?: string): number {
-  return engine === 'ccb' || engine === 'codex' || engine === 'grok' ? 33_256 : 256
+  if (engine === 'ccb' || engine === 'codex' || engine === 'grok') return 33_256
+  if (engine === 'antigravity' || engine === 'cursor' || engine === 'zcode') return 16_256
+  return 256
 }
 
 /** Return a Unicode-safe exact suffix that fits the approximate token budget. */

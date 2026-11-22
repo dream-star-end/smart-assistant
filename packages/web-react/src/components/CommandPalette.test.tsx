@@ -349,4 +349,193 @@ describe("CommandPalette", () => {
     expect(keys()).toEqual(["action:new-project"]);
     expect(screen.getByRole("option", { name: "新建项目「zzzz-nothing」" })).toBeInTheDocument();
   });
+
+  it("活态会话优先展示于顶部，点击直达并对未读完成触发 onMarkRead", () => {
+    const onMarkRead = vi.fn();
+    const liveSessions = [
+      session("s-approve", "审批构建方案", V5.id, 1),
+      session("s-running", "后台跑基准测试", PAPER.id, 2, { runState: "running" }),
+      session("s-done", "Excel 报表已完成", null, 3, { lastOutcome: "completed" }),
+    ];
+    const { props } = setup({
+      sessions: liveSessions,
+      sessionNeedsYou: (id) => (id === "s-approve" ? "approval" : null),
+      unreadIds: new Set(["s-done"]),
+      onMarkRead,
+    });
+    expect(groupLabels()[0]).toBe("活态会话");
+    const liveGroup = within(screen.getByRole("group", { name: "活态会话" })).getAllByRole("option");
+    expect(liveGroup.map((o) => o.getAttribute("data-palette-key"))).toEqual([
+      "session:s-approve",
+      "session:s-running",
+      "session:s-done",
+    ]);
+    fireEvent.click(liveGroup[2]!);
+    expect(onMarkRead).toHaveBeenCalledWith("s-done");
+    expect(props.onOpenSession).toHaveBeenCalledWith("s-done");
+  });
+
+  it("支持显式模型快速切换（含旗舰标注与降级禁选）、站点直达与工作区常用入口", () => {
+    const onSelectModel = vi.fn();
+    const onOpenSite = vi.fn();
+    const onOpenManage = vi.fn();
+    const onOpenQuickAsk = vi.fn();
+    const { input } = setup({
+      sites: [
+        { id: "st-1", slug: "research-hub", title: "科研主页", customDomain: "lab.example.com", visibility: "public" },
+      ],
+      onOpenSite,
+      onOpenSites: vi.fn(),
+      models: [
+        { id: "claude-opus-4-6", display_name: "Claude Opus 4.6", cost_x: 3.5 },
+        { id: "gpt-5.4", display_name: "GPT-5.4", cost_x: 2.0 },
+        { id: "broken-pro", display_name: "Degraded Pro", degraded: true },
+      ],
+      activeModelId: "gpt-5.4",
+      onSelectModel,
+      onOpenManage,
+      onOpenQuickAsk,
+    });
+
+    // 模型分区带旗舰与当前标记；点旗舰模型显式切换；点降级模型不触发切换
+    const modelGroup = within(screen.getByRole("group", { name: "显式切换模型" }));
+    expect(modelGroup.getAllByTestId("palette-model-flagship").length).toBeGreaterThanOrEqual(2);
+    expect(modelGroup.getByTestId("palette-model-current")).toHaveTextContent("当前");
+    fireEvent.click(modelGroup.getByRole("option", { name: /Degraded Pro/ }));
+    expect(onSelectModel).not.toHaveBeenCalled();
+    fireEvent.click(modelGroup.getByRole("option", { name: /Claude Opus 4\.6/ }));
+    expect(onSelectModel).toHaveBeenCalledWith("claude-opus-4-6");
+
+    // 模糊搜站点
+    type(input, "lab.example");
+    fireEvent.click(screen.getByRole("option", { name: /科研主页/ }));
+    expect(onOpenSite).toHaveBeenCalledWith("research-hub");
+
+    // 模糊搜工作区入口：记忆 / 技能 / 定时任务 / 快问小窗
+    type(input, "定时任务");
+    fireEvent.click(screen.getByRole("option", { name: "定时任务" }));
+    expect(onOpenManage).toHaveBeenCalledWith("cron");
+
+    type(input, "快问");
+    fireEvent.click(screen.getByRole("option", { name: "打开快问小窗" }));
+    expect(onOpenQuickAsk).toHaveBeenCalledTimes(1);
+  });
+
+  it("OCV5-817: 异步远程结果回流时保持用户已选中的 activeKey，上下键跳过降级禁选模型，并支持高频 OS 操作", async () => {
+    const onOpenSettings = vi.fn();
+    const onToggleTheme = vi.fn();
+    const onTogglePane = vi.fn();
+    let resolveAssets!: (rows: ProjectAsset[]) => void;
+    const searchAssets = vi.fn(
+      () =>
+        new Promise<ProjectAsset[]>((r) => {
+          resolveAssets = r;
+        }),
+    );
+    const { input } = setup({
+      searchAssets,
+      onOpenSettings,
+      onToggleTheme,
+      onTogglePane,
+      models: [
+        { id: "gpt-5.4", display_name: "GPT-5.4", cost_x: 2.0 },
+        { id: "broken-pro", display_name: "Degraded Pro", degraded: true },
+      ],
+      activeModelId: "gpt-5.4",
+      onSelectModel: vi.fn(),
+    });
+
+    // 1. 异步结果插入上方时，保持用户主动选中的行
+    type(input, "周报");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    const pickedBefore = selected()?.getAttribute("data-palette-key");
+    expect(pickedBefore).toBeTruthy();
+    await waitFor(() => expect(searchAssets).toHaveBeenCalled());
+    resolveAssets([asset("a-late", "周报汇总.md", V5.id)]);
+    await screen.findByRole("option", { name: /周报汇总\.md/ });
+    expect(selected()?.getAttribute("data-palette-key")).toBe(pickedBefore);
+
+    // 2. 键盘导航跳过 disabled（降级）模型
+    type(input, "");
+    const allOpts = options();
+    const degradedOpt = allOpts.find((o) => o.getAttribute("data-palette-key") === "model:broken-pro");
+    expect(degradedOpt).toHaveAttribute("aria-disabled", "true");
+    for (let i = 0; i < allOpts.length; i += 1) {
+      fireEvent.keyDown(input, { key: "ArrowDown" });
+      expect(selected()?.getAttribute("data-palette-key")).not.toBe("model:broken-pro");
+    }
+
+    // 3. 高频 OS 操作（设置 / 主题 / 工作台面板）
+    type(input, "主题");
+    fireEvent.click(screen.getByRole("option", { name: /切换明暗主题/ }));
+    expect(onToggleTheme).toHaveBeenCalledTimes(1);
+    type(input, "设置");
+    fireEvent.click(screen.getByRole("option", { name: /打开设置/ }));
+    expect(onOpenSettings).toHaveBeenCalledTimes(1);
+    type(input, "工作台");
+    fireEvent.click(screen.getByRole("option", { name: /切换工作台面板/ }));
+    expect(onTogglePane).toHaveBeenCalledTimes(1);
+  });
+
+  it("OCV5-838: > 与 @ 快捷前缀过滤、高频动作回调、以及触屏点筛选胶囊不回焦防弹键盘", () => {
+    const onSelectModel = vi.fn();
+    const onSelectAgent = vi.fn();
+    const onFindInSession = vi.fn();
+    const onShareSession = vi.fn();
+    const onOpenInbox = vi.fn();
+    const { input } = setup({
+      activeSession: SESSIONS[0],
+      models: [{ id: "claude-opus-4-6", display_name: "Claude Opus 4.6", cost_x: 3.5 }],
+      activeModelId: "claude-opus-4-6",
+      onSelectModel,
+      agents: [{ id: "coder", name: "代码专家" }],
+      onSelectAgent,
+      onFindInSession,
+      onShareSession,
+      onOpenInbox,
+    });
+
+    // `>` 仅滤命令
+    type(input, ">分享");
+    expect(keys()).toEqual(["action:share-session"]);
+    fireEvent.click(screen.getByRole("option", { name: /分享会话/ }));
+    expect(onShareSession).toHaveBeenCalledTimes(1);
+
+    type(input, ">站内信");
+    expect(keys()).toEqual(["action:open-inbox"]);
+    fireEvent.click(screen.getByRole("option", { name: /打开站内信/ }));
+    expect(onOpenInbox).toHaveBeenCalledTimes(1);
+
+    type(input, ">查找");
+    expect(keys()).toEqual(["action:find-in-session"]);
+    fireEvent.click(screen.getByRole("option", { name: /会话内查找/ }));
+    expect(onFindInSession).toHaveBeenCalledTimes(1);
+
+    // `@` 仅滤模型与智能体
+    type(input, "@代码");
+    expect(keys()).toEqual(["agent:coder"]);
+    fireEvent.click(screen.getByRole("option", { name: /代码专家/ }));
+    expect(onSelectAgent).toHaveBeenCalledWith("coder");
+
+    // 触屏设备（hover: none）点击筛选胶囊不主动回焦输入框，防止手机反复弹起软键盘
+    const origMatchMedia = window.matchMedia;
+    window.matchMedia = vi.fn().mockImplementation((q: string) => ({
+      matches: q === "(hover: none)",
+      media: q,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+    try {
+      const focusSpy = vi.spyOn(input, "focus");
+      focusSpy.mockClear();
+      fireEvent.click(screen.getByRole("button", { name: "项目" }));
+      expect(focusSpy).not.toHaveBeenCalled();
+    } finally {
+      window.matchMedia = origMatchMedia;
+    }
+  });
 });

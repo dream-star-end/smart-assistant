@@ -415,6 +415,13 @@ export function abandonCcbLocalAgentInject(sessionKey: string, taskId: string): 
   existing.state = 'delivered'
 }
 
+export function hasCcbLocalAgentPendingForSession(sessionKey: string): boolean {
+  for (const entry of store.values()) {
+    if (entry.sessionKey === sessionKey && entry.state !== 'delivered') return true
+  }
+  return false
+}
+
 export function clearCcbLocalAgentPendingForSession(sessionKey: string): void {
   for (const [key, entry] of store) {
     if (entry.sessionKey === sessionKey) store.delete(key)

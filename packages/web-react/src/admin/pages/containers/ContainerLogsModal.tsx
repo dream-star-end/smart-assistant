@@ -102,12 +102,18 @@ export function ContainerLogsModal({
         </>
       }
     >
-      <pre
-        ref={bodyRef}
-        className="max-h-[58vh] min-h-[300px] overflow-auto whitespace-pre-wrap break-all rounded-lg bg-hover p-3 font-mono text-[12px] leading-relaxed text-fg"
-      >
-        {text}
-      </pre>
+      <div className="oc-code-shell">
+        <div className="oc-code-shell-header flex items-center justify-between px-3.5 py-2 text-caption font-medium text-faint">
+          <span className="truncate font-mono">{label || 'container.log'}</span>
+          <span className="shrink-0 tabular-nums">tail {lines} 行</span>
+        </div>
+        <pre
+          ref={bodyRef}
+          className="max-h-[58vh] min-h-[300px] overflow-auto whitespace-pre-wrap break-all p-3.5 font-mono text-meta leading-relaxed text-fg"
+        >
+          {text}
+        </pre>
+      </div>
     </Modal>
   )
 }

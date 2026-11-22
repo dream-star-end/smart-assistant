@@ -5,8 +5,12 @@
 
 import { useEffect, useState } from 'react'
 
-import { AuthEpochStaleError } from '../lib/api'
-import { studioApi } from '../lib/studio/api'
+import {
+  AuthEpochStaleError,
+  assertAuthResponseCurrent,
+  bearerHeaders,
+  callWithRefresh,
+} from '../lib/api'
 import type { MediaKind, ProviderKindView, ProvidersView } from '../lib/studio/types'
 import type { AuthSession } from '../lib/types'
 
@@ -22,12 +26,26 @@ function cacheKey(auth: AuthSession): string {
   return `${snap.epoch}`
 }
 
+async function fetchStudioProviders(auth: AuthSession): Promise<ProvidersView> {
+  const response = await callWithRefresh(auth, (token) =>
+    fetch('/api/studio/providers', {
+      credentials: 'include',
+      headers: bearerHeaders(token, false),
+    }),
+  )
+  assertAuthResponseCurrent(response)
+  const value = (await response.json().catch(() => ({}))) as Record<string, unknown>
+  assertAuthResponseCurrent(response)
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  return value as unknown as ProvidersView
+}
+
 export function probeStudio(auth: AuthSession, force = false): Promise<ProvidersView | null> {
   const key = cacheKey(auth)
   if (force) cache.delete(key)
   let hit = cache.get(key)
   if (!hit) {
-    hit = studioApi.providers(auth).catch((err) => {
+    hit = fetchStudioProviders(auth).catch((err) => {
       cache.delete(key)
       if (err instanceof AuthEpochStaleError) throw err
       return null

@@ -6,6 +6,7 @@
  * IuiBlock 在 Markdown 懒块里：这里同样懒加载，不把智能 UI 组件拉进首屏。
  */
 import { Suspense, lazy } from "react";
+import { Skeleton } from "../ui";
 import type { ToolLike } from "./format";
 
 const IuiBlock = lazy(() => import("../iui/IuiBlock").then((m) => ({ default: m.IuiBlock })));
@@ -29,7 +30,7 @@ export function ThsToolCard({ tool }: { tool: ToolLike }) {
   if (blocks.length === 0) return null;
   return (
     <div className="flex flex-col gap-2" data-testid="ths-tool-card">
-      <Suspense fallback={<div className="h-24 animate-pulse rounded-lg bg-hover" aria-hidden />}>
+      <Suspense fallback={<Skeleton className="h-24 w-full rounded-lg" />}>
         {blocks.map((code, i) => (
           <IuiBlock key={`${i}:${code.length}`} code={code} readOnly />
         ))}

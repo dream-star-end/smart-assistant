@@ -45,17 +45,48 @@ const HOP_BY_HOP = new Set([
   "host",
 ]);
 
+export const DEFAULT_FORWARDER_RETRY_BUDGET_MS = 4_000;
+export const DEFAULT_FORWARDER_RETRY_DELAYS_MS = [100, 200, 400] as const;
+export const DEFAULT_FORWARDER_MAX_RETRY_BODY_BYTES = 2 * 1024 * 1024;
+
+const RETRYABLE_UPSTREAM_ERROR_CODES = new Set(["ECONNREFUSED", "ECONNRESET", "EPIPE"]);
+const SAFE_RETRY_METHODS_AFTER_CONNECT = new Set(["GET", "HEAD", "OPTIONS"]);
+
+function isSafeRetryMethodAfterConnect(method: string): boolean {
+  return SAFE_RETRY_METHODS_AFTER_CONNECT.has(method);
+}
+
 export interface ForwarderOpts {
   /** master 控制口,如 http://127.0.0.1:18894 */
   controlBaseUrl: string;
   logger?: Logger;
+  /** 连接阶段瞬断重拨总预算（默认 4000ms）。设为 0 可关闭重试。 */
+  retryBudgetMs?: number;
+  /** 连接阶段退避序列（默认 [100, 200, 400] ms）。 */
+  retryDelaysMs?: readonly number[];
+  /** 可缓冲以支持重拨的最大请求体字节数（默认 2 MiB，超限自动透传不缓冲）。 */
+  maxRetryBodyBytes?: number;
 }
 
 export type Forwarder = (req: IncomingMessage, res: ServerResponse, peerIp: string) => void;
 
+function isRetryableUpstreamError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  return typeof code === "string" && RETRYABLE_UPSTREAM_ERROR_CODES.has(code);
+}
+
 export function makeForwarder(opts: ForwarderOpts): Forwarder {
   const log = (opts.logger ?? rootLogger).child({ subsys: "egressForwarder" });
   const base = new URL(opts.controlBaseUrl);
+  const retryBudgetMs = Math.max(0, opts.retryBudgetMs ?? DEFAULT_FORWARDER_RETRY_BUDGET_MS);
+  const retryDelaysMs =
+    opts.retryDelaysMs && opts.retryDelaysMs.length > 0
+      ? opts.retryDelaysMs
+      : DEFAULT_FORWARDER_RETRY_DELAYS_MS;
+  const maxRetryBodyBytes = Math.max(
+    0,
+    opts.maxRetryBodyBytes ?? DEFAULT_FORWARDER_MAX_RETRY_BODY_BYTES,
+  );
 
   return function forward(req, res, peerIp) {
     const path = req.url ?? "";
@@ -84,16 +115,64 @@ export function makeForwarder(opts: ForwarderOpts): Forwarder {
     }
     headers[EGRESS_PEER_IP_HEADER] = peerIp;
 
-    const up = httpRequest(
-      {
-        protocol: base.protocol,
-        hostname: base.hostname,
-        port: base.port,
-        method: req.method,
-        path,
-        headers,
-      },
-      (upRes) => {
+    let aborted = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let currentUp: ReturnType<typeof httpRequest> | null = null;
+
+    const cleanupTimer = (): void => {
+      if (retryTimer !== null) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+    };
+
+    const cancel = (): void => {
+      if (aborted) return;
+      aborted = true;
+      cleanupTimer();
+      try {
+        currentUp?.destroy();
+      } catch {
+        /* */
+      }
+      currentUp = null;
+    };
+
+    req.once("aborted", cancel);
+    res.once("close", () => {
+      if (!res.writableFinished) cancel();
+    });
+
+    const writeUpstreamError = (err: Error): void => {
+      log.warn("forward_upstream_error", { path: path.split("?")[0], err: err.message });
+      if (aborted || res.destroyed) return;
+      if (!res.headersSent) {
+        res.statusCode = 503;
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
+        res.end(
+          JSON.stringify({
+            error: { code: "EGRESS_UPSTREAM_DOWN", message: "master control plane unavailable" },
+          }),
+        );
+      } else {
+        try {
+          res.destroy();
+        } catch {
+          /* */
+        }
+      }
+    };
+
+    const attachUpstreamResponse = (
+      up: ReturnType<typeof httpRequest>,
+      onResponse: () => void,
+    ): void => {
+      up.on("response", (upRes) => {
+        onResponse();
+        if (aborted || res.destroyed) {
+          upRes.resume();
+          return;
+        }
         res.statusCode = upRes.statusCode ?? 502;
         for (const [k, v] of Object.entries(upRes.headers)) {
           if (v === undefined || HOP_BY_HOP.has(k.toLowerCase())) continue;
@@ -111,29 +190,167 @@ export function makeForwarder(opts: ForwarderOpts): Forwarder {
             /* */
           }
         });
-      },
-    );
-    up.on("error", (err) => {
-      log.warn("forward_upstream_error", { path: path.split("?")[0], err: err.message });
-      if (!res.headersSent) {
-        res.statusCode = 503;
-        res.setHeader("Content-Type", "application/json; charset=utf-8");
-        res.end(JSON.stringify({ error: { code: "EGRESS_UPSTREAM_DOWN", message: "master control plane unavailable" } }));
-      } else {
-        try {
-          res.destroy();
-        } catch {
-          /* */
+      });
+    };
+
+    const streamDirect = (prefetchedChunks?: Buffer[]): void => {
+      if (aborted) return;
+      const up = httpRequest({
+        protocol: base.protocol,
+        hostname: base.hostname,
+        port: base.port,
+        method: req.method,
+        path,
+        headers,
+      });
+      currentUp = up;
+      attachUpstreamResponse(up, () => {
+        /* response headers committed */
+      });
+      up.on("error", (err) => {
+        if (aborted) return;
+        writeUpstreamError(err);
+      });
+      if (prefetchedChunks) {
+        for (const chunk of prefetchedChunks) {
+          if (chunk.length > 0) up.write(chunk);
         }
       }
-    });
-    req.pipe(up);
-    req.on("error", () => {
-      try {
-        up.destroy();
-      } catch {
-        /* */
+      req.pipe(up);
+      req.on("error", cancel);
+    };
+
+    const sendBuffered = (body: Buffer): void => {
+      if (aborted) return;
+      const attemptHeaders: Record<string, string | string[]> = { ...headers };
+      const method = (req.method ?? "GET").toUpperCase();
+      const safeAfterConnect = isSafeRetryMethodAfterConnect(method);
+      if (body.length > 0 || (method !== "GET" && method !== "HEAD" && method !== "DELETE")) {
+        delete attemptHeaders["content-length"];
+        delete attemptHeaders["Content-Length"];
+        attemptHeaders["content-length"] = String(body.length);
       }
-    });
+      const deadline = Date.now() + retryBudgetMs;
+      let attemptIdx = 0;
+
+      const dial = (): void => {
+        if (aborted || res.destroyed) return;
+        let responseStarted = false;
+        let socketConnected = false;
+        const up = httpRequest({
+          protocol: base.protocol,
+          hostname: base.hostname,
+          port: base.port,
+          method: req.method,
+          path,
+          headers: attemptHeaders,
+          agent: false,
+        });
+        currentUp = up;
+        up.once("socket", (sock) => {
+          if (!sock.connecting) {
+            socketConnected = true;
+          } else {
+            sock.once("connect", () => {
+              socketConnected = true;
+            });
+          }
+        });
+        attachUpstreamResponse(up, () => {
+          responseStarted = true;
+        });
+        up.on("error", (err) => {
+          if (aborted || res.destroyed) return;
+          const remaining = deadline - Date.now();
+          const errCode = (err as NodeJS.ErrnoException).code;
+          // Pre-connect failure (ECONNREFUSED or error before TCP connect) proves zero bytes
+          // reached upstream -> safe to retry any method. After TCP connect, ECONNRESET/EPIPE
+          // has an ambiguous outcome -> retry ONLY RFC-safe methods (GET/HEAD/OPTIONS), never
+          // non-safe methods (POST/PUT/PATCH/DELETE) even with Idempotency-Key.
+          const preConnectFailure = !socketConnected || errCode === "ECONNREFUSED";
+          if (
+            !responseStarted &&
+            !res.headersSent &&
+            retryBudgetMs > 0 &&
+            remaining > 0 &&
+            isRetryableUpstreamError(err) &&
+            (preConnectFailure || safeAfterConnect)
+          ) {
+            const delay = retryDelaysMs[Math.min(attemptIdx, retryDelaysMs.length - 1)]!;
+            attemptIdx += 1;
+            const waitMs = Math.min(delay, remaining);
+            retryTimer = setTimeout(() => {
+              retryTimer = null;
+              dial();
+            }, waitMs);
+            retryTimer.unref?.();
+            return;
+          }
+          writeUpstreamError(err);
+        });
+        if (body.length > 0) up.write(body);
+        up.end();
+      };
+
+      dial();
+    };
+
+    const method = (req.method ?? "GET").toUpperCase();
+    const rawContentLength = req.headers["content-length"];
+    const declaredLength =
+      typeof rawContentLength === "string" && /^[0-9]+$/.test(rawContentLength.trim())
+        ? Number(rawContentLength.trim())
+        : null;
+    const hasTransferEncoding = req.headers["transfer-encoding"] !== undefined;
+
+    if (retryBudgetMs <= 0 || maxRetryBodyBytes <= 0) {
+      streamDirect();
+      return;
+    }
+    if (declaredLength !== null && declaredLength > maxRetryBodyBytes) {
+      streamDirect();
+      return;
+    }
+    if (
+      (method === "GET" || method === "HEAD") &&
+      !hasTransferEncoding &&
+      (declaredLength === null || declaredLength === 0)
+    ) {
+      sendBuffered(Buffer.alloc(0));
+      return;
+    }
+
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    let handedOff = false;
+
+    const onData = (chunk: Buffer | string): void => {
+      if (aborted || handedOff) return;
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      totalBytes += buf.length;
+      chunks.push(buf);
+      if (totalBytes > maxRetryBodyBytes) {
+        handedOff = true;
+        req.off("data", onData);
+        req.off("end", onEnd);
+        req.off("error", onReqError);
+        streamDirect(chunks);
+      }
+    };
+    const onEnd = (): void => {
+      if (aborted || handedOff) return;
+      handedOff = true;
+      req.off("data", onData);
+      req.off("error", onReqError);
+      sendBuffered(chunks.length === 0 ? Buffer.alloc(0) : Buffer.concat(chunks, totalBytes));
+    };
+    const onReqError = (): void => {
+      handedOff = true;
+      cancel();
+    };
+
+    req.on("data", onData);
+    req.once("end", onEnd);
+    req.once("error", onReqError);
   };
 }

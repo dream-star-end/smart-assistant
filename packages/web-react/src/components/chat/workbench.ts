@@ -16,8 +16,28 @@ import { parseWebSearchSources } from "../tool/webSearchHits";
 import { resolveToolStatus } from "../tool/status";
 import { type FileChange, collectFileChanges } from "./workPane";
 import type { WorkTurn } from "./workTurns";
+import {
+  DELIVERABLE_CATEGORY_LABEL,
+  DELIVERABLE_CATEGORY_ORDER,
+  type CategoryCount,
+  type DeliverableCategory,
+  type DeliverableFormat,
+  type DeliverableMeta,
+  classifyDeliverable,
+  summarizeDeliverableCategories,
+} from "./deliverablePreview";
 
-export { type WorkTurn, collectWorkTurns, turnIndexOf } from "./workTurns";
+export { type WorkTurn, collectWorkTurns, formatStepSummary, formatWorkTurnTitle, turnIndexOf } from "./workTurns";
+export {
+  DELIVERABLE_CATEGORY_LABEL,
+  DELIVERABLE_CATEGORY_ORDER,
+  classifyDeliverable,
+  summarizeDeliverableCategories,
+  type CategoryCount,
+  type DeliverableCategory,
+  type DeliverableFormat,
+  type DeliverableMeta,
+};
 
 // ── 产出 ────────────────────────────────────────────────────────────────
 
@@ -102,11 +122,42 @@ function mediaKindOf(path: string): OutputMedia["kind"] | null {
   return null;
 }
 
-// 回答里的容器文件路径:与聊天区 MarkdownImpl 同口径 —— 行内 code 里的任意容器绝对路径,
-// 纯文本只认 openclaude 生成 / 上传目录(避免句子里普通 "/x" 误判)。
+// 回答里的容器文件路径:与聊天区 MarkdownImpl 同口径 —— 行内 code 里的容器绝对路径,
+// 但严格过滤构建静态碎片（如 /assets/styles-1VWWTp9J.css）、宿主机/系统不可读目录与内部缓存。
 const INLINE_CODE_RE = /`([^`\n]+)`/g;
 const TEXT_PATH_RE = /(?:\/(?:home\/agent|root)\/\.openclaude)\/[^\s"'`<>，。、；：）)】」]+\.[A-Za-z0-9]{1,10}/g;
 const URL_RE = /https?:\/\/[^\s"'`<>)\]）】」，。]+/g;
+
+// 明显不是容器内用户可读交付物的静态构建路径 / 宿主机路径 / 系统路径前缀
+const GHOST_PATH_PREFIX_RE =
+  /^\/(?:api|assets|static|public|_next|__vite|@vite|@fs|chunks|media|opt|var|run|proc|sys|dev|etc|usr|bin|sbin|lib|lib64|boot|mnt|srv|snap|home\/agent\/\.local|home\/agent\/\.cache|root\/\.local|root\/\.cache)(?:\/|$)/i;
+const GHOST_PATH_SEGMENT_RE =
+  /(?:^|\/)(?:\.git|node_modules|\.playwright-cli|\.vite|\.next|\.nuxt|__pycache__|\.cache|dist\/assets|build\/assets)(?:\/|$)/i;
+const HASHED_ASSET_FILE_RE =
+  /(?:^|\/)(?:(?:styles|index|main|app|vendor|chunk|runtime|bundle|polyfill|entry)[\w-]*-[A-Za-z0-9_-]{6,}\.(?:css|js|mjs|cjs|map)|[^/]+\.(?:js|css)\.map|[^/]+\.map|favicon\.ico|robots\.txt|sitemap\.xml|manifest\.json|sw\.js|service-worker\.js)$/i;
+const STATIC_ASSET_URL_RE =
+  /\/assets\/|\.(?:css|js|mjs|cjs|map|woff2?|ttf|eot|otf|ico)(?:[?#]|$)/i;
+
+/**
+ * 判断回答文本中提取出的绝对路径是否是容器内真实可读的用户交付物路径。
+ * 严格过滤 `/assets/styles-*.css`、`/assets/index-*.js`、`/opt/openclaude/...`、`/var/lib/docker/...`、
+ * `/run/...`、`/etc/...`、`/proc/...`、`node_modules/...` 等幽灵路径或宿主机/系统路径。
+ */
+export function isDeliverableAnswerPath(raw: string): boolean {
+  const s = raw.trim();
+  if (!s.startsWith("/") || s.startsWith("//") || /\s/.test(s)) return false;
+  if (!/\.[A-Za-z0-9]{1,10}$/.test(s)) return false;
+  if (GHOST_PATH_PREFIX_RE.test(s)) return false;
+  if (GHOST_PATH_SEGMENT_RE.test(s)) return false;
+  if (HASHED_ASSET_FILE_RE.test(s)) return false;
+  return true;
+}
+
+/** 判断容器回环 URL 是否适合展示在「本机预览」（排除静态构建资源 URL，如 http://127.0.0.1:.../assets/styles-*.css）。 */
+export function isPreviewPageUrl(url: string): boolean {
+  if (!isContainerPreviewUrl(url)) return false;
+  return !STATIC_ASSET_URL_RE.test(url);
+}
 
 function answerRefs(text: string): { paths: string[]; urls: string[] } {
   const paths: string[] = [];
@@ -114,9 +165,11 @@ function answerRefs(text: string): { paths: string[]; urls: string[] } {
   for (const m of text.matchAll(INLINE_CODE_RE)) {
     const s = m[1].trim();
     if (/^https?:\/\//i.test(s)) urls.push(s);
-    else if (s.startsWith("/") && !s.startsWith("//") && !s.startsWith("/api/") && !/\s/.test(s) && /\.[A-Za-z0-9]{1,10}$/.test(s)) paths.push(s);
+    else if (isDeliverableAnswerPath(s)) paths.push(s);
   }
-  for (const m of text.matchAll(TEXT_PATH_RE)) paths.push(m[0]);
+  for (const m of text.matchAll(TEXT_PATH_RE)) {
+    if (isDeliverableAnswerPath(m[0])) paths.push(m[0]);
+  }
   for (const m of text.matchAll(URL_RE)) urls.push(m[0].replace(/[.,;:!?]+$/, ""));
   return { paths, urls };
 }
@@ -197,7 +250,7 @@ export function collectTurnOutputs(turn: WorkTurn): TurnOutputs {
     }
     for (const u of urls) {
       if (isContainerPreviewUrl(u)) {
-        if (seenLinks.has(u)) continue;
+        if (!isPreviewPageUrl(u) || seenLinks.has(u)) continue;
         seenLinks.add(u);
         links.push({ url: u, label: u.replace(/^https?:\/\//i, "") });
       } else {
@@ -222,6 +275,20 @@ export function collectTurnOutputs(turn: WorkTurn): TurnOutputs {
 
 export function outputCount(o: TurnOutputs): number {
   return o.files.length + o.media.length + o.links.length;
+}
+
+/** 汇总本轮所有成功代码变更的总新增/删除行数，供 Codex 文件目录总览头部展示。 */
+export function turnTotalLineCounts(files: readonly OutputFile[]): { added: number; removed: number; hasCounts: boolean } {
+  let added = 0;
+  let removed = 0;
+  let hasCounts = false;
+  for (const f of files) {
+    if (!f.change || f.change.hasCounts === false) continue;
+    added += f.change.added;
+    removed += f.change.removed;
+    hasCounts = true;
+  }
+  return { added, removed, hasCounts };
 }
 
 // ── 主产物 ──────────────────────────────────────────────────────────────
@@ -378,4 +445,59 @@ export function formatDuration(ms: number): string {
   const m = Math.floor(s / 60);
   if (m < 60) return `${m} 分 ${s % 60} 秒`;
   return `${Math.floor(m / 60)} 小时 ${m % 60} 分`;
+}
+
+export type OutputFileGroup = {
+  category: DeliverableCategory;
+  label: string;
+  files: OutputFile[];
+};
+
+/** 将本轮产出文件按交付物类型（幻灯片 / 表格 / 文档 / PDF / 网页 / 代码 / 文件）归组。 */
+export function groupOutputFiles(files: readonly OutputFile[]): OutputFileGroup[] {
+  const map = new Map<DeliverableCategory, OutputFile[]>();
+  for (const f of files) {
+    const cat = classifyDeliverable(f.path).category;
+    const list = map.get(cat);
+    if (list) list.push(f);
+    else map.set(cat, [f]);
+  }
+  const out: OutputFileGroup[] = [];
+  for (const category of DELIVERABLE_CATEGORY_ORDER) {
+    const list = map.get(category);
+    if (list && list.length > 0) {
+      out.push({ category, label: DELIVERABLE_CATEGORY_LABEL[category], files: list });
+    }
+  }
+  return out;
+}
+
+function normalizePathForMatch(p: string): string {
+  return p.replace(/\\/g, "/").replace(/\/+$/, "").trim();
+}
+
+/** 判断两个交付物路径是否指向同一文件（完全一致、或相对/工作区前缀后缀一致）。 */
+export function matchesOutputPath(candidate: string, target: string): boolean {
+  const a = normalizePathForMatch(candidate);
+  const b = normalizePathForMatch(target);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (a.endsWith(`/${b}`) || b.endsWith(`/${a}`)) return true;
+  return false;
+}
+
+/** 在多轮会话中按最新优先查找包含目标路径（文件或媒体）的轮次下标；找不到返回 -1。 */
+export function findTurnIndexForPath(turns: readonly WorkTurn[], targetPath: string): number {
+  const norm = normalizePathForMatch(targetPath);
+  if (!norm) return -1;
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const out = collectTurnOutputs(turns[i]);
+    if (
+      out.files.some((f) => matchesOutputPath(f.path, norm)) ||
+      out.media.some((m) => matchesOutputPath(m.src, norm))
+    ) {
+      return i;
+    }
+  }
+  return -1;
 }

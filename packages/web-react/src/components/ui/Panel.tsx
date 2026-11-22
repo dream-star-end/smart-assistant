@@ -131,7 +131,7 @@ export function EmptyState({
     return (
       <div data-empty-state="" className="px-4 py-2">
         <div className="pt-2 md:pt-4">
-          <p className="text-[14px] font-semibold leading-5 text-fg">{title}</p>
+          <p className="text-sm font-semibold leading-5 text-fg">{title}</p>
           {hint && <p className="mt-1 max-w-[46ch] text-body text-muted">{hint}</p>}
           {action && <div className="mt-4 flex flex-wrap items-center gap-2">{action}</div>}
         </div>
@@ -139,12 +139,12 @@ export function EmptyState({
     )
   }
   return (
-    <div className="flex flex-col items-center gap-2.5 px-5 py-12 text-center">
-      <span className="flex size-11 items-center justify-center rounded-xl bg-accent-soft text-accent">
-        <Icon size={20} />
+    <div className="flex flex-col items-center gap-3 px-5 py-12 text-center">
+      <span className="oc-icon-badge oc-icon-badge-accent size-12 rounded-xl">
+        <Icon size={21} strokeWidth={1.8} />
       </span>
-      <p className="text-section font-medium text-fg">{title}</p>
-      {hint && <p className="max-w-[19rem] text-meta text-muted">{hint}</p>}
+      <p className="text-section font-semibold tracking-tight text-fg">{title}</p>
+      {hint && <p className="max-w-[19rem] text-meta leading-relaxed text-muted">{hint}</p>}
       {action && <div className="mt-1">{action}</div>}
     </div>
   )

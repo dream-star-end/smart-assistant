@@ -42,6 +42,10 @@ master_local_gate_id_for_job() { # <C.* job id> -> manifest gate id
     C.system-executor) printf 'system-executor-fencing' ;;
     C.host-log-policy) printf 'host-log-policy' ;;
     C.model-policy)    printf 'model-policy-recovery' ;;
+    C.codex-chatgpt-ws) printf 'codex-chatgpt-ws' ;;
+    C.platform-tool-proofs) printf 'platform-tool-proofs' ;;
+    C.terminal-unproven) printf 'terminal-unproven' ;;
+    C.upload-retention) printf 'upload-retention-http' ;;
     C.architecture)    printf 'architecture' ;;
     *) return 1 ;;
   esac

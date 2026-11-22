@@ -16,7 +16,7 @@ class RecoverySubscriber extends EventEmitter {
   terminate(): void { this.close() }
 }
 type Endpoint = Awaited<ReturnType<ResolveContainerEndpoint>>
-export type StartRecoveryBridge = (user: WebSocket, uid: bigint, endpoint: Endpoint, socket: WebSocket, abort: AbortController, connId: string) => void
+export type StartRecoveryBridge = (user: WebSocket, uid: bigint, endpoint: Endpoint, socket: WebSocket, abort: AbortController, connId: string) => void | Promise<void>
 
 export async function rebuildContainerLink(input: {
   carrier: LinkCarrier; rows: LinkDispatch[]; signal: AbortSignal
@@ -46,7 +46,8 @@ export async function rebuildContainerLink(input: {
     for (const row of input.rows) handle.restoreDispatch(row)
     if (!handle.hasOpenDispatches && !handle.keepAlive) { socket.terminate(); return 'attached' }
     const user = new RecoverySubscriber()
-    input.start(user as unknown as WebSocket, uid, endpoint, socket, abort, connId)
+    await input.start(user as unknown as WebSocket, uid, endpoint, socket, abort, connId)
+    if (signal.aborted || links.stopping) throw new Error('container link recovery stopped')
     // Existing cleanup detaches timers/executors while retaining open streams.
     user.close()
     const opened = new Promise<void>((resolve, reject) => {

@@ -101,10 +101,10 @@ export const Checkbox = forwardRef<HTMLInputElement, CheckboxProps>(function Che
           aria-describedby={describedBy}
           data-ui="checkbox"
           className={cn(
-            "peer size-4 shrink-0 cursor-pointer appearance-none rounded-[5px] border border-border-strong bg-surface outline-none transition-colors duration-150 ease-standard",
-            "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg",
+            "oc-checkbox-box peer size-4 shrink-0 cursor-pointer appearance-none rounded-xs border border-border-strong bg-surface outline-none transition-[background-color,border-color,box-shadow,transform] duration-150 ease-spring active:scale-95",
+            "hover:border-accent/65 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg",
             "checked:border-accent checked:bg-accent indeterminate:border-accent indeterminate:bg-accent",
-            "disabled:cursor-not-allowed",
+            "disabled:cursor-not-allowed disabled:active:scale-100",
           )}
           {...props}
         />
@@ -113,13 +113,13 @@ export const Checkbox = forwardRef<HTMLInputElement, CheckboxProps>(function Che
           <Minus
             aria-hidden="true"
             strokeWidth={3}
-            className="pointer-events-none absolute hidden size-3 text-accent-fg peer-indeterminate:block"
+            className="pointer-events-none absolute hidden size-3 text-accent-fg transition-transform duration-150 ease-spring peer-indeterminate:block"
           />
         ) : (
           <Check
             aria-hidden="true"
             strokeWidth={3}
-            className="pointer-events-none absolute hidden size-3 text-accent-fg peer-checked:block"
+            className="pointer-events-none absolute hidden size-3 text-accent-fg transition-transform duration-150 ease-spring peer-checked:block"
           />
         )}
       </span>

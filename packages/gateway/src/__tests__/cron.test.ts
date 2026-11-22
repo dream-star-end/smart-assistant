@@ -575,67 +575,141 @@ describe('deriveCronIndexPayload — 唤醒索引只计用户任务', () => {
   })
 })
 
-describe('CronScheduler.runJob — 合成首帧非 codex 路由字段补齐', () => {
-  // codex 计费旁路封堵的对偶面:cron 进程内直接派发、绕过 master bridge 计费编排,
-  // host 平台 agent(main)又无 per-user 计费主体 → 落 codex 会被 CODEX_BILLING_GUARD
-  // 100% fail-closed 拒。runJob 必须把"解析为 codex 的 cron"改路由到显式非 codex 模型,
-  // 并把 model 路由字段同点传入 getOrCreate(决定 runner engine)+ submit(路由字段)。
-  //
-  // MAJOR-1 routable 自检:降级前 resolveSyntheticTurnModel 会自检兜底模型可路由性。测试进程
-  // 非容器,需注入 host 静态 provider seam(等价 commercial 已装配 OpenCode Go key;合成兜底
-  // 现为 deepseek-v4-flash),否则 gate 判"不可路由"→ 不降级。
-  beforeEach(() => setHostStaticProviderKeys({ opencodego: 'og-key' }))
-  afterEach(() => setHostStaticProviderKeys(null))
-  type SubmitCall = { model: unknown }
+describe('CronScheduler.runJob — 显式 model/effort 与严禁黑盒静默降级 (OCV5-825)', () => {
+  type SubmitCall = { model: unknown; effort: unknown }
+  const savedExempt = process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS
+  const savedAuthority = process.env.OC_MODEL_AUTHORITY
+
+  beforeEach(() => {
+    delete process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS
+    delete process.env.OC_MODEL_AUTHORITY
+    setHostStaticProviderKeys({ opencodego: 'og-key' })
+  })
+  afterEach(() => {
+    setHostStaticProviderKeys(null)
+    if (savedExempt === undefined) delete process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS
+    else process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = savedExempt
+    if (savedAuthority === undefined) delete process.env.OC_MODEL_AUTHORITY
+    else process.env.OC_MODEL_AUTHORITY = savedAuthority
+  })
+
   function makeSchedulerWithSpies(defaultModel: string): {
     sched: InstanceType<typeof CronScheduler>
     getOrCreateOpts: any[]
     submitCalls: SubmitCall[]
+    delivered: string[]
   } {
     const getOrCreateOpts: any[] = []
     const submitCalls: SubmitCall[] = []
+    const delivered: string[] = []
     const sessions = {
       getOrCreate: async (opts: any) => {
         getOrCreateOpts.push(opts)
         return { sessionKey: opts.sessionKey } as any
       },
       // submit 签名:(session, textOrBlocks, onEvent, effortLevel?, model?, ...)
-      submit: async (_s: any, _t: any, _cb: any, _effort?: any, model?: any) => {
-        submitCalls.push({ model })
-        // 不 emit 任何 block → output 为空 → runJob 跳过投递(不触 onDeliver)。
+      submit: async (_s: any, _t: any, _cb: any, effort?: any, model?: any) => {
+        submitCalls.push({ model, effort })
       },
       destroySession: async () => {},
     }
     const config = { defaults: { model: defaultModel } } as any
-    const sched = new CronScheduler(config, sessions as any, () => {})
-    return { sched, getOrCreateOpts, submitCalls }
+    const sched = new CronScheduler(config, sessions as any, (text: string) => {
+      delivered.push(text)
+    })
+    return { sched, getOrCreateOpts, submitCalls, delivered }
   }
 
-  const job = { id: 'heartbeat', schedule: '13 */4 * * *', prompt: 'ping', enabled: true, heartbeat: true } as any
+  const heartbeatJob = { id: 'heartbeat', schedule: '13 */4 * * *', prompt: 'ping', enabled: true, heartbeat: true } as any
+  const userJob = { id: 'remind-u1', schedule: '13 */4 * * *', prompt: 'ping', enabled: true, label: 'Codex日报' } as any
 
-  it('codex 默认(agent 无 model + defaults=gpt-5.6-sol)→ getOrCreate+submit 均带非 codex 兜底模型', async () => {
-    const { sched, getOrCreateOpts, submitCalls } = makeSchedulerWithSpies('gpt-5.6-sol')
-    const outcome = await (sched as any).runJob(job, { id: 'main' }, NOOP_CRON_DURABILITY)
+  it('未豁免且落 codex 默认 → 返回显式可读错误，绝不静默降级为 deepseek-v4-flash', async () => {
+    const { sched, getOrCreateOpts, submitCalls, delivered } = makeSchedulerWithSpies('gpt-5.6-sol')
+    const outcome = await (sched as any).runJob(userJob, { id: 'main' }, NOOP_CRON_DURABILITY)
+    assert.deepEqual(outcome, { kind: 'terminal_failure', code: 'CRON_ENGINE_UNSUPPORTED' })
+    assert.equal(getOrCreateOpts.length, 0, '严禁静默降级后偷偷启动 runner')
+    assert.equal(submitCalls.length, 0, '严禁静默降级后偷偷提交 turn')
+    assert.equal(delivered.length, 1, '用户发起的任务必须收到显式可读错误提示')
+    assert.match(delivered[0]!, /gpt-5\.6-sol/)
+    assert.match(delivered[0]!, /Codex日报/)
+  })
+
+  it('agent 显式 gpt-5.6-sol 且未豁免 → 同样显式报错，绝不偷换模型', async () => {
+    const { sched, getOrCreateOpts, submitCalls } = makeSchedulerWithSpies('glm-5.2')
+    const outcome = await (sched as any).runJob(heartbeatJob, { id: 'main', model: 'gpt-5.6-sol' }, NOOP_CRON_DURABILITY)
+    assert.deepEqual(outcome, { kind: 'terminal_failure', code: 'CRON_ENGINE_UNSUPPORTED' })
+    assert.equal(getOrCreateOpts.length, 0)
+    assert.equal(submitCalls.length, 0)
+  })
+
+  it('selfhost 豁免门开启(OC_SELFHOST_ENGINE_LOCAL_TURNS=1)→ 原样运行显式 Codex 模型与 effort，零降级', async () => {
+    process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = '1'
+    const { sched, getOrCreateOpts, submitCalls } = makeSchedulerWithSpies('glm-5.2')
+    const explicitJob = { ...userJob, model: 'gpt-5.6-sol', effort: 'high' }
+    const outcome = await (sched as any).runJob(explicitJob, { id: 'main' }, NOOP_CRON_DURABILITY)
     assert.deepEqual(outcome, { kind: 'terminal_failure', code: 'EMPTY_OUTPUT' })
     assert.equal(getOrCreateOpts.length, 1)
-    assert.equal(getOrCreateOpts[0].model, 'deepseek-v4-flash', 'getOrCreate 必须收到非 codex 模型(runner engine 决定点)')
+    assert.equal(getOrCreateOpts[0].model, 'gpt-5.6-sol')
     assert.equal(submitCalls.length, 1)
-    assert.equal(submitCalls[0].model, 'deepseek-v4-flash', 'submit 必须带同源 model 路由字段')
+    assert.equal(submitCalls[0].model, 'gpt-5.6-sol')
+    assert.equal(submitCalls[0].effort, 'high')
   })
 
-  it('agent 显式 gpt-5.6-sol(codex)→ 同样替换为非 codex 兜底', async () => {
-    const { sched, getOrCreateOpts, submitCalls } = makeSchedulerWithSpies('glm-5.2')
-    await (sched as any).runJob(job, { id: 'main', model: 'gpt-5.6-sol' }, NOOP_CRON_DURABILITY)
+  it('显式指定受支持的非 codex model + effort → 覆盖默认并透传到 getOrCreate 与 submit', async () => {
+    const { sched, getOrCreateOpts, submitCalls } = makeSchedulerWithSpies('gpt-5.6-sol')
+    const explicitJob = { ...userJob, model: 'deepseek-v4-flash', effort: 'medium' }
+    const outcome = await (sched as any).runJob(explicitJob, { id: 'main', model: 'gpt-5.6-sol' }, NOOP_CRON_DURABILITY)
+    assert.deepEqual(outcome, { kind: 'terminal_failure', code: 'EMPTY_OUTPUT' })
     assert.equal(getOrCreateOpts[0].model, 'deepseek-v4-flash')
     assert.equal(submitCalls[0].model, 'deepseek-v4-flash')
+    assert.equal(submitCalls[0].effort, 'medium')
   })
 
-  it('非 codex agent(glm-5.2)→ 不覆盖(getOrCreate 不带 model,submit model=undefined)', async () => {
+  it('向后兼容旧 job JSON 无 model/effort：非 codex agent(glm-5.2)→ 不覆盖(getOrCreate 不带 model,submit model/effort=undefined)', async () => {
     const { sched, getOrCreateOpts, submitCalls } = makeSchedulerWithSpies('gpt-5.6-sol')
-    await (sched as any).runJob(job, { id: 'x', model: 'glm-5.2' }, NOOP_CRON_DURABILITY)
-    // 尊重原配置:getOrCreate 不注入 model 键(沿用 agent 默认),submit model 为 undefined。
-    assert.equal('model' in getOrCreateOpts[0], false, '非 codex 不应注入 model override')
+    await (sched as any).runJob(heartbeatJob, { id: 'x', model: 'glm-5.2' }, NOOP_CRON_DURABILITY)
+    assert.equal('model' in getOrCreateOpts[0], false, '非 codex 且未显式指定 model 时不应注入 model override')
     assert.equal(submitCalls[0].model, undefined)
+    assert.equal(submitCalls[0].effort, undefined)
+  })
+
+  it('B4: origin-session 与 model/effort 冲突 → addJob 拒收，已存冲突作业在触发前可见拒跑且不消费执行边界', async () => {
+    const { sched, getOrCreateOpts, submitCalls, delivered } = makeSchedulerWithSpies('glm-5.2')
+    let originFired = 0
+    let consumed = 0
+    ;(sched as any).onOriginSessionFire = async () => {
+      originFired++
+      return { kind: 'injected' }
+    }
+    const conflictJob = {
+      id: 'remind-origin-conflict',
+      schedule: '*/10 * * * *',
+      agent: 'main',
+      prompt: 'follow up',
+      enabled: true,
+      label: '原会话冲突测试',
+      resume: 'origin-session',
+      sourceSessionKey: 'agent:main:webchat:dm:sess-1',
+      model: 'glm-5.3',
+    } as any
+
+    await assert.rejects(
+      sched.addJob(conflictJob),
+      /origin-session/,
+      'addJob 必须拒绝 origin-session 同时携带 model/effort',
+    )
+
+    const outcome = await (sched as any).runJob(conflictJob, { id: 'main' }, {
+      ...NOOP_CRON_DURABILITY,
+      consumeOccurrence: async () => { consumed++ },
+    })
+    assert.deepEqual(outcome, { kind: 'terminal_failure', code: 'CRON_ORIGIN_MODEL_CONFLICT' })
+    assert.equal(originFired, 0, '冲突作业绝不能触发 origin-session 注入')
+    assert.equal(consumed, 0, '冲突作业必须在消费 occurrence 之前拒跑')
+    assert.equal(getOrCreateOpts.length, 0)
+    assert.equal(submitCalls.length, 0)
+    assert.equal(delivered.length, 1)
+    assert.match(delivered[0]!, /origin-session/)
   })
 })
 

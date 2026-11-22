@@ -1,3 +1,4 @@
+import { CheckCircle2, ExternalLink, Laptop } from "lucide-react";
 import { useRef, useState } from "react";
 import { BrandMark } from "./BrandMark";
 import { Alert, Button } from "./ui";
@@ -113,14 +114,14 @@ export function DesktopEnrollPage({ auth }: { auth: AuthSession }) {
       <div className="flex min-h-full items-center justify-center px-5 py-12">
         <main className="w-full max-w-[420px] animate-in">
           <div className="mb-7 flex flex-col items-center text-center">
-            <BrandMark className="mb-4 size-12" fontSize="text-[24px]" />
-            <h1 className="text-[22px] font-semibold tracking-tight text-fg">确认这台电脑</h1>
+            <BrandMark className="mb-4 size-12" fontSize="text-2xl" />
+            <h1 className="text-2xl font-semibold tracking-tight text-fg">确认这台电脑</h1>
             <p className="mt-1.5 text-title text-muted">
               {BRAND.nameEn} · {BRAND.tagline}
             </p>
           </div>
 
-          <div className="flex flex-col gap-4 rounded-xl border border-border bg-surface p-5 shadow-soft">
+          <div className="oc-surface-card flex flex-col gap-4 rounded-2xl p-6">
             {!enrollmentId ? (
               // 只有一句「链接无效」会把人卡在卡片里:说清怎么办 + 给一个出口。
               <Alert
@@ -134,25 +135,51 @@ export function DesktopEnrollPage({ auth }: { auth: AuthSession }) {
                 链接无效，请回到 {BRAND.nameEn} 里重新发起「本地模式」登记。
               </Alert>
             ) : phase === "returning" ? (
-              <>
-                <p role="status" className="text-body text-fg">
-                  正在返回 {BRAND.nameEn}…
-                </p>
+              <div className="flex flex-col gap-4">
+                <div className="oc-callout oc-callout-success flex items-center gap-3 rounded-lg p-3.5">
+                  <span className="oc-icon-badge oc-icon-badge-success h-8 w-8 rounded-sm" aria-hidden>
+                    <CheckCircle2 size={16} strokeWidth={1.75} />
+                  </span>
+                  <p role="status" className="text-body font-medium text-fg">
+                    正在返回 {BRAND.nameEn}…
+                  </p>
+                </div>
                 <Button type="button" variant="primary" className="w-full" onClick={reopenApp}>
+                  <ExternalLink size={14} strokeWidth={1.75} />
                   打开 {BRAND.nameEn}
                 </Button>
-              </>
+              </div>
             ) : phase === "done-no-link" ? (
-              <p role="status" className="text-body text-fg">
-                确认成功，请回到应用继续。
-              </p>
+              <div className="oc-callout oc-callout-success flex items-center gap-3 rounded-lg p-3.5">
+                <span className="oc-icon-badge oc-icon-badge-success h-8 w-8 rounded-sm" aria-hidden>
+                  <CheckCircle2 size={16} strokeWidth={1.75} />
+                </span>
+                <p role="status" className="text-body font-medium text-fg">
+                  确认成功，请回到应用继续。
+                </p>
+              </div>
             ) : (
               <>
-                <p className="text-body leading-6 text-fg">
-                  {BRAND.nameEn} 想把这台电脑注册为你的本地运行环境
-                </p>
+                <div className="flex items-start gap-3">
+                  <span className="oc-icon-badge oc-icon-badge-accent h-9 w-9 rounded-md" aria-hidden>
+                    <Laptop size={18} strokeWidth={1.75} />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-body font-medium leading-6 text-fg">
+                      {BRAND.nameEn} 想把这台电脑注册为你的本地运行环境
+                    </p>
+                    <p className="mt-0.5 text-caption text-muted">
+                      确认后仅授权本机客户端与你的账号建立安全连接。
+                    </p>
+                  </div>
+                </div>
                 {publicName ? (
-                  <p className="text-body text-muted">计算机名：{publicName}</p>
+                  <div className="oc-surface-recessed flex items-center justify-between gap-2 rounded-lg px-3.5 py-2.5">
+                    <span className="text-caption font-medium text-muted">设备标识</span>
+                    <p className="truncate font-mono text-meta font-medium text-fg">
+                      计算机名：{publicName}
+                    </p>
+                  </div>
                 ) : null}
                 {error ? (
                   // 设备上限的「去设置解绑」出口:网页端目前没有设备管理页(解绑走桌面端),
@@ -172,7 +199,13 @@ export function DesktopEnrollPage({ auth }: { auth: AuthSession }) {
                   >
                     确认这台电脑
                   </Button>
-                  <Button type="button" variant="secondary" className="w-full" disabled={busy} onClick={cancel}>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    className="w-full"
+                    disabled={busy}
+                    onClick={cancel}
+                  >
                     取消
                   </Button>
                 </div>

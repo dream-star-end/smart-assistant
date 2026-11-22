@@ -18,7 +18,7 @@
   --st-trk-music: #3dbe7e;
   --st-trk-sub: #b9a8ff;
   --st-trk-sfx: #ffb36b;
-  --st-skeleton: #ececf2;
+  --st-skeleton: var(--skeleton);
   --st-sh-soft: 0 1px 2px rgba(17, 17, 26, 0.04), 0 4px 16px rgba(17, 17, 26, 0.06);
   --st-sh-float: 0 2px 6px rgba(17, 17, 26, 0.05), 0 14px 40px rgba(17, 17, 26, 0.1);
   --st-sh-stage: 0 30px 80px -24px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.04);
@@ -32,7 +32,6 @@
 }
 .dark .studio-root {
   --st-agent-ink: #c7ff64;
-  --st-skeleton: #22222b;
   --st-sh-soft: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 16px rgba(0, 0, 0, 0.25);
   --st-sh-float: 0 2px 6px rgba(0, 0, 0, 0.3), 0 14px 40px rgba(0, 0, 0, 0.4);
 }
@@ -112,7 +111,7 @@
 .st-btn-primary {
   background: var(--accent);
   border-color: transparent;
-  color: #fff;
+  color: var(--accent-fg);
 }
 .st-btn-ghost {
   background: transparent;
@@ -316,7 +315,7 @@
 }
 .st-steps a[aria-current="page"] .n {
   background: var(--accent);
-  color: #fff;
+  color: var(--accent-fg);
 }
 /* the director's step: done steps get a tick colour, the working one a live ring */
 .st-steps a[data-step="done"] .n {
@@ -1374,7 +1373,7 @@ fieldset.st-seg {
   height: 30px;
   border-radius: 50%;
   background: var(--accent);
-  color: #fff;
+  color: var(--accent-fg);
   display: grid;
   place-items: center;
 }
@@ -2202,7 +2201,7 @@ fieldset.st-versions {
 }
 .st-play.on {
   background: var(--accent);
-  color: #fff;
+  color: var(--accent-fg);
 }
 .st-play:disabled {
   opacity: 0.4;
@@ -2744,7 +2743,7 @@ output.st-chip {
 }
 .st-track-play.on {
   background: var(--accent);
-  color: #fff;
+  color: var(--accent-fg);
 }
 .st-track-name {
   min-width: 0;

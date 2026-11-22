@@ -40,6 +40,10 @@ import {
   SkillDraftStore,
   isPlatformReservedSkillName,
   parseSkillEvalsJson,
+  paths,
+  recordLocalSkillSearchHits,
+  recordLocalSkillView,
+  searchArchivedSkills,
   searchSkillMetadata,
   serializeSkillEvals,
   syncMarketplaceHub,
@@ -110,7 +114,12 @@ import {
   handleTaskList,
   handleTaskUpdate,
 } from './taskboardMcp.js'
-import { SKILL_PROPOSE_TOOL, TOOLS, normalizeAskUserQuestions } from './toolDefs.js'
+import { REMOTE_SWARM_TOOLS, SKILL_PROPOSE_TOOL, TOOLS, normalizeAskUserQuestions } from './toolDefs.js'
+import {
+  handleRemoteSwarmTool,
+  isRemoteSwarmEnabled,
+  isRemoteSwarmToolName,
+} from './remoteSwarmMcp.js'
 import {
   createPresentOptionsCallBudget,
   handlePresentOptions,
@@ -218,12 +227,12 @@ const server = new Server(
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   // Training session REMOVES authoritative-write tools (only skill_propose drafts).
-  let base = SKILL_TRAIN_RUN_ID
+  let base: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> = SKILL_TRAIN_RUN_ID
     ? [
         ...TOOLS.filter((t) => t.name !== 'skill_save' && t.name !== 'skill_delete'),
         SKILL_PROPOSE_TOOL,
       ]
-    : TOOLS
+    : [...TOOLS]
   // ask_user 默认不暴露(Cursor 已改走正文 ```options 围栏)。仅当
   // OC_ASK_USER_MCP=1 且本进程是 Cursor 主会话时才恢复暴露。
   // discovery 过滤不是授权边界,CallTool 侧还有短路兜底。
@@ -247,6 +256,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   // CallTool repeats the check; oc_bash never passes the read-only allowlist.
   if (!isLocalCliToolEnabled(ENGINE_ID)) {
     base = base.filter((t) => !isLocalCliToolName(t.name) || (ADVISOR_READ_ONLY && isAdvisorReadOnlyMcpTool(t.name)))
+  }
+  if (isRemoteSwarmEnabled() && !ADVISOR_READ_ONLY && !SKILL_EVAL_MODE) {
+    base = [...base, ...REMOTE_SWARM_TOOLS]
   }
   // Cursor's normal consult transport is Bash. Ask mode removes shell tools,
   // so this turn must retain the same authenticated no-tools consult over MCP.
@@ -285,7 +297,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     // Discovery filtering is not an authorization boundary: an MCP client can
     // still call a hidden tool by name. Reject before any gateway request,
     // persistent write, or delegation starts.
-    if (SKILL_EVAL_MODE && isSkillEvalBlockedTool(name)) {
+    if (SKILL_EVAL_MODE && (isSkillEvalBlockedTool(name) || isRemoteSwarmToolName(name))) {
       return toolError(`tool "${name}" is disabled in eval sessions`)
     }
     if (isCursorHiddenDelegateTool(name) && !(ADVISOR_READ_ONLY && name === 'consult_advisor')) {
@@ -353,6 +365,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleOcGrep(args)
       case 'oc_glob':
         return await handleOcGlob(args)
+      case 'swarm':
+      case 'post_message':
+      case 'read_board':
+      case 'swarm_wait':
+        return await handleRemoteSwarmTool(name, args as Record<string, unknown> | undefined)
       case 'ask_user':
         return await handleAskUser(args as any)
       case 'present_options': {
@@ -487,6 +504,10 @@ async function handleSkillSearch(args: { query: string; limit?: number } | undef
     // If none of the ranked names map back to a known skill, treat as a miss
     // and fall through to keyword rather than emitting an empty "Found N".
     if (matched.length > 0) {
+      await recordLocalSkillSearchHits(
+        matched.map(({ r }) => r.name),
+        'user',
+      ).catch(() => {})
       const lines = [`Found ${matched.length} relevant skill(s) for "${query}" (semantic):`, '']
       for (const { r, s } of matched) {
         lines.push(`### ${r.name} [source: ${s!.source}, relevance: ${r.score.toFixed(3)}]`)
@@ -503,21 +524,38 @@ async function handleSkillSearch(args: { query: string; limit?: number } | undef
 
   const hits = searchSkillMetadata(list, query, args?.limit)
   if (hits.length === 0) {
+    const archivedHits = await searchArchivedSkills(paths.sharedSkillsDir, query, 3, {
+      agentId: AGENT_ID,
+    }).catch(() => [])
+    const baseLines = [
+      `No matching skills found for "${query}".`,
+      'Try a broader query or call `skill_list()` to browse all available skills.',
+      'If this was a reusable workflow you just validated, create it with `skill_save` after the task is complete.',
+    ]
+    if (archivedHits.length > 0) {
+      baseLines.push(
+        '',
+        'Archived skills that match this topic (previously auto-archived due to inactivity; can be restored anytime via Archived Records or `/api/skills/archive/restore`):',
+        ...archivedHits.map(
+          (h) => `- **${h.target}** — ${h.description || h.snippet || h.reason} (id: ${h.id})`,
+        ),
+      )
+    }
     return {
       content: [
         {
           type: 'text',
-          text: [
-            `No matching skills found for "${query}".`,
-            'Try a broader query or call `skill_list()` to browse all available skills.',
-            'If this was a reusable workflow you just validated, create it with `skill_save` after the task is complete.',
-          ].join('\n'),
+          text: baseLines.join('\n'),
         },
       ],
     }
   }
 
   const lines = [`Found ${hits.length} matching skill(s) for "${query}":`, '']
+  await recordLocalSkillSearchHits(
+    hits.map((s) => s.name),
+    'user',
+  ).catch(() => {})
   for (const s of hits) {
     lines.push(`### ${s.name} [source: ${s.source}, score: ${s.score}]`)
     lines.push(s.description)
@@ -540,11 +578,14 @@ async function handleSkillView(args: { name: string; subfile?: string }) {
   const v = await skills.view(args.name, args.subfile)
   if (!v) return toolError('skill not found')
   if (typeof v === 'string') {
+    await recordLocalSkillView(args.name, 'user').catch(() => {})
     // Subfile read returns a bare string; we have no source metadata here without
     // a second lookup, but the containing skill_view call can be assumed to land
     // in whichever root actually owned the parent name (baseline-wins).
     return { content: [{ type: 'text', text: v }] }
   }
+  const usageLayer = v.layer === 'hub' ? 'hub' : v.source === 'platform' ? 'platform' : 'user'
+  await recordLocalSkillView(args.name, usageLayer).catch(() => {})
   const header = `[source: ${v.source}]`
   return { content: [{ type: 'text', text: `${header}\n\n${v.rawContent}` }] }
 }
@@ -650,7 +691,26 @@ async function handleSkillSave(rawArgs: unknown) {
     args.body,
   )
   if (!r.ok) return toolError(r.error ?? 'save failed')
-  return toolOk(`Saved skill "${args.name}".`)
+  const notices: string[] = []
+  const bodyBytes = Buffer.byteLength(args.body, 'utf8')
+  if (bodyBytes > 16 * 1024) {
+    notices.push(
+      `Notice: SKILL.md body is ${(bodyBytes / 1024).toFixed(1)} KB (>16 KB). Split detailed reference tables, examples, or long scripts into \`references/\` files so tier-2 loading stays compact.`,
+    )
+  }
+  try {
+    const activeUserSkills = (await skills.list({ includePlatform: false })).length
+    if (activeUserSkills > 60) {
+      notices.push(
+        `Notice: You now have ${activeUserSkills} active user skills (>60). Consider merging overlapping skills or archiving unused cold skills via Manage Center -> Skills Archive to keep context clean.`,
+      )
+    }
+  } catch {
+    // fail-open guardrail
+  }
+  return toolOk(
+    notices.length > 0 ? `Saved skill "${args.name}".\n\n${notices.join('\n')}` : `Saved skill "${args.name}".`,
+  )
 }
 
 async function handleSkillDelete(args: { name: string }) {

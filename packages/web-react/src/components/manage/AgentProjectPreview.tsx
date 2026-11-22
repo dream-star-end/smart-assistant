@@ -1,3 +1,4 @@
+import { Eye, Layers } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { useProjectScope } from '../../hooks/useProjectScope'
 import { apiErrorMessage } from '../../lib/api'
@@ -5,7 +6,7 @@ import { formatBytes } from '../../lib/chat/download'
 import { isWorkScope } from '../../lib/projectScope'
 import { taskboardApi } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
-import { Alert, Button, ListSkeleton } from '../ui'
+import { Alert, Badge, Button, ListSkeleton } from '../ui'
 
 /**
  * 注入槽的用户可读名。后端槽名是实现词（instructions / memories / skills），
@@ -72,23 +73,36 @@ export function AgentProjectPreview({ auth, agentId }: { auth: AuthSession; agen
   const enabled = preview?.enabled !== false
 
   return (
-    <div data-testid="agent-project-preview" className="border-t border-border">
+    <div data-testid="agent-project-preview" className="border-t border-border/80">
       {/* 小节标题,不是页面标题:PanelHeader 在手机管理中心里只留给读屏,这里必须一直可见。 */}
-      <div className="px-4 pb-2 pt-5">
-        <h4 className="text-[14px] font-semibold leading-5 text-fg">智能体会带着这些项目信息开始对话</h4>
-        <p className="mt-0.5 text-meta text-muted">只展示注入了哪些内容和大小，不展示原文。</p>
+      <div className="flex items-start gap-2.5 px-4 pb-3 pt-5">
+        <span className="oc-icon-badge oc-icon-badge-accent mt-0.5 size-7 shrink-0 rounded-lg" aria-hidden="true">
+          <Eye size={14} strokeWidth={1.75} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <h4 className="text-section font-semibold leading-5 tracking-tight text-fg">
+            智能体会带着这些项目信息开始对话
+          </h4>
+          <p className="mt-0.5 text-meta text-muted">只展示注入了哪些内容和大小，不展示原文。</p>
+        </div>
       </div>
       {loading ? (
-        <div className="px-4 pb-3">
+        <div className="px-4 pb-4">
           <ListSkeleton rows={3} />
         </div>
       ) : err ? (
-        <div className="px-4 pb-3">
+        <div className="px-4 pb-4">
           <Alert
             tone="danger"
             density="compact"
+            className="oc-callout oc-callout-danger rounded-xl"
             action={
-              <Button size="sm" variant="secondary" onClick={reload}>
+              <Button
+                size="sm"
+                variant="secondary"
+                className="oc-btn-tactile oc-btn-secondary-craft"
+                onClick={reload}
+              >
                 重试
               </Button>
             }
@@ -97,25 +111,45 @@ export function AgentProjectPreview({ auth, agentId }: { auth: AuthSession; agen
           </Alert>
         </div>
       ) : !enabled ? (
-        <p className="px-4 pb-3 text-caption text-muted">该项目关闭了上下文注入。</p>
+        <div className="px-4 pb-4">
+          <p className="oc-surface-recessed rounded-xl px-3.5 py-2.5 text-caption text-muted">
+            该项目关闭了上下文注入。
+          </p>
+        </div>
       ) : slots.length === 0 ? (
-        <p className="px-4 pb-3 text-caption text-muted">这个项目还没有会注入的内容。</p>
+        <div className="px-4 pb-4">
+          <p className="oc-surface-recessed rounded-xl px-3.5 py-2.5 text-caption text-muted">
+            这个项目还没有会注入的内容。
+          </p>
+        </div>
       ) : (
-        <ul className="flex flex-col gap-1 px-4 pb-3 text-caption text-muted">
-          {slots.map((s) => (
-            <li key={s.name} className="flex flex-wrap items-center gap-x-1.5">
-              <span className="text-fg">{slotLabel(s.name)}</span>
-              <span aria-hidden="true">·</span>
-              <span className="tabular-nums">{formatBytes(s.bytes) || '大小未知'}</span>
-              {s.redacted ? (
-                <>
-                  <span aria-hidden="true">·</span>
-                  <span>已脱敏</span>
-                </>
-              ) : null}
-            </li>
-          ))}
-        </ul>
+        <div className="px-4 pb-4">
+          <ul className="oc-list oc-surface-card overflow-hidden rounded-xl bg-surface">
+            {slots.map((s) => (
+              <li
+                key={s.name}
+                className="oc-list-row flex flex-wrap items-center justify-between gap-2 px-3.5 py-2.5 text-caption text-muted"
+              >
+                <span className="flex min-w-0 items-center gap-2.5">
+                  <span className="oc-icon-badge size-6 shrink-0 rounded-md" aria-hidden="true">
+                    <Layers size={12} strokeWidth={1.75} />
+                  </span>
+                  <span className="truncate text-body font-medium text-fg">{slotLabel(s.name)}</span>
+                </span>
+                <span className="flex shrink-0 items-center gap-2">
+                  {s.redacted ? (
+                    <Badge tone="info" size="sm" className="oc-badge-craft">
+                      已脱敏
+                    </Badge>
+                  ) : null}
+                  <span className="oc-surface-recessed rounded-md px-2 py-0.5 text-caption font-medium tabular-nums text-muted">
+                    {formatBytes(s.bytes) || '大小未知'}
+                  </span>
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
     </div>
   )

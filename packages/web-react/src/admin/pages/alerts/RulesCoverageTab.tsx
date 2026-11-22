@@ -1,9 +1,9 @@
-import { AlertTriangle, RefreshCw } from "lucide-react";
+import { Activity, AlertTriangle, RefreshCw, ShieldCheck } from "lucide-react";
 import { useMemo } from "react";
 import { Badge, Button, useToast } from "../../../components/ui";
 import { type Column, DataTable, LevelBadge, SectionCard, TimeAgo } from "../../components";
 import { ApiError, adminGet, adminSend } from "../../lib/adminApi";
-import { SEVERITY_TONE, TRIGGER_HINT, TRIGGER_LABEL, groupLabel, orderedGroups } from "./constants";
+import { TRIGGER_HINT, TRIGGER_LABEL, groupLabel, orderedGroups } from "./constants";
 import { type Reloadable, useReloadable } from "./useReloadable";
 import type { CoverageRow, RuleStateRow } from "./types";
 import { errText } from "./util";
@@ -46,7 +46,7 @@ function RuleStatesSection({ query }: { query: Reloadable<{ rows: RuleStateRow[]
       render: (r) => (
         <span className="flex items-center gap-2">
           {r.classification === "firing" && !r.acked && <span className="size-1.5 shrink-0 rounded-full bg-danger" />}
-          <span className="font-mono text-meta">{r.rule_id}</span>
+          <span className="font-mono text-meta font-medium text-fg">{r.rule_id}</span>
         </span>
       ),
     },
@@ -75,7 +75,7 @@ function RuleStatesSection({ query }: { query: Reloadable<{ rows: RuleStateRow[]
         if (r.classification !== "firing") return <span className="text-faint">—</span>;
         if (r.acked)
           return (
-            <span className="text-meta">
+            <span className="text-meta tabular-nums">
               #{r.acked_by ?? "?"}{" "}
               {r.acked_at && <span className="text-faint">(<TimeAgo value={r.acked_at} />)</span>}
             </span>
@@ -92,13 +92,13 @@ function RuleStatesSection({ query }: { query: Reloadable<{ rows: RuleStateRow[]
       key: "last_transition_at",
       title: "最近翻转",
       width: 96,
-      render: (r) => (r.last_transition_at ? <TimeAgo value={r.last_transition_at} /> : "—"),
+      render: (r) => (r.last_transition_at ? <TimeAgo value={r.last_transition_at} className="tabular-nums" /> : "—"),
     },
     {
       key: "last_evaluated_at",
       title: "最近评估",
       width: 96,
-      render: (r) => (r.last_evaluated_at ? <TimeAgo value={r.last_evaluated_at} /> : "—"),
+      render: (r) => (r.last_evaluated_at ? <TimeAgo value={r.last_evaluated_at} className="tabular-nums" /> : "—"),
     },
     {
       key: "last_payload",
@@ -119,7 +119,7 @@ function RuleStatesSection({ query }: { query: Reloadable<{ rows: RuleStateRow[]
       align: "right",
       render: (r) =>
         r.classification === "firing" && !r.acked ? (
-          <Button variant="secondary" size="sm" onClick={() => onAck(r)}>
+          <Button variant="secondary" size="sm" onClick={() => onAck(r)} className="oc-btn-tactile">
             确认
           </Button>
         ) : null,
@@ -130,18 +130,25 @@ function RuleStatesSection({ query }: { query: Reloadable<{ rows: RuleStateRow[]
     <SectionCard
       title="规则状态"
       hint="FIRING 当前异常 · RECOVERED 已恢复 · STALE 长时间未评估 · HEALTHY 当前健康"
+      icon={Activity}
+      iconTone="accent"
       action={
-        <Button variant="secondary" size="sm" onClick={reload} disabled={loading}>
+        <Button variant="secondary" size="sm" onClick={reload} disabled={loading} className="oc-btn-tactile">
           <RefreshCw size={14} className={loading ? "animate-spin" : undefined} /> 刷新
         </Button>
       }
       bodyClassName="p-0"
     >
       {error ? (
-        <div className="px-5 py-4 text-body text-danger">加载规则状态失败: {errText(error)}</div>
+        <div className="p-4">
+          <div className="oc-callout oc-callout-danger flex items-center gap-2 rounded-xl px-4 py-3 text-body text-danger">
+            <AlertTriangle size={15} className="shrink-0" />
+            加载规则状态失败: {errText(error)}
+          </div>
+        </div>
       ) : (
         <DataTable
-          className="rounded-none border-0"
+          className="rounded-none border-0 shadow-none"
           columns={columns}
           rows={rows}
           rowKey={(r) => r.rule_id}
@@ -176,14 +183,19 @@ function CoverageSection() {
     <SectionCard
       title="事件覆盖矩阵"
       hint="事件目录 × 通道订阅 —— 谁能收、可否投递、最近一次入队"
+      icon={ShieldCheck}
+      iconTone={orphanCount > 0 ? "warning" : "success"}
       action={
-        <Button variant="secondary" size="sm" onClick={reload} disabled={loading}>
+        <Button variant="secondary" size="sm" onClick={reload} disabled={loading} className="oc-btn-tactile">
           <RefreshCw size={14} className={loading ? "animate-spin" : undefined} /> 刷新
         </Button>
       }
     >
       {error ? (
-        <div className="text-body text-danger">加载覆盖矩阵失败: {errText(error)}</div>
+        <div className="oc-callout oc-callout-danger flex items-center gap-2 rounded-xl px-4 py-3 text-body text-danger">
+          <AlertTriangle size={15} className="shrink-0" />
+          加载覆盖矩阵失败: {errText(error)}
+        </div>
       ) : loading && rows.length === 0 ? (
         <div className="text-body text-faint">加载中…</div>
       ) : rows.length === 0 ? (
@@ -191,8 +203,8 @@ function CoverageSection() {
       ) : (
         <div className="flex flex-col gap-5">
           {orphanCount > 0 && (
-            <div className="flex items-center gap-2 rounded-lg border border-warning/40 bg-warning-soft px-3 py-2.5 text-meta text-warning">
-              <AlertTriangle size={15} className="shrink-0" />
+            <div className="oc-callout oc-callout-warning flex items-start gap-2.5 rounded-xl px-4 py-3 text-meta leading-relaxed text-warning">
+              <AlertTriangle size={15} className="mt-0.5 shrink-0" />
               <span>
                 有 <strong className="tabular-nums">{orphanCount}</strong> 个事件<strong>没有主动通道订阅</strong>
                 ，仅会写入管理员站内信兜底；如需及时主动送达，请新增或编辑通道订阅。
@@ -215,7 +227,7 @@ function CoverageGroup({ group, rows }: { group: string; rows: CoverageRow[] }) 
       title: "事件",
       render: (r) => (
         <div>
-          <div className="font-mono text-meta text-fg">{r.event_type}</div>
+          <div className="font-mono text-meta font-medium text-fg">{r.event_type}</div>
           {r.description && <div className="text-caption text-faint">{r.description}</div>}
         </div>
       ),
@@ -242,7 +254,7 @@ function CoverageGroup({ group, rows }: { group: string; rows: CoverageRow[] }) 
             0
           </Badge>
         ) : (
-          <span className="tabular-nums">{r.subscriber_count}</span>
+          <span className="tabular-nums font-medium">{r.subscriber_count}</span>
         ),
     },
     {
@@ -258,7 +270,7 @@ function CoverageGroup({ group, rows }: { group: string; rows: CoverageRow[] }) 
             </Badge>
           );
         }
-        return <span className="tabular-nums">{r.deliverable_count}</span>;
+        return <span className="tabular-nums font-medium">{r.deliverable_count}</span>;
       },
     },
     {
@@ -267,7 +279,7 @@ function CoverageGroup({ group, rows }: { group: string; rows: CoverageRow[] }) 
       width: 96,
       render: (r) =>
         r.last_fired_at ? (
-          <span title={r.last_severity ? `最近 severity: ${r.last_severity}` : undefined}>
+          <span title={r.last_severity ? `最近 severity: ${r.last_severity}` : undefined} className="tabular-nums">
             <TimeAgo value={r.last_fired_at} />
           </span>
         ) : (
@@ -278,9 +290,12 @@ function CoverageGroup({ group, rows }: { group: string; rows: CoverageRow[] }) 
 
   return (
     <div>
-      <h4 className="mb-2 text-meta font-semibold text-fg">
-        {groupLabel(group)} <span className="font-normal text-faint">({rows.length})</span>
-      </h4>
+      <div className="mb-2.5 flex items-center gap-2">
+        <h4 className="text-body font-semibold text-fg">{groupLabel(group)}</h4>
+        <Badge tone="neutral" className="tabular-nums">
+          {rows.length}
+        </Badge>
+      </div>
       <DataTable columns={columns} rows={rows} rowKey={(r) => r.event_type} />
     </div>
   );

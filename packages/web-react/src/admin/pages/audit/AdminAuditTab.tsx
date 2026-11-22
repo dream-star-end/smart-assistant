@@ -1,4 +1,4 @@
-import { RotateCw } from "lucide-react";
+import { AlertTriangle, RotateCw, ScrollText } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Badge, Button, Input, Modal, useToast } from "../../../components/ui";
 import {
@@ -7,10 +7,11 @@ import {
   DataTable,
   FilterBar,
   KeyValue,
+  SectionCard,
   TimeAgo,
 } from "../../components";
 import { adminGet, apiErrorMessage } from "../../lib/adminApi";
-import { buildDiffRows, FormatJsonValue } from "./diff";
+import { buildDiffRows, DiffTable } from "./diff";
 
 const PAGE_SIZE = 100;
 
@@ -53,70 +54,44 @@ function DiffBody({ row }: { row: AdminAuditRow }) {
   return (
     <div className="flex flex-col gap-4">
       {/* 元信息 */}
-      <div className="rounded-lg border border-border bg-surface px-4 py-2">
-        <KeyValue label="动作" value={<Badge tone="neutral">{row.action}</Badge>} />
+      <div className="oc-surface-recessed divide-y divide-border/60 rounded-xl px-4 py-1">
+        <KeyValue label="动作" value={<Badge tone="accent">{row.action}</Badge>} />
         <KeyValue
           label="操作者"
-          value={<span className="font-mono text-meta">{row.admin_id}</span>}
+          value={<CopyChip value={row.admin_id} />}
         />
         <KeyValue
           label="对象"
           value={
             row.target ? (
-              <span className="font-mono text-meta break-all">{row.target}</span>
+              <CopyChip value={row.target} />
             ) : (
               <span className="text-faint">—</span>
             )
           }
         />
-        <KeyValue label="IP" value={<span className="font-mono text-meta">{row.ip ?? "—"}</span>} />
+        <KeyValue
+          label="IP"
+          value={<span className="font-mono text-meta tabular-nums">{row.ip ?? "—"}</span>}
+        />
         <KeyValue
           label="User-Agent"
           value={
             <span className="break-all text-meta text-muted">{row.user_agent ?? "—"}</span>
           }
         />
-        <KeyValue label="时间" value={<TimeAgo value={row.created_at} />} />
+        <KeyValue
+          label="时间"
+          value={
+            <span className="tabular-nums">
+              <TimeAgo value={row.created_at} />
+            </span>
+          }
+        />
       </div>
 
-      {/* 并排等宽 JSON 对比 */}
-      <div className="overflow-x-auto rounded-lg border border-border">
-        <table className="w-full table-fixed border-collapse text-sm">
-          <thead>
-            <tr className="border-b border-border bg-surface">
-              <th className="w-28 whitespace-nowrap px-3 py-2 text-left text-meta font-medium text-faint">
-                字段
-              </th>
-              <th className="px-3 py-2 text-left text-meta font-medium text-faint">变更前</th>
-              <th className="px-3 py-2 text-left text-meta font-medium text-faint">变更后</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((d) => (
-              <tr
-                key={d.key}
-                data-testid={`diff-row-${d.key}`}
-                data-changed={String(d.changed)}
-                className={
-                  d.changed
-                    ? "border-b border-border/60 bg-warning-soft last:border-0"
-                    : "border-b border-border/60 last:border-0"
-                }
-              >
-                <td className="px-3 py-2 align-top font-mono text-meta text-muted break-all">
-                  {d.key}
-                </td>
-                <td className="px-3 py-2 align-top text-body text-fg">
-                  <FormatJsonValue value={d.before} />
-                </td>
-                <td className="px-3 py-2 align-top text-body text-fg">
-                  <FormatJsonValue value={d.after} />
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      {/* IDE 级并排等宽 JSON 对比 */}
+      <DiffTable rows={rows} />
     </div>
   );
 }
@@ -238,12 +213,13 @@ export function AdminAuditTab() {
     {
       key: "ip",
       title: "IP",
-      cellClassName: "font-mono text-[12px] text-muted",
+      cellClassName: "font-mono text-meta tabular-nums text-muted",
       render: (r) => r.ip ?? "—",
     },
     {
       key: "created_at",
       title: "时间",
+      cellClassName: "tabular-nums",
       render: (r) => <TimeAgo value={r.created_at} />,
     },
     {
@@ -266,7 +242,7 @@ export function AdminAuditTab() {
   ];
 
   return (
-    <div className="flex flex-col gap-3">
+    <div className="flex flex-col gap-4">
       <FilterBar>
         <Input
           value={dAdmin}
@@ -297,7 +273,7 @@ export function AdminAuditTab() {
             value={dFrom}
             onChange={(e) => setDFrom(e.target.value)}
             onKeyDown={onKey}
-            className="h-9 w-[13.5rem]"
+            className="h-9 w-[13.5rem] tabular-nums"
             aria-label="起始时间"
           />
         </label>
@@ -308,7 +284,7 @@ export function AdminAuditTab() {
             value={dTo}
             onChange={(e) => setDTo(e.target.value)}
             onKeyDown={onKey}
-            className="h-9 w-[13.5rem]"
+            className="h-9 w-[13.5rem] tabular-nums"
             aria-label="结束时间"
           />
         </label>
@@ -324,32 +300,60 @@ export function AdminAuditTab() {
           onClick={() => setReloadTick((t) => t + 1)}
           title="刷新"
           aria-label="刷新"
+          className="oc-icon-btn-tactile"
         >
-          <RotateCw size={15} />
+          <RotateCw size={15} className={loading ? "animate-spin" : undefined} />
         </Button>
       </FilterBar>
 
       {error && (
-        <p className="text-sm text-danger">加载失败：{apiErrorMessage(error, "加载失败")}</p>
-      )}
-
-      <DataTable
-        columns={columns}
-        rows={rows}
-        rowKey={(r) => r.id}
-        loading={loading}
-        onRowClick={(r) => setSelected(r)}
-        emptyTitle="暂无审计记录"
-        emptyHint="调整过滤条件或稍后再试。"
-      />
-
-      {cursor && (
-        <div className="flex justify-center py-1">
-          <Button variant="secondary" size="sm" onClick={loadMore} disabled={loadingMore}>
-            {loadingMore ? "加载中…" : "加载更多"}
-          </Button>
+        <div
+          role="alert"
+          className="oc-callout oc-callout-danger flex items-start gap-3 rounded-xl px-4 py-3 text-body"
+        >
+          <span className="oc-icon-badge oc-icon-badge-danger mt-0.5 size-7 rounded-lg">
+            <AlertTriangle size={14} />
+          </span>
+          <p className="min-w-0 flex-1 text-danger">
+            加载失败：{apiErrorMessage(error, "加载失败")}
+          </p>
         </div>
       )}
+
+      <SectionCard
+        title="管理操作记录"
+        hint="记录后台管理员写操作，点击行或「查看 diff」核对变更前后字段"
+        icon={ScrollText}
+        iconTone="accent"
+        action={
+          !loading && (
+            <span className="oc-badge-craft rounded-full bg-hover px-2.5 py-0.5 font-mono text-caption text-muted tabular-nums">
+              已加载 {rows.length.toLocaleString("zh-CN")} 条
+            </span>
+          )
+        }
+        bodyClassName="p-0"
+      >
+        <DataTable
+          columns={columns}
+          rows={rows}
+          rowKey={(r) => r.id}
+          loading={loading}
+          onRowClick={(r) => setSelected(r)}
+          emptyTitle="暂无审计记录"
+          emptyHint="调整过滤条件或稍后再试。"
+          className="rounded-none border-0 shadow-none"
+          footer={
+            cursor ? (
+              <div className="flex justify-center">
+                <Button variant="secondary" size="sm" onClick={loadMore} disabled={loadingMore}>
+                  {loadingMore ? "加载中…" : "加载更多"}
+                </Button>
+              </div>
+            ) : undefined
+          }
+        />
+      </SectionCard>
 
       <Modal
         open={selected !== null}

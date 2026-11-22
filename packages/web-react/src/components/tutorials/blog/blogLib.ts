@@ -13,11 +13,21 @@ export function blogCategoryLabel(category: CommunityTutorialCategory): string {
   return BLOG_CATEGORIES.find((item) => item.value === category)?.label ?? "通用";
 }
 
-/** 没有封面图时的占位渐变(与设计稿同一组深色底)。 */
+/** 没有封面图时的 Clarvy Atelier 暖中性编辑感底纹（纯语义 Token，明暗主题自适应）。 */
 export const BLOG_PLACEHOLDER_GRADIENT: Record<CommunityTutorialCategory, string> = {
-  coding: "linear-gradient(135deg,#3b1f6b,#2a2f6b)",
-  research: "linear-gradient(135deg,#152442,#2a2f6b)",
-  general: "linear-gradient(135deg,#102b29,#2a2f6b)",
+  coding:
+    "radial-gradient(circle at 84% 18%, color-mix(in srgb, var(--info) 14%, transparent), transparent 56%), linear-gradient(135deg, color-mix(in srgb, var(--info) 8%, var(--bubble)) 0%, color-mix(in srgb, var(--fg) 5%, var(--sidebar)) 100%)",
+  research:
+    "radial-gradient(circle at 84% 18%, color-mix(in srgb, var(--success) 13%, transparent), transparent 56%), linear-gradient(135deg, color-mix(in srgb, var(--success) 8%, var(--bubble)) 0%, color-mix(in srgb, var(--fg) 4%, var(--sidebar)) 100%)",
+  general:
+    "radial-gradient(circle at 84% 18%, color-mix(in srgb, var(--accent) 14%, transparent), transparent 56%), linear-gradient(135deg, color-mix(in srgb, var(--accent) 10%, var(--bubble)) 0%, color-mix(in srgb, var(--warning) 7%, var(--sidebar)) 100%)",
+};
+
+/** 无图占位封面的前景图标色（覆盖 .blog-cover 暗底白字，明暗主题均清晰可辨）。 */
+export const BLOG_PLACEHOLDER_INK: Record<CommunityTutorialCategory, string> = {
+  coding: "color-mix(in srgb, var(--info) 68%, var(--muted))",
+  research: "color-mix(in srgb, var(--success) 68%, var(--muted))",
+  general: "color-mix(in srgb, var(--accent) 72%, var(--muted))",
 };
 
 /** 「10月21日」;跨年时带年份。 */
@@ -43,13 +53,26 @@ export function blogReadMinutes(text: string): number {
   return Math.max(1, Math.ceil([...text].length / 400));
 }
 
-const AVATAR_COLORS = ["#6d4af0", "#0a58d8", "#157044", "#bb202a", "#8a5511", "#7a3fb8", "#0f7b8a"];
+/** 文章阅读量：仅在服务端返回有效非负整数时展示。 */
+export function blogViewCount(item: { viewCount?: number | null } | null | undefined): number | null {
+  const count = item?.viewCount;
+  return typeof count === "number" && Number.isFinite(count) && count >= 0 ? Math.floor(count) : null;
+}
 
-export function blogAvatar(name: string): { initial: string; color: string } {
+const AVATAR_TONES: ReadonlyArray<{ bg: string; fg: string }> = [
+  { bg: "var(--accent-soft)", fg: "var(--accent)" },
+  { bg: "var(--info-soft)", fg: "var(--info)" },
+  { bg: "var(--success-soft)", fg: "var(--success)" },
+  { bg: "var(--warning-soft)", fg: "var(--warning)" },
+  { bg: "var(--bubble)", fg: "var(--fg)" },
+];
+
+export function blogAvatar(name: string): { initial: string; color: string; fg: string } {
   const trimmed = name.trim() || "社";
   let hash = 0;
   for (const ch of trimmed) hash = (hash * 31 + (ch.codePointAt(0) ?? 0)) >>> 0;
-  return { initial: [...trimmed][0]!.toUpperCase(), color: AVATAR_COLORS[hash % AVATAR_COLORS.length]! };
+  const tone = AVATAR_TONES[hash % AVATAR_TONES.length]!;
+  return { initial: [...trimmed][0]!.toUpperCase(), color: tone.bg, fg: tone.fg };
 }
 
 export const BLOG_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
@@ -271,6 +294,51 @@ export function clearBlogDraft(key: string): void {
 
 export function isEmptyDraft(draft: BlogDraft): boolean {
   return !draft.title.trim() && !draft.summary.trim() && !draft.bodyMarkdown.trim();
+}
+
+export type BlogDraftField = "title" | "summary" | "category" | "bodyMarkdown";
+
+export type BlogDraftFieldIssue = {
+  field: BlogDraftField;
+  label: string;
+  message: string;
+};
+
+/** 编辑器内联缺失项清单：用于就地展示，不只藏在提交按钮 title 属性里。 */
+export function blogDraftMissingItems(draft: BlogDraft): BlogDraftFieldIssue[] {
+  const issues: BlogDraftFieldIssue[] = [];
+  const titleLen = draft.title.trim().length;
+  if (titleLen < 4) {
+    issues.push({
+      field: "title",
+      label: "标题",
+      message: titleLen === 0 ? "请填写标题（至少 4 个字）" : `标题还差 ${4 - titleLen} 个字`,
+    });
+  }
+  const summaryLen = draft.summary.trim().length;
+  if (summaryLen < 10) {
+    issues.push({
+      field: "summary",
+      label: "摘要",
+      message: summaryLen === 0 ? "请填写摘要（至少 10 个字）" : `摘要还差 ${10 - summaryLen} 个字`,
+    });
+  }
+  if (!BLOG_CATEGORIES.some((c) => c.value === draft.category)) {
+    issues.push({
+      field: "category",
+      label: "分类",
+      message: "请选择文章分类",
+    });
+  }
+  const bodyLen = draft.bodyMarkdown.trim().length;
+  if (bodyLen < 40) {
+    issues.push({
+      field: "bodyMarkdown",
+      label: "正文",
+      message: bodyLen === 0 ? "请填写正文（至少 40 个字）" : `正文还差 ${40 - bodyLen} 个字`,
+    });
+  }
+  return issues;
 }
 
 // ── 我的投稿状态 ────────────────────────────────────────────────────────

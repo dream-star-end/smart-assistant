@@ -240,9 +240,11 @@ export function pathMatchesExpectedRoot(installRoot: string, expectedRoots: stri
     const expected = path.resolve(root);
     if (normalized === expected) return true;
     if (normalized === `${expected}-live`) return true;
+    if (normalized === `${expected}-slot-A` || normalized === `${expected}-slot-B`) return true;
     if (normalized.startsWith(`${expected}/`)) return true;
     if (normalized.startsWith(`${expected}-releases/`)) return true;
     if (normalized.startsWith(`${expected}-live/`)) return true;
+    if (normalized.startsWith(`${expected}-slot-A/`) || normalized.startsWith(`${expected}-slot-B/`)) return true;
   }
   return false;
 }

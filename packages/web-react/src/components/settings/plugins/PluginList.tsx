@@ -58,22 +58,27 @@ export function PluginRow({
   const known = row.enablementKnown !== false
   const showSwitch = !known || !row.enabled || row.connected !== false
   return (
-    <li className="flex items-center gap-2 border-t border-border first:border-t-0" data-plugin-row={row.key}>
+    <li className="flex items-center gap-2 py-0.5" data-plugin-row={row.key}>
       <button
         type="button"
         onClick={onOpen}
         aria-label={`${row.label}：${row.status}，打开设置`}
-        className="flex min-h-[60px] min-w-0 flex-1 items-center gap-3 rounded-md py-2 pr-1 text-left outline-none hover:bg-hover/60 focus-visible:ring-2 focus-visible:ring-ring"
+        className="group flex min-h-[60px] min-w-0 flex-1 items-center gap-3 rounded-xl px-2 py-2 text-left outline-none transition-colors hover:bg-hover/70 focus-visible:ring-2 focus-visible:ring-ring"
       >
         <CardMark name={row.label} category={BUILTIN_PLUGIN_CATEGORY[row.key]} />
         <span className="flex min-w-0 flex-1 flex-col">
-          <span className="truncate text-body font-medium text-fg">{row.label}</span>
-          <span className={cn('flex items-center gap-1.5 text-meta', row.enabled ? 'text-muted' : 'text-faint')}>
+          <span className="truncate text-body font-semibold text-fg">{row.label}</span>
+          <span className={cn('mt-0.5 flex items-center gap-1.5 text-meta', row.enabled ? 'text-muted' : 'text-faint')}>
             <StatusDot tone={row.enabled ? row.tone : 'neutral'} />
             <span className="truncate">{!known ? '启用状态暂不可用' : row.enabled ? row.status : '已停用'}</span>
           </span>
         </span>
-        <ChevronRight size={16} className="shrink-0 text-faint" aria-hidden />
+        <ChevronRight
+          size={16}
+          strokeWidth={1.75}
+          className="shrink-0 text-faint transition-transform group-hover:translate-x-0.5 group-hover:text-muted"
+          aria-hidden
+        />
       </button>
       {onConnect && <Button size="sm" variant="secondary" onClick={onConnect} aria-label={`连接「${row.label}」`} className="mr-1">连接</Button>}
       {showSwitch && (
@@ -82,7 +87,7 @@ export function PluginRow({
           checked={known && row.enabled}
           disabled={busy}
           onCheckedChange={onToggle}
-          className="mr-1"
+          className="mr-1.5"
         />
       )}
     </li>
@@ -102,12 +107,19 @@ export function PluginDetailBar({
   onToggle: (enabled: boolean) => void
 }) {
   return (
-    <div className="flex items-center gap-2 border-b border-border pb-3" data-testid="plugin-detail-bar">
+    <div
+      className="oc-surface-recessed flex items-center gap-2 rounded-xl px-2.5 py-2"
+      data-testid="plugin-detail-bar"
+    >
       <Button size="sm" variant="ghost" onClick={onBack} aria-label="返回插件列表">
         <ArrowLeft size={15} strokeWidth={1.75} aria-hidden /> 插件
       </Button>
-      <span className="ml-auto text-meta text-faint">{RUNTIME_LABEL[row.runtime]}</span>
-      <span className="text-meta text-muted">{row.enablementKnown === false ? '状态未知' : row.enabled ? '已启用' : '已停用'}</span>
+      <span className="oc-badge-craft ml-auto rounded-full bg-surface px-2 py-0.5 text-caption font-medium text-muted">
+        {RUNTIME_LABEL[row.runtime]}
+      </span>
+      <span className="text-caption font-medium text-muted">
+        {row.enablementKnown === false ? '状态未知' : row.enabled ? '已启用' : '已停用'}
+      </span>
       <Switch aria-label={`启用「${row.label}」`} checked={row.enablementKnown !== false && row.enabled} disabled={busy} onCheckedChange={onToggle} />
     </div>
   )
@@ -116,7 +128,7 @@ export function PluginDetailBar({
 /** 停用时详情页顶部的一句说明（设置仍可改，只是助手暂时用不到）。 */
 export function DisabledNote({ label }: { label: string }) {
   return (
-    <output className="mt-3 block rounded-md bg-hover px-3 py-2 text-meta text-muted">
+    <output className="oc-callout oc-callout-warning mt-3 block rounded-xl px-3.5 py-2.5 text-meta text-muted">
       「{label}」已停用：助手暂时不会调用它，账号和设置都保留；打开右上角开关即可恢复。
     </output>
   )
@@ -124,8 +136,8 @@ export function DisabledNote({ label }: { label: string }) {
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <section className="border-t border-border py-4 first:border-t-0">
-      <h3 className="mb-2 text-meta font-semibold text-muted">{title}</h3>
+    <section className="oc-surface-card rounded-2xl p-4">
+      <h3 className="mb-2.5 text-caption font-semibold uppercase tracking-wider text-faint">{title}</h3>
       {children}
     </section>
   )
@@ -141,16 +153,16 @@ export function LocalPluginDetail({
 }) {
   const login = plugin.auth.login
   return (
-    <div className="flex flex-col" data-connector-card={plugin.name}>
-      <section className="py-4">
+    <div className="mt-3 flex flex-col gap-3" data-connector-card={plugin.name}>
+      <section className="oc-surface-card rounded-2xl p-4">
         <h2 className="text-title font-semibold text-fg">{plugin.displayName}</h2>
-        <p className="mt-1 text-body text-muted">{plugin.description}</p>
-        <p className="mt-2 text-meta text-faint">
+        <p className="mt-1 text-body leading-relaxed text-muted">{plugin.description}</p>
+        <p className="mt-2.5 text-caption text-faint">
           {[`v${plugin.version}`, plugin.author.name, plugin.license].filter(Boolean).join(' · ')}
           {plugin.homepage && (
             <>
               {' · '}
-              <a href={plugin.homepage} target="_blank" rel="noreferrer" className="underline-offset-2 hover:underline">
+              <a href={plugin.homepage} target="_blank" rel="noreferrer" className="text-accent underline-offset-2 hover:underline">
                 项目主页
               </a>
             </>
@@ -160,16 +172,18 @@ export function LocalPluginDetail({
 
       {plugin.useCases.length > 0 && (
         <Section title="可以这样用">
-          <ul className="flex flex-col gap-1.5">
+          <ul className="flex flex-col gap-2">
             {plugin.useCases.map((u) => (
               <li key={u}>
                 {onAskInChat ? (
                   <button
                     type="button"
                     onClick={() => onAskInChat(u)}
-                    className="flex w-full min-h-11 items-center gap-2 rounded-md border border-border px-3 py-2 text-left text-body text-fg hover:bg-hover"
+                    className="oc-btn-tactile oc-surface-recessed flex min-h-11 w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-body text-fg hover:border-accent/35"
                   >
-                    <MessageSquarePlus size={15} className="shrink-0 text-muted" aria-hidden />
+                    <span className="oc-icon-badge oc-icon-badge-accent h-7 w-7 rounded-sm" aria-hidden>
+                      <MessageSquarePlus size={14} strokeWidth={1.75} />
+                    </span>
                     <span className="min-w-0 flex-1">{u}</span>
                   </button>
                 ) : (
@@ -197,13 +211,13 @@ export function LocalPluginDetail({
       </Section>
 
       <Section title="组成">
-        <ul className="flex flex-col gap-1 text-body text-muted">
+        <ul className="flex flex-col gap-1.5 text-body text-muted">
           {plugin.components.skills.map((s) => (
             <li key={s.path}>技能说明：教助手什么时候用、怎么用（{s.path}）</li>
           ))}
           {plugin.components.bin.map((b) => (
             <li key={b.name}>
-              命令 <code className="rounded bg-code px-1 font-mono text-meta">{b.name}</code>
+              命令 <code className="rounded-xs bg-code px-1.5 py-0.5 font-mono text-caption text-fg">{b.name}</code>
               {b.description ? `：${b.description}` : ''}
             </li>
           ))}
@@ -211,7 +225,7 @@ export function LocalPluginDetail({
             <li key={d.path}>数据：{d.description ?? d.path}</li>
           ))}
         </ul>
-        <p className="mt-2 text-meta text-faint">在你自己的容器里运行，登录信息也只保存在你的容器里。</p>
+        <p className="mt-2.5 text-caption text-faint">在你自己的容器里运行，登录信息也只保存在你的容器里。</p>
       </Section>
 
       <Section title="会访问的网站">
@@ -220,7 +234,7 @@ export function LocalPluginDetail({
         ) : (
           <ul className="flex flex-wrap gap-1.5">
             {plugin.permissions.network.map((o) => (
-              <li key={o} className="rounded border border-border px-2 py-0.5 font-mono text-meta text-muted">
+              <li key={o} className="oc-badge-craft rounded-full bg-bg px-2.5 py-0.5 font-mono text-caption text-muted">
                 {o.replace(/^https?:\/\//, '')}
               </li>
             ))}
@@ -237,7 +251,7 @@ export function LocalPluginDetail({
 
       {plugin.disclaimer && (
         <Section title="数据声明">
-          <p className="text-body text-muted">{plugin.disclaimer.text}</p>
+          <p className="text-body leading-relaxed text-muted">{plugin.disclaimer.text}</p>
         </Section>
       )}
     </div>

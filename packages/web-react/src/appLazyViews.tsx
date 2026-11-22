@@ -1,5 +1,6 @@
-import { lazy, useState } from "react";
+import { type ComponentProps, lazy, useState } from "react";
 import { BootSplash } from "./components/BootSplash";
+import { LazyBoundary } from "./components/ChunkErrorBoundary";
 import { readNetworkInformation, shouldPrefetchCenters } from "./lib/prefetchPolicy";
 import { TASKBOARD_ENABLED } from "./lib/taskboardFeature";
 
@@ -11,6 +12,49 @@ import { TASKBOARD_ENABLED } from "./lib/taskboardFeature";
 export const IdentityRecoveryNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.IdentityRecoveryNotice })));
 export const AccountSwitchNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.AccountSwitchNotice })));
 export const AuthGate = lazy(() => import("./components/AuthGate").then((m) => ({ default: m.AuthGate })));
+export const AgentGate = lazy(() => import("./components/AgentGate").then((m) => ({ default: m.AgentGate })));
+const RepoStatusBannerLazy = lazy(() =>
+  import("./components/github/RepoStatusBanner").then((m) => ({ default: m.RepoStatusBanner })),
+);
+const ErrorBannerLazy = lazy(() =>
+  import("./components/ErrorBanner").then((m) => ({ default: m.ErrorBanner })),
+);
+const UpdateBannerLazy = lazy(() =>
+  import("./components/UpdateBanner").then((m) => ({ default: m.UpdateBanner })),
+);
+const BackgroundTurnBannerLazy = lazy(() =>
+  import("./components/chat/BackgroundTurnBanner").then((m) => ({ default: m.BackgroundTurnBanner })),
+);
+const TurnCostReminderLazy = lazy(() =>
+  import("./components/chat/TurnCostReminder").then((m) => ({ default: m.TurnCostReminder })),
+);
+const PinnedHudStackLazy = lazy(() =>
+  import("./components/chat/PinnedHudStack").then((m) => ({ default: m.PinnedHudStack })),
+);
+const AppDialogsLazy = lazy(() =>
+  import("./components/AppDialogs").then((m) => ({ default: m.AppDialogs })),
+);
+export function RepoStatusBanner(props: ComponentProps<typeof RepoStatusBannerLazy>) {
+  return <LazyBoundary fallback={null}><RepoStatusBannerLazy {...props} /></LazyBoundary>;
+}
+export function ErrorBanner(props: ComponentProps<typeof ErrorBannerLazy>) {
+  return <LazyBoundary fallback={null}><ErrorBannerLazy {...props} /></LazyBoundary>;
+}
+export function UpdateBanner() {
+  return <LazyBoundary fallback={null}><UpdateBannerLazy /></LazyBoundary>;
+}
+export function BackgroundTurnBanner(props: ComponentProps<typeof BackgroundTurnBannerLazy>) {
+  return <LazyBoundary fallback={null}><BackgroundTurnBannerLazy {...props} /></LazyBoundary>;
+}
+export function TurnCostReminder(props: ComponentProps<typeof TurnCostReminderLazy>) {
+  return <LazyBoundary fallback={null}><TurnCostReminderLazy {...props} /></LazyBoundary>;
+}
+export function PinnedHudStack(props: ComponentProps<typeof PinnedHudStackLazy>) {
+  return <LazyBoundary fallback={null}><PinnedHudStackLazy {...props} /></LazyBoundary>;
+}
+export function AppDialogs(props: ComponentProps<typeof AppDialogsLazy>) {
+  return <LazyBoundary fallback={null}><AppDialogsLazy {...props} /></LazyBoundary>;
+}
 export const Landing = lazy(() => import("./components/Landing").then((m) => ({ default: m.Landing })));
 export const DesktopEnrollPage = lazy(() =>
   import("./components/DesktopEnrollPage").then((m) => ({ default: m.DesktopEnrollPage })),
@@ -85,7 +129,6 @@ export function prefetchLazyCentersOnIdle(): void {
     // 省流量模式 / 2G 下不在后台下完全部中心(shell 审计 S-16);API 缺席的浏览器照常预取。
     if (!shouldPrefetchCenters(readNetworkInformation())) return;
     void import("./components/AgentPicker").catch(() => {});
-    void import("./components/Landing").catch(() => {});
     void import("./components/SettingsCenter").catch(() => {});
     void import("./components/ManageCenter").catch(() => {});
     void import("./components/MarketplaceCenter").catch(() => {});
@@ -94,6 +137,11 @@ export function prefetchLazyCentersOnIdle(): void {
     void import("./components/MediaTaskCenter").catch(() => {});
     // 全屏图片查看器(含圈选编辑/评论/调整大小)也是懒块:时间线里点图即开,预热后首开零延迟。
     void import("./components/ImageViewer").catch(() => {});
+    void import("./components/chat/PinnedHudStack").catch(() => {});
+    void import("./components/AppDialogs").catch(() => {});
+    void import("./components/lazyModelSelectorPanel")
+      .then((m) => m.preloadModelSelectorPanel())
+      .catch(() => {});
     void import("./components/sites/SitesWorkspaceView").catch(() => {});
     if (TASKBOARD_ENABLED) {
       void import("./components/taskboard/TaskboardView").catch(() => {});

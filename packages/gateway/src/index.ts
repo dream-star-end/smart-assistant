@@ -145,3 +145,46 @@ export {
 // never another package's src path. Keep the public surface intentionally small.
 export { getContentReviewStore } from './contentReviewStore.js'
 export { shouldBanForStrikes, violationInbox } from './contentReviewNotice.js'
+export {
+  BRIDGE_CONTAINER_ID_HEADER,
+  BRIDGE_NONCE_HEADER,
+  BRIDGE_REQ_NONCE_HEADER,
+  BRIDGE_SIG_HEADER,
+  BRIDGE_TS_HEADER,
+  InternalBridgeReplayCache,
+  buildSignedInternalBridgeHeaders,
+  canonicalizeBridgePathAndQuery,
+  computeInternalBridgeRequestSig,
+  verifyInternalBridgeAuth,
+  verifyInternalBridgeAuthDetailed,
+} from './routes/internalBridgeAuth.js'
+export {
+  CONTAINER_PAGE_TOKEN_PREFIX,
+  INTERNAL_OFFICE_PREVIEW_PAGE_PATH,
+  INTERNAL_OFFICE_PREVIEW_PATH,
+} from './routes/officePreviewRoute.js'
+export {
+  INTERNAL_SWARM_COMMAND_PATH,
+  INTERNAL_SWARM_USER_ID_HEADER,
+} from './routes/swarmCommandRoute.js'
+export { SWARM_COMMAND_ROUTE_RE } from './swarmCommand.js'
+export {
+  SESSION_BG_COMMAND_ID_RE,
+  cancelSessionBgCommand,
+  listSessionBgCommands,
+  type CancelSessionBgCommandResult,
+  type SessionBgCommandItem,
+} from './sessionBgCommands.js'
+export {
+  cancelSingleDelegateJob,
+  type CancelSingleDelegateJobResult,
+  type DelegateCancelHost,
+} from './delegateCancel.js'
+export {
+  INTERNAL_SESSION_BG_CMD_CANCEL_RE,
+  INTERNAL_SESSION_BG_STATE_RE,
+  INTERNAL_SESSION_DELEGATE_CANCEL_RE,
+  listSessionOriginCrons,
+  type CronJobsWithMetaReader,
+  type SessionOriginCronItem,
+} from './routes/sessionBackgroundRoute.js'

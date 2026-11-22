@@ -13,7 +13,7 @@ import type { FeedbackContext, CardCallbacks } from "../components/chat/cards";
 import { TASKBOARD_ENABLED } from "../lib/taskboardFeature";
 import type { ToolCardActions, SystemActionCardActions, ChatInteraction, ArtifactInspectTarget } from "../components/tool/context";
 import { isBrowserStepMessage } from "../components/tool/browserDetect";
-import type { PaneTab } from "../components/InspectorPanel";
+import type { LiveBrowserHandoffRequest, PaneTab } from "../components/InspectorPanel";
 import type { ToolLike } from "../components/tool/format";
 import type { ChatMessage } from "../lib/chat/model";
 import { preciseRetryEligible } from "../lib/chat/socket";
@@ -63,17 +63,20 @@ export type ChatCardActionsInput = {
   loadExactUserMessage: (message: ChatMessage) => Promise<ChatMessage | null>;
   messageFeedbackTriggerRef: React.RefObject<HTMLElement | null>;
   newSession: () => void;
+  onCompactSession?: () => void;
   openManage: (tab: ManageTab) => void;
   /** 经验分享开关（feature_community_blog）；关时对话卡只读。 */
   communityBlogEnabled: boolean;
   openBlog: (target: BlogOpenTarget) => void;
-  openPane: (tab?: PaneTab | undefined, message?: ToolLike | null | undefined) => void;
+  openPane: (tab?: PaneTab | undefined, message?: ToolLike | null | undefined, liveBrowser?: LiveBrowserHandoffRequest | undefined) => void;
   openSettings: (section?: SettingsDestinationSection) => void;
+  onOpenSwarmBoard?: ToolCardActions["onOpenSwarmBoard"];
   regenerate: () => Promise<void>;
   send: (text: string, media?: { url?: string | undefined; base64?: string | undefined; mimeType?: string | undefined; filename?: string | undefined; hidden?: boolean | undefined; localSrc?: string | undefined; kind: "image" | "audio" | "video" | "file"; }[] | undefined, imageEdit?: { mode?: "annotated" | "outpaint" | undefined; maskIndex?: number | undefined; targetAspect?: "16:9" | "4:3" | "9:16" | "3:4" | "1:1" | undefined; clientJobId: string; sourceIndex: number; guideIndex: number; width: number; height: number; } | undefined, displayText?: string | undefined, replyTo?: { text: string; messageId: string; role: "user" | "assistant"; } | undefined, target?: { sessionId: string; projectId?: string | null | undefined; } | undefined) => Promise<unknown>;
   sendImplicitRatingRef: React.RefObject<((target: ImplicitTarget, opts: { reason: ImplicitReason; }) => void) | null>;
   sending: boolean;
   setBoardOpen: (open: boolean) => void;
+  setBoardTicketId?: (ticketId: string | null) => void;
   setBusy: React.Dispatch<React.SetStateAction<boolean>>;
   setChatError: React.Dispatch<React.SetStateAction<ChatError | null>>;
   setCollapsed: React.Dispatch<React.SetStateAction<boolean>>;
@@ -103,16 +106,19 @@ export function useChatCardActions({
   loadExactUserMessage,
   messageFeedbackTriggerRef,
   newSession,
+  onCompactSession,
   openManage,
   communityBlogEnabled,
   openBlog,
   openPane,
   openSettings,
+  onOpenSwarmBoard,
   regenerate,
   send,
   sendImplicitRatingRef,
   sending,
   setBoardOpen,
+  setBoardTicketId,
   setBusy,
   setChatError,
   setCollapsed,
@@ -213,6 +219,7 @@ export function useChatCardActions({
       onOpenMemory: () => openManage("memory"),
       onOpenSkills: () => openManage("skills"),
       onOpenTasks: () => openManage("cron"),
+      onOpenSwarmBoard,
       downloadLiteratureArtifact: (id: string) => api.downloadLiteratureArtifact(authRef.current, id),
       literatureArtifactMeta: (id: string) => api.literatureArtifactMeta(authRef.current, id),
       ...(verified ? {
@@ -222,7 +229,12 @@ export function useChatCardActions({
         },
       } : {}),
       ...(TASKBOARD_ENABLED ? {
-        onOpenTaskboard: () => { setCollapsed(false); setBoardOpen(true); },
+        onOpenTaskboard: (identifier?: string) => {
+          setCollapsed(false);
+          const ref = typeof identifier === 'string' ? identifier.trim() : '';
+          if (ref) setBoardTicketId?.(ref);
+          setBoardOpen(true);
+        },
         ...(verified ? {
           taskApproval: {
             getTicket: defer('taskGet'),
@@ -247,7 +259,7 @@ export function useChatCardActions({
         },
       } : {}),
     };
-  }, [demo, systemActions, identity, cardAuth, authRef, openManage, setCollapsed, setBoardOpen, communityBlogEnabled, openBlog]);
+  }, [demo, systemActions, identity, cardAuth, authRef, openManage, setCollapsed, setBoardOpen, setBoardTicketId, communityBlogEnabled, openBlog, onOpenSwarmBoard]);
 
   // 对话交互(```options 选择卡片等):点选即替用户发送。demo 不给发送能力(纯展示),
   // 但带上 reason 让交互块说清「演示模式仅供浏览」,而不是笼统的「此会话中不可交互」(misc-p3 D-08)。
@@ -262,8 +274,9 @@ export function useChatCardActions({
       // 浏览器操作(OCV5-374)进「浏览器」页看截图和整轮操作记录;其余工具进步骤详情。
       open: (t: ArtifactInspectTarget) => openPane(isBrowserStepMessage(t.message) ? "browser" : "steps", t.message),
       openPane: (tab: PaneTab, message?: ToolLike | null) => openPane(tab, message),
+      ...(demo ? {} : { openLiveBrowser: (opts?: LiveBrowserHandoffRequest) => openPane("browser", null, opts) }),
     }),
-    [openPane],
+    [openPane, demo],
   );
 
   // 超长消息在会话里只有占位行(_userPayloadDeferred,text 为空):重试与「编辑 / 修改消息」都先
@@ -377,20 +390,24 @@ export function useChatCardActions({
             setSubscribeOpenSignal((n) => n + 1);
           },
       onStartNewSession: demo ? undefined : newSession,
+      onCompactSession: demo ? undefined : onCompactSession,
       onFeedback,
       onFirstTextPaint: demo
         ? undefined
         : (input) => {
+            const wasHidden = input.wasHidden ?? input.backgroundAtFrame;
             reportClientFriction({
               surface: "webchat",
               stage: "first_text_paint",
-              code: input.backgroundAtFrame
+              code: wasHidden
                 ? "FIRST_TEXT_PAINT_AFTER_BACKGROUND"
                 : "FIRST_TEXT_PAINT",
               outcome: "succeeded",
               latencyMs: input.latencyMs,
               traceId: input.traceId,
               sessionId: input.sessionId,
+              path: input.visibilityPath ?? (wasHidden ? "hidden_at_frame" : "visible"),
+              reason: input.visibilityReason ?? (wasHidden ? "hidden_brief" : "hidden_0s"),
             }, authRef.current?.snapshot().token);
           },
       onTimelineBlank: demo

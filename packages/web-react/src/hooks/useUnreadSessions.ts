@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
-import { resolveSessionStatus } from "../lib/sessionStatus";
+import {
+  publishDesktopNotifyState,
+  registerDesktopNotifyToggle,
+} from "../lib/desktopNotifyPref";
+import { type SessionNeedsYouKind, resolveSessionStatus } from "../lib/sessionStatus";
 import type { AuthSession } from "../lib/types";
 
 const TERMINAL_OUTCOMES = new Set([
@@ -111,14 +115,15 @@ function notifyBody(session: UnreadSessionInput): string {
 function fireNotification(
   session: UnreadSessionInput,
   onOpen?: (sessionId: string) => void,
+  override?: { body: string; tag: string },
 ): void {
   if (!notificationSupported()) return;
   try {
     if (Notification.permission !== "granted") return;
     const n = new Notification(session.title || "会话", {
-      body: notifyBody(session),
+      body: override?.body ?? notifyBody(session),
       // 同一会话的多条通知折叠成一条，点开落点也只有一个。
-      tag: `oc-session-${session.id}`,
+      tag: override?.tag ?? `oc-session-${session.id}`,
     });
     // 点通知此前只 close()：通知没有落点（UUS-01）。现在聚焦窗口并把会话 id 交给上层打开。
     n.onclick = () => {
@@ -133,6 +138,20 @@ function fireNotification(
   } catch {
     /* 权限竞态 / 浏览器策略 */
   }
+}
+
+const TITLE_BADGE_PREFIX_RE = /^\[待拍板 \d+\]\s*/;
+
+function stripTitleBadge(title: string): string {
+  return title.replace(TITLE_BADGE_PREFIX_RE, "");
+}
+
+function setsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a.size !== b.size) return false;
+  for (const id of a) {
+    if (!b.has(id)) return false;
+  }
+  return true;
 }
 
 function shouldMarkActiveRead(session: UnreadSessionInput | undefined): boolean {
@@ -153,8 +172,12 @@ export function useUnreadSessions(args: {
   auth?: AuthSession | null;
   /** 用户点击系统通知：上层据此切到对应会话（App 接 selectSession）。不传则只聚焦窗口。 */
   onNotificationOpen?: (sessionId: string) => void;
+  /** 会话是否处于待拍板状态（权限审批/提问/计划/选项卡）；用于上升沿桌面通知与 document.title 角标。 */
+  sessionNeedsYou?: (sessionId: string) => SessionNeedsYouKind | null | undefined;
+  /** 低频壳层元数据版本号，触发待拍板状态重算而不随流式文本 delta 抖动。 */
+  metaVersion?: number;
 }): UnreadState {
-  const { sessions, activeId, userId, auth } = args;
+  const { sessions, activeId, userId, auth, sessionNeedsYou, metaVersion = 0 } = args;
   const onNotificationOpenRef = useRef(args.onNotificationOpen);
   onNotificationOpenRef.current = args.onNotificationOpen;
 
@@ -167,6 +190,8 @@ export function useUnreadSessions(args: {
   );
 
   const prevRef = useRef<Map<string, Snap> | null>(null);
+  const prevNeedsYouRef = useRef<Map<string, SessionNeedsYouKind> | null>(null);
+  const baseTitleRef = useRef<string | null>(null);
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
   const notifyEnabledRef = useRef(notifyEnabled);
@@ -190,14 +215,15 @@ export function useUnreadSessions(args: {
     for (const s of list) {
       if (s.unread === false) optimisticReadRef.current.delete(s.id);
     }
-    setUnreadIds(next);
+    setUnreadIds((cur) => (setsEqual(cur, next) ? cur : next));
   }, []);
 
   useEffect(() => {
     optimisticReadRef.current = new Set();
     optimisticUnreadRef.current = new Set();
     prevRef.current = null;
-    setUnreadIds(new Set());
+    prevNeedsYouRef.current = null;
+    setUnreadIds((cur) => (cur.size === 0 ? cur : new Set()));
     clearLegacyUnread(userId);
     const perm = readPermission();
     setNotifyPermission(perm);
@@ -329,6 +355,58 @@ export function useUnreadSessions(args: {
     setNotifyEnabledState(enabled);
     writeNotifyEnabled(userIdRef.current, enabled);
   }, []);
+
+  // 将桌面通知开关与授权态桥接到 desktopNotifyPref，供 PreferencesTab / LiveActivityStrip 消费。
+  useEffect(() => {
+    publishDesktopNotifyState({ enabled: notifyEnabled, permission: notifyPermission });
+  }, [notifyEnabled, notifyPermission]);
+
+  useEffect(() => registerDesktopNotifyToggle(setNotifyEnabled), [setNotifyEnabled]);
+
+  // 后台会话进入 needs_you（等待审批/回答）上升沿发系统通知，并同步维护 document.title 角标。
+  useEffect(() => {
+    if (!sessionNeedsYou) return;
+    void metaVersion;
+    const nextNeedsYou = new Map<string, SessionNeedsYouKind>();
+    for (const s of sessions) {
+      const kind = sessionNeedsYou(s.id);
+      if (kind) nextNeedsYou.set(s.id, kind);
+    }
+    const prev = prevNeedsYouRef.current;
+    if (prev) {
+      for (const s of sessions) {
+        const kind = nextNeedsYou.get(s.id);
+        if (!kind || prev.has(s.id)) continue;
+        const viewing =
+          typeof document !== "undefined" && !document.hidden && s.id === activeIdRef.current;
+        if (notifyEnabledRef.current && !viewing) {
+          fireNotification(s, (id) => onNotificationOpenRef.current?.(id), {
+            body: kind === "approval" ? "等待你批准" : "等待你回答",
+            tag: `oc-needs-you-${s.id}`,
+          });
+        }
+      }
+    }
+    prevNeedsYouRef.current = nextNeedsYou;
+    if (typeof document !== "undefined") {
+      if (baseTitleRef.current === null) {
+        baseTitleRef.current = stripTitleBadge(document.title || "");
+      }
+      const base = baseTitleRef.current;
+      document.title = nextNeedsYou.size > 0
+        ? `[待拍板 ${nextNeedsYou.size}]${base ? ` ${base}` : ""}`
+        : base;
+    }
+  }, [sessions, sessionNeedsYou, metaVersion]);
+
+  useEffect(
+    () => () => {
+      if (typeof document !== "undefined" && baseTitleRef.current !== null) {
+        document.title = baseTitleRef.current;
+      }
+    },
+    [],
+  );
 
   return {
     unreadIds,

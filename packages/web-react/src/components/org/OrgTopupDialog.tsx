@@ -192,16 +192,16 @@ export function OrgTopupDialog({
         )}
 
         {stage.kind === "input" && (
-          <div className="flex flex-col gap-3">
+          <div className="flex flex-col gap-3.5">
             <div>
               <label
                 htmlFor="org-topup-amount"
-                className="mb-1.5 block text-meta text-muted"
+                className="mb-1.5 block text-meta font-medium text-muted"
               >
                 充值金额（元）
               </label>
-              <div className="flex items-center gap-1.5 rounded-lg border border-border bg-surface px-3.5 focus-within:border-accent focus-within:ring-2 focus-within:ring-ring">
-                <span className="text-title text-faint">¥</span>
+              <div className="oc-field-control flex items-center gap-2 rounded-xl border border-border-control px-3.5 focus-within:border-accent focus-within:ring-2 focus-within:ring-ring">
+                <span className="text-lg font-semibold text-faint">¥</span>
                 <input
                   id="org-topup-amount"
                   inputMode="decimal"
@@ -214,12 +214,12 @@ export function OrgTopupDialog({
                     }
                   }}
                   placeholder="输入充值金额"
-                  className="h-10 w-full bg-transparent text-title text-fg outline-none placeholder:text-faint"
+                  className="h-11 w-full bg-transparent text-lg font-semibold tabular-nums text-fg outline-none placeholder:font-normal placeholder:text-faint"
                 />
               </div>
               {amountCents && (
-                <p className="mt-1 text-caption text-faint">
-                  实付 {formatCentsYuan(amountCents)}
+                <p className="mt-1.5 text-caption tabular-nums text-muted">
+                  实付 <span className="font-medium text-fg">{formatCentsYuan(amountCents)}</span>
                 </p>
               )}
             </div>
@@ -232,10 +232,10 @@ export function OrgTopupDialog({
                   onClick={() => setAmount(y)}
                   className={cn(
                     // 触屏补 44px 命中高(t-762 settings#5:此前 28px);桌面 hover 可用时零变化。
-                    "rounded-full border px-3 py-1 text-meta outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+                    "oc-btn-tactile rounded-full border px-3.5 py-1.5 text-meta font-medium tabular-nums outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
                     amount === y
-                      ? "border-accent bg-accent-soft text-accent"
-                      : "border-border bg-surface text-muted hover:border-border-strong hover:text-fg",
+                      ? "oc-badge-craft border-accent bg-accent-soft text-accent"
+                      : "oc-surface-card text-muted hover:border-border-strong hover:text-fg",
                   )}
                 >
                   ¥{y}
@@ -253,7 +253,7 @@ export function OrgTopupDialog({
             </Button>
             {/* 后端 POST /api/org/topup 不下发汇率与预估积分（审计 SET-09，需后端配合），
                 付款前无法给出确切到账数；先把规则与核对入口说清，到账后再显示实际入账数。 */}
-            <p className="text-caption text-faint" data-testid="org-topup-rate-note">
+            <p className="oc-surface-recessed rounded-lg px-3 py-2 text-caption leading-relaxed text-faint" data-testid="org-topup-rate-note">
               到账积分 = 支付金额 × 平台汇率（以支付时为准，本页暂不预估）。支付成功后即时入账组织钱包，
               到账数会在本弹层与「概览 → 组织钱包余额」显示。
             </p>
@@ -261,18 +261,22 @@ export function OrgTopupDialog({
         )}
 
         {stage.kind === "qr" && (
-          <div className="flex flex-col items-center gap-3">
-            <div className="text-center">
-              <div className="text-[20px] font-semibold text-fg">
+          <div className="flex flex-col items-center gap-3.5">
+            <div className="oc-surface-recessed w-full rounded-xl px-4 py-3 text-center">
+              <div className="text-xl font-semibold tracking-tight tabular-nums text-fg">
                 {formatCentsYuan(stage.amountCents)}
               </div>
-              <div className="text-meta text-faint">订单号 {stage.result.orderNo}</div>
+              <div className="mt-0.5 font-mono text-caption text-faint">
+                订单号 {stage.result.orderNo}
+              </div>
             </div>
-            <HupijiaoPaymentEntry
-              qrcodeUrl={stage.result.qr}
-              mobileUrl={stage.result.mobileUrl}
-              pendingPayment={{ orderNo: stage.result.orderNo, label: "组织充值" }}
-            />
+            <div className="oc-surface-card flex w-full flex-col items-center rounded-xl p-4">
+              <HupijiaoPaymentEntry
+                qrcodeUrl={stage.result.qr}
+                mobileUrl={stage.result.mobileUrl}
+                pendingPayment={{ orderNo: stage.result.orderNo, label: "组织充值" }}
+              />
+            </div>
             <Button variant="ghost" size="sm" onClick={backToInput} className="text-muted">
               <RefreshCw size={14} /> 改充值金额
             </Button>
@@ -280,14 +284,14 @@ export function OrgTopupDialog({
         )}
 
         {stage.kind === "paid" && (
-          <div className="flex flex-col items-center gap-3 py-4 text-center">
-            <span className="flex size-12 items-center justify-center rounded-full bg-success-soft text-success">
-              <Check size={26} />
+          <div className="oc-surface-card flex flex-col items-center gap-3 rounded-xl px-5 py-6 text-center">
+            <span className="oc-icon-badge oc-icon-badge-success size-12 rounded-2xl">
+              <Check size={24} strokeWidth={2.25} />
             </span>
-            <div className="text-title font-semibold text-fg">
+            <div className="text-title font-semibold tabular-nums text-fg">
               已到账 {formatCentsYuan(stage.amountCents)}
             </div>
-            <p className="text-meta text-faint" data-testid="org-topup-credited">
+            <p className="text-meta text-muted" data-testid="org-topup-credited">
               {stage.credited
                 ? `入账 ${formatCredits(stage.credited)} 积分，组织钱包余额已更新。`
                 : "组织钱包余额已更新。"}

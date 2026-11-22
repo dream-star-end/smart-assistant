@@ -27,11 +27,14 @@
 import {
   ChevronRight,
   Clock,
+  FileCode2,
   FilePlus,
   FileText,
   FolderOpen,
+  Lock,
   PanelLeftClose,
   PanelLeftOpen,
+  RotateCcw,
   Trash2,
   TriangleAlert,
 } from "lucide-react";
@@ -55,6 +58,7 @@ import {
   ListSkeleton,
   Modal,
   Skeleton,
+  StatusDot,
   Tabs,
   Textarea,
   TimeAgo,
@@ -596,14 +600,37 @@ export function SkillEditor({
       }}
       // 头部只放人话名字(正文 H1 > 描述首行 > slug),一行截断;slug 与版本号是下面那一行灰字。
       // 原先「技能工作台 · <整句触发描述>」在手机上占四行粗体(运营 10-09 19:53 截图)。
-      title={<span className="line-clamp-1 break-all text-title font-semibold text-fg">{heading}</span>}
+      title={
+        <span className="inline-flex min-w-0 items-center gap-2.5">
+          <span
+            aria-hidden="true"
+            className={cn(
+              "oc-icon-badge size-7 rounded-lg",
+              detail?.layer === "hub" ? "oc-icon-badge-info" : writable ? "oc-icon-badge-accent" : "",
+            )}
+          >
+            {detail && !writable ? (
+              <Lock size={14} strokeWidth={1.85} />
+            ) : (
+              <FileCode2 size={14} strokeWidth={1.85} />
+            )}
+          </span>
+          <span className="line-clamp-1 break-all text-title font-semibold tracking-tight text-fg">{heading}</span>
+        </span>
+      }
       description={
-        <span className="flex min-w-0 flex-wrap items-center gap-x-1.5 text-meta text-faint">
-          <span className="select-all break-all">{skillName}</span>
-          {detail?.version && <span aria-hidden="true">·</span>}
-          {detail?.version && <span className="tabular-nums">v{detail.version}</span>}
-          {detail && !writable && <span aria-hidden="true">·</span>}
-          {detail && !writable && <span>只读</span>}
+        <span className="flex min-w-0 flex-wrap items-center gap-1.5 text-meta text-faint">
+          <span className="select-all break-all font-mono text-caption">{skillName}</span>
+          {detail?.version && (
+            <span className="oc-badge-craft inline-flex items-center rounded-full bg-hover px-2 py-0.5 text-caption font-medium tabular-nums text-muted">
+              v{detail.version}
+            </span>
+          )}
+          {detail && !writable && (
+            <span className="oc-badge-craft inline-flex items-center rounded-full bg-hover px-2 py-0.5 text-caption text-muted">
+              只读
+            </span>
+          )}
         </span>
       }
       size="xl"
@@ -622,6 +649,12 @@ export function SkillEditor({
       }
       footer={
         <>
+          {writable && pendingCount > 0 && (
+            <span className="mr-auto hidden items-center gap-1.5 text-caption tabular-nums text-muted sm:inline-flex">
+              <StatusDot tone="accent" />
+              {pendingCount} 项待保存
+            </span>
+          )}
           <Button variant="ghost" onClick={() => void requestClose()}>
             关闭
           </Button>
@@ -699,12 +732,31 @@ export function SkillEditor({
               {/* 只读技能不用 disabled 控件呈现内容:disabled 是 50% 透明、不可聚焦、不可选中复制、
                   触屏内不可滚动 —— "只读但可读"变成"基本读不了"。改为可聚焦的只读文本块。 */}
               {writable ? (
-                <>
-                  <div className="flex items-baseline justify-between gap-3">
-                    <label htmlFor={`${ID_BASE}-body`} className="text-meta font-medium text-muted">
-                      正文
-                    </label>
-                    <span className="truncate text-caption text-faint">保存后旧版自动进入历史</span>
+                <div className="oc-code-shell flex flex-col md:min-h-0 md:flex-1">
+                  <div className="oc-code-shell-header flex items-center justify-between gap-3 px-3.5 py-2">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <FileText size={13} strokeWidth={1.8} aria-hidden="true" className="shrink-0 text-accent" />
+                      <label htmlFor={`${ID_BASE}-body`} className="cursor-pointer text-meta font-semibold text-fg">
+                        正文
+                      </label>
+                      <span className="oc-badge-craft hidden rounded-md bg-surface/80 px-1.5 py-0.5 font-mono text-caption text-faint sm:inline-flex">
+                        {SKILL_MD}
+                      </span>
+                      {dirtyPaths.has(SKILL_MD) && (
+                        <Badge tone="accent" size="sm">
+                          未保存
+                        </Badge>
+                      )}
+                    </div>
+                    <div className="flex min-w-0 items-center gap-2 text-caption text-faint">
+                      <span className="shrink-0 tabular-nums">
+                        {body ? body.split("\n").length : 0} 行
+                      </span>
+                      <span aria-hidden="true" className="hidden sm:inline">
+                        ·
+                      </span>
+                      <span className="hidden truncate sm:inline">保存后旧版自动进入历史</span>
+                    </div>
                   </div>
                   <Textarea
                     id={`${ID_BASE}-body`}
@@ -714,9 +766,9 @@ export function SkillEditor({
                       markDirty(SKILL_MD);
                     }}
                     spellCheck={false}
-                    className="min-h-[18rem] font-mono md:min-h-0 md:flex-1"
+                    className="min-h-[18rem] rounded-none border-0 bg-transparent px-3.5 py-3 font-mono shadow-none focus-visible:ring-inset md:min-h-0 md:flex-1"
                   />
-                </>
+                </div>
               ) : (
                 <ReadOnlyText label="正文" text={body} className="min-h-[18rem] md:min-h-0 md:flex-1" />
               )}
@@ -724,7 +776,7 @@ export function SkillEditor({
 
             <aside
               aria-label="技能信息"
-              className="flex flex-col gap-6 border-border px-5 py-4 max-md:border-t md:min-h-0 md:overflow-y-auto md:border-l"
+              className="flex flex-col gap-5 border-border bg-bg/35 px-5 py-4 max-md:border-t md:min-h-0 md:overflow-y-auto md:border-l"
             >
               {writable ? (
                 <Field label="描述" hint="触发的唯一依据：做什么 + 什么时候用。">
@@ -740,7 +792,9 @@ export function SkillEditor({
               ) : (
                 <div className="flex flex-col gap-1.5">
                   <span className="text-meta font-medium text-muted">描述</span>
-                  <p className="text-body leading-relaxed text-fg">{desc || "（无描述）"}</p>
+                  <p className="oc-surface-recessed rounded-xl px-3 py-2.5 text-body leading-relaxed text-fg">
+                    {desc || "（无描述）"}
+                  </p>
                 </div>
               )}
 
@@ -767,9 +821,12 @@ export function SkillEditor({
                 ))}
 
               {/* 标识与版本已在头部那一行灰字里,这里只补头部没有的事实。 */}
-              <dl data-skill-facts="" className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 text-meta">
+              <dl
+                data-skill-facts=""
+                className="oc-surface-recessed grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 rounded-xl px-3.5 py-3 text-meta"
+              >
                 <dt className="text-faint">来源</dt>
-                <dd className="text-muted">{detail?.layer === "hub" ? "市场安装" : "自建"}</dd>
+                <dd className="font-medium text-fg">{detail?.layer === "hub" ? "市场安装" : "自建"}</dd>
                 <dt className="text-faint">辅助文件</dt>
                 <dd className="tabular-nums text-muted">{auxCount > 0 ? `${auxCount} 个` : "无"}</dd>
                 <dt className="text-faint">历史版本</dt>
@@ -794,7 +851,7 @@ export function SkillEditor({
                         setDeleting(false);
                       }
                     }}
-                    className="-ml-3 text-danger hover:bg-danger-soft"
+                    className="oc-btn-tactile -ml-2.5 rounded-lg text-danger hover:bg-danger-soft"
                   >
                     <Trash2 size={14} strokeWidth={1.75} aria-hidden="true" />
                     删除技能
@@ -831,11 +888,15 @@ export function SkillEditor({
                   title="还没有辅助文件"
                   hint="辅助文件放参考资料、脚本与素材，技能运行时按需读取；技能正文在「正文」页签。"
                 />
-                {writable && <div data-new-file-form="" className="w-full max-w-sm px-4">{newFileForm}</div>}
+                {writable && (
+                  <div data-new-file-form="" className="oc-surface-card mx-4 w-full max-w-sm rounded-xl p-4">
+                    {newFileForm}
+                  </div>
+                )}
               </div>
             ) : (
             <>
-            <div className="flex items-center gap-2">
+            <div className="oc-surface-recessed flex items-center gap-2.5 rounded-xl px-2.5 py-1.5">
               <IconButton
                 variant="muted"
                 size="sm"
@@ -877,9 +938,14 @@ export function SkillEditor({
                         />
                       ))
                     ) : (
-                      <div key={dir} className="mt-1">
-                        <div className="flex items-center gap-1 px-1.5 py-0.5 text-caption font-medium text-muted">
-                          <ChevronRight size={11} className="rotate-90" /> {dir}/
+                      <div key={dir} className="mt-1.5 first:mt-0">
+                        <div className="flex items-center justify-between gap-1 px-1.5 py-1 text-caption font-medium text-muted">
+                          <span className="inline-flex min-w-0 items-center gap-1 truncate">
+                            <ChevronRight size={11} className="shrink-0 rotate-90 text-faint" />
+                            <FolderOpen size={11} strokeWidth={1.8} className="shrink-0 text-faint" />
+                            <span className="truncate font-mono">{dir}/</span>
+                          </span>
+                          <span className="shrink-0 tabular-nums text-faint">{files.length}</span>
                         </div>
                         {files.map((f) => (
                           <FileNode
@@ -896,7 +962,7 @@ export function SkillEditor({
                     ),
                   )}
                   {writable && (
-                    <div className="mt-2 border-t border-border pt-2">
+                    <div className="mt-2.5 border-t border-border pt-2.5">
                       {newFileForm}
                     </div>
                   )}
@@ -931,28 +997,37 @@ export function SkillEditor({
                     <Skeleton className="h-64 rounded-lg" />
                   </div>
                 ) : writable ? (
-                  <Field
-                    label={
-                      <span className="flex items-center gap-1.5">
-                        <span className="font-mono">{selected}</span>
+                  <div className="oc-code-shell flex min-h-0 flex-1 flex-col">
+                    <div className="oc-code-shell-header flex items-center justify-between gap-2 px-3.5 py-2">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <FileText size={13} strokeWidth={1.8} aria-hidden="true" className="shrink-0 text-accent" />
+                        <label
+                          htmlFor={`${ID_BASE}-aux-editor`}
+                          className="cursor-pointer truncate font-mono text-meta font-semibold text-fg"
+                        >
+                          {selected}
+                        </label>
                         {dirtyPaths.has(selected) && (
                           <Badge tone="accent" size="sm">
                             未保存
                           </Badge>
                         )}
+                      </div>
+                      <span className="shrink-0 text-caption tabular-nums text-faint">
+                        {(fileDrafts[selected] ?? "") ? (fileDrafts[selected] ?? "").split("\n").length : 0} 行
                       </span>
-                    }
-                    className="min-h-0 flex-1"
-                  >
+                    </div>
                     <Textarea
+                      id={`${ID_BASE}-aux-editor`}
                       value={fileDrafts[selected] ?? ""}
                       onChange={(e) => {
                         putDraft(selected, e.target.value);
                         markDirty(selected);
                       }}
-                      className="min-h-[16rem] flex-1 font-mono"
+                      spellCheck={false}
+                      className="min-h-[16rem] flex-1 rounded-none border-0 bg-transparent px-3.5 py-3 font-mono shadow-none focus-visible:ring-inset"
                     />
-                  </Field>
+                  </div>
                 ) : (
                   <ReadOnlyText label={selected} text={fileDrafts[selected] ?? ""} className="min-h-0 flex-1" mono />
                 )}
@@ -1027,10 +1102,21 @@ export function SkillEditor({
                 <ListGroup data-skill-history="">
                   {history.map((h) => (
                     <ListRow key={h.version} className="flex items-center gap-3">
-                      <span className="text-body font-medium tabular-nums text-fg">v{h.version}</span>
-                      <TimeAgo value={h.timestamp} className="text-meta text-faint" />
+                      <span className="oc-icon-badge size-7 rounded-lg" aria-hidden="true">
+                        <Clock size={13} strokeWidth={1.8} />
+                      </span>
+                      <span className="oc-badge-craft inline-flex items-center rounded-full bg-hover px-2 py-0.5 text-body font-medium tabular-nums text-fg">
+                        v{h.version}
+                      </span>
+                      <TimeAgo value={h.timestamp} className="text-meta tabular-nums text-faint" />
                       {writable && (
-                        <Button variant="ghost" size="sm" className="ms-auto" onClick={() => restore(h.version)}>
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          className="ms-auto gap-1.5"
+                          onClick={() => restore(h.version)}
+                        >
+                          <RotateCcw size={13} strokeWidth={1.8} aria-hidden="true" />
                           恢复此版本
                         </Button>
                       )}
@@ -1080,16 +1166,25 @@ function ReadOnlyText({
   className?: string;
   mono?: boolean;
 }) {
+  const lineCount = text ? text.split("\n").length : 0;
   return (
-    <div className={cn("flex flex-col gap-1", className)}>
-      <span className={cn("text-meta font-medium text-muted", mono && "font-mono")}>{label}</span>
+    <div className={cn("oc-code-shell flex flex-col", className)}>
+      <div className="oc-code-shell-header flex items-center justify-between gap-2 px-3.5 py-2">
+        <span className="flex min-w-0 items-center gap-2">
+          <FileText size={13} strokeWidth={1.8} aria-hidden="true" className="shrink-0 text-muted" />
+          <span className={cn("truncate text-meta font-semibold text-fg", mono && "font-mono")}>{label}</span>
+        </span>
+        <span className="oc-badge-craft shrink-0 rounded-full bg-hover px-2 py-0.5 text-caption tabular-nums text-faint">
+          只读 · {lineCount} 行
+        </span>
+      </div>
       <section
         // biome-ignore lint/a11y/noNoninteractiveTabindex: 可滚动的只读区必须能被键盘聚焦
         tabIndex={0}
         aria-label={label}
-        className="min-h-0 flex-1 overflow-auto rounded-lg bg-code outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className="min-h-0 flex-1 overflow-auto bg-code outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
       >
-        <pre className="whitespace-pre-wrap break-words px-3.5 py-2.5 font-mono text-body leading-relaxed text-fg">
+        <pre className="whitespace-pre-wrap break-words px-3.5 py-3 font-mono text-body leading-relaxed text-fg">
           {text || "（空）"}
         </pre>
       </section>
@@ -1116,9 +1211,9 @@ function FileNode({
   return (
     <div
       className={cn(
-        "group flex items-center gap-1.5 rounded-md px-1.5 py-1",
-        indent && "ml-3.5",
-        active ? "bg-accent-soft text-accent" : "text-muted hover:bg-hover hover:text-fg",
+        "group flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors",
+        indent && "ml-3",
+        active ? "oc-segmented-thumb font-medium text-fg" : "text-muted hover:bg-hover hover:text-fg",
       )}
     >
       <button
@@ -1129,9 +1224,9 @@ function FileNode({
         aria-label={dirty ? `${label} 有未保存的修改` : undefined}
         className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md text-left font-mono text-caption outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
       >
-        <FileText size={12} className="shrink-0" />
+        <FileText size={12} strokeWidth={1.8} className={cn("shrink-0", active ? "text-accent" : "text-faint")} />
         <span className="truncate">{label}</span>
-        {dirty && <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-accent" />}
+        {dirty && <StatusDot tone="accent" />}
       </button>
       {onDelete && (
         // 触屏没有 hover 态:原先 `hidden … group-hover:flex` 让删除按钮在手机上

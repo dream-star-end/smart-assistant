@@ -1590,6 +1590,66 @@ describe("provisionV3Container", () => {
     assert.equal(pool.rows[0]!.container_internal_id, "dockerid-1", "Tx2 已写 cid");
   });
 
+  test("OCV5-825: ensureV3Volumes 在 Tx1 COMMIT 之后(锁外)以 Promise.all 并行创建全部 5 卷", async () => {
+    const logsAtVolume: string[][] = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const { docker } = makeDocker();
+    const origCreateVolume = docker.createVolume.bind(docker);
+    (docker as unknown as { createVolume: (opts: { Name?: string; Labels?: Record<string, string> }) => Promise<unknown> }).createVolume = async (opts) => {
+      logsAtVolume.push([...pool.clientLog]);
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 15));
+      try {
+        return await origCreateVolume(opts as never);
+      } finally {
+        inFlight -= 1;
+      }
+    };
+    await provisionV3Container(
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.8.9", randomSecret: fixedSecret("e".repeat(64)) },
+      78,
+    );
+    assert.equal(logsAtVolume.length, 5, "应创建全部 5 个 user volume");
+    for (const snap of logsAtVolume) {
+      assert.deepEqual(snap, ["BEGIN", "COMMIT"], "createVolume 必须在 Tx1 COMMIT 释放 HOST_CAP_LOCK 之后执行");
+    }
+    assert.equal(maxInFlight, 5, "5 个 volume 应由 Promise.all 并行发起而非串行");
+  });
+
+  test("OCV5-825: 锁外 ensureV3Volumes 任一卷失败 → 等待全部并行建卷 settle 后再补偿翻 vanished，绝不泄漏占位行", async () => {
+    const { docker } = makeDocker();
+    const origCreateVolume = docker.createVolume.bind(docker);
+    let calls = 0;
+    let slowSiblingSettled = false;
+    (docker as unknown as { createVolume: (opts: { Name?: string; Labels?: Record<string, string> }) => Promise<unknown> }).createVolume = async (opts) => {
+      calls += 1;
+      const idx = calls;
+      if (idx === 3) {
+        const err = new Error("disk quota exceeded") as Error & { statusCode?: number };
+        err.statusCode = 500;
+        throw err;
+      }
+      if (idx === 5) {
+        await new Promise((r) => setTimeout(r, 25));
+        slowSiblingSettled = true;
+      }
+      return await origCreateVolume(opts as never);
+    };
+    await assert.rejects(
+      provisionV3Container(
+        { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.8.10", randomSecret: fixedSecret("d".repeat(64)) },
+        79,
+      ),
+      (err: Error) => err instanceof SupervisorError,
+    );
+    assert.equal(slowSiblingSettled, true, "Promise.allSettled 必须等待其余并行建卷 settle 后再触发补偿");
+    assert.deepEqual(pool.clientLog, ["BEGIN", "COMMIT"]);
+    assert.equal(pool.rows.length, 1);
+    assert.equal(pool.rows[0]!.state, "vanished", "中段建卷失败必须通过 compensateProvisionFailure 释放占位行");
+  });
+
   // v3→v5 迁移门控(channelState.v3MayServe):v3 绝不给"已迁移 / 迁移中"的用户
   // 重建容器 —— 否则它会重新成为该用户卷的写者,与 v5 权威撞车/破坏卷迁移一致性。
   // 门在 provisionV3Container 最前面(BEGIN / docker 副作用之前)。

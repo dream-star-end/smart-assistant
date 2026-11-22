@@ -32,22 +32,175 @@ const here = dirname(fileURLToPath(import.meta.url))
 // Preserve the frozen extraction baseline; specify later route additions independently.
 const CURRENT_HTTP_DISPATCH: Record<string, LegacyGroup> = {
   ...LEGACY_HTTP_DISPATCH,
-  PRE_AUTH_ROUTES: {
-    ...LEGACY_HTTP_DISPATCH.PRE_AUTH_ROUTES,
-    routes: [{ id: 'SYSTEM_HELP_LOCAL', line: 0, calls: ['handleSystemHelp'],
-      match: (_req, url) => url.pathname === '/api/internal/system-help' }, ...LEGACY_HTTP_DISPATCH.PRE_AUTH_ROUTES.routes],
-    samples: ['/api/internal/system-help', ...LEGACY_HTTP_DISPATCH.PRE_AUTH_ROUTES.samples],
+  PRE_AUTH_ROUTES: (() => {
+    const base = LEGACY_HTTP_DISPATCH.PRE_AUTH_ROUTES
+    const afterProjectSearch = base.routes.findIndex((r) => r.id === 'PROJECT_SEARCH_LOCAL_PATH') + 1
+    const remoteSwarmRoute = {
+      id: 'REMOTE_SWARM_LOCAL_PREFIX',
+      line: 0,
+      calls: ['handleRemoteSwarmLocal', 'sendInternalError'],
+      match: (_req: { method?: string }, url: URL) =>
+        url.pathname.startsWith('/internal/v3/remote-swarm/'),
+    }
+    const sessionBgInternalRoutes = [
+      {
+        id: 'GET /internal/sessions/:id/background-state',
+        line: 0,
+        calls: ['handleInternalSessionBackgroundState'],
+        match: (req: { method?: string }, url: URL) =>
+          /^\/internal\/sessions\/([^/]+)\/background-state$/.test(url.pathname) &&
+          req.method === 'GET',
+      },
+      {
+        id: 'POST /internal/sessions/:id/inflight-delegates/:jobId/cancel',
+        line: 0,
+        calls: ['handleInternalSessionDelegateCancel'],
+        match: (req: { method?: string }, url: URL) =>
+          /^\/internal\/sessions\/([^/]+)\/inflight-delegates\/([^/]+)\/cancel$/.test(
+            url.pathname,
+          ) && req.method === 'POST',
+      },
+      {
+        id: 'POST /internal/sessions/:id/bg-commands/:jobId/cancel',
+        line: 0,
+        calls: ['handleInternalSessionBgCmdCancel'],
+        match: (req: { method?: string }, url: URL) =>
+          /^\/internal\/sessions\/([^/]+)\/bg-commands\/([^/]+)\/cancel$/.test(url.pathname) &&
+          req.method === 'POST',
+      },
+    ]
+    return {
+      ...base,
+      routes: [
+        {
+          id: 'SYSTEM_HELP_LOCAL',
+          line: 0,
+          calls: ['handleSystemHelp'],
+          match: (_req: { method?: string }, url: URL) => url.pathname === '/api/internal/system-help',
+        },
+        ...base.routes.slice(0, afterProjectSearch),
+        remoteSwarmRoute,
+        ...sessionBgInternalRoutes,
+        ...base.routes.slice(afterProjectSearch),
+      ],
+      samples: [
+        '/api/internal/system-help',
+        '/internal/v3/remote-swarm/swarm',
+        '/internal/v3/remote-swarm/post_message',
+        '/internal/sessions/web-sess-1/background-state',
+        '/internal/sessions/web-sess-1/inflight-delegates/dlgjob-abc/cancel',
+        '/internal/sessions/web-sess-1/bg-commands/1234-ocb_1/cancel',
+        ...base.samples,
+      ],
+    }
+  })(),
+  PLATFORM_ROUTES: {
+    ...LEGACY_HTTP_DISPATCH.PLATFORM_ROUTES,
+    routes: [
+      ...LEGACY_HTTP_DISPATCH.PLATFORM_ROUTES.routes,
+      {
+        id: 'INTERNAL /internal/office-preview',
+        line: 0,
+        calls: ['handleInternalOfficePreview'],
+        match: (req: { method?: string }, url: URL) =>
+          url.pathname === '/internal/office-preview' &&
+          (req.method === 'GET' || req.method === 'POST'),
+      },
+      {
+        id: 'GET /internal/office-preview/page',
+        line: 0,
+        calls: ['handleInternalOfficePreviewPage'],
+        match: (req: { method?: string }, url: URL) =>
+          url.pathname === '/internal/office-preview/page' && req.method === 'GET',
+      },
+      {
+        id: 'POST /internal/swarm/command',
+        line: 0,
+        calls: ['handleInternalSwarmCommand'],
+        match: (req: { method?: string }, url: URL) =>
+          /^\/internal\/swarm\/command(?:\/([^/]+))?\/?$/.test(url.pathname) &&
+          req.method === 'POST',
+      },
+    ],
+    samples: [
+      ...LEGACY_HTTP_DISPATCH.PLATFORM_ROUTES.samples,
+      '/internal/office-preview',
+      '/internal/office-preview/page',
+      '/internal/swarm/command',
+      '/internal/swarm/command/sess-1',
+    ],
   },
   AGENT_ROUTES: (() => {
     const agents = LEGACY_HTTP_DISPATCH.AGENT_ROUTES
-    const at = agents.routes.findIndex((r) => r.id === '/api/agents/:1/memory/usage') + 1
+    const afterPersona = agents.routes.findIndex((r) => r.id === '/api/agents/:1/persona') + 1
+    const liveBrowserRoutes = [
+      {
+        id: '/api/agents/:1/browser/live',
+        line: 0,
+        calls: ['handleLiveBrowserLive', 'sendInternalError'],
+        match: (_req: { method?: string }, url: URL) =>
+          /^\/api\/agents\/([a-zA-Z0-9_-]+)\/browser\/live$/.test(url.pathname),
+      },
+      {
+        id: '/api/agents/:1/browser/action',
+        line: 0,
+        calls: ['handleLiveBrowserAction', 'sendInternalError'],
+        match: (_req: { method?: string }, url: URL) =>
+          /^\/api\/agents\/([a-zA-Z0-9_-]+)\/browser\/action$/.test(url.pathname),
+      },
+    ]
+    const withBrowser = [
+      ...agents.routes.slice(0, afterPersona),
+      ...liveBrowserRoutes,
+      ...agents.routes.slice(afterPersona),
+    ]
+    const at = withBrowser.findIndex((r) => r.id === '/api/agents/:1/memory/usage') + 1
     // OpenViking B1 façade view (gateway-only), right after memory/usage.
     const memoryContext = { id: '/api/agents/:1/memory/context', line: 0, calls: ['handleMemoryContext', 'sendInternalError'],
       match: (_req: { method?: string }, url: URL) => /^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/context$/.test(url.pathname) }
+    // OCV5-840: Context governance control-plane routes right after memory/context.
+    const agentContextGovRoutes = [
+      { id: '/api/agents/:1/memory/archive/restore', line: 0, calls: ['handleAgentMemoryArchiveRestore'],
+        match: (_req: { method?: string }, url: URL) => /^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/archive\/restore$/.test(url.pathname) },
+      { id: '/api/agents/:1/memory/archive', line: 0, calls: ['handleAgentMemoryArchive'],
+        match: (_req: { method?: string }, url: URL) => /^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/archive$/.test(url.pathname) },
+      { id: '/api/agents/:1/context-health', line: 0, calls: ['handleAgentContextHealth'],
+        match: (_req: { method?: string }, url: URL) => /^\/api\/agents\/([a-zA-Z0-9_-]+)\/context-health$/.test(url.pathname) },
+      { id: '/api/agents/:1/context-hygiene/run', line: 0, calls: ['handleAgentContextHygieneRun'],
+        match: (_req: { method?: string }, url: URL) => /^\/api\/agents\/([a-zA-Z0-9_-]+)\/context-hygiene\/run$/.test(url.pathname) },
+      { id: '/api/agents/:1/context-hygiene/history', line: 0, calls: ['handleAgentContextHygieneHistory'],
+        match: (_req: { method?: string }, url: URL) => /^\/api\/agents\/([a-zA-Z0-9_-]+)\/context-hygiene\/history$/.test(url.pathname) },
+    ]
+    const withAgentGov = [...withBrowser.slice(0, at), memoryContext, ...agentContextGovRoutes, ...withBrowser.slice(at)]
+    const afterSkills = withAgentGov.findIndex((r) => r.id === '/api/skills') + 1
+    const skillArchiveRoutes = [
+      { id: '/api/skills/archive', line: 0, calls: ['handleSkillsArchiveList'],
+        match: (_req: { method?: string }, url: URL) => url.pathname === '/api/skills/archive' },
+      { id: '/api/skills/archive/restore', line: 0, calls: ['handleSkillsArchiveRestore'],
+        match: (_req: { method?: string }, url: URL) => url.pathname === '/api/skills/archive/restore' },
+      { id: '/api/skills/:1/archive', line: 0, calls: ['handleSkillArchiveItem'],
+        match: (_req: { method?: string }, url: URL) => /^\/api\/skills\/([a-z0-9-]+)\/archive$/.test(url.pathname) },
+    ]
     return {
       ...agents,
-      routes: [...agents.routes.slice(0, at), memoryContext, ...agents.routes.slice(at)],
-      samples: [...agents.samples, '/api/agents/a/memory/context', '/api/agents/aaa/memory/context'],
+      routes: [...withAgentGov.slice(0, afterSkills), ...skillArchiveRoutes, ...withAgentGov.slice(afterSkills)],
+      samples: [
+        ...agents.samples,
+        '/api/agents/a/browser/live',
+        '/api/agents/aaa/browser/live',
+        '/api/agents/a/browser/action',
+        '/api/agents/aaa/browser/action',
+        '/api/agents/a/memory/context',
+        '/api/agents/aaa/memory/context',
+        '/api/agents/a/memory/archive/restore',
+        '/api/agents/a/memory/archive',
+        '/api/agents/a/context-health',
+        '/api/agents/a/context-hygiene/run',
+        '/api/agents/a/context-hygiene/history',
+        '/api/skills/archive',
+        '/api/skills/archive/restore',
+        '/api/skills/demo-skill/archive',
+      ],
     }
   })(),
   WORKSPACE_API_ROUTES: (() => {

@@ -650,8 +650,6 @@ export const messagesScenes: Scene[] = [
         messages={errorStates()}
         transientNotice={{ text: '较长时间未收到新内容，正在与服务器同步…' }}
         historyLoading
-        journalDegraded
-        onRetryJournal={noop}
         cb={{
           ...cb,
           resolveRetryTarget: (cmid) =>

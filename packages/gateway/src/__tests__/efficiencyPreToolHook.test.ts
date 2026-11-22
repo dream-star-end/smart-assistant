@@ -101,10 +101,15 @@ describe('pre-exec hook protocol', () => {
 })
 
 describe('hook config injection (single policy source)', () => {
-  it('off emits no settings / no hooks.json', () => {
-    assert.equal(buildCcbEfficiencySettings('off'), null)
-    assert.equal(buildCursorEfficiencyHooks('off'), null)
-    assert.equal(resolveEfficiencyHookCommand('ccb', 'off'), null)
+  it('off emits no settings / no hooks.json only when action-policy is also off; stays installed when action-policy is on (B1)', () => {
+    assert.equal(buildCcbEfficiencySettings('off', false), null)
+    assert.equal(buildCursorEfficiencyHooks('off', false), null)
+    assert.equal(resolveEfficiencyHookCommand('ccb', 'off', false), null)
+
+    // When efficiency is off but action-policy is on, hooks MUST stay registered!
+    assert.ok(buildCcbEfficiencySettings('off', true))
+    assert.ok(buildCursorEfficiencyHooks('off', true))
+    assert.match(resolveEfficiencyHookCommand('ccb', 'off', true) ?? '', /--mode=off/)
   })
 
   it('CCB settings.json points at the shared hook script, not a copied regex', () => {
@@ -118,14 +123,23 @@ describe('hook config injection (single policy source)', () => {
     assert.doesNotMatch(pre.hooks[0].command, /sleep_ge_60|while true/)
   })
 
-  it('Cursor hooks.json uses beforeShellExecution against the same script', () => {
-    const hooks = buildCursorEfficiencyHooks('deny') as {
+  it('Cursor hooks.json uses beforeShellExecution against the same script and toggles failClosed with action-policy', () => {
+    const hooksOn = buildCursorEfficiencyHooks('deny', true) as {
       version: number
-      hooks: { beforeShellExecution: Array<{ command: string }> }
+      hooks: { beforeShellExecution: Array<{ command: string; timeout: number; failClosed: boolean }> }
     }
-    assert.equal(hooks.version, 1)
-    assert.match(hooks.hooks.beforeShellExecution[0].command, /efficiencyHookRunner\.cjs/)
-    assert.match(hooks.hooks.beforeShellExecution[0].command, /--protocol=cursor/)
+    assert.equal(hooksOn.version, 1)
+    assert.match(hooksOn.hooks.beforeShellExecution[0].command, /efficiencyHookRunner\.cjs/)
+    assert.match(hooksOn.hooks.beforeShellExecution[0].command, /--protocol=cursor/)
+    assert.equal(hooksOn.hooks.beforeShellExecution[0].failClosed, true)
+    assert.equal(hooksOn.hooks.beforeShellExecution[0].timeout, 6)
+
+    const hooksOff = buildCursorEfficiencyHooks('deny', false) as {
+      version: number
+      hooks: { beforeShellExecution: Array<{ command: string; timeout: number; failClosed: boolean }> }
+    }
+    assert.equal(hooksOff.hooks.beforeShellExecution[0].failClosed, false)
+    assert.equal(hooksOff.hooks.beforeShellExecution[0].timeout, 4)
   })
 })
 

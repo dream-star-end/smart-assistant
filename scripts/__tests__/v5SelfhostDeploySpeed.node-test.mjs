@@ -212,11 +212,11 @@ test('P2: bg build starts after admission; non-Box gates overlap it; Box gates a
  const drop=at('  master_gate_db_drop\n');
  assert.ok(wait<idle&&idle<db&&db<drop);
  const marks=[...b.matchAll(/^ {2}tsum_mark (C\.[a-z-]+) /gm)].map(x=>[x[1],x.index]);
- const after=new Set(['C.box-success-recovery','C.box-continuation','C.box-incident-proofs','C.box-longtask','C.ccb-mcp']);
- // P3 aggregates overlapping jobs under C.parallel; each still has its own receipt.
+ const after=new Set(['C.box-success-recovery','C.box-continuation','C.box-incident-proofs','C.box-longtask','C.master-incident-proofs','C.ccb-mcp','C.codex-late-stop']);
+ // P3 + OCV5-823: aggregates overlapping non-DB jobs under C.parallel; each isolated gate has its own tsum_mark.
  assert.deepEqual(marks.map(x=>x[0]),['C.parallel',...after]);
  const queued=[...b.matchAll(/^ {4}(C\.[a-z-]+):master_job_/gm)].map(x=>x[1]);
- assert.deepEqual(queued,['C.session-rootfix','C.watch-gate','C.cursor-sand','C.delegate-billing','C.callback-ws','C.cron-submit','C.prompt-privacy','C.session-boundary','C.system-approval','C.system-executor','C.host-log-policy','C.model-policy','C.architecture']);
+ assert.deepEqual(queued,['C.session-rootfix','C.watch-gate','C.cursor-sand','C.delegate-billing','C.callback-ws','C.cron-submit','C.prompt-privacy','C.session-boundary','C.system-approval','C.system-executor','C.host-log-policy','C.model-policy','C.codex-chatgpt-ws','C.platform-tool-proofs','C.terminal-unproven','C.upload-retention','C.architecture']);
  assert.ok(at('  if ! master_build_jobs_wait;')<wait,'C/D drained before runtime/Box barrier');
  for(const g of after)assert.ok(marks.some(([n])=>n===g),g);
  // the first Box gate's mark opens its phase, then the await (OCV5-557 wait is counted inside that phase)

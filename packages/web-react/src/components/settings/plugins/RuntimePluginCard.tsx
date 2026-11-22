@@ -293,7 +293,7 @@ export function RuntimePluginCard({
               <AccountRows key={account.id}>
                 <ListRow data-plugin-account={account.id} className="flex items-center gap-3">
                   <div className="min-w-0 flex-1">
-                    <div className="truncate text-[14px] font-medium leading-5 text-fg">
+                    <div className="truncate text-section font-medium leading-5 text-fg">
                       {accountName}
                     </div>
                     {/* 颜色与文案同源（pluginAccountState），不再出现"绿色的需重新授权"。 */}
@@ -377,7 +377,7 @@ export function RuntimePluginCard({
                 {account.writeControl?.preapproval?.available && (
                   <ListRow className="flex items-center gap-3">
                     <div className="min-w-0 flex-1">
-                      <div className="text-[14px] leading-5 text-fg">免逐次确认</div>
+                      <div className="text-section font-medium leading-5 text-fg">免逐次确认</div>
                       <div
                         className={`mt-0.5 text-meta ${
                           preapprovalPolicyStale ? 'text-warning' : 'text-faint'
@@ -414,7 +414,7 @@ export function RuntimePluginCard({
                 {plugin.slug === 'knowledge-planet' && account.status === 'active' && (
                   <ListRow className="flex items-center gap-3">
                     <div className="min-w-0 flex-1">
-                      <div className="text-[14px] leading-5 text-fg">无人值守自动回复</div>
+                      <div className="text-section font-medium leading-5 text-fg">无人值守自动回复</div>
                       <div className="mt-0.5 line-clamp-2 text-meta text-faint">
                         按规则自动回复新主题与提问；默认关闭，需单独同意。
                       </div>
@@ -483,7 +483,7 @@ export function RuntimePluginCard({
             <Alert tone="warning" density="compact" className="leading-relaxed">
               {consentAccount.writeControl.disclaimerText}
             </Alert>
-            <label className="flex min-h-11 cursor-pointer items-start gap-2.5 py-1 text-body leading-relaxed text-fg">
+            <label className="oc-surface-recessed flex min-h-11 cursor-pointer items-start gap-2.5 rounded-xl px-3.5 py-2.5 text-body leading-relaxed text-fg">
               <input
                 type="checkbox"
                 className="mt-[3px] size-4 shrink-0 accent-accent"
@@ -542,7 +542,7 @@ export function RuntimePluginCard({
             <Alert tone="warning" density="compact" className="leading-relaxed">
               {preapprovalAccount.writeControl.preapproval.disclaimerText}
             </Alert>
-            <label className="flex min-h-11 cursor-pointer items-start gap-2.5 py-1 text-body leading-relaxed text-fg">
+            <label className="oc-surface-recessed flex min-h-11 cursor-pointer items-start gap-2.5 rounded-xl px-3.5 py-2.5 text-body leading-relaxed text-fg">
               <input
                 type="checkbox"
                 className="mt-[3px] size-4 shrink-0 accent-accent"

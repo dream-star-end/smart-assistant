@@ -1,9 +1,19 @@
-import { ExternalLink, KeyRound, RefreshCw, Trash2 } from "lucide-react";
+import { ExternalLink, Globe, KeyRound, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api, type ChatGptProxyAccess, type ChatGptProxyCredential } from "../lib/api";
 import type { AuthSession } from "../lib/types";
 import { shortTime } from "./settings/labels";
-import { Alert, Button, buttonVariants, CopyChip, Modal, Spinner, Tabs, useConfirm } from "./ui";
+import {
+  Alert,
+  Badge,
+  Button,
+  buttonVariants,
+  CopyChip,
+  Modal,
+  Spinner,
+  Tabs,
+  useConfirm,
+} from "./ui";
 
 type Enabled = Extract<ChatGptProxyAccess, { enabled: true }>;
 
@@ -158,66 +168,90 @@ export function ChatGptProxyDialog({
       )}
       {access && (
         <div className="space-y-4">
-          <section className="rounded-lg border border-border bg-hover/40 p-3">
-            <h3 className="mb-2 text-caption font-medium text-muted">连接信息</h3>
-            <dl className="grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-2 text-body">
-              <dt className="text-muted">PAC 地址</dt>
+          <section className="oc-surface-card rounded-xl p-4">
+            <div className="mb-3 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2.5">
+                <span className="oc-icon-badge oc-icon-badge-success h-7 w-7 rounded-sm" aria-hidden>
+                  <Globe size={14} strokeWidth={1.75} />
+                </span>
+                <div>
+                  <h3 className="text-section font-semibold leading-tight text-fg">连接信息</h3>
+                  <p className="text-caption text-muted">HTTPS 鉴权代理 · 自动分流 PAC</p>
+                </div>
+              </div>
+              <Badge tone={access.hasCredential ? "success" : "neutral"} size="sm">
+                {access.hasCredential ? "凭据就绪" : "未生成凭据"}
+              </Badge>
+            </div>
+            <dl className="oc-surface-recessed grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-2.5 rounded-lg p-3 text-body">
+              <dt className="text-caption font-medium text-muted">PAC 地址</dt>
               <dd className="min-w-0">
                 <CopyChip value={access.pacUrl} className="max-w-full" />
               </dd>
-              <dt className="text-muted">代理服务器</dt>
+              <dt className="text-caption font-medium text-muted">代理服务器</dt>
               <dd className="min-w-0">
                 <CopyChip value={proxyAddr} label={`HTTPS ${proxyAddr}`} />
               </dd>
-              <dt className="text-muted">用户名</dt>
+              <dt className="text-caption font-medium text-muted">用户名</dt>
               <dd className="min-w-0">
                 <CopyChip value={access.username} />
               </dd>
-              <dt className="text-muted">密码</dt>
+              <dt className="text-caption font-medium text-muted">密码</dt>
               <dd className="min-w-0">
                 {issued ? (
-                  <div className="space-y-1">
+                  <div className="oc-callout oc-callout-warning space-y-1.5 rounded-md p-2.5">
                     <CopyChip value={issued.password} />
-                    <p className="text-caption text-warning">密码只显示这一次，请立即复制保存。</p>
+                    <p className="text-caption font-medium text-warning">
+                      密码只显示这一次，请立即复制保存。
+                    </p>
                   </div>
                 ) : access.hasCredential ? (
-                  <span className="text-caption text-muted">
+                  <span className="text-caption tabular-nums text-muted">
                     已生成于 {formatTime(access.rotatedAt)} · 最近使用{" "}
                     {formatTime(access.lastUsedAt)}
                   </span>
                 ) : (
-                  <span className="text-caption text-muted">尚未生成</span>
+                  <span className="text-caption text-faint">尚未生成</span>
                 )}
               </dd>
             </dl>
-            <div className="mt-3 flex flex-wrap gap-1.5">
+            <div className="mt-3 flex flex-wrap items-center gap-2">
               <Button
                 size="sm"
                 variant={access.hasCredential ? "secondary" : "primary"}
                 disabled={busy}
                 onClick={issue}
               >
-                {access.hasCredential ? <RefreshCw size={13} /> : <KeyRound size={13} />}
+                {access.hasCredential ? (
+                  <RefreshCw size={13} strokeWidth={1.75} />
+                ) : (
+                  <KeyRound size={13} strokeWidth={1.75} />
+                )}
                 {access.hasCredential ? "重新生成密码" : "生成密码"}
               </Button>
               {access.hasCredential && (
                 <Button size="sm" variant="ghost" disabled={busy} onClick={revoke}>
-                  <Trash2 size={13} />
+                  <Trash2 size={13} strokeWidth={1.75} />
                   吊销
                 </Button>
               )}
             </div>
           </section>
 
-          <section>
-            <h3 className="mb-2 text-caption font-medium text-muted">浏览器配置</h3>
+          <section className="oc-surface-card rounded-xl p-4">
+            <div className="mb-3 flex items-center gap-2.5">
+              <span className="oc-icon-badge oc-icon-badge-accent h-7 w-7 rounded-sm" aria-hidden>
+                <ShieldCheck size={14} strokeWidth={1.75} />
+              </span>
+              <h3 className="text-section font-semibold text-fg">浏览器配置</h3>
+            </div>
             <Tabs
               value={guide}
               onValueChange={(v) => setGuide(v as GuideTab)}
               items={GUIDE_TABS}
               layout="grid"
             />
-            <ol className="mt-3 list-decimal space-y-1.5 pl-5 text-body text-fg">
+            <ol className="oc-surface-recessed mt-3 list-decimal space-y-2 rounded-lg py-3 pl-8 pr-3.5 text-body leading-relaxed text-fg">
               {guide === "chrome" && (
                 <>
                   <li>
@@ -225,7 +259,11 @@ export function ChatGptProxyDialog({
                     使用设置脚本」；macOS「系统设置 → 网络 → 详细信息 → 代理 → 自动代理配置」。
                   </li>
                   <li>
-                    脚本地址填上面的 <span className="font-mono">PAC 地址</span>，保存。
+                    脚本地址填上面的{" "}
+                    <code className="rounded-xs bg-code px-1.5 py-0.5 font-mono text-caption text-fg">
+                      PAC 地址
+                    </code>
+                    ，保存。
                   </li>
                   <li>
                     访问 chatgpt.com 时浏览器会弹出代理登录框，填写上面的<strong>用户名</strong>与
@@ -239,7 +277,10 @@ export function ChatGptProxyDialog({
                   <li>Firefox「设置 → 常规 → 网络设置 → 设置…」。</li>
                   <li>
                     选「自动代理配置的 URL（PAC）」，填上面的{" "}
-                    <span className="font-mono">PAC 地址</span>，确定。
+                    <code className="rounded-xs bg-code px-1.5 py-0.5 font-mono text-caption text-fg">
+                      PAC 地址
+                    </code>
+                    ，确定。
                   </li>
                   <li>
                     访问 chatgpt.com 时按提示输入<strong>用户名</strong>与<strong>密码</strong>
@@ -255,22 +296,37 @@ export function ChatGptProxyDialog({
                     ；点击右侧锁图标填写<strong>用户名</strong>与<strong>密码</strong>。
                   </li>
                   <li>
-                    在「自动切换」里添加规则：<span className="font-mono">*.chatgpt.com</span>、
-                    <span className="font-mono">*.openai.com</span>、
-                    <span className="font-mono">*.oaistatic.com</span>、
-                    <span className="font-mono">*.oaiusercontent.com</span> →
-                    该情景；默认情景保持「直接连接」。
+                    在「自动切换」里添加规则：
+                    <code className="rounded-xs bg-code px-1.5 py-0.5 font-mono text-caption text-fg">
+                      *.chatgpt.com
+                    </code>
+                    、
+                    <code className="rounded-xs bg-code px-1.5 py-0.5 font-mono text-caption text-fg">
+                      *.openai.com
+                    </code>
+                    、
+                    <code className="rounded-xs bg-code px-1.5 py-0.5 font-mono text-caption text-fg">
+                      *.oaistatic.com
+                    </code>
+                    、
+                    <code className="rounded-xs bg-code px-1.5 py-0.5 font-mono text-caption text-fg">
+                      *.oaiusercontent.com
+                    </code>{" "}
+                    → 该情景；默认情景保持「直接连接」。
                   </li>
                   <li>
                     或者更省事：新建「PAC 情景模式」，PAC 网址填上面的{" "}
-                    <span className="font-mono">PAC 地址</span>，再在 PAC 情景里设置凭据。
+                    <code className="rounded-xs bg-code px-1.5 py-0.5 font-mono text-caption text-fg">
+                      PAC 地址
+                    </code>
+                    ，再在 PAC 情景里设置凭据。
                   </li>
                 </>
               )}
             </ol>
-            <p className="mt-3 text-caption text-muted">
+            <div className="oc-callout oc-callout-info mt-3 rounded-lg px-3 py-2 text-caption text-muted">
               代理只放行 ChatGPT 及其登录依赖域名的 443 端口，不能作为通用代理使用。
-            </p>
+            </div>
           </section>
         </div>
       )}

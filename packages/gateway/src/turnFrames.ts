@@ -233,6 +233,7 @@ export function _earlyRejectErrorFrames(args: {
   code: OutboundError['code']
   message: string
   legacyErrorText: string
+  clientMessageId?: string
 }): readonly [OutboundError & { _userId?: string }, OutboundMessage & { _userId?: string }] {
   const structured: OutboundError & { _userId?: string } = {
     type: 'outbound.error',
@@ -244,6 +245,7 @@ export function _earlyRejectErrorFrames(args: {
     message: args.message,
     isFinal: false,
     traceId: args.traceId,
+    ...(args.clientMessageId ? { clientMessageId: args.clientMessageId } : {}),
     _userId: args.userId,
   }
   const legacyFinal: OutboundMessage & { _userId?: string } = {
@@ -254,6 +256,7 @@ export function _earlyRejectErrorFrames(args: {
     blocks: [{ kind: 'text', text: args.legacyErrorText }],
     isFinal: true,
     traceId: args.traceId,
+    ...(args.clientMessageId ? { clientMessageId: args.clientMessageId } : {}),
     _userId: args.userId,
   }
   return [structured, legacyFinal] as const

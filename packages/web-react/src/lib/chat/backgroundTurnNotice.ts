@@ -16,9 +16,9 @@ import { TURN_COST_REMINDER_CREDITS } from "./reducer";
 import { formatCredits } from "../utils";
 import type { DispatchStatus } from "./socket";
 
-/** 触发条件全部消失后,提示条再保留这么久,避免排队刚泵出时来回闪。 */
-export const BACKGROUND_TURN_HOLD_MS = 10_000;
-/** 提示条自带的复检节拍:保持期到点靠它推进。 */
+/** 独立后台回合提示条已并入 QueuedSendList，不再保留 10 秒残影。 */
+export const BACKGROUND_TURN_HOLD_MS = 0;
+/** 提示条复检节拍（保留导出以兼容上游 hook）。 */
 export const BACKGROUND_TURN_TICK_MS = 5_000;
 
 export const BACKGROUND_TURN_TEXT = "本轮仍在运行。现在发送的消息会等本轮结束后再发出，另行计费。";
@@ -80,22 +80,19 @@ export function turnCreditsLine(
   return `本轮已扣 ${formatCredits(c.settled)} 积分${asOf}`;
 }
 
-/** 仅在已有排队消息时触发横幅;未排队时不弹出(继续/重复发送仍走 guardSend 软确认)。 */
-export function backgroundTurnTriggered(f: BackgroundTurnFacts): boolean {
-  return f.queuedCount > 0;
+/** 独立后台回合横幅已退场（合并至 QueuedSendList 副标题 + TurnCostReminder 独立承接）。 */
+export function backgroundTurnTriggered(_f: BackgroundTurnFacts): boolean {
+  return false;
 }
 
 /**
- * 显隐判定。断线时不显示:连接条和活动行已经说明了情况,而且断线期间无法确认本轮还在跑,
- * 说「仍在运行」就是撒谎。本轮结束、停止结算、断线都立即消失并清掉保持期。
+ * 显隐判定：独立横幅与 10 秒残影均已移除，统一返回隐藏。
+ * 保留函数签名以兼容 `useBackgroundTurn`（`guardSend` 软确认继续独立有效）。
  */
 export function decideBackgroundTurnNotice(
-  f: BackgroundTurnFacts & { lastTriggerAt: number | null; now: number },
+  _f: BackgroundTurnFacts & { lastTriggerAt: number | null; now: number },
 ): { visible: boolean; lastTriggerAt: number | null } {
-  if (!f.turnOpen || f.transport !== "connected") return { visible: false, lastTriggerAt: null };
-  if (backgroundTurnTriggered(f)) return { visible: true, lastTriggerAt: f.now };
-  const held = f.lastTriggerAt !== null && f.now - f.lastTriggerAt < BACKGROUND_TURN_HOLD_MS;
-  return { visible: held, lastTriggerAt: held ? f.lastTriggerAt : null };
+  return { visible: false, lastTriggerAt: null };
 }
 
 export function backgroundTurnNoticeText(compact: boolean, creditsLine?: string | null): string {

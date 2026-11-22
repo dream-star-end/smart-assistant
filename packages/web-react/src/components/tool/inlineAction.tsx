@@ -14,13 +14,13 @@
 import { type ButtonHTMLAttributes, type MouseEvent, forwardRef } from 'react'
 import { cn } from '../../lib/utils'
 
-/** 行内文字操作的基类(text-xs 档,展开/收起/查看更多)。 */
+/** 行内文字操作的基类(text-meta 档,展开/收起/查看更多)。 */
 export const INLINE_ACTION_CLS =
-  'inline-flex items-center gap-1 rounded text-xs text-accent outline-none transition-colors hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11'
+  'inline-flex items-center gap-1 rounded-xs px-1 -mx-1 text-meta font-medium text-accent outline-none transition-colors duration-150 hover:bg-accent-soft/60 hover:text-accent-strong focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11'
 
 /** `<summary>` 用:保留 list-item 显示(浏览器原生三角标记),触屏下用上下内边距把命中区撑到 44px。 */
 export const INLINE_SUMMARY_CLS =
-  'cursor-pointer rounded text-caption text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-3.5'
+  'cursor-pointer rounded-xs text-caption font-medium text-accent outline-none transition-colors duration-150 hover:text-accent-strong hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-3.5'
 
 export interface InlineActionProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   /** 整行可点的块级形态(diff 底部「展开全部」行):左对齐、占满宽度、hover 底色。 */
@@ -43,7 +43,7 @@ export const InlineAction = forwardRef<HTMLButtonElement, InlineActionProps>(fun
       className={cn(
         INLINE_ACTION_CLS,
         block &&
-          'flex w-full rounded-none px-3 py-1 text-left hover:bg-hover/60 focus-visible:ring-inset',
+          'mx-0 flex w-full rounded-none px-3 py-1.5 text-left hover:bg-hover/65 focus-visible:ring-inset',
         className,
       )}
       {...props}

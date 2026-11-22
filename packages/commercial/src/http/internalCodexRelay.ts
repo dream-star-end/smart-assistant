@@ -177,6 +177,86 @@ export function buildCodexRelayLocalBaseUrl(
   return `${localOrigin.replace(/\/+$/, '')}${codexRelayBasePathForUpstream(upstreamBaseUrl)}`
 }
 
+const CODEX_OFFICIAL_RELAY_BASE_PATH = codexRelayBasePathForUpstream(CODEX_OFFICIAL_UPSTREAM_BASE_URL)
+
+export interface CodexBenignAuxStub {
+  readonly status: number
+  readonly body: string
+  readonly contentType?: string
+}
+
+const RAW_TRAVERSAL_SEGMENT_RE = /(^|\/)(?:\.|%2e){1,2}(?:$|\/)/i
+
+function hasRawPathTraversal(reqUrl: string): boolean {
+  const rawPath = reqUrl.split(/[?#]/, 1)[0] ?? ''
+  if (!rawPath.startsWith('/')) return true
+  if (
+    rawPath.includes('://')
+    || rawPath.includes('\\')
+    || rawPath.includes('\u0000')
+    || rawPath.includes('//')
+    || /%5c|%00/i.test(rawPath)
+    || RAW_TRAVERSAL_SEGMENT_RE.test(rawPath)
+  ) {
+    return true
+  }
+  return false
+}
+
+/**
+ * OCV5-825 (B6): Benign auxiliary discovery/settings endpoints added by Codex CLI 0.170.0
+ * under `chatgpt_base_url` (`/backend-api/codex`).
+ *
+ * Security boundary:
+ *  - Raw un-normalized path is checked for dot-segments/traversal BEFORE parsing.
+ *  - Response is only sent AFTER `verifyContainerIdentity` and active binding checks
+ *    succeed (invalid/missing auth still returns 401/409).
+ *  - Never forwarded to upstream `chatgpt.com` (zero residential proxy traffic,
+ *    zero upstream credential read/exposure or failure marking).
+ */
+export function matchCodexBenignAuxStub(reqUrl: string, method: string): CodexBenignAuxStub | null {
+  if (hasRawPathTraversal(reqUrl)) return null
+  const rawPath = reqUrl.split(/[?#]/, 1)[0] ?? ''
+  if (!rawPath.startsWith(`${CODEX_OFFICIAL_RELAY_BASE_PATH}/`)) {
+    return null
+  }
+  const suffixRaw = rawPath.slice(CODEX_OFFICIAL_RELAY_BASE_PATH.length)
+  if (!suffixRaw || /%2f/i.test(suffixRaw)) return null
+  let decoded: string
+  try {
+    decoded = decodeURIComponent(suffixRaw)
+  } catch {
+    return null
+  }
+  if (
+    decoded.includes('..')
+    || decoded.includes('\\')
+    || decoded.startsWith('//')
+    || decoded.includes('\u0000')
+  ) {
+    return null
+  }
+  if (method === 'GET' && (decoded === '/ps/plugins/suggested/codex' || decoded === '/ps/plugins/installed')) {
+    return { status: 200, body: '{"plugins":[]}', contentType: 'application/json; charset=utf-8' }
+  }
+  if (method === 'GET' && (decoded === '/wham/accounts/check' || decoded === '/wham/settings/user')) {
+    return { status: 200, body: '{}', contentType: 'application/json; charset=utf-8' }
+  }
+  if (decoded === '/ps/mcp') {
+    if (method === 'POST') {
+      return {
+        status: 200,
+        body: '{"jsonrpc":"2.0","id":null,"error":{"code":-32601,"message":"mcp relay disabled"}}',
+        contentType: 'application/json; charset=utf-8',
+      }
+    }
+    if (method === 'GET' || method === 'DELETE') {
+      return { status: 204, body: '' }
+    }
+  }
+  return null
+}
+
 function validateRelaySuffix(method: string, suffixRaw: string): { ok: true } | { ok: false; status: number; code: string; message: string } {
   const suffix = suffixRaw.length === 0 ? '/' : suffixRaw
   let decoded: string
@@ -214,6 +294,13 @@ export function mapCodexRelayUrl(
   method: string,
   upstreamBaseUrl: string,
 ): { url: string; upstreamHost: string; upstreamPath: string; suffix: string } | { error: { status: number; code: string; message: string } } {
+  const rawPath = reqUrl.split(/[?#]/, 1)[0] ?? ''
+  if (rawPath.includes('://')) {
+    return { error: { status: 400, code: 'BAD_URL', message: 'absolute url proxying is not allowed' } }
+  }
+  if (RAW_TRAVERSAL_SEGMENT_RE.test(rawPath) || rawPath.includes('\\') || rawPath.includes('\u0000')) {
+    return { error: { status: 400, code: 'BAD_PATH', message: 'unsafe relay path' } }
+  }
   let parsed: URL
   try {
     parsed = new URL(reqUrl, 'http://internal')
@@ -783,7 +870,8 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
       return
     }
     let mapped: ReturnType<typeof mapCodexRelayUrl> | null = null
-    if (routeReq.route === false) {
+    const auxStub = routeReq.route === false ? matchCodexBenignAuxStub(req.url ?? '/', method) : null
+    if (routeReq.route === false && !auxStub) {
       mapped = mapCodexRelayUrlMulti(req.url ?? '/', method, upstreamBaseUrls)
       if ('error' in mapped) {
         if (mapped.error.code === 'PATH_NOT_ALLOWED' || mapped.error.code === 'BAD_PATH') {
@@ -839,6 +927,12 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     if (binding.state !== 'active') {
       userLog.warn('container_not_active', { state: binding.state })
       sendJsonError(res, 409, 'CONTAINER_BINDING_CHANGED', 'container is not active', requestId)
+      return
+    }
+    if (auxStub) {
+      res.statusCode = auxStub.status
+      if (auxStub.contentType) res.setHeader('Content-Type', auxStub.contentType)
+      res.end(auxStub.body)
       return
     }
 

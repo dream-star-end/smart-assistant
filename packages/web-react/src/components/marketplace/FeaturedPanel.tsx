@@ -1,10 +1,9 @@
 import { isMarketplaceCategoryId, marketplaceCategoryLabel } from "@openclaude/protocol/browser";
-import { RefreshCw, Star, Users } from "lucide-react";
+import { Layers, RefreshCw, Star, Users } from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
 import { formatInstallCount, sortFeaturedListings } from "../../lib/marketplace";
 import type { AuthSession, MarketplaceCard } from "../../lib/types";
-import { cn } from "../../lib/utils";
 import {
   Alert,
   Badge,
@@ -18,6 +17,7 @@ import {
   Toolbar,
   useToast,
 } from "../ui";
+import { CardMark } from "./CardMark";
 
 /** 目录拉取上限(技能+智能体各一页;搜索目录本身有 500 上限,精选面看全量足够)。 */
 const CATALOG_LIMIT = 200;
@@ -42,23 +42,35 @@ function isDirty(card: MarketplaceCard, draft: string): boolean {
 function ListSection({
   title,
   count,
+  featured = false,
   children,
 }: {
   title: string;
   count: number;
+  featured?: boolean;
   children: ReactNode;
 }) {
   return (
-    <section className="flex flex-col gap-2">
-      <div className="flex items-center gap-1.5">
-        <h4 className="text-meta font-semibold text-muted">
+    <section className="flex flex-col gap-2.5">
+      <div className="flex items-center gap-2">
+        <span
+          aria-hidden="true"
+          className={
+            featured
+              ? "oc-icon-badge oc-icon-badge-accent size-6 rounded-md"
+              : "oc-icon-badge size-6 rounded-md"
+          }
+        >
+          {featured ? <Star size={12} strokeWidth={1.9} /> : <Layers size={12} strokeWidth={1.9} />}
+        </span>
+        <h4 className="text-section font-semibold tracking-tight text-fg">
           {title}
         </h4>
-        <Badge tone="neutral" size="sm">
+        <Badge tone={featured ? "accent" : "neutral"} size="sm" className="tabular-nums">
           {count}
         </Badge>
       </div>
-      <ul className="flex flex-col gap-2">{children}</ul>
+      <ul className="flex flex-col gap-2.5">{children}</ul>
     </section>
   );
 }
@@ -88,16 +100,19 @@ function FeaturedRow({
     : "未分类";
   const users30d = card.users30d ?? 0;
   const dirty = isDirty(card, draft);
+  const isFeatured = card.featuredRank != null;
   return (
     <li>
       <CardRow
+        icon={<CardMark name={card.name} category={card.category} />}
         title={card.name}
+        className={isFeatured ? "oc-surface-card-hover border-accent/25" : "oc-surface-card-hover"}
         description={
-          <span className="inline-flex flex-wrap items-center gap-1.5">
+          <span className="inline-flex flex-wrap items-center gap-1.5 tabular-nums">
             <span>{catLabel}</span>
             <span aria-hidden="true">·</span>
             <span className="inline-flex items-center gap-1">
-              <Users size={11} aria-hidden="true" /> 30天 {formatInstallCount(users30d) ?? 0} 人在用
+              <Users size={11} strokeWidth={1.8} aria-hidden="true" /> 30天 {formatInstallCount(users30d) ?? 0} 人在用
             </span>
           </span>
         }
@@ -107,9 +122,9 @@ function FeaturedRow({
             <Badge tone={card.kind === "agent" ? "accent" : "neutral"} size="sm">
               {card.kind === "agent" ? "智能体" : "技能"}
             </Badge>
-            {card.featuredRank != null && (
-              <Badge tone="info" size="sm">
-                <Star size={10} aria-hidden="true" /> 精选 #{card.featuredRank}
+            {isFeatured && (
+              <Badge tone="info" size="sm" className="tabular-nums">
+                <Star size={10} strokeWidth={2} aria-hidden="true" /> 精选 #{card.featuredRank}
               </Badge>
             )}
           </>
@@ -127,7 +142,7 @@ function FeaturedRow({
                 placeholder="非精选"
                 aria-label={`${card.name} 精选排序`}
                 aria-invalid={error ? true : undefined}
-                className={cn("w-24", error && "border-danger")}
+                className="w-24 tabular-nums"
               />
               <Button
                 size="sm"
@@ -332,18 +347,18 @@ export function FeaturedPanel({ auth }: { auth: AuthSession }) {
         actions={
           <Button
             size="sm"
-            variant="ghost"
+            variant="secondary"
             onClick={() => setReload((n) => n + 1)}
             loading={loading}
             aria-label="刷新目录"
           >
-            {!loading && <RefreshCw size={14} aria-hidden="true" />} 刷新
+            {!loading && <RefreshCw size={14} strokeWidth={1.8} aria-hidden="true" />} 刷新
           </Button>
         }
       />
 
-      <div className="flex flex-col gap-3 px-4 py-4">
-        <Alert tone="info" density="compact" icon={<Star size={15} />}>
+      <div className="flex flex-col gap-3.5 px-4 py-4">
+        <Alert tone="info" density="compact" icon={<Star size={15} strokeWidth={1.8} />}>
           精选排序越小越靠前，出现在「发现」页顶部的「平台精选」区；留空即取消精选。保存立即生效，列表顺序在点「刷新」后重排。
         </Alert>
 
@@ -396,9 +411,9 @@ export function FeaturedPanel({ auth }: { auth: AuthSession }) {
             />
           )
         ) : (
-          <div className="flex flex-col gap-4">
+          <div className="flex flex-col gap-5">
             {featuredRows.length > 0 && (
-              <ListSection title="当前精选" count={featuredRows.length}>
+              <ListSection title="当前精选" count={featuredRows.length} featured>
                 {featuredRows.map(renderRow)}
               </ListSection>
             )}

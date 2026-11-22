@@ -1,0 +1,25 @@
+{
+  "UI-SCROLL-SINGLE-WRITER": {
+    "components/chat/delegateProcessList.tsx": 2,
+    "components/chat/DeliverableRichPreview.tsx": 3,
+    "components/chat/QuickAskWindow.tsx": 1,
+    "components/chat/SwarmBoardDrawer.tsx": 3,
+    "components/MessageRenderer.tsx": 1
+  },
+  "UI-ZINDEX-LADDER": {
+    "components/chat/liveBrowser.css": 2,
+    "components/chat/WorkbenchBottomBar.tsx": 1,
+    "components/HtmlEmbed.tsx": 2,
+    "components/ImageAnnotationEditor.tsx": 2,
+    "components/ImageViewer.tsx": 3,
+    "components/InspectorPanel.tsx": 2,
+    "components/iui/iui.css": 1,
+    "components/payment/PendingPaymentRecovery.tsx": 1,
+    "components/RichBlocks.tsx": 2,
+    "components/ui/Toast.tsx": 1
+  },
+  "UI-ZERO-LEARNING-COPY": {},
+  "UI-REDUCED-MOTION": {
+    "styles/containerWebPreview.css": 4
+  }
+}

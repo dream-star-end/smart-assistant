@@ -79,7 +79,7 @@ const DOWN_TAGS = [
   "其他",
 ] as const;
 
-/** 单个可切换标签 Chip —— 复用仓内既有 chip 视觉（PublishPanel 同款），不发明新样式。*/
+/** 单个可切换标签 Chip —— 复用仓内既有 chip 视觉（PublishPanel 同款），增加触感层次。*/
 function TagChip({
   label,
   active,
@@ -96,10 +96,10 @@ function TagChip({
       onClick={onClick}
       className={cn(
         // 触屏下 chip 加高到 44px 触控靶(桌面保持紧凑)。
-        "rounded-full border px-2.5 py-1 text-meta outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3.5",
+        "oc-btn-tactile rounded-full border px-2.5 py-1 text-caption font-medium outline-none transition-all duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3.5",
         active
-          ? "border-accent/50 bg-accent-soft text-accent"
-          : "border-border text-muted hover:border-accent/40 hover:text-fg",
+          ? "border-accent/50 bg-accent-soft text-accent shadow-soft"
+          : "border-border bg-surface text-muted hover:border-accent/40 hover:bg-hover hover:text-fg",
       )}
     >
       {label}
@@ -107,7 +107,7 @@ function TagChip({
   );
 }
 
-/** 单个 thumb 图标按钮，选中态高亮（tone=accent + 实心图标），尺寸对齐 MessageActions。*/
+/** 单个 thumb 图标按钮，选中态高亮（tone=accent + 暖陶土微底 + 实心图标），尺寸对齐 MessageActions。*/
 function ThumbButton({
   kind,
   selected,
@@ -128,10 +128,13 @@ function ThumbButton({
       aria-label={label}
       aria-pressed={selected}
       title={label}
-      className={cn(selected && "text-accent hover:text-accent")}
+      className={cn(
+        "oc-btn-tactile",
+        selected && "bg-accent-soft text-accent hover:bg-accent-soft hover:text-accent",
+      )}
       onClick={onClick}
     >
-      <Icon size={15} className={cn(selected && "fill-current")} />
+      <Icon size={15} strokeWidth={1.75} className={cn(selected && "fill-current")} />
     </IconButton>
   );
 }
@@ -222,9 +225,9 @@ export function ResponseRatingCard({
       {expanded && rating && (
         <div
           data-rating-panel
-          className="order-last mt-1 flex basis-full flex-col gap-2.5 rounded-lg border border-border bg-surface/60 px-3 py-2.5 animate-in"
+          className="oc-surface-card order-last mt-1.5 flex basis-full flex-col gap-2.5 rounded-xl px-3.5 py-3 animate-in"
         >
-          <p className="text-meta text-muted">已记录，可选补充原因</p>
+          <p className="text-caption font-medium text-muted">已记录，可选补充原因</p>
           <div className="flex flex-wrap gap-1.5">
             {DOWN_TAGS.map((t) => (
               <TagChip key={t} label={t} active={tags.includes(t)} onClick={() => toggleTag(t)} />
@@ -239,9 +242,9 @@ export function ResponseRatingCard({
               aria-label="补充评价"
               placeholder="补充说说哪里不好（可选）"
               // text-base（≥16px）防 iOS 聚焦整页放大，md+ 回落紧凑字号（与 Input 原语同策略）。
-              className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2.5 text-base text-fg outline-none transition-[border-color,box-shadow] duration-150 placeholder:text-faint focus:border-accent focus:ring-2 focus:ring-ring md:text-body"
+              className="oc-surface-recessed h-8 min-w-0 flex-1 rounded-lg border border-border-control/70 bg-surface px-2.5 text-base text-fg outline-none transition-[border-color,box-shadow] duration-150 placeholder:text-faint focus:border-accent focus:ring-2 focus:ring-ring md:text-body"
             />
-            <Button size="sm" variant="secondary" shape="pill" onClick={submitDetail}>
+            <Button size="sm" variant="secondary" shape="pill" className="oc-btn-tactile oc-btn-secondary-craft" onClick={submitDetail}>
               保存补充
             </Button>
           </div>

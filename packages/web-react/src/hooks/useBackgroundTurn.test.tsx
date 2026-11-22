@@ -66,116 +66,43 @@ function renderTurn(initial: Props) {
   return { ...view, confirm };
 }
 
-describe("useBackgroundTurn 提示条显隐(B4-SPEC §3.2)", () => {
-  test("不在飞 → 不显示;在飞但无排队(含 detached / 静默 ≥30s / 实扣积分) → 不显示", () => {
+describe("useBackgroundTurn 提示条退场（独立横幅并入 QueuedSendList，无 10 秒残影）", () => {
+  test("无论是否排队、断线或实扣积分，均不再弹出独立横幅也不留 10 秒残影", () => {
     vi.useFakeTimers({ now: T0 });
-    const idle = makeSess({ _sendingInFlight: false });
-    const { result, rerender } = renderTurn({ sess: idle });
+    expect(BACKGROUND_TURN_HOLD_MS).toBe(0);
+    const sess = makeSess();
+    const { result, rerender } = renderTurn({ sess, queuedCount: 0 });
     expect(result.current.notice).toBeNull();
-    rerender({ sess: makeSess() });
+
+    rerender({ sess, queuedCount: 1 });
     expect(result.current.notice).toBeNull();
-    act(() => {
-      vi.advanceTimersByTime(30_000 + BACKGROUND_TURN_TICK_MS);
-    });
-    expect(result.current.notice).toBeNull();
+
     rerender({
       sess: makeSess({
-        _lastFrameAt: T0 - 1000,
-        _turnDetachedAt: T0,
         _turnCredits: { clientMessageId: "c1", settled: "1520", requests: 3, asOf: T0, receivedAt: T0 },
       }),
+      queuedCount: 1,
+      compact: true,
     });
     expect(result.current.notice).toBeNull();
-  });
 
-  test("有排队消息 → 显示;桌面和窄屏文案不同,高额积分升 warning", () => {
-    vi.useFakeTimers({ now: T0 });
-    const sess = makeSess();
-    const { result, rerender } = renderTurn({ sess, queuedCount: 1 });
-    expect(result.current.notice).toEqual({ text: BACKGROUND_TURN_TEXT, compact: false, tone: "info" });
-    rerender({ sess, queuedCount: 1, compact: true });
-    expect(result.current.notice).toEqual({ text: BACKGROUND_TURN_TEXT_COMPACT, compact: true, tone: "info" });
-    const withCredits = makeSess({
-      _turnCredits: { clientMessageId: "c1", settled: "1520", requests: 3, asOf: T0, receivedAt: T0 },
-    });
-    rerender({ sess: withCredits, queuedCount: 1, compact: false });
-    expect(result.current.notice).toEqual({
-      text: "本轮已扣 1,520 积分，仍在运行。现在发送的消息会等本轮结束后再发出，另行计费。",
-      compact: false,
-      tone: "warning",
-    });
-  });
-
-  test("有排队消息 → 显示;排队清空后保持 10 秒再消失", () => {
-    vi.useFakeTimers({ now: T0 });
-    const sess = makeSess();
-    const { result, rerender } = renderTurn({ sess, queuedCount: 1 });
-    expect(result.current.notice).not.toBeNull();
-    // 有新帧、排队被泵出:触发全部消失,进入保持期。
-    sess._lastFrameAt = Date.now();
     rerender({ sess, queuedCount: 0 });
-    expect(result.current.notice).not.toBeNull();
-    act(() => {
-      vi.advanceTimersByTime(BACKGROUND_TURN_HOLD_MS - 1000);
-    });
-    sess._lastFrameAt = Date.now();
-    rerender({ sess, queuedCount: 0 });
-    expect(result.current.notice).not.toBeNull();
-    // 节拍在 T0+10s 复检:保持期到点,无需 App 重渲就消失。
     act(() => {
       vi.advanceTimersByTime(BACKGROUND_TURN_TICK_MS);
     });
     expect(result.current.notice).toBeNull();
   });
-
-  test("回合结束 / 开始停止结算 / 断线 / 受理前 → 立即消失,不走保持期", () => {
-    vi.useFakeTimers({ now: T0 });
-    for (const end of [
-      { sess: makeSess({ _sendingInFlight: false }) },
-      { sess: makeSess({ _stopSettlement: {} as ChatSession["_stopSettlement"] }) },
-      { sess: makeSess(), cls: "disconnected" as const },
-      { sess: makeSess(), cls: "connecting" as const },
-      { sess: makeSess(), dispatch: { phase: "sending", queued: 1, serviceStarting: false } as DispatchStatus },
-      { sess: makeSess(), enabled: false },
-    ]) {
-      const { result, rerender, unmount } = renderTurn({ sess: makeSess(), queuedCount: 1 });
-      expect(result.current.notice).not.toBeNull();
-      rerender({ queuedCount: 1, ...end });
-      expect(result.current.notice).toBeNull();
-      unmount();
-    }
-  });
-
-  test("换了一轮(cmid 变)不继承上一轮的保持期", () => {
-    vi.useFakeTimers({ now: T0 });
-    const { result, rerender } = renderTurn({ sess: makeSess(), queuedCount: 1 });
-    expect(result.current.notice).not.toBeNull();
-    rerender({ sess: makeSess({ _activeClientMessageId: "c2" }), queuedCount: 0 });
-    expect(result.current.notice).toBeNull();
-  });
-
-  test("断线后重连:保持期已被清掉,没有触发就不显示", () => {
-    vi.useFakeTimers({ now: T0 });
-    const sess = makeSess();
-    const { result, rerender } = renderTurn({ sess, queuedCount: 1 });
-    rerender({ sess, queuedCount: 0, cls: "disconnected" });
-    expect(result.current.notice).toBeNull();
-    rerender({ sess, queuedCount: 0, cls: "connected" });
-    expect(result.current.notice).toBeNull();
-  });
 });
 
 describe("BackgroundTurnBanner", () => {
-  test("polite 读屏、不带动作按钮;桌面走横幅栈的居中容器,窄屏只留下边距", () => {
-    const { rerender } = render(<BackgroundTurnBanner notice={{ text: BACKGROUND_TURN_TEXT, compact: false }} />);
-    const banner = screen.getByTestId("background-turn-banner");
-    expect(banner).toHaveAttribute("role", "status");
-    expect(banner).toHaveTextContent(BACKGROUND_TURN_TEXT);
-    expect(banner.parentElement).toHaveClass("mx-auto", "mb-2", "max-w-3xl", "px-4");
-    expect(screen.queryByRole("button")).toBeNull();
+  test("独立横幅组件已退场返回 null（排队与计费提醒由 QueuedSendList 与 TurnCostReminder 承接）", () => {
+    const { container, rerender } = render(
+      <BackgroundTurnBanner notice={{ text: BACKGROUND_TURN_TEXT, compact: false }} />,
+    );
+    expect(container.firstChild).toBeNull();
+    expect(screen.queryByTestId("background-turn-banner")).toBeNull();
     rerender(<BackgroundTurnBanner notice={{ text: BACKGROUND_TURN_TEXT_COMPACT, compact: true }} />);
-    expect(screen.getByTestId("background-turn-banner").parentElement).toHaveClass("mb-2");
-    expect(screen.getByTestId("background-turn-banner").parentElement).not.toHaveClass("max-w-3xl");
+    expect(container.firstChild).toBeNull();
   });
 });
 

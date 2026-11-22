@@ -1,4 +1,4 @@
-import { ArrowLeftRight, BadgeCheck, Flag, History, MessageSquare, Play } from 'lucide-react'
+import { ArrowDown, ArrowLeftRight, BadgeCheck, Flag, History, MessageSquare, Play } from 'lucide-react'
 import { type ReactNode, memo, useEffect, useId, useMemo, useRef, useState } from 'react'
 import {
   RUN_STATUS_LABEL,
@@ -79,19 +79,19 @@ function kindLabel(kind: TicketTimelineKind): string {
 }
 
 function dotClass(node: TicketTimelineNode): string {
-  if (node.kind === 'comment') return 'border-accent bg-accent-soft text-accent'
-  if (node.kind === 'approval') return 'border-success bg-success-soft text-success'
-  if (node.kind === 'status') return 'border-warning bg-warning-soft text-warning'
-  if (node.kind === 'run_start') return 'border-info bg-info-soft text-info'
+  if (node.kind === 'comment') return 'oc-icon-badge oc-icon-badge-accent'
+  if (node.kind === 'approval') return 'oc-icon-badge oc-icon-badge-success'
+  if (node.kind === 'status') return 'oc-icon-badge oc-icon-badge-warning'
+  if (node.kind === 'run_start') return 'oc-icon-badge oc-icon-badge-info'
   if (node.kind === 'run_end') {
     const status = node.run?.status
     if (status === 'failed' || status === 'timeout')
-      return 'border-danger bg-danger-soft text-danger'
-    if (status === 'skipped') return 'border-warning bg-warning-soft text-warning'
-    if (status === 'succeeded') return 'border-success bg-success-soft text-success'
-    return 'border-info bg-info-soft text-info'
+      return 'oc-icon-badge oc-icon-badge-danger'
+    if (status === 'skipped') return 'oc-icon-badge oc-icon-badge-warning'
+    if (status === 'succeeded') return 'oc-icon-badge oc-icon-badge-success'
+    return 'oc-icon-badge oc-icon-badge-info'
   }
-  return 'border-border bg-hover text-muted'
+  return 'oc-icon-badge'
 }
 
 function KindIcon({ kind }: { kind: TicketTimelineKind }) {
@@ -105,9 +105,9 @@ function KindIcon({ kind }: { kind: TicketTimelineKind }) {
 }
 
 function authorChipClass(kind: string): string {
-  if (kind === 'agent') return 'bg-accent-soft text-accent'
-  if (kind === 'human') return 'bg-hover text-fg'
-  return 'bg-hover text-muted'
+  if (kind === 'agent') return 'oc-badge-craft bg-accent-soft text-accent'
+  if (kind === 'human') return 'oc-badge-craft bg-hover text-fg'
+  return 'oc-badge-craft bg-hover text-muted'
 }
 
 function authorChipText(kind: string): string {
@@ -190,7 +190,7 @@ function DeferredCollapse({
             <div
               aria-hidden
               data-testid="ticket-comment-fade"
-              className="pointer-events-none absolute inset-x-0 bottom-0 h-8 bg-gradient-to-t from-elevated to-transparent md:from-sidebar"
+              className="pointer-events-none absolute inset-x-0 bottom-0 h-8 bg-gradient-to-t from-surface to-transparent"
             />
           </div>
         )}
@@ -290,7 +290,7 @@ function SystemRun({
       </p>
       {run.status === 'running' && run.preview && (
         <div
-          className="rounded-lg border border-border bg-hover px-3 py-2"
+          className="oc-surface-recessed rounded-xl px-3 py-2.5"
           data-testid="ticket-run-preview"
         >
           <p className="text-caption text-muted">
@@ -429,7 +429,7 @@ function GroupHeader({
             {timelineAuthorLabel(first.author, first.authorKind, pending)}
           </span>
           <span
-            className={`shrink-0 rounded px-1 text-caption ${authorChipClass(first.authorKind)}`}
+            className={`shrink-0 rounded-full px-1.5 py-0.5 text-caption font-medium ${authorChipClass(first.authorKind)}`}
           >
             {authorChipText(first.authorKind)}
           </span>
@@ -514,17 +514,18 @@ function TimelineGroupView({
 }) {
   const head = group.nodes[0]
   if (!head) return null
+  const richCard = head.kind === 'comment' || head.kind === 'run_end'
   const lineClass =
     isFirst && isLast ? 'hidden' : isFirst ? 'top-3 bottom-0' : isLast ? 'top-0 h-3' : 'inset-y-0'
   return (
     <li data-testid="ticket-timeline-group" className="relative flex gap-3">
       <div className="relative w-6 shrink-0">
         <span
-          className={`absolute left-1/2 w-px -translate-x-1/2 bg-border ${lineClass}`}
+          className={`absolute left-1/2 w-px -translate-x-1/2 bg-border/80 ${lineClass}`}
           aria-hidden
         />
         <span
-          className={`relative z-10 mt-0.5 flex h-6 w-6 items-center justify-center rounded-full border ${dotClass(head)}`}
+          className={`relative z-10 mt-0.5 size-6 rounded-full ${dotClass(head)}`}
           title={kindLabel(head.kind)}
         >
           <KindIcon kind={head.kind} />
@@ -532,7 +533,15 @@ function TimelineGroupView({
       </div>
       <div className="min-w-0 flex-1 pb-4">
         <GroupHeader group={group} stageById={stageById} stageName={stageName} now={now} />
-        <GroupBodies group={group} stageById={stageById} stageName={stageName} />
+        <div
+          className={
+            richCard
+              ? 'oc-surface-card mt-1.5 rounded-xl px-3.5 py-2.5'
+              : 'oc-surface-recessed mt-1.5 rounded-xl px-3 py-2'
+          }
+        >
+          <GroupBodies group={group} stageById={stageById} stageName={stageName} />
+        </div>
       </div>
     </li>
   )
@@ -578,39 +587,46 @@ export function TicketTimeline({
 
   return (
     <div
-      className="flex min-w-0 max-w-full shrink-0 flex-col gap-3 overflow-x-hidden border-t border-border pt-3"
+      className="flex min-w-0 max-w-full shrink-0 flex-col gap-3 overflow-x-hidden border-t border-border/70 pt-3.5"
       data-testid="ticket-timeline"
       data-filter={filter}
     >
-      <div className="flex flex-wrap items-center gap-1.5" role="tablist" aria-label="时间线筛选">
-        {TIMELINE_FILTERS.map((id) => {
-          const selected = filter === id
-          const count = model.counts[id]
-          return (
-            <button
-              key={id}
-              type="button"
-              role="tab"
-              aria-selected={selected}
-              data-testid={`ticket-timeline-filter-${id}`}
-              className={`rounded-full border px-2.5 py-1 text-caption [@media(hover:none)]:min-h-11 ${
-                selected
-                  ? 'border-accent bg-accent-soft text-accent'
-                  : 'border-border bg-surface text-muted'
-              }`}
-              onClick={() => setFilter(id)}
-            >
-              {FILTER_LABEL[id]}
-              {count ? ` ${count}` : ''}
-            </button>
-          )
-        })}
+      <div className="flex flex-wrap items-center gap-2">
+        <div
+          className="oc-surface-recessed inline-flex flex-wrap items-center gap-0.5 rounded-full p-0.5"
+          role="tablist"
+          aria-label="时间线筛选"
+        >
+          {TIMELINE_FILTERS.map((id) => {
+            const selected = filter === id
+            const count = model.counts[id]
+            return (
+              <button
+                key={id}
+                type="button"
+                role="tab"
+                aria-selected={selected}
+                data-testid={`ticket-timeline-filter-${id}`}
+                className={`rounded-full px-2.5 py-1 text-caption tabular-nums transition-[background-color,color,box-shadow] duration-150 outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 ${
+                  selected
+                    ? 'oc-segmented-thumb font-medium text-fg'
+                    : 'text-muted hover:text-fg'
+                }`}
+                onClick={() => setFilter(id)}
+              >
+                {FILTER_LABEL[id]}
+                {count ? ` ${count}` : ''}
+              </button>
+            )
+          })}
+        </div>
         <button
           type="button"
           data-testid="ticket-timeline-jump"
-          className="ml-auto rounded-full px-2.5 py-1 text-caption text-accent [@media(hover:none)]:min-h-11"
+          className="oc-btn-tactile ml-auto inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-caption font-medium text-accent hover:bg-accent-soft/60 [@media(hover:none)]:min-h-11"
           onClick={() => endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })}
         >
+          <ArrowDown size={12} aria-hidden />
           跳到最新
         </button>
       </div>
@@ -618,7 +634,7 @@ export function TicketTimeline({
       {loading && items.length === 0 ? (
         <ListSkeleton rows={3} variant="row" />
       ) : model.groups.length === 0 ? (
-        <p className="rounded-lg border border-dashed border-border px-3 py-3 text-center text-caption text-muted">
+        <p className="oc-surface-recessed rounded-xl border border-dashed border-border/80 px-3.5 py-4 text-center text-caption text-muted">
           {emptyText}
         </p>
       ) : (

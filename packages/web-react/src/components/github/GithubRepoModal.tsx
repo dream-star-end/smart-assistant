@@ -293,13 +293,13 @@ export function GithubRepoModal({
       }
     >
           {/* 账号栏 */}
-          <div className="border-b border-border bg-hover/30 px-5 py-3">
+          <div className="border-b border-border/70 bg-bg/60 px-5 py-3.5">
             {!auth || linkLoading ? (
               <div className="flex items-center gap-2 text-body text-faint">
                 <Spinner /> 加载账号状态…
               </div>
             ) : linkErr ? (
-              <div className="flex items-center justify-between gap-3">
+              <div className="oc-callout oc-callout-danger flex items-center justify-between gap-3 rounded-xl px-3.5 py-2.5">
                 <span className="text-body text-danger">{linkErr}</span>
                 <Button
                   variant="secondary"
@@ -310,10 +310,15 @@ export function GithubRepoModal({
                 </Button>
               </div>
             ) : link && !link.linked ? (
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-body text-muted">
-                  连接 GitHub 账号后即可把仓库绑定到当前会话
-                </span>
+              <div className="oc-surface-card flex flex-wrap items-center justify-between gap-3 rounded-xl px-4 py-3">
+                <div className="flex min-w-0 items-center gap-2.5">
+                  <span className="oc-icon-badge oc-icon-badge-accent size-8 rounded-lg" aria-hidden="true">
+                    <GitBranch size={15} strokeWidth={1.75} />
+                  </span>
+                  <span className="text-body text-muted">
+                    连接 GitHub 账号后即可把仓库绑定到当前会话
+                  </span>
+                </div>
                 <Button
                   variant="primary"
                   size="sm"
@@ -324,14 +329,15 @@ export function GithubRepoModal({
                 </Button>
               </div>
             ) : link && link.linked ? (
-              <div className="flex items-center gap-3">
+              <div className="oc-surface-card flex items-center gap-3 rounded-xl px-3.5 py-2.5">
                 <Avatar
                   size="sm"
                   src={link.avatar_url || undefined}
                   fallback={link.login?.[0]?.toUpperCase() || "G"}
+                  className="oc-avatar-ring"
                 />
                 <div className="min-w-0 flex-1">
-                  <div className="truncate text-section font-medium text-fg">
+                  <div className="truncate text-section font-semibold text-fg">
                     @{link.login}
                   </div>
                   <div className="truncate text-caption text-faint" title={link.scopes || undefined}>
@@ -374,12 +380,12 @@ export function GithubRepoModal({
             // grid 两列与列容器都要 min-w-0：否则超长仓库名把第一列按内容撑开，分支列右侧被裁掉（GH-01）。
             <div className="grid min-h-0 min-w-0 flex-1 grid-cols-1 gap-0 overflow-hidden sm:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
               {/* 仓库列 */}
-              <div className="flex min-h-0 min-w-0 flex-col border-border sm:border-r">
-                <div className="px-3 pt-3">
+              <div className="flex min-h-0 min-w-0 flex-col border-border/70 sm:border-r">
+                <div className="px-3.5 pt-3">
                   <div className="relative">
                     <Search
                       size={14}
-                      className="absolute left-3 top-1/2 -translate-y-1/2 text-faint"
+                      className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint"
                     />
                     <Input
                       value={search}
@@ -390,7 +396,7 @@ export function GithubRepoModal({
                     />
                   </div>
                 </div>
-                <div className="min-h-0 flex-1 overflow-y-auto p-2">
+                <div className="min-h-0 flex-1 overflow-y-auto p-2.5">
                   {reposLoading ? (
                     <div aria-live="polite" className="flex items-center justify-center gap-2 py-10 text-body text-faint">
                       <Spinner /> 加载仓库…
@@ -404,7 +410,7 @@ export function GithubRepoModal({
                       无匹配仓库
                     </p>
                   ) : (
-                    <ul className="flex flex-col gap-0.5" aria-label="仓库">
+                    <ul className="flex flex-col gap-1" aria-label="仓库">
                       {filteredRepos.map((r) => {
                         const active = selRepo?.full_name === r.full_name;
                         return (
@@ -414,17 +420,17 @@ export function GithubRepoModal({
                               aria-pressed={active}
                               onClick={() => onPickRepo(r)}
                               className={cn(
-                                "flex w-full min-w-0 items-center gap-2 rounded-lg px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+                                "oc-btn-tactile flex w-full min-w-0 items-center gap-2 rounded-xl px-3 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
                                 active
-                                  ? "bg-accent-soft text-accent"
-                                  : "hover:bg-hover",
+                                  ? "border border-accent/35 bg-accent-soft text-accent shadow-soft"
+                                  : "border border-transparent hover:bg-hover/70",
                               )}
                             >
                               <span className="min-w-0 flex-1 truncate text-body" title={r.full_name}>
                                 <span className="text-faint">
                                   {r.owner.login}/
                                 </span>
-                                <span className="font-medium text-fg">
+                                <span className="font-semibold text-fg">
                                   {r.name}
                                 </span>
                               </span>
@@ -448,11 +454,14 @@ export function GithubRepoModal({
               </div>
 
               {/* 分支列 */}
-              <div className="flex min-h-0 min-w-0 flex-col border-t border-border sm:border-t-0">
-                <div className="px-3 pt-3 text-caption font-medium uppercase tracking-wide text-faint">
-                  分支
+              <div className="flex min-h-0 min-w-0 flex-col border-t border-border/70 bg-bg/40 sm:border-t-0">
+                <div className="flex items-center justify-between px-3.5 pt-3 text-caption font-semibold uppercase tracking-wide text-faint">
+                  <span>分支</span>
+                  {branches.length > 0 && (
+                    <span className="tabular-nums font-normal">{branches.length}</span>
+                  )}
                 </div>
-                <div className="min-h-0 flex-1 overflow-y-auto p-2 pr-2">
+                <div className="min-h-0 flex-1 overflow-y-auto p-2.5">
                   {!selRepo ? (
                     <p className="px-2 py-8 text-center text-meta text-faint">
                       先选择左侧仓库
@@ -466,7 +475,7 @@ export function GithubRepoModal({
                       无分支
                     </p>
                   ) : (
-                    <ul className="flex flex-col gap-0.5" aria-label="分支">
+                    <ul className="flex flex-col gap-1" aria-label="分支">
                       {branches.map((b) => {
                         const active = selBranch === b.name;
                         return (
@@ -476,13 +485,13 @@ export function GithubRepoModal({
                               aria-pressed={active}
                               onClick={() => setSelBranch(b.name)}
                               className={cn(
-                                "flex w-full min-w-0 items-center gap-2 rounded-lg px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+                                "oc-btn-tactile flex w-full min-w-0 items-center gap-2 rounded-xl px-3 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
                                 active
-                                  ? "bg-accent-soft text-accent"
-                                  : "hover:bg-hover",
+                                  ? "border border-accent/35 bg-accent-soft text-accent shadow-soft"
+                                  : "border border-transparent hover:bg-hover/70",
                               )}
                             >
-                              <span className="min-w-0 flex-1 truncate text-body font-medium text-fg" title={b.name}>
+                              <span className="min-w-0 flex-1 truncate font-mono text-meta font-medium text-fg" title={b.name}>
                                 {b.name}
                               </span>
                               {b.name === selRepo.default_branch && (

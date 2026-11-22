@@ -2,11 +2,15 @@
 import { type Cc5ExecutionBackend, isCc5BackendAuthority, parseCc5ExecutionBackend } from './cc5Backend.js'
 import {
   REMOTE_DRIVER_BACKEND,
+  REMOTE_DRIVER_CHILD_SESSION_KEY_RE,
   type RemoteDriverExecutionBackend,
   isRemoteDriverBackendAuthority,
+  isRemoteDriverChildSessionKey,
   parseRemoteDriverExecutionBackend,
   sameRemoteDriverExecutionBackend,
 } from './remotePool/backend.js'
+
+export { REMOTE_DRIVER_CHILD_SESSION_KEY_RE, isRemoteDriverChildSessionKey }
 
 export const CODEX_REMOTE_BACKEND = 'codex-app-server-v1' as const
 export interface CodexExecutionBackend {

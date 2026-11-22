@@ -123,6 +123,10 @@ interface RemoteDriverJournalContextV4 {
   dispatchId: string
   attemptNo: number
   sessionId: string
+  mode?: 'chat' | 'delegate'
+  parentTurnKey?: string | null
+  parentSessionId?: string | null
+  delegateAgentId?: string | null
   pricing: PersistedBillingPricingV1
   billingRevision: string
   authority: {
@@ -255,6 +259,16 @@ function parseContextV4(raw: unknown): RemoteDriverJournalContextV4 {
       typeof c.sessionId === 'string' &&
       c.sessionId.length > 0 &&
       c.sessionId.length <= 256 &&
+      (c.mode === undefined || c.mode === 'chat' || c.mode === 'delegate') &&
+      (c.parentTurnKey === undefined ||
+        c.parentTurnKey === null ||
+        (typeof c.parentTurnKey === 'string' && HASH_RE.test(c.parentTurnKey))) &&
+      (c.parentSessionId === undefined ||
+        c.parentSessionId === null ||
+        (typeof c.parentSessionId === 'string' && c.parentSessionId.length <= 256)) &&
+      (c.delegateAgentId === undefined ||
+        c.delegateAgentId === null ||
+        (typeof c.delegateAgentId === 'string' && c.delegateAgentId.length <= 128)) &&
       typeof c.billingRevision === 'string' &&
       c.billingRevision.length > 0 &&
       typeof c.hostStartAttempted === 'boolean' &&
@@ -843,8 +857,11 @@ async function settleDriverReceiptV4(
     costCredits: cost,
     status: c.receipt.status === 'success' ? 'success' : 'error',
     sessionId: c.sessionId,
-    mode: 'chat',
+    mode: c.mode ?? 'chat',
     turnKey: c.turnKey,
+    ...(c.parentTurnKey ? { parentTurnKey: c.parentTurnKey } : {}),
+    ...(c.parentSessionId ? { parentSessionId: c.parentSessionId } : {}),
+    ...(c.delegateAgentId ? { delegateAgentId: c.delegateAgentId } : {}),
     authority: {
       ...c.authority,
       securityEpoch: BigInt(c.authority.securityEpoch),
@@ -1072,6 +1089,14 @@ export function createRemoteDriverTurnFinance(
           dispatchId: dispatch.dispatch_id,
           attemptNo: dispatch.attempt_no,
           sessionId: dispatch.session_id,
+          ...(a.billingAttribution
+            ? {
+                mode: a.billingAttribution.mode,
+                parentTurnKey: a.billingAttribution.parentTurnKey ?? null,
+                parentSessionId: a.billingAttribution.parentSessionId ?? null,
+                delegateAgentId: a.billingAttribution.delegateAgentId ?? null,
+              }
+            : {}),
           pricing: serializeBillingPricing(pricing),
           billingRevision: gate.snapshot.billingRevision,
           authority: {

@@ -31,9 +31,9 @@ export function AttachChip({
   return (
     <div
       className={cn(
-        "flex items-center gap-1.5 rounded-lg border bg-bg py-1.5 pr-1.5 text-meta",
-        isImage ? "pl-1.5" : "pl-2.5",
-        a.status === "error" ? "border-danger/40" : "border-border",
+        "oc-surface-card flex items-center gap-2 rounded-md py-1.5 pr-1.5 text-meta transition-colors",
+        isImage ? "pl-1.5" : "pl-2",
+        a.status === "error" && "ring-1 ring-inset ring-danger/35",
       )}
       title={a.status === "error" ? a.error || "上传失败" : `${a.name} · ${fmtSize(a.size)}`}
     >
@@ -42,24 +42,34 @@ export function AttachChip({
           type="button"
           onClick={onPreview}
           aria-label={`预览 ${a.name}`}
-          className="relative size-8 shrink-0 overflow-hidden rounded outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="oc-btn-tactile relative size-8 shrink-0 overflow-hidden rounded-xs ring-1 ring-inset ring-border/70 outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           <img src={a.previewUrl} alt={a.name} className="size-full object-cover" />
           {a.status === "uploading" && (
-            <span className="absolute inset-0 flex items-center justify-center bg-black/40">
-              <Loader2 size={13} className="animate-spin text-white" />
+            <span className="absolute inset-0 flex items-center justify-center bg-black/45">
+              <Loader2 size={13} strokeWidth={2} className="animate-spin text-white" />
             </span>
           )}
         </button>
       ) : a.status === "uploading" ? (
-        <Loader2 size={14} className="shrink-0 animate-spin text-accent" />
+        <span aria-hidden className="oc-icon-badge oc-icon-badge-accent size-7 rounded-xs">
+          <Loader2 size={13} strokeWidth={2} className="animate-spin" />
+        </span>
       ) : (
-        <FileText size={14} className={cn("shrink-0", a.status === "error" ? "text-danger" : "text-muted")} />
+        <span
+          aria-hidden
+          className={cn(
+            "oc-icon-badge size-7 rounded-xs",
+            a.status === "error" && "oc-icon-badge-danger",
+          )}
+        >
+          <FileText size={13} strokeWidth={1.75} />
+        </span>
       )}
       {/* 文件名中段截断(C-18):保留扩展名,同名不同格式的文件仍可分辨;完整名在 title。
           失败原因就地可见(C-10):触屏没有 hover,只放 title 等于没说。 */}
       <span className="flex min-w-0 flex-col">
-        <span className={cn("max-w-[160px] whitespace-nowrap", a.status === "error" ? "text-danger" : "text-fg")}>
+        <span className={cn("max-w-[160px] whitespace-nowrap font-medium", a.status === "error" ? "text-danger" : "text-fg")}>
           {middleTruncate(a.name, 24)}
         </span>
         {a.status === "uploading" && typeof a.sentBytes === "number" && a.size > 0 && (
@@ -71,9 +81,9 @@ export function AttachChip({
           <output className="text-caption text-danger">{a.error || "上传失败"}</output>
         )}
         {a.status === "uploading" && typeof a.sentBytes === "number" && a.size > 0 && (
-          <span className="relative mt-0.5 h-1 w-full overflow-hidden rounded bg-hover">
+          <span className="oc-surface-recessed relative mt-0.5 h-1.5 w-full overflow-hidden rounded-full">
             <span
-              className="absolute inset-y-0 left-0 bg-accent"
+              className="oc-progress-fill absolute inset-y-0 left-0 rounded-full bg-accent"
               style={{ width: `${Math.min(100, Math.round((a.sentBytes / a.size) * 100))}%` }}
             />
           </span>
@@ -86,9 +96,9 @@ export function AttachChip({
           type="button"
           onClick={onRetry}
           aria-label={`继续上传 ${a.name}`}
-          className="flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 font-medium text-danger hover:bg-danger/10 [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-2.5"
+          className="oc-btn-tactile flex h-6 shrink-0 items-center gap-1 rounded-xs px-1.5 font-medium text-danger hover:bg-danger/10 [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-2.5"
         >
-          <RotateCcw size={12} />
+          <RotateCcw size={12} strokeWidth={1.75} />
           继续
         </button>
       )}
@@ -99,9 +109,9 @@ export function AttachChip({
           disabled={!onAnnotate}
           aria-label={`编辑图片 ${a.name}`}
           title={annotateDisabledReason ?? "编辑 · Image 2"}
-          className="flex h-8 min-h-11 shrink-0 items-center gap-1 rounded-md px-2 text-meta font-medium text-accent hover:bg-accent/10 disabled:cursor-not-allowed disabled:opacity-35 sm:min-h-8"
+          className="oc-btn-tactile flex h-7 min-h-11 shrink-0 items-center gap-1 rounded-xs px-2 text-caption font-medium text-accent hover:bg-accent-soft disabled:cursor-not-allowed disabled:opacity-35 sm:min-h-7"
         >
-          <Pencil size={14} />
+          <Pencil size={13} strokeWidth={1.75} />
           编辑
         </button>
       )}
@@ -109,9 +119,9 @@ export function AttachChip({
         type="button"
         onClick={onRemove}
         aria-label={`移除 ${a.name}`}
-        className="flex size-6 shrink-0 items-center justify-center rounded text-faint hover:text-danger [@media(hover:none)]:size-11"
+        className="oc-btn-tactile flex size-6 shrink-0 items-center justify-center rounded-xs text-faint hover:bg-hover hover:text-danger [@media(hover:none)]:size-11"
       >
-        <X size={13} />
+        <X size={13} strokeWidth={1.75} />
       </button>
     </div>
   );

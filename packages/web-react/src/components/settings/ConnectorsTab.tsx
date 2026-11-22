@@ -891,7 +891,7 @@ export function ConnectorsTab({
   );
 }
 
-/** 插件分组：可选的弱化组标题（名称 + 等宽计数）+ 发丝线分隔的插件段。 */
+/** 插件分组：可选的弱化组标题（名称 + 等宽计数徽标）+ 精雕卡片组。 */
 function ConnectorGroup({
   label,
   count,
@@ -906,12 +906,16 @@ function ConnectorGroup({
   return (
     <div className={className}>
       {label && (
-        <h4 className="flex items-baseline gap-2 border-b border-border pb-2 text-meta font-medium text-faint">
-          {label}
-          <span className="tabular-nums">{count}</span>
+        <h4 className="mb-2 flex items-center gap-2 text-caption font-semibold uppercase tracking-wider text-faint">
+          <span>{label}</span>
+          <span className="oc-badge-craft rounded-full bg-hover px-1.5 py-0.5 text-caption font-medium tabular-nums text-muted">
+            {count}
+          </span>
         </h4>
       )}
-      <ul className="flex flex-col">{children}</ul>
+      <ul className="oc-surface-card flex flex-col divide-y divide-border/60 overflow-hidden rounded-2xl px-2 py-1">
+        {children}
+      </ul>
     </div>
   )
 }

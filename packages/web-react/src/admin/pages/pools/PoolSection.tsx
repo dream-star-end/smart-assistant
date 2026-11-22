@@ -1,4 +1,4 @@
-import { Plus } from "lucide-react";
+import { Boxes, Info, KeyRound, Plus } from "lucide-react";
 import { Button } from "../../../components/ui";
 import { type Column, DataTable, TimeAgo } from "../../components";
 import { apiErrorMessage } from "../../lib/adminApi";
@@ -22,11 +22,16 @@ export function errMsg(e: unknown): string {
 export function PolicyNote({ policy }: { policy: PoolsResponse["policy"] }) {
   const min = (ms: number) => (ms >= 3_600_000 ? `${ms / 3_600_000} 小时` : `${Math.round(ms / 60_000)} 分钟`);
   return (
-    <div className="rounded-xl border border-border bg-surface px-4 py-3 text-meta leading-relaxed text-muted">
-      统一调度策略:429 按 Retry-After 冷却(限 {Math.round(policy.rate_limit_ms[0] / 1000)} 秒–{min(policy.rate_limit_ms[1])});
-      配额用尽冷却到重置时刻(未给出时 {min(policy.quota_default_ms)});认证失效每 {min(policy.auth_backoff_ms[0])} 起自动探测,
-      逐次加倍至 {min(policy.auth_backoff_ms[1])};上游连续 {policy.fail_threshold} 次失败冷却 {min(policy.upstream_backoff_ms[0])}。
-      订阅账号遇限流不在同一请求内换号,API key 失败后由下一请求换 key。
+    <div className="oc-callout oc-callout-info flex items-start gap-2.5 rounded-xl px-4 py-3 text-meta leading-relaxed text-muted">
+      <span className="oc-icon-badge oc-icon-badge-info mt-0.5 size-6 rounded-md">
+        <Info size={13} strokeWidth={2} />
+      </span>
+      <span className="min-w-0 flex-1">
+        统一调度策略:429 按 Retry-After 冷却(限 {Math.round(policy.rate_limit_ms[0] / 1000)} 秒–{min(policy.rate_limit_ms[1])});
+        配额用尽冷却到重置时刻(未给出时 {min(policy.quota_default_ms)});认证失效每 {min(policy.auth_backoff_ms[0])} 起自动探测,
+        逐次加倍至 {min(policy.auth_backoff_ms[1])};上游连续 {policy.fail_threshold} 次失败冷却 {min(policy.upstream_backoff_ms[0])}。
+        订阅账号遇限流不在同一请求内换号,API key 失败后由下一请求换 key。
+      </span>
     </div>
   );
 }
@@ -35,20 +40,20 @@ export function PolicyNote({ policy }: { policy: PoolsResponse["policy"] }) {
 export function StatusChip({ m }: { m: PoolMember }) {
   if (m.status === "active") {
     return (
-      <span className="inline-flex items-center whitespace-nowrap rounded-full bg-success-soft px-2 py-0.5 text-xs font-medium text-success">
+      <span className="oc-badge-craft inline-flex items-center whitespace-nowrap rounded-full bg-success-soft px-2 py-0.5 text-xs font-medium text-success">
         可调度
       </span>
     );
   }
   if (m.status === "cooldown") {
     return (
-      <span className="inline-flex items-center whitespace-nowrap rounded-full bg-warning-soft px-2 py-0.5 text-xs font-medium text-warning">
+      <span className="oc-badge-craft inline-flex items-center whitespace-nowrap rounded-full bg-warning-soft px-2 py-0.5 text-xs font-medium text-warning">
         {cooldownLabel(m.cooldownReason)}
       </span>
     );
   }
   return (
-    <span className="inline-flex items-center whitespace-nowrap rounded-full bg-hover px-2 py-0.5 text-xs font-medium text-muted">
+    <span className="oc-badge-craft inline-flex items-center whitespace-nowrap rounded-full bg-hover px-2 py-0.5 text-xs font-medium text-muted">
       {m.status === "banned" ? "封禁" : "管理员停用"}
     </span>
   );
@@ -149,8 +154,11 @@ export function PoolSection({
   if (bare) {
     return (
       <div className="flex flex-col gap-2" data-testid={`pool-${pool.service}-keys`}>
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <span className="text-meta text-muted">{title ?? "API key"} · {pool.members.length} 个</span>
+        <div className="oc-surface-recessed flex flex-wrap items-center justify-between gap-2 rounded-xl px-3.5 py-2">
+          <span className="inline-flex items-center gap-2 text-meta font-medium text-muted tabular-nums">
+            <KeyRound size={13.5} className="text-accent" />
+            {title ?? "API key"} · {pool.members.length} 个
+          </span>
           {pool.accepts_api_keys ? (
             <Button size="sm" variant="ghost" onClick={() => onAdd(pool.service)}>
               <Plus size={14} /> 添加 key
@@ -164,15 +172,20 @@ export function PoolSection({
     );
   }
   return (
-    <section className="flex flex-col gap-2" data-testid={`pool-${pool.service}`}>
+    <section className="flex flex-col gap-2.5" data-testid={`pool-${pool.service}`}>
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-baseline gap-2">
-          <h2 className="text-base font-semibold text-fg">{title ?? serviceLabel(pool.service)}</h2>
-          <span className="text-meta text-muted">
-            {c.total} 个成员 · 可调度 {c.active}
-            {c.cooldown > 0 ? ` · 冷却 ${c.cooldown}` : ""}
-            {c.disabled > 0 ? ` · 停用 ${c.disabled}` : ""}
+        <div className="flex items-center gap-2.5">
+          <span className="oc-icon-badge oc-icon-badge-accent size-8 rounded-lg">
+            <Boxes size={15} strokeWidth={1.9} />
           </span>
+          <div className="flex flex-wrap items-baseline gap-2">
+            <h2 className="text-base font-semibold tracking-tight text-fg">{title ?? serviceLabel(pool.service)}</h2>
+            <span className="text-meta text-muted tabular-nums">
+              {c.total} 个成员 · 可调度 {c.active}
+              {c.cooldown > 0 ? ` · 冷却 ${c.cooldown}` : ""}
+              {c.disabled > 0 ? ` · 停用 ${c.disabled}` : ""}
+            </span>
+          </div>
         </div>
         {pool.accepts_api_keys ? (
           <Button size="sm" variant="ghost" onClick={() => onAdd(pool.service)}>

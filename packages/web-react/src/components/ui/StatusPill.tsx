@@ -35,6 +35,15 @@ const TEXT: Record<SemanticTone, string> = {
   idle: "text-status-idle",
 };
 
+/** 压在实心状态圆点上的前景色（如 needs_you 问号）：暗色 --warning(#e0a03a) 须配近黑 --warning-fg（8.01:1）。 */
+const ON_FILL: Record<SemanticTone, string> = {
+  running: "text-accent-fg",
+  attention: "text-warning-fg",
+  done: "text-white",
+  failed: "text-danger-fg",
+  idle: "text-white",
+};
+
 /** 失败 / 需要处理的点带同色柔光晕(只在 md,也就是侧栏行首这种需要一眼扫到的位置)。 */
 const HALO: Partial<Record<SemanticTone, string>> = {
   failed: "ring-[3px] ring-status-failed/20",
@@ -112,7 +121,7 @@ export function StatusPill({
           <svg
             viewBox="0 0 16 16"
             aria-hidden="true"
-            className="size-full shrink-0 text-white"
+            className={cn("size-full shrink-0", ON_FILL[tone])}
           >
             <path
               d="M6.15 5.65C6.35 4.45 7.25 3.75 8.35 3.75C9.55 3.75 10.35 4.5 10.35 5.55C10.35 6.45 9.85 6.95 9.05 7.42C8.35 7.83 8.05 8.22 8.05 9.05"

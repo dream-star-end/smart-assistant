@@ -50,6 +50,7 @@ function check(env: Record<string, string>) {
       WATCH_DISARM: path.join(dir, 'disarm'),
       WATCH_MANUAL_RECOVERY: path.join(dir, 'manual'),
       WATCH_PG_BACKUP_STATUS: path.join(dir, 'pg-backup-status.json'),
+      WATCH_AUTOSAVE_STATUS: path.join(dir, 'no-autosave.json'),
       WATCH_NOW_OVERRIDE: String(NOW),
       WATCH_STUB_DISK_AVAIL_BYTES: String(50 * GIB),
       ...env,

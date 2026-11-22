@@ -1,4 +1,4 @@
-import { CheckCircle2, Inbox, MessageSquare, RefreshCw } from "lucide-react";
+import { BarChart3, CheckCircle2, Inbox, MessageSquare, RefreshCw } from "lucide-react";
 import { useRef, useState } from "react";
 import { Alert, Badge, Button } from "../../../components/ui";
 import {
@@ -61,6 +61,9 @@ export function FeedbackQueue() {
   const [sheetOpen, setSheetOpen] = useState(false);
 
   const kpi = totals?.by_status ?? { open: 0, acked: 0, closed: 0 };
+  const totalCount = totals?.total ?? 0;
+  const openPct = totalCount > 0 ? Math.round((kpi.open / totalCount) * 100) : 0;
+  const handledPct = totalCount > 0 ? Math.round(((kpi.acked + kpi.closed) / totalCount) * 100) : 0;
 
   const chartRef = useRef<HTMLCanvasElement>(null);
   useChart(
@@ -100,7 +103,7 @@ export function FeedbackQueue() {
       width: 150,
       render: (r) =>
         r.user_id ? (
-          <span className="truncate">
+          <span className="truncate font-medium text-fg">
             {r.username ? `${r.username} ` : ""}
             <span className="font-mono text-caption text-faint">#{r.user_id}</span>
           </span>
@@ -122,23 +125,31 @@ export function FeedbackQueue() {
       key: "priority",
       title: "优先级",
       width: 76,
-      render: (r) => r.priority ? (
-        <Badge tone={r.priority === "urgent" ? "danger" : r.priority === "high" ? "warning" : "neutral"}>
-          {{ low: "低", normal: "普通", high: "高", urgent: "紧急" }[r.priority]}
-        </Badge>
-      ) : <span className="text-faint">未设置</span>,
+      render: (r) =>
+        r.priority ? (
+          <Badge tone={r.priority === "urgent" ? "danger" : r.priority === "high" ? "warning" : "neutral"}>
+            {{ low: "低", normal: "普通", high: "高", urgent: "紧急" }[r.priority]}
+          </Badge>
+        ) : (
+          <span className="text-faint">未设置</span>
+        ),
     },
     {
       key: "assigned_to",
       title: "负责人",
       width: 88,
-      render: (r) => r.assigned_to ? <span className="font-mono text-caption">#{r.assigned_to}</span> : <span className="text-faint">未指派</span>,
+      render: (r) =>
+        r.assigned_to ? (
+          <span className="font-mono text-caption text-fg">#{r.assigned_to}</span>
+        ) : (
+          <span className="text-faint">未指派</span>
+        ),
     },
     {
       key: "description",
       title: "内容摘要",
       render: (r) => (
-        <span className="line-clamp-2 max-w-[24rem] text-muted" title={r.description}>
+        <span className="line-clamp-2 max-w-[24rem] text-body text-muted" title={r.description}>
           {r.description}
         </span>
       ),
@@ -153,12 +164,12 @@ export function FeedbackQueue() {
       key: "created_at",
       title: "时间",
       width: 96,
-      render: (r) => <TimeAgo value={r.created_at} className="text-meta text-muted" />,
+      render: (r) => <TimeAgo value={r.created_at} className="text-meta tabular-nums text-muted" />,
     },
   ];
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-5">
       <StatCardRow>
         <StatCard
           label="待处理"
@@ -171,7 +182,7 @@ export function FeedbackQueue() {
         <StatCard label="已关闭" value={kpi.closed} icon={CheckCircle2} tone="neutral" hint="服务端全量" />
         <StatCard
           label="反馈总数"
-          value={totals?.total ?? 0}
+          value={totalCount}
           icon={MessageSquare}
           tone="neutral"
           hint={`当前列表已加载 ${rows.length} 条`}
@@ -179,7 +190,7 @@ export function FeedbackQueue() {
       </StatCardRow>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
-        <div className="flex flex-col gap-3">
+        <div className="flex min-w-0 flex-col gap-3">
           <FilterBar>
             <SelectFilter
               label="状态"
@@ -198,7 +209,7 @@ export function FeedbackQueue() {
               options={TRAFFIC_OPTIONS}
               onChange={(trafficClass) => setFilters((f) => ({ ...f, trafficClass }))}
             />
-            <Button variant="ghost" size="sm" onClick={refresh} className="gap-1.5">
+            <Button variant="ghost" size="sm" onClick={refresh} className="oc-btn-tactile gap-1.5">
               <RefreshCw size={14} />
               刷新
             </Button>
@@ -207,41 +218,82 @@ export function FeedbackQueue() {
           {error ? (
             <Alert tone="danger">加载失败：{apiErrorMessage(error, "加载失败")}</Alert>
           ) : (
-            <>
-              <DataTable
-                columns={columns}
-                rows={rows}
-                rowKey={(r) => r.id}
-                loading={loading}
-                onRowClick={openDetail}
-                emptyTitle="无反馈"
-                emptyHint="当前过滤条件下没有反馈记录。"
-              />
-              {!done && rows.length > 0 && (
-                <div className="flex justify-center">
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    onClick={loadMore}
-                    disabled={loadingMore}
-                  >
-                    {loadingMore ? "加载中…" : "加载更多"}
-                  </Button>
-                </div>
-              )}
-            </>
+            <DataTable
+              columns={columns}
+              rows={rows}
+              rowKey={(r) => r.id}
+              loading={loading}
+              onRowClick={openDetail}
+              emptyTitle="无反馈"
+              emptyHint="当前过滤条件下没有反馈记录。"
+              footer={
+                !done && rows.length > 0 ? (
+                  <div className="flex justify-center">
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={loadMore}
+                      disabled={loadingMore}
+                      className="oc-btn-tactile"
+                    >
+                      {loadingMore ? "加载中…" : "加载更多"}
+                    </Button>
+                  </div>
+                ) : undefined
+              }
+            />
           )}
         </div>
 
-        <ChartCard title="状态构成" hint="按当前筛选的服务端全量统计" height={240}>
-          {(totals?.total ?? 0) === 0 ? (
-            <div className="flex h-full items-center justify-center text-meta text-faint">
-              暂无数据
+        <div className="flex flex-col gap-4">
+          <ChartCard title="状态构成" hint="按当前筛选的服务端全量统计" height={240}>
+            {totalCount === 0 ? (
+              <div className="flex h-full items-center justify-center text-meta text-faint">
+                暂无数据
+              </div>
+            ) : (
+              <canvas ref={chartRef} />
+            )}
+          </ChartCard>
+
+          <div className="oc-surface-card rounded-xl p-4">
+            <div className="flex items-center gap-2.5">
+              <span className="oc-icon-badge oc-icon-badge-accent size-8 rounded-lg">
+                <BarChart3 size={15} strokeWidth={1.95} />
+              </span>
+              <div className="min-w-0">
+                <h3 className="text-body font-semibold text-fg">闭环推进度</h3>
+                <p className="text-caption text-muted">服务端全量占比概览</p>
+              </div>
             </div>
-          ) : (
-            <canvas ref={chartRef} />
-          )}
-        </ChartCard>
+            <div className="mt-3.5 flex flex-col gap-3">
+              <div>
+                <div className="mb-1 flex items-center justify-between text-caption">
+                  <span className="font-medium text-muted">已处理闭环率</span>
+                  <span className="font-mono font-semibold tabular-nums text-fg">{handledPct}%</span>
+                </div>
+                <div className="oc-surface-recessed h-2 w-full overflow-hidden rounded-full">
+                  <div
+                    className="oc-progress-fill h-full rounded-full bg-success transition-[width] duration-300"
+                    style={{ width: `${handledPct}%` }}
+                  />
+                </div>
+              </div>
+              <div>
+                <div className="mb-1 flex items-center justify-between text-caption">
+                  <span className="font-medium text-muted">待处理占比</span>
+                  <span className="font-mono font-semibold tabular-nums text-warning">{openPct}%</span>
+                </div>
+                <div className="oc-surface-recessed h-2 w-full overflow-hidden rounded-full">
+                  <div
+                    className="oc-progress-fill h-full rounded-full bg-warning transition-[width] duration-300"
+                    style={{ width: `${openPct}%` }}
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
 
       <FeedbackDetailSheet

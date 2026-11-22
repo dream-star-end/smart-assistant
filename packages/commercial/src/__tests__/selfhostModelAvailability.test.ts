@@ -121,23 +121,13 @@ test("OCV5-713: missing or malformed release policy refuses startup", () => {
 });
 
 
+import { createGrokRelayRouteAllocator } from "../bootstrap/runtimeSupervisorBootstrap.js";
+
 test("OCV5-713: the actual shared allocator rejects local delegate before touching the pool", async () => {
   configure(false);
-  const source = ts.createSourceFile("index.ts", readFileSync(new URL("../index.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
-  let allocator: ts.Expression | undefined;
-  function visit(node: ts.Node): void {
-    if (ts.isVariableDeclaration(node) && node.name.getText(source) === "allocateGrokRelayRoute") allocator = node.initializer;
-    ts.forEachChild(node, visit);
-  }
-  visit(source);
-  assert.ok(allocator);
-  // Execute the real production arrow, stripping only TypeScript types. A missing
-  // early guard reaches one of these effect dependencies and makes the test fail.
-  const js = ts.transpileModule(`(${allocator.getText(source)})`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
   let poolCalls = 0;
   const unexpected = async () => { poolCalls++; throw new Error("paused model touched account pool"); };
-  const allocate = runInNewContext(js, { isModelAvailable, expireSettledGrokRouteLeases: unexpected,
-    listActiveGrokRouteLeases: unexpected, listEnabledGroupsForModel: unexpected, scheduler: { pick: unexpected } });
+  const allocate = createGrokRelayRouteAllocator({ pick: unexpected } as never);
   for (const modelId of ids.slice(0, 2)) {
     const result = await allocate({ containerId: 11, userId: 42n, modelId, origin: "delegate" });
     assert.equal(result.kind, "unavailable");

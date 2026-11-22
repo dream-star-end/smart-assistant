@@ -191,10 +191,10 @@ function localDateTimeMin(now = new Date()): string {
  */
 function NextRunMeta({ nextRunAt }: { nextRunAt: string | number | null | undefined }) {
   const desc = describeNextRun(nextRunAt, Date.now());
-  const exact = desc.title ? <span className="text-faint">（{desc.title.slice(5)}）</span> : null;
+  const exact = desc.title ? <span className="tabular-nums text-faint">（{desc.title.slice(5)}）</span> : null;
   if (desc.kind === "future") {
     return (
-      <span className="text-muted">
+      <span className="tabular-nums text-muted">
         {desc.label} <TimeAgo value={nextRunAt} tooltip={false} /> {exact}
       </span>
     );
@@ -202,7 +202,7 @@ function NextRunMeta({ nextRunAt }: { nextRunAt: string | number | null | undefi
   if (desc.kind === "overdue") {
     // 语义色只给圆点,文字保持弱化色(规格 §5:状态 = 圆点 + 文字)。
     return (
-      <span data-cron-overdue="" className="inline-flex items-center gap-1.5 text-muted">
+      <span data-cron-overdue="" className="inline-flex items-center gap-1.5 tabular-nums text-muted">
         <StatusDot tone="warning" />
         {desc.label}
       </span>
@@ -210,12 +210,12 @@ function NextRunMeta({ nextRunAt }: { nextRunAt: string | number | null | undefi
   }
   if (desc.kind === "soon") {
     return (
-      <span className="text-muted">
+      <span className="tabular-nums text-muted">
         {desc.label} {exact}
       </span>
     );
   }
-  return <span className="text-faint">{desc.label}</span>;
+  return <span className="tabular-nums text-faint">{desc.label}</span>;
 }
 
 /** 表单预填种子：空态预设 chip 与「再跑一次」共用。 */
@@ -508,7 +508,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
       <ListRow
         key={job.id}
         data-interactive=""
-        className={cn("p-0", job.id === highlightId && "animate-in")}
+        className={cn("p-0 transition-colors hover:bg-hover/70", job.id === highlightId && "animate-in")}
       >
         <div className="flex items-start">
           <button
@@ -517,27 +517,47 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
             aria-expanded={editing}
             aria-label={`编辑「${name}」`}
             aria-describedby={descId}
-            className="min-w-0 flex-1 py-3 pl-4 pr-3 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+            className="group flex min-w-0 flex-1 items-start gap-3 py-3.5 pl-4 pr-3 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
           >
-            <span id={descId} className="flex min-w-0 flex-col gap-0.5">
-              {/* 一级:标题 + 状态(圆点 + 文字)。停用 / 已完成的标题降为弱化色。 */}
+            <span
+              aria-hidden="true"
+              className={cn(
+                "oc-icon-badge mt-0.5 size-8 rounded-lg",
+                status === "active"
+                  ? "oc-icon-badge-accent"
+                  : status === "done"
+                    ? "oc-icon-badge-success"
+                    : "",
+              )}
+            >
+              {status === "done" ? (
+                <CalendarCheck size={14} strokeWidth={1.85} />
+              ) : (
+                <Clock size={14} strokeWidth={1.85} />
+              )}
+            </span>
+            <span id={descId} className="flex min-w-0 flex-1 flex-col gap-1">
+              {/* 一级:标题 + 状态胶囊(圆点 + 文字)。停用 / 已完成的标题降为弱化色。 */}
               <span className="flex min-w-0 items-center gap-2">
                 <span
                   className={cn(
-                    "min-w-0 truncate text-[14px] font-medium leading-5",
+                    "min-w-0 truncate text-sm font-medium leading-5 tracking-tight",
                     status === "active" ? "text-fg" : "text-muted",
                   )}
                 >
                   {title}
                 </span>
-                <span data-cron-status="" className="inline-flex shrink-0 items-center gap-1.5 text-meta text-muted">
+                <span
+                  data-cron-status=""
+                  className="oc-badge-craft inline-flex shrink-0 items-center gap-1.5 rounded-full bg-hover/80 px-2 py-0.5 text-caption font-medium text-muted"
+                >
                   <StatusDot tone={meta.tone} />
                   {meta.label}
                 </span>
               </span>
               {/* 二级:什么时候跑。翻得出中文只显示中文(裸 cron 是实现细节,进编辑表单)。 */}
               <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-body tabular-nums text-fg">
-                {human && <span>{human}</span>}
+                {human && <span className="font-medium">{human}</span>}
                 {status === "active" ? (
                   <span className="text-meta">
                     <NextRunMeta nextRunAt={job.nextRunAt} />
@@ -566,14 +586,14 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
             </span>
           </button>
           {/* 唯一的行内控件:右对齐,与标题行垂直居中(44px 高的盒子中线 = 标题行中线)。 */}
-          <div className="mt-0.5 flex min-h-11 shrink-0 items-center pr-4">
+          <div className="mt-1 flex min-h-11 shrink-0 items-center pr-4">
             {status === "done" ? (
               // 已完成的一次性任务:把开关拨回去毫无意义(那个时刻已经过去),
               // 给一条真出口 —— 打开编辑表单并切到「某时一次」,选个新时间即可重跑。
               <Button
                 variant="ghost"
                 size="sm"
-                className="-mr-2 gap-1.5 px-2 font-normal text-muted hover:text-fg"
+                className="oc-btn-tactile -mr-2 gap-1.5 rounded-lg px-2.5 font-normal text-muted hover:text-fg"
                 onClick={() => startEdit(job, { mode: "once", at: "" })}
               >
                 <RotateCcw size={14} strokeWidth={1.75} aria-hidden="true" />
@@ -590,7 +610,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
           </div>
         </div>
         {editing && (
-          <div className="border-t border-border bg-bg/60">
+          <div className="border-t border-border bg-bg/55">
             <CronForm
               key={`edit-${job.id}-${formNonce}`}
               auth={auth}
@@ -621,7 +641,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
               // 页头不再放第二个同权重的黑按钮。
               variant="ghost"
               size="sm"
-              className="gap-1.5 px-2.5"
+              className="oc-btn-tactile gap-1.5 rounded-lg px-2.5 text-muted hover:text-fg"
               onClick={() => (creating ? setCreating(false) : startCreate())}
             >
               {creating ? (
@@ -650,7 +670,13 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
 
       {!cronBlocked && creating && (
         <div className="px-4 pb-5">
-          <Card tone="sunken" className="border-0">
+          <Card className="overflow-visible">
+            <div className="oc-code-shell-header flex items-center gap-2 rounded-t-xl px-4 py-2.5">
+              <span className="oc-icon-badge oc-icon-badge-accent size-6 rounded-md" aria-hidden="true">
+                <Clock size={12} strokeWidth={1.85} />
+              </span>
+              <span className="text-meta font-semibold text-fg">新建定时任务</span>
+            </div>
             <CronForm
               key={`create-${formNonce}`}
               auth={auth}
@@ -702,6 +728,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
                     key={p.chip}
                     variant="secondary"
                     size="sm"
+                    shape="pill"
                     className="font-normal"
                     onClick={() => startCreate(p.seed)}
                   >
@@ -724,13 +751,15 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
               // 安静表面:不画吸顶色带与底边线;计数是搜索框右侧的弱化等宽数字。
               className="border-b-0 bg-transparent px-4 pb-4 pt-0"
               actions={
-                <span className="text-meta tabular-nums text-faint">{filtered.length} 个任务</span>
+                <span className="oc-badge-craft inline-flex items-center whitespace-nowrap rounded-full bg-hover px-2.5 py-0.5 text-caption font-medium tabular-nums text-muted">
+                  {filtered.length} 个任务
+                </span>
               }
             />
           )}
           <div className="flex flex-col gap-6 px-4 pb-4">
             {filtered.length === 0 ? (
-              <div className="flex flex-col items-start gap-3 py-2">
+              <div className="oc-surface-recessed flex flex-col items-start gap-3 rounded-xl p-4">
                 <p className="text-body text-muted">没有匹配「{query.trim()}」的任务</p>
                 <Button variant="secondary" size="sm" onClick={() => setQuery("")}>
                   清除筛选
@@ -747,7 +776,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
                     <Button
                       variant="ghost"
                       size="sm"
-                      className="-ml-2 gap-1.5 px-2 text-[14px] font-semibold text-fg"
+                      className="oc-btn-tactile -ml-2 gap-1.5 rounded-lg px-2 text-sm font-semibold tracking-tight text-fg"
                       aria-expanded={restOpen}
                       onClick={() => setShowRest((v) => !v)}
                     >
@@ -1008,14 +1037,15 @@ function CronForm({
         <p className="text-caption text-faint">{MODE_HINT[mode]}</p>
 
         {mode === "advanced" && (
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-caption text-faint">示例</span>
+          <div className="oc-surface-recessed flex flex-wrap items-center gap-1.5 rounded-xl px-3 py-2">
+            <span className="mr-0.5 text-caption font-medium text-muted">常用表达式</span>
             {CRON_EXAMPLES.map((ex) => (
               <Button
                 key={ex.cron}
-                variant="subtle"
+                variant="secondary"
                 size="sm"
                 shape="pill"
+                className="font-normal"
                 onClick={() => setCron(ex.cron)}
               >
                 {ex.label}
@@ -1093,17 +1123,26 @@ function CronForm({
 
       {/* <output>(隐含 role=status)+ aria-live:改排程时读屏用户能听到预览变化。
           用 <output> 而非 p[role=status] 是跟随仓内既有写法(ListSkeleton / AuthGate)。 */}
-      <output aria-live="polite" className="flex items-start gap-1.5 text-caption">
+      <output
+        aria-live="polite"
+        className={cn(
+          "flex items-start gap-2 rounded-xl px-3 py-2 text-caption tabular-nums",
+          !incomplete && preview.ok && preview.unparsed
+            ? "oc-callout oc-callout-warning"
+            : "oc-surface-recessed",
+        )}
+      >
         {incomplete ? (
           <span className="text-faint">{INCOMPLETE_HINT[mode]}</span>
         ) : preview.ok ? (
           <>
             <CalendarCheck
-              size={12}
+              size={13}
+              strokeWidth={1.85}
               aria-hidden="true"
-              className={cn("mt-0.5 shrink-0", preview.unparsed ? "text-warning" : "text-faint")}
+              className={cn("mt-0.5 shrink-0", preview.unparsed ? "text-warning" : "text-accent")}
             />
-            <span className={preview.unparsed ? "text-warning" : "text-faint"}>
+            <span className={preview.unparsed ? "text-warning" : "text-muted"}>
               {preview.unparsed ? (
                 <>
                   无法解析成自然语言，请确认这是你要的表达式：
@@ -1130,7 +1169,7 @@ function CronForm({
       {/* 操作条:窄屏吸在滚动区底部(长表单里保存键始终可见),≥md 回到表单末尾的普通一行。 */}
       <div
         data-cron-form-actions=""
-        className="flex items-center gap-2 max-md:sticky max-md:bottom-0 max-md:z-[1] max-md:-mx-4 max-md:-mb-3.5 max-md:border-t max-md:border-border max-md:bg-surface max-md:px-4 max-md:py-2"
+        className="flex items-center gap-2 max-md:sticky max-md:bottom-0 max-md:z-[1] max-md:-mx-4 max-md:-mb-3.5 max-md:border-t max-md:border-border max-md:bg-surface/95 max-md:px-4 max-md:py-2 max-md:backdrop-blur-md"
       >
         {editing && onDelete && (
           <Button
@@ -1138,7 +1177,7 @@ function CronForm({
             size="sm"
             onClick={onDelete}
             disabled={busy || deleteDisabled}
-            className="-ml-2 gap-1.5 px-2 font-normal text-danger hover:bg-danger-soft"
+            className="oc-btn-tactile -ml-2 gap-1.5 rounded-lg px-2.5 font-normal text-danger hover:bg-danger-soft"
           >
             <Trash2 size={14} strokeWidth={1.75} aria-hidden="true" />
             删除任务

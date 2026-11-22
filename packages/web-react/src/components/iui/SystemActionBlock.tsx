@@ -27,18 +27,22 @@ function Price({ preview }: { preview: SystemActionPreview }) {
   </div>
 }
 function Preview({ value }: { value: SystemActionPreview }) {
-  return <div className="space-y-4">
-    <p className="whitespace-pre-wrap text-body text-muted">{value.description}</p>
-    <dl className="oc-iui-kv"><div><dt>影响范围</dt><dd>{value.scope}</dd></div></dl>
-    {value.before.length > 0 && <section aria-label="当前值"><h3 className="mb-2 text-body font-medium">当前</h3>
-      <dl className="oc-iui-kv">{value.before.map((r, i) => <div key={`${i}:${r.label}`}><dt>{r.label}</dt><dd className="whitespace-pre-wrap break-words">{r.value || '未设置'}</dd></div>)}</dl>
+  return <div className="space-y-3.5">
+    <p className="whitespace-pre-wrap text-body leading-relaxed text-muted">{value.description}</p>
+    <div className="oc-surface-recessed rounded-md px-3 py-1">
+      <dl className="oc-iui-kv !px-0 !pb-0"><div><dt>影响范围</dt><dd>{value.scope}</dd></div></dl>
+    </div>
+    {value.before.length > 0 && <section aria-label="当前值" className="oc-surface-card rounded-md p-3">
+      <h3 className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-faint">当前</h3>
+      <dl className="oc-iui-kv !px-0 !pb-0">{value.before.map((r, i) => <div key={`${i}:${r.label}`}><dt>{r.label}</dt><dd className="whitespace-pre-wrap break-words">{r.value || '未设置'}</dd></div>)}</dl>
     </section>}
-    {value.after.length > 0 && <section aria-label="将更改为"><h3 className="mb-2 text-body font-medium">将更改为</h3>
-      <dl className="oc-iui-kv">{value.after.map((r, i) => <div key={`${i}:${r.label}`}><dt>{r.label}</dt><dd className="whitespace-pre-wrap break-words">{r.value || '清空'}</dd></div>)}</dl>
+    {value.after.length > 0 && <section aria-label="将更改为" className="oc-surface-card rounded-md p-3">
+      <h3 className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-accent">将更改为</h3>
+      <dl className="oc-iui-kv !px-0 !pb-0">{value.after.map((r, i) => <div key={`${i}:${r.label}`}><dt>{r.label}</dt><dd className="whitespace-pre-wrap break-words">{r.value || '清空'}</dd></div>)}</dl>
     </section>}
     <Price preview={value} />
-    {value.consequences.length > 0 && <div className={value.destructive ? 'text-danger' : 'text-muted'}>
-      <p className="mb-1 text-body font-medium">确认后会发生什么</p>
+    {value.consequences.length > 0 && <div className={value.destructive ? 'oc-callout rounded-md px-3.5 py-2.5 text-danger' : 'oc-callout rounded-md px-3.5 py-2.5 text-muted'}>
+      <p className="mb-1 text-body font-semibold">确认后会发生什么</p>
       <ul className="space-y-1 text-body">{value.consequences.map((v, i) => <li key={`${i}:${v}`}>{v}</li>)}</ul>
     </div>}
   </div>

@@ -1,104 +1,214 @@
+/**
+ * Telegram Channel Adapter — zero external npm dependencies (native `fetch` + `node:crypto`).
+ *
+ * Modes (B9 backwards-compatibility):
+ *   - Default when only `botToken` (+ `mentionRequired`) is provided (legacy CLI config):
+ *     starts long-polling (`getUpdates`) immediately so inbound messages arrive at `ctx.dispatch`.
+ *   - Webhook mode (`mode: 'webhook'` or `webhookUrl` provided):
+ *     requires non-empty `webhookSecret` (fail-closed on init & on every HTTP request).
+ */
+
 import type { ChannelAdapter, ChannelContext } from '@openclaude/plugin-sdk'
 import type { OutboundMessage } from '@openclaude/protocol'
+import {
+  buildTelegramApprovalCard,
+  type BuildTelegramApprovalCardParams,
+} from './approvalCallback.js'
+import { TelegramBotApi, type TelegramMessage } from './botApi.js'
+import {
+  handleTelegramWebhookPayload,
+  processTelegramUpdate,
+  type TelegramApprovalDecisionEvent,
+  type TelegramApprovalDecisionResult,
+  type TelegramWebhookHttpResult,
+} from './webhook.js'
 
-// Telegram 渠道适配器(grammY)
-//
-// 使用方式(在 gateway plugins 列表里注册):
-//   import { telegramChannelFactory } from '@openclaude/channel-telegram'
-//   channels.push(telegramChannelFactory({ botToken: '...' }))
-//
-// MVP stub:仅占位,实际需要 `bun add grammy`
+export * from './botApi.js'
+export * from './approvalCallback.js'
+export * from './webhook.js'
 
 export interface TelegramConfig {
   botToken: string
-  // 群组中是否必须 @bot 才响应
+  /** Optional custom Bot API base URL (for testing or local Bot API server). */
+  apiBaseUrl?: string
+  /**
+   * Delivery mode: defaults to `'webhook'` when `webhookUrl` is set, otherwise `'polling'`
+   * (preserving full compatibility with legacy CLI configs passing only `{ botToken, mentionRequired }`).
+   */
+  mode?: 'webhook' | 'polling'
+  /** Mandatory secret token for webhook mode (`X-Telegram-Bot-Api-Secret-Token`). */
+  webhookSecret?: string
+  /** HMAC signing secret for Inline Keyboard approval callbacks. Defaults to `webhookSecret`. */
+  callbackSecret?: string
+  /** Optional webhook URL to register automatically on init when mode='webhook'. */
+  webhookUrl?: string
+  /** Allowlisted chat IDs permitted to interact / approve. */
+  allowedChatIds?: ReadonlyArray<string | number>
+  /** Group chats require `@bot` mention unless false. */
   mentionRequired?: boolean
-  // 是否在 Telegram 消息里显示 thinking 块(默认不显示,只有调试需要)
+  /** Include thinking blocks in outbound text (default false). */
   showThinking?: boolean
-  // 重启时是否丢弃离线期间积压的消息(默认 false,保留所有待处理更新)
+  /** Drop pending updates on startup (default false). */
   dropPendingUpdates?: boolean
+  /** Poll interval ms after each getUpdates batch (default 100ms). */
+  pollIntervalMs?: number
+  /** Long-poll timeout seconds passed to Telegram `getUpdates` (default 15s). */
+  pollTimeoutSec?: number
+  /** Maps Telegram operator -> platform ownerUid for approval authorization. */
+  resolveOperatorUid?: (info: {
+    fromUserId: string
+    chatId: string
+    chatType: string
+  }) => Promise<string | null>
+  /** Resolves `(ownerUid, shortCode)` -> active `decisionId` for HMAC digest cross-check. */
+  resolveExpectedDecisionId?: (ownerUid: string, code: string) => Promise<string | null>
+  /** Callback invoked when a verified Inline Keyboard approval button is pressed. */
+  onApprovalCallback?: (
+    event: TelegramApprovalDecisionEvent,
+  ) => Promise<TelegramApprovalDecisionResult>
+  /** Injectable fetch implementation for unit tests. */
+  fetchImpl?: typeof fetch
 }
 
-export function telegramChannelFactory(cfg: TelegramConfig): ChannelAdapter {
-  let bot: any = null
+export interface TelegramChannelAdapter extends ChannelAdapter {
+  readonly api: TelegramBotApi
+  readonly mode: 'webhook' | 'polling'
+  handleWebhook(input: {
+    headers: Record<string, string | string[] | undefined>
+    body: unknown
+  }): Promise<TelegramWebhookHttpResult>
+  sendApprovalCard(
+    params: Omit<BuildTelegramApprovalCardParams, 'secret'> & { secret?: string },
+  ): Promise<TelegramMessage>
+}
+
+export function telegramChannelFactory(cfg: TelegramConfig): TelegramChannelAdapter {
+  const api = new TelegramBotApi({
+    botToken: cfg.botToken,
+    apiBaseUrl: cfg.apiBaseUrl,
+    fetchImpl: cfg.fetchImpl,
+  })
+  const effectiveMode: 'webhook' | 'polling' =
+    cfg.mode ?? (cfg.webhookUrl ? 'webhook' : 'polling')
+  const seenCallbackIds = new Map<string, number>()
+  const inFlightCallbackIds = new Set<string>()
+
   let ctx: ChannelContext | null = null
+  let botUsername: string | undefined
+  let pollingActive = false
+  let pollTimer: ReturnType<typeof setTimeout> | null = null
+  let nextOffset = 0
+
+  function schedulePoll(delayMs = 200): void {
+    if (!pollingActive) return
+    pollTimer = setTimeout(async () => {
+      if (!pollingActive) return
+      try {
+        const updates = await api.getUpdates({
+          offset: nextOffset,
+          timeout: cfg.pollTimeoutSec ?? 15,
+          allowed_updates: ['message', 'callback_query'],
+        })
+        for (const u of updates) {
+          // Advance offset ONLY AFTER update processing completes cleanly (transient errors retry).
+          await processTelegramUpdate(u, {
+            api,
+            callbackSecret: cfg.callbackSecret ?? cfg.webhookSecret,
+            allowedChatIds: cfg.allowedChatIds,
+            mentionRequired: cfg.mentionRequired,
+            botUsername,
+            resolveOperatorUid: cfg.resolveOperatorUid,
+            resolveExpectedDecisionId: cfg.resolveExpectedDecisionId,
+            seenCallbackIds,
+            inFlightCallbackIds,
+            dispatchInbound: (frame) => ctx?.dispatch(frame),
+            onApprovalCallback: cfg.onApprovalCallback,
+          })
+          nextOffset = Math.max(nextOffset, u.update_id + 1)
+        }
+        schedulePoll(cfg.pollIntervalMs ?? 100)
+      } catch (err) {
+        ctx?.log.error('telegram polling error', err instanceof Error ? err.message : String(err))
+        schedulePoll(Math.max(cfg.pollIntervalMs ?? 100, 3000))
+      }
+    }, delayMs)
+    pollTimer.unref?.()
+  }
+
   return {
     id: 'telegram',
     name: 'telegram',
     type: 'channel' as const,
+    api,
+    mode: effectiveMode,
+
     async init(c) {
       ctx = c
-      try {
-        let Bot: any
-        try {
-          const mod = await import('grammy' as any)
-          Bot = mod.Bot
-        } catch {
-          c.log.error('grammy 未安装。请运行: npm install grammy')
-          c.log.error('Telegram 频道已禁用。')
-          return
-        }
-        bot = new Bot(cfg.botToken)
-
-        // Catch Grammy errors to prevent unhandled rejections crashing the process
-        bot.catch((err: any) => {
-          c.log.error('grammy error (caught)', err?.message ?? String(err))
-        })
-
-        bot.on('message', async (botCtx: any) => {
-          const text = botCtx.message?.text
-          if (!text) return
-          const isGroup = botCtx.chat?.type === 'group' || botCtx.chat?.type === 'supergroup'
-          if (isGroup && cfg.mentionRequired !== false) {
-            const me = await bot.api.getMe()
-            if (!text.includes(`@${me.username}`)) return
-          }
-          ctx?.dispatch({
-            type: 'inbound.message',
-            idempotencyKey: `tg:${botCtx.chat.id}:${botCtx.message.message_id}`,
-            channel: 'telegram',
-            peer: {
-              id: String(botCtx.chat.id),
-              kind: isGroup ? 'group' : 'dm',
-              displayName: botCtx.chat.title ?? botCtx.from?.username ?? '',
-            },
-            content: { text },
-            ts: Date.now(),
-          })
-        })
-
-        // Clear old polling sessions before starting
-        try {
-          await bot.api.deleteWebhook({ drop_pending_updates: !!cfg.dropPendingUpdates })
-        } catch {}
-
-        // Start polling with error handling — retry on 409 conflict
-        const startPolling = (attempt = 1) => {
-          bot.start({
-            onStart: () => c.log.info('telegram bot polling started'),
-          }).catch((err: any) => {
-            const is409 = err?.error_code === 409 || String(err).includes('409')
-            if (is409 && attempt <= 5) {
-              const delay = attempt * 3000
-              c.log.info(`telegram 409 conflict, retry #${attempt} in ${delay}ms...`)
-              setTimeout(() => startPolling(attempt + 1), delay)
-            } else {
-              c.log.error('telegram polling failed permanently', err?.message ?? String(err))
-            }
-          })
-        }
-        startPolling()
-        c.log.info('telegram bot started')
-      } catch (err) {
-        c.log.error('telegram init failed (grammy not installed?)', err)
+      if (effectiveMode === 'webhook' && !cfg.webhookSecret?.trim()) {
+        throw new Error('telegram webhook mode requires a non-empty webhookSecret')
       }
-    },
-    async send(out: OutboundMessage) {
-      if (!bot) {
-        ctx?.log.error('telegram send: bot not initialized')
+
+      try {
+        const me = await api.getMe()
+        botUsername = me.username
+      } catch (err) {
+        c.log.error('telegram getMe failed', err instanceof Error ? err.message : String(err))
+      }
+
+      if (effectiveMode === 'polling') {
+        try {
+          await api.deleteWebhook({ drop_pending_updates: !!cfg.dropPendingUpdates })
+        } catch {
+          // best effort
+        }
+        pollingActive = true
+        schedulePoll(0)
+        c.log.info('telegram bot polling started (native fetch)')
         return
       }
-      // Aggregate text first; thinking is hidden by default (debug feature)
+
+      if (cfg.webhookUrl) {
+        await api.setWebhook({
+          url: cfg.webhookUrl,
+          secret_token: cfg.webhookSecret,
+          drop_pending_updates: !!cfg.dropPendingUpdates,
+          allowed_updates: ['message', 'callback_query'],
+        })
+      }
+      c.log.info('telegram bot webhook adapter initialized (native fetch)')
+    },
+
+    async handleWebhook(input) {
+      return handleTelegramWebhookPayload(input, {
+        api,
+        webhookSecret: cfg.webhookSecret,
+        callbackSecret: cfg.callbackSecret ?? cfg.webhookSecret,
+        allowedChatIds: cfg.allowedChatIds,
+        mentionRequired: cfg.mentionRequired,
+        botUsername,
+        resolveOperatorUid: cfg.resolveOperatorUid,
+        resolveExpectedDecisionId: cfg.resolveExpectedDecisionId,
+        seenCallbackIds,
+        inFlightCallbackIds,
+        dispatchInbound: (frame) => ctx?.dispatch(frame),
+        onApprovalCallback: cfg.onApprovalCallback,
+      })
+    },
+
+    async sendApprovalCard(params) {
+      const secret = params.secret ?? cfg.callbackSecret ?? cfg.webhookSecret
+      if (!secret) {
+        throw new Error('sendApprovalCard requires callbackSecret or webhookSecret')
+      }
+      const card = buildTelegramApprovalCard({ ...params, secret })
+      return api.sendMessage({
+        chat_id: params.chatId,
+        text: card.text,
+        reply_markup: card.reply_markup,
+      })
+    },
+
+    async send(out: OutboundMessage) {
       const showThinking = !!cfg.showThinking
       const textParts: string[] = []
       const toolLines: string[] = []
@@ -114,8 +224,6 @@ export function telegramChannelFactory(cfg: TelegramConfig): ChannelAdapter {
           toolLines.push(`${prefix} ${truncate(b.preview, 200)}`)
         }
       }
-      // Compose final message: tools (if any) → text (assistant)
-      // Skip thinking unless explicitly enabled. Skip empty intermediate sends.
       const segments: string[] = []
       if (showThinking && thinkingParts.length > 0) {
         segments.push(`💭 ${thinkingParts.join(' ')}`)
@@ -124,32 +232,30 @@ export function telegramChannelFactory(cfg: TelegramConfig): ChannelAdapter {
       if (textParts.length > 0) {
         segments.push(textParts.join(''))
       } else if (out.isFinal && thinkingParts.length > 0) {
-        // 兜底:模型只输出了 thinking 没输出 text(MiniMax 偶尔会这样),把 thinking 作为答复给用户
         segments.push(thinkingParts.join(' '))
       }
       const text = segments.filter(Boolean).join('\n\n').trim()
-      // Don't bother sending intermediate blocks (we shouldn't get here anyway —
-      // the gateway aggregates for adapters now). And don't send empty finals.
       if (!text) return
       const chunks = splitText(text, 4000)
-      for (const c of chunks) {
+      for (const chunk of chunks) {
         try {
-          // Send as plain text — no markdown parsing → no escape headaches with
-          // Chinese punctuation, code, names containing _, *, [, etc.
-          await bot.api.sendMessage(out.peer.id, c)
-        } catch (err: any) {
+          await api.sendMessage({ chat_id: out.peer.id, text: chunk })
+        } catch (err) {
           ctx?.log.error('telegram sendMessage failed', {
-            err: err?.message ?? String(err),
+            err: err instanceof Error ? err.message : String(err),
             chatId: out.peer.id,
-            preview: c.slice(0, 80),
+            preview: chunk.slice(0, 80),
           })
         }
       }
     },
+
     async shutdown() {
-      try {
-        await bot?.stop()
-      } catch {}
+      pollingActive = false
+      if (pollTimer) {
+        clearTimeout(pollTimer)
+        pollTimer = null
+      }
     },
   }
 }

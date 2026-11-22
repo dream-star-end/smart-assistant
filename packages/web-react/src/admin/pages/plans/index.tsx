@@ -1,4 +1,4 @@
-import { Inbox, Pencil, RotateCw } from "lucide-react";
+import { CreditCard, Inbox, Pencil, RotateCw } from "lucide-react";
 import { useEffect, useState } from "react";
 import {
   Badge,
@@ -107,26 +107,26 @@ function EditPlanModal({
         </>
       }
     >
-      <div className="flex flex-col gap-3">
-        <label className="flex flex-col gap-1 text-meta text-faint">
+      <div className="flex flex-col gap-3.5">
+        <label className="flex flex-col gap-1.5 text-meta font-medium text-fg">
           label
-          <Input value={label} onChange={(e) => setLabel(e.target.value)} />
+          <Input className="oc-field-control" value={label} onChange={(e) => setLabel(e.target.value)} />
         </label>
-        <label className="flex flex-col gap-1 text-meta text-faint">
+        <label className="flex flex-col gap-1.5 text-meta font-medium text-fg">
           amount_cents(支付金额,单位:分;¥1 = 100)
-          <Input value={amount} onChange={(e) => setAmount(e.target.value)} className="tabular-nums" />
+          <Input value={amount} onChange={(e) => setAmount(e.target.value)} className="oc-field-control font-mono tabular-nums" />
         </label>
-        <label className="flex flex-col gap-1 text-meta text-faint">
+        <label className="flex flex-col gap-1.5 text-meta font-medium text-fg">
           credits(到账余额,单位:分;可大于 amount 表赠送)
-          <Input value={credits} onChange={(e) => setCredits(e.target.value)} className="tabular-nums" />
+          <Input value={credits} onChange={(e) => setCredits(e.target.value)} className="oc-field-control font-mono tabular-nums" />
         </label>
-        <label className="flex flex-col gap-1 text-meta text-faint">
+        <label className="flex flex-col gap-1.5 text-meta font-medium text-fg">
           sort_order
           <Input
             type="number"
             value={sort}
             onChange={(e) => setSort(e.target.value)}
-            className="tabular-nums"
+            className="oc-field-control font-mono tabular-nums"
           />
         </label>
       </div>
@@ -192,6 +192,7 @@ export default function PlansPage() {
   return (
     <div className="flex flex-col gap-5">
       <PageHeader
+        icon={CreditCard}
         title={meta.title}
         desc={meta.desc}
         actions={
@@ -203,41 +204,66 @@ export default function PlansPage() {
       />
 
       {error ? (
-        <EmptyState
-          icon={Inbox}
-          title="加载失败"
-          hint={apiErrorMessage(error, "加载失败")}
-          action={
-            <Button variant="secondary" size="sm" onClick={reload}>
-              重试
-            </Button>
-          }
-        />
+        <div className="oc-surface-card rounded-xl">
+          <EmptyState
+            icon={Inbox}
+            title="加载失败"
+            hint={apiErrorMessage(error, "加载失败")}
+            action={
+              <Button variant="secondary" size="sm" onClick={reload}>
+                重试
+              </Button>
+            }
+          />
+        </div>
       ) : loading ? (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
           {Array.from({ length: 3 }).map((_, i) => (
-            <div key={i} className="h-44 animate-pulse rounded-xl border border-border bg-surface" />
+            <div key={i} className="oc-surface-card h-44 animate-pulse rounded-xl" />
           ))}
         </div>
       ) : rows.length === 0 ? (
-        <EmptyState icon={Inbox} title="无套餐" />
+        <div className="oc-surface-card rounded-xl">
+          <EmptyState icon={Inbox} title="无套餐" />
+        </div>
       ) : (
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
+        <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2 xl:grid-cols-3">
           {rows.map((p) => (
-            <Card key={p.code} className="flex flex-col gap-3 p-4">
+            <Card key={p.code} className="oc-surface-card-hover flex flex-col gap-3.5 rounded-xl p-4">
               <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0">
-                  <p className="truncate text-title font-semibold text-fg">{p.label}</p>
-                  <span className="font-mono text-caption text-faint">{p.code}</span>
+                <div className="flex min-w-0 items-center gap-2.5">
+                  <span
+                    className={`oc-icon-badge size-9 rounded-lg ${
+                      p.enabled ? "oc-icon-badge-accent" : ""
+                    }`}
+                  >
+                    <CreditCard size={16} strokeWidth={1.9} />
+                  </span>
+                  <div className="min-w-0">
+                    <p className="truncate text-title font-semibold tracking-tight text-fg">{p.label}</p>
+                    <span className="font-mono text-caption text-faint">{p.code}</span>
+                  </div>
                 </div>
                 <Badge tone={p.enabled ? "success" : "neutral"}>{p.enabled ? "上架" : "下架"}</Badge>
               </div>
+              <div className="oc-surface-recessed grid grid-cols-2 gap-3 rounded-xl p-3">
+                <div>
+                  <p className="text-caption text-faint">支付金额</p>
+                  <p className="mt-1 text-lg font-semibold leading-none tracking-tight text-fg tabular-nums">
+                    {fmtCents(p.amount_cents)}
+                  </p>
+                </div>
+                <div className="border-l border-border/70 pl-3">
+                  <p className="text-caption text-faint">到账余额</p>
+                  <p className="mt-1 text-lg font-semibold leading-none tracking-tight text-accent tabular-nums">
+                    {fmtCents(p.credits)}
+                  </p>
+                </div>
+              </div>
               <div className="flex flex-col gap-0.5">
-                <KeyValue label="支付金额" value={<span className="tabular-nums">{fmtCents(p.amount_cents)}</span>} />
-                <KeyValue label="到账余额" value={<span className="tabular-nums">{fmtCents(p.credits)}</span>} />
                 <KeyValue label="排序" value={<span className="tabular-nums">{p.sort_order}</span>} />
               </div>
-              <div className="flex items-center justify-between border-t border-border pt-3">
+              <div className="flex items-center justify-between border-t border-border/70 pt-3">
                 <label className="flex items-center gap-2 text-meta text-muted">
                   <Switch
                     checked={p.enabled}

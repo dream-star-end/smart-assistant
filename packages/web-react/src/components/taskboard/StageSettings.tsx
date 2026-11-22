@@ -45,6 +45,7 @@ import {
   useToast,
 } from '../ui'
 import { PanelSheet } from './PanelSheet'
+import { ticketTypeBadgeClass, ticketTypeIcon } from './TicketCard'
 
 const HOUR_OPTIONS = [
   { value: '', label: '跟随全局' },
@@ -228,15 +229,15 @@ function EditorSection({
   children: ReactNode
 }) {
   return (
-    <details className="group rounded-lg border border-border" open={defaultOpen}>
-      <summary className="flex cursor-pointer select-none items-center justify-between gap-2 px-3 py-2 text-body font-medium text-fg [&::-webkit-details-marker]:hidden">
+    <details className="oc-surface-card group overflow-hidden rounded-xl" open={defaultOpen}>
+      <summary className="flex cursor-pointer select-none items-center justify-between gap-2 px-3.5 py-2.5 text-body font-medium text-fg transition-colors hover:bg-hover/60 [&::-webkit-details-marker]:hidden">
         <span>
           {title}
           {hint ? <span className="ml-2 text-caption font-normal text-muted">{hint}</span> : null}
         </span>
-        <ChevronDown size={14} className="shrink-0 text-faint transition-transform group-open:rotate-180" />
+        <ChevronDown size={14} className="shrink-0 text-faint transition-transform duration-150 group-open:rotate-180" />
       </summary>
-      <div className="flex flex-col gap-3 border-t border-border px-3 py-3">{children}</div>
+      <div className="flex flex-col gap-3 border-t border-border/60 px-3.5 py-3">{children}</div>
     </details>
   )
 }
@@ -351,7 +352,7 @@ function StageEditor({
     <div className="flex flex-col gap-3" data-testid={`stage-editor-${stage.id}`} data-dirty={dirty ? 'true' : undefined}>
       {stale && (
         <div
-          className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-warning-soft px-3 py-2 text-caption text-warning"
+          className="oc-callout oc-callout-warning flex flex-wrap items-center justify-between gap-2 rounded-xl px-3.5 py-2.5 text-caption text-warning"
           data-testid={`stage-stale-${stage.id}`}
         >
           <span>这个阶段刚被别处更新过；你有未保存的修改，保存会覆盖对方的改动。</span>
@@ -587,7 +588,7 @@ function StageEditor({
           setDraft((d) => ({ ...d, requireHumanAck: v })),
         )}
       </EditorSection>
-      <div className="sticky bottom-0 -mx-1 flex items-center gap-2 bg-hover/95 px-1 py-2 backdrop-blur">
+      <div className="oc-surface-glass sticky bottom-0 flex items-center gap-2.5 rounded-xl px-3 py-2">
         <Button
           type="button"
           size="sm"
@@ -599,7 +600,9 @@ function StageEditor({
           保存阶段
         </Button>
         {dirty ? (
-          <span className="text-caption text-muted">有未保存的修改</span>
+          <Badge tone="warning" size="sm">
+            有未保存的修改
+          </Badge>
         ) : (
           <span className="text-caption text-faint">没有改动</span>
         )}
@@ -990,10 +993,10 @@ export function StageSettings({
                   <div
                     key={stage.id}
                     className={cn(
-                      'rounded-lg bg-hover px-3 py-2',
+                      'oc-surface-recessed rounded-xl px-3 py-2.5 transition-[border-color,box-shadow,opacity] duration-150',
                       dragging && 'opacity-50',
                       dropTarget && 'ring-2 ring-accent',
-                      editing && 'ring-1 ring-border-strong',
+                      editing && 'ring-1 ring-accent/55',
                     )}
                     data-testid={`stage-row-${stage.id}`}
                     data-dragging={dragging ? 'true' : undefined}
@@ -1019,15 +1022,21 @@ export function StageSettings({
                     }}
                   >
                     {/* 名字给足最小宽度,按钮组放不下时整体换到下一行右对齐,不再把名字挤成「需求…」(审计 T-28)。 */}
-                    <div className="flex flex-wrap items-center gap-1">
-                      <span className="inline-flex text-faint" aria-hidden title="拖拽调整顺序">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="inline-flex cursor-grab text-faint active:cursor-grabbing" aria-hidden title="拖拽调整顺序">
                         <GripVertical size={14} />
                       </span>
-                      <span className="w-5 text-caption text-faint">{idx + 1}</span>
-                      <span className="min-w-[8rem] flex-1 truncate text-body text-fg" title={stage.name}>
+                      <span className="oc-badge-craft inline-flex size-5 shrink-0 items-center justify-center rounded-full bg-surface text-caption font-semibold tabular-nums text-muted">
+                        {idx + 1}
+                      </span>
+                      <span className="min-w-[8rem] flex-1 truncate text-body font-medium text-fg" title={stage.name}>
                         {stage.name}
                       </span>
-                      <Badge size="sm" tone={stage.kind === 'ai' ? 'info' : 'neutral'} className="shrink-0">
+                      <Badge
+                        size="sm"
+                        tone={stage.kind === 'ai' ? 'info' : stage.kind === 'gate' ? 'success' : 'accent'}
+                        className="shrink-0"
+                      >
                         {STAGE_KIND_LABEL[stage.kind]}
                       </Badge>
                       <div className="ml-auto flex items-center gap-1">
@@ -1174,24 +1183,50 @@ export function StageSettings({
             <ListSkeleton rows={6} variant="row" />
           ) : (
             <>
-              {grouped.byType.map((g) => (
-                <section key={g.type} className="flex flex-col gap-2">
-                  <h3 className="text-section font-semibold text-fg">{g.label}</h3>
-                  {g.items.length === 0 ? (
-                    <p className="text-caption text-muted">还没有 {g.label} 流水线。</p>
-                  ) : (
-                    g.items.map(renderPipeline)
-                  )}
-                </section>
-              ))}
+              {grouped.byType.map((g) => {
+                const TypeIcon = ticketTypeIcon(g.type)
+                return (
+                  <section key={g.type} className="flex flex-col gap-2">
+                    <div className="flex items-center gap-2">
+                      <span className={cn('size-6 rounded-md', ticketTypeBadgeClass(g.type))} aria-hidden>
+                        <TypeIcon size={12} />
+                      </span>
+                      <h3 className="text-section font-semibold tracking-tight text-fg">{g.label}</h3>
+                      <Badge tone="neutral" size="sm" className="tabular-nums">
+                        {g.items.length}
+                      </Badge>
+                    </div>
+                    {g.items.length === 0 ? (
+                      <p className="oc-surface-recessed rounded-xl px-3 py-2.5 text-caption text-muted">
+                        还没有 {g.label} 流水线。
+                      </p>
+                    ) : (
+                      g.items.map(renderPipeline)
+                    )}
+                  </section>
+                )
+              })}
               {grouped.untyped.length > 0 && (
                 <section className="flex flex-col gap-2">
-                  <h3 className="text-section font-semibold text-fg">通用</h3>
+                  <div className="flex items-center gap-2">
+                    <span className="oc-icon-badge size-6 rounded-md" aria-hidden>
+                      <Workflow size={12} />
+                    </span>
+                    <h3 className="text-section font-semibold tracking-tight text-fg">通用</h3>
+                    <Badge tone="neutral" size="sm" className="tabular-nums">
+                      {grouped.untyped.length}
+                    </Badge>
+                  </div>
                   {grouped.untyped.map(renderPipeline)}
                 </section>
               )}
-              <Card padding="sm" className="flex flex-col gap-2">
-                <h3 className="text-section font-semibold text-fg">新建流水线</h3>
+              <Card padding="sm" className="flex flex-col gap-2.5">
+                <div className="flex items-center gap-2">
+                  <span className="oc-icon-badge oc-icon-badge-accent size-7 rounded-lg" aria-hidden>
+                    <Plus size={14} />
+                  </span>
+                  <h3 className="text-section font-semibold tracking-tight text-fg">新建流水线</h3>
+                </div>
                 <div className="flex flex-wrap items-end gap-2">
                   <Field label="名称" className="min-w-[8rem] flex-1">
                     <Input
@@ -1212,8 +1247,8 @@ export function StageSettings({
                     />
                   </Field>
                 </div>
-                <div className="flex items-center justify-between gap-3">
-                  <span className="text-meta font-medium text-muted">设为该类型默认线</span>
+                <div className="oc-surface-recessed flex items-center justify-between gap-3 rounded-lg px-3 py-2">
+                  <span className="text-meta font-medium text-fg">设为该类型默认线</span>
                   <Switch
                     aria-label="设为该类型默认线"
                     checked={newPipeDefault}
@@ -1224,6 +1259,7 @@ export function StageSettings({
                   <Button
                     type="button"
                     size="sm"
+                    variant="primary"
                     data-testid="pipeline-create-submit"
                     loading={saving}
                     onClick={() => void createPipe()}

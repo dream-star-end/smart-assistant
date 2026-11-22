@@ -14,6 +14,7 @@ import {
 } from './marketplace/useMarketplacePublishes'
 import { useMarketplaceRevision } from './marketplace/useMarketplaceRevision'
 import { Alert, Badge, Button, EmptyState, IconButton, Tabs, useToast } from './ui'
+import { AtelierLazyIcon } from './ui/AtelierLazyIcons'
 
 export type MarketplaceTab = 'browse' | 'installed' | 'publish' | 'review'
 /** Legacy navigation/storage kind. Connector rows remain wire-compatible in PR1. */
@@ -144,17 +145,25 @@ export function MarketplaceCenter({
   return (
     <Dialog.Root open={open} onOpenChange={(o) => !o && requestClose()}>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade" />
+        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/35 backdrop-blur-sm data-[state=open]:animate-fade" />
         <Dialog.Content
           aria-describedby={undefined}
           // 高度上限覆盖 oc-center-dialog 的默认 85dvh:市场是浏览型大弹层,要更高。该变量在未分层的
           // .oc-center-dialog 规则里有默认值,工具类盖不过,只能走内联样式(取小的兜底仍由该规则负责)。
           style={{ '--oc-center-max-h': 'calc(var(--oc-visual-height, 100dvh) - 24px)' } as CSSProperties}
-          className="marketplace-window oc-center-dialog fixed left-1/2 z-50 flex h-[calc(100dvh-24px)] w-[calc(100vw-16px)] max-w-[1120px] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-lg border border-border bg-surface text-fg shadow-float focus:outline-none data-[state=open]:animate-in sm:h-[min(91dvh,940px)] sm:w-[calc(100vw-32px)] lg:w-[calc(100vw-64px)]"
+          className="marketplace-window oc-center-dialog oc-surface-popover fixed left-1/2 z-50 flex h-[calc(100dvh-24px)] w-[calc(100vw-16px)] max-w-[1120px] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl border border-border bg-elevated text-fg shadow-float focus:outline-none data-[state=open]:animate-in sm:h-[min(91dvh,940px)] sm:w-[calc(100vw-32px)] lg:w-[calc(100vw-64px)]"
         >
-          <div className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 border-b border-border px-4 py-3 sm:flex-nowrap sm:px-6">
-            <div className="min-w-0">
-              <Dialog.Title className="truncate text-title font-semibold text-fg">AI 市场</Dialog.Title>
+          <div className="oc-surface-glass flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2.5 border-x-0 border-t-0 border-b border-border/80 px-4 py-3 shadow-none sm:flex-nowrap sm:px-6">
+            <div className="flex min-w-0 items-center gap-2.5">
+              <span
+                className="oc-icon-badge oc-icon-badge-accent size-7 shrink-0 rounded-lg"
+                aria-hidden="true"
+              >
+                <AtelierLazyIcon name="market" size={15} />
+              </span>
+              <Dialog.Title className="truncate text-title font-semibold tracking-tight text-fg">
+                AI 市场
+              </Dialog.Title>
             </div>
             <Tabs
               aria-label="市场分区"
@@ -162,10 +171,10 @@ export function MarketplaceCenter({
               value={safeTab}
               onValueChange={(v) => onTabChange(v as MarketplaceTab)}
               items={tabs.map((t) => ({ value: t.value, label: t.label, featureId: t.featureId }))}
-              className="order-last max-sm:w-full max-sm:[&>[role=tab]]:flex-1 sm:order-none"
+              className="oc-surface-recessed order-last max-sm:w-full max-sm:[&>[role=tab]]:flex-1 sm:order-none"
             />
             <Dialog.Close asChild>
-              <IconButton aria-label="关闭" size="sm" className="ml-auto">
+              <IconButton aria-label="关闭" size="sm" className="oc-btn-tactile ml-auto">
                 <X size={16} />
               </IconButton>
             </Dialog.Close>
@@ -173,11 +182,23 @@ export function MarketplaceCenter({
 
           {/* 发布结果通知:留在滚动区外,滚动时不丢;多条时给出剩余计数,不再"看起来只有一条"。 */}
           {auth && publishNotice && (
-            <div className="border-b border-border px-4 py-2.5 sm:px-6">
+            <div className="shrink-0 border-b border-border/80 bg-surface/65 px-4 py-2.5 sm:px-6">
               <Alert
                 density="compact"
                 tone={noticeApproved ? 'success' : 'warning'}
-                icon={noticeApproved ? <CheckCircle2 size={16} /> : <TriangleAlert size={16} />}
+                className="oc-callout rounded-xl"
+                icon={
+                  <span
+                    className={
+                      noticeApproved
+                        ? 'oc-icon-badge oc-icon-badge-success size-6 rounded-md'
+                        : 'oc-icon-badge oc-icon-badge-warning size-6 rounded-md'
+                    }
+                    aria-hidden="true"
+                  >
+                    {noticeApproved ? <CheckCircle2 size={14} /> : <TriangleAlert size={14} />}
+                  </span>
+                }
                 title={
                   <span className="flex flex-wrap items-center gap-1.5">
                     {noticeApproved
@@ -194,6 +215,7 @@ export function MarketplaceCenter({
                   <Button
                     size="sm"
                     variant="secondary"
+                    className="oc-btn-tactile oc-btn-secondary-craft"
                     onClick={() => {
                       if (noticeApproved) {
                         openApprovedPublish(publishNotice)
@@ -223,16 +245,25 @@ export function MarketplaceCenter({
             className="marketplace-content min-h-0 flex-1 overflow-y-auto overscroll-contain scroll-pt-28 [scrollbar-gutter:stable]"
           >
             {!auth ? (
-              <EmptyState
-                icon={LogIn}
-                title="登录后即可浏览市场"
-                hint="你安装的技能与智能体会跟随账号同步。"
-                action={
-                  <Button size="sm" variant="primary" onClick={onRequireLogin ?? onClose}>
-                    去登录
-                  </Button>
-                }
-              />
+              <div className="px-4 py-10 sm:px-6">
+                <div className="oc-surface-card mx-auto max-w-md rounded-2xl">
+                  <EmptyState
+                    icon={LogIn}
+                    title="登录后即可浏览市场"
+                    hint="你安装的技能与智能体会跟随账号同步。"
+                    action={
+                      <Button
+                        size="sm"
+                        variant="primary"
+                        className="oc-btn-tactile oc-btn-primary-craft"
+                        onClick={onRequireLogin ?? onClose}
+                      >
+                        去登录
+                      </Button>
+                    }
+                  />
+                </div>
+              </div>
             ) : (
               <>
                 {safeTab === 'browse' && (

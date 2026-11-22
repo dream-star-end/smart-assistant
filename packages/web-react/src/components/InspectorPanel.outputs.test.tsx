@@ -6,7 +6,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
-import { InspectorPanelContent } from "./InspectorPanel";
+import { InspectorPanel, InspectorPanelContent, computeDynamicPaneMaxWidth } from "./InspectorPanel";
 import { wrapWithCspOnly } from "./embedCsp";
 import { prefetchMarkdownImpl } from "./Markdown";
 import { preloadToolBody } from "./tool/lazyToolBody";
@@ -106,9 +106,16 @@ describe("产出页", () => {
     fireEvent.click(screen.getByRole("radio", { name: "改动 2" }));
     expect(screen.getAllByTestId("pane-file-change")).toHaveLength(2);
 
+    // 多产物精读态顶栏提供「← 文件列表 (3)」返回 Codex 目录总览，浏览全部文件 / 媒体 / 预览链接 / 来源
+    const backBtn = screen.getByTestId("outputs-back-to-list");
+    expect(backBtn).toHaveTextContent("文件列表");
+    expect(backBtn).toHaveTextContent("(3)");
+    fireEvent.click(backBtn);
+
+    expect(screen.getByTestId("outputs-directory")).toBeInTheDocument();
+    expect(screen.getByTestId("outputs-directory-header")).toHaveTextContent("文件与产出 · 3 项");
     const files = screen.getAllByTestId("outputs-file");
     expect(files.map((f) => f.textContent)).toEqual([expect.stringContaining("index.html"), expect.stringContaining("style.css")]);
-    expect(files[0]).toHaveAttribute("aria-current", "true");
     expect(screen.getAllByTestId("outputs-media")).toHaveLength(1);
     const link = screen.getByTestId("outputs-link");
     expect(link).toHaveAttribute("href", "http://localhost:5173/");
@@ -118,7 +125,7 @@ describe("产出页", () => {
     expect(source).toHaveAttribute("target", "_blank");
     expect(source).toHaveAttribute("rel", "noopener noreferrer");
 
-    // 点别的文件 → 成为主产物
+    // 点别的文件 → 进入单文件精读视图
     fireEvent.click(files[1]);
     expect(screen.getByTestId("outputs-hero-name")).toHaveTextContent("style.css");
     expect(await screen.findByTestId("output-preview-source")).toHaveTextContent("color: red");
@@ -133,7 +140,7 @@ describe("产出页", () => {
     expect(within(md).getAllByRole("listitem")).toHaveLength(2);
   });
 
-  test("回放不出来(只有 Edit)→ 读容器里的当前文件;读不到给重试", async () => {
+  test("回放不出来(只有 Edit)→ 读容器里的当前文件;读不到给「重试读取」并自动隐藏「批注修改」", async () => {
     render(
       <InspectorPanelContent
         messages={[user("u1", "改一下"), tool("e1", "Edit", { file_path: `${W}/app.py`, old_string: "a", new_string: "b" })]}
@@ -142,9 +149,11 @@ describe("产出页", () => {
     );
     await outputsReady();
     expect(screen.getByTestId("outputs-hero-origin")).toHaveTextContent("容器里的当前文件");
-    // 测试环境没有签名通道 → 读取失败,给重试
-    expect(await screen.findByText("没能读取这个文件（可能已被移动或删除）。")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "继续" })).toBeInTheDocument();
+    // 测试环境没有签名通道 → 读取失败,展示人话「重试读取」并隐藏「批注修改」
+    expect(await screen.findByText("没能读取这个文件")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重试读取" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
+    expect(screen.queryByTestId("hero-quick-annotate")).toBeNull();
   });
 
   test("读容器文件的回落:文件又被改过(新的一次 Edit 完成)就重读", async () => {
@@ -190,7 +199,7 @@ describe("产出页", () => {
     expect(screen.getByTestId("outputs-turn")).toHaveTextContent("做一个落地页");
   });
 
-  test("没有产出的轮给安静的空态,「查看步骤」进步骤页", async () => {
+  test("OCV5-844: 没有产出的轮给安静空态，不渲染冗余「查看步骤」按钮与常驻「过程」Tab", async () => {
     render(
       <InspectorPanelContent
         messages={[user("u1", "跑一下测试"), tool("b1", "Bash", { command: "npm test" }), assistant("a1", "都过了")]}
@@ -198,10 +207,12 @@ describe("产出页", () => {
       />,
     );
     await outputsReady();
-    expect(screen.getByTestId("outputs-none")).toHaveTextContent("这一轮没有产出文件");
-    fireEvent.click(screen.getByTestId("outputs-open-steps"));
-    expect(screen.getByRole("tab", { name: /步骤/ })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByTestId("pane-step-list")).toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: /过程|步骤/ })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("outputs-open-steps")).toBeNull();
+    const empty = screen.getByTestId("outputs-none");
+    expect(empty).toHaveTextContent("这一轮没有产出文件");
+    expect(empty).toHaveTextContent("展开左侧完成摘要即可查看本轮执行过程");
+    expect(empty).not.toHaveTextContent("查看步骤");
   });
 
   test("参考来源默认列 5 条,其余收在「显示全部」里", async () => {
@@ -223,5 +234,134 @@ describe("产出页", () => {
     render(<InspectorPanelContent messages={[]} onClose={() => {}} />);
     await outputsReady();
     expect(screen.getByTestId("outputs-empty")).toHaveTextContent("还没有产出");
+  });
+
+  test("targetPath 定位请求跨轮跳转并自动高亮选中目标产物", async () => {
+    render(
+      <InspectorPanelContent
+        messages={session()}
+        request={{ tab: "outputs", targetPath: `${W}/style.css`, nonce: 7 }}
+        onClose={() => {}}
+      />,
+    );
+    await outputsReady();
+    // style.css 位于第 1 轮，自动翻回第 1 轮并成为主产物
+    expect(screen.getByTestId("outputs-turn-counter")).toHaveTextContent("第 1 / 2 轮");
+    expect(screen.getByTestId("outputs-hero-name")).toHaveTextContent("style.css");
+  });
+
+  test("宽屏动态上限计算与全屏影院阅读模式切换", async () => {
+    expect(computeDynamicPaneMaxWidth(1920, 268)).toBe(1120);
+    expect(computeDynamicPaneMaxWidth(1200, 268)).toBe(512);
+
+    render(<InspectorPanel messages={session()} width={440} onClose={() => {}} />);
+    await outputsReady();
+    fireEvent.click(screen.getByTestId("pane-fullscreen-toggle"));
+    expect(screen.getByTestId("pane-fullscreen-dialog")).toBeInTheDocument();
+    expect(screen.getByTestId("pane-fullscreen-docked")).toBeInTheDocument();
+    fireEvent.click(within(screen.getByTestId("pane-fullscreen-dialog")).getByTestId("pane-fullscreen-toggle"));
+    expect(screen.queryByTestId("pane-fullscreen-dialog")).toBeNull();
+  });
+
+  test("移动端底部 Sheet「2-Bar」紧凑阅读器：去 header-safe-t、单轮单文件全出血无套娃、多轮/多文件出极轻微条", async () => {
+    const onToggleFullscreen = vi.fn();
+    const singleFileMessages: ChatMessage[] = [
+      user("u1", "帮我整理一份很长的产品架构分析报告并总结重点", TS),
+      tool("w1", "Write", { file_path: `${W}/report.md`, content: "# 架构分析\n\n核心结论正文。\n" }),
+      assistant("a1", "已完成。", TS + 10_000),
+    ];
+
+    const { rerender } = render(
+      <InspectorPanelContent
+        messages={singleFileMessages}
+        sheet
+        fullscreen={false}
+        onToggleFullscreen={onToggleFullscreen}
+        onClose={() => {}}
+      />,
+    );
+    await outputsReady();
+
+    // 底部 Sheet 非全屏态去掉多余 header-safe-t；支持切全屏
+    expect(screen.getByTestId("pane-header")).not.toHaveClass("header-safe-t");
+    fireEvent.click(screen.getByTestId("pane-fullscreen-toggle"));
+    expect(onToggleFullscreen).toHaveBeenCalledTimes(1);
+
+    // 单轮单文件直接全出血进预览：无 TurnBar、无微条、无 max-h-[68vh] 嵌套滚动
+    expect(screen.queryByTestId("outputs-turn")).toBeNull();
+    expect(screen.queryByTestId("outputs-open-steps")).toBeNull();
+    expect(screen.queryByTestId("outputs-compact-strip")).toBeNull();
+    expect(screen.getByTestId("outputs-hero")).toHaveAttribute("data-compact", "true");
+    expect(screen.getByTestId("outputs-hero-body").className).not.toContain("max-h-[68vh]");
+    expect(await screen.findByTestId("output-preview-markdown")).toBeInTheDocument();
+    expect(screen.getByTestId("workbench-bottom-bar")).toBeInTheDocument();
+
+    // 全屏态恢复 header-safe-t 顶部安全区
+    rerender(
+      <InspectorPanelContent
+        messages={session()}
+        sheet
+        fullscreen
+        onToggleFullscreen={onToggleFullscreen}
+        onClose={() => {}}
+      />,
+    );
+    await outputsReady();
+    expect(screen.getByTestId("pane-header")).toHaveClass("header-safe-t");
+
+    // 多轮单文件时显示清晰的「第 2/2 轮」微条，翻到多产物轮次默认展示 Codex 文件目录总览而非盲翻
+    expect(screen.queryByTestId("outputs-turn")).toBeNull();
+    expect(screen.queryByTestId("outputs-open-steps")).toBeNull();
+    const strip = screen.getByTestId("outputs-compact-strip");
+    expect(strip).toHaveTextContent("第 2/2 轮");
+    fireEvent.click(within(strip).getByLabelText("上一轮"));
+    expect(screen.getByTestId("outputs-directory")).toBeInTheDocument();
+    expect(screen.getByTestId("outputs-directory-header")).toHaveTextContent("文件与产出 · 3 项");
+    expect(screen.getByTestId("outputs-turn-counter")).toHaveTextContent("第 1/2 轮");
+
+    // 点击文件平滑进入精读视图，顶栏展示「← 文件列表 (3)」与前后文件切换钮
+    fireEvent.click(screen.getAllByTestId("outputs-file")[0]);
+    expect(screen.getByTestId("outputs-back-to-list")).toHaveTextContent("(3)");
+    expect(screen.getByTestId("outputs-hero-name")).toHaveTextContent("index.html");
+    fireEvent.click(screen.getByLabelText("下一份文件"));
+    expect(screen.getByTestId("outputs-hero-name")).toHaveTextContent("style.css");
+  });
+
+  test("Codex 两级体验 + 幽灵路径过滤 + 移动端报错态提供「重试读取 / 返回文件列表」并隐藏「批注修改」", async () => {
+    const messages: ChatMessage[] = [
+      user("u1", "构建并改两个文件", TS),
+      tool("e1", "Edit", { file_path: `${W}/missing.ts`, old_string: "a", new_string: "b" }),
+      tool("w1", "Write", { file_path: `${W}/notes.md`, content: "# 说明\n内容\n" }),
+      assistant(
+        "a1",
+        "构建输出 `/assets/styles-1VWWTp9J.css`、宿主机 `/var/lib/docker/volumes/oc/_data/x.ts`、`/opt/openclaude/a.ts`。",
+        TS + 5_000,
+      ),
+    ];
+
+    render(<InspectorPanelContent messages={messages} sheet onClose={() => {}} />);
+    await outputsReady();
+
+    // 幽灵路径被彻底过滤，仅剩 2 个真实工作区文件，且默认打开 Codex 目录总览
+    expect(screen.getByTestId("outputs-directory")).toBeInTheDocument();
+    expect(screen.getByTestId("outputs-directory-header")).toHaveTextContent("文件与产出 · 2 项");
+    const rows = screen.getAllByTestId("outputs-file");
+    expect(rows.map((r) => r.textContent)).toEqual([
+      expect.stringContaining("missing.ts"),
+      expect.stringContaining("notes.md"),
+    ]);
+    expect(screen.queryByText(/styles-1VWWTp9J\.css/)).toBeNull();
+
+    // 点开不可读的 missing.ts → 报错态给出「重试读取」与「返回文件列表」，并自动隐藏「批注修改」
+    fireEvent.click(rows[0]);
+    expect(await screen.findByText("没能读取这个文件")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重试读取" })).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /返回文件列表/ }).length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByTestId("hero-quick-annotate")).toBeNull();
+    expect(screen.queryByRole("button", { name: /批注修改/ })).toBeNull();
+
+    // 点击「返回文件列表」回到目录总览
+    fireEvent.click(screen.getByTestId("outputs-back-to-list"));
+    expect(screen.getByTestId("outputs-directory")).toBeInTheDocument();
   });
 });

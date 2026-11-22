@@ -18,13 +18,13 @@ import { StatusDot, useQuiet } from "./Quiet";
  * **直接当类名字符串用**(不过 cn/tailwind-merge),base 与 variant 里出现同属性会两条都留下,
  * 谁后写谁生效全靠运气。同属性只允许出现在一个轴上。
  */
-export const alertVariants = cva("flex gap-3 rounded-lg border leading-relaxed", {
+export const alertVariants = cva("oc-callout flex gap-3 rounded-lg border leading-relaxed", {
   variants: {
     tone: {
-      info: "border-info/30 bg-info-soft",
-      success: "border-success/30 bg-success-soft",
-      warning: "border-warning/30 bg-warning-soft",
-      danger: "border-danger/30 bg-danger-soft",
+      info: "oc-callout-info border-info/30 bg-info-soft",
+      success: "oc-callout-success border-success/30 bg-success-soft",
+      warning: "oc-callout-warning border-warning/30 bg-warning-soft",
+      danger: "oc-callout-danger border-danger/30 bg-danger-soft",
     },
     /** comfortable = 改造前默认(独立成块的页面级提示);compact = 表单/卡片内的行内提示。 */
     density: {
@@ -36,10 +36,10 @@ export const alertVariants = cva("flex gap-3 rounded-lg border leading-relaxed",
 });
 
 const iconTone: Record<string, string> = {
-  info: "text-info",
-  success: "text-success",
-  warning: "text-warning",
-  danger: "text-danger",
+  info: "oc-icon-badge oc-icon-badge-info",
+  success: "oc-icon-badge oc-icon-badge-success",
+  warning: "oc-icon-badge oc-icon-badge-warning",
+  danger: "oc-icon-badge oc-icon-badge-danger",
 };
 
 export interface AlertProps
@@ -107,7 +107,17 @@ export function Alert({
       {quiet ? (
         <StatusDot tone={tone ?? "info"} className="mt-[7px]" />
       ) : (
-        icon && <span className={cn("mt-0.5 shrink-0", iconTone[tone ?? "info"])}>{icon}</span>
+        icon && (
+          <span
+            className={cn(
+              "mt-0.5 rounded-md",
+              density === "compact" ? "size-6" : "size-7",
+              iconTone[tone ?? "info"],
+            )}
+          >
+            {icon}
+          </span>
+        )
       )}
       <div
         className={cn(

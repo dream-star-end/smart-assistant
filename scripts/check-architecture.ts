@@ -23,6 +23,7 @@
  *          [--json <out.json>] [--write-baseline]
  */
 import { execFileSync, spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -632,8 +633,8 @@ export function renamesSince(root: string, base: string): Map<string, string> {
   return out
 }
 
-/** The baseline entries as committed at `rev`, or null when that commit has no baseline file. */
-export function baselineAt(root: string, rev: string): Record<string, number> | null {
+/** Raw text of `arch/violations-baseline.json` as committed at `rev`, or null when absent. */
+export function baselineRawAt(root: string, rev: string): string | null {
   const r = spawnSync('git', ['show', `${rev}:arch/violations-baseline.json`], {
     cwd: root,
     encoding: 'utf8',
@@ -644,8 +645,15 @@ export function baselineAt(root: string, rev: string): Record<string, number> | 
     if (/does not exist in|exists on disk, but not in/.test(r.stderr)) return null
     fail(`git show ${rev}:arch/violations-baseline.json: ${r.stderr.trim().split('\n')[0]}`)
   }
+  return r.stdout
+}
+
+/** The baseline entries as committed at `rev`, or null when that commit has no baseline file. */
+export function baselineAt(root: string, rev: string): Record<string, number> | null {
+  const raw = baselineRawAt(root, rev)
+  if (raw === null) return null
   try {
-    const j = JSON.parse(r.stdout)
+    const j = JSON.parse(raw)
     if (j.schema !== 1 || !j.entries || typeof j.entries !== 'object') throw new Error('bad shape')
     return j.entries
   } catch (e) {
@@ -677,6 +685,124 @@ export function compare(
   for (const [k, n] of Object.entries(moved))
     if ((current[k] ?? 0) < n) stale.push({ key: k, baseline: n, now: current[k] ?? 0 })
   return { grown, stale }
+}
+
+export const RULE_REMEDIATION: Record<string, { why: string; fix: string }> = {
+  'R1-unmapped': {
+    why: 'Every production source file must belong to a declared layer/module in arch/modules.json.',
+    fix: 'Move the file into an existing domain directory or register its glob in arch/modules.json (CODEOWNERS-protected).',
+  },
+  'R2-upward': {
+    why: 'Value imports must only flow downward across layers (L6→L0 backend, F5→F0 frontend).',
+    fix: 'Use `import type` if only types are needed, move shared contracts to a lower layer (e.g. @openclaude/protocol L0 or web-lib F1), or invert control via DI.',
+  },
+  'R2-same-layer': {
+    why: 'Same-layer modules may only import along the registered acyclic DAG (`allow` in arch/modules.json).',
+    fix: 'Use `import type`, extract shared primitives to a lower layer, or orchestrate cross-domain calls from an upper composition layer (L4/L5/L6 or F5).',
+  },
+  'R2-cross-package-internal': {
+    why: 'Relative imports across package boundaries bypass package.json `exports` and break container/bundle isolation.',
+    fix: 'Import from the public package entrypoint (`@openclaude/<pkg>` or its declared `exports` subpath) instead of relative `../../*/src/` paths.',
+  },
+  'R2-contract-node': {
+    why: 'L0 contract modules (@openclaude/protocol) must stay runtime-agnostic with zero value imports of `node:*`.',
+    fix: 'Remove runtime `node:*` imports from L0 contracts; use pure JS/Web APIs, `import type`, or move Node logic to L1/L2 (@openclaude/kernel / storage / gateway).',
+  },
+  'R3-billing-sql': {
+    why: 'Mutations to billing/ledger/credit/order tables belong strictly to single-authority `billing` / `payment` modules.',
+    fix: 'Delegate all writes to credit_ledger, usage_records, orders, or users.credits through billing/payment service APIs instead of raw SQL DML.',
+  },
+  'R3-env': {
+    why: 'Direct `process.env` reads outside `platform-config` cause config drift and hidden runtime coupling.',
+    fix: 'Declare and parse the variable in `packages/commercial/src/config.ts` (platform-config) or accept it via injected config/deps.',
+  },
+  'R3-net': {
+    why: 'Direct `fetch`/`undici`/`node:http(s)` calls outside registered `net` authorities bypass egress, timeout, and observability controls.',
+    fix: 'Route outbound requests through a registered `net` adapter module (e.g. `adapters-providers`, `web-lib` API client) or inject `fetchImpl`.',
+  },
+  'R3-handler-auth': {
+    why: 'Handler-level auth guards (`requireAuth`, `requireAdmin`, `verifyContainerIdentity`) belong strictly in L5 HTTP boundary modules.',
+    fix: 'Authenticate requests in the HTTP boundary (`interface-http` / `gateway-interface`) and pass the verified principal/identity into lower layers.',
+  },
+  'R3-crypto': {
+    why: 'Cryptographic primitives must be centralized in `platform-auth-crypto` to guarantee safe algorithms and key hygiene.',
+    fix: 'Reuse helpers from `packages/commercial/src/crypto/**` or `platform-auth-crypto` instead of calling low-level `node:crypto` APIs directly.',
+  },
+  'R3-special-case': {
+    why: 'Provider/engine name branching outside adapter boundaries leaks upstream quirks across the codebase.',
+    fix: 'Encapsulate provider/engine-specific behavior behind capabilities/adapters in `adapters-providers` or `gateway-engines`.',
+  },
+  'R2-scope': {
+    why: 'A multi-process shared module must not depend on a module with narrower process scope.',
+    fix: 'Move the dependency to a shared-scope module or pass process-specific behavior in via dependency injection.',
+  },
+  'R2-front-back': {
+    why: 'Frontend (F0-F5) and backend (L1-L6) must stay isolated; frontend may only import L0 contracts.',
+    fix: 'Share types/schemas through `@openclaude/protocol` (L0) instead of importing backend implementation modules.',
+  },
+}
+
+export function formatGateRemediation(
+  items: ReadonlyArray<{ key: string; baseline: number; now: number }>,
+  kind: 'NEW/GROWN' | 'BASELINE-GROWN',
+): string[] {
+  const byRule = new Map<string, { count: number; sample: string }>()
+  for (const item of items) {
+    const [rule, file, target] = item.key.split('|')
+    if (!rule) continue
+    const prev = byRule.get(rule)
+    const sample = target && target !== '-' ? `${file} -> ${target}` : (file ?? item.key)
+    if (!prev) byRule.set(rule, { count: 1, sample })
+    else prev.count++
+  }
+  const lines: string[] = []
+  for (const [rule, info] of byRule) {
+    const guide = RULE_REMEDIATION[rule]
+    if (!guide) continue
+    lines.push(
+      `[GATE-ERROR] ${rule} (${kind}, ${info.count} identit${info.count === 1 ? 'y' : 'ies'}, e.g. ${info.sample})`,
+      `  Why       : ${guide.why}`,
+      `  How to Fix: ${guide.fix}`,
+      '  Re-verify : npx tsx scripts/check-architecture.ts --enforce',
+    )
+  }
+  return lines
+}
+
+export interface ApprovedRebaseline {
+  readonly ticket: string
+  /** Exact SHA-256 hex digest of `<base>:arch/violations-baseline.json` raw bytes. */
+  readonly fromBaselineSha256: string
+  /** Exact SHA-256 hex digest of calibrated `arch/violations-baseline.json` raw bytes. */
+  readonly toBaselineSha256: string
+}
+
+/**
+ * Single-use CODEOWNERS-locked dual-hash rebaseline transition (OCV5-847):
+ * permits ONLY the exact transition `fromBaselineSha256 -> toBaselineSha256`.
+ * Immune to concurrent commits moving the base ref before merge, and permanently
+ * self-invalidates after merge once base advances to `toBaselineSha256`.
+ */
+export const APPROVED_REBASELINE: ApprovedRebaseline = {
+  ticket: 'OCV5-847',
+  fromBaselineSha256: 'fa8553f1bf291dcf3e887f7a4e4a138c0c94a24b311c2ab19eaebffaa9b71eb6',
+  toBaselineSha256: '897f3d1626d20b563406811442962fe550c445146dabc74f8f9bb42aadc6d3f4',
+}
+
+export function sha256Hex(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex')
+}
+
+export function isApprovedRebaseline(
+  baseBaselineRaw: string | null,
+  headBaselineRaw: string,
+  anchor: ApprovedRebaseline | null = APPROVED_REBASELINE,
+): boolean {
+  if (!anchor || baseBaselineRaw === null) return false
+  return (
+    sha256Hex(baseBaselineRaw) === anchor.fromBaselineSha256.toLowerCase() &&
+    sha256Hex(headBaselineRaw) === anchor.toBaselineSha256.toLowerCase()
+  )
 }
 
 function main() {
@@ -712,7 +838,8 @@ function main() {
     return
   }
   if (!existsSync(bf)) fail(`missing ${bf}`)
-  const baseline = JSON.parse(readFileSync(bf, 'utf8'))
+  const baselineRaw = readFileSync(bf, 'utf8')
+  const baseline = JSON.parse(baselineRaw)
   if (
     baseline.schema !== 1 ||
     !baseline.entries ||
@@ -731,11 +858,25 @@ function main() {
   // shrink, otherwise a PR could add a violation and raise its count in the same diff.
   let baselineGrown: { key: string; baseline: number; now: number }[] = []
   let baseHasBaseline = false
+  let rebaselineAnchored = false
   if (base) {
-    const prev = baselineAt(root, base)
-    if (prev) {
+    const prevRaw = baselineRawAt(root, base)
+    if (prevRaw !== null) {
       baseHasBaseline = true
-      baselineGrown = compare(prev, carry(baseline.entries, renames), renames).grown
+      if (isApprovedRebaseline(prevRaw, baselineRaw)) {
+        rebaselineAnchored = true
+      } else {
+        let prev: Record<string, number>
+        try {
+          const j = JSON.parse(prevRaw)
+          if (j.schema !== 1 || !j.entries || typeof j.entries !== 'object')
+            throw new Error('bad shape')
+          prev = j.entries
+        } catch (e) {
+          fail(`invalid baseline at ${base}: ${(e as Error).message}`)
+        }
+        baselineGrown = compare(prev, carry(baseline.entries, renames), renames).grown
+      }
     }
   }
   const byRule: Record<string, number> = {}
@@ -773,12 +914,18 @@ function main() {
   if (stale.length > 50) console.log(`  … ${stale.length - 50} more stale`)
   for (const g of baselineGrown)
     console.log(`  BASELINE-GROWN ${g.key} ${g.baseline} → ${g.now} (the baseline may only shrink)`)
+  for (const line of formatGateRemediation(grown, 'NEW/GROWN')) console.log(line)
+  for (const line of formatGateRemediation(baselineGrown, 'BASELINE-GROWN')) console.log(line)
+  if (rebaselineAnchored)
+    console.log(
+      `[architecture] approved rebaseline anchor matched (${APPROVED_REBASELINE.ticket}, ${APPROVED_REBASELINE.fromBaselineSha256.slice(0, 12)} -> ${APPROVED_REBASELINE.toBaselineSha256.slice(0, 12)}): skipping baseline-grown diff; enforcing new/grown=0 stale=0 unmapped=0`,
+    )
   if (base && !baseHasBaseline)
     console.log(`[architecture] ${base} has no baseline: introduced here`)
   console.log(
     `[architecture] new/grown=${grown.length} stale=${stale.length} baseline-grown=${baselineGrown.length} unmapped=${unmapped}`,
   )
-  if (enforce && (grown.length || stale.length || baselineGrown.length)) process.exit(1)
+  if (enforce && (grown.length || stale.length || baselineGrown.length || unmapped)) process.exit(1)
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main()

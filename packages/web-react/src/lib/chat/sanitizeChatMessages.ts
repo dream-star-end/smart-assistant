@@ -38,9 +38,7 @@ function asCorruptPlaceholder(
   return {
     id: stableCorruptId(sessionId, index, raw),
     role: "system",
-    text: reason === "missing-id"
-      ? "此条消息缺少 id，已跳过渲染"
-      : "此条消息数据结构异常，已跳过渲染",
+    text: "该条内容暂时无法显示",
     ts,
     _source: "server",
     _corruptPlaceholder: true,

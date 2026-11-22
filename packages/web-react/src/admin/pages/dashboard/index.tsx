@@ -1,21 +1,25 @@
 import type { ChartConfiguration } from 'chart.js'
 import {
   Activity,
+  BellRing,
   CheckCircle2,
   CreditCard,
   KeyRound,
+  LayoutDashboard,
   RefreshCw,
   Server,
+  Sparkles,
   TrendingUp,
   UserPlus,
   Users,
 } from 'lucide-react'
 import { type ReactNode, useRef, useState } from 'react'
-import { Button } from '../../../components/ui'
+import { Badge, Button } from '../../../components/ui'
 import {
   ChartCard,
   type ChartTheme,
   LevelBadge,
+  PageHeader,
   RangePreset,
   StatCard,
   StatCardRow,
@@ -189,6 +193,7 @@ export default function DashboardPage() {
       <PageHeaderRow
         title={meta.title}
         desc={meta.desc}
+        firing={firing}
         onRefresh={() => {
           poll.refresh()
           lifetime.reload()
@@ -303,9 +308,14 @@ export default function DashboardPage() {
       </StatCardRow>
 
       {/* 运营至今累计 */}
-      <div className="flex items-center justify-between">
-        <h2 className="text-body font-semibold text-muted">运营至今</h2>
-        <span className="text-meta text-faint">
+      <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+        <div className="flex items-center gap-2">
+          <span className="oc-icon-badge oc-icon-badge-accent size-6 rounded-md">
+            <Sparkles size={13} strokeWidth={2} />
+          </span>
+          <h2 className="text-section font-semibold tracking-tight text-fg">运营至今</h2>
+        </div>
+        <span className="oc-badge-craft rounded-full bg-hover px-2.5 py-0.5 text-caption font-medium text-muted tabular-nums">
           {lifetime.data?.first_paid_at
             ? `自 ${lifetime.data.first_paid_at.slice(0, 10)} 首单`
             : lifetime.error
@@ -540,6 +550,7 @@ export default function DashboardPage() {
 function PageHeaderRow({
   title,
   desc,
+  firing,
   onRefresh,
   refreshing,
   dauV,
@@ -547,26 +558,35 @@ function PageHeaderRow({
 }: {
   title: string
   desc: string
+  firing: number
   onRefresh: () => void
   refreshing: boolean
   dauV: number
   onDau: (v: number) => void
 }) {
   return (
-    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-      <div className="min-w-0">
-        <h1 className="text-lg font-semibold text-fg">{title}</h1>
-        <p className="mt-1 text-[13px] leading-snug text-muted">{desc} · 30s 自动刷新</p>
-      </div>
-      <div className="flex shrink-0 flex-wrap items-center gap-2">
-        <span className="text-meta text-faint">活跃度窗口</span>
-        <RangePreset options={DAU_OPTS} value={dauV} onChange={onDau} />
-        <Button variant="secondary" size="sm" onClick={onRefresh} className="gap-1.5">
-          <RefreshCw size={14} className={refreshing ? 'animate-spin' : undefined} />
-          刷新
-        </Button>
-      </div>
-    </div>
+    <PageHeader
+      icon={LayoutDashboard}
+      title={title}
+      desc={`${desc} · 30s 自动刷新`}
+      badge={
+        firing > 0 ? (
+          <Badge tone="danger" size="sm">
+            {firing} 条告警触发中
+          </Badge>
+        ) : undefined
+      }
+      actions={
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-caption font-medium text-faint">活跃度窗口</span>
+          <RangePreset options={DAU_OPTS} value={dauV} onChange={onDau} />
+          <Button variant="secondary" size="sm" onClick={onRefresh} className="gap-1.5">
+            <RefreshCw size={14} className={refreshing ? 'animate-spin' : undefined} />
+            刷新
+          </Button>
+        </div>
+      }
+    />
   )
 }
 
@@ -581,7 +601,7 @@ function ClickableCard({
       type="button"
       aria-label={label}
       onClick={onClick}
-      className="cursor-pointer rounded-xl text-left outline-none transition-transform hover:-translate-y-0.5 focus-visible:ring-2 focus-visible:ring-ring"
+      className="group block w-full cursor-pointer rounded-xl text-left outline-none focus-visible:ring-2 focus-visible:ring-ring [&>*]:transition-transform [&>*]:duration-150 [&>*]:hover:-translate-y-0.5 [&>*]:hover:border-accent/40"
     >
       {children}
     </button>
@@ -617,7 +637,7 @@ function ChartPanel({
     <ChartCard title={title} hint={hint} action={action} height={height}>
       {loading ? (
         <div className="flex h-full w-full items-center justify-center">
-          <div className="h-full w-full animate-pulse rounded-lg bg-hover" />
+          <div className="h-full w-full animate-pulse rounded-lg bg-skeleton" />
         </div>
       ) : error ? (
         <CenterMsg tone="danger">加载失败</CenterMsg>
@@ -633,7 +653,7 @@ function ChartPanel({
 function CenterMsg({ children, tone }: { children: ReactNode; tone?: 'danger' }) {
   return (
     <div
-      className={`flex h-full w-full items-center justify-center text-[13px] ${
+      className={`flex h-full w-full items-center justify-center text-body ${
         tone === 'danger' ? 'text-danger' : 'text-faint'
       }`}
     >
@@ -672,34 +692,44 @@ function AlertsCard({
   )
   const events7dTotal = events7d?.reduce((a, r) => a + (Number(r.count) || 0), 0) ?? 0
   const recent = summary?.rules.recent_firing ?? []
+  const firingCount = summary?.rules.firing ?? 0
 
   return (
     <button
       type="button"
       aria-label="打开告警中心"
       onClick={onOpen}
-      className="flex cursor-pointer flex-col rounded-xl border border-border bg-surface text-left shadow-soft outline-none transition-colors hover:border-border-strong focus-visible:ring-2 focus-visible:ring-ring"
+      className="oc-surface-card oc-surface-card-hover flex cursor-pointer flex-col overflow-hidden rounded-xl text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
     >
-      <div className="flex items-start justify-between gap-3 px-5 py-3.5">
-        <div className="min-w-0">
-          <h3 className="text-body font-semibold text-fg">告警摘要</h3>
-          <p className="mt-0.5 text-caption text-faint">
-            触发中规则 / 近 24h 事件级别 / 近 7 日事件
-          </p>
+      <div className="flex items-center justify-between gap-3 bg-sidebar/40 px-5 py-3.5 dark:bg-elevated/40">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <span
+            className={`oc-icon-badge size-8 rounded-lg ${
+              firingCount > 0 ? 'oc-icon-badge-danger' : 'oc-icon-badge-success'
+            }`}
+          >
+            <BellRing size={15} strokeWidth={1.95} />
+          </span>
+          <div className="min-w-0">
+            <h3 className="text-title font-semibold tracking-tight text-fg">告警摘要</h3>
+            <p className="mt-0.5 text-caption text-faint">
+              触发中规则 / 近 24h 事件级别 / 近 7 日事件
+            </p>
+          </div>
         </div>
-        <span className="shrink-0 text-meta font-medium text-accent">告警中心 →</span>
+        <span className="shrink-0 text-meta font-semibold text-accent">告警中心 →</span>
       </div>
 
       {loading ? (
-        <div className="border-t border-border px-5 py-8">
-          <div className="h-24 w-full animate-pulse rounded-lg bg-hover" />
+        <div className="border-t border-border/80 px-5 py-8">
+          <div className="h-24 w-full animate-pulse rounded-lg bg-skeleton" />
         </div>
       ) : failed || !summary ? (
-        <div className="border-t border-border px-5 py-8 text-center text-body text-danger">
+        <div className="border-t border-border/80 px-5 py-8 text-center text-body text-danger">
           加载失败
         </div>
       ) : (
-        <div className="border-t border-border px-5 py-4">
+        <div className="border-t border-border/80 px-5 py-4">
           {/* 概览 3 指标 */}
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
             <MiniStat
@@ -727,8 +757,8 @@ function AlertsCard({
 
           <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
             {/* 24h 级别分布 donut */}
-            <div>
-              <p className="mb-1 text-caption text-faint">
+            <div className="oc-surface-recessed rounded-xl p-3">
+              <p className="mb-1.5 text-caption font-medium text-faint">
                 近 24h 事件 · 按级别（{fmtInt(sevTotal)} 起）
               </p>
               <div className="relative h-[132px] w-full">
@@ -736,17 +766,17 @@ function AlertsCard({
               </div>
             </div>
             {/* 最近触发规则 */}
-            <div>
-              <p className="mb-1 text-caption text-faint">最近触发规则</p>
+            <div className="oc-surface-recessed rounded-xl p-3">
+              <p className="mb-1.5 text-caption font-medium text-faint">最近触发规则</p>
               {recent.length === 0 ? (
-                <p className="py-6 text-center text-meta text-faint">近期无触发规则</p>
+                <p className="py-8 text-center text-meta text-faint">近期无触发规则</p>
               ) : (
                 <ul className="flex flex-col divide-y divide-border/60">
                   {recent.map((r) => (
                     <li key={r.rule_id} className="flex items-center justify-between gap-2 py-1.5">
                       <span className="flex min-w-0 items-center gap-1.5">
                         <LevelBadge level="critical" label="触发" />
-                        <code className="truncate text-meta text-fg">{r.rule_id}</code>
+                        <code className="truncate font-mono text-meta text-fg">{r.rule_id}</code>
                       </span>
                       {r.fired_at && (
                         <TimeAgo value={r.fired_at} className="shrink-0 text-caption text-faint" />
@@ -775,9 +805,11 @@ function MiniStat({
     danger: 'text-danger',
   }[tone]
   return (
-    <div className="rounded-lg bg-hover px-3 py-2">
-      <p className="truncate text-caption text-faint">{label}</p>
-      <p className={`mt-0.5 text-[16px] font-semibold tabular-nums ${toneCls}`}>{value}</p>
+    <div className="oc-surface-recessed rounded-xl px-3.5 py-2.5">
+      <p className="truncate text-caption font-medium text-faint">{label}</p>
+      <p className={`mt-1 text-title font-semibold tracking-tight tabular-nums ${toneCls}`}>
+        {value}
+      </p>
     </div>
   )
 }

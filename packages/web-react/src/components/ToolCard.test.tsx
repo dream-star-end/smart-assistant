@@ -271,12 +271,15 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button"));
-    // 未变行是上下文(无 bg 着色),变化行分别标红/绿
+    // 未变行是上下文(无 bg 着色),变化行分别标红/绿(OCV5-838 词级高亮会拆 span,按行 textContent 匹配)
     const ctx = screen.getByText("keep").closest("div");
     expect(ctx?.className).not.toContain("bg-danger-soft");
     expect(ctx?.className).not.toContain("bg-success-soft");
-    expect(screen.getByText("old-line").closest("div")?.className).toContain("bg-danger-soft");
-    expect(screen.getByText("new-line").closest("div")?.className).toContain("bg-success-soft");
+    const diffRows = Array.from(ctx?.parentElement?.children ?? []);
+    const oldRow = diffRows.find((el) => el.textContent?.includes("old-line"));
+    const newRow = diffRows.find((el) => el.textContent?.includes("new-line"));
+    expect(oldRow?.className).toContain("bg-danger-soft");
+    expect(newRow?.className).toContain("bg-success-soft");
     // 行号:上下文行同时有旧/新行号
     const row = screen.getByText("keep").closest("div");
     expect(row?.textContent).toContain("1");
@@ -1120,8 +1123,14 @@ describe("codex fileChange(apply_patch)的 Write/Edit 卡", () => {
     );
     expect(screen.getByText("编辑文件")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button"));
-    expect(screen.getByText("-旧的一行").className).toContain("text-danger");
-    expect(screen.getByText("+新的一行").className).toContain("text-success");
+    const ctxRow = screen.getByText("上下文行").closest("div");
+    const codexDiffRows = Array.from(ctxRow?.parentElement?.children ?? []);
+    const delRow = codexDiffRows.find((el) => el.textContent?.includes("旧的一行"));
+    const addRow = codexDiffRows.find((el) => el.textContent?.includes("新的一行"));
+    expect(delRow?.className).toContain("bg-danger-soft");
+    expect(delRow?.innerHTML).toContain("text-danger");
+    expect(addRow?.className).toContain("bg-success-soft");
+    expect(addRow?.innerHTML).toContain("text-success");
     expect(screen.getByText("上下文行")).toBeInTheDocument();
   });
 
@@ -1169,7 +1178,9 @@ describe("codex fileChange(apply_patch)的 Write/Edit 卡", () => {
     expect(screen.getAllByText("/a/1.txt").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("/a/2.txt")).toBeInTheDocument();
     expect(screen.getByText("删除文件")).toBeInTheDocument();
-    expect(screen.getByText("+y")).toBeInTheDocument();
+    const ySpan = screen.getByText("y");
+    expect(ySpan.closest("div")?.textContent).toContain("+");
+    expect(ySpan.closest("div")?.className).toContain("bg-success-soft");
   });
 
   test("claude 原生 Write(content)行为不变,不误入 codex 分支", () => {

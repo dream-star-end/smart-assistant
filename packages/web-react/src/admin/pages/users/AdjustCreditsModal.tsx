@@ -1,3 +1,4 @@
+import { Wallet } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Button, Input, Modal, useToast } from '../../../components/ui'
 import { adminSend, apiErrorMessage } from '../../lib/adminApi'
@@ -45,6 +46,14 @@ export function AdjustCreditsModal({
         : `解析后：${fmtYuan(cents)}（${cents} 分）`
   const previewTone =
     amount.trim() === '' ? 'text-faint' : cents == null ? 'text-danger' : 'text-success'
+  const previewCallout =
+    amount.trim() === ''
+      ? 'oc-callout'
+      : cents == null
+        ? 'oc-callout oc-callout-danger'
+        : cents > 0
+          ? 'oc-callout oc-callout-success'
+          : 'oc-callout oc-callout-warning'
 
   const canSubmit = cents != null && memo.trim().length > 0 && !submitting
 
@@ -93,27 +102,33 @@ export function AdjustCreditsModal({
       }
     >
       <div className="flex flex-col gap-4">
-        <div className="flex flex-col gap-1.5">
-          <label className="text-meta font-medium text-muted" htmlFor="adj-amount">
-            金额（¥，支持两位小数；正数加、负数扣）
-          </label>
-          <Input
-            id="adj-amount"
-            value={amount}
-            placeholder="例如 1.00 或 -0.50"
-            autoComplete="off"
-            onChange={(e) => setAmount(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.nativeEvent.isComposing && canSubmit) {
-                e.preventDefault()
-                void submit()
-              }
-            }}
-          />
-          <p className={`text-[12px] tabular-nums ${previewTone}`}>{preview}</p>
+        <div className="oc-surface-recessed flex flex-col gap-3 rounded-xl p-3.5">
+          <div className="flex flex-col gap-1.5">
+            <label className="text-meta font-medium text-fg" htmlFor="adj-amount">
+              金额（¥，支持两位小数；正数加、负数扣）
+            </label>
+            <Input
+              id="adj-amount"
+              value={amount}
+              placeholder="例如 1.00 或 -0.50"
+              autoComplete="off"
+              className="oc-field-control font-mono tabular-nums"
+              onChange={(e) => setAmount(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.nativeEvent.isComposing && canSubmit) {
+                  e.preventDefault()
+                  void submit()
+                }
+              }}
+            />
+          </div>
+          <div className={`${previewCallout} flex items-center gap-2 rounded-lg px-3 py-2`}>
+            <Wallet size={14} className="shrink-0 text-muted" aria-hidden="true" />
+            <p className={`text-caption font-medium tabular-nums ${previewTone}`}>{preview}</p>
+          </div>
         </div>
         <div className="flex flex-col gap-1.5">
-          <label className="text-meta font-medium text-muted" htmlFor="adj-memo">
+          <label className="text-meta font-medium text-fg" htmlFor="adj-memo">
             备注（必填）
           </label>
           <Input
@@ -121,6 +136,7 @@ export function AdjustCreditsModal({
             value={memo}
             maxLength={500}
             placeholder="如：补偿 / 退款 / 测试"
+            className="oc-field-control"
             onChange={(e) => setMemo(e.target.value)}
           />
         </div>

@@ -27,7 +27,7 @@ import {
   Wand2,
   X,
 } from "lucide-react";
-import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol/browser";
+import { normalizeTurnErrorCode } from "@openclaude/protocol/browser";
 import { createContext, memo, useContext, useEffect, useId, useRef, useState } from "react";
 import type { BlankProbeReport as TimelineBlankReport } from "../../lib/chat/timelineBlankProbe";
 import type { ChatMessage } from "../../lib/chat/model";
@@ -85,8 +85,7 @@ import { formatDate } from "../ui/TimeAgo";
 import type { ErrorNoticeActionsInput } from "./errorNoticeActions";
 import { ErrorNotice } from "./lazyTurnErrorNotice";
 import { agentDisplayName } from "./agentNames";
-import { ProgressivePlainText } from "./AgentGroupCard";
-import { DelegateProcessList } from "./delegateProcessList";
+import { DelegateProcessListLazy } from "./lazyTimelineCards";
 import { Media } from "./media";
 import { useProcessStep } from "./processStep";
 import { StepMetaBadge } from "./stepDuration";
@@ -135,6 +134,8 @@ export type CardCallbacks = {
   getToken?: () => string | null | undefined;
   /** context_too_long 类:在新会话中延续目标(导航非重发,同 onTopUp 不受末轮门控)。 */
   onStartNewSession?: () => void;
+  /** OCV5-840: context_too_long 类主动作 — 一键压缩当前会话并继续。 */
+  onCompactSession?: () => void;
   onFeedback?: (ctx: FeedbackContext) => void;
   onFirstTextPaint?: (input: {
     traceId: string;
@@ -142,6 +143,17 @@ export type CardCallbacks = {
     clientMessageId: string;
     latencyMs: number;
     backgroundAtFrame: boolean;
+    visibilityState?: DocumentVisibilityState;
+    wasHidden?: boolean;
+    hiddenDurationMs?: number;
+    visibleLatencyMs?: number;
+    visibilityPath?:
+      | "visible"
+      | "hidden_during_wait"
+      | "hidden_at_frame"
+      | "hidden_during_paint"
+      | "hidden_at_paint";
+    visibilityReason?: string;
   }) => void;
   /** INC-20260905-TIMELINE-BLANK: viewport had no painted timeline row for
    *  several consecutive samples. Bounded geometry only, never message text. */
@@ -231,7 +243,10 @@ function CopyIconButton({
       size="sm"
       shape="square"
       variant={variant}
-      className="[@media(hover:none)]:size-11"
+      className={cn(
+        "oc-btn-tactile [@media(hover:none)]:size-11",
+        done && "text-success hover:text-success",
+      )}
       onClick={async () => {
         try {
           await navigator.clipboard.writeText(getText());
@@ -242,7 +257,7 @@ function CopyIconButton({
         }
       }}
     >
-      {done ? <Check size={15} /> : icon}
+      {done ? <Check size={15} strokeWidth={2} className="oc-check-pop" /> : icon}
     </IconButton>
   );
 }
@@ -266,9 +281,14 @@ function ReqIdChip({ traceId }: { traceId: string }) {
         }
       }}
       // 触屏 44px 命中(a11y-B messages#2);桌面维持 20px 胶囊。
-      className="-mx-1.5 inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-mono text-caption text-faint transition-colors hover:bg-hover hover:text-muted [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+      className={cn(
+        "oc-btn-tactile -mx-1.5 inline-flex items-center gap-1 rounded-md border border-transparent px-1.5 py-0.5 font-mono text-caption transition-colors [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3",
+        copied
+          ? "border-success/30 bg-success-soft text-success"
+          : "text-faint hover:border-border/70 hover:bg-hover hover:text-muted",
+      )}
     >
-      {copied ? <Check size={11} /> : null}
+      {copied ? <Check size={11} strokeWidth={2} className="oc-check-pop" /> : null}
       {copied ? "已复制" : `#${traceId.slice(0, 8)}`}
     </button>
   );
@@ -378,14 +398,14 @@ function TouchActionRow({
         aria-expanded={open}
         size="sm"
         shape="square"
-        className="hidden [@media(hover:none)]:inline-flex"
+        className="oc-btn-tactile hidden [@media(hover:none)]:inline-flex"
         onClick={() => setUserOpen(!open)}
       >
-        {open ? <X size={15} /> : <MoreHorizontal size={15} />}
+        {open ? <X size={15} strokeWidth={1.75} /> : <MoreHorizontal size={15} strokeWidth={1.75} />}
       </IconButton>
       <div
         className={cn(
-          "flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100",
+          "flex items-center gap-0.5 rounded-lg opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-within:opacity-100 [@media(hover:hover)]:oc-surface-glass [@media(hover:hover)]:p-0.5",
           open ? "[@media(hover:none)]:opacity-100" : "[@media(hover:none)]:hidden",
         )}
       >
@@ -560,7 +580,33 @@ function MessageActions({
         className,
       )}
     >
-      <CopyIconButton getText={() => body} label="复制" icon={<Copy size={15} />} variant="muted" />
+      <CopyIconButton getText={() => body} label="复制" icon={<Copy size={15} strokeWidth={1.75} />} variant="muted" />
+      {latest && canQuote && (
+        <IconButton
+          aria-label="引用"
+          title="引用"
+          size="sm"
+          shape="square"
+          variant="muted"
+          className="oc-btn-tactile [@media(hover:none)]:size-11"
+          onClick={() => cb.onQuote?.(text !== undefined ? { ...msg, text } : msg)}
+        >
+          <Quote size={15} strokeWidth={1.75} />
+        </IconButton>
+      )}
+      {latest && canRegen && (
+        <IconButton
+          aria-label="重新生成"
+          title="重新生成"
+          size="sm"
+          shape="square"
+          variant="muted"
+          className="oc-btn-tactile [@media(hover:none)]:size-11"
+          onClick={() => cb.onRegenerate?.()}
+        >
+          <RotateCcw size={15} strokeWidth={1.75} />
+        </IconButton>
+      )}
       {rating}
       {speech.speaking && (
         <IconButton
@@ -569,16 +615,16 @@ function MessageActions({
           size="sm"
           shape="square"
           variant="muted"
-          className="text-accent hover:text-accent"
+          className="oc-btn-tactile bg-accent-soft text-accent hover:bg-accent-soft hover:text-accent"
           onClick={speech.toggle}
         >
-          <Square size={13} className="fill-current" />
+          <Square size={13} strokeWidth={1.75} className="fill-current" />
         </IconButton>
       )}
       <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
         <DropdownMenuTrigger asChild>
-          <IconButton aria-label="更多操作" title="更多操作" size="sm" shape="square" variant="muted">
-            <MoreHorizontal size={15} />
+          <IconButton aria-label="更多操作" title="更多操作" size="sm" shape="square" variant="muted" className="oc-btn-tactile">
+            <MoreHorizontal size={15} strokeWidth={1.75} />
           </IconButton>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" className="w-56" aria-label="消息操作">
@@ -676,13 +722,13 @@ function ReplyQuoteBlock({
 }) {
   return (
     <div
-      className="mb-2 border-l-2 border-fg/20 pl-2.5 text-left text-fg/70"
+      className="mb-2 rounded-lg border-l-2 border-accent/55 bg-surface/55 px-2.5 py-1.5 text-left text-fg/80"
       data-testid="message-reply-quote"
     >
-      <div className="mb-0.5 text-caption font-medium">
+      <div className="mb-0.5 text-caption font-medium text-muted">
         {role === "assistant" ? BRAND.name : "你"}
       </div>
-      <div className="line-clamp-2 whitespace-pre-wrap break-words text-[12.5px] leading-5 [overflow-wrap:anywhere]">
+      <div className="line-clamp-2 whitespace-pre-wrap break-words text-meta leading-5 [overflow-wrap:anywhere]">
         {text}
       </div>
     </div>
@@ -692,30 +738,41 @@ function ReplyQuoteBlock({
 // reducer/socket 对 msg 就地 mutate(同引用),叶子层 {msg} 浅比较要么永不重渲(状态标签
 // 卡死在首帧,如 user status),要么因 ctx 每帧新对象而形同虚设 —— 三种 memo 策略并存徒增
 // 认知负担。sig 层已捕获全部渲染所读字段(render.ts messageSignature),叶子直接裸函数。
-function SystemCallbackNoticeCard({ msg }: { msg: ChatMessage }) {
+function SystemCallbackNoticeCard({ msg, readOnly = false }: { msg: ChatMessage; readOnly?: boolean }) {
   const [expanded, setExpanded] = useState(false);
-  const summary = summarizeSystemCallbackUserTurn(msg);
+  const summary = summarizeSystemCallbackUserTurn(msg).replace(/^系统回调\s*·\s*/, "");
   return (
     <div
       className="flex min-w-0 flex-col items-center py-2 animate-in"
       data-testid="system-callback-row"
     >
-      <button
-        type="button"
-        onClick={() => setExpanded((prev) => !prev)}
-        aria-expanded={expanded}
-        className="inline-flex max-w-full items-center gap-1 rounded-full px-3 py-1 text-[12px] leading-snug text-faint transition-colors hover:bg-hover hover:text-muted"
-        data-testid="system-callback-summary"
-      >
-        <span className="truncate">{summary}</span>
-        <ChevronRight
-          size={12}
-          className={cn("shrink-0 transition-transform", expanded && "rotate-90")}
-        />
-      </button>
-      {expanded && msg.text && (
+      <div className="flex w-full max-w-[85%] items-center gap-3 text-caption text-faint">
+        <span aria-hidden className="h-px flex-1 bg-border/60" />
+        {readOnly && msg.text ? (
+          <button
+            type="button"
+            onClick={() => setExpanded((prev) => !prev)}
+            aria-expanded={expanded}
+            className="inline-flex min-w-0 items-center gap-1 text-caption leading-snug text-faint transition-colors hover:text-muted"
+            data-testid="system-callback-summary"
+          >
+            <span className="truncate">{summary}</span>
+            <ChevronRight
+              size={12}
+              strokeWidth={1.75}
+              className={cn("shrink-0 transition-transform duration-200 ease-[var(--ease-spring)]", expanded && "rotate-90")}
+            />
+          </button>
+        ) : (
+          <span className="truncate leading-snug" data-testid="system-callback-summary">
+            {summary}
+          </span>
+        )}
+        <span aria-hidden className="h-px flex-1 bg-border/60" />
+      </div>
+      {readOnly && expanded && msg.text && (
         <div
-          className="mt-1.5 min-w-0 max-w-full whitespace-pre-wrap break-words rounded-xl bg-hover px-3 py-2 text-left text-[12px] leading-relaxed text-faint sm:max-w-[80%] [overflow-wrap:anywhere]"
+          className="oc-surface-recessed mt-1.5 min-w-0 max-w-full whitespace-pre-wrap break-words rounded-xl border border-border/70 px-3.5 py-2 text-left text-caption leading-relaxed text-muted sm:max-w-[80%] [overflow-wrap:anywhere]"
           data-testid="message-text"
         >
           {msg.text}
@@ -742,7 +799,7 @@ export function UserCard({
   awaitingReply?: boolean;
 }) {
   if (isSystemCallbackUserTurn(msg)) {
-    return <SystemCallbackNoticeCard msg={msg} />;
+    return <SystemCallbackNoticeCard msg={msg} readOnly={readOnly} />;
   }
   const status = msg.status;
   // 终态标签(replied/read)不在 USER_STATUS_LABEL 里 → 不渲染。
@@ -768,7 +825,7 @@ export function UserCard({
     <div className="group flex min-w-0 flex-col items-end pt-3 animate-in" data-testid="user-row">
       <div className="relative flex min-w-0 max-w-[78%] flex-col items-end">
         <div
-          className="min-w-0 max-w-full whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-[15.5px] leading-relaxed text-fg [overflow-wrap:anywhere]"
+          className="min-w-0 max-w-full whitespace-pre-wrap break-words rounded-2xl rounded-br-sm border border-border/75 bg-bubble px-4 py-2.5 text-title leading-relaxed text-fg shadow-soft [overflow-wrap:anywhere]"
           data-testid="message-text"
         >
           {msg._replyTo && (
@@ -777,18 +834,18 @@ export function UserCard({
           {msg.text}
         </div>
         {status !== "sending" && status !== "queued" && (
-          <TouchActionRow className="mt-1 [@media(hover:hover)]:absolute [@media(hover:hover)]:bottom-0.5 [@media(hover:hover)]:right-full [@media(hover:hover)]:mr-1.5 [@media(hover:hover)]:mt-0">
-            <CopyIconButton getText={() => msg.text || ""} label="复制" icon={<Copy size={15} />} />
+          <TouchActionRow className="mt-1 [@media(hover:hover)]:absolute [@media(hover:hover)]:bottom-0.5 [@media(hover:hover)]:right-full [@media(hover:hover)]:mr-2 [@media(hover:hover)]:mt-0">
+            <CopyIconButton getText={() => msg.text || ""} label="复制" icon={<Copy size={15} strokeWidth={1.75} />} />
             {canQuote && (
               <IconButton
                 aria-label="引用"
                 title="引用"
                 size="sm"
                 shape="square"
-                className="[@media(hover:none)]:size-11"
+                className="oc-btn-tactile [@media(hover:none)]:size-11"
                 onClick={() => cb?.onQuote?.(msg)}
               >
-                <Quote size={15} />
+                <Quote size={15} strokeWidth={1.75} />
               </IconButton>
             )}
             {canEdit && (
@@ -797,10 +854,10 @@ export function UserCard({
                 title="编辑并重新发送"
                 size="sm"
                 shape="square"
-                className="[@media(hover:none)]:size-11"
+                className="oc-btn-tactile [@media(hover:none)]:size-11"
                 onClick={() => cb?.onEditResend?.(msg)}
               >
-                <Pencil size={15} />
+                <Pencil size={15} strokeWidth={1.75} />
               </IconButton>
             )}
           </TouchActionRow>
@@ -993,7 +1050,6 @@ export function AssistantCard({
   const normalizedCode = normalizeTurnErrorCode(effectiveCode);
   const isEmptyNoReply =
     normalizedCode === "no_response" || normalizedCode === "phantom_turn";
-  const sem = turnErrorSemantics(normalizedCode);
   // Same narrow exception as legacy size: a sealed failure must not keep
   // a frozen「结果正在收尾」title. Every other snapshot stays monotone.
   const ignoreStaleSoftSnapshot =
@@ -1014,10 +1070,6 @@ export function AssistantCard({
   const hasDisplayableBody = Boolean(
     (msg.text && !hasError) || (hasError && presentedError?.bodyText),
   );
-  // Phase-A 降级页只给 visible_head。中断轮的 head 经常是空正文，过程行还在物化。
-  // 判定只看服务端回显的 _displayDegradeReason，刷新后仍成立；物化完成后该字段消失，占位自动让位。
-  const showUnpublishedProcessPending =
-    msg._displayDegradeReason === "records_unpublished" && !hasDisplayableBody && !live;
   const isInsufficient = normalizedCode === "insufficient_credits";
   const shownTitle = isEmptyNoReply
     ? "这轮没有回复"
@@ -1140,20 +1192,31 @@ export function AssistantCard({
           ctx.turnActivity ? <TurnActivity info={ctx.turnActivity} /> : <TypingDots />
         ) : null}
 
-        {isSyntheticEmptyNotice && !live && (
+        {/* 合并空回复兜底卡；存量历史 _emptyTurnTimeout 若非末轮直接隐藏，不再提示过时的「刷新或同步后可见」。 */}
+        {!live && (isSyntheticEmptyNotice || (msg._emptyTurn && (!msg._emptyTurnTimeout || isLastTurn))) && (
           <Alert
-            tone="warning"
+            tone="info"
             density="compact"
-            className="mt-2.5"
-            icon={<AlertTriangle size={17} />}
-            title="这轮没有回复"
+            className="oc-callout mt-2.5"
+            icon={<Info size={16} strokeWidth={1.75} />}
+            data-testid="empty-turn-notice"
           >
             <div className="min-w-0">
-              <p className="text-[13px] leading-5 text-fg/90">模型没有生成内容。可以在当前会话继续。</p>
-              {isLastTurn && showInterruptedContinuation && (
+              <p className="text-body leading-5 text-fg/90">
+                {msg._emptyTurnTimeout
+                  ? "本轮连接曾短暂中断，未收到新回复，可直接继续对话。"
+                  : "模型本轮没有产生新内容，可直接继续对话。"}
+              </p>
+              {isSyntheticEmptyNotice && isLastTurn && showInterruptedContinuation && (
                 <div className="mt-2.5">
-                  <Button size="sm" variant="secondary" shape="pill" onClick={() => cb.onContinueInterrupted?.(msg)}>
-                    <RotateCcw size={14} /> 继续
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    shape="pill"
+                    className="oc-btn-tactile oc-btn-secondary-craft"
+                    onClick={() => cb.onContinueInterrupted?.(msg)}
+                  >
+                    <RotateCcw size={14} strokeWidth={1.75} /> 继续
                   </Button>
                 </div>
               )}
@@ -1163,7 +1226,7 @@ export function AssistantCard({
 
         {/* 截断续写 banner */}
         {msg._truncated && !live && (
-          <Alert tone="warning" className="mt-2.5" icon={<AlertTriangle size={16} />}>
+          <Alert tone="warning" className="oc-callout mt-2.5" icon={<AlertTriangle size={16} strokeWidth={1.75} />}>
             <div className="flex flex-1 flex-wrap items-center justify-between gap-2">
               <span>
                 {msg._truncated === "pause_turn"
@@ -1171,22 +1234,17 @@ export function AssistantCard({
                   : "回复达到长度上限被截断，可让模型继续写。"}
               </span>
               {isLastTurn && (ctx.turnFinalAssistant ?? ctx.isLast) && cb.onContinue && (
-                <Button size="sm" variant="secondary" shape="pill" onClick={cb.onContinue}>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  shape="pill"
+                  className="oc-btn-tactile oc-btn-secondary-craft"
+                  onClick={cb.onContinue}
+                >
                   继续
                 </Button>
               )}
             </div>
-          </Alert>
-        )}
-
-        {/* 空轮提示。_emptyTurnTimeout 仅存量落库消息会命中（新代码不再产生此类消息，改用
-            非持久 transient 软提示）；文案改诚实版：不再断言"无响应"，而是提示内容可能已在
-            服务端生成、刷新/同步后可见，避免与真实内容同屏矛盾。 */}
-        {msg._emptyTurn && (
-          <Alert tone="info" className="mt-2.5" icon={<Info size={16} />}>
-            {msg._emptyTurnTimeout
-              ? "当时与服务器的连接中断，内容可能已在服务端生成（刷新或同步后可见）。"
-              : "模型本轮没有产生新内容。"}
           </Alert>
         )}
 
@@ -1203,36 +1261,9 @@ export function AssistantCard({
               </div>
             )}
           </output>
-        ) : recoveredStep && sem.automaticRecovery === true ? (
-          // OCV5-390: an error the platform retries by itself and that the turn got past is not the
-          // user's business: nothing stays in the process view. Only an error the turn ended on (or
-          // one that is not retried automatically) is shown.
+        ) : recoveredStep ? (
+          // 本轮已恢复/越过的过程错误不再用黄色安慰横幅打扰用户。
           null
-        ) : recoveredStep && !suppressErrorAlert && presentedError ? (
-          // OCV5-307:本轮已越过的错误(例:上游满载的 turn 终态错误被记在较早的正文段上,随后同一轮又
-          // 继续并给出回复)。它是历史事实而非待办 —— 只留一行低调说明 + 可展开的请求信息,不再用整张
-          // 警示卡叫用户「切换模型后重发」。真正以错误收尾的轮次不进这里,仍是完整错误卡。
-          <div
-            role="status"
-            data-testid="recovered-error-note"
-            className="mt-2.5 flex max-w-full flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-border/70 bg-surface px-3 py-2 text-meta text-muted"
-          >
-            <AlertTriangle size={13} aria-hidden="true" className="shrink-0 text-warning" />
-            <span className="font-medium text-fg/80">
-              {isInsufficient && !frozenCard ? creditsCopy.title : shownTitle}
-            </span>
-            <span>· 本轮已继续，无需处理</span>
-            {shownDetail && (
-              <details className="basis-full">
-                <summary className="w-fit cursor-pointer select-none text-caption text-faint hover:text-fg [@media(hover:none)]:py-3.5">
-                  查看请求信息
-                </summary>
-                <pre className="mt-1.5 max-h-28 max-w-full overflow-auto whitespace-pre-wrap rounded-md bg-code px-2.5 py-2 text-caption text-muted [overflow-wrap:anywhere]">
-                  {shownDetail}
-                </pre>
-              </details>
-            )}
-          </div>
         ) : suppressErrorAlert && msg._recoverySkippedNotice ? (
           <ErrorNotice
             role="alert"
@@ -1271,15 +1302,6 @@ export function AssistantCard({
             details={technicalDetails}
           />
         ) : null}
-
-        {showUnpublishedProcessPending && (
-          <output
-            className="mt-2.5 flex items-center gap-2 py-1 text-body text-muted"
-            aria-label="过程记录整理中"
-          >
-            <span>过程记录整理中…</span>
-          </output>
-        )}
 
         {/* 动作条（流式中不显示，避免抖动）。OCV5-359:一条安静的图标行 —— 复制 · 👍 · 👎 · 更多;
             存到项目、时间 · 积分 · 请求ID 都收进「更多」菜单(桌面 hover 时 meta 另在行尾淡显)。
@@ -1435,12 +1457,12 @@ export const ThinkingCard = memo(
             </span>
           </button>
           {!collapsed && hasBody && (
-            <div id={bodyId} className="oc-reveal mb-1.5 mt-0.5 border-l-2 border-border pl-3">
+            <div id={bodyId} className={cn("oc-reveal mb-1.5 mt-0.5 border-l-2 pl-3", live ? "border-accent/40" : "border-border")}>
               {segments.map((seg, i) => (
                 <div
                   key={i}
                   className={cn(
-                    "text-[13.5px] leading-relaxed text-muted [&_.prose]:text-[13.5px] [&_.prose]:leading-relaxed [&_.prose]:text-inherit [&_.prose_p]:mb-1.5 [&_.prose_p:last-child]:mb-0 [&_.prose_strong]:font-medium [&_.prose_strong]:text-inherit [&_.prose_h1]:text-[13.5px] [&_.prose_h2]:text-[13.5px] [&_.prose_h3]:text-[13.5px] [&_.prose_h1]:font-medium [&_.prose_h2]:font-medium [&_.prose_h3]:font-medium [&_.prose_h1]:text-inherit [&_.prose_h2]:text-inherit [&_.prose_h3]:text-inherit",
+                    "text-section leading-relaxed text-muted [&_.prose]:text-section [&_.prose]:leading-relaxed [&_.prose]:text-inherit [&_.prose_p]:mb-1.5 [&_.prose_p:last-child]:mb-0 [&_.prose_strong]:font-medium [&_.prose_strong]:text-inherit [&_.prose_h1]:text-section [&_.prose_h2]:text-section [&_.prose_h3]:text-section [&_.prose_h1]:font-medium [&_.prose_h2]:font-medium [&_.prose_h3]:font-medium [&_.prose_h1]:text-inherit [&_.prose_h2]:text-inherit [&_.prose_h3]:text-inherit",
                     i > 0 && "mt-2",
                   )}
                 >
@@ -1453,7 +1475,7 @@ export const ThinkingCard = memo(
       );
     }
     return (
-      <div className="overflow-hidden rounded-md border border-border/80 bg-surface/70 animate-in">
+      <div className="oc-surface-card overflow-hidden rounded-xl animate-in">
         {/* 折叠开关暴露展开态(aria-expanded,与 DelegateProgressCard / RuntimeEventCard 一致);
             触屏下头部加高到 44px 触控靶。 */}
         <button
@@ -1461,11 +1483,11 @@ export const ThinkingCard = memo(
           onClick={() => setUserCollapsed(!collapsed)}
           aria-expanded={!collapsed}
           aria-controls={!collapsed && hasBody ? bodyId : undefined}
-          className="flex min-h-10 w-full items-center gap-2.5 px-3 py-2 text-left text-body text-muted transition-colors hover:bg-hover/60 [@media(hover:none)]:min-h-11"
+          className="flex min-h-10 w-full items-center gap-2.5 px-3.5 py-2 text-left text-body text-muted transition-colors hover:bg-hover/60 [@media(hover:none)]:min-h-11"
         >
           {/* 与工具卡同一列 24px 图标格,思考/工具在过程里左缘对齐成一条线。 */}
-          <span className="flex size-6 shrink-0 items-center justify-center rounded-[7px] bg-hover text-faint">
-            <Brain size={13} />
+          <span className={cn("oc-icon-badge flex size-6 shrink-0 items-center justify-center rounded-sm", live && "oc-icon-badge-accent")}>
+            <Brain size={13} strokeWidth={1.75} />
           </span>
           <span className={cn("min-w-0 truncate font-medium", live && "oc-live-status-shine")} title={headline}>
             {headline}
@@ -1473,11 +1495,12 @@ export const ThinkingCard = memo(
           <StepMetaBadge ids={msgs.map((m) => m.id)} tokenUsage={tokenUsage} />
           <ChevronRight
             size={14}
-            className={cn("ml-auto shrink-0 text-faint transition-transform duration-200", !collapsed && "rotate-90")}
+            strokeWidth={1.75}
+            className={cn("ml-auto shrink-0 text-faint transition-transform duration-200 ease-[var(--ease-spring)]", !collapsed && "rotate-90")}
           />
         </button>
         {!collapsed && hasBody && (
-          <div id={bodyId} className="border-t border-border/70 px-3.5 py-2.5">
+          <div id={bodyId} className="oc-surface-recessed border-t border-border/70 px-3.5 py-2.5">
             {segments.map((seg, i) => (
               <div
                 key={i}
@@ -1486,7 +1509,7 @@ export const ThinkingCard = memo(
                   // strong 压平(boss 07-11:黑粗体与思考卡低调气质不搭):codex 摘要通篇是
                   // `**标题**`,prose 默认 strong 近黑加粗喧宾夺主 → 收敛为 font-medium + 继承
                   // muted 色,只留轻微强调;标题信息已由折叠态摘要承载,正文不需要重锤。
-                  "text-[13.5px] leading-relaxed text-muted [&_.prose]:text-[13.5px] [&_.prose]:leading-relaxed [&_.prose]:text-inherit [&_.prose_p]:mb-1.5 [&_.prose_p:last-child]:mb-0 [&_.prose_strong]:font-medium [&_.prose_strong]:text-inherit [&_.prose_h1]:text-[13.5px] [&_.prose_h2]:text-[13.5px] [&_.prose_h3]:text-[13.5px] [&_.prose_h1]:font-medium [&_.prose_h2]:font-medium [&_.prose_h3]:font-medium [&_.prose_h1]:text-inherit [&_.prose_h2]:text-inherit [&_.prose_h3]:text-inherit",
+                  "text-section leading-relaxed text-muted [&_.prose]:text-section [&_.prose]:leading-relaxed [&_.prose]:text-inherit [&_.prose_p]:mb-1.5 [&_.prose_p:last-child]:mb-0 [&_.prose_strong]:font-medium [&_.prose_strong]:text-inherit [&_.prose_h1]:text-section [&_.prose_h2]:text-section [&_.prose_h3]:text-section [&_.prose_h1]:font-medium [&_.prose_h2]:font-medium [&_.prose_h3]:font-medium [&_.prose_h1]:text-inherit [&_.prose_h2]:text-inherit [&_.prose_h3]:text-inherit",
                   i > 0 && "mt-2.5 border-t border-border/60 pt-2.5",
                 )}
               >
@@ -1507,7 +1530,7 @@ export const ThinkingCard = memo(
 // ═══════════════ plan ═══════════════
 const STEP_DOT: Record<string, string> = {
   completed: "bg-success",
-  inProgress: "bg-accent animate-pulse",
+  inProgress: "oc-alive-dot bg-accent",
   pending: "bg-faint",
 };
 // 不外包 memo:只收 {msg} + reducer 就地 mutate → 默认浅比较永不重渲(plan 步骤流式更新会丢)。
@@ -1524,13 +1547,13 @@ export function PlanCard({
       !!s && typeof s === "object" && typeof s.step === "string" && typeof s.status === "string",
   );
   return (
-    <div className="overflow-hidden rounded-md border border-border/80 bg-surface animate-in">
-      <div className="flex items-center gap-2.5 border-b border-border/70 px-3 py-2">
-        <span className="flex size-6 items-center justify-center rounded-md bg-accent-soft text-accent">
-          <ListTodo size={14} />
+    <div className="oc-surface-card overflow-hidden rounded-xl animate-in">
+      <div className="flex items-center gap-2.5 border-b border-border/70 px-3.5 py-2.5">
+        <span className="oc-icon-badge oc-icon-badge-accent flex size-6 shrink-0 items-center justify-center rounded-sm">
+          <ListTodo size={13} strokeWidth={1.75} />
         </span>
         <span
-          className="min-w-0 flex-1 truncate text-body font-medium text-fg"
+          className="min-w-0 flex-1 truncate text-body font-semibold text-fg"
           title={msg.text || "执行计划"}
         >
           {msg.text || "执行计划"}
@@ -1540,7 +1563,7 @@ export function PlanCard({
       </div>
       <div className="px-3.5 py-2.5">
         {msg.explanation && (
-          <p className="mb-2 text-[13px] leading-relaxed text-muted">{msg.explanation}</p>
+          <p className="mb-2 text-body leading-relaxed text-muted">{msg.explanation}</p>
         )}
         <ol className="space-y-1.5">
           {steps.map((s, i) => (
@@ -1563,10 +1586,12 @@ export function PlanCard({
 export function GoalCard({ msg }: { msg: ChatMessage }) {
   const status = msg.cleared ? "已清除" : msg.goalStatus || "已同步";
   return (
-    <div className="rounded-md border border-border/80 bg-surface px-3 py-2.5 animate-in">
-      <div className="flex items-center gap-2">
-        <span className="flex size-6 items-center justify-center rounded-md bg-accent-soft text-accent"><Target size={14} /></span>
-        <span className="text-body font-medium text-fg">{msg.text || "会话目标"}</span>
+    <div className="oc-surface-card rounded-xl px-3.5 py-3 animate-in">
+      <div className="flex items-center gap-2.5">
+        <span className="oc-icon-badge oc-icon-badge-accent flex size-6 shrink-0 items-center justify-center rounded-sm">
+          <Target size={13} strokeWidth={1.75} />
+        </span>
+        <span className="text-body font-semibold text-fg">{msg.text || "会话目标"}</span>
         <Badge tone={msg.cleared ? "neutral" : "accent"}>{status}</Badge>
       </div>
       {!msg.cleared && (
@@ -1577,6 +1602,26 @@ export function GoalCard({ msg }: { msg: ChatMessage }) {
             ? ` · ${formatDurationSeconds(msg.timeUsedSeconds)}`
             : ""}
         </p>
+      )}
+    </div>
+  );
+}
+
+const DELEGATE_SUMMARY_STEP = 64 * 1024;
+
+function DelegateSummaryPlainText({ text, className }: { text: string; className?: string }) {
+  const [visibleChars, setVisibleChars] = useState(DELEGATE_SUMMARY_STEP);
+  return (
+    <div className={className}>
+      <div className="whitespace-pre-wrap break-words">{text.slice(0, visibleChars)}</div>
+      {visibleChars < text.length && (
+        <button
+          type="button"
+          onClick={() => setVisibleChars((value) => value + DELEGATE_SUMMARY_STEP)}
+          className="oc-btn-tactile mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg"
+        >
+          继续显示完整结果
+        </button>
       )}
     </div>
   );
@@ -1594,17 +1639,17 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
   const collapsed = userCollapsed ?? done;
   const tokenUsage = delegateTokenUsage(msg);
   return (
-    <div className="overflow-hidden rounded-md border border-border/80 bg-surface animate-in">
+    <div className="oc-surface-card overflow-hidden rounded-xl animate-in">
       <button
         type="button"
         onClick={() => setUserCollapsed(!collapsed)}
         aria-expanded={!collapsed}
-        className="flex min-h-10 w-full items-center gap-2.5 px-3 py-2 text-left transition-colors hover:bg-hover/60"
+        className="flex min-h-10 w-full items-center gap-2.5 px-3.5 py-2.5 text-left transition-colors hover:bg-hover/60 [@media(hover:none)]:min-h-11"
       >
-        <span className="flex size-6 items-center justify-center rounded-md bg-accent-soft text-accent">
-          <Sparkles size={13} />
+        <span className="oc-icon-badge oc-icon-badge-accent flex size-6 shrink-0 items-center justify-center rounded-sm">
+          <Sparkles size={13} strokeWidth={1.75} />
         </span>
-        <span className="min-w-0 truncate text-body font-medium text-fg">{msg.text || "委派子任务"}</span>
+        <span className="min-w-0 truncate text-body font-semibold text-fg">{msg.text || "委派子任务"}</span>
         <span className="ml-auto flex items-center gap-2">
           <TokenUsageBadge usage={tokenUsage} label="子 Agent 合计" />
           {done ? (
@@ -1614,17 +1659,18 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
           )}
           <ChevronRight
             size={15}
-            className={cn("text-faint transition-transform", !collapsed && "rotate-90")}
+            strokeWidth={1.75}
+            className={cn("text-faint transition-transform duration-200 ease-[var(--ease-spring)]", !collapsed && "rotate-90")}
           />
         </span>
       </button>
       {!collapsed && children.length > 0 && (
-        <div className="border-t border-border">
-          <DelegateProcessList childBlocks={children} />
+        <div className="border-t border-border/70">
+          <DelegateProcessListLazy childBlocks={children} />
         </div>
       )}
       {!collapsed && entries.length > 0 && (
-        <ul className="border-t border-border px-3.5 py-2 text-meta text-muted">
+        <ul className="oc-surface-recessed border-t border-border/70 px-3.5 py-2 text-meta text-muted">
           {entries.slice(0, visibleEntries).map((e, i) => (
             <li key={i} className="whitespace-pre-wrap break-words">
               <span className="text-faint">[{e.phase}]</span> {e.text}
@@ -1635,7 +1681,7 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
               <button
                 type="button"
                 onClick={() => setVisibleEntries((value) => value + 100)}
-                className="mx-auto mt-2 block rounded-full bg-hover px-3 py-1 text-xs text-muted hover:text-fg"
+                className="oc-btn-tactile mx-auto mt-2 block rounded-full bg-hover px-3 py-1 text-caption font-medium text-muted hover:text-fg"
               >
                 继续加载委派记录（还有 {entries.length - visibleEntries} 条）
               </button>
@@ -1644,21 +1690,21 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
         </ul>
       )}
       {!collapsed && done && msg.summary && (
-        <ProgressivePlainText
+        <DelegateSummaryPlainText
           text={msg.summary}
-          className="border-t border-border px-3.5 py-2 text-meta text-muted"
+          className="border-t border-border/70 px-3.5 py-2 text-meta text-muted"
         />
       )}
       {/* 折叠态展示结果摘要（完成后）——与 AgentGroupCard 折叠页脚一致;图标跟终态语义
           (失败 → 红 X,不再对着「失败」徽记画绿勾)。 */}
       {collapsed && done && msg.summary && (
-        <div className="flex items-start gap-1.5 border-t border-border px-3.5 py-2 text-meta text-muted">
+        <div className="flex items-start gap-1.5 border-t border-border/70 bg-bg/35 px-3.5 py-2 text-meta text-muted">
           {msg.cancelled ? (
-            <X size={13} className="mt-0.5 shrink-0 text-muted" data-testid="delegate-summary-icon" />
+            <X size={13} strokeWidth={2} className="mt-0.5 shrink-0 text-muted" data-testid="delegate-summary-icon" />
           ) : msg._isError ? (
-            <X size={13} className="mt-0.5 shrink-0 text-danger" data-testid="delegate-summary-icon" />
+            <X size={13} strokeWidth={2} className="mt-0.5 shrink-0 text-danger" data-testid="delegate-summary-icon" />
           ) : (
-            <Check size={13} className="mt-0.5 shrink-0 text-success" data-testid="delegate-summary-icon" />
+            <Check size={13} strokeWidth={2} className="mt-0.5 shrink-0 text-success" data-testid="delegate-summary-icon" />
           )}
           <span className="line-clamp-2">
             {msg.summary.slice(0, 500)}{msg.summary.length > 500 ? "…" : ""}
@@ -1669,12 +1715,74 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
   );
 }
 
+function contextRebuiltDividerLabel(msg: ChatMessage): string | null {
+  const text = msg.text ?? "";
+  const isRebuilt =
+    (typeof msg.id === "string" && msg.id.startsWith("sys-ctxrebuild-")) ||
+    /^(?:换了模型引擎，已用最近|原会话没能直接续上，已用最近|已重新加载会话上下文)/.test(text);
+  if (!isRebuilt) return null;
+  return text.includes("换了模型引擎") ? "已切换模型，保留近期对话" : "已衔接近期对话，可继续交流";
+}
+
 // ═══════════════ system ═══════════════
 export function SystemCard({ msg }: { msg: ChatMessage }) {
+  const [expanded, setExpanded] = useState(false);
   if (!msg.text) return null;
+  const compact = msg._contextCompaction;
+  if (compact) {
+    // P2-3: 自动上下文压缩后台静默，仅保留用户手动触发的整理回执。
+    const isManual =
+      (typeof msg.id === "string" && msg.id.includes("-rcompact:")) ||
+      !msg.text.includes("已自动整理");
+    if (!isManual) return null;
+    return (
+      <div className="flex min-w-0 justify-center animate-in" data-testid="context-compacted-receipt">
+        <div className="oc-surface-recessed min-w-0 max-w-full rounded-xl border border-border/65 px-3.5 py-1.5 text-caption leading-relaxed text-faint sm:max-w-[80%]">
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            aria-expanded={expanded}
+            className="inline-flex max-w-full items-center gap-1.5 text-left outline-none transition-colors hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <span className="break-words [overflow-wrap:anywhere]">{msg.text}</span>
+            <ChevronRight
+              size={12}
+              strokeWidth={1.75}
+              aria-hidden
+              className={cn("shrink-0 transition-transform duration-150", expanded && "rotate-90")}
+            />
+          </button>
+          {expanded && (
+            <div className="mt-1.5 space-y-1 border-t border-border/60 pt-1.5 text-left text-caption text-muted">
+              <p>系统已自动保留近期对话与关键决策，完整聊天记录仍在上方可见。</p>
+              {compact.summaryPreview && (
+                <p className="line-clamp-3 whitespace-pre-wrap break-words text-faint">
+                  {compact.summaryPreview}
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+  const rebuiltLabel = contextRebuiltDividerLabel(msg);
+  if (rebuiltLabel) {
+    return (
+      <div
+        className="flex min-w-0 items-center gap-3 py-1.5 text-caption text-faint animate-in"
+        role="separator"
+        data-testid="context-rebuilt-divider"
+      >
+        <span aria-hidden className="h-px flex-1 bg-border/60" />
+        <span className="shrink-0">{rebuiltLabel}</span>
+        <span aria-hidden className="h-px flex-1 bg-border/60" />
+      </div>
+    );
+  }
   return (
     <div className="flex min-w-0 justify-center animate-in">
-      <div className="min-w-0 max-w-full whitespace-pre-wrap break-words rounded-xl bg-hover px-3 py-1.5 text-left text-[12px] leading-relaxed text-faint sm:max-w-[80%] sm:text-center [overflow-wrap:anywhere]">
+      <div className="oc-surface-recessed min-w-0 max-w-full whitespace-pre-wrap break-words rounded-xl border border-border/65 px-3.5 py-1.5 text-left text-caption leading-relaxed text-faint sm:max-w-[80%] sm:text-center [overflow-wrap:anywhere]">
         {msg.text}
       </div>
     </div>

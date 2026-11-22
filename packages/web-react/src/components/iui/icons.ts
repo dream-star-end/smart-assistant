@@ -127,6 +127,7 @@ export const KIND_ICON_SOURCES = {
   prompt_template: "pen-line",
   storyboard: "camera",
   flashcards: "brain",
+  browser_handoff: "globe",
   quote: "gauge",
   kline: "chart-column",
   intraday: "chart-column",

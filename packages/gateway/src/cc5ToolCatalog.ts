@@ -83,6 +83,131 @@ export function cc5ToolNamingNotice(catalog: Cc5ToolCatalog, cwd: string): strin
     '</tool-naming>'].join('\n')
 }
 
+const PROMPT_SECTION_SEPARATOR = '\n\n---\n\n'
+const REMOTE_SKILLS_COMPACT =
+  '# Skills\n\n技能摘要已因远端提示预算折叠；相关任务请先调用 `skill_search` 再 `skill_view` 按需加载。'
+
+function trimSectionIndexBody(section: string, heading: string, targetBytes: number): string {
+  const idx = section.indexOf(heading)
+  if (idx < 0) return section
+  const prefix = section.slice(0, idx).trimEnd()
+  if (Buffer.byteLength(prefix, 'utf8') >= targetBytes) return prefix
+  const indexBody = section.slice(idx + heading.length).trim()
+  const lines = indexBody.split('\n')
+  const suffix = '\n- ... (已因远端预算折叠，请按需检索)'
+  const budget = targetBytes - Buffer.byteLength(`${prefix}\n\n${heading}\n\n`, 'utf8') - Buffer.byteLength(suffix, 'utf8')
+  if (budget <= 0) return prefix
+  const kept: string[] = []
+  let used = 0
+  for (const line of lines) {
+    const cost = Buffer.byteLength(line, 'utf8') + (kept.length > 0 ? 1 : 0)
+    if (used + cost > budget) break
+    kept.push(line)
+    used += cost
+  }
+  return kept.length > 0 ? `${prefix}\n\n${heading}\n\n${kept.join('\n')}${suffix}` : prefix
+}
+
+function stripSectionAssets(section: string): string {
+  const startMarker = '<!-- oc-project-assets:start -->'
+  const endMarker = '<!-- oc-project-assets:end -->'
+  const start = section.indexOf(startMarker)
+  const end = section.indexOf(endMarker)
+  if (start < 0 || end <= start) return section
+  const before = section.slice(0, start).trimEnd()
+  const after = section.slice(end + endMarker.length).trimStart()
+  const note = '（项目参考资料索引已因远端提示预算折叠，请调用 `project_search` 或读取项目目录。）'
+  return [before, note, after].filter(Boolean).join('\n\n')
+}
+
+function stripAgentsDynamic(section: string): string {
+  for (const heading of ['\n## 多 Agent 协作', '\n## 委派可用型号']) {
+    const idx = section.indexOf(heading)
+    if (idx >= 0) {
+      return section.slice(0, idx).trimEnd()
+    }
+  }
+  return section
+}
+
+/**
+ * OCV5-840: Priority-preserving budget trim for remote prompts.
+ * Trims low-priority dynamic sections (SKILLS -> MEMORY index -> PROJECT_MEMORY index
+ * -> PROJECT assets -> AGENTS dynamic -> SOUL) before ever falling back to utf8Head,
+ * so high-priority tail slots (REPO / RESEARCH / MODEL_HINT / TOOLS) survive.
+ */
+function fitRemotePlatformPrompt(platformPrompt: string, room: number): string {
+  if (Buffer.byteLength(platformPrompt, 'utf8') <= room) return platformPrompt
+  if (!platformPrompt.includes(PROMPT_SECTION_SEPARATOR)) {
+    return utf8Head(platformPrompt, room)
+  }
+  const sections = platformPrompt.split(PROMPT_SECTION_SEPARATOR)
+  const joinSections = () => sections.filter((s) => s.length > 0).join(PROMPT_SECTION_SEPARATOR)
+  const totalBytes = () => Buffer.byteLength(joinSections(), 'utf8')
+
+  const isSkills = (s: string) => s.startsWith('# Skills')
+  const isMemory = (s: string) => s.startsWith('# Memory') || s.startsWith('## 当前索引')
+  const isProjectMemory = (s: string) => s.startsWith('# PROJECT MEMORY')
+  const isProject = (s: string) => s.startsWith('# PROJECT INSTRUCTIONS')
+  const isAgentsDynamicOnly = (s: string) => s.startsWith('## 多 Agent 协作') || s.startsWith('## 委派可用型号')
+  const isAgentsCombined = (s: string) => s.startsWith('# Platform capabilities')
+  const isSoul = (s: string) => s.startsWith('# WHO I AM')
+
+  // Step 1: Collapse SKILLS to L0 compact notice
+  for (let i = 0; i < sections.length && totalBytes() > room; i++) {
+    if (isSkills(sections[i]!)) sections[i] = REMOTE_SKILLS_COMPACT
+  }
+  // Step 2: Shrink or drop MEMORY index (preserve # Memory rules)
+  for (let i = 0; i < sections.length && totalBytes() > room; i++) {
+    const s = sections[i]!
+    if (s.startsWith('## 当前索引')) {
+      const target = Math.max(0, Math.floor(Buffer.byteLength(s, 'utf8') / 2))
+      sections[i] = target > 256 ? trimSectionIndexBody(`## 当前索引\n\n${s.slice('## 当前索引'.length).trim()}`, '## 当前索引', target) : ''
+    } else if (s.startsWith('# Memory') && s.includes('## 当前索引')) {
+      const target = Math.max(256, Math.floor(Buffer.byteLength(s, 'utf8') / 2))
+      sections[i] = trimSectionIndexBody(s, '## 当前索引', target)
+    }
+  }
+  // Step 3: Shrink PROJECT_MEMORY index (preserve header)
+  for (let i = 0; i < sections.length && totalBytes() > room; i++) {
+    const s = sections[i]!
+    if (isProjectMemory(s) && s.includes('## 项目索引')) {
+      const target = Math.max(256, Math.floor(Buffer.byteLength(s, 'utf8') / 2))
+      sections[i] = trimSectionIndexBody(s, '## 项目索引', target)
+    }
+  }
+  // Step 4: Drop PROJECT assets block (preserve instructions)
+  for (let i = 0; i < sections.length && totalBytes() > room; i++) {
+    if (isProject(sections[i]!)) sections[i] = stripSectionAssets(sections[i]!)
+  }
+  // Step 5: Drop AGENTS dynamic roster / model list (preserve Platform capabilities)
+  for (let i = 0; i < sections.length && totalBytes() > room; i++) {
+    if (isAgentsDynamicOnly(sections[i]!)) sections[i] = ''
+    else if (isAgentsCombined(sections[i]!)) sections[i] = stripAgentsDynamic(sections[i]!)
+  }
+  // Step 6: If still over, strip remaining MEMORY / PROJECT_MEMORY index bodies completely
+  for (let i = 0; i < sections.length && totalBytes() > room; i++) {
+    const s = sections[i]!
+    if (s.startsWith('## 当前索引')) sections[i] = ''
+    else if (isMemory(s) && s.includes('## 当前索引')) sections[i] = s.slice(0, s.indexOf('## 当前索引')).trimEnd()
+    else if (isProjectMemory(s) && s.includes('## 项目索引')) sections[i] = s.slice(0, s.indexOf('## 项目索引')).trimEnd()
+  }
+  // Step 7: Trim SOUL if still over budget
+  for (let i = 0; i < sections.length && totalBytes() > room; i++) {
+    if (isSoul(sections[i]!)) {
+      const excess = totalBytes() - room
+      const cur = Buffer.byteLength(sections[i]!, 'utf8')
+      const keep = Math.max(512, cur - excess - 64)
+      if (keep < cur) {
+        sections[i] = `${utf8Head(sections[i]!, keep)}\n\n[... SOUL truncated for remote prompt budget]`
+      }
+    }
+  }
+
+  const candidate = joinSections()
+  return Buffer.byteLength(candidate, 'utf8') <= room ? candidate : utf8Head(candidate, room)
+}
+
 /** The platform prompt (persona, platform, skills, memory) plus the notice, within the node's bound. */
 export function cc5RemotePrompt(
   platformPrompt: string,
@@ -93,5 +218,5 @@ export function cc5RemotePrompt(
   const notice = cc5ToolNamingNotice(catalog, cwd)
   const room = maxBytes - Buffer.byteLength(notice) - 2
   requireCatalog(room > 0 && !platformPrompt.includes('\0') && !notice.includes('\0'))
-  return `${utf8Head(platformPrompt, room)}\n\n${notice}`
+  return `${fitRemotePlatformPrompt(platformPrompt, room)}\n\n${notice}`
 }

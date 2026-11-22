@@ -101,6 +101,10 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			http.Error(w, `{"code":"AUTH_BEARER","error":"bearer invalid"}`, http.StatusUnauthorized)
 			return
 		}
+		// B1 (OCV5-832): node-agent PSK authenticates master→node-agent ONLY.
+		// Strip Authorization immediately after validation so no downstream handler
+		// (especially /tunnel/containers/*) can ever leak the node PSK into a tenant container.
+		r.Header.Del("Authorization")
 		next.ServeHTTP(w, r)
 	})
 }

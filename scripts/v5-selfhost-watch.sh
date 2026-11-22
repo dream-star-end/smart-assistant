@@ -13,10 +13,19 @@ fi
 
 WATCH_DRY="${WATCH_DRY:-1}"
 WATCH_FAIL_THRESHOLD="${WATCH_FAIL_THRESHOLD:-5}"
+WATCH_DEPS_PG_FAIL_THRESHOLD="${WATCH_DEPS_PG_FAIL_THRESHOLD:-3}"
+WATCH_DEPS_PG_FAIL_COUNT="${WATCH_DEPS_PG_FAIL_COUNT:-}"
+WATCH_POST_RESTART_WAIT_SEC="${WATCH_POST_RESTART_WAIT_SEC:-}"
+WATCH_ONCE_POST_RESTART_WAIT_SEC="${WATCH_ONCE_POST_RESTART_WAIT_SEC:-60}"
+WATCH_ONCE_BUDGET_SEC="${WATCH_ONCE_BUDGET_SEC:-95}"
+WATCH_POST_RESTART_POLL_SEC="${WATCH_POST_RESTART_POLL_SEC:-3}"
+WATCH_TIER_PENDING="${WATCH_TIER_PENDING:-}"
+WATCH_SYSTEMD_DIR="${WATCH_SYSTEMD_DIR:-/etc/systemd/system}"
 WATCH_LOCK_TTL_SEC="${WATCH_LOCK_TTL_SEC:-3600}"
 WATCH_MASTER_URL="${WATCH_MASTER_URL:-http://127.0.0.1:18790/healthz}"
 WATCH_EGRESS_URL="${WATCH_EGRESS_URL:-http://172.31.0.1:18892/internal/v5/egress-health}"
 WATCH_MASTER_UNIT="${WATCH_MASTER_UNIT:-openclaude-v5-selfhost.service}"
+WATCH_MASTER_SLOT_TPL="${WATCH_MASTER_SLOT_TPL:-openclaude-v5-selfhost@.service}"; WATCH_FRONTDOOR_UNIT="${WATCH_FRONTDOOR_UNIT:-openclaude-v5-selfhost-frontdoor.service}"
 WATCH_EGRESS_UNIT="${WATCH_EGRESS_UNIT:-openclaude-v5-selfhost-egress.service}"
 WATCH_EGRESS_SLOT_TPL="${WATCH_EGRESS_SLOT_TPL:-openclaude-v5-selfhost-egress@.service}"
 WATCH_LIVE="${WATCH_LIVE:-/opt/openclaude/openclaude-v5-selfhost-live}"
@@ -30,6 +39,9 @@ WATCH_DISARM="${WATCH_DISARM:-/opt/openclaude/v5-selfhost-watch/watch-disarmed}"
 WATCH_LOG="${WATCH_LOG:-/var/log/openclaude-v5-selfhost-watch.log}"
 WATCH_RESTORE="${WATCH_RESTORE:-/opt/openclaude/v5-selfhost-breakglass/restore-worktree-units.sh}"
 WATCH_BACKUP_CURRENT="${WATCH_BACKUP_CURRENT:-/opt/openclaude/v5-selfhost-breakglass/unit-backups/worktree-current}"
+# OCV5-818: 独立 live-WD unit 备份指针(由 backup_installed_units_for_cutover 更新);
+# 留空时在调用期派生为 $(dirname "$WATCH_BACKUP_CURRENT")/live-current,避免测试误读宿主目录。
+WATCH_LIVE_BACKUP_CURRENT="${WATCH_LIVE_BACKUP_CURRENT:-}"
 WATCH_MANUAL_RECOVERY="${WATCH_MANUAL_RECOVERY:-/opt/openclaude/openclaude-v5-selfhost-releases/.manual-recovery-required}"
 WATCH_NOW_OVERRIDE="${WATCH_NOW_OVERRIDE:-}"
 WATCH_STUB_MASTER="${WATCH_STUB_MASTER:-}"
@@ -51,12 +63,15 @@ WATCH_REARM_INTERVAL_SEC="${WATCH_REARM_INTERVAL_SEC:-5}"
 # OCV5-410:告警脚本。显式 WATCH_ALERT_BIN,或安装目录里有可执行 alert.sh 才调用;
 # 仓库里跑的看护测试没有 alert.sh,不会去写宿主状态目录。
 WATCH_ALERT_BIN="${WATCH_ALERT_BIN:-}"
-# OCV5-444:宿主卫生检查(根盘剩余空间、PG 备份新鲜度)。只告警,不改健康判定、失败计数或退出码。
+# OCV5-444/OCV5-823:宿主卫生检查(根盘剩余空间、PG 核心/全备新鲜度与 over_cap 探针)。只告警,不改健康判定、失败计数或退出码。
 WATCH_DISK_PATH="${WATCH_DISK_PATH:-/}"
 WATCH_DISK_WARN_GIB="${WATCH_DISK_WARN_GIB:-15}"
 WATCH_DISK_CRIT_GIB="${WATCH_DISK_CRIT_GIB:-10}"
+WATCH_PG_BACKUP_PROBE_ENABLED="${WATCH_PG_BACKUP_PROBE_ENABLED:-1}"
 WATCH_PG_BACKUP_STATUS="${WATCH_PG_BACKUP_STATUS:-/var/lib/openclaude-v5-selfhost/pg-backup-status.json}"
 WATCH_PG_BACKUP_MAX_AGE_SEC="${WATCH_PG_BACKUP_MAX_AGE_SEC:-129600}"
+WATCH_PG_FULL_BACKUP_MAX_AGE_SEC="${WATCH_PG_FULL_BACKUP_MAX_AGE_SEC:-864000}"
+WATCH_PG_BACKUP_ALERT_OVER_CAP="${WATCH_PG_BACKUP_ALERT_OVER_CAP:-1}"
 WATCH_AUTOSAVE_STATUS="${WATCH_AUTOSAVE_STATUS:-/var/lib/openclaude-v5-selfhost/harness-autosave-status.json}"
 WATCH_AUTOSAVE_MAX_STALE_SEC="${WATCH_AUTOSAVE_MAX_STALE_SEC:-7200}"
 WATCH_STUB_DISK_AVAIL_BYTES="${WATCH_STUB_DISK_AVAIL_BYTES:-}"
@@ -263,6 +278,34 @@ write_fail_count() {
   printf '%s\n' "$n" >"$WATCH_FAIL_COUNT"
 }
 
+deps_pg_fail_count_path() {
+  if [[ -n "${WATCH_DEPS_PG_FAIL_COUNT:-}" ]]; then
+    printf '%s\n' "$WATCH_DEPS_PG_FAIL_COUNT"
+  else
+    printf '%s\n' "${WATCH_RUN_DIR}/deps-pg-fail-count"
+  fi
+}
+
+read_deps_pg_fail_count() {
+  local p n
+  p="$(deps_pg_fail_count_path)"
+  n="$(cat "$p" 2>/dev/null || echo 0)"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  printf '%s\n' "$n"
+}
+
+write_deps_pg_fail_count() {
+  local n="$1" p dir
+  if is_true_dry; then
+    wlog "[dry] 不写 deps-pg-fail-count would=$n"
+    return 0
+  fi
+  p="$(deps_pg_fail_count_path)"
+  dir="$(dirname -- "$p")"
+  mkdir -p -- "$dir"
+  printf '%s\n' "$n" >"$p"
+}
+
 unit_is_active() {
   local unit="$1" stub st
   case "$unit" in
@@ -276,14 +319,12 @@ unit_is_active() {
   fi
   st="$(systemctl is-active "$unit" 2>/dev/null || true)"
   [[ "$st" == "active" ]] && return 0
-  # 2026-09-05 蓝绿双槽:egress 可能由 egress@A/egress@B 任一槽承载,legacy 单 unit 不 active
-  # 属正常。任一槽 active 即视为 egress unit 在。
+  # 蓝绿双槽:master(frontdoor+@A/@B)与 egress(@A/@B)任一活槽即视为 unit 在。
+  if [[ "$unit" == "$WATCH_MASTER_UNIT" && "$(systemctl is-active "$WATCH_FRONTDOOR_UNIT" 2>/dev/null || true)" == "active" ]]; then
+    local ms; for ms in A B; do [[ "$(systemctl is-active "${WATCH_MASTER_SLOT_TPL/@./@$ms.}" 2>/dev/null || true)" == "active" ]] && return 0; done
+  fi
   if [[ "$unit" == "$WATCH_EGRESS_UNIT" ]]; then
-    local s
-    for s in A B; do
-      st="$(systemctl is-active "${WATCH_EGRESS_SLOT_TPL/@./@$s.}" 2>/dev/null || true)"
-      [[ "$st" == "active" ]] && return 0
-    done
+    local s; for s in A B; do [[ "$(systemctl is-active "${WATCH_EGRESS_SLOT_TPL/@./@$s.}" 2>/dev/null || true)" == "active" ]] && return 0; done
   fi
   return 1
 }
@@ -532,8 +573,56 @@ write_grace() {
   printf 'until=%s\n' "$until_ts" >"$WATCH_GRACE"
 }
 
+tier_pending_path() {
+  if [[ -n "${WATCH_TIER_PENDING:-}" ]]; then
+    printf '%s\n' "$WATCH_TIER_PENDING"
+  else
+    printf '%s\n' "${WATCH_RUN_DIR}/watch-tier-pending"
+  fi
+}
+
+write_tier_pending() { # <tier1|tier2> <deadline_epoch> [stage=ready] [cur] [target]
+  local tier="$1" deadline="$2" stage="${3:-ready}" cur="${4:-}" target="${5:-}" p dir tmp
+  if is_true_dry; then
+    wlog "[dry] 不写 tier-pending tier=$tier stage=$stage deadline=$deadline"
+    return 0
+  fi
+  p="$(tier_pending_path)"
+  dir="$(dirname -- "$p")"
+  mkdir -p -- "$dir"
+  tmp="$(mktemp "${dir}/.watch-tier-pending.XXXXXX")" || return 1
+  if printf 'tier=%s\nstage=%s\ncur=%s\ntarget=%s\ndeadline=%s\n' \
+    "$tier" "$stage" "$cur" "$target" "$deadline" >"$tmp" && mv -T -- "$tmp" "$p"; then
+    return 0
+  fi
+  rm -f -- "$tmp"
+  return 1
+}
+
+clear_tier_pending() {
+  local p
+  if is_true_dry; then
+    return 0
+  fi
+  p="$(tier_pending_path)"
+  rm -f -- "$p"
+}
+
+watch_egress_wait_timeout() { # [default_cap=90]
+  local cap="${1:-90}" rem
+  [[ "$cap" =~ ^[1-9][0-9]*$ ]] || cap=90
+  if [[ -n "${WATCH_TICK_DEADLINE:-}" && "$WATCH_TICK_DEADLINE" =~ ^[0-9]+$ ]]; then
+    # 留 10s 给 master restart 与收尾写状态,确保整拍在 TimeoutStartSec=120 内收敛
+    rem=$(( WATCH_TICK_DEADLINE - SECONDS - 10 ))
+    (( rem < 1 )) && rem=1
+    (( rem < cap )) && cap="$rem"
+  fi
+  printf '%s\n' "$cap"
+}
+
 tier1_rollback_legacy() {
-  local prev
+  local prev eg_wait eg_rc=0
+  WATCH_DEFERRED_STAGE="" WATCH_DEFERRED_CUR="" WATCH_DEFERRED_TARGET=""
   prev="$(tr -d '[:space:]' <"${WATCH_RELEASES_ROOT}/.prev-release" 2>/dev/null || true)"
   if ! prev_release_is_valid; then
     wlog "tier1 无合法 prev release"
@@ -546,15 +635,43 @@ tier1_rollback_legacy() {
   fi
   write_grace
   atomic_flip_live "$prev"
-  restart_egress_for_live || return 1
-  timeout 90 bash -c 'until (exec 3<>/dev/tcp/172.31.0.1/18892) 2>/dev/null; do sleep 1; done' || true
-  systemctl restart "$WATCH_MASTER_UNIT"
-  return 0
+  restart_egress_for_live || eg_rc=$?
+  (( eg_rc == 0 )) || return "$eg_rc"
+  eg_wait="$(watch_egress_wait_timeout 90)"
+  timeout "$eg_wait" bash -c 'until (exec 3<>/dev/tcp/172.31.0.1/18892) 2>/dev/null; do sleep 1; done' || true
+  restart_master_for_live
 }
 
-# egress 重启:live 自带双槽模板 → 起另一个槽再 stop --no-block 当前槽(零停机);
-# 否则 legacy 单 unit restart(先停两槽,腾出 18892)。与 deploy-v5-selfhost.sh
-# egress_slot_flip 同语义的精简版;watch 是独立脚本,不 source deploy lib。
+# OCV5-854 (B13): dual-slot recovery even when both @A/@B are dead while frontdoor is active.
+restart_master_for_live() {
+  local live target="" u sa sb pport hz phz i wait_s="${WATCH_MASTER_READY_TIMEOUT_SEC:-45}" st_file="${WATCH_FRONTDOOR_STATE_FILE:-/var/lib/openclaude-v5-selfhost/frontdoor-state.json}" slot_pfx="${WATCH_SLOT_LINK_PREFIX:-/opt/openclaude/openclaude-v5-selfhost-slot}"
+  live="$(readlink -f -- "$WATCH_LIVE" 2>/dev/null || true)"; sa="${WATCH_MASTER_SLOT_TPL/@./@A.}"; sb="${WATCH_MASTER_SLOT_TPL/@./@B.}"
+  if [[ "$(systemctl is-active "$WATCH_FRONTDOOR_UNIT" 2>/dev/null || true)" == "active" || "$(systemctl is-active "$sa" 2>/dev/null || true)" == "active" || "$(systemctl is-active "$sb" 2>/dev/null || true)" == "active" ]]; then
+    if [[ "$(systemctl is-active "$sa" 2>/dev/null || true)" == "active" && "$(systemctl is-active "$sb" 2>/dev/null || true)" != "active" ]]; then target=A
+    elif [[ "$(systemctl is-active "$sb" 2>/dev/null || true)" == "active" && "$(systemctl is-active "$sa" 2>/dev/null || true)" != "active" ]]; then target=B
+    else
+      [[ -r "$st_file" ]] && target="$(jq -r '.slot // empty' "$st_file" 2>/dev/null || true)"
+      if [[ "$target" != "A" && "$target" != "B" ]]; then
+        if [[ -n "${WATCH_DEPLOY_STATE_SLOT_CMD:-}" ]]; then target="$("$WATCH_DEPLOY_STATE_SLOT_CMD" 2>/dev/null || true)"; else target="$(su - postgres -c "psql -X -qAt -d openclaude_v5_selfhost -c 'SELECT active_slot FROM deploy_state WHERE singleton=true;'" 2>/dev/null || true)"; fi
+      fi
+      [[ "$target" == "A" || "$target" == "B" ]] || target=A
+    fi
+    u="${WATCH_MASTER_SLOT_TPL/@./@$target.}"; [[ -n "$live" && -d "$live" ]] && ln -sfn -- "$live" "${slot_pfx}-${target}"
+    systemctl restart "$u" || { wlog "restart_master_for_live: restart $u failed"; return 1; }
+    systemctl start "$WATCH_FRONTDOOR_UNIT" || { wlog "restart_master_for_live: start $WATCH_FRONTDOOR_UNIT failed"; return 1; }
+    [[ "$target" == A ]] && pport="${WATCH_PRIV_PORT_A:-18896}" || pport="${WATCH_PRIV_PORT_B:-18897}"
+    for (( i = 1; i <= wait_s; i++ )); do
+      if [[ -n "${WATCH_MASTER_VERIFY_CMD:-}" ]]; then "$WATCH_MASTER_VERIFY_CMD" "$target" && return 0
+      elif phz="$(curl -fsS --max-time 3 "http://127.0.0.1:${pport}/healthz" 2>/dev/null)" && [[ -n "$phz" ]] && printf '%s\n' "$phz" | jq -e '.ok==true and .leadership.state=="leader" and .vip=="owner"' >/dev/null 2>&1 \
+        && hz="$(curl -fsS --max-time 3 "$WATCH_MASTER_URL" 2>/dev/null)" && [[ -n "$hz" ]] && printf '%s\n' "$hz" | jq -e '.ok==true' >/dev/null 2>&1; then return 0; fi
+      sleep 1
+    done
+    wlog "restart_master_for_live: slot $target ($u) failed priv+18790 health check"; return 1
+  fi
+  systemctl restart "$WATCH_MASTER_UNIT"
+}
+
+# egress 重启:live 自带双槽模板 → 蓝绿翻槽(OCV5-818);否则 legacy 单 unit。
 restart_egress_for_live() {
   local live sa sb cur target s
   live="$(readlink -f -- "$WATCH_LIVE" 2>/dev/null || true)"
@@ -564,40 +681,255 @@ restart_egress_for_live() {
     elif [[ "$(systemctl is-active "$sb" 2>/dev/null)" == active ]]; then cur=B; target=A
     else cur=""; target=A; fi
     if [[ "$(systemctl is-active "$WATCH_EGRESS_UNIT" 2>/dev/null)" == active ]]; then
-      wlog "tier1: legacy egress 仍 active,阻塞 stop(等 drain)"
-      systemctl stop "$WATCH_EGRESS_UNIT" || true
+      local stop_wait=90 stop_rem
+      if [[ -n "${WATCH_TICK_DEADLINE:-}" && "$WATCH_TICK_DEADLINE" =~ ^[0-9]+$ ]]; then
+        stop_rem=$(( WATCH_TICK_DEADLINE - SECONDS - 10 ))
+        if (( stop_rem < 1 )); then
+          wlog "tier1: 本拍剩余预算不足以阻塞停 legacy egress,延至下一拍"
+          WATCH_DEFERRED_STAGE="legacy-egress-stop"
+          WATCH_DEFERRED_CUR=""
+          WATCH_DEFERRED_TARGET="$target"
+          return 76
+        fi
+        (( stop_rem < stop_wait )) && stop_wait="$stop_rem"
+      fi
+      wlog "tier1: legacy egress 仍 active,限时 ${stop_wait}s 阻塞 stop(防 1860s drain 超出看护超时)"
+      if ! timeout "$stop_wait" systemctl stop "$WATCH_EGRESS_UNIT"; then
+        if [[ -n "${WATCH_TICK_DEADLINE:-}" && "$WATCH_TICK_DEADLINE" =~ ^[0-9]+$ ]]; then
+          WATCH_DEFERRED_STAGE="legacy-egress-stop"
+          WATCH_DEFERRED_CUR=""
+          WATCH_DEFERRED_TARGET="$target"
+          return 76
+        fi
+        return 1
+      fi
     fi
     wlog "tier1: egress 槽翻转 ${cur:-none} -> $target"
     systemctl start "${WATCH_EGRESS_SLOT_TPL/@.service/@$target.socket}" "${WATCH_EGRESS_SLOT_TPL/@./@$target.}" || true
-    local port; [[ "$target" == A ]] && port=18898 || port=18899
-    timeout 90 bash -c "until curl -fsS --max-time 2 http://127.0.0.1:$port/internal/v5/egress-slot-health >/dev/null 2>&1; do sleep 1; done" || true
+    local port slot_wait=90 rem
+    [[ "$target" == A ]] && port=18898 || port=18899
+    if [[ -n "${WATCH_TICK_DEADLINE:-}" && "$WATCH_TICK_DEADLINE" =~ ^[0-9]+$ ]]; then
+      rem=$(( WATCH_TICK_DEADLINE - SECONDS - 10 ))
+      (( rem < 1 )) && rem=1
+      (( rem < slot_wait )) && slot_wait="$rem"
+    fi
+    if ! timeout "$slot_wait" bash -c "until curl -fsS --max-time 2 http://127.0.0.1:$port/internal/v5/egress-slot-health >/dev/null 2>&1; do sleep 1; done"; then
+      wlog "tier1: egress 新槽 $target 在 ${slot_wait}s 内未就绪,保留旧槽 ${cur:-none} 不停机"
+      if [[ -n "${WATCH_TICK_DEADLINE:-}" && "$WATCH_TICK_DEADLINE" =~ ^[0-9]+$ && "$slot_wait" -lt 90 ]]; then
+        WATCH_DEFERRED_STAGE="egress-flip"
+        WATCH_DEFERRED_CUR="$cur"
+        WATCH_DEFERRED_TARGET="$target"
+        return 76
+      fi
+      return 1
+    fi
     if [[ -n "$cur" ]]; then
-      # 先阻塞关旧 .socket(ignore-dependencies 绕开 Requires 反向传播),再 --no-block 停
-      # service:否则 service drain 期间 .socket 仍持有 reuseport 组里一个没人 accept 的
-      # listener,约一半新连接被黑洞(2026-09-07 两班列车 egress-health 失败的根因)。
+      # 先阻塞关旧 .socket(ignore-dependencies),再 --no-block 停 service,防 reuseport 黑洞。
       systemctl stop --job-mode=ignore-dependencies "${WATCH_EGRESS_SLOT_TPL/@.service/@$cur.socket}" || return 1
       systemctl stop --no-block "${WATCH_EGRESS_SLOT_TPL/@./@$cur.}" || true
     fi
   else
-    for s in A B; do
-      systemctl stop "${WATCH_EGRESS_SLOT_TPL/@.service/@$s.socket}" "${WATCH_EGRESS_SLOT_TPL/@./@$s.}" 2>/dev/null || true
-    done
+    for s in A B; do systemctl stop "${WATCH_EGRESS_SLOT_TPL/@.service/@$s.socket}" "${WATCH_EGRESS_SLOT_TPL/@./@$s.}" 2>/dev/null || true; done
     systemctl restart "$WATCH_EGRESS_UNIT"
   fi
 }
 
+complete_deferred_egress_flip_legacy() {
+  local cur="${WATCH_RESUME_CUR:-}" target="${WATCH_RESUME_TARGET:-A}" eg_wait
+  if [[ -n "$cur" ]]; then
+    systemctl stop --job-mode=ignore-dependencies "${WATCH_EGRESS_SLOT_TPL/@.service/@$cur.socket}" || return 1
+    systemctl stop --no-block "${WATCH_EGRESS_SLOT_TPL/@./@$cur.}" || true
+  fi
+  eg_wait="$(watch_egress_wait_timeout 90)"
+  timeout "$eg_wait" bash -c 'until (exec 3<>/dev/tcp/172.31.0.1/18892) 2>/dev/null; do sleep 1; done' || true
+  restart_master_for_live
+}
+
+complete_deferred_legacy_egress_legacy() {
+  local eg_rc=0 eg_wait
+  WATCH_DEFERRED_STAGE="" WATCH_DEFERRED_CUR="" WATCH_DEFERRED_TARGET=""
+  restart_egress_for_live || eg_rc=$?
+  (( eg_rc == 0 )) || return "$eg_rc"
+  eg_wait="$(watch_egress_wait_timeout 90)"
+  timeout "$eg_wait" bash -c 'until (exec 3<>/dev/tcp/172.31.0.1/18892) 2>/dev/null; do sleep 1; done' || true
+  restart_master_for_live
+}
+
+# OCV5-818: fail-closed 校验 release 目录与 .complete(root:0/go-w/非空 JSON 40 位 sourceCommit)。
+watch_release_complete_valid() { # <wd>
+  local wd="$1"
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$wd" <<'PY'
+import json, os, re, stat, sys
+wd = sys.argv[1]
+if not os.path.isabs(wd):
+    sys.exit(1)
+real_wd = os.path.realpath(wd)
+try:
+    st_dir = os.lstat(real_wd)
+except OSError:
+    sys.exit(1)
+if not stat.S_ISDIR(st_dir.st_mode) or stat.S_ISLNK(st_dir.st_mode):
+    sys.exit(1)
+if st_dir.st_uid != 0 or (st_dir.st_mode & 0o022) != 0:
+    sys.exit(1)
+marker = os.path.join(real_wd, ".complete")
+try:
+    st_m = os.lstat(marker)
+except OSError:
+    sys.exit(1)
+if not stat.S_ISREG(st_m.st_mode) or stat.S_ISLNK(st_m.st_mode):
+    sys.exit(1)
+if st_m.st_uid != 0 or (st_m.st_mode & 0o022) != 0:
+    sys.exit(1)
+try:
+    def _reject_constant(tok):
+        raise ValueError(f"non-standard JSON constant: {tok}")
+    with open(marker, "r", encoding="utf-8") as fh:
+        raw = fh.read()
+    data = json.loads(raw, parse_constant=_reject_constant)
+except Exception:
+    sys.exit(1)
+if not isinstance(data, dict):
+    sys.exit(1)
+sc = data.get("sourceCommit")
+if not isinstance(sc, str) or not re.fullmatch(r"[0-9a-f]{40}", sc):
+    sys.exit(1)
+PY
+}
+
+tier2_backup_unit_incompatible() { # <unit-file> → 0 需拒绝, 1 兼容或无该文件
+  local unit_file="$1" wd
+  [[ -f "$unit_file" || -L "$unit_file" ]] || return 1
+  if [[ -L "$unit_file" ]]; then
+    wlog "tier2 拒绝: 备份 unit 是符号链接 $unit_file"
+    return 0
+  fi
+  wd="$(awk -F= '/^WorkingDirectory=/{print $2; exit}' "$unit_file" | tr -d '[:space:]')"
+  if [[ -z "$wd" ]]; then
+    wlog "tier2 拒绝: 备份 unit 缺 WorkingDirectory ($unit_file)"
+    return 0
+  fi
+  # OCV5-818: 禁止回装工作树 WD unit。V5+runtimeTuple 启动期强制校验 <cwd>/.complete,
+  # 工作树目录无 .complete 会导致约 60s ENOENT 崩溃循环,且会破坏 live release 与双槽语义。
+  if [[ "$wd" != "$WATCH_LIVE" && "$wd" != *-live ]]; then
+    wlog "tier2 拒绝恢复非 live 工作树备份 unit: $unit_file WorkingDirectory=$wd (期望 $WATCH_LIVE)"
+    return 0
+  fi
+  if ! watch_release_complete_valid "$wd"; then
+    wlog "tier2 拒绝: live WorkingDirectory=$wd 未通过 .complete 运行时安全契约(需 root:0/go-w/非空 JSON 40 位 sourceCommit)"
+    return 0
+  fi
+  return 1
+}
+
+# OCV5-818: 自动 tier2 的合法 live-WD unit 恢复执行路径(与人工 worktree breakglass 分离)。
+# 把已预检的备份目录中 live-WD unit 原子安装到 WATCH_SYSTEMD_DIR,reload 并按现网双槽/单槽语义重启。
+tier2_restore_live_units_from_backup() { # <prechecked-backup-dir>
+  local backup_real="$1" eg_wait
+  command -v python3 >/dev/null 2>&1 || { wlog "tier2 失败: 缺 python3 无法原子安装 live unit"; return 1; }
+  local -a units=("$WATCH_MASTER_UNIT")
+  [[ -f "$backup_real/$WATCH_EGRESS_UNIT" && ! -L "$backup_real/$WATCH_EGRESS_UNIT" ]] && units+=("$WATCH_EGRESS_UNIT")
+  local tpl_svc="$WATCH_EGRESS_SLOT_TPL"
+  local tpl_sock="${WATCH_EGRESS_SLOT_TPL/@.service/@.socket}"
+  [[ -f "$backup_real/$tpl_svc" && ! -L "$backup_real/$tpl_svc" ]] && units+=("$tpl_svc")
+  [[ -f "$backup_real/$tpl_sock" && ! -L "$backup_real/$tpl_sock" ]] && units+=("$tpl_sock")
+  if ! python3 - "$backup_real" "$WATCH_SYSTEMD_DIR" "${units[@]}" <<'PY'
+import os, sys
+src_dir, dst_dir, *names = sys.argv[1:]
+os.makedirs(dst_dir, exist_ok=True)
+tmps = []
+try:
+    for name in names:
+        src = os.path.join(src_dir, name)
+        dst = os.path.join(dst_dir, name)
+        with open(src, "rb") as fh:
+            data = fh.read()
+        if not data:
+            raise RuntimeError(f"empty unit: {src}")
+        tmp = f"{dst}.v5watch-t2.{os.getpid()}"
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o644)
+        try:
+            written = 0
+            while written < len(data):
+                n = os.write(fd, data[written:])
+                if n <= 0:
+                    raise OSError("short write")
+                written += n
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        tmps.append((tmp, dst))
+    for tmp, dst in tmps:
+        os.replace(tmp, dst)
+    dfd = os.open(dst_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+except Exception:
+    for tmp, _ in tmps:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    raise
+PY
+  then
+    wlog "tier2 原子安装 live unit 失败 backup=$backup_real dst=$WATCH_SYSTEMD_DIR"
+    return 1
+  fi
+  wlog "tier2 已从合法 live 备份原子安装 unit (${units[*]}) ← $backup_real → $WATCH_SYSTEMD_DIR"
+  systemctl daemon-reload || return 1
+  local eg_rc=0
+  WATCH_DEFERRED_STAGE="" WATCH_DEFERRED_CUR="" WATCH_DEFERRED_TARGET=""
+  restart_egress_for_live || eg_rc=$?
+  (( eg_rc == 0 )) || return "$eg_rc"
+  eg_wait="$(watch_egress_wait_timeout 90)"
+  timeout "$eg_wait" bash -c 'until (exec 3<>/dev/tcp/172.31.0.1/18892) 2>/dev/null; do sleep 1; done' || true
+  restart_master_for_live
+}
+
+live_backup_current_path() {
+  if [[ -n "${WATCH_LIVE_BACKUP_CURRENT:-}" ]]; then
+    printf '%s\n' "$WATCH_LIVE_BACKUP_CURRENT"
+  else
+    printf '%s/live-current\n' "$(dirname -- "$WATCH_BACKUP_CURRENT")"
+  fi
+}
+
 tier2_restore_units_legacy() {
-  wlog "tier2 准备恢复备份 unit ← $WATCH_BACKUP_CURRENT dry=$WATCH_DRY"
-  if [[ ! -d "$WATCH_BACKUP_CURRENT" ]]; then
+  local live_ptr backup_cand backup_real
+  live_ptr="$(live_backup_current_path)"
+  if [[ -d "$live_ptr" && -f "$live_ptr/$WATCH_MASTER_UNIT" ]]; then
+    backup_cand="$live_ptr"
+  else
+    backup_cand="$WATCH_BACKUP_CURRENT"
+  fi
+  wlog "tier2 准备恢复备份 unit ← $backup_cand dry=$WATCH_DRY"
+  if [[ ! -d "$backup_cand" ]]; then
     wlog "tier2 备份目录不存在"
     return 1
   fi
+  backup_real="$(readlink -f -- "$backup_cand" 2>/dev/null || printf '%s' "$backup_cand")"
+  if tier2_backup_unit_incompatible "$backup_real/$WATCH_MASTER_UNIT" \
+    || tier2_backup_unit_incompatible "$backup_real/$WATCH_EGRESS_UNIT"; then
+    return 1
+  fi
   if is_true_dry || [[ "$WATCH_SKIP_ACTIONS" == 1 ]]; then
-    wlog "[dry] 不执行 restore-worktree-units.sh"
+    wlog "[dry] 不执行 tier2 unit 恢复"
     return 0
   fi
   write_grace
-  bash "$WATCH_RESTORE"
+  if [[ -f "$backup_real/$WATCH_MASTER_UNIT" && ! -L "$backup_real/$WATCH_MASTER_UNIT" ]]; then
+    tier2_restore_live_units_from_backup "$backup_real"
+  else
+    bash "$WATCH_RESTORE" --backup-dir "$backup_real"
+  fi
 }
 
 compound_green() {
@@ -816,7 +1148,10 @@ watch_once() {
     emit_watch_status false release-policy-hold true "$policy_health" || true
     return 0
   fi
-  local count reason loud
+  local count reason loud once_budget skip_tier1=0
+  once_budget="${WATCH_ONCE_BUDGET_SEC:-95}"
+  [[ "$once_budget" =~ ^[1-9][0-9]*$ ]] || once_budget=95
+  local WATCH_TICK_DEADLINE=$(( SECONDS + once_budget ))
   WATCH_LAST_MASTER_BODY=""
 
   if recovery_marker_present || manual_recovery_present; then
@@ -833,69 +1168,279 @@ watch_once() {
     emit_watch_status true maint false unobserved || true
     return 0
   fi
-  if in_cutover_grace; then
-    wlog "cutover grace 未到期(绝对 until,不看 ActiveEnterTimestamp),退出"
-    emit_watch_status true grace false unobserved || true
-    return 0
+
+  local post_wait budget_rem wait_now shortfall
+  post_wait="${WATCH_POST_RESTART_WAIT_SEC:-${WATCH_ONCE_POST_RESTART_WAIT_SEC:-60}}"
+  [[ "$post_wait" =~ ^[0-9]+$ ]] || post_wait=60
+
+  # OCV5-818: 上一拍因整拍预算不足将 tier1/tier2 就绪复查或 egress 槽翻转延至本拍,在 cutover-grace 之前处理
+  local pending_file pending_tier pending_stage pending_cur pending_target pending_deadline now_ts
+  pending_file="$(tier_pending_path)"
+  if [[ -f "$pending_file" && ! -L "$pending_file" ]]; then
+    pending_tier="$(parse_kv_file "$pending_file" tier || true)"
+    pending_stage="$(parse_kv_file "$pending_file" stage || true)"
+    pending_stage="${pending_stage:-ready}"
+    pending_cur="$(parse_kv_file "$pending_file" cur || true)"
+    pending_target="$(parse_kv_file "$pending_file" target || true)"
+    pending_deadline="$(parse_kv_file "$pending_file" deadline || true)"
+    if [[ ( "$pending_tier" == tier1 || "$pending_tier" == tier2 ) && "$pending_deadline" =~ ^[0-9]+$ ]]; then
+      now_ts="$(watch_now)"
+      if [[ "$pending_stage" == egress-flip ]]; then
+        local slot_port=18898 flip_rc=0
+        [[ "$pending_target" == B ]] && slot_port=18899
+        if curl -fsS --max-time 2 "http://127.0.0.1:${slot_port}/internal/v5/egress-slot-health" >/dev/null 2>&1; then
+          wlog "${pending_tier} 待续 egress 新槽 ${pending_target} 已就绪,执行停旧槽 ${pending_cur:-none} 并重启 master"
+          WATCH_RESUME_CUR="$pending_cur" WATCH_RESUME_TARGET="$pending_target" \
+            watch_policy_mutation complete_deferred_egress_flip_legacy || flip_rc=$?
+          if [[ "$flip_rc" == 75 ]]; then
+            wlog "恢复锁忙或 policy hold,本拍保留待续 egress 翻转"
+            emit_watch_status false recovery-wait true red || true
+            return 0
+          fi
+          if [[ "$flip_rc" == 0 ]]; then
+            budget_rem=$(( WATCH_TICK_DEADLINE - SECONDS ))
+            (( budget_rem < 0 )) && budget_rem=0
+            wait_now="$post_wait"
+            (( budget_rem < wait_now )) && wait_now="$budget_rem"
+            if watch_wait_ready_stable 0 "$wait_now"; then
+              clear_tier_pending
+              write_fail_count 0
+              write_deps_pg_fail_count 0
+              wlog "${pending_tier} 待续 egress 翻转后转绿,冻结计数"
+              if [[ "$pending_tier" == tier1 ]]; then
+                watch_alert critical tier1_rolled_back "tier1 已回切到上一份 release 并恢复复合健康绿。当前 live=$(readlink -f "$WATCH_LIVE" 2>/dev/null || echo unknown)。下一步：查出问题的那次发布。"
+              else
+                watch_alert critical tier2_restored "tier2 已恢复 unit 并转绿。下一步：确认 live 指向与 unit 来源，排查原因。"
+              fi
+              emit_watch_status true "" true green || true
+              return 0
+            fi
+            if (( wait_now < post_wait )); then
+              shortfall=$(( post_wait - wait_now ))
+              write_tier_pending "$pending_tier" "$(( $(watch_now) + shortfall ))" ready || true
+              emit_watch_status true "${pending_tier}-verify-pending" true red || true
+              return 0
+            fi
+          fi
+          clear_tier_pending
+          if [[ "$pending_tier" == tier1 ]]; then
+            wlog "tier1 待续 egress 翻转后仍红,进入 tier2"
+            watch_alert critical tier1_still_red "tier1 回切后复合健康仍红，进入 tier2（恢复 unit）。"
+            skip_tier1=1
+          else
+            write_manual_recovery "tier1+tier2-failed"
+            write_disarm "tier1+tier2-failed"
+            WATCH_DISARM_ALERTED=1
+            watch_alert critical rollback_failed "两级兜底后仍红，已停用本看护的自动回滚（watch-disarmed + manual-recovery）。lease worker 的 autorecover 接管：退避重试两级兜底，稳定绿后自动归档标记；仍失败自动开工单派给 AI。"
+            emit_watch_status false "$(suppression_reason_from_files)" true red || true
+            return 1
+          fi
+        elif (( now_ts < pending_deadline )); then
+          wlog "${pending_tier} 待续 egress 新槽 ${pending_target} 仍未就绪,保留旧槽 ${pending_cur:-none}(剩余 $((pending_deadline - now_ts))s)"
+          emit_watch_status true "${pending_tier}-egress-pending" true red || true
+          return 0
+        else
+          clear_tier_pending
+          wlog "${pending_tier} 待续 egress 新槽 ${pending_target} 超时未就绪,保留旧槽 ${pending_cur:-none}"
+          if [[ "$pending_tier" == tier1 ]]; then
+            watch_alert critical tier1_still_red "tier1 egress 新槽超时未就绪，保留旧槽并进入 tier2（恢复 unit）。"
+            skip_tier1=1
+          else
+            write_manual_recovery "tier1+tier2-failed"
+            write_disarm "tier1+tier2-failed"
+            WATCH_DISARM_ALERTED=1
+            watch_alert critical rollback_failed "两级兜底后仍红，已停用本看护的自动回滚（watch-disarmed + manual-recovery）。lease worker 的 autorecover 接管：退避重试两级兜底，稳定绿后自动归档标记；仍失败自动开工单派给 AI。"
+            emit_watch_status false "$(suppression_reason_from_files)" true red || true
+            return 1
+          fi
+        fi
+      elif [[ "$pending_stage" == legacy-egress-stop ]]; then
+        local leg_rc=0
+        watch_policy_mutation complete_deferred_legacy_egress_legacy || leg_rc=$?
+        if [[ "$leg_rc" == 75 ]]; then
+          emit_watch_status false recovery-wait true red || true
+          return 0
+        fi
+        if [[ "$leg_rc" == 76 ]]; then
+          if (( now_ts < pending_deadline )); then
+            write_tier_pending "$pending_tier" "$pending_deadline" "${WATCH_DEFERRED_STAGE:-legacy-egress-stop}" "${WATCH_DEFERRED_CUR:-}" "${WATCH_DEFERRED_TARGET:-}" || true
+            emit_watch_status true "${pending_tier}-egress-pending" true red || true
+            return 0
+          fi
+          leg_rc=1
+        fi
+        if [[ "$leg_rc" == 0 ]]; then
+          budget_rem=$(( WATCH_TICK_DEADLINE - SECONDS ))
+          (( budget_rem < 0 )) && budget_rem=0
+          wait_now="$post_wait"
+          (( budget_rem < wait_now )) && wait_now="$budget_rem"
+          if watch_wait_ready_stable 0 "$wait_now"; then
+            clear_tier_pending
+            write_fail_count 0
+            write_deps_pg_fail_count 0
+            emit_watch_status true "" true green || true
+            return 0
+          fi
+          if (( wait_now < post_wait )); then
+            shortfall=$(( post_wait - wait_now ))
+            write_tier_pending "$pending_tier" "$(( $(watch_now) + shortfall ))" ready || true
+            emit_watch_status true "${pending_tier}-verify-pending" true red || true
+            return 0
+          fi
+        fi
+        clear_tier_pending
+        if [[ "$pending_tier" == tier1 ]]; then
+          skip_tier1=1
+        else
+          write_manual_recovery "tier1+tier2-failed"
+          write_disarm "tier1+tier2-failed"
+          WATCH_DISARM_ALERTED=1
+          emit_watch_status false "$(suppression_reason_from_files)" true red || true
+          return 1
+        fi
+      else
+        if compound_green; then
+          clear_tier_pending
+          write_fail_count 0
+          write_deps_pg_fail_count 0
+          wlog "${pending_tier} 待复查转绿,冻结计数"
+          if [[ "$pending_tier" == tier1 ]]; then
+            watch_alert critical tier1_rolled_back "tier1 已回切到上一份 release 并恢复复合健康绿。当前 live=$(readlink -f "$WATCH_LIVE" 2>/dev/null || echo unknown)。下一步：查出问题的那次发布。"
+          else
+            watch_alert critical tier2_restored "tier2 已恢复 unit 并转绿。下一步：确认 live 指向与 unit 来源，排查原因。"
+          fi
+          emit_watch_status true "" true green || true
+          return 0
+        fi
+        if (( now_ts < pending_deadline )); then
+          wlog "${pending_tier} 待复查中,等待网关就绪(剩余 $((pending_deadline - now_ts))s)"
+          emit_watch_status true "${pending_tier}-verify-pending" true red || true
+          return 0
+        fi
+        clear_tier_pending
+        if [[ "$pending_tier" == tier1 ]]; then
+          wlog "tier1 待复查超时仍红,进入 tier2"
+          watch_alert critical tier1_still_red "tier1 回切后复合健康仍红，进入 tier2（恢复 unit）。"
+          skip_tier1=1
+        else
+          wlog "tier2 待复查超时仍红,进入 disarm"
+          write_manual_recovery "tier1+tier2-failed"
+          write_disarm "tier1+tier2-failed"
+          WATCH_DISARM_ALERTED=1
+          watch_alert critical rollback_failed "两级兜底后仍红，已停用本看护的自动回滚（watch-disarmed + manual-recovery）。lease worker 的 autorecover 接管：退避重试两级兜底，稳定绿后自动归档标记；仍失败自动开工单派给 AI。"
+          emit_watch_status false "$(suppression_reason_from_files)" true red || true
+          return 1
+        fi
+      fi
+    else
+      clear_tier_pending
+    fi
   fi
 
-  if compound_green; then
-    write_fail_count 0
-    wlog "复合健康绿,清失败计数"
-    emit_watch_status true "" true green || true
-    return 0
-  fi
-
-  if loud="$(classify_fail_loud)"; then
-    wlog "FAIL-LOUD class=$loud 不自动回切"
-    write_manual_recovery "$loud"
-    write_disarm "$loud"
-    WATCH_DISARM_ALERTED=1
-    emit_watch_status false "$(suppression_reason_from_files)" true red || true
-    watch_alert critical fail_loud "FAIL-LOUD class=${loud}：不自动回切，已写停用标记与 manual-recovery。lease worker 的 autorecover 接管：依赖/现场恢复后稳定绿即自动归档标记并恢复保护；超时自动开工单派给 AI。"
-    return 0
-  fi
-
-  count="$(read_fail_count)"
-  count=$((count + 1))
-  write_fail_count "$count"
-  wlog "复合健康红 count=$count/$WATCH_FAIL_THRESHOLD master_unit=$(unit_is_active "$WATCH_MASTER_UNIT" && echo active || echo down) egress_unit=$(unit_is_active "$WATCH_EGRESS_UNIT" && echo active || echo down)"
-
-  if (( count < WATCH_FAIL_THRESHOLD )); then
-    emit_watch_status true "" true red || true
-    return 0
-  fi
-
-  wlog "达到阈值,进入两级兜底"
-  watch_alert critical rollback_start "复合健康连续红 ${count}/${WATCH_FAIL_THRESHOLD}，开始两级兜底（tier1 回切上一份 release → tier2 恢复 unit）$(is_true_dry && echo '（WATCH_DRY 演练）')。"
-  if prev_release_is_valid; then
-    local policy_tier_rc=0
-    tier1_rollback || policy_tier_rc=$?
-    if [[ "$policy_tier_rc" == 75 ]]; then
-      wlog "恢复锁忙或 policy hold,本拍等待"
-      emit_watch_status false recovery-wait true red || true
+  if (( skip_tier1 == 0 )); then
+    if in_cutover_grace; then
+      wlog "cutover grace 未到期(绝对 until,不看 ActiveEnterTimestamp),退出"
+      emit_watch_status true grace false unobserved || true
       return 0
     fi
-    if [[ "$policy_tier_rc" == 0 ]]; then
-      sleep 3
-      if [[ "$WATCH_SKIP_ACTIONS" == 1 ]] || is_true_dry || compound_green; then
+
+    if compound_green; then
+      write_fail_count 0
+      write_deps_pg_fail_count 0
+      wlog "复合健康绿,清失败计数"
+      emit_watch_status true "" true green || true
+      return 0
+    fi
+
+    if loud="$(classify_fail_loud)"; then
+      if [[ "$loud" == "deps-pg" ]]; then
+        local pg_count pg_thresh
+        pg_thresh="${WATCH_DEPS_PG_FAIL_THRESHOLD:-3}"
+        [[ "$pg_thresh" =~ ^[1-9][0-9]*$ ]] || pg_thresh=3
+        pg_count="$(read_deps_pg_fail_count)"
+        pg_count=$((pg_count + 1))
+        write_deps_pg_fail_count "$pg_count"
+        if (( pg_count < pg_thresh )); then
+          wlog "WARN deps-pg 瞬态探测异常 count=${pg_count}/${pg_thresh},未达 FAIL-LOUD 阈值,不回切也不停用"
+          emit_watch_status true "" true red || true
+          return 0
+        fi
+        wlog "FAIL-LOUD class=$loud 连续 ${pg_count}/${pg_thresh} 次,不自动回切"
+      else
+        write_deps_pg_fail_count 0
+        wlog "FAIL-LOUD class=$loud 不自动回切"
+      fi
+      write_manual_recovery "$loud"
+      write_disarm "$loud"
+      WATCH_DISARM_ALERTED=1
+      emit_watch_status false "$(suppression_reason_from_files)" true red || true
+      watch_alert critical fail_loud "FAIL-LOUD class=${loud}：不自动回切，已写停用标记与 manual-recovery。lease worker 的 autorecover 接管：依赖/现场恢复后稳定绿即自动归档标记并恢复保护；超时自动开工单派给 AI。"
+      return 0
+    fi
+
+    write_deps_pg_fail_count 0
+    count="$(read_fail_count)"
+    count=$((count + 1))
+    write_fail_count "$count"
+    wlog "复合健康红 count=$count/$WATCH_FAIL_THRESHOLD master_unit=$(unit_is_active "$WATCH_MASTER_UNIT" && echo active || echo down) egress_unit=$(unit_is_active "$WATCH_EGRESS_UNIT" && echo active || echo down)"
+
+    if (( count < WATCH_FAIL_THRESHOLD )); then
+      emit_watch_status true "" true red || true
+      return 0
+    fi
+
+    wlog "达到阈值,进入两级兜底"
+    watch_alert critical rollback_start "复合健康连续红 ${count}/${WATCH_FAIL_THRESHOLD}，开始两级兜底（tier1 回切上一份 release → tier2 恢复 unit）$(is_true_dry && echo '（WATCH_DRY 演练）')。"
+  fi
+
+  if (( skip_tier1 == 0 )); then
+    if prev_release_is_valid; then
+      local policy_tier_rc=0
+      tier1_rollback || policy_tier_rc=$?
+      if [[ "$policy_tier_rc" == 75 ]]; then
+        wlog "恢复锁忙或 policy hold,本拍等待"
+        emit_watch_status false recovery-wait true red || true
+        return 0
+      fi
+      if [[ "$policy_tier_rc" == 76 ]]; then
+        write_tier_pending tier1 "$(( $(watch_now) + 90 ))" "${WATCH_DEFERRED_STAGE:-egress-flip}" "${WATCH_DEFERRED_CUR:-}" "${WATCH_DEFERRED_TARGET:-}" || true
+        wlog "tier1 egress 步骤因本拍预算不足延至下一拍(stage=${WATCH_DEFERRED_STAGE:-egress-flip},保留旧槽 ${WATCH_DEFERRED_CUR:-none})"
+        emit_watch_status true tier1-egress-pending true red || true
+        return 0
+      fi
+      if [[ "$policy_tier_rc" == 0 ]]; then
         if is_true_dry || [[ "$WATCH_SKIP_ACTIONS" == 1 ]]; then
           wlog "tier1 dry 不计为转绿,不冻结(避免把演练当恢复)"
           emit_watch_status true "" true red || true
           return 0
         fi
-        write_fail_count 0
-        wlog "tier1 成功且转绿,冻结计数"
-        watch_alert critical tier1_rolled_back "tier1 已回切到上一份 release 并恢复复合健康绿。当前 live=$(readlink -f "$WATCH_LIVE" 2>/dev/null || echo unknown)。下一步：查出问题的那次发布。"
-        emit_watch_status true "" true green || true
-        return 0
+        budget_rem=$(( WATCH_TICK_DEADLINE - SECONDS ))
+        (( budget_rem < 0 )) && budget_rem=0
+        wait_now="$post_wait"
+        (( budget_rem < wait_now )) && wait_now="$budget_rem"
+        if watch_wait_ready_stable 0 "$wait_now"; then
+          clear_tier_pending
+          write_fail_count 0
+          write_deps_pg_fail_count 0
+          wlog "tier1 成功且转绿,冻结计数"
+          watch_alert critical tier1_rolled_back "tier1 已回切到上一份 release 并恢复复合健康绿。当前 live=$(readlink -f "$WATCH_LIVE" 2>/dev/null || echo unknown)。下一步：查出问题的那次发布。"
+          emit_watch_status true "" true green || true
+          return 0
+        fi
+        if (( wait_now < post_wait )); then
+          shortfall=$(( post_wait - wait_now ))
+          write_tier_pending tier1 "$(( $(watch_now) + shortfall ))" ready || true
+          wlog "tier1 本拍预算耗尽(已等 ${wait_now}s/${post_wait}s),持久化待复查交下一拍"
+          emit_watch_status true tier1-verify-pending true red || true
+          return 0
+        fi
+        wlog "tier1 回切后在启动等待窗口(${post_wait}s)内仍红,进入 tier2"
+        watch_alert critical tier1_still_red "tier1 回切后复合健康仍红，进入 tier2（恢复 unit）。"
       fi
-      wlog "tier1 回切后仍红,进入 tier2"
-      watch_alert critical tier1_still_red "tier1 回切后复合健康仍红，进入 tier2（恢复 worktree unit）。"
+    else
+      wlog "无上一份合法 release,跳过 tier1 直接 tier2"
+      watch_alert warning tier1_skipped "没有上一份合法 release，跳过 tier1，直接 tier2。"
     fi
-  else
-    wlog "无上一份合法 release,跳过 tier1 直接 tier2"
-    watch_alert warning tier1_skipped "没有上一份合法 release，跳过 tier1，直接 tier2。"
   fi
 
   local policy_tier2_rc=0
@@ -905,22 +1450,41 @@ watch_once() {
     emit_watch_status false recovery-wait true red || true
     return 0
   fi
+  if [[ "$policy_tier2_rc" == 76 ]]; then
+    write_tier_pending tier2 "$(( $(watch_now) + 90 ))" "${WATCH_DEFERRED_STAGE:-egress-flip}" "${WATCH_DEFERRED_CUR:-}" "${WATCH_DEFERRED_TARGET:-}" || true
+    wlog "tier2 egress 步骤因本拍预算不足延至下一拍(stage=${WATCH_DEFERRED_STAGE:-egress-flip},保留旧槽 ${WATCH_DEFERRED_CUR:-none})"
+    emit_watch_status true tier2-egress-pending true red || true
+    return 0
+  fi
   if [[ "$policy_tier2_rc" == 0 ]]; then
-    sleep 3
     if [[ "$WATCH_SKIP_ACTIONS" == 1 ]] || is_true_dry; then
       wlog "tier2 dry 完成"
       emit_watch_status true "" true red || true
       return 0
     fi
-    if compound_green; then
+    budget_rem=$(( WATCH_TICK_DEADLINE - SECONDS ))
+    (( budget_rem < 0 )) && budget_rem=0
+    wait_now="$post_wait"
+    (( budget_rem < wait_now )) && wait_now="$budget_rem"
+    if watch_wait_ready_stable 0 "$wait_now"; then
+      clear_tier_pending
       write_fail_count 0
+      write_deps_pg_fail_count 0
       wlog "tier2 成功且转绿,冻结计数"
-      watch_alert critical tier2_restored "tier2 已恢复 worktree unit 并转绿。下一步：确认 live 指向与 unit 来源，排查原因。"
+      watch_alert critical tier2_restored "tier2 已恢复 unit 并转绿。下一步：确认 live 指向与 unit 来源，排查原因。"
       emit_watch_status true "" true green || true
+      return 0
+    fi
+    if (( wait_now < post_wait )); then
+      shortfall=$(( post_wait - wait_now ))
+      write_tier_pending tier2 "$(( $(watch_now) + shortfall ))" ready || true
+      wlog "tier2 本拍预算耗尽(已等 ${wait_now}s/${post_wait}s),持久化待复查交下一拍"
+      emit_watch_status true tier2-verify-pending true red || true
       return 0
     fi
   fi
 
+  clear_tier_pending
   write_manual_recovery "tier1+tier2-failed"
   write_disarm "tier1+tier2-failed"
   wlog "两级兜底仍红,已 disarm。autorecover 接管(退避重试兜底,仍失败自动开工单派给 AI)。"
@@ -1017,14 +1581,19 @@ watch_rearm() {
   fi
   # 计数在锁内、全部检查通过之后才清;归档失败就恢复原值,拒绝时计数不变。
   old_count="$(read_fail_count)"
+  local old_pg_count
+  old_pg_count="$(read_deps_pg_fail_count)"
   dst="${WATCH_DISARM}.rearmed-$(date -u +%Y%m%dT%H%M%SZ)"
   if [[ -e "$dst" || -L "$dst" ]]; then
     exec 8<&-
     rearm_refuse "归档目标已存在: $dst"; return 1
   fi
   write_fail_count 0
+  write_deps_pg_fail_count 0
+  clear_tier_pending
   if ! mv -T -- "$WATCH_DISARM" "$dst" || [[ -e "$WATCH_DISARM" || ! -f "$dst" ]]; then
     write_fail_count "$old_count"
+    write_deps_pg_fail_count "$old_pg_count"
     exec 8<&-
     rearm_refuse "归档停用标记失败,失败计数已恢复为 $old_count"; return 1
   fi
@@ -1051,6 +1620,8 @@ watch_autoclear_markers() { # <how>
   fi
   if [[ -f "$WATCH_DISARM" && ! -L "$WATCH_DISARM" ]]; then
     write_fail_count 0
+    write_deps_pg_fail_count 0
+    clear_tier_pending
     dst="${WATCH_DISARM}.autorearmed-$ts"
     if mv -T -- "$WATCH_DISARM" "$dst"; then cleared="$cleared disarm"; fi
   fi
@@ -1078,11 +1649,45 @@ watch_stable_green() {
   done
 }
 
+# OCV5-818: Type=simple 网关在 systemctl restart 返回后需 ~20-45s 完成加载与监听;
+# 在启动宽限窗口内轮询等待就绪再判成败,避免 tier1 在未 ready 时误判失败直接跌入 tier2。
+watch_wait_ready_stable() { # <require_deps_pg: 0|1> [wait_sec]
+  local require_pg="${1:-1}"
+  local wait_sec="${2:-${WATCH_POST_RESTART_WAIT_SEC:-${WATCH_GRACE_SEC:-90}}}"
+  local poll_sec="${WATCH_POST_RESTART_POLL_SEC:-3}"
+  local deadline rem sl
+  [[ "$wait_sec" =~ ^[0-9]+$ ]] || wait_sec=90
+  [[ "$poll_sec" =~ ^[0-9]+$ ]] || poll_sec=3
+  deadline=$(( SECONDS + wait_sec ))
+  while true; do
+    WATCH_LAST_MASTER_BODY=""
+    if compound_green && { [[ "$require_pg" != 1 ]] || master_deps_pg_ok; }; then
+      if [[ "$require_pg" == 1 ]]; then
+        if watch_stable_green; then
+          return 0
+        fi
+      else
+        return 0
+      fi
+    fi
+    if (( SECONDS >= deadline )); then
+      return 1
+    fi
+    rem=$(( deadline - SECONDS ))
+    sl="$poll_sec"
+    (( sl <= 0 )) && sl=1
+    (( sl > rem )) && sl="$rem"
+    sleep "$sl"
+  done
+}
+
 watch_auto_recover() { # [--probe-only]
   release_policy_context_absent || { echo "AUTORECOVER_WAIT release-policy-hold"; return 75; }
-  local probe_only=0 loud tier=""
+  local probe_only=0 loud tier="" post_wait
+  post_wait="${WATCH_POST_RESTART_WAIT_SEC:-${WATCH_GRACE_SEC:-90}}"
   [[ "${1:-}" == --probe-only ]] && probe_only=1
   if is_true_dry; then echo "AUTORECOVER_SKIP dry"; return 75; fi
+  if [[ "$WATCH_SKIP_ACTIONS" == 1 ]]; then echo "AUTORECOVER_SKIP skip-actions"; return 75; fi
   mkdir -p -- "$(dirname -- "$WATCH_LOCK")"
   if [[ ! -e "$WATCH_LOCK" && ! -L "$WATCH_LOCK" ]]; then
     ( umask 077; set -C; : >"$WATCH_LOCK" ) 2>/dev/null || true
@@ -1107,12 +1712,10 @@ watch_auto_recover() { # [--probe-only]
   fi
   wlog "autorecover: 复合健康红,执行两级兜底"
   if prev_release_is_valid && tier1_rollback; then
-    sleep 3
-    watch_stable_green && tier=tier1
+    watch_wait_ready_stable 1 "$post_wait" && tier=tier1
   fi
   if [[ -z "$tier" ]] && tier2_restore_units; then
-    sleep 3
-    watch_stable_green && tier=tier2
+    watch_wait_ready_stable 1 "$post_wait" && tier=tier2
   fi
   if [[ -n "$tier" ]]; then
     watch_autoclear_markers "$tier 恢复后稳定绿" || { exec 8<&-; echo "AUTORECOVER_STILL_RED markers"; return 1; }
@@ -1410,35 +2013,135 @@ host_autosave_check() {
   host_notify harness_autosave "$level" warning harness_autosave_unhealthy "$msg"
 }
 
-host_checks() {
-  local gib=1073741824 avail level sev age desc
-  avail="$(host_disk_avail_bytes || true)"
-  if [[ "$avail" =~ ^[0-9]+$ ]]; then
-    level=ok
-    sev=info
-    if (( avail < WATCH_DISK_CRIT_GIB * gib )); then
-      level=critical
-      sev=critical
-    elif (( avail < WATCH_DISK_WARN_GIB * gib )); then
-      level=warning
-      sev=warning
-    fi
-    host_notify disk "$level" "$sev" disk_low "根盘 ${WATCH_DISK_PATH} 剩余 $(( avail / gib )) GiB（warning <${WATCH_DISK_WARN_GIB}、critical <${WATCH_DISK_CRIT_GIB} GiB；发布门要 8 GiB）。下一步：du -xsh /opt/openclaude/tmp /var/lib/docker/volumes/* /var/backups/* 找增长源；只清自己建的 worktree 与临时文件。"
+# OCV5-823: PG 备份健康探针（core/full 新鲜度 + skipped_over_cap/aborted_over_cap 异常告警）。
+# 纯只读告警，绝不改健康判定、失败计数或 watch 退出码。可通过 WATCH_PG_BACKUP_PROBE_ENABLED=0 关闭。
+host_pg_backup_check() {
+  case "${WATCH_PG_BACKUP_PROBE_ENABLED:-1}" in
+    0|false|no|off) return 0 ;;
+  esac
+  local f="$WATCH_PG_BACKUP_STATUS"
+  [[ -f "$f" && ! -L "$f" ]] || return 0
+
+  if ! jq -e 'type == "object"' "$f" >/dev/null 2>&1; then
+    host_notify pg_backup stale warning pg_backup_stale \
+      "个人版 PG 备份状态文件不可解析（${f}）。下一步：/opt/openclaude/openclaude-v5-selfhost-live/scripts/v5-selfhost-pg-backup.sh status；journalctl -u openclaude-v5-selfhost-pg-backup.service。"
+    return 0
   fi
+
+  local now max_core_age max_full_age alert_over_cap=1
+  now="$(watch_now)"
+  max_core_age="${WATCH_PG_BACKUP_MAX_AGE_SEC:-129600}"
+  [[ "$max_core_age" =~ ^[0-9]+$ ]] || max_core_age=129600
+  max_full_age="${WATCH_PG_FULL_BACKUP_MAX_AGE_SEC:-864000}"
+  [[ "$max_full_age" =~ ^[0-9]+$ ]] || max_full_age=864000
+  case "${WATCH_PG_BACKUP_ALERT_OVER_CAP:-1}" in
+    0|false|no|off) alert_over_cap=0 ;;
+  esac
+
+  # 1) core 层新鲜度 + 异常
+  local age core_result core_level core_sev core_event desc
+  core_result="$(jq -r '.core.result // empty' "$f" 2>/dev/null || true)"
   age="$(host_backup_age || true)"
   if [[ -n "$age" ]]; then
-    level=ok
+    core_level=ok
+    core_sev=warning
+    core_event=pg_backup_stale
     if [[ "$age" == never ]]; then
-      level=stale
+      core_level=stale
       desc="从未成功"
     else
+      (( age < 0 )) && age=0
       desc="$(( age / 3600 )) 小时前"
-      (( age > WATCH_PG_BACKUP_MAX_AGE_SEC )) && level=stale
+      (( age > max_core_age )) && core_level=stale
     fi
-    host_notify pg_backup "$level" warning pg_backup_stale "个人版 PG 备份 core 层最近成功：${desc}（上限 $(( WATCH_PG_BACKUP_MAX_AGE_SEC / 3600 )) 小时）。下一步：/opt/openclaude/openclaude-v5-selfhost-live/scripts/v5-selfhost-pg-backup.sh status；journalctl -u openclaude-v5-selfhost-pg-backup.service。"
+    if (( alert_over_cap )) && [[ "$core_result" == skipped_over_cap || "$core_result" == aborted_over_cap ]]; then
+      if [[ "$core_level" == stale ]]; then
+        core_level=over_cap_stale
+        core_sev=critical
+      else
+        core_level=over_cap
+        core_sev=warning
+      fi
+      core_event=pg_backup_over_cap
+    fi
+    host_notify pg_backup "$core_level" "$core_sev" "$core_event" \
+      "个人版 PG 备份 core 层最近成功：${desc}（result=${core_result:-unknown}，上限 $(( max_core_age / 3600 )) 小时）。下一步：/opt/openclaude/openclaude-v5-selfhost-live/scripts/v5-selfhost-pg-backup.sh status；journalctl -u openclaude-v5-selfhost-pg-backup.service。"
   fi
-  host_autosave_check || true
+
+  # 2) full 全备层新鲜度 + skipped_over_cap / aborted_over_cap 异常（未配置/缺失则静默跳过）
+  if jq -e '.full | type == "object"' "$f" >/dev/null 2>&1; then
+    local full_result full_last_ok full_at full_compress full_epoch="" full_age=0 full_stale=0 full_over_cap=0
+    local full_level=ok full_sev=info full_event=pg_backup_full full_desc="" full_msg=""
+    full_result="$(jq -r '.full.result // empty' "$f" 2>/dev/null || true)"
+    if [[ "$full_result" != unconfigured ]]; then
+      full_last_ok="$(jq -r '.full.lastOkAt // empty' "$f" 2>/dev/null || true)"
+      full_at="$(jq -r '.full.at // empty' "$f" 2>/dev/null || true)"
+      full_compress="$(jq -r '.full.compress // empty' "$f" 2>/dev/null || true)"
+      if [[ -n "$full_last_ok" ]]; then
+        full_epoch="$(date -u -d "$full_last_ok" +%s 2>/dev/null || true)"
+      fi
+      if [[ "$full_epoch" =~ ^[0-9]+$ ]]; then
+        full_age=$(( now - full_epoch ))
+        (( full_age < 0 )) && full_age=0
+        full_desc="$(( full_age / 86400 )) 天前（$(( full_age / 3600 )) 小时）"
+        (( full_age > max_full_age )) && full_stale=1
+      else
+        full_stale=1
+        full_desc="从未成功"
+      fi
+      if (( alert_over_cap )) && [[ "$full_result" == skipped_over_cap || "$full_result" == aborted_over_cap ]]; then
+        full_over_cap=1
+      fi
+      if (( full_over_cap && full_stale )); then
+        full_level=over_cap_stale
+        full_sev=critical
+        full_event=pg_backup_full_over_cap
+      elif (( full_over_cap )); then
+        full_level=over_cap
+        full_sev=warning
+        full_event=pg_backup_full_over_cap
+      elif (( full_stale )); then
+        full_level=stale
+        full_sev=warning
+        full_event=pg_backup_full_stale
+      elif [[ "$full_result" == failed || "$full_result" == sink_missing ]]; then
+        full_level=failed
+        full_sev=warning
+        full_event=pg_backup_full_failed
+      fi
+      full_msg="个人版 PG 全备 full 层状态：result=${full_result:-unknown}，最近成功：${full_desc}（上限 $(( max_full_age / 86400 )) 天 / $(( max_full_age / 3600 )) 小时${full_at:+，最近尝试=${full_at}}${full_compress:+，compress=${full_compress}}）。下一步：/opt/openclaude/openclaude-v5-selfhost-live/scripts/v5-selfhost-pg-backup.sh status；检查 R2 桶配额与 V5SB_FULL_COMPRESS。"
+      host_notify pg_backup_full "$full_level" "$full_sev" "$full_event" "$full_msg"
+    fi
+  fi
+
+  # 3) coreOffsite 异地核心备份异常探针
+  if jq -e '.coreOffsite | type == "object"' "$f" >/dev/null 2>&1; then
+    local offsite_result offsite_last_ok
+    offsite_result="$(jq -r '.coreOffsite.result // empty' "$f" 2>/dev/null || true)"
+    offsite_last_ok="$(jq -r '.coreOffsite.lastOkAt // empty' "$f" 2>/dev/null || true)"
+    if (( alert_over_cap )) && [[ "$offsite_result" == skipped_over_cap || "$offsite_result" == aborted_over_cap ]]; then
+      host_notify pg_backup_offsite over_cap warning pg_backup_offsite_over_cap \
+        "个人版 PG 备份 coreOffsite 触发容量上限：result=${offsite_result}（lastOkAt=${offsite_last_ok:-never}）。下一步：检查 R2 桶配额与旧对象，/opt/openclaude/openclaude-v5-selfhost-live/scripts/v5-selfhost-pg-backup.sh status。"
+    elif [[ "$offsite_result" == failed ]]; then
+      host_notify pg_backup_offsite failed warning pg_backup_offsite_failed \
+        "个人版 PG 备份 coreOffsite 上传失败：result=${offsite_result}（lastOkAt=${offsite_last_ok:-never}）。下一步：/opt/openclaude/openclaude-v5-selfhost-live/scripts/v5-selfhost-pg-backup.sh status；journalctl -u openclaude-v5-selfhost-pg-backup.service。"
+    elif [[ "$offsite_result" == ok || "$offsite_result" == ok_usage_warn ]]; then
+      host_notify pg_backup_offsite ok info pg_backup_offsite \
+        "个人版 PG 备份 coreOffsite 状态正常（result=${offsite_result}，lastOkAt=${offsite_last_ok:-unknown}）。"
+    fi
+  fi
   return 0
+}
+
+host_checks() {
+  local gib=1073741824 avail level=ok sev=info
+  avail="$(host_disk_avail_bytes || true)"
+  if [[ "$avail" =~ ^[0-9]+$ ]]; then
+    if (( avail < WATCH_DISK_CRIT_GIB * gib )); then level=critical; sev=critical
+    elif (( avail < WATCH_DISK_WARN_GIB * gib )); then level=warning; sev=warning; fi
+    host_notify disk "$level" "$sev" disk_low "根盘 ${WATCH_DISK_PATH} 剩余 $(( avail / gib )) GiB（warning <${WATCH_DISK_WARN_GIB}、critical <${WATCH_DISK_CRIT_GIB} GiB；发布门要 8 GiB）。下一步：du -xsh /opt/openclaude/tmp /var/lib/docker/volumes/* /var/backups/* 找增长源；只清自己建的 worktree 与临时文件。"
+  fi
+  host_pg_backup_check || true; host_autosave_check || true; return 0
 }
 
 usage_watch() {
@@ -1501,19 +2204,10 @@ main() {
     --release-policy-probe) watch_release_policy_probe ;;
     -h|--help) usage_watch; exit 0 ;;
     --selftest) watch_selftest ;;
-    # 本拍(含 set -e 中断)结束时投递已入队告警;保留原退出码。不用 `|| rc=$?`,
-    # 那会让 watch_once 内部的 set -e 全部失效。
     --once|"") trap 'watch_exit_rc=$?; watch_alert_flush; exit "$watch_exit_rc"' EXIT; host_checks || true; watch_once ;;
     --rearm) trap 'watch_exit_rc=$?; watch_alert_flush; exit "$watch_exit_rc"' EXIT; watch_rearm ;;
     --auto-recover) trap 'watch_exit_rc=$?; watch_alert_flush; exit "$watch_exit_rc"' EXIT; watch_auto_recover "${2:-}" ;;
-    *)
-      echo "未知参数: $1" >&2
-      usage_watch >&2
-      exit 2
-      ;;
+    *) echo "未知参数: $1" >&2; usage_watch >&2; exit 2 ;;
   esac
 }
-
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-  main "${1:-}" "${2:-}"
-fi
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "${1:-}" "${2:-}"; fi

@@ -606,3 +606,17 @@ function _sqliteDeleteClientSessionSync(
   db.prepare('DELETE FROM turn_dispatch_inbox WHERE session_id = ?').run(id)
   return true
 }
+
+export type ClientSessionOwnership = 'owner' | 'forbidden' | 'not_found'
+
+export async function _sqliteVerifyClientSessionOwnership(
+  id: string,
+  expectedUserId: string,
+): Promise<ClientSessionOwnership> {
+  const db = await getSessionsDb()
+  const row = db
+    .prepare('SELECT user_id FROM client_sessions WHERE id = ? AND deleted_at IS NULL LIMIT 1')
+    .get(id) as { user_id: string } | undefined
+  if (!row) return 'not_found'
+  return row.user_id === expectedUserId ? 'owner' : 'forbidden'
+}

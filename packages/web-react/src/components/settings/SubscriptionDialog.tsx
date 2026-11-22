@@ -1,4 +1,4 @@
-import { ArrowUpCircle, Check, Loader2, RefreshCw } from "lucide-react";
+import { ArrowUpCircle, Check, Crown, Loader2, RefreshCw, Sparkles } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
 import { reportClientFrictionOnce } from "../../lib/clientFriction";
@@ -11,7 +11,7 @@ import {
 import type { AuthSession, HupiCreateResult, MySubscription, SubscriptionPlanWire } from "../../lib/types";
 import { cn, formatCentsYuan, formatCredits } from "../../lib/utils";
 import { HupijiaoPaymentEntry } from "../payment/HupijiaoPaymentEntry";
-import { Alert, Button, Modal, Spinner, useConfirm } from "../ui";
+import { Alert, Badge, Button, Modal, Spinner, useConfirm } from "../ui";
 
 // 预选意图 / 最近已付费 的模块级状态已下沉到 lib/subscribeIntent(首屏同步渲染的红卡从那里读,
 // 不再把本弹窗拖进入口闭包);此处 re-export 供 AccountTab / 测试等既有引用继续使用。
@@ -282,20 +282,27 @@ export function SubscriptionDialog({
             )}
 
             {!loading && sub && (
-              <div className="rounded-xl border border-border bg-bg px-4 py-3">
-                <div className="flex items-center justify-between">
-                  <span className="text-body text-muted">当前套餐</span>
+              <div className="oc-surface-recessed rounded-xl p-3.5">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="oc-icon-badge oc-icon-badge-accent h-7 w-7 rounded-sm" aria-hidden>
+                      <Crown size={14} strokeWidth={1.75} />
+                    </span>
+                    <span className="text-body font-medium text-muted">当前套餐</span>
+                  </div>
                   <span className="text-title font-semibold text-fg">{sub.planName}</span>
                 </div>
                 {/* 两段都不许从中间折行(390px 下日期曾断成「2026-09-」「20」,审计 SET-18);放不下就整段换行。 */}
-                <div className="mt-1.5 flex flex-wrap items-center justify-between gap-x-3 gap-y-0.5 text-meta text-faint">
+                <div className="mt-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-0.5 text-meta tabular-nums text-faint">
                   <span className="whitespace-nowrap">本期到期 {fmtDate(sub.periodEnd)}</span>
                   <span className="whitespace-nowrap">
                     期内 {formatCredits(sub.periodCredits)} · 钱包 {formatCredits(sub.balance.wallet)}
                   </span>
                 </div>
-                <div className="mt-1 text-meta text-accent">
-                  总可用 {formatCredits(sub.balance.total)} 积分
+                <div className="mt-2 flex items-center">
+                  <span className="oc-badge-craft inline-flex items-center rounded-full bg-accent-soft px-2.5 py-0.5 text-caption font-semibold tabular-nums text-accent">
+                    总可用 {formatCredits(sub.balance.total)} 积分
+                  </span>
                 </div>
               </div>
             )}
@@ -323,20 +330,20 @@ export function SubscriptionDialog({
                     key={p.code}
                     data-preselected={preselected ? "lite" : undefined}
                     className={cn(
-                      "flex items-center justify-between gap-3 rounded-xl border px-4 py-3",
-                      isCurrent || preselected ? "border-accent bg-accent-soft" : "border-border bg-surface",
+                      "oc-surface-card oc-surface-card-hover flex items-center justify-between gap-3 rounded-xl px-4 py-3.5",
+                      (isCurrent || preselected) && "border-accent/45 bg-accent-soft/60",
                     )}
                   >
                     <div className="min-w-0">
                       <div className="flex items-center gap-2">
                         <span className="text-title font-semibold text-fg">{p.name}</span>
                         {isCurrent && (
-                          <span className="rounded-full bg-accent px-1.5 py-0.5 text-micro font-medium text-accent-fg">
+                          <Badge tone="accent" size="sm">
                             当前
-                          </span>
+                          </Badge>
                         )}
                       </div>
-                      <div className="mt-0.5 text-meta text-faint">
+                      <div className="mt-0.5 text-meta tabular-nums text-faint">
                         {isFree ? "免费" : `${formatCentsYuan(p.priceCents)}/月`} · 每月{" "}
                         {formatCredits(p.monthlyCredits)} 积分
                       </div>
@@ -352,7 +359,7 @@ export function SubscriptionDialog({
                         {busy ? (
                           <Loader2 size={14} className="animate-spin" />
                         ) : isUpgrade ? (
-                          <ArrowUpCircle size={14} />
+                          <ArrowUpCircle size={14} strokeWidth={1.75} />
                         ) : null}
                         {action}
                       </Button>
@@ -371,17 +378,22 @@ export function SubscriptionDialog({
               <div
                 data-preselected={intent === "pack" ? "pack" : undefined}
                 className={cn(
-                  "flex items-center justify-between gap-3 rounded-xl border border-dashed px-4 py-3",
+                  "oc-surface-card-hover flex items-center justify-between gap-3 rounded-xl border border-dashed px-4 py-3.5",
                   intent === "pack"
-                    ? "border-accent bg-accent-soft"
-                    : "border-border-strong bg-bg",
+                    ? "border-accent/55 bg-accent-soft/60"
+                    : "border-border-strong bg-bg/70",
                 )}
               >
-                <div className="min-w-0">
-                  <div className="text-title font-semibold text-fg">积分加量包</div>
-                  <div className="mt-0.5 text-meta text-faint">
-                    ¥{TOPUP_PACK.price} 加 {TOPUP_PACK.credits.toLocaleString("zh-CN")} 积分 ·
-                    仅当前套餐有效期内可用
+                <div className="flex min-w-0 items-start gap-2.5">
+                  <span className="oc-icon-badge oc-icon-badge-accent mt-0.5 h-7 w-7 rounded-sm" aria-hidden>
+                    <Sparkles size={14} strokeWidth={1.75} />
+                  </span>
+                  <div className="min-w-0">
+                    <div className="text-title font-semibold text-fg">积分加量包</div>
+                    <div className="mt-0.5 text-meta tabular-nums text-faint">
+                      ¥{TOPUP_PACK.price} 加 {TOPUP_PACK.credits.toLocaleString("zh-CN")} 积分 ·
+                      仅当前套餐有效期内可用
+                    </div>
                   </div>
                 </div>
                 <Button
@@ -397,7 +409,7 @@ export function SubscriptionDialog({
               </div>
             )}
 
-            <p className="text-[11.5px] leading-relaxed text-faint">
+            <p className="text-caption leading-relaxed text-faint">
               扫码支付即时开通。升档按新旧套餐差价计费、周期不变；续费/订阅重置当期积分并顺延一个计费周期。
               套餐积分为「当月使用」，到期未续将降级免费版
               {freePlan ? `（每月 ${formatCredits(freePlan.monthlyCredits)} 积分）` : ""}
@@ -408,7 +420,9 @@ export function SubscriptionDialog({
 
         {stage.kind === "qr" && (
           <div className="flex flex-col items-center gap-3">
-            <div className="text-center text-meta text-faint">{stage.note}</div>
+            <Badge tone="accent" size="sm">
+              {stage.note}
+            </Badge>
             <HupijiaoPaymentEntry
               qrcodeUrl={stage.order.qrcodeUrl}
               mobileUrl={stage.order.mobileUrl}
@@ -419,15 +433,15 @@ export function SubscriptionDialog({
               token={auth.snapshot().token}
             />
             <Button variant="ghost" size="sm" onClick={backToPlans} className="text-muted">
-              <RefreshCw size={14} /> 返回套餐
+              <RefreshCw size={14} strokeWidth={1.75} /> 返回套餐
             </Button>
           </div>
         )}
 
         {stage.kind === "paid" && (
-          <div className="flex flex-col items-center gap-3 py-4 text-center">
-            <span className="flex size-12 items-center justify-center rounded-full bg-success-soft text-success">
-              <Check size={26} />
+          <div className="flex flex-col items-center gap-3 py-5 text-center">
+            <span className="oc-icon-badge oc-icon-badge-success size-12 rounded-2xl">
+              <Check size={24} strokeWidth={2} />
             </span>
             <div className="text-title font-semibold text-fg">{stage.note} 成功</div>
             <p className="text-meta text-faint">套餐与积分已更新，感谢你的支持。</p>

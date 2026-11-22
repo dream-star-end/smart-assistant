@@ -58,6 +58,7 @@ import { IdentityAssetsError, isIdentityAssetsError } from './identityCompatAsse
 
 export const MAX_SKILL_NAME_LENGTH = 64
 export const MAX_SKILL_DESCRIPTION_LENGTH = 1024
+export const MAX_SKILL_HISTORY_VERSIONS = 5
 
 export const SKILL_PRIORITY_MIN = -100
 export const SKILL_PRIORITY_MAX = 100
@@ -1282,6 +1283,7 @@ export class SkillStore {
         await rm(tmpSnap, { force: true }).catch(() => {})
         throw err
       }
+      await pruneSkillHistoryDir(realHistoryDir, realRoot0, MAX_SKILL_HISTORY_VERSIONS).catch(() => {})
     }
 
     // Auto-bump patch version if caller didn't specify
@@ -1781,4 +1783,70 @@ export async function isPlatformReservedSkillName(name: string): Promise<boolean
     if (existsSync(join(paths.agentSeedSkillsDir(entry.name), name, 'SKILL.md'))) return true
   }
   return false
+}
+
+/**
+ * Rolling retention for `skills/<name>/history/<semver>.md`: keep only the newest
+ * `maxVersions` semver snapshots (default 5) and remove older regular files safely
+ * within `rootDir`. Never follows symlinks or deletes outside `rootDir`.
+ */
+export async function pruneSkillHistoryDir(
+  historyDir: string,
+  rootDir: string,
+  maxVersions = MAX_SKILL_HISTORY_VERSIONS,
+  opts?: { dryRun?: boolean },
+): Promise<{ pruned: number; bytesFreed: number; prunedFiles: string[] }> {
+  const keep = Math.max(1, Math.floor(maxVersions))
+  if (!existsSync(historyDir) || !existsSync(rootDir)) {
+    return { pruned: 0, bytesFreed: 0, prunedFiles: [] }
+  }
+  let realHistory: string
+  let realRoot: string
+  try {
+    realHistory = await realpath(historyDir)
+    realRoot = await realpath(rootDir)
+  } catch {
+    return { pruned: 0, bytesFreed: 0, prunedFiles: [] }
+  }
+  if (!realHistory.startsWith(realRoot + sep)) {
+    return { pruned: 0, bytesFreed: 0, prunedFiles: [] }
+  }
+  let entries: string[]
+  try {
+    entries = await readdir(realHistory)
+  } catch {
+    return { pruned: 0, bytesFreed: 0, prunedFiles: [] }
+  }
+  const versions: Array<{ version: string; file: string; fullPath: string }> = []
+  for (const entry of entries) {
+    if (!entry.endsWith('.md') || entry.startsWith('.')) continue
+    const version = entry.slice(0, -3)
+    if (!isValidVersion(version)) continue
+    versions.push({ version, file: entry, fullPath: join(realHistory, entry) })
+  }
+  if (versions.length <= keep) {
+    return { pruned: 0, bytesFreed: 0, prunedFiles: [] }
+  }
+  versions.sort((a, b) => compareSemver(b.version, a.version))
+  const excess = versions.slice(keep)
+  let pruned = 0
+  let bytesFreed = 0
+  const prunedFiles: string[] = []
+  for (const item of excess) {
+    try {
+      const st = await lstat(item.fullPath)
+      if (st.isSymbolicLink() || !st.isFile()) continue
+      const realItem = await realpath(item.fullPath)
+      if (!realItem.startsWith(realHistory + sep)) continue
+      if (!opts?.dryRun) {
+        await rm(realItem, { force: true })
+      }
+      pruned += 1
+      bytesFreed += st.size
+      prunedFiles.push(item.file)
+    } catch {
+      // Ignore concurrent removal
+    }
+  }
+  return { pruned, bytesFreed, prunedFiles }
 }

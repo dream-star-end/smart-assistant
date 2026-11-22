@@ -873,7 +873,7 @@ describe("permission 审批", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  test("同数组 live push 出现 dock；settle 后消失；dock 重开不发 permission_response", async () => {
+  test("同数组 live push 自动弹框；不渲染冗余吸顶 dock；settle 后关闭不发 permission_response", async () => {
     const onRespond = vi.fn();
     const messages: ChatMessage[] = [
       mk("user", { id: "u-live", text: "问", ts: Date.now() }),
@@ -895,18 +895,18 @@ describe("permission 审批", () => {
     view.rerender(
       <MessageList messages={messages} sending cb={{}} onRespondPermission={onRespond} />,
     );
-    expect(screen.getByTestId("pending-permission-dock")).toBeInTheDocument();
+    expect(screen.queryByTestId("pending-permission-dock")).toBeNull();
     await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
     messages[1]!._resolved = true;
     messages[1]!._behavior = "allow";
     view.rerender(
       <MessageList messages={messages} sending cb={{}} onRespondPermission={onRespond} />,
     );
-    expect(screen.queryByTestId("pending-permission-dock")).toBeNull();
+    expect(screen.queryByTestId("pending-approval-bar")).toBeNull();
     expect(onRespond).not.toHaveBeenCalled();
   });
 
-  test("权限卡被虚拟化卸载时 dock 仍打开同一请求且不 decide", async () => {
+  test("权限卡被虚拟化卸载时离屏唯一悬浮条仍打开同一请求且不 decide", async () => {
     const onRespond = vi.fn();
     const filler = Array.from({ length: 120 }, (_, i) =>
       mk("assistant", { id: `fill-${i}`, text: `正文 ${i}`, ts: Date.now() - 120_000 + i }),
@@ -927,11 +927,12 @@ describe("permission 审批", () => {
         onRespondPermission={onRespond}
       />,
     );
-    expect(screen.getByTestId("pending-permission-dock")).toBeInTheDocument();
+    expect(screen.queryByTestId("pending-permission-dock")).toBeNull();
     await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "关闭" }));
     expect(screen.queryByRole("dialog")).toBeNull();
-    fireEvent.click(screen.getByTestId("pending-permission-dock").querySelector("button")!);
+    expect(screen.getByTestId("pending-approval-bar")).toBeInTheDocument();
+    fireEvent.click(within(screen.getByTestId("pending-approval-bar")).getByRole("button", { name: "打开" }));
     await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
     expect(onRespond).not.toHaveBeenCalled();
   });
@@ -1986,10 +1987,10 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
         }}
       />,
     );
-    await waitFor(() => expect(screen.getByRole("button", { name: "加载失败，点击继续" })).toBeTruthy());
+    await waitFor(() => expect(screen.getByRole("button", { name: "加载失败，点击重试" })).toBeTruthy());
     expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("button", { name: "加载更早的处理步骤" })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "加载失败，点击继续" }));
+    fireEvent.click(screen.getByRole("button", { name: "加载失败，点击重试" }));
     await waitFor(() => expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(2));
   });
 
@@ -2157,7 +2158,7 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     );
     expect(screen.getByText("正常用户问题")).toBeInTheDocument();
     expect(screen.getByText("正常助手回复")).toBeInTheDocument();
-    expect(screen.getByText("此条消息缺少 id，已跳过渲染")).toBeInTheDocument();
+    expect(screen.getByText("该条内容暂时无法显示")).toBeInTheDocument();
   });
 
   test("生产滚动容器尚未绑定时不先挂载整个超长会话", () => {
@@ -2170,7 +2171,7 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
         scrollParent={null}
       />,
     );
-    expect(screen.getByRole("status")).toHaveTextContent("正在准备会话");
+    expect(screen.queryByText("正在准备会话…")).toBeNull();
     expect(screen.queryByText("m0")).toBeNull();
     expect(screen.queryByText("m9999")).toBeNull();
   });
@@ -2332,9 +2333,9 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     expect(document.body.textContent).toContain(marker);
   });
 
-  test("计划卡保留易读体验，同时可查看 immutable tape 的完整事件序列", () => {
+  test("计划卡普通流隐藏原始记录开关，仅只读/调试态保留完整事件序列入口", () => {
     const marker = "EXACT_PLAN_EVENT_HISTORY_MARKER";
-    renderMsg({
+    const planMsg: ChatMessage = {
       id: "plan-tape-1",
       role: "plan",
       text: "执行计划",
@@ -2346,9 +2347,13 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
         { kind: "plan", partial: true, future_field: marker },
         { kind: "plan", partial: false, steps: [{ step: "完成修复", status: "completed" }] },
       ],
-    });
-
+    };
+    renderMsg(planMsg);
     expect(screen.getByText("完成修复")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "查看原始计划记录" })).toBeNull();
+
+    cleanup();
+    renderMsg(planMsg, { readOnly: true });
     expect(document.body.textContent).not.toContain(marker);
     fireEvent.click(screen.getByRole("button", { name: "查看原始计划记录" }));
     expect(document.body.textContent).toContain(marker);
@@ -2432,10 +2437,10 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     expect(button).toHaveAttribute("aria-busy", "true");
   });
 
-  test("云端加载失败 → 按钮显示「加载失败，点击继续」且可点(重试)", async () => {
+  test("云端加载失败 → 按钮显示「加载失败，点击重试」且可点(重试)", async () => {
     const onLoadOlder = vi.fn();
     renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5, error: true, onLoadOlder });
-    const btn = screen.getByRole("button", { name: /加载失败，点击继续/ });
+    const btn = screen.getByRole("button", { name: /加载失败，点击重试/ });
     expect(btn).not.toBeDisabled();
     fireEvent.click(btn);
     await waitFor(() => expect(onLoadOlder).toHaveBeenCalledTimes(1));
@@ -2658,7 +2663,7 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
       { container: scroller },
     );
     expect(screen.getByLabelText("生成中")).toBeInTheDocument();
-    expect(screen.getByLabelText("正在加载会话内容")).toBeInTheDocument();
+    expect(screen.queryByLabelText("正在加载会话内容")).toBeNull();
   });
 
   test("新会话首条 optimistic 行走普通 DOM 短列表", () => {
@@ -3385,21 +3390,23 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
   });
 });
 
-describe("context_rebuilt system 提示行(§3.3/§5,复用 SystemCard 灰字样式)", () => {
-  test("role:'system' 上下文重建行 → 居中灰字提示渲染(不新造样式)", () => {
+describe("context_rebuilt system 提示行(P0-5 降噪为极简人话分割线)", () => {
+  test("role:'system' 上下文重建行 → 极简人话分割线渲染，不再重复引擎实现细节", () => {
     const text = "已重新加载会话上下文（最近 40 条对话摘要）。更早的细节助手可能记不全，如需引用旧内容可直接粘贴。";
     render(
       <MessageList
         messages={[
           mk("user", { id: "u1", text: "继续" }),
-          mk("system", { id: "sys-ctx", text }),
+          mk("system", { id: "sys-ctxrebuild-s1-n1", text }),
         ]}
         sending={false}
         cb={{}}
         onRespondPermission={() => {}}
       />,
     );
-    expect(screen.getByText(text)).toBeInTheDocument();
+    const divider = screen.getByTestId("context-rebuilt-divider");
+    expect(divider).toHaveTextContent("已衔接近期对话，可继续交流");
+    expect(screen.queryByText(/实时内容未完全加载/)).toBeNull();
   });
 });
 
@@ -3664,6 +3671,15 @@ describe("主时间线回到底部 FAB", () => {
     expect(btn).toHaveAttribute("aria-label", "回到底部");
     expect(btn).toHaveAttribute("tabindex", "0");
     expect(btn.className).not.toContain("pointer-events-none");
+    expect(btn.className).toContain("bg-elevated/90");
+    expect(btn.className).toContain("border-border-control");
+    expect(btn.className).toContain("backdrop-blur-md");
+    expect(btn.className).toContain("left-1/2");
+    expect(btn.className).toContain("-translate-x-1/2");
+    expect(btn.className).not.toContain("right-0");
+    expect(btn.className).not.toContain("bg-fg");
+    const topFade = screen.getByTestId("timeline-top-fade");
+    expect(topFade).toHaveClass("pointer-events-none", "sticky", "top-0", "h-3", "-mb-3", "bg-gradient-to-b", "from-bg");
     expect(screen.getByTestId("scroll-to-bottom-dock")).toHaveAttribute("data-visible", "true");
     jumpToBottom.mockClear();
     fireEvent.click(btn);
@@ -4488,7 +4504,7 @@ test("real MessageList keeps one Continue on a terminal error before trailing tr
   expect(screen.getByText("已完成前半段")).toBeInTheDocument();
 });
 
-test("system callback user turn renders as centered gray single-line notice with click-to-expand details", () => {
+test("system callback user turn renders as lightweight divider without exposing raw prompt by default", () => {
   const rawCallbackText = [
     "[系统通知 · 自进化租约列车结果]",
     "租约: ls-20261104T194918Z-7edb9cb07a72",
@@ -4500,7 +4516,7 @@ test("system callback user turn renders as centered gray single-line notice with
     text: rawCallbackText,
     status: "sent",
   });
-  render(
+  const { rerender } = render(
     <MessageList
       messages={[callbackMsg]}
       sending={true}
@@ -4510,11 +4526,25 @@ test("system callback user turn renders as centered gray single-line notice with
   );
   expect(screen.getByTestId("system-callback-row")).toBeInTheDocument();
   expect(screen.queryByTestId("user-row")).not.toBeInTheDocument();
-  expect(screen.getByText("系统回调 · 发布列车未通过，Agent 正在处理")).toBeInTheDocument();
+  const summaryEl = screen.getByTestId("system-callback-summary");
+  expect(summaryEl.textContent ?? "").not.toContain("系统回调");
   expect(screen.queryByText(/ls-20261104T194918Z-7edb9cb07a72/)).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "引用" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "编辑" })).not.toBeInTheDocument();
+  // 普通对话流下点击分割线不展开原始系统注入 prompt
+  fireEvent.click(summaryEl);
+  expect(screen.queryByText(/ls-20261104T194918Z-7edb9cb07a72/)).not.toBeInTheDocument();
 
+  // readOnly 审计视图仍可展开查看
+  rerender(
+    <MessageList
+      messages={[callbackMsg]}
+      sending={false}
+      readOnly
+      cb={{}}
+      onRespondPermission={() => {}}
+    />,
+  );
   fireEvent.click(screen.getByTestId("system-callback-summary"));
   expect(screen.getByText(/ls-20261104T194918Z-7edb9cb07a72/)).toBeInTheDocument();
 });

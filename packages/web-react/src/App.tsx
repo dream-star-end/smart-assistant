@@ -7,15 +7,7 @@ import { DialogFallback } from "./components/DialogFallback";
 import { useDraftSessionMaterialization } from "./hooks/useDraftSessionMaterialization";
 import { useDraftPreparation } from "./hooks/useDraftPreparation";
 import { createGoalStarter } from "./lib/goalStart";
-import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { appUpdate } from "./lib/appUpdate";
 import {
   type CursorContextTier,
@@ -25,11 +17,11 @@ import {
   normalizeMessageReplyQuote,
   type MessageReplyQuote,
 } from "@openclaude/protocol/browser";
-import { AgentGate } from "./components/AgentGate";
 import { LazyBoundary } from "./components/ChunkErrorBoundary";
 import type { AuthMode } from "./components/AuthGate";
 import { ChatHeader } from "./components/ChatHeader";
-import { applyIntelligentUiSnapshot, useInputPredictionEnabled } from "./lib/intelligentUi";
+import { applyIntelligentUiSnapshot } from "./lib/intelligentUi";
+import { findLastUserText, useContextCompactAction, useSessionInputPrediction } from "./hooks/useContextGovernance";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
 import { Composer, resetComposerAttachmentCache } from "./components/Composer";
 import { ComposerProjectPill } from "./components/ComposerProjectPill";
@@ -41,17 +33,13 @@ import {
   ImageEditActionsContext,
   type ImageEditSubmit,
 } from "./components/chat/imageEditActions";
-import { extractLatestTodos, PinnedTaskTracker } from "./components/chat/PinnedTaskTracker";
-import { QueuedSendList } from "./components/chat/QueuedSendList";
-import { PinnedDelegateTracker } from "./components/chat/PinnedDelegateTracker";
-import { PinnedGoalBar } from "./components/chat/PinnedGoalBar";
+import { extractLatestTodos } from "./components/chat/todoExtract";
+import { QueuedSendListLazy, SwarmBoardDrawer } from "./components/chat/lazyTimelineCards";
+import { useSwarmBoard, useSwarmMode } from "./hooks/useSwarmUi";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
 import { EmptyState, greetingName } from "./components/EmptyState";
-import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
-import { taskContinuationPrompt } from "./lib/chat/manualTaskContinuation";
+import type { ChatError } from "./components/ErrorBanner";
 import { SessionTimelineBoundary } from "./components/SessionTimelineBoundary";
-import { UpdateBanner } from "./components/UpdateBanner";
-import { RepoStatusBanner } from "./components/github/RepoStatusBanner";
 import { sessionTitleFromText } from "./lib/sessionTitle";
 import { isDialogLayerOpen, resolveGlobalHotkey } from "./lib/hotkeys";
 import { pushPaletteRecent } from "./lib/paletteRecents";
@@ -62,11 +50,8 @@ import { DEFAULT_MANAGE_TAB, type ManageTab, normalizeManageTab } from "./lib/ma
 import type { SettingsSection } from "./components/SettingsCenter";
 import type { OrgSection } from "./components/OrgCenter";
 import type { MarketplaceKind, MarketplaceTab } from "./components/MarketplaceCenter";
-import { AssistantMessage, UserMessage } from "./components/Message";
 import { MessageList, type MessageListArchive } from "./components/MessageRenderer";
 import { MessageListSkeleton } from "./components/chat/HistorySkeleton";
-import { TurnCostReminder } from "./components/chat/TurnCostReminder";
-import { BackgroundTurnBanner } from "./components/chat/BackgroundTurnBanner";
 import { useBackgroundTurn } from "./hooks/useBackgroundTurn";
 import {
   captureVisibleVirtualRowAnchor,
@@ -75,7 +60,8 @@ import {
 } from "./components/chat/archivePaging";
 import { createStickToBottomController } from "./components/chat/stickToBottom";
 import { attachWheelFence } from "./components/chat/wheelFence";
-import { currentTurnSettled } from "./components/chat/turnSegment";
+import { useLiveTerminals } from "./lib/liveTerminals";
+import { useWorkbenchBridge } from "./hooks/useWorkbenchBridge";
 import type { CardCallbacks, FeedbackContext } from "./components/chat/cards";
 import { ResponseRatingProvider } from "./components/chat/ResponseRating";
 import { MediaSignProvider } from "./components/chat/media";
@@ -132,7 +118,7 @@ import { useChatProjects } from "./hooks/useChatProjects";
 import { useUnreadSessions } from "./hooks/useUnreadSessions";
 import { useSidebarWidth } from "./hooks/useSidebarWidth";
 import { useLocalComposerPrefs } from "./hooks/useLocalComposerPrefs";
-import { useMdViewport, useWideViewport } from "./hooks/useMdViewport";
+import { useMdViewport, useViewportClass } from "./hooks/useMdViewport";
 import { useResizableWidth } from "./hooks/useResizableWidth";
 import { readCollapsed, writeCollapsed } from "./lib/sidebarCollapsed";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
@@ -140,16 +126,14 @@ import { type ImplicitReason, useResponseRatings } from "./hooks/useResponseRati
 import { useSessionEngineOptions } from "./hooks/useSessionEngineOptions";
 import { useInbox } from "./hooks/useInbox";
 import { useInflightDelegates } from "./hooks/useInflightDelegates";
+import { useBackgroundTaskTriggers, useLiveMediaJobStore, useSessionBackgroundTasks, useTrackedSwarmSessionIds } from "./hooks/useSessionBackgroundTasks";
+import { useSubscriptionSummary } from "./hooks/useSubscriptionSummary";
 import { useRepoBinding } from "./hooks/useRepoBinding";
 import { useTheme } from "./hooks/useTheme";
 import { useToast } from "./components/ui";
-import { githubErrorText } from "./lib/github";
-import { connectorErrorText } from "./lib/connectors";
 import { imageByteCache } from "./lib/chat/imageBytes";
 import { containerPreviewHrefFromTarget } from "./lib/containerPreview";
-import type { MediaJobWire, RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
-import type { MediaGenerationJob } from "@openclaude/protocol/mediaGeneration";
-import type { InboundMessage, MediaRef } from "./lib/chat/frames";
+import type { InboundMessage, MediaRef, RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
 import { type ChatMessage, isTurnDetached } from "./lib/chat/model";
 import { activeTurnStatus } from "./lib/chat/retryStatus";
 import {
@@ -164,8 +148,6 @@ import {
 } from "./lib/implicitFeedback";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
 import {
-  deriveLiveTerminalEndedAt,
-  deriveLiveTerminalFromMessages,
   deriveSessionNeedsYou,
   getTicketApprovalPendingVersion,
   hasUnansweredOptionsFence,
@@ -193,6 +175,7 @@ import { prepareAdvisorSend, persistRecoveredAdvisor, saveInitialCollaboration }
 import { clearSessionEffort, writeSessionEffort } from "./lib/sessionEffort";
 import { clearContextTierForSession, writeContextTier } from "./lib/sessionContextTier";
 import { writeSessionServiceTier } from "./lib/sessionServiceTier";
+import { clearSessionSwarmMode } from "./lib/sessionSwarmMode";
 import { DEFAULT_AGENT, agentFromApiRow, type Agent } from "./lib/agents";
 import {
   PRODUCT_CAPABILITIES,
@@ -212,8 +195,7 @@ import {
   type PrefsView,
   resolveSessionModel,
 } from "./lib/modelPreferences";
-import { DEMO_MESSAGES, DEMO_MESSAGES_BY_SESSION, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
-import type { ChatProject, LockedPublicModel, Message, PublicConfig, PublicModel, Session, SessionLastOutcome, ToolCard } from "./lib/types";
+import type { ChatProject, LockedPublicModel, Message, PublicConfig, PublicModel, Session, ToolCard } from "./lib/types";
 import type { LockedSelectInfo } from "./components/ModelSelector";
 import { lockedModelUnlockNotice } from "./lib/cursorModelPicker";
 import {
@@ -222,9 +204,7 @@ import {
   modelSwitchCompactionReason,
 } from "./lib/modelSwitch";
 import { TASKBOARD_ENABLED } from "./lib/taskboardFeature";
-import { probeStudio } from "./hooks/useStudioProviders";
 import { useServerFeatures } from "./hooks/useServerFeatures";
-import { dismissSuggestion, readDismissedSuggestions, suggestProjectForChat } from "./lib/unfiledSuggest";
 import { projectChipsBoardId } from "./lib/projectChips";
 import type { SaveToProjectRequest } from "./components/project/SaveToProjectDialog";
 import { useChatScroll } from "./hooks/useChatScroll";
@@ -236,11 +216,11 @@ import { useAppDeepLinks } from "./hooks/useAppDeepLinks";
 import { useAppNavigationActions } from "./hooks/useAppNavigationActions";
 import { useComposerSend } from "./hooks/useComposerSend";
 import { useSessionModelAndCollab } from "./hooks/useSessionModelAndCollab";
-import { AppDialogs } from "./components/AppDialogs";
 
-type PredictInput = typeof import("./lib/inputPrediction").predictInput;
 import {
-  IdentityRecoveryNotice, AccountSwitchNotice, AuthGate, Landing, DesktopEnrollPage,
+  IdentityRecoveryNotice, AccountSwitchNotice, AgentGate, AuthGate,
+  RepoStatusBanner, ErrorBanner, UpdateBanner, TurnCostReminder, PinnedHudStack, AppDialogs,
+  Landing, DesktopEnrollPage,
   TutorialCenter, ContainerWebPreview, StudioApp, TaskboardView, SitesWorkspaceView, InspectorPanel,
   InspectorPanelContent, ImageAnnotationEditor, ProjectHome, QuickAskWindow,
   prefetchLazyCentersOnIdle, SplashFallback, useMountedOnce,
@@ -248,11 +228,25 @@ import {
 export { prefetchLazyCentersOnIdle } from "./appLazyViews";
 
 const EMPTY_WS_MESSAGES: ChatMessage[] = [];
-
-
-
 const EMPTY_CATALOG_MODELS: PublicModel[] = [];
 const EMPTY_LOCKED_CATALOG_MODELS: LockedPublicModel[] = [];
+const CACHED_HISTORY_RETRY_DELAYS_MS = [2_000, 5_000] as const;
+
+// 仅 ?demo=1 时按需加载旧演示消息视图（components/Message.tsx），普通线上首屏零加载。
+const DemoMessageStream = lazy(() =>
+  import("./components/Message").then(({ AssistantMessage, UserMessage }) => ({
+    default: ({ messages, busy, streamText, toolCards, onRegenerate }: {
+      messages: Message[]; busy: boolean; streamText: string; toolCards: ToolCard[]; onRegenerate: () => void;
+    }) => (
+      <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8">
+        {messages.map((m, i) => m.role === "user"
+          ? <UserMessage key={m.id} content={m.content} />
+          : <AssistantMessage key={m.id} message={m} toolCards={[]} onRegenerate={i === messages.length - 1 && !busy ? onRegenerate : undefined} />)}
+        {busy && <AssistantMessage message={{ id: "streaming", role: "assistant", content: streamText, createdAt: new Date().toISOString() }} streaming toolCards={toolCards} />}
+      </div>
+    ),
+  })),
+);
 
 export function App() {
   const {
@@ -277,7 +271,8 @@ export function App() {
   const [publicCfgRetryNonce, setPublicCfgRetryNonce] = useState(0);
 
   // demo 展示消息（本地 fixture 流式回放用；非 demo 的消息权威在 WS service）。
-  const [messages, setMessages] = useState<Message[]>(demo ? DEMO_MESSAGES : []);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const demoModRef = useRef<typeof import("./lib/demo") | null>(null);
   const [busy, setBusy] = useState(false);
   const [streamText, setStreamText] = useState("");
   const [toolCards] = useState<ToolCard[]>([]);
@@ -294,10 +289,10 @@ export function App() {
   const [pickerOpen, setPickerOpen] = useState(false);
   // 对话模型/默认思考深度:模型能力来自 GET /api/public/models；用户默认来自
   // /api/me/preferences。两者同批 hydrate 后才决定初始值,避免迟到偏好覆盖人工选择。
-  const [catalogModels, setModels] = useState<PublicModel[]>(demo ? DEMO_MODELS : []);
+  const [catalogModels, setModels] = useState<PublicModel[]>([]);
   const [catalogLockedModels, setLockedModels] = useState<LockedPublicModel[]>([]);
   const [subscribeOpenSignal, setSubscribeOpenSignal] = useState(0);
-  const [modelId, setModelId] = useState<string | undefined>(demo ? DEMO_MODELS[0]?.id : undefined);
+  const [modelId, setModelId] = useState<string | undefined>(undefined);
   // 最近一次 preferences 快照(default_model 解析用):per-session 模型恢复的回落基准。
   // 写入点 = models 装载批 + SettingsCenter onPreferencesChange;下方 resolver effect 消费。
   const [modelPrefs, setModelPrefs] = useState<PrefsView>({});
@@ -319,21 +314,18 @@ export function App() {
   const [bannersExpanded, setBannersExpanded] = useState(false);
   // UpdateBanner 自己订阅 governor,这里再订一份只为把它算进横幅栈的条数。
   const updateBannerVisible = useSyncExternalStore(appUpdate.subscribe, appUpdate.getBannerVisible);
-  // 版本不一致即亮的顶栏 pill(OCV5-626);横幅出现时 governor 自己把它熄掉。
-  const updatePillVisible = useSyncExternalStore(appUpdate.subscribe, appUpdate.getPillVisible);
   const [imageAnnotationSource, setImageAnnotationSource] = useState<ImageAnnotationSource | null>(null);
   const [containerPreviewUrl, setContainerPreviewUrl] = useState<string | null>(null);
-  // 详情面板(右侧第三栏,OCV5-370):宽屏(≥1100px)内联第三列,开合与宽度记在本机;
-  // 更窄的视口用贴底 Sheet,不硬挤三列。面板里看哪一步是纯 UI 态,不进 ChatSocket。
+  // 详情面板：1024-1199px(expanded)自动折侧栏双栏，≥1200px(wide)允许三栏；更窄走贴底 Sheet。
   const isMdViewport = useMdViewport();
-  const isWideViewport = useWideViewport();
-  // 侧栏抽屉只属于窄屏:拉宽到 md 时 CSS(md:hidden)藏起了它，但 Radix 模态仍开着，
-  // 下一次点输入框只会关掉这个看不见的抽屉(#1240「首次点击无响应」)。跨过 md 即关。
+  const viewportClass = useViewportClass();
+  const isWideViewport = viewportClass === "expanded" || viewportClass === "wide";
   useEffect(() => {
     if (isMdViewport) setMobileNavOpen(false);
   }, [isMdViewport]);
   const [paneOpen, setPaneOpenState] = useState(readDetailPaneOpen);
   const [paneSheetOpen, setPaneSheetOpen] = useState(false);
+  const [paneSheetFull, setPaneSheetFull] = useState(false);
   const [paneRequest, setPaneRequest] = useState<PaneRequest | null>(null);
   const [paneActive, setPaneActive] = useState<ToolLike | null>(null);
   const paneWidth = useResizableWidth(DETAIL_PANE_WIDTH);
@@ -348,8 +340,8 @@ export function App() {
   isWideRef.current = isWideViewport;
   /** 从面板外打开 / 定位面板:宽屏展开内联列,窄屏弹出贴底面板。 */
   const openPane = useCallback(
-    (tab?: PaneTab, message?: ToolLike | null) => {
-      setPaneRequest({ tab, message, nonce: Date.now(), sessionId: activeIdRef.current });
+    (tab?: PaneTab, message?: ToolLike | null, liveBrowser?: PaneRequest["liveBrowser"]) => {
+      setPaneRequest((prev) => ({ tab, message, liveBrowser, nonce: Math.max(Date.now(), (prev?.nonce ?? 0) + 1), sessionId: activeIdRef.current }));
       if (isWideRef.current) setPaneOpen(true);
       else setPaneSheetOpen(true);
     },
@@ -376,7 +368,7 @@ export function App() {
   const [chatGptProxyOpen, setChatGptProxyOpen] = useState(false);
   // 「媒体工作台」入口门控(OCV5-593):GET /api/studio/providers 明确 200 才显示(默认隐藏)。
   const [studioAvailable, setStudioAvailable] = useState(false);
-  const [liveMediaJob, setLiveMediaJob] = useState<MediaGenerationJob | null>(null);
+  const { liveMediaJobs, liveMediaJob, mediaJobVersion, onMediaJob, clearLiveMediaJobs } = useLiveMediaJobStore();
   const [repoModalOpen, setRepoModalOpen] = useState(false);
   const repoModalMounted = useMountedOnce(repoModalOpen);
   const [manageOpen, setManageOpen] = useState(urlRoute.panel === "manage");
@@ -399,8 +391,15 @@ export function App() {
   const [tutorialStep, setTutorialStep] = useState<number | null>(urlRoute.tutorialStep);
   const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
-  // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
-  const [composerPrefill, setComposerPrefill] = useState<{ text: string; nonce: number } | null>(null);
+  const [composerPrefill, setComposerPrefillRaw] = useState<{ text: string; nonce: number; mode?: "replace" | "append" } | null>(null);
+  const setComposerPrefill: React.Dispatch<React.SetStateAction<{ text: string; nonce: number } | null>> = useCallback(
+    (next) => setComposerPrefillRaw((prev) => (typeof next === "function" ? next(prev) : next)),
+    [],
+  );
+  const appendToComposer = useCallback(
+    (text: string) => setComposerPrefillRaw({ text, nonce: Date.now(), mode: "append" }),
+    [],
+  );
   const quickAskSeedRef = useRef(0);
   const [quickAsk, setQuickAsk] = useState<{
     open: boolean;
@@ -509,7 +508,7 @@ export function App() {
   } = useAuth({
     demo,
     resetToken,
-    initialUser: demo ? DEMO_USER : null,
+    initialUser: demo ? { id: "demo", displayName: "rqmn", roles: ["user"] } : null,
     // auth 清空（静默刷新失败或主动登出）→ 清会话/消息/私有面板态,回首页。
     // help 是公开内容：若 URL 明确携带案例/功能深链，静默续期发现未登录时仍应保留。
     onClearAuth: () => {
@@ -526,8 +525,9 @@ export function App() {
       setQuickAsk({ open: false, mounted: false, sending: false, seed: null });
       setContainerPreviewUrl(null);
       setSettingsOpen(false);
+      setSubscribeOpenSignal(0);
       setMediaTasksOpen(false);
-      setLiveMediaJob(null);
+      clearLiveMediaJobs();
       setManageAutoAuthorizePluginSlug(null);
       setOrgOpen(false);
       const publicQuery = new URLSearchParams(location.search);
@@ -553,8 +553,9 @@ export function App() {
       clearModelCatalog();
       setContainerPreviewUrl(null);
       setSettingsOpen(false);
+      setSubscribeOpenSignal(0);
       setMediaTasksOpen(false);
-      setLiveMediaJob(null);
+      clearLiveMediaJobs();
       setManageAutoAuthorizePluginSlug(null);
       setOrgOpen(false);
       setTutorialOpen(false);
@@ -573,6 +574,20 @@ export function App() {
       setMessages([]);
     },
   });
+
+  // 仅 ?demo=1 动态加载演示模型/初始消息，普通线上首屏不打进 lib/demo.ts。
+  useEffect(() => {
+    if (!demo) return;
+    let cancelled = false;
+    void import("./lib/demo").then((m) => {
+      if (cancelled) return;
+      demoModRef.current = m;
+      setModels((p) => (p.length ? p : m.DEMO_MODELS));
+      setModelId((p) => p ?? m.DEMO_MODELS[0]?.id);
+      setMessages((p) => (p.length ? p : (activeIdRef.current ? (m.DEMO_MESSAGES_BY_SESSION[activeIdRef.current] ?? []) : [])));
+    });
+    return () => { cancelled = true; };
+  }, [demo]);
 
   // AuthSession 整个生命周期是同一引用；token + epoch 在对象内部原子推进。
   // 经本地 useRef 再持有一次以保留 biome 的稳定 ref 推断 —— 直接使用 hook 返回的 ref 会在
@@ -662,6 +677,7 @@ export function App() {
     reset: resetSessionList,
     serverListSettled,
     historyLoading,
+    historySettled,
     historyError,
     retryHistory,
   } = useSessionList({
@@ -674,10 +690,11 @@ export function App() {
     confirmDialog,
     promptText,
     clearChatError: () => setChatError(null),
-    // demo：切会话时换本地 fixture 消息。
-    // demo 会话按 id 取 fixture(misc-p3 D-02 接线):目前只有 s1 有消息,其余点开即空态;要给别的会话
-    // 补内容只需往 DEMO_MESSAGES_BY_SESSION 加 fixture 并同步 DEMO_SESSIONS 的 messageCount。
-    onDemoSelect: (id) => setMessages(DEMO_MESSAGES_BY_SESSION[id] ?? []),
+    // demo：切会话时换本地 fixture 消息（仅 ?demo=1 动态加载 lib/demo.ts）。
+    onDemoSelect: (id) => {
+      if (demoModRef.current) setMessages(demoModRef.current.DEMO_MESSAGES_BY_SESSION[id] ?? []);
+      else { setMessages([]); void import("./lib/demo").then((m) => { demoModRef.current = m; if (activeIdRef.current === id) setMessages(m.DEMO_MESSAGES_BY_SESSION[id] ?? []); }); }
+    },
     // 新建会话：停 demo 流式回放 + 清空展示消息 + 清错误（原 newSession 前置收尾）。
     onNewSessionReset: () => {
       interrupt();
@@ -692,6 +709,7 @@ export function App() {
       clearSessionEffort(id); // 同上:思考档位 per-session 键
       clearContextTierForSession(id); // 同上:Cursor 上下文档位 per-session 键
       writeSessionServiceTier(id, null); // OCV5-434 GPT Fast per-session 键
+      clearSessionSwarmMode(id); // OCV5-837 蜂群模式 per-session 键
     },
     onActiveSessionDeleted: () => {
       setMessages([]);
@@ -794,10 +812,6 @@ export function App() {
   useEffect(() => {
     setTimelineLifecycleServerShadow(serverFeatures.timelineShadow);
   }, [serverFeatures.timelineShadow]);
-  const [dismissedSuggestions, setDismissedSuggestions] = useState<Set<string>>(() => new Set());
-  useEffect(() => {
-    setDismissedSuggestions(user?.id ? readDismissedSuggestions(user.id) : new Set());
-  }, [user?.id]);
   // 当前会话所属项目的看板：P5b 两个入口只在会话属于有看板的项目时出现。
   const activeProjectId = activeId ? sessions.find((s) => s.id === activeId)?.projectId : undefined;
   const activeChatProject = activeProjectId ? projects.find((p) => p.id === activeProjectId) : undefined;
@@ -858,19 +872,6 @@ export function App() {
     [demo, auth],
   );
 
-  const unreadSessions = useUnreadSessions({
-    sessions,
-    activeId: activeId ?? null,
-    userId: user?.id ?? null,
-    auth: demo ? null : auth,
-    // sidebar-B UUS-01：系统通知点开后落到对应会话（hook 内已 window.focus()）。
-    // 在项目主页时点系统通知：落到对应会话即离开主页(任务面板保持原行为)。
-    onNotificationOpen: (id: string) => {
-      setProjectHome(null);
-      setPendingRouteProject(null);
-      selectSession(id);
-    },
-  });
   const sidebarWidth = useSidebarWidth();
 
   // 切会话/进出任务看板时清掉面板里的定位:消息对象引用属于旧会话上下文,跨会话保留只会
@@ -889,7 +890,12 @@ export function App() {
   // 本会话的思考档位与上下文档位(hooks/useSessionEngineOptions,提前以同步清理失效速度档)。
   const { sessionEffort, setSessionEffort, contextTier, setContextTier, serviceTier, setServiceTier } =
     useSessionEngineOptions(activeId);
+  useWorkbenchBridge({ demo, activeId, activeIdRef, isWideRef, setPaneRequest, setPaneOpen, setPaneSheetOpen, serviceTier, setServiceTier });
 
+  const swarmStateRef = useRef<{ swarmMode: boolean; swarmRunning: boolean; disableSwarm?: () => void }>({
+    swarmMode: false,
+    swarmRunning: false,
+  });
   const {
     applyCollabDoc,
     cancelModelSwitch,
@@ -911,6 +917,7 @@ export function App() {
     activeId,
     authorizeSwitch,
     getSwitchOptions,
+    getSwarmState: () => swarmStateRef.current,
     agent,
     auth,
     confirmDialog,
@@ -946,6 +953,7 @@ export function App() {
   // Async goal saves can finish after navigation; only consume the selected draft's project.
   const selectedSessionIdRef = useRef(activeId);
   selectedSessionIdRef.current = activeId;
+
   const {
     image2Available,
     imageEditActions,
@@ -996,6 +1004,7 @@ export function App() {
     sockRef,
     stopPreparing,
     stopRef,
+    getSwarmMode: () => swarmStateRef.current.swarmMode,
     toast,
     user,
   });
@@ -1122,7 +1131,7 @@ export function App() {
     // GitHub 仓库绑定状态/错误帧 → useRepoBinding（经 ref，见 repoStatusHandlerRef）。
     onRepoStatus: (f) => repoStatusHandlerRef.current(f),
     onRepoBindError: (f) => repoBindErrorHandlerRef.current(f),
-    onMediaJob: (frame: MediaJobWire) => setLiveMediaJob(frame.job),
+    onMediaJob,
     // 会话模型收敛写与显式选择共用同一 per-session 串行器(防跨写者乱序)。
     queueModelPatch,
   });
@@ -1171,6 +1180,15 @@ export function App() {
 
   // 非 demo：展示的消息来自 WS service 快照（就地 mutation + version 触发重渲）。
   const wsMessages = !demo && activeId ? chat.getMessages(activeId) : EMPTY_WS_MESSAGES;
+  const { swarmSupported, swarmMode, setSwarmMode, toggleSwarmMode } = useSwarmMode({
+    demo, sessionKey: activeId ?? draftSessionId, activeSessionId: activeId,
+    wsMessages, messagesVersion: chat.version, modelId, models,
+  });
+  const swarmUi = useSwarmBoard({ sessionKey: activeId ?? draftSessionId, wsMessages, messagesVersion: chat.version });
+  const swarmRunning = Boolean(
+    swarmUi.latestSwarm && (swarmUi.latestSwarm.phase === "starting" || swarmUi.latestSwarm.phase === "running"),
+  );
+  swarmStateRef.current = { swarmMode, swarmRunning, disableSwarm: () => setSwarmMode(false) };
   // 分享对话框只针对打开时的会话;切会话(返回键/深链)就关掉,不拿旧快照配新标题。
   // biome-ignore lint/correctness/useExhaustiveDependencies: activeId 是触发条件
   useEffect(() => {
@@ -1185,53 +1203,28 @@ export function App() {
     !boardOpen && !sitesOpen && !projectHome && (demo ? !!paneRequest?.message : !!activeId && wsMessages.length > 0);
   const paneRequestHere = paneRequestForSession(paneRequest, activeId);
   const paneInline = paneAvailable && isWideViewport && paneOpen;
+  useEffect(() => {
+    if (viewportClass === "expanded" && paneInline) setCollapsed(true);
+  }, [viewportClass, paneInline]);
   const paneShown = paneInline || (paneAvailable && !isWideViewport && paneSheetOpen);
+  const closePaneSheet = () => { setPaneSheetOpen(false); setPaneSheetFull(false); };
   const togglePane = () => {
     if (paneShown) {
       if (isWideViewport) setPaneOpen(false);
-      else setPaneSheetOpen(false);
+      else closePaneSheet();
       return;
     }
     openPane();
   };
   paneToggleRef.current = paneAvailable && !demo ? togglePane : null;
-  const inflightDelegates = useInflightDelegates({
-    sessionId: !demo && activeId ? activeId : null,
-    messages: wsMessages,
-    enabled:
-      !demo &&
-      gate.access &&
-      !!activeId &&
-      (delegateInflightSurface ?? publicCfg?.featureDelegateInflight) === true,
-    auth,
-  });
+  const { summary: subscriptionSummary, refresh: refreshSubscription } = useSubscriptionSummary(demo ? null : auth);
+  const refreshMeWithSub = useCallback(async () => { await refreshMe(); refreshSubscription(); }, [refreshMe, refreshSubscription]);
+  const { delegateRefreshTrigger, bgTasksRefreshTrigger } = useBackgroundTaskTriggers({ sessionId: activeId, wsSending, wsMessages, chatVersion: chat.version, mediaJobVersion });
+  const inflightDelegates = useInflightDelegates({ sessionId: !demo && activeId ? activeId : null, messages: wsMessages, auth, refreshTrigger: delegateRefreshTrigger, enabled: !demo && gate.access && !!activeId && (delegateInflightSurface ?? publicCfg?.featureDelegateInflight) === true });
+  const bgTasks = useSessionBackgroundTasks({ sessionId: !demo && activeId ? activeId : null, enabled: !demo && gate.access && !!activeId, auth, liveMediaJobs, refreshTrigger: bgTasksRefreshTrigger });
+  const swarmSessionIds = useTrackedSwarmSessionIds({ demo, activeId, latestSwarm: swarmUi.latestSwarm, sessions, getMessages: chat.getMessages, isSending: chat.isSending, version: chat.metaVersion ?? chat.version });
 
-  const sendingIdsRef = useRef(new Set<string>());
-  const liveTerminalsRef = useRef(
-    new Map<string, { lastOutcome: SessionLastOutcome; lastErrorCode: string | null; endedAt: number }>(),
-  );
-  const liveTerminals = useMemo(() => {
-    void chat.version;
-    if (demo) return liveTerminalsRef.current;
-    const now = new Set(sessions.filter((s) => chat.isSending(s.id)).map((s) => s.id));
-    for (const id of now) liveTerminalsRef.current.delete(id);
-    for (const id of sendingIdsRef.current) {
-      if (!now.has(id)) {
-        const t = deriveLiveTerminalFromMessages(chat.getSession(id)?.messages);
-        if (t) liveTerminalsRef.current.set(id, { ...t, endedAt: deriveLiveTerminalEndedAt(chat.getSession(id)?.messages) });
-      }
-    }
-    sendingIdsRef.current = now;
-    return new Map(liveTerminalsRef.current);
-  }, [demo, chat, sessions]);
-  useEffect(() => {
-    for (const [id, t] of liveTerminals) applySessionTerminal(id, t);
-  }, [liveTerminals, applySessionTerminal]);
-
-  const liveTerminal = useCallback(
-    (id: string) => liveTerminals.get(id),
-    [liveTerminals],
-  );
+  const { liveTerminal } = useLiveTerminals({ demo, chat, sessions, applySessionTerminal });
   const ticketApprovalVersion = useSyncExternalStore(
     subscribeTicketApprovalPending,
     getTicketApprovalPendingVersion,
@@ -1239,7 +1232,7 @@ export function App() {
   );
   const sessionNeedsYou = useCallback(
     (id: string) => {
-      void chat.version;
+      void (chat.metaVersion ?? chat.version);
       void ticketApprovalVersion;
       if (demo) return null;
       const liveSess = chat.getSession(id);
@@ -1255,6 +1248,19 @@ export function App() {
     },
     [demo, chat, sessions, ticketApprovalVersion],
   );
+  const unreadSessions = useUnreadSessions({
+    sessions,
+    activeId: activeId ?? null,
+    userId: user?.id ?? null,
+    auth: demo ? null : auth,
+    sessionNeedsYou: demo ? undefined : sessionNeedsYou,
+    metaVersion: chat.metaVersion ?? chat.version,
+    onNotificationOpen: (id: string) => {
+      setProjectHome(null);
+      setPendingRouteProject(null);
+      selectSession(id);
+    },
+  });
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -1422,7 +1428,7 @@ export function App() {
   // 并禁用 Composer。demo 与已就绪（ready|dormant）放行正常对话。
   const gated = !demo && !gate.access;
   // 冷会话加载骨架（计时器 + 派生，见 hooks/useHistorySkeleton）。须在下方 boot/登录等早返回之前调用。
-  const { loadingHistory, historySurface } = useHistorySkeleton({
+  const { loadingHistory, historySurface, slowHistory } = useHistorySkeleton({
     demo,
     activeId,
     sessions,
@@ -1433,24 +1439,66 @@ export function App() {
     demoBusy: busy,
     serverListSettled,
     historyLoading,
+    historySettled,
     historyError,
   });
 
   // 会话级 transient 软提示（"正在发送…"等）：非消息卡片、不落库；随快照读回。
   const transientNotice = !demo && activeId ? chat.getTransientNotice(activeId) : null;
-  // 弱网/重连状态条三态分流（离线 / 环境启动中 / 服务端重连中）。文案与 tone 收口在
-  // deriveConnBanner（纯函数，单测锁定）；返回 null 时不显条。demo 恒不显（本地回放无 WS）。
-  const rawConnBanner = demo
-    ? null
-    : deriveConnBanner({
-        cls: chat.status.cls,
-        label: chat.status.label,
-        browserOnline: chat.browserOnline,
-        provisioning: chat.provisioning,
-      });
+  // 弱网/重连状态条三态分流（离线 / 环境启动中 / 服务端重连中）。
+  // Composer 内已有 EnvironmentPrepBar 时抑制重复的 provisioning 横幅；纯离线态隐藏无效的「立即重连」按钮。
+  const environmentPrepVisible = !demo && !gated && chat.provisioning;
+  const rawConnBanner =
+    demo || (environmentPrepVisible && chat.browserOnline)
+      ? null
+      : deriveConnBanner({
+          cls: chat.status.cls,
+          label: chat.status.label,
+          browserOnline: chat.browserOnline,
+          provisioning: chat.provisioning,
+        });
   // 横幅 2s 延迟（P3 RFC D6）：断开 >2s 才点亮，2s 内重连成功零闪烁。只作用于横幅显示——
   // deriveConnBanner 仍即时反映断线真相，断线排队/禁发等发送语义不受影响。
   const connBanner = useDelayedConnBanner(rawConnBanner);
+  const canRetryConnect =
+    connBanner?.tone === "warning" &&
+    chat.browserOnline &&
+    (typeof navigator === "undefined" || navigator.onLine !== false);
+  // 已有本地缓存消息时历史同步失败先后台静默退避重试，连续失败后再温和提示（空列表无缓存仍即时展示 session-history-error）。
+  const hasCachedWsMessages = wsMessages.length > 0;
+  const cachedHistoryFailRef = useRef<{ sessionId: string; lastToken: number; count: number }>({
+    sessionId: "",
+    lastToken: -1,
+    count: 0,
+  });
+  const [cachedHistoryBannerVisible, setCachedHistoryBannerVisible] = useState(false);
+  useEffect(() => {
+    const id = activeId ?? "";
+    if (cachedHistoryFailRef.current.sessionId !== id) {
+      cachedHistoryFailRef.current = { sessionId: id, lastToken: -1, count: 0 };
+      setCachedHistoryBannerVisible(false);
+    }
+    if (demo || !activeId || !historyError || !hasCachedWsMessages) {
+      if (!historyError && historySettled) {
+        cachedHistoryFailRef.current = { sessionId: id, lastToken: -1, count: 0 };
+        setCachedHistoryBannerVisible(false);
+      }
+      return;
+    }
+    const state = cachedHistoryFailRef.current;
+    if (state.lastToken !== historyError.token) {
+      state.lastToken = historyError.token;
+      state.count += 1;
+    }
+    const delayMs = CACHED_HISTORY_RETRY_DELAYS_MS[state.count - 1];
+    if (delayMs === undefined) {
+      setCachedHistoryBannerVisible(true);
+      return;
+    }
+    if (!chat.browserOnline) return;
+    const timer = window.setTimeout(() => retryHistory(activeId), delayMs);
+    return () => window.clearTimeout(timer);
+  }, [demo, activeId, historyError, historySettled, hasCachedWsMessages, chat.browserOnline, retryHistory]);
   useEffect(() => {
     if (!tutorialOpen) setBlogRequest(null);
   }, [tutorialOpen]);
@@ -1475,6 +1523,14 @@ export function App() {
     onSyncError: () => toast("操作已完成，页面显示暂未同步，请手动刷新。"),
   });
 
+  const { contextHealthOpen, setContextHealthOpen, handleCompactSession } = useContextCompactAction({
+    demo,
+    activeId,
+    wsSending,
+    chat,
+    toast,
+  });
+
   const {
     artifactInspect,
     cardCallbacks,
@@ -1495,6 +1551,7 @@ export function App() {
     chipsProjectName,
     communityBlogEnabled,
     demo,
+    onCompactSession: demo || !activeId ? undefined : () => void handleCompactSession(),
     loadExactUserMessage,
     messageFeedbackTriggerRef,
     newSession,
@@ -1502,11 +1559,13 @@ export function App() {
     openManage,
     openPane,
     openSettings,
+    onOpenSwarmBoard: swarmUi.openBoard,
     regenerate,
     send,
     sendImplicitRatingRef,
     sending,
     setBoardOpen,
+    setBoardTicketId,
     setBusy,
     setChatError,
     setCollapsed,
@@ -1533,45 +1592,9 @@ export function App() {
       ? messageReplyTarget.quote
       : null;
 
-  let lastUserText: string | undefined;
-  if (demo) {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === "user" && messages[i].content) {
-        lastUserText = messages[i].content;
-        break;
-      }
-    }
-  } else {
-    for (let i = wsMessages.length - 1; i >= 0; i--) {
-      const message = wsMessages[i];
-      if (message.role === "user" && message.status !== "queued" && message.text) {
-        lastUserText = message.text;
-        break;
-      }
-    }
-  }
-  // 输入预测(OCV5-375):回答末尾模型写的 next 块 → 输入框浅色预测;打字时按本会话说过的话补全。
-  // 设置里关掉时 master 也不再下发这段提示词。demo 不开。
-  // 解析器按需加载,不进首屏包(首屏只有输入框的补全和浮层);加载失败就没有预测。
-  const inputPredictionOn = useInputPredictionEnabled();
-  const [predictInput, setPredictInput] = useState<PredictInput | null>(null);
-  useEffect(() => {
-    if (demo || !inputPredictionOn || predictInput) return;
-    let alive = true;
-    void import("./lib/inputPrediction").then(
-      (m) => {
-        if (alive) setPredictInput(() => m.predictInput);
-      },
-      () => {},
-    );
-    return () => {
-      alive = false;
-    };
-  }, [demo, inputPredictionOn, predictInput]);
-  const inputPrediction = useMemo(
-    () => (demo || !inputPredictionOn || !predictInput ? null : predictInput(wsMessages)),
-    [demo, inputPredictionOn, predictInput, wsMessages],
-  );
+  const lastUserText = findLastUserText(demo, messages, wsMessages);
+  // 输入预测(OCV5-375):按需加载解析器,不进首屏包。
+  const inputPrediction = useSessionInputPrediction(demo, wsMessages);
   const timelineMessages = wsMessages.filter(
     (message) => message.role !== "user" || message.status !== "queued",
   );
@@ -1611,7 +1634,8 @@ export function App() {
       return;
     }
     let cancelled = false;
-    probeStudio(authRef.current)
+    import("./hooks/useStudioProviders")
+      .then((m) => m.probeStudio(authRef.current))
       .then((view) => {
         if (!cancelled) setStudioAvailable(view !== null);
       })
@@ -1726,6 +1750,7 @@ export function App() {
     activeTutorialWork: tutorialOpen ? tutorialWork : null,
     activeTutorialStep: tutorialOpen ? tutorialStep : null,
     onPopPanel: (panel, topic, caseId, communityId, extras) => {
+      setSubscribeOpenSignal(0);
       setSettingsOpen(panel === "settings");
       setMarketplaceOpen(panel === "market");
       setManageOpen(panel === "manage");
@@ -1965,17 +1990,12 @@ export function App() {
 
   const showEmpty = demo ? messages.length === 0 && !busy : wsMessages.length === 0 && !wsSending;
   // ── 输入框上方的全局横幅栈(shell 审计 S-06)──────────────────────────────
-  // 五种横幅原先各自按条件挂载、互不知情,断线 + 休眠 + 新版本 + 发送失败同时成立时 390px
-  // 屏上横幅吃掉 ~560px。这里先算出"此刻成立的有哪些",交给 resolveBanners 按优先级裁决:
-  // 同屏最多 2 条,其余折叠成一行「还有 N 条提示」。移动端(<md)的连接条走 Composer 的
-  // banner 插槽钉在输入框上方(软键盘不会把它顶走),不进这个栈。
+  // 统一裁决当前成立的横幅，同屏最多 2 条；移动端(<md)的连接条走 Composer 的 banner 插槽。
   const activeBannerKinds: BannerKind[] = [];
   if (chatError) activeBannerKinds.push("error");
   if (!gated && connBanner && isMdViewport) activeBannerKinds.push("connection");
-  if (!demo && gate.phase.kind === "dormant") activeBannerKinds.push("dormant");
   if (!demo && updateBannerVisible) activeBannerKinds.push("update");
-  if (backgroundTurn.notice && isMdViewport) activeBannerKinds.push("turn");
-  if (!demo && !gated && activeSess?._turnCostReminderCredits && !backgroundTurn.notice) activeBannerKinds.push("cost");
+  if (!demo && !gated && activeSess?._turnCostReminderCredits) activeBannerKinds.push("cost");
   const bannerStack = resolveBanners(activeBannerKinds, bannersExpanded);
   const showBanner = (kind: BannerKind) => bannerStack.visible.includes(kind);
 
@@ -2021,8 +2041,11 @@ export function App() {
     },
     user,
     credits: user?.credits ?? null,
-    onOpenAccount: demo ? undefined : closeMobileThen(() => openSettings()),
+    onOpenAccount: demo ? undefined : closeMobileThen(() => openSettings("account")),
+    onOpenPreferences: demo ? undefined : closeMobileThen(() => openSettings("preferences")),
     onOpenFeedback: demo ? undefined : closeMobileThen(() => openSettings("feedback")),
+    onOpenInbox: demo ? undefined : closeMobileThen(() => setInboxOpen(true)),
+    unreadCount: inbox.unreadCount,
     onNew: () => {
       setBoardOpen(false);
       handleNew();
@@ -2058,36 +2081,28 @@ export function App() {
     isSending: (id: string) => !demo && chat.isSending(id),
     liveTerminal,
     sessionNeedsYou,
-    socketVersion: chat.version,
+    socketVersion: chat.metaVersion ?? chat.version,
     onLogout: demo ? undefined : closeMobileThen(logout),
     onOpenManage: demo ? undefined : closeMobileThen(() => openManage(DEFAULT_MANAGE_TAB)),
     onOpenMarketplace: demo ? undefined : closeMobileThen(() => openMarketplace("browse")),
     onOpenTutorial: demo ? undefined : closeMobileThen(() => openTutorial()),
-    onOpenBlog:
-      demo || !communityBlogEnabled
-      ? undefined
-      : closeMobileThen(() => {
-          openTutorial();
-          setTutorialTab("blog");
-        }),
     onOpenMediaTasks:
       demo || mediaTasksAvailable === false ? undefined : closeMobileThen(() => setMediaTasksOpen(true)),
     onOpenStudio: !demo && studioAvailable ? closeMobileThen(() => window.location.assign("/studio")) : undefined,
     onOpenChatGptProxy: !demo && chatGptProxyEnabled ? closeMobileThen(() => setChatGptProxyOpen(true)) : undefined,
-    onOpenApiAccess: !demo && user?.role === "admin" ? closeMobileThen(() => openSettings("api-access")) : undefined,
     theme,
+    onSetTheme: setTheme,
     onCycleTheme: cycle,
     showAdmin: !demo && user?.role === "admin",
     onOpenOrg:
       demo || !(user?.org && (user.org.role === "owner" || user.org.role === "admin"))
         ? undefined
         : closeMobileThen(() => openOrg()),
-    onOpenBoard: demo || !TASKBOARD_ENABLED ? undefined : closeMobileThen(() => setBoardOpen(true)),
+    onOpenBoard: demo || !TASKBOARD_ENABLED ? undefined : (ticketRef?: string) => { setMobileNavOpen(false); const ref = typeof ticketRef === "string" ? ticketRef.trim() : ""; if (ref) { setBoardTicketId(ref); setBoardView((cur) => (cur === "cost" || cur === "weekly" ? preferredBoardView() : cur)); } setBoardOpen(true); },
     boardActive: TASKBOARD_ENABLED && boardOpen,
     onOpenSites: demo ? undefined : closeMobileThen(() => openSites(null)),
     sitesActive: sitesOpen,
-    unreadIds: unreadSessions.unreadIds,
-    onMarkRead: unreadSessions.markRead,
+    unreadIds: unreadSessions.unreadIds, swarmSessionIds, onMarkRead: unreadSessions.markRead,
     onOpenProjectSettings: (p: ChatProject) => {
       setUngroupedAssetsOpen(false);
       setProjectSettings(p);
@@ -2112,6 +2127,7 @@ export function App() {
     loadingArchived,
     onSearchMessages: searchSessionMessages,
     onOpenPalette: closeMobileThen(() => setPaletteOpen(true)),
+    onOpenLiveBrowser: demo ? undefined : (opts?: { url?: string; sessionId?: string | null }) => { setMobileNavOpen(false); if (opts?.sessionId && sessions.some((s) => s.id === opts.sessionId)) selectSession(opts.sessionId); openPane("browser", null, opts?.url ? { url: opts.url } : undefined); },
   };
   return (
     <MediaSignProvider
@@ -2161,7 +2177,7 @@ export function App() {
         />
       </Sheet>
 
-      <main className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <main className="@container flex min-h-0 min-w-0 flex-1 flex-col">
         {TASKBOARD_ENABLED && boardOpen && !demo && auth ? (
           <LazyBoundary fallback={<SplashFallback />}>
             <TaskboardView
@@ -2175,6 +2191,7 @@ export function App() {
               onOpenMobileNav={() => setMobileNavOpen(true)}
               sidebarCollapsed={collapsed}
               onExpandSidebar={() => setCollapsed(false)}
+              sessionUnreadCount={unreadSessions.unreadIds.size}
               sessionIds={sessions.map((s) => s.id)}
               onOpenSession={(id) => {
                 // originSessionKey 是 agent:<id>:webchat:dm:<peerId>，不能当 Session.id。
@@ -2218,6 +2235,7 @@ export function App() {
               onOpenMobileNav={() => setMobileNavOpen(true)}
               sidebarCollapsed={collapsed}
               onExpandSidebar={() => setCollapsed(false)}
+              sessionUnreadCount={unreadSessions.unreadIds.size}
             />
           </LazyBoundary>
         ) : homeProject && projectHome ? (
@@ -2263,6 +2281,7 @@ export function App() {
               loadingArchived={loadingArchived}
               sidebarCollapsed={collapsed}
               onExpandSidebar={() => setCollapsed(false)}
+              sessionUnreadCount={unreadSessions.unreadIds.size}
             />
           </LazyBoundary>
         ) : (
@@ -2271,29 +2290,13 @@ export function App() {
         <h1 className="sr-only">{activeSess?.title || "新对话"}</h1>
         <ChatHeader
           agent={agent}
+          sessionTitle={activeSess?.title}
           onAgentClick={() => setPickerOpen(true)}
           projectBreadcrumb={(() => {
             const pid = sessions.find((s) => s.id === activeId)?.projectId;
             if (!pid) return null;
             const chat = projects.find((p) => p.id === pid);
             return chat ? { chatName: chat.name } : null;
-          })()}
-          projectSuggestion={(() => {
-            if (!serverFeatures.unfiledSuggest || !user?.id || !activeId) return null;
-            const active = sessions.find((s) => s.id === activeId);
-            if (!active || active.projectId || active.archived || dismissedSuggestions.has(active.id)) return null;
-            const hit = suggestProjectForChat(active, sessions, projects);
-            const target = hit ? projects.find((p) => p.id === hit.projectId) : undefined;
-            if (!target) return null;
-            const uid = user.id;
-            return {
-              name: target.name,
-              onAccept: () => moveSessionToProject(active, target.id),
-              onDismiss: () => {
-                dismissSuggestion(uid, active.id);
-                setDismissedSuggestions((cur) => new Set(cur).add(active.id));
-              },
-            };
           })()}
           onOpenProjectScope={() => {
             const pid = sessions.find((s) => s.id === activeId)?.projectId;
@@ -2315,6 +2318,10 @@ export function App() {
           onSelectContextTier={demo ? undefined : setContextTier}
           serviceTier={serviceTier}
           onSelectServiceTier={demo ? undefined : setServiceTier}
+          swarmSupported={swarmSupported}
+          swarmMode={swarmMode}
+          swarmRunning={swarmRunning}
+          onSelectSwarmMode={demo ? undefined : setSwarmMode}
           modelPickerOpen={modelPickerOpen}
           onModelPickerOpenChange={setModelPickerOpen}
           // 团队模式知情指示:与 send 生效条件同构(仅 main 生效),顶栏所见 = 实际所发。
@@ -2328,13 +2335,10 @@ export function App() {
               : undefined
           }
           onDisableAdvisorMode={() => setCollabMode("solo")}
-          credits={demo ? null : (user?.credits ?? null)}
-          onOpenBilling={demo ? undefined : () => openSettings()}
           sidebarCollapsed={collapsed}
           onExpandSidebar={() => setCollapsed(false)}
           onNew={handleNew}
           onOpenMobileNav={() => setMobileNavOpen(true)}
-          onOpenInbox={demo ? undefined : () => setInboxOpen(true)}
           onOpenFind={demo ? undefined : () => setFindOpen(true)}
           onShare={demo ? undefined : () => setShareOpen(true)}
           onToggleQuickAsk={gated ? undefined : () => setQuickAsk((s) => ({ ...s, open: !s.open, mounted: true }))}
@@ -2342,10 +2346,9 @@ export function App() {
           quickAskSending={quickAsk.sending}
           onTogglePane={paneAvailable && !demo ? togglePane : undefined}
           paneOpen={paneShown}
-          unreadCount={inbox.unreadCount}
           sessionUnreadCount={unreadSessions.unreadIds.size}
-          updateAvailable={!demo && updatePillVisible}
-          onReloadForUpdate={demo ? undefined : () => appUpdate.reloadNow()}
+          subscriptionSummary={demo ? null : subscriptionSummary}
+          onOpenSubscription={demo ? undefined : () => { openSettings("account"); setSubscribeOpenSignal((n) => n + 1); }}
         />
         {!demo && auth && authRecoveryAvailable && <LazyBoundary fallback={null}>
           <IdentityRecoveryNotice onRetry={retryBoot} />
@@ -2384,18 +2387,23 @@ export function App() {
           data-font-size={composerPrefs.fontSize}
         >
           {gated ? (
-            <AgentGate
-              phase={gate.phase}
-              onOpen={gate.open}
-              onRetry={gate.check}
-              onTopUp={() => {
-                openSettings("account");
-                setSubscribeOpenSignal((n) => n + 1);
-              }}
-            />
+            <LazyBoundary fallback={<div className="flex flex-1 items-center justify-center p-8 text-meta text-faint">加载中…</div>}>
+              <AgentGate
+                phase={gate.phase}
+                onOpen={gate.open}
+                onRetry={gate.check}
+                onTopUp={() => {
+                  openSettings("account");
+                  setSubscribeOpenSignal((n) => n + 1);
+                }}
+              />
+            </LazyBoundary>
           ) : loadingHistory || historySurface === "skeleton" ? (
             // 冷会话历史拉取期：消息形骨架占位，避免「空白 → 突然填满」的突变。
-            <MessageListSkeleton />
+            <MessageListSkeleton
+              slow={slowHistory}
+              onRetry={activeId ? () => retryHistory(activeId) : undefined}
+            />
           ) : historySurface === "error" ? (
             <div
               className="mx-auto flex max-w-3xl flex-col gap-3 px-5 py-12"
@@ -2408,10 +2416,10 @@ export function App() {
                   activeId ? (
                     <button
                       type="button"
-                      className="rounded-full bg-hover px-3 py-1.5 text-xs text-fg"
+                      className="rounded-full bg-hover px-3 py-1.5 text-xs text-fg [@media(hover:none)]:min-h-11"
                       onClick={() => retryHistory(activeId)}
                     >
-                      继续
+                      重试
                     </button>
                   ) : undefined
                 }
@@ -2428,32 +2436,7 @@ export function App() {
               onOpenGoal={demo ? undefined : () => setGoalOpenNonce(Date.now())}
             />
           ) : demo ? (
-            <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8">
-              {messages.map((m, i) =>
-                m.role === "user" ? (
-                  <UserMessage key={m.id} content={m.content} />
-                ) : (
-                  <AssistantMessage
-                    key={m.id}
-                    message={m}
-                    toolCards={[]}
-                    onRegenerate={i === messages.length - 1 && !busy ? regenerate : undefined}
-                  />
-                ),
-              )}
-              {busy && (
-                <AssistantMessage
-                  message={{
-                    id: "streaming",
-                    role: "assistant",
-                    content: streamText,
-                    createdAt: new Date().toISOString(),
-                  }}
-                  streaming
-                  toolCards={toolCards}
-                />
-              )}
-            </div>
+            <Suspense fallback={null}><DemoMessageStream messages={messages} busy={busy} streamText={streamText} toolCards={toolCards} onRegenerate={regenerate} /></Suspense>
           ) : (
             // 非 demo：真实 WS 消息流 → P5 九类 Aurora 富卡（MessageList 按 role 分派、
             // 签名 memo 防闪；tool 委托 ToolCardSlot；权限审批经 onRespondPermission）。
@@ -2464,11 +2447,11 @@ export function App() {
                 resetKey={activeId ?? "none"}
                 onRetry={activeId ? () => retryHistory(activeId) : undefined}
               >
-                {historyError && wsMessages.length > 0 && (
+                {cachedHistoryBannerVisible && historyError && wsMessages.length > 0 && (
                   <div className="mx-auto mb-2 max-w-3xl px-5 pt-4" data-testid="session-history-error-banner">
                     <Alert
-                      tone="danger"
-                      title="会话加载失败"
+                      tone="warning"
+                      title="历史记录暂未同步"
                       action={
                         <button
                           type="button"
@@ -2479,7 +2462,7 @@ export function App() {
                         </button>
                       }
                     >
-                      {historyError.message}
+                      {historyError.message || "当前展示本地记录，稍后可重试同步。"}
                     </Alert>
                   </div>
                 )}
@@ -2492,8 +2475,6 @@ export function App() {
                   turnActivity={turnActivity}
                   transientNotice={transientNotice}
                   historyLoading={historyLoading}
-                  journalDegraded={activeSess?._liveJournalDegraded === true}
-                  onRetryJournal={activeId ? () => { void chat.retryLiveJournalHydration(activeId); } : undefined}
                   archive={messageListArchive}
                   cb={cardCallbacks}
                   onRespondPermission={onRespondPermission}
@@ -2514,32 +2495,24 @@ export function App() {
               初始展开全部 → ~3s 自动折叠成「正在执行的一条」;无任务或本轮已收口时组件自渲染
               null(收口后由 MessageRenderer 的 inline 只读 TodoWrite/plan 卡兜底)。 */}
           {!demo && !gated && (
-            <PinnedGoalBar messages={timelineMessages} />
+            <>
+              {(wsSending || inflightDelegates.items.length > 0 || bgTasks.hasAny || Boolean(swarmUi.latestSwarm) || timelineMessages.some((m) => m.role === "tool")) && (
+                <PinnedHudStack
+                  timelineMessages={timelineMessages} chatVersion={chat.version} wsSending={wsSending}
+                  tokenUsage={activeSess?._liveTurnUsage?.usage}
+                  delegateItems={inflightDelegates.items} onDismissDelegate={inflightDelegates.dismiss} onCancelDelegate={inflightDelegates.cancel}
+                  onStopTurn={wsSending ? stopTurn : undefined}
+                  latestSwarm={swarmUi.latestSwarm} latestSwarmCardId={swarmUi.latestCard?.messageId} latestSwarmBlockId={swarmUi.latestCard?.blockId}
+                  onOpenSwarmBoard={swarmUi.openBoard}
+                  museJobs={bgTasks.museJobs} mediaJobs={bgTasks.mediaJobs} bgCommands={bgTasks.bgCommands} sessionCrons={bgTasks.sessionCrons}
+                  onCancelMuseJob={bgTasks.cancelMuseJob} onDismissMuseJob={bgTasks.dismissMuseJob} onCancelMediaJob={bgTasks.cancelMediaJob}
+                  onCancelBgCommand={bgTasks.cancelBgCommand} onToggleSessionCron={bgTasks.toggleSessionCron} onDeleteSessionCron={bgTasks.deleteSessionCron}
+                />
+              )}
+              <div id="pending-approval-bar-slot" className="mx-auto mb-2 max-w-3xl px-4 empty:mb-0 empty:hidden" />
+            </>
           )}
-          {!demo && !gated && (
-            <PinnedTaskTracker
-              todos={extractLatestTodos(timelineMessages)}
-              active={wsSending}
-              settled={currentTurnSettled(timelineMessages)}
-              tokenUsage={activeSess?._liveTurnUsage?.usage}
-            />
-          )}
-          {!demo && !gated && (
-            <PinnedDelegateTracker
-              items={inflightDelegates.items}
-              onDismiss={inflightDelegates.dismiss}
-              // 父轮已结束时不再给「停止本轮」(hud H-18 接线):stopTurn 此时无可停之物,按了没反应。
-              onStop={wsSending ? stopTurn : undefined}
-            />
-          )}
-          {!demo && !gated && (
-            <div
-              id="pending-approval-bar-slot"
-              className="mx-auto mb-2 max-w-3xl px-4 empty:mb-0 empty:hidden"
-            />
-          )}
-          {/* 以下六条横幅的显隐由 bannerStack(resolveBanners)统一裁决,渲染顺序即优先级:
-              发送失败 > 连接状态 > 本轮运行 > 容器休眠 > 新版本 > 成本提醒;超出 2 条的折叠成一行。 */}
+          {/* 全局横幅栈按优先级展示（发送失败 > 连接状态 > 新版本 > 成本提醒），超出 2 条折叠。 */}
           {showBanner("error") && chatError && (
             <ErrorBanner
               error={chatError}
@@ -2547,21 +2520,19 @@ export function App() {
                 if (!activeId) return;
                 const t = chatError.retryText;
                 setChatError(null);
-                send(taskContinuationPrompt(t), undefined, undefined, "继续", undefined, { sessionId: activeId });
+                if (t.trim()) void send(t, undefined, undefined, undefined, undefined, { sessionId: activeId });
               }}
               onDismiss={() => setChatError(null)}
               onSwitchModel={demo ? undefined : () => setModelPickerOpen(true)}
             />
           )}
-          {/* WS 连接状态条三态（离线 / 环境启动中 / 服务端重连中，见 deriveConnBanner）。仅非 demo。
-              移动端(< md)软键盘弹出会压缩可视视口,流式布局里的横幅会被顶出屏幕;改走
-              Composer 的 banner 插槽钉在输入框上方,始终可见。桌面(md+)保持原流式位置。 */}
+          {/* WS 连接状态条（离线 / 重连中；桌面流式位，移动端走 Composer banner 插槽）。 */}
           {showBanner("connection") && connBanner && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
               <Alert
                 tone={connBanner.tone}
                 action={
-                  connBanner.tone === "warning" ? (
+                  canRetryConnect ? (
                     <Button
                       size="sm"
                       variant="secondary"
@@ -2576,46 +2547,43 @@ export function App() {
               </Alert>
             </div>
           )}
-          {showBanner("turn") && backgroundTurn.notice && <BackgroundTurnBanner notice={backgroundTurn.notice} />}
-          {showBanner("dormant") && (
-            <div className="mx-auto mb-2 max-w-3xl px-4">
-              <Alert tone="info">容器已休眠，发送消息后将自动唤醒。</Alert>
-            </div>
-          )}
           {/* 版本更新横幅:仅 governor 判定不能自动软刷时出现(自动刷成功的用户无感)。*/}
           {showBanner("update") && <UpdateBanner />}
           {showBanner("cost") && activeSess?._turnCostReminderCredits && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
-              <TurnCostReminder
-                credits={activeSess._turnCostReminderCredits}
-              />
+              <TurnCostReminder credits={activeSess._turnCostReminderCredits} />
             </div>
           )}
-          {(bannerStack.hidden.length > 0 || bannerStack.canCollapse) && (
+          {bannerStack.hidden.length > 0 && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
-              {/* 折叠条不走 Alert 的 action 槽:那个槽在 <sm 会整行换到第二行右对齐(给「重试」类
-                  动作设计的),折叠条要的是"一行文字 + 行内切换键",在 390px 上两行会把省下来的
-                  高度又吃回去。 */}
               <Alert tone="info" density="compact" live="off" data-testid="banner-stack-collapsed">
                 <div className="flex items-center justify-between gap-3">
-                  <span>
-                    {bannersExpanded ? "已展开全部提示" : collapsedBannersLabel(bannerStack.hidden.length)}
-                  </span>
+                  <span>{collapsedBannersLabel(bannerStack.hidden.length)}</span>
                   <Button
                     size="sm"
                     variant="ghost"
                     className="-my-1.5 -mr-1.5 shrink-0"
                     aria-expanded={bannersExpanded}
-                    onClick={() => setBannersExpanded((v) => !v)}
+                    onClick={() => setBannersExpanded(true)}
                   >
-                    {bannersExpanded ? "收起" : "展开"}
+                    展开
                   </Button>
                 </div>
               </Alert>
             </div>
           )}
+          {!demo && !gated && user?.credits != null && Number.isFinite(Number(user.credits)) && Number(user.credits) <= 0 && (
+            <div className="mx-auto mb-2 max-w-3xl px-4">
+              <Alert tone="danger" density="compact" data-testid="credits-depleted-banner">
+                <div className="flex items-center justify-between gap-3">
+                  <span>积分余额已耗尽，充值后可继续对话。</span>
+                  <Button size="sm" variant="secondary" className="-my-1 shrink-0" onClick={() => openSettings("account")}>去充值</Button>
+                </div>
+              </Alert>
+            </div>
+          )}
           {!demo && !gated && queuedOutgoing.length > 0 && (
-            <QueuedSendList
+            <QueuedSendListLazy
               messages={queuedOutgoing}
               onEdit={(message) => cardCallbacks.onEditQueued?.(message)}
               onDelete={(message) => cardCallbacks.onDeleteQueued?.(message)}
@@ -2637,7 +2605,7 @@ export function App() {
                   <Alert
                     tone={connBanner.tone}
                     action={
-                      connBanner.tone === "warning" ? (
+                      canRetryConnect ? (
                         <Button
                           size="sm"
                           variant="secondary"
@@ -2651,11 +2619,12 @@ export function App() {
                     {connBanner.text}
                   </Alert>
                 </div>
-              ) : backgroundTurn.notice && !isMdViewport ? (
-                <BackgroundTurnBanner notice={backgroundTurn.notice} />
               ) : undefined
             }
-            placeholder={`和「${agent.name}」对话…`}
+            placeholder={swarmMode ? undefined : `和「${agent.name}」对话…`}
+            swarmSupported={swarmSupported}
+            swarmMode={swarmMode}
+            onToggleSwarmMode={toggleSwarmMode}
             onUpload={demo ? undefined : uploadMedia}
             getVoiceToken={demo ? undefined : () => authRef.current.snapshot().token}
             prefill={composerPrefill}
@@ -2673,6 +2642,12 @@ export function App() {
             fontSize={composerPrefs.fontSize}
             goalOpenRequest={goalOpenNonce}
             onQuickAskCommand={gated ? undefined : (q) => setQuickAsk((s) => ({ ...s, open: true, mounted: true, seed: { text: q, nonce: ++quickAskSeedRef.current } }))}
+            contextPressure={demo ? null : (activeSess?._contextPressure ?? null)}
+            contextCompactBusy={Boolean(activeSess?._compactingManual || activeSess?._turnStatus === "compacting")}
+            hasActiveSession={Boolean(activeId && !demo)}
+            onCompactCommand={demo || gated || !activeId ? undefined : (ins) => void handleCompactSession(ins)}
+            onOpenContextHealth={demo || gated || !activeId ? undefined : () => setContextHealthOpen(true)}
+            onStartNewSession={demo ? undefined : handleNew}
             projectSlot={
               // 仍是未发首条的草稿时可改归属:包括被 GitHub/目标提前物化成空会话行的草稿。
               activeId && !sessions.some((x) => x.id === activeId && x.messageCount === 0 && !x.projectId) ? undefined : (
@@ -2691,70 +2666,77 @@ export function App() {
         )}
       </main>
 
-      {/* 详情面板(右侧第三栏)。宽屏:与 Sidebar|main 并列的内联 aside;
-          更窄:贴底 Sheet(共用 InspectorPanelContent)。任务看板 / 项目主页占据 main 时不渲染。 */}
-      {paneInline && (
-        <LazyBoundary
-          key={activeId ?? "demo"}
-          fallback={
-            <aside className="flex shrink-0 flex-col items-center gap-3 border-l border-border p-4" style={{ width: paneWidth.width }}>
-              <output className="flex items-center gap-2 text-muted"><Spinner />正在加载详情面板…</output>
-              <Button variant="ghost" onClick={() => setPaneOpen(false)}>关闭详情面板</Button>
-            </aside>
-          }
-        >
-          <InspectorPanel
-            key={activeId ?? "demo"}
-            messages={wsMessages}
-            version={chat.version}
-            running={wsSending}
-            request={paneRequestHere}
-            deferredLoader={paneDeferredLoader}
-            focusNonce={paneRequestHere?.nonce}
-            onClose={() => setPaneOpen(false)}
-            onActiveChange={setPaneActive}
-            width={paneWidth.width}
-            resizing={paneWidth.resizing}
-            widthMin={DETAIL_PANE_WIDTH.min}
-            widthMax={DETAIL_PANE_WIDTH.max}
-            onResizeStart={paneWidth.onResizeStart}
-            onResizeKeyDown={paneWidth.onResizeKeyDown}
-          />
-        </LazyBoundary>
-      )}
-      <Sheet
-        open={paneAvailable && paneSheetOpen && !isWideViewport}
-        onOpenChange={(o) => {
-          if (!o) setPaneSheetOpen(false);
-        }}
-        side="bottom"
-        srTitle="详情面板"
-      >
-        {paneSheetOpen && (
-          <div className="flex h-[80dvh] min-h-0 flex-col">
-            <LazyBoundary
-              key={activeId ?? "demo"}
-              fallback={
-                <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-4">
-                  <output className="flex items-center gap-2 text-muted"><Spinner />正在加载详情面板…</output>
-                  <Button variant="ghost" onClick={() => setPaneSheetOpen(false)}>关闭详情面板</Button>
-                </div>
+      {(() => {
+        const sharedPaneProps = {
+          messages: wsMessages, version: chat.version, running: wsSending, request: paneRequestHere,
+          deferredLoader: paneDeferredLoader, onActiveChange: setPaneActive,
+          onStopTurn: wsSending ? stopTurn : undefined, liveBrowserAgentId: demo ? undefined : agent.id, liveBrowserAuth: auth,
+        };
+        return (
+          <>
+            {paneInline && (
+              <LazyBoundary
+                key={activeId ?? "demo"}
+                fallback={
+                  <aside className="flex shrink-0 flex-col items-center gap-3 border-l border-border p-4" style={{ width: paneWidth.width }}>
+                    <output className="flex items-center gap-2 text-muted"><Spinner />正在加载详情面板…</output>
+                    <Button variant="ghost" onClick={() => setPaneOpen(false)}>关闭详情面板</Button>
+                  </aside>
+                }
+              >
+                <InspectorPanel
+                  key={activeId ?? "demo"}
+                  {...sharedPaneProps}
+                  focusNonce={paneRequestHere?.nonce}
+                  onClose={() => setPaneOpen(false)}
+                  width={paneWidth.width}
+                  resizing={paneWidth.resizing}
+                  widthMin={DETAIL_PANE_WIDTH.min}
+                  widthMax={DETAIL_PANE_WIDTH.max}
+                  onResizeStart={paneWidth.onResizeStart}
+                  onResizeKeyDown={paneWidth.onResizeKeyDown}
+                  onAnnotateToComposer={appendToComposer}
+                />
+              </LazyBoundary>
+            )}
+            <Sheet
+              open={paneAvailable && paneSheetOpen && !isWideViewport}
+              onOpenChange={(o) => { if (!o) closePaneSheet(); }}
+              side="bottom"
+              srTitle="详情面板"
+              className={
+                paneSheetFull
+                  ? "h-[100dvh] max-h-[100dvh] overflow-hidden rounded-none pb-0 [&>div:first-of-type]:hidden"
+                  : "h-[92dvh] max-h-[92dvh] overflow-hidden pb-0"
               }
             >
-              <InspectorPanelContent
-                key={activeId ?? "demo"}
-                messages={wsMessages}
-                version={chat.version}
-                running={wsSending}
-                request={paneRequestHere}
-                deferredLoader={paneDeferredLoader}
-                onClose={() => setPaneSheetOpen(false)}
-                onActiveChange={setPaneActive}
-              />
-            </LazyBoundary>
-          </div>
-        )}
-      </Sheet>
+              {paneSheetOpen && (
+                <div className="flex min-h-0 flex-1 flex-col">
+                  <LazyBoundary
+                    key={activeId ?? "demo"}
+                    fallback={
+                      <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-4">
+                        <output className="flex items-center gap-2 text-muted"><Spinner />正在加载详情面板…</output>
+                        <Button variant="ghost" onClick={closePaneSheet}>关闭详情面板</Button>
+                      </div>
+                    }
+                  >
+                    <InspectorPanelContent
+                      key={activeId ?? "demo"}
+                      {...sharedPaneProps}
+                      sheet
+                      fullscreen={paneSheetFull}
+                      onToggleFullscreen={() => setPaneSheetFull((v) => !v)}
+                      onClose={closePaneSheet}
+                      onAnnotateToComposer={(text) => { appendToComposer(text); closePaneSheet(); }}
+                    />
+                  </LazyBoundary>
+                </div>
+              )}
+            </Sheet>
+          </>
+        );
+      })()}
 
       <AppDialogs
         preferencesRevision={preferencesRevision}
@@ -2806,7 +2788,7 @@ export function App() {
         openManage={openManage}
         openMarketplace={openMarketplace}
         openRepo={openRepo}
-        openSites={demo ? undefined : () => openSites(null)}
+        openSites={demo ? undefined : (slug) => openSites(slug ?? null)}
         openTutorial={openTutorial}
         orgOpen={orgOpen}
         orgSection={orgSection}
@@ -2824,7 +2806,7 @@ export function App() {
         projectSettingsMounted={projectSettingsMounted}
         projectSettingsOpen={projectSettingsOpen}
         projects={projects}
-        refreshMe={refreshMe}
+        refreshMe={refreshMeWithSub}
         refreshMyAgents={refreshMyAgents}
         repo={repo}
         repoModalMounted={repoModalMounted}
@@ -2867,6 +2849,7 @@ export function App() {
         setSaveToProject={setSaveToProject}
         setSettingsOpen={setSettingsOpen}
         setShareOpen={setShareOpen}
+        setSubscribeOpenSignal={setSubscribeOpenSignal}
         setTeamMode={setTeamMode}
         setTheme={setTheme}
         setUngroupedAssetsOpen={setUngroupedAssetsOpen}
@@ -2884,6 +2867,13 @@ export function App() {
         updateProject={updateProject}
         user={user}
         wsMessages={wsMessages}
+        selectModel={selectModel} liveTerminal={liveTerminal} sessionNeedsYou={sessionNeedsYou}
+        unreadIds={unreadSessions.unreadIds} swarmSessionIds={swarmSessionIds} onMarkRead={unreadSessions.markRead}
+        onToggleSwarm={swarmUi.latestCard ? () => swarmUi.openBoard({ snapshot: swarmUi.latestCard!.snapshot, cardId: swarmUi.latestCard!.messageId, blockId: swarmUi.latestCard!.blockId }) : undefined}
+        onOpenQuickAsk={gated ? undefined : () => setQuickAsk((s) => ({ ...s, open: true, mounted: true }))}
+        contextHealthOpen={contextHealthOpen}
+        onContextHealthOpenChange={setContextHealthOpen}
+        onCompactSession={demo || gated || !activeId ? undefined : () => void handleCompactSession()}
       />{tutorialOpen && (
         <LazyBoundary fallback={<DialogFallback />}>
           <TutorialCenter
@@ -2925,6 +2915,7 @@ export function App() {
         <LazyBoundary key={user?.id ?? "anon"} fallback={null}>
           <QuickAskWindow
             open={quickAsk.open} onClose={closeQuickAsk} onSendingChange={onQuickAskSending} seed={quickAsk.seed}
+            onQuoteToComposer={appendToComposer}
             chat={chat} authRef={authRef} user={user} demo={demo} agent={agent} models={models} mainlineModelId={modelId}
             authorizeSwitch={demo ? undefined : authorizeSwitch}
             mainlineSessionId={activeId} mainlineTitle={activeSess?.title ?? sessions.find((s) => s.id === activeId)?.title}
@@ -2954,6 +2945,9 @@ export function App() {
           />
         </LazyBoundary>
       )}
+      {swarmUi.boardOpen && swarmUi.activeDrawerSwarm && (
+        <SwarmBoardDrawer open={swarmUi.boardOpen} onOpenChange={swarmUi.setBoardOpen} snapshot={swarmUi.activeDrawerSwarm} sessionId={activeId} initialFocusMember={swarmUi.boardFocus.member} initialFocusChannel={swarmUi.boardFocus.channel} initialFocusSeq={swarmUi.boardFocus.seq} syncStale={Boolean(activeSess?._swarmSyncStale)} onStopSwarm={wsSending ? stopTurn : undefined} onQuoteToComposer={appendToComposer} />
+      )}
       {containerPreviewUrl && (
         <LazyBoundary fallback={<DialogFallback />}>
           <ContainerWebPreview
@@ -2963,7 +2957,7 @@ export function App() {
             auth={auth}
             onClose={() => setContainerPreviewUrl(null)}
             onUseComments={(text) => {
-              setComposerPrefill({ text, nonce: Date.now() });
+              appendToComposer(text);
               setContainerPreviewUrl(null);
             }}
           />

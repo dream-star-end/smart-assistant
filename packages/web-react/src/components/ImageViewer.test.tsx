@@ -516,4 +516,35 @@ describe('ImageViewer 全屏查看器', () => {
     expect(hrefs[0]).toContain('t=fresh-fallback')
     expect(hrefs[0]).not.toContain('t=stale-error')
   })
+
+  test('支持双击 2× 缩放、滚轮缩放、拖拽平移与还原胶囊(OCV5-838)', () => {
+    render(<Harness submitImageEdit={vi.fn()} />)
+    const img = screen.getByAltText('海报')
+    const stage = screen.getByTestId('image-viewer-stage')
+    const pill = screen.getByTestId('image-viewer-zoom-pill')
+
+    expect(pill).toHaveTextContent('100%')
+    expect(pill).not.toHaveTextContent('还原')
+
+    // 双击图片放大至 200%
+    fireEvent.doubleClick(img)
+    expect(pill).toHaveTextContent('200%')
+    expect(pill).toHaveTextContent('还原')
+    expect(img.style.transform).toContain('scale(2)')
+
+    // 放大态拖拽平移
+    fireEvent.pointerDown(stage, { pointerId: 1, pointerType: 'mouse', button: 0, clientX: 100, clientY: 100 })
+    fireEvent.pointerMove(stage, { pointerId: 1, pointerType: 'mouse', clientX: 140, clientY: 125 })
+    fireEvent.pointerUp(stage, { pointerId: 1, pointerType: 'mouse' })
+    expect(img.style.transform).toContain('translate3d(40px, 25px, 0)')
+
+    // 滚轮继续放大
+    fireEvent.wheel(stage, { deltaY: -100 })
+    expect(pill).toHaveTextContent('230%')
+
+    // 点击还原胶囊回到 100%
+    fireEvent.click(pill)
+    expect(pill).toHaveTextContent('100%')
+    expect(img.style.transform).toContain('translate3d(0px, 0px, 0) scale(1)')
+  })
 })

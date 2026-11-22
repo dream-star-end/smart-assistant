@@ -92,7 +92,8 @@ describe("deferred oversized immutable record", () => {
     renderMsg(deferred, { onPeekTapeRecordPayload, onFetchTapeRecordPayload });
 
     expect(screen.getByText("终端")).toBeInTheDocument();
-    expect(screen.queryByText("正在读取真实 Agent 记录…")).toBeNull();
+    expect(screen.queryByText("正在加载内容…")).toBeNull();
+    expect(screen.queryByText(/真实 Agent 记录/)).toBeNull();
     expect(onFetchTapeRecordPayload).not.toHaveBeenCalled();
     expect(onPeekTapeRecordPayload).toHaveBeenCalledWith(
       "tape-1",
@@ -248,7 +249,7 @@ describe("deferred oversized immutable record", () => {
       } satisfies ChatMessage]);
       renderMsg(deferred, { onFetchTapeRecordPayload });
       await vi.waitFor(() => expect(onFetchTapeRecordPayload).toHaveBeenCalledTimes(1));
-      expect(screen.queryByRole("button", { name: /点击继续/ })).toBeNull();
+      expect(screen.queryByRole("button", { name: /重新加载/ })).toBeNull();
       await act(async () => { await vi.advanceTimersByTimeAsync(1600); });
       await vi.waitFor(() => expect(onFetchTapeRecordPayload).toHaveBeenCalledTimes(2));
       await vi.waitFor(() => expect(screen.getByText("终端")).toBeInTheDocument());
@@ -275,7 +276,7 @@ describe("deferred oversized immutable record", () => {
       } satisfies ChatMessage]);
       renderMsg(deferred, { onFetchTapeRecordPayload });
       await act(async () => { await vi.advanceTimersByTimeAsync(6000); });
-      const retry = await screen.findByRole("button", { name: "真实记录加载失败，点击继续" });
+      const retry = await screen.findByRole("button", { name: "内容加载失败，点击重新加载" });
       expect(onFetchTapeRecordPayload).toHaveBeenCalledTimes(3);
       fireEvent.click(retry);
       await vi.waitFor(() => expect(onFetchTapeRecordPayload).toHaveBeenCalledTimes(4));

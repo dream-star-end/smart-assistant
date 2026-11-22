@@ -25,7 +25,7 @@ function InflightBadge({ fl, startedAt }: { fl: Inflight | null; startedAt: stri
     `峰值自 egress 启动累计,重启归零${startedAt ? `(启动于 ${fmtDateTime(startedAt)})` : ""}` +
     (fl.peak_at ? `;峰值出现于 ${fmtDateTime(fl.peak_at)}` : "");
   return (
-    <span className="inline-flex items-center gap-1.5">
+    <span className="inline-flex items-center gap-1.5 tabular-nums">
       <Badge tone={cur > 0 ? "success" : "neutral"}>{cur}</Badge>
       <span className="text-caption text-faint" title={peakTitle}>
         峰值 {fl.peak ?? 0}
@@ -130,30 +130,30 @@ export function ModelRow({
   };
 
   const cellInput =
-    "h-8 w-full min-w-[5.5rem] text-[13px] tabular-nums";
+    "oc-field-control h-8 w-full min-w-[5.5rem] font-mono text-[13px] tabular-nums";
 
   return (
-    <tr className="border-b border-border/60 last:border-0">
-      <td className="whitespace-nowrap px-3 py-2 font-mono text-meta text-fg">{model.model_id}</td>
-      <td className="px-3 py-2">
+    <tr className="transition-colors duration-150 hover:bg-hover/55">
+      <td className="whitespace-nowrap px-3 py-2.5 font-mono text-meta font-medium text-fg">{model.model_id}</td>
+      <td className="px-3 py-2.5">
         <Input
           value={displayName}
           onChange={(e) => setDisplayName(e.target.value)}
           maxLength={120}
           placeholder="—"
-          className="h-8 w-full min-w-[8rem] text-body"
+          className="oc-field-control h-8 w-full min-w-[8rem] text-body"
         />
       </td>
-      <td className="px-3 py-2">
-        <span className="rounded-md bg-hover px-1.5 py-0.5 font-mono text-caption text-muted">
+      <td className="px-3 py-2.5">
+        <span className="oc-badge-craft rounded-md bg-hover px-2 py-0.5 font-mono text-caption text-muted">
           {model.provider.id || "—"}
         </span>
       </td>
-      <td className="whitespace-nowrap px-3 py-2">
+      <td className="whitespace-nowrap px-3 py-2.5">
         <InflightBadge fl={inflight} startedAt={startedAt} />
       </td>
       <td
-        className="whitespace-nowrap px-3 py-2 text-meta text-muted"
+        className="whitespace-nowrap px-3 py-2.5 text-meta tabular-nums text-muted"
         title={
           model.usage
             ? `7d: ${usageLine(model.usage.d7)}\ncache_read: 24h ${fmtCompactNum(model.usage.d1.cache_read_tokens)} · 7d ${fmtCompactNum(model.usage.d7.cache_read_tokens)}`
@@ -163,7 +163,7 @@ export function ModelRow({
         {model.usage ? usageLine(model.usage.d1) : "—"}
       </td>
       {PRICE_FIELDS.map(([f]) => (
-        <td key={f} className="px-3 py-2">
+        <td key={f} className="px-3 py-2.5">
           <Input
             type="number"
             min={0}
@@ -174,11 +174,11 @@ export function ModelRow({
           />
         </td>
       ))}
-      <td className="px-3 py-2">
+      <td className="px-3 py-2.5">
         <Input
           value={multiplier}
           onChange={(e) => setMultiplier(e.target.value)}
-          className="h-8 w-full min-w-[4.5rem] text-body tabular-nums"
+          className="oc-field-control h-8 w-full min-w-[4.5rem] font-mono text-body tabular-nums"
         />
       </td>
       <td className="px-3 py-2">

@@ -350,3 +350,368 @@ test("OCV5-724: recovery executor stays available after last browser tab detache
     await registry.shutdown();
   }
 });
+
+test("OCV5-819 P0-2: slow hello on session A never head-of-line blocks session B messages or pings", async () => {
+  let releaseHelloA!: () => void;
+  const gateA = new Promise<void>((r) => { releaseHelloA = r; });
+  const queryPool = {
+    query: async () => {
+      await gateA;
+      return { rows: [{ after_seq: "5", active_message_ids: [] }], rowCount: 1 };
+    },
+  } as unknown as Queryable;
+  const registry = new ContainerLinkRegistry(queryPool);
+  const physical = new Transport();
+  try {
+    const sockA = await registry.attach(1n, 7, () => physical as unknown as WebSocket);
+    const sockB = await registry.attach(1n, 7, () => { throw new Error("must reuse transport"); });
+    getContainerLinkHandle(sockA)!.activate();
+    getContainerLinkHandle(sockB)!.activate();
+
+    const helloA = new Promise<void>((resolve, reject) =>
+      sockA.send(wire({ type: "inbound.hello", peers: [{ peerId: "session-A", agentId: "main" }] }), {}, (e) => e ? reject(e) : resolve()),
+    );
+    await Promise.resolve();
+    // While session-A hello is stalled in PG, session-B message and ping MUST transmit immediately!
+    const msgB = new Promise<void>((resolve, reject) =>
+      sockB.send(wire({ type: "inbound.message", peer: { id: "session-B" }, clientMessageId: "cm-b" }), {}, (e) => e ? reject(e) : resolve()),
+    );
+    const pingB = new Promise<void>((resolve, reject) =>
+      sockB.send(wire({ type: "ping", id: "p-1" }), {}, (e) => e ? reject(e) : resolve()),
+    );
+    await Promise.all([msgB, pingB]);
+    assert.deepEqual(physical.sent.map((f) => f.type), ["inbound.message", "ping"]);
+    releaseHelloA();
+    await helloA;
+    assert.deepEqual(physical.sent.map((f) => f.type), ["inbound.message", "ping", "inbound.hello"]);
+  } finally {
+    await registry.shutdown();
+  }
+});
+
+test("OCV5-819 P0-2 (B4): hello prepare timeout blocks dependent session frames without killing shared transport", async () => {
+  const registry = new ContainerLinkRegistry(pool, null, { helloPrepareTimeoutMs: 40 });
+  registry.beforeReplay = (scope) => {
+    if (scope?.sessionIds.includes("session-A")) {
+      return new Promise<void>(() => { /* deliberately stalled for session-A */ });
+    }
+    return Promise.resolve();
+  };
+  const physical = new Transport();
+  try {
+    const sockA = await registry.attach(1n, 7, () => physical as unknown as WebSocket);
+    const sockB = await registry.attach(1n, 7, () => { throw new Error("must reuse transport"); });
+    getContainerLinkHandle(sockA)!.activate();
+    getContainerLinkHandle(sockB)!.activate();
+
+    const errA = await new Promise<Error | undefined>((resolve) =>
+      sockA.send(wire({ type: "inbound.hello", peers: [{ peerId: "session-A", agentId: "main" }] }), {}, resolve),
+    );
+    assert.ok(errA);
+    assert.match(errA.message, /timeout/);
+    assert.equal(physical.readyState, WebSocket.OPEN, "hello timeout must not tear down shared transport");
+
+    // B4: Dependent message for session-A on the failed handle MUST NOT hit the physical wire!
+    const blockedMsgA = await new Promise<Error | undefined>((resolve) =>
+      sockA.send(wire({ type: "inbound.message", peer: { id: "session-A" }, clientMessageId: "cm-a-blocked" }), {}, resolve),
+    );
+    assert.ok(blockedMsgA);
+    assert.match(blockedMsgA.message, /hello failed/);
+    assert.equal(physical.sent.length, 0, "dependent session-A message must never bypass failed hello");
+
+    // Session B continues working on the healthy shared transport.
+    await new Promise<void>((resolve, reject) =>
+      sockB.send(wire({ type: "inbound.message", peer: { id: "session-B" }, clientMessageId: "cm-ok" }), {}, (e) => e ? reject(e) : resolve()),
+    );
+    assert.equal(physical.sent.length, 1);
+    assert.equal(physical.sent[0]!.clientMessageId, "cm-ok");
+  } finally {
+    await registry.shutdown();
+  }
+});
+
+test("OCV5-819 P0-2 (B5): queued inbound frame fails at absolute sendQueueTimeoutMs BEFORE stalled predecessor finishes", async () => {
+  let releaseHello!: () => void;
+  const gate = new Promise<void>((r) => { releaseHello = r; });
+  const queryPool = {
+    query: async () => {
+      await gate;
+      return { rows: [{ after_seq: "1", active_message_ids: [] }], rowCount: 1 };
+    },
+  } as unknown as Queryable;
+  const registry = new ContainerLinkRegistry(queryPool, null, {
+    helloPrepareTimeoutMs: 5_000,
+    sendQueueTimeoutMs: 30,
+  });
+  const physical = new Transport();
+  try {
+    const sock = await registry.attach(1n, 7, () => physical as unknown as WebSocket);
+    getContainerLinkHandle(sock)!.activate();
+
+    const helloDone = new Promise<void>((resolve, reject) =>
+      sock.send(wire({ type: "inbound.hello", peers: [{ peerId: "s-same", agentId: "main" }] }), {}, (e) => e ? reject(e) : resolve()),
+    );
+    let queuedError: Error | undefined;
+    let failedAt = 0;
+    const startedAt = Date.now();
+    const queuedPromise = new Promise<void>((resolve) => {
+      sock.send(wire({ type: "inbound.message", peer: { id: "s-same" }, clientMessageId: "cm-stale" }), {}, (err) => {
+        queuedError = err;
+        failedAt = Date.now() - startedAt;
+        resolve();
+      });
+    });
+
+    // B5: Do NOT release predecessor yet — queuedPromise must fail on its own absolute timer!
+    await queuedPromise;
+    assert.ok(queuedError);
+    assert.match(queuedError.message, /queue timeout/);
+    assert.ok(failedAt < 200, `expected fast fail near 30ms before predecessor settles, got ${failedAt}ms`);
+
+    // Releasing predecessor later must NOT cause the already-expired frame to be sent.
+    releaseHello();
+    await helloDone;
+    assert.deepEqual(physical.sent.map((f) => f.type), ["inbound.hello"], "expired frame must never be sent after predecessor settles");
+  } finally {
+    await registry.shutdown();
+  }
+});
+
+test("OCV5-819 P0-2 (B6): multi-peer hello [A, B] lets B register and send messages while A is stalled", async () => {
+  let releaseA!: () => void;
+  const gateA = new Promise<void>((r) => { releaseA = r; });
+  const queryPool = {
+    query: async (_sql: string, params?: unknown[]) => {
+      const sessionId = String(params?.[3] ?? "");
+      if (sessionId === "session-A") {
+        await gateA;
+      }
+      return { rows: [{ after_seq: "3", active_message_ids: [] }], rowCount: 1 };
+    },
+  } as unknown as Queryable;
+  const registry = new ContainerLinkRegistry(queryPool);
+  const physical = new Transport();
+  try {
+    const sock = await registry.attach(1n, 7, () => physical as unknown as WebSocket);
+    getContainerLinkHandle(sock)!.activate();
+
+    // Browser sends ONE multi-peer hello covering both session-A and session-B.
+    const multiHello = new Promise<void>((resolve, reject) =>
+      sock.send(
+        wire({
+          type: "inbound.hello",
+          peers: [
+            { peerId: "session-A", agentId: "main" },
+            { peerId: "session-B", agentId: "main" },
+          ],
+        }),
+        {},
+        (e) => (e ? reject(e) : resolve()),
+      ),
+    );
+
+    // While session-A's PG lookup is STILL blocked, session-B's hello AND message MUST succeed!
+    await new Promise<void>((resolve, reject) =>
+      sock.send(wire({ type: "inbound.message", peer: { id: "session-B" }, clientMessageId: "cm-b-live" }), {}, (e) => e ? reject(e) : resolve()),
+    );
+    assert.equal(physical.sent.some((f) => f.type === "inbound.hello" && f.peers?.[0]?.peerId === "session-B"), true);
+    assert.equal(physical.sent.some((f) => f.type === "inbound.message" && f.clientMessageId === "cm-b-live"), true);
+    assert.equal(physical.sent.some((f) => f.type === "inbound.hello" && f.peers?.[0]?.peerId === "session-A"), false);
+
+    releaseA();
+    await multiHello;
+    assert.equal(physical.sent.some((f) => f.type === "inbound.hello" && f.peers?.[0]?.peerId === "session-A"), true);
+  } finally {
+    await registry.shutdown();
+  }
+});
+
+test("OCV5-819 P0-2: renew skips unsent and over-aged admitted dispatches but keeps renewing long accepted turns", async () => {
+  let status = "admitted";
+  let admittedAt = new Date();
+  let renewals = 0;
+  const queryPool = {
+    query: async (sql: string) => {
+      if (sql.includes("container_link_heartbeat")) {
+        renewals += 1;
+        return { rows: [], rowCount: 1 };
+      }
+      return {
+        rows: [{
+          user_id: "42",
+          session_id: "s",
+          client_message_id: "m",
+          dispatch_id: "d",
+          attempt_no: 1,
+          lease_epoch: "2",
+          status,
+          admitted_at: admittedAt,
+          terminal_at: null,
+          anchor_seq: null,
+          agent_container_id: "7",
+        }],
+      };
+    },
+  } as unknown as Queryable;
+  const registry = new ContainerLinkRegistry(queryPool, null, { admittedRenewMaxAgeMs: 60_000 });
+  const physical = new Transport();
+  try {
+    const socket = await registry.attach(42n, 7, () => physical as unknown as WebSocket);
+    const handle = getContainerLinkHandle(socket)!;
+    handle.activate();
+    handle.bindDispatch({
+      sessionId: "s",
+      clientMessageId: "m",
+      dispatchId: "d",
+      attemptNo: 1,
+      leaseEpoch: 2,
+    });
+
+    // 1. Before physical wire send completes (`wireSent === false`), admitted must NOT renew.
+    await handle.link.tick();
+    assert.equal(renewals, 0, "unsent admitted dispatch must not renew lease");
+
+    // 2. After wire send succeeds and within grace window, admitted renews normally.
+    handle.markDispatchSent("s", "m");
+    await handle.link.tick();
+    assert.equal(renewals, 1, "freshly sent admitted dispatch renews within grace window");
+
+    // 3. Once admitted age exceeds cap (e.g. 90s without container ack), stop renewing.
+    admittedAt = new Date(Date.now() - 90_000);
+    await handle.link.tick();
+    assert.equal(renewals, 1, "stale admitted dispatch beyond cap must stop renewing");
+
+    // 4. Once container acknowledges (`accepted`), long-running swarm turns renew unboundedly.
+    status = "accepted";
+    await handle.link.tick();
+    assert.equal(renewals, 2, "accepted long turns must keep renewing regardless of admitted age");
+  } finally {
+    await registry.shutdown();
+  }
+});
+
+test("OCV5-819 R2-B4: PG 57014 error during hello.prepare isolates to handle A without closing shared transport or handle B", async () => {
+  const queryPool = {
+    query: async (_sql: string, params?: unknown[]) => {
+      const sid = String(params?.[3] ?? "");
+      if (sid === "session-A") {
+        const err = Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" });
+        throw err;
+      }
+      return { rows: [{ after_seq: "2", active_message_ids: [] }], rowCount: 1 };
+    },
+  } as unknown as Queryable;
+  const registry = new ContainerLinkRegistry(queryPool);
+  const physical = new Transport();
+  try {
+    const sockA = await registry.attach(1n, 7, () => physical as unknown as WebSocket);
+    const sockB = await registry.attach(1n, 7, () => { throw new Error("must reuse transport"); });
+    getContainerLinkHandle(sockA)!.activate();
+    getContainerLinkHandle(sockB)!.activate();
+
+    const errA = await new Promise<Error | undefined>((resolve) =>
+      sockA.send(wire({ type: "inbound.hello", peers: [{ peerId: "session-A", agentId: "main" }] }), {}, resolve),
+    );
+    assert.ok(errA);
+    assert.match(errA.message, /hello prepare failed/);
+    assert.equal(physical.readyState, WebSocket.OPEN, "PG error in hello prepare must not tear down shared transport");
+    assert.equal(getContainerLinkHandle(sockB)!.disposed, false, "unrelated handle B must remain alive");
+
+    // Dependent frame on A is blocked; B works normally.
+    const blockedA = await new Promise<Error | undefined>((resolve) =>
+      sockA.send(wire({ type: "inbound.message", peer: { id: "session-A" }, clientMessageId: "cm-a" }), {}, resolve),
+    );
+    assert.ok(blockedA);
+    assert.match(blockedA.message, /hello failed/);
+
+    await new Promise<void>((resolve, reject) =>
+      sockB.send(wire({ type: "inbound.message", peer: { id: "session-B" }, clientMessageId: "cm-b" }), {}, (e) => e ? reject(e) : resolve()),
+    );
+    assert.equal(physical.sent.length, 1);
+    assert.equal(physical.sent[0]!.clientMessageId, "cm-b");
+  } finally {
+    await registry.shutdown();
+  }
+});
+
+test("OCV5-819 R2-B5: synchronous deadline check rejects expired queued frame even under event-loop delay before timer fires", async () => {
+  let releaseHello!: () => void;
+  const gate = new Promise<void>((r) => { releaseHello = r; });
+  const queryPool = {
+    query: async () => {
+      await gate;
+      return { rows: [{ after_seq: "1", active_message_ids: [] }], rowCount: 1 };
+    },
+  } as unknown as Queryable;
+  const registry = new ContainerLinkRegistry(queryPool, null, {
+    helloPrepareTimeoutMs: 5_000,
+    sendQueueTimeoutMs: 20,
+  });
+  const physical = new Transport();
+  try {
+    const sock = await registry.attach(1n, 7, () => physical as unknown as WebSocket);
+    getContainerLinkHandle(sock)!.activate();
+
+    const helloDone = new Promise<void>((resolve, reject) =>
+      sock.send(wire({ type: "inbound.hello", peers: [{ peerId: "s-jitter", agentId: "main" }] }), {}, (e) => e ? reject(e) : resolve()),
+    );
+    const queuedResult = new Promise<Error | undefined>((resolve) =>
+      sock.send(wire({ type: "inbound.message", peer: { id: "s-jitter" }, clientMessageId: "cm-jitter" }), {}, resolve),
+    );
+
+    // Block event loop synchronously past the 20ms deadline, then release predecessor in the same tick
+    // so the microtask continuation runs BEFORE setTimeout can fire!
+    const spinUntil = Date.now() + 35;
+    while (Date.now() < spinUntil) { /* busy wait */ }
+    releaseHello();
+
+    await helloDone;
+    const err = await queuedResult;
+    assert.ok(err);
+    assert.match(err.message, /queue timeout/);
+    assert.deepEqual(physical.sent.map((f) => f.type), ["inbound.hello"], "expired frame must not hit wire even under timer lag");
+  } finally {
+    await registry.shutdown();
+  }
+});
+
+test("OCV5-821: origin executor availability respects candidate isAvailable on detached keepAlive/open links", async () => {
+  const registry = new ContainerLinkRegistry(pool);
+  const physical = new Transport();
+  const maps = { recovery: new Map<string, Set<RecoveryExecutor>>(), origin: new Map<string, Set<CronOriginExecutor>>() };
+  try {
+    const sock = await registry.attach(9n, 11, () => physical as unknown as WebSocket);
+    const handle = getContainerLinkHandle(sock)!;
+    handle.keepAlive = true;
+    handle.activate();
+    let originReady = false;
+    let originCalls = 0;
+    const originFn: CronOriginExecutor = () => {
+      originCalls++;
+      return originReady ? { kind: "claimed" } : { kind: "not_claimed" };
+    };
+    originFn.agentContainerId = 11;
+    originFn.runtimeKind = "docker";
+    (originFn as CronOriginExecutor & { isAvailable?: () => boolean }).isAvailable = () => originReady;
+    registerBridgeExecutors(9n, sock, {
+      recovery: () => {},
+      origin: originFn,
+    }, maps);
+    handle.detach();
+
+    // When detached keepAlive link's origin reports unavailable (e.g. draining), availableExecutors must hide it
+    // instead of advertising transport before admitUserTurn and then returning not_claimed.
+    assert.equal(availableExecutors(maps.recovery.get("9")).length, 1, "recovery remains available on keepAlive link");
+    assert.equal(availableExecutors(maps.origin.get("9")).length, 0, "origin unavailable when candidate isAvailable() is false");
+
+    // When origin reports ready on the detached keepAlive link, availableExecutors exposes it and invokes it cleanly.
+    originReady = true;
+    const avail = availableExecutors(maps.origin.get("9"));
+    assert.equal(avail.length, 1);
+    assert.equal(avail[0]!.agentContainerId, 11);
+    assert.deepEqual(await avail[0]!({} as Parameters<CronOriginExecutor>[0]), { kind: "claimed" });
+    assert.equal(originCalls, 1);
+  } finally {
+    await registry.shutdown();
+  }
+});

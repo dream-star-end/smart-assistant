@@ -120,7 +120,7 @@ export function GroupFormModal({
     >
       <div className="flex flex-col gap-4">
         <Field label="名称">
-          <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="如 Yunwu GPT 中转站" />
+          <Input className="oc-field-control" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="如 Yunwu GPT 中转站" />
         </Field>
         {isCreate && (
           <div className="grid grid-cols-2 gap-3">
@@ -149,21 +149,22 @@ export function GroupFormModal({
         )}
         {isCreate && (
           <Field label="启用">
-            <div className="flex h-10 items-center">
+            <div className="oc-surface-recessed flex h-10 items-center justify-between rounded-xl px-3.5">
+              <span className="text-sm text-muted">{enabled ? "启用" : "停用"}</span>
               <Switch checked={enabled} onCheckedChange={setEnabled} />
-              <span className="ml-2 text-sm text-muted">{enabled ? "启用" : "停用"}</span>
             </div>
           </Field>
         )}
         <Field label="优先级(数字越小越优先)">
           <Input
+            className="oc-field-control tabular-nums"
             type="number"
             value={priority}
             onChange={(e) => setPriority(e.target.value)}
           />
         </Field>
         <Field label="模型 id(逗号分隔;路由边界)" hint="留空=不限定精确模型。">
-          <Input value={models} onChange={(e) => setModels(e.target.value)} placeholder="如 gpt-5.5, claude-…" />
+          <Input className="oc-field-control font-mono" value={models} onChange={(e) => setModels(e.target.value)} placeholder="如 gpt-5.5, claude-…" />
         </Field>
       </div>
     </Modal>

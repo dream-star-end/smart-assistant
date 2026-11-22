@@ -205,8 +205,10 @@ esac
 # reaper's lock-protected second check will then preserve the active session.
 if [ "$track_activity" -eq 1 ]; then touch "$activity_file"; fi
 pending_file="$state_dir/pending.$$"
+cli_active_file="$state_dir/cli-active.$$"
 : >"$pending_file"
-trap 'rm -f "$pending_file"' EXIT
+: >"$cli_active_file"
+trap 'rm -f "$pending_file" "$cli_active_file"' EXIT
 trap 'exit 130' HUP INT TERM
 exec 9>"$lock_file"
 while ! flock -n 9; do
@@ -215,6 +217,14 @@ while ! flock -n 9; do
 done
 rm -f "$pending_file"
 if [ "$track_activity" -eq 1 ]; then touch "$activity_file"; fi
+if [ "${OPENCLAUDE_BROWSER_OPEN_IF_IDLE:-0}" = "1" ] && [ "$command" = "open" ]; then
+  # Atomic under flock: if another process already opened a session before we acquired
+  # the lock, preserve that live page instead of letting Playwright CLI stop/replace it.
+  if run_cli tab-list >/dev/null 2>&1; then
+    set -- tab-list
+    command=tab-list
+  fi
+fi
 
 reaper_pid="$(cat "$pid_file" 2>/dev/null || true)"
 if [ "$track_activity" -eq 1 ] && \

@@ -12,6 +12,9 @@ export const StepTimingContext = createContext<ReadonlyMap<string, StepTiming> |
 /** Steps shorter than this keep their duration out of sight until hovered (UI-SPEC §5 UI-3). */
 const QUIET_STEP_MS = 10_000
 
+const compactDuration = (s: string) =>
+  s.replace(/\.0 秒$/, 's').replace(/ 秒/g, 's').replace(/ 分 /g, 'm').replace(/ 小时 /g, 'h').replace(/ 分$/, 'm')
+
 function useTicker(enabled: boolean): number {
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
@@ -51,12 +54,14 @@ export function StepMetaBadge({
   const executionMs = timing.ms !== undefined ? timing.executionMs : undefined
   const waitingMs = executionMs !== undefined ? ms - executionMs : 0
   const split = executionMs !== undefined && waitingMs >= 1_000
+  const execText = split ? formatStepDuration(executionMs) : ''
+  const waitText = split ? formatStepDuration(waitingMs) : ''
   const usage = tokenUsageSnapshot(tokenUsage)
   const tokens = usage
     ? `；所在模型调用${tokenUsage?.shared ? '共' : usage.estimated ? '约' : ''} ${groupDigits(String(usage.totalTokens))} token`
     : ''
   const title = split
-    ? `本步共 ${text}；工具执行 ${formatStepDuration(executionMs)}；此前生成与等待 ${formatStepDuration(waitingMs)}${tokens}`
+    ? `本步共 ${text}；工具执行 ${execText}；此前生成与等待 ${waitText}${tokens}`
     : running
     ? `本步已用时 ${text}（自上一步结束起算）${tokens}`
     : `本步耗时 ${text}（自上一步结束起算，含模型生成与执行）${tokens}`
@@ -64,11 +69,18 @@ export function StepMetaBadge({
     <span
       data-testid="step-duration"
       data-step-running={running ? 'true' : 'false'}
-      className={`inline-flex shrink-0 flex-col items-end whitespace-nowrap text-caption font-medium tabular-nums text-faint ${ms < QUIET_STEP_MS ? 'opacity-0 transition-opacity group-hover/step:opacity-100 group-focus-visible/step:opacity-100' : ''}`}
+      className={`inline-flex shrink-0 items-center whitespace-nowrap text-caption font-medium tabular-nums text-faint ${ms < QUIET_STEP_MS ? 'opacity-0 transition-opacity group-hover/step:opacity-100 group-focus-visible/step:opacity-100' : ''}`}
       title={title}
       aria-label={title}
     >
-      {split ? <><span>{`执行 ${formatStepDuration(executionMs)}`}</span><span>{`等待 ${formatStepDuration(waitingMs)}`}</span></> : text}
+      {split ? (
+        <>
+          {compactDuration(execText)}
+          <span className="hidden sm:inline">{` · 等${compactDuration(waitText)}`}</span>
+        </>
+      ) : (
+        compactDuration(text)
+      )}
     </span>
   )
 }

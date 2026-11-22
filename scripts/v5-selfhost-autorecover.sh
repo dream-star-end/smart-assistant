@@ -231,15 +231,57 @@ ar_lock_skip_total() { # <now>
   printf '%s' "$((acc + cur))"
 }
 
-ar_lock_skip_close() { # <end_ts>
-  local end_ts="$1" acc since
+ar_lock_skip_open_wait() { # <start_ts>
+  local start_ts="$1" since closed eff
+  closed="$(ar_get lock_skip_closed_until)"; closed="${closed:-0}"
+  eff="$start_ts"
+  (( closed > eff )) && eff="$closed"
   since="$(ar_get lock_skip_since)"; since="${since:-0}"
-  (( since > 0 )) || return 0
-  acc="$(ar_get lock_skip_sec)"; acc="${acc:-0}"
-  if (( end_ts > since )); then
-    ar_set lock_skip_sec "$((acc + end_ts - since))"
+  if (( since == 0 )); then
+    ar_set lock_skip_since "$eff"
   fi
-  ar_set lock_skip_since 0
+  ar_set lock_skip_had_wait 1
+}
+
+ar_lock_skip_open_rc75() { # <start_ts>
+  local start_ts="$1" since closed eff
+  closed="$(ar_get lock_skip_closed_until)"; closed="${closed:-0}"
+  eff="$start_ts"
+  (( closed > eff )) && eff="$closed"
+  since="$(ar_get lock_skip_since)"; since="${since:-0}"
+  # 区间并集合并:若 wait 已开窗在后,向前扩到 eff 而不重复结算重叠段
+  if (( since == 0 || eff < since )); then
+    ar_set lock_skip_since "$eff"
+  fi
+  ar_set lock_skip_had_wait 0
+}
+
+ar_lock_skip_close() { # <end_ts>
+  local end_ts="$1" acc since closed
+  since="$(ar_get lock_skip_since)"; since="${since:-0}"
+  if (( since > 0 )); then
+    acc="$(ar_get lock_skip_sec)"; acc="${acc:-0}"
+    if (( end_ts > since )); then
+      ar_set lock_skip_sec "$((acc + end_ts - since))"
+    fi
+    closed="$(ar_get lock_skip_closed_until)"; closed="${closed:-0}"
+    if (( end_ts > closed )); then
+      ar_set lock_skip_closed_until "$end_ts"
+    fi
+    ar_set lock_skip_since 0
+  fi
+  ar_set lock_skip_had_wait 0
+}
+
+# 已结算的恢复动作次数:先查动作单元、再在其不活跃时复查结果文件。
+# 动作退出前会原子发布 AR_RESULT,此顺序消除「先判无文件、随后写完退出、再判单元已停」的瞬时窗口竞态。
+ar_settled_attempts() {
+  local attempts
+  attempts="$(ar_get attempts)"; attempts="${attempts:-0}"
+  if ar_unit_active "$AR_ACTION_UNIT.service" || [[ -f "$AR_RESULT" ]]; then
+    attempts=$(( attempts > 0 ? attempts - 1 : 0 ))
+  fi
+  printf '%s' "$attempts"
 }
 
 ar_check_escalation() { # <now> <attempts>   返回 10 表示本 tick 刚新建工单
@@ -302,11 +344,22 @@ autorecover_tick() {
       ar_set lock_skip_since "$now"
     fi
   fi
-  # 1 不抢
-  if lease_deploy_process_running; then ar_log "发布在跑,等待"; return 0; fi
-  if ar_unit_active "$AR_SURVIVOR_UNIT"; then ar_log "cutover survivor 仍在,等待"; return 0; fi
+  # 1 不抢(OCV5-818: 发布列车/cutover survivor 阻塞期间记入跳过窗口,不空耗 1800s 升级时钟,仍受 AR_LOCK_SKIP_MAX_SEC 上限约束;
+  # 失败次数上限仅用已结算次数,避免待消费 AR_RESULT 与旧 last_rc 组合误升级)
+  if lease_deploy_process_running; then
+    ar_lock_skip_open_wait "$now"
+    ar_log "发布在跑,等待"
+    ar_check_escalation "$now" "$(ar_settled_attempts)" || true
+    return 0
+  fi
+  if ar_unit_active "$AR_SURVIVOR_UNIT"; then
+    ar_lock_skip_open_wait "$now"
+    ar_log "cutover survivor 仍在,等待"
+    ar_check_escalation "$now" "$(ar_settled_attempts)" || true
+    return 0
+  fi
   if ar_unit_active "$AR_ACTION_UNIT.service"; then ar_log "上一个恢复动作仍在跑"; return 0; fi
-  # 2 读上一个动作结果
+  # 2 读上一个动作结果(先判结果再决定合并或结算 wait 区间,避免 wait 与 rc=75 重复计费或陈旧 last 截断 wait)
   if [[ -f "$AR_RESULT" ]]; then
     rc="$(sed -n 's/^rc=//p' "$AR_RESULT" | head -n1)"
     out="$(sed -n 's/^out=//p' "$AR_RESULT" | head -n1)"
@@ -315,16 +368,17 @@ autorecover_tick() {
     ar_log "恢复动作结果 rc=${rc:-?} $out"
     last="$(ar_get last)"; last="${last:-0}"
     if [[ "$rc" == 0 ]]; then
-      ar_lock_skip_close "$(( last > 0 ? last : now ))"
+      if [[ "$(ar_get lock_skip_had_wait)" == 1 ]]; then
+        ar_lock_skip_close "$now"
+      else
+        ar_lock_skip_close "$(( last > 0 ? last : now ))"
+      fi
       ar_resolve_trains
       [[ -n "$(ar_get need_escalate)" ]] && ar_escalate "$(ar_get need_escalate)"
       return 0   # 标记已由动作归档;下一 tick 若无事件即结束
     fi
-    if [[ "$rc" == 75 ]]; then  # 现在不能动(锁/窗口),不计次数,累计跳过窗口并下 tick 再来
-      skip_since="$(ar_get lock_skip_since)"; skip_since="${skip_since:-0}"
-      if (( skip_since == 0 )); then
-        ar_set lock_skip_since "$(( last > 0 ? last : now ))"
-      fi
+    if [[ "$rc" == 75 ]]; then  # 现在不能动(锁/窗口),不计次数,按区间并集合并跳过窗口并下 tick 再来
+      ar_lock_skip_open_rc75 "$(( last > 0 ? last : now ))"
       attempts="$(ar_get attempts)"
       attempts="$(( ${attempts:-1} > 0 ? ${attempts:-1} - 1 : 0 ))"
       ar_set attempts "$attempts"
@@ -332,7 +386,13 @@ autorecover_tick() {
       ar_check_escalation "$now" "$attempts" || true
       return 0
     fi
-    ar_lock_skip_close "$(( last > 0 ? last : now ))"
+    if [[ "$(ar_get lock_skip_had_wait)" == 1 ]]; then
+      ar_lock_skip_close "$now"
+    else
+      ar_lock_skip_close "$(( last > 0 ? last : now ))"
+    fi
+  elif [[ "$(ar_get lock_skip_had_wait)" == 1 ]]; then
+    ar_lock_skip_close "$now"
   fi
   # 3 升级判定
   attempts="$(ar_get attempts)"; attempts="${attempts:-0}"

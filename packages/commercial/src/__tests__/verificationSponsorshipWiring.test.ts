@@ -77,7 +77,10 @@ describe("V5 release verification wiring", () => {
       assert.match(source, /track\(sid, \{ expectTurn: true \}\)/, name);
       assert.match(source, /model: cfg\.model/, name);
     }
-    const selector = read("packages/web-react/src/components/ModelSelector.tsx");
+    const selector =
+      read("packages/web-react/src/components/ModelSelector.tsx") +
+      "\n" +
+      read("packages/web-react/src/components/ModelSelectorPanel.tsx");
     assert.match(selector, /data-model-id=\{m\.id\}/);
     const fixture = read("e2e/session-display/fixtures.ts");
     assert.match(fixture, /assertSessionDispatchModel\(userId, id, config\(\)\.model\)/);

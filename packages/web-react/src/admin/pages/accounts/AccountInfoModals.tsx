@@ -97,7 +97,9 @@ export function RefreshHistoryModal({
           <Spinner className="size-4" /> 加载中…
         </div>
       ) : error ? (
-        <div className="py-8 text-center text-sm text-danger">加载失败:{error}</div>
+        <div className="oc-callout oc-callout-danger rounded-xl px-4 py-6 text-center text-sm text-danger">
+          加载失败:{error}
+        </div>
       ) : (
         <>
           <DataTable
@@ -160,7 +162,9 @@ export function RecentUsersModal({
           <Spinner className="size-4" /> 加载中…
         </div>
       ) : error ? (
-        <div className="py-8 text-center text-sm text-danger">加载失败:{error}</div>
+        <div className="oc-callout oc-callout-danger rounded-xl px-4 py-6 text-center text-sm text-danger">
+          加载失败:{error}
+        </div>
       ) : (
         <>
           <DataTable
@@ -300,7 +304,7 @@ export function CursorUsageModal({
           <Spinner className="size-4" /> 正在向 Cursor 查询…
         </div>
       ) : error && !u ? (
-        <div className="flex flex-col items-center gap-3 py-8 text-center text-sm text-danger">
+        <div className="oc-callout oc-callout-danger flex flex-col items-center gap-3 rounded-xl px-4 py-6 text-center text-sm text-danger">
           <span>查询失败:{error}</span>
           <Button size="sm" variant="secondary" onClick={() => void load(true)}>
             重试
@@ -308,8 +312,8 @@ export function CursorUsageModal({
         </div>
       ) : u ? (
         <div className="flex flex-col gap-4">
-          <div className="flex items-center justify-between gap-3 text-meta text-faint">
-            <span>
+          <div className="oc-surface-recessed flex items-center justify-between gap-3 rounded-xl px-3.5 py-2 text-meta text-muted">
+            <span className="tabular-nums">
               拉取于 {fmtDateTime(u.fetched_at)}
               {data?.cached ? "(缓存,60s)" : ""}
             </span>
@@ -318,9 +322,9 @@ export function CursorUsageModal({
             </Button>
           </div>
 
-          <section className="rounded-md border border-border p-3">
-            <div className="mb-2 flex items-center gap-2">
-              <span className="text-sm font-medium">Grok Bot / Sand 池</span>
+          <section className="oc-surface-card rounded-xl p-4">
+            <div className="mb-2.5 flex flex-wrap items-center gap-2">
+              <span className="text-body font-semibold text-fg">Grok Bot / Sand 池</span>
               <span className="text-caption text-faint">独立额度 · 每周重置</span>
               {sand?.grok_plan_label && <Badge tone="neutral">{sand.grok_plan_label}</Badge>}
               {!sand?.grok_plan_label && sand?.grok_plan && <Badge tone="neutral">{sand.grok_plan}</Badge>}
@@ -386,9 +390,9 @@ export function CursorUsageModal({
             )}
           </section>
 
-          <section className="rounded-md border border-border p-3">
-            <div className="mb-2 flex items-center gap-2">
-              <span className="text-sm font-medium">套餐内额度</span>
+          <section className="oc-surface-card rounded-xl p-4">
+            <div className="mb-2.5 flex flex-wrap items-center gap-2">
+              <span className="text-body font-semibold text-fg">套餐内额度</span>
               <span className="text-caption text-faint">Cursor IDE / CLI · 月度</span>
               {u.plan.name && <Badge tone="neutral">{u.plan.name}</Badge>}
               {u.plan.membership_type && u.plan.membership_type !== u.plan.name?.toLowerCase() && (
@@ -435,8 +439,8 @@ export function CursorUsageModal({
             </DescriptionList>
           </section>
 
-          <section className="rounded-md border border-border p-3">
-            <div className="mb-1 text-sm font-medium">按需付费(On-demand)</div>
+          <section className="oc-surface-card rounded-xl p-4">
+            <div className="mb-1.5 text-body font-semibold text-fg">按需付费(On-demand)</div>
             <DescriptionList>
               <DescriptionRow
                 label="状态"
@@ -457,10 +461,10 @@ export function CursorUsageModal({
             </DescriptionList>
           </section>
 
-          <section className="rounded-md border border-border p-3">
-            <div className="mb-2 flex items-baseline justify-between gap-2">
-              <span className="text-sm font-medium">本账期消耗(按模型)</span>
-              <span className="text-meta text-faint">
+          <section className="oc-surface-card rounded-xl p-4">
+            <div className="mb-2.5 flex flex-wrap items-baseline justify-between gap-2">
+              <span className="text-body font-semibold text-fg">本账期消耗(按模型)</span>
+              <span className="text-meta text-faint tabular-nums">
                 {fmtDate(u.cycle_usage.range_start)} → {fmtDate(u.cycle_usage.range_end)} · 合计{" "}
                 {fmtCents(u.cycle_usage.total_cost_cents)} · 输出 {fmtTokens(u.cycle_usage.total_output_tokens)} · 缓存读{" "}
                 {fmtTokens(u.cycle_usage.total_cache_read_tokens)}
@@ -476,7 +480,7 @@ export function CursorUsageModal({
           </section>
 
           {errorEntries.length > 0 && (
-            <div className="rounded-md border border-warning/40 bg-warning/5 p-2 text-meta text-warning">
+            <div className="oc-callout oc-callout-warning rounded-xl px-3.5 py-2.5 text-meta text-warning">
               部分来源不可用:
               {errorEntries.map(([k, v]) => (
                 <span key={k} className="ml-2 font-mono">
@@ -580,7 +584,7 @@ export function GrokUsageModal({
           <Spinner className="size-4" /> 正在查询 Grok 额度…
         </div>
       ) : error && !u ? (
-        <div className="flex flex-col items-center gap-3 py-8 text-center text-sm text-danger">
+        <div className="oc-callout oc-callout-danger flex flex-col items-center gap-3 rounded-xl px-4 py-6 text-center text-sm text-danger">
           <span>查询失败:{error}</span>
           <Button size="sm" variant="secondary" onClick={() => void load(true)}>
             重试
@@ -588,8 +592,8 @@ export function GrokUsageModal({
         </div>
       ) : u ? (
         <div className="flex flex-col gap-4">
-          <div className="flex items-center justify-between gap-3 text-meta text-faint">
-            <span>
+          <div className="oc-surface-recessed flex items-center justify-between gap-3 rounded-xl px-3.5 py-2 text-meta text-muted">
+            <span className="tabular-nums">
               拉取于 {fmtDateTime(u.fetched_at)}
               {data?.cached ? " · 缓存" : ""}
               {data?.stored ? " · 已落库" : ""}
@@ -612,9 +616,9 @@ export function GrokUsageModal({
             {account?.user_blocked_reason ? <Badge tone="danger">{account.user_blocked_reason}</Badge> : null}
           </div>
 
-          <section className="rounded-md border border-border p-3">
-            <div className="mb-2 flex items-center gap-2">
-              <span className="text-sm font-medium">周额度池</span>
+          <section className="oc-surface-card rounded-xl p-4">
+            <div className="mb-2.5 flex items-center gap-2">
+              <span className="text-body font-semibold text-fg">周额度池</span>
               <span className="text-caption text-faint">xAI 周额度 · 每周重置</span>
             </div>
             {pct != null && (
@@ -635,8 +639,8 @@ export function GrokUsageModal({
             </DescriptionList>
           </section>
 
-          <section className="rounded-md border border-border p-3">
-            <div className="mb-1 text-sm font-medium">按需 / 预付</div>
+          <section className="oc-surface-card rounded-xl p-4">
+            <div className="mb-1.5 text-body font-semibold text-fg">按需 / 预付</div>
             {noOnDemand ? (
               <p className="text-meta text-faint">无按需消费</p>
             ) : (
@@ -650,8 +654,8 @@ export function GrokUsageModal({
             )}
           </section>
 
-          <details className="rounded-md border border-border p-3">
-            <summary className="cursor-pointer text-sm font-medium">月度(legacy)</summary>
+          <details className="oc-surface-recessed rounded-xl px-4 py-3">
+            <summary className="cursor-pointer text-body font-medium text-fg">月度(legacy)</summary>
             <DescriptionList>
               <DescriptionRow label="已用 / 上限" value={`${monthly?.used ?? "—"} / ${monthly?.limit ?? "—"}`} />
               <DescriptionRow
@@ -662,7 +666,7 @@ export function GrokUsageModal({
           </details>
 
           {errorEntries.length > 0 && (
-            <div className="rounded-md border border-warning/40 bg-warning/5 p-2 text-meta text-warning">
+            <div className="oc-callout oc-callout-warning rounded-xl px-3.5 py-2.5 text-meta text-warning">
               未能读取:
               {errorEntries.map(([k, v]) => (
                 <span key={k} className="ml-2">

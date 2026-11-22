@@ -16,13 +16,22 @@
 
 import { describe, test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
+  COLD_BACKOFF_TIER1_AGE_MS,
+  COLD_BACKOFF_TIER1_ATTEMPTS,
+  COLD_BACKOFF_TIER1_MS,
+  COLD_BACKOFF_TIER2_AGE_MS,
+  COLD_BACKOFF_TIER2_ATTEMPTS,
+  COLD_BACKOFF_TIER2_MS,
+  entryRetryBackoffMs,
   FINALIZE_RETRY_CAP_AFTER_HANDOFF,
   makeV3MasterRetryQueue,
+  RETRY_BACKOFF_MAX_MS,
+  STALE_TMP_TTL_MS,
   type V3MasterRetryEntry,
 } from "../v3MasterRetryQueue.js";
 import {
@@ -774,6 +783,260 @@ describe("drainOnce — settlement handoff retry cap (rev2 B1)", () => {
     assert.equal(stats.fatalDropped, 0);
     assert.equal(stats.retried, 1);
     assert.equal((await listJsonFiles()).length, 1);
+  });
+});
+
+// ─── drainOnce: backoff cache, cold backoff & stale tmp cleanup (OCV5-810) ──
+
+describe("drainOnce — backoff cache, cold backoff & stale tmp cleanup", () => {
+  test("backoff window skips readFile/JSON.parse via in-memory stat cache and resumes when expired", async () => {
+    let clock = 1_795_000_000_000;
+    let sendCalls = 0;
+    let readCalls = 0;
+    let shouldSucceed = false;
+    const q = makeV3MasterRetryQueue({
+      dir,
+      now: () => clock,
+      readEntryFile: async (filepath) => {
+        readCalls++;
+        return readFile(filepath, "utf8");
+      },
+      attemptSend: async () => {
+        sendCalls++;
+        if (!shouldSucceed) {
+          throw new V3SinkError("TURN_TAPE_RETRYABLE", "transient", 503);
+        }
+      },
+    });
+    await writeEntryDirect({ ...entry(), attempts: 0 });
+
+    // Pass 1: initial read + failed attempt → rewrites with attempts=1 (5s backoff) and caches stat
+    const s1 = await q.drainOnce();
+    assert.equal(s1.retried, 1);
+    assert.equal(s1.backoffCacheHits, 0);
+    assert.equal(readCalls, 1);
+    assert.equal(sendCalls, 1);
+
+    // Passes 2 & 3 within 5s backoff window: zero readFile calls
+    clock += 1_000;
+    const s2 = await q.drainOnce();
+    clock += 3_000;
+    const s3 = await q.drainOnce();
+    assert.equal(s2.pending, 1);
+    assert.equal(s2.backoffCacheHits, 1);
+    assert.equal(s3.pending, 1);
+    assert.equal(s3.backoffCacheHits, 1);
+    assert.equal(readCalls, 1, "backoff window must not re-read file from disk");
+    assert.equal(sendCalls, 1);
+
+    // Past 5s backoff window: cache expires, file re-read, send succeeds & unlinks
+    shouldSucceed = true;
+    clock += 2_000;
+    const s4 = await q.drainOnce();
+    assert.equal(s4.drained, 1);
+    assert.equal(s4.backoffCacheHits, 0);
+    assert.equal(readCalls, 2);
+    assert.equal(sendCalls, 2);
+    assert.equal((await listJsonFiles()).length, 0);
+  });
+
+  test("external atomic replacement invalidates backoff stat cache immediately", async () => {
+    let clock = 1_795_000_000_000;
+    let readCalls = 0;
+    let sendCalls = 0;
+    let failFirst = true;
+    const q = makeV3MasterRetryQueue({
+      dir,
+      now: () => clock,
+      readEntryFile: async (filepath) => {
+        readCalls++;
+        return readFile(filepath, "utf8");
+      },
+      attemptSend: async () => {
+        sendCalls++;
+        if (failFirst) {
+          failFirst = false;
+          throw new V3SinkError("transient", "transient", 503);
+        }
+      },
+    });
+    const name = await writeEntryDirect({ ...entry(), attempts: 0 });
+    await q.drainOnce();
+    assert.equal(readCalls, 1);
+    assert.equal(sendCalls, 1);
+
+    // Externally replace the file atomically (new inode, attempts=0) while still inside backoff window
+    const replacement = join(dir, "external-replacement.tmp");
+    await writeFile(replacement, JSON.stringify({ ...entry(), attempts: 0 }), "utf8");
+    await rename(replacement, join(dir, name));
+
+    clock += 500;
+    const s2 = await q.drainOnce();
+    assert.equal(s2.backoffCacheHits, 0, "inode change must invalidate backoff cache");
+    assert.equal(s2.drained, 1);
+    assert.equal(readCalls, 2);
+    assert.equal(sendCalls, 2);
+  });
+
+  test("atomic replacement during cache establishment never binds a 6h cold backoff to a billing-pending entry", async () => {
+    const base = 1_795_000_000_000;
+    let clock = base + COLD_BACKOFF_TIER2_AGE_MS + 60_000;
+    let sendCalls = 0;
+    let replaced = false;
+    let targetName = "";
+
+    const coldEntry: V3MasterRetryEntry = {
+      ...entry(),
+      firstSeenAt: base,
+      attempts: COLD_BACKOFF_TIER2_ATTEMPTS + 10,
+      lastErrorClass: "transient",
+      lastErrorAt: clock - 1_000,
+      lastErrorMessage: "master 503: TURN_TAPE_RETRYABLE",
+    };
+    const billingEntry: V3MasterRetryEntry = {
+      ...entry(),
+      firstSeenAt: base,
+      attempts: COLD_BACKOFF_TIER2_ATTEMPTS + 10,
+      lastErrorClass: "transient",
+      lastErrorAt: clock - 1_000,
+      lastErrorMessage: "TURN_TAPE_BILLING_PENDING",
+    };
+
+    const q = makeV3MasterRetryQueue({
+      dir,
+      now: () => clock,
+      readEntryFile: async (filepath) => {
+        const raw = await readFile(filepath, "utf8");
+        if (!replaced && filepath.endsWith(targetName)) {
+          // Simulate concurrent atomic replacement after reading version A (6h cold)
+          // and before backoff cache establishment finishes.
+          replaced = true;
+          const tmp = join(dir, "concurrent-billing-swap.tmp");
+          await writeFile(tmp, JSON.stringify(billingEntry), "utf8");
+          await rename(tmp, filepath);
+        }
+        return raw;
+      },
+      attemptSend: async () => {
+        sendCalls++;
+      },
+    });
+
+    targetName = await writeEntryDirect(coldEntry);
+    const s1 = await q.drainOnce();
+    assert.equal(s1.pending, 1);
+    assert.equal(sendCalls, 0);
+
+    // Advance 6 minutes (past billing 5min backoff, well inside 6h cold backoff):
+    // must NOT hit a poisoned cache entry; billing entry must send and drain immediately.
+    clock += 6 * 60_000;
+    const s2 = await q.drainOnce();
+    assert.equal(s2.backoffCacheHits, 0, "mid-read replacement must not populate poisoned backoff cache");
+    assert.equal(s2.drained, 1, "billing-pending entry must drain at 6 min instead of waiting 6h");
+    assert.equal(sendCalls, 1);
+    assert.equal((await listJsonFiles()).length, 0);
+  });
+
+  test("cold backoff tiers apply to long-lived failures without deleting data, while billing/waiver pending stays fast", async () => {
+    const base = 1_795_000_000_000;
+    // Short/mid-term stays capped at RETRY_BACKOFF_MAX_MS (5 min)
+    assert.equal(
+      entryRetryBackoffMs({ attempts: COLD_BACKOFF_TIER1_ATTEMPTS, firstSeenAt: base }, base + 60_000),
+      RETRY_BACKOFF_MAX_MS,
+    );
+    // Tier 1: >=30 attempts & >=24h → 1h
+    assert.equal(
+      entryRetryBackoffMs(
+        { attempts: COLD_BACKOFF_TIER1_ATTEMPTS, firstSeenAt: base, lastErrorMessage: "master 503: TURN_TAPE_RETRYABLE" },
+        base + COLD_BACKOFF_TIER1_AGE_MS,
+      ),
+      COLD_BACKOFF_TIER1_MS,
+    );
+    // Tier 2: >=100 attempts & >=72h → 6h
+    assert.equal(
+      entryRetryBackoffMs(
+        { attempts: COLD_BACKOFF_TIER2_ATTEMPTS, firstSeenAt: base, lastErrorMessage: "session_not_found" },
+        base + COLD_BACKOFF_TIER2_AGE_MS,
+      ),
+      COLD_BACKOFF_TIER2_MS,
+    );
+    // Billing / waiver pending exempt from cold backoff
+    assert.equal(
+      entryRetryBackoffMs(
+        { attempts: COLD_BACKOFF_TIER2_ATTEMPTS + 50, firstSeenAt: base, lastErrorMessage: "TURN_TAPE_BILLING_PENDING" },
+        base + COLD_BACKOFF_TIER2_AGE_MS * 2,
+      ),
+      RETRY_BACKOFF_MAX_MS,
+    );
+    assert.equal(
+      entryRetryBackoffMs(
+        { attempts: COLD_BACKOFF_TIER2_ATTEMPTS + 50, firstSeenAt: base, lastErrorMessage: "TURN_WAIVER_PENDING" },
+        base + COLD_BACKOFF_TIER2_AGE_MS * 2,
+      ),
+      RETRY_BACKOFF_MAX_MS,
+    );
+
+    // End-to-end drainOnce with Tier-1 cold entry: skips at +10m, retries & delivers at +61m
+    let clock = base + COLD_BACKOFF_TIER1_AGE_MS + 10_000;
+    let calls = 0;
+    let allowSuccess = false;
+    const q = makeV3MasterRetryQueue({
+      dir,
+      now: () => clock,
+      attemptSend: async () => {
+        calls++;
+        if (!allowSuccess) {
+          throw new V3SinkError("master 503: TURN_TAPE_RETRYABLE", "transient", 503);
+        }
+      },
+    });
+    await writeEntryDirect({
+      ...entry(),
+      firstSeenAt: base,
+      attempts: COLD_BACKOFF_TIER1_ATTEMPTS - 1,
+    });
+    const s1 = await q.drainOnce();
+    assert.equal(s1.retried, 1);
+    assert.equal(calls, 1);
+
+    // +10 min (past 5min normal max, still within 1h Tier-1 cold backoff)
+    clock += 10 * 60_000;
+    const s2 = await q.drainOnce();
+    assert.equal(s2.pending, 1);
+    assert.equal(s2.backoffCacheHits, 1);
+    assert.equal(calls, 1, "Tier-1 cold entry must not retry after 10 min");
+
+    // +61 min (past 1h Tier-1 cold backoff): still lossless, retries and drains cleanly
+    allowSuccess = true;
+    clock += 51 * 60_000;
+    const s3 = await q.drainOnce();
+    assert.equal(s3.drained, 1);
+    assert.equal(calls, 2);
+    assert.equal((await listJsonFiles()).length, 0);
+  });
+
+  test("reclaims stale orphan *.json.tmp-* files older than 1h while leaving fresh tmp files intact even under skewed logical clock", async () => {
+    const staleTmp = join(dir, "1790414218434-d35ce7537f69d1e6.json.tmp-91-ba9c141f");
+    const freshTmp = join(dir, "1790414218435-d35ce7537f69d1e7.json.tmp-92-deadbeef");
+    const unrelated = join(dir, "README.txt");
+    await writeFile(staleTmp, "crashed partial write", "utf8");
+    await writeFile(freshTmp, "active write in progress", "utf8");
+    await writeFile(unrelated, "keep me", "utf8");
+    const twoHoursAgo = new Date(Date.now() - STALE_TMP_TTL_MS - 60 * 60_000);
+    await utimes(staleTmp, twoHoursAgo, twoHoursAgo);
+
+    // Logical clock skewed 10 days ahead must NOT cause freshTmp to be mistakenly unlinked.
+    const q = makeV3MasterRetryQueue({
+      dir,
+      now: () => Date.now() + 10 * 24 * 60 * 60_000,
+      attemptSend: async () => undefined,
+    });
+    const stats = await q.drainOnce();
+    assert.equal(stats.staleTmpCleaned, 1);
+    const remaining = await readdir(dir);
+    assert.ok(!remaining.includes("1790414218434-d35ce7537f69d1e6.json.tmp-91-ba9c141f"));
+    assert.ok(remaining.includes("1790414218435-d35ce7537f69d1e7.json.tmp-92-deadbeef"));
+    assert.ok(remaining.includes("README.txt"));
   });
 });
 

@@ -491,7 +491,7 @@ describe("errorPresentation R6/R7:失败轮部分正文 + detail 守卫", () => 
     expect(JSON.stringify(p)).not.toContain("API Error");
   });
 
-  test("OCV5-620: BOX_REPLAY_PENDING → 软收尾文案,保留部分回答,不粉红硬失败", () => {
+  test("OCV5-620 / P0-7: BOX_REPLAY_PENDING → 静默吸收,隐藏 Box 与稍后刷新,保留部分回答", () => {
     const detail =
       'API Error: 409 {"error":{"code":"BOX_REPLAY_PENDING","message":"previous Box call still resolving"}}';
     const p = errorPresentation(
@@ -500,7 +500,9 @@ describe("errorPresentation R6/R7:失败轮部分正文 + detail 守卫", () => 
       detail,
     );
     expect(p.title).toBe("结果正在收尾");
+    expect(p.silent).toBe(true);
     expect(p.message).toContain("不会重复扣费");
+    expect(p.message).not.toMatch(/Box|稍后刷新/i);
     expect(p.bodyText).toBe("博客大纲已写完，正在排版。");
     expect(JSON.stringify(p)).not.toContain("任务执行失败");
   });
@@ -731,7 +733,7 @@ describe("引擎/路由内部码不外露(t1049u)", () => {
     expect(p.detail).toBeUndefined();
   });
 
-  test("OCV5-620: BOX_REPLAY_PENDING → 软收尾文案,保留部分回答,不粉红硬失败", () => {
+  test("OCV5-620 / P0-7: BOX_REPLAY_PENDING → 静默吸收,隐藏 Box 与稍后刷新,保留部分回答", () => {
     const detail =
       'API Error: 409 {"error":{"code":"BOX_REPLAY_PENDING","message":"previous Box call still resolving"}}';
     const p = errorPresentation(
@@ -740,7 +742,9 @@ describe("引擎/路由内部码不外露(t1049u)", () => {
       detail,
     );
     expect(p.title).toBe("结果正在收尾");
+    expect(p.silent).toBe(true);
     expect(p.message).toContain("不会重复扣费");
+    expect(p.message).not.toMatch(/Box|稍后刷新/i);
     expect(p.bodyText).toBe("博客大纲已写完，正在排版。");
     expect(JSON.stringify(p)).not.toContain("任务执行失败");
   });

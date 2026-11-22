@@ -1,4 +1,4 @@
-import { Coins, RefreshCw } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, Coins, RefreshCw } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { useProjectScope } from '../../hooks/useProjectScope'
 import { AuthEpochStaleError } from '../../lib/api'
@@ -15,7 +15,7 @@ import {
   taskboardErrorMessage,
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
-import { Button, Card, EmptyState, Field, Input, ListSkeleton, Select, StatCard } from '../ui'
+import { Badge, Button, Card, EmptyState, Field, Input, ListSkeleton, Select, StatCard } from '../ui'
 import { CostCoverageBlock } from './CostCoverageBlock'
 
 const TZ = 'Asia/Shanghai'
@@ -90,16 +90,21 @@ export function CostStatsView({ auth }: { auth: AuthSession }) {
   return (
     <div
       data-testid="cost-stats"
-      className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 pb-4"
+      className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto px-4 pb-5"
       aria-busy={loading || undefined}
     >
-      <div>
-        <h2 className="text-title font-semibold text-fg">成本统计</h2>
-        <p className="mt-1 text-caption text-muted">
-          只统计任务面板里 agent 执行的用量，不含你在对话里的模型用量。先看 token；部分模型路线不回传单价，金额只作参考、不代表免费。
-        </p>
+      <div className="flex items-start gap-3">
+        <span className="oc-icon-badge oc-icon-badge-accent mt-0.5 size-9 rounded-xl" aria-hidden>
+          <Coins size={18} />
+        </span>
+        <div className="min-w-0">
+          <h2 className="text-title font-semibold tracking-tight text-fg">成本统计</h2>
+          <p className="mt-0.5 text-caption leading-relaxed text-muted">
+            只统计任务面板里 agent 执行的用量，不含你在对话里的模型用量。先看 token；部分模型路线不回传单价，金额只作参考、不代表免费。
+          </p>
+        </div>
       </div>
-      <div className="flex flex-wrap items-end gap-2">
+      <div className="oc-surface-card flex flex-wrap items-end gap-2.5 rounded-xl p-3">
         <Field label="从" className="w-auto" error={rangeInvalid ? '起始日不能晚于结束日' : undefined}>
           <Input
             aria-label="成本起始日"
@@ -165,20 +170,27 @@ export function CostStatsView({ auth }: { auth: AuthSession }) {
       ) : (
         <>
           <Card padding="md" className="flex flex-col gap-3">
-            <div className="flex flex-wrap items-baseline justify-between gap-2">
-              <h3 className="text-section font-semibold text-fg">合计</h3>
-              <span className="text-caption text-faint">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <span className="oc-icon-badge oc-icon-badge-info size-7 rounded-lg" aria-hidden>
+                  <Coins size={14} />
+                </span>
+                <h3 className="text-section font-semibold tracking-tight text-fg">合计</h3>
+              </div>
+              <span className="inline-flex items-center rounded-md bg-hover px-2 py-0.5 font-mono text-caption tabular-nums text-muted">
                 {stats.from} → {stats.to} · {stats.totals.runCount} 次执行
               </span>
             </div>
             <CostCoverageBlock totals={stats.totals} />
           </Card>
           {/* 合计之后、分桶之前:先看整体构成再看明细(审计 T-21 ⑤)。 */}
-          <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+          <div className="grid grid-cols-2 gap-2.5 md:grid-cols-4">
             <StatCard
               label="有记录金额的执行"
               value={formatCount(stats.totals.priced.runCount)}
               hint={formatTokenUsage(stats.totals.priced.tokensIn, stats.totals.priced.tokensOut)}
+              icon={CheckCircle2}
+              tone="success"
             />
             <StatCard
               label="没有单价的执行"
@@ -187,6 +199,7 @@ export function CostStatsView({ auth }: { auth: AuthSession }) {
                 stats.totals.unpriced.tokensIn,
                 stats.totals.unpriced.tokensOut,
               )}
+              icon={AlertTriangle}
               tone={stats.totals.unpriced.runCount > 0 ? 'warning' : 'neutral'}
             />
           </div>
@@ -202,16 +215,18 @@ export function CostStatsView({ auth }: { auth: AuthSession }) {
                 <Card
                   key={bucket.key}
                   padding="sm"
-                  className="flex flex-col gap-1"
+                  className="oc-surface-card-hover flex flex-col gap-1.5"
                   data-testid="cost-bucket"
                 >
-                  <div className="flex items-baseline justify-between gap-2">
+                  <div className="flex items-center justify-between gap-2">
                     <h4 className="min-w-0 truncate text-body font-medium text-fg">
                       {bucket.label}
                     </h4>
-                    <span className="shrink-0 text-caption text-faint">{bucket.runCount} 次</span>
+                    <Badge tone="neutral" size="sm" className="shrink-0 tabular-nums">
+                      {bucket.runCount} 次
+                    </Badge>
                   </div>
-                  <p className="text-meta tabular-nums text-fg">
+                  <p className="text-meta font-medium tabular-nums text-fg">
                     {formatTokenUsage(bucket.tokensIn, bucket.tokensOut)}
                   </p>
                   <p

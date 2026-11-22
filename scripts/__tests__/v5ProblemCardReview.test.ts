@@ -11,6 +11,7 @@ import {
   renderDigest,
   renderTicketBody,
   safeDate,
+  isNonActionableTicketFingerprint,
   shouldOpenTicket,
   type FingerprintAgg,
   type ReviewAgg,
@@ -407,6 +408,42 @@ describe("buildOcTaskArgs argv (no shell)", () => {
     assert.deepEqual(
       buildOcTaskArgs("ticket-list", { projectId: "abc", label: "problem-card", limit: 200 }),
       ["ticket", "list", "--project-id", "abc", "--label", "problem-card", "--limit", "200"],
+    );
+  });
+});
+
+
+describe("non-actionable ticket fingerprints (OCV5-278)", () => {
+  test("skips create and comment for recovery_decision:user_cancelled:decision:not_recoverable", () => {
+    const fp = "recovery_decision:user_cancelled:decision:not_recoverable";
+    assert.equal(isNonActionableTicketFingerprint(fp), true);
+    assert.equal(
+      isNonActionableTicketFingerprint("recovery_decision:upstream_failed:decision:not_recoverable"),
+      false,
+    );
+    const agg = aggOf([
+      fpRow({
+        fingerprint: fp,
+        h24: counts({ shown: 8, failed: 8, affected_users: 2, affected_users_failed: 2 }),
+      }),
+      fpRow({
+        fingerprint: "recovery_decision:upstream_failed:decision:not_recoverable",
+        h24: counts({ shown: 5, failed: 5, affected_users: 1, affected_users_failed: 1 }),
+      }),
+    ]);
+    const state: StateFile = { fingerprints: {} };
+    const tickets: TicketRef[] = [
+      { identifier: "OCV5-278", title: `problem-card: ${fp}`, status: "backlog" },
+    ];
+    const { actions } = nextActions(agg, state, tickets);
+    assert.equal(actions.some((a) => a.fingerprint === fp), false);
+    assert.equal(
+      actions.some(
+        (a) =>
+          a.kind === "create" &&
+          a.fingerprint === "recovery_decision:upstream_failed:decision:not_recoverable",
+      ),
+      true,
     );
   });
 });

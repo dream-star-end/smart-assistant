@@ -5,6 +5,7 @@ import { afterEach, expect, test, vi } from 'vitest'
 import { api, ApiError } from '../lib/api'
 import { createMemoryAuthSession } from '../lib/authSession'
 import { readSessionServiceTier, writeSessionServiceTier } from '../lib/sessionServiceTier'
+import { readSessionSwarmMode, writeSessionSwarmMode } from '../lib/sessionSwarmMode'
 import { useSessionEngineOptions } from './useSessionEngineOptions'
 import { EMPTY_COLLAB_UI, type CollaborationConfigDoc, type CollabMode, type CollabUiState } from '../lib/collaborationConfig'
 import type { AuthorizeSwitch } from '../lib/modelSwitchCostTypes'
@@ -807,5 +808,121 @@ test('OCV5-798: draft Astra session with stale ultrafast normalizes persisted ti
 
   const editFastCall = await runDraftSend('fast', '帮我直接修改 README.md')
   expect(editFastCall?.serviceTier).toBe('fast')
+  localStorage.clear()
+})
+
+test('OCV5-843: switching from Antigravity to non-Antigravity auto-disables swarm with merged toast (and keeps on cancel or AG->AG)', async () => {
+  localStorage.clear()
+  vi.spyOn(api, 'getCollaborationConfig').mockResolvedValue(doc('solo', 1))
+  const auth = createMemoryAuthSession(() => {}, 'fixture')
+  const agent = { id: 'main', name: 'Main', description: '' }
+  const models: PublicModel[] = [
+    { id: 'antigravity-gemini-4-neon', display_name: 'Gemini 4 Neon', engine: 'antigravity' },
+    { id: 'antigravity-claude-opus-5.5', display_name: 'Claude Opus 5.5', engine: 'antigravity' },
+    { id: 'gpt-6.2-astra', display_name: 'Astra', engine: 'codex' },
+  ]
+  const toast = vi.fn()
+  const onAutoDisableSwarm = vi.fn()
+  const noop = () => {}
+  const sockRef = { current: { setSessionModel: vi.fn(), getMessages: () => [] } as unknown as UseChatSocket }
+  let confirmReply = false
+  const authorizeSwitch: AuthorizeSwitch = async (req) =>
+    confirmReply ? { requestId: req.requestId, choice: true } : null
+
+  const f = renderHook(
+    ({ modelId, swarmMode, swarmRunning }: { modelId: string; swarmMode: boolean; swarmRunning: boolean }) =>
+      useSessionModelAndCollab({
+        activeId: 'own',
+        authorizeSwitch,
+        modelId,
+        auth,
+        agent,
+        demo: false,
+        models,
+        modelPrefs: {},
+        modelSwitchPreparing: false,
+        sessions: [{ id: 'own', title: 'S', ownerUserId: 'u', updatedAt: '', messageCount: 1, modelId }],
+        confirmDialog: vi.fn(async () => confirmReply),
+        handleNew: noop,
+        queueModelPatch: noop,
+        resetSessionList: noop,
+        sessionsResetRef: { current: noop },
+        swarmMode,
+        swarmRunning,
+        onAutoDisableSwarm,
+        setModelId: noop,
+        setModelSwitchPreparing: noop,
+        setSessions: noop,
+        sockRef,
+        toast,
+      }),
+    { initialProps: { modelId: 'antigravity-gemini-4-neon', swarmMode: true, swarmRunning: false } },
+  )
+
+  // Cancelled switch must NOT disable swarm
+  confirmReply = false
+  await act(async () => {
+    await f.result.current.selectModel('gpt-6.2-astra')
+  })
+  expect(onAutoDisableSwarm).not.toHaveBeenCalled()
+  expect(toast).not.toHaveBeenCalled()
+
+  // Antigravity -> Antigravity keeps swarm enabled
+  confirmReply = true
+  await act(async () => {
+    await f.result.current.selectModel('antigravity-claude-opus-5.5')
+  })
+  expect(onAutoDisableSwarm).not.toHaveBeenCalled()
+  expect(toast).toHaveBeenLastCalledWith('已切换到 Claude Opus 5.5', 'success')
+
+  // Antigravity -> non-Antigravity auto-disables swarm with merged toast
+  await act(async () => {
+    await f.result.current.selectModel('gpt-6.2-astra')
+  })
+  expect(onAutoDisableSwarm).toHaveBeenCalledTimes(1)
+  expect(toast).toHaveBeenLastCalledWith('已切换到 Astra（已自动关闭蜂群模式）', 'success')
+
+  // When a swarm is actively running, toast notes background continuation
+  onAutoDisableSwarm.mockClear()
+  f.rerender({ modelId: 'antigravity-gemini-4-neon', swarmMode: true, swarmRunning: true })
+  await act(async () => {
+    await f.result.current.selectModel('gpt-6.2-astra')
+  })
+  expect(onAutoDisableSwarm).toHaveBeenCalledTimes(1)
+  expect(toast).toHaveBeenLastCalledWith(
+    '已切换到 Astra（当前蜂群仍在后台运行，新消息将以单兵模式发送）',
+    'success',
+  )
+
+  // Fallback without onAutoDisableSwarm writes false directly to sessionSwarmMode
+  writeSessionSwarmMode('own', true)
+  const fallback = renderHook(() =>
+    useSessionModelAndCollab({
+      activeId: 'own',
+      modelId: 'antigravity-gemini-4-neon',
+      auth,
+      agent,
+      demo: false,
+      models,
+      modelPrefs: {},
+      modelSwitchPreparing: false,
+      sessions: [{ id: 'own', title: 'S', ownerUserId: 'u', updatedAt: '', messageCount: 0, modelId: 'antigravity-gemini-4-neon' }],
+      confirmDialog: vi.fn(async () => true),
+      handleNew: noop,
+      queueModelPatch: noop,
+      resetSessionList: noop,
+      sessionsResetRef: { current: noop },
+      swarmMode: true,
+      setModelId: noop,
+      setModelSwitchPreparing: noop,
+      setSessions: noop,
+      sockRef,
+      toast: noop,
+    }),
+  )
+  await act(async () => {
+    await fallback.result.current.selectModel('gpt-6.2-astra')
+  })
+  expect(readSessionSwarmMode('own')).toBe(false)
   localStorage.clear()
 })

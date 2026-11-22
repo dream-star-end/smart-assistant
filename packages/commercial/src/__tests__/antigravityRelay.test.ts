@@ -31,17 +31,24 @@ import {
   resolveAntigravityRelayRoute,
 } from '../billing/antigravityRouteContext.js'
 import {
+  ANTIGRAVITY_AUX_FALLBACK_RATES,
   type AntigravityUsageTotals,
+  antigravityUsageCost,
+  isAntigravityAuxUpstreamModel,
   mapAntigravityUsage,
   planAntigravitySettle,
+  resolveAntigravityAuxPricing,
 } from '../billing/antigravitySettle.js'
 import type { ModelPricing } from '../billing/pricing.js'
 import {
+  ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE,
+  ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE,
   ANTIGRAVITY_RELAY_PREFIX,
   ANTIGRAVITY_UPSTREAM_BASE_URL,
   type AntigravityRelayDeps,
   type AntigravityUsageRow,
   AntigravityUsageTap,
+  _antigravityAuxInflightForTests,
   _antigravityInflightForTests,
   makeAntigravityRelayHandler,
 } from '../http/internalAntigravityRelay.js'
@@ -711,13 +718,14 @@ describe('Antigravity relay concurrent budget (Codex r1 P1)', () => {
   })
 
   test('calls that fit the budget run concurrently up to the per-route cap', async () => {
+    const cap = ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE
     const { statuses, calls } = await concurrent({
       budget: 1_000_000n,
-      n: 7,
+      n: cap + 3,
       extra: { estimateCost: () => 1n },
     })
-    assert.equal(calls, 4)
-    assert.equal(statuses.filter((code) => code === 200).length, 4)
+    assert.equal(calls, cap)
+    assert.equal(statuses.filter((code) => code === 200).length, cap)
     assert.equal(statuses.filter((code) => code === 429).length, 3)
   })
 
@@ -1554,5 +1562,565 @@ describe('Gemini 4 Neon & Orchestrator Neon relay allowlist and directory eligib
       ),
       true,
     )
+  })
+})
+
+describe('Antigravity aux/monitoring billing attribution & concurrency slot decoupling (P0-2)', () => {
+  const neonPricing = {
+    model_id: 'antigravity-gemini-4-neon',
+    display_name: 'Gemini 4 Neon (Antigravity)',
+    input_per_mtok: 600n,
+    output_per_mtok: 3000n,
+    cache_read_per_mtok: 15n,
+    cache_write_per_mtok: 0n,
+    multiplier: '1.000',
+    enabled: true,
+  } as unknown as ModelPricing
+
+  test('P0-2a / B2 red-green: mixed Neon primary + flash-lite aux (agent_monitoring + web_search) bills aux at light rate (~97% lower than Neon) and never grants free quota from request_type', () => {
+    // Primary Neon call: 100k prompt (90k cached -> 10k uncached), 1k output -> 10.35 fen
+    // Aux flash-lite calls (5 agent_monitoring + 1 web_search): 10.1M uncached prompt, 6k output
+    //   At 20/80/1 fallback rate: (10_100_000*20 + 6_000*80)/1e6 = 202.48 fen
+    const mixedTotals: AntigravityUsageTotals = {
+      promptTokens: 100_000n,
+      candidatesTokens: 1_000n,
+      thoughtsTokens: 0n,
+      cachedTokens: 90_000n,
+      calls: 7,
+      aux: {
+        promptTokens: 10_100_000n,
+        candidatesTokens: 6_000n,
+        thoughtsTokens: 0n,
+        cachedTokens: 0n,
+        calls: 6,
+        monitoringCalls: 5,
+      },
+    }
+    // Red baseline: if all rows were collapsed into primary at Neon pricing
+    const naivePrimaryOnly: AntigravityUsageTotals = {
+      promptTokens: 10_200_000n,
+      candidatesTokens: 7_000n,
+      thoughtsTokens: 0n,
+      cachedTokens: 90_000n,
+      calls: 7,
+    }
+    const naiveCost = antigravityUsageCost(naivePrimaryOnly, neonPricing)
+    // ceil((10_110_000*600 + 7_000*3000 + 90_000*15) / 1e6) = ceil(6088.35) = 6089 fen
+    assert.equal(naiveCost, 6089n)
+
+    // Green: single-ceiling bucketed settlement = ceil(10.35 + 202.48) = 213 fen (~96.5% savings vs 6089 fen)
+    const plan = planAntigravitySettle({
+      engineStatus: 'success',
+      totals: mixedTotals,
+      pricing: neonPricing,
+    })
+    assert.equal(plan.settleStatus, 'success')
+    assert.equal(plan.costCredits, 213n)
+    assert.ok(plan.costCredits < naiveCost / 25n)
+    // Billable usage_records reflects all real tokens across primary + aux
+    assert.deepEqual(plan.usage, {
+      input_tokens: 10_110_000n,
+      output_tokens: 7_000n,
+      cache_read_tokens: 90_000n,
+      cache_write_tokens: 0n,
+    })
+    const snap = JSON.parse(plan.snapshotJson)
+    assert.equal(snap.antigravity_calls, 7)
+    assert.equal(snap.antigravity_primary.calls, 1)
+    assert.equal(snap.antigravity_primary.cost_credits, '11')
+    assert.equal(snap.antigravity_aux.calls, 6)
+    assert.equal(snap.antigravity_aux.monitoring_calls, 5)
+    assert.equal(snap.antigravity_aux.cost_credits, '203')
+    assert.equal(snap.antigravity_aux.pricing.source, 'fallback')
+    assert.equal(snap.antigravity_aux.pricing.input_per_mtok, String(ANTIGRAVITY_AUX_FALLBACK_RATES.input_per_mtok))
+    assert.equal(snap.antigravity_monitoring, undefined)
+  })
+
+  test('B2 trust-boundary invariance: same flash-lite model & usage has identical budget reservation and settlement cost for agent_monitoring vs web_search vs empty request_type', async () => {
+    const auxPrompt = 500_000n
+    const auxOutput = 2_000n
+    const makeTotals = (monitoringCalls?: number): AntigravityUsageTotals => ({
+      promptTokens: 0n,
+      candidatesTokens: 0n,
+      thoughtsTokens: 0n,
+      cachedTokens: 0n,
+      calls: 1,
+      aux: {
+        promptTokens: auxPrompt,
+        candidatesTokens: auxOutput,
+        thoughtsTokens: 0n,
+        cachedTokens: 0n,
+        calls: 1,
+        ...(monitoringCalls ? { monitoringCalls } : {}),
+      },
+    })
+    const monPlan = planAntigravitySettle({ engineStatus: 'success', totals: makeTotals(1), pricing: neonPricing })
+    const searchPlan = planAntigravitySettle({ engineStatus: 'success', totals: makeTotals(), pricing: neonPricing })
+    // ceil((500_000*20 + 2_000*80)/1e6) = ceil(10.16) = 11 fen (vs Neon 306 fen)
+    assert.equal(monPlan.costCredits, 11n)
+    assert.equal(searchPlan.costCredits, 11n)
+    assert.equal(monPlan.costCredits, searchPlan.costCredits)
+    assert.deepEqual(monPlan.usage, searchPlan.usage)
+    const neonSameTokens = antigravityUsageCost(
+      { promptTokens: auxPrompt, candidatesTokens: auxOutput, thoughtsTokens: 0n, cachedTokens: 0n, calls: 1 },
+      neonPricing,
+    )
+    assert.equal(neonSameTokens, 306n)
+    assert.ok(monPlan.costCredits < neonSameTokens / 25n)
+
+    // Relay budget precheck & reservation must ALSO be identical for agent_monitoring vs web_search vs omitted requestType.
+    const samePadding = 'x'.repeat(200_000)
+    const monBody = JSON.stringify({ model: 'gemini-3.5-flash-lite', requestType: 'agent_monitoring', prompt: samePadding })
+    const searchBody = JSON.stringify({ model: 'gemini-3.5-flash-lite', requestType: 'web_search', prompt: samePadding })
+    const emptyBody = JSON.stringify({ model: 'gemini-3.5-flash-lite', prompt: samePadding })
+    // Ensure identical byte lengths so default bodyBytes/4 estimate is directly comparable.
+    const maxLen = Math.max(monBody.length, searchBody.length, emptyBody.length)
+    const padTo = (raw: string) => `${raw.slice(0, -1)}${' '.repeat(maxLen - raw.length)}}`
+
+    const observedReservations: bigint[] = []
+    for (const body of [padTo(monBody), padTo(searchBody), padTo(emptyBody)]) {
+      const token = await mintRoute('antigravity-gemini-4-neon', 1_000_000n)
+      const path = `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:streamGenerateContent?alt=sse`
+      let reservedDuringCall = -1n
+      const res = await relay(
+        path,
+        { body },
+        { status: 200, body: SSE },
+        {
+          pricing: { get: (id) => (id === 'antigravity-gemini-4-neon' ? neonPricing : null) },
+          meteredCost: async () => 0n,
+          estimateCost: undefined,
+          requestFn: (async () => {
+            reservedDuringCall = _antigravityInflightForTests().get(token)?.reserved ?? -1n
+            return {
+              statusCode: 200,
+              headers: { 'content-type': 'text/event-stream' },
+              body: Readable.from([Buffer.from(SSE.join(''))]),
+            }
+          }) as never,
+        },
+      )
+      assert.equal(res.status, 200)
+      assert.ok(reservedDuringCall > 0n, 'aux call must reserve non-zero light-model budget')
+      observedReservations.push(reservedDuringCall)
+    }
+    assert.equal(observedReservations[0], observedReservations[1])
+    assert.equal(observedReservations[1], observedReservations[2])
+    // Verify aux reservation is strictly much lower than primary Neon reservation for the same payload size.
+    const primaryToken = await mintRoute('antigravity-gemini-4-neon', 1_000_000n)
+    const primaryBody = padTo(JSON.stringify({ model: 'gemini-4-neon-high', requestType: 'agent', prompt: samePadding }))
+    let primaryReserved = -1n
+    const primaryRes = await relay(
+      `${ANTIGRAVITY_RELAY_PREFIX}/route/${primaryToken}/v1internal:streamGenerateContent?alt=sse`,
+      { body: primaryBody },
+      { status: 200, body: SSE },
+      {
+        pricing: { get: (id) => (id === 'antigravity-gemini-4-neon' ? neonPricing : null) },
+        meteredCost: async () => 0n,
+        estimateCost: undefined,
+        requestFn: (async () => {
+          primaryReserved = _antigravityInflightForTests().get(primaryToken)?.reserved ?? -1n
+          return {
+            statusCode: 200,
+            headers: { 'content-type': 'text/event-stream' },
+            body: Readable.from([Buffer.from(SSE.join(''))]),
+          }
+        }) as never,
+      },
+    )
+    assert.equal(primaryRes.status, 200)
+    assert.ok(observedReservations[0]! < primaryReserved / 10n)
+  })
+
+  test('P0-2a aux pricing resolution: explicit catalog row wins, wildcard stubs are ignored, and aux never exceeds primary', () => {
+    const customAux = {
+      model_id: 'antigravity-gemini-3.5-flash-lite',
+      display_name: 'Flash Lite Catalog',
+      input_per_mtok: 10n,
+      output_per_mtok: 40n,
+      cache_read_per_mtok: 1n,
+      cache_write_per_mtok: 0n,
+      multiplier: '1.000',
+      enabled: true,
+    } as unknown as ModelPricing
+    const mul2Neon = { ...neonPricing, multiplier: '2.000' } as ModelPricing
+
+    const fromCatalog = resolveAntigravityAuxPricing(mul2Neon, {
+      get: (id) => (id === 'antigravity-gemini-3.5-flash-lite' ? customAux : null),
+    })
+    assert.equal(fromCatalog.source, 'catalog')
+    assert.equal(fromCatalog.input_per_mtok, 10n)
+    assert.equal(fromCatalog.output_per_mtok, 40n)
+    assert.equal(fromCatalog.multiplier, '2.000')
+
+    // Wildcard test stub returning primary pricing for every key must NOT charge aux at Neon rates.
+    const fromWildcardStub = resolveAntigravityAuxPricing(neonPricing, { get: () => neonPricing })
+    assert.equal(fromWildcardStub.source, 'fallback')
+    assert.equal(fromWildcardStub.input_per_mtok, ANTIGRAVITY_AUX_FALLBACK_RATES.input_per_mtok)
+
+    // Ultra-cheap primary caps aux rate so aux never costs more than primary.
+    const ultraCheapPrimary = {
+      ...neonPricing,
+      input_per_mtok: 5n,
+      output_per_mtok: 20n,
+      cache_read_per_mtok: 0n,
+    } as ModelPricing
+    const capped = resolveAntigravityAuxPricing(ultraCheapPrimary)
+    assert.equal(capped.input_per_mtok, 5n)
+    assert.equal(capped.output_per_mtok, 20n)
+    assert.equal(capped.cache_read_per_mtok, 0n)
+  })
+
+  test('P0-2a classifier & no-output guard: null/empty legacy fallback, hung primary waiver, and 0-output aux waiver', () => {
+    assert.equal(isAntigravityAuxUpstreamModel('gemini-3.5-flash-lite'), true)
+    assert.equal(isAntigravityAuxUpstreamModel('gemini-4-neon-high'), false)
+    assert.equal(isAntigravityAuxUpstreamModel(''), false)
+    assert.equal(isAntigravityAuxUpstreamModel(null), false)
+    assert.equal(isAntigravityAuxUpstreamModel(undefined), false)
+
+    // Primary produced 0 output tokens; aux output must not make a hung primary turn chargeable.
+    const hungPrimary = planAntigravitySettle({
+      engineStatus: 'success',
+      totals: {
+        promptTokens: 50_000n,
+        candidatesTokens: 0n,
+        thoughtsTokens: 0n,
+        cachedTokens: 0n,
+        calls: 3,
+        aux: {
+          promptTokens: 500_500n,
+          candidatesTokens: 60n,
+          thoughtsTokens: 0n,
+          cachedTokens: 0n,
+          calls: 2,
+          monitoringCalls: 1,
+        },
+      },
+      pricing: neonPricing,
+    })
+    assert.equal(hungPrimary.costCredits, 0n)
+    assert.equal(JSON.parse(hungPrimary.snapshotJson).waived, 'no_output')
+
+    // Aux-only 0-output call (e.g. monitoring call returning 0 output) is still waived by no_output.
+    const zeroOutputAux = planAntigravitySettle({
+      engineStatus: 'success',
+      totals: {
+        promptTokens: 0n,
+        candidatesTokens: 0n,
+        thoughtsTokens: 0n,
+        cachedTokens: 0n,
+        calls: 1,
+        aux: {
+          promptTokens: 500_000n,
+          candidatesTokens: 0n,
+          thoughtsTokens: 0n,
+          cachedTokens: 0n,
+          calls: 1,
+          monitoringCalls: 1,
+        },
+      },
+      pricing: neonPricing,
+    })
+    assert.equal(zeroOutputAux.costCredits, 0n)
+    assert.equal(JSON.parse(zeroOutputAux.snapshotJson).waived, 'no_output')
+  })
+
+  test('P0-2a / B2 relay metering: aux traffic meters at light-model rate (no false Neon 402) and still enforces route budget against spoofed agent_monitoring', async () => {
+    // Budget 200 fen: 3 flash-lite calls of 1M input + 500 output = 3 * 20.04 = 60.12 -> 61 fen (< 200).
+    // Previously at Neon 600/3000 this would have burned 1805 fen and 402'd on call #2!
+    const token = await mintRoute('antigravity-gemini-4-neon', 200n)
+    const path = `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:streamGenerateContent?alt=sse`
+    const oneMtokSse = [
+      'data: {"response":{"candidates":[{"content":{"parts":[{"text":"ok"}]}}],"usageMetadata":{"promptTokenCount":1000000,"candidatesTokenCount":500,"thoughtsTokenCount":0,"cachedContentTokenCount":0}}}\n\n',
+    ]
+    const deps: Partial<AntigravityRelayDeps> = {
+      pricing: { get: (id) => (id === 'antigravity-gemini-4-neon' ? neonPricing : null) },
+      meteredCost: async () => 0n,
+      estimateCost: undefined,
+    }
+    for (let i = 0; i < 3; i++) {
+      const res = await relay(
+        path,
+        { body: generateBody('gemini-3.5-flash-lite', 'agent_monitoring') },
+        { status: 200, body: oneMtokSse },
+        deps,
+      )
+      assert.equal(res.status, 200, `aux monitoring call ${i + 1}`)
+    }
+    const slot = _antigravityInflightForTests().get(token)
+    assert.equal(slot?.recorded.promptTokens, 0n)
+    assert.equal(slot?.recorded.aux?.calls, 3)
+    assert.equal(slot?.recorded.aux?.monitoringCalls, 3)
+    assert.equal(slot?.recorded.aux?.promptTokens, 3_000_000n)
+    assert.equal(_antigravityAuxInflightForTests().has(token), false)
+
+    // Primary Neon call still passes budget precheck because 61 < 200.
+    const primary = await relay(
+      path,
+      { body: generateBody('gemini-4-neon-high', 'agent') },
+      { status: 200, body: SSE },
+      deps,
+    )
+    assert.equal(primary.status, 200)
+    assert.equal(primary.captured.calls, 1)
+
+    // B2 negative check: once aux spend reaches budgetCredits, a spoofed agent_monitoring call MUST be 402-blocked!
+    const tightToken = await mintRoute('antigravity-gemini-4-neon', 20n)
+    const tightPath = `${ANTIGRAVITY_RELAY_PREFIX}/route/${tightToken}/v1internal:streamGenerateContent?alt=sse`
+    const first = await relay(
+      tightPath,
+      { body: generateBody('gemini-3.5-flash-lite', 'agent_monitoring') },
+      { status: 200, body: oneMtokSse }, // 20.04 -> 21 fen >= 20 budget
+      deps,
+    )
+    assert.equal(first.status, 200)
+    const blocked = await relay(
+      tightPath,
+      { body: generateBody('gemini-3.5-flash-lite', 'agent_monitoring') },
+      { status: 200, body: oneMtokSse },
+      deps,
+    )
+    assert.equal(blocked.status, 402)
+    assert.match(blocked.text, /ANTIGRAVITY_BUDGET_EXHAUSTED/)
+    assert.equal(blocked.captured.calls, 0)
+  })
+
+  test('P0-2b concurrency decoupling: 12 saturated primary slots never 429 aux; spoofed primary agent_monitoring still hits primary 429', async () => {
+    const token = await mintRoute('antigravity-gemini-4-neon', 1_000_000n)
+    let primaryGateRelease!: () => void
+    const primaryGate = new Promise<void>((resolve) => {
+      primaryGateRelease = resolve
+    })
+    let primaryEntered = 0
+    let allPrimaryIn!: () => void
+    const primaryFull = new Promise<void>((resolve) => {
+      allPrimaryIn = resolve
+    })
+    const handler = makeAntigravityRelayHandler({
+      identityRepo: repo(),
+      clientSecret: 'GOCSPX-test-secret-not-real-000',
+      freshToken: async () => Buffer.from(FULL_TOKEN, 'utf8'),
+      reportOutcome: async () => {},
+      reportModelOutcome: async () => {},
+      recordUsage: async () => {},
+      meteredCost: async () => 0n,
+      estimateCost: () => 1n,
+      requestFn: (async (_url: unknown, opts: { body?: Buffer }) => {
+        const parsed = JSON.parse(opts.body?.toString('utf8') ?? '{}') as { model?: string }
+        if (parsed.model === 'gemini-4-neon-high') {
+          primaryEntered += 1
+          if (primaryEntered === ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE) allPrimaryIn()
+          await primaryGate
+        }
+        return {
+          statusCode: 200,
+          headers: { 'content-type': 'text/event-stream' },
+          body: Readable.from([Buffer.from(SSE.join(''))]),
+        }
+      }) as never,
+    })
+    const server = createServer((req, res) => {
+      void handler(req, res, CTX)
+    })
+    const port = await listen(server)
+    const base = `http://127.0.0.1:${port}${ANTIGRAVITY_RELAY_PREFIX}/route/${token}`
+    const post = (rpcPath: string, body: string) =>
+      fetch(`${base}/v1internal:${rpcPath}`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${CONTAINER_TOKEN}`, 'content-type': 'application/json' },
+        body,
+      }).then(async (r) => ({ status: r.status, text: await r.text() }))
+    try {
+      const primaries = Array.from({ length: ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE }, () =>
+        post('streamGenerateContent?alt=sse', generateBody('gemini-4-neon-high', 'agent')),
+      )
+      await deadline(primaryFull, '12 primary calls did not saturate route')
+      assert.equal(_antigravityInflightForTests().get(token)?.count, ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE)
+
+      // 13th primary call is rejected with 429 ANTIGRAVITY_ROUTE_BUSY.
+      const overflowPrimary = await post(
+        'streamGenerateContent?alt=sse',
+        generateBody('gemini-4-neon-high', 'agent'),
+      )
+      assert.equal(overflowPrimary.status, 429)
+      assert.match(overflowPrimary.text, /ANTIGRAVITY_ROUTE_BUSY/)
+
+      // Spoofed requestType='agent_monitoring' on primary model MUST stay in primary lane and hit 429.
+      const spoofedPrimary = await post(
+        'streamGenerateContent?alt=sse',
+        generateBody('gemini-4-neon-high', 'agent_monitoring'),
+      )
+      assert.equal(spoofedPrimary.status, 429)
+      assert.match(spoofedPrimary.text, /ANTIGRAVITY_ROUTE_BUSY/)
+
+      // Real aux calls (agent_monitoring, checkpoint, web_search) bypass primary cap and return 200!
+      const [mon, chk, search] = await Promise.all([
+        post('streamGenerateContent?alt=sse', generateBody('gemini-3.5-flash-lite', 'agent_monitoring')),
+        post('streamGenerateContent?alt=sse', generateBody('gemini-3.5-flash-lite', 'checkpoint')),
+        post('generateContent', generateBody('gemini-3.5-flash-lite', 'web_search')),
+      ])
+      assert.equal(mon.status, 200)
+      assert.equal(chk.status, 200)
+      assert.equal(search.status, 200)
+      assert.equal(_antigravityInflightForTests().get(token)?.count, ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE)
+      assert.equal(_antigravityAuxInflightForTests().has(token), false)
+
+      primaryGateRelease()
+      const settledPrimaries = await Promise.all(primaries)
+      assert.ok(settledPrimaries.every((r) => r.status === 200))
+      assert.equal(_antigravityInflightForTests().get(token)?.count, 0)
+    } finally {
+      primaryGateRelease()
+      server.closeAllConnections()
+      await close(server)
+    }
+  })
+
+  test('P0-2b aux lane enforces its own cap (ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE) without starving primary', async () => {
+    const token = await mintRoute('antigravity-gemini-4-neon', 1_000_000n)
+    let auxGateRelease!: () => void
+    const auxGate = new Promise<void>((resolve) => {
+      auxGateRelease = resolve
+    })
+    let auxEntered = 0
+    let allAuxIn!: () => void
+    const auxFull = new Promise<void>((resolve) => {
+      allAuxIn = resolve
+    })
+    const handler = makeAntigravityRelayHandler({
+      identityRepo: repo(),
+      clientSecret: 'GOCSPX-test-secret-not-real-000',
+      freshToken: async () => Buffer.from(FULL_TOKEN, 'utf8'),
+      reportOutcome: async () => {},
+      reportModelOutcome: async () => {},
+      recordUsage: async () => {},
+      meteredCost: async () => 0n,
+      estimateCost: () => 0n,
+      requestFn: (async (_url: unknown, opts: { body?: Buffer }) => {
+        const parsed = JSON.parse(opts.body?.toString('utf8') ?? '{}') as { model?: string }
+        if (parsed.model === 'gemini-3.5-flash-lite') {
+          auxEntered += 1
+          if (auxEntered === ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE) allAuxIn()
+          await auxGate
+        }
+        return {
+          statusCode: 200,
+          headers: { 'content-type': 'text/event-stream' },
+          body: Readable.from([Buffer.from(SSE.join(''))]),
+        }
+      }) as never,
+    })
+    const server = createServer((req, res) => {
+      void handler(req, res, CTX)
+    })
+    const port = await listen(server)
+    const url = `http://127.0.0.1:${port}${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:streamGenerateContent?alt=sse`
+    const post = (body: string) =>
+      fetch(url, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${CONTAINER_TOKEN}`, 'content-type': 'application/json' },
+        body,
+      }).then(async (r) => ({ status: r.status, text: await r.text() }))
+    try {
+      const auxCalls = Array.from({ length: ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE }, () =>
+        post(generateBody('gemini-3.5-flash-lite', 'agent_monitoring')),
+      )
+      await deadline(auxFull, 'aux lane did not reach cap')
+      assert.equal(
+        _antigravityAuxInflightForTests().get(token)?.count,
+        ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE,
+      )
+      assert.equal(_antigravityInflightForTests().get(token)?.count, 0)
+
+      // 25th aux call hits independent aux 429 cap.
+      const overflowAux = await post(generateBody('gemini-3.5-flash-lite', 'agent_monitoring'))
+      assert.equal(overflowAux.status, 429)
+      assert.match(overflowAux.text, /ANTIGRAVITY_AUX_ROUTE_BUSY/)
+
+      // Primary model still has all 12 slots free and succeeds immediately!
+      const primary = await post(generateBody('gemini-4-neon-high', 'agent'))
+      assert.equal(primary.status, 200)
+
+      auxGateRelease()
+      const settledAux = await Promise.all(auxCalls)
+      assert.ok(settledAux.every((r) => r.status === 200))
+      assert.equal(_antigravityAuxInflightForTests().has(token), false)
+    } finally {
+      auxGateRelease()
+      server.closeAllConnections()
+      await close(server)
+    }
+  })
+
+  test('P0-2b aux slot and reservation are always released on auth failure, upstream error, recordUsage failure, and client abort', async () => {
+    const token = await mintRoute('antigravity-gemini-4-neon', 1_000_000n)
+    const path = `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:streamGenerateContent?alt=sse`
+
+    // 1. Auth token error
+    const authFail = await relay(
+      path,
+      { body: generateBody('gemini-3.5-flash-lite', 'agent_monitoring') },
+      { status: 200, body: SSE },
+      { freshToken: async () => { throw new Error('oauth unavailable') } },
+    )
+    assert.equal(authFail.status, 503)
+    assert.equal(_antigravityAuxInflightForTests().has(token), false)
+    assert.equal(_antigravityInflightForTests().get(token)?.reserved, 0n)
+
+    // 2. Upstream network error
+    const netFail = await relay(
+      path,
+      { body: generateBody('gemini-3.5-flash-lite', 'web_search') },
+      { status: 200, body: SSE },
+      {
+        estimateCost: () => 5n,
+        requestFn: (async () => { throw new Error('ECONNRESET') }) as never,
+      },
+    )
+    assert.equal(netFail.status, 503)
+    assert.equal(_antigravityAuxInflightForTests().has(token), false)
+    assert.equal(_antigravityInflightForTests().get(token)?.reserved, 0n)
+
+    // 3. Upstream stream error mid-response
+    let recordAttempts = 0
+    let doneResolve!: () => void
+    const donePromise = new Promise<void>((r) => { doneResolve = r })
+    const handler = makeAntigravityRelayHandler({
+      identityRepo: repo(),
+      clientSecret: 'GOCSPX-test-secret-not-real-000',
+      freshToken: async () => Buffer.from(FULL_TOKEN, 'utf8'),
+      reportOutcome: async () => {},
+      reportModelOutcome: async () => {},
+      recordUsage: async () => {
+        recordAttempts += 1
+        throw new Error('db down')
+      },
+      meteredCost: async () => 0n,
+      estimateCost: () => 3n,
+      requestFn: (async () => ({
+        statusCode: 200,
+        headers: { 'content-type': 'text/event-stream' },
+        body: Readable.from([Buffer.from(SSE.join(''))]),
+      })) as never,
+    })
+    const server = createServer((req, res) => {
+      void handler(req, res, CTX).finally(doneResolve)
+    })
+    const port = await listen(server)
+    try {
+      await fetch(`http://127.0.0.1:${port}${path}`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${CONTAINER_TOKEN}`, 'content-type': 'application/json' },
+        body: generateBody('gemini-3.5-flash-lite', 'checkpoint'),
+      }).then((r) => r.text()).catch(() => {})
+      await deadline(donePromise, 'recordUsage failure handler did not finish')
+      assert.equal(recordAttempts, 3)
+      assert.equal(_antigravityAuxInflightForTests().has(token), false)
+      assert.equal(_antigravityInflightForTests().get(token)?.count, 0)
+      assert.equal(_antigravityInflightForTests().get(token)?.reserved, 0n)
+    } finally {
+      server.closeAllConnections()
+      await close(server)
+    }
   })
 })

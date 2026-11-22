@@ -1,10 +1,17 @@
 import "@testing-library/jest-dom/vitest";
-import { act, render, screen } from "@testing-library/react";
+import { act, render, renderHook, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { MessageList, MessageRenderer } from "../../components/MessageRenderer";
 import { FirstTextPaintCommitProbe } from "../../components/chat/FirstTextPaintCommitProbe";
 import type { CardCallbacks } from "../../components/chat/cards";
+import { type ChatCardActionsInput, useChatCardActions } from "../../hooks/useChatCardActions";
+import { createMemoryAuthSession } from "../authSession";
+import { captureIdentityAttempt, resolveIdentity } from "../resolvedIdentity";
+import {
+  classifyFirstTextPaintVisibility,
+  resetFirstTextPaintVisibilityForTests,
+} from "./firstTextPaintVisibility";
 import type { ChatMessage } from "./model";
 import { ChatSocket, type ChatSocketDeps } from "./socket";
 import { prefetchMarkdownImpl } from "../../components/Markdown";
@@ -106,11 +113,24 @@ function textFrame(input: {
   };
 }
 
+function setDocumentVisibility(state: DocumentVisibilityState): void {
+  Object.defineProperty(document, "visibilityState", {
+    configurable: true,
+    value: state,
+  });
+  document.dispatchEvent(new Event("visibilitychange"));
+}
+
 afterEach(() => {
   for (const ws of FakeWS.instances) {
     if (ws.readyState === 1) ws.close(1000, "test");
   }
   FakeWS.instances = [];
+  resetFirstTextPaintVisibilityForTests();
+  Object.defineProperty(document, "visibilityState", {
+    configurable: true,
+    value: "visible",
+  });
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -219,6 +239,12 @@ describe("browser first-text paint telemetry", () => {
       clientMessageId: "user-1",
       latencyMs: 30_000,
       backgroundAtFrame: false,
+      visibilityState: "visible",
+      wasHidden: false,
+      hiddenDurationMs: 0,
+      visibleLatencyMs: 30_000,
+      visibilityPath: "visible",
+      visibilityReason: "hidden_0s",
     });
 
     view.rerender(
@@ -306,4 +332,229 @@ test("an old paint callback does not delete a replacement probe; empty/error bod
     <FirstTextPaintCommitProbe message={error} onFirstTextPaint={onFirstTextPaint} /></>);
   flush(); flush();
   expect(onFirstTextPaint).toHaveBeenCalledTimes(1);
+});
+
+describe("OCV5-40 first-text paint visibility context", () => {
+  test("nocturnal mobile lockscreen during rAF wait marks wasHidden=true and classifies hidden_during_paint", () => {
+    let now = 31_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const flush = animationFrames();
+    const onFirstTextPaint = vi.fn();
+
+    const message: ChatMessage = {
+      id: "assistant-night",
+      role: "assistant",
+      text: "engine replied quickly",
+      ts: 31_000,
+      _clientMessageId: "u-night",
+      _turnOwnerId: "u-night",
+      _firstTextPaintProbe: {
+        traceId: "f".repeat(32),
+        sessionId: "s-night",
+        clientMessageId: "u-night",
+        startedAt: 1_000,
+        frameAt: 31_000,
+        backgroundAtFrame: false,
+        hiddenBeforeFrame: false,
+      },
+    };
+
+    render(<FirstTextPaintCommitProbe message={message} onFirstTextPaint={onFirstTextPaint} />);
+    // Frame arrived while visible, then user locked phone before 2nd rAF fired (53 minutes hidden).
+    now = 31_010;
+    setDocumentVisibility("hidden");
+    flush();
+    now = 3_211_010;
+    setDocumentVisibility("visible");
+    now = 3_211_020;
+    flush();
+
+    expect(onFirstTextPaint).toHaveBeenCalledTimes(1);
+    expect(onFirstTextPaint).toHaveBeenCalledWith({
+      traceId: "f".repeat(32),
+      sessionId: "s-night",
+      clientMessageId: "u-night",
+      latencyMs: 3_210_020,
+      backgroundAtFrame: false,
+      visibilityState: "visible",
+      wasHidden: true,
+      hiddenDurationMs: 3_180_000,
+      visibleLatencyMs: 30_020,
+      visibilityPath: "hidden_during_paint",
+      visibilityReason: "hidden_15m_60m_mostly_hidden",
+    });
+  });
+
+  test("tab hidden during wait and returned visible before frame arrival still sets hiddenBeforeFrame and wasHidden", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    let now = 1_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const flush = animationFrames();
+
+    const socket = makeSocket();
+    socket.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+
+    const cmid = beginTurn(socket, ws, "s-wait");
+    // User switches tab 1s after submit and returns 3 minutes later before frame arrives.
+    now = 2_000;
+    setDocumentVisibility("hidden");
+    now = 182_000;
+    setDocumentVisibility("visible");
+    now = 183_000;
+
+    ws.emit(textFrame({
+      sessionId: "s-wait",
+      clientMessageId: cmid,
+      traceId: "1".repeat(32),
+      frameSeq: 1,
+      isFinal: true,
+    }));
+
+    const assistant = socket.sessions.get("s-wait")!.messages.find((m) => m.role === "assistant")!;
+    expect(assistant._firstTextPaintProbe).toMatchObject({
+      backgroundAtFrame: false,
+      hiddenBeforeFrame: true,
+      frameAt: 183_000,
+    });
+
+    const onFirstTextPaint = vi.fn();
+    now = 183_020;
+    render(<FirstTextPaintCommitProbe message={assistant} onFirstTextPaint={onFirstTextPaint} />);
+    flush();
+    flush();
+
+    expect(onFirstTextPaint).toHaveBeenCalledTimes(1);
+    expect(onFirstTextPaint).toHaveBeenCalledWith({
+      traceId: "1".repeat(32),
+      sessionId: "s-wait",
+      clientMessageId: cmid,
+      latencyMs: 182_020,
+      backgroundAtFrame: false,
+      visibilityState: "visible",
+      wasHidden: true,
+      hiddenDurationMs: 180_000,
+      visibleLatencyMs: 2_020,
+      visibilityPath: "hidden_during_wait",
+      visibilityReason: "hidden_2m_15m_mostly_hidden",
+    });
+    socket.stop();
+  });
+
+  test("distinguishes slow engine (mostly_visible) from user away (mostly_hidden) and hidden_at_paint", () => {
+    const slowEngine = classifyFirstTextPaintVisibility({
+      latencyMs: 90_000,
+      backgroundAtFrame: false,
+      hiddenBeforeFrame: true,
+      hiddenDuringPaint: false,
+      visibilityState: "visible",
+      hiddenDurationMs: 8_000,
+    });
+    expect(slowEngine).toEqual({
+      wasHidden: true,
+      visibilityPath: "hidden_during_wait",
+      visibilityReason: "hidden_5s_30s_mostly_visible",
+    });
+
+    const stillHidden = classifyFirstTextPaintVisibility({
+      latencyMs: 299_000,
+      backgroundAtFrame: true,
+      hiddenBeforeFrame: true,
+      hiddenDuringPaint: true,
+      visibilityState: "hidden",
+      hiddenDurationMs: 297_000,
+    });
+    expect(stillHidden).toEqual({
+      wasHidden: true,
+      visibilityPath: "hidden_at_paint",
+      visibilityReason: "hidden_2m_15m_mostly_hidden",
+    });
+
+    // All emitted tokens must satisfy the 0278 server CHECK constraints.
+    for (const sample of [slowEngine, stillHidden]) {
+      expect(sample.visibilityPath).toMatch(/^[a-z0-9_]{1,32}$/);
+      expect(sample.visibilityReason).toMatch(/^[a-z0-9_]{1,48}$/);
+    }
+  });
+
+  test("useChatCardActions routes wasHidden=true to FIRST_TEXT_PAINT_AFTER_BACKGROUND with visibility path/reason on the wire", () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("matchMedia", vi.fn(() => ({ matches: true })));
+
+    const auth = createMemoryAuthSession(() => {}, "tok-paint");
+    const input = {
+      authRef: { current: auth },
+      identity: resolveIdentity(captureIdentityAttempt(auth, "tok-paint"), "alice"),
+      demo: false,
+      activeId: "s-wire",
+      communityBlogEnabled: true,
+      chat: {},
+      agent: { id: "main" },
+      loadExactUserMessage: vi.fn(),
+      setComposerPrefill: vi.fn(),
+      toast: vi.fn(),
+      openManage: vi.fn(),
+      openBlog: vi.fn(),
+      openPane: vi.fn(),
+      openSettings: vi.fn(),
+      setCollapsed: vi.fn(),
+      setBoardOpen: vi.fn(),
+    } as unknown as ChatCardActionsInput;
+    const { result } = renderHook(() => useChatCardActions(input));
+    const onFirstTextPaint = result.current.cardCallbacks.onFirstTextPaint!;
+
+    onFirstTextPaint({
+      traceId: "a".repeat(32),
+      sessionId: "s-wire",
+      clientMessageId: "u-fg",
+      latencyMs: 2_400,
+      backgroundAtFrame: false,
+      visibilityState: "visible",
+      wasHidden: false,
+      hiddenDurationMs: 0,
+      visibleLatencyMs: 2_400,
+      visibilityPath: "visible",
+      visibilityReason: "hidden_0s",
+    });
+    onFirstTextPaint({
+      traceId: "b".repeat(32),
+      sessionId: "s-wire",
+      clientMessageId: "u-bg",
+      latencyMs: 3_210_020,
+      backgroundAtFrame: false,
+      visibilityState: "visible",
+      wasHidden: true,
+      hiddenDurationMs: 3_180_000,
+      visibleLatencyMs: 30_020,
+      visibilityPath: "hidden_during_paint",
+      visibilityReason: "hidden_15m_60m_mostly_hidden",
+    });
+
+    const bodies = fetchMock.mock.calls.map((c) => JSON.parse(String((c[1] as RequestInit).body)));
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).toMatchObject({
+      surface: "webchat",
+      stage: "first_text_paint",
+      code: "FIRST_TEXT_PAINT",
+      outcome: "succeeded",
+      latency_ms: 2_400,
+      trace_id: "a".repeat(32),
+      session_id: "s-wire",
+      path: "visible",
+      reason: "hidden_0s",
+    });
+    expect(bodies[1]).toMatchObject({
+      surface: "webchat",
+      stage: "first_text_paint",
+      code: "FIRST_TEXT_PAINT_AFTER_BACKGROUND",
+      outcome: "succeeded",
+      latency_ms: 3_210_020,
+      trace_id: "b".repeat(32),
+      session_id: "s-wire",
+      path: "hidden_during_paint",
+      reason: "hidden_15m_60m_mostly_hidden",
+    });
+  });
 });

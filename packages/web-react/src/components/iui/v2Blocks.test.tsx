@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, within } from "@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { __resetIntelligentUiForTests } from "../../lib/intelligentUi";
 import { MediaSignProvider } from "../chat/media";
-import { ChatInteractionContext } from "../tool/context";
+import { ArtifactInspectContext, ChatInteractionContext } from "../tool/context";
 import { IuiBlock } from "./IuiBlock";
 import { validateSpec } from "./schema";
 import { uiFencesToMarkdown } from "./toMarkdown";
@@ -271,5 +271,65 @@ describe("v2 interactive components", () => {
     fireEvent.click(screen.getByRole("button", { name: "只看未掌握" }));
     expect(within(screen.getByRole("button", { name: /点击翻面/ })).getByText("问题乙")).toBeInTheDocument();
     expect(screen.getByText("1 / 1")).toBeInTheDocument();
+  });
+
+  it("BrowserHandoffBlock validates aliases/safe URLs, opens fullscreen live takeover, sends continue prompt, and degrades in readOnly", () => {
+    const alias = validateSpec(
+      {
+        type: "browser_takeover",
+        title: "请完成 GitHub 登录",
+        url: "javascript:alert(1)",
+        reason: "需要登录授权",
+      },
+      false,
+    );
+    expect(alias.ok && alias.spec.type === "browser_handoff").toBe(true);
+    if (alias.ok && alias.spec.type === "browser_handoff") {
+      expect(alias.spec.url).toBeUndefined();
+    }
+
+    const md = uiFencesToMarkdown(
+      `\`\`\`ui\n${j({ type: "browser_handoff", title: "请完成 GitHub 登录", url: "https://github.com/login", reason: "需要登录" })}\n\`\`\``,
+    );
+    expect(md).toContain("请完成 GitHub 登录");
+    expect(md).toContain("https://github.com/login");
+
+    const openLiveBrowser = vi.fn();
+    const sendUserText = vi.fn();
+    render(
+      <ArtifactInspectContext.Provider value={{ openLiveBrowser }}>
+        <ChatInteractionContext.Provider value={{ sendUserText }}>
+          <IuiBlock
+            code={j({
+              type: "browser_handoff",
+              title: "请完成 GitHub 登录",
+              url: "https://github.com/login",
+              reason: "完成后登录态将同步给助手。",
+              continue_prompt: "我已完成 GitHub 登录，请继续拉取仓库信息。",
+            })}
+          />
+        </ChatInteractionContext.Provider>
+      </ArtifactInspectContext.Provider>,
+    );
+
+    expect(screen.getByText("github.com")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("iui-browser-handoff-open"));
+    expect(openLiveBrowser).toHaveBeenCalledWith({
+      takeover: true,
+      expand: true,
+      url: "https://github.com/login",
+      continuePrompt: "我已完成 GitHub 登录，请继续拉取仓库信息。",
+    });
+    expect(screen.getByRole("status")).toHaveTextContent("正在为你打开实时浏览器");
+
+    // Secondary CTA must only auto-send transparent user-visible copy, never unshown continue_prompt.
+    fireEvent.click(screen.getByTestId("iui-browser-handoff-continue"));
+    expect(sendUserText).toHaveBeenCalledWith("我已完成 github.com 的浏览器操作，请继续。");
+    expect(screen.getByTestId("iui-browser-handoff-continue")).toBeDisabled();
+
+    cleanup();
+    render(<IuiBlock readOnly code={j({ type: "browser_handoff", url: "https://github.com/login" })} />);
+    expect(screen.getByTestId("iui-browser-handoff-open")).toBeDisabled();
+    expect(screen.getByTestId("iui-browser-handoff-continue")).toBeDisabled();
   });
 });

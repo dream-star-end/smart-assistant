@@ -9,7 +9,8 @@ import {formatMessageReplyPrompt} from '@openclaude/protocol/browser';
  */
 import { useCallback, useState, useRef, useEffect, useMemo } from "react";
 import type { MediaRef, InboundMessage } from "../lib/chat/frames";
-import { type MessageReplyQuote, type ServiceTier, cursorModelSupportsContextTier, normalizeServiceTierForModel, isCodexEngineModel } from "@openclaude/protocol/browser";
+import { type MessageReplyQuote, type ServiceTier, cursorModelSupportsContextTier, normalizeServiceTierForModel, isCodexEngineModel, parseSwarmSlashCommand } from "@openclaude/protocol/browser";
+import { isAntigravityModelForUi } from "../components/chat/swarmDetect";
 import { sessionTitleFromText } from "../lib/sessionTitle";
 import type { Message, Session } from "../lib/types";
 import { demoReply } from "../lib/demo";
@@ -18,6 +19,7 @@ import { prepareAdvisorSend, saveInitialCollaboration, persistRecoveredAdvisor }
 import { writeSessionEffort } from "../lib/sessionEffort";
 import { writeContextTier } from "../lib/sessionContextTier";
 import { writeSessionServiceTier } from "../lib/sessionServiceTier";
+import { writeSessionSwarmMode } from "../lib/sessionSwarmMode";
 import { docToUiState, keepCollabChoiceOnSaveFailure, sendCollabFields } from "../lib/collaborationConfig";
 import { apiErrorMessage, api } from "../lib/api";
 import { effortForModel, effectiveEffortModelId } from "../lib/modelPreferences";
@@ -78,6 +80,9 @@ export type ComposerSendInput = {
   sockRef: React.RefObject<UseChatSocket | null>;
   stopPreparing: () => void;
   stopRef: React.RefObject<boolean>;
+  swarmMode?: boolean;
+  /** Optional ref reader so callers can compute `useSwarmMode` after `useChatSocket` without first-frame lag. */
+  getSwarmMode?: () => boolean;
   toast: ToastFn;
   user: User | null;
 };
@@ -126,6 +131,8 @@ export function useComposerSend({
   sockRef,
   stopPreparing,
   stopRef,
+  swarmMode = false,
+  getSwarmMode,
   toast,
   user,
 }: ComposerSendInput) {
@@ -337,6 +344,14 @@ export function useComposerSend({
         sendScrollRef?.current?.();
       }
       const teamLeaderTurn = sendCollab.teamMode;
+      const slashSwarm = parseSwarmSlashCommand(text);
+      const modelIsAntigravity = isAntigravityModelForUi(modelId, models);
+      if (slashSwarm?.matched && !modelIsAntigravity) {
+        toast("蜂群模式仅支持 Antigravity 模型，请先在顶栏切换至 Gemini 4 / Antigravity 模型", "info");
+        return false;
+      }
+      const activeSwarmMode = getSwarmMode ? getSwarmMode() : swarmMode;
+      const effectiveSwarmMode = modelIsAntigravity && (activeSwarmMode || Boolean(slashSwarm?.matched));
       const sent=await sockRef.current?.send({
         ...(authorization?{switchAuthorization:authorization}:{}),
         sessId: sessionId,
@@ -353,6 +368,7 @@ export function useComposerSend({
         imageEdit,
         replyTo,
         teamMode: teamLeaderTurn,
+        ...(effectiveSwarmMode ? { swarmMode: true } : {}),
         collabMode: sendCollab.collabMode,
         ...(sendCollab.collabMode === "advisor"
           ? {
@@ -367,6 +383,9 @@ export function useComposerSend({
         ...(effectiveTurnTier ? { serviceTier: effectiveTurnTier } : {}),
       });
       if(sent===false)return false;
+      if (effectiveSwarmMode && (!originalSessionId || Boolean(slashSwarm?.matched))) {
+        writeSessionSwarmMode(sessionId, true);
+      }
       // Fee confirmation keeps ownership of the draft until the send is accepted.
       if (createdSession && recoveryIsCurrent()) {
         promoteDraftCollab(sessionId, latestCollab, false);
@@ -428,6 +447,7 @@ export function useComposerSend({
       user,
       agent,
       modelId,
+      swarmMode,
       models,
       preferenceEffort,
       sessionEffort,

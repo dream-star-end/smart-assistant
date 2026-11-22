@@ -52,7 +52,7 @@ describe("MessageList preserves hooks across production mount branches", () => {
     const view = render(
       <MessageList {...common} messages={rows} sending={false} scrollParent={null} />,
     );
-    expect(screen.getByRole("status")).toHaveTextContent("正在准备会话");
+    expect(screen.queryByText("正在准备会话…")).toBeNull();
     expect(screen.queryByText("HOOK_ORDER_VISIBLE_USER")).toBeNull();
     view.rerender(
       <MessageList {...common} messages={rows} sending={false} scrollParent={scroller} />,
@@ -61,7 +61,8 @@ describe("MessageList preserves hooks across production mount branches", () => {
     view.rerender(
       <MessageList {...common} messages={rows} sending={false} scrollParent={null} />,
     );
-    expect(screen.getByRole("status")).toHaveTextContent("正在准备会话");
+    expect(screen.queryByText("正在准备会话…")).toBeNull();
+    expect(screen.queryByText("HOOK_ORDER_VISIBLE_USER")).toBeNull();
     view.rerender(
       <MessageList {...common} messages={rows} sending={false} scrollParent={scroller} readOnly />,
     );
@@ -74,7 +75,7 @@ describe("MessageList preserves hooks across production mount branches", () => {
       <MessageList {...common} messages={[]} sending historyLoading scrollParent={scroller} />,
     );
     expect(screen.getByLabelText("生成中")).toBeInTheDocument();
-    expect(screen.getByLabelText("正在加载会话内容")).toBeInTheDocument();
+    expect(screen.queryByLabelText("正在加载会话内容")).toBeNull();
     view.rerender(
       <MessageList {...common} messages={rows} sending scrollParent={scroller} />,
     );
@@ -85,7 +86,7 @@ describe("MessageList preserves hooks across production mount branches", () => {
       <MessageList {...common} messages={[]} sending historyLoading scrollParent={scroller} />,
     );
     expect(screen.queryByText("HOOK_ORDER_VISIBLE_USER")).toBeNull();
-    expect(screen.getByLabelText("正在加载会话内容")).toBeInTheDocument();
+    expect(screen.getByLabelText("生成中")).toBeInTheDocument();
     view.rerender(
       <MessageList {...common} messages={rows} sending={false} scrollParent={scroller} />,
     );

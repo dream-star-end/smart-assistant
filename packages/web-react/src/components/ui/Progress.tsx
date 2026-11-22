@@ -5,8 +5,8 @@ import { cn } from "../../lib/utils";
 /** 填充色语义。brand = 极光渐变(改造前唯一形态)。 */
 export type ProgressTone = "brand" | "neutral" | "success" | "warning" | "danger";
 
-/** 轨道:高度是唯一变化轴,底色/圆角固定。sm 给列表行内的密集用量条。 */
-const progressTrackVariants = cva("w-full overflow-hidden rounded-full bg-hover", {
+/** 轨道:高度是唯一变化轴,微凹槽质感 + 圆角固定。sm 给列表行内的密集用量条。 */
+const progressTrackVariants = cva("oc-surface-recessed w-full overflow-hidden rounded-full", {
   variants: { size: { sm: "h-1.5", md: "h-2" } },
   defaultVariants: { size: "md" },
 });
@@ -17,7 +17,7 @@ const progressTrackVariants = cva("w-full overflow-hidden rounded-full bg-hover"
  * 语义色一上,余额告急在余光里就能看见。
  */
 const progressFillVariants = cva(
-  "h-full rounded-full transition-[width] duration-300 ease-standard",
+  "oc-progress-fill h-full rounded-full transition-[width] duration-300 ease-standard",
   {
     variants: {
       tone: {

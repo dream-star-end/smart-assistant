@@ -1,4 +1,4 @@
-import { Inbox, RotateCw, TriangleAlert } from "lucide-react";
+import { Cpu, Inbox, RotateCw, Server, Tag, TriangleAlert } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import {
   Button,
@@ -18,26 +18,30 @@ import type { HealthMode, Inflight, ModelOpsResp, ModelRowData, ProviderData, St
 
 function PriceChangeTable({ changes }: { changes: PriceChange[] }) {
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-body">
-        <thead>
-          <tr className="border-b border-border text-left text-meta text-faint">
-            <th className="py-1.5 pr-3">项</th>
-            <th className="py-1.5 pr-3 text-right">旧(分/Mtok)</th>
-            <th className="py-1.5 text-right">新(分/Mtok)</th>
-          </tr>
-        </thead>
-        <tbody>
-          {changes.map((c) => (
-            <tr key={c.field} className="border-b border-border/60 last:border-0">
-              <td className="py-1.5 pr-3">{c.label}</td>
-              <td className="py-1.5 pr-3 text-right font-mono tabular-nums text-muted">{c.from}</td>
-              <td className="py-1.5 text-right font-mono tabular-nums font-semibold text-fg">{c.to}</td>
+    <div className="flex flex-col gap-3">
+      <div className="oc-surface-recessed overflow-x-auto rounded-xl px-3 py-2">
+        <table className="w-full text-body">
+          <thead>
+            <tr className="border-b border-border text-left text-caption font-semibold uppercase tracking-wide text-faint">
+              <th className="py-1.5 pr-3">项</th>
+              <th className="py-1.5 pr-3 text-right">旧(分/Mtok)</th>
+              <th className="py-1.5 text-right">新(分/Mtok)</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
-      <p className="mt-3 text-meta text-warning">保存后计费立即生效,请核对每 Mtok 分值。</p>
+          </thead>
+          <tbody>
+            {changes.map((c) => (
+              <tr key={c.field} className="border-b border-border/60 last:border-0">
+                <td className="py-1.5 pr-3">{c.label}</td>
+                <td className="py-1.5 pr-3 text-right font-mono tabular-nums text-muted">{c.from}</td>
+                <td className="py-1.5 text-right font-mono tabular-nums font-semibold text-fg">{c.to}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="oc-callout oc-callout-warning rounded-lg px-3 py-2 text-meta text-warning">
+        保存后计费立即生效,请核对每 Mtok 分值。
+      </div>
     </div>
   );
 }
@@ -82,19 +86,20 @@ function ExtraPromptModal({
         </>
       }
     >
-      <div className="flex flex-col gap-2">
-        <label className="text-meta text-faint">extra_system_prompt(per-model 行为补丁)</label>
+      <div className="flex flex-col gap-3">
+        <label className="text-meta font-medium text-fg">extra_system_prompt(per-model 行为补丁)</label>
         <Textarea
+          className="oc-field-control font-mono"
           value={text}
           onChange={(e) => setText(e.target.value)}
           rows={5}
           maxLength={4096}
           placeholder="留空=不注入。例:完成一个步骤后,不要 yield,继续推进至全部目标完成"
         />
-        <p className="text-[11.5px] leading-relaxed text-faint">
+        <div className="oc-callout oc-callout-info rounded-xl px-3.5 py-2.5 text-caption leading-relaxed text-muted">
           作为 system prompt 注入到 extra-prompt.md 末尾。修改仅对<b>新 spawn</b>的会话生效,
           运行中的会话不换文案。上限 4096 字。
-        </p>
+        </div>
       </div>
     </Modal>
   );
@@ -327,17 +332,19 @@ export default function PricingPage() {
   if (error) {
     return (
       <div className="flex flex-col gap-5">
-        <PageHeader title={meta.title} desc={meta.desc} />
-        <EmptyState
-          icon={Inbox}
-          title="加载模型与服务商失败"
-          hint={apiErrorMessage(error, "加载失败")}
-          action={
-            <Button variant="secondary" size="sm" onClick={() => setReloadTick((t) => t + 1)}>
-              重试
-            </Button>
-          }
-        />
+        <PageHeader icon={Tag} title={meta.title} desc={meta.desc} />
+        <div className="oc-surface-card rounded-xl">
+          <EmptyState
+            icon={Inbox}
+            title="加载模型与服务商失败"
+            hint={apiErrorMessage(error, "加载失败")}
+            action={
+              <Button variant="secondary" size="sm" onClick={() => setReloadTick((t) => t + 1)}>
+                重试
+              </Button>
+            }
+          />
+        </div>
       </div>
     );
   }
@@ -345,6 +352,7 @@ export default function PricingPage() {
   return (
     <div className="flex flex-col gap-5">
       <PageHeader
+        icon={Tag}
         title={meta.title}
         desc={meta.desc}
         actions={
@@ -356,7 +364,7 @@ export default function PricingPage() {
       />
 
       {statsMeta.source === "local_fallback" && (
-        <div className="flex items-center gap-2 rounded-lg border border-warning/40 bg-warning-soft px-3 py-2 text-meta text-warning">
+        <div className="oc-callout oc-callout-warning flex items-center gap-2.5 rounded-xl px-4 py-3 text-meta text-warning">
           <TriangleAlert size={15} className="shrink-0" />
           egress 统计不可达,并发数据可能不完整
         </div>
@@ -364,20 +372,27 @@ export default function PricingPage() {
 
       {/* ── 服务商 ── */}
       <section className="flex flex-col gap-3">
-        <div className="flex items-baseline gap-2">
-          <h2 className="text-title font-semibold text-fg">服务商</h2>
-          <span className="text-meta text-faint">
-            共 {providers.length} 家 · key / 订阅 / 探测延迟 / 并发
+        <div className="flex items-center gap-2.5">
+          <span className="oc-icon-badge oc-icon-badge-accent size-8 rounded-lg">
+            <Server size={15} strokeWidth={1.9} />
           </span>
+          <div className="flex flex-wrap items-baseline gap-2">
+            <h2 className="text-title font-semibold tracking-tight text-fg">服务商</h2>
+            <span className="text-meta text-faint tabular-nums">
+              共 {providers.length} 家 · key / 订阅 / 探测延迟 / 并发
+            </span>
+          </div>
         </div>
         {loading ? (
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
             {Array.from({ length: 3 }).map((_, i) => (
-              <div key={i} className="h-72 animate-pulse rounded-xl border border-border bg-surface" />
+              <div key={i} className="oc-surface-card h-72 animate-pulse rounded-xl" />
             ))}
           </div>
         ) : providers.length === 0 ? (
-          <EmptyState icon={Inbox} title="无服务商" />
+          <div className="oc-surface-card rounded-xl">
+            <EmptyState icon={Inbox} title="无服务商" />
+          </div>
         ) : (
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
             {providers.map((p) => (
@@ -395,52 +410,63 @@ export default function PricingPage() {
 
       {/* ── 模型 ── */}
       <section className="flex flex-col gap-3">
-        <div className="flex items-baseline gap-2">
-          <h2 className="text-title font-semibold text-fg">模型</h2>
-          <span className="text-meta text-faint">共 {models.length} 个 · 行内编辑,逐行保存</span>
+        <div className="flex items-center gap-2.5">
+          <span className="oc-icon-badge oc-icon-badge-info size-8 rounded-lg">
+            <Cpu size={15} strokeWidth={1.9} />
+          </span>
+          <div>
+            <div className="flex flex-wrap items-baseline gap-2">
+              <h2 className="text-title font-semibold tracking-tight text-fg">模型</h2>
+              <span className="text-meta text-faint tabular-nums">共 {models.length} 个 · 行内编辑,逐行保存</span>
+            </div>
+            <p className="text-caption text-faint">价格单位:分/百万token;上下线即时生效(NOTIFY 热加载)</p>
+          </div>
         </div>
-        <p className="text-meta text-faint">价格单位:分/百万token;上下线即时生效(NOTIFY 热加载)</p>
         {loading ? (
-          <div className="h-64 animate-pulse rounded-xl border border-border bg-surface" />
+          <div className="oc-surface-card h-64 animate-pulse rounded-xl" />
         ) : models.length === 0 ? (
-          <EmptyState icon={Inbox} title="无模型" />
+          <div className="oc-surface-card rounded-xl">
+            <EmptyState icon={Inbox} title="无模型" />
+          </div>
         ) : (
-          <div className="overflow-x-auto rounded-xl border border-border bg-surface">
-            <table className="w-full border-collapse text-sm">
-              <thead className="bg-surface">
-                <tr className="border-b border-border text-left text-meta font-medium text-faint">
-                  <th className="px-3 py-2.5">模型ID</th>
-                  <th className="px-3 py-2.5">显示名</th>
-                  <th className="px-3 py-2.5">服务商</th>
-                  <th className="px-3 py-2.5" title="当前并发;峰值自 egress 启动累计,重启归零">
-                    并发
-                  </th>
-                  <th className="px-3 py-2.5">24h 用量</th>
-                  <th className="px-3 py-2.5">输入价</th>
-                  <th className="px-3 py-2.5">输出价</th>
-                  <th className="px-3 py-2.5">缓存读</th>
-                  <th className="px-3 py-2.5">缓存写</th>
-                  <th className="px-3 py-2.5">multiplier</th>
-                  <th className="px-3 py-2.5">思考深度</th>
-                  <th className="px-3 py-2.5">可见性</th>
-                  <th className="px-3 py-2.5">状态</th>
-                  <th className="px-3 py-2.5 text-right">操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {models.map((m) => (
-                  <ModelRow
-                    key={`${m.model_id}:${reloadTick}:${rowNonce[m.model_id] ?? 0}`}
-                    model={m}
-                    inflight={inflight[m.model_id] ?? null}
-                    startedAt={statsMeta.started_at}
-                    onSavePricing={(patch, changes) => savePricing(m, patch, changes)}
-                    onToggleEnabled={(next) => toggleEnabled(m, next)}
-                    onOpenExtra={() => setExtraModel(m)}
-                  />
-                ))}
-              </tbody>
-            </table>
+          <div className="oc-surface-card overflow-hidden rounded-xl">
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse text-sm">
+                <thead className="sticky top-0 z-10 bg-sidebar/85 backdrop-blur-sm dark:bg-elevated/85">
+                  <tr className="border-b border-border text-left text-caption font-semibold uppercase tracking-wide text-faint">
+                    <th className="whitespace-nowrap px-3 py-2.5">模型ID</th>
+                    <th className="whitespace-nowrap px-3 py-2.5">显示名</th>
+                    <th className="whitespace-nowrap px-3 py-2.5">服务商</th>
+                    <th className="whitespace-nowrap px-3 py-2.5" title="当前并发;峰值自 egress 启动累计,重启归零">
+                      并发
+                    </th>
+                    <th className="whitespace-nowrap px-3 py-2.5">24h 用量</th>
+                    <th className="whitespace-nowrap px-3 py-2.5">输入价</th>
+                    <th className="whitespace-nowrap px-3 py-2.5">输出价</th>
+                    <th className="whitespace-nowrap px-3 py-2.5">缓存读</th>
+                    <th className="whitespace-nowrap px-3 py-2.5">缓存写</th>
+                    <th className="whitespace-nowrap px-3 py-2.5">multiplier</th>
+                    <th className="whitespace-nowrap px-3 py-2.5">思考深度</th>
+                    <th className="whitespace-nowrap px-3 py-2.5">可见性</th>
+                    <th className="whitespace-nowrap px-3 py-2.5">状态</th>
+                    <th className="whitespace-nowrap px-3 py-2.5 text-right">操作</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border/60">
+                  {models.map((m) => (
+                    <ModelRow
+                      key={`${m.model_id}:${reloadTick}:${rowNonce[m.model_id] ?? 0}`}
+                      model={m}
+                      inflight={inflight[m.model_id] ?? null}
+                      startedAt={statsMeta.started_at}
+                      onSavePricing={(patch, changes) => savePricing(m, patch, changes)}
+                      onToggleEnabled={(next) => toggleEnabled(m, next)}
+                      onOpenExtra={() => setExtraModel(m)}
+                    />
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
         )}
       </section>

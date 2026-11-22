@@ -13,36 +13,64 @@ interface Options {
   legacy: Map<string, Set<WebSocket>>
   wake?: (carrier: LinkCarrier) => Promise<void>
   log?: { warn(message: string, fields?: Record<string, unknown>): void } | null
+  paused?: boolean
 }
 
-/** The PG lease owns delivery. Link handles and browser subscriptions do not. */
+/** The PG lease owns delivery. Link handles and browser subscriptions do not.
+ * Dual-master step-down fences every async boundary via monotonic activationEpoch
+ * and releases any just-claimed control rows before returning. */
 export class ContainerLinkControls {
   private readonly owner = `master:${randomUUID()}`
   private readonly running = new Map<string, Promise<void>>()
   private scanning: Promise<void> | null = null
   private stopped = false
+  private active: boolean
+  private activationEpoch = 0
   private readonly timer: ReturnType<typeof setInterval>
   constructor(private readonly options: Options) {
+    this.active = !options.paused
     this.timer = setInterval(() => { void this.scan() }, 1000)
     this.timer.unref()
   }
 
+  private isCurrent(epoch: number): boolean {
+    return !this.stopped && this.active && this.activationEpoch === epoch
+  }
+
+  async setActive(active: boolean): Promise<void> {
+    if (active) {
+      if (this.stopped) return
+      this.activationEpoch += 1
+      this.active = true
+      void this.scan()
+      return
+    }
+    this.active = false
+    this.activationEpoch += 1
+    await Promise.allSettled([this.scanning, ...this.running.values()])
+  }
+
   scan(): Promise<void> {
-    if (this.stopped) return Promise.resolve()
+    if (this.stopped || !this.active) return Promise.resolve()
     if (this.scanning) return this.scanning
-    this.scanning = this.scanUsers().catch(error => {
-      this.options.log?.warn('container-link: control scan failed', { error })
+    const epoch = this.activationEpoch
+    this.scanning = this.scanUsers(epoch).catch(error => {
+      if (this.isCurrent(epoch)) this.options.log?.warn('container-link: control scan failed', { error })
     }).finally(() => { this.scanning = null })
     return this.scanning
   }
 
-  private async scanUsers(): Promise<void> {
+  private async scanUsers(epoch: number): Promise<void> {
+    if (!this.isCurrent(epoch)) return
     if (!this.options.links) {
-      for (const uid of this.options.legacy.keys()) await this.drain(BigInt(uid))
+      for (const uid of this.options.legacy.keys()) {
+        if (!this.isCurrent(epoch)) return
+        await this.drain(BigInt(uid), epoch)
+      }
       return
     }
     let after: string | null = null
-    while (!this.stopped) {
+    while (this.isCurrent(epoch)) {
       const page: QueryResult<{ user_id: string }> = await this.options.pool.query<{ user_id: string }>(
         `SELECT DISTINCT user_id FROM turn_control_requests
           WHERE status IN ('pending','leased') AND next_attempt_at<=NOW()
@@ -50,22 +78,25 @@ export class ContainerLinkControls {
             AND ($1::bigint IS NULL OR user_id>$1::bigint)
           ORDER BY user_id LIMIT 100`, [after],
       )
+      if (!this.isCurrent(epoch)) return
       for (const row of page.rows) {
-        if (this.stopped) return
-        await this.drain(BigInt(row.user_id))
+        if (!this.isCurrent(epoch)) return
+        await this.drain(BigInt(row.user_id), epoch)
       }
       if (page.rows.length < 100) return
       after = String(page.rows.at(-1)!.user_id)
     }
   }
 
-  drain(uid: bigint): Promise<void> {
-    if (this.stopped) return Promise.resolve()
+  drain(uid: bigint, epoch = this.activationEpoch): Promise<void> {
+    if (!this.isCurrent(epoch)) return Promise.resolve()
     const key = String(uid)
     const prior = this.running.get(key)
     if (prior) return prior
-    const work = this.deliver(uid).catch(error => {
-      this.options.log?.warn('container-link: durable control drain failed', { uid: key, error })
+    const work = this.deliver(uid, epoch).catch(error => {
+      if (this.isCurrent(epoch)) {
+        this.options.log?.warn('container-link: durable control drain failed', { uid: key, error })
+      }
     }).finally(() => { this.running.delete(key) })
     this.running.set(key, work)
     return work
@@ -81,25 +112,40 @@ export class ContainerLinkControls {
     return [...(this.options.legacy.get(String(uid)) ?? [])].find(socket => socket.readyState === WebSocket.OPEN) ?? null
   }
 
-  private async deliver(uid: bigint): Promise<void> {
+  private async deliver(uid: bigint, epoch: number): Promise<void> {
     let after: string | null = null
     do {
+      if (!this.isCurrent(epoch)) return
       const targets: Target[] = this.options.links ? await this.targets(uid, after) : []
-      if (this.stopped) return
+      if (!this.isCurrent(epoch)) return
       const carriers = new Map(targets.map(target => [target.control_id, target.container_id]))
       const ready = targets.filter(target => this.options.links!.controlTransport(uid, target.container_id))
       for (const cid of new Set(targets.filter(target => !ready.includes(target)).map(target => target.container_id))) {
+        if (!this.isCurrent(epoch)) return
         void this.options.wake?.({ uid: String(uid), containerId: cid }).catch(error => {
-          this.options.log?.warn('container-link: control wake failed', { uid: String(uid), containerId: cid, error })
+          if (this.isCurrent(epoch)) {
+            this.options.log?.warn('container-link: control wake failed', { uid: String(uid), containerId: cid, error })
+          }
         })
       }
+      if (!this.isCurrent(epoch)) return
       if (this.options.links ? ready.length > 0 : this.legacyTransport(uid) !== null) {
         const controls = await claimDueTurnControls(this.options.pool, {
           userId: uid, ownerId: this.owner, leaseMs: 15_000,
           ...(this.options.links ? { controlIds: ready.map(target => target.control_id), limit: 100 } : {}),
         })
+        if (!this.isCurrent(epoch)) {
+          for (const control of controls) {
+            await releaseTurnControlForRetry(this.options.pool, control).catch(() => {})
+          }
+          return
+        }
         for (const control of controls) {
-          const live = this.stopped ? null : this.options.links
+          if (!this.isCurrent(epoch)) {
+            await releaseTurnControlForRetry(this.options.pool, control).catch(() => {})
+            continue
+          }
+          const live = !this.isCurrent(epoch) ? null : this.options.links
             ? this.options.links.controlTransport(uid, carriers.get(control.controlId)!) : this.legacyTransport(uid)
           if (!live) { await releaseTurnControlForRetry(this.options.pool, control); continue }
           try {
@@ -113,11 +159,13 @@ export class ContainerLinkControls {
       }
       if (!this.options.links || targets.length < 100) return
       after = targets.at(-1)!.control_id
-    } while (!this.stopped)
+    } while (this.isCurrent(epoch))
   }
 
   async stop(): Promise<void> {
     this.stopped = true
+    this.active = false
+    this.activationEpoch += 1
     clearInterval(this.timer)
     await Promise.allSettled([this.scanning, ...this.running.values()])
   }

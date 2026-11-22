@@ -157,7 +157,9 @@ export function RelayCredentialsModal({
             <Spinner className="size-4" /> 加载中…
           </div>
         ) : error ? (
-          <div className="py-6 text-center text-sm text-danger">加载失败:{error}</div>
+          <div className="oc-callout oc-callout-danger rounded-xl px-4 py-6 text-center text-sm text-danger">
+            加载失败:{error}
+          </div>
         ) : (
           <DataTable columns={columns} rows={rows} rowKey={(c) => c.id} emptyTitle="暂无凭据" />
         )}
@@ -211,19 +213,22 @@ function CreateCredentialForm({ groupId, onCreated }: { groupId: string; onCreat
   };
 
   return (
-    <div className="flex flex-col gap-3 rounded-lg border border-border bg-surface p-4">
+    <div className="oc-surface-card flex flex-col gap-3 rounded-xl p-4">
+      <div className="oc-callout oc-callout-info rounded-lg px-3 py-2 text-caption text-muted">
+        中转站 API key 加密存储，仅提交一次且后续不回显。
+      </div>
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <Field label="label">
-          <Input value={label} onChange={(e) => setLabel(e.target.value)} />
+          <Input className="oc-field-control" value={label} onChange={(e) => setLabel(e.target.value)} />
         </Field>
         <Field label="base_url">
-          <Input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} />
+          <Input className="oc-field-control font-mono" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} />
         </Field>
         <Field label="model_provider">
-          <Input value={modelProvider} onChange={(e) => setModelProvider(e.target.value)} />
+          <Input className="oc-field-control font-mono" value={modelProvider} onChange={(e) => setModelProvider(e.target.value)} />
         </Field>
         <Field label="provider_name">
-          <Input value={providerName} onChange={(e) => setProviderName(e.target.value)} />
+          <Input className="oc-field-control" value={providerName} onChange={(e) => setProviderName(e.target.value)} />
         </Field>
         <Field label="wire_api">
           <Select value={wireApi} onChange={(e) => setWireApi(e.target.value)}>
@@ -239,9 +244,9 @@ function CreateCredentialForm({ groupId, onCreated }: { groupId: string; onCreat
         </Field>
       </div>
       <Field label="API key(只提交一次,不会回显)">
-        <Textarea value={apiKey} rows={2} onChange={(e) => setApiKey(e.target.value)} placeholder="sk-…" />
+        <Textarea className="oc-field-control font-mono" value={apiKey} rows={2} onChange={(e) => setApiKey(e.target.value)} placeholder="sk-…" />
       </Field>
-      <div className="flex justify-end">
+      <div className="flex justify-end border-t border-border/70 pt-3">
         <Button size="sm" variant="primary" onClick={submit} disabled={saving}>
           {saving ? <Spinner className="size-4" /> : "保存"}
         </Button>

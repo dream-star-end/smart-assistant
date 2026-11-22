@@ -1311,21 +1311,21 @@ function SiteCommentEditor({
               {draft.editingId ? "取消修改" : "取消草稿"}
             </button>
           </div>
-          <button
-            type="button"
-            disabled={!canSave}
-            onClick={onSave}
-            title="⌘/Ctrl + Enter"
-            className="preview-primary-button"
-          >
-            <Check size={15} />
-            {draft.editingId ? "保存" : "添加评论"}
-          </button>
-        </div>
-      </section>
-    </div>
-  );
-}
+            <button
+              type="button"
+              disabled={!canSave}
+              onClick={onSave}
+              title="⌘/Ctrl + Enter"
+              className="preview-primary-button oc-btn-tactile"
+            >
+              <Check size={15} />
+              {draft.editingId ? "保存" : "添加评论"}
+            </button>
+          </div>
+        </section>
+      </div>
+    );
+  }
 
 function SiteCommentsDrawer({
   annotations,
@@ -1340,10 +1340,10 @@ function SiteCommentsDrawer({
 }) {
   return (
     <section className="preview-comments-drawer">
-      <header className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+      <header className="flex items-center justify-between border-b border-white/10 px-4 py-3.5">
         <div>
-          <h2 className="text-sm font-semibold">站点修改意见</h2>
-          <p className="mt-0.5 text-xs text-white/40">
+          <h2 className="text-sm font-semibold tracking-tight">站点修改意见</h2>
+          <p className="mt-0.5 text-xs tabular-nums text-white/45">
             {annotations.length}/{MAX_ANNOTATIONS} 条
           </p>
         </div>
@@ -1351,7 +1351,7 @@ function SiteCommentsDrawer({
           type="button"
           aria-label="关闭评论列表"
           onClick={onClose}
-          className="preview-icon-button"
+          className="preview-icon-button oc-icon-btn-tactile"
         >
           <X size={18} />
         </button>
@@ -1359,7 +1359,9 @@ function SiteCommentsDrawer({
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
         {annotations.length === 0 ? (
           <div className="flex min-h-48 flex-col items-center justify-center gap-3 px-6 text-center text-white/45">
-            <MessageSquarePlus size={24} />
+            <span className="flex size-11 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.04]">
+              <MessageSquarePlus size={20} />
+            </span>
             <p className="text-sm leading-6">还没有修改意见，关闭列表后点按页面元素即可添加。</p>
           </div>
         ) : (
@@ -1367,7 +1369,7 @@ function SiteCommentsDrawer({
             {annotations.map((annotation, index) => (
               <div
                 key={annotation.id}
-                className="flex items-start gap-1 rounded-2xl border border-white/10 bg-white/[0.035] p-2"
+                className="flex items-start gap-1 rounded-2xl border border-white/10 bg-white/[0.04] p-2 transition-colors hover:border-white/20 hover:bg-white/[0.06]"
               >
                 <button
                   type="button"
@@ -1376,17 +1378,17 @@ function SiteCommentsDrawer({
                 >
                   <span
                     className={cn(
-                      "preview-anchor-dot static shrink-0 translate-x-0 translate-y-0",
+                      "preview-anchor-dot static shrink-0 translate-x-0 translate-y-0 tabular-nums",
                       annotation.missing && "preview-anchor-dot-missing",
                     )}
                   >
                     {index + 1}
                   </span>
                   <span className="min-w-0 flex-1">
-                    <span className="preview-accent-text block truncate text-xs font-medium">
+                    <span className="preview-accent-text block truncate font-mono text-xs font-medium">
                       {annotation.target.selector}
                     </span>
-                    <span className="mt-1 line-clamp-3 block text-sm leading-5 text-white/70">
+                    <span className="mt-1 line-clamp-3 block text-sm leading-5 text-white/75">
                       {annotation.comment}
                     </span>
                   </span>
@@ -1395,7 +1397,7 @@ function SiteCommentsDrawer({
                   type="button"
                   aria-label={`删除评论 ${index + 1}`}
                   onClick={() => onDelete(annotation.id)}
-                  className="preview-icon-button preview-delete-button"
+                  className="preview-icon-button preview-delete-button oc-icon-btn-tactile"
                 >
                   <Trash2 size={15} />
                 </button>
@@ -1404,7 +1406,7 @@ function SiteCommentsDrawer({
           </div>
         )}
       </div>
-      <p className="border-t border-white/10 px-4 py-3 text-xs leading-5 text-white/35">
+      <p className="border-t border-white/10 px-4 py-3 text-xs leading-5 text-white/40">
         点击条目可修改内容；点击右上角「加入输入框」即可带回对话让 AI 改码并重新发布。
       </p>
     </section>
