@@ -31,6 +31,11 @@ import {
   type SwarmPhase,
   type SwarmSnapshot,
 } from '@openclaude/protocol'
+import {
+  SwarmStallMonitor,
+  type SwarmStallAlert,
+  type SwarmStallMonitorOptions,
+} from './swarmStallMonitor.js'
 
 const MAX_MEMBERS_JSON_BYTES = 512 * 1024
 const MAX_BOARD_JSONL_BYTES = 2 * 1024 * 1024
@@ -1121,6 +1126,10 @@ export interface AntigravitySwarmWatcherOptions {
    */
   seedBaselineOnStart?: boolean
   onSnapshot: (snapshot: SwarmSnapshot) => void
+  /** Optional zero-token deterministic stall monitor configuration (enabled when `onStallDetected` is provided). */
+  stallMonitor?: SwarmStallMonitorOptions
+  /** Invoked when every live core member stays parked past the stall threshold without `[done]`. */
+  onStallDetected?: (alert: SwarmStallAlert) => void
 }
 
 export function settleSwarmSnapshotTerminal(snap: SwarmSnapshot, phase: SwarmPhase): SwarmSnapshot {
@@ -1151,6 +1160,8 @@ export class AntigravitySwarmWatcher {
   private readonly now: () => number
   private readonly seedBaselineOnStart: boolean
   private readonly onSnapshot: (snapshot: SwarmSnapshot) => void
+  private readonly onStallDetected?: (alert: SwarmStallAlert) => void
+  private readonly stallMonitor: SwarmStallMonitor | null
   private timer: NodeJS.Timeout | null = null
   private throttleTimer: NodeJS.Timeout | null = null
   private keyframeTimer: NodeJS.Timeout | null = null
@@ -1185,6 +1196,8 @@ export class AntigravitySwarmWatcher {
     this.now = opts.now ?? Date.now
     this.seedBaselineOnStart = opts.seedBaselineOnStart === true
     this.onSnapshot = opts.onSnapshot
+    this.onStallDetected = opts.onStallDetected
+    this.stallMonitor = opts.onStallDetected ? new SwarmStallMonitor(opts.stallMonitor) : null
   }
 
   start(): void {
@@ -1419,6 +1432,17 @@ export class AntigravitySwarmWatcher {
     this.backlogTimer.unref()
   }
 
+  private evaluateStall(snap: SwarmSnapshot, now: number): void {
+    if (this.stopped || !this.turnActive || !this.stallMonitor || !this.onStallDetected) return
+    const alert = this.stallMonitor.evaluate(snap, now)
+    if (!alert) return
+    try {
+      this.onStallDetected(alert)
+    } catch {
+      // Observer errors must never crash the adapter timer loop.
+    }
+  }
+
   private pollOnce(force: boolean): void {
     if (this.stopped) return
     const isDormantBaseline =
@@ -1426,6 +1450,11 @@ export class AntigravitySwarmWatcher {
     const statSig = this.computeStatSignature()
     const hasBacklog = !isDormantBaseline && this.telemetryCache.hasAnyBacklog()
     if (!force && !hasBacklog && this.lastStatSignature !== null && statSig === this.lastStatSignature) {
+      // When disk files stop changing completely (true stall), still evaluate
+      // the in-memory stall state machine with zero disk I/O and zero LLM calls.
+      if (this.turnActive && this.lastSnapshot) {
+        this.evaluateStall(this.lastSnapshot, this.now())
+      }
       return
     }
     this.lastStatSignature = statSig
@@ -1484,7 +1513,10 @@ export class AntigravitySwarmWatcher {
       this.startedAt = snap.updatedAt
       snap.startedAt = this.startedAt
     }
-    if (hash === this.lastHash) return
+    if (hash === this.lastHash) {
+      if (this.turnActive) this.evaluateStall(snap, ts)
+      return
+    }
     const isStructuralChange = !this.emittedInTurn || structHash !== this.lastStructuralHash
     this.turnActive = true
     this.lastHash = hash
@@ -1497,6 +1529,7 @@ export class AntigravitySwarmWatcher {
         // trailing activity update so UI stays responsive without flooding PG/WS.
         this.lastSnapshot = { ...snap, revision: this.revision }
         this.scheduleThrottledActivityEmit(snap, this.activityThrottleMs - elapsed)
+        this.evaluateStall(snap, ts)
         return
       }
     }
@@ -1504,6 +1537,7 @@ export class AntigravitySwarmWatcher {
     this.revision = nextRev
     this.lastSnapshot = snap
     this.emitWireSnapshot(snap, false)
+    this.evaluateStall(snap, ts)
   }
 
   /** Stop polling and capture one final authoritative snapshot with terminal phase.
@@ -1536,6 +1570,7 @@ export class AntigravitySwarmWatcher {
 
   stop(): void {
     this.stopped = true
+    this.stallMonitor?.reset()
     this.clearThrottleTimer()
     this.clearKeyframeTimer()
     this.clearBacklogTimer()

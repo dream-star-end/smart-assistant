@@ -9,6 +9,7 @@ import {
   ANTIGRAVITY_SWARM_OFF_MARKER,
   applyAntigravitySwarmTurnDirective,
   hasHistoricalAntigravitySwarm,
+  listLiveAntigravitySwarmMonitors,
 } from '../engine/antigravitySwarmDirective.js'
 import { remoteSwarmLocationForSession } from '../remoteSwarmRuntime.js'
 
@@ -170,4 +171,80 @@ test('OCV5-842: applyAntigravitySwarmTurnDirective suppresses prior swarm on tog
   })
   assert.equal(nonAgy.mode, 'none')
   assert.equal(nonAgy.text, userText)
+})
+
+test('OCV5-848: forbids spawning native monitor, detects live legacy monitors safely, and instructs coordinator to kill them', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'oc-swarm-mon-detect-'))
+  try {
+    const sessionKey = 'agent:main:webchat:dm:legacy-monitor-session'
+    const brainDir = antigravitySessionBrainDir(root, sessionKey)
+    const swarmDir = path.join(brainDir, VALID_CONV_ID, '.system_generated', 'swarm')
+    await mkdir(swarmDir, { recursive: true })
+    await writeFile(
+      path.join(swarmDir, 'members.json'),
+      JSON.stringify({
+        title: 'Legacy Swarm',
+        members: {
+          coordinator: { role: 'coordinator', killed: false },
+          'worker-a': { role: 'worker', killed: false },
+          monitor: { role: 'monitor', killed: false },
+          'monitor-2': { role: 'worker', killed: false },
+          'monitor-3': { role: 'monitor', killed: true },
+        },
+      }),
+    )
+
+    const live = listLiveAntigravitySwarmMonitors({
+      sessionKey,
+      isRemote: false,
+      conversationId: VALID_CONV_ID,
+      antigravityRootDir: root,
+    })
+    assert.deepEqual(live, ['monitor', 'monitor-2'])
+
+    // Symlinked roster is rejected safely
+    const symConv = '22222222-3333-4444-5555-666666666666'
+    const symDir = path.join(brainDir, symConv, '.system_generated', 'swarm')
+    await mkdir(symDir, { recursive: true })
+    await symlink(path.join(swarmDir, 'members.json'), path.join(symDir, 'members.json'))
+    assert.deepEqual(
+      listLiveAntigravitySwarmMonitors({
+        sessionKey,
+        isRemote: false,
+        conversationId: symConv,
+        antigravityRootDir: root,
+      }),
+      [],
+    )
+
+    // Directive forbids native monitor & includes cleanup line when live monitors exist
+    const localOn = applyAntigravitySwarmTurnDirective({
+      finalText: '拆分任务',
+      rawUserText: '拆分任务',
+      isAntigravityTurn: true,
+      isRemoteAntigravity: false,
+      swarmMode: true,
+      hasHistoricalSwarm: true,
+      liveMonitorNames: live,
+    })
+    assert.ok(localOn.text.includes('严禁招募 `monitor` / `monitor-N`'))
+    assert.ok(!localOn.text.includes('若有 `swarm_monitor` 技能可配 `monitor`'))
+    assert.ok(localOn.text.includes('`monitor`、`monitor-2`'))
+    assert.ok(localOn.text.includes('swarm{action:"kill"'))
+
+    // Remote mode without legacy monitors forbids monitor without adding cleanup noise
+    const remoteOn = applyAntigravitySwarmTurnDirective({
+      finalText: '拆分任务',
+      rawUserText: '拆分任务',
+      isAntigravityTurn: true,
+      isRemoteAntigravity: true,
+      swarmMode: true,
+      hasHistoricalSwarm: false,
+      liveMonitorNames: [],
+    })
+    assert.ok(remoteOn.text.includes('严禁招募 `monitor` / `monitor-N`'))
+    assert.ok(!remoteOn.text.includes('残留原生监控成员'))
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })

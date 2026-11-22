@@ -86,6 +86,7 @@ import { resolveEngine } from './engine/registry.js'
 import {
   applyAntigravitySwarmTurnDirective,
   hasHistoricalAntigravitySwarm,
+  listLiveAntigravitySwarmMonitors,
 } from './engine/antigravitySwarmDirective.js'
 import { disableRemoteSwarmCoordinatorMcp } from './remoteSwarmRuntime.js'
 import {
@@ -1817,7 +1818,7 @@ export async function dispatchInbound(
         }
       }
       const boundSwarmConversationId =
-        isAntigravityTurn && !swarmRequested && !isRemoteAntigravity
+        isAntigravityTurn && !isRemoteAntigravity
           ? (session.ccbSessionId ??
               session.runner?.nativeSessionId ??
               this.sessions.resolveAntigravitySwarmTarget?.(frame.peer.id)?.conversationId ??
@@ -1831,6 +1832,14 @@ export async function dispatchInbound(
               conversationId: boundSwarmConversationId,
             })
           : false
+      const liveMonitorNames =
+        isAntigravityTurn && swarmRequested
+          ? listLiveAntigravitySwarmMonitors({
+              sessionKey,
+              isRemote: isRemoteAntigravity,
+              conversationId: boundSwarmConversationId,
+            })
+          : []
       const swarmDirectiveResult = applyAntigravitySwarmTurnDirective({
         finalText,
         rawUserText,
@@ -1838,6 +1847,7 @@ export async function dispatchInbound(
         isRemoteAntigravity,
         swarmMode,
         hasHistoricalSwarm,
+        liveMonitorNames,
       })
       finalText = swarmDirectiveResult.text
       if (swarmDirectiveResult.mode === 'on') {

@@ -38,6 +38,7 @@ import {
   extractSwarmMentions,
 } from '@openclaude/protocol'
 import { antigravityRoot } from './engine/antigravityPlatform.js'
+import { GATEWAY_STALL_MONITOR_AGENT, isSwarmMonitorAgentName } from './engine/swarmStallMonitor.js'
 import { offloadPayloadIfOversized, truncateUtf8Safe } from './payloadOffloadGate.js'
 
 const MEMBER_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/
@@ -853,6 +854,39 @@ export class RemoteSwarmRuntime {
     })
   }
 
+  /**
+   * Trusted gateway stall-monitor channel: appends a deterministic zero-token
+   * stall alert to `board.jsonl` and wakes the targeted waiting member or coordinator.
+   */
+  postGatewayStallAlert(
+    sessionKey: string,
+    alert: { target: string; channel?: string; message: string; reason?: string; attempt?: number },
+  ): BoardPostRecord | null {
+    const state = this.sessions.get(sessionKey.trim())
+    if (!state || state.shuttingDown) return null
+    const cleanTarget = alert.target.trim().toLowerCase()
+    if (!cleanTarget || cleanTarget === 'all') return null
+    const roster = this.ensureRoster(state)
+    const targetRec = roster.members[cleanTarget]
+    if (cleanTarget !== 'coordinator' && (!targetRec || targetRec.killed)) return null
+    const requestedCh = (alert.channel ?? 'main').trim() || 'main'
+    const channel = roster.channels[requestedCh]?.archived ? 'main' : requestedCh
+    const text = alert.message.trim()
+    if (!text) return null
+    return this.appendBoardPost(state, {
+      agent: GATEWAY_STALL_MONITOR_AGENT,
+      channel,
+      kind: 'control',
+      control: {
+        kind: 'stall',
+        target: cleanTarget,
+        ...(alert.reason ? { reason: alert.reason } : {}),
+        ...(alert.attempt !== undefined ? { attempt: alert.attempt } : {}),
+      },
+      text,
+    })
+  }
+
   /** Called when a trusted external API (e.g. `swarmCommand.ts`) appended to `board.jsonl`. */
   onExternalBoardWrite(sessionKey: string): void {
     const state = this.sessions.get(sessionKey.trim())
@@ -1579,6 +1613,15 @@ export class RemoteSwarmRuntime {
       const brief = typeof input.args.brief === 'string' ? input.args.brief.trim() : ''
       if (!MEMBER_NAME_RE.test(baseName) || RESERVED_MEMBER_NAMES.has(baseName)) {
         throw new Error('SWARM_MEMBER_NAME_INVALID')
+      }
+      if (isSwarmMonitorAgentName(baseName)) {
+        return {
+          ok: true,
+          skipped: true,
+          managed_by_gateway: true,
+          added: [],
+          note: 'OpenClaude gateway already runs deterministic zero-token stall monitoring for this swarm; do not spawn an LLM monitor worker.',
+        }
       }
       if (!brief) throw new Error('SWARM_BRIEF_REQUIRED')
 

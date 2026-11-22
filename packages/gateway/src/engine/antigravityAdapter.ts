@@ -83,6 +83,8 @@ import {
   formatSwarmWorkingDetail,
   settleSwarmSnapshotTerminal,
 } from './antigravitySwarmWatcher.js'
+import { GATEWAY_STALL_MONITOR_AGENT } from './swarmStallMonitor.js'
+import { injectSwarmDirective } from '../swarmCommand.js'
 import { lookupRemoteSwarmMcpContext } from '../remoteSwarmRuntime.js'
 import {
   prepareAntigravityNativeTrajectory,
@@ -717,14 +719,46 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   private ensureSwarmWatcher(ctx: TurnContext, conversationId: string): void {
     if (ctx.swarmWatcher || ctx.terminal || ctx.abandoned || !ctx.projection) return
     if (!CONVERSATION_ID_RE.test(conversationId)) return
+    const brainDir = ctx.projection.sessionBrainDir
     const watcher = new AntigravitySwarmWatcher({
-      brainDir: ctx.projection.sessionBrainDir,
+      brainDir,
       conversationId,
       // Resumed conversations may carry a historical swarm directory from an earlier
       // turn. Treat it as a silent baseline until this turn actually mutates the
       // board or runs an own native swarm tool (`activateTurnSwarm()`).
       seedBaselineOnStart: Boolean(ctx.requestedConversationId || ctx.resumedLaunch),
       onSnapshot: (snapshot) => this.emitSwarmSnapshot(ctx, snapshot),
+      onStallDetected: (alert) => {
+        if (ctx.terminal || ctx.abandoned) return
+        const res = injectSwarmDirective({
+          brainDir,
+          conversationId,
+          target: alert.target,
+          message: alert.message,
+          channel: alert.channel,
+          sender: GATEWAY_STALL_MONITOR_AGENT,
+          controlKind: 'stall',
+        })
+        if (res.ok) {
+          log.info('antigravity_swarm_stall_alert', {
+            conversationId,
+            target: alert.target,
+            reason: alert.reason,
+            attempt: alert.attempt,
+            idleMs: alert.idleMs,
+            seq: res.seq,
+          })
+          ctx.swarmWatcher?.kick()
+        } else {
+          log.warn('antigravity_swarm_stall_alert_failed', {
+            conversationId,
+            target: alert.target,
+            reason: alert.reason,
+            code: res.code,
+            error: res.error,
+          })
+        }
+      },
     })
     ctx.swarmWatcher = watcher
     watcher.start()

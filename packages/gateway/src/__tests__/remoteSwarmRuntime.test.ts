@@ -766,4 +766,97 @@ describe('RemoteSwarmRuntime & Admission (OCV5-835)', () => {
       await rt.shutdownAll()
     }
   })
+
+  it('OCV5-848: skips spawning LLM monitor workers and wakes coordinator via zero-token postGatewayStallAlert', async () => {
+    const rootBase = makeTempDir('oc-rswarm-stall-')
+    const ws = makeTempDir('oc-rswarm-stall-ws-')
+    let workerTurns = 0
+    let releaseWorker!: () => void
+    const workerGate = new Promise<void>((r) => {
+      releaseWorker = r
+    })
+    const rt = new RemoteSwarmRuntime({
+      rootBase,
+      executor: {
+        async runWorkerTurn() {
+          workerTurns += 1
+          await workerGate
+          return { text: 'finished' }
+        },
+        async releaseWorkerSession() {},
+      },
+    })
+    try {
+      const s = 'agent:main:webchat:dm:stall-monitor-test'
+      rt.registerSession({ sessionKey: s, model: 'antigravity-gemini-4-neon-remote', workspaceCwd: ws })
+
+      // Attempting to add `monitor` or `monitor-2` is skipped cleanly with 0 worker spawns
+      const skip1 = await rt.handleToolCall({
+        sessionKey: s,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'monitor', brief: 'Load swarm_monitor skill' },
+      })
+      assert.equal(skip1.ok, true)
+      assert.equal(skip1.skipped, true)
+      assert.equal(skip1.managed_by_gateway, true)
+      assert.deepEqual(skip1.added, [])
+
+      const skip2 = await rt.handleToolCall({
+        sessionKey: s,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'monitor-2', brief: 'Replacement monitor' },
+      })
+      assert.equal(skip2.skipped, true)
+      assert.equal(workerTurns, 0)
+
+      // Add a real worker that stays running so coordinator parks in swarm_wait
+      await rt.handleToolCall({
+        sessionKey: s,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'worker-a', brief: 'run long task' },
+      })
+      const statusBefore = (await rt.handleToolCall({
+        sessionKey: s,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'status' },
+      })) as { head_seq: number; members: Array<{ name: string }> }
+      assert.equal(
+        statusBefore.members.some((m) => m.name.startsWith('monitor')),
+        false,
+        'monitor must not appear in roster',
+      )
+
+      const waitPromise = rt.handleToolCall({
+        sessionKey: s,
+        callerMember: 'coordinator',
+        tool: 'swarm_wait',
+        args: { since: statusBefore.head_seq, mentions_only: true, timeout_ms: 5_000 },
+      }) as Promise<{ woke: boolean; posts: Array<{ agent: string; text: string }> }>
+
+      await new Promise((r) => setTimeout(r, 30))
+      const posted = rt.postGatewayStallAlert(s, {
+        target: 'coordinator',
+        channel: 'main',
+        reason: 'idle_waiting',
+        attempt: 1,
+        message: '@coordinator [stall] 全员已静默 3 分钟',
+      })
+      assert.ok(posted)
+      assert.equal(posted.agent, 'gateway-monitor')
+
+      const woke = await waitPromise
+      assert.equal(woke.woke, true)
+      assert.equal(woke.posts.length, 1)
+      assert.equal(woke.posts[0]!.agent, 'gateway-monitor')
+
+      releaseWorker()
+    } finally {
+      releaseWorker()
+      await rt.shutdownAll()
+    }
+  })
 })

@@ -38,6 +38,7 @@ import {
 import { buildCodexBillingEvent } from '../engine/codexAdapter.js'
 import {
   lookupRemoteSwarmMcpContext,
+  lookupRemoteSwarmRuntimeForSession,
   remoteSwarmLocationForSession,
 } from '../remoteSwarmRuntime.js'
 import type { IntelligentUiApplied } from '../promptSlots.js'
@@ -377,11 +378,21 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
       !this.executionBackend.sessionKey.includes(':swarm:')
     ) {
       const loc = remoteSwarmLocationForSession(this.executionBackend.sessionKey)
+      const sessionKeyForSwarm = this.executionBackend.sessionKey
       swarmWatcher = new AntigravitySwarmWatcher({
         brainDir: loc.brainDir,
         conversationId: loc.swarmId,
         seedBaselineOnStart: existsSync(loc.swarmDir),
         onSnapshot: emitSwarmSnapshot,
+        onStallDetected: (alert) => {
+          if (finalized) return
+          const runtime = lookupRemoteSwarmRuntimeForSession(sessionKeyForSwarm)
+          if (!runtime) return
+          const posted = runtime.postGatewayStallAlert(sessionKeyForSwarm, alert)
+          if (posted) {
+            swarmWatcher?.kick()
+          }
+        },
       })
       swarmWatcher.start()
     }

@@ -73,6 +73,8 @@ export interface InjectSwarmDirectiveOptions {
   channel?: string;
   /** 发送者标识(默认 `human`)。 */
   sender?: string;
+  /** 控制事件类型(默认 `steer`,网关停滞告警传 `stall`)。 */
+  controlKind?: string;
   now?: number;
 }
 
@@ -456,12 +458,13 @@ export function injectSwarmDirective(opts: InjectSwarmDirectiveOptions): InjectS
 
   const now = opts.now ?? Date.now();
   const time = new Date(now).toISOString();
+  const controlKind = (opts.controlKind ?? "steer").trim() || "steer";
   const appended = appendBoardPostLocked(dirRes.dir, now, {
     agent,
     channel,
     text: fullText,
     time,
-    control: { kind: "steer", target },
+    control: { kind: controlKind, target },
   });
   if (!appended.ok) return appended;
 
