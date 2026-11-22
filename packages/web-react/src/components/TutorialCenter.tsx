@@ -8,6 +8,7 @@ import {
   type ProductFeatureId,
   capabilityById,
 } from "../lib/productCapabilities";
+import { TASKBOARD_ENABLED } from "../lib/taskboardFeature";
 import type { TutorialActionState } from "../lib/tutorialActions";
 import {
   TUTORIAL_CASES,
@@ -66,6 +67,8 @@ export interface TutorialCenterProps {
   sessionProjectId?: string | null;
   /** 「经验分享」页签开关（由 /api/public/config 的 feature_community_blog 传入）。 */
   blogEnabled?: boolean;
+  /** 任务面板功能开关（商业版构建 VITE_TASKBOARD_ENABLED=0 为 false）。 */
+  taskboardEnabled?: boolean;
   /** 对话内经验分享卡请求打开「我的投稿」或带草稿的编辑器。 */
   blogRequest?: BlogViewRequest | null;
 }
@@ -150,6 +153,7 @@ export function TutorialCenter({
   onSignatureWorkChange,
   stepIndex = null,
   blogEnabled = true,
+  taskboardEnabled = TASKBOARD_ENABLED,
   blogRequest = null,
 }: TutorialCenterProps) {
   const [browseViewState, setBrowseViewState] = useState<TutorialBrowseView>("showcase");
@@ -179,7 +183,12 @@ export function TutorialCenter({
   const signatureWork = signatureWorkId
     ? SIGNATURE_WORKS.find((work) => work.id === signatureWorkId) ?? null
     : null;
-  const effectiveTopicId = topicId && topicId !== dismissedTopicId ? topicId : null;
+  const effectiveTopicId =
+    topicId &&
+    topicId !== dismissedTopicId &&
+    (taskboardEnabled || topicId !== "taskboard")
+      ? topicId
+      : null;
   // 请求的是 blog 页签时 communityId 是经验分享文章 id，即使 blogEnabled 暂未就绪也不得误入旧教程工作室。
   const isLegacyCommunity = Boolean(communityId && requestedView !== "blog");
 
@@ -435,6 +444,7 @@ export function TutorialCenter({
             ) : mode === "guide" ? (
               <PracticalGuideView
                 authenticated={caseActionLabel !== "登录后试用"}
+                taskboardEnabled={taskboardEnabled}
                 onTryScenario={handleTryScenario}
                 onOpenTopic={(id) => handleSelectTopic(id)}
                 onOpenQuickLookup={showLookup}
@@ -443,6 +453,7 @@ export function TutorialCenter({
               <QuickLookupView
                 topicId={effectiveTopicId}
                 stepNumber={stepIndex}
+                taskboardEnabled={taskboardEnabled}
                 onSelectTopic={handleSelectTopic}
                 onRunAction={handleRunTopicAction}
                 actionState={getTopicActionState}

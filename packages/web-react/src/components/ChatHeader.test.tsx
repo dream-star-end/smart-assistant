@@ -467,3 +467,20 @@ describe("OCV5-831 ChatHeader 顶栏遮挡层与手机模型名去括号", () =>
     expect(compactMobileModelLabel("(Antigravity)")).toBe("(Antigravity)");
   });
 });
+
+describe("ChatHeader compact navigation (INC-20260908-CHAT-NAVIGATION)", () => {
+  it("keeps the agent accessible and groups the model independently of actions", async () => {
+    const onAgentClick = vi.fn();
+    renderHeader({ onOpenMobileNav: vi.fn(), onOpenFind: vi.fn(), onAgentClick });
+    const row = screen.getByTestId("chat-model-row");
+    expect(row).toContainElement(screen.getByRole("button", { name: "选择对话模型" }));
+    expect(row).not.toContainElement(screen.getByTestId("header-overflow-trigger"));
+    expect(row).not.toHaveClass("bg-hover/50");
+    expect(row).not.toHaveClass("rounded-xl");
+    openOverflowMenu();
+    const agentItem = await screen.findByTestId("overflow-agent-item");
+    expect(agentItem).toHaveTextContent(MAIN_AGENT.name);
+    fireEvent.click(agentItem);
+    expect(onAgentClick).toHaveBeenCalledTimes(1);
+  });
+});

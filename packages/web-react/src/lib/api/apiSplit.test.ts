@@ -18,8 +18,8 @@ test('api domain parts are disjoint and exposed on api by reference', () => {
       expect(api[key as keyof typeof api], `api.${key}`).toBe(obj[key as keyof typeof obj])
     }
   }
-  expect(seen.size).toBe(168)
+  expect(seen.size).toBe(177)
   expect(api.modelSwitchCost).toBeTypeOf("function")
   expect(api.getMemoryContext).toBeTypeOf("function")
-  expect(Object.keys(api)).toHaveLength(260)
+  expect(Object.keys(api)).toHaveLength(269)
 })

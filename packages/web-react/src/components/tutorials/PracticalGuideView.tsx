@@ -11,6 +11,7 @@ import {
   capabilityById,
   type ProductFeatureId,
 } from "../../lib/productCapabilities";
+import { TASKBOARD_ENABLED } from "../../lib/taskboardFeature";
 import { cn } from "../../lib/utils";
 import { AtelierIcon } from "../ui/AtelierIcons";
 import { Badge, Button } from "../ui";
@@ -21,6 +22,7 @@ import {
   PRACTICAL_GUIDE_SCENARIOS,
   type PracticalGuideCategory,
   type PracticalGuideScenario,
+  visibleScenarioRelatedTopics,
 } from "./practicalGuideData";
 
 export interface PracticalGuideScenarioInput {
@@ -32,6 +34,7 @@ export interface PracticalGuideScenarioInput {
 export interface PracticalGuideViewProps {
   authenticated?: boolean;
   actionLabel?: string;
+  taskboardEnabled?: boolean;
   onTryScenario: (scenario: PracticalGuideScenarioInput) => void;
   onOpenTopic?: (topicId: ProductFeatureId) => void;
   onOpenQuickLookup?: () => void;
@@ -68,6 +71,7 @@ async function copyTextSafe(text: string): Promise<boolean> {
 export function PracticalGuideView({
   authenticated,
   actionLabel,
+  taskboardEnabled = TASKBOARD_ENABLED,
   onTryScenario,
   onOpenTopic,
   onOpenQuickLookup,
@@ -245,6 +249,10 @@ export function PracticalGuideView({
               draftPrompts[scenario.id] !== undefined &&
               draftPrompts[scenario.id] !== scenario.prompt;
             const isCopied = copiedId === scenario.id;
+            const visibleRelatedTopics = visibleScenarioRelatedTopics(
+              scenario.relatedTopics,
+              taskboardEnabled,
+            );
 
             return (
               <article
@@ -366,10 +374,10 @@ export function PracticalGuideView({
                         </ul>
                       </div>
 
-                      {onOpenTopic && scenario.relatedTopics.length > 0 && (
+                      {onOpenTopic && visibleRelatedTopics.length > 0 && (
                         <div className="flex flex-wrap items-center gap-1.5 border-t border-border/70 pt-2.5">
                           <span className="text-caption text-faint">相关能力：</span>
-                          {scenario.relatedTopics.map((topicId) => {
+                          {visibleRelatedTopics.map((topicId) => {
                             const cap = capabilityById(topicId);
                             return (
                               <button

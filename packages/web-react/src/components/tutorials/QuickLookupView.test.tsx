@@ -154,4 +154,50 @@ describe("QuickLookupView", () => {
     expect(disabledCta).toBeDisabled();
     expect(screen.getByText("登录后即可进入这个功能。")).toBeInTheDocument();
   });
+
+  it("商业版关闭 taskboardEnabled 时完全隐藏任务面板词条、搜索命中、深链与相关能力入口", () => {
+    const onSelectTopic = vi.fn();
+    const { rerender } = render(
+      <QuickLookupView
+        topicId={null}
+        taskboardEnabled={false}
+        onSelectTopic={onSelectTopic}
+      />,
+    );
+
+    expect(screen.getByText(/共 25 项能力/)).toBeInTheDocument();
+    expect(screen.queryByText("任务面板")).not.toBeInTheDocument();
+
+    const searchInput = screen.getByRole("searchbox", { name: "搜索功能、命令或场景" });
+    for (const q of ["审批", "任务面板", "工单", "看板"]) {
+      fireEvent.change(searchInput, { target: { value: q } });
+      expect(screen.queryByText("任务面板")).not.toBeInTheDocument();
+    }
+    fireEvent.change(searchInput, { target: { value: "" } });
+
+    // 即使外部深链传入 topicId="taskboard"，在关闭态下也不渲染任务面板操作卡，自动回落速查板
+    rerender(
+      <QuickLookupView
+        topicId="taskboard"
+        taskboardEnabled={false}
+        onSelectTopic={onSelectTopic}
+      />,
+    );
+    expect(screen.queryByRole("heading", { level: 2, name: /任务面板/ })).not.toBeInTheDocument();
+    expect(screen.getByText(/共 25 项能力/)).toBeInTheDocument();
+
+    // 选中 related 中含 taskboard 的主题（sessions-history）时，「接着了解」也不得出现任务面板
+    rerender(
+      <QuickLookupView
+        topicId="sessions-history"
+        taskboardEnabled={false}
+        onSelectTopic={onSelectTopic}
+      />,
+    );
+    expect(
+      screen.getByRole("heading", { level: 2, name: "会话、搜索与跨端历史" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("任务面板")).not.toBeInTheDocument();
+    expect(screen.getAllByText("成果与下载").length).toBeGreaterThanOrEqual(1);
+  });
 });

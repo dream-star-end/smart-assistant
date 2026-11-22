@@ -3,10 +3,15 @@
  *
  * CCB and Cursor spawn efficiencyHookRunner.cjs, which execs this file
  * (JSON on stdin → JSON on stdout). All policy lives in
- * agentEfficiencyGuard.ts — this file only translates protocols.
+ * agentEfficiencyGuard.ts and actionPolicyEngine.ts — this file only
+ * translates protocols.
  *
- * Any exception path returns a protocol-valid allow and exits 0 (fail-open).
- * The runner is the outer belt; this is the inner one.
+ * Fault semantics:
+ *   - Pure efficiency-guard mode (`OPENCLAUDE_ACTION_POLICY=off|0|false`) or
+ *     failures after Action Policy has cleanly allowed: fail-open (allow, exit 0).
+ *   - Action Policy enabled (default): policy evaluation exceptions, malformed
+ *     payloads, or timeouts NEVER fail-open to allow; CCB emits `ask` and
+ *     Cursor emits fail-closed `deny` (`requiresHumanApproval: true`), exit 0.
  */
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -207,14 +212,57 @@ export function formatActionPolicyHookResponse(
   }
 }
 
+export function formatActionPolicyFailClosed(
+  protocol: HookProtocol,
+  reason: string,
+): Record<string, unknown> {
+  const evaluation: ActionPolicyEvaluation = {
+    tier: 'human_approval',
+    initialTier: 'human_approval',
+    matchedRuleId: null,
+    category: null,
+    reason,
+  }
+  return (
+    formatActionPolicyHookResponse(protocol, evaluation) ??
+    (protocol === 'cursor'
+      ? {
+          permission: 'deny',
+          requiresHumanApproval: true,
+          agent_message: reason,
+          user_message: reason,
+        }
+      : {
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'ask',
+            permissionDecisionReason: reason,
+          },
+          reason,
+        })
+  )
+}
+
 export async function handlePreToolHookInput(
   raw: unknown,
   protocol: HookProtocol,
   mode: GuardMode = resolveGuardMode(),
   options: PreToolHookActionPolicyOptions = {},
 ): Promise<Record<string, unknown>> {
+  const policyEnabled = options.actionPolicyEnabled ?? isActionPolicyEnabled()
+  let policyEvaluatedCleanly = false
   try {
-    const input = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+    if (raw === null || raw === undefined || typeof raw !== 'object' || Array.isArray(raw)) {
+      if (policyEnabled) {
+        return formatActionPolicyFailClosed(
+          protocol,
+          'Action policy received empty or malformed hook payload; human confirmation required.',
+        )
+      }
+      return formatAllow(protocol)
+    }
+
+    const input = raw as Record<string, unknown>
     const command = extractShellCommand(input)
     const toolName = extractToolName(input)
     const hasActionablePayload =
@@ -222,38 +270,66 @@ export async function handlePreToolHookInput(
       typeof input.tool === 'string' ||
       command.length > 0
 
+    if (policyEnabled && !hasActionablePayload) {
+      return formatActionPolicyFailClosed(
+        protocol,
+        'Action policy received empty hook event without tool or command; human confirmation required.',
+      )
+    }
+
     // Evaluate both action-policy and efficiency guard, then take the STRICTER decision:
     //   deny > ask (human_approval) > allow+warn > allow
     // This ensures an existing efficiency `deny` is NEVER downgraded/masked by a policy `ask`.
     let policyEvaluation: ActionPolicyEvaluation | null = null
-    const policyEnabled = options.actionPolicyEnabled ?? isActionPolicyEnabled()
     if (policyEnabled && hasActionablePayload) {
       const toolInputObj =
         input.tool_input && typeof input.tool_input === 'object' && !Array.isArray(input.tool_input)
           ? (input.tool_input as Record<string, unknown>)
           : undefined
-      policyEvaluation = await evaluateActionPolicy(
-        {
-          toolName,
-          command: command || undefined,
-          target: extractTarget(input),
-          args: toolInputObj,
-          mainModel:
-            options.mainModel ??
-            (typeof input.model === 'string' ? input.model : process.env.OPENCLAUDE_MAIN_MODEL),
-          sessionKey: typeof input.session_key === 'string' ? input.session_key : undefined,
-        },
-        {
-          loaded: options.loadedPolicy,
-          policyPath: options.policyPath,
-          mainModel: options.mainModel,
-          aiReviewHook: options.aiReviewHook,
-        },
-      )
+      try {
+        policyEvaluation = await evaluateActionPolicy(
+          {
+            toolName,
+            command: command || undefined,
+            target: extractTarget(input),
+            args: toolInputObj,
+            mainModel:
+              options.mainModel ??
+              (typeof input.model === 'string' ? input.model : process.env.OPENCLAUDE_MAIN_MODEL),
+            sessionKey: typeof input.session_key === 'string' ? input.session_key : undefined,
+          },
+          {
+            loaded: options.loadedPolicy,
+            policyPath: options.policyPath,
+            mainModel: options.mainModel,
+            aiReviewHook: options.aiReviewHook,
+          },
+        )
+        policyEvaluatedCleanly = true
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        policyEvaluation = {
+          tier: 'human_approval',
+          initialTier: 'human_approval',
+          matchedRuleId: null,
+          category: null,
+          reason: `Action policy evaluation failed (fail-closed): ${msg}`,
+        }
+      }
+    } else if (!policyEnabled || !hasActionablePayload) {
+      policyEvaluatedCleanly = true
     }
 
     const shellTool = isShellTool(input)
-    const effDecision = shellTool ? evaluateShellForHook(command, mode) : null
+    let effDecision: HookDecision | null = null
+    if (shellTool) {
+      try {
+        effDecision = evaluateShellForHook(command, mode)
+      } catch {
+        // Efficiency guard stays fail-open on its own internal errors without weakening policy.
+        effDecision = null
+      }
+    }
 
     // 1. Hard deny from either guard wins immediately (combine reasons if both flagged).
     if (policyEvaluation?.tier === 'deny') {
@@ -272,7 +348,7 @@ export async function handlePreToolHookInput(
     if (policyEvaluation && policyEvaluation.tier !== 'allow') {
       return (
         formatActionPolicyHookResponse(protocol, policyEvaluation, effDecision?.message) ??
-        formatAllow(protocol)
+        formatActionPolicyFailClosed(protocol, policyEvaluation.reason)
       )
     }
 
@@ -286,7 +362,14 @@ export async function handlePreToolHookInput(
     return protocol === 'cursor'
       ? formatCursorHookResponse(effDecision)
       : formatCcbHookResponse(effDecision)
-  } catch {
+  } catch (err) {
+    if (policyEnabled && !policyEvaluatedCleanly) {
+      const msg = err instanceof Error ? err.message : String(err)
+      return formatActionPolicyFailClosed(
+        protocol,
+        `Action policy evaluation exception (fail-closed): ${msg}`,
+      )
+    }
     return formatAllow(protocol)
   }
 }
@@ -304,32 +387,75 @@ function writeJson(obj: Record<string, unknown>): void {
 async function main(): Promise<void> {
   const protocol = parseHookProtocol()
   const mode = parseHookMode()
+  const policyEnabled = isActionPolicyEnabled()
   const timer = setTimeout(() => {
-    writeJson(formatAllow(protocol))
+    writeJson(
+      policyEnabled
+        ? formatActionPolicyFailClosed(protocol, 'Action policy evaluation timed out (fail-closed).')
+        : formatAllow(protocol),
+    )
     process.exit(0)
   }, resolveInnerTimeoutMs())
   try {
     let parsed: unknown = {}
     try {
       const raw = (await readStdin()).trim()
-      parsed = raw ? JSON.parse(raw) : {}
-    } catch {
+      if (!raw) {
+        if (policyEnabled) {
+          clearTimeout(timer)
+          writeJson(
+            formatActionPolicyFailClosed(
+              protocol,
+              'Action policy received empty stdin payload (fail-closed).',
+            ),
+          )
+          return
+        }
+        parsed = {}
+      } else {
+        parsed = JSON.parse(raw)
+      }
+    } catch (err) {
+      if (policyEnabled) {
+        clearTimeout(timer)
+        writeJson(
+          formatActionPolicyFailClosed(
+            protocol,
+            `Action policy failed to read or parse stdin (fail-closed): ${err instanceof Error ? err.message : String(err)}`,
+          ),
+        )
+        return
+      }
       parsed = {}
     }
     const out = await handlePreToolHookInput(parsed, protocol, mode)
     clearTimeout(timer)
     writeJson(out)
-  } catch {
+  } catch (err) {
     clearTimeout(timer)
-    writeJson(formatAllow(protocol))
+    writeJson(
+      policyEnabled
+        ? formatActionPolicyFailClosed(
+            protocol,
+            `Action policy hook exception (fail-closed): ${err instanceof Error ? err.message : String(err)}`,
+          )
+        : formatAllow(protocol),
+    )
   }
 }
 
 const invoked = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])
 if (invoked) {
-  main().catch(() => {
+  main().catch((err) => {
     const protocol = parseHookProtocol()
-    writeJson(formatAllow(protocol))
+    writeJson(
+      isActionPolicyEnabled()
+        ? formatActionPolicyFailClosed(
+            protocol,
+            `Action policy hook fatal error (fail-closed): ${err instanceof Error ? err.message : String(err)}`,
+          )
+        : formatAllow(protocol),
+    )
     process.exit(0)
   })
 }

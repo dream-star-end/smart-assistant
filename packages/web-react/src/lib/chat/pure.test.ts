@@ -30,6 +30,8 @@ describe("computeTypingLabel — calm human copy without engine/anxiety jargon",
     expect(text).not.toContain("无新数据");
   });
 
+  // Incident anchor (INC-20261028-STALE-ENGINE-STARTING): "transport down + stale → 连接已断开,计时按已发送分钟"
+  // Atelier moved disconnect wording into ConnBanner; computeTypingLabel still reports elapsed minutes and never 启动引擎.
   test("transport down + stale → 不重复断线文案（由全局连接条承载），按已发送分钟展示后台处理中", () => {
     const { text } = computeTypingLabel({ ...base, secs: 1184, silenceMs: 1_163_000, transport: "connecting" });
     expect(text).toContain("正在后台处理中");

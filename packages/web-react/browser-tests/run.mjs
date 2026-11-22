@@ -559,6 +559,9 @@ await page.route("**/api/plugins/**", (route, request) => {
 // 插件启用开关读偏好（OCV5-383）：全部启用。
 await page.route("**/api/me/preferences", (route) =>
   route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ prefs: {} }) }));
+// OCV5-840: MemoryPanel 挂载后拉取常驻上下文健康体检报告，harness 返回空健康态防 404 console.error。
+await page.route("**/api/agents/*/context-health", (route) =>
+  route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ agentId: "main", generatedAt: "2026-11-22T00:00:00.000Z", status: "healthy", totalBytes: 0, reclaimableBytes: 0, slots: [], summary: { coreMemoryCount: 0, coreMemoryBytes: 0, coreMemoryIndexBytes: 0, expiredMemoryCount: 0, oversizedMemoryCount: 0, activeSkillCount: 0, activeSkillBytes: 0, coldSkillCount: 0, oversizedSkillCount: 0, skillHistoryCount: 0, skillHistoryBytes: 0, claudeMdBytes: 0, userMdBytes: 0, archivalCount: 0, archivalBytes: 0, staleArchivalCount: 0, archivedMemoryCount: 0, archivedSkillCount: 0 }, slimCandidates: [] }) }));
 await page.route(harnessUrl, (route) => route.fulfill({
   status: 200,
   contentType: "text/html",

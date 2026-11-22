@@ -10,8 +10,11 @@
  *
  *   TEST_DATABASE_URL=postgres://…@127.0.0.1:…/…_test npx --no-install tsx scripts/check-v5-master-incident-proofs.ts
  */
-import { spawnSync } from 'node:child_process'
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import assert from 'node:assert/strict'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { cpus, tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 import { scopeBoxExecToProfile } from '../packages/commercial/src/http/proxy/boxProfileExec.js'
 import { BoxProfileHealth } from '../packages/commercial/src/http/proxy/boxProfileHealth.js'
 import { isBoxLaunchRequest } from '../packages/commercial/src/http/proxy/boxClaudeProfile.js'
@@ -274,18 +277,536 @@ async function profileAttributionProof(): Promise<string> {
   return '[inc-20261102-box-profile-observer-attribution] PASS — unknown observers never poison login health; known owners remain exact; zero launches'
 }
 
+type FileGroup = {
+  file: string
+  db: boolean
+  entries: Array<{ index: number; proof: Proof }>
+}
+
+export function groupProofsByFile(proofs: readonly Proof[]): FileGroup[] {
+  const byFile = new Map<string, FileGroup>()
+  const groups: FileGroup[] = []
+  proofs.forEach((proof, index) => {
+    const existing = byFile.get(proof.file)
+    if (existing) {
+      existing.db = existing.db || proof.db
+      existing.entries.push({ index, proof })
+    } else {
+      const group: FileGroup = { file: proof.file, db: proof.db, entries: [{ index, proof }] }
+      byFile.set(proof.file, group)
+      groups.push(group)
+    }
+  })
+  return groups
+}
+
+function resolveNoDbConcurrency(): number {
+  const raw = process.env.OC_V5_MASTER_PROOF_CONCURRENCY
+  if (raw && /^\d+$/.test(raw)) {
+    return Math.max(1, Math.min(6, Number(raw)))
+  }
+  return Math.max(2, Math.min(3, Math.floor(cpus().length / 6) || 2))
+}
+
+function resolveDbConcurrency(): number {
+  const raw = process.env.OC_V5_MASTER_PROOF_DB_CONCURRENCY
+  if (raw && /^\d+$/.test(raw)) {
+    return Math.max(1, Math.min(4, Number(raw)))
+  }
+  return cpus().length >= 8 ? 3 : 2
+}
+
+// Longest-processing-time-first ordering for heavy DB and no-DB proofs reduces tail latency.
+const HEAVY_DB_ORDER: readonly string[] = [
+  'packages/commercial/src/__tests__/login.integ.test.ts',
+  'packages/commercial/src/__tests__/studioComposeFlow.integ.test.ts',
+  'packages/commercial/src/__tests__/studioAnnotations.integ.test.ts',
+  'packages/commercial/src/__tests__/openTurnAttribution.integ.test.ts',
+  'packages/commercial/src/__tests__/studioOrchestrator.integ.test.ts',
+  'packages/commercial/src/__tests__/alertOutboxInboxFallback.integ.test.ts',
+]
+
+const HEAVY_NODB_FILES = new Set([
+  'packages/gateway/src/__tests__/remotePoolDrainAndCcAuthProof.test.ts',
+  'packages/gateway/src/__tests__/cc5BashTimeoutProof.test.ts',
+  'packages/gateway/src/__tests__/remotePoolTerminalSettlement.test.ts',
+])
+
+// Strip all PG/DSN/loader overrides so DB workers can only reach their assigned slot DSN
+// and no-DB workers never inherit any database URL.
+const STRIPPED_WORKER_ENV_KEYS = [
+  'DATABASE_URL',
+  'TEST_DATABASE_URL',
+  'NATIVE_FINANCE_TEST_DATABASE_URL',
+  'OCV5_289_JOURNAL_TEST_DATABASE_URL',
+  'OC_V5_PROOF_TEST_DATABASE_URL',
+  'PGHOST',
+  'PGPORT',
+  'PGUSER',
+  'PGPASSWORD',
+  'PGDATABASE',
+  'PGSERVICE',
+  'PGOPTIONS',
+  'PGSSLMODE',
+  'NODE_OPTIONS',
+  'NODE_PATH',
+] as const
+
+export function buildWorkerEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  opts: { db: boolean; dsn?: string; tmpdir: string },
+): NodeJS.ProcessEnv {
+  const clean: NodeJS.ProcessEnv = { ...baseEnv }
+  for (const key of STRIPPED_WORKER_ENV_KEYS) {
+    delete clean[key]
+  }
+  clean.TMPDIR = opts.tmpdir
+  if (opts.db) {
+    if (!opts.dsn) fail('internal error: DB worker missing slot DSN')
+    clean.TEST_DATABASE_URL = opts.dsn
+  }
+  return clean
+}
+
+type EphemeralDbCleanupResult = {
+  ok: boolean
+  failures: string[]
+}
+
+type EphemeralDbPool = {
+  dsns: string[]
+  cleanup: () => EphemeralDbCleanupResult
+}
+
+export function resolvePersistentGateDbRegistry(privateTmp: string): string | null {
+  const explicit = process.env.OC_V5_GATE_DB_REGISTRY?.trim()
+  if (explicit) {
+    const absReg = resolve(explicit)
+    const absTmp = resolve(privateTmp)
+    if (absReg === absTmp || absReg.startsWith(`${absTmp}/`)) {
+      return null
+    }
+    return absReg
+  }
+  if (typeof process.getuid === 'function' && process.getuid() === 0) {
+    return '/var/lib/openclaude-v5-commercial/gate-test-dbs'
+  }
+  // Non-root without an explicit persistent registry falls back to serialized shared DSN
+  // so drop failures can never lose the only ownership token when privateTmp is deleted.
+  return null
+}
+
+function allocateEphemeralDbPool(baseDsn: string, count: number, privateTmp: string): EphemeralDbPool {
+  const helper = join(process.cwd(), 'scripts/lib/gateTestDb.mjs')
+  const registryDir = resolvePersistentGateDbRegistry(privateTmp)
+  if (count <= 1 || !existsSync(helper) || !registryDir) {
+    return { dsns: [baseDsn], cleanup: () => ({ ok: true, failures: [] }) }
+  }
+  const helperEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    OC_V5_GATE_BASE_DSN: baseDsn,
+    OC_V5_GATE_DB_REGISTRY: registryDir,
+  }
+  try {
+    execFileSync(process.execPath, [helper, 'sweep'], {
+      cwd: process.cwd(),
+      env: helperEnv,
+      stdio: ['ignore', 'ignore', 'pipe'],
+      timeout: 30_000,
+    })
+  } catch {
+    // Best-effort orphan sweep; creation failure below falls back cleanly to shared DSN.
+  }
+  const created: Array<{ name: string; url: string }> = []
+  const cleanup = (): EphemeralDbCleanupResult => {
+    const failures: string[] = []
+    while (created.length > 0) {
+      const item = created.pop()!
+      try {
+        execFileSync(process.execPath, [helper, 'drop', item.name], {
+          cwd: process.cwd(),
+          env: helperEnv,
+          stdio: ['ignore', 'ignore', 'pipe'],
+          timeout: 30_000,
+        })
+      } catch (err) {
+        // Keep persistent registry record intact so the next sweep can reclaim the DB.
+        const msg = err instanceof Error ? err.message : String(err)
+        failures.push(`${item.name}: ${msg}`)
+      }
+    }
+    return { ok: failures.length === 0, failures }
+  }
+  try {
+    for (let i = 0; i < count; i++) {
+      const url = execFileSync(process.execPath, [helper, 'create', String(process.pid)], {
+        cwd: process.cwd(),
+        env: helperEnv,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 30_000,
+      }).trim()
+      const m = /\/(ocv5_gate_[0-9]+_[0-9a-f]{12}_test)$/.exec(url)
+      if (!m) throw new Error('unexpected ephemeral gate DB URL')
+      created.push({ name: m[1]!, url })
+    }
+    return { dsns: created.map((c) => c.url), cleanup }
+  } catch {
+    const rollback = cleanup()
+    if (!rollback.ok) {
+      fail(
+        `ephemeral gate DB pool creation failed and rollback drop failed; registry entries retained for sweep: ${rollback.failures.join('; ')}`,
+      )
+    }
+    return { dsns: [baseDsn], cleanup: () => ({ ok: true, failures: [] }) }
+  }
+}
+
+const FILE_TIMEOUT_MS = 240_000
+const MAX_BUFFER_BYTES = 64 * 1024 * 1024
+
+function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) return false
+  try {
+    process.kill(pid, 0)
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException)?.code
+    return code === 'EPERM'
+  }
+  try {
+    const status = readFileSync(`/proc/${pid}/status`, 'utf8')
+    const m = /^State:\s+(\S)/m.exec(status)
+    if (m && m[1] === 'Z') return false
+  } catch {
+    return false
+  }
+  return true
+}
+
+function collectDescendants(roots: Iterable<number>, seen: Set<number>): void {
+  const byParent = new Map<number, number[]>()
+  let entries: string[]
+  try {
+    entries = readdirSync('/proc')
+  } catch {
+    return
+  }
+  for (const name of entries) {
+    if (!/^\d+$/.test(name)) continue
+    const pid = Number(name)
+    try {
+      const status = readFileSync(`/proc/${pid}/status`, 'utf8')
+      const m = /^PPid:\s+(\d+)/m.exec(status)
+      if (!m) continue
+      const ppid = Number(m[1])
+      let list = byParent.get(ppid)
+      if (!list) {
+        list = []
+        byParent.set(ppid, list)
+      }
+      list.push(pid)
+    } catch {
+      // Process exited while scanning /proc.
+    }
+  }
+  const queue = [...roots, ...seen]
+  while (queue.length > 0) {
+    const cur = queue.pop()!
+    const kids = byParent.get(cur)
+    if (!kids) continue
+    for (const kid of kids) {
+      if (kid !== process.pid && !seen.has(kid)) {
+        seen.add(kid)
+        queue.push(kid)
+      }
+    }
+  }
+}
+
+export async function terminateProcessTree(rootPid: number, graceMs = 1_500): Promise<void> {
+  if (!Number.isInteger(rootPid) || rootPid <= 1 || rootPid === process.pid) return
+  const seen = new Set<number>([rootPid])
+  collectDescendants([rootPid], seen)
+
+  const signalAll = (sig: NodeJS.Signals) => {
+    collectDescendants([rootPid], seen)
+    for (const pid of seen) {
+      if (pid !== process.pid) {
+        try { process.kill(pid, sig) } catch {}
+      }
+    }
+  }
+
+  signalAll('SIGTERM')
+  const deadline = Date.now() + graceMs
+  while (Date.now() < deadline) {
+    collectDescendants([rootPid], seen)
+    let anyAlive = false
+    for (const pid of seen) {
+      if (isPidAlive(pid)) {
+        anyAlive = true
+        break
+      }
+    }
+    if (!anyAlive) return
+    await new Promise((r) => setTimeout(r, 50))
+  }
+
+  signalAll('SIGKILL')
+  const killDeadline = Date.now() + 2_000
+  while (Date.now() < killDeadline) {
+    collectDescendants([rootPid], seen)
+    let anyAlive = false
+    for (const pid of seen) {
+      if (isPidAlive(pid)) {
+        anyAlive = true
+        break
+      }
+    }
+    if (!anyAlive) return
+    await new Promise((r) => setTimeout(r, 50))
+  }
+}
+
+type ActiveChild = {
+  child: ChildProcess
+  pid: number | null
+}
+
+function runProofFile(
+  file: string,
+  env: NodeJS.ProcessEnv,
+  active: Set<ActiveChild>,
+): Promise<{ stdout: string; status: number | null; elapsedMs: number }> {
+  return new Promise((resolveRun, rejectRun) => {
+    const started = Date.now()
+    // Keep workers in the outer process group (detached: false) so an outer supervisor
+    // PGID SIGKILL on lease loss reaps every npx/tsx/node worker atomically; normal
+    // timeout/abort reaps the entire descendant tree via /proc in terminateProcessTree.
+    const child = spawn(
+      'npx',
+      ['--no-install', 'tsx', '--test', '--test-reporter=tap', '--test-concurrency=1', file],
+      { cwd: process.cwd(), env, stdio: ['ignore', 'pipe', 'pipe'] },
+    )
+    const entry: ActiveChild = { child, pid: typeof child.pid === 'number' ? child.pid : null }
+    active.add(entry)
+    let stdout = ''
+    let stderr = ''
+    let totalBytes = 0
+    let settled = false
+    let timedOut = false
+    let overflowed = false
+
+    const settle = (fn: () => void) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      active.delete(entry)
+      fn()
+    }
+
+    const drainTreeAndSettle = (fn: () => void) => {
+      if (entry.pid !== null) {
+        void terminateProcessTree(entry.pid, 1_500).finally(() => settle(fn))
+      } else {
+        settle(fn)
+      }
+    }
+
+    const timer = setTimeout(() => {
+      timedOut = true
+      if (entry.pid !== null) {
+        void terminateProcessTree(entry.pid, 1_500)
+      } else {
+        try { child.kill('SIGTERM') } catch {}
+      }
+    }, FILE_TIMEOUT_MS)
+
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
+    child.stdout.on('data', (chunk: string) => {
+      totalBytes += Buffer.byteLength(chunk)
+      if (totalBytes > MAX_BUFFER_BYTES) {
+        overflowed = true
+        if (entry.pid !== null) {
+          void terminateProcessTree(entry.pid, 500)
+        } else {
+          try { child.kill('SIGKILL') } catch {}
+        }
+        return
+      }
+      stdout += chunk
+    })
+    child.stderr.on('data', (chunk: string) => {
+      if (stderr.length < 16_384) stderr += chunk
+    })
+    child.on('error', (err) => {
+      drainTreeAndSettle(() => rejectRun(new Error(`${file}: ${err.message}`)))
+    })
+    child.on('close', (code, signal) => {
+      if (timedOut) {
+        drainTreeAndSettle(() => rejectRun(new Error(`${file}: timed out after ${FILE_TIMEOUT_MS}ms`)))
+        return
+      }
+      if (overflowed) {
+        drainTreeAndSettle(() => rejectRun(new Error(`${file}: TAP output exceeded ${MAX_BUFFER_BYTES} bytes`)))
+        return
+      }
+      if (signal) {
+        drainTreeAndSettle(() => rejectRun(new Error(`${file}: killed by signal ${signal}${stderr ? ` (${stderr.trim().slice(0, 200)})` : ''}`)))
+        return
+      }
+      drainTreeAndSettle(() => resolveRun({ stdout, status: code, elapsedMs: Date.now() - started }))
+    })
+  })
+}
+
+async function runPool<T>(
+  items: readonly T[],
+  limit: number,
+  isAborted: () => boolean,
+  onAbort: () => void,
+  worker: (item: T, slot: number) => Promise<void>,
+): Promise<void> {
+  let next = 0
+  let firstErr: unknown = null
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async (_unused, slot) => {
+    while (firstErr === null && !isAborted()) {
+      const i = next++
+      if (i >= items.length) return
+      try {
+        await worker(items[i]!, slot)
+      } catch (err) {
+        if (firstErr === null) firstErr = err
+        onAbort()
+        return
+      }
+    }
+  })
+  await Promise.allSettled(runners)
+  if (firstErr !== null) throw firstErr
+}
+
 async function main(): Promise<void> {
   const dsn = assertTestDsn(process.env.TEST_DATABASE_URL)
-  const lines: string[] = [await profileAttributionProof()]
-  for (const proof of MASTER_INCIDENT_PROOFS) {
-    const { DATABASE_URL: _db, NODE_OPTIONS: _opts, TEST_DATABASE_URL: _test, ...base } = process.env
-    const env: NodeJS.ProcessEnv = proof.db ? { ...base, TEST_DATABASE_URL: dsn } : base
-    const run = spawnSync('npx', ['--no-install', 'tsx', '--test', '--test-reporter=tap',
-      '--test-concurrency=1', proof.file], { cwd: process.cwd(), env, encoding: 'utf8', timeout: 240_000,
-      maxBuffer: 64 * 1024 * 1024 })
-    if (run.error) fail(`${proof.incident}: ${run.error.message}`)
-    lines.push(...judge(proof, run.stdout ?? '', run.status))
+  // Isolate tsx compile cache per invocation so bloated /tmp/tsx-0 (tens of thousands of stale
+  // entries) never stalls startup or contends across concurrent workers.
+  const privateTmp = mkdtempSync(join(tmpdir(), 'oc-master-proofs-tmp-'))
+  const groups = groupProofsByFile(MASTER_INCIDENT_PROOFS)
+  const dbOrderRank = (file: string) => {
+    const idx = HEAVY_DB_ORDER.indexOf(file)
+    return idx >= 0 ? idx : HEAVY_DB_ORDER.length
   }
+  const dbGroups = groups
+    .filter((g) => g.db)
+    .sort((a, b) => dbOrderRank(a.file) - dbOrderRank(b.file))
+  const heavyNoDb = groups.filter((g) => !g.db && HEAVY_NODB_FILES.has(g.file))
+  const lightNoDb = groups.filter((g) => !g.db && !HEAVY_NODB_FILES.has(g.file))
+  // Interleave heavy subprocess-spawning suites with light ones so heavy suites do not
+  // all saturate CPU/timers simultaneously while still starting early to hide tail latency.
+  const noDbGroups: FileGroup[] = []
+  let hi = 0
+  let li = 0
+  while (hi < heavyNoDb.length || li < lightNoDb.length) {
+    if (hi < heavyNoDb.length) noDbGroups.push(heavyNoDb[hi++]!)
+    for (let k = 0; k < 2 && li < lightNoDb.length; k++) noDbGroups.push(lightNoDb[li++]!)
+  }
+  const dbPool = allocateEphemeralDbPool(dsn, Math.min(resolveDbConcurrency(), dbGroups.length), privateTmp)
+  const resultsByIndex: string[][] = Array.from({ length: MASTER_INCIDENT_PROOFS.length }, () => [])
+  const active = new Set<ActiveChild>()
+  let aborted = false
+  let signalReceived: NodeJS.Signals | null = null
+
+  const terminateAllActive = async (): Promise<void> => {
+    const snapshot = [...active]
+    await Promise.allSettled(
+      snapshot.map(async (entry) => {
+        if (entry.pid !== null) {
+          await terminateProcessTree(entry.pid, 1_500)
+        } else {
+          try { entry.child.kill('SIGTERM') } catch {}
+        }
+      }),
+    )
+  }
+
+  const triggerAbort = () => {
+    if (aborted) return
+    aborted = true
+    void terminateAllActive()
+  }
+
+  const onSig = (sig: NodeJS.Signals) => {
+    if (!signalReceived) signalReceived = sig
+    triggerAbort()
+  }
+  process.once('SIGINT', onSig)
+  process.once('SIGTERM', onSig)
+
+  let workerSeq = 0
+  const executeGroup = async (group: FileGroup, slot: number): Promise<void> => {
+    if (aborted) return
+    const workerTmp = mkdtempSync(join(privateTmp, `w${++workerSeq}-`))
+    const slotDsn = dbPool.dsns[slot % dbPool.dsns.length]!
+    const env = buildWorkerEnv(process.env, { db: group.db, dsn: slotDsn, tmpdir: workerTmp })
+    try {
+      const run = await runProofFile(group.file, env, active)
+      if (aborted) return
+      for (const { index, proof } of group.entries) {
+        resultsByIndex[index] = judge(proof, run.stdout, run.status)
+      }
+      if (process.env.OC_V5_MASTER_PROOF_TIMING === '1') {
+        process.stderr.write(`[master-incident-proofs] ${group.db ? `db[${slot}]` : 'nodb'} ${(run.elapsedMs / 1000).toFixed(1)}s ${group.file}\n`)
+      }
+    } finally {
+      try { rmSync(workerTmp, { recursive: true, force: true }) } catch {}
+    }
+  }
+
+  let profileLine = ''
+  let primaryError: unknown = null
+  let cleanupResult: EphemeralDbCleanupResult = { ok: true, failures: [] }
+  try {
+    const settled = await Promise.allSettled([
+      profileAttributionProof(),
+      runPool(noDbGroups, resolveNoDbConcurrency(), () => aborted, triggerAbort, executeGroup),
+      runPool(dbGroups, dbPool.dsns.length, () => aborted, triggerAbort, executeGroup),
+    ])
+    // Ensure every active worker process group is fully drained before dropping DBs or removing TMPDIR.
+    await terminateAllActive()
+    if (settled[0].status === 'fulfilled') {
+      profileLine = settled[0].value
+    } else {
+      primaryError = settled[0].reason
+    }
+    for (const outcome of settled.slice(1)) {
+      if (outcome.status === 'rejected' && primaryError === null) {
+        primaryError = outcome.reason
+      }
+    }
+  } finally {
+    await terminateAllActive()
+    process.off('SIGINT', onSig)
+    process.off('SIGTERM', onSig)
+    cleanupResult = dbPool.cleanup()
+    try { rmSync(privateTmp, { recursive: true, force: true }) } catch {}
+  }
+
+  if (signalReceived) {
+    process.exit(signalReceived === 'SIGINT' ? 130 : 143)
+  }
+  if (primaryError !== null) {
+    if (primaryError instanceof Error && primaryError.message.startsWith('[master-incident-proofs]')) {
+      throw primaryError
+    }
+    fail(primaryError instanceof Error ? primaryError.message : String(primaryError))
+  }
+  if (!cleanupResult.ok) {
+    fail(`failed to drop ephemeral gate DB(s); registry entries retained for sweep: ${cleanupResult.failures.join('; ')}`)
+  }
+
+  const lines: string[] = [profileLine]
+  for (const groupLines of resultsByIndex) lines.push(...groupLines)
   for (const line of lines) console.log(line)
   console.log(`[master-incident-proofs] PASS ${lines.length} cases`)
 }

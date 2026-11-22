@@ -13,8 +13,10 @@ import { isActionPolicyEnabled } from './actionPolicyEngine.js'
 
 export type HookProtocol = 'ccb' | 'cursor'
 
-/** Engine-side backstop (seconds). Our runner times out well below this. */
+/** Engine-side backstop (seconds) in efficiency-only mode. */
 export const EFFICIENCY_HOOK_ENGINE_TIMEOUT_SEC = 4
+/** Engine-side backstop (seconds) when Action Policy is enabled (> runner 5s max timeout). */
+export const ACTION_POLICY_HOOK_ENGINE_TIMEOUT_SEC = 6
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`
@@ -59,12 +61,15 @@ export function buildCcbEfficiencySettings(
 ): Record<string, unknown> | null {
   const command = resolveEfficiencyHookCommand('ccb', mode, actionPolicyEnabled)
   if (!command) return null
+  const timeout = actionPolicyEnabled
+    ? ACTION_POLICY_HOOK_ENGINE_TIMEOUT_SEC
+    : EFFICIENCY_HOOK_ENGINE_TIMEOUT_SEC
   return {
     hooks: {
       PreToolUse: [
         {
           matcher: 'Bash|Shell',
-          hooks: [{ type: 'command', command, timeout: EFFICIENCY_HOOK_ENGINE_TIMEOUT_SEC }],
+          hooks: [{ type: 'command', command, timeout }],
         },
       ],
     },
@@ -77,14 +82,17 @@ export function buildCursorEfficiencyHooks(
 ): Record<string, unknown> | null {
   const command = resolveEfficiencyHookCommand('cursor', mode, actionPolicyEnabled)
   if (!command) return null
+  const timeout = actionPolicyEnabled
+    ? ACTION_POLICY_HOOK_ENGINE_TIMEOUT_SEC
+    : EFFICIENCY_HOOK_ENGINE_TIMEOUT_SEC
   return {
     version: 1,
     hooks: {
       beforeShellExecution: [
         {
           command,
-          timeout: EFFICIENCY_HOOK_ENGINE_TIMEOUT_SEC,
-          failClosed: false,
+          timeout,
+          failClosed: actionPolicyEnabled,
         },
       ],
     },

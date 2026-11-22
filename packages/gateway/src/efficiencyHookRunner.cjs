@@ -36,6 +36,11 @@ function parseTimeoutMs() {
   return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, Math.trunc(raw)))
 }
 
+function isActionPolicyEnabled(env = process.env) {
+  const raw = String(env.OPENCLAUDE_ACTION_POLICY ?? 'on').trim().toLowerCase()
+  return !(raw === 'off' || raw === '0' || raw === 'false')
+}
+
 function allowPayload(protocol) {
   if (protocol === 'cursor') return { permission: 'allow' }
   return {
@@ -43,6 +48,27 @@ function allowPayload(protocol) {
       hookEventName: 'PreToolUse',
       permissionDecision: 'allow',
     },
+  }
+}
+
+function failClosedPayload(protocol, reason) {
+  if (protocol === 'cursor') {
+    const msg = `[action-policy] 策略评估异常或超时，已 fail-closed 拦截（${reason}）`
+    return {
+      permission: 'deny',
+      requiresHumanApproval: true,
+      agent_message: msg,
+      user_message: msg,
+    }
+  }
+  const msg = `[action-policy] 策略评估异常或超时，需人工确认后执行（${reason}）`
+  return {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'ask',
+      permissionDecisionReason: msg,
+    },
+    reason: msg,
   }
 }
 
@@ -85,16 +111,17 @@ function elapsedMs() {
   return Math.max(0, Date.now() - RUN_STARTED_MS)
 }
 
-function recordFailOpen(reason, protocol) {
+function recordFailSignal(event, reason, protocol) {
+  const label = event === 'fail_closed' ? 'fail-closed' : 'fail-open'
   const rec = {
     ts: new Date().toISOString(),
-    event: 'fail_open',
+    event,
     reason,
     protocol,
     elapsedMs: elapsedMs(),
   }
   try {
-    fs.writeSync(2, `[oc-efficiency-guard] fail-open ${JSON.stringify(rec)}\n`)
+    fs.writeSync(2, `[oc-efficiency-guard] ${label} ${JSON.stringify(rec)}\n`)
   } catch {
     /* stderr is best-effort */
   }
@@ -104,7 +131,7 @@ function recordFailOpen(reason, protocol) {
     const dir = path.join(home, '.efficiency-guard')
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
     fs.appendFileSync(path.join(dir, 'audit.jsonl'), `${JSON.stringify(rec)}\n`, { mode: 0o600 })
-    const countPath = path.join(dir, 'fail-open.count')
+    const countPath = path.join(dir, `${label}.count`)
     let n = 0
     try {
       n = parseInt(fs.readFileSync(countPath, 'utf8'), 10) || 0
@@ -122,8 +149,13 @@ function writeJsonAndExit(obj) {
   process.exit(0)
 }
 
-function failOpen(protocol, reason) {
-  recordFailOpen(reason, protocol)
+function handleRunnerFault(protocol, reason) {
+  if (isActionPolicyEnabled()) {
+    recordFailSignal('fail_closed', reason, protocol)
+    writeJsonAndExit(failClosedPayload(protocol, reason))
+    return
+  }
+  recordFailSignal('fail_open', reason, protocol)
   writeJsonAndExit(allowPayload(protocol))
 }
 
@@ -186,7 +218,7 @@ function main() {
     if (settled) return
     settled = true
     killInner()
-    failOpen(protocol, reason)
+    handleRunnerFault(protocol, reason)
   }
 
   const timer = setTimeout(() => finishFail('timeout'), timeoutMs)
@@ -194,7 +226,7 @@ function main() {
   const resolved = resolveInnerArgs(argv)
   if (resolved.error) {
     clearTimeout(timer)
-    failOpen(protocol, resolved.error)
+    handleRunnerFault(protocol, resolved.error)
     return
   }
 
@@ -206,7 +238,7 @@ function main() {
     })
   } catch (err) {
     clearTimeout(timer)
-    failOpen(protocol, `spawn_error:${err && err.code ? err.code : 'unknown'}`)
+    handleRunnerFault(protocol, `spawn_error:${err && err.code ? err.code : 'unknown'}`)
     return
   }
 
@@ -240,20 +272,20 @@ function main() {
     settled = true
     clearTimeout(timer)
     if (signal === 'SIGKILL' || signal === 'SIGTERM') {
-      failOpen(protocol, `killed:${signal}`)
+      handleRunnerFault(protocol, `killed:${signal}`)
       return
     }
     if (code !== 0) {
-      failOpen(protocol, `nonzero_exit:${code == null ? 'null' : code}`)
+      handleRunnerFault(protocol, `nonzero_exit:${code == null ? 'null' : code}`)
       return
     }
     if (!String(stdout).trim()) {
-      failOpen(protocol, 'empty_output')
+      handleRunnerFault(protocol, 'empty_output')
       return
     }
     const validated = parseAndValidateDecision(protocol, stdout)
     if (!validated) {
-      failOpen(protocol, 'invalid_json')
+      handleRunnerFault(protocol, 'invalid_json')
       return
     }
     writeJsonAndExit(validated)
@@ -264,5 +296,5 @@ try {
   main()
 } catch (err) {
   const protocol = parseProtocol(process.argv.slice(2))
-  failOpen(protocol, `runner_throw:${err && err.name ? err.name : 'Error'}`)
+  handleRunnerFault(protocol, `runner_throw:${err && err.name ? err.name : 'Error'}`)
 }

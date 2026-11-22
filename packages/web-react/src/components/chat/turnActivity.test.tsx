@@ -95,7 +95,7 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     expect(after).not.toContain("执行操作");
   });
 
-  test("INC-20261028-STALE-ENGINE-STARTING: 切回时启动态已过期 → 不显示正在准备中/启动引擎/无新数据", () => {
+  test("INC-20261028-STALE-ENGINE-STARTING: 切回时启动态已过期 → 不显示正在启动引擎 (1184s)", () => {
     const now = Date.now();
     renderTA({ startedAt: now - 1_184_000, lastFrameAt: now - 1_163_000, turnStatus: "engine_starting" });
     const text = screen.getByLabelText("生成中").textContent ?? "";

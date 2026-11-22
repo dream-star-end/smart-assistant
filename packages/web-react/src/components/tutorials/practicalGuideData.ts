@@ -194,3 +194,12 @@ export const PRACTICAL_GUIDE_SCENARIOS: readonly PracticalGuideScenario[] = [
     relatedTopics: ["team-mode", "models-reasoning", "taskboard"],
   },
 ] as const;
+
+export function visibleScenarioRelatedTopics(
+  relatedTopics: readonly ProductFeatureId[],
+  taskboardEnabled: boolean,
+): readonly ProductFeatureId[] {
+  return taskboardEnabled
+    ? relatedTopics
+    : relatedTopics.filter((topicId) => topicId !== "taskboard");
+}

@@ -8,7 +8,7 @@
  */
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { before, beforeEach, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -36,7 +36,9 @@ import { useDedicatedTestDatabase } from "./helpers/db.js";
 const db = useDedicatedTestDatabase("ocv5_824_perf_fixes_test");
 const here = dirname(fileURLToPath(import.meta.url));
 const SQL_0351 = readFileSync(
-  join(here, "../db/migrations/0351_perf_timeline_and_live_snapshot_indexes.sql"),
+  existsSync(join(here, "../db/migrations/0347_commercial_perf_timeline_and_live_snapshot_indexes.sql"))
+    ? join(here, "../db/migrations/0347_commercial_perf_timeline_and_live_snapshot_indexes.sql")
+    : join(here, "../db/migrations/0351_perf_timeline_and_live_snapshot_indexes.sql"),
   "utf8",
 );
 
@@ -183,7 +185,7 @@ describe("OCV5-824 R2 real-PG verification (B1-B8 + N1)", () => {
       // Preflight (stmts[0]) MUST fail loud!
       await assert.rejects(
         rawClient.query(stmts[0]!),
-        /0351 fail-loud: invalid index\(es\) detected \(idx_turn_dispatches_user_session_terminal\)/,
+        /(?:0347|0351) fail-loud: invalid index\(es\) detected \(idx_turn_dispatches_user_session_terminal\)/,
       );
       // Runbook recovery: DROP INDEX CONCURRENTLY then run full 0351 cleanly.
       await rawClient.query("DROP INDEX CONCURRENTLY idx_turn_dispatches_user_session_terminal");

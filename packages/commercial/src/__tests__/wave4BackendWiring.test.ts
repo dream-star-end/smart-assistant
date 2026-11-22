@@ -942,4 +942,71 @@ describe('Wave 4A Group 4: Swarm command end-to-end (commercial router -> contai
       rmSync(agyRoot, { recursive: true, force: true })
     }
   })
+
+  it('omits taskboard source when taskboard is disabled via option or OC_TASKBOARD_ENABLED=0 (zero container probe / SOURCE_UNAVAILABLE noise)', async () => {
+    let listCalls = 0
+    let transitionCalls = 0
+    const throwingBackend = {
+      async listWaitingHuman() {
+        listCalls += 1
+        throw new Error('sleeping container should never be probed when taskboard is disabled')
+      },
+      async getTicket() {
+        throw new Error('getTicket should never be called when taskboard is disabled')
+      },
+      async transitionTicket() {
+        transitionCalls += 1
+        throw new Error('transitionTicket should never be called when taskboard is disabled')
+      },
+    }
+
+    const runtimeDisabledProp = createCommercialPendingDecisionsRuntime({
+      pool: { query: async () => ({ rows: [], rowCount: 0 }) } as unknown as Pool,
+      onControlAdmitted: () => {},
+      taskboardEnabled: false,
+      taskboardBackend: throwingBackend,
+      browserHandoffStore: new InMemoryBrowserHandoffStore(),
+      verifyAccountActive: async () => true,
+    })
+    try {
+      const listed = await runtimeDisabledProp.service.list('42')
+      assert.equal(listed.items.length, 0)
+      assert.equal(listed.warnings, undefined)
+      assert.equal(listCalls, 0)
+
+      await assert.rejects(
+        () =>
+          runtimeDisabledProp.service.resolve('42', 'taskboard:tkt-1@v1', {
+            decision: 'approve',
+          }),
+        (err: unknown) => (err as { code?: string })?.code === 'SOURCE_UNAVAILABLE',
+      )
+      assert.equal(transitionCalls, 0)
+    } finally {
+      runtimeDisabledProp.dispose()
+    }
+
+    const prevEnv = process.env.OC_TASKBOARD_ENABLED
+    process.env.OC_TASKBOARD_ENABLED = '0'
+    try {
+      const runtimeDisabledEnv = createCommercialPendingDecisionsRuntime({
+        pool: { query: async () => ({ rows: [], rowCount: 0 }) } as unknown as Pool,
+        onControlAdmitted: () => {},
+        taskboardBackend: throwingBackend,
+        browserHandoffStore: new InMemoryBrowserHandoffStore(),
+        verifyAccountActive: async () => true,
+      })
+      try {
+        const listed = await runtimeDisabledEnv.service.list('42')
+        assert.equal(listed.items.length, 0)
+        assert.equal(listed.warnings, undefined)
+        assert.equal(listCalls, 0)
+      } finally {
+        runtimeDisabledEnv.dispose()
+      }
+    } finally {
+      if (prevEnv === undefined) delete process.env.OC_TASKBOARD_ENABLED
+      else process.env.OC_TASKBOARD_ENABLED = prevEnv
+    }
+  })
 })

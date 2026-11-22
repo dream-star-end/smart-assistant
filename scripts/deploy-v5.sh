@@ -2970,6 +2970,7 @@ TRUSTED_LEGACY_EGRESS_SOURCE_COMMIT=""
 TRUSTED_LEGACY_EGRESS_ARTIFACT_SHA256=""
 
 source "$SCRIPT_DIR/lib/v5-release-artifacts.sh"
+source "$SCRIPT_DIR/lib/v5-commercial-gate-cache.sh"
 
 # ══════════ 部署与 CI 绿的机械绑定(2026-07-26;审计 9)══════════
 # 背景:`grep -n "gh run|gh api|check-runs|conclusion" scripts/deploy-v5.sh` 此前**零命中** ——
@@ -3659,215 +3660,504 @@ build_release() {
       else
         echo '  lock 变化/无基线 → npm ci' >&2; cd '$staging' && npm ci --no-audit --no-fund >/dev/null 2>&1
       fi"; then echo "✗ node_modules 准备失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
-  # OCV5-121: real isolated PG/SQLite/HTTP journeys on this exact pinned source.
-  # The proof needs the hermetic test PostgreSQL fixture (127.0.0.1:55432, octest) which
-  # only exists on the deploy host — production has no test PG, so on 2026-09-07 the first
-  # --egress ship of 2d9b482ed died on ECONNREFUSED 127.0.0.1:55432 inside the remote
-  # staging tree (live untouched). Run it here from REPO_ROOT, fail-closed when HEAD is
-  # not the pinned sha (assert_clean_source_tree already proved the tree equals HEAD).
-  # The runner owns its hard deadline and cleanup; failure cannot publish a candidate.
+  # OCV5-121 / OCV5-380 / OCV5-376 / OCV5-763 / Box / Remote staging gates + Web official build.
+  # OCV5-808: keep every single pinned proof intact (fail-closed) while eliminating the 32-min
+  # serial bottleneck via:
+  #   1) host-local input-digest gate receipts (v5-commercial-local-gate-cache.py, fail-open to run);
+  #   2) per-build isolated TMPDIR on both controller & KL_HOST (eliminates bloated /tmp/tsx-0 scans);
+  #   3) cross-host & bounded local concurrency:
+  #      - Lane A (KL_HOST): web official build (with warm .tsbuildinfo seed/save) or dist reuse;
+  #      - Lane B (KL_HOST): 11 remote staging proofs (bounded 3-way parallel);
+  #      - Lane C (controller): 5 local no-DB proofs (bounded 3-way parallel);
+  #      - Lane D (controller): box_cand git archive + npm ci (only when any box gate misses) +
+  #                             4 no-DB box/codex/grok proofs (2-way parallel);
+  #      - Lane E (controller): DB-backed proofs serialized (queued-consumer -> master-incident-proofs
+  #                             -> wait box_prep -> box-success-recovery -> box-incident-proofs -> box-longtask).
+  # Every background job is reaped before any cleanup or final release publication.
   if [[ "$(git -C "$REPO_ROOT" rev-parse HEAD)" != "$full_sha" ]]; then
     echo "✗ pinned queued-consumer proof: REPO_ROOT HEAD != pinned $full_sha" >&2
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
-  if ! (cd "$REPO_ROOT" && TEST_DATABASE_URL="${OC_V5_PROOF_TEST_DATABASE_URL:-postgres://test:test@127.0.0.1:55432/openclaude_test}" \
-        npx --no-install tsx scripts/check-v5-queued-consumer.ts); then
-    echo "✗ pinned queued-consumer hermetic proof failed" >&2
+  # Unconditionally verify pinned @openclaude/* workspace realpaths on both controller
+  # and remote staging (~50ms) before any receipt hit can skip behavioral proofs, and
+  # tighten newly extracted staging dirs (git archive may unpack 0775) so root
+  # tsbuildinfo seeding/saving passes strict non-group-writable ancestor checks.
+  if ! commercial_verify_pinned_workspaces_local "$REPO_ROOT"; then
+    echo "✗ pinned controller workspace identity check failed" >&2
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
-  # OCV5-380: master-side incidents that came with the selfhost merge (alert inbox fallback, inbox
-  # delivery key, project output assets, PROJECT.md seed). Each named regression case must pass on
-  # this pinned tree; the alert cases run on the same hermetic test PostgreSQL.
-  if ! (cd "$REPO_ROOT" && TEST_DATABASE_URL="${OC_V5_PROOF_TEST_DATABASE_URL:-postgres://test:test@127.0.0.1:55432/openclaude_test}" \
-        npx --no-install tsx scripts/check-v5-master-incident-proofs.ts); then
-    echo "✗ pinned master incident proofs failed" >&2
+  if ! commercial_verify_pinned_workspaces_remote "$staging"; then
+    echo "✗ pinned remote staging workspace identity check failed" >&2
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
-  # OCV5-376 historical INC closure proofs (seed hash pin + lazy tool-body retry).
-  if ! (cd "$REPO_ROOT" && \
-        npx --no-install tsx scripts/check-v5-ocv5-376-platform-tool-proofs.ts); then
-    echo "✗ pinned OCV5-376 platform/tool proofs failed" >&2
+  ssh "$KL_HOST" "chmod go-w '$staging' '$staging/packages' '$staging/packages/web-react' 2>/dev/null || true"
+
+  local build_gates_t0 build_tmp="" remote_tmp="" remote_node_ver="" box_cand=""
+  local -a bg_pids=() bg_names=() bg_logs=()
+  local lane_failed=0 bg_i bg_pid bg_rc
+  build_gates_t0="$(date +%s)"
+  build_tmp="$(mktemp -d /tmp/ocv5-build-gates.XXXXXX)" || {
+    echo "✗ 无法创建本地构建门临时目录" >&2
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
-  fi
-  # OCV5-763: imported selfhost safety proofs run on this exact pinned checkout.
-  # Isolated SQLite/files/loopback only; no production credentials or billing.
-  if ! (cd "$REPO_ROOT" && npx --no-install tsx scripts/check-v5-system-approval-proofs.ts); then
-    echo "✗ pinned system-approval-proofs failed" >&2
+  }
+  chmod 0700 "$build_tmp"
+  BUILD_RELEASE_ACTIVE_TMPDIR="$build_tmp"
+  BUILD_RELEASE_ACTIVE_BOX_CAND=""
+  BUILD_RELEASE_ACTIVE_PIDS=()
+  remote_tmp="$(ssh "$KL_HOST" "d=\$(mktemp -d /tmp/ocv5-remote-gates.XXXXXX) && chmod 0700 \"\$d\" && printf '%s' \"\$d\"")" || {
+    echo "✗ 无法创建远端构建门临时目录" >&2
+    rm -rf "$build_tmp"
+    BUILD_RELEASE_ACTIVE_TMPDIR=""
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
-  fi
-  if ! (cd "$REPO_ROOT" && npx --no-install tsx scripts/check-v5-prompt-privacy-proofs.ts); then
-    echo "✗ pinned prompt-privacy-proofs failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  if ! (cd "$REPO_ROOT" && npx --no-install tsx scripts/check-v5-system-executor-proofs.ts); then
-    echo "✗ pinned system-executor-proofs failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  if ! (cd "$REPO_ROOT" && npx --no-install tsx scripts/check-v5-upload-retention-proof.ts); then
-    echo "✗ pinned upload-retention-proof failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  # Phase A writer / Phase B reader must choose the same physical billing
-  # anchor across format-2/3 and rolling batching-flag skew. Run from the exact
-  # pinned staging tree, not the shared checkout.
-  if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-lossless-anchor-contract.ts"; then
-    echo "✗ pinned lossless anchor contract gate failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-visible-orphan-liveness.ts"; then
-    echo "✗ pinned visible-orphan liveness gate failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-cursor-sand-inference.ts"; then
-    echo "✗ pinned Cursor Sand InferenceService contract gate failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-ccb-mcp-availability.ts"; then
-    echo "✗ pinned CCB MCP availability contract gate failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-delegate-billing-requestid.ts"; then
-    echo "✗ pinned delegate engine billing requestId contract gate failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  if ! ssh "$KL_HOST" "set -e; cd '$staging' && node scripts/check-v5-callback-payload-hash.mjs"; then
-    echo "✗ pinned callback payload hash WS proof failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-cron-submit-boundary.ts"; then
-    echo "✗ pinned cron submit durability boundary gate failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-session-unavailable-rootfix.ts"; then
-    echo "✗ pinned session-unavailable rootfix contract gate failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
+  }
+  remote_node_ver="$(ssh "$KL_HOST" "node --version 2>/dev/null || true" | tr -d '[:space:]')"
+  commercial_gate_cache_prepare "$full_sha" "$build_tmp" "$remote_node_ver"
+
+  _build_cleanup() {
+    local rm_staging="${1:-0}" p
+    if (( ${#bg_pids[@]} > 0 )); then
+      commercial_kill_pid_tree "${bg_pids[@]}"
+    fi
+    for p in "${bg_pids[@]}"; do
+      wait "$p" 2>/dev/null || true
+    done
+    bg_pids=(); bg_names=(); bg_logs=()
+    BUILD_RELEASE_ACTIVE_PIDS=()
+    [[ -n "$box_cand" && -d "$box_cand" ]] && rm -rf "$box_cand"
+    BUILD_RELEASE_ACTIVE_BOX_CAND=""
+    [[ -n "$build_tmp" && -d "$build_tmp" ]] && rm -rf "$build_tmp"
+    BUILD_RELEASE_ACTIVE_TMPDIR=""
+    [[ -n "$remote_tmp" ]] && ssh "$KL_HOST" "rm -rf '$remote_tmp'" 2>/dev/null || true
+    if [[ "$rm_staging" == 1 ]]; then
+      ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null || true
+    fi
+  }
+
+  # Pre-check cache hits in parent shell so background lanes never race plan reads.
+  local -A gate_hit=()
+  local g_id hit_count=0 total_gates=0
+  for g_id in \
+    queued-consumer master-incident-proofs \
+    ocv5-376-platform-tool-proofs system-approval-fencing prompt-privacy-lifecycle \
+    system-executor-fencing upload-retention-http \
+    lossless-anchor-contract visible-orphan-liveness cursor-sand-inference \
+    ccb-mcp-availability delegate-billing-requestid callback-payload-hash \
+    cron-submit-boundary session-unavailable-rootfix taskboard-commercial-gate \
+    codex-chatgpt-ws advisor-1m-dup-picker \
+    box-success-recovery box-continuation codex-late-stop-closure \
+    box-incident-proofs box-terminal-unproven grok-cli-compatibility box-longtask; do
+    total_gates=$((total_gates + 1))
+    if commercial_gate_cache_has "$g_id" "$full_sha"; then
+      gate_hit["$g_id"]=1
+      hit_count=$((hit_count + 1))
+    else
+      gate_hit["$g_id"]=0
+    fi
+  done
+
+  local need_box_cand=0 need_box_db=0
+  for g_id in box-success-recovery box-continuation codex-late-stop-closure \
+    box-incident-proofs box-terminal-unproven grok-cli-compatibility box-longtask; do
+    [[ "${gate_hit[$g_id]}" == 0 ]] && need_box_cand=1
+  done
+  for g_id in box-success-recovery box-incident-proofs box-longtask; do
+    [[ "${gate_hit[$g_id]}" == 0 ]] && need_box_db=1
+  done
+
   # KL has no 127.0.0.1:55432. Do not ssh this probe and do not read
   # DATABASE_URL. Commercial does not assume the controller fixture.
   # The candidate is a git archive of full_sha; the gate hashes that tree.
   # Do not write flavor.manifest.json and do not borrow checkout/donor deps.
-  box_dsn="${OC_V5_PROOF_TEST_DATABASE_URL:-${TEST_DATABASE_URL:-}}"
-  if [[ -z "$box_dsn" ]]; then
+  local box_dsn="${OC_V5_PROOF_TEST_DATABASE_URL:-${TEST_DATABASE_URL:-}}"
+  if [[ "$need_box_db" == 1 && -z "$box_dsn" ]]; then
     echo "✗ box success recovery: explicit test DSN required (OC_V5_PROOF_TEST_DATABASE_URL or TEST_DATABASE_URL); no commercial default fixture" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    _build_cleanup 1
     return 1
   fi
-  box_cand="$(mktemp -d /tmp/ocv5-box-success-cand.XXXXXX)"
-  if ! git -C "$REPO_ROOT" archive --format=tar "$full_sha" | tar -x -C "$box_cand"; then
-    echo "✗ box success recovery: git archive $full_sha failed" >&2
-    rm -rf "$box_cand"
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  if ! timeout 900 npm --prefix "$box_cand" ci --ignore-scripts --no-audit --no-fund; then
-    echo "✗ box success recovery: npm ci inside the frozen archive failed; refusing the checkout and donor node_modules" >&2
-    rm -rf "$box_cand"
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH \
-      TEST_DATABASE_URL="$box_dsn" \
-      npx --no-install tsx scripts/check-v5-box-success-recovery.ts --candidate-sha "$full_sha"); then
-    echo "✗ pinned box success recovery behavioral gate failed" >&2
-    rm -rf "$box_cand"
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
-      npx --no-install tsx scripts/check-v5-box-continuation.ts --expect-sha "$full_sha"); then
-    echo "✗ pinned box multitool continuation gate failed" >&2
-    rm -rf "$box_cand"
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  # Real remote relay + UID-local ToolHost, rebuilt only from this pinned archive.
-  if ! (cd "$box_cand" && bash scripts/check-v5-codex-late-stop-proof.sh); then
-    echo "✗ pinned Codex late-stop closure proof failed" >&2
-    rm -rf "$box_cand"
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  # check-v5-box-incident-proofs.ts stays named here so the deploy-gate ledger
-  # still sees it. The runner transpiles that file once before main()'s 120s
-  # deadline. Do not switch this back to npx tsx and do not raise LIMIT_MS.
-  if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH \
-      TEST_DATABASE_URL="$box_dsn" \
-      node scripts/run-v5-box-incident-proofs.mjs --expect-sha "$full_sha"); then
-    echo "✗ pinned box incident proofs gate failed" >&2
-    rm -rf "$box_cand"
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
-      npx --no-install tsx scripts/check-v5-box-terminal-unproven-probe.ts); then
-    echo "✗ pinned box terminal-unproven liveness probe failed" >&2
-    rm -rf "$box_cand"; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1
-  fi
-  if ! (cd "$box_cand" && timeout 126 env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
-      -u OC_V5_PROOF_TEST_DATABASE_URL \
-      npx --no-install tsx scripts/check-v5-grok-cli-compatibility.ts --candidate-sha "$full_sha"); then
-    echo "✗ pinned Grok CLI compatibility gate (INC-20261001-GROK-CLI-426) failed" >&2
-    rm -rf "$box_cand"
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL -u OCV5_289_JOURNAL_TEST_DATABASE_URL \
-      TEST_DATABASE_URL="$box_dsn" \
-      npx --no-install tsx scripts/check-v5-box-longtask.ts --expect-sha "$full_sha"); then
-    echo "✗ pinned box long-task generations gate failed" >&2
-    rm -rf "$box_cand"
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  rm -rf "$box_cand"
-  if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-taskboard-commercial-gate.ts"; then
-    echo "✗ pinned taskboard commercial gate (OC_TASKBOARD_ENABLED=0 / empty-board digest) failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-codex-chatgpt-ws.ts"; then
-    echo "✗ pinned Codex ChatGPT websocket hang gate (INC-20260915-CODEX-CHATGPT-WS) failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-advisor-1m-dup-picker.ts"; then
-    echo "✗ pinned advisor 1M twin picker gate (INC-20260915-ADVISOR-1M-DUP-PICKER) failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
-  fi
-  # dist:--with-dist 时**在 staging(archive pinned 源)上跑官方 workspace build**
-  # (`tsc -b && vite build`;R2#2:不从共用工作树构建,
-  # 彻底消 dist 与 archive 不同源);否则硬链继承当前 release 的 dist(前端未变)。两路 DIST_BUILD_ID
-  # 都从 staging 读。
+
+  # Decide web dist reuse in parent shell so DIST_REUSE_* globals stay populated here.
   DIST_REUSE_FROM=""; DIST_REUSE_OLD_SHA=""; DIST_REUSE_PATHS=""
+  local web_needs_build=0
   if [[ "$WITH_DIST" == 1 ]]; then
     echo "── web official build @ staging(pinned $short_sha,不读共用工作树)──" >&2
     if try_reuse_web_dist "$staging" "$cur" "$full_sha"; then
       echo "  ✓ with-dist 复用旧 dist(证据:git diff-tree 无差异 + .complete + dist 存在;来自 $DIST_REUSE_FROM)" >&2
-    elif ! ssh "$KL_HOST" "set -e; cd '$staging' && VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages/web-react >/dev/null 2>&1"; then
-      echo "✗ staging web official build 失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
+    else
+      commercial_seed_remote_frontend_buildinfo "$staging" "$cur"
+      web_needs_build=1
+    fi
   else
     if ! ssh "$KL_HOST" "set -e
         [ -n '$cur' ] && [ -d '$cur/packages/web-react/dist' ] || { echo '✗ 当前 release 无 dist 可继承' >&2; exit 1; }
         mkdir -p '$staging/packages/web-react'; rm -rf '$staging/packages/web-react/dist'; cp -al '$cur/packages/web-react/dist' '$staging/packages/web-react/dist'"; then
-      echo "✗ dist 继承失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
+      echo "✗ dist 继承失败" >&2
+      _build_cleanup 1
+      return 1
+    fi
   fi
+
+  local proof_parallel="${OC_V5_BUILD_GATES_PARALLEL:-1}"
+  mkdir -p "$build_tmp/passed"
+
+  # Prepare box_cand path in parent so _build_cleanup always knows its path.
+  if [[ "$need_box_cand" == 1 ]]; then
+    box_cand="$(mktemp -d /tmp/ocv5-box-success-cand.XXXXXX)" || {
+      echo "✗ box success recovery: mktemp failed" >&2
+      _build_cleanup 1
+      return 1
+    }
+    BUILD_RELEASE_ACTIVE_BOX_CAND="$box_cand"
+  fi
+
+  _run_lane_web_build() {
+    if [[ "$web_needs_build" == 1 ]]; then
+      if ! ssh "$KL_HOST" "set -e; cd '$staging' && VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages/web-react >/dev/null 2>&1"; then
+        echo "✗ staging web official build 失败" >&2
+        return 1
+      fi
+      commercial_save_remote_frontend_buildinfo "$staging"
+    fi
+  }
+
+  _run_lane_remote_proofs() {
+    local -a rpids=() rnames=() rlogs=()
+    local max_jobs=3 rfail=0 idx rp rrc
+    [[ "$proof_parallel" == 1 ]] || max_jobs=1
+    [[ "$proof_parallel" == 1 ]] && trap '(( ${#rpids[@]} > 0 )) && commercial_kill_pid_tree "${rpids[@]}"; wait; exit 143' TERM INT
+    _wait_slot_remote() {
+      while (( ${#rpids[@]} >= max_jobs )); do
+        if ! wait "${rpids[0]}"; then rfail=1; fi
+        cat -- "${rlogs[0]}" >&2 || true
+        rpids=("${rpids[@]:1}"); rnames=("${rnames[@]:1}"); rlogs=("${rlogs[@]:1}")
+      done
+    }
+    _spawn_remote() {
+      local gid="$1" err_msg="$2" cmd="$3"
+      local lfile="$build_tmp/remote.${gid}.log"
+      [[ "${gate_hit[$gid]}" == 0 ]] || return 0
+      _wait_slot_remote
+      [[ "$rfail" == 0 ]] || return 1
+      (
+        set -e
+        if ssh "$KL_HOST" "set -e; export TMPDIR='$remote_tmp/$gid'; mkdir -p \"\$TMPDIR\"; $cmd"; then
+          : > "$build_tmp/passed/$gid"
+        else
+          echo "$err_msg" >&2
+          exit 1
+        fi
+      ) >"$lfile" 2>&1 &
+      rpids+=("$!"); rnames+=("$gid"); rlogs+=("$lfile")
+    }
+    # Phase A writer / Phase B reader must choose the same physical billing anchor across
+    # format-2/3 and rolling batching-flag skew. Keep exact literal command for safety tests.
+    _spawn_remote "lossless-anchor-contract" \
+      "✗ pinned lossless anchor contract gate failed" \
+      "cd '$staging' && npx --no-install tsx scripts/check-v5-lossless-anchor-contract.ts" || rfail=1
+    _spawn_remote "visible-orphan-liveness" \
+      "✗ pinned visible-orphan liveness gate failed" \
+      "cd '$staging' && npx --no-install tsx scripts/check-v5-visible-orphan-liveness.ts" || rfail=1
+    _spawn_remote "cursor-sand-inference" \
+      "✗ pinned Cursor Sand InferenceService contract gate failed" \
+      "cd '$staging' && npx --no-install tsx scripts/check-v5-cursor-sand-inference.ts" || rfail=1
+    _spawn_remote "ccb-mcp-availability" \
+      "✗ pinned CCB MCP availability contract gate failed" \
+      "cd '$staging' && npx --no-install tsx scripts/check-v5-ccb-mcp-availability.ts" || rfail=1
+    _spawn_remote "delegate-billing-requestid" \
+      "✗ pinned delegate engine billing requestId contract gate failed" \
+      "cd '$staging' && npx --no-install tsx scripts/check-v5-delegate-billing-requestid.ts" || rfail=1
+    _spawn_remote "callback-payload-hash" \
+      "✗ pinned callback payload hash WS proof failed" \
+      "cd '$staging' && node scripts/check-v5-callback-payload-hash.mjs" || rfail=1
+    _spawn_remote "cron-submit-boundary" \
+      "✗ pinned cron submit durability boundary gate failed" \
+      "cd '$staging' && npx --no-install tsx scripts/check-v5-cron-submit-boundary.ts" || rfail=1
+    _spawn_remote "session-unavailable-rootfix" \
+      "✗ pinned session-unavailable rootfix contract gate failed" \
+      "cd '$staging' && npx --no-install tsx scripts/check-v5-session-unavailable-rootfix.ts" || rfail=1
+    _spawn_remote "taskboard-commercial-gate" \
+      "✗ pinned taskboard commercial gate (OC_TASKBOARD_ENABLED=0 / empty-board digest) failed" \
+      "cd '$staging' && npx --no-install tsx scripts/check-v5-taskboard-commercial-gate.ts" || rfail=1
+    _spawn_remote "codex-chatgpt-ws" \
+      "✗ pinned Codex ChatGPT websocket hang gate (INC-20260915-CODEX-CHATGPT-WS) failed" \
+      "cd '$staging' && npx --no-install tsx scripts/check-v5-codex-chatgpt-ws.ts" || rfail=1
+    _spawn_remote "advisor-1m-dup-picker" \
+      "✗ pinned advisor 1M twin picker gate (INC-20260915-ADVISOR-1M-DUP-PICKER) failed" \
+      "cd '$staging' && npx --no-install tsx scripts/check-v5-advisor-1m-dup-picker.ts" || rfail=1
+    for idx in "${!rpids[@]}"; do
+      rrc=0; wait "${rpids[$idx]}" || rrc=$?
+      cat -- "${rlogs[$idx]}" >&2 || true
+      [[ "$rrc" == 0 ]] || rfail=1
+    done
+    return "$rfail"
+  }
+
+  _run_lane_local_nodb() {
+    local -a lpids=() llogs=()
+    local max_jobs=3 lfail=0 idx lrc
+    [[ "$proof_parallel" == 1 ]] || max_jobs=1
+    [[ "$proof_parallel" == 1 ]] && trap '(( ${#lpids[@]} > 0 )) && commercial_kill_pid_tree "${lpids[@]}"; wait; exit 143' TERM INT
+    _wait_slot_local() {
+      while (( ${#lpids[@]} >= max_jobs )); do
+        if ! wait "${lpids[0]}"; then lfail=1; fi
+        cat -- "${llogs[0]}" >&2 || true
+        lpids=("${lpids[@]:1}"); llogs=("${llogs[@]:1}")
+      done
+    }
+    _spawn_local() {
+      local gid="$1" err_msg="$2" script_rel="$3"
+      local lfile="$build_tmp/local.${gid}.log" ltmp="$build_tmp/tmp.${gid}"
+      [[ "${gate_hit[$gid]}" == 0 ]] || return 0
+      _wait_slot_local
+      [[ "$lfail" == 0 ]] || return 1
+      mkdir -p "$ltmp"
+      (
+        set -e
+        if (cd "$REPO_ROOT" && TMPDIR="$ltmp" npx --no-install tsx "$script_rel"); then
+          : > "$build_tmp/passed/$gid"
+        else
+          echo "$err_msg" >&2
+          exit 1
+        fi
+      ) >"$lfile" 2>&1 &
+      lpids+=("$!"); llogs+=("$lfile")
+    }
+    _spawn_local "ocv5-376-platform-tool-proofs" \
+      "✗ pinned OCV5-376 platform/tool proofs failed" \
+      "scripts/check-v5-ocv5-376-platform-tool-proofs.ts" || lfail=1
+    _spawn_local "system-approval-fencing" \
+      "✗ pinned system-approval-proofs failed" \
+      "scripts/check-v5-system-approval-proofs.ts" || lfail=1
+    _spawn_local "prompt-privacy-lifecycle" \
+      "✗ pinned prompt-privacy-proofs failed" \
+      "scripts/check-v5-prompt-privacy-proofs.ts" || lfail=1
+    _spawn_local "system-executor-fencing" \
+      "✗ pinned system-executor-proofs failed" \
+      "scripts/check-v5-system-executor-proofs.ts" || lfail=1
+    _spawn_local "upload-retention-http" \
+      "✗ pinned upload-retention-proof failed" \
+      "scripts/check-v5-upload-retention-proof.ts" || lfail=1
+    for idx in "${!lpids[@]}"; do
+      lrc=0; wait "${lpids[$idx]}" || lrc=$?
+      cat -- "${llogs[$idx]}" >&2 || true
+      [[ "$lrc" == 0 ]] || lfail=1
+    done
+    return "$lfail"
+  }
+
+  _run_box_prep() {
+    [[ "$need_box_cand" == 1 ]] || return 0
+    if ! git -C "$REPO_ROOT" archive --format=tar "$full_sha" | tar -x -C "$box_cand"; then
+      echo "✗ box success recovery: git archive $full_sha failed" >&2
+      return 1
+    fi
+    if ! timeout 900 npm --prefix "$box_cand" ci --ignore-scripts --no-audit --no-fund; then
+      echo "✗ box success recovery: npm ci inside the frozen archive failed; refusing the checkout and donor node_modules" >&2
+      return 1
+    fi
+    : > "$build_tmp/box-prep.ok"
+  }
+
+  _run_lane_box_nodb() {
+    [[ "$need_box_cand" == 1 ]] || return 0
+    # Wait for box_prep signal file written after box_prep completes.
+    local waited=0
+    while [[ ! -f "$build_tmp/box-prep.ok" && ! -f "$build_tmp/box-prep.fail" ]]; do
+      sleep 1
+      waited=$((waited + 1))
+      if (( waited > 960 )); then
+        echo "✗ box_cand preparation wait timed out" >&2
+        return 1
+      fi
+    done
+    [[ -f "$build_tmp/box-prep.ok" ]] || return 1
+    local -a bpids=() blogs=()
+    local max_jobs=2 bfail=0 idx brc
+    [[ "$proof_parallel" == 1 ]] || max_jobs=1
+    [[ "$proof_parallel" == 1 ]] && trap '(( ${#bpids[@]} > 0 )) && commercial_kill_pid_tree "${bpids[@]}"; wait; exit 143' TERM INT
+    _wait_slot_box() {
+      while (( ${#bpids[@]} >= max_jobs )); do
+        if ! wait "${bpids[0]}"; then bfail=1; fi
+        cat -- "${blogs[0]}" >&2 || true
+        bpids=("${bpids[@]:1}"); blogs=("${blogs[@]:1}")
+      done
+    }
+    _spawn_box() {
+      local gid="$1" err_msg="$2"; shift 2
+      local lfile="$build_tmp/box.${gid}.log" btmp="$build_tmp/tmp.${gid}"
+      [[ "${gate_hit[$gid]}" == 0 ]] || return 0
+      _wait_slot_box
+      [[ "$bfail" == 0 ]] || return 1
+      mkdir -p "$btmp"
+      (
+        set -e
+        if (cd "$box_cand" && TMPDIR="$btmp" "$@"); then
+          : > "$build_tmp/passed/$gid"
+        else
+          echo "$err_msg" >&2
+          exit 1
+        fi
+      ) >"$lfile" 2>&1 &
+      bpids+=("$!"); blogs+=("$lfile")
+    }
+    _spawn_box "box-continuation" \
+      "✗ pinned box multitool continuation gate failed" \
+      env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-box-continuation.ts --expect-sha "$full_sha" || bfail=1
+    # Real remote relay + UID-local ToolHost, rebuilt only from this pinned archive.
+    _spawn_box "codex-late-stop-closure" \
+      "✗ pinned Codex late-stop closure proof failed" \
+      bash scripts/check-v5-codex-late-stop-proof.sh || bfail=1
+    _spawn_box "box-terminal-unproven" \
+      "✗ pinned box terminal-unproven liveness probe failed" \
+      env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-box-terminal-unproven-probe.ts || bfail=1
+    _spawn_box "grok-cli-compatibility" \
+      "✗ pinned Grok CLI compatibility gate (INC-20261001-GROK-CLI-426) failed" \
+      timeout 126 env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
+      -u OC_V5_PROOF_TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-grok-cli-compatibility.ts --candidate-sha "$full_sha" || bfail=1
+    for idx in "${!bpids[@]}"; do
+      brc=0; wait "${bpids[$idx]}" || brc=$?
+      cat -- "${blogs[$idx]}" >&2 || true
+      [[ "$brc" == 0 ]] || bfail=1
+    done
+    return "$bfail"
+  }
+
+  _run_lane_db_serial() {
+    local dtmp
+    if [[ "${gate_hit[queued-consumer]}" == 0 ]]; then
+      dtmp="$build_tmp/tmp.queued-consumer"; mkdir -p "$dtmp"
+      if ! (cd "$REPO_ROOT" && TMPDIR="$dtmp" TEST_DATABASE_URL="${OC_V5_PROOF_TEST_DATABASE_URL:-postgres://test:test@127.0.0.1:55432/openclaude_test}" \
+            npx --no-install tsx scripts/check-v5-queued-consumer.ts); then
+        echo "✗ pinned queued-consumer hermetic proof failed" >&2
+        return 1
+      fi
+      : > "$build_tmp/passed/queued-consumer"
+    fi
+    if [[ "${gate_hit[master-incident-proofs]}" == 0 ]]; then
+      if ! (cd "$REPO_ROOT" && TEST_DATABASE_URL="${OC_V5_PROOF_TEST_DATABASE_URL:-postgres://test:test@127.0.0.1:55432/openclaude_test}" \
+            npx --no-install tsx scripts/check-v5-master-incident-proofs.ts); then
+        echo "✗ pinned master incident proofs failed" >&2
+        return 1
+      fi
+      : > "$build_tmp/passed/master-incident-proofs"
+    fi
+    if [[ "$need_box_db" == 1 ]]; then
+      local waited=0
+      while [[ ! -f "$build_tmp/box-prep.ok" && ! -f "$build_tmp/box-prep.fail" ]]; do
+        sleep 1
+        waited=$((waited + 1))
+        if (( waited > 960 )); then
+          echo "✗ box_cand preparation wait timed out (DB lane)" >&2
+          return 1
+        fi
+      done
+      [[ -f "$build_tmp/box-prep.ok" ]] || return 1
+      if [[ "${gate_hit[box-success-recovery]}" == 0 ]]; then
+        dtmp="$build_tmp/tmp.box-success-recovery"; mkdir -p "$dtmp"
+        if ! (cd "$box_cand" && TMPDIR="$dtmp" env -u NODE_OPTIONS -u NODE_PATH \
+            TEST_DATABASE_URL="$box_dsn" \
+            npx --no-install tsx scripts/check-v5-box-success-recovery.ts --candidate-sha "$full_sha"); then
+          echo "✗ pinned box success recovery behavioral gate failed" >&2
+          return 1
+        fi
+        : > "$build_tmp/passed/box-success-recovery"
+      fi
+      # check-v5-box-incident-proofs.ts stays named here so the deploy-gate ledger
+      # still sees it. The runner transpiles that file once before main()'s 120s
+      # deadline. Do not switch this back to npx tsx and do not raise LIMIT_MS.
+      if [[ "${gate_hit[box-incident-proofs]}" == 0 ]]; then
+        dtmp="$build_tmp/tmp.box-incident-proofs"; mkdir -p "$dtmp"
+        if ! (cd "$box_cand" && TMPDIR="$dtmp" env -u NODE_OPTIONS -u NODE_PATH \
+            TEST_DATABASE_URL="$box_dsn" \
+            node scripts/run-v5-box-incident-proofs.mjs --expect-sha "$full_sha"); then
+          echo "✗ pinned box incident proofs gate failed" >&2
+          return 1
+        fi
+        : > "$build_tmp/passed/box-incident-proofs"
+      fi
+      if [[ "${gate_hit[box-longtask]}" == 0 ]]; then
+        dtmp="$build_tmp/tmp.box-longtask"; mkdir -p "$dtmp"
+        if ! (cd "$box_cand" && TMPDIR="$dtmp" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL -u OCV5_289_JOURNAL_TEST_DATABASE_URL \
+            TEST_DATABASE_URL="$box_dsn" \
+            npx --no-install tsx scripts/check-v5-box-longtask.ts --expect-sha "$full_sha"); then
+          echo "✗ pinned box long-task generations gate failed" >&2
+          return 1
+        fi
+        : > "$build_tmp/passed/box-longtask"
+      fi
+    fi
+  }
+
+  if [[ "$proof_parallel" == 1 ]]; then
+    echo "── 并行执行发布门与前端构建(hits=$hit_count/$total_gates, box_cand=$need_box_cand, web_build=$web_needs_build)──" >&2
+    if [[ "$need_box_cand" == 1 ]]; then
+      ( if ! _run_box_prep; then : > "$build_tmp/box-prep.fail"; exit 1; fi ) >"$build_tmp/lane.box-prep.log" 2>&1 &
+      bg_pids+=("$!"); bg_names+=("box-prep"); bg_logs+=("$build_tmp/lane.box-prep.log")
+      BUILD_RELEASE_ACTIVE_PIDS+=("$!")
+    fi
+    if [[ "$web_needs_build" == 1 ]]; then
+      ( _run_lane_web_build ) >"$build_tmp/lane.web-build.log" 2>&1 &
+      bg_pids+=("$!"); bg_names+=("web-build"); bg_logs+=("$build_tmp/lane.web-build.log")
+      BUILD_RELEASE_ACTIVE_PIDS+=("$!")
+    fi
+    ( _run_lane_remote_proofs ) >"$build_tmp/lane.remote-proofs.log" 2>&1 &
+    bg_pids+=("$!"); bg_names+=("remote-proofs"); bg_logs+=("$build_tmp/lane.remote-proofs.log")
+    BUILD_RELEASE_ACTIVE_PIDS+=("$!")
+    ( _run_lane_local_nodb ) >"$build_tmp/lane.local-nodb.log" 2>&1 &
+    bg_pids+=("$!"); bg_names+=("local-nodb"); bg_logs+=("$build_tmp/lane.local-nodb.log")
+    BUILD_RELEASE_ACTIVE_PIDS+=("$!")
+    if [[ "$need_box_cand" == 1 ]]; then
+      ( _run_lane_box_nodb ) >"$build_tmp/lane.box-nodb.log" 2>&1 &
+      bg_pids+=("$!"); bg_names+=("box-nodb"); bg_logs+=("$build_tmp/lane.box-nodb.log")
+      BUILD_RELEASE_ACTIVE_PIDS+=("$!")
+    fi
+    if ! _run_lane_db_serial; then
+      lane_failed=1
+    fi
+    for bg_i in "${!bg_pids[@]}"; do
+      bg_pid="${bg_pids[$bg_i]}"
+      bg_rc=0; wait "$bg_pid" || bg_rc=$?
+      if [[ -s "${bg_logs[$bg_i]}" ]]; then
+        cat -- "${bg_logs[$bg_i]}" >&2 || true
+      fi
+      if [[ "$bg_rc" != 0 ]]; then
+        echo "✗ 并行发布轨道失败: ${bg_names[$bg_i]} (rc=$bg_rc)" >&2
+        lane_failed=1
+      fi
+    done
+    bg_pids=(); bg_names=(); bg_logs=()
+    BUILD_RELEASE_ACTIVE_PIDS=()
+  else
+    if ! _run_box_prep; then : > "$build_tmp/box-prep.fail"; lane_failed=1; fi
+    [[ "$lane_failed" == 0 ]] && { _run_lane_db_serial || lane_failed=1; }
+    [[ "$lane_failed" == 0 ]] && { _run_lane_local_nodb || lane_failed=1; }
+    [[ "$lane_failed" == 0 ]] && { _run_lane_remote_proofs || lane_failed=1; }
+    [[ "$lane_failed" == 0 ]] && { _run_lane_box_nodb || lane_failed=1; }
+    [[ "$lane_failed" == 0 ]] && { _run_lane_web_build || lane_failed=1; }
+  fi
+
+  if [[ "$lane_failed" != 0 ]]; then
+    _build_cleanup 1
+    return 1
+  fi
+
+  # Record receipts in parent shell only after every lane succeeded.
+  local passed_file passed_gid recorded_count=0
+  for passed_file in "$build_tmp"/passed/*; do
+    [[ -f "$passed_file" ]] || continue
+    passed_gid="$(basename -- "$passed_file")"
+    commercial_gate_cache_record "$passed_gid" "$full_sha"
+    recorded_count=$((recorded_count + 1))
+  done
+  echo "  ✓ 发布门与前端构建完成(elapsed=$(( $(date +%s) - build_gates_t0 ))s, cache_hits=$hit_count/$total_gates, executed=$recorded_count)" >&2
+  _build_cleanup 0
   DIST_BUILD_ID="$(ssh "$KL_HOST" "grep -o 'name=\"oc-build\" content=\"[0-9a-f]\\{8,32\\}\"' '$staging/packages/web-react/dist/index.html' 2>/dev/null | grep -o '[0-9a-f]\\{8,32\\}' | head -1" 2>/dev/null || true)"
   [[ -n "$DIST_BUILD_ID" ]] || { echo "✗ staging dist 缺 oc-build meta" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; }
   # Core semantic recall runs in the master host process, not in a user
@@ -11112,10 +11402,35 @@ reset_mutation_lane_runtime() {
   return 0
 }
 
+BUILD_RELEASE_ACTIVE_TMPDIR=""
+BUILD_RELEASE_ACTIVE_BOX_CAND=""
+BUILD_RELEASE_ACTIVE_PIDS=()
+
+commercial_cleanup_build_locals() {
+  local p
+  if (( ${#BUILD_RELEASE_ACTIVE_PIDS[@]} > 0 )); then
+    commercial_kill_pid_tree "${BUILD_RELEASE_ACTIVE_PIDS[@]}"
+  fi
+  for p in "${BUILD_RELEASE_ACTIVE_PIDS[@]}"; do
+    wait "$p" 2>/dev/null || true
+  done
+  BUILD_RELEASE_ACTIVE_PIDS=()
+  if [[ -n "${BUILD_RELEASE_ACTIVE_BOX_CAND:-}" && -d "$BUILD_RELEASE_ACTIVE_BOX_CAND" && "$BUILD_RELEASE_ACTIVE_BOX_CAND" == /tmp/ocv5-box-success-cand.* ]]; then
+    rm -rf -- "$BUILD_RELEASE_ACTIVE_BOX_CAND" 2>/dev/null || true
+  fi
+  BUILD_RELEASE_ACTIVE_BOX_CAND=""
+  if [[ -n "${BUILD_RELEASE_ACTIVE_TMPDIR:-}" && -d "$BUILD_RELEASE_ACTIVE_TMPDIR" && "$BUILD_RELEASE_ACTIVE_TMPDIR" == /tmp/ocv5-build-gates.* ]]; then
+    rm -rf -- "$BUILD_RELEASE_ACTIVE_TMPDIR" 2>/dev/null || true
+  fi
+  BUILD_RELEASE_ACTIVE_TMPDIR=""
+}
+
 mutation_lane_payload_cleanup() {
   local rc=$?
   trap - EXIT INT TERM HUP
   set +e
+  # Reap controller-local build_release scratch work (never touches remote/production paths).
+  commercial_cleanup_build_locals
   # Payload owns PLANNED_MAINTENANCE_* state. Signal/crash/lease-loss exits skip
   # all mutation cleanup. Controlled exits may clear only that exact nonce while
   # the parent concurrently supervises the lease. The durable in-flight marker

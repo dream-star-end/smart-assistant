@@ -8,7 +8,7 @@
  * Run: npx tsx --test packages/commercial/src/__tests__/pgTimelinePerf.test.ts
  */
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -460,35 +460,48 @@ describe("sessionSnapshot O(1) 3-state pointers, bounded fallback & single-tx ba
   });
 });
 
-describe("0350 + 0351 migration split contract (B1)", () => {
-  test("0350 short DDL + trigger, 0351 -- no-transaction CONCURRENTLY indexes + preflight/postflight, rollbacks & metadata aligned", () => {
-    const mig350 = readFileSync(
-      join(here, "../db/migrations/0350_perf_timeline_and_live_snapshot.sql"),
+describe("0346/0350 + 0347/0351 migration split contract (B1)", () => {
+  test("short DDL + trigger, -- no-transaction CONCURRENTLY indexes + preflight/postflight, rollbacks & metadata aligned", () => {
+    const isCommercialLineage = existsSync(
+      join(here, "../db/migrations/0346_commercial_perf_timeline_and_live_snapshot.sql"),
+    );
+    const prevVersion = isCommercialLineage
+      ? "0345_commercial_user_site_collaborators"
+      : "0349_user_site_collaborators";
+    const ddlVersion = isCommercialLineage
+      ? "0346_commercial_perf_timeline_and_live_snapshot"
+      : "0350_perf_timeline_and_live_snapshot";
+    const idxVersion = isCommercialLineage
+      ? "0347_commercial_perf_timeline_and_live_snapshot_indexes"
+      : "0351_perf_timeline_and_live_snapshot_indexes";
+
+    const migDdl = readFileSync(
+      join(here, `../db/migrations/${ddlVersion}.sql`),
       "utf8",
     );
-    const rb350 = readFileSync(
-      join(here, "../db/rollbacks/0350_perf_timeline_and_live_snapshot.sql"),
+    const rbDdl = readFileSync(
+      join(here, `../db/rollbacks/${ddlVersion}.sql`),
       "utf8",
     );
-    const mig351 = readFileSync(
-      join(here, "../db/migrations/0351_perf_timeline_and_live_snapshot_indexes.sql"),
+    const migIdx = readFileSync(
+      join(here, `../db/migrations/${idxVersion}.sql`),
       "utf8",
     );
-    const rb351 = readFileSync(
-      join(here, "../db/rollbacks/0351_perf_timeline_and_live_snapshot_indexes.sql"),
+    const rbIdx = readFileSync(
+      join(here, `../db/rollbacks/${idxVersion}.sql`),
       "utf8",
     );
     const meta = JSON.parse(
       readFileSync(join(here, "../../../../deploy/v5/release-metadata.json"), "utf8"),
     ) as { requiredMigrations: string[] };
 
-    assert.match(mig350, /^-- order-dependency: 0349_user_site_collaborators/m);
-    assert.match(mig350, /SET LOCAL lock_timeout = '5s';/);
-    const mig350NonComments = mig350.replace(/^--.*$/gm, "");
-    assert.equal(/\bCREATE\s+(?:UNIQUE\s+)?INDEX\b/i.test(mig350NonComments), false, "B1: 0350 must NOT execute CREATE INDEX");
-    assert.equal(mig350.includes("last_dispatch_summary"), false, "B7: dropped unmaintained summary column");
-    assert.match(mig350, /trg_client_sessions_invalidate_last_preview/);
-    assert.match(rb350, /trg_client_sessions_invalidate_last_preview/);
+    assert.match(migDdl, new RegExp(`^-- order-dependency: ${prevVersion}`, "m"));
+    assert.match(migDdl, /SET LOCAL lock_timeout = '5s';/);
+    const migDdlNonComments = migDdl.replace(/^--.*$/gm, "");
+    assert.equal(/\bCREATE\s+(?:UNIQUE\s+)?INDEX\b/i.test(migDdlNonComments), false, "B1: DDL migration must NOT execute CREATE INDEX");
+    assert.equal(migDdl.includes("last_dispatch_summary"), false, "B7: dropped unmaintained summary column");
+    assert.match(migDdl, /trg_client_sessions_invalidate_last_preview/);
+    assert.match(rbDdl, /trg_client_sessions_invalidate_last_preview/);
     for (const col of [
       "payload_bytes",
       "visible_payload_bytes",
@@ -499,25 +512,41 @@ describe("0350 + 0351 migration split contract (B1)", () => {
       "latest_turn_status_seq",
       "latest_turn_usage_seq",
     ]) {
-      assert.ok(mig350.includes(col), `0350 missing ${col}`);
-      assert.ok(rb350.includes(col), `0350 rollback missing ${col}`);
+      assert.ok(migDdl.includes(col), `${ddlVersion} missing ${col}`);
+      assert.ok(rbDdl.includes(col), `${ddlVersion} rollback missing ${col}`);
     }
 
-    assert.match(mig351, /^-- no-transaction/m);
-    assert.match(mig351, /^-- order-dependency: 0350_perf_timeline_and_live_snapshot/m);
-    assert.match(mig351, /NOT\s+i\.indisvalid|indisvalid\s*=\s*false/i, "B1: preflight must fail loud on INVALID indexes");
-    assert.match(mig351, /i\.indisvalid\b/i, "B1: postflight must verify VALID indexes");
+    assert.match(migIdx, /^-- no-transaction/m);
+    assert.match(migIdx, new RegExp(`^-- order-dependency: ${ddlVersion}`, "m"));
+    assert.match(migIdx, /NOT\s+i\.indisvalid|indisvalid\s*=\s*false/i, "B1: preflight must fail loud on INVALID indexes");
+    assert.match(migIdx, /i\.indisvalid\b/i, "B1: postflight must verify VALID indexes");
     for (const idx of [
       "idx_turn_dispatches_user_session_terminal",
       "idx_turn_dispatches_user_session_open",
       "idx_live_streams_retired_updated",
       "idx_live_frames_stream_frame_seq",
     ]) {
-      assert.ok(mig351.includes(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${idx}`), `0351 missing CONCURRENTLY ${idx}`);
-      assert.ok(rb351.includes(`DROP INDEX CONCURRENTLY IF EXISTS ${idx}`), `0351 rollback missing ${idx}`);
+      assert.ok(migIdx.includes(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${idx}`), `${idxVersion} missing CONCURRENTLY ${idx}`);
+      assert.ok(rbIdx.includes(`DROP INDEX CONCURRENTLY IF EXISTS ${idx}`), `${idxVersion} rollback missing ${idx}`);
     }
 
-    assert.ok(meta.requiredMigrations.includes("0350_perf_timeline_and_live_snapshot"));
-    assert.ok(meta.requiredMigrations.includes("0351_perf_timeline_and_live_snapshot_indexes"));
+    assert.ok(meta.requiredMigrations.includes(ddlVersion));
+    assert.ok(meta.requiredMigrations.includes(idxVersion));
+
+    if (isCommercialLineage) {
+      const handoffVersion = "0348_commercial_pending_browser_handoffs";
+      const migHandoff = readFileSync(
+        join(here, `../db/migrations/${handoffVersion}.sql`),
+        "utf8",
+      );
+      const rbHandoff = readFileSync(
+        join(here, `../db/rollbacks/${handoffVersion}.sql`),
+        "utf8",
+      );
+      assert.match(migHandoff, new RegExp(`^-- order-dependency: ${idxVersion}`, "m"));
+      assert.match(migHandoff, /GRANT SELECT, INSERT, UPDATE, DELETE[\s\S]*ON TABLE pending_browser_handoffs[\s\S]*TO openclaude_app;/);
+      assert.match(rbHandoff, /DROP TABLE IF EXISTS pending_browser_handoffs;/);
+      assert.ok(meta.requiredMigrations.includes(handoffVersion));
+    }
   });
 });

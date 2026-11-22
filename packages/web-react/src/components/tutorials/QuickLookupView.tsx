@@ -49,6 +49,7 @@ import {
   type ProductFeatureId,
 } from "../../lib/productCapabilities";
 import { resolveTutorialAction } from "../../lib/tutorialActions";
+import { TASKBOARD_ENABLED } from "../../lib/taskboardFeature";
 import {
   TUTORIAL_MEDIA,
   tutorialById,
@@ -60,6 +61,7 @@ import { Badge, Button } from "../ui";
 export interface QuickLookupViewProps {
   topicId: ProductFeatureId | null;
   stepNumber?: number | null;
+  taskboardEnabled?: boolean;
   onSelectTopic: (topicId: ProductFeatureId | null) => void;
   onRunAction?: (topic: TutorialTopic) => void;
   actionState?: (topic: TutorialTopic) => {
@@ -231,6 +233,7 @@ async function copyTextSafe(text: string): Promise<boolean> {
 export function QuickLookupView({
   topicId,
   stepNumber = null,
+  taskboardEnabled = TASKBOARD_ENABLED,
   onSelectTopic,
   onRunAction,
   actionState,
@@ -238,29 +241,57 @@ export function QuickLookupView({
 }: QuickLookupViewProps): JSX.Element {
   const [query, setQuery] = useState("");
   const activeTopicId: ProductFeatureId | null =
-    topicId && isProductFeatureId(topicId) ? topicId : null;
+    topicId &&
+    isProductFeatureId(topicId) &&
+    (taskboardEnabled || topicId !== "taskboard")
+      ? topicId
+      : null;
 
   const trimmedQuery = query.trim();
 
+  const visibleCommands = useMemo(
+    () =>
+      taskboardEnabled
+        ? QUICK_COMMANDS
+        : QUICK_COMMANDS.filter((item) => item.relatedTopicId !== "taskboard"),
+    [taskboardEnabled],
+  );
+
+  const visibleFeaturedTopicIds = useMemo(
+    () =>
+      taskboardEnabled
+        ? FEATURED_TOPIC_IDS
+        : FEATURED_TOPIC_IDS.filter((id) => id !== "taskboard"),
+    [taskboardEnabled],
+  );
+
+  const visibleCapabilities = useMemo(
+    () =>
+      taskboardEnabled
+        ? PRODUCT_CAPABILITY_LIST
+        : PRODUCT_CAPABILITY_LIST.filter((feature) => feature.id !== "taskboard"),
+    [taskboardEnabled],
+  );
+
   const matchedCommands = useMemo(() => {
     if (!trimmedQuery) return [];
-    return QUICK_COMMANDS.filter((item) => commandMatches(item, trimmedQuery));
-  }, [trimmedQuery]);
+    return visibleCommands.filter((item) => commandMatches(item, trimmedQuery));
+  }, [trimmedQuery, visibleCommands]);
 
   const matchedCapabilities = useMemo(() => {
     if (!trimmedQuery) return [];
-    return PRODUCT_CAPABILITY_LIST.filter((feature) =>
+    return visibleCapabilities.filter((feature) =>
       capabilityMatches(feature, trimmedQuery),
     );
-  }, [trimmedQuery]);
+  }, [trimmedQuery, visibleCapabilities]);
 
   const groupedCapabilities = useMemo(
     () =>
       PRODUCT_FEATURE_CATEGORIES.map((group) => ({
         ...group,
-        items: PRODUCT_CAPABILITY_LIST.filter((item) => item.category === group.id),
-      })),
-    [],
+        items: visibleCapabilities.filter((item) => item.category === group.id),
+      })).filter((group) => group.items.length > 0),
+    [visibleCapabilities],
   );
 
   const handlePickTopic = (id: ProductFeatureId) => {
@@ -440,7 +471,7 @@ export function QuickLookupView({
               </div>
             </div>
             <div className="mt-3.5 grid gap-2.5 sm:grid-cols-2 lg:grid-cols-3">
-              {QUICK_COMMANDS.map((cmd) => (
+              {visibleCommands.map((cmd) => (
                 <button
                   key={cmd.id}
                   type="button"
@@ -473,7 +504,7 @@ export function QuickLookupView({
               <span className="text-caption text-faint">点击查看步骤与直达入口</span>
             </div>
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-              {FEATURED_TOPIC_IDS.map((id) => {
+              {visibleFeaturedTopicIds.map((id) => {
                 const feature = capabilityById(id);
                 const topic = tutorialById(id);
                 const Icon = FEATURE_ICONS[feature.icon] ?? Sparkles;
@@ -511,7 +542,7 @@ export function QuickLookupView({
             <div className="flex items-baseline justify-between gap-2">
               <h2 className="text-title font-semibold text-fg">全部能力索引</h2>
               <span className="text-caption tabular-nums text-faint">
-                共 {PRODUCT_CAPABILITY_LIST.length} 项能力，按分组展开查找
+                共 {visibleCapabilities.length} 项能力，按分组展开查找
               </span>
             </div>
             <div className="flex flex-col gap-2">
@@ -656,6 +687,7 @@ export function QuickLookupView({
             <TopicOperationCard
               topicId={activeTopicId}
               stepNumber={stepNumber}
+              taskboardEnabled={taskboardEnabled}
               onSelectTopic={onSelectTopic}
               onRunAction={onRunAction}
               actionState={actionState}
@@ -670,12 +702,14 @@ export function QuickLookupView({
 function TopicOperationCard({
   topicId,
   stepNumber,
+  taskboardEnabled,
   onSelectTopic,
   onRunAction,
   actionState,
 }: {
   topicId: ProductFeatureId;
   stepNumber: number | null;
+  taskboardEnabled: boolean;
   onSelectTopic: (topicId: ProductFeatureId | null) => void;
   onRunAction?: (topic: TutorialTopic) => void;
   actionState?: (topic: TutorialTopic) => {
@@ -985,35 +1019,41 @@ function TopicOperationCard({
       </section>
 
       {/* 相关能力跳转 */}
-      {topic.related.length > 0 && (
-        <section aria-label="相关能力" className="flex flex-col gap-2.5">
-          <h3 className="text-section font-semibold text-fg">接着了解</h3>
-          <div className="grid gap-2.5 sm:grid-cols-3">
-            {topic.related.map((relatedId) => {
-              const related = capabilityById(relatedId);
-              const RelatedIcon = FEATURE_ICONS[related.icon] ?? Sparkles;
-              return (
-                <button
-                  key={relatedId}
-                  type="button"
-                  onClick={() => onSelectTopic(relatedId)}
-                  className="oc-surface-card oc-surface-card-hover oc-btn-tactile group flex min-h-11 items-center gap-2.5 rounded-xl px-3.5 py-2.5 text-left text-meta font-medium text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  <span className="oc-icon-badge oc-icon-badge-accent size-7 shrink-0 rounded-lg">
-                    <RelatedIcon size={14} strokeWidth={1.75} aria-hidden />
-                  </span>
-                  <span className="min-w-0 flex-1 truncate">{related.shortTitle}</span>
-                  <ArrowRight
-                    size={13}
-                    aria-hidden
-                    className="shrink-0 text-faint transition-transform group-hover:translate-x-0.5"
-                  />
-                </button>
-              );
-            })}
-          </div>
-        </section>
-      )}
+      {(() => {
+        const visibleRelated = taskboardEnabled
+          ? topic.related
+          : topic.related.filter((relatedId) => relatedId !== "taskboard");
+        if (visibleRelated.length === 0) return null;
+        return (
+          <section aria-label="相关能力" className="flex flex-col gap-2.5">
+            <h3 className="text-section font-semibold text-fg">接着了解</h3>
+            <div className="grid gap-2.5 sm:grid-cols-3">
+              {visibleRelated.map((relatedId) => {
+                const related = capabilityById(relatedId);
+                const RelatedIcon = FEATURE_ICONS[related.icon] ?? Sparkles;
+                return (
+                  <button
+                    key={relatedId}
+                    type="button"
+                    onClick={() => onSelectTopic(relatedId)}
+                    className="oc-surface-card oc-surface-card-hover oc-btn-tactile group flex min-h-11 items-center gap-2.5 rounded-xl px-3.5 py-2.5 text-left text-meta font-medium text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <span className="oc-icon-badge oc-icon-badge-accent size-7 shrink-0 rounded-lg">
+                      <RelatedIcon size={14} strokeWidth={1.75} aria-hidden />
+                    </span>
+                    <span className="min-w-0 flex-1 truncate">{related.shortTitle}</span>
+                    <ArrowRight
+                      size={13}
+                      aria-hidden
+                      className="shrink-0 text-faint transition-transform group-hover:translate-x-0.5"
+                    />
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+        );
+      })()}
     </article>
   );
 }

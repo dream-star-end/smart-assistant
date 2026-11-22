@@ -93,48 +93,121 @@ oc_hotcfg__log() { echo "  [hotcfg] $*" >&2; }
 oc_hotcfg__file_rows() {
   local root="$1"
   [ -d "$root" ] || { oc_hotcfg__die "file_rows: 目录不存在 $root"; return 1; }
-  ( cd "$root" || exit 1
-    {
-      find . -type f ! -name 'MANIFEST.json' ! -name 'MANIFEST.json.tmp' -print0 \
-        | xargs -0 -P"$(nproc)" -I '{}' sh -c '
-            f=${1#./}
-            h=$(sha256sum "$1" | cut -d" " -f1) || exit 1
-            s=$(stat -c "%s" "$1") || exit 1
-            m=$(stat -c "%a" "$1") || exit 1
-            printf "%s\t%s\t%s\t%s\n" "$f" "$h" "$s" "$m"
-          ' _ '{}'
-      # symlink 行:sha256 字段=字面 link:<原始 target(readlink,不解析)>,size=0,mode=777
-      find . -type l -print0 \
-        | xargs -0 -P"$(nproc)" -I '{}' sh -c '
-            f=${1#./}
-            t=$(readlink "$1") || exit 1
-            printf "%s\tlink:%s\t0\t777\n" "$f" "$t"
-          ' _ '{}'
-    } | LC_ALL=C sort -t "$(printf '\t')" -k1,1
-  )
+  python3 - "$root" <<'OC_FILE_ROWS'
+import concurrent.futures
+import hashlib
+import os
+import stat
+import sys
+
+root = os.fsencode(os.path.abspath(sys.argv[1]))
+if not os.path.isdir(root):
+    sys.stderr.write(f"FATAL[hotcfg]: file_rows: 目录不存在 {sys.argv[1]}\n")
+    raise SystemExit(1)
+
+O_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+EXCLUDED_FILES = (b"MANIFEST.json", b"MANIFEST.json.tmp")
+
+reg_items = []
+link_lines = []
+
+def walk(directory, prefix=b""):
+    with os.scandir(directory) as scan:
+        for entry in scan:
+            name = entry.name
+            rel = name if not prefix else prefix + b"/" + name
+            st = entry.stat(follow_symlinks=False)
+            mode = st.st_mode
+            if stat.S_ISDIR(mode):
+                walk(entry.path, rel)
+            elif stat.S_ISLNK(mode):
+                # Match bash command substitution $(readlink ...) stripping trailing newlines.
+                target = os.readlink(entry.path).rstrip(b"\n")
+                link_lines.append(b"\t".join((rel, b"link:" + target, b"0", b"777")) + b"\n")
+            elif stat.S_ISREG(mode):
+                if name in EXCLUDED_FILES:
+                    continue
+                reg_items.append((rel, entry.path, format(stat.S_IMODE(mode), "o").encode("ascii")))
+
+walk(root)
+
+def hash_file(item):
+    rel, path, mode_b = item
+    h = hashlib.sha256()
+    fd = os.open(path, O_FLAGS)
+    try:
+        while chunk := os.read(fd, 1048576):
+            h.update(chunk)
+        size_b = str(os.fstat(fd).st_size).encode("ascii")
+    finally:
+        os.close(fd)
+    # Match GNU sha256sum backslash prefix when filename contains \, \n or \r.
+    escaped = b"\\" if any(ch in rel for ch in (b"\\", b"\n", b"\r")) else b""
+    return b"\t".join((rel, escaped + h.hexdigest().encode("ascii"), size_b, mode_b)) + b"\n"
+
+workers = min(16, max(2, (os.cpu_count() or 4) * 2))
+if len(reg_items) >= 32:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        reg_lines = list(pool.map(hash_file, reg_items, chunksize=16))
+else:
+    reg_lines = [hash_file(item) for item in reg_items]
+
+raw = b"".join(reg_lines) + b"".join(link_lines)
+lines = raw.split(b"\n")[:-1]
+lines.sort(key=lambda line: (line.split(b"\t", 1)[0], line))
+out = sys.stdout.buffer
+if lines:
+    out.write(b"\n".join(lines) + b"\n")
+out.flush()
+OC_FILE_ROWS
 }
 
 # TSV(stdin) → files[] JSON 数组。size 转数字。
 oc_hotcfg__rows_to_json() {
-  jq -R -s -c '
-    split("\n") | map(select(length > 0)) | map(split("\t"))
-    | map({path: .[0], sha256: .[1], size: (.[2] | tonumber), mode: .[3]})
-  '
+  python3 -c '
+import json, sys
+items = []
+for raw in sys.stdin.buffer:
+    line = raw.rstrip(b"\r\n")
+    if not line:
+        continue
+    parts = line.split(b"\t")
+    if len(parts) < 4:
+        raise SystemExit("FATAL[hotcfg]: malformed file_rows line")
+    items.append({
+        "path": parts[0].decode("utf-8"),
+        "sha256": parts[1].decode("utf-8"),
+        "size": int(parts[2]),
+        "mode": parts[3].decode("utf-8"),
+    })
+sys.stdout.write(json.dumps(items, ensure_ascii=False, separators=(",", ":")) + "\n")
+'
 }
 
 # TSV(stdin) → 12hex digest。$1: all|boot(boot 仅 entrypoint/ 与 seed/ 前缀行)。
-# **bash printf 逐行输出真实 NUL 字节**(awk 会在 \0 处截断格式串,故不可用 awk)。
+# 与原 bash IFS=$'\t' read -r p h s m + printf '%s\0%s\0%s\n' 逐字节等价,避免 40k 行循环。
 oc_hotcfg__digest_from_rows() {
-  local mode="${1:-all}" p h s m
-  {
-    while IFS=$'\t' read -r p h s m; do
-      [ -n "$p" ] || continue
-      if [ "$mode" = boot ]; then
-        case "$p" in entrypoint/*|seed/*) : ;; *) continue ;; esac
-      fi
-      printf '%s\0%s\0%s\n' "$p" "$h" "$m"
-    done
-  } | sha256sum | cut -c1-12
+  local mode="${1:-all}"
+  python3 -c '
+import hashlib, sys
+mode = sys.argv[1]
+h = hashlib.sha256()
+for raw in sys.stdin.buffer:
+    line = raw.rstrip(b"\n")
+    rest = line.lstrip(b"\t")
+    fields = []
+    for _ in range(3):
+        first, sep, rest = rest.partition(b"\t")
+        fields.append(first)
+        rest = rest.lstrip(b"\t") if sep else b""
+    p, val, _size = fields
+    if not p:
+        continue
+    if mode == "boot" and not (p.startswith(b"entrypoint/") or p.startswith(b"seed/")):
+        continue
+    h.update(p + b"\0" + val + b"\0" + rest.rstrip(b"\t") + b"\n")
+sys.stdout.write(h.hexdigest()[:12] + "\n")
+' "$mode"
 }
 
 # 在 <root> 写 MANIFEST.json 并 echo digest。
@@ -1466,7 +1539,7 @@ oc_hotcfg_activate_saga() {
     return 79
   fi
   if [ "$_hotcfg_restart_rc" != 0 ]; then
-    echo "⚠ [hotcfg] restart_cmd 失败(rc=$_hotcfg_restart_rc);摘录 egress/master 最近日志" >&2
+    echo "⚠ [hotcfg] restart_cmd 失败;摘录 egress/master 最近日志 (rc=$_hotcfg_restart_rc)" >&2
     journalctl -u openclaude-v5-selfhost-egress.service -u 'openclaude-v5-selfhost-egress@*' -n 40 --no-pager >&2 || true
     journalctl -u openclaude-v5-selfhost.service -n 20 --no-pager >&2 || true
     tail -n 80 /var/log/openclaude-v5-selfhost-egress.log >&2 || true

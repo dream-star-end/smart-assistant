@@ -16,6 +16,7 @@ import { Value } from '@sinclair/typebox/value';
 
 import { after, before, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -120,7 +121,11 @@ const MIGRATION_0237_PROJECT_ASSETS = path.resolve(here, "../db/migrations/0237_
 // OCV5-380 (selfhost P2): archive / pin / template / delete manifest on chat_projects.
 const MIGRATION_0302_CHAT_PROJECT_WORKSPACE = path.resolve(here, "../db/migrations/0302_chat_project_workspace.sql");
 const MIGRATION_0323 = path.resolve(here, "../db/migrations/0323_turn_dispatches_trace_id.sql");
-const MIGRATION_0350 = path.resolve(here, "../db/migrations/0350_perf_timeline_and_live_snapshot.sql");
+const MIGRATION_0350 = existsSync(
+  path.resolve(here, "../db/migrations/0346_commercial_perf_timeline_and_live_snapshot.sql"),
+)
+  ? path.resolve(here, "../db/migrations/0346_commercial_perf_timeline_and_live_snapshot.sql")
+  : path.resolve(here, "../db/migrations/0350_perf_timeline_and_live_snapshot.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -795,10 +800,21 @@ describe("pgSessionsBackend contract", () => {
       messages: [{ id: "nul-1", role: "tool", text: "prefix\u0000needle", ts: 1 }],
     }));
 
-    const listed = await backend.listClientSessions("u-1");
-    const meta = listed.sessions.find((session) => session.id === sessionId);
-    assert.ok(meta, "坏预览只能降级本行，不能让 /api/sessions/list 整体 500");
-    assert.equal(meta.lastMessagePreview, undefined);
+    // OCV5-824 预计算 last_preview 在写入时已清洗 U+0000，list 直接返回干净预览且不 500；
+    const listedPrecomputed = await backend.listClientSessions("u-1");
+    const metaPrecomputed = listedPrecomputed.sessions.find((session) => session.id === sessionId);
+    assert.ok(metaPrecomputed, "含 NUL 的预计算行不能让 /api/sessions/list 整体 500");
+    assert.equal(metaPrecomputed.lastMessagePreview, "prefixneedle");
+
+    // 模拟 0346/0350 之前的旧行（last_preview IS NULL），验证 SQL fallback 仍按单行降级不拖垮侧栏。
+    await pool.query("UPDATE client_sessions SET last_preview = NULL WHERE id = $1 AND user_id = $2", [
+      sessionId,
+      "u-1",
+    ]);
+    const listedLegacy = await backend.listClientSessions("u-1");
+    const metaLegacy = listedLegacy.sessions.find((session) => session.id === sessionId);
+    assert.ok(metaLegacy, "坏预览只能降级本行，不能让 /api/sessions/list 整体 500");
+    assert.equal(metaLegacy.lastMessagePreview, undefined);
 
     const searched = await backend.searchClientSessions("u-1", { q: "needle" });
     assert.ok(searched.results.some((result) => result.sessionId === sessionId));

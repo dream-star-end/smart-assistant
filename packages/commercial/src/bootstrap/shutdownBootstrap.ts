@@ -48,6 +48,7 @@ export interface CommercialShutdownHandles {
   internalProxyServer?: HttpServer;
   externalMtlsServer?: HttpsServer;
   getDesktopTlsClose: () => (() => Promise<void>) | undefined;
+  disposePendingDecisions?: () => void;
   clearGatewayProviders: () => void;
   pricing: { shutdown: () => Promise<void> };
   redis: IORedis;
@@ -163,6 +164,7 @@ export function createCommercialShutdown(handles: CommercialShutdownHandles): ()
     if (desktopTlsClose) {
       await desktopTlsClose().catch(() => {});
     }
+    try { handles.disposePendingDecisions?.(); } catch { /* ignore */ }
     handles.clearGatewayProviders();
     try { await handles.pricing.shutdown(); } catch { /* ignore */ }
     try { await handles.redis.quit(); } catch { /* ignore */ }

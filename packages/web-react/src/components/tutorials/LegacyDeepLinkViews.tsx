@@ -11,6 +11,7 @@ import {
 import { useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import { capabilityById } from "../../lib/productCapabilities";
+import { TASKBOARD_ENABLED } from "../../lib/taskboardFeature";
 import {
   TUTORIAL_CASE_BY_ID,
   type TutorialCase,
@@ -343,7 +344,9 @@ function LegacyCaseDetail({
             <div>
               <h3 className="text-meta font-semibold text-fg">涉及能力</h3>
               <div className="mt-2.5 flex flex-wrap gap-1.5">
-                {item.capabilityIds.map((id) => (
+                {item.capabilityIds
+                  .filter((id) => TASKBOARD_ENABLED || id !== "taskboard")
+                  .map((id) => (
                   <span
                     key={id}
                     className="oc-badge-craft rounded-full bg-surface px-2.5 py-1 text-caption text-muted"

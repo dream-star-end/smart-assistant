@@ -155,4 +155,34 @@ describe("PracticalGuideView", () => {
     );
     expect(screen.getAllByRole("button", { name: "立即试用该模板" })).toHaveLength(8);
   });
+
+  it("商业版关闭 taskboardEnabled 时隐藏实战场景卡中的任务面板相关能力入口", () => {
+    const onOpenTopic = vi.fn();
+    const { rerender } = render(
+      <PracticalGuideView
+        taskboardEnabled
+        onTryScenario={() => {}}
+        onOpenTopic={onOpenTopic}
+      />,
+    );
+
+    const swarmCard = document.querySelector<HTMLElement>(
+      'article[data-scenario-id="swarm-parallel-btw"]',
+    );
+    expect(swarmCard).not.toBeNull();
+    const scope = within(swarmCard!);
+    fireEvent.click(scope.getByRole("button", { name: /看指令与要点/ }));
+    expect(scope.getByRole("button", { name: "任务面板" })).toBeInTheDocument();
+
+    rerender(
+      <PracticalGuideView
+        taskboardEnabled={false}
+        onTryScenario={() => {}}
+        onOpenTopic={onOpenTopic}
+      />,
+    );
+    expect(scope.queryByRole("button", { name: "任务面板" })).not.toBeInTheDocument();
+    expect(scope.getByRole("button", { name: "团队模式" })).toBeInTheDocument();
+    expect(scope.getByRole("button", { name: "模型与思考" })).toBeInTheDocument();
+  });
 });

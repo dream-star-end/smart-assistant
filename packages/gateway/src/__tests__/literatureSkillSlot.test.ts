@@ -286,11 +286,11 @@ describe('buildSkillsSlot baseline overlay', () => {
     await withEnv({ OPENCLAUDE_BASELINE_SKILLS_DIR: baselineRoot }, async () => {
       const slot = await buildSkillsSlot({ agentId: 'prio-slot-test-agent' })
       assert.ok(slot)
-      // 纯字母序截断会把 zz-core 挤出前 15;priority 排序必须让它上榜且排第一。
+      // OCV5-840 平台核心桶配额 <=6:纯字母序截断会把 zz-core 挤出前 6;priority 排序必须让它上榜且排第一,余 10 个折叠。
       assert.match(slot!.content, /\*\*zz-core\*\*/)
       const firstEntry = slot!.content.split('\n').find((l) => l.startsWith('- **'))
       assert.match(firstEntry ?? '', /zz-core/)
-      assert.match(slot!.content, /还有 1 个/)
+      assert.match(slot!.content, /还有 10 个/)
     })
   })
 

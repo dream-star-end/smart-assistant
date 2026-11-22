@@ -105,8 +105,9 @@ export class PgBrowserHandoffStore implements BrowserHandoffStore {
   }
 
   /**
-   * Strictly relies on migration `0352_pending_browser_handoffs.sql` (never runs DDL
-   * on the request path). Missing table fails closed as `SOURCE_UNAVAILABLE`.
+   * Strictly relies on migration `0348_commercial_pending_browser_handoffs.sql` /
+   * `0352_pending_browser_handoffs.sql` (never runs DDL on the request path).
+   * Missing table fails closed as `SOURCE_UNAVAILABLE`.
    */
   private async runQuery<R extends Record<string, unknown>>(
     sql: string,
@@ -118,7 +119,7 @@ export class PgBrowserHandoffStore implements BrowserHandoffStore {
       if (isUndefinedTableError(err)) {
         throw new PendingDecisionError(
           'SOURCE_UNAVAILABLE',
-          'pending_browser_handoffs table missing (migration 0352 required)',
+          'pending_browser_handoffs table missing (migration 0348/0352 required)',
         )
       }
       throw err

@@ -30,6 +30,7 @@ import {
   type PendingDecisionItem,
   type PendingDecisionRiskLevel,
 } from '@openclaude/protocol'
+import { isMasterTaskboardEnabled } from '../agent-sandbox/taskboardEnv.js'
 import type { V3SupervisorDeps } from '../agent-sandbox/v3supervisor.js'
 import { onConnectorWritePendingCreated } from '../connectors/ledger.js'
 import { onPermissionAuthorityCreated } from '../dispatch/turnControlStore.js'
@@ -808,6 +809,7 @@ export interface CommercialPendingDecisionsRuntimeDeps {
     userId: string,
   ) => void | Promise<void>
   /** Optional overrides for tests. */
+  taskboardEnabled?: boolean
   taskboardBackend?: TaskboardDecisionBackend
   browserHandoffStore?: BrowserHandoffStore
   wechatSessions?: ImSessionController
@@ -845,12 +847,7 @@ export function createCommercialPendingDecisionsRuntime(
       },
     })
 
-  const taskboardBackend =
-    deps.taskboardBackend ??
-    createContainerTaskboardDecisionBackend({
-      v3Supervisor: deps.v3Supervisor,
-      bridgeSecret: deps.bridgeSecret,
-    })
+  const taskboardEnabled = deps.taskboardEnabled ?? isMasterTaskboardEnabled()
 
   const service = createPendingDecisionsService({
     now,
@@ -869,7 +866,17 @@ export function createCommercialPendingDecisionsRuntime(
         },
       }),
       createConnectorWriteSource({ pool: deps.pool }),
-      createTaskboardSource(taskboardBackend),
+      ...(taskboardEnabled
+        ? [
+            createTaskboardSource(
+              deps.taskboardBackend ??
+                createContainerTaskboardDecisionBackend({
+                  v3Supervisor: deps.v3Supervisor,
+                  bridgeSecret: deps.bridgeSecret,
+                }),
+            ),
+          ]
+        : []),
       createBrowserHandoffSource(browserHandoffStore),
     ],
   })
@@ -1095,6 +1102,7 @@ export function createCommercialPendingDecisionsRuntime(
     }
   })
 
+  let disposed = false
   return {
     service,
     shortCodes,
@@ -1102,6 +1110,8 @@ export function createCommercialPendingDecisionsRuntime(
     wechatRemoteControl,
     qqRemoteControl,
     dispose: () => {
+      if (disposed) return
+      disposed = true
       unsubOnCreated()
       unsubOnResolved()
       unsubPerm()
