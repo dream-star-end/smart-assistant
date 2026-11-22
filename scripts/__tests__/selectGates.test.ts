@@ -6,16 +6,18 @@
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   ALL_GATE_IDS,
   gateMeta,
   groupByPhase,
   selectGates,
 } from "../select-gates.ts";
+import { gateCommand, runFast } from "../run-v5-fast.ts";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
@@ -168,6 +170,68 @@ describe("selectGates mapping edges", () => {
     ] as const) {
       assert.equal(gateMeta(g).cost, "cheap", `${g} must stay cheap`);
       assert.equal(gateMeta(g).lock, null, `${g} must be lock-free`);
+    }
+    for (const g of [
+      "check:monotonic-baselines",
+      "check:changelog-guard",
+      "check:pg-migration-safety",
+      "check:rest-contract",
+    ] as const) {
+      const cmd = gateCommand(gateMeta(g), "origin/feat/v5-selfhost");
+      assert.ok(
+        cmd.args.includes("--base") && cmd.args.includes("origin/feat/v5-selfhost"),
+        `${g} must forward --base to checker: ${cmd.args.join(" ")}`,
+      );
+    }
+  });
+
+  test("run-v5-fast 把 --base 透传给 check:changelog-guard,干净工作树中已提交的 changelog.json 变更真实退出 1", async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), "oc-fast-base-"));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: dir,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      BOSS_APPROVED_CHANGELOG: "0",
+    };
+    const git = (...args: string[]) =>
+      execFileSync("git", ["-C", dir, ...args], { env, encoding: "utf8" }).trim();
+    git("init", "-q");
+    git("config", "user.name", "test");
+    git("config", "user.email", "test@example.invalid");
+
+    const tsxCli = join(REPO_ROOT, "node_modules/tsx/dist/cli.mjs");
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    cpSync(join(REPO_ROOT, "scripts/check-changelog-guard.ts"), join(dir, "scripts/check-changelog-guard.ts"));
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify({
+        name: "fast-base-fixture",
+        private: true,
+        scripts: {
+          "check:changelog-guard": `node ${JSON.stringify(tsxCli)} scripts/check-changelog-guard.ts`,
+        },
+      }),
+    );
+    writeFileSync(join(dir, "changelog.json"), "[]\n");
+    git("add", ".");
+    git("commit", "-qm", "base");
+    const baseSha = git("rev-parse", "HEAD");
+
+    // Commit a changelog.json edit and leave working tree 100% clean.
+    writeFileSync(join(dir, "changelog.json"), '[{"version":"9.9.9"}]\n');
+    git("commit", "-qam", "edit-changelog");
+    assert.equal(git("status", "--short"), "", "working tree must be clean");
+
+    const prevBoss = process.env.BOSS_APPROVED_CHANGELOG;
+    process.env.BOSS_APPROVED_CHANGELOG = "0";
+    try {
+      const code = await runFast({ dryRun: false, base: baseSha, cwd: dir });
+      assert.equal(code, 1, "committed changelog.json edit must fail with exit 1 when runFast forwards --base");
+    } finally {
+      if (prevBoss === undefined) delete process.env.BOSS_APPROVED_CHANGELOG;
+      else process.env.BOSS_APPROVED_CHANGELOG = prevBoss;
     }
   });
 });

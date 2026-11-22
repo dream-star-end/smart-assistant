@@ -612,9 +612,14 @@ describe('Clarvy context-health & archive router firewall (OCV5-859)', () => {
     await resetPool()
   })
 
-  it('unauthenticated Clarvy routes fall through to gateway auth (401 UNAUTHORIZED) instead of commercial 404 NOT_FOUND', async () => {
+  it('unauthenticated and gateway-only/cross-layer credential requests to Clarvy routes fail closed with 401 UNAUTHORIZED (never fall through to gateway)', async () => {
     const pool = makeStubPool()
     setPoolOverride(pool)
+    const { token: userToken } = await signAccess({ sub: '42', role: 'user' }, JWT_SECRET)
+    const { token: foreignGatewayToken } = await signAccess(
+      { sub: '42', role: 'user' },
+      'different-gateway-access-token-secret',
+    )
     const handler = createCommercialHandler(
       {
         jwtSecret: JWT_SECRET,
@@ -629,18 +634,42 @@ describe('Clarvy context-health & archive router firewall (OCV5-859)', () => {
       { logger: makeCtx().log as any },
     )
 
-    for (const r of CLARVY_ROUTES) {
-      const req = makeReq({ method: r.method, url: r.path })
-      const res = makeRes()
-      const handled = await handler(req as any, res as any)
-      // Must NOT return commercial 404; returning false hands off to gateway checkHttpAuth → 401 UNAUTHORIZED.
-      assert.equal(handled, false, `${r.method} ${r.path} must fall through to gateway auth instead of 404`)
-      assert.equal(res.headersSent, false, `${r.method} ${r.path} must not write commercial 404`)
-      // Simulate gateway checkHttpAuth rejecting unauthenticated /api/* before any host route runs.
-      const gatewayStatus = 401
-      const gatewayErrorCode = 'UNAUTHORIZED'
-      assert.equal(gatewayStatus, 401)
-      assert.equal(gatewayErrorCode, 'UNAUTHORIZED')
+    const credVariants: Array<{ name: string; headers: Record<string, string> }> = [
+      { name: 'no credentials', headers: {} },
+      // Gateway extractToken() accepts `sec-websocket-protocol: bearer, <tok>` and raw `Authorization: <tok>`
+      // without `Bearer ` prefix, whereas commercial extractTokenFromReq() ignores both.
+      // Clarvy routes MUST terminate with 401 in commercial instead of returning false to gateway.
+      {
+        name: 'sec-websocket-protocol bearer user JWT (gateway-only extraction)',
+        headers: { 'sec-websocket-protocol': `bearer, ${userToken}` },
+      },
+      {
+        name: 'raw Authorization header without Bearer prefix (gateway-only extraction)',
+        headers: { authorization: userToken },
+      },
+      {
+        name: 'non-commercial gateway-signed JWT',
+        headers: { authorization: `Bearer ${foreignGatewayToken}` },
+      },
+    ]
+
+    for (const v of credVariants) {
+      for (const r of CLARVY_ROUTES) {
+        const req = makeReq({ method: r.method, url: r.path, headers: v.headers })
+        const res = makeRes()
+        const handled = await handler(req as any, res as any)
+        assert.equal(
+          handled,
+          true,
+          `${r.method} ${r.path} (${v.name}) must terminate in commercial and NEVER fall through to gateway`,
+        )
+        assert.equal(
+          res.statusCode,
+          401,
+          `${r.method} ${r.path} (${v.name}) expected 401, got ${res.statusCode} ${res.body.toString()}`,
+        )
+        assert.equal(JSON.parse(res.body.toString()).error?.code, 'UNAUTHORIZED')
+      }
     }
   })
 

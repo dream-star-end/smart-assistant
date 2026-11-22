@@ -57,6 +57,8 @@ export interface GateMeta {
   /** 根 package.json 脚本名;typecheck 在 scoped 时由 runner 改写成 tsc --build */
   npmScript: GateId;
   npmArgs?: string[];
+  /** 基线敏感门禁: run-v5-fast 需把自身的 `--base <ref>` 透传给脚本 */
+  passBaseFlag?: boolean;
   cost: GateCost;
   lock: GateLock;
 }
@@ -71,17 +73,18 @@ export const ALL_GATES: GateMeta[] = [
   { id: "check:ui-gates", npmScript: "check:ui-gates", cost: "cheap", lock: null },
   { id: "check:no-weak-downgrade", npmScript: "check:no-weak-downgrade", cost: "cheap", lock: null },
   { id: "check:route-sync", npmScript: "check:route-sync", cost: "cheap", lock: null },
-  { id: "check:monotonic-baselines", npmScript: "check:monotonic-baselines", cost: "cheap", lock: null },
-  { id: "check:changelog-guard", npmScript: "check:changelog-guard", cost: "cheap", lock: null },
+  { id: "check:monotonic-baselines", npmScript: "check:monotonic-baselines", passBaseFlag: true, cost: "cheap", lock: null },
+  { id: "check:changelog-guard", npmScript: "check:changelog-guard", passBaseFlag: true, cost: "cheap", lock: null },
   { id: "check:feature-flags-ttl", npmScript: "check:feature-flags-ttl", cost: "cheap", lock: null },
   {
     id: "check:pg-migration-safety",
     npmScript: "check:pg-migration-safety",
-    npmArgs: ["--base", "origin/feat/v5-selfhost", "--no-squawk"],
+    npmArgs: ["--no-squawk"],
+    passBaseFlag: true,
     cost: "cheap",
     lock: null,
   },
-  { id: "check:rest-contract", npmScript: "check:rest-contract", cost: "cheap", lock: null },
+  { id: "check:rest-contract", npmScript: "check:rest-contract", passBaseFlag: true, cost: "cheap", lock: null },
   { id: "check:governance:fast", npmScript: "check:governance:fast", cost: "cheap", lock: null },
   { id: "lint:scheduler-wiring", npmScript: "lint:scheduler-wiring", cost: "cheap", lock: null },
   { id: "lint:agent-containers-sql", npmScript: "lint:agent-containers-sql", cost: "cheap", lock: null },

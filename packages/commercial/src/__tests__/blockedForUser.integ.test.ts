@@ -355,18 +355,33 @@ describe("BLOCKED_FOR_USER_RULES — fall through paths", () => {
     const r = await fetchWith("/api/cron", "GET");
     assert.equal(r.status, 404);
     assert.equal(r.text, FALLTHROUGH_MARKER);
-    // OCV5-859: Clarvy context-health / archive routes under /api/agents must also
-    // fall through to gateway auth (401) rather than returning commercial 404 NOT_FOUND.
-    for (const p of [
+    // OCV5-859: Clarvy context-health / archive routes MUST fail closed in commercial
+    // with canonical 401 UNAUTHORIZED (never fall through to host gateway contextHealthApi.ts,
+    // even when carrying gateway-only extracted credentials like sec-websocket-protocol or raw Authorization).
+    const clarvyUid = await createUser(`clarvy-cross-${Date.now()}@x.com`, "user");
+    const clarvyUserTok = await tokenFor(clarvyUid, "user");
+    const clarvyPaths = [
       "/api/agents/main/context-health",
       "/api/agents/main/context-hygiene/history",
       "/api/agents/main/memory/archive",
+      "/api/skills/archive",
       "/api/skills/archive/restore",
       "/api/skills/my-skill/archive",
-    ]) {
+    ];
+    for (const p of clarvyPaths) {
       const c = await fetchWith(p, "GET");
-      assert.equal(c.status, 404, `expected fallthrough marker for ${p}, got ${c.status} ${c.text}`);
-      assert.equal(c.text, FALLTHROUGH_MARKER, `must not return commercial 404 for ${p}`);
+      assert.equal(c.status, 401, `expected 401 UNAUTHORIZED for ${p}, got ${c.status} ${c.text}`);
+      assert.equal((JSON.parse(c.text) as any)?.error?.code, "UNAUTHORIZED");
+      const crossLayer = await fetch(`${baseUrl}${p}`, {
+        method: "GET",
+        headers: {
+          "sec-websocket-protocol": `bearer, ${clarvyUserTok}`,
+          authorization: clarvyUserTok,
+        },
+      });
+      const crossJson = (await crossLayer.json()) as any;
+      assert.equal(crossLayer.status, 401, `cross-layer creds must 401 on ${p}`);
+      assert.equal(crossJson?.error?.code, "UNAUTHORIZED");
     }
   });
 

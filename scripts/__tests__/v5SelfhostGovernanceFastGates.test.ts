@@ -1,25 +1,26 @@
 /**
  * OCV5-847 / OCV5-849 / OCV5-859: Wave 1/2 governance fast gates wired into the
- * host-local V5 selfhost release train (`scripts/v5-selfhost-master-release-lib.sh`).
+ * host-local V5 selfhost release train (`scripts/lib/v5-selfhost-governance-gates.sh`
+ * sourced by `scripts/v5-selfhost-master-release-lib.sh`).
  *
  * Verifies:
  *   1. `master_resolve_governance_base_ref` precedence (explicit override, live .complete
- *      sourceCommit, origin/feat/v5-selfhost, detached-HEAD parent HEAD~1, initial commit)
- *      and fail-closed behavior on invalid explicit ref.
- *   2. `build_master_release` calls `master_run_governance_fast_gates` before C/D parallel
- *      jobs and cleans up staging on failure.
+ *      sourceCommit, origin/feat/v5-selfhost, detached-HEAD parent HEAD~1), skips any
+ *      candidate that resolves to `full_sha` (no silent self-comparison!), and fails closed
+ *      on invalid/self explicit override or isolated root commit.
+ *   2. `build_master_release` sources `lib/v5-selfhost-governance-gates.sh`, invokes
+ *      `master_run_governance_fast_gates` before C/D parallel jobs, and cleans up on failure.
  *   3. Real execution of `master_run_governance_fast_gates` against a `.git`-less `git archive`
  *      staging directory (with `GIT_DIR` + `safe.directory=*`) passes with ZERO side effects
  *      on `$staging` and `$REPO_ROOT`.
  *   4. Real RED cases on isolated temp repos + `.git`-less staging archives:
- *      - unsafe PG migration (`DROP COLUMN`) blocks
- *      - unauthorized `changelog.json` edit blocks (and `BOSS_APPROVED_CHANGELOG=1` approves)
+ *      - unsafe PG migration (`DROP COLUMN`) blocks EVEN when parent env sets `OC_PG_MIGRATION_BOSS_APPROVED=1`
+ *      - unauthorized `changelog.json` edit blocks EVEN when parent env sets `BOSS_APPROVED_CHANGELOG=1`
  *      - raised monotonic budget in `packages/web-react/budgets.json` blocks
  */
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
 import {
-  chmodSync,
   cpSync,
   existsSync,
   mkdirSync,
@@ -37,7 +38,9 @@ import { fileURLToPath } from 'node:url'
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const MASTER_LIB_PATH = join(REPO_ROOT, 'scripts/v5-selfhost-master-release-lib.sh')
+const GOV_LIB_PATH = join(REPO_ROOT, 'scripts/lib/v5-selfhost-governance-gates.sh')
 const MASTER_LIB_SRC = readFileSync(MASTER_LIB_PATH, 'utf8')
+const GOV_LIB_SRC = readFileSync(GOV_LIB_PATH, 'utf8')
 
 function extractBashFn(src: string, name: string): string {
   const m = src.match(new RegExp(`^${name}\\(\\) \\{[^\\n]*\\n[\\s\\S]*?^\\}`, 'm'))
@@ -45,8 +48,6 @@ function extractBashFn(src: string, name: string): string {
   return m[0]
 }
 
-const FN_RESOLVE = extractBashFn(MASTER_LIB_SRC, 'master_resolve_governance_base_ref')
-const FN_RUN = extractBashFn(MASTER_LIB_SRC, 'master_run_governance_fast_gates')
 const FN_BUILD = extractBashFn(MASTER_LIB_SRC, 'build_master_release')
 
 const q = (s: string) => `'${s.replaceAll("'", "'\\''")}'`
@@ -96,32 +97,35 @@ function runBash(body: string, env: NodeJS.ProcessEnv = process.env) {
       '-o',
       'pipefail',
       '-c',
-      ['mlog() { echo "$*" >&2; }', 'tsum_note() { :; }', FN_RESOLVE, FN_RUN, body].join('\n'),
+      ['mlog() { echo "$*" >&2; }', 'tsum_note() { :; }', `source ${q(GOV_LIB_PATH)}`, body].join(
+        '\n',
+      ),
     ],
     { env, encoding: 'utf8', timeout: 180_000 },
   )
 }
 
 describe('master_resolve_governance_base_ref (OCV5-859)', () => {
-  test('prefers live .complete sourceCommit, falls back to detached HEAD parent and initial commit, fails closed on bad explicit override', (t) => {
+  test('skips self-matching live/origin refs, falls back to parent, and fails closed on isolated root or invalid/self override', (t) => {
     const f = makeTempGitRepo(t)
     writeFileSync(join(f.repo, 'a.txt'), 'v1\n')
     f.git('add', '.')
     f.git('commit', '-qm', 'c1')
     const c1 = f.git('rev-parse', 'HEAD')
 
-    // 1) Initial single-commit repo with no live link and no origin/feat/v5-selfhost → falls back to c1 itself
+    // 1) Isolated root commit with no parent, no live link, no origin/feat/v5-selfhost → MUST fail closed (no self-comparison!)
     let r = runBash(
       `REPO_ROOT=${q(f.repo)}; MASTER_LIVE_LINK=${q(join(f.dir, 'missing-live'))}; master_resolve_governance_base_ref ${q(c1)}`,
       f.env,
     )
-    assert.equal(r.status, 0, r.stderr)
-    assert.equal(r.stdout.trim(), c1)
+    assert.notEqual(r.status, 0, 'isolated root commit without explicit base must fail closed')
+    assert.match(r.stderr, /无法为目标 commit .* 解析非自身基线/)
 
-    // 2) Add second commit and detach HEAD → falls back to c1 (HEAD~1 / parent)
+    // 2) Add c2, set origin/feat/v5-selfhost == c2, and omit live marker → must SKIP self-matching origin ref and fall back to c1 (c2^)
     writeFileSync(join(f.repo, 'a.txt'), 'v2\n')
     f.git('commit', '-qam', 'c2')
     const c2 = f.git('rev-parse', 'HEAD')
+    f.git('update-ref', 'refs/remotes/origin/feat/v5-selfhost', c2)
     f.git('checkout', '-q', '--detach', c2)
 
     r = runBash(
@@ -129,16 +133,16 @@ describe('master_resolve_governance_base_ref (OCV5-859)', () => {
       f.env,
     )
     assert.equal(r.status, 0, r.stderr)
-    assert.equal(r.stdout.trim(), c1, 'detached HEAD should resolve parent commit')
+    assert.equal(r.stdout.trim(), c1, 'must skip self-matching origin/feat/v5-selfhost and fall back to c2^')
 
-    // 3) Live .complete sourceCommit takes priority over HEAD~1
+    // 3) Live .complete sourceCommit pointing to c3 itself is skipped, falling back to origin/feat/v5-selfhost (c2)
     writeFileSync(join(f.repo, 'a.txt'), 'v3\n')
     f.git('commit', '-qam', 'c3')
     const c3 = f.git('rev-parse', 'HEAD')
     const liveRel = join(f.dir, 'rel-live')
     const liveLink = join(f.dir, 'live')
     mkdirSync(liveRel, { recursive: true })
-    writeFileSync(join(liveRel, '.complete'), JSON.stringify({ sourceCommit: c1 }))
+    writeFileSync(join(liveRel, '.complete'), JSON.stringify({ sourceCommit: c3 }))
     symlinkSync(liveRel, liveLink)
 
     r = runBash(
@@ -146,15 +150,35 @@ describe('master_resolve_governance_base_ref (OCV5-859)', () => {
       f.env,
     )
     assert.equal(r.status, 0, r.stderr)
-    assert.equal(r.stdout.trim(), c1, 'live .complete sourceCommit must take precedence over HEAD~1')
+    assert.equal(
+      r.stdout.trim(),
+      'origin/feat/v5-selfhost',
+      'must skip self-matching live sourceCommit and fall back to non-self origin/feat/v5-selfhost',
+    )
 
-    // 4) Explicit OC_V5_GOVERNANCE_BASE_REF wins when valid, fails closed when invalid
+    // 4) Non-self live .complete sourceCommit (c1) takes priority over origin/feat/v5-selfhost (c2)
+    writeFileSync(join(liveRel, '.complete'), JSON.stringify({ sourceCommit: c1 }))
+    r = runBash(
+      `REPO_ROOT=${q(f.repo)}; MASTER_LIVE_LINK=${q(liveLink)}; master_resolve_governance_base_ref ${q(c3)}`,
+      f.env,
+    )
+    assert.equal(r.status, 0, r.stderr)
+    assert.equal(r.stdout.trim(), c1, 'non-self live .complete sourceCommit must take precedence')
+
+    // 5) Explicit OC_V5_GOVERNANCE_BASE_REF wins when valid & non-self; fails closed when invalid OR equal to full_sha
     r = runBash(
       `REPO_ROOT=${q(f.repo)}; MASTER_LIVE_LINK=${q(liveLink)}; OC_V5_GOVERNANCE_BASE_REF=${q(c2)}; master_resolve_governance_base_ref ${q(c3)}`,
       f.env,
     )
     assert.equal(r.status, 0, r.stderr)
     assert.equal(r.stdout.trim(), c2)
+
+    r = runBash(
+      `REPO_ROOT=${q(f.repo)}; OC_V5_GOVERNANCE_BASE_REF=${q(c3)}; master_resolve_governance_base_ref ${q(c3)}`,
+      f.env,
+    )
+    assert.notEqual(r.status, 0, 'explicit self-comparison override must fail closed')
+    assert.match(r.stderr, /禁止自比较/)
 
     r = runBash(
       `REPO_ROOT=${q(f.repo)}; OC_V5_GOVERNANCE_BASE_REF=nonexistent-ref-xyz; master_resolve_governance_base_ref ${q(c3)}`,
@@ -166,7 +190,10 @@ describe('master_resolve_governance_base_ref (OCV5-859)', () => {
 })
 
 describe('build_master_release wiring & zero-side-effect execution (OCV5-859)', () => {
-  test('build_master_release invokes master_run_governance_fast_gates before C/D parallel jobs and cleans up on failure', () => {
+  test('master-release-lib sources governance-gates lib and build_master_release invokes it before C/D parallel jobs', () => {
+    assert.match(MASTER_LIB_SRC, /source "\$\(dirname "\$\{BASH_SOURCE\[0\]\}"\)\/lib\/v5-selfhost-governance-gates\.sh"/)
+    assert.match(GOV_LIB_SRC, /OC_PG_MIGRATION_BOSS_APPROVED=0/)
+    assert.match(GOV_LIB_SRC, /BOSS_APPROVED_CHANGELOG=0/)
     const callIdx = FN_BUILD.indexOf('master_run_governance_fast_gates "$staging" "$full_sha"')
     const p3Idx = FN_BUILD.indexOf('  # P3:')
     const receiptIdx = FN_BUILD.indexOf('master_gate_receipt_prepare "$staging" "$full_sha"')
@@ -176,14 +203,14 @@ describe('build_master_release wiring & zero-side-effect execution (OCV5-859)', 
     assert.match(block, /die /)
   })
 
-  test('master_run_governance_fast_gates enforces PG migration safety, changelog guard, and monotonic baselines in a .git-less staging archive', (t) => {
+  test('master_run_governance_fast_gates enforces PG safety, changelog guard, and monotonic baselines in .git-less staging and ignores parent approval env vars', (t) => {
     const f = makeTempGitRepo(t)
     const staging = join(f.dir, 'staging')
     const gateTmp = join(f.dir, 'gate-tmp')
     mkdirSync(staging, { recursive: true })
     mkdirSync(gateTmp, { recursive: true })
 
-    // Create minimal stubs for the 10 pure-FS scripts + real copies of the 4 Wave 2 git-aware scripts.
+    // Create minimal stubs for the 10 pure-FS scripts + real copies of the git-aware governance checkers.
     const scriptsDir = join(f.repo, 'scripts')
     const commScriptsDir = join(f.repo, 'packages/commercial/scripts')
     const migDir = join(f.repo, 'packages/commercial/src/db/migrations')
@@ -210,7 +237,6 @@ describe('build_master_release wiring & zero-side-effect execution (OCV5-859)', 
     ]) {
       writeFileSync(join(f.repo, rel), 'process.exit(0)\n')
     }
-    // Use the REAL governance checkers for monotonic baselines, PG migration safety, and changelog guard!
     for (const rel of [
       'scripts/check-monotonic-baselines.ts',
       'scripts/check-pg-migration-safety.ts',
@@ -239,10 +265,10 @@ describe('build_master_release wiring & zero-side-effect execution (OCV5-859)', 
       symlinkSync(join(REPO_ROOT, 'node_modules'), join(staging, 'node_modules'))
     }
 
-    const invoke = (sha: string, extraEnv = '') =>
+    const invoke = (sha: string, extraEnv: Record<string, string> = {}) =>
       runBash(
-        `REPO_ROOT=${q(f.repo)}; MASTER_LIVE_LINK=${q(join(f.dir, 'no-live'))}; MASTER_GATE_TMPDIR=${q(gateTmp)}; OC_V5_GOVERNANCE_BASE_REF=${q(baseSha)}; ${extraEnv} master_run_governance_fast_gates ${q(staging)} ${q(sha)}`,
-        f.env,
+        `REPO_ROOT=${q(f.repo)}; MASTER_LIVE_LINK=${q(join(f.dir, 'no-live'))}; MASTER_GATE_TMPDIR=${q(gateTmp)}; OC_V5_GOVERNANCE_BASE_REF=${q(baseSha)}; master_run_governance_fast_gates ${q(staging)} ${q(sha)}`,
+        { ...f.env, ...extraEnv },
       )
 
     // Case 1 (GREEN): safe additive migration passes with zero side effects on staging
@@ -256,17 +282,17 @@ describe('build_master_release wiring & zero-side-effect execution (OCV5-859)', 
     assert.equal(res.status, 0, res.stderr)
     assert.deepEqual(listTree(staging), treeBefore, 'staging tree must have zero side effects')
 
-    // Case 2 (RED): unsafe PG migration (DROP COLUMN) blocks in pinned staging
+    // Case 2 (RED): unsafe PG migration (DROP COLUMN) blocks EVEN IF parent env exports OC_PG_MIGRATION_BOSS_APPROVED=1
     writeFileSync(join(migDir, '0003_drop.sql'), 'ALTER TABLE t DROP COLUMN note;\n')
     f.git('add', '.')
     f.git('commit', '-qm', 'unsafe-mig')
     const unsafeMigSha = f.git('rev-parse', 'HEAD')
     exportArchive(unsafeMigSha)
-    res = invoke(unsafeMigSha)
-    assert.notEqual(res.status, 0, 'DROP COLUMN migration must fail closed')
+    res = invoke(unsafeMigSha, { OC_PG_MIGRATION_BOSS_APPROVED: '1' })
+    assert.notEqual(res.status, 0, 'DROP COLUMN migration must fail closed even when parent env sets OC_PG_MIGRATION_BOSS_APPROVED=1')
     assert.match(res.stderr + res.stdout, /PG-BAN-DROP-COLUMN/)
 
-    // Reset back to safeSha, test Case 3 (RED): raised monotonic budget blocks
+    // Case 3 (RED): raised monotonic budget blocks
     f.git('reset', '--hard', safeSha)
     writeFileSync(join(webDir, 'budgets.json'), JSON.stringify({ mainJsBytes: 999_999 }, null, 2) + '\n')
     f.git('commit', '-qam', 'raise-budget')
@@ -276,17 +302,14 @@ describe('build_master_release wiring & zero-side-effect execution (OCV5-859)', 
     assert.notEqual(res.status, 0, 'raised budget must fail closed')
     assert.match(res.stderr + res.stdout, /MONOTONIC-BUDGET-RAISED/)
 
-    // Reset back to safeSha, test Case 4 (RED → GREEN): changelog.json edit requires BOSS_APPROVED_CHANGELOG=1
+    // Case 4 (RED): unauthorized changelog.json edit blocks EVEN IF parent env exports BOSS_APPROVED_CHANGELOG=1
     f.git('reset', '--hard', safeSha)
     writeFileSync(join(f.repo, 'changelog.json'), '[{"version":"1"}]\n')
     f.git('commit', '-qam', 'edit-changelog')
     const clSha = f.git('rev-parse', 'HEAD')
     exportArchive(clSha)
-    res = invoke(clSha)
-    assert.notEqual(res.status, 0, 'unapproved changelog.json edit must fail closed')
+    res = invoke(clSha, { BOSS_APPROVED_CHANGELOG: '1' })
+    assert.notEqual(res.status, 0, 'changelog.json edit must fail closed even when parent env sets BOSS_APPROVED_CHANGELOG=1')
     assert.match(res.stderr + res.stdout, /CHANGELOG-GUARD/)
-
-    res = invoke(clSha, 'BOSS_APPROVED_CHANGELOG=1')
-    assert.equal(res.status, 0, `BOSS_APPROVED_CHANGELOG=1 should pass: ${res.stderr}`)
   })
 })
