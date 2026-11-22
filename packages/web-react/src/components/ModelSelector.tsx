@@ -313,6 +313,7 @@ export function ModelSelector({
       aria-busy={loading || undefined}
       data-degraded={selectedDegraded && !teamEngineActive ? 'true' : undefined}
       data-swarm-active={swarmActive ? 'true' : undefined}
+      data-swarm-running={swarmRunningActive ? 'true' : undefined}
       className={cn(
         'oc-btn-tactile oc-spring-press flex min-h-10 min-w-0 max-w-full items-center gap-1.5 rounded-full border border-border/80 bg-surface/85 px-3 py-1 text-section font-medium text-fg shadow-xs outline-none sm:min-h-10 sm:rounded-lg sm:border-border/60 sm:bg-surface/65 sm:px-2.5 sm:py-1.5',
         'hover:border-border-strong hover:bg-surface hover:text-fg hover:shadow-soft focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
@@ -338,13 +339,6 @@ export function ModelSelector({
           data-testid="model-trigger-swarm-icon"
         >
           <AtelierIcon name="swarm" size={14} className="shrink-0 text-accent" />
-          {swarmRunningActive && (
-            <span
-              aria-hidden
-              data-testid="model-trigger-swarm-running-dot"
-              className="oc-alive-dot absolute -right-0.5 -top-0.5 size-[5px] ring-1 ring-surface"
-            />
-          )}
         </span>
       ) : !selectedDegraded ? (
         <AtelierIcon name="sparkles" size={14} className="hidden shrink-0 text-accent/85 sm:block" />

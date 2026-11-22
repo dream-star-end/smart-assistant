@@ -20,6 +20,7 @@ import { cn } from "../../lib/utils";
 import { Badge, Button, Spinner } from "../ui";
 import { AtelierIcon } from "../ui/AtelierIcons";
 import { ModelFamilyIcon } from "../ui/ModelFamilyIcons";
+import "./liveActivity.css";
 import {
   formatPostClock,
   formatSwarmElapsed,
@@ -182,7 +183,7 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
                 member.failed
                   ? "bg-danger"
                   : working
-                    ? "oc-alive-dot"
+                    ? "bg-accent"
                     : killed
                       ? "bg-faint"
                       : "bg-success",
@@ -259,11 +260,12 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
     <div
       data-testid="swarm-inline-card"
       data-swarm-id={snapshot.swarmId}
+      data-active={active ? "true" : undefined}
       className={cn(
-        "oc-surface-card group relative overflow-hidden rounded-2xl transition-all duration-200 animate-in",
+        "oc-surface-card group relative overflow-hidden rounded-2xl transition-all duration-200",
         active
-          ? "border-accent/40 shadow-float ring-1 ring-accent/15"
-          : "hover:border-border-strong",
+          ? "oc-border-breathe"
+          : "animate-in hover:border-border-strong",
       )}
     >
       {/* Top luminous aurora hairline when swarm is actively coordinating */}
@@ -289,22 +291,14 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
             className={cn(
               "oc-icon-badge relative size-7 shrink-0 rounded-lg",
               iconBadgeTone,
-              active && "oc-breathe-aura",
             )}
           >
             <AtelierIcon name="swarm" size={15} />
-            {active && (
-              <span
-                aria-hidden
-                className="oc-alive-dot absolute -right-0.5 -top-0.5 size-2 ring-2 ring-surface"
-              />
-            )}
           </span>
           <span className="min-w-0 flex-1 truncate text-section font-semibold tracking-[-0.01em] text-fg">
             {snapshot.title || "蜂群协作"}
           </span>
-          <Badge tone={phase.tone} className="shrink-0 gap-1.5">
-            {active && <span aria-hidden className="oc-alive-dot size-1.5 shrink-0" />}
+          <Badge tone={phase.tone} className="shrink-0">
             {phase.label}
           </Badge>
         </button>

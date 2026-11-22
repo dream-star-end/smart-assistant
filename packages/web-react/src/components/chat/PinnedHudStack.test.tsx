@@ -123,7 +123,10 @@ describe("PinnedHudStack — unified Live Agent capsule", () => {
     expect(capsule).toHaveAttribute("data-primary-kind", "swarm");
     expect(capsule).toHaveAttribute("data-running", "true");
     expect(capsule).toHaveTextContent("UI 统一重构");
-    expect(within(capsule).getByTestId("live-agent-capsule-dot")).toHaveAttribute("data-running", "true");
+    // OCV5-850: 底部胶囊以自身边框慢呼吸承载运行态，不再在图标左侧叠加闪烁红点或图标光晕
+    expect(within(capsule).queryByTestId("live-agent-capsule-dot")).toBeNull();
+    expect(capsule.querySelector(".oc-alive-dot")).toBeNull();
+    expect(capsule.querySelector(".oc-breathe-aura")).toBeNull();
     // goal 已收敛至 Composer 单入口，不再占 HUD +N 计数（仅 delegate + task = +2）
     expect(within(capsule).getByTestId("live-agent-capsule-more")).toHaveTextContent("+2");
     expect(within(capsule).getByTestId("live-agent-capsule-timer")).toBeInTheDocument();

@@ -1598,7 +1598,7 @@ describe('ModelSelector OCV5-843 蜂群模式集成（列表微标 + 参数区�
     expect(screen.getByTestId('model-picker-two-col')).toBeInTheDocument()
   })
 
-  it('开启蜂群态时顶栏触发器呈现暖陶土激活态、双端可见图标、桌面蜂群微徽标、运行态呼吸点与摘要同步；团队模式时隐藏', async () => {
+  it('开启蜂群态时顶栏触发器呈现暖陶土激活态、双端可见图标、桌面蜂群微徽标与运行态属性同步（无闪烁红点）；团队模式时隐藏', async () => {
     const { rerender } = render(
       <ModelSelector
         models={SWARM_MODELS}
@@ -1616,10 +1616,11 @@ describe('ModelSelector OCV5-843 蜂群模式集成（列表微标 + 参数区�
 
     const trigger = screen.getByRole('button', { name: '选择对话模型' })
     expect(trigger).toHaveAttribute('data-swarm-active', 'true')
+    expect(trigger).toHaveAttribute('data-swarm-running', 'true')
     expect(trigger.className).toContain('oc-model-trigger-swarm')
     expect(trigger.className).toContain('oc-shimmer-sheen')
     expect(screen.getByTestId('model-trigger-swarm-icon')).toBeInTheDocument()
-    expect(screen.getByTestId('model-trigger-swarm-running-dot')).toBeInTheDocument()
+    expect(screen.queryByTestId('model-trigger-swarm-running-dot')).toBeNull()
 
     const badge = screen.getByTestId('model-trigger-swarm-badge')
     expect(badge).toHaveTextContent('蜂群')

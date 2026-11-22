@@ -517,15 +517,21 @@ describe("Antigravity native swarm reducer & UI (OCV5-809)", () => {
     const { rerender } = render(
       <SwarmInlineCard snapshot={makeSnapshot({ phase: "running" })} cardId="m-v" blockId="b-v" onOpenBoard={vi.fn()} />,
     );
+    // OCV5-850: 卡片运行态收敛为外框柔和边框慢呼吸，去除多余水波红点与图标外扩光晕
+    const runCard = screen.getByTestId("swarm-inline-card");
+    expect(runCard.className).toContain("oc-border-breathe");
+    expect(runCard.querySelector(".oc-alive-dot")).toBeNull();
     const runIcon = screen.getByTestId("swarm-header-icon");
     expect(runIcon.className).toContain("oc-icon-badge");
     expect(runIcon.className).toContain("oc-icon-badge-accent");
+    expect(runIcon.className).not.toContain("oc-breathe-aura");
     expect(runIcon.className).not.toContain("bg-primary");
     expect(screen.getByTestId("swarm-open-board-btn").className).toContain("oc-btn-accent-craft");
 
     rerender(
       <SwarmInlineCard snapshot={makeSnapshot({ phase: "completed" })} cardId="m-v" blockId="b-v" onOpenBoard={vi.fn()} />,
     );
+    expect(screen.getByTestId("swarm-inline-card").className).not.toContain("oc-border-breathe");
     const doneIcon = screen.getByTestId("swarm-header-icon");
     expect(doneIcon.className).toContain("oc-icon-badge");
     expect(doneIcon.className).toContain("oc-icon-badge-success");
@@ -554,9 +560,12 @@ describe("Antigravity native swarm reducer & UI (OCV5-809)", () => {
     expect(drawer.className).toContain("sm:h-[84dvh]");
     expect(drawer.className).toContain("sm:rounded-2xl");
 
-    // Breathing modern swarm icon badge
+    // OCV5-850: 抽屉顶栏保持清爽静默语义徽标，不再叠加水波红点与图标外扩光晕
+    expect(drawer.getAttribute("data-swarm-active")).toBe("true");
     const drawerIcon = within(drawer).getByTestId("swarm-drawer-icon");
-    expect(drawerIcon.className).toContain("oc-breathe-aura");
+    expect(drawerIcon.className).toContain("oc-icon-badge-accent");
+    expect(drawerIcon.className).not.toContain("oc-breathe-aura");
+    expect(drawer.querySelector(".oc-alive-dot")).toBeNull();
 
     // Mobile search bar is collapsed by default; clicking toggle opens & focuses it
     expect(within(drawer).queryByTestId("swarm-mobile-search-bar")).toBeNull();

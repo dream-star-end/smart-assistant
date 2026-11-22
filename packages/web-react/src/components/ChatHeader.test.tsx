@@ -134,7 +134,8 @@ describe("ChatHeader 未读状态点与零双红点（OCV5-843）", () => {
     expect(sessionDot).toBeTruthy();
     expect(sessionDot).toHaveTextContent("");
     expect(sessionDot).toHaveAttribute("data-unread-count", "128");
-    expect(sessionDot).toHaveClass("size-1.5", "rounded-full", "bg-accent", "oc-alive-dot");
+    expect(sessionDot).toHaveClass("size-1.5", "rounded-full", "bg-accent");
+    expect(sessionDot).not.toHaveClass("oc-alive-dot");
 
     const expand = screen.getByRole("button", { name: "展开侧栏,128 条未读会话" });
     expect(expand.parentElement?.querySelector("[data-testid=session-unread-badge]")).toHaveAttribute(

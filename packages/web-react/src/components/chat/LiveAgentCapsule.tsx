@@ -491,21 +491,7 @@ export default function LiveAgentCapsule({
             className="oc-live-capsule-main oc-spring-press min-w-0 flex-1 overflow-hidden"
           >
             <span
-              aria-hidden
-              data-testid="live-agent-capsule-dot"
-              data-running={isRunning ? "true" : "false"}
-              className={
-                isRunning
-                  ? "oc-live-capsule-dot oc-alive-dot shrink-0"
-                  : "oc-live-capsule-dot shrink-0"
-              }
-            />
-            <span
-              className={
-                isRunning && primaryKind === "swarm"
-                  ? "oc-icon-badge oc-icon-badge-accent oc-breathe-aura flex size-5 shrink-0 items-center justify-center rounded-full"
-                  : "oc-icon-badge oc-icon-badge-accent flex size-5 shrink-0 items-center justify-center rounded-full"
-              }
+              className="oc-icon-badge oc-icon-badge-accent flex size-5 shrink-0 items-center justify-center rounded-full"
             >
               {renderPrimaryIcon()}
             </span>

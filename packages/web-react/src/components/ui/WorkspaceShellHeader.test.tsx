@@ -23,7 +23,8 @@ describe("HeaderCountBadge（OCV5-820 6px 克制状态点）", () => {
     expect(accentDot).toHaveTextContent("");
     expect(accentDot).toHaveAttribute("aria-label", "120 条未读会话");
     expect(accentDot).toHaveAttribute("data-unread-count", "120");
-    expect(accentDot).toHaveClass("size-1.5", "rounded-full", "bg-accent", "oc-alive-dot");
+    expect(accentDot).toHaveClass("size-1.5", "rounded-full", "bg-accent");
+    expect(accentDot).not.toHaveClass("oc-alive-dot");
     expect(accentDot).not.toHaveClass("motion-safe:animate-pulse");
 
     rerender(
@@ -68,7 +69,8 @@ describe("WorkspaceShellHeader", () => {
     expect(dots).toHaveLength(2);
     for (const dot of dots) {
       expect(dot).toHaveTextContent("");
-      expect(dot).toHaveClass("size-1.5", "bg-accent", "oc-alive-dot");
+      expect(dot).toHaveClass("size-1.5", "bg-accent");
+      expect(dot).not.toHaveClass("oc-alive-dot");
       expect(dot).not.toHaveClass("motion-safe:animate-pulse");
     }
   });

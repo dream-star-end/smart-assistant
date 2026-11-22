@@ -1175,12 +1175,6 @@ body {
       --oc-dock-b: 20%;
       animation: oc-dock-breathe 3.6s ease-in-out infinite;
     }
-    .oc-composer-dock[data-swarm="true"] {
-      --oc-dock-r: 1.5px;
-      --oc-dock-a: 10%;
-      --oc-dock-b: 18%;
-      animation: oc-dock-breathe 4.2s ease-in-out infinite;
-    }
     @media (hover: hover) {
       .oc-shimmer-sheen:hover::after { animation: oc-sheen-sweep 760ms var(--ease-emphasized-decel) 1; }
     }

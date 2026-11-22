@@ -235,7 +235,7 @@ function RosterMemberRow({
             member.failed
               ? "bg-danger"
               : working
-                ? "oc-alive-dot"
+                ? "bg-accent"
                 : killed
                   ? "bg-faint"
                   : "bg-success",
@@ -659,6 +659,7 @@ export function SwarmBoardDrawer({
           ref={contentRef}
           tabIndex={-1}
           data-testid="swarm-board-drawer"
+          data-swarm-active={active ? "true" : undefined}
           aria-describedby={undefined}
           onOpenAutoFocus={(e) => {
             e.preventDefault();
@@ -689,7 +690,7 @@ export function SwarmBoardDrawer({
               className={cn(
                 "oc-icon-badge relative size-7 shrink-0 rounded-xl sm:size-8",
                 active
-                  ? "oc-icon-badge-accent oc-breathe-aura"
+                  ? "oc-icon-badge-accent"
                   : snapshot.phase === "completed"
                     ? "oc-icon-badge-success"
                     : snapshot.phase === "error"
@@ -705,8 +706,7 @@ export function SwarmBoardDrawer({
                 <RD.Title className="min-w-0 truncate text-section font-semibold tracking-[-0.015em] text-fg sm:text-title">
                   {snapshot.title || "蜂群协作看板"}
                 </RD.Title>
-                <Badge tone={phase.tone} className="shrink-0 gap-1.5">
-                  {active && <span aria-hidden className="oc-alive-dot size-1.5 shrink-0" />}
+                <Badge tone={phase.tone} className="shrink-0">
                   {phase.label}
                 </Badge>
               </div>
