@@ -71,8 +71,9 @@ describe("getApiKeyUsageReport — SQL 形状", () => {
       assert.equal(q.params[0], "7");
       assert.ok(!/\$3/.test(q.sql), "未钉 key 时不得出现 $3");
     }
-    const recent = queries.find((q) => /ORDER BY u\.created_at DESC/i.test(q.sql))!;
-    assert.ok(recent, "recent 段存在");
+    const recent = queries.find((q) => /ORDER BY u\.id DESC/i.test(q.sql))!;
+    assert.ok(recent, "recent 段存在且按 u.id DESC 排序(与分页端点排序键一致)");
+    assert.ok(!/ORDER BY u\.created_at/i.test(recent.sql), "首屏 recent 不得再按 created_at 混序");
     assert.ok(!/status\s*=\s*'success'/i.test(recent.sql), "recent 段不按 status 过滤(失败请求也可见)");
     assert.match(recent.sql, /LIMIT 50/);
     const byKey = queries.find((q) => /GROUP BY u\.api_key_id/i.test(q.sql))!;
@@ -196,5 +197,89 @@ describe("listApiKeyUsageRecent — SQL 形状与游标语义", () => {
       listApiKeyUsageRecent("7", "7d", null, { beforeId: "1 OR 1=1" }),
       /beforeId must be validated by caller/,
     );
+  });
+
+  test("首屏(getApiKeyUsageReport.recent)与后续页(listApiKeyUsageRecent)在时间戳打平/逆序时零漏行零重复", async () => {
+    // 构造 55 条同窗口记录(id 1001..1055):
+    //   - 1004 / 1005 / 1006 共享完全相同的 created_at(打平时间戳);
+    //   - 1007(高 id)的 created_at 比 1003(低 id)更早(模拟并发长事务开始早但晚分配 id)。
+    // 若首屏仍按 created_at DESC, id DESC 排序,1007 会被挤出首屏前 50,而首屏末行 id < 1007,
+    // 后续页按 u.id < before 拉取将永久漏掉 1007 且重复拉出已进首屏的 1003。
+    const baseMs = Date.parse("2026-09-08T12:00:00.000Z");
+    const dataset = Array.from({ length: 55 }, (_, i) => {
+      const id = 1001 + i;
+      let tsMs = baseMs + i * 1000;
+      if (id >= 1004 && id <= 1006) tsMs = baseMs + 5000; // 同毫秒打平
+      if (id === 1007) tsMs = baseMs - 60_000; // 高 id 但更早的事务开始时间
+      if (id === 1003) tsMs = baseMs + 90_000; // 低 id 但更新的事务开始时间
+      return {
+        id: String(id),
+        created_at: new Date(tsMs).toISOString(),
+        tsMs,
+        api_key_id: "11",
+        label: "k",
+        model: "cursor-haiku-4.5",
+        input_tokens: "1",
+        output_tokens: "1",
+        cache_read_tokens: "0",
+        cache_write_tokens: "0",
+        cost_credits: "3",
+        status: "success",
+      };
+    });
+
+    const pool = {
+      async query(sql: string, params: unknown[] = []) {
+        const trimmed = sql.trim();
+        if (/^SELECT COUNT\(\*\)::TEXT/i.test(trimmed)) {
+          return {
+            rows: [{ requests: "55", input_tokens: "55", output_tokens: "55", cache_read_tokens: "0", cache_write_tokens: "0", credits: "165" }],
+            rowCount: 1,
+          };
+        }
+        if (/FROM\s+usage_records\s+u\b/i.test(trimmed) && !/GROUP\s+BY/i.test(trimmed)) {
+          const beforeMatch = trimmed.match(/u\.id\s*<\s*\$(\d+)::bigint/i);
+          const beforeId = beforeMatch ? BigInt(params[Number(beforeMatch[1]) - 1] as string) : null;
+          const limitParamMatch = trimmed.match(/LIMIT\s+\$(\d+)/i);
+          const limitLiteralMatch = trimmed.match(/LIMIT\s+(\d+)/i);
+          const lim = limitParamMatch
+            ? Number(params[Number(limitParamMatch[1]) - 1])
+            : limitLiteralMatch
+              ? Number(limitLiteralMatch[1])
+              : 50;
+          const sortByCreatedAt = /ORDER\s+BY\s+u\.created_at\s+DESC/i.test(trimmed);
+          const filtered = dataset.filter((r) => (beforeId === null ? true : BigInt(r.id) < beforeId));
+          filtered.sort((a, b) => {
+            if (sortByCreatedAt && b.tsMs !== a.tsMs) return b.tsMs - a.tsMs;
+            return BigInt(b.id) > BigInt(a.id) ? 1 : -1;
+          });
+          const rows = filtered.slice(0, lim).map(({ tsMs: _ts, ...rest }) => rest);
+          return { rows, rowCount: rows.length };
+        }
+        return { rows: [], rowCount: 0 };
+      },
+      async connect() { throw new Error("not used"); },
+      async end() {},
+    } as unknown as Pool;
+    setPoolOverride(pool);
+
+    const report = await getApiKeyUsageReport("7", "7d", null);
+    assert.equal(report.recent.length, 50);
+    const page1Ids = report.recent.map((r) => r.id);
+    const lastPage1Id = page1Ids[page1Ids.length - 1]!;
+    assert.equal(lastPage1Id, "1006");
+
+    const page2 = await listApiKeyUsageRecent("7", "7d", null, { beforeId: lastPage1Id, limit: 3 });
+    assert.deepEqual(page2.entries.map((r) => r.id), ["1005", "1004", "1003"]);
+    assert.equal(page2.next_before, "1003");
+
+    const page3 = await listApiKeyUsageRecent("7", "7d", null, { beforeId: page2.next_before, limit: 10 });
+    assert.deepEqual(page3.entries.map((r) => r.id), ["1002", "1001"]);
+    assert.equal(page3.next_before, null);
+
+    const combined = [...page1Ids, ...page2.entries.map((r) => r.id), ...page3.entries.map((r) => r.id)];
+    const expected = Array.from({ length: 55 }, (_, i) => String(1055 - i));
+    assert.deepEqual(combined, expected, "首屏 + 后续页必须覆盖全部 55 条且严格按 id 降序,零漏行零重复");
+    assert.equal(new Set(combined).size, 55);
   });
 });

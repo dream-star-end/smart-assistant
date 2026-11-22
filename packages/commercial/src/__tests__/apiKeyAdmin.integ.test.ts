@@ -218,27 +218,33 @@ function buildFakePool(): FakePoolHandle {
       // maintenance_mode = false(无 row → DEFAULTS)
       return { rows: [], rowCount: 0 };
     }
-    // ─── usage/recent 游标分页(listApiKeyUsageRecent)────────────────────
+    // ─── usage.recent 首屏 & usage/recent 游标分页(均 ORDER BY u.id DESC)──
     //
-    // 按 SQL 形状匹配:FROM usage_records u + ORDER BY u.id DESC。参数序是
-    // $1 user_id, $2 hours,后跟可选 key_id / before,末位恒为 limit+1。
-    // 这里在内存里复刻同一谓词(窗口 / key / before / **不过滤 status**)与排序,
-    // 让 next_before 连续性、失败行可见性等断言真的走 handler → 数据层 → SQL 形状。
-    if (/FROM\s+usage_records\s+u/i.test(trimmed) && /ORDER\s+BY\s+u\.id\s+DESC/i.test(trimmed)) {
+    // 按 SQL 形状匹配:FROM usage_records u + ORDER BY u.id DESC(不带 GROUP BY)。
+    // 首屏 getApiKeyUsageReport.recent 用字面量 `LIMIT 50`;分页 listApiKeyUsageRecent
+    // 用参数化 `LIMIT $N`(limit+1)。这里真实解析 SQL 里的 LIMIT / before / key_id,
+    // 让首屏→翻页的跨页连续性真走 handler → 数据层 → SQL 形状。
+    if (/FROM\s+usage_records\s+u\b/i.test(trimmed) && /ORDER\s+BY\s+u\.id\s+DESC/i.test(trimmed)) {
       const userId = params[0] as string;
       const hours = Number(params[1]);
       const keyIdx = trimmed.match(/u\.api_key_id\s*=\s*\$(\d+)::bigint/i);
       const beforeIdx = trimmed.match(/u\.id\s*<\s*\$(\d+)::bigint/i);
+      const limitParamIdx = trimmed.match(/LIMIT\s+\$(\d+)/i);
+      const limitLiteralIdx = trimmed.match(/LIMIT\s+(\d+)/i);
       const keyId = keyIdx ? (params[Number(keyIdx[1]) - 1] as string) : null;
       const before = beforeIdx ? (params[Number(beforeIdx[1]) - 1] as string) : null;
-      const limitPlusOne = Number(params[params.length - 1]);
+      const rowLimit = limitParamIdx
+        ? Number(params[Number(limitParamIdx[1]) - 1])
+        : limitLiteralIdx
+          ? Number(limitLiteralIdx[1])
+          : 50;
       const rows = usage
         .filter((r) => r.user_id === userId && r.api_key_id !== null)
         .filter((r) => r.hoursAgo <= hours)
         .filter((r) => (keyId === null ? true : r.api_key_id === keyId))
         .filter((r) => (before === null ? true : BigInt(r.id) < BigInt(before)))
         .sort((a, b) => (BigInt(b.id) > BigInt(a.id) ? 1 : -1))
-        .slice(0, limitPlusOne)
+        .slice(0, rowLimit)
         .map((r) => ({
           id: r.id,
           created_at: new Date(Date.now() - r.hoursAgo * 3600_000).toISOString(),
@@ -255,12 +261,8 @@ function buildFakePool(): FakePoolHandle {
       return { rows, rowCount: rows.length };
     }
 
-    // ─── GET /api/me/api-keys/usage 报表的五段查询 ────────────────────────
-    //
-    // 本文件只用它验"/usage 返回体形状没被 /usage/recent 改动",不验聚合数值:
-    // summary / trend / by_key / by_model 返空,recent 段用同一份内存数据(按
-    // created_at DESC 排,固定前 50 条 —— 即前端的第一页)。
-    if (/FROM\s+usage_records\s+u/i.test(trimmed) && /ORDER\s+BY\s+u\.created_at\s+DESC/i.test(trimmed)) {
+    // ─── 若回退成 ORDER BY u.created_at DESC,按 created_at 排以暴露混序漏行 ──
+    if (/FROM\s+usage_records\s+u\b/i.test(trimmed) && /ORDER\s+BY\s+u\.created_at\s+DESC/i.test(trimmed)) {
       const userId = params[0] as string;
       const hours = Number(params[1]);
       const keyId = /\$3::bigint/i.test(trimmed) ? (params[2] as string) : null;
@@ -268,7 +270,7 @@ function buildFakePool(): FakePoolHandle {
         .filter((r) => r.user_id === userId && r.api_key_id !== null)
         .filter((r) => r.hoursAgo <= hours)
         .filter((r) => (keyId === null ? true : r.api_key_id === keyId))
-        .sort((a, b) => a.hoursAgo - b.hoursAgo)
+        .sort((a, b) => (a.hoursAgo !== b.hoursAgo ? a.hoursAgo - b.hoursAgo : BigInt(b.id) > BigInt(a.id) ? 1 : -1))
         .slice(0, 50)
         .map((r) => ({
           id: r.id,
@@ -1508,5 +1510,55 @@ describe("GET /api/me/api-keys/usage/recent — 游标分页", () => {
     const pb = report.bodyJson() as Record<string, unknown>;
     assert.ok("summary" in pb && Array.isArray(pb.recent), "/usage 仍是报表形状(recent 前 50 条)");
     assert.ok(!("next_before" in pb), "/usage 返回体不变,不引入分页字段");
+  });
+
+  test("跨端点首屏(/usage.recent) → 翻页(/usage/recent?before=)在时间戳打平与逆序下零漏行零重复", async () => {
+    const h = await buildHarness();
+    const jwt = await h.jwtFor(USER_A_ID);
+    const created = await runReq(h, {
+      method: "POST",
+      url: "/api/me/api-keys",
+      headers: { authorization: `Bearer ${jwt}` },
+      body: { label: "cross-page" },
+    });
+    assert.equal(created.statusCode, 201);
+    const keyId = (created.bodyJson() as { id: string }).id;
+
+    // 造 55 条记录(id 5001..5055):
+    //   - 5005..5007 同时间戳(hoursAgo=1.0)
+    //   - 5008(高 id)事务开始早(hoursAgo=3.0)
+    //   - 5003(低 id)事务开始晚(hoursAgo=0.1)
+    for (let id = 5001; id <= 5055; id++) {
+      let hoursAgo = 2 - (id - 5001) * 0.02;
+      if (id >= 5005 && id <= 5007) hoursAgo = 1.0;
+      if (id === 5008) hoursAgo = 3.0;
+      if (id === 5003) hoursAgo = 0.1;
+      seedRecent(h.fp, USER_A_ID, keyId, [id], { hoursAgo });
+    }
+
+    const firstRes = await runReq(h, {
+      method: "GET",
+      url: "/api/me/api-keys/usage?window=7d",
+      headers: { authorization: `Bearer ${jwt}` },
+    });
+    assert.equal(firstRes.statusCode, 200, firstRes.bodyText());
+    const firstBody = firstRes.bodyJson() as { recent: { id: string }[] };
+    assert.equal(firstBody.recent.length, 50);
+    const cursor = firstBody.recent[firstBody.recent.length - 1]!.id;
+    assert.equal(cursor, "5006");
+
+    const secondRes = await runReq(h, {
+      method: "GET",
+      url: `/api/me/api-keys/usage/recent?window=7d&before=${cursor}&limit=50`,
+      headers: { authorization: `Bearer ${jwt}` },
+    });
+    assert.equal(secondRes.statusCode, 200, secondRes.bodyText());
+    const secondBody = secondRes.bodyJson() as RecentPageBody;
+    assert.equal(secondBody.next_before, null);
+
+    const allIds = [...firstBody.recent.map((r) => r.id), ...secondBody.entries.map((r) => r.id)];
+    const expectedIds = Array.from({ length: 55 }, (_, i) => String(5055 - i));
+    assert.deepEqual(allIds, expectedIds, "首屏 /usage.recent + 后续页 /usage/recent 必须零漏行零重复");
+    assert.equal(new Set(allIds).size, 55);
   });
 });

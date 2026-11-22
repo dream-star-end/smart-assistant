@@ -96,10 +96,10 @@ type ApiKeyMessageAuditPage = {
  * 复用统一的透明刷新 / 身份围栏 / JSON 解包三件套即可(与 MediaTaskCenter 同一先例),
  * 不必为一次性的查询在全局 api 对象上再挂两个方法。
  */
-async function getJson<T>(auth: AuthSession, path: string): Promise<T> {
+async function getJson<T>(auth: AuthSession, path: string, signal?: AbortSignal): Promise<T> {
   return jsonOrThrow<T>(
     callWithRefresh(auth, (token) =>
-      fetch(path, { credentials: "include", headers: bearerHeaders(token) }),
+      fetch(path, { credentials: "include", headers: bearerHeaders(token), signal }),
     ),
   );
 }
@@ -185,6 +185,12 @@ export function ApiKeyUsagePanel({ auth, keys }: { auth: AuthSession; keys: ApiK
   const [recentBefore, setRecentBefore] = useState<string | null | undefined>(undefined);
   const [recentLoading, setRecentLoading] = useState(false);
   const [recentErr, setRecentErr] = useState<string | null>(null);
+  /**
+   * 筛选代数（window / keyId / auth / reloadTick 变更或卸载时递增）：
+   * 隔离进行中的 loadMoreRecent 竞态，避免切换筛选条件后旧请求晚到追加旧行或覆盖游标。
+   */
+  const filterGenRef = useRef(0);
+  const loadMoreAbortRef = useRef<AbortController | null>(null);
 
   // 被撤销的 key 会从列表消失；若当前正按它过滤则回到「全部」。
   useEffect(() => {
@@ -193,27 +199,32 @@ export function ApiKeyUsagePanel({ auth, keys }: { auth: AuthSession; keys: ApiK
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: reloadTick 是显式重试触发器。
   useEffect(() => {
-    let alive = true;
+    const gen = ++filterGenRef.current;
+    loadMoreAbortRef.current?.abort();
+    loadMoreAbortRef.current = null;
     setLoading(true);
     setErr(null);
     setReport(null);
     // 窗口 / key 过滤变了，之前翻出来的分页结果与新条件无关，必须整体重置。
     setMoreRecent([]);
     setRecentBefore(undefined);
+    setRecentLoading(false);
     setRecentErr(null);
     api
       .getApiKeyUsage(auth, window, keyId === ALL_KEYS ? undefined : keyId)
       .then((r) => {
-        if (alive) setReport(r);
+        if (filterGenRef.current === gen) setReport(r);
       })
       .catch((e) => {
-        if (alive) setErr(apiErrorMessage(e, "加载 API Key 消耗统计失败"));
+        if (filterGenRef.current === gen) setErr(apiErrorMessage(e, "加载 API Key 消耗统计失败"));
       })
       .finally(() => {
-        if (alive) setLoading(false);
+        if (filterGenRef.current === gen) setLoading(false);
       });
     return () => {
-      alive = false;
+      filterGenRef.current += 1;
+      loadMoreAbortRef.current?.abort();
+      loadMoreAbortRef.current = null;
     };
   }, [auth, window, keyId, reloadTick]);
 
@@ -235,6 +246,10 @@ export function ApiKeyUsagePanel({ auth, keys }: { auth: AuthSession; keys: ApiK
     if (!last || recentLoading) return;
     const cursor = recentBefore === undefined ? last.id : recentBefore;
     if (cursor === null) return;
+    const gen = filterGenRef.current;
+    loadMoreAbortRef.current?.abort();
+    const ac = new AbortController();
+    loadMoreAbortRef.current = ac;
     setRecentLoading(true);
     setRecentErr(null);
     try {
@@ -247,13 +262,17 @@ export function ApiKeyUsagePanel({ auth, keys }: { auth: AuthSession; keys: ApiK
       const page = await getJson<ApiKeyUsageRecentPage>(
         auth,
         `/api/me/api-keys/usage/recent?${qs.toString()}`,
+        ac.signal,
       );
+      if (filterGenRef.current !== gen || ac.signal.aborted) return;
       setMoreRecent((prev) => [...prev, ...page.entries]);
       setRecentBefore(page.next_before);
     } catch (e) {
+      if (filterGenRef.current !== gen || ac.signal.aborted) return;
       setRecentErr(apiErrorMessage(e, "加载更多明细失败"));
     } finally {
-      setRecentLoading(false);
+      if (loadMoreAbortRef.current === ac) loadMoreAbortRef.current = null;
+      if (filterGenRef.current === gen) setRecentLoading(false);
     }
   }, [auth, window, keyId, recentRows, recentBefore, recentLoading]);
 
@@ -586,6 +605,12 @@ export function ApiKeyAuditPanel({ auth, keys }: { auth: AuthSession; keys: ApiK
   const [err, setErr] = useState<string | null>(null);
   const [hidden, setHidden] = useState(false);
   const [reloadTick, setReloadTick] = useState(0);
+  /**
+   * 筛选代数（keyId / errorsOnly / auth / reloadTick 变更或卸载时递增）：
+   * 隔离进行中的 loadMore 竞态，避免切换筛选条件后旧请求晚到追加旧行或覆盖游标。
+   */
+  const filterGenRef = useRef(0);
+  const loadMoreAbortRef = useRef<AbortController | null>(null);
 
   // 撤销后的 key 会从下拉里消失，同 usage 面板：回到「全部」。
   useEffect(() => {
@@ -594,22 +619,26 @@ export function ApiKeyAuditPanel({ auth, keys }: { auth: AuthSession; keys: ApiK
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: reloadTick 是显式重试触发器。
   useEffect(() => {
-    let alive = true;
+    const gen = ++filterGenRef.current;
+    loadMoreAbortRef.current?.abort();
+    loadMoreAbortRef.current = null;
+    const ac = new AbortController();
     setLoading(true);
+    setMore(false);
     setErr(null);
     setEntries([]);
     setNextBefore(null);
     const qs = new URLSearchParams({ limit: String(AUDIT_PAGE_SIZE) });
     if (keyId !== ALL_KEYS) qs.set("key_id", keyId);
     if (errorsOnly) qs.set("errors_only", "1");
-    getJson<ApiKeyMessageAuditPage>(auth, `/api/me/api-keys/messages?${qs.toString()}`)
+    getJson<ApiKeyMessageAuditPage>(auth, `/api/me/api-keys/messages?${qs.toString()}`, ac.signal)
       .then((page) => {
-        if (!alive) return;
+        if (filterGenRef.current !== gen || ac.signal.aborted) return;
         setEntries(page.entries);
         setNextBefore(page.next_before);
       })
       .catch((e) => {
-        if (!alive) return;
+        if (filterGenRef.current !== gen || ac.signal.aborted) return;
         if (e instanceof ApiError && e.status === 403) {
           setHidden(true);
           return;
@@ -617,15 +646,22 @@ export function ApiKeyAuditPanel({ auth, keys }: { auth: AuthSession; keys: ApiK
         setErr(apiErrorMessage(e, "加载请求审计失败"));
       })
       .finally(() => {
-        if (alive) setLoading(false);
+        if (filterGenRef.current === gen) setLoading(false);
       });
     return () => {
-      alive = false;
+      filterGenRef.current += 1;
+      ac.abort();
+      loadMoreAbortRef.current?.abort();
+      loadMoreAbortRef.current = null;
     };
   }, [auth, keyId, errorsOnly, reloadTick]);
 
   const loadMore = useCallback(async () => {
     if (nextBefore === null || more) return;
+    const gen = filterGenRef.current;
+    loadMoreAbortRef.current?.abort();
+    const ac = new AbortController();
+    loadMoreAbortRef.current = ac;
     setMore(true);
     setErr(null);
     try {
@@ -638,13 +674,17 @@ export function ApiKeyAuditPanel({ auth, keys }: { auth: AuthSession; keys: ApiK
       const page = await getJson<ApiKeyMessageAuditPage>(
         auth,
         `/api/me/api-keys/messages?${qs.toString()}`,
+        ac.signal,
       );
+      if (filterGenRef.current !== gen || ac.signal.aborted) return;
       setEntries((prev) => [...prev, ...page.entries]);
       setNextBefore(page.next_before);
     } catch (e) {
+      if (filterGenRef.current !== gen || ac.signal.aborted) return;
       setErr(apiErrorMessage(e, "加载更多审计失败"));
     } finally {
-      setMore(false);
+      if (loadMoreAbortRef.current === ac) loadMoreAbortRef.current = null;
+      if (filterGenRef.current === gen) setMore(false);
     }
   }, [auth, keyId, errorsOnly, nextBefore, more]);
 
