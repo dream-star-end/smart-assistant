@@ -1058,6 +1058,8 @@ selfhost_master_migrate_legacy_to_dual_slot() { # <rel> [prev_live]
 
   atomic_flip_slot_symlink B "$rel" || return 1
   if ! systemctl start "$(selfhost_master_slot_unit B)"; then
+    systemctl stop "$(selfhost_master_slot_unit B)" 2>/dev/null || true
+    systemctl reset-failed "$(selfhost_master_slot_unit B)" 2>/dev/null || true
     selfhost_ds_log "  ✗ 预热 @B 失败;legacy 零触碰"; rm -f -- "$V5_MIGRATION_STATE_FILE"; return 1
   fi
   if ! selfhost_wait_slot_standby_ready B 90; then

@@ -11,6 +11,7 @@ import {
   assertFlavorForMigrate,
   assertFlavorIdentity,
   parseFlavorManifest,
+  pathMatchesExpectedRoot,
 } from "./assertFlavor.js";
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
@@ -282,5 +283,12 @@ describe("adversarial identity", () => {
       () => parseFlavorManifest(JSON.parse(readFileSync(path.join(fixtures, "schema-bool-true.json"), "utf8"))),
       /schema must be integer/,
     );
+  });
+
+  test("OCV5-854: dual-slot -slot-A and -slot-B symlinks match expectedRoots while invalid slots reject", () => {
+    assert.equal(pathMatchesExpectedRoot("/opt/openclaude/openclaude-v5-selfhost-slot-A", ["/opt/openclaude/openclaude-v5-selfhost"]), true);
+    assert.equal(pathMatchesExpectedRoot("/opt/openclaude/openclaude-v5-selfhost-slot-B/scripts/lib", ["/opt/openclaude/openclaude-v5-selfhost"]), true);
+    assert.equal(pathMatchesExpectedRoot("/opt/openclaude/openclaude-v5-selfhost-slot-C", ["/opt/openclaude/openclaude-v5-selfhost"]), false);
+    assert.equal(pathMatchesExpectedRoot("/opt/openclaude/openclaude-v5-slot-B", ["/opt/openclaude/openclaude-v5-selfhost"]), false);
   });
 });
