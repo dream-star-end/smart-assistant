@@ -1,7 +1,7 @@
 [Unit]
 Description=Cloudflared quick tunnel for OpenClaude V5 self-host gateway (18790)
-After=network.target openclaude-v5-selfhost.service
-Wants=openclaude-v5-selfhost.service
+After=network.target openclaude-v5-selfhost-frontdoor.service
+Wants=openclaude-v5-selfhost-frontdoor.service
 
 [Service]
 Type=simple

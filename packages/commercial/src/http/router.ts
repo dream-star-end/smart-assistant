@@ -514,9 +514,21 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
   // 内存 / 技能(host singleton 存储)。memdir 范式后 memory 面多了 files/:file 子路由
   // (单条记忆文件 CRUD),与 memory/user 同属 host singleton,必须一并拦死;文件名段
   // 放宽到任意非斜杠段(拦截面宁宽勿漏,文件名合法性校验是容器 gateway 的事)。
+  // Clarvy 记忆归档箱与还原子路由(memory/archive、memory/archive/restore)一并兜底。
   {
-    re: /^\/api\/agents\/[^/]+\/memory\/(memory|user|usage|context|files\/[^/]+)$/,
+    re: /^\/api\/agents\/[^/]+\/memory\/(memory|user|usage|context|files\/[^/]+|archive(\/restore)?)$/,
     label: '/api/agents/:id/memory/*',
+  },
+  // Clarvy 上下文健康体检与确定性清理(OCV5-859):已登录用户由前置 containerApiProxy
+  // 透传至用户容器;这里全方法拦截作 host singleton 兜底,同时避免未鉴权请求落入
+  // COMMERCIAL_ROUTE_PREFIXES 的 /api/agents 后误返 404 而非 gateway 401。
+  {
+    re: /^\/api\/agents\/[^/]+\/context-health$/,
+    label: '/api/agents/:id/context-health',
+  },
+  {
+    re: /^\/api\/agents\/[^/]+\/context-hygiene\/.+$/,
+    label: '/api/agents/:id/context-hygiene/*',
   },
   // Auto-Dream Optimizer 读写用户容器内的审计/建议状态并可应用已确认的变更。
   // 正常请求先由 containerApiProxy 转发；这里全方法拦截仅作 host singleton 兜底。
@@ -538,6 +550,10 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
   { re: /^\/api\/agents\/[A-Za-z0-9_-]+\/browser\/(live|action)$/, label: '/api/agents/:id/browser/*' },
   // 用户级共享技能库(host singleton 存储);付费用户只能经 container proxy 操作自己容器
   { re: /^\/api\/skills(\/[A-Za-z0-9_\-]+)?$/, label: '/api/skills' },
+  // Clarvy 技能归档箱与归档/还原(OCV5-859):/api/skills/archive 已被上行覆盖,
+  // 这里补齐 /api/skills/archive/restore 与 /api/skills/:name/archive 宿主兜底。
+  { re: /^\/api\/skills\/archive\/restore$/, label: '/api/skills/archive/restore' },
+  { re: /^\/api\/skills\/[^/]+\/archive$/, label: '/api/skills/:name/archive' },
   // SkillOpt 训练(/api/skills/:name/train + /api/skill-training/*):同样落 host singleton
   // 存储 + 起 host 主 agent 会话 = RCE/越权,付费用户必须经 container proxy(见 bridge
   // allowlist)。这里 block host 兜底,防 proxy 关闭/admin 绕过时落到 master host。

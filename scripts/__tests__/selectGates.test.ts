@@ -140,6 +140,36 @@ describe("selectGates mapping edges", () => {
     assert.deepEqual(locked.map((g) => g.id), ["test:commercial:unit:gate"]);
     assert.deepEqual(unlocked.map((g) => g.id), ["test:browser"]);
   });
+
+  test("Wave 1/2 治理快门选门映射(OCV5-847/849/859):按触及面精准触发 cheap 快门,不拉重浏览器", () => {
+    assert.ok(ids(["AGENTS.md"]).includes("check:docs-links"));
+    assert.ok(ids(["packages/commercial/src/http/router.ts"]).includes("check:route-sync"));
+    assert.ok(ids(["packages/gateway/src/bridgeApiAllowlist.ts"]).includes("check:route-sync"));
+    assert.ok(ids(["packages/commercial/src/db/migrations/0280_test.sql"]).includes("check:pg-migration-safety"));
+    assert.ok(ids(["packages/protocol/src/httpContracts.ts"]).includes("check:rest-contract"));
+    assert.ok(ids(["packages/web-react/budgets.json"]).includes("check:monotonic-baselines"));
+    assert.ok(ids(["deploy/v5/feature-flags-registry.json"]).includes("check:feature-flags-ttl"));
+    assert.ok(ids(["deploy/v5/feature-flags-registry.json"]).includes("check:monotonic-baselines"));
+    assert.ok(ids(["changelog.json"]).includes("check:changelog-guard"));
+    assert.ok(ids(["packages/web-react/src/App.tsx"]).includes("check:ui-gates"));
+    assert.ok(ids(["scripts/check-v5-route-sync.ts"]).includes("check:governance:fast"));
+    assert.ok(ids(["scripts/deploy-v5-selfhost.sh"]).includes("test:v5:ops"));
+    for (const g of [
+      "check:docs-links",
+      "check:ui-gates",
+      "check:no-weak-downgrade",
+      "check:route-sync",
+      "check:monotonic-baselines",
+      "check:changelog-guard",
+      "check:feature-flags-ttl",
+      "check:pg-migration-safety",
+      "check:rest-contract",
+      "check:governance:fast",
+    ] as const) {
+      assert.equal(gateMeta(g).cost, "cheap", `${g} must stay cheap`);
+      assert.equal(gateMeta(g).lock, null, `${g} must be lock-free`);
+    }
+  });
 });
 
 describe("check:v5:fast 不得削弱 CI", () => {

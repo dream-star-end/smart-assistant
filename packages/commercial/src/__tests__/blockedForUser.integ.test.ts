@@ -196,6 +196,16 @@ describe("BLOCKED_FOR_USER_RULES — user role → 403", () => {
     { path: "/api/agents/main/memory/files/some-fact.md", method: "GET" },
     { path: "/api/agents/main/memory/files/some-fact.md", method: "PUT" },
     { path: "/api/agents/main/memory/files/some-fact.md", method: "DELETE" },
+    // Clarvy 上下文健康、确定性清理、记忆归档箱与技能归档箱(OCV5-859)
+    { path: "/api/agents/main/context-health", method: "GET" },
+    { path: "/api/agents/main/context-hygiene/run", method: "POST" },
+    { path: "/api/agents/main/context-hygiene/history", method: "GET" },
+    { path: "/api/agents/main/memory/archive", method: "GET" },
+    { path: "/api/agents/main/memory/archive", method: "POST" },
+    { path: "/api/agents/main/memory/archive/restore", method: "POST" },
+    { path: "/api/skills/archive", method: "GET" },
+    { path: "/api/skills/archive/restore", method: "POST" },
+    { path: "/api/skills/my-skill/archive", method: "POST" },
     // Auto-Dream Optimizer 正常走 container proxy；缺少 proxy deps 时不能落到 host singleton
     { path: "/api/agents/main/auto-dream-optimizer", method: "GET" },
     { path: "/api/agents/main/auto-dream-optimizer", method: "POST" },
@@ -345,6 +355,19 @@ describe("BLOCKED_FOR_USER_RULES — fall through paths", () => {
     const r = await fetchWith("/api/cron", "GET");
     assert.equal(r.status, 404);
     assert.equal(r.text, FALLTHROUGH_MARKER);
+    // OCV5-859: Clarvy context-health / archive routes under /api/agents must also
+    // fall through to gateway auth (401) rather than returning commercial 404 NOT_FOUND.
+    for (const p of [
+      "/api/agents/main/context-health",
+      "/api/agents/main/context-hygiene/history",
+      "/api/agents/main/memory/archive",
+      "/api/skills/archive/restore",
+      "/api/skills/my-skill/archive",
+    ]) {
+      const c = await fetchWith(p, "GET");
+      assert.equal(c.status, 404, `expected fallthrough marker for ${p}, got ${c.status} ${c.text}`);
+      assert.equal(c.text, FALLTHROUGH_MARKER, `must not return commercial 404 for ${p}`);
+    }
   });
 
   test("invalid JWT → fall through", async (t) => {

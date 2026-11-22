@@ -1328,6 +1328,174 @@ master_note_architecture() { # <report.json>
   mlog "  architecture: violations/identities/grown/stale/unmapped/seconds = $counts"
 }
 
+# ── Wave 1/2 秒级只读治理快门(OCV5-847/849/859)──────────────────────────
+# 接入宿主本地发布列车(build_master_release 在 C/D 并行任务之前执行),只跑秒级只读快门:
+#   - 纯文件系统治理快门(对齐 package.json check:governance:fast)直接在 pinned $staging 执行;
+#   - git/base-ref 快门(rest-contract-compat / monotonic-baselines / pg-migration-safety /
+#     changelog-guard)带 safe.directory=* 与只读 GIT_DIR 对齐 pinned $full_sha 与解析出的 base_ref;
+#   - 零副作用(不写 staging / REPO_ROOT)、支持 detached HEAD、不跑重量级 Chromium 或全量测试。
+master_resolve_governance_base_ref() { # <full-sha> → stdout ref (explicit override invalid → fail-closed)
+  local full_sha="$1" live_root="" live_sha="" explicit="${OC_V5_GOVERNANCE_BASE_REF:-}"
+  local -a g=(env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory 'GIT_CONFIG_VALUE_0=*' git -C "$REPO_ROOT")
+  if [[ -n "$explicit" ]]; then
+    if "${g[@]}" rev-parse --verify --quiet "${explicit}^{commit}" >/dev/null 2>&1; then
+      printf '%s\n' "$explicit"
+      return 0
+    fi
+    mlog "✗ governance fast gate: OC_V5_GOVERNANCE_BASE_REF=$explicit 不是有效 commit"
+    return 1
+  fi
+  if [[ -L "${MASTER_LIVE_LINK:-}" ]]; then
+    live_root="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
+    if [[ -n "$live_root" && -f "$live_root/.complete" ]]; then
+      live_sha="$(jq -er '.sourceCommit // empty' "$live_root/.complete" 2>/dev/null || true)"
+      if [[ "$live_sha" =~ ^[0-9a-f]{40}$ ]] \
+        && "${g[@]}" cat-file -e "${live_sha}^{commit}" 2>/dev/null \
+        && "${g[@]}" merge-base "$live_sha" "$full_sha" >/dev/null 2>&1; then
+        printf '%s\n' "$live_sha"
+        return 0
+      fi
+    fi
+  fi
+  if "${g[@]}" rev-parse --verify --quiet 'origin/feat/v5-selfhost^{commit}' >/dev/null 2>&1 \
+    && "${g[@]}" merge-base 'origin/feat/v5-selfhost' "$full_sha" >/dev/null 2>&1; then
+    printf '%s\n' 'origin/feat/v5-selfhost'
+    return 0
+  fi
+  if "${g[@]}" rev-parse --verify --quiet "${full_sha}^^{commit}" >/dev/null 2>&1; then
+    "${g[@]}" rev-parse --verify "${full_sha}^"
+    return 0
+  fi
+  printf '%s\n' "$full_sha"
+}
+
+master_run_governance_fast_gates() { # <pinned-staging> <full-sha>
+  local staging="$1" full_sha="$2" base_ref="" git_dir="" head_sha="" s changed_mig changed_cl
+  local -a g=(env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory 'GIT_CONFIG_VALUE_0=*' git -C "$REPO_ROOT")
+  local -a tsx_cmd=(npx --no-install tsx)
+  if [[ -f "$staging/node_modules/tsx/dist/cli.mjs" ]]; then
+    tsx_cmd=(node "$staging/node_modules/tsx/dist/cli.mjs")
+  elif [[ -x "$staging/node_modules/.bin/tsx" ]]; then
+    tsx_cmd=("$staging/node_modules/.bin/tsx")
+  fi
+  local -a fast_scripts=(
+    scripts/check-docs-links.ts
+    scripts/check-ui-hard-gates.ts
+    scripts/check-no-silent-model-downgrade.ts
+    scripts/check-v5-route-sync.ts
+    scripts/check-feature-flags-ttl.ts
+    scripts/check-schedulers.ts
+    packages/commercial/scripts/lint-agent-containers-sql.ts
+    scripts/check-v5-test-retries.ts
+    scripts/check-integ-tiers.ts
+    scripts/check-v5-e2e-selectors.ts
+  )
+  local -a pg_file_args=()
+
+  mlog "── Wave 1/2 治理快门(只读/秒级, pinned staging @ ${full_sha:0:12}) ──"
+  for s in "${fast_scripts[@]}"; do
+    if [[ ! -f "$staging/$s" ]]; then
+      mlog "✗ governance fast gate: 候选缺 $s"
+      return 1
+    fi
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" \
+        GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="*" \
+        OC_TEST_RETRY_ENFORCE=1 \
+        "${tsx_cmd[@]}" "$s" ); then
+      mlog "✗ pinned governance fast gate 失败: $s"
+      return 1
+    fi
+  done
+
+  base_ref="$(master_resolve_governance_base_ref "$full_sha")" || return 1
+  git_dir="$("${g[@]}" rev-parse --absolute-git-dir 2>/dev/null || true)"
+  if [[ -z "$git_dir" || ! -d "$git_dir" ]]; then
+    mlog "✗ governance fast gate: 无法解析 REPO_ROOT=$REPO_ROOT 的 git-dir"
+    return 1
+  fi
+  mlog "  governance base_ref=$base_ref"
+
+  if [[ ! -f "$staging/scripts/check-rest-contract-compat.ts" ]]; then
+    mlog "✗ governance fast gate: 候选缺 scripts/check-rest-contract-compat.ts"
+    return 1
+  fi
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" \
+      GIT_DIR="$git_dir" \
+      GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="*" \
+      "${tsx_cmd[@]}" scripts/check-rest-contract-compat.ts --root "$staging" --base "$base_ref" ); then
+    mlog "✗ pinned REST contract compat gate 失败 (base=$base_ref)"
+    return 1
+  fi
+
+  if [[ ! -f "$staging/scripts/check-monotonic-baselines.ts" ]]; then
+    mlog "✗ governance fast gate: 候选缺 scripts/check-monotonic-baselines.ts"
+    return 1
+  fi
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" \
+      GIT_DIR="$git_dir" \
+      GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="*" \
+      "${tsx_cmd[@]}" scripts/check-monotonic-baselines.ts --root "$staging" --base "$base_ref" ); then
+    mlog "✗ pinned monotonic baselines gate 失败 (base=$base_ref)"
+    return 1
+  fi
+
+  if [[ ! -f "$staging/scripts/check-pg-migration-safety.ts" ]]; then
+    mlog "✗ governance fast gate: 候选缺 scripts/check-pg-migration-safety.ts"
+    return 1
+  fi
+  if ! changed_mig="$("${g[@]}" diff --name-only --diff-filter=AMR "${base_ref}...${full_sha}" -- 'packages/commercial/src/db/migrations/*.sql')"; then
+    mlog "✗ governance fast gate: git diff ${base_ref}...${full_sha} 迁移清单失败"
+    return 1
+  fi
+  while IFS= read -r s; do
+    [[ -n "$s" && -f "$staging/$s" ]] || continue
+    pg_file_args+=(--file "$staging/$s")
+  done <<<"$changed_mig"
+  if (( ${#pg_file_args[@]} > 0 )); then
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" \
+        OC_PG_MIGRATION_BOSS_APPROVED="${OC_PG_MIGRATION_BOSS_APPROVED:-0}" \
+        "${tsx_cmd[@]}" scripts/check-pg-migration-safety.ts --root "$staging" --no-squawk "${pg_file_args[@]}" ); then
+      mlog "✗ pinned PG migration safety gate 失败 (base=$base_ref)"
+      return 1
+    fi
+  else
+    mlog "  [pg-migration-safety] ok: 0 changed migration file(s) (${base_ref:0:12}...${full_sha:0:12})"
+  fi
+
+  if [[ ! -f "$staging/scripts/check-changelog-guard.ts" ]]; then
+    mlog "✗ governance fast gate: 候选缺 scripts/check-changelog-guard.ts"
+    return 1
+  fi
+  head_sha="$("${g[@]}" rev-parse --verify HEAD 2>/dev/null || true)"
+  if [[ "$head_sha" == "$full_sha" && "${ALLOW_DIRTY:-0}" != 1 && "${PLATFORM_FROM_HEAD:-0}" != 1 ]]; then
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" \
+        GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="*" \
+        BOSS_APPROVED_CHANGELOG="${BOSS_APPROVED_CHANGELOG:-0}" \
+        "${tsx_cmd[@]}" scripts/check-changelog-guard.ts --root "$REPO_ROOT" --base "$base_ref" ); then
+      mlog "✗ pinned changelog guard gate 失败 (base=$base_ref)"
+      return 1
+    fi
+  else
+    if ! changed_cl="$("${g[@]}" diff --name-only "${base_ref}...${full_sha}" -- changelog.json)"; then
+      mlog "✗ governance fast gate: git diff ${base_ref}...${full_sha} changelog.json 失败"
+      return 1
+    fi
+    if [[ -n "$changed_cl" ]]; then
+      if [[ "${BOSS_APPROVED_CHANGELOG:-0}" == 1 ]]; then
+        mlog "  [changelog-guard] changelog.json changed (${base_ref:0:12}...${full_sha:0:12}) — approved via BOSS_APPROVED_CHANGELOG=1"
+      else
+        mlog "✗ [GATE-ERROR] CHANGELOG-GUARD: changelog.json changed in ${base_ref:0:12}...${full_sha:0:12} without BOSS_APPROVED_CHANGELOG=1"
+        return 1
+      fi
+    else
+      mlog "  [changelog-guard] ok: changelog.json untouched (${base_ref:0:12}...${full_sha:0:12})"
+    fi
+  fi
+
+  tsum_note governanceFastGates "passed:${base_ref:0:12}" 2>/dev/null || :
+  mlog "  ✓ Wave 1/2 治理快门全部通过 (base=$base_ref)"
+}
+
 build_master_release() {
   local full_sha short_sha ts staging reldir donor t0 t1 build_id web_key web_donor
   MASTER_GATE_RECEIPT_IDS=""
@@ -1352,7 +1520,7 @@ build_master_release() {
 
   mlog "── build_master_release staging→$reldir (pinned $short_sha) ──"
   if [[ "${DRY:-0}" == 1 ]]; then
-    mlog "  [dry-run] git archive $full_sha → $staging; 硬链或 npm ci; staging vite; .complete; mv -T → $reldir"
+    mlog "  [dry-run] git archive $full_sha → $staging; 硬链或 npm ci; Wave 1/2 governance fast gates; staging vite; .complete; mv -T → $reldir"
     BUILT_MASTER_RELEASE="$reldir"
     return 0
   fi
@@ -1437,6 +1605,10 @@ build_master_release() {
   fi
   mlog "  发布门 TMPDIR=$MASTER_GATE_TMPDIR(tsx 缓存只属于本次构建,门跑完即删)"
   master_gate_receipt_prepare "$staging" "$full_sha"
+  if ! master_run_governance_fast_gates "$staging" "$full_sha"; then
+    cleanup_master_staging
+    die "pinned Wave 1/2 governance fast gates 失败(live 未改)"
+  fi
   # P3: C/D share up to three load-budgeted slots; Box/ccb-mcp stay isolated.
   # Keep literal commands in these nested functions: parity/incident gates inspect this body.
   tsum_mark C.parallel 2>/dev/null || :

@@ -2106,7 +2106,7 @@ cmd_deploy() {
   fi
   tsum_init 2>/dev/null || :
   log "══ v5 selfhost --deploy(不可变 master + 容器制品 + joint 翻转) ══"
-  log "流程: 构建 master release(staging vite) → runtime-release → platform bundle"
+  log "流程: 构建 master release(Wave 1/2 治理快门 + staging vite) → runtime-release → platform bundle"
   log "      → 复用 --cutover 同一套状态机翻转(survivor / 两级回滚 / 候选 snapshot unit)"
   log "      前端不再吃工作树;masterRelease/transitionKind 记新 live rel-*"
   preflight_common
