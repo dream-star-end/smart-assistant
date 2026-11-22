@@ -25,12 +25,75 @@ import type { AuthSession, Session } from "../lib/types";
 
 const ACTIVE_POLL_MS = 5_000;
 const REFRESH_THROTTLE_MS = 1_500;
+// 网关 cron 每 60s tick 一次（触发时刻可能落在目标分钟末尾如 :56），到期后按有限三段复查覆盖完整 tick 窗
+const CRON_DUE_RECHECK_OFFSETS_MS = [5_000, 35_000, 68_000] as const;
+const CRON_DUE_RECHECK_WINDOW_MS =
+  CRON_DUE_RECHECK_OFFSETS_MS[CRON_DUE_RECHECK_OFFSETS_MS.length - 1];
+const MAX_CRON_DUE_TIMER_MS = 24 * 60 * 60_000;
 export const BG_MEDIA_TERMINAL_RECENCY_MS = 30 * 60_000;
 const LIVE_MEDIA_MAP_CAP = 50;
 const EMPTY_STRING_SET: ReadonlySet<string> = new Set();
 
 function isSwarmRunningPhase(phase: string | undefined): boolean {
   return phase === "starting" || phase === "running";
+}
+
+function syncTrackedCronDues(
+  tracked: Map<string, number>,
+  crons: readonly SessionCronItem[],
+  watermark: number,
+): void {
+  const activeIds = new Set<string>();
+  for (const c of crons) {
+    const prevDue = tracked.get(c.id);
+    const lastRun =
+      typeof c.lastRunAt === "number" && Number.isFinite(c.lastRunAt) ? c.lastRunAt : null;
+    if (!c.enabled) {
+      // 网关执行一次性续跑时先写 enabled=false，结算完毕才写 lastRunAt：
+      // 仅对「已跟踪且已到期、无 lastRunAt 且复查窗未耗尽」的一次性任务保留剩余复查，
+      // 避免恰好撞进禁用中间态时提前取消后续复查；原本手动暂停的任务不在 tracked 中不会触发。
+      if (
+        c.oneshot === true &&
+        prevDue !== undefined &&
+        lastRun === null &&
+        watermark >= prevDue &&
+        watermark < prevDue + CRON_DUE_RECHECK_WINDOW_MS
+      ) {
+        activeIds.add(c.id);
+      }
+      continue;
+    }
+    activeIds.add(c.id);
+    const nextDue = c.nextRunAt !== null && Number.isFinite(c.nextRunAt) ? c.nextRunAt : null;
+    if (prevDue === undefined) {
+      if (nextDue !== null) tracked.set(c.id, nextDue);
+      continue;
+    }
+    // 后端已回报本次或更晚的执行记录 → 本轮复查提前收敛，周期任务滚动至下一次
+    if (lastRun !== null && lastRun >= prevDue) {
+      if (nextDue !== null && nextDue > prevDue) tracked.set(c.id, nextDue);
+      else tracked.delete(c.id);
+      continue;
+    }
+    // 调度被改早 → 立即跟进更早到期时间
+    if (nextDue !== null && nextDue < prevDue) {
+      tracked.set(c.id, nextDue);
+      continue;
+    }
+    // 三段复查窗未耗尽前保留本轮到期点：即使 computeNextRun 在过整点后已返回 null 或跳到下周期/明年，
+    // 仍须覆盖网关 60s tick 尾端（如 :56）完成执行后的清理复查
+    if (watermark < prevDue + CRON_DUE_RECHECK_WINDOW_MS) {
+      continue;
+    }
+    if (nextDue !== null && nextDue > prevDue) {
+      tracked.set(c.id, nextDue);
+    } else {
+      tracked.delete(c.id);
+    }
+  }
+  for (const id of tracked.keys()) {
+    if (!activeIds.has(id)) tracked.delete(id);
+  }
 }
 
 export function filterVisibleMuseJobs(
@@ -108,6 +171,7 @@ export function useSessionBackgroundTasks(
   const lastRefreshAtRef = useRef(0);
   const refreshTimerRef = useRef<number | null>(null);
   const prevRefreshTriggerRef = useRef(refreshTrigger);
+  const trackedCronDueRef = useRef<Map<string, number>>(new Map());
 
   // 记录实时观测到的非终态 H3 mediaJobs，终态在当前页保持可见直至「知道了」
   useEffect(() => {
@@ -131,6 +195,11 @@ export function useSessionBackgroundTasks(
       for (const job of res.snapshot.museJobs) {
         if (!isTerminalMuseJobStatus(job.status)) seenLiveRef.current.add(job.id);
       }
+      syncTrackedCronDues(
+        trackedCronDueRef.current,
+        res.snapshot.sessionCrons,
+        lastRefreshAtRef.current,
+      );
       setRawMuseJobs(res.snapshot.museJobs);
       setRawBgCommands(res.snapshot.bgCommands);
       setSessionCrons(res.snapshot.sessionCrons);
@@ -138,6 +207,7 @@ export function useSessionBackgroundTasks(
     }
     if (res.sessionNotReady) {
       committedSeqRef.current = mySeq;
+      trackedCronDueRef.current.clear();
       setRawMuseJobs([]);
       setRawBgCommands([]);
       setSessionCrons([]);
@@ -146,6 +216,7 @@ export function useSessionBackgroundTasks(
     if (res.routeMissing) {
       committedSeqRef.current = mySeq;
       routeMissingRef.current.add(sid);
+      trackedCronDueRef.current.clear();
       setRawMuseJobs([]);
       setRawBgCommands([]);
       setSessionCrons([]);
@@ -158,6 +229,7 @@ export function useSessionBackgroundTasks(
       refreshTimerRef.current = null;
     }
     prevRefreshTriggerRef.current = refreshTrigger;
+    trackedCronDueRef.current.clear();
     if (!enabled || !sessionId || !auth) {
       genRef.current += 1;
       committedSeqRef.current = ++requestSeqRef.current;
@@ -185,6 +257,28 @@ export function useSessionBackgroundTasks(
     // biome-ignore lint/correctness/useExhaustiveDependencies: refreshTrigger 由节流 effect 单独消费
   }, [enabled, sessionId, auth, pullTasks]);
 
+  const triggerThrottledPull = useCallback(
+    (sid: string, myGen: number) => {
+      if (!authRef.current || routeMissingRef.current.has(sid)) return;
+      const elapsed = Date.now() - lastRefreshAtRef.current;
+      if (elapsed >= REFRESH_THROTTLE_MS) {
+        if (refreshTimerRef.current !== null) {
+          window.clearTimeout(refreshTimerRef.current);
+          refreshTimerRef.current = null;
+        }
+        void pullTasks(sid, myGen);
+        return;
+      }
+      if (refreshTimerRef.current !== null) return;
+      const waitMs = Math.max(0, REFRESH_THROTTLE_MS - elapsed);
+      refreshTimerRef.current = window.setTimeout(() => {
+        refreshTimerRef.current = null;
+        if (genRef.current === myGen) void pullTasks(sid, myGen);
+      }, waitMs);
+    },
+    [pullTasks],
+  );
+
   useEffect(() => {
     if (refreshTrigger === undefined || refreshTrigger === prevRefreshTriggerRef.current) {
       prevRefreshTriggerRef.current = refreshTrigger;
@@ -192,32 +286,18 @@ export function useSessionBackgroundTasks(
     }
     prevRefreshTriggerRef.current = refreshTrigger;
     if (!enabled || !sessionId || !auth || routeMissingRef.current.has(sessionId)) return;
-    const myGen = genRef.current;
-    const elapsed = Date.now() - lastRefreshAtRef.current;
-    if (elapsed >= REFRESH_THROTTLE_MS) {
-      if (refreshTimerRef.current !== null) {
-        window.clearTimeout(refreshTimerRef.current);
-        refreshTimerRef.current = null;
-      }
-      void pullTasks(sessionId, myGen);
-      return;
-    }
-    if (refreshTimerRef.current !== null) return;
-    const waitMs = Math.max(0, REFRESH_THROTTLE_MS - elapsed);
-    refreshTimerRef.current = window.setTimeout(() => {
-      refreshTimerRef.current = null;
-      if (genRef.current === myGen) void pullTasks(sessionId, myGen);
-    }, waitMs);
-  }, [refreshTrigger, enabled, sessionId, auth, pullTasks]);
+    triggerThrottledPull(sessionId, genRef.current);
+  }, [refreshTrigger, enabled, sessionId, auth, triggerThrottledPull]);
 
   const hasActivePollableTasks =
     rawMuseJobs.some((j) => !isTerminalMuseJobStatus(j.status)) || rawBgCommands.length > 0;
-  const shouldPollTasks =
+  const baseEligible =
     enabled &&
     Boolean(sessionId) &&
     Boolean(auth) &&
-    !routeMissingRef.current.has(sessionId ?? "") &&
-    hasActivePollableTasks;
+    !routeMissingRef.current.has(sessionId ?? "");
+  const shouldPollTasks = baseEligible && hasActivePollableTasks;
+  const shouldRefreshOnVisible = baseEligible && (hasActivePollableTasks || sessionCrons.length > 0);
 
   useEffect(() => {
     if (!shouldPollTasks || !sessionId) return;
@@ -226,15 +306,79 @@ export function useSessionBackgroundTasks(
       if (document.visibilityState !== "visible") return;
       void pullTasks(sessionId, myGen);
     }, ACTIVE_POLL_MS);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [shouldPollTasks, sessionId, pullTasks]);
+
+  useEffect(() => {
+    if (!shouldRefreshOnVisible || !sessionId) return;
+    const myGen = genRef.current;
     const onVisible = () => {
-      if (document.visibilityState === "visible") void pullTasks(sessionId, myGen);
+      if (document.visibilityState === "visible") triggerThrottledPull(sessionId, myGen);
     };
     document.addEventListener("visibilitychange", onVisible);
     return () => {
-      window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [shouldPollTasks, sessionId, pullTasks]);
+  }, [shouldRefreshOnVisible, sessionId, triggerThrottledPull]);
+
+  // 仅有待触发定时续跑且无活跃轮询项时，按任务 ID 保留本轮到期点并做有限三段复查（空闲仍 0 轮询）
+  useEffect(() => {
+    if (!baseEligible || hasActivePollableTasks || !sessionId) {
+      return;
+    }
+    const myGen = genRef.current;
+    let disposed = false;
+    let timerId: number | null = null;
+    let lastFiredTarget = 0;
+
+    const clearTimer = () => {
+      if (timerId !== null) {
+        window.clearTimeout(timerId);
+        timerId = null;
+      }
+    };
+
+    const scheduleNext = () => {
+      clearTimer();
+      if (disposed || genRef.current !== myGen) return;
+      const watermark = Math.max(lastRefreshAtRef.current, lastFiredTarget);
+      let nextTarget: number | null = null;
+      for (const dueAt of trackedCronDueRef.current.values()) {
+        for (const offset of CRON_DUE_RECHECK_OFFSETS_MS) {
+          const candidate = dueAt + offset;
+          if (candidate > watermark) {
+            if (nextTarget === null || candidate < nextTarget) nextTarget = candidate;
+            break;
+          }
+        }
+      }
+      if (nextTarget === null) return;
+      const delay = nextTarget - Date.now();
+      if (delay > MAX_CRON_DUE_TIMER_MS) {
+        timerId = window.setTimeout(scheduleNext, MAX_CRON_DUE_TIMER_MS);
+        return;
+      }
+      const targetToFire = nextTarget;
+      timerId = window.setTimeout(() => {
+        timerId = null;
+        if (disposed || genRef.current !== myGen) return;
+        if (document.visibilityState !== "visible") return;
+        lastFiredTarget = targetToFire;
+        void pullTasks(sessionId, myGen).then(() => {
+          if (!disposed && genRef.current === myGen) scheduleNext();
+        });
+      }, Math.max(0, delay));
+    };
+
+    scheduleNext();
+    return () => {
+      disposed = true;
+      clearTimer();
+    };
+    // 依赖 sessionCrons 引用：每次快照落地（含回前台刷新与到期复查）都用最新 trackedCronDueRef 重排后续阶梯
+  }, [baseEligible, hasActivePollableTasks, sessionId, sessionCrons, pullTasks]);
 
   const dismissMuseJob = useCallback((jobId: string) => {
     setDismissed((prev) => {
@@ -314,6 +458,7 @@ export function useSessionBackgroundTasks(
       if (!ok) return false;
       if (genRef.current === myGen) {
         committedSeqRef.current = ++requestSeqRef.current;
+        if (!nextEnabled) trackedCronDueRef.current.delete(cronId);
         setSessionCrons((prev) =>
           prev.map((c) => (c.id === cronId ? { ...c, enabled: nextEnabled } : c)),
         );
@@ -523,12 +668,23 @@ export function useBackgroundTaskTriggers(opts: {
     return wsMessages.length;
   }, [wsMessages, chatVersion]);
 
+  // 长会话热尾归档（spill）后 wsMessages.length 可能不变或变小，额外追踪末条消息签名捕获离线补拉/定时续跑回复
+  const tailMsgSignature = useMemo(() => {
+    void chatVersion;
+    const last = wsMessages[wsMessages.length - 1];
+    if (!last) return "";
+    const orderSeq = typeof last._orderSeq === "number" ? last._orderSeq : "";
+    return `${last.id}:${orderSeq}`;
+  }, [wsMessages, chatVersion]);
+  const prevTailMsgSigRef = useRef(tailMsgSignature);
+
   useEffect(() => {
     if (prevSessionRef.current !== sessionId) {
       prevSessionRef.current = sessionId;
       prevSendingRef.current = wsSending;
       prevDelegateBlocksRef.current = delegateBlockCount;
       prevMsgCountRef.current = msgCount;
+      prevTailMsgSigRef.current = tailMsgSignature;
       prevMediaVersionRef.current = mediaJobVersion;
       return;
     }
@@ -552,14 +708,16 @@ export function useBackgroundTaskTriggers(opts: {
     }
     prevMediaVersionRef.current = mediaJobVersion;
 
-    if (!wsSending && msgCount > prevMsgCountRef.current) {
+    const tailAdvanced = tailMsgSignature !== "" && tailMsgSignature !== prevTailMsgSigRef.current;
+    if (!wsSending && (msgCount > prevMsgCountRef.current || tailAdvanced)) {
       bumpBg = true;
     }
     prevMsgCountRef.current = msgCount;
+    prevTailMsgSigRef.current = tailMsgSignature;
 
     if (bumpDelegate) setDelegateTrigger((n) => n + 1);
     if (bumpBg) setBgTrigger((n) => n + 1);
-  }, [sessionId, wsSending, delegateBlockCount, msgCount, mediaJobVersion]);
+  }, [sessionId, wsSending, delegateBlockCount, msgCount, tailMsgSignature, mediaJobVersion]);
 
   return { delegateRefreshTrigger: delegateTrigger, bgTasksRefreshTrigger: bgTrigger };
 }

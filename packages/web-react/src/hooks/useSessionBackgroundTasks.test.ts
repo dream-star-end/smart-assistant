@@ -172,6 +172,8 @@ describe("sessionBackgroundTasks pure helpers", () => {
 
   test("formatCountdown 准确格式化倒计时文案", () => {
     const now = 1_000_000;
+    expect(formatCountdown(now - 70_000, now)).toBe("已到点");
+    expect(formatCountdown(now - 50_000, now)).toBe("即将触发");
     expect(formatCountdown(now + 20_000, now)).toBe("即将触发");
     expect(formatCountdown(now + 12 * 60_000, now)).toBe("12 分钟后");
     expect(formatCountdown(now + 90 * 60_000, now)).toBe("1 小时 30 分后");
@@ -271,6 +273,241 @@ describe("useSessionBackgroundTasks", () => {
     await act(() => vi.advanceTimersByTimeAsync(30_000));
     expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(1);
     expect(fetchSessionOriginCrons).not.toHaveBeenCalled();
+  });
+
+  test("仅有定时续跑时切回前台自动重拉并清除已执行完的任务卡片", async () => {
+    vi.useFakeTimers();
+    let vis: DocumentVisibilityState = "visible";
+    vi.spyOn(document, "visibilityState", "get").mockImplementation(() => vis);
+
+    const cron = cronItem({ id: "cron-oneshot", oneshot: true, nextRunAt: Date.now() + 60_000 });
+    vi.mocked(fetchSessionBackgroundTasksResult)
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: { delegates: [], museJobs: [], bgCommands: [], sessionCrons: [cron] },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: { delegates: [], museJobs: [], bgCommands: [], sessionCrons: [] },
+      });
+
+    const { result } = renderHook(() =>
+      useSessionBackgroundTasks({ sessionId: "s1", enabled: true, auth }),
+    );
+    await act(async () => {});
+    expect(result.current.sessionCrons).toEqual([cron]);
+    expect(result.current.hasAny).toBe(true);
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(1);
+
+    // 锁屏/切后台期间定时任务执行完毕并删除，切回前台立刻拉取清空残留卡片
+    vis = "hidden";
+    await act(() => vi.advanceTimersByTimeAsync(20_000));
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(1);
+
+    vis = "visible";
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(2);
+    expect(result.current.sessionCrons).toEqual([]);
+    expect(result.current.hasAny).toBe(false);
+  });
+
+  test("仅有定时续跑时在 nextRunAt 过后按有限阶梯复查（+5s/+35s 时 nextRunAt 已变 null 仍持续复查至 +68s 自动清卡）", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-23T01:42:50+08:00"));
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+
+    const dueAt = new Date("2026-11-23T01:43:00+08:00").getTime();
+    const cronInitial = cronItem({ id: "cron-due", oneshot: true, nextRunAt: dueAt });
+    // 真实网关行为（cron.ts computeNextRun）：01:43:05/35 尚未到 :56 tick，任务仍在但 nextRunAt 已为 null
+    const cronAfterDueBeforeTick = cronItem({ id: "cron-due", oneshot: true, nextRunAt: null });
+
+    vi.mocked(fetchSessionBackgroundTasksResult)
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: { delegates: [], museJobs: [], bgCommands: [], sessionCrons: [cronInitial] },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: { delegates: [], museJobs: [], bgCommands: [], sessionCrons: [cronAfterDueBeforeTick] },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: { delegates: [], museJobs: [], bgCommands: [], sessionCrons: [{ ...cronAfterDueBeforeTick }] },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: { delegates: [], museJobs: [], bgCommands: [], sessionCrons: [] },
+      });
+
+    const { result } = renderHook(() =>
+      useSessionBackgroundTasks({ sessionId: "s1", enabled: true, auth }),
+    );
+    await act(async () => {});
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(1);
+
+    // 到点前（01:43:04）0 额外请求
+    await act(() => vi.advanceTimersByTimeAsync(14_000));
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(1);
+
+    // +5s（01:43:05）第 1 次复查：后端返回 nextRunAt=null，卡片仍在，但必须保留本轮到期点继续复查
+    await act(() => vi.advanceTimersByTimeAsync(1_000));
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(2);
+    expect(result.current.sessionCrons).toHaveLength(1);
+    expect(result.current.sessionCrons[0]?.nextRunAt).toBeNull();
+
+    // +35s（01:43:35）第 2 次复查仍自动触发
+    await act(() => vi.advanceTimersByTimeAsync(30_000));
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(3);
+    expect(result.current.sessionCrons).toHaveLength(1);
+
+    // +68s（01:44:08）第 3 次复查：:56 tick 已执行完并清理，无外部事件自动清卡
+    await act(() => vi.advanceTimersByTimeAsync(33_000));
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(4);
+    expect(result.current.sessionCrons).toEqual([]);
+    expect(result.current.hasAny).toBe(false);
+
+    // 后续保持 0 轮询
+    await act(() => vi.advanceTimersByTimeAsync(120_000));
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(4);
+  });
+
+  test("一次性续跑在 +35s 恰好读到已自动禁用但尚未写 lastRunAt 的中间态，仍继续 +68s 复查并自动清卡", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-23T01:42:50+08:00"));
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+
+    const dueAt = new Date("2026-11-23T01:43:00+08:00").getTime();
+    const cronInitial = cronItem({ id: "cron-mid", oneshot: true, enabled: true, nextRunAt: dueAt });
+    const cronAfterDue = cronItem({ id: "cron-mid", oneshot: true, enabled: true, nextRunAt: null });
+    // cron.ts 先将 oneshot 写 enabled=false，结算末尾才写 lastRunAt
+    const cronDisabledSettling = cronItem({
+      id: "cron-mid",
+      oneshot: true,
+      enabled: false,
+      nextRunAt: null,
+    });
+
+    vi.mocked(fetchSessionBackgroundTasksResult)
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: { delegates: [], museJobs: [], bgCommands: [], sessionCrons: [cronInitial] },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: { delegates: [], museJobs: [], bgCommands: [], sessionCrons: [cronAfterDue] },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: { delegates: [], museJobs: [], bgCommands: [], sessionCrons: [cronDisabledSettling] },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: { delegates: [], museJobs: [], bgCommands: [], sessionCrons: [] },
+      });
+
+    const { result } = renderHook(() =>
+      useSessionBackgroundTasks({ sessionId: "s1", enabled: true, auth }),
+    );
+    await act(async () => {});
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(1);
+
+    // +5s：仍启用但 nextRunAt=null
+    await act(() => vi.advanceTimersByTimeAsync(15_000));
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(2);
+
+    // +35s：撞进 enabled=false 且无 lastRunAt 中间态
+    await act(() => vi.advanceTimersByTimeAsync(30_000));
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(3);
+    expect(result.current.sessionCrons[0]?.enabled).toBe(false);
+
+    // +68s：仍继续复查并自动清空卡片
+    await act(() => vi.advanceTimersByTimeAsync(33_000));
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(4);
+    expect(result.current.sessionCrons).toEqual([]);
+    expect(result.current.hasAny).toBe(false);
+  });
+
+  test("周期定时续跑在 +5s 复查已回报 lastRunAt >= prevDue 时提前滚动到下一次，不发多余复查", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-23T01:44:50+08:00"));
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+
+    const dueAt = new Date("2026-11-23T01:45:00+08:00").getTime();
+    const nextCycleAt = new Date("2026-11-23T02:00:00+08:00").getTime();
+    vi.mocked(fetchSessionBackgroundTasksResult)
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: {
+          delegates: [],
+          museJobs: [],
+          bgCommands: [],
+          sessionCrons: [cronItem({ id: "cron-rec", schedule: "*/15 * * * *", nextRunAt: dueAt })],
+        },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: {
+          delegates: [],
+          museJobs: [],
+          bgCommands: [],
+          sessionCrons: [
+            cronItem({
+              id: "cron-rec",
+              schedule: "*/15 * * * *",
+              nextRunAt: nextCycleAt,
+              lastRunAt: dueAt,
+            }),
+          ],
+        },
+      });
+
+    const { result } = renderHook(() =>
+      useSessionBackgroundTasks({ sessionId: "s1", enabled: true, auth }),
+    );
+    await act(async () => {});
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(1);
+
+    // +5s 复查拿到 lastRunAt === dueAt 与新 nextRunAt (02:00)
+    await act(() => vi.advanceTimersByTimeAsync(15_000));
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(2);
+    expect(result.current.sessionCrons[0]?.nextRunAt).toBe(nextCycleAt);
+
+    // 之后 2 分钟内不再触发本轮剩余 +35s / +68s 复查
+    await act(() => vi.advanceTimersByTimeAsync(120_000));
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(2);
+  });
+
+  test("定时续跑到期复查达到 3 次上限后停止，即使后端仍返回 null 或旧过期 nextRunAt 也不死循环", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-23T01:42:55+08:00"));
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+
+    const dueAt = new Date("2026-11-23T01:43:00+08:00").getTime();
+    const cronInitial = cronItem({ id: "cron-stuck", oneshot: true, nextRunAt: dueAt });
+    const cronStuckNull = cronItem({ id: "cron-stuck", oneshot: true, nextRunAt: null });
+    let call = 0;
+    vi.mocked(fetchSessionBackgroundTasksResult).mockImplementation(async () => {
+      call += 1;
+      return {
+        ok: true,
+        snapshot: {
+          delegates: [],
+          museJobs: [],
+          bgCommands: [],
+          sessionCrons: [call === 1 ? cronInitial : { ...cronStuckNull }],
+        },
+      };
+    });
+
+    renderHook(() => useSessionBackgroundTasks({ sessionId: "s1", enabled: true, auth }));
+    await act(async () => {});
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(1);
+
+    // 推进 5 分钟：仅触发 +5s / +35s / +68s 共 3 次复查（总计 4 次）后彻底停手
+    await act(() => vi.advanceTimersByTimeAsync(5 * 60_000));
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(4);
   });
 
   test("存在活跃后台命令/Muse 任务时开启 5s 轮询，隐藏暂停，切回前台立刻拉 1 次，终态后停止轮询", async () => {
@@ -633,6 +870,13 @@ describe("cross-session & trigger helpers", () => {
 
     rerender({ wsSending: false, wsMessages: msgs, chatVersion: 3, mediaJobVersion: 1 });
     expect(result.current.bgTasksRefreshTrigger).toBe(2);
+
+    // 长会话热尾归档（spill）导致消息数组长度不变甚至变短，但末条消息 id 变化 → 仍触发刷新
+    const spilledMsgs = [
+      { id: "m-cron-reply", role: "assistant", text: "续跑完成", ts: 2, _orderSeq: 220 } as ChatMessage,
+    ];
+    rerender({ wsSending: false, wsMessages: spilledMsgs, chatVersion: 4, mediaJobVersion: 1 });
+    expect(result.current.bgTasksRefreshTrigger).toBe(3);
   });
 
   test("Muse 结算期拒绝取消（cancelled=false, status=running）时保留服务端状态，绝不显示假已取消", async () => {

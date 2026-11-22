@@ -41,14 +41,24 @@ export interface SessionOriginCronItem {
   schedule: string
   message?: string
   nextRunAt: number | null
+  lastRunAt?: number | null
   oneshot?: boolean
   resume: 'origin-session'
   sourceSessionKey: string
 }
 
 export type CronJobsWithMetaReader = () => Promise<
-  Array<CronJob & { nextRunAt?: string | number; lastRunAt?: string }>
+  Array<CronJob & { nextRunAt?: string | number; lastRunAt?: string | number }>
 >
+
+function parseCronMetaTs(raw: unknown): number | null {
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) return raw
+  if (typeof raw === 'string' && raw.trim()) {
+    const parsed = Date.parse(raw.trim())
+    if (Number.isFinite(parsed) && parsed > 0) return parsed
+  }
+  return null
+}
 
 export async function listSessionOriginCrons(
   sessionId: string,
@@ -56,7 +66,7 @@ export async function listSessionOriginCrons(
 ): Promise<SessionOriginCronItem[]> {
   const sid = sessionId.trim()
   if (!sid || !listJobsWithMeta) return []
-  let jobs: Array<CronJob & { nextRunAt?: string | number }>
+  let jobs: Array<CronJob & { nextRunAt?: string | number; lastRunAt?: string | number }>
   try {
     jobs = await listJobsWithMeta()
   } catch {
@@ -67,23 +77,23 @@ export async function listSessionOriginCrons(
     if (job.resume !== 'origin-session') continue
     if (typeof job.sourceSessionKey !== 'string' || !job.sourceSessionKey.trim()) continue
     if (sessionIdFromParentKey(job.sourceSessionKey) !== sid) continue
+    const enabled = job.enabled !== false
+    const nextRunAt = parseCronMetaTs(job.nextRunAt)
+    const lastRunAt = parseCronMetaTs(job.lastRunAt)
+    // 已触发完成的一次性续跑会先标为 enabled=false，等下一轮 60s tick 才从 cron.yaml 移除；
+    // 窗口期内直接过滤，避免前端残留「已暂停」卡片。手动暂停且未执行过的一次性任务仍保留。
+    if (job.oneshot && !enabled && nextRunAt === null && lastRunAt !== null) continue
     const rawPrompt = typeof job.prompt === 'string' ? job.prompt.replace(/\s+/g, ' ').trim() : ''
     const name = (typeof job.label === 'string' ? job.label.trim() : '') || rawPrompt.slice(0, 80) || job.id
     const message = rawPrompt ? rawPrompt.slice(0, 240) : undefined
-    let nextRunAt: number | null = null
-    if (typeof job.nextRunAt === 'number' && Number.isFinite(job.nextRunAt)) {
-      nextRunAt = job.nextRunAt
-    } else if (typeof job.nextRunAt === 'string' && job.nextRunAt.trim()) {
-      const parsed = Date.parse(job.nextRunAt)
-      if (Number.isFinite(parsed)) nextRunAt = parsed
-    }
     items.push({
       id: job.id,
       name,
-      enabled: job.enabled !== false,
+      enabled,
       schedule: job.schedule,
       ...(message ? { message } : {}),
       nextRunAt,
+      ...(lastRunAt !== null ? { lastRunAt } : {}),
       ...(job.oneshot ? { oneshot: true } : {}),
       resume: 'origin-session',
       sourceSessionKey: job.sourceSessionKey,

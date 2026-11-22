@@ -25,6 +25,7 @@ import {
   handleInternalSessionBackgroundState,
   handleInternalSessionBgCmdCancel,
   handleInternalSessionDelegateCancel,
+  listSessionOriginCrons,
 } from '../routes/sessionBackgroundRoute.js'
 import {
   cancelSessionBgCommand,
@@ -874,5 +875,68 @@ describe('internal container background routes (bridge auth + replay)', () => {
     } finally {
       rmSync(regDir, { recursive: true, force: true })
     }
+  })
+
+  it('filters completed oneshot origin-session crons before next tick cleanup while keeping paused unexecuted oneshots and forwarding lastRunAt', async () => {
+    const items = await listSessionOriginCrons('sess-cron-1', async () => [
+      {
+        id: 'oneshot-done',
+        schedule: '43 1 23 11 *',
+        agent: 'main',
+        prompt: 'already fired oneshot',
+        enabled: false,
+        oneshot: true,
+        resume: 'origin-session',
+        sourceSessionKey: 'agent:main:webchat:dm:sess-cron-1',
+        lastRunAt: '2026-11-22T17:43:00.000Z',
+      },
+      {
+        id: 'oneshot-paused',
+        schedule: '0 2 23 11 *',
+        agent: 'main',
+        prompt: 'manually paused before running',
+        enabled: false,
+        oneshot: true,
+        resume: 'origin-session',
+        sourceSessionKey: 'agent:main:webchat:dm:sess-cron-1',
+      },
+      {
+        id: 'recurring-active',
+        schedule: '*/30 * * * *',
+        agent: 'main',
+        prompt: 'recurring check',
+        enabled: true,
+        resume: 'origin-session',
+        sourceSessionKey: 'agent:main:webchat:dm:sess-cron-1',
+        nextRunAt: '2026-11-22T18:30:00.000Z',
+        lastRunAt: '2026-11-22T18:00:00.000Z',
+      },
+    ])
+
+    assert.deepEqual(
+      items.map((item) => ({
+        id: item.id,
+        enabled: item.enabled,
+        oneshot: item.oneshot,
+        nextRunAt: item.nextRunAt,
+        lastRunAt: item.lastRunAt,
+      })),
+      [
+        {
+          id: 'recurring-active',
+          enabled: true,
+          oneshot: undefined,
+          nextRunAt: Date.parse('2026-11-22T18:30:00.000Z'),
+          lastRunAt: Date.parse('2026-11-22T18:00:00.000Z'),
+        },
+        {
+          id: 'oneshot-paused',
+          enabled: false,
+          oneshot: true,
+          nextRunAt: null,
+          lastRunAt: undefined,
+        },
+      ],
+    )
   })
 })

@@ -50,6 +50,7 @@ export type SessionCronItem = {
   enabled: boolean;
   schedule: string;
   nextRunAt: number | null;
+  lastRunAt?: number;
   oneshot?: boolean;
   prompt?: string;
   resume: "origin-session";
@@ -100,6 +101,8 @@ export function formatCompactElapsed(ms: number): string {
 export function formatCountdown(nextRunAt: number | null | undefined, now = Date.now()): string {
   if (nextRunAt == null || !Number.isFinite(nextRunAt)) return "";
   const diffMs = nextRunAt - now;
+  // 网关 cron 每 60s tick 一次，过整点 65s 内仍处于触发窗，超过则不再永久显示「即将触发」
+  if (diffMs < -65_000) return "已到点";
   if (diffMs <= 30_000) return "即将触发";
   const mins = Math.ceil(diffMs / 60_000);
   if (mins < 60) return `${mins} 分钟后`;
@@ -228,6 +231,7 @@ export function filterSessionOriginCrons(
       enabled,
       schedule: typeof o.schedule === "string" ? o.schedule : "",
       nextRunAt,
+      ...(lastRunAt !== null ? { lastRunAt } : {}),
       oneshot,
       prompt: promptText,
       resume: "origin-session",
