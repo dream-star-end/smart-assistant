@@ -188,6 +188,19 @@
   --status-done: var(--success);
   --status-failed: var(--danger);
   --status-idle: var(--faint);
+  /* 集中 11 档语义 z-index 层级阶梯（OCV5-847 / docs/UI_DESIGN_SYSTEM.md）：
+     明确区分页内浮层与 Radix Portal 菜单，确保 Portal 菜单严格高于全屏查看器/弹窗/抽屉。 */
+  --z-base: 0;
+  --z-sticky: 10;
+  --z-sidebar: 20;
+  --z-header: 30;
+  --z-popover-inline: 40;
+  --z-drawer: 50;
+  --z-modal: 60;
+  --z-viewer: 70;
+  --z-popover-portal: 80;
+  --z-tooltip: 90;
+  --z-toast: 100;
 }
 
 /* ── Dark — Warm-Neutral: deep charcoal-ink canvas, elevated warm slate,

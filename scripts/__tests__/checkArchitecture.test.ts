@@ -2,12 +2,22 @@
 // shrinks, and the checker fails closed. Run: npx tsx --test scripts/__tests__/checkArchitecture.test.ts
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { ModuleMap, check, compare, factsOf, globToRegExp, tally } from '../check-architecture.ts'
+import {
+  APPROVED_REBASELINE,
+  ModuleMap,
+  check,
+  compare,
+  factsOf,
+  globToRegExp,
+  isApprovedRebaseline,
+  sha256Hex,
+  tally,
+} from '../check-architecture.ts'
 
 const SCRIPT = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -388,5 +398,40 @@ describe('CLI', () => {
       0,
       'git rename carries the entry',
     )
+  })
+})
+
+describe('approved rebaseline anchor (OCV5-847)', () => {
+  test('matches only exact dual-hash transition (fromBaselineSha256 -> toBaselineSha256); self-invalidates after merge and rejects 1-byte tamper', () => {
+    const fromRaw = '{"schema":1,"entries":{"R3-env|a.ts|-":1}}\n'
+    const toRaw = '{"schema":1,"entries":{"R3-env|a.ts|-":1,"R3-net|b.ts|-":2}}\n'
+    const anchor = {
+      ticket: 'OCV5-TEST',
+      fromBaselineSha256: sha256Hex(fromRaw),
+      toBaselineSha256: sha256Hex(toRaw),
+    }
+    assert.equal(isApprovedRebaseline(fromRaw, toRaw, anchor), true)
+    assert.equal(
+      isApprovedRebaseline(toRaw, toRaw, anchor),
+      false,
+      'after merge (base == toRaw) anchor must self-invalidate permanently',
+    )
+    assert.equal(
+      isApprovedRebaseline(`${fromRaw} `, toRaw, anchor),
+      false,
+      '1-byte change in base baseline must NOT match',
+    )
+    assert.equal(
+      isApprovedRebaseline(fromRaw, `${toRaw} `, anchor),
+      false,
+      '1-byte tamper in head baseline must NOT match',
+    )
+    assert.equal(isApprovedRebaseline(null, toRaw, anchor), false)
+  })
+
+  test('APPROVED_REBASELINE declares valid distinct SHA-256 transition hashes without freezing future debt paydown', () => {
+    assert.match(APPROVED_REBASELINE.fromBaselineSha256, /^[0-9a-f]{64}$/)
+    assert.match(APPROVED_REBASELINE.toBaselineSha256, /^[0-9a-f]{64}$/)
+    assert.notEqual(APPROVED_REBASELINE.fromBaselineSha256, APPROVED_REBASELINE.toBaselineSha256)
   })
 })

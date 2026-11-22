@@ -1550,18 +1550,17 @@ build_master_release() {
       return 1
     fi
   }
-  # OCV5-545(第三阶段 P0b 列车步骤):架构护栏在 pinned staging 跑报告期,计数写进 summary.json。
-  # 报告期不拦新增违规(和 PR CI 的 architecture job 一致);检查器 fail-closed(解析失败、modules.json
-  # 或基线不合法,退出 2)照样让列车失败。转强制期时这里改 --enforce。
+  # OCV5-545 / OCV5-847: 架构护栏在 pinned staging 跑强制期(--enforce),计数写进 summary.json。
+  # 新增/增长违规、未清理的 stale 基线、或检查器 fail-closed(退出 2)均让列车失败。
   master_job_architecture() {
-    mlog "  architecture guardrails (report period) @ pinned staging"
+    mlog "  architecture guardrails (enforced) @ pinned staging"
     if [[ ! -f "$staging/scripts/check-architecture.ts" ]]; then
       mlog "新候选缺 scripts/check-architecture.ts"
       return 1
     fi
     if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-architecture.ts \
-        --json "$MASTER_GATE_TMPDIR/architecture.json" ); then
-      mlog "pinned architecture guardrails 失败(检查器 fail-closed)"
+        --enforce --json "$MASTER_GATE_TMPDIR/architecture.json" ); then
+      mlog "pinned architecture guardrails 失败(新增/增长/过期基线违规或检查器 fail-closed)"
       return 1
     fi
   }

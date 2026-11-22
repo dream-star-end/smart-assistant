@@ -69,6 +69,14 @@
     "typecheck:watch": "tsc --build --watch",
     "check": "npm run lint && npm run lint:agent-containers-sql && npm run lint:scheduler-wiring && npm run lint:undefined-refs && npm run lint:migration-order && npm run lint:integ-tiers && npm run typecheck && npm run test",
     "check:test-retries": "tsx scripts/check-v5-test-retries.ts",
+    "check:docs-links": "tsx scripts/check-docs-links.ts",
+    "check:ui-gates": "tsx scripts/check-ui-hard-gates.ts",
+    "check:no-weak-downgrade": "tsx scripts/check-no-silent-model-downgrade.ts",
+    "check:route-sync": "tsx scripts/check-v5-route-sync.ts",
+    "check:monotonic-baselines": "tsx scripts/check-monotonic-baselines.ts",
+    "check:changelog-guard": "tsx scripts/check-changelog-guard.ts",
+    "check:feature-flags-ttl": "tsx scripts/check-feature-flags-ttl.ts",
+    "check:governance:fast": "npm run check:docs-links && npm run check:ui-gates && npm run check:no-weak-downgrade && npm run check:route-sync && npm run check:changelog-guard && npm run check:feature-flags-ttl && npm run lint:scheduler-wiring && npm run lint:agent-containers-sql && npm run check:test-retries && npm run lint:integ-tiers && npm run check:v5:e2e-selectors",
     "test:ccb:box-context": "bun --cwd claude-code-best test --timeout 120000 src/utils/model/boxContextTransport.test.ts src/utils/__tests__/messages.test.ts src/utils/__tests__/sessionFileIo.test.ts src/utils/__tests__/nativeTranscriptRecovery.test.ts src/utils/__tests__/sessionTranscriptReader.test.ts src/utils/__tests__/sessionTranscriptQueue.test.ts src/services/compact/idleNativeFit.test.ts src/services/compact/idleSiblingRecovery.test.ts src/services/compact/idleRollback.test.ts src/services/compact/idlePrepared.test.ts src/services/compact/idleConcurrentRecovery.test.ts"
   },
   "devDependencies": {

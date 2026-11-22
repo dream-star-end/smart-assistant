@@ -1,8 +1,50 @@
-# P0 flavor / incident ledger ratchet. Human review required to change the
-# freeze, tombstones, or the checker that enforces them.
-e2e/session-display/incident-ledger-baseline.json @dream-star-end
-e2e/session-display/incident-ledger-baseline.sha256 @dream-star-end
-e2e/session-display/incident-tombstones.json @dream-star-end
-e2e/session-display/incident-tombstone-approvers.json @dream-star-end
-scripts/check-incident-ledger-superset.ts @dream-star-end
-packages/commercial/src/flavor/flavor-rules.json @dream-star-end
+# OpenClaude V5 Selfhost A/B Governance CODEOWNERS (OCV5-847, Blueprint §4.2.5)
+#
+# Class A (locked here): static gates, rules, exemptions, budgets, CI workflows,
+# release train scripts/manifest, freeze anchors, runtime permission core, and
+# changelog.json. Any change requires @dream-star-end human review.
+#
+# Class B (intentionally NOT listed here): dynamic debt-ratchet / append-only
+# baselines guarded monotonically via `--base` checks by the Class A checkers
+# above, so routine debt cleanup, fix(v5) ledger appends, and flag retirements
+# never deadlock auto-merge.
+
+# === 1. CI workflows, rules & gate infrastructure ===
+.github/CODEOWNERS                                      @dream-star-end
+.github/workflows/                                      @dream-star-end
+.github/scripts/                                        @dream-star-end
+.github/known-failures/                                 @dream-star-end
+.github/integ-tiers/                                    @dream-star-end
+.github/file-size-ratchet-exceptions.json               @dream-star-end
+biome.json                                              @dream-star-end
+arch/modules.json                                       @dream-star-end
+
+# === 2. Frontend budgets, exemptions, gate tests & tutorial history anchor ===
+packages/web-react/vite.config.ts                       @dream-star-end
+packages/web-react/budgets.json                         @dream-star-end
+packages/web-react/design-tokens-exempt.json            @dream-star-end
+packages/web-react/src/test/designTokens.test.ts        @dream-star-end
+packages/web-react/browser-tests/layout-invariants.mjs  @dream-star-end
+packages/web-react/tutorial-sync-history-head.json      @dream-star-end
+
+# === 3. Core gate scripts, migration gates & release train scripts/manifest ===
+scripts/check-*.ts                                      @dream-star-end
+scripts/check-*.sh                                      @dream-star-end
+scripts/v5-selfhost-migration-*.sh                      @dream-star-end
+scripts/v5-selfhost-master-release-lib.sh               @dream-star-end
+scripts/deploy-v5-selfhost.sh                           @dream-star-end
+scripts/lib/v5-selfhost-*.sh                            @dream-star-end
+packages/commercial/scripts/lint-*.ts                   @dream-star-end
+deploy/v5/selfhost-release-gates.json                   @dream-star-end
+
+# === 4. P0 flavor / incident ledger freeze anchors, permission core & changelog ===
+# (Preserves all 6 original freeze/flavor/checker entries verbatim.)
+e2e/session-display/incident-ledger-baseline.json       @dream-star-end
+e2e/session-display/incident-ledger-baseline.sha256     @dream-star-end
+e2e/session-display/incident-tombstones.json            @dream-star-end
+e2e/session-display/incident-tombstone-approvers.json   @dream-star-end
+scripts/check-incident-ledger-superset.ts               @dream-star-end
+packages/commercial/src/flavor/flavor-rules.json        @dream-star-end
+packages/protocol/src/advisorNoWrite.ts                 @dream-star-end
+packages/gateway/src/actionPolicyEngine.ts              @dream-star-end
+changelog.json                                          @dream-star-end

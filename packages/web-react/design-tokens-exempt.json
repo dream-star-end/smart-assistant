@@ -1,0 +1,15 @@
+{
+  "description": "Class-A CODEOWNERS-protected exemption patterns for design token drift ratchet (paths relative to packages/web-react/src).",
+  "patterns": [
+    { "regex": "^admin/", "reason": "UI-SPEC §4.1: admin surface staged exemption" },
+    { "regex": "^components/tutorials/", "reason": "UI-SPEC §4.1: tutorials surface staged exemption" },
+    { "regex": "^components/landing/", "reason": "UI-SPEC §4.1: landing surface staged exemption" },
+    { "regex": "^components/Landing\\.tsx$", "reason": "UI-SPEC §4.1: landing entry staged exemption" },
+    { "regex": "^test/", "reason": "Test files" },
+    { "regex": "\\.test\\.tsx?$", "reason": "Unit test files" },
+    { "regex": "^styles\\.css$", "reason": "Single source of truth for design tokens" },
+    { "regex": "^styles/landing\\.css$", "reason": "OCV5-817: lazy-split stylesheet from styles.css" },
+    { "regex": "^styles/containerWebPreview\\.css$", "reason": "OCV5-817: lazy-split stylesheet from styles.css" },
+    { "regex": "^components/iui/iui\\.css$", "reason": "OCV5-817: lazy-split stylesheet from styles.css" }
+  ]
+}

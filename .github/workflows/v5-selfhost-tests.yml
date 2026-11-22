@@ -190,3 +190,87 @@ jobs:
             "CI=$CI" \
             "TEST_DATABASE_URL=$TEST_DATABASE_URL" \
             npm run test:v5:ops
+
+  # OCV5-847 (P0-4): 补齐已在 feat/v5-selfhost 实测 100% 绿灯的包单测与 Go 构建。
+  # 注: test:storage 当前在 feat/v5-selfhost 有 2 处存量失败（sixTablesSqlArchitecture.test.ts
+  # 检出 containerSwarmCommandProxy.ts:54 & sessionBackgroundTasksProxy.ts:87 直查 client_sessions，
+  # 以及 embeddingMigrationConcurrency.test.ts ENOENT），待单独立单清绿后再接入本 workflow。
+  protocol:
+    name: selfhost-protocol
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run protocol unit tests
+        run: npm run test:protocol
+
+  channels:
+    name: selfhost-channels
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run channels unit tests
+        run: npm run test:channels
+
+  mcp-memory:
+    name: selfhost-mcp-memory
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install ripgrep (mcp-memory search tests)
+        run: command -v rg >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ripgrep)
+
+      - name: Run mcp-memory unit tests
+        run: npm run test:mcp-memory
+
+  node-agent-go:
+    name: selfhost-node-agent-go
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: packages/commercial/node-agent/go.mod
+          cache-dependency-path: packages/commercial/node-agent/go.sum
+
+      - name: Build and vet node-agent
+        run: npm run build:node-agent

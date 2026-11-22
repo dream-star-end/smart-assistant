@@ -19,15 +19,147 @@
 //   OC_UI_SHOT_TIMEOUT 单张截图的超时毫秒(默认 90000,见下方"渲染器偶发卡顿")
 //   OC_E2E_BROWSER    指定 Chrome/Chromium 可执行文件(见 scripts/lib/resolve-browser.mjs)
 //   OC_UI_IMAGE_HOSTS 放行这些主机的图片请求(逗号分隔,如 images.unsplash.com);缺省全部离线兜 204
+// CLI 选项(可选;无参数时完全保持既有默认行为):
+//   --tier=core       仅筛选核心高频子集(36 个代表场景,供 PR L4 视觉回归快速执行)
+//   --tier=full       全量场景(默认)
+//   --list            仅列出筛选后的场景清单并退出 0(不截图、不写输出目录)
 // 退出码:0 全部成功 / 1 有场景失败或零场景(fail-loud,不静默出空目录)。
 import { createRequire } from 'node:module'
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, dirname, extname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { basename, dirname, extname, join, resolve } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import tailwindcss from '@tailwindcss/vite'
 import { build as viteBuild } from 'vite'
 import { resolveBrowserExecutable } from '../../../../scripts/lib/resolve-browser.mjs'
+
+/**
+ * PR 级核心高频视觉回归子集(L4 --tier=core,36 场景):覆盖壳层/侧栏/输入坞/模型选择/
+ * 消息与过程披露/HUD/权限审批/工具检查器/IUI/项目工作台/任务看板/管理中心/市场/设置与登录。
+ */
+export const CORE_TIER_SCENE_IDS = Object.freeze([
+  // Shell & design system (3)
+  'shell-ui-kit',
+  'shell-empty-state',
+  'shell-global-banners',
+  // Sidebar & inbox (3)
+  'sidebar-overview',
+  'sidebar-mobile-drawer',
+  'sidebar-inbox',
+  // Composer & model picker (4)
+  'composer-idle',
+  'composer-loaded',
+  'composer-busy',
+  'composer-model-menu',
+  // Messages & process disclosure (6)
+  'messages-timeline-rich',
+  'messages-assistant-streaming',
+  'messages-error-states',
+  'messages-scroll-window',
+  'process-live',
+  'process-done',
+  // HUD & permission/approval cards (4)
+  'hud-stack',
+  'hud-delegate-running',
+  'permission-card-pending-modal',
+  'permission-card-settled',
+  // Tools, inspector & IUI (4)
+  'tools-states',
+  'tools-bodies',
+  'tools-inspector',
+  'iui-roast',
+  // Project & workspace density (2)
+  'project-home-overview',
+  'workspace-chat-density',
+  // Taskboard (2)
+  'taskboard-board-responsive',
+  'taskboard-ticket-drawer',
+  // Manage center (3)
+  'manage-memory',
+  'manage-cron',
+  'manage-skills',
+  // Marketplace (2)
+  'market-browse-skill',
+  'market-detail',
+  // Settings, subscription & auth (3)
+  'settings-full-account',
+  'settings-subscription-dialog',
+  'auth-login',
+])
+
+export function parseShootArgs(argv = []) {
+  let tier = null
+  let listOnly = false
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i]
+    if (arg === '--list') {
+      listOnly = true
+    } else if (arg === '--tier') {
+      tier = argv[++i] ?? ''
+    } else if (arg.startsWith('--tier=')) {
+      tier = arg.slice('--tier='.length)
+    } else {
+      throw new Error(`ui-preview: 未知参数 ${arg}（支持 --tier=core|full、--list）`)
+    }
+  }
+  if (tier !== null && tier !== 'core' && tier !== 'full') {
+    throw new Error(`ui-preview: 不支持的 --tier=${tier}（仅支持 core 或 full）`)
+  }
+  return { tier, listOnly }
+}
+
+export function discoverScenesStatic(dir, files) {
+  const scenes = []
+  const seen = new Set()
+  for (const file of [...files].sort()) {
+    const text = readFileSync(join(dir, file), 'utf8')
+    const idRe = /\bid\s*:\s*(['"])([^'"\n]+)\1/g
+    for (const m of text.matchAll(idRe)) {
+      const start = m.index ?? 0
+      const id = m[2]
+      const slice = text.slice(start, start + 900)
+      const labelM = /^\s*,\s*(?:\/\/[^\n]*\n\s*)*(?:group\s*:\s*['"]([^'"]+)['"]\s*,\s*(?:\/\/[^\n]*\n\s*)*)?label\s*:\s*(['"])([^'"\n]+)\2/.exec(
+        slice.slice(m[0].length),
+      )
+      if (!labelM) continue
+      if (!/\brender\s*(?::|\()/.test(slice)) continue
+      const group = labelM[1] || (/\bgroup\s*:\s*(['"])([^'"]+)\1/.exec(slice.slice(0, 400))?.[2] ?? 'manage')
+      const vpM = /\bviewports\s*:\s*\[([^\]]*)\]/.exec(slice.slice(0, 500))
+      const viewports = vpM ? [...vpM[1].matchAll(/['"]([^'"]+)['"]/g)].map((x) => x[1]) : ['desktop']
+      if (seen.has(id)) continue
+      seen.add(id)
+      scenes.push({ id, label: labelM[3], group, viewports })
+    }
+  }
+  return scenes
+}
+
+export function selectScenesForRun(allScenes, { tier = null, sceneFilter = [] } = {}) {
+  let pool = allScenes
+  const missingCoreIds = []
+  if (tier === 'core') {
+    const byId = new Map(allScenes.map((scene) => [scene.id, scene]))
+    pool = []
+    for (const id of CORE_TIER_SCENE_IDS) {
+      const hit = byId.get(id)
+      if (hit) pool.push(hit)
+      else missingCoreIds.push(id)
+    }
+  }
+  const selected = pool.filter(
+    (scene) => sceneFilter.length === 0 || sceneFilter.some((needle) => scene.id.includes(needle)),
+  )
+  return { selected, missingCoreIds }
+}
+
+async function runShoot() {
+let cliOpts
+try {
+  cliOpts = parseShootArgs(process.argv.slice(2))
+} catch (err) {
+  console.error(err.message)
+  process.exit(1)
+}
 
 const IMAGE_HOSTS = new Set(
   (process.env.OC_UI_IMAGE_HOSTS ?? '')
@@ -48,7 +180,9 @@ const REPO_ROOT = dirname(dirname(PKG))
 const OUT_DIR =
   process.env.OC_UI_SHOTS ??
   '/tmp/claude-0/-root/b1d7896a-48a0-4d60-8110-f289447f9192/scratchpad/ui-shots/before'
-mkdirSync(OUT_DIR, { recursive: true })
+if (!cliOpts.listOnly) {
+  mkdirSync(OUT_DIR, { recursive: true })
+}
 
 const SHOT_DELAY = Number(process.env.OC_UI_SHOT_DELAY ?? 400)
 // page.screenshot 默认 30s。这台机器上 96 张 2x 高分图连拍时,渲染器偶发会在某一张上卡住
@@ -92,6 +226,28 @@ if (orphanFiles.length > 0) {
 console.log(
   `ui-preview: 场景模块 manage=[${groupFiles.manage.join(', ') || '无'}] market=[${groupFiles.market.join(', ') || '无'}]`,
 )
+
+if (cliOpts.listOnly) {
+  const discovered = discoverScenesStatic(HERE, sceneFiles)
+  const { selected, missingCoreIds } = selectScenesForRun(discovered, {
+    tier: cliOpts.tier,
+    sceneFilter: SCENE_FILTER,
+  })
+  if (missingCoreIds.length > 0) {
+    console.warn(`ui-preview: --tier=core 清单中有 ${missingCoreIds.length} 个场景未找到: ${missingCoreIds.join(', ')}`)
+  }
+  if (selected.length === 0) {
+    console.error(`ui-preview: 筛选条件(tier=${cliOpts.tier ?? 'full'}, OC_UI_SCENES=${SCENE_FILTER.join(',')})未匹配到任何场景`)
+    process.exit(1)
+  }
+  const tierLabel = cliOpts.tier ?? 'full'
+  console.log(`ui-preview: tier=${tierLabel} 共选中 ${selected.length} / ${discovered.length} 个场景:`)
+  for (const scene of selected) {
+    const vps = (scene.viewports ?? ['desktop']).join(',')
+    console.log(`  ${scene.id.padEnd(36)} [${vps.padEnd(14)}] ${scene.group}/${scene.label}`)
+  }
+  process.exit(0)
+}
 
 const API_STUB = join(HERE, 'api-stub.ts')
 const plugins = [
@@ -148,27 +304,6 @@ await esbuild.build({
 })
 
 const cssOutDir = join(workDir, 'css')
-await viteBuild({
-  root: PKG,
-  configFile: false,
-  logLevel: 'silent',
-  plugins: [tailwindcss()],
-  build: {
-    outDir: cssOutDir,
-    emptyOutDir: true,
-    cssCodeSplit: false,
-    rollupOptions: {
-      // 既有先例文件:内容就是 import '../src/styles.css'(tailwind 入口 + 设计 token)。
-      input: join(BROWSER_TESTS, 'preview-styles.ts'),
-      output: {
-        entryFileNames: 'preview-styles.js',
-        // 字体等资产保留各自文件名(run.mjs 那套 preview-styles[extname] 会让多个 woff2 撞名)。
-        assetFileNames: 'assets/[name]-[hash][extname]',
-      },
-    },
-  },
-})
-
 function walk(dir, out = []) {
   for (const name of readdirSync(dir)) {
     const abs = join(dir, name)
@@ -177,10 +312,35 @@ function walk(dir, out = []) {
   }
   return out
 }
-const builtAssets = walk(cssOutDir)
-const cssFile = builtAssets.find((p) => p.endsWith('.css'))
-if (!cssFile) throw new Error('ui-preview: 预览 production CSS 构建失败(产物里没有 .css)')
-const assetByName = new Map(builtAssets.map((p) => [basename(p), p]))
+let cssText = ''
+let assetByName = new Map()
+if (!cliOpts.listOnly) {
+  await viteBuild({
+    root: PKG,
+    configFile: false,
+    logLevel: 'silent',
+    plugins: [tailwindcss()],
+    build: {
+      outDir: cssOutDir,
+      emptyOutDir: true,
+      cssCodeSplit: false,
+      rollupOptions: {
+        // 既有先例文件:内容就是 import '../src/styles.css'(tailwind 入口 + 设计 token)。
+        input: join(BROWSER_TESTS, 'preview-styles.ts'),
+        output: {
+          entryFileNames: 'preview-styles.js',
+          // 字体等资产保留各自文件名(run.mjs 那套 preview-styles[extname] 会让多个 woff2 撞名)。
+          assetFileNames: 'assets/[name]-[hash][extname]',
+        },
+      },
+    },
+  })
+  const builtAssets = walk(cssOutDir)
+  const cssFile = builtAssets.find((p) => p.endsWith('.css'))
+  if (!cssFile) throw new Error('ui-preview: 预览 production CSS 构建失败(产物里没有 .css)')
+  cssText = readFileSync(cssFile, 'utf8')
+  assetByName = new Map(builtAssets.map((p) => [basename(p), p]))
+}
 
 // bundle **不能内联进 <script>**:一旦场景把 Markdown 链路(highlight.js 的 `"<!--|-->"` 语言定义 +
 // react-dom 的 `"<script><\/script>"` 字面量)拉进依赖图,HTML 解析器会在 `<!--` 后进入
@@ -195,7 +355,7 @@ const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#fafafb">
 <title>OpenClaude UI 预览台</title>
-<style>${readFileSync(cssFile, 'utf8')}</style>
+<style>${cssText}</style>
 </head><body><div id="root"></div><script src="${HARNESS_BUNDLE_URL}"></script></body></html>`
 
 const CONTENT_TYPES = {
@@ -394,18 +554,33 @@ const allScenes = await probePage.evaluate(() => window.__ocScenes)
 const sceneModuleKeys = await probePage.evaluate(() => window.__ocSceneModules)
 await probeContext.close()
 
-const selected = allScenes.filter(
-  (scene) => SCENE_FILTER.length === 0 || SCENE_FILTER.some((needle) => scene.id.includes(needle)),
-)
+const { selected, missingCoreIds } = selectScenesForRun(allScenes, {
+  tier: cliOpts.tier,
+  sceneFilter: SCENE_FILTER,
+})
+if (missingCoreIds.length > 0) {
+  console.warn(`ui-preview: --tier=core 清单中有 ${missingCoreIds.length} 个场景未注册: ${missingCoreIds.join(', ')}`)
+}
 if (selected.length === 0) {
   await browser.close()
   console.error(
     allScenes.length === 0
       ? 'ui-preview: 零场景 —— scenes-manage / scenes-market 模块没产出任何 Scene(检查文件名是否含 manage/market,以及是否导出了场景数组)\n' +
         `  模块导出:manage=[${(sceneModuleKeys?.manage ?? []).join(', ')}] market=[${(sceneModuleKeys?.market ?? []).join(', ')}]`
-      : `ui-preview: OC_UI_SCENES=${SCENE_FILTER.join(',')} 未匹配到任何场景`,
+      : `ui-preview: 筛选条件(tier=${cliOpts.tier ?? 'full'}, OC_UI_SCENES=${SCENE_FILTER.join(',')})未匹配到任何场景`,
   )
   process.exit(1)
+}
+
+if (cliOpts.listOnly) {
+  await browser.close()
+  const tierLabel = cliOpts.tier ?? 'full'
+  console.log(`ui-preview: tier=${tierLabel} 共选中 ${selected.length} / ${allScenes.length} 个场景:`)
+  for (const scene of selected) {
+    const vps = (scene.viewports ?? ['desktop']).join(',')
+    console.log(`  ${scene.id.padEnd(36)} [${vps.padEnd(14)}] ${scene.group}/${scene.label}`)
+  }
+  process.exit(0)
 }
 
 for (const [viewport, options] of Object.entries(VIEWPORTS)) {
@@ -471,3 +646,11 @@ if (failures.length > 0) {
 }
 console.log('\nui-preview: 全部成功')
 process.exit(0)
+}
+
+const isDirectRun =
+  typeof process.argv[1] === 'string' && import.meta.url === pathToFileURL(resolve(process.argv[1])).href
+
+if (isDirectRun) {
+  await runShoot()
+}

@@ -79,6 +79,48 @@ describe('pure rules', () => {
     assert.equal(baselineRaises(B, { ...B, slack: 200 }).length, 1)
   })
 
+  test('yellow-zone & cssFiles protection cannot be removed or loosened via 0 -> undefined -> 100', () => {
+    const baseYellow: Baseline = {
+      limit: 3000,
+      slack: 100,
+      files: { 'big.ts': 4000 },
+      cssFiles: { 'studio.css': 3074 },
+      yellowZoneLimit: 2000,
+      yellowZoneSlack: 0,
+      yellowZoneFiles: { 'App.tsx': 2992 },
+    }
+    // Step 1 of 0 -> undefined -> 100 must be blocked immediately
+    const { yellowZoneSlack: _droppedSlack, ...withoutSlack } = baseYellow
+    assert.equal(
+      baselineRaises(baseYellow, withoutSlack).length,
+      1,
+      'removing yellowZoneSlack (0 -> undefined) must be blocked',
+    )
+    // Step 2: even from omitted slack (effective 0) -> 100 must also be blocked
+    assert.equal(
+      baselineRaises(withoutSlack, { ...withoutSlack, yellowZoneSlack: 100 }).length,
+      1,
+      'raising effective yellowZoneSlack (undefined/0 -> 100) must be blocked',
+    )
+    // Dropping cssFiles, yellowZoneLimit, or yellowZoneFiles must be blocked
+    const { cssFiles: _droppedCss, ...withoutCss } = baseYellow
+    const { yellowZoneLimit: _droppedLimit, ...withoutLimit } = baseYellow
+    const { yellowZoneFiles: _droppedYellow, ...withoutYellow } = baseYellow
+    assert.equal(baselineRaises(baseYellow, withoutCss).length, 1)
+    assert.equal(baselineRaises(baseYellow, withoutLimit).length, 1)
+    assert.equal(baselineRaises(baseYellow, withoutYellow).length, 1)
+    // Legitimate shrink & red->yellow demotion stays green
+    assert.deepEqual(
+      baselineRaises(baseYellow, {
+        ...baseYellow,
+        files: {},
+        cssFiles: { 'studio.css': 3000 },
+        yellowZoneFiles: { 'App.tsx': 2900, 'big.ts': 2800 },
+      }),
+      [],
+    )
+  })
+
   test('exceptions need ticket, reason and an expiry within 30 days', () => {
     const today = '2026-10-16'
     const good = {
