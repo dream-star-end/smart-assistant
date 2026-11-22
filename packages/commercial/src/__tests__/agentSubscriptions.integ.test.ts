@@ -698,6 +698,69 @@ describe("OCV5-136 partial unique index & channel/kind isolation", () => {
     assert.ok(intact.rows.every((row) => row.status === "running"));
   });
 
+  test("active v3 supervisor row (subscription_id IS NULL) blocks openAgentSubscription and rolls back entire tx", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("sup-conflict@x.com", 5000n);
+    const supSecret = Buffer.alloc(32, 0xdd);
+    const seeded = await query<{ id: string; updated_at: Date }>(
+      `INSERT INTO agent_containers
+          (user_id, subscription_id, docker_id, docker_name, image, status, state,
+           runtime_channel, runtime_kind, secret_hash)
+       VALUES ($1, NULL, 'v3-sup-docker-id', $2, $3, 'running', 'active', 'v3', 'docker', $4)
+       RETURNING id::text AS id, updated_at`,
+      [uid.toString(), `oc-v3-u${uid}`, IMAGE, supSecret],
+    );
+
+    await assert.rejects(
+      () => openAgentSubscription({ userId: uid, image: "other/image:v2" }),
+      /active non-subscription container/,
+    );
+
+    // Original supervisor container row is completely unchanged
+    const conAfter = await query<{
+      id: string;
+      subscription_id: string | null;
+      docker_id: string | null;
+      docker_name: string | null;
+      image: string | null;
+      status: string;
+      secret_hash: Buffer;
+      updated_at: Date;
+    }>(
+      `SELECT id::text AS id, subscription_id::text AS subscription_id, docker_id, docker_name,
+              image, status, secret_hash, updated_at
+         FROM agent_containers
+        WHERE user_id = $1`,
+      [uid.toString()],
+    );
+    assert.equal(conAfter.rows.length, 1);
+    assert.equal(conAfter.rows[0].id, seeded.rows[0].id);
+    assert.equal(conAfter.rows[0].subscription_id, null);
+    assert.equal(conAfter.rows[0].docker_id, "v3-sup-docker-id");
+    assert.equal(conAfter.rows[0].docker_name, `oc-v3-u${uid}`);
+    assert.equal(conAfter.rows[0].image, IMAGE);
+    assert.equal(conAfter.rows[0].status, "running");
+    assert.deepEqual(conAfter.rows[0].secret_hash, supSecret);
+    assert.equal(conAfter.rows[0].updated_at.getTime(), seeded.rows[0].updated_at.getTime());
+
+    // Wallet debit, subscription insert, and ledger insert all rolled back
+    const bal = await query<{ credits: string }>(
+      "SELECT credits::text AS credits FROM users WHERE id = $1",
+      [uid.toString()],
+    );
+    assert.equal(BigInt(bal.rows[0].credits), 5000n);
+    const subCnt = await query<{ c: string }>(
+      "SELECT COUNT(*)::text AS c FROM agent_subscriptions WHERE user_id = $1",
+      [uid.toString()],
+    );
+    assert.equal(subCnt.rows[0].c, "0");
+    const ledgerCnt = await query<{ c: string }>(
+      "SELECT COUNT(*)::text AS c FROM credit_ledger WHERE user_id = $1",
+      [uid.toString()],
+    );
+    assert.equal(ledgerCnt.rows[0].c, "0");
+  });
+
   test("v5 channel fails closed before touching DB", async (t) => {
     if (skipIfNoPg(t)) return;
     const uid = await createUser("v5-blocked@x.com", 5000n);

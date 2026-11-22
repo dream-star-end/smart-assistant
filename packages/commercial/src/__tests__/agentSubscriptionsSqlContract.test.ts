@@ -63,7 +63,7 @@ describe("OCV5-136 migration & SQL contract for openAgentSubscription", () => {
     );
     assert.match(
       src,
-      /ON CONFLICT\s*\(\s*user_id,\s*runtime_channel,\s*runtime_kind\s*\)\s*WHERE\s+state\s*=\s*'active'\s*DO UPDATE/i,
+      /ON CONFLICT\s*\(\s*user_id,\s*runtime_channel,\s*runtime_kind\s*\)\s*WHERE\s+state\s*=\s*'active'\s*DO UPDATE[\s\S]*WHERE\s+agent_containers\.subscription_id\s+IS\s+NOT\s+NULL/i,
     );
   });
 
@@ -133,7 +133,7 @@ describe("OCV5-136 migration & SQL contract for openAgentSubscription", () => {
     assert.ok(upsert, "expected INSERT INTO agent_containers query");
     assert.match(
       upsert.sql,
-      /ON CONFLICT\s*\(\s*user_id,\s*runtime_channel,\s*runtime_kind\s*\)\s*WHERE\s+state\s*=\s*'active'\s*DO UPDATE/i,
+      /ON CONFLICT\s*\(\s*user_id,\s*runtime_channel,\s*runtime_kind\s*\)\s*WHERE\s+state\s*=\s*'active'\s*DO UPDATE[\s\S]*WHERE\s+agent_containers\.subscription_id\s+IS\s+NOT\s+NULL/i,
     );
     assert.match(upsert.sql, /\bstate\b[\s\S]*\bruntime_channel\b[\s\S]*\bruntime_kind\b[\s\S]*\bsecret_hash\b/i);
     assert.ok(Array.isArray(upsert.params), "expected query parameters");
@@ -141,6 +141,70 @@ describe("OCV5-136 migration & SQL contract for openAgentSubscription", () => {
     assert.equal(upsert.params[6], "v3");
     assert.ok(Buffer.isBuffer(upsert.params[7]), "secret_hash must be a Buffer (BYTEA)");
     assert.equal((upsert.params[7] as Buffer).length, 32, "secret_hash must be 32 bytes for 0024 CHECK");
+  });
+
+  test("openAgentSubscription throws and rolls back tx when guarded upsert returns 0 rows (active supervisor container)", async () => {
+    const sqls: string[] = [];
+    const now = new Date();
+    const end = new Date(now.getTime() + 30 * 86400_000);
+
+    const fakeClient = {
+      async query(sql: string) {
+        sqls.push(sql.trim());
+        if (/^(BEGIN|COMMIT|ROLLBACK)$/i.test(sql.trim())) {
+          return { rows: [], rowCount: 0 };
+        }
+        if (/FROM users WHERE id/i.test(sql)) {
+          return { rows: [{ credits: "5000", status: "active" }], rowCount: 1 };
+        }
+        if (/FROM agent_subscriptions/i.test(sql)) {
+          return { rows: [], rowCount: 0 };
+        }
+        if (/INSERT INTO agent_subscriptions/i.test(sql)) {
+          return { rows: [{ id: "101", start_at: now, end_at: end }], rowCount: 1 };
+        }
+        if (/UPDATE users SET credits/i.test(sql)) {
+          return { rows: [], rowCount: 1 };
+        }
+        if (/INSERT INTO credit_ledger/i.test(sql)) {
+          return { rows: [{ id: "202" }], rowCount: 1 };
+        }
+        if (/INSERT INTO agent_containers/i.test(sql)) {
+          // Simulates DO UPDATE WHERE agent_containers.subscription_id IS NOT NULL matching 0 rows
+          return { rows: [], rowCount: 0 };
+        }
+        throw new Error(`unexpected SQL in contract test: ${sql}`);
+      },
+      release() {
+        /* noop */
+      },
+    } as unknown as PoolClient;
+
+    const fakePool = {
+      async connect() {
+        return fakeClient;
+      },
+      async end() {
+        /* noop */
+      },
+    } as unknown as Pool;
+
+    const prev = process.env.OC_RUNTIME_CHANNEL;
+    process.env.OC_RUNTIME_CHANNEL = "v3";
+    setPoolOverride(fakePool);
+    try {
+      await assert.rejects(
+        () => openAgentSubscription({ userId: 42n, image: "openclaude/agent-runtime:latest" }),
+        /active non-subscription container/,
+      );
+    } finally {
+      if (prev === undefined) Reflect.deleteProperty(process.env, "OC_RUNTIME_CHANNEL");
+      else process.env.OC_RUNTIME_CHANNEL = prev;
+    }
+
+    assert.ok(sqls.includes("BEGIN"), "expected transaction BEGIN");
+    assert.ok(sqls.includes("ROLLBACK"), "expected transaction ROLLBACK");
+    assert.ok(!sqls.includes("COMMIT"), "must never COMMIT when supervisor container conflicts");
   });
 
   test("openAgentSubscription rejects on v5 channel before acquiring a DB connection", async () => {

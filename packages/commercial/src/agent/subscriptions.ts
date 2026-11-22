@@ -284,6 +284,7 @@ export async function openAgentSubscription(
            volume_gc_at = NULL,
            last_error = NULL,
            updated_at = NOW()
+       WHERE agent_containers.subscription_id IS NOT NULL
        RETURNING id::text AS id`,
       [
         uidStr,
@@ -296,6 +297,11 @@ export async function openAgentSubscription(
         placeholderSecretHash,
       ],
     );
+    if (conRow.rows.length === 0) {
+      throw new Error(
+        `cannot open legacy agent subscription: user ${uidStr} already has an active non-subscription container on ${runtimeChannel}/docker`,
+      );
+    }
 
     return {
       subscription_id: subId,
