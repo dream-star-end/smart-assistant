@@ -26,19 +26,26 @@ function runRunner(opts: {
   script?: string
   stdin?: string
   timeoutMs?: number
+  actionPolicy?: string
 }): { status: number | null; stdout: string; stderr: string; elapsedMs: number } {
   const started = Date.now()
   const args = [RUNNER, `--protocol=${opts.protocol}`, '--mode=deny']
   if (opts.script) args.push(`--script=${opts.script}`)
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    OPENCLAUDE_HOME: TEST_HOME,
+    OPENCLAUDE_EFFICIENCY_HOOK_TIMEOUT_MS: String(opts.timeoutMs ?? 1500),
+  }
+  if (opts.actionPolicy !== undefined) {
+    env.OPENCLAUDE_ACTION_POLICY = opts.actionPolicy
+  } else {
+    delete env.OPENCLAUDE_ACTION_POLICY
+  }
   const result = spawnSync(process.execPath, args, {
     encoding: 'utf8',
     input: opts.stdin ?? '{"command":"true"}\n',
     timeout: 8000,
-    env: {
-      ...process.env,
-      OPENCLAUDE_HOME: TEST_HOME,
-      OPENCLAUDE_EFFICIENCY_HOOK_TIMEOUT_MS: String(opts.timeoutMs ?? 1500),
-    },
+    env,
   })
   return {
     status: result.status,
@@ -65,6 +72,12 @@ function failOpenCount(): number {
   return parseInt(readFileSync(p, 'utf8'), 10) || 0
 }
 
+function failClosedCount(): number {
+  const p = join(TEST_HOME, '.efficiency-guard', 'fail-closed.count')
+  if (!existsSync(p)) return 0
+  return parseInt(readFileSync(p, 'utf8'), 10) || 0
+}
+
 function assertAllowed(protocol: 'ccb' | 'cursor', stdout: string, status: number | null) {
   assert.equal(status, 0, `runner must exit 0, got ${status}: ${stdout}`)
   const obj = JSON.parse(stdout.trim())
@@ -72,6 +85,17 @@ function assertAllowed(protocol: 'ccb' | 'cursor', stdout: string, status: numbe
     assert.equal(obj.permission, 'allow')
   } else {
     assert.equal(obj.hookSpecificOutput.permissionDecision, 'allow')
+  }
+}
+
+function assertFailClosed(protocol: 'ccb' | 'cursor', stdout: string, status: number | null) {
+  assert.equal(status, 0, `runner must exit 0 (never exit 2), got ${status}: ${stdout}`)
+  const obj = JSON.parse(stdout.trim())
+  if (protocol === 'cursor') {
+    assert.equal(obj.permission, 'deny')
+    assert.equal(obj.requiresHumanApproval, true)
+  } else {
+    assert.equal(obj.hookSpecificOutput.permissionDecision, 'ask')
   }
 }
 
@@ -95,10 +119,14 @@ describe('engine hook command stays on the fail-open runner', () => {
   })
 })
 
-describe('four hook-chain faults all fail-open with a signal', () => {
+describe('efficiency-only mode (OPENCLAUDE_ACTION_POLICY=off): four hook-chain faults fail-open with a signal', () => {
   it('missing inner script → allow + audit + counter', () => {
     const before = failOpenCount()
-    const out = runRunner({ protocol: 'ccb', script: join(TEST_HOME, 'no-such-hook.cjs') })
+    const out = runRunner({
+      protocol: 'ccb',
+      script: join(TEST_HOME, 'no-such-hook.cjs'),
+      actionPolicy: 'off',
+    })
     assertAllowed('ccb', out.stdout, out.status)
     assert.match(out.stderr, /fail-open/)
     assert.match(out.stderr, /nonzero_exit|tsx_missing|spawn_error|timeout/)
@@ -110,7 +138,7 @@ describe('four hook-chain faults all fail-open with a signal', () => {
   it('nonzero inner exit → allow + audit + counter', () => {
     const script = writeFixture('exit1.cjs', 'process.stdout.write("not used\\n"); process.exit(1);\n')
     const before = failOpenCount()
-    const out = runRunner({ protocol: 'cursor', script })
+    const out = runRunner({ protocol: 'cursor', script, actionPolicy: 'off' })
     assertAllowed('cursor', out.stdout, out.status)
     assert.match(out.stderr, /fail-open/)
     assert.match(out.stderr, /nonzero_exit:1/)
@@ -121,7 +149,7 @@ describe('four hook-chain faults all fail-open with a signal', () => {
   it('invalid JSON stdout → allow + audit + counter', () => {
     const script = writeFixture('badjson.cjs', 'process.stdout.write("this is not json\\n"); process.exit(0);\n')
     const before = failOpenCount()
-    const out = runRunner({ protocol: 'ccb', script })
+    const out = runRunner({ protocol: 'ccb', script, actionPolicy: 'off' })
     assertAllowed('ccb', out.stdout, out.status)
     assert.match(out.stderr, /invalid_json/)
     assert.ok(failOpenCount() > before)
@@ -135,7 +163,7 @@ describe('four hook-chain faults all fail-open with a signal', () => {
       `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`,
     )
     const before = failOpenCount()
-    const out = runRunner({ protocol: 'cursor', script, timeoutMs: 250 })
+    const out = runRunner({ protocol: 'cursor', script, timeoutMs: 250, actionPolicy: 'off' })
     assertAllowed('cursor', out.stdout, out.status)
     assert.ok(out.elapsedMs < 2000, `timeout must be ms-level, took ${out.elapsedMs}ms`)
     assert.match(out.stderr, /timeout/)
@@ -164,6 +192,127 @@ describe('four hook-chain faults all fail-open with a signal', () => {
       }
     }
     assert.equal(alive, false, `inner pid ${innerPid} still alive after runner timeout`)
+  })
+})
+
+describe('action-policy enabled (default / on): runner & inner faults NEVER fail-open to allow', () => {
+  it('missing inner script via real runner → CCB ask + Cursor deny (never allow)', () => {
+    const before = failClosedCount()
+    const ccb = runRunner({ protocol: 'ccb', script: join(TEST_HOME, 'no-such-policy-hook.cjs') })
+    assertFailClosed('ccb', ccb.stdout, ccb.status)
+    assert.match(ccb.stderr, /fail-closed/)
+
+    const cursor = runRunner({ protocol: 'cursor', script: join(TEST_HOME, 'no-such-policy-hook.cjs') })
+    assertFailClosed('cursor', cursor.stdout, cursor.status)
+    assert.match(cursor.stderr, /fail-closed/)
+    assert.ok(failClosedCount() >= before + 2)
+    assert.match(auditText(), /"event":"fail_closed"/)
+  })
+
+  it('nonzero exit & invalid JSON stdout via real runner → CCB ask + Cursor deny', () => {
+    const exitScript = writeFixture('policy-exit1.cjs', 'process.exit(1);\n')
+    const badJsonScript = writeFixture('policy-badjson.cjs', 'process.stdout.write("not json\\n");\n')
+
+    const ccbExit = runRunner({ protocol: 'ccb', script: exitScript, actionPolicy: 'on' })
+    assertFailClosed('ccb', ccbExit.stdout, ccbExit.status)
+    assert.match(ccbExit.stderr, /nonzero_exit:1/)
+
+    const cursorBad = runRunner({ protocol: 'cursor', script: badJsonScript, actionPolicy: 'on' })
+    assertFailClosed('cursor', cursorBad.stdout, cursorBad.status)
+    assert.match(cursorBad.stderr, /invalid_json/)
+  })
+
+  it('hung inner script times out via real runner → CCB ask + Cursor deny and kills orphan child', () => {
+    const pidFile = join(TEST_HOME, 'policy-hang.pid')
+    const script = writeFixture(
+      'policy-hang.cjs',
+      `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`,
+    )
+    const ccb = runRunner({ protocol: 'ccb', script, timeoutMs: 250 })
+    assertFailClosed('ccb', ccb.stdout, ccb.status)
+    assert.ok(ccb.elapsedMs < 2000, `timeout must be ms-level, took ${ccb.elapsedMs}ms`)
+    assert.match(ccb.stderr, /timeout/)
+
+    const cursor = runRunner({ protocol: 'cursor', script, timeoutMs: 250 })
+    assertFailClosed('cursor', cursor.stdout, cursor.status)
+    assert.match(cursor.stderr, /timeout/)
+
+    assert.ok(existsSync(pidFile))
+    const innerPid = Number(readFileSync(pidFile, 'utf8'))
+    let alive = true
+    for (let i = 0; i < 40 && alive; i++) {
+      try {
+        process.kill(innerPid, 0)
+        spawnSync('sleep', ['0.05'])
+      } catch {
+        alive = false
+      }
+    }
+    assert.equal(alive, false, `inner pid ${innerPid} still alive after policy timeout`)
+  })
+
+  it('inner policy evaluation exception fails closed (CCB ask / Cursor deny) without downgrading efficiency deny', async () => {
+    const { handlePreToolHookInput } = await import('../efficiencyPreToolHook.js')
+    const brokenPolicy = {
+      ok: true as const,
+      source: 'file' as const,
+      path: '/tmp/broken.yaml',
+      warnings: [],
+      get policy(): never {
+        throw new Error('boom during action policy read')
+      },
+    }
+
+    const ccb = await handlePreToolHookInput(
+      { tool_name: 'Bash', tool_input: { command: 'echo safe' } },
+      'ccb',
+      'warn',
+      { actionPolicyEnabled: true, loadedPolicy: brokenPolicy },
+    )
+    assert.equal((ccb.hookSpecificOutput as { permissionDecision: string }).permissionDecision, 'ask')
+
+    const cursor = await handlePreToolHookInput(
+      { command: 'echo safe' },
+      'cursor',
+      'warn',
+      { actionPolicyEnabled: true, loadedPolicy: brokenPolicy },
+    )
+    assert.equal(cursor.permission, 'deny')
+    assert.equal(cursor.requiresHumanApproval, true)
+
+    // Existing efficiency deny MUST still win over synthesized policy ask
+    const strictCcb = await handlePreToolHookInput(
+      { tool_name: 'Bash', tool_input: { command: 'sleep 600' } },
+      'ccb',
+      'deny',
+      { actionPolicyEnabled: true, loadedPolicy: brokenPolicy },
+    )
+    assert.equal((strictCcb.hookSpecificOutput as { permissionDecision: string }).permissionDecision, 'deny')
+  })
+
+  it('real runner + real inner hook fail-closed on invalid JSON stdin when policy enabled, fail-open when policy off', () => {
+    const distRunner = join(SRC_DIR, '../dist/efficiencyHookRunner.cjs')
+    const runnerPath = existsSync(distRunner) ? distRunner : RUNNER
+    const runReal = (protocol: 'ccb' | 'cursor', actionPolicy?: string) =>
+      spawnSync(process.execPath, [runnerPath, `--protocol=${protocol}`, '--mode=deny'], {
+        encoding: 'utf8',
+        input: '{not-valid-json\n',
+        timeout: 8000,
+        env: {
+          ...process.env,
+          OPENCLAUDE_HOME: TEST_HOME,
+          OPENCLAUDE_EFFICIENCY_HOOK_TIMEOUT_MS: '5000',
+          ...(actionPolicy !== undefined ? { OPENCLAUDE_ACTION_POLICY: actionPolicy } : {}),
+        },
+      })
+
+    const ccbOn = runReal('ccb', 'on')
+    assertFailClosed('ccb', ccbOn.stdout ?? '', ccbOn.status)
+    const cursorOn = runReal('cursor', 'on')
+    assertFailClosed('cursor', cursorOn.stdout ?? '', cursorOn.status)
+
+    const ccbOff = runReal('ccb', 'off')
+    assertAllowed('ccb', ccbOff.stdout ?? '', ccbOff.status)
   })
 })
 
@@ -244,10 +393,17 @@ describe('happy path is unchanged', () => {
     assert.equal(JSON.parse(out.stdout.trim()).permission, 'deny')
   })
 
-  it('malformed stdin still allows via handlePreToolHookInput', async () => {
+  it('malformed payload allows only when action-policy is off; fails closed when action-policy is on', async () => {
     const { handlePreToolHookInput } = await import('../efficiencyPreToolHook.js')
-    const out = await handlePreToolHookInput('not-json', 'ccb', 'deny')
-    assert.equal((out.hookSpecificOutput as { permissionDecision: string }).permissionDecision, 'allow')
+    const outOff = await handlePreToolHookInput('not-json', 'ccb', 'deny', { actionPolicyEnabled: false })
+    assert.equal((outOff.hookSpecificOutput as { permissionDecision: string }).permissionDecision, 'allow')
+
+    const outCcbOn = await handlePreToolHookInput('not-json', 'ccb', 'deny', { actionPolicyEnabled: true })
+    assert.equal((outCcbOn.hookSpecificOutput as { permissionDecision: string }).permissionDecision, 'ask')
+
+    const outCursorOn = await handlePreToolHookInput('not-json', 'cursor', 'deny', { actionPolicyEnabled: true })
+    assert.equal(outCursorOn.permission, 'deny')
+    assert.equal(outCursorOn.requiresHumanApproval, true)
   })
 })
 

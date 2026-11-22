@@ -2805,6 +2805,7 @@ export async function registerCommercial(
       internalProxyServer,
       externalMtlsServer,
       getDesktopTlsClose: () => desktopTlsClose,
+      disposePendingDecisions: () => pendingDecisionsRuntime.dispose(),
       clearGatewayProviders: () => {
         try { setModelHintProvider(null); } catch { /* ignore */ }
         try { setHostStaticProviderKeys(null); } catch { /* ignore */ }

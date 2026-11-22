@@ -1071,6 +1071,7 @@ export function createCommercialPendingDecisionsRuntime(
     }
   })
 
+  let disposed = false
   return {
     service,
     shortCodes,
@@ -1078,6 +1079,8 @@ export function createCommercialPendingDecisionsRuntime(
     wechatRemoteControl,
     qqRemoteControl,
     dispose: () => {
+      if (disposed) return
+      disposed = true
       unsubOnCreated()
       unsubPerm()
       unsubConn()
