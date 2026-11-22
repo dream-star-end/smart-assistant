@@ -722,7 +722,7 @@ export function handleClientSessionsHttp(
     }
     ;(async () => {
       if (!(await clientSessionIsActive(sessId, userId))) {
-        io.sendJson(res, 404, { error: 'not found' })
+        io.sendJson(res, 404, { code: 'SESSION_NOT_FOUND', error: 'session not found' })
         return
       }
       const host = io.delegateCancelHost?.()
@@ -753,7 +753,7 @@ export function handleClientSessionsHttp(
     }
     ;(async () => {
       if (!(await clientSessionIsActive(sessId, userId))) {
-        io.sendJson(res, 404, { error: 'not found' })
+        io.sendJson(res, 404, { code: 'SESSION_NOT_FOUND', error: 'session not found' })
         return
       }
       io.sendJson(res, 200, { items: listSessionBgCommands(sessId) })
@@ -781,7 +781,7 @@ export function handleClientSessionsHttp(
     }
     ;(async () => {
       if (!(await clientSessionIsActive(sessId, userId))) {
-        io.sendJson(res, 404, { error: 'not found' })
+        io.sendJson(res, 404, { code: 'SESSION_NOT_FOUND', error: 'session not found' })
         return
       }
       const result = await cancelSessionBgCommand(sessId, entryId)
@@ -807,7 +807,7 @@ export function handleClientSessionsHttp(
     }
     ;(async () => {
       if (!(await clientSessionIsActive(sessId, userId))) {
-        io.sendJson(res, 404, { error: 'not found' })
+        io.sendJson(res, 404, { code: 'SESSION_NOT_FOUND', error: 'session not found' })
         return
       }
       let delegates: unknown[] = []

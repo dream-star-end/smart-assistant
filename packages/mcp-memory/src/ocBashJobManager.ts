@@ -8,7 +8,7 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 export const OC_BASH_MAX_OUTPUT_BYTES = 200 * 1024
@@ -90,6 +90,43 @@ export function parseProcStatStartTimeTicks(statLine: string): number | null {
   if (!rawTicks || !/^\d+$/.test(rawTicks)) return null
   const ticks = Number(rawTicks)
   return Number.isSafeInteger(ticks) && ticks >= 0 ? ticks : null
+}
+
+/**
+ * Returns true if any live non-zombie process still belongs to verified process group `pgid`
+ * with `starttime >= minStartTicks` (prevents deleting the control snapshot when the shell
+ * leader exits while detached sub-children in the same process group are still running).
+ */
+export function hasAliveVerifiedGroupMembers(pgid: number, minStartTicks: number | null): boolean {
+  if (process.platform !== 'linux' || !Number.isInteger(pgid) || pgid <= 1 || minStartTicks === null) {
+    return false
+  }
+  let entries: string[]
+  try {
+    entries = readdirSync('/proc')
+  } catch {
+    return false
+  }
+  for (const name of entries) {
+    if (!/^\d+$/.test(name)) continue
+    try {
+      const raw = readFileSync(`/proc/${name}/stat`, 'utf8')
+      const rparen = raw.lastIndexOf(')')
+      if (rparen < 0) continue
+      const fields = raw.slice(rparen + 1).trim().split(/\s+/)
+      const state = fields[0] ?? ''
+      if (state === 'Z' || state === 'X' || state === 'x') continue
+      const pgrp = Number(fields[2])
+      if (pgrp !== pgid) continue
+      const ticks = Number(fields[19])
+      if (Number.isSafeInteger(ticks) && ticks >= minStartTicks) {
+        return true
+      }
+    } catch {
+      /* exited during scan */
+    }
+  }
+  return false
 }
 
 /**
@@ -655,7 +692,17 @@ export class OcBashJobManager {
       this.localProcessGroups.delete(pid)
       this.untrackProcessGroup?.(pid)
     }
-    this.removeJobSnapshot(job)
+    const groupStillRunning =
+      !job.killRequested &&
+      Boolean(pid && pid > 1) &&
+      hasAliveVerifiedGroupMembers(pid!, job.startTimeTicks)
+    if (!groupStillRunning) {
+      this.removeJobSnapshot(job)
+    } else if (job.snapshotPath) {
+      // Leader exited while child processes in the same process group are still alive:
+      // keep the disk snapshot so gateway list/cancel retains control until the group exits.
+      this.activeSnapshotPaths.delete(job.snapshotPath)
+    }
     job.resolveClose()
 
     if (!job.waiterInFlight && job.yielded) {

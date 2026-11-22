@@ -634,4 +634,46 @@ describe("cross-session & trigger helpers", () => {
     rerender({ wsSending: false, wsMessages: msgs, chatVersion: 3, mediaJobVersion: 1 });
     expect(result.current.bgTasksRefreshTrigger).toBe(2);
   });
+
+  test("Muse 结算期拒绝取消（cancelled=false, status=running）时保留服务端状态，绝不显示假已取消", async () => {
+    const auth = createMemoryAuthSession(() => {});
+    vi.mocked(fetchSessionBackgroundTasksResult)
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: {
+          delegates: [],
+          museJobs: [museJob({ id: "m-settle", status: "running", promptPreview: "settling video" })],
+          bgCommands: [],
+          sessionCrons: [],
+        },
+      })
+      .mockResolvedValueOnce({ ok: false, routeMissing: false, sessionNotReady: false });
+    vi.mocked(cancelSessionMuseJob).mockResolvedValueOnce({
+      ok: true,
+      cancelled: false,
+      status: "running",
+    });
+
+    const { result } = renderHook(() =>
+      useSessionBackgroundTasks({
+        sessionId: "s-settle",
+        auth,
+        enabled: true,
+        liveMediaJobs: new Map(),
+      }),
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(result.current.museJobs).toHaveLength(1);
+    expect(result.current.museJobs[0]?.status).toBe("running");
+
+    let ok = true;
+    await act(async () => {
+      ok = await result.current.cancelMuseJob("m-settle");
+    });
+    expect(ok).toBe(false);
+    expect(result.current.museJobs[0]?.status).toBe("running");
+  });
 });

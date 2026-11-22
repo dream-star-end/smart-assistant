@@ -170,4 +170,36 @@ describe('ocBashJobManager disk snapshots (OCV5-844)', () => {
       mgr.disposeAll()
     }
   })
+
+  it('retains disk snapshot when shell leader exits while a backgrounded child in the same pgrp stays alive', async () => {
+    if (process.platform !== 'linux') return
+    const regDir = mkdtempSync(join(tmpdir(), 'oc-bash-snap-orphan-'))
+    const mgr = new OcBashJobManager({
+      registryDir: regDir,
+      sessionKey: 'agent:main:webchat:dm:sess_orphan',
+    })
+    let childPid = 0
+    try {
+      // Spawn detached background child that closes stdio so shell leader exits immediately while child stays in same pgrp.
+      const outcome = await mgr.startAndWait({
+        command: 'sleep 20 </dev/null >/dev/null 2>&1 & echo $!',
+        timeoutMs: 3000,
+      })
+      assert.equal(outcome.kind, 'finished')
+      childPid = Number(outcome.stdout.trim())
+      assert.ok(Number.isInteger(childPid) && childPid > 1)
+      const files = readdirSync(regDir).filter((f) => f.endsWith('.json'))
+      assert.equal(files.length, 1, 'snapshot must remain while verified group member is still alive')
+    } finally {
+      if (childPid > 1) {
+        try {
+          process.kill(childPid, 'SIGKILL')
+        } catch {
+          /* already exited */
+        }
+      }
+      mgr.disposeAll()
+      rmSync(regDir, { recursive: true, force: true })
+    }
+  })
 })

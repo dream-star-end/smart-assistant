@@ -613,6 +613,56 @@ describe('cancelSingleDelegateJob', () => {
     assert.equal(surface.get('dlgjob-sync-1')?.state, 'cancelled')
   })
 
+  it('matches progressRunId strictly and never cancels an unrelated child by agentId prefix alone', () => {
+    const surface = new DelegateInflightSurfaceStore({ dbPath: null })
+    const parentSessionKey = 'agent:main:webchat:dm:sess-sync-2'
+    surface.upsertEnqueue({
+      jobId: 'dlgjob-stale',
+      parentSessionKey,
+      agentId: 'researcher',
+      runId: 'run-old',
+      goal: 'stale run',
+      state: 'running',
+    })
+    const activeChildKey = 'agent:researcher:delegate:main:1700000:abcd'
+    const interrupted: string[] = []
+    const hostMismatch: DelegateCancelHost = {
+      delegateJobs: () => undefined,
+      delegateInflightSurface: () => surface,
+      sessions: {
+        getByKey: (k) =>
+          k === activeChildKey ? ({ sessionKey: k, progressRunId: 'run-newer' } as never) : undefined,
+        interrupt: (k) => {
+          interrupted.push(k)
+          return true
+        },
+      },
+      _activeDelegationsByParent: new Map([[parentSessionKey, new Set([activeChildKey])]]),
+      _interruptDelegationsForParent: () => false,
+    }
+    const denied = cancelSingleDelegateJob(hostMismatch, 'sess-sync-2', 'dlgjob-stale')
+    assert.equal(denied.ok, false)
+    if (!denied.ok) {
+      assert.equal(denied.status, 409)
+      assert.equal(denied.code, 'DELEGATE_CANCEL_UNCONFIRMED')
+    }
+    assert.deepEqual(interrupted, [])
+    assert.equal(surface.get('dlgjob-stale')?.state, 'running')
+
+    // Exact progressRunId match cancels cleanly even when childKey does not contain runId
+    surface.upsertEnqueue({
+      jobId: 'dlgjob-live',
+      parentSessionKey,
+      agentId: 'researcher',
+      runId: 'run-newer',
+      goal: 'current run',
+      state: 'running',
+    })
+    const ok = cancelSingleDelegateJob(hostMismatch, 'sess-sync-2', 'dlgjob-live')
+    assert.deepEqual(ok, { ok: true, cancelled: true, state: 'cancelled' })
+    assert.deepEqual(interrupted, [activeChildKey])
+  })
+
   it('retries CAS once and returns 409 DELEGATE_CANCEL_CONFLICT without fabricating surface cancelled if job stays non-terminal', () => {
     const jobs = new DelegateJobStore({ sm: true })
     const surface = new DelegateInflightSurfaceStore({ dbPath: null })

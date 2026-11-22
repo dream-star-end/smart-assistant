@@ -256,16 +256,26 @@ export function useSessionBackgroundTasks(
       if (!res.ok) return false;
       if (genRef.current === myGen) {
         committedSeqRef.current = ++requestSeqRef.current;
-        const nextStatus: SessionMuseJobStatus =
-          res.status === "succeeded" || res.status === "failed" || res.status === "cancelled"
+        const validStatus: SessionMuseJobStatus | null =
+          res.status === "queued" ||
+          res.status === "running" ||
+          res.status === "succeeded" ||
+          res.status === "failed" ||
+          res.status === "cancelled"
             ? res.status
-            : "cancelled";
-        setRawMuseJobs((prev) =>
-          prev.map((j) => (j.id === jobId ? { ...j, status: nextStatus } : j)),
-        );
+            : null;
+        if (validStatus) {
+          setRawMuseJobs((prev) =>
+            prev.map((j) => (j.id === jobId ? { ...j, status: validStatus } : j)),
+          );
+        } else if (res.cancelled) {
+          setRawMuseJobs((prev) =>
+            prev.map((j) => (j.id === jobId ? { ...j, status: "cancelled" } : j)),
+          );
+        }
         await pullTasks(sid, myGen);
       }
-      return true;
+      return Boolean(res.cancelled);
     },
     [pullTasks],
   );

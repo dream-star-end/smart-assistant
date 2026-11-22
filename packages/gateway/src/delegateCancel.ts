@@ -81,33 +81,28 @@ function interruptChildSession(host: DelegateCancelHost, childSessionKey: string
 function resolveUniqueSyncChildKey(
   host: DelegateCancelHost,
   parentSessionKey: string,
-  agentId: string,
+  _agentId: string,
   runId: string,
 ): string | null {
   const activeChildren = host._activeDelegationsByParent?.get(parentSessionKey)
   if (!activeChildren || activeChildren.size === 0) return null
+  if (!runId) return null
   const all = [...activeChildren]
 
-  // 1. Prefer exact runId match in child session key (or live session metadata if present).
-  if (runId) {
-    const byRunId = all.filter((childKey) => {
-      if (childKey.includes(runId)) return true
-      const sess = host.sessions.getByKey(childKey) as
-        | { delegateRunId?: string; runId?: string }
-        | undefined
-      return sess?.delegateRunId === runId || sess?.runId === runId
-    })
-    if (byRunId.length === 1) return byRunId[0]!
-    if (byRunId.length > 1) return null
-  }
-
-  // 2. Fallback: unambiguous single active delegation for this agent under the same parent.
-  if (agentId) {
-    const prefix = `agent:${agentId}:delegate:`
-    const byAgent = all.filter((childKey) => childKey.startsWith(prefix))
-    if (byAgent.length === 1) return byAgent[0]!
-  }
-  return null
+  // Require exact runId identity match (progressRunId is set by delegateRuntime on real child sessions).
+  // Never guess by agentId alone: parallel delegations or stale surface rows could cancel an unrelated child.
+  const byRunId = all.filter((childKey) => {
+    if (childKey.includes(runId)) return true
+    const sess = host.sessions.getByKey(childKey) as
+      | { progressRunId?: string; delegateRunId?: string; runId?: string }
+      | undefined
+    return (
+      sess?.progressRunId === runId ||
+      sess?.delegateRunId === runId ||
+      sess?.runId === runId
+    )
+  })
+  return byRunId.length === 1 ? byRunId[0]! : null
 }
 
 export function cancelSingleDelegateJob(
