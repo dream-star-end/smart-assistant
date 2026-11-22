@@ -15,9 +15,16 @@ import { WORKSPACE_API_ROUTES } from './routes/workspaceApi.js'
 import { dispatchRoutes } from './routes/routeTable.js'
 import { handleClientSessionsHttp } from './routes/clientSessions.js'
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
-import { constants as fsConstants, closeSync, openSync, readFileSync, statSync } from 'node:fs'
+import {
+  constants as fsConstants,
+  closeSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+} from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { join, resolve } from 'node:path'
+import { join, resolve, sep } from 'node:path'
 import { checkLocalBridge } from './localBridgeAuth.js'
 import { resolveOpenedPath } from './openedPath.js'
 import { readConfig, writeConfig } from '@openclaude/storage'
@@ -338,6 +345,36 @@ export function _handleHttpAfterCommercial(
 }
 
 /**
+ * Strict allowlist for repo-built tutorial showcase HTML pages that may be framed
+ * inside the same-origin SPA showroom (OCV5-191, OCV5-154). Global responses keep
+ * `X-Frame-Options: DENY`; ONLY verified regular static HTML files on disk inside
+ * `webRoot` matching these two exact repo-built patterns in `spa` mode receive
+ * `X-Frame-Options: SAMEORIGIN` and `Content-Security-Policy: frame-ancestors 'self'`.
+ */
+const TRUSTED_SHOWCASE_EMBED_PATTERNS: readonly RegExp[] = [
+  /^\/tutorials\/showcase-works\/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\/index\.html$/,
+  /^\/tutorials\/cases\/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\/showcase\/dashboard\.html$/,
+]
+
+export const SHOWCASE_EMBED_CSP = "frame-ancestors 'self'"
+
+export function isTrustedShowcaseEmbedPath(pathname: string): boolean {
+  return TRUSTED_SHOWCASE_EMBED_PATTERNS.some((re) => re.test(pathname))
+}
+
+function isRegularFileWithinWebRoot(filePath: string, webRoot: string): boolean {
+  try {
+    if (!statSync(filePath).isFile()) return false
+    const realRoot = realpathSync(webRoot)
+    const rootPrefix = realRoot.endsWith(sep) ? realRoot : realRoot + sep
+    const realFile = realpathSync(filePath)
+    return realFile.startsWith(rootPrefix)
+  } catch {
+    return false
+  }
+}
+
+/**
  * 静态 web UI(含 /admin 302 与 SPA 回退)。true = 已响应;false = 交给调用方 404。
  * 自 _handleHttpAfterCommercial 原样抽出以便单测(OCV5-632);在原逻辑上只多两件事,
  * 规则都在 staticFileCandidates:spa 下 /assets/* 在 webRoot 未命中时回落资产池(按真实路径
@@ -371,8 +408,18 @@ export function serveWebStatic(
     assetsPool: this.deps.webAssetsPool,
   })
   if (candidates === null) return false
+  const allowShowcaseEmbed = this.deps.staticMode === 'spa' && isTrustedShowcaseEmbedPath(safePath)
   for (const filePath of candidates) {
+    if (allowShowcaseEmbed && !isRegularFileWithinWebRoot(filePath, webRoot)) continue
+    if (allowShowcaseEmbed) {
+      res.setHeader('X-Frame-Options', 'SAMEORIGIN')
+      res.setHeader('Content-Security-Policy', SHOWCASE_EMBED_CSP)
+    }
     if (this._serveStaticCached(filePath, cacheHeader, req, res, mimeFor(filePath))) return true
+    if (allowShowcaseEmbed && !res.headersSent) {
+      res.setHeader('X-Frame-Options', 'DENY')
+      res.removeHeader('Content-Security-Policy')
+    }
   }
   // SPA fallback — only for navigation requests (no file extension)
   // Static assets (.js/.css/.map/.min.js etc.) should 404, not serve index.html
