@@ -45,6 +45,7 @@ export type FlashcardsSpec = Sub & { type: "flashcards"; title?: string; cards: 
 
 export type BrowserHandoffSpec = Sub & {
   type: "browser_handoff";
+  decisionId?: string;
   title?: string;
   url?: string;
   reason?: string;
@@ -337,6 +338,7 @@ function flashcards(raw: Record<string, unknown>, ctx: Ctx): FlashcardsSpec | nu
 function browserHandoff(raw: Record<string, unknown>, _ctx: Ctx): BrowserHandoffSpec {
   return {
     type: "browser_handoff",
+    ...optional("decisionId", str(raw.decisionId ?? raw.decision_id ?? raw.handoffId ?? raw.handoff_id ?? raw.id, 120)),
     ...optional("title", str(raw.title, 120)),
     ...optional("url", httpUrl(raw.url ?? raw.page_url ?? raw.href)),
     ...optional("reason", str(raw.reason ?? raw.body ?? raw.message ?? raw.description, 600)),

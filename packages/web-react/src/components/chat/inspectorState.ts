@@ -23,6 +23,7 @@ export type LiveBrowserHandoffRequest = {
   expand?: boolean;
   url?: string;
   continuePrompt?: string;
+  handoffId?: string;
 };
 
 /**
@@ -59,6 +60,63 @@ export const InspectorStopTurnContext = createContext<(() => void) | undefined>(
 
 export function useInspectorStopTurn(): (() => void) | undefined {
   return useContext(InspectorStopTurnContext);
+}
+
+/** 会话级云端浏览器人工接管完成事件（严格按 sessionId + handoffId 精准同步对话内 BrowserHandoffBlock 卡片）。 */
+export interface LiveBrowserHandbackEvent {
+  sessionId: string | null;
+  handoffId: string;
+  agentId?: string;
+  autoSent?: boolean;
+  ts: number;
+}
+
+const liveBrowserHandbacks = new Map<string, LiveBrowserHandbackEvent>();
+let liveBrowserHandbackVersion = 0;
+const liveBrowserHandbackListeners = new Set<() => void>();
+
+function handbackScopeKey(sessionId: string | null | undefined, handoffId: string): string {
+  return `${sessionId ?? ""}::${handoffId}`;
+}
+
+export function notifyLiveBrowserHandback(
+  evt: Omit<LiveBrowserHandbackEvent, "ts" | "sessionId" | "handoffId"> & {
+    sessionId?: string | null;
+    handoffId?: string | null;
+  },
+): void {
+  if (!evt.handoffId) return;
+  const sessionId = evt.sessionId ?? null;
+  liveBrowserHandbacks.set(handbackScopeKey(sessionId, evt.handoffId), {
+    sessionId,
+    handoffId: evt.handoffId,
+    agentId: evt.agentId,
+    autoSent: evt.autoSent,
+    ts: Date.now(),
+  });
+  liveBrowserHandbackVersion += 1;
+  for (const listener of liveBrowserHandbackListeners) {
+    listener();
+  }
+}
+
+export function subscribeLiveBrowserHandback(listener: () => void): () => void {
+  liveBrowserHandbackListeners.add(listener);
+  return () => {
+    liveBrowserHandbackListeners.delete(listener);
+  };
+}
+
+export function getLiveBrowserHandbackVersion(): number {
+  return liveBrowserHandbackVersion;
+}
+
+export function getLiveBrowserHandbackFor(
+  sessionId: string | null | undefined,
+  handoffId: string | null | undefined,
+): LiveBrowserHandbackEvent | null {
+  if (!handoffId) return null;
+  return liveBrowserHandbacks.get(handbackScopeKey(sessionId, handoffId)) ?? null;
 }
 
 /**

@@ -131,6 +131,7 @@ export interface GatewayLifecycleHost {
   _wsKeepaliveTimer: Gateway['_wsKeepaliveTimer']
   bootAutoResume: Gateway['bootAutoResume']
   channels: Gateway['channels']
+  checkHttpAuth: Gateway['checkHttpAuth']
   clientsByPeer: Gateway['clientsByPeer']
   cron: Gateway['cron']
   cronProjectPorts: Gateway['cronProjectPorts']
@@ -144,6 +145,7 @@ export interface GatewayLifecycleHost {
   injectCronOriginSession: Gateway['injectCronOriginSession']
   injectSendToAgentCallback: Gateway['injectSendToAgentCallback']
   lastActiveChannel: Gateway['lastActiveChannel']
+  liveBrowser: Gateway['liveBrowser']
   log: Gateway['log']
   rateLimiter: Gateway['rateLimiter']
   refreshClaudeOAuthIfNeeded: Gateway['refreshClaudeOAuthIfNeeded']
@@ -401,6 +403,11 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
   this.wss.on('error', (err) => {
     this.log.error('wss.server_error', undefined, err)
   })
+  this.liveBrowser.setAgentRunningCheck((id: string) =>
+    this.sessions.list().some((s) => s.agentId === id && (this.sessions.getByKey(s.sessionKey)?._activeTurnCount ?? 0) > 0),
+  )
+  this.liveBrowser.setUpgradeAuthCheck((req) => this.checkHttpAuth(req))
+  this.liveBrowser.setCommercialMasterMode(Boolean(this.deps.commercial))
   this.httpServer.on('upgrade', (req, socket, head) => {
     // 1) 商业化模块优先(/ws/user-chat-bridge / /ws/agent / 未来私有路径)
     try {
@@ -422,6 +429,19 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
         socket.destroy()
       } catch {}
       return
+    }
+    // 2.5) Live cloud browser CDP stream (/ws/live-browser) — container/standalone only.
+    // Commercial master always claims /ws/live-browser in step 1 above.
+    if (!this.deps.commercial) {
+      try {
+        if (this.liveBrowser.handleUpgrade(req, socket, head)) return
+      } catch (err) {
+        this.log.error('liveBrowser.handleUpgrade threw', undefined, err)
+        try {
+          socket.destroy()
+        } catch {}
+        return
+      }
     }
     // 3) gateway 自身 /ws(浏览器 ↔ gateway 的 ChannelAdapter 协议)
     const url = req.url ?? '/'
@@ -1018,11 +1038,16 @@ export async function _doShutdown(this: GatewayLifecycleHost, exit: boolean): Pr
     }
   }
 
-  // ── Stage 3.75: close isolated preview Chromium/CDP sessions ──
+  // ── Stage 3.75: close isolated preview & live browser CDP sessions ──
   try {
     await this._containerPreview.shutdown()
   } catch (err) {
     this.log.warn('container preview shutdown error', undefined, err)
+  }
+  try {
+    await this.liveBrowser.shutdown()
+  } catch (err) {
+    this.log.warn('live browser shutdown error', undefined, err)
   }
 
   // ── Stage 4: drain sessions (kill CCB subprocesses, flush resume map) ──

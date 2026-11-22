@@ -66,9 +66,30 @@ describe('liveBrowserController', () => {
     assert.notEqual(ocBrowserAgentKey('main'), ocBrowserAgentKey('coder'))
   })
 
-  it('strictly allows only http: and https: URLs', () => {
+  it('strictly allows only public http: and https: URLs and blocks private/loopback SSRF targets', () => {
     assert.equal(validateLiveBrowserUrl('https://arxiv.org/abs/2501.00001'), 'https://arxiv.org/abs/2501.00001')
-    assert.equal(validateLiveBrowserUrl('http://127.0.0.1:8765/demo.html'), 'http://127.0.0.1:8765/demo.html')
+    assert.equal(validateLiveBrowserUrl('http://example.com:8080/demo.html'), 'http://example.com:8080/demo.html')
+    // OCV5-857 / OCV5-343: cloud live browser blocks loopback/private/link-local SSRF targets;
+    // local container dev servers must use the dedicated containerPreview pipeline instead.
+    for (const ssrf of [
+      'http://127.0.0.1:8765/demo.html',
+      'http://localhost:3000/',
+      'http://[::1]:8080/',
+      'http://0.0.0.0:80/',
+      'http://169.254.169.254/latest/meta-data/',
+      'http://10.0.0.1/',
+      'http://172.16.0.5/',
+      'http://192.168.1.10/',
+      'http://[fc00::1]/',
+      'http://[fe80::1]/',
+      'http://[::ffff:127.0.0.1]/',
+      'http://user:pass@example.com/',
+    ]) {
+      assert.throws(
+        () => validateLiveBrowserUrl(ssrf),
+        (err: unknown) => err instanceof LiveBrowserError && err.code === 'UNSAFE_URL',
+      )
+    }
     for (const bad of [
       'file:///etc/passwd',
       'javascript:alert(1)',
@@ -163,6 +184,7 @@ describe('liveBrowserController', () => {
     const ctrl = new LiveBrowserController({
       ocBrowserBin: '/usr/local/bin/oc-browser',
       existsSync: () => true,
+      dnsLookup: (async () => [{ address: '93.184.216.34', family: 4 }]) as any,
       execFn: async (_bin, args) => {
         const myCall = ++execCount
         if (myCall === 1) await firstGate
@@ -310,7 +332,13 @@ describe('liveBrowserController', () => {
     )
     assert.equal(r200.statusCode, 200)
     assert.equal(r200.headers.get('cache-control'), 'no-store')
-    assert.deepEqual(r200.body, { available: true, active: false, agentBusy: false })
+    assert.deepEqual(r200.body, {
+      available: true,
+      active: false,
+      agentBusy: false,
+      streamAvailable: true,
+      humanTakeover: false,
+    })
 
     // 409 AGENT_RUNNING when another session for the same agent is actively executing
     const rBusy = makeFakeRes()
@@ -472,6 +500,7 @@ describe('liveBrowserController', () => {
     const ctrl = new LiveBrowserController({
       ocBrowserBin: '/usr/local/bin/oc-browser',
       existsSync: () => true,
+      dnsLookup: (async () => [{ address: '93.184.216.34', family: 4 }]) as any,
       execFn: async (_bin, args) => {
         cmds.push(args)
         throw new Error('page.goto: net::ERR_CONNECTION_CLOSED at https://flaky.invalid/')

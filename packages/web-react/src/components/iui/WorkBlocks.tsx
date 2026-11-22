@@ -1,8 +1,13 @@
 import { AlertTriangle, BookOpen, Check, ChevronDown, Copy, Download, Eye, EyeOff, Globe, Loader2, Lock, Maximize2, PanelRight, Play, RotateCcw } from "lucide-react";
-import { useState } from "react";
+import { useId, useState, useSyncExternalStore } from "react";
 import { nativeDownload } from "../../lib/chat/download";
 import { cn } from "../../lib/utils";
 import { dispatchOpenInWorkbench } from "../../lib/workbenchOpen";
+import {
+  getLiveBrowserHandbackFor,
+  getLiveBrowserHandbackVersion,
+  subscribeLiveBrowserHandback,
+} from "../chat/inspectorState";
 import { useMediaSigner } from "../chat/media";
 import { chatInteractionUnavailableText, useArtifactInspect, useChatInteraction } from "../tool/context";
 import { useToast } from "../ui";
@@ -393,11 +398,22 @@ function parseHandoffUrl(url: string): { isHttps: boolean; host: string; path: s
 
 export function BrowserHandoffBlock({ spec, notes, streaming, readOnly, nested }: BlockProps<BrowserHandoffSpec>) {
   const { openLiveBrowser } = useArtifactInspect();
-  const { sendUserText, busy, reason } = useChatInteraction();
+  const { sendUserText, busy, reason, sessionId } = useChatInteraction();
   const [opened, setOpened] = useState(false);
   const [sent, setSent] = useState(false);
+  const instanceId = useId();
+  const handoffId = spec.decisionId || `bh:${instanceId}`;
+  useSyncExternalStore(
+    subscribeLiveBrowserHandback,
+    getLiveBrowserHandbackVersion,
+    getLiveBrowserHandbackVersion,
+  );
+  const matchedHandback = getLiveBrowserHandbackFor(sessionId ?? null, handoffId);
 
   const parsedUrl = spec.url ? parseHandoffUrl(spec.url) : null;
+  const handedBack = Boolean(matchedHandback);
+  const effectiveSent = sent || Boolean(matchedHandback?.autoSent);
+
   // Secondary button auto-sends immediately: strictly send transparent user-visible copy,
   // never an unshown model-authored prompt. Custom `continue_prompt` is only prefilled into
   // Composer on browser handback so the user can review/edit before sending.
@@ -406,7 +422,7 @@ export function BrowserHandoffBlock({ spec, notes, streaming, readOnly, nested }
     : "我已完成云端浏览器操作，请继续。";
   const handbackDraft = spec.continue_prompt ?? visibleContinueMessage;
   const canTakeover = !readOnly && !streaming && Boolean(openLiveBrowser);
-  const canContinue = !readOnly && !streaming && Boolean(sendUserText) && !busy && !sent;
+  const canContinue = !readOnly && !streaming && Boolean(sendUserText) && !busy && !effectiveSent;
 
   return (
     <Frame
@@ -418,7 +434,16 @@ export function BrowserHandoffBlock({ spec, notes, streaming, readOnly, nested }
       nested={nested}
       copyText={() => v2ToMarkdown(spec)}
     >
-      <div className="oc-iui-bh" data-testid="iui-browser-handoff">
+      <div className="oc-iui-bh" data-testid="iui-browser-handoff" data-completed={handedBack ? "true" : "false"}>
+        {handedBack && (
+          <div
+            className="inline-flex w-fit items-center gap-1.5 rounded-full bg-success-soft px-2.5 py-0.5 text-caption font-medium text-success"
+            data-testid="iui-browser-handoff-completed"
+          >
+            <Check size={12} aria-hidden />
+            已完成接管
+          </div>
+        )}
         {parsedUrl && (
           <div className="oc-iui-bh-url" title={spec.url}>
             <span className="oc-iui-bh-url-icon" aria-hidden>
@@ -447,11 +472,12 @@ export function BrowserHandoffBlock({ spec, notes, streaming, readOnly, nested }
                 expand: true,
                 url: spec.url,
                 continuePrompt: handbackDraft,
+                handoffId,
               });
             }}
           >
             <Maximize2 size={14} aria-hidden />
-            {spec.action_label ?? "放大并接管浏览器"}
+            {handedBack ? "再次接管浏览器" : (spec.action_label ?? "放大并接管浏览器")}
           </button>
           <button
             type="button"
@@ -465,14 +491,20 @@ export function BrowserHandoffBlock({ spec, notes, streaming, readOnly, nested }
             }}
           >
             <Check size={14} aria-hidden />
-            {sent ? "已通知助手继续" : (spec.continue_label ?? "我已完成，继续任务")}
+            {effectiveSent ? "已通知助手继续" : (spec.continue_label ?? "我已完成，继续任务")}
           </button>
         </div>
-        {opened && !sent && (
+        {handedBack ? (
           <p className="oc-iui-bh-note" role="status">
-            正在为你打开实时浏览器… 完成操作后可点击浏览器顶栏「交还助手」或上方按钮继续。
+            {effectiveSent
+              ? "已完成接管并已通知助手继续任务。"
+              : "已完成接管并交还浏览器控制权；如需继续任务请点击上方按钮。"}
           </p>
-        )}
+        ) : opened && !effectiveSent ? (
+          <p className="oc-iui-bh-note" role="status">
+            正在为你打开实时浏览器… 完成操作后可点击浏览器顶栏「交还并继续」或上方按钮继续。
+          </p>
+        ) : null}
         {!readOnly && !streaming && !openLiveBrowser && (
           <p className="oc-iui-bh-note">{chatInteractionUnavailableText(reason)}</p>
         )}

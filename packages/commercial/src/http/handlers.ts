@@ -118,6 +118,7 @@ import {
 } from "../inbox/assets.js";
 import type { ContainerPreviewTicketStore } from '../ws/containerPreviewTickets.js'
 import type { DirectContainerPreviewService } from '../ws/directContainerPreview.js'
+import type { LiveBrowserTicketStore } from '../ws/liveBrowserTickets.js'
 import type { ChatGptProxyHttpDeps } from './chatgptProxy.js'
 import type { PluginRuntimeFacade } from '../plugins/runtime.js'
 import type { KnowledgePlanetSetupManager } from '../plugins/knowledgePlanetSetup.js'
@@ -179,6 +180,10 @@ export interface CommercialHttpDeps {
   containerPreviewTickets?: ContainerPreviewTicketStore;
   /** Prevent issuing a ticket until the public WS bridge is fully assembled. */
   containerPreviewAvailable?: () => boolean;
+  /** Short-lived one-time browser tickets for V5 live cloud browser WS stream (OCV5-857). */
+  liveBrowserTickets?: LiveBrowserTicketStore;
+  /** Prevent issuing a live browser stream ticket until the WS bridge is assembled. */
+  liveBrowserStreamAvailable?: () => boolean;
   /** Optional native iframe transport; legacy screencast remains the fallback. */
   directContainerPreview?: DirectContainerPreviewService
   /** ChatGPT direct-connect proxy management; undefined when the listener is off. */

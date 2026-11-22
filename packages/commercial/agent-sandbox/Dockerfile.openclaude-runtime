@@ -609,6 +609,42 @@ RUN apt-get update \
     && test -x /usr/bin/ssh-keyscan \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
+# ------------------------------------------------------------
+# Real desktop browser environment (OCV5-857 Phase 2)
+# ------------------------------------------------------------
+# Official Google Chrome Stable + lightweight Openbox WM + Xvfb + UTF-8 locales
+# (en_US.UTF-8, zh_CN.UTF-8; container default remains LANG=C.UTF-8 / LC_ALL=C.UTF-8).
+# Placed after the heavy Playwright/Chromium + CLI layers so cached layers above stay
+# valid, and before the trailing oc-browser smoke check so image builds verify headed Chrome.
+RUN set -eux; \
+    test "$(dpkg --print-architecture)" = amd64; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        gnupg \
+        openbox \
+        xvfb \
+        locales; \
+    sed -i -e 's/^# *en_US\.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' \
+           -e 's/^# *zh_CN\.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen; \
+    grep -q '^en_US\.UTF-8 UTF-8' /etc/locale.gen || echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen; \
+    grep -q '^zh_CN\.UTF-8 UTF-8' /etc/locale.gen || echo 'zh_CN.UTF-8 UTF-8' >> /etc/locale.gen; \
+    locale-gen; \
+    mkdir -p /usr/share/keyrings; \
+    curl -fsSL --retry 3 https://dl.google.com/linux/linux_signing_key.pub \
+      | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg; \
+    chmod 0644 /usr/share/keyrings/google-chrome.gpg; \
+    printf '%s\n' 'deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main' \
+      > /etc/apt/sources.list.d/google-chrome.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends google-chrome-stable; \
+    chmod u-s /opt/google/chrome/chrome-sandbox 2>/dev/null || true; \
+    google-chrome-stable --version; \
+    command -v openbox; \
+    command -v Xvfb; \
+    locale -a | grep -qiE '^en_US\.utf-?8$'; \
+    locale -a | grep -qiE '^zh_CN\.utf-?8$'; \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
 
 # ── oc-* 工具: trailing base-stage layers (after CLI/Playwright/Chromium) ──
 # 镜像内 /usr/local/bin 副本仅当 bundle 未挂载时兜底;source 已迁 platform-runtime/bin/(改动真热)。
@@ -788,6 +824,8 @@ RUN set -eux; \
     OPENCLAUDE_AGENT_ID=image-build-smoke OPENCLAUDE_HOME="$SMOKE_HOME" \
       OPENCLAUDE_PLAYWRIGHT_CLI_IDLE_SECONDS=60 OPENCLAUDE_PLAYWRIGHT_CLI_POLL_SECONDS=1 \
       oc-browser open about:blank >/dev/null; \
+    test -s "$SMOKE_HOME"/browser-profiles/image-build-smoke-*/DevToolsActivePort; \
+    test -s /tmp/openclaude-playwright-cli/image-build-smoke-*/xvfb.display; \
     OPENCLAUDE_AGENT_ID=image-build-smoke OPENCLAUDE_HOME="$SMOKE_HOME" \
       OPENCLAUDE_PLAYWRIGHT_CLI_IDLE_SECONDS=60 OPENCLAUDE_PLAYWRIGHT_CLI_POLL_SECONDS=1 \
       oc-browser snapshot >/dev/null; \

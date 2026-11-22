@@ -19,9 +19,11 @@ import {
   bootstrapMailerBridgeAndAuthority,
   bootstrapPluginsRuntime,
   buildContainerHelpersAndPreview,
+  claimUnavailableLiveBrowserUpgrade,
   createGrokRelayRouteAllocator,
   createOptionalContainerPreviewBridge,
   createOptionalDirectContainerPreview,
+  createPreviewAndLiveBrowserTickets,
   wireRemoteMuxDeps,
 } from "./bootstrap/runtimeSupervisorBootstrap.js";
 import {
@@ -250,7 +252,6 @@ import { makeModelSwitchCostService } from './billing/modelSwitchCostTarget.js';
 import { isCursorDurableBilling, settleDurableCursorBilling } from "./billing/durableCursorBilling.js";
 import { parseZeroChargeCutoff, startCursorAuditReconciler } from "./billing/cursorAuditReconciler.js";
 import { type ContainerPreviewBridgeHandler } from "./ws/containerPreviewBridge.js";
-import { ContainerPreviewTicketStore } from "./ws/containerPreviewTickets.js";
 import { type DirectContainerPreviewService } from "./ws/directContainerPreview.js";
 import {
   DEFAULT_V3_CCB_BASELINE_DIR,
@@ -1389,13 +1390,7 @@ export async function registerCommercial(
   wireRemoteMuxDeps();
 
   const containerPreviewBaseUrl = process.env.COMMERCIAL_BASE_URL?.trim();
-  const containerPreviewTickets =
-    runtimeChannel === "v5"
-    && modelAuthoritySigner
-    && v3Deps
-    && containerPreviewBaseUrl
-      ? new ContainerPreviewTicketStore()
-      : undefined;
+  const { containerPreviewTickets, liveBrowserTickets } = createPreviewAndLiveBrowserTickets({ runtimeChannel, modelAuthoritySigner, v3Deps, baseUrl: containerPreviewBaseUrl });
 
   const {
     sharedEnsureRunning,
@@ -1504,6 +1499,8 @@ export async function registerCommercial(
     pendingDecisionsService: pendingDecisionsRuntime.service,
     containerPreviewTickets,
     containerPreviewAvailable: () => containerPreviewBridge !== undefined,
+    liveBrowserTickets,
+    liveBrowserStreamAvailable: () => containerPreviewBridge !== undefined,
     directContainerPreview,
     chatgptProxy: chatgptProxyHttp,
     pluginRuntime: pluginFacade,
@@ -1724,6 +1721,7 @@ export async function registerCommercial(
     createOptionalContainerPreviewBridge({
       env: process.env,
       containerPreviewTickets,
+      liveBrowserTickets,
       modelAuthoritySigner,
       containerPreviewBaseUrl,
       dockerEnsureRunning,
@@ -2752,9 +2750,9 @@ export async function registerCommercial(
     runtimeStatus,
     handleWsUpgrade: (req, socket, head) => {
       if (directContainerPreview?.handleUpgrade(req, socket, head)) return true;
-      // Preview uses its own short-lived one-time ticket and must never fall
-      // through to the ordinary cookie/JWT bridges.
+      // Preview & live-browser use short-lived tickets and must never fall through.
       if (containerPreviewBridge?.handleUpgrade(req, socket, head)) return true;
+      if (claimUnavailableLiveBrowserUpgrade(req, socket)) return true;
       // V3: 优先匹配 voice input,再 /ws/user-chat-bridge(2E)。legacy /ws/agent 已删除。
       if (voiceTranscribeHandler.handleUpgrade(req, socket, head)) return true;
       if (userChatBridge.handleUpgrade(req, socket, head)) return true;

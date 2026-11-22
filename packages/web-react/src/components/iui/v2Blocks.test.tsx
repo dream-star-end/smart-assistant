@@ -319,6 +319,7 @@ describe("v2 interactive components", () => {
       expand: true,
       url: "https://github.com/login",
       continuePrompt: "我已完成 GitHub 登录，请继续拉取仓库信息。",
+      handoffId: expect.any(String),
     });
     expect(screen.getByRole("status")).toHaveTextContent("正在为你打开实时浏览器");
 
@@ -331,5 +332,53 @@ describe("v2 interactive components", () => {
     render(<IuiBlock readOnly code={j({ type: "browser_handoff", url: "https://github.com/login" })} />);
     expect(screen.getByTestId("iui-browser-handoff-open")).toBeDisabled();
     expect(screen.getByTestId("iui-browser-handoff-continue")).toBeDisabled();
+  });
+
+  it("BrowserHandoffBlock updates ONLY the matching sessionId + handoffId card without affecting sibling same-origin cards", async () => {
+    const { notifyLiveBrowserHandback } = await import("../chat/inspectorState");
+    const openLiveBrowser = vi.fn();
+    const sendUserText = vi.fn();
+    render(
+      <ArtifactInspectContext.Provider value={{ openLiveBrowser }}>
+        <ChatInteractionContext.Provider value={{ sendUserText, sessionId: "sess-1" }}>
+          <IuiBlock
+            code={j({
+              type: "browser_handoff",
+              decisionId: "handoff-card-1",
+              title: "第一次登录",
+              url: "https://github.com/login",
+            })}
+          />
+          <IuiBlock
+            code={j({
+              type: "browser_handoff",
+              decisionId: "handoff-card-2",
+              title: "第二次验证",
+              url: "https://github.com/login",
+            })}
+          />
+        </ChatInteractionContext.Provider>
+      </ArtifactInspectContext.Provider>,
+    );
+    const cards = screen.getAllByTestId("iui-browser-handoff");
+    expect(cards).toHaveLength(2);
+    expect(screen.queryByTestId("iui-browser-handoff-completed")).toBeNull();
+
+    // Firing handback for another session with the same handoffId MUST NOT complete sess-1 cards
+    const { act } = await import("@testing-library/react");
+    act(() => {
+      notifyLiveBrowserHandback({ sessionId: "sess-other", handoffId: "handoff-card-1", agentId: "main", autoSent: true });
+    });
+    expect(screen.queryByTestId("iui-browser-handoff-completed")).toBeNull();
+
+    // Firing handback for sess-1 + handoff-card-1 completes ONLY card 1, leaving card 2 untouched!
+    act(() => {
+      notifyLiveBrowserHandback({ sessionId: "sess-1", handoffId: "handoff-card-1", agentId: "main", autoSent: true });
+    });
+    expect(cards[0]).toHaveAttribute("data-completed", "true");
+    expect(cards[1]).toHaveAttribute("data-completed", "false");
+    expect(screen.getAllByTestId("iui-browser-handoff-completed")).toHaveLength(1);
+    expect(screen.getAllByTestId("iui-browser-handoff-continue")[0]).toBeDisabled();
+    expect(screen.getAllByTestId("iui-browser-handoff-continue")[1]).not.toBeDisabled();
   });
 });

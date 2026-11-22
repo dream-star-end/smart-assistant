@@ -582,7 +582,9 @@ export function InspectorPanelContent({
   };
   const [tab, setTabState] = useState<PrimaryPaneTab>(() => {
     const resolved = request ? resolveRequest(request) : null;
-    return resolved?.kind === "tab" ? resolved.tab : readStoredTab();
+    if (resolved?.kind === "tab") return resolved.tab;
+    if (messages.length === 0 && liveBrowserAgentId && liveBrowserAuth) return "browser";
+    return readStoredTab();
   });
   const [selected, setSelected] = useState<ToolLike | null>(() => {
     const resolved = request ? resolveRequest(request) : null;
@@ -875,7 +877,7 @@ export function InspectorPanelContent({
             className="[&_[role=tab]]:px-2.5 [&_[role=tab]]:py-1 [&_[role=tab]]:text-meta [&_[role=tab]]:transition-all [&_[role=tab]]:duration-150 [@media(hover:none)]:[&_[role=tab]]:min-h-9"
           />
         </div>
-        {onToggleFullscreen && (
+        {onToggleFullscreen && (fullscreen || !(view === "browser" && liveBrowserAvailable && !shown)) && (
           <IconButton
             aria-label={fullscreen ? "退出全屏阅读" : "全屏阅读"}
             title={fullscreen ? "恢复默认高度 (Esc)" : "全屏沉浸阅读"}
@@ -1032,8 +1034,14 @@ export function InspectorPanel({
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose, fullscreen]);
 
+  const liveBrowserFocusOwnedRef = useRef(false);
+  liveBrowserFocusOwnedRef.current = Boolean(
+    content.request?.tab === "browser" &&
+      (content.request.liveBrowser?.takeover || content.request.liveBrowser?.expand),
+  );
+
   // 每次从外面点开(换了一步 / 点了顶栏开关)都记下当时的焦点元素并把焦点移进面板;
-  // 面板整体卸载时把焦点还给最后那个入口。
+  // 面板整体卸载时把焦点还给最后那个入口。若焦点已进入面板或实时浏览器接管画布则不抢占。
   useEffect(() => {
     if (focusNonce === undefined) return;
     const active = document.activeElement;
@@ -1045,6 +1053,15 @@ export function InspectorPanel({
       returnFocusRef.current = active;
     }
     const raf = requestAnimationFrame(() => {
+      if (liveBrowserFocusOwnedRef.current) return;
+      const curr = document.activeElement;
+      if (
+        curr instanceof HTMLElement &&
+        (asideRef.current?.contains(curr) ||
+          curr.closest('[data-testid="live-browser-theater-dialog"]'))
+      ) {
+        return;
+      }
       asideRef.current?.querySelector<HTMLElement>("[data-inspector-close]")?.focus();
     });
     return () => cancelAnimationFrame(raf);

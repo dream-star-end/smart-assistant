@@ -1,37 +1,28 @@
 /**
- * Live cloud browser viewport & one-click human takeover stage (OCV5-813).
+ * Live cloud browser viewport & human takeover orchestrator (OCV5-813 / OCV5-857).
  *
- * Lazily loaded inside BrowserView so zero bytes enter the initial bundle.
- * Shares the container's persistent per-agent `oc-browser` Chromium daemon:
- * - Watch mode: smart low-overhead frame sync (pauses on hidden tab).
- * - Takeover mode: click / right-click / scroll / keyboard / text input / tab management.
- * - Hand back: preserves cookies/localStorage/page state and optionally prefills a continuation
- *   prompt into the chat Composer.
+ * Strictly lazily loaded inside BrowserView so zero bytes enter the initial bundle.
+ * Orchestrates:
+ * - Real-time WebSocket binary frame stream (`LiveBrowserStreamClient`) with automatic
+ *   graceful fallback to adaptive HTTP polling (`liveBrowserApi`).
+ * - Clarvy Atelier browser chrome (`LiveBrowserToolbar`) & interactive canvas (`LiveBrowserCanvas`).
+ * - Exclusive human/assistant takeover arbitration, cross-origin handoff guard,
+ *   one-click "交还并继续" + session-level `BrowserHandoffBlock` sync.
  */
+import type {
+  LiveBrowserDecodedFrame,
+  LiveBrowserMouseButton,
+  LiveBrowserStatePayload,
+} from "@openclaude/protocol/browser";
 import * as RD from "@radix-ui/react-dialog";
 import {
-  ArrowLeft,
-  ArrowRight,
-  Check,
-  CornerDownLeft,
-  Globe,
-  Hand,
-  Lock,
   Maximize2,
   Minimize2,
-  Plus,
-  Power,
-  RotateCw,
-  Send,
   ShieldAlert,
   X,
 } from "lucide-react";
 import {
   type FormEvent,
-  type KeyboardEvent as ReactKeyboardEvent,
-  type MouseEvent as ReactMouseEvent,
-  type PointerEvent as ReactPointerEvent,
-  type WheelEvent as ReactWheelEvent,
   useCallback,
   useEffect,
   useRef,
@@ -40,65 +31,57 @@ import {
 import {
   type LiveBrowserActionPayload,
   type LiveBrowserState,
+  type LiveBrowserTabInfo,
   fetchLiveBrowserState,
   normalizeBrowserUrlInput,
   sendLiveBrowserAction,
 } from "../../lib/liveBrowserApi";
+import {
+  type LiveBrowserConnectionStatus,
+  LiveBrowserStreamClient,
+  type LiveBrowserStreamStats,
+} from "../../lib/liveBrowserStreamClient";
 import type { AuthSession } from "../../lib/types";
+import { useChatInteraction } from "../tool/context";
 import { Spinner, useToast } from "../ui";
-import { type LiveBrowserHandoffRequest, useInspectorStopTurn } from "./inspectorState";
+import {
+  LiveBrowserCanvas,
+  type LiveBrowserCanvasHandle,
+  type LiveBrowserZoomMode,
+} from "./LiveBrowserCanvas";
+import {
+  LiveBrowserErrorBanner,
+  LiveBrowserIdleView,
+  LiveBrowserLoadingView,
+  LiveBrowserTakeoverDock,
+  LiveBrowserToolbar,
+  LiveBrowserUnavailableView,
+} from "./LiveBrowserToolbar";
+import {
+  type LiveBrowserHandoffRequest,
+  notifyLiveBrowserHandback,
+  useInspectorStopTurn,
+} from "./inspectorState";
 import "./liveBrowser.css";
 
-const QUICK_PRESETS = [
-  { label: "Google Scholar", url: "https://scholar.google.com" },
-  { label: "arXiv", url: "https://arxiv.org" },
-  { label: "GitHub", url: "https://github.com" },
-] as const;
-
-const QUICK_KEYS = [
-  { label: "Enter", key: "Enter" },
-  { label: "Tab", key: "Tab" },
-  { label: "退格", key: "Backspace" },
-  { label: "上翻", key: "PageUp" },
-  { label: "下翻", key: "PageDown" },
-  { label: "Esc", key: "Escape" },
-] as const;
-
-const SPECIAL_KEY_MAP: Record<string, string> = {
-  Enter: "Enter",
-  Backspace: "Backspace",
-  Delete: "Delete",
-  ArrowUp: "ArrowUp",
-  ArrowDown: "ArrowDown",
-  ArrowLeft: "ArrowLeft",
-  ArrowRight: "ArrowRight",
-  PageUp: "PageUp",
-  PageDown: "PageDown",
-  Home: "Home",
-  End: "End",
-  " ": "Space",
-};
-
-const CTRL_COMBO_KEYS = new Set(["a", "c", "v", "x", "z"]);
-
-const TOUCH_DRAG_SLOP = 8;
-const TOUCH_SCROLL_GAIN = 2;
 const MAX_POLL_BACKOFF_MS = 30_000;
+const UNAVAILABLE_BASE_BACKOFF_MS = 3_000;
+const HTTP_TAKEOVER_RENEW_MS = 30_000;
+const SAFE_HANDBACK_CONTINUE_MESSAGE = "我已完成浏览器接管操作，请继续处理。";
 
-interface ClickRipple {
-  id: number;
-  xPct: number;
-  yPct: number;
-}
-
-interface TouchScrollGesture {
-  pointerId: number;
-  startX: number;
-  startY: number;
-  lastX: number;
-  lastY: number;
-  dragging: boolean;
-  lastSentAt: number;
+/** Convert native key + CDP modifier bitmask to Playwright `press` expression for HTTP fallback. */
+export function formatPlaywrightKey(key: string, modifiers = 0): string {
+  const baseKey = key === " " ? "Space" : key;
+  const mods: string[] = [];
+  if (modifiers & 2 || modifiers & 4) mods.push("Control");
+  if (modifiers & 1) mods.push("Alt");
+  if (
+    (modifiers & 8) &&
+    (baseKey === "Tab" || baseKey.startsWith("Arrow") || baseKey === "Home" || baseKey === "End")
+  ) {
+    mods.push("Shift");
+  }
+  return mods.length > 0 ? `${mods.join("+")}+${baseKey}` : baseKey;
 }
 
 export interface LiveBrowserStageProps {
@@ -106,6 +89,8 @@ export interface LiveBrowserStageProps {
   auth: AuthSession;
   /** Whether the assistant is currently executing a browser tool step (speeds up idle→active detection). */
   running?: boolean;
+  /** Whether this view is currently hidden behind another sub-mode (e.g. 步骤记录 keep-alive). */
+  hidden?: boolean;
   /** Optional one-click handoff request emitted by a chat `browser_handoff` card. */
   handoffRequest?: (LiveBrowserHandoffRequest & { nonce: number }) | null;
   /** Notifies parent once a handoff request has been settled so remounting never replays it. */
@@ -119,7 +104,9 @@ export interface LiveBrowserStageProps {
 }
 
 interface HandoffOriginMismatch {
+  expectedOrigin: string;
   expectedHost: string;
+  actualOrigin: string;
   actualHost: string;
   continuePrompt: string | null;
 }
@@ -144,19 +131,54 @@ function errorMessageOf(err: unknown): string {
   return "云端浏览器连接失败，请稍后重试";
 }
 
-function formatSyncTime(ts?: number): string {
-  if (!ts) return "";
-  try {
-    return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-  } catch {
-    return "";
+function isTakeoverConflictError(err: unknown): boolean {
+  const status = (err as { status?: number })?.status;
+  const code = (err as { code?: string })?.code ?? "";
+  const msg = errorMessageOf(err);
+  return (
+    code === "TAKEOVER_ALREADY_HELD" ||
+    code === "TAKEOVER_TOKEN_MISMATCH" ||
+    /TAKEOVER_ALREADY_HELD|TAKEOVER_TOKEN_MISMATCH|独占接管|租约/.test(msg) ||
+    (status === 409 && !/助手正在操作浏览器|AGENT_RUNNING/.test(msg))
+  );
+}
+
+function mergeStreamState(prev: LiveBrowserState | null, next: LiveBrowserStatePayload): LiveBrowserState {
+  // If old container lacks CDP while an active HTTP screenshot is already displayed, preserve it.
+  if (next.cdpAvailable === false && prev?.active) {
+    return {
+      ...prev,
+      cdpAvailable: false,
+      agentBusy: next.agentBusy ?? prev.agentBusy,
+    };
   }
+  return {
+    available: true,
+    active: next.active,
+    agentBusy: next.agentBusy,
+    humanTakeover: next.humanTakeover,
+    takeoverToken: next.takeoverToken ?? prev?.takeoverToken,
+    loading: next.loading,
+    url: next.url,
+    origin: next.origin ?? parseOriginAndHost(next.url)?.origin,
+    targetId: next.targetId ?? prev?.targetId,
+    navGen: next.navGen ?? prev?.navGen,
+    cdpAvailable: next.cdpAvailable,
+    title: next.title,
+    viewport: next.viewport ?? prev?.viewport,
+    tabs: next.tabs ? [...next.tabs] : prev?.tabs,
+    dialog: next.dialog ?? null,
+    capturedAt: next.capturedAt ?? Date.now(),
+    imageBase64: next.active ? prev?.imageBase64 : undefined,
+    mimeType: prev?.mimeType,
+  };
 }
 
 export function LiveBrowserStage({
   agentId,
   auth,
   running = false,
+  hidden = false,
   handoffRequest = null,
   onHandoffSettled,
   onHandBackToComposer,
@@ -166,51 +188,62 @@ export function LiveBrowserStage({
   const toast = useToast();
   const ctxStopTurn = useInspectorStopTurn();
   const effectiveStopTurn = onStopTurn ?? ctxStopTurn;
+  const { sendUserText, busy: chatBusy, sessionId: chatSessionId } = useChatInteraction();
 
   const [state, setState] = useState<LiveBrowserState | null>(null);
   const [initialLoading, setInitialLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [takeover, setTakeover] = useState(false);
+  const [takeoverLeaseMode, setTakeoverLeaseMode] = useState<"none" | "exclusive" | "compat">("none");
   const [expanded, setExpanded] = useState(false);
+  const [zoomMode, setZoomMode] = useState<LiveBrowserZoomMode>("fit");
   const [error, setError] = useState<string | null>(null);
   const [originMismatch, setOriginMismatch] = useState<HandoffOriginMismatch | null>(null);
+  const [originMismatchDismissed, setOriginMismatchDismissed] = useState(false);
   const [handoffWaiting, setHandoffWaiting] = useState(false);
   const [pollEpoch, setPollEpoch] = useState(0);
+
+  const [streamStatus, setStreamStatus] = useState<LiveBrowserConnectionStatus>("idle");
+  const [streamFrame, setStreamFrame] = useState<LiveBrowserDecodedFrame | null>(null);
+  const [streamStats, setStreamStats] = useState<LiveBrowserStreamStats>({
+    fps: 0,
+    rttMs: null,
+    lastFrameAt: null,
+    mode: "polling",
+  });
+  const [remoteCursor, setRemoteCursor] = useState<string>("default");
+  const [captureFocused, setCaptureFocused] = useState(false);
 
   const [launchUrl, setLaunchUrl] = useState("https://scholar.google.com");
   const [addressDraft, setAddressDraft] = useState("");
   const [addressEditing, setAddressEditing] = useState(false);
   const [typeDraft, setTypeDraft] = useState("");
-  const [ripple, setRipple] = useState<ClickRipple | null>(null);
 
   const stageRef = useRef<HTMLDivElement>(null);
-  const imgRef = useRef<HTMLImageElement>(null);
+  const canvasHandleRef = useRef<LiveBrowserCanvasHandle | null>(null);
   const expandBtnRef = useRef<HTMLButtonElement>(null);
+  const streamClientRef = useRef<LiveBrowserStreamClient | null>(null);
   const mountedRef = useRef(true);
   const authRef = useRef(auth);
   authRef.current = auth;
 
-  // Monotonic sequence fencing: stale GET polls can never overwrite newer POST action frames.
+  // Monotonic sequence fencing: stale GET polls can never overwrite newer POST/WS states.
   const reqSeqRef = useRef(0);
   const appliedSeqRef = useRef(0);
+  const lastPollEpochRef = useRef(0);
   const pollAbortRef = useRef<AbortController | null>(null);
   const pollInFlightRef = useRef(false);
   const pollErrorStreakRef = useRef(0);
+  const unavailableStreakRef = useRef(0);
   const actionInFlightRef = useRef(false);
   const userClosingRef = useRef(false);
   const pendingTakeoverAfterStopRef = useRef(false);
   const prevActiveRef = useRef(false);
   const prevTakeoverRef = useRef(false);
-  const touchGestureRef = useRef<TouchScrollGesture | null>(null);
-  const suppressNextClickRef = useRef(false);
   const keyBufferRef = useRef<{ text: string; timer: number | null }>({ text: "", timer: null });
   const inputQueueRef = useRef<LiveBrowserActionPayload[]>([]);
-  const wheelBufferRef = useRef<{ dx: number; dy: number; x?: number; y?: number; timer: number | null }>({
-    dx: 0,
-    dy: 0,
-    timer: null,
-  });
 
+  const wsConnected = streamStatus === "connected" && state?.cdpAvailable !== false;
   const lockedByAssistant = running || state?.agentBusy === true;
   const effectiveTakeover = takeover && !lockedByAssistant;
   const takeoverActiveRef = useRef(false);
@@ -219,6 +252,24 @@ export function LiveBrowserStage({
   runningRef.current = running;
   const stateUrlRef = useRef<string | undefined>(state?.url);
   stateUrlRef.current = state?.url;
+  const renderedOriginRef = useRef<string | undefined>(
+    state?.origin ?? parseOriginAndHost(state?.url)?.origin,
+  );
+  renderedOriginRef.current = state?.origin ?? parseOriginAndHost(state?.url)?.origin;
+  const renderedTargetIdRef = useRef<string | undefined>(state?.targetId);
+  renderedTargetIdRef.current = state?.targetId;
+
+  const httpTakeoverTokenRef = useRef<string | null>(null);
+  const httpLeaseRenewTimerRef = useRef<number | null>(null);
+  const httpLeaseHeldRef = useRef(false);
+  const httpLeaseGenRef = useRef(0);
+  const wsTakeoverRequestedRef = useRef(false);
+
+  const navGenMetaRef = useRef<Map<number, { origin?: string; targetId?: string }>>(new Map());
+  const paintedNavGenRef = useRef<number | null>(null);
+  const paintedOriginRef = useRef<string | undefined>(undefined);
+  const paintedTargetIdRef = useRef<string | undefined>(undefined);
+
   const lastHandoffNonceRef = useRef<number | null>(null);
   const pendingHandoffRef = useRef<(LiveBrowserHandoffRequest & { nonce: number }) | null>(null);
   const pendingPostOpenHandoffRef = useRef<{
@@ -227,8 +278,10 @@ export function LiveBrowserStage({
     expand?: boolean;
     url?: string;
     continuePrompt?: string | null;
+    handoffId?: string | null;
   } | null>(null);
   const handoffContinuePromptRef = useRef<string | null>(null);
+  const activeHandoffIdRef = useRef<string | null>(null);
   const onHandoffSettledRef = useRef(onHandoffSettled);
   onHandoffSettledRef.current = onHandoffSettled;
 
@@ -238,46 +291,237 @@ export function LiveBrowserStage({
       window.clearTimeout(keyBufferRef.current.timer);
       keyBufferRef.current.timer = null;
     }
-    wheelBufferRef.current.dx = 0;
-    wheelBufferRef.current.dy = 0;
-    if (wheelBufferRef.current.timer !== null) {
-      window.clearTimeout(wheelBufferRef.current.timer);
-      wheelBufferRef.current.timer = null;
-    }
     inputQueueRef.current.length = 0;
+  }, []);
+
+  const handleFramePainted = useCallback((frame: LiveBrowserDecodedFrame) => {
+    const ng = frame.navGen & 0xffff;
+    paintedNavGenRef.current = ng;
+    const meta = navGenMetaRef.current.get(ng);
+    if (meta) {
+      paintedOriginRef.current = meta.origin;
+      paintedTargetIdRef.current = meta.targetId;
+    } else if (
+      ng === 0 ||
+      (typeof stateRef.current?.navGen === "number" && (stateRef.current.navGen & 0xffff) === ng)
+    ) {
+      paintedOriginRef.current = renderedOriginRef.current;
+      paintedTargetIdRef.current = renderedTargetIdRef.current;
+    }
+  }, []);
+
+  /**
+   * Build origin/target/navGen fence bound to the actually-painted frame.
+   * Returns `null` when a newer `state.navGen` arrived before its frame finished painting
+   * (pausing WS input so keystrokes/clicks cannot hit an unrendered destination page).
+   */
+  const getWsInputFence = useCallback(() => {
+    const latestNavGen = stateRef.current?.navGen;
+    if (typeof latestNavGen === "number" && latestNavGen > 0) {
+      const painted = paintedNavGenRef.current;
+      if (painted === null || (painted & 0xffff) !== (latestNavGen & 0xffff)) {
+        return null;
+      }
+    }
+    return {
+      expectedOrigin: paintedOriginRef.current ?? renderedOriginRef.current,
+      expectedTargetId: paintedTargetIdRef.current ?? renderedTargetIdRef.current,
+      ...(paintedNavGenRef.current !== null ? { expectedNavGen: paintedNavGenRef.current } : {}),
+      ...(stateRef.current?.takeoverToken ? { takeoverToken: stateRef.current.takeoverToken } : {}),
+    };
+  }, []);
+
+  const syncTakeoverToStream = useCallback((active: boolean) => {
+    wsTakeoverRequestedRef.current = active;
+    const tok = stateRef.current?.takeoverToken;
+    streamClientRef.current?.send({
+      type: "takeover",
+      active,
+      ...(tok ? { takeoverToken: tok } : {}),
+    });
+  }, []);
+
+  const stopHttpLeaseRenewal = useCallback(() => {
+    if (httpLeaseRenewTimerRef.current !== null) {
+      window.clearInterval(httpLeaseRenewTimerRef.current);
+      httpLeaseRenewTimerRef.current = null;
+    }
+  }, []);
+
+  const revokeTakeoverOnLeaseLost = useCallback(
+    (notice = "当前由另一标签页独占接管") => {
+      httpLeaseGenRef.current += 1;
+      stopHttpLeaseRenewal();
+      httpTakeoverTokenRef.current = null;
+      httpLeaseHeldRef.current = false;
+      wsTakeoverRequestedRef.current = false;
+      takeoverActiveRef.current = false;
+      prevTakeoverRef.current = false;
+      clearPendingInputBuffers();
+      setTakeover(false);
+      setTakeoverLeaseMode("none");
+      setError(notice);
+      toast(notice, "info");
+    },
+    [stopHttpLeaseRenewal, clearPendingInputBuffers, toast],
+  );
+
+  const releaseHttpTakeoverLease = useCallback(
+    (keepalive = false) => {
+      httpLeaseGenRef.current += 1;
+      stopHttpLeaseRenewal();
+      const token = httpTakeoverTokenRef.current;
+      const hadLease = httpLeaseHeldRef.current || Boolean(token);
+      httpTakeoverTokenRef.current = null;
+      httpLeaseHeldRef.current = false;
+      if (mountedRef.current) setTakeoverLeaseMode("none");
+      if (!hadLease) return;
+      const payload: LiveBrowserActionPayload = token
+        ? { action: "takeover", active: false, token }
+        : { action: "takeover", active: false };
+      void Promise.resolve(
+        sendLiveBrowserAction(
+          authRef.current,
+          agentId,
+          payload,
+          keepalive ? { keepalive: true } : undefined,
+        ),
+      ).catch(() => {
+        /* best-effort release on teardown */
+      });
+    },
+    [agentId, stopHttpLeaseRenewal],
+  );
+
+  const acquireHttpTakeoverLease = useCallback(() => {
+    const gen = ++httpLeaseGenRef.current;
+    stopHttpLeaseRenewal();
+    void Promise.resolve(
+      sendLiveBrowserAction(authRef.current, agentId, { action: "takeover", active: true }),
+    )
+      .then((res) => {
+        if (!mountedRef.current || gen !== httpLeaseGenRef.current || !takeoverActiveRef.current) {
+          // Released before acquire completed: proactively release returned token.
+          if (res?.humanTakeover && res.takeoverToken) {
+            void Promise.resolve(
+              sendLiveBrowserAction(authRef.current, agentId, {
+                action: "takeover",
+                active: false,
+                token: res.takeoverToken,
+              }),
+            ).catch(() => {});
+          }
+          return;
+        }
+        if (res?.humanTakeover === true) {
+          httpTakeoverTokenRef.current = res.takeoverToken ?? null;
+          httpLeaseHeldRef.current = true;
+          setTakeoverLeaseMode("exclusive");
+          httpLeaseRenewTimerRef.current = window.setInterval(() => {
+            if (!mountedRef.current || !takeoverActiveRef.current || gen !== httpLeaseGenRef.current) {
+              stopHttpLeaseRenewal();
+              return;
+            }
+            const tok = httpTakeoverTokenRef.current;
+            void Promise.resolve(
+              sendLiveBrowserAction(
+                authRef.current,
+                agentId,
+                tok ? { action: "takeover", active: true, token: tok } : { action: "takeover", active: true },
+              ),
+            )
+              .then((renewed) => {
+                if (!mountedRef.current || gen !== httpLeaseGenRef.current) return;
+                if (renewed?.takeoverToken) httpTakeoverTokenRef.current = renewed.takeoverToken;
+                if (renewed?.humanTakeover === false) {
+                  revokeTakeoverOnLeaseLost("当前由另一标签页独占接管");
+                }
+              })
+              .catch((renewErr) => {
+                if (!mountedRef.current || gen !== httpLeaseGenRef.current) return;
+                if (isTakeoverConflictError(renewErr)) {
+                  revokeTakeoverOnLeaseLost("当前由另一标签页独占接管");
+                } else if (/助手正在操作浏览器|AGENT_RUNNING/.test(errorMessageOf(renewErr))) {
+                  revokeTakeoverOnLeaseLost(errorMessageOf(renewErr));
+                }
+              });
+          }, HTTP_TAKEOVER_RENEW_MS);
+        } else {
+          // Legacy server without exclusive human-takeover lease support: display honestly.
+          httpTakeoverTokenRef.current = null;
+          httpLeaseHeldRef.current = false;
+          setTakeoverLeaseMode("compat");
+        }
+      })
+      .catch((err) => {
+        if (!mountedRef.current || gen !== httpLeaseGenRef.current) return;
+        const msg = errorMessageOf(err);
+        if (isTakeoverConflictError(err)) {
+          revokeTakeoverOnLeaseLost("当前由另一标签页独占接管");
+          return;
+        }
+        if ((err as { status?: number })?.status === 409 || /助手正在操作浏览器|AGENT_RUNNING/.test(msg)) {
+          revokeTakeoverOnLeaseLost(msg);
+          return;
+        }
+        // Legacy server rejecting unknown `takeover` action: honestly enter compat mode.
+        httpTakeoverTokenRef.current = null;
+        httpLeaseHeldRef.current = false;
+        setTakeoverLeaseMode("compat");
+      });
+  }, [agentId, stopHttpLeaseRenewal, revokeTakeoverOnLeaseLost]);
+
+  const focusCanvasSoon = useCallback(() => {
+    window.requestAnimationFrame(() => {
+      if (!mountedRef.current || !takeoverActiveRef.current) return;
+      canvasHandleRef.current?.focusCapture();
+    });
   }, []);
 
   const activateHandoffOnActivePage = useCallback(
     (
-      req: { takeover?: boolean; expand?: boolean; url?: string; continuePrompt?: string | null },
+      req: {
+        takeover?: boolean;
+        expand?: boolean;
+        url?: string;
+        continuePrompt?: string | null;
+        handoffId?: string | null;
+      },
       actualUrl: string | undefined,
       isBusyNow: boolean,
     ) => {
+      activeHandoffIdRef.current = req.handoffId ?? null;
       const expected = parseOriginAndHost(req.url);
       const actual = parseOriginAndHost(actualUrl);
       if (expected && actual && expected.origin !== actual.origin) {
-        // Always revoke any active takeover before asking the user to confirm the mismatched origin.
         takeoverActiveRef.current = false;
         clearPendingInputBuffers();
         setTakeover(false);
+        syncTakeoverToStream(false);
+        releaseHttpTakeoverLease(false);
         handoffContinuePromptRef.current = null;
         setOriginMismatch({
+          expectedOrigin: expected.origin,
           expectedHost: expected.host,
+          actualOrigin: actual.origin,
           actualHost: actual.host,
           continuePrompt: req.continuePrompt?.trim() || null,
         });
+        setOriginMismatchDismissed(false);
         if (req.expand) setExpanded(true);
         return;
       }
       setOriginMismatch(null);
+      setOriginMismatchDismissed(false);
       handoffContinuePromptRef.current = req.continuePrompt?.trim() || null;
       if (req.takeover && !isBusyNow) {
         setTakeover(true);
-        window.requestAnimationFrame(() => stageRef.current?.focus({ preventScroll: true }));
+        syncTakeoverToStream(true);
+        focusCanvasSoon();
       }
       if (req.expand) setExpanded(true);
     },
-    [clearPendingInputBuffers],
+    [clearPendingInputBuffers, syncTakeoverToStream, releaseHttpTakeoverLease, focusCanvasSoon],
   );
 
   useEffect(() => {
@@ -286,17 +530,45 @@ export function LiveBrowserStage({
       mountedRef.current = false;
       pollAbortRef.current?.abort();
       clearPendingInputBuffers();
+      releaseHttpTakeoverLease(true);
     };
-  }, [clearPendingInputBuffers]);
+  }, [clearPendingInputBuffers, releaseHttpTakeoverLease]);
 
-  // Honest exclusive control: whenever the assistant is actively running a turn (local or any
-  // server-side session for this agent), drop takeover back to watch-only mode, discard pending
-  // buffers, and explain why via toast instead of silently dropping user input.
+  // Synchronize HTTP fallback human-takeover lease & honest WS lease confirmation.
+  const serverConfirmedHumanTakeover = state?.humanTakeover === true;
+  useEffect(() => {
+    if (!effectiveTakeover) {
+      wsTakeoverRequestedRef.current = false;
+      releaseHttpTakeoverLease(false);
+      return;
+    }
+    if (wsConnected) {
+      if (httpLeaseHeldRef.current || httpTakeoverTokenRef.current) {
+        releaseHttpTakeoverLease(false);
+      }
+      // Only show "独占接管中" once server confirms this connection holds humanTakeover=true.
+      setTakeoverLeaseMode(
+        serverConfirmedHumanTakeover && wsTakeoverRequestedRef.current ? "exclusive" : "none",
+      );
+      return;
+    }
+    // HTTP fallback mode: acquire & 30s-renew a real server-side human-takeover lease.
+    acquireHttpTakeoverLease();
+  }, [
+    effectiveTakeover,
+    wsConnected,
+    serverConfirmedHumanTakeover,
+    acquireHttpTakeoverLease,
+    releaseHttpTakeoverLease,
+  ]);
+
+  // Honest exclusive control: whenever assistant runs, exit takeover and notify user.
   useEffect(() => {
     if (lockedByAssistant) {
       const wasInTakeover = prevTakeoverRef.current;
       prevTakeoverRef.current = false;
       setTakeover(false);
+      syncTakeoverToStream(false);
       clearPendingInputBuffers();
       if (wasInTakeover) {
         const reasonSuffix = state?.reason ? `（${state.reason}）` : "";
@@ -312,26 +584,50 @@ export function LiveBrowserStage({
     if (pendingTakeoverAfterStopRef.current && state?.active) {
       pendingTakeoverAfterStopRef.current = false;
       setTakeover(true);
-      window.requestAnimationFrame(() => stageRef.current?.focus({ preventScroll: true }));
+      syncTakeoverToStream(true);
+      focusCanvasSoon();
       toast("已暂停助手并进入人工接管", "success");
     }
-  }, [lockedByAssistant, clearPendingInputBuffers, running, state?.agentBusy, state?.active, state?.reason, toast]);
+  }, [
+    lockedByAssistant,
+    clearPendingInputBuffers,
+    syncTakeoverToStream,
+    focusCanvasSoon,
+    running,
+    state?.agentBusy,
+    state?.active,
+    state?.reason,
+    toast,
+  ]);
 
   useEffect(() => {
     prevTakeoverRef.current = effectiveTakeover;
   }, [effectiveTakeover]);
 
-  // Reset takeover, expanded theater view, and address draft if switching agent.
+  // Reset state cleanly when switching agents or chat sessions.
   useEffect(() => {
+    releaseHttpTakeoverLease(false);
     setTakeover(false);
+    setTakeoverLeaseMode("none");
     setExpanded(false);
+    setZoomMode("fit");
     setAddressEditing(false);
     setError(null);
     setOriginMismatch(null);
+    setOriginMismatchDismissed(false);
     setHandoffWaiting(false);
     setState(null);
+    setStreamFrame(null);
+    paintedNavGenRef.current = null;
+    paintedOriginRef.current = undefined;
+    paintedTargetIdRef.current = undefined;
+    navGenMetaRef.current.clear();
+    setStreamStatus("idle");
+    setStreamStats({ fps: 0, rttMs: null, lastFrameAt: null, mode: "polling" });
+    setRemoteCursor("default");
     setInitialLoading(true);
     pollErrorStreakRef.current = 0;
+    unavailableStreakRef.current = 0;
     pendingTakeoverAfterStopRef.current = false;
     prevActiveRef.current = false;
     prevTakeoverRef.current = false;
@@ -339,25 +635,58 @@ export function LiveBrowserStage({
     pendingHandoffRef.current = null;
     pendingPostOpenHandoffRef.current = null;
     handoffContinuePromptRef.current = null;
+    activeHandoffIdRef.current = null;
     reqSeqRef.current += 1;
     appliedSeqRef.current = reqSeqRef.current;
+    lastPollEpochRef.current = pollEpoch;
     pollAbortRef.current?.abort();
-  }, [agentId, clearPendingInputBuffers]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId, clearPendingInputBuffers, releaseHttpTakeoverLease]);
+
+  // Release takeover lease cleanly on session switch without tearing down agent viewport state.
+  const prevSessionIdRef = useRef<string | null | undefined>(chatSessionId);
+  useEffect(() => {
+    if (prevSessionIdRef.current !== chatSessionId) {
+      prevSessionIdRef.current = chatSessionId;
+      if (takeoverActiveRef.current) {
+        takeoverActiveRef.current = false;
+        setTakeover(false);
+        syncTakeoverToStream(false);
+        releaseHttpTakeoverLease(false);
+        clearPendingInputBuffers();
+      }
+      activeHandoffIdRef.current = null;
+    }
+  }, [chatSessionId, syncTakeoverToStream, releaseHttpTakeoverLease, clearPendingInputBuffers]);
 
   const applyState = useCallback(
     (seq: number, next: LiveBrowserState) => {
       if (!mountedRef.current || seq < appliedSeqRef.current) return;
       appliedSeqRef.current = seq;
       pollErrorStreakRef.current = 0;
+      if (next.available) {
+        unavailableStreakRef.current = 0;
+      }
       const wasActive = prevActiveRef.current;
       prevActiveRef.current = next.active;
       setState(next);
       setInitialLoading(false);
       setError(null);
       onActiveStateChange?.(next.active);
+
+      // Clear origin-mismatch lock automatically if the browser navigated back to expected origin.
+      const nextOrigin = parseOriginAndHost(next.url)?.origin;
+      if (nextOrigin) {
+        setOriginMismatch((prev) =>
+          prev && prev.expectedOrigin === nextOrigin ? null : prev,
+        );
+      }
+
       if (!next.active) {
         pendingPostOpenHandoffRef.current = null;
         setOriginMismatch(null);
+        setOriginMismatchDismissed(false);
+        setStreamFrame(null);
         const unexpectedClose = wasActive && !userClosingRef.current;
         userClosingRef.current = false;
         pendingTakeoverAfterStopRef.current = false;
@@ -391,6 +720,121 @@ export function LiveBrowserStage({
     }
   }, [state?.url, addressEditing]);
 
+  // WebSocket real-time stream client lifecycle (with silent graceful fallback to HTTP polling).
+  const applyStateRef = useRef(applyState);
+  applyStateRef.current = applyState;
+  const stateRef = useRef(state);
+  stateRef.current = state;
+
+  useEffect(() => {
+    const client = new LiveBrowserStreamClient({
+      agentId,
+      getAuth: () => authRef.current,
+      callbacks: {
+        onStatus: (nextStatus) => {
+          if (!mountedRef.current) return;
+          setStreamStatus(nextStatus);
+          if (nextStatus === "connected") {
+            if (takeoverActiveRef.current) {
+              client.send({ type: "takeover", active: true });
+            }
+          } else {
+            // Immediately clear stale canvas frame so HTTP polling <img> renders cleanly without overlap.
+            setStreamFrame(null);
+            paintedNavGenRef.current = null;
+            paintedOriginRef.current = undefined;
+            paintedTargetIdRef.current = undefined;
+            if (nextStatus === "replaced") {
+              takeoverActiveRef.current = false;
+              setTakeover(false);
+              clearPendingInputBuffers();
+            }
+          }
+        },
+        onState: (payload) => {
+          if (!mountedRef.current) return;
+          if (typeof payload.navGen === "number") {
+            const key = payload.navGen & 0xffff;
+            if (navGenMetaRef.current.size > 32) {
+              const firstKey = navGenMetaRef.current.keys().next().value;
+              if (firstKey !== undefined) navGenMetaRef.current.delete(firstKey);
+            }
+            navGenMetaRef.current.set(key, {
+              origin: payload.origin ?? parseOriginAndHost(payload.url)?.origin,
+              targetId: payload.targetId,
+            });
+          }
+          if (payload.cdpAvailable === false) {
+            setStreamFrame(null);
+            paintedNavGenRef.current = null;
+          }
+          const seq = ++reqSeqRef.current;
+          const merged = mergeStreamState(stateRef.current, payload);
+          applyStateRef.current(seq, merged);
+        },
+        onFrame: (frame) => {
+          if (!mountedRef.current) return;
+          setStreamFrame(frame);
+        },
+        onCursor: (cursor) => {
+          if (!mountedRef.current) return;
+          setRemoteCursor(cursor || "default");
+        },
+        onStats: (stats) => {
+          if (!mountedRef.current) return;
+          setStreamStats(stats);
+        },
+        onError: (msg, code) => {
+          if (!mountedRef.current) return;
+          if (code === "CDP_UNAVAILABLE") {
+            // Silently fall back to HTTP polling preserving active HTTP screenshot.
+            setStreamFrame(null);
+            setState((prev) => (prev ? { ...prev, cdpAvailable: false } : prev));
+            setPollEpoch((n) => n + 1);
+            return;
+          }
+          if (code === "TAKEOVER_ALREADY_HELD" || code === "TAKEOVER_TOKEN_MISMATCH") {
+            revokeTakeoverOnLeaseLost("当前由另一标签页独占接管");
+            return;
+          }
+          if (code === "ORIGIN_MISMATCH" || code === "TARGET_MISMATCH") {
+            // Pause takeover immediately and demand explicit user confirmation on the new page/origin.
+            takeoverActiveRef.current = false;
+            setTakeover(false);
+            client.send({ type: "takeover", active: false });
+            clearPendingInputBuffers();
+            const expected = parseOriginAndHost(renderedOriginRef.current ?? stateUrlRef.current);
+            const actual = parseOriginAndHost(stateUrlRef.current);
+            setOriginMismatch({
+              expectedOrigin: expected?.origin ?? renderedOriginRef.current ?? "",
+              expectedHost: expected?.host ?? "原页面",
+              actualOrigin: actual?.origin ?? "",
+              actualHost: actual?.host ?? "当前新页面",
+              continuePrompt: handoffContinuePromptRef.current,
+            });
+            setOriginMismatchDismissed(false);
+            toast("页面来源或标签页已变化，已暂停输入，请核对地址栏后重新确认接管", "info");
+            return;
+          }
+          setError(msg);
+        },
+        onFallback: () => {
+          if (!mountedRef.current) return;
+          setStreamFrame(null);
+        },
+      },
+    });
+    streamClientRef.current = client;
+    client.start();
+
+    return () => {
+      client.dispose();
+      if (streamClientRef.current === client) {
+        streamClientRef.current = null;
+      }
+    };
+  }, [agentId]);
+
   const pollOnce = useCallback(async (): Promise<boolean> => {
     if (!mountedRef.current || actionInFlightRef.current || pollInFlightRef.current) return true;
     if (typeof document !== "undefined" && document.hidden) return true;
@@ -405,6 +849,9 @@ export function LiveBrowserStage({
         signal: ctrl.signal,
       });
       if (ctrl.signal.aborted) return true;
+      if (!next.available) {
+        unavailableStreakRef.current += 1;
+      }
       applyState(mySeq, next);
       return true;
     } catch (err) {
@@ -423,24 +870,45 @@ export function LiveBrowserStage({
 
   const handleRetryConnection = useCallback(() => {
     pollErrorStreakRef.current = 0;
+    unavailableStreakRef.current = 0;
     setError(null);
     if (state && !state.available) {
       setState(null);
       setInitialLoading(true);
     }
+    streamClientRef.current?.retryNow();
     setPollEpoch((n) => n + 1);
   }, [state]);
 
-  // Adaptive chained polling with exponential backoff on errors; pauses when tab is hidden.
+  // Adaptive HTTP polling: active whenever WS is NOT connected; automatically pauses when WS is live.
+  // Also handles exponential backoff re-check when `available: false` (cold-start recovery).
   const isActive = state?.active === true;
   const isAvailable = state?.available !== false;
+  const stateIsNull = state === null;
+
   useEffect(() => {
-    if (!isAvailable && state !== null) return;
+    if (wsConnected) return;
+    if (hidden && !effectiveTakeover) return;
+
     let cancelled = false;
     let timer: number | null = null;
-    const baseIntervalMs = isActive ? (effectiveTakeover ? 1200 : 900) : lockedByAssistant ? 1800 : 4000;
+
+    // Takeover polls faster (450ms) than watch mode (900ms); unavailable retries with backoff.
+    const baseIntervalMs = !isAvailable && !stateIsNull
+      ? UNAVAILABLE_BASE_BACKOFF_MS
+      : isActive
+        ? effectiveTakeover
+          ? 450
+          : 900
+        : lockedByAssistant
+          ? 1800
+          : 4000;
 
     const nextDelayMs = () => {
+      if (!isAvailable && !stateIsNull) {
+        const streak = Math.max(0, unavailableStreakRef.current - 1);
+        return Math.min(MAX_POLL_BACKOFF_MS, UNAVAILABLE_BASE_BACKOFF_MS * 2 ** Math.min(streak, 4));
+      }
       const streak = pollErrorStreakRef.current;
       if (streak <= 0) return baseIntervalMs;
       return Math.min(MAX_POLL_BACKOFF_MS, baseIntervalMs * 2 ** Math.min(streak, 4));
@@ -461,7 +929,12 @@ export function LiveBrowserStage({
       schedule(nextDelayMs());
     };
 
-    if (state === null || pollEpoch > 0) {
+    // Only fire an immediate poll on initial mount or when pollEpoch genuinely incremented.
+    const epochChanged = pollEpoch !== lastPollEpochRef.current;
+    if (epochChanged) {
+      lastPollEpochRef.current = pollEpoch;
+    }
+    if (stateIsNull || epochChanged) {
       void runCycle();
     } else {
       schedule(nextDelayMs());
@@ -489,7 +962,18 @@ export function LiveBrowserStage({
       if (timer !== null) window.clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [agentId, isActive, isAvailable, lockedByAssistant, effectiveTakeover, pollOnce, state === null, pollEpoch]);
+  }, [
+    agentId,
+    wsConnected,
+    hidden,
+    isActive,
+    isAvailable,
+    lockedByAssistant,
+    effectiveTakeover,
+    pollOnce,
+    stateIsNull,
+    pollEpoch,
+  ]);
 
   const runAction = useCallback(
     async (payload: LiveBrowserActionPayload) => {
@@ -499,39 +983,49 @@ export function LiveBrowserStage({
       setBusy(true);
       setError(null);
       const mySeq = ++reqSeqRef.current;
+      let succeeded = false;
       try {
         const liveOrigin = parseOriginAndHost(stateUrlRef.current)?.origin;
         const enrichedPayload: LiveBrowserActionPayload =
           liveOrigin &&
           (payload.action === "click" ||
             payload.action === "dblclick" ||
+            payload.action === "hover" ||
+            payload.action === "drag" ||
             payload.action === "wheel" ||
             payload.action === "type" ||
+            payload.action === "paste" ||
             payload.action === "press") &&
           !payload.expectedOrigin
             ? { ...payload, expectedOrigin: liveOrigin }
             : payload;
         const next = await sendLiveBrowserAction(authRef.current, agentId, enrichedPayload);
+        succeeded = true;
         applyState(mySeq, next);
       } catch (err) {
         const post = pendingPostOpenHandoffRef.current;
         pendingPostOpenHandoffRef.current = null;
+        // Pause/clear pending input queue on failure so errors never cascade-spam.
+        clearPendingInputBuffers();
         if (!isAbortError(err) && mountedRef.current) {
           const msg = errorMessageOf(err);
           const isAgentBusyConflict =
-            (err as { status?: number })?.status === 409 ||
-            /助手正在操作浏览器|AGENT_RUNNING/.test(msg);
+            /助手正在操作浏览器|AGENT_RUNNING/.test(msg) ||
+            ((err as { status?: number })?.status === 409 && !isTakeoverConflictError(err));
           if (post && isAgentBusyConflict) {
-            // Re-queue transient 409 handoff so it automatically resumes when the assistant finishes.
             pendingHandoffRef.current = {
               nonce: post.nonce,
               takeover: post.takeover,
               expand: post.expand,
               url: post.url,
               continuePrompt: post.continuePrompt ?? undefined,
+              handoffId: post.handoffId ?? undefined,
             };
             setHandoffWaiting(true);
             setState((prev) => (prev ? { ...prev, agentBusy: true } : prev));
+          } else if (isTakeoverConflictError(err)) {
+            if (post) onHandoffSettledRef.current?.(post.nonce);
+            revokeTakeoverOnLeaseLost("当前由另一标签页独占接管");
           } else {
             if (post) onHandoffSettledRef.current?.(post.nonce);
             setError(msg);
@@ -540,8 +1034,8 @@ export function LiveBrowserStage({
       } finally {
         actionInFlightRef.current = false;
         if (mountedRef.current) setBusy(false);
-        // Drain next queued canvas input in strict FIFO order only while still in takeover.
-        if (mountedRef.current && takeoverActiveRef.current) {
+        // Drain next queued canvas input strictly FIFO ONLY when the previous action succeeded.
+        if (succeeded && mountedRef.current && takeoverActiveRef.current) {
           const nextQueued = inputQueueRef.current.shift();
           if (nextQueued) {
             void runAction(nextQueued);
@@ -553,7 +1047,7 @@ export function LiveBrowserStage({
         }
       }
     },
-    [agentId, applyState],
+    [agentId, applyState, clearPendingInputBuffers],
   );
 
   const enqueueCanvasInput = useCallback(
@@ -585,9 +1079,16 @@ export function LiveBrowserStage({
     }
     const pending = buf.text;
     buf.text = "";
+    if (streamClientRef.current?.isConnected()) {
+      const fence = getWsInputFence();
+      if (!fence) return;
+      streamClientRef.current.send({ type: "insert_text", text: pending, ...fence });
+      return;
+    }
     enqueueCanvasInput({ action: "type", text: pending, submit: false });
   }, [enqueueCanvasInput]);
 
+  // Unified action dispatchers: WS first when connected, HTTP fallback otherwise.
   const handleLaunch = (e: FormEvent) => {
     e.preventDefault();
     if (lockedByAssistant || busy) return;
@@ -596,6 +1097,7 @@ export function LiveBrowserStage({
       setError("请输入有效的 http:// 或 https:// 网址");
       return;
     }
+    if (streamClientRef.current?.send({ type: "open", url })) return;
     void runAction({ action: "open", url });
   };
 
@@ -608,233 +1110,335 @@ export function LiveBrowserStage({
       return;
     }
     setAddressEditing(false);
+    if (streamClientRef.current?.send({ type: "navigate", url })) return;
     void runAction({ action: "goto", url });
   };
 
-  const normalizedCoords = (e: { clientX: number; clientY: number }): { x: number; y: number } | null => {
-    const img = imgRef.current;
-    if (!img) return null;
-    const rect = img.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return null;
-    const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    const y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
-    return { x, y };
-  };
+  const handleHistory = useCallback(
+    (action: "back" | "forward" | "reload" | "stop") => {
+      if (lockedByAssistant) return;
+      if (streamClientRef.current?.send({ type: "history", action })) return;
+      void runAction({ action });
+    },
+    [lockedByAssistant, runAction],
+  );
 
-  const showRipple = (x: number, y: number) => {
-    const id = Date.now() + Math.random();
-    setRipple({ id, xPct: x * 100, yPct: y * 100 });
-    window.setTimeout(() => {
-      setRipple((curr) => (curr?.id === id ? null : curr));
-    }, 360);
-  };
+  const handleTabSelect = useCallback(
+    (tab: LiveBrowserTabInfo) => {
+      if (lockedByAssistant) return;
+      if (
+        streamClientRef.current?.send({
+          type: "tab",
+          action: "select",
+          ...(tab.id ? { targetId: tab.id, id: tab.id } : {}),
+          index: tab.index,
+        })
+      ) {
+        return;
+      }
+      void runAction({ action: "tab_select", index: tab.index });
+    },
+    [lockedByAssistant, runAction],
+  );
 
-  const handleCanvasClick = (e: ReactMouseEvent<HTMLImageElement>) => {
-    if (!effectiveTakeover) return;
-    if (suppressNextClickRef.current) {
-      suppressNextClickRef.current = false;
-      return;
-    }
-    const pt = normalizedCoords(e);
-    if (!pt) return;
-    stageRef.current?.focus({ preventScroll: true });
-    flushKeyBufferToQueue();
-    if (enqueueCanvasInput({ action: "click", x: pt.x, y: pt.y, normalized: true, button: "left" })) {
-      showRipple(pt.x, pt.y);
-    }
-  };
-
-  const handleCanvasDoubleClick = (e: ReactMouseEvent<HTMLImageElement>) => {
-    if (!effectiveTakeover) return;
-    const pt = normalizedCoords(e);
-    if (!pt) return;
-    stageRef.current?.focus({ preventScroll: true });
-    flushKeyBufferToQueue();
-    if (enqueueCanvasInput({ action: "dblclick", x: pt.x, y: pt.y, normalized: true })) {
-      showRipple(pt.x, pt.y);
-    }
-  };
-
-  const handleCanvasContextMenu = (e: ReactMouseEvent<HTMLImageElement>) => {
-    if (!effectiveTakeover) return;
-    e.preventDefault();
-    const pt = normalizedCoords(e);
-    if (!pt) return;
-    flushKeyBufferToQueue();
-    if (enqueueCanvasInput({ action: "click", x: pt.x, y: pt.y, normalized: true, button: "right" })) {
-      showRipple(pt.x, pt.y);
-    }
-  };
-
-  const handleTouchPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
-    if (!effectiveTakeover || e.pointerType !== "touch") return;
-    if (touchGestureRef.current) return;
-    touchGestureRef.current = {
-      pointerId: e.pointerId,
-      startX: e.clientX,
-      startY: e.clientY,
-      lastX: e.clientX,
-      lastY: e.clientY,
-      dragging: false,
-      lastSentAt: 0,
-    };
-  };
-
-  const handleTouchPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
-    if (!effectiveTakeover || e.pointerType !== "touch") return;
-    const g = touchGestureRef.current;
-    if (!g || g.pointerId !== e.pointerId) return;
-    const totalDist = Math.hypot(e.clientX - g.startX, e.clientY - g.startY);
-    if (!g.dragging) {
-      if (totalDist <= TOUCH_DRAG_SLOP) return;
-      g.dragging = true;
-      suppressNextClickRef.current = true;
-    }
-    const now = performance.now();
-    if (now - g.lastSentAt < 120) return;
-    const dx = Math.round((g.lastX - e.clientX) * TOUCH_SCROLL_GAIN);
-    const dy = Math.round((g.lastY - e.clientY) * TOUCH_SCROLL_GAIN);
-    g.lastX = e.clientX;
-    g.lastY = e.clientY;
-    g.lastSentAt = now;
-    if (dx !== 0 || dy !== 0) {
-      const pt = normalizedCoords(e);
-      enqueueCanvasInput({
-        action: "wheel",
-        x: pt?.x,
-        y: pt?.y,
-        normalized: true,
-        deltaX: dx,
-        deltaY: dy,
-      });
-    }
-  };
-
-  const handleTouchPointerEnd = (e: ReactPointerEvent<HTMLDivElement>) => {
-    const g = touchGestureRef.current;
-    if (!g || g.pointerId !== e.pointerId) return;
-    touchGestureRef.current = null;
-    if (g.dragging && effectiveTakeover) {
-      const dx = Math.round((g.lastX - e.clientX) * TOUCH_SCROLL_GAIN);
-      const dy = Math.round((g.lastY - e.clientY) * TOUCH_SCROLL_GAIN);
-      if (dx !== 0 || dy !== 0) {
-        const pt = normalizedCoords(e);
-        enqueueCanvasInput({
-          action: "wheel",
-          x: pt?.x,
-          y: pt?.y,
-          normalized: true,
-          deltaX: dx,
-          deltaY: dy,
+  const handleTabClose = useCallback(
+    (tab: LiveBrowserTabInfo) => {
+      if (lockedByAssistant) return;
+      if (tab.id) {
+        const sent = streamClientRef.current?.send({
+          type: "tab",
+          action: "close",
+          targetId: tab.id,
+          id: tab.id,
         });
+        if (sent) return;
+        // Never downgrade a stable targetId close to a mutable HTTP index close (avoids closing wrong tab).
+        setPollEpoch((n) => n + 1);
+        toast("实时连接波动，未能关闭标签页，已刷新标签列表请重试", "info");
+        return;
       }
-      window.setTimeout(() => {
-        suppressNextClickRef.current = false;
-      }, 300);
-    }
-  };
+      if (streamClientRef.current?.send({ type: "tab", action: "close", index: tab.index })) return;
+      void runAction({ action: "tab_close", index: tab.index });
+    },
+    [lockedByAssistant, runAction, toast],
+  );
 
-  const handleCanvasWheel = (e: ReactWheelEvent<HTMLDivElement>) => {
-    if (!effectiveTakeover) return;
-    const pt = normalizedCoords(e);
-    const buf = wheelBufferRef.current;
-    buf.dx += e.deltaX;
-    buf.dy += e.deltaY;
-    if (pt) {
-      buf.x = pt.x;
-      buf.y = pt.y;
-    }
-    if (buf.timer === null) {
-      buf.timer = window.setTimeout(() => {
-        const dx = Math.round(buf.dx);
-        const dy = Math.round(buf.dy);
-        const x = buf.x;
-        const y = buf.y;
-        buf.dx = 0;
-        buf.dy = 0;
-        buf.timer = null;
-        if (!takeoverActiveRef.current) return;
-        if (dx !== 0 || dy !== 0) {
-          enqueueCanvasInput({ action: "wheel", x, y, normalized: true, deltaX: dx, deltaY: dy });
-        }
-      }, 220);
-    }
-  };
+  const handleTabNew = useCallback(() => {
+    if (lockedByAssistant) return;
+    if (streamClientRef.current?.send({ type: "tab", action: "new" })) return;
+    void runAction({ action: "tab_new" });
+  }, [lockedByAssistant, runAction]);
 
-  const handleStageKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (!effectiveTakeover) return;
-    // Let native IME composition pass through untouched (users use bottom input bar for CJK).
-    if (e.nativeEvent.isComposing) return;
-    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-
-    // Local focus escape: pressing Escape releases keyboard capture on the canvas without closing
-    // InspectorPanel (remote Esc is available via the quick-keys dock). Tab stays native for a11y.
-    if (e.key === "Escape") {
-      e.preventDefault();
-      e.stopPropagation();
-      stageRef.current?.blur();
-      return;
-    }
-
-    if ((e.ctrlKey || e.metaKey) && !e.altKey) {
-      const lower = e.key.toLowerCase();
-      if (CTRL_COMBO_KEYS.has(lower)) {
-        e.preventDefault();
-        e.stopPropagation();
-        flushKeyBufferToQueue();
-        enqueueCanvasInput({ action: "press", key: `Control+${lower}` });
-      }
-      return;
-    }
-
-    const mapped = SPECIAL_KEY_MAP[e.key];
-    if (mapped) {
-      e.preventDefault();
-      e.stopPropagation();
-      flushKeyBufferToQueue();
-      enqueueCanvasInput({ action: "press", key: mapped });
-      return;
-    }
-
-    // Buffer rapid printable keystrokes instead of dropping them while an action is in flight.
-    if (e.key.length === 1 && !e.altKey && !e.ctrlKey && !e.metaKey) {
-      e.preventDefault();
-      e.stopPropagation();
-      const buf = keyBufferRef.current;
-      buf.text += e.key;
-      if (buf.timer !== null) window.clearTimeout(buf.timer);
-      buf.timer = window.setTimeout(() => {
-        buf.timer = null;
-        flushKeyBufferToQueue();
-      }, 160);
-    }
-  };
-
-  const handleSendText = (submit: boolean) => {
-    if (!typeDraft || busy || lockedByAssistant) return;
-    const text = typeDraft;
-    setTypeDraft("");
-    void runAction({ action: "type", text, submit });
-  };
-
-  const handleHandBack = () => {
+  const handleCloseBrowser = useCallback(() => {
+    userClosingRef.current = true;
     takeoverActiveRef.current = false;
     prevTakeoverRef.current = false;
     pendingTakeoverAfterStopRef.current = false;
     clearPendingInputBuffers();
     setTakeover(false);
+    releaseHttpTakeoverLease(false);
+    setExpanded(false);
+    if (streamClientRef.current?.send({ type: "close_browser" })) return;
+    void runAction({ action: "close" });
+  }, [clearPendingInputBuffers, releaseHttpTakeoverLease, runAction]);
+
+  const handleEnterTakeover = useCallback(() => {
+    if (lockedByAssistant || originMismatch) return;
+    setTakeover(true);
+    syncTakeoverToStream(true);
+    focusCanvasSoon();
+  }, [lockedByAssistant, originMismatch, syncTakeoverToStream, focusCanvasSoon]);
+
+  const handlePointerEvent = useCallback(
+    (evt: {
+      action: "move" | "down" | "up" | "click" | "dblclick";
+      x: number;
+      y: number;
+      button?: LiveBrowserMouseButton;
+      clickCount?: number;
+      modifiers?: number;
+    }): boolean => {
+      if (!takeoverActiveRef.current) return false;
+      if (streamClientRef.current?.isConnected()) {
+        const fence = getWsInputFence();
+        if (!fence) return false;
+        return streamClientRef.current.send({
+          type: "pointer",
+          action: evt.action,
+          x: evt.x,
+          y: evt.y,
+          button: evt.button,
+          clickCount: evt.clickCount,
+          modifiers: evt.modifiers,
+          ...fence,
+        });
+      }
+      if (evt.action === "dblclick") {
+        return enqueueCanvasInput({
+          action: "dblclick",
+          x: evt.x,
+          y: evt.y,
+          normalized: true,
+        });
+      }
+      if (evt.action === "click") {
+        return enqueueCanvasInput({
+          action: "click",
+          x: evt.x,
+          y: evt.y,
+          normalized: true,
+          button: evt.button ?? "left",
+        });
+      }
+      return false;
+    },
+    [enqueueCanvasInput],
+  );
+
+  const handleDragFallback = useCallback(
+    (evt: { fromX: number; fromY: number; toX: number; toY: number }) => {
+      enqueueCanvasInput({
+        action: "drag",
+        fromX: evt.fromX,
+        fromY: evt.fromY,
+        toX: evt.toX,
+        toY: evt.toY,
+        normalized: true,
+      });
+    },
+    [enqueueCanvasInput],
+  );
+
+  const handleWheelEvent = useCallback(
+    (evt: { x?: number; y?: number; deltaX: number; deltaY: number; modifiers?: number }) => {
+      if (!takeoverActiveRef.current) return;
+      if (streamClientRef.current?.isConnected()) {
+        const fence = getWsInputFence();
+        if (!fence) return;
+        streamClientRef.current.send({
+          type: "wheel",
+          x: evt.x,
+          y: evt.y,
+          deltaX: evt.deltaX,
+          deltaY: evt.deltaY,
+          modifiers: evt.modifiers,
+          ...fence,
+        });
+        return;
+      }
+      enqueueCanvasInput({
+        action: "wheel",
+        x: evt.x,
+        y: evt.y,
+        normalized: true,
+        deltaX: evt.deltaX,
+        deltaY: evt.deltaY,
+      });
+    },
+    [enqueueCanvasInput],
+  );
+
+  const handleKeyEvent = useCallback(
+    (evt: { action: "down" | "up" | "press"; key: string; code?: string; modifiers?: number }) => {
+      if (!takeoverActiveRef.current) return;
+      if (streamClientRef.current?.isConnected()) {
+        const fence = getWsInputFence();
+        if (!fence) return;
+        streamClientRef.current.send({
+          type: "key",
+          action: evt.action,
+          key: evt.key,
+          code: evt.code,
+          modifiers: evt.modifiers,
+          ...fence,
+        });
+        return;
+      }
+      enqueueCanvasInput({
+        action: "press",
+        key: formatPlaywrightKey(evt.key, evt.modifiers),
+      });
+    },
+    [enqueueCanvasInput],
+  );
+
+  const handleInsertText = useCallback(
+    (text: string) => {
+      if (!text || !takeoverActiveRef.current) return;
+      if (streamClientRef.current?.isConnected()) {
+        const fence = getWsInputFence();
+        if (!fence) return;
+        streamClientRef.current.send({ type: "insert_text", text, ...fence });
+        return;
+      }
+      enqueueCanvasInput({ action: "type", text, submit: false });
+    },
+    [enqueueCanvasInput],
+  );
+
+  const handlePasteText = useCallback(
+    (text: string) => {
+      if (!text || !takeoverActiveRef.current) return;
+      if (streamClientRef.current?.isConnected()) {
+        const fence = getWsInputFence();
+        if (!fence) return;
+        streamClientRef.current.send({ type: "insert_text", text, ...fence });
+        return;
+      }
+      enqueueCanvasInput({ action: "paste", text });
+    },
+    [enqueueCanvasInput],
+  );
+
+  const handleStagePrintableKey = useCallback(
+    (char: string) => {
+      if (streamClientRef.current?.isConnected()) {
+        const fence = getWsInputFence();
+        if (!fence) return;
+        streamClientRef.current.send({ type: "insert_text", text: char, ...fence });
+        return;
+      }
+      const buf = keyBufferRef.current;
+      buf.text += char;
+      if (buf.timer !== null) window.clearTimeout(buf.timer);
+      buf.timer = window.setTimeout(() => {
+        buf.timer = null;
+        flushKeyBufferToQueue();
+      }, 160);
+    },
+    [flushKeyBufferToQueue],
+  );
+
+  const handleRespondDialog = useCallback(
+    (accept: boolean, promptText?: string) => {
+      if (streamClientRef.current?.send({ type: "dialog", accept, promptText })) return;
+      void runAction({ action: "dialog", accept, promptText });
+    },
+    [runAction],
+  );
+
+  const handleSendText = (submit: boolean) => {
+    if (!typeDraft || busy || lockedByAssistant) return;
+    const text = typeDraft;
+    setTypeDraft("");
+    if (streamClientRef.current?.isConnected()) {
+      const fence = getWsInputFence();
+      if (!fence) return;
+      streamClientRef.current.send({ type: "insert_text", text, ...fence });
+      if (submit) {
+        streamClientRef.current.send({ type: "key", action: "press", key: "Enter", code: "Enter", ...fence });
+      }
+      return;
+    }
+    void runAction({ action: "type", text, submit });
+  };
+
+  const releaseTakeoverCommon = useCallback(() => {
+    takeoverActiveRef.current = false;
+    prevTakeoverRef.current = false;
+    pendingTakeoverAfterStopRef.current = false;
+    clearPendingInputBuffers();
+    setTakeover(false);
+    syncTakeoverToStream(false);
+    releaseHttpTakeoverLease(false);
     setExpanded(false);
     setOriginMismatch(null);
+    setOriginMismatchDismissed(false);
+  }, [clearPendingInputBuffers, syncTakeoverToStream, releaseHttpTakeoverLease]);
+
+  const handleHandBackAndContinue = useCallback(() => {
+    releaseTakeoverCommon();
     const customPrompt = handoffContinuePromptRef.current;
+    const handoffId = activeHandoffIdRef.current;
     handoffContinuePromptRef.current = null;
-    if (onHandBackToComposer) {
-      const label = state?.title?.trim() || state?.url?.trim() || "当前网页";
-      onHandBackToComposer(customPrompt || `我已在云端浏览器完成操作（当前页面：${label}），请继续刚才的任务。`);
-      toast("已交还控制权，并将续跑指令填入输入框", "success");
-    } else {
-      toast("已交还云端浏览器控制权", "success");
+    activeHandoffIdRef.current = null;
+    // Never interpolate untrusted external webpage title or URL (prevents token leakage & prompt injection).
+    const safeContinue = customPrompt || SAFE_HANDBACK_CONTINUE_MESSAGE;
+
+    if (sendUserText && !chatBusy) {
+      sendUserText(SAFE_HANDBACK_CONTINUE_MESSAGE);
+      notifyLiveBrowserHandback({
+        sessionId: chatSessionId ?? null,
+        handoffId,
+        agentId,
+        autoSent: true,
+      });
+      toast("已交还控制权并通知助手继续任务", "success");
+      return;
     }
-  };
+    if (onHandBackToComposer) {
+      onHandBackToComposer(safeContinue);
+      notifyLiveBrowserHandback({
+        sessionId: chatSessionId ?? null,
+        handoffId,
+        agentId,
+        autoSent: false,
+      });
+      toast("已交还控制权，并将续跑指令填入输入框", "success");
+      return;
+    }
+    notifyLiveBrowserHandback({
+      sessionId: chatSessionId ?? null,
+      handoffId,
+      agentId,
+      autoSent: false,
+    });
+    toast("已交还云端浏览器控制权", "success");
+  }, [releaseTakeoverCommon, sendUserText, chatBusy, chatSessionId, onHandBackToComposer, agentId, toast]);
+
+  const handleHandBackOnly = useCallback(() => {
+    releaseTakeoverCommon();
+    const handoffId = activeHandoffIdRef.current;
+    handoffContinuePromptRef.current = null;
+    activeHandoffIdRef.current = null;
+    notifyLiveBrowserHandback({
+      sessionId: chatSessionId ?? null,
+      handoffId,
+      agentId,
+      autoSent: false,
+    });
+    toast("已退出人工接管，交还助手控制权", "info");
+  }, [releaseTakeoverCommon, chatSessionId, agentId, toast]);
 
   const handlePauseAndTakeover = () => {
     if (!effectiveStopTurn) return;
@@ -842,6 +1446,31 @@ export function LiveBrowserStage({
     effectiveStopTurn();
     toast("正在暂停助手，暂停完成后自动进入人工接管…", "info");
   };
+
+  const handleCopyUrl = useCallback(() => {
+    if (!state?.url) return;
+    try {
+      void navigator.clipboard?.writeText(state.url);
+      toast("已复制当前页面网址", "success");
+    } catch {
+      toast("复制失败，请手动复制地址栏内容", "info");
+    }
+  }, [state?.url, toast]);
+
+  const handleScreenshot = useCallback(() => {
+    const dataUrl = canvasHandleRef.current?.exportScreenshotDataUrl();
+    if (!dataUrl) {
+      toast("当前暂无可保存的页面画面", "info");
+      return;
+    }
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const ext = dataUrl.startsWith("data:image/png") ? "png" : "jpg";
+    const link = document.createElement("a");
+    link.href = dataUrl;
+    link.download = `live-browser-${ts}.${ext}`;
+    link.click();
+    toast("已保存当前浏览器画面截图", "success");
+  }, [toast]);
 
   // Fulfill one-click handoff requests emitted from chat `browser_handoff` cards.
   useEffect(() => {
@@ -863,7 +1492,6 @@ export function LiveBrowserStage({
       onHandoffSettledRef.current?.(req.nonce);
       return;
     }
-    // Preserve pending handoff across temporary assistant/action locks instead of dropping clicks.
     if (lockedByAssistant || busy || actionInFlightRef.current) {
       setHandoffWaiting(true);
       return;
@@ -885,6 +1513,7 @@ export function LiveBrowserStage({
           expand: req.expand,
           url: normalized,
           continuePrompt: req.continuePrompt?.trim() || null,
+          handoffId: req.handoffId ?? null,
         };
         void runAction({ action: "open", url: normalized, ifIdle: true });
         return;
@@ -904,148 +1533,46 @@ export function LiveBrowserStage({
   ]);
 
   if (initialLoading && !state) {
-    return (
-      <div className="lb-root" data-testid="live-browser-loading">
-        <div className="lb-idle-surface oc-surface-card">
-          <span className="lb-idle-icon oc-icon-badge oc-icon-badge-accent" aria-hidden>
-            <Spinner size={18} />
-          </span>
-          <h3 className="lb-idle-title">云端实时浏览器</h3>
-          <p className="lb-idle-desc">正在连接云端浏览器视口…</p>
-        </div>
-      </div>
-    );
+    return <LiveBrowserLoadingView />;
   }
 
   if (state && !state.available) {
-    const customReason = state.reason && state.reason !== "unavailable" ? state.reason : null;
-    return (
-      <div className="lb-root" data-testid="live-browser-unavailable">
-        <div className="lb-idle-surface oc-surface-card" data-tone="warning">
-          <span className="lb-idle-icon oc-icon-badge oc-icon-badge-warning" aria-hidden>
-            <ShieldAlert size={18} />
-          </span>
-          <h3 className="lb-idle-title">当前环境未启用云端浏览器</h3>
-          <p className="lb-idle-desc">
-            {customReason
-              ? `${customReason}（容器冷启动中可稍候点击重新检测；历史步骤快照仍可在「步骤记录」查看）`
-              : "该运行容器暂未挂载实时浏览器引擎，若容器正在冷启动可点击重新检测；助手的浏览器步骤快照仍可在「步骤记录」中查看。"}
-          </p>
-          <button
-            type="button"
-            className="lb-preset-chip oc-btn-tactile oc-btn-secondary-craft"
-            data-testid="live-browser-retry-available"
-            onClick={handleRetryConnection}
-          >
-            <RotateCw size={12} aria-hidden />
-            重新检测
-          </button>
-        </div>
-      </div>
-    );
+    return <LiveBrowserUnavailableView reason={state.reason} onRetry={handleRetryConnection} />;
   }
 
   if (!state?.active) {
     return (
-      <div className="lb-root" data-testid="live-browser-idle">
-        {error && (
-          <div className="lb-error-banner oc-callout oc-callout-danger" role="alert" data-testid="live-browser-error">
-            <span>{error}</span>
-            <div className="lb-error-actions">
-              <button
-                type="button"
-                className="lb-error-retry oc-btn-tactile oc-btn-secondary-craft"
-                data-testid="live-browser-error-retry"
-                onClick={handleRetryConnection}
-              >
-                立即重试
-              </button>
-              <button type="button" className="lb-error-close" aria-label="关闭提示" onClick={() => setError(null)}>
-                <X size={13} />
-              </button>
-            </div>
-          </div>
-        )}
-        {handoffWaiting && (
-          <div className="lb-handoff-banner oc-callout oc-callout-info" role="status" data-testid="live-browser-handoff-waiting">
-            <span className="lb-handoff-body">
-              <Spinner size={13} className="shrink-0 text-accent" />
-              <span>助手正在操作浏览器，当前步骤完成后将自动为你开启接管…</span>
-            </span>
-          </div>
-        )}
-        <div className="lb-idle-surface oc-surface-card">
-          <span className="lb-idle-icon oc-icon-badge oc-icon-badge-accent" aria-hidden>
-            <Globe size={18} />
-          </span>
-          <h3 className="lb-idle-title">云端实时浏览器</h3>
-          <p className="lb-idle-desc">
-            助手操作网页时会自动同步实时画面；你也可以现在启动，直接登录学术库或处理验证，页面状态与助手共享。
-          </p>
-          <form className="lb-launch-form" onSubmit={handleLaunch}>
-            <input
-              type="text"
-              value={launchUrl}
-              disabled={lockedByAssistant}
-              onChange={(e) => setLaunchUrl(e.target.value)}
-              placeholder="输入网址，例如 https://arxiv.org"
-              aria-label="启动网址"
-              className="lb-launch-input oc-surface-recessed"
-              data-testid="live-browser-launch-input"
-            />
-            <button
-              type="submit"
-              disabled={busy || lockedByAssistant}
-              className="lb-launch-btn oc-btn-tactile oc-btn-primary-craft"
-              data-testid="live-browser-launch-btn"
-            >
-              {busy ? <Spinner size={13} /> : <Globe size={13} />}
-              启动
-            </button>
-          </form>
-          <div className="lb-presets" aria-label="快捷入口">
-            {QUICK_PRESETS.map((preset) => (
-              <button
-                key={preset.url}
-                type="button"
-                disabled={busy || lockedByAssistant}
-                className="lb-preset-chip oc-btn-tactile oc-btn-secondary-craft"
-                onClick={() => {
-                  setLaunchUrl(preset.url);
-                  void runAction({ action: "open", url: preset.url });
-                }}
-              >
-                {preset.label}
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
+      <LiveBrowserIdleView
+        error={error}
+        handoffWaiting={handoffWaiting}
+        launchUrl={launchUrl}
+        busy={busy}
+        lockedByAssistant={lockedByAssistant}
+        onLaunchUrlChange={setLaunchUrl}
+        onLaunchSubmit={handleLaunch}
+        onSelectPreset={(presetUrl) => {
+          setLaunchUrl(presetUrl);
+          if (!streamClientRef.current?.send({ type: "open", url: presetUrl })) {
+            void runAction({ action: "open", url: presetUrl });
+          }
+        }}
+        onRetry={handleRetryConnection}
+        onDismissError={() => setError(null)}
+      />
     );
   }
 
   const tabs = state.tabs ?? [];
-  const isHttps = (state.url ?? "").startsWith("https://");
+  const canAutoSendContinue = Boolean(sendUserText && !chatBusy);
 
   const browserShell = (
     <>
       {error && (
-        <div className="lb-error-banner oc-callout oc-callout-danger" role="alert" data-testid="live-browser-error">
-          <span>{error}</span>
-          <div className="lb-error-actions">
-            <button
-              type="button"
-              className="lb-error-retry oc-btn-tactile oc-btn-secondary-craft"
-              data-testid="live-browser-error-retry"
-              onClick={handleRetryConnection}
-            >
-              立即重试
-            </button>
-            <button type="button" className="lb-error-close" aria-label="关闭提示" onClick={() => setError(null)}>
-              <X size={13} />
-            </button>
-          </div>
-        </div>
+        <LiveBrowserErrorBanner
+          error={error}
+          onRetry={handleRetryConnection}
+          onDismiss={() => setError(null)}
+        />
       )}
 
       {handoffWaiting && (
@@ -1057,7 +1584,7 @@ export function LiveBrowserStage({
         </div>
       )}
 
-      {originMismatch && !effectiveTakeover && (
+      {originMismatch && !originMismatchDismissed && !effectiveTakeover && (
         <div className="lb-handoff-banner oc-callout oc-callout-warning" role="alert" data-testid="live-browser-origin-mismatch">
           <span className="lb-handoff-body">
             <span className="oc-icon-badge oc-icon-badge-warning size-6 rounded-xs" aria-hidden>
@@ -1077,17 +1604,22 @@ export function LiveBrowserStage({
               data-testid="live-browser-confirm-mismatch"
               onClick={() => {
                 if (lockedByAssistant) return;
-                // Re-verify live host at click time: if page navigated again before confirmation, refresh banner.
                 const currentActual = parseOriginAndHost(state?.url);
                 if (currentActual && currentActual.host !== originMismatch.actualHost) {
-                  setOriginMismatch({ ...originMismatch, actualHost: currentActual.host });
+                  setOriginMismatch({
+                    ...originMismatch,
+                    actualOrigin: currentActual.origin,
+                    actualHost: currentActual.host,
+                  });
                   return;
                 }
                 const prompt = originMismatch.continuePrompt;
                 setOriginMismatch(null);
+                setOriginMismatchDismissed(false);
                 handoffContinuePromptRef.current = prompt;
                 setTakeover(true);
-                window.requestAnimationFrame(() => stageRef.current?.focus({ preventScroll: true }));
+                syncTakeoverToStream(true);
+                focusCanvasSoon();
               }}
             >
               确认接管当前页
@@ -1095,8 +1627,10 @@ export function LiveBrowserStage({
             <button
               type="button"
               className="lb-icon-btn oc-btn-tactile"
-              aria-label="关闭域名核对提示"
-              onClick={() => setOriginMismatch(null)}
+              aria-label="收起域名核对提示"
+              title="收起提示（仍需核对确认后才可接管）"
+              data-testid="live-browser-dismiss-mismatch"
+              onClick={() => setOriginMismatchDismissed(true)}
             >
               <X size={13} />
             </button>
@@ -1105,327 +1639,89 @@ export function LiveBrowserStage({
       )}
 
       <div className="lb-shell" data-takeover={effectiveTakeover ? "true" : "false"}>
-        {/* Top Chrome Toolbar */}
-        <div className="lb-toolbar">
-          {expanded && (
-            <span className="lb-chrome-dots" aria-hidden>
-              <span />
-              <span />
-              <span />
-            </span>
-          )}
-          <div className="lb-nav-group">
-            <button
-              type="button"
-              className="lb-icon-btn oc-btn-tactile"
-              aria-label="后退"
-              title={lockedByAssistant ? "助手执行中，暂不可操作" : "后退"}
-              disabled={busy || lockedByAssistant}
-              onClick={() => void runAction({ action: "back" })}
-            >
-              <ArrowLeft size={14} />
-            </button>
-            <button
-              type="button"
-              className="lb-icon-btn oc-btn-tactile"
-              aria-label="前进"
-              title={lockedByAssistant ? "助手执行中，暂不可操作" : "前进"}
-              disabled={busy || lockedByAssistant}
-              onClick={() => void runAction({ action: "forward" })}
-            >
-              <ArrowRight size={14} />
-            </button>
-            <button
-              type="button"
-              className="lb-icon-btn oc-btn-tactile"
-              aria-label="刷新页面"
-              title={lockedByAssistant ? "助手执行中，暂不可操作" : "刷新页面"}
-              disabled={busy || lockedByAssistant}
-              onClick={() => void runAction({ action: "reload" })}
-            >
-              <RotateCw size={13} className={busy ? "lb-spin" : undefined} />
-            </button>
-          </div>
+        <LiveBrowserToolbar
+          url={state.url}
+          title={state.title}
+          loading={state.loading}
+          capturedAt={state.capturedAt}
+          tabs={tabs}
+          addressDraft={addressDraft}
+          onAddressDraftChange={setAddressDraft}
+          onAddressEditingChange={setAddressEditing}
+          onAddressSubmit={handleAddressSubmit}
+          effectiveTakeover={effectiveTakeover}
+          takeoverLeaseMode={takeoverLeaseMode}
+          lockedByAssistant={lockedByAssistant}
+          running={running}
+          canPauseAndTakeover={Boolean(effectiveStopTurn)}
+          canAutoSendContinue={canAutoSendContinue}
+          originMismatchLocked={Boolean(originMismatch)}
+          originMismatchDismissed={originMismatchDismissed}
+          onReopenOriginMismatch={() => setOriginMismatchDismissed(false)}
+          busy={busy}
+          expanded={expanded}
+          expandBtnRef={expandBtnRef}
+          zoomMode={zoomMode}
+          onToggleZoom={() => setZoomMode((prev) => (prev === "fit" ? "1:1" : "fit"))}
+          captureFocused={captureFocused}
+          onReleaseCaptureFocus={() => canvasHandleRef.current?.blurCapture()}
+          connectionStatus={streamStatus}
+          hasConnectionError={Boolean(error)}
+          streamStats={streamStats}
+          onHistory={handleHistory}
+          onTabSelect={handleTabSelect}
+          onTabClose={handleTabClose}
+          onTabNew={handleTabNew}
+          onEnterTakeover={handleEnterTakeover}
+          onPauseAndTakeover={handlePauseAndTakeover}
+          onHandBackAndContinue={handleHandBackAndContinue}
+          onHandBackOnly={handleHandBackOnly}
+          onToggleExpand={() => setExpanded((prev) => !prev)}
+          onCloseBrowser={handleCloseBrowser}
+          onCopyUrl={handleCopyUrl}
+          onScreenshot={handleScreenshot}
+        />
 
-          <form className="lb-address-form oc-surface-recessed" onSubmit={handleAddressSubmit}>
-            <span className="lb-address-icon" data-secure={isHttps ? "true" : "false"} aria-hidden>
-              {isHttps ? <Lock size={11} /> : <Globe size={11} />}
-            </span>
-            <input
-              type="text"
-              value={addressDraft}
-              readOnly={lockedByAssistant}
-              onFocus={() => {
-                if (!lockedByAssistant) setAddressEditing(true);
-              }}
-              onBlur={() => setAddressEditing(false)}
-              onChange={(e) => setAddressDraft(e.target.value)}
-              placeholder="输入网址并回车…"
-              aria-label="浏览器地址栏"
-              className="lb-address-input"
-              data-testid="live-browser-address"
-            />
-          </form>
+        <LiveBrowserCanvas
+          canvasHandleRef={canvasHandleRef}
+          stageRef={stageRef}
+          viewport={state.viewport}
+          title={state.title}
+          imageBase64={state.imageBase64}
+          mimeType={state.mimeType}
+          streamFrame={streamFrame}
+          effectiveTakeover={effectiveTakeover}
+          lockedByAssistant={lockedByAssistant}
+          originMismatchLocked={Boolean(originMismatch)}
+          wsConnected={wsConnected}
+          connectionStatus={streamStatus}
+          busy={busy}
+          zoomMode={zoomMode}
+          remoteCursor={remoteCursor}
+          dialog={state.dialog}
+          onRequestTakeover={handleEnterTakeover}
+          onRetryConnection={handleRetryConnection}
+          onPointerEvent={handlePointerEvent}
+          onDragFallback={handleDragFallback}
+          onWheelEvent={handleWheelEvent}
+          onKeyEvent={handleKeyEvent}
+          onInsertText={handleInsertText}
+          onPasteText={handlePasteText}
+          onStagePrintableKey={handleStagePrintableKey}
+          onFlushKeyBuffer={flushKeyBufferToQueue}
+          onRespondDialog={handleRespondDialog}
+          onCaptureFocusChange={setCaptureFocused}
+          onFramePainted={handleFramePainted}
+        />
 
-          <div className="lb-toolbar-actions">
-            {effectiveTakeover ? (
-              <button
-                type="button"
-                className="lb-cta-btn oc-btn-tactile oc-btn-accent-craft"
-                data-variant="takeover"
-                data-testid="live-browser-handback-btn"
-                onClick={handleHandBack}
-              >
-                <Check size={13} />
-                交还助手
-              </button>
-            ) : lockedByAssistant && running && effectiveStopTurn ? (
-              <button
-                type="button"
-                className="lb-cta-btn oc-btn-tactile"
-                data-variant="watch"
-                title="暂停当前助手回合，并自动进入人工接管"
-                data-testid="live-browser-pause-takeover-btn"
-                onClick={handlePauseAndTakeover}
-              >
-                <Hand size={13} />
-                暂停并接管
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="lb-cta-btn oc-btn-tactile"
-                data-variant="watch"
-                disabled={lockedByAssistant || Boolean(originMismatch)}
-                title={
-                  lockedByAssistant
-                    ? "助手正在操作浏览器，本轮结束或停止后即可接管"
-                    : originMismatch
-                      ? "请先核对上方域名提示并确认后再接管"
-                      : "接管云端浏览器"
-                }
-                data-testid="live-browser-takeover-btn"
-                onClick={() => {
-                  if (lockedByAssistant || originMismatch) return;
-                  setTakeover(true);
-                  window.requestAnimationFrame(() => stageRef.current?.focus({ preventScroll: true }));
-                }}
-              >
-                <Hand size={13} />
-                {lockedByAssistant ? "助手操作中" : "接管"}
-              </button>
-            )}
-            <button
-              ref={expanded ? undefined : expandBtnRef}
-              type="button"
-              className="lb-icon-btn oc-btn-tactile"
-              aria-label={expanded ? "退出放大视图" : "放大浏览器视图"}
-              title={expanded ? "缩小回侧栏 (Esc)" : "放大为沉浸全屏视口"}
-              data-testid="live-browser-expand-btn"
-              onClick={() => setExpanded((prev) => !prev)}
-            >
-              {expanded ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
-            </button>
-            <button
-              type="button"
-              className="lb-icon-btn oc-btn-tactile"
-              aria-label="关闭云端浏览器"
-              title={lockedByAssistant ? "助手执行中，暂不可关闭" : "关闭云端浏览器"}
-              disabled={busy || lockedByAssistant}
-              data-testid="live-browser-close-btn"
-              onClick={() => {
-                userClosingRef.current = true;
-                takeoverActiveRef.current = false;
-                prevTakeoverRef.current = false;
-                pendingTakeoverAfterStopRef.current = false;
-                clearPendingInputBuffers();
-                setTakeover(false);
-                setExpanded(false);
-                void runAction({ action: "close" });
-              }}
-            >
-              <Power size={13} />
-            </button>
-          </div>
-        </div>
-
-        {/* Multi-tab bar (rendered only when more than 1 tab is open) */}
-        {tabs.length > 1 && (
-          <div className="lb-tabs" role="tablist" aria-label="浏览器标签页" data-testid="live-browser-tabs">
-            {tabs.map((t) => (
-              <div key={t.index} className="lb-tab" data-active={t.active ? "true" : "false"}>
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={t.active}
-                  disabled={busy || lockedByAssistant}
-                  className="lb-tab-select"
-                  title={t.title || t.url}
-                  onClick={() => void runAction({ action: "tab_select", index: t.index })}
-                >
-                  {t.title || t.url || `标签页 ${t.index + 1}`}
-                </button>
-                <button
-                  type="button"
-                  disabled={busy || lockedByAssistant}
-                  className="lb-tab-close"
-                  aria-label={`关闭标签页 ${t.title || t.index + 1}`}
-                  onClick={() => void runAction({ action: "tab_close", index: t.index })}
-                >
-                  <X size={11} />
-                </button>
-              </div>
-            ))}
-            <button
-              type="button"
-              className="lb-icon-btn oc-btn-tactile"
-              aria-label="新建标签页"
-              title="新建标签页"
-              disabled={busy || lockedByAssistant}
-              onClick={() => void runAction({ action: "tab_new" })}
-            >
-              <Plus size={12} />
-            </button>
-          </div>
-        )}
-
-        {/* Integrated Status Ribbon */}
-        <div
-          className="lb-status-ribbon"
-          data-takeover={effectiveTakeover ? "true" : "false"}
-          data-testid="live-browser-status"
-        >
-          <div className="lb-status-left">
-            <span
-              className="lb-live-dot"
-              data-takeover={effectiveTakeover ? "true" : "false"}
-              data-busy={lockedByAssistant ? "true" : "false"}
-              aria-hidden
-            />
-            <span className="lb-status-text">
-              {lockedByAssistant
-                ? "助手正在操作浏览器 · 实时观看中（本轮结束或停止后可一键接管）"
-                : effectiveTakeover
-                  ? "已接管 · 点击画面交互，完成后点「交还助手」"
-                  : state.title
-                    ? `实时画面 · ${state.title}`
-                    : "实时画面同步中 · 点击「接管」可直接操作"}
-            </span>
-          </div>
-          <div className="lb-status-right">
-            {effectiveTakeover && (
-              <span className="lb-status-kbd-hint">
-                <kbd className="oc-kbd">Esc</kbd>
-                <span>退出捕获</span>
-              </span>
-            )}
-            {state.capturedAt && <span className="lb-status-meta">{formatSyncTime(state.capturedAt)}</span>}
-          </div>
-        </div>
-
-        {/* Viewport Canvas */}
-        <div
-          ref={stageRef}
-          tabIndex={effectiveTakeover ? 0 : -1}
-          className="lb-stage"
-          data-takeover={effectiveTakeover ? "true" : "false"}
-          data-testid="live-browser-stage"
-          aria-label={effectiveTakeover ? "云端浏览器交互画布（接管中）" : "云端浏览器实时画布"}
-          onKeyDown={handleStageKeyDown}
-          onWheel={handleCanvasWheel}
-          onPointerDown={handleTouchPointerDown}
-          onPointerMove={handleTouchPointerMove}
-          onPointerUp={handleTouchPointerEnd}
-          onPointerCancel={handleTouchPointerEnd}
-        >
-          {busy && <span className="lb-progress-bar" aria-hidden />}
-          {state.imageBase64 ? (
-            <div className="lb-frame-wrap">
-              <img
-                ref={imgRef}
-                src={`data:${state.mimeType ?? "image/jpeg"};base64,${state.imageBase64}`}
-                alt={state.title ? `${state.title} 实时画面` : "云端浏览器实时画面"}
-                draggable={false}
-                className="lb-frame-img"
-                data-testid="live-browser-frame"
-                onClick={handleCanvasClick}
-                onDoubleClick={handleCanvasDoubleClick}
-                onContextMenu={handleCanvasContextMenu}
-              />
-              {ripple && (
-                <span
-                  key={ripple.id}
-                  className="lb-ripple"
-                  style={{ left: `${ripple.xPct}%`, top: `${ripple.yPct}%` }}
-                  aria-hidden
-                />
-              )}
-            </div>
-          ) : (
-            <div className="lb-stage-placeholder">
-              <span className="oc-icon-badge oc-icon-badge-accent size-9 rounded-md" aria-hidden>
-                <Spinner size={15} />
-              </span>
-              <span>正在捕获页面画面…</span>
-            </div>
-          )}
-        </div>
-
-        {/* Takeover Bottom Text Input & Quick Keys */}
         {effectiveTakeover && (
-          <div className="lb-takeover-dock" data-testid="live-browser-takeover-dock">
-            <form
-              className="lb-type-form"
-              onSubmit={(e) => {
-                e.preventDefault();
-                handleSendText(true);
-              }}
-            >
-              <input
-                type="text"
-                value={typeDraft}
-                onChange={(e) => setTypeDraft(e.target.value)}
-                placeholder="输入文字或验证码发送到页面焦点…"
-                aria-label="向云端浏览器输入文字"
-                className="lb-type-input oc-surface-recessed"
-                data-testid="live-browser-type-input"
-              />
-              <button
-                type="button"
-                disabled={busy || !typeDraft}
-                className="lb-type-btn oc-btn-tactile oc-btn-secondary-craft"
-                data-testid="live-browser-type-send"
-                onClick={() => handleSendText(false)}
-              >
-                <Send size={12} />
-                输入
-              </button>
-              <button
-                type="submit"
-                disabled={busy || !typeDraft}
-                className="lb-type-btn oc-btn-tactile oc-btn-primary-craft"
-                data-primary="true"
-                title="输入并按回车"
-                aria-label="输入并按回车"
-                data-testid="live-browser-type-submit"
-              >
-                <CornerDownLeft size={12} />
-              </button>
-            </form>
-            <div className="lb-keys-row" aria-label="快捷按键">
-              {QUICK_KEYS.map((item) => (
-                <button
-                  key={item.key}
-                  type="button"
-                  disabled={busy}
-                  className="lb-key-chip oc-kbd oc-btn-tactile"
-                  onClick={() => void runAction({ action: "press", key: item.key })}
-                >
-                  {item.label}
-                </button>
-              ))}
-            </div>
-          </div>
+          <LiveBrowserTakeoverDock
+            typeDraft={typeDraft}
+            busy={busy}
+            onTypeDraftChange={setTypeDraft}
+            onSendText={handleSendText}
+            onPressQuickKey={(key) => handleKeyEvent({ action: "press", key })}
+          />
         )}
       </div>
     </>
@@ -1464,13 +1760,12 @@ export function LiveBrowserStage({
             data-testid="live-browser-theater-dialog"
             aria-describedby={undefined}
             onCloseAutoFocus={(e) => {
-              // Restore focus deterministically to the inline expand trigger after portal teardown.
               e.preventDefault();
               window.requestAnimationFrame(() => expandBtnRef.current?.focus());
             }}
             onEscapeKeyDown={(e) => {
-              // If the takeover canvas is focused, first Escape releases keyboard capture without
-              // closing the theater dialog; second Escape closes ONLY this dialog (never parent Sheet).
+              // If stage itself is focused (not imeSink), first Esc releases stage focus;
+              // second Esc collapses ONLY theater dialog (never parent Sheet).
               if (stageRef.current && document.activeElement === stageRef.current) {
                 e.preventDefault();
                 stageRef.current.blur();
@@ -1478,28 +1773,7 @@ export function LiveBrowserStage({
             }}
           >
             <RD.Title className="sr-only">云端实时浏览器放大视图</RD.Title>
-            {expanded ? (
-              <>
-                <div className="lb-theater-bar oc-surface-glass">
-                  <div className="lb-theater-bar-left">
-                    <span
-                      className="lb-live-dot"
-                      data-takeover={effectiveTakeover ? "true" : "false"}
-                      data-busy={lockedByAssistant ? "true" : "false"}
-                      aria-hidden
-                    />
-                    <span className="lb-theater-bar-title">
-                      {state.title || "云端实时浏览器 · 沉浸视口"}
-                    </span>
-                  </div>
-                  <div className="lb-theater-bar-right">
-                    <kbd className="oc-kbd">Esc</kbd>
-                    <span>返回侧栏</span>
-                  </div>
-                </div>
-                {browserShell}
-              </>
-            ) : null}
+            {expanded ? browserShell : null}
           </RD.Content>
         </RD.Portal>
       </RD.Root>

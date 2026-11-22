@@ -30,49 +30,59 @@ import {
   writeFileSync,
 } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { lookup as dnsLookup } from 'node:dns/promises'
 import { createConnection } from 'node:net'
 import { basename, dirname, join } from 'node:path'
+import type { Duplex } from 'node:stream'
+import {
+  LIVE_BROWSER_MAX_URL_CHARS,
+  LiveBrowserError,
+  acquireHumanTakeoverLease,
+  assertLiveBrowserUrlPublic,
+  isPrivateOrReservedIp,
+  readActiveHumanTakeoverLease,
+  releaseHumanTakeoverLease,
+  renewHumanTakeoverLease,
+  validateLiveBrowserUrl,
+} from './liveBrowserSecurity.js'
+import {
+  LiveBrowserStreamManager,
+  type LiveBrowserCdpEndpoint,
+  type LiveBrowserCdpTransport,
+} from './liveBrowserStream.js'
+
+export {
+  LIVE_BROWSER_MAX_URL_CHARS,
+  LiveBrowserError,
+  acquireHumanTakeoverLease,
+  assertLiveBrowserUrlPublic,
+  isPrivateOrReservedIp,
+  readActiveHumanTakeoverLease,
+  releaseHumanTakeoverLease,
+  renewHumanTakeoverLease,
+  validateLiveBrowserUrl,
+}
 
 export const LIVE_BROWSER_AGENT_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/
-export const LIVE_BROWSER_MAX_URL_CHARS = 2048
 export const LIVE_BROWSER_MAX_TYPE_CHARS = 2000
 export const LIVE_BROWSER_MAX_BODY_BYTES = 32 * 1024
-export const LIVE_BROWSER_MAX_QUEUE_DEPTH = 6
+export const LIVE_BROWSER_MAX_QUEUE_DEPTH = 12
 export const LIVE_BROWSER_MAX_IMAGE_BYTES = 900 * 1024 // ~1.2 MiB base64
 const READ_TIMEOUT_MS = 12_000
 const ACTION_TIMEOUT_MS = 20_000
 const EXEC_MAX_BUFFER = 4 * 1024 * 1024
+const DEFAULT_FAST_PATH_SETTLE_MS = 120
 
 const DEFAULT_OC_BROWSER_BIN = '/usr/local/bin/oc-browser'
 const STATE_ROOT = '/tmp/openclaude-playwright-cli'
 
 export const ALLOWED_PRESS_KEYS: ReadonlySet<string> = new Set([
-  'Enter',
-  'Backspace',
-  'Delete',
-  'Tab',
-  'Shift+Tab',
-  'Escape',
-  'Space',
-  ' ',
-  'ArrowUp',
-  'ArrowDown',
-  'ArrowLeft',
-  'ArrowRight',
-  'Home',
-  'End',
-  'PageUp',
-  'PageDown',
-  'Control+a',
-  'Meta+a',
-  'Control+c',
-  'Meta+c',
-  'Control+v',
-  'Meta+v',
-  'Control+x',
-  'Meta+x',
-  'Control+z',
-  'Meta+z',
+  'Enter', 'Backspace', 'Delete', 'Tab', 'Shift+Tab', 'Escape', 'Space', ' ',
+  'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+  'Shift+ArrowUp', 'Shift+ArrowDown', 'Shift+ArrowLeft', 'Shift+ArrowRight',
+  'Home', 'End', 'PageUp', 'PageDown',
+  'Control+a', 'Meta+a', 'Control+c', 'Meta+c', 'Control+v', 'Meta+v',
+  'Control+x', 'Meta+x', 'Control+z', 'Meta+z', 'Control+Shift+z', 'Meta+Shift+z',
 ])
 
 // Match only Playwright / CLI browser-session-absent errors, NEVER webpage network errors
@@ -82,6 +92,8 @@ const SESSION_CLOSED_RE =
 
 const DAEMON_SOCKET_DEAD_RE =
   /\b(?:ENOENT|ECONNREFUSED|ECONNRESET|EPIPE)\b|daemon socket closed/i
+
+const ACTIVITY_LOCK_BUSY_RE = /activity lock busy/i
 
 export interface LiveBrowserTabInfo {
   index: number
@@ -94,6 +106,9 @@ export interface LiveBrowserState {
   available: boolean
   active: boolean
   agentBusy?: boolean
+  streamAvailable?: boolean
+  humanTakeover?: boolean
+  takeoverToken?: string
   url?: string
   title?: string
   viewport?: { width: number; height: number }
@@ -109,28 +124,22 @@ export type LiveBrowserAction =
   | { action: 'goto'; url: string }
   | { action: 'click'; x: number; y: number; normalized?: boolean; button?: 'left' | 'right'; expectedOrigin?: string }
   | { action: 'dblclick'; x: number; y: number; normalized?: boolean; button?: 'left' | 'right'; expectedOrigin?: string }
+  | { action: 'hover'; x: number; y: number; normalized?: boolean; expectedOrigin?: string }
+  | { action: 'drag'; fromX: number; fromY: number; toX: number; toY: number; normalized?: boolean; expectedOrigin?: string }
   | { action: 'wheel'; x?: number; y?: number; normalized?: boolean; deltaX?: number; deltaY: number; expectedOrigin?: string }
   | { action: 'type'; text: string; submit?: boolean; expectedOrigin?: string }
+  | { action: 'paste'; text: string; expectedOrigin?: string }
   | { action: 'press'; key: string; expectedOrigin?: string }
+  | { action: 'takeover'; active: boolean; token?: string }
+  | { action: 'dialog'; accept: boolean; promptText?: string }
   | { action: 'back' }
   | { action: 'forward' }
   | { action: 'reload' }
+  | { action: 'stop' }
   | { action: 'tab_select'; index: number }
   | { action: 'tab_new'; url?: string }
   | { action: 'tab_close'; index?: number }
   | { action: 'close' }
-
-export class LiveBrowserError extends Error {
-  readonly status: number
-  readonly code: string
-
-  constructor(status: number, code: string, message: string) {
-    super(message)
-    this.name = 'LiveBrowserError'
-    this.status = status
-    this.code = code
-  }
-}
 
 export interface LiveBrowserExecResult {
   stdout: string
@@ -166,6 +175,7 @@ export interface LiveBrowserControllerDeps {
   ocBrowserBin?: string
   stateRoot?: string
   browserHome?: string
+  env?: NodeJS.ProcessEnv
   existsSync?: (p: string) => boolean
   execFn?: LiveBrowserExecFn
   resolveDaemonEndpoint?: (stateDir: string) => PlaywrightDaemonEndpoint | null
@@ -173,6 +183,11 @@ export interface LiveBrowserControllerDeps {
   withLock?: PlaywrightLockFn
   readFrameFile?: (filePath: string) => Buffer
   unlinkFrameFile?: (filePath: string) => void
+  dnsLookup?: typeof dnsLookup
+  settleDelayMs?: number
+  discoverCdpEndpoint?: (stateDir: string) => LiveBrowserCdpEndpoint | null
+  connectCdp?: (endpoint: LiveBrowserCdpEndpoint) => Promise<LiveBrowserCdpTransport>
+  isAgentRunning?: (agentId: string) => boolean
 }
 
 const DAEMON_RPC_MAX_BYTES = 4 * 1024 * 1024
@@ -588,26 +603,6 @@ export function isValidLiveBrowserAgentId(agentId: string): boolean {
   return LIVE_BROWSER_AGENT_ID_RE.test(agentId)
 }
 
-export function validateLiveBrowserUrl(raw: unknown): string {
-  if (typeof raw !== 'string') {
-    throw new LiveBrowserError(400, 'INVALID_URL', '请输入有效的 http 或 https 网址')
-  }
-  const trimmed = raw.trim()
-  if (!trimmed || trimmed.length > LIVE_BROWSER_MAX_URL_CHARS || /[\r\n\0]/.test(trimmed)) {
-    throw new LiveBrowserError(400, 'INVALID_URL', '网址格式无效或长度超限')
-  }
-  let parsed: URL
-  try {
-    parsed = new URL(trimmed)
-  } catch {
-    throw new LiveBrowserError(400, 'INVALID_URL', '无法解析该网址，请包含 http:// 或 https://')
-  }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new LiveBrowserError(400, 'UNSAFE_URL_PROTOCOL', `不支持 ${parsed.protocol} 协议，仅允许 http/https`)
-  }
-  return parsed.toString()
-}
-
 function finiteNumber(v: unknown, field: string): number {
   if (typeof v !== 'number' || !Number.isFinite(v)) {
     throw new LiveBrowserError(400, 'INVALID_PARAM', `参数 ${field} 必须为有效数字`)
@@ -660,6 +655,35 @@ export function validateLiveBrowserAction(raw: unknown): LiveBrowserAction {
       const expectedOrigin = optionalExpectedOrigin(obj.expectedOrigin)
       return { action, x, y, normalized, button, ...(expectedOrigin ? { expectedOrigin } : {}) }
     }
+    case 'hover': {
+      const normalized = obj.normalized === true
+      const x = finiteNumber(obj.x, 'x')
+      const y = finiteNumber(obj.y, 'y')
+      if (normalized && (x < 0 || x > 1 || y < 0 || y > 1)) {
+        throw new LiveBrowserError(400, 'INVALID_COORD', '归一化坐标需在 [0, 1] 范围内')
+      }
+      if (!normalized && (x < 0 || x > 8192 || y < 0 || y > 8192)) {
+        throw new LiveBrowserError(400, 'INVALID_COORD', '坐标超出合理范围')
+      }
+      const expectedOrigin = optionalExpectedOrigin(obj.expectedOrigin)
+      return { action: 'hover', x, y, normalized, ...(expectedOrigin ? { expectedOrigin } : {}) }
+    }
+    case 'drag': {
+      const normalized = obj.normalized === true
+      const fromX = finiteNumber(obj.fromX, 'fromX')
+      const fromY = finiteNumber(obj.fromY, 'fromY')
+      const toX = finiteNumber(obj.toX, 'toX')
+      const toY = finiteNumber(obj.toY, 'toY')
+      const coords = [fromX, fromY, toX, toY]
+      if (normalized && coords.some((c) => c < 0 || c > 1)) {
+        throw new LiveBrowserError(400, 'INVALID_COORD', '归一化坐标需在 [0, 1] 范围内')
+      }
+      if (!normalized && coords.some((c) => c < 0 || c > 8192)) {
+        throw new LiveBrowserError(400, 'INVALID_COORD', '拖拽坐标超出合理范围')
+      }
+      const expectedOrigin = optionalExpectedOrigin(obj.expectedOrigin)
+      return { action: 'drag', fromX, fromY, toX, toY, normalized, ...(expectedOrigin ? { expectedOrigin } : {}) }
+    }
     case 'wheel': {
       const normalized = obj.normalized === true
       const deltaY = clamp(finiteNumber(obj.deltaY, 'deltaY'), -4000, 4000)
@@ -687,6 +711,16 @@ export function validateLiveBrowserAction(raw: unknown): LiveBrowserAction {
       const expectedOrigin = optionalExpectedOrigin(obj.expectedOrigin)
       return { action: 'type', text: obj.text, submit: obj.submit === true, ...(expectedOrigin ? { expectedOrigin } : {}) }
     }
+    case 'paste': {
+      if (typeof obj.text !== 'string' || obj.text.length === 0 || obj.text.length > LIVE_BROWSER_MAX_TYPE_CHARS) {
+        throw new LiveBrowserError(400, 'INVALID_TEXT', `粘贴文本长度需在 1~${LIVE_BROWSER_MAX_TYPE_CHARS} 字符内`)
+      }
+      if (obj.text.includes('\0')) {
+        throw new LiveBrowserError(400, 'INVALID_TEXT', '粘贴文本包含非法字符')
+      }
+      const expectedOrigin = optionalExpectedOrigin(obj.expectedOrigin)
+      return { action: 'paste', text: obj.text, ...(expectedOrigin ? { expectedOrigin } : {}) }
+    }
     case 'press': {
       if (typeof obj.key !== 'string' || !ALLOWED_PRESS_KEYS.has(obj.key)) {
         throw new LiveBrowserError(400, 'INVALID_KEY', '不支持该按键指令')
@@ -694,9 +728,18 @@ export function validateLiveBrowserAction(raw: unknown): LiveBrowserAction {
       const expectedOrigin = optionalExpectedOrigin(obj.expectedOrigin)
       return { action: 'press', key: obj.key, ...(expectedOrigin ? { expectedOrigin } : {}) }
     }
+    case 'takeover': {
+      const token = typeof obj.token === 'string' && obj.token.trim() ? obj.token.trim().slice(0, 64) : undefined
+      return { action: 'takeover', active: obj.active === true, ...(token ? { token } : {}) }
+    }
+    case 'dialog': {
+      const promptText = typeof obj.promptText === 'string' ? obj.promptText.slice(0, 512) : undefined
+      return { action: 'dialog', accept: obj.accept === true, ...(promptText !== undefined ? { promptText } : {}) }
+    }
     case 'back':
     case 'forward':
     case 'reload':
+    case 'stop':
     case 'close':
       return { action }
     case 'tab_select': {
@@ -778,9 +821,16 @@ export function buildPlaywrightRunCodeScript(
     return pages.includes(p) ? p : (pages[pages.length - 1] || p);
   };
   let activePage = resolveTarget(page);
+  const readCssViewport = async (pg) => {
+    try {
+      const css = await pg.evaluate(() => ({ width: Math.round(window.innerWidth || 0), height: Math.round(window.innerHeight || 0) }));
+      if (css && css.width >= 64 && css.height >= 64) return css;
+    } catch {}
+    return pg.viewportSize() || { width: 1280, height: 720 };
+  };
   if (P.mode === 'action' && P.op) {
     const op = P.op;
-    const vp = activePage.viewportSize() || { width: 1280, height: 720 };
+    const vp = await readCssViewport(activePage);
     const toPx = (x, y, norm) => ({
       px: Math.max(1, Math.min(vp.width - 1, Math.round(norm ? x * vp.width : x))),
       py: Math.max(1, Math.min(vp.height - 1, Math.round(norm ? y * vp.height : y))),
@@ -793,6 +843,20 @@ export function buildPlaywrightRunCodeScript(
       await activePage.goForward({ waitUntil: 'domcontentloaded', timeout: 10000 });
     } else if (op.action === 'reload') {
       await activePage.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
+    } else if (op.action === 'stop') {
+      try { await activePage.evaluate(() => window.stop()); } catch {}
+    } else if (op.action === 'hover') {
+      const { px, py } = toPx(op.x, op.y, !!op.normalized);
+      await activePage.mouse.move(px, py);
+      await activePage.waitForTimeout(80);
+    } else if (op.action === 'drag') {
+      const a = toPx(op.fromX, op.fromY, !!op.normalized);
+      const b = toPx(op.toX, op.toY, !!op.normalized);
+      await activePage.mouse.move(a.px, a.py);
+      await activePage.mouse.down({ button: 'left' });
+      await activePage.mouse.move(b.px, b.py, { steps: 10 });
+      await activePage.mouse.up({ button: 'left' });
+      await activePage.waitForTimeout(140);
     } else if (op.action === 'click' || op.action === 'dblclick') {
       const { px, py } = toPx(op.x, op.y, !!op.normalized);
       const clickOpts = { button: op.button === 'right' ? 'right' : 'left' };
@@ -810,6 +874,9 @@ export function buildPlaywrightRunCodeScript(
       await activePage.keyboard.insertText(op.text);
       if (op.submit) await activePage.keyboard.press('Enter');
       await activePage.waitForTimeout(140);
+    } else if (op.action === 'paste') {
+      await activePage.keyboard.insertText(op.text);
+      await activePage.waitForTimeout(140);
     } else if (op.action === 'press') {
       await activePage.keyboard.press(op.key);
       await activePage.waitForTimeout(120);
@@ -824,7 +891,7 @@ export function buildPlaywrightRunCodeScript(
     try { t = await pg.title(); } catch {}
     tabs.push({ index: i, title: String(t || '').slice(0, 120), url: String(pg.url() || '').slice(0, 512), active: pg === activePage });
   }
-  const viewport = activePage.viewportSize() || { width: 1280, height: 720 };
+  const viewport = await readCssViewport(activePage);
   let title = '';
   try { title = await activePage.title(); } catch {}
   let imageBase64 = undefined;
@@ -856,6 +923,7 @@ interface AgentQueueState {
 
 interface AgentMetaCache {
   viewport: { width: number; height: number }
+  viewportSource?: 'css' | 'png'
   tabs: LiveBrowserTabInfo[]
   url: string
   title: string
@@ -865,6 +933,7 @@ export class LiveBrowserController {
   private readonly bin: string
   private readonly stateRoot: string
   private readonly browserHome: string
+  private readonly injectedEnv?: NodeJS.ProcessEnv
   private readonly checkExists: (p: string) => boolean
   private readonly execFn: LiveBrowserExecFn
   private readonly resolveDaemon: (stateDir: string) => PlaywrightDaemonEndpoint | null
@@ -872,6 +941,10 @@ export class LiveBrowserController {
   private readonly lockFn: PlaywrightLockFn
   private readonly readFrame: (filePath: string) => Buffer
   private readonly unlinkFrame: (filePath: string) => void
+  private readonly dnsLookup?: typeof dnsLookup
+  private readonly settleDelayMs: number
+  private readonly streamManager: LiveBrowserStreamManager
+  private agentRunningCheck?: (agentId: string) => boolean
   private readonly queues = new Map<string, AgentQueueState>()
   private readonly metaCache = new Map<string, AgentMetaCache>()
   private shotSeq = 0
@@ -879,6 +952,7 @@ export class LiveBrowserController {
   constructor(deps: LiveBrowserControllerDeps = {}) {
     this.bin = deps.ocBrowserBin ?? DEFAULT_OC_BROWSER_BIN
     this.stateRoot = deps.stateRoot ?? STATE_ROOT
+    this.injectedEnv = deps.env
     this.browserHome = deps.browserHome ?? process.env.OPENCLAUDE_HOME ?? '/home/agent/.openclaude'
     this.checkExists = deps.existsSync ?? existsSync
     this.execFn = deps.execFn ?? defaultExecFn
@@ -900,6 +974,69 @@ export class LiveBrowserController {
           // Best-effort temp cleanup.
         }
       })
+    this.dnsLookup = deps.dnsLookup
+    this.settleDelayMs = deps.settleDelayMs ?? DEFAULT_FAST_PATH_SETTLE_MS
+    this.agentRunningCheck = deps.isAgentRunning
+    this.streamManager = new LiveBrowserStreamManager({
+      getEnv: () => this.injectedEnv ?? this.envFor('main'),
+      stateDirFor: (id) => this.stateDirFor(id),
+      touchActivity: (id) => this.touchActivity(id),
+      isAgentBusy: (id) => Boolean(this.agentRunningCheck?.(id)) || this.isExternalCliActive(id),
+      isBrowserProcessActive: (id) => this.isSessionActive(id) || Boolean(this.daemonEndpointFor(id)),
+      openBrowser: async (id, url) => { await this.performAction(id, { action: 'open', ...(url ? { url } : {}) }) },
+      closeBrowser: async (id) => { await this.performAction(id, { action: 'close' }) },
+      syncDaemonTab: (id, op) => this.syncDaemonActiveTab(id, op),
+      dnsLookup: deps.dnsLookup,
+      discoverCdpEndpoint: deps.discoverCdpEndpoint,
+      connectCdp: deps.connectCdp,
+    })
+  }
+
+  setAgentRunningCheck(fn: (agentId: string) => boolean): void { this.agentRunningCheck = fn }
+  setUpgradeAuthCheck(fn: (req: IncomingMessage) => boolean): void { this.streamManager.setUpgradeAuthCheck(fn) }
+  setCommercialMasterMode(enabled: boolean): void { this.streamManager.setCommercialMasterMode(enabled) }
+
+  private async syncDaemonActiveTab(
+    agentId: string,
+    op: { index: number; url?: string; occurrenceIndex?: number },
+  ): Promise<void> {
+    const endpoint = this.daemonEndpointFor(agentId)
+    if (endpoint) {
+      await this.lockFn(endpoint.stateDir, async () => {
+        const rpcOpts = { cwd: this.browserHome, timeoutMs: READ_TIMEOUT_MS }
+        let targetIdx = op.index
+        if (op.url) {
+          const tabRes = await this.daemonRpc(endpoint, { _: ['tab-list'] }, rpcOpts)
+          const parsedTabs = parsePlaywrightTabList(tabRes.text)
+          const atIdx = parsedTabs.find((t) => t.index === op.index)
+          if (atIdx && atIdx.url === op.url) {
+            targetIdx = atIdx.index
+          } else {
+            const sameUrl = parsedTabs.filter((t) => t.url === op.url)
+            const matched = sameUrl[op.occurrenceIndex ?? 0] ?? sameUrl[0]
+            if (matched) targetIdx = matched.index
+          }
+        }
+        await this.daemonRpc(endpoint, { _: ['tab-select', String(targetIdx)] }, rpcOpts)
+      })
+      return
+    }
+    if (this.isSessionActive(agentId)) {
+      await this.execFn(this.bin, ['tab-select', String(op.index)], { env: this.envFor(agentId), timeout: READ_TIMEOUT_MS, maxBuffer: EXEC_MAX_BUFFER })
+    }
+  }
+
+  handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): boolean {
+    return this.streamManager.handleUpgrade(req, socket, head)
+  }
+
+  async shutdown(): Promise<void> {
+    await this.streamManager.shutdown()
+    this.metaCache.clear()
+  }
+
+  isHumanTakeoverActive(agentId: string): boolean {
+    return Boolean(readActiveHumanTakeoverLease(this.stateDirFor(agentId)))
   }
 
   isAvailable(): boolean {
@@ -937,9 +1074,10 @@ export class LiveBrowserController {
 
   private envFor(agentId: string): NodeJS.ProcessEnv {
     return {
-      ...process.env,
+      ...(this.injectedEnv ?? process.env),
       OPENCLAUDE_AGENT_ID: agentId,
       OC_AGENT_ID: agentId,
+      OPENCLAUDE_LIVE_BROWSER_INTERNAL: '1',
     }
   }
 
@@ -1053,9 +1191,9 @@ export class LiveBrowserController {
         await this.daemonRpc(endpoint, { _: ['screenshot'], filename: shotPath }, rpcOpts)
         const buf = this.readFrame(shotPath)
         const pngDims = readPngDimensions(buf)
-        if (pngDims) {
+        if (pngDims && cached?.viewportSource !== 'css') {
           viewport = pngDims
-          this.metaCache.set(agentId, { viewport, tabs, url, title })
+          this.metaCache.set(agentId, { viewport, viewportSource: 'png', tabs, url, title })
         }
         if (buf.length > 0 && buf.length <= LIVE_BROWSER_MAX_IMAGE_BYTES) {
           imageBase64 = buf.toString('base64')
@@ -1075,6 +1213,7 @@ export class LiveBrowserController {
             if (state.viewport && state.tabs) {
               this.metaCache.set(agentId, {
                 viewport: state.viewport,
+                viewportSource: 'css',
                 tabs: state.tabs,
                 url: state.url ?? url,
                 title: state.title ?? title,
@@ -1113,7 +1252,7 @@ export class LiveBrowserController {
   private performActionViaDaemon(
     agentId: string,
     endpoint: PlaywrightDaemonEndpoint,
-    action: Exclude<LiveBrowserAction, { action: 'close' | 'open' }>,
+    action: Exclude<LiveBrowserAction, { action: 'close' | 'open' | 'takeover' | 'dialog' }>,
   ): Promise<LiveBrowserState> {
     return this.lockFn(endpoint.stateDir, async () => {
       // Re-verify external CLI ownership AFTER acquiring cross-process flock so a CLI
@@ -1138,8 +1277,13 @@ export class LiveBrowserController {
         py: clamp(Math.round(norm ? y * vp.height : y), 1, Math.max(1, vp.height - 1)),
       })
 
-      // Authentic DOM dblclick (clickCount=2): run via Playwright run-code over the fast socket.
-      if (action.action === 'dblclick') {
+      // Authentic DOM dblclick / drag / paste / stop: run via Playwright run-code over the fast socket.
+      if (
+        action.action === 'dblclick' ||
+        action.action === 'drag' ||
+        action.action === 'paste' ||
+        action.action === 'stop'
+      ) {
         const script = buildPlaywrightRunCodeScript({
           mode: 'action',
           includeFrame: true,
@@ -1152,6 +1296,7 @@ export class LiveBrowserController {
         if (state.active && state.viewport && state.tabs) {
           this.metaCache.set(agentId, {
             viewport: state.viewport,
+            viewportSource: 'css',
             tabs: state.tabs,
             url: state.url ?? '',
             title: state.title ?? '',
@@ -1162,6 +1307,7 @@ export class LiveBrowserController {
       }
 
       let reuseTabs = false
+      let needsSettle = false
       switch (action.action) {
         case 'goto':
           await this.daemonRpc(endpoint, { _: ['goto', action.url] }, rpcOpts)
@@ -1175,12 +1321,20 @@ export class LiveBrowserController {
         case 'reload':
           await this.daemonRpc(endpoint, { _: ['reload'] }, rpcOpts)
           break
+        case 'hover': {
+          const { px, py } = toPx(action.x, action.y, action.normalized)
+          await this.daemonRpc(endpoint, { _: ['mousemove', String(px), String(py)] }, rpcOpts)
+          reuseTabs = true
+          needsSettle = true
+          break
+        }
         case 'click': {
           const { px, py } = toPx(action.x, action.y, action.normalized)
           const btn = action.button === 'right' ? 'right' : 'left'
           await this.daemonRpc(endpoint, { _: ['mousemove', String(px), String(py)] }, rpcOpts)
           await this.daemonRpc(endpoint, { _: btn === 'right' ? ['mousedown', 'right'] : ['mousedown'] }, rpcOpts)
           await this.daemonRpc(endpoint, { _: btn === 'right' ? ['mouseup', 'right'] : ['mouseup'] }, rpcOpts)
+          needsSettle = true
           break
         }
         case 'wheel': {
@@ -1194,6 +1348,7 @@ export class LiveBrowserController {
             rpcOpts,
           )
           reuseTabs = true
+          needsSettle = true
           break
         }
         case 'type': {
@@ -1203,11 +1358,13 @@ export class LiveBrowserController {
           } else {
             reuseTabs = true
           }
+          needsSettle = true
           break
         }
         case 'press': {
           await this.daemonRpc(endpoint, { _: ['press', action.key] }, rpcOpts)
           reuseTabs = action.key !== 'Enter'
+          needsSettle = true
           break
         }
         case 'tab_select':
@@ -1223,6 +1380,10 @@ export class LiveBrowserController {
             rpcOpts,
           )
           break
+      }
+
+      if (needsSettle && this.settleDelayMs > 0) {
+        await new Promise((r) => setTimeout(r, this.settleDelayMs))
       }
 
       return this.captureViaDaemonLocked(agentId, endpoint, {
@@ -1271,6 +1432,25 @@ export class LiveBrowserController {
           })
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
+          if (ACTIVITY_LOCK_BUSY_RE.test(msg)) {
+            const cached = this.metaCache.get(agentId)
+            return {
+              available: true,
+              active: true,
+              agentBusy: true,
+              streamAvailable: true,
+              humanTakeover: this.isHumanTakeoverActive(agentId),
+              ...(cached
+                ? {
+                    url: cached.url,
+                    title: cached.title,
+                    viewport: cached.viewport,
+                    tabs: cached.tabs,
+                  }
+                : {}),
+              capturedAt: Date.now(),
+            }
+          }
           if (SESSION_CLOSED_RE.test(msg) || DAEMON_SOCKET_DEAD_RE.test(msg)) {
             this.metaCache.delete(agentId)
             return { available: true, active: false }
@@ -1367,16 +1547,73 @@ export class LiveBrowserController {
       throw new LiveBrowserError(503, 'BROWSER_UNAVAILABLE', '当前环境未启用云端浏览器')
     }
 
+    // Async DNS SSRF verification for any navigation URL before touching the browser.
+    if (
+      (action.action === 'open' || action.action === 'goto' || action.action === 'tab_new') &&
+      action.url
+    ) {
+      await assertLiveBrowserUrlPublic(action.url, { lookup: this.dnsLookup })
+    }
+
+    // Explicit human takeover lease management (R2 #5: strictly mutually exclusive acquire).
+    if (action.action === 'takeover') {
+      const stateDir = this.stateDirFor(agentId)
+      let takeoverToken: string | undefined
+      if (action.active) {
+        if (this.isExternalCliActive(agentId) || this.agentRunningCheck?.(agentId)) {
+          throw new LiveBrowserError(409, 'AGENT_RUNNING', '助手正在操作浏览器，请等待当前浏览器操作完成后再接管')
+        }
+        const lease = acquireHumanTakeoverLease(stateDir, { token: action.token })
+        takeoverToken = lease.token
+      } else {
+        releaseHumanTakeoverLease(stateDir, action.token)
+        if (readActiveHumanTakeoverLease(stateDir)) {
+          throw new LiveBrowserError(409, 'TAKEOVER_TOKEN_MISMATCH', '接管租约归属不匹配，无法释放')
+        }
+      }
+      const state = await this.getLiveState(agentId, { includeFrame: false })
+      return {
+        ...state,
+        streamAvailable: true,
+        humanTakeover: this.isHumanTakeoverActive(agentId),
+        ...(takeoverToken ? { takeoverToken } : {}),
+      }
+    }
+
+    const rawObj = rawAction && typeof rawAction === 'object' && !Array.isArray(rawAction) ? (rawAction as Record<string, unknown>) : null
+    const callerTakeoverToken =
+      typeof rawObj?.takeoverToken === 'string' && rawObj.takeoverToken.trim()
+        ? rawObj.takeoverToken.trim().slice(0, 64)
+        : undefined
+    const verifyCallerTakeoverToken = () => {
+      if (!callerTakeoverToken) return
+      const activeLease = readActiveHumanTakeoverLease(this.stateDirFor(agentId))
+      if (!activeLease || activeLease.token !== callerTakeoverToken) {
+        throw new LiveBrowserError(409, 'TAKEOVER_TOKEN_MISMATCH', '接管租约已失效或已被其他连接独占接管')
+      }
+    }
+    verifyCallerTakeoverToken()
+
+    if (action.action === 'dialog') {
+      await this.streamManager.handleDialogViaActiveStream(agentId, action.accept, action.promptText)
+      const state = await this.getLiveState(agentId, { includeFrame: true })
+      return {
+        ...state,
+        streamAvailable: true,
+        humanTakeover: this.isHumanTakeoverActive(agentId),
+      }
+    }
+
     // Invalidate any pre-action coalesced read so subsequent polls wait for the post-action frame.
     const existingQueue = this.queues.get(agentId)
     if (existingQueue) existingQueue.inFlightRead = null
 
     return this.enqueue(agentId, async (): Promise<LiveBrowserState> => {
-      // Re-verify external CLI ownership right at the serialized execution boundary so a
-      // queued human action cannot slip onto a page that the assistant just started navigating.
-      if (this.isExternalCliActive(agentId)) {
+      // Re-verify external CLI, active agent turn, and takeover token right at the serialized boundary.
+      if (this.isExternalCliActive(agentId) || Boolean(this.agentRunningCheck?.(agentId))) {
         throw new LiveBrowserError(409, 'AGENT_RUNNING', '助手正在操作浏览器，请等待当前浏览器操作完成后再接管')
       }
+      verifyCallerTakeoverToken()
       const env = this.envFor(agentId)
       if (action.action === 'close') {
         this.metaCache.delete(agentId)
@@ -1467,6 +1704,13 @@ export class LiveBrowserController {
         } catch (err) {
           if (err instanceof LiveBrowserError) throw err
           const msg = err instanceof Error ? err.message : String(err)
+          if (ACTIVITY_LOCK_BUSY_RE.test(msg)) {
+            throw new LiveBrowserError(
+              409,
+              'AGENT_RUNNING',
+              '助手正在操作浏览器，请等待当前浏览器操作完成后再接管',
+            )
+          }
           if (SESSION_CLOSED_RE.test(msg) || DAEMON_SOCKET_DEAD_RE.test(msg)) {
             this.metaCache.delete(agentId)
             if (action.action === 'goto') {
@@ -1609,9 +1853,17 @@ export async function handleLiveBrowserLiveHttp(
   const quality = parsedQuality !== undefined && Number.isFinite(parsedQuality) ? parsedQuality : undefined
   try {
     const state = await host.controller.getLiveState(agentId, { includeFrame, quality })
-    const agentBusy = Boolean(host.isAgentRunning?.(agentId)) || host.controller.isExternalCliActive(agentId)
+    const agentBusy =
+      Boolean(state.agentBusy) ||
+      Boolean(host.isAgentRunning?.(agentId)) ||
+      host.controller.isExternalCliActive(agentId)
     res.setHeader('Cache-Control', 'no-store')
-    host.sendJson(res, 200, { ...state, agentBusy })
+    host.sendJson(res, 200, {
+      ...state,
+      agentBusy,
+      streamAvailable: true,
+      humanTakeover: host.controller.isHumanTakeoverActive(agentId),
+    })
   } catch (err) {
     if (err instanceof LiveBrowserError) {
       host.sendJson(res, err.status, { error: err.message, code: err.code })
@@ -1635,7 +1887,8 @@ export async function handleLiveBrowserActionHttp(
     host.sendJson(res, 404, { error: '智能体不存在', code: 'AGENT_NOT_FOUND' })
     return
   }
-  if (host.isAgentRunning?.(agentId) || host.controller.isExternalCliActive(agentId)) {
+  const agentBusy = Boolean(host.isAgentRunning?.(agentId) || host.controller.isExternalCliActive(agentId))
+  if (agentBusy && !host.readBody && typeof (req as { on?: unknown }).on !== 'function') {
     host.sendJson(res, 409, {
       error: '助手正在操作浏览器，请等待当前浏览器操作完成后再接管',
       code: 'AGENT_RUNNING',
@@ -1662,10 +1915,25 @@ export async function handleLiveBrowserActionHttp(
     host.sendJson(res, 400, { error: '请求体不是有效的 JSON', code: 'INVALID_JSON' })
     return
   }
+  const isTakeoverRelease =
+    Boolean(parsed && typeof parsed === 'object' && !Array.isArray(parsed)) &&
+    (parsed as Record<string, unknown>).action === 'takeover' &&
+    (parsed as Record<string, unknown>).active === false
+  if (!isTakeoverRelease && agentBusy) {
+    host.sendJson(res, 409, {
+      error: '助手正在操作浏览器，请等待当前浏览器操作完成后再接管',
+      code: 'AGENT_RUNNING',
+    })
+    return
+  }
   try {
     const state = await host.controller.performAction(agentId, parsed)
     res.setHeader('Cache-Control', 'no-store')
-    host.sendJson(res, 200, state)
+    host.sendJson(res, 200, {
+      ...state,
+      streamAvailable: true,
+      humanTakeover: host.controller.isHumanTakeoverActive(agentId),
+    })
   } catch (err) {
     if (err instanceof LiveBrowserError) {
       host.sendJson(res, err.status, { error: err.message, code: err.code })

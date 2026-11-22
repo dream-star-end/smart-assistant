@@ -6,9 +6,10 @@
  * 数据全部来自 browserSteps.collectBrowserSteps;不新增请求,截图走现有的签名媒体通道。
  */
 import { ArrowDownToLine, ChevronRight, Globe, ImageOff } from "lucide-react";
-import { Suspense, lazy, useEffect, useState } from "react";
+import { lazy, useEffect, useState } from "react";
 import type { AuthSession } from "../../lib/types";
 import { cn } from "../../lib/utils";
+import { LazyBoundary } from "../ChunkErrorBoundary";
 import { ActionTrail, AddressBar, PlainSignedImg, ShotThumb } from "../tool/BrowserStepCard";
 import { type BrowserTurnStep, collectBrowserSteps, displayAddress } from "../tool/browserSteps";
 import type { ToolLike } from "../tool/format";
@@ -329,8 +330,14 @@ export function BrowserView({
     if (liveEnabled && liveHandoff) setMode("live");
   }, [liveEnabled, liveHandoff?.nonce]);
 
-  if (!turn && !liveEnabled) return null;
   const effectiveMode: "live" | "steps" = !liveEnabled ? "steps" : stepCount === 0 ? "live" : mode;
+  // 隐藏保活：一旦挂载过「实时视口」，切到「步骤记录」时仅隐藏而不卸载，避免 WS 断连丢失接管状态。
+  const [liveMounted, setLiveMounted] = useState(() => liveEnabled && effectiveMode === "live");
+  useEffect(() => {
+    if (liveEnabled && effectiveMode === "live") setLiveMounted(true);
+  }, [liveEnabled, effectiveMode]);
+
+  if (!turn && !liveEnabled) return null;
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto" data-testid="browser-view">
@@ -365,30 +372,39 @@ export function BrowserView({
         </div>
       )}
 
-      {effectiveMode === "live" && liveBrowserAgentId && liveBrowserAuth ? (
-        <Suspense
-          fallback={
-            <div className="lb-root">
-              <div className="oc-surface-card flex items-center justify-center gap-2.5 rounded-lg px-4 py-8 text-meta text-muted">
-                <span aria-hidden className="oc-icon-badge oc-icon-badge-accent size-8 rounded-md">
-                  <Spinner size={14} />
-                </span>
-                正在加载实时浏览器…
-              </div>
-            </div>
-          }
+      {liveMounted && liveBrowserAgentId && liveBrowserAuth && (
+        <div
+          className={effectiveMode === "live" ? undefined : "hidden"}
+          aria-hidden={effectiveMode !== "live" || undefined}
+          data-testid="browser-live-keepalive"
         >
-          <LiveBrowserStage
-            agentId={liveBrowserAgentId}
-            auth={liveBrowserAuth}
-            running={liveRunning ?? running}
-            handoffRequest={liveHandoff}
-            onHandoffSettled={onHandoffSettled}
-            onHandBackToComposer={onAnnotateToComposer}
-            onActiveStateChange={setLiveActive}
-          />
-        </Suspense>
-      ) : turn ? (
+          <LazyBoundary
+            fallback={
+              <div className="lb-root">
+                <div className="oc-surface-card flex items-center justify-center gap-2.5 rounded-lg px-4 py-8 text-meta text-muted">
+                  <span aria-hidden className="oc-icon-badge oc-icon-badge-accent size-8 rounded-md">
+                    <Spinner size={14} />
+                  </span>
+                  正在加载实时浏览器…
+                </div>
+              </div>
+            }
+          >
+            <LiveBrowserStage
+              agentId={liveBrowserAgentId}
+              auth={liveBrowserAuth}
+              running={liveRunning ?? running}
+              hidden={effectiveMode !== "live"}
+              handoffRequest={liveHandoff}
+              onHandoffSettled={onHandoffSettled}
+              onHandBackToComposer={onAnnotateToComposer}
+              onActiveStateChange={setLiveActive}
+            />
+          </LazyBoundary>
+        </div>
+      )}
+
+      {effectiveMode === "steps" && turn ? (
         /* key:换轮 / 换入口时选中重置。 */
         <TurnBrowser
           key={`${turn.key}:${focusId ?? ""}`}

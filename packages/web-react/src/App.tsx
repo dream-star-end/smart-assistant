@@ -340,8 +340,8 @@ export function App() {
   isWideRef.current = isWideViewport;
   /** 从面板外打开 / 定位面板:宽屏展开内联列,窄屏弹出贴底面板。 */
   const openPane = useCallback(
-    (tab?: PaneTab, message?: ToolLike | null, liveBrowser?: PaneRequest["liveBrowser"]) => {
-      setPaneRequest((prev) => ({ tab, message, liveBrowser, nonce: Math.max(Date.now(), (prev?.nonce ?? 0) + 1), sessionId: activeIdRef.current }));
+    (tab?: PaneTab, message?: ToolLike | null, liveBrowser?: PaneRequest["liveBrowser"], targetSessionId?: string | null) => {
+      setPaneRequest((prev) => ({ tab, message, liveBrowser, nonce: Math.max(Date.now(), (prev?.nonce ?? 0) + 1), sessionId: targetSessionId !== undefined ? targetSessionId : activeIdRef.current }));
       if (isWideRef.current) setPaneOpen(true);
       else setPaneSheetOpen(true);
     },
@@ -1200,7 +1200,7 @@ export function App() {
   activeIdRef.current = activeId ?? null;
   // 详情面板可用 = 对话视图(非任务看板 / 项目主页)里有会话内容;demo 只在点了某张工具卡时出现。
   const paneAvailable =
-    !boardOpen && !sitesOpen && !projectHome && (demo ? !!paneRequest?.message : !!activeId && wsMessages.length > 0);
+    !boardOpen && !sitesOpen && !projectHome && (demo ? !!paneRequest?.message : (!!activeId && wsMessages.length > 0) || Boolean(auth && agent.id));
   const paneRequestHere = paneRequestForSession(paneRequest, activeId);
   const paneInline = paneAvailable && isWideViewport && paneOpen;
   useEffect(() => {
@@ -2127,7 +2127,7 @@ export function App() {
     loadingArchived,
     onSearchMessages: searchSessionMessages,
     onOpenPalette: closeMobileThen(() => setPaletteOpen(true)),
-    onOpenLiveBrowser: demo ? undefined : (opts?: { url?: string; sessionId?: string | null }) => { setMobileNavOpen(false); if (opts?.sessionId && sessions.some((s) => s.id === opts.sessionId)) selectSession(opts.sessionId); openPane("browser", null, opts?.url ? { url: opts.url } : undefined); },
+    onOpenLiveBrowser: demo ? undefined : (opts?: { url?: string; sessionId?: string | null }) => { setMobileNavOpen(false); const targetSid = opts?.sessionId && sessions.some((s) => s.id === opts.sessionId) ? opts.sessionId : undefined; if (targetSid) selectSession(targetSid); openPane("browser", null, { takeover: true, expand: true, ...(opts?.url ? { url: opts.url } : {}) }, targetSid); },
   };
   return (
     <MediaSignProvider
