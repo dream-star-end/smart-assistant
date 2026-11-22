@@ -83,6 +83,8 @@ export type NotifyClaimFence = {
   aAttemptedAt?: () => number | undefined
   /** Signal that master rejected this epoch's clientMessageId as terminal `previously_failed`. */
   notePreviouslyFailed?: () => void
+  /** Signal that the origin session is permanently gone (e.g. Master 404 SESSION_GONE). */
+  noteTerminalGone?: () => void
 }
 
 export type InlinePushRuntime = {
@@ -296,7 +298,10 @@ export class DefaultEngineNotifier implements EngineNotifier {
         notifyClaimFenceOf(event)?.notePreviouslyFailed?.()
         return { ok: false, failureClass: result.failureClass ?? 'transport' }
       }
-      if (result.gone) return { ok: false, failureClass: result.failureClass ?? 'transport' }
+      if (result.gone) {
+        notifyClaimFenceOf(event)?.noteTerminalGone?.()
+        return { ok: false, failureClass: result.failureClass ?? 'transport' }
+      }
       if (result.busy) return { ok: false, failureClass: result.failureClass ?? 'internal' }
       return { ok: false, failureClass: result.failureClass ?? 'transport' }
     } catch {

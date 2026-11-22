@@ -1358,7 +1358,7 @@ export function _armNotifyRetryScheduler(this: GatewayLifecycleHost): void {
     clearTimeout(this._notifyRetryTimer)
     this._notifyRetryTimer = undefined
   }
-  if (!this._delegateJobs) return
+  if (this._shuttingDown || !this._delegateJobs) return
   const notifierOn = isDelegateNotifierEffective()
   const handoffDelay = notifierOn ? undefined : handedOffDelegateRetryDelay(this._delegateJobs)
   const cronDelay = !notifierOn && isDelegateDurableEffective()
@@ -1379,7 +1379,9 @@ export function _armNotifyRetryScheduler(this: GatewayLifecycleHost): void {
           this._drainFlagOffCronOriginNotifies({ dueOnly: true }),
           retryHandedOffDelegateNotifies(this),
         ])
-    void work.finally(() => this._armNotifyRetryScheduler())
+    void work.finally(() => {
+      if (!this._shuttingDown) this._armNotifyRetryScheduler()
+    })
   }, delay)
   this._notifyRetryTimer.unref()
 }

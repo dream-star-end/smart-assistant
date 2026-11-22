@@ -8,6 +8,8 @@ import {
   type DelegateCallbackState,
   type DelegateJobState,
 } from '@openclaude/protocol'
+import type { DelegateJobSnapshot } from './delegateJobs.js'
+import { resolveDelegateCallbackOwner } from './delegateSmFlag.js'
 
 export type IntentRecoveryAction =
   | { action: 'legacy_interrupt' }
@@ -38,4 +40,32 @@ export function decideSendToAgentIntentRecovery(opts: {
     return { action: 'ack_delivered' }
   }
   return { action: 'ensure_callback', jobId: opts.job.jobId, state: opts.job.state }
+}
+
+/**
+ * Shared ownership predicate for flag-off (`OC_DELEGATE_NOTIFIER=0`)
+ * `origin-inject` job-row delivery and retry scheduling.
+ *
+ * - `kind === 'delegate'` with `callbackOriginSessionKey` (dynamic MCP wait
+ *   handoff) is always job-row owned regardless of `callbackOwner`.
+ * - `kind === 'send_to_agent'` is job-row owned ONLY when
+ *   `callbackOwner === 'job'`. When `callbackOwner === 'intent'` and
+ *   `NOTIFIER=0`, the legacy intent path owns delivery (`sta-cb-{jobId}` and
+ *   intent file removal without advancing `delegate_jobs.callback_state`), so
+ *   both row selection and dispatch must skip these rows to prevent duplicate
+ *   delivery with a fresh `dlgcb-*` id on timer tick or restart.
+ */
+export function isFlagOffJobOwnedOriginInject(
+  job: Pick<
+    DelegateJobSnapshot,
+    'kind' | 'callback' | 'callbackOriginSessionKey' | 'parentSessionKey'
+  >,
+  callbackOwner: 'job' | 'intent' = resolveDelegateCallbackOwner(),
+): boolean {
+  if (job.callback !== 'origin-inject') return false
+  if (job.kind === 'delegate') return Boolean(job.callbackOriginSessionKey)
+  if (job.kind === 'send_to_agent') {
+    return callbackOwner === 'job' && Boolean(job.callbackOriginSessionKey || job.parentSessionKey)
+  }
+  return false
 }

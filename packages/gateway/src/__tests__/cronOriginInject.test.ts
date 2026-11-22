@@ -72,6 +72,20 @@ describe('postCronOriginInject', () => {
       fetcher: mockFetcher([], 404),
     })
     assert.deepEqual(r404, { kind: 'gone' })
+    const r404SessionGone = await postCronOriginInject(PAYLOAD, {
+      config: CONFIG,
+      fetcher: mockFetcher([], 404, {
+        error: { code: 'SESSION_GONE', message: 'origin session missing or deleted' },
+      }),
+    })
+    assert.deepEqual(r404SessionGone, { kind: 'gone' })
+    const r404Other = await postCronOriginInject(PAYLOAD, {
+      config: CONFIG,
+      fetcher: mockFetcher([], 404, {
+        error: { code: 'NOT_FOUND', message: 'route missing' },
+      }),
+    })
+    assert.deepEqual(r404Other, { kind: 'retryable', code: 'HTTP_404' })
     const r409 = await postCronOriginInject(PAYLOAD, {
       config: CONFIG,
       fetcher: mockFetcher([], 409),

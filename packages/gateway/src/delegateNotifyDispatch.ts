@@ -171,6 +171,7 @@ export async function dispatchJobTerminalNotify(
   let deliveryToken: string | undefined
   let claimedLive = live
   let previouslyFailed = false
+  let terminalGone = false
   if (owned) {
     const claimed = store.claimNotifyDelivery(job.id, fenceOf(live))
     if (!claimed.ok) return { skipped: true, reason: 'lost_claim' }
@@ -214,6 +215,9 @@ export async function dispatchJobTerminalNotify(
       notePreviouslyFailed: () => {
         previouslyFailed = true
       },
+      noteTerminalGone: () => {
+        terminalGone = true
+      },
     }
     Object.defineProperty(event, NOTIFY_CLAIM_FENCE, {
       value: fence,
@@ -231,20 +235,23 @@ export async function dispatchJobTerminalNotify(
     if (owned && deliveryToken) {
       const latest = store.snapshotOf(job.id)
       if (latest?.callbackState !== 'delivered') {
-        store.releaseNotifyClaim(job.id, deliveryToken, fenceOf(live))
+        if (store.shouldAbandonNotifyAfterAttempt(job.id)) {
+          const abandoned = store.abandonNotifyClaim(job.id, deliveryToken, fenceOf(claimedLive))
+          if (abandoned) {
+            const settled = store.snapshotOf(job.id) ?? claimedLive
+            log.warn('delegate notify abandoned after retry budget', {
+              jobId: settled.id,
+              callback: settled.callback,
+              notifyAttempt: settled.notifyAttempt,
+              terminalCommittedAt: settled.terminalCommittedAt,
+            })
+            const lane = (settled.notifyLane as NotifyLane | undefined) ?? preferred
+            return ackDelivered(store, settled, hooks, notifyId, lane)
+          }
+        } else {
+          store.releaseNotifyClaim(job.id, deliveryToken, fenceOf(claimedLive))
+        }
       }
-    }
-    if (owned && store.shouldAbandonNotify(job.id)) {
-      const latest = store.snapshotOf(job.id) ?? live
-      store.abandonNotify(latest.id, fenceOf(latest))
-      log.warn('delegate notify abandoned after retry budget', {
-        jobId: latest.id,
-        callback: latest.callback,
-        notifyAttempt: latest.notifyAttempt,
-        terminalCommittedAt: latest.terminalCommittedAt,
-      })
-      const lane = (latest.notifyLane as NotifyLane | undefined) ?? preferred
-      return ackDelivered(store, store.snapshotOf(job.id) ?? latest, hooks, notifyId, lane)
     }
     throw err
   }
@@ -300,24 +307,59 @@ export async function dispatchJobTerminalNotify(
         // Never abandon or invoke onDelivered cleanup from a stale owner.
         return result
       }
+    } else if (terminalGone) {
+      const abandoned = store.abandonNotifyClaim(job.id, deliveryToken, fenceOf(claimedLive))
+      if (abandoned) {
+        const latest = store.snapshotOf(job.id) ?? claimedLive
+        log.warn('delegate notify abandoned: origin session gone', {
+          jobId: latest.id,
+          callback: latest.callback,
+          callbackEpoch: latest.callbackEpoch,
+          notifyAttempt: latest.notifyAttempt,
+        })
+        const lane = (latest.notifyLane as NotifyLane | undefined) ?? preferred
+        const abandonedNotifyId = delegateNotifyId(
+          latest.id,
+          latest.callbackEpoch > 0 ? latest.callbackEpoch : 1,
+        )
+        return ackDelivered(store, latest, hooks, abandonedNotifyId, lane)
+      }
+      // Stale delivery token: another worker reclaimed or completed this row.
+      return result
     } else if (!result.hold) {
+      if (store.shouldAbandonNotifyAfterAttempt(job.id)) {
+        const abandoned = store.abandonNotifyClaim(job.id, deliveryToken, fenceOf(claimedLive))
+        if (abandoned) {
+          const latest = store.snapshotOf(job.id) ?? claimedLive
+          log.warn('delegate notify abandoned after retry budget', {
+            jobId: latest.id,
+            callback: latest.callback,
+            notifyAttempt: latest.notifyAttempt,
+            terminalCommittedAt: latest.terminalCommittedAt,
+            failureClass: result.failureClass,
+          })
+          const lane = (latest.notifyLane as NotifyLane | undefined) ?? preferred
+          return ackDelivered(store, latest, hooks, notifyId, lane)
+        }
+        return result
+      }
       store.releaseNotifyClaim(job.id, deliveryToken, fenceOf(claimedLive))
     }
   } else if (owned) {
     store.deferPendingNotify(job.id, fenceOf(claimedLive))
-  }
-  if (owned && !result.hold && store.shouldAbandonNotify(job.id)) {
-    const latest = store.snapshotOf(job.id) ?? live
-    store.abandonNotify(latest.id, fenceOf(latest))
-    log.warn('delegate notify abandoned after retry budget', {
-      jobId: latest.id,
-      callback: latest.callback,
-      notifyAttempt: latest.notifyAttempt,
-      terminalCommittedAt: latest.terminalCommittedAt,
-      failureClass: result.failureClass,
-    })
-    const lane = (latest.notifyLane as NotifyLane | undefined) ?? preferred
-    return ackDelivered(store, store.snapshotOf(job.id) ?? latest, hooks, notifyId, lane)
+    if (!result.hold && store.shouldAbandonNotify(job.id)) {
+      const latest = store.snapshotOf(job.id) ?? live
+      store.abandonNotify(latest.id, fenceOf(latest))
+      log.warn('delegate notify abandoned after retry budget', {
+        jobId: latest.id,
+        callback: latest.callback,
+        notifyAttempt: latest.notifyAttempt,
+        terminalCommittedAt: latest.terminalCommittedAt,
+        failureClass: result.failureClass,
+      })
+      const lane = (latest.notifyLane as NotifyLane | undefined) ?? preferred
+      return ackDelivered(store, store.snapshotOf(job.id) ?? latest, hooks, notifyId, lane)
+    }
   }
   return result
 }

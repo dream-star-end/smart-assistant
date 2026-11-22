@@ -378,6 +378,7 @@ export class DelegateJobStore {
     string,
     { claimToken: string; fencingEpoch: number; phase: 'attached' | 'quiesce_acked' }
   >()
+  private closed = false
 
   constructor(opts: DelegateJobStoreOptions = {}) {
     this.ttlMs = opts.ttlMs ?? DEFAULT_DELEGATE_JOB_TTL_MS
@@ -1344,6 +1345,7 @@ export class DelegateJobStore {
 
   /** Terminal jobs whose Completer callback is still pending/injecting. */
   listPendingNotify(): DelegateJobSnapshot[] {
+    if (this.closed) return []
     const out: DelegateJobSnapshot[] = []
     if (this.durable) {
       for (const row of this.durable.loadAll()) this.ingestDurableRow(row)
@@ -1758,6 +1760,71 @@ export class DelegateJobStore {
   }
 
   /**
+   * Whether counting the currently active failed delivery attempt exhausts
+   * the retry budget (`NOTIFY_ABANDON_MIN_ATTEMPTS` + `NOTIFY_ABANDON_AFTER_TERMINAL_MS`).
+   * Lets callers still holding a `deliveryToken` atomically call
+   * `abandonNotifyClaim` without first releasing the claim.
+   */
+  shouldAbandonNotifyAfterAttempt(jobId: string): boolean {
+    const job = this.refreshJob(jobId)
+    if (!job) return false
+    return shouldAbandonPendingNotify(
+      {
+        notifyAttempt: (job.notifyAttempt ?? 0) + 1,
+        terminalCommittedAt: job.terminalCommittedAt,
+      },
+      this.now(),
+    )
+  }
+
+  /**
+   * Atomically abandon an active notify claim fenced by the caller's
+   * `deliveryToken` (injecting → abandoned). Used for terminal origin
+   * failures (e.g. Master 404 SESSION_GONE) and retry-budget exhaustion so
+   * a stale worker whose lease expired cannot overwrite a competing worker's
+   * active claim or delivered receipt.
+   */
+  abandonNotifyClaim(
+    jobId: string,
+    deliveryToken: string,
+    fence?: { claimToken: string; fencingEpoch: number },
+  ): boolean {
+    const job = this.refreshJob(jobId)
+    if (!job) return false
+    if (job.claimToken) {
+      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) {
+        return false
+      }
+    }
+    if (job.callbackState !== 'injecting' || job.notifyDeliveryToken !== deliveryToken) {
+      return false
+    }
+    const now = this.now()
+    if (this.durable) {
+      const row = this.durable.casAbandonNotify({
+        jobId,
+        state: job.state,
+        fencingEpoch: job.fencingEpoch,
+        claimToken: job.claimToken ?? null,
+        deliveryToken,
+        now,
+      })
+      if (!row) {
+        this.refreshJob(jobId)
+        return false
+      }
+      this.ingestDurableRow(row)
+      return true
+    }
+    job.callbackState = 'abandoned'
+    job.notifyDeliveryToken = undefined
+    job.notifyClaimedUntil = null
+    job.notifyRetryAt = null
+    job.lastActivityAt = now
+    return true
+  }
+
+  /**
    * Terminal notify budget exhausted. Clears the claim/retry so the
    * scheduler never picks the row again. pending|injecting → abandoned.
    */
@@ -1917,6 +1984,7 @@ export class DelegateJobStore {
   }
 
   close(): void {
+    this.closed = true
     for (const job of this.jobs.values()) {
       const waiters = job.waiters.splice(0)
       for (const w of waiters) w({ status: 'expired', jobId: job.id })

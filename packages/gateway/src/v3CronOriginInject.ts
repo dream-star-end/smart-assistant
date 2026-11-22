@@ -24,6 +24,7 @@ const MAX_ERROR_BODY_BYTES = 8_192
  * recovery sentinels, `in_flight`, or billed dispatches.
  */
 export const CRON_ORIGIN_PREVIOUSLY_FAILED_UNEXECUTED_CODE = 'PREVIOUSLY_FAILED_UNEXECUTED'
+export const CRON_ORIGIN_SESSION_GONE_CODE = 'SESSION_GONE'
 
 export function readV3CronOriginInjectConfig(
   env: NodeJS.ProcessEnv = process.env,
@@ -115,7 +116,7 @@ export async function postCronOriginInject(
     })
     const chunks: Buffer[] = []
     let capturedBytes = 0
-    const shouldCapture = res.statusCode !== 200 && res.statusCode !== 404 && res.statusCode !== 409
+    const shouldCapture = res.statusCode !== 200 && res.statusCode !== 409
     try {
       for await (const chunk of res.body) {
         if (shouldCapture && capturedBytes < MAX_ERROR_BODY_BYTES) {
@@ -129,7 +130,18 @@ export async function postCronOriginInject(
       // ignore drain
     }
     if (res.statusCode === 200) return { kind: 'injected' }
-    if (res.statusCode === 404) return { kind: 'gone' }
+    if (res.statusCode === 404) {
+      const errorInfo = parseCronOriginInjectErrorBody(chunks)
+      if (errorInfo?.code && errorInfo.code !== CRON_ORIGIN_SESSION_GONE_CODE) {
+        log.warn('cron-origin-inject 404 with non-SESSION_GONE code', {
+          status: res.statusCode,
+          code: errorInfo.code,
+          ...(errorInfo.message ? { message: errorInfo.message } : {}),
+        })
+        return { kind: 'retryable', code: `HTTP_${res.statusCode}` }
+      }
+      return { kind: 'gone' }
+    }
     if (res.statusCode === 409) return { kind: 'in_flight' }
     const errorInfo = parseCronOriginInjectErrorBody(chunks)
     if (isPreviouslyFailedResponse(res.statusCode, errorInfo)) {

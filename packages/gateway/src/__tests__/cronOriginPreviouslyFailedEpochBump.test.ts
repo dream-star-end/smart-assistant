@@ -7,7 +7,7 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/cronOriginPreviouslyFailedEpochBump.test.ts
  */
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, rm } from 'node:fs/promises'
 import { type Server, createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -32,17 +32,31 @@ import {
 import { DelegateDurableDb } from '../delegateDurable.js'
 import {
   DelegateJobStore,
+  NOTIFY_ABANDON_AFTER_TERMINAL_MS,
+  NOTIFY_ABANDON_MIN_ATTEMPTS,
   NOTIFY_CLAIM_LEASE_MS,
   NOTIFY_MAX_CALLBACK_EPOCH,
   nextNotifyBackoffMs,
 } from '../delegateJobs.js'
 import { dispatchJobTerminalNotify, retryPendingNotifies } from '../delegateNotifyDispatch.js'
-import { handedOffDelegateRetryDelay } from '../delegateWaitHandoff.js'
+import { resolveDelegateCallbackOwner } from '../delegateSmFlag.js'
+import {
+  handedOffDelegateRetryDelay,
+  retryHandedOffDelegateNotifies,
+} from '../delegateWaitHandoff.js'
 import { DefaultEngineNotifier } from '../engineNotifier.js'
 import { _armNotifyRetryScheduler } from '../gatewayLifecycle.js'
 import { runBoundedOriginInjectBackoff } from '../originInjectBackoff.js'
+import { sendToAgentCallbackClientMessageId } from '../sendToAgentCallback.js'
+import {
+  persistSendToAgentIntent,
+  recoverInterruptedSendToAgentIntents,
+} from '../sendToAgentIntentStore.js'
 import { Gateway } from '../server.js'
-import { CRON_ORIGIN_PREVIOUSLY_FAILED_UNEXECUTED_CODE } from '../v3CronOriginInject.js'
+import {
+  CRON_ORIGIN_PREVIOUSLY_FAILED_UNEXECUTED_CODE,
+  CRON_ORIGIN_SESSION_GONE_CODE,
+} from '../v3CronOriginInject.js'
 
 const ORIGIN_KEY = 'agent:main:webchat:dm:webocv573origin01'
 const ENV_KEYS = [
@@ -688,7 +702,13 @@ describe('OCV5-73: cron-origin-inject previously_failed bounded callback_epoch b
       assert.deepEqual(receivedIds, [delegateCallbackMessageId(jobId, 1)])
 
       // Without restarting, wait for the armed 1s backoff timer to fire and deliver epoch 2!
-      for (let i = 0; i < 150 && store.snapshotOf(jobId)?.callbackState !== 'delivered'; i += 1) {
+      for (
+        let i = 0;
+        i < 150 &&
+        (store.snapshotOf(jobId)?.callbackState !== 'delivered' ||
+          host._activeSendToAgentCallbacks.size > 0);
+        i += 1
+      ) {
         await delay(30)
       }
       const finalSnap = store.snapshotOf(jobId)!
@@ -700,7 +720,417 @@ describe('OCV5-73: cron-origin-inject previously_failed bounded callback_epoch b
         delegateCallbackMessageId(jobId, 2),
       ])
     } finally {
+      if (host) host._shuttingDown = true
       if (host?._notifyRetryTimer) clearTimeout(host._notifyRetryTimer)
+      store?.close()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('R2 Critical (CALLBACK_OWNER=intent + NOTIFIER=0): first 200 clears intent and restart never redelivers via dlgcb id', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ocv5-73-intent-restart-'))
+    const dbPath = join(dir, 'delegate.db')
+    const intentDir = join(dir, 'intents')
+    process.env.OC_DELEGATE_SM = '1'
+    process.env.OC_DELEGATE_DURABLE = '1'
+    process.env.OC_DELEGATE_NOTIFIER = '0'
+    process.env.OC_DELEGATE_CALLBACK_OWNER = 'intent'
+    process.env.OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR = intentDir
+    receivedIds = []
+    let store1: DelegateJobStore | undefined
+    let store2: DelegateJobStore | undefined
+    let host1: any
+    let host2: any
+    try {
+      store1 = new DelegateJobStore({
+        sm: true,
+        durable: new DelegateDurableDb(dbPath),
+      })
+      const { jobId, claimToken, fencingEpoch } = createTerminalSendToAgentJob(store1)
+      const savedIntent = {
+        v: 1 as const,
+        jobId,
+        originSessionKey: ORIGIN_KEY,
+        userId: '3',
+        agentId: 'research-assistant',
+        goal: '查资料',
+        createdAt: Date.now(),
+      }
+      await persistSendToAgentIntent(savedIntent)
+
+      const gw1 = makeGatewayForOriginInject() as any
+      host1 = {
+        _shuttingDown: false,
+        _delegateJobs: store1,
+        _activeSendToAgentCallbacks: new Map([[jobId, savedIntent]]),
+        _notifyRetryTimer: undefined as ReturnType<typeof setTimeout> | undefined,
+        _drainFlagOffCronOriginNotifies: async () => {},
+        sessions: { getByKey: () => ({ userId: '3' }) },
+        log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+        injectSendToAgentCallback: gw1.injectSendToAgentCallback.bind(gw1),
+      }
+      host1._ensureDurableSendToAgentCallback = _ensureDurableSendToAgentCallback.bind(host1)
+      host1._armNotifyRetryScheduler = _armNotifyRetryScheduler.bind(host1)
+
+      masterResponder = () => ({ status: 200, body: { ok: true, requestId: 'req-intent-200' } })
+
+      // 1) First completion under CALLBACK_OWNER=intent + NOTIFIER=0 delivers via legacy sta-cb-{jobId}
+      //    and removes the intent file while leaving delegate_jobs.callbackState='pending'.
+      _queueSendToAgentCallback.call(
+        host1,
+        {
+          callbackOnComplete: 'origin-inject',
+          parentSessionKey: ORIGIN_KEY,
+          callbackOriginSessionKey: ORIGIN_KEY,
+          callbackOriginUserId: '3',
+          claimToken,
+          fencingEpoch,
+        } as any,
+        {
+          jobId,
+          agentId: 'research-assistant',
+          goal: '查资料',
+          output: '结论正文',
+        },
+      )
+
+      for (let i = 0; i < 100 && host1._activeSendToAgentCallbacks.size > 0; i += 1) {
+        await delay(20)
+      }
+      await delay(20)
+      assert.deepEqual(receivedIds, [sendToAgentCallbackClientMessageId(jobId)])
+      assert.deepEqual(await readdir(intentDir), [])
+      assert.equal(store1.snapshotOf(jobId)?.callbackState, 'pending')
+
+      // Live scheduler/retry must NOT touch intent-owned send_to_agent rows
+      assert.equal(handedOffDelegateRetryDelay(store1), undefined)
+      host1._armNotifyRetryScheduler()
+      assert.equal(host1._notifyRetryTimer, undefined)
+      await retryHandedOffDelegateNotifies(host1)
+      assert.equal(receivedIds.length, 1)
+
+      host1._shuttingDown = true
+      store1.close()
+      store1 = undefined
+
+      // 2) Simulate container restart reopening the same durable SQLite DB:
+      //    boot recovery + flag-off retry scheduler + direct _ensureDurableSendToAgentCallback
+      //    must NEVER re-inject with dlgcb-{jobId}-1!
+      store2 = new DelegateJobStore({
+        sm: true,
+        durable: new DelegateDurableDb(dbPath),
+      })
+      const gw2 = makeGatewayForOriginInject() as any
+      host2 = {
+        _shuttingDown: false,
+        _delegateJobs: store2,
+        _activeSendToAgentCallbacks: new Map(),
+        _notifyRetryTimer: undefined as ReturnType<typeof setTimeout> | undefined,
+        _drainFlagOffCronOriginNotifies: async () => {},
+        sessions: { getByKey: () => ({ userId: '3' }) },
+        log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+        injectSendToAgentCallback: gw2.injectSendToAgentCallback.bind(gw2),
+      }
+      host2._ensureDurableSendToAgentCallback = _ensureDurableSendToAgentCallback.bind(host2)
+      host2._armNotifyRetryScheduler = _armNotifyRetryScheduler.bind(host2)
+
+      const recovery = await recoverInterruptedSendToAgentIntents(
+        async () => {
+          throw new Error('intent was already removed on first 200; interrupt notice must not run')
+        },
+        process.env,
+        {
+          callbackOwner: resolveDelegateCallbackOwner(),
+          resolveJob: (id) => store2!.snapshotOf(id),
+          ensureCallback: (job, intent) => host2._ensureDurableSendToAgentCallback(job, intent),
+        },
+      )
+      assert.equal(recovery.recovered, 0)
+      assert.equal(recovery.retained, 0)
+      assert.equal(handedOffDelegateRetryDelay(store2), undefined)
+      host2._armNotifyRetryScheduler()
+      assert.equal(host2._notifyRetryTimer, undefined)
+      await retryHandedOffDelegateNotifies(host2)
+      assert.equal(
+        await host2._ensureDurableSendToAgentCallback(store2.snapshotOf(jobId), savedIntent),
+        false,
+      )
+      assert.deepEqual(
+        receivedIds,
+        [sendToAgentCallbackClientMessageId(jobId)],
+        'restart must not redeliver an intent-owned callback with a new dlgcb-* id',
+      )
+    } finally {
+      if (host1) host1._shuttingDown = true
+      if (host2) host2._shuttingDown = true
+      if (host1?._notifyRetryTimer) clearTimeout(host1._notifyRetryTimer)
+      if (host2?._notifyRetryTimer) clearTimeout(host2._notifyRetryTimer)
+      store1?.close()
+      store2?.close()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('R2 Warning (owner=job, NOTIFIER=0): Master 404 SESSION_GONE terminates row with current delivery token and stops retrying', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ocv5-73-404-flagoff-'))
+    const dbPath = join(dir, 'delegate.db')
+    const intentDir = join(dir, 'intents')
+    process.env.OC_DELEGATE_SM = '1'
+    process.env.OC_DELEGATE_DURABLE = '1'
+    process.env.OC_DELEGATE_NOTIFIER = '0'
+    process.env.OC_DELEGATE_CALLBACK_OWNER = 'job'
+    process.env.OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR = intentDir
+    receivedIds = []
+    let store: DelegateJobStore | undefined
+    let reopened: DelegateJobStore | undefined
+    let host: any
+    try {
+      store = new DelegateJobStore({
+        sm: true,
+        durable: new DelegateDurableDb(dbPath),
+      })
+      const { jobId } = createTerminalSendToAgentJob(store)
+      const savedIntent = {
+        v: 1 as const,
+        jobId,
+        originSessionKey: ORIGIN_KEY,
+        userId: '3',
+        agentId: 'research-assistant',
+        goal: '查资料',
+        createdAt: Date.now(),
+      }
+      await persistSendToAgentIntent(savedIntent)
+
+      const gw = makeGatewayForOriginInject() as any
+      host = {
+        _shuttingDown: false,
+        _delegateJobs: store,
+        _activeSendToAgentCallbacks: new Map([[jobId, savedIntent]]),
+        _notifyRetryTimer: undefined as ReturnType<typeof setTimeout> | undefined,
+        _drainFlagOffCronOriginNotifies: async () => {},
+        sessions: { getByKey: () => ({ userId: '3' }) },
+        log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+        injectSendToAgentCallback: gw.injectSendToAgentCallback.bind(gw),
+      }
+      host._ensureDurableSendToAgentCallback = _ensureDurableSendToAgentCallback.bind(host)
+      host._armNotifyRetryScheduler = _armNotifyRetryScheduler.bind(host)
+
+      masterResponder = () => ({
+        status: 404,
+        body: {
+          error: {
+            code: CRON_ORIGIN_SESSION_GONE_CODE,
+            message: 'origin session missing or deleted',
+            request_id: 'req-404-gone',
+          },
+        },
+      })
+
+      const ok = await host._ensureDurableSendToAgentCallback(store.snapshotOf(jobId), savedIntent)
+      assert.equal(ok, true, '404 SESSION_GONE terminates callback cleanly')
+      assert.deepEqual(receivedIds, [delegateCallbackMessageId(jobId, 1)])
+      const snap = store.snapshotOf(jobId)!
+      assert.equal(snap.callbackState, 'abandoned')
+      assert.equal(snap.notifyRetryAt, null)
+      assert.equal(snap.notifyDeliveryToken, undefined)
+      assert.equal(host._activeSendToAgentCallbacks.size, 0)
+      assert.deepEqual(await readdir(intentDir), [])
+      assert.equal(host._notifyRetryTimer, undefined)
+      assert.equal(handedOffDelegateRetryDelay(store), undefined)
+
+      // Retry pass and restart must never contact master again
+      await retryHandedOffDelegateNotifies(host)
+      assert.equal(receivedIds.length, 1)
+      host._shuttingDown = true
+      store.close()
+      store = undefined
+
+      reopened = new DelegateJobStore({
+        sm: true,
+        durable: new DelegateDurableDb(dbPath),
+      })
+      assert.equal(reopened.snapshotOf(jobId)?.callbackState, 'abandoned')
+      assert.equal(reopened.listPendingNotify().length, 0)
+      assert.equal(handedOffDelegateRetryDelay(reopened), undefined)
+    } finally {
+      if (host) host._shuttingDown = true
+      if (host?._notifyRetryTimer) clearTimeout(host._notifyRetryTimer)
+      store?.close()
+      reopened?.close()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('R2 Warning (owner=job, NOTIFIER=1 + stale token race): Master 404 SESSION_GONE terminates immediately with delivery-token fence', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ocv5-73-404-notifier-'))
+    const dbPath = join(dir, 'delegate.db')
+    let now = 1_700_000_600_000
+    receivedIds = []
+    let onDeliveredCount = 0
+    try {
+      const store = new DelegateJobStore({
+        sm: true,
+        durable: new DelegateDurableDb(dbPath),
+        now: () => now,
+      })
+      const jobId = createTerminalSendToAgentJob(store).jobId
+      const gw = makeGatewayForOriginInject()
+      const notifier = makeNotifier(gw)
+
+      masterResponder = () => ({
+        status: 404,
+        body: {
+          error: {
+            code: CRON_ORIGIN_SESSION_GONE_CODE,
+            message: 'origin session missing or deleted',
+            request_id: 'req-404-nfy',
+          },
+        },
+      })
+
+      // Fresh terminal job (attempt 0, 0ms elapsed): 404 SESSION_GONE must abandon immediately
+      const res = await dispatchJobTerminalNotify(store, store.snapshotOf(jobId)!, notifier, {
+        onDelivered: () => {
+          onDeliveredCount += 1
+        },
+      })
+      assert.equal('ok' in res && res.ok, true)
+      assert.equal(onDeliveredCount, 1)
+      assert.deepEqual(receivedIds, [delegateCallbackMessageId(jobId, 1)])
+      const snap = store.snapshotOf(jobId)!
+      assert.equal(snap.callbackState, 'abandoned')
+      assert.equal(snap.notifyRetryAt, null)
+      assert.equal(store.listPendingNotify().length, 0)
+
+      // Stale delivery-token race: Worker A gets 404 after Worker B reclaimed → must NOT abandon Worker B!
+      const jobId2 = createTerminalSendToAgentJob(store).jobId
+      const storeB = new DelegateJobStore({
+        sm: true,
+        durable: new DelegateDurableDb(dbPath),
+        now: () => now,
+      })
+      const snap2 = store.snapshotOf(jobId2)!
+      const fence2 = { claimToken: snap2.claimToken!, fencingEpoch: snap2.fencingEpoch }
+      let tokenB: string | undefined
+      let staleOnDelivered = 0
+      const slowGoneNotifier = new DefaultEngineNotifier({
+        resumeInject: {
+          inject: async () => {
+            now += NOTIFY_CLAIM_LEASE_MS + 1_000
+            const claimB = storeB.claimNotifyDelivery(jobId2, fence2)
+            assert.equal(claimB.ok, true)
+            if (claimB.ok) tokenB = claimB.token
+            return { ok: false, failureClass: 'transport', gone: true }
+          },
+        },
+      })
+      const staleRes = await dispatchJobTerminalNotify(store, snap2, slowGoneNotifier, {
+        onDelivered: () => {
+          staleOnDelivered += 1
+        },
+      })
+      assert.equal('ok' in staleRes && staleRes.ok, false)
+      assert.equal(staleOnDelivered, 0)
+      assert.equal(storeB.snapshotOf(jobId2)?.callbackState, 'injecting')
+      assert.equal(storeB.snapshotOf(jobId2)?.notifyDeliveryToken, tokenB)
+      assert.equal(storeB.completeNotifyDelivery(jobId2, tokenB!, fence2), true)
+      assert.equal(storeB.snapshotOf(jobId2)?.callbackState, 'delivered')
+
+      storeB.close()
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('R2 Warning (transient 5xx/network retry budget): enforces NOTIFY_ABANDON_MIN_ATTEMPTS + 24h ceiling in both flag-off and notifier paths', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ocv5-73-transient-budget-'))
+    const dbPath = join(dir, 'delegate.db')
+    const intentDir = join(dir, 'intents')
+    process.env.OC_DELEGATE_SM = '1'
+    process.env.OC_DELEGATE_DURABLE = '1'
+    process.env.OC_DELEGATE_NOTIFIER = '0'
+    process.env.OC_DELEGATE_CALLBACK_OWNER = 'job'
+    process.env.OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR = intentDir
+    let now = 1_700_000_700_000
+    receivedIds = []
+    let store: DelegateJobStore | undefined
+    let host: any
+    try {
+      store = new DelegateJobStore({
+        sm: true,
+        durable: new DelegateDurableDb(dbPath),
+        now: () => now,
+      })
+      const { jobId, claimToken, fencingEpoch } = createTerminalSendToAgentJob(store)
+      const fence = { claimToken, fencingEpoch }
+      const savedIntent = {
+        v: 1 as const,
+        jobId,
+        originSessionKey: ORIGIN_KEY,
+        userId: '3',
+        agentId: 'research-assistant',
+        goal: '查资料',
+        createdAt: now,
+      }
+      await persistSendToAgentIntent(savedIntent)
+
+      const gw = makeGatewayForOriginInject() as any
+      host = {
+        _shuttingDown: false,
+        _delegateJobs: store,
+        _activeSendToAgentCallbacks: new Map([[jobId, savedIntent]]),
+        _notifyRetryTimer: undefined as ReturnType<typeof setTimeout> | undefined,
+        _armNotifyRetryScheduler: () => {},
+        sessions: { getByKey: () => ({ userId: '3' }) },
+        log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+        injectSendToAgentCallback: gw.injectSendToAgentCallback.bind(gw),
+      }
+      host._ensureDurableSendToAgentCallback = _ensureDurableSendToAgentCallback.bind(host)
+
+      masterResponder = () => ({
+        status: 503,
+        body: { error: { code: 'NO_TRANSPORT', message: 'no attested container bridge' } },
+      })
+
+      // 1) Under budget (attempt 1, < 24h): must stay pending with backoff, never abandon or bump epoch
+      const firstOk = await host._ensureDurableSendToAgentCallback(store.snapshotOf(jobId), savedIntent)
+      assert.equal(firstOk, false)
+      const afterFirst = store.snapshotOf(jobId)!
+      assert.equal(afterFirst.callbackState, 'pending')
+      assert.equal(afterFirst.callbackEpoch, 1)
+      assert.equal(afterFirst.notifyAttempt, 1)
+      assert.ok(afterFirst.notifyRetryAt != null && afterFirst.notifyRetryAt > now)
+      assert.equal(host._activeSendToAgentCallbacks.size, 1)
+
+      // 2) Advance attempts to NOTIFY_ABANDON_MIN_ATTEMPTS - 2 (46) while still < 24h:
+      //    47th attempt (even past 24h) is still below 48 → stays pending
+      for (let i = afterFirst.notifyAttempt ?? 0; i < NOTIFY_ABANDON_MIN_ATTEMPTS - 2; i += 1) {
+        assert.equal(store.deferPendingNotify(jobId, fence), true)
+      }
+      now = (store.snapshotOf(jobId)?.terminalCommittedAt ?? now) + NOTIFY_ABANDON_AFTER_TERMINAL_MS + 1_000
+      const attempt47Ok = await host._ensureDurableSendToAgentCallback(store.snapshotOf(jobId), savedIntent)
+      assert.equal(attempt47Ok, false)
+      const after47 = store.snapshotOf(jobId)!
+      assert.equal(after47.callbackState, 'pending')
+      assert.equal(after47.notifyAttempt, NOTIFY_ABANDON_MIN_ATTEMPTS - 1)
+
+      // 3) Attempt 48 (meets BOTH >= 48 attempts AND >= 24h terminal age):
+      //    atomically abandons with current delivery token and clears intent!
+      now = (after47.notifyRetryAt ?? now) + 1
+      const attempt48Ok = await host._ensureDurableSendToAgentCallback(store.snapshotOf(jobId), savedIntent)
+      assert.equal(attempt48Ok, true)
+      const abandoned = store.snapshotOf(jobId)!
+      assert.equal(abandoned.callbackState, 'abandoned')
+      assert.equal(abandoned.callbackEpoch, 1)
+      assert.equal(abandoned.notifyRetryAt, null)
+      assert.equal(host._activeSendToAgentCallbacks.size, 0)
+      assert.deepEqual(await readdir(intentDir), [])
+      assert.equal(store.listPendingNotify().length, 0)
+      // All transient retries kept epoch 1 (no spurious epoch bumps)
+      assert.deepEqual(receivedIds, Array(3).fill(delegateCallbackMessageId(jobId, 1)))
+    } finally {
+      if (host) host._shuttingDown = true
       store?.close()
       await rm(dir, { recursive: true, force: true })
     }
