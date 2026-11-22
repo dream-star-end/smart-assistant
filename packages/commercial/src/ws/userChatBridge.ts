@@ -78,8 +78,10 @@ import { ConnectionRegistry, type Conn } from "./connections.js";
 import type { Logger } from "../logging/logger.js";
 import { admittedTraceIdentity, recordTurnTrace, updateTurnTraceDispatch } from "./turnTraces.js";
 import {
+  type ClientTelemetryContext,
   extractFirstVisibleAttribution,
   FirstVisiblePersistGate,
+  parseClientTelemetryFromUserAgent,
   recordTurnFirstVisible,
   TurnResponseMilestoneTracker,
 } from "./turnPerformance.js";
@@ -2332,6 +2334,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // 头。把生成挪到 IIFE 起点,保证 tunnel pre-dial / bridge log / 后续 child
       // (turnLog 等)共享同一 UUID;startBridge 内 connId 参数直接收。
       const connId = randomUUID();
+      const clientTelemetry = parseClientTelemetryFromUserAgent(req.headers["user-agent"]);
 
       void (async () => {
         // 1) JWT 验证 — token 来源只接受:
@@ -2577,6 +2580,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           agentModelResolverHandle,
           connId,
           claims.role === "admin" ? "admin" : "user",
+          true,
+          clientTelemetry,
         );
         getContainerLinkHandle(containerWs)?.activate();
       })().catch((err: unknown) => {
@@ -2600,6 +2605,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     connId: string,
     userRole: "user" | "admin" = "user",
     originAuthzReady = true,
+    clientTelemetry?: ClientTelemetryContext,
   ): void {
     // CG2b/CG4 — connection-scoped logger:把 uid + connection-level trace 钉进 bindings,
     // 后续 startBridge 内所有 log call 不必手写这两个字段。turn-scoped(traceId)再从
@@ -2643,7 +2649,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     let firstUserFrameAtMs: number | null = null;
     let firstContainerFrameAtMs: number | null = null;
     const firstVisiblePersist = new FirstVisiblePersistGate();
-    const responseMilestoneTracker = new TurnResponseMilestoneTracker();
+    const responseMilestoneTracker = new TurnResponseMilestoneTracker(512, clientTelemetry);
     const ttftKind: "cold" | "warm" = endpoint.coldStart === true ? "cold" : "warm";
     // plan v3 review v1 §F4 follow-up:per-bridge 最后一次"用户主动声明"的 modelId。
     // 用于在没带 model 字段的后续帧上仍然能用对应 model 校验 grants(防在飞会话
@@ -5988,6 +5994,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   model: effectiveModelForFrame,
                   userId: uid,
                   startedAtMs: receivedAtMs,
+                  ...(ingress === "browser" ? {} : { browserFamily: null, deviceClass: null }),
                 });
               }
             }
