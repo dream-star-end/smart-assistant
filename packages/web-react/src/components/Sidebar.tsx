@@ -1,13 +1,16 @@
 import {
   Archive,
+  Bell,
   ChevronDown,
   ChevronRight,
   ChevronsUpDown,
   Command,
+  LayoutGrid,
   ListChecks,
   PanelLeftClose,
   Plus,
   Search,
+  Store,
   X,
 } from "lucide-react";
 import {
@@ -37,7 +40,6 @@ import type {
 } from "../lib/types";
 import { cn, formatCompactCount, formatCredits } from "../lib/utils";
 import { BrandMark } from "./BrandMark";
-import { ThemeToggle } from "./ThemeToggle";
 import { ProjectRow } from "./sidebar/ProjectRow";
 import { SessionRow } from "./sidebar/SessionRow";
 import { VirtualList } from "./sidebar/VirtualList";
@@ -120,11 +122,6 @@ if (typeof window !== "undefined") {
 const EMPTY_HINT_CTA_HEIGHT = 108;
 /** 零会话零项目的引导空态（图标 + 标题 + 两行说明 + 两个按钮，S-13）。 */
 const EMPTY_ALL_HEIGHT = 200;
-/**
- * 底栏「案例」入口在此宽度及以上才带文字；默认 268px 与移动抽屉一律只留图标（title / aria-label 照旧），
- * 把横向空间让给昵称与余额 —— 268px 下文字版会把「余额 258.5万 积分」截成「余额 258.5万…」（S-09 / SIDEBAR-R1）。
- */
-const FOOTER_LABEL_MIN_WIDTH = 300;
 const NAV_ITEM_BASE =
   "oc-spring-press oc-icon-nudge group relative flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:h-9";
 const NAV_ITEM_ACTIVE = "bg-sidebar-active font-medium text-fg shadow-sidebar-active";
@@ -202,11 +199,13 @@ export type SidebarProps = {
   collapseLabel?: string;
   onLogout?: () => void;
   onOpenAccount?: () => void;
+  /** 点账号菜单「设置」直达偏好页；未传时回退 onOpenAccount。 */
+  onOpenPreferences?: () => void;
   onOpenFeedback?: () => void;
   onOpenManage?: () => void;
   onOpenMarketplace?: () => void;
   onOpenTutorial?: () => void;
-  /** 经验分享（OCV5-577）：一级入口，打开教程中心的「经验分享」页签。 */
+  /** @deprecated OCV5-843 已并入账号菜单「帮助与案例」，保留可选以向后兼容。 */
   onOpenBlog?: () => void;
   onOpenOrg?: () => void;
   onOpenBoard?: (ticketRef?: string) => void;
@@ -216,13 +215,19 @@ export type SidebarProps = {
   onOpenStudio?: () => void;
   /** 「ChatGPT 直连」面板入口:仅管理员 / 白名单用户且服务端已开启时由 App 传入。 */
   onOpenChatGptProxy?: () => void;
-  /** 「API 接入」入口:管理员由 App 传入(admin-only rollout),直达设置 api-access 分区。 */
+  /** @deprecated OCV5-843 已收敛进设置中心「API 接入」分区，保留可选以向后兼容。 */
   onOpenApiAccess?: () => void;
   boardActive?: boolean;
   sitesActive?: boolean;
   showAdmin?: boolean;
   theme?: Theme;
+  /** 直接切换主题（供账号菜单内联三段控件使用）。 */
+  onSetTheme?: (theme: Theme) => void;
   onCycleTheme?: () => void;
+  /** 站内信未读数（侧栏左下角全局铃铛按钮 6px 状态点 + aria-label/title 精确计数）。 */
+  unreadCount?: number;
+  /** 打开全局站内信抽屉。 */
+  onOpenInbox?: () => void;
   unreadIds?: Set<string>;
   onMarkRead?: (id: string) => void;
   onOpenProjectSettings?: (p: ChatProject) => void;
@@ -298,23 +303,25 @@ export function Sidebar({
   collapseLabel = "折叠侧栏",
   onLogout,
   onOpenAccount,
+  onOpenPreferences,
   onOpenFeedback,
   onOpenManage,
   onOpenMarketplace,
   onOpenTutorial,
-  onOpenBlog,
   onOpenOrg,
   onOpenBoard,
   onOpenSites,
   onOpenMediaTasks,
   onOpenStudio,
   onOpenChatGptProxy,
-  onOpenApiAccess,
   boardActive,
   sitesActive,
   showAdmin,
   theme,
+  onSetTheme,
   onCycleTheme,
+  unreadCount,
+  onOpenInbox,
   unreadIds,
   onMarkRead,
   onOpenProjectSettings,
@@ -683,22 +690,22 @@ export function Sidebar({
   }, []);
 
   const hasAccountMenu = Boolean(
-    onOpenManage ||
-      onOpenMarketplace ||
-      onOpenOrg ||
+    onOpenOrg ||
       showAdmin ||
       onOpenMediaTasks ||
       onOpenStudio ||
       onOpenChatGptProxy ||
-      onOpenApiAccess ||
       onOpenAccount ||
+      onOpenPreferences ||
+      onOpenTutorial ||
       onOpenFeedback ||
-      onLogout,
+      onLogout ||
+      (theme && (onSetTheme || onCycleTheme)),
   );
 
   // 底栏余额：默认 268px 下完整千分位数字已被截成「1,234,56…」（S-09），底栏一律用
   // 万 / 亿 缩写（formatCompactCount），精确值放 title 悬浮；账号菜单里空间充足仍显完整数字。
-  const footerCompact = typeof width !== "number" || width < FOOTER_LABEL_MIN_WIDTH;
+  const hasUnreadInbox = Boolean(unreadCount && unreadCount > 0);
   const creditsExact = credits != null ? `${formatCredits(credits)} 积分` : null;
   // 无余额（个人版 / 自托管未接计费、demo、未登录）时副标题此前写死「多模型 · 计量计费」——
   // 商业化营销文案出现在不计费的部署形态里（S-14）。改为有邮箱显邮箱、没有就不占这一行；
@@ -1223,7 +1230,7 @@ export function Sidebar({
           </div>
         )}
 
-        {(onOpenBoard || onOpenSites || onOpenBlog) && (
+        {(onOpenBoard || onOpenSites || onOpenManage || onOpenMarketplace) && (
           <div className="mt-1.5 flex flex-col gap-0.5">
             {onOpenBoard && (
               <button
@@ -1259,20 +1266,39 @@ export function Sidebar({
                 站点
               </button>
             )}
-            {onOpenBlog && (
+            {onOpenManage && (
               <button
                 type="button"
-                data-product-control
-                data-testid="blog-nav"
-                onClick={onOpenBlog}
+                data-product-feature={PRODUCT_CAPABILITIES.memory.id}
+                data-testid="manage-nav"
+                title="管理中心：记忆 · 技能 · 定时 · 插件"
+                onClick={onOpenManage}
                 className={cn(NAV_ITEM_BASE, NAV_ITEM_IDLE)}
               >
-                <AtelierIcon
-                  name="blog"
+                <LayoutGrid
                   size={16}
+                  strokeWidth={1.75}
+                  aria-hidden
                   className="shrink-0 text-faint transition-colors group-hover:text-fg"
                 />
-                经验分享
+                管理中心
+              </button>
+            )}
+            {onOpenMarketplace && (
+              <button
+                type="button"
+                data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}
+                data-testid="marketplace-nav"
+                onClick={onOpenMarketplace}
+                className={cn(NAV_ITEM_BASE, NAV_ITEM_IDLE)}
+              >
+                <Store
+                  size={16}
+                  strokeWidth={1.75}
+                  aria-hidden
+                  className="shrink-0 text-faint transition-colors group-hover:text-fg"
+                />
+                市场
               </button>
             )}
           </div>
@@ -1341,7 +1367,7 @@ export function Sidebar({
         </div>
       ) : null}
 
-      {/* 底栏：克制发丝边界，账号区 + 案例展厅 + 主题切换光学对齐。 */}
+      {/* 底栏：克制发丝边界，账号胶囊 + 全局站内信铃铛光学对齐。 */}
       <div className="shrink-0 border-t border-border/60 px-2 pt-1.5 sidebar-foot-safe-b">
         <div className="flex items-center gap-0.5" data-product-entry-scope="sidebar-account">
           {hasAccountMenu ? (
@@ -1363,15 +1389,17 @@ export function Sidebar({
                       email={email}
                       showSecondaryEmail={showSecondaryEmail}
                       credits={credits}
+                      theme={theme}
+                      onSetTheme={onSetTheme}
+                      onCycleTheme={onCycleTheme}
                       showAdmin={showAdmin}
-                      onOpenManage={onOpenManage}
-                      onOpenMarketplace={onOpenMarketplace}
                       onOpenOrg={onOpenOrg}
                       onOpenStudio={onOpenStudio}
                       onOpenMediaTasks={onOpenMediaTasks}
                       onOpenChatGptProxy={onOpenChatGptProxy}
-                      onOpenApiAccess={onOpenApiAccess}
                       onOpenAccount={onOpenAccount}
+                      onOpenPreferences={onOpenPreferences}
+                      onOpenTutorial={onOpenTutorial}
                       onOpenFeedback={onOpenFeedback}
                       onLogout={onLogout}
                     />
@@ -1382,25 +1410,32 @@ export function Sidebar({
           ) : (
             userChip
           )}
-          {onOpenTutorial && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              data-product-control
-              onClick={onOpenTutorial}
-              aria-label="打开案例展厅"
-              title="案例展厅"
-              className={cn(
-                "oc-btn-tactile oc-spring-press h-7 shrink-0 gap-1 rounded-sm text-faint hover:text-fg [@media(hover:none)]:min-h-10 [@media(hover:none)]:min-w-10",
-                footerCompact ? "w-7 px-0" : "px-2",
+          {onOpenInbox && (
+            <div className="relative shrink-0">
+              <IconButton
+                type="button"
+                variant="muted"
+                size="sm"
+                shape="square"
+                data-product-feature={PRODUCT_CAPABILITIES.inbox.id}
+                data-testid="sidebar-inbox-btn"
+                onClick={onOpenInbox}
+                aria-label={hasUnreadInbox ? `站内信（${unreadCount} 条未读）` : "站内信"}
+                title={hasUnreadInbox ? `站内信（${unreadCount} 条未读）` : "站内信"}
+                className="oc-btn-tactile oc-spring-press rounded-sm hover:text-fg"
+              >
+                <Bell size={16} strokeWidth={1.75} />
+              </IconButton>
+              {hasUnreadInbox && (
+                <span
+                  data-testid="sidebar-inbox-badge"
+                  data-unread-count={unreadCount}
+                  aria-hidden="true"
+                  className="pointer-events-none absolute right-1 top-1 size-1.5 rounded-full bg-accent ring-2 ring-sidebar [@media(hover:none)]:right-2.5 [@media(hover:none)]:top-2.5"
+                />
               )}
-            >
-              <AtelierIcon name="blog" size={15} />
-              {!footerCompact && <span className="text-caption font-medium">案例</span>}
-            </Button>
+            </div>
           )}
-          {theme && onCycleTheme && <ThemeToggle theme={theme} onCycle={onCycleTheme} compact />}
         </div>
       </div>
     </aside>

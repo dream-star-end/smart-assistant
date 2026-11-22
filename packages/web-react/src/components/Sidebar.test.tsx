@@ -94,13 +94,34 @@ describe("Sidebar 账号菜单（平台超管 / 反馈）", () => {
   });
 });
 
-describe("Sidebar 管理中心入口副标题", () => {
-  it("展示与实际分区对齐的速览文案，不再有「优化」待确认徽章", () => {
-    renderSidebar({ onOpenManage: () => {} });
+describe("Sidebar 管理中心与市场一级导航（OCV5-843）", () => {
+  it("管理中心与市场提升为侧栏一级工作区导航，附速览提示且不再藏在账号菜单", () => {
+    const onOpenManage = vi.fn();
+    const onOpenMarketplace = vi.fn();
+    renderSidebar({ onOpenManage, onOpenMarketplace, onOpenAccount: () => {} });
+    const primary = document.querySelector("[data-product-entry-scope='sidebar-primary']")!;
+    const manageBtn = screen.getByTestId("manage-nav");
+    const marketBtn = screen.getByTestId("marketplace-nav");
+    expect(primary.contains(manageBtn)).toBe(true);
+    expect(primary.contains(marketBtn)).toBe(true);
+    expect(manageBtn).toHaveTextContent("管理中心");
+    expect(manageBtn).toHaveAttribute("title", "管理中心：记忆 · 技能 · 定时 · 插件");
+    expect(marketBtn).toHaveTextContent("市场");
+
+    fireEvent.click(manageBtn);
+    fireEvent.click(marketBtn);
+    expect(onOpenManage).toHaveBeenCalledTimes(1);
+    expect(onOpenMarketplace).toHaveBeenCalledTimes(1);
+
     openAccountMenu();
-    const entry = screen.getByRole("menuitem", { name: /管理中心/ });
-    expect(entry).toHaveTextContent("记忆 · 技能 · 定时 · 插件");
-    expect(entry).not.toHaveTextContent(/待确认/);
+    expect(screen.queryByRole("menuitem", { name: /管理中心/ })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: /^市场/ })).toBeNull();
+  });
+
+  it("一级导航不再渲染低频重复的「经验分享」（即使传入兼容 prop onOpenBlog）", () => {
+    renderSidebar({ onOpenBoard: () => {}, onOpenSites: () => {}, onOpenBlog: () => {} });
+    expect(screen.queryByTestId("blog-nav")).toBeNull();
+    expect(screen.queryByRole("button", { name: "经验分享" })).toBeNull();
   });
 });
 
@@ -162,21 +183,31 @@ describe("Sidebar 会话列表", () => {
     expect(idleRow).not.toHaveAttribute("data-active");
   });
 
-  it("管理/市场/组织/后台不再占侧栏主区；点账号菜单才出现，设置与退出也在菜单里", () => {
+  it("账号菜单精简分组：管理/市场在一级导航，底栏去案例与主题按钮、改放全局站内信，菜单含计费卡/内联主题/帮助与案例/管理与接入", () => {
     const onOpenAccount = vi.fn();
+    const onOpenPreferences = vi.fn();
+    const onOpenTutorial = vi.fn();
     const onLogout = vi.fn();
     const onOpenMediaTasks = vi.fn();
+    const onOpenStudio = vi.fn();
+    const onOpenInbox = vi.fn();
+    const onSetTheme = vi.fn();
     renderSidebar({
+      credits: "1696777",
       onOpenManage: () => {},
       onOpenMarketplace: () => {},
-      onOpenTutorial: () => {},
+      onOpenTutorial,
       onOpenOrg: () => {},
+      onOpenStudio,
       onOpenMediaTasks,
       onOpenAccount,
+      onOpenPreferences,
+      onOpenInbox,
+      unreadCount: 86,
       onLogout,
       showAdmin: true,
       theme: "light",
-      onCycleTheme: () => {},
+      onSetTheme,
     });
     // 顶部「新建会话」+ 空态 CTA 同名(空态出口),取 DOM 序第一个(顶部按钮)锁 class 契约。
     // SIDEBAR-R1：可见边界(描边 + 实底)画在外层卡片 [data-sidebar-new] 上，按钮本身透明铺满。
@@ -187,65 +218,132 @@ describe("Sidebar 会话列表", () => {
     expect(createCard!.className).toMatch(/border-border/);
     expect(createCard!.className).toMatch(/bg-surface/);
 
-    expect(screen.queryByRole("button", { name: /管理中心/ })).toBeNull();
-    expect(screen.queryByRole("button", { name: /^市场/ })).toBeNull();
+    // 管理中心与市场在一级主导航区；组织/后台/退出不在主导航区
+    expect(screen.getByTestId("manage-nav")).toBeInTheDocument();
+    expect(screen.getByTestId("marketplace-nav")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /^组织/ })).toBeNull();
     expect(screen.queryByRole("link", { name: /管理后台/ })).toBeNull();
     expect(screen.queryByRole("button", { name: "退出登录" })).toBeNull();
     expect(screen.queryByRole("button", { name: "反馈与帮助" })).toBeNull();
 
-    const tutorial = screen.getByRole("button", { name: "打开案例展厅" });
-    expect(tutorial).toBeInTheDocument();
-    // 默认宽度只留图标（SIDEBAR-R1），入口靠 aria-label / title 可辨。
-    expect(tutorial).toHaveAttribute("title", "案例展厅");
-    expect(screen.getByRole("button", { name: /切换主题/ })).toBeInTheDocument();
+    // 底栏移除旧「案例展厅」和「主题切换」按钮，改放全局站内信铃铛与未读状态点
+    expect(screen.queryByRole("button", { name: "打开案例展厅" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /切换主题/ })).toBeNull();
+    const inboxBtn = screen.getByTestId("sidebar-inbox-btn");
+    expect(inboxBtn).toHaveAttribute("aria-label", "站内信（86 条未读）");
+    expect(inboxBtn).toHaveAttribute("title", "站内信（86 条未读）");
+    expect(screen.getByTestId("sidebar-inbox-badge")).toHaveAttribute("data-unread-count", "86");
+    fireEvent.click(inboxBtn);
+    expect(onOpenInbox).toHaveBeenCalledTimes(1);
 
     openAccountMenu();
-    expect(screen.getByRole("menuitem", { name: /管理中心/ })).toBeInTheDocument();
-    expect(screen.getByRole("menuitem", { name: /^市场/ })).toBeInTheDocument();
+    // 顶部计费卡可点击直达账户与计费，并展示完整千分位积分
+    const billingCard = screen.getByTestId("account-menu-billing-card");
+    expect(billingCard.tagName).toBe("BUTTON");
+    expect(billingCard).toHaveTextContent("1,696,777 积分");
+
+    // 内联三段主题切换控件（点击不关闭菜单）
+    const themeGroup = screen.getByTestId("account-menu-theme-control");
+    expect(themeGroup).toHaveAttribute("role", "radiogroup");
+    expect(within(themeGroup).getByRole("radio", { name: "浅色" })).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(within(themeGroup).getByRole("radio", { name: "深色" }));
+    expect(onSetTheme).toHaveBeenCalledWith("dark");
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+
+    // 管理中心 / 市场不再出现在账号菜单
+    expect(screen.queryByRole("menuitem", { name: /管理中心/ })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: /^市场/ })).toBeNull();
+
+    // 管理与接入分组标签与条目
+    expect(screen.getByText("管理与接入")).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /^组织/ })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /管理后台/ })).toHaveAttribute("href", "/admin.html");
-    fireEvent.click(screen.getByRole("menuitem", { name: "视频任务" }));
-    expect(onOpenMediaTasks).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("menuitem", { name: "媒体工作台" })).toBeInTheDocument();
+
+    // 点顶部计费卡直达账户与计费并关闭菜单
+    fireEvent.click(billingCard);
+    expect(onOpenAccount).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("menu")).toBeNull();
 
     openAccountMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "设置" }));
-    expect(onOpenAccount).toHaveBeenCalledTimes(1);
+    expect(onOpenPreferences).toHaveBeenCalledTimes(1);
+
+    openAccountMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "帮助与案例" }));
+    expect(onOpenTutorial).toHaveBeenCalledTimes(1);
+
+    openAccountMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "视频任务" }));
+    expect(onOpenMediaTasks).toHaveBeenCalledTimes(1);
 
     openAccountMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "退出登录" }));
     expect(onLogout).toHaveBeenCalledTimes(1);
   });
 
-  it("「ChatGPT 直连」只在 App 传入回调时出现在账号菜单，未授权不渲染", () => {
+  it("未传 onOpenPreferences 时点「设置」回退触发 onOpenAccount；普通用户不显示「管理与接入」标题", () => {
+    const onOpenAccount = vi.fn();
+    renderSidebar({ onOpenAccount, onOpenTutorial: () => {}, onLogout: () => {} });
+    openAccountMenu();
+    expect(screen.queryByText("管理与接入")).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "设置" }));
+    expect(onOpenAccount).toHaveBeenCalledTimes(1);
+  });
+
+  it("站内信无未读（unreadCount=0 或缺省）时不渲染未读状态点", () => {
+    const { rerender } = renderSidebar({ onOpenInbox: () => {}, unreadCount: 0 });
+    expect(screen.getByTestId("sidebar-inbox-btn")).toHaveAttribute("aria-label", "站内信");
+    expect(screen.queryByTestId("sidebar-inbox-badge")).toBeNull();
+    rerender(
+      <Sidebar
+        sessions={sessions}
+        user={user}
+        onSelect={() => {}}
+        onNew={() => {}}
+        onRename={() => {}}
+        onDelete={() => {}}
+        onOpenInbox={() => {}}
+        unreadCount={3}
+      />,
+    );
+    expect(screen.getByTestId("sidebar-inbox-badge")).toHaveAttribute("data-unread-count", "3");
+    expect(screen.getByTestId("sidebar-inbox-btn")).toHaveAttribute("aria-label", "站内信（3 条未读）");
+  });
+
+  it("「ChatGPT 直连」只在 App 传入回调时出现在账号菜单的「管理与接入」分组，未授权不渲染", () => {
     renderSidebar({ onOpenAccount: () => {}, onOpenMediaTasks: () => {} });
     openAccountMenu();
     expect(screen.queryByRole("menuitem", { name: "ChatGPT 直连" })).toBeNull();
+    expect(screen.queryByText("管理与接入")).toBeNull();
     cleanup();
 
     const onOpenChatGptProxy = vi.fn();
     renderSidebar({ onOpenAccount: () => {}, onOpenChatGptProxy });
     openAccountMenu();
+    expect(screen.getByText("管理与接入")).toBeInTheDocument();
     const item = screen.getByRole("menuitem", { name: "ChatGPT 直连" });
     expect(item).toHaveAttribute("data-product-control");
     fireEvent.click(item);
     expect(onOpenChatGptProxy).toHaveBeenCalledTimes(1);
   });
 
-  it("「API 接入」只在 App 传入回调（admin）时出现在账号菜单，点击触发", () => {
-    renderSidebar({ onOpenAccount: () => {} });
-    openAccountMenu();
-    expect(screen.queryByRole("menuitem", { name: /API 接入/ })).toBeNull();
-    cleanup();
-
+  it("「API 接入」已收敛至设置中心，账号菜单不再重复外置（即使传入兼容 prop onOpenApiAccess）", () => {
     const onOpenApiAccess = vi.fn();
     renderSidebar({ onOpenAccount: () => {}, onOpenApiAccess });
     openAccountMenu();
-    const item = screen.getByRole("menuitem", { name: /API 接入/ });
-    expect(item).toHaveAttribute("data-product-control");
-    expect(item).toHaveTextContent("本地 Claude Code");
-    fireEvent.click(item);
-    expect(onOpenApiAccess).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("menuitem", { name: /API 接入/ })).toBeNull();
+  });
+
+  it("仅传 onCycleTheme 未传 onSetTheme 时，内联主题切换仍可向后兼容回退触发", () => {
+    const onCycleTheme = vi.fn();
+    renderSidebar({ theme: "light", onCycleTheme });
+    openAccountMenu();
+    const themeGroup = screen.getByTestId("account-menu-theme-control");
+    fireEvent.click(within(themeGroup).getByRole("radio", { name: "浅色" }));
+    expect(onCycleTheme).not.toHaveBeenCalled();
+    fireEvent.click(within(themeGroup).getByRole("radio", { name: "深色" }));
+    expect(onCycleTheme).toHaveBeenCalledTimes(1);
   });
 
   it("点击用户区先弹出账号菜单，而不是直接进入设置", () => {
@@ -1632,26 +1730,14 @@ describe("Sidebar S-12 未知项目的会话落回未分类", () => {
 });
 
 describe("Sidebar S-09 底栏最窄宽度", () => {
-  it("220px 时「案例」只留图标，余额用万/亿缩写且精确值在 title", () => {
-    renderSidebar({ width: 220, credits: "1234567", onOpenTutorial: () => {} });
-    const tutorial = screen.getByRole("button", { name: "打开案例展厅" });
-    expect(tutorial).not.toHaveTextContent("案例");
+  it("220px 时底栏余额用万/亿缩写且精确值在 title，不再被案例/主题按钮挤压", () => {
+    renderSidebar({ width: 220, credits: "1234567", onOpenTutorial: () => {}, onOpenInbox: () => {} });
+    expect(screen.queryByRole("button", { name: "打开案例展厅" })).toBeNull();
+    expect(screen.getByTestId("sidebar-inbox-btn")).toBeInTheDocument();
     const chip = screen.getByText(/^余额 /);
     expect(chip).toHaveTextContent("余额 123.4万 积分");
     expect(chip).not.toHaveTextContent("…");
     expect(chip).toHaveAttribute("title", "余额 1,234,567 积分");
-  });
-
-  // SIDEBAR-R1：268px（默认 / 移动抽屉）下「案例」文字会把余额截成「余额 258.5万…」，
-  // 改为只留图标（aria-label / title 不变）；≥300px 拖宽后才带文字。
-  it("默认 268px 只留图标且余额完整；拖宽到 300px 才显示「案例」文字", () => {
-    const { unmount } = renderSidebar({ width: 268, credits: "1234567", onOpenTutorial: () => {} });
-    const tutorial = screen.getByRole("button", { name: "打开案例展厅" });
-    expect(tutorial).not.toHaveTextContent("案例");
-    expect(tutorial).toHaveAttribute("title", "案例展厅");
-    unmount();
-    renderSidebar({ width: 300, credits: "1234567", onOpenTutorial: () => {} });
-    expect(screen.getByRole("button", { name: "打开案例展厅" })).toHaveTextContent("案例");
   });
 });
 
@@ -2106,27 +2192,30 @@ describe("Sidebar 项目归档/置顶（P2）", () => {
 
 
 describe("Sidebar UI-1 层级", () => {
-  it("任务、经验分享是搜索下方带文字的行；案例与主题在账号行右侧；不再有底栏图标行", () => {
+  it("任务/站点/管理中心/市场位于一级主导航；站内信铃铛在账号行右侧；案例与主题收进账号菜单", () => {
     renderSidebar({
       onOpenBoard: () => {},
-      onOpenBlog: () => {},
+      onOpenSites: () => {},
+      onOpenManage: () => {},
+      onOpenMarketplace: () => {},
       onOpenTutorial: () => {},
+      onOpenInbox: () => {},
       theme: "light",
-      onCycleTheme: () => {},
+      onSetTheme: () => {},
     });
     const primary = document.querySelector("[data-product-entry-scope='sidebar-primary']")!;
     const account = document.querySelector("[data-product-entry-scope='sidebar-account']")!;
     expect(document.querySelector("[data-product-entry-scope='sidebar-nav']")).toBeNull();
-    for (const name of ["任务", "经验分享"]) {
+    for (const name of ["任务", "站点", "管理中心", "市场"]) {
       const btn = screen.getByRole("button", { name });
       expect(primary.contains(btn)).toBe(true);
       expect(btn).toHaveTextContent(name);
     }
-    for (const name of ["打开案例展厅", /切换主题/]) {
-      const btn = screen.getByRole("button", { name });
-      expect(account.contains(btn)).toBe(true);
-      expect(primary.contains(btn)).toBe(false);
-    }
+    const inbox = screen.getByTestId("sidebar-inbox-btn");
+    expect(account.contains(inbox)).toBe(true);
+    expect(primary.contains(inbox)).toBe(false);
+    expect(screen.queryByRole("button", { name: "打开案例展厅" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /切换主题/ })).toBeNull();
   });
 
   it("项目超过 5 条时末尾「查看全部 N 条」打开项目主页", () => {

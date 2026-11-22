@@ -21,6 +21,7 @@ import type { PreferenceEffort } from '../lib/modelPreferences'
 import type { PublicModel } from '../lib/types'
 import { cn } from '../lib/utils'
 import { EFFORT_OPTIONS } from './settings/effortOptions'
+import { AtelierIcon } from './ui/AtelierIcons'
 import { ModelFamilyIcon, type ModelFamilyKind, detectModelFamily } from './ui/ModelFamilyIcons'
 
 export type ExtrasLayout = 'dock' | 'column' | 'tab'
@@ -189,6 +190,7 @@ export function SegmentPill({
   'data-service-tier'?: string
   'data-cursor-context'?: string
   'data-context'?: string
+  'data-swarm-mode'?: string
 }) {
   return (
     <button
@@ -215,10 +217,12 @@ export function SegmentPill({
 function SectionHeading({
   title,
   summary,
+  summaryAccent,
   compact,
 }: {
   title: string
   summary: ReactNode
+  summaryAccent?: boolean
   compact?: boolean
 }) {
   return (
@@ -229,7 +233,14 @@ function SectionHeading({
       )}
     >
       <span>{title}</span>
-      <span className="model-picker-cost-pill shrink-0 whitespace-nowrap rounded-full px-2 py-px text-caption font-medium tabular-nums text-muted">
+      <span
+        className={cn(
+          'shrink-0 whitespace-nowrap rounded-full px-2 py-px text-caption font-medium tabular-nums',
+          summaryAccent
+            ? 'bg-accent-soft text-accent ring-1 ring-inset ring-accent/25'
+            : 'model-picker-cost-pill text-muted',
+        )}
+      >
         {summary}
       </span>
     </div>
@@ -263,6 +274,9 @@ export type ModelSelectorExtrasProps = {
   showPlatformEffort: boolean
   effortSupported?: readonly string[]
   effortActive?: PreferenceEffort | null
+  showSwarmMode?: boolean
+  swarmMode?: boolean
+  swarmRunning?: boolean
   onOpenChange: (open: boolean) => void
   onRememberAndSelect: (id: string) => void
   onSelectCursor: (
@@ -278,6 +292,7 @@ export type ModelSelectorExtrasProps = {
   onSelectEffort?: (value: PreferenceEffort | null) => void
   onSelectContextTier?: (tier: CursorContextTier) => void
   onSelectServiceTier?: (tier: ServiceTier | null) => void
+  onSelectSwarmMode?: (enabled: boolean) => void
 }
 
 /**
@@ -312,6 +327,9 @@ export function ModelSelectorExtras({
   showPlatformEffort,
   effortSupported,
   effortActive,
+  showSwarmMode = false,
+  swarmMode = false,
+  swarmRunning = false,
   onOpenChange,
   onRememberAndSelect,
   onSelectCursor,
@@ -319,6 +337,7 @@ export function ModelSelectorExtras({
   onSelectEffort,
   onSelectContextTier,
   onSelectServiceTier,
+  onSelectSwarmMode,
 }: ModelSelectorExtrasProps) {
   const compact = layout === 'dock'
   const cursorStdMember = selectedCursor
@@ -393,6 +412,15 @@ export function ModelSelectorExtras({
                     {tag.label}
                   </span>
                 ))}
+                {swarmMode && (
+                  <span
+                    data-testid="model-picker-extras-swarm-tag"
+                    className="model-picker-tag-accent inline-flex shrink-0 items-center gap-0.5 rounded-full px-1.5 py-px text-micro font-medium leading-tight"
+                  >
+                    <AtelierIcon name="swarm" size={10} className="shrink-0" />
+                    <span>蜂群</span>
+                  </span>
+                )}
               </div>
               {tierLabel && (
                 <p className="mt-0.5 truncate text-caption text-muted">{tierLabel}</p>
@@ -575,6 +603,51 @@ export function ModelSelectorExtras({
                 <span className="text-micro tabular-nums opacity-80">1.5 倍基础单价</span>
               </SegmentPill>
             </div>
+          </div>
+        )}
+
+        {showSwarmMode && onSelectSwarmMode && (
+          <div data-testid="model-picker-swarm-section">
+            <SectionHeading
+              title="协作模式"
+              summary={swarmMode ? '蜂群' : '单兵'}
+              summaryAccent={swarmMode}
+              compact={compact}
+            />
+            {layout === 'column' && (
+              <p className="px-1 pb-1.5 text-caption text-muted">
+                多智能体并行拆解与讨论板，按各成员实际用量计费。
+              </p>
+            )}
+            <div
+              role="group"
+              aria-label="协作模式"
+              className="oc-surface-recessed flex flex-wrap gap-1 rounded-md p-1"
+            >
+              <SegmentPill
+                data-swarm-mode="solo"
+                active={!swarmMode}
+                onClick={() => onSelectSwarmMode(false)}
+              >
+                <span>单兵</span>
+              </SegmentPill>
+              <SegmentPill
+                data-swarm-mode="swarm"
+                active={swarmMode}
+                onClick={() => onSelectSwarmMode(true)}
+              >
+                <AtelierIcon name="swarm" size={13} className="shrink-0" />
+                <span>蜂群</span>
+              </SegmentPill>
+            </div>
+            {swarmRunning && (
+              <p
+                data-testid="model-picker-swarm-running-hint"
+                className="mt-1.5 px-1 text-caption leading-relaxed text-muted"
+              >
+                当前蜂群运行中；切回单兵将在下一条消息生效，不影响看板查看。
+              </p>
+            )}
           </div>
         )}
 

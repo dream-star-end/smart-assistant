@@ -897,6 +897,10 @@ export function App() {
     useSessionEngineOptions(activeId);
   useWorkbenchBridge({ demo, activeId, activeIdRef, isWideRef, setPaneRequest, setPaneOpen, setPaneSheetOpen, serviceTier, setServiceTier });
 
+  const swarmStateRef = useRef<{ swarmMode: boolean; swarmRunning: boolean; disableSwarm?: () => void }>({
+    swarmMode: false,
+    swarmRunning: false,
+  });
   const {
     applyCollabDoc,
     cancelModelSwitch,
@@ -918,6 +922,7 @@ export function App() {
     activeId,
     authorizeSwitch,
     getSwitchOptions,
+    getSwarmState: () => swarmStateRef.current,
     agent,
     auth,
     confirmDialog,
@@ -953,7 +958,7 @@ export function App() {
   // Async goal saves can finish after navigation; only consume the selected draft's project.
   const selectedSessionIdRef = useRef(activeId);
   selectedSessionIdRef.current = activeId;
-  const { swarmSupported, swarmMode, toggleSwarmMode } = useSwarmMode({
+  const { swarmSupported, swarmMode, setSwarmMode, toggleSwarmMode } = useSwarmMode({
     demo, sessionKey: activeId ?? draftSessionId, activeSessionId: activeId,
     wsMessages: !demo && activeId ? (sockRef.current?.getMessages(activeId) ?? EMPTY_WS_MESSAGES) : EMPTY_WS_MESSAGES,
     messagesVersion: sockRef.current?.version ?? 0,
@@ -1187,6 +1192,10 @@ export function App() {
   // 非 demo：展示的消息来自 WS service 快照（就地 mutation + version 触发重渲）。
   const wsMessages = !demo && activeId ? chat.getMessages(activeId) : EMPTY_WS_MESSAGES;
   const swarmUi = useSwarmBoard({ sessionKey: activeId ?? draftSessionId, wsMessages, messagesVersion: chat.version });
+  const swarmRunning = Boolean(
+    swarmUi.latestSwarm && (swarmUi.latestSwarm.phase === "starting" || swarmUi.latestSwarm.phase === "running"),
+  );
+  swarmStateRef.current = { swarmMode, swarmRunning, disableSwarm: () => setSwarmMode(false) };
   // 分享对话框只针对打开时的会话;切会话(返回键/深链)就关掉,不拿旧快照配新标题。
   // biome-ignore lint/correctness/useExhaustiveDependencies: activeId 是触发条件
   useEffect(() => {
@@ -2006,8 +2015,11 @@ export function App() {
     },
     user,
     credits: user?.credits ?? null,
-    onOpenAccount: demo ? undefined : closeMobileThen(() => openSettings()),
+    onOpenAccount: demo ? undefined : closeMobileThen(() => openSettings("account")),
+    onOpenPreferences: demo ? undefined : closeMobileThen(() => openSettings("preferences")),
     onOpenFeedback: demo ? undefined : closeMobileThen(() => openSettings("feedback")),
+    onOpenInbox: demo ? undefined : closeMobileThen(() => setInboxOpen(true)),
+    unreadCount: inbox.unreadCount,
     onNew: () => {
       setBoardOpen(false);
       handleNew();
@@ -2048,19 +2060,12 @@ export function App() {
     onOpenManage: demo ? undefined : closeMobileThen(() => openManage(DEFAULT_MANAGE_TAB)),
     onOpenMarketplace: demo ? undefined : closeMobileThen(() => openMarketplace("browse")),
     onOpenTutorial: demo ? undefined : closeMobileThen(() => openTutorial()),
-    onOpenBlog:
-      demo || !communityBlogEnabled
-      ? undefined
-      : closeMobileThen(() => {
-          openTutorial();
-          setTutorialTab("blog");
-        }),
     onOpenMediaTasks:
       demo || mediaTasksAvailable === false ? undefined : closeMobileThen(() => setMediaTasksOpen(true)),
     onOpenStudio: !demo && studioAvailable ? closeMobileThen(() => window.location.assign("/studio")) : undefined,
     onOpenChatGptProxy: !demo && chatGptProxyEnabled ? closeMobileThen(() => setChatGptProxyOpen(true)) : undefined,
-    onOpenApiAccess: !demo && user?.role === "admin" ? closeMobileThen(() => openSettings("api-access")) : undefined,
     theme,
+    onSetTheme: setTheme,
     onCycleTheme: cycle,
     showAdmin: !demo && user?.role === "admin",
     onOpenOrg:
@@ -2161,6 +2166,9 @@ export function App() {
               onOpenMobileNav={() => setMobileNavOpen(true)}
               sidebarCollapsed={collapsed}
               onExpandSidebar={() => setCollapsed(false)}
+              sessionUnreadCount={unreadSessions.unreadIds.size}
+              updateAvailable={!demo && updatePillVisible}
+              onReloadForUpdate={demo ? undefined : () => appUpdate.reloadNow()}
               sessionIds={sessions.map((s) => s.id)}
               onOpenSession={(id) => {
                 // originSessionKey 是 agent:<id>:webchat:dm:<peerId>，不能当 Session.id。
@@ -2204,6 +2212,9 @@ export function App() {
               onOpenMobileNav={() => setMobileNavOpen(true)}
               sidebarCollapsed={collapsed}
               onExpandSidebar={() => setCollapsed(false)}
+              sessionUnreadCount={unreadSessions.unreadIds.size}
+              updateAvailable={!demo && updatePillVisible}
+              onReloadForUpdate={demo ? undefined : () => appUpdate.reloadNow()}
             />
           </LazyBoundary>
         ) : homeProject && projectHome ? (
@@ -2249,6 +2260,9 @@ export function App() {
               loadingArchived={loadingArchived}
               sidebarCollapsed={collapsed}
               onExpandSidebar={() => setCollapsed(false)}
+              sessionUnreadCount={unreadSessions.unreadIds.size}
+              updateAvailable={!demo && updatePillVisible}
+              onReloadForUpdate={demo ? undefined : () => appUpdate.reloadNow()}
             />
           </LazyBoundary>
         ) : (
@@ -2303,6 +2317,10 @@ export function App() {
           onSelectContextTier={demo ? undefined : setContextTier}
           serviceTier={serviceTier}
           onSelectServiceTier={demo ? undefined : setServiceTier}
+          swarmSupported={swarmSupported}
+          swarmMode={swarmMode}
+          swarmRunning={swarmRunning}
+          onSelectSwarmMode={demo ? undefined : setSwarmMode}
           modelPickerOpen={modelPickerOpen}
           onModelPickerOpenChange={setModelPickerOpen}
           // 团队模式知情指示:与 send 生效条件同构(仅 main 生效),顶栏所见 = 实际所发。
@@ -2316,13 +2334,10 @@ export function App() {
               : undefined
           }
           onDisableAdvisorMode={() => setCollabMode("solo")}
-          credits={demo ? null : (user?.credits ?? null)}
-          onOpenBilling={demo ? undefined : () => openSettings()}
           sidebarCollapsed={collapsed}
           onExpandSidebar={() => setCollapsed(false)}
           onNew={handleNew}
           onOpenMobileNav={() => setMobileNavOpen(true)}
-          onOpenInbox={demo ? undefined : () => setInboxOpen(true)}
           onOpenFind={demo ? undefined : () => setFindOpen(true)}
           onShare={demo ? undefined : () => setShareOpen(true)}
           onToggleQuickAsk={gated ? undefined : () => setQuickAsk((s) => ({ ...s, open: !s.open, mounted: true }))}
@@ -2330,7 +2345,6 @@ export function App() {
           quickAskSending={quickAsk.sending}
           onTogglePane={paneAvailable && !demo ? togglePane : undefined}
           paneOpen={paneShown}
-          unreadCount={inbox.unreadCount}
           sessionUnreadCount={unreadSessions.unreadIds.size}
           updateAvailable={!demo && updatePillVisible}
           onReloadForUpdate={demo ? undefined : () => appUpdate.reloadNow()}
@@ -2574,6 +2588,16 @@ export function App() {
                   >
                     {bannersExpanded ? "收起" : "展开"}
                   </Button>
+                </div>
+              </Alert>
+            </div>
+          )}
+          {!demo && !gated && user?.credits != null && Number.isFinite(Number(user.credits)) && Number(user.credits) <= 0 && (
+            <div className="mx-auto mb-2 max-w-3xl px-4">
+              <Alert tone="danger" density="compact" data-testid="credits-depleted-banner">
+                <div className="flex items-center justify-between gap-3">
+                  <span>积分余额已耗尽，充值后可继续对话。</span>
+                  <Button size="sm" variant="secondary" className="-my-1 shrink-0" onClick={() => openSettings("account")}>去充值</Button>
                 </div>
               </Alert>
             </div>

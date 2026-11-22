@@ -1551,3 +1551,128 @@ describe('ModelSelector OCV5-836 现代品牌徽标、去刷屏名称清洗与�
     }
   })
 })
+
+describe('ModelSelector OCV5-843 蜂群模式集成（列表微标 + 参数区协作模式 + 顶栏胶囊激活态）', () => {
+  const SWARM_MODELS: PublicModel[] = [
+    { id: 'antigravity-gemini-4-neon', display_name: 'Gemini 4 Neon (Antigravity)', engine: 'antigravity', cost_x: 2.7 },
+    { id: 'antigravity-orchestrator-neon', display_name: 'Orchestrator Neon (Antigravity)', engine: 'antigravity', cost_x: 4.5 },
+    { id: 'antigravity-claude-opus-5.5', display_name: 'Claude Opus 5.5 (Antigravity)', engine: 'antigravity', cost_x: 2.1 },
+    { id: 'claude-opus-5.5', display_name: 'Claude Opus 5.5', engine: 'ccb', cost_x: 6.1 },
+    { id: 'gpt-6.2-astra', display_name: 'GPT-6.2-Astra', engine: 'codex', cost_x: 4.1 },
+  ]
+
+  it('仅 Antigravity 模型行展示只读蜂群微标，同名双 Claude Opus 5.5 一眼可辨；协作模式点击不关闭面板', async () => {
+    const onSelectSwarmMode = vi.fn()
+    render(
+      <ModelSelector
+        models={SWARM_MODELS}
+        selectedId="antigravity-orchestrator-neon"
+        onSelect={() => {}}
+        swarmSupported
+        swarmMode={false}
+        onSelectSwarmMode={onSelectSwarmMode}
+      />,
+    )
+
+    // 即使 Orchestrator 无思考档位，也应进入桌面双栏并展示协作模式
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findByTestId('model-picker-two-col')
+
+    const agClaudeRow = document.querySelector('[data-model-id="antigravity-claude-opus-5.5"]')
+    const nativeClaudeRow = document.querySelector('[data-model-id="claude-opus-5.5"]')
+    expect(agClaudeRow?.querySelector('[data-testid="model-row-swarm-capable"]')).toBeTruthy()
+    expect(nativeClaudeRow?.querySelector('[data-testid="model-row-swarm-capable"]')).toBeNull()
+
+    const swarmSection = screen.getByTestId('model-picker-swarm-section')
+    expect(swarmSection.textContent).toContain('协作模式')
+    expect(swarmSection.textContent).toContain('多智能体并行拆解与讨论板')
+
+    const swarmPill = document.querySelector('[data-swarm-mode="swarm"]') as HTMLButtonElement
+    const soloPill = document.querySelector('[data-swarm-mode="solo"]') as HTMLButtonElement
+    expect(soloPill).toHaveAttribute('aria-pressed', 'true')
+    expect(swarmPill).toHaveAttribute('aria-pressed', 'false')
+
+    fireEvent.click(swarmPill)
+    expect(onSelectSwarmMode).toHaveBeenCalledWith(true)
+    // 切换协作模式不关闭面板
+    expect(screen.getByTestId('model-picker-two-col')).toBeInTheDocument()
+  })
+
+  it('开启蜂群态时顶栏触发器呈现暖陶土激活态、双端可见图标、桌面蜂群微徽标、运行态呼吸点与摘要同步；团队模式时隐藏', async () => {
+    const { rerender } = render(
+      <ModelSelector
+        models={SWARM_MODELS}
+        selectedId="antigravity-gemini-4-neon"
+        onSelect={() => {}}
+        effortSupported={['low', 'medium', 'high']}
+        effortActive="high"
+        onSelectEffort={() => {}}
+        swarmSupported
+        swarmMode
+        swarmRunning
+        onSelectSwarmMode={() => {}}
+      />,
+    )
+
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(trigger).toHaveAttribute('data-swarm-active', 'true')
+    expect(trigger.className).toContain('oc-model-trigger-swarm')
+    expect(trigger.className).toContain('oc-shimmer-sheen')
+    expect(screen.getByTestId('model-trigger-swarm-icon')).toBeInTheDocument()
+    expect(screen.getByTestId('model-trigger-swarm-running-dot')).toBeInTheDocument()
+
+    const badge = screen.getByTestId('model-trigger-swarm-badge')
+    expect(badge).toHaveTextContent('蜂群')
+    expect(badge.className).toContain('hidden')
+    expect(badge.className).toContain('sm:inline-flex')
+
+    openMenu(trigger)
+    await screen.findByTestId('model-picker-two-col')
+    expect(screen.getByTestId('model-picker-extras-swarm-tag')).toHaveTextContent('蜂群')
+    expect(screen.getByTestId('model-picker-swarm-running-hint')).toHaveTextContent('当前蜂群运行中')
+
+    // 团队模式锁定态不叠加蜂群样式
+    rerender(
+      <ModelSelector
+        models={SWARM_MODELS}
+        selectedId="antigravity-gemini-4-neon"
+        onSelect={() => {}}
+        teamEngineActive
+        swarmSupported
+        swarmMode
+        swarmRunning
+        onSelectSwarmMode={() => {}}
+      />,
+    )
+    expect(screen.getByRole('button', { name: '选择对话模型' })).not.toHaveAttribute('data-swarm-active')
+    expect(screen.queryByTestId('model-trigger-swarm-badge')).toBeNull()
+  })
+
+  it('移动端 BottomSheet 头部副标同步显示蜂群微标签，并在底部参数坞可切换协作模式', async () => {
+    const restore = stubViewport({ width: 390, height: 844 })
+    const onSelectSwarmMode = vi.fn()
+    try {
+      render(
+        <ModelSelector
+          models={SWARM_MODELS}
+          selectedId="antigravity-gemini-4-neon"
+          onSelect={() => {}}
+          swarmSupported
+          swarmMode
+          onSelectSwarmMode={onSelectSwarmMode}
+        />,
+      )
+      fireEvent.click(screen.getByRole('button', { name: '选择对话模型' }))
+      await screen.findByRole('dialog')
+
+      expect(screen.getByTestId('model-picker-sheet-swarm-tag')).toHaveTextContent('蜂群')
+      const dock = screen.getByTestId('model-picker-extras-dock')
+      const soloBtn = dock.querySelector('[data-swarm-mode="solo"]') as HTMLButtonElement
+      fireEvent.click(soloBtn)
+      expect(onSelectSwarmMode).toHaveBeenCalledWith(false)
+      expect(screen.getByRole('dialog')).toBeInTheDocument()
+    } finally {
+      restore()
+    }
+  })
+})

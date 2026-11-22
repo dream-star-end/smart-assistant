@@ -46,10 +46,8 @@ import { RepoPill } from "./github/RepoPill";
 import {
   IconButton,
   iconButtonVariants,
-  StatusPill,
   useToast,
 } from "./ui";
-import { AtelierIcon } from "./ui/AtelierIcons";
 
 // Captured by one upload, not keyed by the reusable "new" draft name. Promotion
 // moves this exact attachment's owner without redirecting future new drafts.
@@ -1281,13 +1279,27 @@ export function Composer({
               onOpenGoal={() => setGoalOpen(true)}
               onOpenRepo={onOpenRepo}
               repoSelection={repoSelection}
-              hasSwarmPlaybooks={Boolean(swarmSupported && onToggleSwarmMode)}
+              hasSwarmPlaybooks={Boolean(swarmSupported)}
               onOpenSwarmPlaybooks={() => {
                 setPlusMenuOpen(false);
                 window.setTimeout(() => setPlaybookOpen(true), 0);
               }}
             />
-            {((onOpenRepo && !hasBoundRepo) || (swarmSupported && onToggleSwarmMode)) && (
+            {swarmSupported && playbookOpen && (
+              <SwarmPlaybookPopoverLazy
+                disabled={disabled}
+                currentText={value}
+                open={playbookOpen}
+                onOpenChange={setPlaybookOpen}
+                triggerClassName="hidden"
+                onSelectPlaybook={(draft) => {
+                  setValue(draft);
+                  if (!swarmMode) onToggleSwarmMode?.();
+                  window.requestAnimationFrame(() => ref.current?.focus());
+                }}
+              />
+            )}
+            {onOpenRepo && !hasBoundRepo && (
               <span aria-hidden className="mx-0.5 hidden h-4 w-px shrink-0 bg-border/70 sm:block" />
             )}
             {/* 未绑定仓库时：移动端收纳在「+」菜单内，桌面 sm+ 保留无框轻量入口；已绑定则统一展示于顶部微上下文条。 */}
@@ -1295,52 +1307,6 @@ export function Composer({
               <span className="hidden min-w-0 items-center sm:flex" data-testid="composer-repo-slot">
                 <RepoPill selection={null} onClick={onOpenRepo} quiet />
               </span>
-            )}
-            {swarmSupported && onToggleSwarmMode && (
-              <div className="relative flex min-w-0 shrink-0 items-center gap-1">
-                <button
-                  type="button"
-                  data-testid="composer-swarm-toggle"
-                  data-product-control
-                  aria-pressed={swarmMode}
-                  disabled={disabled}
-                  onClick={onToggleSwarmMode}
-                  title={
-                    swarmMode
-                      ? "已开启 Antigravity 蜂群模式：多智能体并行协作与实时讨论板（各成员请求按当前模型路由实际用量计费）。点击关闭"
-                      : "开启 Antigravity 蜂群模式：多智能体并行拆解与互审（也可直接输入 /swarm）"
-                  }
-                  className={cn(
-                    "oc-btn-tactile oc-spring-press inline-flex min-h-8 shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-caption font-medium transition-colors [@media(hover:none)]:min-h-10",
-                    "outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50",
-                    swarmMode
-                      ? "oc-breathe-aura border-accent/30 bg-accent-soft text-accent shadow-xs hover:bg-accent/15"
-                      : "border-transparent text-muted hover:bg-hover hover:text-fg",
-                  )}
-                >
-                  <AtelierIcon
-                    name="swarm"
-                    size={15}
-                    className={cn("shrink-0", swarmMode && "text-accent")}
-                  />
-                  <span>蜂群</span>
-                  {swarmMode && (
-                    <StatusPill status="running" variant="dot" size="sm" decorative />
-                  )}
-                </button>
-                <SwarmPlaybookPopoverLazy
-                  disabled={disabled}
-                  currentText={value}
-                  open={playbookOpen}
-                  onOpenChange={setPlaybookOpen}
-                  triggerClassName="hidden sm:inline-flex"
-                  onSelectPlaybook={(draft) => {
-                    setValue(draft);
-                    if (!swarmMode) onToggleSwarmMode();
-                    window.requestAnimationFrame(() => ref.current?.focus());
-                  }}
-                />
-              </div>
             )}
             <div className="ml-auto flex shrink-0 items-center gap-1.5">
               {/* 生成中排队发送(C-02):此前生成中唯一按钮是「停止」,桌面 Enter 排队无反馈,触屏 Enter=换行

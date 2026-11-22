@@ -315,7 +315,9 @@ function requestToken(init?: RequestInit): string {
 }
 
 async function openAgentPicker() {
-  fireEvent.click(await screen.findByRole('button', { name: /全能助手|切换智能体/ }))
+  const more = await screen.findByTestId('header-overflow-trigger')
+  fireEvent.pointerDown(more, { button: 0, pointerType: 'mouse' })
+  fireEvent.click(await screen.findByTestId('overflow-agent-item'))
   await screen.findByRole('dialog', { name: '选择智能体' })
 }
 
@@ -2231,9 +2233,15 @@ describe('经验分享入口跟随 feature_community_blog（OCV5-577）', () => 
     render(<App />)
   }
 
-  test('已登录（静默续期）且开关打开：侧栏出现「经验分享」入口', async () => {
+  test('已登录（静默续期）且开关打开：经验分享收口至帮助与案例，侧栏一级导航不重复渲染 blog-nav', async () => {
     bootLoggedIn(true)
-    expect(await screen.findByTestId('blog-nav')).toBeInTheDocument()
+    expect(await screen.findByTestId('manage-nav')).toBeInTheDocument()
+    expect(screen.getByTestId('marketplace-nav')).toBeInTheDocument()
+    expect(screen.queryByTestId('blog-nav')).toBeNull()
+    const accountTrigger = screen.getByRole('button', { name: '账号菜单' })
+    fireEvent.pointerDown(accountTrigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('menuitem', { name: /帮助与案例/ }))
+    expect(await screen.findByText('经验分享')).toBeInTheDocument()
   })
 
   test('未登录访客打开 tab=blog 深链：开关打开时进入经验分享', async () => {

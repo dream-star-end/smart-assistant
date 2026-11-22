@@ -53,10 +53,22 @@ export function compactMobileModelLabel(label: string): string {
   return stripped || label
 }
 
-function CostMark({ model, multiplier = 1 }: { model?: { cost_x?: number }; multiplier?: number }) {
+function CostMark({
+  model,
+  multiplier = 1,
+  className,
+}: {
+  model?: { cost_x?: number }
+  multiplier?: number
+  className?: string
+}) {
   const label = modelCostLabel(model, multiplier)
   if (!label) return null
-  return <span className="shrink-0 text-caption font-normal tabular-nums text-faint">{label}</span>
+  return (
+    <span className={cn('shrink-0 text-caption font-normal tabular-nums text-faint', className)}>
+      {label}
+    </span>
+  )
 }
 
 function promoLabelOf(model: { promo_label?: unknown } | undefined): string | undefined {
@@ -161,6 +173,10 @@ export function ModelSelector({
   onSelectContextTier,
   serviceTier,
   onSelectServiceTier,
+  swarmSupported,
+  swarmMode,
+  swarmRunning,
+  onSelectSwarmMode,
   open,
   onOpenChange,
   onCancelSwitch,
@@ -186,6 +202,11 @@ export function ModelSelector({
    */
   serviceTier?: ServiceTier | null
   onSelectServiceTier?: (tier: ServiceTier | null) => void
+  /** OCV5-843 Antigravity 蜂群模式：面板内协作模式开关 + 顶栏胶囊激活态样式。 */
+  swarmSupported?: boolean
+  swarmMode?: boolean
+  swarmRunning?: boolean
+  onSelectSwarmMode?: (enabled: boolean) => void
   open?: boolean
   onOpenChange?: (open: boolean) => void
   /** 压缩切换进行中时给出：trigger 此时禁用，这是放弃等待、保留原模型的唯一入口。 */
@@ -258,6 +279,8 @@ export function ModelSelector({
   }, [teamEngineActive])
 
   const selectedPromo = promoLabelOf(selected)
+  const swarmActive = Boolean(swarmMode && !teamEngineActive)
+  const swarmRunningActive = Boolean(swarmRunning && swarmActive)
 
   const triggerButton = (
     <button
@@ -281,17 +304,21 @@ export function ModelSelector({
             ? `团队模式固定由队长模型 ${engineLabel} 执行与计费，关闭团队模式后可切换模型`
             : selectedDegraded
               ? '当前模型暂不可用，点击更换'
-              : hasCompactLabel
-                ? label
-                : undefined
+              : swarmActive
+                ? `${label} · 蜂群模式已开启`
+                : hasCompactLabel
+                  ? label
+                  : undefined
       }
       aria-busy={loading || undefined}
       data-degraded={selectedDegraded && !teamEngineActive ? 'true' : undefined}
+      data-swarm-active={swarmActive ? 'true' : undefined}
       className={cn(
         'oc-btn-tactile oc-spring-press flex min-h-10 min-w-0 max-w-full items-center gap-1.5 rounded-full border border-border/80 bg-surface/85 px-3 py-1 text-section font-medium text-fg shadow-xs outline-none sm:min-h-10 sm:rounded-lg sm:border-border/60 sm:bg-surface/65 sm:px-2.5 sm:py-1.5',
         'hover:border-border-strong hover:bg-surface hover:text-fg hover:shadow-soft focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
         'disabled:pointer-events-none disabled:opacity-50',
         sheetOpen && 'border-accent/45 bg-surface shadow-soft',
+        swarmActive && 'oc-model-trigger-swarm oc-shimmer-sheen',
         teamEngineActive && 'border-accent/25 bg-accent-soft/70 text-accent hover:text-accent disabled:opacity-100',
       )}
     >
@@ -305,6 +332,20 @@ export function ModelSelector({
         />
       ) : teamEngineActive ? (
         <Users size={14} strokeWidth={1.75} className="shrink-0 text-accent" />
+      ) : swarmActive && !selectedDegraded ? (
+        <span
+          className="relative inline-flex shrink-0 items-center justify-center"
+          data-testid="model-trigger-swarm-icon"
+        >
+          <AtelierIcon name="swarm" size={14} className="shrink-0 text-accent" />
+          {swarmRunningActive && (
+            <span
+              aria-hidden
+              data-testid="model-trigger-swarm-running-dot"
+              className="oc-alive-dot absolute -right-0.5 -top-0.5 size-[5px] ring-1 ring-surface"
+            />
+          )}
+        </span>
       ) : !selectedDegraded ? (
         <AtelierIcon name="sparkles" size={14} className="hidden shrink-0 text-accent/85 sm:block" />
       ) : null}
@@ -344,6 +385,14 @@ export function ModelSelector({
               · {tierLabel}
             </span>
           )}
+          {swarmActive && (
+            <span
+              data-testid="model-trigger-swarm-badge"
+              className="oc-badge-craft hidden shrink-0 items-center rounded-full bg-accent/14 px-1.5 py-0.5 text-micro font-semibold leading-none text-accent sm:inline-flex"
+            >
+              蜂群
+            </span>
+          )}
           {mobileSpeedBadge && (
             <span
               data-testid="model-trigger-speed-mobile"
@@ -354,7 +403,11 @@ export function ModelSelector({
           )}
         </>
       )}
-      <CostMark model={teamEngineActive ? leaderModel : selected} multiplier={triggerCostMultiplier} />
+      <CostMark
+        model={teamEngineActive ? leaderModel : selected}
+        multiplier={triggerCostMultiplier}
+        className={swarmActive ? 'text-accent/80' : undefined}
+      />
       {!teamEngineActive && <PromoBadge label={selectedPromo} className="hidden sm:inline-flex" />}
       {!teamEngineActive && (
         <ChevronDown
@@ -362,6 +415,7 @@ export function ModelSelector({
           strokeWidth={1.75}
           className={cn(
             'shrink-0 text-faint transition-transform duration-200 ease-spring',
+            swarmActive && 'text-accent/75',
             sheetOpen && 'rotate-180 text-accent',
           )}
         />
@@ -385,6 +439,10 @@ export function ModelSelector({
     onSelectContextTier,
     serviceTier,
     onSelectServiceTier,
+    swarmSupported,
+    swarmMode: swarmActive,
+    swarmRunning: Boolean(swarmRunning && !teamEngineActive),
+    onSelectSwarmMode,
     label,
     tierLabel,
     shortViewport,

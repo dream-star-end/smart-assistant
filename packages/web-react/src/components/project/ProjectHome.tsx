@@ -113,6 +113,9 @@ export type ProjectHomeProps = {
   loadingArchived?: boolean;
   sidebarCollapsed?: boolean;
   onExpandSidebar?: () => void;
+  sessionUnreadCount?: number;
+  updateAvailable?: boolean;
+  onReloadForUpdate?: () => void;
   /**
    * 项目的看板/记忆/技能/定时任务在各自的页面里,按本项目的范围打开。
    * onPrepareBoard 确保本项目的看板已在容器里建好(首次用时创建);成功后本组件把
@@ -207,6 +210,9 @@ export function ProjectHome(props: ProjectHomeProps) {
     onPrepareBoard,
     onShowSurface,
     onExpandSidebar,
+    sessionUnreadCount,
+    updateAvailable,
+    onReloadForUpdate,
     recipeSchedule = false,
   } = props;
 
@@ -318,6 +324,9 @@ export function ProjectHome(props: ProjectHomeProps) {
         onOpenMobileNav={onOpenMobileNav}
         sidebarCollapsed={sidebarCollapsed}
         onExpandSidebar={onExpandSidebar}
+        sessionUnreadCount={sessionUnreadCount}
+        updateAvailable={updateAvailable}
+        onReloadForUpdate={onReloadForUpdate}
       >
         <span className="text-meta font-medium text-muted">项目</span>
       </WorkspaceShellHeader>

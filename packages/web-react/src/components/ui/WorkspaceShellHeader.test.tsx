@@ -72,4 +72,74 @@ describe("WorkspaceShellHeader", () => {
       expect(dot).not.toHaveClass("motion-safe:animate-pulse");
     }
   });
+
+  it("mobileLeftExtra 落在 md:hidden 左组紧邻汉堡钮，与桌面 md:flex 折叠左组严格互斥", () => {
+    const onMobileAction = vi.fn();
+    const onDesktopAction = vi.fn();
+    render(
+      <WorkspaceShellHeader
+        onOpenMobileNav={vi.fn()}
+        mobileLeftExtra={
+          <button type="button" data-testid="mobile-extra" onClick={onMobileAction}>
+            移动新建
+          </button>
+        }
+        sidebarCollapsed
+        onExpandSidebar={vi.fn()}
+        collapsedExtra={
+          <button type="button" data-testid="desktop-extra" onClick={onDesktopAction}>
+            桌面新建
+          </button>
+        }
+      >
+        <span>内容</span>
+      </WorkspaceShellHeader>,
+    );
+
+    const mobileLeft = screen.getByTestId("shell-mobile-left");
+    const collapsedLeft = screen.getByTestId("shell-collapsed-left");
+    expect(mobileLeft).toHaveClass("md:hidden");
+    expect(collapsedLeft).toHaveClass("hidden", "md:flex");
+    expect(mobileLeft).toContainElement(screen.getByTestId("mobile-extra"));
+    expect(collapsedLeft).toContainElement(screen.getByTestId("desktop-extra"));
+
+    fireEvent.click(screen.getByTestId("mobile-extra"));
+    expect(onMobileAction).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByTestId("desktop-extra"));
+    expect(onDesktopAction).toHaveBeenCalledTimes(1);
+  });
+
+  it("updateAvailable + onReloadForUpdate 在壳层统一展示轻刷新条，缺任一条件时不渲染", () => {
+    const onReload = vi.fn();
+    const { rerender, container } = render(
+      <WorkspaceShellHeader onReloadForUpdate={onReload}>
+        <span>内容</span>
+      </WorkspaceShellHeader>,
+    );
+    expect(screen.queryByTestId("shell-update-banner")).toBeNull();
+    expect(screen.queryByTestId("update-pill")).toBeNull();
+
+    rerender(
+      <WorkspaceShellHeader updateAvailable>
+        <span>内容</span>
+      </WorkspaceShellHeader>,
+    );
+    expect(screen.queryByTestId("shell-update-banner")).toBeNull();
+
+    rerender(
+      <WorkspaceShellHeader updateAvailable onReloadForUpdate={onReload}>
+        <span>内容</span>
+      </WorkspaceShellHeader>,
+    );
+    const header = container.querySelector("header");
+    const banner = screen.getByTestId("shell-update-banner");
+    const pill = screen.getByTestId("update-pill");
+    expect(header).toContainElement(banner);
+    expect(banner).toContainElement(pill);
+    expect(pill).toHaveAttribute("aria-label", "有新版本，点击刷新页面");
+    expect(pill).toHaveTextContent("发现新版本 · 立即刷新");
+
+    fireEvent.click(pill);
+    expect(onReload).toHaveBeenCalledTimes(1);
+  });
 });

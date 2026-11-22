@@ -12,6 +12,8 @@ import { useEffect, useRef, useCallback, useState } from "react";
 import { resolveNewSessionModel, resolveSessionModel } from "../lib/modelPreferences";
 import { freshSessionRequiredForSwitch, freshSessionSwitchNotice, modelSwitchCompactionReason } from "../lib/modelSwitch";
 import { readSessionServiceTier, writeSessionServiceTier } from "../lib/sessionServiceTier";
+import { writeSessionSwarmMode } from "../lib/sessionSwarmMode";
+import { isAntigravityModelForUi } from "../components/chat/swarmDetect";
 import { MODEL_SWITCH_CANCELLED_MESSAGE } from "../lib/chat/modelSwitchCostDispatch";
 import { type CollabUiState, EMPTY_COLLAB_UI, docToUiState, type CollabMode, advisorParentCapabilityAllowed, ADVISOR_PARENT_BLOCK_REASON, recommendedAdvisorModel, keepCollabChoiceOnSaveFailure, collaborationPutBody } from "../lib/collaborationConfig";
 import { api, ApiError, apiErrorMessage } from "../lib/api";
@@ -41,6 +43,11 @@ export type SessionModelAndCollabInput = {
   sessionsResetRef: React.RefObject<() => void>;
   serviceTier?: ServiceTier | null;
   setServiceTier?: (tier: ServiceTier | null) => void;
+  swarmMode?: boolean;
+  swarmRunning?: boolean;
+  onAutoDisableSwarm?: () => void;
+  /** 动态读取最新蜂群态（供调用方 hook 声明晚于本 hook 时避免首帧陈旧闭包）。 */
+  getSwarmState?: () => { swarmMode: boolean; swarmRunning: boolean; disableSwarm?: () => void };
   setModelId: React.Dispatch<React.SetStateAction<string | undefined>>;
   setModelSwitchPreparing: React.Dispatch<React.SetStateAction<boolean>>;
   setSessions: React.Dispatch<React.SetStateAction<Session[]>>;
@@ -67,6 +74,10 @@ export function useSessionModelAndCollab({
   sessionsResetRef,
   serviceTier = null,
   setServiceTier,
+  swarmMode = false,
+  swarmRunning = false,
+  onAutoDisableSwarm,
+  getSwarmState,
   setModelId,
   setModelSwitchPreparing,
   setSessions,
@@ -157,6 +168,14 @@ export function useSessionModelAndCollab({
   latestServiceTierRef.current = serviceTier;
   const setServiceTierRef = useRef(setServiceTier);
   setServiceTierRef.current = setServiceTier;
+  const latestSwarmModeRef = useRef(swarmMode);
+  latestSwarmModeRef.current = swarmMode;
+  const latestSwarmRunningRef = useRef(swarmRunning);
+  latestSwarmRunningRef.current = swarmRunning;
+  const onAutoDisableSwarmRef = useRef(onAutoDisableSwarm);
+  onAutoDisableSwarmRef.current = onAutoDisableSwarm;
+  const getSwarmStateRef = useRef(getSwarmState);
+  getSwarmStateRef.current = getSwarmState;
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); setModelId, setModelSwitchPreparing, sockRef are App useState setter/useRef passed in, stable
   const selectModel = useCallback(
     async (id: string) => {
@@ -173,14 +192,31 @@ export function useSessionModelAndCollab({
         if (setServiceTierRef.current && nextTier !== (latestServiceTierRef.current ?? null)) {
           setServiceTierRef.current(nextTier);
         }
+        const liveSwarm = getSwarmStateRef.current?.();
+        const wasSwarmMode = liveSwarm ? liveSwarm.swarmMode : Boolean(latestSwarmModeRef.current);
+        const wasSwarmRunning = liveSwarm ? liveSwarm.swarmRunning : Boolean(latestSwarmRunningRef.current);
+        const disableSwarm = liveSwarm?.disableSwarm ?? onAutoDisableSwarmRef.current;
+        const autoDisabledSwarm = wasSwarmMode && !isAntigravityModelForUi(id, models);
+        if (autoDisabledSwarm) {
+          if (disableSwarm) {
+            disableSwarm();
+          } else if (!demo && sid) {
+            writeSessionSwarmMode(sid, false);
+          }
+        }
         // 成功反馈只挂用户主动切换路径:boot 恢复模型偏好走上方 resolveSessionModel 的
         // setModelId,不经过 commit,不会误报。失败面已有 toast(压缩失败)或 server-wins
         // 盖回,成功此前静默;压缩切换(prepareModelSwitch)带明确等待,给压缩语义文案。
         const displayName = models.find((m) => m.id === id)?.display_name ?? id;
-        toast(
-          modelSwitchId ? `已压缩上下文并切换到 ${displayName}` : `已切换到 ${displayName}`,
-          "success",
-        );
+        const baseToast = modelSwitchId
+          ? `已压缩上下文并切换到 ${displayName}`
+          : `已切换到 ${displayName}`;
+        const toastText = autoDisabledSwarm
+          ? wasSwarmRunning
+            ? `${baseToast}（当前蜂群仍在后台运行，新消息将以单兵模式发送）`
+            : `${baseToast}（已自动关闭蜂群模式）`
+          : baseToast;
+        toast(toastText, "success");
         if (demo) return;
         if (!sid) return;
         setSessions((c) => c.map((s) => (s.id === sid ? { ...s, modelId: id } : s)));

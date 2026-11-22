@@ -832,11 +832,61 @@ body {
       inset 0 1px 0 rgba(255, 255, 255, 0.1);
   }
   .oc-composer-dock[data-swarm="true"] {
-    border-color: color-mix(in srgb, var(--accent) 46%, var(--border-strong));
+    border-color: color-mix(in srgb, var(--accent) 36%, var(--border-strong));
     box-shadow:
-      0 0 0 2px color-mix(in srgb, var(--accent) 14%, transparent),
-      0 6px 24px -6px color-mix(in srgb, var(--accent) 20%, transparent),
+      0 0 0 1.5px color-mix(in srgb, var(--accent) 10%, transparent),
+      0 4px 18px -6px color-mix(in srgb, var(--accent) 15%, transparent),
       var(--shadow-soft);
+  }
+  .dark .oc-composer-dock[data-swarm="true"] {
+    border-color: color-mix(in srgb, var(--accent) 42%, var(--border-strong));
+    box-shadow:
+      0 0 0 1.5px color-mix(in srgb, var(--accent) 14%, transparent),
+      0 6px 22px -6px color-mix(in srgb, var(--accent) 20%, transparent),
+      var(--shadow-soft);
+  }
+
+  /* OCV5-843: 顶栏选中模型胶囊（蜂群激活态）—— 明暗双主题柔光暖陶土边框 + 轻渐变 + 克制投影，
+     区别于 teamEngineActive 实心锁定态，保持可点击切换质感。 */
+  .oc-model-trigger-swarm[data-swarm-active="true"] {
+    border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+    background: linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--accent) 10%, var(--surface)) 0%,
+      color-mix(in srgb, var(--accent) 4%, var(--surface)) 100%
+    );
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--accent) 12%, transparent),
+      0 2px 10px -3px color-mix(in srgb, var(--accent) 22%, transparent),
+      inset 0 1px 0 color-mix(in srgb, var(--surface) 70%, transparent);
+  }
+  .oc-model-trigger-swarm[data-swarm-active="true"]:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--accent) 56%, var(--border));
+    background: linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--accent) 13%, var(--surface)) 0%,
+      color-mix(in srgb, var(--accent) 6%, var(--surface)) 100%
+    );
+  }
+  .dark .oc-model-trigger-swarm[data-swarm-active="true"] {
+    border-color: color-mix(in srgb, var(--accent) 48%, transparent);
+    background: linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--accent) 18%, var(--surface)) 0%,
+      color-mix(in srgb, var(--accent) 8%, var(--surface)) 100%
+    );
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent),
+      0 3px 14px -3px color-mix(in srgb, var(--accent) 28%, transparent),
+      inset 0 1px 0 color-mix(in srgb, var(--fg) 8%, transparent);
+  }
+  .dark .oc-model-trigger-swarm[data-swarm-active="true"]:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+    background: linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--accent) 22%, var(--surface)) 0%,
+      color-mix(in srgb, var(--accent) 11%, var(--surface)) 100%
+    );
   }
 
   /* 12. IDE 级代码块外壳：精致边框 + 微凹顶栏 + 圆角裁切 + 柔和投影 */
@@ -1113,15 +1163,16 @@ body {
       animation: oc-dock-breathe 3.6s ease-in-out infinite;
     }
     .oc-composer-dock[data-swarm="true"] {
-      --oc-dock-r: 2px;
-      --oc-dock-a: 16%;
-      --oc-dock-b: 26%;
-      animation: oc-dock-breathe 3.2s ease-in-out infinite;
+      --oc-dock-r: 1.5px;
+      --oc-dock-a: 10%;
+      --oc-dock-b: 18%;
+      animation: oc-dock-breathe 4.2s ease-in-out infinite;
     }
     @media (hover: hover) {
       .oc-shimmer-sheen:hover::after { animation: oc-sheen-sweep 760ms var(--ease-emphasized-decel) 1; }
     }
     .oc-shimmer-sheen[data-active="true"]::after,
+    .oc-shimmer-sheen[data-swarm-active="true"]::after,
     .oc-shimmer-sheen[aria-pressed="true"]::after { animation: oc-sheen-sweep 1.2s var(--ease-emphasized-decel) 1; }
     .oc-indeterminate-bar::after {
       transform: translateX(-105%);

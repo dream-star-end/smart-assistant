@@ -34,7 +34,7 @@ export function ComposerPlusMenu({
   onOpenGoal: () => void;
   onOpenRepo?: () => void;
   repoSelection?: RepoSelection | null;
-  /** 移动端 <640px 蜂群剧本入口收敛进「+」菜单，避免底栏溢出。 */
+  /** OCV5-843: 桌面与移动端统一将蜂群剧本模板收敛进「+」菜单，仅支持蜂群的模型显示。 */
   hasSwarmPlaybooks?: boolean;
   onOpenSwarmPlaybooks?: () => void;
 }) {
@@ -149,7 +149,7 @@ export function ComposerPlusMenu({
             data-product-control
             data-testid="composer-menu-swarm-playbooks"
             onSelect={onOpenSwarmPlaybooks}
-            className="gap-2.5 sm:hidden"
+            className="gap-2.5"
           >
             <span
               aria-hidden

@@ -1,4 +1,4 @@
-import { Menu, PanelLeft } from "lucide-react";
+import { Menu, PanelLeft, RefreshCw } from "lucide-react";
 import { type ReactNode, useRef } from "react";
 import { cn } from "../../lib/utils";
 import { IconButton } from "./IconButton";
@@ -48,10 +48,13 @@ export function HeaderCountBadge({
 export function WorkspaceShellHeader({
   onOpenMobileNav,
   mobileNavLabel = "打开菜单",
+  mobileLeftExtra,
   sidebarCollapsed = false,
   onExpandSidebar,
   sessionUnreadCount,
   collapsedExtra,
+  updateAvailable = false,
+  onReloadForUpdate,
   border = "subtle",
   backdrop = true,
   className,
@@ -61,11 +64,16 @@ export function WorkspaceShellHeader({
 }: {
   onOpenMobileNav?: () => void;
   mobileNavLabel?: string;
+  /** 移动端（<md）汉堡菜单钮紧右侧的附加控件（如 ChatHeader 对话态的新建会话钮，与桌面折叠态对齐）。 */
+  mobileLeftExtra?: ReactNode;
   sidebarCollapsed?: boolean;
   onExpandSidebar?: () => void;
   sessionUnreadCount?: number;
   /** 桌面侧栏折叠态展开钮右侧的附加控件（如 ChatHeader 的新建会话钮）。 */
   collapsedExtra?: ReactNode;
+  /** 服务端已是新前端（appUpdate.getPillVisible）。true 且提供 onReloadForUpdate 时在壳层统一渲染轻刷新条。 */
+  updateAvailable?: boolean;
+  onReloadForUpdate?: () => void;
   border?: "subtle" | "none";
   backdrop?: boolean;
   className?: string;
@@ -76,6 +84,7 @@ export function WorkspaceShellHeader({
   const headerRef = useRef<HTMLElement>(null);
   useToastAnchor(headerRef);
   const hasUnreadSessions = Boolean(sessionUnreadCount && sessionUnreadCount > 0);
+  const showUpdateBanner = Boolean(updateAvailable && onReloadForUpdate);
 
   return (
     <header
@@ -94,35 +103,40 @@ export function WorkspaceShellHeader({
           contentClassName,
         )}
       >
-        {onOpenMobileNav && (
-          <div className="relative shrink-0 md:hidden">
-            <IconButton
-              data-product-control
-              onClick={onOpenMobileNav}
-              aria-label={
-                hasUnreadSessions
-                  ? `${mobileNavLabel},${sessionUnreadCount} 条未读会话`
-                  : mobileNavLabel
-              }
-              title={
-                hasUnreadSessions
-                  ? `${mobileNavLabel}（${sessionUnreadCount} 条未读会话）`
-                  : mobileNavLabel
-              }
-              shape="square"
-            >
-              <Menu size={18} />
-            </IconButton>
-            <HeaderCountBadge
-              count={sessionUnreadCount}
-              testId="session-unread-badge"
-              tone="accent"
-              ariaLabel={hasUnreadSessions ? `${sessionUnreadCount} 条未读会话` : undefined}
-            />
+        {(onOpenMobileNav || mobileLeftExtra) && (
+          <div className="flex shrink-0 items-center gap-0.5 md:hidden" data-testid="shell-mobile-left">
+            {onOpenMobileNav && (
+              <div className="relative shrink-0">
+                <IconButton
+                  data-product-control
+                  onClick={onOpenMobileNav}
+                  aria-label={
+                    hasUnreadSessions
+                      ? `${mobileNavLabel},${sessionUnreadCount} 条未读会话`
+                      : mobileNavLabel
+                  }
+                  title={
+                    hasUnreadSessions
+                      ? `${mobileNavLabel}（${sessionUnreadCount} 条未读会话）`
+                      : mobileNavLabel
+                  }
+                  shape="square"
+                >
+                  <Menu size={18} />
+                </IconButton>
+                <HeaderCountBadge
+                  count={sessionUnreadCount}
+                  testId="session-unread-badge"
+                  tone="accent"
+                  ariaLabel={hasUnreadSessions ? `${sessionUnreadCount} 条未读会话` : undefined}
+                />
+              </div>
+            )}
+            {mobileLeftExtra}
           </div>
         )}
         {sidebarCollapsed && (onExpandSidebar || collapsedExtra) && (
-          <div className="hidden shrink-0 items-center gap-1 md:flex">
+          <div className="hidden shrink-0 items-center gap-1 md:flex" data-testid="shell-collapsed-left">
             {onExpandSidebar && (
               <div className="relative">
                 <IconButton
@@ -155,6 +169,26 @@ export function WorkspaceShellHeader({
         )}
         {children}
       </div>
+      {showUpdateBanner && (
+        <div
+          data-testid="shell-update-banner"
+          role="status"
+          className="flex items-center justify-center border-t border-accent/15 bg-accent-soft/65 px-3 py-1"
+        >
+          <button
+            type="button"
+            data-product-control
+            data-testid="update-pill"
+            aria-label="有新版本，点击刷新页面"
+            title="有新版本，点击刷新页面"
+            onClick={onReloadForUpdate}
+            className="oc-btn-tactile oc-spring-press inline-flex min-h-7 items-center gap-1.5 rounded-full px-2.5 py-0.5 text-caption font-medium text-accent outline-none transition-colors hover:bg-accent/12 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-bg"
+          >
+            <RefreshCw size={12} strokeWidth={1.75} aria-hidden className="shrink-0" />
+            <span>发现新版本 · 立即刷新</span>
+          </button>
+        </div>
+      )}
     </header>
   );
 }

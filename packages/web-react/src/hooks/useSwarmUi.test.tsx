@@ -170,4 +170,40 @@ describe("OCV5-837: sessionSwarmMode persistence & useSwarmMode", () => {
     expect(readSessionSwarmMode("draft-mat-1")).toBe(true);
     unmount();
   });
+
+  test("OCV5-843: setSwarmMode sets explicit boolean for both persisted sessions and drafts", () => {
+    const persisted = renderHook(() =>
+      useSwarmMode({
+        demo: false,
+        sessionKey: "s-explicit",
+        activeSessionId: "s-explicit",
+        modelId: "antigravity-gemini-4-neon",
+        models: [...MODELS],
+      }),
+    );
+    act(() => persisted.result.current.setSwarmMode(true));
+    expect(persisted.result.current.swarmMode).toBe(true);
+    expect(readSessionSwarmMode("s-explicit")).toBe(true);
+    act(() => persisted.result.current.setSwarmMode(true));
+    expect(persisted.result.current.swarmMode).toBe(true);
+    act(() => persisted.result.current.setSwarmMode(false));
+    expect(persisted.result.current.swarmMode).toBe(false);
+    expect(readSessionSwarmMode("s-explicit")).toBe(false);
+    persisted.unmount();
+
+    const draft = renderHook(() =>
+      useSwarmMode({
+        demo: false,
+        sessionKey: "draft-explicit",
+        activeSessionId: undefined,
+        modelId: "antigravity-gemini-4-neon",
+        models: [...MODELS],
+      }),
+    );
+    act(() => draft.result.current.setSwarmMode(true));
+    expect(draft.result.current.swarmMode).toBe(true);
+    act(() => draft.result.current.setSwarmMode(false));
+    expect(draft.result.current.swarmMode).toBe(false);
+    draft.unmount();
+  });
 });

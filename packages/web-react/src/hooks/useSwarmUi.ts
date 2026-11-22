@@ -70,17 +70,23 @@ export function useSwarmMode(opts: {
   const effectiveEnabled = persistedId ? (explicitValue ?? promotedDraft ?? detectedSwarm) : Boolean(draftSwarm[sessionKey]);
   const swarmMode = swarmSupported && effectiveEnabled;
 
-  const toggleSwarmMode = useCallback(() => {
-    const next = !effectiveEnabled;
-    if (persistedId) {
-      writeSessionSwarmMode(persistedId, next);
-      setPersistedMap((prev) => ({ ...prev, [persistedId]: next }));
-    } else {
-      setDraftSwarm((prev) => ({ ...prev, [sessionKey]: next }));
-    }
-  }, [effectiveEnabled, persistedId, sessionKey]);
+  const setSwarmMode = useCallback(
+    (next: boolean) => {
+      if (persistedId) {
+        writeSessionSwarmMode(persistedId, next);
+        setPersistedMap((prev) => ({ ...prev, [persistedId]: next }));
+      } else {
+        setDraftSwarm((prev) => ({ ...prev, [sessionKey]: next }));
+      }
+    },
+    [persistedId, sessionKey],
+  );
 
-  return { swarmSupported, swarmMode, toggleSwarmMode };
+  const toggleSwarmMode = useCallback(() => {
+    setSwarmMode(!effectiveEnabled);
+  }, [effectiveEnabled, setSwarmMode]);
+
+  return { swarmSupported, swarmMode, setSwarmMode, toggleSwarmMode };
 }
 
 export function useSwarmBoard(opts: {

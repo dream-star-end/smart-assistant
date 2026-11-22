@@ -194,7 +194,10 @@ describe("Composer · 蜂群剧本模板快选弹层", () => {
       </TooltipProvider>,
     );
 
-    fireEvent.click(await screen.findByTestId("composer-swarm-playbooks"));
+    const plusBtn = screen.getByRole("button", { name: "更多选项" });
+    fireEvent.pointerDown(plusBtn, { button: 0, pointerType: "mouse" });
+    fireEvent.click(plusBtn);
+    fireEvent.click(await screen.findByTestId("composer-menu-swarm-playbooks"));
     const popover = await screen.findByTestId("swarm-playbook-popover");
     expect(popover).toHaveTextContent("并行实现+验收");
     expect(popover).toHaveTextContent("多源文献深研+核验");

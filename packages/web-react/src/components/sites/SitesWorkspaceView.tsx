@@ -78,6 +78,9 @@ export function SitesWorkspaceView({
   onOpenMobileNav,
   sidebarCollapsed,
   onExpandSidebar,
+  sessionUnreadCount,
+  updateAvailable,
+  onReloadForUpdate,
 }: {
   auth: AuthSession;
   activeSlug: string | null;
@@ -88,6 +91,9 @@ export function SitesWorkspaceView({
   onOpenMobileNav?: () => void;
   sidebarCollapsed?: boolean;
   onExpandSidebar?: () => void;
+  sessionUnreadCount?: number;
+  updateAvailable?: boolean;
+  onReloadForUpdate?: () => void;
 }) {
   const toast = useToast();
   const [accessGen, setAccessGen] = useState(() => auth.getAccessGeneration());
@@ -267,12 +273,15 @@ export function SitesWorkspaceView({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-bg">
-      {(onOpenMobileNav || (sidebarCollapsed && onExpandSidebar)) && (
+      {(onOpenMobileNav || (sidebarCollapsed && onExpandSidebar) || (updateAvailable && onReloadForUpdate)) && (
         <WorkspaceShellHeader
           onOpenMobileNav={onOpenMobileNav}
           sidebarCollapsed={sidebarCollapsed}
           onExpandSidebar={onExpandSidebar}
-          className={cn(!(sidebarCollapsed && onExpandSidebar) && "md:hidden")}
+          sessionUnreadCount={sessionUnreadCount}
+          updateAvailable={updateAvailable}
+          onReloadForUpdate={onReloadForUpdate}
+          className={cn(!(sidebarCollapsed && onExpandSidebar) && !(updateAvailable && onReloadForUpdate) && "md:hidden")}
         >
           <span className="text-section font-semibold text-fg md:hidden">站点</span>
         </WorkspaceShellHeader>

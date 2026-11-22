@@ -86,6 +86,9 @@ export function TaskboardView({
   sidebarCollapsed,
   onExpandSidebar,
   onOpenProjectSettings,
+  sessionUnreadCount,
+  updateAvailable,
+  onReloadForUpdate,
 }: {
   auth: AuthSession
   view: BoardViewParam
@@ -100,6 +103,9 @@ export function TaskboardView({
   sidebarCollapsed?: boolean
   onExpandSidebar?: () => void
   onOpenProjectSettings?: (projectId: string) => void
+  sessionUnreadCount?: number
+  updateAvailable?: boolean
+  onReloadForUpdate?: () => void
 }) {
   const projectScope = useProjectScope()
   const workQuery = boardWorkQuery(projectScope.scope)
@@ -869,6 +875,9 @@ export function TaskboardView({
         onOpenMobileNav={onOpenMobileNav}
         sidebarCollapsed={sidebarCollapsed}
         onExpandSidebar={onExpandSidebar}
+        sessionUnreadCount={sessionUnreadCount}
+        updateAvailable={updateAvailable}
+        onReloadForUpdate={onReloadForUpdate}
         className="oc-surface-glass border-x-0 border-t-0"
         contentClassName="flex-wrap gap-2 px-3 py-2 md:flex-nowrap md:px-4"
       >

@@ -57,7 +57,9 @@ import {
   Sheet,
   useConfirm,
 } from './ui'
+import { AtelierIcon } from './ui/AtelierIcons'
 import { ModelFamilyIcon, type ModelFamilyKind, detectModelFamily } from './ui/ModelFamilyIcons'
+import { isAntigravityModelForUi } from './chat/swarmDetect'
 
 type PickerMode = 'menu' | 'sheet'
 type ShortViewportTab = 'models' | 'extras'
@@ -93,6 +95,10 @@ export type ModelSelectorPanelProps = {
   onSelectContextTier?: (tier: CursorContextTier) => void
   serviceTier?: ServiceTier | null
   onSelectServiceTier?: (tier: ServiceTier | null) => void
+  swarmSupported?: boolean
+  swarmMode?: boolean
+  swarmRunning?: boolean
+  onSelectSwarmMode?: (enabled: boolean) => void
   label: string
   tierLabel: string | null
   shortViewport?: boolean
@@ -271,6 +277,10 @@ export function ModelSelectorPanel({
   onSelectContextTier,
   serviceTier,
   onSelectServiceTier,
+  swarmSupported,
+  swarmMode,
+  swarmRunning,
+  onSelectSwarmMode,
   label,
   tierLabel,
   shortViewport = false,
@@ -375,6 +385,7 @@ export function ModelSelectorPanel({
   const activeCursorContextTier: CursorContextTier = contextTier ?? DEFAULT_CURSOR_CONTEXT_TIER
   const showPlatformEffort =
     !selectedCursor && Boolean(effortSupported && effortSupported.length > 0 && onSelectEffort)
+  const showSwarmMode = Boolean(swarmSupported && onSelectSwarmMode && !teamEngineActive)
 
   const hasExtras =
     showCursorEffort ||
@@ -383,7 +394,8 @@ export function ModelSelectorPanel({
     showServiceTiers ||
     showCursorContextTier ||
     showContextTier ||
-    showPlatformEffort
+    showPlatformEffort ||
+    showSwarmMode
 
   const [shortTab, setShortTab] = useState<ShortViewportTab>('models')
   useEffect(() => {
@@ -466,6 +478,7 @@ export function ModelSelectorPanel({
       const active = m.id === selectedId
       const degraded = isDegraded(m)
       const raw = modelLabel(m)
+      const supportsSwarm = isAntigravityModelForUi(m.id, models)
       return (
         <PickerItem
           mode={mode}
@@ -482,6 +495,19 @@ export function ModelSelectorPanel({
             <ModelNameWithTags rawLabel={raw} modelId={m.id} family={family} />
           </span>
           <span className="flex shrink-0 items-center gap-1.5">
+            {supportsSwarm && !degraded && (
+              <span
+                data-testid="model-row-swarm-capable"
+                title="支持蜂群模式"
+                aria-label="支持蜂群模式"
+                className={cn(
+                  'inline-flex shrink-0 items-center justify-center',
+                  active && swarmMode ? 'text-accent' : 'text-accent/75',
+                )}
+              >
+                <AtelierIcon name="swarm" size={12} className="shrink-0" />
+              </span>
+            )}
             <CostMark model={m} />
             <PromoBadge label={promoLabelOf(m)} />
             {degraded && <Badge tone="danger">暂不可用</Badge>}
@@ -795,6 +821,9 @@ export function ModelSelectorPanel({
     showPlatformEffort,
     effortSupported,
     effortActive,
+    showSwarmMode,
+    swarmMode: Boolean(swarmMode && !teamEngineActive),
+    swarmRunning: Boolean(swarmRunning && !teamEngineActive),
     onOpenChange,
     onRememberAndSelect: rememberAndSelect,
     onSelectCursor: selectCursor,
@@ -802,6 +831,7 @@ export function ModelSelectorPanel({
     onSelectEffort,
     onSelectContextTier,
     onSelectServiceTier,
+    onSelectSwarmMode,
   }
 
   const selectedFamily = detectModelFamily(`${selectedId ?? ''} ${label}`)
@@ -857,6 +887,15 @@ export function ModelSelectorPanel({
                       {tag.label}
                     </span>
                   ))}
+                  {swarmMode && !teamEngineActive && (
+                    <span
+                      data-testid="model-picker-sheet-swarm-tag"
+                      className="model-picker-tag-accent inline-flex shrink-0 items-center gap-0.5 rounded-full px-1.5 py-px text-micro font-medium leading-tight"
+                    >
+                      <AtelierIcon name="swarm" size={10} className="shrink-0" />
+                      <span>蜂群</span>
+                    </span>
+                  )}
                   <CostMark model={selected} multiplier={effectiveMultiplier} />
                 </div>
               </div>
