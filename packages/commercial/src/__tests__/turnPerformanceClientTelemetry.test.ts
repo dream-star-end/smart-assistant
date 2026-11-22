@@ -16,7 +16,12 @@ import {
   recordTurnResponseMilestone,
   TurnResponseMilestoneTracker,
 } from "../ws/turnPerformance.js";
-import { BRIDGE_WS_PATH, createUserChatBridge, type UserChatBridgeDeps } from "../ws/userChatBridge.js";
+import {
+  BRIDGE_WS_PATH,
+  createUserChatBridge,
+  PROMPT_QUEUE_DISPATCH_REQUEST_TYPE,
+  type UserChatBridgeDeps,
+} from "../ws/userChatBridge.js";
 
 const JWT_SECRET = "ocv5-40-turn-perf-telemetry-test-secret-0123456789";
 
@@ -151,17 +156,19 @@ describe("parseClientTelemetryFromUserAgent (OCV5-40)", () => {
     });
   });
 
-  test("classifies Edge and Firefox across desktop/mobile/tablet", () => {
+  test("classifies Edge and Firefox in exact parity with web-react clientFriction.ts", () => {
     assert.deepEqual(parseClientTelemetryFromUserAgent(UA_EDGE_DESKTOP), {
       browserFamily: "edge",
       deviceClass: "desktop",
     });
+    // clientFriction.ts matches /Edg\// (not EdgA/ or EdgiOS/), so mobile Edge
+    // falls through to Chrome on Android and Safari on iOS on both server and client.
     assert.deepEqual(parseClientTelemetryFromUserAgent(UA_EDGE_ANDROID), {
-      browserFamily: "edge",
+      browserFamily: "chrome",
       deviceClass: "mobile",
     });
     assert.deepEqual(parseClientTelemetryFromUserAgent(UA_EDGE_IOS), {
-      browserFamily: "edge",
+      browserFamily: "safari",
       deviceClass: "mobile",
     });
     assert.deepEqual(parseClientTelemetryFromUserAgent(UA_FIREFOX_DESKTOP), {
@@ -176,8 +183,9 @@ describe("parseClientTelemetryFromUserAgent (OCV5-40)", () => {
       browserFamily: "firefox",
       deviceClass: "tablet",
     });
+    // clientFriction.ts matches /Firefox\// (not FxiOS/), so Firefox iOS buckets as safari.
     assert.deepEqual(parseClientTelemetryFromUserAgent(UA_FIREFOX_IOS), {
-      browserFamily: "firefox",
+      browserFamily: "safari",
       deviceClass: "mobile",
     });
   });
@@ -195,12 +203,12 @@ describe("parseClientTelemetryFromUserAgent (OCV5-40)", () => {
     });
   });
 
-  test("returns closed other/unknown tokens for CLI/unknown UAs without false-positive substring matches", () => {
+  test("returns closed other/unknown tokens for CLI/unknown UAs", () => {
     assert.deepEqual(parseClientTelemetryFromUserAgent("curl/8.5.0"), {
       browserFamily: "other",
       deviceClass: "unknown",
     });
-    assert.deepEqual(parseClientTelemetryFromUserAgent("MyChrome/1.0 NotSafari/1.0"), {
+    assert.deepEqual(parseClientTelemetryFromUserAgent("CustomBot/1.0"), {
       browserFamily: "other",
       deviceClass: "unknown",
     });
@@ -464,5 +472,136 @@ describe("userChatBridge end-to-end WS upgrade User-Agent -> FIRST_*_FRAME telem
         ["FIRST_TEXT_FRAME", null, null],
       ],
     );
+  });
+
+  test("Non-browser ingress (prompt_queue) on a browser WS with real User-Agent records strictly null/null", async () => {
+    const { pool, frictionInserts } = makeRecordingPool();
+    const containerWss = new WebSocketServer({ port: 0 });
+    let bridge: ReturnType<typeof createUserChatBridge> | null = null;
+    let gateway: http.Server | null = null;
+    try {
+      await new Promise<void>((r) => containerWss.once("listening", () => r()));
+      const containerPort = (containerWss.address() as { port: number }).port;
+      const containerConnected = new Promise<WebSocket>((resolve) => {
+        containerWss.on("connection", (ws) => resolve(ws));
+      });
+
+      bridge = createUserChatBridge({
+        jwtSecret: JWT_SECRET,
+        resolveContainerEndpoint: async () => ({ host: "127.0.0.1", port: containerPort }),
+        loadAllowedModelChecker: async () => () => true,
+        containerConnectTimeoutMs: 1_500,
+        promptQueueEnabled: true,
+        pgPool: pool,
+        preCheckRedis: {
+          async atomicReserve() { return { ok: true as const, locked: 0n, needed: 0n }; },
+          async releaseReservation() { return true; },
+        } as UserChatBridgeDeps["preCheckRedis"],
+        pricing: { get() { return null; } } as unknown as UserChatBridgeDeps["pricing"],
+      });
+
+      gateway = http.createServer((_, res) => res.end());
+      gateway.on("upgrade", (req, socket, head) => {
+        if (!bridge!.handleUpgrade(req, socket, head)) {
+          socket.destroy();
+        }
+      });
+      await new Promise<void>((r) => gateway!.listen(0, "127.0.0.1", () => r()));
+      const gatewayPort = (gateway.address() as { port: number }).port;
+
+      const { token } = await signAccess({ sub: "405", role: "user" }, JWT_SECRET);
+      const clientWs = new WebSocket(
+        `ws://127.0.0.1:${gatewayPort}${BRIDGE_WS_PATH}`,
+        ["bearer", token],
+        { headers: { "User-Agent": UA_SAFARI_MOBILE } },
+      );
+      await new Promise<void>((r) => clientWs.once("open", () => r()));
+      const containerWs = await containerConnected;
+
+      const forwardedP = new Promise<{ traceId: string }>((resolve) => {
+        containerWs.on("message", (data) => {
+          const text = typeof data === "string" ? data : data.toString("utf8");
+          const parsed = JSON.parse(text) as { type?: string; traceId?: string; clientMessageId?: string };
+          if (
+            parsed.type === "inbound.message" &&
+            parsed.clientMessageId === "cmid-pq-ocv5-40" &&
+            typeof parsed.traceId === "string"
+          ) {
+            resolve({ traceId: parsed.traceId });
+          }
+        });
+      });
+
+      containerWs.send(JSON.stringify({
+        type: PROMPT_QUEUE_DISPATCH_REQUEST_TYPE,
+        grantId: "11111111-1111-4111-8111-111111111111",
+        owner: {
+          sessionKey: "agent:main:webchat:dm:sess_pq_40",
+          clientSessionId: "sess_pq_40",
+          agentId: "main",
+          peer: { id: "sess_pq_40", kind: "dm" },
+        },
+        claim: {
+          epoch: "1",
+          claimToken: "a".repeat(64),
+        },
+        item: {
+          itemId: "item-pq-ocv5-40",
+          clientMessageId: "cmid-pq-ocv5-40",
+          contentHash: "b".repeat(64),
+          content: { text: "queued background turn" },
+          requestedExecution: {
+            agentId: "main",
+            model: "gpt-6-astra",
+          },
+        },
+      }));
+      const { traceId } = await forwardedP;
+
+      containerWs.send(JSON.stringify({
+        type: "outbound.message",
+        traceId,
+        peer: { id: "sess_pq_40" },
+        blocks: [{ kind: "thinking", text: "queued thinking" }],
+        isFinal: false,
+      }));
+      containerWs.send(JSON.stringify({
+        type: "outbound.message",
+        traceId,
+        peer: { id: "sess_pq_40" },
+        blocks: [{ kind: "text", text: "queued answer" }],
+        isFinal: true,
+      }));
+
+      await waitFor(() =>
+        frictionInserts.filter(
+          (e) => e.code === "FIRST_THINKING_FRAME" || e.code === "FIRST_TEXT_FRAME",
+        ).length === 2
+          ? true
+          : undefined,
+      );
+
+      clientWs.close();
+      await new Promise<void>((r) => {
+        if (clientWs.readyState === WebSocket.CLOSED) return r();
+        clientWs.once("close", () => r());
+      });
+
+      const events = frictionInserts.filter(
+        (e) => e.code === "FIRST_THINKING_FRAME" || e.code === "FIRST_TEXT_FRAME",
+      );
+      assert.deepEqual(
+        events.map((e) => [e.code, e.browserFamily, e.deviceClass]),
+        [
+          ["FIRST_THINKING_FRAME", null, null],
+          ["FIRST_TEXT_FRAME", null, null],
+        ],
+      );
+    } finally {
+      if (bridge) await bridge.shutdown();
+      for (const client of containerWss.clients) client.terminate();
+      await new Promise<void>((r) => containerWss.close(() => r()));
+      if (gateway) await new Promise<void>((r) => gateway!.close(() => r()));
+    }
   });
 });

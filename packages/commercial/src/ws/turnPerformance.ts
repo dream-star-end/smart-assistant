@@ -71,12 +71,17 @@ export function parseClientTelemetryFromUserAgent(userAgent: unknown): ClientTel
     return { browserFamily: null, deviceClass: null };
   }
 
+  // Keep browser_family classification identical to packages/web-react/src/lib/clientFriction.ts
+  // (`browserFamily()`) so server FIRST_TEXT_FRAME/FIRST_THINKING_FRAME and client
+  // FIRST_TEXT_PAINT bucket every User-Agent identically.
+  // Note: server device_class is UA-derived because the WS HTTP upgrade has no
+  // viewport width, whereas client FIRST_TEXT_PAINT derives device_class via matchMedia.
   let browserFamily: TelemetryBrowserFamily = "other";
-  if (/\bEdg(?:A|iOS)?\//.test(bounded)) browserFamily = "edge";
-  else if (/\b(?:Firefox|FxiOS)\//.test(bounded)) browserFamily = "firefox";
-  else if (/\bCriOS\//.test(bounded)) browserFamily = "chrome_ios";
-  else if (/\b(?:Headless)?Chrome\//.test(bounded)) browserFamily = "chrome";
-  else if (/\bSafari\//.test(bounded)) browserFamily = "safari";
+  if (/Edg\//.test(bounded)) browserFamily = "edge";
+  else if (/Firefox\//.test(bounded)) browserFamily = "firefox";
+  else if (/CriOS\//.test(bounded)) browserFamily = "chrome_ios";
+  else if (/Chrome\//.test(bounded)) browserFamily = "chrome";
+  else if (/Safari\//.test(bounded)) browserFamily = "safari";
 
   let deviceClass: TelemetryDeviceClass = "unknown";
   if (
