@@ -176,7 +176,7 @@ function LogRow({
         type="button"
         onClick={onOpenStep}
         aria-label={`第 ${n} 步的详情`}
-        title="在步骤里看完整输入输出"
+        title="查看这一步的完整输入输出"
         className="oc-btn-tactile relative z-10 shrink-0 rounded-xs p-1 text-faint opacity-0 outline-none transition-opacity hover:bg-hover hover:text-fg focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover:opacity-100 [@media(hover:none)]:opacity-100"
       >
         <ChevronRight size={14} aria-hidden />
@@ -192,7 +192,6 @@ function TurnBrowser({
   running,
   focusId,
   onSelectTurn,
-  onOpenSteps,
   onOpenStep,
 }: {
   turn: WorkTurn;
@@ -201,7 +200,6 @@ function TurnBrowser({
   running: boolean;
   focusId: string | null;
   onSelectTurn: (index: number) => void;
-  onOpenSteps: () => void;
   onOpenStep: (message: ToolLike) => void;
 }) {
   const steps = collectBrowserSteps(turn.steps);
@@ -224,7 +222,6 @@ function TurnBrowser({
         fileCount={0}
         onPrev={() => onSelectTurn(index - 1)}
         onNext={() => onSelectTurn(index + 1)}
-        onOpenSteps={onOpenSteps}
       />
       {item ? (
         <>
@@ -312,7 +309,6 @@ export function BrowserView({
   liveRunning,
   focusId,
   onSelectTurn,
-  onOpenSteps,
   onOpenStep,
   liveBrowserAgentId,
   liveBrowserAuth,
@@ -328,7 +324,6 @@ export function BrowserView({
   /** 从卡片点进来时要看的那一步(消息 id)。 */
   focusId: string | null;
   onSelectTurn: (index: number) => void;
-  onOpenSteps: () => void;
   onOpenStep: (message: ToolLike) => void;
   /** 可选：启用云端实时浏览器视口与人工接管（OCV5-813）。 */
   liveBrowserAgentId?: string;
@@ -426,7 +421,6 @@ export function BrowserView({
           running={running}
           focusId={focusId}
           onSelectTurn={onSelectTurn}
-          onOpenSteps={onOpenSteps}
           onOpenStep={onOpenStep}
         />
       ) : null}

@@ -181,6 +181,18 @@ export interface MuseJobView {
   charged_credits?: string
 }
 
+export interface MuseSessionJobView {
+  id: string
+  kind: MuseKind
+  status: MuseJobStatus
+  promptPreview: string
+  queuePosition?: number
+  queueLength?: number
+  queuedAt: number
+  startedAt?: number
+  errorCode?: string | null
+}
+
 /** What the bridge receives from /poll. */
 function canFallbackBoxExecToHatch(input: {
   /** The submit call was started (it may have reached the relay even without a reply). */
@@ -1177,6 +1189,97 @@ export class MuseBridgeHub {
       })
     }
     return this.viewOf(job)
+  }
+
+  /** Session-scoped Muse jobs: PG durable rows merged with live hub queue position & state (OCV5-844). */
+  async listSessionJobs(userId: string, sessionId: string): Promise<MuseSessionJobView[]> {
+    const sid = sessionId.trim()
+    if (!userId || !sid) return []
+    const byId = new Map<string, MuseSessionJobView>()
+    if (this.store.listSessionJobs) {
+      const stored = await this.store.listSessionJobs(userId, sid)
+      for (const row of stored) {
+        byId.set(row.id, {
+          id: row.id,
+          kind: row.kind,
+          status: row.status,
+          promptPreview: row.promptPreview,
+          queuedAt: row.queuedAt,
+          ...(row.startedAt !== undefined ? { startedAt: row.startedAt } : {}),
+          ...(row.errorCode ? { errorCode: row.errorCode } : {}),
+        })
+      }
+    }
+    const now = this.now()
+    const recentWindowMs = 10 * 60_000
+    for (const job of this.jobs.values()) {
+      if (job.userId !== userId || job.durable?.sessionId !== sid) continue
+      if (job.state === 'done' && now - job.finishedAt > recentWindowMs) continue
+      const existing = byId.get(job.id)
+      const view = this.viewOf(job)
+      const promptPreview =
+        existing?.promptPreview ||
+        (job.spec.prompt ?? '').replace(/\s+/g, ' ').trim().slice(0, 240)
+      const startedAt =
+        existing?.startedAt ??
+        (job.state === 'running' && job.dispatchedAt > 0 ? job.dispatchedAt : undefined)
+      const errorCode =
+        view.error?.code ??
+        (view.status === 'failed' || view.status === 'cancelled' ? existing?.errorCode : undefined)
+      byId.set(job.id, {
+        id: job.id,
+        kind: job.spec.kind,
+        status: view.status,
+        promptPreview,
+        ...(view.status === 'queued' && view.queue_position !== undefined
+          ? { queuePosition: view.queue_position }
+          : {}),
+        ...(view.status === 'queued' && view.queue_length !== undefined
+          ? { queueLength: view.queue_length }
+          : {}),
+        queuedAt: existing?.queuedAt ?? job.queuedAt,
+        ...(startedAt !== undefined ? { startedAt } : {}),
+        ...(errorCode ? { errorCode } : {}),
+      })
+    }
+    return [...byId.values()].sort((a, b) => b.queuedAt - a.queuedAt).slice(0, 10)
+  }
+
+  /**
+   * Session-scoped Muse cancel (OCV5-844):
+   *   - Verifies both `userId` and `durable.sessionId === sessionId` (returns null on mismatch).
+   *   - Refuses to cancel a job currently in `settling` to prevent billing races.
+   *   - Falls back to conditional PG cancel for durable background jobs not held in this process.
+   *   - Never charges credits and is idempotent on terminal jobs.
+   */
+  async cancelSessionJob(
+    userId: string,
+    sessionId: string,
+    jobId: string,
+  ): Promise<{ ok: true; cancelled: boolean; status: MuseJobStatus } | null> {
+    const sid = sessionId.trim()
+    if (!userId || !sid || !jobId) return null
+    const live = this.jobs.get(jobId)
+    if (live) {
+      if (live.userId !== userId || live.durable?.sessionId !== sid) return null
+      if (live.state === 'done') {
+        return { ok: true, cancelled: false, status: this.viewOf(live).status }
+      }
+      if (live.settling) {
+        return { ok: true, cancelled: false, status: 'running' }
+      }
+      const view = this.cancel(userId, jobId)
+      const pendingWrite = this.persisted.get(jobId)
+      if (pendingWrite) {
+        await pendingWrite.catch(() => {})
+      }
+      const status = view?.status ?? 'cancelled'
+      return { ok: true, cancelled: status === 'cancelled', status }
+    }
+    if (!this.store.cancelSessionJob) return null
+    const dbRes = await this.store.cancelSessionJob(userId, sid, jobId)
+    if (!dbRes) return null
+    return { ok: true, cancelled: dbRes.cancelled, status: dbRes.status }
   }
 
   /** Path of a finished file, for the owner only. */

@@ -207,4 +207,44 @@ describe("PinnedDelegateTracker", () => {
     expect(screen.queryByText("已完成摘要第一行")).toBeNull();
     vi.useRealTimers();
   });
+
+  test("非终态项传入 onCancel 时渲染单条取消按钮，提交中禁用防双击", async () => {
+    let resolveCancel!: (v: boolean) => void;
+    const onCancel = vi.fn(
+      () =>
+        new Promise<boolean>((r) => {
+          resolveCancel = r;
+        }),
+    );
+    render(
+      <PinnedDelegateTracker
+        items={[
+          item({ jobId: "run-1", state: "running", goal: "拉取日志" }),
+          item({ jobId: "done-1", state: "completed", goal: "已完结任务", resultSummary: "ok" }),
+        ]}
+        onDismiss={() => {}}
+        onCancel={onCancel}
+      />,
+    );
+
+    const cancelBtn = screen.getByRole("button", { name: "取消任务：拉取日志" });
+    expect(cancelBtn).toHaveTextContent("取消");
+    expect(screen.queryByRole("button", { name: "取消任务：已完结任务" })).toBeNull();
+
+    fireEvent.click(cancelBtn);
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    expect(onCancel).toHaveBeenCalledWith("run-1");
+    expect(cancelBtn).toBeDisabled();
+    expect(cancelBtn).toHaveTextContent("取消中…");
+
+    // 禁用态再次点击不重复提交
+    fireEvent.click(cancelBtn);
+    expect(onCancel).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveCancel(true);
+    });
+    expect(cancelBtn).not.toBeDisabled();
+    expect(cancelBtn).toHaveTextContent("取消");
+  });
 });

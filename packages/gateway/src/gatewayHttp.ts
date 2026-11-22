@@ -119,8 +119,28 @@ function normalizePath(p: string): string {
   // Dynamic API routes — normalize IDs
   const normalized = p
     .replace(
+      /\/api\/sessions\/[a-zA-Z0-9_-]+\/inflight-delegates\/[^/]+\/cancel$/,
+      '/api/sessions/:id/inflight-delegates/:jobId/cancel',
+    )
+    .replace(
       /\/api\/sessions\/[a-zA-Z0-9_-]+\/inflight-delegates$/,
       '/api/sessions/:id/inflight-delegates',
+    )
+    .replace(
+      /\/api\/sessions\/[a-zA-Z0-9_-]+\/bg-commands\/[^/]+\/cancel$/,
+      '/api/sessions/:id/bg-commands/:jobId/cancel',
+    )
+    .replace(
+      /\/api\/sessions\/[a-zA-Z0-9_-]+\/bg-commands$/,
+      '/api/sessions/:id/bg-commands',
+    )
+    .replace(
+      /\/api\/sessions\/[a-zA-Z0-9_-]+\/muse-jobs\/[^/]+\/cancel$/,
+      '/api/sessions/:id/muse-jobs/:jobId/cancel',
+    )
+    .replace(
+      /\/api\/sessions\/[a-zA-Z0-9_-]+\/background-tasks$/,
+      '/api/sessions/:id/background-tasks',
     )
     .replace(/\/api\/sessions\/[a-zA-Z0-9_-]+\/read$/, '/api/sessions/:id/read')
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+\/skills\/[a-z0-9-]+/, '/api/agents/:id/skills/:name')

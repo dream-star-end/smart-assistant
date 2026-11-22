@@ -2,7 +2,10 @@ import { createContext, useContext } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import type { ToolLike } from "../tool/format";
 
-export type PaneTab = "outputs" | "steps" | "plan" | "browser";
+/** 右栏顶栏主分区（OCV5-844:「过程」降级为按需下钻的单步全文视图，不再作为顶栏常驻 Tab）。 */
+export type PrimaryPaneTab = "outputs" | "plan" | "browser";
+
+export type PaneTab = PrimaryPaneTab | "steps";
 
 export type TargetOutputRequest = {
   path?: string;
@@ -29,7 +32,10 @@ export type LiveBrowserHandoffRequest = {
  * tab 缺省 = 只开面板(停在上次的分区)。
  */
 export type PaneRequest = {
-  /** "changes" 是 r1 的改动页:改动并进了产出页,旧入口 / 旧记忆按产出处理。 */
+  /**
+   * "changes" 是 r1 的改动页:改动并进了产出页,旧入口 / 旧记忆按产出处理。
+   * "steps" 仅配合具体 message 触发按需单步全文下钻；无 message 时回落到产出页。
+   */
   tab?: PaneTab | "changes";
   /** steps / browser:要打开的那一步;outputs:这一轮里的任意一行(定位到它所在的那一轮)。 */
   message?: ToolLike | null;

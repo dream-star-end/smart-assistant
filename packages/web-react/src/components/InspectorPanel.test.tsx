@@ -115,6 +115,35 @@ describe("产物详情列(inspector)", () => {
     expect(container.querySelector('[data-card="a"] [aria-label="在详情面板查看"]')).toHaveAttribute("aria-pressed", "true");
   });
 
+  test("OCV5-844: 从 ToolCard 点入具体步骤打开 StepDetail 查看全文，无常驻「过程」Tab，点击「返回产出」退回产出页", async () => {
+    const stepMsg = { id: "edit-1", role: "tool" as const, text: "Edit", ts: 1_700_000_000_000, ...longEditMessage };
+    let opened: ArtifactInspectTarget | null = null;
+    render(
+      <ArtifactInspectContext.Provider value={{ open: (target) => { opened = target; } }}>
+        <ToolCard message={stepMsg} />
+      </ArtifactInspectContext.Provider>,
+    );
+    fireEvent.click(screen.getByLabelText("在详情面板查看"));
+    expect(opened).toEqual({ kind: "tool", message: stepMsg });
+    cleanup();
+
+    render(
+      <InspectorPanelContent
+        messages={[
+          { id: "u1", role: "user", text: "修改演示文件", ts: 1_700_000_000_000, status: "replied" },
+          stepMsg,
+        ]}
+        request={{ tab: "steps", message: stepMsg, nonce: 1 }}
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.queryByRole("tab", { name: /过程|步骤/ })).not.toBeInTheDocument();
+    expect(screen.getByText(/line-120/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /返回产出/ }));
+    expect(await screen.findByTestId("outputs-view")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "产出" })).toHaveAttribute("aria-selected", "true");
+  });
+
   test("详情面板全文模式渲染完整 diff,并可关闭", () => {
     const onClose = vi.fn();
     const target: ArtifactInspectTarget = { kind: "tool", message: longEditMessage };

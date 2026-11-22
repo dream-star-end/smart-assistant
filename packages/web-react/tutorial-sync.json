@@ -31,24 +31,24 @@
       "sourceHash": "b1f867bb41272edd5f297badc5af29d53aef3da685ec1f92a8f1170dbc9a60e6"
     },
     "billing-usage": {
-      "contentHash": "bf8194415d10a203cfea1bf147fa12c1d40eaed602f04368f3335bae484ced9e",
-      "contentVersion": 5,
-      "entryIdentityHash": "80db8579faa7bef89629b561480ab70bb5bb42786c305765096a8ad3e8688537",
+      "contentHash": "d4c61789e5c42d67deee7805cdbe842ad887e9f1cb497856157ae9cb13b0da62",
+      "contentVersion": 6,
+      "entryIdentityHash": "1e8589327f424440a86f3663e642a9143d3b6a272912582ff2bbcf97b63b5253",
       "mediaHash": "3eb3bc92b68ea4bbe200cea90aed65e475fa9a46cad1d81bd095da468a9662e5",
       "mediaKey": "billing-usage",
       "mediaVersion": 3,
       "registryHash": "7df12d4762b37530312c1a0af52a058e29e2c362d9600d5deb8a741100037930",
-      "sourceHash": "068c887e6abb363fe644e4b8cda89ee6d72564e8f4777056724f68b1f52d0250"
+      "sourceHash": "82e69be836c0492e6e527e1640ca6b994c914f5e2f3691f8938e97252d4c4f23"
     },
     "chat-basics": {
-      "contentHash": "b9c21bdf2fb6559bb9dd7ef63b830e417639c97e58d60add4ffcc1ab36816f8a",
-      "contentVersion": 13,
-      "entryIdentityHash": "331eabde973f54df3c1e4f25337d9692195532be311135b6e7ae153c30ab3725",
+      "contentHash": "ddaf4d8e29b1926a42c2e7f8d7d9af25d4f3f92378f7c9430ef3b386a8735864",
+      "contentVersion": 14,
+      "entryIdentityHash": "0965bb75b2fca8c2e15eb16debc3d29de957367e342fe67b7e3033bfc79a0d30",
       "mediaHash": "c499b1db8bcebaffaec1ad215c73f62adfc4326ac5c135c6a49c657fcdfb059a",
       "mediaKey": "chat-basics",
       "mediaVersion": 5,
       "registryHash": "343b05739f30ffb4df16583570adcf768ad03a8f0df19d80097465aec77dc35f",
-      "sourceHash": "fdc62121cea9b6f209ebf8c7ded365282c0b52621bfffc26e556de4e9938a6dd"
+      "sourceHash": "730515e8bed305875b963878822cfb07c2ac2108e45586ca18749c6288568db4"
     },
     "connectors": {
       "contentHash": "60d53be82da147122f4fef4ea5028d7e02e59148ab15b9454ee7aa933f45a874",

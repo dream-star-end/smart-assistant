@@ -127,14 +127,14 @@ import { type ImplicitReason, useResponseRatings } from "./hooks/useResponseRati
 import { useSessionEngineOptions } from "./hooks/useSessionEngineOptions";
 import { useInbox } from "./hooks/useInbox";
 import { useInflightDelegates } from "./hooks/useInflightDelegates";
+import { useBackgroundTaskTriggers, useLiveMediaJobStore, useSessionBackgroundTasks, useTrackedSwarmSessionIds } from "./hooks/useSessionBackgroundTasks";
+import { useSubscriptionSummary } from "./hooks/useSubscriptionSummary";
 import { useRepoBinding } from "./hooks/useRepoBinding";
 import { useTheme } from "./hooks/useTheme";
 import { useToast } from "./components/ui";
 import { imageByteCache } from "./lib/chat/imageBytes";
 import { containerPreviewHrefFromTarget } from "./lib/containerPreview";
-import type { MediaJobWire, RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
-import type { MediaGenerationJob } from "@openclaude/protocol/mediaGeneration";
-import type { InboundMessage, MediaRef } from "./lib/chat/frames";
+import type { InboundMessage, MediaRef, RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
 import { type ChatMessage, isTurnDetached } from "./lib/chat/model";
 import { activeTurnStatus } from "./lib/chat/retryStatus";
 import {
@@ -371,7 +371,7 @@ export function App() {
   const [chatGptProxyOpen, setChatGptProxyOpen] = useState(false);
   // 「媒体工作台」入口门控(OCV5-593):GET /api/studio/providers 明确 200 才显示(默认隐藏)。
   const [studioAvailable, setStudioAvailable] = useState(false);
-  const [liveMediaJob, setLiveMediaJob] = useState<MediaGenerationJob | null>(null);
+  const { liveMediaJobs, liveMediaJob, mediaJobVersion, onMediaJob, clearLiveMediaJobs } = useLiveMediaJobStore();
   const [repoModalOpen, setRepoModalOpen] = useState(false);
   const repoModalMounted = useMountedOnce(repoModalOpen);
   const [manageOpen, setManageOpen] = useState(urlRoute.panel === "manage");
@@ -529,7 +529,7 @@ export function App() {
       setContainerPreviewUrl(null);
       setSettingsOpen(false);
       setMediaTasksOpen(false);
-      setLiveMediaJob(null);
+      clearLiveMediaJobs();
       setManageAutoAuthorizePluginSlug(null);
       setOrgOpen(false);
       const publicQuery = new URLSearchParams(location.search);
@@ -556,7 +556,7 @@ export function App() {
       setContainerPreviewUrl(null);
       setSettingsOpen(false);
       setMediaTasksOpen(false);
-      setLiveMediaJob(null);
+      clearLiveMediaJobs();
       setManageAutoAuthorizePluginSlug(null);
       setOrgOpen(false);
       setTutorialOpen(false);
@@ -1142,7 +1142,7 @@ export function App() {
     // GitHub 仓库绑定状态/错误帧 → useRepoBinding（经 ref，见 repoStatusHandlerRef）。
     onRepoStatus: (f) => repoStatusHandlerRef.current(f),
     onRepoBindError: (f) => repoBindErrorHandlerRef.current(f),
-    onMediaJob: (frame: MediaJobWire) => setLiveMediaJob(frame.job),
+    onMediaJob,
     // 会话模型收敛写与显式选择共用同一 per-session 串行器(防跨写者乱序)。
     queueModelPatch,
   });
@@ -1224,16 +1224,12 @@ export function App() {
     openPane();
   };
   paneToggleRef.current = paneAvailable && !demo ? togglePane : null;
-  const inflightDelegates = useInflightDelegates({
-    sessionId: !demo && activeId ? activeId : null,
-    messages: wsMessages,
-    enabled:
-      !demo &&
-      gate.access &&
-      !!activeId &&
-      (delegateInflightSurface ?? publicCfg?.featureDelegateInflight) === true,
-    auth,
-  });
+  const { summary: subscriptionSummary, refresh: refreshSubscription } = useSubscriptionSummary(demo ? null : auth);
+  const refreshMeWithSub = useCallback(async () => { await refreshMe(); refreshSubscription(); }, [refreshMe, refreshSubscription]);
+  const { delegateRefreshTrigger, bgTasksRefreshTrigger } = useBackgroundTaskTriggers({ sessionId: activeId, wsSending, wsMessages, chatVersion: chat.version, mediaJobVersion });
+  const inflightDelegates = useInflightDelegates({ sessionId: !demo && activeId ? activeId : null, messages: wsMessages, auth, refreshTrigger: delegateRefreshTrigger, enabled: !demo && gate.access && !!activeId && (delegateInflightSurface ?? publicCfg?.featureDelegateInflight) === true });
+  const bgTasks = useSessionBackgroundTasks({ sessionId: !demo && activeId ? activeId : null, enabled: !demo && gate.access && !!activeId, auth, liveMediaJobs, refreshTrigger: bgTasksRefreshTrigger });
+  const swarmSessionIds = useTrackedSwarmSessionIds({ demo, activeId, latestSwarm: swarmUi.latestSwarm, sessions, getMessages: chat.getMessages, isSending: chat.isSending, version: chat.metaVersion ?? chat.version });
 
   const { liveTerminal } = useLiveTerminals({ demo, chat, sessions, applySessionTerminal });
   const ticketApprovalVersion = useSyncExternalStore(
@@ -2076,8 +2072,7 @@ export function App() {
     boardActive: TASKBOARD_ENABLED && boardOpen,
     onOpenSites: demo ? undefined : closeMobileThen(() => openSites(null)),
     sitesActive: sitesOpen,
-    unreadIds: unreadSessions.unreadIds,
-    onMarkRead: unreadSessions.markRead,
+    unreadIds: unreadSessions.unreadIds, swarmSessionIds, onMarkRead: unreadSessions.markRead,
     onOpenProjectSettings: (p: ChatProject) => {
       setUngroupedAssetsOpen(false);
       setProjectSettings(p);
@@ -2346,6 +2341,8 @@ export function App() {
           onTogglePane={paneAvailable && !demo ? togglePane : undefined}
           paneOpen={paneShown}
           sessionUnreadCount={unreadSessions.unreadIds.size}
+          subscriptionSummary={demo ? null : subscriptionSummary}
+          onOpenSubscription={demo ? undefined : () => { openSettings("account"); setSubscribeOpenSignal((n) => n + 1); }}
           updateAvailable={!demo && updatePillVisible}
           onReloadForUpdate={demo ? undefined : () => appUpdate.reloadNow()}
         />
@@ -2497,22 +2494,18 @@ export function App() {
               null(收口后由 MessageRenderer 的 inline 只读 TodoWrite/plan 卡兜底)。 */}
           {!demo && !gated && (
             <>
-              {(wsSending || inflightDelegates.items.length > 0 || Boolean(swarmUi.latestSwarm) || timelineMessages.some((m) => m.role === "goal" || m.role === "tool")) && (
+              {(wsSending || inflightDelegates.items.length > 0 || bgTasks.hasAny || Boolean(swarmUi.latestSwarm) || timelineMessages.some((m) => m.role === "goal" || m.role === "tool")) && (
                 <PinnedHudStack
-                  timelineMessages={timelineMessages}
-                  chatVersion={chat.version}
-                  wsSending={wsSending}
+                  timelineMessages={timelineMessages} chatVersion={chat.version} wsSending={wsSending}
                   tokenUsage={activeSess?._liveTurnUsage?.usage}
-                  delegateItems={inflightDelegates.items}
-                  onDismissDelegate={inflightDelegates.dismiss}
+                  delegateItems={inflightDelegates.items} onDismissDelegate={inflightDelegates.dismiss} onCancelDelegate={inflightDelegates.cancel}
                   onStopTurn={wsSending ? stopTurn : undefined}
-                  latestSwarm={swarmUi.latestSwarm}
-                  latestSwarmCardId={swarmUi.latestCard?.messageId}
-                  latestSwarmBlockId={swarmUi.latestCard?.blockId}
-                  latestSwarmKey={swarmUi.latestSwarmKey}
-                  dismissedSwarmKey={swarmUi.dismissedSwarmKey}
-                  onOpenSwarmBoard={swarmUi.openBoard}
-                  onDismissSwarm={swarmUi.dismissSwarm}
+                  latestSwarm={swarmUi.latestSwarm} latestSwarmCardId={swarmUi.latestCard?.messageId} latestSwarmBlockId={swarmUi.latestCard?.blockId}
+                  latestSwarmKey={swarmUi.latestSwarmKey} dismissedSwarmKey={swarmUi.dismissedSwarmKey}
+                  onOpenSwarmBoard={swarmUi.openBoard} onDismissSwarm={swarmUi.dismissSwarm}
+                  museJobs={bgTasks.museJobs} mediaJobs={bgTasks.mediaJobs} bgCommands={bgTasks.bgCommands} sessionCrons={bgTasks.sessionCrons}
+                  onCancelMuseJob={bgTasks.cancelMuseJob} onDismissMuseJob={bgTasks.dismissMuseJob} onCancelMediaJob={bgTasks.cancelMediaJob}
+                  onCancelBgCommand={bgTasks.cancelBgCommand} onToggleSessionCron={bgTasks.toggleSessionCron} onDeleteSessionCron={bgTasks.deleteSessionCron}
                 />
               )}
               <div id="pending-approval-bar-slot" className="mx-auto mb-2 max-w-3xl px-4 empty:mb-0 empty:hidden" />
@@ -2828,7 +2821,7 @@ export function App() {
         projectSettingsMounted={projectSettingsMounted}
         projectSettingsOpen={projectSettingsOpen}
         projects={projects}
-        refreshMe={refreshMe}
+        refreshMe={refreshMeWithSub}
         refreshMyAgents={refreshMyAgents}
         repo={repo}
         repoModalMounted={repoModalMounted}
@@ -2889,7 +2882,7 @@ export function App() {
         user={user}
         wsMessages={wsMessages}
         selectModel={selectModel} liveTerminal={liveTerminal} sessionNeedsYou={sessionNeedsYou}
-        unreadIds={unreadSessions.unreadIds} onMarkRead={unreadSessions.markRead}
+        unreadIds={unreadSessions.unreadIds} swarmSessionIds={swarmSessionIds} onMarkRead={unreadSessions.markRead}
         onOpenQuickAsk={gated ? undefined : () => setQuickAsk((s) => ({ ...s, open: true, mounted: true }))}
         contextHealthOpen={contextHealthOpen}
         onContextHealthOpenChange={setContextHealthOpen}

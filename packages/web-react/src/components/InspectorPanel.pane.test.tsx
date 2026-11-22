@@ -49,35 +49,18 @@ function session(): ChatMessage[] {
   ];
 }
 
-const STEPS = { tab: "steps" as const, nonce: 1 };
+const STEPS_WITHOUT_MESSAGE = { tab: "steps" as const, nonce: 1 };
 
-describe("详情面板分区与步骤", () => {
-  test("步骤页按轮分组、最近一轮在上并默认展开;点一步进入详情,计数与上一步 / 下一步 / 返回", () => {
-    render(<InspectorPanelContent messages={session()} request={STEPS} onClose={() => {}} />);
-    expect(screen.getByRole("tab", { name: /步骤\s*4/ })).toHaveAttribute("aria-selected", "true");
-    const turns = screen.getAllByTestId("pane-turn");
-    expect(turns).toHaveLength(2);
-    expect(within(turns[0]).getByText("第二轮：写代码并运行")).toBeInTheDocument();
-    expect(within(turns[0]).getAllByTestId("pane-step")).toHaveLength(3);
-    // 更早的轮默认收起,点开才见
-    expect(within(turns[1]).queryByTestId("pane-step")).not.toBeInTheDocument();
-    fireEvent.click(within(turns[1]).getByRole("button", { name: /第一轮/ }));
-    expect(within(turns[1]).getAllByTestId("pane-step")).toHaveLength(1);
-
-    fireEvent.click(within(turns[0]).getAllByTestId("pane-step")[1]);
-    expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("3 / 4");
-    expect(screen.getByRole("heading", { level: 3, name: "终端" })).toBeInTheDocument();
-    fireEvent.click(screen.getByLabelText("下一步"));
-    expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("4 / 4");
-    expect(screen.getByLabelText("下一步")).toBeDisabled();
-    fireEvent.click(screen.getByLabelText("上一步"));
-    fireEvent.click(screen.getByLabelText("上一步"));
-    expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("2 / 4");
-    fireEvent.click(screen.getByRole("button", { name: /全部步骤/ }));
-    expect(screen.getByTestId("pane-step-list")).toBeInTheDocument();
+describe("详情面板分区与按需单步下钻", () => {
+  test("OCV5-844: 顶栏不出现常驻「过程」Tab，无具体步骤的 steps 请求安全回落到产出页", async () => {
+    render(<InspectorPanelContent messages={session()} request={STEPS_WITHOUT_MESSAGE} onClose={() => {}} />);
+    await screen.findByTestId("outputs-view");
+    expect(screen.getByRole("tab", { name: "产出" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("tab", { name: /过程|步骤/ })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("pane-step-list")).not.toBeInTheDocument();
   });
 
-  test("面板内 K/J 与 ←/→ 翻步;焦点在分区栏上时 ←/→ 归分区栏", () => {
+  test("按需点入具体步骤进入 StepDetail: 计数、上一步 / 下一步与「返回产出」", async () => {
     const messages = session();
     render(
       <InspectorPanelContent
@@ -86,50 +69,59 @@ describe("详情面板分区与步骤", () => {
         onClose={() => {}}
       />,
     );
-    const body = screen.getByTestId("pane-step-body");
+    expect(screen.queryByRole("tab", { name: /过程|步骤/ })).not.toBeInTheDocument();
     expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("3 / 4");
-    fireEvent.keyDown(body, { key: "j" });
+    expect(screen.getByRole("heading", { level: 3, name: "终端" })).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("下一步"));
     expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("4 / 4");
-    fireEvent.keyDown(body, { key: "ArrowLeft" });
-    fireEvent.keyDown(body, { key: "k" });
+    expect(screen.getByLabelText("下一步")).toBeDisabled();
+    fireEvent.click(screen.getByLabelText("上一步"));
+    fireEvent.click(screen.getByLabelText("上一步"));
     expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("2 / 4");
-    fireEvent.keyDown(screen.getByRole("tab", { name: /步骤/ }), { key: "ArrowRight" });
+    fireEvent.click(screen.getByRole("button", { name: /返回产出/ }));
+    expect(await screen.findByTestId("outputs-view")).toBeInTheDocument();
     expect(screen.queryByTestId("pane-step-counter")).not.toBeInTheDocument();
   });
 
-  test("每步用时与过程时间轴同口径:从上一步结束(首步从本轮开始)到这一步结束", () => {
-    const t0 = TS;
+  test("面板内 K/J 与 ←/→ 翻步;焦点在分区栏上时 ←/→ 归分区栏并退出单步下钻", () => {
+    const messages: ChatMessage[] = [
+      user("u0", "规划"),
+      tool("todo", "TodoWrite", { todos: [{ content: "写代码", status: "in_progress" }] }),
+      ...session(),
+    ];
+    // session()[5] is messages[7] ("python3 fib.py")
     render(
       <InspectorPanelContent
-        messages={[
-          { ...user("u1", "跑"), ts: t0 },
-          { id: "th", role: "thinking", text: "想", ts: t0 + 100, completedAt: t0 + 1000 },
-          tool("b1", "Bash", { command: "a" }, { ts: t0 + 1200, completedAt: t0 + 2500, durationMs: 300 }),
-          tool("b2", "Bash", { command: "b" }, { ts: t0 + 2600, completedAt: t0 + 4100, durationMs: 1200 }),
-        ]}
-        request={STEPS}
+        messages={messages}
+        request={{ tab: "steps", message: messages[7], nonce: 1 }}
         onClose={() => {}}
       />,
     );
-    const rows = screen.getAllByTestId("pane-step");
-    // 2500 − 1000(思考结束) = 1.5 秒;4100 − 2500 = 1.6 秒(不是工具自身的 0.3 / 1.2 秒)
-    expect(rows[0]).toHaveTextContent("1.5 秒");
-    expect(rows[1]).toHaveTextContent("1.6 秒");
+    const body = screen.getByTestId("pane-step-body");
+    expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("4 / 5");
+    fireEvent.keyDown(body, { key: "j" });
+    expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("5 / 5");
+    fireEvent.keyDown(body, { key: "ArrowLeft" });
+    fireEvent.keyDown(body, { key: "k" });
+    expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("3 / 5");
+    fireEvent.keyDown(screen.getByRole("tab", { name: "产出" }), { key: "ArrowRight" });
+    expect(screen.queryByTestId("pane-step-counter")).not.toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /计划/ })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("pane-plan")).toBeInTheDocument();
   });
 
-  test("没有步骤时给空态", () => {
-    render(<InspectorPanelContent messages={[user("u1", "你好")]} request={STEPS} onClose={() => {}} />);
-    expect(screen.getByText("还没有执行步骤")).toBeInTheDocument();
-  });
-
-  test("运行中停在最新一步 = 跟随:新步骤到来自动切过去;翻回旧步骤后「回到最新」", () => {
+  test("运行中点开最新一步 = 跟随:新步骤到来自动切过去;翻回旧步骤后「回到最新」", () => {
     const messages = session();
     const onActive = vi.fn();
     const { rerender } = render(
-      <InspectorPanelContent messages={messages} running request={STEPS} onClose={() => {}} onActiveChange={onActive} />,
+      <InspectorPanelContent
+        messages={messages}
+        running
+        request={{ tab: "steps", message: messages[6], nonce: 1 }}
+        onClose={() => {}}
+        onActiveChange={onActive}
+      />,
     );
-    const latestRow = screen.getAllByTestId("pane-step")[2];
-    fireEvent.click(latestRow);
     expect(screen.getByTestId("pane-following")).toBeInTheDocument();
     expect(onActive).toHaveBeenLastCalledWith(messages[6]);
 
@@ -159,7 +151,7 @@ describe("详情面板分区与步骤", () => {
 });
 
 describe("产出页里的改动", () => {
-  test("文件的改动视图:同会话再次 Write 按与上次写入的 diff 计数并展示;「查看这一步」跳回步骤", async () => {
+  test("文件的改动视图:同会话再次 Write 按与上次写入的 diff 计数并展示;「查看这一步」下钻 StepDetail 并可返回产出", async () => {
     render(<InspectorPanelContent messages={session()} request={{ tab: "outputs", nonce: 1 }} onClose={() => {}} />);
     await screen.findByTestId("outputs-view");
     expect(screen.getByRole("tab", { name: "产出" })).toHaveAttribute("aria-selected", "true");
@@ -174,8 +166,14 @@ describe("产出页里的改动", () => {
     expect(changes).toHaveLength(2);
     expect(changes[1]).toHaveTextContent("覆盖写入（与上次写入对比）");
     fireEvent.click(within(changes[1]).getByRole("button", { name: "查看这一步" }));
-    expect(screen.getByRole("tab", { name: /步骤/ })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("tab", { name: /过程|步骤/ })).not.toBeInTheDocument();
     expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("4 / 4");
+    expect(screen.getByRole("button", { name: /返回产出/ })).toBeInTheDocument();
+
+    // 点击「返回产出」回到产出页
+    fireEvent.click(screen.getByRole("button", { name: /返回产出/ }));
+    expect(await screen.findByTestId("outputs-view")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "产出" })).toHaveAttribute("aria-selected", "true");
   });
 
   test("失败的写入标「有失败」且不计行数", async () => {
@@ -212,15 +210,32 @@ describe("计划页与记忆", () => {
     expect(plan).toHaveTextContent("正在写代码");
   });
 
-  test("分区选择记在本机,下次打开停在同一分区;没记过 / r1 记的「改动」→ 产出", () => {
+  test("OCV5-844: 分区选择记在本机; 旧缓存 \"steps\" / \"changes\" 自动迁移回 \"outputs\"", () => {
+    const withPlan = [
+      user("u0", "规划"),
+      tool("todo", "TodoWrite", { todos: [{ content: "写代码", status: "in_progress" }] }),
+      ...session(),
+    ];
+    render(<InspectorPanelContent messages={withPlan} onClose={() => {}} />);
+    expect(screen.getByRole("tab", { name: "产出" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("tab", { name: /过程|步骤/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: /计划/ }));
+    expect(localStorage.getItem(PANE_TAB_STORAGE_KEY)).toBe("plan");
+    cleanup();
+
+    render(<InspectorPanelContent messages={withPlan} onClose={() => {}} />);
+    expect(screen.getByRole("tab", { name: /计划/ })).toHaveAttribute("aria-selected", "true");
+    cleanup();
+
+    // 旧缓存 "steps" 静默迁回 "outputs"
+    localStorage.setItem(PANE_TAB_STORAGE_KEY, "steps");
     render(<InspectorPanelContent messages={session()} onClose={() => {}} />);
     expect(screen.getByRole("tab", { name: "产出" })).toHaveAttribute("aria-selected", "true");
-    fireEvent.click(screen.getByRole("tab", { name: /步骤/ }));
-    expect(localStorage.getItem(PANE_TAB_STORAGE_KEY)).toBe("steps");
+    expect(localStorage.getItem(PANE_TAB_STORAGE_KEY)).toBe("outputs");
+    expect(screen.queryByRole("tab", { name: /过程|步骤/ })).not.toBeInTheDocument();
     cleanup();
-    render(<InspectorPanelContent messages={session()} onClose={() => {}} />);
-    expect(screen.getByRole("tab", { name: /步骤/ })).toHaveAttribute("aria-selected", "true");
-    cleanup();
+
+    // r1 旧缓存 "changes" 同样回落到 "outputs"
     localStorage.setItem(PANE_TAB_STORAGE_KEY, "changes");
     render(<InspectorPanelContent messages={session()} onClose={() => {}} />);
     expect(screen.getByRole("tab", { name: "产出" })).toHaveAttribute("aria-selected", "true");
@@ -266,8 +281,9 @@ describe("Codex r1 回归", () => {
 
   test("选中按 id:历史重载用同 id 的新对象替换后,详情显示新正文,计数与翻步还在", () => {
     const first = session();
-    const { rerender } = render(<InspectorPanelContent messages={first} request={STEPS} onClose={() => {}} />);
-    fireEvent.click(screen.getAllByTestId("pane-step")[1]);
+    const { rerender } = render(
+      <InspectorPanelContent messages={first} request={{ tab: "steps", message: first[5], nonce: 1 }} onClose={() => {}} />,
+    );
     expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("3 / 4");
     const reloaded = first.map((m) => (m.id === "t3" ? { ...m, output: "RELOADED-OUTPUT" } : { ...m }));
     rerender(<InspectorPanelContent messages={reloaded} onClose={() => {}} />);
@@ -355,7 +371,7 @@ describe("Codex r1 回归", () => {
     expect(screen.queryByTestId("pane-following")).not.toBeInTheDocument();
   });
 
-  test("过程 Tab 清洗系统回调标题与 env HOME 宿主桥接命令，顶栏标签克制显示「过程」", () => {
+  test("OCV5-844: 按需 StepDetail 头部副摘要剥离 env HOME 宿主桥接噪音，顶栏无常驻「过程」Tab", () => {
     const hostCmd = [
       "env HOME=/home/agent /home/agent/.local/bin/host '",
       '  export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="*"',
@@ -370,23 +386,23 @@ describe("Codex r1 回归", () => {
       user("u2", "🎫 lease ls-20261121T072712Z-c88785cc5d71 已满足"),
       tool("t2", "Bash", { command: hostCmd }),
     ];
-    render(<InspectorPanelContent messages={messages} request={STEPS} onClose={() => {}} />);
+    render(
+      <InspectorPanelContent
+        messages={messages}
+        request={{ tab: "steps", message: messages[3], nonce: 1 }}
+        onClose={() => {}}
+      />,
+    );
 
-    // 顶栏显示克制的「过程」标签，同时兼容 /步骤/ 无障碍名称
-    const stepsTab = screen.getByRole("tab", { name: /过程/ });
-    expect(stepsTab).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByRole("tab", { name: /步骤\s*2/ })).toBe(stepsTab);
+    // 顶栏不再显示常驻「过程 / 步骤」Tab
+    expect(screen.queryByRole("tab", { name: /过程|步骤/ })).not.toBeInTheDocument();
+    expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("2 / 2");
 
-    // 轮次标题已清洗为人话，绝不暴露原始 lease id / emoji / hex
-    const turns = screen.getAllByTestId("pane-turn");
-    expect(turns[0]).toHaveTextContent("发布上线完成");
-    expect(turns[1]).toHaveTextContent("发版同步提示");
-    expect(screen.queryByText(/ls-20261121T072712Z/)).toBeNull();
-
-    // 步骤副摘要已剥离 env HOME=/home/agent 宿主桥接噪音
-    const stepRow = within(turns[0]).getByTestId("pane-step");
-    expect(stepRow).toHaveTextContent("tsc --noEmit");
-    expect(stepRow).not.toHaveTextContent("env HOME=");
-    expect(stepRow).not.toHaveTextContent("GIT_CONFIG_COUNT");
+    // StepHeader 副摘要已剥离 env HOME=/home/agent 宿主桥接噪音
+    const heading = screen.getByRole("heading", { level: 3, name: "终端" });
+    const headerRow = heading.closest("div")?.parentElement;
+    expect(headerRow).toHaveTextContent("tsc --noEmit");
+    expect(headerRow).not.toHaveTextContent("env HOME=");
+    expect(headerRow).not.toHaveTextContent("GIT_CONFIG_COUNT");
   });
 });

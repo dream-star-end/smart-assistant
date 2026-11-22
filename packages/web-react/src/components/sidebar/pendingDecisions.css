@@ -15,6 +15,12 @@
   border-bottom: 1px solid var(--border);
 }
 
+.oc-pd-dock[data-collapsed="true"] {
+  margin: 0.375rem 0.5rem 0.125rem;
+  padding: 0;
+  border-bottom: 0;
+}
+
 .oc-pd-head {
   display: flex;
   flex-shrink: 0;
@@ -23,13 +29,17 @@
   padding: 0 0.125rem;
 }
 
+.oc-pd-dock[data-collapsed="true"] .oc-pd-head {
+  padding: 0;
+}
+
 .oc-pd-title-btn {
   display: flex;
   flex: 1 1 auto;
   min-width: 0;
   align-items: center;
   gap: 0.375rem;
-  border: 0;
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
   padding: 0.25rem 0.375rem;
   background: transparent;
@@ -38,11 +48,35 @@
   font-weight: 600;
   text-align: left;
   cursor: pointer;
-  transition: background-color 140ms var(--ease-standard);
+  transition:
+    background-color 150ms var(--ease-standard),
+    border-color 150ms var(--ease-standard),
+    box-shadow 150ms var(--ease-standard);
 }
 
 .oc-pd-title-btn:hover {
   background: var(--hover);
+}
+
+.oc-pd-dock[data-collapsed="true"] .oc-pd-title-btn {
+  padding: 0.375rem 0.5rem;
+  border-color: color-mix(in srgb, var(--border) 90%, transparent);
+  background: color-mix(in srgb, var(--surface) 68%, transparent);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--fg) 3%, transparent);
+}
+
+.oc-pd-dock[data-collapsed="true"] .oc-pd-title-btn:hover {
+  border-color: var(--border-strong);
+  background: var(--surface);
+  box-shadow: var(--shadow-soft);
+}
+
+.oc-pd-dock[data-collapsed="true"][data-highest-risk="high"] .oc-pd-title-btn {
+  border-color: color-mix(in srgb, var(--warning) 28%, var(--border));
+}
+
+.oc-pd-dock[data-collapsed="true"][data-highest-risk="critical"] .oc-pd-title-btn {
+  border-color: color-mix(in srgb, var(--danger) 30%, var(--border));
 }
 
 .oc-pd-title-btn:focus-visible {
@@ -62,6 +96,23 @@
   flex-shrink: 0;
 }
 
+.oc-pd-risk-dot {
+  width: 0.375rem;
+  height: 0.375rem;
+  border-radius: var(--radius-full);
+  flex-shrink: 0;
+}
+
+.oc-pd-risk-dot[data-risk="high"] {
+  background: var(--warning);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--warning) 18%, transparent);
+}
+
+.oc-pd-risk-dot[data-risk="critical"] {
+  background: var(--danger);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 20%, transparent);
+}
+
 .oc-pd-count {
   display: inline-flex;
   align-items: center;
@@ -75,6 +126,25 @@
   font-size: var(--text-micro);
   font-weight: 700;
   font-variant-numeric: tabular-nums;
+}
+
+.oc-pd-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: auto;
+  color: var(--faint);
+  transition:
+    transform 180ms var(--ease-standard),
+    color 140ms var(--ease-standard);
+}
+
+.oc-pd-title-btn:hover .oc-pd-chevron {
+  color: var(--muted);
+}
+
+.oc-pd-chevron[data-expanded="true"] {
+  transform: rotate(90deg);
 }
 
 .oc-pd-filters {

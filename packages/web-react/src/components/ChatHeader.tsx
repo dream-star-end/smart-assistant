@@ -1,6 +1,7 @@
 import type { CursorContextTier, ServiceTier } from "@openclaude/protocol/browser";
 import {
   ChevronDown,
+  Crown,
   FolderOpen,
   Loader2,
   MessageCircleQuestion,
@@ -10,6 +11,7 @@ import {
   Users,
 } from "lucide-react";
 import { useState } from "react";
+import type { SubscriptionSummary } from "../hooks/useSubscriptionSummary";
 import type { Agent } from "../lib/agents";
 import type { PreferenceEffort } from "../lib/modelPreferences";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
@@ -47,6 +49,42 @@ export function altKeyLabel(): string {
   return /Mac|iPhone|iPad|iPod/i.test(platform) ? "⌥" : "Alt+";
 }
 
+function formatSubscriptionExpiryDate(raw?: string | null): string | null {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  const isoDate = /^(\d{4}-\d{2}-\d{2})/.exec(trimmed);
+  if (isoDate) return isoDate[1]!;
+  const parsed = new Date(trimmed);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString().slice(0, 10);
+}
+
+function buildSubscriptionEntryMeta(summary?: SubscriptionSummary | null): {
+  paid: boolean;
+  chipText: string;
+  detailLabel: string;
+} {
+  if (!summary?.paid) {
+    return {
+      paid: false,
+      chipText: "订阅",
+      detailLabel: "查看订阅套餐与积分",
+    };
+  }
+  const plan = summary.planName?.trim() || summary.planCode?.trim() || "已订阅";
+  const parts = [`当前订阅：${plan}`];
+  const expiry = formatSubscriptionExpiryDate(summary.periodEnd);
+  if (expiry) parts.push(`到期 ${expiry}`);
+  if (typeof summary.periodCredits === "number" && Number.isFinite(summary.periodCredits)) {
+    parts.push(`本期剩余 ${summary.periodCredits.toLocaleString("zh-CN")} 积分`);
+  }
+  return {
+    paid: true,
+    chipText: plan,
+    detailLabel: parts.join(" · "),
+  };
+}
+
 export function ChatHeader({
   agent,
   onAgentClick,
@@ -78,8 +116,9 @@ export function ChatHeader({
   onDisableAdvisorMode,
   sidebarCollapsed,
   onExpandSidebar,
-  onNew,
   onOpenMobileNav,
+  onOpenSubscription,
+  subscriptionSummary,
   onOpenFind,
   onShare,
   onToggleQuickAsk,
@@ -150,9 +189,14 @@ export function ChatHeader({
   onOpenBilling?: () => void;
   sidebarCollapsed?: boolean;
   onExpandSidebar?: () => void;
+  /** @deprecated OCV5-844 顶栏不再渲染独立新建按钮，保留可选类型兼容旧调用方。 */
   onNew?: () => void;
   /** 移动端打开侧栏抽屉（窄屏侧栏不内联）。 */
   onOpenMobileNav?: () => void;
+  /** OCV5-844: 点击顶栏右侧订阅入口回调；传入时渲染精致订阅入口。 */
+  onOpenSubscription?: () => void;
+  /** OCV5-844: 当前用户的订阅状态摘要（区分已付费套餐徽章与未付费订阅引导）。 */
+  subscriptionSummary?: SubscriptionSummary | null;
   /** @deprecated OCV5-843 站内信已迁归侧栏左下角，保留可选类型兼容旧调用方。 */
   onOpenInbox?: () => void;
   /** 打开会话内查找条（省略则不渲染查找项，如 demo）。收敛在当前会话「更多操作」菜单中。 */
@@ -185,10 +229,10 @@ export function ChatHeader({
   const trimmedSessionTitle = typeof sessionTitle === "string" ? sessionTitle.trim() : "";
   const showSessionTitle = Boolean(trimmedSessionTitle && trimmedSessionTitle !== "新对话");
   const isNonDefaultAgent = agent.id !== "main";
-  const showMobileNewChat = Boolean(onNew && (onTogglePane || showSessionTitle));
   const hasWorkspaceToggles = Boolean(onToggleQuickAsk || onTogglePane);
   const hasDesktopOverflowTools = Boolean(onOpenFind || onShare);
   const hasAnyOverflowTools = Boolean(onToggleQuickAsk || hasDesktopOverflowTools);
+  const subscriptionMeta = buildSubscriptionEntryMeta(subscriptionSummary);
   // 团队模式说明弹层的受控开关：点「关闭团队模式」需要主动收起弹层（chip 随
   // teamModeActive 翻 false 一起卸载,不控 open 会留下无锚点的浮层）。
   const [teamPopoverOpen, setTeamPopoverOpen] = useState(false);
@@ -205,36 +249,6 @@ export function ChatHeader({
       updateAvailable={updateAvailable}
       onReloadForUpdate={onReloadForUpdate}
       className="relative z-20 border-x-0 border-t-0 border-b border-border/80 bg-bg/95 backdrop-blur-md shadow-xs"
-      mobileLeftExtra={
-        showMobileNewChat && onNew ? (
-          <IconButton
-            data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
-            data-testid="mobile-new-chat-btn"
-            onClick={onNew}
-            aria-label="新建会话"
-            title="新建会话"
-            shape="square"
-            className="oc-btn-tactile oc-spring-press oc-icon-nudge text-muted hover:text-fg"
-          >
-            <AtelierIcon name="newChat" size={17} />
-          </IconButton>
-        ) : undefined
-      }
-      collapsedExtra={
-        onNew ? (
-          <IconButton
-            data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
-            data-testid="desktop-collapsed-new-chat-btn"
-            onClick={onNew}
-            aria-label="新建会话"
-            title="新建会话"
-            shape="square"
-            className="oc-btn-tactile oc-spring-press oc-icon-nudge"
-          >
-            <AtelierIcon name="newChat" size={17} />
-          </IconButton>
-        ) : undefined
-      }
       contentClassName="min-h-12 flex-nowrap items-center gap-1 px-2 py-1 sm:min-h-[52px] sm:gap-1.5 sm:px-4 sm:py-1.5"
     >
       {/* 模型与运行态核心区：手机 <640px 居中紧凑胶囊（对称留白）；桌面 sm+ 左对齐且优先保障模型与蜂群态宽度。 */}
@@ -451,8 +465,30 @@ export function ChatHeader({
         </span>
       ) : null}
 
-      {/* 右侧当前会话操作区：桌面 [快问] + [◫ 工作台] + [···]；移动 [◫ 工作台(对话态)] + [···]（零红点）。 */}
+      {/* 右侧当前会话操作区：桌面 [订阅] + [快问] + [◫ 工作台] + [···]；移动 [订阅] + [◫ 工作台(对话态)] + [···]（零红点）。 */}
       <div className="ml-auto flex shrink-0 items-center gap-0.5 sm:gap-1">
+        {onOpenSubscription && (
+          <button
+            type="button"
+            data-product-feature={PRODUCT_CAPABILITIES.billing.id}
+            data-testid="header-subscription-btn"
+            data-paid={subscriptionMeta.paid ? "true" : "false"}
+            onClick={onOpenSubscription}
+            aria-label={subscriptionMeta.detailLabel}
+            title={subscriptionMeta.detailLabel}
+            className={cn(
+              "oc-btn-tactile oc-spring-press oc-badge-craft inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md border text-caption font-medium leading-none outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11 sm:h-8 sm:w-auto sm:gap-1.5 sm:rounded-full sm:px-2.5",
+              subscriptionMeta.paid
+                ? "border-warning/30 bg-warning-soft/80 text-warning hover:border-warning/50 hover:bg-warning-soft"
+                : "border-accent/25 bg-accent-soft/75 text-accent hover:border-accent/45 hover:bg-accent-soft",
+            )}
+          >
+            <Crown size={15} strokeWidth={1.85} aria-hidden className="shrink-0" />
+            <span className="hidden max-w-[5.5rem] truncate sm:inline">
+              {subscriptionMeta.chipText}
+            </span>
+          </button>
+        )}
         {hasWorkspaceToggles && (
           <div className="flex items-center gap-0.5 sm:gap-1" data-testid="header-workspace-toggles">
             {onToggleQuickAsk && (

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
 import { canonicalTaskContinuationError, manualTaskContinuationSource } from "../lib/chat/manualTaskContinuation";
 import { MessageListSkeleton, PartialHistorySkeleton } from "./chat/HistorySkeleton";
-import { workSummary } from "./chat/ProcessDisclosure";
+import { preloadPhaseTimelineSummary, workSummary } from "./chat/ProcessDisclosure";
 import { collectPaneSteps } from "./chat/workPane";
 import { MessageList } from "./MessageRenderer";
 import { ArtifactInspectContext } from "./tool/context";
@@ -22,6 +22,7 @@ loadBeforeAll(prefetchMarkdownImpl);
 loadBeforeAll(preloadToolBody);
 loadBeforeAll(preloadTimelineCards);
 loadBeforeAll(preloadProcessStages);
+loadBeforeAll(preloadPhaseTimelineSummary);
 
 afterEach(() => {
   cleanup();
@@ -2761,20 +2762,40 @@ describe("OCV5-370 过程摘要上的详情面板入口", () => {
     expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "false");
   });
 
-  test("只有其它步骤 → 「在详情面板查看步骤」;没有面板(无 provider)→ 都不出现", () => {
+  test("OCV5-844: 无文件改动时不渲染 process-pane-steps 图标，已完成多步回合默认收起为单行完成摘要且展开后支持阶段筛选", () => {
     const openPane = vi.fn();
+    const multiStepMessages: ChatMessage[] = [
+      row("u1", "user", "检查项目构建", { status: "replied", ts: 1_700_000_000_000 }),
+      row("r1", "tool", "读取", { _clientMessageId: "u1", toolName: "Read", inputJson: { file_path: "src/a.ts" }, _completed: true, output: "a" }),
+      row("r2", "tool", "搜索", { _clientMessageId: "u1", toolName: "Grep", inputJson: { pattern: "foo" }, _completed: true, output: "hit" }),
+      row("v1", "tool", "终端", { _clientMessageId: "u1", toolName: "Bash", inputJson: { command: "pnpm test" }, _completed: true, output: "pass" }),
+      row("v2", "tool", "终端", { _clientMessageId: "u1", toolName: "Bash", inputJson: { command: "pnpm typecheck" }, _completed: true, output: "ok" }),
+      row("a1", "assistant", "全部检查通过。", { _clientMessageId: "u1", ts: 1_700_000_012_000 }),
+    ];
     render(
       <ArtifactInspectContext.Provider value={{ open: () => {}, openPane }}>
-        <MessageList processDisclosure messages={settledTurn()} sending={false} sessionId="session-a" cb={{}} onRespondPermission={() => {}} />
+        <MessageList processDisclosure messages={multiStepMessages} sending={false} sessionId="session-a" cb={{}} onRespondPermission={() => {}} />
       </ArtifactInspectContext.Provider>,
     );
+    // 已完成回合默认只展示单行完成摘要，不展示阶段子行，也不展示 process-pane-steps 小图标
+    expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("phase-timeline-strip")).not.toBeInTheDocument();
     expect(screen.queryByTestId("process-pane-changes")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "在详情面板查看步骤" }));
-    expect(openPane).toHaveBeenCalledWith("steps");
+    expect(screen.queryByTestId("process-pane-steps")).not.toBeInTheDocument();
+
+    // 点击完成行展开后，PhaseTimelineFilterBar 仍完整可用
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "true");
+    const filterBar = screen.getByTestId("phase-filter-bar");
+    fireEvent.click(within(filterBar).getByTestId("phase-filter-verify"));
+    expect(screen.getByTestId("process-phase-filtered")).toHaveAttribute("data-phase-filter", "verify");
+    expect(within(screen.getByTestId("process-phase-filtered")).getAllByTestId("process-step-row")).toHaveLength(2);
+
     cleanup();
     renderList(settledTurn());
     expect(screen.queryByTestId("process-pane-steps")).not.toBeInTheDocument();
     expect(screen.queryByTestId("process-pane-changes")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("phase-timeline-strip")).not.toBeInTheDocument();
   });
 });
 

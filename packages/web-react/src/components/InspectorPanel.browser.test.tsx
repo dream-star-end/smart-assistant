@@ -95,13 +95,18 @@ describe("浏览器页", () => {
     expect(screen.getByTestId("browser-window-noshot")).toHaveTextContent("没有成功");
   });
 
-  test("操作记录里的「详情」进步骤页那一步", async () => {
+  test("操作记录里的「详情」下钻到 StepDetail 全文，点「返回浏览器」回到浏览器页", async () => {
     const messages = session();
     render(<InspectorPanelContent messages={messages} request={{ tab: "browser", message: messages[2], nonce: 1 }} onClose={() => {}} />);
     await browserReady();
+    expect(screen.queryByTestId("outputs-open-steps")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "第 2 步的详情" }));
-    expect(screen.getByRole("tab", { name: /步骤/ })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("tab", { name: /过程|步骤/ })).not.toBeInTheDocument();
     expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("3 / 5");
+    expect(screen.getByRole("button", { name: /返回浏览器/ })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /返回浏览器/ }));
+    await browserReady();
+    expect(screen.getByRole("tab", { name: /浏览器/ })).toHaveAttribute("aria-selected", "true");
   });
 
   test("大记录定位桩:用点击带来的完整消息,或页面缓存里的正文", async () => {
@@ -204,10 +209,14 @@ describe("浏览器页", () => {
     });
   });
 
-  test("不在顶层轮里的浏览器步(子任务等)退回步骤详情", () => {
+  test("不在顶层轮里的浏览器步(子任务等)退回按需步骤详情", async () => {
     const child = bash("child", "oc-browser open https://a.example", page("https://a.example/", "A"));
     render(<InspectorPanelContent messages={session()} request={{ tab: "browser", message: child, nonce: 1 }} onClose={() => {}} />);
-    expect(screen.getByRole("tab", { name: /步骤/ })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("tab", { name: /过程|步骤/ })).not.toBeInTheDocument();
+    expect(screen.getByTestId("pane-stepper")).toBeInTheDocument();
+    expect(screen.getByTestId("pane-step-body")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /返回产出/ }));
+    expect(await screen.findByTestId(/^outputs-(view|empty)$/)).toBeInTheDocument();
   });
 
   test("非浏览器轮次 running=true 时，浏览器步骤页不误报「助手正在操作浏览器」", async () => {

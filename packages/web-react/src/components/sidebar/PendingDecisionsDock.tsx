@@ -11,7 +11,6 @@
 import {
   ArrowUpRight,
   Check,
-  ChevronDown,
   ChevronRight,
   Plug,
   RefreshCw,
@@ -37,6 +36,28 @@ import "./pendingDecisions.css";
 
 const POLL_INTERVAL_MS = 30_000;
 const DEFAULT_VISIBLE_ITEMS = 12;
+export const PENDING_DECISIONS_COLLAPSED_STORAGE_KEY = "oc_v5_pending_decisions_collapsed";
+
+function readStoredCollapsed(): boolean | null {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return null;
+    const raw = window.localStorage.getItem(PENDING_DECISIONS_COLLAPSED_STORAGE_KEY);
+    if (raw === "1" || raw === "true") return true;
+    if (raw === "0" || raw === "false") return false;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredCollapsed(collapsed: boolean): void {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return;
+    window.localStorage.setItem(PENDING_DECISIONS_COLLAPSED_STORAGE_KEY, collapsed ? "1" : "0");
+  } catch {
+    // 隐私模式或存储配额受限时静默忽略
+  }
+}
 
 /** 从 taskboard 待拍板条目解析任务单 identifier（优先）或 ticketId，供直达详情抽屉使用。 */
 export function resolveTaskboardTicketRef(item: PendingDecisionItem): string | null {
@@ -94,14 +115,17 @@ export function PendingDecisionsDock({
   onOpenBoard,
   onOpenLiveBrowser,
   pollIntervalMs = POLL_INTERVAL_MS,
-  defaultCollapsed = false,
+  defaultCollapsed = true,
 }: PendingDecisionsDockProps) {
   const ctxAuth = useOptionalAuth();
   const auth = authProp !== undefined ? authProp : ctxAuth;
   const toast = useToast();
 
   const [items, setItems] = useState<PendingDecisionItem[]>([]);
-  const [collapsed, setCollapsed] = useState(defaultCollapsed);
+  const [collapsed, setCollapsed] = useState<boolean>(() => {
+    const stored = readStoredCollapsed();
+    return stored !== null ? stored : defaultCollapsed;
+  });
   const [sourceFilter, setSourceFilter] = useState<PendingDecisionSource | "all">("all");
   const [showAll, setShowAll] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -109,6 +133,14 @@ export function PendingDecisionsDock({
   const [conflictNotice, setConflictNotice] = useState<string | null>(null);
   const mountedRef = useRef(true);
   const lastFetchAtRef = useRef(0);
+
+  const handleToggleCollapsed = useCallback(() => {
+    setCollapsed((prev) => {
+      const next = !prev;
+      writeStoredCollapsed(next);
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -189,6 +221,15 @@ export function PendingDecisionsDock({
     [items, effectiveFilter],
   );
 
+  const highestRisk = useMemo<"critical" | "high" | null>(() => {
+    let hasHigh = false;
+    for (const item of items) {
+      if (item.riskLevel === "critical") return "critical";
+      if (item.riskLevel === "high") hasHigh = true;
+    }
+    return hasHigh ? "high" : null;
+  }, [items]);
+
   // 无待拍板时零噪音收起
   if (items.length === 0) return null;
 
@@ -246,10 +287,16 @@ export function PendingDecisionsDock({
     }
   };
 
+  const toggleTitle = collapsed
+    ? `展开待拍板（${items.length} 项${highestRisk ? "，含高风险" : ""}）`
+    : "收起待拍板";
+
   return (
     <section
       aria-label="待拍板决策收件箱"
       data-testid="pending-decisions-dock"
+      data-collapsed={collapsed ? "true" : "false"}
+      data-highest-risk={highestRisk ?? undefined}
       className="oc-pd-dock"
     >
       <div className="oc-pd-head">
@@ -257,31 +304,51 @@ export function PendingDecisionsDock({
           type="button"
           data-testid="pending-decisions-toggle"
           aria-expanded={!collapsed}
-          onClick={() => setCollapsed((v) => !v)}
+          title={toggleTitle}
+          onClick={handleToggleCollapsed}
           className="oc-pd-title-btn"
         >
           <span className="oc-pd-icon" aria-hidden>
             <AtelierIcon name="shield" size={13} />
           </span>
           <span className="truncate">待拍板</span>
+          {highestRisk && (
+            <span
+              className="oc-pd-risk-dot"
+              data-testid="pending-decisions-risk-dot"
+              data-risk={highestRisk}
+              aria-hidden
+            />
+          )}
+          {highestRisk && (
+            <span className="sr-only">
+              {highestRisk === "critical" ? "含极高风险项" : "含高风险项"}
+            </span>
+          )}
           <span className="oc-pd-count" data-testid="pending-decisions-count">
             {items.length}
           </span>
-          <span className="ml-auto text-faint" aria-hidden>
-            {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+          <span
+            className="oc-pd-chevron"
+            data-expanded={!collapsed ? "true" : "false"}
+            aria-hidden
+          >
+            <ChevronRight size={13} strokeWidth={1.85} />
           </span>
         </button>
-        <IconButton
-          size="sm"
-          shape="square"
-          aria-label="刷新待拍板列表"
-          title="刷新待拍板"
-          disabled={refreshing}
-          onClick={() => void fetchItems()}
-          className="oc-spring-press size-7 shrink-0 [@media(hover:none)]:size-11"
-        >
-          <RefreshCw size={12} className={refreshing ? "animate-spin" : undefined} />
-        </IconButton>
+        {!collapsed && (
+          <IconButton
+            size="sm"
+            shape="square"
+            aria-label="刷新待拍板列表"
+            title="刷新待拍板"
+            disabled={refreshing}
+            onClick={() => void fetchItems()}
+            className="oc-spring-press size-7 shrink-0 [@media(hover:none)]:size-11"
+          >
+            <RefreshCw size={12} className={refreshing ? "animate-spin" : undefined} />
+          </IconButton>
+        )}
       </div>
 
       {!collapsed && (

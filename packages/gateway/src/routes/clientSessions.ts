@@ -51,6 +51,7 @@ import {
   upsertClientSession,
 } from '@openclaude/storage'
 import type { AdvisorConfigStore } from '../advisorConfigStore.js'
+import { cancelSingleDelegateJob, type DelegateCancelHost } from '../delegateCancel.js'
 import { handleInflightDelegatesRequest } from '../delegateInflightSurface.js'
 import type { DelegateInflightSurfaceStore } from '../delegateInflightSurface.js'
 import type { DelegateJobStore } from '../delegateJobs.js'
@@ -60,6 +61,7 @@ import {
   attachPermissionSnapshotIfMissing,
   parsePermissionLookupQuery,
 } from '../pendingPermissionSnapshot.js'
+import { cancelSessionBgCommand, listSessionBgCommands } from '../sessionBgCommands.js'
 import type { SessionManager } from '../sessionManager.js'
 import { isPatrolSessionKey } from '../taskboard/domain.js'
 import { handleChatProjectsHttp } from './chatProjects.js'
@@ -82,6 +84,7 @@ export interface ClientSessionsHttpIo extends GatewayHttpIo {
   pendingPermissions: Parameters<typeof attachPermissionSnapshotIfMissing>[1]
   delegateJobs(): DelegateJobStore | undefined
   ensureDelegateInflightSurface(): DelegateInflightSurfaceStore
+  delegateCancelHost?(): DelegateCancelHost
   advisorConfigStore(): AdvisorConfigStore
 }
 
@@ -693,6 +696,137 @@ export function handleClientSessionsHttp(
       .catch((error: unknown) =>
         io.sendSessionReadFailure(res, error, sessId, 'inflight delegates read failed'),
       )
+    return true
+  }
+  const delegateCancelMatch = url.pathname.match(
+    /^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/inflight-delegates\/([^/]{1,180})\/cancel$/,
+  )
+  if (delegateCancelMatch) {
+    const sessId = delegateCancelMatch[1]
+    const userId = io.getUserId(req)
+    if (req.method !== 'POST') {
+      io.sendJson(res, 405, { error: 'method not allowed' })
+      return true
+    }
+    let jobId = ''
+    try {
+      jobId = decodeURIComponent(delegateCancelMatch[2]).trim()
+    } catch {
+      io.sendJson(res, 400, { error: 'invalid job id' })
+      return true
+    }
+    ;(async () => {
+      if (!(await clientSessionIsActive(sessId, userId))) {
+        io.sendJson(res, 404, { error: 'not found' })
+        return
+      }
+      const host = io.delegateCancelHost?.()
+      if (!host) {
+        io.sendJson(res, 503, { error: 'delegate cancel unavailable' })
+        return
+      }
+      const result = cancelSingleDelegateJob(host, sessId, jobId)
+      if (!result.ok) {
+        io.sendJson(res, result.status, { error: result.error, code: result.code })
+        return
+      }
+      io.sendJson(res, 200, result)
+    })().catch((error: unknown) =>
+      io.sendSessionReadFailure(res, error, sessId, 'delegate cancel failed'),
+    )
+    return true
+  }
+  const bgCommandsMatch = url.pathname.match(
+    /^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/bg-commands$/,
+  )
+  if (bgCommandsMatch) {
+    const sessId = bgCommandsMatch[1]
+    const userId = io.getUserId(req)
+    if (req.method !== 'GET') {
+      io.sendJson(res, 405, { error: 'method not allowed' })
+      return true
+    }
+    ;(async () => {
+      if (!(await clientSessionIsActive(sessId, userId))) {
+        io.sendJson(res, 404, { error: 'not found' })
+        return
+      }
+      io.sendJson(res, 200, { items: listSessionBgCommands(sessId) })
+    })().catch((error: unknown) =>
+      io.sendSessionReadFailure(res, error, sessId, 'bg commands read failed'),
+    )
+    return true
+  }
+  const bgCommandCancelMatch = url.pathname.match(
+    /^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/bg-commands\/([^/]{1,128})\/cancel$/,
+  )
+  if (bgCommandCancelMatch) {
+    const sessId = bgCommandCancelMatch[1]
+    const userId = io.getUserId(req)
+    if (req.method !== 'POST') {
+      io.sendJson(res, 405, { error: 'method not allowed' })
+      return true
+    }
+    let entryId = ''
+    try {
+      entryId = decodeURIComponent(bgCommandCancelMatch[2]).trim()
+    } catch {
+      io.sendJson(res, 400, { error: 'invalid job id' })
+      return true
+    }
+    ;(async () => {
+      if (!(await clientSessionIsActive(sessId, userId))) {
+        io.sendJson(res, 404, { error: 'not found' })
+        return
+      }
+      const result = await cancelSessionBgCommand(sessId, entryId)
+      if (!result.ok) {
+        io.sendJson(res, result.status, { error: result.error, code: result.code })
+        return
+      }
+      io.sendJson(res, 200, result)
+    })().catch((error: unknown) =>
+      io.sendSessionReadFailure(res, error, sessId, 'bg command cancel failed'),
+    )
+    return true
+  }
+  const backgroundTasksMatch = url.pathname.match(
+    /^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/background-tasks$/,
+  )
+  if (backgroundTasksMatch) {
+    const sessId = backgroundTasksMatch[1]
+    const userId = io.getUserId(req)
+    if (req.method !== 'GET') {
+      io.sendJson(res, 405, { error: 'method not allowed' })
+      return true
+    }
+    ;(async () => {
+      if (!(await clientSessionIsActive(sessId, userId))) {
+        io.sendJson(res, 404, { error: 'not found' })
+        return
+      }
+      let delegates: unknown[] = []
+      if (isDelegateInflightSurfaceEffective()) {
+        const resDelegates = await handleInflightDelegatesRequest({
+          method: 'GET',
+          sessionId: sessId,
+          userId,
+          enabled: true,
+          searchParams: url.searchParams,
+          loadSession: async () => ({ id: sessId, userId }),
+          store: io.ensureDelegateInflightSurface(),
+          overlayJobs: () => io.delegateJobs()?.listNonTerminal() ?? [],
+          resolveJob: (jobId) => io.delegateJobs()?.snapshotOf(jobId),
+        })
+        if (resDelegates.status === 200 && Array.isArray(resDelegates.body.items)) {
+          delegates = resDelegates.body.items
+        }
+      }
+      const bgCommands = listSessionBgCommands(sessId)
+      io.sendJson(res, 200, { delegates, museJobs: [], bgCommands })
+    })().catch((error: unknown) =>
+      io.sendSessionReadFailure(res, error, sessId, 'background tasks read failed'),
+    )
     return true
   }
   const sessionReadMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/read$/)

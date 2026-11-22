@@ -49,8 +49,41 @@ const MULTI_PHASE_MESSAGES: ChatMessage[] = [
 ];
 
 describe("PhaseTimelineSummary integration in ProcessDisclosure", () => {
-  test("renders compact phase strip when collapsed and opens directly into clicked phase filter", () => {
-    render(<Harness messages={MULTI_PHASE_MESSAGES} />);
+  test("OCV5-844: completed multi-step turn hides collapsed phase strip and steps icon, while expanded filter bar still filters phases", () => {
+    render(<Harness messages={MULTI_PHASE_MESSAGES} active={false} />);
+
+    // Completed & collapsed: only the single summary line, no explore/verify phase strip and no process-pane-steps button
+    expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("phase-timeline-strip")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("process-pane-steps")).not.toBeInTheDocument();
+
+    // Expanding still shows the full interactive PhaseTimelineFilterBar
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "true");
+    const filterBar = screen.getByTestId("phase-filter-bar");
+    expect(within(filterBar).getByTestId("phase-filter-all")).toHaveAttribute("aria-pressed", "true");
+
+    // Filtering by edit shows the 1 edit step
+    fireEvent.click(screen.getByTestId("phase-filter-edit"));
+    expect(within(filterBar).getByTestId("phase-filter-edit")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("phase-group-header")).toHaveTextContent("代码与产物编辑");
+    const filtered = screen.getByTestId("process-phase-filtered");
+    expect(filtered).toHaveAttribute("data-phase-filter", "edit");
+    expect(within(filtered).getAllByTestId("process-step-row")).toHaveLength(1);
+
+    // Switching filter to explore shows the 2 explore steps
+    fireEvent.click(screen.getByTestId("phase-filter-explore"));
+    expect(screen.getByTestId("process-phase-filtered")).toHaveAttribute("data-phase-filter", "explore");
+    expect(within(screen.getByTestId("process-phase-filtered")).getAllByTestId("process-step-row")).toHaveLength(2);
+
+    // Resetting restores the chronological step view (single-section renders step rows directly without redundant group fold)
+    fireEvent.click(screen.getByTestId("phase-filter-reset"));
+    expect(screen.queryByTestId("process-phase-filtered")).not.toBeInTheDocument();
+    expect(screen.getAllByTestId("process-step-row")).toHaveLength(4);
+  });
+
+  test("running turn manually collapsed still shows compact live phase strip and opens directly into clicked phase filter", () => {
+    render(<Harness messages={MULTI_PHASE_MESSAGES} active initialOpen={false} />);
 
     const strip = screen.getByTestId("phase-timeline-strip");
     expect(within(strip).getByTestId("phase-pill-explore")).toHaveTextContent("探索2");
@@ -73,16 +106,6 @@ describe("PhaseTimelineSummary integration in ProcessDisclosure", () => {
     const filtered = screen.getByTestId("process-phase-filtered");
     expect(filtered).toHaveAttribute("data-phase-filter", "edit");
     expect(within(filtered).getAllByTestId("process-step-row")).toHaveLength(1);
-
-    // Switching filter to explore shows the 2 explore steps
-    fireEvent.click(screen.getByTestId("phase-filter-explore"));
-    expect(screen.getByTestId("process-phase-filtered")).toHaveAttribute("data-phase-filter", "explore");
-    expect(within(screen.getByTestId("process-phase-filtered")).getAllByTestId("process-step-row")).toHaveLength(2);
-
-    // Resetting restores the chronological step view (single-section renders step rows directly without redundant group fold)
-    fireEvent.click(screen.getByTestId("phase-filter-reset"));
-    expect(screen.queryByTestId("process-phase-filtered")).not.toBeInTheDocument();
-    expect(screen.getAllByTestId("process-step-row")).toHaveLength(4);
   });
 
   test("hides compact strip and filter bar for simple single-step turns", () => {
@@ -127,22 +150,34 @@ describe("PhaseTimelineSummary integration in ProcessDisclosure", () => {
     expect(within(filterBar).queryByTestId("phase-active-dot-explore")).toBeNull();
   });
 
-  test("OCV5-834: hides filter bar for short 2-3 step turns by default, but shows it when clicked from collapsed strip", () => {
-    render(
+  test("OCV5-834: hides filter bar for short 2-3 step turns by default, and shows it when clicked from running collapsed strip", () => {
+    const view = render(
       <Harness
+        active={false}
         messages={[
           msg("r1", "tool", { toolName: "Read", inputJson: { file_path: "src/a.ts" }, _completed: true }),
           msg("v1", "tool", { toolName: "Bash", inputJson: { command: "pnpm test" }, _completed: true }),
         ]}
       />,
     );
-    // Normal open: zero filter-bar noise for < 4 steps
+    // Completed short turn: no collapsed strip and no filter bar when opened
+    expect(screen.queryByTestId("phase-timeline-strip")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("process-toggle"));
     expect(screen.queryByTestId("phase-filter-bar")).not.toBeInTheDocument();
     expect(screen.getAllByTestId("process-step-row")).toHaveLength(2);
+    view.unmount();
 
-    // Close and click a phase crumb from the collapsed strip: filter bar shows so user can reset
-    fireEvent.click(screen.getByTestId("process-toggle"));
+    // Running short turn collapsed: clicking a phase crumb opens directly into filter bar so user can reset
+    render(
+      <Harness
+        active
+        initialOpen={false}
+        messages={[
+          msg("r1", "tool", { toolName: "Read", inputJson: { file_path: "src/a.ts" }, _completed: true }),
+          msg("v1", "tool", { toolName: "Bash", inputJson: { command: "pnpm test" }, _completed: false }),
+        ]}
+      />,
+    );
     fireEvent.click(screen.getByTestId("phase-pill-verify"));
     expect(screen.getByTestId("phase-filter-bar")).toBeInTheDocument();
     expect(screen.getByTestId("process-phase-filtered")).toHaveAttribute("data-phase-filter", "verify");

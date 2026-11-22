@@ -168,3 +168,20 @@ export {
   INTERNAL_SWARM_USER_ID_HEADER,
 } from './routes/swarmCommandRoute.js'
 export { SWARM_COMMAND_ROUTE_RE } from './swarmCommand.js'
+export {
+  SESSION_BG_COMMAND_ID_RE,
+  cancelSessionBgCommand,
+  listSessionBgCommands,
+  type CancelSessionBgCommandResult,
+  type SessionBgCommandItem,
+} from './sessionBgCommands.js'
+export {
+  cancelSingleDelegateJob,
+  type CancelSingleDelegateJobResult,
+  type DelegateCancelHost,
+} from './delegateCancel.js'
+export {
+  INTERNAL_SESSION_BG_CMD_CANCEL_RE,
+  INTERNAL_SESSION_BG_STATE_RE,
+  INTERNAL_SESSION_DELEGATE_CANCEL_RE,
+} from './routes/sessionBackgroundRoute.js'

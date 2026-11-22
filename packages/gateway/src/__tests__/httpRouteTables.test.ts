@@ -42,6 +42,33 @@ const CURRENT_HTTP_DISPATCH: Record<string, LegacyGroup> = {
       match: (_req: { method?: string }, url: URL) =>
         url.pathname.startsWith('/internal/v3/remote-swarm/'),
     }
+    const sessionBgInternalRoutes = [
+      {
+        id: 'GET /internal/sessions/:id/background-state',
+        line: 0,
+        calls: ['handleInternalSessionBackgroundState'],
+        match: (req: { method?: string }, url: URL) =>
+          /^\/internal\/sessions\/([^/]+)\/background-state$/.test(url.pathname) &&
+          req.method === 'GET',
+      },
+      {
+        id: 'POST /internal/sessions/:id/inflight-delegates/:jobId/cancel',
+        line: 0,
+        calls: ['handleInternalSessionDelegateCancel'],
+        match: (req: { method?: string }, url: URL) =>
+          /^\/internal\/sessions\/([^/]+)\/inflight-delegates\/([^/]+)\/cancel$/.test(
+            url.pathname,
+          ) && req.method === 'POST',
+      },
+      {
+        id: 'POST /internal/sessions/:id/bg-commands/:jobId/cancel',
+        line: 0,
+        calls: ['handleInternalSessionBgCmdCancel'],
+        match: (req: { method?: string }, url: URL) =>
+          /^\/internal\/sessions\/([^/]+)\/bg-commands\/([^/]+)\/cancel$/.test(url.pathname) &&
+          req.method === 'POST',
+      },
+    ]
     return {
       ...base,
       routes: [
@@ -53,12 +80,16 @@ const CURRENT_HTTP_DISPATCH: Record<string, LegacyGroup> = {
         },
         ...base.routes.slice(0, afterProjectSearch),
         remoteSwarmRoute,
+        ...sessionBgInternalRoutes,
         ...base.routes.slice(afterProjectSearch),
       ],
       samples: [
         '/api/internal/system-help',
         '/internal/v3/remote-swarm/swarm',
         '/internal/v3/remote-swarm/post_message',
+        '/internal/sessions/web-sess-1/background-state',
+        '/internal/sessions/web-sess-1/inflight-delegates/dlgjob-abc/cancel',
+        '/internal/sessions/web-sess-1/bg-commands/1234-ocb_1/cancel',
         ...base.samples,
       ],
     }

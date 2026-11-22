@@ -5,10 +5,12 @@ import {
   mergeInflightWithTimeline,
   type InflightDelegateItem,
 } from "../lib/chat/inflightDelegates";
+import { cancelInflightDelegate } from "../lib/chat/sessionBackgroundTasks";
 import type { ChatMessage } from "../lib/chat/model";
 import type { AuthSession } from "../lib/types";
 
 const POLL_MS = 15_000;
+const REFRESH_THROTTLE_MS = 2_000;
 /**
  * Terminal rows persist server-side (≤32/session). Without a recency gate an
  * old session would pin a stale "completed" pill on open. Show a terminal item
@@ -92,8 +94,15 @@ export function useInflightDelegates(opts: {
   messages: ChatMessage[];
   enabled: boolean;
   auth: AuthSession | null;
-}): { items: InflightDelegateItem[]; degraded: boolean; dismiss: (jobId: string) => void } {
-  const { sessionId, messages, enabled, auth } = opts;
+  /** 外部事件脉冲（turn 结束 / delegate_progress / 出现委派块等），带节流触发补拉，解决中途起委派轮询盲区。 */
+  refreshTrigger?: number;
+}): {
+  items: InflightDelegateItem[];
+  degraded: boolean;
+  dismiss: (jobId: string) => void;
+  cancel: (jobId: string) => Promise<boolean>;
+} {
+  const { sessionId, messages, enabled, auth, refreshTrigger } = opts;
   const [rawItems, setRawItems] = useState<InflightDelegateItem[] | null>(null);
   const [failures, setFailures] = useState(0);
   const [dismissed, setDismissed] = useState<Set<string>>(() => readDismissedDelegates(sessionId));
@@ -110,6 +119,9 @@ export function useInflightDelegates(opts: {
   const authRef = useRef(auth);
   authRef.current = auth;
   const genRef = useRef(0);
+  const lastPullAtRef = useRef(0);
+  const refreshTimerRef = useRef<number | null>(null);
+  const prevRefreshTriggerRef = useRef(refreshTrigger);
 
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
@@ -128,6 +140,7 @@ export function useInflightDelegates(opts: {
     const a = authRef.current;
     if (!a) return;
     if (notFoundRef.current.has(sid)) return;
+    lastPullAtRef.current = Date.now();
     const result = await fetchInflightDelegatesResult(sid, a);
     if (genRef.current !== myGen) return;
     if (result.ok) {
@@ -142,7 +155,28 @@ export function useInflightDelegates(opts: {
     setFailures((n) => Math.min(n + 1, 2));
   }, []);
 
+  const cancel = useCallback(
+    async (jobId: string): Promise<boolean> => {
+      const sid = sessionIdRef.current;
+      const a = authRef.current;
+      if (!sid || !a || !jobId) return false;
+      const myGen = genRef.current;
+      const res = await cancelInflightDelegate(sid, jobId, a);
+      if (!res.ok) return false;
+      if (genRef.current === myGen) {
+        await pull(sid, myGen);
+      }
+      return true;
+    },
+    [pull],
+  );
+
   useEffect(() => {
+    if (refreshTimerRef.current !== null) {
+      window.clearTimeout(refreshTimerRef.current);
+      refreshTimerRef.current = null;
+    }
+    prevRefreshTriggerRef.current = refreshTrigger;
     if (!enabled || !sessionId || !auth) {
       genRef.current += 1;
       setRawItems(null);
@@ -159,8 +193,38 @@ export function useInflightDelegates(opts: {
     void pull(sessionId, myGen);
     return () => {
       genRef.current += 1;
+      if (refreshTimerRef.current !== null) {
+        window.clearTimeout(refreshTimerRef.current);
+        refreshTimerRef.current = null;
+      }
     };
+    // biome-ignore lint/correctness/useExhaustiveDependencies: refreshTrigger 由下方节流 effect 单独处理，不触发全量重置。
   }, [enabled, sessionId, auth, pull]);
+
+  useEffect(() => {
+    if (refreshTrigger === undefined || refreshTrigger === prevRefreshTriggerRef.current) {
+      prevRefreshTriggerRef.current = refreshTrigger;
+      return;
+    }
+    prevRefreshTriggerRef.current = refreshTrigger;
+    if (!enabled || !sessionId || !auth || notFoundRef.current.has(sessionId)) return;
+    const myGen = genRef.current;
+    const elapsed = Date.now() - lastPullAtRef.current;
+    if (elapsed >= REFRESH_THROTTLE_MS) {
+      if (refreshTimerRef.current !== null) {
+        window.clearTimeout(refreshTimerRef.current);
+        refreshTimerRef.current = null;
+      }
+      void pull(sessionId, myGen);
+      return;
+    }
+    if (refreshTimerRef.current !== null) return;
+    const waitMs = Math.max(0, REFRESH_THROTTLE_MS - elapsed);
+    refreshTimerRef.current = window.setTimeout(() => {
+      refreshTimerRef.current = null;
+      if (genRef.current === myGen) void pull(sessionId, myGen);
+    }, waitMs);
+  }, [refreshTrigger, enabled, sessionId, auth, pull]);
 
   const shouldPoll =
     !!enabled &&
@@ -196,5 +260,5 @@ export function useInflightDelegates(opts: {
     });
   }, [rawItems, messages, dismissed]);
 
-  return { items, degraded: failures > 0, dismiss };
+  return { items, degraded: failures > 0, dismiss, cancel };
 }

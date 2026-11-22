@@ -1,4 +1,4 @@
-import { ChevronDown, PanelRight, Pencil } from "lucide-react";
+import { ChevronDown, Pencil } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { type ChatMessage, isRetryingTurnStatus } from "../../lib/chat/model";
 import { isErrorCardHeldWithAnswer } from "../../lib/chat/render";
@@ -1204,12 +1204,11 @@ export function ProcessDisclosure<T>({
       break;
     }
   }
-  // 详情面板入口(OCV5-370):本轮改过文件 → 常显「改动 N 个文件」,点开面板的改动页;
-  // 只有其它步骤 → 一个安静的面板图标(桌面悬停 / 触屏常显),点开步骤页。
+  // 详情面板入口(OCV5-370 / OCV5-844):本轮改过文件 → 常显「改动 N 个文件」,点开面板的产出页;
+  // 不再在完成行右侧挂打开「过程」Tab 的图标(单步全文按需从展开后的工具卡进入)。
   const openPane = useArtifactInspect().openPane;
   const processRows = openPane ? sections.flatMap((section) => section.items.flatMap((item) => messagesOf(item))) : [];
   const changedFiles = openPane ? toolChangedFileCount(processRows) : 0;
-  const hasToolRows = processRows.some((message) => message.role === "tool");
   const elapsedValid = active && typeof startedAt === "number" && Number.isFinite(startedAt) && startedAt > 0;
   // 长步骤 / 步骤间隙的活性信号。当前段是叙述(中途说明)时原本不挂任何动效——流式文字本身就是信号;
   // 但文字写完后模型可能还要想很久、或下一条命令还没到,整屏就没有任何「还在干活」的迹象,
@@ -1330,20 +1329,9 @@ export function ProcessDisclosure<T>({
             {changedFiles} 个文件
           </span>
         </button>
-      ) : openPane && hasToolRows ? (
-        <button
-          type="button"
-          data-testid="process-pane-steps"
-          aria-label="在详情面板查看步骤"
-          title="在详情面板查看步骤"
-          className="oc-btn-tactile flex size-7 shrink-0 items-center justify-center rounded-md text-faint/80 opacity-0 outline-none transition-all hover:bg-hover/70 hover:text-fg focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover/shellrow:opacity-100 [@media(hover:none)]:size-10 [@media(hover:none)]:opacity-100"
-          onClick={() => openPane("steps")}
-        >
-          <PanelRight size={14} strokeWidth={1.75} />
-        </button>
       ) : null}
       </div>
-      {!open && maybeMultiStep ? (
+      {active && !open && maybeMultiStep ? (
         <LazyPhaseTimelineStrip
           messages={messages}
           stepTimings={stepTimings}

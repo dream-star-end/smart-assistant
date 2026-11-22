@@ -1504,6 +1504,7 @@ export async function registerCommercial(
     mediaGeneration: mediaGenerationService,
     sites: sitesService,
     museBridgeHttp,
+    museHub,
     studio: studioHttp,
     goalStateService,
     pendingDecisionsService: pendingDecisionsRuntime.service,

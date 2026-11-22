@@ -102,7 +102,6 @@ export function TurnBar({
   fileCount,
   onPrev,
   onNext,
-  onOpenSteps,
 }: {
   turn: WorkTurn;
   index: number;
@@ -111,7 +110,6 @@ export function TurnBar({
   fileCount: number;
   onPrev: () => void;
   onNext: () => void;
-  onOpenSteps: () => void;
 }) {
   const s = turnSummary(turn, running);
   const parts: ReactNode[] = [];
@@ -165,20 +163,6 @@ export function TurnBar({
             {p}
           </span>
         ))}
-        {s.steps > 0 && (
-          <button
-            type="button"
-            onClick={onOpenSteps}
-            data-testid="outputs-open-steps"
-            className={cn(
-              "oc-btn-tactile inline-flex items-center gap-0.5 rounded-md px-1.5 py-0.5 font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring",
-              parts.length > 0 && "ml-0.5",
-            )}
-          >
-            查看步骤
-            <ChevronRight size={13} aria-hidden />
-          </button>
-        )}
       </p>
     </div>
   );
@@ -887,7 +871,6 @@ export function OutputsView({
   running,
   targetOutput,
   onSelectTurn,
-  onOpenSteps,
   onOpenStep,
   onAnnotateToComposer,
 }: {
@@ -900,7 +883,6 @@ export function OutputsView({
   /** 从对话文件卡 / 科研报告 / 智能 UI 交付物卡外部直达的目标产物定位请求。 */
   targetOutput?: TargetOutputRequest | null;
   onSelectTurn: (index: number) => void;
-  onOpenSteps: () => void;
   onOpenStep: (message: ToolLike) => void;
   /** 可选：批注回填至 Composer 输入框的回调。 */
   onAnnotateToComposer?: (draft: string) => void;
@@ -963,7 +945,6 @@ export function OutputsView({
         compact={isCompact}
         targetOutput={targetOutput}
         onSelectTurn={onSelectTurn}
-        onOpenSteps={onOpenSteps}
         onOpenStep={onOpenStep}
         onAnnotateToComposer={onAnnotateToComposer}
       />
@@ -980,7 +961,6 @@ function TurnOutputsBody({
   compact,
   targetOutput,
   onSelectTurn,
-  onOpenSteps,
   onOpenStep,
   onAnnotateToComposer,
 }: {
@@ -992,7 +972,6 @@ function TurnOutputsBody({
   compact: boolean;
   targetOutput?: TargetOutputRequest | null;
   onSelectTurn: (index: number) => void;
-  onOpenSteps: () => void;
   onOpenStep: (message: ToolLike) => void;
   onAnnotateToComposer?: (draft: string) => void;
 }) {
@@ -1087,7 +1066,6 @@ function TurnOutputsBody({
           fileCount={fileCount}
           onPrev={() => onSelectTurn(index - 1)}
           onNext={() => onSelectTurn(index + 1)}
-          onOpenSteps={onOpenSteps}
         />
       )}
 
@@ -1183,7 +1161,7 @@ function TurnOutputsBody({
           </span>
           <p className="text-body font-semibold text-fg">{running ? "这一轮还在进行" : "这一轮没有产出文件"}</p>
           <p className="max-w-xs text-meta leading-relaxed text-muted">
-            {running ? "写出的文件、生成的图片和查过的网页会出现在这里。" : "回答在左侧对话里；想看助手做了什么，可以查看步骤。"}
+            {running ? "写出的文件、生成的图片和查过的网页会出现在这里。" : "回答在左侧对话里；展开左侧完成摘要即可查看本轮执行过程。"}
           </p>
         </div>
       ) : null}

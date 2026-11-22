@@ -199,7 +199,7 @@ describe("产出页", () => {
     expect(screen.getByTestId("outputs-turn")).toHaveTextContent("做一个落地页");
   });
 
-  test("没有产出的轮给安静的空态,「查看步骤」进步骤页", async () => {
+  test("OCV5-844: 没有产出的轮给安静空态，不渲染冗余「查看步骤」按钮与常驻「过程」Tab", async () => {
     render(
       <InspectorPanelContent
         messages={[user("u1", "跑一下测试"), tool("b1", "Bash", { command: "npm test" }), assistant("a1", "都过了")]}
@@ -207,10 +207,12 @@ describe("产出页", () => {
       />,
     );
     await outputsReady();
-    expect(screen.getByTestId("outputs-none")).toHaveTextContent("这一轮没有产出文件");
-    fireEvent.click(screen.getByTestId("outputs-open-steps"));
-    expect(screen.getByRole("tab", { name: /步骤/ })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByTestId("pane-step-list")).toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: /过程|步骤/ })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("outputs-open-steps")).toBeNull();
+    const empty = screen.getByTestId("outputs-none");
+    expect(empty).toHaveTextContent("这一轮没有产出文件");
+    expect(empty).toHaveTextContent("展开左侧完成摘要即可查看本轮执行过程");
+    expect(empty).not.toHaveTextContent("查看步骤");
   });
 
   test("参考来源默认列 5 条,其余收在「显示全部」里", async () => {

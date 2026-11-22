@@ -104,16 +104,29 @@ function StatusMark({ state, className }: { state: string; className?: string })
 function DelegateRow({
   item,
   onDismiss,
+  onCancel,
 }: {
   item: InflightDelegateItem;
   onDismiss: (jobId: string) => void;
+  onCancel?: (jobId: string) => Promise<boolean> | void;
 }) {
+  const [cancelling, setCancelling] = useState(false);
   const terminal = isTerminalDelegateState(item.state);
   const goalLine = firstLine(item.goal);
   const hint = item.liveHint.trim();
   // 终态一律显示摘要(H-01):失败 / 取消 / 被终止的原因就在 resultSummary 里,以前只给 completed 看。
   const summary = terminal ? firstLine(item.resultSummary ?? "") : "";
   const name = agentDisplayName(item.agentId) || item.agentId;
+  const handleCancel = async (e: React.MouseEvent<HTMLButtonElement>) => {
+    e.stopPropagation();
+    if (!onCancel || cancelling) return;
+    setCancelling(true);
+    try {
+      await onCancel(item.jobId);
+    } finally {
+      setCancelling(false);
+    }
+  };
   return (
     <div className="flex items-start gap-2 text-body">
       <span className="mt-px shrink-0">
@@ -153,6 +166,18 @@ function DelegateRow({
         >
           知道了
         </Button>
+      ) : onCancel ? (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          disabled={cancelling}
+          aria-label={`取消任务：${goalLine || item.goal}`}
+          className="shrink-0 text-muted hover:bg-danger/10 hover:text-danger"
+          onClick={(e) => void handleCancel(e)}
+        >
+          {cancelling ? "取消中…" : "取消"}
+        </Button>
       ) : null}
     </div>
   );
@@ -161,10 +186,12 @@ function DelegateRow({
 export function PinnedDelegateTracker({
   items,
   onDismiss,
+  onCancel,
   onStop,
 }: {
   items: InflightDelegateItem[];
   onDismiss: (jobId: string) => void;
+  onCancel?: (jobId: string) => Promise<boolean> | void;
   onStop?: () => void;
 }) {
   const visible = useMemo(() => visibleDelegateItems(items), [items]);
@@ -334,7 +361,12 @@ export function PinnedDelegateTracker({
             className={cn(HUD_LIST_CLS, overflow.fadeCls)}
           >
             {visible.map((item) => (
-              <DelegateRow key={item.jobId} item={item} onDismiss={onDismiss} />
+              <DelegateRow
+                key={item.jobId}
+                item={item}
+                onDismiss={onDismiss}
+                onCancel={onCancel}
+              />
             ))}
           </div>
         )}

@@ -8,13 +8,22 @@ import {
 } from "../../lib/api/wave4Api";
 import { createMemoryAuthSession } from "../../lib/authSession";
 import { ToastProvider } from "../ui";
-import { PendingDecisionsDock, resolveTaskboardTicketRef } from "./PendingDecisionsDock";
+import {
+  PENDING_DECISIONS_COLLAPSED_STORAGE_KEY,
+  PendingDecisionsDock,
+  resolveTaskboardTicketRef,
+} from "./PendingDecisionsDock";
 
 const origFetch = globalThis.fetch;
 
 afterEach(() => {
   cleanup();
   globalThis.fetch = origFetch;
+  try {
+    window.localStorage.removeItem(PENDING_DECISIONS_COLLAPSED_STORAGE_KEY);
+  } catch {
+    /* ignore */
+  }
   vi.restoreAllMocks();
 });
 
@@ -150,7 +159,16 @@ describe("PendingDecisionsDock · 统一待拍板聚合收件箱", () => {
     );
 
     expect(await screen.findByTestId("pending-decisions-dock")).toBeInTheDocument();
+    expect(screen.getByTestId("pending-decisions-dock")).toHaveAttribute("data-collapsed", "true");
     expect(screen.getByTestId("pending-decisions-count")).toHaveTextContent("3");
+    expect(screen.getByTestId("pending-decisions-risk-dot")).toHaveAttribute("data-risk", "high");
+    expect(screen.getByTestId("pending-decisions-toggle")).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("pending-decisions-list")).toBeNull();
+    expect(screen.queryAllByTestId("pending-decision-item")).toHaveLength(0);
+
+    // 点击折叠条展开后，渲染全部卡片并保留二元审批 / 直达区分
+    fireEvent.click(screen.getByTestId("pending-decisions-toggle"));
+    expect(screen.getByTestId("pending-decisions-toggle")).toHaveAttribute("aria-expanded", "true");
 
     const cards = screen.getAllByTestId("pending-decision-item");
     expect(cards).toHaveLength(3);
@@ -200,7 +218,7 @@ describe("PendingDecisionsDock · 统一待拍板聚合收件箱", () => {
 
     render(
       <ToastProvider>
-        <PendingDecisionsDock auth={auth} pollIntervalMs={0} />
+        <PendingDecisionsDock auth={auth} pollIntervalMs={0} defaultCollapsed={false} />
       </ToastProvider>,
     );
 
@@ -284,6 +302,9 @@ describe("PendingDecisionsDock · 统一待拍板聚合收件箱", () => {
     );
 
     expect(await screen.findByTestId("pending-decisions-count")).toHaveTextContent("5");
+    expect(screen.queryAllByTestId("pending-decision-item")).toHaveLength(0);
+
+    fireEvent.click(screen.getByTestId("pending-decisions-toggle"));
     const cards = screen.getAllByTestId("pending-decision-item");
     expect(cards).toHaveLength(5);
 
@@ -298,5 +319,66 @@ describe("PendingDecisionsDock · 统一待拍板聚合收件箱", () => {
     // 点击卡片 2 的 ↗ 按钮 → 从 sourceId 剥离 @v4
     fireEvent.click(within(cards[2]!).getByTestId("pending-decision-open-source"));
     expect(onOpenBoard).toHaveBeenLastCalledWith("tk-266");
+  });
+
+  it("展开/折叠偏好持久化到 localStorage：重挂载后保持用户选择，且优先于 defaultCollapsed", async () => {
+    const auth = createMemoryAuthSession(() => {}, "jwt-pd-persist");
+    const items: PendingDecisionItem[] = [
+      makeItem({
+        id: "connector_write:cw-low",
+        source: "connector_write",
+        sourceId: "cw-low",
+        title: "普通低风险写入",
+        riskLevel: "low",
+      }),
+    ];
+    globalThis.fetch = vi.fn(async () =>
+      new Response(JSON.stringify(listPayload(items)), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    ) as typeof fetch;
+
+    const first = render(
+      <ToastProvider>
+        <PendingDecisionsDock auth={auth} pollIntervalMs={0} />
+      </ToastProvider>,
+    );
+
+    expect(await screen.findByTestId("pending-decisions-dock")).toBeInTheDocument();
+    // 全为低风险项时不展示高风险微点
+    expect(screen.queryByTestId("pending-decisions-risk-dot")).toBeNull();
+    expect(screen.getByTestId("pending-decisions-toggle")).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryAllByTestId("pending-decision-item")).toHaveLength(0);
+
+    // 用户点击展开，写入持久化偏好
+    fireEvent.click(screen.getByTestId("pending-decisions-toggle"));
+    expect(screen.getAllByTestId("pending-decision-item")).toHaveLength(1);
+    expect(window.localStorage.getItem(PENDING_DECISIONS_COLLAPSED_STORAGE_KEY)).toBe("0");
+
+    // 卸载重挂载（模拟关闭再打开移动端抽屉/侧栏）：保持展开
+    first.unmount();
+    const second = render(
+      <ToastProvider>
+        <PendingDecisionsDock auth={auth} pollIntervalMs={0} />
+      </ToastProvider>,
+    );
+    expect(await screen.findByTestId("pending-decisions-dock")).toBeInTheDocument();
+    expect(screen.getByTestId("pending-decisions-toggle")).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getAllByTestId("pending-decision-item")).toHaveLength(1);
+
+    // 用户再次折叠，写入持久化偏好，即使外部传 defaultCollapsed={false} 也以用户持久化偏好为准
+    fireEvent.click(screen.getByTestId("pending-decisions-toggle"));
+    expect(window.localStorage.getItem(PENDING_DECISIONS_COLLAPSED_STORAGE_KEY)).toBe("1");
+    second.unmount();
+
+    render(
+      <ToastProvider>
+        <PendingDecisionsDock auth={auth} pollIntervalMs={0} defaultCollapsed={false} />
+      </ToastProvider>,
+    );
+    expect(await screen.findByTestId("pending-decisions-dock")).toBeInTheDocument();
+    expect(screen.getByTestId("pending-decisions-toggle")).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryAllByTestId("pending-decision-item")).toHaveLength(0);
   });
 });

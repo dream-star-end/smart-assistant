@@ -1305,7 +1305,7 @@ export function Sidebar({
         )}
       </div>
 
-      {showLiveActivityStrip && (hasLiveCandidate || Boolean(optionalAuth)) && (
+      {showLiveActivityStrip && !searching && !multiSelect && (hasLiveCandidate || Boolean(optionalAuth)) && (
         <Suspense fallback={null}>
           <SidebarLiveActivityStrip
             sessions={activeSessions}

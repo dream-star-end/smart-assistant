@@ -237,6 +237,7 @@ export type AppDialogsProps = {
   liveTerminal?: (id: string) => { lastOutcome?: string | null; lastErrorCode?: string | null } | undefined;
   sessionNeedsYou?: (id: string) => SessionNeedsYouKind | null | undefined;
   unreadIds?: ReadonlySet<string>;
+  swarmSessionIds?: ReadonlySet<string>;
   onMarkRead?: (id: string) => void;
   onOpenQuickAsk?: () => void;
   contextHealthOpen?: boolean;
@@ -376,6 +377,7 @@ export function AppDialogs({
   liveTerminal,
   sessionNeedsYou,
   unreadIds,
+  swarmSessionIds,
   onMarkRead,
   onOpenQuickAsk,
   contextHealthOpen,
@@ -561,6 +563,7 @@ export function AppDialogs({
             liveTerminal={liveTerminal}
             sessionNeedsYou={sessionNeedsYou}
             unreadIds={unreadIds}
+            swarmSessionIds={swarmSessionIds}
             onMarkRead={onMarkRead}
             onOpenSite={demo || !openSites ? undefined : (slug) => openSites(slug)}
             models={models}

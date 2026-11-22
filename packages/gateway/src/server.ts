@@ -645,6 +645,7 @@ export class Gateway {
     pendingPermissions: this._pendingPermissions,
     delegateJobs: () => this._delegateJobs,
     ensureDelegateInflightSurface: () => this._ensureDelegateInflightSurface(),
+    delegateCancelHost: () => this._delegateCancelHost(),
     advisorConfigStore: () => this.advisorConfigStore(),
   }
   /**
@@ -881,13 +882,15 @@ export class Gateway {
   }
 
   // ───────── HTTP ─────────
-  private handleHttp(req: IncomingMessage, res: ServerResponse): void {
-    handleHttpImpl.call(this as unknown as GatewayHttpHost, req, res)
-  }
+  private handleHttp(req: IncomingMessage, res: ServerResponse): void { handleHttpImpl.call(this as unknown as GatewayHttpHost, req, res) }
+  private _delegateCancelHost() { return { traceHost: this, delegateJobs: () => this._delegateJobs, delegateInflightSurface: () => this._ensureDelegateInflightSurface(), sessions: this.sessions, _delegateQueueWaiters: this._delegateQueueWaiters, _interruptDelegationsForParent: (k: string) => this._interruptDelegationsForParent(k) } }
   /** Narrow view of the Gateway for routes/preAuth.ts (FINDINGS §7.5 2b, OCV5-468). */
   private readonly preAuthRoutesIo: PreAuthRoutesIo = ((gw: Gateway): PreAuthRoutesIo => ({
     handleSystemHelp: (req, res) => handleSystemHelpLocal(req, res, getSystemHelpRelay(gw.sessions)),
     handleRemoteSwarmLocal: (req, res, url) => handleGatewayRemoteSwarmHttp({ req, res, url, extractToken: (r) => gw.extractToken(r), accessToken: gw.deps.config.gateway.accessToken, readBody: (r, m) => gw.readBody(r, m), sendJson: (r, c, b) => gw.sendJson(r, c, b), runtime: gw._ensureRemoteSwarmRuntime(), sessions: gw.sessions }),
+    delegateJobs: () => gw._delegateJobs,
+    ensureDelegateInflightSurface: () => gw._ensureDelegateInflightSurface(),
+    delegateCancelHost: () => gw._delegateCancelHost(),
     _handleSkillEvalGenStart: (...args) => gw._handleSkillEvalGenStart(...args),
     _handleSkillEvalGenStatus: (...args) => gw._handleSkillEvalGenStatus(...args),
     _handleSkillTrainRun: (...args) => gw._handleSkillTrainRun(...args),

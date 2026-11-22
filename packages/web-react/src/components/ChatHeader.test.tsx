@@ -262,23 +262,8 @@ describe("ChatHeader 当前会话「···」溢出菜单与快捷键标签", ()
   });
 });
 
-describe("ChatHeader 桌面与移动端对称布局（OCV5-843）", () => {
-  it("空会话态移动端仅留左汉堡 + 居中模型胶囊 + 右「···」，不渲染多余新建按钮", () => {
-    renderHeader({
-      onOpenMobileNav: vi.fn(),
-      onNew: vi.fn(),
-      sessionTitle: "新对话",
-    });
-
-    const headerRow = screen.getByTestId("chat-model-row").parentElement;
-    expect(headerRow).toHaveClass("flex-nowrap", "min-h-12");
-    expect(screen.queryByTestId("mobile-new-chat-btn")).toBeNull();
-    expect(screen.queryByTestId("detail-pane-toggle")).toBeNull();
-    expect(screen.getByTestId("chat-model-row")).toHaveClass("justify-center", "sm:justify-start");
-    expect(screen.getByTestId("header-overflow-trigger")).toBeInTheDocument();
-  });
-
-  it("活跃会话态移动端左 2（汉堡 + newChat）与右 2（工作台 + 「···」）完全对称，且与桌面折叠态新建按钮互斥无重复", () => {
+describe("ChatHeader 极简左侧与顶栏订阅入口（OCV5-844）", () => {
+  it("空会话与活跃会话态均不再渲染顶栏独立新建按钮（桌面折叠与移动抽屉左区仅留侧栏切换键）", () => {
     const onNew = vi.fn();
     const onTogglePane = vi.fn();
     renderHeader({
@@ -290,24 +275,86 @@ describe("ChatHeader 桌面与移动端对称布局（OCV5-843）", () => {
       sessionTitle: "性能回归排查",
     });
 
+    const headerRow = screen.getByTestId("chat-model-row").parentElement;
+    expect(headerRow).toHaveClass("flex-nowrap", "min-h-12");
+    expect(screen.getByTestId("chat-model-row")).toHaveClass("justify-center", "sm:justify-start");
+
     const mobileLeft = screen.getByTestId("shell-mobile-left");
     const collapsedLeft = screen.getByTestId("shell-collapsed-left");
-    const mobileNewBtn = screen.getByTestId("mobile-new-chat-btn");
-    const desktopNewBtn = screen.getByTestId("desktop-collapsed-new-chat-btn");
-
-    // 移动新建钮落在 md:hidden 左组紧邻汉堡钮；桌面折叠新建钮落在 hidden md:flex 左组
     expect(mobileLeft).toHaveClass("md:hidden");
-    expect(mobileLeft).toContainElement(mobileNewBtn);
     expect(collapsedLeft).toHaveClass("hidden", "md:flex");
-    expect(collapsedLeft).toContainElement(desktopNewBtn);
-
-    fireEvent.click(mobileNewBtn);
-    expect(onNew).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("mobile-new-chat-btn")).toBeNull();
+    expect(screen.queryByTestId("desktop-collapsed-new-chat-btn")).toBeNull();
+    expect(screen.queryByRole("button", { name: "新建会话" })).toBeNull();
+    expect(screen.getByRole("button", { name: "打开菜单" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "展开侧栏" })).toBeInTheDocument();
 
     const paneBtn = screen.getByTestId("detail-pane-toggle");
     expect(paneBtn).not.toHaveClass("hidden");
     fireEvent.click(paneBtn);
     expect(onTogglePane).toHaveBeenCalledTimes(1);
+    expect(onNew).not.toHaveBeenCalled();
+  });
+
+  it("未传 onOpenSubscription 时不渲染订阅入口；传入后未付费态展示「订阅」胶囊且位于工作台按钮左侧", () => {
+    renderHeader({ onTogglePane: vi.fn() });
+    expect(screen.queryByTestId("header-subscription-btn")).toBeNull();
+    cleanup();
+
+    const onOpenSubscription = vi.fn();
+    renderHeader({
+      onOpenSubscription,
+      onTogglePane: vi.fn(),
+      subscriptionSummary: { paid: false, planName: "免费版" },
+    });
+
+    const subBtn = screen.getByTestId("header-subscription-btn");
+    expect(subBtn).toHaveAttribute("data-product-feature", "billing-usage");
+    expect(subBtn).toHaveAttribute("data-paid", "false");
+    expect(subBtn).toHaveAttribute("aria-label", "查看订阅套餐与积分");
+    expect(subBtn).toHaveAttribute("title", "查看订阅套餐与积分");
+    expect(subBtn).toHaveTextContent("订阅");
+
+    // 位于右侧工作台按钮左侧
+    const rightGroup = subBtn.parentElement!;
+    const children = Array.from(rightGroup.children);
+    const subIdx = children.indexOf(subBtn);
+    const togglesIdx = children.indexOf(screen.getByTestId("header-workspace-toggles"));
+    expect(subIdx).toBeGreaterThanOrEqual(0);
+    expect(subIdx).toBeLessThan(togglesIdx);
+
+    fireEvent.click(subBtn);
+    expect(onOpenSubscription).toHaveBeenCalledTimes(1);
+  });
+
+  it("已付费态展示暖金套餐胶囊（套餐名）并在 title/aria-label 呈现到期日与本期剩余积分", () => {
+    const onOpenSubscription = vi.fn();
+    renderHeader({
+      onOpenSubscription,
+      subscriptionSummary: {
+        paid: true,
+        planName: "Pro",
+        planCode: "pro",
+        periodEnd: "2026-12-22T00:00:00Z",
+        periodCredits: 12000,
+        status: "active",
+      },
+    });
+
+    const subBtn = screen.getByTestId("header-subscription-btn");
+    expect(subBtn).toHaveAttribute("data-paid", "true");
+    expect(subBtn).toHaveTextContent("Pro");
+    expect(subBtn).toHaveAttribute(
+      "title",
+      "当前订阅：Pro · 到期 2026-12-22 · 本期剩余 12,000 积分",
+    );
+    expect(subBtn).toHaveAttribute(
+      "aria-label",
+      "当前订阅：Pro · 到期 2026-12-22 · 本期剩余 12,000 积分",
+    );
+
+    fireEvent.click(subBtn);
+    expect(onOpenSubscription).toHaveBeenCalledTimes(1);
   });
 
   it("默认全能助手不在桌面顶栏抢占头像位；非默认智能体展示紧凑芯片且可点击切换", () => {

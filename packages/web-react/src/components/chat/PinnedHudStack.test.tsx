@@ -1,9 +1,15 @@
 import type { SwarmSnapshot } from "@openclaude/protocol/browser";
+import type { MediaGenerationJob } from "@openclaude/protocol/mediaGeneration";
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { InflightDelegateItem } from "../../lib/chat/inflightDelegates";
 import type { ChatMessage } from "../../lib/chat/model";
+import type {
+  SessionBgCommandItem,
+  SessionCronItem,
+  SessionMuseJobItem,
+} from "../../lib/chat/sessionBackgroundTasks";
 import { PinnedHudStack } from "./PinnedHudStack";
 
 afterEach(cleanup);
@@ -265,5 +271,172 @@ describe("PinnedHudStack — unified Live Agent capsule", () => {
     const action = within(capsule).getByTestId("live-agent-capsule-action");
     expect(action.className).toContain("shrink-0");
     expect(within(capsule).getByTestId("live-agent-capsule-more").className).toContain("shrink-0");
+  });
+
+  test("活跃后台命令优先级高于待触发定时续跑，单行胶囊显示 +1 并在展开面板支持终止/暂停/删除", async () => {
+    const onCancelBgCommand = vi.fn(async () => true);
+    const onToggleSessionCron = vi.fn(async () => true);
+    const onDeleteSessionCron = vi.fn(async () => true);
+    const bgCmd: SessionBgCommandItem = {
+      id: "99-ocb_1",
+      jobId: "ocb_1",
+      commandPreview: "pytest -q tests/e2e",
+      cwd: "/app",
+      startedAt: Date.now() - 45_000,
+      updatedAt: Date.now() - 1_000,
+    };
+    const cron: SessionCronItem = {
+      id: "cron-1",
+      name: "巡检部署状态",
+      enabled: true,
+      schedule: "*/15 * * * *",
+      nextRunAt: Date.now() + 12 * 60_000,
+      resume: "origin-session",
+      sourceSessionKey: "agent:main:webchat:dm:s1",
+    };
+
+    render(
+      <PinnedHudStack
+        timelineMessages={[]}
+        chatVersion={1}
+        wsSending={false}
+        delegateItems={[]}
+        onDismissDelegate={vi.fn()}
+        latestSwarm={null}
+        latestSwarmKey={null}
+        dismissedSwarmKey={null}
+        onOpenSwarmBoard={vi.fn()}
+        onDismissSwarm={vi.fn()}
+        bgCommands={[bgCmd]}
+        sessionCrons={[cron]}
+        onCancelBgCommand={onCancelBgCommand}
+        onToggleSessionCron={onToggleSessionCron}
+        onDeleteSessionCron={onDeleteSessionCron}
+      />,
+    );
+
+    const capsule = await screen.findByTestId("live-agent-capsule");
+    expect(capsule).toHaveAttribute("data-primary-kind", "bg_cmd");
+    expect(capsule).toHaveAttribute("data-running", "true");
+    expect(capsule).toHaveTextContent("后台命令");
+    expect(capsule).toHaveTextContent("pytest -q tests/e2e");
+    expect(within(capsule).getByTestId("live-agent-capsule-more")).toHaveTextContent("+1");
+
+    // 展开面板展示后台命令与定时续跑并可执行行内干预
+    fireEvent.click(screen.getByTestId("live-agent-capsule-toggle"));
+    const panel = screen.getByTestId("pinned-background-tasks-panel");
+    expect(within(panel).getByText("12 分钟后")).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(within(panel).getByRole("button", { name: "终止后台命令：pytest -q tests/e2e" }));
+    });
+    expect(onCancelBgCommand).toHaveBeenCalledWith("99-ocb_1");
+
+    await act(async () => {
+      fireEvent.click(within(panel).getByRole("button", { name: "暂停定时续跑：巡检部署状态" }));
+    });
+    expect(onToggleSessionCron).toHaveBeenCalledWith("cron-1", false);
+
+    await act(async () => {
+      fireEvent.click(within(panel).getByRole("button", { name: "删除定时续跑：巡检部署状态" }));
+    });
+    expect(onDeleteSessionCron).toHaveBeenCalledWith("cron-1");
+  });
+
+  test("异步媒体（Muse + H3）与仅定时续跑场景正确渲染单行胶囊及展开操作", async () => {
+    const onCancelMuseJob = vi.fn(async () => true);
+    const onDismissMuseJob = vi.fn();
+    const museQueued: SessionMuseJobItem = {
+      id: "muse-q1",
+      kind: "video",
+      status: "queued",
+      promptPreview: "雪山日出无人机航拍",
+      queuePosition: 2,
+      queueLength: 5,
+      queuedAt: Date.now() - 8_000,
+    };
+    const h3Done: MediaGenerationJob = {
+      id: "h3-done",
+      requestId: "r-1",
+      kind: "h3_generate",
+      resourceClass: "gpu-h3",
+      status: "completed",
+      phase: "completed",
+      prompt: "水墨山水转场",
+      sessionId: "s1",
+      createdAt: new Date(Date.now() - 30_000).toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    const view = render(
+      <PinnedHudStack
+        timelineMessages={[]}
+        chatVersion={1}
+        wsSending={false}
+        delegateItems={[]}
+        onDismissDelegate={vi.fn()}
+        latestSwarm={null}
+        latestSwarmKey={null}
+        dismissedSwarmKey={null}
+        onOpenSwarmBoard={vi.fn()}
+        onDismissSwarm={vi.fn()}
+        museJobs={[museQueued]}
+        mediaJobs={[h3Done]}
+        onCancelMuseJob={onCancelMuseJob}
+        onDismissMuseJob={onDismissMuseJob}
+      />,
+    );
+
+    const capsule = await screen.findByTestId("live-agent-capsule");
+    expect(capsule).toHaveAttribute("data-primary-kind", "media");
+    expect(capsule).toHaveAttribute("data-running", "true");
+    expect(capsule).toHaveTextContent("排队第 2 位");
+    expect(capsule).toHaveTextContent("雪山日出无人机航拍");
+
+    fireEvent.click(screen.getByTestId("live-agent-capsule-toggle"));
+    const panel = screen.getByTestId("pinned-background-tasks-panel");
+    expect(within(panel).getByText("排队第 2/5 位")).toBeInTheDocument();
+    expect(within(panel).getByText("已完成")).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(within(panel).getByRole("button", { name: "取消媒体任务：雪山日出无人机航拍" }));
+    });
+    expect(onCancelMuseJob).toHaveBeenCalledWith("muse-q1");
+
+    fireEvent.click(within(panel).getByRole("button", { name: "知道了" }));
+    expect(onDismissMuseJob).toHaveBeenCalledWith("h3-done");
+
+    // 仅剩定时续跑时展示 schedule 胶囊与倒计时
+    view.rerender(
+      <PinnedHudStack
+        timelineMessages={[]}
+        chatVersion={1}
+        wsSending={false}
+        delegateItems={[]}
+        onDismissDelegate={vi.fn()}
+        latestSwarm={null}
+        latestSwarmKey={null}
+        dismissedSwarmKey={null}
+        onOpenSwarmBoard={vi.fn()}
+        onDismissSwarm={vi.fn()}
+        sessionCrons={[
+          {
+            id: "c-only",
+            name: "晚间总结提醒",
+            enabled: true,
+            schedule: "0 20 * * *",
+            nextRunAt: Date.now() + 25 * 60_000,
+            resume: "origin-session",
+            sourceSessionKey: "agent:main:webchat:dm:s1",
+          },
+        ]}
+      />,
+    );
+    const schedCapsule = await screen.findByTestId("live-agent-capsule");
+    expect(schedCapsule).toHaveAttribute("data-primary-kind", "schedule");
+    expect(schedCapsule).toHaveAttribute("data-running", "false");
+    expect(schedCapsule).toHaveTextContent("定时续跑");
+    expect(schedCapsule).toHaveTextContent("晚间总结提醒");
+    expect(within(schedCapsule).getByTestId("live-agent-capsule-timer")).toHaveTextContent("25 分钟后");
   });
 });

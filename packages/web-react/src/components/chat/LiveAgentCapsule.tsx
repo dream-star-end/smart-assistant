@@ -1,9 +1,29 @@
 import type { SwarmSnapshot } from "@openclaude/protocol/browser";
-import { ArrowUpRight, ChevronDown, ChevronUp, ListChecks, Target } from "lucide-react";
+import type { MediaGenerationJob } from "@openclaude/protocol/mediaGeneration";
+import {
+  ArrowUpRight,
+  ChevronDown,
+  ChevronUp,
+  Clock,
+  Film,
+  Image as ImageIcon,
+  ListChecks,
+  Target,
+} from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { isTerminalDelegateState, type InflightDelegateItem } from "../../lib/chat/inflightDelegates";
 import type { ChatMessage, LiveTurnTokenUsageSnapshot } from "../../lib/chat/model";
 import { formatDurationSeconds } from "../../lib/chat/pure";
+import {
+  firstLinePreview,
+  formatCompactElapsed,
+  formatCountdown,
+  isTerminalMediaJobStatus,
+  isTerminalMuseJobStatus,
+  type SessionBgCommandItem,
+  type SessionCronItem,
+  type SessionMuseJobItem,
+} from "../../lib/chat/sessionBackgroundTasks";
 import { AtelierIcon } from "../ui/AtelierIcons";
 import {
   PinnedDelegateTrackerLazy,
@@ -11,25 +31,18 @@ import {
   PinnedSwarmDock,
   PinnedTaskTrackerLazy,
 } from "./lazyTimelineCards";
+import { PinnedBackgroundTasksPanel } from "./PinnedBackgroundTasksPanel";
 import type { SwarmOpenRequest } from "./swarmDetect";
 import { formatSwarmElapsed, isSwarmActive, summarizeSwarmCounts, swarmPhaseMeta } from "./swarmUtils";
 import type { TodoItem } from "./todoExtract";
 import "./liveActivity.css";
 
-type HudKind = "swarm" | "delegate" | "task" | "goal";
+export type HudKind = "swarm" | "delegate" | "media" | "bg_cmd" | "schedule" | "task" | "goal";
 
-function firstLine(text: string): string {
-  const nl = text.search(/\r|\n/);
-  return (nl === -1 ? text : text.slice(0, nl)).trim();
-}
-
-function formatCompactMmSs(ms: number): string {
-  const total = Math.max(0, Math.floor(ms / 1000));
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-  const mmss = `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-  return h > 0 ? `${h}:${mmss}` : mmss;
+function parseIsoMs(iso: string | undefined): number {
+  if (!iso) return 0;
+  const t = Date.parse(iso);
+  return Number.isFinite(t) ? t : 0;
 }
 
 export type LiveAgentCapsuleProps = {
@@ -41,6 +54,7 @@ export type LiveAgentCapsuleProps = {
   tokenUsage?: LiveTurnTokenUsageSnapshot;
   delegateItems: InflightDelegateItem[];
   onDismissDelegate: (id: string) => void;
+  onCancelDelegate?: (jobId: string) => Promise<boolean>;
   onStopTurn?: () => void;
   latestSwarm: SwarmSnapshot | null;
   latestSwarmCardId?: string;
@@ -49,6 +63,16 @@ export type LiveAgentCapsuleProps = {
   dismissedSwarmKey: string | null;
   onOpenSwarmBoard: (req: SwarmOpenRequest) => void;
   onDismissSwarm: (key: string) => void;
+  museJobs?: SessionMuseJobItem[];
+  mediaJobs?: MediaGenerationJob[];
+  bgCommands?: SessionBgCommandItem[];
+  sessionCrons?: SessionCronItem[];
+  onCancelMuseJob?: (jobId: string) => Promise<boolean>;
+  onDismissMuseJob?: (jobId: string) => void;
+  onCancelMediaJob?: (jobId: string) => Promise<boolean>;
+  onCancelBgCommand?: (entryId: string) => Promise<boolean>;
+  onToggleSessionCron?: (cronId: string, enabled: boolean) => Promise<boolean>;
+  onDeleteSessionCron?: (cronId: string) => Promise<boolean>;
 };
 
 export default function LiveAgentCapsule({
@@ -60,6 +84,7 @@ export default function LiveAgentCapsule({
   tokenUsage,
   delegateItems,
   onDismissDelegate,
+  onCancelDelegate,
   onStopTurn,
   latestSwarm,
   latestSwarmCardId,
@@ -68,6 +93,16 @@ export default function LiveAgentCapsule({
   dismissedSwarmKey,
   onOpenSwarmBoard,
   onDismissSwarm,
+  museJobs = [],
+  mediaJobs = [],
+  bgCommands = [],
+  sessionCrons = [],
+  onCancelMuseJob,
+  onDismissMuseJob,
+  onCancelMediaJob,
+  onCancelBgCommand,
+  onToggleSessionCron,
+  onDeleteSessionCron,
 }: LiveAgentCapsuleProps) {
   const [expanded, setExpanded] = useState(false);
   const [now, setNow] = useState(() => Date.now());
@@ -76,25 +111,64 @@ export default function LiveAgentCapsule({
   const swarmActive = latestSwarm ? isSwarmActive(latestSwarm.phase) : false;
   const hasSwarm = swarmActive;
   const hasDelegate = delegateItems.length > 0;
+  const hasMedia = museJobs.length > 0 || mediaJobs.length > 0;
+  const hasBgCmd = bgCommands.length > 0;
+  const hasSchedule = sessionCrons.length > 0;
   const hasIncompleteTodo = todos.some((t) => t.status !== "completed");
   const hasTask = hasIncompleteTodo && (!settled || wsSending);
   const hasGoal = goalMessage !== null;
-
-  const activeOrder: HudKind[] = [];
-  if (hasSwarm) activeOrder.push("swarm");
-  if (hasDelegate) activeOrder.push("delegate");
-  if (hasTask) activeOrder.push("task");
-  if (hasGoal) activeOrder.push("goal");
 
   const runningDelegates = useMemo(
     () => delegateItems.filter((item) => item.state === "running"),
     [delegateItems],
   );
+  const liveDelegates = useMemo(
+    () => delegateItems.filter((item) => !isTerminalDelegateState(item.state)),
+    [delegateItems],
+  );
   const primaryDelegate = useMemo(() => {
-    const live = delegateItems.filter((item) => !isTerminalDelegateState(item.state));
-    const pool = runningDelegates.length > 0 ? runningDelegates : live.length > 0 ? live : delegateItems;
+    const pool =
+      runningDelegates.length > 0
+        ? runningDelegates
+        : liveDelegates.length > 0
+          ? liveDelegates
+          : delegateItems;
     return pool.slice().sort((a, b) => b.updatedAt - a.updatedAt)[0] ?? null;
-  }, [delegateItems, runningDelegates]);
+  }, [delegateItems, liveDelegates, runningDelegates]);
+
+  const activeMuseJobs = useMemo(
+    () => museJobs.filter((j) => !isTerminalMuseJobStatus(j.status)),
+    [museJobs],
+  );
+  const activeMediaJobs = useMemo(
+    () => mediaJobs.filter((j) => !isTerminalMediaJobStatus(j.status)),
+    [mediaJobs],
+  );
+  const mediaActiveCount = activeMuseJobs.length + activeMediaJobs.length;
+  const mediaTotalCount = museJobs.length + mediaJobs.length;
+  const mediaRunning = mediaActiveCount > 0;
+
+  const primaryBgCmd = bgCommands[0] ?? null;
+  const enabledCrons = useMemo(
+    () => sessionCrons.filter((c) => c.enabled),
+    [sessionCrons],
+  );
+  const primaryCron = enabledCrons[0] ?? sessionCrons[0] ?? null;
+  const goalActive =
+    hasGoal && (goalMessage.goalStatus ?? "active").trim().toLowerCase() === "active";
+
+  // 活跃运行态优先于待触发定时/已终态提示，保持单行胶囊只聚焦此刻最关键的运行态
+  const activeOrder: HudKind[] = [];
+  if (hasSwarm) activeOrder.push("swarm");
+  if (hasDelegate && liveDelegates.length > 0) activeOrder.push("delegate");
+  if (hasMedia && mediaRunning) activeOrder.push("media");
+  if (hasBgCmd) activeOrder.push("bg_cmd");
+  if (hasTask) activeOrder.push("task");
+  if (hasGoal && goalActive) activeOrder.push("goal");
+  if (hasDelegate && liveDelegates.length === 0) activeOrder.push("delegate");
+  if (hasMedia && !mediaRunning) activeOrder.push("media");
+  if (hasSchedule) activeOrder.push("schedule");
+  if (hasGoal && !goalActive) activeOrder.push("goal");
 
   useEffect(() => {
     const seen = Date.now();
@@ -111,12 +185,22 @@ export default function LiveAgentCapsule({
     }
   }, [delegateItems]);
 
-  const anyTimerRunning = swarmActive || runningDelegates.length > 0;
+  const fastTimerRunning =
+    swarmActive || runningDelegates.length > 0 || mediaRunning || hasBgCmd;
   useEffect(() => {
-    if (!anyTimerRunning) return;
+    if (!fastTimerRunning) return;
+    setNow(Date.now());
     const id = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(id);
-  }, [anyTimerRunning]);
+  }, [fastTimerRunning]);
+
+  const slowCountdownRunning = !fastTimerRunning && enabledCrons.length > 0;
+  useEffect(() => {
+    if (!slowCountdownRunning) return;
+    setNow(Date.now());
+    const id = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(id);
+  }, [slowCountdownRunning, sessionCrons]);
 
   useEffect(() => {
     if (activeOrder.length === 0 && expanded) setExpanded(false);
@@ -131,6 +215,7 @@ export default function LiveAgentCapsule({
   let label = "";
   let detail = "";
   let timer = "";
+  let primaryMediaIsImage = false;
 
   if (primaryKind === "swarm" && latestSwarm) {
     const counts = summarizeSwarmCounts(latestSwarm.members);
@@ -145,14 +230,77 @@ export default function LiveAgentCapsule({
       : phase.label;
     timer = swarmActive ? formatSwarmElapsed(latestSwarm.startedAt, now) : "";
   } else if (primaryKind === "delegate" && primaryDelegate) {
-    const liveCount = delegateItems.filter((item) => !isTerminalDelegateState(item.state)).length;
+    const liveCount = liveDelegates.length;
     isRunning = runningDelegates.length > 0;
     label = liveCount > 0 ? `后台 ${liveCount} 进行中` : `后台 ${delegateItems.length} 已结束`;
-    detail = firstLine(primaryDelegate.goal) || primaryDelegate.goal;
+    detail = firstLinePreview(primaryDelegate.goal) || primaryDelegate.goal;
     if (isRunning) {
       const start = delegateStartRef.current.get(primaryDelegate.jobId) ?? now;
-      timer = formatCompactMmSs(now - start);
+      timer = formatCompactElapsed(now - start);
     }
+  } else if (primaryKind === "media") {
+    isRunning = mediaRunning;
+    const primaryMuse = activeMuseJobs[0] ?? museJobs[0] ?? null;
+    const primaryMedia = activeMediaJobs[0] ?? mediaJobs[0] ?? null;
+    if (primaryMuse && (activeMuseJobs.length > 0 || activeMediaJobs.length === 0)) {
+      primaryMediaIsImage = primaryMuse.kind === "image";
+      const kindWord = primaryMuse.kind === "image" ? "图片" : "视频";
+      if (mediaActiveCount > 1) {
+        label = `媒体 ${mediaActiveCount} 进行中`;
+      } else if (primaryMuse.status === "queued") {
+        label = primaryMuse.queuePosition ? `排队第 ${primaryMuse.queuePosition} 位` : `${kindWord}排队中`;
+      } else if (primaryMuse.status === "running") {
+        label = `${kindWord}生成中`;
+      } else if (primaryMuse.status === "succeeded") {
+        label = `${kindWord}已完成`;
+      } else if (primaryMuse.status === "failed") {
+        label = `${kindWord}生成失败`;
+      } else {
+        label = mediaTotalCount > 1 ? `媒体 ${mediaTotalCount} 项` : `${kindWord}已取消`;
+      }
+      detail = firstLinePreview(primaryMuse.promptPreview) || `${kindWord}任务`;
+      const anchor = primaryMuse.startedAt ?? primaryMuse.queuedAt;
+      if (mediaRunning && anchor > 0) {
+        timer = formatCompactElapsed(Math.max(0, now - anchor));
+      }
+    } else if (primaryMedia) {
+      const kindWord = primaryMedia.kind === "video_compose" ? "视频合成" : "视频";
+      if (mediaActiveCount > 1) {
+        label = `媒体 ${mediaActiveCount} 进行中`;
+      } else if (primaryMedia.status === "queued" || primaryMedia.status === "dispatching") {
+        label = primaryMedia.queuePosition ? `排队第 ${primaryMedia.queuePosition} 位` : `${kindWord}排队中`;
+      } else if (primaryMedia.status === "running" || primaryMedia.status === "reconnecting") {
+        label = `${kindWord}生成中`;
+      } else if (primaryMedia.status === "completed") {
+        label = `${kindWord}已完成`;
+      } else if (primaryMedia.status === "failed") {
+        label = `${kindWord}生成失败`;
+      } else {
+        label = `${kindWord}已取消`;
+      }
+      detail = firstLinePreview(primaryMedia.prompt ?? "") || `${kindWord}任务`;
+      const createdMs = parseIsoMs(primaryMedia.createdAt);
+      if (mediaRunning && createdMs > 0) {
+        timer = formatCompactElapsed(Math.max(0, now - createdMs));
+      }
+    }
+  } else if (primaryKind === "bg_cmd" && primaryBgCmd) {
+    isRunning = true;
+    label = bgCommands.length > 1 ? `后台命令 ${bgCommands.length}` : "后台命令";
+    detail = firstLinePreview(primaryBgCmd.commandPreview) || primaryBgCmd.jobId;
+    if (primaryBgCmd.startedAt > 0) {
+      timer = formatCompactElapsed(Math.max(0, now - primaryBgCmd.startedAt));
+    }
+  } else if (primaryKind === "schedule" && primaryCron) {
+    isRunning = false;
+    label =
+      enabledCrons.length > 1
+        ? `定时续跑 ${enabledCrons.length}`
+        : enabledCrons.length === 1
+          ? "定时续跑"
+          : "定时已暂停";
+    detail = primaryCron.name;
+    timer = primaryCron.enabled ? formatCountdown(primaryCron.nextRunAt, now) : "已暂停";
   } else if (primaryKind === "task") {
     const done = todos.filter((t) => t.status === "completed").length;
     const activeTodo =
@@ -168,14 +316,36 @@ export default function LiveAgentCapsule({
       timer = `${tokenUsage.totalTokens.toLocaleString()} tok`;
     }
   } else if (primaryKind === "goal" && goalMessage) {
-    const status = (goalMessage.goalStatus ?? "active").trim().toLowerCase();
-    isRunning = status === "active";
+    isRunning = goalActive;
     label = "目标";
     detail = goalMessage.text || "会话目标";
     timer = formatDurationSeconds(goalMessage.timeUsedSeconds);
   }
 
-  const SecondaryIcon = primaryKind === "task" ? ListChecks : Target;
+  const hasBackgroundPanel = hasMedia || hasBgCmd || hasSchedule;
+
+  const renderPrimaryIcon = () => {
+    switch (primaryKind) {
+      case "swarm":
+        return <AtelierIcon name="swarm" size={12} className="oc-live-capsule-icon" />;
+      case "delegate":
+        return <AtelierIcon name="agent" size={12} className="oc-live-capsule-icon" />;
+      case "bg_cmd":
+        return <AtelierIcon name="terminal" size={12} className="oc-live-capsule-icon" />;
+      case "media":
+        return primaryMediaIsImage ? (
+          <ImageIcon size={11} strokeWidth={1.85} aria-hidden className="oc-live-capsule-icon" />
+        ) : (
+          <Film size={11} strokeWidth={1.85} aria-hidden className="oc-live-capsule-icon" />
+        );
+      case "schedule":
+        return <Clock size={11} strokeWidth={1.85} aria-hidden className="oc-live-capsule-icon" />;
+      case "task":
+        return <ListChecks size={11} strokeWidth={1.85} aria-hidden className="oc-live-capsule-icon" />;
+      case "goal":
+        return <Target size={11} strokeWidth={1.85} aria-hidden className="oc-live-capsule-icon" />;
+    }
+  };
 
   return (
     <div data-testid="pinned-hud-stack">
@@ -190,10 +360,26 @@ export default function LiveAgentCapsule({
               tokenUsage={tokenUsage}
             />
           )}
+          {hasBackgroundPanel && (
+            <PinnedBackgroundTasksPanel
+              museJobs={museJobs}
+              mediaJobs={mediaJobs}
+              bgCommands={bgCommands}
+              sessionCrons={sessionCrons}
+              now={now}
+              onCancelMuseJob={onCancelMuseJob}
+              onDismissMuseJob={onDismissMuseJob}
+              onCancelMediaJob={onCancelMediaJob}
+              onCancelBgCommand={onCancelBgCommand}
+              onToggleSessionCron={onToggleSessionCron}
+              onDeleteSessionCron={onDeleteSessionCron}
+            />
+          )}
           {hasDelegate && (
             <PinnedDelegateTrackerLazy
               items={delegateItems}
               onDismiss={onDismissDelegate}
+              onCancel={onCancelDelegate}
               onStop={onStopTurn}
             />
           )}
@@ -242,13 +428,7 @@ export default function LiveAgentCapsule({
                   : "oc-icon-badge oc-icon-badge-accent flex size-5 shrink-0 items-center justify-center rounded-full"
               }
             >
-              {primaryKind === "swarm" ? (
-                <AtelierIcon name="swarm" size={12} className="oc-live-capsule-icon" />
-              ) : primaryKind === "delegate" ? (
-                <AtelierIcon name="agent" size={12} className="oc-live-capsule-icon" />
-              ) : (
-                <SecondaryIcon size={11} strokeWidth={1.85} aria-hidden className="oc-live-capsule-icon" />
-              )}
+              {renderPrimaryIcon()}
             </span>
             <span
               title={label}

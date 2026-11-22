@@ -413,6 +413,10 @@ import {
   handleCommercialOfficePreviewPage,
 } from './containerOfficePreviewProxy.js'
 import { handleCommercialSwarmCommand } from './containerSwarmCommandProxy.js'
+import {
+  handleCommercialSessionBackgroundTasks,
+  isSessionBackgroundTasksPath,
+} from './sessionBackgroundTasksProxy.js'
 
 /**
  * **P0 — v3 multi-tenant leak firewall** (2026-04-22)
@@ -1885,8 +1889,11 @@ export function createCommercialHandler(
     //
     // 这里**先检查 isOurs**,把 "不关心的路径(如 /ws 、/healthz)" 留给下层。
     const isSwarmCommandPath = SWARM_COMMAND_ROUTE_RE.test(path)
+    const isSessionBgTasksPath = isSessionBackgroundTasksPath(path)
     const isOursForMaintenance =
-      prefixes.some((p) => path === p || path.startsWith(p)) || isSwarmCommandPath
+      prefixes.some((p) => path === p || path.startsWith(p)) ||
+      isSwarmCommandPath ||
+      isSessionBgTasksPath
     const isAllowlistForMaintenance =
       path.startsWith('/api/admin/') ||
       path === '/api/public/config' ||
@@ -2070,6 +2077,25 @@ export function createCommercialHandler(
       }
       incrGatewayRequest('/api/sessions/:id/swarm/command', method, res.statusCode)
       swarmLog.info('http_request', { status: res.statusCode, durationMs: Date.now() - startedAt })
+      return true
+    }
+
+    // ── 会话后台任务聚合与单条取消代理(OCV5-844)──────────────────────────
+    if (isSessionBgTasksPath) {
+      setSecurityHeaders(res)
+      const requestId = ensureRequestId(req)
+      res.setHeader(REQUEST_ID_HEADER, requestId)
+      const { traceId, traceIdOrigin } = resolveRequestTrace(req.headers)
+      const bgLog = httpLogger.child({ requestId, route: '/api/sessions/:id/background-tasks', method, path: safeLogPath, clientIp: clientIpOf(req), traceId, traceIdOrigin })
+      const bgCtx: RequestContext = { requestId, clientIp: clientIpOf(req), authBoundIp: req.socket.remoteAddress ?? 'unknown', userAgent: userAgentOf(req), log: bgLog }
+      const startedAt = Date.now()
+      try {
+        await handleCommercialSessionBackgroundTasks(req, res, bgCtx, deps)
+      } catch (err) {
+        handleError(err, res, requestId, bgLog)
+      }
+      incrGatewayRequest('/api/sessions/:id/background-tasks', method, res.statusCode)
+      bgLog.info('http_request', { status: res.statusCode, durationMs: Date.now() - startedAt })
       return true
     }
 
