@@ -1,4 +1,9 @@
 import { useLayoutEffect, useRef } from "react";
+import {
+  currentDocumentVisibilityState,
+  ensureFirstTextPaintVisibilityTracking,
+  summarizeFirstTextPaintVisibility,
+} from "../../lib/chat/firstTextPaintVisibility";
 import type { ChatMessage } from "../../lib/chat/model";
 import type { CardCallbacks } from "./cards";
 
@@ -18,6 +23,15 @@ export function FirstTextPaintCommitProbe({ message, onFirstTextPaint }: {
   useLayoutEffect(() => {
     if (!probe || !onFirstTextPaint || reported.has(probe)) return;
     if (typeof requestAnimationFrame !== "function" || typeof cancelAnimationFrame !== "function") return;
+    const mountedAt = Date.now();
+    ensureFirstTextPaintVisibilityTracking(mountedAt);
+    let hiddenDuringPaintObserved = currentDocumentVisibilityState() !== "visible";
+    const onVisibilityChange = () => {
+      if (currentDocumentVisibilityState() !== "visible") hiddenDuringPaintObserved = true;
+    };
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibilityChange);
+    }
     let first = 0;
     let second = 0;
     let cancelled = false;
@@ -25,12 +39,28 @@ export function FirstTextPaintCommitProbe({ message, onFirstTextPaint }: {
       second = requestAnimationFrame(() => {
         if (cancelled || reported.has(probe)) return;
         reported.add(probe);
+        const paintedAt = Date.now();
+        const latencyMs = Math.max(0, paintedAt - probe.startedAt);
+        const visibility = summarizeFirstTextPaintVisibility({
+          startedAt: probe.startedAt,
+          frameAt: probe.frameAt ?? mountedAt,
+          paintedAt,
+          backgroundAtFrame: probe.backgroundAtFrame,
+          hiddenBeforeFrame: probe.hiddenBeforeFrame,
+          hiddenDuringPaintObserved,
+        });
         onFirstTextPaint({
           traceId: probe.traceId,
           sessionId: probe.sessionId,
           clientMessageId: probe.clientMessageId,
-          latencyMs: Math.max(0, Date.now() - probe.startedAt),
+          latencyMs,
           backgroundAtFrame: probe.backgroundAtFrame,
+          visibilityState: visibility.visibilityState,
+          wasHidden: visibility.wasHidden,
+          hiddenDurationMs: visibility.hiddenDurationMs,
+          visibleLatencyMs: visibility.visibleLatencyMs,
+          visibilityPath: visibility.visibilityPath,
+          visibilityReason: visibility.visibilityReason,
         });
         if (messageRef.current._firstTextPaintProbe === probe) messageRef.current._firstTextPaintProbe = undefined;
       });
@@ -39,6 +69,9 @@ export function FirstTextPaintCommitProbe({ message, onFirstTextPaint }: {
       cancelled = true;
       cancelAnimationFrame(first);
       if (second) cancelAnimationFrame(second);
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+      }
     };
   }, [probe, onFirstTextPaint]);
   return null;

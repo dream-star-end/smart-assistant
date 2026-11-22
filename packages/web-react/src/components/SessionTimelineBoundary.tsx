@@ -1,6 +1,10 @@
 import { AlertTriangle } from "lucide-react";
 import { Component, type ErrorInfo, type ReactNode } from "react";
-import { reportClientFriction } from "../lib/clientFriction";
+import {
+  boundedRenderErrorLocation,
+  reportClientFriction,
+  sessionIdFromPathname,
+} from "../lib/clientFriction";
 
 type Props = { children: ReactNode; onRetry?: () => void; resetKey?: string };
 type State = { failed: boolean; autoRetryUsed: boolean };
@@ -21,11 +25,18 @@ export class SessionTimelineBoundary extends Component<Props, State> {
 
   componentDidCatch(error: unknown, info: ErrorInfo) {
     console.error("[SessionTimelineBoundary] 会话时间线渲染失败", error, info.componentStack);
+    const errorLocation = boundedRenderErrorLocation(error, info.componentStack);
+    const sessionId =
+      this.props.resetKey && this.props.resetKey !== "none"
+        ? this.props.resetKey
+        : sessionIdFromPathname(typeof window !== "undefined" ? window.location.pathname : undefined);
     reportClientFriction({
       surface: "chat",
       stage: "timeline_render",
       code: isUpdateDepthError(error) ? "REACT_UPDATE_DEPTH_185" : "TIMELINE_RENDER_ERROR",
-      sessionId: this.props.resetKey,
+      attempts: this.state.autoRetryUsed ? 2 : 1,
+      ...(sessionId ? { sessionId } : {}),
+      ...errorLocation,
     });
     // React #185 used to come from the virtualizer lifecycle. One deferred remount
     // remains safe if a future renderer loop appears; persistent faults stop after

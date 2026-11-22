@@ -395,16 +395,19 @@ export function useChatCardActions({
       onFirstTextPaint: demo
         ? undefined
         : (input) => {
+            const wasHidden = input.wasHidden ?? input.backgroundAtFrame;
             reportClientFriction({
               surface: "webchat",
               stage: "first_text_paint",
-              code: input.backgroundAtFrame
+              code: wasHidden
                 ? "FIRST_TEXT_PAINT_AFTER_BACKGROUND"
                 : "FIRST_TEXT_PAINT",
               outcome: "succeeded",
               latencyMs: input.latencyMs,
               traceId: input.traceId,
               sessionId: input.sessionId,
+              path: input.visibilityPath ?? (wasHidden ? "hidden_at_frame" : "visible"),
+              reason: input.visibilityReason ?? (wasHidden ? "hidden_brief" : "hidden_0s"),
             }, authRef.current?.snapshot().token);
           },
       onTimelineBlank: demo

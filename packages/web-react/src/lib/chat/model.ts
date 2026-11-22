@@ -257,6 +257,10 @@ export type ChatMessage = {
     clientMessageId: string;
     startedAt: number;
     backgroundAtFrame: boolean;
+    /** Timestamp when the first text WS frame arrived (ms since epoch). */
+    frameAt?: number;
+    /** Whether document.visibilityState was hidden at any point during [startedAt, frameAt]. */
+    hiddenBeforeFrame?: boolean;
   };
   /**
    * 行的产出来源。`'server'` = 后端 server-authored 行(getSession/listSessions 带回的

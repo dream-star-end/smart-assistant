@@ -30,6 +30,10 @@ import { contextRebuiltRow } from "./contextRebuilt";
 import { SocketMetaTracker, STOP_SETTLEMENT_TIMEOUT_NOTICE } from "./socketMeta";
 import { applyRecoveryStatusFrame, rememberRetryStatus } from "./retryStatus";
 import {
+  ensureFirstTextPaintVisibilityTracking,
+  measureHiddenWindow,
+} from "./firstTextPaintVisibility";
+import {
   applyCostCharged,
   applyCostWaived,
   applyCallUsage,
@@ -2024,12 +2028,18 @@ export class ChatSocket {
     if (alreadyVisible) return null;
     const user = sess.messages.find((message) => message.role === "user" && message.id === clientMessageId);
     if (!user || !Number.isFinite(user.ts)) return null;
+    const frameAt = Date.now();
+    const backgroundAtFrame = typeof document !== "undefined" && document.visibilityState !== "visible";
+    ensureFirstTextPaintVisibilityTracking();
+    const preFrame = measureHiddenWindow(user.ts, frameAt, undefined, backgroundAtFrame);
     return {
       traceId,
       sessionId,
       clientMessageId,
       startedAt: user.ts,
-      backgroundAtFrame: typeof document !== "undefined" && document.visibilityState !== "visible",
+      backgroundAtFrame,
+      frameAt,
+      hiddenBeforeFrame: preFrame.wasHidden,
     };
   }
 
@@ -5384,6 +5394,7 @@ export class ChatSocket {
       _routing: { ...routing },
       _sendAttempt: 0,
     });
+    ensureFirstTextPaintVisibilityTracking(userMsg.ts);
     payload.clientMessageId = userMsg.id;
     payload.idempotencyKey = messageAttemptIdempotencyKey(userMsg.id, 0);
     // 生成占位卡（需求 C）：imageEdit 提交紧随乐观 user 行注入一条**本地专属**占位行

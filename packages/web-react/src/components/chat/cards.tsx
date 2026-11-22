@@ -143,6 +143,17 @@ export type CardCallbacks = {
     clientMessageId: string;
     latencyMs: number;
     backgroundAtFrame: boolean;
+    visibilityState?: DocumentVisibilityState;
+    wasHidden?: boolean;
+    hiddenDurationMs?: number;
+    visibleLatencyMs?: number;
+    visibilityPath?:
+      | "visible"
+      | "hidden_during_wait"
+      | "hidden_at_frame"
+      | "hidden_during_paint"
+      | "hidden_at_paint";
+    visibilityReason?: string;
   }) => void;
   /** INC-20260905-TIMELINE-BLANK: viewport had no painted timeline row for
    *  several consecutive samples. Bounded geometry only, never message text. */
