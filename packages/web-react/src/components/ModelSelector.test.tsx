@@ -1624,8 +1624,8 @@ describe('ModelSelector OCV5-843 蜂群模式集成（列表微标 + 参数区�
 
     const badge = screen.getByTestId('model-trigger-swarm-badge')
     expect(badge).toHaveTextContent('蜂群')
-    expect(badge.className).toContain('hidden')
-    expect(badge.className).toContain('sm:inline-flex')
+    expect(badge.className).toContain('inline-flex')
+    expect(badge.className).not.toContain('hidden')
 
     openMenu(trigger)
     await screen.findByTestId('model-picker-two-col')
@@ -1675,5 +1675,22 @@ describe('ModelSelector OCV5-843 蜂群模式集成（列表微标 + 参数区�
     } finally {
       restore()
     }
+  })
+
+  it('非支持蜂群的模型在面板内展示触屏可读引导（切至 Gemini 4 / Antigravity 可启用蜂群）', async () => {
+    render(
+      <ModelSelector
+        models={SWARM_MODELS}
+        selectedId="claude-opus-5-5-native"
+        onSelect={() => {}}
+        swarmSupported={false}
+        swarmMode={false}
+        onSelectSwarmMode={() => {}}
+      />,
+    )
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    openMenu(trigger)
+    const hint = await screen.findByTestId('model-picker-swarm-hint')
+    expect(hint.textContent).toContain('Antigravity')
   })
 })

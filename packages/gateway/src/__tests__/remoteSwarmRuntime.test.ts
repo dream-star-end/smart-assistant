@@ -28,16 +28,21 @@ import { AntigravitySwarmWatcher } from '../engine/antigravitySwarmWatcher.js'
 import {
   REMOTE_SWARM_LOCAL_PREFIX,
   capWorkerToolsets,
+  createGatewayRemoteSwarmExecutor,
   handleRemoteSwarmLocal,
 } from '../remoteSwarmLocal.js'
 import {
+  DEFAULT_WAIT_TIMEOUT_MS,
   RemoteSwarmRuntime,
+  type RemoteSwarmTelemetryEvent,
   type RemoteSwarmWorkerExecutor,
   type RemoteSwarmWorkerTurnInput,
   disableRemoteSwarmCoordinatorMcp,
   lookupRemoteSwarmMcpContext,
+  reconcileRemoteSwarmOnBoot,
   remoteSwarmLocationForSession,
 } from '../remoteSwarmRuntime.js'
+import { handleStop, type WsConnectionHost } from '../wsConnection.js'
 
 const tempDirs: string[] = []
 
@@ -1022,6 +1027,1174 @@ describe('RemoteSwarmRuntime & Admission (OCV5-835)', () => {
       }
     } finally {
       releaseRetry()
+      await rt.shutdownAll()
+    }
+  })
+
+  it('P0-2: interruptSessionWorkers and wsConnection.handleStop cascade-abort workers, unblock waiters, release lanes, and preserve history + dirty worktrees', async () => {
+    const agyRoot = makeTempDir('oc-rswarm-stop-root-')
+    const repo = initTempGitRepo()
+    const sessionKey = 'agent:main:webchat:dm:stop-cascade-1'
+
+    let workerStarted!: () => void
+    const workerStartedP = new Promise<void>((r) => {
+      workerStarted = r
+    })
+    const abortedWorkers: string[] = []
+    const releasedSessions: string[] = []
+    let workerWtPath = ''
+
+    const rt = new RemoteSwarmRuntime({
+      rootBase: agyRoot,
+      executor: {
+        async runWorkerTurn(input) {
+          workerWtPath = input.workspaceCwd
+          writeFileSync(join(workerWtPath, 'wip.txt'), 'uncommitted user work\n', 'utf8')
+          workerStarted()
+          return await new Promise((resolve) => {
+            input.signal.addEventListener(
+              'abort',
+              () => {
+                abortedWorkers.push(input.workerName)
+                resolve({ text: '', error: 'aborted' })
+              },
+              { once: true },
+            )
+          })
+        },
+        async releaseWorkerSession(workerSessionKey) {
+          releasedSessions.push(workerSessionKey)
+          return { released: true, state: 'released' }
+        },
+      },
+    })
+
+    try {
+      rt.registerSession({
+        sessionKey,
+        model: 'antigravity-gemini-4-neon-remote',
+        workspaceCwd: repo,
+      })
+
+      await rt.handleToolCall({
+        sessionKey,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'builder', brief: 'Build feature', workspace: 'share' },
+      })
+      await workerStartedP
+
+      // Queue a pendingWake while worker is busy AND park coordinator in swarm_wait.
+      const waitP = rt.handleToolCall({
+        sessionKey,
+        callerMember: 'coordinator',
+        tool: 'swarm_wait',
+        args: { since: 1, mentions_only: true, timeout_ms: 10_000 },
+      }) as Promise<{ woke: boolean; reason: string }>
+      await new Promise((r) => setTimeout(r, 25))
+
+      // Trigger Stop via wsConnection.handleStop (direct sessionKey path).
+      const mockHost = {
+        sessions: {
+          list: () => [{ sessionKey }],
+          interrupt: () => false,
+          interruptClientTurn: () => false,
+          fencePreStartStop: () => {},
+        },
+        _interruptDelegationsForParent: () => false,
+        _settlePendingPermissionsForStop: () => {},
+        router: { route: () => ({ sessionKey }) },
+        log: { info: () => {}, warn: () => {} },
+      } as unknown as WsConnectionHost
+
+      const stopped = await handleStop.call(mockHost, {
+        type: 'inbound.control.stop',
+        channel: 'webchat',
+        peer: { id: 'stop-cascade-1', kind: 'dm' },
+        sessionKey,
+      })
+      assert.equal(stopped, true, 'handleStop must report true when remote swarm workers are interrupted')
+
+      const waitRes = await waitP
+      assert.equal(waitRes.woke, false)
+      assert.equal(waitRes.reason, 'user_stop')
+      assert.deepEqual(abortedWorkers, ['builder'])
+      assert.ok(releasedSessions.length >= 1, 'remote lane must be released on interrupt')
+
+      // History in members.json & dirty worktree MUST be preserved!
+      const loc = rt.locationFor(sessionKey)
+      const rosterRaw = JSON.parse(readFileSync(join(loc.swarmDir, 'members.json'), 'utf8')) as {
+        runtime?: string
+        members: Record<string, { phase: string; killed: boolean }>
+      }
+      assert.equal(rosterRaw.runtime, 'remote')
+      assert.equal(rosterRaw.members.builder?.killed, false)
+      assert.equal(rosterRaw.members.builder?.phase, 'STOPPED')
+      assert.equal(existsSync(join(workerWtPath, 'wip.txt')), true, 'dirty worktree file must not be deleted on Stop')
+    } finally {
+      await rt.shutdownAll()
+    }
+  })
+
+  it('P0-3: mutateRoster + 3-phase kill preserves concurrent title/channel/add/last_read_seq and fails closed on corrupt members.json', async () => {
+    const agyRoot = makeTempDir('oc-rswarm-p03-root-')
+    const ws = makeTempDir('oc-rswarm-p03-ws-')
+    const sessionKey = 'agent:main:webchat:dm:p03-concurrency'
+
+    let releaseKillPause!: () => void
+    const killPauseGate = new Promise<void>((r) => {
+      releaseKillPause = r
+    })
+    let inReleaseHook!: () => void
+    const inReleaseHookP = new Promise<void>((r) => {
+      inReleaseHook = r
+    })
+
+    const rt = new RemoteSwarmRuntime({
+      rootBase: agyRoot,
+      executor: {
+        async runWorkerTurn(input) {
+          return await new Promise((resolve) => {
+            input.signal.addEventListener('abort', () => resolve({ text: '', error: 'aborted' }), {
+              once: true,
+            })
+          })
+        },
+        async releaseWorkerSession() {
+          inReleaseHook()
+          await killPauseGate
+          return { released: true, state: 'released' }
+        },
+      },
+    })
+
+    try {
+      rt.registerSession({
+        sessionKey,
+        model: 'antigravity-gemini-4-neon-remote',
+        workspaceCwd: ws,
+      })
+      await rt.handleToolCall({
+        sessionKey,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'victim', brief: 'hold' },
+      })
+      await new Promise((r) => setTimeout(r, 25))
+
+      // Start kill of `victim` — it will pause mid-await inside releaseWorkerSession.
+      const killP = rt.executeOperatorKill(sessionKey, 'victim', 'race_test')
+      await inReleaseHookP
+
+      // Perform concurrent roster mutations WHILE kill is awaiting stop/release!
+      await Promise.all([
+        rt.handleToolCall({
+          sessionKey,
+          callerMember: 'coordinator',
+          tool: 'swarm',
+          args: { action: 'title', title: 'Concurrent Title Preserved' },
+        }),
+        rt.handleToolCall({
+          sessionKey,
+          callerMember: 'coordinator',
+          tool: 'swarm',
+          args: { action: 'channel', op: 'create', channel: 'ops', topic: 'Ops' },
+        }),
+        rt.handleToolCall({
+          sessionKey,
+          callerMember: 'coordinator',
+          tool: 'swarm',
+          args: { action: 'add', name: 'survivor', brief: 'Added mid-kill' },
+        }),
+        rt.handleToolCall({
+          sessionKey,
+          callerMember: 'coordinator',
+          tool: 'read_board',
+          args: { since: 0 },
+        }),
+      ])
+
+      releaseKillPause()
+      const killRes = await killP
+      assert.equal(killRes.ok, true)
+      assert.deepEqual(killRes.killed, ['victim'])
+
+      // Verify ZERO concurrent mutations were clobbered by killMemberInternal!
+      const st = (await rt.handleToolCall({
+        sessionKey,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'status' },
+      })) as {
+        title: string
+        members: Array<{ name: string; status: string }>
+        channels: Array<{ name: string }>
+      }
+      assert.equal(st.title, 'Concurrent Title Preserved')
+      assert.ok(st.channels.some((c) => c.name === 'ops'), 'concurrent channel create must survive kill')
+      assert.ok(st.members.some((m) => m.name === 'survivor'), 'concurrent add must survive kill')
+      assert.equal(st.members.find((m) => m.name === 'victim')?.status, 'killed')
+
+      // Fail-closed test: corrupt members.json MUST throw SWARM_ROSTER_CORRUPT and NOT overwrite disk!
+      const loc = rt.locationFor(sessionKey)
+      const membersPath = join(loc.swarmDir, 'members.json')
+      const corruptPayload = '{ "title": "broken", "members": '
+      writeFileSync(membersPath, corruptPayload, 'utf8')
+      await assert.rejects(
+        () =>
+          rt.handleToolCall({
+            sessionKey,
+            callerMember: 'coordinator',
+            tool: 'swarm',
+            args: { action: 'status' },
+          }),
+        /SWARM_ROSTER_CORRUPT/,
+      )
+      assert.equal(
+        readFileSync(membersPath, 'utf8'),
+        corruptPayload,
+        'corrupt members.json must never be silently overwritten',
+      )
+    } finally {
+      releaseKillPause()
+      await rt.shutdownAll()
+    }
+  })
+
+  it('P1-1: async .board.lock yields event loop while contended and serializes concurrent posts with monotonic seqs', async () => {
+    const agyRoot = makeTempDir('oc-rswarm-p11-root-')
+    const ws = makeTempDir('oc-rswarm-p11-ws-')
+    const sessionKey = 'agent:main:webchat:dm:p11-async-lock'
+
+    const rt = new RemoteSwarmRuntime({ rootBase: agyRoot })
+    try {
+      rt.registerSession({
+        sessionKey,
+        model: 'antigravity-gemini-4-neon-remote',
+        workspaceCwd: ws,
+      })
+      // Initialize swarm dir
+      await rt.handleToolCall({
+        sessionKey,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'title', title: 'Async Lock Test' },
+      })
+      const loc = rt.locationFor(sessionKey)
+      const lockPath = join(loc.swarmDir, '.board.lock')
+      writeFileSync(lockPath, `99999:${Date.now()}\n`, 'utf8')
+
+      let timerFiredBeforeUnlock = false
+      let unlocked = false
+      const releaseTimer = setTimeout(() => {
+        unlocked = true
+        rmSync(lockPath, { force: true })
+      }, 70)
+      const probeTimer = setTimeout(() => {
+        if (!unlocked) timerFiredBeforeUnlock = true
+      }, 15)
+
+      try {
+        const posts = (await Promise.all(
+          Array.from({ length: 6 }, (_, i) =>
+            rt.handleToolCall({
+              sessionKey,
+              callerMember: 'coordinator',
+              tool: 'post_message',
+              args: { text: `msg-${i + 1}` },
+            }),
+          ),
+        )) as Array<{ seq: number }>
+        const seqs = posts.map((p) => p.seq).sort((a, b) => a - b)
+        assert.deepEqual(seqs, [1, 2, 3, 4, 5, 6], 'all concurrent posts must get unique monotonic seqs')
+        assert.equal(
+          timerFiredBeforeUnlock,
+          true,
+          'event loop timer must fire while waiting for .board.lock (zero sync busy-wait)',
+        )
+      } finally {
+        clearTimeout(releaseTimer)
+        clearTimeout(probeTimer)
+        rmSync(lockPath, { force: true })
+      }
+    } finally {
+      await rt.shutdownAll()
+    }
+  })
+
+  it('P1-3 & P1-4: validates post_message channel, records ERROR/cacheRead/thinking/coordinator telemetry, staggers DEFAULT_WAIT_TIMEOUT_MS, and fans out to multiple waiters', async () => {
+    assert.equal(DEFAULT_WAIT_TIMEOUT_MS, 240_000)
+
+    const agyRoot = makeTempDir('oc-rswarm-p13-root-')
+    const ws = makeTempDir('oc-rswarm-p13-ws-')
+    const sessionKey = 'agent:main:webchat:dm:p13-telemetry'
+
+    // 1) Verify createGatewayRemoteSwarmExecutor emits ERROR telemetry on early return (missing parent agent)
+    const earlyEvents: RemoteSwarmTelemetryEvent[] = []
+    const realExec = createGatewayRemoteSwarmExecutor({
+      sessions: {
+        getByKey: () => undefined,
+        destroySession: async () => {},
+      } as any,
+      resolveAgent: async () => null,
+      log: { warn: () => {} },
+    })
+    const earlyRes = await realExec.runWorkerTurn({
+      coordinatorSessionKey: sessionKey,
+      workerSessionKey: 'agent:missing:swarm:dm:w_r1',
+      workerName: 'w1',
+      workerTurnSeq: 1,
+      workerTurnNonce: 'aaaa',
+      workerConversationId: '11111111-2222-4333-8444-555555555555',
+      parentAgentId: 'nonexistent-agent',
+      callerToken: 'tok',
+      model: 'antigravity-gemini-4-neon-remote',
+      workspaceCwd: ws,
+      prompt: 'hi',
+      signal: new AbortController().signal,
+      onTelemetry: (ev) => earlyEvents.push(ev),
+    })
+    assert.ok(earlyRes.error?.includes('parent agent not found'))
+    assert.equal(earlyEvents.length, 1)
+    assert.equal(earlyEvents[0]?.type, 'ERROR')
+    assert.equal(earlyEvents[0]?.status, 'ERROR')
+
+    // 2) Runtime tests: channel check, result.error transcript, cacheRead/thinking tokens, coordinator telemetry, multi-waiter wake
+    let workerDone!: () => void
+    const workerDoneP = new Promise<void>((r) => {
+      workerDone = r
+    })
+    const rt = new RemoteSwarmRuntime({
+      rootBase: agyRoot,
+      executor: {
+        async runWorkerTurn(input) {
+          input.onTelemetry({
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            inputTokens: 1000,
+            outputTokens: 250,
+            cacheReadTokens: 800,
+            thinkingTokens: 150,
+          })
+          workerDone()
+          // Return an error WITHOUT emitting an ERROR telemetry event to verify runtime fills it in!
+          return { text: '', error: 'upstream_lane_timeout' }
+        },
+        async releaseWorkerSession() {},
+      },
+    })
+
+    try {
+      rt.registerSession({
+        sessionKey,
+        model: 'antigravity-gemini-4-neon-remote',
+        workspaceCwd: ws,
+      })
+
+      // Ghost channel rejected fail-closed
+      await assert.rejects(
+        () =>
+          rt.handleToolCall({
+            sessionKey,
+            callerMember: 'coordinator',
+            tool: 'post_message',
+            args: { channel: 'general', text: 'ghost channel post' },
+          }),
+        /SWARM_CHANNEL_NOT_FOUND:general/,
+      )
+
+      // Record coordinator usage telemetry
+      rt.recordCoordinatorTelemetry(sessionKey, {
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        inputTokens: 500,
+        outputTokens: 120,
+        cacheReadTokens: 400,
+        thinkingTokens: 60,
+      })
+
+      await rt.handleToolCall({
+        sessionKey,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'analyst', brief: 'Analyze logs' },
+      })
+      await workerDoneP
+      await new Promise((r) => setTimeout(r, 40))
+
+      const loc = rt.locationFor(sessionKey)
+      const roster = JSON.parse(readFileSync(join(loc.swarmDir, 'members.json'), 'utf8')) as {
+        members: Record<string, { conversation_id: string }>
+      }
+      const workerTranscript = readFileSync(
+        join(loc.brainDir, roster.members.analyst!.conversation_id, '.system_generated', 'logs', 'transcript.jsonl'),
+        'utf8',
+      )
+      assert.match(workerTranscript, /"cache_read_tokens":800/)
+      assert.match(workerTranscript, /"thinking_tokens":150/)
+      assert.match(workerTranscript, /"type":"ERROR"/)
+      assert.match(workerTranscript, /upstream_lane_timeout/)
+
+      const coordTranscript = readFileSync(
+        join(loc.brainDir, loc.swarmId, '.system_generated', 'logs', 'transcript.jsonl'),
+        'utf8',
+      )
+      assert.match(coordTranscript, /"cache_read_tokens":400/)
+      assert.match(coordTranscript, /"thinking_tokens":60/)
+      assert.match(coordTranscript, /"name":"swarm"/)
+
+      // Verify AntigravitySwarmWatcher observes the worker's failed state from transcript ERROR
+      const watcher = new AntigravitySwarmWatcher({
+        brainDir: loc.brainDir,
+        conversationId: loc.swarmId,
+        onSnapshot: () => {},
+      })
+      watcher.start()
+      const snap = watcher.latestSnapshot()
+      watcher.stop()
+      const analystSnap = snap?.members.find((m) => m.name === 'analyst')
+      assert.equal(analystSnap?.failed, true, 'watcher must observe failed=true from result.error ERROR transcript step')
+      assert.match(analystSnap?.lastError ?? '', /upstream_lane_timeout/)
+
+      // Multi-waiter fan-out (reusing preloaded posts without per-waiter disk reads)
+      const w1 = rt.handleToolCall({
+        sessionKey,
+        callerMember: 'analyst',
+        tool: 'swarm_wait',
+        args: { since: 0, mentions_only: false, timeout_ms: 3_000 },
+      })
+      // Already available for since=0; test waiting on current headSeq with 2 waiters
+      const stNow = (await rt.handleToolCall({
+        sessionKey,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'status' },
+      })) as { head_seq: number }
+      await w1
+
+      const waitA = rt.handleToolCall({
+        sessionKey,
+        callerMember: 'analyst',
+        tool: 'swarm_wait',
+        args: { since: stNow.head_seq, mentions_only: false, timeout_ms: 3_000 },
+      }) as Promise<{ woke: boolean; posts: Array<{ text: string }> }>
+      const waitB = rt.handleToolCall({
+        sessionKey,
+        callerMember: 'analyst',
+        tool: 'swarm_wait',
+        args: { since: stNow.head_seq, mentions_only: false, timeout_ms: 3_000 },
+      }) as Promise<{ woke: boolean; posts: Array<{ text: string }> }>
+      await new Promise((r) => setTimeout(r, 20))
+      await rt.handleToolCall({
+        sessionKey,
+        callerMember: 'coordinator',
+        tool: 'post_message',
+        args: { text: 'broadcast update for all waiters' },
+      })
+      const [resA, resB] = await Promise.all([waitA, waitB])
+      assert.equal(resA.woke, true)
+      assert.equal(resB.woke, true)
+      assert.equal(resA.posts.at(-1)?.text, 'broadcast update for all waiters')
+      assert.equal(resB.posts.at(-1)?.text, 'broadcast update for all waiters')
+    } finally {
+      await rt.shutdownAll()
+    }
+  })
+
+  it('P2-1 & P2-3: reconcileRemoteSwarmOnBoot heals stale RUNNING + cleans only clean archived/orphan worktrees; batch add rolls back worktrees atomically; kill checks added_by per prefix-matched member', async () => {
+    const agyRoot = makeTempDir('oc-rswarm-p2-root-')
+    const repo = initTempGitRepo()
+    const sessionKey = 'agent:main:webchat:dm:p2-hardening'
+
+    const rt = new RemoteSwarmRuntime({
+      rootBase: agyRoot,
+      executor: {
+        async runWorkerTurn() {
+          return { text: 'ok' }
+        },
+        async releaseWorkerSession() {},
+      },
+    })
+
+    try {
+      rt.registerSession({
+        sessionKey,
+        model: 'antigravity-gemini-4-neon-remote',
+        workspaceCwd: repo,
+      })
+
+      // 1) Per-member `added_by` authorization on prefix kill:
+      //    lead adds `sub-1`; coordinator adds `sub-2`. lead MUST be forbidden from prefix-killing `sub`!
+      await rt.handleToolCall({
+        sessionKey,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'lead', brief: 'Lead worker' },
+      })
+      await rt.handleToolCall({
+        sessionKey,
+        callerMember: 'lead',
+        tool: 'swarm',
+        args: { action: 'add', name: 'sub-1', brief: 'Helper owned by lead' },
+      })
+      await rt.handleToolCall({
+        sessionKey,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'sub-2', brief: 'Helper owned by coordinator' },
+      })
+      await assert.rejects(
+        () =>
+          rt.handleToolCall({
+            sessionKey,
+            callerMember: 'lead',
+            tool: 'swarm',
+            args: { action: 'kill', name: 'sub' },
+          }),
+        /SWARM_KILL_FORBIDDEN/,
+      )
+      // Neither sub-1 nor sub-2 should be killed!
+      const stAfterForbidden = (await rt.handleToolCall({
+        sessionKey,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'status' },
+      })) as { members: Array<{ name: string; status: string }> }
+      assert.notEqual(stAfterForbidden.members.find((m) => m.name === 'sub-1')?.status, 'killed')
+      assert.notEqual(stAfterForbidden.members.find((m) => m.name === 'sub-2')?.status, 'killed')
+
+      // When `lead` owns all shards (`own-1`, `own-2`), prefix kill `own` succeeds!
+      await rt.handleToolCall({
+        sessionKey,
+        callerMember: 'lead',
+        tool: 'swarm',
+        args: { action: 'add', name: 'own', brief: 'Owned shards', n: 2 },
+      })
+      const ownKill = (await rt.handleToolCall({
+        sessionKey,
+        callerMember: 'lead',
+        tool: 'swarm',
+        args: { action: 'kill', name: 'own' },
+      })) as { killed: string[] }
+      assert.deepEqual(ownKill.killed.sort(), ['own-1', 'own-2'])
+
+      // 2) Batch `add` preflight + atomic worktree rollback:
+      //    Pre-create a dirty worktree at `<repo>/.oc-swarm-worktrees/<swarmId8>-batch-2` so
+      //    batch add (`tasks: ['t1', 't2']`, workspace: 'branch') fails before creating `batch-1`!
+      const loc = rt.locationFor(sessionKey)
+      const wtBase = join(repo, '.oc-swarm-worktrees')
+      const batch1Wt = join(wtBase, `${loc.swarmId.slice(0, 8)}-batch-1`)
+      const batch2Wt = join(wtBase, `${loc.swarmId.slice(0, 8)}-batch-2`)
+      mkdirSync(batch2Wt, { recursive: true })
+      writeFileSync(join(batch2Wt, 'dirty.txt'), 'keep\n', 'utf8')
+      await assert.rejects(
+        () =>
+          rt.handleToolCall({
+            sessionKey,
+            callerMember: 'coordinator',
+            tool: 'swarm',
+            args: {
+              action: 'add',
+              name: 'batch',
+              brief: 'Batch work',
+              tasks: ['t1', 't2'],
+              workspace: 'branch',
+            },
+          }),
+        /SWARM_WORKTREE_CREATE_FAILED/,
+      )
+      assert.equal(existsSync(batch1Wt), false, 'batch-1 worktree must not leak when batch-2 preflight fails')
+      assert.equal(existsSync(batch2Wt), true, 'pre-existing dirty batch-2 directory must stay untouched')
+      rmSync(batch2Wt, { recursive: true, force: true })
+
+      // 3) Create two real worktrees (one clean, one dirty) and test `reconcileRemoteSwarmOnBoot`:
+      const addedClean = (await rt.handleToolCall({
+        sessionKey,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'arch-clean', brief: 'clean wt', workspace: 'share' },
+      })) as { added: Array<{ workspace: string }> }
+      const addedDirty = (await rt.handleToolCall({
+        sessionKey,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'arch-dirty', brief: 'dirty wt', workspace: 'share' },
+      })) as { added: Array<{ workspace: string }> }
+      const cleanWt = addedClean.added[0]!.workspace
+      const dirtyWt = addedDirty.added[0]!.workspace
+      // Wait for the spawned mock worker turns to settle before simulating a process crash on disk.
+      const settleDeadline = Date.now() + 3_000
+      while (Date.now() < settleDeadline) {
+        const st = (await rt.handleToolCall({
+          sessionKey,
+          callerMember: 'coordinator',
+          tool: 'swarm',
+          args: { action: 'status' },
+        })) as { members: Array<{ name: string; status: string }> }
+        const c = st.members.find((m) => m.name === 'arch-clean')
+        const d = st.members.find((m) => m.name === 'arch-dirty')
+        if (c?.status === 'waiting' && d?.status === 'waiting') break
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      writeFileSync(join(dirtyWt, 'keep-me.txt'), 'dirty\n', 'utf8')
+
+      // Simulate gateway crash leaving `arch-clean` and `arch-dirty` stuck in RUNNING on disk
+      const membersPath = join(loc.swarmDir, 'members.json')
+      const diskRoster = JSON.parse(readFileSync(membersPath, 'utf8'))
+      diskRoster.members['arch-clean'].phase = 'RUNNING'
+      diskRoster.members['arch-dirty'].phase = 'RUNNING'
+      writeFileSync(membersPath, JSON.stringify(diskRoster, null, 2), 'utf8')
+
+      // Also place a corrupt roster in another slot to prove reconcile does NOT overwrite it
+      const corruptLoc = remoteSwarmLocationForSession('agent:main:webchat:dm:corrupt-boot', agyRoot)
+      mkdirSync(corruptLoc.swarmDir, { recursive: true })
+      const corruptRaw = '{bad json'
+      writeFileSync(join(corruptLoc.swarmDir, 'members.json'), corruptRaw, 'utf8')
+
+      const rec = await reconcileRemoteSwarmOnBoot({
+        rootBase: agyRoot,
+        workspaceRoots: [repo],
+        isSessionArchived: ({ sessionKey: sk }) => sk === sessionKey,
+      })
+
+      assert.equal(rec.reconciledSwarms, 1)
+      assert.ok(rec.reconciledMembers >= 2)
+      assert.equal(rec.corruptRosters, 1)
+      assert.equal(readFileSync(join(corruptLoc.swarmDir, 'members.json'), 'utf8'), corruptRaw)
+
+      const healedRoster = JSON.parse(readFileSync(membersPath, 'utf8'))
+      assert.equal(healedRoster.members['arch-clean'].phase, 'STOPPED')
+      assert.equal(healedRoster.members['arch-dirty'].phase, 'STOPPED')
+      assert.equal(existsSync(cleanWt), false, 'clean archived worktree must be pruned on boot reconcile')
+      assert.equal(existsSync(dirtyWt), true, 'dirty archived worktree must NEVER be deleted on boot reconcile')
+      assert.ok(rec.cleanedWorktrees.includes(cleanWt))
+      assert.ok(rec.preservedDirtyWorktrees.includes(dirtyWt))
+    } finally {
+      await rt.shutdownAll()
+    }
+  })
+
+  it('T2 B1: reconcileRemoteSwarmOnBoot NEVER deletes unregistered plain directory under ignored .oc-swarm-worktrees', async () => {
+    const agyRoot = makeTempDir('oc-rswarm-b1-root-')
+    const repo = initTempGitRepo()
+    writeFileSync(join(repo, '.gitignore'), '.oc-swarm-worktrees/\n', 'utf8')
+    execFileSync('git', ['add', '.gitignore'], { cwd: repo, stdio: 'ignore' })
+    execFileSync('git', ['commit', '-m', 'ignore worktrees dir'], { cwd: repo, stdio: 'ignore' })
+
+    const unregisteredDir = join(repo, '.oc-swarm-worktrees', '12345678-drafts')
+    mkdirSync(unregisteredDir, { recursive: true })
+    const draftPath = join(unregisteredDir, 'draft.md')
+    writeFileSync(draftPath, 'precious user draft\n', 'utf8')
+
+    const rec = await reconcileRemoteSwarmOnBoot({
+      rootBase: agyRoot,
+      workspaceRoots: [repo],
+    })
+
+    assert.equal(existsSync(draftPath), true, 'draft file in unregistered directory MUST survive boot reconcile')
+    assert.equal(readFileSync(draftPath, 'utf8'), 'precious user draft\n')
+    assert.equal(rec.cleanedWorktrees.includes(unregisteredDir), false)
+    assert.ok(rec.preservedDirtyWorktrees.includes(unregisteredDir))
+  })
+
+  it('T2 B3: concurrent same-name add reserves exclusively so loser fails SWARM_MEMBER_EXISTS without deleting winner worktree', async () => {
+    const agyRoot = makeTempDir('oc-rswarm-b3-root-')
+    const repo = initTempGitRepo()
+    const sessionKey = 'agent:main:webchat:dm:b3-concurrent-add'
+    const executedCwds: string[] = []
+    let workerRan!: () => void
+    const workerRanP = new Promise<void>((r) => {
+      workerRan = r
+    })
+
+    const rt = new RemoteSwarmRuntime({
+      rootBase: agyRoot,
+      executor: {
+        async runWorkerTurn(input) {
+          executedCwds.push(input.workspaceCwd)
+          workerRan()
+          return { text: 'wrote cleanly' }
+        },
+        async releaseWorkerSession() {},
+      },
+    })
+
+    try {
+      rt.registerSession({
+        sessionKey,
+        model: 'antigravity-gemini-4-neon-remote',
+        workspaceCwd: repo,
+      })
+
+      const [r1, r2] = await Promise.allSettled([
+        rt.handleToolCall({
+          sessionKey,
+          callerMember: 'coordinator',
+          tool: 'swarm',
+          args: { action: 'add', name: 'writer', brief: 'Task A', workspace: 'share' },
+        }),
+        rt.handleToolCall({
+          sessionKey,
+          callerMember: 'coordinator',
+          tool: 'swarm',
+          args: { action: 'add', name: 'writer', brief: 'Task B', workspace: 'share' },
+        }),
+      ])
+
+      const fulfilled = [r1, r2].filter((r): r is PromiseFulfilledResult<Record<string, unknown>> => r.status === 'fulfilled')
+      const rejected = [r1, r2].filter((r): r is PromiseRejectedResult => r.status === 'rejected')
+      assert.equal(fulfilled.length, 1, 'exactly one concurrent add must win')
+      assert.equal(rejected.length, 1, 'exactly one concurrent add must lose')
+      assert.match(String(rejected[0]!.reason), /SWARM_MEMBER_EXISTS:writer/)
+
+      const winnerWt = (fulfilled[0]!.value.added as Array<{ workspace: string }>)[0]!.workspace
+      assert.equal(existsSync(winnerWt), true, 'winner worktree directory MUST remain intact')
+
+      await Promise.race([
+        workerRanP,
+        new Promise<void>((_, rej) => setTimeout(() => rej(new Error('worker did not run')), 2_500)),
+      ])
+      assert.equal(executedCwds[0], winnerWt, 'winner worker must execute inside its intact worktree')
+
+      const loc = rt.locationFor(sessionKey)
+      const diskRoster = JSON.parse(readFileSync(join(loc.swarmDir, 'members.json'), 'utf8')) as {
+        pending_adds?: unknown
+      }
+      assert.equal(diskRoster.pending_adds, undefined, 'pending_adds must be cleaned after commit')
+    } finally {
+      await rt.shutdownAll()
+    }
+  })
+
+  it('T2 B4: immediate interruptSessionWorkers right after add cancels startup window with 0 executor calls and 0 worker posts', async () => {
+    const agyRoot = makeTempDir('oc-rswarm-b4-root-')
+    const ws = makeTempDir('oc-rswarm-b4-ws-')
+    const sessionKey = 'agent:main:webchat:dm:b4-startup-stop'
+    let executorCalls = 0
+
+    const rt = new RemoteSwarmRuntime({
+      rootBase: agyRoot,
+      executor: {
+        async runWorkerTurn() {
+          executorCalls += 1
+          return { text: 'should never run' }
+        },
+        async releaseWorkerSession() {},
+      },
+    })
+
+    try {
+      rt.registerSession({
+        sessionKey,
+        model: 'antigravity-gemini-4-neon-remote',
+        workspaceCwd: ws,
+      })
+
+      await rt.handleToolCall({
+        sessionKey,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'writer', brief: 'Run immediately' },
+      })
+      const stopRes = await rt.interruptSessionWorkers(sessionKey, 'user_stop')
+      await new Promise((r) => setTimeout(r, 80))
+
+      assert.equal(stopRes.interrupted, true)
+      assert.equal(executorCalls, 0, 'cancelled worker must NEVER invoke executor after immediate Stop')
+
+      const board = (await rt.handleToolCall({
+        sessionKey,
+        callerMember: 'coordinator',
+        tool: 'read_board',
+        args: { since: 0 },
+      })) as { posts: Array<{ agent: string }> }
+      assert.equal(
+        board.posts.filter((p) => p.agent === 'writer').length,
+        0,
+        'cancelled worker must NEVER post any result to the board',
+      )
+    } finally {
+      await rt.shutdownAll()
+    }
+  })
+
+  it('T2 B4 R2: Stop arriving while add brief post waits on .board.lock suppresses brief, starts 0 calls for B, and settles B to STOPPED', async () => {
+    const agyRoot = makeTempDir('oc-rswarm-b4-r2-root-')
+    const ws = makeTempDir('oc-rswarm-b4-r2-ws-')
+    const sessionKey = 'agent:main:webchat:dm:b4-board-lock-stop'
+
+    let workerAStarted!: () => void
+    const workerAStartedP = new Promise<void>((r) => {
+      workerAStarted = r
+    })
+    let workerBCalls = 0
+
+    const rt = new RemoteSwarmRuntime({
+      rootBase: agyRoot,
+      executor: {
+        async runWorkerTurn(input) {
+          if (input.workerName === 'worker-b') {
+            workerBCalls += 1
+            return { text: 'worker-b should never run' }
+          }
+          workerAStarted()
+          return await new Promise((resolve) => {
+            input.signal.addEventListener('abort', () => resolve({ text: '', error: 'aborted' }), {
+              once: true,
+            })
+          })
+        },
+        async releaseWorkerSession() {},
+      },
+    })
+
+    try {
+      rt.registerSession({
+        sessionKey,
+        model: 'antigravity-gemini-4-neon-remote',
+        workspaceCwd: ws,
+      })
+      await rt.handleToolCall({
+        sessionKey,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'worker-a', brief: 'Hold running' },
+      })
+      await workerAStartedP
+
+      const loc = rt.locationFor(sessionKey)
+      const boardLockPath = join(loc.swarmDir, '.board.lock')
+      const membersPath = join(loc.swarmDir, 'members.json')
+      // Hold `.board.lock` so `add(worker-b)` commits `worker-b` into `members.json`
+      // and then blocks waiting on `.board.lock` before writing the brief post.
+      writeFileSync(boardLockPath, `99999:${Date.now()}\n`, 'utf8')
+      let lockReleased = false
+      try {
+        const addBP = rt.handleToolCall({
+          sessionKey,
+          callerMember: 'coordinator',
+          tool: 'swarm',
+          args: { action: 'add', name: 'worker-b', brief: 'Should be cancelled on Stop' },
+        })
+
+        // Wait until `worker-b` is persisted in `members.json` while brief post is blocked on `.board.lock`.
+        const waitCommitDeadline = Date.now() + 2_000
+        while (Date.now() < waitCommitDeadline) {
+          const parsed = JSON.parse(readFileSync(membersPath, 'utf8')) as {
+            members?: Record<string, unknown>
+          }
+          if (parsed.members?.['worker-b']) break
+          await new Promise((r) => setTimeout(r, 10))
+        }
+        const preStopRoster = JSON.parse(readFileSync(membersPath, 'utf8')) as {
+          members: Record<string, { phase: string }>
+        }
+        assert.ok(preStopRoster.members['worker-b'], 'worker-b must be in roster before Stop')
+
+        // Fire Stop while `add(worker-b)` is blocked waiting on `.board.lock`!
+        const stopRes = await rt.interruptSessionWorkers(sessionKey, 'user_stop')
+        assert.equal(stopRes.interrupted, true)
+
+        // Release `.board.lock` so `add(worker-b)` resumes.
+        rmSync(boardLockPath, { force: true })
+        lockReleased = true
+
+        const addBRes = await addBP
+        await new Promise((r) => setTimeout(r, 60))
+
+        assert.equal(addBRes.ok, false)
+        assert.equal(addBRes.interrupted, true)
+        assert.equal(addBRes.cancelled, true)
+        assert.equal(workerBCalls, 0, 'worker-b must have 0 executor calls after Stop during .board.lock wait')
+
+        const board = (await rt.handleToolCall({
+          sessionKey,
+          callerMember: 'coordinator',
+          tool: 'read_board',
+          args: { since: 0 },
+        })) as { posts: Array<{ agent: string; text: string }> }
+        assert.equal(
+          board.posts.filter((p) => p.agent === 'worker-b' || p.text.includes('@worker-b')).length,
+          0,
+          'cancelled add must post neither brief nor worker-b result to board',
+        )
+
+        const finalRoster = JSON.parse(readFileSync(membersPath, 'utf8')) as {
+          members: Record<string, { phase: string; killed: boolean }>
+        }
+        assert.equal(finalRoster.members['worker-b']?.phase, 'STOPPED')
+        assert.equal(finalRoster.members['worker-b']?.killed, false)
+      } finally {
+        if (!lockReleased) rmSync(boardLockPath, { force: true })
+      }
+    } finally {
+      await rt.shutdownAll()
+    }
+  })
+
+  it('T2 B5: exact clientMessageId pre-start Stop on beta MUST NOT cascade-interrupt alpha swarm on the same peer', async () => {
+    const agyRoot = makeTempDir('oc-rswarm-b5-root-')
+    const ws = makeTempDir('oc-rswarm-b5-ws-')
+    const peerId = 'shared-peer-b5'
+    const alphaKey = `agent:alpha:webchat:dm:${peerId}`
+    const betaKey = `agent:beta:webchat:dm:${peerId}`
+    const betaCmid = 'cmid-beta-prestart-001'
+    let alphaStarted!: () => void
+    const alphaStartedP = new Promise<void>((r) => {
+      alphaStarted = r
+    })
+    let alphaAborted = 0
+
+    const rt = new RemoteSwarmRuntime({
+      rootBase: agyRoot,
+      executor: {
+        async runWorkerTurn(input) {
+          alphaStarted()
+          return await new Promise((resolve) => {
+            input.signal.addEventListener(
+              'abort',
+              () => {
+                alphaAborted += 1
+                resolve({ text: '', error: 'aborted' })
+              },
+              { once: true },
+            )
+          })
+        },
+        async releaseWorkerSession() {},
+      },
+    })
+
+    try {
+      rt.registerSession({
+        sessionKey: alphaKey,
+        model: 'antigravity-gemini-4-neon-remote',
+        workspaceCwd: ws,
+      })
+      await rt.handleToolCall({
+        sessionKey: alphaKey,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'alpha-worker', brief: 'keep running' },
+      })
+      await alphaStartedP
+
+      const fenced: Array<{ peerId: string; cmid: string }> = []
+      const mockHost = {
+        sessions: {
+          list: () => [{ sessionKey: alphaKey }, { sessionKey: betaKey }],
+          interrupt: () => false,
+          interruptClientTurn: () => false,
+          fencePreStartStop: (p: string, c: string) => fenced.push({ peerId: p, cmid: c }),
+        },
+        _admittedClientTurns: new Set([`${peerId}\0${betaCmid}`]),
+        _interruptDelegationsForParent: () => false,
+        _settlePendingPermissionsForStop: () => {},
+        router: { route: () => ({ sessionKey: betaKey }) },
+        log: { info: () => {}, warn: () => {} },
+      } as unknown as WsConnectionHost
+
+      const stopped = await handleStop.call(mockHost, {
+        type: 'inbound.control.stop',
+        channel: 'webchat',
+        peer: { id: peerId, kind: 'dm' },
+        agentId: 'beta',
+        clientMessageId: betaCmid,
+      })
+
+      assert.equal(stopped, true)
+      assert.deepEqual(fenced, [{ peerId, cmid: betaCmid }])
+      await new Promise((r) => setTimeout(r, 40))
+      assert.equal(alphaAborted, 0, 'pre-start Stop for beta must NEVER interrupt alpha swarm worker')
+    } finally {
+      await rt.shutdownAll()
+    }
+  })
+
+  it('T2 B7: swarm_wait catches matching post arriving during WAITING roster write without timing out', async () => {
+    const agyRoot = makeTempDir('oc-rswarm-b7-root-')
+    const ws = makeTempDir('oc-rswarm-b7-ws-')
+    const sessionKey = 'agent:main:webchat:dm:b7-wait-window'
+    let releaseWorker!: () => void
+    const workerGate = new Promise<void>((r) => {
+      releaseWorker = r
+    })
+    let workerRunning!: () => void
+    const workerRunningP = new Promise<void>((r) => {
+      workerRunning = r
+    })
+
+    const rt = new RemoteSwarmRuntime({
+      rootBase: agyRoot,
+      executor: {
+        async runWorkerTurn() {
+          workerRunning()
+          await workerGate
+          return { text: 'done' }
+        },
+        async releaseWorkerSession() {},
+      },
+    })
+
+    try {
+      rt.registerSession({
+        sessionKey,
+        model: 'antigravity-gemini-4-neon-remote',
+        workspaceCwd: ws,
+      })
+      await rt.handleToolCall({
+        sessionKey,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'busy-worker', brief: 'stay busy' },
+      })
+      await workerRunningP
+
+      const st = (await rt.handleToolCall({
+        sessionKey,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'status' },
+      })) as { head_seq: number }
+
+      // Deterministically hit the exact B7 race window: AFTER `swarm_wait`'s initial
+      // `alreadyMatching` check returns empty, DURING its async `mutateRoster(WAITING)` write,
+      // and BEFORE `state.waiters.add(entry)` runs, land a matching `@coordinator` post on disk.
+      const origMutateRoster = (rt as any).mutateRoster.bind(rt)
+      let injected = false
+      ;(rt as any).mutateRoster = async (stateArg: unknown, fn: unknown, opts: unknown) => {
+        const res = await origMutateRoster(stateArg, fn, opts)
+        if (!injected && opts === undefined) {
+          injected = true
+          await rt.executeOperatorSteer(sessionKey, 'coordinator', 'race-window-message')
+        }
+        return res
+      }
+
+      const t0 = Date.now()
+      try {
+        const res2 = (await rt.handleToolCall({
+          sessionKey,
+          callerMember: 'coordinator',
+          tool: 'swarm_wait',
+          args: { since: st.head_seq, mentions_only: true, timeout_ms: 2_500 },
+        })) as { woke: boolean; reason: string; posts: Array<{ text: string }> }
+        const elapsed = Date.now() - t0
+        assert.equal(injected, true, 'must have injected post inside WAITING mutateRoster window')
+        assert.equal(res2.woke, true, 'swarm_wait must wake immediately instead of timing out')
+        assert.equal(res2.reason, 'already_available')
+        assert.ok(elapsed < 1_000, `expected immediate wake (<1000ms), got ${elapsed}ms`)
+        assert.ok(res2.posts.some((p) => p.text.includes('race-window-message')))
+      } finally {
+        ;(rt as any).mutateRoster = origMutateRoster
+      }
+    } finally {
+      releaseWorker()
+      await rt.shutdownAll()
+    }
+  })
+
+  it('T2 B8 & NB4: background worker roster read/missing-members failure NEVER triggers unhandledRejection and keeps other sessions healthy', async () => {
+    const agyRoot = makeTempDir('oc-rswarm-b8-root-')
+    const ws = makeTempDir('oc-rswarm-b8-ws-')
+    const badSess = 'agent:main:webchat:dm:b8-bad-session'
+    const goodSess = 'agent:main:webchat:dm:b8-good-session'
+
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason)
+    }
+    process.on('unhandledRejection', onUnhandled)
+
+    let goodRan = false
+    const rt = new RemoteSwarmRuntime({
+      rootBase: agyRoot,
+      executor: {
+        async runWorkerTurn(input) {
+          if (input.coordinatorSessionKey === goodSess) {
+            goodRan = true
+          }
+          return { text: 'good ok' }
+        },
+        async releaseWorkerSession() {},
+      },
+    })
+
+    try {
+      rt.registerSession({
+        sessionKey: badSess,
+        model: 'antigravity-gemini-4-neon-remote',
+        workspaceCwd: ws,
+      })
+      rt.registerSession({
+        sessionKey: goodSess,
+        model: 'antigravity-gemini-4-neon-remote',
+        workspaceCwd: ws,
+      })
+
+      await rt.handleToolCall({
+        sessionKey: badSess,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'bad-w', brief: 'init' },
+      })
+      await new Promise((r) => setTimeout(r, 40))
+
+      // NB4: Replace members.json with a JSON object MISSING `members` (must fail closed, NOT fabricate coordinator!)
+      const badLoc = rt.locationFor(badSess)
+      const badMembersPath = join(badLoc.swarmDir, 'members.json')
+      const missingMembersJson = JSON.stringify({ title: 'truncated-no-members' })
+      writeFileSync(badMembersPath, missingMembersJson, 'utf8')
+
+      await assert.rejects(
+        () =>
+          rt.handleToolCall({
+            sessionKey: badSess,
+            callerMember: 'coordinator',
+            tool: 'swarm',
+            args: { action: 'status' },
+          }),
+        /SWARM_ROSTER_CORRUPT:members_not_object/,
+      )
+      assert.equal(readFileSync(badMembersPath, 'utf8'), missingMembersJson)
+
+      // Trigger background worker scheduling on badSess while roster fails with lock timeout / corrupt error
+      // First restore a valid roster briefly so notifyAfterBoardPost schedules bad-w, then corrupt before runWorkerLoop finishes readRoster!
+      const validBackup = JSON.stringify({
+        runtime: 'remote',
+        title: 'temp',
+        members: {
+          coordinator: { conversation_id: badLoc.swarmId, role: 'coordinator', model: 'm', phase: 'RUNNING', wake_mode: 'mentions', wait_since: 0, last_read_seq: 0, killed: false, channels: ['main'] },
+          'bad-w': { conversation_id: '11111111-2222-4333-8444-555555555555', role: 'worker', model: 'm', phase: 'WAITING', wake_mode: 'mentions', wait_since: 0, last_read_seq: 0, killed: false, channels: ['main'] },
+        },
+        channels: { main: { topic: '主频道' } },
+      })
+      writeFileSync(badMembersPath, validBackup, 'utf8')
+      const badRosterLock = join(badLoc.swarmDir, '.roster.lock')
+      // Hold `.roster.lock` so scheduleWorkerRun's background `readRoster` queues, then overwrite `members.json` with corrupt JSON and release lock!
+      writeFileSync(badRosterLock, `99999:${Date.now()}\n`, 'utf8')
+      await rt.executeOperatorSteer(badSess, 'bad-w', 'wake into corrupt roster')
+      writeFileSync(badMembersPath, missingMembersJson, 'utf8')
+      rmSync(badRosterLock, { force: true })
+
+      await new Promise((r) => setTimeout(r, 80))
+      assert.deepEqual(unhandled, [], 'background worker roster failure must NEVER emit unhandledRejection')
+      assert.equal(readFileSync(badMembersPath, 'utf8'), missingMembersJson, 'corrupt roster must remain un-overwritten')
+
+      // Unrelated session `goodSess` must remain 100% operational!
+      await rt.handleToolCall({
+        sessionKey: goodSess,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'good-w', brief: 'healthy task' },
+      })
+      const deadline = Date.now() + 2_000
+      while (!goodRan && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      assert.equal(goodRan, true, 'unrelated session must keep working cleanly after badSess fault')
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
       await rt.shutdownAll()
     }
   })

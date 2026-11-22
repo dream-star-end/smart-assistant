@@ -15,50 +15,64 @@
  *        - Full Master-side billing & audit via `remoteDriverTurnBilling`
  *        - Bounded concurrency semaphore (default 3 parallel workers) protecting remote node lane caps
  */
-import { execFileSync } from 'node:child_process'
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
-import {
-  appendFileSync,
-  closeSync,
-  constants as fsConstants,
-  existsSync,
-  fstatSync,
-  lstatSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  realpathSync,
-  renameSync,
-  rmSync,
-  unlinkSync,
-  writeFileSync,
-  writeSync,
-} from 'node:fs'
-import { join, resolve, sep } from 'node:path'
-import {
-  SWARM_MAX_CHANNELS,
-  SWARM_MAX_MEMBERS,
-  extractSwarmMentions,
-} from '@openclaude/protocol'
+import { appendFileSync, existsSync } from 'node:fs'
+import { join } from 'node:path'
+import { extractSwarmMentions } from '@openclaude/protocol'
 import { antigravityRoot } from './engine/antigravityPlatform.js'
-import { GATEWAY_STALL_MONITOR_AGENT, isSwarmMonitorAgentName } from './engine/swarmStallMonitor.js'
-import { offloadPayloadIfOversized, truncateUtf8Safe } from './payloadOffloadGate.js'
+import { GATEWAY_STALL_MONITOR_AGENT } from './engine/swarmStallMonitor.js'
+import {
+  type BoardPostRecord,
+  type RemoteSwarmLocation,
+  type RosterChannelRecord,
+  type RosterFile,
+  type RosterMemberRecord,
+  appendBoardLineNoSymlink,
+  assertSafeSwarmDir,
+  atomicWriteJson,
+  ensurePrivateDir,
+  formatBoardTimestamp,
+  readBoardPostsFromDisk,
+  readOrInitRosterStrict,
+  readRosterStrict,
+  withAsyncSwarmFileLock,
+  withSwarmFileLockNonBlocking,
+} from './remoteSwarmLocks.js'
+import {
+  reconcileRemoteSwarmOnBoot,
+  removeWorkerGitWorktree,
+} from './remoteSwarmReconcile.js'
+import {
+  DEFAULT_READ_BOARD_MAX_BYTES,
+  MAX_READ_BOARD_MAX_BYTES,
+  MAX_SWARM_POST_CHARS,
+  type RemoteSwarmToolHost,
+  executePostMessageTool,
+  executeReadBoardTool,
+  executeSwarmAddAction,
+  executeSwarmChannelAction,
+  executeSwarmStatusAction,
+} from './remoteSwarmTools.js'
 
-const MEMBER_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/
-const CHANNEL_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/
-const RESERVED_MEMBER_NAMES = new Set(['all', 'coordinator'])
+export type {
+  BoardPostRecord,
+  RemoteSwarmLocation,
+  RosterChannelRecord,
+  RosterFile,
+  RosterMemberRecord,
+}
+export {
+  DEFAULT_READ_BOARD_MAX_BYTES,
+  MAX_READ_BOARD_MAX_BYTES,
+  MAX_SWARM_POST_CHARS,
+  reconcileRemoteSwarmOnBoot,
+}
+
 const DEFAULT_MAX_PARALLEL_WORKERS = 3
-const DEFAULT_WAIT_TIMEOUT_MS = 180_000
+/** Staggered away from SwarmStallMonitor's 180s quiet threshold (P1-4). */
+export const DEFAULT_WAIT_TIMEOUT_MS = 240_000
 const MAX_WAIT_TIMEOUT_MS = 300_000
-const DEFAULT_READ_BOARD_LIMIT = 50
-const MAX_READ_BOARD_LIMIT = 200
-export const DEFAULT_READ_BOARD_MAX_BYTES = 32 * 1024
-export const MAX_READ_BOARD_MAX_BYTES = 128 * 1024
-export const MAX_SWARM_POST_CHARS = 24_000
 const DEFAULT_CALLER_TOKEN_TTL_MS = 12 * 60 * 60_000
-const BOARD_LOCK_MAX_WAIT_MS = 5_000
-const BOARD_LOCK_STALE_MS = 30_000
-const MAX_SHARD_ADD = 8
 
 export interface RemoteSwarmMcpContext {
   readonly coordinatorSessionKey: string
@@ -70,6 +84,17 @@ export interface RemoteSwarmMcpContext {
  *  HMAC-signed RemoteSwarm caller tokens for MCP subprocess env injection. */
 const activeMcpContexts = new Map<string, RemoteSwarmMcpContext>()
 const activeRuntimeBySession = new Map<string, RemoteSwarmRuntime>()
+let defaultRuntimeFactory: (() => RemoteSwarmRuntime) | null = null
+
+export function setDefaultRemoteSwarmRuntimeFactory(
+  factory: (() => RemoteSwarmRuntime) | null,
+): void {
+  defaultRuntimeFactory = factory
+}
+
+export function resolveDefaultRemoteSwarmRuntime(): RemoteSwarmRuntime | null {
+  return defaultRuntimeFactory ? defaultRuntimeFactory() : null
+}
 
 export function lookupRemoteSwarmMcpContext(sessionKey: string): RemoteSwarmMcpContext | undefined {
   return activeMcpContexts.get(sessionKey.trim())
@@ -92,12 +117,6 @@ export function lookupRemoteSwarmRuntimeForSession(
   sessionKey: string,
 ): RemoteSwarmRuntime | undefined {
   return activeRuntimeBySession.get(sessionKey.trim())
-}
-
-export interface RemoteSwarmLocation {
-  readonly brainDir: string
-  readonly swarmId: string
-  readonly swarmDir: string
 }
 
 export interface RemoteSwarmWorkerTurnInput {
@@ -125,6 +144,8 @@ export interface RemoteSwarmTelemetryEvent {
   readonly toolArgs?: Record<string, unknown>
   readonly inputTokens?: number
   readonly outputTokens?: number
+  readonly cacheReadTokens?: number
+  readonly thinkingTokens?: number
   readonly error?: string
 }
 
@@ -133,6 +154,8 @@ export interface RemoteSwarmWorkerTurnResult {
   readonly error?: string
   readonly inputTokens?: number
   readonly outputTokens?: number
+  readonly cacheReadTokens?: number
+  readonly thinkingTokens?: number
 }
 
 export interface RemoteSwarmWorkerExecutor {
@@ -142,53 +165,17 @@ export interface RemoteSwarmWorkerExecutor {
   ): Promise<{ released: boolean; state: string } | void>
 }
 
-interface RosterMemberRecord {
-  conversation_id: string
-  role: 'coordinator' | 'worker' | 'verifier' | 'narrator' | 'monitor'
-  model: string
-  phase: 'RUNNING' | 'WAITING' | 'STOPPED' | 'KILLED'
-  wake_mode: 'mentions' | 'all'
-  wait_since: number
-  last_read_seq: number
-  killed: boolean
-  channels: string[]
-  workspace?: {
-    mode: 'inherit' | 'share' | 'branch'
-    path?: string
-    branch?: string
-  }
-  added_by?: string
-}
-
-interface RosterChannelRecord {
-  topic?: string
-  creator?: string
-  archived?: boolean
-}
-
-interface RosterFile {
-  title: string
-  members: Record<string, RosterMemberRecord>
-  channels: Record<string, RosterChannelRecord>
-}
-
-export interface BoardPostRecord {
-  seq: number
-  agent: string
-  channel: string
-  text: string
-  time: string
-  kind?: string
-  request_id?: string
-  control?: Record<string, unknown>
-}
-
 interface WaiterEntry {
   readonly memberName: string
   readonly since: number
   readonly mentionsOnly: boolean
   readonly channel?: string
-  readonly resolve: (result: { woke: boolean; posts: BoardPostRecord[]; headSeq: number; reason: string }) => void
+  readonly resolve: (result: {
+    woke: boolean
+    posts: BoardPostRecord[]
+    headSeq: number
+    reason: string
+  }) => void
   readonly timer: NodeJS.Timeout
 }
 
@@ -199,9 +186,11 @@ interface WorkerRuntimeState {
   turnSeq: number
   running: boolean
   pendingWake: boolean
+  runGeneration: number
   abortController: AbortController | null
   runPromise: Promise<void> | null
   stepCounter: number
+  lastKnownConvId?: string
 }
 
 interface SwarmSessionState {
@@ -215,7 +204,9 @@ interface SwarmSessionState {
   readonly workers: Map<string, WorkerRuntimeState>
   readonly waiters: Set<WaiterEntry>
   shuttingDown: boolean
+  interruptGeneration: number
   boardSeqKnown: number
+  coordinatorStepCounter: number
 }
 
 export function deterministicSwarmUuid(seed: string): string {
@@ -253,327 +244,12 @@ function trustedStallAlertTarget(post: BoardPostRecord): string | null {
   return null
 }
 
-function formatBoardTimestamp(now = new Date()): string {
-  return now.toISOString().replace('T', ' ').slice(0, 19)
-}
-
-function inferMemberRole(name: string): RosterMemberRecord['role'] {
-  const lower = name.toLowerCase()
-  if (lower === 'coordinator') return 'coordinator'
-  if (/^narrator(?:-\d+)?$/.test(lower)) return 'narrator'
-  if (/^monitor(?:-\d+)?$/.test(lower)) return 'monitor'
-  if (/verif|review|audit|qa|test/.test(lower)) return 'verifier'
-  return 'worker'
-}
-
-function ensurePrivateDir(dir: string): void {
-  mkdirSync(dir, { recursive: true, mode: 0o700 })
-}
-
-function atomicWriteJson(filePath: string, data: unknown): void {
-  const tmpPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2, 8)}.tmp`
-  const payload = JSON.stringify(data, null, 2)
-  writeFileSync(tmpPath, payload, { mode: 0o600 })
-  renameSync(tmpPath, filePath)
-}
-
-function assertSafeSwarmDir(location: RemoteSwarmLocation): { dev: number; ino: number } {
-  const rootStat = lstatSync(location.brainDir)
-  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
-    throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
-  }
-  const realRoot = realpathSync(location.brainDir)
-  let cur = location.brainDir
-  let lastStat = rootStat
-  for (const seg of [location.swarmId, '.system_generated', 'swarm']) {
-    cur = join(cur, seg)
-    const st = lstatSync(cur)
-    if (st.isSymbolicLink() || !st.isDirectory()) {
-      throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
-    }
-    lastStat = st
-  }
-  const realSwarm = realpathSync(cur)
-  const prefix = realRoot.endsWith(sep) ? realRoot : `${realRoot}${sep}`
-  if (!realSwarm.startsWith(prefix)) {
-    throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
-  }
-  return { dev: lastStat.dev, ino: lastStat.ino }
-}
-
-function appendBoardLineNoSymlink(swarmDir: string, line: string): void {
-  const boardPath = join(swarmDir, 'board.jsonl')
-  let fd: number | null = null
-  try {
-    const flags =
-      fsConstants.O_WRONLY |
-      fsConstants.O_APPEND |
-      fsConstants.O_CREAT |
-      (typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0)
-    fd = openSync(boardPath, flags, 0o600)
-    const fst = fstatSync(fd)
-    if (!fst.isFile()) {
-      throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
-    }
-    writeSync(fd, line, null, 'utf8')
-  } catch (err: any) {
-    if (err?.code === 'ELOOP') throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
-    throw err
-  } finally {
-    if (fd !== null) {
-      try { closeSync(fd) } catch { /* ignore */ }
-    }
-  }
-}
-
-function withBoardFileLock<T>(location: RemoteSwarmLocation, fn: () => T): T {
-  const swarmDir = location.swarmDir
-  ensurePrivateDir(swarmDir)
-  const dirId = assertSafeSwarmDir(location)
-  const lockPath = join(swarmDir, '.board.lock')
-  const deadline = Date.now() + BOARD_LOCK_MAX_WAIT_MS
-  let fd: number | null = null
-  while (fd === null) {
-    try {
-      const flags =
-        fsConstants.O_CREAT |
-        fsConstants.O_EXCL |
-        fsConstants.O_WRONLY |
-        (typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0)
-      fd = openSync(lockPath, flags, 0o600)
-    } catch (err: any) {
-      if (err?.code === 'ELOOP') throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
-      if (err?.code !== 'EEXIST') throw err
-      let unlinkedStale = false
-      try {
-        const st = lstatSync(lockPath)
-        if (st.isSymbolicLink()) throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
-        if (Date.now() - st.mtimeMs > BOARD_LOCK_STALE_MS) {
-          unlinkSync(lockPath)
-          unlinkedStale = true
-        }
-      } catch (statErr: any) {
-        if (statErr?.message === 'SWARM_BOARD_SYMLINK_REJECTED') throw statErr
-        // Lock disappeared or transient stat error: still enforce deadline below.
-      }
-      if (Date.now() >= deadline) {
-        throw new Error('SWARM_BOARD_LOCK_TIMEOUT')
-      }
-      if (unlinkedStale) continue
-      const until = Math.min(deadline, Date.now() + 15)
-      while (Date.now() < until) {
-        // bounded short spin for lock file release
-      }
-    }
-  }
-  try {
-    const afterId = assertSafeSwarmDir(location)
-    if (afterId.dev !== dirId.dev || afterId.ino !== dirId.ino) {
-      throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
-    }
-    return fn()
-  } finally {
-    try {
-      closeSync(fd)
-    } catch {
-      /* ignore */
-    }
-    try {
-      unlinkSync(lockPath)
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-function readBoardPostsFromDisk(swarmDir: string): BoardPostRecord[] {
-  const boardPath = join(swarmDir, 'board.jsonl')
-  let fd: number | null = null
-  let raw = ''
-  try {
-    const lst = lstatSync(boardPath)
-    if (lst.isSymbolicLink() || !lst.isFile()) {
-      throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
-    }
-    const flags =
-      fsConstants.O_RDONLY |
-      (typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0)
-    fd = openSync(boardPath, flags)
-    const fst = fstatSync(fd)
-    if (!fst.isFile() || fst.dev !== lst.dev || fst.ino !== lst.ino) {
-      throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
-    }
-    raw = readFileSync(fd, 'utf8')
-  } catch (err: any) {
-    if (err?.code === 'ENOENT') return []
-    if (err?.code === 'ELOOP') throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
-    throw err
-  } finally {
-    if (fd !== null) {
-      try { closeSync(fd) } catch { /* ignore */ }
-    }
-  }
-  const posts: BoardPostRecord[] = []
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim()
-    if (!trimmed) continue
-    try {
-      const obj = JSON.parse(trimmed) as Record<string, unknown>
-      if (!obj || typeof obj !== 'object') continue
-      const seq = typeof obj.seq === 'number' && Number.isFinite(obj.seq) ? Math.floor(obj.seq) : posts.length + 1
-      posts.push({
-        seq,
-        agent: typeof obj.agent === 'string' && obj.agent.trim() ? obj.agent.trim() : 'unknown',
-        channel: typeof obj.channel === 'string' && obj.channel.trim() ? obj.channel.trim() : 'main',
-        text: typeof obj.text === 'string' ? obj.text : '',
-        time: typeof obj.time === 'string' ? obj.time : formatBoardTimestamp(),
-        ...(typeof obj.kind === 'string' ? { kind: obj.kind } : {}),
-        ...(typeof obj.request_id === 'string' ? { request_id: obj.request_id } : {}),
-        ...(obj.control && typeof obj.control === 'object' && !Array.isArray(obj.control)
-          ? { control: obj.control as Record<string, unknown> }
-          : {}),
-      })
-    } catch {
-      // skip torn line
-    }
-  }
-  return posts
-}
-
-function findGitRepoTopLevel(cwd: string): string | null {
-  try {
-    const out = execFileSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 5_000,
-    }).trim()
-    return out || null
-  } catch {
-    return null
-  }
-}
-
-function isGitWorktreeDirty(wtPath: string): boolean {
-  try {
-    const out = execFileSync('git', ['-C', wtPath, 'status', '--porcelain'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 5_000,
-    }).trim()
-    return out.length > 0
-  } catch {
-    return true
-  }
-}
-
-/**
- * Check whether a worktree's HEAD commit is unmerged into the main repository's HEAD (I6).
- * In `share` (detached HEAD) mode, a worker can commit changes leaving porcelain clean;
- * deleting the worktree without proving its commit is reachable from main HEAD orphans work.
- */
-function hasUnmergedGitWorktreeCommits(repoTop: string, wtPath: string): boolean {
-  try {
-    const wtHead = execFileSync('git', ['-C', wtPath, 'rev-parse', 'HEAD'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 5_000,
-    }).trim()
-    if (!wtHead) return true
-    execFileSync('git', ['-C', repoTop, 'merge-base', '--is-ancestor', wtHead, 'HEAD'], {
-      stdio: 'ignore',
-      timeout: 5_000,
-    })
-    return false
-  } catch {
-    return true
-  }
-}
-
-function isGitWorktreeUnsafeToDelete(repoTop: string, wtPath: string): boolean {
-  return isGitWorktreeDirty(wtPath) || hasUnmergedGitWorktreeCommits(repoTop, wtPath)
-}
-
-function createWorkerGitWorktree(
-  baseCwd: string,
-  swarmId: string,
-  workerName: string,
-  mode: 'share' | 'branch',
-): { mode: 'share' | 'branch'; path: string; branch?: string } {
-  const repoTop = findGitRepoTopLevel(baseCwd)
-  if (!repoTop) {
-    throw new Error(`SWARM_WORKTREE_CREATE_FAILED: workspace is not a git repository (${baseCwd})`)
-  }
-  const wtBase = join(repoTop, '.oc-swarm-worktrees')
-  ensurePrivateDir(wtBase)
-  const slug = `${swarmId.slice(0, 8)}-${workerName}`
-  const wtPath = resolve(wtBase, slug)
-  if (!wtPath.startsWith(`${resolve(wtBase)}/`)) {
-    throw new Error(`SWARM_WORKTREE_CREATE_FAILED: invalid worktree path (${slug})`)
-  }
-  try {
-    if (existsSync(wtPath)) {
-      if (isGitWorktreeUnsafeToDelete(repoTop, wtPath)) {
-        throw new Error(`existing worktree has uncommitted or unmerged changes (${wtPath})`)
-      }
-      execFileSync('git', ['-C', repoTop, 'worktree', 'remove', '--force', wtPath], {
-        stdio: 'ignore',
-        timeout: 10_000,
-      })
-    }
-    if (mode === 'branch') {
-      const branchName = `swarm/${slug}-${Date.now().toString(36)}`
-      execFileSync('git', ['-C', repoTop, 'worktree', 'add', '-b', branchName, wtPath, 'HEAD'], {
-        stdio: 'ignore',
-        timeout: 15_000,
-      })
-      return { mode: 'branch', path: wtPath, branch: branchName }
-    }
-    execFileSync('git', ['-C', repoTop, 'worktree', 'add', '--detach', wtPath, 'HEAD'], {
-      stdio: 'ignore',
-      timeout: 15_000,
-    })
-    return { mode: 'share', path: wtPath }
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err)
-    throw new Error(`SWARM_WORKTREE_CREATE_FAILED: ${detail}`)
-  }
-}
-
-function removeWorkerGitWorktree(
-  baseCwd: string,
-  wtPath: string | undefined,
-  opts?: { forceDirty?: boolean },
-): { removed: boolean; preservedDirtyPath?: string } {
-  if (!wtPath) return { removed: false }
-  const repoTop = findGitRepoTopLevel(baseCwd)
-  const wtBase = repoTop ? resolve(repoTop, '.oc-swarm-worktrees') : null
-  const resolvedWt = resolve(wtPath)
-  if (!wtBase || !resolvedWt.startsWith(`${wtBase}/`)) {
-    return { removed: false }
-  }
-  if (!existsSync(resolvedWt)) {
-    return { removed: true }
-  }
-  if (!opts?.forceDirty && isGitWorktreeUnsafeToDelete(repoTop!, resolvedWt)) {
-    return { removed: false, preservedDirtyPath: resolvedWt }
-  }
-  try {
-    execFileSync('git', ['-C', repoTop!, 'worktree', 'remove', '--force', resolvedWt], {
-      stdio: 'ignore',
-      timeout: 10_000,
-    })
-    return { removed: true }
-  } catch {
-    try {
-      rmSync(resolvedWt, { recursive: true, force: true })
-      return { removed: true }
-    } catch {
-      return { removed: false, preservedDirtyPath: resolvedWt }
-    }
-  }
-}
-
-function memberMatchesMention(memberName: string, mention: string, memberChannels: string[], postChannel: string): boolean {
+function memberMatchesMention(
+  memberName: string,
+  mention: string,
+  memberChannels: string[],
+  postChannel: string,
+): boolean {
   const m = mention.toLowerCase()
   const lower = memberName.toLowerCase()
   if (m === 'all') return true
@@ -585,6 +261,12 @@ function memberMatchesMention(memberName: string, mention: string, memberChannel
   }
   void postChannel
   return false
+}
+
+function isAbortInterruptReason(signal: AbortSignal): boolean {
+  const r = signal.reason
+  const msg = r instanceof Error ? r.message : typeof r === 'string' ? r : ''
+  return msg.startsWith('SWARM_INTERRUPTED:')
 }
 
 export class RemoteSwarmRuntime {
@@ -604,7 +286,8 @@ export class RemoteSwarmRuntime {
   }) {
     this.rootBase = opts?.rootBase ?? antigravityRoot()
     const envCap = Number.parseInt(process.env.OC_REMOTE_SWARM_MAX_WORKERS ?? '', 10)
-    const configured = opts?.maxParallelWorkers ?? (Number.isFinite(envCap) ? envCap : DEFAULT_MAX_PARALLEL_WORKERS)
+    const configured =
+      opts?.maxParallelWorkers ?? (Number.isFinite(envCap) ? envCap : DEFAULT_MAX_PARALLEL_WORKERS)
     this.maxParallelWorkers = Math.max(1, Math.min(4, configured))
     this.executor = opts?.executor
     this.hmacSecret = opts?.hmacSecret ?? randomBytes(32)
@@ -619,7 +302,9 @@ export class RemoteSwarmRuntime {
     const cleanSession = sessionKey.trim()
     const cleanMember = memberName.trim().toLowerCase()
     const exp = Date.now() + Math.max(1_000, Math.floor(ttlMs))
-    const payload = Buffer.from(`${cleanSession}\n${cleanMember}\n${exp}`, 'utf8').toString('base64url')
+    const payload = Buffer.from(`${cleanSession}\n${cleanMember}\n${exp}`, 'utf8').toString(
+      'base64url',
+    )
     const sig = createHmac('sha256', this.hmacSecret).update(payload, 'utf8').digest('base64url')
     return `rsw1.${payload}.${sig}`
   }
@@ -668,8 +353,13 @@ export class RemoteSwarmRuntime {
     }
     const rt = state.workers.get(cleanMember)
     if (!rt || !rt.running) return false
-    const roster = this.ensureRoster(state)
-    const memberRec = roster.members[cleanMember]
+    let roster: RosterFile | null = null
+    try {
+      roster = readRosterStrict(state.location)
+    } catch {
+      return false
+    }
+    const memberRec = roster?.members[cleanMember]
     if (!memberRec || memberRec.killed) return false
     return activeMcpContexts.get(rt.workerSessionKey)?.callerToken === token
   }
@@ -708,7 +398,9 @@ export class RemoteSwarmRuntime {
         workers: new Map(),
         waiters: new Set(),
         shuttingDown: false,
+        interruptGeneration: 0,
         boardSeqKnown: 0,
+        coordinatorStepCounter: 0,
       }
       this.sessions.set(key, state)
     } else {
@@ -735,6 +427,66 @@ export class RemoteSwarmRuntime {
     return state
   }
 
+  /**
+   * Lazily hydrate an in-memory control handle for an existing on-disk remote swarm
+   * (e.g., after a gateway restart) WITHOUT minting coordinator MCP tokens (P2-1).
+   * Returns `null` fail-closed if no valid `members.json` exists on disk.
+   */
+  hydrateSessionFromDisk(input: {
+    sessionKey: string
+    workspaceCwd?: string
+    model?: string
+    parentAgentId?: string
+  }): SwarmSessionState | null {
+    const key = input.sessionKey.trim()
+    if (!key) return null
+    const existing = this.sessions.get(key)
+    if (existing && !existing.shuttingDown) {
+      activeRuntimeBySession.set(key, this)
+      return existing
+    }
+    const location = this.locationFor(key)
+    let roster: RosterFile | null = null
+    try {
+      assertSafeSwarmDir(location)
+      roster = readRosterStrict(location)
+    } catch {
+      return null
+    }
+    if (!roster) return null
+
+    const inferredAgent = /^agent:([A-Za-z0-9_-]{1,64}):/.exec(key)?.[1] ?? 'main'
+    const parentAgentId = (input.parentAgentId ?? inferredAgent).trim() || 'main'
+    const resolvedModel =
+      input.model?.trim() || roster.members.coordinator?.model?.trim() || 'antigravity-gemini-4-neon-remote'
+    const resolvedCwd = input.workspaceCwd?.trim() || roster.workspace_cwd?.trim() || process.cwd()
+
+    let headSeq = 0
+    try {
+      const posts = readBoardPostsFromDisk(location.swarmDir)
+      headSeq = posts.reduce((m, p) => Math.max(m, p.seq), 0)
+    } catch {
+      headSeq = 0
+    }
+
+    const state: SwarmSessionState = {
+      sessionKey: key,
+      location,
+      model: resolvedModel,
+      workspaceCwd: resolvedCwd,
+      parentAgentId,
+      workers: new Map(),
+      waiters: new Set(),
+      shuttingDown: false,
+      interruptGeneration: 0,
+      boardSeqKnown: headSeq,
+      coordinatorStepCounter: 0,
+    }
+    this.sessions.set(key, state)
+    activeRuntimeBySession.set(key, this)
+    return state
+  }
+
   disableCoordinatorMcp(sessionKey: string): void {
     disableRemoteSwarmCoordinatorMcp(sessionKey)
   }
@@ -747,65 +499,40 @@ export class RemoteSwarmRuntime {
     return null
   }
 
-  private ensureRoster(state: SwarmSessionState): RosterFile {
-    ensurePrivateDir(state.location.swarmDir)
-    const membersPath = join(state.location.swarmDir, 'members.json')
-    if (existsSync(membersPath)) {
-      try {
-        const parsed = JSON.parse(readFileSync(membersPath, 'utf8')) as Partial<RosterFile>
-        const members = parsed.members && typeof parsed.members === 'object' ? { ...parsed.members } : {}
-        const channels =
-          parsed.channels && typeof parsed.channels === 'object'
-            ? { ...parsed.channels }
-            : { main: { topic: '主频道' } }
-        if (!members.coordinator) {
-          members.coordinator = {
-            conversation_id: state.location.swarmId,
-            role: 'coordinator',
-            model: state.model,
-            phase: 'RUNNING',
-            wake_mode: 'mentions',
-            wait_since: 0,
-            last_read_seq: 0,
-            killed: false,
-            channels: ['main'],
-          }
-        }
-        return {
-          title: typeof parsed.title === 'string' && parsed.title.trim() ? parsed.title : '蜂群协作',
-          members,
-          channels,
-        }
-      } catch {
-        // fall through to fresh roster
+  /**
+   * Serialized per-session roster transaction guarded by in-process Promise queue +
+   * `.roster.lock` (P0-3). Fail-closed on corrupt/unreadable/symlink `members.json`;
+   * initializes default roster ONLY on `ENOENT`.
+   */
+  private mutateRoster<T>(
+    state: SwarmSessionState,
+    fn: (roster: RosterFile) => T,
+    opts?: { persist?: boolean },
+  ): Promise<T> {
+    const persist = opts?.persist !== false
+    return withAsyncSwarmFileLock(state.location, '.roster.lock', () => {
+      const { roster } = readOrInitRosterStrict(state.location, {
+        model: state.model,
+        sessionKey: state.sessionKey,
+        workspaceCwd: state.workspaceCwd,
+      })
+      const result = fn(roster)
+      if (persist) {
+        roster.runtime = 'remote'
+        roster.session_key = state.sessionKey
+        if (state.workspaceCwd) roster.workspace_cwd = state.workspaceCwd
+        atomicWriteJson(join(state.location.swarmDir, 'members.json'), roster)
       }
-    }
-    const fresh: RosterFile = {
-      title: '蜂群协作',
-      members: {
-        coordinator: {
-          conversation_id: state.location.swarmId,
-          role: 'coordinator',
-          model: state.model,
-          phase: 'RUNNING',
-          wake_mode: 'mentions',
-          wait_since: 0,
-          last_read_seq: 0,
-          killed: false,
-          channels: ['main'],
-        },
-      },
-      channels: {
-        main: { topic: '主频道' },
-      },
-    }
-    atomicWriteJson(membersPath, fresh)
-    return fresh
+      return result
+    })
   }
 
-  private saveRoster(state: SwarmSessionState, roster: RosterFile): void {
-    ensurePrivateDir(state.location.swarmDir)
-    atomicWriteJson(join(state.location.swarmDir, 'members.json'), roster)
+  /**
+   * Read-only strict roster snapshot (initializes ONLY on `ENOENT` under `.roster.lock`,
+   * never silently overwrites corrupt/unreadable `members.json`).
+   */
+  private readRoster(state: SwarmSessionState): Promise<RosterFile> {
+    return this.mutateRoster(state, (roster) => roster, { persist: false })
   }
 
   private appendTranscriptStep(
@@ -827,10 +554,21 @@ export class RemoteSwarmRuntime {
       if (ev.toolName) {
         record.tool_calls = [{ name: ev.toolName, arguments: ev.toolArgs ?? {} }]
       }
-      if (ev.inputTokens !== undefined || ev.outputTokens !== undefined) {
+      if (
+        ev.inputTokens !== undefined ||
+        ev.outputTokens !== undefined ||
+        ev.cacheReadTokens !== undefined ||
+        ev.thinkingTokens !== undefined
+      ) {
         record.usage = {
           input_tokens: Math.max(0, Math.floor(ev.inputTokens ?? 0)),
           output_tokens: Math.max(0, Math.floor(ev.outputTokens ?? 0)),
+          ...(ev.cacheReadTokens !== undefined
+            ? { cache_read_tokens: Math.max(0, Math.floor(ev.cacheReadTokens)) }
+            : {}),
+          ...(ev.thinkingTokens !== undefined
+            ? { thinking_tokens: Math.max(0, Math.floor(ev.thinkingTokens)) }
+            : {}),
         }
       }
       if (ev.error) {
@@ -842,7 +580,15 @@ export class RemoteSwarmRuntime {
     }
   }
 
-  private appendBoardPost(
+  /** Record a telemetry step into the coordinator's `transcript.jsonl` (P1-3). */
+  recordCoordinatorTelemetry(sessionKey: string, ev: RemoteSwarmTelemetryEvent): void {
+    const state = this.sessions.get(sessionKey.trim())
+    if (!state) return
+    state.coordinatorStepCounter += 1
+    this.appendTranscriptStep(state, state.location.swarmId, state.coordinatorStepCounter, ev)
+  }
+
+  private async appendBoardPost(
     state: SwarmSessionState,
     input: {
       agent: string
@@ -850,28 +596,136 @@ export class RemoteSwarmRuntime {
       channel?: string
       kind?: string
       control?: Record<string, unknown>
+      expectedGeneration?: number
     },
-  ): BoardPostRecord {
+  ): Promise<BoardPostRecord | null> {
+    const expectedGen = input.expectedGeneration
+    const isStaleGeneration = () =>
+      expectedGen !== undefined &&
+      (state.shuttingDown || state.interruptGeneration !== expectedGen)
+    if (isStaleGeneration()) return null
     const channel = (input.channel || 'main').trim() || 'main'
-    const post = withBoardFileLock(state.location, () => {
-      const existing = readBoardPostsFromDisk(state.location.swarmDir)
-      const headSeq = existing.reduce((max, p) => Math.max(max, p.seq), 0)
-      const next: BoardPostRecord = {
-        seq: headSeq + 1,
-        agent: input.agent,
-        channel,
-        text: input.text,
-        time: formatBoardTimestamp(),
-        ...(input.kind ? { kind: input.kind } : {}),
-        ...(input.control ? { control: input.control } : {}),
-        request_id: randomUUID(),
+    const writeRes = await withAsyncSwarmFileLock(
+      state.location,
+      '.board.lock',
+      () => {
+        // B4: Re-check generation AFTER acquiring `.board.lock` so a Stop arriving while
+        // queued on `.board.lock` prevents the stale brief post and worker wake.
+        if (isStaleGeneration()) return null
+        const existing = readBoardPostsFromDisk(state.location.swarmDir)
+        const headSeq = existing.reduce((max, p) => Math.max(max, p.seq), 0)
+        const next: BoardPostRecord = {
+          seq: headSeq + 1,
+          agent: input.agent,
+          channel,
+          text: input.text,
+          time: formatBoardTimestamp(),
+          ...(input.kind ? { kind: input.kind } : {}),
+          ...(input.control ? { control: input.control } : {}),
+          request_id: randomUUID(),
+        }
+        appendBoardLineNoSymlink(state.location.swarmDir, `${JSON.stringify(next)}\n`)
+        return { post: next, allPosts: [...existing, next] }
+      },
+    )
+    if (!writeRes) return null
+    state.boardSeqKnown = Math.max(state.boardSeqKnown, writeRes.post.seq)
+    this.notifyAfterBoardPost(state, writeRes.post, writeRes.allPosts, expectedGen)
+    return writeRes.post
+  }
+
+  /**
+   * Cascade-interrupt all active workers and unblock waiters for a session on user Stop
+   * or Swarm toggle-off (P0-2). Aborts running workers, clears `pendingWake`, unblocks
+   * `waiters`, releases remote lanes, and transitions active workers to `STOPPED`, while
+   * strictly preserving `members.json` history and all worktrees (never deletes user work).
+   */
+  async interruptSessionWorkers(
+    sessionKey: string,
+    reason = 'user_stop',
+    opts?: { stopWaitTimeoutMs?: number },
+  ): Promise<{
+    interrupted: boolean
+    abortedWorkers: string[]
+    unblockedWaiters: number
+  }> {
+    const cleanKey = sessionKey.trim()
+    const state = this.sessions.get(cleanKey)
+    if (!state) {
+      return { interrupted: false, abortedWorkers: [], unblockedWaiters: 0 }
+    }
+
+    // B4: Immediately bump interruptGeneration synchronously BEFORE any await so any
+    // scheduled worker still in its pre-executor startup window cannot proceed or re-arm.
+    state.interruptGeneration += 1
+
+    let unblockedWaiters = 0
+    for (const waiter of [...state.waiters]) {
+      state.waiters.delete(waiter)
+      clearTimeout(waiter.timer)
+      unblockedWaiters += 1
+      waiter.resolve({
+        woke: false,
+        posts: [],
+        headSeq: state.boardSeqKnown,
+        reason,
+      })
+    }
+
+    const waitMs = Math.max(50, opts?.stopWaitTimeoutMs ?? 3_000)
+    const abortedWorkers: string[] = []
+    const abortedSet = new Set<string>()
+    const activeWaits: Promise<void>[] = []
+
+    for (const rt of state.workers.values()) {
+      const wasActive = rt.running || rt.pendingWake || rt.abortController !== null
+      rt.pendingWake = false
+      activeMcpContexts.delete(rt.workerSessionKey)
+      if (wasActive) {
+        abortedWorkers.push(rt.name)
+        abortedSet.add(rt.name)
       }
-      appendBoardLineNoSymlink(state.location.swarmDir, `${JSON.stringify(next)}\n`)
-      return next
-    })
-    state.boardSeqKnown = Math.max(state.boardSeqKnown, post.seq)
-    this.notifyAfterBoardPost(state, post)
-    return post
+      rt.abortController?.abort(new Error(`SWARM_INTERRUPTED:${reason}`))
+      if (rt.runPromise) {
+        activeWaits.push(
+          Promise.race([
+            rt.runPromise.catch(() => {}),
+            new Promise<void>((r) => setTimeout(r, waitMs).unref?.()),
+          ]),
+        )
+      }
+    }
+    await Promise.allSettled(activeWaits)
+
+    const releases: Promise<unknown>[] = []
+    for (const rt of state.workers.values()) {
+      activeMcpContexts.delete(rt.workerSessionKey)
+      if (this.executor && (abortedSet.has(rt.name) || rt.turnSeq > 0)) {
+        releases.push(this.executor.releaseWorkerSession(rt.workerSessionKey).catch(() => {}))
+      }
+    }
+    await Promise.allSettled(releases)
+
+    if (abortedWorkers.length > 0 || unblockedWaiters > 0) {
+      try {
+        await this.mutateRoster(state, (roster) => {
+          for (const [name, member] of Object.entries(roster.members)) {
+            if (name === 'coordinator' || member.killed) continue
+            if (abortedSet.has(name) || member.phase === 'RUNNING') {
+              member.phase = 'STOPPED'
+            }
+          }
+        })
+      } catch {
+        // Do not mask interrupt success if roster is unreadable/missing.
+      }
+    }
+
+    return {
+      interrupted: abortedWorkers.length > 0 || unblockedWaiters > 0,
+      abortedWorkers,
+      unblockedWaiters,
+    }
   }
 
   /**
@@ -908,7 +762,7 @@ export class RemoteSwarmRuntime {
     const res = await this.killMemberInternal(state, targetName, reason)
     const confirmed = !res.notFound && res.unconfirmed.length === 0
     if (!res.notFound && (res.killed.length > 0 || res.unconfirmed.length > 0)) {
-      this.appendBoardPost(state, {
+      await this.appendBoardPost(state, {
         agent: 'operator',
         channel: 'main',
         kind: 'control',
@@ -932,28 +786,31 @@ export class RemoteSwarmRuntime {
    * Trusted operator steer channel: appends an authenticated operator directive to `board.jsonl`
    * and wakes the targeted member(s) without letting untrusted posts trigger destructive actions.
    */
-  executeOperatorSteer(
+  async executeOperatorSteer(
     sessionKey: string,
     targetName: string,
     directive: string,
     channel = 'main',
-  ): BoardPostRecord {
+  ): Promise<BoardPostRecord> {
     const state = this.sessions.get(sessionKey.trim())
     if (!state) throw new Error('REMOTE_SWARM_SESSION_NOT_REGISTERED')
     const cleanTarget = targetName.trim().toLowerCase()
     if (!cleanTarget) throw new Error('SWARM_MEMBER_NAME_REQUIRED')
-    return this.appendBoardPost(state, {
+    const post = await this.appendBoardPost(state, {
       agent: 'operator',
       channel,
       kind: 'control',
       control: { kind: 'steer', target: cleanTarget },
       text: `@${cleanTarget} ${directive.trim()}`,
     })
+    return post!
   }
 
   /**
    * Trusted gateway stall-monitor channel: appends a deterministic zero-token
    * stall alert to `board.jsonl` and wakes the targeted waiting member or coordinator.
+   * Uses non-blocking lock acquire (ZERO busy-wait) so synchronous watcher callbacks
+   * never freeze the event loop or emit unhandled rejections.
    */
   postGatewayStallAlert(
     sessionKey: string,
@@ -963,25 +820,46 @@ export class RemoteSwarmRuntime {
     if (!state || state.shuttingDown) return null
     const cleanTarget = alert.target.trim().toLowerCase()
     if (!cleanTarget || cleanTarget === 'all') return null
-    const roster = this.ensureRoster(state)
+    const { roster } = readOrInitRosterStrict(state.location, {
+      model: state.model,
+      sessionKey: state.sessionKey,
+      workspaceCwd: state.workspaceCwd,
+    })
     const targetRec = roster.members[cleanTarget]
     if (cleanTarget !== 'coordinator' && (!targetRec || targetRec.killed)) return null
     const requestedCh = (alert.channel ?? 'main').trim() || 'main'
     const channel = roster.channels[requestedCh]?.archived ? 'main' : requestedCh
     const text = alert.message.trim()
     if (!text) return null
-    return this.appendBoardPost(state, {
-      agent: GATEWAY_STALL_MONITOR_AGENT,
-      channel,
-      kind: 'control',
-      control: {
-        kind: 'stall',
-        target: cleanTarget,
-        ...(alert.reason ? { reason: alert.reason } : {}),
-        ...(alert.attempt !== undefined ? { attempt: alert.attempt } : {}),
+
+    const { post, allPosts } = withSwarmFileLockNonBlocking(
+      state.location,
+      '.board.lock',
+      () => {
+        const existing = readBoardPostsFromDisk(state.location.swarmDir)
+        const headSeq = existing.reduce((max, p) => Math.max(max, p.seq), 0)
+        const next: BoardPostRecord = {
+          seq: headSeq + 1,
+          agent: GATEWAY_STALL_MONITOR_AGENT,
+          channel,
+          text,
+          time: formatBoardTimestamp(),
+          kind: 'control',
+          control: {
+            kind: 'stall',
+            target: cleanTarget,
+            ...(alert.reason ? { reason: alert.reason } : {}),
+            ...(alert.attempt !== undefined ? { attempt: alert.attempt } : {}),
+          },
+          request_id: randomUUID(),
+        }
+        appendBoardLineNoSymlink(state.location.swarmDir, `${JSON.stringify(next)}\n`)
+        return { post: next, allPosts: [...existing, next] }
       },
-      text,
-    })
+    )
+    state.boardSeqKnown = Math.max(state.boardSeqKnown, post.seq)
+    this.notifyAfterBoardPost(state, post, allPosts)
+    return post
   }
 
   /** Called when a trusted external API (e.g. `swarmCommand.ts`) appended to `board.jsonl`. */
@@ -992,19 +870,41 @@ export class RemoteSwarmRuntime {
     const fresh = posts.filter((p) => p.seq > state.boardSeqKnown)
     for (const post of fresh) {
       state.boardSeqKnown = Math.max(state.boardSeqKnown, post.seq)
-      this.notifyAfterBoardPost(state, post)
+      this.notifyAfterBoardPost(state, post, posts)
     }
   }
 
-  private notifyAfterBoardPost(state: SwarmSessionState, post: BoardPostRecord): void {
+  private notifyAfterBoardPost(
+    state: SwarmSessionState,
+    post: BoardPostRecord,
+    preloadedPosts?: BoardPostRecord[],
+    expectedGeneration?: number,
+  ): void {
     // Ordinary board messages NEVER parse or execute kill directives (BLOCKER 4).
     // Destructive kills go exclusively through `swarm{action:"kill"}` (ownership-checked)
     // or trusted `executeOperatorKill(...)`.
-    const roster = this.ensureRoster(state)
+    let roster: RosterFile | null = null
+    try {
+      roster = readRosterStrict(state.location, {
+        defaultModel: state.model,
+        sessionKey: state.sessionKey,
+        workspaceCwd: state.workspaceCwd,
+      })
+    } catch {
+      return
+    }
+    if (!roster) return
+
     const trustedStallTarget = trustedStallAlertTarget(post)
     const mentions = trustedStallTarget ? [trustedStallTarget] : extractSwarmMentions(post.text)
 
-    // 1. Wake matching swarm_wait waiters
+    // 1. Wake matching swarm_wait waiters — reuse preloadedPosts / read disk at most ONCE (P1-4).
+    let cachedAllPosts: BoardPostRecord[] | null = preloadedPosts ?? null
+    let cachedHeadSeq: number | null =
+      preloadedPosts !== undefined
+        ? preloadedPosts.reduce((m, p) => Math.max(m, p.seq), post.seq)
+        : null
+
     for (const waiter of [...state.waiters]) {
       if (post.seq <= waiter.since) continue
       if (post.agent.toLowerCase() === waiter.memberName.toLowerCase()) continue
@@ -1017,28 +917,55 @@ export class RemoteSwarmRuntime {
         memberChannels.includes(post.channel)
       const mentioned = trustedStallTarget
         ? waiter.memberName.toLowerCase() === trustedStallTarget
-        : mentions.some((m) => memberMatchesMention(waiter.memberName, m, memberChannels, post.channel))
-      if (trustedStallTarget ? mentioned : !waiter.mentionsOnly ? inChannel || mentioned : mentioned) {
+        : mentions.some((m) =>
+            memberMatchesMention(waiter.memberName, m, memberChannels, post.channel),
+          )
+      if (
+        trustedStallTarget
+          ? mentioned
+          : !waiter.mentionsOnly
+            ? inChannel || mentioned
+            : mentioned
+      ) {
         state.waiters.delete(waiter)
         clearTimeout(waiter.timer)
-        const allPosts = readBoardPostsFromDisk(state.location.swarmDir)
-        const delta = allPosts.filter((p) => p.seq > waiter.since)
+        let delta: BoardPostRecord[]
+        let headSeq: number
+        if (waiter.since === post.seq - 1 && !cachedAllPosts) {
+          delta = [post]
+          headSeq = Math.max(state.boardSeqKnown, post.seq)
+        } else {
+          if (cachedAllPosts === null) {
+            cachedAllPosts = readBoardPostsFromDisk(state.location.swarmDir)
+          }
+          if (cachedHeadSeq === null) {
+            cachedHeadSeq = cachedAllPosts.reduce((m, p) => Math.max(m, p.seq), post.seq)
+          }
+          delta = cachedAllPosts.filter((p) => p.seq > waiter.since)
+          headSeq = cachedHeadSeq
+        }
         waiter.resolve({
           woke: true,
           posts: delta,
-          headSeq: allPosts.reduce((m, p) => Math.max(m, p.seq), 0),
+          headSeq,
           reason: 'new_post',
         })
       }
     }
 
     // 2. Wake matching non-killed workers
+    if (
+      expectedGeneration !== undefined &&
+      (state.shuttingDown || state.interruptGeneration !== expectedGeneration)
+    ) {
+      return
+    }
     for (const [name, member] of Object.entries(roster.members)) {
       if (name === 'coordinator' || member.killed) continue
       if (name.toLowerCase() === post.agent.toLowerCase()) continue
       if (trustedStallTarget) {
         if (name.toLowerCase() === trustedStallTarget) {
-          this.scheduleWorkerRun(state, name)
+          this.scheduleWorkerRun(state, name, expectedGeneration)
         }
         continue
       }
@@ -1049,13 +976,16 @@ export class RemoteSwarmRuntime {
         member.wake_mode === 'all' &&
         (post.channel === 'main' || (member.channels ?? ['main']).includes(post.channel))
       if (mentioned || channelMatch) {
-        this.scheduleWorkerRun(state, name)
+        this.scheduleWorkerRun(state, name, expectedGeneration)
       }
     }
   }
 
   /** Runtime-wide concurrency semaphore shared across ALL coordinator sessions (IMPORTANT 5). */
-  private async acquireWorkerSlot(state: SwarmSessionState, signal: AbortSignal): Promise<boolean> {
+  private async acquireWorkerSlot(
+    state: SwarmSessionState,
+    signal: AbortSignal,
+  ): Promise<boolean> {
     if (signal.aborted || state.shuttingDown) return false
     if (this.activeWorkerSlots < this.maxParallelWorkers) {
       this.activeWorkerSlots += 1
@@ -1089,8 +1019,41 @@ export class RemoteSwarmRuntime {
     }
   }
 
-  private scheduleWorkerRun(state: SwarmSessionState, workerName: string): void {
+  private handleBackgroundWorkerFatal(
+    state: SwarmSessionState,
+    rt: WorkerRuntimeState,
+    err: unknown,
+  ): void {
+    const msg = err instanceof Error ? err.message : String(err)
+    if (rt.lastKnownConvId) {
+      rt.stepCounter += 1
+      this.appendTranscriptStep(state, rt.lastKnownConvId, rt.stepCounter, {
+        type: 'ERROR',
+        status: 'ERROR',
+        error: msg,
+      })
+    }
+    // Wake waiting coordinators on this session so a background roster/IO fault never hangs them.
+    for (const waiter of [...state.waiters]) {
+      if (waiter.memberName !== 'coordinator') continue
+      state.waiters.delete(waiter)
+      clearTimeout(waiter.timer)
+      waiter.resolve({
+        woke: false,
+        posts: [],
+        headSeq: state.boardSeqKnown,
+        reason: `worker_error:${rt.name}`,
+      })
+    }
+  }
+
+  private scheduleWorkerRun(
+    state: SwarmSessionState,
+    workerName: string,
+    expectedGeneration?: number,
+  ): void {
     if (state.shuttingDown || !this.executor) return
+    if (expectedGeneration !== undefined && state.interruptGeneration !== expectedGeneration) return
     let rt = state.workers.get(workerName)
     if (!rt) {
       const cleanName = workerName.replace(/[^a-zA-Z0-9_-]/g, '_')
@@ -1106,6 +1069,7 @@ export class RemoteSwarmRuntime {
         turnSeq: 0,
         running: false,
         pendingWake: false,
+        runGeneration: state.interruptGeneration,
         abortController: null,
         runPromise: null,
         stepCounter: 0,
@@ -1116,20 +1080,46 @@ export class RemoteSwarmRuntime {
       rt.pendingWake = true
       return
     }
+    // B4: Bind cancelable generation & AbortController synchronously BEFORE any await.
+    const myGeneration = state.interruptGeneration
+    const runAc = new AbortController()
     rt.running = true
     rt.pendingWake = false
-    const run = this.runWorkerLoop(state, rt).finally(() => {
-      if (rt && rt.runPromise === run) rt.runPromise = null
-    })
+    rt.runGeneration = myGeneration
+    rt.abortController = runAc
+    // B8: Catch all background rejections at the scheduling boundary so a roster/IO fault
+    // NEVER escapes as an unhandledRejection and crashes the Gateway process.
+    const run = this.runWorkerLoop(state, rt, myGeneration, runAc)
+      .catch((err) => {
+        this.handleBackgroundWorkerFatal(state, rt, err)
+      })
+      .finally(() => {
+        if (rt && rt.runPromise === run) rt.runPromise = null
+      })
     rt.runPromise = run
   }
 
-  private async runWorkerLoop(state: SwarmSessionState, rt: WorkerRuntimeState): Promise<void> {
+  private async runWorkerLoop(
+    state: SwarmSessionState,
+    rt: WorkerRuntimeState,
+    myGeneration: number,
+    runAc: AbortController,
+  ): Promise<void> {
+    let lastInterrupted = false
+    const isCancelled = (): boolean => {
+      if (state.interruptGeneration !== myGeneration || isAbortInterruptReason(runAc.signal)) {
+        lastInterrupted = true
+        return true
+      }
+      return state.shuttingDown || runAc.signal.aborted
+    }
     try {
-      while (!state.shuttingDown) {
-        const roster = this.ensureRoster(state)
+      while (!isCancelled()) {
+        const roster = await this.readRoster(state)
+        if (isCancelled()) return
         const member = roster.members[rt.name]
         if (!member || member.killed) return
+        rt.lastKnownConvId = member.conversation_id
 
         const allPosts = readBoardPostsFromDisk(state.location.swarmDir)
         const unread = allPosts.filter((p) => p.seq > (member.last_read_seq ?? 0))
@@ -1144,7 +1134,9 @@ export class RemoteSwarmRuntime {
           }
           const mentions = extractSwarmMentions(p.text)
           return (
-            mentions.some((m) => memberMatchesMention(rt.name, m, member.channels ?? ['main'], p.channel)) ||
+            mentions.some((m) =>
+              memberMatchesMention(rt.name, m, member.channels ?? ['main'], p.channel),
+            ) ||
             (member.wake_mode === 'all' &&
               (p.channel === 'main' || (member.channels ?? ['main']).includes(p.channel)))
           )
@@ -1153,16 +1145,20 @@ export class RemoteSwarmRuntime {
         // newer messages that arrive while `runWorkerTurn` is executing — IMPORTANT 3).
         const consumedSeq = unread.reduce((m, p) => Math.max(m, p.seq), member.last_read_seq ?? 0)
         if (relevant.length === 0) {
-          member.last_read_seq = Math.max(member.last_read_seq ?? 0, consumedSeq)
-          this.saveRoster(state, roster)
+          if (isCancelled()) return
+          await this.mutateRoster(state, (r) => {
+            const m = r.members[rt.name]
+            if (m && !m.killed) {
+              m.last_read_seq = Math.max(m.last_read_seq ?? 0, consumedSeq)
+            }
+          })
           return
         }
 
-        const ac = new AbortController()
-        rt.abortController = ac
-        const gotSlot = await this.acquireWorkerSlot(state, ac.signal)
-        if (!gotSlot) {
-          rt.abortController = null
+        if (isCancelled()) return
+        const gotSlot = await this.acquireWorkerSlot(state, runAc.signal)
+        if (!gotSlot || isCancelled()) {
+          if (gotSlot) this.releaseWorkerSlot()
           return
         }
 
@@ -1179,20 +1175,27 @@ export class RemoteSwarmRuntime {
           callerToken: workerCallerToken,
         })
 
+        let activeMemberConvId: string | null = member.conversation_id
         try {
-          const freshRoster = this.ensureRoster(state)
-          const freshMember = freshRoster.members[rt.name]
-          if (!freshMember || freshMember.killed) return
-          if (
-            freshMember.workspace?.path &&
-            freshMember.workspace.mode !== 'inherit' &&
-            !existsSync(freshMember.workspace.path)
-          ) {
-            throw new Error(`SWARM_WORKTREE_MISSING:${freshMember.workspace.path}`)
-          }
-          freshMember.phase = 'RUNNING'
-          freshMember.last_read_seq = Math.max(freshMember.last_read_seq ?? 0, consumedSeq)
-          this.saveRoster(state, freshRoster)
+          const freshMember = await this.mutateRoster(state, (freshRoster) => {
+            if (isCancelled()) return null
+            const m = freshRoster.members[rt.name]
+            if (!m || m.killed) return null
+            if (
+              m.workspace?.path &&
+              m.workspace.mode !== 'inherit' &&
+              !existsSync(m.workspace.path)
+            ) {
+              throw new Error(`SWARM_WORKTREE_MISSING:${m.workspace.path}`)
+            }
+            m.phase = 'RUNNING'
+            m.last_read_seq = Math.max(m.last_read_seq ?? 0, consumedSeq)
+            return { ...m, channels: [...(m.channels ?? ['main'])] }
+          })
+          if (!freshMember || isCancelled()) return
+          activeMemberConvId = freshMember.conversation_id
+          rt.lastKnownConvId = freshMember.conversation_id
+
           // Mark a new USER_INPUT turn boundary in transcript.jsonl so an ERROR
           // from a previous failed attempt cannot bleed into this healthy retry.
           rt.stepCounter += 1
@@ -1221,6 +1224,8 @@ export class RemoteSwarmRuntime {
           ].join('\n')
 
           const targetCwd = freshMember.workspace?.path || state.workspaceCwd
+          if (isCancelled()) return
+          let emittedErrorThisTurn = false
           const result = await this.executor!.runWorkerTurn({
             coordinatorSessionKey: state.sessionKey,
             workerSessionKey: turnSessionKey,
@@ -1235,21 +1240,39 @@ export class RemoteSwarmRuntime {
             effort: state.effort,
             workspaceCwd: targetCwd,
             prompt: workerPrompt,
-            signal: ac.signal,
+            signal: runAc.signal,
             onTelemetry: (ev) => {
+              if (ev.type === 'ERROR' || ev.status === 'ERROR') {
+                emittedErrorThisTurn = true
+              }
               rt.stepCounter += 1
               this.appendTranscriptStep(state, freshMember.conversation_id, rt.stepCounter, ev)
             },
           })
+
+          // P1-3: Any returned `result.error` (including early-return failures before submit)
+          // MUST write an ERROR transcript step so SwarmBoard & SwarmStallMonitor(member_failed)
+          // observe it reliably.
+          if (result.error && !emittedErrorThisTurn && !isCancelled()) {
+            rt.stepCounter += 1
+            this.appendTranscriptStep(state, freshMember.conversation_id, rt.stepCounter, {
+              type: 'ERROR',
+              status: 'ERROR',
+              error: result.error,
+            })
+          }
+
+          if (isCancelled()) return
 
           // Check if worker posted on the board during its turn; if not, post its summary/error so coordinator is never stuck.
           const afterPosts = readBoardPostsFromDisk(state.location.swarmDir)
           const ownPostsDuringTurn = afterPosts.filter(
             (p) => p.seq > consumedSeq && p.agent.toLowerCase() === rt.name.toLowerCase(),
           )
-          const latestRoster = this.ensureRoster(state)
+          const latestRoster = await this.readRoster(state)
+          if (isCancelled()) return
           const latestMember = latestRoster.members[rt.name]
-          if (latestMember && !latestMember.killed && !ac.signal.aborted) {
+          if (latestMember && !latestMember.killed && !isCancelled()) {
             let postedFallbackSeq = 0
             if (ownPostsDuringTurn.length === 0) {
               const fallbackText = result.error
@@ -1257,58 +1280,82 @@ export class RemoteSwarmRuntime {
                 : result.text.trim()
                   ? `@coordinator ${result.text.trim().slice(0, 6000)}`
                   : '@coordinator 已完成本轮执行（无额外文本输出）。'
-              const posted = this.appendBoardPost(state, {
+              const preferredChannel =
+                (latestMember.channels ?? ['main']).find(
+                  (c) => c !== 'main' && latestRoster.channels[c] && !latestRoster.channels[c]?.archived,
+                ) ?? 'main'
+              const posted = await this.appendBoardPost(state, {
                 agent: rt.name,
-                channel: (latestMember.channels ?? ['main']).find((c) => c !== 'main') ?? 'main',
+                channel: preferredChannel,
                 text: fallbackText,
+                expectedGeneration: myGeneration,
               })
+              if (!posted) return
               postedFallbackSeq = posted.seq
             }
             // Only advance `last_read_seq` to `consumedSeq` (NOT whole-board headSeq!),
             // so any directed message from another member that arrived mid-turn remains
             // unread and is delivered on the next loop iteration (IMPORTANT 3).
-            const refreshedRoster = this.ensureRoster(state)
-            const refreshedMember = refreshedRoster.members[rt.name]
-            if (refreshedMember && !refreshedMember.killed) {
-              refreshedMember.phase = 'WAITING'
-              refreshedMember.wait_since = Math.max(
-                consumedSeq,
-                postedFallbackSeq,
-                ...ownPostsDuringTurn.map((p) => p.seq),
-              )
-              refreshedMember.last_read_seq = Math.max(refreshedMember.last_read_seq ?? 0, consumedSeq)
-              this.saveRoster(state, refreshedRoster)
-            }
+            await this.mutateRoster(state, (refreshedRoster) => {
+              const refreshedMember = refreshedRoster.members[rt.name]
+              if (refreshedMember && !refreshedMember.killed) {
+                refreshedMember.phase = isCancelled() ? 'STOPPED' : 'WAITING'
+                refreshedMember.wait_since = Math.max(
+                  consumedSeq,
+                  postedFallbackSeq,
+                  ...ownPostsDuringTurn.map((p) => p.seq),
+                )
+                refreshedMember.last_read_seq = Math.max(
+                  refreshedMember.last_read_seq ?? 0,
+                  consumedSeq,
+                )
+              }
+            })
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
-          rt.stepCounter += 1
-          const errRoster = this.ensureRoster(state)
-          const errMember = errRoster.members[rt.name]
-          if (errMember) {
-            this.appendTranscriptStep(state, errMember.conversation_id, rt.stepCounter, {
-              type: 'ERROR',
-              status: 'ERROR',
-              error: msg,
+          if (isCancelled()) return
+          try {
+            let convId = activeMemberConvId
+            let shouldPostFallback = false
+            await this.mutateRoster(state, (errRoster) => {
+              const errMember = errRoster.members[rt.name]
+              if (!errMember) return
+              convId = errMember.conversation_id
+              if (!errMember.killed && !isCancelled()) {
+                errMember.phase = 'WAITING'
+                shouldPostFallback = true
+              }
             })
-            if (!errMember.killed && !ac.signal.aborted && !state.shuttingDown) {
-              errMember.phase = 'WAITING'
-              this.saveRoster(state, errRoster)
-              this.appendBoardPost(state, {
+            if (convId) {
+              rt.stepCounter += 1
+              this.appendTranscriptStep(state, convId, rt.stepCounter, {
+                type: 'ERROR',
+                status: 'ERROR',
+                error: msg,
+              })
+            }
+            if (shouldPostFallback && !isCancelled()) {
+              await this.appendBoardPost(state, {
                 agent: rt.name,
                 channel: 'main',
                 text: `@coordinator [worker-error] ${msg.slice(0, 500)}`,
+                expectedGeneration: myGeneration,
               })
             }
+          } catch {
+            // Best-effort error reporting if roster itself is corrupt/unavailable.
           }
         } finally {
           activeMcpContexts.delete(turnSessionKey)
-          rt.abortController = null
           this.releaseWorkerSlot()
         }
 
+        if (isCancelled()) break
+
         // Re-check unread messages in case a new directed post arrived during the turn.
-        const postTurnRoster = this.ensureRoster(state)
+        const postTurnRoster = await this.readRoster(state)
+        if (isCancelled()) break
         const postTurnMember = postTurnRoster.members[rt.name]
         const hasMoreUnread =
           Boolean(postTurnMember && !postTurnMember.killed) &&
@@ -1319,26 +1366,48 @@ export class RemoteSwarmRuntime {
           )
         if (!rt.pendingWake && !hasMoreUnread) break
       }
+    } catch (err) {
+      // B8: Catch loop-level readRoster / board IO / lock timeout failures without crashing Gateway.
+      if (!isCancelled()) {
+        this.handleBackgroundWorkerFatal(state, rt, err)
+      }
     } finally {
       rt.running = false
+      if (rt.abortController === runAc) {
+        rt.abortController = null
+      }
       try {
-        const settleRoster = this.ensureRoster(state)
-        const settleMember = settleRoster.members[rt.name]
-        if (settleMember && !settleMember.killed && settleMember.phase === 'RUNNING') {
-          settleMember.phase = 'WAITING'
-          this.saveRoster(state, settleRoster)
-        }
+        await this.mutateRoster(state, (settleRoster) => {
+          const settleMember = settleRoster.members[rt.name]
+          if (settleMember && !settleMember.killed && settleMember.phase === 'RUNNING') {
+            settleMember.phase = lastInterrupted ? 'STOPPED' : 'WAITING'
+          }
+        })
       } catch {
         /* ignore settle error during teardown */
       }
       this.checkIdleWaiters(state)
+      // If a brand-new post arrived AFTER an interrupt while this stale generation was still exiting,
+      // re-schedule cleanly on the current generation.
+      if (
+        !state.shuttingDown &&
+        rt.pendingWake &&
+        state.interruptGeneration !== myGeneration
+      ) {
+        this.scheduleWorkerRun(state, rt.name)
+      }
     }
   }
 
   private checkIdleWaiters(state: SwarmSessionState): void {
     const anyRunning = [...state.workers.values()].some((w) => w.running)
     if (anyRunning) return
-    const allPosts = readBoardPostsFromDisk(state.location.swarmDir)
+    let allPosts: BoardPostRecord[]
+    try {
+      allPosts = readBoardPostsFromDisk(state.location.swarmDir)
+    } catch {
+      return
+    }
     const headSeq = allPosts.reduce((m, p) => Math.max(m, p.seq), 0)
     for (const waiter of [...state.waiters]) {
       if (waiter.memberName !== 'coordinator') continue
@@ -1351,11 +1420,21 @@ export class RemoteSwarmRuntime {
     }
   }
 
+  /**
+   * Three-phase lock-safe kill (P0-3 + P2-3):
+   *   1. Under `mutateRoster`: resolve prefix-matched members, enforce per-member `added_by`
+   *      authorization BEFORE mutating anything, mark `killed = true / phase = 'KILLED'`, and
+   *      release `.roster.lock` before any `await`.
+   *   2. Outside any lock: abort workers, revoke tokens, await exit + lane release, remove clean
+   *      worktrees while preserving dirty/unmerged worktrees.
+   *   3. Under `mutateRoster`: re-read latest `members.json` and confirm terminal state without
+   *      clobbering concurrent `add`/`channel`/`title`/`last_read_seq` updates.
+   */
   private async killMemberInternal(
     state: SwarmSessionState,
     targetName: string,
     _reason: string,
-    opts?: { forceDirtyWorktree?: boolean; stopWaitTimeoutMs?: number },
+    opts?: { forceDirtyWorktree?: boolean; stopWaitTimeoutMs?: number; caller?: string },
   ): Promise<{
     killed: string[]
     unconfirmed: string[]
@@ -1363,32 +1442,69 @@ export class RemoteSwarmRuntime {
     notFound: boolean
     preservedDirtyWorktrees: string[]
   }> {
-    const roster = this.ensureRoster(state)
     const lower = targetName.toLowerCase()
-    const matchedNames = Object.keys(roster.members).filter((name) => {
-      const n = name.toLowerCase()
-      if (n === 'coordinator') return false
-      return n === lower || (n.startsWith(`${lower}-`) && /^\d+$/.test(n.slice(lower.length + 1)))
+    const caller = opts?.caller?.trim().toLowerCase()
+
+    // Phase 1: atomic authorization + mark KILLED under `.roster.lock` (no `await` inside).
+    const phase1 = await this.mutateRoster(state, (roster) => {
+      if (caller && caller !== 'coordinator' && lower === 'coordinator') {
+        throw new Error('SWARM_KILL_FORBIDDEN')
+      }
+      const matchedNames = Object.keys(roster.members).filter((name) => {
+        const n = name.toLowerCase()
+        if (n === 'coordinator') return false
+        return n === lower || (n.startsWith(`${lower}-`) && /^\d+$/.test(n.slice(lower.length + 1)))
+      })
+      if (matchedNames.length === 0) {
+        return {
+          notFound: true as const,
+          alreadyKilled: [] as string[],
+          toKill: [] as Array<{ name: string; workspace?: RosterMemberRecord['workspace'] }>,
+        }
+      }
+      if (caller && caller !== 'coordinator') {
+        for (const name of matchedNames) {
+          if (roster.members[name]?.added_by?.toLowerCase() !== caller) {
+            throw new Error('SWARM_KILL_FORBIDDEN')
+          }
+        }
+      }
+      const alreadyKilled: string[] = []
+      const toKill: Array<{ name: string; workspace?: RosterMemberRecord['workspace'] }> = []
+      for (const name of matchedNames) {
+        const rec = roster.members[name]!
+        if (rec.killed) {
+          alreadyKilled.push(name)
+          continue
+        }
+        rec.killed = true
+        rec.phase = 'KILLED'
+        toKill.push({
+          name,
+          workspace: rec.workspace ? { ...rec.workspace } : undefined,
+        })
+      }
+      return { notFound: false as const, alreadyKilled, toKill }
     })
-    if (matchedNames.length === 0) {
-      return { killed: [], unconfirmed: [], alreadyKilled: [], notFound: true, preservedDirtyWorktrees: [] }
+
+    if (phase1.notFound) {
+      return {
+        killed: [],
+        unconfirmed: [],
+        alreadyKilled: [],
+        notFound: true,
+        preservedDirtyWorktrees: [],
+      }
     }
+
+    // Phase 2: stop running workers, release remote lanes, clean clean worktrees (NO lock held).
     const killed: string[] = []
     const unconfirmed: string[] = []
-    const alreadyKilled: string[] = []
     const preservedDirtyWorktrees: string[] = []
     const waitMs = Math.max(50, opts?.stopWaitTimeoutMs ?? 5_000)
 
-    for (const name of matchedNames) {
-      const rec = roster.members[name]!
-      if (rec.killed) {
-        alreadyKilled.push(name)
-        continue
-      }
-      rec.killed = true
-      rec.phase = 'KILLED'
-      // Persist killed=true and revoke active MCP token immediately so concurrent wakes/calls fail closed.
-      this.saveRoster(state, roster)
+    for (const item of phase1.toKill) {
+      const { name, workspace } = item
       const rt = state.workers.get(name)
       let stopConfirmed = true
       if (rt) {
@@ -1423,8 +1539,8 @@ export class RemoteSwarmRuntime {
         unconfirmed.push(name)
         continue
       }
-      if (rec.workspace?.path && rec.workspace.mode !== 'inherit') {
-        const wtRes = removeWorkerGitWorktree(state.workspaceCwd, rec.workspace.path, {
+      if (workspace?.path && workspace.mode !== 'inherit') {
+        const wtRes = removeWorkerGitWorktree(state.workspaceCwd, workspace.path, {
           forceDirty: opts?.forceDirtyWorktree,
         })
         if (wtRes.preservedDirtyPath) {
@@ -1433,8 +1549,28 @@ export class RemoteSwarmRuntime {
       }
       killed.push(name)
     }
-    this.saveRoster(state, roster)
-    return { killed, unconfirmed, alreadyKilled, notFound: false, preservedDirtyWorktrees }
+
+    // Phase 3: re-read latest roster under `.roster.lock` and seal terminal state
+    // without overwriting any concurrent add/channel/title/last_read_seq mutations.
+    if (killed.length > 0 || unconfirmed.length > 0) {
+      await this.mutateRoster(state, (latestRoster) => {
+        for (const name of [...killed, ...unconfirmed]) {
+          const rec = latestRoster.members[name]
+          if (rec) {
+            rec.killed = true
+            rec.phase = 'KILLED'
+          }
+        }
+      })
+    }
+
+    return {
+      killed,
+      unconfirmed,
+      alreadyKilled: phase1.alreadyKilled,
+      notFound: false,
+      preservedDirtyWorktrees,
+    }
   }
 
   /** Execute one of the 4 Swarm MCP tools (`swarm`, `post_message`, `read_board`, `swarm_wait`). */
@@ -1451,123 +1587,42 @@ export class RemoteSwarmRuntime {
     }
     const caller = (input.callerMember || 'coordinator').trim() || 'coordinator'
 
+    // P1-3: Record coordinator swarm tool invocations in coordinator's transcript.jsonl.
+    if (caller === 'coordinator') {
+      this.recordCoordinatorTelemetry(state.sessionKey, {
+        type: 'TOOL_CALL',
+        status: 'ACTIVE',
+        toolName: input.tool,
+        toolArgs: input.args,
+      })
+    }
+
+    const toolHost: RemoteSwarmToolHost = {
+      location: state.location,
+      model: state.model,
+      workspaceCwd: state.workspaceCwd,
+      isWorkerRunning: (name) => Boolean(state.workers.get(name)?.running),
+      getInterruptGeneration: () => state.interruptGeneration,
+      isSessionStopped: (expectedGen) =>
+        state.shuttingDown || state.interruptGeneration !== expectedGen,
+      readRoster: () => this.readRoster(state),
+      mutateRoster: (fn) => this.mutateRoster(state, fn),
+      appendBoardPost: (postInput) => this.appendBoardPost(state, postInput),
+    }
+
     if (input.tool === 'post_message') {
-      const rawText = typeof input.args.text === 'string' ? input.args.text.trim() : ''
-      if (!rawText) throw new Error('SWARM_POST_EMPTY')
-      const gatedPost =
-        rawText.length > MAX_SWARM_POST_CHARS
-          ? offloadPayloadIfOversized({
-              workspaceDir: state.location.swarmDir,
-              sessionId: state.location.swarmId,
-              category: `swarm-post-${caller}`,
-              label: `swarm:${caller}`,
-              content: rawText,
-              inlineMaxChars: MAX_SWARM_POST_CHARS,
-            })
-          : null
-      const text = gatedPost ? gatedPost.text : rawText
-      const roster = this.ensureRoster(state)
-      const requestedCh = typeof input.args.channel === 'string' ? input.args.channel.trim() : ''
-      const defaultCh =
-        caller === 'coordinator'
-          ? 'main'
-          : (roster.members[caller]?.channels ?? ['main']).find((c) => c !== 'main') ?? 'main'
-      const channel = requestedCh || defaultCh
-      if (channel !== 'main' && roster.channels[channel]?.archived) {
-        throw new Error(`SWARM_CHANNEL_ARCHIVED:${channel}`)
-      }
-      const post = this.appendBoardPost(state, { agent: caller, channel, text })
-      return {
-        ok: true,
-        seq: post.seq,
-        channel: post.channel,
-        time: post.time,
-        ...(gatedPost?.offloaded
-          ? {
-              truncated: true,
-              warning: `Post exceeded ${MAX_SWARM_POST_CHARS} chars and was offloaded to disk.`,
-              ...(gatedPost.artifactPath ? { artifact_path: gatedPost.artifactPath } : {}),
-            }
-          : {}),
-      }
+      return executePostMessageTool(toolHost, caller, input.args)
     }
 
     if (input.tool === 'read_board') {
-      const since =
-        typeof input.args.since === 'number' && Number.isFinite(input.args.since) && input.args.since >= 0
-          ? Math.floor(input.args.since)
-          : 0
-      const rawLimit =
-        typeof input.args.limit === 'number' && Number.isFinite(input.args.limit)
-          ? Math.floor(input.args.limit)
-          : DEFAULT_READ_BOARD_LIMIT
-      const limit = Math.max(1, Math.min(MAX_READ_BOARD_LIMIT, rawLimit))
-      const rawMaxBytes =
-        typeof input.args.maxBytes === 'number' && Number.isFinite(input.args.maxBytes)
-          ? Math.floor(input.args.maxBytes)
-          : typeof input.args.max_bytes === 'number' && Number.isFinite(input.args.max_bytes)
-            ? Math.floor(input.args.max_bytes)
-            : DEFAULT_READ_BOARD_MAX_BYTES
-      const maxBytes = Math.max(1_024, Math.min(MAX_READ_BOARD_MAX_BYTES, rawMaxBytes))
-      const channelFilter = typeof input.args.channel === 'string' ? input.args.channel.trim() : ''
-      const roster = this.ensureRoster(state)
-      const memberChannels = roster.members[caller]?.channels ?? ['main']
-      const allPosts = readBoardPostsFromDisk(state.location.swarmDir)
-      const filtered = allPosts.filter((p) => {
-        if (p.seq <= since) return false
-        if (channelFilter === '*') return true
-        if (channelFilter) return p.channel === channelFilter
-        if (caller === 'coordinator') return true
-        return p.channel === 'main' || memberChannels.includes(p.channel)
-      })
-      const countTruncated = filtered.length > limit
-      const countBounded = countTruncated ? filtered.slice(filtered.length - limit) : filtered
-      // Apply UTF-8 byte budget from newest backwards, keeping complete messages without splitting UTF-8.
-      const byteBounded: typeof countBounded = []
-      let usedBytes = 0
-      let byteBudgetHit = false
-      for (let i = countBounded.length - 1; i >= 0; i -= 1) {
-        const post = countBounded[i]!
-        const postBytes = Buffer.byteLength(JSON.stringify(post), 'utf8')
-        if (byteBounded.length > 0 && usedBytes + postBytes > maxBytes) {
-          byteBudgetHit = true
-          break
-        }
-        if (byteBounded.length === 0 && postBytes > maxBytes) {
-          const textBudget = Math.max(256, maxBytes - 256)
-          const clipped = truncateUtf8Safe(post.text, textBudget)
-          byteBounded.unshift({
-            ...post,
-            text: clipped.truncated ? `${clipped.text}… [truncated to fit read_board maxBytes=${maxBytes}]` : clipped.text,
-          })
-          usedBytes += maxBytes
-          byteBudgetHit = true
-          break
-        }
-        byteBounded.unshift(post)
-        usedBytes += postBytes
-      }
-      const truncated = countTruncated || byteBudgetHit
-      const headSeq = allPosts.reduce((m, p) => Math.max(m, p.seq), 0)
-      const readCursor = byteBounded.reduce((m, p) => Math.max(m, p.seq), since)
-      if (roster.members[caller]) {
-        roster.members[caller]!.last_read_seq = Math.max(roster.members[caller]!.last_read_seq ?? 0, readCursor)
-        this.saveRoster(state, roster)
-      }
-      return {
-        ok: true,
-        head_seq: headSeq,
-        truncated,
-        byte_budget_hit: byteBudgetHit,
-        max_bytes: maxBytes,
-        total_matching: filtered.length,
-        posts: byteBounded,
-      }
+      return executeReadBoardTool(toolHost, caller, input.args)
     }
 
     if (input.tool === 'swarm_wait') {
       const since =
-        typeof input.args.since === 'number' && Number.isFinite(input.args.since) && input.args.since >= 0
+        typeof input.args.since === 'number' &&
+        Number.isFinite(input.args.since) &&
+        input.args.since >= 0
           ? Math.floor(input.args.since)
           : 0
       const mentionsOnly = input.args.mentions_only !== false
@@ -1575,134 +1630,206 @@ export class RemoteSwarmRuntime {
       const rawTimeout =
         typeof input.args.timeout_ms === 'number' && Number.isFinite(input.args.timeout_ms)
           ? Math.floor(input.args.timeout_ms)
-          : typeof input.args.timeout_seconds === 'number' && Number.isFinite(input.args.timeout_seconds)
+          : typeof input.args.timeout_seconds === 'number' &&
+              Number.isFinite(input.args.timeout_seconds)
             ? Math.floor(input.args.timeout_seconds * 1_000)
             : DEFAULT_WAIT_TIMEOUT_MS
       const timeoutMs = Math.max(1_000, Math.min(MAX_WAIT_TIMEOUT_MS, rawTimeout))
 
-      const roster = this.ensureRoster(state)
+      const matchWaitPosts = (posts: BoardPostRecord[]): BoardPostRecord[] =>
+        posts.filter((p) => {
+          if (p.seq <= since) return false
+          if (p.agent.toLowerCase() === caller.toLowerCase()) return false
+          if (channel && channel !== '*' && p.channel !== channel) return false
+          const stallTarget = trustedStallAlertTarget(p)
+          if (stallTarget !== null) {
+            return stallTarget === caller.toLowerCase()
+          }
+          const mentions = extractSwarmMentions(p.text)
+          const mentioned = mentions.some((m) =>
+            memberMatchesMention(caller, m, memberChannels, p.channel),
+          )
+          const inChannel =
+            caller === 'coordinator' || p.channel === 'main' || memberChannels.includes(p.channel)
+          return mentionsOnly ? mentioned : inChannel || mentioned
+        })
+
+      const roster = await this.readRoster(state)
       const memberChannels = roster.members[caller]?.channels ?? ['main']
       const existing = readBoardPostsFromDisk(state.location.swarmDir)
       const headSeq = existing.reduce((m, p) => Math.max(m, p.seq), 0)
-      const alreadyMatching = existing.filter((p) => {
-        if (p.seq <= since) return false
-        if (p.agent.toLowerCase() === caller.toLowerCase()) return false
-        if (channel && channel !== '*' && p.channel !== channel) return false
-        const stallTarget = trustedStallAlertTarget(p)
-        if (stallTarget !== null) {
-          return stallTarget === caller.toLowerCase()
-        }
-        const mentions = extractSwarmMentions(p.text)
-        const mentioned = mentions.some((m) => memberMatchesMention(caller, m, memberChannels, p.channel))
-        const inChannel = caller === 'coordinator' || p.channel === 'main' || memberChannels.includes(p.channel)
-        return mentionsOnly ? mentioned : inChannel || mentioned
-      })
+      const alreadyMatching = matchWaitPosts(existing)
       if (alreadyMatching.length > 0) {
-        return { ok: true, woke: true, head_seq: headSeq, posts: alreadyMatching, reason: 'already_available' }
+        return {
+          ok: true,
+          woke: true,
+          head_seq: headSeq,
+          posts: alreadyMatching,
+          reason: 'already_available',
+        }
       }
 
       const anyRunning = [...state.workers.values()].some((w) => w.running)
       if (!anyRunning && caller === 'coordinator') {
         const delta = existing.filter((p) => p.seq > since)
-        return { ok: true, woke: false, head_seq: headSeq, posts: delta, reason: 'no_working_members' }
+        return {
+          ok: true,
+          woke: false,
+          head_seq: headSeq,
+          posts: delta,
+          reason: 'no_working_members',
+        }
       }
 
-      if (roster.members[caller] && !roster.members[caller]!.killed) {
-        // Only update transient `phase` and `wait_since`; NEVER overwrite persistent
-        // `wake_mode` so a one-shot `mentions_only:false` wait cannot change future routing.
-        roster.members[caller]!.phase = 'WAITING'
-        roster.members[caller]!.wait_since = since
-        this.saveRoster(state, roster)
-      }
+      const waitStartGen = state.interruptGeneration
+      await this.mutateRoster(state, (r) => {
+        const m = r.members[caller]
+        if (m && !m.killed) {
+          // Only update transient `phase` and `wait_since`; NEVER overwrite persistent
+          // `wake_mode` so a one-shot `mentions_only:false` wait cannot change future routing.
+          m.phase = 'WAITING'
+          m.wait_since = since
+        }
+      })
 
       let waited: { woke: boolean; posts: BoardPostRecord[]; headSeq: number; reason: string }
       try {
-        waited = await new Promise<{ woke: boolean; posts: BoardPostRecord[]; headSeq: number; reason: string }>(
-          (resolveWait, rejectWait) => {
-            const timer = setTimeout(() => {
+        waited = await new Promise<{
+          woke: boolean
+          posts: BoardPostRecord[]
+          headSeq: number
+          reason: string
+        }>((resolveWait, rejectWait) => {
+          let settled = false
+          const settle = (res: {
+            woke: boolean
+            posts: BoardPostRecord[]
+            headSeq: number
+            reason: string
+          }) => {
+            if (settled) return
+            settled = true
+            state.waiters.delete(entry)
+            clearTimeout(timer)
+            resolveWait(res)
+          }
+          const timer = setTimeout(() => {
+            if (settled) return
+            try {
+              const cur = readBoardPostsFromDisk(state.location.swarmDir)
+              settle({
+                woke: false,
+                posts: cur.filter((p) => p.seq > since),
+                headSeq: cur.reduce((m, p) => Math.max(m, p.seq), 0),
+                reason: 'timeout',
+              })
+            } catch (err) {
+              settled = true
               state.waiters.delete(entry)
-              try {
-                const cur = readBoardPostsFromDisk(state.location.swarmDir)
-                resolveWait({
-                  woke: false,
-                  posts: cur.filter((p) => p.seq > since),
-                  headSeq: cur.reduce((m, p) => Math.max(m, p.seq), 0),
-                  reason: 'timeout',
-                })
-              } catch (err) {
-                rejectWait(err)
-              }
-            }, timeoutMs)
-            timer.unref?.()
-            const entry: WaiterEntry = {
-              memberName: caller,
-              since,
-              mentionsOnly,
-              channel,
-              resolve: resolveWait,
-              timer,
+              clearTimeout(timer)
+              rejectWait(err)
             }
-            state.waiters.add(entry)
-          },
-        )
+          }, timeoutMs)
+          timer.unref?.()
+          const entry: WaiterEntry = {
+            memberName: caller,
+            since,
+            mentionsOnly,
+            channel,
+            resolve: settle,
+            timer,
+          }
+          state.waiters.add(entry)
+
+          // B7: Synchronously re-check board posts, interrupt/shutdown, and worker idle state
+          // AFTER registering `entry` so posts written during the `WAITING` roster await can
+          // NEVER be lost.
+          if (state.shuttingDown) {
+            settle({
+              woke: false,
+              posts: [],
+              headSeq: state.boardSeqKnown,
+              reason: 'session_shutdown',
+            })
+            return
+          }
+          if (state.interruptGeneration !== waitStartGen) {
+            settle({
+              woke: false,
+              posts: [],
+              headSeq: state.boardSeqKnown,
+              reason: 'interrupted',
+            })
+            return
+          }
+          try {
+            const rechecked = readBoardPostsFromDisk(state.location.swarmDir)
+            const recheckHead = rechecked.reduce((m, p) => Math.max(m, p.seq), 0)
+            const recheckMatched = matchWaitPosts(rechecked)
+            if (recheckMatched.length > 0) {
+              settle({
+                woke: true,
+                posts: recheckMatched,
+                headSeq: recheckHead,
+                reason: 'already_available',
+              })
+              return
+            }
+            if (caller === 'coordinator' && ![...state.workers.values()].some((w) => w.running)) {
+              const delta = rechecked.filter((p) => p.seq > since)
+              settle({
+                woke: delta.length > 0,
+                posts: delta,
+                headSeq: recheckHead,
+                reason: delta.length > 0 ? 'workers_settled' : 'no_working_members',
+              })
+            }
+          } catch (err) {
+            settled = true
+            state.waiters.delete(entry)
+            clearTimeout(timer)
+            rejectWait(err)
+          }
+        })
       } finally {
         if (!state.shuttingDown) {
           try {
-            const resumeRoster = this.ensureRoster(state)
-            const resumeMember = resumeRoster.members[caller]
-            if (resumeMember && !resumeMember.killed) {
-              resumeMember.phase = 'RUNNING'
-              this.saveRoster(state, resumeRoster)
-            }
+            await this.mutateRoster(state, (resumeRoster) => {
+              const resumeMember = resumeRoster.members[caller]
+              if (resumeMember && !resumeMember.killed) {
+                resumeMember.phase = 'RUNNING'
+              }
+            })
           } catch {
             /* ignore resume settle error */
           }
         }
       }
-      return { ok: true, woke: waited.woke, head_seq: waited.headSeq, posts: waited.posts, reason: waited.reason }
+      return {
+        ok: true,
+        woke: waited.woke,
+        head_seq: waited.headSeq,
+        posts: waited.posts,
+        reason: waited.reason,
+      }
     }
 
     // tool === 'swarm'
-    const action = typeof input.args.action === 'string' ? input.args.action.trim().toLowerCase() : ''
-    const roster = this.ensureRoster(state)
+    const action =
+      typeof input.args.action === 'string' ? input.args.action.trim().toLowerCase() : ''
 
     if (action === 'title') {
       if (caller !== 'coordinator') throw new Error('SWARM_TITLE_COORDINATOR_ONLY')
       const title = typeof input.args.title === 'string' ? input.args.title.trim().slice(0, 120) : ''
       if (!title) throw new Error('SWARM_TITLE_REQUIRED')
-      roster.title = title
-      this.saveRoster(state, roster)
+      await this.mutateRoster(state, (roster) => {
+        roster.title = title
+      })
       return { ok: true, title }
     }
 
     if (action === 'status') {
-      const allPosts = readBoardPostsFromDisk(state.location.swarmDir)
-      const headSeq = allPosts.reduce((m, p) => Math.max(m, p.seq), 0)
-      const members = Object.entries(roster.members).map(([name, m]) => ({
-        name,
-        role: m.role,
-        model: m.model,
-        status: m.killed
-          ? 'killed'
-          : state.workers.get(name)?.running || (name === 'coordinator' && m.phase === 'RUNNING')
-            ? 'working'
-            : 'waiting',
-        channels: m.channels,
-        workspace: m.workspace?.path ?? state.workspaceCwd,
-        workspace_mode: m.workspace?.mode ?? 'inherit',
-      }))
-      return {
-        ok: true,
-        swarm_id: state.location.swarmId,
-        title: roster.title,
-        head_seq: headSeq,
-        members,
-        channels: Object.entries(roster.channels).map(([name, ch]) => ({
-          name,
-          ...(ch.topic ? { topic: ch.topic } : {}),
-          ...(ch.archived ? { archived: true } : {}),
-        })),
-      }
+      return executeSwarmStatusAction(toolHost)
     }
 
     if (action === 'models') {
@@ -1714,158 +1841,18 @@ export class RemoteSwarmRuntime {
     }
 
     if (action === 'channel') {
-      const op = typeof input.args.op === 'string' ? input.args.op.trim().toLowerCase() : 'list'
-      if (op === 'list') {
-        return {
-          ok: true,
-          channels: Object.entries(roster.channels).map(([name, ch]) => ({
-            name,
-            ...(ch.topic ? { topic: ch.topic } : {}),
-            ...(ch.archived ? { archived: true } : {}),
-            subscribers: Object.values(roster.members).filter((m) => !m.killed && (m.channels ?? []).includes(name))
-              .length,
-          })),
-        }
-      }
-      const chName = typeof input.args.channel === 'string' ? input.args.channel.trim().toLowerCase() : ''
-      if (!CHANNEL_NAME_RE.test(chName) || chName === 'main') {
-        throw new Error('SWARM_CHANNEL_NAME_INVALID')
-      }
-      if (op === 'create') {
-        if (Object.keys(roster.channels).length >= SWARM_MAX_CHANNELS && !roster.channels[chName]) {
-          throw new Error('SWARM_CHANNEL_LIMIT_REACHED')
-        }
-        const topic = typeof input.args.topic === 'string' ? input.args.topic.trim().slice(0, 160) : undefined
-        roster.channels[chName] = { ...(topic ? { topic } : {}), creator: caller, archived: false }
-        this.saveRoster(state, roster)
-        return { ok: true, channel: chName, topic }
-      }
-      if (op === 'archive') {
-        if (!roster.channels[chName]) throw new Error('SWARM_CHANNEL_NOT_FOUND')
-        roster.channels[chName]!.archived = true
-        this.saveRoster(state, roster)
-        return { ok: true, channel: chName, archived: true }
-      }
-      if (op === 'subscribe' || op === 'unsubscribe' || op === 'join' || op === 'leave') {
-        const target =
-          typeof input.args.name === 'string' && input.args.name.trim()
-            ? input.args.name.trim().toLowerCase()
-            : caller
-        const member = roster.members[target]
-        if (!member) throw new Error('SWARM_MEMBER_NOT_FOUND')
-        if (!roster.channels[chName]) throw new Error('SWARM_CHANNEL_NOT_FOUND')
-        const set = new Set(member.channels ?? ['main'])
-        if (op === 'subscribe' || op === 'join') set.add(chName)
-        else set.delete(chName)
-        set.add('main')
-        member.channels = [...set]
-        this.saveRoster(state, roster)
-        return { ok: true, name: target, channels: member.channels }
-      }
-      throw new Error(`SWARM_CHANNEL_OP_UNSUPPORTED:${op}`)
+      return executeSwarmChannelAction(toolHost, caller, input.args)
     }
 
     if (action === 'add') {
-      const baseName = typeof input.args.name === 'string' ? input.args.name.trim().toLowerCase() : ''
-      const brief = typeof input.args.brief === 'string' ? input.args.brief.trim() : ''
-      if (!MEMBER_NAME_RE.test(baseName) || RESERVED_MEMBER_NAMES.has(baseName)) {
-        throw new Error('SWARM_MEMBER_NAME_INVALID')
-      }
-      if (isSwarmMonitorAgentName(baseName)) {
-        return {
-          ok: true,
-          skipped: true,
-          managed_by_gateway: true,
-          added: [],
-          note: 'OpenClaude gateway already runs deterministic zero-token stall monitoring for this swarm; do not spawn an LLM monitor worker.',
-        }
-      }
-      if (!brief) throw new Error('SWARM_BRIEF_REQUIRED')
-
-      const tasksArr = Array.isArray(input.args.tasks)
-        ? input.args.tasks.filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
-        : null
-      const nRaw = typeof input.args.n === 'number' && Number.isInteger(input.args.n) ? input.args.n : 1
-      const count = tasksArr ? Math.min(tasksArr.length, MAX_SHARD_ADD) : Math.max(1, Math.min(nRaw, MAX_SHARD_ADD))
-      const requestedWorkspace =
-        input.args.workspace === 'share' || input.args.workspace === 'branch' ? input.args.workspace : 'inherit'
-      const requestedChannels = Array.isArray(input.args.channels)
-        ? input.args.channels
-            .filter((c): c is string => typeof c === 'string' && CHANNEL_NAME_RE.test(c.trim().toLowerCase()))
-            .map((c) => c.trim().toLowerCase())
-        : []
-      const workerModel =
-        typeof input.args.model === 'string' && input.args.model.trim() ? input.args.model.trim() : state.model
-
-      const specs: Array<{ name: string; fullBrief: string }> =
-        count === 1 && !tasksArr
-          ? [{ name: baseName, fullBrief: brief }]
-          : Array.from({ length: count }, (_, idx) => ({
-              name: `${baseName}-${idx + 1}`,
-              fullBrief: tasksArr ? `${brief}\n\n[Shard Target]: ${tasksArr[idx]}` : brief,
-            }))
-
-      if (Object.keys(roster.members).length + specs.length > SWARM_MAX_MEMBERS) {
-        throw new Error('SWARM_MEMBER_LIMIT_REACHED')
-      }
-
-      const added: Array<{ name: string; workspace_mode: string; workspace: string; seq: number }> = []
-      const primaryChannel = requestedChannels[0] || 'main'
-      if (primaryChannel !== 'main' && !roster.channels[primaryChannel]) {
-        roster.channels[primaryChannel] = { creator: caller }
-      }
-      const memberChannels = [...new Set(['main', ...requestedChannels])]
-
-      for (const spec of specs) {
-        if (roster.members[spec.name]) {
-          throw new Error(`SWARM_MEMBER_EXISTS:${spec.name}`)
-        }
-        const convId = randomUUID()
-        const ws =
-          requestedWorkspace === 'inherit'
-            ? { mode: 'inherit' as const }
-            : createWorkerGitWorktree(state.workspaceCwd, state.location.swarmId, spec.name, requestedWorkspace)
-        const existingHead = readBoardPostsFromDisk(state.location.swarmDir).reduce((m, p) => Math.max(m, p.seq), 0)
-        roster.members[spec.name] = {
-          conversation_id: convId,
-          role: inferMemberRole(spec.name),
-          model: workerModel,
-          phase: 'RUNNING',
-          wake_mode: 'mentions',
-          wait_since: existingHead,
-          last_read_seq: existingHead,
-          killed: false,
-          channels: memberChannels,
-          workspace: ws,
-          added_by: caller,
-        }
-        this.saveRoster(state, roster)
-        const post = this.appendBoardPost(state, {
-          agent: caller,
-          channel: primaryChannel,
-          text: `@${spec.name} ${spec.fullBrief}`,
-          kind: 'brief',
-        })
-        added.push({
-          name: spec.name,
-          workspace_mode: ws.mode,
-          workspace: 'path' in ws ? ws.path : state.workspaceCwd,
-          seq: post.seq,
-        })
-      }
-      return { ok: true, added }
+      return executeSwarmAddAction(toolHost, caller, input.args)
     }
 
     if (action === 'kill') {
-      const target = typeof input.args.name === 'string' ? input.args.name.trim().toLowerCase() : ''
+      const target =
+        typeof input.args.name === 'string' ? input.args.name.trim().toLowerCase() : ''
       if (!target) throw new Error('SWARM_MEMBER_NAME_REQUIRED')
-      if (caller !== 'coordinator') {
-        const rec = roster.members[target]
-        if (!rec || rec.added_by !== caller) {
-          throw new Error('SWARM_KILL_FORBIDDEN')
-        }
-      }
-      const res = await this.killMemberInternal(state, target, 'tool_kill')
+      const res = await this.killMemberInternal(state, target, 'tool_kill', { caller })
       if (res.notFound) throw new Error(`SWARM_MEMBER_NOT_FOUND:${target}`)
       return {
         ok: true,
@@ -1884,13 +1871,14 @@ export class RemoteSwarmRuntime {
           : caller
       const nextModel = typeof input.args.model === 'string' ? input.args.model.trim() : ''
       if (!nextModel) throw new Error('SWARM_MODEL_REQUIRED')
-      const rec = roster.members[target]
-      if (!rec) throw new Error(`SWARM_MEMBER_NOT_FOUND:${target}`)
       if (state.workers.get(target)?.running) {
         throw new Error(`SWARM_MEMBER_BUSY:${target}`)
       }
-      rec.model = nextModel
-      this.saveRoster(state, roster)
+      await this.mutateRoster(state, (roster) => {
+        const rec = roster.members[target]
+        if (!rec) throw new Error(`SWARM_MEMBER_NOT_FOUND:${target}`)
+        rec.model = nextModel
+      })
       return { ok: true, name: target, model: nextModel }
     }
 
@@ -1915,7 +1903,12 @@ export class RemoteSwarmRuntime {
     for (const waiter of [...state.waiters]) {
       state.waiters.delete(waiter)
       clearTimeout(waiter.timer)
-      waiter.resolve({ woke: false, posts: [], headSeq: state.boardSeqKnown, reason: 'session_shutdown' })
+      waiter.resolve({
+        woke: false,
+        posts: [],
+        headSeq: state.boardSeqKnown,
+        reason: 'session_shutdown',
+      })
     }
 
     const activeWaits: Promise<void>[] = []
@@ -1944,12 +1937,14 @@ export class RemoteSwarmRuntime {
 
     const preservedDirtyWorktrees: string[] = []
     try {
-      const roster = this.ensureRoster(state)
-      for (const rec of Object.values(roster.members)) {
-        if (rec.workspace?.path && rec.workspace.mode !== 'inherit') {
-          const wtRes = removeWorkerGitWorktree(state.workspaceCwd, rec.workspace.path)
-          if (wtRes.preservedDirtyPath) {
-            preservedDirtyWorktrees.push(wtRes.preservedDirtyPath)
+      const roster = readRosterStrict(state.location)
+      if (roster) {
+        for (const rec of Object.values(roster.members)) {
+          if (rec.workspace?.path && rec.workspace.mode !== 'inherit') {
+            const wtRes = removeWorkerGitWorktree(state.workspaceCwd, rec.workspace.path)
+            if (wtRes.preservedDirtyPath) {
+              preservedDirtyWorktrees.push(wtRes.preservedDirtyPath)
+            }
           }
         }
       }

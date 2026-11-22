@@ -138,12 +138,13 @@ describe("SwarmBoardDrawer · 遥测展示与交互式指挥操控台", () => {
     // 默认目标是 coordinator，不显示停止成员按钮
     expect(screen.queryByTestId("swarm-terminate-trigger")).toBeNull();
 
-    // 发送指令给 coordinator → Toast 提示，不出现重复内联反馈条
+    // 发送指令给 coordinator → Toast 提示 + 讨论流立即乐观回显「已投递」，不出现重复内联反馈条
     fireEvent.change(screen.getByTestId("swarm-command-input"), {
       target: { value: "请优先核验 bundle 体积预算" },
     });
     fireEvent.click(screen.getByTestId("swarm-command-send"));
     expect(await screen.findByText("已向 @coordinator 发送指令（#2）")).toBeInTheDocument();
+    expect(screen.getByTestId("swarm-post-delivered-2")).toHaveTextContent("已投递");
     expect(screen.queryByTestId("swarm-command-feedback")).toBeNull();
 
     // 切换目标到非 coordinator 成员 worker-ui → 展示停止该成员按钮 → 二次确认

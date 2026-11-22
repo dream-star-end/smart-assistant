@@ -1,7 +1,7 @@
 import { withUserError } from '@openclaude/protocol'
 import { getSystemHelpRelay, installSystemHelpRelay } from './systemHelpRelay.js'
 import { handleSystemHelpLocal } from './systemHelpHttp.js'
-import { createGatewayRemoteSwarmRuntime, handleGatewayRemoteSwarmHttp, type RemoteSwarmRuntime } from './remoteSwarmLocal.js'
+import { createGatewayRemoteSwarmRuntime, handleGatewayRemoteSwarmHttp, interruptGatewayRemoteSwarmSession, reconcileGatewayRemoteSwarmOnBoot, setDefaultRemoteSwarmRuntimeFactory, type RemoteSwarmRuntime } from './remoteSwarmLocal.js'
 import { createTaskboardPreflight } from './taskboard/stagePreflight.js'
 export { runSessionPreheat, validateEnginePreheatBody } from './sessionPreheat.js'
 export type { EnginePreheatBody, EnginePreheatValidation, SessionPreheatHost } from './sessionPreheat.js'
@@ -807,8 +807,11 @@ export class Gateway {
             this._sendPromptQueueSnapshotToClient(context, requester as WebSocket, snapshot)
           },
           sendDispatch: (context, frame) => this._sendPromptQueueDispatch(context, frame),
-          interruptExact: async (context, turnId) =>
-            this.sessions.interruptExact(context.owner.sessionKey, turnId),
+          interruptExact: async (context, turnId) => {
+            const ok = this.sessions.interruptExact(context.owner.sessionKey, turnId)
+            if (ok) await this._interruptRemoteSwarmForSession(context.owner.sessionKey, 'prompt_queue_interrupt')
+            return ok
+          },
           persistInterrupted: async ({ context, detail, turnId, turnIndex }) => {
             await persistInterruptedPromptQueueTurn({
               sessionKey: context.owner.sessionKey,
@@ -842,23 +845,17 @@ export class Gateway {
       clearCcbLocalAgentPendingForSession(sessionKey)
       void this._remoteSwarmRuntime?.shutdownSession(sessionKey).catch(() => {})
     }
+    setDefaultRemoteSwarmRuntimeFactory(() => this._ensureRemoteSwarmRuntime())
   }
   private _ensureRemoteSwarmRuntime(): RemoteSwarmRuntime { return (this._remoteSwarmRuntime ??= createGatewayRemoteSwarmRuntime({ sessions: this.sessions, getAgentsConfig: () => this._getAgentsConfig(), defaultModel: this.deps.config.defaults.model, log: this.log })) }
-
-  /** Feed `prune()` eviction counts into Prometheus counters. Called from
-   *  every store/peekReplay site so age-on-read pruning is also reflected.
-   *  Also refreshes the ring size gauge — single source of truth for the
-   *  `oc_outbound_ring_size_bytes` value. */
+  private _interruptRemoteSwarmForSession(sessionKey: string, reason = 'user_stop'): Promise<boolean> { return interruptGatewayRemoteSwarmSession(this._remoteSwarmRuntime, sessionKey, reason) }
   private _recordRingEvictions(stats: EvictionStats): void {
     if (stats.entries) outboundRingEvictedTotal.inc({ cause: 'entries' }, stats.entries)
     if (stats.age) outboundRingEvictedTotal.inc({ cause: 'age' }, stats.age)
     if (stats.bytes) outboundRingEvictedTotal.inc({ cause: 'bytes' }, stats.bytes)
     outboundRingSizeBytes.value = this._outboundRing.totalBytes()
   }
-
-  start(): Promise<void> {
-    return startImpl.call(this as unknown as GatewayLifecycleHost)
-  }
+  async start(): Promise<void> { await reconcileGatewayRemoteSwarmOnBoot({ agentsConfig: this.deps.agentsConfig, log: this.log }); return startImpl.call(this as unknown as GatewayLifecycleHost) }
 
   /**
    * Public, idempotent shutdown. Safe to call from signal handlers, fatal

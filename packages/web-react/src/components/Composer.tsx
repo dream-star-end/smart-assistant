@@ -383,6 +383,7 @@ export function Composer({
   // (卸载会杀掉 label 的原生激活,见附件项注释),菜单关闭改由我们在宏任务里手动触发。
   const [plusMenuOpen, setPlusMenuOpen] = useState(false);
   const [playbookOpen, setPlaybookOpen] = useState(false);
+  const plusAnchorRef = useRef<HTMLSpanElement>(null);
   const toast = useToast();
   const [voiceMsg, setVoiceMsg] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
@@ -1270,35 +1271,37 @@ export function Composer({
                 <Paperclip size={17} strokeWidth={1.75} />
               </label>
             )}
-            <ComposerPlusMenu
-              open={plusMenuOpen}
-              onOpenChange={setPlusMenuOpen}
-              disabled={disabled}
-              canGoal={canGoal}
-              visibleGoal={visibleGoal}
-              onOpenGoal={() => setGoalOpen(true)}
-              onOpenRepo={onOpenRepo}
-              repoSelection={repoSelection}
-              hasSwarmPlaybooks={Boolean(swarmSupported)}
-              onOpenSwarmPlaybooks={() => {
-                setPlusMenuOpen(false);
-                window.setTimeout(() => setPlaybookOpen(true), 0);
-              }}
-            />
-            {swarmSupported && playbookOpen && (
-              <SwarmPlaybookPopoverLazy
+            <span ref={plusAnchorRef} className="inline-flex shrink-0 items-center">
+              <ComposerPlusMenu
+                open={plusMenuOpen}
+                onOpenChange={setPlusMenuOpen}
                 disabled={disabled}
-                currentText={value}
-                open={playbookOpen}
-                onOpenChange={setPlaybookOpen}
-                triggerClassName="hidden"
-                onSelectPlaybook={(draft) => {
-                  setValue(draft);
-                  if (!swarmMode) onToggleSwarmMode?.();
-                  window.requestAnimationFrame(() => ref.current?.focus());
+                canGoal={canGoal}
+                visibleGoal={visibleGoal}
+                onOpenGoal={() => setGoalOpen(true)}
+                onOpenRepo={onOpenRepo}
+                repoSelection={repoSelection}
+                hasSwarmPlaybooks={Boolean(swarmSupported)}
+                onOpenSwarmPlaybooks={() => {
+                  setPlusMenuOpen(false);
+                  window.setTimeout(() => setPlaybookOpen(true), 0);
                 }}
               />
-            )}
+              {swarmSupported && playbookOpen && (
+                <SwarmPlaybookPopoverLazy
+                  disabled={disabled}
+                  currentText={value}
+                  open={playbookOpen}
+                  onOpenChange={setPlaybookOpen}
+                  anchorRef={plusAnchorRef}
+                  onSelectPlaybook={(draft) => {
+                    setValue(draft);
+                    if (!swarmMode) onToggleSwarmMode?.();
+                    window.requestAnimationFrame(() => ref.current?.focus());
+                  }}
+                />
+              )}
+            </span>
             {onOpenRepo && !hasBoundRepo && (
               <span aria-hidden className="mx-0.5 hidden h-4 w-px shrink-0 bg-border/70 sm:block" />
             )}

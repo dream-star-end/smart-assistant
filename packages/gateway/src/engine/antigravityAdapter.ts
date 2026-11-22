@@ -728,9 +728,27 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       // board or runs an own native swarm tool (`activateTurnSwarm()`).
       seedBaselineOnStart: Boolean(ctx.requestedConversationId || ctx.resumedLaunch),
       onSnapshot: (snapshot) => this.emitSwarmSnapshot(ctx, snapshot),
+      stallMonitor: {
+        onDiagnostic: (diag) => {
+          log.info('antigravity_swarm_stall_diagnostic', {
+            sessionKey: this.opts.sessionKey,
+            conversationId,
+            kind: diag.kind,
+            phase: diag.phase,
+            headSeq: diag.headSeq,
+            idleMs: diag.idleMs,
+            alertCount: diag.alertCount,
+            workingMembers: diag.workingMembers,
+            waitingMembers: diag.waitingMembers,
+            ...(diag.reason ? { reason: diag.reason } : {}),
+            ...(diag.target ? { target: diag.target } : {}),
+            ...(diag.detail ? { detail: diag.detail } : {}),
+          })
+        },
+      },
       onStallDetected: (alert) => {
         if (ctx.terminal || ctx.abandoned) return
-        const res = injectSwarmDirective({
+        void injectSwarmDirective({
           brainDir,
           conversationId,
           target: alert.target,
@@ -739,25 +757,39 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
           sender: GATEWAY_STALL_MONITOR_AGENT,
           controlKind: 'stall',
         })
-        if (res.ok) {
-          log.info('antigravity_swarm_stall_alert', {
-            conversationId,
-            target: alert.target,
-            reason: alert.reason,
-            attempt: alert.attempt,
-            idleMs: alert.idleMs,
-            seq: res.seq,
+          .then((res) => {
+            if (ctx.terminal || ctx.abandoned) return
+            if (res.ok) {
+              log.info('antigravity_swarm_stall_alert', {
+                sessionKey: this.opts.sessionKey,
+                conversationId,
+                target: alert.target,
+                reason: alert.reason,
+                attempt: alert.attempt,
+                idleMs: alert.idleMs,
+                seq: res.seq,
+              })
+              ctx.swarmWatcher?.kick()
+            } else {
+              log.warn('antigravity_swarm_stall_alert_failed', {
+                sessionKey: this.opts.sessionKey,
+                conversationId,
+                target: alert.target,
+                reason: alert.reason,
+                code: res.code,
+                error: res.error,
+              })
+            }
           })
-          ctx.swarmWatcher?.kick()
-        } else {
-          log.warn('antigravity_swarm_stall_alert_failed', {
-            conversationId,
-            target: alert.target,
-            reason: alert.reason,
-            code: res.code,
-            error: res.error,
+          .catch((err) => {
+            log.warn('antigravity_swarm_stall_alert_failed', {
+              sessionKey: this.opts.sessionKey,
+              conversationId,
+              target: alert.target,
+              reason: alert.reason,
+              error: String((err as Error)?.message ?? err),
+            })
           })
-        }
       },
     })
     ctx.swarmWatcher = watcher

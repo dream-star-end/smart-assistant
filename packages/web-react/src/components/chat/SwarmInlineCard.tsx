@@ -7,6 +7,7 @@
  */
 import type { SwarmMemberSnapshot, SwarmSnapshot } from "@openclaude/protocol/browser";
 import {
+  Activity,
   AlertTriangle,
   ArrowUpRight,
   ChevronRight,
@@ -15,19 +16,22 @@ import {
   MessageSquare,
   Users,
 } from "lucide-react";
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { cn } from "../../lib/utils";
 import { Badge, Button, Spinner } from "../ui";
 import { AtelierIcon } from "../ui/AtelierIcons";
 import { ModelFamilyIcon } from "../ui/ModelFamilyIcons";
 import "./liveActivity.css";
+import { SwarmElapsedTicker } from "./SwarmElapsedTicker";
 import {
+  classifySwarmPost,
   formatPostClock,
-  formatSwarmElapsed,
+  formatTelemetryTokens,
   humanizeSwarmModel,
   isSwarmActive,
   memberInitial,
   summarizeSwarmCounts,
+  summarizeSwarmTelemetry,
   swarmMemberStyle,
   swarmPhaseMeta,
   swarmRoleLabel,
@@ -52,13 +56,23 @@ function InlineRichLine({
     <span>
       {tokens.map((tok, idx) => {
         if (tok.kind === "mention") {
+          if (tok.target === "all") {
+            return (
+              <span
+                key={idx}
+                className="mx-0.5 inline-flex items-center rounded bg-warning-soft px-1 py-0 text-caption font-medium text-warning"
+              >
+                {tok.value}
+              </span>
+            );
+          }
           return (
             <button
               key={idx}
               type="button"
               onClick={(e) => {
                 e.stopPropagation();
-                if (tok.target !== "all") onClickMember?.(tok.target);
+                onClickMember?.(tok.target);
               }}
               className="mx-0.5 inline-flex items-center rounded bg-accent-soft px-1 py-0 text-caption font-medium text-accent transition-colors hover:bg-accent/20"
             >
@@ -122,20 +136,19 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
   const [everActive, setEverActive] = useState(active);
   const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null);
   const [showKilled, setShowKilled] = useState(false);
-  const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
     if (active) setEverActive(true);
   }, [active]);
 
-  useEffect(() => {
-    if (!active) return;
-    const id = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, [active]);
-
   const collapsed = userCollapsed ?? (!active && !everActive);
-  const elapsed = active ? formatSwarmElapsed(snapshot.startedAt, now) : "";
+  const telemetrySummary = useMemo(() => summarizeSwarmTelemetry(snapshot.members), [snapshot.members]);
+  const totalTokensLabel = telemetrySummary.hasTokens
+    ? `${telemetrySummary.partial ? "~" : ""}${formatTelemetryTokens(
+        telemetrySummary.inputTokens,
+        telemetrySummary.outputTokens,
+      )}`
+    : "";
   const iconBadgeTone = active
     ? "oc-icon-badge-accent"
     : snapshot.phase === "completed"
@@ -242,7 +255,7 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
               member.failed
                 ? "text-danger"
                 : working
-                  ? "text-fg/85 oc-live-status-shine"
+                  ? "font-medium text-accent"
                   : "text-muted",
             )}
             title={member.lastError || member.activity || ""}
@@ -337,7 +350,31 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
                 {counts.isolatedWorktrees} 独立 worktree
               </span>
             )}
-            {elapsed && <span className="font-mono tabular-nums text-muted">{elapsed}</span>}
+            <SwarmElapsedTicker
+              startedAt={snapshot.startedAt}
+              endedAt={snapshot.updatedAt}
+              active={active}
+              prefix={active ? undefined : "总耗时 "}
+              data-testid="swarm-inline-elapsed"
+              className="font-mono tabular-nums text-muted"
+            />
+            {totalTokensLabel && (
+              <span
+                data-testid="swarm-inline-total-tokens"
+                title={
+                  telemetrySummary.cacheHitRatePct != null
+                    ? `整群总 Token · 缓存命中率 ${telemetrySummary.cacheHitRatePct}%`
+                    : "整群输入 / 输出 Token 汇总"
+                }
+                className="inline-flex items-center gap-0.5 font-mono tabular-nums text-muted"
+              >
+                <Activity size={11} aria-hidden className="text-faint" />
+                <span>{totalTokensLabel}</span>
+                {telemetrySummary.cacheHitRatePct != null && (
+                  <span className="text-micro text-faint">· 缓存 {telemetrySummary.cacheHitRatePct}%</span>
+                )}
+              </span>
+            )}
             {counts.failed > 0 && (
               <span className="inline-flex items-center gap-0.5 text-danger">
                 <AlertTriangle size={11} />
@@ -474,6 +511,7 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
                 {recentPosts.map((post) => {
                   const style = swarmMemberStyle(post.agent);
                   const clock = formatPostClock(post.time);
+                  const semantic = classifySwarmPost(post);
                   return (
                     <div
                       key={post.seq}
@@ -494,6 +532,11 @@ export const SwarmInlineCard = memo(function SwarmInlineCard({
                       >
                         {post.agent}
                       </span>
+                      {semantic && (
+                        <Badge tone={semantic.tone} size="sm" className="shrink-0 py-0 text-micro">
+                          {semantic.label}
+                        </Badge>
+                      )}
                       {post.channel && post.channel !== "main" && (
                         <span className="shrink-0 rounded bg-hover px-1 py-0 text-micro text-muted">
                           #{post.channel}

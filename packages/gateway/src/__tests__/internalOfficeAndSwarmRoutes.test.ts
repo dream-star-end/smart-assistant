@@ -33,6 +33,11 @@ import {
   handleInternalSwarmCommand,
   resolveAuthoritativeSessionSwarm,
 } from '../routes/swarmCommandRoute.js'
+import {
+  RemoteSwarmRuntime,
+  lookupRemoteSwarmMcpContext,
+  remoteSwarmLocationForSession,
+} from '../remoteSwarmRuntime.js'
 import { SessionManager } from '../sessionManager.js'
 
 const BRIDGE_SECRET = 'wave4-test-bridge-secret-32bytes!'
@@ -797,6 +802,316 @@ describe('internal swarm command route (B6 + B7)', () => {
       assert.equal(readFileSync(oldBoardPath, 'utf8'), initialOldBoard, 'historical board.jsonl must remain untouched')
     } finally {
       rmSync(agyRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('P2-1: lazily restores on-disk Remote Swarm control handle after restart for steer and confirmed terminate without minting MCP tokens', async () => {
+    const agyRoot = mkdtempSync(path.join(tmpdir(), 'oc-int-rswarm-lazy-'))
+    const wsDir = mkdtempSync(path.join(tmpdir(), 'oc-int-rswarm-ws-'))
+    const sessionId = 'sess-remote-lazy-1'
+    const sessionKey = `agent:main:webchat:dm:${sessionId}`
+    const replayCache = new InternalBridgeReplayCache()
+
+    // Seed an on-disk remote swarm via rt1 and shut down rt1 (simulating gateway restart).
+    const rt1 = new RemoteSwarmRuntime({ rootBase: agyRoot })
+    rt1.registerSession({
+      sessionKey,
+      model: 'antigravity-gemini-4-neon-remote',
+      workspaceCwd: wsDir,
+    })
+    await rt1.handleToolCall({
+      sessionKey,
+      callerMember: 'coordinator',
+      tool: 'swarm',
+      args: { action: 'add', name: 'worker-lazy', brief: 'initial task' },
+    })
+    await rt1.shutdownAll()
+
+    // Cold runtime rt2 has NOT called registerSession for sessionKey.
+    const rt2 = new RemoteSwarmRuntime({ rootBase: agyRoot })
+    const lookupSessionTarget = (sid: string) =>
+      sid === sessionId ? { sessionKey } : null
+
+    try {
+      // 1) resolveAuthoritativeSessionSwarm locates the deterministic remote swarm on disk
+      const resolved = resolveAuthoritativeSessionSwarm(sessionId, {
+        antigravityRootDir: () => agyRoot,
+        lookupSessionTarget,
+      })
+      const loc = remoteSwarmLocationForSession(sessionKey, agyRoot)
+      assert.ok(resolved)
+      assert.equal(resolved.brainDir, loc.brainDir)
+      assert.equal(resolved.conversationId, loc.swarmId)
+
+      // 2) Steer lazily hydrates rt2 and appends directive to remote board.jsonl
+      const steerUrl = `/internal/swarm/command?sessionId=${sessionId}`
+      const steerBody = { action: 'steer', target: 'worker-lazy', message: 'resume with focus' }
+      const rSteer = makeRes()
+      await handleInternalSwarmCommand(
+        makeReq({
+          method: 'POST',
+          url: steerUrl,
+          headers: signedAuthHeaders({
+            method: 'POST',
+            url: steerUrl,
+            body: steerBody,
+            extra: { [INTERNAL_SWARM_USER_ID_HEADER]: '42' },
+          }),
+          body: steerBody,
+        }),
+        rSteer.res,
+        new URL(steerUrl, 'http://x'),
+        {
+          env: AUTH_ENV,
+          replayCache,
+          antigravityRootDir: () => agyRoot,
+          lookupSessionTarget,
+          getRemoteSwarmRuntime: () => rt2,
+        },
+      )
+      assert.equal(rSteer.status(), 200)
+      assert.ok(readFileSync(path.join(loc.swarmDir, 'board.jsonl'), 'utf8').includes('resume with focus'))
+      assert.equal(
+        lookupRemoteSwarmMcpContext(sessionKey),
+        undefined,
+        'lazy control hydration must NOT mint coordinator MCP caller tokens',
+      )
+
+      // 3) Terminate routes through hydrated rt2.executeOperatorKill -> confirmed kill!
+      const killUrl = `/internal/swarm/command/${sessionId}`
+      const killBody = { action: 'terminate', memberName: 'worker-lazy', reason: 'operator_stop' }
+      const rKill = makeRes()
+      await handleInternalSwarmCommand(
+        makeReq({
+          method: 'POST',
+          url: killUrl,
+          headers: signedAuthHeaders({
+            method: 'POST',
+            url: killUrl,
+            body: killBody,
+            extra: { [INTERNAL_SWARM_USER_ID_HEADER]: '42' },
+          }),
+          body: killBody,
+        }),
+        rKill.res,
+        new URL(killUrl, 'http://x'),
+        {
+          env: AUTH_ENV,
+          replayCache,
+          antigravityRootDir: () => agyRoot,
+          lookupSessionTarget,
+          getRemoteSwarmRuntime: () => rt2,
+        },
+      )
+      assert.equal(rKill.status(), 200)
+      const killJson = rKill.json() as { ok: boolean; status: string; killed: string[] }
+      assert.equal(killJson.ok, true)
+      assert.equal(killJson.status, 'confirmed')
+      assert.deepEqual(killJson.killed, ['worker-lazy'])
+    } finally {
+      await rt2.shutdownAll()
+      rmSync(agyRoot, { recursive: true, force: true })
+      rmSync(wsDir, { recursive: true, force: true })
+    }
+  })
+
+  it('T2 B6: unified target resolution routes active Native cleanly despite historical Remote, and fails closed for BOTH steer and terminate on cold Native+Remote ambiguity', async () => {
+    const agyRoot = mkdtempSync(path.join(tmpdir(), 'oc-int-b6-dual-'))
+    const wsDir = mkdtempSync(path.join(tmpdir(), 'oc-int-b6-dual-ws-'))
+    const sessionId = 'sess-dual-b6'
+    const sessionKey = `agent:main:webchat:dm:${sessionId}`
+    const replayCache = new InternalBridgeReplayCache()
+
+    // 1) Seed historical Remote swarm on disk with `shared-worker`, then shut down rt1.
+    const rt1 = new RemoteSwarmRuntime({ rootBase: agyRoot })
+    rt1.registerSession({
+      sessionKey,
+      model: 'antigravity-gemini-4-neon-remote',
+      workspaceCwd: wsDir,
+    })
+    await rt1.handleToolCall({
+      sessionKey,
+      callerMember: 'coordinator',
+      tool: 'swarm',
+      args: { action: 'add', name: 'shared-worker', brief: 'old remote work' },
+    })
+    await rt1.shutdownAll()
+    const remoteLoc = remoteSwarmLocationForSession(sessionKey, agyRoot)
+    const initialRemoteBoard = readFileSync(path.join(remoteLoc.swarmDir, 'board.jsonl'), 'utf8')
+    const initialRemoteMembers = readFileSync(path.join(remoteLoc.swarmDir, 'members.json'), 'utf8')
+
+    // 2) Seed active Native swarm for the SAME sessionId with `shared-worker`.
+    const nativeBrainDir = antigravitySessionBrainDir(agyRoot, sessionKey)
+    const nativeSwarmDir = path.join(nativeBrainDir, COORD_CONV, '.system_generated', 'swarm')
+    mkdirSync(nativeSwarmDir, { recursive: true })
+    writeFileSync(
+      path.join(nativeSwarmDir, 'members.json'),
+      JSON.stringify({
+        title: 'Active Native Swarm',
+        members: {
+          coordinator: { role: 'coordinator', killed: false },
+          'shared-worker': { role: 'worker', killed: false },
+        },
+      }),
+    )
+    const nativeBoardPath = path.join(nativeSwarmDir, 'board.jsonl')
+    writeFileSync(
+      nativeBoardPath,
+      `${JSON.stringify({ seq: 1, agent: 'coordinator', channel: 'main', text: 'native start', time: '2026-11-22T00:00:00Z' })}\n`,
+    )
+
+    const coldRemoteRt = new RemoteSwarmRuntime({ rootBase: agyRoot })
+    const cmdUrl = `/internal/swarm/command?sessionId=${sessionId}`
+
+    try {
+      // Case A: Explicit active Native binding (`brainDir` + `conversationId`) MUST win for BOTH steer & terminate!
+      const activeNativeLookup = (sid: string) =>
+        sid === sessionId ? { sessionKey, brainDir: nativeBrainDir, conversationId: COORD_CONV } : null
+
+      const resolvedNative = resolveAuthoritativeSessionSwarm(sessionId, {
+        antigravityRootDir: () => agyRoot,
+        lookupSessionTarget: activeNativeLookup,
+      })
+      assert.deepEqual(resolvedNative, { brainDir: nativeBrainDir, conversationId: COORD_CONV })
+
+      const steerBody = { action: 'steer', target: 'shared-worker', message: 'stay on native' }
+      const rNativeSteer = makeRes()
+      await handleInternalSwarmCommand(
+        makeReq({
+          method: 'POST',
+          url: cmdUrl,
+          headers: signedAuthHeaders({
+            method: 'POST',
+            url: cmdUrl,
+            body: steerBody,
+            extra: { [INTERNAL_SWARM_USER_ID_HEADER]: '42' },
+          }),
+          body: steerBody,
+        }),
+        rNativeSteer.res,
+        new URL(cmdUrl, 'http://x'),
+        {
+          env: AUTH_ENV,
+          replayCache,
+          antigravityRootDir: () => agyRoot,
+          lookupSessionTarget: activeNativeLookup,
+          getRemoteSwarmRuntime: () => coldRemoteRt,
+        },
+      )
+      assert.equal(rNativeSteer.status(), 200)
+      assert.ok(readFileSync(nativeBoardPath, 'utf8').includes('stay on native'))
+      assert.equal(
+        readFileSync(path.join(remoteLoc.swarmDir, 'board.jsonl'), 'utf8'),
+        initialRemoteBoard,
+        'active Native steer must NOT touch historical Remote board',
+      )
+
+      const termBody = { action: 'terminate', memberName: 'shared-worker', reason: 'stop_native' }
+      const rNativeTerm = makeRes()
+      await handleInternalSwarmCommand(
+        makeReq({
+          method: 'POST',
+          url: cmdUrl,
+          headers: signedAuthHeaders({
+            method: 'POST',
+            url: cmdUrl,
+            body: termBody,
+            extra: { [INTERNAL_SWARM_USER_ID_HEADER]: '42' },
+          }),
+          body: termBody,
+        }),
+        rNativeTerm.res,
+        new URL(cmdUrl, 'http://x'),
+        {
+          env: AUTH_ENV,
+          replayCache,
+          antigravityRootDir: () => agyRoot,
+          lookupSessionTarget: activeNativeLookup,
+          getRemoteSwarmRuntime: () => coldRemoteRt,
+        },
+      )
+      assert.equal(rNativeTerm.status(), 200)
+      assert.equal((rNativeTerm.json() as { status: string }).status, 'requested')
+      assert.equal(
+        readFileSync(path.join(remoteLoc.swarmDir, 'members.json'), 'utf8'),
+        initialRemoteMembers,
+        'active Native terminate must NOT kill historical Remote member',
+      )
+
+      // Case B: Cold ambiguous lookup (NO `brainDir`, NO live remote runtime, BOTH Native & Remote exist on disk)
+      // MUST fail closed with 404 SWARM_NOT_FOUND for BOTH steer AND terminate!
+      const coldAmbiguousLookup = (sid: string) =>
+        sid === sessionId ? { sessionKey, conversationId: COORD_CONV } : null
+      assert.equal(
+        resolveAuthoritativeSessionSwarm(sessionId, {
+          antigravityRootDir: () => agyRoot,
+          lookupSessionTarget: coldAmbiguousLookup,
+        }),
+        null,
+      )
+
+      const ambigSteer = { action: 'steer', target: 'shared-worker', message: 'ambiguous steer' }
+      const rAmbigSteer = makeRes()
+      await handleInternalSwarmCommand(
+        makeReq({
+          method: 'POST',
+          url: cmdUrl,
+          headers: signedAuthHeaders({
+            method: 'POST',
+            url: cmdUrl,
+            body: ambigSteer,
+            extra: { [INTERNAL_SWARM_USER_ID_HEADER]: '42' },
+          }),
+          body: ambigSteer,
+        }),
+        rAmbigSteer.res,
+        new URL(cmdUrl, 'http://x'),
+        {
+          env: AUTH_ENV,
+          replayCache,
+          antigravityRootDir: () => agyRoot,
+          lookupSessionTarget: coldAmbiguousLookup,
+          getRemoteSwarmRuntime: () => coldRemoteRt,
+        },
+      )
+      assert.equal(rAmbigSteer.status(), 404)
+      assert.equal((rAmbigSteer.json() as { code: string }).code, 'SWARM_NOT_FOUND')
+
+      const ambigTerm = { action: 'terminate', memberName: 'shared-worker', reason: 'ambiguous_kill' }
+      const rAmbigTerm = makeRes()
+      await handleInternalSwarmCommand(
+        makeReq({
+          method: 'POST',
+          url: cmdUrl,
+          headers: signedAuthHeaders({
+            method: 'POST',
+            url: cmdUrl,
+            body: ambigTerm,
+            extra: { [INTERNAL_SWARM_USER_ID_HEADER]: '42' },
+          }),
+          body: ambigTerm,
+        }),
+        rAmbigTerm.res,
+        new URL(cmdUrl, 'http://x'),
+        {
+          env: AUTH_ENV,
+          replayCache,
+          antigravityRootDir: () => agyRoot,
+          lookupSessionTarget: coldAmbiguousLookup,
+          getRemoteSwarmRuntime: () => coldRemoteRt,
+        },
+      )
+      assert.equal(rAmbigTerm.status(), 404)
+      assert.equal((rAmbigTerm.json() as { code: string }).code, 'SWARM_NOT_FOUND')
+      assert.equal(
+        readFileSync(path.join(remoteLoc.swarmDir, 'members.json'), 'utf8'),
+        initialRemoteMembers,
+        'cold ambiguous terminate must NEVER bypass resolution to kill historical Remote member',
+      )
+    } finally {
+      await coldRemoteRt.shutdownAll()
+      rmSync(agyRoot, { recursive: true, force: true })
+      rmSync(wsDir, { recursive: true, force: true })
     }
   })
 })

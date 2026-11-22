@@ -21,6 +21,7 @@ import {
   lstatSync,
   openSync,
   readFileSync,
+  readSync,
   realpathSync,
   unlinkSync,
   writeSync,
@@ -37,10 +38,19 @@ const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-
 const SAFE_MEMBER_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const SAFE_CHANNEL_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const MAX_MEMBERS_JSON_BYTES = 512 * 1024;
-const MAX_BOARD_SCAN_BYTES = 4 * 1024 * 1024;
+/** Generous hard ceiling for large swarm boards (64 MB) paired with O(1) tail seq scanning. */
+const MAX_BOARD_SCAN_BYTES = 64 * 1024 * 1024;
+/** Tail window scanned first when `board.jsonl` grows past 256 KB so large boards stay O(1). */
+const BOARD_TAIL_SCAN_BYTES = 256 * 1024;
 const MAX_COMMAND_BODY_BYTES = 32 * 1024;
 const BOARD_LOCK_STALE_MS = 15_000;
-const BOARD_LOCK_RETRIES = 40;
+const BOARD_LOCK_TIMEOUT_MS = 5_000;
+const BOARD_LOCK_BASE_DELAY_MS = 15;
+const BOARD_LOCK_MAX_DELAY_MS = 120;
+const BOARD_LOCK_JITTER_MS = 15;
+
+/** Per-swarmDir in-process serialization queue to eliminate intra-process lock thrashing. */
+const boardLockQueues = new Map<string, Promise<unknown>>();
 
 export const SWARM_COMMAND_ROUTE_RE = /^\/api\/sessions\/([^/]+)\/swarm\/command\/?$/;
 
@@ -76,6 +86,8 @@ export interface InjectSwarmDirectiveOptions {
   /** 控制事件类型(默认 `steer`,网关停滞告警传 `stall`)。 */
   controlKind?: string;
   now?: number;
+  /** 可选测试钩子:覆盖 `.board.lock` 异步等待上限(默认 5000ms)。 */
+  lockTimeoutMs?: number;
 }
 
 export interface InjectSwarmDirectiveSuccess {
@@ -102,7 +114,9 @@ export interface TerminateSwarmMemberOptions {
    * 可选权威执行器回执回调:仅当真实会话执行器确认目标实例已停止并返回 `true` 时,
    * 才返回 `status: 'confirmed'`;否则诚实返回 `status: 'requested'`。
    */
-  confirmByExecutor?: (memberName: string, reason: string) => boolean;
+  confirmByExecutor?: (memberName: string, reason: string) => boolean | Promise<boolean>;
+  /** 可选测试钩子:覆盖 `.board.lock` 异步等待上限(默认 5000ms)。 */
+  lockTimeoutMs?: number;
 }
 
 export type TerminateSwarmStatus = "requested" | "confirmed" | "already_killed";
@@ -189,69 +203,118 @@ function assertSwarmDirIdentity(dir: VerifiedSwarmDir): SwarmCommandFailure | nu
   }
 }
 
+function sleepAsync(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, Math.max(1, ms));
+    timer.unref();
+  });
+}
+
+async function runInSwarmDirQueue<T>(swarmDir: string, fn: () => Promise<T>): Promise<T> {
+  const prev = boardLockQueues.get(swarmDir) ?? Promise.resolve();
+  let release!: () => void;
+  const tail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const chained = prev.catch(() => undefined).then(() => tail);
+  boardLockQueues.set(swarmDir, chained);
+  await prev.catch(() => undefined);
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (boardLockQueues.get(swarmDir) === chained) {
+      boardLockQueues.delete(swarmDir);
+    }
+  }
+}
+
 /**
- * 独占锁文件保护 `board.jsonl` 读序号 + 追加(防并发指令序号撞车)。
+ * 异步独占锁文件保护 `board.jsonl` 读序号 + 追加(防并发指令序号撞车，绝不阻塞事件循环)。
+ * 采用进程内 per-swarmDir Promise 队列 + 异步带抖动指数退避重试，保持 `O_NOFOLLOW`/symlink 安全校验不降级。
  */
-function withSwarmBoardLock<T>(
+async function withSwarmBoardLock<T>(
   dir: VerifiedSwarmDir,
   now: number,
-  fn: () => T | SwarmCommandFailure,
-): T | SwarmCommandFailure {
-  const identityErr = assertSwarmDirIdentity(dir);
-  if (identityErr) return identityErr;
+  fn: () => T | SwarmCommandFailure | Promise<T | SwarmCommandFailure>,
+  lockTimeoutMs: number = BOARD_LOCK_TIMEOUT_MS,
+): Promise<T | SwarmCommandFailure> {
+  return runInSwarmDirQueue(dir.swarmDir, async () => {
+    const identityErr = assertSwarmDirIdentity(dir);
+    if (identityErr) return identityErr;
 
-  const lockPath = path.join(dir.swarmDir, ".board.lock");
-  const lockFlags =
-    fsConstants.O_WRONLY |
-    fsConstants.O_CREAT |
-    fsConstants.O_EXCL |
-    (typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0);
+    const lockPath = path.join(dir.swarmDir, ".board.lock");
+    const lockFlags =
+      fsConstants.O_WRONLY |
+      fsConstants.O_CREAT |
+      fsConstants.O_EXCL |
+      (typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0);
 
-  let lockFd: number | null = null;
-  for (let attempt = 0; attempt < BOARD_LOCK_RETRIES; attempt += 1) {
+    const deadline = Date.now() + Math.max(20, lockTimeoutMs);
+    let lockFd: number | null = null;
+    let attempt = 0;
+    for (;;) {
+      try {
+        lockFd = openSync(lockPath, lockFlags, 0o600);
+        writeSync(lockFd, `${process.pid}:${now}\n`, null, "utf8");
+        closeSync(lockFd);
+        lockFd = null;
+        break;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException | null)?.code;
+        if (code === "ELOOP") {
+          return { ok: false, code: "SYMLINK_REJECTED", error: "board lock symlink rejected" };
+        }
+        if (code === "EEXIST") {
+          // 检查是否为过期孤儿锁或符号链接
+          let unlinkedStale = false;
+          try {
+            const st = lstatSync(lockPath);
+            if (st.isSymbolicLink()) {
+              return { ok: false, code: "SYMLINK_REJECTED", error: "board lock symlink rejected" };
+            }
+            if (Date.now() - st.mtimeMs > BOARD_LOCK_STALE_MS) {
+              try {
+                unlinkSync(lockPath);
+                unlinkedStale = true;
+              } catch {
+                /* raced */
+              }
+            }
+          } catch {
+            // lock already released
+            unlinkedStale = true;
+          }
+          const remaining = deadline - Date.now();
+          if (remaining <= 0 && !unlinkedStale) {
+            return { ok: false, code: "LOCK_CONTENTION", error: "swarm board lock busy; retry shortly" };
+          }
+          if (!unlinkedStale) {
+            const backoff = Math.min(
+              BOARD_LOCK_MAX_DELAY_MS,
+              BOARD_LOCK_BASE_DELAY_MS * Math.min(8, attempt + 1),
+            );
+            const jitter = Math.floor(Math.random() * BOARD_LOCK_JITTER_MS);
+            await sleepAsync(Math.min(remaining, backoff + jitter));
+          }
+          attempt += 1;
+          continue;
+        }
+        return { ok: false, code: "IO_FAILED", error: `cannot acquire board lock: ${(err as Error).message}` };
+      }
+    }
+
     try {
-      lockFd = openSync(lockPath, lockFlags, 0o600);
-      writeSync(lockFd, `${process.pid}:${now}\n`, null, "utf8");
-      closeSync(lockFd);
-      lockFd = null;
-      break;
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException | null)?.code;
-      if (code === "ELOOP") {
-        return { ok: false, code: "SYMLINK_REJECTED", error: "board lock symlink rejected" };
+      const recheck = assertSwarmDirIdentity(dir);
+      if (recheck) return recheck;
+      return await fn();
+    } finally {
+      if (lockFd !== null) {
+        try { closeSync(lockFd); } catch { /* ignore */ }
       }
-      if (code === "EEXIST") {
-        // 检查是否为过期孤儿锁
-        try {
-          const st = lstatSync(lockPath);
-          if (st.isSymbolicLink()) {
-            return { ok: false, code: "SYMLINK_REJECTED", error: "board lock symlink rejected" };
-          }
-          if (Date.now() - st.mtimeMs > BOARD_LOCK_STALE_MS) {
-            try { unlinkSync(lockPath); } catch { /* raced */ }
-          }
-        } catch {
-          // lock already released
-        }
-        if (attempt === BOARD_LOCK_RETRIES - 1) {
-          return { ok: false, code: "LOCK_CONTENTION", error: "swarm board lock busy; retry shortly" };
-        }
-        continue;
-      }
-      return { ok: false, code: "IO_FAILED", error: `cannot acquire board lock: ${(err as Error).message}` };
+      try { unlinkSync(lockPath); } catch { /* ignore */ }
     }
-  }
-
-  try {
-    const recheck = assertSwarmDirIdentity(dir);
-    if (recheck) return recheck;
-    return fn();
-  } finally {
-    if (lockFd !== null) {
-      try { closeSync(lockFd); } catch { /* ignore */ }
-    }
-    try { unlinkSync(lockPath); } catch { /* ignore */ }
-  }
+  });
 }
 
 function readRosterSafe(
@@ -299,6 +362,29 @@ function readRosterSafe(
   }
 }
 
+function parseHeadSeqFromText(text: string, allowLineCountFallback: boolean): number {
+  let headSeq = 0;
+  let lineCount = 0;
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    lineCount += 1;
+    try {
+      const obj = JSON.parse(trimmed) as { seq?: unknown };
+      if (typeof obj?.seq === "number" && Number.isFinite(obj.seq) && obj.seq > 0) {
+        headSeq = Math.max(headSeq, Math.floor(obj.seq));
+      } else if (allowLineCountFallback) {
+        headSeq = Math.max(headSeq, lineCount);
+      }
+    } catch {
+      if (allowLineCountFallback) {
+        headSeq = Math.max(headSeq, lineCount);
+      }
+    }
+  }
+  return headSeq;
+}
+
 function readBoardHeadSeq(boardPath: string): { ok: true; headSeq: number } | SwarmCommandFailure {
   let fd: number | null = null;
   try {
@@ -311,28 +397,30 @@ function readBoardHeadSeq(boardPath: string): { ok: true; headSeq: number } | Sw
       (typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0);
     fd = openSync(boardPath, flags);
     const fst = fstatSync(fd);
-    if (!fst.isFile() || fst.size > MAX_BOARD_SCAN_BYTES) {
+    if (!fst.isFile() || fst.dev !== lst.dev || fst.ino !== lst.ino || fst.size > MAX_BOARD_SCAN_BYTES) {
       return { ok: false, code: "IO_FAILED", error: "board.jsonl invalid or exceeds scan cap" };
     }
-    const text = readFileSync(fd, "utf8");
-    let headSeq = 0;
-    let lineCount = 0;
-    for (const line of text.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      lineCount += 1;
-      try {
-        const obj = JSON.parse(trimmed) as { seq?: unknown };
-        if (typeof obj?.seq === "number" && Number.isFinite(obj.seq) && obj.seq > 0) {
-          headSeq = Math.max(headSeq, Math.floor(obj.seq));
-        } else {
-          headSeq = Math.max(headSeq, lineCount);
-        }
-      } catch {
-        headSeq = Math.max(headSeq, lineCount);
+    if (fst.size === 0) return { ok: true, headSeq: 0 };
+    if (fst.size > BOARD_TAIL_SCAN_BYTES) {
+      const tailSize = Math.min(fst.size, BOARD_TAIL_SCAN_BYTES);
+      const startOffset = fst.size - tailSize;
+      const buf = Buffer.allocUnsafe(tailSize);
+      let readTotal = 0;
+      while (readTotal < tailSize) {
+        const n = readSync(fd, buf, readTotal, tailSize - readTotal, startOffset + readTotal);
+        if (n <= 0) break;
+        readTotal += n;
+      }
+      const rawTail = buf.subarray(0, readTotal).toString("utf8");
+      const firstNl = rawTail.indexOf("\n");
+      const completeTail = firstNl >= 0 ? rawTail.slice(firstNl + 1) : "";
+      const tailSeq = parseHeadSeqFromText(completeTail, false);
+      if (tailSeq > 0) {
+        return { ok: true, headSeq: tailSeq };
       }
     }
-    return { ok: true, headSeq };
+    const text = readFileSync(fd, "utf8");
+    return { ok: true, headSeq: parseHeadSeqFromText(text, true) };
   } catch (err) {
     const code = (err as NodeJS.ErrnoException | null)?.code;
     if (code === "ENOENT") return { ok: true, headSeq: 0 };
@@ -347,51 +435,57 @@ function readBoardHeadSeq(boardPath: string): { ok: true; headSeq: number } | Sw
   }
 }
 
-function appendBoardPostLocked(
+async function appendBoardPostLocked(
   dir: VerifiedSwarmDir,
   now: number,
   post: { agent: string; channel: string; text: string; time: string; control?: Record<string, unknown> },
-): { ok: true; seq: number } | SwarmCommandFailure {
-  return withSwarmBoardLock(dir, now, () => {
-    const boardPath = path.join(dir.swarmDir, "board.jsonl");
-    const seqRes = readBoardHeadSeq(boardPath);
-    if (!seqRes.ok) return seqRes;
-    const nextSeq = seqRes.headSeq + 1;
-    const line = `${JSON.stringify({
-      seq: nextSeq,
-      agent: post.agent,
-      channel: post.channel,
-      text: post.text,
-      time: post.time,
-      ...(post.control ? { control: post.control } : {}),
-    })}\n`;
+  lockTimeoutMs?: number,
+): Promise<{ ok: true; seq: number } | SwarmCommandFailure> {
+  return withSwarmBoardLock(
+    dir,
+    now,
+    () => {
+      const boardPath = path.join(dir.swarmDir, "board.jsonl");
+      const seqRes = readBoardHeadSeq(boardPath);
+      if (!seqRes.ok) return seqRes;
+      const nextSeq = seqRes.headSeq + 1;
+      const line = `${JSON.stringify({
+        seq: nextSeq,
+        agent: post.agent,
+        channel: post.channel,
+        text: post.text,
+        time: post.time,
+        ...(post.control ? { control: post.control } : {}),
+      })}\n`;
 
-    let fd: number | null = null;
-    try {
-      const flags =
-        fsConstants.O_WRONLY |
-        fsConstants.O_APPEND |
-        fsConstants.O_CREAT |
-        (typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0);
-      fd = openSync(boardPath, flags, 0o600);
-      const fst = fstatSync(fd);
-      if (!fst.isFile()) {
-        return { ok: false, code: "SYMLINK_REJECTED", error: "board.jsonl is not a regular file" };
+      let fd: number | null = null;
+      try {
+        const flags =
+          fsConstants.O_WRONLY |
+          fsConstants.O_APPEND |
+          fsConstants.O_CREAT |
+          (typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0);
+        fd = openSync(boardPath, flags, 0o600);
+        const fst = fstatSync(fd);
+        if (!fst.isFile()) {
+          return { ok: false, code: "SYMLINK_REJECTED", error: "board.jsonl is not a regular file" };
+        }
+        writeSync(fd, line, null, "utf8");
+        return { ok: true, seq: nextSeq };
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException | null)?.code;
+        if (code === "ELOOP") {
+          return { ok: false, code: "SYMLINK_REJECTED", error: "board.jsonl symlink rejected" };
+        }
+        return { ok: false, code: "IO_FAILED", error: `failed to append board.jsonl: ${(err as Error).message}` };
+      } finally {
+        if (fd !== null) {
+          try { closeSync(fd); } catch { /* ignore */ }
+        }
       }
-      writeSync(fd, line, null, "utf8");
-      return { ok: true, seq: nextSeq };
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException | null)?.code;
-      if (code === "ELOOP") {
-        return { ok: false, code: "SYMLINK_REJECTED", error: "board.jsonl symlink rejected" };
-      }
-      return { ok: false, code: "IO_FAILED", error: `failed to append board.jsonl: ${(err as Error).message}` };
-    } finally {
-      if (fd !== null) {
-        try { closeSync(fd); } catch { /* ignore */ }
-      }
-    }
-  });
+    },
+    lockTimeoutMs,
+  );
 }
 
 function normalizeTargetName(raw: string): string {
@@ -401,7 +495,9 @@ function normalizeTargetName(raw: string): string {
 /**
  * 向活跃 Swarm board 注入人工纠偏指令(`@coordinator` / `@member` / `@all`)。
  */
-export function injectSwarmDirective(opts: InjectSwarmDirectiveOptions): InjectSwarmDirectiveResult {
+export async function injectSwarmDirective(
+  opts: InjectSwarmDirectiveOptions,
+): Promise<InjectSwarmDirectiveResult> {
   const target = normalizeTargetName(opts.target);
   if (!target || !SAFE_MEMBER_NAME_RE.test(target)) {
     return { ok: false, code: "INVALID_TARGET", error: "invalid target member name" };
@@ -459,13 +555,18 @@ export function injectSwarmDirective(opts: InjectSwarmDirectiveOptions): InjectS
   const now = opts.now ?? Date.now();
   const time = new Date(now).toISOString();
   const controlKind = (opts.controlKind ?? "steer").trim() || "steer";
-  const appended = appendBoardPostLocked(dirRes.dir, now, {
-    agent,
-    channel,
-    text: fullText,
-    time,
-    control: { kind: controlKind, target },
-  });
+  const appended = await appendBoardPostLocked(
+    dirRes.dir,
+    now,
+    {
+      agent,
+      channel,
+      text: fullText,
+      time,
+      control: { kind: controlKind, target },
+    },
+    opts.lockTimeoutMs,
+  );
   if (!appended.ok) return appended;
 
   return {
@@ -489,7 +590,9 @@ export function injectSwarmDirective(opts: InjectSwarmDirectiveOptions): InjectS
  *   - 仅当 `confirmByExecutor` 真实确认目标实例停止时返 `status: 'confirmed'`,
  *     否则诚实返回 `status: 'requested'` 等待 coordinator/执行器执行 `swarm{action:"kill"}`。
  */
-export function terminateSwarmMember(opts: TerminateSwarmMemberOptions): TerminateSwarmMemberResult {
+export async function terminateSwarmMember(
+  opts: TerminateSwarmMemberOptions,
+): Promise<TerminateSwarmMemberResult> {
   const memberName = normalizeTargetName(opts.memberName);
   if (!memberName || !SAFE_MEMBER_NAME_RE.test(memberName)) {
     return { ok: false, code: "INVALID_TARGET", error: "invalid member name" };
@@ -535,23 +638,30 @@ export function terminateSwarmMember(opts: TerminateSwarmMemberOptions): Termina
   const sender = (opts.sender ?? "human").trim() || "human";
   const reason = (opts.reason ?? "operator requested single-member stop").trim().slice(0, 240);
 
-  const confirmed = opts.confirmByExecutor ? Boolean(opts.confirmByExecutor(memberName, reason)) : false;
+  const confirmed = opts.confirmByExecutor
+    ? Boolean(await opts.confirmByExecutor(memberName, reason))
+    : false;
   const noticeText = confirmed
     ? `@coordinator [control:kill:confirmed] 已确认单点终止成员 @${memberName}（原因：${reason}）。请评估是否需要重新分派未完成工作。`
     : `@coordinator [control:kill:requested] 人工请求单点终止成员 @${memberName}（原因：${reason}）。请调用 swarm{action:"kill", name:"${memberName}"} 安全回收并确认状态。`;
 
-  const appended = appendBoardPostLocked(dirRes.dir, now, {
-    agent: sender,
-    channel: "main",
-    text: noticeText,
-    time,
-    control: {
-      kind: "terminate",
-      target: memberName,
-      status: confirmed ? "confirmed" : "requested",
-      reason,
+  const appended = await appendBoardPostLocked(
+    dirRes.dir,
+    now,
+    {
+      agent: sender,
+      channel: "main",
+      text: noticeText,
+      time,
+      control: {
+        kind: "terminate",
+        target: memberName,
+        status: confirmed ? "confirmed" : "requested",
+        reason,
+      },
     },
-  });
+    opts.lockTimeoutMs,
+  );
   if (!appended.ok) {
     return appended;
   }
@@ -1092,7 +1202,7 @@ export async function handleSwarmCommandRoute(
   }
 
   if (action === "steer") {
-    const result = injectSwarmDirective({
+    const result = await injectSwarmDirective({
       brainDir: targetSwarm.brainDir,
       conversationId: targetSwarm.conversationId,
       target,
@@ -1106,7 +1216,7 @@ export async function handleSwarmCommandRoute(
   }
 
   if (action === "kill" || action === "terminate") {
-    const result = terminateSwarmMember({
+    const result = await terminateSwarmMember({
       brainDir: targetSwarm.brainDir,
       conversationId: targetSwarm.conversationId,
       memberName,
@@ -1130,7 +1240,7 @@ export async function handleSwarmCommandRoute(
     }
     const kickoff =
       body.postKickoff === true
-        ? injectSwarmDirective({
+        ? await injectSwarmDirective({
             brainDir: targetSwarm.brainDir,
             conversationId: targetSwarm.conversationId,
             target: "all",

@@ -386,6 +386,11 @@ export function ModelSelectorPanel({
   const showPlatformEffort =
     !selectedCursor && Boolean(effortSupported && effortSupported.length > 0 && onSelectEffort)
   const showSwarmMode = Boolean(swarmSupported && onSelectSwarmMode && !teamEngineActive)
+  const hasSwarmCapableCatalog = Boolean(
+    !teamEngineActive &&
+      !swarmSupported &&
+      models.some((m) => !isDegraded(m) && isAntigravityModelForUi(m.id, models)),
+  )
 
   const hasExtras =
     showCursorEffort ||
@@ -822,6 +827,7 @@ export function ModelSelectorPanel({
     effortSupported,
     effortActive,
     showSwarmMode,
+    showSwarmUnsupportedHint: hasSwarmCapableCatalog,
     swarmMode: Boolean(swarmMode && !teamEngineActive),
     swarmRunning: Boolean(swarmRunning && !teamEngineActive),
     onOpenChange,
@@ -971,7 +977,7 @@ export function ModelSelectorPanel({
                   {notes}
                   {list}
                 </div>
-                {hasExtras && (
+                {hasExtras ? (
                   <div
                     role="region"
                     aria-label="执行参数"
@@ -980,7 +986,15 @@ export function ModelSelectorPanel({
                   >
                     <ModelSelectorExtras layout="dock" {...sharedExtrasProps} />
                   </div>
-                )}
+                ) : hasSwarmCapableCatalog ? (
+                  <div
+                    data-testid="model-picker-swarm-hint"
+                    className="flex shrink-0 items-center gap-1.5 border-t border-border/70 bg-bg/60 px-3.5 py-2.5 text-caption text-muted"
+                  >
+                    <AtelierIcon name="swarm" size={12} className="shrink-0 text-accent/80" />
+                    <span>切至 Gemini 4 / Antigravity 模型可启用蜂群协作</span>
+                  </div>
+                ) : null}
               </>
             )}
           </div>
@@ -1050,6 +1064,15 @@ export function ModelSelectorPanel({
         >
           {list}
         </div>
+        {hasSwarmCapableCatalog && (
+          <div
+            data-testid="model-picker-swarm-hint"
+            className="mt-1 flex shrink-0 items-center gap-1.5 border-t border-border/70 px-2 pt-2 pb-1 text-caption text-muted"
+          >
+            <AtelierIcon name="swarm" size={12} className="shrink-0 text-accent/80" />
+            <span>切至 Gemini 4 / Antigravity 模型可启用蜂群协作</span>
+          </div>
+        )}
       </DropdownMenuContent>
       {confirmLongContextEl}
     </>

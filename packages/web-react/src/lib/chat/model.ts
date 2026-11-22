@@ -763,6 +763,10 @@ export type ChatSession = {
   _contextPressure?: SessionContextPressureState;
   /** OCV5-840: manual `/compact` request in-flight for this session (memory-only). */
   _compactingManual?: boolean;
+  /** True when a delta SwarmSnapshot hit `missing_base` and triggered a resync (memory-only). */
+  _swarmSyncStale?: boolean;
+  /** Last epoch ms when a swarm delta gap triggered `forceSync` (throttle guard, memory-only). */
+  _swarmResyncLastAt?: number;
   /** Bridge hello snapshot (meta.detached) arrival time; stale once a newer frame lands. */
   _turnDetachedAt?: number;
   /** Stream of the last applied session snapshot. Hello / HTTP report it with the

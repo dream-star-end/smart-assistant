@@ -73,4 +73,26 @@ describe('TOOLS ↔ toolNames.ts 锁步', () => {
       assert.ok(t.inputSchema, `${t.name} 缺 inputSchema`)
     }
   })
+
+  it('P1-3: REMOTE_SWARM_TOOLS schema 与运行时语义对齐 (main/channels/max_bytes/mentions_only/240s)', () => {
+    const swarmTool = REMOTE_SWARM_TOOLS.find((t) => t.name === 'swarm')!
+    const postTool = REMOTE_SWARM_TOOLS.find((t) => t.name === 'post_message')!
+    const readTool = REMOTE_SWARM_TOOLS.find((t) => t.name === 'read_board')!
+    const waitTool = REMOTE_SWARM_TOOLS.find((t) => t.name === 'swarm_wait')!
+
+    const swarmProps = swarmTool.inputSchema.properties as Record<string, any>
+    assert.equal(swarmProps.channels?.type, 'array')
+    assert.equal(swarmProps.channels?.items?.type, 'string')
+
+    const postProps = postTool.inputSchema.properties as Record<string, any>
+    assert.match(postProps.channel?.description ?? '', /`main`/)
+    assert.doesNotMatch(postProps.channel?.description ?? '', /`general`/)
+
+    const readProps = readTool.inputSchema.properties as Record<string, any>
+    assert.equal(readProps.max_bytes?.type, 'number')
+
+    const waitProps = waitTool.inputSchema.properties as Record<string, any>
+    assert.equal(waitProps.mentions_only?.type, 'boolean')
+    assert.match(waitProps.timeout_seconds?.description ?? '', /240/)
+  })
 })

@@ -1005,3 +1005,316 @@ test('INC-20261112-AGY-ROUTE-LIFETIME: HTTP heartbeat crosses six hours then Sto
     await f.close()
   }
 })
+
+describe('P0-2a real PG aux/monitoring settlement attribution & legacy compatibility', () => {
+  const NEON_MODEL = 'antigravity-gemini-4-neon'
+  const NEON_PRICING = {
+    model_id: NEON_MODEL,
+    display_name: 'Gemini 4 Neon (Antigravity)',
+    input_per_mtok: 600n,
+    output_per_mtok: 3000n,
+    cache_read_per_mtok: 15n,
+    cache_write_per_mtok: 0n,
+    multiplier: '1.000',
+    enabled: true,
+  } as unknown as ModelPricing
+  const neonPricingCache = {
+    get: (id: string) => (id === NEON_MODEL ? NEON_PRICING : null),
+  } as unknown as PricingCache
+
+  async function customUsageRow(args: {
+    requestId: string
+    userId: bigint
+    routeModelId: string
+    upstreamModel: string
+    requestType: string | null
+    prompt: number
+    out: number
+    cached?: number
+  }): Promise<void> {
+    await query(
+      `INSERT INTO antigravity_relay_usage
+         (call_id, request_id, user_id, route_model_id, upstream_model, request_type, status_code,
+          prompt_tokens, candidates_tokens, thoughts_tokens, cached_tokens)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 200, $6, $7, 0, $8)`,
+      [
+        args.requestId,
+        args.userId.toString(),
+        args.routeModelId,
+        args.upstreamModel,
+        args.requestType,
+        args.prompt,
+        args.out,
+        args.cached ?? 0,
+      ],
+    )
+  }
+
+  test('same request_id mixing Neon primary + flash-lite agent_monitoring + web_search bills all aux at light-model rate (~97% lower than Neon)', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const uid = await user(1_000_000n)
+    const requestId = rid()
+    await recordAntigravityTurn(getPool(), {
+      requestId,
+      userId: uid,
+      modelId: NEON_MODEL,
+      sessionId: 'swarm-neon-1',
+      traceId: null,
+    })
+    // Primary Neon: 100k prompt (90k cached -> 10k uncached), 1k output -> 10.35 fen
+    await customUsageRow({
+      requestId,
+      userId: uid,
+      routeModelId: NEON_MODEL,
+      upstreamModel: 'gemini-4-neon-high',
+      requestType: 'agent',
+      prompt: 100_000,
+      out: 1_000,
+      cached: 90_000,
+    })
+    // 3 heavy uncached agent_monitoring calls on gemini-3.5-flash-lite: 30M uncached input, 6k output
+    //   At 20/80/1: 600.48 fen (vs 18,018 fen if billed at Neon rate!)
+    for (let i = 0; i < 3; i++) {
+      await customUsageRow({
+        requestId,
+        userId: uid,
+        routeModelId: NEON_MODEL,
+        upstreamModel: 'gemini-3.5-flash-lite',
+        requestType: 'agent_monitoring',
+        prompt: 10_000_000,
+        out: 2_000,
+        cached: 0,
+      })
+    }
+    // 1 web_search call on gemini-3.5-flash-lite: 100k uncached input, 1k output -> 2.08 fen at 20/80/1
+    await customUsageRow({
+      requestId,
+      userId: uid,
+      routeModelId: NEON_MODEL,
+      upstreamModel: 'gemini-3.5-flash-lite',
+      requestType: 'web_search',
+      prompt: 100_000,
+      out: 1_000,
+      cached: 0,
+    })
+
+    const done = await settleAntigravityTurnRecord({
+      pool: getPool(),
+      pricing: neonPricingCache,
+      requestId,
+      userId: uid,
+      engineStatus: 'success',
+    })
+    assert.ok(done)
+    // Single ceiling(10.35 + 600.48 + 2.08) = ceil(612.91) = 613 fen (vs 18,092 fen if billed at Neon rate!)
+    assert.equal(await balance(uid), 1_000_000n - 613n)
+    const usage = await query<{
+      cost_credits: string
+      input_tokens: string
+      output_tokens: string
+      cache_read_tokens: string
+      snapshot: Record<string, unknown>
+    }>(
+      `SELECT cost_credits::text, input_tokens::text, output_tokens::text, cache_read_tokens::text,
+              price_snapshot AS snapshot
+         FROM usage_records WHERE request_id = $1 AND user_id = $2`,
+      [requestId, uid.toString()],
+    )
+    assert.equal(usage.rows.length, 1)
+    assert.equal(usage.rows[0]!.cost_credits, '613')
+    assert.equal(usage.rows[0]!.input_tokens, '30110000')
+    assert.equal(usage.rows[0]!.output_tokens, '8000')
+    assert.equal(usage.rows[0]!.cache_read_tokens, '90000')
+    const snap = usage.rows[0]!.snapshot as Record<string, Record<string, unknown>>
+    assert.equal(usage.rows[0]!.snapshot.antigravity_calls, 5)
+    assert.equal(snap.antigravity_aux?.calls, 4)
+    assert.equal(snap.antigravity_aux?.monitoring_calls, 3)
+    assert.equal(snap.antigravity_aux?.input_tokens, '30100000')
+    assert.equal(snap.antigravity_monitoring, undefined)
+  })
+
+  test('B2 real PG trust boundary: identical flash-lite usage settles to identical credits for agent_monitoring vs web_search vs NULL request_type', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const costs: bigint[] = []
+    for (const reqType of ['agent_monitoring', 'web_search', null] as const) {
+      const uid = await user(1_000_000n)
+      const requestId = rid()
+      await recordAntigravityTurn(getPool(), {
+        requestId,
+        userId: uid,
+        modelId: NEON_MODEL,
+        sessionId: `b2-invariance-${reqType ?? 'null'}`,
+        traceId: null,
+      })
+      await customUsageRow({
+        requestId,
+        userId: uid,
+        routeModelId: NEON_MODEL,
+        upstreamModel: 'gemini-3.5-flash-lite',
+        requestType: reqType,
+        prompt: 1_000_000,
+        out: 2_000,
+        cached: 0,
+      })
+      const done = await settleAntigravityTurnRecord({
+        pool: getPool(),
+        pricing: neonPricingCache,
+        requestId,
+        userId: uid,
+        engineStatus: 'success',
+      })
+      assert.ok(done)
+      costs.push(1_000_000n - (await balance(uid)))
+    }
+    // ceil((1_000_000*20 + 2_000*80)/1e6) = ceil(20.16) = 21 fen (vs 606 fen at Neon rate)
+    assert.deepEqual(costs, [21n, 21n, 21n])
+  })
+
+  test('four-quadrant compat & anti-spoof: NULL/empty request_type and spoofed primary agent_monitoring stay accurately billed', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const uid = await user(1_000_000n)
+    const requestId = rid()
+    await recordAntigravityTurn(getPool(), {
+      requestId,
+      userId: uid,
+      modelId: NEON_MODEL,
+      sessionId: 'compat-neon-1',
+      traceId: null,
+    })
+    // 1. Legacy primary row with NULL request_type -> primary Neon rate: 100k * 600 + 1k * 3000 = 63 fen
+    await customUsageRow({
+      requestId,
+      userId: uid,
+      routeModelId: NEON_MODEL,
+      upstreamModel: 'gemini-4-neon-high',
+      requestType: null,
+      prompt: 100_000,
+      out: 1_000,
+    })
+    // 2. Spoofed primary row with request_type='agent_monitoring' -> MUST stay primary Neon rate: 63 fen
+    await customUsageRow({
+      requestId,
+      userId: uid,
+      routeModelId: NEON_MODEL,
+      upstreamModel: 'gemini-4-neon-high',
+      requestType: 'agent_monitoring',
+      prompt: 100_000,
+      out: 1_000,
+    })
+    // 3. Legacy aux row with NULL request_type -> aux light rate (20/80/1), NOT Neon, NOT waived: 2.08 fen
+    await customUsageRow({
+      requestId,
+      userId: uid,
+      routeModelId: NEON_MODEL,
+      upstreamModel: 'gemini-3.5-flash-lite',
+      requestType: null,
+      prompt: 100_000,
+      out: 1_000,
+    })
+
+    const done = await settleAntigravityTurnRecord({
+      pool: getPool(),
+      pricing: neonPricingCache,
+      requestId,
+      userId: uid,
+      engineStatus: 'success',
+    })
+    assert.ok(done)
+    // Primary total = 200k input * 600 + 2k output * 3000 = 126.00 fen
+    // Aux total = 100k input * 20 + 1k output * 80 = 2.08 fen
+    // Single ceiling(128.08) = 129 fen
+    assert.equal(await balance(uid), 1_000_000n - 129n)
+    const snap = (
+      await query<{ snapshot: Record<string, unknown> }>(
+        'SELECT price_snapshot AS snapshot FROM usage_records WHERE request_id = $1',
+        [requestId],
+      )
+    ).rows[0]!.snapshot
+    assert.equal(snap.antigravity_monitoring, undefined)
+    assert.equal((snap.antigravity_primary as Record<string, unknown>).calls, 2)
+    assert.equal((snap.antigravity_aux as Record<string, unknown>).calls, 1)
+  })
+
+  test('refreshWaivedAntigravityUsage folds late flash-lite aux call at light-model rate without inflating at Neon rate', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const uid = await user(1_000n)
+    const requestId = rid()
+    await recordAntigravityTurn(getPool(), {
+      requestId,
+      userId: uid,
+      modelId: NEON_MODEL,
+      sessionId: null,
+      traceId: null,
+    })
+    await customUsageRow({
+      requestId,
+      userId: uid,
+      routeModelId: NEON_MODEL,
+      upstreamModel: 'gemini-4-neon-high',
+      requestType: 'agent',
+      prompt: 10_000,
+      out: 100,
+    })
+    assert.ok(
+      await settleAntigravityTurnRecord({
+        pool: getPool(),
+        pricing: neonPricingCache,
+        requestId,
+        userId: uid,
+        engineStatus: 'error',
+        terminalCode: 'USER_STOPPED',
+      }),
+    )
+    const read = async () =>
+      (
+        await query<{ snapshot: Record<string, unknown>; input_tokens: string }>(
+          'SELECT price_snapshot AS snapshot, input_tokens::text FROM usage_records WHERE request_id = $1',
+          [requestId],
+        )
+      ).rows[0]!
+    const before = await read()
+    assert.equal(before.snapshot.antigravity_calls, 1)
+    // ceil((10_000*600 + 100*3000)/1e6) = ceil(6.3) = 7
+    assert.equal(before.snapshot.wouldHaveCharged, '7')
+
+    // Late flash-lite agent_monitoring row lands after turn stopped: 1M input + 1k output -> 20.08 fen at aux rate (vs 603 at Neon!)
+    await customUsageRow({
+      requestId,
+      userId: uid,
+      routeModelId: NEON_MODEL,
+      upstreamModel: 'gemini-3.5-flash-lite',
+      requestType: 'agent_monitoring',
+      prompt: 1_000_000,
+      out: 1_000,
+    })
+    assert.equal(
+      await refreshWaivedAntigravityUsage({
+        pool: getPool(),
+        pricing: neonPricingCache,
+        requestId,
+        userId: uid,
+      }),
+      true,
+    )
+    const after = await read()
+    assert.equal(after.snapshot.antigravity_calls, 2)
+    // Single ceiling(6.3 + 20.08) = ceil(26.38) = 27 fen (still waived to 0 charged)
+    assert.equal(after.snapshot.wouldHaveCharged, '27')
+    assert.equal(after.input_tokens, '1010000')
+    assert.equal(
+      (after.snapshot.antigravity_aux as Record<string, unknown>).monitoring_calls,
+      1,
+    )
+    assert.equal(await balance(uid), 1_000n)
+    // Idempotent second call
+    assert.equal(
+      await refreshWaivedAntigravityUsage({
+        pool: getPool(),
+        pricing: neonPricingCache,
+        requestId,
+        userId: uid,
+      }),
+      false,
+    )
+  })
+})

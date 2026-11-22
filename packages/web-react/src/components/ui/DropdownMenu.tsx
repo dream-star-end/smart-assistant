@@ -25,7 +25,7 @@ export const DropdownMenuContent = forwardRef<
         // 矮视口（如手机横屏）下按 min(80dvh, Radix 可用高) 封顶并开启纵向滚动（OCV5-778 / OCV5-820）；
         // oc-dropdown-max-h 提供老 WebView 的 80vh 回退，调用方传自定义 max-h-* 时自动让位不冲突。
         !hasUnprefixedMaxH(className) && "oc-dropdown-max-h",
-        "oc-surface-popover z-50 min-w-[11.5rem] overflow-y-auto overflow-x-hidden overscroll-contain rounded-xl p-1.5 text-fg outline-none",
+        "oc-surface-popover z-[var(--z-popover-portal)] min-w-[11.5rem] overflow-y-auto overflow-x-hidden overscroll-contain rounded-xl p-1.5 text-fg outline-none",
         DEFAULT_DROPDOWN_MAX_H,
         "origin-[var(--radix-popper-transform-origin)] data-[state=open]:animate-pop data-[state=closed]:oc-pop-out",
         className,

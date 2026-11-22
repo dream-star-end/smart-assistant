@@ -3,456 +3,51 @@
  *
  * Lazy-loaded (zero first-screen gzip cost). Features:
  *  - Split-pane desktop layout (Roster & Live Telemetry rail + Chronological Collaboration Board)
- *    with smooth mobile tab switcher
- *  - Channel tabs (`#main`, `#parser`, ...), member focus filter (posts by or @mentioning member),
- *    and instant full-text search
- *  - Interactive `@mention`, `@#channel`, and `#seq` jump-and-flash tokens
- *  - Markdown rendering for structured posts, copy button, follow-latest auto-scroll,
- *    and keyboard navigation (`Esc`, `[`, `]`)
+ *    with smooth mobile tab switcher and collapsible Member Profile Bar
+ *  - Channel tabs (`#main`, `#parser`, ...), member focus filter, instant search,
+ *    and first-class `[stall]` / failed-member alert banner with one-click focus
+ *  - Isolated `<SwarmElapsedTicker />` leaf & memoized rows (zero 1s full-tree re-renders)
+ *  - Interactive `@mention`, `@#channel`, `#seq` navigation, scroll-fence follow-latest
+ *    with unread counter, and active/read-only SwarmCommandBar
  */
 import * as RD from "@radix-ui/react-dialog";
-import type { SwarmBoardPost, SwarmMemberSnapshot, SwarmSnapshot } from "@openclaude/protocol/browser";
+import type { SwarmBoardPost, SwarmSnapshot } from "@openclaude/protocol/browser";
 import {
   Activity,
   AlertTriangle,
   ArrowDown,
-  Check,
   ChevronRight,
-  Clock3,
-  Copy,
-  GitBranch,
   Hash,
   MessageSquare,
-  Quote,
+  OctagonX,
   Search,
+  ShieldAlert,
   Users,
-  Wrench,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useOptionalAuth } from "../../hooks/useProjectScope";
 import type { AuthSession } from "../../lib/types";
 import { cn } from "../../lib/utils";
-import { Markdown } from "../Markdown";
-import { Badge, IconButton, useToast } from "../ui";
+import { Badge, Button, IconButton, Spinner, useToast } from "../ui";
 import { AtelierIcon } from "../ui/AtelierIcons";
-import { ModelFamilyIcon } from "../ui/ModelFamilyIcons";
+import { PostRow, RosterMemberRow } from "./SwarmBoardRows";
 import { SwarmCommandBar } from "./SwarmCommandBar";
+import { SwarmElapsedTicker } from "./SwarmElapsedTicker";
+import { SwarmMemberProfileBar } from "./SwarmMemberProfileBar";
 import {
-  formatPostClock,
-  formatSwarmElapsed,
-  formatTelemetryDuration,
+  detectSwarmAlerts,
   formatTelemetryTokens,
-  hasMemberTelemetry,
-  humanizeSwarmModel,
   isSwarmActive,
   memberInitial,
   postMatchesMember,
   summarizeSwarmCounts,
+  summarizeSwarmTelemetry,
   swarmMemberStyle,
   swarmPhaseMeta,
-  swarmRoleLabel,
-  swarmStatusLabel,
-  swarmWorkspaceBadge,
-  tokenizeSwarmInlineText,
 } from "./swarmUtils";
 
-function hasRichMarkdown(text: string): boolean {
-  return /(?:^|\n)(?:#{1,4}\s|```|[-*]\s|\d+\.\s|\|.*\|)|`[^`]+`|\*\*[^*]+\*\*/.test(text);
-}
-
-/**
- * 将富文本 Markdown 中非代码/非链接区域的 @member、@#channel、#seq 转为页内锚点链接，
- * 以便 Markdown 完整渲染的同时，仍然保持点击聚焦成员 / 切换频道 / 跳转序号的交互能力。
- */
-export function linkifySwarmMarkdownTokens(text: string): string {
-  // 跳过围栏代码块、行内代码与已有 Markdown 链接
-  const PROTECTED_RE = /(```[\s\S]*?```|`[^`\n]+`|\[[^\]]*\]\([^)]+\))/g;
-  const parts = text.split(PROTECTED_RE);
-  return parts
-    .map((part, idx) => {
-      if (idx % 2 === 1) return part;
-      return tokenizeSwarmInlineText(part)
-        .map((tok) => {
-          if (tok.kind === "mention") {
-            return `[${tok.value}](#swarm-mention:${encodeURIComponent(tok.target)})`;
-          }
-          if (tok.kind === "channel_mention") {
-            return `[${tok.value}](#swarm-channel:${encodeURIComponent(tok.channel)})`;
-          }
-          if (tok.kind === "seq") {
-            return `[${tok.value}](#swarm-seq:${tok.seq})`;
-          }
-          return tok.value;
-        })
-        .join("");
-    })
-    .join("");
-}
-
-function InteractivePostBody({
-  text,
-  onMention,
-  onChannel,
-  onJumpSeq,
-}: {
-  text: string;
-  onMention: (name: string) => void;
-  onChannel: (ch: string) => void;
-  onJumpSeq: (seq: number) => void;
-}) {
-  const rich = hasRichMarkdown(text);
-  const linkedMarkdown = useMemo(() => (rich ? linkifySwarmMarkdownTokens(text) : ""), [rich, text]);
-
-  if (rich) {
-    return (
-      <div
-        className={cn(
-          "prose-sm max-w-none text-body leading-relaxed text-fg",
-          "[&_a[href^='#swarm-mention:']]:mx-0.5 [&_a[href^='#swarm-mention:']]:inline-flex [&_a[href^='#swarm-mention:']]:items-center [&_a[href^='#swarm-mention:']]:rounded-md [&_a[href^='#swarm-mention:']]:border-0 [&_a[href^='#swarm-mention:']]:bg-accent-soft [&_a[href^='#swarm-mention:']]:px-1.5 [&_a[href^='#swarm-mention:']]:py-0.5 [&_a[href^='#swarm-mention:']]:text-caption [&_a[href^='#swarm-mention:']]:font-medium [&_a[href^='#swarm-mention:']]:text-accent",
-          "[&_a[href^='#swarm-channel:']]:mx-0.5 [&_a[href^='#swarm-channel:']]:inline-flex [&_a[href^='#swarm-channel:']]:items-center [&_a[href^='#swarm-channel:']]:rounded-md [&_a[href^='#swarm-channel:']]:border-0 [&_a[href^='#swarm-channel:']]:bg-info-soft [&_a[href^='#swarm-channel:']]:px-1.5 [&_a[href^='#swarm-channel:']]:py-0.5 [&_a[href^='#swarm-channel:']]:text-caption [&_a[href^='#swarm-channel:']]:font-medium [&_a[href^='#swarm-channel:']]:text-info",
-          "[&_a[href^='#swarm-seq:']]:mx-0.5 [&_a[href^='#swarm-seq:']]:inline-flex [&_a[href^='#swarm-seq:']]:items-center [&_a[href^='#swarm-seq:']]:rounded [&_a[href^='#swarm-seq:']]:border-0 [&_a[href^='#swarm-seq:']]:bg-hover [&_a[href^='#swarm-seq:']]:px-1.5 [&_a[href^='#swarm-seq:']]:py-0.5 [&_a[href^='#swarm-seq:']]:font-mono [&_a[href^='#swarm-seq:']]:text-caption [&_a[href^='#swarm-seq:']]:font-medium [&_a[href^='#swarm-seq:']]:text-muted",
-        )}
-        onClick={(e) => {
-          const anchor = (e.target as HTMLElement | null)?.closest("a");
-          const href = anchor?.getAttribute("href");
-          if (!href || !href.startsWith("#swarm-")) return;
-          e.preventDefault();
-          if (href.startsWith("#swarm-mention:")) {
-            const target = decodeURIComponent(href.slice("#swarm-mention:".length));
-            if (target && target !== "all") onMention(target);
-          } else if (href.startsWith("#swarm-channel:")) {
-            const ch = decodeURIComponent(href.slice("#swarm-channel:".length));
-            if (ch) onChannel(ch);
-          } else if (href.startsWith("#swarm-seq:")) {
-            const seq = Number.parseInt(href.slice("#swarm-seq:".length), 10);
-            if (Number.isFinite(seq) && seq > 0) onJumpSeq(seq);
-          }
-        }}
-      >
-        <Markdown>{linkedMarkdown}</Markdown>
-      </div>
-    );
-  }
-  const tokens = tokenizeSwarmInlineText(text);
-  return (
-    <p className="whitespace-pre-wrap break-words text-body leading-relaxed text-fg">
-      {tokens.map((tok, idx) => {
-        if (tok.kind === "mention") {
-          return (
-            <button
-              key={idx}
-              type="button"
-              onClick={() => tok.target !== "all" && onMention(tok.target)}
-              className={cn(
-                "mx-0.5 inline-flex items-center rounded-md px-1.5 py-0.5 text-caption font-medium transition-colors",
-                tok.target === "all"
-                  ? "bg-warning-soft text-warning"
-                  : "bg-accent-soft text-accent hover:bg-accent/20",
-              )}
-            >
-              {tok.value}
-            </button>
-          );
-        }
-        if (tok.kind === "channel_mention") {
-          return (
-            <button
-              key={idx}
-              type="button"
-              onClick={() => onChannel(tok.channel)}
-              className="mx-0.5 inline-flex items-center rounded-md bg-info-soft px-1.5 py-0.5 text-caption font-medium text-info transition-colors hover:bg-info/20"
-            >
-              {tok.value}
-            </button>
-          );
-        }
-        if (tok.kind === "seq") {
-          return (
-            <button
-              key={idx}
-              type="button"
-              onClick={() => onJumpSeq(tok.seq)}
-              className="mx-0.5 inline-flex items-center rounded bg-hover px-1.5 py-0.5 font-mono text-caption font-medium text-muted transition-colors hover:bg-active hover:text-fg"
-            >
-              {tok.value}
-            </button>
-          );
-        }
-        return <span key={idx}>{tok.value}</span>;
-      })}
-    </p>
-  );
-}
-
-function RosterMemberRow({
-  member,
-  activeSwarm,
-  selected,
-  onSelect,
-}: {
-  member: SwarmMemberSnapshot;
-  activeSwarm: boolean;
-  selected: boolean;
-  onSelect: () => void;
-}) {
-  const style = swarmMemberStyle(member.name, member.role);
-  const working = member.status === "working" && activeSwarm;
-  const killed = member.status === "killed";
-  const modelText = humanizeSwarmModel(member.model);
-  const wsBadge = swarmWorkspaceBadge(member.workspace);
-  const showTelemetry = hasMemberTelemetry(member);
-  const elapsedText = formatTelemetryDuration(member.elapsedMs);
-  const tokensText = formatTelemetryTokens(member.inputTokens, member.outputTokens);
-  const approxPrefix = member.telemetryPartial ? "~" : "";
-
-  return (
-    <button
-      type="button"
-      onClick={onSelect}
-      aria-pressed={selected}
-      className={cn(
-        "oc-stagger-in oc-hover-lift oc-spring-press flex w-full items-start gap-2.5 rounded-xl border px-2.5 py-2 text-left transition-all duration-150",
-        "outline-none focus-visible:ring-2 focus-visible:ring-ring",
-        selected
-          ? "border-accent/45 bg-accent-soft/60 shadow-soft"
-          : killed
-            ? "border-transparent opacity-60 hover:bg-hover/60"
-            : "border-transparent hover:bg-hover/70",
-      )}
-    >
-      <span
-        className={cn(
-          "relative mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg text-caption font-semibold",
-          style.avatar,
-        )}
-      >
-        {memberInitial(member.name)}
-        <span
-          title={swarmStatusLabel(member.status)}
-          className={cn(
-            "absolute -bottom-0.5 -right-0.5 size-2 rounded-full ring-2 ring-surface",
-            member.failed
-              ? "bg-danger"
-              : working
-                ? "bg-accent"
-                : killed
-                  ? "bg-faint"
-                  : "bg-success",
-          )}
-        />
-      </span>
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-1.5">
-          <span className="truncate text-meta font-semibold text-fg">@{member.name}</span>
-          <span className="shrink-0 rounded bg-hover px-1 py-0 text-micro text-muted">
-            {swarmRoleLabel(member.role)}
-          </span>
-          {wsBadge && (
-            <span
-              title={wsBadge.title}
-              className="inline-flex shrink-0 items-center gap-0.5 rounded bg-info-soft px-1 py-0 text-micro font-medium text-info"
-            >
-              <GitBranch size={9} />
-              {wsBadge.label}
-            </span>
-          )}
-          {member.unreadCount > 0 && activeSwarm && (
-            <span className="ml-auto shrink-0 rounded-full bg-accent-soft px-1.5 py-0 font-mono text-micro font-medium text-accent tabular-nums">
-              +{member.unreadCount}
-            </span>
-          )}
-        </div>
-        <div
-          className={cn(
-            "mt-0.5 truncate text-caption",
-            member.failed
-              ? "text-danger"
-              : working
-                ? "text-muted oc-live-status-shine"
-                : "text-faint",
-          )}
-          title={member.lastError || member.activity || ""}
-        >
-          {member.failed
-            ? member.lastError || "执行异常"
-            : member.activity || swarmStatusLabel(member.status)}
-        </div>
-        <div className="mt-1 flex items-center gap-2 text-micro text-faint">
-          {modelText && (
-            <span className="inline-flex min-w-0 items-center gap-1 truncate">
-              <ModelFamilyIcon model={member.model ?? modelText} size={13} className="shrink-0 text-muted" />
-              <span className="truncate">{modelText}</span>
-            </span>
-          )}
-          {member.stepCount > 0 && (
-            <span className="shrink-0 font-mono tabular-nums">{member.stepCount} 步</span>
-          )}
-          {member.lastPostSeq !== undefined && (
-            <span className="shrink-0 font-mono tabular-nums">最近 #{member.lastPostSeq}</span>
-          )}
-        </div>
-        {showTelemetry && (
-          <div
-            className="mt-1.5 flex flex-wrap items-center gap-1 text-micro text-muted"
-            data-testid={`swarm-member-telemetry-${member.name}`}
-          >
-            {elapsedText && (
-              <span
-                className="inline-flex items-center gap-0.5 rounded bg-hover px-1.5 py-0.5 font-mono tabular-nums"
-                title="成员累计运行耗时"
-              >
-                <Clock3 size={9} aria-hidden className="text-faint" />
-                {approxPrefix}
-                {elapsedText}
-              </span>
-            )}
-            {tokensText && (
-              <span
-                className="inline-flex items-center gap-0.5 rounded bg-hover px-1.5 py-0.5 font-mono tabular-nums"
-                title="输入 / 输出 Token 用量"
-              >
-                <Activity size={9} aria-hidden className="text-faint" />
-                {approxPrefix}
-                {tokensText}
-              </span>
-            )}
-            {typeof member.toolCalls === "number" && (
-              <span
-                className="inline-flex items-center gap-0.5 rounded bg-hover px-1.5 py-0.5 font-mono tabular-nums"
-                title="工具调用次数"
-              >
-                <Wrench size={9} aria-hidden className="text-faint" />
-                {approxPrefix}
-                {member.toolCalls} 次
-              </span>
-            )}
-          </div>
-        )}
-      </div>
-    </button>
-  );
-}
-
-function PostRow({
-  post,
-  highlighted,
-  onMention,
-  onChannel,
-  onJumpSeq,
-  onQuote,
-  setRowRef,
-}: {
-  post: SwarmBoardPost;
-  highlighted: boolean;
-  onMention: (name: string) => void;
-  onChannel: (ch: string) => void;
-  onJumpSeq: (seq: number) => void;
-  onQuote?: (post: SwarmBoardPost) => void;
-  setRowRef: (seq: number, el: HTMLDivElement | null) => void;
-}) {
-  const [copied, setCopied] = useState(false);
-  const [expanded, setExpanded] = useState(false);
-  const toast = useToast();
-  const style = swarmMemberStyle(post.agent);
-  const clock = formatPostClock(post.time);
-  const isDoneMarker = post.text.trimStart().startsWith("[done]");
-  const isLong = post.text.length > 900;
-  const shownText = isLong && !expanded ? `${post.text.slice(0, 900)}…` : post.text;
-
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(post.text);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-    } catch {
-      toast("复制失败，请手动选中文本复制", "error");
-    }
-  };
-
-  return (
-    <div
-      ref={(el) => setRowRef(post.seq, el)}
-      data-swarm-post-seq={post.seq}
-      className={cn(
-        "oc-surface-card oc-stagger-in oc-hover-lift group rounded-2xl px-3.5 py-3 transition-all duration-200",
-        highlighted
-          ? "border-accent bg-accent-soft/40 ring-2 ring-accent/30"
-          : isDoneMarker
-            ? "oc-callout oc-callout-success"
-            : "hover:border-border-strong",
-      )}
-    >
-      <div className="mb-2 flex flex-wrap items-center gap-2">
-        <span className="rounded-md bg-hover px-1.5 py-0.5 font-mono text-caption font-semibold text-muted tabular-nums">
-          #{post.seq}
-        </span>
-        <button
-          type="button"
-          onClick={() => onMention(post.agent)}
-          className={cn(
-            "inline-flex items-center gap-1 rounded-lg border px-2 py-0.5 text-caption font-semibold transition-opacity hover:opacity-85",
-            style.badge,
-          )}
-        >
-          <span>@{post.agent}</span>
-        </button>
-        {post.channel && post.channel !== "main" && (
-          <button
-            type="button"
-            onClick={() => onChannel(post.channel!)}
-            className="inline-flex items-center gap-0.5 rounded-md bg-info-soft px-1.5 py-0.5 text-caption font-medium text-info hover:bg-info/20"
-          >
-            <Hash size={10} />
-            {post.channel}
-          </button>
-        )}
-        {isDoneMarker && <Badge tone="success">阶段完结</Badge>}
-        <div className="ml-auto flex items-center gap-1">
-          {clock && <span className="font-mono text-micro text-faint tabular-nums">{clock}</span>}
-          {onQuote && (
-            <button
-              type="button"
-              onClick={() => onQuote(post)}
-              aria-label={`引用 #${post.seq} 到主线`}
-              title="引用到主输入框"
-              data-testid={`swarm-quote-post-${post.seq}`}
-              className="flex size-7 items-center justify-center rounded-md text-faint opacity-0 transition-all hover:bg-hover hover:text-fg group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:size-11 [@media(hover:none)]:opacity-100"
-            >
-              <Quote size={12} />
-            </button>
-          )}
-          <button
-            type="button"
-            onClick={() => void copy()}
-            aria-label="复制讨论内容"
-            title="复制"
-            className="flex size-7 items-center justify-center rounded-md text-faint opacity-0 transition-all hover:bg-hover hover:text-fg group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:size-11 [@media(hover:none)]:opacity-100"
-          >
-            {copied ? <Check size={12} className="oc-check-pop text-success" /> : <Copy size={12} />}
-          </button>
-        </div>
-      </div>
-
-      <InteractivePostBody
-        text={shownText}
-        onMention={onMention}
-        onChannel={onChannel}
-        onJumpSeq={onJumpSeq}
-      />
-
-      {isLong && (
-        <button
-          type="button"
-          onClick={() => setExpanded((v) => !v)}
-          className="mt-2 text-caption font-medium text-accent hover:underline"
-        >
-          {expanded ? "收起长文" : `展开完整内容（共 ${post.text.length} 字）`}
-        </button>
-      )}
-    </div>
-  );
-}
+export { hasRichMarkdown, linkifySwarmMarkdownTokens } from "./SwarmBoardRows";
 
 export function SwarmBoardDrawer({
   open,
@@ -463,6 +58,8 @@ export function SwarmBoardDrawer({
   initialFocusMember = null,
   initialFocusChannel = null,
   initialFocusSeq = null,
+  syncStale = false,
+  onStopSwarm,
   onQuoteToComposer,
 }: {
   open: boolean;
@@ -473,6 +70,8 @@ export function SwarmBoardDrawer({
   initialFocusMember?: string | null;
   initialFocusChannel?: string | null;
   initialFocusSeq?: number | null;
+  syncStale?: boolean;
+  onStopSwarm?: () => void;
   onQuoteToComposer?: (text: string) => void;
 }) {
   const ctxAuth = useOptionalAuth();
@@ -484,9 +83,11 @@ export function SwarmBoardDrawer({
   const [showKilledRoster, setShowKilledRoster] = useState(false);
   const [followLatest, setFollowLatest] = useState(true);
   const [isNearBottom, setIsNearBottom] = useState(true);
+  const [unreadNewCount, setUnreadNewCount] = useState(0);
   const [mobileTab, setMobileTab] = useState<"board" | "roster">("board");
   const [highlightedSeq, setHighlightedSeq] = useState<number | null>(null);
-  const [now, setNow] = useState(() => Date.now());
+  const [confirmAbort, setConfirmAbort] = useState(false);
+  const [optimisticPosts, setOptimisticPosts] = useState<SwarmBoardPost[]>([]);
   const toast = useToast();
 
   const contentRef = useRef<HTMLDivElement>(null);
@@ -495,23 +96,58 @@ export function SwarmBoardDrawer({
   const postRefs = useRef(new Map<number, HTMLDivElement>());
   const highlightTimerRef = useRef<number | null>(null);
   const pendingJumpSeqRef = useRef<number | null>(null);
+  const programmaticScrollRef = useRef(false);
+  const programmaticScrollTimerRef = useRef<number | null>(null);
+  const lastSeenSeqRef = useRef<number>(0);
   const snapshotRef = useRef(snapshot);
   snapshotRef.current = snapshot;
 
+  // Clear optimistic posts when switching to a different swarm or closing drawer.
+  const currentSwarmId = snapshot?.swarmId ?? null;
   useEffect(() => {
-    if (!open) return;
-    setSelectedMember(initialFocusMember ?? null);
-    setSelectedChannel(initialFocusChannel ?? null);
+    setOptimisticPosts([]);
+    setConfirmAbort(false);
+  }, [currentSwarmId]);
+
+  useEffect(() => {
+    if (!open) {
+      setConfirmAbort(false);
+      return;
+    }
+    const snap = snapshotRef.current;
+    const targetPost =
+      typeof initialFocusSeq === "number" && initialFocusSeq > 0
+        ? snap?.posts.find((p) => p.seq === initialFocusSeq)
+        : undefined;
+
+    // Guarantee target post visibility when jumping into a specific #seq across channels/members.
+    const nextChannel = targetPost
+      ? initialFocusChannel && (targetPost.channel || "main") === initialFocusChannel
+        ? initialFocusChannel
+        : null
+      : (initialFocusChannel ?? null);
+    const nextMember = targetPost
+      ? initialFocusMember && postMatchesMember(targetPost, initialFocusMember)
+        ? initialFocusMember
+        : null
+      : (initialFocusMember ?? null);
+
+    setSelectedMember(nextMember);
+    setSelectedChannel(nextChannel);
     setSearch("");
     setMobileSearchOpen(false);
     setMobileTab("board");
+    setUnreadNewCount(0);
     const focusedIsKilled = Boolean(
-      initialFocusMember &&
-        snapshotRef.current?.members.some(
-          (m) => m.status === "killed" && m.name.toLowerCase() === initialFocusMember.toLowerCase(),
+      nextMember &&
+        snap?.members.some(
+          (m) => m.status === "killed" && m.name.toLowerCase() === nextMember.toLowerCase(),
         ),
     );
     setShowKilledRoster(focusedIsKilled);
+    const headSeq = snap?.posts[snap.posts.length - 1]?.seq ?? 0;
+    lastSeenSeqRef.current = headSeq;
+
     if (typeof initialFocusSeq === "number" && initialFocusSeq > 0) {
       pendingJumpSeqRef.current = initialFocusSeq;
       setFollowLatest(false);
@@ -520,6 +156,7 @@ export function SwarmBoardDrawer({
       if (highlightTimerRef.current !== null) window.clearTimeout(highlightTimerRef.current);
       highlightTimerRef.current = window.setTimeout(() => setHighlightedSeq(null), 2200);
     } else {
+      pendingJumpSeqRef.current = null;
       setFollowLatest(true);
       setIsNearBottom(true);
     }
@@ -533,21 +170,46 @@ export function SwarmBoardDrawer({
   const active = snapshot ? isSwarmActive(snapshot.phase) : false;
 
   useEffect(() => {
-    if (!open || !active) return;
-    const id = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, [open, active]);
+    if (!active && confirmAbort) setConfirmAbort(false);
+  }, [active, confirmAbort]);
 
   useEffect(() => {
     return () => {
       if (highlightTimerRef.current !== null) window.clearTimeout(highlightTimerRef.current);
+      if (programmaticScrollTimerRef.current !== null) {
+        window.clearTimeout(programmaticScrollTimerRef.current);
+      }
     };
   }, []);
+
+  // Merge confirmed snapshot posts with any pending optimistic steer posts (auto-deduplicated by seq).
+  const { mergedPosts, optimisticSeqSet } = useMemo(() => {
+    if (!snapshot) return { mergedPosts: [] as SwarmBoardPost[], optimisticSeqSet: new Set<number>() };
+    if (optimisticPosts.length === 0) {
+      return { mergedPosts: snapshot.posts, optimisticSeqSet: new Set<number>() };
+    }
+    const confirmedSeqs = new Set(snapshot.posts.map((p) => p.seq));
+    const pending = optimisticPosts.filter((p) => !confirmedSeqs.has(p.seq));
+    if (pending.length === 0) {
+      return { mergedPosts: snapshot.posts, optimisticSeqSet: new Set<number>() };
+    }
+    const merged = [...snapshot.posts, ...pending].sort((a, b) => a.seq - b.seq);
+    return { mergedPosts: merged, optimisticSeqSet: new Set(pending.map((p) => p.seq)) };
+  }, [snapshot, optimisticPosts]);
+
+  // Drop confirmed optimistic posts so memory stays clean.
+  useEffect(() => {
+    if (!snapshot || optimisticPosts.length === 0) return;
+    const confirmedSeqs = new Set(snapshot.posts.map((p) => p.seq));
+    if (optimisticPosts.some((p) => confirmedSeqs.has(p.seq))) {
+      setOptimisticPosts((prev) => prev.filter((p) => !confirmedSeqs.has(p.seq)));
+    }
+  }, [snapshot, optimisticPosts]);
 
   const filteredPosts = useMemo(() => {
     if (!snapshot) return [];
     const q = search.trim().toLowerCase();
-    return snapshot.posts.filter((post) => {
+    return mergedPosts.filter((post) => {
       if (selectedChannel && (post.channel || "main") !== selectedChannel) return false;
       if (selectedMember && !postMatchesMember(post, selectedMember)) return false;
       if (q) {
@@ -556,38 +218,120 @@ export function SwarmBoardDrawer({
       }
       return true;
     });
-  }, [snapshot, selectedChannel, selectedMember, search]);
+  }, [snapshot, mergedPosts, selectedChannel, selectedMember, search]);
 
-  // Auto-follow newest board posts when enabled.
+  const armProgrammaticScrollFence = useCallback((durationMs: number) => {
+    programmaticScrollRef.current = true;
+    if (programmaticScrollTimerRef.current !== null) {
+      window.clearTimeout(programmaticScrollTimerRef.current);
+    }
+    programmaticScrollTimerRef.current = window.setTimeout(() => {
+      programmaticScrollRef.current = false;
+      programmaticScrollTimerRef.current = null;
+    }, durationMs);
+  }, []);
+
+  // Single helper for scrolling feed to bottom (strictly respects UI-SCROLL-SINGLE-WRITER budget).
+  const scrollFeedToBottom = useCallback(
+    (smooth: boolean) => {
+      const el = feedRef.current;
+      if (!el) return;
+      armProgrammaticScrollFence(smooth ? 420 : 80);
+      if (smooth && typeof el.scrollTo === "function") {
+        el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+      } else {
+        el.scrollTop = el.scrollHeight;
+      }
+    },
+    [armProgrammaticScrollFence],
+  );
+
+  // Auto-follow newest board posts when enabled; accumulate unread count while paused.
   const latestPostSeq = filteredPosts[filteredPosts.length - 1]?.seq ?? 0;
   useEffect(() => {
-    if (!open || !followLatest || !feedRef.current) return;
-    feedRef.current.scrollTop = feedRef.current.scrollHeight;
-  }, [open, followLatest, latestPostSeq]);
+    if (!open) return;
+    if (followLatest) {
+      lastSeenSeqRef.current = Math.max(lastSeenSeqRef.current, latestPostSeq);
+      setUnreadNewCount(0);
+      scrollFeedToBottom(false);
+    } else if (latestPostSeq > lastSeenSeqRef.current) {
+      const unseen = filteredPosts.filter((p) => p.seq > lastSeenSeqRef.current).length;
+      setUnreadNewCount(unseen);
+    }
+  }, [open, followLatest, latestPostSeq, filteredPosts, scrollFeedToBottom]);
 
-  const setRowRef = useCallback((seq: number, el: HTMLDivElement | null) => {
+  // Recalculate overflow when filter narrows results so the jump-to-bottom pill hides on <=1 screen.
+  useEffect(() => {
+    if (!open) return;
+    const el = feedRef.current;
+    if (!el) return;
+    const noOverflow = el.scrollHeight - el.clientHeight <= 48;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+    if (noOverflow || nearBottom) {
+      setIsNearBottom(true);
+      setUnreadNewCount(0);
+      lastSeenSeqRef.current = Math.max(lastSeenSeqRef.current, latestPostSeq);
+    }
+  }, [open, filteredPosts.length, selectedChannel, selectedMember, search, latestPostSeq]);
+
+  const registerRowRef = useCallback((seq: number, el: HTMLDivElement | null) => {
     if (el) postRefs.current.set(seq, el);
     else postRefs.current.delete(seq);
   }, []);
 
+  const handleMention = useCallback((name: string) => {
+    setSelectedMember(name);
+    setMobileTab("board");
+  }, []);
+
+  const handleChannel = useCallback((ch: string) => {
+    setSelectedChannel(ch);
+  }, []);
+
+  const handleSelectRosterMember = useCallback((memberName: string) => {
+    setSelectedMember((prev) =>
+      prev?.toLowerCase() === memberName.toLowerCase() ? null : memberName,
+    );
+    setMobileTab("board");
+  }, []);
+
+  const handleOptimisticSteer = useCallback((post: SwarmBoardPost) => {
+    setOptimisticPosts((prev) => {
+      if (prev.some((p) => p.seq === post.seq)) return prev;
+      return [...prev, post];
+    });
+  }, []);
+
   const jumpToSeq = useCallback(
     (seq: number) => {
-      const existsInWindow = snapshot?.posts.some((p) => p.seq === seq) ?? false;
-      if (!existsInWindow) {
+      const targetPost = mergedPosts.find((p) => p.seq === seq);
+      if (!targetPost) {
         toast(`#${seq} 属于更早的历史记录，当前窗口未保留`, "info");
         return;
       }
+      // Preserve active filters when the target #seq is already visible; only clear conflicting ones.
+      const visibleNow = filteredPosts.some((p) => p.seq === seq);
+      if (!visibleNow) {
+        if (selectedChannel && (targetPost.channel || "main") !== selectedChannel) {
+          setSelectedChannel(null);
+        }
+        if (selectedMember && !postMatchesMember(targetPost, selectedMember)) {
+          setSelectedMember(null);
+        }
+        const q = search.trim().toLowerCase();
+        if (q) {
+          const hay = `#${targetPost.seq} @${targetPost.agent} ${targetPost.channel ?? ""} ${targetPost.text}`.toLowerCase();
+          if (!hay.includes(q)) setSearch("");
+        }
+      }
       pendingJumpSeqRef.current = seq;
-      setSelectedMember(null);
-      setSelectedChannel(null);
-      setSearch("");
       setFollowLatest(false);
       setMobileTab("board");
       setHighlightedSeq(seq);
       if (highlightTimerRef.current !== null) window.clearTimeout(highlightTimerRef.current);
       highlightTimerRef.current = window.setTimeout(() => setHighlightedSeq(null), 2200);
     },
-    [snapshot, toast],
+    [mergedPosts, filteredPosts, selectedChannel, selectedMember, search, toast],
   );
 
   useEffect(() => {
@@ -596,8 +340,9 @@ export function SwarmBoardDrawer({
     const target = postRefs.current.get(seq);
     if (!target) return;
     pendingJumpSeqRef.current = null;
+    armProgrammaticScrollFence(420);
     target.scrollIntoView?.({ behavior: "smooth", block: "center" });
-  }, [open, filteredPosts, highlightedSeq]);
+  }, [open, filteredPosts, highlightedSeq, armProgrammaticScrollFence]);
 
   const quotePostToMainline = useCallback(
     (post: SwarmBoardPost) => {
@@ -611,7 +356,19 @@ export function SwarmBoardDrawer({
     [onQuoteToComposer, onOpenChange, toast],
   );
 
-  // `[` / `]` keyboard stepping across posts when not typing in search input.
+  const followUpSummaryToMainline = useCallback(() => {
+    if (!onQuoteToComposer || !snapshot) return;
+    const tail = mergedPosts[mergedPosts.length - 1];
+    if (tail) {
+      quotePostToMainline(tail);
+      return;
+    }
+    onQuoteToComposer(`> [蜂群协作「${snapshot.title || "蜂群协作"}」]\n> 请基于上述协作结果继续：`);
+    onOpenChange(false);
+    toast("已引用蜂群上下文到主输入框", "success");
+  }, [onQuoteToComposer, snapshot, mergedPosts, quotePostToMainline, onOpenChange, toast]);
+
+  // `[` / `]` keyboard stepping across currently filtered posts when not typing in inputs.
   useEffect(() => {
     if (!open || filteredPosts.length === 0) return;
     const onKey = (e: KeyboardEvent) => {
@@ -625,7 +382,7 @@ export function SwarmBoardDrawer({
           : filteredPosts.length - 1;
       const nextIdx =
         e.key === "["
-          ? Math.max(0, (idx <= 0 ? 0 : idx - 1))
+          ? Math.max(0, idx <= 0 ? 0 : idx - 1)
           : Math.min(filteredPosts.length - 1, idx < 0 ? 0 : idx + 1);
       const target = filteredPosts[nextIdx];
       if (target) jumpToSeq(target.seq);
@@ -642,19 +399,35 @@ export function SwarmBoardDrawer({
     () => (snapshot ? snapshot.members.filter((m) => m.status === "killed") : []),
     [snapshot],
   );
+  const selectedMemberObj = useMemo(() => {
+    if (!snapshot || !selectedMember) return null;
+    const key = selectedMember.toLowerCase();
+    return snapshot.members.find((m) => m.name.toLowerCase() === key) ?? null;
+  }, [snapshot, selectedMember]);
+
+  const telemetrySummary = useMemo(
+    () => (snapshot ? summarizeSwarmTelemetry(snapshot.members) : null),
+    [snapshot],
+  );
+  const alerts = useMemo(() => (snapshot ? detectSwarmAlerts(snapshot) : null), [snapshot]);
 
   if (!snapshot) return null;
 
   const phase = swarmPhaseMeta(snapshot.phase);
   const counts = summarizeSwarmCounts(snapshot.members);
-  const elapsed = active ? formatSwarmElapsed(snapshot.startedAt, now) : "";
   const showChannelBar = snapshot.channels.length > 1;
   const trimmedSearch = search.trim();
+  const totalTokensLabel = telemetrySummary?.hasTokens
+    ? `${telemetrySummary.partial ? "~" : ""}${formatTelemetryTokens(
+        telemetrySummary.inputTokens,
+        telemetrySummary.outputTokens,
+      )}`
+    : "";
 
   return (
     <RD.Root open={open} onOpenChange={onOpenChange}>
       <RD.Portal>
-        <RD.Overlay className="fixed inset-0 z-50 bg-black/35 backdrop-blur-sm data-[state=open]:animate-fade" />
+        <RD.Overlay className="fixed inset-0 z-[var(--z-drawer)] bg-black/35 backdrop-blur-sm data-[state=open]:animate-fade" />
         <RD.Content
           ref={contentRef}
           tabIndex={-1}
@@ -666,8 +439,8 @@ export function SwarmBoardDrawer({
             contentRef.current?.focus({ preventScroll: true });
           }}
           className={cn(
-            "oc-surface-popover fixed inset-x-0 bottom-0 top-auto z-50 flex translate-x-0 translate-y-0 flex-col overflow-hidden text-fg outline-none",
-            "h-[92dvh] max-h-[92dvh] w-full rounded-t-2xl rounded-b-none pb-[env(safe-area-inset-bottom,0px)] oc-sheet-in-bottom",
+            "oc-surface-popover fixed inset-x-0 bottom-0 top-auto z-[var(--z-drawer)] flex translate-x-0 translate-y-0 flex-col overflow-hidden text-fg outline-none",
+            "h-[92dvh] max-h-[min(92dvh,calc(var(--oc-visual-height,100dvh)-1rem))] w-full rounded-t-2xl rounded-b-none pb-[env(safe-area-inset-bottom,0px)] oc-sheet-in-bottom",
             "sm:inset-x-auto sm:bottom-auto sm:left-1/2 sm:top-1/2 sm:-translate-x-1/2 sm:-translate-y-1/2",
             "sm:h-[84dvh] sm:max-h-[min(84dvh,calc(var(--oc-visual-height,100dvh)-2rem))] sm:w-[calc(100vw-2.5rem)] sm:max-w-5xl sm:rounded-2xl sm:animate-in",
           )}
@@ -709,6 +482,15 @@ export function SwarmBoardDrawer({
                 <Badge tone={phase.tone} className="shrink-0">
                   {phase.label}
                 </Badge>
+                {syncStale && (
+                  <span
+                    data-testid="swarm-sync-reconnecting"
+                    className="inline-flex shrink-0 items-center gap-1 rounded-full bg-warning-soft px-2 py-0.5 text-micro font-medium text-warning"
+                  >
+                    <Spinner size={10} />
+                    同步重连中
+                  </span>
+                )}
               </div>
               <div className="mt-0.5 hidden flex-wrap items-center gap-x-3 gap-y-0.5 text-caption text-faint sm:flex">
                 <span className="tabular-nums">
@@ -718,7 +500,33 @@ export function SwarmBoardDrawer({
                   {counts.killed > 0 ? ` · ${counts.killed} 已回收` : ""}
                 </span>
                 <span className="tabular-nums">{snapshot.totalPosts} 条讨论</span>
-                {elapsed && <span className="font-mono tabular-nums text-muted">{elapsed}</span>}
+                <SwarmElapsedTicker
+                  startedAt={snapshot.startedAt}
+                  endedAt={snapshot.updatedAt}
+                  active={active}
+                  prefix={active ? undefined : "总耗时 "}
+                  data-testid="swarm-drawer-elapsed"
+                  className="font-mono tabular-nums text-muted"
+                />
+                {totalTokensLabel && (
+                  <span
+                    data-testid="swarm-drawer-total-tokens"
+                    title={
+                      telemetrySummary?.cacheHitRatePct != null
+                        ? `整群总 Token · 缓存命中率 ${telemetrySummary.cacheHitRatePct}%`
+                        : "整群输入 / 输出 Token 汇总"
+                    }
+                    className="inline-flex items-center gap-1 font-mono tabular-nums text-muted"
+                  >
+                    <Activity size={11} aria-hidden className="text-faint" />
+                    <span>{totalTokensLabel}</span>
+                    {telemetrySummary?.cacheHitRatePct != null && (
+                      <span className="rounded bg-hover px-1 py-0 text-micro text-muted">
+                        缓存 {telemetrySummary.cacheHitRatePct}%
+                      </span>
+                    )}
+                  </span>
+                )}
                 {counts.failed > 0 && (
                   <span className="inline-flex items-center gap-1 text-danger">
                     <AlertTriangle size={11} />
@@ -728,9 +536,26 @@ export function SwarmBoardDrawer({
               </div>
             </div>
 
-            {/* Desktop inline search (sm+) + Mobile search toggle (<640px) + Close */}
+            {/* Desktop inline search (sm+) + Abort swarm + Mobile search toggle + Close */}
             <div className="flex shrink-0 items-center gap-1 sm:gap-1.5">
-              <div className="relative hidden sm:block sm:w-52">
+              {active && onStopSwarm && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  data-testid="swarm-abort-trigger"
+                  onClick={() => setConfirmAbort((v) => !v)}
+                  title="中止整轮蜂群协作"
+                  className={cn(
+                    "oc-spring-press min-h-11 shrink-0 text-danger sm:min-h-8",
+                    confirmAbort && "ring-2 ring-ring",
+                  )}
+                >
+                  <OctagonX size={13} aria-hidden />
+                  <span className="hidden sm:inline">中止蜂群</span>
+                </Button>
+              )}
+              <div className="relative hidden sm:block sm:w-48 lg:w-52">
                 <Search
                   size={13}
                   strokeWidth={1.75}
@@ -759,7 +584,7 @@ export function SwarmBoardDrawer({
                 data-testid="swarm-mobile-search-toggle"
                 shape="square"
                 className={cn(
-                  "oc-spring-press size-8 shrink-0 sm:hidden",
+                  "oc-spring-press min-h-11 min-w-11 shrink-0 sm:hidden",
                   (mobileSearchOpen || Boolean(trimmedSearch)) && "bg-accent-soft text-accent",
                 )}
               >
@@ -769,12 +594,87 @@ export function SwarmBoardDrawer({
                 onClick={() => onOpenChange(false)}
                 aria-label="关闭蜂群看板"
                 shape="square"
-                className="oc-spring-press size-8 shrink-0"
+                className="oc-spring-press min-h-11 min-w-11 shrink-0 sm:min-h-0 sm:min-w-0 sm:size-8"
               >
                 <X size={16} strokeWidth={1.75} />
               </IconButton>
             </div>
           </div>
+
+          {/* Two-step abort entire swarm confirmation bar */}
+          {active && confirmAbort && onStopSwarm && (
+            <div
+              data-testid="swarm-abort-confirm"
+              className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-danger-soft/50 px-3.5 py-2 sm:px-4"
+            >
+              <span className="inline-flex items-center gap-1.5 text-caption font-semibold text-danger">
+                <ShieldAlert size={14} aria-hidden />
+                确认中止整轮蜂群协作？正在运行的成员将被中断，已产出的讨论记录会保留。
+              </span>
+              <div className="flex shrink-0 items-center gap-1.5">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => setConfirmAbort(false)}
+                  className="min-h-11 sm:min-h-8"
+                >
+                  取消
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="danger"
+                  data-testid="swarm-abort-confirm-btn"
+                  onClick={() => {
+                    setConfirmAbort(false);
+                    onStopSwarm();
+                    toast("已请求中止整轮蜂群协作", "info");
+                  }}
+                  className="min-h-11 sm:min-h-8"
+                >
+                  <OctagonX size={12} aria-hidden />
+                  确认中止
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {/* Restrained stall / failed-member alert strip with one-click focus */}
+          {alerts?.hasAlert && (
+            <div
+              data-testid="swarm-alert-banner"
+              className={cn(
+                "flex flex-wrap items-center justify-between gap-2 border-b border-border/80 px-3.5 py-1.5 text-caption sm:px-4",
+                alerts.failedMembers.length > 0
+                  ? "oc-callout-danger bg-danger-soft/35 text-danger"
+                  : "oc-callout-warning bg-warning-soft/45 text-warning",
+              )}
+            >
+              <span className="inline-flex min-w-0 items-center gap-1.5 font-medium">
+                <AlertTriangle size={13} aria-hidden className="shrink-0" />
+                <span className="truncate">{alerts.summary}</span>
+              </span>
+              {(alerts.primaryFocusMember || alerts.primaryFocusSeq) && (
+                <button
+                  type="button"
+                  data-testid="swarm-alert-focus-btn"
+                  onClick={() => {
+                    if (alerts.primaryFocusMember) {
+                      setSelectedMember(alerts.primaryFocusMember);
+                      setMobileTab("board");
+                    }
+                    if (alerts.primaryFocusSeq) {
+                      jumpToSeq(alerts.primaryFocusSeq);
+                    }
+                  }}
+                  className="oc-spring-press shrink-0 rounded-md bg-surface/85 px-2 py-0.5 text-caption font-semibold text-fg transition-colors hover:bg-surface"
+                >
+                  {alerts.primaryFocusMember ? `聚焦 @${alerts.primaryFocusMember}` : "查看预警"}
+                </button>
+              )}
+            </div>
+          )}
 
           {/* Expandable Mobile Search Bar (<640px only, collapsed by default) */}
           {mobileSearchOpen && (
@@ -807,7 +707,7 @@ export function SwarmBoardDrawer({
                 }}
                 aria-label="收起搜索"
                 data-testid="swarm-mobile-search-close"
-                className="oc-spring-press shrink-0 rounded-lg px-2 py-1.5 text-caption font-medium text-muted transition-colors hover:bg-hover hover:text-fg"
+                className="oc-spring-press min-h-11 shrink-0 rounded-lg px-2.5 py-1.5 text-caption font-medium text-muted transition-colors hover:bg-hover hover:text-fg"
               >
                 取消
               </button>
@@ -892,7 +792,12 @@ export function SwarmBoardDrawer({
                 ) : (
                   <span>{counts.live} 活跃</span>
                 )}
-                {elapsed && <span className="font-mono text-muted">{elapsed}</span>}
+                <SwarmElapsedTicker
+                  startedAt={snapshot.startedAt}
+                  endedAt={snapshot.updatedAt}
+                  active={active}
+                  className="font-mono text-muted"
+                />
               </div>
             )}
           </div>
@@ -930,12 +835,7 @@ export function SwarmBoardDrawer({
                       member={member}
                       activeSwarm={active}
                       selected={selectedMember?.toLowerCase() === member.name.toLowerCase()}
-                      onSelect={() => {
-                        setSelectedMember((prev) =>
-                          prev?.toLowerCase() === member.name.toLowerCase() ? null : member.name,
-                        );
-                        setMobileTab("board");
-                      }}
+                      onSelect={handleSelectRosterMember}
                     />
                   ))}
                 </div>
@@ -985,12 +885,7 @@ export function SwarmBoardDrawer({
                           member={member}
                           activeSwarm={active}
                           selected={selectedMember?.toLowerCase() === member.name.toLowerCase()}
-                          onSelect={() => {
-                            setSelectedMember((prev) =>
-                              prev?.toLowerCase() === member.name.toLowerCase() ? null : member.name,
-                            );
-                            setMobileTab("board");
-                          }}
+                          onSelect={handleSelectRosterMember}
                         />
                       ))}
                     </div>
@@ -1058,15 +953,39 @@ export function SwarmBoardDrawer({
                 </div>
               )}
 
+              {/* Collapsible Member Profile Dossier when a member is selected */}
+              {selectedMemberObj && (
+                <SwarmMemberProfileBar
+                  member={selectedMemberObj}
+                  activeSwarm={active}
+                  onJumpSeq={jumpToSeq}
+                />
+              )}
+
               <div className="relative flex min-h-0 flex-1 flex-col">
                 <div
                   ref={feedRef}
                   onScroll={(e) => {
                     const el = e.currentTarget;
                     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+                    if (programmaticScrollRef.current) {
+                      if (nearBottom) {
+                        programmaticScrollRef.current = false;
+                        setIsNearBottom(true);
+                        setUnreadNewCount(0);
+                        lastSeenSeqRef.current = Math.max(lastSeenSeqRef.current, latestPostSeq);
+                      }
+                      return;
+                    }
                     setIsNearBottom(nearBottom);
-                    if (!nearBottom && followLatest) setFollowLatest(false);
-                    else if (nearBottom && !followLatest) setFollowLatest(true);
+                    if (!nearBottom && followLatest) {
+                      setFollowLatest(false);
+                      lastSeenSeqRef.current = Math.max(lastSeenSeqRef.current, latestPostSeq);
+                    } else if (nearBottom && !followLatest) {
+                      setFollowLatest(true);
+                      setUnreadNewCount(0);
+                      lastSeenSeqRef.current = Math.max(lastSeenSeqRef.current, latestPostSeq);
+                    }
                   }}
                   className="flex-1 space-y-2.5 overflow-y-auto px-3.5 py-3 sm:px-4 sm:py-3.5"
                   data-testid="swarm-board-feed"
@@ -1083,12 +1002,12 @@ export function SwarmBoardDrawer({
                         <AtelierIcon name="swarm" size={20} />
                       </span>
                       <p className="text-body font-medium text-fg">
-                        {snapshot.posts.length === 0
+                        {mergedPosts.length === 0
                           ? "蜂群讨论板尚未产生消息"
                           : "当前筛选条件下暂无匹配讨论"}
                       </p>
                       <p className="text-caption text-faint">
-                        {snapshot.posts.length === 0
+                        {mergedPosts.length === 0
                           ? "协调者完成分工后，各成员的汇报与互审会在此实时呈现"
                           : "尝试切换频道、取消成员聚焦或清空关键词"}
                       </p>
@@ -1099,11 +1018,12 @@ export function SwarmBoardDrawer({
                         key={post.seq}
                         post={post}
                         highlighted={highlightedSeq === post.seq}
-                        onMention={(name) => setSelectedMember(name)}
-                        onChannel={(ch) => setSelectedChannel(ch)}
+                        optimistic={optimisticSeqSet.has(post.seq)}
+                        onMention={handleMention}
+                        onChannel={handleChannel}
                         onJumpSeq={jumpToSeq}
                         onQuote={onQuoteToComposer ? quotePostToMainline : undefined}
-                        setRowRef={setRowRef}
+                        registerRowRef={registerRowRef}
                       />
                     ))
                   )}
@@ -1118,19 +1038,16 @@ export function SwarmBoardDrawer({
                     onClick={() => {
                       setFollowLatest(true);
                       setIsNearBottom(true);
-                      const el = feedRef.current;
-                      if (el) {
-                        if (typeof el.scrollTo === "function") {
-                          el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-                        } else {
-                          el.scrollTop = el.scrollHeight;
-                        }
-                      }
+                      setUnreadNewCount(0);
+                      lastSeenSeqRef.current = Math.max(lastSeenSeqRef.current, latestPostSeq);
+                      scrollFeedToBottom(true);
                     }}
-                    className="oc-surface-glass oc-spring-press oc-hover-lift absolute bottom-3 right-3 z-10 inline-flex items-center gap-1 rounded-full border border-border-strong/70 px-2.5 py-1.5 text-caption font-medium text-fg shadow-float sm:bottom-3.5 sm:right-4"
+                    className="oc-surface-glass oc-spring-press oc-hover-lift absolute bottom-3 right-3 z-10 inline-flex min-h-11 items-center gap-1 rounded-full border border-border-strong/70 px-3 py-1.5 text-caption font-medium text-fg shadow-float sm:bottom-3.5 sm:right-4 sm:min-h-0 sm:px-2.5"
                   >
                     <ArrowDown size={13} strokeWidth={2} className="text-accent" />
-                    <span>回到底部</span>
+                    <span>
+                      {unreadNewCount > 0 ? `${unreadNewCount} 条新讨论` : "回到底部"}
+                    </span>
                   </button>
                 )}
               </div>
@@ -1143,6 +1060,8 @@ export function SwarmBoardDrawer({
                 selectedMember={selectedMember}
                 selectedChannel={selectedChannel}
                 active={active}
+                onFollowUpToComposer={onQuoteToComposer ? followUpSummaryToMainline : undefined}
+                onOptimisticSteer={handleOptimisticSteer}
               />
 
               {/* Subtle keyboard legend footer */}

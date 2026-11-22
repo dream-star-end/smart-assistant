@@ -877,9 +877,9 @@ export const REMOTE_SWARM_TOOLS = [
       'Manage the Swarm of parallel remote Antigravity workers collaborating on the shared message board.',
       'Actions:',
       '  - title: name the swarm (`title` required; coordinator only).',
-      '  - add: spawn a worker (`name`, `brief`; optional `workspace`: "inherit" | "share" | "branch", `n` for homogeneous copies, `tasks` for sharded copies, `model`). Leave `model` unset to inherit the session model.',
-      '  - status: list all swarm members, their states (`waiting` / `working` / `killed`), channels, and workspaces.',
-      '  - channel: create a named discussion channel (`channel`, optional `topic`).',
+      '  - add: spawn a worker (`name`, `brief`; optional `workspace`: "inherit" | "share" | "branch", `channels` to subscribe on creation, `n` for homogeneous copies, `tasks` for sharded copies, `model`). Leave `model` unset to inherit the session model.',
+      '  - status: list all swarm members, their states (`waiting` / `working` / `stopped` / `killed`), channels, and workspaces.',
+      '  - channel: manage named discussion channels (`op`: "list" | "create" | "join" | "leave" | "archive", `channel`, optional `topic`, `name`).',
       '  - model: update a waiting worker model (`name`, `model`).',
       '  - kill: permanently terminate a worker (`name`) and clean up its isolated worktree after landing its changes.',
     ].join('\n'),
@@ -906,6 +906,11 @@ export const REMOTE_SWARM_TOOLS = [
           items: { type: 'string' },
           description: 'Optional per-worker shard targets for `add`.',
         },
+        channels: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional channel names to subscribe spawned worker(s) to on `add` (first channel becomes primary brief channel).',
+        },
         channel: { type: 'string', description: 'Channel name for `channel` action.' },
         op: {
           type: 'string',
@@ -926,7 +931,10 @@ export const REMOTE_SWARM_TOOLS = [
       type: 'object',
       properties: {
         text: { type: 'string', description: 'Message content to post.' },
-        channel: { type: 'string', description: 'Optional channel name (defaults to `general`).' },
+        channel: {
+          type: 'string',
+          description: 'Optional existing channel name (defaults to `main`, or the worker\'s primary subscribed channel).',
+        },
       },
       required: ['text'],
     },
@@ -934,13 +942,17 @@ export const REMOTE_SWARM_TOOLS = [
   {
     name: 'read_board',
     description:
-      'Read messages from the shared Swarm message board, optionally filtering by `since` post id or `channel`.',
+      'Read messages from the shared Swarm message board, optionally filtering by `since` post id, `channel`, `limit`, or UTF-8 `max_bytes`.',
     inputSchema: {
       type: 'object',
       properties: {
         since: { type: 'number', description: 'Only return posts with id > since.' },
-        channel: { type: 'string', description: 'Optional channel name filter.' },
+        channel: { type: 'string', description: 'Optional channel name filter (`*` for all channels).' },
         limit: { type: 'number', description: 'Maximum number of recent posts to return (default 50, max 200).' },
+        max_bytes: {
+          type: 'number',
+          description: 'Maximum UTF-8 byte budget for returned posts (default 32768, max 131072).',
+        },
       },
     },
   },
@@ -952,10 +964,14 @@ export const REMOTE_SWARM_TOOLS = [
       type: 'object',
       properties: {
         since: { type: 'number', description: 'Last seen board post id (default 0).' },
+        mentions_only: {
+          type: 'boolean',
+          description: 'Wake only on messages mentioning you (`@name`/`@all`/`@#channel`, default true). Pass false to wake on any post in subscribed channels.',
+        },
         channel: { type: 'string', description: 'Optional channel name filter.' },
         timeout_seconds: {
           type: 'number',
-          description: 'Maximum seconds to wait (default 180, max 300).',
+          description: 'Maximum seconds to wait (default 240, max 300).',
         },
       },
     },

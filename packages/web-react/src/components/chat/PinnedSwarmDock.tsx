@@ -5,14 +5,13 @@
  */
 import type { SwarmSnapshot } from "@openclaude/protocol/browser";
 import { ArrowUpRight, MessageSquare } from "lucide-react";
-import { useEffect, useState } from "react";
 import { cn } from "../../lib/utils";
 import { altKeyLabel } from "../ChatHeader";
 import { Badge } from "../ui";
 import { AtelierIcon } from "../ui/AtelierIcons";
 import "./liveActivity.css";
+import { SwarmElapsedTicker } from "./SwarmElapsedTicker";
 import {
-  formatSwarmElapsed,
   isSwarmActive,
   memberInitial,
   summarizeSwarmCounts,
@@ -31,25 +30,15 @@ export function PinnedSwarmDock({
   snapshot: SwarmSnapshot | null;
   cardId?: string;
   blockId?: string;
-  dismissed: boolean;
   onOpenBoard: (req: SwarmOpenRequest) => void;
-  onDismiss: () => void;
 }) {
-  const [now, setNow] = useState(() => Date.now());
   const active = snapshot ? isSwarmActive(snapshot.phase) : false;
-
-  useEffect(() => {
-    if (!active) return;
-    const id = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, [active]);
 
   if (!snapshot || !active) return null;
 
   const counts = summarizeSwarmCounts(snapshot.members);
   const phase = swarmPhaseMeta(snapshot.phase);
   const latestPost = snapshot.posts[snapshot.posts.length - 1] ?? null;
-  const elapsed = formatSwarmElapsed(snapshot.startedAt, now);
   const liveMembers = snapshot.members.filter((m) => m.status !== "killed").slice(0, 6);
 
   return (
@@ -73,11 +62,11 @@ export function PinnedSwarmDock({
               <Badge tone={phase.tone} size="sm" className="shrink-0 gap-1 py-0 text-micro">
                 {counts.working > 0 ? `${counts.working} 运行中` : `${counts.live} 成员`}
               </Badge>
-              {elapsed && (
-                <span className="hidden shrink-0 font-mono text-micro text-faint tabular-nums sm:inline">
-                  {elapsed}
-                </span>
-              )}
+              <SwarmElapsedTicker
+                startedAt={snapshot.startedAt}
+                active={active}
+                className="hidden shrink-0 font-mono text-micro text-faint tabular-nums sm:inline"
+              />
             </div>
 
             {latestPost ? (

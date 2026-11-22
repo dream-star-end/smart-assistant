@@ -1,10 +1,12 @@
 import {
   isSwarmSnapshot,
-  mergeSwarmSnapshots,
+  mergeSwarmSnapshotsStrict,
   SWARM_BOARD_TOOL_NAME,
   type SwarmSnapshot,
 } from "@openclaude/protocol/browser";
 import { addMessage, type ChatMessage, type ChatSession } from "./model";
+
+export type SwarmSnapshotApplyResult = "applied" | "stale" | "missing_base" | "ignored";
 
 function extractExistingSwarmSnapshot(m: ChatMessage | null | undefined): SwarmSnapshot | null {
   if (!m) return null;
@@ -25,8 +27,8 @@ export function applySwarmSnapshotBlock(
   turnStart: number,
   frameTurnOwnerId: string | undefined,
   isFrozenRow: (m: ChatMessage) => boolean,
-): void {
-  if (!isSwarmSnapshot(block.snapshot)) return;
+): SwarmSnapshotApplyResult {
+  if (!isSwarmSnapshot(block.snapshot)) return "ignored";
   const snap: SwarmSnapshot = block.snapshot;
   const blockId =
     typeof block.blockId === "string" && block.blockId
@@ -41,7 +43,7 @@ export function applySwarmSnapshotBlock(
     const mid = sess._blockIdToMsgId.get(blockId);
     const hit = sess.messages.find((m) => m.id === mid && m.role === "tool") ?? null;
     if (hit) {
-      if (isFrozenRow(hit)) return;
+      if (isFrozenRow(hit)) return "ignored";
       existing = hit;
     }
   }
@@ -49,7 +51,7 @@ export function applySwarmSnapshotBlock(
     for (let idx = sess.messages.length - 1; idx >= 0; idx -= 1) {
       const cand = sess.messages[idx];
       if (cand?.role === "tool" && cand.toolName === SWARM_BOARD_TOOL_NAME && cand.blockId === blockId) {
-        if (isFrozenRow(cand)) return;
+        if (isFrozenRow(cand)) return "ignored";
         existing = cand;
         break;
       }
@@ -70,14 +72,19 @@ export function applySwarmSnapshotBlock(
     }
   }
 
-  // 3. Monotonic revision guard + delta post merge against out-of-order replay frames
-  //    (checks both live `_swarmSnapshot` AND persisted `inputJson.snapshot`).
+  // 3. Monotonic revision guard + strict delta continuity check against out-of-order/gapped frames.
   const existingSnap = extractExistingSwarmSnapshot(existing);
-  const mergedSnap = mergeSwarmSnapshots(existingSnap, snap);
-  if (!mergedSnap) {
-    return;
+  const mergeRes = mergeSwarmSnapshotsStrict(existingSnap, snap);
+  if (!mergeRes.ok) {
+    if (mergeRes.reason === "missing_base") {
+      sess._swarmSyncStale = true;
+      return "missing_base";
+    }
+    return "stale";
   }
 
+  const mergedSnap = mergeRes.snapshot;
+  sess._swarmSyncStale = false;
   const isTerminal = mergedSnap.phase !== "running" && mergedSnap.phase !== "starting";
   const inputJson = {
     swarmId: mergedSnap.swarmId,
@@ -108,10 +115,15 @@ export function applySwarmSnapshotBlock(
     existing._partial = false;
     existing._completed = isTerminal;
     existing._swarmSnapshot = mergedSnap;
-    existing.completedAt = Date.now();
+    if (isTerminal) {
+      if (existing.completedAt == null) existing.completedAt = Date.now();
+    } else {
+      existing.completedAt = undefined;
+    }
     if (frameTurnOwnerId) existing._turnOwnerId = frameTurnOwnerId;
   }
   sess._blockIdToMsgId?.set(blockId, existing.id);
+  return "applied";
 }
 
 export function finalizeSwarmMessageOnTurnEnd(

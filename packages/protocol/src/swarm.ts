@@ -23,6 +23,8 @@ export interface SwarmMemberSnapshot {
   model?: string
   channels?: string[]
   workspace?: string
+  workspaceBranch?: string
+  workspacePath?: string
   wakeMode?: string
   stepCount: number
   activity?: string
@@ -35,6 +37,8 @@ export interface SwarmMemberSnapshot {
   elapsedMs?: number
   inputTokens?: number
   outputTokens?: number
+  cacheReadTokens?: number
+  thinkingTokens?: number
   toolCalls?: number
   /** True when telemetry scanning still has unread backlog or hit its per-file budget/line cap. */
   telemetryPartial?: boolean
@@ -118,11 +122,10 @@ export function isSwarmSnapshot(value: unknown): value is SwarmSnapshot {
   )
 }
 
-/** Parse leading `/swarm` slash command. Returns stripped task text when matched, else null. */
+/** Parse leading `/swarm` or `/swarm-playbook` slash command. Returns stripped task text when matched, else null. */
 export function parseSwarmSlashCommand(rawText: string): { matched: true; task: string } | null {
   const trimmed = rawText.trim()
-  if (trimmed === '/swarm') return { matched: true, task: '' }
-  const match = /^\/swarm(?:\s+([\s\S]*))$/i.exec(trimmed)
+  const match = /^\/swarm(?:-playbook)?(?:\s+([\s\S]*))?$/i.exec(trimmed)
   if (!match) return null
   return { matched: true, task: (match[1] ?? '').trim() }
 }
@@ -279,6 +282,8 @@ export function compactSwarmSnapshotToByteBudget(
     ...m,
     ...(m.activity ? { activity: clampSwarmText(m.activity, 80) } : {}),
     ...(m.lastError ? { lastError: clampSwarmText(m.lastError, 120) } : {}),
+    ...(m.workspaceBranch ? { workspaceBranch: clampSwarmText(m.workspaceBranch, 64) } : {}),
+    ...(m.workspacePath ? { workspacePath: clampSwarmText(m.workspacePath, 80) } : {}),
   }))
   const baseChannels = cleanBase.channels.map((c) => ({
     ...c,

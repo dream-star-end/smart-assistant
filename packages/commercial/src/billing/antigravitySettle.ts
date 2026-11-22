@@ -1,29 +1,96 @@
+import { ANTIGRAVITY_AUX_UPSTREAM_MODELS } from '@openclaude/protocol'
 import { antigravityOwnerProtectedSql } from './antigravityRouteAuthority.js'
 /**
  * Antigravity turn settlement (OCV5-415 P2).
  *
  * Usage is server-observed: the relay writes one antigravity_relay_usage row
- * per forwarded generate call (title generation included) from the upstream
- * usageMetadata. The container's own report is never billed: the CLI omits
- * the title call and its usage is cumulative across a resumed conversation.
- * Every call is priced at the turn's catalog model.
+ * per forwarded generate call (title generation, web_search, agent_monitoring
+ * included) from the upstream usageMetadata. The container's own report is
+ * never billed: the CLI omits auxiliary calls and its usage is cumulative
+ * across a resumed conversation.
+ *
+ * Per-bucket attribution (strictly keyed on server-routed upstream_model,
+ * never on untrusted client-declared request_type):
+ *   - Primary calls (route model, plus legacy rows missing upstream_model):
+ *     billed at the turn's catalog model pricing.
+ *   - Auxiliary calls (ANTIGRAVITY_AUX_UPSTREAM_MODELS such as
+ *     gemini-3.5-flash-lite, regardless of request_type): billed at the aux
+ *     light-model rate (catalog row if present, else commercial-aligned
+ *     flash-lite fallback, capped at primary pricing), combined with primary
+ *     under a single ceiling. Client request_type='agent_monitoring' is
+ *     recorded only as an observational count (`monitoring_calls`) in
+ *     price_snapshot.antigravity_aux and never waives charges or budget.
  */
 import type { Pool } from 'pg'
-import { type TokenUsage, computeCost } from './calculator.js'
+import { COST_SCALE, type TokenUsage, computeCost, multiplierToScaled } from './calculator.js'
 import type { ModelPricing, PricingCache } from './pricing.js'
 import { type SettleResult, settleUsageAndLedger } from './proxyBilling.js'
 import { releaseInflight } from '../account-pool/policy/affinity.js'
 
 export type AntigravityEngineStatus = 'success' | 'error' | 'unavailable'
 
-export interface AntigravityUsageTotals {
+/**
+ * CLI-internal safety monitor requestType observed on aux flash-lite calls.
+ * Used strictly for observational counters (`monitoring_calls`), never for
+ * billing waivers or budget exemptions (client-supplied header/body metadata
+ * is untrusted).
+ */
+export const ANTIGRAVITY_MONITORING_REQUEST_TYPE = 'agent_monitoring' as const
+
+/**
+ * Fallback commercial-aligned light-model rates for Antigravity auxiliary models
+ * (gemini-3.5-flash-lite: ~$0.10/MTok input, ~$0.40/MTok output, ~$0.01/MTok cache read →
+ * 20 / 80 / 1 / 0 fen/MTok at commercial 200 fen/USD input/output and 100 fen/USD cache read).
+ * Used when model_pricing has no explicit row for the aux model. Each dimension is capped
+ * at the route's primary pricing so an aux call can never exceed the primary model's rate.
+ */
+export const ANTIGRAVITY_AUX_FALLBACK_RATES = Object.freeze({
+  model_id: 'antigravity-aux-flash-lite',
+  display_name: 'Gemini Flash Lite (Antigravity Aux)',
+  input_per_mtok: 20n,
+  output_per_mtok: 80n,
+  cache_read_per_mtok: 1n,
+  cache_write_per_mtok: 0n,
+})
+
+const ANTIGRAVITY_AUX_PRICING_KEYS = [
+  'antigravity-gemini-3.5-flash-lite',
+  'gemini-3.5-flash-lite',
+] as const
+
+export interface AntigravityAuxPricing {
+  model_id: string
+  display_name: string
+  input_per_mtok: bigint
+  output_per_mtok: bigint
+  cache_read_per_mtok: bigint
+  cache_write_per_mtok: bigint
+  multiplier: string
+  source: 'catalog' | 'fallback'
+}
+
+export interface AntigravityUsageBucket {
   promptTokens: bigint
   candidatesTokens: bigint
   thoughtsTokens: bigint
   cachedTokens: bigint
   calls: number
+  /** Observational subset of aux calls labeled request_type='agent_monitoring' (no billing effect). */
+  monitoringCalls?: number
+}
+
+export interface AntigravityUsageTotals {
+  /** Primary (route model) tokens — and legacy rows lacking upstream_model. */
+  promptTokens: bigint
+  candidatesTokens: bigint
+  thoughtsTokens: bigint
+  cachedTokens: bigint
+  /** Total relay calls across all buckets (primary + aux). */
+  calls: number
   /** Server-observed HTTP 200 retirement banner, persisted as relay status 410. */
   retired?: boolean
+  /** Auxiliary-model calls (ANTIGRAVITY_AUX_UPSTREAM_MODELS, billed at light-model rate). */
+  aux?: AntigravityUsageBucket
 }
 
 export const EMPTY_ANTIGRAVITY_USAGE: AntigravityUsageTotals = Object.freeze({
@@ -34,11 +101,58 @@ export const EMPTY_ANTIGRAVITY_USAGE: AntigravityUsageTotals = Object.freeze({
   calls: 0,
 })
 
+/** True when upstreamModel is one of the CLI's auxiliary light models (e.g. gemini-3.5-flash-lite). */
+export function isAntigravityAuxUpstreamModel(upstreamModel: string | null | undefined): boolean {
+  return (
+    typeof upstreamModel === 'string' &&
+    upstreamModel.length > 0 &&
+    (ANTIGRAVITY_AUX_UPSTREAM_MODELS as readonly string[]).includes(upstreamModel)
+  )
+}
+
+function minBigInt(a: bigint, b: bigint): bigint {
+  return a < b ? a : b
+}
+
+export function resolveAntigravityAuxPricing(
+  primaryPricing: ModelPricing,
+  pricingLookup?: Pick<PricingCache, 'get'> | null,
+): AntigravityAuxPricing {
+  let catalogMatch: ModelPricing | null = null
+  if (pricingLookup) {
+    for (const key of ANTIGRAVITY_AUX_PRICING_KEYS) {
+      const found = pricingLookup.get(key)
+      // Require exact model_id match so wildcard stubs or alias fallbacks
+      // never misidentify the primary model's row as aux pricing.
+      if (found !== null && found.model_id === key) {
+        catalogMatch = found
+        break
+      }
+    }
+  }
+  const base = catalogMatch ?? ANTIGRAVITY_AUX_FALLBACK_RATES
+  return {
+    model_id: base.model_id,
+    display_name: base.display_name,
+    input_per_mtok: minBigInt(base.input_per_mtok, primaryPricing.input_per_mtok),
+    output_per_mtok: minBigInt(base.output_per_mtok, primaryPricing.output_per_mtok),
+    cache_read_per_mtok: minBigInt(base.cache_read_per_mtok, primaryPricing.cache_read_per_mtok),
+    cache_write_per_mtok: minBigInt(base.cache_write_per_mtok, primaryPricing.cache_write_per_mtok),
+    multiplier: primaryPricing.multiplier,
+    source: catalogMatch ? 'catalog' : 'fallback',
+  }
+}
+
 /**
  * Gemini usageMetadata → platform tokens. promptTokenCount includes the
  * cached part; thoughts are billed as output (as the upstream does).
  */
-export function mapAntigravityUsage(totals: AntigravityUsageTotals): TokenUsage {
+export function mapAntigravityUsage(
+  totals: Pick<
+    AntigravityUsageBucket,
+    'promptTokens' | 'candidatesTokens' | 'thoughtsTokens' | 'cachedTokens'
+  >,
+): TokenUsage {
   const cached =
     totals.cachedTokens < totals.promptTokens ? totals.cachedTokens : totals.promptTokens
   return {
@@ -55,42 +169,138 @@ export async function sumAntigravityRelayUsage(
   userId: bigint,
 ): Promise<AntigravityUsageTotals> {
   const res = await pool.query<{
+    bucket?: string | null
     prompt: string | null
     candidates: string | null
     thoughts: string | null
     cached: string | null
     calls: string
+    monitoring_calls?: string | null
     retired: boolean | null
   }>(
-    `SELECT SUM(prompt_tokens)::text AS prompt, SUM(candidates_tokens)::text AS candidates,
+    `SELECT CASE
+              WHEN COALESCE(upstream_model, '') = ANY($3::text[]) THEN 'aux'
+              ELSE 'primary'
+            END AS bucket,
+            SUM(prompt_tokens)::text AS prompt, SUM(candidates_tokens)::text AS candidates,
             SUM(thoughts_tokens)::text AS thoughts, SUM(cached_tokens)::text AS cached,
-            COUNT(*)::text AS calls, BOOL_OR(status_code = 410) AS retired
-       FROM antigravity_relay_usage WHERE request_id = $1 AND user_id = $2`,
-    [requestId, userId.toString()],
+            COUNT(*)::text AS calls,
+            COUNT(*) FILTER (WHERE COALESCE(request_type, '') = $4)::text AS monitoring_calls,
+            BOOL_OR(status_code = 410) AS retired
+       FROM antigravity_relay_usage WHERE request_id = $1 AND user_id = $2
+      GROUP BY 1`,
+    [
+      requestId,
+      userId.toString(),
+      [...ANTIGRAVITY_AUX_UPSTREAM_MODELS],
+      ANTIGRAVITY_MONITORING_REQUEST_TYPE,
+    ],
   )
-  const row = res.rows[0]
-  if (!row) return { ...EMPTY_ANTIGRAVITY_USAGE }
+  if (res.rows.length === 0) return { ...EMPTY_ANTIGRAVITY_USAGE }
+  const totals: AntigravityUsageTotals = {
+    promptTokens: 0n,
+    candidatesTokens: 0n,
+    thoughtsTokens: 0n,
+    cachedTokens: 0n,
+    calls: 0,
+    retired: false,
+  }
+  for (const row of res.rows) {
+    const bucket = row.bucket ?? 'primary'
+    const prompt = BigInt(row.prompt ?? '0')
+    const candidates = BigInt(row.candidates ?? '0')
+    const thoughts = BigInt(row.thoughts ?? '0')
+    const cached = BigInt(row.cached ?? '0')
+    const calls = Number(row.calls ?? '0')
+    const monitoringCalls = Number(row.monitoring_calls ?? '0')
+    totals.calls += calls
+    if (row.retired === true) totals.retired = true
+    if (bucket === 'aux') {
+      const prev = totals.aux
+      const nextMonitoringCalls = (prev?.monitoringCalls ?? 0) + monitoringCalls
+      totals.aux = {
+        promptTokens: (prev?.promptTokens ?? 0n) + prompt,
+        candidatesTokens: (prev?.candidatesTokens ?? 0n) + candidates,
+        thoughtsTokens: (prev?.thoughtsTokens ?? 0n) + thoughts,
+        cachedTokens: (prev?.cachedTokens ?? 0n) + cached,
+        calls: (prev?.calls ?? 0) + calls,
+        ...(nextMonitoringCalls > 0 ? { monitoringCalls: nextMonitoringCalls } : {}),
+      }
+    } else {
+      totals.promptTokens += prompt
+      totals.candidatesTokens += candidates
+      totals.thoughtsTokens += thoughts
+      totals.cachedTokens += cached
+    }
+  }
+  return totals
+}
+
+function scaledTokenCost(
+  usage: TokenUsage,
+  pricing: Pick<
+    ModelPricing,
+    'input_per_mtok' | 'output_per_mtok' | 'cache_read_per_mtok' | 'cache_write_per_mtok' | 'multiplier'
+  >,
+): bigint {
+  const mul = multiplierToScaled(pricing.multiplier)
+  return (
+    BigInt(usage.input_tokens) * pricing.input_per_mtok * mul +
+    BigInt(usage.output_tokens) * pricing.output_per_mtok * mul +
+    BigInt(usage.cache_read_tokens) * pricing.cache_read_per_mtok * mul +
+    BigInt(usage.cache_write_tokens) * pricing.cache_write_per_mtok * mul
+  )
+}
+
+function ceilScaledCredits(scaled: bigint): bigint {
+  return scaled === 0n ? 0n : (scaled + COST_SCALE - 1n) / COST_SCALE
+}
+
+function computeAntigravityBreakdown(
+  totals: AntigravityUsageTotals,
+  pricing: ModelPricing,
+  pricingLookup?: Pick<PricingCache, 'get'> | null,
+) {
+  const primaryUsage = mapAntigravityUsage(totals)
+  const auxUsage = totals.aux && totals.aux.calls > 0 ? mapAntigravityUsage(totals.aux) : null
+  const auxPricing = auxUsage ? resolveAntigravityAuxPricing(pricing, pricingLookup) : null
+  const primaryScaled = scaledTokenCost(primaryUsage, pricing)
+  const auxScaled = auxUsage && auxPricing ? scaledTokenCost(auxUsage, auxPricing) : 0n
+  const totalScaled = primaryScaled + auxScaled
+  const costCredits = ceilScaledCredits(totalScaled)
+  const billableUsage: TokenUsage = auxUsage
+    ? {
+        input_tokens: BigInt(primaryUsage.input_tokens) + BigInt(auxUsage.input_tokens),
+        output_tokens: BigInt(primaryUsage.output_tokens) + BigInt(auxUsage.output_tokens),
+        cache_read_tokens:
+          BigInt(primaryUsage.cache_read_tokens) + BigInt(auxUsage.cache_read_tokens),
+        cache_write_tokens: 0n,
+      }
+    : primaryUsage
   return {
-    promptTokens: BigInt(row.prompt ?? '0'),
-    candidatesTokens: BigInt(row.candidates ?? '0'),
-    thoughtsTokens: BigInt(row.thoughts ?? '0'),
-    cachedTokens: BigInt(row.cached ?? '0'),
-    calls: Number(row.calls),
-    retired: row.retired === true,
+    primaryUsage,
+    auxUsage,
+    auxPricing,
+    primaryCostCredits: ceilScaledCredits(primaryScaled),
+    auxCostCredits: ceilScaledCredits(auxScaled),
+    costCredits,
+    billableUsage,
   }
 }
 
 export function antigravityUsageCost(
   totals: AntigravityUsageTotals,
   pricing: ModelPricing,
+  pricingLookup?: Pick<PricingCache, 'get'> | null,
 ): bigint {
-  return computeCost(mapAntigravityUsage(totals), pricing).cost_credits
+  return computeAntigravityBreakdown(totals, pricing, pricingLookup).costCredits
 }
 
 export function planAntigravitySettle(args: {
   engineStatus: AntigravityEngineStatus
   totals: AntigravityUsageTotals
   pricing: ModelPricing
+  pricingLookup?: Pick<PricingCache, 'get'> | null
   terminalCode?: string | null
 }): {
   settleStatus: 'success' | 'error'
@@ -98,18 +308,61 @@ export function planAntigravitySettle(args: {
   snapshotJson: string
   usage: TokenUsage
 } {
-  const usage = mapAntigravityUsage(args.totals)
-  const { cost_credits, snapshot } = computeCost(usage, args.pricing)
+  const breakdown = computeAntigravityBreakdown(args.totals, args.pricing, args.pricingLookup)
+  const { snapshot } = computeCost(breakdown.primaryUsage, args.pricing)
+  const cost_credits = breakdown.costCredits
+  const usage = breakdown.billableUsage
   const effectiveStatus = args.totals.retired ? 'error' : args.engineStatus
   const engineOk = effectiveStatus === 'success'
-  const waivedNoOutput = engineOk && BigInt(usage.output_tokens) === 0n && cost_credits > 0n
+  const primaryCalls = Math.max(0, args.totals.calls - (args.totals.aux?.calls ?? 0))
+  const hasOutput =
+    primaryCalls > 0
+      ? BigInt(breakdown.primaryUsage.output_tokens) > 0n
+      : BigInt(usage.output_tokens) > 0n
+  const waivedNoOutput = engineOk && !hasOutput && cost_credits > 0n
   const costCredits = engineOk && !waivedNoOutput ? cost_credits : 0n
+  const hasBreakdown = Boolean(breakdown.auxUsage)
+  const monitoringCalls = args.totals.aux?.monitoringCalls ?? 0
   const snapshotJson = JSON.stringify({
     ...snapshot,
     antigravity_status: effectiveStatus,
     ...(args.totals.retired ? { antigravity_terminal_code: 'ANTIGRAVITY_MODEL_RETIRED' } : {}),
     antigravity_calls: args.totals.calls,
-    ...(!args.totals.retired && args.terminalCode ? { antigravity_terminal_code: args.terminalCode } : {}),
+    ...(hasBreakdown
+      ? {
+          antigravity_primary: {
+            calls: primaryCalls,
+            input_tokens: BigInt(breakdown.primaryUsage.input_tokens).toString(),
+            output_tokens: BigInt(breakdown.primaryUsage.output_tokens).toString(),
+            cache_read_tokens: BigInt(breakdown.primaryUsage.cache_read_tokens).toString(),
+            cost_credits: breakdown.primaryCostCredits.toString(),
+          },
+        }
+      : {}),
+    ...(breakdown.auxUsage && breakdown.auxPricing && args.totals.aux
+      ? {
+          antigravity_aux: {
+            calls: args.totals.aux.calls,
+            ...(monitoringCalls > 0 ? { monitoring_calls: monitoringCalls } : {}),
+            input_tokens: BigInt(breakdown.auxUsage.input_tokens).toString(),
+            output_tokens: BigInt(breakdown.auxUsage.output_tokens).toString(),
+            cache_read_tokens: BigInt(breakdown.auxUsage.cache_read_tokens).toString(),
+            cost_credits: breakdown.auxCostCredits.toString(),
+            pricing: {
+              model_id: breakdown.auxPricing.model_id,
+              input_per_mtok: breakdown.auxPricing.input_per_mtok.toString(),
+              output_per_mtok: breakdown.auxPricing.output_per_mtok.toString(),
+              cache_read_per_mtok: breakdown.auxPricing.cache_read_per_mtok.toString(),
+              cache_write_per_mtok: breakdown.auxPricing.cache_write_per_mtok.toString(),
+              multiplier: breakdown.auxPricing.multiplier,
+              source: breakdown.auxPricing.source,
+            },
+          },
+        }
+      : {}),
+    ...(!args.totals.retired && args.terminalCode
+      ? { antigravity_terminal_code: args.terminalCode }
+      : {}),
     ...(waivedNoOutput ? { waived: 'no_output', wouldHaveCharged: cost_credits.toString() } : {}),
     ...(!engineOk && cost_credits > 0n
       ? { waived: 'antigravity_engine_not_success', wouldHaveCharged: cost_credits.toString() }
@@ -151,6 +404,7 @@ export async function settleAntigravityTurn(args: {
     engineStatus: args.engineStatus,
     totals,
     pricing,
+    pricingLookup: args.pricing,
     terminalCode: args.terminalCode ?? null,
   })
   const settled = await settleUsageAndLedger(args.pool, {
@@ -231,6 +485,7 @@ export async function refreshWaivedAntigravityUsage(args: {
       engineStatus: row.snapshot.antigravity_status as AntigravityEngineStatus,
       totals,
       pricing,
+      pricingLookup: args.pricing,
       terminalCode: typeof terminalCode === 'string' ? terminalCode : null,
     })
     await client.query(

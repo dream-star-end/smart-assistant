@@ -18,6 +18,7 @@ import {
   isMemberEffectivelyWaiting,
   isSwarmMonitorAgentName,
   type SwarmStallAlert,
+  type SwarmStallDiagnosticEvent,
 } from '../engine/swarmStallMonitor.js'
 import { injectSwarmDirective } from '../swarmCommand.js'
 
@@ -311,6 +312,7 @@ test('OCV5-848: AntigravitySwarmWatcher triggers stall alert even when disk file
 
     let fakeNow = 1_000_000
     const alerts: SwarmStallAlert[] = []
+    const pendingWrites: Promise<unknown>[] = []
     const watcher = new AntigravitySwarmWatcher({
       brainDir,
       conversationId: CONV_ID,
@@ -321,17 +323,20 @@ test('OCV5-848: AntigravitySwarmWatcher triggers stall alert even when disk file
       onSnapshot: () => {},
       onStallDetected: (alert) => {
         alerts.push(alert)
-        const res = injectSwarmDirective({
-          brainDir,
-          conversationId: CONV_ID,
-          target: alert.target,
-          message: alert.message,
-          channel: alert.channel,
-          sender: GATEWAY_STALL_MONITOR_AGENT,
-          controlKind: 'stall',
-          now: fakeNow,
-        })
-        assert.equal(res.ok, true)
+        pendingWrites.push(
+          injectSwarmDirective({
+            brainDir,
+            conversationId: CONV_ID,
+            target: alert.target,
+            message: alert.message,
+            channel: alert.channel,
+            sender: GATEWAY_STALL_MONITOR_AGENT,
+            controlKind: 'stall',
+            now: fakeNow,
+          }).then((res) => {
+            assert.equal(res.ok, true)
+          }),
+        )
       },
     })
 
@@ -342,6 +347,7 @@ test('OCV5-848: AntigravitySwarmWatcher triggers stall alert even when disk file
     // 2. Advance virtual clock past 3 min while disk statSignature stays completely unchanged
     fakeNow += 185_000
     await new Promise((r) => setTimeout(r, 60))
+    await Promise.all(pendingWrites)
 
     assert.equal(alerts.length, 1, 'should fire stall alert even with unchanged disk statSig')
     assert.equal(alerts[0]!.target, 'coordinator')
@@ -601,4 +607,180 @@ test('OCV5-848 Blocker 2, 4, 5: healthy slow remote worker stays working (0 aler
   assert.ok(stage2Alert)
   assert.equal(stage2Alert.target, 'worker-a')
   assert.deepEqual(stage2Alert.citedSeqs, [4])
+})
+
+test('OCV5-852 P0-1/P1-4: DONE_PREFIX_RE accepts markdown bold & optional @all, emits throttled diagnostics, and catches native CLI 1.5.8 silent-park scenarios', () => {
+  // 1. DONE_PREFIX_RE accepts **[done]**, **[done]:**, @all [done], @all **[done]** and rejects mid-prose / @worker
+  for (const doneText of [
+    '[done] 完成',
+    '**[done]** 全部收口',
+    '**[done]:** 全部收口',
+    '@all [done] 阶段收尾',
+    '@all **[done]** 全部完成',
+  ]) {
+    const mon = new SwarmStallMonitor({ stallThresholdMs: 10_000 })
+    const snap = makeSnapshot({
+      members: [
+        makeMember({ name: 'coordinator', role: 'coordinator', status: 'waiting', lastPostSeq: 2 }),
+        makeMember({ name: 'worker-a', role: 'worker', status: 'waiting', lastPostSeq: 1 }),
+      ],
+      posts: [
+        { seq: 1, agent: 'worker-a', channel: 'main', text: '@coordinator done', mentions: ['coordinator'] },
+        { seq: 2, agent: 'coordinator', channel: 'main', text: doneText, mentions: [] },
+      ],
+      totalPosts: 2,
+    })
+    assert.equal(mon.evaluate(snap, 0), null)
+    assert.equal(mon.evaluate(snap, 300_000), null, `expected "${doneText}" to suppress stall alerts`)
+  }
+
+  for (const notDoneText of ['尚未 [done]，请继续', '@worker-a [done] 请确认']) {
+    const mon = new SwarmStallMonitor({ stallThresholdMs: 10_000 })
+    const snap = makeSnapshot({
+      members: [
+        makeMember({ name: 'coordinator', role: 'coordinator', status: 'waiting', lastPostSeq: 2 }),
+        makeMember({ name: 'worker-a', role: 'worker', status: 'waiting', lastPostSeq: 1 }),
+      ],
+      posts: [
+        { seq: 1, agent: 'worker-a', channel: 'main', text: '@coordinator 汇报', mentions: ['coordinator'] },
+        { seq: 2, agent: 'coordinator', channel: 'main', text: notDoneText, mentions: [] },
+      ],
+      totalPosts: 2,
+    })
+    assert.equal(mon.evaluate(snap, 0), null)
+    assert.ok(mon.evaluate(snap, 20_000), `expected "${notDoneText}" NOT to be treated as terminal [done]`)
+  }
+
+  // 2. Structured diagnostics: immediate transitions + throttled repetitive checks + observer crash isolation
+  const diags: SwarmStallDiagnosticEvent[] = []
+  let throwOnce = true
+  const diagMon = new SwarmStallMonitor({
+    stallThresholdMs: 180_000,
+    diagnosticThrottleMs: 30_000,
+    onDiagnostic: (ev) => {
+      diags.push(ev)
+      if (throwOnce) {
+        throwOnce = false
+        throw new Error('observer boom')
+      }
+    },
+  })
+  const busySnap = makeSnapshot({
+    members: [
+      makeMember({ name: 'coordinator', role: 'coordinator', status: 'waiting', lastPostSeq: 1 }),
+      makeMember({ name: 'worker-a', role: 'worker', status: 'working', activity: '运行命令' }),
+    ],
+  })
+  assert.equal(diagMon.evaluate(busySnap, 10_000), null)
+  // Repetitive skipped_working within 30s throttle window is suppressed
+  assert.equal(diagMon.evaluate(busySnap, 20_000), null)
+  assert.equal(diags.filter((d) => d.kind === 'skipped_working').length, 1)
+  // Past 30s throttle emits again
+  assert.equal(diagMon.evaluate(busySnap, 45_000), null)
+  assert.equal(diags.filter((d) => d.kind === 'skipped_working').length, 2)
+
+  // Transition to quiet waiting emits immediately, then alert_emitted fires immediately at threshold
+  const parkedSnap = makeSnapshot({
+    members: [
+      makeMember({ name: 'coordinator', role: 'coordinator', status: 'waiting', lastPostSeq: 1 }),
+      makeMember({ name: 'worker-a', role: 'worker', status: 'working', activity: '已完成本轮思考' }),
+    ],
+  })
+  assert.equal(isMemberEffectivelyWaiting(parkedSnap.members[1]!), true)
+  assert.equal(diagMon.evaluate(parkedSnap, 50_000), null)
+  assert.equal(diagMon.evaluate(parkedSnap, 100_000), null)
+  const alert = diagMon.evaluate(parkedSnap, 235_000)
+  assert.ok(alert)
+  assert.ok(diags.some((d) => d.kind === 'alert_emitted' && d.target === alert.target))
+
+  // 3. End-to-end native CLI 1.5.8 silent-park scenarios:
+  //    [swarm_wait, post_message] + GENERIC DONE, 已完成本轮思考, and SYSTEM_MESSAGE wake -> re-park
+  const brainDir = mkdtempSync(join(tmpdir(), 'oc-stall-852-e2e-'))
+  try {
+    const swarmDir = join(brainDir, CONV_ID, '.system_generated', 'swarm')
+    const coordLogs = join(brainDir, CONV_ID, '.system_generated', 'logs')
+    const workerLogs = join(brainDir, WORKER_CONV_ID, '.system_generated', 'logs')
+    mkdirSync(swarmDir, { recursive: true })
+    mkdirSync(coordLogs, { recursive: true })
+    mkdirSync(workerLogs, { recursive: true })
+
+    writeFileSync(
+      join(swarmDir, 'members.json'),
+      JSON.stringify({
+        title: 'CLI 1.5.8 静默停泊验证',
+        members: {
+          coordinator: {
+            conversation_id: CONV_ID,
+            role: 'coordinator',
+            desired_state: 'RUNNING',
+            phase: 'RUNNING',
+            wake_mode: 'mentions',
+            last_read_seq: 1,
+            last_nudged_seq: 1,
+            killed: false,
+          },
+          'worker-a': {
+            conversation_id: WORKER_CONV_ID,
+            role: 'worker',
+            desired_state: 'RUNNING',
+            phase: 'RUNNING',
+            wake_mode: 'working',
+            last_read_seq: 1,
+            last_nudged_seq: 1,
+            killed: false,
+          },
+        },
+      }),
+    )
+    writeFileSync(
+      join(swarmDir, 'board.jsonl'),
+      `${JSON.stringify({ seq: 1, agent: 'coordinator', channel: 'main', text: '@worker-a 请开工' })}\n`,
+    )
+    // Coordinator called [swarm_wait, post_message] (swarm_wait first!) + GENERIC DONE
+    writeFileSync(
+      join(coordLogs, 'transcript.jsonl'),
+      `${[
+        JSON.stringify({
+          step_index: 0,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [
+            { name: 'swarm_wait', args: { since: '1' } },
+            { name: 'post_message', args: { text: '@worker-a 请开工' } },
+          ],
+        }),
+        JSON.stringify({ step_index: 1, type: 'GENERIC', status: 'DONE', content: 'Waiting...' }),
+        JSON.stringify({ step_index: 2, type: 'GENERIC', status: 'DONE', content: '{"seq":1}' }),
+      ].join('\n')}\n`,
+    )
+    // Worker woke on SYSTEM_MESSAGE and ended turn with 已完成本轮思考 without calling swarm_wait
+    writeFileSync(
+      join(workerLogs, 'transcript.jsonl'),
+      `${[
+        JSON.stringify({ step_index: 0, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '[swarm] #1' }),
+        JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }),
+      ].join('\n')}\n`,
+    )
+
+    const snap = readAntigravitySwarmSnapshot({
+      brainDir,
+      conversationId: CONV_ID,
+      phase: 'running',
+      revision: 1,
+      now: 1_000,
+    })
+    assert.ok(snap)
+    assert.equal(snap.members.find((m) => m.name === 'coordinator')?.status, 'waiting')
+    assert.equal(snap.members.find((m) => m.name === 'coordinator')?.activity, '等待讨论板消息')
+    assert.equal(snap.members.find((m) => m.name === 'worker-a')?.activity, '已完成本轮思考')
+
+    const e2eMon = new SwarmStallMonitor({ stallThresholdMs: 180_000 })
+    assert.equal(e2eMon.evaluate(snap, 1_000), null)
+    const e2eAlert = e2eMon.evaluate(snap, 185_000)
+    assert.ok(e2eAlert, 'must catch silent park of [swarm_wait, post_message] + 已完成本轮思考')
+    assert.equal(e2eAlert.target, 'worker-a')
+    assert.equal(e2eAlert.reason, 'unanswered_mention')
+  } finally {
+    rmSync(brainDir, { recursive: true, force: true })
+  }
 })

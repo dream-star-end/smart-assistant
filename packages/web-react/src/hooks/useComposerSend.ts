@@ -81,6 +81,8 @@ export type ComposerSendInput = {
   stopPreparing: () => void;
   stopRef: React.RefObject<boolean>;
   swarmMode?: boolean;
+  /** Optional ref reader so callers can compute `useSwarmMode` after `useChatSocket` without first-frame lag. */
+  getSwarmMode?: () => boolean;
   toast: ToastFn;
   user: User | null;
 };
@@ -130,6 +132,7 @@ export function useComposerSend({
   stopPreparing,
   stopRef,
   swarmMode = false,
+  getSwarmMode,
   toast,
   user,
 }: ComposerSendInput) {
@@ -347,7 +350,8 @@ export function useComposerSend({
         toast("蜂群模式仅支持 Antigravity 模型，请先在顶栏切换至 Gemini 4 / Antigravity 模型", "info");
         return false;
       }
-      const effectiveSwarmMode = modelIsAntigravity && (swarmMode || Boolean(slashSwarm?.matched));
+      const activeSwarmMode = getSwarmMode ? getSwarmMode() : swarmMode;
+      const effectiveSwarmMode = modelIsAntigravity && (activeSwarmMode || Boolean(slashSwarm?.matched));
       const sent=await sockRef.current?.send({
         ...(authorization?{switchAuthorization:authorization}:{}),
         sessId: sessionId,

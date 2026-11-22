@@ -68,6 +68,7 @@ import {
 } from './turnDispatchInbox.js'
 import { readUploadUserFailureCode } from './uploadTotalRejection.js'
 import { _pendingPermissionCatchupFrames } from './pendingPermissionSnapshot.js'
+import { lookupRemoteSwarmRuntimeForSession } from './remoteSwarmRuntime.js'
 import { resolveLocalExecutionIfEnforced, localExecutionOverride, makePeerKey, _parseConnectionTraceIdFromUpgrade, _stripPrivateRoutingFields, _turnStatusWireFields, _helloTurnStatusResendPhase, preparedModelSwitchCatchupFrame, _matchActiveTurnReplayCandidate, _unservedActiveTurnReplay, _noteActiveTurnReplayServed, _shouldPushTurnInterruptedFinal, _shouldInterruptUnknownInFlight } from './server.js'
 import type { Gateway } from './server.js'
 
@@ -88,6 +89,7 @@ export interface WsConnectionHost {
   _handleSessionRepoBind: Gateway['_handleSessionRepoBind']
   _handleSessionRepoUnbind: Gateway['_handleSessionRepoUnbind']
   _interruptDelegationsForParent: Gateway['_interruptDelegationsForParent']
+  _interruptRemoteSwarmForSession?: Gateway['_interruptRemoteSwarmForSession']
   _modelAuthority: Gateway['_modelAuthority']
   _outboundRing: Gateway['_outboundRing']
   _pendingPermissions: Gateway['_pendingPermissions']
@@ -1295,6 +1297,24 @@ export type HandleStopFrame = {
     clientMessageId?: string
   }
 
+async function interruptRemoteSwarmForSession(
+  host: WsConnectionHost,
+  sessionKey: string,
+  reason: string,
+): Promise<boolean> {
+  if (host._interruptRemoteSwarmForSession) {
+    return host._interruptRemoteSwarmForSession(sessionKey, reason)
+  }
+  const rt = lookupRemoteSwarmRuntimeForSession(sessionKey)
+  if (!rt) return false
+  try {
+    const res = await rt.interruptSessionWorkers(sessionKey, reason)
+    return res.interrupted
+  } catch {
+    return false
+  }
+}
+
 export async function handleStop(
   this: WsConnectionHost,
   frame: HandleStopFrame,
@@ -1313,14 +1333,15 @@ export async function handleStop(
 
   // Exact browser identity is authoritative across assistant switches. Scan
   // the peer's live agent sessions and interrupt only the matching owner,
-  // then cascade through the captain's delegate/reviewer tree.
+  // then cascade through the captain's delegate/reviewer/remote-swarm tree.
   if (clientMessageId) {
     for (const live of this.sessions.list()) {
       if (!live.sessionKey.endsWith(suffix)) continue
       const selfInterrupted = this.sessions.interruptClientTurn(live.sessionKey, clientMessageId)
       if (!selfInterrupted) continue
       const delegateInterrupted = this._interruptDelegationsForParent(live.sessionKey)
-      const ok = selfInterrupted || delegateInterrupted
+      const swarmInterrupted = await interruptRemoteSwarmForSession(this, live.sessionKey, 'user_stop')
+      const ok = selfInterrupted || delegateInterrupted || swarmInterrupted
       // The turn is gone; any permission it was blocked on must not
       // outlive it as a dead card (browser) / pending row (master).
       this._settlePendingPermissionsForStop(live.sessionKey, clientMessageId)
@@ -1334,6 +1355,8 @@ export async function handleStop(
     // OCV5-435: accepted but its engine run does not exist yet (cold start,
     // lock wait). Bind the Stop to that exact turn instead of answering
     // TURN_NOT_ACTIVE and letting it run unseen.
+    // B5: Do NOT cascade-interrupt other live sessions sharing the peer suffix;
+    // pre-start turns have not spawned workers and have no ownership over other agents' swarms.
     if (this._admittedClientTurns?.has(preStartStopKey(frame.peer.id, clientMessageId))) {
       this.sessions.fencePreStartStop(frame.peer.id, clientMessageId)
       this.log.info('interrupt', {
@@ -1371,8 +1394,9 @@ export async function handleStop(
         if (!live.sessionKey.endsWith(suffix)) continue
         const selfInterrupted = this.sessions.interrupt(live.sessionKey, 'user')
         const delegateInterrupted = this._interruptDelegationsForParent(live.sessionKey)
+        const swarmInterrupted = await interruptRemoteSwarmForSession(this, live.sessionKey, 'user_stop')
         if (selfInterrupted) this._settlePendingPermissionsForStop(live.sessionKey)
-        interrupted = selfInterrupted || delegateInterrupted || interrupted
+        interrupted = selfInterrupted || delegateInterrupted || swarmInterrupted || interrupted
       }
       if (interrupted) {
         this.log.info('interrupt', { sessionKey: `*${suffix}`, ok: true })
@@ -1391,8 +1415,9 @@ export async function handleStop(
   }
   const selfInterrupted = this.sessions.interrupt(sessionKey, 'user')
   const delegateInterrupted = this._interruptDelegationsForParent(sessionKey)
+  const swarmInterrupted = await interruptRemoteSwarmForSession(this, sessionKey, 'user_stop')
   if (selfInterrupted) this._settlePendingPermissionsForStop(sessionKey)
-  let ok = selfInterrupted || delegateInterrupted
+  let ok = selfInterrupted || delegateInterrupted || swarmInterrupted
   // Compatibility containment for already-open clients: if their selector
   // changed before Stop, the legacy frame names the new agent. Only on a
   // direct miss do we fall back to the existing peer-wide stop behavior.
@@ -1401,8 +1426,9 @@ export async function handleStop(
       if (!live.sessionKey.endsWith(suffix)) continue
       const fallbackSelf = this.sessions.interrupt(live.sessionKey, 'user')
       const fallbackDelegates = this._interruptDelegationsForParent(live.sessionKey)
+      const fallbackSwarm = await interruptRemoteSwarmForSession(this, live.sessionKey, 'user_stop')
       if (fallbackSelf) this._settlePendingPermissionsForStop(live.sessionKey)
-      ok = fallbackSelf || fallbackDelegates || ok
+      ok = fallbackSelf || fallbackDelegates || fallbackSwarm || ok
     }
   }
   this.log.info('interrupt', { sessionKey, ok })

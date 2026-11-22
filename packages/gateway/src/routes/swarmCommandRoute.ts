@@ -19,7 +19,12 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import { antigravityRoot, antigravitySessionBrainDir } from '../engine/antigravityPlatform.js'
-import { lookupRemoteSwarmRuntimeForSession } from '../remoteSwarmRuntime.js'
+import {
+  type RemoteSwarmRuntime,
+  lookupRemoteSwarmRuntimeForSession,
+  remoteSwarmLocationForSession,
+  resolveDefaultRemoteSwarmRuntime,
+} from '../remoteSwarmRuntime.js'
 import {
   handleSwarmCommandRoute,
   parseSwarmControlCommand,
@@ -62,6 +67,7 @@ export interface InternalSwarmCommandDeps {
     sessionId: string,
   ) => Promise<ResolvedSessionSwarmTarget | 'forbidden' | null>
   antigravityRootDir?: () => string
+  getRemoteSwarmRuntime?: () => RemoteSwarmRuntime | null
   now?: () => number
 }
 
@@ -98,41 +104,114 @@ function hasSwarmMembersJson(brainDir: string, conversationId: string): boolean 
   return Boolean(st && !st.isSymbolicLink() && st.isFile())
 }
 
+export interface AuthoritativeSwarmBinding {
+  target: ResolvedSessionSwarmTarget
+  kind: 'native' | 'remote'
+  sessionKey?: string
+}
+
+/**
+ * Resolve the container-authoritative active or cold-disk swarm binding for `sessionId` (B6).
+ *
+ * Precedence (shared identically by BOTH `steer` and `terminate`):
+ *   1. Explicit active runner binding (`lookedUp.brainDir` + `lookedUp.conversationId`):
+ *      binds strictly to that exact `(brainDir, conversationId)` (`remote` iff it matches
+ *      `remoteSwarmLocationForSession`, otherwise `native`). If `members.json` is absent,
+ *      fails closed (`null`) and NEVER falls back to historical or opposite-runtime boards.
+ *   2. Active live Remote Swarm runtime (`lookupRemoteSwarmRuntimeForSession(sessionKey)`):
+ *      when no explicit `brainDir` overrides it, binds to that live remote swarm (fail-closed
+ *      if `members.json` is missing).
+ *   3. Cold disk fallback (no active runner binding and no live remote runtime):
+ *      checks the exact authoritative native candidate (`lookedUp.conversationId` if present)
+ *      and the deterministic remote candidate (`remoteSwarmLocationForSession`). Succeeds ONLY
+ *      when exactly ONE candidate exists on disk; fails closed (`null`) on 0 or >1 (ambiguous).
+ */
+export function resolveAuthoritativeSwarmBinding(
+  sessionId: string,
+  deps: Pick<InternalSwarmCommandDeps, 'lookupSessionTarget' | 'antigravityRootDir'> = {},
+): AuthoritativeSwarmBinding | null {
+  if (!SAFE_SESSION_ID_RE.test(sessionId)) return null
+  const lookedUp = deps.lookupSessionTarget?.(sessionId) ?? null
+  if (!lookedUp) return null
+
+  const root = deps.antigravityRootDir ? deps.antigravityRootDir() : antigravityRoot()
+  const remoteLoc = lookedUp.sessionKey
+    ? remoteSwarmLocationForSession(lookedUp.sessionKey, root)
+    : null
+
+  // 1) Explicit active binding from live runner (`brainDir` + `conversationId`).
+  if (lookedUp.brainDir) {
+    if (!lookedUp.conversationId || !CONVERSATION_ID_RE.test(lookedUp.conversationId)) {
+      return null
+    }
+    if (!hasSwarmMembersJson(lookedUp.brainDir, lookedUp.conversationId)) {
+      return null
+    }
+    const isRemote =
+      remoteLoc !== null &&
+      path.resolve(lookedUp.brainDir) === path.resolve(remoteLoc.brainDir) &&
+      lookedUp.conversationId.toLowerCase() === remoteLoc.swarmId.toLowerCase()
+    return {
+      target: { brainDir: lookedUp.brainDir, conversationId: lookedUp.conversationId },
+      kind: isRemote ? 'remote' : 'native',
+      ...(lookedUp.sessionKey ? { sessionKey: lookedUp.sessionKey } : {}),
+    }
+  }
+
+  // 2) Live in-memory Remote Swarm runtime without a conflicting native active binding.
+  if (lookedUp.sessionKey && remoteLoc && lookupRemoteSwarmRuntimeForSession(lookedUp.sessionKey)) {
+    if (hasSwarmMembersJson(remoteLoc.brainDir, remoteLoc.swarmId)) {
+      return {
+        target: { brainDir: remoteLoc.brainDir, conversationId: remoteLoc.swarmId },
+        kind: 'remote',
+        sessionKey: lookedUp.sessionKey,
+      }
+    }
+    return null
+  }
+
+  // 3) Cold disk fallback (no live runner/runtime): require a unique unambiguous candidate.
+  const candidates: AuthoritativeSwarmBinding[] = []
+  const seen = new Set<string>()
+  const addCandidate = (brainDir: string, conversationId: string, kind: 'native' | 'remote') => {
+    const k = `${path.resolve(brainDir)}\0${conversationId.toLowerCase()}`
+    if (seen.has(k)) return
+    if (hasSwarmMembersJson(brainDir, conversationId)) {
+      seen.add(k)
+      candidates.push({
+        target: { brainDir, conversationId },
+        kind,
+        ...(lookedUp.sessionKey ? { sessionKey: lookedUp.sessionKey } : {}),
+      })
+    }
+  }
+
+  if (lookedUp.conversationId && CONVERSATION_ID_RE.test(lookedUp.conversationId) && lookedUp.sessionKey) {
+    if (
+      remoteLoc &&
+      lookedUp.conversationId.toLowerCase() === remoteLoc.swarmId.toLowerCase()
+    ) {
+      addCandidate(remoteLoc.brainDir, remoteLoc.swarmId, 'remote')
+    } else {
+      addCandidate(antigravitySessionBrainDir(root, lookedUp.sessionKey), lookedUp.conversationId, 'native')
+    }
+  }
+  if (remoteLoc) {
+    addCandidate(remoteLoc.brainDir, remoteLoc.swarmId, 'remote')
+  }
+
+  // B6: Fail closed unless exactly ONE authoritative candidate exists (reject cold Native+Remote ambiguity).
+  return candidates.length === 1 ? candidates[0]! : null
+}
+
 /**
  * Resolve the container-authoritative `{ brainDir, conversationId }` for `sessionId`.
- *
- * B6 (OCV5-832): Requires an authoritative session -> conversationId binding from
- * `lookupSessionTarget` (live runner, live session `ccbSessionId`, or persisted
- * SessionManager `_resumeMap`). If the bound conversation has no active swarm
- * (`members.json`), returns `null` (404 `SWARM_NOT_FOUND`) and NEVER scans or falls
- * back to older historical conversation directories in the same `brainDir`.
  */
 export function resolveAuthoritativeSessionSwarm(
   sessionId: string,
   deps: Pick<InternalSwarmCommandDeps, 'lookupSessionTarget' | 'antigravityRootDir'> = {},
 ): ResolvedSessionSwarmTarget | null {
-  if (!SAFE_SESSION_ID_RE.test(sessionId)) return null
-  const lookedUp = deps.lookupSessionTarget?.(sessionId) ?? null
-  if (!lookedUp?.conversationId || !CONVERSATION_ID_RE.test(lookedUp.conversationId)) {
-    return null
-  }
-
-  const root = deps.antigravityRootDir ? deps.antigravityRootDir() : antigravityRoot()
-  const candidateBrainDirs: string[] = []
-  if (lookedUp.brainDir) candidateBrainDirs.push(lookedUp.brainDir)
-  if (lookedUp.sessionKey) {
-    const derived = antigravitySessionBrainDir(root, lookedUp.sessionKey)
-    if (!candidateBrainDirs.includes(derived)) candidateBrainDirs.push(derived)
-  }
-
-  const matches: ResolvedSessionSwarmTarget[] = []
-  for (const brainDir of candidateBrainDirs) {
-    if (hasSwarmMembersJson(brainDir, lookedUp.conversationId)) {
-      matches.push({ brainDir, conversationId: lookedUp.conversationId })
-    }
-  }
-  // B6: Fail closed unless exactly one authoritative target matches.
-  return matches.length === 1 ? matches[0]! : null
+  return resolveAuthoritativeSwarmBinding(sessionId, deps)?.target ?? null
 }
 
 function extractSessionId(url: URL): string | null {
@@ -233,53 +312,71 @@ export async function handleInternalSwarmCommand(
     return
   }
 
-  // If this session is an active Remote Antigravity Swarm coordinator, route trusted
-  // human kill commands directly through `RemoteSwarmRuntime.executeOperatorKill` (honest
-  // confirmed vs pending stop) and wake workers after `steer` board writes (OCV5-835).
-  const lookedUpSession = deps.lookupSessionTarget?.(sessionId) ?? null
-  const remoteRuntime = lookedUpSession?.sessionKey
-    ? lookupRemoteSwarmRuntimeForSession(lookedUpSession.sessionKey)
-    : undefined
+  // B6: Resolve the authoritative target ONCE and share it across BOTH `steer` and `terminate`.
+  // Only hydrate and dispatch to RemoteSwarmRuntime when the resolved binding is explicitly `remote`;
+  // ambiguous cold Native+Remote or active Native bindings NEVER route to a stale Remote swarm.
+  let resolvedBinding: AuthoritativeSwarmBinding | null = null
+  let customResolvedTarget: ResolvedSessionSwarmTarget | 'forbidden' | null | undefined
+  if (deps.resolveSessionSwarm) {
+    customResolvedTarget = await deps.resolveSessionSwarm(userId, sessionId)
+  } else {
+    resolvedBinding = resolveAuthoritativeSwarmBinding(sessionId, deps)
+  }
 
-  if (remoteRuntime && lookedUpSession?.sessionKey) {
+  let remoteRuntime: RemoteSwarmRuntime | undefined
+  const remoteSessionKey = resolvedBinding?.kind === 'remote' ? resolvedBinding.sessionKey : undefined
+  if (resolvedBinding?.kind === 'remote' && remoteSessionKey) {
+    remoteRuntime = lookupRemoteSwarmRuntimeForSession(remoteSessionKey)
+    if (!remoteRuntime) {
+      const candidate = deps.getRemoteSwarmRuntime?.() ?? resolveDefaultRemoteSwarmRuntime()
+      if (candidate?.hydrateSessionFromDisk({ sessionKey: remoteSessionKey })) {
+        remoteRuntime = candidate
+      }
+    }
+  }
+
+  if (remoteRuntime && remoteSessionKey) {
     try {
       const parsedBody = JSON.parse(rawBody.toString('utf8') || '{}') as Record<string, unknown>
-      let action = typeof parsedBody.action === 'string' ? parsedBody.action.trim().toLowerCase() : ''
-      let memberName =
-        typeof parsedBody.memberName === 'string'
-          ? parsedBody.memberName
-          : typeof parsedBody.target === 'string'
-            ? parsedBody.target
-            : ''
-      let reason = typeof parsedBody.reason === 'string' ? parsedBody.reason : undefined
-      if (!action && typeof parsedBody.command === 'string') {
-        const cmd = parseSwarmControlCommand(parsedBody.command)
-        if (cmd?.kind === 'kill') {
-          action = 'kill'
-          memberName = cmd.memberName
-          reason = cmd.reason
+      const hasForbiddenPathOverride = 'brainDir' in parsedBody || 'swarmDir' in parsedBody
+      if (!hasForbiddenPathOverride) {
+        let action = typeof parsedBody.action === 'string' ? parsedBody.action.trim().toLowerCase() : ''
+        let memberName =
+          typeof parsedBody.memberName === 'string'
+            ? parsedBody.memberName
+            : typeof parsedBody.target === 'string'
+              ? parsedBody.target
+              : ''
+        let reason = typeof parsedBody.reason === 'string' ? parsedBody.reason : undefined
+        if (!action && typeof parsedBody.command === 'string') {
+          const cmd = parseSwarmControlCommand(parsedBody.command)
+          if (cmd?.kind === 'kill') {
+            action = 'kill'
+            memberName = cmd.memberName
+            reason = cmd.reason
+          }
         }
-      }
-      if ((action === 'kill' || action === 'terminate') && memberName.trim()) {
-        const killRes = await remoteRuntime.executeOperatorKill(
-          lookedUpSession.sessionKey,
-          memberName.trim(),
-          reason || `user:${userId}`,
-        )
-        if (killRes.notFound) {
-          sendJson(res, 404, { ok: false, code: 'MEMBER_NOT_FOUND', error: `member not found: ${memberName}` })
+        if ((action === 'kill' || action === 'terminate') && memberName.trim()) {
+          const killRes = await remoteRuntime.executeOperatorKill(
+            remoteSessionKey,
+            memberName.trim(),
+            reason || `user:${userId}`,
+          )
+          if (killRes.notFound) {
+            sendJson(res, 404, { ok: false, code: 'MEMBER_NOT_FOUND', error: `member not found: ${memberName}` })
+            return
+          }
+          sendJson(res, 200, {
+            ok: true,
+            action: 'terminate',
+            status: killRes.confirmed ? 'confirmed' : 'requested',
+            killed: killRes.killed,
+            unconfirmed: killRes.unconfirmed,
+            alreadyKilled: killRes.alreadyKilled,
+            preservedDirtyWorktrees: killRes.preservedDirtyWorktrees,
+          })
           return
         }
-        sendJson(res, 200, {
-          ok: true,
-          action: 'terminate',
-          status: killRes.confirmed ? 'confirmed' : 'requested',
-          killed: killRes.killed,
-          unconfirmed: killRes.unconfirmed,
-          alreadyKilled: killRes.alreadyKilled,
-          preservedDirtyWorktrees: killRes.preservedDirtyWorktrees,
-        })
-        return
       }
     } catch {
       // Malformed JSON falls through to handleSwarmCommandRoute's standard 400 validation.
@@ -297,13 +394,12 @@ export async function handleInternalSwarmCommand(
 
   await handleSwarmCommandRoute(replayReq, res, {
     authenticate: async () => ({ id: userId }),
-    resolveSessionSwarm:
-      deps.resolveSessionSwarm ??
-      (async (_uid, sid) => resolveAuthoritativeSessionSwarm(sid, deps)),
+    resolveSessionSwarm: async () =>
+      deps.resolveSessionSwarm ? (customResolvedTarget ?? null) : (resolvedBinding?.target ?? null),
     now: deps.now,
   })
-  if (remoteRuntime && lookedUpSession?.sessionKey) {
-    remoteRuntime.onExternalBoardWrite(lookedUpSession.sessionKey)
+  if (remoteRuntime && remoteSessionKey) {
+    remoteRuntime.onExternalBoardWrite(remoteSessionKey)
   }
 }
 

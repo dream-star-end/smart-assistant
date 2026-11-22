@@ -30,6 +30,7 @@ export const GATEWAY_STALL_MONITOR_AGENT = 'gateway-monitor'
 export const DEFAULT_SWARM_STALL_THRESHOLD_MS = 180_000
 export const DEFAULT_SWARM_STALL_RETRY_COOLDOWN_MS = 540_000
 export const DEFAULT_SWARM_STALL_MAX_ALERTS = 3
+export const DEFAULT_SWARM_STALL_DIAGNOSTIC_THROTTLE_MS = 30_000
 
 export type SwarmStallReason =
   | 'member_failed'
@@ -38,6 +39,34 @@ export type SwarmStallReason =
   | 'unclaimed_result'
   | 'channel_stalled'
   | 'idle_waiting'
+
+export type SwarmStallDiagnosticKind =
+  | 'skipped_phase'
+  | 'skipped_no_workers'
+  | 'stage_done_entered'
+  | 'stage_done_suppressed'
+  | 'stage_rearmed'
+  | 'progress_reset'
+  | 'skipped_working'
+  | 'activity_postponed'
+  | 'quiet_waiting'
+  | 'suppressed_max_alerts'
+  | 'suppressed_cooldown'
+  | 'alert_emitted'
+
+export interface SwarmStallDiagnosticEvent {
+  readonly kind: SwarmStallDiagnosticKind
+  readonly swarmId: string
+  readonly phase: SwarmSnapshot['phase']
+  readonly headSeq: number
+  readonly idleMs: number
+  readonly alertCount: number
+  readonly workingMembers: readonly string[]
+  readonly waitingMembers: readonly string[]
+  readonly reason?: SwarmStallReason
+  readonly target?: string
+  readonly detail?: string
+}
 
 export interface SwarmStallAlert {
   /** Single target member name (without leading `@`, never `all`). */
@@ -61,11 +90,15 @@ export interface SwarmStallMonitorOptions {
   retryCooldownMs?: number
   /** Max consecutive alerts for the same stall before going silent (default 3). */
   maxAlerts?: number
+  /** Optional structured diagnostic observer (throttled on repetitive checks, immediate on transitions/alerts). */
+  onDiagnostic?: (event: SwarmStallDiagnosticEvent) => void
+  /** Minimum interval between repetitive diagnostic logs of the same kind (default 30s). */
+  diagnosticThrottleMs?: number
 }
 
 const MONITOR_NAME_RE = /^monitor(?:-\d+)?$/i
-const DONE_PREFIX_RE = /^\s*\[done\](?:\s|$|:|：|-)/i
-const PARKED_WAIT_ACTIVITY = '等待讨论板消息'
+const DONE_PREFIX_RE = /^\s*(?:@all\s+)?(?:\*{1,2}|_{1,2})?\[done\](?::|：)?(?:\*{1,2}|_{1,2})?(?:\s|$|:|：|-|—)/i
+const PARKED_WAIT_ACTIVITIES = new Set(['等待讨论板消息', '已完成本轮思考'])
 
 export function isSwarmMonitorAgentName(name: string): boolean {
   const lower = name.trim().toLowerCase()
@@ -88,7 +121,11 @@ export function isSwarmAuxiliaryRole(role: SwarmMemberRole): boolean {
 export function isMemberEffectivelyWaiting(member: SwarmMemberSnapshot): boolean {
   if (member.status === 'killed') return false
   if (member.status === 'waiting' || member.status === 'stopped') return true
-  return member.status === 'working' && member.activity === PARKED_WAIT_ACTIVITY
+  return (
+    member.status === 'working' &&
+    typeof member.activity === 'string' &&
+    PARKED_WAIT_ACTIVITIES.has(member.activity)
+  )
 }
 
 function isMonitorPost(post: SwarmBoardPost): boolean {
@@ -165,6 +202,8 @@ export class SwarmStallMonitor {
   private readonly stallThresholdMs: number
   private readonly retryCooldownMs: number
   private readonly maxAlerts: number
+  private readonly onDiagnostic?: (event: SwarmStallDiagnosticEvent) => void
+  private readonly diagnosticThrottleMs: number
 
   /** Highest coordinator `[done]` post seq observed. */
   private lastDoneSeq = 0
@@ -188,11 +227,18 @@ export class SwarmStallMonitor {
   private alertCount = 0
   private lastAlertAt = 0
   private readonly repingedMentions = new Map<string, number>()
+  private lastDiagnosticKind: SwarmStallDiagnosticKind | null = null
+  private lastDiagnosticAt = 0
 
   constructor(opts?: SwarmStallMonitorOptions) {
     this.stallThresholdMs = Math.max(1_000, opts?.stallThresholdMs ?? DEFAULT_SWARM_STALL_THRESHOLD_MS)
     this.retryCooldownMs = Math.max(1_000, opts?.retryCooldownMs ?? DEFAULT_SWARM_STALL_RETRY_COOLDOWN_MS)
     this.maxAlerts = Math.max(1, Math.floor(opts?.maxAlerts ?? DEFAULT_SWARM_STALL_MAX_ALERTS))
+    this.onDiagnostic = opts?.onDiagnostic
+    this.diagnosticThrottleMs = Math.max(
+      0,
+      opts?.diagnosticThrottleMs ?? DEFAULT_SWARM_STALL_DIAGNOSTIC_THROTTLE_MS,
+    )
   }
 
   /** Clear all state on turn end, user stop, or swarm teardown. */
@@ -203,6 +249,8 @@ export class SwarmStallMonitor {
     this.lastBusinessKey = null
     this.lastActivityKey = null
     this.lastQuietSince = 0
+    this.lastDiagnosticKind = null
+    this.lastDiagnosticAt = 0
     this.clearAlertState()
   }
 
@@ -212,6 +260,30 @@ export class SwarmStallMonitor {
     this.repingedMentions.clear()
   }
 
+  private emitDiagnostic(
+    now: number,
+    event: SwarmStallDiagnosticEvent,
+    opts?: { immediate?: boolean },
+  ): void {
+    if (!this.onDiagnostic) return
+    const immediate = opts?.immediate === true
+    if (
+      !immediate &&
+      this.lastDiagnosticKind === event.kind &&
+      this.diagnosticThrottleMs > 0 &&
+      now - this.lastDiagnosticAt < this.diagnosticThrottleMs
+    ) {
+      return
+    }
+    this.lastDiagnosticKind = event.kind
+    this.lastDiagnosticAt = now
+    try {
+      this.onDiagnostic(event)
+    } catch {
+      // Diagnostic observer errors must never break stall monitoring.
+    }
+  }
+
   /**
    * Inspect a snapshot in O(members + recentPosts) memory time with zero I/O and
    * zero LLM calls. Returns an alert only when every live core member is parked
@@ -219,6 +291,16 @@ export class SwarmStallMonitor {
    */
   evaluate(snap: SwarmSnapshot, now: number = Date.now()): SwarmStallAlert | null {
     if (snap.phase !== 'running' && snap.phase !== 'starting') {
+      this.emitDiagnostic(now, {
+        kind: 'skipped_phase',
+        swarmId: snap.swarmId,
+        phase: snap.phase,
+        headSeq: 0,
+        idleMs: 0,
+        alertCount: this.alertCount,
+        workingMembers: [],
+        waitingMembers: [],
+      })
       this.reset()
       return null
     }
@@ -232,12 +314,29 @@ export class SwarmStallMonitor {
       this.lastActivityKey = null
       this.lastQuietSince = now
       this.clearAlertState()
+      this.emitDiagnostic(now, {
+        kind: 'skipped_no_workers',
+        swarmId: snap.swarmId,
+        phase: snap.phase,
+        headSeq: 0,
+        idleMs: 0,
+        alertCount: 0,
+        workingMembers: [],
+        waitingMembers: liveCoreMembers.map((m) => m.name),
+      })
       return null
     }
 
     const nonMonitorPosts = snap.posts.filter((p) => !isMonitorPost(p))
     const effectiveHeadSeq =
       nonMonitorPosts.length > 0 ? nonMonitorPosts[nonMonitorPosts.length - 1]!.seq : 0
+
+    const workingMembers: string[] = []
+    const waitingMembers: string[] = []
+    for (const m of liveCoreMembers) {
+      if (isMemberEffectivelyWaiting(m)) waitingMembers.push(m.name)
+      else workingMembers.push(m.name)
+    }
 
     let newestDoneSeq = this.lastDoneSeq
     for (const post of nonMonitorPosts) {
@@ -252,6 +351,21 @@ export class SwarmStallMonitor {
       this.stageDone = true
       this.doneWorkerNames = currentWorkerNames
       this.clearAlertState()
+      this.emitDiagnostic(
+        now,
+        {
+          kind: 'stage_done_entered',
+          swarmId: snap.swarmId,
+          phase: snap.phase,
+          headSeq: effectiveHeadSeq,
+          idleMs: 0,
+          alertCount: 0,
+          workingMembers,
+          waitingMembers,
+          detail: `doneSeq=#${newestDoneSeq}`,
+        },
+        { immediate: true },
+      )
     }
 
     const postsAfterDone = nonMonitorPosts.filter((p) => p.seq > this.lastDoneSeq)
@@ -266,11 +380,36 @@ export class SwarmStallMonitor {
       const newWorkerRecruited = [...currentWorkerNames].some((n) => !this.doneWorkerNames.has(n))
       if (!coordinatorStartedNewStage && !newWorkerRecruited) {
         this.lastQuietSince = now
+        this.emitDiagnostic(now, {
+          kind: 'stage_done_suppressed',
+          swarmId: snap.swarmId,
+          phase: snap.phase,
+          headSeq: effectiveHeadSeq,
+          idleMs: 0,
+          alertCount: this.alertCount,
+          workingMembers,
+          waitingMembers,
+        })
         return null
       }
       this.stageDone = false
       this.doneWorkerNames.clear()
       this.clearAlertState()
+      this.emitDiagnostic(
+        now,
+        {
+          kind: 'stage_rearmed',
+          swarmId: snap.swarmId,
+          phase: snap.phase,
+          headSeq: effectiveHeadSeq,
+          idleMs: 0,
+          alertCount: 0,
+          workingMembers,
+          waitingMembers,
+          detail: coordinatorStartedNewStage ? 'coordinator_post' : 'new_worker',
+        },
+        { immediate: true },
+      )
     }
 
     const stagePosts = postsAfterDone
@@ -293,12 +432,23 @@ export class SwarmStallMonitor {
       ),
     ].join('|')
 
-    const anyWorking = liveCoreMembers.some((m) => !isMemberEffectivelyWaiting(m))
+    const anyWorking = workingMembers.length > 0
 
     if (this.lastBusinessKey === null) {
       this.lastBusinessKey = businessKey
       this.lastActivityKey = activityKey
       this.lastQuietSince = now
+      this.emitDiagnostic(now, {
+        kind: anyWorking ? 'skipped_working' : 'quiet_waiting',
+        swarmId: snap.swarmId,
+        phase: snap.phase,
+        headSeq: effectiveHeadSeq,
+        idleMs: 0,
+        alertCount: this.alertCount,
+        workingMembers,
+        waitingMembers,
+        detail: 'baseline_seeded',
+      })
       return null
     }
 
@@ -307,12 +457,32 @@ export class SwarmStallMonitor {
       this.lastActivityKey = activityKey
       this.lastQuietSince = now
       this.clearAlertState()
+      this.emitDiagnostic(now, {
+        kind: 'progress_reset',
+        swarmId: snap.swarmId,
+        phase: snap.phase,
+        headSeq: effectiveHeadSeq,
+        idleMs: 0,
+        alertCount: 0,
+        workingMembers,
+        waitingMembers,
+      })
       return null
     }
 
     if (anyWorking) {
       this.lastActivityKey = activityKey
       this.lastQuietSince = now
+      this.emitDiagnostic(now, {
+        kind: 'skipped_working',
+        swarmId: snap.swarmId,
+        phase: snap.phase,
+        headSeq: effectiveHeadSeq,
+        idleMs: 0,
+        alertCount: this.alertCount,
+        workingMembers,
+        waitingMembers,
+      })
       return null
     }
 
@@ -321,13 +491,59 @@ export class SwarmStallMonitor {
       // postpone idle timer, but keep `alertCount` and `repingedMentions` intact.
       this.lastActivityKey = activityKey
       this.lastQuietSince = now
+      this.emitDiagnostic(now, {
+        kind: 'activity_postponed',
+        swarmId: snap.swarmId,
+        phase: snap.phase,
+        headSeq: effectiveHeadSeq,
+        idleMs: 0,
+        alertCount: this.alertCount,
+        workingMembers,
+        waitingMembers,
+      })
       return null
     }
 
     const idleMs = Math.max(0, now - this.lastQuietSince)
-    if (idleMs < this.stallThresholdMs) return null
-    if (this.alertCount >= this.maxAlerts) return null
-    if (this.alertCount > 0 && now - this.lastAlertAt < this.retryCooldownMs) return null
+    if (idleMs < this.stallThresholdMs) {
+      this.emitDiagnostic(now, {
+        kind: 'quiet_waiting',
+        swarmId: snap.swarmId,
+        phase: snap.phase,
+        headSeq: effectiveHeadSeq,
+        idleMs,
+        alertCount: this.alertCount,
+        workingMembers,
+        waitingMembers,
+      })
+      return null
+    }
+    if (this.alertCount >= this.maxAlerts) {
+      this.emitDiagnostic(now, {
+        kind: 'suppressed_max_alerts',
+        swarmId: snap.swarmId,
+        phase: snap.phase,
+        headSeq: effectiveHeadSeq,
+        idleMs,
+        alertCount: this.alertCount,
+        workingMembers,
+        waitingMembers,
+      })
+      return null
+    }
+    if (this.alertCount > 0 && now - this.lastAlertAt < this.retryCooldownMs) {
+      this.emitDiagnostic(now, {
+        kind: 'suppressed_cooldown',
+        swarmId: snap.swarmId,
+        phase: snap.phase,
+        headSeq: effectiveHeadSeq,
+        idleMs,
+        alertCount: this.alertCount,
+        workingMembers,
+        waitingMembers,
+      })
+      return null
+    }
 
     const attempt = this.alertCount + 1
     const alert = this.diagnoseStall({
@@ -342,6 +558,22 @@ export class SwarmStallMonitor {
 
     this.alertCount = attempt
     this.lastAlertAt = now
+    this.emitDiagnostic(
+      now,
+      {
+        kind: 'alert_emitted',
+        swarmId: snap.swarmId,
+        phase: snap.phase,
+        headSeq: effectiveHeadSeq,
+        idleMs,
+        alertCount: attempt,
+        workingMembers,
+        waitingMembers,
+        reason: alert.reason,
+        target: alert.target,
+      },
+      { immediate: true },
+    )
     return alert
   }
 

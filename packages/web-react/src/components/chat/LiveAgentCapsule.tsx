@@ -1,6 +1,7 @@
 import type { SwarmSnapshot } from "@openclaude/protocol/browser";
 import type { MediaGenerationJob } from "@openclaude/protocol/mediaGeneration";
 import {
+  AlertTriangle,
   ArrowUpRight,
   ChevronDown,
   ChevronUp,
@@ -33,8 +34,9 @@ import {
   PinnedBackgroundTasksPanel,
   summarizeBgCommand,
 } from "./PinnedBackgroundTasksPanel";
+import { SwarmElapsedTicker } from "./SwarmElapsedTicker";
 import type { SwarmOpenRequest } from "./swarmDetect";
-import { formatSwarmElapsed, isSwarmActive, summarizeSwarmCounts, swarmPhaseMeta } from "./swarmUtils";
+import { detectSwarmAlerts, isSwarmActive, summarizeSwarmCounts, swarmPhaseMeta } from "./swarmUtils";
 import type { TodoItem } from "./todoExtract";
 import "./liveActivity.css";
 
@@ -59,10 +61,10 @@ export type LiveAgentCapsuleProps = {
   latestSwarm: SwarmSnapshot | null;
   latestSwarmCardId?: string;
   latestSwarmBlockId?: string;
-  latestSwarmKey: string | null;
-  dismissedSwarmKey: string | null;
+  latestSwarmKey?: string | null;
+  dismissedSwarmKey?: string | null;
   onOpenSwarmBoard: (req: SwarmOpenRequest) => void;
-  onDismissSwarm: (key: string) => void;
+  onDismissSwarm?: (key: string) => void;
   museJobs?: SessionMuseJobItem[];
   mediaJobs?: MediaGenerationJob[];
   bgCommands?: SessionBgCommandItem[];
@@ -105,6 +107,9 @@ export default function LiveAgentCapsule({
 }: LiveAgentCapsuleProps) {
   void timelineMessages;
   void tokenUsage;
+  void latestSwarmKey;
+  void dismissedSwarmKey;
+  void onDismissSwarm;
   const [expanded, setExpanded] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const [autoHiddenDelegates, setAutoHiddenDelegates] = useState<ReadonlySet<string>>(() => new Set());
@@ -274,8 +279,10 @@ export default function LiveAgentCapsule({
     }
   }, [visibleDelegates]);
 
+  // Swarm elapsed time is isolated inside <SwarmElapsedTicker />, so LiveAgentCapsule
+  // does not trigger parent 1s re-renders when only a swarm is running.
   const fastTimerRunning =
-    swarmActive || runningDelegates.length > 0 || mediaRunning || hasBgCmd;
+    runningDelegates.length > 0 || mediaRunning || hasBgCmd;
   useEffect(() => {
     if (!fastTimerRunning) return;
     setNow(Date.now());
@@ -306,6 +313,8 @@ export default function LiveAgentCapsule({
   let timer = "";
   let primaryMediaIsImage = false;
 
+  const swarmAlerts = primaryKind === "swarm" && latestSwarm ? detectSwarmAlerts(latestSwarm) : null;
+
   if (primaryKind === "swarm" && latestSwarm) {
     const counts = summarizeSwarmCounts(latestSwarm.members);
     const phase = swarmPhaseMeta(latestSwarm.phase);
@@ -317,7 +326,7 @@ export default function LiveAgentCapsule({
         ? `${counts.working} 运行中${latestPost ? ` · ${latestPost.agent}` : ""}`
         : `${counts.live} 成员`
       : phase.label;
-    timer = swarmActive ? formatSwarmElapsed(latestSwarm.startedAt, now) : "";
+    timer = "";
   } else if (primaryKind === "delegate" && primaryDelegate) {
     const liveCount = liveDelegates.length;
     isRunning = runningDelegates.length > 0;
@@ -467,9 +476,7 @@ export default function LiveAgentCapsule({
               snapshot={latestSwarm}
               cardId={latestSwarmCardId}
               blockId={latestSwarmBlockId}
-              dismissed={dismissedSwarmKey === latestSwarmKey}
               onOpenBoard={onOpenSwarmBoard}
-              onDismiss={() => latestSwarmKey && onDismissSwarm(latestSwarmKey)}
             />
           )}
         </div>
@@ -517,11 +524,18 @@ export default function LiveAgentCapsule({
                 {detail}
               </span>
             )}
-            {timer && (
+            {primaryKind === "swarm" && latestSwarm ? (
+              <SwarmElapsedTicker
+                startedAt={latestSwarm.startedAt}
+                active={swarmActive}
+                data-testid="live-agent-capsule-timer"
+                className="oc-live-capsule-timer shrink-0"
+              />
+            ) : timer ? (
               <span data-testid="live-agent-capsule-timer" className="oc-live-capsule-timer shrink-0">
                 {timer}
               </span>
-            )}
+            ) : null}
             {extraCount > 0 && (
               <span data-testid="live-agent-capsule-more" className="oc-live-capsule-more shrink-0">
                 +{extraCount}
@@ -533,6 +547,35 @@ export default function LiveAgentCapsule({
               <ChevronUp size={14} aria-hidden className="shrink-0 text-faint" />
             )}
           </button>
+
+          {primaryKind === "swarm" && latestSwarm && swarmAlerts?.hasAlert && (
+            <button
+              type="button"
+              data-testid="live-agent-capsule-swarm-alert"
+              title={swarmAlerts.summary}
+              onClick={() =>
+                onOpenSwarmBoard({
+                  snapshot: latestSwarm,
+                  cardId: latestSwarmCardId,
+                  blockId: latestSwarmBlockId,
+                  focusMember: swarmAlerts.primaryFocusMember,
+                  focusSeq: swarmAlerts.primaryFocusSeq,
+                })
+              }
+              className={
+                swarmAlerts.failedMembers.length > 0
+                  ? "oc-spring-press inline-flex shrink-0 items-center gap-1 rounded-full bg-danger-soft px-2 py-1 text-micro font-semibold text-danger transition-colors hover:bg-danger/20"
+                  : "oc-spring-press inline-flex shrink-0 items-center gap-1 rounded-full bg-warning-soft px-2 py-1 text-micro font-semibold text-warning transition-colors hover:bg-warning/20"
+              }
+            >
+              <AlertTriangle size={11} aria-hidden className="shrink-0" />
+              <span className="max-w-28 truncate">
+                {swarmAlerts.failedMembers.length > 0
+                  ? `${swarmAlerts.failedMembers.length} 异常`
+                  : "停滞预警"}
+              </span>
+            </button>
+          )}
 
           {primaryKind === "swarm" && latestSwarm && (
             <button

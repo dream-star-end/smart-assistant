@@ -1,10 +1,15 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
-import { antigravitySessionBrainDir } from '../engine/antigravityPlatform.js'
+import {
+  ANTIGRAVITY_PREAMBLE,
+  antigravitySessionBrainDir,
+  cleanupAntigravityLaunch,
+  projectAntigravityPlatform,
+} from '../engine/antigravityPlatform.js'
 import {
   ANTIGRAVITY_SWARM_OFF_MARKER,
   applyAntigravitySwarmTurnDirective,
@@ -259,6 +264,120 @@ test('OCV5-848: forbids spawning native monitor, detects live legacy monitors sa
     assert.ok(remoteOn.text.includes('严禁招募 `monitor` / `monitor-N`'))
     assert.ok(!remoteOn.text.includes('残留原生监控成员'))
   } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('OCV5-852 P0-3/P2-2: dual @monitor/@narrator ban, @all [done] prohibition, pre-[done] kill cleanup, /swarm-playbook, resumed deduplication, and disabled skill stubs', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'oc-swarm-852-dir-'))
+  const prevHome = process.env.OPENCLAUDE_HOME
+  try {
+    // 1. Fresh vs resumed swarm directive deduplication + dual ban + @all [done] ban + pre-[done] kill
+    const fresh = applyAntigravitySwarmTurnDirective({
+      finalText: '开发新模块',
+      rawUserText: '开发新模块',
+      isAntigravityTurn: true,
+      isRemoteAntigravity: false,
+      swarmMode: true,
+      hasHistoricalSwarm: false,
+    })
+    assert.equal(fresh.mode, 'on')
+    assert.ok(fresh.text.includes('monitor'))
+    assert.ok(fresh.text.includes('narrator'))
+    assert.ok(fresh.text.includes('@all [done]'))
+    assert.ok(fresh.text.includes('swarm{action:"kill"}'))
+
+    const resumed = applyAntigravitySwarmTurnDirective({
+      finalText: '继续下一阶段',
+      rawUserText: '继续下一阶段',
+      isAntigravityTurn: true,
+      isRemoteAntigravity: false,
+      swarmMode: true,
+      hasHistoricalSwarm: true,
+    })
+    assert.equal(resumed.mode, 'on')
+    assert.ok(resumed.text.includes('narrator'))
+    assert.ok(resumed.text.includes('@all [done]'))
+    assert.ok(resumed.text.length < fresh.text.length * 0.6, 'resumed swarm directive must be significantly deduplicated')
+
+    // 2. /swarm-playbook slash command activates swarm mode cleanly
+    const viaPlaybook = applyAntigravitySwarmTurnDirective({
+      finalText: '/swarm-playbook arch-audit 检查权限边界',
+      rawUserText: '/swarm-playbook arch-audit 检查权限边界',
+      isAntigravityTurn: true,
+      isRemoteAntigravity: false,
+      swarmMode: false,
+      hasHistoricalSwarm: false,
+    })
+    assert.equal(viaPlaybook.mode, 'on')
+    assert.equal(viaPlaybook.viaSlash, true)
+    assert.ok(viaPlaybook.text.includes('arch-audit 检查权限边界'))
+    assert.ok(!viaPlaybook.text.includes('/swarm-playbook'))
+
+    // 3. listLiveAntigravitySwarmMonitors detects both monitor and narrator legacy members
+    const sessionKey = 'agent:main:webchat:dm:aux-detect'
+    const brainDir = antigravitySessionBrainDir(root, sessionKey)
+    const swarmDir = path.join(brainDir, VALID_CONV_ID, '.system_generated', 'swarm')
+    await mkdir(swarmDir, { recursive: true })
+    await writeFile(
+      path.join(swarmDir, 'members.json'),
+      JSON.stringify({
+        title: 'Aux Cleanup',
+        members: {
+          coordinator: { role: 'coordinator', killed: false },
+          monitor: { role: 'monitor', killed: false },
+          narrator: { role: 'narrator', killed: false },
+          'narrator-2': { role: 'narrator', killed: true },
+        },
+      }),
+    )
+    assert.deepEqual(
+      listLiveAntigravitySwarmMonitors({
+        sessionKey,
+        isRemote: false,
+        conversationId: VALID_CONV_ID,
+        antigravityRootDir: root,
+      }),
+      ['monitor', 'narrator'],
+    )
+
+    // 4. Slimmed ANTIGRAVITY_PREAMBLE bans both monitor & narrator while staying compact
+    assert.ok(ANTIGRAVITY_PREAMBLE.includes('monitor'))
+    assert.ok(ANTIGRAVITY_PREAMBLE.includes('narrator'))
+    assert.ok(ANTIGRAVITY_PREAMBLE.includes('/swarm-playbook'))
+
+    // 5. Launch projection overrides built-in swarm_monitor & swarm_narrator under ~/.gemini/config/skills/
+    process.env.OPENCLAUDE_HOME = root
+    const proj = projectAntigravityPlatform({
+      credential: {
+        accessToken: 'tok',
+        accessTokenExpiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      },
+      agentId: 'main',
+      sessionKey,
+      gatewayPort: 0,
+      gatewayToken: '',
+      delegationDepth: 0,
+    })
+    try {
+      const monitorStub = await readFile(
+        path.join(proj.launchHome, '.gemini', 'config', 'skills', 'swarm_monitor', 'SKILL.md'),
+        'utf8',
+      )
+      const narratorStub = await readFile(
+        path.join(proj.launchHome, '.gemini', 'config', 'skills', 'swarm_narrator', 'SKILL.md'),
+        'utf8',
+      )
+      assert.match(monitorStub, /name:\s*swarm_monitor/)
+      assert.match(monitorStub, /DISABLED in OpenClaude/)
+      assert.match(narratorStub, /name:\s*swarm_narrator/)
+      assert.match(narratorStub, /DISABLED in OpenClaude/)
+    } finally {
+      cleanupAntigravityLaunch(proj)
+    }
+  } finally {
+    if (prevHome === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_HOME')
+    else process.env.OPENCLAUDE_HOME = prevHome
     await rm(root, { recursive: true, force: true })
   }
 })

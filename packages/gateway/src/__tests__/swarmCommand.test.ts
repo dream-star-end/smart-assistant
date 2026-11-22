@@ -83,12 +83,12 @@ function makeRes() {
 }
 
 describe("injectSwarmDirective", () => {
-  it("injects @coordinator and @member directives into board.jsonl with monotonic seq under lock", () => {
+  it("injects @coordinator and @member directives into board.jsonl with monotonic seq under lock", async () => {
     const brainDir = mkdtempSync(path.join(tmpdir(), "oc-swarm-cmd-"));
     try {
       setupSwarmFixture(brainDir);
 
-      const r1 = injectSwarmDirective({
+      const r1 = await injectSwarmDirective({
         brainDir,
         conversationId: COORD_CONV,
         target: "coordinator",
@@ -102,7 +102,7 @@ describe("injectSwarmDirective", () => {
         assert.deepEqual(r1.mentions, ["coordinator"]);
       }
 
-      const r2 = injectSwarmDirective({
+      const r2 = await injectSwarmDirective({
         brainDir,
         conversationId: COORD_CONV,
         target: "@worker-1",
@@ -126,13 +126,13 @@ describe("injectSwarmDirective", () => {
     }
   });
 
-  it("rejects killed/unknown targets, invalid conversationId, and symlinked board.jsonl", () => {
+  it("rejects killed/unknown targets, invalid conversationId, and symlinked board.jsonl", async () => {
     const brainDir = mkdtempSync(path.join(tmpdir(), "oc-swarm-sec-"));
     const outside = mkdtempSync(path.join(tmpdir(), "oc-swarm-out-"));
     try {
       const swarmDir = setupSwarmFixture(brainDir);
 
-      const killedRes = injectSwarmDirective({
+      const killedRes = await injectSwarmDirective({
         brainDir,
         conversationId: COORD_CONV,
         target: "dead-worker",
@@ -141,7 +141,7 @@ describe("injectSwarmDirective", () => {
       assert.equal(killedRes.ok, false);
       if (!killedRes.ok) assert.equal(killedRes.code, "MEMBER_ALREADY_KILLED");
 
-      const unknownRes = injectSwarmDirective({
+      const unknownRes = await injectSwarmDirective({
         brainDir,
         conversationId: COORD_CONV,
         target: "ghost",
@@ -150,7 +150,7 @@ describe("injectSwarmDirective", () => {
       assert.equal(unknownRes.ok, false);
       if (!unknownRes.ok) assert.equal(unknownRes.code, "MEMBER_NOT_FOUND");
 
-      const badConv = injectSwarmDirective({
+      const badConv = await injectSwarmDirective({
         brainDir,
         conversationId: "../escape",
         target: "coordinator",
@@ -164,7 +164,7 @@ describe("injectSwarmDirective", () => {
       rmSync(path.join(swarmDir, "board.jsonl"));
       symlinkSync(outsideBoard, path.join(swarmDir, "board.jsonl"));
 
-      const symRes = injectSwarmDirective({
+      const symRes = await injectSwarmDirective({
         brainDir,
         conversationId: COORD_CONV,
         target: "coordinator",
@@ -177,17 +177,111 @@ describe("injectSwarmDirective", () => {
       rmSync(outside, { recursive: true, force: true });
     }
   });
+
+  it("P1-1: serializes concurrent directives via async queue, backs off on external .board.lock without blocking event loop, rejects lock symlinks, and handles >4MB boards", async () => {
+    const brainDir = mkdtempSync(path.join(tmpdir(), "oc-swarm-async-lock-"));
+    const outside = mkdtempSync(path.join(tmpdir(), "oc-swarm-lock-out-"));
+    try {
+      const swarmDir = setupSwarmFixture(brainDir);
+
+      // 1. 12 concurrent directives on same swarmDir produce unique monotonic seq 2..13
+      const results = await Promise.all(
+        Array.from({ length: 12 }, (_, idx) =>
+          injectSwarmDirective({
+            brainDir,
+            conversationId: COORD_CONV,
+            target: "worker-1",
+            message: `并发消息 #${idx}`,
+            now: Date.parse("2026-11-21T03:00:00.000Z") + idx * 1000,
+          }),
+        ),
+      );
+      const seqs = results.map((r) => {
+        assert.equal(r.ok, true);
+        return r.ok ? r.seq : -1;
+      });
+      assert.deepEqual(
+        [...seqs].sort((a, b) => a - b),
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+      );
+
+      // 2. External .board.lock held for 60ms: async backoff waits without blocking timers
+      const lockPath = path.join(swarmDir, ".board.lock");
+      writeFileSync(lockPath, "999999:0\n");
+      let timerTicks = 0;
+      const tickInterval = setInterval(() => {
+        timerTicks += 1;
+      }, 10);
+      setTimeout(() => {
+        rmSync(lockPath, { force: true });
+      }, 60);
+      try {
+        const waitedRes = await injectSwarmDirective({
+          brainDir,
+          conversationId: COORD_CONV,
+          target: "coordinator",
+          message: "等待锁释放后写入",
+          lockTimeoutMs: 1_000,
+        });
+        assert.equal(waitedRes.ok, true);
+        if (waitedRes.ok) assert.equal(waitedRes.seq, 14);
+        assert.ok(timerTicks >= 1, "async lock wait must not freeze the Node.js event loop");
+      } finally {
+        clearInterval(tickInterval);
+      }
+
+      // 3. Symlinked .board.lock is rejected fail-closed
+      const evilLock = path.join(outside, "evil.lock");
+      writeFileSync(evilLock, "x");
+      symlinkSync(evilLock, lockPath);
+      const symLockRes = await injectSwarmDirective({
+        brainDir,
+        conversationId: COORD_CONV,
+        target: "coordinator",
+        message: "must reject lock symlink",
+        lockTimeoutMs: 200,
+      });
+      assert.equal(symLockRes.ok, false);
+      if (!symLockRes.ok) assert.equal(symLockRes.code, "SYMLINK_REJECTED");
+      rmSync(lockPath, { force: true });
+
+      // 4. Large >4.5MB board.jsonl succeeds via O(1) tail scan without hitting legacy 4MB wall
+      const bigFiller = "长讨论板内容".repeat(400);
+      const chunks: string[] = [];
+      let seq = 1;
+      let bytes = 0;
+      while (bytes < 4.6 * 1024 * 1024) {
+        const line = `${JSON.stringify({ seq, agent: "worker-1", channel: "main", text: bigFiller })}\n`;
+        chunks.push(line);
+        bytes += Buffer.byteLength(line, "utf8");
+        seq += 1;
+      }
+      writeFileSync(path.join(swarmDir, "board.jsonl"), chunks.join(""), "utf8");
+      const lastSeqBefore = seq - 1;
+      const bigBoardRes = await injectSwarmDirective({
+        brainDir,
+        conversationId: COORD_CONV,
+        target: "coordinator",
+        message: "超大讨论板续写测试",
+      });
+      assert.equal(bigBoardRes.ok, true);
+      if (bigBoardRes.ok) assert.equal(bigBoardRes.seq, lastSeqBefore + 1);
+    } finally {
+      rmSync(brainDir, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("B8: terminateSwarmMember honest status protocol (requested vs confirmed vs already_killed)", () => {
-  it("posts @coordinator kill request without falsely mutating members.json, reports confirmed only with executor receipt, and fails loudly on board error", () => {
+  it("posts @coordinator kill request without falsely mutating members.json, reports confirmed only with executor receipt, and fails loudly on board error", async () => {
     const brainDir = mkdtempSync(path.join(tmpdir(), "oc-swarm-kill-"));
     const outside = mkdtempSync(path.join(tmpdir(), "oc-swarm-kill-out-"));
     try {
       const swarmDir = setupSwarmFixture(brainDir);
 
       // Refuses coordinator termination
-      const coordKill = terminateSwarmMember({
+      const coordKill = await terminateSwarmMember({
         brainDir,
         conversationId: COORD_CONV,
         memberName: "coordinator",
@@ -196,7 +290,7 @@ describe("B8: terminateSwarmMember honest status protocol (requested vs confirme
       if (!coordKill.ok) assert.equal(coordKill.code, "CANNOT_KILL_COORDINATOR");
 
       // Without executor confirmation → status === 'requested', members.json NOT overwritten!
-      const reqRes = terminateSwarmMember({
+      const reqRes = await terminateSwarmMember({
         brainDir,
         conversationId: COORD_CONV,
         memberName: "worker-1",
@@ -215,7 +309,7 @@ describe("B8: terminateSwarmMember honest status protocol (requested vs confirme
       assert.equal(rosterUnchanged.members["worker-1"]?.killed, false);
 
       // With authoritative executor confirmation → status === 'confirmed'
-      const confRes = terminateSwarmMember({
+      const confRes = await terminateSwarmMember({
         brainDir,
         conversationId: COORD_CONV,
         memberName: "worker-1",
@@ -229,7 +323,7 @@ describe("B8: terminateSwarmMember honest status protocol (requested vs confirme
       }
 
       // Already killed member → status === 'already_killed'
-      const deadRes = terminateSwarmMember({
+      const deadRes = await terminateSwarmMember({
         brainDir,
         conversationId: COORD_CONV,
         memberName: "dead-worker",
@@ -245,7 +339,7 @@ describe("B8: terminateSwarmMember honest status protocol (requested vs confirme
       writeFileSync(evilBoard, "");
       rmSync(path.join(swarmDir, "board.jsonl"));
       symlinkSync(evilBoard, path.join(swarmDir, "board.jsonl"));
-      const failRes = terminateSwarmMember({
+      const failRes = await terminateSwarmMember({
         brainDir,
         conversationId: COORD_CONV,
         memberName: "worker-1",

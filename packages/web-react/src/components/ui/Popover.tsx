@@ -20,7 +20,7 @@ export const PopoverContent = forwardRef<
       align={align}
       sideOffset={sideOffset}
       className={cn(
-        "oc-surface-popover z-50 w-72 rounded-xl p-3.5 text-fg outline-none",
+        "oc-surface-popover z-[var(--z-popover-portal)] w-72 rounded-xl p-3.5 text-fg outline-none",
         "data-[state=open]:animate-pop",
         className,
       )}

@@ -16,6 +16,8 @@ import { createHash } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { REMOTE_SWARM_LOCAL_PREFIX } from '@openclaude/protocol'
 import type { AgentDef, AgentsConfig } from '@openclaude/storage'
+import { listClientSessions } from '@openclaude/storage'
+import type { GatewayStreamEvent } from './ccbMessageParser.js'
 import { checkToken } from './auth.js'
 import {
   acquireDelegateRemoteLane,
@@ -26,10 +28,14 @@ import {
   type RemoteSwarmWorkerExecutor,
   type RemoteSwarmWorkerTurnInput,
   type RemoteSwarmWorkerTurnResult,
+  disableRemoteSwarmCoordinatorMcp,
+  lookupRemoteSwarmRuntimeForSession,
+  reconcileRemoteSwarmOnBoot,
+  setDefaultRemoteSwarmRuntimeFactory,
 } from './remoteSwarmRuntime.js'
 import type { SessionManager } from './sessionManager.js'
 
-export { REMOTE_SWARM_LOCAL_PREFIX }
+export { REMOTE_SWARM_LOCAL_PREFIX, setDefaultRemoteSwarmRuntimeFactory }
 export type { RemoteSwarmRuntime }
 
 export const REMOTE_SWARM_SESSION_HEADER = 'x-oc-remote-swarm-session'
@@ -140,19 +146,34 @@ export function createGatewayRemoteSwarmExecutor(deps: {
 
   return {
     async runWorkerTurn(input: RemoteSwarmWorkerTurnInput): Promise<RemoteSwarmWorkerTurnResult> {
+      let emittedErrorTelemetry = false
+      const reportErrorTelemetry = (errMsg: string): void => {
+        if (emittedErrorTelemetry || !errMsg) return
+        emittedErrorTelemetry = true
+        input.onTelemetry({
+          type: 'ERROR',
+          status: 'ERROR',
+          error: errMsg,
+        })
+      }
+      const failEarly = (errMsg: string): RemoteSwarmWorkerTurnResult => {
+        reportErrorTelemetry(errMsg)
+        return { text: '', error: errMsg }
+      }
+
       if (input.signal.aborted) {
-        return { text: '', error: 'aborted before start' }
+        return failEarly('aborted before start')
       }
 
       const parent = deps.sessions.getByKey(input.coordinatorSessionKey)
       const effectiveAgentId = (parent?.agentId ?? input.parentAgentId ?? '').trim()
       if (!effectiveAgentId) {
-        return { text: '', error: 'missing parent agent identity for swarm worker' }
+        return failEarly('missing parent agent identity for swarm worker')
       }
 
       const parentAgent = await deps.resolveAgent(effectiveAgentId)
       if (!parentAgent) {
-        return { text: '', error: `parent agent not found: ${effectiveAgentId}` }
+        return failEarly(`parent agent not found: ${effectiveAgentId}`)
       }
       const cappedToolsets = capWorkerToolsets(parentAgent.toolsets, input.allowedToolsets)
       // Fail closed on empty intersection BEFORE acquiring a lane: `SubprocessRunner` treats `[]` as unfiltered (B5).
@@ -161,10 +182,10 @@ export function createGatewayRemoteSwarmExecutor(deps: {
         cappedToolsets !== undefined &&
         cappedToolsets.length === 0
       ) {
-        return { text: '', error: 'worker toolset intersection with parent coordinator is empty' }
+        return failEarly('worker toolset intersection with parent coordinator is empty')
       }
       if (input.signal.aborted) {
-        return { text: '', error: 'aborted during agent resolution' }
+        return failEarly('aborted during agent resolution')
       }
 
       const acquired = await acquireDelegateRemoteLane({
@@ -177,7 +198,7 @@ export function createGatewayRemoteSwarmExecutor(deps: {
         log: deps.log,
       })
       if (!acquired.ok) {
-        return { text: '', error: `远端蜂群成员车道申请失败（${acquired.code}）: ${acquired.reason}` }
+        return failEarly(`远端蜂群成员车道申请失败（${acquired.code}）: ${acquired.reason}`)
       }
       const lease = acquired.lease
       activeLaneScopes.set(input.workerSessionKey, {
@@ -187,7 +208,7 @@ export function createGatewayRemoteSwarmExecutor(deps: {
       if (input.signal.aborted) {
         await lease.release({ outcome: 'interrupted', releaseLane: true })
         activeLaneScopes.delete(input.workerSessionKey)
-        return { text: '', error: 'aborted during lane acquisition' }
+        return failEarly('aborted during lane acquisition')
       }
 
       const workerAgent: AgentDef = {
@@ -205,6 +226,8 @@ export function createGatewayRemoteSwarmExecutor(deps: {
       let turnError: string | undefined
       let inputTokens = 0
       let outputTokens = 0
+      let cacheReadTokens = 0
+      let thinkingTokens = 0
 
       try {
         const session = await deps.sessions.getOrCreate({
@@ -237,6 +260,7 @@ export function createGatewayRemoteSwarmExecutor(deps: {
         // Re-check abort AFTER async getOrCreate and BEFORE registering listener / submitting (IMPORTANT 7).
         if (input.signal.aborted) {
           turnError = 'aborted before submit'
+          reportErrorTelemetry(turnError)
         } else {
           const onAbort = () => {
             try {
@@ -267,21 +291,34 @@ export function createGatewayRemoteSwarmExecutor(deps: {
                 } else if (ev.kind === 'usage') {
                   const inTok = ev.usage.inputTokens ?? 0
                   const outTok = ev.usage.outputTokens ?? 0
+                  const cacheReadTok = ev.usage.cacheReadTokens ?? 0
+                  const extraUsage = ev.usage as {
+                    thinkingTokens?: unknown
+                    thoughtsTokens?: unknown
+                  }
+                  const thinkingTok =
+                    typeof extraUsage.thinkingTokens === 'number' &&
+                    Number.isFinite(extraUsage.thinkingTokens)
+                      ? Math.max(0, Math.floor(extraUsage.thinkingTokens))
+                      : typeof extraUsage.thoughtsTokens === 'number' &&
+                          Number.isFinite(extraUsage.thoughtsTokens)
+                        ? Math.max(0, Math.floor(extraUsage.thoughtsTokens))
+                        : 0
                   inputTokens += inTok
                   outputTokens += outTok
+                  cacheReadTokens += cacheReadTok
+                  thinkingTokens += thinkingTok
                   input.onTelemetry({
                     type: 'PLANNER_RESPONSE',
                     status: 'DONE',
                     inputTokens: inTok,
                     outputTokens: outTok,
+                    ...(cacheReadTok > 0 ? { cacheReadTokens: cacheReadTok } : {}),
+                    ...(thinkingTok > 0 ? { thinkingTokens: thinkingTok } : {}),
                   })
                 } else if (ev.kind === 'error') {
                   turnError = ev.error
-                  input.onTelemetry({
-                    type: 'ERROR',
-                    status: 'ERROR',
-                    error: ev.error,
-                  })
+                  reportErrorTelemetry(ev.error)
                 }
               },
               input.effort,
@@ -299,6 +336,7 @@ export function createGatewayRemoteSwarmExecutor(deps: {
         }
       } catch (err) {
         turnError = turnError ?? (err instanceof Error ? err.message : String(err))
+        reportErrorTelemetry(turnError)
       } finally {
         const rel = await lease.release({
           outcome: input.signal.aborted
@@ -315,11 +353,17 @@ export function createGatewayRemoteSwarmExecutor(deps: {
         await deps.sessions.destroySession(input.workerSessionKey).catch(() => {})
       }
 
+      if (turnError) {
+        reportErrorTelemetry(turnError)
+      }
+
       return {
         text: output,
         ...(turnError ? { error: turnError } : {}),
         inputTokens,
         outputTokens,
+        ...(cacheReadTokens > 0 ? { cacheReadTokens } : {}),
+        ...(thinkingTokens > 0 ? { thinkingTokens } : {}),
       }
     },
 
@@ -391,4 +435,171 @@ export async function handleGatewayRemoteSwarmHttp(deps: {
     runtime: deps.runtime,
   })
   deps.sendJson(deps.res, result.status, result.body)
+}
+
+const REMOTE_SWARM_SELF_TOOLS = new Set([
+  'swarm',
+  'post_message',
+  'read_board',
+  'swarm_wait',
+  'mcp_openclaude-memory_swarm',
+  'mcp_openclaude-memory_post_message',
+  'mcp_openclaude-memory_read_board',
+  'mcp_openclaude-memory_swarm_wait',
+])
+
+export async function interruptGatewayRemoteSwarmSession(
+  runtime: RemoteSwarmRuntime | null | undefined,
+  sessionKey: string,
+  reason = 'user_stop',
+): Promise<boolean> {
+  const rt = runtime ?? lookupRemoteSwarmRuntimeForSession(sessionKey)
+  if (!rt) return false
+  try {
+    const res = await rt.interruptSessionWorkers(sessionKey, reason)
+    return res.interrupted
+  } catch {
+    return false
+  }
+}
+
+export async function reconcileGatewayRemoteSwarmOnBoot(deps: {
+  agentsConfig?: AgentsConfig | null
+  log: {
+    info?: (msg: string, fields?: Record<string, unknown>) => void
+    warn: (msg: string, fields?: Record<string, unknown>) => void
+  }
+}): Promise<void> {
+  try {
+    const workspaceRoots = [
+      ...new Set(
+        (deps.agentsConfig?.agents ?? [])
+          .map((a) => a.cwd)
+          .filter((cwd): cwd is string => typeof cwd === 'string' && cwd.trim().length > 0),
+      ),
+    ]
+    let archivedIdsPromise: Promise<Set<string>> | null = null
+    const getArchivedSessionIds = (): Promise<Set<string>> => {
+      if (!archivedIdsPromise) {
+        const candidateUserIds = [
+          ...new Set([
+            'default',
+            ...(process.env.OC_USER_ID ? [`c:${process.env.OC_USER_ID}`, process.env.OC_USER_ID] : []),
+            ...(process.env.OPENCLAUDE_USER_ID
+              ? [`c:${process.env.OPENCLAUDE_USER_ID}`, process.env.OPENCLAUDE_USER_ID]
+              : []),
+          ]),
+        ]
+        archivedIdsPromise = Promise.all(
+          candidateUserIds.map((uid) =>
+            listClientSessions(uid, { includeArchived: true }).catch(() => ({ sessions: [] })),
+          ),
+        ).then((results) => {
+          const ids = new Set<string>()
+          for (const res of results) {
+            for (const meta of res.sessions) {
+              if (meta.archived === true) ids.add(meta.id)
+            }
+          }
+          return ids
+        })
+      }
+      return archivedIdsPromise
+    }
+    await reconcileRemoteSwarmOnBoot({
+      workspaceRoots,
+      isSessionArchived: async ({ sessionKey }) => {
+        if (!sessionKey) return false
+        const peerId = sessionKey.split(':').slice(4).join(':')
+        if (!peerId) return false
+        const archivedIds = await getArchivedSessionIds()
+        return archivedIds.has(peerId)
+      },
+      log: deps.log,
+    })
+  } catch (err) {
+    deps.log.warn('remote swarm boot reconcile failed (continuing startup)', {
+      error: err instanceof Error ? err.message : String(err),
+    })
+  }
+}
+
+export async function prepareRemoteSwarmInboundTurn(input: {
+  sessionKey: string
+  isRemoteAntigravity: boolean
+  effectiveModel?: string
+  swarmRequested: boolean
+  effort?: string
+  workspaceCwd: string
+  parentAgentId: string
+  allowedToolsets?: readonly string[]
+  ensureRuntime: () => RemoteSwarmRuntime
+}): Promise<RemoteSwarmRuntime | null> {
+  if (input.isRemoteAntigravity && input.effectiveModel && input.swarmRequested) {
+    const rt = input.ensureRuntime()
+    rt.registerSession({
+      sessionKey: input.sessionKey,
+      model: input.effectiveModel,
+      effort: input.effort,
+      workspaceCwd: input.workspaceCwd,
+      parentAgentId: input.parentAgentId,
+      allowedToolsets: input.allowedToolsets,
+    })
+    rt.recordCoordinatorTelemetry(input.sessionKey, {
+      type: 'USER_INPUT',
+      status: 'DONE',
+    })
+    return rt
+  }
+  disableRemoteSwarmCoordinatorMcp(input.sessionKey)
+  await interruptGatewayRemoteSwarmSession(null, input.sessionKey, 'swarm_disabled')
+  return null
+}
+
+export function recordRemoteSwarmLeaderStreamEvent(
+  runtime: RemoteSwarmRuntime | null,
+  sessionKey: string,
+  e: GatewayStreamEvent,
+): void {
+  if (!runtime) return
+  if (e.kind === 'block') {
+    const b = e.block as { kind?: unknown; toolName?: unknown; inputJson?: unknown }
+    if (
+      b?.kind === 'tool_use' &&
+      typeof b.toolName === 'string' &&
+      !REMOTE_SWARM_SELF_TOOLS.has(b.toolName)
+    ) {
+      runtime.recordCoordinatorTelemetry(sessionKey, {
+        type: 'TOOL_CALL',
+        status: 'ACTIVE',
+        toolName: b.toolName,
+        toolArgs:
+          b.inputJson && typeof b.inputJson === 'object'
+            ? (b.inputJson as Record<string, unknown>)
+            : {},
+      })
+    }
+  } else if (e.kind === 'usage') {
+    const extraUsage = e.usage as { thinkingTokens?: unknown; thoughtsTokens?: unknown }
+    const thinkingTokens =
+      typeof extraUsage.thinkingTokens === 'number' && Number.isFinite(extraUsage.thinkingTokens)
+        ? Math.max(0, Math.floor(extraUsage.thinkingTokens))
+        : typeof extraUsage.thoughtsTokens === 'number' && Number.isFinite(extraUsage.thoughtsTokens)
+          ? Math.max(0, Math.floor(extraUsage.thoughtsTokens))
+          : undefined
+    runtime.recordCoordinatorTelemetry(sessionKey, {
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      inputTokens: e.usage.inputTokens ?? 0,
+      outputTokens: e.usage.outputTokens ?? 0,
+      ...(e.usage.cacheReadTokens !== undefined ? { cacheReadTokens: e.usage.cacheReadTokens } : {}),
+      ...(thinkingTokens !== undefined ? { thinkingTokens } : {}),
+    })
+  } else if (e.kind === 'error') {
+    runtime.recordCoordinatorTelemetry(sessionKey, {
+      type: 'ERROR',
+      status: 'ERROR',
+      error: e.error,
+    })
+  }
 }

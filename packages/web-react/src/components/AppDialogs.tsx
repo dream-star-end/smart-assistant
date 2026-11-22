@@ -241,6 +241,7 @@ export type AppDialogsProps = {
   swarmSessionIds?: ReadonlySet<string>;
   onMarkRead?: (id: string) => void;
   onOpenQuickAsk?: () => void;
+  onToggleSwarm?: () => void;
   contextHealthOpen?: boolean;
   onContextHealthOpenChange?: (open: boolean) => void;
   onCompactSession?: () => void;
@@ -382,6 +383,7 @@ export function AppDialogs({
   swarmSessionIds,
   onMarkRead,
   onOpenQuickAsk,
+  onToggleSwarm,
   contextHealthOpen,
   onContextHealthOpenChange,
   onCompactSession,
@@ -577,6 +579,7 @@ export function AppDialogs({
             onSelectModel={selectModel}
             onOpenManage={demo ? undefined : (tab) => openManage(tab)}
             onOpenQuickAsk={onOpenQuickAsk}
+            onToggleSwarm={onToggleSwarm}
             onCompactSession={demo ? undefined : onCompactSession}
             onOpenContextHealth={demo || !onContextHealthOpenChange ? undefined : () => onContextHealthOpenChange(true)}
           />

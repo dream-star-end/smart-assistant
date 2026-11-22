@@ -35,7 +35,12 @@ export function useSwarmMode(opts: {
 
   const detectedSwarm = useMemo(() => {
     void messagesVersion;
-    return hasSessionSwarm || Boolean(persistedId && wsMessages?.length && latestSwarmCard(wsMessages));
+    if (hasSessionSwarm) return true;
+    if (!persistedId || !wsMessages?.length) return false;
+    const card = latestSwarmCard(wsMessages);
+    return Boolean(
+      card && (card.snapshot.phase === "starting" || card.snapshot.phase === "running"),
+    );
   }, [hasSessionSwarm, persistedId, wsMessages, messagesVersion]);
 
   useEffect(() => {

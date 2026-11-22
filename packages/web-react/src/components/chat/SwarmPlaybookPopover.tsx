@@ -8,7 +8,7 @@
  */
 import * as RP from "@radix-ui/react-popover";
 import { BookOpenCheck, ChevronDown, Code2, Layers, Scale, X } from "lucide-react";
-import { type CSSProperties, useState } from "react";
+import { type CSSProperties, type RefObject, useState } from "react";
 import {
   SWARM_PLAYBOOK_PRESETS,
   type SwarmPlaybookPreset,
@@ -22,10 +22,12 @@ export type SwarmPlaybookPopoverProps = {
   disabled?: boolean;
   currentText: string;
   onSelectPlaybook: (draft: string, preset: SwarmPlaybookPreset) => void;
-  /** 可选受控开合态（移动端从 ComposerPlusMenu 唤起时复用同一弹层）。 */
+  /** 可选受控开合态（移动端/桌面从 ComposerPlusMenu 唤起时复用同一弹层）。 */
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
-  /** 可选覆盖触发器样式（如 <640px 隐藏底栏内联触发器）。 */
+  /** 可选外部可见锚点引用（避免 `hidden` 触发器导致 Radix Anchor 0×0 定位漂移）。 */
+  anchorRef?: RefObject<HTMLElement | null>;
+  /** 可选覆盖触发器样式（无 anchorRef 时生效）。 */
   triggerClassName?: string;
 };
 
@@ -54,6 +56,7 @@ export function SwarmPlaybookPopover({
   onSelectPlaybook,
   open: openProp,
   onOpenChange,
+  anchorRef,
   triggerClassName,
 }: SwarmPlaybookPopoverProps) {
   const toast = useToast();
@@ -66,30 +69,34 @@ export function SwarmPlaybookPopover({
 
   return (
     <RP.Root open={open} onOpenChange={setOpen}>
-      <RP.Anchor className="inline-flex shrink-0 items-center">
-        <RP.Trigger asChild>
-          <button
-            type="button"
-            data-testid="composer-swarm-playbooks"
-            data-product-control
-            aria-expanded={open}
-            disabled={disabled}
-            title="选择蜂群高阶剧本模板"
-            className={cn(
-              "oc-btn-tactile oc-spring-press inline-flex min-h-8 shrink-0 items-center gap-1 rounded-full border px-2 py-1 text-caption font-medium transition-colors [@media(hover:none)]:min-h-10",
-              "outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50",
-              open
-                ? "border-accent/30 bg-accent-soft text-accent"
-                : "border-transparent text-muted hover:bg-hover hover:text-fg",
-              triggerClassName,
-            )}
-          >
-            <Layers size={12} strokeWidth={1.85} aria-hidden />
-            <span>剧本</span>
-            <ChevronDown size={11} className={cn("transition-transform", open && "rotate-180")} aria-hidden />
-          </button>
-        </RP.Trigger>
-      </RP.Anchor>
+      {anchorRef ? (
+        <RP.Anchor virtualRef={anchorRef as RefObject<HTMLElement>} />
+      ) : (
+        <RP.Anchor className="inline-flex shrink-0 items-center">
+          <RP.Trigger asChild>
+            <button
+              type="button"
+              data-testid="composer-swarm-playbooks"
+              data-product-control
+              aria-expanded={open}
+              disabled={disabled}
+              title="选择蜂群高阶剧本模板"
+              className={cn(
+                "oc-btn-tactile oc-spring-press inline-flex min-h-8 shrink-0 items-center gap-1 rounded-full border px-2 py-1 text-caption font-medium transition-colors [@media(hover:none)]:min-h-10",
+                "outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50",
+                open
+                  ? "border-accent/30 bg-accent-soft text-accent"
+                  : "border-transparent text-muted hover:bg-hover hover:text-fg",
+                triggerClassName,
+              )}
+            >
+              <Layers size={12} strokeWidth={1.85} aria-hidden />
+              <span>剧本</span>
+              <ChevronDown size={11} className={cn("transition-transform", open && "rotate-180")} aria-hidden />
+            </button>
+          </RP.Trigger>
+        </RP.Anchor>
+      )}
 
       <PopoverContent
         side="top"

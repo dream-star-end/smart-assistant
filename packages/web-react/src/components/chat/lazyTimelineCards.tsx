@@ -497,7 +497,19 @@ export function SwarmPlaybookPopoverLazy(props: SwarmPlaybookPopoverProps) {
     <SwarmLazyErrorBoundary
       onRebuild={() => { if (!loadedSwarm) LazySwarmPlaybookPopover = lazySwarm('SwarmPlaybookPopover') }}
       renderChildren={() => (
-        <Suspense fallback={null}>
+        <Suspense
+          fallback={
+            props.open ? (
+                <span
+                  role="status"
+                  data-testid="swarm-playbook-loading"
+                  className="ml-1.5 inline-flex items-center rounded-full border border-border bg-surface px-2.5 py-1 text-caption text-muted shadow-soft"
+                >
+                  剧本加载中…
+                </span>
+            ) : null
+          }
+        >
           <LazySwarmPlaybookPopover {...props} />
         </Suspense>
       )}

@@ -310,7 +310,7 @@ describe("Antigravity native swarm reducer & UI (OCV5-809)", () => {
     render(
       <div>
         <SwarmInlineCard snapshot={snap} cardId="m-1" blockId="b-1" onOpenBoard={onOpenBoard} />
-        <PinnedSwarmDock snapshot={snap} cardId="m-1" blockId="b-1" dismissed={false} onOpenBoard={onOpenBoard} onDismiss={vi.fn()} />
+        <PinnedSwarmDock snapshot={snap} cardId="m-1" blockId="b-1" onOpenBoard={onOpenBoard} />
       </div>,
     );
 
@@ -446,9 +446,7 @@ describe("Antigravity native swarm reducer & UI (OCV5-809)", () => {
         snapshot={completed}
         cardId="m-done"
         blockId="b-done"
-        dismissed={false}
         onOpenBoard={vi.fn()}
-        onDismiss={vi.fn()}
       />,
     );
     expect(container.firstChild).toBeNull();
@@ -459,9 +457,7 @@ describe("Antigravity native swarm reducer & UI (OCV5-809)", () => {
         snapshot={makeSnapshot({ phase: "running", title: longTitle })}
         cardId="m-run"
         blockId="b-run"
-        dismissed={false}
         onOpenBoard={vi.fn()}
-        onDismiss={vi.fn()}
       />,
     );
     const dock = screen.getByTestId("pinned-swarm-dock");
@@ -627,5 +623,263 @@ describe("Antigravity native swarm reducer & UI (OCV5-809)", () => {
     const killedList = within(roster).getByTestId("swarm-roster-killed-list");
     expect(within(killedList).getByText("@worker-old-1")).toBeTruthy();
     expect(within(killedList).getByText("@worker-old-2")).toBeTruthy();
+  });
+
+  it("hardening: missing_base delta triggers forceSync + stale flag, and active frames never set completedAt", () => {
+    const sess = createSession({ id: "s-gap", agentId: "main" });
+    sess._sendingInFlight = true;
+    const forceSync = vi.fn();
+
+    // Active frame (rev 1) must NOT stamp completedAt.
+    applyOutboundMessage(
+      sess,
+      {
+        type: "outbound.message",
+        sessionKey: "k1",
+        channel: "webchat",
+        peer: { id: "s-gap", kind: "dm" },
+        frameSeq: 1,
+        isFinal: false,
+        blocks: [
+          {
+            kind: "swarm_snapshot",
+            blockId: "agy-swarm-11111111-t0",
+            snapshot: makeSnapshot({
+              revision: 1,
+              phase: "running",
+              postsMode: "full",
+              posts: [{ seq: 1, agent: "coordinator", channel: "main", text: "开局", mentions: [] }],
+              totalPosts: 1,
+            }),
+          },
+        ],
+      },
+      { forceSync },
+    );
+    const row = sess.messages.find((m) => m.toolName === SWARM_BOARD_TOOL_NAME)!;
+    expect(row.completedAt).toBeUndefined();
+    expect(sess._swarmSyncStale).toBe(false);
+
+    // Gapped delta (deltaBaseSeq: 5 > prevHeadSeq: 1) marks stale and requests forceSync.
+    applyOutboundMessage(
+      sess,
+      {
+        type: "outbound.message",
+        sessionKey: "k1",
+        channel: "webchat",
+        peer: { id: "s-gap", kind: "dm" },
+        frameSeq: 2,
+        isFinal: false,
+        blocks: [
+          {
+            kind: "swarm_snapshot",
+            blockId: "agy-swarm-11111111-t0",
+            snapshot: makeSnapshot({
+              revision: 3,
+              phase: "running",
+              postsMode: "delta",
+              deltaBaseSeq: 5,
+              posts: [{ seq: 6, agent: "parser", channel: "main", text: "跳帧", mentions: [] }],
+              totalPosts: 6,
+            }),
+          },
+        ],
+      },
+      { forceSync },
+    );
+    expect(sess._swarmSyncStale).toBe(true);
+    expect(forceSync).toHaveBeenCalledWith("s-gap");
+
+    // Full terminal snapshot clears stale flag and records completedAt.
+    applyOutboundMessage(
+      sess,
+      {
+        type: "outbound.message",
+        sessionKey: "k1",
+        channel: "webchat",
+        peer: { id: "s-gap", kind: "dm" },
+        frameSeq: 3,
+        isFinal: false,
+        blocks: [
+          {
+            kind: "swarm_snapshot",
+            blockId: "agy-swarm-11111111-t0",
+            snapshot: makeSnapshot({
+              revision: 4,
+              phase: "completed",
+              postsMode: "full",
+              totalPosts: 3,
+            }),
+          },
+        ],
+      },
+      { forceSync },
+    );
+    expect(sess._swarmSyncStale).toBe(false);
+    expect(row.completedAt).toBeTypeOf("number");
+  });
+
+  it("hardening: terminal swarm renders read-only command bar with follow-up quote action and zero dangerous controls", () => {
+    const onQuote = vi.fn();
+    const onOpenChange = vi.fn();
+    const completed = makeSnapshot({
+      phase: "completed",
+      startedAt: 1_760_000_000_000 - 125_000,
+      updatedAt: 1_760_000_000_000,
+    });
+    render(
+      <SwarmBoardDrawer
+        open
+        onOpenChange={onOpenChange}
+        snapshot={completed}
+        sessionId="s-done"
+        onQuoteToComposer={onQuote}
+      />,
+    );
+    const bar = screen.getByTestId("swarm-command-bar");
+    expect(bar.getAttribute("data-swarm-readonly")).toBe("true");
+    expect(screen.queryByTestId("swarm-command-input")).toBeNull();
+    expect(screen.queryByTestId("swarm-command-send")).toBeNull();
+    expect(screen.queryByTestId("swarm-terminate-trigger")).toBeNull();
+    expect(screen.getByTestId("swarm-drawer-elapsed").textContent).toContain("总耗时 02:05");
+
+    fireEvent.click(screen.getByTestId("swarm-readonly-followup-btn"));
+    expect(onQuote).toHaveBeenCalledTimes(1);
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("hardening: initialFocusSeq highlights target post, [/] stepping preserves active filters, and long Markdown folds via CSS without breaking fences", () => {
+    const longFenceText = [
+      "详细对比报告：",
+      "> 引用块需要富文本识别，见 [规范链接](https://example.com/spec)",
+      "```ts",
+      ...Array.from({ length: 30 }, (_, i) => `export const line_${i} = "payload_${i}_0123456789abcdef";`),
+      "```",
+    ].join("\n");
+    const snap = makeSnapshot({
+      posts: [
+        { seq: 1, agent: "coordinator", channel: "main", text: "@all 启动任务", mentions: ["all"] },
+        { seq: 2, agent: "parser", channel: "parser", text: longFenceText, mentions: [] },
+        { seq: 3, agent: "verifier", channel: "parser", text: "@coordinator #2 检查通过", mentions: ["coordinator"] },
+      ],
+    });
+    render(
+      <SwarmBoardDrawer
+        open
+        onOpenChange={vi.fn()}
+        snapshot={snap}
+        initialFocusChannel="main"
+        initialFocusSeq={2}
+      />,
+    );
+
+    const drawer = screen.getByTestId("swarm-board-drawer");
+    // Even though initialFocusChannel="main" mismatched #2's channel="parser", #2 stays visible & highlighted.
+    expect(drawer.querySelector('[data-swarm-post-seq="2"]')).toBeTruthy();
+    // Long Markdown is folded visually via CSS max-h and expands cleanly without cutting fences.
+    expect(within(drawer).getByTestId("swarm-post-folded-2").className).toContain("max-h-72");
+    fireEvent.click(within(drawer).getByTestId("swarm-post-expand-2"));
+    expect(within(drawer).queryByTestId("swarm-post-folded-2")).toBeNull();
+
+    // Filter to channel #parser (2 posts: #2 and #3), then press `[` to step without clearing the filter!
+    fireEvent.click(within(drawer).getByTitle("词法与语法"));
+    expect(within(drawer).getByTestId("swarm-board-feed").querySelectorAll("[data-swarm-post-seq]")).toHaveLength(2);
+    fireEvent.keyDown(window, { key: "[" });
+    expect(within(drawer).getByTestId("swarm-board-feed").querySelectorAll("[data-swarm-post-seq]")).toHaveLength(2);
+  });
+
+  it("hardening: semantic [stall]/[control:kill]/[steer] callouts, alert focus, member profile bar, token+cache summary, abort confirm, and charter compliance", () => {
+    const onStopSwarm = vi.fn();
+    const snap = makeSnapshot({
+      phase: "running",
+      members: [
+        {
+          name: "coordinator",
+          role: "coordinator",
+          status: "waiting",
+          stepCount: 4,
+          unreadCount: 0,
+          inputTokens: 20_000,
+          outputTokens: 4_000,
+          cacheReadTokens: 80_000,
+          toolCalls: 3,
+        },
+        {
+          name: "worker-err",
+          role: "worker",
+          status: "working",
+          workspace: "share",
+          workspaceBranch: "swarm/worker-err",
+          workspacePath: "/tmp/wt-worker-err",
+          stepCount: 9,
+          unreadCount: 1,
+          failed: true,
+          activity: "正在运行端到端集成测试并检查状态机收敛",
+          lastError: "AssertionError: full untruncated diagnostic message for worker-err failure",
+          inputTokens: 30_000,
+          outputTokens: 6_000,
+          cacheReadTokens: 20_000,
+          thinkingTokens: 5_000,
+          elapsedMs: 42_000,
+          toolCalls: 8,
+          lastPostSeq: 2,
+        },
+      ],
+      posts: [
+        { seq: 1, agent: "user:1", channel: "main", text: "[steer] @worker-err 优先排查超时", mentions: ["worker-err"] },
+        { seq: 2, agent: "monitor", channel: "main", text: "[stall] @worker-err 连续 180s 无进展", mentions: ["worker-err"] },
+        { seq: 3, agent: "coordinator", channel: "main", text: "[control:kill] 回收超时成员", mentions: [] },
+      ],
+      totalPosts: 3,
+    });
+
+    render(
+      <div>
+        <SwarmInlineCard snapshot={snap} cardId="m-obs" blockId="b-obs" onOpenBoard={vi.fn()} />
+        <SwarmBoardDrawer
+          open
+          onOpenChange={vi.fn()}
+          snapshot={snap}
+          syncStale
+          onStopSwarm={onStopSwarm}
+        />
+      </div>,
+    );
+
+    const drawer = screen.getByTestId("swarm-board-drawer");
+    // Z-index & mobile visual-height & zero oc-live-status-shine on working rows
+    expect(drawer.className).toContain("z-[var(--z-drawer)]");
+    expect(drawer.className).toContain("var(--oc-visual-height");
+    expect(drawer.querySelector(".oc-live-status-shine")).toBeNull();
+    expect(screen.getByTestId("swarm-inline-card").querySelector(".oc-live-status-shine")).toBeNull();
+
+    // Sync reconnecting pill + whole-swarm token & cache hit rate summary
+    expect(within(drawer).getByTestId("swarm-sync-reconnecting")).toBeTruthy();
+    expect(within(drawer).getByTestId("swarm-drawer-total-tokens").textContent).toContain("50.0k↑ 10.0k↓");
+    expect(within(drawer).getByTestId("swarm-drawer-total-tokens").textContent).toContain("缓存 67%");
+    expect(screen.getByTestId("swarm-inline-total-tokens").textContent).toContain("50.0k↑ 10.0k↓");
+
+    // Semantic post badges & data-swarm-post-kind
+    expect(drawer.querySelector('[data-swarm-post-seq="1"]')?.getAttribute("data-swarm-post-kind")).toBe("steer");
+    expect(drawer.querySelector('[data-swarm-post-seq="2"]')?.getAttribute("data-swarm-post-kind")).toBe("stall");
+    expect(drawer.querySelector('[data-swarm-post-seq="3"]')?.getAttribute("data-swarm-post-kind")).toBe("control_kill");
+
+    // Alert banner -> one-click focus opens Member Profile Bar with full error & branch & cache
+    expect(within(drawer).getByTestId("swarm-alert-banner")).toBeTruthy();
+    fireEvent.click(within(drawer).getByTestId("swarm-alert-focus-btn"));
+    const profileBar = within(drawer).getByTestId("swarm-member-profile-bar");
+    expect(within(profileBar).getByTestId("swarm-member-profile-error").textContent).toContain(
+      "full untruncated diagnostic message for worker-err failure",
+    );
+    expect(within(profileBar).getByTestId("swarm-member-profile-workspace").textContent).toContain(
+      "swarm/worker-err",
+    );
+    expect(within(profileBar).getByTestId("swarm-member-profile-cache").textContent).toContain("缓存 20.0k");
+
+    // Two-step abort entire swarm confirmation
+    fireEvent.click(within(drawer).getByTestId("swarm-abort-trigger"));
+    expect(within(drawer).getByTestId("swarm-abort-confirm")).toBeTruthy();
+    fireEvent.click(within(drawer).getByTestId("swarm-abort-confirm-btn"));
+    expect(onStopSwarm).toHaveBeenCalledTimes(1);
   });
 });

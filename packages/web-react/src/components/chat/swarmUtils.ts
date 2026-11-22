@@ -4,6 +4,7 @@ import type {
   SwarmMemberSnapshot,
   SwarmMemberStatus,
   SwarmPhase,
+  SwarmSnapshot,
 } from "@openclaude/protocol/browser";
 export {
   extractSwarmSnapshotFromMessage,
@@ -188,8 +189,169 @@ export function hasMemberTelemetry(member: SwarmMemberSnapshot): boolean {
     (typeof member.elapsedMs === "number" && Number.isFinite(member.elapsedMs)) ||
     (typeof member.inputTokens === "number" && Number.isFinite(member.inputTokens)) ||
     (typeof member.outputTokens === "number" && Number.isFinite(member.outputTokens)) ||
+    (typeof member.cacheReadTokens === "number" && Number.isFinite(member.cacheReadTokens)) ||
+    (typeof member.thinkingTokens === "number" && Number.isFinite(member.thinkingTokens)) ||
     (typeof member.toolCalls === "number" && Number.isFinite(member.toolCalls))
   );
+}
+
+export type SwarmTelemetrySummary = {
+  hasTokens: boolean;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  thinkingTokens: number;
+  toolCalls: number;
+  cacheHitRatePct: number | null;
+  partial: boolean;
+};
+
+/** 汇总整群 Token / 缓存命中率 / 思考 Token / 工具调用（向后兼容缺省字段的旧快照）。 */
+export function summarizeSwarmTelemetry(members: readonly SwarmMemberSnapshot[]): SwarmTelemetrySummary {
+  let hasTokens = false;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheReadTokens = 0;
+  let thinkingTokens = 0;
+  let toolCalls = 0;
+  let partial = false;
+  for (const m of members) {
+    if (typeof m.inputTokens === "number" && Number.isFinite(m.inputTokens) && m.inputTokens >= 0) {
+      inputTokens += m.inputTokens;
+      hasTokens = true;
+    }
+    if (typeof m.outputTokens === "number" && Number.isFinite(m.outputTokens) && m.outputTokens >= 0) {
+      outputTokens += m.outputTokens;
+      hasTokens = true;
+    }
+    if (typeof m.cacheReadTokens === "number" && Number.isFinite(m.cacheReadTokens) && m.cacheReadTokens >= 0) {
+      cacheReadTokens += m.cacheReadTokens;
+      if (m.cacheReadTokens > 0) hasTokens = true;
+    }
+    if (typeof m.thinkingTokens === "number" && Number.isFinite(m.thinkingTokens) && m.thinkingTokens >= 0) {
+      thinkingTokens += m.thinkingTokens;
+    }
+    if (typeof m.toolCalls === "number" && Number.isFinite(m.toolCalls) && m.toolCalls >= 0) {
+      toolCalls += m.toolCalls;
+    }
+    if (m.telemetryPartial) partial = true;
+  }
+  const cacheDenom = inputTokens + cacheReadTokens;
+  const cacheHitRatePct =
+    cacheReadTokens > 0 && cacheDenom > 0
+      ? Math.min(100, Math.round((cacheReadTokens / cacheDenom) * 100))
+      : null;
+  return {
+    hasTokens,
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    thinkingTokens,
+    toolCalls,
+    cacheHitRatePct,
+    partial,
+  };
+}
+
+export type SwarmPostSemantic = {
+  kind: "done" | "stall" | "control_kill" | "steer";
+  label: string;
+  tone: "success" | "warning" | "danger" | "info";
+  calloutClass: string;
+};
+
+/** 识别讨论板帖子的一等语义标记（[done] / [stall] / [control:kill] / [steer]）。 */
+export function classifySwarmPost(post: SwarmBoardPost): SwarmPostSemantic | null {
+  const trimmed = post.text.trimStart();
+  if (trimmed.startsWith("[done]")) {
+    return { kind: "done", label: "阶段完结", tone: "success", calloutClass: "oc-callout oc-callout-success" };
+  }
+  if (trimmed.startsWith("[stall]")) {
+    return { kind: "stall", label: "停滞预警", tone: "warning", calloutClass: "oc-callout oc-callout-warning" };
+  }
+  if (trimmed.startsWith("[control:kill]")) {
+    return { kind: "control_kill", label: "成员回收", tone: "danger", calloutClass: "oc-callout oc-callout-danger" };
+  }
+  if (trimmed.startsWith("[steer]") || post.agent.toLowerCase().startsWith("user:")) {
+    return { kind: "steer", label: "人工指令", tone: "info", calloutClass: "oc-callout oc-callout-info" };
+  }
+  return null;
+}
+
+export type SwarmAlertSummary = {
+  hasAlert: boolean;
+  failedMembers: SwarmMemberSnapshot[];
+  unresolvedStalls: SwarmBoardPost[];
+  primaryFocusMember: string | null;
+  primaryFocusSeq: number | null;
+  summary: string;
+};
+
+/** 聚合未解决的 `[stall]` 预警与 `failed` 异常成员，供抽屉顶栏与实时胶囊一键定位。 */
+export function detectSwarmAlerts(snapshot: SwarmSnapshot): SwarmAlertSummary {
+  const failedMembers = snapshot.members.filter((m) => Boolean(m.failed));
+  const active = isSwarmActive(snapshot.phase);
+  const memberByName = new Map(snapshot.members.map((m) => [m.name.toLowerCase(), m]));
+  const latestNonStallByAgent = new Map<string, number>();
+  for (const p of snapshot.posts) {
+    if (!p.text.trimStart().startsWith("[stall]")) {
+      const k = p.agent.toLowerCase();
+      latestNonStallByAgent.set(k, Math.max(latestNonStallByAgent.get(k) ?? 0, p.seq));
+    }
+  }
+  const unresolvedStalls: SwarmBoardPost[] = [];
+  if (active) {
+    for (const p of snapshot.posts) {
+      if (!p.text.trimStart().startsWith("[stall]")) continue;
+      const mentionedWorkers = p.mentions.filter(
+        (m) => m !== "all" && m !== "coordinator" && memberByName.has(m),
+      );
+      if (mentionedWorkers.length === 0) {
+        // 群级停滞：若之后尚未出现更新的非 stall 进展，视为仍未解决
+        const hasNewerProgress = snapshot.posts.some(
+          (other) => other.seq > p.seq && !other.text.trimStart().startsWith("[stall]"),
+        );
+        if (!hasNewerProgress) unresolvedStalls.push(p);
+      } else {
+        const stillStalled = mentionedWorkers.some((name) => {
+          const member = memberByName.get(name);
+          if (!member || member.status === "killed") return false;
+          const latestSeq = latestNonStallByAgent.get(name) ?? 0;
+          return latestSeq <= p.seq;
+        });
+        if (stillStalled) unresolvedStalls.push(p);
+      }
+    }
+  }
+
+  const latestStall = unresolvedStalls[unresolvedStalls.length - 1] ?? null;
+  const firstFailed = failedMembers[0] ?? null;
+  const stallMember =
+    latestStall?.mentions.find((m) => m !== "all" && m !== "coordinator" && memberByName.has(m)) ?? null;
+  const primaryFocusMember = firstFailed?.name ?? stallMember ?? null;
+  const primaryFocusSeq = latestStall?.seq ?? firstFailed?.lastPostSeq ?? null;
+  const hasAlert = failedMembers.length > 0 || unresolvedStalls.length > 0;
+
+  let summary = "";
+  if (failedMembers.length > 0 && unresolvedStalls.length > 0) {
+    summary = `${failedMembers.length} 名成员异常 · ${unresolvedStalls.length} 条停滞预警`;
+  } else if (failedMembers.length > 0) {
+    summary =
+      failedMembers.length === 1
+        ? `@${failedMembers[0]!.name} 执行异常`
+        : `${failedMembers.length} 名成员执行异常`;
+  } else if (unresolvedStalls.length > 0) {
+    summary = stallMember ? `@${stallMember} 停滞预警` : `${unresolvedStalls.length} 条停滞预警`;
+  }
+
+  return {
+    hasAlert,
+    failedMembers,
+    unresolvedStalls,
+    primaryFocusMember,
+    primaryFocusSeq,
+    summary,
+  };
 }
 
 export function formatPostClock(time?: string): string {

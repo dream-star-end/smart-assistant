@@ -275,6 +275,7 @@ export type ModelSelectorExtrasProps = {
   effortSupported?: readonly string[]
   effortActive?: PreferenceEffort | null
   showSwarmMode?: boolean
+  showSwarmUnsupportedHint?: boolean
   swarmMode?: boolean
   swarmRunning?: boolean
   onOpenChange: (open: boolean) => void
@@ -328,6 +329,7 @@ export function ModelSelectorExtras({
   effortSupported,
   effortActive,
   showSwarmMode = false,
+  showSwarmUnsupportedHint = false,
   swarmMode = false,
   swarmRunning = false,
   onOpenChange,
@@ -606,7 +608,7 @@ export function ModelSelectorExtras({
           </div>
         )}
 
-        {showSwarmMode && onSelectSwarmMode && (
+        {showSwarmMode && onSelectSwarmMode ? (
           <div data-testid="model-picker-swarm-section">
             <SectionHeading
               title="协作模式"
@@ -649,7 +651,17 @@ export function ModelSelectorExtras({
               </p>
             )}
           </div>
-        )}
+        ) : showSwarmUnsupportedHint ? (
+          <div
+            data-testid="model-picker-swarm-hint"
+            className="flex items-start gap-2 rounded-lg border border-border/70 bg-surface/70 px-2.5 py-2 text-caption text-muted"
+          >
+            <AtelierIcon name="swarm" size={13} className="mt-0.5 shrink-0 text-accent/80" />
+            <span className="leading-relaxed">
+              当前模型不支持蜂群；切至 Gemini 4 / Antigravity 模型可启用蜂群协作。
+            </span>
+          </div>
+        ) : null}
 
         {showCursorEffort && selectedCursor && (
           <div>

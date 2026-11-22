@@ -1239,3 +1239,243 @@ test('OCV5-842: seedBaselineOnStart stays dormant when historical worker transcr
     await rm(brainDir, { recursive: true, force: true })
   }
 })
+
+test('OCV5-852 P0-1: native CLI 1.5.8 vs Remote status semantics, SYSTEM_MESSAGE & [swarm_wait, post_message], object workspace sanitization, >120 posts aggregation, and cacheRead/thinking telemetry', async () => {
+  const brainDir = await mkdtemp(path.join(tmpdir(), 'oc-swarm-852-'))
+  try {
+    // 1. Native CLI 1.5.8 roster: sleeping members have phase=RUNNING + wake_mode=mentions/all -> waiting;
+    //    active worker has wake_mode=working -> working.
+    const swarmDir = path.join(brainDir, COORD_CONV, '.system_generated', 'swarm')
+    const coordLogs = path.join(brainDir, COORD_CONV, '.system_generated', 'logs')
+    const workerLogs = path.join(brainDir, WORKER_CONV, '.system_generated', 'logs')
+    const verifierLogs = path.join(brainDir, VERIFIER_CONV, '.system_generated', 'logs')
+    await mkdir(swarmDir, { recursive: true })
+    await mkdir(coordLogs, { recursive: true })
+    await mkdir(workerLogs, { recursive: true })
+    await mkdir(verifierLogs, { recursive: true })
+
+    await writeFile(
+      path.join(swarmDir, 'members.json'),
+      JSON.stringify({
+        title: 'CLI 1.5.8 原生蜂群',
+        members: {
+          coordinator: {
+            conversation_id: COORD_CONV,
+            role: 'coordinator',
+            desired_state: 'RUNNING',
+            applied_model: 'gemini-4-neon-high',
+            workspace_mode: 'inherit',
+            phase: 'RUNNING',
+            wake_mode: 'mentions',
+            last_read_seq: 150,
+            last_nudged_seq: 150,
+            killed: false,
+          },
+          parser: {
+            conversation_id: WORKER_CONV,
+            role: 'worker',
+            desired_state: 'RUNNING',
+            workspace_mode: 'share',
+            phase: 'RUNNING',
+            wake_mode: 'working',
+            last_read_seq: 149,
+            last_nudged_seq: 149,
+            killed: false,
+          },
+          verifier: {
+            conversation_id: VERIFIER_CONV,
+            role: 'verifier',
+            desired_state: 'RUNNING',
+            workspace_mode: 'inherit',
+            phase: 'RUNNING',
+            wake_mode: 'all',
+            last_read_seq: 150,
+            last_nudged_seq: 150,
+            killed: false,
+          },
+        },
+      }),
+    )
+
+    // Coordinator called [swarm_wait, post_message] (swarm_wait NOT last) followed by native GENERIC DONE (no tool_name)
+    await writeFile(
+      path.join(coordLogs, 'transcript.jsonl'),
+      `${[
+        JSON.stringify({
+          step_index: 10,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          input_tokens: 4000,
+          cache_read_tokens: 95_000,
+          output_tokens: 500,
+          thinking_tokens: 1_200,
+          tool_calls: [
+            { name: 'swarm_wait', args: { since: '149' } },
+            { name: 'post_message', args: { text: '@parser 请继续' } },
+          ],
+          created_at: '2026-11-22T13:00:00Z',
+        }),
+        JSON.stringify({
+          step_index: 11,
+          type: 'GENERIC',
+          status: 'DONE',
+          content: 'Waiting for a message...',
+          created_at: '2026-11-22T13:00:01Z',
+        }),
+        JSON.stringify({
+          step_index: 12,
+          type: 'GENERIC',
+          status: 'DONE',
+          content: '{"status":"posted","seq":150}',
+          created_at: '2026-11-22T13:00:02Z',
+        }),
+      ].join('\n')}\n`,
+    )
+
+    // Native worker had an old ERROR, then woke on SYSTEM_MESSAGE (no USER_INPUT)
+    await writeFile(
+      path.join(workerLogs, 'transcript.jsonl'),
+      `${[
+        JSON.stringify({ step_index: 0, type: 'ERROR_MESSAGE', status: 'ERROR', content: 'old transient error' }),
+        JSON.stringify({
+          step_index: 1,
+          type: 'SYSTEM_MESSAGE',
+          status: 'DONE',
+          content: '[swarm] new board message #150',
+          created_at: '2026-11-22T13:01:00Z',
+        }),
+      ].join('\n')}\n`,
+    )
+
+    // Verifier transcript carries usage.cache_read_tokens + usage.thoughts_tokens
+    await writeFile(
+      path.join(verifierLogs, 'transcript.jsonl'),
+      `${[
+        JSON.stringify({ step_index: 0, type: 'SYSTEM_MESSAGE', status: 'DONE' }),
+        JSON.stringify({
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          usage: { input_tokens: 1000, output_tokens: 200, cache_read_tokens: 33_000, thoughts_tokens: 850 },
+          tool_calls: [],
+        }),
+      ].join('\n')}\n`,
+    )
+
+    // 150 posts (> SWARM_MAX_POSTS=120): verifier posted only at #5 in #audit, remaining 149 in main
+    const boardLines: string[] = []
+    for (let seq = 1; seq <= 150; seq += 1) {
+      if (seq === 5) {
+        boardLines.push(JSON.stringify({ seq, agent: 'verifier', channel: 'audit', text: '早期审计结果' }))
+      } else {
+        boardLines.push(JSON.stringify({ seq, agent: seq % 2 === 0 ? 'parser' : 'coordinator', channel: 'main', text: `msg #${seq}` }))
+      }
+    }
+    await writeFile(path.join(swarmDir, 'board.jsonl'), `${boardLines.join('\n')}\n`)
+
+    const cache = new IncrementalTranscriptTelemetryCache()
+    const snap = readAntigravitySwarmSnapshot({
+      brainDir,
+      conversationId: COORD_CONV,
+      phase: 'running',
+      revision: 1,
+      telemetryCache: cache,
+      drainTelemetry: true,
+    })
+    assert.ok(snap)
+    assert.equal(snap.totalPosts, 150)
+    assert.equal(snap.posts.length, 120)
+    assert.equal(snap.truncatedPosts, 30)
+
+    const coord = snap.members.find((m) => m.name === 'coordinator')!
+    assert.equal(coord.status, 'waiting', 'native CLI phase=RUNNING + wake_mode=mentions must be waiting')
+    assert.equal(coord.activity, '等待讨论板消息', '[swarm_wait, post_message] + GENERIC DONE must parse as waiting for board')
+    assert.equal(coord.workspace, 'inherit')
+    assert.equal(coord.cacheReadTokens, 95_000)
+    assert.equal(coord.thinkingTokens, 1_200)
+
+    const parser = snap.members.find((m) => m.name === 'parser')!
+    assert.equal(parser.status, 'working', 'native CLI wake_mode=working must stay working')
+    assert.equal(parser.activity, '启动处理中…', 'SYSTEM_MESSAGE turn boundary must show startup activity and clear prior ERROR')
+    assert.equal(Boolean(parser.failed), false)
+    assert.equal(parser.workspace, 'share')
+
+    const verifier = snap.members.find((m) => m.name === 'verifier')!
+    assert.equal(verifier.status, 'waiting', 'native CLI phase=RUNNING + wake_mode=all must be waiting')
+    assert.equal(verifier.lastPostSeq, 5, 'full-board aggregation must retain lastPostSeq from before the 120-post tail')
+    assert.equal(verifier.cacheReadTokens, 33_000)
+    assert.equal(verifier.thinkingTokens, 850)
+
+    const auditCh = snap.channels.find((c) => c.name === 'audit')
+    assert.equal(auditCh?.postCount, 1, 'full-board channel postCount must include posts outside the 120-post tail')
+    const mainCh = snap.channels.find((c) => c.name === 'main')
+    assert.equal(mainCh?.postCount, 149)
+
+    // 2. RemoteSwarm roster with explicit runtime='remote' + object workspace { mode, branch, path }
+    const remoteSwarmDir = path.join(brainDir, OTHER_CONV, '.system_generated', 'swarm')
+    await mkdir(remoteSwarmDir, { recursive: true })
+    await writeFile(
+      path.join(remoteSwarmDir, 'members.json'),
+      JSON.stringify({
+        title: 'Remote 蜂群',
+        runtime: 'remote',
+        members: {
+          coordinator: {
+            conversation_id: OTHER_CONV,
+            role: 'coordinator',
+            phase: 'RUNNING',
+            wake_mode: 'mentions',
+            killed: false,
+            workspace: { mode: 'inherit' },
+          },
+          'wt-worker': {
+            conversation_id: WORKER_CONV,
+            role: 'worker',
+            phase: 'RUNNING',
+            wake_mode: 'mentions',
+            killed: false,
+            workspace: {
+              mode: 'share',
+              branch: 'oc-swarm/wt-worker',
+              path: '/home/agent/.openclaude/workspace/repo/.oc-swarm-worktrees/abc123/wt-worker',
+            },
+          },
+          'abs-worker': {
+            conversation_id: VERIFIER_CONV,
+            role: 'worker',
+            phase: 'WAITING',
+            wake_mode: 'mentions',
+            killed: false,
+            workspace: {
+              mode: 'branch',
+              branch: 'feat/isolated',
+              path: '/Users/alice/private/secret-repo/worktree-1',
+            },
+          },
+        },
+      }),
+    )
+    const remoteSnap = readAntigravitySwarmSnapshot({
+      brainDir,
+      conversationId: OTHER_CONV,
+      phase: 'running',
+      revision: 1,
+    })
+    assert.ok(remoteSnap)
+    const wt = remoteSnap.members.find((m) => m.name === 'wt-worker')!
+    assert.equal(wt.status, 'working', 'RemoteSwarm phase=RUNNING must remain working even with wake_mode=mentions')
+    assert.equal(wt.workspace, 'share')
+    assert.equal(wt.workspaceBranch, 'oc-swarm/wt-worker')
+    assert.equal(wt.workspacePath, '.oc-swarm-worktrees/abc123/wt-worker')
+    assert.ok(!wt.workspacePath?.includes('/home/agent'))
+
+    const abs = remoteSnap.members.find((m) => m.name === 'abs-worker')!
+    assert.equal(abs.status, 'waiting')
+    assert.equal(abs.workspace, 'branch')
+    assert.equal(abs.workspaceBranch, 'feat/isolated')
+    assert.equal(abs.workspacePath, '…/secret-repo/worktree-1')
+    assert.ok(!abs.workspacePath?.includes('/Users/alice'))
+  } finally {
+    await rm(brainDir, { recursive: true, force: true })
+  }
+})

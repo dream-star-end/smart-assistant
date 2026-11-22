@@ -26,10 +26,10 @@ export type PinnedHudStackProps = {
   latestSwarm: SwarmSnapshot | null;
   latestSwarmCardId?: string;
   latestSwarmBlockId?: string;
-  latestSwarmKey: string | null;
-  dismissedSwarmKey: string | null;
+  latestSwarmKey?: string | null;
+  dismissedSwarmKey?: string | null;
   onOpenSwarmBoard: (req: SwarmOpenRequest) => void;
-  onDismissSwarm: (key: string) => void;
+  onDismissSwarm?: (key: string) => void;
   museJobs?: SessionMuseJobItem[];
   mediaJobs?: MediaGenerationJob[];
   bgCommands?: SessionBgCommandItem[];

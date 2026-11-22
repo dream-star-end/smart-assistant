@@ -382,7 +382,7 @@ export function ModelSelector({
           {swarmActive && (
             <span
               data-testid="model-trigger-swarm-badge"
-              className="oc-badge-craft hidden shrink-0 items-center rounded-full bg-accent/14 px-1.5 py-0.5 text-micro font-semibold leading-none text-accent sm:inline-flex"
+              className="oc-badge-craft inline-flex shrink-0 items-center rounded-full bg-accent/14 px-1.5 py-0.5 text-micro font-semibold leading-none text-accent"
             >
               蜂群
             </span>

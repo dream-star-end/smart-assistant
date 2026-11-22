@@ -15,14 +15,14 @@ const MODELS = [
   { id: "gpt-6.2-astra", engine: "codex", name: "GPT 6.2 Astra" },
 ] as const;
 
-function makeSwarmMsg(): ChatMessage {
+function makeSwarmMsg(phase: SwarmSnapshot["phase"] = "running"): ChatMessage {
   const snapshot: SwarmSnapshot = {
     swarmId: "7474cf40-399d-415c-a951-6713ce671aef",
     title: "Wave 4 蜂群",
-    phase: "running",
+    phase,
     revision: 10,
     updatedAt: 1_700_000_000_000,
-    members: [{ name: "coordinator", role: "coordinator", status: "working", stepCount: 5, unreadCount: 0 }],
+    members: [{ name: "coordinator", role: "coordinator", status: phase === "running" ? "working" : "waiting", stepCount: 5, unreadCount: 0 }],
     channels: [{ name: "main", memberCount: 1, postCount: 1 }],
     posts: [{ seq: 1, agent: "coordinator", text: "启动", channel: "main", mentions: [] }],
     totalPosts: 1,
@@ -205,5 +205,24 @@ describe("OCV5-837: sessionSwarmMode persistence & useSwarmMode", () => {
     act(() => draft.result.current.setSwarmMode(false));
     expect(draft.result.current.swarmMode).toBe(false);
     draft.unmount();
+  });
+
+  test("does NOT auto-enable swarmMode for historical terminal SwarmBoard cards across devices", () => {
+    for (const phase of ["completed", "interrupted", "error"] as const) {
+      const { result, unmount } = renderHook(() =>
+        useSwarmMode({
+          demo: false,
+          sessionKey: `s-hist-${phase}`,
+          activeSessionId: `s-hist-${phase}`,
+          wsMessages: [makeSwarmMsg(phase)],
+          messagesVersion: 1,
+          modelId: "antigravity-gemini-4-neon",
+          models: [...MODELS],
+        }),
+      );
+      expect(readSessionSwarmMode(`s-hist-${phase}`)).toBeUndefined();
+      expect(result.current.swarmMode).toBe(false);
+      unmount();
+    }
   });
 });

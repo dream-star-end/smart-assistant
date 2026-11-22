@@ -953,12 +953,6 @@ export function App() {
   // Async goal saves can finish after navigation; only consume the selected draft's project.
   const selectedSessionIdRef = useRef(activeId);
   selectedSessionIdRef.current = activeId;
-  const { swarmSupported, swarmMode, setSwarmMode, toggleSwarmMode } = useSwarmMode({
-    demo, sessionKey: activeId ?? draftSessionId, activeSessionId: activeId,
-    wsMessages: !demo && activeId ? (sockRef.current?.getMessages(activeId) ?? EMPTY_WS_MESSAGES) : EMPTY_WS_MESSAGES,
-    messagesVersion: sockRef.current?.version ?? 0,
-    modelId, models,
-  });
 
   const {
     image2Available,
@@ -1010,7 +1004,7 @@ export function App() {
     sockRef,
     stopPreparing,
     stopRef,
-    swarmMode,
+    getSwarmMode: () => swarmStateRef.current.swarmMode,
     toast,
     user,
   });
@@ -1186,6 +1180,10 @@ export function App() {
 
   // 非 demo：展示的消息来自 WS service 快照（就地 mutation + version 触发重渲）。
   const wsMessages = !demo && activeId ? chat.getMessages(activeId) : EMPTY_WS_MESSAGES;
+  const { swarmSupported, swarmMode, setSwarmMode, toggleSwarmMode } = useSwarmMode({
+    demo, sessionKey: activeId ?? draftSessionId, activeSessionId: activeId,
+    wsMessages, messagesVersion: chat.version, modelId, models,
+  });
   const swarmUi = useSwarmBoard({ sessionKey: activeId ?? draftSessionId, wsMessages, messagesVersion: chat.version });
   const swarmRunning = Boolean(
     swarmUi.latestSwarm && (swarmUi.latestSwarm.phase === "starting" || swarmUi.latestSwarm.phase === "running"),
@@ -2505,8 +2503,7 @@ export function App() {
                   delegateItems={inflightDelegates.items} onDismissDelegate={inflightDelegates.dismiss} onCancelDelegate={inflightDelegates.cancel}
                   onStopTurn={wsSending ? stopTurn : undefined}
                   latestSwarm={swarmUi.latestSwarm} latestSwarmCardId={swarmUi.latestCard?.messageId} latestSwarmBlockId={swarmUi.latestCard?.blockId}
-                  latestSwarmKey={swarmUi.latestSwarmKey} dismissedSwarmKey={swarmUi.dismissedSwarmKey}
-                  onOpenSwarmBoard={swarmUi.openBoard} onDismissSwarm={swarmUi.dismissSwarm}
+                  onOpenSwarmBoard={swarmUi.openBoard}
                   museJobs={bgTasks.museJobs} mediaJobs={bgTasks.mediaJobs} bgCommands={bgTasks.bgCommands} sessionCrons={bgTasks.sessionCrons}
                   onCancelMuseJob={bgTasks.cancelMuseJob} onDismissMuseJob={bgTasks.dismissMuseJob} onCancelMediaJob={bgTasks.cancelMediaJob}
                   onCancelBgCommand={bgTasks.cancelBgCommand} onToggleSessionCron={bgTasks.toggleSessionCron} onDeleteSessionCron={bgTasks.deleteSessionCron}
@@ -2872,6 +2869,7 @@ export function App() {
         wsMessages={wsMessages}
         selectModel={selectModel} liveTerminal={liveTerminal} sessionNeedsYou={sessionNeedsYou}
         unreadIds={unreadSessions.unreadIds} swarmSessionIds={swarmSessionIds} onMarkRead={unreadSessions.markRead}
+        onToggleSwarm={swarmUi.latestCard ? () => swarmUi.openBoard({ snapshot: swarmUi.latestCard!.snapshot, cardId: swarmUi.latestCard!.messageId, blockId: swarmUi.latestCard!.blockId }) : undefined}
         onOpenQuickAsk={gated ? undefined : () => setQuickAsk((s) => ({ ...s, open: true, mounted: true }))}
         contextHealthOpen={contextHealthOpen}
         onContextHealthOpenChange={setContextHealthOpen}
@@ -2948,7 +2946,7 @@ export function App() {
         </LazyBoundary>
       )}
       {swarmUi.boardOpen && swarmUi.activeDrawerSwarm && (
-        <SwarmBoardDrawer open={swarmUi.boardOpen} onOpenChange={swarmUi.setBoardOpen} snapshot={swarmUi.activeDrawerSwarm} sessionId={activeId} initialFocusMember={swarmUi.boardFocus.member} initialFocusChannel={swarmUi.boardFocus.channel} onQuoteToComposer={appendToComposer} />
+        <SwarmBoardDrawer open={swarmUi.boardOpen} onOpenChange={swarmUi.setBoardOpen} snapshot={swarmUi.activeDrawerSwarm} sessionId={activeId} initialFocusMember={swarmUi.boardFocus.member} initialFocusChannel={swarmUi.boardFocus.channel} initialFocusSeq={swarmUi.boardFocus.seq} syncStale={Boolean(activeSess?._swarmSyncStale)} onStopSwarm={wsSending ? stopTurn : undefined} onQuoteToComposer={appendToComposer} />
       )}
       {containerPreviewUrl && (
         <LazyBoundary fallback={<DialogFallback />}>

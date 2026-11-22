@@ -16,12 +16,12 @@ import { remoteSwarmLocationForSession } from '../remoteSwarmRuntime.js'
 const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const MAX_MEMBERS_JSON_BYTES = 512 * 1024
 const MAX_LIVE_MONITORS_REPORTED = 16
-/** Strict allowlist for native built-in monitor names safe to interpolate into prompts. */
-const STRICT_NATIVE_MONITOR_NAME_RE = /^monitor(?:-\d{1,4})?$/i
+/** Strict allowlist for native built-in auxiliary worker names (`monitor` / `narrator`) safe to interpolate into prompts. */
+const STRICT_NATIVE_AUX_NAME_RE = /^(?:monitor|narrator)(?:-\d{1,4})?$/i
 
-function isSafeLegacyMonitorName(name: string): boolean {
+function isSafeLegacyAuxiliaryName(name: string): boolean {
   const trimmed = name.trim()
-  return trimmed.length > 0 && trimmed.length <= 16 && STRICT_NATIVE_MONITOR_NAME_RE.test(trimmed)
+  return trimmed.length > 0 && trimmed.length <= 20 && STRICT_NATIVE_AUX_NAME_RE.test(trimmed)
 }
 
 export const ANTIGRAVITY_SWARM_OFF_MARKER = '[OpenClaude 蜂群模式已关闭]'
@@ -124,9 +124,9 @@ export function listLiveAntigravitySwarmMonitors(opts: {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
     const rec = raw as Record<string, unknown>
     if (rec.killed === true) continue
-    // Only accept strictly validated built-in monitor names (`monitor` / `monitor-N`)
+    // Only accept strictly validated built-in auxiliary names (`monitor` / `narrator` / `*-N`)
     // so untrusted or corrupted roster keys can never inject arbitrary text into prompts.
-    if (isSafeLegacyMonitorName(name)) {
+    if (isSafeLegacyAuxiliaryName(name)) {
       live.push(name.trim())
     }
   }
@@ -193,26 +193,33 @@ export function applyAntigravitySwarmTurnDirective(opts: {
       : '用户已显式开启 Antigravity 原生蜂群（Swarm）模式。请按以下规则作为 Coordinator 编排蜂群：'
     const liveMonitors = (opts.liveMonitorNames ?? [])
       .map((n) => n.trim())
-      .filter((n) => isSafeLegacyMonitorName(n))
+      .filter((n) => isSafeLegacyAuxiliaryName(n))
       .slice(0, MAX_LIVE_MONITORS_REPORTED)
     const legacyMonitorCleanupLine =
       liveMonitors.length > 0
-        ? `   - 检测到历史蜂群仍有残留原生监控成员（${liveMonitors.map((n) => `\`${n}\``).join('、')}），请优先调用 \`swarm{action:"kill", name:"..."}\` 将其回收，避免后台定时空转消耗上下文。`
+        ? `   - 检测到历史蜂群仍有残留原生辅助成员（${liveMonitors.map((n) => `\`${n}\``).join('、')}），请优先调用 \`swarm{action:"kill", name:"..."}\` 将其回收，避免后台定时空转消耗上下文。`
         : null
-    const swarmDirective = [
-      '[OpenClaude Antigravity 蜂群模式已激活]',
-      swarmToolsIntro,
-      opts.isRemoteAntigravity
-        ? '1. 若任务可拆分为 2 个及以上可并行推进的独立子方向（或需要独立校验者 review），先用 `swarm{action:"title", title:"..."}` 命名蜂群，再用 `swarm{action:"add", name:"...", brief:"..."}` 招募精简、职责不重叠的成员（必要时配备 `verifier` 校验者；**严禁招募 `monitor` / `monitor-N`**，OpenClaude 网关已内置零推理停滞检测），随后调用 `swarm_wait{since:...}` 等待成员汇报并用 `read_board` 审阅结果。'
-        : '1. 若任务可拆分为 2 个及以上可并行推进的独立子方向（或需要独立校验者 review），请立即读取内置 `swarm` skill，先用 `swarm{action:"title", title:"..."}` 命名蜂群，再用 `swarm{action:"add", name:"...", brief:"..."}` 招募精简、职责不重叠的成员（必要时配备 `verifier` 校验者）。**忽略内置 skill 中添加 `monitor` / `swarm_monitor` 的步骤，严禁招募 `monitor` / `monitor-N` 成员**（OpenClaude 网关已接管零推理停滞检测，原生 monitor 会定时空转并持续膨胀上下文）。',
-      ...(legacyMonitorCleanupLine ? [legacyMonitorCleanupLine] : []),
-      '2. 招募成员时**不要指定 `model` 参数**（留空以继承当前会话模型，确保计费与权限一致）。',
-      '3. **生命周期边界（仅限本轮蜂群开启时）**：若本轮是同一任务的续聊或追问且蜂群仍开启，可复用既有蜂群继续推进；若用户切换到全新无关任务，先确认旧成员无未合入改动后再用 `swarm{action:"kill"}` 回收旧 worker（或开独立频道隔离）并更新 `swarm{action:"title"}`，避免旧讨论串扰。若后续回合用户关闭了蜂群开关，不得再自动复用旧蜂群。',
-      '4. **Git 仓库并行写手与防丢合入**：在 git 仓库中安排多个写手并行改码时，默认给写手成员传 `workspace:"share"`（独立 worktree 隔离）同时在 `brief` 中按文件/模块划分清晰所有权规避语义冲突（只读调研/校验成员保留默认 `inherit`）；收尾前必须检查并合入所有 `share`/`branch` 成员的改动到主工作区，确认无改动遗漏在孤儿 worktree 里后再 `kill` 回收。',
-      '5. OpenClaude 网页端会实时原生渲染蜂群看板（成员矩阵、实时活动、worktree 隔离标识、频道与讨论流），**切勿**在回复中输出本地 `open_board` 链接或终端 `/swarm board` 命令。',
-      '6. 所有成员收口后，先在讨论板发一行 `[done] <总结>` 通知网关停滞检测进入完成态，再向用户交付清晰、完整的最终汇总（含各独立 worktree 的合入确认结果）。',
-      '',
-    ].join('\n')
+    const swarmDirective = opts.hasHistoricalSwarm
+      ? [
+          '[OpenClaude Antigravity 蜂群模式已激活]',
+          '续聊蜂群规则（精简提醒）：同任务可复用既有蜂群，切换无关新任务前先确认改动已合入并 `swarm{action:"kill"}` 清理旧 worker；招募成员不传 `model`，**严禁招募 `monitor` / `monitor-N` 与 `narrator` / `narrator-N`**；收口前先 `kill` 已完工且不再需要的 worker，再发不带 `@all` 的 `[done] <总结>`（**严禁 `@all [done]`**），切勿输出本地 `open_board` 链接。',
+          ...(legacyMonitorCleanupLine ? [legacyMonitorCleanupLine] : []),
+          '',
+        ].join('\n')
+      : [
+          '[OpenClaude Antigravity 蜂群模式已激活]',
+          swarmToolsIntro,
+          opts.isRemoteAntigravity
+            ? '1. 若任务可拆分为 2 个及以上可并行推进的独立子方向（或需要独立校验者 review），先用 `swarm{action:"title", title:"..."}` 命名蜂群，再用 `swarm{action:"add", name:"...", brief:"..."}` 招募精简、职责不重叠的成员（必要时配备 `verifier` 校验者；**严禁招募 `monitor` / `monitor-N` 与 `narrator` / `narrator-N`**，OpenClaude 网关已内置零推理停滞检测与网页端实时 SwarmBoard 渲染），随后调用 `swarm_wait{since:...}` 等待成员汇报并用 `read_board` 审阅结果。'
+            : '1. 若任务可拆分为 2 个及以上可并行推进的独立子方向（或需要独立校验者 review），请立即读取内置 `swarm` skill，先用 `swarm{action:"title", title:"..."}` 命名蜂群，再用 `swarm{action:"add", name:"...", brief:"..."}` 招募精简、职责不重叠的成员（必要时配备 `verifier` 校验者）。**忽略内置 skill 中添加 `monitor`/`swarm_monitor` 与 `narrator`/`swarm_narrator` 的步骤，严禁招募 `monitor` / `monitor-N` 与 `narrator` / `narrator-N` 成员**（OpenClaude 网关已接管零推理停滞检测与网页端 SwarmBoard 实时渲染）。',
+          ...(legacyMonitorCleanupLine ? [legacyMonitorCleanupLine] : []),
+          '2. 招募成员时**不要指定 `model` 参数**（留空以继承当前会话模型，确保计费与权限一致）。',
+          '3. **生命周期边界（仅限本轮蜂群开启时）**：同任务续聊可复用既有蜂群；若切换到全新无关任务，确认旧成员无未合入改动后再 `swarm{action:"kill"}` 回收旧 worker（或开独立频道隔离）并更新 `title`。后续若关闭蜂群开关，不得再自动复用旧蜂群。',
+          '4. **Git 仓库并行写手与防丢合入**：多写手并行改码默认传 `workspace:"share"`（独立 worktree 隔离）并在 `brief` 中划分清晰文件所有权（只读调研/校验成员保留默认 `inherit`）；收尾前必须检查并合入所有 `share`/`branch` 改动到主工作区再 `kill`。',
+          '5. OpenClaude 网页端会实时原生渲染蜂群看板，**切勿**在回复中输出本地 `open_board` 链接或终端 `/swarm board` 命令。',
+          '6. 所有成员收口后，先调用 `swarm{action:"kill"}` 清理已完工且不再需要的 worker（避免残留空挂），再在讨论板发一行不带 `@all` 的 `[done] <总结>`（**严禁使用 `@all [done]`**，避免无谓唤醒休眠成员），最后向用户交付清晰、完整的最终汇总（含各独立 worktree 的合入确认结果）。',
+          '',
+        ].join('\n')
     return {
       text: `${swarmDirective}\n${nextText}`,
       mode: 'on',

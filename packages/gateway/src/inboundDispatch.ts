@@ -88,7 +88,10 @@ import {
   hasHistoricalAntigravitySwarm,
   listLiveAntigravitySwarmMonitors,
 } from './engine/antigravitySwarmDirective.js'
-import { disableRemoteSwarmCoordinatorMcp } from './remoteSwarmRuntime.js'
+import {
+  prepareRemoteSwarmInboundTurn,
+  recordRemoteSwarmLeaderStreamEvent,
+} from './remoteSwarmLocal.js'
 import {
   getTurnAuthority,
   isEngineLocalTurnExempt,
@@ -1787,83 +1790,29 @@ export async function dispatchInbound(
         })
         finalText = teamPreamble + finalText
       }
-      // Antigravity swarm mode (OCV5-809 local + OCV5-835 remote parity + OCV5-842 off-toggle guard):
-      // activated only by explicit `swarmMode: true` toggle or leading `/swarm`.
-      // When turned OFF on a session with a historical swarm, revoke remote coordinator MCP
-      // and inject an explicit single-agent suppression directive so resumed coordinators do
-      // not keep waking prior swarm workers.
-      const effectiveModelForSwarm =
-        safeModelForRouting ?? agent.model ?? this.deps.config.defaults.model
-      const isAntigravityTurn =
-        turnAuthority?.engine === 'antigravity' ||
-        (typeof effectiveModelForSwarm === 'string' && isAntigravityEngineModel(effectiveModelForSwarm))
-      const isRemoteAntigravity =
-        isAntigravityTurn &&
-        (isRemoteDriverExecutionBackend(turnAuthority?.executionBackend) ||
-          (typeof effectiveModelForSwarm === 'string' && effectiveModelForSwarm.endsWith('-remote')))
-      const slashSwarm = parseSwarmSlashCommand(rawUserText)
-      const swarmRequested = swarmMode || Boolean(slashSwarm?.matched)
-      if (isRemoteAntigravity && effectiveModelForSwarm) {
-        if (swarmRequested) {
-          this._ensureRemoteSwarmRuntime().registerSession({
-            sessionKey,
-            model: effectiveModelForSwarm,
-            effort: safeEffortLevel ?? undefined,
-            workspaceCwd: session.workspaceCwd || agent.cwd || process.cwd(),
-            parentAgentId: agent.id,
-            allowedToolsets: agent.toolsets,
-          })
-        } else {
-          disableRemoteSwarmCoordinatorMcp(sessionKey)
-        }
-      }
-      const boundSwarmConversationId =
-        isAntigravityTurn && !isRemoteAntigravity
-          ? (session.ccbSessionId ??
-              session.runner?.nativeSessionId ??
-              this.sessions.resolveAntigravitySwarmTarget?.(frame.peer.id)?.conversationId ??
-              undefined)
-          : undefined
-      const hasHistoricalSwarm =
-        isAntigravityTurn && !swarmRequested
-          ? hasHistoricalAntigravitySwarm({
-              sessionKey,
-              isRemote: isRemoteAntigravity,
-              conversationId: boundSwarmConversationId,
-            })
-          : false
-      const liveMonitorNames =
-        isAntigravityTurn && swarmRequested
-          ? listLiveAntigravitySwarmMonitors({
-              sessionKey,
-              isRemote: isRemoteAntigravity,
-              conversationId: boundSwarmConversationId,
-            })
-          : []
+      // Antigravity swarm mode (OCV5-809 local + OCV5-835 remote parity + OCV5-842/P0-2 off-toggle guard).
+      const effectiveModelForSwarm = safeModelForRouting ?? agent.model ?? this.deps.config.defaults.model
+      const isAntigravityTurn = turnAuthority?.engine === 'antigravity' || (typeof effectiveModelForSwarm === 'string' && isAntigravityEngineModel(effectiveModelForSwarm))
+      const isRemoteAntigravity = isAntigravityTurn && (isRemoteDriverExecutionBackend(turnAuthority?.executionBackend) || (typeof effectiveModelForSwarm === 'string' && effectiveModelForSwarm.endsWith('-remote')))
+      const swarmRequested = swarmMode || Boolean(parseSwarmSlashCommand(rawUserText)?.matched)
+      const activeRemoteSwarmRuntime = await prepareRemoteSwarmInboundTurn({
+        sessionKey, isRemoteAntigravity, effectiveModel: effectiveModelForSwarm, swarmRequested,
+        effort: safeEffortLevel ?? undefined, workspaceCwd: session.workspaceCwd || agent.cwd || process.cwd(),
+        parentAgentId: agent.id, allowedToolsets: agent.toolsets, ensureRuntime: () => this._ensureRemoteSwarmRuntime(),
+      })
+      const boundSwarmConversationId = isAntigravityTurn && !isRemoteAntigravity
+        ? (session.ccbSessionId ?? session.runner?.nativeSessionId ?? this.sessions.resolveAntigravitySwarmTarget?.(frame.peer.id)?.conversationId ?? undefined)
+        : undefined
       const swarmDirectiveResult = applyAntigravitySwarmTurnDirective({
-        finalText,
-        rawUserText,
-        isAntigravityTurn,
-        isRemoteAntigravity,
-        swarmMode,
-        hasHistoricalSwarm,
-        liveMonitorNames,
+        finalText, rawUserText, isAntigravityTurn, isRemoteAntigravity, swarmMode,
+        hasHistoricalSwarm: isAntigravityTurn ? hasHistoricalAntigravitySwarm({ sessionKey, isRemote: isRemoteAntigravity, conversationId: boundSwarmConversationId }) : false,
+        liveMonitorNames: isAntigravityTurn && swarmRequested ? listLiveAntigravitySwarmMonitors({ sessionKey, isRemote: isRemoteAntigravity, conversationId: boundSwarmConversationId }) : [],
       })
       finalText = swarmDirectiveResult.text
       if (swarmDirectiveResult.mode === 'on') {
-        this.log.info('antigravity_swarm_mode_turn', {
-          sessionKey,
-          model: effectiveModelForSwarm,
-          remote: isRemoteAntigravity,
-          viaSlash: swarmDirectiveResult.viaSlash,
-          viaToggle: swarmDirectiveResult.viaToggle,
-        })
+        this.log.info('antigravity_swarm_mode_turn', { sessionKey, model: effectiveModelForSwarm, remote: isRemoteAntigravity, viaSlash: swarmDirectiveResult.viaSlash, viaToggle: swarmDirectiveResult.viaToggle })
       } else if (swarmDirectiveResult.mode === 'off_with_history') {
-        this.log.info('antigravity_swarm_mode_suppressed', {
-          sessionKey,
-          model: effectiveModelForSwarm,
-          remote: isRemoteAntigravity,
-        })
+        this.log.info('antigravity_swarm_mode_suppressed', { sessionKey, model: effectiveModelForSwarm, remote: isRemoteAntigravity })
       }
       // Pass as plain text. No image content blocks — safer for non-multimodal providers.
       const payload: string = finalText
@@ -1948,6 +1897,7 @@ export async function dispatchInbound(
       }
       const deliverPendingApiErrorTerminal = (): boolean => {
         if (!_pendingApiErrorFrame || !_pendingApiErrorFinalized) return false
+        activeRemoteSwarmRuntime?.recordCoordinatorTelemetry(sessionKey, { type: 'ERROR', status: 'ERROR', error: _apiErrorText || 'api_error' })
         turnErrored = true
         session.currentTurnStatus = null
         this._runLog.complete(currentRun, { status: 'failed', error: _apiErrorText })
@@ -1978,6 +1928,7 @@ export async function dispatchInbound(
       // SessionStreamEvent ⊆ GatewayStreamEvent,故本 handler 仍可下传给要求
       // SessionStreamEvent handler 的 sessions.submit()(函数参数逆变)。
       const onLeaderEvent = (e: GatewayStreamEvent) => {
+        recordRemoteSwarmLeaderStreamEvent(activeRemoteSwarmRuntime, sessionKey, e)
         if (e.kind === 'block') {
           const b = e.block as any
           // tool_output_tail 是替换语义的快照(1Hz),且 sessionManager 现在让

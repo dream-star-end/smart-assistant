@@ -23,10 +23,7 @@ import { createPassiveRelayTiming } from './passiveRelayTiming.js'
  */
 import { randomUUID } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import {
-  ANTIGRAVITY_AUX_UPSTREAM_MODELS,
-  antigravityAllowedUpstreamModels,
-} from '@openclaude/protocol'
+import { antigravityAllowedUpstreamModels } from '@openclaude/protocol'
 import { type Dispatcher, request } from 'undici'
 import { reportAntigravityModelOutcome } from '../account-pool/antigravityModelCooldown.js'
 import {
@@ -50,8 +47,10 @@ import {
   resolveAntigravityRelayRoute,
 } from '../billing/antigravityRouteContext.js'
 import {
+  ANTIGRAVITY_MONITORING_REQUEST_TYPE,
   type AntigravityUsageTotals,
   antigravityUsageCost,
+  isAntigravityAuxUpstreamModel,
   refreshWaivedAntigravityUsage,
   sumAntigravityRelayUsage,
 } from '../billing/antigravitySettle.js'
@@ -86,6 +85,11 @@ const MAX_GENERATE_BODY = 32 * 1024 * 1024
  * multiple parallel turns on the same route (each still strictly reserved
  * against route.budgetCredits atomically below). */
 export const ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE = 12
+/** Independent per-route concurrency cap for auxiliary light-model calls
+ * (e.g. gemini-3.5-flash-lite agent_monitoring / checkpoint / web_search) so
+ * monitoring bursts never contend for the primary model's 12 slots while still
+ * bounding aux fan-out on a single route. */
+export const ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE = 24
 /** Output tokens assumed for an in-flight reservation (input comes from the body size). */
 const RESERVED_OUTPUT_TOKENS = 2048
 const MAX_METADATA_BODY = 1024 * 1024
@@ -148,7 +152,11 @@ export interface AntigravityRelayDeps {
   recordUsage?: (row: AntigravityUsageRow) => Promise<void>
   meteredCost?: (route: AntigravityRelayRoute) => Promise<bigint | null>
   /** Conservative cost of one generate call before it runs; null = pricing missing. */
-  estimateCost?: (route: AntigravityRelayRoute, bodyBytes: number) => bigint | null
+  estimateCost?: (
+    route: AntigravityRelayRoute,
+    bodyBytes: number,
+    upstreamModel?: string,
+  ) => bigint | null
   /** Cost of the summed in-process usage, rounded once like settlement (not per call). */
   totalsCost?: (route: AntigravityRelayRoute, totals: AntigravityUsageTotals) => bigint
   /** After a call's row is written: fold it into a turn that already settled as waived. */
@@ -378,18 +386,74 @@ interface InflightSlot {
   recorded: AntigravityUsageTotals
   touchedAt: number
 }
+interface AuxInflightSlot {
+  count: number
+  touchedAt: number
+}
 const inflight = new Map<string, InflightSlot>()
+const auxInflight = new Map<string, AuxInflightSlot>()
 /** Longer than the route TTL; idle slots past it are dropped. */
 const SLOT_IDLE_MS = 2 * 60 * 60 * 1000
 
 function pruneSlots(now: number): void {
+  for (const [key, slot] of auxInflight) {
+    if (slot.count <= 0 && now - slot.touchedAt > SLOT_IDLE_MS) auxInflight.delete(key)
+  }
   for (const [key, slot] of inflight) {
-    if (slot.count <= 0 && now - slot.touchedAt > SLOT_IDLE_MS) inflight.delete(key)
+    if (
+      slot.count <= 0 &&
+      (auxInflight.get(key)?.count ?? 0) <= 0 &&
+      now - slot.touchedAt > SLOT_IDLE_MS
+    ) {
+      inflight.delete(key)
+    }
   }
 }
 
 export function _antigravityInflightForTests(): ReadonlyMap<string, InflightSlot> {
   return inflight
+}
+
+export function _antigravityAuxInflightForTests(): ReadonlyMap<string, AuxInflightSlot> {
+  return auxInflight
+}
+
+function accumulateRecordedUsage(
+  prev: AntigravityUsageTotals,
+  row: Pick<
+    AntigravityUsageRow,
+    'upstreamModel' | 'requestType' | 'promptTokens' | 'candidatesTokens' | 'thoughtsTokens' | 'cachedTokens'
+  >,
+): AntigravityUsageTotals {
+  const prompt = BigInt(row.promptTokens)
+  const candidates = BigInt(row.candidatesTokens)
+  const thoughts = BigInt(row.thoughtsTokens)
+  const cached = BigInt(row.cachedTokens)
+  if (isAntigravityAuxUpstreamModel(row.upstreamModel)) {
+    const a = prev.aux
+    const monitoringCalls =
+      (a?.monitoringCalls ?? 0) + (row.requestType === ANTIGRAVITY_MONITORING_REQUEST_TYPE ? 1 : 0)
+    return {
+      ...prev,
+      calls: prev.calls + 1,
+      aux: {
+        promptTokens: (a?.promptTokens ?? 0n) + prompt,
+        candidatesTokens: (a?.candidatesTokens ?? 0n) + candidates,
+        thoughtsTokens: (a?.thoughtsTokens ?? 0n) + thoughts,
+        cachedTokens: (a?.cachedTokens ?? 0n) + cached,
+        calls: (a?.calls ?? 0) + 1,
+        ...(monitoringCalls > 0 ? { monitoringCalls } : {}),
+      },
+    }
+  }
+  return {
+    ...prev,
+    promptTokens: prev.promptTokens + prompt,
+    candidatesTokens: prev.candidatesTokens + candidates,
+    thoughtsTokens: prev.thoughtsTokens + thoughts,
+    cachedTokens: prev.cachedTokens + cached,
+    calls: prev.calls + 1,
+  }
 }
 
 /** Resolves true once `res` drains, false if it closes (or already has) first. */
@@ -432,7 +496,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       const pricing = deps.pricing?.get(route.modelId) ?? null
       if (pricing === null) return null
       const totals = await sumAntigravityRelayUsage(getPool(), route.requestId, route.userId)
-      return antigravityUsageCost(totals, pricing)
+      return antigravityUsageCost(totals, pricing, deps.pricing ?? undefined)
     })
   const refreshWaived =
     deps.refreshWaived ??
@@ -447,15 +511,41 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
     })
   const estimateCost =
     deps.estimateCost ??
-    ((route: AntigravityRelayRoute, bodyBytes: number) => {
+    ((
+      route: AntigravityRelayRoute,
+      bodyBytes: number,
+      upstreamModel?: string,
+    ) => {
       const pricing = deps.pricing?.get(route.modelId) ?? null
       if (pricing === null) return null
+      const promptTokens = BigInt(Math.ceil(bodyBytes / 4))
+      const candidatesTokens = BigInt(RESERVED_OUTPUT_TOKENS)
+      if (isAntigravityAuxUpstreamModel(upstreamModel)) {
+        return antigravityUsageCost(
+          {
+            promptTokens: 0n,
+            candidatesTokens: 0n,
+            thoughtsTokens: 0n,
+            cachedTokens: 0n,
+            calls: 1,
+            aux: {
+              promptTokens,
+              candidatesTokens,
+              thoughtsTokens: 0n,
+              cachedTokens: 0n,
+              calls: 1,
+            },
+          },
+          pricing,
+          deps.pricing ?? undefined,
+        )
+      }
       // ~4 bytes per token of JSON body is generous for prompts (cached parts
       // are billed lower, so this over-reserves).
       return antigravityUsageCost(
         {
-          promptTokens: BigInt(Math.ceil(bodyBytes / 4)),
-          candidatesTokens: BigInt(RESERVED_OUTPUT_TOKENS),
+          promptTokens,
+          candidatesTokens,
           thoughtsTokens: 0n,
           cachedTokens: 0n,
           calls: 1,
@@ -467,7 +557,9 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
     deps.totalsCost ??
     ((route: AntigravityRelayRoute, totals: AntigravityUsageTotals) => {
       const pricing = deps.pricing?.get(route.modelId) ?? null
-      return pricing === null ? 0n : antigravityUsageCost(totals, pricing)
+      return pricing === null
+        ? 0n
+        : antigravityUsageCost(totals, pricing, deps.pricing ?? undefined)
     })
 
   return async (req, res, ctx) => {
@@ -547,14 +639,30 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
     }
     let upstreamModel = ''
     let requestType: string | null = null
-    let reservation: { slot: InflightSlot; estimate: bigint } | null = null
-    // Kept (not deleted) at count 0 so `recorded` survives between calls; pruned when idle.
+    let reservation: {
+      slot: InflightSlot
+      auxSlot: AuxInflightSlot | null
+      estimate: bigint
+      lane: 'primary' | 'aux'
+    } | null = null
+    // Primary slot is kept at count 0 so `recorded` survives between calls (pruned when idle);
+    // aux slot carries no inter-call state and is removed once its count reaches 0.
     const release = (): void => {
       if (!reservation) return
-      reservation.slot.count -= 1
-      reservation.slot.reserved -= reservation.estimate
-      reservation.slot.touchedAt = now()
+      const current = reservation
       reservation = null
+      const ts = now()
+      if (current.lane === 'aux' && current.auxSlot) {
+        current.auxSlot.count = Math.max(0, current.auxSlot.count - 1)
+        current.auxSlot.touchedAt = ts
+        if (auxInflight.get(token) === current.auxSlot && current.auxSlot.count <= 0) {
+          auxInflight.delete(token)
+        }
+      } else {
+        current.slot.count = Math.max(0, current.slot.count - 1)
+      }
+      current.slot.reserved -= current.estimate
+      current.slot.touchedAt = ts
     }
     if (generate) {
       let payload: Record<string, unknown>
@@ -575,6 +683,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
         error(res, 403, 'ANTIGRAVITY_MODEL_NOT_ALLOWED', requestId)
         return
       }
+      const isAuxLane = isAntigravityAuxUpstreamModel(upstreamModel)
       stage('precheck_started')
       let spent: bigint | null
       try {
@@ -583,14 +692,15 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
         error(res, 503, 'ANTIGRAVITY_METERING_UNAVAILABLE', requestId)
         return
       }
-      const estimate = estimateCost(route, body!.length)
+      const estimate = estimateCost(route, body!.length, upstreamModel)
       if (spent === null || estimate === null) {
         error(res, 503, 'ANTIGRAVITY_PRICING_UNAVAILABLE', requestId)
         return
       }
       // Synchronous from here to the reservation: no await between the check
       // and the increment, so concurrent calls see each other's reservations.
-      pruneSlots(now())
+      const ts = now()
+      pruneSlots(ts)
       const slot = inflight.get(token) ?? {
         count: 0,
         reserved: 0n,
@@ -601,9 +711,16 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
           cachedTokens: 0n,
           calls: 0,
         },
-        touchedAt: now(),
+        touchedAt: ts,
       }
-      if (slot.count >= ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE) {
+      let auxSlot: AuxInflightSlot | null = null
+      if (isAuxLane) {
+        auxSlot = auxInflight.get(token) ?? { count: 0, touchedAt: ts }
+        if (auxSlot.count >= ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE) {
+          error(res, 429, 'ANTIGRAVITY_AUX_ROUTE_BUSY', requestId)
+          return
+        }
+      } else if (slot.count >= ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE) {
         error(res, 429, 'ANTIGRAVITY_ROUTE_BUSY', requestId)
         return
       }
@@ -613,21 +730,27 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       const committed = (spent > local ? spent : local) + slot.reserved
       if (
         committed >= route.budgetCredits ||
-        (slot.count > 0 && committed + estimate > route.budgetCredits)
+        ((slot.count > 0 || slot.reserved > 0n) && committed + estimate > route.budgetCredits)
       ) {
         error(res, 402, 'ANTIGRAVITY_BUDGET_EXHAUSTED', requestId)
         return
       }
-      slot.count += 1
+      if (isAuxLane && auxSlot) {
+        auxSlot.count += 1
+        auxSlot.touchedAt = ts
+        auxInflight.set(token, auxSlot)
+      } else {
+        slot.count += 1
+      }
       slot.reserved += estimate
-      slot.touchedAt = now()
+      slot.touchedAt = ts
       inflight.set(token, slot)
-      reservation = { slot, estimate }
-      stage('precheck_complete')
+      reservation = { slot, auxSlot, estimate, lane: isAuxLane ? 'aux' : 'primary' }
     }
 
     let accessToken: Buffer | null = null
     try {
+      if (generate) stage('precheck_complete')
       try {
         stage('auth_prepare_started')
         accessToken = await freshToken(route.accountId)
@@ -674,10 +797,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
         outcome,
         outcome.kind === 'success' ? null : `antigravity_http_${status}`,
       ).catch(() => {})
-      if (
-        generate &&
-        !(ANTIGRAVITY_AUX_UPSTREAM_MODELS as readonly string[]).includes(upstreamModel)
-      ) {
+      if (generate && !isAntigravityAuxUpstreamModel(upstreamModel)) {
         const modelOk = classified.kind === 'success'
         if (modelOk || classified.kind === 'upstream_error') {
           void reportModelOutcome(route.accountId, route.modelId, modelOk).catch(() => {})
@@ -749,14 +869,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
           }
         }
         if (reservation) {
-          const r = reservation.slot.recorded
-          reservation.slot.recorded = {
-            promptTokens: r.promptTokens + BigInt(row.promptTokens),
-            candidatesTokens: r.candidatesTokens + BigInt(row.candidatesTokens),
-            thoughtsTokens: r.thoughtsTokens + BigInt(row.thoughtsTokens),
-            cachedTokens: r.cachedTokens + BigInt(row.cachedTokens),
-            calls: r.calls + 1,
-          }
+          reservation.slot.recorded = accumulateRecordedUsage(reservation.slot.recorded, row)
         }
         // A Stop may have settled the turn while this call was still streaming (OCV5-451).
         void refreshWaived(route).catch(() => {})
