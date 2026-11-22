@@ -47,6 +47,7 @@ import {
 import { resolveParentTapeIngestState, type ParentTapeIngestState } from './delegateNotifyTape.js'
 import { delayUntilNextNotifyRetry } from './delegateNotifyDispatch.js'
 import { formatJobTerminalMarkdown, injectPayloadFromJobTerminal } from './jobTerminal.js'
+import { ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE } from './cronOriginSession.js'
 import { delegateCallbackMessageId, restoreDelegateJobSnapshots } from './delegateCompleter.js'
 import { eventBus } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
@@ -1325,6 +1326,12 @@ export function _ensureEngineNotifier(
                 once: true,
               })
         if (result.kind === 'injected') return { ok: true }
+        if (
+          result.kind === 'retryable_failure' &&
+          result.code === ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE
+        ) {
+          return { ok: false, failureClass: 'transport' as const, previouslyFailed: true }
+        }
         if (result.kind === 'retryable_failure' && result.code === 'ORIGIN_SESSION_BUSY') {
           return { ok: false, failureClass: 'internal' as const, busy: true }
         }

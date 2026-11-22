@@ -9,7 +9,11 @@
 import { clientSessionIsActive } from './routes/clientSessions.js'
 import { isDelegateTerminalState } from '@openclaude/protocol'
 import { appendServerAuthoredMessage } from '@openclaude/storage'
-import { parseOriginWebchatSessionKey, type CronOriginFireResult } from './cronOriginSession.js'
+import {
+  ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE,
+  parseOriginWebchatSessionKey,
+  type CronOriginFireResult,
+} from './cronOriginSession.js'
 import {
   buildSendToAgentCallbackText,
   callbackPayloadFromDurableJob,
@@ -251,6 +255,7 @@ export async function _ensureDurableSendToAgentCallback(
     const claim = store.claimNotifyDelivery(job.id, fence)
     if (!claim.ok) return false
     const payload = callbackPayloadFromDurableJob(claim.snapshot)
+    let previouslyFailed = false
     try {
       const result = await this.injectSendToAgentCallback({
         parentSessionKey: intent.originSessionKey,
@@ -262,7 +267,12 @@ export async function _ensureDurableSendToAgentCallback(
         error: payload.error,
         clientMessageId: delegateCallbackMessageId(intent.jobId, claim.snapshot.callbackEpoch || 1),
       })
-      if (result.kind !== 'injected') return false
+      if (result.kind !== 'injected') {
+        previouslyFailed =
+          result.kind === 'retryable_failure' &&
+          result.code === ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE
+        return false
+      }
       const delivered = store.completeNotifyDelivery(job.id, claim.token, fence)
       if (delivered) {
         this._activeSendToAgentCallbacks?.delete(job.id)
@@ -270,7 +280,16 @@ export async function _ensureDurableSendToAgentCallback(
       }
       return delivered
     } finally {
-      store.releaseNotifyClaim(job.id, claim.token, fence)
+      if (previouslyFailed) {
+        const bumped = store.releaseNotifyClaimWithEpochBump(job.id, claim.token, fence)
+        if (bumped === 'epoch_cap_reached') {
+          store.abandonNotify(job.id, fence)
+          this._activeSendToAgentCallbacks?.delete(job.id)
+          await removeSendToAgentIntent(job.id)
+        }
+      } else {
+        store.releaseNotifyClaim(job.id, claim.token, fence)
+      }
       this._armNotifyRetryScheduler()
     }
   }
@@ -624,7 +643,19 @@ export function _queueSendToAgentCallback(
     .then(async (result) => {
       if (result.kind !== 'injected') {
         if (owner === 'job') {
-          this._delegateJobs?.patchCallbackState(args.jobId, 'pending', fence)
+          if (
+            result.kind === 'retryable_failure' &&
+            result.code === ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE
+          ) {
+            const bumped = this._delegateJobs?.bumpCallbackEpochForRetry(args.jobId, fence)
+            if (bumped === 'epoch_cap_reached') {
+              this._delegateJobs?.abandonNotify(args.jobId, fence)
+              this._activeSendToAgentCallbacks.delete(args.jobId)
+              await removeSendToAgentIntent(args.jobId)
+            }
+          } else {
+            this._delegateJobs?.patchCallbackState(args.jobId, 'pending', fence)
+          }
         }
         return
       }
@@ -708,6 +739,9 @@ export async function injectSendToAgentCallback(
       // path so the notifier parks the job as pending instead of degrading.
       if (posted.kind === 'in_flight') {
         return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_BUSY' }
+      }
+      if (posted.kind === 'previously_failed') {
+        return { kind: 'retryable_failure', code: ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE }
       }
       return { kind: 'retryable_failure', code: posted.code }
     }

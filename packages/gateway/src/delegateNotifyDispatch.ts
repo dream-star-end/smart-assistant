@@ -15,6 +15,7 @@ import {
   type NotifyResult,
 } from '@openclaude/protocol'
 import {
+  NOTIFY_MAX_CALLBACK_EPOCH,
   isResumeInjectCallback,
   type DelegateJobSnapshot,
   type DelegateJobStore,
@@ -79,9 +80,10 @@ export async function dispatchJobTerminalNotify(
     return { skipped: true, reason: 'not_terminal' }
   }
 
+  const current = store.snapshotOf(job.id) ?? job
   let parentEngine =
-    hooks.resolveParentEngine?.(job) ?? parseParentEngine(job.parentEngine)
-  const notifyId = delegateNotifyId(job.id, job.callbackEpoch > 0 ? job.callbackEpoch : 1)
+    hooks.resolveParentEngine?.(current) ?? parseParentEngine(current.parentEngine)
+  const notifyId = delegateNotifyId(current.id, current.callbackEpoch > 0 ? current.callbackEpoch : 1)
   const silent =
     job.callbackState === 'skipped_silent' ||
     job.callback === 'none' ||
@@ -166,38 +168,52 @@ export async function dispatchJobTerminalNotify(
   })
 
   const live = store.snapshotOf(job.id) ?? job
-  const event = buildJobTerminalFromSnapshot(live, {
-    parentEngine,
-    parentNativeId: hooks.resolveNativeId?.(live),
-    goal: hooks.resolveGoal?.(live),
-    callbackOriginSessionKey: hooks.resolveCallbackOrigin?.(live),
-  })
-  if (!event) return { ok: false, failureClass: 'internal' }
-
   let deliveryToken: string | undefined
+  let claimedLive = live
+  let previouslyFailed = false
   if (owned) {
     const claimed = store.claimNotifyDelivery(job.id, fenceOf(live))
     if (!claimed.ok) return { skipped: true, reason: 'lost_claim' }
     deliveryToken = claimed.token
-    const token = claimed.token
+    claimedLive = claimed.snapshot
+  }
+
+  const event = buildJobTerminalFromSnapshot(claimedLive, {
+    parentEngine,
+    parentNativeId: hooks.resolveNativeId?.(claimedLive),
+    goal: hooks.resolveGoal?.(claimedLive),
+    callbackOriginSessionKey: hooks.resolveCallbackOrigin?.(claimedLive),
+  })
+  if (!event) {
+    if (owned && deliveryToken) {
+      store.releaseNotifyClaim(job.id, deliveryToken, fenceOf(claimedLive))
+    }
+    return { ok: false, failureClass: 'internal' }
+  }
+
+  if (owned && deliveryToken) {
+    const token = deliveryToken
     const fence: NotifyClaimFence = {
-      isLive: () => store.isNotifyClaimLive(live.id, token),
+      isLive: () => store.isNotifyClaimLive(claimedLive.id, token),
       ackDelivered: () => {
         try {
-          return store.completeNotifyDelivery(live.id, token, fenceOf(live))
+          return store.completeNotifyDelivery(claimedLive.id, token, fenceOf(claimedLive))
         } catch {
           return false
         }
       },
       markAAttempted: () => {
         try {
-          return store.markNotifyAAttempted(live.id, token, fenceOf(live))
+          return store.markNotifyAAttempted(claimedLive.id, token, fenceOf(claimedLive))
         } catch {
           return false
         }
       },
-      hasAAttempted: () => store.hasNotifyAAttempted(live.id),
-      aAttemptedAt: () => store.snapshotOf(live.id)?.notifyAAttemptedAt ?? undefined,
+      hasAAttempted: () => store.hasNotifyAAttempted(claimedLive.id),
+      aAttemptedAt: () => store.snapshotOf(claimedLive.id)?.notifyAAttemptedAt ?? undefined,
+      notePreviouslyFailed: () => {
+        previouslyFailed = true
+      },
     }
     Object.defineProperty(event, NOTIFY_CLAIM_FENCE, {
       value: fence,
@@ -253,11 +269,39 @@ export async function dispatchJobTerminalNotify(
   }
 
   if (owned && deliveryToken) {
-    if (!result.hold) {
-      store.releaseNotifyClaim(job.id, deliveryToken, fenceOf(live))
+    if (previouslyFailed) {
+      const release = store.releaseNotifyClaimWithEpochBump(job.id, deliveryToken, fenceOf(claimedLive))
+      if (release === 'bumped') {
+        const bumped = store.snapshotOf(job.id)
+        log.info('delegate notify bumped callback_epoch after previously_failed', {
+          jobId: claimedLive.id,
+          callback: claimedLive.callback,
+          previousEpoch: event.callbackEpoch,
+          nextEpoch: bumped?.callbackEpoch,
+          notifyAttempt: bumped?.notifyAttempt,
+        })
+      } else if (release === 'epoch_cap_reached') {
+        const latest = store.snapshotOf(job.id) ?? claimedLive
+        store.abandonNotify(latest.id, fenceOf(latest))
+        log.warn('delegate notify abandoned after previously_failed callback_epoch cap', {
+          jobId: latest.id,
+          callback: latest.callback,
+          callbackEpoch: latest.callbackEpoch,
+          maxCallbackEpoch: NOTIFY_MAX_CALLBACK_EPOCH,
+          notifyAttempt: latest.notifyAttempt,
+        })
+        const lane = (latest.notifyLane as NotifyLane | undefined) ?? preferred
+        const abandonedNotifyId = delegateNotifyId(
+          latest.id,
+          latest.callbackEpoch > 0 ? latest.callbackEpoch : 1,
+        )
+        return ackDelivered(store, store.snapshotOf(job.id) ?? latest, hooks, abandonedNotifyId, lane)
+      }
+    } else if (!result.hold) {
+      store.releaseNotifyClaim(job.id, deliveryToken, fenceOf(claimedLive))
     }
   } else if (owned) {
-    store.deferPendingNotify(job.id, fenceOf(live))
+    store.deferPendingNotify(job.id, fenceOf(claimedLive))
   }
   if (owned && !result.hold && store.shouldAbandonNotify(job.id)) {
     const latest = store.snapshotOf(job.id) ?? live

@@ -1,4 +1,7 @@
-import type { CronOriginFireResult } from './cronOriginSession.js'
+import {
+  ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE,
+  type CronOriginFireResult,
+} from './cronOriginSession.js'
 
 /** Shared with send_to_agent origin-inject: 12 attempts, 500ms → 5s. */
 export const ORIGIN_INJECT_RETRY_BUDGET = 12
@@ -31,7 +34,13 @@ export async function runBoundedOriginInjectBackoff(opts: {
     if (opts.isShuttingDown?.()) return { kind: 'fallback' }
     if (opts.shouldAbort?.()) return { kind: 'fallback' }
     const attempt = await opts.tryOnce()
-    if (attempt.kind === 'injected' || attempt.kind === 'fallback' || attempt.kind === 'terminal_failure') {
+    if (
+      attempt.kind === 'injected' ||
+      attempt.kind === 'fallback' ||
+      attempt.kind === 'terminal_failure' ||
+      (attempt.kind === 'retryable_failure' &&
+        attempt.code === ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE)
+    ) {
       return attempt
     }
     await sleep(delayMs)

@@ -13,6 +13,7 @@ import { after, before, describe, it } from 'node:test'
 
 import { CRON_ORIGIN_INJECT_PATH } from '@openclaude/protocol'
 
+import { ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE } from '../cronOriginSession.js'
 import { Gateway } from '../server.js'
 
 const PARENT_KEY = 'agent:main:webchat:dm:webtestparent0001'
@@ -24,6 +25,7 @@ type Seen = { path: string; auth: string | undefined; body: any }
 let server: Server
 let seen: Seen[] = []
 let nextStatus = 200
+let nextBody: unknown = undefined
 
 before(async () => {
   for (const k of ENV_KEYS) savedEnv[k] = process.env[k]
@@ -34,7 +36,7 @@ before(async () => {
       seen.push({ path: req.url ?? '', auth: req.headers.authorization, body: JSON.parse(raw) })
       res.statusCode = nextStatus
       res.setHeader('content-type', 'application/json')
-      res.end(JSON.stringify({ ok: nextStatus === 200 }))
+      res.end(JSON.stringify(nextBody !== undefined ? nextBody : { ok: nextStatus === 200 }))
     })
   })
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
@@ -130,6 +132,7 @@ describe('injectSendToAgentCallback → master admission', () => {
   it('maps 5xx to a retryable failure carrying the HTTP code', async () => {
     seen = []
     nextStatus = 503
+    nextBody = undefined
     const gw = makeGateway()
     const r = await gw.injectSendToAgentCallback({
       parentSessionKey: PARENT_KEY,
@@ -140,6 +143,37 @@ describe('injectSendToAgentCallback → master admission', () => {
       once: true,
     })
     assert.deepEqual(r, { kind: 'retryable_failure', code: 'HTTP_503' })
+  })
+
+  it('maps 503 previously_failed to ORIGIN_MESSAGE_PREVIOUSLY_FAILED and exits backoff after 1 try (OCV5-73)', async () => {
+    seen = []
+    nextStatus = 503
+    nextBody = {
+      error: {
+        code: 'INJECT_FAILED',
+        message: 'previously_failed',
+        request_id: 'req-pf-1',
+      },
+    }
+    try {
+      const gw = makeGateway()
+      const r = await gw.injectSendToAgentCallback({
+        parentSessionKey: PARENT_KEY,
+        jobId: 'dlgjob-pf',
+        agentId: 'x',
+        goal: 'g',
+        output: 'o',
+        clientMessageId: 'dlgcb-dlgjob-pf-1',
+        // Even without once:true, bounded backoff must NOT burn 12 tries on the same poisoned id
+      })
+      assert.deepEqual(r, {
+        kind: 'retryable_failure',
+        code: ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE,
+      })
+      assert.equal(seen.length, 1)
+    } finally {
+      nextBody = undefined
+    }
   })
 
   it('keeps the callback text under the master 32k body limit even with a huge goal', async () => {

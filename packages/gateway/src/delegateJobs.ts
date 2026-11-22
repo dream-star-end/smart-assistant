@@ -11,6 +11,7 @@
 import { randomBytes } from 'node:crypto'
 import {
   assertDelegateTransition,
+  delegateNotifyId,
   isDelegateTerminalState,
   type DelegateCallback,
   type DelegateCallbackState,
@@ -91,6 +92,13 @@ export const NOTIFY_RETRY_MAX_MS = 30_000
  */
 export const NOTIFY_ABANDON_MIN_ATTEMPTS = 48
 export const NOTIFY_ABANDON_AFTER_TERMINAL_MS = 24 * 60 * 60_000
+/**
+ * Max callback_epoch (inclusive) allowed when master rejects a callback
+ * clientMessageId as terminal `previously_failed` (OCV5-73). Epoch starts at 1,
+ * so cap=5 allows up to 4 epoch bumps (epochs 1..5) with exponential backoff
+ * before abandoning permanent failures.
+ */
+export const NOTIFY_MAX_CALLBACK_EPOCH = 5
 
 export function nextNotifyBackoffMs(attempt: number): number {
   const exp = Math.min(16, Math.max(0, Math.floor(attempt)))
@@ -1651,6 +1659,106 @@ export class DelegateJobStore {
     job.notifyAttempt = nextAttempt
     job.lastActivityAt = now
     return true
+  }
+
+  /**
+   * Release an active notify claim after master reported `previously_failed`
+   * for this epoch's `clientMessageId`, atomically bumping `callback_epoch`
+   * (bounded by `NOTIFY_MAX_CALLBACK_EPOCH`) and scheduling exponential backoff
+   * so the next retry mints a fresh `dlgcb-{jobId}-{epoch}` id without forming
+   * an infinite retry storm.
+   */
+  releaseNotifyClaimWithEpochBump(
+    jobId: string,
+    deliveryToken: string,
+    fence?: { claimToken: string; fencingEpoch: number },
+    opts?: { maxCallbackEpoch?: number },
+  ): 'bumped' | 'epoch_cap_reached' | 'stale' {
+    const job = this.refreshJob(jobId)
+    if (!job) return 'stale'
+    if (job.claimToken) {
+      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) {
+        return 'stale'
+      }
+    }
+    if (job.callbackState !== 'injecting' || job.notifyDeliveryToken !== deliveryToken) {
+      return 'stale'
+    }
+    const currentEpoch = job.callbackEpoch > 0 ? job.callbackEpoch : 1
+    const maxEpoch = Math.max(1, Math.floor(opts?.maxCallbackEpoch ?? NOTIFY_MAX_CALLBACK_EPOCH))
+    if (currentEpoch >= maxEpoch) {
+      return 'epoch_cap_reached'
+    }
+    const nextEpoch = currentEpoch + 1
+    const nextNotifyId = delegateNotifyId(job.id, nextEpoch)
+    const now = this.now()
+    const nextAttempt = (job.notifyAttempt ?? 0) + 1
+    const retryAt = now + nextNotifyBackoffMs(job.notifyAttempt ?? 0)
+    if (this.durable) {
+      const row = this.durable.casReleaseNotify({
+        jobId,
+        state: job.state,
+        fencingEpoch: job.fencingEpoch,
+        claimToken: job.claimToken ?? null,
+        deliveryToken,
+        now,
+        retryAt,
+        notifyAttempt: nextAttempt,
+        callbackEpoch: nextEpoch,
+        notifyId: nextNotifyId,
+      })
+      if (!row) {
+        this.refreshJob(jobId)
+        return 'stale'
+      }
+      this.ingestDurableRow(row)
+      return 'bumped'
+    }
+    job.callbackState = 'pending'
+    job.callbackEpoch = nextEpoch
+    job.notifyId = nextNotifyId
+    job.notifyDeliveryToken = undefined
+    job.notifyClaimedUntil = null
+    job.notifyRetryAt = retryAt
+    job.notifyAttempt = nextAttempt
+    job.lastActivityAt = now
+    return 'bumped'
+  }
+
+  /**
+   * Non-token bounded epoch bump for flag-off `owner === 'job'` paths that
+   * transition `injecting -> pending` without `claimNotifyDelivery`.
+   */
+  bumpCallbackEpochForRetry(
+    jobId: string,
+    fence?: { claimToken: string; fencingEpoch: number },
+    opts?: { maxCallbackEpoch?: number },
+  ): 'bumped' | 'epoch_cap_reached' | 'stale' {
+    const job = this.refreshJob(jobId)
+    if (!job) return 'stale'
+    if (job.claimToken) {
+      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) {
+        return 'stale'
+      }
+    }
+    if (job.callbackState !== 'injecting' && job.callbackState !== 'pending') {
+      return 'stale'
+    }
+    const currentEpoch = job.callbackEpoch > 0 ? job.callbackEpoch : 1
+    const maxEpoch = Math.max(1, Math.floor(opts?.maxCallbackEpoch ?? NOTIFY_MAX_CALLBACK_EPOCH))
+    if (currentEpoch >= maxEpoch) {
+      return 'epoch_cap_reached'
+    }
+    const nextEpoch = currentEpoch + 1
+    const now = this.now()
+    const draft = this.cloneEntry(job)
+    draft.callbackState = 'pending'
+    draft.callbackEpoch = nextEpoch
+    draft.notifyId = delegateNotifyId(job.id, nextEpoch)
+    draft.notifyAttempt = (job.notifyAttempt ?? 0) + 1
+    draft.notifyRetryAt = now + nextNotifyBackoffMs(job.notifyAttempt ?? 0)
+    draft.lastActivityAt = now
+    return this.commit(job, draft, false) ? 'bumped' : 'stale'
   }
 
   shouldAbandonNotify(jobId: string): boolean {

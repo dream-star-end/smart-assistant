@@ -390,6 +390,8 @@ export class DelegateDurableDb {
     this.casReleaseNotifyStmt = this.db.prepare(`
       UPDATE delegate_jobs SET
         callback_state='pending',
+        callback_epoch=COALESCE(@callback_epoch, callback_epoch),
+        notify_id=COALESCE(@notify_id, notify_id),
         notify_delivery_token=NULL,
         notify_claimed_until=NULL,
         notify_retry_at=@retry_at,
@@ -678,6 +680,8 @@ export class DelegateDurableDb {
     now: number
     retryAt: number
     notifyAttempt: number
+    callbackEpoch?: number
+    notifyId?: string
   }): DurableJobRecord | undefined {
     this.throwIfInjectedFailure()
     const row = this.casReleaseNotifyStmt.get({
@@ -689,6 +693,8 @@ export class DelegateDurableDb {
       now: args.now,
       retry_at: args.retryAt,
       notify_attempt: args.notifyAttempt,
+      callback_epoch: args.callbackEpoch ?? null,
+      notify_id: args.notifyId ?? null,
     }) as Record<string, unknown> | undefined
     return row ? fromRow(row) : undefined
   }

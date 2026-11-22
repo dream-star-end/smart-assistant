@@ -86,6 +86,7 @@ import { cronDelegateIdempotencyKey, delegateNotifyId } from '@openclaude/protoc
 import { isDelegateNotifierEffective, isDelegateSmEnabled } from './delegateSmFlag.js'
 import {
   DELEGATE_LEASE_HEARTBEAT_MS,
+  NOTIFY_MAX_CALLBACK_EPOCH,
   type DelegateJobStore,
 } from './delegateJobs.js'
 import {
@@ -99,6 +100,7 @@ import {
   buildCronOriginResumeText,
   CRON_CALLBACK_LEGACY_LANE,
   isLegacyCronOriginLane,
+  ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE,
   parseOriginWebchatSessionKey,
   type CronOriginFireResult,
 } from './cronOriginSession.js'
@@ -139,6 +141,8 @@ interface CronOccurrenceRecord {
   /** Fence captured at claimQueued for this occurrence; never re-read from the live job. */
   delegateClaimToken?: string
   delegateFencingEpoch?: number
+  /** OCV5-73: bounded callback_epoch bumped on master `previously_failed` for legacy origin-session leg. */
+  callbackEpoch?: number
 }
 
 export function classifyCronOccurrenceRecovery(
@@ -329,6 +333,8 @@ export interface CronRetryEntry {
 export interface CronDeliveryContext {
   dueMinuteKey: number
   deliveryId: string
+  /** OCV5-73: bounded callback epoch for origin-session clientMessageId minting. */
+  callbackEpoch?: number
 }
 
 export function cronDeliveryId(jobId: string, dueMinuteKey: number): string {
@@ -2189,7 +2195,48 @@ export class CronScheduler {
             projectMode: project.mode,
             boardProjectId: project.mode === 'fixed' ? project.boardProjectId : null,
           }
-          result = await this.onOriginSessionFire!(fireJob, deliveryContext)
+          const occForEpoch = readOccurrence(deliveryContext.deliveryId)
+          const currentCallbackEpoch =
+            typeof occForEpoch?.callbackEpoch === 'number' && occForEpoch.callbackEpoch > 1
+              ? Math.floor(occForEpoch.callbackEpoch)
+              : 1
+          const fireDeliveryContext: CronDeliveryContext =
+            currentCallbackEpoch > 1
+              ? { ...deliveryContext, callbackEpoch: currentCallbackEpoch }
+              : deliveryContext
+          result = await this.onOriginSessionFire!(fireJob, fireDeliveryContext)
+          if (
+            result.kind === 'retryable_failure' &&
+            result.code === ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE
+          ) {
+            if (currentCallbackEpoch >= NOTIFY_MAX_CALLBACK_EPOCH) {
+              logger.warn(`job ${job.id} origin-session previously_failed epoch cap reached`, {
+                jobId: job.id,
+                deliveryId: deliveryContext.deliveryId,
+                callbackEpoch: currentCallbackEpoch,
+                maxCallbackEpoch: NOTIFY_MAX_CALLBACK_EPOCH,
+              })
+              await this.notifyOriginSessionDropped(job, deliveryContext, 'exhausted')
+              return {
+                kind: 'terminal_failure',
+                code: 'ORIGIN_MESSAGE_PREVIOUSLY_FAILED_EXHAUSTED',
+              }
+            }
+            const nextEpoch = currentCallbackEpoch + 1
+            if (occForEpoch) {
+              writeOccurrence({
+                ...occForEpoch,
+                callbackEpoch: nextEpoch,
+                updatedAt: Date.now(),
+              })
+            }
+            logger.info(`job ${job.id} origin-session bumped callbackEpoch after previously_failed`, {
+              jobId: job.id,
+              deliveryId: deliveryContext.deliveryId,
+              previousEpoch: currentCallbackEpoch,
+              nextEpoch,
+            })
+          }
         }
       }
     } catch (err) {

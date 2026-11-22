@@ -19,13 +19,14 @@ interface Captured {
   init: { method?: string; headers?: Record<string, string>; body?: string }
 }
 
-function mockFetcher(captured: Captured[], statusCode = 200) {
+function mockFetcher(captured: Captured[], statusCode = 200, responseBody: unknown = {}) {
   return (async (url: string, init: any) => {
     captured.push({ url, init })
+    const raw = typeof responseBody === 'string' ? responseBody : JSON.stringify(responseBody)
     return {
       statusCode,
       headers: {},
-      body: Readable.from([Buffer.from('{}', 'utf8')]),
+      body: Readable.from([Buffer.from(raw, 'utf8')]),
     }
   }) as unknown as typeof import('undici').request
 }
@@ -81,5 +82,54 @@ describe('postCronOriginInject', () => {
       fetcher: mockFetcher([], 503),
     })
     assert.equal(r503.kind, 'retryable')
+  })
+
+  test('503 previously_failed 与 TURN_PREVIOUSLY_FAILED 映射 previously_failed，其余 503/409 保持原样 (OCV5-73)', async () => {
+    // Master makeCronOriginInjectHandler exact payload for admit.kind === "previously_failed"
+    const rMaster503 = await postCronOriginInject(PAYLOAD, {
+      config: CONFIG,
+      fetcher: mockFetcher([], 503, {
+        error: {
+          code: 'INJECT_FAILED',
+          message: 'previously_failed',
+          request_id: 'req-123',
+        },
+        userError: { code: 'unknown', message: 'internal' },
+      }),
+    })
+    assert.deepEqual(rMaster503, { kind: 'previously_failed' })
+
+    // Forward-compat dedicated error code on 409 or 503
+    const rCode409 = await postCronOriginInject(PAYLOAD, {
+      config: CONFIG,
+      fetcher: mockFetcher([], 409, {
+        error: { code: 'TURN_PREVIOUSLY_FAILED', message: 'terminal failed' },
+      }),
+    })
+    assert.deepEqual(rCode409, { kind: 'previously_failed' })
+
+    // Other 503 reasons MUST stay retryable (preserve same-epoch idempotency)
+    for (const body of [
+      { error: { code: 'NO_TRANSPORT', message: 'no attested container bridge' } },
+      { error: { code: 'INJECT_FAILED', message: 'delivery_unknown' } },
+      { error: { code: 'INJECT_FAILED', message: 'manual_hold' } },
+      { error: { code: 'INJECT_FAILED', message: 'dispatch_rejected' } },
+      'not-json',
+    ]) {
+      const r = await postCronOriginInject(PAYLOAD, {
+        config: CONFIG,
+        fetcher: mockFetcher([], 503, body),
+      })
+      assert.deepEqual(r, { kind: 'retryable', code: 'HTTP_503' })
+    }
+
+    // 409 TURN_IN_FLIGHT MUST stay in_flight (preserve same-epoch idempotency)
+    const rInFlight = await postCronOriginInject(PAYLOAD, {
+      config: CONFIG,
+      fetcher: mockFetcher([], 409, {
+        error: { code: 'TURN_IN_FLIGHT', message: 'origin session has another open turn' },
+      }),
+    })
+    assert.deepEqual(rInFlight, { kind: 'in_flight' })
   })
 })
