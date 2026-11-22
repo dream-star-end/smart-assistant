@@ -99,22 +99,34 @@ function assertFailClosed(protocol: 'ccb' | 'cursor', stdout: string, status: nu
   }
 }
 
-describe('engine hook command stays on the fail-open runner', () => {
-  it('CCB/Cursor commands point at the runner, not a copied regex, and Cursor is failClosed:false', () => {
-    const ccb = buildCcbEfficiencySettings('deny')
-    const pre = (ccb as { hooks: { PreToolUse: Array<{ hooks: Array<{ command: string; timeout: number }> }> } })
+describe('engine hook command config switches cleanly between efficiency-only and action-policy modes', () => {
+  it('efficiency-only mode keeps failClosed:false and 4s timeout; action-policy mode sets Cursor failClosed:true and 6s timeout (>5s runner max)', () => {
+    const ccbOff = buildCcbEfficiencySettings('deny', false)
+    const preOff = (ccbOff as { hooks: { PreToolUse: Array<{ hooks: Array<{ command: string; timeout: number }> }> } })
       .hooks.PreToolUse[0]
-    assert.match(pre.hooks[0].command, /efficiencyHookRunner\.cjs/)
-    assert.match(pre.hooks[0].command, /--protocol=ccb/)
-    assert.equal(pre.hooks[0].timeout, 4)
-    assert.doesNotMatch(pre.hooks[0].command, /sleep_ge_60|while true/)
+    assert.match(preOff.hooks[0].command, /efficiencyHookRunner\.cjs/)
+    assert.match(preOff.hooks[0].command, /--protocol=ccb/)
+    assert.equal(preOff.hooks[0].timeout, 4)
+    assert.doesNotMatch(preOff.hooks[0].command, /sleep_ge_60|while true/)
 
-    const hooks = buildCursorEfficiencyHooks('deny') as {
+    const hooksOff = buildCursorEfficiencyHooks('deny', false) as {
       hooks: { beforeShellExecution: Array<{ command: string; timeout: number; failClosed: boolean }> }
     }
-    assert.match(hooks.hooks.beforeShellExecution[0].command, /efficiencyHookRunner\.cjs/)
-    assert.equal(hooks.hooks.beforeShellExecution[0].failClosed, false)
-    assert.equal(hooks.hooks.beforeShellExecution[0].timeout, 4)
+    assert.match(hooksOff.hooks.beforeShellExecution[0].command, /efficiencyHookRunner\.cjs/)
+    assert.equal(hooksOff.hooks.beforeShellExecution[0].failClosed, false)
+    assert.equal(hooksOff.hooks.beforeShellExecution[0].timeout, 4)
+
+    const ccbOn = buildCcbEfficiencySettings('deny', true)
+    const preOn = (ccbOn as { hooks: { PreToolUse: Array<{ hooks: Array<{ command: string; timeout: number }> }> } })
+      .hooks.PreToolUse[0]
+    assert.equal(preOn.hooks[0].timeout, 6)
+
+    const hooksOn = buildCursorEfficiencyHooks('deny', true) as {
+      hooks: { beforeShellExecution: Array<{ command: string; timeout: number; failClosed: boolean }> }
+    }
+    assert.match(hooksOn.hooks.beforeShellExecution[0].command, /efficiencyHookRunner\.cjs/)
+    assert.equal(hooksOn.hooks.beforeShellExecution[0].failClosed, true)
+    assert.equal(hooksOn.hooks.beforeShellExecution[0].timeout, 6)
     assert.ok(resolveEfficiencyHookCommand('ccb', 'warn')?.includes('efficiencyHookRunner.cjs'))
   })
 })
@@ -290,13 +302,13 @@ describe('action-policy enabled (default / on): runner & inner faults NEVER fail
     assert.equal((strictCcb.hookSpecificOutput as { permissionDecision: string }).permissionDecision, 'deny')
   })
 
-  it('real runner + real inner hook fail-closed on invalid JSON stdin when policy enabled, fail-open when policy off', () => {
+  it('real runner + real inner hook fail-closed on invalid JSON and empty stdin when policy enabled, fail-open when policy off', () => {
     const distRunner = join(SRC_DIR, '../dist/efficiencyHookRunner.cjs')
     const runnerPath = existsSync(distRunner) ? distRunner : RUNNER
-    const runReal = (protocol: 'ccb' | 'cursor', actionPolicy?: string) =>
+    const runReal = (protocol: 'ccb' | 'cursor', input: string, actionPolicy?: string) =>
       spawnSync(process.execPath, [runnerPath, `--protocol=${protocol}`, '--mode=deny'], {
         encoding: 'utf8',
-        input: '{not-valid-json\n',
+        input,
         timeout: 8000,
         env: {
           ...process.env,
@@ -306,13 +318,23 @@ describe('action-policy enabled (default / on): runner & inner faults NEVER fail
         },
       })
 
-    const ccbOn = runReal('ccb', 'on')
-    assertFailClosed('ccb', ccbOn.stdout ?? '', ccbOn.status)
-    const cursorOn = runReal('cursor', 'on')
-    assertFailClosed('cursor', cursorOn.stdout ?? '', cursorOn.status)
+    // Invalid JSON stdin
+    const ccbInvalidOn = runReal('ccb', '{not-valid-json\n', 'on')
+    assertFailClosed('ccb', ccbInvalidOn.stdout ?? '', ccbInvalidOn.status)
+    const cursorInvalidOn = runReal('cursor', '{not-valid-json\n', 'on')
+    assertFailClosed('cursor', cursorInvalidOn.stdout ?? '', cursorInvalidOn.status)
+    const ccbInvalidOff = runReal('ccb', '{not-valid-json\n', 'off')
+    assertAllowed('ccb', ccbInvalidOff.stdout ?? '', ccbInvalidOff.status)
 
-    const ccbOff = runReal('ccb', 'off')
-    assertAllowed('ccb', ccbOff.stdout ?? '', ccbOff.status)
+    // Empty stdin (must NEVER silently fall back to {} -> allow when Action Policy is enabled)
+    const ccbEmptyOn = runReal('ccb', '', 'on')
+    assertFailClosed('ccb', ccbEmptyOn.stdout ?? '', ccbEmptyOn.status)
+    const cursorEmptyOn = runReal('cursor', '   \n', 'on')
+    assertFailClosed('cursor', cursorEmptyOn.stdout ?? '', cursorEmptyOn.status)
+    const ccbEmptyOff = runReal('ccb', '', 'off')
+    assertAllowed('ccb', ccbEmptyOff.stdout ?? '', ccbEmptyOff.status)
+    const cursorEmptyOff = runReal('cursor', '', 'off')
+    assertAllowed('cursor', cursorEmptyOff.stdout ?? '', cursorEmptyOff.status)
   })
 })
 

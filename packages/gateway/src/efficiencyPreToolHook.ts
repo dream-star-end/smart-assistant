@@ -252,23 +252,30 @@ export async function handlePreToolHookInput(
   const policyEnabled = options.actionPolicyEnabled ?? isActionPolicyEnabled()
   let policyEvaluatedCleanly = false
   try {
-    if (raw !== null && raw !== undefined && (typeof raw !== 'object' || Array.isArray(raw))) {
+    if (raw === null || raw === undefined || typeof raw !== 'object' || Array.isArray(raw)) {
       if (policyEnabled) {
         return formatActionPolicyFailClosed(
           protocol,
-          'Action policy received malformed hook payload; human confirmation required.',
+          'Action policy received empty or malformed hook payload; human confirmation required.',
         )
       }
       return formatAllow(protocol)
     }
 
-    const input = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+    const input = raw as Record<string, unknown>
     const command = extractShellCommand(input)
     const toolName = extractToolName(input)
     const hasActionablePayload =
       typeof input.tool_name === 'string' ||
       typeof input.tool === 'string' ||
       command.length > 0
+
+    if (policyEnabled && !hasActionablePayload) {
+      return formatActionPolicyFailClosed(
+        protocol,
+        'Action policy received empty hook event without tool or command; human confirmation required.',
+      )
+    }
 
     // Evaluate both action-policy and efficiency guard, then take the STRICTER decision:
     //   deny > ask (human_approval) > allow+warn > allow
@@ -391,17 +398,30 @@ async function main(): Promise<void> {
   }, resolveInnerTimeoutMs())
   try {
     let parsed: unknown = {}
-    let raw = ''
     try {
-      raw = (await readStdin()).trim()
-      parsed = raw ? JSON.parse(raw) : {}
-    } catch {
-      if (policyEnabled && raw.length > 0) {
+      const raw = (await readStdin()).trim()
+      if (!raw) {
+        if (policyEnabled) {
+          clearTimeout(timer)
+          writeJson(
+            formatActionPolicyFailClosed(
+              protocol,
+              'Action policy received empty stdin payload (fail-closed).',
+            ),
+          )
+          return
+        }
+        parsed = {}
+      } else {
+        parsed = JSON.parse(raw)
+      }
+    } catch (err) {
+      if (policyEnabled) {
         clearTimeout(timer)
         writeJson(
           formatActionPolicyFailClosed(
             protocol,
-            'Action policy received invalid JSON on stdin (fail-closed).',
+            `Action policy failed to read or parse stdin (fail-closed): ${err instanceof Error ? err.message : String(err)}`,
           ),
         )
         return

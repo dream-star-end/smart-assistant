@@ -123,14 +123,23 @@ describe('hook config injection (single policy source)', () => {
     assert.doesNotMatch(pre.hooks[0].command, /sleep_ge_60|while true/)
   })
 
-  it('Cursor hooks.json uses beforeShellExecution against the same script', () => {
-    const hooks = buildCursorEfficiencyHooks('deny') as {
+  it('Cursor hooks.json uses beforeShellExecution against the same script and toggles failClosed with action-policy', () => {
+    const hooksOn = buildCursorEfficiencyHooks('deny', true) as {
       version: number
-      hooks: { beforeShellExecution: Array<{ command: string }> }
+      hooks: { beforeShellExecution: Array<{ command: string; timeout: number; failClosed: boolean }> }
     }
-    assert.equal(hooks.version, 1)
-    assert.match(hooks.hooks.beforeShellExecution[0].command, /efficiencyHookRunner\.cjs/)
-    assert.match(hooks.hooks.beforeShellExecution[0].command, /--protocol=cursor/)
+    assert.equal(hooksOn.version, 1)
+    assert.match(hooksOn.hooks.beforeShellExecution[0].command, /efficiencyHookRunner\.cjs/)
+    assert.match(hooksOn.hooks.beforeShellExecution[0].command, /--protocol=cursor/)
+    assert.equal(hooksOn.hooks.beforeShellExecution[0].failClosed, true)
+    assert.equal(hooksOn.hooks.beforeShellExecution[0].timeout, 6)
+
+    const hooksOff = buildCursorEfficiencyHooks('deny', false) as {
+      version: number
+      hooks: { beforeShellExecution: Array<{ command: string; timeout: number; failClosed: boolean }> }
+    }
+    assert.equal(hooksOff.hooks.beforeShellExecution[0].failClosed, false)
+    assert.equal(hooksOff.hooks.beforeShellExecution[0].timeout, 4)
   })
 })
 
