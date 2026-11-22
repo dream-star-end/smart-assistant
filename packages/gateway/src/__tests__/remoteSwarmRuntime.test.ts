@@ -909,4 +909,120 @@ describe('RemoteSwarmRuntime & Admission (OCV5-835)', () => {
       await rt.shutdownAll()
     }
   })
+
+  it('OCV5-848 R2 fixes: swarm_wait preserves wake_mode, retry after ERROR clears stale failed status, and timeout board error rejects cleanly', async () => {
+    const rootBase = makeTempDir('oc-rswarm-r2-')
+    const ws = makeTempDir('oc-rswarm-r2-ws-')
+    let calls = 0
+    let releaseRetry!: () => void
+    const retryGate = new Promise<void>((r) => {
+      releaseRetry = r
+    })
+    const rt = new RemoteSwarmRuntime({
+      rootBase,
+      executor: {
+        async runWorkerTurn(input) {
+          calls += 1
+          if (calls === 1) {
+            // Worker calls swarm_wait(mentions_only:false) once and lets it time out
+            await rt.handleToolCall({
+              sessionKey: input.coordinatorSessionKey,
+              callerMember: input.workerName,
+              tool: 'swarm_wait',
+              args: { since: 99, mentions_only: false, timeout_ms: 1_000 },
+            })
+            throw new Error('transient upstream failure')
+          }
+          // Second turn (retry after ERROR): blocks before emitting any telemetry
+          await retryGate
+          return { text: 'retry ok' }
+        },
+        async releaseWorkerSession() {},
+      },
+    })
+    try {
+      const s = 'agent:main:webchat:dm:r2-fixes-test'
+      rt.registerSession({ sessionKey: s, model: 'antigravity-gemini-4-neon-remote', workspaceCwd: ws })
+      await rt.handleToolCall({
+        sessionKey: s,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'worker-a', brief: 'first run' },
+      })
+
+      // Wait for first turn (including 1s swarm_wait timeout + ERROR) to settle
+      const d1 = Date.now() + 4_000
+      while (Date.now() < d1) {
+        const st = (await rt.handleToolCall({
+          sessionKey: s,
+          callerMember: 'coordinator',
+          tool: 'swarm',
+          args: { action: 'status' },
+        })) as { members: Array<{ name: string; status: string }> }
+        if (calls === 1 && st.members.find((m) => m.name === 'worker-a')?.status === 'waiting') break
+        await new Promise((r) => setTimeout(r, 30))
+      }
+      assert.equal(calls, 1)
+
+      // 1) Unaddressed coordinator post must NOT re-wake worker-a (wake_mode remained 'mentions')
+      await rt.handleToolCall({
+        sessionKey: s,
+        callerMember: 'coordinator',
+        tool: 'post_message',
+        args: { text: '普通状态同步，未 @ 任何人' },
+      })
+      await new Promise((r) => setTimeout(r, 80))
+      assert.equal(calls, 1, 'mentions_only:false wait must not mutate persistent wake_mode to all')
+
+      // 2) Explicitly retry worker-a; while slow retry has emitted 0 telemetry yet,
+      //    previous turn's ERROR must NOT bleed into snapshot as failed/waiting
+      await rt.handleToolCall({
+        sessionKey: s,
+        callerMember: 'coordinator',
+        tool: 'post_message',
+        args: { text: '@worker-a 请重试一次' },
+      })
+      const d2 = Date.now() + 2_000
+      while (calls < 2 && Date.now() < d2) {
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      assert.equal(calls, 2)
+      const loc = rt.locationFor(s)
+      const watcher = new AntigravitySwarmWatcher({
+        brainDir: loc.brainDir,
+        conversationId: loc.swarmId,
+        onSnapshot: () => {},
+      })
+      watcher.start()
+      const snap = watcher.latestSnapshot()
+      watcher.stop()
+      const wSnap = snap?.members.find((m) => m.name === 'worker-a')
+      assert.ok(wSnap)
+      assert.equal(wSnap.status, 'working', 'healthy retry after prior ERROR must be working')
+      assert.equal(Boolean(wSnap.failed), false, 'stale ERROR from previous turn must not mark retry as failed')
+
+      // 3) Timeout path inside swarm_wait rejects cleanly if board.jsonl becomes a symlink mid-wait
+      const outside = join(ws, 'timeout-target.txt')
+      writeFileSync(outside, 'x\n', 'utf8')
+      const waitPromise = rt.handleToolCall({
+        sessionKey: s,
+        callerMember: 'coordinator',
+        tool: 'swarm_wait',
+        args: { since: 99, mentions_only: true, timeout_ms: 1_000 },
+      })
+      await new Promise((r) => setTimeout(r, 40))
+      rmSync(join(loc.swarmDir, 'board.jsonl'), { force: true })
+      symlinkSync(outside, join(loc.swarmDir, 'board.jsonl'))
+      // Keep event loop alive across the unref'd swarm_wait timeout timer in this isolated test.
+      const keepAlive = setTimeout(() => {}, 2_000)
+      try {
+        await assert.rejects(waitPromise, /SWARM_BOARD_SYMLINK_REJECTED/)
+      } finally {
+        clearTimeout(keepAlive)
+      }
+    } finally {
+      releaseRetry()
+      await rt.shutdownAll()
+    }
+  })
 })

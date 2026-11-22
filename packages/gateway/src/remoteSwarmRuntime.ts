@@ -27,13 +27,14 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   unlinkSync,
   writeFileSync,
   writeSync,
 } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { join, resolve, sep } from 'node:path'
 import {
   SWARM_MAX_CHANNELS,
   SWARM_MAX_MEMBERS,
@@ -118,7 +119,7 @@ export interface RemoteSwarmWorkerTurnInput {
 }
 
 export interface RemoteSwarmTelemetryEvent {
-  readonly type: 'PLANNER_RESPONSE' | 'TOOL_CALL' | 'ERROR'
+  readonly type: 'USER_INPUT' | 'PLANNER_RESPONSE' | 'TOOL_CALL' | 'ERROR'
   readonly status: 'ACTIVE' | 'DONE' | 'ERROR'
   readonly toolName?: string
   readonly toolArgs?: Record<string, unknown>
@@ -276,12 +277,28 @@ function atomicWriteJson(filePath: string, data: unknown): void {
   renameSync(tmpPath, filePath)
 }
 
-function assertSafeSwarmDir(swarmDir: string): { dev: number; ino: number } {
-  const st = lstatSync(swarmDir)
-  if (st.isSymbolicLink() || !st.isDirectory()) {
+function assertSafeSwarmDir(location: RemoteSwarmLocation): { dev: number; ino: number } {
+  const rootStat = lstatSync(location.brainDir)
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
     throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
   }
-  return { dev: st.dev, ino: st.ino }
+  const realRoot = realpathSync(location.brainDir)
+  let cur = location.brainDir
+  let lastStat = rootStat
+  for (const seg of [location.swarmId, '.system_generated', 'swarm']) {
+    cur = join(cur, seg)
+    const st = lstatSync(cur)
+    if (st.isSymbolicLink() || !st.isDirectory()) {
+      throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
+    }
+    lastStat = st
+  }
+  const realSwarm = realpathSync(cur)
+  const prefix = realRoot.endsWith(sep) ? realRoot : `${realRoot}${sep}`
+  if (!realSwarm.startsWith(prefix)) {
+    throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
+  }
+  return { dev: lastStat.dev, ino: lastStat.ino }
 }
 
 function appendBoardLineNoSymlink(swarmDir: string, line: string): void {
@@ -309,9 +326,10 @@ function appendBoardLineNoSymlink(swarmDir: string, line: string): void {
   }
 }
 
-function withBoardFileLock<T>(swarmDir: string, fn: () => T): T {
+function withBoardFileLock<T>(location: RemoteSwarmLocation, fn: () => T): T {
+  const swarmDir = location.swarmDir
   ensurePrivateDir(swarmDir)
-  const dirId = assertSafeSwarmDir(swarmDir)
+  const dirId = assertSafeSwarmDir(location)
   const lockPath = join(swarmDir, '.board.lock')
   const deadline = Date.now() + BOARD_LOCK_MAX_WAIT_MS
   let fd: number | null = null
@@ -349,7 +367,7 @@ function withBoardFileLock<T>(swarmDir: string, fn: () => T): T {
     }
   }
   try {
-    const afterId = assertSafeSwarmDir(swarmDir)
+    const afterId = assertSafeSwarmDir(location)
     if (afterId.dev !== dirId.dev || afterId.ino !== dirId.ino) {
       throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
     }
@@ -835,7 +853,7 @@ export class RemoteSwarmRuntime {
     },
   ): BoardPostRecord {
     const channel = (input.channel || 'main').trim() || 'main'
-    const post = withBoardFileLock(state.location.swarmDir, () => {
+    const post = withBoardFileLock(state.location, () => {
       const existing = readBoardPostsFromDisk(state.location.swarmDir)
       const headSeq = existing.reduce((max, p) => Math.max(max, p.seq), 0)
       const next: BoardPostRecord = {
@@ -1175,6 +1193,13 @@ export class RemoteSwarmRuntime {
           freshMember.phase = 'RUNNING'
           freshMember.last_read_seq = Math.max(freshMember.last_read_seq ?? 0, consumedSeq)
           this.saveRoster(state, freshRoster)
+          // Mark a new USER_INPUT turn boundary in transcript.jsonl so an ERROR
+          // from a previous failed attempt cannot bleed into this healthy retry.
+          rt.stepCounter += 1
+          this.appendTranscriptStep(state, freshMember.conversation_id, rt.stepCounter, {
+            type: 'USER_INPUT',
+            status: 'DONE',
+          })
 
           const digest = relevant
             .map((p) => `[#${p.seq} #${p.channel} ${p.agent}]: ${p.text}`)
@@ -1583,8 +1608,9 @@ export class RemoteSwarmRuntime {
       }
 
       if (roster.members[caller] && !roster.members[caller]!.killed) {
+        // Only update transient `phase` and `wait_since`; NEVER overwrite persistent
+        // `wake_mode` so a one-shot `mentions_only:false` wait cannot change future routing.
         roster.members[caller]!.phase = 'WAITING'
-        roster.members[caller]!.wake_mode = mentionsOnly ? 'mentions' : 'all'
         roster.members[caller]!.wait_since = since
         this.saveRoster(state, roster)
       }
@@ -1592,16 +1618,20 @@ export class RemoteSwarmRuntime {
       let waited: { woke: boolean; posts: BoardPostRecord[]; headSeq: number; reason: string }
       try {
         waited = await new Promise<{ woke: boolean; posts: BoardPostRecord[]; headSeq: number; reason: string }>(
-          (resolveWait) => {
+          (resolveWait, rejectWait) => {
             const timer = setTimeout(() => {
               state.waiters.delete(entry)
-              const cur = readBoardPostsFromDisk(state.location.swarmDir)
-              resolveWait({
-                woke: false,
-                posts: cur.filter((p) => p.seq > since),
-                headSeq: cur.reduce((m, p) => Math.max(m, p.seq), 0),
-                reason: 'timeout',
-              })
+              try {
+                const cur = readBoardPostsFromDisk(state.location.swarmDir)
+                resolveWait({
+                  woke: false,
+                  posts: cur.filter((p) => p.seq > since),
+                  headSeq: cur.reduce((m, p) => Math.max(m, p.seq), 0),
+                  reason: 'timeout',
+                })
+              } catch (err) {
+                rejectWait(err)
+              }
             }, timeoutMs)
             timer.unref?.()
             const entry: WaiterEntry = {
