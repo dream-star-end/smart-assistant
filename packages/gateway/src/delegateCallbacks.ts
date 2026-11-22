@@ -41,6 +41,7 @@ import {
 import { runBoundedOriginInjectBackoff } from './originInjectBackoff.js'
 import {
   persistSendToAgentIntent,
+  readSendToAgentIntent,
   recoverInterruptedSendToAgentIntents,
   removeSendToAgentIntent,
   type SendToAgentIntent,
@@ -268,12 +269,14 @@ export async function _ensureDurableSendToAgentCallback(
     const payload = callbackPayloadFromDurableJob(claim.snapshot)
     let settled = false
     try {
+      const persistedIntent = intent.goal ? null : await readSendToAgentIntent(job.id)
+      const effectiveGoal = intent.goal || persistedIntent?.goal || ''
       const result = await this.injectSendToAgentCallback({
         parentSessionKey: intent.originSessionKey,
         jobId: intent.jobId,
         agentId: intent.agentId,
-        goal: intent.goal,
-        userId: intent.userId,
+        goal: effectiveGoal,
+        userId: intent.userId ?? persistedIntent?.userId,
         output: payload.output,
         error: payload.error,
         clientMessageId: delegateCallbackMessageId(intent.jobId, claim.snapshot.callbackEpoch || 1),

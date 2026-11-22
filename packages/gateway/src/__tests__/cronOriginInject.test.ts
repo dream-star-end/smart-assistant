@@ -67,11 +67,12 @@ describe('postCronOriginInject', () => {
   })
 
   test('404/409/503 映射 gone / in_flight / retryable', async () => {
-    const r404 = await postCronOriginInject(PAYLOAD, {
+    // 404: ONLY complete read with explicit SESSION_GONE or exact empty body '' maps to gone
+    const r404Empty = await postCronOriginInject(PAYLOAD, {
       config: CONFIG,
-      fetcher: mockFetcher([], 404),
+      fetcher: mockFetcher([], 404, ''),
     })
-    assert.deepEqual(r404, { kind: 'gone' })
+    assert.deepEqual(r404Empty, { kind: 'gone' })
     const r404SessionGone = await postCronOriginInject(PAYLOAD, {
       config: CONFIG,
       fetcher: mockFetcher([], 404, {
@@ -79,13 +80,37 @@ describe('postCronOriginInject', () => {
       }),
     })
     assert.deepEqual(r404SessionGone, { kind: 'gone' })
-    const r404Other = await postCronOriginInject(PAYLOAD, {
+
+    // Non-empty 404 without SESSION_GONE (HTML, codeless JSON, wrong code, empty JSON object) → retryable
+    for (const body of [
+      '<html><body>404 Not Found</body></html>',
+      { message: 'route not found' },
+      { error: { code: 'NOT_FOUND', message: 'route missing' } },
+      {},
+      'x'.repeat(10_000),
+    ]) {
+      const r404Retry = await postCronOriginInject(PAYLOAD, {
+        config: CONFIG,
+        fetcher: mockFetcher([], 404, body),
+      })
+      assert.deepEqual(r404Retry, { kind: 'retryable', code: 'HTTP_404' })
+    }
+
+    // 404 whose body stream errors mid-read → retryable (never treat incomplete body as gone)
+    const brokenBodyFetcher = (async () => ({
+      statusCode: 404,
+      headers: {},
+      body: (async function* () {
+        yield Buffer.from('{"error":{"code":"SESSION', 'utf8')
+        throw new Error('aborted stream')
+      })(),
+    })) as unknown as typeof import('undici').request
+    const r404ReadErr = await postCronOriginInject(PAYLOAD, {
       config: CONFIG,
-      fetcher: mockFetcher([], 404, {
-        error: { code: 'NOT_FOUND', message: 'route missing' },
-      }),
+      fetcher: brokenBodyFetcher,
     })
-    assert.deepEqual(r404Other, { kind: 'retryable', code: 'HTTP_404' })
+    assert.deepEqual(r404ReadErr, { kind: 'retryable', code: 'HTTP_404' })
+
     const r409 = await postCronOriginInject(PAYLOAD, {
       config: CONFIG,
       fetcher: mockFetcher([], 409),

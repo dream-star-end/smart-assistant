@@ -116,31 +116,48 @@ export async function postCronOriginInject(
     })
     const chunks: Buffer[] = []
     let capturedBytes = 0
+    let bodyReadComplete = true
+    let bodyTruncated = false
     const shouldCapture = res.statusCode !== 200 && res.statusCode !== 409
     try {
       for await (const chunk of res.body) {
-        if (shouldCapture && capturedBytes < MAX_ERROR_BODY_BYTES) {
+        if (shouldCapture) {
           const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-          const remaining = MAX_ERROR_BODY_BYTES - capturedBytes
-          chunks.push(buf.length <= remaining ? buf : buf.subarray(0, remaining))
-          capturedBytes += Math.min(buf.length, remaining)
+          if (capturedBytes < MAX_ERROR_BODY_BYTES) {
+            const remaining = MAX_ERROR_BODY_BYTES - capturedBytes
+            if (buf.length > remaining) bodyTruncated = true
+            chunks.push(buf.length <= remaining ? buf : buf.subarray(0, remaining))
+            capturedBytes += Math.min(buf.length, remaining)
+          } else if (buf.length > 0) {
+            bodyTruncated = true
+          }
         }
       }
     } catch {
-      // ignore drain
+      bodyReadComplete = false
     }
     if (res.statusCode === 200) return { kind: 'injected' }
     if (res.statusCode === 404) {
-      const errorInfo = parseCronOriginInjectErrorBody(chunks)
-      if (errorInfo?.code && errorInfo.code !== CRON_ORIGIN_SESSION_GONE_CODE) {
-        log.warn('cron-origin-inject 404 with non-SESSION_GONE code', {
+      if (!bodyReadComplete || bodyTruncated) {
+        log.warn('cron-origin-inject 404 body incomplete; treating as retryable', {
           status: res.statusCode,
-          code: errorInfo.code,
-          ...(errorInfo.message ? { message: errorInfo.message } : {}),
+          bodyReadComplete,
+          bodyTruncated,
         })
         return { kind: 'retryable', code: `HTTP_${res.statusCode}` }
       }
-      return { kind: 'gone' }
+      const rawBody = Buffer.concat(chunks).toString('utf8')
+      if (rawBody === '') return { kind: 'gone' }
+      const errorInfo = parseCronOriginInjectErrorBody(chunks)
+      if (errorInfo?.code === CRON_ORIGIN_SESSION_GONE_CODE) {
+        return { kind: 'gone' }
+      }
+      log.warn('cron-origin-inject 404 without SESSION_GONE code; treating as retryable', {
+        status: res.statusCode,
+        ...(errorInfo?.code ? { code: errorInfo.code } : {}),
+        ...(errorInfo?.message ? { message: errorInfo.message } : {}),
+      })
+      return { kind: 'retryable', code: `HTTP_${res.statusCode}` }
     }
     if (res.statusCode === 409) return { kind: 'in_flight' }
     const errorInfo = parseCronOriginInjectErrorBody(chunks)

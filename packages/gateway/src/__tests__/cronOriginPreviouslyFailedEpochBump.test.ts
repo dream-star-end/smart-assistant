@@ -1136,6 +1136,143 @@ describe('OCV5-73: cron-origin-inject previously_failed bounded callback_epoch b
     }
   })
 
+  it('T2 P1 (owner=job, NOTIFIER=0): restart restores persisted intent goal so retry preserves identical text/requestHash without immutable_conflict', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ocv5-73-restart-goal-'))
+    const dbPath = join(dir, 'delegate.db')
+    const intentDir = join(dir, 'intents')
+    process.env.OC_DELEGATE_SM = '1'
+    process.env.OC_DELEGATE_DURABLE = '1'
+    process.env.OC_DELEGATE_NOTIFIER = '0'
+    process.env.OC_DELEGATE_CALLBACK_OWNER = 'job'
+    process.env.OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR = intentDir
+    let now = 1_700_000_800_000
+    receivedIds = []
+    const receivedTexts: string[] = []
+    const expectedTextById = new Map<string, string>()
+    let store1: DelegateJobStore | undefined
+    let store2: DelegateJobStore | undefined
+    let host1: any
+    let host2: any
+    try {
+      store1 = new DelegateJobStore({
+        sm: true,
+        durable: new DelegateDurableDb(dbPath),
+        now: () => now,
+      })
+      const { jobId } = createTerminalSendToAgentJob(store1)
+      const originalGoal = '核验重启后目标正文与请求哈希一致'
+      const savedIntent = {
+        v: 1 as const,
+        jobId,
+        originSessionKey: ORIGIN_KEY,
+        userId: '3',
+        agentId: 'research-assistant',
+        goal: originalGoal,
+        createdAt: now,
+      }
+      await persistSendToAgentIntent(savedIntent)
+
+      const gw1 = makeGatewayForOriginInject() as any
+      host1 = {
+        _shuttingDown: false,
+        _delegateJobs: store1,
+        _activeSendToAgentCallbacks: new Map([[jobId, savedIntent]]),
+        _armNotifyRetryScheduler: () => {},
+        sessions: { getByKey: () => ({ userId: '3' }) },
+        log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+        injectSendToAgentCallback: gw1.injectSendToAgentCallback.bind(gw1),
+      }
+      host1._ensureDurableSendToAgentCallback = _ensureDurableSendToAgentCallback.bind(host1)
+
+      let epoch1Calls = 0
+      masterResponder = (clientMessageId, body) => {
+        receivedTexts.push(body.text)
+        const prev = expectedTextById.get(clientMessageId)
+        if (prev !== undefined && prev !== body.text) {
+          return {
+            status: 503,
+            body: {
+              error: {
+                code: 'INJECT_FAILED',
+                message: 'immutable_conflict',
+                request_id: 'req-immutable-conflict',
+              },
+            },
+          }
+        }
+        expectedTextById.set(clientMessageId, body.text)
+        if (clientMessageId === delegateCallbackMessageId(jobId, 1)) {
+          epoch1Calls += 1
+          return epoch1Calls === 1
+            ? { status: 503, body: { error: { code: 'NO_TRANSPORT', message: 'bridge down' } } }
+            : UNEXECUTED_503_REPLY
+        }
+        return { status: 200, body: { ok: true, requestId: 'req-epoch2-ok' } }
+      }
+
+      // 1) Pre-restart attempt 1 (epoch 1) fails transiently with NO_TRANSPORT
+      const ok1 = await host1._ensureDurableSendToAgentCallback(store1.snapshotOf(jobId), savedIntent)
+      assert.equal(ok1, false)
+      assert.equal(store1.snapshotOf(jobId)?.callbackEpoch, 1)
+      assert.equal(store1.snapshotOf(jobId)?.callbackState, 'pending')
+      assert.ok(receivedTexts[0]!.includes(originalGoal))
+      host1._shuttingDown = true
+      store1.close()
+      store1 = undefined
+
+      // 2) Restart: empty in-memory _activeSendToAgentCallbacks; advance past backoff and run timer retry
+      now += nextNotifyBackoffMs(0) + 1
+      store2 = new DelegateJobStore({
+        sm: true,
+        durable: new DelegateDurableDb(dbPath),
+        now: () => now,
+      })
+      const gw2 = makeGatewayForOriginInject() as any
+      host2 = {
+        _shuttingDown: false,
+        _delegateJobs: store2,
+        _activeSendToAgentCallbacks: new Map(), // empty after restart!
+        _armNotifyRetryScheduler: () => {},
+        sessions: { getByKey: () => ({ userId: '3' }) },
+        log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+        injectSendToAgentCallback: gw2.injectSendToAgentCallback.bind(gw2),
+      }
+      host2._ensureDurableSendToAgentCallback = _ensureDurableSendToAgentCallback.bind(host2)
+
+      // Post-restart retry on epoch 1: must reconstruct byte-identical text (no immutable_conflict!),
+      // receive PREVIOUSLY_FAILED_UNEXECUTED, and bump epoch 1 -> 2.
+      await retryHandedOffDelegateNotifies(host2)
+      assert.equal(receivedTexts.length, 2)
+      assert.equal(
+        receivedTexts[1],
+        receivedTexts[0],
+        'post-restart retry must preserve exact goal/text so requestHash matches epoch 1',
+      )
+      assert.equal(store2.snapshotOf(jobId)?.callbackEpoch, 2)
+      assert.equal(store2.snapshotOf(jobId)?.callbackState, 'pending')
+
+      // Advance past epoch 2 backoff -> delivers epoch 2 with the exact same goal text!
+      now = (store2.snapshotOf(jobId)?.notifyRetryAt ?? now) + 1
+      await retryHandedOffDelegateNotifies(host2)
+      assert.equal(receivedTexts.length, 3)
+      assert.equal(receivedTexts[2], receivedTexts[0])
+      assert.equal(store2.snapshotOf(jobId)?.callbackState, 'delivered')
+      assert.equal(store2.snapshotOf(jobId)?.callbackEpoch, 2)
+      assert.deepEqual(await readdir(intentDir), [])
+      assert.deepEqual(receivedIds, [
+        delegateCallbackMessageId(jobId, 1),
+        delegateCallbackMessageId(jobId, 1),
+        delegateCallbackMessageId(jobId, 2),
+      ])
+    } finally {
+      if (host1) host1._shuttingDown = true
+      if (host2) host2._shuttingDown = true
+      store1?.close()
+      store2?.close()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   it('runBoundedOriginInjectBackoff exits immediately on ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE', async () => {
     let tries = 0
     let sleeps = 0

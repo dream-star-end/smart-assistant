@@ -7,6 +7,7 @@ import type { DelegateRuntimeHost } from './delegateRuntime.js'
 import type { DelegateCallbacksHost } from './delegateCallbacks.js'
 import type { DelegateJobStore } from './delegateJobs.js'
 import { resolveDelegateCallbackOwner } from './delegateSmFlag.js'
+import { readSendToAgentIntent } from './sendToAgentIntentStore.js'
 
 type HandoffRetryHost = Pick<DelegateCallbacksHost,
   '_delegateJobs' | '_activeSendToAgentCallbacks' | '_ensureDurableSendToAgentCallback' | 'log'>
@@ -32,18 +33,20 @@ export async function retryHandedOffDelegateNotifies(host: HandoffRetryHost): Pr
   const jobs = host._delegateJobs?.listDueNotify() ?? []
   for (const job of jobs) {
     if (!isFlagOffJobOwnedOriginInject(job, owner)) continue
-    const originSessionKey = job.callbackOriginSessionKey ?? job.parentSessionKey
-    if (!originSessionKey) continue
     const active = host._activeSendToAgentCallbacks?.get(job.id)
+    const persisted = active?.goal ? null : await readSendToAgentIntent(job.id)
+    const originSessionKey =
+      job.callbackOriginSessionKey ?? persisted?.originSessionKey ?? job.parentSessionKey
+    if (!originSessionKey) continue
     try {
       await host._ensureDurableSendToAgentCallback(job, {
         v: 1,
         jobId: job.id,
         originSessionKey,
-        userId: job.callbackOriginUserId ?? active?.userId,
-        agentId: job.agentId,
-        goal: active?.goal ?? '',
-        createdAt: job.createdAt ?? Date.now(),
+        userId: job.callbackOriginUserId ?? active?.userId ?? persisted?.userId,
+        agentId: persisted?.agentId ?? job.agentId,
+        goal: active?.goal || persisted?.goal || '',
+        createdAt: persisted?.createdAt ?? job.createdAt ?? Date.now(),
       })
     } catch (err) {
       host.log.warn('delegate handoff callback retry failed', { jobId: job.id }, err as Error)

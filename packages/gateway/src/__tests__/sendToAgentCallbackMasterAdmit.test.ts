@@ -117,16 +117,32 @@ describe('injectSendToAgentCallback → master admission', () => {
   it('maps 404 (session gone) to fallback', async () => {
     seen = []
     nextStatus = 404
-    const gw = makeGateway()
-    const r = await gw.injectSendToAgentCallback({
-      parentSessionKey: PARENT_KEY,
-      jobId: 'dlgjob-gone',
-      agentId: 'x',
-      goal: 'g',
-      output: 'o',
-      once: true,
-    })
-    assert.deepEqual(r, { kind: 'fallback' })
+    nextBody = { error: { code: 'SESSION_GONE', message: 'origin session missing or deleted' } }
+    try {
+      const gw = makeGateway()
+      const r = await gw.injectSendToAgentCallback({
+        parentSessionKey: PARENT_KEY,
+        jobId: 'dlgjob-gone',
+        agentId: 'x',
+        goal: 'g',
+        output: 'o',
+        once: true,
+      })
+      assert.deepEqual(r, { kind: 'fallback' })
+
+      nextBody = { message: 'route not found' }
+      const rNonSession404 = await gw.injectSendToAgentCallback({
+        parentSessionKey: PARENT_KEY,
+        jobId: 'dlgjob-route-404',
+        agentId: 'x',
+        goal: 'g',
+        output: 'o',
+        once: true,
+      })
+      assert.deepEqual(rNonSession404, { kind: 'retryable_failure', code: 'HTTP_404' })
+    } finally {
+      nextBody = undefined
+    }
   })
 
   it('maps 5xx to a retryable failure carrying the HTTP code', async () => {
