@@ -16,7 +16,7 @@ type HandoffRetryHost = Pick<DelegateCallbacksHost,
 export function handedOffDelegateRetryDelay(
   store: DelegateJobStore,
   now = Date.now(),
-  env: NodeJS.ProcessEnv = process.env,
+  env?: NodeJS.ProcessEnv,
 ): number | undefined {
   const owner = resolveDelegateCallbackOwner(env)
   const jobs = store

@@ -84,10 +84,7 @@ import {
 } from './delegateCronIdempotency.js'
 import { cronDelegateIdempotencyKey, delegateNotifyId } from '@openclaude/protocol'
 import { isDelegateNotifierEffective, isDelegateSmEnabled } from './delegateSmFlag.js'
-import {
-  DELEGATE_LEASE_HEARTBEAT_MS,
-  type DelegateJobStore,
-} from './delegateJobs.js'
+import { DELEGATE_LEASE_HEARTBEAT_MS, NOTIFY_MAX_CALLBACK_EPOCH, type DelegateJobStore } from './delegateJobs.js'
 import { fireCronOriginWithEpochBump } from './cronOriginEpochHelper.js'
 import {
   postCronIndex,
@@ -2183,7 +2180,7 @@ export class CronScheduler {
         await resolveRuntimeExecutionAgent({ id: job.agent })
         if (useLegacyLeg && dlgJobId) this.stampLegacyCronGeneration(dlgJobId)
         result = await fireCronOriginWithEpochBump({
-          useLegacyLeg, job, project, deliveryContext, readOccurrence, writeOccurrence,
+          useLegacyLeg, maxCallbackEpoch: NOTIFY_MAX_CALLBACK_EPOCH, job, project, deliveryContext, readOccurrence, writeOccurrence,
           onOriginSessionFire: (j, c) => this.onOriginSessionFire!(j, c),
           notifyOriginSessionDropped: (j, c, r) => this.notifyOriginSessionDropped(j, c, r),
           logger,

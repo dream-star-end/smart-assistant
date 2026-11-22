@@ -57,7 +57,7 @@ export async function removeSendToAgentIntent(
 
 export async function readSendToAgentIntent(
   jobId: string,
-  env: NodeJS.ProcessEnv = process.env,
+  env?: NodeJS.ProcessEnv,
 ): Promise<SendToAgentIntent | null> {
   let path: string
   try {

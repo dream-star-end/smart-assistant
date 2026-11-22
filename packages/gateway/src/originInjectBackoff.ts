@@ -1,7 +1,11 @@
-import {
-  ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE,
-  type CronOriginFireResult,
-} from './cronOriginSession.js'
+import type { CronOriginFireResult } from './cronOriginSession.js'
+
+/**
+ * Master `/internal/v3/cron-origin-inject` reported proven-unexecuted
+ * `previously_failed` for this `clientMessageId`; callers must bump
+ * `callback_epoch` (bounded) to mint a fresh `clientMessageId`.
+ */
+export const ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE = 'ORIGIN_MESSAGE_PREVIOUSLY_FAILED'
 
 /** Shared with send_to_agent origin-inject: 12 attempts, 500ms → 5s. */
 export const ORIGIN_INJECT_RETRY_BUDGET = 12

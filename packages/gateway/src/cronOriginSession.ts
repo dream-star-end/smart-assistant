@@ -20,13 +20,8 @@ export type CronOriginFireResult =
   | { kind: 'retryable_failure'; code: string }
   | { kind: 'terminal_failure'; code: string }
 
-/**
- * Master `/internal/v3/cron-origin-inject` reported `previously_failed` for
- * this `clientMessageId` (terminal non-completed `turn_dispatches` row).
- * Reusing the same id will always 503; callers must bump `callback_epoch`
- * (bounded) to mint a fresh `clientMessageId`.
- */
-export const ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE = 'ORIGIN_MESSAGE_PREVIOUSLY_FAILED'
+import { ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE } from './originInjectBackoff.js'
+export { ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE }
 
 export type OriginWebchatSession = {
   sessionKey: string

@@ -47,7 +47,7 @@ import {
 import { resolveParentTapeIngestState, type ParentTapeIngestState } from './delegateNotifyTape.js'
 import { delayUntilNextNotifyRetry } from './delegateNotifyDispatch.js'
 import { formatJobTerminalMarkdown, injectPayloadFromJobTerminal } from './jobTerminal.js'
-import { ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE } from './cronOriginSession.js'
+const ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE = 'ORIGIN_MESSAGE_PREVIOUSLY_FAILED'
 import { delegateCallbackMessageId, restoreDelegateJobSnapshots } from './delegateCompleter.js'
 import { eventBus } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'

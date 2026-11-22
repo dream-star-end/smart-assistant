@@ -3,7 +3,6 @@ import {
   parseOriginWebchatSessionKey,
   type CronOriginFireResult,
 } from './cronOriginSession.js'
-import { NOTIFY_MAX_CALLBACK_EPOCH } from './delegateJobsNotifyOps.js'
 
 export interface CronOriginEpochOccurrence {
   callbackEpoch?: number
@@ -22,6 +21,7 @@ export interface FireCronOriginWithEpochBumpParams<
   TCtx extends CronOriginEpochDeliveryContext,
 > {
   useLegacyLeg: boolean
+  maxCallbackEpoch: number
   job: TJob
   project: { mode: TJob['projectMode']; boardProjectId: string | null }
   deliveryContext: TCtx
@@ -59,7 +59,7 @@ export async function fireCronOriginWithEpochBump<
   const fireCtx: TCtx = curEpoch > 1 ? { ...deliveryContext, callbackEpoch: curEpoch } : deliveryContext
   const result = await params.onOriginSessionFire(fireJob, fireCtx)
   if (result.kind === 'retryable_failure' && result.code === ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE) {
-    if (curEpoch >= NOTIFY_MAX_CALLBACK_EPOCH) {
+    if (curEpoch >= params.maxCallbackEpoch) {
       params.logger.warn(`job ${job.id} origin-session previously_failed epoch cap reached`, {
         jobId: job.id,
         deliveryId: deliveryContext.deliveryId,

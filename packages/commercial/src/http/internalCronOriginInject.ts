@@ -18,14 +18,13 @@ import {
   type ContainerIdentityRepo,
 } from "../auth/containerIdentity.js";
 import { rootLogger, type Logger } from "../logging/logger.js";
-import {
-  CRON_ORIGIN_PREVIOUSLY_FAILED_UNEXECUTED_CODE,
-  CRON_ORIGIN_PREVIOUSLY_FAILED_UNEXECUTED_REASON,
-} from "../ws/cronOriginInject.js";
 import type {
   CronOriginInjectInput,
   CronOriginInjectResult,
 } from "../ws/userChatBridge.js";
+
+const CRON_ORIGIN_PREVIOUSLY_FAILED_UNEXECUTED_CODE = "PREVIOUSLY_FAILED_UNEXECUTED";
+const CRON_ORIGIN_PREVIOUSLY_FAILED_UNEXECUTED_REASON = "previously_failed_unexecuted";
 import {
   HttpError,
   REQUEST_ID_HEADER,
