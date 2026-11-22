@@ -16,7 +16,7 @@ import { type OpenClaudeConfig, readAgentsConfig, readConfig } from '@openclaude
 /** Resolve effective gateway listen port honoring OPENCLAUDE_GATEWAY_PORT override (dual-slot A=18791/B=18795). */
 export function resolveEffectiveGatewayPort(
   configPort: number,
-  env: NodeJS.ProcessEnv = process.env,
+  env: Readonly<Record<string, string | undefined>>,
 ): number {
   const trimmed = String(env.OPENCLAUDE_GATEWAY_PORT ?? '').trim()
   if (!trimmed || !/^[0-9]+$/.test(trimmed)) return configPort
@@ -130,9 +130,9 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
     ? resolve(here, '../../../web-react/dist')
     : resolve(here, '../../../web/public')
   let webAssetsPool: string | undefined
+  // 静态与商业端口 env 决策共用这一次读取。
+  const v5WebEnv = process.env
   if (isV5Channel) {
-    // v5 静态面的两个 env 决策共用这一次读取。
-    const v5WebEnv = process.env
     const decision = resolveV5WebRoot({
       releaseDist: webRoot,
       releaseRoot: resolve(here, '../../../..'),
@@ -166,7 +166,7 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
         webDistDir: staticMode === 'spa' ? webRoot : undefined,
         // 双 slot 的 gateway.port 不同(A=18791/B=18795,经 OPENCLAUDE_GATEWAY_PORT 覆盖)。
         // Quick Tunnel 必须回源到当前进程的实际监听端口,不能由 commercial 侧猜 slot。
-        gatewayPort: resolveEffectiveGatewayPort(config.gateway.port),
+        gatewayPort: resolveEffectiveGatewayPort(config.gateway.port, v5WebEnv),
       })
       console.log('[cli] commercial module registered (v3 mode)')
     } catch (err) {

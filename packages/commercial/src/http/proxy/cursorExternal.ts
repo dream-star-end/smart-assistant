@@ -49,7 +49,7 @@ import type { Logger } from "../../logging/logger.js";
 import {
   defaultCutoverInFlightTracker,
   rejectIfCutoverFencing,
-} from "../../deploy/cutoverReadiness.js";
+} from "../../logging/cutoverInFlight.js";
 import type { ProxyIdentity } from "../../auth/proxyIdentity.js";
 import { AuthzDeniedError, AuthzLoadError } from "../../auth/proxyIdentity.js";
 import type { ModelPricing, PricingCache } from "../../billing/pricing.js";

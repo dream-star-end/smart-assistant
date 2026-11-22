@@ -26,7 +26,7 @@ import {
   parseChatGptProxyUsername,
 } from '@openclaude/protocol/chatgptProxy'
 
-import { defaultCutoverInFlightTracker } from '../deploy/cutoverReadiness.js'
+import { defaultCutoverInFlightTracker } from '../logging/cutoverInFlight.js'
 import type { Logger } from '../logging/logger.js'
 
 const MAX_TUNNELS_PER_USER = 64

@@ -19,7 +19,7 @@ import {
   type ContainerIdentityRepo,
   verifyContainerIdentity,
 } from '../auth/containerIdentity.js'
-import { rejectIfCutoverFencing } from '../deploy/cutoverReadiness.js'
+import { rejectIfCutoverFencing } from '../logging/cutoverInFlight.js'
 import { REQUEST_ID_HEADER, ensureRequestId, sendJson, setSecurityHeaders } from '../http/util.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
 import { readBodyBuffer } from './bridgeHttp.js'

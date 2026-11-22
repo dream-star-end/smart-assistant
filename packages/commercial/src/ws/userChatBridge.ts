@@ -249,7 +249,7 @@ import {
   releaseRecoveryForTransportWait,
   type ClaimedRecoveryJob,
 } from "../dispatch/turnRecoveryStore.js";
-import { defaultCutoverInFlightTracker } from "../deploy/cutoverReadiness.js";
+import { defaultCutoverInFlightTracker } from "../logging/cutoverInFlight.js";
 import type {
   AdmitUserTurnInput,
   AdmitUserTurnResult,

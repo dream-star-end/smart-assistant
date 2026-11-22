@@ -35,7 +35,7 @@ import {
   runBoxExecVideoJob,
 } from './boxExecVideo.js'
 
-import { defaultCutoverInFlightTracker } from '../deploy/cutoverReadiness.js'
+import { defaultCutoverInFlightTracker } from '../logging/cutoverInFlight.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
 import {
   MUSE_BACKGROUND_TTL_MS,

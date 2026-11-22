@@ -19,9 +19,9 @@ export const DEFAULT_REMOTE_V4_DRAIN_SOCKET = '/run/openclaude-v5-selfhost/remot
 
 /** Resolve the per-slot drain socket path from OC_REMOTE_V4_DRAIN_SOCKET, falling back to the legacy default. */
 export function resolveRemoteV4DrainSocketPath(
-  env: Readonly<Record<string, string | undefined>> = process.env,
+  env?: Readonly<Record<string, string | undefined>>,
 ): string {
-  const raw = env.OC_REMOTE_V4_DRAIN_SOCKET?.trim()
+  const raw = env?.OC_REMOTE_V4_DRAIN_SOCKET?.trim()
   if (!raw || raw === 'none') return DEFAULT_REMOTE_V4_DRAIN_SOCKET
   return raw
 }
