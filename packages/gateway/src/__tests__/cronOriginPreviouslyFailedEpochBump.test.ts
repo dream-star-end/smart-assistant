@@ -1,7 +1,8 @@
 /**
- * OCV5-73: `cron-origin-inject` 遇 `previously_failed` (503) 应让容器 bounded bump
- * `callback_epoch` 铸造新 `clientMessageId` 重发，同时保持 `delivered` / `in_flight` /
- * `accepted` / `NO_TRANSPORT` / `delivery_unknown` 同 epoch 幂等去重，且受最大 epoch 上限约束。
+ * OCV5-73: `cron-origin-inject` 遇 Master 权威证明未执行的 `503 PREVIOUSLY_FAILED_UNEXECUTED`
+ * 时，容器以 delivery-token 围栏原子 CAS 有限次 bump `callback_epoch` 铸造新 `clientMessageId`
+ * 重发；泛化 503 (`executed_error`/恢复占位/有账/旧版 Master)、409 `in_flight`、200 `delivered`/
+ * `deduplicated`/`accepted` 绝不 bump；达上限原子 CAS 熔断；flag-off `send_to_agent` 正常调度重试。
  *
  * Run: npx tsx --test packages/gateway/src/__tests__/cronOriginPreviouslyFailedEpochBump.test.ts
  */
@@ -11,6 +12,7 @@ import { type Server, createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
+import { setTimeout as delay } from 'node:timers/promises'
 
 import {
   CRON_ORIGIN_INJECT_PATH,
@@ -23,24 +25,52 @@ import {
   ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE,
   buildCronContinuationEnvelope,
 } from '../cronOriginSession.js'
+import {
+  _ensureDurableSendToAgentCallback,
+  _queueSendToAgentCallback,
+} from '../delegateCallbacks.js'
 import { DelegateDurableDb } from '../delegateDurable.js'
 import {
   DelegateJobStore,
+  NOTIFY_CLAIM_LEASE_MS,
   NOTIFY_MAX_CALLBACK_EPOCH,
   nextNotifyBackoffMs,
 } from '../delegateJobs.js'
 import { dispatchJobTerminalNotify, retryPendingNotifies } from '../delegateNotifyDispatch.js'
+import { handedOffDelegateRetryDelay } from '../delegateWaitHandoff.js'
 import { DefaultEngineNotifier } from '../engineNotifier.js'
+import { _armNotifyRetryScheduler } from '../gatewayLifecycle.js'
 import { runBoundedOriginInjectBackoff } from '../originInjectBackoff.js'
 import { Gateway } from '../server.js'
+import { CRON_ORIGIN_PREVIOUSLY_FAILED_UNEXECUTED_CODE } from '../v3CronOriginInject.js'
 
 const ORIGIN_KEY = 'agent:main:webchat:dm:webocv573origin01'
-const ENV_KEYS = ['OPENCLAUDE_V3_MASTER_BASE_URL', 'OPENCLAUDE_V3_CONTAINER_TOKEN'] as const
+const ENV_KEYS = [
+  'OPENCLAUDE_V3_MASTER_BASE_URL',
+  'OPENCLAUDE_V3_CONTAINER_TOKEN',
+  'OC_DELEGATE_SM',
+  'OC_DELEGATE_DURABLE',
+  'OC_DELEGATE_NOTIFIER',
+  'OC_DELEGATE_CALLBACK_OWNER',
+  'OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR',
+] as const
 const savedEnv: Record<string, string | undefined> = {}
 
 type MasterReply = {
   status: number
   body: unknown
+}
+
+const UNEXECUTED_503_REPLY: MasterReply = {
+  status: 503,
+  body: {
+    error: {
+      code: CRON_ORIGIN_PREVIOUSLY_FAILED_UNEXECUTED_CODE,
+      message: 'previously_failed_unexecuted',
+      request_id: 'req-pf-unexecuted',
+    },
+    userError: { code: 'unknown', message: 'error' },
+  },
 }
 
 let server: Server
@@ -162,10 +192,14 @@ function createTerminalCronOriginJob(store: DelegateJobStore): string {
   return created.jobId
 }
 
-function createTerminalSendToAgentJob(store: DelegateJobStore): string {
+function createTerminalSendToAgentJob(store: DelegateJobStore): {
+  jobId: string
+  claimToken: string
+  fencingEpoch: number
+} {
   const created = store.create('research-assistant', {
     queued: true,
-    kind: 'delegate',
+    kind: 'send_to_agent',
     callback: 'origin-inject',
     parentSessionKey: ORIGIN_KEY,
     callbackOriginSessionKey: ORIGIN_KEY,
@@ -184,11 +218,15 @@ function createTerminalSendToAgentJob(store: DelegateJobStore): string {
     ),
     true,
   )
-  return created.jobId
+  return {
+    jobId: created.jobId,
+    claimToken: claimed.claimToken,
+    fencingEpoch: claimed.fencingEpoch,
+  }
 }
 
 describe('OCV5-73: cron-origin-inject previously_failed bounded callback_epoch bump', () => {
-  it('bumps callback_epoch on 503 previously_failed, enforces backoff, and succeeds with fresh clientMessageId', async () => {
+  it('bumps callback_epoch on 503 PREVIOUSLY_FAILED_UNEXECUTED, enforces backoff, and succeeds with fresh clientMessageId', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'ocv5-73-bump-'))
     const dbPath = join(dir, 'delegate.db')
     let now = 1_700_000_000_000
@@ -203,26 +241,11 @@ describe('OCV5-73: cron-origin-inject previously_failed bounded callback_epoch b
       const gw = makeGatewayForOriginInject()
       const notifier = makeNotifier(gw)
 
-      // Master rejects epoch 1 with exact makeCronOriginInjectHandler 503 previously_failed payload,
-      // and accepts epoch 2 cleanly.
-      masterResponder = (clientMessageId) => {
-        if (clientMessageId === delegateCallbackMessageId(jobId, 1)) {
-          return {
-            status: 503,
-            body: {
-              error: {
-                code: 'INJECT_FAILED',
-                message: 'previously_failed',
-                request_id: 'req-pf-epoch1',
-              },
-              userError: { code: 'unknown', message: 'error' },
-            },
-          }
-        }
-        return { status: 200, body: { ok: true, requestId: 'req-ok-epoch2' } }
-      }
+      masterResponder = (clientMessageId) =>
+        clientMessageId === delegateCallbackMessageId(jobId, 1)
+          ? UNEXECUTED_503_REPLY
+          : { status: 200, body: { ok: true, requestId: 'req-ok-epoch2' } }
 
-      // Attempt 1 (epoch 1) → 503 previously_failed → bump to epoch 2 + backoff
       const first = await dispatchJobTerminalNotify(store, store.snapshotOf(jobId)!, notifier)
       assert.equal('ok' in first && first.ok, false)
 
@@ -274,19 +297,13 @@ describe('OCV5-73: cron-origin-inject previously_failed bounded callback_epoch b
 
       masterResponder = (clientMessageId) =>
         clientMessageId === delegateCallbackMessageId(jobId, 1)
-          ? {
-              status: 503,
-              body: {
-                error: { code: 'INJECT_FAILED', message: 'previously_failed', request_id: 'r1' },
-              },
-            }
+          ? UNEXECUTED_503_REPLY
           : { status: 200, body: { ok: true, requestId: 'r2' } }
 
       await dispatchJobTerminalNotify(store1, store1.snapshotOf(jobId)!, makeNotifier(gw))
       assert.equal(store1.snapshotOf(jobId)?.callbackEpoch, 2)
       store1.close()
 
-      // Simulate restart with fresh SQLite store + fresh EngineNotifier
       now += nextNotifyBackoffMs(0)
       const store2 = new DelegateJobStore({
         sm: true,
@@ -311,7 +328,7 @@ describe('OCV5-73: cron-origin-inject previously_failed bounded callback_epoch b
     }
   })
 
-  it('preserves same callback_epoch idempotency for in_flight, transient 503, and delivered/deduplicated/accepted', async () => {
+  it('never bumps callback_epoch for generic 503 previously_failed (executed_error/recovery/billed), 409 in_flight, NO_TRANSPORT, delivery_unknown, manual_hold, or 200', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'ocv5-73-idem-'))
     const dbPath = join(dir, 'delegate.db')
     let now = 1_700_000_200_000
@@ -327,24 +344,29 @@ describe('OCV5-73: cron-origin-inject previously_failed bounded callback_epoch b
       const notifier = makeNotifier(gw)
 
       const sequence: MasterReply[] = [
-        // 409 TURN_IN_FLIGHT (admitted / rejecting / session_busy / already_owned)
+        // Generic 503 INJECT_FAILED / previously_failed (executed_error, provisional recovery sentinel, or billed) → MUST NOT bump!
+        {
+          status: 503,
+          body: { error: { code: 'INJECT_FAILED', message: 'previously_failed', request_id: 'r-exec' } },
+        },
+        // 409 TURN_IN_FLIGHT (and even 409 carrying PREVIOUSLY_FAILED_UNEXECUTED) → MUST NOT bump!
         {
           status: 409,
-          body: {
-            error: { code: 'TURN_IN_FLIGHT', message: 'origin session has another open turn' },
-          },
+          body: { error: { code: 'TURN_IN_FLIGHT', message: 'origin session has another open turn' } },
         },
-        // 503 NO_TRANSPORT
+        {
+          status: 409,
+          body: { error: { code: CRON_ORIGIN_PREVIOUSLY_FAILED_UNEXECUTED_CODE, message: 'previously_failed_unexecuted' } },
+        },
+        // 503 NO_TRANSPORT / delivery_unknown / manual_hold → MUST NOT bump!
         {
           status: 503,
           body: { error: { code: 'NO_TRANSPORT', message: 'no attested container bridge' } },
         },
-        // 503 delivery_unknown (bytes may be in flight — MUST NOT bump!)
         {
           status: 503,
           body: { error: { code: 'INJECT_FAILED', message: 'delivery_unknown' } },
         },
-        // 503 manual_hold (MUST NOT bump!)
         {
           status: 503,
           body: { error: { code: 'INJECT_FAILED', message: 'manual_hold' } },
@@ -357,40 +379,33 @@ describe('OCV5-73: cron-origin-inject previously_failed bounded callback_epoch b
       ]
       masterResponder = () => sequence.shift() ?? { status: 200, body: { ok: true } }
 
-      for (let i = 0; i < 4; i += 1) {
+      for (let i = 0; i < 6; i += 1) {
         const res = await retryPendingNotifies(store, notifier, {}, { dueOnly: true })
         assert.equal(res.failed, 1)
         const snap = store.snapshotOf(jobId)!
-        assert.equal(
-          snap.callbackEpoch,
-          1,
-          `transient/in_flight attempt ${i + 1} must not bump epoch`,
-        )
+        assert.equal(snap.callbackEpoch, 1, `attempt ${i + 1} must NOT bump epoch`)
         assert.equal(snap.callbackState, 'pending')
         now = (snap.notifyRetryAt ?? now) + 1
       }
 
-      // 5th try gets 200 (deduplicated/accepted)
       const done = await retryPendingNotifies(store, notifier, {}, { dueOnly: true })
       assert.equal(done.delivered, 1)
       assert.equal(store.snapshotOf(jobId)?.callbackState, 'delivered')
       assert.equal(store.snapshotOf(jobId)?.callbackEpoch, 1)
 
-      // Every single attempt used the EXACT same epoch-1 clientMessageId
       const expectedId = delegateCallbackMessageId(jobId, 1)
-      assert.deepEqual(receivedIds, [expectedId, expectedId, expectedId, expectedId, expectedId])
+      assert.deepEqual(receivedIds, Array(7).fill(expectedId))
 
-      // Subsequent dispatch on already-delivered row is a no-op with 0 HTTP calls
       const replay = await dispatchJobTerminalNotify(store, store.snapshotOf(jobId)!, notifier)
       assert.equal('ok' in replay && replay.ok, true)
-      assert.equal(receivedIds.length, 5)
+      assert.equal(receivedIds.length, 7)
       store.close()
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
   })
 
-  it('caps callback_epoch bumps at NOTIFY_MAX_CALLBACK_EPOCH and abandons permanent previously_failed storms', async () => {
+  it('caps callback_epoch bumps at NOTIFY_MAX_CALLBACK_EPOCH and atomically abandons permanent unexecuted failures', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'ocv5-73-cap-'))
     const dbPath = join(dir, 'delegate.db')
     let now = 1_700_000_300_000
@@ -406,17 +421,7 @@ describe('OCV5-73: cron-origin-inject previously_failed bounded callback_epoch b
       const gw = makeGatewayForOriginInject()
       const notifier = makeNotifier(gw)
 
-      // Master permanently returns 503 previously_failed for every epoch
-      masterResponder = () => ({
-        status: 503,
-        body: {
-          error: {
-            code: 'INJECT_FAILED',
-            message: 'previously_failed',
-            request_id: 'req-permanent-pf',
-          },
-        },
-      })
+      masterResponder = () => UNEXECUTED_503_REPLY
 
       const hooks = {
         onDelivered: () => {
@@ -424,7 +429,6 @@ describe('OCV5-73: cron-origin-inject previously_failed bounded callback_epoch b
         },
       }
 
-      // Drive retries up to the cap (epochs 1..NOTIFY_MAX_CALLBACK_EPOCH)
       for (let attempt = 1; attempt <= NOTIFY_MAX_CALLBACK_EPOCH; attempt += 1) {
         const res = await retryPendingNotifies(store, notifier, hooks, { dueOnly: true })
         const snap = store.snapshotOf(jobId)!
@@ -435,14 +439,12 @@ describe('OCV5-73: cron-origin-inject previously_failed bounded callback_epoch b
           assert.ok(snap.notifyRetryAt != null && snap.notifyRetryAt > now)
           now = snap.notifyRetryAt
         } else {
-          // Final attempt hit the cap → abandoned, no epoch 6!
           assert.equal(snap.callbackState, 'abandoned')
           assert.equal(snap.callbackEpoch, NOTIFY_MAX_CALLBACK_EPOCH)
           assert.equal(snap.notifyRetryAt, null)
         }
       }
 
-      // Exact epochs 1..NOTIFY_MAX_CALLBACK_EPOCH sent, never beyond cap
       const expectedIds = Array.from({ length: NOTIFY_MAX_CALLBACK_EPOCH }, (_, idx) =>
         delegateCallbackMessageId(jobId, idx + 1),
       )
@@ -451,7 +453,6 @@ describe('OCV5-73: cron-origin-inject previously_failed bounded callback_epoch b
       assert.equal(store.listPendingNotify().length, 0)
       assert.equal(store.listDueNotify(now + 100_000).length, 0)
 
-      // No further HTTP traffic on future ticks
       const extra = await retryPendingNotifies(store, notifier, hooks, { dueOnly: true })
       assert.equal(extra.scanned, 0)
       assert.equal(receivedIds.length, NOTIFY_MAX_CALLBACK_EPOCH)
@@ -461,59 +462,246 @@ describe('OCV5-73: cron-origin-inject previously_failed bounded callback_epoch b
     }
   })
 
-  it('also bumps callback_epoch for send_to_agent origin-inject callbacks and rejects stale claim bumps', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'ocv5-73-sta-'))
+  it('Blocker 2 (2-connection SQLite CAS): stale worker A at epoch cap cannot abandon or clear worker B valid claim', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ocv5-73-dual-cas-'))
     const dbPath = join(dir, 'delegate.db')
     let now = 1_700_000_400_000
-    receivedIds = []
     try {
-      const store = new DelegateJobStore({
+      const storeA = new DelegateJobStore({
         sm: true,
         durable: new DelegateDurableDb(dbPath),
         now: () => now,
       })
-      const jobId = createTerminalSendToAgentJob(store)
-      const gw = makeGatewayForOriginInject()
-      const notifier = makeNotifier(gw)
+      const storeB = new DelegateJobStore({
+        sm: true,
+        durable: new DelegateDurableDb(dbPath),
+        now: () => now,
+      })
+      const jobId = createTerminalCronOriginJob(storeA)
+      const initial = storeA.snapshotOf(jobId)!
+      const fence = { claimToken: initial.claimToken!, fencingEpoch: initial.fencingEpoch }
+
+      // Drive job durably from epoch 1 to NOTIFY_MAX_CALLBACK_EPOCH (5)
+      for (let epoch = 1; epoch < NOTIFY_MAX_CALLBACK_EPOCH; epoch += 1) {
+        const claim = storeA.claimNotifyDelivery(jobId, fence)
+        assert.equal(claim.ok, true)
+        if (!claim.ok) throw new Error('claim failed')
+        assert.equal(
+          storeA.releaseNotifyClaimWithEpochBump(jobId, claim.token, fence),
+          'bumped',
+        )
+        now = (storeA.snapshotOf(jobId)?.notifyRetryAt ?? now) + 1
+      }
+      assert.equal(storeA.snapshotOf(jobId)?.callbackEpoch, NOTIFY_MAX_CALLBACK_EPOCH)
+
+      // Worker A claims epoch 5 delivery
+      const claimA = storeA.claimNotifyDelivery(jobId, fence)
+      assert.equal(claimA.ok, true)
+      if (!claimA.ok) throw new Error('claimA failed')
+
+      // Worker A stalls past claim lease expiry → Worker B reclaims with fresh tokenB
+      now += NOTIFY_CLAIM_LEASE_MS + 1_000
+      const claimB = storeB.claimNotifyDelivery(jobId, fence)
+      assert.equal(claimB.ok, true)
+      if (!claimB.ok) throw new Error('claimB failed')
+      assert.notEqual(claimB.token, claimA.token)
+
+      // Stale Worker A hits epoch cap and tries to abandon with its stale tokenA:
+      // MUST return 'stale' and MUST NOT abandon or clear Worker B's claim!
+      const staleCapOutcome = storeA.releaseNotifyClaimWithEpochBump(jobId, claimA.token, fence)
+      assert.equal(staleCapOutcome, 'stale')
+      const liveAfterStaleA = storeB.snapshotOf(jobId)!
+      assert.equal(liveAfterStaleA.callbackState, 'injecting')
+      assert.equal(liveAfterStaleA.notifyDeliveryToken, claimB.token)
+
+      // Worker B completes delivery with valid tokenB → succeeds!
+      assert.equal(storeB.completeNotifyDelivery(jobId, claimB.token, fence), true)
+      assert.equal(storeB.snapshotOf(jobId)?.callbackState, 'delivered')
+
+      storeA.close()
+      storeB.close()
+
+      // Reopen fresh SQLite connection (restart proof): delivered, NOT abandoned
+      const storeAfterRestart = new DelegateJobStore({
+        sm: true,
+        durable: new DelegateDurableDb(dbPath),
+        now: () => now,
+      })
+      assert.equal(storeAfterRestart.snapshotOf(jobId)?.callbackState, 'delivered')
+      assert.equal(storeAfterRestart.snapshotOf(jobId)?.callbackEpoch, NOTIFY_MAX_CALLBACK_EPOCH)
+      storeAfterRestart.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('Blocker 2 (dispatchJobTerminalNotify race): stale worker A returning previouslyFailed at epoch cap does NOT invoke onDelivered cleanup', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ocv5-73-dispatch-race-'))
+    const dbPath = join(dir, 'delegate.db')
+    let now = 1_700_000_500_000
+    let onDeliveredA = 0
+    try {
+      const storeA = new DelegateJobStore({
+        sm: true,
+        durable: new DelegateDurableDb(dbPath),
+        now: () => now,
+      })
+      const storeB = new DelegateJobStore({
+        sm: true,
+        durable: new DelegateDurableDb(dbPath),
+        now: () => now,
+      })
+      const jobId = createTerminalCronOriginJob(storeA)
+      const initial = storeA.snapshotOf(jobId)!
+      const fence = { claimToken: initial.claimToken!, fencingEpoch: initial.fencingEpoch }
+
+      // Drive to epoch 5
+      for (let epoch = 1; epoch < NOTIFY_MAX_CALLBACK_EPOCH; epoch += 1) {
+        const c = storeA.claimNotifyDelivery(jobId, fence)
+        assert.equal(c.ok, true)
+        if (!c.ok) throw new Error('claim failed')
+        assert.equal(storeA.releaseNotifyClaimWithEpochBump(jobId, c.token, fence), 'bumped')
+        now = (storeA.snapshotOf(jobId)?.notifyRetryAt ?? now) + 1
+      }
+
+      let tokenB: string | undefined
+      const slowNotifierA = new DefaultEngineNotifier({
+        resumeInject: {
+          inject: async () => {
+            // While A is awaiting master, its lease expires and Worker B reclaims!
+            now += NOTIFY_CLAIM_LEASE_MS + 1_000
+            const claimB = storeB.claimNotifyDelivery(jobId, fence)
+            assert.equal(claimB.ok, true)
+            if (claimB.ok) tokenB = claimB.token
+            return { ok: false, failureClass: 'transport', previouslyFailed: true }
+          },
+        },
+      })
+
+      const resA = await dispatchJobTerminalNotify(
+        storeA,
+        storeA.snapshotOf(jobId)!,
+        slowNotifierA,
+        {
+          onDelivered: () => {
+            onDeliveredA += 1
+          },
+        },
+      )
+      assert.equal('ok' in resA && resA.ok, false)
+      assert.equal(onDeliveredA, 0, 'stale worker A must not trigger onDelivered/intent cleanup')
+      assert.ok(tokenB)
+      assert.equal(storeB.snapshotOf(jobId)?.callbackState, 'injecting')
+      assert.equal(storeB.completeNotifyDelivery(jobId, tokenB!, fence), true)
+      assert.equal(storeB.snapshotOf(jobId)?.callbackState, 'delivered')
+
+      storeA.close()
+      storeB.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('Blocker 3 (flag-off kind=send_to_agent): bumps epoch 1→2, arms real retry timer, and delivers epoch 2 without restart', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ocv5-73-flagoff-sta-'))
+    const dbPath = join(dir, 'delegate.db')
+    const intentDir = join(dir, 'intents')
+    process.env.OC_DELEGATE_SM = '1'
+    process.env.OC_DELEGATE_DURABLE = '1'
+    process.env.OC_DELEGATE_NOTIFIER = '0'
+    process.env.OC_DELEGATE_CALLBACK_OWNER = 'job'
+    process.env.OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR = intentDir
+    receivedIds = []
+    let store: DelegateJobStore | undefined
+    let host: any
+    try {
+      store = new DelegateJobStore({
+        sm: true,
+        durable: new DelegateDurableDb(dbPath),
+      })
+      const { jobId, claimToken, fencingEpoch } = createTerminalSendToAgentJob(store)
+      assert.equal(store.snapshotOf(jobId)?.kind, 'send_to_agent')
+
+      const gw = makeGatewayForOriginInject() as any
+      host = {
+        _delegateJobs: store,
+        _activeSendToAgentCallbacks: new Map([
+          [
+            jobId,
+            {
+              v: 1,
+              jobId,
+              originSessionKey: ORIGIN_KEY,
+              userId: '3',
+              agentId: 'research-assistant',
+              goal: '查资料',
+              createdAt: Date.now(),
+            },
+          ],
+        ]),
+        _notifyRetryTimer: undefined as ReturnType<typeof setTimeout> | undefined,
+        _drainFlagOffCronOriginNotifies: async () => {},
+        sessions: { getByKey: () => ({ userId: '3' }) },
+        log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+        injectSendToAgentCallback: gw.injectSendToAgentCallback.bind(gw),
+      }
+      host._ensureDurableSendToAgentCallback = _ensureDurableSendToAgentCallback.bind(host)
+      host._armNotifyRetryScheduler = _armNotifyRetryScheduler.bind(host)
 
       masterResponder = (clientMessageId) =>
         clientMessageId === delegateCallbackMessageId(jobId, 1)
-          ? {
-              status: 503,
-              body: {
-                error: {
-                  code: 'INJECT_FAILED',
-                  message: 'previously_failed',
-                  request_id: 'r-sta1',
-                },
-              },
-            }
-          : { status: 200, body: { ok: true, requestId: 'r-sta2' } }
+          ? UNEXECUTED_503_REPLY
+          : { status: 200, body: { ok: true, requestId: 'req-sta-epoch2' } }
 
-      const first = await dispatchJobTerminalNotify(store, store.snapshotOf(jobId)!, notifier)
-      assert.equal('ok' in first && first.ok, false)
-      assert.equal(store.snapshotOf(jobId)?.callbackEpoch, 2)
+      // Trigger real flag-off completion callback path for kind='send_to_agent'
+      _queueSendToAgentCallback.call(
+        host,
+        {
+          callbackOnComplete: 'origin-inject',
+          parentSessionKey: ORIGIN_KEY,
+          callbackOriginSessionKey: ORIGIN_KEY,
+          callbackOriginUserId: '3',
+          claimToken,
+          fencingEpoch,
+        } as any,
+        {
+          jobId,
+          agentId: 'research-assistant',
+          goal: '查资料',
+          output: '结论正文',
+        },
+      )
 
-      // Stale token cannot bump or mutate state
-      const staleResult = store.releaseNotifyClaimWithEpochBump(jobId, 'wrong-token')
-      assert.equal(staleResult, 'stale')
-      assert.equal(store.snapshotOf(jobId)?.callbackEpoch, 2)
+      // Wait for Attempt 1 (epoch 1 → 503 PREVIOUSLY_FAILED_UNEXECUTED → bumped to epoch 2 & timer armed)
+      for (let i = 0; i < 100 && store.snapshotOf(jobId)?.callbackEpoch !== 2; i += 1) {
+        await delay(20)
+      }
+      const afterFirst = store.snapshotOf(jobId)!
+      assert.equal(afterFirst.callbackEpoch, 2)
+      assert.equal(afterFirst.callbackState, 'pending')
+      assert.notEqual(
+        handedOffDelegateRetryDelay(store),
+        undefined,
+        'flag-off scheduler must see kind=send_to_agent epoch 2 pending row',
+      )
+      assert.ok(host._notifyRetryTimer, 'flag-off retry timer must be armed')
+      assert.deepEqual(receivedIds, [delegateCallbackMessageId(jobId, 1)])
 
-      now += nextNotifyBackoffMs(0)
-      const second = await retryPendingNotifies(store, notifier, {}, { dueOnly: true })
-      assert.equal(second.delivered, 1)
+      // Without restarting, wait for the armed 1s backoff timer to fire and deliver epoch 2!
+      for (let i = 0; i < 150 && store.snapshotOf(jobId)?.callbackState !== 'delivered'; i += 1) {
+        await delay(30)
+      }
+      const finalSnap = store.snapshotOf(jobId)!
+      assert.equal(finalSnap.callbackState, 'delivered')
+      assert.equal(finalSnap.callbackEpoch, 2)
+      assert.equal(host._notifyRetryTimer, undefined)
       assert.deepEqual(receivedIds, [
         delegateCallbackMessageId(jobId, 1),
         delegateCallbackMessageId(jobId, 2),
       ])
-
-      // Already-delivered job cannot be bumped
-      const afterDelivered = store.bumpCallbackEpochForRetry(jobId)
-      assert.equal(afterDelivered, 'stale')
-      assert.equal(store.snapshotOf(jobId)?.callbackState, 'delivered')
-      assert.equal(store.snapshotOf(jobId)?.callbackEpoch, 2)
-      store.close()
     } finally {
+      if (host?._notifyRetryTimer) clearTimeout(host._notifyRetryTimer)
+      store?.close()
       await rm(dir, { recursive: true, force: true })
     }
   })

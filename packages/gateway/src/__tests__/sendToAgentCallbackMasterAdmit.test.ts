@@ -145,13 +145,13 @@ describe('injectSendToAgentCallback → master admission', () => {
     assert.deepEqual(r, { kind: 'retryable_failure', code: 'HTTP_503' })
   })
 
-  it('maps 503 previously_failed to ORIGIN_MESSAGE_PREVIOUSLY_FAILED and exits backoff after 1 try (OCV5-73)', async () => {
+  it('maps 503 PREVIOUSLY_FAILED_UNEXECUTED to ORIGIN_MESSAGE_PREVIOUSLY_FAILED and exits backoff after 1 try (OCV5-73)', async () => {
     seen = []
     nextStatus = 503
     nextBody = {
       error: {
-        code: 'INJECT_FAILED',
-        message: 'previously_failed',
+        code: 'PREVIOUSLY_FAILED_UNEXECUTED',
+        message: 'previously_failed_unexecuted',
         request_id: 'req-pf-1',
       },
     }
@@ -171,6 +171,27 @@ describe('injectSendToAgentCallback → master admission', () => {
         code: ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE,
       })
       assert.equal(seen.length, 1)
+
+      // Negative control: generic 503 INJECT_FAILED / previously_failed (e.g. executed_error)
+      // MUST NOT map to ORIGIN_MESSAGE_PREVIOUSLY_FAILED
+      seen = []
+      nextBody = {
+        error: {
+          code: 'INJECT_FAILED',
+          message: 'previously_failed',
+          request_id: 'req-pf-generic',
+        },
+      }
+      const rGeneric = await gw.injectSendToAgentCallback({
+        parentSessionKey: PARENT_KEY,
+        jobId: 'dlgjob-pf-generic',
+        agentId: 'x',
+        goal: 'g',
+        output: 'o',
+        clientMessageId: 'dlgcb-dlgjob-pf-generic-1',
+        once: true,
+      })
+      assert.deepEqual(rGeneric, { kind: 'retryable_failure', code: 'HTTP_503' })
     } finally {
       nextBody = undefined
     }

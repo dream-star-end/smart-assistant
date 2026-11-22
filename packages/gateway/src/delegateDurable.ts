@@ -187,6 +187,7 @@ export class DelegateDurableDb {
   private readonly casClaimNotifyStmt
   private readonly casCompleteNotifyStmt
   private readonly casReleaseNotifyStmt
+  private readonly casAbandonNotifyStmt
   private readonly casMarkAAttemptedStmt
   private readonly getStmt
   private readonly getByIdemStmt
@@ -396,6 +397,26 @@ export class DelegateDurableDb {
         notify_claimed_until=NULL,
         notify_retry_at=@retry_at,
         notify_attempt=@notify_attempt,
+        last_activity_at=@now,
+        updated_at=@now
+      WHERE job_id=@job_id
+        AND retired_at IS NULL
+        AND state=@expected_state
+        AND fencing_epoch=@expected_epoch
+        AND (
+          (@expected_token IS NULL AND claim_token IS NULL)
+          OR claim_token=@expected_token
+        )
+        AND callback_state='injecting'
+        AND notify_delivery_token=@delivery_token
+      RETURNING *
+    `)
+    this.casAbandonNotifyStmt = this.db.prepare(`
+      UPDATE delegate_jobs SET
+        callback_state='abandoned',
+        notify_delivery_token=NULL,
+        notify_claimed_until=NULL,
+        notify_retry_at=NULL,
         last_activity_at=@now,
         updated_at=@now
       WHERE job_id=@job_id
@@ -695,6 +716,26 @@ export class DelegateDurableDb {
       notify_attempt: args.notifyAttempt,
       callback_epoch: args.callbackEpoch ?? null,
       notify_id: args.notifyId ?? null,
+    }) as Record<string, unknown> | undefined
+    return row ? fromRow(row) : undefined
+  }
+
+  casAbandonNotify(args: {
+    jobId: string
+    state: string
+    fencingEpoch: number
+    claimToken?: string | null
+    deliveryToken: string
+    now: number
+  }): DurableJobRecord | undefined {
+    this.throwIfInjectedFailure()
+    const row = this.casAbandonNotifyStmt.get({
+      job_id: args.jobId,
+      expected_state: args.state,
+      expected_epoch: args.fencingEpoch,
+      expected_token: args.claimToken ?? null,
+      delivery_token: args.deliveryToken,
+      now: args.now,
     }) as Record<string, unknown> | undefined
     return row ? fromRow(row) : undefined
   }

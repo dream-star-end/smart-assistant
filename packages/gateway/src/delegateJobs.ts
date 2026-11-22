@@ -1662,18 +1662,23 @@ export class DelegateJobStore {
   }
 
   /**
-   * Release an active notify claim after master reported `previously_failed`
-   * for this epoch's `clientMessageId`, atomically bumping `callback_epoch`
-   * (bounded by `NOTIFY_MAX_CALLBACK_EPOCH`) and scheduling exponential backoff
-   * so the next retry mints a fresh `dlgcb-{jobId}-{epoch}` id without forming
-   * an infinite retry storm.
+   * Release an active notify claim after master reported proven-unexecuted
+   * `PREVIOUSLY_FAILED_UNEXECUTED` for this epoch's `clientMessageId`.
+   *
+   * - Below `maxCallbackEpoch`: atomically bumps `callback_epoch` + `notify_id`,
+   *   clears the delivery claim, and schedules exponential `nextNotifyBackoffMs`
+   *   fenced by `deliveryToken`.
+   * - At or above `maxCallbackEpoch`: atomically transitions `callback_state` to
+   *   `'abandoned'` and clears the claim/retry in ONE SQLite CAS fenced by the
+   *   caller's original `deliveryToken` (so a stale worker whose lease expired
+   *   cannot overwrite a competing worker's active claim or completed receipt).
    */
   releaseNotifyClaimWithEpochBump(
     jobId: string,
     deliveryToken: string,
     fence?: { claimToken: string; fencingEpoch: number },
     opts?: { maxCallbackEpoch?: number },
-  ): 'bumped' | 'epoch_cap_reached' | 'stale' {
+  ): 'bumped' | 'abandoned_at_epoch_cap' | 'stale' {
     const job = this.refreshJob(jobId)
     if (!job) return 'stale'
     if (job.claimToken) {
@@ -1686,12 +1691,33 @@ export class DelegateJobStore {
     }
     const currentEpoch = job.callbackEpoch > 0 ? job.callbackEpoch : 1
     const maxEpoch = Math.max(1, Math.floor(opts?.maxCallbackEpoch ?? NOTIFY_MAX_CALLBACK_EPOCH))
+    const now = this.now()
     if (currentEpoch >= maxEpoch) {
-      return 'epoch_cap_reached'
+      if (this.durable) {
+        const row = this.durable.casAbandonNotify({
+          jobId,
+          state: job.state,
+          fencingEpoch: job.fencingEpoch,
+          claimToken: job.claimToken ?? null,
+          deliveryToken,
+          now,
+        })
+        if (!row) {
+          this.refreshJob(jobId)
+          return 'stale'
+        }
+        this.ingestDurableRow(row)
+        return 'abandoned_at_epoch_cap'
+      }
+      job.callbackState = 'abandoned'
+      job.notifyDeliveryToken = undefined
+      job.notifyClaimedUntil = null
+      job.notifyRetryAt = null
+      job.lastActivityAt = now
+      return 'abandoned_at_epoch_cap'
     }
     const nextEpoch = currentEpoch + 1
     const nextNotifyId = delegateNotifyId(job.id, nextEpoch)
-    const now = this.now()
     const nextAttempt = (job.notifyAttempt ?? 0) + 1
     const retryAt = now + nextNotifyBackoffMs(job.notifyAttempt ?? 0)
     if (this.durable) {
@@ -1723,42 +1749,6 @@ export class DelegateJobStore {
     job.notifyAttempt = nextAttempt
     job.lastActivityAt = now
     return 'bumped'
-  }
-
-  /**
-   * Non-token bounded epoch bump for flag-off `owner === 'job'` paths that
-   * transition `injecting -> pending` without `claimNotifyDelivery`.
-   */
-  bumpCallbackEpochForRetry(
-    jobId: string,
-    fence?: { claimToken: string; fencingEpoch: number },
-    opts?: { maxCallbackEpoch?: number },
-  ): 'bumped' | 'epoch_cap_reached' | 'stale' {
-    const job = this.refreshJob(jobId)
-    if (!job) return 'stale'
-    if (job.claimToken) {
-      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) {
-        return 'stale'
-      }
-    }
-    if (job.callbackState !== 'injecting' && job.callbackState !== 'pending') {
-      return 'stale'
-    }
-    const currentEpoch = job.callbackEpoch > 0 ? job.callbackEpoch : 1
-    const maxEpoch = Math.max(1, Math.floor(opts?.maxCallbackEpoch ?? NOTIFY_MAX_CALLBACK_EPOCH))
-    if (currentEpoch >= maxEpoch) {
-      return 'epoch_cap_reached'
-    }
-    const nextEpoch = currentEpoch + 1
-    const now = this.now()
-    const draft = this.cloneEntry(job)
-    draft.callbackState = 'pending'
-    draft.callbackEpoch = nextEpoch
-    draft.notifyId = delegateNotifyId(job.id, nextEpoch)
-    draft.notifyAttempt = (job.notifyAttempt ?? 0) + 1
-    draft.notifyRetryAt = now + nextNotifyBackoffMs(job.notifyAttempt ?? 0)
-    draft.lastActivityAt = now
-    return this.commit(job, draft, false) ? 'bumped' : 'stale'
   }
 
   shouldAbandonNotify(jobId: string): boolean {

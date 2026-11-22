@@ -273,16 +273,15 @@ export async function dispatchJobTerminalNotify(
       const release = store.releaseNotifyClaimWithEpochBump(job.id, deliveryToken, fenceOf(claimedLive))
       if (release === 'bumped') {
         const bumped = store.snapshotOf(job.id)
-        log.info('delegate notify bumped callback_epoch after previously_failed', {
+        log.info('delegate notify bumped callback_epoch after previously_failed_unexecuted', {
           jobId: claimedLive.id,
           callback: claimedLive.callback,
           previousEpoch: event.callbackEpoch,
           nextEpoch: bumped?.callbackEpoch,
           notifyAttempt: bumped?.notifyAttempt,
         })
-      } else if (release === 'epoch_cap_reached') {
+      } else if (release === 'abandoned_at_epoch_cap') {
         const latest = store.snapshotOf(job.id) ?? claimedLive
-        store.abandonNotify(latest.id, fenceOf(latest))
         log.warn('delegate notify abandoned after previously_failed callback_epoch cap', {
           jobId: latest.id,
           callback: latest.callback,
@@ -295,7 +294,11 @@ export async function dispatchJobTerminalNotify(
           latest.id,
           latest.callbackEpoch > 0 ? latest.callbackEpoch : 1,
         )
-        return ackDelivered(store, store.snapshotOf(job.id) ?? latest, hooks, abandonedNotifyId, lane)
+        return ackDelivered(store, latest, hooks, abandonedNotifyId, lane)
+      } else {
+        // Stale delivery token: another worker reclaimed or completed this row.
+        // Never abandon or invoke onDelivered cleanup from a stale owner.
+        return result
       }
     } else if (!result.hold) {
       store.releaseNotifyClaim(job.id, deliveryToken, fenceOf(claimedLive))

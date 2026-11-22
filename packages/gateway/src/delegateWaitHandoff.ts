@@ -4,14 +4,23 @@ import { parseOriginWebchatSessionKey } from './cronOriginSession.js'
 import { DELEGATE_CONTEXT_HEADER, verifyDelegateContextToken } from './delegateContext.js'
 import type { DelegateRuntimeHost } from './delegateRuntime.js'
 import type { DelegateCallbacksHost } from './delegateCallbacks.js'
-import type { DelegateJobStore } from './delegateJobs.js'
+import type { DelegateJobSnapshot, DelegateJobStore } from './delegateJobs.js'
 
 type HandoffRetryHost = Pick<DelegateCallbacksHost,
   '_delegateJobs' | '_activeSendToAgentCallbacks' | '_ensureDurableSendToAgentCallback' | 'log'>
 
-/** Reuse the gateway notify timer for the legacy delivery path's handed-off subset. */
+function isFlagOffOriginInjectRetryJob(job: DelegateJobSnapshot): boolean {
+  if (job.callback !== 'origin-inject') return false
+  if (job.kind === 'delegate') return Boolean(job.callbackOriginSessionKey)
+  if (job.kind === 'send_to_agent') {
+    return Boolean(job.callbackOriginSessionKey || job.parentSessionKey)
+  }
+  return false
+}
+
+/** Reuse the gateway notify timer for the legacy delivery path's origin-inject subset (handoff + send_to_agent). */
 export function handedOffDelegateRetryDelay(store: DelegateJobStore, now = Date.now()): number | undefined {
-  const jobs = store.listPendingNotify().filter((job) => job.kind === 'delegate' && job.callback === 'origin-inject' && job.callbackOriginSessionKey)
+  const jobs = store.listPendingNotify().filter(isFlagOffOriginInjectRetryJob)
   if (jobs.length === 0) return undefined
   return Math.max(0, Math.min(...jobs.map((job) => job.callbackState === 'injecting'
     ? job.notifyClaimedUntil ?? now
@@ -21,14 +30,16 @@ export function handedOffDelegateRetryDelay(store: DelegateJobStore, now = Date.
 export async function retryHandedOffDelegateNotifies(host: HandoffRetryHost): Promise<void> {
   const jobs = host._delegateJobs?.listDueNotify() ?? []
   for (const job of jobs) {
-    if (job.kind !== 'delegate' || job.callback !== 'origin-inject' || !job.callbackOriginSessionKey) continue
+    if (!isFlagOffOriginInjectRetryJob(job)) continue
+    const originSessionKey = job.callbackOriginSessionKey ?? job.parentSessionKey
+    if (!originSessionKey) continue
     const active = host._activeSendToAgentCallbacks?.get(job.id)
     try {
       await host._ensureDurableSendToAgentCallback(job, {
         v: 1,
         jobId: job.id,
-        originSessionKey: job.callbackOriginSessionKey,
-        userId: job.callbackOriginUserId,
+        originSessionKey,
+        userId: job.callbackOriginUserId ?? active?.userId,
         agentId: job.agentId,
         goal: active?.goal ?? '',
         createdAt: job.createdAt ?? Date.now(),

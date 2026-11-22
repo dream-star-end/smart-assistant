@@ -84,32 +84,39 @@ describe('postCronOriginInject', () => {
     assert.equal(r503.kind, 'retryable')
   })
 
-  test('503 previously_failed 与 TURN_PREVIOUSLY_FAILED 映射 previously_failed，其余 503/409 保持原样 (OCV5-73)', async () => {
-    // Master makeCronOriginInjectHandler exact payload for admit.kind === "previously_failed"
-    const rMaster503 = await postCronOriginInject(PAYLOAD, {
+  test('仅 503 + PREVIOUSLY_FAILED_UNEXECUTED 映射 previously_failed，泛化 503 与所有 409 均保持原义 (OCV5-73)', async () => {
+    // Authoritative Master proven-unexecuted signal → previously_failed (authorizes epoch bump)
+    const rProvenUnexecuted = await postCronOriginInject(PAYLOAD, {
       config: CONFIG,
       fetcher: mockFetcher([], 503, {
         error: {
-          code: 'INJECT_FAILED',
-          message: 'previously_failed',
+          code: 'PREVIOUSLY_FAILED_UNEXECUTED',
+          message: 'previously_failed_unexecuted',
           request_id: 'req-123',
         },
         userError: { code: 'unknown', message: 'internal' },
       }),
     })
-    assert.deepEqual(rMaster503, { kind: 'previously_failed' })
+    assert.deepEqual(rProvenUnexecuted, { kind: 'previously_failed' })
 
-    // Forward-compat dedicated error code on 409 or 503
-    const rCode409 = await postCronOriginInject(PAYLOAD, {
-      config: CONFIG,
-      fetcher: mockFetcher([], 409, {
-        error: { code: 'TURN_PREVIOUSLY_FAILED', message: 'terminal failed' },
-      }),
-    })
-    assert.deepEqual(rCode409, { kind: 'previously_failed' })
-
-    // Other 503 reasons MUST stay retryable (preserve same-epoch idempotency)
+    // 409 MUST NEVER bump epoch regardless of error code/message
     for (const body of [
+      { error: { code: 'TURN_IN_FLIGHT', message: 'origin session has another open turn' } },
+      { error: { code: 'PREVIOUSLY_FAILED_UNEXECUTED', message: 'previously_failed_unexecuted' } },
+      { error: { code: 'TURN_PREVIOUSLY_FAILED', message: 'terminal failed' } },
+    ]) {
+      const r409 = await postCronOriginInject(PAYLOAD, {
+        config: CONFIG,
+        fetcher: mockFetcher([], 409, body),
+      })
+      assert.deepEqual(r409, { kind: 'in_flight' })
+    }
+
+    // Generic 503 INJECT_FAILED/previously_failed (executed_error, recovery sentinel, billed, legacy master)
+    // and all other 503 reasons MUST stay retryable (preserve same-epoch idempotency, zero double-billing)
+    for (const body of [
+      { error: { code: 'INJECT_FAILED', message: 'previously_failed', request_id: 'req-exec-err' } },
+      { error: { code: 'TURN_PREVIOUSLY_FAILED', message: 'previously_failed' } },
       { error: { code: 'NO_TRANSPORT', message: 'no attested container bridge' } },
       { error: { code: 'INJECT_FAILED', message: 'delivery_unknown' } },
       { error: { code: 'INJECT_FAILED', message: 'manual_hold' } },
@@ -122,14 +129,5 @@ describe('postCronOriginInject', () => {
       })
       assert.deepEqual(r, { kind: 'retryable', code: 'HTTP_503' })
     }
-
-    // 409 TURN_IN_FLIGHT MUST stay in_flight (preserve same-epoch idempotency)
-    const rInFlight = await postCronOriginInject(PAYLOAD, {
-      config: CONFIG,
-      fetcher: mockFetcher([], 409, {
-        error: { code: 'TURN_IN_FLIGHT', message: 'origin session has another open turn' },
-      }),
-    })
-    assert.deepEqual(rInFlight, { kind: 'in_flight' })
   })
 })

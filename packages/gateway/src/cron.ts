@@ -2196,45 +2196,22 @@ export class CronScheduler {
             boardProjectId: project.mode === 'fixed' ? project.boardProjectId : null,
           }
           const occForEpoch = readOccurrence(deliveryContext.deliveryId)
-          const currentCallbackEpoch =
-            typeof occForEpoch?.callbackEpoch === 'number' && occForEpoch.callbackEpoch > 1
-              ? Math.floor(occForEpoch.callbackEpoch)
-              : 1
-          const fireDeliveryContext: CronDeliveryContext =
-            currentCallbackEpoch > 1
-              ? { ...deliveryContext, callbackEpoch: currentCallbackEpoch }
-              : deliveryContext
-          result = await this.onOriginSessionFire!(fireJob, fireDeliveryContext)
-          if (
-            result.kind === 'retryable_failure' &&
-            result.code === ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE
-          ) {
-            if (currentCallbackEpoch >= NOTIFY_MAX_CALLBACK_EPOCH) {
+          const curEpoch = typeof occForEpoch?.callbackEpoch === 'number' && occForEpoch.callbackEpoch > 1
+            ? Math.floor(occForEpoch.callbackEpoch) : 1
+          const fireCtx: CronDeliveryContext = curEpoch > 1 ? { ...deliveryContext, callbackEpoch: curEpoch } : deliveryContext
+          result = await this.onOriginSessionFire!(fireJob, fireCtx)
+          if (result.kind === 'retryable_failure' && result.code === ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE) {
+            if (curEpoch >= NOTIFY_MAX_CALLBACK_EPOCH) {
               logger.warn(`job ${job.id} origin-session previously_failed epoch cap reached`, {
-                jobId: job.id,
-                deliveryId: deliveryContext.deliveryId,
-                callbackEpoch: currentCallbackEpoch,
-                maxCallbackEpoch: NOTIFY_MAX_CALLBACK_EPOCH,
+                jobId: job.id, deliveryId: deliveryContext.deliveryId, callbackEpoch: curEpoch,
               })
               await this.notifyOriginSessionDropped(job, deliveryContext, 'exhausted')
-              return {
-                kind: 'terminal_failure',
-                code: 'ORIGIN_MESSAGE_PREVIOUSLY_FAILED_EXHAUSTED',
-              }
+              return { kind: 'terminal_failure', code: 'ORIGIN_MESSAGE_PREVIOUSLY_FAILED_EXHAUSTED' }
             }
-            const nextEpoch = currentCallbackEpoch + 1
-            if (occForEpoch) {
-              writeOccurrence({
-                ...occForEpoch,
-                callbackEpoch: nextEpoch,
-                updatedAt: Date.now(),
-              })
-            }
+            const nextEpoch = curEpoch + 1
+            if (occForEpoch) writeOccurrence({ ...occForEpoch, callbackEpoch: nextEpoch, updatedAt: Date.now() })
             logger.info(`job ${job.id} origin-session bumped callbackEpoch after previously_failed`, {
-              jobId: job.id,
-              deliveryId: deliveryContext.deliveryId,
-              previousEpoch: currentCallbackEpoch,
-              nextEpoch,
+              jobId: job.id, deliveryId: deliveryContext.deliveryId, previousEpoch: curEpoch, nextEpoch,
             })
           }
         }

@@ -346,4 +346,124 @@ describe("injectCronOriginTurn stamps admit + inbound.model", () => {
     assert.deepEqual(ack.peer, { id: "webmw2i71k6k399qc", kind: "dm" });
     assert.equal((ack.cronOrigin as { model?: string }).model, "gemini-3.1-pro-agy");
   });
+
+  test("OCV5-73: previously_failed emits previously_failed_unexecuted ONLY for proven not_accepted + not_billed", async () => {
+    const makePreviouslyFailed = (
+      admitInput: AdmitUserTurnInput,
+      patch: Partial<{
+        outcome: "not_accepted" | "executed_error" | "crashed" | "interrupted";
+        failureCode: string | null;
+        producerFencedAt: Date | null;
+        visibleAt: number | null;
+      }>,
+    ): AdmitUserTurnResult => {
+      const admitted = fakeAdmitted(admitInput);
+      if (admitted.kind !== "admitted") throw new Error("unreachable");
+      return {
+        kind: "previously_failed",
+        workspaceMode: "legacy",
+        dispatch: {
+          ...admitted.dispatch,
+          status: "terminal",
+          outcome: patch.outcome ?? "not_accepted",
+          failureCode: patch.failureCode ?? "DISPATCH_NOT_ACCEPTED",
+          producerFencedAt: patch.producerFencedAt ?? null,
+          visibleAt: patch.visibleAt ?? null,
+          terminalAt: new Date(),
+        },
+      };
+    };
+
+    // Positive: terminal not_accepted + not_billed → safe dedicated reason
+    const safe = await executeCronOriginInject({
+      input,
+      admitUserTurn: async (a) => makePreviouslyFailed(a, { outcome: "not_accepted" }),
+      assessBilling: async () => "not_billed",
+      executor: () => {
+        throw new Error("must not execute");
+      },
+    });
+    assert.deepEqual(safe, { kind: "failed", reason: "previously_failed_unexecuted" });
+
+    // Negative controls: ALL must fail closed to generic previously_failed (NO epoch bump)
+    const unsafeCases: Array<{
+      label: string;
+      patch: Parameters<typeof makePreviouslyFailed>[1];
+      assessBilling?: () => Promise<"billed" | "not_billed">;
+    }> = [
+      {
+        label: "executed_error (already ran / may have billed)",
+        patch: { outcome: "executed_error", failureCode: "MODEL_ERROR" },
+        assessBilling: async () => "not_billed",
+      },
+      {
+        label: "provisional recovery sentinel RESULT_RECOVERY_PENDING (can late-complete)",
+        patch: { outcome: "executed_error", failureCode: "RESULT_RECOVERY_PENDING" },
+        assessBilling: async () => "not_billed",
+      },
+      {
+        label: "provisional recovery sentinel SERVICE_RESTART (can late-complete)",
+        patch: { outcome: "executed_error", failureCode: "SERVICE_RESTART" },
+        assessBilling: async () => "not_billed",
+      },
+      {
+        label: "crashed outcome",
+        patch: { outcome: "crashed", failureCode: "CRASHED" },
+        assessBilling: async () => "not_billed",
+      },
+      {
+        label: "interrupted outcome",
+        patch: { outcome: "interrupted", failureCode: "INTERRUPTED" },
+        assessBilling: async () => "not_billed",
+      },
+      {
+        label: "explicit USER_CANCELLED not_accepted",
+        patch: { outcome: "not_accepted", failureCode: "USER_CANCELLED" },
+        assessBilling: async () => "not_billed",
+      },
+      {
+        label: "producerFencedAt set",
+        patch: { outcome: "not_accepted", producerFencedAt: new Date() },
+        assessBilling: async () => "not_billed",
+      },
+      {
+        label: "visibleAt set (already showed output)",
+        patch: { outcome: "not_accepted", visibleAt: Date.now() },
+        assessBilling: async () => "not_billed",
+      },
+      {
+        label: "not_accepted but billing evidence exists",
+        patch: { outcome: "not_accepted" },
+        assessBilling: async () => "billed",
+      },
+      {
+        label: "not_accepted when billing oracle throws (fail closed)",
+        patch: { outcome: "not_accepted" },
+        assessBilling: async () => {
+          throw new Error("pg transient failure");
+        },
+      },
+      {
+        label: "not_accepted with no billing oracle / pgPool (fail closed)",
+        patch: { outcome: "not_accepted" },
+        assessBilling: undefined,
+      },
+    ];
+
+    for (const c of unsafeCases) {
+      const res = await executeCronOriginInject({
+        input,
+        admitUserTurn: async (a) => makePreviouslyFailed(a, c.patch),
+        ...(c.assessBilling ? { assessBilling: c.assessBilling } : {}),
+        executor: () => {
+          throw new Error("must not execute");
+        },
+      });
+      assert.deepEqual(
+        res,
+        { kind: "failed", reason: "previously_failed" },
+        `expected fail-closed generic previously_failed for: ${c.label}`,
+      );
+    }
+  });
 });

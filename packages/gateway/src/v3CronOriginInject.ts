@@ -17,6 +17,14 @@ export { CRON_ORIGIN_INJECT_PATH }
 const ATTEMPT_TIMEOUT_MS = 15_000
 const MAX_ERROR_BODY_BYTES = 8_192
 
+/**
+ * Authoritative Master error code emitted ONLY on HTTP 503 when Master proves
+ * the previous `clientMessageId` dispatch was terminal `not_accepted` with
+ * zero billing evidence (OCV5-73). Never emitted for `executed_error`,
+ * recovery sentinels, `in_flight`, or billed dispatches.
+ */
+export const CRON_ORIGIN_PREVIOUSLY_FAILED_UNEXECUTED_CODE = 'PREVIOUSLY_FAILED_UNEXECUTED'
+
 export function readV3CronOriginInjectConfig(
   env: NodeJS.ProcessEnv = process.env,
 ): V3WechatOutboundConfig | null {
@@ -71,11 +79,10 @@ function isPreviouslyFailedResponse(
   statusCode: number,
   info: CronOriginInjectErrorInfo | null,
 ): boolean {
-  if (!info) return false
-  if (info.code === 'TURN_PREVIOUSLY_FAILED' || info.code === 'PREVIOUSLY_FAILED') {
-    return true
-  }
-  return statusCode === 503 && info.message === 'previously_failed'
+  return (
+    statusCode === 503 &&
+    info?.code === CRON_ORIGIN_PREVIOUSLY_FAILED_UNEXECUTED_CODE
+  )
 }
 
 export async function postCronOriginInject(
@@ -108,7 +115,7 @@ export async function postCronOriginInject(
     })
     const chunks: Buffer[] = []
     let capturedBytes = 0
-    const shouldCapture = res.statusCode !== 200 && res.statusCode !== 404
+    const shouldCapture = res.statusCode !== 200 && res.statusCode !== 404 && res.statusCode !== 409
     try {
       for await (const chunk of res.body) {
         if (shouldCapture && capturedBytes < MAX_ERROR_BODY_BYTES) {
@@ -123,16 +130,16 @@ export async function postCronOriginInject(
     }
     if (res.statusCode === 200) return { kind: 'injected' }
     if (res.statusCode === 404) return { kind: 'gone' }
+    if (res.statusCode === 409) return { kind: 'in_flight' }
     const errorInfo = parseCronOriginInjectErrorBody(chunks)
     if (isPreviouslyFailedResponse(res.statusCode, errorInfo)) {
-      log.warn('cron-origin-inject clientMessageId previously failed on master', {
+      log.warn('cron-origin-inject clientMessageId previously failed (unexecuted) on master', {
         status: res.statusCode,
         ...(errorInfo?.code ? { code: errorInfo.code } : {}),
         ...(errorInfo?.message ? { message: errorInfo.message } : {}),
       })
       return { kind: 'previously_failed' }
     }
-    if (res.statusCode === 409) return { kind: 'in_flight' }
     log.warn('cron-origin-inject unexpected status', {
       status: res.statusCode,
       ...(errorInfo?.code ? { code: errorInfo.code } : {}),
