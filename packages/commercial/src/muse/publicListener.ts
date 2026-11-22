@@ -160,7 +160,7 @@ export function startMusePublicListener(deps: MusePublicListenerDeps): MusePubli
     }
   }
 
-  const retryMs = deps.retryMs ?? 2_000
+  const retryMs = deps.retryMs ?? 250
   const deadline = Date.now() + (deps.maxWaitMs ?? 10 * 60_000)
   const ready = new Promise<number | null>((resolve) => {
     const attempt = () => {

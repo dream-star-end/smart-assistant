@@ -35,6 +35,7 @@ import {
   runBoxExecVideoJob,
 } from './boxExecVideo.js'
 
+import { defaultCutoverInFlightTracker } from '../deploy/cutoverReadiness.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
 import {
   MUSE_BACKGROUND_TTL_MS,
@@ -370,7 +371,7 @@ export class MuseBridgeHub {
   private readonly boxExecPollMs: number
   private readonly boxExecRetrySleep?: (ms: number, signal?: AbortSignal) => Promise<void>
   private reservedBox = 0
-  /** Box-exec jobs waiting for a relay slot, and the ones running on it. */
+  private nonDurableSubmitting = 0
   private readonly boxExecPending: HubJob[] = []
   private readonly boxExecInflight = new Set<HubJob>()
 
@@ -498,9 +499,11 @@ export class MuseBridgeHub {
     return [...this.sessions.values()].some((s) => this.sessionOnline(s))
   }
 
-  /** Sent to the bridge in /hello: how many jobs it may run at once. */
-  bridgeConcurrency(): number {
-    return this.perBridgeConcurrency
+  bridgeConcurrency(): number { return this.perBridgeConcurrency }
+  activeNonDurableJobCount(): number {
+    let n = this.nonDurableSubmitting
+    for (const j of this.jobs.values()) if (!j.durable && (j.state !== 'done' || this.persisted.has(j.id))) n += 1
+    return n
   }
 
   private sessionOnline(session: Session): boolean {
@@ -890,7 +893,7 @@ export class MuseBridgeHub {
       this.durability && spec.kind === 'video' && opts.sessionKey !== undefined
         ? await this.durability.validateOrigin(userId, opts.sessionKey)
         : undefined
-    // Offline jobs are admitted once, then consume the same bounded retry budget as failures.
+    if (!origin && defaultCutoverInFlightTracker.isFencing()) throw new MuseError(503, 'CUTOVER_FENCING_RETRY_LATER', 'master cutover fencing active; retry later', true)
     const version = this.sessions.values().next().value?.version ?? null
     if (
       !this.multiBridge && this.bridgeOnline() && spec.source_images?.length &&
@@ -939,20 +942,11 @@ export class MuseBridgeHub {
     this.reserved.set(key, pending + 1)
     const own = this.reservedByUser.get(userId) ?? { count: 0, credits: 0n }
     this.reservedByUser.set(userId, { count: own.count + 1, credits: own.credits + price })
+    if (!origin) this.nonDurableSubmitting += 1
     try {
-      // Other admissions of this account in this process, not yet in the database.
-      return await this.admit(
-        userId,
-        containerId,
-        spec,
-        pending,
-        price,
-        own.credits,
-        opts.jobId,
-        origin,
-        routeBox,
-      )
+      return await this.admit(userId, containerId, spec, pending, price, own.credits, opts.jobId, origin, routeBox)
     } finally {
+      if (!origin) this.nonDurableSubmitting = Math.max(0, this.nonDurableSubmitting - 1)
       if (routeBox) this.reservedBox -= 1
       else this.reservedTotal -= 1
       const left = (this.reserved.get(key) ?? 1) - 1

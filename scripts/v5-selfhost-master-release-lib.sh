@@ -2422,24 +2422,24 @@ SQL
   log "  --allow-inflight: adopted exact-source registered permission; 用户 11:48 授权个人版不等在途请求"
 }
 
-# OCV5-513: wait after the build, before arming recovery or changing live units.
-# This is an idle snapshot, not an admission fence; new arrivals can still race.
+# OCV5-513 / OCV5-854: tiered idle gate (delegates to dual-slot lib when loaded).
 cutover_wait_for_user_idle() {
+  if declare -F selfhost_cutover_wait_for_safe_window >/dev/null 2>&1; then
+    selfhost_cutover_wait_for_safe_window
+    return $?
+  fi
   local counts started=$SECONDS deadline=$((SECONDS + 600))
   if [[ "${ALLOW_INFLIGHT:-0}" == 1 ]]; then
     [[ "${PG_DB:-}" == openclaude_v5_selfhost ]] || { cutover_clog "  ✗ --allow-inflight 仅用于 selfhost"; return 1; }
     if [[ "$DRY" != 1 ]]; then
       if ! lease_train_load_lib || ! lease_inflight_train_allowed "${LEASE_TRAIN_ID:-}" "${LEASE_TARGET_SHA:-}"; then
-        cutover_clog "  ✗ --allow-inflight 缺少正式列车的精确源授权;拒绝切换"
-        return 1
+        cutover_clog "  ✗ --allow-inflight 缺少正式列车的精确源授权;拒绝切换"; return 1
       fi
     fi
-    cutover_clog "  --allow-inflight: 跳过个人版600s空闲/在途检查;用户已接受在途回合可能中断"
-    return 0
+    cutover_clog "  --allow-inflight: 跳过个人版600s空闲/在途检查;用户已接受在途回合可能中断"; return 0
   fi
   if [[ "$DRY" == 1 ]]; then
-    cutover_clog "  [dry-run] 切换前等待全部用户回合结束(只读,最多 600s;不查询数据库)"
-    return 0
+    cutover_clog "  [dry-run] 切换前等待全部用户回合结束(只读,最多 600s;不查询数据库)"; return 0
   fi
   while :; do
     if ! counts="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
@@ -2452,18 +2452,15 @@ SELECT
      SELECT 1 FROM turn_dispatches d WHERE d.dispatch_id=j.dispatch_id
        AND d.status='terminal' AND d.terminal_at IS NOT NULL));
 COMMIT;")"; then
-      cutover_clog "  ✗ 无法只读确认用户空闲;拒绝切换,旧 master 继续运行"
-      return 1
+      cutover_clog "  ✗ 无法只读确认用户空闲;拒绝切换,旧 master 继续运行"; return 1
     fi
     if [[ ! "$counts" =~ ^[0-9]+\|[0-9]+$ ]]; then
-      cutover_clog "  ✗ 空闲查询结果无效;拒绝切换,旧 master 继续运行"
-      return 1
+      cutover_clog "  ✗ 空闲查询结果无效;拒绝切换,旧 master 继续运行"; return 1
     fi
     cutover_clog "  idle snapshot UTC=$(date -u +%FT%TZ) open_dispatches=${counts%|*} unclassified_journals=${counts#*|} elapsed=$((SECONDS - started))s"
     [[ "$counts" == '0|0' ]] && return 0
     if (( SECONDS >= deadline )); then
-      cutover_clog "  ✗ 等待空闲 600s 超时;拒绝切换,旧 master 继续运行"
-      return 1
+      cutover_clog "  ✗ 等待空闲 600s 超时;拒绝切换,旧 master 继续运行"; return 1
     fi
     sleep 5
   done
@@ -2472,18 +2469,18 @@ COMMIT;")"; then
 REMOTE_V4_CUTOVER_DRAINED=0
 
 remote_v4_cutover_reopen() {
-  local sock="${OC_REMOTE_V4_DRAIN_SOCKET:-/run/openclaude-v5-selfhost/remote-v4-drain.sock}"
+  local sock
+  if declare -F selfhost_master_active_drain_sock >/dev/null 2>&1; then sock="$(selfhost_master_active_drain_sock)"; else sock="${OC_REMOTE_V4_DRAIN_SOCKET:-/run/openclaude-v5-selfhost/remote-v4-drain.sock}"; fi
   REMOTE_V4_CUTOVER_DRAINED=0
   [[ "${DRY:-0}" != 1 ]] || return 0
   [[ -S "$sock" ]] || return 0
   bash "$SCRIPT_DIR/agent-remote/drain-remote-v4.sh" --reopen --socket "$sock" >/dev/null 2>&1 || true
 }
 
-# OCV5-749 AC-5: R1 generation cutover drain fence. Closes new remote-pool admissions
-# (`REMOTE_POOL_DRAINING_RETRY_LATER`) and waits for active relays + remote journals;
-# aborts cutover without killing active turns if drain times out.
+# OCV5-749 AC-5 / OCV5-854: R1 generation cutover drain fence (slot-aware socket).
 remote_v4_cutover_drain() {
-  local sock="${OC_REMOTE_V4_DRAIN_SOCKET:-/run/openclaude-v5-selfhost/remote-v4-drain.sock}"
+  local sock
+  if declare -F selfhost_master_active_drain_sock >/dev/null 2>&1; then sock="$(selfhost_master_active_drain_sock)"; else sock="${OC_REMOTE_V4_DRAIN_SOCKET:-/run/openclaude-v5-selfhost/remote-v4-drain.sock}"; fi
   local timeout_ms="${OC_REMOTE_V4_DRAIN_TIMEOUT_MS:-600000}"
   local run_id="${LEASE_TRAIN_ID:-cutover-$$}" out rc=0 v4_active has_version
   if [[ "${ALLOW_INFLIGHT:-0}" == 1 ]]; then

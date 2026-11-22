@@ -113,13 +113,16 @@ export class ConnectionRegistry {
   }
 
   /** 清空。服务重启/发版时调用(给每个 conn 发 cause='shutdown' 的 close——
-   *  瞬态语义,前端自动重连,**不是** kick)。 */
-  closeAll(reason = "server shutting down"): void {
+   *  瞬态语义,前端自动重连,**不是** kick)。返回被关闭的连接数。 */
+  closeAll(reason = "server shutting down"): number {
+    let closed = 0;
     for (const list of this.byUser.values()) {
       for (const c of list) {
+        closed += 1;
         try { c.close(reason, "shutdown"); } catch { /* */ }
       }
     }
     this.byUser.clear();
+    return closed;
   }
 }

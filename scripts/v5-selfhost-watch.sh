@@ -25,6 +25,7 @@ WATCH_LOCK_TTL_SEC="${WATCH_LOCK_TTL_SEC:-3600}"
 WATCH_MASTER_URL="${WATCH_MASTER_URL:-http://127.0.0.1:18790/healthz}"
 WATCH_EGRESS_URL="${WATCH_EGRESS_URL:-http://172.31.0.1:18892/internal/v5/egress-health}"
 WATCH_MASTER_UNIT="${WATCH_MASTER_UNIT:-openclaude-v5-selfhost.service}"
+WATCH_MASTER_SLOT_TPL="${WATCH_MASTER_SLOT_TPL:-openclaude-v5-selfhost@.service}"; WATCH_FRONTDOOR_UNIT="${WATCH_FRONTDOOR_UNIT:-openclaude-v5-selfhost-frontdoor.service}"
 WATCH_EGRESS_UNIT="${WATCH_EGRESS_UNIT:-openclaude-v5-selfhost-egress.service}"
 WATCH_EGRESS_SLOT_TPL="${WATCH_EGRESS_SLOT_TPL:-openclaude-v5-selfhost-egress@.service}"
 WATCH_LIVE="${WATCH_LIVE:-/opt/openclaude/openclaude-v5-selfhost-live}"
@@ -318,14 +319,12 @@ unit_is_active() {
   fi
   st="$(systemctl is-active "$unit" 2>/dev/null || true)"
   [[ "$st" == "active" ]] && return 0
-  # 2026-09-05 蓝绿双槽:egress 可能由 egress@A/egress@B 任一槽承载,legacy 单 unit 不 active
-  # 属正常。任一槽 active 即视为 egress unit 在。
+  # 蓝绿双槽:master(frontdoor+@A/@B)与 egress(@A/@B)任一活槽即视为 unit 在。
+  if [[ "$unit" == "$WATCH_MASTER_UNIT" && "$(systemctl is-active "$WATCH_FRONTDOOR_UNIT" 2>/dev/null || true)" == "active" ]]; then
+    local ms; for ms in A B; do [[ "$(systemctl is-active "${WATCH_MASTER_SLOT_TPL/@./@$ms.}" 2>/dev/null || true)" == "active" ]] && return 0; done
+  fi
   if [[ "$unit" == "$WATCH_EGRESS_UNIT" ]]; then
-    local s
-    for s in A B; do
-      st="$(systemctl is-active "${WATCH_EGRESS_SLOT_TPL/@./@$s.}" 2>/dev/null || true)"
-      [[ "$st" == "active" ]] && return 0
-    done
+    local s; for s in A B; do [[ "$(systemctl is-active "${WATCH_EGRESS_SLOT_TPL/@./@$s.}" 2>/dev/null || true)" == "active" ]] && return 0; done
   fi
   return 1
 }
@@ -640,14 +639,39 @@ tier1_rollback_legacy() {
   (( eg_rc == 0 )) || return "$eg_rc"
   eg_wait="$(watch_egress_wait_timeout 90)"
   timeout "$eg_wait" bash -c 'until (exec 3<>/dev/tcp/172.31.0.1/18892) 2>/dev/null; do sleep 1; done' || true
-  systemctl restart "$WATCH_MASTER_UNIT"
-  return 0
+  restart_master_for_live
 }
 
-# egress 重启:live 自带双槽模板 → 起另一个槽再 stop --no-block 当前槽(零停机);
-# 否则 legacy 单 unit restart(先停两槽,腾出 18892)。与 deploy-v5-selfhost.sh
-# egress_slot_flip 同语义的精简版;watch 是独立脚本,不 source deploy lib。
-# OCV5-818: 新槽未确认就绪绝不停旧槽;整拍预算不足时返回 76 持久化待续阶段交下一拍。
+# OCV5-854 (B13): dual-slot recovery even when both @A/@B are dead while frontdoor is active.
+restart_master_for_live() {
+  local live target="" u sa sb pport hz phz i wait_s="${WATCH_MASTER_READY_TIMEOUT_SEC:-45}" st_file="${WATCH_FRONTDOOR_STATE_FILE:-/var/lib/openclaude-v5-selfhost/frontdoor-state.json}" slot_pfx="${WATCH_SLOT_LINK_PREFIX:-/opt/openclaude/openclaude-v5-selfhost-slot}"
+  live="$(readlink -f -- "$WATCH_LIVE" 2>/dev/null || true)"; sa="${WATCH_MASTER_SLOT_TPL/@./@A.}"; sb="${WATCH_MASTER_SLOT_TPL/@./@B.}"
+  if [[ "$(systemctl is-active "$WATCH_FRONTDOOR_UNIT" 2>/dev/null || true)" == "active" || "$(systemctl is-active "$sa" 2>/dev/null || true)" == "active" || "$(systemctl is-active "$sb" 2>/dev/null || true)" == "active" ]]; then
+    if [[ "$(systemctl is-active "$sa" 2>/dev/null || true)" == "active" && "$(systemctl is-active "$sb" 2>/dev/null || true)" != "active" ]]; then target=A
+    elif [[ "$(systemctl is-active "$sb" 2>/dev/null || true)" == "active" && "$(systemctl is-active "$sa" 2>/dev/null || true)" != "active" ]]; then target=B
+    else
+      [[ -r "$st_file" ]] && target="$(jq -r '.slot // empty' "$st_file" 2>/dev/null || true)"
+      if [[ "$target" != "A" && "$target" != "B" ]]; then
+        if [[ -n "${WATCH_DEPLOY_STATE_SLOT_CMD:-}" ]]; then target="$("$WATCH_DEPLOY_STATE_SLOT_CMD" 2>/dev/null || true)"; else target="$(su - postgres -c "psql -X -qAt -d openclaude_v5_selfhost -c 'SELECT active_slot FROM deploy_state WHERE singleton=true;'" 2>/dev/null || true)"; fi
+      fi
+      [[ "$target" == "A" || "$target" == "B" ]] || target=A
+    fi
+    u="${WATCH_MASTER_SLOT_TPL/@./@$target.}"; [[ -n "$live" && -d "$live" ]] && ln -sfn -- "$live" "${slot_pfx}-${target}"
+    systemctl restart "$u" || { wlog "restart_master_for_live: restart $u failed"; return 1; }
+    systemctl start "$WATCH_FRONTDOOR_UNIT" || { wlog "restart_master_for_live: start $WATCH_FRONTDOOR_UNIT failed"; return 1; }
+    [[ "$target" == A ]] && pport="${WATCH_PRIV_PORT_A:-18896}" || pport="${WATCH_PRIV_PORT_B:-18897}"
+    for (( i = 1; i <= wait_s; i++ )); do
+      if [[ -n "${WATCH_MASTER_VERIFY_CMD:-}" ]]; then "$WATCH_MASTER_VERIFY_CMD" "$target" && return 0
+      elif phz="$(curl -fsS --max-time 3 "http://127.0.0.1:${pport}/healthz" 2>/dev/null)" && [[ -n "$phz" ]] && printf '%s\n' "$phz" | jq -e '.ok==true and .leadership.state=="leader" and .vip=="owner"' >/dev/null 2>&1 \
+        && hz="$(curl -fsS --max-time 3 "$WATCH_MASTER_URL" 2>/dev/null)" && [[ -n "$hz" ]] && printf '%s\n' "$hz" | jq -e '.ok==true' >/dev/null 2>&1; then return 0; fi
+      sleep 1
+    done
+    wlog "restart_master_for_live: slot $target ($u) failed priv+18790 health check"; return 1
+  fi
+  systemctl restart "$WATCH_MASTER_UNIT"
+}
+
+# egress 重启:live 自带双槽模板 → 蓝绿翻槽(OCV5-818);否则 legacy 单 unit。
 restart_egress_for_live() {
   local live sa sb cur target s
   live="$(readlink -f -- "$WATCH_LIVE" 2>/dev/null || true)"
@@ -700,22 +724,16 @@ restart_egress_for_live() {
       return 1
     fi
     if [[ -n "$cur" ]]; then
-      # 先阻塞关旧 .socket(ignore-dependencies 绕开 Requires 反向传播),再 --no-block 停
-      # service:否则 service drain 期间 .socket 仍持有 reuseport 组里一个没人 accept 的
-      # listener,约一半新连接被黑洞(2026-09-07 两班列车 egress-health 失败的根因)。
+      # 先阻塞关旧 .socket(ignore-dependencies),再 --no-block 停 service,防 reuseport 黑洞。
       systemctl stop --job-mode=ignore-dependencies "${WATCH_EGRESS_SLOT_TPL/@.service/@$cur.socket}" || return 1
       systemctl stop --no-block "${WATCH_EGRESS_SLOT_TPL/@./@$cur.}" || true
     fi
   else
-    for s in A B; do
-      systemctl stop "${WATCH_EGRESS_SLOT_TPL/@.service/@$s.socket}" "${WATCH_EGRESS_SLOT_TPL/@./@$s.}" 2>/dev/null || true
-    done
+    for s in A B; do systemctl stop "${WATCH_EGRESS_SLOT_TPL/@.service/@$s.socket}" "${WATCH_EGRESS_SLOT_TPL/@./@$s.}" 2>/dev/null || true; done
     systemctl restart "$WATCH_EGRESS_UNIT"
   fi
 }
 
-# 完成被整拍预算延后的 egress 槽翻转(须经 watch_policy_mutation 保护调用):
-# 仅在确认新槽健康后才停旧槽并重启 master。
 complete_deferred_egress_flip_legacy() {
   local cur="${WATCH_RESUME_CUR:-}" target="${WATCH_RESUME_TARGET:-A}" eg_wait
   if [[ -n "$cur" ]]; then
@@ -724,7 +742,7 @@ complete_deferred_egress_flip_legacy() {
   fi
   eg_wait="$(watch_egress_wait_timeout 90)"
   timeout "$eg_wait" bash -c 'until (exec 3<>/dev/tcp/172.31.0.1/18892) 2>/dev/null; do sleep 1; done' || true
-  systemctl restart "$WATCH_MASTER_UNIT"
+  restart_master_for_live
 }
 
 complete_deferred_legacy_egress_legacy() {
@@ -734,14 +752,10 @@ complete_deferred_legacy_egress_legacy() {
   (( eg_rc == 0 )) || return "$eg_rc"
   eg_wait="$(watch_egress_wait_timeout 90)"
   timeout "$eg_wait" bash -c 'until (exec 3<>/dev/tcp/172.31.0.1/18892) 2>/dev/null; do sleep 1; done' || true
-  systemctl restart "$WATCH_MASTER_UNIT"
+  restart_master_for_live
 }
 
-# OCV5-818: 与 packages/commercial/src/agent-sandbox/syntheticEvalOverlayRuntime.ts
-# readSyntheticEvalReleaseSourceCommit + assertRootOwnedSafe 保持同一契约(fail-closed):
-# 1. 解析后目录与 .complete 均为非符号链接的真实目录/普通文件,uid=0,不可 group/other 写(mode&022==0)
-# 2. 严格 JSON 解析(拒绝空文件/畸形 JSON),sourceCommit 为 40 位十六进制字符串
-# 3. 缺少 python3 一律拒绝(不静默放行)
+# OCV5-818: fail-closed 校验 release 目录与 .complete(root:0/go-w/非空 JSON 40 位 sourceCommit)。
 watch_release_complete_valid() { # <wd>
   local wd="$1"
   command -v python3 >/dev/null 2>&1 || return 1
@@ -877,7 +891,7 @@ PY
   (( eg_rc == 0 )) || return "$eg_rc"
   eg_wait="$(watch_egress_wait_timeout 90)"
   timeout "$eg_wait" bash -c 'until (exec 3<>/dev/tcp/172.31.0.1/18892) 2>/dev/null; do sleep 1; done' || true
-  systemctl restart "$WATCH_MASTER_UNIT"
+  restart_master_for_live
 }
 
 live_backup_current_path() {
@@ -2120,23 +2134,14 @@ host_pg_backup_check() {
 }
 
 host_checks() {
-  local gib=1073741824 avail level sev
+  local gib=1073741824 avail level=ok sev=info
   avail="$(host_disk_avail_bytes || true)"
   if [[ "$avail" =~ ^[0-9]+$ ]]; then
-    level=ok
-    sev=info
-    if (( avail < WATCH_DISK_CRIT_GIB * gib )); then
-      level=critical
-      sev=critical
-    elif (( avail < WATCH_DISK_WARN_GIB * gib )); then
-      level=warning
-      sev=warning
-    fi
+    if (( avail < WATCH_DISK_CRIT_GIB * gib )); then level=critical; sev=critical
+    elif (( avail < WATCH_DISK_WARN_GIB * gib )); then level=warning; sev=warning; fi
     host_notify disk "$level" "$sev" disk_low "根盘 ${WATCH_DISK_PATH} 剩余 $(( avail / gib )) GiB（warning <${WATCH_DISK_WARN_GIB}、critical <${WATCH_DISK_CRIT_GIB} GiB；发布门要 8 GiB）。下一步：du -xsh /opt/openclaude/tmp /var/lib/docker/volumes/* /var/backups/* 找增长源；只清自己建的 worktree 与临时文件。"
   fi
-  host_pg_backup_check || true
-  host_autosave_check || true
-  return 0
+  host_pg_backup_check || true; host_autosave_check || true; return 0
 }
 
 usage_watch() {
@@ -2199,19 +2204,10 @@ main() {
     --release-policy-probe) watch_release_policy_probe ;;
     -h|--help) usage_watch; exit 0 ;;
     --selftest) watch_selftest ;;
-    # 本拍(含 set -e 中断)结束时投递已入队告警;保留原退出码。不用 `|| rc=$?`,
-    # 那会让 watch_once 内部的 set -e 全部失效。
     --once|"") trap 'watch_exit_rc=$?; watch_alert_flush; exit "$watch_exit_rc"' EXIT; host_checks || true; watch_once ;;
     --rearm) trap 'watch_exit_rc=$?; watch_alert_flush; exit "$watch_exit_rc"' EXIT; watch_rearm ;;
     --auto-recover) trap 'watch_exit_rc=$?; watch_alert_flush; exit "$watch_exit_rc"' EXIT; watch_auto_recover "${2:-}" ;;
-    *)
-      echo "未知参数: $1" >&2
-      usage_watch >&2
-      exit 2
-      ;;
+    *) echo "未知参数: $1" >&2; usage_watch >&2; exit 2 ;;
   esac
 }
-
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-  main "${1:-}" "${2:-}"
-fi
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "${1:-}" "${2:-}"; fi

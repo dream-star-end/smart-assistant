@@ -26,6 +26,7 @@ import {
   parseChatGptProxyUsername,
 } from '@openclaude/protocol/chatgptProxy'
 
+import { defaultCutoverInFlightTracker } from '../deploy/cutoverReadiness.js'
 import type { Logger } from '../logging/logger.js'
 
 const MAX_TUNNELS_PER_USER = 64
@@ -154,6 +155,10 @@ export function createChatGptProxyServer(deps: ChatGptProxyServerDeps): ChatGptP
       rejectConnect(clientSocket, 503, 'Service Unavailable')
       return
     }
+    if (defaultCutoverInFlightTracker.isFencing()) {
+      rejectConnect(clientSocket, 503, 'Service Unavailable', { 'Retry-After': '1' })
+      return
+    }
     if (isIpThrottled(remote)) {
       rejectConnect(clientSocket, 429, 'Too Many Requests')
       return
@@ -167,7 +172,7 @@ export function createChatGptProxyServer(deps: ChatGptProxyServerDeps): ChatGptP
       return
     }
     const uid = parseChatGptProxyUsername(creds.username)
-    if (uid === null || !(await deps.verifyCredential(uid, creds.password))) {
+    if (uid === null) {
       noteAuthFail(remote)
       rejectConnect(clientSocket, 407, 'Proxy Authentication Required', {
         'Proxy-Authenticate': REALM,
@@ -175,46 +180,71 @@ export function createChatGptProxyServer(deps: ChatGptProxyServerDeps): ChatGptP
       return
     }
 
-    const [entitlement, role] = await Promise.all([
-      deps.getEntitlement(),
-      deps.resolveUserRole(uid),
-    ])
-    if (
-      !entitlement.assembled ||
-      role === null ||
-      (role !== 'admin' && !entitlement.allowlist.includes(uid))
-    ) {
-      log?.info('chatgpt_proxy.forbidden', {
-        uid,
-        reason: role === null ? 'inactive' : 'not_entitled',
-      })
-      rejectConnect(clientSocket, 403, 'Forbidden')
-      return
-    }
+    // Reserve an in-flight cutover slot synchronously before the first await so
+    // readiness cannot observe 0 while async credential/role checks are pending,
+    // then hand off atomically to `tunnels.size` or release on rejection/error.
+    const releasePendingConnect = defaultCutoverInFlightTracker.begin('chatgptProxy')
+    let target: ReturnType<typeof parseChatGptProxyConnectTarget>
+    try {
+      if (!(await deps.verifyCredential(uid, creds.password))) {
+        noteAuthFail(remote)
+        rejectConnect(clientSocket, 407, 'Proxy Authentication Required', {
+          'Proxy-Authenticate': REALM,
+        })
+        return
+      }
 
-    const target = parseChatGptProxyConnectTarget(req.url ?? '')
-    if (
-      !target ||
-      target.port !== CHATGPT_PROXY_ALLOWED_PORT ||
-      !isChatGptProxyAllowedHost(target.host)
-    ) {
-      log?.info('chatgpt_proxy.target_rejected', { uid, target: bounded(req.url, 128) })
-      rejectConnect(clientSocket, 403, 'Forbidden')
-      return
-    }
+      const [entitlement, role] = await Promise.all([
+        deps.getEntitlement(),
+        deps.resolveUserRole(uid),
+      ])
+      if (
+        !entitlement.assembled ||
+        role === null ||
+        (role !== 'admin' && !entitlement.allowlist.includes(uid))
+      ) {
+        log?.info('chatgpt_proxy.forbidden', {
+          uid,
+          reason: role === null ? 'inactive' : 'not_entitled',
+        })
+        rejectConnect(clientSocket, 403, 'Forbidden')
+        return
+      }
 
-    if (tunnels.size >= MAX_TUNNELS_GLOBAL || (perUser.get(uid) ?? 0) >= MAX_TUNNELS_PER_USER) {
-      rejectConnect(clientSocket, 429, 'Too Many Requests')
-      return
-    }
+      target = parseChatGptProxyConnectTarget(req.url ?? '')
+      if (
+        !target ||
+        target.port !== CHATGPT_PROXY_ALLOWED_PORT ||
+        !isChatGptProxyAllowedHost(target.host)
+      ) {
+        log?.info('chatgpt_proxy.target_rejected', { uid, target: bounded(req.url, 128) })
+        rejectConnect(clientSocket, 403, 'Forbidden')
+        return
+      }
 
-    // Reserve the slot synchronously right after the cap check (zero awaits in
-    // between): pending upstream handshakes count against the same caps as
-    // active tunnels, so concurrent CONNECTs cannot both claim the last slot
-    // and pending upstreams cannot pile up beyond the cap.
-    tunnels.add(clientSocket)
-    perUser.set(uid, (perUser.get(uid) ?? 0) + 1)
-    deps.onTunnelUsed?.(uid)
+      // Re-check fencing synchronously right before joining `tunnels` so a fence
+      // toggled during async auth/role lookups rejects cleanly without entering tunnels.
+      if (closing || defaultCutoverInFlightTracker.isFencing()) {
+        rejectConnect(clientSocket, 503, 'Service Unavailable', { 'Retry-After': '1' })
+        return
+      }
+
+      if (tunnels.size >= MAX_TUNNELS_GLOBAL || (perUser.get(uid) ?? 0) >= MAX_TUNNELS_PER_USER) {
+        rejectConnect(clientSocket, 429, 'Too Many Requests')
+        return
+      }
+
+      // Reserve the slot synchronously right after the cap check (zero awaits in
+      // between): pending upstream handshakes count against the same caps as
+      // active tunnels, so concurrent CONNECTs cannot both claim the last slot
+      // and pending upstreams cannot pile up beyond the cap.
+      tunnels.add(clientSocket)
+      perUser.set(uid, (perUser.get(uid) ?? 0) + 1)
+      deps.onTunnelUsed?.(uid)
+      releasePendingConnect()
+    } finally {
+      releasePendingConnect()
+    }
 
     const startedAt = now()
     let upstream: Socket | null = null
@@ -373,7 +403,7 @@ export function createChatGptProxyServer(deps: ChatGptProxyServerDeps): ChatGptP
       })
     },
     listenWithRetry(opts = {}): void {
-      const retryMs = opts.retryMs ?? 2_000
+      const retryMs = opts.retryMs ?? 250
       const deadline = now() + (opts.maxWaitMs ?? 10 * 60_000)
       const attempt = () => {
         if (closing) return

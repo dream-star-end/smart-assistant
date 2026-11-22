@@ -94,6 +94,11 @@ import {
   privatePortForSlot,
   type ControlListener,
 } from "../deploy/controlListener.js";
+import {
+  defaultCutoverInFlightTracker,
+  handleCutoverControlRequest,
+  rejectIfCutoverFencing,
+} from "../deploy/cutoverReadiness.js";
 import type { DesiredWatch, Slot } from "../deploy/deployState.js";
 import type { LeaderLeaseController, LeadershipStatus } from "../deploy/leaderLease.js";
 import {
@@ -630,6 +635,9 @@ export async function bootstrapInternalProxyAndListeners(
           service: deps.mediaGenerationService,
         });
       const museInternalHandler = makeMuseInternalHandler({ identityRepo, hub: deps.museHub });
+      defaultCutoverInFlightTracker.setMuseJobsGetter(
+        () => deps.museHub?.activeNonDurableJobCount() ?? 0,
+      );
       const sitesInternalHandler = makeSitesInternalHandler({
         identityRepo,
         sites: deps.sitesService,
@@ -1328,6 +1336,22 @@ export async function bootstrapInternalProxyAndListeners(
           return;
         }
         if (
+          req.socket.localPort === privatePortForSlot(deps.ocSlot) &&
+          handleCutoverControlRequest(req, res, {
+            slot: deps.ocSlot,
+            secret: deps.cfg.OC_EGRESS_SECRET,
+            verifySecret: deps.verifyEgressSecret,
+            getLeadership: currentLeadership,
+            getControlListener: () => controlListener,
+            desiredWatch: deps.deployDesiredWatch,
+            getActiveBrowserWs: () => deps.getCronOriginBridge()?.registry.total() ?? 0,
+            drainBrowserWebSockets: () => deps.getCronOriginBridge()?.drainBrowserWebSockets?.() ?? 0,
+            getContainerLinkEnabled: () => deps.getCronOriginBridge()?.containerLinkEnabled === true,
+          })
+        ) {
+          return;
+        }
+        if (
           deps.dualMasterEnabled &&
           req.socket.localPort === privatePortForSlot(deps.ocSlot) &&
           handleSlotRelayRequest(req, res, {
@@ -1533,7 +1557,7 @@ export async function bootstrapExternalApiKeyProxy(deps: {
           "[commercial] cursor external API outbox not configured; cursor engine models unavailable on api-key proxy",
         );
       }
-      externalApiKeyProxy = makeAnthropicProxyHandler({
+      const rawExternalApiKeyProxy = makeAnthropicProxyHandler({
         pgPool: getPool(),
         pricing: deps.pricing,
         preCheckRedis: deps.preCheckRedis,
@@ -1556,6 +1580,15 @@ export async function bootstrapExternalApiKeyProxy(deps: {
         getSessionPinMode,
         listEnabledAccountGroupsForModel: listEnabledGroupsForModel,
       });
+      externalApiKeyProxy = async (req, res, ctx) => {
+        if (rejectIfCutoverFencing(res)) return;
+        const release = defaultCutoverInFlightTracker.begin("externalApi", res);
+        try {
+          await rawExternalApiKeyProxy(req, res, ctx);
+        } finally {
+          release();
+        }
+      };
       // eslint-disable-next-line no-console
       console.log(
         "[commercial] external api-key anthropic proxy assembled (POST /api/anthropic/v1/messages + GET /v1/models + GET /v1/usage, engine models via relay)",

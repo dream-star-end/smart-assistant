@@ -77,6 +77,7 @@ import {
 } from "../compute-pool/nodeAgentClient.js";
 import * as computeQueries from "../compute-pool/queries.js";
 import type { CommercialConfig } from "../config.js";
+import { defaultCutoverInFlightTracker } from "../deploy/cutoverReadiness.js";
 import { getPool } from "../db/index.js";
 import type { DispatchAdmissionBackend } from "../db/pgSessionsBackend.js";
 import { tx } from "../db/queries.js";
@@ -890,6 +891,8 @@ export function buildContainerHelpersAndPreview(deps: {
             getFlags: () => getChatGptProxyFlagSnapshot(),
           };
           chatgptProxyServer.listenWithRetry();
+          const cgpSrv = chatgptProxyServer;
+          defaultCutoverInFlightTracker.setChatgptProxyTunnelsGetter(() => cgpSrv.activeTunnels());
           // eslint-disable-next-line no-console
           console.log(
             `[commercial] ChatGPT direct-connect proxy ENABLED on ${cgpEnv.publicHost}:${cgpEnv.port}`,

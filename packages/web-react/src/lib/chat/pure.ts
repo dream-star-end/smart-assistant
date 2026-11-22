@@ -743,6 +743,8 @@ export type CloseDecision = {
   provisioning: boolean;
   /** CLOSE_REASON_LABELS 命中文案（4503/4504 错误类 reason）。*/
   closeReasonLabel: string;
+  /** 4509 服务重启首次重连允许走短抖动 [250, 600)ms（双槽秒级切流零闪烁）。*/
+  fastFirstReconnect?: boolean;
 };
 
 /**
@@ -755,13 +757,14 @@ export function classifyClose(code: number, reason: unknown): CloseDecision {
   if (policy) return { action: "policy", policy, serverHintedDelay: 0, provisioning: false, closeReasonLabel: "" };
   if (code === 1008) return { action: "auth_1008", serverHintedDelay: 0, provisioning: false, closeReasonLabel: "" };
   // 4509 服务重启/发版(服务端 CLOSE_BRIDGE.SERVER_RESTART,两端语义务必同改):瞬态,
-  // 走标准退避立即自动重连(蓝绿重启秒级),横幅露「服务更新中」;绝不弹错/不进正文。
+  // 首次走短抖动自动重连(蓝绿切流 <2s 零闪烁),后续失败回落标准退避;绝不弹错/不进正文。
   if (code === 4509) {
     return {
       action: "reconnect",
       serverHintedDelay: 0,
       provisioning: false,
       closeReasonLabel: CLOSE_REASON_LABELS.server_restart,
+      fastFirstReconnect: true,
     };
   }
 
@@ -823,6 +826,30 @@ export function isPermanentJournalError(error: unknown): boolean {
 /** 标准指数退避 + jitter（websocket.js:2313）：2/4/8/16/30s 上限 + 0–1000ms。*/
 export function backoffDelay(attempts: number): number {
   return Math.min(2000 * 2 ** attempts, 30000) + Math.random() * 1000;
+}
+
+/** 连接收到 sys.relay_ready 并持续存活达到本阈值后，才重置重连退避计数（防 accept-then-close 风暴）。*/
+export const RECONNECT_BACKOFF_RESET_MS = 10_000;
+
+/** 4509 服务重启首次重连短抖动：[250, 600) ms，远低于 2s 横幅显示延迟。*/
+export function serverRestartFirstDelay(rand: () => number = Math.random): number {
+  return 250 + rand() * 350;
+}
+
+/** 计算 onclose 的重连延迟与下一轮 attempts（serverHintedDelay 不递增；4509 仅首连短抖动）。*/
+export function nextReconnectDelay(
+  decision: Pick<CloseDecision, "serverHintedDelay" | "fastFirstReconnect">,
+  attempts: number,
+  rand: () => number = Math.random,
+): { delay: number; nextAttempts: number } {
+  if (decision.serverHintedDelay > 0) {
+    return { delay: decision.serverHintedDelay, nextAttempts: attempts };
+  }
+  const delay =
+    decision.fastFirstReconnect && attempts === 0
+      ? serverRestartFirstDelay(rand)
+      : backoffDelay(attempts);
+  return { delay, nextAttempts: attempts + 1 };
 }
 
 // ═══════════════ bridge error 归一化（websocket.js:3906-3935）═══════════════

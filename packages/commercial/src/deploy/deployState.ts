@@ -221,6 +221,8 @@ export interface DesiredWatch {
   waitReady(): Promise<DesiredSnapshot>;
   /** 立即拉一次(消费者在关键决策点需要精确判定,不等下一轮 5s tick)。 */
   refreshNow(): Promise<DesiredSnapshot>;
+  /** 立即触发一次轮询(refreshNow 的 void 别名,供私有控制口 refresh-desired 调用)。 */
+  pollNow?(): Promise<void>;
   /** 订阅 desired 变更(仅在 leader/control slot 或 generation 变化时回调);返回退订函数。 */
   onChange(cb: (snap: DesiredSnapshot) => void): () => void;
   stop(): void;

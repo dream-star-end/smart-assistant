@@ -809,6 +809,18 @@ export class ContainerLinkRegistry {
     }
     return false;
   }
+  /** Release recovery/detached handles on leader step-down via handoff semantics (linkShutdown),
+   * never synthesizing container_close / transport death that would revoke surviving Grok leases. */
+  releaseInactiveLinks(): void {
+    for (const link of [...this.links.values()]) {
+      for (const handle of [...link.consumers]) {
+        if (handle.recoveryOnly || handle.detached) {
+          handle.emit("linkShutdown");
+          link.release(handle);
+        }
+      }
+    }
+  }
   async drain(): Promise<void> { await Promise.allSettled([...this.draining].map((link) => link.drain())); }
   async shutdown(): Promise<void> {
     this.stopping = true;

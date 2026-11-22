@@ -9,6 +9,7 @@ import { connect as tlsConnect, type TLSSocket } from 'node:tls'
 import { after, before, describe, test } from 'node:test'
 
 import { createChatGptProxyServer, type ChatGptProxyServer } from '../server.js'
+import { defaultCutoverInFlightTracker } from '../../deploy/cutoverReadiness.js'
 import { createLogger } from '../../logging/logger.js'
 
 /**
@@ -99,6 +100,7 @@ describe('chatgpt proxy server', () => {
   let proxy: ChatGptProxyServer
   let port: number
   let entitled = true
+  let verifyGate: { entered: () => void; release: Promise<void> } | null = null
   const allowlist: number[] = [7]
   const used: number[] = []
   const tunnelEvents = new EventEmitter()
@@ -113,7 +115,14 @@ describe('chatgpt proxy server', () => {
       tlsCertPath: cert,
       tlsKeyPath: key,
       upstream: new URL(`http://127.0.0.1:${upstream.port}`),
-      verifyCredential: async (uid, secret) => secret === `secret-for-${uid}`,
+      verifyCredential: async (uid, secret) => {
+        const g = verifyGate
+        if (g) {
+          g.entered()
+          await g.release
+        }
+        return secret === `secret-for-${uid}`
+      },
       resolveUserRole: async (uid) =>
         uid === 3 ? 'admin' : uid === 7 || uid === 9 ? 'user' : null,
       getEntitlement: async () => ({ assembled: entitled, allowlist }),
@@ -235,6 +244,82 @@ describe('chatgpt proxy server', () => {
     assert.equal(blocked.status, 403)
     blocked.socket.destroy()
     entitled = true
+  })
+
+  test('cutover fence rejects new CONNECT with 503 + Retry-After: 1 while existing tunnel finishes', async () => {
+    const existing = await tlsRequest(
+      port,
+      `CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\nProxy-Authorization: ${basic('u3', 'secret-for-3')}\r\n\r\n`,
+    )
+    assert.equal(existing.status, 200)
+    assert.equal(proxy.activeTunnels(), 1)
+
+    defaultCutoverInFlightTracker.setFencing(true)
+    try {
+      const fenced = await tlsRequest(
+        port,
+        `CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\nProxy-Authorization: ${basic('u3', 'secret-for-3')}\r\n\r\n`,
+      )
+      assert.equal(fenced.status, 503)
+      assert.match(fenced.headers, /Retry-After:\s*1/i)
+      fenced.socket.destroy()
+      // Existing tunnel continues to relay data while fenced
+      const echoed = await new Promise<string>((resolve) => {
+        existing.socket.once('data', (c: Buffer) => resolve(c.toString('utf8')))
+        existing.socket.write('still alive')
+      })
+      assert.equal(echoed, 'STILL ALIVE')
+      const closed = once(tunnelEvents, 'closed', { signal: AbortSignal.timeout(5_000) })
+      existing.socket.destroy()
+      await closed
+      assert.equal(proxy.activeTunnels(), 0)
+    } finally {
+      defaultCutoverInFlightTracker.setFencing(false)
+    }
+  })
+
+  test('B04: CONNECT paused in async auth increments activeChatgptProxy and is rejected when fence enables mid-auth', async () => {
+    defaultCutoverInFlightTracker.setChatgptProxyTunnelsGetter(() => proxy.activeTunnels())
+    let enteredResolve!: () => void
+    let releaseResolve!: () => void
+    const enteredP = new Promise<void>((r) => { enteredResolve = r })
+    const releaseP = new Promise<void>((r) => { releaseResolve = r })
+    verifyGate = { entered: enteredResolve, release: releaseP }
+    const upstreamBefore = upstream.connects.length
+
+    try {
+      const connectP = tlsRequest(
+        port,
+        `CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\nProxy-Authorization: ${basic('u3', 'secret-for-3')}\r\n\r\n`,
+      )
+      await enteredP
+      // Pre-await begin('chatgptProxy') must make readiness observe activeChatgptProxy >= 1
+      assert.ok(
+        defaultCutoverInFlightTracker.snapshot().activeChatgptProxy >= 1,
+        'CONNECT paused during async credential verification must be counted as in-flight',
+      )
+
+      // Enable fence while auth is still in flight
+      defaultCutoverInFlightTracker.setFencing(true)
+      releaseResolve()
+
+      const res = await connectP
+      assert.equal(res.status, 503)
+      assert.match(res.headers, /Retry-After:\s*1/i)
+      res.socket.destroy()
+
+      assert.equal(proxy.activeTunnels(), 0, 'fenced CONNECT must never enter tunnels')
+      assert.equal(upstream.connects.length, upstreamBefore, 'fenced CONNECT must not dial upstream')
+      assert.equal(
+        defaultCutoverInFlightTracker.snapshot().activeChatgptProxy,
+        0,
+        'in-flight counter must return to 0 after fenced rejection',
+      )
+    } finally {
+      verifyGate = null
+      defaultCutoverInFlightTracker.setFencing(false)
+      defaultCutoverInFlightTracker.setChatgptProxyTunnelsGetter(null)
+    }
   })
 })
 

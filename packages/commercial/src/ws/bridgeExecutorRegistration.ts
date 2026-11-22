@@ -3,7 +3,7 @@ import type { ClaimedRecoveryJob } from "../dispatch/turnRecoveryStore.js";
 import type { CronOriginExecutor } from "./userChatBridge.js";
 import { getContainerLinkHandle, type ContainerLinkHandle } from "./containerLink.js";
 
-export type RecoveryExecutor = (job: ClaimedRecoveryJob) => void;
+export type RecoveryExecutor = (job: ClaimedRecoveryJob, epoch?: number) => void;
 export type BridgeExecutors = { recovery: RecoveryExecutor | null; origin: CronOriginExecutor | null };
 type ExecutorMaps = { recovery: Map<string, Set<RecoveryExecutor>>; origin: Map<string, Set<CronOriginExecutor>> };
 type Executor = (...args: never[]) => unknown;
@@ -36,10 +36,10 @@ export class ContainerLinkExecutors {
     }
     return undefined;
   }
-  readonly recovery: RecoveryExecutor = (job) => {
+  readonly recovery: RecoveryExecutor = (job, epoch) => {
     const executor = this.currentFor("recovery")?.recovery;
     if (!executor) throw new Error("container link has no execution context");
-    executor(job);
+    executor(job, epoch);
   };
   readonly origin: CronOriginExecutor = (payload) => {
     return this.currentFor("origin")?.origin?.(payload) ?? { kind: "not_claimed" };

@@ -622,13 +622,12 @@ export async function registerCommercial(
   let deployDesiredWatch: DesiredWatch | undefined;
   let leaderLease: LeaderLeaseController | undefined;
   let controlListener: ControlListener | undefined;
+  let cronOriginBridgeRef: UserChatBridgeHandler | null = null;
   if (dualMasterEnabled) {
     deployDesiredWatch = startDesiredWatch({
       pool: getPool(),
       onError: (err) => rootLogger.warn("[deployDesiredWatch] poll 失败(保留旧缓存)", { err: (err as Error)?.message ?? String(err) }),
     });
-    // env 资格严格解析('1'|'0';unset/非法=fail-closed 拒起)。与 controlPlaneEnabled 分职:
-    // controlPlaneEnabled 仍供 auto-migrate 等一次性启动分支(读 env 资格不动);lease 用严格版。
     const eligibleEnv = resolveLeaderEnvEligibility(process.env);
     leaderLease = createLeaderLeaseController({
       pool: getPool(),
@@ -636,14 +635,14 @@ export async function registerCommercial(
       desiredWatch: deployDesiredWatch,
       eligibleEnv,
       callbacks: {
-        // BLOCKER 1:onAcquire=bundle start-all-or-fail;required 成员起不来 → start() reject →
-        // lease step-down + onFatal(fail-stop)。onFence 返回 {drained,stuck};drained:false → lease fail-stop。
         onAcquire: async () => {
           await leaderBundle.start();
           await seedPlatformAgentsForLeadership();
+          await cronOriginBridgeRef?.setBackgroundRoleActive?.(true);
         },
-        onFence: (reason) => {
+        onFence: async (reason) => {
           rootLogger.warn(`[leaderLease] fence → stopAndDrain bundle(${reason})`, { subsys: "leaderLease" });
+          await cronOriginBridgeRef?.setBackgroundRoleActive?.(false);
           return leaderBundle.stopAndDrain();
         },
       },
@@ -1099,11 +1098,6 @@ export async function registerCommercial(
   // 2026-07-02 egress split:authz 加载器抽到 auth/userModelAuthz.ts 单一权威
   // (master 与 egress 两进程共用同一份规则),语义与原内联实现逐行等价。
   const loadUserModelAuthz = makeLoadUserModelAuthz();
-  // cron-origin-inject 的 bridge 晚绑定引用:handler 必须在内层 internal-proxy 作用域
-  // 创建(identityRepo 在那里),而 userChatBridge 要到 registerCommercial 尾部才初始化。
-  // 直接闭包引用 const userChatBridge 会在初始化窗口内 TDZ 抛错(b1d9e4fbb 同类问题);
-  // 用可空 ref:bridge 未就绪 → no_transport(503),容器侧按 retryable 下轮重试。
-  let cronOriginBridgeRef: UserChatBridgeHandler | null = null;
   let systemActions: ReturnType<typeof assembleSystemActions> | undefined;
 
   ({
@@ -2743,7 +2737,7 @@ export async function registerCommercial(
     }
   })
 
-  void userChatBridge.rebuildContainerLinks?.();
+  if (!dualMasterEnabled) void userChatBridge.rebuildContainerLinks?.();
   const stopLogTiming = startLogTimingReporter(rootLogger);
   return {
     handle: async (req, res) => {

@@ -141,6 +141,8 @@ import {
   backoffDelay,
   type ChatStatusClass,
   classifyClose,
+  nextReconnectDelay,
+  RECONNECT_BACKOFF_RESET_MS,
   COST_CHARGED_LAST_FINAL_TTL_MS,
   type EmptyTurnDecision,
   emptyTurnNoticeText,
@@ -868,6 +870,7 @@ export class ChatSocket {
   private lastOpenAtMs = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectCountdown: ReturnType<typeof setInterval> | null = null;
+  private backoffResetTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ── 1008 续期闸门（§5）──
   private wsAuthRefreshInFlight = false;
@@ -1776,7 +1779,6 @@ export class ChatSocket {
     this.ws = ws;
     ws.onopen = () => {
       const reconnected = this.everOpened;
-      this.reconnectAttempts = 0;
       this.isBrowserOnline = true;
       this.pendingBrowserOfflineAt = 0;
       this.everOpened = true;
@@ -1930,6 +1932,7 @@ export class ChatSocket {
       // the prepared generation or send cancel — reconnect + ring replay
       // (or live fanout onto the new socket) delivers outbound.model_switch.prepared.
       this.relayReady = false; // 连接关闭:relay 失效,待下次 sys.relay_ready
+      if (this.backoffResetTimer) { clearTimeout(this.backoffResetTimer); this.backoffResetTimer = null; }
       this.masterOwnsAutomaticRecovery = false; this.helloSentAt.clear();
       this.resetControlsForReplay();
       if (this.reconnectInFlightTimer) {
@@ -1980,8 +1983,8 @@ export class ChatSocket {
         return;
       }
       this.setProvisioningBanner(decision.provisioning);
-      const delay = decision.serverHintedDelay > 0 ? decision.serverHintedDelay : backoffDelay(this.reconnectAttempts);
-      if (decision.serverHintedDelay === 0) this.reconnectAttempts++; // server hint 不计入 client 退避（§1）
+      const { delay, nextAttempts } = nextReconnectDelay(decision, this.reconnectAttempts);
+      this.reconnectAttempts = nextAttempts;
       const label = decision.closeReasonLabel;
       const bannerCls = this.everOpened ? "disconnected" : "connecting";
       if (delay >= 4000) {
@@ -2313,6 +2316,9 @@ export class ChatSocket {
           for (const sess of this.sessions.values()) this.reconcileContainerForSession(sess);
         }
         this.relayReady = true;
+        if (this.reconnectAttempts > 0 && !this.backoffResetTimer) {
+          this.backoffResetTimer = setTimeout(() => { this.backoffResetTimer = null; if (this.ws?.readyState === 1 && this.relayReady) this.reconnectAttempts = 0; }, RECONNECT_BACKOFF_RESET_MS);
+        }
         this.kickDispatchPump();
         this.kickControlPump();
         this.maybePromoteToConnected();
@@ -3552,6 +3558,7 @@ export class ChatSocket {
       clearInterval(this.reconnectCountdown);
       this.reconnectCountdown = null;
     }
+    if (this.backoffResetTimer) { clearTimeout(this.backoffResetTimer); this.backoffResetTimer = null; }
   }
 
   private schedulePolicyReconnect(status: string): void {

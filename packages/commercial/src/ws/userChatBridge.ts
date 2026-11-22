@@ -249,6 +249,7 @@ import {
   releaseRecoveryForTransportWait,
   type ClaimedRecoveryJob,
 } from "../dispatch/turnRecoveryStore.js";
+import { defaultCutoverInFlightTracker } from "../deploy/cutoverReadiness.js";
 import type {
   AdmitUserTurnInput,
   AdmitUserTurnResult,
@@ -818,6 +819,8 @@ export interface UserChatBridgeDeps {
   containerLinkHeartbeatMs?: number;
   resolveContainerLinkEndpoint?: (uid: bigint, containerId: number) => Promise<Awaited<ReturnType<ResolveContainerEndpoint>> | "pending" | null>;
   containerLinkRecovery?: { channel?: string; retryMs?: number; spacingMs?: number; maxAttempts?: number };
+  /** Dual-master standby mode: defer ContainerLink recovery, control scan, and recovery drain until activated. */
+  deferBackgroundActivation?: boolean;
   modelSwitchCost?: ModelSwitchCostService;
   jwtSecret: string | Uint8Array;
   /** Dedicated read/prepare help only; never a model lease or approval credential. */
@@ -1464,8 +1467,16 @@ export interface UserChatBridgeHandler {
   shutdown(reason?: string): Promise<void>;
   /** 测试 / metrics:获取 ConnectionRegistry。 */
   registry: ConnectionRegistry;
+  /** Whether ContainerLinkRegistry was actually created on this Master instance. */
+  readonly containerLinkEnabled?: boolean;
   containerLinkSnapshots?(): ContainerLinkSnapshot[];
   rebuildContainerLinks?(): Promise<void>;
+  /** Dual-master lifecycle: activate/deactivate background ContainerLink recovery & durable control/recovery polling; resolves only after prior epoch drains. */
+  setBackgroundRoleActive?(active: boolean): Promise<void>;
+  /** Alias for setBackgroundRoleActive. */
+  setActiveLeader?(active: boolean): Promise<void>;
+  /** Gracefully close all browser WebSockets with 4509 SERVER_RESTART without interrupting container turns. */
+  drainBrowserWebSockets?(): number;
   /**
    * 给指定 uid 的所有活跃 user WS 广播一个 JSON 帧(旁路透传管道,非容器来源)。
    *
@@ -2133,9 +2144,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     };
   }
 
+  let backgroundActive = !deps.deferBackgroundActivation;
+  let backgroundEpoch = 0;
   const recovery = links && deps.resolveContainerLinkEndpoint ? new ContainerLinkRecovery({
     pool: deps.pgPool!, channel: deps.containerLinkRecovery?.channel ?? "v5", log,
     ...deps.containerLinkRecovery,
+    paused: !backgroundActive,
     drain: async () => { await links.drain(); await outboundPersistQueues.drain(); },
     attach: (carrier, rows, signal, keepAlive) => rebuildContainerLink({ carrier, rows, signal, keepAlive, links, deps, maxFrameBytes,
       start: async (user, uid, endpoint, socket, abort, connId) => {
@@ -2160,15 +2174,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       },
     }),
   }) : null;
-  if (links && recovery) links.onTransportLost = (uid, cid) => recovery.lost(uid, cid);
+  if (links && recovery) links.onTransportLost = (uid, cid) => { if (backgroundActive) recovery.lost(uid, cid); };
   const drainingChecks = new Set<() => void>();
   let shuttingDown = false;
-  const uidToRecoveryExecutors = new Map<
-    string,
-    Set<(job: ClaimedRecoveryJob) => void>
-  >();
+  const uidToRecoveryExecutors = new Map<string, Set<(job: ClaimedRecoveryJob, epoch?: number) => void>>();
   const uidToCronOriginExecutors = new Map<string, Set<CronOriginExecutor>>();
   const recoveryDrainInFlight = new Map<string, Promise<void>>();
+  const recoveryExecutionInFlight = new Set<Promise<void>>();
+  const recoveryJobEpochs = new WeakMap<ClaimedRecoveryJob, number>();
   const recoveryDrainNeedsRerun = new Set<string>();
   const recoveryLastScanAt = new Map<string, number>();
   const recoveryLeaseOwner = `master-recovery:${randomUUID()}`;
@@ -2177,15 +2190,28 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   const controls = deps.pgPool ? new ContainerLinkControls({
     pool: deps.pgPool, channel: deps.containerLinkRecovery?.channel ?? "v5", links,
     legacy: uidToContainerWs, wake: carrier => recovery?.wake(carrier) ?? Promise.resolve(), log,
+    paused: !backgroundActive,
   }) : null;
   const drainDurableControlsForUser = (uid: bigint): Promise<void> => controls?.drain(uid) ?? Promise.resolve();
 
-  const runSingleRecoveryDrainPass = async (uid: bigint, key: string): Promise<void> => {
-    if (!deps.pgPool || shuttingDown) return;
+  const isBackgroundCurrent = (epoch: number): boolean => !shuttingDown && backgroundActive && backgroundEpoch === epoch;
+  const isRecoveryJobCurrent = (job?: ClaimedRecoveryJob): boolean => {
+    const ep = job ? recoveryJobEpochs.get(job) : undefined;
+    return ep === undefined || isBackgroundCurrent(ep);
+  };
+  const trackRecoveryPromise = (p: Promise<unknown>): void => {
+    const w = p.then(() => undefined, () => undefined);
+    recoveryExecutionInFlight.add(w);
+    void w.finally(() => recoveryExecutionInFlight.delete(w));
+  };
+
+  const runSingleRecoveryDrainPass = async (uid: bigint, key: string, epoch: number): Promise<void> => {
+    if (!deps.pgPool || !isBackgroundCurrent(epoch)) return;
     const lastScanAt = recoveryLastScanAt.get(key) ?? 0;
     if (deps.reconcileAutomaticRecoveryJobs && Date.now() - lastScanAt >= 30_000) {
       recoveryLastScanAt.set(key, Date.now());
       await deps.reconcileAutomaticRecoveryJobs(uid, 100);
+      if (!isBackgroundCurrent(epoch)) return;
     }
     let executor = availableExecutors(uidToRecoveryExecutors.get(key))[0];
     if (!executor) {
@@ -2193,31 +2219,32 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         try {
           const channel = deps.containerLinkRecovery?.channel ?? "v5";
           const carriers = await listDueRecoveryCarrierContainers(deps.pgPool, uid, channel);
+          if (!isBackgroundCurrent(epoch)) return;
           for (const row of carriers) {
+            if (!isBackgroundCurrent(epoch)) return;
             if (links.retainKeepAliveConsumer(uid, row.container_id)) {
               continue;
             }
-            // Do NOT await recovery.wake inside drainDurableRecoveryForUser:
-            // recovery.wake drains outboundPersistQueues before attaching, while
-            // final frame persistence awaits drainDurableRecoveryForUser. Firing
-            // wake asynchronously keeps the wait graph strictly acyclic, and
-            // onContainerAttest (or the post-wake callback for already-attached
-            // links) re-triggers drainDurableRecoveryForUser once ready.
             void recovery
               .wake({ uid: key, containerId: row.container_id })
               .then(() => {
-                if (!shuttingDown && availableExecutors(uidToRecoveryExecutors.get(key)).length > 0) {
+                if (isBackgroundCurrent(epoch) && availableExecutors(uidToRecoveryExecutors.get(key)).length > 0) {
                   void drainDurableRecoveryForUser(uid);
                 }
               })
               .catch((wakeErr) => {
-                log?.warn("user-chat-bridge: durable recovery carrier wake failed", { uid: key, error: wakeErr });
+                if (isBackgroundCurrent(epoch)) {
+                  log?.warn("user-chat-bridge: durable recovery carrier wake failed", { uid: key, error: wakeErr });
+                }
               });
           }
         } catch (wakeErr) {
-          log?.warn("user-chat-bridge: durable recovery carrier lookup failed", { uid: key, error: wakeErr });
+          if (isBackgroundCurrent(epoch)) {
+            log?.warn("user-chat-bridge: durable recovery carrier lookup failed", { uid: key, error: wakeErr });
+          }
         }
       }
+      if (!isBackgroundCurrent(epoch)) return;
       executor = availableExecutors(uidToRecoveryExecutors.get(key))[0];
       if (!executor) return;
     }
@@ -2226,14 +2253,25 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       ownerId: recoveryLeaseOwner,
       leaseMs: recoveryLeaseMs,
     });
+    if (!isBackgroundCurrent(epoch)) {
+      for (const job of jobs) {
+        await releaseRecoveryForTransportWait(deps.pgPool, job).catch(() => {});
+      }
+      return;
+    }
     for (const job of jobs) {
+      if (!isBackgroundCurrent(epoch)) {
+        await releaseRecoveryForTransportWait(deps.pgPool, job).catch(() => {});
+        continue;
+      }
       const liveExecutor = availableExecutors(uidToRecoveryExecutors.get(key))[0];
       if (!liveExecutor) {
         await releaseRecoveryForTransportWait(deps.pgPool, job);
         continue;
       }
       try {
-        liveExecutor(job);
+        recoveryJobEpochs.set(job, epoch);
+        liveExecutor(job, epoch);
       } catch {
         await releaseRecoveryForTransportWait(deps.pgPool, job);
       }
@@ -2244,7 +2282,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
    * by attested durable-dispatch bridges; every claimed request then enters
    * the same executeAdmittedTurn pipeline as an ordinary browser message. */
   const drainDurableRecoveryForUser = (uid: bigint): Promise<void> => {
-    if (!deps.pgPool || shuttingDown) return Promise.resolve();
+    if (!deps.pgPool || shuttingDown || !backgroundActive) return Promise.resolve();
+    const epoch = backgroundEpoch;
     const key = uid.toString();
     const existing = recoveryDrainInFlight.get(key);
     if (existing) {
@@ -2255,11 +2294,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       do {
         recoveryDrainNeedsRerun.delete(key);
         try {
-          await runSingleRecoveryDrainPass(uid, key);
+          await runSingleRecoveryDrainPass(uid, key, epoch);
         } catch (error) {
-          log?.warn("user-chat-bridge: durable recovery drain failed", { uid: key, error });
+          if (isBackgroundCurrent(epoch)) {
+            log?.warn("user-chat-bridge: durable recovery drain failed", { uid: key, error });
+          }
         }
-      } while (recoveryDrainNeedsRerun.has(key) && !shuttingDown);
+      } while (recoveryDrainNeedsRerun.has(key) && isBackgroundCurrent(epoch));
     })().finally(() => {
       recoveryDrainInFlight.delete(key);
       recoveryDrainNeedsRerun.delete(key);
@@ -2268,6 +2309,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     return work;
   };
   const recoveryDrainTimer = setInterval(() => {
+    if (!backgroundActive) return;
     for (const uid of uidToRecoveryExecutors.keys()) {
       void drainDurableRecoveryForUser(BigInt(uid));
     }
@@ -2692,7 +2734,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     let containerHasSystemHelp = false;
     let containerHasCodexSpeedTiers = false;
     let speedTierAttestSeen = false;
-    let recoveryExecutor: ((job: ClaimedRecoveryJob) => void) | null = null;
+    let recoveryExecutor: ((job: ClaimedRecoveryJob, epoch?: number) => void) | null = null;
     let cronOriginExecutor: CronOriginExecutor | null = null;
     let unregisterExecutors: (() => void) | null = null;
     let attestTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2781,9 +2823,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       containerHasCodexSpeedTiers = caps.includes(CODEX_SPEED_TIERS_CAPABILITY);
       attestState = "ok";
       if (containerHasDurableDispatch && deps.pgPool && recoveryExecutor === null) {
-        recoveryExecutor = (job) => {
-          const encoded = Buffer.from(JSON.stringify(job.request), "utf8");
-          executeAdmittedTurn(encoded, false, "recovery", undefined, job);
+        recoveryExecutor = (job, epoch) => {
+          if (epoch !== undefined) recoveryJobEpochs.set(job, epoch);
+          if (!isRecoveryJobCurrent(job)) { trackRecoveryPromise(releaseRecoveryForTransportWait(deps.pgPool!, job)); return; }
+          executeAdmittedTurn(Buffer.from(JSON.stringify(job.request), "utf8"), false, "recovery", undefined, job);
         };
       }
       if (containerHasDurableDispatch && deps.admitUserTurn && cronOriginExecutor === null) {
@@ -3917,7 +3960,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             })
             .catch(() => {});
         } else {
-          void releaseRecoveryPreReceipt(pool, fenced).catch(() => {});
+          trackRecoveryPromise(releaseRecoveryPreReceipt(pool, fenced));
         }
         return;
       }
@@ -4370,6 +4413,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         // admission's own idempotency result instead of reading the tape here.
         if (cleaned) return null;
         if (await tryDedupCompleted()) return null;
+      }
+
+      if (recoveryJob && !isRecoveryJobCurrent(recoveryJob)) { onReject?.("SERVER_RESTART"); return null; }
+      if (persistUserRow && defaultCutoverInFlightTracker.isFencing()) {
+        onReject?.("SERVER_RESTART");
+        if (!recoveryJob && pretrackedEnrichment === undefined) {
+          sendErrorFrame(userWs, "SESSION_PERSIST_UNAVAILABLE", "master cutover fencing; retry on new slot", { peerId, ...(clientMessageId !== null ? { clientMessageId } : {}) });
+          try { userWs.close(CLOSE_BRIDGE.SERVER_RESTART, "server_restart"); } catch { /* */ }
+        }
+        return null;
       }
 
       // persistUserRow=false(prompt-queue lane)整块跳过:queue 协调器已建 user 行 + turn 权威,
@@ -4845,12 +4898,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
     };
 
-    const trackPreparation = (work: () => Promise<void>): void => {
+    const trackBridgePreparation = (work: () => Promise<void>): Promise<void> => {
       preparationInFlight++;
-      void work().finally(() => {
-        preparationInFlight--;
-        checkDrainComplete();
-      });
+      return work().finally(() => { preparationInFlight--; checkDrainComplete(); });
     };
 
     // Serialize only identity readiness preparation on the original transport peer.
@@ -4873,6 +4923,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     ): void => {
       const isPromptQueueDispatch = ingress === "prompt_queue";
       const isCronOriginDispatch = ingress === "cron_origin";
+      const trackPreparation = (work: () => Promise<void>): void => {
+        const p = trackBridgePreparation(work);
+        if (recoveryJob) trackRecoveryPromise(p);
+      };
       let promptQueueResolved = false;
       let promptQueueFallbackTimer: ReturnType<typeof setTimeout> | null = null;
       const rejectPromptQueueDispatch = (reasonCode: string): void => {
@@ -4901,7 +4955,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 })
                 .catch(() => {});
             } else {
-              void releaseRecoveryForTransportWait(deps.pgPool, recoveryJob).catch(() => {});
+              trackRecoveryPromise(releaseRecoveryForTransportWait(deps.pgPool, recoveryJob));
             }
           }
         }
@@ -4957,6 +5011,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           (candidate) => candidate.recoveryJob?.jobId === recoveryJob.jobId,
         );
         if (!record) return false;
+        if (!isRecoveryJobCurrent(recoveryJob)) { failDispatchPreForward(record, "recovery_epoch_fenced"); return false; }
         return forwardRecoveryUnderRootFence(
           deps.pgPool,
           {
@@ -4967,6 +5022,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             dispatchLeaseEpoch: record.leaseEpoch,
           },
           () => {
+            if (!isRecoveryJobCurrent(recoveryJob)) return false;
             if (record.pendingRecoveryAck) {
               const ack = record.pendingRecoveryAck;
               record.pendingRecoveryAck = undefined;
@@ -7740,7 +7796,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         return;
       }
       const passthroughForward = forwardPreparedFrame(passthroughData, isBinary, passthroughLen);
-      if (passthroughForward instanceof Promise) void passthroughForward;
+      if (passthroughForward instanceof Promise) { if (recoveryJob) trackRecoveryPromise(passthroughForward); else void passthroughForward; }
       };
 
       // This gate runs after raw ingress/owner/hash validation and never rewrites
@@ -10565,12 +10621,30 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     return set ? [...set][0] ?? null : null;
   }
 
+  const setBackgroundRoleActive = async (active: boolean): Promise<void> => {
+    if (active) {
+      backgroundEpoch += 1;
+      backgroundActive = true;
+      await Promise.allSettled([controls?.setActive(true), recovery?.setActive(true)]);
+      return;
+    }
+    backgroundActive = false;
+    backgroundEpoch += 1;
+    links?.releaseInactiveLinks();
+    await Promise.allSettled([controls?.setActive(false), recovery?.setActive(false), ...recoveryDrainInFlight.values()]);
+    while (recoveryExecutionInFlight.size > 0) await Promise.allSettled([...recoveryExecutionInFlight.values()]);
+  };
+
   return {
     handleUpgrade,
     shutdown,
     registry,
+    containerLinkEnabled: links !== null,
     containerLinkSnapshots: () => links?.snapshots() ?? [],
     rebuildContainerLinks: async () => { await Promise.all([recovery?.start(), controls?.scan()]); },
+    setBackgroundRoleActive,
+    setActiveLeader: setBackgroundRoleActive,
+    drainBrowserWebSockets: () => registry.closeAll("server_restart"),
     broadcastToUser,
     syncGoalToContainers,
     drainRecoveryForUser: drainDurableRecoveryForUser,

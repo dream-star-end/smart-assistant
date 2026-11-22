@@ -296,6 +296,7 @@ export function createCommercialUserChatBridge(deps: {
       return typeof rev === "string" && rev !== "" ? { ...ep, bundleRev: rev } : ep;
     },
     containerLinkRecovery: { channel: deps.runtimeChannel },
+    deferBackgroundActivation: deps.dualMasterEnabled,
     modelSwitchCost: deps.modelSwitchCost,
     jwtSecret: deps.jwtSecret,
     issueSystemHelpBootstrap: deps.systemActions
