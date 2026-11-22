@@ -87,8 +87,8 @@ test('delegate sessions inherit repo lookup without rewriting delegate peer iden
   )
   assert.match(
     delegateCore,
-    /peerId:\s*sourceAgent\s*\|\|\s*'system'/,
-    'delegate identity/routing peerId must stay sourceAgent',
+    /peerId:\s*(?:sourceAgent\s*\|\|\s*'system'|remoteLaneLease[\s\S]*?:\s*sourceAgent\s*\|\|\s*'system')/,
+    'delegate identity/routing peerId must stay sourceAgent (with optional remoteLaneLease run suffix)',
   )
   assert.match(
     delegateCore,

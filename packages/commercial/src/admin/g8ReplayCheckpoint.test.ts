@@ -128,7 +128,7 @@ describe("g8 replay checkpoint", () => {
   test("the metric series appears only after a check runs", async () => {
     const before = await renderPrometheus({ override: { agentContainersRunning: 0 } });
     assert.equal(before.includes("g8_replay_check_total"), false);
-    assert.equal((before.match(/^# HELP /gm) ?? []).length, 25);
+    assert.equal((before.match(/^# HELP /gm) ?? []).length, 27);
     incG8ReplayCheck("turn_end", "box_rejected");
     incG8ReplayCheck("turn_end", "trace-id-must-not-be-a-label");
     const during = await renderPrometheus({ override: { agentContainersRunning: 0 } });

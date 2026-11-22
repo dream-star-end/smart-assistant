@@ -192,9 +192,15 @@ import os, sys
 root = os.path.abspath(sys.argv[1])
 expected = [os.path.abspath(x) for x in sys.argv[2].split("\n") if x]
 for exp in expected:
-    if root == exp or root == exp + "-live":
+    if root == exp or root == exp + "-live" or root == exp + "-slot-A" or root == exp + "-slot-B":
         sys.exit(0)
-    if root.startswith(exp + "/") or root.startswith(exp + "-releases/") or root.startswith(exp + "-live/"):
+    if (
+        root.startswith(exp + "/")
+        or root.startswith(exp + "-releases/")
+        or root.startswith(exp + "-live/")
+        or root.startswith(exp + "-slot-A/")
+        or root.startswith(exp + "-slot-B/")
+    ):
         sys.exit(0)
 sys.exit(1)
 PY

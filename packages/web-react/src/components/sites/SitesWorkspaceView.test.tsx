@@ -333,7 +333,9 @@ describe("SitesWorkspaceView", () => {
     expect(screen.queryByDisplayValue("LEAK_KEY")).not.toBeInTheDocument();
 
     expect(screen.getByText("待验证 DNS")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "验证域名" }));
+    const verifyBtn = screen.getByRole("button", { name: "验证域名" });
+    await waitFor(() => expect(verifyBtn).toBeEnabled());
+    fireEvent.click(verifyBtn);
     expect(await screen.findByText("已验证")).toBeInTheDocument();
   });
 
