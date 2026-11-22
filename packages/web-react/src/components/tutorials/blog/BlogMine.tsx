@@ -67,12 +67,12 @@ function ReviewSteps() {
     { label: "发布", state: "todo" },
   ];
   return (
-    <ol className="mt-2 flex flex-wrap items-center gap-x-1.5 gap-y-1.5 text-[12px] text-faint" aria-label="审核进度">
+    <ol className="mt-2 flex flex-wrap items-center gap-x-1.5 gap-y-1.5 text-meta text-faint" aria-label="审核进度">
       {steps.map((step, index) => {
         const Icon = step.state === "done" ? CircleCheck : step.state === "cur" ? LoaderCircle : Circle;
         return (
           <Fragment key={step.label}>
-            {index > 0 && <span aria-hidden className="h-px w-2.5 bg-border-strong sm:w-[18px]" />}
+            {index > 0 && <span aria-hidden className="h-px w-2.5 bg-border-strong sm:w-4" />}
             <li
               aria-current={step.state === "cur" ? "step" : undefined}
               className={cn(
@@ -95,24 +95,26 @@ function ReviewSteps() {
 function EditNotice({ stage, item }: { stage: BlogEditStage; item: CommunityTutorialMine }) {
   if (stage === "rejected") {
     return (
-      <div className="mt-2.5 rounded-xl bg-danger-soft px-3 py-2.5 text-[13px] leading-[1.6] text-fg">
-        <b className="inline text-[13px]">修改未通过，线上仍是原版。原因：</b>
+      <Alert tone="danger" density="compact" live="off" className="mt-2.5">
+        <b className="inline font-semibold">修改未通过，线上仍是原版。原因：</b>
         {item.edit?.reviewNote ?? "未说明"}
-      </div>
+      </Alert>
     );
   }
   return (
-    <div className="mt-2.5 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-xl bg-info-soft px-3 py-2.5 text-[13px] leading-[1.6] text-fg">
-      <span className={cn("blog-chip", stage === "ai" ? "blog-chip-info" : "blog-chip-warn")}>
-        {stage === "ai" ? (
-          <LoaderCircle size={12} aria-hidden className="animate-spin motion-reduce:animate-none" />
-        ) : (
-          <UserCheck size={12} aria-hidden />
-        )}
-        {stage === "ai" ? "修改审核中" : "修改待人工复核"}
-      </span>
-      <span>线上仍是原版，新版本审核通过后自动替换。</span>
-    </div>
+    <Alert tone="info" density="compact" live="off" className="mt-2.5">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span className={cn("blog-chip", stage === "ai" ? "blog-chip-info" : "blog-chip-warn")}>
+          {stage === "ai" ? (
+            <LoaderCircle size={12} aria-hidden className="animate-spin motion-reduce:animate-none" />
+          ) : (
+            <UserCheck size={12} aria-hidden />
+          )}
+          {stage === "ai" ? "修改审核中" : "修改待人工复核"}
+        </span>
+        <span>线上仍是原版，新版本审核通过后自动替换。</span>
+      </div>
+    </Alert>
   );
 }
 
@@ -146,7 +148,8 @@ export function BlogMine({
       if (!quiet) setLoading(true);
       try {
         const page = await api.listMyCommunityTutorials(auth, cursor);
-        const mine = page.tutorials.filter((item) => item.kind !== "snapshot");
+        const rows = Array.isArray(page?.tutorials) ? page.tutorials : [];
+        const mine = rows.filter((item) => item.kind !== "snapshot");
         // 轮询时状态有变化就提示(审核出结果)。
         for (const item of mine) {
           const before = stagesRef.current.get(item.id);
@@ -205,33 +208,33 @@ export function BlogMine({
   };
 
   return (
-    <div className="mx-auto w-full max-w-[860px] px-4 pb-12 pt-5 sm:px-6 sm:pt-7">
+    <div className="mx-auto w-full max-w-4xl px-4 pb-12 pt-4 sm:px-6 sm:pt-6">
       {confirmElement}
       <button
         type="button"
         onClick={onBack}
-        className="mb-[22px] inline-flex items-center gap-1.5 rounded-md text-[13px] text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+        className="mb-5 inline-flex min-h-11 items-center gap-1.5 rounded-md text-body text-muted outline-none transition-colors hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9"
       >
-        <ArrowLeft size={15} /> 经验分享
+        <ArrowLeft size={15} aria-hidden /> 经验分享
       </button>
-      <div className="mb-4 flex flex-col items-stretch gap-3.5 sm:flex-row sm:items-end sm:justify-between">
+      <div className="mb-5 flex flex-col items-stretch gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="mb-1 text-[26px] font-bold text-fg">我的投稿</h1>
-          <p className="m-0 text-[14px] text-muted">审核结果也会发到站内信。</p>
+          <h1 className="m-0 text-xl font-bold tracking-tight text-fg sm:text-2xl">我的投稿</h1>
+          <p className="mt-1 text-body text-muted">审核结果也会发到站内信。</p>
         </div>
-        <Button variant="accent" shape="pill" className="shadow-[0_4px_14px_#5a3fee38]" onClick={() => onWrite()}>
-          <SquarePen size={15} /> 写一篇经验
+        <Button variant="accent" shape="pill" className="max-sm:min-h-11" onClick={() => onWrite()}>
+          <SquarePen size={15} aria-hidden /> 写一篇经验
         </Button>
       </div>
       {error && (
-        <Alert tone="danger" className="mb-3">
+        <Alert tone="danger" density="compact" className="mb-3">
           {error}
         </Alert>
       )}
       {loading && items.length === 0 ? (
         <ListSkeleton rows={3} />
       ) : items.length === 0 ? (
-        <div className="rounded-[20px] border border-dashed border-border p-10 text-center text-body text-faint">
+        <div className="oc-surface-card rounded-xl border-dashed p-10 text-center text-body text-faint">
           你还没有投稿。
         </div>
       ) : (
@@ -246,22 +249,22 @@ export function BlogMine({
             return (
               <article
                 key={item.id}
-                className="flex flex-wrap items-center gap-3.5 rounded-[20px] border border-border bg-surface p-3.5 sm:flex-nowrap sm:gap-4 sm:p-[16px_18px]"
+                className="oc-surface-card flex flex-wrap items-center gap-3.5 rounded-xl p-3.5 sm:flex-nowrap sm:gap-4 sm:p-4"
               >
                 <BlogCover
                   item={cover}
                   source={stage === "published" ? undefined : privateSource}
                   showChip={false}
-                  className="!aspect-auto h-[120px] w-full shrink-0 rounded-xl sm:h-[72px] sm:w-[120px] [&_svg]:size-6"
+                  className="!aspect-auto h-30 w-full shrink-0 rounded-lg sm:h-18 sm:w-30 [&_svg]:size-6"
                 />
                 <div className="min-w-0 flex-1 basis-full sm:basis-auto">
-                  <b className="mb-1.5 block text-[15px] text-fg">{item.title}</b>
+                  <b className="mb-1.5 block text-title font-semibold text-fg">{item.title}</b>
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className={cn("blog-chip", chip.className)}>
                       <Icon size={12} aria-hidden className={stage === "ai" ? "animate-spin motion-reduce:animate-none" : undefined} />
                       {chip.label}
                     </span>
-                    <span className="text-meta text-faint">
+                    <span className="text-meta text-faint tabular-nums">
                       {stage === "published" && item.publishedAt
                         ? `${blogShortDate(item.publishedAt)} · 已被阅读 ${item.viewCount ?? 0} 次`
                         : stage === "ai"
@@ -271,27 +274,27 @@ export function BlogMine({
                   </div>
                   {stage === "ai" && <ReviewSteps />}
                   {stage === "rejected" && item.reviewNote && (
-                    <div className="mt-2.5 rounded-xl bg-danger-soft px-3 py-2.5 text-[13px] leading-[1.6] text-fg">
-                      <b className="inline text-[13px]">原因：</b>
+                    <Alert tone="danger" density="compact" live="off" className="mt-2.5">
+                      <b className="inline font-semibold">原因：</b>
                       {item.reviewNote}
-                    </div>
+                    </Alert>
                   )}
                   {stage === "takedown" && item.reviewNote && (
-                    <div className="mt-2.5 rounded-xl bg-danger-soft px-3 py-2.5 text-[13px] leading-[1.6] text-fg">
-                      <b className="inline text-[13px]">下架原因：</b>
+                    <Alert tone="danger" density="compact" live="off" className="mt-2.5">
+                      <b className="inline font-semibold">下架原因：</b>
                       {item.reviewNote}
-                    </div>
+                    </Alert>
                   )}
                   {stage === "human" && (
-                    <div className="mt-2.5 rounded-xl bg-warning-soft px-3 py-2.5 text-[13px] leading-[1.6] text-fg">
+                    <Alert tone="warning" density="compact" live="off" className="mt-2.5">
                       AI 没能确定这篇是否合规，已转给管理员复核，一般 24 小时内处理。
-                    </div>
+                    </Alert>
                   )}
                   {editStage && <EditNotice stage={editStage} item={item} />}
                 </div>
                 <div className="ml-auto flex shrink-0 flex-wrap justify-end gap-2">
                   {stage === "published" && (
-                    <Button variant="secondary" size="sm" shape="pill" onClick={() => onOpen(item.id)}>
+                    <Button variant="secondary" size="sm" shape="pill" className="max-sm:min-h-11" onClick={() => onOpen(item.id)}>
                       查看
                     </Button>
                   )}
@@ -300,6 +303,7 @@ export function BlogMine({
                       variant={stage === "rejected" || editStage === "rejected" ? "accent" : "secondary"}
                       size="sm"
                       shape="pill"
+                      className="max-sm:min-h-11"
                       disabled={busyId !== null}
                       onClick={() => onEdit(blogEditSeed(item), { id: item.id, published: item.status === "approved" })}
                     >
@@ -311,6 +315,7 @@ export function BlogMine({
                       variant="secondary"
                       size="sm"
                       shape="pill"
+                      className="max-sm:min-h-11"
                       onClick={() =>
                         onWrite({
                           title: item.title,
@@ -328,7 +333,7 @@ export function BlogMine({
                       variant="ghost"
                       size="sm"
                       shape="pill"
-                      className="text-muted"
+                      className="text-muted max-sm:min-h-11"
                       loading={busyId === item.id}
                       disabled={busyId !== null}
                       onClick={() => void withdraw(item)}
@@ -344,7 +349,7 @@ export function BlogMine({
       )}
       {nextCursor && (
         <div className="mt-5 flex justify-center">
-          <Button variant="secondary" shape="pill" loading={loading} onClick={() => void load(nextCursor)}>
+          <Button variant="secondary" shape="pill" className="max-sm:min-h-11" loading={loading} onClick={() => void load(nextCursor)}>
             加载更多
           </Button>
         </div>

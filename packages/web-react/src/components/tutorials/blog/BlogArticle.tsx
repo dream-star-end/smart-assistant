@@ -1,11 +1,12 @@
-import { CalendarClock, Clock3, CodeXml, FileText, type LucideIcon } from "lucide-react";
+import { CalendarClock, Clock3, CodeXml, FileText, Link2, type LucideIcon, ShieldCheck, SquarePen } from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useState } from "react";
 import { api } from "../../../lib/api";
 import type { AuthSession, CommunityTutorialCategory, CommunityTutorialSummary } from "../../../lib/types";
 import { cn } from "../../../lib/utils";
 import { ZoomableImage } from "../../chat/media";
 import { Markdown } from "../../Markdown";
-import { BLOG_PLACEHOLDER_GRADIENT, blogAvatar, blogCategoryLabel } from "./blogLib";
+import { Button } from "../../ui";
+import { BLOG_PLACEHOLDER_GRADIENT, BLOG_PLACEHOLDER_INK, blogAvatar, blogCategoryLabel } from "./blogLib";
 
 const CATEGORY_ICON: Record<CommunityTutorialCategory, LucideIcon> = {
   coding: CodeXml,
@@ -93,11 +94,13 @@ export function BlogProse({
   markdown,
   source,
   pending,
+  compact = false,
 }: {
   markdown: string;
   source: BlogImageSource;
   /** 编辑器里正在上传的图:占位 → 进度。键是 Markdown 里的占位 token。 */
   pending?: ReadonlyMap<string, number>;
+  compact?: boolean;
 }) {
   const renderImage = useCallback(
     (sha: string, image: { alt: string }) => <BlogImage sha={sha} alt={image.alt} source={source} />,
@@ -106,7 +109,7 @@ export function BlogProse({
   // 上传中的占位符 `![上传中 xx%](uploading:<id>)` 不是合法图片,渲染成骨架块。
   const parts = splitUploading(markdown);
   return (
-    <div className="blog-prose">
+    <div className={cn("blog-prose", compact && "blog-prose-compact")}>
       {parts.map((part) =>
         part.kind === "text" ? (
           <Markdown key={`t${part.at}`} readOnly tutorialImage={renderImage}>
@@ -171,8 +174,14 @@ export function BlogAvatar({ name, size = 22 }: { name: string; size?: number })
   return (
     <span
       aria-hidden
-      className="inline-grid shrink-0 place-items-center rounded-full font-bold text-white"
-      style={{ width: size, height: size, background: avatar.color, fontSize: Math.round(size * 0.45) }}
+      className="inline-grid shrink-0 place-items-center rounded-full border border-border font-semibold"
+      style={{
+        width: size,
+        height: size,
+        background: avatar.color,
+        color: avatar.fg,
+        fontSize: Math.round(size * 0.45),
+      }}
     >
       {avatar.initial}
     </span>
@@ -198,10 +207,40 @@ export function BlogCover({
   return (
     <div
       className={cn("blog-cover", className)}
-      style={url ? { backgroundImage: `url(${url})` } : { background: BLOG_PLACEHOLDER_GRADIENT[item.category] }}
+      style={
+        url
+          ? { backgroundImage: `url(${url})` }
+          : { background: BLOG_PLACEHOLDER_GRADIENT[item.category], color: BLOG_PLACEHOLDER_INK[item.category] }
+      }
     >
       {showChip && <span className="blog-chip">{blogCategoryLabel(item.category)}</span>}
       {!url && <Icon size={36} strokeWidth={1.4} aria-hidden />}
+    </div>
+  );
+}
+
+/** 详情底部操作栏：审核声明 + 复制链接 + 写下我的经验（直达编辑器）。 */
+export function BlogArticleFooter({
+  onCopyLink,
+  onWrite,
+}: {
+  onCopyLink: () => void;
+  onWrite: () => void;
+}) {
+  return (
+    <div className="oc-surface-card mt-9 flex flex-col items-stretch justify-between gap-3 rounded-xl p-4 sm:flex-row sm:items-center sm:px-5">
+      <div className="flex items-center gap-2 text-meta text-faint">
+        <ShieldCheck size={15} className="shrink-0" aria-hidden />
+        <span>本文已通过内容审核 · 观点仅代表作者</span>
+      </div>
+      <div className="flex flex-wrap gap-2">
+        <Button variant="secondary" size="sm" shape="pill" className="max-sm:min-h-11 max-sm:flex-1" onClick={onCopyLink}>
+          <Link2 size={14} aria-hidden /> 复制链接
+        </Button>
+        <Button variant="accent" size="sm" shape="pill" className="max-sm:min-h-11 max-sm:flex-1" onClick={onWrite}>
+          <SquarePen size={14} aria-hidden /> 写下我的经验
+        </Button>
+      </div>
     </div>
   );
 }

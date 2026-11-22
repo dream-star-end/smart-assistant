@@ -69,15 +69,50 @@ afterEach(() => {
 })
 
 describe('经验分享', () => {
-  it('列表：只拉 markdown，显示总篇数、本周精选、待处理投稿数；未登录写一篇要求登录', async () => {
+  it('列表：只拉 markdown，显示紧凑页头标题「经验分享」、总篇数、本周精选、阅读量；未登录写一篇要求登录', async () => {
+    vi.mocked(api.listCommunityTutorials).mockResolvedValue({
+      tutorials: [
+        { ...post('1', { coverSha: SHA }), viewCount: 256 } as CommunityTutorialSummary,
+        post('2'),
+        post('3', { category: 'coding' }),
+      ],
+      nextCursor: null,
+      total: 6,
+    })
     const onRequireLogin = vi.fn()
     render(<CommunityBlog onRequireLogin={onRequireLogin} />)
     expect(await screen.findByText('经验 1')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '经验分享' })).toBeInTheDocument()
     expect(api.listCommunityTutorials).toHaveBeenCalledWith(expect.objectContaining({ kind: 'markdown' }))
     expect(screen.getByText(/已发布 6 篇/)).toBeInTheDocument()
     expect(screen.getByText('本周精选')).toBeInTheDocument()
+    expect(screen.getByText('256 次阅读')).toBeInTheDocument()
+    // 移动端搜索框 16px 防 iOS 缩放，分类胶囊 ≥44px
+    const search = screen.getByRole('searchbox')
+    expect(search.className).toContain('text-base')
+    expect(search.className).toContain('md:text-body')
+    expect(screen.getByRole('button', { name: '编码' }).className).toContain('min-h-11')
     fireEvent.click(screen.getByRole('button', { name: /写一篇经验/ }))
     expect(onRequireLogin).toHaveBeenCalled()
+  })
+
+  it('接口返回缺少 tutorials 字段的空对象时安全降级为空列表不崩溃', async () => {
+    vi.mocked(api.listCommunityTutorials).mockResolvedValue({} as Awaited<ReturnType<typeof api.listCommunityTutorials>>)
+    vi.mocked(api.listMyCommunityTutorials).mockResolvedValue({} as Awaited<ReturnType<typeof api.listMyCommunityTutorials>>)
+    render(<CommunityBlog auth={auth} userId="u1" />)
+    expect(await screen.findByText('还没有人分享经验')).toBeInTheDocument()
+  })
+
+  it('我的投稿徽标同时统计待审与驳回，有驳回时用危险语义徽标', async () => {
+    vi.mocked(api.listMyCommunityTutorials).mockResolvedValue({
+      tutorials: [mine({ id: '21', status: 'pending' }), mine({ id: '22', status: 'rejected' })],
+      nextCursor: null,
+    })
+    render(<CommunityBlog auth={auth} userId="u1" />)
+    await screen.findByText('经验 1')
+    const badge = await screen.findByLabelText('1 篇待审，1 篇未通过')
+    expect(badge).toHaveTextContent('2')
+    expect(badge.className).toContain('blog-chip-bad')
   })
 
   it('分类胶囊切换会带 category 重新查询', async () => {
@@ -90,19 +125,24 @@ describe('经验分享', () => {
     )
   })
 
-  it('详情：阅读版式、只渲染本站图片、打开期间 noindex', async () => {
+  it('详情：阅读版式、阅读量、只渲染本站图片、底部「复制链接」与「写下我的经验」、打开期间 noindex', async () => {
     vi.spyOn(api, 'getCommunityTutorial').mockResolvedValue({
       ...post('9'),
+      viewCount: 88,
       bodyMarkdown: `## 小标题\n\n正文第一段。\n\n![配置截图](tutorial-blob:${SHA})\n\n![外链](https://tracker.test/x.png)`,
-    })
-    const { unmount } = render(<CommunityBlog detailId="9" onDetailIdChange={() => {}} />)
+    } as Awaited<ReturnType<typeof api.getCommunityTutorial>>)
+    const { unmount } = render(<CommunityBlog auth={auth} userId="u1" detailId="9" onDetailIdChange={() => {}} />)
     expect(await screen.findByRole('heading', { name: '经验 9' })).toBeInTheDocument()
     expect(document.querySelector('meta[name="robots"]')?.getAttribute('content')).toBe('noindex')
     await screen.findByText('小标题')
+    expect(screen.getByText('88 次阅读')).toBeInTheDocument()
     expect(screen.getByText('配置截图')).toBeInTheDocument()
     expect(screen.getByText('[外链]')).toBeInTheDocument()
     expect(document.querySelector('img[src*="tracker.test"]')).toBeNull()
     expect(screen.getByText(/本文已通过内容审核/)).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: /复制链接/ }).length).toBeGreaterThanOrEqual(2)
+    fireEvent.click(screen.getByRole('button', { name: /写下我的经验/ }))
+    expect(await screen.findByLabelText('标题')).toBeInTheDocument()
     unmount()
     expect(document.querySelector('meta[name="robots"]')).toBeNull()
   })
@@ -210,7 +250,7 @@ describe('经验分享', () => {
     await waitFor(() => expect(withdraw).toHaveBeenCalledWith(auth, '4'))
   })
 
-  it('编辑器：没填够不提交，填好后提交并进入我的投稿', async () => {
+  it('编辑器：缺失项有清晰内联提示，没填够不提交，填好后提交并进入我的投稿', async () => {
     window.localStorage.removeItem('oc:blog-draft:u1')
     const submit = vi.spyOn(api, 'submitCommunityTutorial').mockResolvedValue({
       id: '30',
@@ -220,14 +260,19 @@ describe('经验分享', () => {
     render(<CommunityBlog auth={auth} userId="u1" />)
     await screen.findByText('经验 1')
     fireEvent.click(screen.getByRole('button', { name: /写一篇经验/ }))
-    fireEvent.click(await screen.findByRole('button', { name: /提交发布/ }))
+    expect(await screen.findByText('还需补全：标题、摘要、正文')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /提交发布/ }))
     expect(await screen.findByText('标题至少 4 个字')).toBeInTheDocument()
+    expect(screen.getByText('请填写标题（至少 4 个字）')).toBeInTheDocument()
+    expect(screen.getByText('请填写摘要（至少 10 个字）')).toBeInTheDocument()
+    expect(screen.getByText('请填写正文（至少 40 个字）')).toBeInTheDocument()
     expect(submit).not.toHaveBeenCalled()
     fireEvent.change(screen.getByLabelText('标题'), { target: { value: '定时任务做日报' } })
     fireEvent.change(screen.getByLabelText('摘要'), { target: { value: '记录配置步骤和踩过的坑。' } })
     fireEvent.change(screen.getByLabelText('正文（Markdown）'), {
       target: { value: '## 做法\n\n先准备数据源，再写清楚口径，最后让定时任务每天自动跑一次，跑完核对三天的数据都对得上。' },
     })
+    expect(screen.queryByText(/还需补全/)).toBeNull()
     expect(screen.getByRole('heading', { name: '定时任务做日报' })).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /提交发布/ }))
     await waitFor(() => expect(submit).toHaveBeenCalled())

@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import {
   BLOG_IMAGE_MAX_BYTES,
+  BLOG_PLACEHOLDER_GRADIENT,
+  BLOG_PLACEHOLDER_INK,
   BlogImageError,
   applyToolbar,
+  blogAvatar,
   blogCanEdit,
   blogDraftKey,
+  blogDraftMissingItems,
   clearAllBlogLocalDrafts,
   blogEditChangeMessage,
   blogEditDraftKey,
@@ -15,6 +19,7 @@ import {
   blogReadMinutes,
   blogShortDate,
   blogStageChangeMessage,
+  blogViewCount,
   compressBlogImage,
   fitLongEdge,
   imageAltFromName,
@@ -181,5 +186,50 @@ describe("clearAllBlogLocalDrafts", () => {
     expect(window.localStorage.getItem("oc:blog-draft")).toBeNull();
     expect(window.localStorage.getItem("oc:blog-draft:u1")).toBeNull();
     expect(window.localStorage.getItem("oc:blog-edit:9")).toBeNull();
+  });
+});
+
+describe("blogLib · Clarvy Atelier Token 与内联校验辅助", () => {
+  it("占位封面与头像全部走语义 Token，不含硬编码 hex 或 rgba", () => {
+    for (const gradient of Object.values(BLOG_PLACEHOLDER_GRADIENT)) {
+      expect(gradient).toContain("var(--");
+      expect(gradient).not.toMatch(/#[0-9a-f]{3,8}/i);
+      expect(gradient).not.toMatch(/rgba?\(/i);
+    }
+    for (const ink of Object.values(BLOG_PLACEHOLDER_INK)) {
+      expect(ink).toContain("var(--");
+      expect(ink).not.toMatch(/#[0-9a-f]{3,8}/i);
+    }
+    const avatar = blogAvatar("林小舟");
+    expect(avatar.initial).toBe("林");
+    expect(avatar.color).toMatch(/^var\(--/);
+    expect(avatar.fg).toMatch(/^var\(--/);
+  });
+
+  it("blogViewCount 仅接受有效非负数字", () => {
+    expect(blogViewCount({ viewCount: 128 })).toBe(128);
+    expect(blogViewCount({ viewCount: 0 })).toBe(0);
+    expect(blogViewCount({ viewCount: -1 })).toBeNull();
+    expect(blogViewCount({ viewCount: undefined })).toBeNull();
+    expect(blogViewCount(null)).toBeNull();
+  });
+
+  it("blogDraftMissingItems 列出标题/摘要/分类/正文缺失项并随填写消退", () => {
+    const empty = blogDraftMissingItems({ title: "", summary: "", category: "general", bodyMarkdown: "" });
+    expect(empty.map((item) => item.field)).toEqual(["title", "summary", "bodyMarkdown"]);
+    const badCat = blogDraftMissingItems({
+      title: "合法的标题内容",
+      summary: "一段超过十个字的清晰摘要说明。",
+      category: "invalid" as "general",
+      bodyMarkdown: "这是一段超过四十个字的经验正文，包含背景说明、具体步骤以及可复现的验证方式，帮助他人快速上手。",
+    });
+    expect(badCat.map((item) => item.field)).toEqual(["category"]);
+    const valid = blogDraftMissingItems({
+      title: "合法的标题内容",
+      summary: "一段超过十个字的清晰摘要说明。",
+      category: "coding",
+      bodyMarkdown: "这是一段超过四十个字的经验正文，包含背景说明、具体步骤以及可复现的验证方式，帮助他人快速上手。",
+    });
+    expect(valid).toEqual([]);
   });
 });

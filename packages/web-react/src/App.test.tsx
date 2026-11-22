@@ -2226,6 +2226,7 @@ describe('经验分享入口跟随 feature_community_blog（OCV5-577）', () => 
       if (u.includes('/api/me')) {
         return okJson({ user: { id: 'u1', email: 'a@b.com', role: 'user', display_name: 'Alice', credits: '300' } })
       }
+      if (u.includes('/api/tutorials')) return okJson({ tutorials: [], nextCursor: null, total: 0 })
       return okJson({})
     }) as unknown as FetchMock
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
@@ -2241,7 +2242,8 @@ describe('经验分享入口跟随 feature_community_blog（OCV5-577）', () => 
     const accountTrigger = screen.getByRole('button', { name: '账号菜单' })
     fireEvent.pointerDown(accountTrigger, { button: 0, pointerType: 'mouse' })
     fireEvent.click(await screen.findByRole('menuitem', { name: /帮助与案例/ }))
-    expect(await screen.findByText('经验分享')).toBeInTheDocument()
+    expect(await screen.findByRole('tab', { name: '经验分享' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: '经验分享' })).toBeInTheDocument()
   })
 
   test('未登录访客打开 tab=blog 深链：开关打开时进入经验分享', async () => {
