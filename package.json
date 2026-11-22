@@ -76,7 +76,12 @@
     "check:monotonic-baselines": "tsx scripts/check-monotonic-baselines.ts",
     "check:changelog-guard": "tsx scripts/check-changelog-guard.ts",
     "check:feature-flags-ttl": "tsx scripts/check-feature-flags-ttl.ts",
-    "check:governance:fast": "npm run check:docs-links && npm run check:ui-gates && npm run check:no-weak-downgrade && npm run check:route-sync && npm run check:changelog-guard && npm run check:feature-flags-ttl && npm run lint:scheduler-wiring && npm run lint:agent-containers-sql && npm run check:test-retries && npm run lint:integ-tiers && npm run check:v5:e2e-selectors",
+    "check:pg-migration-safety": "tsx scripts/check-pg-migration-safety.ts",
+    "check:rest-contract": "tsx scripts/check-rest-contract-compat.ts",
+    "check:cross-family-audit": "tsx scripts/check-cross-family-audit.ts",
+    "check:vlm-judge": "tsx scripts/check-vlm-aesthetic-judge.ts",
+    "check:layout-invariants": "node packages/web-react/browser-tests/layout-invariants.mjs --tier core --baseline packages/web-react/layout-invariants-baseline.json",
+    "check:governance:fast": "npm run check:docs-links && npm run check:ui-gates && npm run check:no-weak-downgrade && npm run check:route-sync && npm run check:changelog-guard && npm run check:feature-flags-ttl && npm run check:rest-contract && npm run lint:scheduler-wiring && npm run lint:agent-containers-sql && npm run check:test-retries && npm run lint:integ-tiers && npm run check:v5:e2e-selectors",
     "test:ccb:box-context": "bun --cwd claude-code-best test --timeout 120000 src/utils/model/boxContextTransport.test.ts src/utils/__tests__/messages.test.ts src/utils/__tests__/sessionFileIo.test.ts src/utils/__tests__/nativeTranscriptRecovery.test.ts src/utils/__tests__/sessionTranscriptReader.test.ts src/utils/__tests__/sessionTranscriptQueue.test.ts src/services/compact/idleNativeFit.test.ts src/services/compact/idleSiblingRecovery.test.ts src/services/compact/idleRollback.test.ts src/services/compact/idlePrepared.test.ts src/services/compact/idleConcurrentRecovery.test.ts"
   },
   "devDependencies": {

@@ -23,7 +23,7 @@
  * adapter 必须返回 ok=false,否则 outbox 会把实际未送达消息标记为 sent。
  */
 
-import { sendIlinkMedia, sendIlinkText } from "../../../channels/wechat/src/iLink.js"
+import { sendIlinkMedia, sendIlinkText } from "@openclaude/channel-wechat"
 
 import { rootLogger, type Logger } from "../logging/logger.js"
 import type { SendMediaFn, SendResult, SendTextFn } from "./outboxWorker.js"

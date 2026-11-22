@@ -6,7 +6,7 @@
  *   1. Authenticates caller via Bearer JWT or `oc_session` cookie (401 on failure).
  *   2. Verifies active account in DB when `v3Supervisor` is wired (403 if inactive).
  *   3. Rejects client-supplied `brainDir` immediately at master edge (`400 FORBIDDEN_FIELD`).
- *   4. Verifies `sessionId` ownership in PG `client_sessions` (`403 FORBIDDEN` if another
+ *   4. Verifies `sessionId` ownership via `ClientSessionsBackend` (`403 FORBIDDEN` if another
  *      user's session, `404 SWARM_NOT_FOUND` if missing/deleted).
  *   5. Forwards strictly to the caller's own running container `/internal/swarm/command`
  *      with signed `X-OpenClaude-Container-Id` + `X-OpenClaude-Bridge-Nonce` +
@@ -19,7 +19,7 @@ import {
   INTERNAL_SWARM_USER_ID_HEADER,
   SWARM_COMMAND_ROUTE_RE,
 } from '@openclaude/gateway'
-import { getPool } from '../db/index.js'
+import { verifyClientSessionOwnership } from '@openclaude/storage'
 import { MASTER_USER_PREFIX } from '../wechat/userIds.js'
 import { ContainerUnreadyError } from '../ws/userChatBridge.js'
 import {
@@ -34,7 +34,7 @@ import { HttpError, readJsonBody, sendJson } from './util.js'
 const MAX_SWARM_COMMAND_BODY_BYTES = 32 * 1024
 
 export interface CommercialSwarmCommandDeps {
-  /** Test seam: override PG session ownership lookup ('owner' | 'forbidden' | 'not_found'). */
+  /** Test seam: override session ownership lookup ('owner' | 'forbidden' | 'not_found'). */
   verifySessionOwnership?: (
     userId: string,
     sessionId: string,
@@ -48,17 +48,8 @@ export interface CommercialSwarmCommandDeps {
 async function defaultVerifySessionOwnership(
   userId: string,
   sessionId: string,
-  pool = getPool(),
 ): Promise<'owner' | 'forbidden' | 'not_found'> {
-  const res = await pool.query<{ user_id: string }>(
-    `SELECT user_id FROM client_sessions WHERE id = $1 AND deleted_at IS NULL LIMIT 1`,
-    [sessionId],
-  )
-  const row = res.rows[0]
-  if (!row) return 'not_found'
-  const expectedOwner = `${MASTER_USER_PREFIX}${userId}`
-  if (row.user_id !== expectedOwner) return 'forbidden'
-  return 'owner'
+  return verifyClientSessionOwnership(sessionId, `${MASTER_USER_PREFIX}${userId}`)
 }
 
 export async function handleCommercialSwarmCommand(
@@ -108,7 +99,7 @@ export async function handleCommercialSwarmCommand(
 
   const ownership = overrides?.verifySessionOwnership
     ? await overrides.verifySessionOwnership(user.id, sessionId)
-    : await defaultVerifySessionOwnership(user.id, sessionId, deps.v3Supervisor?.pool ?? getPool())
+    : await defaultVerifySessionOwnership(user.id, sessionId)
 
   if (ownership === 'forbidden') {
     throw new HttpError(403, 'FORBIDDEN', 'session does not belong to user')

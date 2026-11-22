@@ -5,19 +5,17 @@ import { join } from "node:path";
 
 import {
   decryptIlinkImageBuffer,
+  decryptIlinkMediaBuffer,
+  sanitizeWechatFilename,
   WECHAT_IMAGE_MAX_ATTACHMENTS,
   WECHAT_IMAGE_MAX_BYTES,
-  type DecryptedWechatImage,
-  type WechatImageAttachment,
-} from "../../../channels/wechat/src/iLinkImage.js";
-import {
-  decryptIlinkMediaBuffer,
   WECHAT_MEDIA_MAX_ATTACHMENTS,
   WECHAT_MEDIA_MAX_BYTES,
-  sanitizeWechatFilename,
+  type DecryptedWechatImage,
   type DecryptedWechatMedia,
+  type WechatImageAttachment,
   type WechatMediaAttachment,
-} from "../../../channels/wechat/src/iLinkMedia.js";
+} from "@openclaude/channel-wechat";
 import type { UserMediaLocation } from "../agent-sandbox/userMedia.js";
 
 const CONTAINER_UPLOADS_DIR = "/home/agent/.openclaude/uploads";

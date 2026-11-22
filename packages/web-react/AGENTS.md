@@ -27,7 +27,8 @@
   - `npx vitest run packages/web-react/src/test/designTokens.test.ts`（3 主题 AA + Token 棘轮 + `--z-*` 单调断言）
   - `npm run test:web-react`（目标文件可先定点跑，合前跑全量）
 - **提交前收口**：
-  - `npm run typecheck:preview --workspace packages/web-react`（防 `browser-tests/` 类型腐烂）
+  - `npm run typecheck:preview --workspace packages/web-react`（已入 PR CI，防 `browser-tests/` 类型腐烂）
+  - `npm run check:layout-invariants`（L2/L3 真 Chromium 多视口布局不变量已入 PR CI；基线 `packages/web-react/layout-invariants-baseline.json` 只降不升）
   - 改依赖/入口/CSS 跑 1 次 `npm run build:web-react`（470 KiB 首屏预算硬门）
   - 涉新入口/选择器跑 `npm run check:tutorials && npm run check:v5:e2e-selectors`
-  - 视觉/布局实景扫描（已落盘，本地/按需运行，待 P1-3/P1-4 接入 PR CI；纯引擎单测已入 CI）：`node packages/web-react/browser-tests/layout-invariants.mjs` / `node packages/web-react/browser-tests/ui-preview/shoot.mjs --tier=core --list`
+  - 本地按需视觉与审美校准（尚未入 PR CI 阻断）：`node packages/web-react/browser-tests/ui-preview/shoot.mjs --tier=core --list` / `npm run check:vlm-judge -- --dry-run`（L6 当前 `advisory` 校准态）

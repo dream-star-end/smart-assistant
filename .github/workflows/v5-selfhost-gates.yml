@@ -30,6 +30,7 @@ env:
   OC_V5_ALLOW_BREAKING_MIGRATION: '0'
   V5_SMOKE_E2E: '1'
   BOSS_APPROVED_CHANGELOG: '0'
+  OC_PG_MIGRATION_BOSS_APPROVED: '0'
 
 jobs:
   gates:
@@ -185,8 +186,65 @@ jobs:
       - name: Feature flags TTL registry gate
         run: npx tsx scripts/check-feature-flags-ttl.ts
 
+      # OCV5-847 (Wave 2): PG 零停机 Expand-Contract 迁移安全门 & 核心 5 域 REST API 契约兼容门（直调 A 类脚本）。
+      - name: PG zero-downtime migration safety gate
+        env:
+          OC_PG_MIGRATION_BOSS_APPROVED: '0'
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ steps.base.outputs.ref }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(git rev-parse HEAD)"
+          APPROVAL_ARGS=()
+          CHANGED_MIGRATIONS="$(git diff --name-only "$BASE_REF...HEAD" -- packages/commercial/src/db/migrations/)"
+          # 仅当 packages/commercial/src/db/migrations/ 发生变更时，通过受信任 GitHub API 核验 @dream-star-end 的 APPROVED 审批。
+          if [ -n "$CHANGED_MIGRATIONS" ]; then
+            if [ "$EVENT" = "pull_request" ] && [ -n "$PR_NUMBER" ] && [[ "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              parent2="$(git rev-parse --verify --quiet HEAD^2 || true)"
+              if [ "$PR_HEAD_SHA" = "$HEAD_SHA" ] || [ "$PR_HEAD_SHA" = "$parent2" ]; then
+                if gh api --paginate "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" \
+                  | jq -es --arg sha "$PR_HEAD_SHA" --arg head "$HEAD_SHA" \
+                      'add | [.[] | select(.user.login == "dream-star-end" and .state != "COMMENTED")] | last | (.state == "APPROVED" and (.commit_id == $sha or .commit_id == $head))' >/dev/null 2>&1; then
+                  APPROVAL_ARGS+=(--approved-commit "$HEAD_SHA")
+                fi
+              fi
+            elif [ "$EVENT" = "push" ]; then
+              # 按迁移文件粒度逐个核验其末次修改提交所属的已合入 PR 审签，兼容迁移 commit / PR head / merge commit 三者不同（如 PR #1401）且杜绝批量 push 过度豁免。
+              MERGE_BASE="$(git merge-base "$BASE_REF" HEAD)"
+              while IFS= read -r mfile; do
+                [ -n "$mfile" ] || continue
+                msha="$(git log -n 1 --format=%H "${MERGE_BASE}..HEAD" -- "$mfile" || true)"
+                [ -n "$msha" ] || continue
+                while IFS=$'\t' read -r pr_num pr_head pr_merge; do
+                  [ -n "$pr_num" ] || continue
+                  if [ -n "$pr_merge" ] && ! git merge-base --is-ancestor "$pr_merge" "$HEAD_SHA" 2>/dev/null; then
+                    continue
+                  fi
+                  if gh api --paginate "repos/${GH_REPO}/pulls/${pr_num}/reviews" \
+                    | jq -es --arg sha "$pr_head" --arg merge "$pr_merge" \
+                        'add | [.[] | select(.user.login == "dream-star-end" and .state != "COMMENTED")] | last | (.state == "APPROVED" and (.commit_id == $sha or ($merge != "" and .commit_id == $merge)))' >/dev/null 2>&1; then
+                    APPROVAL_ARGS+=(--approved-file "$mfile")
+                    break
+                  fi
+                done < <(
+                  gh api --paginate "repos/${GH_REPO}/commits/${msha}/pulls" \
+                    | jq -rs 'add | (. // []) | .[] | select(.merged_at != null and .base.ref == "feat/v5-selfhost") | [.number, .head.sha, (.merge_commit_sha // "")] | @tsv' \
+                    || true
+                )
+              done <<< "$CHANGED_MIGRATIONS"
+            fi
+          fi
+          npx tsx scripts/check-pg-migration-safety.ts --base "$BASE_REF" "${APPROVAL_ARGS[@]}"
+
+      - name: REST API contract snapshot and compatibility gate
+        run: npx tsx scripts/check-rest-contract-compat.ts --base "${{ steps.base.outputs.ref }}"
+
       - name: Governance gate self-tests
-        run: npx tsx --test scripts/__tests__/check-docs-links.test.ts scripts/__tests__/check-ui-hard-gates.test.ts scripts/__tests__/check-no-silent-model-downgrade.test.ts scripts/__tests__/check-v5-route-sync.test.ts scripts/__tests__/check-monotonic-baselines.test.ts scripts/__tests__/check-changelog-guard.test.ts scripts/__tests__/check-feature-flags-ttl.test.ts
+        run: npx tsx --test scripts/__tests__/check-docs-links.test.ts scripts/__tests__/check-ui-hard-gates.test.ts scripts/__tests__/check-no-silent-model-downgrade.test.ts scripts/__tests__/check-v5-route-sync.test.ts scripts/__tests__/check-monotonic-baselines.test.ts scripts/__tests__/check-changelog-guard.test.ts scripts/__tests__/check-feature-flags-ttl.test.ts scripts/__tests__/check-pg-migration-safety.test.ts scripts/__tests__/check-rest-contract-compat.test.ts scripts/__tests__/check-cross-family-audit.test.ts scripts/__tests__/check-vlm-aesthetic-judge.test.ts
 
       - name: Prepare and flip lane isolation (temporary git, locks and artifacts only)
         run: |

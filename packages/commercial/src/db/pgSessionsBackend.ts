@@ -146,6 +146,7 @@ import {
   type ClientSession,
   type ClientSessionLifecycle,
   type ClientSessionLifecycleRef,
+  type ClientSessionOwnership,
   type BatchClientSessionsInput,
   type BatchClientSessionsResult,
   type MarkClientSessionReadResult,
@@ -11826,6 +11827,20 @@ export function createPgSessionsBackend(
         userId: row.user_id,
         state: row.state,
       }));
+    },
+
+    async verifyClientSessionOwnership(
+      id: string,
+      expectedUserId: string,
+    ): Promise<ClientSessionOwnership> {
+      const row = (
+        await pool.query<{ user_id: string }>(
+          "SELECT user_id FROM client_sessions WHERE id = $1 AND deleted_at IS NULL LIMIT 1",
+          [id],
+        )
+      ).rows[0];
+      if (!row) return "not_found";
+      return row.user_id === expectedUserId ? "owner" : "forbidden";
     },
 
     async getClientSessionPartial(

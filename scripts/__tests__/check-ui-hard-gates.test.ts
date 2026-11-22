@@ -7,16 +7,26 @@ import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 import {
+  LAYOUT_BASELINE_SCHEMA_VERSION,
+  LAYOUT_CORE_TIER_SCENE_IDS,
   THEMES,
   VIEWPORTS,
+  aggregateViolationCounts,
+  buildViolationKey,
   checkControlOverlaps,
   checkDomA11y,
   checkHorizontalOverflow,
   checkNonEllipsisTruncation,
   checkTouchTargets,
+  compareWithLayoutBaseline,
+  createLayoutBaseline,
   evaluateLayoutSnapshot,
+  formatBaselineRegressions,
   formatLayoutViolations,
+  parseCliArgs,
+  parseLayoutBaselineJson,
   rectIntersectionArea,
+  validateLayoutBaseline,
 } from '../../packages/web-react/browser-tests/layout-invariants.mjs'
 import {
   CORE_TIER_SCENE_IDS,
@@ -433,6 +443,152 @@ describe('Layout invariants & DOM a11y pure engine (packages/web-react/browser-t
     })
     assert.match(formatted, /\[GATE-ERROR\] A11Y-UNNAMED-BUTTON at composer-idle \/ mobile \/ dark/)
     assert.match(formatted, /Screenshot: \/tmp\/fail\.png/)
+  })
+
+  it('B-class baseline comparison: allows exact match & debt paydown, blocks new violations & count increases', () => {
+    assert.ok(LAYOUT_CORE_TIER_SCENE_IDS.length >= 8 && LAYOUT_CORE_TIER_SCENE_IDS.length <= 12)
+    assert.equal(
+      buildViolationKey('composer-idle', 'mobile', 'dark', 'LAYOUT-TOUCH-TARGET-SMALL'),
+      'composer-idle|mobile|dark|LAYOUT-TOUCH-TARGET-SMALL',
+    )
+
+    const initialCounts = aggregateViolationCounts([
+      {
+        target: 'composer-idle',
+        viewport: 'mobile',
+        theme: 'dark',
+        violations: [
+          { ruleId: 'LAYOUT-TOUCH-TARGET-SMALL' },
+          { ruleId: 'LAYOUT-TOUCH-TARGET-SMALL' },
+          { ruleId: 'LAYOUT-FORBIDDEN-OVERFLOW-X-HIDDEN' },
+        ],
+      },
+      {
+        target: 'sidebar-overview',
+        viewport: 'desktop',
+        theme: 'light',
+        violations: [{ ruleId: 'LAYOUT-CONTROL-OVERLAP' }],
+      },
+    ])
+
+    const baseline = createLayoutBaseline(initialCounts, {
+      tier: 'core',
+      scenes: ['composer-idle', 'sidebar-overview'],
+    })
+    assert.equal(baseline.schemaVersion, LAYOUT_BASELINE_SCHEMA_VERSION)
+
+    // Exact match passes
+    const exact = compareWithLayoutBaseline(initialCounts, baseline)
+    assert.equal(exact.ok, true)
+    assert.equal(exact.regressions.length, 0)
+    assert.equal(exact.debtPaydowns.length, 0)
+
+    // Debt paydown (reduced count + eliminated key) passes and reports paydowns
+    const paidDown = compareWithLayoutBaseline(
+      {
+        'composer-idle|mobile|dark|LAYOUT-TOUCH-TARGET-SMALL': 1,
+        'composer-idle|mobile|dark|LAYOUT-FORBIDDEN-OVERFLOW-X-HIDDEN': 1,
+      },
+      baseline,
+    )
+    assert.equal(paidDown.ok, true)
+    assert.equal(paidDown.regressions.length, 0)
+    assert.equal(paidDown.debtPaydowns.length, 2)
+
+    // Increased count + brand-new violation key are strictly blocked
+    const regressed = compareWithLayoutBaseline(
+      {
+        'composer-idle|mobile|dark|LAYOUT-TOUCH-TARGET-SMALL': 3,
+        'composer-idle|mobile|dark|LAYOUT-FORBIDDEN-OVERFLOW-X-HIDDEN': 1,
+        'sidebar-overview|desktop|light|LAYOUT-CONTROL-OVERLAP': 1,
+        'market-browse-skill|mobile|dark|LAYOUT-HORIZONTAL-OVERFLOW': 1,
+      },
+      baseline,
+    )
+    assert.equal(regressed.ok, false)
+    assert.equal(regressed.regressions.length, 2)
+    assert.equal(
+      regressed.regressions.some(
+        (r) =>
+          r.kind === 'count-increased' &&
+          r.key === 'composer-idle|mobile|dark|LAYOUT-TOUCH-TARGET-SMALL' &&
+          r.delta === 1,
+      ),
+      true,
+    )
+    assert.equal(
+      regressed.regressions.some(
+        (r) =>
+          r.kind === 'new-violation' &&
+          r.key === 'market-browse-skill|mobile|dark|LAYOUT-HORIZONTAL-OVERFLOW' &&
+          r.allowed === 0 &&
+          r.actual === 1,
+      ),
+      true,
+    )
+    const msg = formatBaselineRegressions(regressed.regressions, {
+      baselinePath: 'packages/web-react/layout-invariants-baseline.json',
+    })
+    assert.match(msg, /\[GATE-ERROR\] LAYOUT-BASELINE-REGRESSION/)
+    assert.match(msg, /LAYOUT-HORIZONTAL-OVERFLOW/)
+  })
+
+  it('B-class baseline fail-closed: rejects malformed JSON, invalid schema, bad keys, and non-integer counts', () => {
+    assert.throws(() => parseLayoutBaselineJson(''), /LAYOUT-BASELINE-INVALID/)
+    assert.throws(() => parseLayoutBaselineJson('{not valid json'), /LAYOUT-BASELINE-INVALID/)
+    assert.throws(() => validateLayoutBaseline(null), /LAYOUT-BASELINE-INVALID/)
+    assert.throws(
+      () => validateLayoutBaseline({ schemaVersion: 99, counts: {} }),
+      /LAYOUT-BASELINE-INVALID/,
+    )
+    assert.throws(
+      () => validateLayoutBaseline({ schemaVersion: 1, counts: [] }),
+      /LAYOUT-BASELINE-INVALID/,
+    )
+    assert.throws(
+      () =>
+        validateLayoutBaseline({
+          schemaVersion: 1,
+          counts: { 'bad-key-missing-parts': 1 },
+        }),
+      /LAYOUT-BASELINE-INVALID/,
+    )
+    assert.throws(
+      () =>
+        validateLayoutBaseline({
+          schemaVersion: 1,
+          counts: { 'scene|mobile|dark|RULE': -1 },
+        }),
+      /LAYOUT-BASELINE-INVALID/,
+    )
+    assert.throws(
+      () =>
+        validateLayoutBaseline({
+          schemaVersion: 1,
+          counts: { 'scene|mobile|dark|RULE': 1.5 },
+        }),
+      /LAYOUT-BASELINE-INVALID/,
+    )
+    assert.throws(
+      () =>
+        validateLayoutBaseline({
+          schemaVersion: 1,
+          counts: { 'scene|mobile|dark|RULE': '2' },
+        }),
+      /LAYOUT-BASELINE-INVALID/,
+    )
+    // CLI arg parsing for --tier, --baseline, --write-baseline
+    const parsed = parseCliArgs([
+      '--tier',
+      'core',
+      '--baseline',
+      'packages/web-react/layout-invariants-baseline.json',
+      '--write-baseline',
+    ])
+    assert.equal(parsed.tier, 'core')
+    assert.equal(parsed.baseline, 'packages/web-react/layout-invariants-baseline.json')
+    assert.equal(parsed.writeBaseline, true)
+    assert.throws(() => parseCliArgs(['--tier', 'bogus']), /Unsupported --tier/)
   })
 })
 

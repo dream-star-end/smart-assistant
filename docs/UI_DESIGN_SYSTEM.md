@@ -125,39 +125,37 @@
 
 ## 4. 6 层 UI/UX 硬门禁漏斗与执行命令
 
-> **当前接线状态（严格区分已入 CI 与本地按需脚本）**：
-> 1. **已接入 PR CI 硬阻断**：L1 静态门（`scripts/check-ui-hard-gates.ts`、`packages/web-react/src/test/designTokens.test.ts` 随 `test:web-react`）、L5 构建期 470 KiB & CSS 预算（`packages/web-react/budgets.json` + `npm run build:web-react`）与 `scripts/check-file-size-ratchet.ts`、`npm run test:browser` 既有真浏览器套件、`scripts/check-v5-e2e-selectors.ts`、以及 L2/L3 几何与 DOM a11y 纯断言引擎单测（`scripts/__tests__/check-ui-hard-gates.test.ts`）。
-> 2. **已落盘可执行脚本（本地/按需运行，待 P1-3/P1-4 冻结存量基线与固定 Linux 基准图后接入 `.github/workflows/v5-selfhost-web-react.yml` PR CI）**：`packages/web-react/browser-tests/layout-invariants.mjs`（L2/L3 实景浏览器扫描）与 `packages/web-react/browser-tests/ui-preview/shoot.mjs --tier=core`（L4 核心 36 场景截图对比）。
-> 3. **P2 计划（尚未落盘）**：L5 LHCI CWV 与 L6 独立 VLM 审美 Rubric 评委。
+> **当前接线状态（严格区分已入 PR CI 与本地/校准态脚本）**：
+> 1. **已接入 PR CI 硬阻断**：L1 静态门（`scripts/check-ui-hard-gates.ts`、`packages/web-react/src/test/designTokens.test.ts` 随 `test:web-react`）、`typecheck:preview`（`packages/web-react/tsconfig.browser-tests.json`）、L2/L3 实景 Chromium 多视口布局与 DOM a11y 门（`packages/web-react/browser-tests/layout-invariants.mjs --tier core --baseline packages/web-react/layout-invariants-baseline.json`，B 类存量基线由 `scripts/check-monotonic-baselines.ts` 守单调）、L5 构建期 470 KiB & CSS 预算（`packages/web-react/budgets.json` + `npm run build:web-react`）与 `scripts/check-file-size-ratchet.ts`、`npm run test:browser` 既有真浏览器套件、`scripts/check-v5-e2e-selectors.ts`。
+> 2. **已落盘脚本（未接入 PR CI 阻断，清晰分层）**：L4 `packages/web-react/browser-tests/ui-preview/shoot.mjs --tier=core`（本地/按需像素截图对比，待固定 Linux 基准图后接入 PR CI）；L6 `scripts/check-vlm-aesthetic-judge.ts` + `packages/web-react/browser-tests/vlm-rubric/rubric.json`（已落盘且单测入 PR CI，当前 `mode: "advisory"` 2 周校准态，未接入实时 VLM PR 阻断）。
+> 3. **P2 计划（尚未落盘）**：L5 LHCI CWV（`LCP≤2.5s`/`CLS≤0.1`/`TBT≤200ms`）。
 
 | 层级 | 门禁职责与落点文件 | 当前执行状态 | 关键命令 / 防篡改保护 |
 |---|---|---|---|
 | **L1 静态样式 / Token / `--z-*` / 滚动 / 术语 / 动效** | `packages/web-react/src/test/designTokens.test.ts`（3 主题 AA + Token 棘轮 + `--z-*` 单调断言）、`packages/web-react/design-tokens-exempt.json`（A 类豁免）、`packages/web-react/design-tokens-counts.json`（B 类计数）、`packages/web-react/ui-static-baseline.json`（B 类基线）、`scripts/check-ui-hard-gates.ts`（单 writer 滚动 / `--z-*` 竞价 / 零学习成本文案 / `prefers-reduced-motion`） | **已接入 PR CI 硬阻断**（本地 `<5s` + `v5-selfhost-gates.yml` / `v5-selfhost-web-react.yml`） | `npm run check:ui-gates`<br>`npx vitest run packages/web-react/src/test/designTokens.test.ts` |
-| **L2 多视口几何布局不变量** | `packages/web-react/browser-tests/layout-invariants.mjs`：4 视口（`390×844`/`768×1024`/`1280×800`/`1440×900`）× 双主题检测零横向溢出（禁 `html/body` `overflow-x:hidden`）、零控件重叠、零非省略截断、`<640px` 44px 热区，失败自动画红框落盘截图 | **纯引擎单测已入 PR CI；实景浏览器扫描已落盘（本地/按需运行，待 P1-3 冻结存量基线后接入 PR CI）** | `node packages/web-react/browser-tests/layout-invariants.mjs`（脚本锁入 A 类 `CODEOWNERS`；纯引擎单测在 `scripts/__tests__/check-ui-hard-gates.test.ts`） |
-| **L3 运行时 DOM 无障碍** | 集成在 `packages/web-react/browser-tests/layout-invariants.mjs`（检测无名按钮/缺 `alt`/缺 `<html lang>`，环境中存在 `@axe-core/playwright` 时自动叠加 `wcag21aa`） | **纯引擎单测已入 PR CI；实景扫描随 L2 本地/按需运行（待 P1-3 接入 PR CI）** | 随 L2 同导航零额外启页执行 |
-| **L4 像素视觉回归** | 复用 `packages/web-react/browser-tests/ui-preview/shoot.mjs`：`--tier=core`（核心 36 场景）与全量 257 场景；`bug/refactor/perf(v5):` 禁改基线，`ui(v5):` 在 L2/L3 全绿下受控更新 | **可执行脚本已落盘（本地/按需运行，待 P1-4 固定 Linux 基准图后接入 PR CI；全量归 Nightly）** | `node packages/web-react/browser-tests/ui-preview/shoot.mjs --tier=core --list` |
+| **L2 多视口几何布局不变量** | `packages/web-react/browser-tests/layout-invariants.mjs`（A 类锁）+ `packages/web-react/layout-invariants-baseline.json`（B 类存量基线）：核心 11 场景 × 4 视口（`390×844`/`768×1024`/`1280×800`/`1440×900`）× 双主题检测零横向溢出、零控件重叠、零非省略截断、`<640px` 44px 热区，失败画红框落盘截图 | **已接入 PR CI 硬阻断**（`v5-selfhost-web-react.yml` `web-react-browser` 真 Chromium 实跑 + `check-monotonic-baselines.ts` 守基线单调） | `npm run check:layout-invariants`<br>（单测在 `scripts/__tests__/check-ui-hard-gates.test.ts`） |
+| **L3 运行时 DOM 无障碍** | 集成在 `packages/web-react/browser-tests/layout-invariants.mjs`（检测无名按钮/缺 `alt`/缺 `<html lang>`，环境中存在 `@axe-core/playwright` 时自动叠加 `wcag21aa`） | **已接入 PR CI 硬阻断**（随 L2 `--tier core` 同导航执行） | 随 `npm run check:layout-invariants` 零额外启页执行 |
+| **L4 像素视觉回归** | 复用 `packages/web-react/browser-tests/ui-preview/shoot.mjs`：`--tier=core`（核心 36 场景）与全量 257 场景；`bug/refactor/perf(v5):` 禁改基线，`ui(v5):` 在 L2/L3 全绿下受控更新 | **可执行脚本已落盘（本地/按需运行，尚未接入 PR CI 实景视觉快照阻断；全量归 Nightly）** | `node packages/web-react/browser-tests/ui-preview/shoot.mjs --tier=core --list` |
 | **L5 首屏体积与 CSS 体积棘轮** | `packages/web-react/budgets.json`（470 KiB = `481,280 B` 硬预算 + `460,800 B` 软告警 + CSS 总量预算）+ `packages/web-react/vite.config.ts` + `scripts/check-file-size-ratchet.ts`（含 `.css` 与黄区冻结）；LHCI CWV（`LCP≤2.5s`/`CLS≤0.1`/`TBT≤200ms`，P2 计划） | **已接入构建期 + PR CI 硬阻断**（`build:web-react` / `file-size-ratchet` / `monotonic-baselines`；LHCI 为 P2 计划） | `npm run build:web-react`<br>`npx tsx scripts/check-file-size-ratchet.ts` |
-| **L6 独立 VLM 审美 Rubric 评委** | 独立多模态强模型按 5 维 Rubric（Craft / Hierarchy / Coherence / Anti-Slop / Usability）审查代表态拼图，仅条件触发于设计系统/壳层/`ui-redesign` PR（P2 计划） | **P2 计划**（严格条件触发 / 离线巡检，尚未接入 PR CI） | 评委 prompt 与阈值划入 L4 元层，严禁生成者自评 |
+| **L6 独立 VLM 审美 Rubric 评委** | `packages/web-react/browser-tests/vlm-rubric/rubric.json`（A 类 5 维 Rubric）+ `scripts/check-vlm-aesthetic-judge.ts`（条件触发/强制 CoT/`$0.50` 与 2 轮封顶/fail-closed） | **已落盘 + 单测入 PR CI；`advisory` 2 周校准态（尚未接入实时 VLM PR 阻断）** | `npm run check:vlm-judge -- --dry-run`（Rubric 锁入 A 类 `CODEOWNERS`） |
 
 ### 专项补齐门与日常必跑命令清单
 
 ```bash
-# 1. 本地秒级前端静态快门 + L2/L3 几何/a11y 纯引擎单测（<5s，均已接入 PR CI）
+# 1. 本地秒级前端静态快门 + 预览类型检查 + 纯引擎单测（<10s，均已接入 PR CI）
 npm run check:ui-gates
-npx tsx --test scripts/__tests__/check-ui-hard-gates.test.ts
+npm run typecheck:preview --workspace packages/web-react
+npx tsx --test scripts/__tests__/check-ui-hard-gates.test.ts scripts/__tests__/check-vlm-aesthetic-judge.test.ts
 npx vitest run packages/web-react/src/test/designTokens.test.ts
 
-# 2. 全量前端单测与既有真浏览器套件（已接入 v5-selfhost-web-react.yml PR CI，OCV5-343 必须 100% 全绿）
+# 2. 全量前端单测、既有真浏览器套件与 L2/L3 实景布局不变量（均已接入 v5-selfhost-web-react.yml PR CI）
 npm run test:web-react
 npm run test:browser
+npm run check:layout-invariants
 
-# 3. 470 KiB 首屏预算构建 + 选择器同步门（已入 CI）+ 本地按需预览类型/教程检查
-npm run build:web-react
-npm run check:v5:e2e-selectors
-npm run typecheck:preview --workspace packages/web-react
+# 3. 470 KiB 首屏预算构建 + 选择器同步门（已入 CI）+ 本地按需教程/L4 视觉快照/L6 advisory 校准
+npm run build:web-react && npm run check:v5:e2e-selectors
 npm run check:tutorials
-
-# 4. L2/L3 实景浏览器布局扫描与 L4 核心 36 场景截图（已落盘，本地/按需运行，待 P1-3/P1-4 接入 PR CI）
-node packages/web-react/browser-tests/layout-invariants.mjs
 node packages/web-react/browser-tests/ui-preview/shoot.mjs --tier=core --list
+npm run check:vlm-judge -- --dry-run --changed-files packages/web-react/src/styles.css
 ```

@@ -9,10 +9,13 @@ import {
   BUDGETS_PATH,
   DESIGN_TOKENS_COUNTS_PATH,
   FEATURE_FLAGS_REGISTRY_PATH,
+  LAYOUT_INVARIANTS_BASELINE_PATH,
   UI_STATIC_BASELINE_PATH,
   compareBudgets,
   compareCountRatchet,
   compareFeatureFlagsRegistry,
+  compareLayoutInvariantsBaseline,
+  validateLayoutInvariantsBaselineSchema,
 } from '../check-monotonic-baselines.ts'
 
 const SCRIPT = path.resolve(
@@ -126,6 +129,70 @@ describe('check-monotonic-baselines pure comparators', () => {
     assert.equal(flipped.length, 1)
     assert.equal(flipped[0]!.rule, 'MONOTONIC-FLAG-MADE-PERMANENT')
   })
+
+  test('layout-invariants-baseline.json: lowering counts or deleting keys PASS; adding key, raising count, or invalid schema FAIL', () => {
+    const base = {
+      schemaVersion: 1,
+      tier: 'core',
+      keyFormat: 'scene|viewport|theme|ruleId',
+      scenes: ['composer-idle', 'sidebar-overview'],
+      viewports: ['mobile', 'desktop'],
+      themes: ['light', 'dark'],
+      counts: {
+        'composer-idle|mobile|light|LAYOUT-TOUCH-TARGET-SMALL': 2,
+        'sidebar-overview|mobile|dark|LAYOUT-TOUCH-TARGET-SMALL': 15,
+      },
+    }
+    // Debt cleanup: lowered count & deleted key -> PASS
+    assert.deepEqual(
+      compareLayoutInvariantsBaseline(base, {
+        ...base,
+        counts: {
+          'sidebar-overview|mobile|dark|LAYOUT-TOUCH-TARGET-SMALL': 10,
+        },
+      }),
+      [],
+    )
+    // Raised count -> RED
+    const raised = compareLayoutInvariantsBaseline(base, {
+      ...base,
+      counts: {
+        ...base.counts,
+        'composer-idle|mobile|light|LAYOUT-TOUCH-TARGET-SMALL': 3,
+      },
+    })
+    assert.equal(raised.length, 1)
+    assert.equal(raised[0]!.rule, 'MONOTONIC-COUNT-RAISED')
+
+    // Newly added key (even count=0 or >0) -> RED
+    const added = compareLayoutInvariantsBaseline(base, {
+      ...base,
+      counts: {
+        ...base.counts,
+        'tools-inspector|mobile|dark|LAYOUT-HORIZONTAL-OVERFLOW': 1,
+      },
+    })
+    assert.equal(added.length, 1)
+    assert.equal(added[0]!.rule, 'MONOTONIC-COUNT-ADDED')
+
+    const addedZero = compareLayoutInvariantsBaseline(base, {
+      ...base,
+      counts: {
+        ...base.counts,
+        'tools-inspector|mobile|dark|LAYOUT-HORIZONTAL-OVERFLOW': 0,
+      },
+    })
+    assert.equal(addedZero.length, 1)
+    assert.equal(addedZero[0]!.rule, 'MONOTONIC-COUNT-ADDED')
+
+    // Invalid schema (bad schemaVersion / malformed key) -> RED
+    const badSchema = validateLayoutInvariantsBaselineSchema({
+      schemaVersion: 2,
+      counts: { 'bad-key-format': 1 },
+    })
+    assert.ok(badSchema.some((v) => v.rule === 'MONOTONIC-SCHEMA-INVALID' && v.key === 'schemaVersion'))
+    assert.ok(badSchema.some((v) => v.rule === 'MONOTONIC-SCHEMA-INVALID' && v.key === 'bad-key-format'))
+  })
 })
 
 describe('check-monotonic-baselines CLI', () => {
@@ -139,6 +206,11 @@ describe('check-monotonic-baselines CLI', () => {
     put(BUDGETS_PATH, { firstScreenGzipBytes: 481280 })
     put(DESIGN_TOKENS_COUNTS_PATH, { pxText: { 'components/chat': 10 } })
     put(UI_STATIC_BASELINE_PATH, { 'UI-ZINDEX-LADDER': { 'components/a.tsx': 2 } })
+    put(LAYOUT_INVARIANTS_BASELINE_PATH, {
+      schemaVersion: 1,
+      tier: 'core',
+      counts: { 'composer-idle|mobile|light|LAYOUT-TOUCH-TARGET-SMALL': 2 },
+    })
     put(FEATURE_FLAGS_REGISTRY_PATH, {
       schema: 1,
       flags: [{ name: 'OC_P5_CHIPS', permanent: false, expireAt: '2026-12-22' }],
@@ -148,7 +220,70 @@ describe('check-monotonic-baselines CLI', () => {
     })
     assert.equal(r.status, 0, r.stderr)
     assert.match(r.stdout, /budgets\.json=introduced/)
+    assert.match(r.stdout, /layout-invariants-baseline\.json=introduced/)
     assert.match(r.stdout, /violations=0/)
+  })
+
+  test('RED: CLI catches invalid layout-invariants-baseline.json on initial introduction and regressions once committed', (t) => {
+    // 1. Initial introduction with invalid schema -> RED
+    const introDir = initGitRepo(t, {})
+    const introAbs = path.join(introDir, LAYOUT_INVARIANTS_BASELINE_PATH)
+    mkdirSync(path.dirname(introAbs), { recursive: true })
+    writeFileSync(introAbs, JSON.stringify({ schemaVersion: 99, counts: {} }))
+    const badIntro = spawnSync(
+      process.execPath,
+      ['--import', 'tsx', SCRIPT, '--root', introDir, '--base', 'base'],
+      { encoding: 'utf8' },
+    )
+    assert.equal(badIntro.status, 1)
+    assert.match(badIntro.stderr, /\[GATE-ERROR\] MONOTONIC-SCHEMA-INVALID/)
+
+    // 2. Once committed at base: raising count or adding key -> RED; debt cleanup -> GREEN
+    const dir = initGitRepo(t, {
+      [LAYOUT_INVARIANTS_BASELINE_PATH]: {
+        schemaVersion: 1,
+        tier: 'core',
+        counts: {
+          'composer-idle|mobile|light|LAYOUT-TOUCH-TARGET-SMALL': 2,
+          'sidebar-overview|mobile|dark|LAYOUT-TOUCH-TARGET-SMALL': 5,
+        },
+      },
+    })
+    writeFileSync(
+      path.join(dir, LAYOUT_INVARIANTS_BASELINE_PATH),
+      JSON.stringify({
+        schemaVersion: 1,
+        tier: 'core',
+        counts: {
+          'composer-idle|mobile|light|LAYOUT-TOUCH-TARGET-SMALL': 3,
+          'sidebar-overview|mobile|dark|LAYOUT-TOUCH-TARGET-SMALL': 5,
+          'tools-inspector|mobile|dark|LAYOUT-HORIZONTAL-OVERFLOW': 1,
+        },
+      }),
+    )
+    const red = spawnSync(process.execPath, ['--import', 'tsx', SCRIPT, '--root', dir, '--base', 'base'], {
+      encoding: 'utf8',
+    })
+    assert.equal(red.status, 1)
+    assert.match(red.stderr, /\[GATE-ERROR\] MONOTONIC-COUNT-RAISED/)
+    assert.match(red.stderr, /\[GATE-ERROR\] MONOTONIC-COUNT-ADDED/)
+
+    writeFileSync(
+      path.join(dir, LAYOUT_INVARIANTS_BASELINE_PATH),
+      JSON.stringify({
+        schemaVersion: 1,
+        tier: 'core',
+        counts: {
+          'sidebar-overview|mobile|dark|LAYOUT-TOUCH-TARGET-SMALL': 4,
+        },
+      }),
+    )
+    const green = spawnSync(process.execPath, ['--import', 'tsx', SCRIPT, '--root', dir, '--base', 'base'], {
+      encoding: 'utf8',
+    })
+    assert.equal(green.status, 0, green.stderr)
+    assert.match(green.stdout, /layout-invariants-baseline\.json=compared/)
+    assert.match(green.stdout, /violations=0/)
   })
 
   test('RED: CLI catches raised budget, raised count, and extended flag TTL against committed base', (t) => {

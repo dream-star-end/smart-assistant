@@ -1,4 +1,5 @@
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -75,6 +76,26 @@ export const VIEWPORTS = Object.freeze({
 export const THEMES = Object.freeze(['light', 'dark'])
 export const MIN_TOUCH_TARGET_PX = 44
 export const MOBILE_BREAKPOINT_PX = 640
+export const LAYOUT_BASELINE_SCHEMA_VERSION = 1
+export const DEFAULT_BASELINE_FILENAME = 'layout-invariants-baseline.json'
+
+/**
+ * PR 级核心布局不变量场景集（--tier core，11 场景 × 4 视口 × 2 主题 = 88 帧）：
+ * 覆盖主聊空态/流式/完成、顶栏+输入区、侧栏、设置/订阅、市场、管理中心、Workbench。
+ */
+export const LAYOUT_CORE_TIER_SCENE_IDS = Object.freeze([
+  'shell-empty-state',
+  'messages-assistant-streaming',
+  'messages-timeline-rich',
+  'composer-idle',
+  'sidebar-overview',
+  'settings-full-account',
+  'settings-subscription-dialog',
+  'market-browse-skill',
+  'manage-skills',
+  'workspace-chat-density',
+  'tools-inspector',
+])
 
 /**
  * Compute intersection area (in CSS px^2) between two axis-aligned rectangles { x, y, width, height }.
@@ -378,6 +399,225 @@ export function formatLayoutViolations(violations, context = {}) {
     .join('\n\n')
 }
 
+// ── B-Class Monotonic Debt Baseline Engine (pure, unit-testable) ────────────
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function validateNonEmptySegment(value, fieldName) {
+  if (typeof value !== 'string' || value.trim().length === 0 || value.includes('|')) {
+    throw new Error(
+      `[GATE-ERROR] LAYOUT-BASELINE-INVALID: invalid ${fieldName} (${JSON.stringify(value)})`,
+    )
+  }
+  return value.trim()
+}
+
+/**
+ * Normalize a single violation occurrence into a stable identity key:
+ *   `${target}|${viewport}|${theme}|${ruleId}`
+ * Aggregating per (scene, viewport, theme, rule) prevents DOM micro-tweaks from causing noisy churn.
+ */
+export function buildViolationKey(target, viewport, theme, ruleId) {
+  return [
+    validateNonEmptySegment(target, 'target'),
+    validateNonEmptySegment(viewport, 'viewport'),
+    validateNonEmptySegment(theme, 'theme'),
+    validateNonEmptySegment(ruleId, 'ruleId'),
+  ].join('|')
+}
+
+function sortCountsObject(counts) {
+  const sorted = {}
+  for (const key of Object.keys(counts).sort()) {
+    const val = counts[key]
+    if (val > 0) sorted[key] = val
+  }
+  return sorted
+}
+
+/**
+ * Aggregate violations across evaluated frames into deterministic key -> count map.
+ */
+export function aggregateViolationCounts(frameResults = []) {
+  const counts = {}
+  for (const frame of frameResults) {
+    if (!frame || !Array.isArray(frame.violations)) continue
+    for (const v of frame.violations) {
+      if (!v || !v.ruleId) continue
+      const key = buildViolationKey(frame.target, frame.viewport, frame.theme, v.ruleId)
+      counts[key] = (counts[key] ?? 0) + 1
+    }
+  }
+  return sortCountsObject(counts)
+}
+
+/**
+ * Create a canonical B-class layout invariants baseline payload.
+ */
+export function createLayoutBaseline(counts = {}, metadata = {}) {
+  const baseline = {
+    schemaVersion: LAYOUT_BASELINE_SCHEMA_VERSION,
+    tier: typeof metadata.tier === 'string' && metadata.tier.trim() ? metadata.tier.trim() : 'core',
+    keyFormat: 'scene|viewport|theme|ruleId',
+    scenes: Array.isArray(metadata.scenes) ? [...metadata.scenes] : [],
+    viewports: Array.isArray(metadata.viewports) ? [...metadata.viewports] : Object.keys(VIEWPORTS),
+    themes: Array.isArray(metadata.themes) ? [...metadata.themes] : [...THEMES],
+    counts: sortCountsObject(counts),
+  }
+  return validateLayoutBaseline(baseline)
+}
+
+/**
+ * Fail-closed schema validation for layout-invariants baseline JSON.
+ */
+export function validateLayoutBaseline(raw) {
+  if (!isPlainObject(raw)) {
+    throw new Error('[GATE-ERROR] LAYOUT-BASELINE-INVALID: baseline root must be a JSON object')
+  }
+  if (raw.schemaVersion !== LAYOUT_BASELINE_SCHEMA_VERSION) {
+    throw new Error(
+      `[GATE-ERROR] LAYOUT-BASELINE-INVALID: unsupported schemaVersion=${JSON.stringify(raw.schemaVersion)} (expected ${LAYOUT_BASELINE_SCHEMA_VERSION})`,
+    )
+  }
+  if (!isPlainObject(raw.counts)) {
+    throw new Error('[GATE-ERROR] LAYOUT-BASELINE-INVALID: missing or invalid "counts" object')
+  }
+  for (const listField of ['scenes', 'viewports', 'themes']) {
+    if (raw[listField] !== undefined) {
+      if (
+        !Array.isArray(raw[listField]) ||
+        raw[listField].some((item) => typeof item !== 'string' || item.trim().length === 0)
+      ) {
+        throw new Error(
+          `[GATE-ERROR] LAYOUT-BASELINE-INVALID: "${listField}" must be an array of non-empty strings`,
+        )
+      }
+    }
+  }
+
+  const validatedCounts = {}
+  for (const [key, val] of Object.entries(raw.counts)) {
+    const parts = key.split('|')
+    if (parts.length !== 4 || parts.some((p) => p.trim().length === 0 || p !== p.trim())) {
+      throw new Error(
+        `[GATE-ERROR] LAYOUT-BASELINE-INVALID: invalid count key "${key}" (expected "scene|viewport|theme|ruleId")`,
+      )
+    }
+    if (typeof val !== 'number' || !Number.isSafeInteger(val) || val < 0) {
+      throw new Error(
+        `[GATE-ERROR] LAYOUT-BASELINE-INVALID: invalid count value for "${key}" (${JSON.stringify(val)}; expected non-negative integer)`,
+      )
+    }
+    validatedCounts[key] = val
+  }
+
+  return {
+    schemaVersion: LAYOUT_BASELINE_SCHEMA_VERSION,
+    tier: typeof raw.tier === 'string' && raw.tier.trim() ? raw.tier.trim() : 'core',
+    keyFormat: 'scene|viewport|theme|ruleId',
+    scenes: Array.isArray(raw.scenes) ? [...raw.scenes] : [],
+    viewports: Array.isArray(raw.viewports) ? [...raw.viewports] : Object.keys(VIEWPORTS),
+    themes: Array.isArray(raw.themes) ? [...raw.themes] : [...THEMES],
+    counts: sortCountsObject(validatedCounts),
+  }
+}
+
+export function parseLayoutBaselineJson(text) {
+  if (typeof text !== 'string' || text.trim().length === 0) {
+    throw new Error('[GATE-ERROR] LAYOUT-BASELINE-INVALID: baseline file is empty')
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(text)
+  } catch (err) {
+    throw new Error(
+      `[GATE-ERROR] LAYOUT-BASELINE-INVALID: malformed JSON (${err instanceof Error ? err.message : String(err)})`,
+    )
+  }
+  return validateLayoutBaseline(parsed)
+}
+
+/**
+ * Compare current aggregated violation counts against a validated B-class baseline.
+ * - actual <= allowed: PASS (debt paydown when actual < allowed)
+ * - actual > allowed (new key or increased count): FAIL (regression)
+ */
+export function compareWithLayoutBaseline(actualCounts, baseline) {
+  const validBaseline = validateLayoutBaseline(baseline)
+  if (!isPlainObject(actualCounts)) {
+    throw new Error('[GATE-ERROR] LAYOUT-BASELINE-INVALID: actualCounts must be a plain object')
+  }
+
+  const regressions = []
+  const debtPaydowns = []
+  let totalActual = 0
+  let totalAllowed = 0
+
+  const allKeys = new Set([...Object.keys(validBaseline.counts), ...Object.keys(actualCounts)])
+  for (const key of [...allKeys].sort()) {
+    const allowed = validBaseline.counts[key] ?? 0
+    const actual = actualCounts[key] ?? 0
+    if (typeof actual !== 'number' || !Number.isSafeInteger(actual) || actual < 0) {
+      throw new Error(
+        `[GATE-ERROR] LAYOUT-BASELINE-INVALID: invalid actual count for "${key}" (${JSON.stringify(actual)})`,
+      )
+    }
+    totalAllowed += allowed
+    totalActual += actual
+
+    if (actual > allowed) {
+      regressions.push({
+        key,
+        kind: allowed === 0 ? 'new-violation' : 'count-increased',
+        actual,
+        allowed,
+        delta: actual - allowed,
+      })
+    } else if (actual < allowed) {
+      debtPaydowns.push({
+        key,
+        previous: allowed,
+        actual,
+        delta: allowed - actual,
+      })
+    }
+  }
+
+  return {
+    ok: regressions.length === 0,
+    regressions,
+    debtPaydowns,
+    totalActual,
+    totalAllowed,
+    baselineKeyCount: Object.keys(validBaseline.counts).length,
+    actualKeyCount: Object.keys(actualCounts).filter((k) => (actualCounts[k] ?? 0) > 0).length,
+  }
+}
+
+export function formatBaselineRegressions(regressions, context = {}) {
+  return regressions
+    .map((r) => {
+      const [target, viewport, theme, ruleId] = r.key.split('|')
+      const kindLabel =
+        r.kind === 'new-violation' ? '新增布局/无障碍违规' : `存量违规计数上涨 (+${r.delta})`
+      return [
+        `[GATE-ERROR] LAYOUT-BASELINE-REGRESSION (${ruleId}) at ${target} / ${viewport} / ${theme}`,
+        `  Violation : ${kindLabel} — actual=${r.actual}, baseline=${r.allowed}`,
+        '  Why       : B 类存量基线只允许单调清债（actual <= baseline），严禁新增违规或抬高基线',
+        '  How to Fix: 修复当前改动引入的布局/触控热区/无障碍回归；严禁调高 baseline 绕过门禁',
+        context.outDir ? `  Artifacts : ${context.outDir}` : '',
+        context.baselinePath
+          ? `  Re-verify : node packages/web-react/browser-tests/layout-invariants.mjs --tier core --baseline ${context.baselinePath}`
+          : '  Re-verify : node packages/web-react/browser-tests/layout-invariants.mjs --tier core --baseline packages/web-react/layout-invariants-baseline.json',
+      ]
+        .filter(Boolean)
+        .join('\n')
+    })
+    .join('\n\n')
+}
+
 // ── Browser Snapshot Collector (executed in Playwright page context) ─────────
 
 async function collectPageSnapshot(page, viewport) {
@@ -394,18 +634,48 @@ async function collectPageSnapshot(page, viewport) {
       return `${tag}[data-oc-layout-id="${marker}"]`
     }
 
-    function isElementVisible(el) {
-      if (!(el instanceof Element)) return false
+    function clippedVisibleRect(el) {
+      if (!(el instanceof Element)) return null
       const style = getComputedStyle(el)
       if (
         style.display === 'none' ||
         style.visibility === 'hidden' ||
         Number.parseFloat(style.opacity) === 0
       ) {
-        return false
+        return null
       }
       const r = el.getBoundingClientRect()
-      return r.width > 0.5 && r.height > 0.5
+      if (r.width <= 0.5 || r.height <= 0.5) return null
+      let left = r.left
+      let top = r.top
+      let right = r.right
+      let bottom = r.bottom
+      // Clip against scroll/overflow ancestors so items scrolled out of view do not falsely collide
+      // with fixed headers/footers outside the scroll container.
+      let parent = el.parentElement
+      while (parent && parent !== document.body && parent !== document.documentElement) {
+        const ps = getComputedStyle(parent)
+        const clipX = ps.overflowX === 'hidden' || ps.overflowX === 'auto' || ps.overflowX === 'scroll' || ps.overflowX === 'clip'
+        const clipY = ps.overflowY === 'hidden' || ps.overflowY === 'auto' || ps.overflowY === 'scroll' || ps.overflowY === 'clip'
+        if (clipX || clipY) {
+          const pr = parent.getBoundingClientRect()
+          if (clipX) {
+            left = Math.max(left, pr.left)
+            right = Math.min(right, pr.right)
+          }
+          if (clipY) {
+            top = Math.max(top, pr.top)
+            bottom = Math.min(bottom, pr.bottom)
+          }
+          if (right - left <= 0.5 || bottom - top <= 0.5) return null
+        }
+        parent = parent.parentElement
+      }
+      return { x: left, y: top, width: right - left, height: bottom - top }
+    }
+
+    function isElementVisible(el) {
+      return clippedVisibleRect(el) !== null
     }
 
     function layerKeyFor(el) {
@@ -432,26 +702,44 @@ async function collectPageSnapshot(page, viewport) {
       document.querySelectorAll('button, a[href], [role="button"], [role="tab"]'),
     )
     const controls = []
+    const touchTargets = []
     const nodeToId = new Map()
     let seq = 0
 
     for (const el of interactiveNodes) {
-      if (!isElementVisible(el)) continue
+      const r = clippedVisibleRect(el)
+      if (!r) continue
+      const rawRect = el.getBoundingClientRect()
       seq += 1
       const id = `ctrl-${seq}`
       nodeToId.set(el, id)
-      const r = el.getBoundingClientRect()
       const selector = cssSelectorFor(el, seq)
+      const label = (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 60)
+      const primary = el.tagName.toLowerCase() === 'button' || el.getAttribute('role') === 'button'
       controls.push({
         id,
         selector,
-        label: (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 60),
+        label,
         layerKey: layerKeyFor(el),
         visible: true,
-        primary: el.tagName.toLowerCase() === 'button' || el.getAttribute('role') === 'button',
+        primary,
         rect: { x: r.x, y: r.y, width: r.width, height: r.height },
         _el: el,
       })
+      // For mobile touch target checks, measure the control's intrinsic rendered rect when at least
+      // half of it is visible inside any clipping scroll container (avoids subpixel scroll-edge jitter).
+      const rawArea = rawRect.width * rawRect.height
+      const visibleArea = r.width * r.height
+      if (rawArea > 0 && visibleArea / rawArea >= 0.5) {
+        touchTargets.push({
+          id,
+          selector,
+          label,
+          visible: true,
+          primary,
+          rect: { x: rawRect.x, y: rawRect.y, width: rawRect.width, height: rawRect.height },
+        })
+      }
     }
 
     // Link ancestor/descendant controls to avoid false overlaps for nested buttons/links
@@ -514,7 +802,7 @@ async function collectPageSnapshot(page, viewport) {
       viewport: vp,
       overflow,
       controls,
-      touchTargets: controls,
+      touchTargets,
       textElements,
       a11y: {
         htmlLang: document.documentElement.getAttribute('lang'),
@@ -569,11 +857,13 @@ async function applyTheme(page, theme) {
   }, theme)
 }
 
-function parseCliArgs(argv) {
+export function parseCliArgs(argv) {
   const opts = {
     url: null,
     scenes: [],
     tier: null,
+    baseline: null,
+    writeBaseline: false,
     viewports: Object.keys(VIEWPORTS),
     themes: [...THEMES],
     outDir: join(tmpdir(), 'oc-layout-invariants-fails'),
@@ -602,6 +892,14 @@ function parseCliArgs(argv) {
       opts.tier = argv[++i] ?? null
     } else if (arg.startsWith('--tier=')) {
       opts.tier = arg.slice('--tier='.length)
+    } else if (arg === '--baseline') {
+      opts.baseline = argv[++i] ?? null
+      if (!opts.baseline) throw new Error('--baseline requires a file path')
+    } else if (arg.startsWith('--baseline=')) {
+      opts.baseline = arg.slice('--baseline='.length)
+      if (!opts.baseline) throw new Error('--baseline requires a file path')
+    } else if (arg === '--write-baseline') {
+      opts.writeBaseline = true
     } else if (arg === '--viewports') {
       opts.viewports = (argv[++i] ?? '')
         .split(',')
@@ -631,6 +929,9 @@ function parseCliArgs(argv) {
     } else {
       throw new Error(`Unknown CLI argument: ${arg}`)
     }
+  }
+  if (opts.tier !== null && opts.tier !== 'core' && opts.tier !== 'full') {
+    throw new Error(`Unsupported --tier=${opts.tier} (expected core or full)`)
   }
   return opts
 }
@@ -738,7 +1039,9 @@ async function buildUiPreviewHarness(pkgDir, browserTestsDir) {
   const harnessUrl = 'http://127.0.0.1/__openclaude_layout_invariants__'
   const bundleUrl = `${harnessUrl}/harness.js`
   const bundleText = readFileSync(bundlePath, 'utf8')
-  const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OpenClaude Layout Invariants</title><style>${readFileSync(cssFile, 'utf8')}</style></head><body><div id="root"></div><script src="${bundleUrl}"></script></body></html>`
+  const deterministicMotionCss =
+    '*,*::before,*::after{transition-duration:0s!important;transition-delay:0s!important;animation-duration:0s!important;animation-delay:0s!important;scroll-behavior:auto!important;}'
+  const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OpenClaude Layout Invariants</title><style>${readFileSync(cssFile, 'utf8')}\n${deterministicMotionCss}</style></head><body><div id="root"></div><script src="${bundleUrl}"></script></body></html>`
 
   return {
     workDir,
@@ -751,7 +1054,22 @@ async function buildUiPreviewHarness(pkgDir, browserTestsDir) {
   }
 }
 
+function frameHasBaselineRegression(target, viewport, theme, violations, baseline) {
+  if (!baseline) return violations.length > 0
+  const byRule = {}
+  for (const v of violations) {
+    byRule[v.ruleId] = (byRule[v.ruleId] ?? 0) + 1
+  }
+  for (const [ruleId, count] of Object.entries(byRule)) {
+    const key = buildViolationKey(target, viewport, theme, ruleId)
+    const allowed = baseline.counts[key] ?? 0
+    if (count > allowed) return true
+  }
+  return false
+}
+
 async function runCli() {
+  const startedAt = Date.now()
   let opts
   try {
     opts = parseCliArgs(process.argv.slice(2))
@@ -766,7 +1084,9 @@ async function runCli() {
         'Usage: node packages/web-react/browser-tests/layout-invariants.mjs [options]',
         '  --url <url>                 Audit a local running URL across 4 viewports x 2 themes',
         '  --scenes <id1,id2,...>      Audit matching ui-preview scenes',
-        '  --tier=core                 Audit core ui-preview scenes',
+        '  --tier core|full            Audit core (11 representative scenes) or full ui-preview scenes',
+        '  --baseline <path>           Compare violations against B-class monotonic baseline JSON',
+        '  --write-baseline            Write current violation counts as B-class baseline JSON',
         '  --viewports <list>          Subset of mobile,tablet,laptop,desktop (default: all 4)',
         '  --themes <list>             Subset of light,dark (default: light,dark)',
         '  --out-dir <dir>             Directory for failure screenshots with 3px red outlines',
@@ -781,28 +1101,50 @@ async function runCli() {
     process.exit(2)
   }
 
-  const require_ = createRequire(import.meta.url)
-  const { chromium } = require_('playwright-core')
   const here = dirname(fileURLToPath(import.meta.url))
   const pkgDir = dirname(here)
   const repoRoot = dirname(dirname(pkgDir))
+
+  let loadedBaseline = null
+  if (opts.baseline && !opts.writeBaseline) {
+    const baselineAbs = resolve(opts.baseline)
+    if (!existsSync(baselineAbs)) {
+      console.error(
+        `[GATE-ERROR] LAYOUT-BASELINE-INVALID: baseline file not found: ${baselineAbs}`,
+      )
+      return 1
+    }
+    try {
+      loadedBaseline = parseLayoutBaselineJson(readFileSync(baselineAbs, 'utf8'))
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err))
+      return 1
+    }
+  }
+
+  const require_ = createRequire(import.meta.url)
+  const { chromium } = require_('playwright-core')
   const { resolveBrowserExecutable } = await import(
     pathToFileURL(join(repoRoot, 'scripts', 'lib', 'resolve-browser.mjs')).href
   )
 
   const AxeBuilder = await tryLoadAxeBuilder()
+  const executablePath = resolveBrowserExecutable()
   console.log(
-    `layout-invariants: axe-core ${AxeBuilder ? 'enabled (wcag21aa)' : 'not installed (running built-in geometry + DOM a11y engine)'}`,
+    `layout-invariants: chromium=${executablePath} | axe-core=${AxeBuilder ? 'enabled (wcag21aa)' : 'built-in geometry + DOM a11y engine'}`,
   )
 
   let browser
   let previewHarness = null
   try {
-    browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true })
+    browser = await chromium.launch({ executablePath, headless: true })
     const failures = []
+    const frameResults = []
     let checksExecuted = 0
+    let targetSceneIds = []
 
     if (opts.url) {
+      targetSceneIds = [opts.url]
       for (const vpName of opts.viewports) {
         const vp = VIEWPORTS[vpName]
         const ctx = await browser.newContext({
@@ -828,7 +1170,22 @@ async function runCli() {
           }
           const result = evaluateLayoutSnapshot(snap)
           checksExecuted += 1
-          if (!result.ok) {
+          frameResults.push({
+            target: opts.url,
+            viewport: vpName,
+            theme,
+            violations: result.violations,
+          })
+          const shouldFailFrame =
+            !opts.writeBaseline &&
+            frameHasBaselineRegression(
+              opts.url,
+              vpName,
+              theme,
+              result.violations,
+              loadedBaseline,
+            )
+          if (shouldFailFrame) {
             mkdirSync(opts.outDir, { recursive: true })
             await highlightOffendingNodes(page, result.violations)
             const shotPath = join(opts.outDir, `url--${vpName}--${theme}--fail.png`)
@@ -897,13 +1254,14 @@ async function runCli() {
 
       let targetScenes = allScenes
       if (opts.tier === 'core') {
-        const { CORE_TIER_SCENE_IDS } = await import(
-          pathToFileURL(join(here, 'ui-preview', 'shoot.mjs')).href
-        ).catch(() => ({ CORE_TIER_SCENE_IDS: null }))
-        if (CORE_TIER_SCENE_IDS) {
-          const coreSet = new Set(CORE_TIER_SCENE_IDS)
-          targetScenes = targetScenes.filter((s) => coreSet.has(s.id))
+        const byId = new Map(allScenes.map((s) => [s.id, s]))
+        const missingCoreIds = LAYOUT_CORE_TIER_SCENE_IDS.filter((id) => !byId.has(id))
+        if (missingCoreIds.length > 0) {
+          throw new Error(
+            `layout-invariants: --tier core missing expected scenes: ${missingCoreIds.join(', ')}`,
+          )
         }
+        targetScenes = LAYOUT_CORE_TIER_SCENE_IDS.map((id) => byId.get(id))
       }
       if (opts.scenes.length > 0) {
         targetScenes = targetScenes.filter((s) =>
@@ -913,57 +1271,162 @@ async function runCli() {
       if (targetScenes.length === 0) {
         throw new Error('layout-invariants: zero ui-preview scenes matched filter (fail-loud)')
       }
+      targetSceneIds = targetScenes.map((s) => s.id)
 
-      for (const vpName of opts.viewports) {
-        const vp = VIEWPORTS[vpName]
-        const ctx = await browser.newContext({
-          viewport: { width: vp.width, height: vp.height },
-          deviceScaleFactor: vp.deviceScaleFactor,
-          isMobile: vp.isMobile,
-          hasTouch: vp.hasTouch,
-          locale: 'zh-CN',
-          timezoneId: 'Asia/Shanghai',
-        })
-        const page = await ctx.newPage()
-        await setupPreviewPage(page)
-        for (const theme of opts.themes) {
-          await applyTheme(page, theme)
-          for (const scene of targetScenes) {
-            await page.evaluate((id) => window.__mountScene(id), scene.id)
-            await page.evaluate(() => document.fonts.ready.then(() => true))
-            await page.waitForTimeout(250)
-            const snap = await collectPageSnapshot(page, vp)
-            if (AxeBuilder) {
-              const axeRes = await new AxeBuilder({ page })
-                .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
-                .analyze()
-              snap.axeViolations = axeRes.violations ?? []
+      const viewportBatches = await Promise.all(
+        opts.viewports.map(async (vpName) => {
+          const vp = VIEWPORTS[vpName]
+          const ctx = await browser.newContext({
+            viewport: { width: vp.width, height: vp.height },
+            deviceScaleFactor: vp.deviceScaleFactor,
+            isMobile: vp.isMobile,
+            hasTouch: vp.hasTouch,
+            reducedMotion: 'reduce',
+            locale: 'zh-CN',
+            timezoneId: 'Asia/Shanghai',
+          })
+          const localFrames = []
+          const localFailures = []
+          let localChecks = 0
+          try {
+            const page = await ctx.newPage()
+            await setupPreviewPage(page)
+            for (const theme of opts.themes) {
+              await applyTheme(page, theme)
+              for (const scene of targetScenes) {
+                await page.evaluate((id) => window.__mountScene(id), scene.id)
+                await page.evaluate(
+                  () =>
+                    document.fonts.ready.then(
+                      () =>
+                        new Promise((r) =>
+                          requestAnimationFrame(() => requestAnimationFrame(() => r(true))),
+                        ),
+                    ),
+                )
+                await page.waitForTimeout(180)
+                const sceneError = await page.evaluate(() => window.__ocSceneError ?? null)
+                const snap = await collectPageSnapshot(page, vp)
+                if (AxeBuilder) {
+                  const axeRes = await new AxeBuilder({ page })
+                    .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
+                    .analyze()
+                  snap.axeViolations = axeRes.violations ?? []
+                }
+                const result = evaluateLayoutSnapshot(snap)
+                if (sceneError) {
+                  result.violations.push({
+                    ruleId: 'LAYOUT-SCENE-RENDER-ERROR',
+                    selector: '#root',
+                    detail: `场景渲染崩溃: ${String(sceneError).slice(0, 200)}`,
+                    why: 'ui-preview 核心场景必须能正常渲染，不得在 ErrorBoundary 中崩溃',
+                    howToFix: '检查对应场景或组件在当前视口/主题下的运行时异常',
+                  })
+                  result.ok = false
+                }
+                localChecks += 1
+                localFrames.push({
+                  target: scene.id,
+                  viewport: vpName,
+                  theme,
+                  violations: result.violations,
+                })
+                const shouldFailFrame =
+                  !opts.writeBaseline &&
+                  frameHasBaselineRegression(
+                    scene.id,
+                    vpName,
+                    theme,
+                    result.violations,
+                    loadedBaseline,
+                  )
+                if (shouldFailFrame) {
+                  mkdirSync(opts.outDir, { recursive: true })
+                  await highlightOffendingNodes(page, result.violations)
+                  const shotPath = join(opts.outDir, `${scene.id}--${vpName}--${theme}--fail.png`)
+                  await page.screenshot({ path: shotPath, fullPage: true, animations: 'disabled' })
+                  localFailures.push({
+                    target: scene.id,
+                    viewport: vpName,
+                    theme,
+                    screenshotPath: shotPath,
+                    violations: result.violations,
+                  })
+                }
+                await page.evaluate(() => window.__unmountScene())
+              }
             }
-            const result = evaluateLayoutSnapshot(snap)
-            checksExecuted += 1
-            if (!result.ok) {
-              mkdirSync(opts.outDir, { recursive: true })
-              await highlightOffendingNodes(page, result.violations)
-              const shotPath = join(opts.outDir, `${scene.id}--${vpName}--${theme}--fail.png`)
-              await page.screenshot({ path: shotPath, fullPage: true, animations: 'disabled' })
-              failures.push({
-                target: scene.id,
-                viewport: vpName,
-                theme,
-                screenshotPath: shotPath,
-                violations: result.violations,
-              })
-            }
-            await page.evaluate(() => window.__unmountScene())
+          } finally {
+            await ctx.close()
           }
-        }
-        await ctx.close()
+          return { localChecks, localFrames, localFailures }
+        }),
+      )
+      for (const batch of viewportBatches) {
+        checksExecuted += batch.localChecks
+        frameResults.push(...batch.localFrames)
+        failures.push(...batch.localFailures)
       }
     }
 
     if (checksExecuted === 0) {
       console.error('[GATE-ERROR] LAYOUT-INVARIANTS-ZERO-CHECKS: 0 checks executed')
       return 1
+    }
+
+    const actualCounts = aggregateViolationCounts(frameResults)
+    const elapsedSec = ((Date.now() - startedAt) / 1000).toFixed(1)
+
+    if (opts.writeBaseline) {
+      const targetPath = opts.baseline
+        ? resolve(opts.baseline)
+        : join(pkgDir, DEFAULT_BASELINE_FILENAME)
+      const baselineObj = createLayoutBaseline(actualCounts, {
+        tier: opts.tier ?? (opts.url ? 'url' : 'custom'),
+        scenes: targetSceneIds,
+        viewports: opts.viewports,
+        themes: opts.themes,
+      })
+      mkdirSync(dirname(targetPath), { recursive: true })
+      writeFileSync(targetPath, `${JSON.stringify(baselineObj, null, 2)}\n`, 'utf8')
+      const totalStock = Object.values(baselineObj.counts).reduce((sum, n) => sum + n, 0)
+      console.log(
+        `layout-invariants: WROTE BASELINE ${targetPath} (scenes=${targetSceneIds.length}, frames=${checksExecuted}, keys=${Object.keys(baselineObj.counts).length}, totalStock=${totalStock}, elapsed=${elapsedSec}s)`,
+      )
+      return 0
+    }
+
+    if (loadedBaseline) {
+      const comparison = compareWithLayoutBaseline(actualCounts, loadedBaseline)
+      if (!comparison.ok) {
+        mkdirSync(opts.outDir, { recursive: true })
+        writeFileSync(
+          join(opts.outDir, 'report.json'),
+          `${JSON.stringify({ regressions: comparison.regressions, failures }, null, 2)}\n`,
+          'utf8',
+        )
+        console.error(
+          formatBaselineRegressions(comparison.regressions, {
+            baselinePath: opts.baseline,
+            outDir: opts.outDir,
+          }),
+        )
+        for (const f of failures) {
+          console.error(`\n${formatLayoutViolations(f.violations, f)}`)
+        }
+        console.error(
+          `\nlayout-invariants: FAIL (${comparison.regressions.length} baseline regression(s), frames=${checksExecuted}, elapsed=${elapsedSec}s, artifacts=${opts.outDir})`,
+        )
+        return 1
+      }
+      const paydownNote =
+        comparison.debtPaydowns.length > 0
+          ? ` | debtPaydowns=${comparison.debtPaydowns.length} (可运行 --write-baseline 清债收紧)`
+          : ''
+      console.log(
+        `layout-invariants: PASS (scenes=${targetSceneIds.length}, frames=${checksExecuted}, baselineKeys=${comparison.baselineKeyCount}, stock=${comparison.totalActual}/${comparison.totalAllowed}, elapsed=${elapsedSec}s${paydownNote})`,
+      )
+      return 0
     }
 
     if (failures.length > 0) {
@@ -977,12 +1440,14 @@ async function runCli() {
         console.error(formatLayoutViolations(f.violations, f))
       }
       console.error(
-        `\nlayout-invariants: FAIL (${failures.length} / ${checksExecuted} frames failed, screenshots in ${opts.outDir})`,
+        `\nlayout-invariants: FAIL (${failures.length} / ${checksExecuted} frames failed, elapsed=${elapsedSec}s, screenshots in ${opts.outDir})`,
       )
       return 1
     }
 
-    console.log(`layout-invariants: PASS (${checksExecuted} viewport x theme checks passed)`)
+    console.log(
+      `layout-invariants: PASS (scenes=${targetSceneIds.length}, frames=${checksExecuted}, elapsed=${elapsedSec}s)`,
+    )
     return 0
   } finally {
     if (browser) await browser.close()

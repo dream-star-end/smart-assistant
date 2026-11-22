@@ -7,8 +7,8 @@
 | 改动范围 | 分级 & 提交前缀 | 动工前必读 | 本地秒级快门 | PR CI 与熔断 |
 |---|---|---|---|---|
 | 换 env/文案/Logo/文档 | **T0**<br>`chore/docs(v5):` | 本文 | 相关单测 + `npm run check:docs-links`（`<15s`）；**不上审** | 变更 Biome + 文档死链；绿灯自动合 |
-| 单包 UI/组件/局部 Bug（不动协议/迁移） | **T1**<br>`ui/bug/perf/refactor(v5):` | `docs/UI_DESIGN_SYSTEM.md` + 包级 `AGENTS.md` | 目标包单测 + 增量 `tsc` + `npm run check:ui-gates`（改入口/CSS 加 `npm run build:web-react`）；**不上审** | `test:web-react` / `test:browser` 既有套件 + L1 静态门 / 选择器 / 几何 a11y 纯引擎单测（L2/L4 实景脚本本地按需跑，待 P1-3/P1-4 接 CI）；非必需红必核因；**CI 2 轮熔断转人** |
-| 跨包/`gateway`/协议/存储/计费/迁移/权限 | **T2**<br>`bug/perf/refactor(v5):`（真线上事故复盘才用 `fix(v5):` + `Incident: INC-...`） | `docs/V5_SELFHOST_PLAYBOOK.md` + 包级 `AGENTS.md` | 以上 + `npm run check:governance:fast` + `node packages/cli/scripts/build-container-gateway.mjs` + **跨家族审（`1+1` 上限）** + 重型 proof 定稿单跑 1 次 | 全量静态门 + 迁移兼容 + 单包单测 + 回归契约；**CI 2 轮熔断转人** |
+| 单包 UI/组件/局部 Bug（不动协议/迁移） | **T1**<br>`ui/bug/perf/refactor(v5):` | `docs/UI_DESIGN_SYSTEM.md` + 包级 `AGENTS.md` | 目标包单测 + 增量 `tsc` + `npm run check:ui-gates`（改入口/CSS 加 `npm run build:web-react`）；**不上审** | `test:web-react` / `typecheck:preview` / `test:browser` / L2-L3 `layout-invariants.mjs --tier core` + L1 静态门与选择器全入 PR CI（L4 `shoot.mjs --tier=core` 本地按需跑，L6 `check:vlm-judge` 处于 `advisory` 校准态）；非必需红必核因；**CI 2 轮熔断转人** |
+| 跨包/`gateway`/协议/存储/计费/迁移/权限 | **T2**<br>`bug/perf/refactor(v5):`（真线上事故复盘才用 `fix(v5):` + `Incident: INC-...`） | `docs/V5_SELFHOST_PLAYBOOK.md` + 包级 `AGENTS.md` | 以上 + `npm run check:governance:fast` + `node packages/cli/scripts/build-container-gateway.mjs` + **跨家族审（`1+1` 上限，`npm run check:cross-family-audit` 核验）** + 重型 proof 定稿单跑 1 次 | 全量静态门 + PG 零停机迁移安全 + REST 契约兼容 + 单包单测（含 `selfhost-storage`）+ 回归契约；**CI 2 轮熔断转人** |
 | **A 类 `CODEOWNERS`**（门禁/工作流/预算/豁免/发布脚本/权限核心/`changelog.json`）、商业生产 | **L4 人工红线** | `docs/V5_SELFHOST_PLAYBOOK.md` | 仅候选分支准备 PR + 完整证据，**严禁自批自合** | 全量 `--base` 单调校验 + **强制 `@dream-star-end` 人工审签** |
 
 ## 2. 十大北极星红线（一句话钩子）
@@ -31,7 +31,7 @@
 - **V5 商业版（Aurora）总手册**：`docs/V5_DEV_PLAYBOOK.md` 与 `docs/V5_ROADMAP_2026H2.md`（商业版任务开工必读）
 - **跨分支规则与紧急通道**：`CLAUDE.md`（含 dx 声明的 P0 emergency lane、工作树与 `changelog.json` 审批制度）
 - **包级高频红线指南**：`packages/web-react/AGENTS.md` | `packages/commercial/AGENTS.md` | `packages/gateway/AGENTS.md`
-- **一键秒级治理快门**：`npm run check:governance:fast`（涵盖 `scripts/check-docs-links.ts`、`scripts/check-ui-hard-gates.ts`、`scripts/check-no-silent-model-downgrade.ts`、`scripts/check-v5-route-sync.ts`、`scripts/check-changelog-guard.ts`、`scripts/check-feature-flags-ttl.ts` 等）；架构与棘轮门：`scripts/check-architecture.ts`、`scripts/check-gate-couplings.ts`、`scripts/check-file-size-ratchet.ts`、`scripts/check-monotonic-baselines.ts`。
+- **一键秒级治理快门**：`npm run check:governance:fast`（涵盖 `scripts/check-docs-links.ts`、`scripts/check-ui-hard-gates.ts`、`scripts/check-no-silent-model-downgrade.ts`、`scripts/check-v5-route-sync.ts`、`scripts/check-changelog-guard.ts`、`scripts/check-feature-flags-ttl.ts`、`scripts/check-rest-contract-compat.ts` 等）；架构、迁移与棘轮门：`scripts/check-architecture.ts`、`scripts/check-gate-couplings.ts`、`scripts/check-file-size-ratchet.ts`、`scripts/check-monotonic-baselines.ts`、`scripts/check-pg-migration-safety.ts`。
 
 ## 4. 分支、Worktree 与诊断只读边界（BLOCKING）
 

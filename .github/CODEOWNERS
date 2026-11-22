@@ -25,6 +25,7 @@ packages/web-react/budgets.json                         @dream-star-end
 packages/web-react/design-tokens-exempt.json            @dream-star-end
 packages/web-react/src/test/designTokens.test.ts        @dream-star-end
 packages/web-react/browser-tests/layout-invariants.mjs  @dream-star-end
+packages/web-react/browser-tests/vlm-rubric/            @dream-star-end
 packages/web-react/tutorial-sync-history-head.json      @dream-star-end
 
 # === 3. Core gate scripts, migration gates & release train scripts/manifest ===
@@ -46,5 +47,7 @@ e2e/session-display/incident-tombstone-approvers.json   @dream-star-end
 scripts/check-incident-ledger-superset.ts               @dream-star-end
 packages/commercial/src/flavor/flavor-rules.json        @dream-star-end
 packages/protocol/src/advisorNoWrite.ts                 @dream-star-end
+packages/protocol/src/httpContracts.ts                  @dream-star-end
+packages/protocol/rest-contract-snapshot.json           @dream-star-end
 packages/gateway/src/actionPolicyEngine.ts              @dream-star-end
 changelog.json                                          @dream-star-end

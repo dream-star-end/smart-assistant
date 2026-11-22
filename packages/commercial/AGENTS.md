@@ -18,7 +18,7 @@
 ## 2. 强模型主权、数据库迁移与高可靠纪律
 
 - **禁弱模型暗降（第一红线）**：主脑、`/btw`、Cron、`ai_review` 严禁静默降级至弱模型；仅允许明确登记的纯杂务（标题/索引等）或用户显式选择（`npm run check:no-weak-downgrade`）。
-- **PG 迁移安全与阶段 0 三问**：新增 SQL 迁移（`packages/commercial/src/db/migrate.ts`）前必须自答「旧活跃实例兼容？是否锁表？回滚后旧码可读？」；强制 Expand-Contract 两步迁移，禁止未经人工审签的破坏性/锁表 DDL；必跑 `npm run lint:migration-order`、`scripts/v5-selfhost-migration-precheck.sh`、`scripts/v5-selfhost-migration-compat-check.sh`。
+- **PG 迁移安全与 REST 契约兼容（已入 PR CI）**：新增 SQL 迁移（`packages/commercial/src/db/migrate.ts`）前必须自答「旧活跃实例兼容？是否锁表？回滚后旧码可读？」；强制 Expand-Contract 两步迁移，严禁未经人工审签的破坏性/锁表 DDL，必跑 `npm run lint:migration-order`、`npm run check:pg-migration-safety -- --base origin/feat/v5-selfhost`、`scripts/v5-selfhost-migration-precheck.sh`、`scripts/v5-selfhost-migration-compat-check.sh`；涉核心 5 域 REST 接口同步更新 `packages/protocol/src/httpContracts.ts` 与 `packages/protocol/rest-contract-snapshot.json` 并过 `npm run check:rest-contract`。
 - **高可靠 SQL 与错误处理**：`ON CONFLICT (k) DO UPDATE ... WHERE` 守卫仅能比对冲突键 `k` 函数决定的列，且 `RETURNING` 0 行必区分守卫假与行不存在；跨层失败用结构化可重试标记，禁止正则匹配错误字符串；永久失败绝不重连/重试循环；遵循 `npm run lint:agent-containers-sql`。
 - **Feature Flag 与 `changelog.json`**：所有活跃 Selfhost Flag 须登记在 `deploy/v5/feature-flags-registry.json`（个人版默认 TTL ≤30 天，上线即直切 `enforce` + 判停秒回）；`changelog.json` 仅人类可改（`npm run check:changelog-guard`）。
 - **测试真结果与梯队登记**：新增 `*.integ.test.ts` 必须登记进 `.github/integ-tiers/`；测试须经真实入口断言账务/状态终态，禁无保护静默 retry（`npm run check:test-retries`）。
@@ -27,9 +27,9 @@
 
 - **架构与红线快门（`<10s`）**：
   - `npx tsx scripts/check-architecture.ts --enforce`
-  - `npm run check:route-sync && npm run check:no-weak-downgrade && npm run check:feature-flags-ttl && npm run check:changelog-guard`
-  - `npm run lint:scheduler-wiring && npm run lint:agent-containers-sql && npm run lint:migration-order && npm run lint:integ-tiers && npm run check:test-retries`
+  - `npm run check:route-sync && npm run check:no-weak-downgrade && npm run check:feature-flags-ttl && npm run check:changelog-guard && npm run check:rest-contract`
+  - `npm run check:pg-migration-safety -- --base origin/feat/v5-selfhost && npm run lint:scheduler-wiring && npm run lint:agent-containers-sql && npm run lint:migration-order && npm run lint:integ-tiers && npm run check:test-retries`
 - **单测与构建**：
-  - `npm run test:commercial:unit:gate`（Master/Egress 单元门）
+  - `npm run test:commercial:unit:gate`（Master/Egress 单元门）& `npm run test:storage`（`selfhost-storage` 已入 PR CI）
   - 涉 `node-agent` 跑 `npm run build:node-agent`
   - 涉共享协议/容器交互补跑 `node packages/cli/scripts/build-container-gateway.mjs`

@@ -191,10 +191,27 @@ jobs:
             "TEST_DATABASE_URL=$TEST_DATABASE_URL" \
             npm run test:v5:ops
 
-  # OCV5-847 (P0-4): 补齐已在 feat/v5-selfhost 实测 100% 绿灯的包单测与 Go 构建。
-  # 注: test:storage 当前在 feat/v5-selfhost 有 2 处存量失败（sixTablesSqlArchitecture.test.ts
-  # 检出 containerSwarmCommandProxy.ts:54 & sessionBackgroundTasksProxy.ts:87 直查 client_sessions，
-  # 以及 embeddingMigrationConcurrency.test.ts ENOENT），待单独立单清绿后再接入本 workflow。
+  # OCV5-847 (P0-4 / Wave 2): 补齐已在 feat/v5-selfhost 实测 100% 绿灯的包单测与 Go 构建。
+  storage:
+    name: selfhost-storage
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run storage unit tests
+        run: npm run test:storage
+
   protocol:
     name: selfhost-protocol
     runs-on: ubuntu-latest

@@ -12,7 +12,11 @@
  *      `packages/web-react/ui-static-baseline.json`:
  *        Every category/file count must stay `<= base` (deleting entries or lowering counts
  *        for debt cleanup is allowed; adding new entries or raising any count is forbidden).
- *   3. `deploy/v5/feature-flags-registry.json`:
+ *   3. `packages/web-react/layout-invariants-baseline.json`:
+ *        `{ schemaVersion: 1, counts: { "scene|viewport|theme|ruleId": count } }` —
+ *        every count must stay `<= base` and no new baseline keys may be added once present
+ *        at `<base>` (debt cleanup by lowering counts or deleting keys is allowed).
+ *   4. `deploy/v5/feature-flags-registry.json`:
  *        Existing flags must not extend `expireAt` past `<base>` and must not flip
  *        `permanent: false` -> `permanent: true`.
  *
@@ -32,6 +36,7 @@ export const DEFAULT_BASE_REF = 'origin/feat/v5-selfhost'
 export const BUDGETS_PATH = 'packages/web-react/budgets.json'
 export const DESIGN_TOKENS_COUNTS_PATH = 'packages/web-react/design-tokens-counts.json'
 export const UI_STATIC_BASELINE_PATH = 'packages/web-react/ui-static-baseline.json'
+export const LAYOUT_INVARIANTS_BASELINE_PATH = 'packages/web-react/layout-invariants-baseline.json'
 export const FEATURE_FLAGS_REGISTRY_PATH = 'deploy/v5/feature-flags-registry.json'
 
 export interface MonotonicViolation {
@@ -252,6 +257,137 @@ export function compareCountRatchet(
         headValue: String(headVal),
         detail: `baseline count for "${key}" increased from ${baseVal} to ${headVal}`,
         howToFix: `Eliminate the new violations so "${key}" stays <= ${baseVal}; baseline counts may only shrink.`,
+      })
+    }
+  }
+  return out
+}
+
+export function validateLayoutInvariantsBaselineSchema(
+  raw: unknown,
+  file = LAYOUT_INVARIANTS_BASELINE_PATH,
+): MonotonicViolation[] {
+  if (!isPlainObject(raw)) {
+    return [
+      {
+        rule: 'MONOTONIC-SCHEMA-INVALID',
+        file,
+        key: '<root>',
+        baseValue: '-',
+        headValue: typeof raw,
+        detail: `${file} must be a JSON object with schemaVersion=1 and counts map`,
+        howToFix: `Restore valid JSON schema in ${file} via layout-invariants.mjs.`,
+      },
+    ]
+  }
+
+  const out: MonotonicViolation[] = []
+  if (raw.schemaVersion !== 1) {
+    out.push({
+      rule: 'MONOTONIC-SCHEMA-INVALID',
+      file,
+      key: 'schemaVersion',
+      baseValue: '-',
+      headValue: JSON.stringify(raw.schemaVersion),
+      detail: `${file} must have schemaVersion === 1`,
+      howToFix: `Set schemaVersion to 1 in ${file}.`,
+    })
+  }
+
+  for (const listField of ['scenes', 'viewports', 'themes'] as const) {
+    const val = raw[listField]
+    if (
+      val !== undefined &&
+      (!Array.isArray(val) || val.some((item) => typeof item !== 'string' || !item.trim()))
+    ) {
+      out.push({
+        rule: 'MONOTONIC-SCHEMA-INVALID',
+        file,
+        key: listField,
+        baseValue: '-',
+        headValue: JSON.stringify(val),
+        detail: `${listField} in ${file} must be an array of non-empty strings`,
+        howToFix: `Restore valid string array for ${listField} in ${file}.`,
+      })
+    }
+  }
+
+  if (!isPlainObject(raw.counts)) {
+    out.push({
+      rule: 'MONOTONIC-SCHEMA-INVALID',
+      file,
+      key: 'counts',
+      baseValue: '-',
+      headValue: typeof raw.counts,
+      detail: `${file} must contain a plain object "counts" mapping "scene|viewport|theme|ruleId" to non-negative integers`,
+      howToFix: `Restore a valid "counts" object in ${file}.`,
+    })
+    return out
+  }
+
+  for (const [key, val] of Object.entries(raw.counts)) {
+    const parts = key.split('|')
+    if (parts.length !== 4 || parts.some((p) => p.trim().length === 0 || p !== p.trim())) {
+      out.push({
+        rule: 'MONOTONIC-SCHEMA-INVALID',
+        file,
+        key,
+        baseValue: '-',
+        headValue: JSON.stringify(val),
+        detail: `invalid layout baseline key "${key}" (expected "scene|viewport|theme|ruleId")`,
+        howToFix: `Use exact 4-segment "scene|viewport|theme|ruleId" keys in ${file}.`,
+      })
+      continue
+    }
+    if (typeof val !== 'number' || !Number.isSafeInteger(val) || val < 0) {
+      out.push({
+        rule: 'MONOTONIC-SCHEMA-INVALID',
+        file,
+        key,
+        baseValue: '-',
+        headValue: JSON.stringify(val),
+        detail: `count for "${key}" must be a non-negative integer`,
+        howToFix: `Set a valid non-negative integer count for "${key}" in ${file}.`,
+      })
+    }
+  }
+  return out
+}
+
+export function compareLayoutInvariantsBaseline(
+  baseRaw: unknown,
+  headRaw: unknown,
+  file = LAYOUT_INVARIANTS_BASELINE_PATH,
+): MonotonicViolation[] {
+  const schemaErrs = validateLayoutInvariantsBaselineSchema(headRaw, file)
+  if (schemaErrs.length > 0) return schemaErrs
+  if (!isPlainObject(baseRaw) || !isPlainObject(baseRaw.counts)) return []
+
+  const baseCounts = baseRaw.counts as Record<string, unknown>
+  const headCounts = (headRaw as { counts: Record<string, number> }).counts
+  const out: MonotonicViolation[] = []
+
+  for (const [key, headVal] of Object.entries(headCounts)) {
+    const baseVal = baseCounts[key]
+    if (typeof baseVal !== 'number' || !Number.isSafeInteger(baseVal)) {
+      out.push({
+        rule: 'MONOTONIC-COUNT-ADDED',
+        file,
+        key,
+        baseValue: 'absent',
+        headValue: String(headVal),
+        detail: `new layout baseline key "${key}" added with count ${headVal}`,
+        howToFix: `Fix the newly introduced layout/a11y violation in code instead of adding keys to ${file}.`,
+      })
+    } else if (headVal > baseVal) {
+      out.push({
+        rule: 'MONOTONIC-COUNT-RAISED',
+        file,
+        key,
+        baseValue: String(baseVal),
+        headValue: String(headVal),
+        detail: `layout baseline count for "${key}" increased from ${baseVal} to ${headVal}`,
+        howToFix: `Eliminate the new layout/a11y violations so "${key}" stays <= ${baseVal}; baseline counts may only shrink.`,
       })
     }
   }
@@ -573,6 +709,11 @@ export function checkMonotonicBaselines(opts: {
       file: UI_STATIC_BASELINE_PATH,
       validate: (h) => validateCountRatchetSchema(h, UI_STATIC_BASELINE_PATH),
       compare: (b, h) => compareCountRatchet(b, h, UI_STATIC_BASELINE_PATH),
+    },
+    {
+      file: LAYOUT_INVARIANTS_BASELINE_PATH,
+      validate: (h) => validateLayoutInvariantsBaselineSchema(h, LAYOUT_INVARIANTS_BASELINE_PATH),
+      compare: (b, h) => compareLayoutInvariantsBaseline(b, h, LAYOUT_INVARIANTS_BASELINE_PATH),
     },
     {
       file: FEATURE_FLAGS_REGISTRY_PATH,

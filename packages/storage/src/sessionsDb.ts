@@ -1,8 +1,7 @@
 import { scanUploadReferenceRows, UPLOAD_REFERENCE_MAX_BYTES, type UploadReferenceOptions, type UploadReferenceRow } from './sessionUploadReferences.js'
 import type { SessionSnapshot } from '@openclaude/protocol';
 
-import { appendFile, readFile, rename, writeFile } from 'node:fs/promises'
-import { mkdir } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import {
   TEAM_CARD_CLIENT_DISPLAY_FIELDS,
@@ -70,6 +69,7 @@ import {
   _sqliteBatchClientSessions,
   _sqliteMarkClientSessionRead,
   _sqliteMarkAllClientSessionsRead,
+  _sqliteVerifyClientSessionOwnership,
 } from './sessionsDbSidebar.js'
 export {
   SESSION_SEARCH_LIMIT_DEFAULT,
@@ -94,6 +94,7 @@ export type {
   BatchSessionCasRow,
   BatchClientSessionsInput,
   BatchClientSessionsResult,
+  ClientSessionOwnership,
 } from './sessionsDbSidebar.js'
 export {
   CHAT_PROJECT_NAME_MAX,
@@ -5984,6 +5985,7 @@ const sqliteBackend = {
   getClientSession: _sqliteGetClientSession,
   getClientSessionCollabParent: _sqliteGetClientSessionCollabParent,
   classifyClientSessions: _sqliteClassifyClientSessions,
+  verifyClientSessionOwnership: _sqliteVerifyClientSessionOwnership,
   getClientSessionPartial: _sqliteGetClientSessionPartial,
   readArchivedMessages: _sqliteReadArchivedMessages,
   readClientSessionLiveFrames: _sqliteReadClientSessionLiveFrames,
@@ -6128,6 +6130,9 @@ export const getClientSessionCollabParent: ClientSessionsBackend['getClientSessi
 
 export const classifyClientSessions: ClientSessionsBackend['classifyClientSessions'] =
   (...args) => getActiveBackend().classifyClientSessions(...args)
+
+export const verifyClientSessionOwnership: ClientSessionsBackend['verifyClientSessionOwnership'] =
+  (...args) => getActiveBackend().verifyClientSessionOwnership(...args)
 
 export const getClientSessionPartial: ClientSessionsBackend['getClientSessionPartial'] =
   (...args) => getActiveBackend().getClientSessionPartial(...args)

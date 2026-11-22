@@ -8,7 +8,7 @@
  *
  * Security & availability invariants:
  *   1. Authenticates caller via Bearer JWT or `oc_session` cookie + active account check (401/403).
- *   2. Verifies `sessionId` ownership in PG `client_sessions` (`403 FORBIDDEN` for another user's
+ *   2. Verifies `sessionId` ownership via `ClientSessionsBackend` (`403 FORBIDDEN` for another user's
  *      session, `404 NOT_FOUND` if missing/deleted).
  *   3. NEVER wakes a sleeping container: inspects `getV3ContainerStatus` first and only dials the
  *      container when `status.state === 'running'`, with short fail-open timeouts on read routes.
@@ -18,8 +18,8 @@ import {
   INTERNAL_SWARM_USER_ID_HEADER,
   SESSION_BG_COMMAND_ID_RE,
 } from '@openclaude/gateway'
+import { verifyClientSessionOwnership } from '@openclaude/storage'
 import { getV3ContainerStatus, type V3ContainerStatus } from '../agent-sandbox/v3supervisor.js'
-import { getPool } from '../db/index.js'
 import type { MuseSessionJobView } from '../muse/hub.js'
 import { MuseError } from '../muse/protocol.js'
 import { MASTER_USER_PREFIX } from '../wechat/userIds.js'
@@ -81,17 +81,8 @@ export function isSessionBackgroundTasksPath(path: string): boolean {
 async function defaultVerifySessionOwnership(
   userId: string,
   sessionId: string,
-  pool = getPool(),
 ): Promise<'owner' | 'forbidden' | 'not_found'> {
-  const res = await pool.query<{ user_id: string }>(
-    `SELECT user_id FROM client_sessions WHERE id = $1 AND deleted_at IS NULL LIMIT 1`,
-    [sessionId],
-  )
-  const row = res.rows[0]
-  if (!row) return 'not_found'
-  const expectedOwner = `${MASTER_USER_PREFIX}${userId}`
-  if (row.user_id !== expectedOwner) return 'forbidden'
-  return 'owner'
+  return verifyClientSessionOwnership(sessionId, `${MASTER_USER_PREFIX}${userId}`)
 }
 
 function decodeSegment(raw: string, code: string, label: string): string {
@@ -290,7 +281,7 @@ export async function handleCommercialSessionBackgroundTasks(
 
   const ownership = overrides?.verifySessionOwnership
     ? await overrides.verifySessionOwnership(user.id, sessionId)
-    : await defaultVerifySessionOwnership(user.id, sessionId, deps.v3Supervisor?.pool ?? getPool())
+    : await defaultVerifySessionOwnership(user.id, sessionId)
   if (ownership === 'forbidden') {
     throw new HttpError(403, 'FORBIDDEN', 'session does not belong to user')
   }
