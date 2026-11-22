@@ -29,8 +29,10 @@ import {
 import {
   cancelSessionBgCommand,
   listSessionBgCommands,
+  parseProcStatInfo,
   parseProcStatStartTimeTicks,
   readLinuxProcStartTimeTicks,
+  type ProcStatInfo,
   type SessionBgCommandSnapshot,
 } from '../sessionBgCommands.js'
 
@@ -94,9 +96,10 @@ function mockReq(opts: {
 }
 
 describe('sessionBgCommands', () => {
-  it('parses /proc/<pid>/stat field 22 with parentheses in comm', () => {
+  it('parses /proc/<pid>/stat field 3 (state), field 5 (pgrp), and field 22 (starttime) with parentheses in comm', () => {
     const stat =
       '555 (bash (sub)) R 1 555 555 0 -1 4194304 10 0 0 0 1 1 0 0 20 0 1 0 1234567 100 10 0'
+    assert.deepEqual(parseProcStatInfo(stat), { state: 'R', pgrp: 555, startTimeTicks: 1234567 })
     assert.equal(parseProcStatStartTimeTicks(stat), 1234567)
   })
 
@@ -264,7 +267,7 @@ describe('sessionBgCommands', () => {
       assert.equal(signals1.length, 0)
       assert.equal(existsSync(reusedPath), false)
 
-      // 2. Stubborn live process: SIGTERM then SIGKILL after grace
+      // 2. Stubborn live process: SIGTERM then SIGKILL after grace, then confirmed dead
       const stubbornPath = writeSnap(dir, {
         id: '100-ocb_3',
         jobId: 'ocb_3',
@@ -280,23 +283,88 @@ describe('sessionBgCommands', () => {
         maxLifetimeAt: now + 60_000,
       })
       const signals2: Array<{ target: number; sig: NodeJS.Signals }> = []
+      let stubbornAlive = true
       const res2 = await cancelSessionBgCommand('sess-A', '100-ocb_3', dir, {
         now: () => now,
         platform: 'linux',
-        isProcessAlive: () => true,
-        readStartTimeTicks: () => 3333,
-        sendSignal: (target, sig) => signals2.push({ target, sig }),
+        readProcStat: (pid) =>
+          pid === 7003 && stubbornAlive ? { state: 'S', pgrp: 7003, startTimeTicks: 3333 } : null,
+        listProcPids: () => (stubbornAlive ? [7003] : []),
+        sendSignal: (target, sig) => {
+          signals2.push({ target, sig })
+          if (sig === 'SIGKILL') stubbornAlive = false
+        },
         killGraceMs: 40,
+        killConfirmMs: 40,
         sleep: async () => {},
       })
       assert.deepEqual(res2, { ok: true, cancelled: true })
       assert.deepEqual(signals2, [
         { target: -7003, sig: 'SIGTERM' },
         { target: -7003, sig: 'SIGKILL' },
+        { target: 7003, sig: 'SIGKILL' },
       ])
       assert.equal(existsSync(stubbornPath), false)
 
-      // 3. Missing entry → idempotent alreadyExited
+      // 3. Unkillable process: stays alive after SIGKILL → returns 409 and preserves snapshot
+      const stuckPath = writeSnap(dir, {
+        id: '100-ocb_4',
+        jobId: 'ocb_4',
+        pid: 7004,
+        pgid: 7004,
+        ownerPid: 100,
+        startTimeTicks: 4444,
+        sessionKey: 'a:b:sess-A',
+        sessionId: 'sess-A',
+        commandPreview: 'unkillable',
+        startedAt: now,
+        updatedAt: now,
+        maxLifetimeAt: now + 60_000,
+      })
+      const resStuck = await cancelSessionBgCommand('sess-A', '100-ocb_4', dir, {
+        now: () => now,
+        platform: 'linux',
+        readProcStat: (pid) =>
+          pid === 7004 ? { state: 'D', pgrp: 7004, startTimeTicks: 4444 } : null,
+        listProcPids: () => [7004],
+        sendSignal: () => {},
+        killGraceMs: 40,
+        killConfirmMs: 40,
+        sleep: async () => {},
+      })
+      assert.equal(resStuck.ok, false)
+      if (!resStuck.ok) {
+        assert.equal(resStuck.status, 409)
+        assert.equal(resStuck.code, 'BG_COMMAND_CANCEL_UNCONFIRMED')
+      }
+      assert.equal(existsSync(stuckPath), true, 'snapshot must remain when group did not exit')
+
+      // 4. Snapshot with pgid !== pid is rejected without signalling
+      writeSnap(dir, {
+        id: '100-ocb_5',
+        jobId: 'ocb_5',
+        pid: 7005,
+        pgid: 9999,
+        ownerPid: 100,
+        startTimeTicks: 5555,
+        sessionKey: 'a:b:sess-A',
+        sessionId: 'sess-A',
+        commandPreview: 'bad pgid',
+        startedAt: now,
+        updatedAt: now,
+        maxLifetimeAt: now + 60_000,
+      })
+      const badPgidSignals: number[] = []
+      const resBadPgid = await cancelSessionBgCommand('sess-A', '100-ocb_5', dir, {
+        now: () => now,
+        platform: 'linux',
+        sendSignal: (t) => badPgidSignals.push(t),
+      })
+      assert.equal(resBadPgid.ok, false)
+      if (!resBadPgid.ok) assert.equal(resBadPgid.status, 409)
+      assert.equal(badPgidSignals.length, 0)
+
+      // 5. Missing entry → idempotent alreadyExited
       const res3 = await cancelSessionBgCommand('sess-A', '100-ocb_999', dir)
       assert.deepEqual(res3, { ok: true, cancelled: false, alreadyExited: true })
     } finally {
@@ -337,6 +405,71 @@ describe('sessionBgCommands', () => {
     } finally {
       try {
         if (child.pid) process.kill(-child.pid, 'SIGKILL')
+      } catch {}
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('kills lingering process-group descendants even after the group leader has already exited', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-bg-orphan-member-'))
+    const pidFile = join(dir, 'descendant.pid')
+    // Spawn a detached group leader that spawns a background sleep in the SAME pgrp and immediately exits.
+    const leader = spawn(
+      '/bin/bash',
+      ['-lc', `sleep 30 >/dev/null 2>&1 & echo $! > "${pidFile}"; exit 0`],
+      { detached: true, stdio: 'ignore' },
+    )
+    let descendantPid = 0
+    try {
+      assert.ok(leader.pid && leader.pid > 1)
+      const leaderTicks = readLinuxProcStartTimeTicks(leader.pid)
+      await new Promise<void>((resolve) => leader.once('exit', () => resolve()))
+      const deadline = Date.now() + 2_000
+      while (!existsSync(pidFile) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      descendantPid = Number((await import('node:fs')).readFileSync(pidFile, 'utf8').trim())
+      assert.ok(descendantPid > 1, 'descendant pid must be recorded')
+
+      const now = Date.now()
+      writeSnap(dir, {
+        id: `${process.pid}-ocb_2`,
+        jobId: 'ocb_2',
+        pid: leader.pid,
+        pgid: leader.pid,
+        ownerPid: process.pid,
+        startTimeTicks: leaderTicks,
+        sessionKey: 'agent:main:webchat:dm:sess-orphan',
+        sessionId: 'sess-orphan',
+        commandPreview: 'background child after leader exit',
+        startedAt: now,
+        updatedAt: now,
+        maxLifetimeAt: now + 60_000,
+      })
+
+      // Even though leader exited, the live descendant in the same pgrp keeps the entry visible!
+      const listed = listSessionBgCommands('sess-orphan', dir)
+      assert.equal(listed.length, 1)
+
+      const res = await cancelSessionBgCommand('sess-orphan', `${process.pid}-ocb_2`, dir, {
+        killGraceMs: 250,
+        killConfirmMs: 300,
+      })
+      assert.deepEqual(res, { ok: true, cancelled: true })
+      assert.equal(listSessionBgCommands('sess-orphan', dir).length, 0)
+      let descendantAlive = true
+      try {
+        process.kill(descendantPid, 0)
+      } catch {
+        descendantAlive = false
+      }
+      assert.equal(descendantAlive, false, 'lingering group descendant must be terminated')
+    } finally {
+      try {
+        if (leader.pid) process.kill(-leader.pid, 'SIGKILL')
+      } catch {}
+      try {
+        if (descendantPid > 1) process.kill(descendantPid, 'SIGKILL')
       } catch {}
       rmSync(dir, { recursive: true, force: true })
     }
@@ -431,6 +564,92 @@ describe('cancelSingleDelegateJob', () => {
     const res = cancelSingleDelegateJob(host, 'sess-term-1', created.jobId)
     assert.deepEqual(res, { ok: true, cancelled: false, state: 'completed' })
   })
+
+  it('returns 409 DELEGATE_CANCEL_UNCONFIRMED and never fabricates cancelled for surface-only sync delegates without a live handle', () => {
+    const surface = new DelegateInflightSurfaceStore({ dbPath: null })
+    const parentSessionKey = 'agent:main:webchat:dm:sess-sync-1'
+    surface.upsertEnqueue({
+      jobId: 'dlgjob-sync-1',
+      parentSessionKey,
+      agentId: 'researcher',
+      runId: 'run-sync-1',
+      goal: 'sync search',
+      state: 'running',
+    })
+    const hostNoHandle: DelegateCancelHost = {
+      delegateJobs: () => undefined,
+      delegateInflightSurface: () => surface,
+      sessions: { getByKey: () => undefined, interrupt: () => false },
+      _activeDelegationsByParent: new Map(),
+      _interruptDelegationsForParent: () => false,
+    }
+    const unconfirmed = cancelSingleDelegateJob(hostNoHandle, 'sess-sync-1', 'dlgjob-sync-1')
+    assert.equal(unconfirmed.ok, false)
+    if (!unconfirmed.ok) {
+      assert.equal(unconfirmed.status, 409)
+      assert.equal(unconfirmed.code, 'DELEGATE_CANCEL_UNCONFIRMED')
+    }
+    assert.equal(surface.get('dlgjob-sync-1')?.state, 'running', 'must not fabricate cancelled')
+
+    // With an unambiguous live handle whose interrupt returns true, cancel succeeds!
+    const childKey = 'agent:researcher:delegate:main:run-sync-1'
+    const interrupted: string[] = []
+    const hostWithHandle: DelegateCancelHost = {
+      delegateJobs: () => undefined,
+      delegateInflightSurface: () => surface,
+      sessions: {
+        getByKey: (k) => (k === childKey ? ({ sessionKey: k } as never) : undefined),
+        interrupt: (k) => {
+          interrupted.push(k)
+          return true
+        },
+      },
+      _activeDelegationsByParent: new Map([[parentSessionKey, new Set([childKey])]]),
+      _interruptDelegationsForParent: () => false,
+    }
+    const confirmed = cancelSingleDelegateJob(hostWithHandle, 'sess-sync-1', 'dlgjob-sync-1')
+    assert.deepEqual(confirmed, { ok: true, cancelled: true, state: 'cancelled' })
+    assert.deepEqual(interrupted, [childKey])
+    assert.equal(surface.get('dlgjob-sync-1')?.state, 'cancelled')
+  })
+
+  it('retries CAS once and returns 409 DELEGATE_CANCEL_CONFLICT without fabricating surface cancelled if job stays non-terminal', () => {
+    const jobs = new DelegateJobStore({ sm: true })
+    const surface = new DelegateInflightSurfaceStore({ dbPath: null })
+    const parentSessionKey = 'agent:main:webchat:dm:sess-cas-1'
+    const created = jobs.create('coder', { parentSessionKey })
+    assert.ok('jobId' in created)
+    surface.upsertEnqueue({
+      jobId: created.jobId,
+      parentSessionKey,
+      agentId: 'coder',
+      goal: 'cas conflict',
+      state: 'running',
+    })
+    let failCalls = 0
+    const fakeStore = {
+      snapshotOf: (id: string) => jobs.snapshotOf(id),
+      fail: () => {
+        failCalls += 1
+        return false
+      },
+    } as unknown as DelegateJobStore
+
+    const host: DelegateCancelHost = {
+      delegateJobs: () => fakeStore,
+      delegateInflightSurface: () => surface,
+      sessions: { getByKey: () => undefined, interrupt: () => false },
+      _interruptDelegationsForParent: () => false,
+    }
+    const res = cancelSingleDelegateJob(host, 'sess-cas-1', created.jobId)
+    assert.equal(failCalls, 2, 'must attempt CAS and retry once with fresh snapshot')
+    assert.equal(res.ok, false)
+    if (!res.ok) {
+      assert.equal(res.status, 409)
+      assert.equal(res.code, 'DELEGATE_CANCEL_CONFLICT')
+    }
+    assert.equal(surface.get(created.jobId)?.state, 'running', 'must not write cancelled on CAS conflict')
+  })
 })
 
 describe('internal container background routes (bridge auth + replay)', () => {
@@ -480,6 +699,39 @@ describe('internal container background routes (bridge auth + replay)', () => {
         now: () => 1_700_000_000_000,
         delegateJobs: () => jobs,
         ensureDelegateInflightSurface: () => surface,
+        listCronJobsWithMeta: async () => [
+          {
+            id: 'cron-1',
+            schedule: '*/15 * * * *',
+            agent: 'main',
+            prompt: 'check deploy status',
+            label: 'Deploy check',
+            enabled: true,
+            resume: 'origin-session',
+            sourceSessionKey: 'agent:main:webchat:dm:sess-1',
+            nextRunAt: '2026-11-22T15:00:00.000Z',
+          },
+          {
+            id: 'cron-other',
+            schedule: '0 * * * *',
+            agent: 'main',
+            prompt: 'other session',
+            enabled: true,
+            resume: 'origin-session',
+            sourceSessionKey: 'agent:main:webchat:dm:sess-other',
+            nextRunAt: '2026-11-22T15:00:00.000Z',
+          },
+          {
+            id: 'cron-iso',
+            schedule: '0 * * * *',
+            agent: 'main',
+            prompt: 'isolated cron',
+            enabled: true,
+            resume: 'isolated',
+            sourceSessionKey: 'agent:main:webchat:dm:sess-1',
+            nextRunAt: '2026-11-22T15:00:00.000Z',
+          },
+        ],
         bgCommandsRegistryDir: regDir,
       })
       assert.equal(m2.result().status, 200)
@@ -487,6 +739,18 @@ describe('internal container background routes (bridge auth + replay)', () => {
       assert.equal(Array.isArray(body.delegates), true)
       assert.equal((body.delegates as unknown[]).length, 1)
       assert.deepEqual(body.bgCommands, [])
+      assert.deepEqual(body.sessionCrons, [
+        {
+          id: 'cron-1',
+          name: 'Deploy check',
+          enabled: true,
+          schedule: '*/15 * * * *',
+          message: 'check deploy status',
+          nextRunAt: Date.parse('2026-11-22T15:00:00.000Z'),
+          resume: 'origin-session',
+          sourceSessionKey: 'agent:main:webchat:dm:sess-1',
+        },
+      ])
 
       // Replay same headers → 409 REPLAY_REJECTED
       const req2 = mockReq({

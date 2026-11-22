@@ -3,9 +3,11 @@
  *
  * `packages/mcp-memory/src/ocBashJobManager.ts` atomically writes active job snapshots to
  * `<registryDir>/<ownerPid>-<jobId>.json` including Linux `/proc/<pid>/stat` field 22
- * (`startTimeTicks`). This module reads/filters those snapshots per `sessionId`, reaps dead
- * or expired files, and terminates a targeted process group only after verifying both
- * `sessionId` ownership and `startTimeTicks` identity (eliminating PID-reuse kill risk).
+ * (`startTimeTicks`). This module reads/filters those snapshots per `sessionId`, verifies
+ * process-group ownership (`pgid === pid`, `pgrp === entry.pgid`, `starttime` bounds), scans
+ * all live members of the verified process group (including lingering descendants after leader
+ * exit), and only deletes the snapshot / reports 200 after confirming the entire verified group
+ * has exited.
  */
 import { lstatSync, readdirSync, readFileSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
@@ -13,7 +15,14 @@ import { join } from 'node:path'
 export const SESSION_BG_COMMAND_ID_RE = /^[0-9]+-ocb_[0-9]+$/
 export const SESSION_BG_COMMANDS_MAX_ITEMS = 20
 export const SESSION_BG_COMMAND_KILL_GRACE_MS = 400
+export const SESSION_BG_COMMAND_KILL_CONFIRM_MS = 400
 const KILL_POLL_STEP_MS = 40
+
+export interface ProcStatInfo {
+  state: string
+  pgrp: number
+  startTimeTicks: number
+}
 
 export interface SessionBgCommandSnapshot {
   id: string
@@ -48,9 +57,15 @@ export interface SessionBgCommandsOps {
   now?: () => number
   platform?: NodeJS.Platform
   isProcessAlive?: (pid: number) => boolean
+  /** Legacy test seam for starttime-only checks; superseded by `readProcStat`. */
   readStartTimeTicks?: (pid: number) => number | null
+  /** Read parsed `/proc/<pid>/stat` (`state`, `pgrp`, `startTimeTicks`). */
+  readProcStat?: (pid: number) => ProcStatInfo | null
+  /** Enumerate all numeric PIDs from `/proc`. */
+  listProcPids?: () => number[]
   sendSignal?: (pidOrNegPgid: number, signal: NodeJS.Signals) => void
   killGraceMs?: number
+  killConfirmMs?: number
   sleep?: (ms: number) => Promise<void>
 }
 
@@ -66,26 +81,62 @@ export function resolveSessionBgCommandsRegistryDir(
   return join(base, 'run', 'oc-bash-jobs')
 }
 
-export function parseProcStatStartTimeTicks(statLine: string): number | null {
+/**
+ * Parse Linux `/proc/<pid>/stat` extracting:
+ *   - field 3 (`state`): index 0 after last `)`
+ *   - field 5 (`pgrp`): index 2 after last `)`
+ *   - field 22 (`starttime`): index 19 after last `)`
+ */
+export function parseProcStatInfo(statLine: string): ProcStatInfo | null {
   const rparen = statLine.lastIndexOf(')')
   if (rparen < 0) return null
   const rest = statLine.slice(rparen + 1).trim()
   if (!rest) return null
   const fields = rest.split(/\s+/)
-  // Field 1=pid, 2=(comm); after last ')', index 0 is field 3 (state), so field 22 is index 19.
+  const state = fields[0]
+  const rawPgrp = fields[2]
   const rawTicks = fields[19]
-  if (!rawTicks || !/^\d+$/.test(rawTicks)) return null
-  const ticks = Number(rawTicks)
-  return Number.isSafeInteger(ticks) && ticks >= 0 ? ticks : null
+  if (!state || !rawPgrp || !rawTicks) return null
+  if (!/^-?\d+$/.test(rawPgrp) || !/^\d+$/.test(rawTicks)) return null
+  const pgrp = Number(rawPgrp)
+  const startTimeTicks = Number(rawTicks)
+  if (!Number.isSafeInteger(pgrp) || !Number.isSafeInteger(startTimeTicks) || startTimeTicks < 0) {
+    return null
+  }
+  return { state, pgrp, startTimeTicks }
 }
 
-export function readLinuxProcStartTimeTicks(pid: number): number | null {
+export function parseProcStatStartTimeTicks(statLine: string): number | null {
+  return parseProcStatInfo(statLine)?.startTimeTicks ?? null
+}
+
+export function readLinuxProcStatInfo(pid: number): ProcStatInfo | null {
   if (!Number.isInteger(pid) || pid <= 1) return null
   if (process.platform !== 'linux') return null
   try {
-    return parseProcStatStartTimeTicks(readFileSync(`/proc/${pid}/stat`, 'utf8'))
+    return parseProcStatInfo(readFileSync(`/proc/${pid}/stat`, 'utf8'))
   } catch {
     return null
+  }
+}
+
+export function readLinuxProcStartTimeTicks(pid: number): number | null {
+  return readLinuxProcStatInfo(pid)?.startTimeTicks ?? null
+}
+
+function defaultListLinuxProcPids(): number[] {
+  if (process.platform !== 'linux') return []
+  try {
+    const entries = readdirSync('/proc')
+    const pids: number[] = []
+    for (const name of entries) {
+      if (!/^[1-9][0-9]*$/.test(name)) continue
+      const pid = Number(name)
+      if (Number.isSafeInteger(pid) && pid > 1) pids.push(pid)
+    }
+    return pids
+  } catch {
+    return []
   }
 }
 
@@ -97,6 +148,12 @@ function defaultIsProcessAlive(pid: number): boolean {
   } catch (err) {
     return (err as NodeJS.ErrnoException)?.code === 'EPERM'
   }
+}
+
+function isStatAlive(stat: ProcStatInfo | null): stat is ProcStatInfo {
+  if (!stat) return false
+  // Zombie ('Z') or Dead ('X') processes have already terminated and cannot be signalled further.
+  return stat.state !== 'Z' && stat.state !== 'X'
 }
 
 function defaultSendSignal(target: number, signal: NodeJS.Signals): void {
@@ -126,7 +183,7 @@ function parseSnapshotFile(filePath: string, expectedId: string): SessionBgComma
     const id = typeof raw.id === 'string' ? raw.id : ''
     const jobId = typeof raw.jobId === 'string' ? raw.jobId : ''
     const pid = typeof raw.pid === 'number' ? raw.pid : Number.NaN
-    const pgid = typeof raw.pgid === 'number' ? raw.pgid : pid
+    const pgid = typeof raw.pgid === 'number' ? raw.pgid : Number.NaN
     const ownerPid = typeof raw.ownerPid === 'number' ? raw.ownerPid : 0
     const startTimeTicks =
       typeof raw.startTimeTicks === 'number' && Number.isSafeInteger(raw.startTimeTicks)
@@ -144,6 +201,8 @@ function parseSnapshotFile(filePath: string, expectedId: string): SessionBgComma
       !jobId ||
       !Number.isInteger(pid) ||
       pid <= 1 ||
+      !Number.isInteger(pgid) ||
+      pgid !== pid ||
       !Number.isFinite(startedAt) ||
       !Number.isFinite(maxLifetimeAt)
     ) {
@@ -153,7 +212,7 @@ function parseSnapshotFile(filePath: string, expectedId: string): SessionBgComma
       id,
       jobId,
       pid,
-      pgid: Number.isInteger(pgid) && pgid > 1 ? pgid : pid,
+      pgid,
       ownerPid,
       startTimeTicks,
       sessionKey,
@@ -169,46 +228,105 @@ function parseSnapshotFile(filePath: string, expectedId: string): SessionBgComma
   }
 }
 
-function isSameLiveProcess(
-  entry: SessionBgCommandSnapshot,
-  now: number,
-  ops: SessionBgCommandsOps,
-): boolean {
-  if (!Number.isInteger(entry.pid) || entry.pid <= 1) return false
-  if (now >= entry.maxLifetimeAt) return false
-  const isAlive = ops.isProcessAlive ?? defaultIsProcessAlive
-  if (!isAlive(entry.pid)) return false
-  const platform = ops.platform ?? process.platform
-  const readTicks = ops.readStartTimeTicks ?? readLinuxProcStartTimeTicks
-  if (platform === 'linux' || ops.readStartTimeTicks) {
-    // Fail closed on Linux when startTimeTicks is missing or mismatched to prevent PID-reuse kills.
-    if (entry.startTimeTicks === null) return false
-    const currentTicks = readTicks(entry.pid)
-    if (currentTicks === null || currentTicks !== entry.startTimeTicks) return false
-  }
-  return true
+interface VerifiedGroupScan {
+  /** True when the original leader PID now belongs to a different process or different pgrp. */
+  identityMismatch: boolean
+  /** Verified live PIDs belonging to `entry.pgid` with `starttime >= entry.startTimeTicks`. */
+  members: number[]
 }
 
-function sendGroupOrPidSignal(
-  entry: Pick<SessionBgCommandSnapshot, 'pid' | 'pgid'>,
-  signal: NodeJS.Signals,
-  sendSignal: (target: number, sig: NodeJS.Signals) => void,
-): boolean {
-  const pgid = Number.isInteger(entry.pgid) && entry.pgid > 1 ? entry.pgid : entry.pid
-  try {
-    sendSignal(-pgid, signal)
-    return true
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException)?.code === 'ESRCH' && pgid === entry.pid) {
-      // Group might not exist if process already exited or was not group leader; try pid directly.
-    }
-    try {
-      sendSignal(entry.pid, signal)
-      return true
-    } catch {
-      return false
+function buildProcStatReader(ops: SessionBgCommandsOps): (pid: number) => ProcStatInfo | null {
+  if (ops.readProcStat) return ops.readProcStat
+  if (ops.readStartTimeTicks) {
+    // Backwards-compatible adapter for unit tests that inject only `readStartTimeTicks`.
+    const isAlive = ops.isProcessAlive ?? defaultIsProcessAlive
+    return (pid: number) => {
+      if (!isAlive(pid)) return null
+      const ticks = ops.readStartTimeTicks!(pid)
+      if (ticks === null) return null
+      return { state: 'S', pgrp: pid, startTimeTicks: ticks }
     }
   }
+  return readLinuxProcStatInfo
+}
+
+function scanVerifiedGroupMembers(
+  entry: SessionBgCommandSnapshot,
+  ops: SessionBgCommandsOps,
+): VerifiedGroupScan {
+  if (!Number.isInteger(entry.pid) || entry.pid <= 1 || entry.pgid !== entry.pid) {
+    return { identityMismatch: true, members: [] }
+  }
+  const platform = ops.platform ?? process.platform
+  const useProcInspection =
+    platform === 'linux' || Boolean(ops.readProcStat || ops.readStartTimeTicks || ops.listProcPids)
+
+  if (!useProcInspection) {
+    const isAlive = ops.isProcessAlive ?? defaultIsProcessAlive
+    return { identityMismatch: false, members: isAlive(entry.pid) ? [entry.pid] : [] }
+  }
+
+  // Fail closed when startTimeTicks is absent on Linux so we never risk killing a reused PID/PGID.
+  if (entry.startTimeTicks === null) {
+    return { identityMismatch: true, members: [] }
+  }
+
+  const readStat = buildProcStatReader(ops)
+  const leaderStat = readStat(entry.pid)
+  if (isStatAlive(leaderStat)) {
+    if (leaderStat.pgrp !== entry.pgid || leaderStat.startTimeTicks !== entry.startTimeTicks) {
+      return { identityMismatch: true, members: [] }
+    }
+  }
+
+  const members: number[] = []
+  const seen = new Set<number>()
+  if (isStatAlive(leaderStat)) {
+    members.push(entry.pid)
+    seen.add(entry.pid)
+  }
+
+  const listPids =
+    ops.listProcPids ??
+    (ops.readProcStat || ops.readStartTimeTicks ? () => [entry.pid] : defaultListLinuxProcPids)
+  for (const pid of listPids()) {
+    if (seen.has(pid) || !Number.isInteger(pid) || pid <= 1) continue
+    const stat = readStat(pid)
+    if (!isStatAlive(stat)) continue
+    if (stat.pgrp === entry.pgid && stat.startTimeTicks >= entry.startTimeTicks) {
+      members.push(pid)
+      seen.add(pid)
+    }
+  }
+
+  return { identityMismatch: false, members }
+}
+
+function signalVerifiedGroup(
+  entry: Pick<SessionBgCommandSnapshot, 'pid' | 'pgid'>,
+  members: readonly number[],
+  signal: NodeJS.Signals,
+  sendSignal: (target: number, sig: NodeJS.Signals) => void,
+  alsoSignalMembers: boolean,
+): boolean {
+  let delivered = false
+  try {
+    sendSignal(-entry.pgid, signal)
+    delivered = true
+  } catch {
+    /* group kill failed (e.g., leader exited or ESRCH); fall through to member PIDs */
+  }
+  if (!delivered || alsoSignalMembers) {
+    for (const pid of members) {
+      try {
+        sendSignal(pid, signal)
+        delivered = true
+      } catch {
+        /* member already exited */
+      }
+    }
+  }
+  return delivered
 }
 
 export function listSessionBgCommands(
@@ -238,7 +356,12 @@ export function listSessionBgCommands(
       unlinkSafe(filePath)
       continue
     }
-    if (!isSameLiveProcess(entry, now, ops)) {
+    if (now >= entry.maxLifetimeAt) {
+      unlinkSafe(filePath)
+      continue
+    }
+    const scan = scanVerifiedGroupMembers(entry, ops)
+    if (scan.identityMismatch || scan.members.length === 0) {
       unlinkSafe(filePath)
       continue
     }
@@ -293,15 +416,29 @@ export async function cancelSessionBgCommand(
 
   const entry = parseSnapshotFile(filePath, entryId)
   if (!entry) {
-    unlinkSafe(filePath)
-    return { ok: true, cancelled: false, alreadyExited: true }
+    return {
+      ok: false,
+      status: 409,
+      code: 'BG_COMMAND_IDENTITY_INVALID',
+      error: 'background command snapshot failed pgid/pid validation',
+    }
   }
   if (entry.sessionId !== sid) {
     return { ok: false, status: 404, code: 'NOT_FOUND', error: 'background command not found' }
   }
 
   const nowFn = ops.now ?? Date.now
-  if (!isSameLiveProcess(entry, nowFn(), ops)) {
+  if (nowFn() >= entry.maxLifetimeAt) {
+    unlinkSafe(filePath)
+    return { ok: true, cancelled: false, alreadyExited: true }
+  }
+
+  let scan = scanVerifiedGroupMembers(entry, ops)
+  if (scan.identityMismatch) {
+    unlinkSafe(filePath)
+    return { ok: true, cancelled: false, alreadyExited: true }
+  }
+  if (scan.members.length === 0) {
     unlinkSafe(filePath)
     return { ok: true, cancelled: false, alreadyExited: true }
   }
@@ -309,26 +446,57 @@ export async function cancelSessionBgCommand(
   const sendSignal = ops.sendSignal ?? defaultSendSignal
   const sleep = ops.sleep ?? defaultSleep
   const graceMs = Math.max(0, ops.killGraceMs ?? SESSION_BG_COMMAND_KILL_GRACE_MS)
+  const confirmMs = Math.max(0, ops.killConfirmMs ?? SESSION_BG_COMMAND_KILL_CONFIRM_MS)
 
-  const sentTerm = sendGroupOrPidSignal(entry, 'SIGTERM', sendSignal)
+  // Phase 1: SIGTERM to verified process group (falling back to verified members if needed).
+  const sentTerm = signalVerifiedGroup(entry, scan.members, 'SIGTERM', sendSignal, false)
   if (!sentTerm) {
-    unlinkSafe(filePath)
-    return { ok: true, cancelled: false, alreadyExited: true }
+    scan = scanVerifiedGroupMembers(entry, ops)
+    if (scan.identityMismatch || scan.members.length === 0) {
+      unlinkSafe(filePath)
+      return { ok: true, cancelled: false, alreadyExited: true }
+    }
   }
 
+  // Wait up to graceMs for the entire verified group to exit cleanly.
   if (graceMs > 0) {
     let waited = 0
     while (waited < graceMs) {
       const step = Math.min(KILL_POLL_STEP_MS, graceMs - waited)
       await sleep(step)
       waited += step
-      if (!isSameLiveProcess(entry, nowFn(), ops)) break
+      scan = scanVerifiedGroupMembers(entry, ops)
+      if (scan.identityMismatch || scan.members.length === 0) break
+    }
+  } else {
+    scan = scanVerifiedGroupMembers(entry, ops)
+  }
+
+  // Phase 2: escalate to SIGKILL on -pgid AND any remaining verified members, then confirm exit.
+  if (!scan.identityMismatch && scan.members.length > 0) {
+    signalVerifiedGroup(entry, scan.members, 'SIGKILL', sendSignal, true)
+    if (confirmMs > 0) {
+      let waited = 0
+      while (waited < confirmMs) {
+        const step = Math.min(KILL_POLL_STEP_MS, confirmMs - waited)
+        await sleep(step)
+        waited += step
+        scan = scanVerifiedGroupMembers(entry, ops)
+        if (scan.identityMismatch || scan.members.length === 0) break
+      }
+    } else {
+      scan = scanVerifiedGroupMembers(entry, ops)
     }
   }
 
-  // Re-verify process identity (pid + startTimeTicks) before escalating to SIGKILL.
-  if (isSameLiveProcess(entry, nowFn(), ops)) {
-    sendGroupOrPidSignal(entry, 'SIGKILL', sendSignal)
+  // Never delete snapshot or report success if verified group members are still running.
+  if (!scan.identityMismatch && scan.members.length > 0) {
+    return {
+      ok: false,
+      status: 409,
+      code: 'BG_COMMAND_CANCEL_UNCONFIRMED',
+      error: `background command process group still has ${scan.members.length} live member(s)`,
+    }
   }
 
   unlinkSafe(filePath)

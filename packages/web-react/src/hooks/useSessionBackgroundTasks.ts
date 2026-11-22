@@ -10,7 +10,6 @@ import {
   cancelSessionMuseJob,
   deleteSessionCronJob,
   fetchSessionBackgroundTasksResult,
-  fetchSessionOriginCrons,
   filterSessionMediaJobs,
   isTerminalMediaJobStatus,
   isTerminalMuseJobStatus,
@@ -20,6 +19,7 @@ import {
   type SessionBgCommandItem,
   type SessionCronItem,
   type SessionMuseJobItem,
+  type SessionMuseJobStatus,
 } from "../lib/chat/sessionBackgroundTasks";
 import type { AuthSession, Session } from "../lib/types";
 
@@ -72,10 +72,11 @@ export type UseSessionBackgroundTasksResult = {
 /**
  * 统一会话后台任务聚合 Hook（OCV5-844）：
  *
- * - 聚合当前会话的 Muse 异步媒体、oc_bash 后台命令、origin-session 定时续跑、sys.media_job 媒体任务；
- * - 进会话拉 1 次；收到 refreshTrigger（turn 结束 / sys.muse_result / sys.media_job）节流刷新；
- * - 仅当存在非终态 museJobs 或 bgCommands 时开 5s 轮询（隐藏页暂停、切回前台立刻拉 1 次），空闲时 0 轮询；
- * - /background-tasks 返回 404 时静默降级为空，不影响定时续跑与 H3 媒体任务展示。
+ * - 进会话首拉与轮询只请求 `GET /api/sessions/:id/background-tasks`（零 `/api/cron` 首拉唤醒容器），
+ *   统一消费 `museJobs`、`bgCommands`、`sessionCrons` 并合并当前会话 `sys.media_job`；
+ * - 仅当存在非终态 `museJobs` 或 `bgCommands` 时开 5s 轮询（隐藏页暂停、回前台即拉，空闲 0 轮询）；
+ * - 严格区分缺路由 404（`routeMissing` 静默降级停轮询）与新会话未落行 404（`sessionNotReady` 当空态不拉黑，下一次触发即自动恢复）；
+ * - 同会话单调请求序号（`requestSeqRef` / `committedSeqRef`）防止在途旧轮询覆盖新的取消/修改快照。
  */
 export function useSessionBackgroundTasks(
   opts: UseSessionBackgroundTasksOpts,
@@ -95,13 +96,15 @@ export function useSessionBackgroundTasks(
     setDismissed(readDismissedBgMedia(sessionId));
   }
 
-  const bgNotFoundRef = useRef(new Set<string>());
+  const routeMissingRef = useRef(new Set<string>());
   const seenLiveRef = useRef(new Set<string>());
   const authRef = useRef(auth);
   authRef.current = auth;
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
   const genRef = useRef(0);
+  const requestSeqRef = useRef(0);
+  const committedSeqRef = useRef(0);
   const lastRefreshAtRef = useRef(0);
   const refreshTimerRef = useRef<number | null>(null);
   const prevRefreshTriggerRef = useRef(refreshTrigger);
@@ -118,40 +121,36 @@ export function useSessionBackgroundTasks(
 
   const pullTasks = useCallback(async (sid: string, myGen: number) => {
     const a = authRef.current;
-    if (!a || bgNotFoundRef.current.has(sid)) return;
+    if (!a || routeMissingRef.current.has(sid)) return;
+    lastRefreshAtRef.current = Date.now();
+    const mySeq = ++requestSeqRef.current;
     const res = await fetchSessionBackgroundTasksResult(sid, a);
-    if (genRef.current !== myGen) return;
+    if (genRef.current !== myGen || mySeq < committedSeqRef.current) return;
     if (res.ok) {
+      committedSeqRef.current = mySeq;
       for (const job of res.snapshot.museJobs) {
         if (!isTerminalMuseJobStatus(job.status)) seenLiveRef.current.add(job.id);
       }
       setRawMuseJobs(res.snapshot.museJobs);
       setRawBgCommands(res.snapshot.bgCommands);
+      setSessionCrons(res.snapshot.sessionCrons);
       return;
     }
-    if (res.notFound) {
-      bgNotFoundRef.current.add(sid);
+    if (res.sessionNotReady) {
+      committedSeqRef.current = mySeq;
       setRawMuseJobs([]);
       setRawBgCommands([]);
+      setSessionCrons([]);
+      return;
+    }
+    if (res.routeMissing) {
+      committedSeqRef.current = mySeq;
+      routeMissingRef.current.add(sid);
+      setRawMuseJobs([]);
+      setRawBgCommands([]);
+      setSessionCrons([]);
     }
   }, []);
-
-  const pullCrons = useCallback(async (sid: string, myGen: number) => {
-    const a = authRef.current;
-    if (!a) return;
-    const res = await fetchSessionOriginCrons(sid, a);
-    if (genRef.current !== myGen) return;
-    if (res.ok) setSessionCrons(res.items);
-  }, []);
-
-  const pullAll = useCallback(
-    (sid: string, myGen: number) => {
-      lastRefreshAtRef.current = Date.now();
-      void pullTasks(sid, myGen);
-      void pullCrons(sid, myGen);
-    },
-    [pullTasks, pullCrons],
-  );
 
   useEffect(() => {
     if (refreshTimerRef.current !== null) {
@@ -161,6 +160,7 @@ export function useSessionBackgroundTasks(
     prevRefreshTriggerRef.current = refreshTrigger;
     if (!enabled || !sessionId || !auth) {
       genRef.current += 1;
+      committedSeqRef.current = ++requestSeqRef.current;
       setRawMuseJobs([]);
       setRawBgCommands([]);
       setSessionCrons([]);
@@ -168,12 +168,13 @@ export function useSessionBackgroundTasks(
       return;
     }
     const myGen = ++genRef.current;
+    committedSeqRef.current = ++requestSeqRef.current;
     setRawMuseJobs([]);
     setRawBgCommands([]);
     setSessionCrons([]);
     setDismissed(readDismissedBgMedia(sessionId));
     seenLiveRef.current = new Set();
-    pullAll(sessionId, myGen);
+    void pullTasks(sessionId, myGen);
     return () => {
       genRef.current += 1;
       if (refreshTimerRef.current !== null) {
@@ -182,7 +183,7 @@ export function useSessionBackgroundTasks(
       }
     };
     // biome-ignore lint/correctness/useExhaustiveDependencies: refreshTrigger 由节流 effect 单独消费
-  }, [enabled, sessionId, auth, pullAll]);
+  }, [enabled, sessionId, auth, pullTasks]);
 
   useEffect(() => {
     if (refreshTrigger === undefined || refreshTrigger === prevRefreshTriggerRef.current) {
@@ -190,7 +191,7 @@ export function useSessionBackgroundTasks(
       return;
     }
     prevRefreshTriggerRef.current = refreshTrigger;
-    if (!enabled || !sessionId || !auth) return;
+    if (!enabled || !sessionId || !auth || routeMissingRef.current.has(sessionId)) return;
     const myGen = genRef.current;
     const elapsed = Date.now() - lastRefreshAtRef.current;
     if (elapsed >= REFRESH_THROTTLE_MS) {
@@ -198,16 +199,16 @@ export function useSessionBackgroundTasks(
         window.clearTimeout(refreshTimerRef.current);
         refreshTimerRef.current = null;
       }
-      pullAll(sessionId, myGen);
+      void pullTasks(sessionId, myGen);
       return;
     }
     if (refreshTimerRef.current !== null) return;
     const waitMs = Math.max(0, REFRESH_THROTTLE_MS - elapsed);
     refreshTimerRef.current = window.setTimeout(() => {
       refreshTimerRef.current = null;
-      if (genRef.current === myGen) pullAll(sessionId, myGen);
+      if (genRef.current === myGen) void pullTasks(sessionId, myGen);
     }, waitMs);
-  }, [refreshTrigger, enabled, sessionId, auth, pullAll]);
+  }, [refreshTrigger, enabled, sessionId, auth, pullTasks]);
 
   const hasActivePollableTasks =
     rawMuseJobs.some((j) => !isTerminalMuseJobStatus(j.status)) || rawBgCommands.length > 0;
@@ -215,7 +216,7 @@ export function useSessionBackgroundTasks(
     enabled &&
     Boolean(sessionId) &&
     Boolean(auth) &&
-    !bgNotFoundRef.current.has(sessionId ?? "") &&
+    !routeMissingRef.current.has(sessionId ?? "") &&
     hasActivePollableTasks;
 
   useEffect(() => {
@@ -253,7 +254,17 @@ export function useSessionBackgroundTasks(
       const myGen = genRef.current;
       const res = await cancelSessionMuseJob(sid, jobId, a);
       if (!res.ok) return false;
-      if (genRef.current === myGen) await pullTasks(sid, myGen);
+      if (genRef.current === myGen) {
+        committedSeqRef.current = ++requestSeqRef.current;
+        const nextStatus: SessionMuseJobStatus =
+          res.status === "succeeded" || res.status === "failed" || res.status === "cancelled"
+            ? res.status
+            : "cancelled";
+        setRawMuseJobs((prev) =>
+          prev.map((j) => (j.id === jobId ? { ...j, status: nextStatus } : j)),
+        );
+        await pullTasks(sid, myGen);
+      }
       return true;
     },
     [pullTasks],
@@ -268,6 +279,7 @@ export function useSessionBackgroundTasks(
       const res = await cancelSessionBgCommand(sid, entryId, a);
       if (!res.ok) return false;
       if (genRef.current === myGen) {
+        committedSeqRef.current = ++requestSeqRef.current;
         setRawBgCommands((prev) => prev.filter((cmd) => cmd.id !== entryId));
         await pullTasks(sid, myGen);
       }
@@ -291,14 +303,15 @@ export function useSessionBackgroundTasks(
       const ok = await updateSessionCronEnabled(cronId, nextEnabled, a);
       if (!ok) return false;
       if (genRef.current === myGen) {
+        committedSeqRef.current = ++requestSeqRef.current;
         setSessionCrons((prev) =>
           prev.map((c) => (c.id === cronId ? { ...c, enabled: nextEnabled } : c)),
         );
-        await pullCrons(sid, myGen);
+        await pullTasks(sid, myGen);
       }
       return true;
     },
-    [pullCrons],
+    [pullTasks],
   );
 
   const deleteSessionCron = useCallback(
@@ -310,19 +323,20 @@ export function useSessionBackgroundTasks(
       const ok = await deleteSessionCronJob(cronId, a);
       if (!ok) return false;
       if (genRef.current === myGen) {
+        committedSeqRef.current = ++requestSeqRef.current;
         setSessionCrons((prev) => prev.filter((c) => c.id !== cronId));
-        await pullCrons(sid, myGen);
+        await pullTasks(sid, myGen);
       }
       return true;
     },
-    [pullCrons],
+    [pullTasks],
   );
 
   const refresh = useCallback(() => {
     const sid = sessionIdRef.current;
     if (!sid || !authRef.current) return;
-    pullAll(sid, genRef.current);
-  }, [pullAll]);
+    void pullTasks(sid, genRef.current);
+  }, [pullTasks]);
 
   const museJobs = useMemo(
     () =>

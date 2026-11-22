@@ -47,7 +47,10 @@ import type { DelegateJobStore } from '../delegateJobs.js'
 import { REMOTE_SWARM_LOCAL_PREFIX } from '../remoteSwarmLocal.js'
 import type { Gateway, GatewayDeps } from '../server.js'
 import { type HttpRoute, predicateRoute, regexRoute } from './routeTable.js'
-import { SESSION_BACKGROUND_INTERNAL_ROUTES } from './sessionBackgroundRoute.js'
+import {
+  SESSION_BACKGROUND_INTERNAL_ROUTES,
+  type CronJobsWithMetaReader,
+} from './sessionBackgroundRoute.js'
 
 export interface PreAuthRoutesIo {
   handleSystemHelp?(req: IncomingMessage, res: ServerResponse): Promise<void>
@@ -55,6 +58,7 @@ export interface PreAuthRoutesIo {
   delegateJobs?(): DelegateJobStore | undefined
   ensureDelegateInflightSurface?(): DelegateInflightSurfaceStore
   delegateCancelHost?(): DelegateCancelHost
+  listCronJobsWithMeta?: CronJobsWithMetaReader
   _handleSkillEvalGenStart(
     req: IncomingMessage,
     res: ServerResponse,

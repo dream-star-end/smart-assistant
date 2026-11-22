@@ -3,17 +3,22 @@
  *
  * Cancels one delegate job owned by `sessionId` without stopping the parent turn:
  *   1. Validates `job.parentSessionKey` belongs to `sessionId` (404 on mismatch/missing).
- *   2. Idempotent when the job is already in a terminal state (`{ ok: true, cancelled: false, state }`).
- *   3. Interrupts the child session, queued capacity waiter, pre-spawn trace wait, and nested
- *      descendant delegations, marks the job `cancelled` in `DelegateJobStore`, and authoritatively
- *      projects `'cancelled'` into `DelegateInflightSurfaceStore`.
+ *   2. Idempotent when already in a terminal state (`{ ok: true, cancelled: false, state }`).
+ *   3. For durable/async jobs in `DelegateJobStore`: interrupts the child session, CAS-fails the
+ *      job to `'cancelled'` (with 1 CAS retry on fresh token/epoch if still non-terminal), and
+ *      ONLY projects to `DelegateInflightSurfaceStore` / returns 200 after the durable row is
+ *      confirmed terminal; otherwise returns 409 `DELEGATE_CANCEL_CONFLICT` without fabricating
+ *      a `'cancelled'` surface state.
+ *   4. For surface-only (sync) rows: locates an unambiguous live handle in
+ *      `_activeDelegationsByParent` / `sessions` and confirms real interruption; if none can be
+ *      confirmed, NEVER fabricates `'cancelled'` and returns 409 `DELEGATE_CANCEL_UNCONFIRMED`.
  */
 import { isDelegateTerminalState, type DelegateJobState } from '@openclaude/protocol'
 import {
   sessionIdFromParentKey,
   type DelegateInflightSurfaceStore,
 } from './delegateInflightSurface.js'
-import type { DelegateJobStore } from './delegateJobs.js'
+import type { DelegateJobSnapshot, DelegateJobStore } from './delegateJobs.js'
 import { cancelDelegateTraceWait } from './delegateTrace.js'
 import type { SessionManager } from './sessionManager.js'
 
@@ -26,6 +31,7 @@ export interface DelegateCancelHost {
   delegateInflightSurface?: () => DelegateInflightSurfaceStore | undefined
   sessions: Pick<SessionManager, 'getByKey' | 'interrupt'>
   _delegateQueueWaiters?: Map<string, () => void>
+  _activeDelegationsByParent?: Map<string, Set<string>>
   _interruptDelegationsForParent(parentSessionKey: string): boolean
 }
 
@@ -36,6 +42,72 @@ export type CancelSingleDelegateJobResult =
 function belongsToSession(parentSessionKey: string | undefined, sessionId: string): boolean {
   if (!parentSessionKey || !sessionId) return false
   return sessionIdFromParentKey(parentSessionKey) === sessionId
+}
+
+function interruptChildSession(host: DelegateCancelHost, childSessionKey: string): boolean {
+  let confirmed = false
+  if (cancelDelegateTraceWait(host.traceHost ?? host, childSessionKey)) {
+    confirmed = true
+  }
+  const wakeQueued = host._delegateQueueWaiters?.get(childSessionKey)
+  if (wakeQueued) {
+    host._delegateQueueWaiters?.delete(childSessionKey)
+    try {
+      wakeQueued()
+      confirmed = true
+    } catch {
+      /* ignore */
+    }
+  }
+  try {
+    if (host._interruptDelegationsForParent(childSessionKey)) {
+      confirmed = true
+    }
+  } catch {
+    /* ignore */
+  }
+  if (host.sessions.getByKey(childSessionKey)) {
+    try {
+      if (host.sessions.interrupt(childSessionKey, 'user')) {
+        confirmed = true
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return confirmed
+}
+
+function resolveUniqueSyncChildKey(
+  host: DelegateCancelHost,
+  parentSessionKey: string,
+  agentId: string,
+  runId: string,
+): string | null {
+  const activeChildren = host._activeDelegationsByParent?.get(parentSessionKey)
+  if (!activeChildren || activeChildren.size === 0) return null
+  const all = [...activeChildren]
+
+  // 1. Prefer exact runId match in child session key (or live session metadata if present).
+  if (runId) {
+    const byRunId = all.filter((childKey) => {
+      if (childKey.includes(runId)) return true
+      const sess = host.sessions.getByKey(childKey) as
+        | { delegateRunId?: string; runId?: string }
+        | undefined
+      return sess?.delegateRunId === runId || sess?.runId === runId
+    })
+    if (byRunId.length === 1) return byRunId[0]!
+    if (byRunId.length > 1) return null
+  }
+
+  // 2. Fallback: unambiguous single active delegation for this agent under the same parent.
+  if (agentId) {
+    const prefix = `agent:${agentId}:delegate:`
+    const byAgent = all.filter((childKey) => childKey.startsWith(prefix))
+    if (byAgent.length === 1) return byAgent[0]!
+  }
+  return null
 }
 
 export function cancelSingleDelegateJob(
@@ -64,42 +136,33 @@ export function cancelSingleDelegateJob(
       return { ok: true, cancelled: false, state: job.state }
     }
 
-    const childSessionKey = job.sessionKey
-    if (childSessionKey) {
-      cancelDelegateTraceWait(host.traceHost ?? host, childSessionKey)
-      const wakeQueued = host._delegateQueueWaiters?.get(childSessionKey)
-      if (wakeQueued) {
-        host._delegateQueueWaiters?.delete(childSessionKey)
-        try {
-          wakeQueued()
-        } catch {
-          /* ignore */
-        }
-      }
-      try {
-        host._interruptDelegationsForParent(childSessionKey)
-      } catch {
-        /* ignore */
-      }
-      if (host.sessions.getByKey(childSessionKey)) {
-        try {
-          host.sessions.interrupt(childSessionKey, 'user')
-        } catch {
-          /* ignore */
-        }
-      }
+    if (job.sessionKey) {
+      interruptChildSession(host, job.sessionKey)
     }
 
-    const failed = jobs!.fail(jid, {
-      failureClass: 'cancelled',
-      detail: 'user-cancelled',
-      httpStatus: 409,
-      nextState: 'cancelled',
-      body: { cancelled: true },
-      ...(job.claimToken ? { claimToken: job.claimToken, fencingEpoch: job.fencingEpoch } : {}),
-    })
+    const attemptFail = (snap: DelegateJobSnapshot): boolean =>
+      jobs!.fail(jid, {
+        failureClass: 'cancelled',
+        detail: 'user-cancelled',
+        httpStatus: 409,
+        nextState: 'cancelled',
+        body: { cancelled: true },
+        ...(snap.claimToken ? { claimToken: snap.claimToken, fencingEpoch: snap.fencingEpoch } : {}),
+      })
 
-    const after = jobs!.snapshotOf(jid)
+    let failed = attemptFail(job)
+    let after = jobs!.snapshotOf(jid)
+
+    // Retry CAS once with fresh token/epoch if job is still non-terminal (e.g., queued -> running race).
+    if (!failed && after && !isDelegateTerminalState(after.state)) {
+      if (after.sessionKey && after.sessionKey !== job.sessionKey) {
+        interruptChildSession(host, after.sessionKey)
+      }
+      failed = attemptFail(after)
+      after = jobs!.snapshotOf(jid)
+    }
+
+    // Only project to surface and report 200 when the authoritative job row is confirmed terminal.
     if (after && isDelegateTerminalState(after.state)) {
       try {
         surface?.projectJob(after)
@@ -113,26 +176,15 @@ export function cancelSingleDelegateJob(
       }
     }
 
-    if (surface?.get(jid)) {
-      try {
-        surface.updateLive({
-          jobId: jid,
-          state: 'cancelled',
-          liveHint: '',
-          authoritative: true,
-        })
-      } catch {
-        /* fail-open */
-      }
-    }
     return {
-      ok: true,
-      cancelled: failed,
-      state: after?.state ?? 'cancelled',
+      ok: false,
+      status: 409,
+      code: 'DELEGATE_CANCEL_CONFLICT',
+      error: 'delegate job could not be transitioned to cancelled',
     }
   }
 
-  // Fallback for surface-only (e.g., sync delegate or expired job handle still visible in surface).
+  // Surface-only fallback (e.g., sync delegate): must confirm real handle interruption first.
   const row = surface?.get(jid)
   if (!row || !belongsToSession(row.parentSessionKey, sid)) {
     return { ok: false, status: 404, code: 'NOT_FOUND', error: 'delegate job not found' }
@@ -140,6 +192,23 @@ export function cancelSingleDelegateJob(
   if (isDelegateTerminalState(row.state)) {
     return { ok: true, cancelled: false, state: row.state }
   }
+
+  const matchedChildKey = resolveUniqueSyncChildKey(
+    host,
+    row.parentSessionKey,
+    row.agentId,
+    row.runId,
+  )
+  const confirmed = matchedChildKey ? interruptChildSession(host, matchedChildKey) : false
+  if (!confirmed) {
+    return {
+      ok: false,
+      status: 409,
+      code: 'DELEGATE_CANCEL_UNCONFIRMED',
+      error: 'no live delegate handle confirmed for cancellation',
+    }
+  }
+
   try {
     surface!.updateLive({
       jobId: jid,

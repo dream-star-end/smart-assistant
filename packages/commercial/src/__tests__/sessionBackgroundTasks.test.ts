@@ -22,6 +22,7 @@ import { createCommercialHandler } from '../http/router.js'
 import type { MuseBilling } from '../muse/billing.js'
 import type { MuseDurability, MuseDurableState } from '../muse/durable.js'
 import { MuseBridgeHub } from '../muse/hub.js'
+import { MuseError } from '../muse/protocol.js'
 import type {
   MuseJobFinish,
   MuseJobInsert,
@@ -313,6 +314,65 @@ describe('MuseBridgeHub session jobs query & cancel (OCV5-844)', () => {
       rmSync(root, { recursive: true, force: true })
     }
   })
+
+  it('throws 503 MUSE_CANCEL_PERSIST_FAILED instead of returning 200 when durable PG cancel fails', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'oc-muse-pgfail-'))
+    const store = new FakeMuseStore()
+    store.finishJob = async () => {
+      throw new Error('pg write failed')
+    }
+    store.cancelSessionJob = async () => {
+      throw new Error('pg conditional cancel failed')
+    }
+    const hub = new MuseBridgeHub({
+      store,
+      durability: store,
+      stateRoot: root,
+      allowedUids: 'all',
+      rate: { imagePerHour: 100, imagePerDay: 100, videoPerHour: 100, videoPerDay: 100 },
+      cliTimeoutSec: { image: 60, video: 300 },
+    })
+    try {
+      hub.hello('cred-1', '0.5.0')
+      const jobId = await hub.submit(
+        '101',
+        null,
+        { kind: 'video', prompt: 'fail pg persist' },
+        { sessionKey: 'agent:main:webchat:dm:sess-pgfail' },
+      )
+      await assert.rejects(
+        () => hub.cancelSessionJob('101', 'sess-pgfail', jobId),
+        (err: unknown) =>
+          err instanceof MuseError &&
+          err.status === 503 &&
+          err.code === 'MUSE_CANCEL_PERSIST_FAILED',
+      )
+
+      // Also verify HTTP route maps MuseError(503) cleanly to 503 MUSE_CANCEL_PERSIST_FAILED
+      const httpHandler = createCommercialHandler({
+        jwtSecret: JWT_SECRET,
+        mailer: { send: async () => {} } as unknown as Mailer,
+        redis: { incr: async () => 1, expire: async () => 1 },
+        verifyActiveAccount: async () => true,
+        museHub: hub,
+        sessionBackgroundTasksRouteDeps: {
+          skipDbActiveCheck: true,
+          verifySessionOwnership: async () => 'owner',
+        },
+      })
+      const r503 = makeRes()
+      const tok = await makeJwt('101')
+      await httpHandler(
+        makeReq({ method: 'POST', url: `/api/sessions/sess-pgfail/muse-jobs/${jobId}/cancel`, token: tok }),
+        r503.res,
+      )
+      assert.equal(r503.read().status, 503)
+      assert.equal((r503.read().json?.error as { code?: string })?.code, 'MUSE_CANCEL_PERSIST_FAILED')
+    } finally {
+      await hub.stop()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('sessionBackgroundTasksProxy HTTP routes (OCV5-844)', () => {
@@ -397,17 +457,19 @@ describe('sessionBackgroundTasksProxy HTTP routes (OCV5-844)', () => {
       await handler(makeReq({ method: 'GET', url: '/api/sessions/sess-other-02/background-tasks', token: tok }), r403.res)
       assert.equal(r403.read().status, 403)
 
-      // 404 missing session
+      // 404 missing session returns SESSION_NOT_FOUND (so frontend distinguishes from missing route)
       const r404 = makeRes()
       await handler(makeReq({ method: 'GET', url: '/api/sessions/sess-missing-99/background-tasks', token: tok }), r404.res)
       assert.equal(r404.read().status, 404)
+      assert.equal((r404.read().json?.error as { code?: string })?.code, 'SESSION_NOT_FOUND')
 
-      // 200 sleeping container: fail-open empty delegates & bgCommands, real museJobs, NEVER wakes container
+      // 200 sleeping container: fail-open empty delegates, bgCommands, sessionCrons; real museJobs; NEVER wakes container
       const rSleep = makeRes()
       await handler(makeReq({ method: 'GET', url: '/api/sessions/sess-mine-01/background-tasks', token: tok }), rSleep.res)
       assert.equal(rSleep.read().status, 200)
       assert.deepEqual(rSleep.read().json?.delegates, [])
       assert.deepEqual(rSleep.read().json?.bgCommands, [])
+      assert.deepEqual(rSleep.read().json?.sessionCrons, [])
       assert.equal((rSleep.read().json?.museJobs as unknown[]).length, 1)
 
       // 200 inflight-delegates while container sleeping: empty items, never wakes container
@@ -471,6 +533,18 @@ describe('sessionBackgroundTasksProxy HTTP routes (OCV5-844)', () => {
             nextCursor: null,
             truncated: false,
             bgCommands: [{ id: '444-ocb_1', jobId: 'ocb_1', commandPreview: 'npm test', startedAt: 1000, updatedAt: 1000 }],
+            sessionCrons: [
+              {
+                id: 'cron-live-1',
+                name: 'Follow up',
+                enabled: true,
+                schedule: '0 9 * * *',
+                message: 'check status',
+                nextRunAt: 1700003600000,
+                resume: 'origin-session',
+                sourceSessionKey: 'agent:main:webchat:dm:sess-run-01',
+              },
+            ],
           }),
         )
         return
@@ -519,6 +593,7 @@ describe('sessionBackgroundTasksProxy HTTP routes (OCV5-844)', () => {
       assert.equal(r1.read().status, 200)
       assert.equal((r1.read().json?.delegates as Array<{ jobId: string }>)[0]?.jobId, 'dlgjob-live-1')
       assert.equal((r1.read().json?.bgCommands as Array<{ id: string }>)[0]?.id, '444-ocb_1')
+      assert.equal((r1.read().json?.sessionCrons as Array<{ id: string }>)[0]?.id, 'cron-live-1')
       assert.deepEqual(r1.read().json?.museJobs, [])
 
       // 2. GET /api/sessions/:id/inflight-delegates reads real container delegates!

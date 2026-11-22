@@ -60,11 +60,12 @@ export type SessionBackgroundTasksSnapshot = {
   delegates: InflightDelegateItem[];
   museJobs: SessionMuseJobItem[];
   bgCommands: SessionBgCommandItem[];
+  sessionCrons: SessionCronItem[];
 };
 
 export type SessionBackgroundTasksFetchResult =
   | { ok: true; snapshot: SessionBackgroundTasksSnapshot }
-  | { ok: false; notFound: boolean };
+  | { ok: false; routeMissing: boolean; sessionNotReady: boolean };
 
 const MUSE_STATUS_SET = new Set<string>([
   "queued",
@@ -208,10 +209,17 @@ export function filterSessionOriginCrons(
     // 已触发完成的一次性续跑不再常驻胶囊
     if (oneshot && !enabled && nextRunAt === null && lastRunAt !== null) continue;
 
+    const promptText =
+      typeof o.prompt === "string"
+        ? o.prompt
+        : typeof o.message === "string"
+          ? o.message
+          : undefined;
+
     const rawName =
       (typeof o.name === "string" && o.name.trim()) ||
       (typeof o.label === "string" && o.label.trim()) ||
-      (typeof o.prompt === "string" && firstLinePreview(o.prompt)) ||
+      (promptText && firstLinePreview(promptText)) ||
       "定时续跑";
 
     out.push({
@@ -221,7 +229,7 @@ export function filterSessionOriginCrons(
       schedule: typeof o.schedule === "string" ? o.schedule : "",
       nextRunAt,
       oneshot,
-      prompt: typeof o.prompt === "string" ? o.prompt : undefined,
+      prompt: promptText,
       resume: "origin-session",
       sourceSessionKey: sourceKey,
     });
@@ -314,11 +322,40 @@ export function writeDismissedBgMedia(
   }
 }
 
+/**
+ * 区分「新会话尚未在服务端落行（404 SESSION_NOT_FOUND / session not found）」
+ * 与「服务端未挂载该路由（404 route missing）」：前者属于瞬态空态，不可永久拉黑后续刷新。
+ */
+export function isSessionNotReady404(body: unknown): boolean {
+  const rec = asRecord(body);
+  if (!rec) return false;
+  const errObj = asRecord(rec.error);
+  const code = (
+    (typeof rec.code === "string" ? rec.code : "") ||
+    (typeof errObj?.code === "string" ? errObj.code : "")
+  )
+    .trim()
+    .toUpperCase();
+  if (code === "SESSION_NOT_FOUND") return true;
+
+  const message = (
+    (typeof rec.message === "string" ? rec.message : "") ||
+    (typeof errObj?.message === "string" ? errObj.message : "") ||
+    (typeof rec.error === "string" ? rec.error : "")
+  )
+    .trim()
+    .toLowerCase();
+  if (!message) return false;
+  if (message.includes("route") || message.includes("cannot get")) return false;
+  if (message.includes("session") && message.includes("not found")) return true;
+  return false;
+}
+
 export async function fetchSessionBackgroundTasksResult(
   sessionId: string,
   auth: AuthSession,
 ): Promise<SessionBackgroundTasksFetchResult> {
-  if (!sessionId) return { ok: false, notFound: false };
+  if (!sessionId) return { ok: false, routeMissing: false, sessionNotReady: false };
   try {
     const res = await callWithRefresh(auth, (t) =>
       fetch(`/api/sessions/${encodeURIComponent(sessionId)}/background-tasks`, {
@@ -326,12 +363,19 @@ export async function fetchSessionBackgroundTasksResult(
         headers: bearerHeaders(t),
       }),
     );
-    if (res.status === 404) return { ok: false, notFound: true };
-    if (res.status !== 200) return { ok: false, notFound: false };
+    if (res.status === 404) {
+      const errBody = await res.json().catch(() => null);
+      const sessionNotReady = isSessionNotReady404(errBody);
+      return { ok: false, routeMissing: !sessionNotReady, sessionNotReady };
+    }
+    if (res.status !== 200) {
+      return { ok: false, routeMissing: false, sessionNotReady: false };
+    }
     const body = asRecord(await res.json());
     const rawDelegates = body && Array.isArray(body.delegates) ? body.delegates : [];
     const rawMuse = body && Array.isArray(body.museJobs) ? body.museJobs : [];
     const rawCmds = body && Array.isArray(body.bgCommands) ? body.bgCommands : [];
+    const rawCrons = body && Array.isArray(body.sessionCrons) ? body.sessionCrons : [];
 
     const delegates: InflightDelegateItem[] = [];
     for (const raw of rawDelegates) {
@@ -348,9 +392,10 @@ export async function fetchSessionBackgroundTasksResult(
       const item = normalizeSessionBgCommandItem(raw);
       if (item) bgCommands.push(item);
     }
-    return { ok: true, snapshot: { delegates, museJobs, bgCommands } };
+    const sessionCrons = filterSessionOriginCrons(rawCrons, sessionId);
+    return { ok: true, snapshot: { delegates, museJobs, bgCommands, sessionCrons } };
   } catch {
-    return { ok: false, notFound: false };
+    return { ok: false, routeMissing: false, sessionNotReady: false };
   }
 }
 

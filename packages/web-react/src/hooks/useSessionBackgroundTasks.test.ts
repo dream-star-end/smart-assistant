@@ -13,7 +13,9 @@ import {
   fetchSessionOriginCrons,
   filterSessionOriginCrons,
   formatCountdown,
+  isSessionNotReady404,
   updateSessionCronEnabled,
+  type SessionBackgroundTasksFetchResult,
   type SessionBgCommandItem,
   type SessionCronItem,
   type SessionMuseJobItem,
@@ -106,7 +108,7 @@ function mediaJob(over: Partial<MediaGenerationJob> = {}): MediaGenerationJob {
 }
 
 describe("sessionBackgroundTasks pure helpers", () => {
-  test("filterSessionOriginCrons 仅保留匹配当前 sessionId 且 resume=origin-session 的定时任务", () => {
+  test("filterSessionOriginCrons 仅保留匹配当前 sessionId 且 resume=origin-session 的定时任务并兼容 message 字段", () => {
     const now = Date.now();
     const out = filterSessionOriginCrons(
       [
@@ -115,6 +117,7 @@ describe("sessionBackgroundTasks pure helpers", () => {
           name: "本会话续跑",
           enabled: true,
           schedule: "*/15 * * * *",
+          message: "汇总测试覆盖率",
           nextRunAt: now + 600_000,
           resume: "origin-session",
           sourceSessionKey: "agent:main:webchat:dm:sess-a",
@@ -152,6 +155,19 @@ describe("sessionBackgroundTasks pure helpers", () => {
     );
     expect(out).toHaveLength(1);
     expect(out[0]?.id).toBe("c1");
+    expect(out[0]?.prompt).toBe("汇总测试覆盖率");
+  });
+
+  test("isSessionNotReady404 精确区分新会话未建行 404 与路由缺失 404", () => {
+    expect(isSessionNotReady404({ code: "SESSION_NOT_FOUND" })).toBe(true);
+    expect(isSessionNotReady404({ error: { code: "SESSION_NOT_FOUND", message: "missing" } })).toBe(true);
+    expect(isSessionNotReady404({ code: "NOT_FOUND", message: "session not found" })).toBe(true);
+    expect(isSessionNotReady404({ error: { code: "NOT_FOUND", message: "session not found" } })).toBe(true);
+
+    expect(isSessionNotReady404({ code: "NOT_FOUND", message: "session background task route not found" })).toBe(false);
+    expect(isSessionNotReady404({ code: "NOT_FOUND", message: "Not Found" })).toBe(false);
+    expect(isSessionNotReady404({ error: "Cannot GET /api/sessions/s1/background-tasks" })).toBe(false);
+    expect(isSessionNotReady404(null)).toBe(false);
   });
 
   test("formatCountdown 准确格式化倒计时文案", () => {
@@ -163,31 +179,98 @@ describe("sessionBackgroundTasks pure helpers", () => {
     expect(formatCountdown(now + 48 * 60 * 60_000, now)).toBe("2 天后");
     expect(formatCountdown(null, now)).toBe("");
   });
+
+  test("fetchSessionBackgroundTasksResult 实测解析 sessionCrons 与 404 分流（SESSION_NOT_FOUND vs 缺路由）", async () => {
+    const actual = await vi.importActual<typeof import("../lib/chat/sessionBackgroundTasks")>(
+      "../lib/chat/sessionBackgroundTasks",
+    );
+    const auth = createMemoryAuthSession(() => {}, "tok");
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    // 1. 404 SESSION_NOT_FOUND → sessionNotReady: true, routeMissing: false
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ code: "SESSION_NOT_FOUND", message: "session not found" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    expect(await actual.fetchSessionBackgroundTasksResult("s1", auth)).toEqual({
+      ok: false,
+      routeMissing: false,
+      sessionNotReady: true,
+    });
+
+    // 2. 404 路由缺失 → routeMissing: true, sessionNotReady: false
+    fetchSpy.mockResolvedValueOnce(new Response("Not Found", { status: 404 }));
+    expect(await actual.fetchSessionBackgroundTasksResult("s1", auth)).toEqual({
+      ok: false,
+      routeMissing: true,
+      sessionNotReady: false,
+    });
+
+    // 3. 200 聚合响应：仅发 /background-tasks，正确解析 sessionCrons
+    const nextRunAt = Date.now() + 300_000;
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          delegates: [],
+          museJobs: [],
+          bgCommands: [],
+          sessionCrons: [
+            {
+              id: "c1",
+              name: "定时复查",
+              enabled: true,
+              schedule: "*/10 * * * *",
+              message: "复查 CI 状态",
+              nextRunAt,
+              resume: "origin-session",
+              sourceSessionKey: "agent:main:webchat:dm:s1",
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const okRes = await actual.fetchSessionBackgroundTasksResult("s1", auth);
+    expect(okRes.ok).toBe(true);
+    if (okRes.ok) {
+      expect(okRes.snapshot.sessionCrons).toHaveLength(1);
+      expect(okRes.snapshot.sessionCrons[0]?.name).toBe("定时复查");
+      expect(okRes.snapshot.sessionCrons[0]?.prompt).toBe("复查 CI 状态");
+    }
+    expect(fetchSpy.mock.calls.every(([url]) => String(url).includes("/background-tasks"))).toBe(
+      true,
+    );
+  });
 });
 
 describe("useSessionBackgroundTasks", () => {
   const auth = createMemoryAuthSession(() => {}, "tok");
 
-  test("空闲会话只拉 1 次，0 轮询", async () => {
+  test("进会话仅发 /background-tasks 零发 /api/cron，空闲时 0 轮询", async () => {
     vi.useFakeTimers();
     vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    const cron = cronItem();
     vi.mocked(fetchSessionBackgroundTasksResult).mockResolvedValue({
       ok: true,
-      snapshot: { delegates: [], museJobs: [], bgCommands: [] },
+      snapshot: { delegates: [], museJobs: [], bgCommands: [], sessionCrons: [cron] },
     });
-    vi.mocked(fetchSessionOriginCrons).mockResolvedValue({ ok: true, items: [] });
 
     const { result } = renderHook(() =>
       useSessionBackgroundTasks({ sessionId: "s1", enabled: true, auth }),
     );
     await act(async () => {});
-    expect(result.current.hasAny).toBe(false);
+    expect(result.current.sessionCrons).toEqual([cron]);
+    expect(result.current.hasAny).toBe(true);
     expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(1);
-    expect(fetchSessionOriginCrons).toHaveBeenCalledTimes(1);
+    // 绝不直接发 GET /api/cron（防止首拉唤醒休眠容器）
+    expect(fetchSessionOriginCrons).not.toHaveBeenCalled();
 
+    // 仅有待触发定时续跑、无活跃运行项时：0 轮询
     await act(() => vi.advanceTimersByTimeAsync(30_000));
     expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(1);
-    expect(fetchSessionOriginCrons).toHaveBeenCalledTimes(1);
+    expect(fetchSessionOriginCrons).not.toHaveBeenCalled();
   });
 
   test("存在活跃后台命令/Muse 任务时开启 5s 轮询，隐藏暂停，切回前台立刻拉 1 次，终态后停止轮询", async () => {
@@ -198,10 +281,18 @@ describe("useSessionBackgroundTasks", () => {
     const running = museJob({ status: "running" });
     const done = { ...running, status: "succeeded" as const };
     vi.mocked(fetchSessionBackgroundTasksResult)
-      .mockResolvedValueOnce({ ok: true, snapshot: { delegates: [], museJobs: [running], bgCommands: [] } })
-      .mockResolvedValueOnce({ ok: true, snapshot: { delegates: [], museJobs: [running], bgCommands: [] } })
-      .mockResolvedValueOnce({ ok: true, snapshot: { delegates: [], museJobs: [done], bgCommands: [] } });
-    vi.mocked(fetchSessionOriginCrons).mockResolvedValue({ ok: true, items: [] });
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: { delegates: [], museJobs: [running], bgCommands: [], sessionCrons: [] },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: { delegates: [], museJobs: [running], bgCommands: [], sessionCrons: [] },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: { delegates: [], museJobs: [done], bgCommands: [], sessionCrons: [] },
+      });
 
     const { result } = renderHook(() =>
       useSessionBackgroundTasks({ sessionId: "s1", enabled: true, auth }),
@@ -210,16 +301,13 @@ describe("useSessionBackgroundTasks", () => {
     expect(result.current.museJobs).toHaveLength(1);
     expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(1);
 
-    // 5s 后触发第 2 次拉取
     await act(() => vi.advanceTimersByTimeAsync(5_000));
     expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(2);
 
-    // 隐藏标签页：跳过轮询
     vis = "hidden";
     await act(() => vi.advanceTimersByTimeAsync(15_000));
     expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(2);
 
-    // 切回前台：立刻拉第 3 次，收到终态
     vis = "visible";
     await act(async () => {
       document.dispatchEvent(new Event("visibilitychange"));
@@ -227,29 +315,127 @@ describe("useSessionBackgroundTasks", () => {
     expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(3);
     expect(result.current.museJobs[0]?.status).toBe("succeeded");
 
-    // 终态后停止轮询
     await act(() => vi.advanceTimersByTimeAsync(20_000));
     expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(3);
   });
 
-  test("/background-tasks 返回 404 时静默降级为空，不影响定时续跑与当前会话 mediaJobs", async () => {
-    vi.mocked(fetchSessionBackgroundTasksResult).mockResolvedValue({ ok: false, notFound: true });
-    vi.mocked(fetchSessionOriginCrons).mockResolvedValue({ ok: true, items: [cronItem()] });
+  test("Blocker 5: 首次 404 SESSION_NOT_FOUND（sessionNotReady）不永久拉黑，下一次 refreshTrigger 自动拉回任务", async () => {
+    vi.useFakeTimers();
+    const cmd = bgCmd();
+    const cron = cronItem();
+    vi.mocked(fetchSessionBackgroundTasksResult)
+      .mockResolvedValueOnce({ ok: false, routeMissing: false, sessionNotReady: true })
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: { delegates: [], museJobs: [], bgCommands: [cmd], sessionCrons: [cron] },
+      });
+
+    const { result, rerender } = renderHook(
+      ({ refreshTrigger }) =>
+        useSessionBackgroundTasks({ sessionId: "s-new", enabled: true, auth, refreshTrigger }),
+      { initialProps: { refreshTrigger: 0 } },
+    );
+    await act(async () => {});
+    expect(result.current.hasAny).toBe(false);
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(1);
+
+    // 首轮发送/完成后触发 refreshTrigger，未被拉黑，正常拉回后台任务
+    rerender({ refreshTrigger: 1 });
+    await act(() => vi.advanceTimersByTimeAsync(1_500));
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(2);
+    expect(result.current.bgCommands).toEqual([cmd]);
+    expect(result.current.sessionCrons).toEqual([cron]);
+    expect(result.current.hasAny).toBe(true);
+  });
+
+  test("缺路由 404（routeMissing）静默降级停止后续拉取，且不影响当前会话 mediaJobs", async () => {
+    vi.useFakeTimers();
+    vi.mocked(fetchSessionBackgroundTasksResult).mockResolvedValue({
+      ok: false,
+      routeMissing: true,
+      sessionNotReady: false,
+    });
 
     const liveMap = new Map<string, MediaGenerationJob>([
       ["mj-1", mediaJob({ id: "mj-1", sessionId: "s1" })],
       ["mj-other", mediaJob({ id: "mj-other", sessionId: "s2" })],
     ]);
 
-    const { result } = renderHook(() =>
-      useSessionBackgroundTasks({ sessionId: "s1", enabled: true, auth, liveMediaJobs: liveMap }),
+    const { result, rerender } = renderHook(
+      ({ refreshTrigger }) =>
+        useSessionBackgroundTasks({
+          sessionId: "s1",
+          enabled: true,
+          auth,
+          liveMediaJobs: liveMap,
+          refreshTrigger,
+        }),
+      { initialProps: { refreshTrigger: 0 } },
     );
     await act(async () => {});
     expect(result.current.museJobs).toEqual([]);
     expect(result.current.bgCommands).toEqual([]);
-    expect(result.current.sessionCrons).toHaveLength(1);
+    expect(result.current.sessionCrons).toEqual([]);
     expect(result.current.mediaJobs.map((j) => j.id)).toEqual(["mj-1"]);
     expect(result.current.hasAny).toBe(true);
+
+    // 后续 refreshTrigger 不再重试已判定缺失的路由
+    rerender({ refreshTrigger: 1 });
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(1);
+  });
+
+  test("请求序号保护：在途旧轮询响应滞后到达时，绝不覆盖更新的取消快照", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+
+    const cmd = bgCmd({ id: "42-ocb_1" });
+    let resolveStalePoll!: (r: SessionBackgroundTasksFetchResult) => void;
+    const stalePollPromise = new Promise<SessionBackgroundTasksFetchResult>((r) => {
+      resolveStalePoll = r;
+    });
+
+    vi.mocked(fetchSessionBackgroundTasksResult)
+      // 第 1 次：进会话拉到运行中的后台命令
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: { delegates: [], museJobs: [], bgCommands: [cmd], sessionCrons: [] },
+      })
+      // 第 2 次：5s 定时轮询发出但滞后（包含未取消前的旧快照）
+      .mockReturnValueOnce(stalePollPromise)
+      // 第 3 次：cancelBgCommand 成功后立刻触发的新拉取（已为空）
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: { delegates: [], museJobs: [], bgCommands: [], sessionCrons: [] },
+      });
+
+    vi.mocked(cancelSessionBgCommand).mockResolvedValueOnce({ ok: true, cancelled: true });
+
+    const { result } = renderHook(() =>
+      useSessionBackgroundTasks({ sessionId: "s1", enabled: true, auth }),
+    );
+    await act(async () => {});
+    expect(result.current.bgCommands).toEqual([cmd]);
+
+    // 触发第 2 次 5s 轮询（滞留在途）
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(2);
+
+    // 在途轮询尚未返回时，用户点击终止并成功，触发第 3 次拉取
+    await act(async () => {
+      expect(await result.current.cancelBgCommand("42-ocb_1")).toBe(true);
+    });
+    expect(fetchSessionBackgroundTasksResult).toHaveBeenCalledTimes(3);
+    expect(result.current.bgCommands).toEqual([]);
+
+    // 此时旧的在途轮询才返回包含 cmd 的过期快照 → 必须被丢弃，不能复活已终止命令
+    await act(async () => {
+      resolveStalePoll({
+        ok: true,
+        snapshot: { delegates: [], museJobs: [], bgCommands: [cmd], sessionCrons: [] },
+      });
+    });
+    expect(result.current.bgCommands).toEqual([]);
   });
 
   test("行内干预动作：cancelMuseJob / cancelBgCommand / toggleSessionCron / deleteSessionCron / dismissMuseJob", async () => {
@@ -261,7 +447,7 @@ describe("useSessionBackgroundTasks", () => {
     vi.mocked(fetchSessionBackgroundTasksResult)
       .mockResolvedValueOnce({
         ok: true,
-        snapshot: { delegates: [], museJobs: [mRunning, mDone], bgCommands: [cmd] },
+        snapshot: { delegates: [], museJobs: [mRunning, mDone], bgCommands: [cmd], sessionCrons: [cron] },
       })
       .mockResolvedValueOnce({
         ok: true,
@@ -269,6 +455,7 @@ describe("useSessionBackgroundTasks", () => {
           delegates: [],
           museJobs: [{ ...mRunning, status: "cancelled" }, mDone],
           bgCommands: [cmd],
+          sessionCrons: [cron],
         },
       })
       .mockResolvedValueOnce({
@@ -277,12 +464,27 @@ describe("useSessionBackgroundTasks", () => {
           delegates: [],
           museJobs: [{ ...mRunning, status: "cancelled" }, mDone],
           bgCommands: [],
+          sessionCrons: [cron],
+        },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: {
+          delegates: [],
+          museJobs: [{ ...mRunning, status: "cancelled" }, mDone],
+          bgCommands: [],
+          sessionCrons: [{ ...cron, enabled: false }],
+        },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        snapshot: {
+          delegates: [],
+          museJobs: [{ ...mRunning, status: "cancelled" }, mDone],
+          bgCommands: [],
+          sessionCrons: [],
         },
       });
-    vi.mocked(fetchSessionOriginCrons)
-      .mockResolvedValueOnce({ ok: true, items: [cron] })
-      .mockResolvedValueOnce({ ok: true, items: [{ ...cron, enabled: false }] })
-      .mockResolvedValueOnce({ ok: true, items: [] });
 
     vi.mocked(cancelSessionMuseJob).mockResolvedValue({ ok: true, cancelled: true, status: "cancelled" });
     vi.mocked(cancelSessionBgCommand).mockResolvedValue({ ok: true, cancelled: true });
@@ -319,6 +521,7 @@ describe("useSessionBackgroundTasks", () => {
     });
     expect(deleteSessionCronJob).toHaveBeenCalledWith("cron-1", auth);
     expect(result.current.sessionCrons).toEqual([]);
+    expect(fetchSessionOriginCrons).not.toHaveBeenCalled();
 
     act(() => {
       result.current.dismissMuseJob("m-done");
@@ -386,11 +589,9 @@ describe("cross-session & trigger helpers", () => {
     );
     expect(result.current.has("s1")).toBe(true);
 
-    // 切去 s2：后台 s1 仍在运行，仍保留在 swarmSessionIds 中
     rerender({ activeId: "s2", latestSwarm: null, version: 2 });
     expect(result.current.has("s1")).toBe(true);
 
-    // s1 蜂群完成：自动移除
     msgsBySession.s1 = [
       { id: "m1", role: "tool", toolName: "SwarmBoard", text: "", ts: 1, _swarmSnapshot: completedSwarm } as ChatMessage,
     ];
@@ -421,18 +622,15 @@ describe("cross-session & trigger helpers", () => {
     expect(result.current.delegateRefreshTrigger).toBe(0);
     expect(result.current.bgTasksRefreshTrigger).toBe(0);
 
-    // 出现委派块 → 触发 delegateRefreshTrigger
     msgs.push({ id: "d1", role: "agent-group", text: "", ts: 1 } as ChatMessage);
     rerender({ wsSending: true, wsMessages: msgs, chatVersion: 2, mediaJobVersion: 0 });
     expect(result.current.delegateRefreshTrigger).toBe(1);
     expect(result.current.bgTasksRefreshTrigger).toBe(0);
 
-    // wsSending true -> false → 双方各触发 1 次
     rerender({ wsSending: false, wsMessages: msgs, chatVersion: 3, mediaJobVersion: 0 });
     expect(result.current.delegateRefreshTrigger).toBe(2);
     expect(result.current.bgTasksRefreshTrigger).toBe(1);
 
-    // mediaJobVersion 递增 → 触发 bgTasksRefreshTrigger
     rerender({ wsSending: false, wsMessages: msgs, chatVersion: 3, mediaJobVersion: 1 });
     expect(result.current.bgTasksRefreshTrigger).toBe(2);
   });

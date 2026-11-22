@@ -67,6 +67,10 @@ import { isPatrolSessionKey } from '../taskboard/domain.js'
 import { handleChatProjectsHttp } from './chatProjects.js'
 import type { GatewayHttpIo } from './httpIo.js'
 import { handleProjectAssetsHttp } from './projectAssets.js'
+import {
+  listSessionOriginCrons,
+  type CronJobsWithMetaReader,
+} from './sessionBackgroundRoute.js'
 
 export interface ClientSessionsHttpIo extends GatewayHttpIo {
   sendSessionReadFailure(
@@ -85,6 +89,7 @@ export interface ClientSessionsHttpIo extends GatewayHttpIo {
   delegateJobs(): DelegateJobStore | undefined
   ensureDelegateInflightSurface(): DelegateInflightSurfaceStore
   delegateCancelHost?(): DelegateCancelHost
+  listCronJobsWithMeta?: CronJobsWithMetaReader
   advisorConfigStore(): AdvisorConfigStore
 }
 
@@ -823,7 +828,8 @@ export function handleClientSessionsHttp(
         }
       }
       const bgCommands = listSessionBgCommands(sessId)
-      io.sendJson(res, 200, { delegates, museJobs: [], bgCommands })
+      const sessionCrons = await listSessionOriginCrons(sessId, io.listCronJobsWithMeta)
+      io.sendJson(res, 200, { delegates, museJobs: [], bgCommands, sessionCrons })
     })().catch((error: unknown) =>
       io.sendSessionReadFailure(res, error, sessId, 'background tasks read failed'),
     )

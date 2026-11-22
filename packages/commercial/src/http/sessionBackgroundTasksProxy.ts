@@ -21,6 +21,7 @@ import {
 import { getV3ContainerStatus, type V3ContainerStatus } from '../agent-sandbox/v3supervisor.js'
 import { getPool } from '../db/index.js'
 import type { MuseSessionJobView } from '../muse/hub.js'
+import { MuseError } from '../muse/protocol.js'
 import { MASTER_USER_PREFIX } from '../wechat/userIds.js'
 import { authenticateActiveCommercialUser } from './activeUserAuth.js'
 import {
@@ -141,6 +142,7 @@ interface ContainerBackgroundStatePayload {
   nextCursor: string | null
   truncated: boolean
   bgCommands: unknown[]
+  sessionCrons: unknown[]
 }
 
 async function fetchContainerBackgroundStateFailOpen(
@@ -155,6 +157,7 @@ async function fetchContainerBackgroundStateFailOpen(
     nextCursor: null,
     truncated: false,
     bgCommands: [],
+    sessionCrons: [],
   }
   let running: { status: V3ContainerStatus; clientDeps: ContainerInternalClientDeps } | null
   try {
@@ -186,6 +189,7 @@ async function fetchContainerBackgroundStateFailOpen(
       nextCursor: typeof parsed.nextCursor === 'string' ? parsed.nextCursor : null,
       truncated: parsed.truncated === true,
       bgCommands: Array.isArray(parsed.bgCommands) ? parsed.bgCommands : [],
+      sessionCrons: Array.isArray(parsed.sessionCrons) ? parsed.sessionCrons : [],
     }
   } catch {
     return empty
@@ -291,7 +295,7 @@ export async function handleCommercialSessionBackgroundTasks(
     throw new HttpError(403, 'FORBIDDEN', 'session does not belong to user')
   }
   if (ownership === 'not_found') {
-    throw new HttpError(404, 'NOT_FOUND', 'session not found')
+    throw new HttpError(404, 'SESSION_NOT_FOUND', 'session not found')
   }
 
   const uid = BigInt(user.id)
@@ -307,6 +311,7 @@ export async function handleCommercialSessionBackgroundTasks(
       delegates: containerState.delegates,
       museJobs,
       bgCommands: containerState.bgCommands,
+      sessionCrons: containerState.sessionCrons,
     })
     return
   }
@@ -360,7 +365,15 @@ export async function handleCommercialSessionBackgroundTasks(
     if (!deps.museHub) {
       throw new HttpError(404, 'NOT_FOUND', 'muse job not found')
     }
-    const result = await deps.museHub.cancelSessionJob(user.id, sessionId, jobId)
+    let result
+    try {
+      result = await deps.museHub.cancelSessionJob(user.id, sessionId, jobId)
+    } catch (err) {
+      if (err instanceof MuseError) {
+        throw new HttpError(err.status, err.code, err.message)
+      }
+      throw err
+    }
     if (!result) {
       throw new HttpError(404, 'NOT_FOUND', 'muse job not found')
     }

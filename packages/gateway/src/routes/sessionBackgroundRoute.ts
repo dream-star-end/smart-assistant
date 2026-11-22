@@ -12,9 +12,11 @@
  *     `client_sessions` ownership.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { CronJob } from '../cron.js'
 import { cancelSingleDelegateJob, type DelegateCancelHost } from '../delegateCancel.js'
 import {
   INFLIGHT_GET_DEFAULT_LIMIT,
+  sessionIdFromParentKey,
   type DelegateInflightSurfaceStore,
 } from '../delegateInflightSurface.js'
 import type { DelegateJobStore } from '../delegateJobs.js'
@@ -31,6 +33,71 @@ import {
 } from './internalBridgeAuth.js'
 import type { PreAuthRoutesIo } from './preAuth.js'
 import { type HttpRoute, predicateRoute } from './routeTable.js'
+
+export interface SessionOriginCronItem {
+  id: string
+  name: string
+  enabled: boolean
+  schedule: string
+  message?: string
+  nextRunAt: number | null
+  oneshot?: boolean
+  resume: 'origin-session'
+  sourceSessionKey: string
+}
+
+export type CronJobsWithMetaReader = () => Promise<
+  Array<CronJob & { nextRunAt?: string | number; lastRunAt?: string }>
+>
+
+export async function listSessionOriginCrons(
+  sessionId: string,
+  listJobsWithMeta?: CronJobsWithMetaReader,
+): Promise<SessionOriginCronItem[]> {
+  const sid = sessionId.trim()
+  if (!sid || !listJobsWithMeta) return []
+  let jobs: Array<CronJob & { nextRunAt?: string | number }>
+  try {
+    jobs = await listJobsWithMeta()
+  } catch {
+    return []
+  }
+  const items: SessionOriginCronItem[] = []
+  for (const job of jobs) {
+    if (job.resume !== 'origin-session') continue
+    if (typeof job.sourceSessionKey !== 'string' || !job.sourceSessionKey.trim()) continue
+    if (sessionIdFromParentKey(job.sourceSessionKey) !== sid) continue
+    const rawPrompt = typeof job.prompt === 'string' ? job.prompt.replace(/\s+/g, ' ').trim() : ''
+    const name = (typeof job.label === 'string' ? job.label.trim() : '') || rawPrompt.slice(0, 80) || job.id
+    const message = rawPrompt ? rawPrompt.slice(0, 240) : undefined
+    let nextRunAt: number | null = null
+    if (typeof job.nextRunAt === 'number' && Number.isFinite(job.nextRunAt)) {
+      nextRunAt = job.nextRunAt
+    } else if (typeof job.nextRunAt === 'string' && job.nextRunAt.trim()) {
+      const parsed = Date.parse(job.nextRunAt)
+      if (Number.isFinite(parsed)) nextRunAt = parsed
+    }
+    items.push({
+      id: job.id,
+      name,
+      enabled: job.enabled !== false,
+      schedule: job.schedule,
+      ...(message ? { message } : {}),
+      nextRunAt,
+      ...(job.oneshot ? { oneshot: true } : {}),
+      resume: 'origin-session',
+      sourceSessionKey: job.sourceSessionKey,
+    })
+  }
+  items.sort((a, b) => {
+    if (a.enabled !== b.enabled) return a.enabled ? -1 : 1
+    if (a.nextRunAt !== null && b.nextRunAt !== null) return a.nextRunAt - b.nextRunAt
+    if (a.nextRunAt !== null) return -1
+    if (b.nextRunAt !== null) return 1
+    return a.id.localeCompare(b.id)
+  })
+  return items
+}
 
 export const INTERNAL_SESSION_BG_STATE_RE =
   /^\/internal\/sessions\/([^/]+)\/background-state$/
@@ -53,6 +120,7 @@ export interface InternalSessionBackgroundDeps {
   delegateJobs?: () => DelegateJobStore | undefined
   ensureDelegateInflightSurface?: () => DelegateInflightSurfaceStore
   delegateCancelHost?: () => DelegateCancelHost
+  listCronJobsWithMeta?: CronJobsWithMetaReader
   bgCommandsRegistryDir?: string
   bgCommandsOps?: SessionBgCommandsOps
 }
@@ -195,12 +263,14 @@ export async function handleInternalSessionBackgroundState(
     deps.bgCommandsRegistryDir,
     deps.bgCommandsOps,
   )
+  const sessionCrons = await listSessionOriginCrons(sessionId, deps.listCronJobsWithMeta)
 
   sendJson(res, 200, {
     delegates,
     nextCursor,
     truncated,
     bgCommands,
+    sessionCrons,
   })
 }
 
@@ -284,6 +354,7 @@ export const SESSION_BACKGROUND_INTERNAL_ROUTES: readonly HttpRoute<PreAuthRoute
       handleInternalSessionBackgroundState(req, res, url, {
         delegateJobs: io.delegateJobs,
         ensureDelegateInflightSurface: io.ensureDelegateInflightSurface,
+        listCronJobsWithMeta: io.listCronJobsWithMeta,
       }).catch((err) => {
         io.log.error('internal session background-state handler crashed', undefined, err as Error)
         if (!res.headersSent) {
