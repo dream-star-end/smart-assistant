@@ -1,8 +1,5 @@
 import {
   readLatestCodexNativeHandoff,
-  runnerShutdownTimeoutMs,
-  waitForCloseWithin,
-  killCodexProcessGroup,
   abortableDelay,
   normalisePrompt,
   isInlinePushProcLive,
@@ -25,54 +22,27 @@ import { _codexMemoryTurnEnv } from './codexMemoryTurnEnv.js'
 export { _codexMemoryTurnEnv } from './codexMemoryTurnEnv.js'
 import { EventEmitter } from 'node:events'
 import type { IntelligentUiApplied } from '../promptSlots.js'
-import {
-  mkdtempSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  AUTOMATIC_TURN_RETRY_MAX,
-  type CallTokenUsageSnapshot,
   type GoalStateSnapshot,
   type ServiceTier,
   type ToolTerminationReason,
   type TurnTokenUsageSnapshot,
-  codexTransportModelId,
-  isToolExitCode,
   normalizeServiceTierForModel,
-  turnErrorSemantics,
 } from '@openclaude/protocol'
-import { type OpenClaudeConfig, paths } from '@openclaude/storage'
-import { type CodexLaunchOverrides, buildCodexLaunchOverrides } from '../codexLaunchOverrides.js'
+import { type OpenClaudeConfig } from '@openclaude/storage'
+import { type CodexLaunchOverrides, shouldOmitPlatformMcp } from '../codexLaunchOverrides.js'
 import type { RepoSnapshot } from '../sessionRepoWorkspace.js'
 import {
   _sanitizeThreadId,
   buildCodexEnv,
-  buildCodexLongContextArgs,
-  buildCodexModelCatalogArgs,
-  buildCodexMultiAgentDisableArgs,
-  buildCodexProviderConfigArgs,
-  buildCodexReasoningSummaryArgs,
-  buildCodexTelemetryHardeningArgs,
   type CodexProviderConfigOverride,
-  codexReasoningEffortConfig,
-  copyImagePathsToPublicDir,
 } from './codexShared.js'
 import { V3_CODEX_RELAY_PREFIX } from '../v3CodexRelay.js'
 import { CodexRelayPathDeniedTracker } from './codexRelayPathGuard.js'
-import { shouldOmitPlatformMcp } from '../codexLaunchOverrides.js'
 import { writeCodexDelegateContext } from './codexDelegateContext.js'
-import {
-  buildAdvisorReadOnlyArgs, buildCodexThreadPolicyParams,
-  buildCodexTurnPolicyParams, ensureCodexTurnServiceTierSupported, readAdvisorReadOnlyConfig,
-} from './codexAdvisorReadOnly.js'
-import {
-  buildHermeticDenial,
-  isHermeticExecutionMethod,
-} from './codexHermeticPolicy.js'
 import { createLogger } from '../logger.js'
 import { type ClassifiedErrorCode, classifyRunError } from '../errorClassify.js'
 import { withCodexTurnTrace } from '../relayTrace.js'
@@ -84,46 +54,43 @@ import type {
 import {
   type PendingRequest,
   type CodexGoalBlock,
-  normalizeCodexGoal,
-  collabReceiverThreadIds,
-  collabAgentsStates,
-  collabTool,
-  collabStatus,
-  collabPrompt,
-  shortThreadId,
-  collabAgentInput,
-  summarizeCollabControl,
-  isTerminalCollabAgentStatus,
-  isErrorCollabAgentStatus,
-  codexToolOutcome,
-  type JsonRpcCallError,
-  isMissingRolloutError,
-  isGoalAlreadyClearedError,
-  type RunnerMessage,
   type CodexTokenBreakdown,
   _EMPTY_TOKEN_BREAKDOWN,
-  _coerceTokenBreakdown,
   _subtractTokenBreakdown,
-  _codexUsageToAnthropicShape,
-  _codexTurnUsageSnapshot,
-  _SUPPRESSED_ITEM_TYPES,
-  _normaliseCodexItemType,
-  _isContextCompactionItem,
-  _stringifyItemBounded,
   type RuntimeRateLimits,
-  _parseCodexRateLimits,
   type PendingCodexUserInput,
-  _classifyJsonRpcLine,
-  jsonRpcResult,
-  jsonRpcMethodNotFound,
-  jsonRpcInvalidParams,
-  asRecord,
-  codexReverseRpcKey,
-  normalizeCodexUserInput,
-  buildMcpElicitationContent,
-  summarizeCommandForDescription,
   stripShellWrapper,
 } from './codexAppServerProtocol.js'
+import {
+  type CodexRpcTransportHost,
+  platformGoalSignature as platformGoalSignatureImpl,
+  syncPlatformGoal as syncPlatformGoalImpl,
+  sendPermissionResponse as sendPermissionResponseImpl,
+  settlePendingUserInputsForTurn as settlePendingUserInputsForTurnImpl,
+  takePendingUserInput as takePendingUserInputImpl,
+  compactCurrentThreadForHandoff as compactCurrentThreadForHandoffImpl,
+  ensureLaunchOverrides as ensureLaunchOverridesImpl,
+  cleanupLaunchOverrides as cleanupLaunchOverridesImpl,
+  cleanupHermeticDir as cleanupHermeticDirImpl,
+  shutdown as shutdownImpl,
+  ensureSpawnedInternal as ensureSpawnedInternalImpl,
+  ensureSpawnedRemote as ensureSpawnedRemoteImpl,
+  failAllPending as failAllPendingImpl,
+  writeRaw as writeRawImpl,
+  sendRequest as sendRequestImpl,
+  buildCompactResumeParams,
+} from './codexRpcTransport.js'
+import {
+  type CodexTurnExecutionHost,
+  emitForcedShutdownResult as emitForcedShutdownResultImpl,
+  consumeActiveTurnUsage as consumeActiveTurnUsageImpl,
+  buildTurnStartParams as buildTurnStartParamsImpl,
+  startNewThread as startNewThreadImpl,
+  resetAttemptState as resetAttemptStateImpl,
+  verifyTurnServiceTier as verifyTurnServiceTierImpl,
+  shouldRetryTurnStart as shouldRetryTurnStartImpl,
+  runTurn as runTurnImpl,
+} from './codexTurnExecution.js'
 import {
   type CodexNotificationHost,
   type TurnRetryMeta,
@@ -170,16 +137,7 @@ export type { JsonRpcCallError, RuntimeRateLimits } from './codexAppServerProtoc
 
 export const log = createLogger({ module: 'codexAppServerRunner' })
 
-const RUNNER_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
-const RUNNER_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
-
-const NATIVE_COMPACTION_TIMEOUT_MS = 15 * 60_000
-
 // ── turn/start 窄路径自动重试(turn-retry 批,2026-07-18)──────────────────
-// 只重试 **turn/start 请求本身被拒**的窄路径(app-server 明确 JSON-RPC application
-// error + retryable 语义 + 本 attempt 零可观测输出/零 usage/零终态帧)。**status=
-// 'failed' 一律不重试**:实测②——failed 后 user input 已落 thread(rollout
-// response_item 在 API 调用前落盘且不回滚),重发 turn/start 会重复 user input。
 /** 第 N 次失败后、第 N+1 次尝试前的基础退避(index = 失败的 attempt 序号 − 1)。 */
 const RETRY_BACKOFFS_MS = [2_000, 5_000] as const
 const RETRY_JITTER_MS = 500
@@ -663,59 +621,11 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private platformGoalSignature(): string {
-    const goal = this.platformGoal
-    if (!goal || goal.status === 'cleared') return 'cleared'
-    return JSON.stringify({
-      goalId: goal.goalId,
-      stateRevision: goal.stateRevision,
-      objective: goal.objective,
-      status: goal.status,
-      tokenBudget: goal.tokenBudget,
-    })
+    return platformGoalSignatureImpl.call(this as unknown as CodexRpcTransportHost)
   }
 
-  private async syncPlatformGoal(): Promise<void> {
-    // thread/goal/set is outside the node's closed RPC grammar; goal cards stay container-side.
-    if (this.opts.remote) return
-    if (!this.platformGoalInitialized || !this.threadId || !this.attached) return
-    const signature = this.platformGoalSignature()
-    if (signature === this.syncedPlatformGoalSignature) return
-    const goal = this.platformGoal
-    const cleared = !goal || goal.status === 'cleared'
-    // app-server can deliver the matching notification synchronously from the
-    // same stdout chunk before this request Promise resumes. Stage the platform
-    // generation first so that notification is correlated to the mutation that
-    // caused it; restore the last successful stamp if the request itself fails.
-    const previousSignature = this.syncedPlatformGoalSignature
-    const previousGoal = this.syncedPlatformGoal
-    this.syncedPlatformGoalSignature = signature
-    // Keep a cleared platform snapshot for correlation so Codex's native
-    // thread/goal/cleared notification updates the existing card in place.
-    this.syncedPlatformGoal = goal ? structuredClone(goal) : null
-    try {
-      await this.sendRequest('thread/goal/set', {
-        threadId: this.threadId,
-        objective: cleared ? null : goal.objective,
-        status: cleared ? null : goal.status === 'completed' ? 'complete' : goal.status,
-        tokenBudget: cleared ? null : goal.tokenBudget,
-      })
-    } catch (err) {
-      // Clearing a goal the app-server never had = the desired state already
-      // holds; keep the staged 'cleared' stamp so the next turn short-circuits
-      // on signature instead of re-issuing the doomed RPC.
-      if (cleared && isGoalAlreadyClearedError(err)) {
-        log.info('codex thread/goal/set: no goal upstream — treating clear as no-op', {
-          sessionKey: this.opts.sessionKey,
-          threadId: this.threadId,
-        })
-        return
-      }
-      // SessionManager serializes setGoalState under the session lock, so no
-      // newer sync can legitimately supersede this staged value here.
-      this.syncedPlatformGoalSignature = previousSignature
-      this.syncedPlatformGoal = previousGoal
-      throw err
-    }
+  private syncPlatformGoal(): Promise<void> {
+    return syncPlatformGoalImpl.call(this as unknown as CodexRpcTransportHost)
   }
 
   // ── Phase 5 GitHub session repo binding (parity with SubprocessRunner) ──
@@ -801,69 +711,15 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   sendPermissionResponse(requestId: string, responseUnk: unknown): boolean {
-    const pending = this.pendingUserInputs.get(requestId)
-    if (!pending) return false
-
-    const response = asRecord(responseUnk)
-    const codexAnswers: Record<string, { answers: string[] }> = {}
-    if (response.behavior === 'allow') {
-      // server.ts already ran sanitizeAskUserQuestionUpdatedInput. Keep a
-      // defensive type/nonblank check here because EngineAdapter is a public
-      // seam and tests/other channels may call it directly.
-      const updatedInput = asRecord(response.updatedInput)
-      const answersByQuestionText = asRecord(updatedInput.answers)
-      for (const question of pending.questions) {
-        const answer = answersByQuestionText[question.question]
-        if (typeof answer !== 'string' || answer.trim().length === 0) continue
-        // Codex 0.144/0.149 has no multiSelect input field. Its response still
-        // uses an array so future/internal callers can express more than one
-        // value; the existing AskUserQuestion card supplies one string.
-        codexAnswers[question.id] = { answers: [answer] }
-      }
-    }
-
-    // A browser deny (or an allow whose already-sanitized answers somehow
-    // vanished) is represented by the schema-valid empty answers map. Codex
-    // app-server uses the same empty response after a client-side RPC error,
-    // so the model receives an explicit no-answer result instead of hanging.
-    const written = this.writeRaw(jsonRpcResult(pending.rpcId, { answers: codexAnswers }))
-    if (!written) return false
-    this.takePendingUserInput(requestId)
-    // Resume from human wait with a fresh liveness window, without waiting
-    // for upstream stdout. The status message below also emits adapter
-    // activity, renewing the independent 30min idle backstop.
-    this.lastActivityAt = Date.now()
-    this.emitUserInputWaitStatus()
-    return true
+    return sendPermissionResponseImpl.call(this as unknown as CodexRpcTransportHost, requestId, responseUnk)
   }
 
   private takePendingUserInput(requestId: string): PendingCodexUserInput | null {
-    const pending = this.pendingUserInputs.get(requestId)
-    if (!pending) return null
-    this.pendingUserInputs.delete(requestId)
-    this.pendingUserInputIdsByRpc.delete(pending.rpcKey)
-    return pending
+    return takePendingUserInputImpl.call(this as unknown as CodexRpcTransportHost, requestId)
   }
 
   private settlePendingUserInputsForTurn(turnId: string, reason: string): number {
-    const requestIds = [...this.pendingUserInputs.entries()]
-      .filter(([, pending]) => pending.turnId === turnId)
-      .map(([requestId]) => requestId)
-    for (const requestId of requestIds) {
-      const pending = this.takePendingUserInput(requestId)
-      if (!pending) continue
-      this.writeRaw(jsonRpcResult(pending.rpcId, { answers: {} }))
-    }
-    if (requestIds.length > 0) {
-      this.emitUserInputWaitStatus()
-      log.info('codex requestUserInput settled without browser answer', {
-        sessionKey: this.opts.sessionKey,
-        turnId,
-        count: requestIds.length,
-        reason,
-      })
-    }
-    return requestIds.length
+    return settlePendingUserInputsForTurnImpl.call(this as unknown as CodexRpcTransportHost, turnId, reason)
   }
 
   private settleAllPendingUserInputs(reason: string): void {
@@ -906,12 +762,10 @@ export class CodexAppServerRunner extends EventEmitter {
           const cwd = this._applyRepoBindingFromSnapshot(repo)
           await this.ensureSpawned(repo, cwd)
           assertCurrent()
-          const transportModel = codexTransportModelId(this.opts.model)
-          await this.sendRequest('thread/resume', {
-              ...(this.cachedOverrides?.instructionsContent !== undefined ? { baseInstructions: this.cachedOverrides.instructionsContent } : {}),
-            threadId: sourceThread, approvalPolicy: 'never', sandbox: 'danger-full-access', cwd,
-            ...(transportModel ? { model: transportModel } : {}),
-          })
+          await this.sendRequest(
+            'thread/resume',
+            buildCompactResumeParams(sourceThread, cwd, this.opts.model, this.cachedOverrides?.instructionsContent),
+          )
           assertCurrent()
           this.attached = true
         }
@@ -920,44 +774,8 @@ export class CodexAppServerRunner extends EventEmitter {
       }, { assertCurrent, beforeOwnedShutdown: () => { assertCurrent(); expectedGeneration++ } })
     } finally { this.compactPrivacyPreparing = false }
   }
-  private async compactCurrentThreadForHandoff(): Promise<NativeModelHandoffArtifact> {
-    if (!this.proc || !this.attached || !this.threadId) {
-      throw new Error('CODEX_NATIVE_COMPACTION_SESSION_NOT_READY')
-    }
-    if (this.processing || this.currentTurnCompleter || this.pendingNativeCompaction) {
-      throw new Error('CODEX_NATIVE_COMPACTION_BUSY')
-    }
-    const compactStartedAt = Date.now()
-    const completed = new Promise<void>((resolvePromise, rejectPromise) => {
-      const timer = setTimeout(() => {
-        if (this.pendingNativeCompaction?.startedAt !== compactStartedAt) return
-        this.pendingNativeCompaction = null
-        rejectPromise(new Error('CODEX_NATIVE_COMPACTION_TIMEOUT'))
-      }, NATIVE_COMPACTION_TIMEOUT_MS)
-      timer.unref?.()
-      this.pendingNativeCompaction = {
-        startedAt: compactStartedAt,
-        resolve: resolvePromise,
-        reject: rejectPromise,
-        timer,
-      }
-    })
-    try {
-      await this.sendRequest('thread/compact/start', { threadId: this.threadId })
-      await completed
-      const result = (await this.sendRequest('thread/read', {
-        threadId: this.threadId,
-        includeTurns: false,
-      })) as { thread?: { path?: unknown } }
-      const rolloutPath = result.thread?.path
-      if (typeof rolloutPath !== 'string' || !rolloutPath) {
-        throw new Error('CODEX_NATIVE_COMPACTION_PATH_MISSING')
-      }
-      return await readLatestCodexNativeHandoff(rolloutPath, compactStartedAt)
-    } catch (error) {
-      this.clearPendingNativeCompaction(compactStartedAt)
-      throw error
-    }
+  private compactCurrentThreadForHandoff(): Promise<NativeModelHandoffArtifact> {
+    return compactCurrentThreadForHandoffImpl.call(this as unknown as CodexRpcTransportHost)
   }
 
   private clearPendingNativeCompaction(compactStartedAt: number): void {
@@ -1041,79 +859,8 @@ export class CodexAppServerRunner extends EventEmitter {
    *
    *  `repoSnap` 由 caller(`ensureSpawned`)从 turn 顶部的单一 snapshot 透传过来,
    *  保证 launch overrides 的 REPO slot 与 spawn cwd / thread/start.cwd 用同一份。 */
-  private async ensureLaunchOverrides(
-    repoSnap: RepoSnapshot | null,
-  ): Promise<CodexLaunchOverrides | null> {
-    if (this.opts.hermeticNoTools) return null
-    if (!this.opts.config) return null
-    if (this.cachedOverrides && this.sessionDir) return this.cachedOverrides
-    // Cache miss with an existing sessionDir means updateConfig invalidated
-    // cachedOverrides while the dir was still bound. ensureLaunchOverrides is
-    // only called from ensureSpawned (proc===null guard), so by the time we
-    // reach this point the previous proc has exited.
-    if (this.sessionDir) {
-      try {
-        rmSync(this.sessionDir, { recursive: true, force: true })
-      } catch (err) {
-        log.warn('codex app-server stale sessionDir cleanup failed', {
-          sessionDir: this.sessionDir,
-          err: (err as Error).message,
-        })
-      }
-      this.sessionDir = null
-    }
-    const privacyGeneration = this._preheatGeneration
-    const dir = mkdtempSync(join(tmpdir(), 'oc-codex-app-'))
-    try {
-      const overrides = await buildCodexLaunchOverrides({
-        systemHelpContextFile: this.opts.systemHelpContextFile,
-        promptPolicy: this.promptPolicy,
-        agentId: this.opts.agentId,
-        sessionKey: this.opts.sessionKey,
-        persona: this.opts.persona,
-        identityCompat: this.opts.identityCompat,
-        provider: this.opts.agentProvider,
-        model: this.opts.model,
-        effortLevel: this.effortLevel,
-        sessionDir: dir,
-        claudeCodePath: this.opts.config.auth.claudeCodePath,
-        gatewayPort: this.opts.config.gateway.port,
-        gatewayToken: this.opts.config.gateway.accessToken,
-        delegationDepth: this.opts.delegationDepth,
-        // Phase 5:把 turn 顶部的 snapshot 一路透传到 buildPromptContext 的 REPO slot,
-        // 让 codex 系统提示中带上仓库元信息(parity with SubprocessRunner)。
-        repoSnapshot: repoSnap,
-        sessionId: this.opts.sessionId,
-        projectId: this.opts.projectId,
-        runContext: this.opts.runContext,
-        frozenProjectContext: this.opts.frozenProjectContext,
-        cwd: this.opts.cwd,
-        readOnly: this.advisorReadOnly,
-      })
-      if (privacyGeneration !== this._preheatGeneration) throw new Error('PROMPT_PRIVACY_SPAWN_STALE')
-      writeFileSync(overrides.instructionsFile, overrides.instructionsContent, 'utf8')
-      // v3 hardening — see codexRunner.ts for rationale (token never in argv).
-      if (overrides.tokenFile && overrides.tokenContent !== null) {
-        writeFileSync(overrides.tokenFile, overrides.tokenContent, { mode: 0o600 })
-      }
-      if (overrides.delegateContextFile && overrides.delegateContextContent !== null) {
-        writeFileSync(overrides.delegateContextFile, overrides.delegateContextContent, {
-          mode: 0o600,
-        })
-      }
-      this._promptIntelligentUi = overrides.intelligentUiApplied
-      this._promptPolicyFingerprint = overrides.promptPolicyFingerprint
-      this.sessionDir = dir
-      this.cachedOverrides = overrides
-      return overrides
-    } catch (err) {
-      try {
-        rmSync(dir, { recursive: true, force: true })
-      } catch {
-        /* swallow */
-      }
-      throw err
-    }
+  private ensureLaunchOverrides(repoSnap: RepoSnapshot | null): Promise<CodexLaunchOverrides | null> {
+    return ensureLaunchOverridesImpl.call(this as unknown as CodexRpcTransportHost, repoSnap)
   }
 
   private consultTurnBinding:
@@ -1145,35 +892,12 @@ export class CodexAppServerRunner extends EventEmitter {
     })
   }
 
-  /** Cleanup helper shared by `shutdown()` and the proc close handler so
-   *  override teardown happens regardless of which path tears the proc down
-   *  first. Idempotent. */
   private cleanupLaunchOverrides(): void {
-    if (this.sessionDir) {
-      try {
-        rmSync(this.sessionDir, { recursive: true, force: true })
-      } catch (err) {
-        log.warn('codex app-server session dir cleanup failed', {
-          sessionDir: this.sessionDir,
-          err: (err as Error).message,
-        })
-      }
-      this.sessionDir = null
-    }
-    this.cachedOverrides = null
+    cleanupLaunchOverridesImpl.call(this as unknown as CodexRpcTransportHost)
   }
 
   private cleanupHermeticDir(): void {
-    if (!this.hermeticDir) return
-    try {
-      rmSync(this.hermeticDir, { recursive: true, force: true })
-    } catch (err) {
-      log.warn('codex hermetic cwd cleanup failed', {
-        sessionKey: this.opts.sessionKey,
-        err: (err as Error).message,
-      })
-    }
-    this.hermeticDir = null
+    cleanupHermeticDirImpl.call(this as unknown as CodexRpcTransportHost)
   }
 
   async start(): Promise<void> {
@@ -1221,148 +945,8 @@ export class CodexAppServerRunner extends EventEmitter {
     })
   }
 
-  async shutdown(opts?: { keepQueuedTurns?: boolean }): Promise<void> {
-    // Same transient-shutdown semantics as CodexRunner: kill the current
-    // proc, drain queue, but allow subsequent submit() to respawn. effort
-    // switching and auth-token refresh paths rely on this.
-    const preserveNativeUsage = this.nativeContext.running
-    this.shuttingDown = true
-    this.nativeContext.abort(new Error('Native context compaction interrupted'))
-    this._preheatGeneration++
-    this._preheatPromise = null
-    this._preheatedSignature = null
-    if (this._unannouncedPreheatThread) {
-      this._unannouncedPreheatThread = false
-      this.clearSessionId()
-    }
-    // Hung initialize/preheat shares _spawnPromise with submit(). Drop it and
-    // reject pending JSON-RPC before waiting for the process so waiters fail
-    // closed instead of inheriting a never-settling handshake.
-    this._spawnPromise = null
-    // Abort backoff sleep or Ultrafast capability check before failing pending RPCs so waiters
-    // observe shutdown rather than misclassifying it as a user interrupt.
-    if (this.pendingRetryAbort) {
-      this.pendingRetryAbort.abort('shutdown')
-      this.pendingRetryAbort = null
-    }
-    for (const [, p] of this.pending) {
-      p.reject(new Error('CodexAppServerRunner shutdown'))
-    }
-    this.pending.clear()
-    if (!opts?.keepQueuedTurns) {
-      const pendingQueue = this.queue
-      this.queue = []
-      for (const q of pendingQueue) q.reject(new Error('CodexAppServerRunner shutdown'))
-    }
-    if (this.pendingNativeCompaction) {
-      const pending = this.pendingNativeCompaction
-      this.pendingNativeCompaction = null
-      clearTimeout(pending.timer)
-      pending.reject(new Error('CODEX_NATIVE_COMPACTION_INTERRUPTED'))
-    }
-    // Resolve app-server reverse requests while stdin is still writable. This
-    // mirrors a browser deny and prevents requestUserInput from surviving a
-    // transient runner recycle in either pending map.
-    this.settleAllPendingUserInputs('runner shutdown')
-    const proc = this.proc
-    if (proc) {
-      let resolveClose!: () => void
-      const closePromise = new Promise<void>((resolve) => {
-        resolveClose = resolve
-      })
-      const onClose = () => resolveClose()
-      proc.once('close', onClose)
-      if (proc.exitCode === null && proc.signalCode === null) {
-        if (this.opts.remote) {
-          // No local process group exists. The lane stop is the only effect; the relay child
-          // closes as soon as its poll loop can no longer reach the lane.
-          void this.opts.remote.stop().catch((err: Error) => {
-            log.warn('codex remote lane stop failed', { sessionKey: this.opts.sessionKey, err: err.message })
-          })
-          proc.kill()
-        } else {
-          killCodexProcessGroup(proc, 'SIGTERM')
-        }
-      }
-      let closed = await waitForCloseWithin(
-        closePromise,
-        runnerShutdownTimeoutMs(
-          'OPENCLAUDE_RUNNER_SHUTDOWN_GRACE_MS',
-          RUNNER_SHUTDOWN_GRACE_DEFAULT_MS,
-        ),
-      )
-      if (!closed) {
-        killCodexProcessGroup(proc, 'SIGKILL')
-        closed = await waitForCloseWithin(
-          closePromise,
-          runnerShutdownTimeoutMs(
-            'OPENCLAUDE_RUNNER_SHUTDOWN_FINAL_DRAIN_MS',
-            RUNNER_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS,
-          ),
-        )
-      }
-      if (!closed) {
-        proc.removeListener('close', onClose)
-        log.error('codex app-server close did not arrive after process-group SIGKILL', {
-          sessionKey: this.opts.sessionKey,
-          pid: proc.pid,
-        })
-        // Keep the exact process identity and stdout parser attached. A
-        // descendant may still own the pipe; clearing `this.proc` here used to
-        // discard those late bytes and let SessionManager finalize a partial
-        // immutable tape. The normal close handler will finish billing and the
-        // tape whenever the pipe actually closes. New submits remain queued
-        // behind `shuttingDown` rather than racing this unfinished turn.
-        return
-      }
-    }
-    // Reject any in-flight JSON-RPC requests so callers don't hang forever.
-    for (const [, p] of this.pending) {
-      p.reject(new Error('CodexAppServerRunner shutdown'))
-    }
-    this.pending.clear()
-    // Reject the in-flight turn (if any) so runTurn's await-completer doesn't
-    // wedge — the proc.close handler also does this, but shutdown can be
-    // called before the close event fires (race).
-    if (this.currentTurnCompleter) {
-      this.currentTurnCompleter.reject(new Error('CodexAppServerRunner shutdown'))
-      this.currentTurnCompleter = null
-    }
-    this.activeTurnId = null
-    this.currentCollabAgentPolicy = undefined
-    this.resetInitializedState()
-    this.attached = false
-    this.syncedPlatformGoalSignature = null
-    this.syncedPlatformGoal = null
-    // The proc close event (awaited above) is the stdout-drained boundary.
-    // Only now may we clear the identity pointer; clearing it earlier made the
-    // stdout identity guard discard bytes already emitted by Codex.
-    if (this.proc === proc) this.proc = null
-    this.spawnedProviderSignature = null
-    this.stdoutBuf = ''
-    // Per-turn 配对台账随进程一起丢弃(下一 turn 会在 runTurn 顶部重新清空)。
-    this.emittedToolUseIds.clear()
-    // Clear in-flight token state. priorTurnTotal is INTENTIONALLY preserved
-    // across shutdown — codex's thread token totals are server-side and
-    // monotonic, so when the same instance respawns and resumes the thread,
-    // the next `thread/tokenUsage/updated.total` value will still include
-    // every prior turn's tokens. Resetting our baseline would over-bill the
-    // first turn after a respawn by the entire thread total.
-    //
-    // Native preflight has no user turn completer: after stdout drains its
-    // caller emits the original failure/Stop with this still-unconsumed usage.
-    if (!preserveNativeUsage) {
-      this.activeTurnTotal = null
-      this.currentTurnUsage = null
-    }
-    this.resetCallUsageAttribution()
-    // Tear down the per-spawn launch overrides so the next post-shutdown
-    // submit() rebuilds against a fresh sessionDir. Re-using a stale
-    // overrides reference after we rmSync the dir would point codex at a
-    // deleted file on respawn.
-    this.cleanupLaunchOverrides()
-    this.cleanupHermeticDir()
-    this.shuttingDown = false
+  shutdown(opts?: { keepQueuedTurns?: boolean }): Promise<void> {
+    return shutdownImpl.call(this as unknown as CodexRpcTransportHost, opts)
   }
 
   /** Capture-by-value barrier for the current app-server generation. */
@@ -1493,470 +1077,115 @@ export class CodexAppServerRunner extends EventEmitter {
     }
   }
 
-  private async _ensureSpawnedInternal(
-    repoSnap: RepoSnapshot | null,
-    effectiveCwd: string,
-  ): Promise<void> {
-    let generation = this._preheatGeneration
-    if (this.proc && !this.proc.killed && this.initialized) return
-    if (this.proc && !this.proc.killed && !this.initialized) {
-      // In-flight initialize is fully covered by the shared _spawnPromise, so
-      // reaching here means a previous initialize FAILED and left a live but
-      // never-initialized proc. It would poison every later ensureSpawned
-      // (this branch used to return "success"); tear it down and respawn.
-      log.warn('codex app-server alive but uninitialized — replacing process', {
-        sessionKey: this.opts.sessionKey,
-      })
-      await this.shutdown()
-      if (this._preheatGeneration !== generation + 1) throw new Error('CODEX_SPAWN_STALE')
-      generation = this._preheatGeneration
+  private getSpawnFn(): typeof spawn {
+    return _spawnFn
+  }
+
+  private getHostProcessEnv(): NodeJS.ProcessEnv {
+    return process.env
+  }
+
+  private buildCodexSpawnEnv(): NodeJS.ProcessEnv {
+    return {
+      ...buildCodexEnv(),
+      ...identityCompatEnvironment(this.opts.identityCompat),
+      OPENCLAUDE_AGENT_ID: this.opts.agentId,
+      ..._codexMemoryTurnEnv(this.opts.agentId, this.opts.sessionKey, {
+        gatewayPort: this.opts.config?.gateway.port,
+        contextFile: this.cachedOverrides?.delegateContextFile,
+        systemHelpContextFile: this.opts.systemHelpContextFile,
+      }),
     }
-    // Clear any partial-line residue from a prior proc (Codex review
-    // #019dde20 BLOCKER round 3): stdoutBuf is runner-scoped, so without
-    // this, a fragment like '{"jsonrpc":"2.0",' left by the old proc would
-    // get prepended to the new proc's first stdout chunk and corrupt the
-    // initialize response.
-    this.stdoutBuf = ''
-    this.relayDeniedTracker.reset()
-    if (this.opts.remote) return this._ensureSpawnedRemote()
-    // Build platform context overrides BEFORE spawn so the long-lived
-    // app-server proc has model_instructions_file + mcp-memory available
-    // from its very first turn. Failure here is non-fatal — fall back to
-    // naked launch (same graceful-degradation stance as subprocessRunner's
-    // "skip built-in MCP" branch).
-    //
-    // Phase 5:repoSnap 来自 runTurn 顶部一次取的 snapshot,贯穿到
-    // buildCodexLaunchOverrides 内 buildPromptContext 的 REPO slot。
-    let argvOverrides: string[] = []
-    try {
-      if (this.opts.hermeticNoTools) {
-        argvOverrides = [
-          '-c',
-          'mcp_servers={}',
-          '-c',
-          'features.shell_tool=false',
-          '-c',
-          'features.unified_exec=false',
-          '-c',
-          'features.apps=false',
-          '-c',
-          'features.plugins=false',
-          '-c',
-          'features.browser_use=false',
-          '-c',
-          'features.browser_use_external=false',
-          '-c',
-          'features.computer_use=false',
-          '-c',
-          'features.image_generation=false',
-          '-c',
-          'features.multi_agent=false',
-          '-c',
-          'features.multi_agent_v2=false',
-        ]
-      } else {
-        const launchStartedAt = performance.now()
-    const overrides = await this.ensureLaunchOverrides(repoSnap)
-    log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
-      stage: 'launch_context_ready', durationMs: performance.now() - launchStartedAt })
-        if (overrides) argvOverrides = overrides.argvOverrides
-      }
-    } catch (err) {
-      if (this.promptPolicy) throw err
-      log.warn(
-        'codex app-server launch overrides build failed; spawning without platform context',
-        {
-          sessionKey: this.opts.sessionKey,
-          err: (err as Error).message,
-        },
-      )
-    }
-    // `codex app-server` accepts `-c key=value` overrides. They must precede
-    // `--listen` so clap's positional/option parser sees the stdio:// last.
-    //
-    // effort 进 codex argv 主通道。共享 protocol 按型号给出合法档位与默认值:
-    // Sol 缺省 low、Terra/Luna 缺省 medium；用户显式 max 原样透传。
-    const providerSignature = this.codexRouteSignature()
-    const providerArgs = buildCodexProviderConfigArgs(process.env, this.codexRouteConfig)
-    const modelCatalogArgs = buildCodexModelCatalogArgs(this.opts.model)
-    const longContextArgs = buildCodexLongContextArgs(this.opts.model)
-    const effortArgs = codexReasoningEffortConfig(this.opts.model, this.effortLevel)
-    // T3:reasoning summary 与 effort 是同一 provider 的推理配置,co-locate 在这里
-    // 一起拼(仅 codex-native/gpt-5.5 官方 OAuth 路径生效,env 可秒关)。让队长思考
-    // 阶段吐 summary → thinking 卡可见。
-    const reasoningSummaryArgs = buildCodexReasoningSummaryArgs(
-      this.opts.agentProvider,
-      process.env,
-    )
-    // T1:每次 spawn 无条件关闭 codex 原生多 agent(features.multi_agent_v2),与
-    // telemetry hardening 同为"无条件安全兜底"——即便 launch overrides 构建失败走
-    // naked launch,原生 spawnAgent 也不会复活来绕开 delegate_task。见 helper 注释。
-    const multiAgentDisableArgs = buildCodexMultiAgentDisableArgs(process.env)
-    // Codex 原生 request_user_input 默认只在 plan mode 暴露。V5 普通对话也必须
-    // 走同一条“暂停当前 turn → 专用 Ask UI → 回写答案后续跑”的交互链，不能退回
-    // busy 期间不可点击的 Markdown options 卡。与 multi-agent/telemetry 一样无条件
-    // 注入，确保 platform context 构建失败走 naked launch 时仍可提问。
-    const requestUserInputArgs = this.opts.hermeticNoTools
-      ? []
-      : ['-c', 'features.default_mode_request_user_input=true']
-    // Codex 0.144 can parse a model-authored apply_patch while its custom-tool
-    // input is still arriving and emit cumulative structured
-    // `item/fileChange/patchUpdated` snapshots. Without this feature the first
-    // fileChange item is only visible after the complete patch has been
-    // generated, which leaves large edits looking frozen for minutes.
-    const applyPatchStreamingArgs = this.opts.hermeticNoTools
-      ? []
-      : ['-c', 'features.apply_patch_streaming_events=true']
-    // v5 telemetry-block C1(配置面双保险):遥测/自更新关闭 + chatgpt_base_url
-    // 指向容器 loopback relay。**每次 spawn 无条件追加**(不挂 provider override
-    // 成功路径)——即便本 turn 无 route override / managed_config 被非法值整份丢弃,
-    // codex 的遥测直连仍被这组 `-c` 拦下。chatgpt_base_url 的 loopback base 用
-    // 容器 gateway 端口(config.gateway.port,与 official_oauth route override 的
-    // base_url 同拼法);config 缺失(legacy naked 路径)→ 省略该键,仍留 managed
-    // _config 兜底。
+  }
+
+  private resolveChatgptRelayBaseUrl(): string | undefined {
     const relayPort = this.opts.config?.gateway?.port
-    const chatgptRelayBaseUrl =
-      typeof relayPort === 'number' && relayPort > 0
-        ? `http://127.0.0.1:${relayPort}${V3_CODEX_RELAY_PREFIX}/backend-api/codex`
-        : undefined
-    const telemetryArgs = buildCodexTelemetryHardeningArgs(chatgptRelayBaseUrl)
-    // 阶段 agent / 巡检会话不挂平台 MCP skills。chatgpt_base_url 仍指向 relay,
-    // 但 apps/plugins/MCP 关闭后 rmcp 不应再打 allowlist 外路径。放在 argv 末尾
-    // 覆盖 launch overrides 里可能注入的 mcp_servers.openclaude_memory.*。
-    const omitPlatformMcp = shouldOmitPlatformMcp(this.opts.agentId, this.opts.sessionKey)
-    const stageAgentArgs = omitPlatformMcp
-      ? ['-c', 'mcp_servers={}', '-c', 'features.apps=false', '-c', 'features.plugins=false']
-      : []
-    const args = [
-      'app-server',
-      // Register the platform server. Inherited server tables are explicitly
-      // disabled after initialize because empty TOML maps merge with them.
-      ...(this.advisorReadOnly ? ['-c', 'mcp_servers={}'] : []),
-      ...argvOverrides,
-      ...providerArgs,
-      ...modelCatalogArgs,
-      ...longContextArgs,
-      ...effortArgs,
-      ...reasoningSummaryArgs,
-      ...multiAgentDisableArgs,
-      ...requestUserInputArgs,
-      ...applyPatchStreamingArgs,
-      ...telemetryArgs,
-      ...stageAgentArgs,
-      ...(this.advisorReadOnly ? buildAdvisorReadOnlyArgs() : []),
-      '--listen',
-      'stdio://',
-    ]
-    // Phase 5:spawn cwd 用 effectiveCwd(ready 时 = repo workspaceDir,其它 = opts.cwd)。
-    // 虽然 codex app-server 本质是个 JSON-RPC 服务,proc 自身 cwd 大多数子命令不直接用,
-    // 但保持与 thread/start.cwd 一致避免任何"哪边是真值"的混淆。
-    if (generation !== this._preheatGeneration) throw new Error('CODEX_SPAWN_STALE')
-    const proc = _spawnFn('codex', args, {
-      cwd: effectiveCwd,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      detached: true,
-      // buildCodexEnv() scrub 掉全部 OPENCLAUDE_*(安全红线,防内部 token/URL 泄漏给
-      // codex/chatgpt 后端)。但 oc-memory CLI(模型经 bash 调,继承本进程 env)需要知道
-      // 自己是哪个 agent 才能读写正确的 MEMORY.md/USER.md/archival —— 否则非 main agent
-      // 跑在 codex(gpt-5.5)上会回落 'main'、污染 main 的记忆(memory CLI 化引入的缺口)。
-      // 用**非 OPENCLAUDE_ 前缀**的 OC_AGENT_ID 显式注入(不被 scrub):agent-id 不是密钥
-      // (模型本就从 persona/SOUL 知道自己是谁),暴露给 codex shell 零敏感。旧 MCP 是靠
-      // mcp_servers.X.env 显式注入 agent-id 才没这问题;CLI 走 ambient env 需本行补齐。
-      env: {
-        ...buildCodexEnv(),
-        ...identityCompatEnvironment(this.opts.identityCompat),
-        OPENCLAUDE_AGENT_ID: this.opts.agentId,
-        ..._codexMemoryTurnEnv(this.opts.agentId, this.opts.sessionKey, {
-          gatewayPort: this.opts.config?.gateway.port,
-          contextFile: this.cachedOverrides?.delegateContextFile,
-          systemHelpContextFile: this.opts.systemHelpContextFile,
-        }),
-      },
-    }) as ChildProcessWithoutNullStreams
-    this.proc = proc
-    this.spawnedAdvisorReadOnly = this.advisorReadOnly
-    proc.stdin.on('error', (err: NodeJS.ErrnoException) => {
-      if (this.proc !== proc) return
-      log.warn('codex app-server stdin error', {
-        sessionKey: this.opts.sessionKey,
-        err: err.message,
-        code: err.code,
-      })
-    })
-    this.outputDrainPromise = new Promise<void>((resolve) => {
-      this.resolveOutputDrain = resolve
-    })
-    this.spawnedProviderSignature = providerSignature
-    proc.stdout.on('data', (chunk: Buffer) => {
-      // Identity guard (Codex review #019dde20 BLOCKER round 2): a stale
-      // stdout frame from a discarded proc must NOT be parsed against the new
-      // runner state. Without this, an old proc's queued `item/agentMessage/
-      // delta` could land while a fresh `turn/start` is in flight and the
-      // early-adopt path would attribute the old turn's text to the new turn.
-      if (this.proc !== proc) return
-      this.lastActivityAt = Date.now()
-      this.stdoutBuf += chunk.toString('utf8')
-      let nl = this.stdoutBuf.indexOf('\n')
-      while (nl >= 0) {
-        const line = this.stdoutBuf.slice(0, nl).trim()
-        this.stdoutBuf = this.stdoutBuf.slice(nl + 1)
-        if (line) this.handleLine(line)
-        nl = this.stdoutBuf.indexOf('\n')
-      }
-    })
-    proc.stderr.on('data', (chunk: Buffer) => {
-      this.handleStderrChunk(proc, chunk.toString('utf8'))
-    })
-    proc.on('error', (err) => {
-      // Identity check: a delayed error from a discarded proc must not corrupt
-      // a freshly spawned one. shutdown() (or a previous close) may have already
-      // re-pointed `this.proc` at a new child by the time this fires.
-      if (this.proc !== proc) {
-        log.info('codex app-server stale proc error ignored', {
-          sessionKey: this.opts.sessionKey,
-          err: err.message,
-        })
-        return
-      }
-      log.error('codex app-server proc error', { err: err.message })
-      this.emit('error', err)
-      // 审计 R8:proc 在 turn/start 重试退避窗口内出错 → 唤醒退避,让 runTurn 立即转
-      // crashed 终态(retryBackoffProcGone,不误判 USER_CANCELLED)。error 刻意不清
-      // this.proc(晚到 stdout 留到 close 收尾),故 proc-gone 门靠标记而非 `!this.proc`。
-      this.wakeRetryBackoffOnProcGone()
-      // `error` can precede `close`. Keep the exact process identity, pending
-      // turn, and partial JSON line alive until the stdio-drained close
-      // boundary; otherwise late paid output is silently discarded.
-    })
-    proc.on('close', (code, signal) => {
-      // Identity check: see the `error` handler comment. Without this, the
-      // sequence shutdown → submit → respawn → old-proc-close-fires would
-      // null out the new proc and reject its pending requests.
-      if (this.proc !== proc) {
+    return typeof relayPort === 'number' && relayPort > 0
+      ? `http://127.0.0.1:${relayPort}${V3_CODEX_RELAY_PREFIX}/backend-api/codex`
+      : undefined
+  }
+
+  private onTransportProcessClose(
+    proc: ChildProcessWithoutNullStreams,
+    code: number | null,
+    signal: NodeJS.Signals | null,
+    remote: boolean,
+  ): void {
+    if (this.proc !== proc) {
+      if (!remote) {
         log.info('codex app-server stale proc close ignored', {
           sessionKey: this.opts.sessionKey,
           code,
           signal,
         })
-        return
       }
-      log.info('codex app-server proc close', {
-        sessionKey: this.opts.sessionKey,
-        code,
-        signal,
-      })
-      // Preserve a final complete JSON-RPC object even if the process died
-      // before writing its trailing newline.
-      if (this.stdoutBuf.length > 0) {
-        const trailing = this.stdoutBuf.trim()
-        this.stdoutBuf = ''
-        if (trailing) this.handleLine(trailing)
-      }
-      this.resolveOutputDrain?.()
-      this.resolveOutputDrain = null
-      this.handleStderrChunk(proc, '\n', true)
-      const wasShutdown = this.shuttingDown
-      // Reject any remaining pending JSON-RPC requests AND the in-flight turn
-      // promise so callers don't hang. emitResult is the responsibility of
-      // runTurn's catch — we just unwedge promises here.
-      const closeReason = `codex app-server exited code=${code} signal=${signal ?? ''}`
-      if (wasShutdown) this.emitForcedShutdownResult(closeReason)
-      this.failAllPending(closeReason)
-      // 审计 R8:proc 关闭时唤醒仍在跑的退避 sleep,让 runTurn 立即转终态(否则要等满
-      // 退避才命中下面 proc=null 的 proc-gone 门)。shutdown 路径已在 shutdown() 里 abort
-      // 过(幂等);crash 路径这里是唯一唤醒点。
-      this.wakeRetryBackoffOnProcGone()
-      this.proc = null
-      this.spawnedProviderSignature = null
-      this.resetInitializedState()
-      this.attached = false
+      return
+    }
+    log.info(remote ? 'codex remote lane close' : 'codex app-server proc close', {
+      sessionKey: this.opts.sessionKey,
+      code,
+      signal,
+    })
+    if (this.stdoutBuf.length > 0) {
+      const trailing = this.stdoutBuf.trim()
+      this.stdoutBuf = ''
+      if (trailing) this.handleLine(trailing)
+    }
+    this.resolveOutputDrain?.()
+    this.resolveOutputDrain = null
+    if (!remote) this.handleStderrChunk(proc, '\n', true)
+    const wasShutdown = this.shuttingDown
+    const closeReason = remote
+      ? `codex remote lane closed code=${code} signal=${signal ?? ''}`
+      : `codex app-server exited code=${code} signal=${signal ?? ''}`
+    if (wasShutdown) this.emitForcedShutdownResult(closeReason)
+    this.failAllPending(closeReason)
+    this.wakeRetryBackoffOnProcGone()
+    this.proc = null
+    this.spawnedProviderSignature = null
+    this.resetInitializedState()
+    this.attached = false
+    if (!remote) {
       this.syncedPlatformGoalSignature = null
       this.syncedPlatformGoal = null
-      this.activeTurnId = null
-      // Clear stdoutBuf so the next proc's first response isn't prepended
-      // with a partial line residue from this dying proc.
-      this.stdoutBuf = ''
-      // Drop the launch overrides cache too — the dir contents are tied to
-      // the dead proc, and the next ensureSpawned() will lazy-rebuild a
-      // fresh dir. Not strictly required (shutdown already covers the
-      // explicit-stop path) but matches the symmetry "proc gone → context
-      // regenerated" so a crash-respawn can't reuse a stale path.
-      this.cleanupLaunchOverrides()
-      // Intentional recycle/shutdown must not surface SIGTERM as SERVICE_RESTART
-      // on a follow-up turn that already installed its exit listener (OCV5-224).
-      if (!wasShutdown) {
-        this.emit('exit', {
-          code: code ?? 0,
-          signal,
-          crashed: code != null && code !== 0,
-        })
-      }
-      if (wasShutdown) this.shuttingDown = false
-    })
-
-    // JSON-RPC handshake. `collaborationMode` and related plan-first fields
-    // are gated behind Codex's experimental API capability, so declare it
-    // before any turn/start call. We call the proc fresh-spawned so writes
-    // won't EPIPE.
-    const initializeStartedAt = performance.now()
-    try {
-      const initialized = await this.sendRequest('initialize', this.buildInitializeParams())
-      this.initializedPayload = initialized
-      this.advisorReadOnlyConfig = await readAdvisorReadOnlyConfig(this.advisorReadOnly, initialized,
-        () => this.sendRequest('config/read', { cwd: effectiveCwd, includeLayers: false }),
-        this.cachedOverrides?.tokenFile != null)
-      log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
-        stage: 'initialize_ready', durationMs: performance.now() - initializeStartedAt })
-    } catch (err) {
-      // A live but never-initialized app-server must not survive: later
-      // ensureSpawned calls would see proc-alive and (historically) skip the
-      // handshake. Tear it down before rethrowing so the next call respawns.
-      try {
-        await this.shutdown()
-      } catch {
-        /* teardown is best-effort on a failed handshake */
-      }
-      throw err
     }
-    this.initialized = true
+    this.activeTurnId = null
+    this.stdoutBuf = ''
+    if (remote) this.remoteInstructions = null
+    this.cleanupLaunchOverrides()
+    // Intentional recycle/shutdown must not surface SIGTERM as SERVICE_RESTART
+    // on a follow-up turn that already installed its exit listener (OCV5-224).
+    if (!wasShutdown) {
+      this.emit('exit', {
+        code: code ?? 0,
+        signal,
+        crashed: code != null && code !== 0,
+      })
+    }
+    if (wasShutdown) this.shuttingDown = false
   }
 
-  /**
-   * Remote lane spawn: no argv, no env, no local cwd/config. The platform instructions are the
-   * only local input; the node owns model, sandbox and credentials. Everything after the
-   * process boundary is the same code as a local app-server.
-   */
-  private async _ensureSpawnedRemote(): Promise<void> {
-    const remote = this.opts.remote!
-    // The lane is admitted first: its catalog is the instruction table, and the master rejects
-    // any frame that arrives before it holds this turn's authority.
-    await remote.ready()
-    let platformPrompt = ''
-    try {
-      const overrides = await this.ensureLaunchOverrides(null)
-      platformPrompt = overrides?.instructionsContent ?? ''
-    } catch (err) {
-      // Without platform context the remote model would run blind; unlike the local
-      // path we cannot fall back to a naked launch that still has a tool host.
-      throw err instanceof Error ? err : new Error('CODEX_REMOTE_CONTEXT_UNAVAILABLE')
-    }
-    this.remoteInstructions = remote.instructions(platformPrompt)
-    const proc = remote.child
-    this.proc = proc
-    // The remote lane is spawned from the same route inputs as a local one, so the route-change
-    // guard below must see the real signature: a placeholder would restart the lane every turn.
-    this.spawnedProviderSignature = this.codexRouteSignature()
-    this.outputDrainPromise = new Promise<void>((resolve) => {
-      this.resolveOutputDrain = resolve
-    })
-    proc.stdout.on('data', (chunk: Buffer) => {
-      if (this.proc !== proc) return
-      this.lastActivityAt = Date.now()
-      this.stdoutBuf += chunk.toString('utf8')
-      let nl = this.stdoutBuf.indexOf('\n')
-      while (nl >= 0) {
-        const line = this.stdoutBuf.slice(0, nl).trim()
-        this.stdoutBuf = this.stdoutBuf.slice(nl + 1)
-        if (line) this.handleLine(line)
-        nl = this.stdoutBuf.indexOf('\n')
-      }
-    })
-    // The relay never forwards node stderr; nothing to parse and nothing to echo.
-    proc.stderr.resume()
-    proc.on('error', (err: Error) => {
-      if (this.proc !== proc) return
-      log.error('codex remote lane error', { sessionKey: this.opts.sessionKey, err: err.message })
-      this.emit('error', err)
-      this.wakeRetryBackoffOnProcGone()
-    })
-    proc.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
-      if (this.proc !== proc) return
-      log.info('codex remote lane close', { sessionKey: this.opts.sessionKey, code, signal })
-      if (this.stdoutBuf.length > 0) {
-        const trailing = this.stdoutBuf.trim()
-        this.stdoutBuf = ''
-        if (trailing) this.handleLine(trailing)
-      }
-      this.resolveOutputDrain?.()
-      this.resolveOutputDrain = null
-      const wasShutdown = this.shuttingDown
-      const closeReason = `codex remote lane closed code=${code} signal=${signal ?? ''}`
-      if (wasShutdown) this.emitForcedShutdownResult(closeReason)
-      this.failAllPending(closeReason)
-      this.wakeRetryBackoffOnProcGone()
-      this.proc = null
-      this.spawnedProviderSignature = null
-      this.resetInitializedState()
-      this.attached = false
-      this.activeTurnId = null
-      this.stdoutBuf = ''
-      this.remoteInstructions = null
-      this.cleanupLaunchOverrides()
-      if (!wasShutdown) {
-        this.emit('exit', { code: code ?? 0, signal, crashed: code != null && code !== 0 })
-      }
-      if (wasShutdown) this.shuttingDown = false
-    })
-    try {
-      this.initializedPayload = await this.sendRequest('initialize', this.buildInitializeParams())
-    } catch (err) {
-      try {
-        await this.shutdown()
-      } catch {
-        /* teardown is best-effort on a failed handshake */
-      }
-      throw err
-    }
-    this.initialized = true
+  private _ensureSpawnedInternal(
+    repoSnap: RepoSnapshot | null,
+    effectiveCwd: string,
+  ): Promise<void> {
+    return ensureSpawnedInternalImpl.call(this as unknown as CodexRpcTransportHost, repoSnap, effectiveCwd)
+  }
+
+  private _ensureSpawnedRemote(): Promise<void> {
+    return ensureSpawnedRemoteImpl.call(this as unknown as CodexRpcTransportHost)
   }
 
   private failAllPending(reason: string): void {
-    this.nativeContext.abort(new Error(reason))
-    for (const [, p] of this.pending) {
-      p.reject(new Error(reason))
-    }
-    this.pending.clear()
-    if (this.currentTurnCompleter) {
-      this.currentTurnCompleter.reject(new Error(reason))
-      this.currentTurnCompleter = null
-    }
-    // The process is already gone at this boundary, so a JSON-RPC response is
-    // impossible. Still clear both indexes to prevent stale ids from leaking
-    // into a later app-server generation.
-    this.clearPendingUserInputs()
+    failAllPendingImpl.call(this as unknown as CodexRpcTransportHost, reason)
   }
 
-  /** Emit one synthetic terminal result after a forced process shutdown. This
-   * runs only at the stdout `close` boundary, so every preceding notification
-   * has already updated `activeTurnTotal` and the parser buffers. */
   private emitForcedShutdownResult(reason: string): void {
-    if (this.forcedShutdownResultEmitted) return
-    if (!this.currentTurnCompleter && this.activeTurnId === null) return
-    this.forcedShutdownResultEmitted = true
-    const turnUsage = this.consumeActiveTurnUsage()
-    const usage = turnUsage ? _codexUsageToAnthropicShape(turnUsage) : undefined
-    this.emitResult({
-      durationMs: 0,
-      ok: false,
-      error: reason,
-      usage,
-      requestId: this.activeRequestId,
-      rateLimits: this._consumeRateLimitsForEmit(),
-      stopReason: 'interrupted',
-    })
+    emitForcedShutdownResultImpl.call(this as unknown as CodexTurnExecutionHost, reason)
   }
 
-  /** Move the latest cumulative usage snapshot into this turn exactly once.
-   * Normal, crash, and forced-stop paths share this so killed-turn usage can
-   * never be promoted into the next baseline without a billing frame. */
   private consumeActiveTurnUsage(): CodexTokenBreakdown | null {
-    if (this.activeTurnTotal === null) return null
-    const baseline = this.priorTurnTotal ?? _EMPTY_TOKEN_BREAKDOWN
-    const delta = _subtractTokenBreakdown(this.activeTurnTotal, baseline)
-    this.currentTurnUsage = delta
-    this.priorTurnTotal = this.activeTurnTotal
-    this.activeTurnTotal = null
-    return delta
+    return consumeActiveTurnUsageImpl.call(this as unknown as CodexTurnExecutionHost)
   }
 
   private async _handleChatgptAuthTokensRefresh(
@@ -1973,16 +1202,7 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private writeRaw(line: string): boolean {
-    if (!this.isInlinePushProcLive(this.proc)) return false
-    try {
-      this.proc!.stdin.write(`${line}\n`)
-      return true
-    } catch (err) {
-      log.warn('codex app-server stdin write failed', {
-        err: (err as Error).message,
-      })
-      return false
-    }
+    return writeRawImpl.call(this as unknown as CodexRpcTransportHost, line)
   }
 
   async writeDelegateTerminalNotification(
@@ -2004,24 +1224,12 @@ export class CodexAppServerRunner extends EventEmitter {
    * admission, not ingest: turn/start may still reject. The only ACK is a
    * turn id returned by turn/start (activeTurnId).
    */
-    get hasIngestedParentTurn(): boolean {
+  get hasIngestedParentTurn(): boolean {
     return this.activeTurnId != null
   }
 
   private sendRequest(method: string, params: unknown, signal?: AbortSignal): Promise<unknown> {
-    if (signal?.aborted) return Promise.reject(new Error(`codex request ${method} aborted`))
-    const id = ++this.nextRequestId
-    return new Promise((resolve, reject) => {
-      const onAbort = signal ? () => { this.pending.delete(id); reject(new Error(`codex request ${method} aborted`)) } : null
-      const unlisten = () => { if (onAbort) signal?.removeEventListener('abort', onAbort) }
-      if (onAbort) signal?.addEventListener('abort', onAbort, { once: true })
-      this.pending.set(id, {
-        resolve: (v) => { unlisten(); resolve(v) },
-        reject: (e) => { unlisten(); reject(e) },
-        method,
-      })
-      this.writeRaw(JSON.stringify({ jsonrpc: '2.0', id, method, params }))
-    })
+    return sendRequestImpl.call(this as unknown as CodexRpcTransportHost, method, params, signal)
   }
 
   private buildServerRequestAutoApproval(method: string, params: unknown): unknown | null {
@@ -2053,19 +1261,7 @@ export class CodexAppServerRunner extends EventEmitter {
     prompt: string,
     serviceTier: ServiceTier | null = this._serviceTier,
   ): Record<string, unknown> {
-    if (this.opts.remote) {
-      // The relay's grammar is closed: model/sandbox/collaboration settings are the node's,
-      // provisioned from the signed catalog; the container only names thread, text and effort.
-      return {
-        threadId: this.threadId,
-        input: [{ type: 'text', text: prompt }],
-        ...(this.effortLevel ? { effort: this.effortLevel } : {}),
-      }
-    }
-    return buildCodexTurnPolicyParams(prompt, this.threadId, {
-      ...this.opts, effortLevel: this.effortLevel, serviceTier,
-      mode: this.conversationMode, readOnly: this.advisorReadOnly,
-    })
+    return buildTurnStartParamsImpl.call(this as unknown as CodexTurnExecutionHost, prompt, serviceTier)
   }
 
   private handleNotification(method: string, params: unknown): void {
@@ -2123,83 +1319,12 @@ export class CodexAppServerRunner extends EventEmitter {
     return { threadId, baseInstructions: this.remoteInstructions }
   }
 
-  private async _startNewThread(effectiveCwd: string, preheatGeneration?: number): Promise<void> {
-    // Phase 5:effectiveCwd 由 runTurn 顶部一次取的 snapshot 折算而来,
-    // 与 ensureSpawned cwd / launch overrides 的 REPO slot 保持一致。
-    // A remote node owns cwd/model/sandbox; only the platform instructions cross.
-    const res = (await this.sendRequest('thread/start', this.opts.remote
-      ? (this.remoteInstructions !== null ? { baseInstructions: this.remoteInstructions } : {})
-      : buildCodexThreadPolicyParams(effectiveCwd, this.opts.model,
-        this.advisorReadOnly, this.advisorReadOnlyConfig, this.opts.hermeticNoTools))) as
-      { thread?: { id?: string } } | undefined
-    const tid = res?.thread?.id
-    if (typeof tid !== 'string' || !tid) {
-      throw new Error('thread/start did not return thread.id')
-    }
-    if (preheatGeneration !== undefined && preheatGeneration !== this._preheatGeneration) {
-      throw new Error('CODEX_PREHEAT_STALE')
-    }
-    this.threadId = tid
-    this.priorTurnTotal = null
-    this.activeTurnTotal = null
-    this.currentTurnUsage = null
-    this.resetCallUsageAttribution()
-    this.syncedPlatformGoalSignature = null
-    this.syncedPlatformGoal = null
-    // sessionManager listens for this and writes the new id (+ provider tag)
-    // to resume-map.json, so the *next* turn against this sessionKey resumes
-    // against the fresh thread instead of looping back into -32600.
-    if (preheatGeneration === undefined) this.emit('session_id', tid)
-    else this._unannouncedPreheatThread = true
+  private _startNewThread(effectiveCwd: string, preheatGeneration?: number): Promise<void> {
+    return startNewThreadImpl.call(this as unknown as CodexTurnExecutionHost, effectiveCwd, preheatGeneration)
   }
 
-  /** turn-retry 批 — 每个 attempt 起点集中复位 per-attempt 态。**保留
-   *  priorTurnTotal**(跨 attempt/turn 的累计基线)。activeTurnTotal 先断言 delta
-   *  为零再清(重试路径下 turn/start 被拒前不可能有 tokenUsage 通知);非零=底座
-   *  异常,promote 而非丢弃,防漏账。pendingUserInputs 断言空(串行 runner 不变量)。 */
   private resetAttemptState(): void {
-    if (this.pendingUserInputs.size > 0) {
-      // 到达 attempt 起点仍有挂起 reverse-request → 违反串行 runner 不变量。settle
-      // 掉(no-answer)后再继续,绝不带进新 attempt。
-      log.error('resetAttemptState: pendingUserInputs not empty at attempt boundary', {
-        sessionKey: this.opts.sessionKey,
-        count: this.pendingUserInputs.size,
-      })
-      this.settleAllPendingUserInputs('attempt reset')
-    }
-    if (this.activeTurnTotal !== null) {
-      const delta = _subtractTokenBreakdown(
-        this.activeTurnTotal,
-        this.priorTurnTotal ?? _EMPTY_TOKEN_BREAKDOWN,
-      )
-      if (!this._isZeroBreakdown(delta)) {
-        // 理论不可达(重试门已保证零 usage);真发生则 promote 到 priorTurnTotal 保账,
-        // 不静默丢。
-        log.error('resetAttemptState: non-zero usage delta at attempt boundary — promoting', {
-          sessionKey: this.opts.sessionKey,
-          delta,
-        })
-        this.priorTurnTotal = this.activeTurnTotal
-      }
-      this.activeTurnTotal = null
-    }
-    this.currentTurnCompleter = null
-    this.activeTurnId = null
-    this.currentAssistantBuf = ''
-    this.hasCurrentStructuredOutput = false
-    this.currentStructuredOutput = undefined
-    this.currentPlanDraft = ''
-    this.reasoningItemState.clear()
-    this.emittedToolUseIds.clear()
-    this.inflightItemHandlers.clear()
-    this.collabReceiverToSpawnId.clear()
-    this.collabSpawnReceivers.clear()
-    this.completedCollabSpawnResults.clear()
-    this.currentTurnUsage = null
-    this.resetCallUsageAttribution()
-    this.attemptHadObservableOutput = false
-    this.attemptHadToolOrPermission = false
-    this.attemptEmittedTerminal = false; rememberImageStderr(this, null)
+    resetAttemptStateImpl.call(this as unknown as CodexTurnExecutionHost)
   }
 
   /**
@@ -2300,59 +1425,31 @@ export class CodexAppServerRunner extends EventEmitter {
   private abortableDelay(ms: number, signal: AbortSignal): Promise<boolean> {
     return abortableDelay(ms, signal)
   }
-  private async verifyTurnServiceTier(readOnly: boolean, serviceTier: ServiceTier | null): Promise<void> {
-    const controller = new AbortController()
-    this.pendingRetryAbort = controller
-    this.retryBackoffProcGone = false
-    try {
-      await ensureCodexTurnServiceTierSupported({
-        model: this.opts.model, readOnly, serviceTier, remote: Boolean(this.opts.remote),
-        initialized: this.initializedPayload, signal: controller.signal,
-        listModels: (cursor, sig) => this.sendRequest('model/list', cursor ? { cursor } : {}, sig),
-      })
-    } catch (err) {
-      if (controller.signal.aborted && controller.signal.reason === 'user-stop' && !this.retryBackoffProcGone) {
-        this.pendingStartInterrupt = true; return
-      }
-      throw err
-    } finally { if (this.pendingRetryAbort === controller) this.pendingRetryAbort = null }
+  private verifyTurnServiceTier(readOnly: boolean, serviceTier: ServiceTier | null): Promise<void> {
+    return verifyTurnServiceTierImpl.call(this as unknown as CodexTurnExecutionHost, readOnly, serviceTier)
   }
 
-  /** turn/start 窄路径自动重试门。**全部**满足才允许重试(fail-closed):
-   *   1. 共享自动重试额度尚未用尽;
-   *   2. err 是明确的 JSON-RPC application error(有 rpcCode/rpcMessage 且
-   *      rpcMethod==='turn/start');transport 断连/进程 exit/超时形状(裸 Error,
-   *      无 rpcCode)一律不算;
-   *   3. app-server 子进程仍存活;
-   *   4. 未获得/未 adopt 任何 turnId(activeTurnId 为 null)且 completer 未被任何
-   *      提前到达的 turn 通知 settle(currentTurnCompleter 非空)——任一破坏 = 结局
-   *      未知,不重试;
-   *   5. classifyRunError(rpcMessage) 命中 retryable 语义(turnErrorSemantics);
-   *   6. 本 attempt 两台账 flag 均 false、usage 为零、未 emit 过终态帧;
-   *   7. pendingUserInputs 为空(非空 = 违反门,放弃重试走终态,不静默清)。 */
+  private classifyRunErrorCode(errStr: string | undefined): ClassifiedErrorCode {
+    return classifyRunError(errStr).code
+  }
+
+  private runWithTurnTrace<T>(
+    threadId: string | null,
+    traceId: string | undefined,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    return withCodexTurnTrace(threadId, traceId, fn)
+  }
+
+  private async recycleAfterUserCancelled(): Promise<void> {
+    await this.recycleProcKeepQueue('user-cancelled')
+  }
+
   private shouldRetryTurnStart(err: unknown, retryState: AutomaticRetryState): boolean {
-    if (retryState.attempt >= retryState.max) return false
-    const e = err as Partial<JsonRpcCallError> | null | undefined
-    if (
-      !e ||
-      typeof e.rpcCode !== 'number' ||
-      typeof e.rpcMessage !== 'string' ||
-      e.rpcMethod !== 'turn/start'
-    ) {
-      return false
-    }
-    if (!this.proc || this.proc.killed) return false
-    if (this.activeTurnId !== null) return false
-    if (this.currentTurnCompleter === null) return false
-    if (!turnErrorSemantics(classifyRunError(e.rpcMessage).code).retryable) return false
-    if (this.attemptHadObservableOutput || this.attemptHadToolOrPermission) return false
-    if (this.attemptEmittedTerminal) return false
-    if (!this.activeAttemptUsageIsZero()) return false
-    if (this.pendingUserInputs.size > 0) return false
-    return true
+    return shouldRetryTurnStartImpl.call(this as unknown as CodexTurnExecutionHost, err, retryState)
   }
 
-  private async runTurn(
+  private runTurn(
     prompt: string,
     requestId?: string,
     collabAgentPolicy?: CollabAgentPolicy,
@@ -2361,531 +1458,16 @@ export class CodexAppServerRunner extends EventEmitter {
     readOnly = false,
     turnServiceTier: ServiceTier | null = this._serviceTier,
   ): Promise<void> {
-    const turnTraceId = traceId === null ? undefined : traceId ?? this.opts.traceId
-    const startedAt = Date.now()
-    const timingStartedAt = performance.now()
-    // Join speculative preparation; a failed warmup falls back to normal preparation.
-    if (this._preheatPromise) await this._preheatPromise.catch(() => {})
-    this.advisorReadOnly = readOnly
-    const seenDeltas = new Set<string>()
-    const observeFirstDelta = (message: any): void => {
-      const delta = message?.event?.delta
-      const stage = delta?.type === 'text_delta' && delta.text?.length ? 'first_text_delta'
-        : delta?.type === 'thinking_delta' && delta.thinking?.length ? 'first_reasoning_delta' : null
-      if (!stage || seenDeltas.has(stage) || message.session_id !== this.threadId) return
-      seenDeltas.add(stage)
-      log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
-        stage, elapsedMs: performance.now() - timingStartedAt })
-    }
-    this.on('message', observeFirstDelta)
-    this.activeRequestId = requestId
-    this.forcedShutdownResultEmitted = false
-    // Serial runner invariant: no reverse request from the previous turn may
-    // be carried into this one. Normally turn/completed already performed the
-    // same cleanup; this is a defensive boundary for unusual protocol order.
-    this.settleAllPendingUserInputs('next turn started')
-    // Phase 5:turn 顶部一次性取 snapshot,贯穿 ensureSpawned / thread/start /
-    // thread/resume / launch overrides 四个消费点。任何中途读 snapshot 的写法
-    // 都会出现撕裂窗口(spawn cwd 用了 ready,attach cwd 拿到 cloning 之类)。
-    const repoSnap = this._currentRepoSnapshot()
-    let effectiveCwd = this._applyRepoBindingFromSnapshot(repoSnap)
-    log.info('codex app-server turn start', {
-      traceId: turnTraceId,
-      sessionKey: this.opts.sessionKey,
-      resumed: this.threadId != null,
-      pid: this.proc?.pid ?? null,
-      reusedProc: Boolean(this.proc && this.initialized && !this.staleProcGeneration),
-      promptChars: prompt.length,
-      effectiveCwd,
-      repoBound: this._boundRepoBinding != null,
-    })
-    // Per-attempt 态(currentAssistantBuf / currentPlanDraft / reasoningItemState /
-    // emittedToolUseIds / collab maps / activeTurnTotal / currentTurnUsage / 三个
-    // 台账 flag)的复位统一交给 resetAttemptState(在每个 attempt 起点调用)。
-    // priorTurnTotal 跨 turn 保留(累计基线),不在此清。这里只做 turn 级一次性准备。
-    this.currentCollabAgentPolicy = collabAgentPolicy
-
-    const retryState = automaticRetryState ?? {
-      rootClientMessageId: `local-${this.opts.sessionKey}`,
-      attempt: 0,
-      max: AUTOMATIC_TURN_RETRY_MAX,
-    }
-    try {
-      if (
-        this.proc &&
-        !this.proc.killed &&
-        ((this.spawnedAdvisorReadOnly !== null && this.spawnedAdvisorReadOnly !== readOnly) ||
-          (this.spawnedProviderSignature !== null &&
-          this.spawnedProviderSignature !== this.codexRouteSignature()) ||
-          (this._preheatedSignature !== null &&
-            this._preheatedSignature !== this.preheatSignature(repoSnap, effectiveCwd)))
-      ) {
-        // Route changes require a fresh Codex app-server process because
-        // provider/base_url are launch-time CLI args. Do not let this restart
-        // reject already-queued turns for the same session; only the current
-        // runner process is being replaced.
-        const queuedTurns = this.queue
-        this.queue = []
-        try {
-          await this.shutdown()
-          effectiveCwd = this._applyRepoBindingFromSnapshot(repoSnap)
-        } finally {
-          if (queuedTurns.length > 0) {
-            this.queue = queuedTurns.concat(this.queue)
-          }
-        }
-      }
-      // A route-change shutdown above clears active turn state; restore this
-      // queued turn's policy before the actual turn/start notifications arrive.
-      this.currentCollabAgentPolicy = collabAgentPolicy
-      if (this.pendingConsultRespawn) {
-        this.pendingConsultRespawn = false
-        await this.shutdown()
-        this.shuttingDown = false
-      }
-      const reusedProcess = Boolean(this.proc && this.initialized && !this.staleProcGeneration)
-      await this.ensureSpawned(repoSnap, effectiveCwd)
-      log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
-        stage: 'engine_ready', reusedProcess, elapsedMs: performance.now() - timingStartedAt })
-      const threadStartedAt = performance.now()
-      this.refreshDelegateContext(turnTraceId)
-
-      // Each fresh app-server proc must explicitly attach a thread before
-      // turn/start. `attached` is per-proc (cleared on close/error), so this
-      // fires correctly on:
-      //   1. first turn after construction (no threadId → thread/start)
-      //   2. first turn after construction with resumeSessionId (thread/resume)
-      //   3. first turn after proc respawn (shutdown / crash) — re-attach via
-      //      thread/resume against the captured threadId.
-      if (!this.attached) {
-        if (!this.threadId) {
-          await this._startNewThread(effectiveCwd)
-        } else {
-          try {
-            await this.sendRequest('thread/resume', this.opts.remote
-              ? this.remoteResumeParams(this.threadId)
-              : {
-                  ...(this.cachedOverrides?.instructionsContent !== undefined ? { baseInstructions: this.cachedOverrides.instructionsContent } : {}),
-                  threadId: this.threadId,
-                  ...buildCodexThreadPolicyParams(effectiveCwd, this.opts.model,
-                    this.advisorReadOnly, this.advisorReadOnlyConfig),
-                })
-          } catch (err) {
-            // Self-heal "no rollout found for thread id" (-32600). Caused by
-            // master sessionManager persisting `thread_id` across container
-            // rebuilds while the codex `~/.codex/sessions/...` rollout JSONL
-            // lives only in the per-container ephemeral layer. Without this,
-            // every fresh container's first GPT turn ended in a 31ms empty
-            // result frame and the user saw "未收到回复" (Codex review
-            // #019e0b72 BLOCKER 1, root cause confirmed by user).
-            //
-            // Trade-off: we lose conversation context for that one turn since
-            // the rollout really is gone. emit('session_id') feeds the new
-            // tid back into sessionManager → resume-map, so subsequent turns
-            // recover normally. Any other thread/resume error (proc died,
-            // schema drift, etc.) re-throws so the outer catch surfaces it
-            // as ok=false rather than masking it with a fresh thread.
-            if (!isMissingRolloutError(err)) throw err
-            const staleThreadId = this.threadId
-            const fallback = staleThreadId
-              ? this.opts.resolveResumeFallback?.(staleThreadId)
-              : undefined
-            if (fallback && fallback !== staleThreadId) {
-              log.warn('codex thread/resume missing rollout — resuming prior durable thread', {
-                sessionKey: this.opts.sessionKey,
-                staleThreadId,
-                fallbackThreadId: fallback,
-              })
-              // Switching native thread: thread-scoped token ledger must be
-              // re-seeded from the fallback thread's own history (same reset
-              // _startNewThread does), otherwise the first usage frame is
-              // diffed against the dead thread's cumulative total (B1).
-              this.threadId = fallback
-              this.priorTurnTotal = null
-              this.activeTurnTotal = null
-              this.currentTurnUsage = null
-              this.resetCallUsageAttribution()
-              this.syncedPlatformGoalSignature = null
-              this.syncedPlatformGoal = null
-              try {
-                await this.sendRequest('thread/resume', this.opts.remote
-                  ? this.remoteResumeParams(fallback)
-                  : {
-                      ...(this.cachedOverrides?.instructionsContent !== undefined ? { baseInstructions: this.cachedOverrides.instructionsContent } : {}),
-                      threadId: fallback,
-                      ...buildCodexThreadPolicyParams(effectiveCwd, this.opts.model,
-                        this.advisorReadOnly, this.advisorReadOnlyConfig),
-                    })
-                this.emit('session_id', fallback)
-                this.attached = true
-              } catch (err2) {
-                if (!isMissingRolloutError(err2)) throw err2
-                log.warn('codex fallback thread also missing rollout — restarting fresh', {
-                  sessionKey: this.opts.sessionKey,
-                  fallbackThreadId: fallback,
-                })
-                this.threadId = null
-                await this._startNewThread(effectiveCwd)
-              }
-            } else {
-              log.warn('codex thread/resume missing rollout — restarting fresh', {
-                sessionKey: this.opts.sessionKey,
-                staleThreadId,
-                rpcMessage: (err as JsonRpcCallError).rpcMessage,
-              })
-              this.threadId = null
-              await this._startNewThread(effectiveCwd)
-            }
-          }
-        }
-        this.attached = true
-      }
-
-      const preheatedThreadClaimed = Boolean(this._unannouncedPreheatThread && this.threadId)
-      if (this._unannouncedPreheatThread && this.threadId) {
-        this._unannouncedPreheatThread = false
-        this.emit('session_id', this.threadId)
-      }
-      this._preheatedSignature = null
-      log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
-        stage: 'thread_ready', preheatedThreadClaimed, durationMs: performance.now() - threadStartedAt, elapsedMs: performance.now() - timingStartedAt })
-      await this.syncPlatformGoal()
-
-      this.nativeContext.beginTurn()
-      // ── attempt 循环 ──────────────────────────────────────────────────
-      // 仅「turn/start 请求本身被拒」的窄路径可循环重试(shouldRetryTurnStart 门)。
-      // 一旦 turn/start 成功返回 turn.id,turn 进入执行,后续任何失败(status=
-      // 'failed'/interrupted/异常)都**不**在此循环内重试 —— 直接 return 或抛给外
-      // 层 catch 走终态(实测②:turn 一旦开始,user input 已落 thread,重发会重复)。
-      for (;;) {
-        // 每个 attempt 起点集中复位 per-attempt 态(见 resetAttemptState)。
-        this.resetAttemptState()
-        if (!this.pendingStartInterrupt) await this.verifyTurnServiceTier(readOnly, turnServiceTier)
-        // Native compaction is a local RPC outside the relay grammar; the node manages its
-        // own context window for a remote thread.
-        if (!this.pendingStartInterrupt && !this.opts.remote) {
-          await this.nativeContext.compactIfNeeded({
-            threadId: this.threadId, traceId: turnTraceId,
-            timeoutMs: NATIVE_COMPACTION_TIMEOUT_MS,
-            send: () => this.sendRequest('thread/compact/start', { threadId: this.threadId }),
-            drainFailure: async () => {
-              const drained = this.outputDrainPromise
-              if (!this.shuttingDown) await this.recycleProcKeepQueue('native-context-compaction-failed')
-              await drained
-            },
-          })
-        }
-
-        // Set up the completion box BEFORE turn/start so a fast turn/completed
-        // notification (rare but possible) doesn't slip past us.
-        const completed = new Promise<{
-          status?: string
-          durationMs?: number
-          error?: { message?: string; codexErrorInfo?: unknown }
-        }>((resolve, reject) => {
-          this.currentTurnCompleter = { resolve, reject }
-        })
-        // A remote child can die between the completer being set and anyone awaiting it; that
-        // late rejection must stay a turn failure, never a gateway-level unhandled rejection.
-        void completed.catch(() => {})
-
-        if (this.pendingStartInterrupt) {
-          // OCV5-435: stopped before turn/start — never start it.
-          this.pendingStartInterrupt = false
-          this.currentTurnCompleter = null
-          void completed.catch(() => {})
-          this.emitResult({
-            durationMs: Date.now() - startedAt,
-            ok: false,
-            error: 'codex turn interrupted',
-            requestId,
-            rateLimits: this._consumeRateLimitsForEmit(),
-            stopReason: 'interrupted',
-            terminalCode: 'USER_CANCELLED',
-          })
-          return
-        }
-
-        let tres: { turn?: { id?: string } } | undefined
-        try {
-          log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
-            stage: 'turn_start_sent', elapsedMs: performance.now() - timingStartedAt })
-          tres = (await withCodexTurnTrace(this.threadId, turnTraceId, () =>
-            this.sendRequest('turn/start', this.buildTurnStartParams(prompt, turnServiceTier)))) as
-            | { turn?: { id?: string } }
-            | undefined
-        } catch (startErr) {
-          if (this.shouldRetryTurnStart(startErr, retryState)) {
-            // 本 attempt 的 completed promise 就此放弃(无人 await)。必须立即
-            // 解除 completer 并挂 no-op catch:否则退避期间 close-only 路径
-            // (close → failAllPending)会 reject 一个无人接的 Promise →
-            // unhandled rejection(gateway 无全局守卫,Node 默认可升级为进程
-            // 退出,codex 子进程崩溃就此放大成整个 gateway 退出)。
-            this.currentTurnCompleter = null
-            void completed.catch(() => {})
-            const nextAttempt = retryState.attempt + 1
-            retryState.attempt = nextAttempt
-            const delayMs = this.computeRetryDelayMs(nextAttempt)
-            const cls = classifyRunError((startErr as JsonRpcCallError).rpcMessage).code
-            log.warn('codex turn/start rejected — auto-retrying (narrow path)', {
-              sessionKey: this.opts.sessionKey,
-              attempt: nextAttempt,
-              nextAttempt,
-              delayMs,
-              errorClass: cls,
-              rpcCode: (startErr as JsonRpcCallError).rpcCode,
-            })
-            // 排定重试:进入退避前发 retrying 侧信道帧;所有退出路径(成功进入下一
-            // attempt / interrupt / 异常)经 finally 保证清 status:null,且在 turn/start
-            // 重发**前**清(不等 final)。
-            this.emitRetryingStatus({
-              attempt: nextAttempt,
-              max: retryState.max,
-              delayMs,
-              retryAt: Date.now() + delayMs,
-            })
-            const controller = new AbortController()
-            this.pendingRetryAbort = controller
-            // 审计 R8:每个退避窗口起点复位 proc-gone 标记(仅本窗口内 close/error 置位)。
-            this.retryBackoffProcGone = false
-            let interruptedDuringBackoff = false
-            try {
-              interruptedDuringBackoff = await this.abortableDelay(delayMs, controller.signal)
-            } finally {
-              this.pendingRetryAbort = null
-              this.emitTurnStatus(null)
-            }
-            // proc 在退避期间消失(crash close 置 proc=null / error 唤醒置
-            // retryBackoffProcGone / shutdown kill)→ 绝不把 turn/start 重发进死管道
-            // (writeRaw 静默失败、pending 无人 settle → runTurn 挂死)。转外层 catch
-            // 走终态(parser finalized 会与可能的 forced result 去重)。必须先于
-            // interrupt 判定:shutdown abort 与 proc-gone 唤醒的退避都走这里,不误报成
-            // USER_CANCELLED。审计 R8:retryBackoffProcGone 捕获 error 早于 close(proc
-            // 尚未置 null)的窗口,让其也判为 crashed 而非用户取消。
-            if (!this.proc || this.proc.killed || this.shuttingDown || this.retryBackoffProcGone) {
-              throw new Error('codex app-server gone during retry backoff')
-            }
-            if (interruptedDuringBackoff) {
-              // 用户在退避窗口内 interrupt():终止后继 attempt,走 USER_CANCELLED 终态
-              // (载荷对齐既有 interrupted 分支)。此路径无 turn 执行 → 无 partial usage。
-              this.activeTurnId = null
-              this.currentTurnCompleter = null
-              const cancelUsage = this.consumeActiveTurnUsage()
-              this.emitResult({
-                durationMs: Date.now() - startedAt,
-                ok: false,
-                error: 'codex turn interrupted',
-                usage: cancelUsage ? _codexUsageToAnthropicShape(cancelUsage) : undefined,
-                requestId,
-                rateLimits: this._consumeRateLimitsForEmit(),
-                stopReason: 'interrupted',
-                terminalCode: 'USER_CANCELLED',
-              })
-              return
-            }
-            continue
-          }
-          // 不满足重试门 → 抛给外层 catch 走终态(fail closed)。
-          throw startErr
-        }
-
-        log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
-          stage: 'turn_start_accepted', elapsedMs: performance.now() - timingStartedAt })
-        const turnId = tres?.turn?.id
-        if (typeof turnId !== 'string' || !turnId) {
-          throw new Error('turn/start did not return turn.id')
-        }
-        this.activeTurnId = turnId
-        if (this.pendingStartInterrupt) {
-          // OCV5-435: stopped while turn/start was in flight — interrupt now.
-          this.pendingStartInterrupt = false
-          this.interrupt()
-        }
-
-        const turn = await completed
-
-        // Drain any in-flight item-completed handlers (e.g. imageGeneration's
-        // base64 decode + writeFile, copyImagePathsToPublicDir for savedPath)
-        // that are still pending. codex emits item/completed before
-        // turn/completed, so by the time `await completed` resolves all of
-        // this turn's item handlers are already registered in the Set —
-        // a single snapshot Promise.allSettled is sufficient (no loop). Without
-        // this, currentAssistantBuf may snapshot empty for emitResult, and
-        // the handler's text_delta / tool_result frames arrive AFTER the
-        // result frame, by which point ccbMessageParser has already finalized
-        // and the frontend drops or mis-orders them.
-        if (this.inflightItemHandlers.size > 0) {
-          await Promise.allSettled([...this.inflightItemHandlers])
-        }
-
-        this.activeTurnId = null
-
-        const durationMs = Date.now() - startedAt
-        const status = turn?.status
-        // Compute per-turn usage delta from the most recent
-        // thread/tokenUsage/updated snapshot we observed during this turn.
-        // If codex never emitted one (e.g. an empty/no-LLM turn or a cancelled
-        // turn before the first call settled), fall through with usage=undefined.
-        const turnUsage = this.consumeActiveTurnUsage()
-        log.info('codex app-server turn end', {
-          sessionKey: this.opts.sessionKey,
-          status,
-          durationMs,
-          assistantChars: this.currentAssistantBuf.length,
-          ...(turnUsage
-            ? {
-                inputTokens: turnUsage.inputTokens,
-                outputTokens: turnUsage.outputTokens,
-                cachedInputTokens: turnUsage.cachedInputTokens,
-                reasoningOutputTokens: turnUsage.reasoningOutputTokens,
-              }
-            : {}),
-        })
-
-        const usagePayload = turnUsage ? _codexUsageToAnthropicShape(turnUsage) : undefined
-        // Issue A v1.0.108 — snapshot 当前最新已知 rateLimits piggy-back 到 billing 帧。
-        // **故意不 clear** this.latestRateLimits:让快照粘在 runner instance 上,后到
-        // notification 也能被下一 turn 带出。
-        // round-2 dedup(Codex review NEEDS-FIX 2):若与上次真正发出的快照相等(JSON 序列化对比),
-        // 则不带 rateLimits — 避免下游 quota.ts 在 30s throttle 过期后把同一份旧值再写一次,
-        // 把 quota_updated_at 假刷新成 NOW 误导 admin UI 以为 Codex 刚观测过。
-        const rateLimitsPayload = this._consumeRateLimitsForEmit()
-
-        if (status === 'completed') {
-          this.emitResult({
-            durationMs,
-            ok: true,
-            text: this.currentAssistantBuf,
-            usage: usagePayload,
-            requestId,
-            rateLimits: rateLimitsPayload,
-            // LOW-2:codex 'completed' = 正常终态 → Anthropic 口径 'end_turn'。
-            stopReason: 'end_turn',
-          })
-        } else if (status === 'failed') {
-          const errMsg = turn?.error?.message ?? 'codex turn failed'
-          const codexErrorInfo = turn?.error?.codexErrorInfo
-          // turn-retry 批:**不再注入裸文本** `[turn failed: ...]` text_delta —— 错误
-          // 只走结构化 errorClass + result 帧,不污染 assistant 正文(codexAdapter 的
-          // errorKind 分类改由 result.result → lastErrorText 承载)。
-          // **status='failed' 一律不自动重发 turn/start**(实测②:input 已落 thread,
-          // rollout response_item 在 API 调用前落盘且不回滚,持久化视图里失败 turn 记为
-          // completed/error:null 无法事后区分;重发 = 重复 user input)。thread/rollback
-          // 事后回滚方案登记为债(见 playbook turn-retry 批)。
-          const errorClass = this.classifyErrorClass(errMsg)
-          log.error('codex app-server turn failed status', {
-            sessionKey: this.opts.sessionKey,
-            errMsg,
-            ...(errorClass ? { errorClass } : {}),
-            // codexErrorInfo(turn.error 的附加字段,实测值 "other")仅进内部日志,
-            // 不进用户面。
-            ...(codexErrorInfo !== undefined ? { codexErrorInfo } : {}),
-          })
-          this.emitResult({
-            durationMs,
-            ok: false,
-            error: errMsg,
-            usage: usagePayload,
-            requestId,
-            rateLimits: rateLimitsPayload,
-            ...(errorClass ? { errorClass } : {}),
-          })
-        } else if (status === 'interrupted') {
-          // Reap the app-server BEFORE publishing USER_CANCELLED so a follow-up
-          // submit cannot inherit this proc's SIGTERM as SERVICE_RESTART.
-          this.activeTurnId = null
-          this.currentTurnCompleter = null
-          await this.recycleProcKeepQueue('user-cancelled')
-          this.emitResult({
-            durationMs,
-            ok: false,
-            error: 'codex turn interrupted',
-            usage: usagePayload,
-            requestId,
-            rateLimits: rateLimitsPayload,
-            stopReason: 'interrupted',
-            terminalCode: 'USER_CANCELLED',
-          })
-        } else {
-          this.emitResult({
-            durationMs,
-            ok: false,
-            error: `codex turn unexpected status=${status ?? 'unknown'}`,
-            usage: usagePayload,
-            requestId,
-            rateLimits: rateLimitsPayload,
-          })
-        }
-        // turn 已终态(completed/failed/interrupted/unexpected)→ 退出 attempt 循环。
-        return
-      }
-    } catch (err) {
-      if (this.recycleInflight) await this.recycleInflight
-      // Best-effort drain on the error path too. If turn/start failed
-      // before any item/completed arrived this is a no-op; if codex
-      // crashed mid-turn after firing item/completed, draining keeps
-      // the order of emit calls (their text_delta / tool_result before
-      // our error result frame) consistent with the happy path.
-      // Promise.allSettled never throws, so this can't shadow the
-      // original `err` we're about to surface.
-      if (this.inflightItemHandlers.size > 0) {
-        await Promise.allSettled([...this.inflightItemHandlers])
-      }
-      const failedTurnUsage = this.consumeActiveTurnUsage()
-      this.settleAllPendingUserInputs('turn failed')
-      this.activeTurnId = null
-      this.currentTurnCompleter = null
-      const durationMs = Date.now() - startedAt
-      if (this.pendingStartInterrupt) {
-        // OCV5-442: the user stopped this turn before it had an id, and it then
-        // failed before starting — typically the gateway's shutdown escalation
-        // after the Stop grace while the app-server was still initializing. The
-        // outcome is the user's Stop, as in the "stopped before turn/start" branch.
-        this.pendingStartInterrupt = false
-        log.info('codex turn stopped before start', {
-          sessionKey: this.opts.sessionKey,
-          err: (err as Error).message,
-        })
-        this.emitResult({
-          durationMs,
-          ok: false,
-          error: 'codex turn interrupted',
-          usage: failedTurnUsage ? _codexUsageToAnthropicShape(failedTurnUsage) : undefined,
-          requestId,
-          rateLimits: this._consumeRateLimitsForEmit(),
-          stopReason: 'interrupted',
-          terminalCode: 'USER_CANCELLED',
-        })
-        return
-      }
-      // turn-retry 批:catch 路径也结构化分类(非 unknown 才带 errorClass)。此路径
-      // 覆盖 turn/start 拒绝但**不满足重试门**、attach/spawn 失败、mid-turn 异常等。
-      const errMsg = `codex app-server: ${(err as Error).message}`
-      const errorClass = this.classifyErrorClass(errMsg)
-      log.error('codex app-server turn failed', {
-        sessionKey: this.opts.sessionKey,
-        err: (err as Error).message,
-        ...(errorClass ? { errorClass } : {}),
-      })
-      this.emitResult({
-        durationMs,
-        ok: false,
-        error: errMsg,
-        usage: failedTurnUsage ? _codexUsageToAnthropicShape(failedTurnUsage) : undefined,
-        requestId,
-        // Issue A v1.0.108 — catch 路径也走 dedup helper(notification 与 turn 异常
-        // 不耦合,init 阶段可能已经收到过快照,但若上一 turn 已发同值就别再发)。
-        rateLimits: this._consumeRateLimitsForEmit(),
-        ...(errorClass ? { errorClass } : {}),
-      })
-      // Do NOT re-throw — drain() catches and rejects the queue entry, but
-      // upstream sessionManager handles errors via the result message above.
-    } finally {
-      this.off('message', observeFirstDelta)
-      this.currentCollabAgentPolicy = undefined
-      this.activeRequestId = undefined
-      this.pendingStartInterrupt = false
-    }
+    return runTurnImpl.call(
+      this as unknown as CodexTurnExecutionHost,
+      prompt,
+      requestId,
+      collabAgentPolicy,
+      automaticRetryState,
+      traceId,
+      readOnly,
+      turnServiceTier,
+    )
   }
 
   private emitAssistantToolUse(id: string, name: string, input: unknown): void {

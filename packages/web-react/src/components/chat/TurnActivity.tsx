@@ -160,7 +160,7 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
     (recoveryKind === "waiting-service" || recoveryKind === "retrying") &&
     !info.hasVisibleProcess
   ) {
-    text = "正在恢复实时内容…";
+    text = "正在同步进展…";
     cls = "recovering";
   } else if (info.turnStatus === "engine_starting" || info.turnStatus === "engine_resuming") {
     // 引擎冷启动可见化:进程 spawn / 会话恢复期间不再显示误导性的「思考中」。
@@ -207,7 +207,7 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
 
   return (
     <div
-      className={cn("flex items-center gap-2 py-1 text-body text-muted", cls)}
+      className={cn("flex items-center gap-2.5 py-1.5 text-body text-muted", cls)}
       aria-label="生成中"
       aria-live="polite"
     >
@@ -216,7 +216,7 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
         {segments.map((segment, index) =>
           segment.elapsed ? (
             // biome-ignore lint/suspicious/noArrayIndexKey: 片段按位置稳定,无身份可取。
-            <span key={index} aria-hidden data-elapsed>
+            <span key={index} aria-hidden data-elapsed className="font-mono text-caption tabular-nums text-faint">
               {segment.text}
             </span>
           ) : (

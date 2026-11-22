@@ -8,9 +8,11 @@ import {
   ImagePlus,
   Link,
   List,
+  Mail,
   Send,
   Trash2,
-  UploadCloud,
+  Upload,
+  Users,
 } from 'lucide-react'
 import {
   type ClipboardEvent,
@@ -406,9 +408,14 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
   }
 
   return (
-    <SectionCard title="新建站内信" hint="卡片消息 · Markdown · 图片 · 数据图表">
+    <SectionCard
+      title="新建站内信"
+      hint="卡片消息 · Markdown · 图片 · 数据图表"
+      icon={Send}
+      iconTone="accent"
+    >
       {confirmEl}
-      <div className="flex flex-col gap-4">
+      <div className="flex flex-col gap-5">
         <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
           <Field label="收件范围">
             <Tabs
@@ -425,16 +432,22 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
                 onChange={(event) => setUserId(event.target.value)}
                 placeholder="例如 1234"
                 inputMode="numeric"
+                className="oc-field-control tabular-nums"
               />
             </Field>
           )}
         </div>
 
-        <div className="rounded-xl border border-border bg-elevated p-3 sm:p-4">
+        <div className="oc-surface-recessed rounded-xl p-3.5 sm:p-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <h3 className="text-body font-semibold text-fg">受众 dry-run</h3>
-              <p className="mt-1 text-meta text-faint">只计算受众，不创建消息；发送时将固化不可变收件人快照。</p>
+            <div className="flex items-start gap-2.5">
+              <span className="oc-icon-badge oc-icon-badge-info mt-0.5 size-8 rounded-lg">
+                <Users size={15} />
+              </span>
+              <div>
+                <h3 className="text-body font-semibold text-fg">受众 dry-run</h3>
+                <p className="mt-0.5 text-meta text-faint">只计算受众，不创建消息；发送时将固化不可变收件人快照。</p>
+              </div>
             </div>
             <Button variant="secondary" size="sm" onClick={() => void previewAudience()} disabled={previewBusy || busy}>
               <Eye size={14} />{previewBusy ? '计算中…' : '预览受众'}
@@ -442,15 +455,15 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
           </div>
           {previewError && <Alert tone="danger" density="compact" className="mt-3">{previewError}</Alert>}
           {audiencePreview && (
-            <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
-              <div className="rounded-lg bg-surface px-3 py-2">
+            <div className="mt-3.5 grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
+              <div className="oc-surface-card rounded-xl px-3.5 py-2.5">
                 <p className="text-caption text-faint">预计收件人</p>
                 <p className="mt-1 text-xl font-semibold tabular-nums text-fg">{audiencePreview.recipients}</p>
-                <p className="mt-1 text-caption text-faint">
+                <p className="mt-1 text-caption tabular-nums text-faint">
                   近30天接收量 p50 {audiencePreview.recipient_load.p50_30d} · p90 {audiencePreview.recipient_load.p90_30d} · max {audiencePreview.recipient_load.max_30d}
                 </p>
               </div>
-              <div className="min-w-0 rounded-lg bg-surface px-3 py-2">
+              <div className="oc-surface-card min-w-0 rounded-xl px-3.5 py-2.5">
                 <p className="text-caption text-faint">样本（仅供人工核对）</p>
                 <div className="mt-2 flex flex-wrap gap-1.5">
                   {audiencePreview.sample.length === 0 ? <span className="text-meta text-faint">无匹配用户</span> : audiencePreview.sample.map((user) => (
@@ -464,7 +477,7 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
           )}
           {audiencePreview && audiencePreview.recipient_load.max_30d > 20 && (
             <Alert tone="warning" density="compact" className="mt-3">
-              高负荷提示：该受众中单用户近30天最多已接收 {audiencePreview.recipient_load.max_30d} 条。仅透明提示，不自动阻断或静默缩小受众。
+              高负荷提示：该受众中单用户近30天最多已接收 <span className="tabular-nums">{audiencePreview.recipient_load.max_30d}</span> 条。仅透明提示，不自动阻断或静默缩小受众。
             </Alert>
           )}
         </div>
@@ -475,6 +488,7 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
             onChange={(event) => setTitle(event.target.value)}
             maxLength={200}
             placeholder="≤200 字"
+            className="oc-field-control"
           />
         </Field>
 
@@ -489,8 +503,8 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
           </div>
           <div
             className={cn(
-              'overflow-hidden rounded-xl border bg-surface transition-colors',
-              dragging ? 'border-accent ring-2 ring-ring' : 'border-border',
+              'oc-surface-card overflow-hidden rounded-xl transition-colors',
+              dragging && 'border-accent ring-2 ring-ring',
             )}
             onDragOver={(event) => {
               event.preventDefault()
@@ -501,7 +515,7 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
           >
             <div
               className={cn(
-                'flex flex-wrap items-center gap-0.5 border-b border-border bg-hover/50 px-2 py-1.5',
+                'oc-code-shell-header flex flex-wrap items-center gap-0.5 px-2.5 py-1.5',
                 mobilePane === 'preview' && 'hidden lg:flex',
               )}
             >
@@ -559,7 +573,7 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
             <div className="grid min-h-[22rem] lg:grid-cols-2">
               <div
                 className={cn(
-                  'min-w-0 border-border lg:block lg:border-r',
+                  'flex min-w-0 flex-col border-border/80 lg:flex lg:border-r',
                   mobilePane === 'preview' && 'hidden',
                 )}
               >
@@ -571,11 +585,11 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
                   rows={14}
                   maxLength={16_384}
                   placeholder="输入 Markdown，或把图片拖到这里…"
-                  className="min-h-[22rem] resize-y rounded-none border-0 bg-transparent font-mono text-body focus:ring-0"
+                  className="min-h-[22rem] flex-1 resize-y rounded-none border-0 bg-transparent font-mono text-body shadow-none focus:ring-0"
                 />
-                <div className="flex items-center justify-between border-t border-border px-3 py-2 text-caption text-faint">
+                <div className="flex items-center justify-between border-t border-border/80 bg-sidebar/40 px-3 py-2 text-caption text-faint dark:bg-elevated/35">
                   <span className="inline-flex items-center gap-1">
-                    <UploadCloud size={12} /> 最多 8 张，共 15 MiB
+                    <Upload size={12} /> 最多 8 张，共 15 MiB
                   </span>
                   <span className="tabular-nums">{body.length} / 16,384</span>
                 </div>
@@ -583,7 +597,7 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
 
               <div
                 className={cn(
-                  'min-w-0 bg-bg/50 p-3 lg:block sm:p-4',
+                  'oc-surface-recessed min-w-0 rounded-none border-0 p-3.5 lg:block sm:p-4',
                   mobilePane === 'edit' && 'hidden',
                 )}
               >
@@ -594,20 +608,20 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
         </Field>
 
         {assets.length > 0 && (
-          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+          <div className="grid gap-2.5 sm:grid-cols-2 lg:grid-cols-3">
             {assets.map((asset) => (
               <div
                 key={asset.clientId}
-                className="flex items-center gap-2 rounded-lg border border-border bg-surface p-2"
+                className="oc-surface-card oc-surface-card-hover flex items-center gap-2.5 rounded-xl p-2"
               >
                 <img
                   src={asset.previewUrl}
                   alt=""
-                  className="size-11 shrink-0 rounded-md object-cover"
+                  className="size-11 shrink-0 rounded-lg border border-border/60 object-cover"
                 />
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-meta font-medium text-fg">{asset.file.name}</p>
-                  <p className="text-caption text-faint">
+                  <p className="text-caption tabular-nums text-faint">
                     {(asset.file.size / 1024 / 1024).toFixed(2)} MiB
                   </p>
                 </div>
@@ -624,9 +638,9 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
         )}
 
         {hasExternalImage && (
-          <p className="rounded-lg bg-warning-soft px-3 py-2 text-[12px] leading-relaxed text-warning">
+          <div className="oc-callout oc-callout-warning rounded-xl px-3.5 py-2.5 text-[12px] leading-relaxed text-warning">
             外链图片会让第三方图片服务器看到收件人的 IP 与访问时间；敏感内容请使用平台上传。
-          </p>
+          </div>
         )}
 
         <div className="flex flex-wrap gap-4">
@@ -641,7 +655,7 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
               type="datetime-local"
               value={expires}
               onChange={(event) => setExpires(event.target.value)}
-              className="sm:w-56"
+              className="oc-field-control tabular-nums sm:w-56"
             />
           </Field>
         </div>
@@ -652,24 +666,41 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
           </Alert>
         )}
 
-        <Field label="邮件推送">
-          <div className="flex flex-col gap-1.5">
-            <div className="flex items-center gap-2.5">
-              <Switch
-                checked={notifyEmail && !emailDisabled}
-                disabled={emailDisabled}
-                onCheckedChange={setNotifyEmail}
-                aria-label="同时发邮件到用户邮箱"
-              />
-              <span className="text-body text-fg">
-                同时发邮件到用户邮箱（图片和图表降级为“登录站内信查看”）
-              </span>
+        <div className="oc-surface-recessed rounded-xl p-3.5 sm:p-4">
+          <Field label="邮件推送">
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center gap-2.5">
+                <Switch
+                  checked={notifyEmail && !emailDisabled}
+                  disabled={emailDisabled}
+                  onCheckedChange={setNotifyEmail}
+                  aria-label="同时发邮件到用户邮箱"
+                />
+                <span className="text-body text-fg">
+                  同时发邮件到用户邮箱（图片和图表降级为“登录站内信查看”）
+                </span>
+              </div>
+              <div
+                className={cn(
+                  'oc-callout flex items-center gap-2 rounded-lg px-3 py-2 text-meta',
+                  emailDisabled || emailCfg?.provider === 'stub'
+                    ? 'oc-callout-warning text-muted'
+                    : 'oc-callout-info text-muted',
+                )}
+              >
+                <Mail size={13} className="shrink-0 text-faint" />
+                <span>{emailHint}</span>
+              </div>
             </div>
-            <p className="text-meta text-faint">{emailHint}</p>
-          </div>
-        </Field>
+          </Field>
+        </div>
 
-        <div className="flex justify-end">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border/80 pt-4">
+          <p className="text-meta tabular-nums text-faint">
+            {audiencePreview
+              ? `受众已就绪 · 预计 ${audiencePreview.recipients} 位收件人`
+              : '请先执行「预览受众」确认收件范围后再发送'}
+          </p>
           <Button
             variant="primary"
             onClick={send}
@@ -688,8 +719,8 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
 function PreviewCard({ title, level, body }: { title: string; level: InboxLevel; body: string }) {
   const meta = INBOX_LEVEL_META[level]
   return (
-    <article className="mx-auto overflow-hidden rounded-xl border border-border bg-elevated shadow-soft">
-      <header className="border-b border-border px-4 py-3">
+    <article className="oc-surface-card mx-auto overflow-hidden rounded-xl">
+      <header className="border-b border-border/80 bg-sidebar/35 px-4 py-3 dark:bg-elevated/35">
         <div className="flex items-center justify-between gap-2">
           <p className="min-w-0 truncate text-title font-semibold text-fg">
             {title || '站内信标题'}
@@ -724,7 +755,7 @@ function ToolButton({
       aria-label={label}
       title={label}
       onClick={onClick}
-      className="size-8 text-muted"
+      className="oc-icon-btn-tactile size-8 text-muted hover:text-fg"
     >
       {children}
     </Button>

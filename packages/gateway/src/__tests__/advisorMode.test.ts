@@ -10,8 +10,11 @@ import {
   ADVISOR_PREAMBLE,
   advisorCanonicalModelId,
   assertAdvisorModelAllowed,
+  assertAdvisorReadOnlyNoTools,
   coerceHistoryMessages,
+  freezeAdvisorConsultContext,
   isAdvisorConsultParentEngine,
+  isConsultAdvisorToolName,
   uniquePendingConsultInvocationId,
   advisorConsultParentGate,
   buildAdvisorSnapshot,
@@ -506,17 +509,138 @@ describe('advisorMode snapshot', () => {
     assert.equal(hist.records?.[0]?.text, 'keep me')
   })
 
-  it('isAdvisorConsultParentEngine allows every main engine and closes unknowns', () => {
+  it('isAdvisorConsultParentEngine allows every main engine including antigravity and closes unknowns', () => {
     assert.equal(isAdvisorConsultParentEngine('ccb'), true)
     assert.equal(isAdvisorConsultParentEngine('codex'), true)
     assert.equal(isAdvisorConsultParentEngine('grok'), true)
     assert.equal(isAdvisorConsultParentEngine('cursor'), true)
+    assert.equal(isAdvisorConsultParentEngine('antigravity'), true)
     assert.equal(isAdvisorConsultParentEngine('zcode'), false)
+    assert.equal(advisorConsultParentGate('antigravity').allowed, true)
     assert.equal(advisorConsultParentGate('grok').allowed, true)
     assert.equal(advisorConsultParentGate('nope').allowed, false)
     assert.equal(advisorConsultParentGate(undefined).allowed, false)
     assert.match(String(advisorConsultParentGate(undefined).reason), /不能开顾问/)
     assert.doesNotMatch(String(advisorConsultParentGate('nope').reason), /CCB|tool_use|一期/)
+  })
+
+  it('recognizes Antigravity native MCP/shell consult calls and file tools for context freezing', () => {
+    assert.equal(isConsultAdvisorToolName('mcp_openclaude-memory_consult_advisor'), true)
+    assert.deepEqual(
+      uniquePendingConsultInvocationId([
+        { toolName: 'mcp_openclaude-memory_consult_advisor', toolUseId: 'ag_call_123456', completed: false },
+      ]),
+      { ok: true, invocationId: 'ag_call_123456' },
+    )
+    assert.deepEqual(
+      uniquePendingConsultInvocationId([
+        {
+          toolName: 'call_mcp_tool',
+          toolUseId: 'ag_lazy_mcp_01',
+          completed: false,
+          inputJson: { ServerName: 'openclaude-memory', ToolName: 'consult_advisor', Arguments: { question: 'check' } },
+        },
+      ]),
+      { ok: true, invocationId: 'ag_lazy_mcp_01' },
+    )
+    assert.deepEqual(
+      uniquePendingConsultInvocationId([
+        {
+          toolName: 'run_command',
+          toolUseId: 'ag_shell_0001',
+          completed: false,
+          inputJson: { CommandLine: 'oc-memory consult-advisor --question "review"' },
+        },
+      ]),
+      { ok: true, invocationId: 'ag_shell_0001' },
+    )
+
+    const paths = parentAuthorizedArtifactTexts({
+      userTask: '审阅设计稿',
+      currentTools: [
+        { name: 'view_file', input: { AbsolutePath: '/home/agent/.openclaude/generated/design.md' } },
+        { name: 'edit_file', input: { Path: '/home/agent/.openclaude/generated/plan.md' } },
+        { name: 'write_to_file', input: { TargetFile: '/home/agent/.openclaude/generated/spec.md' } },
+      ],
+    })
+    assert.deepEqual(paths, [
+      '/home/agent/.openclaude/generated/design.md',
+      '/home/agent/.openclaude/generated/plan.md',
+      '/home/agent/.openclaude/generated/spec.md',
+    ])
+  })
+
+  it('Antigravity main session freezes read-only consult context, refuses weak-model downgrade, and forbids advisor write tools', () => {
+    const provenModels = [
+      { id: 'gpt-6-astra', label: 'GPT-6 Astra', engine: 'codex' },
+      { id: 'MiniMax-M3', label: 'MiniMax M3', engine: 'ccb', providerId: 'minimax' },
+    ]
+    const mutableHistory = [{ role: 'user', text: '请用只读模式互审方案，不要改文件' }]
+    const mutableTools: Array<{ name?: string; input?: unknown; result?: string; completed?: boolean }> = [
+      { name: 'view_file', input: { AbsolutePath: '/repo/a.ts' }, result: 'ok', completed: true },
+    ]
+
+    const frozen = freezeAdvisorConsultContext({
+      parentEngine: 'antigravity',
+      requestedAdvisorModel: 'gpt-6-astra',
+      advisorModels: provenModels,
+      question: '这个并发锁设计是否存在竞态？',
+      concern: 'TOCTOU',
+      source: {
+        userTask: '请用只读模式互审方案，不要改文件',
+        readOnly: true,
+        injectedConstraints: '仅审阅不落盘',
+        historyRecords: mutableHistory,
+        currentTools: mutableTools,
+        authorizedArtifacts: [],
+      },
+      execution: { modelId: 'gpt-6-astra', engine: 'codex', providerId: 'codex' },
+      toolPolicy: { toolsDisabled: true, allowedTools: [] },
+    })
+
+    assert.equal(frozen.ok, true)
+    if (frozen.ok) {
+      assert.equal(frozen.parentEngine, 'antigravity')
+      assert.equal(frozen.advisorModel, 'gpt-6-astra')
+      assert.equal(Object.isFrozen(frozen.snapshot), true)
+      assert.equal(Object.isFrozen(frozen.snapshot.history), true)
+      assert.match(frozen.prompt, /你是无工具顾问/)
+      assert.ok(frozen.prompt.includes(ADVISOR_NO_WRITE_CONSTRAINT))
+
+      // Mutating caller arrays after freeze must not tamper with frozen snapshot
+      mutableHistory.push({ role: 'assistant', text: 'mutated later' })
+      mutableTools.push({ name: 'write_file', input: {}, result: 'mutated', completed: true })
+      assert.equal(frozen.snapshot.history?.length, 1)
+      assert.equal(frozen.snapshot.currentTools?.length, 1)
+    }
+
+    // Refuse silent downgrade to weaker/unproven model
+    const downgraded = freezeAdvisorConsultContext({
+      parentEngine: 'antigravity',
+      requestedAdvisorModel: 'weak-flash-unproven',
+      advisorModels: provenModels,
+      question: 'review',
+      concern: '',
+      source: { userTask: 'task' },
+    })
+    assert.equal(downgraded.ok, false)
+    if (!downgraded.ok) assert.equal(downgraded.code, 'ADVISOR_MODEL_DENIED')
+
+    // Refuse granting write or any tools to the advisor
+    const withWriteTool = freezeAdvisorConsultContext({
+      parentEngine: 'antigravity',
+      requestedAdvisorModel: 'gpt-6-astra',
+      advisorModels: provenModels,
+      question: 'review',
+      concern: '',
+      source: { userTask: 'task' },
+      toolPolicy: { toolsDisabled: true, allowedTools: ['write_file'] },
+    })
+    assert.equal(withWriteTool.ok, false)
+    if (!withWriteTool.ok) assert.equal(withWriteTool.code, 'ADVISOR_TOOLS_FORBIDDEN')
+
+    assert.equal(assertAdvisorReadOnlyNoTools({ toolsDisabled: false }).ok, false)
+    assert.equal(assertAdvisorReadOnlyNoTools({ toolsDisabled: true, allowedTools: [] }).ok, true)
   })
 
   it('uniquePendingConsultInvocationId uses one in-flight consult and never mints', () => {

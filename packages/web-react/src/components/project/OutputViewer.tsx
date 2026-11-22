@@ -1,5 +1,5 @@
 import { ArrowRight, Check, ChevronRight, Copy, Download, ExternalLink, History, RotateCcw } from "lucide-react";
-import { lazy, type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatBytes, openInNewTab } from "../../lib/chat/download";
 import { useProgressiveImage } from "../../lib/chat/useProgressiveImage";
 import type { ProjectAsset } from "../../lib/types";
@@ -33,6 +33,17 @@ import { OUTPUT_KIND_LABELS, outputKind } from "./projectHomeModel";
 
 // 全屏图片查看器（缩放 / 下载）只在点开大图时才需要，和聊天里的缩略图同一个懒块。
 const ImageViewer = lazy(() => import("../ImageViewer").then((m) => ({ default: m.ImageViewer })));
+// 统一复用右侧 Workbench 的全格式富预览器（按需懒加载，不进首屏入口包）。
+const DeliverableRichPreview = lazy(() =>
+  import("../chat/DeliverableRichPreview").then((m) => ({ default: m.DeliverableRichPreview })),
+);
+
+const BINARY_OFFICE_EXTS = new Set(["pptx", "ppt", "key", "odp", "xlsx", "xls", "xlsm", "ods", "numbers", "docx", "doc", "rtf", "odt", "pages"]);
+
+function extOfName(name: string): string {
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
+}
 
 /** 产出的字节来源：优先这一版自己的不可变副本（url），没有副本的旧登记才取源路径。 */
 export function outputSrc(a: Pick<ProjectAsset, "url" | "containerPath">): string | null {
@@ -182,11 +193,11 @@ function OutputThumb({ asset, visible, compact }: { asset: ProjectAsset; visible
       aria-hidden
       data-testid="output-thumb"
       className={cn(
-        "relative flex shrink-0 items-center justify-center overflow-hidden rounded-md border border-border bg-hover",
+        "oc-icon-badge relative flex shrink-0 items-center justify-center overflow-hidden rounded-lg",
         compact ? "size-9" : "size-11",
       )}
     >
-      <span className="font-mono text-[10px] font-semibold leading-none tracking-wide text-muted">
+      <span className="font-mono text-micro font-semibold leading-none tracking-wide text-muted">
         {extBadgeOf(asset.name)}
       </span>
       {isImage && src && visible && <ImageThumb src={src} />}
@@ -225,13 +236,13 @@ export function OutputRow({
       data-testid="output-row"
       data-output-kind={outputKind(asset)}
       className={cn(
-        "group flex w-full min-w-0 gap-3 text-left outline-none transition-colors duration-100 hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-        compact ? "min-h-11 items-center rounded-md px-2 py-2" : "min-h-12 items-start px-4 py-3",
+        "group flex w-full min-w-0 gap-3 text-left outline-none transition-colors duration-100 hover:bg-hover/70 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+        compact ? "min-h-11 items-center rounded-lg px-2 py-2" : "min-h-12 items-start px-4 py-3",
       )}
     >
       <OutputThumb asset={asset} visible={visible} compact={compact} />
       <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <span className="truncate text-[14px] font-medium leading-5 text-fg" title={asset.name}>
+        <span className="truncate text-body font-medium leading-5 text-fg" title={asset.name}>
           {asset.name}
         </span>
         {snippet && (
@@ -252,15 +263,22 @@ export function OutputRow({
             <span>{OUTPUT_KIND_LABELS[outputKind(asset)]}</span>
           )}
           <TimeAgo value={asset.createdAt} tooltip={false} />
-          {!compact && size && <span>{size}</span>}
-          {versions > 1 && <span data-testid="output-version-badge">v{versions}</span>}
+          {!compact && size && <span className="tabular-nums">{size}</span>}
+          {versions > 1 && (
+            <span
+              data-testid="output-version-badge"
+              className="oc-badge-craft rounded-full bg-accent-soft px-1.5 py-0.5 text-micro font-medium tabular-nums text-accent"
+            >
+              v{versions}
+            </span>
+          )}
         </MetaLine>
       </span>
       <ChevronRight
         size={15}
         strokeWidth={1.75}
         aria-hidden="true"
-        className="shrink-0 self-center text-faint transition-colors group-hover:text-muted"
+        className="shrink-0 self-center text-faint transition-transform duration-150 group-hover:translate-x-0.5 group-hover:text-muted"
       />
     </button>
   );
@@ -392,15 +410,22 @@ function TextPreview({
   if (text === null) {
     return <PreviewFallback title="这不是纯文本文件" hint="内容无法按文字显示，请下载后用合适的应用打开。" onDownload={onDownload} />;
   }
-  // Markdown 走站内的渲染器（react-markdown，不开原始 HTML；readOnly 不执行 HTML 围栏、图片只走签名/外链只读）。
-  // 无语言代码块不做同步语言探测（autoDetectCode=false）；整篇过长直接按纯文本显示 —— 外来文件
-  // 里一个几百 KB 的代码块就能让解析 + 高亮把主线程卡死、连关闭都点不动。
-  if (kind === "markdown" && text.length <= MARKDOWN_RENDER_MAX_CHARS) {
+  // Markdown / Marp 幻灯片与 CSV/TSV 表格统一复用 DeliverableRichPreview（按需懒加载），
+  // 让项目主页产出预览同样具备大纲目录跳转、16:9 幻灯片视图、表格筛选排序与带位置批注能力。
+  // 整篇过长仍按纯文本显示，避免大文件阻塞主线程。
+  const ext = extOfName(asset.name);
+  const isRichDelimited = kind === "text" && (ext === "csv" || ext === "tsv") && text.length <= MARKDOWN_RENDER_MAX_CHARS;
+  if ((kind === "markdown" && text.length <= MARKDOWN_RENDER_MAX_CHARS) || isRichDelimited) {
     return (
-      <div data-testid="output-preview-markdown" className="min-w-0">
-        <Markdown readOnly signMedia autoDetectCode={false}>
-          {text}
-        </Markdown>
+      <div className="min-w-0">
+        <Suspense fallback={<PreviewLoading />}>
+          <DeliverableRichPreview
+            path={outputSrc(asset) ?? asset.name}
+            name={asset.name}
+            text={text}
+            showActionBar={false}
+          />
+        </Suspense>
       </div>
     );
   }
@@ -521,19 +546,19 @@ function LoadedImagePreview({ asset, onDownload }: { asset: ProjectAsset; onDown
     return <PreviewFallback title="图片加载失败" hint="可以重试，或直接下载。" onDownload={onDownload} onRetry={reload} />;
   }
   return (
-    <div className="flex min-h-0 flex-1 items-center justify-center bg-hover p-3">
+    <div className="oc-surface-recessed flex min-h-0 flex-1 items-center justify-center p-4">
       {objectUrl && status === "loaded" ? (
         <button
           type="button"
           onClick={openZoom}
           aria-label={`放大查看 ${asset.name}`}
-          className="flex max-h-full max-w-full cursor-zoom-in items-center justify-center rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="flex max-h-full max-w-full cursor-zoom-in items-center justify-center rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           <img
             data-testid="output-preview-image"
             src={objectUrl}
             alt={asset.name}
-            className="max-h-[calc(100dvh-14rem)] max-w-full rounded-md object-contain md:max-h-[min(60dvh,32rem)]"
+            className="max-h-[calc(100dvh-14rem)] max-w-full rounded-xl object-contain shadow-pop md:max-h-[min(60dvh,32rem)]"
           />
         </button>
       ) : (
@@ -746,12 +771,23 @@ export function OutputViewer({
           <TextPreview kind={kind} asset={asset} onText={setText} onDownload={download} />
         )}
         {kind === "file" && (
-          <FileDetails
-            asset={asset}
-            sourceTitle={sourceTitle}
-            onOpenSession={canOpenSession ? openSession : undefined}
-            onShowVersions={versions > 1 ? showVersions : undefined}
-          />
+          <div className="flex flex-col gap-4">
+            {BINARY_OFFICE_EXTS.has(extOfName(asset.name)) && (
+              <Suspense fallback={<PreviewLoading />}>
+                <DeliverableRichPreview
+                  path={outputSrc(asset) ?? asset.name}
+                  name={asset.name}
+                  showActionBar={false}
+                />
+              </Suspense>
+            )}
+            <FileDetails
+              asset={asset}
+              sourceTitle={sourceTitle}
+              onOpenSession={canOpenSession ? openSession : undefined}
+              onShowVersions={versions > 1 ? showVersions : undefined}
+            />
+          </div>
         )}
       </div>
     </Modal>

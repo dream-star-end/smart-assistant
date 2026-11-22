@@ -270,6 +270,12 @@ async function startRig(opts: {
   /** B10:容器 attest 携带 durable-turn-dispatch-v1 → 走 dispatch 受理路径。 */
   durableDispatch?: boolean;
   containerLinkEnabled?: boolean;
+  /** OCV5-821: wire resolveContainerLinkEndpoint so rebuildContainerLinks() can dial the test container. */
+  containerLinkRecoveryEnabled?: boolean;
+  /** OCV5-821: optional bundleRev returned by resolveContainerLinkEndpoint / resolveContainerEndpoint. */
+  endpointBundleRev?: string;
+  loadAllowedModelChecker?: UserChatBridgeDeps["loadAllowedModelChecker"];
+  persistOutboundFrame?: UserChatBridgeDeps["persistOutboundFrame"];
   systemHelp?: boolean;
   issueSystemHelpBootstrap?: UserChatBridgeDeps['issueSystemHelpBootstrap'];
   /** M7 专用:容器不回 dispatch receipt，让 admitted lease 保持在 bridge drain map。 */
@@ -294,6 +300,8 @@ async function startRig(opts: {
   deferContainerSendCompletionForTest?: (complete: () => void) => void;
   /** B3(R3):注入 mock pgPool 观察受理后 pre-forward 失败出口的 casToTerminal(需三件套齐)。 */
   pgPool?: unknown;
+  /** OCV5-821: extend defaultDurablePgPool for containerLink recovery / session lookup queries. */
+  extraPgQuery?: (sql: string, params: unknown[]) => { rows: unknown[]; rowCount?: number } | null;
   /** OCV5-746:注入可观察的 preCheckRedis(默认空桩,断言不到 releaseReservation)。 */
   preCheckRedis?: unknown;
 }): Promise<Rig> {
@@ -376,6 +384,8 @@ async function startRig(opts: {
             return { rows: [], rowCount: 0 };
           if (/FROM turn_recovery_jobs/.test(sql) && /FOR UPDATE SKIP LOCKED/.test(sql))
             return { rows: [], rowCount: 0 };
+          const extraResult = opts.extraPgQuery?.(sql, params) ?? null;
+          if (extraResult !== null) return extraResult;
           const err = new Error(`unexpected durable rig pool query: ${sql}`);
           deferredPoolErrors.push(err);
           throw err;
@@ -432,6 +442,8 @@ async function startRig(opts: {
               ]);
               return { rows: [authorityBinding] };
             }
+            const extraClientResult = opts.extraPgQuery?.(sql, params) ?? null;
+            if (extraClientResult !== null) return extraClientResult;
             const err = new Error(`unexpected authority binding client query: ${sql}`);
             deferredPoolErrors.push(err);
             throw err;
@@ -580,11 +592,25 @@ async function startRig(opts: {
     jwtSecret: JWT_SECRET,
     issueSystemHelpBootstrap: opts.issueSystemHelpBootstrap,
     ...(opts.loadAgentModelResolver ? { loadAgentModelResolver: opts.loadAgentModelResolver } : {}),
+    ...(opts.loadAllowedModelChecker ? { loadAllowedModelChecker: opts.loadAllowedModelChecker } : {}),
+    ...(opts.persistOutboundFrame ? { persistOutboundFrame: opts.persistOutboundFrame } : {}),
     resolveContainerEndpoint: async () => ({
       host: "127.0.0.1",
       port: containerPort,
       containerId: CONTAINER_ID,
+      ...(opts.endpointBundleRev ? { bundleRev: opts.endpointBundleRev } : {}),
     }),
+    ...(opts.containerLinkRecoveryEnabled
+      ? {
+          resolveContainerLinkEndpoint: async (_uid, cid) => ({
+            host: "127.0.0.1",
+            port: containerPort,
+            containerId: cid,
+            ...(opts.endpointBundleRev ? { bundleRev: opts.endpointBundleRev } : {}),
+          }),
+          containerLinkRecovery: { channel: "v5", spacingMs: 1, retryMs: 5 },
+        }
+      : {}),
     containerConnectTimeoutMs: 1500,
     ...(modelAuthority ? { modelAuthority } : {}),
     ...(admitUserTurn ? { admitUserTurn } : {}),
@@ -3531,5 +3557,501 @@ describe('OCV5-746 chat turn model authority', () => {
     assert.equal(probe.bindingReleaseHits, 0, 'CAS 未命中不得释放远端绑定');
     assert.equal(probe.bindingState, 'running');
     assert.equal(probe.browserErrorFrames.length, 1, '身份合法的拒帧仍要给用户可绑定错误卡');
+  });
+});
+
+describe("OCV5-821: offline keepAlive and detached ContainerLink cron_origin delivery", () => {
+  test("rebuilt keepAlive recoveryOnly link delivers lsc-* callback when no browser is connected", { timeout: 15_000 }, async () => {
+    const admissions: AdmitUserTurnInput[] = [];
+    let carrierReturned = false;
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      containerLinkEnabled: true,
+      containerLinkRecoveryEnabled: true,
+      verifyDispatchReceipt: true,
+      extraPgQuery: (sql) => {
+        if (/SELECT model_id FROM client_sessions/.test(sql)) {
+          return { rows: [{ model_id: "glm-5.2" }], rowCount: 1 };
+        }
+        if (/SELECT DISTINCT d\.user_id, d\.agent_container_id::int AS container_id/.test(sql)) {
+          if (carrierReturned) return { rows: [], rowCount: 0 };
+          carrierReturned = true;
+          return { rows: [{ user_id: String(UID), container_id: CONTAINER_ID }], rowCount: 1 };
+        }
+        if (/SELECT d\.session_id,d\.client_message_id,d\.agent_id,d\.dispatch_id,d\.attempt_no,d\.lease_epoch/.test(sql)) {
+          return {
+            rows: [{
+              session_id: "sess-821-existing",
+              client_message_id: "existing-open",
+              agent_id: "main",
+              dispatch_id: "11111111-1111-4111-8111-111111111111",
+              attempt_no: 1,
+              lease_epoch: "1",
+            }],
+            rowCount: 1,
+          };
+        }
+        if (/FROM client_session_live_frames|AS after_seq/.test(sql)) {
+          return { rows: [{ after_seq: null, active_message_ids: [] }], rowCount: 1 };
+        }
+        if (/FROM turn_recovery_jobs/.test(sql)) {
+          return { rows: [], rowCount: 0 };
+        }
+        if (/FROM turn_dispatches/.test(sql) && /WHERE user_id = \$1 AND session_id = \$2 AND client_message_id = \$3/.test(sql)) {
+          return { rows: [], rowCount: 0 };
+        }
+        return null;
+      },
+      admitUserTurn: async (input) => {
+        admissions.push(input);
+        return fakeAdmittedDispatch(input);
+      },
+    });
+    try {
+      // Rebuild a background ContainerLink (recoveryOnly=true, userDetached=true, subscribers=0)
+      await rig.bridge.rebuildContainerLinks!();
+      await waitFor(() =>
+        rig.bridge.containerLinkSnapshots!().some((s) => s.uid === String(UID) && s.subscribers === 0) &&
+        rig.bridge._testGetCronOriginExecutor(String(UID)) !== null,
+      );
+
+      const res = await rig.bridge.injectCronOriginTurn({
+        uid: BigInt(UID),
+        sessionId: "sess-821-offline",
+        clientMessageId: "lsc-821-offline-keepalive",
+        agentId: "main",
+        text: "发布列车已上线",
+      });
+
+      assert.equal(res.kind, "injected", "offline rebuilt container-link must deliver cron_origin instead of returning no_transport after admit");
+      assert.equal(admissions.length, 1);
+      const sentFrame = rig.containerSeen
+        .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+        .find((f) => f.type === "inbound.message" && f.clientMessageId === "lsc-821-offline-keepalive");
+      assert.ok(sentFrame, "container must physically receive the lsc-* inbound.message frame");
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("last browser tab detaching while a dispatch is open still delivers lsc-* callback without orphaned admit", { timeout: 15_000 }, async () => {
+    const admissions: AdmitUserTurnInput[] = [];
+    const admittedByKey = new Map<string, TurnDispatchRow>();
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      containerLinkEnabled: true,
+      verifyDispatchReceipt: true,
+      extraPgQuery: (sql, params) => {
+        if (/SELECT model_id FROM client_sessions/.test(sql)) {
+          return { rows: [{ model_id: "glm-5.2" }], rowCount: 1 };
+        }
+        if (/FROM client_session_live_frames|AS after_seq/.test(sql)) {
+          return { rows: [{ after_seq: null, active_message_ids: [] }], rowCount: 1 };
+        }
+        if (/FROM turn_recovery_jobs/.test(sql)) {
+          return { rows: [], rowCount: 0 };
+        }
+        if (/container_link_heartbeat|UPDATE turn_dispatches SET lease_until/.test(sql)) {
+          return { rows: [], rowCount: 1 };
+        }
+        if (/FROM turn_dispatches/.test(sql) && /WHERE user_id = \$1 AND session_id = \$2 AND client_message_id = \$3/.test(sql)) {
+          const d = admittedByKey.get(`${String(params[1])}:${String(params[2])}`);
+          if (!d) return { rows: [], rowCount: 0 };
+          return {
+            rows: [{
+              dispatch_id: d.dispatchId,
+              user_id: d.userId.toString(),
+              session_id: d.sessionId,
+              client_message_id: d.clientMessageId,
+              agent_id: d.agentId,
+              model: d.model,
+              request_hash: d.requestHash,
+              billing_request_id: d.billingRequestId,
+              attempt_no: d.attemptNo,
+              status: d.status,
+              outcome: d.outcome,
+              failure_code: d.failureCode,
+              conflict_reason: d.conflictReason,
+              resolution: d.resolution,
+              resolved_at: d.resolvedAt,
+              client_notified: d.clientNotified,
+              owner_id: d.ownerId,
+              lease_epoch: String(d.leaseEpoch),
+              lease_until: d.leaseUntil,
+              anchor_seq: d.anchorSeq !== null ? d.anchorSeq.toString() : null,
+              admitted_at: d.admittedAt,
+              accepted_at: d.acceptedAt,
+              terminal_at: d.terminalAt,
+              last_attempt_at: d.lastAttemptAt,
+              visible_head: d.visibleHead,
+              visible_at: d.visibleAt,
+              producer_fenced_at: d.producerFencedAt,
+              shutdown_ctx: d.shutdownCtx,
+              agent_container_id: CONTAINER_ID,
+              runtime_kind: "docker",
+              trace_id: d.traceId,
+            }],
+            rowCount: 1,
+          };
+        }
+        return null;
+      },
+      admitUserTurn: async (input) => {
+        admissions.push(input);
+        const res = fakeAdmittedDispatch(input);
+        if (res.kind === "admitted") {
+          admittedByKey.set(`${input.sessionId}:${input.clientMessageId}`, res.dispatch);
+        }
+        return res;
+      },
+    });
+    let ws: WebSocket | undefined;
+    try {
+      ws = await openClient(rig.port);
+      await waitFor(() => rig.bridge._testGetCronOriginExecutor(String(UID)) !== null);
+      // Send a normal browser turn and have the container emit a non-final stream frame so hasOpenDispatches stays true.
+      ws.send(inboundFrame({
+        model: "glm-5.2",
+        peer: { id: "sess-821-open", kind: "dm" },
+        clientMessageId: "cm-821-open-turn",
+        idempotencyKey: "web:cm-821-open-turn:0",
+      }));
+      await waitFor(() => rig.containerSeen.some((raw) => raw.includes("cm-821-open-turn")));
+      const container = [...rig.containerWss.clients][0];
+      assert.ok(container);
+      container.send(JSON.stringify({
+        type: "outbound.message",
+        peer: { id: "sess-821-open", kind: "dm" },
+        clientMessageId: "cm-821-open-turn",
+        isFinal: false,
+        blocks: [{ kind: "text", text: "still running" }],
+      }));
+      await new Promise((r) => setTimeout(r, 30));
+      // Close the last browser tab (triggers detachUserSide -> userDetached=true, subscribers=0, link stays alive).
+      ws.close();
+      await waitFor(() =>
+        rig.bridge.containerLinkSnapshots!().some((s) => s.uid === String(UID) && s.subscribers === 0),
+      );
+
+      const res = await rig.bridge.injectCronOriginTurn({
+        uid: BigInt(UID),
+        sessionId: "sess-821-cb",
+        clientMessageId: "lsc-821-detached-open",
+        agentId: "main",
+        text: "发布列车已上线(离线回调)",
+      });
+      assert.equal(res.kind, "injected", "detached link with open dispatch must deliver cron_origin");
+      const sentFrame = rig.containerSeen
+        .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+        .find((f) => f.type === "inbound.message" && f.clientMessageId === "lsc-821-detached-open");
+      assert.ok(sentFrame, "container must physically receive lsc-821-detached-open");
+    } finally {
+      ws?.terminate();
+      await stopRig(rig);
+    }
+  });
+
+  test("closed browser with no open dispatch or keepAlive returns no_transport before calling admitUserTurn", { timeout: 15_000 }, async () => {
+    const admissions: AdmitUserTurnInput[] = [];
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      containerLinkEnabled: true,
+      admitUserTurn: async (input) => {
+        admissions.push(input);
+        return fakeAdmittedDispatch(input);
+      },
+    });
+    let ws: WebSocket | undefined;
+    try {
+      ws = await openClient(rig.port);
+      await waitFor(() => rig.bridge._testGetCronOriginExecutor(String(UID)) !== null);
+      ws.close();
+      await waitFor(() => rig.bridge.containerLinkSnapshots!().length === 0);
+
+      const res = await rig.bridge.injectCronOriginTurn({
+        uid: BigInt(UID),
+        sessionId: "sess-821-idle",
+        clientMessageId: "lsc-821-no-link",
+        agentId: "main",
+        text: "should not admit without transport",
+      });
+      assert.deepEqual(res, { kind: "no_transport" });
+      assert.equal(admissions.length, 0, "must never leave an orphaned admitted row when no transport is available");
+    } finally {
+      ws?.terminate();
+      await stopRig(rig);
+    }
+  });
+
+  test("rebuilt link loads bundleRev authz context for model-less cron_origin and fails closed when authz load fails", { timeout: 15_000 }, async () => {
+    const seenBundleRevs: Array<string | undefined> = [];
+    const buildQuery = (carrierFlag: { done: boolean }) => (sql: string) => {
+      if (/SELECT model_id FROM client_sessions/.test(sql)) {
+        return { rows: [{ model_id: null }], rowCount: 1 };
+      }
+      if (/SELECT DISTINCT d\.user_id, d\.agent_container_id::int AS container_id/.test(sql)) {
+        if (carrierFlag.done) return { rows: [], rowCount: 0 };
+        carrierFlag.done = true;
+        return { rows: [{ user_id: String(UID), container_id: CONTAINER_ID }], rowCount: 1 };
+      }
+      if (/SELECT d\.session_id,d\.client_message_id,d\.agent_id,d\.dispatch_id,d\.attempt_no,d\.lease_epoch/.test(sql)) {
+        return {
+          rows: [{
+            session_id: "sess-821-existing",
+            client_message_id: "existing-open",
+            agent_id: "main",
+            dispatch_id: "11111111-1111-4111-8111-111111111111",
+            attempt_no: 1,
+            lease_epoch: "1",
+          }],
+          rowCount: 1,
+        };
+      }
+      if (/FROM client_session_live_frames|AS after_seq/.test(sql)) {
+        return { rows: [{ after_seq: null, active_message_ids: [] }], rowCount: 1 };
+      }
+      if (/FROM turn_recovery_jobs/.test(sql)) return { rows: [], rowCount: 0 };
+      if (/FROM turn_dispatches/.test(sql) && /WHERE user_id = \$1 AND session_id = \$2 AND client_message_id = \$3/.test(sql)) {
+        return { rows: [], rowCount: 0 };
+      }
+      return null;
+    };
+
+    // Part A: authz loads with exact container bundleRev -> model-less main callback resolves glm-5.2 and injects.
+    const flagA = { done: false };
+    const rigA = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      containerLinkEnabled: true,
+      containerLinkRecoveryEnabled: true,
+      endpointBundleRev: "a1b2c3d4e5f6",
+      verifyDispatchReceipt: true,
+      loadAllowedModelChecker: async () => (modelId) => modelId === "glm-5.2",
+      loadAgentModelResolver: async (_uid, opts) => {
+        seenBundleRevs.push(opts?.bundleRev);
+        const fn = ((agentId: string) => (agentId === "main" ? "glm-5.2" : null)) as Awaited<ReturnType<NonNullable<UserChatBridgeDeps["loadAgentModelResolver"]>>>;
+        return fn;
+      },
+      extraPgQuery: buildQuery(flagA),
+      admitUserTurn: async (input) => fakeAdmittedDispatch(input),
+    });
+    try {
+      await rigA.bridge.rebuildContainerLinks!();
+      await waitFor(() =>
+        rigA.bridge.containerLinkSnapshots!().some((s) => s.uid === String(UID) && s.subscribers === 0) &&
+        rigA.bridge._testGetCronOriginExecutor(String(UID)) !== null,
+      );
+      const resA = await rigA.bridge.injectCronOriginTurn({
+        uid: BigInt(UID),
+        sessionId: "sess-821-nomodel",
+        clientMessageId: "lsc-821-authz-ok",
+        agentId: "main",
+        text: "no saved session model",
+      });
+      assert.equal(resA.kind, "injected");
+      assert.deepEqual(seenBundleRevs, ["a1b2c3d4e5f6"], "rebuilt bridge must load resolver with exact container bundleRev");
+    } finally {
+      await stopRig(rigA);
+    }
+
+    // Part B: authz load throws -> link still rebuilds for recovery, but origin fails closed without admitting.
+    const admissionsB: AdmitUserTurnInput[] = [];
+    const flagB = { done: false };
+    const rigB = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      containerLinkEnabled: true,
+      containerLinkRecoveryEnabled: true,
+      loadAgentModelResolver: async () => { throw new Error("seed bundle missing"); },
+      extraPgQuery: buildQuery(flagB),
+      admitUserTurn: async (input) => {
+        admissionsB.push(input);
+        return fakeAdmittedDispatch(input);
+      },
+    });
+    try {
+      await rigB.bridge.rebuildContainerLinks!();
+      await waitFor(() =>
+        rigB.bridge.containerLinkSnapshots!().some((s) => s.uid === String(UID) && s.subscribers === 0),
+      );
+      const resB = await rigB.bridge.injectCronOriginTurn({
+        uid: BigInt(UID),
+        sessionId: "sess-821-failclosed",
+        clientMessageId: "lsc-821-authz-fail",
+        agentId: "main",
+        text: "must fail closed",
+      });
+      assert.deepEqual(resB, { kind: "no_transport" });
+      assert.equal(admissionsB.length, 0, "authz-unready rebuilt link must not admit cron_origin");
+    } finally {
+      await stopRig(rigB);
+    }
+  });
+
+  test("cron_origin fresh identity rejection does not tear down shared ContainerLink or kill sibling in-flight stream", { timeout: 15_000 }, async () => {
+    const persistedFinalFrames: Array<{ sessionId: string; clientMessageId: string; frameSeq: number }> = [];
+    const admittedByKey = new Map<string, TurnDispatchRow>();
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      containerLinkEnabled: true,
+      verifyDispatchReceipt: true,
+      persistOutboundFrame: async (row) => {
+        const parsed = JSON.parse(row.payload) as { isFinal?: boolean };
+        if (parsed.isFinal === true) {
+          persistedFinalFrames.push({ sessionId: row.sessionId, clientMessageId: row.clientMessageId ?? "", frameSeq: row.frameSeq });
+        }
+      },
+      loadAgentModelResolver: async () => {
+        const fn = ((agentId: string) => (agentId === "main" ? "glm-5.2" : null)) as Awaited<ReturnType<NonNullable<UserChatBridgeDeps["loadAgentModelResolver"]>>>;
+        fn.isIdentityRegistered = (agentId: string) => agentId === "broken-agent";
+        fn.authorizeExecution = async (agentId: string) => {
+          if (agentId === "broken-agent") throw new Error("identity not ready");
+          return { identity: { requestedId: agentId, executionAgentId: agentId, status: "no-registration" as const }, model: "glm-5.2" };
+        };
+        return fn;
+      },
+      extraPgQuery: (sql, params) => {
+        if (/SELECT model_id FROM client_sessions/.test(sql)) return { rows: [{ model_id: "glm-5.2" }], rowCount: 1 };
+        if (/FROM client_session_live_frames|AS after_seq/.test(sql)) return { rows: [{ after_seq: null, active_message_ids: [] }], rowCount: 1 };
+        if (/FROM turn_recovery_jobs/.test(sql)) return { rows: [], rowCount: 0 };
+        if (/container_link_heartbeat|UPDATE turn_dispatches SET lease_until|SET status = 'terminal'/.test(sql)) return { rows: [], rowCount: 1 };
+        if (/FROM turn_dispatches/.test(sql) && /WHERE user_id = \$1 AND session_id = \$2 AND client_message_id = \$3/.test(sql)) {
+          const d = admittedByKey.get(`${String(params[1])}:${String(params[2])}`);
+          if (!d) return { rows: [], rowCount: 0 };
+          return {
+            rows: [{
+              dispatch_id: d.dispatchId, user_id: d.userId.toString(), session_id: d.sessionId,
+              client_message_id: d.clientMessageId, agent_id: d.agentId, model: d.model,
+              request_hash: d.requestHash, billing_request_id: d.billingRequestId, attempt_no: d.attemptNo,
+              status: d.status, outcome: d.outcome, failure_code: d.failureCode,
+              conflict_reason: d.conflictReason, resolution: d.resolution, resolved_at: d.resolvedAt,
+              client_notified: d.clientNotified, owner_id: d.ownerId, lease_epoch: String(d.leaseEpoch),
+              lease_until: d.leaseUntil, anchor_seq: d.anchorSeq !== null ? d.anchorSeq.toString() : null,
+              admitted_at: d.admittedAt, accepted_at: d.acceptedAt, terminal_at: d.terminalAt,
+              last_attempt_at: d.lastAttemptAt, visible_head: d.visibleHead, visible_at: d.visibleAt,
+              producer_fenced_at: d.producerFencedAt, shutdown_ctx: d.shutdownCtx,
+              agent_container_id: CONTAINER_ID, runtime_kind: "docker", trace_id: d.traceId,
+            }],
+            rowCount: 1,
+          };
+        }
+        return null;
+      },
+      admitUserTurn: async (input) => {
+        const res = fakeAdmittedDispatch(input);
+        if (res.kind === "admitted") admittedByKey.set(`${input.sessionId}:${input.clientMessageId}`, res.dispatch);
+        return res;
+      },
+    });
+    let ws: WebSocket | undefined;
+    try {
+      ws = await openClient(rig.port);
+      await waitFor(() => rig.bridge._testGetCronOriginExecutor(String(UID)) !== null);
+      // Start sibling stream A and keep it open while the last browser tab detaches.
+      ws.send(inboundFrame({
+        model: "glm-5.2",
+        peer: { id: "sess-821-survivor", kind: "dm" },
+        clientMessageId: "cm-821-survivor",
+        idempotencyKey: "web:cm-821-survivor:0",
+      }));
+      await waitFor(() => rig.containerSeen.some((raw) => raw.includes("cm-821-survivor")));
+      const container = [...rig.containerWss.clients][0];
+      assert.ok(container);
+      container.send(JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:sess-821-survivor",
+        frameSeq: 1,
+        peer: { id: "sess-821-survivor", kind: "dm" },
+        clientMessageId: "cm-821-survivor",
+        isFinal: false,
+        blocks: [{ kind: "text", text: "part 1" }],
+      }));
+      await new Promise((r) => setTimeout(r, 30));
+      ws.close();
+      await waitFor(() => rig.bridge.containerLinkSnapshots!().some((s) => s.uid === String(UID) && s.subscribers === 0));
+
+      // Inject failing cron_origin B whose registered identity rejects execution.
+      const resB = await rig.bridge.injectCronOriginTurn({
+        uid: BigInt(UID),
+        sessionId: "sess-821-rejected-id",
+        clientMessageId: "lsc-821-bad-identity",
+        agentId: "broken-agent",
+        text: "should reject without killing link",
+      });
+      assert.equal(resB.kind, "failed");
+      assert.equal(
+        rig.containerSeen.some((raw) => raw.includes("lsc-821-bad-identity")),
+        false,
+        "rejected identity must never be forwarded to container",
+      );
+      assert.equal(rig.bridge.containerLinkSnapshots!().length, 1, "shared ContainerLink must survive cron_origin identity rejection");
+
+      // Sibling stream A emits its final frame and must still be received and persisted.
+      container.send(JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:sess-821-survivor",
+        frameSeq: 2,
+        peer: { id: "sess-821-survivor", kind: "dm" },
+        clientMessageId: "cm-821-survivor",
+        isFinal: true,
+        blocks: [{ kind: "text", text: "done" }],
+      }));
+      await waitFor(() => persistedFinalFrames.some((f) => f.clientMessageId === "cm-821-survivor" && f.frameSeq === 2));
+    } finally {
+      ws?.terminate();
+      await stopRig(rig);
+    }
+  });
+
+  test("legacy bridge (no ContainerLink) in drain returns no_transport before calling admitUserTurn", { timeout: 15_000 }, async () => {
+    const admissions: AdmitUserTurnInput[] = [];
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      containerLinkEnabled: false,
+      holdDispatchReceipt: true,
+      admitUserTurn: async (input) => {
+        admissions.push(input);
+        return fakeAdmittedDispatch(input);
+      },
+    });
+    let ws: WebSocket | undefined;
+    try {
+      ws = await openClient(rig.port);
+      await waitFor(() => rig.bridge._testGetCronOriginExecutor(String(UID)) !== null);
+      // Put legacy bridge into in-flight admitted state so closing ws enters drain (detachUserSide without finalCleanup).
+      ws.send(inboundFrame({
+        model: "glm-5.2",
+        peer: { id: "sess-821-legacy", kind: "dm" },
+        clientMessageId: "cm-821-legacy-inflight",
+        idempotencyKey: "web:cm-821-legacy-inflight:0",
+      }));
+      await waitFor(() => rig.containerSeen.some((raw) => raw.includes("cm-821-legacy-inflight")));
+      assert.equal(admissions.length, 1);
+      const closed = new Promise<void>((r) => ws!.once("close", () => r()));
+      ws.close();
+      await closed;
+      await new Promise((r) => setTimeout(r, 30));
+
+      // Bridge is still in drain (container socket still open, executor still registered in map).
+      assert.equal(rig.containerWss.clients.size, 1, "legacy bridge must still be draining");
+      const res = await rig.bridge.injectCronOriginTurn({
+        uid: BigInt(UID),
+        sessionId: "sess-821-legacy-cb",
+        clientMessageId: "lsc-821-legacy-drain",
+        agentId: "main",
+        text: "must not admit during legacy drain",
+      });
+      assert.deepEqual(res, { kind: "no_transport" });
+      assert.equal(admissions.length, 1, "legacy bridge in drain must not call admitUserTurn for cron_origin");
+    } finally {
+      ws?.terminate();
+      for (const c of rig.containerWss.clients) c.terminate();
+      await stopRig(rig);
+    }
   });
 });

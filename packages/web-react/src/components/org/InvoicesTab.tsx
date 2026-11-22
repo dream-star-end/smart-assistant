@@ -190,161 +190,190 @@ export function InvoicesTab({
   }
 
   return (
-    <div className="flex flex-col">
+    <div className="flex flex-col gap-4 p-5">
       {!canManageBilling && (
-        <div className="px-5 pt-4">
-          <Alert tone="info" className="text-meta">
-            仅组织拥有者或财务委派人可管理发票抬头与申请开票，下方为开票申请记录（只读）。
-          </Alert>
-        </div>
+        <Alert tone="info" className="text-meta">
+          仅组织拥有者或财务委派人可管理发票抬头与申请开票，下方为开票申请记录（只读）。
+        </Alert>
       )}
 
       {/* 发票抬头(写:owner∥财务委派) */}
       {canManageBilling && (
-      <form onSubmit={saveProfile} className="px-5 py-4">
-        <div className="flex items-center gap-1.5 pb-2 text-caption font-medium uppercase tracking-wide text-faint">
-          <FileText size={13} /> 发票抬头
-        </div>
-        <div className="flex flex-col gap-2.5">
-          <Field label="发票抬头" required>
-            <Input
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              placeholder="公司全称"
-              required
-            />
-          </Field>
-          <Field label="税号">
-            <Input
-              value={taxId}
-              onChange={(e) => setTaxId(e.target.value)}
-              placeholder="统一社会信用代码"
-            />
-          </Field>
-          <Field label="地址">
-            <Input
-              value={address}
-              onChange={(e) => setAddress(e.target.value)}
-              placeholder="开票地址（选填）"
-            />
-          </Field>
-          <Field label="接收邮箱">
-            <Input
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              placeholder="电子发票接收邮箱（选填）"
-            />
-          </Field>
-        </div>
-        <div className="mt-3 flex items-center gap-2">
-          <Button
-            type="submit"
-            variant="primary"
-            size="sm"
-            disabled={savingProfile || title.trim().length === 0}
-          >
-            {savingProfile ? <Spinner size={14} /> : null}
-            保存抬头
-          </Button>
-          {profile?.updated_at && (
-            <span className="text-caption text-faint">上次更新 {shortTime(profile.updated_at)}</span>
-          )}
-        </div>
-      </form>
+        <form onSubmit={saveProfile} className="oc-surface-card rounded-xl p-4">
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="oc-icon-badge size-7 rounded-md">
+                <FileText size={14} strokeWidth={1.75} />
+              </span>
+              <span className="text-section font-semibold text-fg">发票抬头</span>
+            </div>
+            {profile?.updated_at && (
+              <span className="text-caption text-faint">上次更新 {shortTime(profile.updated_at)}</span>
+            )}
+          </div>
+          <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+            <Field label="发票抬头" required>
+              <Input
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder="公司全称"
+                required
+              />
+            </Field>
+            <Field label="税号">
+              <Input
+                value={taxId}
+                onChange={(e) => setTaxId(e.target.value)}
+                placeholder="统一社会信用代码"
+              />
+            </Field>
+            <Field label="地址">
+              <Input
+                value={address}
+                onChange={(e) => setAddress(e.target.value)}
+                placeholder="开票地址（选填）"
+              />
+            </Field>
+            <Field label="接收邮箱">
+              <Input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="电子发票接收邮箱（选填）"
+              />
+            </Field>
+          </div>
+          <div className="mt-3.5 flex items-center justify-end gap-2">
+            <Button
+              type="submit"
+              variant="primary"
+              size="sm"
+              disabled={savingProfile || title.trim().length === 0}
+            >
+              {savingProfile ? <Spinner size={14} /> : null}
+              保存抬头
+            </Button>
+          </div>
+        </form>
       )}
 
       {/* 按订单申请开票(写:owner∥财务委派) */}
       {canManageBilling && (
-      <div className="border-t border-border px-5 py-4">
-        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
-          选择已支付订单申请开票
-        </div>
-        {ordersErr ? (
-          <Alert tone="warning" className="text-meta">
-            {ordersErr}
-          </Alert>
-        ) : paidOrders.length === 0 ? (
-          <p className="py-2 text-meta text-faint">暂无可开票的已支付订单。</p>
-        ) : (
-          <>
-            <ul className="flex flex-col gap-1">
-              {paidOrders.map((o) => {
-                const pk = orderPk(o);
-                const checked = selected.has(pk);
-                return (
-                  <li key={pk}>
-                    <label
-                      className={cn(
-                        "flex cursor-pointer items-center gap-3 rounded-lg border px-3 py-2 transition-colors",
-                        checked ? "border-accent/50 bg-accent-soft" : "border-border hover:bg-hover",
-                      )}
-                    >
-                      {/* 整行 label 即命中区；复选框本体 16px 在触屏上难看清也难点准，升到 20px（审计 SET-11）。 */}
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        onChange={() => toggleOrder(pk)}
-                        className="size-5 shrink-0 accent-[var(--accent,#6d5efc)]"
-                      />
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate font-mono text-meta text-fg">
-                          {o.order_no}
-                        </span>
-                        <span className="block truncate text-caption text-faint">
-                          {o.paid_at ? shortTime(o.paid_at) : shortTime(o.created_at)}
-                        </span>
-                      </span>
-                      <span className="shrink-0 text-body font-medium tabular-nums text-fg">
-                        {formatCentsYuan(o.amount_cents)}
-                      </span>
-                    </label>
-                  </li>
-                );
-              })}
-            </ul>
-            <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
-              <span className="text-meta text-muted">
-                已选 {selected.size} 笔 · 合计{" "}
-                <span className="font-medium text-fg">{formatCentsYuan(selectedTotal)}</span>
+        <div className="oc-surface-card rounded-xl p-4">
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <span className="text-section font-semibold text-fg">选择已支付订单申请开票</span>
+            {paidOrders.length > 0 && (
+              <span className="oc-badge-craft rounded-full bg-hover px-2 py-0.5 text-caption font-medium tabular-nums text-muted">
+                {paidOrders.length} 笔可开票
               </span>
-              <Button
-                variant="primary"
-                size="sm"
-                onClick={submitInvoice}
-                disabled={submitting || selected.size === 0}
-              >
-                {submitting ? <Spinner size={14} /> : null}
-                申请开票
-              </Button>
-            </div>
-            {!profile?.title && (
-              <p className="mt-1.5 text-caption text-warning">请先在上方保存发票抬头再申请。</p>
             )}
-          </>
-        )}
-      </div>
+          </div>
+          {ordersErr ? (
+            <Alert tone="warning" className="text-meta">
+              {ordersErr}
+            </Alert>
+          ) : paidOrders.length === 0 ? (
+            <p className="oc-surface-recessed rounded-lg py-4 text-center text-meta text-faint">
+              暂无可开票的已支付订单。
+            </p>
+          ) : (
+            <>
+              <ul className="flex flex-col gap-1.5">
+                {paidOrders.map((o) => {
+                  const pk = orderPk(o);
+                  const checked = selected.has(pk);
+                  return (
+                    <li key={pk}>
+                      <label
+                        className={cn(
+                          "flex cursor-pointer items-center gap-3 rounded-xl border px-3.5 py-2.5 transition-colors",
+                          checked
+                            ? "border-accent/50 bg-accent-soft"
+                            : "oc-surface-card-hover border-border bg-surface hover:bg-hover/40",
+                        )}
+                      >
+                        {/* 整行 label 即命中区；复选框本体 16px 在触屏上难看清也难点准，升到 20px（审计 SET-11）。 */}
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleOrder(pk)}
+                          className="oc-checkbox-box size-5 shrink-0 accent-accent"
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate font-mono text-meta font-medium text-fg">
+                            {o.order_no}
+                          </span>
+                          <span className="block truncate text-caption text-faint">
+                            {o.paid_at ? shortTime(o.paid_at) : shortTime(o.created_at)}
+                          </span>
+                        </span>
+                        <span className="shrink-0 text-body font-semibold tabular-nums text-fg">
+                          {formatCentsYuan(o.amount_cents)}
+                        </span>
+                      </label>
+                    </li>
+                  );
+                })}
+              </ul>
+              <div className="oc-surface-recessed mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl px-3.5 py-2.5">
+                <span className="text-meta text-muted">
+                  已选 <span className="font-medium tabular-nums text-fg">{selected.size}</span> 笔 · 合计{" "}
+                  <span className="font-semibold tabular-nums text-fg">
+                    {formatCentsYuan(selectedTotal)}
+                  </span>
+                </span>
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={submitInvoice}
+                  disabled={submitting || selected.size === 0}
+                >
+                  {submitting ? <Spinner size={14} /> : null}
+                  申请开票
+                </Button>
+              </div>
+              {!profile?.title && (
+                <p className="mt-2 text-caption text-warning">请先在上方保存发票抬头再申请。</p>
+              )}
+            </>
+          )}
+        </div>
       )}
 
       {/* 申请状态(读:全员可见) */}
-      <div className="border-t border-border px-5 py-4">
-        <div className="flex items-center gap-1.5 pb-2 text-caption font-medium uppercase tracking-wide text-faint">
-          <ReceiptText size={13} /> 开票申请
+      <div className="oc-surface-card rounded-xl p-4">
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <span className="oc-icon-badge oc-icon-badge-info size-7 rounded-md">
+              <ReceiptText size={14} strokeWidth={1.75} />
+            </span>
+            <span className="text-section font-semibold text-fg">开票申请</span>
+          </div>
+          {invoices.length > 0 && (
+            <span className="oc-badge-craft rounded-full bg-hover px-2 py-0.5 text-caption font-medium tabular-nums text-muted">
+              {invoices.length}
+            </span>
+          )}
         </div>
         {invoicesErr ? (
           <Alert tone="warning" className="text-meta">
             {invoicesErr}
           </Alert>
         ) : invoices.length === 0 ? (
-          <p className="py-2 text-meta text-faint">暂无开票申请。</p>
+          <p className="oc-surface-recessed rounded-lg py-4 text-center text-meta text-faint">
+            暂无开票申请。
+          </p>
         ) : (
-          <ul className="flex flex-col gap-1.5">
+          <ul className="flex flex-col gap-2">
             {invoices.map((inv) => {
               const sm = reqStatusMeta(inv.status);
               return (
-                <li key={inv.id} className="rounded-lg border border-border px-3 py-2.5">
+                <li
+                  key={inv.id}
+                  className="oc-surface-recessed rounded-xl px-3.5 py-3"
+                >
                   <div className="flex items-center justify-between gap-3">
-                    <span className="text-section font-medium tabular-nums text-fg">
+                    <span className="text-section font-semibold tabular-nums text-fg">
                       {formatCentsYuan(inv.amount_cents)}
                     </span>
                     <Badge tone={sm.tone}>{sm.label}</Badge>
@@ -354,7 +383,7 @@ export function InvoicesTab({
                     {inv.order_ids.length} 笔订单 · {shortTime(inv.created_at)}
                   </div>
                   {inv.admin_note && (
-                    <div className="mt-1 text-caption text-muted">备注：{inv.admin_note}</div>
+                    <div className="mt-1.5 text-caption text-muted">备注：{inv.admin_note}</div>
                   )}
                 </li>
               );

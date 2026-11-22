@@ -1,18 +1,20 @@
-import { RotateCw } from "lucide-react";
+import { AlertTriangle, Info, RotateCw, ShieldAlert } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Badge, Button, Modal, useToast } from "../../../components/ui";
+import { cn } from "../../../lib/utils";
 import {
   type Column,
   CopyChip,
   DataTable,
   FilterBar,
   KeyValue,
+  SectionCard,
   SelectFilter,
   type SelectOption,
   TimeAgo,
 } from "../../components";
 import { adminGet, apiErrorMessage } from "../../lib/adminApi";
-import { FormatJsonValue } from "./diff";
+import { PayloadShell } from "./diff";
 import {
   SECURITY_EVENT_TYPE_LABELS,
   type SecurityEventRow,
@@ -38,19 +40,54 @@ function typeTone(type: string): "warning" | "danger" | "neutral" {
   return "neutral";
 }
 
-/** 安全事件详情：元信息 + 完整 detail JSON。 */
+function severityMeta(type: string): {
+  callout: string;
+  badge: string;
+  summary: string;
+} {
+  if (type === "route_blocked") {
+    return {
+      callout: "oc-callout-danger",
+      badge: "oc-icon-badge-danger",
+      summary: "请求已被安全策略阻断，请核对来源 IP 与目标路由。",
+    };
+  }
+  if (type === "route_bypass") {
+    return {
+      callout: "oc-callout-warning",
+      badge: "oc-icon-badge-warning",
+      summary: "管理员在受限路由触发了策略放行，请复核操作归属与上下文。",
+    };
+  }
+  return {
+    callout: "oc-callout-info",
+    badge: "oc-icon-badge-info",
+    summary: "安全审计事件记录，点击右侧按钮可复制原始 detail 载荷。",
+  };
+}
+
+/** 安全事件详情：严重度提示卡 + 元信息 + IDE 级 detail 载荷。 */
 function EventDetail({ row }: { row: SecurityEventRow }) {
+  const sev = severityMeta(row.type);
+
   return (
     <div className="flex flex-col gap-4">
-      <div className="rounded-lg border border-border bg-surface px-4 py-2">
-        <KeyValue
-          label="类型"
-          value={
-            <Badge tone={typeTone(row.type)}>
-              {typeLabel(row.type)}
-            </Badge>
-          }
-        />
+      <div className={cn("oc-callout flex items-start gap-3 rounded-xl px-4 py-3", sev.callout)}>
+        <span className={cn("oc-icon-badge mt-0.5 size-8 rounded-lg", sev.badge)}>
+          <ShieldAlert size={15} strokeWidth={1.9} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge tone={typeTone(row.type)}>{typeLabel(row.type)}</Badge>
+            {row.target && (
+              <span className="truncate font-mono text-caption text-muted">{row.target}</span>
+            )}
+          </div>
+          <p className="mt-1 text-meta text-muted">{sev.summary}</p>
+        </div>
+      </div>
+
+      <div className="oc-surface-recessed divide-y divide-border/60 rounded-xl px-4 py-1">
         <KeyValue
           label="触发者"
           value={
@@ -65,23 +102,31 @@ function EventDetail({ row }: { row: SecurityEventRow }) {
           label="对象"
           value={
             row.target ? (
-              <span className="font-mono text-meta break-all">{row.target}</span>
+              <CopyChip value={row.target} />
             ) : (
               <span className="text-faint">—</span>
             )
           }
         />
-        <KeyValue label="IP" value={<span className="font-mono text-meta">{row.ip ?? "—"}</span>} />
+        <KeyValue
+          label="IP"
+          value={<span className="font-mono text-meta tabular-nums">{row.ip ?? "—"}</span>}
+        />
         <KeyValue
           label="User-Agent"
           value={<span className="break-all text-meta text-muted">{row.user_agent ?? "—"}</span>}
         />
-        <KeyValue label="时间" value={<TimeAgo value={row.created_at} />} />
+        <KeyValue
+          label="时间"
+          value={
+            <span className="tabular-nums">
+              <TimeAgo value={row.created_at} />
+            </span>
+          }
+        />
       </div>
-      <div>
-        <p className="mb-1.5 text-meta font-medium text-faint">detail</p>
-        <FormatJsonValue value={row.detail} />
-      </div>
+
+      <PayloadShell title="detail" value={row.detail} />
     </div>
   );
 }
@@ -162,14 +207,13 @@ export function SecurityEventsTab() {
     {
       key: "created_at",
       title: "时间",
+      cellClassName: "tabular-nums",
       render: (r) => <TimeAgo value={r.created_at} />,
     },
     {
       key: "type",
       title: "类型",
-      render: (r) => (
-        <Badge tone={typeTone(r.type)}>{typeLabel(r.type)}</Badge>
-      ),
+      render: (r) => <Badge tone={typeTone(r.type)}>{typeLabel(r.type)}</Badge>,
     },
     {
       key: "actor_user_id",
@@ -190,7 +234,7 @@ export function SecurityEventsTab() {
     {
       key: "ip",
       title: "IP",
-      cellClassName: "font-mono text-[12px] text-muted",
+      cellClassName: "font-mono text-meta tabular-nums text-muted",
       render: (r) => r.ip ?? "—",
     },
     {
@@ -208,7 +252,7 @@ export function SecurityEventsTab() {
   ];
 
   return (
-    <div className="flex flex-col gap-3">
+    <div className="flex flex-col gap-4">
       <FilterBar>
         <SelectFilter label="类型" value={type} options={TYPE_OPTIONS} onChange={setType} />
         <Button
@@ -217,30 +261,69 @@ export function SecurityEventsTab() {
           onClick={() => setReloadTick((t) => t + 1)}
           title="刷新"
           aria-label="刷新"
+          className="oc-icon-btn-tactile"
         >
-          <RotateCw size={15} />
+          <RotateCw size={15} className={loading ? "animate-spin" : undefined} />
         </Button>
       </FilterBar>
 
-      {error && <p className="text-sm text-danger">加载失败：{apiErrorMessage(error, "加载失败")}</p>}
+      <div className="oc-callout oc-callout-info flex items-start gap-3 rounded-xl px-4 py-3 text-body leading-relaxed">
+        <span className="oc-icon-badge oc-icon-badge-info mt-0.5 size-7 rounded-lg">
+          <Info size={14} />
+        </span>
+        <p className="min-w-0 flex-1 text-muted">
+          记录管理策略放行与防火墙阻断的安全审计事件；点击任意行展开上下文与完整 detail 载荷。
+        </p>
+      </div>
 
-      <DataTable
-        columns={columns}
-        rows={rows}
-        rowKey={(r) => r.id}
-        loading={loading}
-        onRowClick={(r) => setSelected(r)}
-        emptyTitle="暂无安全事件"
-        emptyHint="调整过滤条件或稍后再试。"
-      />
-
-      {cursor && (
-        <div className="flex justify-center py-1">
-          <Button variant="secondary" size="sm" onClick={loadMore} disabled={loadingMore}>
-            {loadingMore ? "加载中…" : "加载更多"}
-          </Button>
+      {error && (
+        <div
+          role="alert"
+          className="oc-callout oc-callout-danger flex items-start gap-3 rounded-xl px-4 py-3 text-body"
+        >
+          <span className="oc-icon-badge oc-icon-badge-danger mt-0.5 size-7 rounded-lg">
+            <AlertTriangle size={14} />
+          </span>
+          <p className="min-w-0 flex-1 text-danger">
+            加载失败：{apiErrorMessage(error, "加载失败")}
+          </p>
         </div>
       )}
+
+      <SectionCard
+        title="安全事件记录"
+        hint="管理员绕过放行与防火墙阻断记录，按时间倒序排列"
+        icon={ShieldAlert}
+        iconTone="danger"
+        action={
+          !loading && (
+            <span className="oc-badge-craft rounded-full bg-hover px-2.5 py-0.5 font-mono text-caption text-muted tabular-nums">
+              已加载 {rows.length.toLocaleString("zh-CN")} 条
+            </span>
+          )
+        }
+        bodyClassName="p-0"
+      >
+        <DataTable
+          columns={columns}
+          rows={rows}
+          rowKey={(r) => r.id}
+          loading={loading}
+          onRowClick={(r) => setSelected(r)}
+          emptyTitle="暂无安全事件"
+          emptyHint="调整过滤条件或稍后再试。"
+          className="rounded-none border-0 shadow-none"
+          footer={
+            cursor ? (
+              <div className="flex justify-center">
+                <Button variant="secondary" size="sm" onClick={loadMore} disabled={loadingMore}>
+                  {loadingMore ? "加载中…" : "加载更多"}
+                </Button>
+              </div>
+            ) : undefined
+          }
+        />
+      </SectionCard>
 
       <Modal
         open={selected !== null}

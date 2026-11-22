@@ -13,6 +13,17 @@ import {
 import type { ChannelAdapter } from '@openclaude/plugin-sdk'
 import { type OpenClaudeConfig, readAgentsConfig, readConfig } from '@openclaude/storage'
 
+/** Resolve effective gateway listen port honoring OPENCLAUDE_GATEWAY_PORT override (dual-slot A=18791/B=18795). */
+export function resolveEffectiveGatewayPort(
+  configPort: number,
+  env: Readonly<Record<string, string | undefined>>,
+): number {
+  const trimmed = String(env.OPENCLAUDE_GATEWAY_PORT ?? '').trim()
+  if (!trimmed || !/^[0-9]+$/.test(trimmed)) return configPort
+  const parsed = Number(trimmed)
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535 ? parsed : configPort
+}
+
 export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
   let gw: Gateway | null = null
   let emergencyActive = false
@@ -119,9 +130,9 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
     ? resolve(here, '../../../web-react/dist')
     : resolve(here, '../../../web/public')
   let webAssetsPool: string | undefined
+  // 静态与商业端口 env 决策共用这一次读取。
+  const v5WebEnv = process.env
   if (isV5Channel) {
-    // v5 静态面的两个 env 决策共用这一次读取。
-    const v5WebEnv = process.env
     const decision = resolveV5WebRoot({
       releaseDist: webRoot,
       releaseRoot: resolve(here, '../../../..'),
@@ -153,9 +164,9 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
       // (spa=web-react/dist);透传避免 commercial 侧二次推导。vanilla(v3)不传 → 功能 inert。
       commercial = await mod.registerCommercial(null, {
         webDistDir: staticMode === 'spa' ? webRoot : undefined,
-        // 双 slot 的 gateway.port 不同(A=18790/B=18795)。Quick Tunnel 必须
-        // 回源到当前进程的实际监听端口,不能由 commercial 侧猜 slot。
-        gatewayPort: config.gateway.port,
+        // 双 slot 的 gateway.port 不同(A=18791/B=18795,经 OPENCLAUDE_GATEWAY_PORT 覆盖)。
+        // Quick Tunnel 必须回源到当前进程的实际监听端口,不能由 commercial 侧猜 slot。
+        gatewayPort: resolveEffectiveGatewayPort(config.gateway.port, v5WebEnv),
       })
       console.log('[cli] commercial module registered (v3 mode)')
     } catch (err) {

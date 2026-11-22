@@ -465,49 +465,54 @@ export function AuthGate({
   );
 
   return (
-    <div className="relative h-full overflow-y-auto bg-bg">
+    <div className="relative flex h-full flex-col overflow-y-auto bg-bg">
       <div
         aria-hidden
-        className="pointer-events-none absolute inset-0 opacity-70"
+        className="pointer-events-none fixed inset-0 opacity-70"
         style={{
           background:
             "radial-gradient(60% 50% at 50% -10%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 70%)",
         }}
       />
-      {onBack && mode !== "reset" && (
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={mode === "login" ? onBack : () => go("login")}
-          className="absolute left-4 top-4 z-10 gap-1.5 text-muted"
-        >
-          <ArrowLeft size={15} />
-          {mode === "login" ? "返回首页" : "返回登录"}
-        </Button>
-      )}
-      <div className="absolute right-4 top-4 z-10">
-        <ThemeToggle theme={theme} onCycle={onCycleTheme} />
-      </div>
+      <header className="relative z-10 w-full shrink-0 pt-[env(safe-area-inset-top,0px)]">
+        <div className="flex items-center justify-between px-4 py-3">
+          <div>
+            {onBack && mode !== "reset" && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={mode === "login" ? onBack : () => go("login")}
+                className="oc-spring-press gap-1.5 text-muted"
+              >
+                <ArrowLeft size={15} />
+                {mode === "login" ? "返回首页" : "返回登录"}
+              </Button>
+            )}
+          </div>
+          <ThemeToggle theme={theme} onCycle={onCycleTheme} />
+        </div>
+      </header>
 
       {/* 滚动容器内居中：内容短则垂直居中，内容高(注册4字段/小屏)则可滚动不被裁。 */}
-      <div className="flex min-h-full items-center justify-center px-5 py-12">
-      <div className="relative w-full max-w-[400px] animate-in">
+      <div className="relative flex flex-1 items-center justify-center px-5 pb-[max(2.5rem,env(safe-area-inset-bottom,0px))] pt-3">
+      <div className="relative w-full max-w-[400px]">
         <div className="mb-7 flex flex-col items-center text-center">
           {/* 品牌一致性:与落地页同一个「从」字方块(共享 BrandMark),
               替换原紫色渐变 Sparkles —— 用户从落地页点「登录」进来不再像换了个产品。 */}
-          <BrandMark className="mb-4 size-12" fontSize="text-[24px]" />
-          <h1 className="text-[22px] font-semibold tracking-tight text-fg">{titles[mode].h}</h1>
+          <BrandMark className="mb-4 size-12" fontSize="text-2xl" />
+          <h1 className="text-xl font-semibold tracking-tight text-fg">{titles[mode].h}</h1>
           <p className="mt-1.5 text-title text-muted">{titles[mode].sub}</p>
         </div>
 
         {/* ── 登录 ── */}
         {mode === "login" && (
           <form
+            key={mode}
             onSubmit={(e) => {
               e.preventDefault();
               submitLogin();
             }}
-            className="flex flex-col gap-3 rounded-xl border border-border bg-surface p-5 shadow-soft"
+            className="oc-surface-card animate-in flex flex-col gap-3 rounded-2xl p-6"
           >
             <label className="flex flex-col gap-1.5">
               <span className="text-body font-medium text-muted">邮箱</span>
@@ -565,7 +570,7 @@ export function AuthGate({
                 !password ||
                 (bypassKnown && !turnstileReady)
               }
-              className="mt-1 w-full gap-2 rounded-xl text-[14.5px]"
+              className="oc-btn-primary-craft oc-spring-press oc-icon-nudge mt-1 w-full gap-2 rounded-xl text-title"
             >
               {busyNow ? (
                 <><Spinner size={17} />正在登录…</>
@@ -586,7 +591,7 @@ export function AuthGate({
               </p>
             )}
 
-            <p className="mt-1 text-center text-[12px] leading-5 text-faint">
+            <p className="mt-1 text-center text-meta leading-5 text-faint">
               登录即代表你已阅读并同意<LegalLinks />
             </p>
           </form>
@@ -595,11 +600,12 @@ export function AuthGate({
         {/* ── 注册 ── */}
         {mode === "register" && (
           <form
+            key={mode}
             onSubmit={(e) => {
               e.preventDefault();
               void submitRegister();
             }}
-            className="flex flex-col gap-3 rounded-xl border border-border bg-surface p-5 shadow-soft"
+            className="oc-surface-card animate-in flex flex-col gap-3 rounded-2xl p-6"
           >
             <label className="flex flex-col gap-1.5">
               <span className="text-body font-medium text-muted">邮箱</span>
@@ -652,15 +658,39 @@ export function AuthGate({
                 placeholder="再输一次密码"
                 className="rounded-xl bg-bg"
               />
+              {confirmPw.length > 0 && (
+                <p
+                  data-testid="register-password-match"
+                  className={cn(
+                    "flex items-center gap-1 text-caption",
+                    password !== confirmPw
+                      ? "text-danger"
+                      : password.length >= MIN_PW
+                        ? "text-success"
+                        : "text-muted",
+                  )}
+                >
+                  {password !== confirmPw ? (
+                    "密码暂不一致"
+                  ) : password.length >= MIN_PW ? (
+                    <>
+                      <Check size={12} className="oc-check-pop shrink-0" />
+                      两次密码一致
+                    </>
+                  ) : (
+                    `密码一致，还需至少 ${MIN_PW} 位`
+                  )}
+                </p>
+              )}
             </div>
 
-            {/* 同意条款:触屏下 checkbox 放大到 20px、整行撑到 44px(a11y-B landing#2);桌面 13px 原样。 */}
-            <label className="flex items-start gap-2 text-[12.5px] leading-5 text-muted [@media(hover:none)]:min-h-11 [@media(hover:none)]:items-center">
+            {/* 同意条款:触屏下 checkbox 放大到 20px、整行撑到 44px(a11y-B landing#2);桌面 12px 原样。 */}
+            <label className="flex items-start gap-2 text-meta leading-5 text-muted [@media(hover:none)]:min-h-11 [@media(hover:none)]:items-center">
               <input
                 type="checkbox"
                 checked={agreeTerms}
                 onChange={(e) => setAgreeTerms(e.target.checked)}
-                className="mt-0.5 accent-[var(--accent,#6d5efc)] [@media(hover:none)]:mt-0 [@media(hover:none)]:size-5"
+                className="mt-0.5 accent-accent [@media(hover:none)]:mt-0 [@media(hover:none)]:size-5"
               />
               <span>
                 我已阅读并同意<LegalLinks />
@@ -675,7 +705,7 @@ export function AuthGate({
               type="submit"
               variant="primary"
               disabled={busyNow || !email.trim() || !password || !confirmPw || !turnstileReady}
-              className="mt-1 w-full gap-2 rounded-xl text-[14.5px]"
+              className="oc-btn-primary-craft oc-spring-press oc-icon-nudge mt-1 w-full gap-2 rounded-xl text-title"
             >
               {busyNow ? <Spinner size={17} /> : (<>创建账号<ArrowRight size={16} /></>)}
             </Button>
@@ -692,11 +722,12 @@ export function AuthGate({
         {/* ── 邮箱验证 ── */}
         {mode === "verify" && (
           <form
+            key={mode}
             onSubmit={(e) => {
               e.preventDefault();
               void submitVerify();
             }}
-            className="flex flex-col gap-3 rounded-xl border border-border bg-surface p-5 shadow-soft"
+            className="oc-surface-card animate-in flex flex-col gap-3 rounded-2xl p-6"
           >
             {noticeBox}
             <label className="flex flex-col gap-1.5">
@@ -708,7 +739,7 @@ export function AuthGate({
                 autoComplete="one-time-code"
                 placeholder="输入 6 位验证码"
                 // 0.4em 字距是给 6 位数字排版的,占位文案不能跟着被拉开成「请 输 入 …」。
-                className="rounded-xl bg-bg text-center text-[18px] tracking-[0.4em] placeholder:tracking-normal"
+                className="rounded-xl bg-bg text-center text-lg tracking-[0.4em] placeholder:tracking-normal"
               />
             </label>
 
@@ -718,7 +749,7 @@ export function AuthGate({
               type="submit"
               variant="primary"
               disabled={busyNow || !/^\d{6}$/.test(code.trim())}
-              className="mt-1 w-full gap-2 rounded-xl text-[14.5px]"
+              className="oc-btn-primary-craft oc-spring-press oc-icon-nudge mt-1 w-full gap-2 rounded-xl text-title"
             >
               {busyNow ? <Spinner size={17} /> : (<>验证并继续<ArrowRight size={16} /></>)}
             </Button>
@@ -739,11 +770,12 @@ export function AuthGate({
         {/* ── 忘记密码（发重置邮件）── */}
         {mode === "forgot" && (
           <form
+            key={mode}
             onSubmit={(e) => {
               e.preventDefault();
               void submitForgot();
             }}
-            className="flex flex-col gap-3 rounded-xl border border-border bg-surface p-5 shadow-soft"
+            className="oc-surface-card animate-in flex flex-col gap-3 rounded-2xl p-6"
           >
             {resetSent ? (
               <div className="flex flex-col items-center gap-3 py-3 text-center">
@@ -754,7 +786,7 @@ export function AuthGate({
                   如果 <span className="font-medium">{email.trim()}</span> 已注册，重置链接已发出。
                 </p>
                 <p className="text-meta text-faint">请查收邮件（含垃圾箱），点击链接设置新密码。</p>
-                <Button variant="secondary" onClick={() => go("login")} className="mt-1 rounded-xl">
+                <Button variant="secondary" onClick={() => go("login")} className="oc-spring-press mt-1 rounded-xl">
                   返回登录
                 </Button>
               </div>
@@ -780,7 +812,7 @@ export function AuthGate({
                   type="submit"
                   variant="primary"
                   disabled={busyNow || !email.trim() || !turnstileReady}
-                  className="mt-1 w-full gap-2 rounded-xl text-[14.5px]"
+                  className="oc-btn-primary-craft oc-spring-press oc-icon-nudge mt-1 w-full gap-2 rounded-xl text-title"
                 >
                   {busyNow ? <Spinner size={17} /> : (<>发送重置链接<ArrowRight size={16} /></>)}
                 </Button>
@@ -799,16 +831,17 @@ export function AuthGate({
         {/* ── 重置密码（邮件链接 token）── */}
         {mode === "reset" && (
           <form
+            key={mode}
             onSubmit={(e) => {
               e.preventDefault();
               void submitReset();
             }}
-            className="flex flex-col gap-3 rounded-xl border border-border bg-surface p-5 shadow-soft"
+            className="oc-surface-card animate-in flex flex-col gap-3 rounded-2xl p-6"
           >
             {!resetToken ? (
               <div className="flex flex-col items-center gap-3 py-3 text-center">
                 <p className="text-title text-fg">重置链接无效或已过期，请从邮件重新打开。</p>
-                <Button variant="secondary" onClick={() => go("forgot")} className="rounded-xl">
+                <Button variant="secondary" onClick={() => go("forgot")} className="oc-spring-press rounded-xl">
                   重新申请重置
                 </Button>
               </div>
@@ -849,7 +882,7 @@ export function AuthGate({
                   type="submit"
                   variant="primary"
                   disabled={busyNow || newPw.length < MIN_PW || !newPwConfirm}
-                  className="mt-1 w-full gap-2 rounded-xl text-[14.5px]"
+                  className="oc-btn-primary-craft oc-spring-press oc-icon-nudge mt-1 w-full gap-2 rounded-xl text-title"
                 >
                   {busyNow ? <Spinner size={17} /> : (<>重置密码<ArrowRight size={16} /></>)}
                 </Button>

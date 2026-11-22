@@ -1,3 +1,4 @@
+import '../styles/containerWebPreview.css'
 import {
   CONTAINER_PREVIEW_DESKTOP_VIEWPORT,
   CONTAINER_PREVIEW_MOBILE_VIEWPORT,
@@ -904,7 +905,7 @@ export function ContainerWebPreview({
       // .oc-center-dialog 会顶掉下面的 top/max-h;也不能用 fullscreen —— 那条带 md:
       // 桌面回落会把它拉回居中。定位权威留在这里。
       mobile="none"
-      className="left-0 top-[var(--oc-visual-offset-top,0px)] h-[var(--oc-visual-height,100dvh)] max-h-[var(--oc-visual-height,100dvh)] w-screen max-w-none translate-x-0 translate-y-0 rounded-none border-0 bg-[#0c0c11]"
+      className="preview-modal-root left-0 top-[var(--oc-visual-offset-top,0px)] h-[var(--oc-visual-height,100dvh)] max-h-[var(--oc-visual-height,100dvh)] w-screen max-w-none translate-x-0 translate-y-0 rounded-none border-0"
       bodyClassName="overflow-hidden p-0"
     >
       <div
@@ -938,7 +939,7 @@ export function ContainerWebPreview({
                 onClick={requestClose}
                 aria-label="关闭网页预览"
                 title="关闭 (Esc)"
-                className="preview-icon-button"
+                className="preview-icon-button oc-spring-press"
               >
                 <X size={19} />
               </button>
@@ -948,7 +949,7 @@ export function ContainerWebPreview({
                   disabled={!ready}
                   onClick={() => sendControl({ type: 'preview.navigate', action: 'back' })}
                   aria-label="后退"
-                  className="preview-icon-button"
+                  className="preview-icon-button oc-spring-press"
                 >
                   <ArrowLeft size={18} />
                 </button>
@@ -957,7 +958,7 @@ export function ContainerWebPreview({
                   disabled={!ready}
                   onClick={() => sendControl({ type: 'preview.navigate', action: 'forward' })}
                   aria-label="前进"
-                  className="preview-icon-button"
+                  className="preview-icon-button oc-spring-press"
                 >
                   <ArrowRight size={18} />
                 </button>
@@ -966,7 +967,7 @@ export function ContainerWebPreview({
                   disabled={!ready}
                   onClick={() => sendControl({ type: 'preview.navigate', action: 'reload' })}
                   aria-label="刷新网页"
-                  className="preview-icon-button"
+                  className="preview-icon-button oc-spring-press"
                 >
                   <RotateCw size={17} />
                 </button>
@@ -983,7 +984,7 @@ export function ContainerWebPreview({
                   <span className="block truncate text-meta font-semibold text-white/90">
                     {displayTitle}
                   </span>
-                  <span className="block truncate text-micro text-white/45">{displayUrl}</span>
+                  <span className="block truncate text-micro text-white/50">{displayUrl}</span>
                 </span>
               </div>
               <button
@@ -991,7 +992,7 @@ export function ContainerWebPreview({
                 disabled={!ready}
                 onClick={() => sendControl({ type: 'preview.navigate', action: 'reload' })}
                 aria-label="刷新网页"
-                className="preview-icon-button preview-mobile-reload"
+                className="preview-icon-button preview-mobile-reload oc-spring-press"
               >
                 <RotateCw size={17} />
               </button>
@@ -1020,7 +1021,7 @@ export function ContainerWebPreview({
                   }}
                   aria-label="切换兼容预览"
                   title="兼容模式（远程浏览器）"
-                  className="preview-icon-button"
+                  className="preview-icon-button oc-spring-press"
                 >
                   <RefreshCw size={16} />
                 </button>
@@ -1036,7 +1037,7 @@ export function ContainerWebPreview({
                 type="button"
                 onClick={leaveCommentMode}
                 aria-label="返回操作网页"
-                className="preview-icon-button"
+                className="preview-icon-button oc-spring-press"
               >
                 <ArrowLeft size={19} />
               </button>
@@ -1046,7 +1047,7 @@ export function ContainerWebPreview({
                 onClick={() => setSurface('commentsDrawer')}
                 aria-haspopup="dialog"
                 aria-expanded={surface === 'commentsDrawer'}
-                className="preview-comment-count"
+                className="preview-comment-count oc-spring-press"
               >
                 <ListChecks size={16} />
                 <span>{annotations.length} 条评论</span>
@@ -1056,7 +1057,7 @@ export function ContainerWebPreview({
                 disabled={annotations.length === 0}
                 onClick={submitReview}
                 title="只加入输入框，不会自动发送或附截图"
-                className="preview-primary-button"
+                className="preview-primary-button oc-spring-press"
               >
                 <span className="hidden min-[430px]:inline">加入输入框</span>
                 {/* 窄屏缩写也要说清动作是「加入」而不是「完成」—— 它只预填,不发送(审计 M-20)。 */}
@@ -1074,7 +1075,7 @@ export function ContainerWebPreview({
               aria-label="显示预览控制"
               aria-expanded="false"
               onClick={revealControls}
-              className="preview-icon-button"
+              className="preview-icon-button oc-spring-press"
             >
               <MoreHorizontal size={20} />
             </button>
@@ -1102,7 +1103,7 @@ export function ContainerWebPreview({
             data-fullscreen={fillsClientViewport}
             className={cn(
               'preview-viewport relative max-h-full max-w-full overflow-hidden',
-              !fillsClientViewport && (device === 'mobile' ? 'rounded-[28px]' : 'rounded-xl'),
+              !fillsClientViewport && (device === 'mobile' ? 'rounded-xl2' : 'rounded-xl'),
               fillsClientViewport && 'size-full max-h-none max-w-none rounded-none border-0',
               mode === 'comment' && ready && 'preview-viewport-selecting',
               hasError && 'preview-viewport-error',
@@ -1318,7 +1319,7 @@ export function ContainerWebPreview({
                   setSurface('none')
                   focusSoon(previewFocusTarget)
                 }}
-                className="preview-icon-button"
+                className="preview-icon-button oc-spring-press"
               >
                 <X size={18} />
               </button>
@@ -1342,13 +1343,13 @@ export function ContainerWebPreview({
                 }}
                 aria-label="输入网页文字"
                 placeholder="输入到网页当前焦点…"
-                className="min-w-0 flex-1 bg-transparent px-1 text-base text-white outline-none placeholder:text-white/35"
+                className="min-w-0 flex-1 bg-transparent px-1 text-base text-white outline-none placeholder:text-white/55 md:text-sm"
               />
               <button
                 type="submit"
                 disabled={!ready || !textInput}
                 aria-label="确认输入网页文字"
-                className="preview-composer-submit"
+                className="preview-composer-submit oc-spring-press"
               >
                 <Send size={17} />
               </button>
@@ -1460,15 +1461,15 @@ function PreviewStatus({
 }) {
   return (
     <output className="preview-status-pill" aria-live="polite">
-      <span className={cn('size-1.5 rounded-full', ready ? 'bg-emerald-400' : 'bg-amber-300')} />
+      <span className={cn('preview-status-dot', ready && 'preview-status-dot-ready')} />
       <span>{PHASE_LABEL[phase] ?? phase}</span>
       {ready && transport === 'direct' && (
-        <span className="hidden border-l border-white/10 pl-2 text-emerald-200/65 sm:inline">
+        <span className="preview-direct-badge hidden border-l border-white/10 pl-2 sm:inline">
           原生清晰预览
         </span>
       )}
       {frameStats && (
-        <span className="hidden border-l border-white/10 pl-2 text-white/40 lg:inline">
+        <span className="hidden border-l border-white/10 pl-2 text-white/45 lg:inline">
           {frameStats.width}×{frameStats.height} · {frameStats.fps} fps ·{' '}
           {frameStats.highQuality ? '高清' : '实时'}
           {frameStats.responseMs !== null ? ` · ${frameStats.responseMs} ms` : ''}
@@ -1510,7 +1511,11 @@ function PreviewError({
         <h2 className="preview-error-title">{copy.title}</h2>
         <p className="preview-error-copy">{copy.copy}</p>
         {retryable && (
-          <button type="button" onClick={onRetry} className="preview-primary-button mx-auto mt-3.5">
+          <button
+            type="button"
+            onClick={onRetry}
+            className="preview-primary-button oc-spring-press mx-auto mt-3.5"
+          >
             <RefreshCw size={16} />
             继续
           </button>
@@ -1550,7 +1555,10 @@ function PreviewActionButton({
       disabled={disabled}
       aria-pressed={label === '操作' || label === '评论' ? active : undefined}
       onClick={onClick}
-      className={cn('preview-action-button', active && 'preview-action-button-active')}
+      className={cn(
+        'preview-action-button oc-spring-press',
+        active && 'preview-action-button-active',
+      )}
     >
       <span className="preview-action-icon">{icon}</span>
       <span>{label}</span>
@@ -1576,7 +1584,10 @@ function DeviceButton({
       aria-label={`${label}预览`}
       aria-pressed={active}
       onClick={onClick}
-      className={cn('preview-device-button', active && 'preview-device-button-active')}
+      className={cn(
+        'preview-device-button oc-spring-press',
+        active && 'preview-device-button-active',
+      )}
     >
       {children}
       <span className="hidden lg:inline">{label}</span>
@@ -1619,7 +1630,7 @@ function CommentEditor({
           <div className="min-w-0 flex-1">
             <ElementSummary target={draft.target} />
             {draft.targetMissing && (
-              <p className="mt-2 text-xs leading-5 text-amber-200">
+              <p className="preview-warning-copy mt-2 text-xs leading-5">
                 页面变化后未找到这个元素，请在画面中重新选择后再保存。
               </p>
             )}
@@ -1629,7 +1640,7 @@ function CommentEditor({
             aria-label="收起评论编辑器"
             title="收起并保留草稿 (Esc)"
             onClick={onHide}
-            className="preview-icon-button -mr-1 -mt-1"
+            className="preview-icon-button oc-spring-press -mr-1 -mt-1"
           >
             <X size={17} />
           </button>
@@ -1642,13 +1653,13 @@ function CommentEditor({
           onKeyDown={(event) => {
             // ⌘/Ctrl+Enter 保存(审计 M-21);Enter 本身仍是换行。
             if (event.key !== 'Enter' || !(event.metaKey || event.ctrlKey)) return
-            if (event.nativeEvent.isComposing) return
+            if (event.nativeEvent.isComposing || event.keyCode === 229) return
             event.preventDefault()
             if (canSave) onSave()
           }}
           aria-label="描述网页修改"
           placeholder="例如：按钮改成品牌色，文案改为“立即开始”，移动端占满一行。"
-          className="mt-3 min-h-20 w-full resize-none bg-transparent text-sm leading-6 text-white outline-none placeholder:text-white/30"
+          className="mt-3 min-h-20 w-full resize-none bg-transparent text-base leading-6 text-white outline-none placeholder:text-white/55 md:text-sm"
         />
         <div className="mt-2 flex items-center justify-between gap-2 border-t border-white/10 pt-2">
           <div className="flex items-center gap-1">
@@ -1657,13 +1668,17 @@ function CommentEditor({
                 type="button"
                 aria-label="删除该评论"
                 onClick={onDelete}
-                className="preview-secondary-button preview-destructive-button"
+                className="preview-secondary-button preview-destructive-button oc-spring-press"
               >
                 <Trash2 size={15} />
                 删除
               </button>
             )}
-            <button type="button" onClick={onCancel} className="preview-secondary-button">
+            <button
+              type="button"
+              onClick={onCancel}
+              className="preview-secondary-button oc-spring-press"
+            >
               {draft.editingId ? '取消修改' : '取消草稿'}
             </button>
           </div>
@@ -1673,7 +1688,7 @@ function CommentEditor({
             onClick={onSave}
             aria-label={draft.editingId ? '保存评论' : '添加评论'}
             title="⌘/Ctrl + Enter"
-            className="preview-primary-button"
+            className="preview-primary-button oc-spring-press"
           >
             <Check size={15} />
             {draft.editingId ? '保存' : '添加评论'}
@@ -1753,7 +1768,7 @@ function CommentsDrawer({
                       {annotation.comment}
                     </span>
                     {annotation.missing && (
-                      <span className="mt-1 block text-xs text-amber-200">
+                      <span className="preview-warning-copy mt-1 block text-xs">
                         页面变化后未重新匹配
                       </span>
                     )}
@@ -1763,7 +1778,7 @@ function CommentsDrawer({
                   type="button"
                   aria-label={`删除评论 ${index + 1}`}
                   onClick={() => onDelete(annotation.id, index)}
-                  className="preview-icon-button preview-delete-button"
+                  className="preview-icon-button preview-delete-button oc-spring-press"
                 >
                   <Trash2 size={15} />
                 </button>

@@ -517,7 +517,9 @@ deliver_session() { # <id> <tid> <session_key> <body> <attempts>   (P2)
   payload="$(jq -cn --arg uid "$uid" --arg sid "$sid" --arg agent "$agent" --arg cmid "$tid" --arg text "$body" '{uid:$uid,sessionId:$sid,agentId:$agent,clientMessageId:$cmid,text:$text}')"
   resp="$(lease_callback_post "" "$payload" 2>&1)" || { retry_later "$id" "$attempts" "callback: ${resp:0:200}"; return; }
   code="${resp##*$'\n'}"; resp="${resp%$'\n'*}"
-  local kind; kind="$(printf '%s' "$resp" | jq -r '.kind // empty' 2>/dev/null || true)"
+  local kind reason
+  kind="$(printf '%s' "$resp" | jq -r '.kind // empty' 2>/dev/null || true)"
+  reason="$(printf '%s' "$resp" | jq -r '.reason // empty' 2>/dev/null || true)"
   case "$code:$kind" in
     200:injected)
       lease_tx <<SQL || true
@@ -532,6 +534,12 @@ SQL
       ;;
     200:gone)
       fallback_session "$id" "session gone → ticket" ;;
+    200:failed)
+      case "$reason" in
+        previously_failed|manual_hold|immutable_conflict|invalid_payload)
+          fallback_session "$id" "session callback terminal ($reason) → ticket" ;;
+        *) retry_later "$id" "$attempts" "http=$code kind=${kind:-?} ${resp:0:160}" ;;
+      esac ;;
     *) retry_later "$id" "$attempts" "http=$code kind=${kind:-?} ${resp:0:160}" ;;
   esac
 }

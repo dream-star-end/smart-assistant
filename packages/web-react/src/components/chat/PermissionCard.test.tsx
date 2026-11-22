@@ -270,7 +270,8 @@ describe("PermissionCard 过期判据 _askUserExpiresAt", () => {
       />,
     );
     expect(screen.queryByRole("dialog")).toBeNull();
-    expect(screen.getByText("已过期")).toBeInTheDocument();
+    expect(screen.getByText("等待时间较长")).toBeInTheDocument();
+    expect(screen.queryByText("已过期")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "回答" }));
     expect(screen.getByRole("dialog")).toBeInTheDocument();
   });
@@ -1091,7 +1092,7 @@ describe("未决态专审(PC-xx · t-875)", () => {
     expect(screen.getByText("2 / 2")).toBeInTheDocument();
   });
 
-  test("PC-03 活提问过期 fail-safe:卡头「已过期」旁补说明,「审批」仍可点;历史过期卡不出这行", () => {
+  test("PC-03 活提问超时 fail-safe:卡头不标「已过期」,不提时钟偏差,「审批」仍可点;历史过期卡保持已过期", () => {
     const { rerender } = render(
       <PermissionCard
         msg={bashPermMsg({ requestId: "req-failsafe", _askUserExpiresAt: Date.now() - 1000 })}
@@ -1099,8 +1100,11 @@ describe("未决态专审(PC-xx · t-875)", () => {
         livePrompt
       />,
     );
-    expect(screen.getByRole("status")).toHaveTextContent("已过期");
-    expect(screen.getByTestId("permission-expired-failsafe")).toHaveTextContent(/仍可作答/);
+    expect(screen.getByRole("status")).toHaveTextContent("等待时间较长");
+    expect(screen.getByRole("status")).not.toHaveTextContent("已过期");
+    const failsafe = screen.getByTestId("permission-expired-failsafe");
+    expect(failsafe).toHaveTextContent(/仍可作答/);
+    expect(failsafe.textContent ?? "").not.toMatch(/时钟偏差|已过期/);
     expect(screen.getByRole("button", { name: "审批" })).toBeInTheDocument();
     rerender(
       <PermissionCard
@@ -1109,6 +1113,7 @@ describe("未决态专审(PC-xx · t-875)", () => {
         livePrompt={false}
       />,
     );
+    expect(screen.getByRole("status")).toHaveTextContent("已过期");
     expect(screen.queryByTestId("permission-expired-failsafe")).toBeNull();
     expect(screen.getByText("提问已过期，无法再作答")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "审批" })).toBeNull();
@@ -1205,8 +1210,8 @@ describe("181 a753 countdown keeps the single expiry authority", () => {
   });
 });
 
-describe("问答卡继续", () => {
-  test("「继续」不提交任何 allow 答案", () => {
+describe("问答卡按钮语义（P0-3）与离屏单悬浮条（P1-2）", () => {
+  test("「回答」为 accent 主按钮，「跳过提问」为次要按钮且不提交 allow 答案", () => {
     const onRespond = vi.fn();
     render(
       <PermissionCard
@@ -1225,14 +1230,66 @@ describe("问答卡继续", () => {
       />,
     );
     expect(screen.queryByRole("dialog")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "继续" }));
+    expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
+    const answerBtn = screen.getByRole("button", { name: "回答" });
+    const skipBtn = screen.getByRole("button", { name: "跳过提问" });
+    expect(answerBtn.className).toContain("oc-btn-accent-craft");
+    expect(skipBtn.className).not.toContain("oc-btn-accent-craft");
+
+    fireEvent.click(skipBtn);
     expect(onRespond).toHaveBeenCalledTimes(1);
     const payload = onRespond.mock.calls[0][0];
-    expect(payload.behavior).not.toBe("allow");
+    expect(payload.behavior).toBe("deny");
+    expect(payload.message).toBe("User continued");
     expect(payload.updatedInput?.answers).toBeUndefined();
     const encoded = JSON.stringify(payload);
     expect(encoded).not.toContain("购买");
     expect(encoded).not.toContain("简约");
+  });
+
+  test("流内卡在视口内时隐藏悬浮条，滚出视口后展示唯一悬浮条", () => {
+    const msg = bashPermMsg({ requestId: "req-offscreen-sync" });
+    const scroller = document.createElement("div");
+    let cardTop = 100;
+    let cardBottom = 220;
+    scroller.getBoundingClientRect = () => ({
+      top: 0, bottom: 500, left: 0, right: 400, width: 400, height: 500, x: 0, y: 0, toJSON: () => ({}),
+    });
+    document.body.appendChild(scroller);
+    try {
+      render(
+        <>
+          <div id="pending-approval-bar-slot" />
+          <PermissionPromptHost
+            messages={[msg]}
+            onRespond={vi.fn()}
+            sending
+            sessionId="offscreen-sess"
+            scrollParent={scroller}
+          />
+        </>,
+      );
+      const inlineCard = document.createElement("div");
+      inlineCard.setAttribute("data-testid", "permission-card");
+      inlineCard.setAttribute("data-permission-request", msg.requestId!);
+      inlineCard.getBoundingClientRect = () => ({
+        top: cardTop, bottom: cardBottom, left: 0, right: 360, width: 360, height: 120, x: 0, y: cardTop, toJSON: () => ({}),
+      });
+      scroller.appendChild(inlineCard);
+
+      // 关闭自动弹出的弹窗后，流内卡仍在视口内 → 不叠显底部悬浮条
+      fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+      fireEvent.scroll(scroller);
+      expect(screen.queryByTestId("pending-approval-bar")).toBeNull();
+
+      // 滚出视口后 → 唯一悬浮条出现，防止卡死
+      cardTop = -200;
+      cardBottom = -80;
+      fireEvent.scroll(scroller);
+      expect(screen.getByTestId("pending-approval-bar")).toHaveAttribute("data-request-id", msg.requestId);
+    } finally {
+      scroller.remove();
+    }
   });
 });
 
@@ -1360,7 +1417,7 @@ describe("lazyTimelineCards PermissionCard 预热同步就绪", () => {
     }
   });
 
-  test("懒块挂起期间点击 pending-permission-dock 后切换 sessionId，旧请求占用被释放，新会话活提问自动弹窗不受阻塞", async () => {
+  test("懒块挂起期间切换 sessionId，不产生冗余吸顶 dock，新会话活提问自动弹窗不受阻塞", async () => {
     let resolveLoader!: (mod: typeof import("./PermissionCard")) => void;
     _setPermissionCardLoaderForTest(
       () =>
@@ -1383,9 +1440,7 @@ describe("lazyTimelineCards PermissionCard 预热同步就绪", () => {
       </>,
     );
 
-    const dockBtn = screen.getByRole("button", { name: "打开审批" });
-    fireEvent.click(dockBtn);
-    expect(activeModalRequest()).toBe("req-dock-a");
+    expect(screen.queryByTestId("pending-permission-dock")).toBeNull();
 
     rerender(
       <>
@@ -1399,10 +1454,6 @@ describe("lazyTimelineCards PermissionCard 预热同步就绪", () => {
         />
       </>,
     );
-
-    await waitFor(() => {
-      expect(activeModalRequest()).toBeNull();
-    });
 
     const realModule = await import("./PermissionCard");
     await act(async () => {

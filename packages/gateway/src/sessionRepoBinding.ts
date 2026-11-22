@@ -158,11 +158,13 @@ export function _checkRepoBindSession(
   sessionId: string,
 ): 'authorized' | 'queued' {
   const userId = this.getWsUserId(ws)
-  // grace window:hello 后 5s 内,任何 bind 帧引用其 peerIds 视作 authorized。
-  // 帮 race:bind 在 hello 之后但 message 注册之前到达。
+  // grace window:hello 后 5s 内,任何 bind 帧引用其 peerId 视作 authorized。
+  // 帮 race:bind 在 hello 之后但 message 注册之前到达。按 peerId 独立记录时间戳,
+  // 避免共享 ContainerLink 拆发多 peer hello 时互相覆盖宽限窗 (OCV5-819 B6)。
   const recent = this._recentHelloPeers.get(ws)
-  if (recent && Date.now() - recent.recordedAt <= REPO_BIND_HELLO_GRACE_MS) {
-    if (recent.peerIds.has(sessionId)) return 'authorized'
+  const recordedAt = recent?.get(sessionId)
+  if (recordedAt !== undefined && Date.now() - recordedAt <= REPO_BIND_HELLO_GRACE_MS) {
+    return 'authorized'
   }
   // 直查 clientsByPeer:Codex Phase 4.7 #1 — makePeerKey 是 `userId:channel:peerId`
   // (3 parts),不是 4 parts。直接构造预期 key 避免格式漂移 bug。

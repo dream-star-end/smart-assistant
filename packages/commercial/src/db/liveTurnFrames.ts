@@ -18,11 +18,17 @@ import {
   touchDispatchLeaseOnLiveFrame,
 } from "../dispatch/turnDispatchStore.js";
 import {
+  LIVE_UNIT_CHECKPOINT_STATEMENT_TIMEOUT_MS,
   deleteLiveUnitCheckpoints,
+  isLiveUnitCheckpointDegraded,
   loadOpenDispatchLiveUnitCheckpoint,
+  markLiveUnitCheckpointDegraded,
   scheduleLiveUnitCheckpoint,
   upsertLiveUnitCheckpoint,
 } from "./liveUnitCheckpoints.js";
+
+export const LIVE_UNITS_READ_MAX_ROWS = 4_000;
+export const LIVE_UNITS_READ_MAX_BYTES = 8 * 1024 * 1024;
 
 /** OCV5-57 audit r1 B3: in-process producer fence + terminal cache. */
 export const PRODUCER_FENCE_TTL_MS = 6 * 60 * 60_000;
@@ -182,6 +188,110 @@ function sha256(payload: Buffer): string {
   return createHash("sha256").update(payload).digest("hex");
 }
 
+function hasPgUnsafeJsonString(value: unknown): boolean {
+  if (typeof value === "string") {
+    for (let i = 0; i < value.length; i += 1) {
+      const code = value.charCodeAt(i);
+      if (code === 0) return true;
+      if (code >= 0xd800 && code <= 0xdbff) {
+        const next = value.charCodeAt(i + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          i += 1;
+          continue;
+        }
+        return true;
+      }
+      if (code >= 0xdc00 && code <= 0xdfff) return true;
+    }
+    return false;
+  }
+  if (Array.isArray(value)) {
+    return value.some(hasPgUnsafeJsonString);
+  }
+  if (value !== null && typeof value === "object") {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (hasPgUnsafeJsonString(k) || hasPgUnsafeJsonString(v)) return true;
+    }
+  }
+  return false;
+}
+
+function toPgSafeJsonString(value: unknown): string | null {
+  try {
+    if (hasPgUnsafeJsonString(value)) return null;
+    const serialized = JSON.stringify(value);
+    if (!serialized || serialized.includes("\\u0000")) return null;
+    return serialized;
+  } catch {
+    return null;
+  }
+}
+
+export interface LiveStreamFactPointers {
+  isStatus: boolean;
+  statusJson: string | null;
+  isUsage: boolean;
+  usageJson: string | null;
+}
+
+/**
+ * Extract PG-JSONB-safe latest turn_status / turn_usage pointer snapshots from
+ * one outbound wire payload. Fast-paths out via substring probe so ordinary
+ * text/tool delta frames incur zero JSON.parse overhead. Payloads containing
+ * NUL or lone surrogates still set `isStatus`/`isUsage = true` with `null` JSON
+ * so `persistGatewayLiveFrame` advances `latest_turn_*_seq` and invalidates any
+ * older cached JSONB pointer (B5 freshness).
+ */
+export function extractSafeLiveStreamFactPointers(
+  payloadStr: string,
+  frameSeq: number,
+): LiveStreamFactPointers {
+  const maybeStatus = payloadStr.includes('"outbound.turn_status"');
+  const maybeUsage = payloadStr.includes('"outbound.turn_usage"');
+  if (!maybeStatus && !maybeUsage) {
+    return { isStatus: false, statusJson: null, isUsage: false, usageJson: null };
+  }
+  let parsed: Record<string, unknown>;
+  try {
+    const raw = JSON.parse(payloadStr) as unknown;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return { isStatus: false, statusJson: null, isUsage: false, usageJson: null };
+    }
+    parsed = raw as Record<string, unknown>;
+  } catch {
+    return { isStatus: false, statusJson: null, isUsage: false, usageJson: null };
+  }
+  if (parsed.type === "outbound.turn_status") {
+    const statusPayload: Record<string, unknown> = {
+      frameSeq,
+      type: "outbound.turn_status",
+      status: parsed.status ?? null,
+    };
+    if (parsed.retry !== undefined) statusPayload.retry = parsed.retry;
+    if (parsed.detail !== undefined) statusPayload.detail = parsed.detail;
+    return {
+      isStatus: true,
+      statusJson: toPgSafeJsonString(statusPayload),
+      isUsage: false,
+      usageJson: null,
+    };
+  }
+  if (
+    parsed.type === "outbound.turn_usage" &&
+    parsed.usage !== null &&
+    typeof parsed.usage === "object" &&
+    !Array.isArray(parsed.usage)
+  ) {
+    return {
+      isStatus: false,
+      statusJson: null,
+      isUsage: true,
+      usageJson: toPgSafeJsonString({ frameSeq, usage: parsed.usage }),
+    };
+  }
+  return { isStatus: false, statusJson: null, isUsage: false, usageJson: null };
+}
+
 /**
  * Retrying the same live-frame journal write cannot resolve an identity or
  * immutable-payload conflict. The bridge duck-types this exact flag so these
@@ -242,6 +352,7 @@ export async function persistGatewayLiveFrame(
   const payload = Buffer.from(input.payload, "utf8");
   const payloadSha256 = sha256(payload);
   const sessionUserId = `c:${input.uid.toString()}`;
+  const factPointers = extractSafeLiveStreamFactPointers(input.payload, input.frameSeq);
 
   const persisted = await retryOnSerializationFailure(() => withTx(pool, async (client) => {
     // Lock the dispatch row BEFORE reading tape state, in a SEPARATE statement:
@@ -317,17 +428,62 @@ export async function persistGatewayLiveFrame(
     const stream = await client.query(
       `INSERT INTO client_session_live_streams
          (stream_key,session_id,user_id,client_message_id,dispatch_id,attempt_no,
-          agent_container_id,source,projection_source,terminal_status,tape_id,tape_sha256)
+          agent_container_id,source,projection_source,terminal_status,tape_id,tape_sha256,
+          latest_turn_status_json,latest_turn_usage_json,
+          latest_turn_status_seq,latest_turn_usage_seq)
        VALUES (
          $1,$2,$3,$4,$5::uuid,$6,$7,'gateway',
-         $8,$9,$10,$11
+         $8,$9,$10,$11,$12::jsonb,$13::jsonb,
+         CASE WHEN $15::boolean THEN $14::bigint ELSE 0 END,
+         CASE WHEN $16::boolean THEN $14::bigint ELSE 0 END
        )
        ON CONFLICT (stream_key) DO UPDATE SET
          updated_at=NOW(),
+         provenance=CASE
+           WHEN EXCLUDED.dispatch_id IS NULL
+             THEN client_session_live_streams.provenance - 'retired_at'
+           ELSE client_session_live_streams.provenance
+         END,
          client_message_id=CASE
            WHEN EXCLUDED.dispatch_id IS NULL
              THEN COALESCE(EXCLUDED.client_message_id,client_session_live_streams.client_message_id)
            ELSE client_session_live_streams.client_message_id
+         END,
+         latest_turn_status_json=CASE
+           WHEN $15::boolean
+             AND (
+               client_session_live_streams.latest_turn_status_seq IS NULL
+               OR client_session_live_streams.latest_turn_status_seq <= $14::bigint
+             )
+             THEN EXCLUDED.latest_turn_status_json
+           ELSE client_session_live_streams.latest_turn_status_json
+         END,
+         latest_turn_status_seq=CASE
+           WHEN $15::boolean
+             AND (
+               client_session_live_streams.latest_turn_status_seq IS NULL
+               OR client_session_live_streams.latest_turn_status_seq <= $14::bigint
+             )
+             THEN $14::bigint
+           ELSE client_session_live_streams.latest_turn_status_seq
+         END,
+         latest_turn_usage_json=CASE
+           WHEN $16::boolean
+             AND (
+               client_session_live_streams.latest_turn_usage_seq IS NULL
+               OR client_session_live_streams.latest_turn_usage_seq <= $14::bigint
+             )
+             THEN EXCLUDED.latest_turn_usage_json
+           ELSE client_session_live_streams.latest_turn_usage_json
+         END,
+         latest_turn_usage_seq=CASE
+           WHEN $16::boolean
+             AND (
+               client_session_live_streams.latest_turn_usage_seq IS NULL
+               OR client_session_live_streams.latest_turn_usage_seq <= $14::bigint
+             )
+             THEN $14::bigint
+           ELSE client_session_live_streams.latest_turn_usage_seq
          END
        WHERE client_session_live_streams.session_id=EXCLUDED.session_id
          AND client_session_live_streams.user_id=EXCLUDED.user_id
@@ -361,6 +517,11 @@ export async function persistGatewayLiveFrame(
         finalizedTape?.status ?? null,
         finalizedTape?.tape_id ?? null,
         finalizedTape?.tape_sha256 ?? null,
+        factPointers.statusJson,
+        factPointers.usageJson,
+        input.frameSeq,
+        factPointers.isStatus,
+        factPointers.isUsage,
       ],
     );
     if ((stream.rowCount ?? 0) !== 1) {
@@ -807,6 +968,8 @@ export async function readClientSessionLiveFrames(
 
 export type ReadClientSessionLiveUnitsOptions = ServeLiveUnitsOptions & {
   deadlineMs?: number;
+  maxReadRows?: number;
+  maxReadBytes?: number;
 };
 
 function parseLiveFrameRow(row: {
@@ -842,6 +1005,7 @@ async function readOpenDispatchStreamMeta(
   tapeProjectionVersion: number;
   streamGeneration: number;
   lineage: string[];
+  currentStreamKeys: string[];
 } | null> {
   const session = await client.query(
     "SELECT 1 FROM client_sessions WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL",
@@ -918,6 +1082,7 @@ async function readOpenDispatchStreamMeta(
     tapeProjectionVersion,
     streamGeneration: streamGenerationFromLineage(lineage, currentStreamKeys),
     lineage,
+    currentStreamKeys,
   };
 }
 
@@ -956,65 +1121,199 @@ export async function readClientSessionLiveUnits(
   userId: string,
   options?: ReadClientSessionLiveUnitsOptions,
 ): Promise<LiveUnitsPage | null> {
-  const snapshot = await withTx(pool, async (client) => {
-    const meta = await readOpenDispatchStreamMeta(client, sessionId, userId);
-    if (!meta) return null;
-    if (meta.streamClientMessageIds.length === 0) {
-      return { meta, frames: [] as LiveFrameInput[], checkpoint: null as Awaited<ReturnType<typeof loadOpenDispatchLiveUnitCheckpoint>> };
-    }
-    const checkpoint = await loadOpenDispatchLiveUnitCheckpoint(
-      client,
-      sessionId,
-      userId,
-      OPEN_DISPATCH_STREAM_SQL,
-    );
-    const afterRecordId = checkpoint ? checkpoint.state.throughRecordId : "0";
-    const rows = (
-      await client.query<{
-        record_id: string;
-        stream_key: string;
-        client_message_id: string | null;
-        payload: Buffer;
-        payload_sha256: string | null;
-      }>(
-        `SELECT f.record_id::text,f.stream_key,s.client_message_id,f.payload,f.payload_sha256
-           FROM client_session_live_streams s
-           JOIN client_session_live_frames f ON f.stream_key=s.stream_key
-          WHERE s.user_id=$2 AND s.session_id=$1
-            AND ${OPEN_DISPATCH_STREAM_SQL}
-            AND f.record_id>$3::bigint
-          ORDER BY f.record_id`,
-        [sessionId, userId, afterRecordId],
+  const maxReadRows = Math.max(1, options?.maxReadRows ?? LIVE_UNITS_READ_MAX_ROWS);
+  const maxReadBytes = Math.max(1024, options?.maxReadBytes ?? LIVE_UNITS_READ_MAX_BYTES);
+
+  type BoundedFrameRow = {
+    record_id: string;
+    stream_key: string;
+    client_message_id: string | null;
+    payload: Buffer | null;
+    payload_sha256: string | null;
+    nbytes?: string | number | null;
+    rn?: string | number | null;
+  };
+
+  const queryBoundedOpenFrames = async (
+    client: PoolClient,
+    afterRecordId: string,
+    rowBudget: number,
+    byteBudget: number,
+  ): Promise<BoundedFrameRow[]> => {
+    const safeRowBudget = Math.max(0, rowBudget);
+    const safeByteBudget = Math.max(0, byteBudget);
+    return (
+      await client.query<BoundedFrameRow>(
+        `WITH candidates AS (
+           SELECT f.record_id, f.stream_key, s.client_message_id, f.payload_sha256,
+                  octet_length(f.payload) AS nbytes,
+                  ROW_NUMBER() OVER (ORDER BY f.record_id ASC) AS rn
+             FROM client_session_live_streams s
+             JOIN client_session_live_frames f ON f.stream_key = s.stream_key
+            WHERE s.user_id = $2
+              AND s.session_id = $1
+              AND ${OPEN_DISPATCH_STREAM_SQL}
+              AND f.record_id > $3::bigint
+            ORDER BY f.record_id ASC
+            LIMIT $4
+         ), picked AS (
+           SELECT record_id, stream_key, client_message_id, payload_sha256, nbytes, rn,
+                  SUM(nbytes) OVER (ORDER BY record_id ASC) AS cum_bytes
+             FROM candidates
+         )
+         SELECT p.record_id::text, p.stream_key, p.client_message_id, p.payload_sha256, p.nbytes, p.rn,
+                CASE WHEN p.rn <= $5 AND p.cum_bytes <= $6 THEN f.payload ELSE NULL END AS payload
+           FROM picked p
+           LEFT JOIN client_session_live_frames f
+             ON f.record_id = p.record_id
+            AND p.rn <= $5
+            AND p.cum_bytes <= $6
+          WHERE (p.rn <= $5 AND p.cum_bytes <= $6)
+             OR (p.rn <= $5 AND p.record_id = (
+                  SELECT MIN(p2.record_id) FROM picked p2 WHERE p2.rn <= $5 AND p2.cum_bytes > $6
+                ))
+             OR p.rn = $4
+          ORDER BY p.record_id ASC`,
+        [sessionId, userId, afterRecordId, safeRowBudget + 1, safeRowBudget, safeByteBudget],
       )
     ).rows;
-    return { meta, frames: rows.map(parseLiveFrameRow), checkpoint };
+  };
+
+  const parseBoundedRows = (
+    rows: BoundedFrameRow[],
+    rowBudget: number,
+    initialBytes: number,
+  ): { ok: true; frames: LiveFrameInput[]; totalBytes: number } | { ok: false; reason: "budget" | "parse_error" } => {
+    if (rows.length > rowBudget) return { ok: false, reason: "budget" };
+    let totalBytes = initialBytes;
+    for (const row of rows) {
+      if ((row.rn != null && Number(row.rn) > rowBudget) || row.payload == null) {
+        return { ok: false, reason: "budget" };
+      }
+      const rowBytes =
+        row.nbytes != null && Number.isFinite(Number(row.nbytes))
+          ? Number(row.nbytes)
+          : Buffer.isBuffer(row.payload)
+            ? row.payload.byteLength
+            : Buffer.byteLength(String(row.payload), "utf8");
+      totalBytes += rowBytes;
+      if (totalBytes > maxReadBytes) return { ok: false, reason: "budget" };
+    }
+    const frames: LiveFrameInput[] = [];
+    for (const row of rows) {
+      try {
+        frames.push(parseLiveFrameRow({
+          record_id: row.record_id,
+          stream_key: row.stream_key,
+          client_message_id: row.client_message_id,
+          payload: row.payload!,
+          payload_sha256: row.payload_sha256,
+        }));
+      } catch {
+        return { ok: false, reason: "parse_error" };
+      }
+    }
+    return { ok: true, frames, totalBytes };
+  };
+
+  const snapshot = await withTx(pool, async (client) => {
+    await client.query(`SET LOCAL statement_timeout = '${LIVE_UNIT_CHECKPOINT_STATEMENT_TIMEOUT_MS}'`);
+    const meta = await readOpenDispatchStreamMeta(client, sessionId, userId);
+    if (!meta) return null;
+    const singleStreamKey = meta.currentStreamKeys.length === 1 ? meta.currentStreamKeys[0]! : null;
+    if (meta.streamClientMessageIds.length === 0) {
+      return {
+        meta,
+        singleStreamKey,
+        degradedReason: null as "fallback" | "budget" | "parse_error" | null,
+        frames: [] as LiveFrameInput[],
+        totalBytes: 0,
+        checkpoint: null as Awaited<ReturnType<typeof loadOpenDispatchLiveUnitCheckpoint>>,
+      };
+    }
+    // Only use per-stream degraded circuit-breaker and per-stream checkpoint when there
+    // is a single active open stream. Multi-open-stream sessions bypass single-stream
+    // checkpoints and rebuild from record 0 under the shared budget so one stream's
+    // checkpoint can never shadow an earlier sibling stream (OCV5-819 B8).
+    if (singleStreamKey !== null && isLiveUnitCheckpointDegraded(singleStreamKey)) {
+      return {
+        meta,
+        singleStreamKey,
+        degradedReason: "fallback" as const,
+        frames: [] as LiveFrameInput[],
+        totalBytes: 0,
+        checkpoint: null as Awaited<ReturnType<typeof loadOpenDispatchLiveUnitCheckpoint>>,
+      };
+    }
+    const checkpoint = singleStreamKey !== null
+      ? await loadOpenDispatchLiveUnitCheckpoint(
+          client,
+          sessionId,
+          userId,
+          OPEN_DISPATCH_STREAM_SQL,
+        )
+      : null;
+    const matchedCheckpoint =
+      checkpoint && checkpoint.streamKey === singleStreamKey ? checkpoint : null;
+    const afterRecordId = matchedCheckpoint ? matchedCheckpoint.state.throughRecordId : "0";
+    const rows = await queryBoundedOpenFrames(client, afterRecordId, maxReadRows, maxReadBytes);
+    const parsed = parseBoundedRows(rows, maxReadRows, 0);
+    if (!parsed.ok) {
+      return {
+        meta,
+        singleStreamKey,
+        degradedReason: parsed.reason,
+        frames: [] as LiveFrameInput[],
+        totalBytes: 0,
+        checkpoint: matchedCheckpoint,
+      };
+    }
+    return {
+      meta,
+      singleStreamKey,
+      degradedReason: null as "fallback" | "budget" | "parse_error" | null,
+      frames: parsed.frames,
+      totalBytes: parsed.totalBytes,
+      checkpoint: matchedCheckpoint,
+    };
   }, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
   if (!snapshot) return null;
+  if (snapshot.degradedReason !== null) {
+    if (snapshot.singleStreamKey !== null) {
+      markLiveUnitCheckpointDegraded(snapshot.singleStreamKey, snapshot.degradedReason);
+    }
+    return fallbackLiveUnitsPage(snapshot.meta);
+  }
   const lastRecordId = snapshot.frames.length > 0
     ? snapshot.frames[snapshot.frames.length - 1]!.recordId
     : snapshot.checkpoint?.state.throughRecordId ?? "0";
-  const catchUp = await withTx(pool, async (client) => {
-    if (snapshot.meta.streamClientMessageIds.length === 0) return [] as LiveFrameInput[];
-    const rows = (
-      await client.query<{
-        record_id: string;
-        stream_key: string;
-        client_message_id: string | null;
-        payload: Buffer;
-        payload_sha256: string | null;
-      }>(
-        `SELECT f.record_id::text,f.stream_key,s.client_message_id,f.payload,f.payload_sha256
-           FROM client_session_live_streams s
-           JOIN client_session_live_frames f ON f.stream_key=s.stream_key
-          WHERE s.user_id=$2 AND s.session_id=$1
-            AND ${OPEN_DISPATCH_STREAM_SQL}
-            AND f.record_id>$3::bigint
-          ORDER BY f.record_id`,
-        [sessionId, userId, lastRecordId],
-      )
-    ).rows;
-    return rows.map(parseLiveFrameRow);
+  const remainingRows = Math.max(0, maxReadRows - snapshot.frames.length);
+  const remainingBytes = Math.max(0, maxReadBytes - snapshot.totalBytes);
+  const catchUpResult = await withTx(pool, async (client) => {
+    if (snapshot.meta.streamClientMessageIds.length === 0) {
+      return { ok: true as const, frames: [] as LiveFrameInput[], streamSetChanged: false };
+    }
+    await client.query(`SET LOCAL statement_timeout = '${LIVE_UNIT_CHECKPOINT_STATEMENT_TIMEOUT_MS}'`);
+    const rows = await queryBoundedOpenFrames(client, lastRecordId, remainingRows, remainingBytes);
+    const parsed = parseBoundedRows(rows, remainingRows, snapshot.totalBytes);
+    if (!parsed.ok) return { ok: false as const, reason: parsed.reason };
+    // B8: Detect if a new open stream appeared between the snapshot tx and catch-up tx.
+    const knownStreams = new Set(snapshot.meta.currentStreamKeys);
+    const streamSetChanged = parsed.frames.some((f) => !knownStreams.has(f.streamKey));
+    return { ok: true as const, frames: parsed.frames, streamSetChanged };
   }, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  if (!catchUpResult.ok) {
+    if (snapshot.singleStreamKey !== null) {
+      markLiveUnitCheckpointDegraded(snapshot.singleStreamKey, catchUpResult.reason);
+    }
+    return fallbackLiveUnitsPage(snapshot.meta);
+  }
+  if (catchUpResult.streamSetChanged) {
+    // Active open-stream set changed mid-GET: fail closed without minting a stale resume
+    // cursor or polluting single-stream A's checkpoint with sibling stream B's units (OCV5-819 B8).
+    return fallbackLiveUnitsPage(snapshot.meta);
+  }
+  const catchUp = catchUpResult.frames;
 
   const opts = options ?? {};
   const reduced = reduceLiveJournal(snapshot.frames, {
@@ -1022,20 +1321,34 @@ export async function readClientSessionLiveUnits(
     lineage: snapshot.meta.lineage ?? [],
     checkpointState: snapshot.checkpoint?.state ?? null,
   });
-  if (!reduced.ok) return fallbackLiveUnitsPage(snapshot.meta);
+  if (!reduced.ok) {
+    if (snapshot.singleStreamKey !== null) {
+      markLiveUnitCheckpointDegraded(snapshot.singleStreamKey, "fallback");
+    }
+    return fallbackLiveUnitsPage(snapshot.meta);
+  }
   const page = assembleLiveUnitsFromState(reduced.state, snapshot.meta, opts, catchUp);
-  if (page.degraded === false) {
+  if (page.degraded !== false) {
+    if (snapshot.singleStreamKey !== null) {
+      markLiveUnitCheckpointDegraded(snapshot.singleStreamKey, "fallback");
+    }
+  } else if (
+    snapshot.singleStreamKey !== null &&
+    (snapshot.frames.length > 0 || catchUp.length > 0) &&
+    snapshot.frames.every((f) => f.streamKey === snapshot.singleStreamKey) &&
+    catchUp.every((f) => f.streamKey === snapshot.singleStreamKey)
+  ) {
+    // Only backfill single-stream checkpoints when every folded frame belongs strictly to
+    // that single stream and new frames actually advanced state (OCV5-819 B8/NB3).
     const forCache = catchUp.length === 0
       ? reduced
       : continueReduceLiveFrames(reduced.state, catchUp, opts);
-    const streamKey = snapshot.checkpoint?.streamKey
-      ?? snapshot.frames[0]?.streamKey
-      ?? catchUp[0]?.streamKey;
-    if (forCache.ok && streamKey) {
+    if (forCache.ok) {
       const cacheState = forCache.state;
+      const targetStreamKey = snapshot.singleStreamKey;
       setImmediate(() => {
         void upsertLiveUnitCheckpoint(pool, {
-          streamKey,
+          streamKey: targetStreamKey,
           sessionId,
           userId,
           state: cacheState,
@@ -1444,4 +1757,334 @@ export async function retireDeadLiveStreams(
       RETURNING s.stream_key`,
   );
   return { retired: (aged.rowCount ?? 0) + (leftover.rowCount ?? 0) };
+}
+
+export const DEFAULT_RETIRED_PRUNE_OLDER_THAN_DAYS = 7;
+export const MIN_RETIRED_PRUNE_OLDER_THAN_DAYS = 1;
+export const MAX_RETIRED_PRUNE_OLDER_THAN_DAYS = 365;
+
+const STRICT_RETIRED_AT_RE =
+  /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}(?::?\d{2})?)?$/;
+
+/**
+ * Strictly parse `provenance.retired_at` timestamps (ISO-8601 or PG `NOW()::text`)
+ * with calendar validation (rejects invalid months/days like Feb 30 or trailing
+ * garbage). Returns null for unparseable values — never guesses from updated_at
+ * (OCV5-824 N1).
+ */
+export function parseStrictRetiredAtMs(raw: unknown): number | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  const match = STRICT_RETIRED_AT_RE.exec(trimmed);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  if (
+    month < 1 || month > 12 ||
+    day < 1 || day > 31 ||
+    hour > 23 || minute > 59 || second > 59
+  ) {
+    return null;
+  }
+  const check = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  if (
+    check.getUTCFullYear() !== year ||
+    check.getUTCMonth() !== month - 1 ||
+    check.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  const tzRaw = match[8];
+  let offsetMinutes = 0;
+  if (tzRaw && tzRaw !== "Z") {
+    const sign = tzRaw[0] === "-" ? -1 : 1;
+    const digits = tzRaw.slice(1).replace(":", "");
+    const tzH = Number(digits.slice(0, 2));
+    const tzM = digits.length === 4 ? Number(digits.slice(2, 4)) : 0;
+    if (tzH > 23 || tzM > 59) return null;
+    offsetMinutes = sign * (tzH * 60 + tzM);
+  }
+  const fracMs = match[7] ? Number(match[7].slice(0, 3).padEnd(3, "0")) : 0;
+  return check.getTime() + fracMs - offsetMinutes * 60_000;
+}
+
+export interface PruneRetiredLiveFramesResult {
+  deletedFrames: number;
+  prunedStreams: number;
+  deletedStreams: number;
+  retainedStreams: number;
+  skippedInvalidRetiredAt: number;
+}
+
+const RETIRED_PRUNE_TAPE_RECOVERABLE_SQL = `(
+  s.dispatch_id IS NOT NULL
+  AND s.attempt_no IS NOT NULL
+  AND s.stream_key = ('dispatch:' || s.dispatch_id::text || ':' || s.attempt_no::text)
+  AND EXISTS (
+    SELECT 1 FROM turn_dispatches d
+     WHERE d.dispatch_id=s.dispatch_id
+       AND ('c:' || d.user_id::text)=s.user_id
+       AND d.session_id=s.session_id
+       AND d.status='terminal'
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM turn_recovery_jobs rj
+     WHERE ('c:' || rj.user_id::text)=s.user_id
+       AND rj.session_id=s.session_id
+       AND rj.status IN ('queued','leased','sent','forwarded')
+       AND (
+         s.client_message_id IS NULL
+         OR rj.source_client_message_id=s.client_message_id
+         OR rj.root_client_message_id=s.client_message_id
+         OR rj.dispatch_id=s.dispatch_id
+       )
+  )
+  AND (
+    (
+      s.tape_id IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM client_session_turn_tapes t
+         WHERE t.session_id=s.session_id
+           AND t.user_id=s.user_id
+           AND t.tape_id=s.tape_id
+           AND t.finalized_at IS NOT NULL
+           AND EXISTS (
+             SELECT 1 FROM client_session_turn_tape_records r
+              WHERE r.session_id=t.session_id
+                AND r.user_id=t.user_id
+                AND r.tape_id=t.tape_id
+                AND COALESCE(r.payload_bytes, octet_length(r.payload)) > 0
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM client_session_live_frames fr
+              WHERE fr.stream_key=s.stream_key
+                AND floor(EXTRACT(EPOCH FROM fr.created_at)*1000)::bigint > t.finalized_at
+           )
+      )
+    )
+    OR EXISTS (
+      SELECT 1 FROM client_session_turn_tapes t
+       WHERE t.session_id=s.session_id
+         AND t.user_id=s.user_id
+         AND t.dispatch_id=s.dispatch_id
+         AND t.attempt_no=s.attempt_no
+         AND t.finalized_at IS NOT NULL
+         AND EXISTS (
+           SELECT 1 FROM client_session_turn_tape_records r
+            WHERE r.session_id=t.session_id
+              AND r.user_id=t.user_id
+              AND r.tape_id=t.tape_id
+              AND COALESCE(r.payload_bytes, octet_length(r.payload)) > 0
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM client_session_live_frames fr
+            WHERE fr.stream_key=s.stream_key
+              AND floor(EXTRACT(EPOCH FROM fr.created_at)*1000)::bigint > t.finalized_at
+         )
+    )
+  )
+)`;
+
+/**
+ * Safely prune retired gateway live streams and their frames ONLY when:
+ *   1. The stream has immutable single-turn dispatch identity
+ *      (`dispatch:<dispatch_id>:<attempt_no>`). Reusable `legacy:*` streams
+ *      without per-turn identity are NEVER deleted and are counted in
+ *      `retainedStreams`.
+ *   2. Inside a destructive transaction holding the exact same session-level
+ *      `pg_advisory_xact_lock('oc_recovery_session:' || uid || ':' || sessionId)`
+ *      as `turnRecoveryStore.lockRecoveryRoot`, we lock the stream row(s)
+ *      `FOR UPDATE` and atomically re-verify terminal dispatch status, absence
+ *      of active `turn_recovery_jobs`, and an authoritative finalized non-empty
+ *      tape replica before deleting frames, checkpoints, and the empty stream
+ *      (OCV5-824 B2 + N1).
+ */
+export async function pruneRetiredLiveFrames(
+  pool: Pool,
+  options?: { olderThanDays?: number; batchSize?: number; maxBatches?: number; nowMs?: number },
+): Promise<PruneRetiredLiveFramesResult> {
+  const olderThanDays = asPositiveInt(
+    options?.olderThanDays,
+    DEFAULT_RETIRED_PRUNE_OLDER_THAN_DAYS,
+    MAX_RETIRED_PRUNE_OLDER_THAN_DAYS,
+  );
+  const batchSize = asPositiveInt(options?.batchSize, DEFAULT_PRUNE_BATCH_SIZE, 20_000);
+  const maxBatches = options?.maxBatches === undefined
+    ? Number.POSITIVE_INFINITY
+    : asPositiveInt(options.maxBatches, 1, 1_000_000);
+  const cutoffMs = (options?.nowMs ?? Date.now()) - olderThanDays * 24 * 60 * 60 * 1000;
+  const streamScanLimit = Math.min(batchSize, 2000);
+
+  const touched = new Set<string>();
+  let deletedFrames = 0;
+  let deletedStreams = 0;
+  let retainedStreams = 0;
+  let skippedInvalidRetiredAt = 0;
+  let afterStreamKey: string | null = null;
+  let frameBatchesUsed = 0;
+
+  for (let scanPage = 0; scanPage < maxBatches; scanPage += 1) {
+    const candidates: Array<{
+      stream_key: string;
+      user_id: string;
+      session_id: string;
+      retired_at_raw: string | null;
+      tape_recoverable: boolean;
+    }> = (
+      await pool.query<{
+        stream_key: string;
+        user_id: string;
+        session_id: string;
+        retired_at_raw: string | null;
+        tape_recoverable: boolean;
+      }>(
+        `SELECT s.stream_key,
+                s.user_id,
+                s.session_id,
+                s.provenance->>'retired_at' AS retired_at_raw,
+                ${RETIRED_PRUNE_TAPE_RECOVERABLE_SQL} AS tape_recoverable
+           FROM client_session_live_streams s
+          WHERE s.source='gateway'
+            AND s.provenance ? 'retired_at'
+            AND s.updated_at < NOW() - ($2::integer * INTERVAL '1 day')
+            AND ($3::text IS NULL OR s.stream_key > $3)
+          ORDER BY s.stream_key ASC
+          LIMIT $1`,
+        [streamScanLimit, olderThanDays, afterStreamKey],
+      )
+    ).rows;
+    if (candidates.length === 0) break;
+    afterStreamKey = candidates[candidates.length - 1]!.stream_key;
+
+    const groupsBySession = new Map<string, { numericUid: string; sessionId: string; streamKeys: string[] }>();
+    for (const row of candidates) {
+      const retiredAtMs = parseStrictRetiredAtMs(row.retired_at_raw);
+      if (retiredAtMs === null) {
+        skippedInvalidRetiredAt += 1;
+        continue;
+      }
+      if (retiredAtMs >= cutoffMs) continue;
+      if (row.tape_recoverable !== true) {
+        retainedStreams += 1;
+        continue;
+      }
+      const uidMatch = /^c:([1-9][0-9]*)$/.exec(row.user_id);
+      if (!uidMatch) {
+        retainedStreams += 1;
+        continue;
+      }
+      const groupKey = `${uidMatch[1]}:${row.session_id}`;
+      let group = groupsBySession.get(groupKey);
+      if (!group) {
+        group = { numericUid: uidMatch[1]!, sessionId: row.session_id, streamKeys: [] };
+        groupsBySession.set(groupKey, group);
+      }
+      group.streamKeys.push(row.stream_key);
+    }
+
+    for (const group of groupsBySession.values()) {
+      if (frameBatchesUsed >= maxBatches) break;
+      await withTx(pool, async (client) => {
+        // Coordinate strictly with turnRecoveryStore.lockRecoveryRoot / turnControlStore
+        // on the exact same session-level advisory xact lock before re-verifying & deleting.
+        await client.query(
+          `SELECT pg_advisory_xact_lock(hashtextextended(
+             'oc_recovery_session:' || $1::text || ':' || $2, 0
+           ))`,
+          [group.numericUid, group.sessionId],
+        );
+
+        const locked = (
+          await client.query<{
+            stream_key: string;
+            retired_at_raw: string | null;
+            tape_recoverable: boolean;
+          }>(
+            `SELECT s.stream_key,
+                    s.provenance->>'retired_at' AS retired_at_raw,
+                    ${RETIRED_PRUNE_TAPE_RECOVERABLE_SQL} AS tape_recoverable
+               FROM client_session_live_streams s
+              WHERE s.stream_key = ANY($1::text[])
+                AND s.source='gateway'
+                AND s.provenance ? 'retired_at'
+                AND s.updated_at < NOW() - ($2::integer * INTERVAL '1 day')
+              ORDER BY s.stream_key ASC
+              FOR UPDATE`,
+            [group.streamKeys, olderThanDays],
+          )
+        ).rows;
+
+        const verifiedKeys: string[] = [];
+        for (const row of locked) {
+          const retiredAtMs = parseStrictRetiredAtMs(row.retired_at_raw);
+          if (retiredAtMs === null) {
+            skippedInvalidRetiredAt += 1;
+            continue;
+          }
+          if (retiredAtMs >= cutoffMs) continue;
+          if (row.tape_recoverable !== true) {
+            retainedStreams += 1;
+            continue;
+          }
+          verifiedKeys.push(row.stream_key);
+        }
+        if (verifiedKeys.length === 0) return;
+
+        const txTouched = new Set<string>();
+        while (frameBatchesUsed < maxBatches) {
+          const res = await client.query<{ stream_key: string }>(
+            `DELETE FROM client_session_live_frames
+              WHERE record_id IN (
+                SELECT f.record_id
+                  FROM client_session_live_frames f
+                 WHERE f.stream_key = ANY($1::text[])
+                 LIMIT $2
+              )
+              RETURNING stream_key`,
+            [verifiedKeys, batchSize],
+          );
+          const count = res.rowCount ?? 0;
+          if (count === 0) break;
+          frameBatchesUsed += 1;
+          deletedFrames += count;
+          for (const r of res.rows) {
+            touched.add(r.stream_key);
+            txTouched.add(r.stream_key);
+          }
+          if (count < batchSize) break;
+        }
+        if (txTouched.size > 0) {
+          await deleteLiveUnitCheckpoints(client, [...txTouched]);
+        }
+        const delStreams = await client.query<{ stream_key: string }>(
+          `DELETE FROM client_session_live_streams s
+            WHERE s.stream_key = ANY($1::text[])
+              AND s.source='gateway'
+              AND s.projection_source='live'
+              AND s.provenance ? 'retired_at'
+              AND NOT EXISTS (
+                SELECT 1 FROM client_session_live_frames f
+                 WHERE f.stream_key=s.stream_key
+              )
+            RETURNING s.stream_key`,
+          [verifiedKeys],
+        );
+        deletedStreams += delStreams.rowCount ?? 0;
+      });
+    }
+
+    if (frameBatchesUsed >= maxBatches || candidates.length < streamScanLimit) break;
+  }
+
+  return {
+    deletedFrames,
+    prunedStreams: touched.size,
+    deletedStreams,
+    retainedStreams,
+    skippedInvalidRetiredAt,
+  };
 }

@@ -253,6 +253,16 @@ function renderLabels(v: LabelValues): string {
 export const containerLinkRebuilt = new Counter({ name: "container_link_rebuilt_total", help: "Container links rebuilt from open dispatches", labelNames: [] });
 export const containerLinkReconnect = new Counter({ name: "container_link_reconnect_total", help: "Bounded container link recovery outcomes", labelNames: ["outcome"] });
 export const containerLinkGap = new Counter({ name: "container_link_gap_total", help: "Durable container ring replay gaps", labelNames: [] });
+export const containerLinkSendEvents = new Counter({
+  name: "container_link_send_events_total",
+  help: "ContainerLink send queue, hello timeout, and admitted lease cap events",
+  labelNames: ["outcome"],
+});
+export const liveUnitCheckpointEvents = new Counter({
+  name: "live_unit_checkpoint_events_total",
+  help: "Live unit checkpoint flush outcomes and degraded circuit-breaker trips",
+  labelNames: ["outcome"],
+});
 export const containerLinkControlDelivered = new Counter({ name: "container_link_control_delivered_total", help: "Successful durable control transport sends, including retries", labelNames: ["via"] });
 
 export const gatewayRequests = new Counter({
@@ -789,6 +799,8 @@ export async function renderPrometheus(deps: CollectDeps = {}): Promise<string> 
   containerLinkRebuilt.render(out);
   containerLinkReconnect.render(out);
   containerLinkGap.render(out);
+  containerLinkSendEvents.render(out);
+  liveUnitCheckpointEvents.render(out);
   containerLinkControlDelivered.render(out);
   gatewayRequests.render(out);
   billingDebits.render(out);
@@ -826,6 +838,8 @@ export function resetMetricsForTest(): void {
   containerLinkRebuilt.reset();
   containerLinkReconnect.reset();
   containerLinkGap.reset();
+  containerLinkSendEvents.reset();
+  liveUnitCheckpointEvents.reset();
   containerLinkControlDelivered.reset();
   gatewayRequests.reset();
   billingDebits.reset();

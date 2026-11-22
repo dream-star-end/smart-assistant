@@ -634,3 +634,146 @@ describe("listVolumeGcCandidates + restoreVolumeGcAfterFailure", () => {
     assert.equal(r.length, 0);
   });
 });
+
+// ============================================================
+//  OCV5-136: partial unique index (state='active', runtime_channel, runtime_kind) + v5 guard
+// ============================================================
+
+describe("OCV5-136 partial unique index & channel/kind isolation", () => {
+  test("historical vanished row does not collide with openAgentSubscription and is ignored by readers", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("vanished-resub@x.com", 5000n);
+    const vanished = await query<{ id: string }>(
+      `INSERT INTO agent_containers
+          (user_id, docker_name, workspace_volume, home_volume, image, status, state,
+           runtime_channel, runtime_kind, secret_hash)
+       VALUES ($1, $2, $3, $4, $5, 'removed', 'vanished', 'v3', 'docker', $6)
+       RETURNING id::text AS id`,
+      [uid.toString(), `agent-u${uid}-old`, "w-old", "h-old", IMAGE, Buffer.alloc(32, 0xaa)],
+    );
+    const opened = await openAgentSubscription({ userId: uid, image: IMAGE });
+    assert.notEqual(opened.container_id, BigInt(vanished.rows[0].id));
+
+    const status = await getAgentStatus(uid);
+    assert.equal(status.container?.id, opened.container_id.toString());
+    assert.equal(status.container?.status, "provisioning");
+
+    const access = await checkAgentAccess(uid);
+    assert.equal(access.ok, true);
+    if (access.ok) {
+      assert.equal(access.container_id, opened.container_id.toString());
+    }
+  });
+
+  test("active v5 or desktop rows for the same user do not collide with v3/docker openAgentSubscription", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("multi-channel-kind@x.com", 5000n);
+    const v5Row = await query<{ id: string }>(
+      `INSERT INTO agent_containers
+          (user_id, docker_name, workspace_volume, home_volume, image, status, state,
+           runtime_channel, runtime_kind, secret_hash)
+       VALUES ($1, $2, $3, $4, $5, 'running', 'active', 'v5', 'docker', $6)
+       RETURNING id::text AS id`,
+      [uid.toString(), `agent-v5-u${uid}`, "w-v5", "h-v5", IMAGE, Buffer.alloc(32, 0xbb)],
+    );
+    const desktopRow = await query<{ id: string }>(
+      `INSERT INTO agent_containers
+          (user_id, docker_name, workspace_volume, home_volume, image, status, state,
+           runtime_channel, runtime_kind, secret_hash)
+       VALUES ($1, $2, $3, $4, $5, 'running', 'active', 'v3', 'desktop', $6)
+       RETURNING id::text AS id`,
+      [uid.toString(), `agent-desktop-u${uid}`, "w-dt", "h-dt", IMAGE, Buffer.alloc(32, 0xcc)],
+    );
+
+    const opened = await openAgentSubscription({ userId: uid, image: IMAGE });
+    assert.notEqual(opened.container_id, BigInt(v5Row.rows[0].id));
+    assert.notEqual(opened.container_id, BigInt(desktopRow.rows[0].id));
+
+    // v5 and desktop rows remain untouched
+    const intact = await query<{ id: string; status: string }>(
+      "SELECT id::text AS id, status FROM agent_containers WHERE id IN ($1, $2) ORDER BY id",
+      [v5Row.rows[0].id, desktopRow.rows[0].id],
+    );
+    assert.equal(intact.rows.length, 2);
+    assert.ok(intact.rows.every((row) => row.status === "running"));
+  });
+
+  test("active v3 supervisor row (subscription_id IS NULL) blocks openAgentSubscription and rolls back entire tx", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("sup-conflict@x.com", 5000n);
+    const supSecret = Buffer.alloc(32, 0xdd);
+    const seeded = await query<{ id: string; updated_at: Date }>(
+      `INSERT INTO agent_containers
+          (user_id, subscription_id, docker_id, docker_name, image, status, state,
+           runtime_channel, runtime_kind, secret_hash)
+       VALUES ($1, NULL, 'v3-sup-docker-id', $2, $3, 'running', 'active', 'v3', 'docker', $4)
+       RETURNING id::text AS id, updated_at`,
+      [uid.toString(), `oc-v3-u${uid}`, IMAGE, supSecret],
+    );
+
+    await assert.rejects(
+      () => openAgentSubscription({ userId: uid, image: "other/image:v2" }),
+      /active non-subscription container/,
+    );
+
+    // Original supervisor container row is completely unchanged
+    const conAfter = await query<{
+      id: string;
+      subscription_id: string | null;
+      docker_id: string | null;
+      docker_name: string | null;
+      image: string | null;
+      status: string;
+      secret_hash: Buffer;
+      updated_at: Date;
+    }>(
+      `SELECT id::text AS id, subscription_id::text AS subscription_id, docker_id, docker_name,
+              image, status, secret_hash, updated_at
+         FROM agent_containers
+        WHERE user_id = $1`,
+      [uid.toString()],
+    );
+    assert.equal(conAfter.rows.length, 1);
+    assert.equal(conAfter.rows[0].id, seeded.rows[0].id);
+    assert.equal(conAfter.rows[0].subscription_id, null);
+    assert.equal(conAfter.rows[0].docker_id, "v3-sup-docker-id");
+    assert.equal(conAfter.rows[0].docker_name, `oc-v3-u${uid}`);
+    assert.equal(conAfter.rows[0].image, IMAGE);
+    assert.equal(conAfter.rows[0].status, "running");
+    assert.deepEqual(conAfter.rows[0].secret_hash, supSecret);
+    assert.equal(conAfter.rows[0].updated_at.getTime(), seeded.rows[0].updated_at.getTime());
+
+    // Wallet debit, subscription insert, and ledger insert all rolled back
+    const bal = await query<{ credits: string }>(
+      "SELECT credits::text AS credits FROM users WHERE id = $1",
+      [uid.toString()],
+    );
+    assert.equal(BigInt(bal.rows[0].credits), 5000n);
+    const subCnt = await query<{ c: string }>(
+      "SELECT COUNT(*)::text AS c FROM agent_subscriptions WHERE user_id = $1",
+      [uid.toString()],
+    );
+    assert.equal(subCnt.rows[0].c, "0");
+    const ledgerCnt = await query<{ c: string }>(
+      "SELECT COUNT(*)::text AS c FROM credit_ledger WHERE user_id = $1",
+      [uid.toString()],
+    );
+    assert.equal(ledgerCnt.rows[0].c, "0");
+  });
+
+  test("v5 channel fails closed before touching DB", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("v5-blocked@x.com", 5000n);
+    const prev = process.env.OC_RUNTIME_CHANNEL;
+    process.env.OC_RUNTIME_CHANNEL = "v5";
+    try {
+      await assert.rejects(
+        () => openAgentSubscription({ userId: uid, image: IMAGE }),
+        /forbidden on v5 channel/,
+      );
+    } finally {
+      if (prev === undefined) Reflect.deleteProperty(process.env, "OC_RUNTIME_CHANNEL");
+      else process.env.OC_RUNTIME_CHANNEL = prev;
+    }
+  });
+});

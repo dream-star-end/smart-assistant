@@ -121,7 +121,9 @@ const ACTION_LABEL: Record<CardAction, string> = {
 };
 /** 主按钮的外观。卡片里的那枚是整卡按钮的一部分(点它和点卡片是同一件事),只画样子不另设焦点。 */
 const ACTION_CLASS =
-  "inline-flex h-8 shrink-0 items-center rounded-md border border-border bg-surface px-3 text-body font-medium text-fg transition-colors group-hover:border-border-strong";
+  "oc-btn-tactile oc-btn-secondary-craft inline-flex h-8 shrink-0 items-center rounded-lg bg-surface px-3 text-body font-medium text-fg group-hover:border-accent/40 group-hover:text-accent";
+const ACTION_UPDATE_CLASS =
+  "oc-btn-tactile oc-btn-accent-craft inline-flex h-8 shrink-0 items-center rounded-lg bg-accent px-3 text-body font-medium text-accent-fg";
 
 /**
  * 单张目录卡片(分区视图与平铺视图共用)。UI-5 之后只留四样东西:
@@ -135,6 +137,7 @@ function CardTile({
   card,
   installed,
   plugins,
+  featured = false,
   onOpen,
   onConnect,
 }: {
@@ -142,6 +145,8 @@ function CardTile({
   installed: Map<string, MarketplaceInstalled>;
   /** 插件目录(slug → 状态);只在「插件」类目传入。 */
   plugins?: Map<string, PluginEntry>;
+  /** 是否处于平台精选画廊区。 */
+  featured?: boolean;
   onOpen: (slug: string) => void;
   /** 市场插件装了还没连账号时,主按钮直接去管理中心连接(不经过详情页)。 */
   onConnect?: (slug: string) => void;
@@ -206,19 +211,35 @@ function CardTile({
         aria-label={ariaLabel}
         aria-describedby={descId}
         data-category={card.category ?? "general"}
-        className="marketplace-card group flex h-full w-full items-center gap-3 rounded-md border border-border bg-surface p-4 text-left outline-none transition-colors hover:border-border-strong focus-visible:ring-2 focus-visible:ring-ring"
+        className={cn(
+          "marketplace-card oc-surface-card oc-surface-card-hover group flex h-full w-full items-center gap-3.5 rounded-xl p-4 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring",
+          featured && "border-accent/25",
+        )}
       >
-        <CardMark name={card.name} category={card.category} />
+        <CardMark
+          name={card.name}
+          category={card.category}
+          className="transition-transform duration-200 group-hover:scale-[1.03]"
+        />
         <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-          <span className="flex min-w-0 items-baseline gap-1.5">
-            <span className="marketplace-card-name truncate text-body font-semibold text-fg">{card.name}</span>
-            {trustMark && <span className="shrink-0 text-caption text-faint">{trustMark}</span>}
+          <span className="flex min-w-0 items-center gap-1.5">
+            <span className="marketplace-card-name truncate text-body font-semibold tracking-tight text-fg">
+              {card.name}
+            </span>
+            {trustMark && (
+              <span className="oc-badge-craft shrink-0 rounded-full bg-hover px-1.5 py-0.5 text-caption font-medium text-muted">
+                {trustMark}
+              </span>
+            )}
           </span>
-          <span id={descId} className="marketplace-card-description line-clamp-2 text-meta text-muted">
+          <span
+            id={descId}
+            className="marketplace-card-description line-clamp-2 text-meta leading-relaxed text-muted"
+          >
             {cardBlurb(card.description, isPlugin)}
           </span>
           {hasMeta && (
-            <span className="mt-1 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-0.5 text-caption text-faint">
+            <span className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-caption tabular-nums text-faint">
               {showState && (
                 <StatusPill
                   variant="pill"
@@ -234,15 +255,15 @@ function CardTile({
                 <span
                   role="img"
                   aria-label={`好评 ${rating.up}/${ratingTotal}，来自 ${ratingTotal} 次真实使用的反馈`}
-                  className="inline-flex items-center gap-1"
+                  className="inline-flex items-center gap-1 tabular-nums"
                 >
-                  <ThumbsUp size={11} aria-hidden="true" />
+                  <ThumbsUp size={11} strokeWidth={1.8} aria-hidden="true" />
                   {rating.up}/{ratingTotal}
                 </span>
               )}
               {inUseLabel && (
-                <span className="inline-flex items-center gap-1">
-                  <Users size={11} aria-hidden="true" />
+                <span className="inline-flex items-center gap-1 tabular-nums">
+                  <Users size={11} strokeWidth={1.8} aria-hidden="true" />
                   {inUseLabel}
                 </span>
               )}
@@ -251,7 +272,7 @@ function CardTile({
                 <span
                   role="img"
                   aria-label={`${bench.label}（${bench.title}）`}
-                  className="inline-flex min-w-0 items-center gap-1 truncate"
+                  className="inline-flex min-w-0 items-center gap-1 truncate tabular-nums"
                 >
                   {bench.label} · 自报
                 </span>
@@ -260,13 +281,22 @@ function CardTile({
           )}
         </span>
         {action === "installed" ? (
-          <span aria-hidden="true" className="inline-flex shrink-0 items-center gap-1 text-meta text-faint">
-            <Check size={13} strokeWidth={1.75} />
+          <span
+            aria-hidden="true"
+            className="oc-badge-craft inline-flex shrink-0 items-center gap-1 rounded-full bg-success-soft px-2.5 py-1 text-caption font-medium text-success"
+          >
+            <Check size={12} strokeWidth={2} />
             {ACTION_LABEL.installed}
           </span>
         ) : (
           // 有单独「连接」按钮时这里只占位,保证文字列宽度不变。
-          <span aria-hidden="true" className={cn(ACTION_CLASS, connectHere && "invisible")}>
+          <span
+            aria-hidden="true"
+            className={cn(
+              action === "update" ? ACTION_UPDATE_CLASS : ACTION_CLASS,
+              connectHere && "invisible",
+            )}
+          >
             {ACTION_LABEL[action]}
           </span>
         )}
@@ -292,6 +322,7 @@ function Section({
   blurb,
   count,
   truncated,
+  featured = false,
   cards,
   installed,
   plugins,
@@ -303,6 +334,8 @@ function Section({
   count: number;
   /** 目录只拉了一页:分区计数只是"已加载"的成员数,不能当"共有"说(K-03)。 */
   truncated?: boolean;
+  /** 是否为平台精选画廊区。 */
+  featured?: boolean;
   cards: MarketplaceCard[];
   installed: Map<string, MarketplaceInstalled>;
   plugins?: Map<string, PluginEntry>;
@@ -310,10 +343,22 @@ function Section({
   onConnect?: (slug: string) => void;
 }) {
   return (
-    <section className="marketplace-section flex flex-col gap-3">
-      <div className="flex min-w-0 items-baseline gap-2">
-        <h3 className="shrink-0 text-section font-semibold text-fg">{title}</h3>
-        <span className="shrink-0 text-meta tabular-nums text-faint">{truncated ? `已加载 ${count}` : count}</span>
+    <section className="marketplace-section flex flex-col gap-3.5">
+      <div className="flex min-w-0 items-center gap-2">
+        {featured && (
+          <span aria-hidden="true" className="oc-icon-badge oc-icon-badge-accent size-6 rounded-md">
+            <Sparkles size={13} strokeWidth={1.85} />
+          </span>
+        )}
+        <h3 className="shrink-0 text-section font-semibold tracking-tight text-fg">{title}</h3>
+        <span
+          className={cn(
+            "oc-badge-craft shrink-0 rounded-full px-2 py-0.5 text-caption font-medium tabular-nums",
+            featured ? "bg-accent-soft text-accent" : "bg-hover text-muted",
+          )}
+        >
+          {truncated ? `已加载 ${count}` : count}
+        </span>
         {truncated && <span className="shrink-0 text-caption text-faint">还有更多未加载</span>}
         {/* 分区说明在窄屏隐藏:每个分区多一行就多吃 16px。 */}
         {blurb && <p className="hidden min-w-0 truncate text-caption text-faint sm:block">{blurb}</p>}
@@ -325,6 +370,7 @@ function Section({
             card={c}
             installed={installed}
             plugins={plugins}
+            featured={featured}
             onOpen={onOpen}
             onConnect={onConnect}
           />
@@ -630,7 +676,7 @@ export function BrowsePanel({
     <div className="marketplace-browse flex flex-col">
       {/* 一条吸顶栏承载「看哪一类 + 搜什么 + 让 AI 帮挑」(UI-5:去掉 hero 和英文小字之后,打开市场
           第一眼就是它和卡片)。手机上两行:类目一行,搜索一行,整条吸顶。 */}
-      <div className="marketplace-toolbar sticky top-0 z-10 flex flex-col gap-2 border-b border-border bg-surface px-4 py-3 sm:flex-row sm:items-center sm:gap-3 sm:px-6">
+      <div className="marketplace-toolbar oc-surface-glass sticky top-0 z-10 flex flex-col gap-2 border-x-0 border-t-0 border-b border-border/80 px-4 py-3 shadow-none sm:flex-row sm:items-center sm:gap-3 sm:px-6">
         {onKindChange && (
           <Tabs
             aria-label="市场类型"
@@ -640,12 +686,13 @@ export function BrowsePanel({
             className="shrink-0 max-sm:w-full max-sm:[&>[role=tab]]:flex-1"
           />
         )}
-        <div className="flex min-w-0 flex-1 items-center gap-1.5">
-          <div className="relative min-w-0 flex-1">
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <div className="group relative min-w-0 flex-1">
             <Search
               size={15}
+              strokeWidth={1.8}
               aria-hidden="true"
-              className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint"
+              className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint transition-colors duration-150 group-focus-within:text-accent"
             />
             <Input
               // type=search 让浏览器给出原生清除按钮(与 ui/Toolbar 同一取舍:自绘 ✕ 在触屏上
@@ -662,15 +709,15 @@ export function BrowsePanel({
             <IconButton
               aria-label="同步失败，点击重试"
               size="sm"
-              className="shrink-0 text-warning hover:text-warning"
+              className="oc-icon-btn-tactile shrink-0 text-warning hover:text-warning"
               onClick={() => void loadCards(true)}
             >
-              <RefreshCw size={14} />
+              <RefreshCw size={14} strokeWidth={1.85} />
             </IconButton>
           )}
           {onAskAiInChat && (
-            <Button size="sm" variant="ghost" className="shrink-0" onClick={askAi}>
-              <Sparkles size={14} aria-hidden="true" /> AI 帮我挑
+            <Button size="sm" variant="secondary" className="shrink-0" onClick={askAi}>
+              <Sparkles size={14} strokeWidth={1.85} className="text-accent" aria-hidden="true" /> AI 帮我挑
             </Button>
           )}
         </div>
@@ -685,7 +732,7 @@ export function BrowsePanel({
             // 只在窄屏(真的横滚时)可聚焦;桌面换行不滚,不留无意义的 Tab 停靠点(QA t-1028 §6 #1)。
             // biome-ignore lint/a11y/noNoninteractiveTabindex: 移动端横向滚动分类必须可由键盘聚焦和滚动。
             tabIndex={narrow ? 0 : undefined}
-            className="marketplace-categories flex snap-x scroll-px-4 gap-1.5 overflow-x-auto px-4 pb-1 pt-3 outline-none [scrollbar-width:none] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [&::-webkit-scrollbar]:hidden sm:flex-wrap sm:snap-none sm:overflow-x-visible sm:px-6"
+            className="marketplace-categories flex snap-x scroll-px-4 gap-1.5 overflow-x-auto px-4 pb-1 pt-3.5 outline-none [scrollbar-width:none] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [&::-webkit-scrollbar]:hidden sm:flex-wrap sm:snap-none sm:overflow-x-visible sm:px-6"
           >
             <Chip active={selectedCat === null} onClick={() => setSelectedCat(null)}>
               全部
@@ -703,7 +750,7 @@ export function BrowsePanel({
           </section>
           <div
             aria-hidden="true"
-            className="pointer-events-none absolute inset-y-0 right-0 w-8 bg-linear-to-l from-surface to-transparent sm:hidden"
+            className="pointer-events-none absolute inset-y-0 right-0 w-8 bg-linear-to-l from-elevated to-transparent sm:hidden"
           />
         </div>
       )}
@@ -782,12 +829,16 @@ export function BrowsePanel({
           >
             {flatMode ? (
               <>
-                <h3 className="min-w-0 truncate text-section font-semibold text-fg">{flatTitle}</h3>
-                <span className="shrink-0 text-meta tabular-nums text-faint">{flatCards.length}</span>
+                <h3 className="min-w-0 truncate text-section font-semibold tracking-tight text-fg">
+                  {flatTitle}
+                </h3>
+                <span className="oc-badge-craft shrink-0 rounded-full bg-hover px-2 py-0.5 text-caption font-medium tabular-nums text-muted">
+                  {flatCards.length}
+                </span>
               </>
             ) : (
               // 只拉了一页时说「已加载」而不是「共」:分区计数与这里都不能把一页当全量(K-03)。
-              <p className="text-caption text-faint">
+              <p className="text-caption tabular-nums text-faint">
                 {truncated ? `已加载 ${shownCards.length} 个${noun}，还有更多` : `共 ${shownCards.length} 个${noun}`}
               </p>
             )}
@@ -818,6 +869,7 @@ export function BrowsePanel({
                   blurb={`平台为你挑选的优质${noun}`}
                   count={sections.featured.length}
                   truncated={truncated}
+                  featured
                   cards={sections.featured}
                   installed={installed}
                   plugins={pluginBySlug}
@@ -911,10 +963,10 @@ function Chip({
       aria-pressed={active}
       className={cn(
         // 触控靶:这排 chip 在横向滚动条里,26px 高时手指几乎点不中(要么误触邻项、要么触发横滑)。
-        "shrink-0 snap-start whitespace-nowrap rounded-full border px-3 py-1 text-meta font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-4",
+        "oc-btn-tactile shrink-0 snap-start whitespace-nowrap rounded-full border px-3 py-1 text-meta font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-4",
         active
-          ? "border-accent/50 bg-accent-soft text-accent"
-          : "border-border text-muted hover:border-accent/40 hover:text-fg",
+          ? "oc-badge-craft border-accent/45 bg-accent-soft text-accent"
+          : "border-border/80 bg-surface/80 text-muted hover:border-border-strong hover:bg-surface hover:text-fg",
       )}
     >
       {children}

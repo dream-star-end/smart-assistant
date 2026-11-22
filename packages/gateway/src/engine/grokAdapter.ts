@@ -2,7 +2,7 @@ import { freezeGrokExecutionDescriptor } from '@openclaude/protocol'
 import { isV3ContainerRuntime } from '../hostStaticProviders.js'
 import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
 import { PassiveStageTiming } from '../passiveStageTiming.js'
-import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
+import { identityCompatEnvironment, paths, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 /**
  * First-class adapter for xAI's official Grok CLI. The CLI runs once per turn
  * in headless streaming-json mode; subscription credentials never enter the
@@ -43,8 +43,15 @@ import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWith
 import { grokProductToolInput, grokProductToolName, grokProductToolOutput } from './grokToolNormalize.js'
 import { decideEngineCwd } from '../engineCwd.js'
 import { persistRunContextSnapshot } from '../runContextPersist.js'
-import { buildPromptContext } from '../promptSlots.js'
+import { buildPromptContext, memoryInstructionsFingerprint } from '../promptSlots.js'
 import { GROK_PREAMBLE, prepareGrokHome, projectGrokPlatform } from './grokPlatform.js'
+import {
+  buildResumedEnvelopeInputsKey,
+  clearResumedEnvelopeState,
+  decideResumedEnvelopeElision,
+  resumedEnvelopePreamble,
+  writeResumedEnvelopeState,
+} from './resumedEnvelopeDedup.js'
 import { renderCcbGoalPrompt } from '../goalPrompt.js'
 import { bindRouteTrace } from '../relayTrace.js'
 import {
@@ -348,9 +355,14 @@ function assembleGrokPrompt(
   platformContent: string,
   input: string,
   goal: GoalStateSnapshot | null,
+  opts?: { elidePlatformContext?: boolean },
 ): string {
-  const body = platformContent ? `${platformContent}\n\n${input}` : input
   const goalText = renderCcbGoalPrompt(goal)
+  if (opts?.elidePlatformContext) {
+    const withGoal = goalText ? `${goalText}\n\n${input}` : input
+    return `${resumedEnvelopePreamble('grok')}\n\n${withGoal}`
+  }
+  const body = platformContent ? `${platformContent}\n\n${input}` : input
   const withGoal = goalText ? `${goalText}\n\n${body}` : body
   return `${preamble}\n${withGoal}`
 }
@@ -405,6 +417,9 @@ interface GrokTurnContext {
   spawnGeneration: number
   firstStdoutTimer: NodeJS.Timeout | null
   launchSpec: GrokLaunchSpec | null
+  promptInputsKey: string | null
+  elidedPlatformContext: boolean
+  fullPromptText: string | null
   /** Ends this turn's route-token trace binding for the container relay (OCV5-580). */
   releaseRelayTrace: (() => void) | null
 }
@@ -535,6 +550,9 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       spawnGeneration: 0,
       firstStdoutTimer: null,
       launchSpec: null,
+      promptInputsKey: null,
+      elidedPlatformContext: false,
+      fullPromptText: null,
       releaseRelayTrace: null,
     }
     this.active = ctx
@@ -623,7 +641,33 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       skillEvalDraft: this.opts.skillEvalDraft,
       skillTrainRunId: this.opts.skillTrainRunId,
     })
-    const prompt = await this.composePrompt(ctx.params, repoSnapshot, platform.advertisedMcpTools, ctx.canonicalModel)
+    const composed = await this.composePromptParts(
+      ctx.params,
+      repoSnapshot,
+      platform.advertisedMcpTools,
+      ctx.canonicalModel,
+      cwdDecision,
+    )
+    const ocHome = process.env.OPENCLAUDE_HOME?.trim() || paths.home
+    ctx.promptInputsKey = composed.inputsKey
+    ctx.fullPromptText = composed.fullPrompt
+    const elideDecision = decideResumedEnvelopeElision({
+      openClaudeHome: ocHome,
+      engine: 'grok',
+      sessionKey: this.opts.sessionKey,
+      requestedResumeId: this.nativeId,
+      inputsKey: composed.inputsKey,
+    })
+    ctx.elidedPlatformContext = Boolean(this.nativeId) && elideDecision.elide
+    log.info('grok_prompt_context_mode', {
+      sessionKey: this.opts.sessionKey,
+      traceId: ctx.params.traceId,
+      resumeId: this.nativeId,
+      decision: ctx.elidedPlatformContext ? 'elide_resumed' : 'full_inject',
+      reason: elideDecision.reason,
+      savedBytes: ctx.elidedPlatformContext ? composed.platformBytes : 0,
+    })
+    const prompt = ctx.elidedPlatformContext ? composed.resumedPrompt : composed.fullPrompt
     const promptDir = mkdtempSync(join(tmpdir(), 'oc-grok-prompt-'))
     const promptFile = join(promptDir, 'prompt.md')
     try {
@@ -893,6 +937,14 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     ctx.replacingProc = false
     ctx.proc = null
     ctx.procClosed = false
+    if (ctx.elidedPlatformContext && ctx.fullPromptText && ctx.launchSpec?.promptFile) {
+      try {
+        writeFileSync(ctx.launchSpec.promptFile, grokUserQuery(ctx.fullPromptText), { encoding: 'utf8', mode: 0o600 })
+        ctx.elidedPlatformContext = false
+      } catch {
+        // Best-effort full-prompt restore before cold retry
+      }
+    }
     try {
       this.spawnGrokChild(ctx, { resume: false })
     } catch (err) {
@@ -930,12 +982,13 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     })
   }
 
-  private async composePrompt(
+  private async composePromptParts(
     params: TurnParams,
     repoSnapshot: ReturnType<NonNullable<EngineCreateOpts['getRepoSnapshot']>> | null,
     availableMcpTools: string[],
     canonicalModel: string | undefined,
-  ): Promise<string> {
+    cwdDecision: ReturnType<typeof decideEngineCwd>,
+  ): Promise<{ fullPrompt: string; resumedPrompt: string; inputsKey: string | null; platformBytes: number }> {
     const input = promptText(params.input)
     try {
       const platform = await buildPromptContext({
@@ -952,11 +1005,6 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
         sessionId: typeof this.opts.sessionId === 'string' ? this.opts.sessionId : undefined,
         projectId: this.opts.projectId,
       })
-      const cwdDecision = decideEngineCwd({
-        agentBaseDir: this.opts.agentBaseDir,
-        repoSnapshot,
-        projectBound: Boolean(this.opts.projectId),
-      })
       await persistRunContextSnapshot({
         descriptor: this.opts.runContext,
         applied: platform.applied,
@@ -966,22 +1014,56 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
         cwdSource: cwdDecision.source,
         sessionRepoOverlay: cwdDecision.sessionRepoOverlay,
       })
+      const platformContent = platform.content || ''
+      const platformBytes = Buffer.byteLength(platformContent, 'utf8')
+      const inputsKey = buildResumedEnvelopeInputsKey({
+        engine: 'grok',
+        preamble: GROK_PREAMBLE,
+        agentId: this.opts.agentId,
+        projectId: this.opts.projectId,
+        sessionId: typeof this.opts.sessionId === 'string' ? this.opts.sessionId : undefined,
+        cwd: cwdDecision.cwd,
+        cwdSource: cwdDecision.source,
+        sessionRepoOverlay: cwdDecision.sessionRepoOverlay,
+        availableMcpTools,
+        identityCompatFingerprint: this.opts.identityCompat?.fingerprint,
+        repoSnapshot,
+        skillEvalMode: this.opts.skillEvalMode,
+        skillEvalExclude: this.opts.skillEvalExclude,
+        skillEvalDraft: this.opts.skillEvalDraft,
+        intelligentUi: platform.intelligentUi,
+        promptPolicyFingerprint: platform.promptPolicyFingerprint,
+        frozenProjectContext: platform.frozenProjectContext,
+        readOnly: params.readOnly,
+        applied: platform.applied,
+        memoryInstructionsFingerprint: memoryInstructionsFingerprint(this.opts.agentId),
+      })
       log.info('prompt_context_built', {
         sessionKey: this.opts.sessionKey,
         agentId: this.opts.agentId,
         backend: 'grok',
-        prompt_bytes: Buffer.byteLength(platform.content || '', 'utf8'),
-        prompt_sha256: createHash('sha256').update(platform.content || '', 'utf8').digest('hex').slice(0, 12),
+        prompt_bytes: platformBytes,
+        prompt_sha256: createHash('sha256').update(platformContent, 'utf8').digest('hex').slice(0, 12),
         board_project_id: this.opts.runContext?.boardProjectId ?? this.opts.projectId ?? null,
       })
-      return assembleGrokPrompt(GROK_PREAMBLE, platform.content || '', input, this.platformGoal)
+      return {
+        fullPrompt: assembleGrokPrompt(GROK_PREAMBLE, platformContent, input, this.platformGoal),
+        resumedPrompt: assembleGrokPrompt(GROK_PREAMBLE, platformContent, input, this.platformGoal, { elidePlatformContext: true }),
+        inputsKey,
+        platformBytes,
+      }
     } catch {
       if (this.opts.identityCompat?.assets) throw new Error('COMPAT_CONFIG_CONFLICT: identity prompt assembly failed')
       let persona = ''
       if (this.opts.persona) {
         try { persona = readFileSync(this.opts.persona, 'utf8').trim() } catch { persona = '' }
       }
-      return assembleGrokPrompt(GROK_PREAMBLE, persona, input, this.platformGoal)
+      return {
+        fullPrompt: assembleGrokPrompt(GROK_PREAMBLE, persona, input, this.platformGoal),
+        resumedPrompt: assembleGrokPrompt(GROK_PREAMBLE, persona, input, this.platformGoal),
+        inputsKey: null,
+        platformBytes: Buffer.byteLength(persona, 'utf8'),
+      }
     }
   }
 
@@ -1247,6 +1329,25 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     const stopReason = creditExhausted ? 'error' : ctx.interrupted ? 'interrupted' : upstreamStopReason
     ctx.terminal = true
     const isError = ctx.errorDetail !== null
+    if (
+      !creditExhausted &&
+      !isError &&
+      !ctx.interrupted &&
+      !ctx.abandoned &&
+      !ctx.droppedNativeResume &&
+      !ctx.elidedPlatformContext &&
+      this.nativeId &&
+      ctx.promptInputsKey
+    ) {
+      writeResumedEnvelopeState(process.env.OPENCLAUDE_HOME?.trim() || paths.home, {
+        v: 1,
+        engine: 'grok',
+        sessionKey: this.opts.sessionKey,
+        resumeId: this.nativeId,
+        inputsKey: ctx.promptInputsKey,
+        updatedAt: Date.now(),
+      })
+    }
     ctx.params.sessionTotals.turns += 1
     // Charge the tokens already consumed; master clamp still applies. Do not
     // mark USER_CANCELLED or the remaining work would be a free overage.
@@ -1446,7 +1547,10 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   }
 
   get nativeSessionId(): string | null { return this.nativeId }
-  clearSessionId(): void { this.nativeId = null }
+  clearSessionId(): void {
+    this.nativeId = null
+    clearResumedEnvelopeState(process.env.OPENCLAUDE_HOME?.trim() || paths.home, 'grok', this.opts.sessionKey)
+  }
   setResumeSessionId(sessionId: string): void { this.nativeId = sessionId }
   setModel(model: string | undefined): void {
     const nextFast = model === 'grok-build-fast'

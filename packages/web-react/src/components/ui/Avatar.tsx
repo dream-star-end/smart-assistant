@@ -8,14 +8,14 @@ import { cn } from "../../lib/utils";
  * tone: brand=极光渐变底白字 / ink=主色底反相字 / neutral=低强度灰底。
  */
 export const avatarVariants = cva(
-  "inline-flex shrink-0 select-none items-center justify-center overflow-hidden font-semibold",
+  "oc-avatar-ring inline-flex shrink-0 select-none items-center justify-center overflow-hidden font-semibold",
   {
     variants: {
       size: {
-        xs: "size-6 text-[11px]",
+        xs: "size-6 text-caption",
         sm: "size-7 text-xs",
         md: "size-9 text-sm",
-        lg: "size-11 text-[15px]",
+        lg: "size-11 text-title",
       },
       shape: { round: "rounded-full", square: "rounded-lg" },
       tone: {

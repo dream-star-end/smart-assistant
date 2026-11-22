@@ -7,11 +7,11 @@
 import type { ToolTone } from './meta'
 
 export const TONE_TILE: Record<ToolTone, string> = {
-  accent: 'bg-accent-soft text-accent',
-  success: 'bg-success-soft text-success',
-  info: 'bg-info-soft text-info',
-  warning: 'bg-warning-soft text-warning',
-  neutral: 'bg-hover text-muted',
+  accent: 'oc-icon-badge oc-icon-badge-accent',
+  success: 'oc-icon-badge oc-icon-badge-success',
+  info: 'oc-icon-badge oc-icon-badge-info',
+  warning: 'oc-icon-badge oc-icon-badge-warning',
+  neutral: 'oc-icon-badge',
 }
 
 /** 取 tone 对应的底色类;未知/缺省 tone 回落 accent(与旧两处 `?? "accent"` 语义一致)。 */

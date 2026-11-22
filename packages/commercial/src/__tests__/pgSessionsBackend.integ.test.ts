@@ -16,6 +16,7 @@ import { Value } from '@sinclair/typebox/value';
 
 import { after, before, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -120,6 +121,11 @@ const MIGRATION_0237_PROJECT_ASSETS = path.resolve(here, "../db/migrations/0237_
 // OCV5-380 (selfhost P2): archive / pin / template / delete manifest on chat_projects.
 const MIGRATION_0302_CHAT_PROJECT_WORKSPACE = path.resolve(here, "../db/migrations/0302_chat_project_workspace.sql");
 const MIGRATION_0323 = path.resolve(here, "../db/migrations/0323_turn_dispatches_trace_id.sql");
+const MIGRATION_0350 = existsSync(
+  path.resolve(here, "../db/migrations/0346_commercial_perf_timeline_and_live_snapshot.sql"),
+)
+  ? path.resolve(here, "../db/migrations/0346_commercial_perf_timeline_and_live_snapshot.sql")
+  : path.resolve(here, "../db/migrations/0350_perf_timeline_and_live_snapshot.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -302,6 +308,7 @@ before(async () => {
       ADD COLUMN IF NOT EXISTS is_research_default BOOLEAN NOT NULL DEFAULT FALSE;
   `);
   await pool.query(await readFile(MIGRATION_0323, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0350, { encoding: "utf8" }));
   migration0176EscapedNulBackfill = (
     await pool.query<NonNullable<typeof migration0176EscapedNulBackfill>>(
       `SELECT physical_record_count, logical_record_count, record_payload_bytes::text

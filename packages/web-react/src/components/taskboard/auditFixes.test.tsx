@@ -424,6 +424,44 @@ describe('T-05 / T-06 / T-07 / T-30 单据抽屉', () => {
     expect(onOpenTicket).toHaveBeenCalledWith(null)
   })
 
+  test('OCV5-839 从「待拍板」深链直达任务单时，即使当前范围为「全部项目」也能打开详情并自动对齐工作项目', async () => {
+    const waiting = ticket({
+      id: 'tk-145',
+      identifier: 'OCV5-145',
+      projectId: 'p1',
+      title: 'UX 持续迭代计划',
+      status: 'waiting_human',
+    })
+    stubBoard({ columns: [{ stage: stage(), tickets: [waiting] }], inbox: [waiting] })
+    mockDrawerApis(waiting)
+    history.replaceState({}, '', '/board?ticket=OCV5-145')
+    render(
+      <ProjectScopeProvider auth={auth} chatProjects={[]} userId="audit-jump-all">
+        <ToastProvider>
+          <TooltipProvider>
+            <TaskboardView
+              auth={auth}
+              view="board"
+              ticketId="OCV5-145"
+              onViewChange={() => {}}
+              onOpenTicket={() => {}}
+              onOpenMobileNav={() => {}}
+            />
+          </TooltipProvider>
+        </ToastProvider>
+      </ProjectScopeProvider>,
+    )
+
+    const drawer = await screen.findByTestId('ticket-drawer')
+    expect(within(drawer).getByText('UX 持续迭代计划')).toBeInTheDocument()
+    expect(within(drawer).getByTestId('inbox-approve')).toBeInTheDocument()
+    // 详情载入后应自动把 ProjectScope 从 all 对齐到该单所属项目 p1，背景看板随之加载对应项目
+    await waitFor(() => {
+      expect(new URLSearchParams(window.location.search).get('project')).toBe('p1')
+    })
+    expect(screen.queryByText('任务看板按工作项目组织。请在上方选择一个具体的工作项目。')).not.toBeInTheDocument()
+  })
+
   test('T-19 只有被点的按钮转圈，其余禁用', async () => {
     const running = ticket({
       allowedMoves: [

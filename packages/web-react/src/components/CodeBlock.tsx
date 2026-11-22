@@ -1,4 +1,4 @@
-import { Check, ChevronDown, Copy, WrapText } from "lucide-react";
+import { Check, ChevronDown, ChevronUp, Code2, Copy, Terminal, WrapText } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { cn } from "../lib/utils";
 import { useToast } from "./ui";
@@ -47,8 +47,9 @@ export function CodeBlock({
   const ref = useRef<HTMLElement>(null);
   const [copied, setCopied] = useState(false);
   const [wrap, setWrap] = useState(readCodeWrap);
+  const canCollapse = !live && lineCount > CODE_COLLAPSE_LINES;
   // 只在挂载时决定一次;之后行数增长 / live 翻转都不再收起。
-  const [collapsed, setCollapsed] = useState(() => !live && lineCount > CODE_COLLAPSE_LINES);
+  const [collapsed, setCollapsed] = useState(() => canCollapse);
   const toast = useToast();
 
   useEffect(() => {
@@ -73,33 +74,69 @@ export function CodeBlock({
     writeCodeWrap(!wrap);
   };
 
+  const isShell = /^(?:sh|bash|zsh|shell|console|terminal|powershell|cmd)$/i.test(language || "");
+  const LangIcon = isShell ? Terminal : Code2;
+
   return (
     // overflow-clip(而非 hidden)不建立滚动容器,表头才能 sticky 在聊天滚动区顶部:长代码块
     // 展开后滚到中段,「复制 / 换行」仍在手边。
-    <div className="my-4 overflow-clip rounded-[12px] border border-border bg-code">
-      {/* 表头:与代码同底、只用一道淡分隔线,语言名小号等宽;动作按钮去掉常驻底色,hover 才浮出。 */}
-      <div className="sticky top-0 z-[1] flex items-center justify-between border-b border-border/70 bg-code py-1 pl-4 pr-1.5">
-        <span className="font-mono text-caption tracking-wide text-faint">{language || "code"}</span>
-        <div className="flex items-center gap-0.5">
+    <div className="oc-code-shell my-4 overflow-clip rounded-xl">
+      {/* IDE 级精致顶栏:微凹底槽 + 语言微胶囊 + 触感动作按钮。 */}
+      <div className="oc-code-shell-header sticky top-0 z-[1] flex items-center justify-between gap-2 px-3 py-1.5 backdrop-blur-sm">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="inline-flex min-w-0 items-center gap-1.5 rounded-md border border-border/70 bg-surface/80 px-2 py-0.5 font-mono text-caption font-medium tracking-wide text-muted">
+            <LangIcon size={12} strokeWidth={1.75} aria-hidden="true" className="shrink-0 text-faint" />
+            <span className="truncate">{language || "code"}</span>
+          </span>
+          {lineCount > 0 && (
+            <span className="hidden shrink-0 font-mono text-micro tabular-nums text-faint sm:inline">
+              {lineCount} 行
+            </span>
+          )}
+        </div>
+        <div className="flex shrink-0 items-center gap-1">
+          {canCollapse && !collapsed && (
+            <button
+              type="button"
+              onClick={() => setCollapsed(true)}
+              aria-label="收起代码块"
+              className="oc-btn-tactile flex items-center gap-1 rounded-md px-2 py-1 text-caption font-medium text-faint transition-colors hover:bg-hover hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+            >
+              <ChevronUp size={13} strokeWidth={1.75} />
+              收起
+            </button>
+          )}
           <button
             type="button"
             onClick={toggleWrap}
             aria-label="换行"
             aria-pressed={wrap}
+            title={wrap ? "取消换行" : "换行"}
             className={cn(
-              "flex items-center gap-1.5 rounded-md px-2 py-1 text-caption transition-colors hover:bg-hover hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3",
-              wrap ? "text-fg" : "text-faint",
+              "oc-btn-tactile flex items-center gap-1.5 rounded-md border px-2 py-1 text-caption font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3",
+              wrap
+                ? "border-accent/30 bg-accent-soft text-accent"
+                : "border-transparent text-faint hover:bg-hover hover:text-fg",
             )}
           >
-            <WrapText size={13} />
-            换行
+            <WrapText size={13} strokeWidth={1.75} aria-hidden="true" />
+            <span className="hidden sm:inline">换行</span>
           </button>
           <button
             type="button"
             onClick={copy}
-            className="flex items-center gap-1.5 rounded-md px-2 py-1 text-caption text-faint transition-colors hover:bg-hover hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+            className={cn(
+              "oc-btn-tactile flex min-w-[4.5rem] items-center justify-center gap-1.5 rounded-md border px-2 py-1 text-caption font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3",
+              copied
+                ? "border-success/30 bg-success-soft text-success"
+                : "border-transparent text-faint hover:bg-hover hover:text-fg",
+            )}
           >
-            {copied ? <Check size={13} className="text-success" /> : <Copy size={13} />}
+            {copied ? (
+              <Check size={13} strokeWidth={2} className="oc-check-pop" aria-hidden="true" />
+            ) : (
+              <Copy size={13} strokeWidth={1.75} aria-hidden="true" />
+            )}
             {copied ? "已复制" : "复制"}
           </button>
         </div>
@@ -109,7 +146,7 @@ export function CodeBlock({
           data-code-collapsed={collapsed || undefined}
           style={collapsed ? { maxHeight: `calc(${COLLAPSED_LINES} * 1.7 * 13px + 1.5rem)` } : undefined}
           className={cn(
-            "overflow-x-auto px-4 py-3 text-[13px] leading-[1.7] [scrollbar-width:thin]",
+            "overflow-x-auto px-4 py-3.5 text-body leading-[1.7] [scrollbar-width:thin]",
             collapsed && "overflow-y-hidden",
             wrap && "whitespace-pre-wrap break-words",
           )}
@@ -119,13 +156,13 @@ export function CodeBlock({
           </code>
         </pre>
         {collapsed && (
-          <div className="absolute inset-x-0 bottom-0 flex h-20 items-end justify-center bg-gradient-to-b from-transparent to-code pb-2">
+          <div className="absolute inset-x-0 bottom-0 flex h-24 items-end justify-center bg-gradient-to-b from-transparent via-code/80 to-code pb-3">
             <button
               type="button"
               onClick={() => setCollapsed(false)}
-              className="flex items-center gap-1 rounded-full border border-border bg-surface px-3 py-1 text-caption text-muted shadow-sm transition-colors hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-4"
+              className="oc-btn-tactile oc-btn-secondary-craft flex items-center gap-1.5 rounded-full border border-border bg-surface px-3.5 py-1.5 text-caption font-medium text-fg shadow-soft transition-colors hover:border-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-4"
             >
-              <ChevronDown size={13} />
+              <ChevronDown size={13} strokeWidth={1.75} />
               展开全部（{lineCount} 行）
             </button>
           </div>

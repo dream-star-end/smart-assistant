@@ -211,15 +211,17 @@ describe('底栏按钮稳定性(M-12)', () => {
   })
 })
 
-// ── 审计 M-24:价格不在前端写死 —— 计费口径一改前端就说谎。 ──
-describe('计费文案(M-24)', () => {
-  test('顶栏副标题与读屏帮助文案不再写死「每张 50 积分」', async () => {
+// ── 审计 M-24 / OCV5-838:价格不在前端写死,隐藏内部代号 Image 2,重试按钮文案明确。 ──
+describe('计费文案与加载失败重试(M-24 / OCV5-838)', () => {
+  test('顶栏副标题隐藏内部代号 Image 2 且不再写死积分;加载失败按钮为「重试加载」', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500 }) as unknown as Response))
     render(<EditorHarness />)
     const title = await screen.findByText('圈选要修改的区域')
-    expect(title.parentElement).toHaveTextContent('Image 2')
+    expect(title.parentElement).toHaveTextContent('局部重绘')
+    expect(title.parentElement).not.toHaveTextContent('Image 2')
     expect(title.parentElement?.textContent).not.toMatch(/积分/)
     expect(document.getElementById('image-edit-help')?.textContent).not.toMatch(/积分/)
+    expect(await screen.findByRole('button', { name: '重试加载' })).toBeInTheDocument()
   })
 })
 
@@ -345,6 +347,16 @@ describe('桌面鼠标画笔路径(需求 §1)', () => {
     // Shift+Enter 不提交
     fireEvent.keyDown(ta, { key: 'Enter', shiftKey: true })
     expect(onSubmit).not.toHaveBeenCalled()
+
+    // 中文 IME 组词期间 Enter（isComposing / keyCode=229 / compositionStart..End）严禁误发提交
+    fireEvent.keyDown(ta, { key: 'Enter', isComposing: true })
+    expect(onSubmit).not.toHaveBeenCalled()
+    fireEvent.keyDown(ta, { key: 'Enter', keyCode: 229 })
+    expect(onSubmit).not.toHaveBeenCalled()
+    fireEvent.compositionStart(ta)
+    fireEvent.keyDown(ta, { key: 'Enter' })
+    expect(onSubmit).not.toHaveBeenCalled()
+    fireEvent.compositionEnd(ta)
 
     // Enter 提交
     fireEvent.keyDown(ta, { key: 'Enter' })

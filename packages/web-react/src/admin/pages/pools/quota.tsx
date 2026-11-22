@@ -98,19 +98,32 @@ export function QuotaWindowsCell({ quota, now = Date.now() }: { quota: MemberQuo
         }
         const tone = w.usedPct === null ? null : toneOf(w.usedPct);
         const pct = w.usedPct === null ? "—" : `${w.usedPct % 1 === 0 ? w.usedPct.toFixed(0) : w.usedPct.toFixed(1)}%`;
+        const fillPct = w.usedPct === null ? null : Math.max(0, Math.min(100, w.usedPct));
+        const fillCls =
+          tone === "danger" ? "bg-danger" : tone === "warning" ? "bg-warning" : "bg-accent";
         const reset = resetLabel(w.resetsAt, now);
         return (
-          <span key={w.label} className="whitespace-nowrap text-meta">
-            <span className="text-muted">{w.label}</span>{" "}
-            {tone ? (
-              <Badge tone={tone} className="px-1.5 py-0 text-caption">
-                已用 {pct}
-              </Badge>
-            ) : (
-              <span className="tabular-nums text-fg">已用 {pct}</span>
-            )}
-            {reset ? <span className="text-faint"> · {reset}</span> : null}
-          </span>
+          <div key={w.label} className="flex flex-col gap-1">
+            <span className="whitespace-nowrap text-meta">
+              <span className="text-muted">{w.label}</span>{" "}
+              {tone ? (
+                <Badge tone={tone} className="px-1.5 py-0 text-caption tabular-nums">
+                  已用 {pct}
+                </Badge>
+              ) : (
+                <span className="tabular-nums text-fg">已用 {pct}</span>
+              )}
+              {reset ? <span className="text-faint"> · {reset}</span> : null}
+            </span>
+            {fillPct !== null ? (
+              <div className="h-1 w-28 overflow-hidden rounded-full bg-hover/90">
+                <div
+                  className={`oc-progress-fill h-full rounded-full ${fillCls}`}
+                  style={{ width: `${fillPct}%` }}
+                />
+              </div>
+            ) : null}
+          </div>
         );
       })}
       {quota.note ? <span className="line-clamp-2 text-caption text-faint">{quota.note}</span> : null}

@@ -1,28 +1,17 @@
 import {
-  Clapperboard,
   Archive,
-  BookOpen,
-  Building2,
+  Bell,
   ChevronDown,
   ChevronRight,
   ChevronsUpDown,
   Command,
-  Film,
-  Globe,
-  KeyRound,
   LayoutGrid,
   ListChecks,
-  LogOut,
-  MessageSquareText,
   PanelLeftClose,
   Plus,
   Search,
-  Settings,
-  ShieldCheck,
-  SquareKanban,
   Store,
   X,
-  PenLine,
 } from "lucide-react";
 import {
   type KeyboardEvent as ReactKeyboardEvent,
@@ -36,7 +25,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import { archivedExpandedStorageKey } from "../hooks/useChatProjects";
-import { useProjectScope } from "../hooks/useProjectScope";
+import { useOptionalAuth, useProjectScope } from "../hooks/useProjectScope";
 import { SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN } from "../hooks/useSidebarWidth";
 import type { Theme } from "../hooks/useTheme";
 import { BRAND } from "../lib/brand";
@@ -51,7 +40,6 @@ import type {
 } from "../lib/types";
 import { cn, formatCompactCount, formatCredits } from "../lib/utils";
 import { BrandMark } from "./BrandMark";
-import { ThemeToggle } from "./ThemeToggle";
 import { ProjectRow } from "./sidebar/ProjectRow";
 import { SessionRow } from "./sidebar/SessionRow";
 import { VirtualList } from "./sidebar/VirtualList";
@@ -75,26 +63,69 @@ import {
   Avatar,
   Button,
   DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
   IconButton,
   StatusPill,
 } from "./ui";
+import { AtelierIcon } from "./ui/AtelierIcons";
 
 /** 多选批量条只在进入多选后出现，懒加载，不进首屏（UI-1 用它抵掉本片首屏增量）。 */
 const BatchBar = lazy(() => import("./sidebar/BatchBar").then((m) => ({ default: m.BatchBar })));
+/** 活态指挥条（含统一「待拍板」聚合区）按需懒加载，不进首屏静态闭包。 */
+const SidebarLiveActivityStrip = lazy(() =>
+  import("./sidebar/LiveActivityStrip").then((m) => ({ default: m.SidebarLiveActivityStrip })),
+);
+
+type AccountMenuModule = typeof import("./sidebar/AccountMenuContent");
+let loadedAccountMenu: AccountMenuModule | null = null;
+let pendingAccountMenu: Promise<AccountMenuModule> | null = null;
+
+/** 账号下拉菜单懒块预热：移出首屏同步入口闭包，就绪后同步解析零闪烁。 */
+export function preloadAccountMenu(): Promise<AccountMenuModule> {
+  if (!pendingAccountMenu) {
+    pendingAccountMenu = import("./sidebar/AccountMenuContent").then(
+      (mod) => {
+        loadedAccountMenu = mod;
+        return mod;
+      },
+      (err: unknown) => {
+        pendingAccountMenu = null;
+        throw err;
+      },
+    );
+  }
+  return pendingAccountMenu;
+}
+
+const LazyAccountMenuContent = lazy(() => {
+  const ready = loadedAccountMenu;
+  if (ready) {
+    const sync = {
+      // biome-ignore lint/suspicious/noThenProperty: synchronous thenable for React.lazy once preloaded
+      then(resolve: (value: { default: AccountMenuModule["AccountMenuContent"] }) => void) {
+        resolve({ default: ready.AccountMenuContent });
+      },
+    };
+    return sync as unknown as Promise<{ default: AccountMenuModule["AccountMenuContent"] }>;
+  }
+  return preloadAccountMenu().then((mod) => ({ default: mod.AccountMenuContent }));
+});
+
+if (typeof window !== "undefined") {
+  const idle = (window as Window & { requestIdleCallback?: (cb: () => void) => number })
+    .requestIdleCallback;
+  if (idle) idle(() => { void preloadAccountMenu().catch(() => {}); });
+  else window.setTimeout(() => { void preloadAccountMenu().catch(() => {}); }, 10);
+}
 
 /** 空态提示行叠加「新建会话」CTA 后的行高(文字 + gap + 按钮 + 原 py-6 呼吸位)。 */
 const EMPTY_HINT_CTA_HEIGHT = 108;
 /** 零会话零项目的引导空态（图标 + 标题 + 两行说明 + 两个按钮，S-13）。 */
 const EMPTY_ALL_HEIGHT = 200;
-/**
- * 底栏「案例」入口在此宽度及以上才带文字；默认 268px 与移动抽屉一律只留图标（title / aria-label 照旧），
- * 把横向空间让给昵称与余额 —— 268px 下文字版会把「余额 258.5万 积分」截成「余额 258.5万…」（S-09 / SIDEBAR-R1）。
- */
-const FOOTER_LABEL_MIN_WIDTH = 300;
+const NAV_ITEM_BASE =
+  "oc-spring-press oc-icon-nudge group relative flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:h-9";
+const NAV_ITEM_ACTIVE = "bg-sidebar-active font-medium text-fg shadow-sidebar-active";
+const NAV_ITEM_IDLE = "text-muted hover:bg-hover/80 hover:text-fg";
 
 function readArchivedExpanded(userId: string | undefined): boolean {
   if (!userId) return false;
@@ -168,27 +199,35 @@ export type SidebarProps = {
   collapseLabel?: string;
   onLogout?: () => void;
   onOpenAccount?: () => void;
+  /** 点账号菜单「设置」直达偏好页；未传时回退 onOpenAccount。 */
+  onOpenPreferences?: () => void;
   onOpenFeedback?: () => void;
   onOpenManage?: () => void;
   onOpenMarketplace?: () => void;
   onOpenTutorial?: () => void;
-  /** 经验分享（OCV5-577）：一级入口，打开教程中心的「经验分享」页签。 */
+  /** @deprecated OCV5-843 已并入账号菜单「帮助与案例」，保留可选以向后兼容。 */
   onOpenBlog?: () => void;
   onOpenOrg?: () => void;
-  onOpenBoard?: () => void;
+  onOpenBoard?: (ticketRef?: string) => void;
   onOpenSites?: () => void;
   onOpenMediaTasks?: () => void;
   /** OCV5-593: shown only when /api/studio/providers answers 200 for this account. */
   onOpenStudio?: () => void;
   /** 「ChatGPT 直连」面板入口:仅管理员 / 白名单用户且服务端已开启时由 App 传入。 */
   onOpenChatGptProxy?: () => void;
-  /** 「API 接入」入口:管理员由 App 传入(admin-only rollout),直达设置 api-access 分区。 */
+  /** @deprecated OCV5-843 已收敛进设置中心「API 接入」分区，保留可选以向后兼容。 */
   onOpenApiAccess?: () => void;
   boardActive?: boolean;
   sitesActive?: boolean;
   showAdmin?: boolean;
   theme?: Theme;
+  /** 直接切换主题（供账号菜单内联三段控件使用）。 */
+  onSetTheme?: (theme: Theme) => void;
   onCycleTheme?: () => void;
+  /** 站内信未读数（侧栏左下角全局铃铛按钮 6px 状态点 + aria-label/title 精确计数）。 */
+  unreadCount?: number;
+  /** 打开全局站内信抽屉。 */
+  onOpenInbox?: () => void;
   unreadIds?: Set<string>;
   onMarkRead?: (id: string) => void;
   onOpenProjectSettings?: (p: ChatProject) => void;
@@ -225,6 +264,12 @@ export type SidebarProps = {
   virtualizeThreshold?: number;
   /** Ctrl/⌘K palette (projects, chats, files, actions). Omit to hide the hint button. */
   onOpenPalette?: () => void;
+  /** 可选：多代理/蜂群协作运行中的会话 id 集合（供顶部活态指挥区识别协作态）。 */
+  swarmSessionIds?: ReadonlySet<string>;
+  /** 可选：是否展示侧栏顶部活态指挥区；默认 true（无活态项时自动零占位折叠）。 */
+  showLiveActivityStrip?: boolean;
+  /** 可选：从待拍板聚合区一键直达实时浏览器接管视口。 */
+  onOpenLiveBrowser?: (opts?: { url?: string; sessionId?: string | null }) => void;
 };
 
 export function Sidebar({
@@ -258,23 +303,25 @@ export function Sidebar({
   collapseLabel = "折叠侧栏",
   onLogout,
   onOpenAccount,
+  onOpenPreferences,
   onOpenFeedback,
   onOpenManage,
   onOpenMarketplace,
   onOpenTutorial,
-  onOpenBlog,
   onOpenOrg,
   onOpenBoard,
   onOpenSites,
   onOpenMediaTasks,
   onOpenStudio,
   onOpenChatGptProxy,
-  onOpenApiAccess,
   boardActive,
   sitesActive,
   showAdmin,
   theme,
+  onSetTheme,
   onCycleTheme,
+  unreadCount,
+  onOpenInbox,
   unreadIds,
   onMarkRead,
   onOpenProjectSettings,
@@ -298,6 +345,9 @@ export function Sidebar({
   searchProjectId,
   virtualizeThreshold = VIRTUALIZE_THRESHOLD,
   onOpenPalette,
+  swarmSessionIds,
+  showLiveActivityStrip = true,
+  onOpenLiveBrowser,
 }: SidebarProps) {
   const [q, setQ] = useState("");
   const [now, setNow] = useState(() => Date.now());
@@ -308,6 +358,7 @@ export function Sidebar({
   const [orderOverride, setOrderOverride] = useState<string[] | null>(null);
   const [searchHits, setSearchHits] = useState<SessionSearchHit[]>([]);
   const [searchRemote, setSearchRemote] = useState<"idle" | "loading" | "empty" | "error">("idle");
+  const [accountMenuOpened, setAccountMenuOpened] = useState(false);
   const coarse = useCoarsePointer();
   const userId = user?.id;
   const sessions = useMemo(
@@ -332,6 +383,7 @@ export function Sidebar({
   }, [archivedExpanded]);
   const searching = q.trim().length > 0;
   const projectScope = useProjectScope();
+  const optionalAuth = useOptionalAuth();
   // 全局项目范围(在看板/管理中心选的)也会收窄侧栏搜索:必须看得见,也能一键放开。
   // 放开只对本侧栏搜索生效,范围本身一变就恢复跟随。
   const [ignoreScopeForSearch, setIgnoreScopeForSearch] = useState(false);
@@ -488,6 +540,25 @@ export function Sidebar({
     [orderedProjects, projectSessions, runningIds],
   );
 
+  const hasLiveCandidate = useMemo(() => {
+    void socketVersion;
+    if (!showLiveActivityStrip || searching || multiSelect) return false;
+    if (runningIds.size > 0 || (swarmSessionIds?.size ?? 0) > 0) return true;
+    for (const s of activeSessions) {
+      if (sessionNeedsYou?.(s.id)) return true;
+    }
+    return false;
+  }, [
+    showLiveActivityStrip,
+    searching,
+    multiSelect,
+    runningIds,
+    swarmSessionIds,
+    activeSessions,
+    sessionNeedsYou,
+    socketVersion,
+  ]);
+
   const flatItems = useMemo(
     () =>
       flattenSidebarItems({
@@ -619,50 +690,55 @@ export function Sidebar({
   }, []);
 
   const hasAccountMenu = Boolean(
-    onOpenManage ||
-      onOpenMarketplace ||
-      onOpenOrg ||
+    onOpenOrg ||
       showAdmin ||
       onOpenMediaTasks ||
       onOpenStudio ||
       onOpenChatGptProxy ||
-      onOpenApiAccess ||
       onOpenAccount ||
+      onOpenPreferences ||
+      onOpenTutorial ||
       onOpenFeedback ||
-      onLogout,
+      onLogout ||
+      (theme && (onSetTheme || onCycleTheme)),
   );
 
   // 底栏余额：默认 268px 下完整千分位数字已被截成「1,234,56…」（S-09），底栏一律用
   // 万 / 亿 缩写（formatCompactCount），精确值放 title 悬浮；账号菜单里空间充足仍显完整数字。
-  const footerCompact = typeof width !== "number" || width < FOOTER_LABEL_MIN_WIDTH;
+  const hasUnreadInbox = Boolean(unreadCount && unreadCount > 0);
   const creditsExact = credits != null ? `${formatCredits(credits)} 积分` : null;
   // 无余额（个人版 / 自托管未接计费、demo、未登录）时副标题此前写死「多模型 · 计量计费」——
   // 商业化营销文案出现在不计费的部署形态里（S-14）。改为有邮箱显邮箱、没有就不占这一行；
   // 最小改动、可回退、不引入新的能力开关判断，计费形态下仍显示余额。
   const email = user?.email?.trim() || null;
-  const accountSubtitle = credits != null ? null : email;
+  const displayName = user?.displayName?.trim() || "未登录";
+  const showSecondaryEmail = Boolean(email && email.toLowerCase() !== displayName.toLowerCase());
+  const accountSubtitle = credits != null ? null : showSecondaryEmail ? email : null;
+  const warmAccountMenu = hasAccountMenu ? () => { void preloadAccountMenu().catch(() => {}); } : undefined;
   const userChip = (
     <button
       type="button"
       data-product-feature={PRODUCT_CAPABILITIES.billing.id}
       disabled={!hasAccountMenu}
       aria-label={hasAccountMenu ? "账号菜单" : undefined}
-      className="flex min-w-0 flex-1 items-center gap-2.5 rounded-sm py-1.5 pl-1.5 pr-2 text-left outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring enabled:hover:bg-hover data-[state=open]:bg-hover [@media(hover:none)]:min-h-11"
+      onPointerEnter={warmAccountMenu}
+      onFocus={warmAccountMenu}
+      className="oc-btn-tactile oc-spring-press group flex min-w-0 flex-1 items-center gap-2 rounded-sm py-1.5 pl-1.5 pr-2 text-left outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring enabled:hover:bg-hover/80 data-[state=open]:bg-sidebar-active data-[state=open]:shadow-sidebar-active [@media(hover:none)]:min-h-10"
     >
       <Avatar
         size="sm"
         tone="neutral"
-        className="bg-accent-soft text-[12px] text-accent ring-1 ring-inset ring-accent/15"
+        className="oc-avatar-ring bg-accent-soft text-meta font-semibold text-accent ring-1 ring-inset ring-accent/20"
       >
-        {(user?.displayName || "U").slice(0, 1).toUpperCase()}
+        {displayName.slice(0, 1).toUpperCase()}
       </Avatar>
       <span className="min-w-0 flex-1 leading-tight">
         <span className="block truncate text-body font-medium text-fg">
-          {user?.displayName || "未登录"}
+          {displayName}
         </span>
         {credits != null ? (
           <span
-            className="mt-0.5 block truncate text-caption tabular-nums text-faint"
+            className="mt-0.5 block truncate text-caption font-medium tabular-nums text-faint"
             title={creditsExact ? `余额 ${creditsExact}` : undefined}
           >
             {`余额 ${formatCompactCount(credits)} 积分`}
@@ -677,8 +753,9 @@ export function Sidebar({
         // 触屏两侧各有 44px 图标钮，省掉这枚纯装饰箭头把宽度还给余额。
         <ChevronsUpDown
           size={14}
+          strokeWidth={1.75}
           aria-hidden
-          className="shrink-0 text-faint [@media(hover:none)]:hidden"
+          className="shrink-0 text-faint transition-colors group-hover:text-muted [@media(hover:none)]:hidden"
         />
       )}
     </button>
@@ -690,7 +767,7 @@ export function Sidebar({
       return (
         <h2
           className={cn(
-            "m-0 flex h-full items-center pl-2.5 pr-1 text-caption font-medium tracking-[0.04em] text-faint",
+            "m-0 flex h-full items-center pl-2.5 pr-1 text-caption font-semibold tracking-[0.06em] text-faint",
             // 桌面 32px 行：文字压在下部、贴近其所属分组；触屏带按钮的标题行升到 44px（拍平层同步加高），
             // 文字与 44px 按钮垂直居中对齐（S-04）。
             !(withAction && coarse) && "pt-2.5",
@@ -704,10 +781,10 @@ export function Sidebar({
               variant="muted"
               size="xs"
               shape="square"
-              className="ml-auto rounded-xs"
+              className="oc-btn-tactile ml-auto rounded-xs"
               onClick={onCreateProject}
             >
-              <Plus size={14} />
+              <Plus size={14} strokeWidth={1.75} />
             </IconButton>
           )}
           {withAction && onOpenProjectArchive && (
@@ -717,10 +794,10 @@ export function Sidebar({
               variant="muted"
               size="xs"
               shape="square"
-              className="rounded-xs"
+              className="oc-btn-tactile rounded-xs"
               onClick={onOpenProjectArchive}
             >
-              <Archive size={14} />
+              <Archive size={14} strokeWidth={1.75} />
             </IconButton>
           )}
         </h2>
@@ -734,12 +811,12 @@ export function Sidebar({
             data-testid="sidebar-empty-all"
             className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center"
           >
-            <span className="flex size-10 items-center justify-center rounded-full bg-hover text-faint">
-              <MessageSquareText size={18} />
+            <span className="oc-icon-badge oc-icon-badge-accent size-10 rounded-md">
+              <AtelierIcon name="newChat" size={18} />
             </span>
             <div className="flex flex-col gap-1">
-              <span className="text-body font-medium text-fg">{item.text}</span>
-              <span className="text-caption text-faint">
+              <span className="text-body font-semibold text-fg">{item.text}</span>
+              <span className="text-caption leading-relaxed text-faint">
                 新建一个会话开始聊天；相关会话多了，可以建项目归到一起。
               </span>
             </div>
@@ -782,14 +859,13 @@ export function Sidebar({
       );
     }
     if (item.kind === "more") {
-      // 与子会话同轴（缩进 + 层级引导线），读作这一组的最后一行。
+      // 与项目下缩进会话标题同一左对齐基线（pl-2 + pl-7 = 36px）。
       return (
-        <div className="relative h-full py-px pl-[22px]">
-          <span aria-hidden className="pointer-events-none absolute inset-y-0 left-[15px] w-px bg-border" />
+        <div className="relative h-full py-px pl-2">
           <button
             type="button"
             onClick={() => onOpenProject?.(item.projectId)}
-            className="flex h-full w-full items-center gap-1 rounded-sm pl-7.5 text-left text-caption text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            className="flex h-full w-full items-center gap-1 rounded-sm pl-7 text-left text-caption text-faint outline-none transition-colors hover:bg-hover/80 hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
             查看全部 {item.count} 条
             <ChevronRight size={12} aria-hidden />
@@ -932,11 +1008,11 @@ export function Sidebar({
               onLoadArchived?.();
             }
           }}
-          // 与项目行同一骨架（图标列 / 名称 / 旋转箭头 / 计数），但整行取 faint：归档是次要入口。
-          className="mt-1 flex h-[calc(100%-0.25rem)] w-full items-center gap-2 rounded-sm pl-2 pr-2 text-left text-section text-faint outline-none transition-colors duration-150 hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+          // 与项目行同一骨架（16px 图标列 / 名称 / 旋转箭头 / 计数），整行取 faint：归档是次要入口。
+          className="mt-1 flex h-[calc(100%-0.25rem)] w-full items-center gap-2.5 rounded-sm px-2.5 text-left text-section text-faint outline-none transition-colors duration-150 hover:bg-hover/80 hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
         >
-          <span className="flex size-3.5 shrink-0 items-center justify-center">
-            <Archive size={14} aria-hidden />
+          <span className="flex size-4 shrink-0 items-center justify-center">
+            <Archive size={14} strokeWidth={1.75} aria-hidden />
           </span>
           <span className="min-w-0 truncate">已归档</span>
           <ChevronRight
@@ -959,7 +1035,7 @@ export function Sidebar({
     <aside
       className={cn(
         // 桌面加一道发丝分隔线与主区切开（移动抽屉自带遮罩，不需要）。
-        "relative flex h-full shrink-0 flex-col bg-sidebar md:border-r md:border-border/70",
+        "relative flex h-full min-h-0 shrink-0 flex-col bg-sidebar md:border-r md:border-border/70",
         width == null && "w-[268px]",
         resizing && "select-none",
       )}
@@ -986,13 +1062,16 @@ export function Sidebar({
           )}
         />
       )}
-      <div className="flex flex-col px-2 pb-1 pt-2.5" data-product-entry-scope="sidebar-primary">
-        <div className="mb-2.5 flex h-8 items-center justify-between pl-2 pr-0.5">
+      <div
+        className="flex shrink-0 flex-col border-b border-border/60 px-2 pb-2 sidebar-head-safe-t"
+        data-product-entry-scope="sidebar-primary"
+      >
+        <div className="mb-2 flex h-8 items-center justify-between pl-1.5 pr-0.5">
           <div className="flex min-w-0 items-center gap-2.5">
             <BrandMark
               className="size-[26px]"
-              rounded="rounded-[8px]"
-              fontSize="text-[14px]"
+              rounded="rounded-sm"
+              fontSize="text-section"
               flat
             />
             <span className="truncate text-title font-semibold tracking-tight text-fg">
@@ -1008,59 +1087,58 @@ export function Sidebar({
               variant="muted"
               size="sm"
               shape="square"
-              className="rounded-xs"
+              className="oc-btn-tactile rounded-sm"
             >
-              <PanelLeftClose size={16} />
+              <PanelLeftClose size={16} strokeWidth={1.75} />
             </IconButton>
           )}
         </div>
 
-        {/* 主操作：一张带发丝描边的浮起卡片，左侧墨色圆形「+」是整栏唯一的强视觉锚点；
-            有智能体选择时右侧以细分隔线切出下拉，而不是两块拼接的按钮（SIDEBAR-R1）。 */}
+        {/* 主操作：干练克制的 Codex/Linear 比例，去厚重白砖阴影；有智能体选择时右侧细线切出下拉。 */}
         <div
           data-sidebar-new
-          className="mb-2 flex h-9 w-full items-stretch rounded-sm border border-border bg-surface text-section shadow-sidebar-btn transition-[border-color,box-shadow] duration-150 ease-standard hover:border-border-strong [@media(hover:none)]:h-11"
+          className="group/new oc-btn-tactile oc-spring-press mb-2 flex h-9 w-full items-stretch rounded-sm border border-border/80 bg-surface/90 text-section shadow-2xs transition-colors duration-150 ease-standard hover:border-border-strong hover:bg-surface [@media(hover:none)]:h-10"
         >
           <button
             type="button"
             data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
             onClick={onNew}
             className={cn(
-              "flex min-w-0 flex-1 items-center gap-2.5 pl-2 pr-2 text-left font-medium text-fg outline-none transition-colors duration-150 hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-              onNewWithAgent ? "rounded-l-[8px]" : "rounded-[8px]",
+              "oc-icon-nudge flex min-w-0 flex-1 items-center gap-2.5 px-2.5 text-left font-medium text-fg outline-none transition-colors duration-150 hover:bg-hover/60 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+              onNewWithAgent ? "rounded-l-sm" : "rounded-sm",
             )}
           >
-            <span
-              aria-hidden
-              className="flex size-[22px] shrink-0 items-center justify-center rounded-full bg-primary text-primary-fg"
-            >
-              <Plus size={14} strokeWidth={2.5} />
-            </span>
+            <AtelierIcon
+              name="newChat"
+              size={16}
+              className="shrink-0 text-accent"
+            />
             <span className="truncate">新建会话</span>
           </button>
           {onNewWithAgent && (
             <>
-              <span aria-hidden className="my-2 w-px shrink-0 bg-border" />
+              <span aria-hidden className="my-2 w-px shrink-0 bg-border/80" />
               <button
                 type="button"
                 data-product-feature={PRODUCT_CAPABILITIES.agents.id}
                 aria-label="选择智能体后新建"
                 title="选择智能体后新建"
                 onClick={onNewWithAgent}
-                className="flex w-9 shrink-0 items-center justify-center rounded-r-[8px] text-faint outline-none transition-colors duration-150 hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:w-11"
+                className="flex w-8 shrink-0 items-center justify-center rounded-r-sm text-faint outline-none transition-colors duration-150 hover:bg-hover/60 hover:text-fg focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:w-10"
               >
-                <ChevronDown size={15} />
+                <ChevronDown size={14} strokeWidth={1.75} />
               </button>
             </>
           )}
         </div>
 
-        {/* 搜索与「任务」同一导航行骨架（图标列 / 文字 / 尾部操作）：静息时像导航项，聚焦时浮起成输入卡。 */}
-        <label className="group/search flex h-8 min-w-0 items-center gap-2.5 rounded-sm pl-2.5 pr-1 text-muted transition-[background-color,box-shadow] duration-150 hover:bg-hover focus-within:bg-sidebar-active focus-within:shadow-sidebar-active focus-within:ring-1 focus-within:ring-ring [@media(hover:none)]:min-h-11">
+        {/* 搜索条：轻柔微凹槽，图标与快捷键轻盈协调。 */}
+        <label className="group/search flex h-8 min-w-0 items-center gap-2.5 rounded-sm border border-transparent bg-hover/65 pl-2.5 pr-1 text-muted transition-colors duration-150 hover:border-border/70 focus-within:border-border-strong focus-within:bg-sidebar-active focus-within:shadow-sidebar-active [@media(hover:none)]:min-h-10">
           <Search
             size={15}
+            strokeWidth={1.75}
             aria-hidden
-            className="shrink-0 text-faint transition-colors group-focus-within/search:text-fg"
+            className="size-4 shrink-0 text-faint transition-colors group-focus-within/search:text-fg"
           />
           <input
             data-product-feature={PRODUCT_CAPABILITIES.sessions.id}
@@ -1078,7 +1156,7 @@ export function Sidebar({
             placeholder="搜索标题或消息"
             // 输入字号移动端保持 16px（iOS 输入框 <16px 聚焦会整页放大）；占位符单独取导航行字号，
             // 静息态与下方「任务」同一视觉重量（iOS 缩放只看输入框本身字号，不看 placeholder）。
-            className="h-full w-full min-w-0 bg-transparent text-base text-fg outline-none placeholder:text-section placeholder:text-muted md:text-section"
+            className="h-full w-full min-w-0 bg-transparent text-base text-fg outline-none placeholder:text-body placeholder:text-faint md:text-body"
           />
           {q && (
             <IconButton
@@ -1090,7 +1168,7 @@ export function Sidebar({
               shape="round"
               onClick={() => setQ("")}
             >
-              <X size={13} />
+              <X size={13} strokeWidth={1.75} />
             </IconButton>
           )}
           {onOpenPalette && !q && (
@@ -1104,10 +1182,10 @@ export function Sidebar({
                 e.preventDefault();
                 onOpenPalette();
               }}
-              className="flex h-6 shrink-0 items-center justify-center rounded-xs px-1.5 text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11 [@media(hover:none)]:px-0"
+              className="oc-btn-tactile flex h-6 shrink-0 items-center justify-center rounded-xs px-0.5 text-faint outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-10 [@media(hover:none)]:px-0"
             >
-              <kbd className="font-sans text-caption [@media(hover:none)]:hidden">{paletteKeyLabel()}</kbd>
-              <Command size={15} aria-hidden className="hidden [@media(hover:none)]:block" />
+              <kbd className="oc-kbd [@media(hover:none)]:hidden">{paletteKeyLabel()}</kbd>
+              <Command size={15} strokeWidth={1.75} aria-hidden className="hidden [@media(hover:none)]:block" />
             </button>
           )}
           {onBatch && !multiSelect && (
@@ -1119,17 +1197,17 @@ export function Sidebar({
               variant="muted"
               size="xs"
               shape="square"
-              className="rounded-xs"
+              className="oc-btn-tactile rounded-xs"
               onClick={() => setMultiSelect(true)}
             >
-              <ListChecks size={15} />
+              <ListChecks size={15} strokeWidth={1.75} />
             </IconButton>
           )}
         </label>
         {searching && scopeFilterForSearch !== undefined && (
           <div
             data-testid="sidebar-search-scope"
-            className="mt-1 flex min-w-0 items-center gap-1 rounded-sm bg-accent-soft py-0.5 pl-2.5 pr-1 text-caption text-accent"
+            className="mt-1.5 flex min-w-0 items-center gap-1 rounded-sm bg-accent-soft py-0.5 pl-2.5 pr-1 text-caption font-medium text-accent ring-1 ring-inset ring-accent/20"
           >
             <span className="min-w-0 flex-1 truncate">
               仅在「
@@ -1147,68 +1225,106 @@ export function Sidebar({
               shape="round"
               onClick={() => setIgnoreScopeForSearch(true)}
             >
-              <X size={12} />
+              <X size={12} strokeWidth={1.75} />
             </IconButton>
           </div>
         )}
 
-        {onOpenBoard && (
-          <button
-            type="button"
-            data-product-feature={PRODUCT_CAPABILITIES.taskboard.id}
-            data-testid="taskboard-nav"
-            onClick={onOpenBoard}
-            aria-current={boardActive ? "true" : undefined}
-            className={cn(
-              "mt-0.5 flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section outline-none transition-[background-color,color,box-shadow] duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
-              boardActive
-                ? "bg-sidebar-active font-medium text-fg shadow-sidebar-active"
-                : "text-muted hover:bg-hover hover:text-fg",
+        {(onOpenBoard || onOpenSites || onOpenManage || onOpenMarketplace) && (
+          <div className="mt-1.5 flex flex-col gap-0.5">
+            {onOpenBoard && (
+              <button
+                type="button"
+                data-product-feature={PRODUCT_CAPABILITIES.taskboard.id}
+                data-testid="taskboard-nav"
+                onClick={() => onOpenBoard()}
+                aria-current={boardActive ? "true" : undefined}
+                className={cn(NAV_ITEM_BASE, boardActive ? NAV_ITEM_ACTIVE : NAV_ITEM_IDLE)}
+              >
+                <AtelierIcon
+                  name="tasks"
+                  size={16}
+                  className={cn("shrink-0 transition-colors", boardActive ? "text-accent" : "text-faint group-hover:text-fg")}
+                />
+                任务
+              </button>
             )}
-          >
-            <SquareKanban
-              size={15}
-              aria-hidden
-              className={boardActive ? "text-fg" : "text-faint"}
-            />
-            任务
-          </button>
-        )}
-        {onOpenSites && (
-          <button
-            type="button"
-            data-product-control
-            data-testid="sites-nav"
-            onClick={onOpenSites}
-            aria-current={sitesActive ? "true" : undefined}
-            className={cn(
-              "mt-0.5 flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section outline-none transition-[background-color,color,box-shadow] duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
-              sitesActive
-                ? "bg-sidebar-active font-medium text-fg shadow-sidebar-active"
-                : "text-muted hover:bg-hover hover:text-fg",
+            {onOpenSites && (
+              <button
+                type="button"
+                data-product-control
+                data-testid="sites-nav"
+                onClick={onOpenSites}
+                aria-current={sitesActive ? "true" : undefined}
+                className={cn(NAV_ITEM_BASE, sitesActive ? NAV_ITEM_ACTIVE : NAV_ITEM_IDLE)}
+              >
+                <AtelierIcon
+                  name="sites"
+                  size={16}
+                  className={cn("shrink-0 transition-colors", sitesActive ? "text-accent" : "text-faint group-hover:text-fg")}
+                />
+                站点
+              </button>
             )}
-          >
-            <Globe
-              size={15}
-              aria-hidden
-              className={sitesActive ? "text-fg" : "text-faint"}
-            />
-            站点
-          </button>
-        )}
-        {onOpenBlog && (
-          <button
-            type="button"
-            data-product-control
-            data-testid="blog-nav"
-            onClick={onOpenBlog}
-            className="mt-0.5 flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section text-muted outline-none transition-[background-color,color,box-shadow] duration-150 hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
-          >
-            <PenLine size={15} aria-hidden className="text-faint" />
-            经验分享
-          </button>
+            {onOpenManage && (
+              <button
+                type="button"
+                data-product-feature={PRODUCT_CAPABILITIES.memory.id}
+                data-testid="manage-nav"
+                title="管理中心：记忆 · 技能 · 定时 · 插件"
+                onClick={onOpenManage}
+                className={cn(NAV_ITEM_BASE, NAV_ITEM_IDLE)}
+              >
+                <LayoutGrid
+                  size={16}
+                  strokeWidth={1.75}
+                  aria-hidden
+                  className="shrink-0 text-faint transition-colors group-hover:text-fg"
+                />
+                管理中心
+              </button>
+            )}
+            {onOpenMarketplace && (
+              <button
+                type="button"
+                data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}
+                data-testid="marketplace-nav"
+                onClick={onOpenMarketplace}
+                className={cn(NAV_ITEM_BASE, NAV_ITEM_IDLE)}
+              >
+                <Store
+                  size={16}
+                  strokeWidth={1.75}
+                  aria-hidden
+                  className="shrink-0 text-faint transition-colors group-hover:text-fg"
+                />
+                市场
+              </button>
+            )}
+          </div>
         )}
       </div>
+
+      {showLiveActivityStrip && !searching && !multiSelect && (hasLiveCandidate || Boolean(optionalAuth)) && (
+        <Suspense fallback={null}>
+          <SidebarLiveActivityStrip
+            sessions={activeSessions}
+            projects={orderedProjects}
+            isSending={isSending}
+            liveTerminal={liveTerminal}
+            sessionNeedsYou={sessionNeedsYou}
+            unreadIds={unreadIds}
+            swarmSessionIds={swarmSessionIds}
+            socketVersion={socketVersion}
+            activeId={activeId}
+            auth={optionalAuth}
+            onSelect={rowActions.select}
+            onMarkRead={onMarkRead ? rowActions.markRead : undefined}
+            onOpenBoard={onOpenBoard}
+            onOpenLiveBrowser={onOpenLiveBrowser}
+          />
+        </Suspense>
+      )}
 
       {multiSelect && onBatch && (
         <Suspense fallback={null}>
@@ -1246,162 +1362,80 @@ export function Sidebar({
             onClick={onLoadMore}
             className="rounded-md px-2 py-1 text-caption font-medium text-danger outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
           >
-            加载更早会话失败，点击继续
+            加载更早会话失败，点击重试
           </button>
         </div>
       ) : null}
 
-      {/* 底栏：账号区，右侧是案例展厅与主题切换。任务 / 经验分享在搜索下方以文字行呈现；
-          管理 / 市场仍在账号菜单里（T41 契约）。 */}
-      <div className="border-t border-border/70 px-2 pt-1 sidebar-foot-safe-b">
-        <div className="flex items-center" data-product-entry-scope="sidebar-account">
+      {/* 底栏：克制发丝边界，账号胶囊 + 全局站内信铃铛光学对齐。 */}
+      <div className="shrink-0 border-t border-border/60 px-2 pt-1.5 sidebar-foot-safe-b">
+        <div className="flex items-center gap-0.5" data-product-entry-scope="sidebar-account">
           {hasAccountMenu ? (
-            <DropdownMenu>
+            <DropdownMenu
+              onOpenChange={(open) => {
+                if (open) {
+                  void preloadAccountMenu().catch(() => {});
+                  setAccountMenuOpened(true);
+                }
+              }}
+            >
               <DropdownMenuTrigger asChild>{userChip}</DropdownMenuTrigger>
-              <DropdownMenuContent
-                side="top"
-                align="start"
-                sideOffset={8}
-                className="w-64 p-1.5"
-                data-product-entry-scope="account-menu"
-              >
-                <div className="flex items-center gap-2.5 px-2 py-2">
-                  <Avatar
-                    tone="neutral"
-                    className="bg-accent-soft text-body text-accent ring-1 ring-inset ring-accent/15"
-                  >
-                    {(user?.displayName || "U").slice(0, 1).toUpperCase()}
-                  </Avatar>
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-section font-medium text-fg">
-                      {user?.displayName || "未登录"}
-                    </p>
-                    {/* 登录邮箱始终在菜单头部（体验官：有余额时账号区看不到邮箱）。 */}
-                    {email && <p className="truncate text-caption text-faint">{email}</p>}
-                    {credits != null && (
-                      <p className="truncate text-caption text-faint">{`${formatCredits(credits)} 积分`}</p>
-                    )}
-                  </div>
-                </div>
-                <DropdownMenuSeparator />
-                {onOpenManage && (
-                  <DropdownMenuItem
-                    data-product-feature={PRODUCT_CAPABILITIES.memory.id}
-                    onSelect={onOpenManage}
-                  >
-                    <LayoutGrid size={16} className="shrink-0 text-muted" />
-                    <span className="flex-1">管理中心</span>
-                    <span className="text-caption text-faint">记忆 · 技能 · 定时 · 插件</span>
-                  </DropdownMenuItem>
-                )}
-                {onOpenMarketplace && (
-                  <DropdownMenuItem
-                    data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}
-                    onSelect={onOpenMarketplace}
-                  >
-                    <Store size={16} className="shrink-0 text-muted" />
-                    市场
-                  </DropdownMenuItem>
-                )}
-                {onOpenOrg && (
-                  <DropdownMenuItem
-                    data-product-feature={PRODUCT_CAPABILITIES.organization.id}
-                    onSelect={onOpenOrg}
-                  >
-                    <Building2 size={16} className="shrink-0 text-muted" />
-                    组织
-                  </DropdownMenuItem>
-                )}
-                {showAdmin && (
-                  <DropdownMenuItem asChild data-product-control>
-                    <a data-product-control href="/admin.html">
-                      <ShieldCheck size={16} className="shrink-0 text-muted" />
-                      管理后台
-                    </a>
-                  </DropdownMenuItem>
-                )}
-                {onOpenStudio && (
-                  <DropdownMenuItem data-product-control onSelect={onOpenStudio}>
-                    <Clapperboard size={16} className="shrink-0 text-muted" />
-                    媒体工作台
-                  </DropdownMenuItem>
-                )}
-                {onOpenMediaTasks && (
-                  <DropdownMenuItem data-product-control onSelect={onOpenMediaTasks}>
-                    <Film size={16} className="shrink-0 text-muted" />
-                    视频任务
-                  </DropdownMenuItem>
-                )}
-                {onOpenChatGptProxy && (
-                  <DropdownMenuItem data-product-control onSelect={onOpenChatGptProxy}>
-                    <Globe size={16} className="shrink-0 text-muted" />
-                    ChatGPT 直连
-                  </DropdownMenuItem>
-                )}
-                {onOpenApiAccess && (
-                  <DropdownMenuItem data-product-control onSelect={onOpenApiAccess}>
-                    <KeyRound size={16} className="shrink-0 text-muted" />
-                    <span className="flex-1">API 接入</span>
-                    <span className="text-caption text-faint">本地 Claude Code</span>
-                  </DropdownMenuItem>
-                )}
-                {(onOpenAccount || onOpenFeedback || onLogout) &&
-                  (onOpenManage ||
-                    onOpenMarketplace ||
-                    onOpenOrg ||
-                    showAdmin ||
-                    onOpenStudio ||
-                    onOpenMediaTasks ||
-                    onOpenChatGptProxy ||
-                    onOpenApiAccess) && <DropdownMenuSeparator />}
-                {onOpenAccount && (
-                  <DropdownMenuItem
-                    data-product-feature={PRODUCT_CAPABILITIES.billing.id}
-                    onSelect={onOpenAccount}
-                  >
-                    <Settings size={16} className="shrink-0 text-muted" />
-                    设置
-                  </DropdownMenuItem>
-                )}
-                {onOpenFeedback && (
-                  <DropdownMenuItem
-                    data-product-feature={PRODUCT_CAPABILITIES.feedback.id}
-                    onSelect={onOpenFeedback}
-                  >
-                    <MessageSquareText size={16} className="shrink-0 text-muted" />
-                    意见反馈
-                  </DropdownMenuItem>
-                )}
-                {onLogout && (
-                  <DropdownMenuItem data-product-control destructive onSelect={onLogout}>
-                    <LogOut size={16} className="shrink-0" />
-                    退出登录
-                  </DropdownMenuItem>
-                )}
-              </DropdownMenuContent>
+              {accountMenuOpened && (() => {
+                const AccountMenuComp = loadedAccountMenu?.AccountMenuContent ?? LazyAccountMenuContent;
+                return (
+                  <Suspense fallback={null}>
+                    <AccountMenuComp
+                      displayName={displayName}
+                      email={email}
+                      showSecondaryEmail={showSecondaryEmail}
+                      credits={credits}
+                      theme={theme}
+                      onSetTheme={onSetTheme}
+                      onCycleTheme={onCycleTheme}
+                      showAdmin={showAdmin}
+                      onOpenOrg={onOpenOrg}
+                      onOpenStudio={onOpenStudio}
+                      onOpenMediaTasks={onOpenMediaTasks}
+                      onOpenChatGptProxy={onOpenChatGptProxy}
+                      onOpenAccount={onOpenAccount}
+                      onOpenPreferences={onOpenPreferences}
+                      onOpenTutorial={onOpenTutorial}
+                      onOpenFeedback={onOpenFeedback}
+                      onLogout={onLogout}
+                    />
+                  </Suspense>
+                );
+              })()}
             </DropdownMenu>
           ) : (
             userChip
           )}
-          {onOpenTutorial && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              data-product-control
-              onClick={onOpenTutorial}
-              aria-label="打开案例展厅"
-              title="案例展厅"
-              className={cn(
-                "h-7 shrink-0 gap-1 rounded-xs text-faint hover:text-fg [@media(hover:none)]:size-11",
-                footerCompact ? "w-7 px-0" : "px-2",
+          {onOpenInbox && (
+            <div className="relative shrink-0">
+              <IconButton
+                type="button"
+                variant="muted"
+                size="sm"
+                shape="square"
+                data-product-feature={PRODUCT_CAPABILITIES.inbox.id}
+                data-testid="sidebar-inbox-btn"
+                onClick={onOpenInbox}
+                aria-label={hasUnreadInbox ? `站内信（${unreadCount} 条未读）` : "站内信"}
+                title={hasUnreadInbox ? `站内信（${unreadCount} 条未读）` : "站内信"}
+                className="oc-btn-tactile oc-spring-press rounded-sm hover:text-fg"
+              >
+                <Bell size={16} strokeWidth={1.75} />
+              </IconButton>
+              {hasUnreadInbox && (
+                <span
+                  data-testid="sidebar-inbox-badge"
+                  data-unread-count={unreadCount}
+                  aria-hidden="true"
+                  className="pointer-events-none absolute right-1 top-1 size-1.5 rounded-full bg-accent ring-2 ring-sidebar [@media(hover:none)]:right-2.5 [@media(hover:none)]:top-2.5"
+                />
               )}
-            >
-              <BookOpen size={16} />
-              {!footerCompact && <span className="text-caption font-medium">案例</span>}
-            </Button>
+            </div>
           )}
-          {theme && onCycleTheme && <ThemeToggle theme={theme} onCycle={onCycleTheme} compact />}
         </div>
       </div>
     </aside>

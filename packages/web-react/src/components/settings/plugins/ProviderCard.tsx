@@ -276,7 +276,7 @@ export function ConnectionRow({
             </IconButton>
           </div>
         ) : (
-          <div className="truncate text-[14px] font-medium leading-5 text-fg">
+          <div className="truncate text-section font-medium leading-5 text-fg">
             {conn.displayName || conn.accountHint || '未命名连接'}
           </div>
         )}

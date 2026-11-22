@@ -4,6 +4,7 @@ import {
   countSubstantiveHistoryMessages,
   HISTORY_SKELETON_CAP_MS,
   HISTORY_SKELETON_GRACE_MS,
+  HISTORY_SKELETON_SLOW_MS,
   type HistorySkeletonInput,
   useHistorySkeleton,
 } from "./useHistorySkeleton";
@@ -39,32 +40,38 @@ describe("useHistorySkeleton", () => {
   test("meta 未知（深链）→ GRACE 窗内骨架，过后 empty", () => {
     vi.useFakeTimers();
     const { result } = renderHook(() => useHistorySkeleton(base()));
-    expect(result.current).toEqual({ loadingHistory: true, historySurface: "skeleton" });
+    expect(result.current).toEqual({ loadingHistory: true, historySurface: "skeleton", slowHistory: false });
     act(() => {
       vi.advanceTimersByTime(HISTORY_SKELETON_GRACE_MS);
     });
-    expect(result.current).toEqual({ loadingHistory: false, historySurface: "empty" });
+    expect(result.current).toEqual({ loadingHistory: false, historySurface: "empty", slowHistory: false });
   });
 
-  test("确知有历史 → 骨架持续到 CAP 封顶", () => {
+  test("确知有历史 → 骨架持续到 CAP 封顶，5s 后标 slowHistory", () => {
     vi.useFakeTimers();
     const input = base({ serverListSettled: true, sessions: [{ id: "sess-a", messageCount: 5 }] });
     const { result } = renderHook(() => useHistorySkeleton(input));
     act(() => {
-      vi.advanceTimersByTime(HISTORY_SKELETON_CAP_MS - 1);
+      vi.advanceTimersByTime(HISTORY_SKELETON_SLOW_MS);
+    });
+    expect(result.current.slowHistory).toBe(true);
+    expect(result.current.historySurface).toBe("skeleton");
+    act(() => {
+      vi.advanceTimersByTime(HISTORY_SKELETON_CAP_MS - HISTORY_SKELETON_SLOW_MS - 1);
     });
     expect(result.current.historySurface).toBe("skeleton");
     act(() => {
       vi.advanceTimersByTime(1);
     });
     expect(result.current.loadingHistory).toBe(false);
+    expect(result.current.slowHistory).toBe(false);
   });
 
   test("权威已知为空会话 → 直接 empty", () => {
     const { result } = renderHook(() =>
       useHistorySkeleton(base({ serverListSettled: true, sessions: [{ id: "sess-a", messageCount: 0 }] })),
     );
-    expect(result.current).toEqual({ loadingHistory: false, historySurface: "empty" });
+    expect(result.current).toEqual({ loadingHistory: false, historySurface: "empty", slowHistory: false });
   });
 
   test("切换 activeId → 截止标记重置并重新计时", () => {
@@ -91,10 +98,10 @@ describe("useHistorySkeleton", () => {
     });
     expect(result.current.historySurface).toBe("skeleton");
     rerender(base({ historyLoading: false, wsMessageCount: 3 }));
-    expect(result.current).toEqual({ loadingHistory: false, historySurface: "messages" });
+    expect(result.current).toEqual({ loadingHistory: false, historySurface: "messages", slowHistory: false });
   });
 
-  test("历史读取失败且确知非空 → 骨架封顶后 error", () => {
+  test("历史读取失败且确知非空 → 立即 error（OCV5-786 不再被 8s 骨架遮蔽）", () => {
     vi.useFakeTimers();
     const { result } = renderHook(() =>
       useHistorySkeleton(
@@ -105,11 +112,22 @@ describe("useHistorySkeleton", () => {
         }),
       ),
     );
-    expect(result.current.historySurface).toBe("skeleton");
-    act(() => {
-      vi.advanceTimersByTime(HISTORY_SKELETON_CAP_MS);
-    });
-    expect(result.current.historySurface).toBe("error");
+    expect(result.current).toEqual({ loadingHistory: false, historySurface: "error", slowHistory: false });
+  });
+
+  test("canonical 已落定为空（historySettled=true）→ 不白等 8s 骨架", () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() =>
+      useHistorySkeleton(
+        base({
+          serverListSettled: true,
+          sessions: [{ id: "sess-a", messageCount: 3 }],
+          historyLoading: false,
+          historySettled: true,
+        }),
+      ),
+    );
+    expect(result.current).toEqual({ loadingHistory: false, historySurface: "empty", slowHistory: false });
   });
 
   test("demo → 不骨架、不计时，surface 取 demo 消息/忙碌态", () => {
@@ -117,14 +135,14 @@ describe("useHistorySkeleton", () => {
     const { result } = renderHook(() =>
       useHistorySkeleton(base({ demo: true, demoMessageCount: 2, historyError: new Error("ignored") })),
     );
-    expect(result.current).toEqual({ loadingHistory: false, historySurface: "messages" });
+    expect(result.current).toEqual({ loadingHistory: false, historySurface: "messages", slowHistory: false });
     expect(vi.getTimerCount()).toBe(0);
   });
 
   test("未选中会话 → 不计时", () => {
     vi.useFakeTimers();
     const { result } = renderHook(() => useHistorySkeleton(base({ activeId: undefined })));
-    expect(result.current).toEqual({ loadingHistory: false, historySurface: "empty" });
+    expect(result.current).toEqual({ loadingHistory: false, historySurface: "empty", slowHistory: false });
     expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -144,13 +162,13 @@ describe("useHistorySkeleton", () => {
         historyLoading: true,
       }),
     });
-    expect(result.current).toEqual({ loadingHistory: true, historySurface: "skeleton" });
+    expect(result.current).toEqual({ loadingHistory: true, historySurface: "skeleton", slowHistory: false });
 
-    // Even past CAP_MS while canonical GET is still in flight, keep skeleton rather than orphan card.
+    // Even past CAP_MS while canonical GET is still in flight, keep skeleton and flag slowHistory.
     act(() => {
       vi.advanceTimersByTime(HISTORY_SKELETON_CAP_MS);
     });
-    expect(result.current).toEqual({ loadingHistory: true, historySurface: "skeleton" });
+    expect(result.current).toEqual({ loadingHistory: true, historySurface: "skeleton", slowHistory: true });
 
     // When canonical GET settles with an error, expose retry error surface instead of hiding behind orphan card.
     rerender(
@@ -162,7 +180,7 @@ describe("useHistorySkeleton", () => {
         historyError: new Error("timeout"),
       }),
     );
-    expect(result.current).toEqual({ loadingHistory: false, historySurface: "error" });
+    expect(result.current).toEqual({ loadingHistory: false, historySurface: "error", slowHistory: false });
 
     // Once real transcript messages arrive, switch to messages immediately.
     const mergedCount = countSubstantiveHistoryMessages([
@@ -179,6 +197,6 @@ describe("useHistorySkeleton", () => {
         historyError: null,
       }),
     );
-    expect(result.current).toEqual({ loadingHistory: false, historySurface: "messages" });
+    expect(result.current).toEqual({ loadingHistory: false, historySurface: "messages", slowHistory: false });
   });
 });

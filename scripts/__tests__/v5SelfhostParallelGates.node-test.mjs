@@ -9,8 +9,7 @@ import { fileURLToPath } from 'node:url';
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const lib = readFileSync(join(root, 'scripts/v5-selfhost-master-release-lib.sh'), 'utf8');
 const serialGateIds = ['box-success-recovery', 'box-continuation', 'box-incident-proofs', 'box-longtask',
-  'master-incident-proofs', 'codex-chatgpt-ws', 'platform-tool-proofs', 'terminal-unproven',
-  'upload-retention', 'ccb-mcp', 'codex-late-stop'].map((id) => `C.${id}`);
+  'master-incident-proofs', 'ccb-mcp', 'codex-late-stop'].map((id) => `C.${id}`);
 const isSerialGate = (id) => serialGateIds.includes(id);
 const assertSerialTail = (lines) => {
   let previousEnd = lines.indexOf('runtime-awaited');
@@ -20,8 +19,8 @@ const assertSerialTail = (lines) => {
     assert.ok(previousEnd >= 0 && previousEnd < start && start < end, id);
     previousEnd = end;
   }
-  assert.ok(lines.indexOf('end C.terminal-unproven') < lines.indexOf('db-drop'));
-  assert.ok(lines.indexOf('db-drop') < lines.findIndex((line) => line.startsWith('start C.upload-retention ')));
+  assert.ok(lines.indexOf('end C.master-incident-proofs') < lines.indexOf('db-drop'));
+  assert.ok(lines.indexOf('db-drop') < lines.findIndex((line) => line.startsWith('start C.ccb-mcp ')));
   assert.ok(previousEnd < lines.indexOf('tmp-cleanup'));
   assert.ok(lines.indexOf('tmp-cleanup') < lines.indexOf('seal built'));
 };
@@ -525,10 +524,10 @@ test('production wiring: all 24 C gates + D run pinned; C/D overlap; Box waits f
   const starts = lines.filter((l) => l.startsWith('start '));
   const ids = starts.map((l) => l.split(' ')[1]);
   const expected = ['session-rootfix', 'watch-gate', 'cursor-sand', 'delegate-billing', 'callback-ws',
-    'cron-submit', 'prompt-privacy', 'session-boundary', 'system-approval', 'system-executor', 'host-log-policy', 'model-policy', 'architecture',
+    'cron-submit', 'prompt-privacy', 'session-boundary', 'system-approval', 'system-executor', 'host-log-policy', 'model-policy',
+    'codex-chatgpt-ws', 'platform-tool-proofs', 'terminal-unproven', 'upload-retention', 'architecture',
     'box-success-recovery', 'box-continuation', 'box-incident-proofs', 'box-longtask',
-    'master-incident-proofs', 'codex-chatgpt-ws', 'platform-tool-proofs', 'terminal-unproven',
-    'upload-retention', 'ccb-mcp', 'codex-late-stop'].map((id) => `C.${id}`);
+    'master-incident-proofs', 'ccb-mcp', 'codex-late-stop'].map((id) => `C.${id}`);
   assert.deepEqual([...ids].sort(), [...expected, 'D'].sort());
   const queued = [...r.stderr.matchAll(/\[([^\]]+)\] 后台启动/g)].map((match) => match[1]);
   assert.deepEqual(queued, ['D', ...expected.filter((id) => !isSerialGate(id))]);
@@ -554,11 +553,8 @@ test('production wiring: all 24 C gates + D run pinned; C/D overlap; Box waits f
   }
   assert.equal(active, 0);
   assert.ok(lines.indexOf('end C.box-longtask') < lines.indexOf('db-drop'));
-  const uploadStart = lines.findIndex((l) => l.startsWith('start C.upload-retention '));
-  const uploadEnd = lines.indexOf('end C.upload-retention');
-  assert.ok(lines.indexOf('db-drop') < uploadStart);
-  assert.ok(uploadStart < uploadEnd);
-  assert.ok(uploadEnd < lines.findIndex((l) => l.startsWith('start C.ccb-mcp ')));
+  assert.ok(lines.indexOf('end C.master-incident-proofs') < lines.indexOf('db-drop'));
+  assert.ok(lines.indexOf('db-drop') < lines.findIndex((l) => l.startsWith('start C.ccb-mcp ')));
   const lateStart = lines.findIndex((l) => l.startsWith('start C.codex-late-stop '));
   assert.ok(lines.indexOf('end C.ccb-mcp') < lateStart);
   assert.ok(lateStart < lines.indexOf('end C.codex-late-stop'));
@@ -605,7 +601,8 @@ for (const receipt of ['hit', 'wrong-sha']) {
       // Worker-local notes would be lost; final summary proves parent ownership.
       assert.equal(notes(f)[`gateEvidence.${gate}`], receipt === 'hit' ? 'merge-queue-receipt' : 'local');
     }
-    const local = ['D', 'C.cursor-sand', 'C.session-boundary', 'C.host-log-policy', 'C.model-policy', 'C.architecture'];
+    const local = ['D', 'C.cursor-sand', 'C.session-boundary', 'C.host-log-policy', 'C.model-policy',
+      'C.codex-chatgpt-ws', 'C.platform-tool-proofs', 'C.terminal-unproven', 'C.upload-retention', 'C.architecture'];
     for (const phase of local) assert.ok(ids.includes(phase), phase);
     assert.deepEqual([...ids].sort(), [...local, ...serialGateIds, ...(receipt === 'hit' ? [] : Object.keys(receiptPhases))].sort());
     assert.equal(ids.length, receipt === 'hit' ? 17 : 25);
@@ -633,17 +630,26 @@ for (const badDonor of [false, true]) {
   });
 }
 
-for (const receipt of ['hit', 'miss']) {
-  test(`production wiring: upload retention proof failure blocks CCB and seal with receipt ${receipt}`, (t) => {
-    const f = fixture(t);
-    const r = run(f, wireFixture(f, 'C.upload-retention', receipt));
-    assert.equal(r.status, 73, r.stderr);
-    const lines = events(f);
-    assert.ok(lines.some((l) => l.startsWith('start C.upload-retention ')));
-    assert.ok(!lines.some((l) => l.startsWith('start C.ccb-mcp ') || l.startsWith('seal ')), lines.join('\n'));
-    assert.match(r.stderr, /pinned upload retention HTTP responsiveness proof failed/);
-    assert.equal(lines.at(-1), 'cleanup');
-  });
+for (const [gate, diagnostic] of [
+  ['C.codex-chatgpt-ws', 'pinned imported codex-chatgpt-ws proof failed'],
+  ['C.platform-tool-proofs', 'pinned imported ocv5-376-platform-tool-proofs proof failed'],
+  ['C.terminal-unproven', 'pinned imported box-terminal-unproven-probe proof failed'],
+  ['C.upload-retention', 'pinned upload retention HTTP responsiveness proof failed']]) {
+  for (const receipt of ['hit', 'miss']) {
+    test(`production wiring: parallel non-DB proof ${gate} failure blocks Box, CCB and seal with receipt ${receipt}`, (t) => {
+      const f = fixture(t);
+      const r = run(f, wireFixture(f, gate, receipt));
+      assert.equal(r.status, 73, r.stderr);
+      const lines = events(f);
+      assert.equal(lines.filter((line) => line.startsWith(`start ${gate} `)).length, 1);
+      assert.match(readFileSync(notes(f)[`job.${gate}.log`], 'utf8'), /\[gate-failure\] fixture failed/);
+      assert.ok(readFileSync(notes(f)[`job.${gate}.log`], 'utf8').includes(diagnostic));
+      assert.equal(notes(f)[`job.${gate}.rc`], '1');
+      assert.ok(!lines.some((l) => l.startsWith('start C.box-') || l.startsWith('start C.ccb-mcp ') || l.startsWith('seal ')), lines.join('\n'));
+      assert.ok(!lines.includes('db-create'));
+      assert.equal(lines.at(-1), 'cleanup');
+    });
+  }
 }
 
 for (const receipt of ['hit', 'miss']) {
@@ -661,10 +667,7 @@ for (const receipt of ['hit', 'miss']) {
 }
 
 for (const [gate, diagnostic] of [
-  ['C.master-incident-proofs', 'pinned imported master incident proofs failed'],
-  ['C.codex-chatgpt-ws', 'pinned imported codex-chatgpt-ws proof failed'],
-  ['C.platform-tool-proofs', 'pinned imported ocv5-376-platform-tool-proofs proof failed'],
-  ['C.terminal-unproven', 'pinned imported box-terminal-unproven-probe proof failed']]) {
+  ['C.master-incident-proofs', 'pinned imported master incident proofs failed']]) {
   for (const receipt of ['hit', 'miss']) {
     test(`production wiring: ${gate} failure blocks all successors and seal with receipt ${receipt}`, (t) => {
       const f = fixture(t);

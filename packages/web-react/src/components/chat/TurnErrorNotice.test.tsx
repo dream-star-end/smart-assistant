@@ -15,7 +15,7 @@ afterEach(() => {
   _resetBoxCapacityHoldAutoContinueForTest();
 });
 
-test("OCV5-734: box_capacity_held disables Continue while waiting for slot release and auto-continues once", () => {
+test("OCV5-734 / P0-7: box_capacity_held waits silently without alert card or Box copy, auto-continues once, then falls back gently", () => {
   vi.useFakeTimers();
   const onContinueInterrupted = vi.fn();
   const msg = {
@@ -45,11 +45,12 @@ test("OCV5-734: box_capacity_held disables Continue while waiting for slot relea
     />,
   );
 
-  const waitBtn = screen.getByRole("button", {
-    name: new RegExp(`正在等待上一轮释放（${BOX_CAPACITY_HELD_WAIT_SECONDS}s）`),
-  });
-  expect(waitBtn).toBeDisabled();
-  fireEvent.click(waitBtn);
+  // Brief auto-wait period shows quiet inline status, never an interruption alert card or "Box" copy.
+  const waiting = screen.getByTestId("box-capacity-waiting-status");
+  expect(waiting).toHaveTextContent("上一步仍在收尾，马上自动继续…");
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(screen.queryByRole("button")).toBeNull();
+  expect(document.body.textContent ?? "").not.toMatch(/\bBox\b|本轮暂时中断/);
   expect(onContinueInterrupted).not.toHaveBeenCalled();
 
   for (let i = 0; i < BOX_CAPACITY_HELD_WAIT_SECONDS; i++) {
@@ -60,9 +61,10 @@ test("OCV5-734: box_capacity_held disables Continue while waiting for slot relea
 
   expect(onContinueInterrupted).toHaveBeenCalledTimes(1);
   expect(onContinueInterrupted).toHaveBeenCalledWith(msg);
-  expect(screen.getByTestId("box-capacity-released-notice")).toHaveTextContent(
-    "等待时间已结束，已为你自动尝试继续一次。",
-  );
+  expect(screen.queryByTestId("box-capacity-waiting-status")).toBeNull();
+  // If still rendered after auto-continue, shows calm fallback without "Box" or redundant comfort note.
+  expect(document.body.textContent ?? "").not.toMatch(/\bBox\b|等待时间已结束/);
+  expect(screen.getByRole("button", { name: "继续" })).not.toBeDisabled();
 
   // Re-rendering or advancing timers further must never auto-continue a second time.
   rerender(
@@ -95,4 +97,35 @@ test("non-box_capacity_held errors keep Continue immediately clickable without c
   expect(btn).not.toBeDisabled();
   fireEvent.click(btn);
   expect(onContinue).toHaveBeenCalledTimes(1);
+});
+
+test("P0-7: TurnErrorNotice strips internal Box name even when provided via fixedBody", () => {
+  render(
+    <TurnErrorNotice
+      role="status"
+      tone="attention"
+      code="box_capacity_held"
+      fixedBody="当前会话在 Box 上的前一步执行仍在收尾，本轮暂时中断；已有进度已保留，请稍后继续。"
+      actions={() => []}
+    />,
+  );
+  expect(document.body.textContent ?? "").not.toMatch(/\bBox\b/);
+  expect(screen.getByText("前一步执行仍在收尾，已有进度已保留，请稍后继续。")).toBeInTheDocument();
+});
+
+test("OCV5-838: 限流/模型不可用错误提供次级 CTA「切换备用模型继续」并触发模型选择器", () => {
+  const onContinue = vi.fn();
+  const onOpenModelPicker = vi.fn();
+  render(
+    <TurnErrorNotice
+      role="alert"
+      tone="attention"
+      code="rate_limited"
+      actions={() => [{ label: "继续", onClick: onContinue }]}
+      onOpenModelPicker={onOpenModelPicker}
+    />,
+  );
+  const switchBtn = screen.getByRole("button", { name: "切换备用模型继续" });
+  fireEvent.click(switchBtn);
+  expect(onOpenModelPicker).toHaveBeenCalledTimes(1);
 });

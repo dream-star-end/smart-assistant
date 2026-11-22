@@ -16,7 +16,7 @@ import type { ToolLike } from "./format";
 
 /** 链接态地址栏:触屏 44px 命中(a11y-B tools#1),视觉不变。 */
 const LINK_CLS =
-  "outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11";
+  "outline-none transition-[background-color,border-color] duration-150 hover:border-border-strong hover:bg-hover/80 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11";
 
 /** 地址:https 显示锁;公网地址新标签打开;容器回环地址交给全局「容器预览」监听;其余只显示。 */
 export function AddressBar({ url, className }: { url: string; className?: string }) {
@@ -25,15 +25,15 @@ export function AddressBar({ url, className }: { url: string; className?: string
   const Icon = secure ? Lock : Globe;
   const body = (
     <>
-      <Icon size={12} aria-hidden className="shrink-0 text-faint" />
+      <Icon size={12} strokeWidth={1.75} aria-hidden className={cn("shrink-0", secure ? "text-success" : "text-faint")} />
       <span className="min-w-0 truncate">
-        <span className="text-fg">{host}</span>
+        <span className="font-medium text-fg">{host}</span>
         {path && <span className="text-faint">{path}</span>}
       </span>
     </>
   );
   const base = cn(
-    "flex min-w-0 items-center gap-1.5 rounded-full bg-hover/80 px-3 py-1.5 font-mono text-[12px] leading-none",
+    "oc-surface-recessed flex min-w-0 items-center gap-1.5 rounded-full px-3 py-1.5 font-mono text-meta leading-none",
     className,
   );
   if (isContainerPreviewUrl(url)) {
@@ -72,11 +72,11 @@ export function ActionTrail({ step, className }: { step: BrowserStep; className?
       {step.actions.map((a, i) => (
         // biome-ignore lint/suspicious/noArrayIndexKey: 同一动作可在一条命令里出现多次,顺序即身份
         <Fragment key={i}>
-          {i > 0 && <ChevronRight size={12} aria-hidden className="shrink-0 text-faint/70" />}
+          {i > 0 && <ChevronRight size={12} strokeWidth={1.75} aria-hidden className="shrink-0 text-faint/70" />}
           <li className="flex min-w-0 items-center gap-1">
-            <span className="shrink-0 text-muted">{a.label}</span>
+            <span className="shrink-0 font-medium text-muted">{a.label}</span>
             {a.detail && !/^https?:\/\//i.test(a.detail) && (
-              <span className="min-w-0 max-w-[16rem] truncate rounded bg-hover px-1 font-mono text-[11.5px] text-fg" title={a.detail}>
+              <span className="min-w-0 max-w-[16rem] truncate rounded-xs border border-border/60 bg-hover/90 px-1.5 py-0.5 font-mono text-caption text-fg" title={a.detail}>
                 {a.detail}
               </span>
             )}
@@ -92,14 +92,14 @@ function OutputFold({ text, label }: { text: string; label: string }) {
   if (!clean) return null;
   return (
     <details className="group/fold">
-      <summary className="inline-flex cursor-pointer list-none items-center gap-1 rounded text-caption text-faint outline-none hover:text-muted focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
-        <ChevronRight size={12} aria-hidden className="transition-transform group-open/fold:rotate-90" />
+      <summary className="inline-flex cursor-pointer list-none items-center gap-1 rounded-xs text-caption font-medium text-faint outline-none transition-colors hover:text-muted focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
+        <ChevronRight size={12} strokeWidth={1.75} aria-hidden className="transition-transform duration-150 group-open/fold:rotate-90" />
         {label}
       </summary>
       <pre
         // biome-ignore lint/a11y/noNoninteractiveTabindex: 有 max-h 的滚动区要能聚焦,键盘才能滚
         tabIndex={0}
-        className="mt-1.5 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className="oc-surface-recessed mt-1.5 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2.5 font-mono text-caption leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         {clean.length > 12000 ? `${clean.slice(0, 12000)}\n…` : clean}
       </pre>
@@ -122,8 +122,8 @@ export function ShotThumb({ src, n, active, onPick }: { src: string; n: number; 
       aria-pressed={active}
       onClick={onPick}
       className={cn(
-        "h-12 w-20 shrink-0 overflow-hidden rounded-md border bg-hover outline-none focus-visible:ring-2 focus-visible:ring-ring",
-        active ? "border-accent ring-1 ring-accent" : "border-border/70 opacity-75 hover:opacity-100",
+        "h-12 w-20 shrink-0 overflow-hidden rounded-md border bg-surface shadow-soft outline-none transition-[opacity,border-color,transform] duration-150 focus-visible:ring-2 focus-visible:ring-ring",
+        active ? "border-accent ring-1 ring-accent" : "border-border/75 opacity-75 hover:opacity-100",
       )}
       data-testid="browser-shot-thumb"
     >
@@ -140,37 +140,37 @@ export function BrowserStepCard({ step, tool }: { step: BrowserStep; tool: ToolL
   const openPane = inspect.open ? () => inspect.open?.({ kind: "tool", message: tool }) : null;
   return (
     <section
-      className="group/card overflow-hidden rounded-xl border border-border/80 bg-surface shadow-soft"
+      className="oc-surface-card group/card overflow-hidden rounded-xl"
       data-testid="browser-card"
     >
       <div className="space-y-2 px-3 pt-3 pb-2.5">
         {step.url && <AddressBar url={step.url} />}
         {step.title && (
-          <p className="truncate px-1 text-body font-medium text-fg" title={step.title} data-testid="browser-title">
+          <p className="truncate px-1 text-body font-medium tracking-[-0.005em] text-fg" title={step.title} data-testid="browser-title">
             {step.title}
           </p>
         )}
         <ActionTrail step={step} className="px-1" />
         {step.error && (
-          <p className="break-words px-1 text-meta text-danger" data-testid="browser-error">
+          <p className="oc-callout oc-callout-danger break-words rounded-md px-2.5 py-1.5 text-meta text-danger" data-testid="browser-error">
             {step.error.slice(0, 240)}
           </p>
         )}
-        {step.running && <p className="animate-pulse px-1 text-meta text-faint">正在操作浏览器…</p>}
+        {step.running && <p className="oc-live-status-shine px-1 text-meta text-faint">正在操作浏览器…</p>}
       </div>
       {shot && (
-        <div className="border-t border-border/70 bg-hover/40 p-2.5">
-          <div className="relative flex justify-center overflow-hidden rounded-lg border border-border/70 bg-hover/60" data-testid="browser-shot">
+        <div className="oc-surface-recessed rounded-none border-0 border-t border-border/75 p-2.5">
+          <div className="relative flex justify-center overflow-hidden rounded-lg border border-border/80 bg-surface shadow-soft" data-testid="browser-shot">
             {/* 点图放大(全局看图器);右上角进侧栏看这一轮的浏览器记录。 */}
             <SignedImg src={shot} alt="页面截图" className="block max-h-80 w-auto max-w-full object-contain" />
             {openPane && (
               <button
                 type="button"
                 onClick={openPane}
-                className="absolute top-2 right-2 flex items-center gap-1 rounded-full bg-black/55 px-2 py-1 text-caption text-white outline-none transition-opacity hover:bg-black/70 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/card:opacity-100 [@media(hover:hover)]:focus-visible:opacity-100"
+                className="oc-surface-glass oc-btn-tactile absolute top-2 right-2 flex items-center gap-1 rounded-full px-2.5 py-1 text-caption font-medium text-fg outline-none transition-opacity focus-visible:ring-2 focus-visible:ring-ring [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/card:opacity-100 [@media(hover:hover)]:focus-visible:opacity-100"
                 data-testid="browser-open-pane"
               >
-                <PanelRight size={11} aria-hidden />
+                <PanelRight size={11} strokeWidth={1.75} aria-hidden />
                 在侧栏查看
               </button>
             )}
@@ -186,7 +186,7 @@ export function BrowserStepCard({ step, tool }: { step: BrowserStep; tool: ToolL
         </div>
       )}
       {(step.error || step.snapshot) && (
-        <div className="border-t border-border/70 px-4 py-2">
+        <div className="border-t border-border/75 px-3.5 py-2">
           <OutputFold text={step.output} label={step.error ? "错误详情" : "查看页面快照"} />
         </div>
       )}

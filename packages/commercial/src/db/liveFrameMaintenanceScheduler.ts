@@ -19,7 +19,11 @@
 
 import type { Pool } from "pg";
 import {
+  DEFAULT_RETIRED_PRUNE_OLDER_THAN_DAYS,
+  MAX_RETIRED_PRUNE_OLDER_THAN_DAYS,
+  MIN_RETIRED_PRUNE_OLDER_THAN_DAYS,
   pruneProjectedLiveFrames,
+  pruneRetiredLiveFrames,
   retireDeadLiveStreams,
 } from "./liveTurnFrames.js";
 
@@ -38,16 +42,23 @@ export const DEFAULT_PRUNE_BATCH_SIZE = 5000;
 /** 与 retireDeadLiveStreams 默认一致(2h);env 只允许更保守。 */
 export const DEFAULT_RETIRE_MIN_AGE_MS = 2 * 60 * 60 * 1000;
 export const MAX_RETIRE_MIN_AGE_MS = 365 * 24 * 60 * 60 * 1000;
+/** 与 pruneRetiredLiveFrames 默认一致(7d);清理已退役超过保留期的死流与帧。 */
+export const DEFAULT_RETIRED_RETENTION_DAYS = DEFAULT_RETIRED_PRUNE_OLDER_THAN_DAYS;
+export const MIN_RETIRED_RETENTION_DAYS = MIN_RETIRED_PRUNE_OLDER_THAN_DAYS;
+export const MAX_RETIRED_RETENTION_DAYS = MAX_RETIRED_PRUNE_OLDER_THAN_DAYS;
 
 export interface LiveFrameMaintenanceCounts {
   deletedFrames: number;
   prunedStreams: number;
   retired: number;
+  deletedRetiredFrames: number;
+  prunedRetiredStreams: number;
+  deletedRetiredStreams: number;
 }
 
 export interface LiveFrameMaintenanceHandle {
   stop(): void;
-  /** 测试/运维:立即跑一轮(prune + retire)。与 interval tick 共用 running 守卫。 */
+  /** 测试/运维:立即跑一轮(prune + retire + pruneRetired)。与 interval tick 共用 running 守卫。 */
   runNow(): Promise<LiveFrameMaintenanceCounts>;
 }
 
@@ -57,6 +68,7 @@ export interface LiveFrameMaintenanceOptions {
   pruneBatchSize?: number;
   pruneMaxBatches?: number;
   retireMinAgeMs?: number;
+  retiredRetentionDays?: number;
   disabled?: boolean;
   runOnStart?: boolean;
   onError?: (err: unknown) => void;
@@ -68,12 +80,25 @@ export interface LiveFrameMaintenanceOptions {
     pool: Pool,
     options?: { minAgeMs?: number },
   ) => Promise<{ retired: number }>;
+  pruneRetiredFn?: (
+    pool: Pool,
+    options?: { olderThanDays?: number; batchSize?: number; maxBatches?: number },
+  ) => Promise<{
+    deletedFrames: number;
+    prunedStreams: number;
+    deletedStreams: number;
+    retainedStreams?: number;
+    skippedInvalidRetiredAt?: number;
+  }>;
 }
 
 const EMPTY_COUNTS: LiveFrameMaintenanceCounts = {
   deletedFrames: 0,
   prunedStreams: 0,
   retired: 0,
+  deletedRetiredFrames: 0,
+  prunedRetiredStreams: 0,
+  deletedRetiredStreams: 0,
 };
 
 export function resolveLiveFrameMaintenanceDisabled(
@@ -104,6 +129,16 @@ export function resolveRetireMinAgeMs(envValue: string | number | undefined): nu
   return Math.min(raw, MAX_RETIRE_MIN_AGE_MS);
 }
 
+export function resolveRetiredRetentionDays(
+  envValue: string | number | undefined = process.env.COMMERCIAL_LIVE_FRAME_RETIRED_RETENTION_DAYS,
+): number {
+  const raw = Number(envValue);
+  if (!Number.isSafeInteger(raw) || raw < MIN_RETIRED_RETENTION_DAYS) {
+    return DEFAULT_RETIRED_RETENTION_DAYS;
+  }
+  return Math.min(raw, MAX_RETIRED_RETENTION_DAYS);
+}
+
 function defaultOnError(err: unknown): void {
   // eslint-disable-next-line no-console
   console.warn("[liveFrameMaintenance] tick failed:", err);
@@ -116,7 +151,7 @@ export function startLiveFrameMaintenanceScheduler(
   if (disabled) {
     return {
       stop() {},
-      runNow: async () => EMPTY_COUNTS,
+      runNow: async () => ({ ...EMPTY_COUNTS }),
     };
   }
 
@@ -127,8 +162,10 @@ export function startLiveFrameMaintenanceScheduler(
     Math.min(MAX_PRUNE_MAX_BATCHES, opts.pruneMaxBatches ?? DEFAULT_PRUNE_MAX_BATCHES),
   );
   const retireMinAgeMs = resolveRetireMinAgeMs(opts.retireMinAgeMs);
+  const retiredRetentionDays = resolveRetiredRetentionDays(opts.retiredRetentionDays);
   const pruneFn = opts.pruneFn ?? pruneProjectedLiveFrames;
   const retireFn = opts.retireFn ?? retireDeadLiveStreams;
+  const pruneRetiredFn = opts.pruneRetiredFn ?? pruneRetiredLiveFrames;
   const onError = opts.onError ?? defaultOnError;
   const runOnStart = opts.runOnStart ?? true;
   const pool = opts.pool;
@@ -143,6 +180,9 @@ export function startLiveFrameMaintenanceScheduler(
       let deletedFrames = 0;
       let prunedStreams = 0;
       let retired = 0;
+      let deletedRetiredFrames = 0;
+      let prunedRetiredStreams = 0;
+      let deletedRetiredStreams = 0;
       try {
         const pruned = await pruneFn(pool, {
           batchSize: pruneBatchSize,
@@ -159,7 +199,26 @@ export function startLiveFrameMaintenanceScheduler(
       } catch (err) {
         onError(err);
       }
-      return { deletedFrames, prunedStreams, retired };
+      try {
+        const retiredPruned = await pruneRetiredFn(pool, {
+          olderThanDays: retiredRetentionDays,
+          batchSize: pruneBatchSize,
+          maxBatches: pruneMaxBatches,
+        });
+        deletedRetiredFrames = retiredPruned.deletedFrames;
+        prunedRetiredStreams = retiredPruned.prunedStreams;
+        deletedRetiredStreams = retiredPruned.deletedStreams;
+      } catch (err) {
+        onError(err);
+      }
+      return {
+        deletedFrames,
+        prunedStreams,
+        retired,
+        deletedRetiredFrames,
+        prunedRetiredStreams,
+        deletedRetiredStreams,
+      };
     } finally {
       running = false;
     }

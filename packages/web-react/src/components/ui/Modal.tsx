@@ -1,7 +1,7 @@
 import * as RD from "@radix-ui/react-dialog";
 import { cva, type VariantProps } from "class-variance-authority";
 import { X } from "lucide-react";
-import { type ReactNode, useRef } from "react";
+import { type ReactNode, useLayoutEffect, useRef } from "react";
 import { cn } from "../../lib/utils";
 import { revealFocusedElement, useScrollBodyTabbable } from "./a11y";
 import { IconButton } from "./IconButton";
@@ -38,7 +38,7 @@ export type ModalMobileLayout = "center" | "fullscreen" | "sheet";
  * 不依赖不同工具类在基础段内的相对顺序。
  */
 export const modalContentVariants = cva(
-  "fixed z-50 flex flex-col overflow-hidden bg-elevated shadow-float outline-none data-[state=open]:animate-in",
+  "oc-surface-popover fixed z-50 flex flex-col overflow-hidden bg-elevated shadow-float outline-none data-[state=open]:oc-dialog-in data-[state=closed]:oc-dialog-out",
   {
     // 轴顺序即类名输出顺序:size / fixedHeight 先出、mobile 后出 —— fullscreen / sheet
     // 才能用 max-w-none / h-auto 通过 twMerge 折掉前两轴的桌面值,再由 compoundVariants
@@ -58,7 +58,7 @@ export const modalContentVariants = cva(
         center:
           "oc-center-dialog left-1/2 top-1/2 max-h-[88dvh] w-[calc(100vw-2rem)] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-border",
         fullscreen:
-          "bottom-0 left-0 right-0 top-0 h-auto max-h-none w-full max-w-none translate-x-0 translate-y-0 rounded-none border-0 border-border md:bottom-auto md:left-1/2 md:right-auto md:top-1/2 md:max-h-[88dvh] md:w-[calc(100vw-2rem)] md:-translate-x-1/2 md:-translate-y-1/2 md:rounded-xl md:border",
+          "bottom-auto left-0 right-0 top-[var(--oc-visual-offset-top,0px)] h-[var(--oc-visual-height,100dvh)] max-h-[var(--oc-visual-height,100dvh)] w-full max-w-none translate-x-0 translate-y-0 rounded-none border-0 border-border pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)] md:bottom-auto md:left-1/2 md:right-auto md:top-1/2 md:h-auto md:max-h-[88dvh] md:w-[calc(100vw-2rem)] md:-translate-x-1/2 md:-translate-y-1/2 md:rounded-xl md:border md:p-0",
         /**
          * 定位完全交给调用方:本轴一个类都不输出(连 oc-center-dialog 也不挂)。
          *
@@ -111,6 +111,8 @@ export interface ModalProps extends VariantProps<typeof modalContentVariants> {
   headerActions?: ReactNode;
   /** Optional layered-Escape handler. Omit to keep Radix's default close behavior. */
   onEscapeKeyDown?: RD.DialogContentProps["onEscapeKeyDown"];
+  /** Optional outside-pointerdown handler; only invoked when this Modal is topmost. */
+  onPointerDownOutside?: RD.DialogContentProps["onPointerDownOutside"];
   /** Let immersive dialogs place initial focus on their primary interaction surface. */
   onOpenAutoFocus?: RD.DialogContentProps["onOpenAutoFocus"];
   /** Controlled dialogs opened by an external action can explicitly restore that action's focus. */
@@ -118,6 +120,15 @@ export interface ModalProps extends VariantProps<typeof modalContentVariants> {
   /** 教程/产品能力锚点，透传到 role=dialog 节点。 */
   "data-product-feature"?: string;
 }
+
+// 活跃 Modal 栈（按打开顺序，栈顶在末尾）。
+// Radix Dialog 1.1.18 启用了 deferPointerDownOutside: true：当两层 Modal 叠开时，
+// 点顶层关闭按钮会在 pointerdown 阶段为底层注册延后到 click 的 outside 监听；
+// click 阶段顶层先同步卸载并退出 Radix 层栈，紧接着延后的 outside 监听触发底层 onDismiss，
+// 导致关闭顶层 Modal 时把底层 Modal 一并关闭（OCV5-845）。
+// 在 document 捕获阶段快照每次 pointerdown 时本 Modal 是否位于栈顶，按下时非栈顶（或当前非栈顶）
+// 一律拦截该次 outside dismiss。
+const openModalStack: symbol[] = [];
 
 /**
  * 居中模态。基于 Radix Dialog,免费获得焦点陷阱 / Escape / aria-modal。
@@ -141,6 +152,7 @@ export function Modal({
   hideClose,
   headerActions,
   onEscapeKeyDown,
+  onPointerDownOutside,
   onOpenAutoFocus,
   onCloseAutoFocus,
   "data-product-feature": dataProductFeature,
@@ -150,22 +162,64 @@ export function Modal({
   // 正文滚动区:只在「溢出且没有可聚焦子孙」时进入 Tab 序(a11y shell#7),让纯文本长内容也能键盘滚动。
   const bodyRef = useRef<HTMLDivElement>(null);
   const bodyTabbable = useScrollBodyTabbable(bodyRef, open);
+  const modalIdRef = useRef<symbol | null>(null);
+  if (modalIdRef.current === null) {
+    modalIdRef.current = Symbol("modal");
+  }
+  const modalId = modalIdRef.current;
+  const wasTopAtPointerDownRef = useRef(true);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    wasTopAtPointerDownRef.current = true;
+    const prevIdx = openModalStack.indexOf(modalId);
+    if (prevIdx !== -1) openModalStack.splice(prevIdx, 1);
+    openModalStack.push(modalId);
+
+    const onDocPointerDown = () => {
+      wasTopAtPointerDownRef.current = openModalStack[openModalStack.length - 1] === modalId;
+    };
+    document.addEventListener("pointerdown", onDocPointerDown, true);
+
+    return () => {
+      document.removeEventListener("pointerdown", onDocPointerDown, true);
+      const idx = openModalStack.indexOf(modalId);
+      if (idx !== -1) openModalStack.splice(idx, 1);
+    };
+  }, [open, modalId]);
+
   return (
     <RD.Root open={open} onOpenChange={onOpenChange}>
       <RD.Portal>
-        <RD.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade" />
+        <RD.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:oc-backdrop-in data-[state=closed]:oc-backdrop-out" />
         <RD.Content
           {...(hasDescription ? {} : { "aria-describedby": undefined })}
           {...(dataProductFeature
             ? { "data-product-feature": dataProductFeature }
             : {})}
           onEscapeKeyDown={onEscapeKeyDown}
+          onPointerDownOutside={(event) => {
+            if (
+              !wasTopAtPointerDownRef.current ||
+              openModalStack[openModalStack.length - 1] !== modalId
+            ) {
+              event.preventDefault();
+              return;
+            }
+            onPointerDownOutside?.(event);
+          }}
           onOpenAutoFocus={onOpenAutoFocus}
           onCloseAutoFocus={onCloseAutoFocus}
           // Tab 回绕时 Radix 用 preventScroll 聚焦,目标若滚出了弹层可视区要自己滚回来(a11y shell#8)。
           onFocusCapture={revealFocusedElement}
           className={cn(modalContentVariants({ size, fixedHeight, mobile }), className)}
         >
+          {mobile === "sheet" && (
+            <div
+              aria-hidden
+              className="mx-auto mt-2.5 h-1 w-10 shrink-0 rounded-full bg-border-strong/80 md:hidden"
+            />
+          )}
           {title ? (
             <div
               className={cn(
@@ -175,9 +229,9 @@ export function Modal({
               )}
             >
               <div className="min-w-0">
-                <RD.Title className="text-base font-semibold text-fg">{title}</RD.Title>
+                <RD.Title className="text-base font-semibold tracking-tight text-fg">{title}</RD.Title>
                 {description && (
-                  <RD.Description className="mt-1 text-sm text-muted">{description}</RD.Description>
+                  <RD.Description className="mt-1 text-body leading-relaxed text-muted">{description}</RD.Description>
                 )}
               </div>
               {(headerActions || !hideClose) && (
@@ -185,7 +239,7 @@ export function Modal({
                   {headerActions}
                   {!hideClose && (
                     <RD.Close asChild>
-                      <IconButton aria-label="关闭" size="sm">
+                      <IconButton aria-label="关闭" size="sm" shape="square">
                         <X size={16} />
                       </IconButton>
                     </RD.Close>
@@ -215,7 +269,7 @@ export function Modal({
           {footer && (
             // 窄屏按钮组竖排:col-reverse 让"主操作"(DOM 里写在最后)留在最上,且各自铺满整行 ——
             // 375px 屏上并排两个中文按钮会被压到两三个字宽。
-            <div className="flex justify-end gap-2 border-t border-border px-5 py-4 max-sm:flex-col-reverse max-sm:[&>*]:w-full">
+            <div className="flex justify-end gap-2 border-t border-border/80 bg-bg/45 px-5 py-3.5 max-sm:flex-col-reverse max-sm:[&>*]:w-full">
               {footer}
             </div>
           )}

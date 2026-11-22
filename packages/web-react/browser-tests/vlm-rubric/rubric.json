@@ -1,0 +1,99 @@
+{
+  "schemaVersion": 1,
+  "mode": "advisory",
+  "calibrationWeeks": 2,
+  "temperature": 0,
+  "hardRejectFloor": 3.5,
+  "passTargetDefault": 4.0,
+  "maxCostUsdPerPr": 0.5,
+  "maxRoundsPerPr": 2,
+  "scoreScale": {
+    "min": 1,
+    "max": 5
+  },
+  "dimensions": [
+    {
+      "id": "craft",
+      "label": "视觉工艺与对齐精度",
+      "minScore": 4.0,
+      "hardRejectBelow": 3.5,
+      "weight": 0.25,
+      "criteria": "元素基线对齐、间距网格一致、圆角与描边层次清晰、无像素抖动/溢出/错位或粗糙分割线。",
+      "anchors": {
+        "5": "旗舰桌面应用级工艺：留白节奏统一，图标与文字基线严格对齐，明暗双主题描边和表面层级干净无瑕疵。",
+        "3": "功能完整但细节毛糙：局部卡片内边距不均、按钮高度或图标基线轻微偏移、暗色模式描边发脏。",
+        "1": "明显视觉破损：控件重叠穿模、文字被非省略号硬裁切、弹窗/抽屉错位或页面出现横向溢出。"
+      }
+    },
+    {
+      "id": "hierarchy_density",
+      "label": "信息层级与密度平衡",
+      "minScore": 4.0,
+      "hardRejectBelow": 3.5,
+      "weight": 0.2,
+      "criteria": "主次视觉焦点明确，高频操作一眼可达，信息密度与呼吸感平衡，不堆砌冗余徽章/横幅挤占主对话区。",
+      "anchors": {
+        "5": "一眼识别主路径：主内容区占比充裕，标题/正文/辅助元信息字号与对比度梯度自然，移动端同样清爽。",
+        "3": "信息略显平铺或拥挤：次要状态标签与主操作争抢注意力，或横幅/工具栏占据过多首屏垂直高度。",
+        "1": "层级坍塌：满屏均等权重的卡片与按钮，首屏主任务区被提示条/装饰块严重挤压。"
+      }
+    },
+    {
+      "id": "design_system_coherence",
+      "label": "设计系统一致性",
+      "minScore": 4.0,
+      "hardRejectBelow": 3.5,
+      "weight": 0.2,
+      "criteria": "严格复用 styles.css 语义色板、圆角、阴影与 components/ui 原语，明暗主题极性反转完整且无硬编码孤岛样式。",
+      "anchors": {
+        "5": "与既有壳层与 UI Kit 浑然一体：语义 token、状态色、交互反馈和排版尺度在明暗双主题下高度一致。",
+        "3": "局部脱离设计系统：个别模块自造颜色/圆角/输入框样式，与相邻面板视觉语言略有割裂。",
+        "1": "严重风格漂移：出现硬编码亮色背景侵入暗色主题、私造 z-index 遮挡浮层、或完全异质的组件外观。"
+      }
+    },
+    {
+      "id": "anti_slop_restraint",
+      "label": "克制感与反 AI 模板感",
+      "minScore": 3.5,
+      "hardRejectBelow": 3.5,
+      "weight": 0.15,
+      "criteria": "拒绝廉价 AI 模板美学（紫蓝霓虹渐变、无意义发光阴影、装饰性毛玻璃、满屏营销风 emoji/空洞标语与冗余卡片套卡片）。",
+      "anchors": {
+        "5": "克制、工具导向、经得起长时间工作凝视：装饰服从信息表达，无多余渐变、光晕或营销话术。",
+        "3": "基本克制但略有模板感：存在少量不必要的渐变强调或装饰性徽章，未明显干扰阅读。",
+        "1": "典型 AI Slop：刺眼紫蓝渐变、滥用发光边框/重阴影、卡片层层嵌套或充斥无信息量营销副标题。"
+      }
+    },
+    {
+      "id": "interactive_usability",
+      "label": "交互可用性与可达性",
+      "minScore": 4.0,
+      "hardRejectBelow": 3.5,
+      "weight": 0.2,
+      "criteria": "主操作热区清晰易点（移动端 >=44px）、文字与图标对比度满足 WCAG AA、状态反馈（加载/禁用/错误/空态）直观无内部术语。",
+      "anchors": {
+        "5": "交互直觉零学习成本：焦点与状态反馈明确，移动端热区宽裕，无内部协议报错术语暴露。",
+        "3": "可用但存在摩擦：部分图标按钮表意不够清晰、对比度贴近下限或小屏操作略显局促。",
+        "1": "可用性受阻：低对比度导致文字难辨、核心按钮过小或被遮挡、或直接向终端用户暴露内部错误码。"
+      }
+    }
+  ],
+  "triggerPolicy": {
+    "labels": ["ui-redesign"],
+    "exactPaths": [
+      "packages/web-react/src/styles.css",
+      "packages/web-react/src/App.tsx",
+      "packages/web-react/src/components/Sidebar.tsx",
+      "packages/web-react/src/components/InspectorPanel.tsx",
+      "packages/web-react/src/components/Composer.tsx",
+      "packages/web-react/src/components/chat/SwarmBoardDrawer.tsx"
+    ],
+    "pathPrefixes": ["packages/web-react/src/components/ui/"],
+    "newTopLevelCenterPatterns": [
+      "^packages/web-react/src/(pages|centers|views)/[^/]+\\.tsx$",
+      "^packages/web-react/src/components/[A-Z][^/]*Center\\.tsx$",
+      "^packages/web-react/src/components/[^/]+/[A-Z][^/]*Center\\.tsx$"
+    ],
+    "ignorePatterns": ["\\.test\\.[tj]sx?$", "\\.spec\\.[tj]sx?$", "(^|/)__tests__/"]
+  }
+}

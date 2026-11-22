@@ -42,6 +42,9 @@ import {
   AUTOMATIC_TURN_RETRY_MAX,
   isCodexEngineModel,
   isCursorEngineModel,
+  isAntigravityEngineModel,
+  isRemoteDriverExecutionBackend,
+  parseSwarmSlashCommand,
   isClientMessageId,
   formatMessageReplyPrompt,
   normalizeMessageReplyQuote,
@@ -70,6 +73,9 @@ import {
 import type { GatewayStreamEvent } from './ccbMessageParser.js'
 import { noteForegroundBashToolResult } from './ccbLocalAgentCallback.js'
 import { parseDocument } from './documentParser.js'
+import { offloadPayloadIfOversized } from './payloadOffloadGate.js'
+import { markSelfClientTurnForAutoCompact } from './sessionAutoCompact.js'
+import { contextRebuildsTotal } from './metrics.js'
 import { EMPTY_COMPLETED_TURN_NOTICE, hasPlatedAssistantOutput } from './emptyCompletedTurn.js'
 import type { PromptQueueExternalTurnReservation } from './sessionManager.js'
 import { inferAgentForModel } from './inferAgentForModel.js'
@@ -77,6 +83,15 @@ import { capMarketplaceToolsets, mergeOnDemandToolsets } from './toolsetIntent.j
 import { projectCcbExecutionDescriptor } from './subprocessRunner.js'
 import { readV3CodexRelayConfig, V3_CODEX_RELAY_PREFIX } from './v3CodexRelay.js'
 import { resolveEngine } from './engine/registry.js'
+import {
+  applyAntigravitySwarmTurnDirective,
+  hasHistoricalAntigravitySwarm,
+  listLiveAntigravitySwarmMonitors,
+} from './engine/antigravitySwarmDirective.js'
+import {
+  prepareRemoteSwarmInboundTurn,
+  recordRemoteSwarmLeaderStreamEvent,
+} from './remoteSwarmLocal.js'
 import {
   getTurnAuthority,
   isEngineLocalTurnExempt,
@@ -105,10 +120,12 @@ import { V3_WECHAT_OUTBOUND_ADAPTER_ID, V3_QQBOT_OUTBOUND_ADAPTER_ID, liveSessio
 import { ALLOWED_INBOUND_MODELS } from './delegatePolicy.js'
 import { sessionStartFailureCode, sessionStartFailureMessage, userSentTurnFrames } from './turnFrames.js'
 import { MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_FILE, MAX_UPLOAD_SINGLE, MAX_UPLOAD_TOTAL, mimeFor } from './httpUploadStatic.js'
+import { formatLegacyBase64OversizeError, resolveLegacyBase64MaxBytes } from './wsPayloadPolicy.js'
 import type { Gateway, LocalExecutionDecision } from './server.js'
 
 export interface InboundDispatchHost {
   _adoptOrphanedStdoutWaitDelegates: Gateway['_adoptOrphanedStdoutWaitDelegates']
+  _ensureRemoteSwarmRuntime: Gateway['_ensureRemoteSwarmRuntime']
   _freezeAdvisorTurn: Gateway['_freezeAdvisorTurn']
   _getAgentsConfig: Gateway['_getAgentsConfig']
   _hiddenDelegateGuard: Gateway['_hiddenDelegateGuard']
@@ -562,6 +579,7 @@ export async function dispatchInbound(
     // 团队模式(v5 轻量组队):turn 级 flag,仅 main 队长生效。ws 帧无 typebox runtime
     // 校验(JSON cast),用 === true 防御(与 _frameRequestId 同模式)。
     const teamMode = (frame as any).teamMode === true
+    const swarmMode = (frame as any).swarmMode === true
     const inboundCollabMode = normalizeCollabMode({
       collabMode: (frame as { collabMode?: unknown }).collabMode,
       teamMode,
@@ -992,19 +1010,29 @@ export async function dispatchInbound(
       }
       const attachmentSizes: number[] = []
       let attachmentTotalOver = false
-      // First pass — validate base64 (legacy) entries the same way as before so
-      // old web bundles still get correct 4xx-style WS error frames.
+      // First pass — guard legacy inline base64 attachments against OOM and
+      // give an explicit migration error guiding large files to HTTP `/api/uploads`.
       // The total check happens after every attachment is counted. Rejecting at
       // the first prefix that crosses the cap would name the wrong total.
+      const legacyBase64Cap = Math.min(MAX_UPLOAD_SINGLE, resolveLegacyBase64MaxBytes())
+      let legacyBase64TotalBytes = 0
       for (const m of media) {
         if (!m.base64) continue
         const rawLen = m.base64.length
         const byteLen = Math.ceil(rawLen * 0.75) // base64 → bytes approx
-        if (byteLen > MAX_UPLOAD_SINGLE) {
-          rejectFrame(
-            `附件超过 ${MAX_UPLOAD_SINGLE / 1024 / 1024}MB 限制 (${(byteLen / 1024 / 1024).toFixed(1)}MB)`,
-            { byteLen },
-          )
+        if (byteLen > legacyBase64Cap) {
+          rejectFrame(formatLegacyBase64OversizeError(byteLen, legacyBase64Cap), {
+            byteLen,
+            limitBytes: legacyBase64Cap,
+          })
+          return
+        }
+        legacyBase64TotalBytes += byteLen
+        if (legacyBase64TotalBytes > legacyBase64Cap) {
+          rejectFrame(formatLegacyBase64OversizeError(legacyBase64TotalBytes, legacyBase64Cap), {
+            byteLen: legacyBase64TotalBytes,
+            limitBytes: legacyBase64Cap,
+          })
           return
         }
         attachmentSizes.push(byteLen)
@@ -1571,16 +1599,62 @@ export async function dispatchInbound(
             }
           }
 
+          const ATTACHMENT_INLINE_PER_FILE_MAX_CHARS = 16_000
+          const ATTACHMENT_INLINE_TURN_MAX_CHARS = 32_000
+          let remainingAttachmentInlineChars = ATTACHMENT_INLINE_TURN_MAX_CHARS
+          const safePeerSlug =
+            frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80) || 'default'
+          const attachmentArtifactWorkspace = join(paths.home, 'workspace', 'sessions', safePeerSlug)
+
           for (const doc of parsedDocs) {
+            const perDocBudget = Math.min(
+              ATTACHMENT_INLINE_PER_FILE_MAX_CHARS,
+              remainingAttachmentInlineChars,
+            )
+            let projectedBody = doc.markdown
+            let offloaded = false
+            let artifactPath: string | undefined
+            if (doc.markdown.length > perDocBudget) {
+              const gated = offloadPayloadIfOversized({
+                workspaceDir: attachmentArtifactWorkspace,
+                sessionKey: out.sessionKey,
+                sessionId: frame.peer.id,
+                category: 'attachment',
+                label: doc.file.name,
+                content: doc.markdown,
+                inlineMaxChars: Math.max(1_024, perDocBudget),
+                ...(perDocBudget < 1_024 ? { headChars: 700, tailChars: 200 } : {}),
+              })
+              projectedBody = gated.text
+              offloaded = gated.offloaded
+              artifactPath = gated.artifactPath
+              remainingAttachmentInlineChars = Math.max(
+                0,
+                remainingAttachmentInlineChars - Math.min(perDocBudget, gated.inlineChars),
+              )
+            } else {
+              remainingAttachmentInlineChars = Math.max(
+                0,
+                remainingAttachmentInlineChars - doc.markdown.length,
+              )
+            }
+            const statusTag =
+              doc.truncated || offloaded
+                ? offloaded
+                  ? ' **(已外置节选)**'
+                  : ' **(已截断)**'
+                : ''
             lines.push(
               '',
               '---',
               `**用户上传的文档**:\`${doc.file.name}\` (${doc.file.mimeType}, ${doc.file.sizeHint})`,
-              `_已由 ${doc.parser} 在服务端预解析为 markdown,内容如下_${doc.truncated ? ' **(已截断)**' : ''}:`,
+              `_已由 ${doc.parser} 在服务端预解析为 markdown,内容如下_${statusTag}:`,
               '',
-              doc.markdown,
+              projectedBody,
               '',
-              `_(原文件保存在服务器:\`${doc.file.path}\`,如需访问图片/附件可用 Read)_`,
+              artifactPath
+                ? `_(完整解析文本已落盘:\`${artifactPath}\`,原文件:\`${doc.file.path}\`,按需用 Read/Grep 分段查看)_`
+                : `_(原文件保存在服务器:\`${doc.file.path}\`,如需访问图片/附件可用 Read)_`,
             )
           }
 
@@ -1716,6 +1790,30 @@ export async function dispatchInbound(
         })
         finalText = teamPreamble + finalText
       }
+      // Antigravity swarm mode (OCV5-809 local + OCV5-835 remote parity + OCV5-842/P0-2 off-toggle guard).
+      const effectiveModelForSwarm = safeModelForRouting ?? agent.model ?? this.deps.config.defaults.model
+      const isAntigravityTurn = turnAuthority?.engine === 'antigravity' || (typeof effectiveModelForSwarm === 'string' && isAntigravityEngineModel(effectiveModelForSwarm))
+      const isRemoteAntigravity = isAntigravityTurn && (isRemoteDriverExecutionBackend(turnAuthority?.executionBackend) || (typeof effectiveModelForSwarm === 'string' && effectiveModelForSwarm.endsWith('-remote')))
+      const swarmRequested = swarmMode || Boolean(parseSwarmSlashCommand(rawUserText)?.matched)
+      const activeRemoteSwarmRuntime = await prepareRemoteSwarmInboundTurn({
+        sessionKey, isRemoteAntigravity, effectiveModel: effectiveModelForSwarm, swarmRequested,
+        effort: safeEffortLevel ?? undefined, workspaceCwd: session.workspaceCwd || agent.cwd || process.cwd(),
+        parentAgentId: agent.id, allowedToolsets: agent.toolsets, ensureRuntime: () => this._ensureRemoteSwarmRuntime(),
+      })
+      const boundSwarmConversationId = isAntigravityTurn && !isRemoteAntigravity
+        ? (session.ccbSessionId ?? session.runner?.nativeSessionId ?? this.sessions.resolveAntigravitySwarmTarget?.(frame.peer.id)?.conversationId ?? undefined)
+        : undefined
+      const swarmDirectiveResult = applyAntigravitySwarmTurnDirective({
+        finalText, rawUserText, isAntigravityTurn, isRemoteAntigravity, swarmMode,
+        hasHistoricalSwarm: isAntigravityTurn ? hasHistoricalAntigravitySwarm({ sessionKey, isRemote: isRemoteAntigravity, conversationId: boundSwarmConversationId }) : false,
+        liveMonitorNames: isAntigravityTurn && swarmRequested ? listLiveAntigravitySwarmMonitors({ sessionKey, isRemote: isRemoteAntigravity, conversationId: boundSwarmConversationId }) : [],
+      })
+      finalText = swarmDirectiveResult.text
+      if (swarmDirectiveResult.mode === 'on') {
+        this.log.info('antigravity_swarm_mode_turn', { sessionKey, model: effectiveModelForSwarm, remote: isRemoteAntigravity, viaSlash: swarmDirectiveResult.viaSlash, viaToggle: swarmDirectiveResult.viaToggle })
+      } else if (swarmDirectiveResult.mode === 'off_with_history') {
+        this.log.info('antigravity_swarm_mode_suppressed', { sessionKey, model: effectiveModelForSwarm, remote: isRemoteAntigravity })
+      }
       // Pass as plain text. No image content blocks — safer for non-multimodal providers.
       const payload: string = finalText
       const taskType = sessionKey.includes(':cron:')
@@ -1799,6 +1897,7 @@ export async function dispatchInbound(
       }
       const deliverPendingApiErrorTerminal = (): boolean => {
         if (!_pendingApiErrorFrame || !_pendingApiErrorFinalized) return false
+        activeRemoteSwarmRuntime?.recordCoordinatorTelemetry(sessionKey, { type: 'ERROR', status: 'ERROR', error: _apiErrorText || 'api_error' })
         turnErrored = true
         session.currentTurnStatus = null
         this._runLog.complete(currentRun, { status: 'failed', error: _apiErrorText })
@@ -1829,6 +1928,7 @@ export async function dispatchInbound(
       // SessionStreamEvent ⊆ GatewayStreamEvent,故本 handler 仍可下传给要求
       // SessionStreamEvent handler 的 sessions.submit()(函数参数逆变)。
       const onLeaderEvent = (e: GatewayStreamEvent) => {
+        recordRemoteSwarmLeaderStreamEvent(activeRemoteSwarmRuntime, sessionKey, e)
         if (e.kind === 'block') {
           const b = e.block as any
           // tool_output_tail 是替换语义的快照(1Hz),且 sessionManager 现在让
@@ -1848,8 +1948,8 @@ export async function dispatchInbound(
                 typeof b.parentToolUseId === 'string' ? b.parentToolUseId : undefined,
             })
           }
-          const isTail = b?.kind === 'tool_output_tail'
-          if (isTail) {
+          const isSnapshotSideband = b?.kind === 'tool_output_tail' || b?.kind === 'swarm_snapshot'
+          if (isSnapshotSideband) {
             if (liveWechatAdapter) {
               this.deliver({ ...out, blocks: [e.block], isFinal: false }, undefined)
               return
@@ -2382,6 +2482,7 @@ export async function dispatchInbound(
         // 内部子 turn 没有前台用户看)。gateway-authored 决策直接 deliver(),不绕 engine
         // event 流(那是底座上报通道)。frame 路由继承主 out(_inheritOutboundRouting)。
         emitContextRebuilt: (info: { messageCount: number; reason?: 'engine-switch' | 'native-resume-loss' }) => {
+          contextRebuildsTotal.inc({ reason: info.reason ?? 'native-resume-loss' })
           this.deliver(_buildContextRebuiltFrame(out, agent.id, info.messageCount, info.reason, safeClientMessageId), adapter)
         },
         ...(safeClientMessageId
@@ -2431,6 +2532,7 @@ export async function dispatchInbound(
         this._promptQueueExecutionFenceByFrame.delete(frame as object)
       }
       this.sessions.beginClientTurn(session)
+      markSelfClientTurnForAutoCompact(session, promptQueueExecutionFence)
       const clientTurnStartedAt = Date.now()
       let clientTurnThrew = false
       let clientTurnError: unknown | undefined

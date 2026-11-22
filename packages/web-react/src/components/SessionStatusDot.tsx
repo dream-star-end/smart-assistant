@@ -4,6 +4,7 @@ import {
   resolveSidebarDotLabel,
 } from "../lib/sessionStatus";
 import { SIDEBAR_DOT_STATUS } from "../lib/ui/statusTone";
+import { cn } from "../lib/utils";
 import { StatusPill } from "./ui/StatusPill";
 
 /**
@@ -32,7 +33,7 @@ export function SessionStatusDot({
       size="md"
       mark={kind === "running" ? "ring" : kind === "needs_you" ? "question" : "dot"}
       data-dot-kind={kind}
-      className={className}
+      className={cn("shrink-0 transition-transform duration-200 ease-spring", className)}
     />
   );
 }

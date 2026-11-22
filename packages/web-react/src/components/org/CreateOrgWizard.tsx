@@ -228,14 +228,14 @@ export function CreateOrgWizard({
                 )}
 
                 {plan && total && (
-                  <div className="rounded-xl border border-border bg-bg px-4 py-3">
+                  <div className="oc-surface-recessed rounded-xl px-4 py-3">
                     <div className="flex items-center justify-between text-body">
                       <span className="text-muted">应付合计</span>
-                      <span className="text-[16px] font-semibold text-fg">
+                      <span className="text-base font-semibold tabular-nums text-fg">
                         {formatCentsYuan(total.totalCents)}
                       </span>
                     </div>
-                    <div className="mt-1 text-meta text-faint">
+                    <div className="mt-1 text-meta tabular-nums text-faint">
                       {seats} 席 × {formatCentsYuan(plan.seatPriceCents)}/月 · 入池{" "}
                       {formatCredits(total.totalCredits)} 积分 · 有效期 {plan.periodDays} 天
                     </div>
@@ -248,7 +248,7 @@ export function CreateOrgWizard({
               <p className="py-8 text-center text-body text-faint">暂无可用企业套餐。</p>
             )}
 
-            <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center justify-between gap-2 pt-1">
               <Button variant="ghost" size="sm" onClick={() => setStep("name")} className="text-muted">
                 <ArrowLeft size={15} /> 上一步
               </Button>
@@ -290,10 +290,15 @@ export function CreateOrgDialog({
         <Dialog.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade" />
         <Dialog.Content
           aria-describedby={undefined}
-          className="fixed left-1/2 top-1/2 z-50 flex max-h-[85vh] w-[calc(100vw-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-surface shadow-float focus:outline-none data-[state=open]:animate-in"
+          className="oc-surface-popover fixed left-1/2 top-1/2 z-50 flex max-h-[85vh] w-[calc(100vw-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl focus:outline-none data-[state=open]:animate-in"
         >
-          <div className="flex items-center justify-between gap-3 px-5 py-4">
-            <Dialog.Title className="text-title font-semibold text-fg">创建组织</Dialog.Title>
+          <div className="flex items-center justify-between gap-3 border-b border-border/70 px-5 py-4">
+            <div className="flex items-center gap-2.5">
+              <span className="oc-icon-badge oc-icon-badge-accent size-8 rounded-lg">
+                <Building2 size={16} strokeWidth={1.75} />
+              </span>
+              <Dialog.Title className="text-title font-semibold text-fg">创建组织</Dialog.Title>
+            </div>
             <Dialog.Close asChild>
               {/* 走 ui/IconButton：自带 type="button" 与触屏 44px 命中（审计 SET-11，与 OrgCenter 同款）。 */}
               <IconButton variant="muted" size="md" shape="square" aria-label="关闭">
@@ -320,7 +325,7 @@ function WizardSteps({ step }: { step: Step | "pay" }) {
   const activeIdx = step === "name" ? 0 : step === "plan" ? 1 : 2;
   return (
     <div
-      className="flex items-center gap-2 border-b border-border px-5 py-3 text-meta"
+      className="flex items-center gap-2 border-b border-border/70 bg-bg/60 px-5 py-3 text-meta"
       data-testid="create-org-steps"
       data-active-step={items[activeIdx].key}
     >
@@ -331,18 +336,27 @@ function WizardSteps({ step }: { step: Step | "pay" }) {
           <div key={it.key} className="flex items-center gap-2">
             <span
               className={cn(
-                "flex size-5 items-center justify-center rounded-full text-caption font-medium",
+                "flex size-6 items-center justify-center rounded-full text-caption font-semibold tabular-nums transition-colors",
                 done
-                  ? "bg-success-soft text-success"
+                  ? "oc-icon-badge oc-icon-badge-success rounded-full"
                   : active
-                    ? "bg-accent text-accent-fg"
-                    : "bg-hover text-faint",
+                    ? "bg-accent text-accent-fg shadow-soft"
+                    : "oc-surface-recessed text-faint",
               )}
             >
-              {done ? <Check size={12} /> : i + 1}
+              {done ? <Check size={12} strokeWidth={2.25} /> : i + 1}
             </span>
-            <span className={cn(active ? "text-fg" : "text-faint")}>{it.label}</span>
-            {i < items.length - 1 && <span className="mx-1 h-px w-4 bg-border" />}
+            <span className={cn("font-medium", active ? "text-fg" : done ? "text-muted" : "text-faint")}>
+              {it.label}
+            </span>
+            {i < items.length - 1 && (
+              <span
+                className={cn(
+                  "mx-1 h-px w-5 transition-colors",
+                  done ? "bg-success/50" : "bg-border",
+                )}
+              />
+            )}
           </div>
         );
       })}
@@ -366,26 +380,28 @@ function PlanCard({
       onClick={onSelect}
       aria-pressed={selected}
       className={cn(
-        "flex items-center justify-between gap-3 rounded-xl border px-4 py-3 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+        "flex items-center justify-between gap-3 rounded-xl px-4 py-3.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring",
         selected
-          ? "border-accent bg-accent-soft"
-          : "border-border bg-surface hover:border-border-strong",
+          ? "border border-accent bg-accent-soft shadow-soft transition-colors"
+          : "oc-surface-card oc-surface-card-hover",
       )}
     >
       <div className="min-w-0">
         <div className="flex items-center gap-2">
           <span className="text-title font-semibold text-fg">{plan.name}</span>
           {selected && (
-            <span className="rounded-full bg-accent px-1.5 py-0.5 text-micro font-medium text-accent-fg">
+            <span className="oc-badge-craft rounded-full bg-accent px-2 py-0.5 text-micro font-medium text-accent-fg">
               已选
             </span>
           )}
         </div>
-        <div className="mt-0.5 text-meta text-faint">
+        <div className="mt-1 text-meta tabular-nums text-muted">
           {formatCentsYuan(plan.seatPriceCents)}/席·月 · 每席 {formatCredits(plan.perSeatCredits)} 积分入池
         </div>
       </div>
-      <span className="shrink-0 text-caption text-faint">最低 {plan.minSeats} 席</span>
+      <span className="oc-badge-craft shrink-0 rounded-full bg-hover px-2 py-0.5 text-caption tabular-nums text-muted">
+        最低 {plan.minSeats} 席
+      </span>
     </button>
   );
 }
@@ -408,10 +424,10 @@ export function SeatPicker({
   const lo = min ?? plan.minSeats;
   // 步进按钮桌面 32px；触屏（hover:none）升到 44px 命中标准（审计 SET-11），输入框同步升高对齐。
   const stepBtnCls =
-    "flex size-8 items-center justify-center rounded-md border border-border text-fg outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-40 [@media(hover:none)]:size-11";
+    "oc-btn-secondary-craft oc-btn-tactile flex size-8 items-center justify-center rounded-lg text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-40 [@media(hover:none)]:size-11";
   return (
-    <div className="flex items-center justify-between gap-3">
-      <span className="text-meta text-muted">{label}</span>
+    <div className="oc-surface-card flex items-center justify-between gap-3 rounded-xl px-4 py-2.5">
+      <span className="text-meta font-medium text-muted">{label}</span>
       <div className="flex items-center gap-2">
         <button
           type="button"
@@ -432,7 +448,7 @@ export function SeatPicker({
             onChange(Number.isFinite(n) ? n : lo);
           }}
           aria-label={label}
-          className="h-8 w-16 rounded-md border border-border bg-surface text-center text-title tabular-nums text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring [@media(hover:none)]:h-11"
+          className="oc-field-control h-8 w-16 rounded-lg border border-border-control text-center text-title font-semibold tabular-nums text-fg outline-none [@media(hover:none)]:h-11"
         />
         <button
           type="button"

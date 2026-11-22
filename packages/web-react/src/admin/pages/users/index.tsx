@@ -1,4 +1,12 @@
-import { Download, RefreshCw } from 'lucide-react'
+import {
+  Activity,
+  CreditCard,
+  Download,
+  RefreshCw,
+  TrendingUp,
+  UserPlus,
+  Users,
+} from 'lucide-react'
 import { useRef, useState } from 'react'
 import { Badge, Button, useToast } from '../../../components/ui'
 import {
@@ -179,7 +187,7 @@ export default function UsersPage() {
                 e.stopPropagation()
                 navigate('containers', { user_email: u.email })
               }}
-              className="shrink-0 rounded-md bg-hover px-1.5 py-0.5 text-caption text-muted outline-none transition-colors hover:bg-active hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+              className="oc-btn-tactile oc-badge-craft shrink-0 rounded-md bg-hover px-1.5 py-0.5 text-caption font-medium text-muted outline-none transition-colors hover:bg-active hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
               title="查看该用户的活跃容器"
             >
               {u.containers_active} 容器
@@ -267,6 +275,7 @@ export default function UsersPage() {
   return (
     <div className="flex flex-col gap-5">
       <PageHeader
+        icon={Users}
         title={meta.title}
         desc={meta.desc}
         actions={
@@ -292,6 +301,7 @@ export default function UsersPage() {
       {/* KPI */}
       <StatCardRow>
         <StatCard
+          icon={Users}
           label="总用户数"
           value={stats.data ? fmtInt(stats.data.total_users) : '—'}
           hint={
@@ -301,10 +311,11 @@ export default function UsersPage() {
                 ? '加载失败'
                 : undefined
           }
-          tone={stats.data && stats.data.banned_users > 0 ? 'warning' : 'success'}
+          tone={stats.data && stats.data.banned_users > 0 ? 'warning' : 'accent'}
           loading={stats.loading && !stats.data}
         />
         <StatCard
+          icon={UserPlus}
           label="7 天新注册"
           value={stats.data ? fmtInt(stats.data.new_7d) : '—'}
           hint="7d 累计"
@@ -312,12 +323,15 @@ export default function UsersPage() {
           loading={stats.loading && !stats.data}
         />
         <StatCard
+          icon={Activity}
           label="7 天活跃"
           value={stats.data ? fmtInt(stats.data.active_7d) : '—'}
           hint="有 usage_records 的独立用户"
+          tone="info"
           loading={stats.loading && !stats.data}
         />
         <StatCard
+          icon={CreditCard}
           label="7 天付费用户"
           value={stats.data ? fmtInt(stats.data.paying_7d) : '—'}
           hint={stats.data ? `平均余额 ${fmtYuan(stats.data.avg_credits_cents)}` : undefined}
@@ -327,10 +341,15 @@ export default function UsersPage() {
       </StatCardRow>
 
       {/* 新用户漏斗 */}
-      <div className="flex items-center justify-between">
-        <h2 className="text-body font-semibold text-muted">
-          新用户漏斗 <span className="text-faint">· 最近 {funnelDays} 天</span>
-        </h2>
+      <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+        <div className="flex items-center gap-2.5">
+          <span className="oc-icon-badge oc-icon-badge-accent size-7 rounded-lg">
+            <TrendingUp size={14} strokeWidth={2} />
+          </span>
+          <h2 className="text-body font-semibold tracking-tight text-fg">
+            新用户漏斗 <span className="font-normal text-faint">· 最近 {funnelDays} 天</span>
+          </h2>
+        </div>
         <RangePreset value={funnelDays} onChange={setFunnelDays} />
       </div>
       <StatCardRow className="lg:grid-cols-8">
@@ -425,22 +444,22 @@ export default function UsersPage() {
       </FilterBar>
 
       {list.error && !list.data ? (
-        <div className="rounded-xl border border-danger/40 bg-danger-soft px-4 py-8 text-center text-body text-danger">
+        <div className="oc-callout oc-callout-danger rounded-xl px-4 py-8 text-center text-body text-danger">
           加载失败：{errMsg(list.error)}
         </div>
       ) : (
-        <div className="flex flex-col gap-2">
-          <DataTable
-            columns={columns}
-            rows={rows}
-            rowKey={(u) => u.id}
-            loading={list.loading && !list.data}
-            onRowClick={(u) => setSelectedId(u.id)}
-            emptyTitle="无用户"
-            emptyHint="没有符合当前筛选条件的用户"
-          />
-          <Pagination offset={offset} limit={PAGE_SIZE} count={totalLoaded} onChange={setOffset} />
-        </div>
+        <DataTable
+          columns={columns}
+          rows={rows}
+          rowKey={(u) => u.id}
+          loading={list.loading && !list.data}
+          onRowClick={(u) => setSelectedId(u.id)}
+          emptyTitle="无用户"
+          emptyHint="没有符合当前筛选条件的用户"
+          footer={
+            <Pagination offset={offset} limit={PAGE_SIZE} count={totalLoaded} onChange={setOffset} />
+          }
+        />
       )}
 
       <UserDetailSheet

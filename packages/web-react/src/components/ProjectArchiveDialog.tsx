@@ -43,18 +43,33 @@ export function ProjectArchiveDialog({
 
   return (
     <Modal open={open} onOpenChange={onOpenChange} title="已归档和最近删除的项目" size="md">
-      <div className="flex flex-col gap-5">
-        <section aria-label="已归档的项目">
-          <h3 className="mb-2 flex items-center gap-1.5 text-meta font-medium text-muted">
-            <Archive size={14} aria-hidden /> 已归档
-          </h3>
+      <div className="flex flex-col gap-4">
+        <section aria-label="已归档的项目" className="oc-surface-card rounded-xl p-4">
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <h3 className="flex items-center gap-2 text-section font-semibold text-fg">
+              <span className="oc-icon-badge size-7 rounded-md" aria-hidden>
+                <Archive size={14} strokeWidth={1.75} />
+              </span>
+              已归档
+            </h3>
+            {archived.length > 0 && (
+              <span className="oc-badge-craft rounded-full bg-hover px-2 py-0.5 text-caption font-medium tabular-nums text-muted">
+                {archived.length}
+              </span>
+            )}
+          </div>
           {archived.length === 0 ? (
-            <p className="text-caption text-faint">没有归档的项目。项目菜单里的「归档」会把它收到这里。</p>
+            <p className="oc-surface-recessed rounded-lg px-3 py-3 text-caption text-faint">
+              没有归档的项目。项目菜单里的「归档」会把它收到这里。
+            </p>
           ) : (
-            <ul className="flex flex-col gap-1">
+            <ul className="flex flex-col gap-1.5">
               {archived.map((p) => (
-                <li key={p.id} className="flex min-h-11 items-center gap-2 rounded-md px-2 hover:bg-hover">
-                  <span className="min-w-0 flex-1 truncate text-body">{p.name}</span>
+                <li
+                  key={p.id}
+                  className="oc-surface-recessed flex min-h-11 items-center gap-2 rounded-lg px-3 py-1.5"
+                >
+                  <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">{p.name}</span>
                   <Button
                     size="sm"
                     variant="secondary"
@@ -75,21 +90,34 @@ export function ProjectArchiveDialog({
             </ul>
           )}
         </section>
-        <section aria-label="最近删除的项目">
-          <h3 className="mb-2 flex items-center gap-1.5 text-meta font-medium text-muted">
-            <Trash2 size={14} aria-hidden /> 最近删除（30 天内可恢复）
-          </h3>
+        <section aria-label="最近删除的项目" className="oc-surface-card rounded-xl p-4">
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <h3 className="flex items-center gap-2 text-section font-semibold text-fg">
+              <span className="oc-icon-badge oc-icon-badge-danger size-7 rounded-md" aria-hidden>
+                <Trash2 size={14} strokeWidth={1.75} />
+              </span>
+              最近删除（30 天内可恢复）
+            </h3>
+            {deleted && deleted.length > 0 && (
+              <span className="oc-badge-craft rounded-full bg-hover px-2 py-0.5 text-caption font-medium tabular-nums text-muted">
+                {deleted.length}
+              </span>
+            )}
+          </div>
           {deleted === null ? (
-            <p className="text-caption text-faint">正在加载…</p>
+            <p className="oc-surface-recessed rounded-lg px-3 py-3 text-caption text-faint">正在加载…</p>
           ) : deleted.length === 0 ? (
             <EmptyState icon={Trash2} title="没有最近删除的项目" />
           ) : (
-            <ul className="flex flex-col gap-1">
+            <ul className="flex flex-col gap-1.5">
               {deleted.map((d) => (
-                <li key={d.id} className="flex min-h-11 items-center gap-2 rounded-md px-2 hover:bg-hover">
+                <li
+                  key={d.id}
+                  className="oc-surface-recessed flex min-h-11 items-center gap-2 rounded-lg px-3 py-2"
+                >
                   <span className="min-w-0 flex-1">
-                    <span className="block truncate text-body">{d.name}</span>
-                    <span className="block text-caption text-faint">
+                    <span className="block truncate text-body font-medium text-fg">{d.name}</span>
+                    <span className="block text-caption tabular-nums text-faint">
                       {d.sessionCount} 个会话 · 还剩 {daysLeft(d.deletedAt)} 天
                     </span>
                   </span>

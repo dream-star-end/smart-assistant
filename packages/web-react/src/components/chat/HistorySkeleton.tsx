@@ -34,11 +34,17 @@ export function shouldShowHistorySkeleton(p: {
   graceExpired: boolean;
   /** 安全兜底超时已过（有历史分支的封顶，防历史拉取失败时骨架永停）。 */
   capExpired: boolean;
+  /** 当前会话 canonical history 请求已失败：不再用骨架遮蔽错误重试面（OCV5-786）。 */
+  historyError?: boolean;
+  /** 当前会话 canonical history 已落定为空（成功返回 0 条实质消息或 404）：不再空等 capExpired。 */
+  settledEmpty?: boolean;
 }): boolean {
   if (!p.selected || p.gated) return false;
   if (p.cachedCount > 0) return false; // 有缓存消息 → 绝不骨架
   if (p.sending) return false; // 有 in-flight turn → 走 typing 指示
   if (p.loading) return true; // 真请求仍在途时固定 cap 不得伪装成 EmptyState
+  if (p.historyError) return false; // 失败立即让位给错误态 + 重试按钮，不白卡 8s 骨架
+  if (p.settledEmpty) return false; // 已落定为空，不再白等 8s cap
   if (p.knownMessageCount > 0) return !p.capExpired; // 确知有历史 → 骨架至到达/兜底
   if (p.metaKnown) return false; // 权威已知为空会话 → 直接 EmptyState
   return !p.graceExpired; // meta 未知（深链/列表未落定）→ 800ms 兜底窗
@@ -47,19 +53,21 @@ export function shouldShowHistorySkeleton(p: {
 /** 单条骨架气泡：左（助手正文）/右（用户）交替形态，不再留头像列。 */
 function SkeletonBubble({ side }: { side: "left" | "right" }) {
   if (side === "right") {
-    // 用户消息：右对齐，单块圆角气泡。
+    // 用户消息：右对齐，精致圆角气泡骨架。
     return (
       <div className="flex justify-end">
-        <Skeleton className="h-10 w-1/2 max-w-[280px] rounded-2xl" />
+        <div className="w-1/2 max-w-[280px] rounded-2xl rounded-br-sm border border-border/60 bg-bubble/65 px-4 py-3">
+          <Skeleton className="h-3.5 w-4/5 rounded-md" />
+        </div>
       </div>
     );
   }
   return (
-    <div className="min-w-0">
-      <div className="min-w-0 space-y-2">
-        <Skeleton className="h-4 w-4/5" />
-        <Skeleton className="h-4 w-full" />
-        <Skeleton className="h-4 w-2/3" />
+    <div className="min-w-0 py-1">
+      <div className="min-w-0 space-y-2.5">
+        <Skeleton className="h-3.5 w-4/5 rounded-md" />
+        <Skeleton className="h-3.5 w-full rounded-md" />
+        <Skeleton className="h-3.5 w-2/3 rounded-md" />
       </div>
     </div>
   );
@@ -69,57 +77,44 @@ function SkeletonBubble({ side }: { side: "left" | "right" }) {
  * 消息区加载骨架：2~3 条左右交替气泡，容器几何对齐 MessageList
  * （mx-auto max-w-3xl px-5 py-8 gap-4），历史到达时替换为真列表无跳动。
  */
-export function MessageListSkeleton() {
+export function MessageListSkeleton({
+  slow = false,
+  onRetry,
+}: {
+  /** 冷加载超过慢网阈值时在骨架下方浮出轻量重试动作条（OCV5-786）。 */
+  slow?: boolean;
+  onRetry?: () => void;
+} = {}) {
   return (
     <div
-      className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8"
+      className="mx-auto flex max-w-3xl flex-col gap-5 px-5 py-8"
       aria-busy="true"
       aria-label="正在加载会话历史"
     >
       <SkeletonBubble side="right" />
       <SkeletonBubble side="left" />
       <SkeletonBubble side="right" />
+      {slow && onRetry && (
+        <output
+          data-testid="history-skeleton-slow-retry"
+          className="oc-surface-glass mt-2 flex items-center justify-between gap-3 rounded-xl px-4 py-2.5 text-caption text-muted animate-in"
+          aria-live="polite"
+        >
+          <span>加载较慢，网络可能存在波动</span>
+          <button
+            type="button"
+            onClick={onRetry}
+            className="oc-btn-tactile oc-btn-secondary-craft shrink-0 rounded-full border border-border bg-surface px-3 py-1 font-medium text-fg transition-colors hover:border-border-strong hover:text-accent [@media(hover:none)]:min-h-11"
+          >
+            重试
+          </button>
+        </output>
+      )}
     </div>
   );
 }
 
-/** 已有部分真实消息时的轻量尾部占位：不遮内容，只说明剩余内容仍在加载。 */
+/** 已有部分真实消息时的后台同步静默合并：不在消息尾部闪烁假回复骨架，避免打断阅读。 */
 export function PartialHistorySkeleton() {
-  return (
-    <output
-      className="py-1 text-muted"
-      aria-label="正在加载会话内容"
-      aria-live="polite"
-      aria-busy="true"
-      data-testid="partial-history-skeleton"
-    >
-      <div className="min-w-0 flex-1 space-y-2">
-        <span className="block text-xs">正在加载会话内容…</span>
-        <Skeleton className="h-4 w-4/5" />
-        <Skeleton className="h-4 w-2/3" />
-      </div>
-    </output>
-  );
-}
-
-/** Journal hydrate hit a page/time cap. Do not cover history; offer retry. */
-export function JournalHydrationRetry({ onRetry }: { onRetry: () => void }) {
-  return (
-    <output
-      className="flex items-center justify-between gap-3 py-2 text-muted"
-      aria-label="实时内容未完全加载"
-      data-testid="journal-hydration-retry"
-    >
-      <span className="min-w-0 text-xs">实时内容未完全加载，已显示已有记录。</span>
-      {/* text-foreground 不是本仓 token(会回落到父级 text-muted,与说明文字同色):改 text-fg +
-          常显下划线,让动作按钮看得出是可点的;触屏下加高到 44px。 */}
-      <button
-        type="button"
-        className="shrink-0 text-xs font-medium text-fg underline underline-offset-2 hover:text-accent [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-2"
-        onClick={onRetry}
-      >
-        继续
-      </button>
-    </output>
-  );
+  return null;
 }

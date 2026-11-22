@@ -30,6 +30,20 @@ describe('bridge API allowlist', () => {
       matchCommercialContainerApiProxy('/api/agents/main/persona', 'PUT')?.label,
       '/api/agents/:id/persona',
     )
+    // Live cloud browser visualization & human takeover (OCV5-813).
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/agents/main/browser/live', 'GET')?.label,
+      '/api/agents/:id/browser/live',
+    )
+    assert.equal(matchCommercialContainerApiProxy('/api/agents/main/browser/live', 'POST'), null)
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/agents/main/browser/action', 'POST')?.label,
+      '/api/agents/:id/browser/action',
+    )
+    assert.equal(matchCommercialContainerApiProxy('/api/agents/main/browser/action', 'GET'), null)
+    assert.equal(matchCommercialContainerApiProxy('/api/agents/main/browser/action', 'DELETE'), null)
+    assert.equal(matchCommercialContainerApiProxy('/api/agents/main/browser/action/extra', 'POST'), null)
+    assert.equal(matchCommercialContainerApiProxy('/api/agents/main./browser/live', 'GET'), null)
     assert.equal(
       matchCommercialContainerApiProxy('/api/agents/main/memory/user', 'GET')?.label,
       '/api/agents/:id/memory/:target',

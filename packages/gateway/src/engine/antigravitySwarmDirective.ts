@@ -1,0 +1,241 @@
+/**
+ * Antigravity per-turn Swarm directive & historical-swarm detection (OCV5-842).
+ *
+ * Keeps `inboundDispatch.ts` concise and directly unit-testable for both:
+ *   1. Swarm ON (`swarmMode: true` toggle or `/swarm` slash command)
+ *   2. Swarm OFF follow-up on a session that previously created a swarm
+ *      (injects an explicit suppression directive so resumed coordinators do
+ *      not keep waking historical workers from earlier turns).
+ */
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { parseSwarmSlashCommand } from '@openclaude/protocol'
+import { antigravityRoot, antigravitySessionBrainDir } from './antigravityPlatform.js'
+import { remoteSwarmLocationForSession } from '../remoteSwarmRuntime.js'
+
+const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const MAX_MEMBERS_JSON_BYTES = 512 * 1024
+const MAX_LIVE_MONITORS_REPORTED = 16
+/** Strict allowlist for native built-in auxiliary worker names (`monitor` / `narrator`) safe to interpolate into prompts. */
+const STRICT_NATIVE_AUX_NAME_RE = /^(?:monitor|narrator)(?:-\d{1,4})?$/i
+
+function isSafeLegacyAuxiliaryName(name: string): boolean {
+  const trimmed = name.trim()
+  return trimmed.length > 0 && trimmed.length <= 20 && STRICT_NATIVE_AUX_NAME_RE.test(trimmed)
+}
+
+export const ANTIGRAVITY_SWARM_OFF_MARKER = '[OpenClaude 蜂群模式已关闭]'
+
+export const ANTIGRAVITY_SWARM_OFF_DIRECTIVE = [
+  ANTIGRAVITY_SWARM_OFF_MARKER,
+  '用户已在界面关闭本轮蜂群开关。请以单 Agent 模式直接回复并完成本轮任务，禁止调用 `swarm`、`post_message`、`read_board`、`swarm_wait` 工具，也不要唤醒、检查或复用此前的蜂群成员（除非用户在本轮消息中明确要求使用蜂群或 `/swarm`）。',
+  '',
+].join('\n')
+
+function resolveRegularFileNoSymlink(
+  rootDir: string,
+  segments: readonly string[],
+): { fullPath: string; dev: number; ino: number } | null {
+  try {
+    const rootStat = lstatSync(rootDir)
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) return null
+    let cur = rootDir
+    for (let i = 0; i < segments.length - 1; i += 1) {
+      cur = join(cur, segments[i]!)
+      const st = lstatSync(cur)
+      if (st.isSymbolicLink() || !st.isDirectory()) return null
+    }
+    const leaf = join(cur, segments[segments.length - 1]!)
+    const leafStat = lstatSync(leaf)
+    if (leafStat.isSymbolicLink() || !leafStat.isFile()) return null
+    return { fullPath: leaf, dev: leafStat.dev, ino: leafStat.ino }
+  } catch {
+    return null
+  }
+}
+
+function isRegularFileNoSymlink(rootDir: string, segments: readonly string[]): boolean {
+  return resolveRegularFileNoSymlink(rootDir, segments) !== null
+}
+
+function readBoundedRegularJsonNoSymlink(
+  rootDir: string,
+  segments: readonly string[],
+): Record<string, unknown> | null {
+  const resolved = resolveRegularFileNoSymlink(rootDir, segments)
+  if (!resolved) return null
+  let fd: number | null = null
+  try {
+    const flags =
+      fsConstants.O_RDONLY |
+      (typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0)
+    fd = openSync(resolved.fullPath, flags)
+    const st = fstatSync(fd)
+    if (!st.isFile() || st.dev !== resolved.dev || st.ino !== resolved.ino) return null
+    if (st.size <= 0 || st.size > MAX_MEMBERS_JSON_BYTES) return null
+    const parsed = JSON.parse(readFileSync(fd, 'utf8')) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    return parsed as Record<string, unknown>
+  } catch {
+    return null
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd) } catch { /* ignore */ }
+    }
+  }
+}
+
+/**
+ * List any live (non-killed) built-in `monitor` / `monitor-N` workers lingering
+ * in an existing swarm roster so the coordinator can reclaim them instead of
+ * letting their 3-minute cron burn tokens (OCV5-848).
+ */
+export function listLiveAntigravitySwarmMonitors(opts: {
+  sessionKey: string
+  isRemote: boolean
+  conversationId?: string
+  antigravityRootDir?: string
+  remoteSwarmRootBase?: string
+}): string[] {
+  let roster: Record<string, unknown> | null = null
+  if (opts.isRemote) {
+    const loc = remoteSwarmLocationForSession(opts.sessionKey, opts.remoteSwarmRootBase)
+    roster = readBoundedRegularJsonNoSymlink(loc.brainDir, [
+      loc.swarmId,
+      '.system_generated',
+      'swarm',
+      'members.json',
+    ])
+  } else {
+    const convId = opts.conversationId?.trim()
+    if (!convId || !CONVERSATION_ID_RE.test(convId)) return []
+    const brainDir = antigravitySessionBrainDir(opts.antigravityRootDir ?? antigravityRoot(), opts.sessionKey)
+    roster = readBoundedRegularJsonNoSymlink(brainDir, [
+      convId,
+      '.system_generated',
+      'swarm',
+      'members.json',
+    ])
+  }
+  const members = roster?.members
+  if (!members || typeof members !== 'object' || Array.isArray(members)) return []
+  const live: string[] = []
+  for (const [name, raw] of Object.entries(members as Record<string, unknown>)) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+    const rec = raw as Record<string, unknown>
+    if (rec.killed === true) continue
+    // Only accept strictly validated built-in auxiliary names (`monitor` / `narrator` / `*-N`)
+    // so untrusted or corrupted roster keys can never inject arbitrary text into prompts.
+    if (isSafeLegacyAuxiliaryName(name)) {
+      live.push(name.trim())
+    }
+  }
+  return live.sort().slice(0, MAX_LIVE_MONITORS_REPORTED)
+}
+
+/**
+ * Returns true if this Antigravity session already has a persisted swarm roster
+ * (`members.json`) on disk for the active local conversation or remote session.
+ */
+export function hasHistoricalAntigravitySwarm(opts: {
+  sessionKey: string
+  isRemote: boolean
+  conversationId?: string
+  antigravityRootDir?: string
+  remoteSwarmRootBase?: string
+}): boolean {
+  if (opts.isRemote) {
+    const loc = remoteSwarmLocationForSession(opts.sessionKey, opts.remoteSwarmRootBase)
+    return isRegularFileNoSymlink(loc.brainDir, [loc.swarmId, '.system_generated', 'swarm', 'members.json'])
+  }
+  const convId = opts.conversationId?.trim()
+  if (!convId || !CONVERSATION_ID_RE.test(convId)) return false
+  const brainDir = antigravitySessionBrainDir(opts.antigravityRootDir ?? antigravityRoot(), opts.sessionKey)
+  return isRegularFileNoSymlink(brainDir, [convId, '.system_generated', 'swarm', 'members.json'])
+}
+
+export interface AntigravitySwarmTurnDirectiveResult {
+  readonly text: string
+  readonly mode: 'on' | 'off_with_history' | 'none'
+  readonly viaSlash: boolean
+  readonly viaToggle: boolean
+}
+
+export function applyAntigravitySwarmTurnDirective(opts: {
+  finalText: string
+  rawUserText: string
+  isAntigravityTurn: boolean
+  isRemoteAntigravity: boolean
+  swarmMode: boolean
+  hasHistoricalSwarm: boolean
+  liveMonitorNames?: readonly string[]
+}): AntigravitySwarmTurnDirectiveResult {
+  const slashSwarm = parseSwarmSlashCommand(opts.rawUserText)
+  const viaSlash = Boolean(slashSwarm?.matched)
+  const viaToggle = opts.swarmMode
+  const swarmRequested = viaToggle || viaSlash
+
+  if (!opts.isAntigravityTurn) {
+    return { text: opts.finalText, mode: 'none', viaSlash, viaToggle }
+  }
+
+  if (swarmRequested) {
+    let nextText = opts.finalText
+    if (viaSlash && opts.rawUserText && nextText.endsWith(opts.rawUserText)) {
+      const prefixPart = nextText.slice(0, nextText.length - opts.rawUserText.length)
+      const taskBody =
+        slashSwarm?.task ||
+        '请先了解当前工作区与上下文，并告知我可以如何拆分为并行蜂群任务。'
+      nextText = `${prefixPart}${taskBody}`
+    }
+    const swarmToolsIntro = opts.isRemoteAntigravity
+      ? '用户已显式开启远端 Antigravity 蜂群（Swarm）模式（由容器侧蜂群运行时驱动，通过 `swarm`、`post_message`、`read_board`、`swarm_wait` 四个 MCP 工具编排并行成员，每个成员同样运行在远端 Gemini 并拥有完整的本地工作区工具与 Git Worktree 隔离）。请按以下规则作为 Coordinator 编排蜂群：'
+      : '用户已显式开启 Antigravity 原生蜂群（Swarm）模式。请按以下规则作为 Coordinator 编排蜂群：'
+    const liveMonitors = (opts.liveMonitorNames ?? [])
+      .map((n) => n.trim())
+      .filter((n) => isSafeLegacyAuxiliaryName(n))
+      .slice(0, MAX_LIVE_MONITORS_REPORTED)
+    const legacyMonitorCleanupLine =
+      liveMonitors.length > 0
+        ? `   - 检测到历史蜂群仍有残留原生辅助成员（${liveMonitors.map((n) => `\`${n}\``).join('、')}），请优先调用 \`swarm{action:"kill", name:"..."}\` 将其回收，避免后台定时空转消耗上下文。`
+        : null
+    const swarmDirective = opts.hasHistoricalSwarm
+      ? [
+          '[OpenClaude Antigravity 蜂群模式已激活]',
+          '续聊蜂群规则（精简提醒）：同任务可复用既有蜂群，切换无关新任务前先确认改动已合入并 `swarm{action:"kill"}` 清理旧 worker；招募成员不传 `model`，**严禁招募 `monitor` / `monitor-N` 与 `narrator` / `narrator-N`**；收口前先 `kill` 已完工且不再需要的 worker，再发不带 `@all` 的 `[done] <总结>`（**严禁 `@all [done]`**），切勿输出本地 `open_board` 链接。',
+          ...(legacyMonitorCleanupLine ? [legacyMonitorCleanupLine] : []),
+          '',
+        ].join('\n')
+      : [
+          '[OpenClaude Antigravity 蜂群模式已激活]',
+          swarmToolsIntro,
+          opts.isRemoteAntigravity
+            ? '1. 若任务可拆分为 2 个及以上可并行推进的独立子方向（或需要独立校验者 review），先用 `swarm{action:"title", title:"..."}` 命名蜂群，再用 `swarm{action:"add", name:"...", brief:"..."}` 招募精简、职责不重叠的成员（必要时配备 `verifier` 校验者；**严禁招募 `monitor` / `monitor-N` 与 `narrator` / `narrator-N`**，OpenClaude 网关已内置零推理停滞检测与网页端实时 SwarmBoard 渲染），随后调用 `swarm_wait{since:...}` 等待成员汇报并用 `read_board` 审阅结果。'
+            : '1. 若任务可拆分为 2 个及以上可并行推进的独立子方向（或需要独立校验者 review），请立即读取内置 `swarm` skill，先用 `swarm{action:"title", title:"..."}` 命名蜂群，再用 `swarm{action:"add", name:"...", brief:"..."}` 招募精简、职责不重叠的成员（必要时配备 `verifier` 校验者）。**忽略内置 skill 中添加 `monitor`/`swarm_monitor` 与 `narrator`/`swarm_narrator` 的步骤，严禁招募 `monitor` / `monitor-N` 与 `narrator` / `narrator-N` 成员**（OpenClaude 网关已接管零推理停滞检测与网页端 SwarmBoard 实时渲染）。',
+          ...(legacyMonitorCleanupLine ? [legacyMonitorCleanupLine] : []),
+          '2. 招募成员时**不要指定 `model` 参数**（留空以继承当前会话模型，确保计费与权限一致）。',
+          '3. **生命周期边界（仅限本轮蜂群开启时）**：同任务续聊可复用既有蜂群；若切换到全新无关任务，确认旧成员无未合入改动后再 `swarm{action:"kill"}` 回收旧 worker（或开独立频道隔离）并更新 `title`。后续若关闭蜂群开关，不得再自动复用旧蜂群。',
+          '4. **Git 仓库并行写手与防丢合入**：多写手并行改码默认传 `workspace:"share"`（独立 worktree 隔离）并在 `brief` 中划分清晰文件所有权（只读调研/校验成员保留默认 `inherit`）；收尾前必须检查并合入所有 `share`/`branch` 改动到主工作区再 `kill`。',
+          '5. OpenClaude 网页端会实时原生渲染蜂群看板，**切勿**在回复中输出本地 `open_board` 链接或终端 `/swarm board` 命令。',
+          '6. 所有成员收口后，先调用 `swarm{action:"kill"}` 清理已完工且不再需要的 worker（避免残留空挂），再在讨论板发一行不带 `@all` 的 `[done] <总结>`（**严禁使用 `@all [done]`**，避免无谓唤醒休眠成员），最后向用户交付清晰、完整的最终汇总（含各独立 worktree 的合入确认结果）。',
+          '',
+        ].join('\n')
+    return {
+      text: `${swarmDirective}\n${nextText}`,
+      mode: 'on',
+      viaSlash,
+      viaToggle,
+    }
+  }
+
+  if (opts.hasHistoricalSwarm) {
+    return {
+      text: `${ANTIGRAVITY_SWARM_OFF_DIRECTIVE}\n${opts.finalText}`,
+      mode: 'off_with_history',
+      viaSlash,
+      viaToggle,
+    }
+  }
+
+  return { text: opts.finalText, mode: 'none', viaSlash, viaToggle }
+}

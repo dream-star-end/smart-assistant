@@ -1,4 +1,4 @@
-import { Bot, Bug, FlaskConical, Sparkles, UserCheck, Wrench } from 'lucide-react'
+import { Bug, FlaskConical, Sparkles, UserCheck, Wrench } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import type { DragEvent, ReactNode } from 'react'
 import {
@@ -14,7 +14,8 @@ import {
   latestRunHint,
 } from '../../lib/taskboard'
 import { cn } from '../../lib/utils'
-import { Badge, Card, TimeAgo } from '../ui'
+import { Badge, Card, StatusPill, TimeAgo } from '../ui'
+import { AtelierIcon } from '../ui/AtelierIcons'
 
 const TYPE_ICON: Record<TicketType, LucideIcon> = {
   bug: Bug,
@@ -30,12 +31,23 @@ const TYPE_ICON_CLASS: Record<TicketType, string> = {
   chore: 'text-faint',
 }
 
+const TYPE_BADGE_CLASS: Record<TicketType, string> = {
+  bug: 'oc-icon-badge oc-icon-badge-danger',
+  feature: 'oc-icon-badge oc-icon-badge-info',
+  spike: 'oc-icon-badge oc-icon-badge-accent',
+  chore: 'oc-icon-badge',
+}
+
 export function ticketTypeIcon(type: TicketType): LucideIcon {
   return TYPE_ICON[type]
 }
 
 export function ticketTypeIconClass(type: TicketType): string {
   return TYPE_ICON_CLASS[type]
+}
+
+export function ticketTypeBadgeClass(type: TicketType): string {
+  return TYPE_BADGE_CLASS[type]
 }
 
 export function ticketPriorityTone(priority: TicketPriority) {
@@ -90,7 +102,7 @@ export function TicketCard({
   const showStatus = !hideStatus || ticket.status === 'blocked'
   const titleClass = cn(ticket.status === 'canceled' && 'line-through')
   const title = (
-    <p className="mt-0.5 line-clamp-2 break-words text-body font-medium text-fg">
+    <p className="mt-1 line-clamp-2 break-words text-body font-medium leading-snug text-fg">
       {onOpen ? (
         <button
           type="button"
@@ -98,7 +110,7 @@ export function TicketCard({
           data-drag-through="true"
           title={ticket.title}
           className={cn(
-            'text-left outline-none hover:underline focus-visible:rounded-sm focus-visible:ring-2 focus-visible:ring-ring',
+            'text-left outline-none transition-colors hover:text-accent focus-visible:rounded-sm focus-visible:ring-2 focus-visible:ring-ring',
             titleClass,
           )}
           onClick={(e) => {
@@ -117,10 +129,15 @@ export function TicketCard({
   )
   const people =
     agent || approver ? (
-      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-caption text-muted">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1 text-caption text-muted">
         {agent && (
-          <span data-testid="ticket-assignee" className="inline-flex min-w-0 items-center gap-1">
-            <Bot size={12} className="shrink-0 text-faint" aria-hidden />
+          <span data-testid="ticket-assignee" className="inline-flex min-w-0 items-center gap-1.5">
+            <span
+              className="oc-avatar-ring inline-flex size-4 shrink-0 items-center justify-center rounded-full bg-accent-soft text-accent"
+              aria-hidden
+            >
+              <AtelierIcon name="agent" size={11} />
+            </span>
             <span className="sr-only">{'执行者 '}</span>
             <span className="truncate" title={agent}>
               {agent}
@@ -128,8 +145,13 @@ export function TicketCard({
           </span>
         )}
         {approver && (
-          <span data-testid="ticket-approver" className="inline-flex min-w-0 items-center gap-1">
-            <UserCheck size={12} className="shrink-0 text-faint" aria-hidden />
+          <span data-testid="ticket-approver" className="inline-flex min-w-0 items-center gap-1.5">
+            <span
+              className="oc-avatar-ring inline-flex size-4 shrink-0 items-center justify-center rounded-full bg-hover text-muted"
+              aria-hidden
+            >
+              <UserCheck size={10} />
+            </span>
             <span className="sr-only">{'批准人 '}</span>
             <span className="truncate" title={approver}>
               {approver}
@@ -154,8 +176,8 @@ export function TicketCard({
       padding="sm"
       interactive={!!onOpen}
       className={cn(
-        'relative flex flex-col',
-        compact ? 'gap-1.5 p-2' : 'gap-2',
+        'relative flex flex-col overflow-hidden',
+        compact ? 'gap-2 p-2.5' : 'gap-2.5 p-3.5',
         (ticket.status === 'canceled' || ticket.status === 'done') && 'opacity-60',
         draggable && 'cursor-grab active:cursor-grabbing',
         dragging && 'opacity-50',
@@ -167,18 +189,18 @@ export function TicketCard({
     >
       {ticket.status === 'blocked' && (
         <span
-          className="absolute right-0 top-0 rounded-bl-md rounded-tr-xl bg-danger px-1.5 py-0.5 text-caption font-medium text-danger-fg"
+          className="absolute right-0 top-0 rounded-bl-lg rounded-tr-xl bg-danger px-2 py-0.5 text-caption font-medium text-danger-fg"
           title={ticket.blockedReason || TICKET_STATUS_LABEL.blocked}
         >
           受阻
         </span>
       )}
-      <div className="flex items-start gap-2">
+      <div className="flex items-start gap-2.5">
         <span
           className={cn(
-            'mt-0.5 flex shrink-0 items-center justify-center rounded-lg bg-hover',
+            'mt-0.5 rounded-lg',
             compact ? 'size-6' : 'size-7',
-            TYPE_ICON_CLASS[ticket.type],
+            TYPE_BADGE_CLASS[ticket.type] ?? 'oc-icon-badge',
           )}
           title={TICKET_TYPE_LABEL[ticket.type]}
           aria-hidden
@@ -187,24 +209,23 @@ export function TicketCard({
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5">
-            <span className="font-mono text-caption text-faint">{ticket.identifier}</span>
+            <span className="inline-flex items-center rounded-md bg-hover px-1.5 py-0.5 font-mono text-caption font-medium tracking-tight text-muted tabular-nums">
+              {ticket.identifier}
+            </span>
             {/* 紧凑态没有类型徽章,类型只靠图标表达 —— 给读屏补一份文字;卡片态由徽章承载,不重复。 */}
             {compact && <span className="sr-only">{TICKET_TYPE_LABEL[ticket.type]}</span>}
             {runHint === 'running' && (
-              <span
-                className="size-1.5 shrink-0 animate-pulse rounded-full bg-accent"
-                title="执行中"
-              />
+              <StatusPill status="running" variant="dot" size="sm" label="执行中" />
             )}
             {runHint === 'failed' && (
-              <span className="size-1.5 shrink-0 rounded-full bg-danger" title="最近执行失败" />
+              <StatusPill status="failed" variant="dot" size="sm" label="最近执行失败" />
             )}
           </div>
           {title}
         </div>
       </div>
       {compact ? (
-        <div className="flex min-w-0 items-center gap-1.5">
+        <div className="flex min-w-0 items-center gap-1.5 border-t border-border/60 pt-2">
           <Badge tone={TICKET_PRIORITY_TONE[ticket.priority]} size="sm" className="shrink-0">
             {ticket.priority}
           </Badge>
@@ -237,12 +258,12 @@ export function TicketCard({
           </div>
           {people}
           {(showUpdatedAt || actionSlot) && (
-            <div className="flex min-w-0 items-center justify-between gap-1.5">
+            <div className="flex min-w-0 items-center justify-between gap-1.5 border-t border-border/60 pt-2">
               {showUpdatedAt ? (
                 <TimeAgo
                   value={ticket.updatedAt}
                   format="short"
-                  className="shrink-0 text-caption text-faint"
+                  className="shrink-0 text-caption tabular-nums text-faint"
                 />
               ) : (
                 <span />

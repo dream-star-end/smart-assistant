@@ -162,16 +162,17 @@ describe("PinnedTaskTracker 交互", () => {
     expect(screen.queryByText("任务一")).toBeNull();
   });
 
-  test("任务 HUD 用紧凑数字实时替换 token 快照", () => {
+  test("任务 HUD 隐藏裸 token 计数，不向用户暴露 tok 数字", () => {
     const view = render(
       <PinnedTaskTracker todos={TODOS} active tokenUsage={{ totalTokens: 64 }} />,
     );
-    expect(screen.getByText("64")).toBeInTheDocument();
+    expect(screen.getByText("任务列表 1/3")).toBeInTheDocument();
+    expect(screen.queryByText("64")).toBeNull();
+    expect(screen.queryByText(/tok/i)).toBeNull();
     view.rerender(
       <PinnedTaskTracker todos={TODOS} active tokenUsage={{ totalTokens: 96 }} />,
     );
-    expect(screen.getByText("96")).toBeInTheDocument();
-    expect(screen.queryByText("64")).not.toBeInTheDocument();
+    expect(screen.queryByText("96")).toBeNull();
   });
 
   test("空任务 → 不渲染", () => {

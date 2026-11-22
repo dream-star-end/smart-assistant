@@ -58,36 +58,36 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
   const tokenUsage = delegateTokenUsage(msg);
 
   return (
-    <div className="overflow-hidden rounded-lg border border-border/70 bg-bg">
+    <div className="oc-surface-card overflow-hidden rounded-xl">
       <button
         type="button"
         onClick={() => setUserOpen(!open)}
-        className="flex w-full items-center gap-2.5 px-3 py-2 text-left hover:bg-hover"
+        className="flex w-full items-center gap-2.5 px-3 py-2 text-left transition-colors hover:bg-hover/70"
       >
         <span
           className={cn(
-            "flex size-5 shrink-0 items-center justify-center rounded-md",
+            "oc-icon-badge flex size-6 shrink-0 items-center justify-center rounded-sm",
             running
-              ? "bg-accent-soft text-accent"
+              ? "oc-icon-badge-accent"
               : status.tone === "warning"
-                ? "bg-warning-soft text-warning"
+                ? "oc-icon-badge-warning"
                 : status.tone === "danger"
-                  ? "bg-danger-soft text-danger"
-                  : "bg-success-soft text-success",
+                  ? "oc-icon-badge-danger"
+                  : "oc-icon-badge-success",
           )}
         >
           {running ? (
             <Spinner size={11} />
           ) : status.tone === "warning" ? (
-            <Clock size={11} />
+            <Clock size={11} strokeWidth={1.85} />
           ) : status.tone === "danger" ? (
-            <X size={11} />
+            <X size={11} strokeWidth={2} />
           ) : (
-            <Check size={11} />
+            <Check size={11} strokeWidth={2} />
           )}
         </span>
         <span className="min-w-0 flex-1">
-          <span className="block truncate text-meta font-medium text-fg">{name}</span>
+          <span className="block truncate text-meta font-semibold text-fg">{name}</span>
           {goal && <span className="block truncate text-caption text-faint">{goal}</span>}
         </span>
         <span className="flex max-w-[55%] flex-wrap items-center justify-end gap-x-2 gap-y-1">
@@ -103,8 +103,12 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
           )}
           {verdict && <Badge tone={verdict.tone}>{verdict.label}</Badge>}
           <TokenUsageBadge usage={tokenUsage} label="子 Agent" />
-          {cost && <span className="text-caption font-medium text-faint">{groupDigits(cost)} 积分</span>}
-          <ChevronRight size={14} className={cn("text-faint transition-transform", open && "rotate-90")} />
+          {cost && <span className="font-mono text-caption font-medium tabular-nums text-faint">{groupDigits(cost)} 积分</span>}
+          <ChevronRight
+            size={14}
+            strokeWidth={1.75}
+            className={cn("text-faint transition-transform duration-200 ease-[var(--ease-spring)]", open && "rotate-90")}
+          />
         </span>
       </button>
 
@@ -121,7 +125,7 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
               {typeof msg._resultPreview === "string" && msg._resultPreview && (
                 <ProgressivePlainText
                   text={msg._resultPreview}
-                  className="text-[12px] leading-relaxed text-muted"
+                  className="text-meta leading-relaxed text-muted"
                 />
               )}
             </div>
@@ -131,8 +135,8 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
       )}
 
       {!open && !running && typeof msg._resultPreview === "string" && msg._resultPreview && (
-        <div className="flex items-start gap-1.5 border-t border-border/70 px-3 py-1.5 text-meta text-muted">
-          <Check size={12} className="mt-0.5 shrink-0 text-success" />
+        <div className="flex items-start gap-1.5 border-t border-border/70 bg-bg/35 px-3 py-1.5 text-meta text-muted">
+          <Check size={12} strokeWidth={2} className="mt-0.5 shrink-0 text-success" />
           <span className="line-clamp-1">
             {msg._resultPreview.slice(0, 500)}{msg._resultPreview.length > 500 ? "…" : ""}
           </span>
@@ -176,21 +180,21 @@ export const TeamPanel = memo(
     const collapsed = userCollapsed ?? (allDone && !everActive);
 
     return (
-      <div className="rounded-xl border border-border bg-surface animate-in" data-testid="team-panel">
+      <div className="oc-surface-card overflow-hidden rounded-2xl animate-in" data-testid="team-panel">
         <button
           type="button"
           onClick={() => setUserCollapsed(!collapsed)}
-          className="flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left hover:bg-hover"
+          className="flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left transition-colors hover:bg-hover/70"
         >
-          <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-grad-cta text-white">
-            <Users size={13} />
+          <span className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-grad-cta text-white shadow-soft">
+            <Users size={14} strokeWidth={1.85} />
           </span>
-          <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">
+          <span className="min-w-0 flex-1 truncate text-body font-semibold text-fg">
             团队协作 · {total} 个智能体
           </span>
-          <span className="flex max-w-[55%] flex-wrap items-center justify-end gap-x-2 gap-y-1 text-caption">
+          <span className="flex max-w-[55%] flex-wrap items-center justify-end gap-x-2 gap-y-1 text-caption tabular-nums">
             {running > 0 && (
-              <span className="flex items-center gap-1 text-accent">
+              <span className="flex items-center gap-1 font-medium text-accent">
                 <Spinner size={10} /> {running} 运行中
               </span>
             )}
@@ -198,12 +202,16 @@ export const TeamPanel = memo(
             {failed > 0 && <span className="text-danger">✕ {failed} 失败</span>}
             {timedOut > 0 && <span className="text-warning">⏱ {timedOut} 超时</span>}
             <TokenUsageBadge usage={teamTokenUsage} label="合计" />
-            <ChevronRight size={15} className={cn("text-faint transition-transform", !collapsed && "rotate-90")} />
+            <ChevronRight
+              size={15}
+              strokeWidth={1.75}
+              className={cn("text-faint transition-transform duration-200 ease-[var(--ease-spring)]", !collapsed && "rotate-90")}
+            />
           </span>
         </button>
 
         {!collapsed && (
-          <div className="space-y-2 border-t border-border px-3 py-2.5">
+          <div className="oc-surface-recessed space-y-2 border-t border-border/70 px-3 py-2.5">
             {members.map((m, i) => (
               <TeamMemberRow key={m.id} msg={m} idx={i} cost={delegateCosts?.[m._delegateAgentId ?? ""]} />
             ))}

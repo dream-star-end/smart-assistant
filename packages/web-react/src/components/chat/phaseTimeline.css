@@ -1,0 +1,298 @@
+/* Codex 极简活动流与阶段微标签样式，仅消费 design system --* tokens。 */
+
+/* 无框透明画布 + 左侧 1.5px 柔和渐变导引线（与顶部状态图标中心垂直对齐）。 */
+.oc-codex-rail::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.25rem;
+  bottom: 0.25rem;
+  width: 1.5px;
+  border-radius: 9999px;
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--border-strong) 70%, transparent),
+    color-mix(in srgb, var(--border) 58%, transparent) 85%,
+    transparent
+  );
+  pointer-events: none;
+}
+
+/* 助手中间旁白（commentary）自然呼吸呈现，无额外圆点与硬框。 */
+.oc-codex-commentary {
+  padding: 0.375rem 0;
+  color: var(--muted);
+}
+
+/* 运行中步骤的 14px 柔和线性微图标呼吸提示。 */
+.oc-codex-icon-live {
+  color: var(--accent);
+  animation: oc-phase-dot-pulse 2s ease-in-out infinite;
+}
+
+.oc-phase-strip {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0.125rem;
+  padding: 0 1.25rem 0.125rem 1.75rem;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  -webkit-mask-image: linear-gradient(to right, black 0%, black calc(100% - 28px), transparent 100%);
+  mask-image: linear-gradient(to right, black 0%, black calc(100% - 28px), transparent 100%);
+}
+
+.oc-phase-strip::-webkit-scrollbar {
+  display: none;
+}
+
+@media (max-width: 639px) {
+  .oc-phase-strip {
+    padding-left: 1.5rem;
+  }
+}
+
+.oc-phase-crumb {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 0.25rem;
+  height: 1.375rem;
+  padding: 0 0.375rem;
+  border-radius: 0.375rem;
+  border: 0;
+  background: transparent;
+  color: var(--faint);
+  font-size: var(--text-caption);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  font-weight: 450;
+  white-space: nowrap;
+  cursor: pointer;
+  outline: none;
+  transition:
+    background-color 150ms var(--ease-standard),
+    color 150ms var(--ease-standard);
+}
+
+.oc-phase-crumb:hover {
+  background: color-mix(in srgb, var(--hover) 75%, transparent);
+  color: var(--fg);
+}
+
+.oc-phase-crumb:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
+/* 语义分离：运行中仅加权文字+左侧 6px 呼吸点；选中筛选态才使用暖陶土微底。 */
+.oc-phase-crumb[data-phase-active="true"] {
+  color: var(--fg);
+  font-weight: 500;
+}
+
+.oc-phase-crumb[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--accent-soft) 80%, transparent);
+  color: var(--accent);
+  font-weight: 550;
+}
+
+/* Codex 风格无框微标签项（24px 紧凑高度，平时纯文字零视觉负担）。 */
+.oc-phase-pill {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 0.25rem;
+  height: 1.5rem;
+  padding: 0 0.5rem;
+  border-radius: 0.375rem;
+  border: 0;
+  background: transparent;
+  color: var(--faint);
+  font-size: var(--text-caption);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  font-weight: 450;
+  white-space: nowrap;
+  cursor: pointer;
+  outline: none;
+  transition:
+    background-color 150ms var(--ease-standard),
+    color 150ms var(--ease-standard);
+}
+
+.oc-phase-pill:hover {
+  background: color-mix(in srgb, var(--hover) 72%, transparent);
+  color: var(--fg);
+}
+
+.oc-phase-pill:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
+/* 运行中但未被单选过滤的阶段：保持透明无底，仅靠左侧 6px 呼吸点 + 轻度文字加权区分「谁在跑」。 */
+.oc-phase-pill[data-phase-active="true"] {
+  background: transparent;
+  color: var(--fg);
+  font-weight: 500;
+}
+
+/* 用户当前选中的筛选 Tab：柔和暖陶土微底，严格分离运行中态，杜绝双高亮。 */
+.oc-phase-pill[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--accent-soft) 80%, transparent);
+  color: var(--accent);
+  font-weight: 550;
+}
+
+.oc-phase-active-dot {
+  width: 6px;
+  height: 6px;
+  flex-shrink: 0;
+  border-radius: 9999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
+  animation: oc-phase-dot-pulse 2s ease-in-out infinite;
+}
+
+@keyframes oc-phase-dot-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.42;
+    transform: scale(0.84);
+  }
+}
+
+.oc-phase-pill-icon {
+  flex-shrink: 0;
+  opacity: 0.72;
+}
+
+.oc-phase-pill-count {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.78;
+}
+
+.oc-phase-pill-duration {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.65;
+  margin-left: 0.0625rem;
+}
+
+.oc-phase-connector {
+  flex-shrink: 0;
+  color: var(--faint);
+  opacity: 0.4;
+}
+
+.oc-phase-metric {
+  flex-shrink: 0;
+  margin-left: 0.25rem;
+  font-size: var(--text-caption);
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+/* 展开态极简无框微标签条，直接贴合在导引线顶部，无厚重边框与大胶囊堆砌。 */
+.oc-phase-filter-bar {
+  position: relative;
+  z-index: 1;
+  background: transparent;
+  margin: 0 0 0.25rem;
+  padding: 0 0 0.25rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 42%, transparent);
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.oc-phase-filter-pills {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0.125rem;
+  min-width: 0;
+  padding-right: 1.5rem;
+  overflow-x: auto;
+  scrollbar-width: none;
+  -webkit-mask-image: linear-gradient(to right, black 0%, black calc(100% - 28px), transparent 100%);
+  mask-image: linear-gradient(to right, black 0%, black calc(100% - 28px), transparent 100%);
+}
+
+.oc-phase-filter-pills::-webkit-scrollbar {
+  display: none;
+}
+
+.oc-phase-reset {
+  flex-shrink: 0;
+  height: 1.5rem;
+  padding: 0 0.375rem;
+  border-radius: 0.375rem;
+  border: 0;
+  background: transparent;
+  color: var(--faint);
+  font-size: var(--text-caption);
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  outline: none;
+  transition: background-color 150ms var(--ease-standard), color 150ms var(--ease-standard);
+}
+
+.oc-phase-reset:hover {
+  background: color-mix(in srgb, var(--hover) 72%, transparent);
+  color: var(--fg);
+}
+
+.oc-phase-reset:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
+.oc-phase-group-head {
+  position: relative;
+  z-index: 1;
+  background: transparent;
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  margin: 0 0 0.125rem;
+  padding: 0.125rem 0;
+  color: var(--muted);
+  font-size: var(--text-caption);
+  font-variant-numeric: tabular-nums;
+  line-height: var(--text-caption--line-height);
+  font-weight: 500;
+}
+
+/* 触屏保持舒适点按热区而不膨胀为厚重胶囊。 */
+@media (hover: none) {
+  .oc-phase-crumb,
+  .oc-phase-pill,
+  .oc-phase-reset {
+    min-height: 2rem;
+    padding: 0 0.5rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .oc-phase-crumb,
+  .oc-phase-pill,
+  .oc-phase-reset {
+    transition: none;
+  }
+
+  .oc-phase-active-dot,
+  .oc-codex-icon-live {
+    animation: none;
+  }
+}

@@ -7,10 +7,15 @@ import { test, type TestContext } from 'node:test'
 import Database from 'better-sqlite3'
 import protobuf from 'protobufjs'
 import {
+  ANTIGRAVITY_EXTRA_CLI_SHA256_ENV,
+  ANTIGRAVITY_NATIVE_CLI_1_5_8_SHA256,
   ANTIGRAVITY_NATIVE_CLI_SHA256,
+  ANTIGRAVITY_NATIVE_CLI_SHA256_ALLOWLIST,
   prepareAntigravityNativeTrajectory as prepare,
   recoverAntigravityNativeTrajectory as recover,
+  resolveAntigravityNativeCliSha256Allowlist,
   verifyAntigravityNativeBinary,
+  type AntigravityNativeDegradationEvent,
   type AntigravityNativeDependencies,
 } from '../engine/antigravityNativeTrajectory.js'
 import { antigravityNativeSchema } from '../engine/antigravityNativeSchema.js'
@@ -275,4 +280,83 @@ test('valid signed int32 remains accepted while an overflowing int32 is rejected
     Buffer.from(protobuf.Writer.create().uint32(5 << 3 | 2).bytes(overflow).finish())])
   db.prepare('UPDATE steps SET step_payload = ? WHERE idx = 1').run(payload); db.close()
   assert.deepEqual(await recover(binding, ID, ID), { ok: false, reason: 'native-read-failed' })
+})
+
+test('controlled SHA-256 allowlist merges built-in pinned hash and valid OC_ANTIGRAVITY_EXTRA_CLI_SHA256 entries while rejecting malformed tokens', async t => {
+  const f = await fixture(t)
+  const binary = f.input.cliPath
+  await writeFile(binary, 'upgraded-antigravity-cli-1.4.1')
+  const upgradedHash = hash('upgraded-antigravity-cli-1.4.1')
+  const secondHash = hash('upgraded-antigravity-cli-1.4.2')
+
+  assert.ok(ANTIGRAVITY_NATIVE_CLI_SHA256_ALLOWLIST.includes(ANTIGRAVITY_NATIVE_CLI_SHA256))
+
+  const resolved = resolveAntigravityNativeCliSha256Allowlist(`  ${upgradedHash.toUpperCase()}, not-a-sha256; ${secondHash}\nshort  `)
+  assert.equal(resolved.has(ANTIGRAVITY_NATIVE_CLI_SHA256), true)
+  assert.equal(resolved.has(upgradedHash), true)
+  assert.equal(resolved.has(secondHash), true)
+  assert.equal(resolved.has('not-a-sha256'), false)
+  assert.equal(resolved.size, ANTIGRAVITY_NATIVE_CLI_SHA256_ALLOWLIST.length + 2)
+
+  // Unrecognized binary fails closed and emits structured degradation event with actualSha256
+  const degraded: AntigravityNativeDegradationEvent[] = []
+  const prevEnv = process.env[ANTIGRAVITY_EXTRA_CLI_SHA256_ENV]
+  delete process.env[ANTIGRAVITY_EXTRA_CLI_SHA256_ENV]
+  t.after(() => {
+    if (prevEnv === undefined) delete process.env[ANTIGRAVITY_EXTRA_CLI_SHA256_ENV]
+    else process.env[ANTIGRAVITY_EXTRA_CLI_SHA256_ENV] = prevEnv
+  })
+  assert.equal(await verifyAntigravityNativeBinary(binary, ANTIGRAVITY_NATIVE_CLI_SHA256, {
+    onDegraded: (e) => degraded.push(e),
+  }), false)
+  assert.equal(degraded.length, 1)
+  assert.equal(degraded[0].stage, 'verify')
+  assert.equal(degraded[0].reason, 'binary-sha256-mismatch')
+  assert.equal(degraded[0].actualSha256, upgradedHash)
+  assert.equal(degraded[0].extraEnvConfigured, false)
+
+  // Adding the upgraded CLI hash via OC_ANTIGRAVITY_EXTRA_CLI_SHA256 immediately verifies (even with cached binary hash)
+  process.env[ANTIGRAVITY_EXTRA_CLI_SHA256_ENV] = `${upgradedHash.toUpperCase()}, ${secondHash}`
+  assert.equal(await verifyAntigravityNativeBinary(binary), true)
+
+  // Full prepare + recover succeeds end-to-end with real streaming verifier + env allowlist
+  const db = createDb(f.filename)
+  const binding = await prepare({ ...f.input, requestedResumeId: ID })
+  assert.equal(binding.binaryVerified, true)
+  assert.equal(binding.reason, undefined)
+  insert(db, 0, user()); insert(db, 1, final()); db.close()
+  assert.deepEqual(await recover(binding, ID, ID), { ok: true, text: ANSWER, stepIndex: 1, hash: hash(ANSWER) })
+
+  // Removing env extension degrades cleanly with explicit structured prepare degradation event
+  delete process.env[ANTIGRAVITY_EXTRA_CLI_SHA256_ENV]
+  const prepareDegraded: AntigravityNativeDegradationEvent[] = []
+  const degradedBinding = await prepare({ ...f.input, requestedResumeId: ID }, {
+    onDegraded: (e) => prepareDegraded.push(e),
+  })
+  assert.equal(degradedBinding.binaryVerified, false)
+  assert.equal(degradedBinding.reason, 'binary-unverified')
+  assert.ok(prepareDegraded.some((e) => e.stage === 'verify' && e.actualSha256 === upgradedHash))
+  assert.ok(prepareDegraded.some((e) => e.stage === 'prepare' && e.reason === 'binary-unverified'))
+})
+
+test('OCV5-852: built-in allowlist includes verified Antigravity CLI 1.5.8 SHA-256 and eliminates startup degradation', async () => {
+  assert.equal(ANTIGRAVITY_NATIVE_CLI_1_5_8_SHA256, '9db59b6371107b939befa9c507c0a24989fda974e75d81d8529f3689ef7322e5')
+  assert.ok(ANTIGRAVITY_NATIVE_CLI_SHA256_ALLOWLIST.includes(ANTIGRAVITY_NATIVE_CLI_1_5_8_SHA256))
+  const resolved = resolveAntigravityNativeCliSha256Allowlist(undefined)
+  assert.equal(resolved.has(ANTIGRAVITY_NATIVE_CLI_1_5_8_SHA256), true)
+
+  const cli158Path = '/opt/antigravity-cli/versions/1.5.8/antigravity'
+  try {
+    await readFile(cli158Path)
+  } catch {
+    return
+  }
+  const degraded: AntigravityNativeDegradationEvent[] = []
+  assert.equal(
+    await verifyAntigravityNativeBinary(cli158Path, ANTIGRAVITY_NATIVE_CLI_SHA256, {
+      onDegraded: (e) => degraded.push(e),
+    }),
+    true,
+  )
+  assert.equal(degraded.length, 0)
 })

@@ -1,0 +1,55 @@
+{
+  "pxText": {
+    "components/*": 110,
+    "components/chat": 29,
+    "components/manage": 14,
+    "components/org": 8,
+    "components/payment": 1,
+    "components/project": 2,
+    "components/settings": 14,
+    "components/tool": 36,
+    "components/ui": 4
+  },
+  "rawColor": {
+    "components/*": 31,
+    "components/chat": 2,
+    "components/iui": 3,
+    "components/marketplace": 0,
+    "components/org": 1,
+    "components/project": 4,
+    "components/settings": 1,
+    "components/studio": 147,
+    "components/ui": 4,
+    "hooks": 2,
+    "lib": 17
+  },
+  "paletteColor": {
+    "components/*": 31,
+    "lib": 22
+  },
+  "radius": {
+    "components/*": 25,
+    "components/chat": 4,
+    "components/manage": 2,
+    "components/project": 1,
+    "components/ui": 1
+  },
+  "adhocDot": {
+    "components/*": 6,
+    "components/chat": 1,
+    "components/manage": 3,
+    "components/marketplace": 1,
+    "components/taskboard": 2
+  },
+  "adhocError": {
+    "components/*": 15,
+    "components/chat": 8,
+    "components/github": 2,
+    "components/manage": 1,
+    "components/marketplace": 2,
+    "components/settings": 3,
+    "components/taskboard": 6,
+    "components/tool": 10,
+    "components/ui": 6
+  }
+}

@@ -1,4 +1,4 @@
-import { AlertTriangle, Check, FileText, RefreshCw, Rocket, ShieldX, X } from "lucide-react";
+import { AlertTriangle, Bell, Check, FileText, RefreshCw, Rocket, ShieldOff, ShieldX, Wrench, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button, Modal, useConfirm, usePrompt, useToast } from "../../../components/ui";
 import {
@@ -284,11 +284,13 @@ function PendingReleaseCard({
   else header = "修复已就绪，待放行部署";
 
   return (
-    <div className="rounded-lg border border-warning/40 bg-warning-soft px-4 py-3">
+    <div className="oc-callout oc-callout-warning rounded-xl px-4 py-3.5">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2 text-body font-semibold text-warning">
-            <Rocket size={14} />
+            <span className="oc-icon-badge oc-icon-badge-warning size-6 rounded-md">
+              <Rocket size={13} />
+            </span>
             {header}
           </div>
           <div className="mt-1.5 text-body text-fg">
@@ -314,7 +316,7 @@ function PendingReleaseCard({
 
       {/* 全局熔断提示（Modal 覆盖页面顶部 banner，卡片内需自证为何禁用）。 */}
       {fuseEngaged && (
-        <div className="mt-2 flex items-center gap-1.5 text-meta font-medium text-danger">
+        <div className="mt-2.5 flex items-center gap-1.5 text-meta font-medium text-danger">
           <ShieldX size={13} className="shrink-0" />
           全局部署熔断已触发，暂不可放行；请先在页面顶部清除熔断。
         </div>
@@ -322,7 +324,7 @@ function PendingReleaseCard({
 
       {/* 放行请求状态流（202 异步；随详情轮询自动更新）。 */}
       {rr && (
-        <div className="mt-3 rounded-md border border-border bg-surface px-3 py-2 text-meta">
+        <div className="oc-surface-card mt-3 rounded-xl px-3.5 py-2.5 text-meta">
           <div className="flex items-center justify-between gap-2">
             <span className="text-faint">放行请求</span>
             <span className="flex items-center gap-1.5">
@@ -339,7 +341,7 @@ function PendingReleaseCard({
             <TimeAgo value={rr.updatedAt} />
           </div>
           {rr.failureReason && terminal && rr.status !== "deployed" && (
-            <div className="mt-1.5 rounded border border-danger/30 bg-danger-soft px-2 py-1 text-danger">
+            <div className="oc-callout oc-callout-danger mt-2 rounded-lg px-2.5 py-1.5 text-danger">
               上次失败原因：{rr.failureReason}
             </div>
           )}
@@ -347,7 +349,7 @@ function PendingReleaseCard({
       )}
 
       {/* 放行内容清单（human gate）—— 数据源=最新 pending_release 事件 detail。 */}
-      <div className="mt-3 space-y-2 rounded-md border border-warning/30 bg-surface px-3 py-2.5 text-meta">
+      <div className="oc-surface-card mt-3 space-y-2 rounded-xl px-3.5 py-3 text-meta">
         {!plan.complete && (
           <div className="flex items-center gap-1.5 font-medium text-danger">
             <AlertTriangle size={13} className="shrink-0" />
@@ -596,7 +598,7 @@ function IncidentDetailBody({ id, fuse }: { id: string; fuse: ReleaseFuseResp | 
 
       {/* 正在修复卡（活跃 repair 的最新进度；待放行时上卡已覆盖，不重复）。 */}
       {activeRepair && activeRepair.id !== pendingReleaseRepair?.id && (
-        <div className="rounded-lg border border-info/40 bg-info-soft px-4 py-3">
+        <div className="oc-callout oc-callout-info rounded-xl px-4 py-3">
           <div className="flex items-center gap-2 text-body font-semibold text-info">
             <RefreshCw size={14} className="animate-spin" />
             正在修复（第 {activeRepair.attempt} 次尝试 · {activeRepair.status}）
@@ -610,7 +612,7 @@ function IncidentDetailBody({ id, fuse }: { id: string; fuse: ReleaseFuseResp | 
       )}
 
       {/* incident 全字段（服务端已 redaction，仅挑已知字段展示，不吐任意 JSON）。 */}
-      <div className="rounded-lg border border-border bg-surface px-4 py-2">
+      <div className="oc-surface-recessed rounded-xl px-4 py-2">
         <KeyValue
           label="状态"
           value={
@@ -1038,12 +1040,14 @@ export default function SelfhealPage() {
 
   return (
     <div className="flex flex-col gap-5">
-      <PageHeader title={meta.title} desc={meta.desc} />
+      <PageHeader icon={Wrench} title={meta.title} desc={meta.desc} />
 
       {/* 全局 Tier2 部署熔断 banner（deploy_unknown 触发）—— 触发期间所有一键放行禁用。 */}
       {fuseData?.engaged && (
-        <div className="flex items-start gap-3 rounded-lg border border-danger/50 bg-danger-soft px-4 py-3">
-          <ShieldX size={18} className="mt-0.5 shrink-0 text-danger" />
+        <div className="oc-callout oc-callout-danger flex items-start gap-3 rounded-xl px-4 py-3.5">
+          <span className="oc-icon-badge oc-icon-badge-danger mt-0.5 size-8 shrink-0 rounded-lg">
+            <ShieldX size={16} />
+          </span>
           <div className="min-w-0 flex-1">
             <div className="text-body font-semibold text-danger">
               Tier2 部署熔断已触发 —— 所有一键放行已禁用
@@ -1086,7 +1090,7 @@ export default function SelfhealPage() {
           <Button variant="secondary" size="sm" onClick={refresh} disabled={loading}>
             <RefreshCw size={14} className={loading ? "animate-spin" : undefined} /> 刷新
           </Button>
-          <span className="ml-auto text-meta text-muted" aria-live="polite">
+          <span className="ml-auto text-meta font-medium text-muted tabular-nums" aria-live="polite">
             {typeof data?.total === "number"
               ? `共 ${data.total} 条${typeof data.open_total === "number" ? ` · ${data.open_total} 条未恢复` : ""}`
               : `已加载 ${incidents.length} 条${data?.next_before ? "，仍有更多" : ""}`}
@@ -1094,7 +1098,7 @@ export default function SelfhealPage() {
         </FilterBar>
 
         {error && (
-          <div className="flex items-center gap-2 rounded-lg border border-danger/40 bg-danger-soft px-3 py-2.5 text-body text-danger">
+          <div className="oc-callout oc-callout-danger flex items-center gap-2 rounded-xl px-3.5 py-2.5 text-body text-danger">
             <AlertTriangle size={15} className="shrink-0" />
             加载事故列表失败：{apiErrorMessage(error, "请求失败")}
           </div>
@@ -1113,7 +1117,7 @@ export default function SelfhealPage() {
         {canLoadMore && (
           <div className="flex justify-center">
             <Button
-              variant="ghost"
+              variant="secondary"
               size="sm"
               onClick={() => setLimit((l) => Math.min(MAX_LIMIT, l + PAGE))}
             >
@@ -1124,11 +1128,13 @@ export default function SelfhealPage() {
       </div>
 
       <SectionCard
+        icon={Bell}
+        iconTone="info"
         title="用户恢复通知审批"
         hint="仅真实失败且已全自动恢复的在线用户可进入冻结人群；企微同意后才定向发送"
         bodyClassName="p-0"
       >
-        <div className="border-b border-line px-4 py-3 text-body text-muted">
+        <div className="border-b border-border/80 bg-sidebar/25 px-4 py-3 text-body text-muted dark:bg-elevated/25">
           {noticeData?.binding?.active ? (
             <>审批人已绑定：{noticeData.binding.boundIdentity ?? "已绑定"}</>
           ) : noticeData?.binding ? (
@@ -1147,7 +1153,7 @@ export default function SelfhealPage() {
             loading={noticeLoading && noticeRows.length === 0}
             emptyTitle="暂无用户通知审批"
             emptyHint="默认不发用户告警；只有可信自动恢复与真实影响证据闭合后才会出现审批单。"
-            className="rounded-none border-0"
+            className="rounded-none border-0 shadow-none"
           />
         )}
       </SectionCard>
@@ -1155,6 +1161,8 @@ export default function SelfhealPage() {
       {/* 已压制的 conditions(H1b suppression 审计面:压制中 = 不投影/不派修,
           真实恢复自动解除;误压可在此手动解除)。 */}
       <SectionCard
+        icon={ShieldOff}
+        iconTone="warning"
         title="已压制的检测项"
         hint="resolve 仍异常的探测类事故后进入压制；检测真实恢复自动解除，误压可手动解除"
         bodyClassName="p-0"
@@ -1172,7 +1180,7 @@ export default function SelfhealPage() {
             loading={suppressedLoading && suppressedRows.length === 0}
             emptyTitle="当前没有被压制的检测项"
             emptyHint="手动 resolve 仍在异常的探测类事故后，压制记录会出现在这里。"
-            className="rounded-none border-0"
+            className="rounded-none border-0 shadow-none"
           />
         )}
       </SectionCard>

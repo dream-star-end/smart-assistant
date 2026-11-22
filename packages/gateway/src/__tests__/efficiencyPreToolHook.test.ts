@@ -101,10 +101,15 @@ describe('pre-exec hook protocol', () => {
 })
 
 describe('hook config injection (single policy source)', () => {
-  it('off emits no settings / no hooks.json', () => {
-    assert.equal(buildCcbEfficiencySettings('off'), null)
-    assert.equal(buildCursorEfficiencyHooks('off'), null)
-    assert.equal(resolveEfficiencyHookCommand('ccb', 'off'), null)
+  it('off emits no settings / no hooks.json only when action-policy is also off; stays installed when action-policy is on (B1)', () => {
+    assert.equal(buildCcbEfficiencySettings('off', false), null)
+    assert.equal(buildCursorEfficiencyHooks('off', false), null)
+    assert.equal(resolveEfficiencyHookCommand('ccb', 'off', false), null)
+
+    // When efficiency is off but action-policy is on, hooks MUST stay registered!
+    assert.ok(buildCcbEfficiencySettings('off', true))
+    assert.ok(buildCursorEfficiencyHooks('off', true))
+    assert.match(resolveEfficiencyHookCommand('ccb', 'off', true) ?? '', /--mode=off/)
   })
 
   it('CCB settings.json points at the shared hook script, not a copied regex', () => {

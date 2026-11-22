@@ -1,12 +1,11 @@
 import {
   ArrowLeft,
+  Eye,
   Flame,
   Inbox,
   Link2,
   Search,
-  ShieldCheck,
   SquarePen,
-  Users,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { tutorialHref } from "../../../hooks/useAppRoute";
@@ -19,7 +18,7 @@ import type {
 } from "../../../lib/types";
 import { cn } from "../../../lib/utils";
 import { Alert, Button, ListSkeleton, useToast } from "../../ui";
-import { BlogAvatar, BlogChips, BlogCover, BlogProse, type BlogImageSource } from "./BlogArticle";
+import { BlogArticleFooter, BlogAvatar, BlogChips, BlogCover, BlogProse, type BlogImageSource } from "./BlogArticle";
 import { BlogEditor, type BlogEditTarget } from "./BlogEditor";
 import { BlogMine } from "./BlogMine";
 import {
@@ -28,6 +27,7 @@ import {
   blogLongDate,
   blogReadMinutes,
   blogShortDate,
+  blogViewCount,
 } from "./blogLib";
 
 
@@ -153,15 +153,23 @@ export function CommunityBlog({
   );
 }
 
-function BlogMeta({ item }: { item: CommunityTutorialSummary }) {
+function BlogMeta({ item }: { item: CommunityTutorialSummary & { viewCount?: number | null } }) {
+  const views = blogViewCount(item);
+  const shortDate = blogShortDate(item.publishedAt);
   return (
-    <div className="flex flex-wrap items-center gap-1.5 text-meta text-faint">
-      <BlogAvatar name={item.authorName} />
-      <span>{item.authorName}</span>
-      <span aria-hidden className="size-[3px] rounded-full bg-current opacity-60" />
-      <span>{blogShortDate(item.publishedAt)}</span>
-      <span aria-hidden className="size-[3px] rounded-full bg-current opacity-60" />
-      <span>{item.readMinutes ?? 1} 分钟读完</span>
+    <div className="oc-meta flex flex-wrap items-center gap-y-1 text-meta text-faint">
+      <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+        <BlogAvatar name={item.authorName} />
+        <span>{item.authorName}</span>
+      </span>
+      {shortDate && <span className="whitespace-nowrap">{shortDate}</span>}
+      <span className="whitespace-nowrap">{item.readMinutes ?? 1} 分钟读完</span>
+      {views !== null && (
+        <span className="inline-flex items-center gap-1 whitespace-nowrap">
+          <Eye size={12} aria-hidden />
+          {views} 次阅读
+        </span>
+      )}
     </div>
   );
 }
@@ -180,21 +188,26 @@ function BlogCard({
       type="button"
       onClick={onOpen}
       className={cn(
-        "group flex flex-col overflow-hidden rounded-[20px] border border-border bg-surface text-left outline-none transition-[box-shadow,transform] duration-200 hover:-translate-y-0.5 hover:shadow-float focus-visible:ring-2 focus-visible:ring-ring",
+        "oc-surface-card oc-surface-card-hover group flex flex-col overflow-hidden rounded-xl text-left outline-none focus-visible:ring-2 focus-visible:ring-ring",
         featured && "md:col-span-2 md:flex-row",
       )}
     >
-      <BlogCover item={item} className={featured ? "md:aspect-auto md:min-h-[260px] md:flex-[1.15]" : undefined} />
-      <div className={cn("flex flex-1 flex-col gap-2 p-[16px_18px_18px]", featured && "md:justify-center md:p-[26px]")}>
+      <BlogCover item={item} className={featured ? "md:aspect-auto md:min-h-64 md:flex-[1.15]" : undefined} />
+      <div className={cn("flex flex-1 flex-col gap-2 p-4 sm:p-5", featured && "md:justify-center md:p-6")}>
         {featured && (
-          <span className="flex items-center gap-1.5 text-meta font-bold text-accent">
-            <Flame size={15} aria-hidden /> 本周精选
+          <span className="inline-flex items-center gap-1.5 text-caption font-semibold text-accent">
+            <Flame size={14} aria-hidden /> 本周精选
           </span>
         )}
-        <h3 className={cn("m-0 font-bold leading-[1.45] text-fg group-hover:text-accent", featured ? "text-[16px] md:text-[21px]" : "text-[16px]")}>
+        <h3
+          className={cn(
+            "m-0 font-semibold leading-snug text-fg transition-colors group-hover:text-accent",
+            featured ? "text-title md:text-lg" : "text-title",
+          )}
+        >
           {item.title}
         </h3>
-        <p className={cn("m-0 text-[13px] leading-[1.6] text-muted", featured ? "line-clamp-2 md:line-clamp-3 md:text-[14px]" : "line-clamp-2")}>
+        <p className={cn("m-0 text-body leading-relaxed text-muted", featured ? "line-clamp-2 md:line-clamp-3" : "line-clamp-2")}>
           {item.summary}
         </p>
         <div className="mt-auto pt-1.5">
@@ -227,7 +240,7 @@ function BlogList({
   const [loading, setLoading] = useState(false);
   const [loadedOnce, setLoadedOnce] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [pendingMine, setPendingMine] = useState(0);
+  const [mineSummary, setMineSummary] = useState<{ pending: number; rejected: number }>({ pending: 0, rejected: 0 });
 
   const load = useCallback(
     async (cursor: string | null) => {
@@ -240,9 +253,10 @@ function BlogList({
           category: filters.category || null,
           kind: "markdown",
         });
-        setItems((current) => (cursor ? [...current, ...page.tutorials] : page.tutorials));
-        setNextCursor(page.nextCursor);
-        if (!cursor) setTotal(typeof page.total === "number" ? page.total : null);
+        const rows = Array.isArray(page?.tutorials) ? page.tutorials : [];
+        setItems((current) => (cursor ? [...current, ...rows] : rows));
+        setNextCursor(page?.nextCursor ?? null);
+        if (!cursor) setTotal(typeof page?.total === "number" ? page.total : null);
       } catch (cause) {
         setError(apiErrorMessage(cause, "加载经验分享失败"));
       } finally {
@@ -266,13 +280,24 @@ function BlogList({
   }, [query]);
 
   useEffect(() => {
-    if (!auth) return;
+    if (!auth) {
+      setMineSummary({ pending: 0, rejected: 0 });
+      return;
+    }
     let cancelled = false;
     api
       .listMyCommunityTutorials(auth, null)
       .then((page) => {
-        if (!cancelled)
-          setPendingMine(page.tutorials.filter((item) => item.kind !== "snapshot" && item.status === "pending").length);
+        if (cancelled) return;
+        const rows = Array.isArray(page?.tutorials) ? page.tutorials : [];
+        let pending = 0;
+        let rejected = 0;
+        for (const item of rows) {
+          if (item.kind === "snapshot") continue;
+          if (item.status === "pending" || item.edit?.status === "pending") pending += 1;
+          else if (item.status === "rejected" || item.edit?.status === "rejected") rejected += 1;
+        }
+        setMineSummary({ pending, rejected });
       })
       .catch(() => {});
     return () => {
@@ -282,36 +307,44 @@ function BlogList({
 
   const featureFirst = !filters.query && !filters.category && items.length >= 3;
   const shownTotal = total ?? items.length;
+  const attentionMine = mineSummary.pending + mineSummary.rejected;
 
   return (
-    <div className="mx-auto w-full max-w-[1100px] px-4 pb-12 pt-5 sm:px-6 sm:pt-7">
-      <div className="mb-4 flex flex-col items-stretch gap-3.5 sm:mb-[22px] sm:flex-row sm:items-end sm:justify-between sm:gap-6">
-        <div>
-          <p className="flex items-center gap-1.5 text-[12.5px] font-bold text-accent">
-            <Users size={15} aria-hidden /> 社区经验 · 已发布 {shownTotal} 篇
-          </p>
-          <h1 className="mb-1.5 mt-2 text-[25px] font-bold leading-[1.2] tracking-[-0.01em] text-fg sm:text-[32px]">
-            别人怎么用好它，
-            <br />
-            一看就会。
-          </h1>
-          <p className="m-0 text-[14px] text-muted">来自真实用户的实践经验：具体的场景、可复用的步骤、踩过的坑。</p>
+    <div className="mx-auto w-full max-w-5xl px-4 pb-12 pt-4 sm:px-6 sm:pt-5">
+      <div className="mb-4 flex flex-col gap-3 sm:mb-5 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+        <div className="flex min-w-0 flex-wrap items-baseline gap-x-2.5 gap-y-0.5">
+          <h2 className="m-0 text-title font-semibold tracking-tight text-fg sm:text-lg">经验分享</h2>
+          <span className="text-meta text-faint">已发布 {shownTotal} 篇 · 真实实践与可复用步骤</span>
         </div>
-        <div className="flex flex-wrap gap-2">
-          <Button variant="secondary" shape="pill" className="max-sm:flex-1" onClick={onMine}>
-            <Inbox size={15} /> 我的投稿
-            {pendingMine > 0 && (
-              <span className="blog-chip blog-chip-warn h-[18px]">{pendingMine}</span>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button variant="secondary" shape="pill" className="max-sm:min-h-11 max-sm:flex-1" onClick={onMine}>
+            <Inbox size={15} aria-hidden /> 我的投稿
+            {attentionMine > 0 && (
+              <span
+                className={cn(
+                  "blog-chip h-5 min-w-5 justify-center px-1.5 tabular-nums",
+                  mineSummary.rejected > 0 ? "blog-chip-bad" : "blog-chip-warn",
+                )}
+                aria-label={
+                  mineSummary.rejected > 0 && mineSummary.pending > 0
+                    ? `${mineSummary.pending} 篇待审，${mineSummary.rejected} 篇未通过`
+                    : mineSummary.rejected > 0
+                      ? `${mineSummary.rejected} 篇未通过`
+                      : `${mineSummary.pending} 篇待审`
+                }
+              >
+                {attentionMine}
+              </span>
             )}
           </Button>
-          <Button variant="accent" shape="pill" className="shadow-[0_4px_14px_#5a3fee38] max-sm:flex-1" onClick={onWrite}>
-            <SquarePen size={15} /> 写一篇经验
+          <Button variant="accent" shape="pill" className="max-sm:min-h-11 max-sm:flex-1" onClick={onWrite}>
+            <SquarePen size={15} aria-hidden /> 写一篇经验
           </Button>
         </div>
       </div>
 
       <div className="mb-5 flex flex-wrap items-center gap-2.5">
-        <label className="flex h-10 min-w-full flex-1 items-center gap-2 rounded-full border border-border-strong bg-surface px-3.5 text-faint focus-within:ring-2 focus-within:ring-ring sm:min-w-[220px]">
+        <label className="flex min-h-11 min-w-full flex-1 items-center gap-2 rounded-full border border-border-control bg-surface px-3.5 text-faint transition-colors focus-within:border-accent focus-within:ring-2 focus-within:ring-ring sm:min-h-10 sm:min-w-56">
           <Search size={15} aria-hidden />
           <span className="sr-only">搜索经验分享</span>
           <input
@@ -319,7 +352,7 @@ function BlogList({
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             placeholder="搜索标题、摘要或作者"
-            className="h-full min-w-0 flex-1 bg-transparent text-[13.5px] text-fg outline-none placeholder:text-faint"
+            className="h-full min-w-0 flex-1 bg-transparent text-base text-fg outline-none placeholder:text-faint md:text-body"
           />
         </label>
         <fieldset className="no-scrollbar m-0 flex w-full min-w-0 gap-1.5 overflow-x-auto border-0 p-0 sm:w-auto" aria-label="分类">
@@ -330,10 +363,10 @@ function BlogList({
               aria-pressed={filters.category === option.value}
               onClick={() => setFilters((current) => ({ ...current, category: option.value }))}
               className={cn(
-                "inline-flex h-[34px] shrink-0 items-center rounded-full border px-3.5 text-[13px] font-semibold outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                "inline-flex min-h-11 shrink-0 items-center rounded-full border px-4 text-body font-medium transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9 sm:px-3.5",
                 filters.category === option.value
                   ? "border-primary bg-primary text-primary-fg"
-                  : "border-border bg-surface text-muted hover:text-fg",
+                  : "border-border bg-surface text-muted hover:border-border-strong hover:text-fg",
               )}
             >
               {option.label}
@@ -354,15 +387,15 @@ function BlogList({
       ) : loading && items.length === 0 ? (
         <ListSkeleton variant="card" rows={3} />
       ) : items.length === 0 && loadedOnce ? (
-        <div className="rounded-[20px] border border-dashed border-border p-10 text-center">
-          <SquarePen size={28} className="mx-auto text-faint" />
+        <div className="oc-surface-card rounded-xl border-dashed p-10 text-center">
+          <SquarePen size={28} className="mx-auto text-faint" aria-hidden />
           <p className="mt-3 text-body font-medium text-fg">
             {filters.query || filters.category ? "没有找到匹配的经验" : "还没有人分享经验"}
           </p>
           <p className="mt-1 text-meta text-faint">把你用得顺手的做法写下来，帮到下一个人。</p>
         </div>
       ) : (
-        <div className="grid grid-cols-1 gap-3.5 md:grid-cols-3 md:gap-[18px]">
+        <div className="grid grid-cols-1 gap-3.5 md:grid-cols-3 md:gap-4">
           {items.map((item, index) => (
             <BlogCard key={item.id} item={item} featured={featureFirst && index === 0} onOpen={() => onOpen(item.id)} />
           ))}
@@ -370,7 +403,7 @@ function BlogList({
       )}
       {nextCursor && !error && (
         <div className="mt-6 flex justify-center">
-          <Button variant="secondary" shape="pill" loading={loading} onClick={() => void load(nextCursor)}>
+          <Button variant="secondary" shape="pill" className="max-sm:min-h-11" loading={loading} onClick={() => void load(nextCursor)}>
             加载更多
           </Button>
         </div>
@@ -434,7 +467,8 @@ function BlogDetail({
     api
       .listCommunityTutorials({ kind: "markdown", limit: 3 })
       .then((page) => {
-        if (!cancelled) setMore(page.tutorials.filter((entry) => entry.id !== id).slice(0, 2));
+        const rows = Array.isArray(page?.tutorials) ? page.tutorials : [];
+        if (!cancelled) setMore(rows.filter((entry) => entry.id !== id).slice(0, 2));
       })
       .catch(() => {});
     return () => {
@@ -449,15 +483,16 @@ function BlogDetail({
       .catch(() => toast("复制失败，请手动复制地址栏链接", "error"));
   };
   const minutes = useMemo(() => item?.readMinutes ?? blogReadMinutes(item?.bodyMarkdown ?? ""), [item]);
+  const views = blogViewCount(item as (CommunityTutorialDetail & { viewCount?: number | null }) | null);
 
   return (
-    <article className="mx-auto w-full max-w-[760px] px-4 pb-12 pt-[18px] sm:px-6 sm:pb-16 sm:pt-[26px]">
+    <article className="mx-auto w-full max-w-3xl px-4 pb-12 pt-4 sm:px-6 sm:pb-16 sm:pt-6">
       <button
         type="button"
         onClick={onBack}
-        className="mb-[22px] inline-flex items-center gap-1.5 rounded-md text-[13px] text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+        className="mb-5 inline-flex min-h-11 items-center gap-1.5 rounded-md text-body text-muted outline-none transition-colors hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9"
       >
-        <ArrowLeft size={15} /> 经验分享
+        <ArrowLeft size={15} aria-hidden /> 经验分享
       </button>
       {error ? (
         <Alert tone="danger">{error}</Alert>
@@ -466,54 +501,55 @@ function BlogDetail({
       ) : (
         <>
           <BlogChips category={item.category} minutes={minutes} />
-          <h1 className="my-3 text-[24px] font-bold leading-[1.3] tracking-[-0.01em] text-fg sm:text-[30px]">{item.title}</h1>
-          <p className="mb-[18px] text-[16px] leading-[1.7] text-muted">{item.summary}</p>
+          <h1 className="my-3 text-xl font-bold leading-snug tracking-tight text-fg sm:text-2xl">{item.title}</h1>
+          <p className="mb-5 text-base leading-relaxed text-muted">{item.summary}</p>
           <div className="mb-7 flex flex-wrap items-center justify-between gap-3 border-y border-border py-3.5">
-            <div className="flex items-center gap-2.5 text-[13.5px]">
+            <div className="flex items-center gap-2.5 text-section">
               <BlogAvatar name={item.authorName} size={34} />
               <div>
-                <b className="text-fg">{item.authorName}</b>
-                <div className="text-meta text-faint">{blogLongDate(item.publishedAt)}发布</div>
+                <b className="font-semibold text-fg">{item.authorName}</b>
+                <div className="oc-meta flex flex-wrap items-center gap-y-0.5 text-meta text-faint">
+                  <span className="whitespace-nowrap">{blogLongDate(item.publishedAt)}发布</span>
+                  {views !== null && (
+                    <span className="inline-flex items-center gap-1 whitespace-nowrap">
+                      <Eye size={12} aria-hidden />
+                      {views} 次阅读
+                    </span>
+                  )}
+                </div>
               </div>
             </div>
-            <Button variant="secondary" size="sm" shape="pill" onClick={copyLink}>
-              <Link2 size={14} /> 复制链接
+            <Button variant="secondary" size="sm" shape="pill" className="max-sm:min-h-11" onClick={copyLink}>
+              <Link2 size={14} aria-hidden /> 复制链接
             </Button>
           </div>
           <BlogProse markdown={item.bodyMarkdown} source={PUBLIC_SOURCE} />
-          <div className="mt-9 flex flex-col items-stretch justify-between gap-3 rounded-[18px] border border-border bg-surface p-[18px] sm:flex-row sm:items-center">
-            <div className="flex items-center gap-2 text-[12.5px] text-faint">
-              <ShieldCheck size={15} aria-hidden /> 本文已通过内容审核 · 观点仅代表作者
-            </div>
-            <div className="flex gap-2">
-              <Button variant="secondary" size="sm" shape="pill" onClick={copyLink}>
-                <Link2 size={14} /> 复制链接
-              </Button>
-              <Button variant="accent" size="sm" shape="pill" onClick={onWrite}>
-                <SquarePen size={14} /> 我也写一篇
-              </Button>
-            </div>
-          </div>
+          <BlogArticleFooter onCopyLink={copyLink} onWrite={onWrite} />
           {more.length > 0 && (
             <section>
-              <h2 className="mb-3 mt-[34px] text-[14px] font-bold text-fg">更多经验</h2>
+              <h2 className="mb-3 mt-8 text-section font-semibold text-fg">更多经验</h2>
               <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2">
-                {more.map((entry) => (
-                  <button
-                    key={entry.id}
-                    type="button"
-                    onClick={() => onOpen(entry.id)}
-                    className="flex items-center gap-3 rounded-[20px] border border-border bg-surface p-3 text-left outline-none hover:shadow-float focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    <BlogCover item={entry} showChip={false} className="!aspect-auto h-14 w-[84px] shrink-0 rounded-[10px] [&_svg]:size-5" />
-                    <div className="min-w-0">
-                      <b className="line-clamp-2 block text-[13.5px] leading-[1.45] text-fg">{entry.title}</b>
-                      <div className="mt-1 text-meta text-faint">
-                        {entry.authorName} · {entry.readMinutes ?? 1} 分钟
+                {more.map((entry) => {
+                  const entryViews = blogViewCount(entry as CommunityTutorialSummary & { viewCount?: number | null });
+                  return (
+                    <button
+                      key={entry.id}
+                      type="button"
+                      onClick={() => onOpen(entry.id)}
+                      className="oc-surface-card oc-surface-card-hover flex items-center gap-3 rounded-xl p-3 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      <BlogCover item={entry} showChip={false} className="!aspect-auto h-14 w-21 shrink-0 rounded-md [&_svg]:size-5" />
+                      <div className="min-w-0">
+                        <b className="line-clamp-2 block text-section font-medium leading-snug text-fg">{entry.title}</b>
+                        <div className="oc-meta mt-1 flex flex-wrap items-center gap-y-0.5 text-meta text-faint">
+                          <span className="whitespace-nowrap">{entry.authorName}</span>
+                          <span className="whitespace-nowrap">{entry.readMinutes ?? 1} 分钟</span>
+                          {entryViews !== null && <span className="whitespace-nowrap">{entryViews} 次阅读</span>}
+                        </div>
                       </div>
-                    </div>
-                  </button>
-                ))}
+                    </button>
+                  );
+                })}
               </div>
             </section>
           )}

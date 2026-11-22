@@ -1,17 +1,21 @@
-import { AlertTriangle, BookOpen, Check, ChevronDown, Copy, Download, Eye, EyeOff, RotateCcw } from "lucide-react";
+import { AlertTriangle, BookOpen, Check, ChevronDown, Copy, Download, Eye, EyeOff, Globe, Loader2, Lock, Maximize2, PanelRight, Play, RotateCcw } from "lucide-react";
 import { useState } from "react";
 import { nativeDownload } from "../../lib/chat/download";
 import { cn } from "../../lib/utils";
+import { dispatchOpenInWorkbench } from "../../lib/workbenchOpen";
 import { useMediaSigner } from "../chat/media";
-import { useChatInteraction } from "../tool/context";
+import { chatInteractionUnavailableText, useArtifactInspect, useChatInteraction } from "../tool/context";
+import { useToast } from "../ui";
 import { BodyMarkdown, Frame, Inline, useCopiedFlag } from "./shell";
 import { interpolateRunbookCommand, v2ToMarkdown } from "./v2Markdown";
-import type { CitationsSpec, DeliverablesSpec, RunbookSpec } from "./v2Schema";
+import type { BrowserHandoffSpec, CitationsSpec, DeliverablesSpec, RunbookSpec } from "./v2Schema";
+import "./browserHandoff.css";
 
 type BlockProps<S> = { spec: S; notes: string[]; streaming: boolean; readOnly?: boolean; nested?: boolean };
 
 function SmallCopy({ getText, label, idle }: { getText: () => string; label: string; idle: string }) {
   const [done, flash] = useCopiedFlag();
+  const toast = useToast();
   return (
     <button
       type="button"
@@ -22,7 +26,7 @@ function SmallCopy({ getText, label, idle }: { getText: () => string; label: str
           await navigator.clipboard.writeText(getText());
           flash();
         } catch {
-          /* ignore */
+          toast("复制失败，请手动选中文本复制", "error");
         }
       }}
     >
@@ -31,6 +35,8 @@ function SmallCopy({ getText, label, idle }: { getText: () => string; label: str
     </button>
   );
 }
+
+const BATCH_DOWNLOAD_DELAY_MS = 250;
 
 // ── 10. Deliverables 工作台 ──────────────────────────────────────────────
 
@@ -41,6 +47,7 @@ export function DeliverablesBlock({ spec, notes, streaming, nested }: BlockProps
     return first >= 0 && spec.items.length <= 4 ? first : null;
   });
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const [downloadingAll, setDownloadingAll] = useState(false);
   const downloadable = spec.items.filter((x) => !!x.path);
 
   const downloadItem = async (item: DeliverablesSpec["items"][number]) => {
@@ -53,6 +60,19 @@ export function DeliverablesBlock({ spec, notes, streaming, nested }: BlockProps
     const url = await resolve(item.path);
     if (url) nativeDownload(url, item.name);
     else setStatusMsg(`未能签名下载 ${item.name}（预览或只读环境不支持容器取档）`);
+  };
+
+  const downloadAll = async () => {
+    if (downloadingAll) return;
+    setDownloadingAll(true);
+    try {
+      for (let i = 0; i < downloadable.length; i += 1) {
+        if (i > 0) await new Promise((r) => window.setTimeout(r, BATCH_DOWNLOAD_DELAY_MS));
+        await downloadItem(downloadable[i]!);
+      }
+    } finally {
+      setDownloadingAll(false);
+    }
   };
 
   const activePreview = previewIdx !== null ? spec.items[previewIdx] : undefined;
@@ -70,12 +90,11 @@ export function DeliverablesBlock({ spec, notes, streaming, nested }: BlockProps
           <button
             type="button"
             className="oc-iui-btn is-primary"
-            onClick={async () => {
-              for (const item of downloadable) await downloadItem(item);
-            }}
+            disabled={downloadingAll}
+            onClick={() => void downloadAll()}
           >
-            <Download size={14} aria-hidden />
-            下载全部 ({downloadable.length})
+            {downloadingAll ? <Loader2 size={14} className="animate-spin" aria-hidden /> : <Download size={14} aria-hidden />}
+            {downloadingAll ? "正在下载…" : `下载全部 (${downloadable.length})`}
           </button>
         ) : undefined
       }
@@ -94,6 +113,23 @@ export function DeliverablesBlock({ spec, notes, streaming, nested }: BlockProps
                 {info && <div className="oc-iui-deliv-meta">{info}</div>}
               </div>
               <div className="oc-iui-deliv-actions">
+                {it.path && !streaming && (
+                  <button
+                    type="button"
+                    className="oc-iui-text-btn"
+                    data-testid="deliverable-open-workbench"
+                    onClick={() =>
+                      dispatchOpenInWorkbench({
+                        path: it.path,
+                        title: it.name,
+                        tab: "outputs",
+                      })
+                    }
+                  >
+                    <PanelRight size={13} aria-hidden />
+                    工作台预览
+                  </button>
+                )}
                 {it.preview && (
                   <button
                     type="button"
@@ -228,9 +264,11 @@ export function CitationsBlock({ spec, notes, streaming, readOnly, nested }: Blo
 
 // ── 12. Runbook 参数化命令流卡 ──────────────────────────────────────────
 
-export function RunbookBlock({ spec, notes, streaming, nested }: BlockProps<RunbookSpec>) {
+export function RunbookBlock({ spec, notes, streaming, readOnly, nested }: BlockProps<RunbookSpec>) {
+  const { sendUserText, busy } = useChatInteraction();
   const [values, setValues] = useState<Record<string, string>>(() => Object.fromEntries(spec.vars.map((v) => [v.id, v.value])));
   const dirty = spec.vars.some((v) => values[v.id] !== v.value);
+  const canRun = !readOnly && !streaming && !!sendUserText;
 
   const renderCommand = (cmd: string) => {
     const parts = cmd.split(/(\{\{[A-Za-z_][A-Za-z0-9_]*\}\}|\$\{[A-Za-z_][A-Za-z0-9_]*\})/g);
@@ -311,6 +349,21 @@ export function RunbookBlock({ spec, notes, streaming, nested }: BlockProps<Runb
                 </span>
               )}
               {!streaming && <SmallCopy getText={() => interpolateRunbookCommand(st.command, values)} label={`第 ${i + 1} 步命令`} idle="复制" />}
+              {canRun && (
+                <button
+                  type="button"
+                  className="oc-iui-text-btn"
+                  data-testid={`runbook-run-step-${i}`}
+                  disabled={!!busy}
+                  onClick={() => {
+                    const cmd = interpolateRunbookCommand(st.command, values);
+                    sendUserText?.(`请执行操作步骤「${st.title}」：\n\`\`\`bash\n${cmd}\n\`\`\``);
+                  }}
+                >
+                  <Play size={12} aria-hidden />
+                  执行
+                </button>
+              )}
             </div>
             {st.detail && <p className="oc-iui-runbook-detail">{st.detail}</p>}
             <pre className="oc-iui-cmd-pre">
@@ -319,6 +372,111 @@ export function RunbookBlock({ spec, notes, streaming, nested }: BlockProps<Runb
           </li>
         ))}
       </ol>
+    </Frame>
+  );
+}
+
+// ── 13. BrowserHandoff 云端浏览器人工接管卡（OCV5-816） ────────────────────────
+
+function parseHandoffUrl(url: string): { isHttps: boolean; host: string; path: string } {
+  try {
+    const u = new URL(url);
+    return {
+      isHttps: u.protocol === "https:",
+      host: u.host,
+      path: `${u.pathname === "/" ? "" : u.pathname}${u.search}`,
+    };
+  } catch {
+    return { isHttps: url.startsWith("https://"), host: url, path: "" };
+  }
+}
+
+export function BrowserHandoffBlock({ spec, notes, streaming, readOnly, nested }: BlockProps<BrowserHandoffSpec>) {
+  const { openLiveBrowser } = useArtifactInspect();
+  const { sendUserText, busy, reason } = useChatInteraction();
+  const [opened, setOpened] = useState(false);
+  const [sent, setSent] = useState(false);
+
+  const parsedUrl = spec.url ? parseHandoffUrl(spec.url) : null;
+  // Secondary button auto-sends immediately: strictly send transparent user-visible copy,
+  // never an unshown model-authored prompt. Custom `continue_prompt` is only prefilled into
+  // Composer on browser handback so the user can review/edit before sending.
+  const visibleContinueMessage = parsedUrl
+    ? `我已完成 ${parsedUrl.host} 的浏览器操作，请继续。`
+    : "我已完成云端浏览器操作，请继续。";
+  const handbackDraft = spec.continue_prompt ?? visibleContinueMessage;
+  const canTakeover = !readOnly && !streaming && Boolean(openLiveBrowser);
+  const canContinue = !readOnly && !streaming && Boolean(sendUserText) && !busy && !sent;
+
+  return (
+    <Frame
+      kind="browser_handoff"
+      title={spec.title ?? "需要你接管云端浏览器"}
+      subtitle={spec.subtitle ?? "云端浏览器与助手共享同一会话与登录态，完成验证后即可无缝交还"}
+      notes={notes}
+      streaming={streaming}
+      nested={nested}
+      copyText={() => v2ToMarkdown(spec)}
+    >
+      <div className="oc-iui-bh" data-testid="iui-browser-handoff">
+        {parsedUrl && (
+          <div className="oc-iui-bh-url" title={spec.url}>
+            <span className="oc-iui-bh-url-icon" aria-hidden>
+              {parsedUrl.isHttps ? <Lock size={13} /> : <Globe size={13} />}
+            </span>
+            <span className="oc-iui-bh-url-text">
+              <span className="oc-iui-bh-url-host">{parsedUrl.host}</span>
+              {parsedUrl.path}
+            </span>
+          </div>
+        )}
+        <p className="oc-iui-bh-reason">
+          <Inline text={spec.reason ?? "当前页面需要人工完成登录、二次验证或确认操作。点击下方按钮将为你放大云端浏览器并开启直接操控。"} />
+        </p>
+        <div className="oc-iui-bh-actions">
+          <button
+            type="button"
+            className="oc-iui-btn is-primary"
+            disabled={!canTakeover}
+            data-testid="iui-browser-handoff-open"
+            onClick={() => {
+              if (!canTakeover) return;
+              setOpened(true);
+              openLiveBrowser?.({
+                takeover: true,
+                expand: true,
+                url: spec.url,
+                continuePrompt: handbackDraft,
+              });
+            }}
+          >
+            <Maximize2 size={14} aria-hidden />
+            {spec.action_label ?? "放大并接管浏览器"}
+          </button>
+          <button
+            type="button"
+            className="oc-iui-btn"
+            disabled={!canContinue}
+            data-testid="iui-browser-handoff-continue"
+            onClick={() => {
+              if (!canContinue) return;
+              setSent(true);
+              sendUserText?.(visibleContinueMessage);
+            }}
+          >
+            <Check size={14} aria-hidden />
+            {sent ? "已通知助手继续" : (spec.continue_label ?? "我已完成，继续任务")}
+          </button>
+        </div>
+        {opened && !sent && (
+          <p className="oc-iui-bh-note" role="status">
+            正在为你打开实时浏览器… 完成操作后可点击浏览器顶栏「交还助手」或上方按钮继续。
+          </p>
+        )}
+        {!readOnly && !streaming && !openLiveBrowser && (
+          <p className="oc-iui-bh-note">{chatInteractionUnavailableText(reason)}</p>
+        )}
+      </div>
     </Frame>
   );
 }

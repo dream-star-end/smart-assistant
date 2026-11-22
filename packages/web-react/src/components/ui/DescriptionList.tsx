@@ -53,12 +53,12 @@ export function DescriptionRow({
   const Term = inList ? "dt" : "span";
   const Desc = inList ? "dd" : "span";
   return (
-    <div className={cn("flex items-start justify-between gap-4 py-1.5 text-body", className)}>
-      <Term className={cn("shrink-0 text-faint", labelClassName)}>
+    <div className={cn("flex items-start justify-between gap-4 py-2 text-body transition-colors", className)}>
+      <Term className={cn("shrink-0 text-muted", labelClassName)}>
         {label}
         {hint && <span className="mt-0.5 block text-caption text-faint">{hint}</span>}
       </Term>
-      <Desc className={cn("min-w-0 break-words text-right font-medium text-fg", valueClassName)}>
+      <Desc className={cn("min-w-0 break-words text-right font-medium tabular-nums text-fg", valueClassName)}>
         {value}
       </Desc>
     </div>

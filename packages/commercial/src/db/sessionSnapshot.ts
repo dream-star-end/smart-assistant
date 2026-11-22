@@ -1,7 +1,13 @@
 import { automaticRetryStatus, type SessionSnapshot, type TurnTokenUsageSnapshot } from '@openclaude/protocol'
 import type { Pool, PoolClient } from 'pg'
 import { readDispatchSettledCredits } from '../billing/dispatchSettledCredits.js'
-import { pendingPermissionPromptToFrame, readPendingPermissionPrompts } from '../dispatch/turnControlStore.js'
+import {
+  HELLO_PENDING_PERMISSION_MAX_SESSIONS,
+  HELLO_PENDING_PERMISSION_MAX_TOTAL_ROWS,
+  pendingPermissionPromptToFrame,
+  readPendingPermissionPrompts,
+  readPendingPermissionPromptsForSessions,
+} from '../dispatch/turnControlStore.js'
 import { readOpenDispatchEngineReady } from './liveTurnFrames.js'
 import { openDispatchTurnStatusSnapshotFrame, terminalDispatchReconcile } from './sessionSnapshotStatus.js'
 
@@ -16,13 +22,81 @@ export interface SessionSnapshotOptions {
   containerId?: number
 }
 export const SESSION_SNAPSHOT_MAX_BYTES = 1024 * 1024
+/** Upper bound on fallback BYTEA fact scan pages for legacy NULL-seq streams. */
+export const SESSION_SNAPSHOT_FACTS_MAX_PAGES = 8
+/** Physically scanned rows per fallback window in (stream_key, frame_seq DESC, record_id DESC) order (max 8 * 256 = 2048 rows). */
+export const SESSION_SNAPSHOT_FACTS_SCAN_WINDOW = 256
 
 type Queryable = Pick<PoolClient, 'query'>
-type SnapshotFact = { record_id: string; frame_seq: string; payload: Buffer }
 type Dispatch = {
   dispatch_id: string; client_message_id: string; agent_id: string
   status: string; outcome: string | null; attempt_no: number
   admitted_at: Date; accepted_at: Date | null; terminal_at: Date | null
+}
+type RecoveryRow = {
+  status: NonNullable<SessionSnapshot['recovery']>['status']
+  semantic_recovery_attempt: number
+  retry_limit: number | null
+}
+
+function buildRecoveryState(recovery: RecoveryRow | undefined): SessionSnapshot['recovery'] {
+  if (!recovery) return null
+  const retryStatus = automaticRetryStatus(
+    recovery.status === 'forwarded' ? 'running' : 'scheduled',
+    recovery.semantic_recovery_attempt,
+    recovery.retry_limit ?? undefined,
+  )
+  return {
+    status: recovery.status,
+    attempt: recovery.semantic_recovery_attempt,
+    maxAttempts: recovery.retry_limit,
+    retryStatus: { ...retryStatus, actions: [...retryStatus.actions] },
+  }
+}
+
+export function parseLatestTurnStatusPointer(raw: unknown): Record<string, unknown> | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const obj = raw as Record<string, unknown>
+  if (!('status' in obj)) return null
+  return obj
+}
+
+export function parseLatestTurnUsagePointer(raw: unknown): SessionSnapshot['usage'] {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const obj = raw as Record<string, unknown>
+  if (
+    typeof obj.frameSeq !== 'number' ||
+    !Number.isSafeInteger(obj.frameSeq) ||
+    !obj.usage ||
+    typeof obj.usage !== 'object' ||
+    Array.isArray(obj.usage)
+  ) {
+    return null
+  }
+  return { frameSeq: obj.frameSeq, usage: obj.usage as TurnTokenUsageSnapshot }
+}
+
+function parseOptionalNonNegativeSeq(raw: string | number | null | undefined): number | null {
+  if (raw == null) return null
+  const num = Number(raw)
+  return Number.isSafeInteger(num) && num >= 0 ? num : null
+}
+
+function hasPositiveCursor(options: SessionSnapshotOptions): boolean {
+  const requestedAfterBase = Number.isSafeInteger(options.afterSeq) && options.afterSeq! > 0 ? options.afterSeq! : 0
+  if (requestedAfterBase > 0) return true
+  return !!options.afterSeqByAgent && Object.values(options.afterSeqByAgent).some(
+    (v) => typeof v === 'number' && Number.isSafeInteger(v) && v > 0,
+  )
+}
+
+function emptySessionSnapshot(sessionId: string, asOf: number): SessionSnapshot {
+  return {
+    v: 1, sessionId, dispatch: null, streamKey: null, lastFrameSeq: null, lastFrameAt: null,
+    engineReady: null, turnStatus: null, reconcile: null, recovery: null,
+    pendingPermissions: { items: [], completeness: 'complete' }, usage: null, credits: null,
+    frames: [], nextAfterSeq: 0, hasMore: false, gap: null, asOf,
+  }
 }
 
 /** The caller owns a REPEATABLE READ READ ONLY transaction. HTTP invokes this
@@ -47,51 +121,27 @@ export async function buildSessionSnapshot(
       ORDER BY (client_message_id=$3) DESC NULLS LAST, admitted_at DESC, dispatch_id DESC LIMIT 1`,
     [uid, sessionId, options.clientMessageId ?? null],
   )).rows[0]
-  const snapshot: SessionSnapshot = {
-    v: 1, sessionId, dispatch: null, streamKey: null, lastFrameSeq: null, lastFrameAt: null,
-    engineReady: null, turnStatus: null, reconcile: null, recovery: null,
-    pendingPermissions: { items: [], completeness: 'complete' }, usage: null, credits: null,
-    frames: [], nextAfterSeq: 0, hasMore: false, gap: null, asOf,
-  }
-  // Optional during rolling upgrades; a missing recovery table must not poison
-  // the transaction used by the remaining authoritative snapshot queries.
-  await q.query('SAVEPOINT session_snapshot_recovery')
-  try {
-    const recovery = (await q.query<{
-      status: NonNullable<SessionSnapshot['recovery']>['status']
-      semantic_recovery_attempt: number; retry_limit: number | null
-    }>(
-      `/* session-snapshot-recovery */
-       SELECT status,semantic_recovery_attempt,
-              request_json->'_automaticRecoveryRetryLimit' AS retry_limit
-         FROM turn_recovery_jobs
-        WHERE user_id=$1::bigint AND session_id=$2
-          AND status IN ('queued','leased','sent','forwarded')
-        ORDER BY created_at DESC,job_id DESC LIMIT 1`,
-      [uid, sessionId],
-    )).rows[0]
-    if (recovery) {
-      const retryStatus = automaticRetryStatus(recovery.status === 'forwarded' ? 'running' : 'scheduled',
-        recovery.semantic_recovery_attempt, recovery.retry_limit ?? undefined)
-      snapshot.recovery = {
-        status: recovery.status, attempt: recovery.semantic_recovery_attempt, maxAttempts: recovery.retry_limit,
-        retryStatus: { ...retryStatus, actions: [...retryStatus.actions] },
-      }
-    }
-  } catch (error) {
-    await q.query('ROLLBACK TO SAVEPOINT session_snapshot_recovery')
-    // Only a not-yet-migrated rolling peer means this optional fact is absent.
-    // A timeout/read failure cannot prove that automatic recovery stopped.
-    if ((error as { code?: unknown } | null)?.code !== '42P01') throw error
-  } finally {
-    await q.query('RELEASE SAVEPOINT session_snapshot_recovery')
-  }
+  const snapshot = emptySessionSnapshot(sessionId, asOf)
+  // turn_recovery_jobs has been permanently migrated since 0202; query directly
+  // without allocating a hot-path SAVEPOINT / subtransaction.
+  const recovery = (await q.query<RecoveryRow>(
+    `/* session-snapshot-recovery */
+     SELECT status,semantic_recovery_attempt,
+            request_json->'_automaticRecoveryRetryLimit' AS retry_limit
+       FROM turn_recovery_jobs
+      WHERE user_id=$1::bigint AND session_id=$2
+        AND status IN ('queued','leased','sent','forwarded')
+      ORDER BY created_at DESC,job_id DESC LIMIT 1`,
+    [uid, sessionId],
+  )).rows[0]
+  snapshot.recovery = buildRecoveryState(recovery)
+
   const agentId = row?.agent_id || 'main'
   const sessionKey = `agent:${agentId}:webchat:dm:${sessionId.replace(/[^a-zA-Z0-9_-]/g, '_')}`
   try {
     const permissions = await readPendingPermissionPrompts(q, { userId: BigInt(uid), sessionId, limit: 64 })
     snapshot.pendingPermissions = {
-      items: permissions.map(p => pendingPermissionPromptToFrame(p, { peerId: sessionId, sessionKey }, asOf))
+      items: permissions.map((p) => pendingPermissionPromptToFrame(p, { peerId: sessionId, sessionKey }, asOf))
         .filter((p): p is Record<string, unknown> => p !== null),
       completeness: permissions.length === 64 ? 'truncated' : 'complete',
     }
@@ -99,11 +149,8 @@ export async function buildSessionSnapshot(
     snapshot.pendingPermissions.completeness = 'unavailable'
   }
   const requestedAfterBase = Number.isSafeInteger(options.afterSeq) && options.afterSeq! > 0 ? options.afterSeq! : 0
-  const anyAgentAfterPositive = !!options.afterSeqByAgent && Object.values(options.afterSeqByAgent).some(
-    v => typeof v === 'number' && Number.isSafeInteger(v) && v > 0,
-  )
   if (!row) {
-    if ((requestedAfterBase > 0 || anyAgentAfterPositive) && typeof options.containerId === 'number' &&
+    if (hasPositiveCursor(options) && typeof options.containerId === 'number' &&
         Number.isSafeInteger(options.containerId) && options.containerId > 0) {
       const lastDispatch = (await q.query<{ agent_container_id: string | number | null }>(
         `/* session-snapshot-container-cursor */
@@ -126,7 +173,7 @@ export async function buildSessionSnapshot(
   }
   const streamKey = `dispatch:${row.dispatch_id}:${row.attempt_no}`
   snapshot.streamKey = streamKey
-  // A failed optional credit query must not abort the transaction's state read.
+  // Keep credit isolation ONLY on active/requested dispatch rows (never on idle sessions).
   await q.query('SAVEPOINT session_snapshot_credits')
   try {
     snapshot.credits = await readDispatchSettledCredits(q, {
@@ -138,10 +185,20 @@ export async function buildSessionSnapshot(
   await q.query('RELEASE SAVEPOINT session_snapshot_credits')
   if (row.status === 'terminal' && !snapshot.recovery) snapshot.reconcile = terminalDispatchReconcile(row.outcome)
   const stream = (await q.query<{
-    projection_source: string; provenance: { containerLinkGap?: SessionSnapshot['gap'] }; frame_seq: string | null; created_at: Date | null
+    projection_source: string
+    provenance: { containerLinkGap?: SessionSnapshot['gap'] }
+    latest_turn_status_json?: unknown
+    latest_turn_usage_json?: unknown
+    latest_turn_status_seq?: string | number | null
+    latest_turn_usage_seq?: string | number | null
+    frame_seq: string | null
+    created_at: Date | null
   }>(
     `/* session-snapshot-watermark */
-     SELECT s.projection_source, s.provenance, f.frame_seq, f.created_at
+     SELECT s.projection_source, s.provenance,
+            s.latest_turn_status_json, s.latest_turn_usage_json,
+            s.latest_turn_status_seq, s.latest_turn_usage_seq,
+            f.frame_seq, f.created_at
        FROM client_session_live_streams s
        LEFT JOIN LATERAL (
          SELECT frame_seq,created_at FROM client_session_live_frames
@@ -154,35 +211,164 @@ export async function buildSessionSnapshot(
   snapshot.lastFrameSeq = stream?.frame_seq == null ? null : Number(stream.frame_seq)
   snapshot.lastFrameAt = stream?.created_at?.getTime() ?? null
 
-  // BYTEA can contain JSON strings that PostgreSQL JSONB cannot represent
-  // (e.g. escaped NUL / lone surrogates). Narrow by wire-type bytes, then
-  // JSON.parse and verify the top-level type in JS. Page past false positives
-  // such as nested objects; never cap the latest-usage search at 64 tail frames.
-  let latestStatus: Record<string, unknown> | null = null
-  let before: [string, string] | null = null
-  while (!latestStatus || !snapshot.usage) {
-    const facts: { rows: SnapshotFact[] } = await q.query<SnapshotFact>(
-      `/* session-snapshot-facts */
-       SELECT record_id::text,frame_seq,payload FROM client_session_live_frames
-        WHERE stream_key=$1 AND ($2::bigint IS NULL OR (frame_seq,record_id)<($2::bigint,$3::bigint))
-          AND octet_length(payload)<=65536
-          AND (position($4::bytea IN payload)>0 OR position($5::bytea IN payload)>0)
-        ORDER BY frame_seq DESC,record_id DESC LIMIT 64`,
-      [streamKey, before?.[0] ?? null, before?.[1] ?? null,
-        Buffer.from('"outbound.turn_status"'), Buffer.from('"outbound.turn_usage"')],
-    )
-    for (const fact of facts.rows) {
-      const payload = JSON.parse(fact.payload.toString('utf8')) as Record<string, unknown>
-      if (!snapshot.usage && payload.type === 'outbound.turn_usage') {
-        snapshot.usage = { frameSeq: Number(fact.frame_seq), usage: payload.usage as TurnTokenUsageSnapshot }
-      } else if (!latestStatus && payload.type === 'outbound.turn_status') latestStatus = payload
-    }
-    if (facts.rows.length < 64) break
-    const last = facts.rows[facts.rows.length - 1]!
-    before = [last.frame_seq, last.record_id]
+  const needStatus = row.status === 'admitted' || row.status === 'accepted'
+  const hasFrames = snapshot.lastFrameSeq !== null
+
+  // OCV5-824 B5: 3-state tracked pointer semantics:
+  //   seq === 0        -> tracked stream known to have NO fact of this kind (0 BYTEA scans)
+  //   seq > 0 + JSON   -> O(1) JSONB pointer hit (0 BYTEA scans)
+  //   seq > 0 + NULL   -> non-JSONB-safe latest frame (e.g. NUL/surrogate): exact frame_seq lookup
+  //   seq === null     -> legacy pre-0350 stream: strictly scanned-row-bounded (record_id DESC) CTE
+  const statusSeq = parseOptionalNonNegativeSeq(stream?.latest_turn_status_seq)
+  const usageSeq = parseOptionalNonNegativeSeq(stream?.latest_turn_usage_seq)
+  let latestStatus = parseLatestTurnStatusPointer(stream?.latest_turn_status_json)
+  snapshot.usage = parseLatestTurnUsagePointer(stream?.latest_turn_usage_json)
+
+  const exactSeqs: number[] = []
+  if (hasFrames && needStatus && !latestStatus && statusSeq !== null && statusSeq > 0) {
+    exactSeqs.push(statusSeq)
   }
-  if (row.status === 'admitted' || row.status === 'accepted') {
-    snapshot.engineReady = await readOpenDispatchEngineReady(q, { dispatchId: row.dispatch_id, attemptNo: row.attempt_no })
+  if (hasFrames && !snapshot.usage && usageSeq !== null && usageSeq > 0 && !exactSeqs.includes(usageSeq)) {
+    exactSeqs.push(usageSeq)
+  }
+  if (exactSeqs.length > 0) {
+    const exactFacts = await q.query<{ frame_seq: string; payload: Buffer }>(
+      `/* session-snapshot-fact-by-seq */
+       SELECT frame_seq::text, payload
+         FROM client_session_live_frames
+        WHERE stream_key=$1
+          AND frame_seq = ANY($2::bigint[])
+          AND octet_length(payload) <= 65536
+        ORDER BY record_id DESC
+        LIMIT $3`,
+      [streamKey, exactSeqs, exactSeqs.length],
+    )
+    for (const fact of exactFacts.rows) {
+      const seqNum = Number(fact.frame_seq)
+      let payload: Record<string, unknown>
+      try {
+        const raw = JSON.parse(fact.payload.toString('utf8')) as unknown
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+        payload = raw as Record<string, unknown>
+      } catch {
+        continue
+      }
+      if (!snapshot.usage && usageSeq === seqNum && payload.type === 'outbound.turn_usage') {
+        snapshot.usage = { frameSeq: seqNum, usage: payload.usage as TurnTokenUsageSnapshot }
+      } else if (needStatus && !latestStatus && statusSeq === seqNum && payload.type === 'outbound.turn_status') {
+        latestStatus = payload
+      }
+    }
+  }
+
+  const needLegacyStatus = needStatus && !latestStatus && statusSeq === null
+  const needLegacyUsage = !snapshot.usage && usageSeq === null
+  let latestStatusSeq = -1
+  let legacyFactsTruncated = false
+  let legacyFactsOldestScannedSeq: number | null = null
+  if (hasFrames && (needLegacyStatus || needLegacyUsage)) {
+    let beforeCursor: [string, string] | null = null
+    let lastHasMoreEarlier = false
+    let lastMinFrameSeq: number | null = null
+    for (
+      let pageNo = 0;
+      pageNo < SESSION_SNAPSHOT_FACTS_MAX_PAGES &&
+      ((needLegacyStatus && !latestStatus) || (needLegacyUsage && !snapshot.usage));
+      pageNo++
+    ) {
+      type BoundedFactRow = {
+        record_id: string | null
+        frame_seq: string | null
+        payload: Buffer | null
+        scanned_count: number
+        has_more_earlier: boolean
+        min_frame_seq: string | null
+        min_record_id: string | null
+      }
+      const facts: { rows: BoundedFactRow[] } = await q.query<BoundedFactRow>(
+        `/* session-snapshot-facts */
+         WITH win_plus AS MATERIALIZED (
+           SELECT record_id, frame_seq, payload
+             FROM client_session_live_frames
+            WHERE stream_key=$1
+              AND frame_seq IS NOT NULL
+              AND ($2::bigint IS NULL OR (frame_seq, record_id) < ($2::bigint, $3::bigint))
+            ORDER BY frame_seq DESC, record_id DESC
+            LIMIT $4
+         ), win AS (
+           SELECT record_id, frame_seq, payload
+             FROM win_plus
+            ORDER BY frame_seq DESC, record_id DESC
+            LIMIT $5
+         ), meta AS (
+           SELECT (SELECT COUNT(*)::int FROM win) AS scanned_count,
+                  ((SELECT COUNT(*) FROM win_plus) > $5) AS has_more_earlier,
+                  tail.frame_seq::text AS min_frame_seq,
+                  tail.record_id::text AS min_record_id
+             FROM (SELECT 1) AS one
+             LEFT JOIN LATERAL (
+               SELECT frame_seq, record_id
+                 FROM win
+                ORDER BY frame_seq ASC, record_id ASC
+                LIMIT 1
+             ) tail ON TRUE
+         )
+         SELECT w.record_id::text, w.frame_seq::text, w.payload,
+                m.scanned_count, m.has_more_earlier, m.min_frame_seq, m.min_record_id
+           FROM meta m
+           LEFT JOIN win w
+             ON octet_length(w.payload) <= 65536
+            AND (position($6::bytea IN w.payload) > 0 OR position($7::bytea IN w.payload) > 0)
+          ORDER BY w.frame_seq DESC NULLS LAST, w.record_id DESC NULLS LAST`,
+        [
+          streamKey,
+          beforeCursor?.[0] ?? null,
+          beforeCursor?.[1] ?? null,
+          SESSION_SNAPSHOT_FACTS_SCAN_WINDOW + 1,
+          SESSION_SNAPSHOT_FACTS_SCAN_WINDOW,
+          Buffer.from('"outbound.turn_status"'),
+          Buffer.from('"outbound.turn_usage"'),
+        ],
+      )
+      const metaRow = facts.rows[0]
+      if (!metaRow || metaRow.scanned_count === 0) {
+        lastHasMoreEarlier = false
+        break
+      }
+      for (const fact of facts.rows) {
+        if (fact.record_id === null || fact.frame_seq === null || fact.payload === null) continue
+        const factSeq = Number(fact.frame_seq)
+        if (!Number.isSafeInteger(factSeq)) continue
+        let payload: Record<string, unknown>
+        try {
+          const raw = JSON.parse(fact.payload.toString('utf8')) as unknown
+          if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+          payload = raw as Record<string, unknown>
+        } catch {
+          continue
+        }
+        if (needLegacyUsage && payload.type === 'outbound.turn_usage' && (!snapshot.usage || factSeq > snapshot.usage.frameSeq)) {
+          snapshot.usage = { frameSeq: factSeq, usage: payload.usage as TurnTokenUsageSnapshot }
+        } else if (needLegacyStatus && payload.type === 'outbound.turn_status' && (!latestStatus || factSeq > latestStatusSeq)) {
+          latestStatus = payload
+          latestStatusSeq = factSeq
+        }
+      }
+      lastHasMoreEarlier = metaRow.has_more_earlier === true
+      lastMinFrameSeq = metaRow.min_frame_seq != null ? Number(metaRow.min_frame_seq) : null
+      if (!lastHasMoreEarlier || !metaRow.min_frame_seq || !metaRow.min_record_id) break
+      beforeCursor = [metaRow.min_frame_seq, metaRow.min_record_id]
+    }
+    const stillMissingLegacyFact = (needLegacyStatus && !latestStatus) || (needLegacyUsage && !snapshot.usage)
+    if (stillMissingLegacyFact && lastHasMoreEarlier) {
+      legacyFactsTruncated = true
+      legacyFactsOldestScannedSeq = lastMinFrameSeq !== null && Number.isSafeInteger(lastMinFrameSeq) ? lastMinFrameSeq : 1
+    }
+  }
+  if (needStatus) {
+    snapshot.engineReady = hasFrames
+      ? await readOpenDispatchEngineReady(q, { dispatchId: row.dispatch_id, attemptNo: row.attempt_no })
+      : false
     snapshot.turnStatus = openDispatchTurnStatusSnapshotFrame({
       peerId: sessionId, agentId, clientMessageId: row.client_message_id,
       engineReady: snapshot.engineReady, admittedAt: row.admitted_at, now: asOf, credits: snapshot.credits,
@@ -209,6 +395,10 @@ export async function buildSessionSnapshot(
     snapshot.gap = { reason: 'tape' }
     return snapshot
   }
+  if (!hasFrames) {
+    snapshot.gap ??= reset ? { reason: 'cursor_reset' } : containerLinkGap
+    return snapshot
+  }
   const page = await q.query<{
     record_id: string; frame_seq: string; payload: Buffer | null; payload_sha256: string
   }>(
@@ -229,23 +419,24 @@ export async function buildSessionSnapshot(
   for (const frame of page.rows.slice(0, limit)) {
     if (frame.payload === null) {
       if (!reset) {
-        // Fetch exact bytes through the existing payload endpoint, then advance
-        // to frameSeq. Do not silently skip a frame or loop at the same cursor.
         snapshot.gap = { reason: 'byte_limit', recordId: frame.record_id, sha256: frame.payload_sha256, frameSeq: Number(frame.frame_seq) }
       }
       snapshot.hasMore = true
       break
     }
     if (snapshot.nextAfterSeq > 0 && Number(frame.frame_seq) > snapshot.nextAfterSeq + 1) {
-      // A session-scoped sequence can include non-journalled sidebands. Report
-      // the observed discontinuity, without claiming those bytes are recoverable.
       sequenceGap ??= { reason: 'sequence_gap', afterSeq: snapshot.nextAfterSeq, beforeSeq: Number(frame.frame_seq) }
     }
     snapshot.frames.push({ recordId: frame.record_id, frameSeq: Number(frame.frame_seq), payload: JSON.parse(frame.payload.toString('utf8')) })
     snapshot.nextAfterSeq = Number(frame.frame_seq)
   }
   snapshot.hasMore ||= page.rows.length > limit
-  snapshot.gap ??= reset ? { reason: 'cursor_reset' } : containerLinkGap ?? sequenceGap ?? (snapshot.hasMore ? { reason: 'page_limit' } : null)
+  const legacyFactsGap: SessionSnapshot['gap'] = legacyFactsTruncated
+    ? { reason: 'sequence_gap', afterSeq: 0, beforeSeq: legacyFactsOldestScannedSeq ?? 1 }
+    : null
+  snapshot.gap ??= reset
+    ? { reason: 'cursor_reset' }
+    : containerLinkGap ?? sequenceGap ?? (snapshot.hasMore ? { reason: 'page_limit' } : legacyFactsGap)
   return snapshot
 }
 
@@ -259,7 +450,211 @@ export async function readSessionSnapshot(
     await client.query('COMMIT')
     return result
   } catch (error) {
-    await client.query('ROLLBACK')
+    try { await client.query('ROLLBACK') } catch { /* preserve original error */ }
     throw error
   } finally { client.release() }
+}
+
+export interface BatchSessionSnapshotTarget {
+  sessionId: string
+  options?: SessionSnapshotOptions
+}
+
+/**
+ * Batch-read WS `hello` snapshots for multiple sessions inside ONE
+ * `REPEATABLE READ READ ONLY` transaction (OCV5-824), eliminating the 64-serial
+ * transaction storm while preserving exact single-session snapshot semantics.
+ *
+ * All queries on the single `PoolClient` execute strictly sequentially.
+ */
+export async function readSessionSnapshotsBatch(
+  pool: Pool,
+  uid: string,
+  targets: readonly BatchSessionSnapshotTarget[],
+  batchOptions?: { containerId?: number },
+): Promise<Map<string, SessionSnapshot>> {
+  const result = new Map<string, SessionSnapshot>()
+  if (!/^[1-9][0-9]*$/.test(uid) || targets.length === 0) return result
+  const uniqueTargets: BatchSessionSnapshotTarget[] = []
+  const seen = new Set<string>()
+  for (const t of targets) {
+    if (!t.sessionId || seen.has(t.sessionId)) continue
+    seen.add(t.sessionId)
+    uniqueTargets.push(t)
+  }
+  if (uniqueTargets.length === 0) return result
+
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
+    const requestedIds = uniqueTargets.map((t) => t.sessionId)
+    const ownedRows = (await client.query<{ session_id: string; as_of: string }>(
+      `/* session-snapshot-batch-owner */
+       SELECT id AS session_id,
+              (EXTRACT(EPOCH FROM clock_timestamp())*1000)::bigint AS as_of
+         FROM client_sessions
+        WHERE user_id=$1 AND deleted_at IS NULL AND id=ANY($2::text[])`,
+      [`c:${uid}`, requestedIds],
+    )).rows
+    if (ownedRows.length === 0) {
+      await client.query('COMMIT')
+      return result
+    }
+    const asOfBySession = new Map<string, number>()
+    for (const r of ownedRows) asOfBySession.set(r.session_id, Number(r.as_of))
+    const ownedTargets = uniqueTargets.filter((t) => asOfBySession.has(t.sessionId))
+    const ownedIds = ownedTargets.map((t) => t.sessionId)
+
+    const openDispatches = (await client.query<{ session_id: string }>(
+      `/* session-snapshot-batch-dispatch */
+       SELECT DISTINCT session_id
+         FROM turn_dispatches
+        WHERE user_id=$1::bigint AND session_id=ANY($2::text[])
+          AND status IN ('admitted','accepted','rejecting')`,
+      [uid, ownedIds],
+    )).rows
+    const openSessionSet = new Set(openDispatches.map((r) => r.session_id))
+
+    const detailedTargets: BatchSessionSnapshotTarget[] = []
+    const idleTargets: BatchSessionSnapshotTarget[] = []
+    for (const t of ownedTargets) {
+      if (openSessionSet.has(t.sessionId) || t.options?.clientMessageId) {
+        detailedTargets.push(t)
+      } else {
+        idleTargets.push(t)
+      }
+    }
+
+    if (idleTargets.length > 0) {
+      const idleIds = idleTargets.map((t) => t.sessionId)
+      const recoveryRows = (await client.query<RecoveryRow & { session_id: string }>(
+        `/* session-snapshot-batch-recovery */
+         SELECT DISTINCT ON (session_id)
+                session_id, status, semantic_recovery_attempt,
+                request_json->'_automaticRecoveryRetryLimit' AS retry_limit
+           FROM turn_recovery_jobs
+          WHERE user_id=$1::bigint AND session_id=ANY($2::text[])
+            AND status IN ('queued','leased','sent','forwarded')
+          ORDER BY session_id, created_at DESC, job_id DESC`,
+        [uid, idleIds],
+      )).rows
+      const recoveryBySession = new Map<string, RecoveryRow>()
+      for (const r of recoveryRows) recoveryBySession.set(r.session_id, r)
+
+      const permissionsBySession = new Map<string, SessionSnapshot['pendingPermissions']>()
+      const uidBig = BigInt(uid)
+      const MAX_TARGETED_PERMISSION_REFILLS = 8
+      let targetedRefills = 0
+      for (let i = 0; i < idleIds.length; i += HELLO_PENDING_PERMISSION_MAX_SESSIONS) {
+        const chunk = idleIds.slice(i, i + HELLO_PENDING_PERMISSION_MAX_SESSIONS)
+        const perSessionQuota = Math.max(
+          1,
+          Math.min(64, Math.floor(HELLO_PENDING_PERMISSION_MAX_TOTAL_ROWS / chunk.length)),
+        )
+        try {
+          const scan = await readPendingPermissionPromptsForSessions(client, {
+            userId: uidBig,
+            sessionIds: chunk,
+            limitPerSession: 64,
+          })
+          const uncovered = new Set(scan.uncoveredSessionIds)
+          for (const sid of chunk) {
+            const asOf = asOfBySession.get(sid) ?? Date.now()
+            const sessionKey = `agent:main:webchat:dm:${sid.replace(/[^a-zA-Z0-9_-]/g, '_')}`
+            const rows = scan.bySession.get(sid) ?? []
+            const hitPerSessionQuota = rows.length >= perSessionQuota
+            // OCV5-824 B6: readPendingPermissionPromptsForSessions clamps each
+            // session to floor(64 / chunk.length). When a session hits that
+            // fair-share quota, do a targeted single-session refill (up to 64)
+            // within a bounded budget, or conservatively mark 'truncated' so
+            // prompts are never silently truncated under 'complete'.
+            if (hitPerSessionQuota && perSessionQuota < 64 && targetedRefills < MAX_TARGETED_PERMISSION_REFILLS) {
+              targetedRefills += 1
+              try {
+                const fullRows = await readPendingPermissionPrompts(client, {
+                  userId: uidBig,
+                  sessionId: sid,
+                  limit: 64,
+                })
+                const items = fullRows
+                  .map((p) => pendingPermissionPromptToFrame(p, { peerId: sid, sessionKey }, asOf))
+                  .filter((p): p is Record<string, unknown> => p !== null)
+                permissionsBySession.set(sid, {
+                  items,
+                  completeness: fullRows.length >= 64 ? 'truncated' : 'complete',
+                })
+                continue
+              } catch {
+                permissionsBySession.set(sid, { items: [], completeness: 'unavailable' })
+                continue
+              }
+            }
+            const items = rows
+              .map((p) => pendingPermissionPromptToFrame(p, { peerId: sid, sessionKey }, asOf))
+              .filter((p): p is Record<string, unknown> => p !== null)
+            permissionsBySession.set(sid, {
+              items,
+              completeness: uncovered.has(sid) || hitPerSessionQuota || rows.length >= 64 ? 'truncated' : 'complete',
+            })
+          }
+        } catch {
+          for (const sid of chunk) {
+            permissionsBySession.set(sid, { items: [], completeness: 'unavailable' })
+          }
+        }
+      }
+
+      const containerId = batchOptions?.containerId
+      const cursorCheckIds = typeof containerId === 'number' && Number.isSafeInteger(containerId) && containerId > 0
+        ? idleTargets.filter((t) => hasPositiveCursor(t.options ?? {})).map((t) => t.sessionId)
+        : []
+      const lastContainerBySession = new Map<string, number>()
+      if (cursorCheckIds.length > 0) {
+        const cursorRows = (await client.query<{ session_id: string; agent_container_id: string | number | null }>(
+          `/* session-snapshot-batch-container-cursor */
+           SELECT DISTINCT ON (session_id)
+                  session_id, agent_container_id
+             FROM turn_dispatches
+            WHERE user_id=$1::bigint AND session_id=ANY($2::text[])
+              AND agent_container_id IS NOT NULL
+            ORDER BY session_id, admitted_at DESC, dispatch_id DESC`,
+          [uid, cursorCheckIds],
+        )).rows
+        for (const r of cursorRows) {
+          if (r.agent_container_id != null) lastContainerBySession.set(r.session_id, Number(r.agent_container_id))
+        }
+      }
+      const cursorCheckSet = new Set(cursorCheckIds)
+
+      for (const t of idleTargets) {
+        const asOf = asOfBySession.get(t.sessionId)!
+        const snap = emptySessionSnapshot(t.sessionId, asOf)
+        snap.recovery = buildRecoveryState(recoveryBySession.get(t.sessionId))
+        snap.pendingPermissions = permissionsBySession.get(t.sessionId) ?? { items: [], completeness: 'complete' }
+        if (cursorCheckSet.has(t.sessionId)) {
+          const lastCid = lastContainerBySession.get(t.sessionId)
+          if (lastCid === undefined || lastCid !== containerId) {
+            snap.gap = { reason: 'cursor_reset' }
+          }
+        }
+        result.set(t.sessionId, snap)
+      }
+    }
+
+    for (const t of detailedTargets) {
+      const snap = await buildSessionSnapshot(client, uid, t.sessionId, {
+        ...(t.options ?? {}),
+        ...(typeof batchOptions?.containerId === 'number' ? { containerId: batchOptions.containerId } : {}),
+      })
+      if (snap) result.set(t.sessionId, snap)
+    }
+
+    await client.query('COMMIT')
+    return result
+  } catch (error) {
+    try { await client.query('ROLLBACK') } catch { /* preserve original error */ }
+    throw error
+  } finally {
+    client.release()
+  }
 }

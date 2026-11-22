@@ -219,6 +219,23 @@
     "platform-auth-crypto"
    ]
   },
+  "adapters-openai": {
+   "layer": "L2",
+   "match": [
+    "packages/commercial/src/openai/**"
+   ],
+   "scope": [
+    "master"
+   ],
+   "authorities": [
+    "net"
+   ],
+   "allow": [
+    "platform-config",
+    "storage"
+   ],
+   "note": "OpenAI platform key, omni-moderation and skill-embedding adapter"
+  },
   "storage": {
    "layer": "L2",
    "match": [
@@ -571,6 +588,49 @@
     "identity"
    ]
   },
+  "media-studio": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/media-studio/**"
+   ],
+   "scope": [
+    "master"
+   ],
+   "allow": [
+    "identity",
+    "billing",
+    "muse"
+   ],
+   "note": "Media Studio domain: orchestrator, compose, providers, store; HTTP handlers and wiring are interface-http"
+  },
+  "sites": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/sites/**"
+   ],
+   "scope": [
+    "master"
+   ],
+   "allow": [
+    "identity"
+   ],
+   "note": "Sites hosting domain: service, repo, edge runner/sandbox/server, env crypto; HTTP handlers and wiring are interface-http"
+  },
+  "pending-decisions": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/pendingDecisions/**"
+   ],
+   "scope": [
+    "master"
+   ],
+   "allow": [
+    "identity",
+    "connectors",
+    "dispatch"
+   ],
+   "note": "Pending decisions hub, IM command bridge, browser handoff store and connector action policy"
+  },
   "tutorials": {
    "layer": "L3",
    "match": [
@@ -719,6 +779,19 @@
     "master"
    ]
   },
+  "system-assistant": {
+   "layer": "L4",
+   "match": [
+    "packages/commercial/src/system-assistant/**"
+   ],
+   "scope": [
+    "master"
+   ],
+   "allow": [
+    "app-container"
+   ],
+   "note": "System assistant orchestration and read/preference/metadata operations; HTTP handlers and wiring are interface-http"
+  },
   "gateway-delegation": {
    "layer": "L4",
    "match": [
@@ -762,7 +835,16 @@
     "packages/commercial/src/middleware/**",
     "packages/commercial/src/muse/bridgeHttp.ts",
     "packages/commercial/src/muse/internalHttp.ts",
-    "packages/commercial/src/muse/assemble.ts"
+    "packages/commercial/src/muse/assemble.ts",
+    "packages/commercial/src/media-studio/http.ts",
+    "packages/commercial/src/media-studio/assemble.ts",
+    "packages/commercial/src/sites/browserHttp.ts",
+    "packages/commercial/src/sites/internalHttp.ts",
+    "packages/commercial/src/sites/assemble.ts",
+    "packages/commercial/src/system-assistant/browserHttp.ts",
+    "packages/commercial/src/system-assistant/internalHttp.ts",
+    "packages/commercial/src/system-assistant/assemble.ts",
+    "packages/commercial/src/tavily/webSearchProxy.ts"
    ],
    "scope": [
     "master"
@@ -803,7 +885,10 @@
   "commercial-bootstrap": {
    "layer": "L6",
    "match": [
-    "packages/commercial/src/index.ts"
+    "packages/commercial/src/index.ts",
+    "packages/commercial/src/commercialRegistrationTypes.ts",
+    "packages/commercial/src/runtimeStatus.ts",
+    "packages/commercial/src/bootstrap/**"
    ],
    "scope": [
     "master"
@@ -854,6 +939,7 @@
    "layer": "F5",
    "match": [
     "packages/web-react/src/App.tsx",
+    "packages/web-react/src/appLazyViews.tsx",
     "packages/web-react/src/main.tsx",
     "packages/web-react/src/registerSW.ts"
    ],

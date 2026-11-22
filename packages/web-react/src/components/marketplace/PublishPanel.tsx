@@ -314,10 +314,10 @@ function SubmitBar({
   const [expanded, setExpanded] = useState(false);
   const collapsed = missing.length > MISSING_INLINE_MAX && !expanded;
   return (
-    <div className="sticky bottom-0 -mx-4 flex flex-wrap items-center justify-between gap-2 border-t border-border bg-surface/95 px-4 py-3 backdrop-blur">
+    <div className="oc-surface-glass sticky bottom-0 -mx-4 flex flex-wrap items-center justify-between gap-2.5 border-x-0 border-b-0 border-t border-border/80 px-4 py-3 shadow-none sm:-mx-6 sm:px-6">
       <div className="min-w-0 flex-1 basis-40">
         {missing.length > 0 ? (
-          <p className="text-caption text-warning">
+          <p className="text-caption tabular-nums text-warning">
             还差 {missing.length} 项必填
             {collapsed ? (
               <>
@@ -368,7 +368,7 @@ function SubmitBar({
         loading={submitting}
         onClick={onSubmit}
       >
-        {submitting ? null : <Upload size={15} />}
+        {submitting ? null : <Upload size={15} strokeWidth={1.85} />}
         发布到市场
       </Button>
     </div>
@@ -386,19 +386,21 @@ function DoneScreen({
   plugin?: boolean;
 }) {
   return (
-    <div className="flex flex-col items-center gap-3 px-6 py-16 text-center">
-      <CheckCircle2 size={32} className="text-success" />
-      <p className="text-title font-medium text-fg">已提交，等待平台审核</p>
-      <p className="max-w-sm text-body text-muted">
+    <div className="oc-surface-card flex flex-col items-center gap-3.5 rounded-2xl px-6 py-14 text-center">
+      <span aria-hidden="true" className="oc-icon-badge oc-icon-badge-success size-14 rounded-2xl">
+        <CheckCircle2 size={26} strokeWidth={1.85} />
+      </span>
+      <p className="text-title font-semibold tracking-tight text-fg">已提交，等待平台审核</p>
+      <p className="max-w-sm text-body leading-relaxed text-muted">
         {plugin
           ? "插件会先由 AI 核对完整技术声明与安全决策；真实凭据在用户绑定时由身份探针验证，不确定、内容过大或高风险项会转人工复核。审核进度会在市场内实时更新。"
           : "AI 审核通常几分钟内完成；通过后将上架并对其他用户可见，需要人工复核的会稍慢。"}
       </p>
-      <div className="flex flex-wrap items-center justify-center gap-2">
+      <div className="mt-1 flex flex-wrap items-center justify-center gap-2">
         <Button variant="primary" size="sm" onClick={onViewProgress}>
           查看审核进度
         </Button>
-        <Button variant="ghost" size="sm" onClick={onAgain}>
+        <Button variant="secondary" size="sm" onClick={onAgain}>
           继续发布
         </Button>
       </div>
@@ -755,9 +757,14 @@ export function PublishPanel({
 
   return (
     <div className="marketplace-publish mx-auto flex w-full min-w-0 max-w-[860px] flex-col gap-4 px-4 py-4 sm:px-6">
-      <header className="pt-1">
-        <h2 className="text-title font-semibold text-fg">发布到市场</h2>
-        <p className="mt-1 text-meta text-muted">把你做好的技能、智能体或插件分享给其他人。</p>
+      <header className="flex items-center gap-3 pt-1">
+        <span aria-hidden="true" className="oc-icon-badge oc-icon-badge-accent size-9 rounded-xl">
+          <Upload size={17} strokeWidth={1.85} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <h2 className="text-title font-semibold tracking-tight text-fg">发布到市场</h2>
+          <p className="mt-0.5 text-meta text-muted">把你做好的技能、智能体或插件分享给其他人。</p>
+        </div>
       </header>
       {confirmEl}
       <div ref={publishesRef}>
@@ -786,13 +793,16 @@ export function PublishPanel({
         <button
           type="button"
           onClick={() => onCreateInChat(kind)}
-          className="group flex w-full items-center gap-3 rounded-xl border border-accent/30 bg-accent-soft/40 px-4 py-3 text-left outline-none transition-colors hover:border-accent/60 hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring"
+          className="oc-surface-card oc-surface-card-hover group flex w-full items-center gap-3.5 rounded-xl border-accent/30 bg-accent-soft/35 px-4 py-3.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
-          <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
-            <Sparkles size={17} />
+          <span
+            aria-hidden="true"
+            className="oc-icon-badge oc-icon-badge-accent size-10 rounded-xl transition-transform duration-200 group-hover:scale-[1.04]"
+          >
+            <Sparkles size={18} strokeWidth={1.85} />
           </span>
           <span className="min-w-0 flex-1">
-            <span className="block text-section font-semibold text-fg">
+            <span className="block text-section font-semibold tracking-tight text-fg">
               在对话中创建
               {kind === "skill" ? "技能" : kind === "agent" ? "智能体" : "插件"}（推荐）
             </span>
@@ -804,7 +814,8 @@ export function PublishPanel({
           </span>
           <ChevronRight
             size={16}
-            className="shrink-0 text-faint transition-transform group-hover:translate-x-0.5"
+            strokeWidth={1.85}
+            className="shrink-0 text-faint transition-transform duration-150 group-hover:translate-x-0.5 group-hover:text-accent"
           />
         </button>
       )}
@@ -1304,10 +1315,10 @@ function SkillPublishForm({
                 还没有附属文件。参考资料、评测用例、脚本都可以随技能一起发布。
               </p>
             ) : (
-              <ul className="flex flex-col gap-2">
+              <ul className="flex flex-col gap-3">
                 {d.files.map((f, i) => (
-                  <li key={i} className="flex flex-col gap-1.5 rounded-lg border border-border p-2">
-                    <div className="flex items-center gap-2">
+                  <li key={i} className="oc-code-shell flex flex-col">
+                    <div className="oc-code-shell-header flex items-center gap-2 px-2.5 py-2">
                       <Input
                         inputSize="sm"
                         aria-label={`附属文件 ${i + 1} 路径`}
@@ -1334,20 +1345,22 @@ function SkillPublishForm({
                         <X size={15} />
                       </IconButton>
                     </div>
-                    <Textarea
-                      aria-label={`附属文件 ${i + 1} 内容`}
-                      value={f.content}
-                      onChange={(e) => {
-                        const v = e.target.value;
-                        draft.set((cur) => ({
-                          files: cur.files.map((x, j) => (j === i ? { ...x, content: v } : x)),
-                        }));
-                        setBundleErrors([]);
-                      }}
-                      rows={4}
-                      placeholder="文件内容…"
-                      className="resize-y font-mono"
-                    />
+                    <div className="p-2">
+                      <Textarea
+                        aria-label={`附属文件 ${i + 1} 内容`}
+                        value={f.content}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          draft.set((cur) => ({
+                            files: cur.files.map((x, j) => (j === i ? { ...x, content: v } : x)),
+                          }));
+                          setBundleErrors([]);
+                        }}
+                        rows={4}
+                        placeholder="文件内容…"
+                        className="resize-y font-mono"
+                      />
+                    </div>
                   </li>
                 ))}
               </ul>
@@ -1756,8 +1769,10 @@ function AgentPublishForm({
                   <Checkbox
                     key={t.value}
                     className={cn(
-                      "flex items-center rounded-lg border px-3 py-2 transition-colors",
-                      checked ? "border-accent/50 bg-accent-soft text-fg" : "border-border text-muted",
+                      "oc-btn-tactile flex items-center rounded-lg border px-3 py-2",
+                      checked
+                        ? "border-accent/45 bg-accent-soft text-fg"
+                        : "border-border bg-surface text-muted hover:border-border-strong",
                       t.locked && "opacity-100",
                     )}
                     checked={checked}
@@ -1827,10 +1842,10 @@ function AgentPublishForm({
                           : "点击设为必需依赖"
                       }
                       className={cn(
-                        "rounded-full border px-2.5 py-1 text-meta outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3",
+                        "oc-btn-tactile rounded-full border px-2.5 py-1 text-meta outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3",
                         selected
-                          ? "border-accent/50 bg-accent-soft text-accent"
-                          : "border-border text-muted hover:border-accent/40 hover:text-fg",
+                          ? "oc-badge-craft border-accent/45 bg-accent-soft text-accent"
+                          : "border-border/80 bg-surface text-muted hover:border-border-strong hover:text-fg",
                       )}
                     >
                       {selected ? (selected.optional ? "可选 · " : "必需 · ") : ""}
@@ -2279,7 +2294,7 @@ function MyPublishes({
   const isOpen = open ?? pending + rejected > 0;
 
   return (
-    <div className="overflow-hidden rounded-xl border border-border bg-elevated">
+    <div className="oc-surface-card overflow-hidden rounded-xl">
       {confirmEl}
       <button
         type="button"
@@ -2287,22 +2302,25 @@ function MyPublishes({
         aria-expanded={isOpen}
         // 列表只在展开时挂载:收起态不能留一个指向空气的 IDREF(t-762 market#2;同 SkillsPanel 写法)。
         aria-controls={isOpen ? "my-publishes-list" : undefined}
-        className="flex w-full items-center gap-2 px-3.5 py-2.5 text-left outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        className="flex w-full items-center gap-2 px-4 py-3 text-left outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
       >
         <ChevronRight
           size={15}
-          className={cn("shrink-0 text-faint transition-transform", isOpen && "rotate-90")}
+          strokeWidth={1.85}
+          className={cn("shrink-0 text-faint transition-transform duration-150", isOpen && "rotate-90")}
         />
-        <span className="text-body font-medium text-fg">我的发布（{rows.length}）</span>
+        <span className="text-section font-semibold tracking-tight text-fg tabular-nums">
+          我的发布（{rows.length}）
+        </span>
         <span className="flex items-center gap-1.5">
           {pending > 0 && <Badge tone="warning">{pending} 审核中</Badge>}
           {rejected > 0 && <Badge tone="danger">{rejected} 未通过</Badge>}
         </span>
       </button>
       {isOpen && (
-        <ul id="my-publishes-list" className="flex flex-col border-t border-border">
+        <ul id="my-publishes-list" className="flex flex-col border-t border-border/80">
           {error && (
-            <li className="border-b border-border px-3.5 py-2.5">
+            <li className="border-b border-border/80 px-4 py-2.5">
               <Alert
                 tone="danger"
                 density="compact"
@@ -2317,7 +2335,7 @@ function MyPublishes({
             </li>
           )}
           {actionErr && (
-            <li className="border-b border-border px-3.5 py-2.5">
+            <li className="border-b border-border/80 px-4 py-2.5">
               <Alert tone="danger" density="compact" onDismiss={() => setActionErr(null)}>
                 {actionErr}
               </Alert>
@@ -2338,10 +2356,13 @@ function MyPublishes({
             const canUnlist = r.status === "approved" && r.isCurrent && r.listingState === "active";
             const canRefill = r.status === "rejected";
             return (
-              <li key={r.versionId} className="border-b border-border px-3.5 py-3 last:border-b-0">
+              <li
+                key={r.versionId}
+                className="border-b border-border/80 px-4 py-3 transition-colors last:border-b-0 hover:bg-hover/40"
+              >
                 <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-body font-medium text-fg">{r.name}</span>
-                  <span className="shrink-0 text-caption text-faint">v{r.version}</span>
+                  <span className="text-body font-semibold tracking-tight text-fg">{r.name}</span>
+                  <span className="shrink-0 text-caption tabular-nums text-faint">v{r.version}</span>
                   {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
                   {marketplaceArtifactKind(r) === "plugin" && <Badge tone="info">插件</Badge>}
                   <Badge tone={meta.tone}>{meta.label}</Badge>
@@ -2350,7 +2371,7 @@ function MyPublishes({
                   )}
                   <TimeAgo
                     value={r.createdAt}
-                    className="ml-auto shrink-0 text-caption text-faint"
+                    className="ml-auto shrink-0 text-caption tabular-nums text-faint"
                   />
                 </div>
                 {r.status === "pending" && (
@@ -2360,8 +2381,8 @@ function MyPublishes({
                 )}
                 {withdrawn && <p className="mt-1.5 text-meta text-muted">你已撤销此提交。</p>}
                 {!withdrawn && r.status === "rejected" && r.reviewNote && (
-                  <p className="mt-1.5 text-meta leading-relaxed text-muted">
-                    <span className="font-medium text-danger">拒绝理由：</span>
+                  <p className="oc-callout oc-callout-danger mt-2 rounded-lg px-3 py-2 text-meta leading-relaxed text-fg">
+                    <span className="font-semibold text-danger">拒绝理由：</span>
                     {r.reviewNote}
                   </p>
                 )}

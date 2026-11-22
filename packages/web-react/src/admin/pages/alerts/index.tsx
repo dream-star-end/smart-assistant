@@ -1,4 +1,4 @@
-import { AlertTriangle, BookOpen, Check, Clock3 } from "lucide-react";
+import { AlertTriangle, Bell, BellRing, BookOpen, Check, Clock3 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { Badge, Button, Tabs, useToast } from "../../../components/ui";
 import { PageHeader, SectionCard, TimeAgo } from "../../components";
@@ -42,6 +42,11 @@ export default function AlertsPage() {
     { intervalMs: 15_000 },
   );
 
+  const firingCount = useMemo(
+    () => (ruleStatesQ.data?.rows ?? []).filter((r) => r.classification === "firing").length,
+    [ruleStatesQ.data],
+  );
+
   const openSilence = (ruleId: string) => {
     setSilenceRule(ruleId);
     setTab("silences");
@@ -49,13 +54,26 @@ export default function AlertsPage() {
 
   return (
     <div className="flex flex-col gap-5">
-      <PageHeader title={meta.title} desc={meta.desc} />
+      <PageHeader
+        icon={Bell}
+        title={meta.title}
+        desc={meta.desc}
+        badge={
+          firingCount > 0 ? (
+            <Badge tone="danger" className="tabular-nums">
+              {firingCount} 条触发中
+            </Badge>
+          ) : undefined
+        }
+      />
       <AlertActionQueue
         query={ruleStatesQ}
         onOpenRules={() => setTab("rules")}
         onSilence={openSilence}
       />
-      <Tabs value={tab} onValueChange={setTab} items={TAB_ITEMS} aria-label="告警中心分区" />
+      <div className="flex items-center justify-between gap-3">
+        <Tabs value={tab} onValueChange={setTab} items={TAB_ITEMS} aria-label="告警中心分区" />
+      </div>
 
       {tab === "channels" && <ChannelsTab events={events} />}
       {tab === "outbox" && <OutboxTab events={events} />}
@@ -126,35 +144,55 @@ function AlertActionQueue({
     }
   };
 
+  const sectionTone = counts.firing > 0 ? "danger" : counts.stale > 0 ? "warning" : "success";
+
   return (
     <SectionCard
       title="当前行动队列"
       hint={`firing ${counts.firing} · recovered ${counts.recovered} · stale ${counts.stale}`}
-      action={<Button variant="secondary" size="sm" onClick={onOpenRules}>查看全部规则</Button>}
+      icon={BellRing}
+      iconTone={sectionTone}
+      action={
+        <Button variant="secondary" size="sm" onClick={onOpenRules} className="oc-btn-tactile">
+          查看全部规则
+        </Button>
+      }
     >
       {query.error ? (
-        <div className="flex items-center gap-2 text-body text-danger"><AlertTriangle size={15} />加载行动队列失败：{errText(query.error)}</div>
+        <div className="oc-callout oc-callout-danger flex items-center gap-2 rounded-xl px-3.5 py-2.5 text-body text-danger">
+          <AlertTriangle size={15} className="shrink-0" />
+          加载行动队列失败：{errText(query.error)}
+        </div>
       ) : query.loading && !query.data ? (
-        <div className="h-20 animate-pulse rounded-lg bg-hover" />
+        <div className="h-20 animate-pulse rounded-xl bg-hover" />
       ) : actionable.length === 0 ? (
-        <div className="flex items-center gap-2 text-body text-muted"><Check size={15} className="text-success" />当前没有 firing 或 stale 告警。</div>
+        <div className="oc-callout oc-callout-success flex items-center gap-2 rounded-xl px-3.5 py-2.5 text-body text-fg">
+          <Check size={15} className="shrink-0 text-success" />
+          当前没有 firing 或 stale 告警。
+        </div>
       ) : (
-        <ul className="divide-y divide-border">
+        <ul className="flex flex-col gap-2.5">
           {actionable.map((row) => {
             const stale = classificationOf(row) === "stale";
             const runbook = safeRunbookHref(row.last_payload ?? {});
             const incidentId = incidentIdOf(row.last_payload ?? {});
             return (
-              <li key={row.rule_id} className="flex flex-col gap-3 py-3 first:pt-0 last:pb-0 sm:flex-row sm:items-center sm:justify-between">
+              <li
+                key={row.rule_id}
+                className={`oc-callout ${stale || row.acked ? "oc-callout-warning" : "oc-callout-danger"} flex flex-col gap-3 rounded-xl px-4 py-3 sm:flex-row sm:items-center sm:justify-between`}
+              >
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
                     <Badge tone={stale || row.acked ? "warning" : "danger"}>
                       {stale ? "STALE" : row.acked ? "ACKED" : "FIRING"}
                     </Badge>
-                    <span className="break-all font-mono text-meta text-fg">{row.rule_id}</span>
+                    <span className="break-all font-mono text-meta font-semibold text-fg">
+                      {row.rule_id}
+                    </span>
                   </div>
-                  <p className="mt-1 flex items-center gap-1.5 text-meta text-muted">
-                    <Clock3 size={12} />持续时间 {row.last_transition_at ? <TimeAgo value={row.last_transition_at} /> : "未知"}
+                  <p className="mt-1.5 flex items-center gap-1.5 text-meta tabular-nums text-muted">
+                    <Clock3 size={12} className="shrink-0 text-faint" />
+                    持续时间 {row.last_transition_at ? <TimeAgo value={row.last_transition_at} /> : "未知"}
                   </p>
                   {stale && row.firing && (
                     <p className="mt-1 text-meta text-warning">
@@ -163,10 +201,33 @@ function AlertActionQueue({
                   )}
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
-                  {!stale && !row.acked && <Button variant="secondary" size="sm" onClick={() => void ack(row)}>确认</Button>}
-                  <Button variant="secondary" size="sm" onClick={() => onSilence(row.rule_id)}>静默</Button>
-                  {runbook && <a href={runbook} target="_blank" rel="noreferrer" className="inline-flex h-8 items-center gap-1 rounded-md px-2.5 text-meta font-medium text-accent outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"><BookOpen size={13} />runbook</a>}
-                  {incidentId && <a href={`#tab=selfheal&incident_id=${encodeURIComponent(incidentId)}`} className="inline-flex h-8 items-center rounded-md px-2.5 text-meta font-medium text-accent outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring">事故 #{incidentId}</a>}
+                  {!stale && !row.acked && (
+                    <Button variant="secondary" size="sm" onClick={() => void ack(row)} className="oc-btn-tactile">
+                      确认
+                    </Button>
+                  )}
+                  <Button variant="secondary" size="sm" onClick={() => onSilence(row.rule_id)} className="oc-btn-tactile">
+                    静默
+                  </Button>
+                  {runbook && (
+                    <a
+                      href={runbook}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="oc-btn-tactile oc-btn-secondary-craft inline-flex h-8 items-center gap-1 rounded-lg px-2.5 text-meta font-medium text-accent outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      <BookOpen size={13} />
+                      runbook
+                    </a>
+                  )}
+                  {incidentId && (
+                    <a
+                      href={`#tab=selfheal&incident_id=${encodeURIComponent(incidentId)}`}
+                      className="oc-btn-tactile oc-btn-secondary-craft inline-flex h-8 items-center rounded-lg px-2.5 text-meta font-medium text-accent outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      事故 #{incidentId}
+                    </a>
+                  )}
                 </div>
               </li>
             );

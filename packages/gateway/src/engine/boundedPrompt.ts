@@ -12,6 +12,7 @@ export async function prepareBoundedPrompt(opts: {
   maxBytes: number
   cwd: string
   engine: string
+  sessionKey?: string
   onEvent: (event: EngineContentEvent) => void
 }): Promise<string> {
   const bytes = (input: string): number => Buffer.byteLength(opts.serialize(input), 'utf8')
@@ -32,7 +33,7 @@ export async function prepareBoundedPrompt(opts: {
   } else {
     // Keep the complete input (including any injected history), not a clipped
     // preview. mkdtemp + exclusive create cannot overwrite workspace files.
-    const reference = await writeContextReference(opts.cwd, opts.input, 'input.txt')
+    const reference = await writeContextReference(opts.cwd, opts.input, 'input.txt', undefined, opts.sessionKey)
     const file = reference.file
     input = [
       'The complete input for this turn is stored in the UTF-8 file below because it exceeds the launch transport limit.',

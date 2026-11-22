@@ -43,4 +43,27 @@ describe("RepoPill", () => {
     expect(branch).toHaveClass("text-muted");
     expect(branch.className).not.toMatch(/opacity-/);
   });
+
+  it("支持 compact（微上下文条紧凑芯片）与 quiet（桌面未绑定无框轻入口）变体", () => {
+    const { rerender } = render(<RepoPill selection={null} onClick={() => {}} quiet />);
+    const quietBtn = screen.getByRole("button", { name: "关联 GitHub 仓库" });
+    expect(quietBtn).toHaveClass("border-transparent", "bg-transparent");
+
+    rerender(
+      <RepoPill
+        selection={{
+          selected: true,
+          owner: "acme",
+          repo: "web",
+          branch: "main",
+          status: "ready",
+          selection_version: 1,
+        }}
+        onClick={() => {}}
+        compact
+      />,
+    );
+    const compactBtn = screen.getByRole("button", { name: "代码仓库 acme/web，点击管理" });
+    expect(compactBtn).toHaveClass("py-0.5", "text-caption");
+  });
 });

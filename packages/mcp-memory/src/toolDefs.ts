@@ -866,3 +866,114 @@ export const SKILL_PROPOSE_TOOL = {
     required: ['name', 'op', 'rationale'],
   },
 }
+
+// Remote Antigravity Swarm orchestration tools (OCV5-835).
+// Exposed ONLY when OPENCLAUDE_REMOTE_SWARM_ENABLED=1 (remote Antigravity coordinator
+// and its spawned remote swarm workers); absent in local AGY and all non-AGY sessions.
+export const REMOTE_SWARM_TOOLS = [
+  {
+    name: 'swarm',
+    description: [
+      'Manage the Swarm of parallel remote Antigravity workers collaborating on the shared message board.',
+      'Actions:',
+      '  - title: name the swarm (`title` required; coordinator only).',
+      '  - add: spawn a worker (`name`, `brief`; optional `workspace`: "inherit" | "share" | "branch", `channels` to subscribe on creation, `n` for homogeneous copies, `tasks` for sharded copies, `model`). Leave `model` unset to inherit the session model.',
+      '  - status: list all swarm members, their states (`waiting` / `working` / `stopped` / `killed`), channels, and workspaces.',
+      '  - channel: manage named discussion channels (`op`: "list" | "create" | "join" | "leave" | "archive", `channel`, optional `topic`, `name`).',
+      '  - model: update a waiting worker model (`name`, `model`).',
+      '  - kill: permanently terminate a worker (`name`) and clean up its isolated worktree after landing its changes.',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['title', 'add', 'status', 'channel', 'model', 'kill', 'models'],
+          description: 'Swarm action to perform.',
+        },
+        name: { type: 'string', description: 'Worker roster name (lowercase a-z0-9_-).' },
+        brief: { type: 'string', description: 'Public assignment posted on the board for `add`.' },
+        title: { type: 'string', description: 'Short swarm title for `title`.' },
+        workspace: {
+          type: 'string',
+          enum: ['inherit', 'share', 'branch'],
+          description: 'Workspace isolation mode for `add` (`share` / `branch` creates a git worktree).',
+        },
+        model: { type: 'string', description: 'Optional model override (leave unset to inherit).' },
+        n: { type: 'number', description: 'Optional homogeneous worker count (1-8) for `add`.' },
+        tasks: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional per-worker shard targets for `add`.',
+        },
+        channels: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional channel names to subscribe spawned worker(s) to on `add` (first channel becomes primary brief channel).',
+        },
+        channel: { type: 'string', description: 'Channel name for `channel` action.' },
+        op: {
+          type: 'string',
+          enum: ['list', 'create', 'join', 'leave', 'archive'],
+          description: 'Sub-operation for `channel` action (default `list`).',
+        },
+        topic: { type: 'string', description: 'Optional channel topic for `channel` action.' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'post_message',
+    description: [
+      'Post a message to the shared Swarm message board. Use `@<name>` to wake a specific worker, `@all` to wake all active workers, or `@#<channel>` for channel broadcasts.',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'Message content to post.' },
+        channel: {
+          type: 'string',
+          description: 'Optional existing channel name (defaults to `main`, or the worker\'s primary subscribed channel).',
+        },
+      },
+      required: ['text'],
+    },
+  },
+  {
+    name: 'read_board',
+    description:
+      'Read messages from the shared Swarm message board, optionally filtering by `since` post id, `channel`, `limit`, or UTF-8 `max_bytes`.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        since: { type: 'number', description: 'Only return posts with id > since.' },
+        channel: { type: 'string', description: 'Optional channel name filter (`*` for all channels).' },
+        limit: { type: 'number', description: 'Maximum number of recent posts to return (default 50, max 200).' },
+        max_bytes: {
+          type: 'number',
+          description: 'Maximum UTF-8 byte budget for returned posts (default 32768, max 131072).',
+        },
+      },
+    },
+  },
+  {
+    name: 'swarm_wait',
+    description:
+      'Block until new messages appear on the Swarm board after `since` (or until all working workers finish / timeout). Use this after spawning workers instead of polling in a loop.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        since: { type: 'number', description: 'Last seen board post id (default 0).' },
+        mentions_only: {
+          type: 'boolean',
+          description: 'Wake only on messages mentioning you (`@name`/`@all`/`@#channel`, default true). Pass false to wake on any post in subscribed channels.',
+        },
+        channel: { type: 'string', description: 'Optional channel name filter.' },
+        timeout_seconds: {
+          type: 'number',
+          description: 'Maximum seconds to wait (default 240, max 300).',
+        },
+      },
+    },
+  },
+]

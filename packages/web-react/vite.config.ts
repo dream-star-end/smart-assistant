@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import { defineConfig, type Plugin } from "vite";
@@ -7,6 +9,59 @@ import tailwindcss from "@tailwindcss/vite";
 import { forbiddenTaskboardEntryImports } from "./src/lib/forbidTaskboardEntryImport";
 import { describeFirstScreenBudget, firstScreenBudgetReport } from "./src/lib/firstScreenBudget";
 import { deferEntryStylesheets } from "./src/lib/nonBlockingCss";
+
+type WebBudgets = {
+  firstScreenGzipBytes: number;
+  firstScreenGzipWarnBytes: number;
+  cssTotalRawBytes: number;
+};
+
+function loadWebBudgets(): WebBudgets {
+  const budgetPath = fileURLToPath(new URL("./budgets.json", import.meta.url));
+  const parsed = JSON.parse(readFileSync(budgetPath, "utf8")) as Partial<WebBudgets>;
+  const { firstScreenGzipBytes, firstScreenGzipWarnBytes, cssTotalRawBytes } = parsed;
+  if (
+    !Number.isInteger(firstScreenGzipBytes) ||
+    (firstScreenGzipBytes as number) <= 0 ||
+    !Number.isInteger(firstScreenGzipWarnBytes) ||
+    (firstScreenGzipWarnBytes as number) <= 0 ||
+    !Number.isInteger(cssTotalRawBytes) ||
+    (cssTotalRawBytes as number) <= 0
+  ) {
+    throw new Error(
+      [
+        "[GATE-ERROR] UI-BUDGETS-SCHEMA at packages/web-react/budgets.json",
+        "  Violation : budgets.json must define positive integer firstScreenGzipBytes, firstScreenGzipWarnBytes, and cssTotalRawBytes",
+        "  Why       : 首屏与 CSS 体积预算是受 A 类 CODEOWNERS 保护的硬门禁真源",
+        "  How to Fix: 恢复 packages/web-react/budgets.json 中三个正整数字段（只降不升）",
+        "  Re-verify : npm run build:web-react",
+      ].join("\n"),
+    );
+  }
+  return {
+    firstScreenGzipBytes: firstScreenGzipBytes as number,
+    firstScreenGzipWarnBytes: firstScreenGzipWarnBytes as number,
+    cssTotalRawBytes: cssTotalRawBytes as number,
+  };
+}
+
+function measureCssRawBytes(srcDir: string): { totalBytes: number; fileCount: number } {
+  let totalBytes = 0;
+  let fileCount = 0;
+  const walk = (dir: string) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (entry.name.endsWith(".css")) {
+        totalBytes += statSync(full).size;
+        fileCount += 1;
+      }
+    }
+  };
+  walk(srcDir);
+  return { totalBytes, fileCount };
+}
 
 /**
  * 前端构建身份(版本握手单一权威):对最终 index.html(资产标签已注入)取
@@ -123,7 +178,10 @@ function forbidTaskboardEntryImport(): Plugin {
  * ceil(460.6/10)*10 = 470.0KB = 481280(~9.4KB 余量)。可逆:改回常量即恢复。
  * 纯函数与单测在 src/lib/firstScreenBudget。
  */
-const FIRST_SCREEN_GZIP_BUDGET = 481280;
+const WEB_BUDGETS = loadWebBudgets();
+const FIRST_SCREEN_GZIP_BUDGET = WEB_BUDGETS.firstScreenGzipBytes;
+const FIRST_SCREEN_GZIP_WARN_BUDGET = WEB_BUDGETS.firstScreenGzipWarnBytes;
+const CSS_TOTAL_RAW_BUDGET = WEB_BUDGETS.cssTotalRawBytes;
 
 function firstScreenBudget(): Plugin {
   return {
@@ -147,12 +205,41 @@ function firstScreenBudget(): Plugin {
         gzipSync(Buffer.from(code), { level: 9 }).length,
       );
       if (report.overBudget) {
-        throw new Error(`first-screen-budget:\n${describeFirstScreenBudget(report)}`);
+        throw new Error(
+          [
+            "[GATE-ERROR] UI-FIRST-SCREEN-BUDGET at packages/web-react/budgets.json",
+            `  Violation : ${describeFirstScreenBudget(report)}`,
+            "  Why       : 首屏 470 KiB gzip 硬预算不可抬升（OCV5-847 / budgets.json 受 A 类 CODEOWNERS 保护）",
+            "  How to Fix: 将非首屏模块改为动态 import / 可重建懒加载工厂，勿上调 budgets.json",
+            "  Re-verify : npm run build:web-react",
+          ].join("\n"),
+        );
+      }
+      if (report.totalGzipBytes > FIRST_SCREEN_GZIP_WARN_BUDGET) {
+        console.warn(
+          `[GATE-WARN] first-screen-budget approaching cap: ${report.totalGzipBytes} > warn ${FIRST_SCREEN_GZIP_WARN_BUDGET} bytes gzip (hard cap ${FIRST_SCREEN_GZIP_BUDGET}, remaining ${FIRST_SCREEN_GZIP_BUDGET - report.totalGzipBytes} bytes)`,
+        );
       }
       // 每次构建都把余量摆出来,而不是等超了才看到(OCV5-376)。
       console.log(
-        `first-screen-budget: ${report.totalGzipBytes} / ${FIRST_SCREEN_GZIP_BUDGET} bytes gzip, ` +
-          `margin ${FIRST_SCREEN_GZIP_BUDGET - report.totalGzipBytes}`,
+        `first-screen-budget: ${report.totalGzipBytes} / ${FIRST_SCREEN_GZIP_BUDGET} bytes gzip, margin ${FIRST_SCREEN_GZIP_BUDGET - report.totalGzipBytes}`,
+      );
+
+      const cssDir = fileURLToPath(new URL("./src", import.meta.url));
+      const cssMeasure = measureCssRawBytes(cssDir);
+      if (cssMeasure.totalBytes > CSS_TOTAL_RAW_BUDGET) {
+        throw new Error(
+          [
+            "[GATE-ERROR] UI-CSS-RAW-BUDGET at packages/web-react/budgets.json",
+            `  Violation : src/**/*.css raw total ${cssMeasure.totalBytes} bytes (${cssMeasure.fileCount} files) > budget ${CSS_TOTAL_RAW_BUDGET} bytes`,
+            "  Why       : 全包 CSS 总原始字节受只降不升棘轮保护（OCV5-847）",
+            "  How to Fix: 复用 styles.css 既有 Atelier 原语与语义 Token，清理冗余样式规则，勿上调 budgets.json",
+            "  Re-verify : npm run build:web-react",
+          ].join("\n"),
+        );
+      }
+      console.log(
+        `css-raw-budget: ${cssMeasure.totalBytes} / ${CSS_TOTAL_RAW_BUDGET} bytes raw (${cssMeasure.fileCount} files), margin ${CSS_TOTAL_RAW_BUDGET - cssMeasure.totalBytes}`,
       );
     },
   };

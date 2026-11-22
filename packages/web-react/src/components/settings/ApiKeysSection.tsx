@@ -471,18 +471,25 @@ export function ApiKeysSection({
       )}
 
       <section
-        className="rounded-2xl border border-accent/20 bg-accent-soft/30 p-4 sm:p-5"
+        className="oc-surface-card rounded-2xl p-4 sm:p-5"
         data-testid="guide-ccswitch"
       >
         <div className="mb-4 flex items-start gap-3">
-          <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-accent text-accent-fg">
-            <PlugZap size={20} />
+          <span
+            className="oc-btn-accent-craft flex size-10 shrink-0 items-center justify-center rounded-xl bg-accent text-accent-fg"
+            aria-hidden
+          >
+            <PlugZap size={20} strokeWidth={1.75} />
           </span>
           <div className="min-w-0 flex-1">
-            <h3 className="text-section font-semibold text-fg">用 CC Switch 一键接入</h3>
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="text-section font-semibold text-fg">用 CC Switch 一键接入</h3>
+              <Badge tone="accent" size="sm">
+                推荐
+              </Badge>
+            </div>
             <p className="mt-1 text-meta text-muted">准备密钥 → 导入配置 → 在本机开始使用</p>
           </div>
-          <span className="rounded-full bg-surface px-2 py-1 text-caption text-accent">推荐</span>
         </div>
         <Tabs
           aria-label="密钥来源"
@@ -496,7 +503,7 @@ export function ApiKeysSection({
             { value: "existing", label: "使用已有密钥" },
           ]}
         />
-        <div className="mt-3">
+        <div className="oc-surface-recessed mt-3 rounded-xl p-3.5">
           {keySource === "new" ? (
             <div className="space-y-3">
               <div className="flex items-center gap-2">
@@ -506,7 +513,7 @@ export function ApiKeysSection({
                   onChange={(e) => setLabel(e.target.value)}
                   placeholder="新密钥名称（如 my-cli）"
                   maxLength={64}
-                  className="h-auto bg-bg px-3 py-2 text-section"
+                  className="bg-surface"
                   onKeyDown={(e) => {
                     // 中文输入法选词的回车不是提交(审计 SET-24；与 CreateOrgWizard 同一守卫)。
                     if (e.key === "Enter" && !e.nativeEvent.isComposing) create();
@@ -524,14 +531,15 @@ export function ApiKeysSection({
               </div>
 
               {keySource === "new" && justCreated && (
-                <Alert tone="warning" className="mb-3 flex flex-col gap-2 text-meta">
+                <Alert tone="warning" className="mb-1 flex flex-col gap-2 text-meta">
                   <span>请立即复制并妥善保存，关闭后将无法再次查看完整密钥。</span>
-                  <div className="flex items-center gap-2">
-                    <code className="min-w-0 flex-1 truncate rounded-md bg-bg px-2 py-1 font-mono text-meta text-fg">
+                  <div className="oc-code-shell flex items-center gap-2 px-2.5 py-1.5">
+                    <code className="min-w-0 flex-1 truncate font-mono text-meta text-fg">
                       {justCreated.plaintext}
                     </code>
-                    <Button variant="secondary" size="sm" onClick={copyPlaintext}>
-                      <Copy size={13} /> {copied ? "已复制" : "复制"}
+                    <Button variant="secondary" size="sm" onClick={copyPlaintext} className="shrink-0">
+                      {copied ? <Check size={13} strokeWidth={2} /> : <Copy size={13} strokeWidth={1.75} />}{" "}
+                      {copied ? "已复制" : "复制"}
                     </Button>
                   </div>
                 </Alert>
@@ -578,7 +586,7 @@ export function ApiKeysSection({
               )}
               data-testid="ccswitch-deeplink"
             >
-              <ExternalLink size={15} /> 一键导入到 CC Switch
+              <ExternalLink size={15} strokeWidth={1.75} /> 一键导入到 CC Switch
             </a>
           ) : (
             <Button
@@ -588,7 +596,7 @@ export function ApiKeysSection({
               className="min-h-10 w-full sm:w-auto"
               data-testid="ccswitch-deeplink"
             >
-              <ExternalLink size={15} /> 一键导入到 CC Switch
+              <ExternalLink size={15} strokeWidth={1.75} /> 一键导入到 CC Switch
             </Button>
           )}
           <p
@@ -602,14 +610,14 @@ export function ApiKeysSection({
             {keyHint}
           </p>
         </div>
-        <div className="mt-4 border-t border-accent/15 pt-3 text-caption text-muted">
+        <div className="mt-4 border-t border-border pt-3 text-caption text-muted">
           <p>
             导入会将密钥交给本机 CC Switch，并直接切换为 Claude Code 当前供应商、开启用量查询，请勿分享导入链接。
           </p>
           <p className="mt-1">
-            导入后请<b>重新打开终端</b>再运行 <code className="font-mono">claude</code>
-            ；若之前手动设置过 <code className="font-mono">ANTHROPIC_API_KEY</code> /{" "}
-            <code className="font-mono">ANTHROPIC_AUTH_TOKEN</code> 环境变量，请先清掉，避免旧密钥与新密钥同时发送。
+            导入后请<b>重新打开终端</b>再运行 <code className="rounded-xs bg-code px-1 py-0.5 font-mono text-fg">claude</code>
+            ；若之前手动设置过 <code className="rounded-xs bg-code px-1 py-0.5 font-mono text-fg">ANTHROPIC_API_KEY</code> /{" "}
+            <code className="rounded-xs bg-code px-1 py-0.5 font-mono text-fg">ANTHROPIC_AUTH_TOKEN</code> 环境变量，请先清掉，避免旧密钥与新密钥同时发送。
           </p>
           <p className="mt-1">
             还未安装？{" "}
@@ -617,7 +625,7 @@ export function ApiKeysSection({
               href={CC_SWITCH_RELEASES}
               target="_blank"
               rel="noreferrer noopener"
-              className="text-accent hover:underline"
+              className="font-medium text-accent hover:underline"
             >
               下载 CC Switch <ExternalLink size={11} className="inline" />
             </a>{" "}
@@ -626,8 +634,8 @@ export function ApiKeysSection({
         </div>
       </section>
 
-      <div className="mt-4 rounded-xl border border-border bg-surface p-3">
-        <div className="flex items-center justify-between gap-2">
+      <div className="oc-code-shell mt-4">
+        <div className="oc-code-shell-header flex items-center justify-between gap-2 px-3.5 py-2">
           <span className="text-caption font-medium text-muted">API 端点 · Anthropic 兼容</span>
           <Button
             variant="ghost"
@@ -642,20 +650,23 @@ export function ApiKeysSection({
               }
             }}
           >
-            <Copy size={13} /> {endpointCopied ? "已复制" : "复制"}
+            {endpointCopied ? <Check size={13} strokeWidth={2} /> : <Copy size={13} strokeWidth={1.75} />}{" "}
+            {endpointCopied ? "已复制" : "复制"}
           </Button>
         </div>
-        <code className="mt-1 block select-all break-all font-mono text-meta text-fg">
+        <code className="block select-all break-all px-3.5 py-2.5 font-mono text-meta text-fg">
           {endpoint}
         </code>
       </div>
 
       <section className="mt-6" aria-label="密钥管理">
         <div className="mb-3 flex items-center gap-2">
-          <KeyRound size={16} className="text-muted" />
+          <span className="oc-icon-badge oc-icon-badge-accent h-7 w-7 rounded-sm" aria-hidden>
+            <KeyRound size={14} strokeWidth={1.75} />
+          </span>
           <h3 className="text-section font-semibold text-fg">密钥管理</h3>
           {keys && (
-            <span className="rounded-full bg-hover px-2 py-0.5 text-caption text-muted">
+            <span className="oc-badge-craft rounded-full bg-hover px-2 py-0.5 text-caption font-medium tabular-nums text-muted">
               {keys.length}
             </span>
           )}
@@ -665,12 +676,12 @@ export function ApiKeysSection({
             <Spinner /> 加载中…
           </div>
         ) : !keys || keys.length === 0 ? (
-          <p className="py-3 text-center text-meta text-faint">
+          <div className="oc-surface-recessed rounded-xl px-4 py-5 text-center text-meta text-faint">
             还没有 API Key。在上方「创建新密钥」里起个名（如 MacBook）即可创建第一把。
-          </p>
+          </div>
         ) : (
           <>
-            <ul className="flex flex-col gap-2" data-testid="api-keys-list">
+            <ul className="flex flex-col gap-2.5" data-testid="api-keys-list">
               {keyPage.pageRows.map((k) => (
                 <ApiKeyRow
                   key={k.id}
@@ -690,20 +701,20 @@ export function ApiKeysSection({
           </>
         )}
 
-        <p className="mt-3 flex items-start gap-1.5 text-caption text-faint">
-          <ShieldCheck size={14} className="shrink-0" />
+        <p className="mt-3 flex items-center gap-1.5 text-caption text-faint">
+          <ShieldCheck size={14} strokeWidth={1.75} className="shrink-0 text-success" />
           可随时停用、设置积分上限或撤销，不影响网页对话。
         </p>
       </section>
 
       <details
-        className="mt-5 rounded-xl border border-border p-3 text-caption"
+        className="oc-surface-card mt-5 rounded-xl p-3.5 text-caption"
         data-testid="guide-manual-ccswitch"
       >
         <summary className={FAQ_SUMMARY_CLASS}>
           手动配置 CC Switch · JSON
         </summary>
-        <ol className="mt-2 list-decimal space-y-1 pl-5 text-faint">
+        <ol className="mt-2.5 list-decimal space-y-1.5 pl-5 text-faint">
           <li>
             或手动添加：打开 CC Switch → <b>Claude Code</b> 标签 → 右上角 <b>+</b> 添加供应商 →
             预设选「<b>自定义</b>」。
@@ -724,70 +735,86 @@ export function ApiKeysSection({
             <code className="font-mono">claude</code>。
           </li>
         </ol>
-        <p className="mt-2 text-caption text-muted">
+        <p className="mt-2.5 text-caption text-muted">
           {keyReady
             ? "复制将包含完整密钥，请勿分享配置。已有密钥在预览中已隐藏。"
             : "以下是配置模板，请先在上方准备密钥。"}
         </p>
-        <div className="mt-2 flex items-start gap-2">
+        <div className="oc-code-shell mt-2">
+          <div className="oc-code-shell-header flex items-center justify-between gap-2 px-3 py-1.5">
+            <span className="font-mono text-caption text-faint">settings.json</span>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => copyBlock("ccswitch")}
+              className="shrink-0"
+            >
+              {copiedBlock === "ccswitch" ? (
+                <Check size={13} strokeWidth={2} />
+              ) : (
+                <Copy size={13} strokeWidth={1.75} />
+              )}{" "}
+              {copiedBlock === "ccswitch" ? "已复制" : "复制"}
+            </Button>
+          </div>
           <pre
-            className="min-w-0 flex-1 overflow-x-auto rounded-md bg-bg px-2 py-1.5 font-mono text-caption text-fg"
+            className="overflow-x-auto px-3 py-2.5 font-mono text-caption leading-relaxed text-fg"
             data-testid="ccswitch-config"
           >
             {keySource === "existing" && keyReady
               ? ccSwitchConfig.replace(candidateKey, "oc-cc.••••••••.••••••••")
               : ccSwitchConfig}
           </pre>
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => copyBlock("ccswitch")}
-            className="shrink-0"
-          >
-            <Copy size={13} /> {copiedBlock === "ccswitch" ? "已复制" : "复制"}
-          </Button>
         </div>
       </details>
 
       <details
-        className="mt-2 rounded-xl border border-border p-3 text-caption"
+        className="oc-surface-card mt-2.5 rounded-xl p-3.5 text-caption"
         data-testid="guide-usage"
       >
         <summary className={FAQ_SUMMARY_CLASS}>
           在 CC Switch 里查看余额与用量
         </summary>
-        <p className="mt-2 text-faint">
+        <p className="mt-2.5 text-faint">
           一键导入已自动开启。手动添加的供应商：卡片菜单 →「<b>用量查询</b>」→ 模板选「<b>自定义</b>
           」→ 把下面脚本整段贴进去 → 开启并「测试」。脚本用该供应商已填的端点与密钥请求{" "}
           <code className="select-all font-mono">GET {usageUrl}</code>
           ，显示当前可用积分、该密钥累计消耗与上限(无上限时显示 ∞)。
         </p>
-        <div className="mt-2 flex items-start gap-2">
+        <div className="oc-code-shell mt-2">
+          <div className="oc-code-shell-header flex items-center justify-between gap-2 px-3 py-1.5">
+            <span className="font-mono text-caption text-faint">usage-query.js</span>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => copyBlock("usage")}
+              className="shrink-0"
+            >
+              {copiedBlock === "usage" ? (
+                <Check size={13} strokeWidth={2} />
+              ) : (
+                <Copy size={13} strokeWidth={1.75} />
+              )}{" "}
+              {copiedBlock === "usage" ? "已复制" : "复制"}
+            </Button>
+          </div>
           <pre
-            className="min-w-0 flex-1 overflow-x-auto rounded-md bg-bg px-2 py-1.5 font-mono text-caption text-fg"
+            className="overflow-x-auto px-3 py-2.5 font-mono text-caption leading-relaxed text-fg"
             data-testid="usage-script"
           >
             {usageScript}
           </pre>
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => copyBlock("usage")}
-            className="shrink-0"
-          >
-            <Copy size={13} /> {copiedBlock === "usage" ? "已复制" : "复制"}
-          </Button>
         </div>
       </details>
 
       <details
-        className="mt-2 rounded-xl border border-border p-3 text-caption"
+        className="oc-surface-card mt-2.5 rounded-xl p-3.5 text-caption"
         data-testid="guide-troubleshoot"
       >
         <summary className={FAQ_SUMMARY_CLASS}>
           Claude Code 报 401 / Auth conflict 怎么办
         </summary>
-        <ul className="mt-2 list-disc space-y-1 pl-5 text-faint">
+        <ul className="mt-2.5 list-disc space-y-1.5 pl-5 text-faint">
           <li>
             <b>401 container identity verification failed</b>：密钥已撤销、已停用，或本机 Claude Code
             用的不是这把密钥。到 CC Switch 确认<b>当前选中</b>的供应商就是本站、密钥是密钥管理里仍有效的那一把；
@@ -828,11 +855,11 @@ export function ApiKeysSection({
       </details>
 
       <details
-        className="mt-2 rounded-xl border border-border p-3 text-caption"
+        className="oc-surface-card mt-2.5 rounded-xl p-3.5 text-caption"
         data-testid="guide-env"
       >
         <summary className={cn(FAQ_SUMMARY_CLASS, "font-normal")}>手动接入本地 Claude Code(环境变量)</summary>
-        <p className="mt-2 text-faint">
+        <p className="mt-2.5 text-faint">
           在本机终端设置以下环境变量后启动 <code className="font-mono">claude</code>
           。请求经本站 API Key 端点转发，按站内积分计费(余额为 0 或触达单 key 上限时返回 402)。
         </p>
@@ -841,25 +868,33 @@ export function ApiKeysSection({
             ? "复制将包含完整密钥，请勿分享配置。已有密钥在预览中已隐藏。"
             : "以下是配置模板，请先在上方准备密钥。"}
         </p>
-        <div className="mt-2 flex items-start gap-2">
+        <div className="oc-code-shell mt-2">
+          <div className="oc-code-shell-header flex items-center justify-between gap-2 px-3 py-1.5">
+            <span className="font-mono text-caption text-faint">shell · env</span>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => copyBlock("env")}
+              className="shrink-0"
+            >
+              {copiedBlock === "env" ? (
+                <Check size={13} strokeWidth={2} />
+              ) : (
+                <Copy size={13} strokeWidth={1.75} />
+              )}{" "}
+              {copiedBlock === "env" ? "已复制" : "复制"}
+            </Button>
+          </div>
           <pre
-            className="min-w-0 flex-1 overflow-x-auto rounded-md bg-bg px-2 py-1.5 font-mono text-caption text-fg"
+            className="overflow-x-auto px-3 py-2.5 font-mono text-caption leading-relaxed text-fg"
             data-testid="env-snippet"
           >
             {keySource === "existing" && keyReady
               ? claudeCodeSnippet.replace(candidateKey, "oc-cc.••••••••.••••••••")
               : claudeCodeSnippet}
           </pre>
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => copyBlock("env")}
-            className="shrink-0"
-          >
-            <Copy size={13} /> {copiedBlock === "env" ? "已复制" : "复制"}
-          </Button>
         </div>
-        <p className="mt-2 text-faint">
+        <p className="mt-2.5 text-faint">
           可用模型请求 <code className="select-all font-mono">GET {modelsUrl}</code>
           (带同一个 API Key)查询，返回 Anthropic / OpenAI 兼容的{" "}
           <code className="font-mono">data[].id</code>
@@ -942,12 +977,23 @@ function ApiKeyRow({
       // 状态文字一起压到 2.3–2.9:1。停用态只降非交互装饰 —— 描边改虚线、主名改 muted,
       // 控件与状态文字保持实色。
       className={cn(
-        "flex flex-col gap-2 rounded-xl border bg-surface p-3 transition-colors hover:border-accent/30",
-        disabled ? "border-dashed border-border-strong" : "border-border",
+        "flex flex-col gap-2.5 rounded-xl p-3.5 transition-all",
+        disabled
+          ? "border border-dashed border-border-strong bg-surface/80"
+          : "oc-surface-card oc-surface-card-hover",
       )}
       data-api-key-id={k.id}
     >
       <div className="flex items-center gap-3">
+        <span
+          className={cn(
+            "oc-icon-badge h-8 w-8 rounded-sm",
+            !disabled && "oc-icon-badge-accent",
+          )}
+          aria-hidden
+        >
+          <KeyRound size={14} strokeWidth={1.75} />
+        </span>
         <span className="min-w-0 flex-1">
           {editing === "label" ? (
             <span className="flex items-center gap-1">
@@ -971,8 +1017,13 @@ function ApiKeyRow({
               </IconBtn>
             </span>
           ) : (
-            <span className="flex items-center gap-1">
-              <span className={cn("truncate text-section", disabled ? "text-muted" : "text-fg")}>
+            <span className="flex items-center gap-1.5">
+              <span
+                className={cn(
+                  "truncate text-section font-medium",
+                  disabled ? "text-muted" : "text-fg",
+                )}
+              >
                 {k.label}
               </span>
               <IconBtn label="重命名" onClick={() => startEdit("label")} disabled={busy}>
@@ -986,9 +1037,12 @@ function ApiKeyRow({
               )}
             </span>
           )}
-          <span className="block truncate font-mono text-caption text-faint">
-            {k.keyPrefix}··· · {shortTime(k.createdAt)}
-            {k.lastUsedAt ? ` · 最近使用 ${shortTime(k.lastUsedAt)}` : " · 从未使用"}
+          <span className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-caption text-faint">
+            <code className="rounded-xs bg-code px-1.5 py-0.5 font-mono text-caption text-muted">
+              {k.keyPrefix}···
+            </code>
+            <span>· {shortTime(k.createdAt)}</span>
+            <span>{k.lastUsedAt ? `· 最近使用 ${shortTime(k.lastUsedAt)}` : "· 从未使用"}</span>
           </span>
         </span>
         <span className="flex shrink-0 items-center gap-1.5 text-caption text-faint">
@@ -1008,13 +1062,13 @@ function ApiKeyRow({
           onClick={onRemove}
           aria-label="撤销"
           title="撤销"
-          className="hover:bg-danger-soft hover:text-danger"
+          className="hover:text-danger"
         >
-          <Trash2 size={14} />
+          <Trash2 size={14} strokeWidth={1.75} />
         </IconButton>
       </div>
 
-      <div className="flex flex-wrap items-center gap-2 text-caption text-faint">
+      <div className="flex flex-wrap items-center gap-2 border-t border-border/60 pt-2 text-caption text-faint">
         <span className="shrink-0 tabular-nums">已用 {formatCredits(k.spentCredits)} 积分</span>
         {editing === "limit" ? (
           <span className="flex items-center gap-1">
@@ -1052,9 +1106,9 @@ function ApiKeyRow({
         )}
         {/* 触达上限只把进度条变红不够(色弱 / 扫读看不出，审计 SET-28)，补一句文字。 */}
         {pct !== null && pct >= 100 && (
-          <span className="rounded bg-danger-soft px-1.5 py-0.5 text-caption text-danger">
+          <Badge tone="danger" size="sm">
             已达上限
-          </span>
+          </Badge>
         )}
         {pct !== null && (
           <Progress

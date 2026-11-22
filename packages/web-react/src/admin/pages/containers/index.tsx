@@ -308,6 +308,7 @@ export default function ContainersPage() {
   return (
     <div className="flex flex-col gap-5">
       <PageHeader
+        icon={Boxes}
         title={meta.title}
         desc={meta.desc}
         actions={
@@ -368,6 +369,8 @@ export default function ContainersPage() {
 
       {/* 列表 */}
       <SectionCard
+        icon={Boxes}
+        iconTone="accent"
         title="Agent 容器"
         hint={
           list.loading
@@ -376,7 +379,7 @@ export default function ContainersPage() {
               ? `共 ${filtered.length} / ${rows.length} 条（过滤中）`
               : `共 ${rows.length} 条`
         }
-        bodyClassName="flex flex-col gap-3"
+        bodyClassName="flex flex-col gap-3.5"
       >
         <FilterBar>
           <SelectFilter
@@ -399,16 +402,16 @@ export default function ContainersPage() {
         </FilterBar>
 
         {hostFilter && (
-          <div className="flex items-center gap-2 text-meta text-faint">
+          <div className="oc-surface-recessed inline-flex w-fit items-center gap-2 rounded-lg px-3 py-1.5 text-meta text-muted">
             <span>虚机过滤：</span>
             <CopyChip value={hostFilter} />
           </div>
         )}
 
         {list.error ? (
-          <p className="px-1 py-8 text-center text-body text-danger">
+          <div className="oc-callout oc-callout-danger rounded-xl px-4 py-3 text-body text-danger">
             加载失败：{apiErrorMessage(list.error, '加载失败')}
-          </p>
+          </div>
         ) : (
           <DataTable
             columns={columns}

@@ -567,6 +567,9 @@ describe("SitesWorkspaceView", () => {
     );
 
     expect(await screen.findByRole("heading", { name: "协作站点" })).toBeInTheDocument();
+    // Back button uses unified "站点" terminology and thumb mounts zero iframes
+    expect(screen.getByRole("button", { name: "站点" })).toBeInTheDocument();
+    expect(document.querySelectorAll("iframe")).toHaveLength(0);
     // Owner-only controls must be hidden for editor
     expect(screen.queryByRole("button", { name: "删除站点" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "添加变量" })).not.toBeInTheDocument();

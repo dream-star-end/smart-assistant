@@ -48,10 +48,17 @@ export function parseMcpResources(output?: string | null): McpResourceParse | nu
 
 function ResourceRow({ item }: { item: McpResource }) {
   return (
-    <li className="rounded-lg border border-border bg-surface px-3 py-2">
-      <div className="break-words text-body font-medium text-fg">{item.name}</div>
-      {item.uri && <div className="mt-0.5 break-all font-mono text-caption text-faint">{item.uri}</div>}
-      {item.description && <div className="mt-0.5 break-words text-meta text-muted">{item.description}</div>}
+    <li className="oc-surface-card rounded-lg px-3 py-2.5">
+      <div className="flex items-start gap-2.5">
+        <span className="oc-icon-badge mt-0.5 size-6">
+          <Boxes size={13} strokeWidth={1.75} aria-hidden="true" />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="break-words text-body font-medium text-fg">{item.name}</div>
+          {item.uri && <div className="mt-0.5 break-all font-mono text-caption text-faint">{item.uri}</div>}
+          {item.description && <div className="mt-0.5 break-words text-meta text-muted">{item.description}</div>}
+        </div>
+      </div>
     </li>
   );
 }
@@ -62,9 +69,11 @@ export function renderMcpResourcesCard(output?: string | null): ReactNode | null
   const emptyText = parse.kind === "templates" ? "没有可用的 MCP 资源模板" : "没有已注册的 MCP 资源";
   if (parse.items.length === 0) {
     return (
-      <div className="rounded-xl border border-dashed border-border bg-elevated px-3 py-4 text-center">
-        <Boxes size={18} className="mx-auto text-faint" />
-        <div className="mt-1 text-body font-medium text-fg">{emptyText}</div>
+      <div className="oc-surface-recessed rounded-xl border-dashed px-4 py-5 text-center">
+        <span className="oc-icon-badge mx-auto size-9">
+          <Boxes size={16} strokeWidth={1.75} aria-hidden="true" />
+        </span>
+        <div className="mt-2 text-body font-medium text-fg">{emptyText}</div>
       </div>
     );
   }

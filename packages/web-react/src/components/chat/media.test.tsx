@@ -612,4 +612,29 @@ describe("ImageViewer 开启/下载时刷新签名(点击时签名不回归)", (
     // 气泡缩略 + 查看器原图各一次；下载本身不得再产生第三个网络请求。
     expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
   });
+
+  test("SignedFileCard 提供「工作台预览」主入口并派发 oc:open-workbench 事件", async () => {
+    const sign = makeSignMock();
+    const received: unknown[] = [];
+    const onOpen = (ev: Event) => received.push((ev as CustomEvent).detail);
+    window.addEventListener("oc:open-workbench", onOpen);
+    try {
+      render(
+        <MediaSignProvider sign={sign}>
+          <SignedFileCard src="/home/agent/.openclaude/workspace/report.md" filename="report.md" />
+        </MediaSignProvider>,
+      );
+      const previewBtn = await screen.findByTestId("signed-file-workbench-preview");
+      fireEvent.click(previewBtn);
+      expect(received).toEqual([
+        {
+          path: "/home/agent/.openclaude/workspace/report.md",
+          title: "report.md",
+          tab: "outputs",
+        },
+      ]);
+    } finally {
+      window.removeEventListener("oc:open-workbench", onOpen);
+    }
+  });
 });

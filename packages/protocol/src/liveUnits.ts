@@ -8,8 +8,15 @@
  */
 
 import { mintLiveProcessKey } from './timelineLifecycle.js'
+import {
+  SWARM_BOARD_TOOL_NAME,
+  compactSwarmSnapshotToByteBudget,
+  isSwarmSnapshot,
+  mergeSwarmSnapshotsStrict,
+  type SwarmSnapshot,
+} from './swarm.js'
 
-export const LIVE_UNITS_REDUCER_EPOCH = '2'
+export const LIVE_UNITS_REDUCER_EPOCH = '4'
 export const LIVE_UNITS_DEFAULT_N = 20
 export const LIVE_UNITS_MAX_N = 80
 export const LIVE_UNITS_DEFAULT_K = 20
@@ -107,6 +114,8 @@ export type LiveUnitState = {
   units: LiveUnit[]
   throughFrameSeq: number
   throughRecordId: string
+  /** Stream key paired atomically with `throughFrameSeq` / `throughRecordId` (OCV5-837). */
+  throughStreamKey?: string
   sessionKey?: string
   reducerEpoch: string
   /** SessionKey-reuse generation. Independent of reducerEpoch. */
@@ -119,6 +128,8 @@ export type LiveUnitsResume = {
   sessionKey: string
   frameSeq: number
   recordId: string
+  /** Authoritative live stream identity matching this resume cursor (OCV5-837). */
+  streamKey?: string
 }
 
 export type LiveUnitsPage = {
@@ -628,6 +639,7 @@ function reduceLiveFramesOnto(
   }
   let throughFrameSeq = seed.throughFrameSeq
   let throughRecordId = seed.throughRecordId
+  let throughStreamKey: string | undefined = seed.throughStreamKey
   let sessionKey: string | undefined = seed.sessionKey
 
   for (let i = 0; i < frames.length; i++) {
@@ -637,9 +649,29 @@ function reduceLiveFramesOnto(
     const frame = frames[i]!
     const streamGeneration = genFor(frame.streamKey)
     const meta = frameMeta(frame)
-    if (meta.seq > throughFrameSeq) throughFrameSeq = meta.seq
+    if (frame.streamKey) {
+      if (throughStreamKey && frame.streamKey !== throughStreamKey) {
+        // Stream switched: reset cursor watermark atomically to this new stream's record so
+        // (throughStreamKey, throughFrameSeq, sessionKey) never mix an older stream's seq
+        // with a newer streamKey (OCV5-837).
+        throughStreamKey = frame.streamKey
+        throughFrameSeq = meta.seq
+        sessionKey = meta.sessionKey || undefined
+      } else if (!throughStreamKey) {
+        if (throughFrameSeq === 0 || meta.seq > throughFrameSeq) {
+          throughStreamKey = frame.streamKey
+          throughFrameSeq = meta.seq
+          if (meta.sessionKey) sessionKey = meta.sessionKey
+        }
+      } else {
+        if (meta.seq > throughFrameSeq) throughFrameSeq = meta.seq
+        if (meta.sessionKey) sessionKey = meta.sessionKey
+      }
+    } else {
+      if (meta.seq > throughFrameSeq) throughFrameSeq = meta.seq
+      if (meta.sessionKey) sessionKey = meta.sessionKey
+    }
     throughRecordId = frame.recordId
-    if (meta.sessionKey) sessionKey = meta.sessionKey
     // Permission lifecycle frames are user-blocking control state, not message
     // blocks. The compact live-unit schema cannot represent them. Advancing a
     // resume cursor past either frame would make the browser skip the raw
@@ -651,7 +683,70 @@ function reduceLiveFramesOnto(
     if (meta.type === 'outbound.permission_request' || meta.type === 'outbound.permission_settled')
       return { ok: false, degraded: 'fallback' }
     if (meta.type !== 'outbound.message') continue
-    const block = meta.blocks[0]
+    // Fold live Antigravity swarm_snapshot blocks natively into a single latest-wins
+    // SwarmBoard tool unit (with monotonic revision guard + delta post merging).
+    // Do NOT clear openThinking so sideband telemetry never fragments streaming text.
+    const swarmBlocks = meta.blocks.filter((b) => str(b.kind) === 'swarm_snapshot')
+    if (swarmBlocks.length > 0) {
+      const cmid = frame.clientMessageId
+      for (const sBlock of swarmBlocks) {
+        if (!isSwarmSnapshot(sBlock.snapshot)) continue
+        const incoming = sBlock.snapshot
+        const blockId = str(sBlock.blockId) || `agy-swarm-${incoming.swarmId.slice(0, 8)}`
+        let unit = tools.get(blockId)
+        const existingSnap = extractSwarmSnapshotFromLiveUnit(unit)
+        const mergeRes = mergeSwarmSnapshotsStrict(existingSnap, incoming)
+        if (!mergeRes.ok) {
+          // A delta frame whose baseline post was evicted/missing must fail closed
+          // rather than certifying a gapped board and advancing the resume cursor (OCV5-819 B7).
+          if (mergeRes.reason === 'missing_base') {
+            return { ok: false, degraded: 'fallback' }
+          }
+          continue
+        }
+        const merged = mergeRes.snapshot
+        const isTerminal = merged.phase !== 'running' && merged.phase !== 'starting'
+        const inputJson = {
+          swarmId: merged.swarmId,
+          title: merged.title,
+          phase: merged.phase,
+          snapshot: merged,
+        }
+        if (!unit) {
+          unit = {
+            id: unitId('tool', blockId, meta.seq),
+            kind: 'tool',
+            seqFirst: meta.seq,
+            seqLast: meta.seq,
+            recordIdFirst: frame.recordId,
+            recordIdLast: frame.recordId,
+            open: !isTerminal,
+            clientMessageId: cmid,
+            sessionKey: meta.sessionKey,
+            blockId,
+            toolName: SWARM_BOARD_TOOL_NAME,
+            inputJson,
+            text: merged.title,
+            error: merged.phase === 'error' ? true : undefined,
+            payloadRef: meta.ref,
+          }
+          pushStampedUnit(units, unit, processKeys, streamGeneration)
+          tools.set(blockId, unit)
+        } else {
+          unit.toolName = SWARM_BOARD_TOOL_NAME
+          unit.blockId = blockId
+          unit.inputJson = inputJson
+          unit.text = merged.title
+          unit.open = !isTerminal
+          unit.error = merged.phase === 'error' ? true : undefined
+          unit.seqLast = meta.seq
+          unit.recordIdLast = frame.recordId
+          unit.payloadRef = meta.ref
+        }
+      }
+      if (swarmBlocks.length === meta.blocks.length) continue
+    }
+    const block = meta.blocks.find((b) => str(b.kind) !== 'swarm_snapshot')
     if (!block) continue
     const kind = str(block.kind)
     const cmid = frame.clientMessageId
@@ -660,8 +755,14 @@ function reduceLiveFramesOnto(
       const messageId = str(block.messageId) || undefined
       const key = `${kind}:${messageId || cmid || 'default'}`
       let unit = openThinking.get(key)
-      const last = units[units.length - 1]
-      if (!unit || unit !== last || unit.kind !== kind) {
+      let lastNonSwarm: MutableUnit | undefined
+      for (let j = units.length - 1; j >= 0; j -= 1) {
+        if (!isSwarmBoardUnit(units[j])) {
+          lastNonSwarm = units[j]
+          break
+        }
+      }
+      if (!unit || unit !== lastNonSwarm || unit.kind !== kind) {
         unit = {
           id: unitId(kind, key, meta.seq),
           kind,
@@ -884,12 +985,48 @@ function reduceLiveFramesOnto(
       units,
       throughFrameSeq,
       throughRecordId,
+      ...(throughStreamKey ? { throughStreamKey } : {}),
       sessionKey,
       reducerEpoch: LIVE_UNITS_REDUCER_EPOCH,
       streamGeneration: streamKeyLineage.length > 0 ? streamKeyLineage.length - 1 : (seed.streamGeneration ?? 0),
       streamKeyLineage,
     },
   }
+}
+
+const SWARM_CHECKPOINT_MAX_BYTES = 128 * 1024
+
+function isSwarmBoardUnit(unit: LiveUnit | undefined | null): boolean {
+  return Boolean(unit && unit.kind === 'tool' && unit.toolName === SWARM_BOARD_TOOL_NAME)
+}
+
+function isPinnedOpenUnit(unit: LiveUnit): boolean {
+  return unit.open && (unit.kind === 'agent_group' || isSwarmBoardUnit(unit))
+}
+
+function extractSwarmSnapshotFromLiveUnit(unit: LiveUnit | undefined | null): SwarmSnapshot | null {
+  if (!isSwarmBoardUnit(unit) || !unit) return null
+  const input = unit.inputJson
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null
+  const rec = input as Record<string, unknown>
+  if (isSwarmSnapshot(rec.snapshot)) return rec.snapshot
+  if (isSwarmSnapshot(rec)) return rec
+  return null
+}
+
+function compactSwarmUnitEnvelope(unit: LiveUnit, maxBytes: number): boolean {
+  const snap = extractSwarmSnapshotFromLiveUnit(unit)
+  if (!snap) return false
+  const before = jsonSize(unit.inputJson)
+  if (before <= maxBytes) return false
+  const compacted = compactSwarmSnapshotToByteBudget(snap, maxBytes)
+  unit.inputJson = {
+    swarmId: compacted.swarmId,
+    title: compacted.title,
+    phase: compacted.phase,
+    snapshot: compacted,
+  }
+  return jsonSize(unit.inputJson) < before
 }
 
 function cloneUnit(unit: LiveUnit): LiveUnit {
@@ -928,7 +1065,12 @@ function applyPreviewToUnit(unit: LiveUnit, previewMax: number): boolean {
   let changed = false
   if (truncateField(unit as unknown as Record<string, unknown>, 'output', previewMax)) changed = true
   if (truncateField(unit as unknown as Record<string, unknown>, 'outputJson', previewMax)) changed = true
-  if (truncateField(unit as unknown as Record<string, unknown>, 'inputJson', previewMax)) changed = true
+  if (isSwarmBoardUnit(unit)) {
+    // Keep SwarmBoard snapshots structurally intact while respecting serving byte budgets.
+    if (compactSwarmUnitEnvelope(unit, Math.max(4096, previewMax))) changed = true
+  } else if (truncateField(unit as unknown as Record<string, unknown>, 'inputJson', previewMax)) {
+    changed = true
+  }
   if (unit.kind !== 'thinking' && unit.kind !== 'text') {
     if (truncateField(unit as unknown as Record<string, unknown>, 'text', previewMax)) changed = true
   } else if ((unit.text || '').length > previewMax) {
@@ -953,7 +1095,13 @@ function applyCheckpointStubsToUnit(unit: LiveUnit, previewMax: number): void {
   if (unit.kind !== 'thinking' && unit.kind !== 'text') {
     truncateField(unit as unknown as Record<string, unknown>, 'output', previewMax)
     truncateField(unit as unknown as Record<string, unknown>, 'outputJson', previewMax)
-    truncateField(unit as unknown as Record<string, unknown>, 'inputJson', previewMax)
+    if (isSwarmBoardUnit(unit)) {
+      // SwarmBoard accumulates delta posts across frames; retain a bounded full snapshot
+      // in checkpoints so reload/second-tab hydration renders the live board immediately.
+      compactSwarmUnitEnvelope(unit, SWARM_CHECKPOINT_MAX_BYTES)
+    } else {
+      truncateField(unit as unknown as Record<string, unknown>, 'inputJson', previewMax)
+    }
     if (unit.kind === 'tool') {
       truncateField(unit as unknown as Record<string, unknown>, 'text', previewMax)
     }
@@ -966,7 +1114,7 @@ function applyCheckpointStubsToUnit(unit: LiveUnit, previewMax: number): void {
 }
 
 function selectFirstPack(units: LiveUnit[], n: number): { pack: LiveUnit[]; hasMoreBefore: boolean; beforeCursor: string | null } {
-  const open = units.filter((u) => u.open && u.kind === 'agent_group')
+  const open = units.filter(isPinnedOpenUnit)
   const tail = units.slice(Math.max(0, units.length - n))
   const seen = new Set<string>()
   const pack: LiveUnit[] = []
@@ -976,7 +1124,7 @@ function selectFirstPack(units: LiveUnit[], n: number): { pack: LiveUnit[]; hasM
     pack.push(unit)
   }
   pack.sort((a, b) => a.seqFirst - b.seqFirst || a.id.localeCompare(b.id))
-  // before 游标按 tail 窗口，不含被并入的更早 open 组卡，避免漏掉组卡与尾窗之间的单元。
+  // before 游标按 tail 窗口，不含被并入的更早 open 组卡/蜂群卡，避免漏掉组卡与尾窗之间的单元。
   const tailMinSeq = tail[0]?.seqFirst
   const hasMoreBefore = typeof tailMinSeq === 'number' && units.some((u) => u.seqFirst < tailMinSeq)
   const beforeCursor = hasMoreBefore && typeof tailMinSeq === 'number' ? `u:${tailMinSeq}` : null
@@ -988,7 +1136,7 @@ function selectBeforePack(units: LiveUnit[], beforeSeq: number, n: number): {
   hasMoreBefore: boolean
   beforeCursor: string | null
 } {
-  const older = units.filter((u) => u.seqFirst < beforeSeq && !(u.open && u.kind === 'agent_group'))
+  const older = units.filter((u) => u.seqFirst < beforeSeq && !isPinnedOpenUnit(u))
   const pack = older.slice(Math.max(0, older.length - n))
   const hasMoreBefore = older.length > pack.length
   const beforeCursor = hasMoreBefore && pack[0] ? `u:${pack[0].seqFirst}` : null
@@ -1067,21 +1215,28 @@ function enforceBudget(pack: LiveUnit[], opts: {
   // first left a refresh showing only the subtask (OCV5-275).
   if (over() && opts.keepOpenChrome) {
     current = current.map((u) => {
-      if (!(u.open && u.kind === 'agent_group')) return u
-      const chrome = cloneUnit(u)
-      const hadChildren = (u.children?.length ?? 0) > 0
-      chrome.children = []
-      chrome.nestedHasMoreBefore = hadChildren || u.nestedHasMoreBefore === true
-      chrome.nestedBeforeCursor = hadChildren
-        ? (u.nestedBeforeCursor ?? 'c:0')
-        : (u.nestedBeforeCursor ?? null)
-      applyPreviewToUnit(chrome, opts.previewMax)
-      return chrome
+      if (u.open && u.kind === 'agent_group') {
+        const chrome = cloneUnit(u)
+        const hadChildren = (u.children?.length ?? 0) > 0
+        chrome.children = []
+        chrome.nestedHasMoreBefore = hadChildren || u.nestedHasMoreBefore === true
+        chrome.nestedBeforeCursor = hadChildren
+          ? (u.nestedBeforeCursor ?? 'c:0')
+          : (u.nestedBeforeCursor ?? null)
+        applyPreviewToUnit(chrome, opts.previewMax)
+        return chrome
+      }
+      if (u.open && isSwarmBoardUnit(u)) {
+        const chrome = cloneUnit(u)
+        compactSwarmUnitEnvelope(chrome, Math.max(4096, Math.floor(opts.maxBytes / 4)))
+        return chrome
+      }
+      return u
     })
   }
   if (over()) {
-    const open = current.filter((u) => u.open && u.kind === 'agent_group')
-    const rest = current.filter((u) => !(u.open && u.kind === 'agent_group'))
+    const open = current.filter(isPinnedOpenUnit)
+    const rest = current.filter((u) => !isPinnedOpenUnit(u))
     while (over() && rest.length > 0) {
       rest.shift()
       droppedNonOpen = true
@@ -1090,10 +1245,14 @@ function enforceBudget(pack: LiveUnit[], opts: {
     if (over() && opts.keepOpenChrome) {
       current = open.map((u) => {
         const chrome = cloneUnit(u)
-        chrome.children = []
-        chrome.nestedHasMoreBefore = (u.children?.length ?? 0) > 0 || u.nestedHasMoreBefore === true
-        chrome.nestedBeforeCursor = u.nestedBeforeCursor ?? (chrome.nestedHasMoreBefore ? 'c:0' : null)
-        applyPreviewToUnit(chrome, opts.previewMax)
+        if (u.kind === 'agent_group') {
+          chrome.children = []
+          chrome.nestedHasMoreBefore = (u.children?.length ?? 0) > 0 || u.nestedHasMoreBefore === true
+          chrome.nestedBeforeCursor = u.nestedBeforeCursor ?? (chrome.nestedHasMoreBefore ? 'c:0' : null)
+          applyPreviewToUnit(chrome, opts.previewMax)
+        } else if (isSwarmBoardUnit(u)) {
+          compactSwarmUnitEnvelope(chrome, Math.max(2048, Math.floor(opts.maxBytes / 4)))
+        }
         return chrome
       })
       let preview = opts.previewMax
@@ -1107,7 +1266,7 @@ function enforceBudget(pack: LiveUnit[], opts: {
       }
     }
   }
-  const restNow = current.filter((u) => !(u.open && u.kind === 'agent_group'))
+  const restNow = current.filter((u) => !isPinnedOpenUnit(u))
   const restMinSeq = restNow.length > 0 ? Math.min(...restNow.map((u) => u.seqFirst)) : null
   return { units: current, droppedNonOpen, restMinSeq }
 }
@@ -1174,11 +1333,18 @@ export function serveLiveUnits(
       : `u:${state.throughFrameSeq + 1}`
   }
 
+  // Only emit resume.streamKey when proved atomically paired with throughFrameSeq (OCV5-837).
+  const resumeStreamKey =
+    typeof state.throughStreamKey === 'string' && state.throughStreamKey.length > 0
+      ? state.throughStreamKey
+      : undefined
+
   const resume: LiveUnitsResume | undefined = state.throughRecordId !== '0'
     ? {
       sessionKey: state.sessionKey || '',
       frameSeq: state.throughFrameSeq,
       recordId: state.throughRecordId,
+      ...(resumeStreamKey ? { streamKey: resumeStreamKey } : {}),
     }
     : undefined
 
@@ -1245,6 +1411,7 @@ function cloneState(state: LiveUnitState): LiveUnitState {
     units: state.units.map(cloneUnit),
     throughFrameSeq: state.throughFrameSeq,
     throughRecordId: state.throughRecordId,
+    ...(state.throughStreamKey ? { throughStreamKey: state.throughStreamKey } : {}),
     sessionKey: state.sessionKey,
     reducerEpoch: state.reducerEpoch,
     streamGeneration: state.streamGeneration,
@@ -1306,6 +1473,7 @@ export function foldLiveUnitStateForCheckpoint(
     }),
     throughFrameSeq: state.throughFrameSeq,
     throughRecordId: state.throughRecordId,
+    ...(state.throughStreamKey ? { throughStreamKey: state.throughStreamKey } : {}),
     sessionKey: state.sessionKey,
     reducerEpoch: state.reducerEpoch || LIVE_UNITS_REDUCER_EPOCH,
     streamGeneration: state.streamGeneration ?? 0,
@@ -1343,6 +1511,9 @@ export function parseLiveUnitCheckpoint(
     units,
     throughFrameSeq: obj.throughFrameSeq,
     throughRecordId: obj.throughRecordId,
+    ...(typeof obj.throughStreamKey === 'string' && obj.throughStreamKey.length > 0
+      ? { throughStreamKey: obj.throughStreamKey }
+      : {}),
     sessionKey: typeof obj.sessionKey === 'string' ? obj.sessionKey : undefined,
     reducerEpoch: expectedEpoch,
     streamGeneration: typeof obj.streamGeneration === 'number' ? obj.streamGeneration : 0,

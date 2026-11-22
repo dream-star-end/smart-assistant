@@ -82,6 +82,25 @@ async function inTransaction<T>(pool: Pool, work: (client: PoolClient) => Promis
   }
 }
 
+export type PermissionAuthorityCreatedListener = (
+  input: PermissionAuthorityInput,
+) => void | Promise<void>
+
+const permissionAuthorityCreatedListeners = new Set<PermissionAuthorityCreatedListener>()
+
+/**
+ * Subscribe to newly inserted (non-duplicate) durable `turn_permission_requests` rows.
+ * Used by pending-decisions bootstrap for proactive IM push notifications (OCV5-832 B3).
+ */
+export function onPermissionAuthorityCreated(
+  listener: PermissionAuthorityCreatedListener,
+): () => void {
+  permissionAuthorityCreatedListeners.add(listener)
+  return () => {
+    permissionAuthorityCreatedListeners.delete(listener)
+  }
+}
+
 /** Persist the exact runtime-authored permission prompt before browser
  * delivery. A duplicate request may refresh expiry only when its immutable
  * tool/input authority is byte-for-byte equivalent. */
@@ -113,7 +132,13 @@ export async function persistPermissionAuthority(
     ],
   )
   if (result.rowCount === 0) throw new TurnControlConflictError('PERMISSION_CONFLICT')
-  return result.rows[0]?.inserted ? 'inserted' : 'existing'
+  const outcome: 'inserted' | 'existing' = result.rows[0]?.inserted ? 'inserted' : 'existing'
+  if (outcome === 'inserted' && permissionAuthorityCreatedListeners.size > 0) {
+    for (const listener of permissionAuthorityCreatedListeners) {
+      void Promise.resolve(listener(input)).catch(() => {})
+    }
+  }
+  return outcome
 }
 
 /** Commit a Stop/permission response before transport. Stop admission and

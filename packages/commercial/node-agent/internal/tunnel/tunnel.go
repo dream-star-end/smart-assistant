@@ -147,11 +147,25 @@ func buildUpstreamRequest(
 		"Transfer-Encoding":   true,
 		"Upgrade":             true,
 	}
+	// B1 (OCV5-832): Always strip node-level authentication headers unconditionally
+	// (including on WebSocket upgrades) so master→node-agent PSK credentials can
+	// never be forwarded into a tenant container, while keeping per-container bridge
+	// headers (X-OpenClaude-Container-Id / X-OpenClaude-Bridge-Nonce / X-Oc-Bridge-*).
+	stripAlways := map[string]bool{
+		"Authorization":          true,
+		"Proxy-Authorization":    true,
+		"X-Node-Agent-Psk":       true,
+		"X-Openclaude-Node-Psk":  true,
+	}
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("%s %s HTTP/1.1\r\n", method, singleLine(upstreamPath)))
 	sb.WriteString("Host: " + singleLine(host) + "\r\n")
 	for k, vs := range headers {
-		if hop[http.CanonicalHeaderKey(k)] && !isWs {
+		ck := http.CanonicalHeaderKey(k)
+		if stripAlways[ck] {
+			continue
+		}
+		if hop[ck] && !isWs {
 			continue
 		}
 		for _, v := range vs {

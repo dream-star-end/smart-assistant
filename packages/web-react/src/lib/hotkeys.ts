@@ -49,8 +49,8 @@ export function resolveGlobalHotkey(
   if ((e.key === "k" || e.key === "K") && !e.shiftKey && !e.altKey) return "search";
   // 按物理键认 `\`:中文输入法标点模式下 key 会变成「、」,code 仍是 Backslash。
   if ((e.code === "Backslash" || e.key === "\\") && !e.shiftKey) return "pane";
+  // ⌘⇧O 新建会话：焦点在输入框时也允许触发（用户常驻 Composer）。
   if ((e.key === "o" || e.key === "O") && e.shiftKey) {
-    if (isEditableTarget(e.target)) return null;
     return "new";
   }
   if ((e.key === "f" || e.key === "F") && !e.shiftKey) {

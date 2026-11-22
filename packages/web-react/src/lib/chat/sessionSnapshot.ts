@@ -196,6 +196,32 @@ export function reconcileSessionRelayContainer(
   return { changed: false, reset: false };
 }
 
+/** True when the session already holds non-user hydrated/live rows for this dispatch turn. */
+export function hasOwnerLiveRows(
+  sess: Pick<ChatSession, "messages">,
+  clientMessageId: string | undefined,
+): boolean {
+  if (!clientMessageId) return false;
+  return sess.messages.some(
+    (m) =>
+      m.role !== "user" &&
+      (m._turnOwnerId === clientMessageId || m._clientMessageId === clientMessageId),
+  );
+}
+
+/** True when a degraded snapshot rebuild should preserve existing live rows on the same stream. */
+export function shouldKeepLocalRowsOnDegradedRebuild(
+  sess: Pick<ChatSession, "messages" | "_snapshotStream">,
+  streamKey: string | null | undefined,
+  clientMessageId: string | undefined,
+  rebuildActive: boolean,
+  degraded: boolean,
+): boolean {
+  if (!rebuildActive || !degraded || !clientMessageId) return false;
+  const sameOrUnknownStream = !sess._snapshotStream?.streamKey || !streamKey || sess._snapshotStream.streamKey === streamKey;
+  return sameOrUnknownStream && hasOwnerLiveRows(sess, clientMessageId);
+}
+
 /** Finalize container binding for a legacy in-flight session once an active open snapshot settles it. */
 export function reconcileOpenSnapshotRelayContainer(
   sess: ChatSession,

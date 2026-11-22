@@ -1,0 +1,739 @@
+/* 右侧统一 Workbench 交付物富预览样式（OCV5-811 / Clarvy Atelier OCV5-822）。
+ * 仅使用 styles.css 已定义的设计 token（--*）与 color-mix，零裸色值，明/暗双态高质感。 */
+
+.wb-preview-shell {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  background: var(--surface);
+  color: var(--fg);
+}
+
+/* ── 顶部统一交付物操作条（单行防折行，轻磨砂） ──────────────────────── */
+.wb-action-bar {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2.625rem;
+  padding: 0.375rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 88%, var(--bg));
+  backdrop-filter: blur(12px) saturate(1.3);
+  -webkit-backdrop-filter: blur(12px) saturate(1.3);
+}
+
+.wb-action-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.wb-action-path {
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wb-action-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  flex-shrink: 0;
+}
+
+/* ── 批注回填抽屉 ───────────────────────────────────────────────────── */
+.wb-annotate-box {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem 0.875rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 20%, var(--border));
+  background: color-mix(in srgb, var(--accent-soft) 55%, var(--surface));
+}
+
+.wb-annotate-box-docked {
+  border-top: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+  border-bottom: 0;
+}
+
+/* ── 唯一底部操作栏（44px + safe-area-inset-bottom，2-Bar 沉浸阅读器） ── */
+.wb-bottom-dock {
+  position: sticky;
+  bottom: 0;
+  z-index: 10;
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  backdrop-filter: blur(16px) saturate(1.45);
+  -webkit-backdrop-filter: blur(16px) saturate(1.45);
+  box-shadow: 0 -1px 0 var(--border), 0 -8px 20px -12px color-mix(in srgb, var(--fg) 14%, transparent);
+}
+
+.wb-bottom-bar {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0.375rem;
+  min-height: calc(2.75rem + env(safe-area-inset-bottom, 0px));
+  padding: 0.375rem 0.75rem calc(0.375rem + env(safe-area-inset-bottom, 0px));
+}
+
+.wb-annotate-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.wb-anchor-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.1875rem 0.625rem;
+  border-radius: var(--radius-full);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 24%, transparent);
+  color: var(--accent);
+  font-size: var(--text-caption);
+  font-weight: 600;
+  max-width: 100%;
+}
+
+.wb-annotate-input {
+  width: 100%;
+  min-height: 3.75rem;
+  resize: vertical;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-control);
+  background: var(--surface);
+  color: var(--fg);
+  padding: 0.5rem 0.75rem;
+  line-height: 1.5;
+  outline: none;
+  box-shadow: inset 0 1px 2px color-mix(in srgb, var(--fg) 5%, transparent);
+  transition: border-color 140ms var(--ease-standard), box-shadow 140ms var(--ease-standard);
+}
+
+.wb-annotate-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 22%, transparent);
+}
+
+/* ── 表格预览器（CSV / TSV） ────────────────────────────────────────── */
+.wb-table-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.625rem 0.875rem;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--fg) 1.8%, var(--surface));
+}
+
+.wb-table-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+  padding: 0.5rem 0.875rem;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--fg) 2.5%, var(--bg));
+}
+
+.wb-stat-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.25rem 0.625rem;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--fg) 4%, transparent);
+  font-size: var(--text-caption);
+  color: var(--muted);
+}
+
+.wb-table-scroll {
+  overflow: auto;
+  max-height: 52vh;
+  background: var(--surface);
+}
+
+[data-compact="true"] .wb-table-scroll {
+  max-height: none;
+}
+
+.wb-data-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: var(--text-meta);
+}
+
+.wb-data-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: color-mix(in srgb, var(--elevated) 92%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border-strong);
+  border-right: 1px solid var(--border);
+  padding: 0;
+  text-align: left;
+  font-weight: 600;
+  color: var(--fg);
+  white-space: nowrap;
+}
+
+.wb-data-table thead th:last-child {
+  border-right: none;
+}
+
+.wb-th-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  width: 100%;
+  min-height: 2.25rem;
+  padding: 0.375rem 0.625rem;
+  background: transparent;
+  border: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+  transition: background-color 120ms var(--ease-standard);
+}
+
+.wb-th-btn:hover {
+  background: var(--hover);
+}
+
+.wb-th-btn:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+
+.wb-data-table tbody td {
+  border-bottom: 1px solid var(--border);
+  border-right: 1px solid color-mix(in srgb, var(--border) 65%, transparent);
+  padding: 0.4375rem 0.625rem;
+  color: var(--fg);
+  vertical-align: top;
+  max-width: 18rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wb-data-table tbody td:last-child {
+  border-right: none;
+}
+
+.wb-data-table tbody tr:hover td {
+  background: color-mix(in srgb, var(--accent) 4%, var(--hover));
+}
+
+.wb-row-gutter {
+  width: 3rem;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--faint);
+  background: color-mix(in srgb, var(--fg) 2.2%, var(--surface));
+}
+
+.wb-row-action-cell {
+  width: 2.5rem;
+  text-align: center;
+  padding: 0.25rem 0.375rem;
+}
+
+/* ── 幻灯片逐页预览器（16:9 出版级画布 + 触感缩略条） ────────────────── */
+.wb-slides-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 0.875rem;
+  padding: 1rem;
+  background: radial-gradient(120% 80% at 50% 0%, color-mix(in srgb, var(--accent) 4.5%, transparent), transparent 60%), var(--bg);
+}
+
+[data-compact="true"] .wb-slides-wrap {
+  padding: 0.625rem 0.75rem 0.75rem;
+  gap: 0.625rem;
+}
+
+.wb-slide-stage {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: var(--radius-lg);
+  border: 1px solid color-mix(in srgb, var(--fg) 10%, transparent);
+  background: var(--elevated);
+  box-shadow: var(--shadow-float), inset 0 1px 0 color-mix(in srgb, var(--surface) 90%, transparent);
+  overflow: auto;
+  padding: 1.75rem 2rem;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+[data-compact="true"] .wb-slide-stage {
+  padding: 1rem 1.125rem;
+}
+
+.wb-slide-page-badge {
+  position: absolute;
+  right: 0.75rem;
+  bottom: 0.625rem;
+  padding: 0.1875rem 0.625rem;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 84%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  color: var(--muted);
+  font-size: var(--text-caption);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+.wb-slide-strip {
+  display: flex;
+  gap: 0.5rem;
+  overflow-x: auto;
+  padding: 0.1875rem 0.125rem 0.375rem;
+}
+
+.wb-slide-thumb {
+  flex: 0 0 auto;
+  min-width: 7.5rem;
+  max-width: 10.5rem;
+  min-height: 2.875rem;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.125rem;
+  padding: 0.5rem 0.6875rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--fg) 4%, transparent);
+  color: var(--muted);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 160ms var(--ease-standard), background-color 160ms var(--ease-standard), box-shadow 160ms var(--ease-standard), transform 160ms var(--ease-spring);
+}
+
+.wb-slide-thumb:hover {
+  border-color: var(--border-strong);
+  background: var(--elevated);
+  box-shadow: var(--shadow-soft);
+  transform: translateY(-1px);
+}
+
+.wb-slide-thumb[aria-current="true"] {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent-soft) 78%, var(--surface));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 25%, transparent), 0 4px 12px -6px color-mix(in srgb, var(--accent) 35%, transparent);
+  color: var(--fg);
+}
+
+.wb-slide-thumb:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
+.wb-slide-notes {
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--fg) 4%, transparent);
+  padding: 0.625rem 0.875rem;
+  font-size: var(--text-meta);
+  color: var(--muted);
+}
+
+/* ── 长文档阅读器（极轻统计微条 + 折叠大纲） ────────────────────────── */
+.wb-doc-bar {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2.125rem;
+  padding: 0.375rem 0.875rem;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--fg) 1.8%, var(--surface));
+}
+
+.wb-doc-outline {
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--fg) 2.4%, var(--bg));
+  box-shadow: inset 0 1px 3px color-mix(in srgb, var(--fg) 5%, transparent);
+  padding: 0.5rem 0.875rem;
+  max-height: 12rem;
+  overflow-y: auto;
+}
+
+.wb-outline-item {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  border-radius: var(--radius-sm);
+  padding: 0.25rem 0.5rem;
+  transition: background-color 120ms var(--ease-standard);
+}
+
+.wb-outline-item:hover {
+  background: var(--hover);
+}
+
+/* ── 二进制 Office 交付物优雅呈现卡（PPTX / XLSX / DOCX） ───────────── */
+.wb-office-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 0.875rem;
+  padding: 2.25rem 1.5rem;
+  background:
+    radial-gradient(85% 65% at 50% 0%, color-mix(in srgb, var(--accent) 7%, transparent), transparent 70%),
+    color-mix(in srgb, var(--bg) 55%, var(--surface));
+}
+
+.wb-office-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 3.5rem;
+  height: 3.5rem;
+  border-radius: var(--radius-lg);
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+  color: var(--accent);
+  box-shadow: var(--shadow-soft), inset 0 1px 0 color-mix(in srgb, var(--surface) 85%, transparent);
+}
+
+.wb-office-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
+}
+
+/* ── PDF 预览容器 ───────────────────────────────────────────────────── */
+.wb-pdf-frame {
+  display: block;
+  width: 100%;
+  height: min(62vh, 580px);
+  border: 0;
+  background: var(--bg);
+}
+
+/* ── Codex 风格文件目录总览行与类型微胶囊（OCV5-834） ────────────────── */
+.wb-dir-row {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.625rem 1rem;
+  background: transparent;
+  border: 0;
+  text-align: left;
+  outline: none;
+  cursor: pointer;
+  transition: background-color 140ms var(--ease-standard);
+}
+
+.wb-dir-row:hover {
+  background: var(--hover);
+}
+
+.wb-dir-row:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--ring);
+}
+
+.wb-type-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.125rem 0.4375rem;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  font-weight: 500;
+  letter-spacing: 0.01em;
+}
+
+@media (hover: none) {
+  .wb-th-btn,
+  .wb-dir-row,
+  .wb-office-thumb,
+  .wb-office-qa-row,
+  .wb-slide-thumb {
+    min-height: 2.75rem;
+  }
+  .wb-xlsx-sheet-tab,
+  .wb-xlsx-cell-btn,
+  .wb-xlsx-error-pill {
+    min-height: 2.5rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wb-slide-thumb:hover,
+  .wb-office-thumb:hover {
+    transform: none;
+  }
+}
+
+/* ── Office 零轮次高保真预览（OCV5-833 · Clarvy Atelier） ────────────── */
+.wb-office-pages-shell {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.wb-office-subbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--fg) 1.8%, var(--surface));
+}
+
+.wb-office-qa-pill-error {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.wb-office-qa-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  max-height: 8.5rem;
+  overflow-y: auto;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg) 70%, var(--surface));
+}
+
+.wb-office-qa-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  border: 0;
+  border-radius: var(--radius-sm);
+  padding: 0.25rem 0.375rem;
+  background: transparent;
+  cursor: pointer;
+  transition: background-color 140ms var(--ease-standard);
+}
+
+.wb-office-qa-row:hover {
+  background: var(--hover);
+}
+
+.wb-office-pages-body {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  flex-direction: row;
+  background:
+    radial-gradient(120% 80% at 50% 0%, color-mix(in srgb, var(--accent) 4%, transparent), transparent 65%),
+    var(--bg);
+}
+
+.wb-office-thumb-rail {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  width: 7.25rem;
+  flex-shrink: 0;
+  overflow-y: auto;
+  padding: 0.75rem 0.5rem;
+  border-right: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 78%, var(--bg));
+}
+
+.wb-office-pages-shell[data-compact="true"] .wb-office-pages-body {
+  flex-direction: column-reverse;
+}
+
+.wb-office-pages-shell[data-compact="true"] .wb-office-thumb-rail {
+  width: 100%;
+  flex-direction: row;
+  overflow-x: auto;
+  overflow-y: hidden;
+  border-right: 0;
+  border-top: 1px solid var(--border);
+  padding: 0.5rem 0.75rem;
+}
+
+.wb-office-thumb {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  flex-shrink: 0;
+  width: 100%;
+  padding: 0.3125rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  cursor: pointer;
+  transition:
+    border-color 150ms var(--ease-standard),
+    box-shadow 150ms var(--ease-standard),
+    transform 150ms var(--ease-spring);
+}
+
+.wb-office-pages-shell[data-compact="true"] .wb-office-thumb {
+  width: 5.5rem;
+}
+
+.wb-office-thumb:hover {
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-soft);
+  transform: translateY(-1px);
+}
+
+.wb-office-thumb[aria-current="true"] {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent-soft) 72%, var(--surface));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 26%, transparent);
+}
+
+.wb-office-thumb-frame {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+  background: var(--elevated);
+}
+
+.wb-office-stage-col {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 0.875rem;
+  overflow-y: auto;
+}
+
+.wb-office-stage {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 15rem;
+  overflow: hidden;
+  border-radius: var(--radius-lg);
+  border: 1px solid color-mix(in srgb, var(--fg) 10%, transparent);
+  background: var(--elevated);
+  box-shadow: var(--shadow-float), inset 0 1px 0 color-mix(in srgb, var(--surface) 88%, transparent);
+  padding: 0.5rem;
+}
+
+.wb-office-stage-img {
+  display: block;
+  max-width: 100%;
+  max-height: 62vh;
+  width: auto;
+  height: auto;
+  border-radius: var(--radius-sm);
+  object-fit: contain;
+}
+
+.wb-xlsx-error-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4375rem 0.75rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--danger) 24%, var(--border));
+  background: color-mix(in srgb, var(--danger-soft) 72%, var(--surface));
+}
+
+.wb-xlsx-error-pill {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.1875rem 0.5rem;
+  border-radius: var(--radius-full);
+  border: 1px solid color-mix(in srgb, var(--danger) 28%, transparent);
+  background: var(--surface);
+  color: var(--danger);
+  font-size: var(--text-caption);
+  cursor: pointer;
+  transition: background-color 140ms var(--ease-standard);
+}
+
+.wb-xlsx-error-pill:hover {
+  background: var(--danger-soft);
+}
+
+.wb-xlsx-selection-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4375rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent-soft) 40%, var(--surface));
+}
+
+.wb-xlsx-table tbody td.wb-xlsx-td {
+  padding: 0;
+  max-width: 14rem;
+}
+
+.wb-xlsx-cell-btn {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 2rem;
+  padding: 0.3125rem 0.5rem;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.wb-xlsx-cell-btn:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+
+.wb-xlsx-cell-error {
+  background: color-mix(in srgb, var(--danger-soft) 85%, var(--surface)) !important;
+  color: var(--danger) !important;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger) 30%, transparent);
+}
+
+.wb-xlsx-cell-selected {
+  background: color-mix(in srgb, var(--accent-soft) 80%, var(--surface)) !important;
+  box-shadow: inset 0 0 0 1.5px var(--accent);
+}

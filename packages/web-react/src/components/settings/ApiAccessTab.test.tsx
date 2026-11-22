@@ -914,6 +914,87 @@ describe("ApiKeyUsagePanel · 消耗统计", () => {
     await waitFor(() => expect(screen.getByText("已显示 50 条")).toBeInTheDocument());
   });
 
+  test("loadMore 竞态隔离:切换 key/窗口后旧「加载更多」晚到不得追加旧行、覆盖游标或锁死按钮", async () => {
+    const allKeysFirst = Array.from({ length: 50 }, (_, i) =>
+      recentRow(String(900 - i), { api_key_id: "12", label: "paused", cost_credits: "10" }),
+    );
+    const key11First = Array.from({ length: 50 }, (_, i) =>
+      recentRow(String(200 - i), { api_key_id: "11", label: "my-cli", cost_credits: "11" }),
+    );
+    vi.mocked(api.getApiKeyUsage).mockImplementation(async (_auth, _win, keyId) =>
+      makeReport({ key_id: keyId ?? null, recent: keyId === "11" ? key11First : allKeysFirst }),
+    );
+
+    let resolveStale!: (res: Response) => void;
+    let staleSignal: AbortSignal | undefined;
+    let recentCall = 0;
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      fetched.push(url);
+      if (url.startsWith("/api/me/api-keys/usage/recent")) {
+        recentCall += 1;
+        if (recentCall === 1) {
+          staleSignal = init?.signal ?? undefined;
+          return new Promise<Response>((resolve) => {
+            resolveStale = resolve;
+          });
+        }
+        return Promise.resolve(
+          jsonResponse({
+            window: "7d",
+            key_id: "11",
+            entries: [recentRow("150", { api_key_id: "11", label: "my-cli", cost_credits: "88" })],
+            next_before: null,
+          }),
+        );
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+
+    render(<ApiKeyUsagePanel auth={auth} keys={KEYS} />);
+    const moreBtn = await screen.findByTestId("recent-load-more");
+    fireEvent.click(moreBtn);
+    await waitFor(() => expect(screen.getByTestId("recent-load-more")).toBeDisabled());
+    expect(staleSignal?.aborted).toBe(false);
+
+    // 第一次 loadMore 仍在途时切换到 key 11:旧请求被 abort,新筛选加载后按钮可点。
+    fireEvent.change(screen.getByRole("combobox", { name: "按密钥过滤" }), {
+      target: { value: "11" },
+    });
+    await waitFor(() => expect(api.getApiKeyUsage).toHaveBeenCalledWith(auth, "7d", "11"));
+    expect(staleSignal?.aborted).toBe(true);
+    await waitFor(() => expect(screen.getByTestId("recent-load-more")).toBeEnabled());
+    expect(screen.getByText("已显示 50 条")).toBeInTheDocument();
+
+    // 即使旧 fetch 忽略 signal 依然晚到 resolve(带不同 key 的行与 next_before=null),
+    // 也必须被 filterGen 丢弃:不得追加旧行、不得覆盖新筛选游标。
+    resolveStale(
+      jsonResponse({
+        window: "7d",
+        key_id: null,
+        entries: [recentRow("777", { api_key_id: "12", label: "stale-other-key", cost_credits: "9999" })],
+        next_before: null,
+      }),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const recentTable = screen.getByRole("table", { name: /最近 API Key 请求/ });
+    expect(within(recentTable).queryByText("stale-other-key")).not.toBeInTheDocument();
+    expect(within(recentTable).queryByText("9,999")).not.toBeInTheDocument();
+    expect(screen.getByText("已显示 50 条")).toBeInTheDocument();
+    expect(screen.getByTestId("recent-load-more")).toBeEnabled();
+
+    // 在新筛选上点击「加载更多」必须用 key 11 的末行游标(151),而不是被旧响应污染的 cursor。
+    fireEvent.click(screen.getByTestId("recent-load-more"));
+    await waitFor(() => expect(screen.getByText("已显示 51 条")).toBeInTheDocument());
+    const url = new URL(lastFetch("/api/me/api-keys/usage/recent"), "https://x.example");
+    expect(url.searchParams.get("key_id")).toBe("11");
+    expect(url.searchParams.get("before")).toBe("151");
+    expect(within(recentTable).getByText("88")).toBeInTheDocument();
+    expect(screen.getByText("已到底")).toBeInTheDocument();
+  });
+
   test("第一页不满页时直接判「已到底」,不打分页端点", async () => {
     render(<ApiKeyUsagePanel auth={auth} keys={KEYS} />);
     expect(await screen.findByText("已到底")).toBeInTheDocument();
@@ -1000,6 +1081,143 @@ describe("ApiKeyAuditPanel · 请求审计", () => {
     );
     expect(screen.getByText("已到底")).toBeInTheDocument();
     expect(screen.getByText("已显示 2 条")).toBeInTheDocument();
+  });
+
+  test("loadMore 竞态隔离:切 key/errorsOnly 后旧「加载更多」晚到(resolve 或 reject)均被丢弃", async () => {
+    let resolveStaleMore!: (res: Response) => void;
+    let staleSignal: AbortSignal | undefined;
+    let call = 0;
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      fetched.push(url);
+      call += 1;
+      if (call === 1) {
+        // 初始全部请求:第 1 页
+        return Promise.resolve(
+          jsonResponse({
+            entries: [auditRow("501", { last_user_message: "全部首屏消息" })],
+            next_before: "501",
+          }),
+        );
+      }
+      if (call === 2) {
+        // 全部请求:loadMore(保持挂起以模拟晚到)
+        staleSignal = init?.signal ?? undefined;
+        return new Promise<Response>((resolve) => {
+          resolveStaleMore = resolve;
+        });
+      }
+      if (call === 3) {
+        // 切到「只看失败」后的第 1 页
+        return Promise.resolve(
+          jsonResponse({
+            entries: [
+              auditRow("301", {
+                status: "error",
+                terminal_code: "UPSTREAM_502",
+                last_user_message: "失败筛选首屏消息",
+              }),
+            ],
+            next_before: "301",
+          }),
+        );
+      }
+      // 切筛选后的真实 loadMore
+      return Promise.resolve(
+        jsonResponse({
+          entries: [
+            auditRow("300", {
+              status: "error",
+              terminal_code: "UPSTREAM_502",
+              last_user_message: "失败筛选第二页消息",
+            }),
+          ],
+          next_before: null,
+        }),
+      );
+    });
+
+    render(<ApiKeyAuditPanel auth={auth} keys={KEYS} />);
+    const moreBtn = await screen.findByTestId("audit-load-more");
+    fireEvent.click(moreBtn);
+    await waitFor(() => expect(screen.getByTestId("audit-load-more")).toBeDisabled());
+    expect(staleSignal?.aborted).toBe(false);
+
+    // 切「只看失败」:旧 loadMore 被 abort,新筛选首屏就绪且按钮恢复可点。
+    fireEvent.click(screen.getByRole("switch", { name: "只看失败" }));
+    expect(await screen.findByText("失败筛选首屏消息")).toBeInTheDocument();
+    expect(staleSignal?.aborted).toBe(true);
+    expect(screen.getByTestId("audit-load-more")).toBeEnabled();
+
+    // 旧 loadMore 晚到返回旧筛选行与 next_before=null → 必须被 filterGen 丢弃。
+    resolveStaleMore(
+      jsonResponse({
+        entries: [auditRow("499", { last_user_message: "旧筛选脏记录" })],
+        next_before: null,
+      }),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(screen.queryByText("旧筛选脏记录")).not.toBeInTheDocument();
+    expect(screen.getByText("失败筛选首屏消息")).toBeInTheDocument();
+    expect(screen.getByText("已显示 1 条")).toBeInTheDocument();
+    expect(screen.getByTestId("audit-load-more")).toBeEnabled();
+
+    // 新筛选再点「加载更多」必须沿用 before=301 & errors_only=1。
+    fireEvent.click(screen.getByTestId("audit-load-more"));
+    expect(await screen.findByText("失败筛选第二页消息")).toBeInTheDocument();
+    const url = new URL(lastFetch("/api/me/api-keys/messages"), "https://x.example");
+    expect(url.searchParams.get("before")).toBe("301");
+    expect(url.searchParams.get("errors_only")).toBe("1");
+    expect(screen.getByText("已到底")).toBeInTheDocument();
+    expect(screen.getByText("已显示 2 条")).toBeInTheDocument();
+
+    // 再验证旧 loadMore 晚到 reject 也不得污染新筛选状态(不会渲染错误横幅)。
+    let rejectStaleMore!: (err: unknown) => void;
+    let phase2Call = 0;
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      fetched.push(url);
+      phase2Call += 1;
+      if (phase2Call === 1) {
+        return Promise.resolve(
+          jsonResponse({
+            entries: [auditRow("201", { api_key_id: "11", last_user_message: "key11 首屏" })],
+            next_before: "201",
+          }),
+        );
+      }
+      if (phase2Call === 2) {
+        return new Promise<Response>((_res, reject) => {
+          rejectStaleMore = reject;
+        });
+      }
+      return Promise.resolve(
+        jsonResponse({
+          entries: [auditRow("101", { api_key_id: "12", last_user_message: "key12 首屏" })],
+          next_before: null,
+        }),
+      );
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "审计按密钥过滤" }), {
+      target: { value: "11" },
+    });
+    expect(await screen.findByText("key11 首屏")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("audit-load-more"));
+    await waitFor(() => expect(screen.getByTestId("audit-load-more")).toBeDisabled());
+
+    fireEvent.change(screen.getByRole("combobox", { name: "审计按密钥过滤" }), {
+      target: { value: "12" },
+    });
+    expect(await screen.findByText("key12 首屏")).toBeInTheDocument();
+
+    rejectStaleMore(new Error("stale network failure"));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(screen.queryByText("加载更多审计失败")).not.toBeInTheDocument();
+    expect(screen.getByText("key12 首屏")).toBeInTheDocument();
   });
 
   test("用户消息含 <script> 时只作为文本渲染,不产生真实节点;长消息可展开", async () => {

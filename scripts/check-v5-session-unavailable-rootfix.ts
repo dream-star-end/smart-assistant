@@ -11,6 +11,11 @@ import { createProofTsxCache } from './lib/proofTsxCache.js'
 
 const root = process.cwd()
 const bridge = readFileSync(join(root, 'packages/commercial/src/ws/userChatBridge.ts'), 'utf8')
+// userChatBridge.ts plus modules split out of it (OCV5-821: cronOriginInject.ts).
+const bridgeSource = [
+  bridge,
+  readFileSync(join(root, 'packages/commercial/src/ws/cronOriginInject.ts'), 'utf8'),
+].join('\n')
 const reconciler = readFileSync(
   join(root, 'packages/commercial/src/dispatch/turnDispatchReconciler.ts'),
   'utf8',
@@ -85,7 +90,7 @@ for (const marker of [
   'if (admit.kind === "already_owned") return { kind: "in_flight" };',
   'forwardInboundFrame(frameData, frameIsBinary, frameLength, dispatchRecord)',
 ]) {
-  if (!bridge.includes(marker)) {
+  if (!bridgeSource.includes(marker)) {
     throw new Error(`[session-unavailable-rootfix] missing bridge invariant: ${marker}`)
   }
 }

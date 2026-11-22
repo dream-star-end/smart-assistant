@@ -1,3 +1,4 @@
+import { MessageSquare } from "lucide-react";
 import { useState } from "react";
 import { Tabs } from "../../../components/ui";
 import { PageHeader } from "../../components";
@@ -23,6 +24,7 @@ export default function FeedbackPage() {
   return (
     <div className="flex flex-col gap-5">
       <PageHeader
+        icon={MessageSquare}
         title={meta.title}
         desc={meta.desc}
         actions={<Tabs value={tab} onValueChange={setTab} items={TABS} aria-label="反馈视图切换" />}

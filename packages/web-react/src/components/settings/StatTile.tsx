@@ -15,6 +15,7 @@ export function StatTile({
   label,
   value,
   unit,
+  icon,
   accent,
   className,
 }: {
@@ -23,20 +24,40 @@ export function StatTile({
   value: string;
   /** 数字单位(如「积分」);单独渲染,避免与数字之间被当作可断词的整体。 */
   unit?: string;
+  /** 可选微型图标，置于标签旁强化扫描识别。 */
+  icon?: ReactNode;
   accent?: boolean;
   className?: string;
 }) {
   return (
-    <div className={cn("min-w-0 rounded-xl border border-border bg-surface px-3 py-2.5", className)}>
-      <div className="truncate text-caption text-faint">{label}</div>
+    <div
+      className={cn(
+        "oc-surface-card min-w-0 rounded-xl px-3.5 py-3",
+        className,
+      )}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <div className="truncate text-caption font-medium text-faint">{label}</div>
+        {icon && (
+          <span
+            className={cn(
+              "oc-icon-badge h-6 w-6 rounded-xs",
+              accent && "oc-icon-badge-accent",
+            )}
+            aria-hidden
+          >
+            {icon}
+          </span>
+        )}
+      </div>
       <div
         className={cn(
-          "mt-0.5 flex flex-wrap items-baseline gap-x-1 text-[16px] font-semibold leading-tight tabular-nums",
+          "mt-1 flex flex-wrap items-baseline gap-x-1 text-base font-semibold leading-tight tracking-tight tabular-nums",
           accent ? "text-accent" : "text-fg",
         )}
       >
         <span className="whitespace-nowrap">{value}</span>
-        {unit && <span className="whitespace-nowrap text-body font-medium">{unit}</span>}
+        {unit && <span className="whitespace-nowrap text-body font-medium text-muted">{unit}</span>}
       </div>
     </div>
   );

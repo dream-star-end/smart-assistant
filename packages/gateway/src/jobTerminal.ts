@@ -2,6 +2,7 @@
  * OCV5-22 R0/R1: build the engine-agnostic JobTerminal snapshot and the
  * stable Markdown/JSON body written on InlinePush / ResumeInject.
  */
+import { join } from 'node:path'
 import {
   classifyNotifyLane,
   delegateNotifyId,
@@ -11,10 +12,12 @@ import {
   type JobTerminal,
   type NotifyLane,
 } from '@openclaude/protocol'
+import { paths } from '@openclaude/storage'
 import type { DelegateJobSnapshot } from './delegateJobs.js'
 import { parseCronContinuation } from './cronOriginSession.js'
+import { offloadPayloadIfOversized } from './payloadOffloadGate.js'
 
-const RESULT_REF_MAX = 8_000
+export const RESULT_REF_MAX = 4_000
 
 export function parseParentEngine(raw: unknown): DelegateParentEngine | undefined {
   return isDelegateParentEngine(raw) ? raw : undefined
@@ -24,7 +27,10 @@ export function isHeartbeatSilentOutput(text: unknown): boolean {
   return typeof text === 'string' && text.trim() === 'HEARTBEAT_OK'
 }
 
-export function resultRefFromSnapshot(job: DelegateJobSnapshot): string | undefined {
+export function resultRefFromSnapshot(
+  job: DelegateJobSnapshot,
+  opts?: { sessionKey?: string },
+): string | undefined {
   const body = job.result?.body ?? {}
   const output = typeof body.output === 'string' ? body.output : undefined
   const error = typeof body.error === 'string' ? body.error : undefined
@@ -35,7 +41,19 @@ export function resultRefFromSnapshot(job: DelegateJobSnapshot): string | undefi
     Boolean(error && !output)
   const raw = failed ? job.failureDetail || error || output : output || error
   if (!raw) return undefined
-  return raw.slice(0, RESULT_REF_MAX)
+  if (raw.length <= RESULT_REF_MAX) return raw
+  const ownerSessionKey =
+    opts?.sessionKey || job.callbackOriginSessionKey || job.parentSessionKey || job.sessionKey
+  const gated = offloadPayloadIfOversized({
+    workspaceDir: join(paths.home, 'workspace', 'delegate-artifacts'),
+    sessionKey: ownerSessionKey,
+    sessionId: job.id,
+    category: 'delegate-callback',
+    label: job.agentId || job.id,
+    content: raw,
+    inlineMaxChars: RESULT_REF_MAX,
+  })
+  return gated.text
 }
 
 export function resultOkFromSnapshot(job: DelegateJobSnapshot): boolean | undefined {
@@ -100,7 +118,7 @@ export function buildJobTerminalFromSnapshot(
     failureClass: job.failureClass,
     failureDetail: job.failureDetail,
     sessionKey: job.sessionKey,
-    resultRef: resultRefFromSnapshot(job),
+    resultRef: resultRefFromSnapshot(job, { sessionKey: parentSessionKey }),
     parentSessionKey,
     parentEngine,
     parentNativeId: extras.parentNativeId,
@@ -116,6 +134,12 @@ export function buildJobTerminalFromSnapshot(
   }
 }
 
+function extractArtifactPath(text: string | undefined): string | undefined {
+  if (!text) return undefined
+  const m = /Full content offloaded to: `([^`]+)`/.exec(text)
+  return m?.[1]
+}
+
 export function formatJobTerminalMarkdown(event: JobTerminal): string {
   const notifyId = delegateNotifyId(event.jobId, event.callbackEpoch)
   const failed = isJobTerminalFailure(event)
@@ -127,14 +151,32 @@ export function formatJobTerminalMarkdown(event: JobTerminal): string {
         : failed
           ? '🔄 子任务失败'
           : '🔄 子任务已完成'
+  // OCV5-840: never duplicate resultRef inside the metadata JSON block.
+  // Keep metadata + artifactPath in <delegate-terminal>, and render the bounded
+  // summary body once below.
+  let bodyText = event.resultRef?.trim() ?? ''
+  let artifactPath = extractArtifactPath(bodyText)
+  if (bodyText.length > RESULT_REF_MAX) {
+    const gated = offloadPayloadIfOversized({
+      workspaceDir: join(paths.home, 'workspace', 'delegate-artifacts'),
+      sessionKey: event.parentSessionKey || event.sessionKey,
+      sessionId: event.jobId,
+      category: 'delegate-callback',
+      label: event.agentId || event.jobId,
+      content: bodyText,
+      inlineMaxChars: RESULT_REF_MAX,
+    })
+    bodyText = gated.text
+    artifactPath = gated.artifactPath ?? artifactPath
+  }
   const payload = {
     jobId: event.jobId,
     state: event.state,
     notifyId,
     failureClass: event.failureClass,
     sessionKey: event.sessionKey,
-    resultRef: event.resultRef,
     parentEngine: event.parentEngine,
+    ...(artifactPath ? { artifactPath } : {}),
   }
   const lines = [
     heading,
@@ -146,8 +188,8 @@ export function formatJobTerminalMarkdown(event: JobTerminal): string {
   if (event.goal?.trim()) {
     lines.push('', `任务：${event.goal.trim()}`)
   }
-  if (event.resultRef?.trim()) {
-    lines.push('', failed ? '错误：' : '结论：', event.resultRef.trim())
+  if (bodyText) {
+    lines.push('', failed ? '错误：' : '结论：', bodyText)
   }
   lines.push('', '请综合这条结论继续回复用户。这是系统刚注入的完成回调，不要假装你早就看过。')
   return lines.join('\n')

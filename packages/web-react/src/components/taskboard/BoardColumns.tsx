@@ -1,9 +1,10 @@
-import { Archive, Columns3, Plus, Workflow } from 'lucide-react'
+import { Archive, Columns3, Inbox, Plus, UserCheck, Workflow } from 'lucide-react'
 import { type DragEvent, type ReactNode, useEffect, useRef, useState } from 'react'
 import type { BoardColumn, Ticket } from '../../lib/taskboard'
 import { collectInboxTickets, stageColumnTickets } from '../../lib/taskboard'
 import { cn } from '../../lib/utils'
 import { Badge, Button, EmptyState } from '../ui'
+import { AtelierIcon } from '../ui/AtelierIcons'
 import { TicketCard } from './TicketCard'
 import {
   BACKLOG_DROP_ID,
@@ -254,8 +255,15 @@ export function BoardColumns({
               className="shrink-0 gap-1 px-3 text-caption"
               onClick={() => jumpToColumn(item.id)}
             >
-              <span>{item.label}</span>
-              <span className={active ? 'opacity-80' : 'text-faint'}>{item.count}</span>
+              <span className="truncate">{item.label}</span>
+              <span
+                className={cn(
+                  'rounded-full px-1.5 py-0.5 text-caption font-medium tabular-nums',
+                  active ? 'bg-surface/20 text-current' : 'bg-hover text-faint',
+                )}
+              >
+                {item.count}
+              </span>
             </Button>
           )
         })}
@@ -344,9 +352,11 @@ export function BoardColumns({
         <div
           data-testid="board-overflow-hint"
           aria-hidden
-          className="pointer-events-none absolute inset-y-0 right-0 flex w-16 items-center justify-end bg-gradient-to-l from-bg via-bg/80 to-transparent pr-1 text-faint"
+          className="pointer-events-none absolute inset-y-0 right-0 flex w-16 items-center justify-end bg-gradient-to-l from-bg via-bg/80 to-transparent pr-2 text-muted"
         >
-          <span className="text-body">→</span>
+          <span className="oc-surface-glass flex size-7 items-center justify-center rounded-full text-body font-medium">
+            →
+          </span>
         </div>
       )}
     </div>
@@ -357,9 +367,9 @@ function ColumnEmpty({ children }: { children: ReactNode }) {
   return (
     <div
       data-testid="column-empty"
-      className="flex min-h-[10rem] flex-1 items-center justify-center rounded-lg border border-dashed border-border bg-hover px-3 py-6"
+      className="flex min-h-[10rem] flex-1 items-center justify-center rounded-xl border border-dashed border-border/80 bg-surface/45 px-3.5 py-6"
     >
-      <p className="text-center text-meta text-muted">{children}</p>
+      <p className="text-center text-meta leading-relaxed text-muted">{children}</p>
     </div>
   )
 }
@@ -370,7 +380,7 @@ function DropPlaceholder() {
       data-testid="drop-placeholder"
       data-drop-placeholder="true"
       aria-hidden
-      className="pointer-events-none h-9 shrink-0 rounded-lg border-2 border-dashed border-accent bg-accent-soft"
+      className="pointer-events-none h-10 shrink-0 rounded-xl border-2 border-dashed border-accent bg-accent-soft/80"
     />
   )
 }
@@ -442,6 +452,18 @@ function BoardColumnFrame({
     onDrop(dropId, e)
   }
 
+  const columnBadge = backlog
+    ? { cls: 'oc-icon-badge', icon: <Archive size={13} aria-hidden /> }
+    : inbox
+      ? { cls: 'oc-icon-badge oc-icon-badge-warning', icon: <Inbox size={13} aria-hidden /> }
+      : kind === 'ai'
+        ? { cls: 'oc-icon-badge oc-icon-badge-info', icon: <AtelierIcon name="agent" size={13} /> }
+        : kind === 'human'
+          ? { cls: 'oc-icon-badge oc-icon-badge-accent', icon: <UserCheck size={13} aria-hidden /> }
+          : kind === 'gate'
+            ? { cls: 'oc-icon-badge oc-icon-badge-success', icon: <AtelierIcon name="shield" size={13} /> }
+            : { cls: 'oc-icon-badge', icon: <Columns3 size={13} aria-hidden /> }
+
   return (
     <section
       data-testid={
@@ -461,43 +483,48 @@ function BoardColumnFrame({
       className={cn(
         // 桌面列宽随容器伸缩(14–18rem):1440px 视口下六列尽量排开,不再固定 288px 把最后一列
         // 整个推到视口外(审计 T-24);仍溢出时右侧有渐隐 + 箭头提示。
-        'flex w-[calc(100vw-2rem)] max-w-[20rem] shrink-0 snap-start flex-col rounded-xl md:w-[clamp(14rem,calc((100%_-_5.75rem)/6),18rem)] md:max-w-none md:snap-none',
-        backlog || inbox || empty
-          ? 'border border-dashed border-border bg-hover'
-          : 'border border-transparent bg-bg',
-        dragging && canDrop && 'border-solid border-accent bg-accent-soft',
-        hover && 'border-accent ring-2 ring-accent',
+        'oc-surface-recessed flex w-[calc(100vw-2rem)] max-w-[20rem] shrink-0 snap-start flex-col rounded-2xl p-2 transition-[border-color,background-color,box-shadow,opacity] duration-150 md:w-[clamp(14rem,calc((100%_-_5.75rem)/6),18rem)] md:max-w-none md:snap-none',
+        (backlog || inbox || empty) && 'border-dashed',
+        dragging && canDrop && 'border-solid border-accent/70 bg-accent-soft/60',
+        hover && 'border-accent ring-2 ring-accent/50',
         forbidden && 'opacity-40',
       )}
     >
-      <header className="sticky top-0 z-10 bg-inherit px-1 py-2">
-        <h3 className="flex min-w-0 items-center gap-1.5 text-section font-semibold text-fg">
-          {(backlog || inbox) && <Archive size={14} className="shrink-0 text-faint" aria-hidden />}
+      <header className="sticky top-0 z-10 rounded-t-xl px-1.5 pt-1 pb-2">
+        <h3 className="flex min-w-0 items-center gap-1.5 text-section font-semibold tracking-tight text-fg">
+          <span className={cn('size-6 rounded-md', columnBadge.cls)} aria-hidden>
+            {columnBadge.icon}
+          </span>
           <span className="truncate">{title}</span>
           {typeLabel && (
-            <span data-testid="column-type-filter" className="shrink-0 font-normal text-faint">
+            <span data-testid="column-type-filter" className="shrink-0 text-caption font-normal text-faint">
               · {typeLabel}
             </span>
           )}
-          <Badge tone="neutral" size="sm" data-testid="column-count">
+          <Badge
+            tone={inbox && count > 0 ? 'warning' : 'neutral'}
+            size="sm"
+            data-testid="column-count"
+            className="ml-auto tabular-nums"
+          >
             {count}
           </Badge>
         </h3>
         {backlog && (
-          <p className="mt-0.5 text-caption text-faint">
+          <p className="mt-1 text-caption leading-snug text-faint">
             这里的单 AI 不会碰，拖进右边的站才会开工。
           </p>
         )}
         {inbox && (
-          <p className="mt-0.5 text-caption text-faint">人来拍板。通过后才会继续往下走。</p>
+          <p className="mt-1 text-caption leading-snug text-faint">人来拍板。通过后才会继续往下走。</p>
         )}
         {!backlog && !inbox && kind && (
-          <p className="mt-0.5 text-caption text-faint">
+          <p className="mt-1 text-caption leading-snug text-faint">
             {kind === 'ai' ? 'AI 站' : kind === 'human' ? '人工站' : '闸门'}
           </p>
         )}
       </header>
-      <div className="flex min-h-[12rem] min-w-0 flex-1 flex-col gap-2 overflow-y-auto pr-0.5">
+      <div className="flex min-h-[12rem] min-w-0 flex-1 flex-col gap-2 overflow-y-auto px-0.5 pb-0.5">
         {hover && <DropPlaceholder />}
         {children}
       </div>

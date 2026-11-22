@@ -83,21 +83,25 @@ export function OrgPayQr({
   }, [auth, order.orderNo, onPaid]);
 
   return (
-    <div className="flex flex-col items-center gap-3">
+    <div className="flex flex-col items-center gap-3.5">
       {err && (
         <Alert tone="warning" className="w-full text-meta">
           {err}
         </Alert>
       )}
-      <div className="text-center">
-        <div className="text-[20px] font-semibold text-fg">{formatCentsYuan(amountCents)}</div>
-        <div className="text-meta text-faint">{note}</div>
+      <div className="oc-surface-recessed w-full rounded-xl px-4 py-3 text-center">
+        <div className="text-xl font-semibold tracking-tight tabular-nums text-fg">
+          {formatCentsYuan(amountCents)}
+        </div>
+        <div className="mt-0.5 text-meta text-faint">{note}</div>
       </div>
-      <HupijiaoPaymentEntry
-        qrcodeUrl={order.qr}
-        mobileUrl={order.mobileUrl}
-        pendingPayment={{ orderNo: order.orderNo, label: note }}
-      />
+      <div className="oc-surface-card flex w-full flex-col items-center rounded-xl p-4">
+        <HupijiaoPaymentEntry
+          qrcodeUrl={order.qr}
+          mobileUrl={order.mobileUrl}
+          pendingPayment={{ orderNo: order.orderNo, label: note }}
+        />
+      </div>
       {onBack && (
         <Button variant="ghost" size="sm" onClick={onBack} className="text-muted">
           <RefreshCw size={14} /> {backLabel}
@@ -120,12 +124,12 @@ export function OrgPaySuccess({
   doneLabel?: string;
 }) {
   return (
-    <div className="flex flex-col items-center gap-3 py-4 text-center">
-      <span className="flex size-12 items-center justify-center rounded-full bg-success-soft text-success">
-        <Check size={26} />
+    <div className="oc-surface-card flex flex-col items-center gap-3 rounded-xl px-5 py-6 text-center">
+      <span className="oc-icon-badge oc-icon-badge-success size-12 rounded-2xl">
+        <Check size={24} strokeWidth={2.25} />
       </span>
       <div className="text-title font-semibold text-fg">{title}</div>
-      {subtitle && <p className="text-meta text-faint">{subtitle}</p>}
+      {subtitle && <p className="max-w-xs text-meta text-muted">{subtitle}</p>}
       <Button variant="primary" size="sm" onClick={onDone} className="mt-1">
         {doneLabel}
       </Button>

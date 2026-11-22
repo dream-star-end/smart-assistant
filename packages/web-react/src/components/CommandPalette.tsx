@@ -1,14 +1,24 @@
 import * as RD from "@radix-ui/react-dialog";
 import {
   ArrowLeft,
+  Bell,
+  Check,
+  FileText,
+  Folder,
   FolderInput,
+  Gauge,
   House,
-  MessageSquarePlus,
+  MessageSquare,
+  Minimize2,
+  Moon,
+  Plug,
   Plus,
   Search,
-  SquareKanban,
+  Share2,
+  Target,
 } from "lucide-react";
 import {
+  type CSSProperties,
   type KeyboardEvent,
   type ReactNode,
   useEffect,
@@ -18,24 +28,40 @@ import {
   useState,
 } from "react";
 import type { ProjectTab } from "../hooks/useAppRoute";
+import type { ManageTab } from "../lib/manageTabs";
 import { readPaletteRecents } from "../lib/paletteRecents";
 import { PROJECT_COLORS } from "../lib/projectColors";
-import type { ChatProject, ProjectAsset, Session, SessionSearchHit } from "../lib/types";
+import type { SessionNeedsYouKind } from "../lib/sessionStatus";
+import type {
+  ChatProject,
+  ProjectAsset,
+  PublicModel,
+  Session,
+  SessionSearchHit,
+} from "../lib/types";
 import { cn, relativeTime } from "../lib/utils";
 import {
   PALETTE_FILTERS,
   type PaletteActionId,
+  type PaletteAgentItem,
   type PaletteFilter,
   type PaletteGroup,
   type PaletteItem,
+  type PaletteSiteItem,
   buildMoveTargets,
   buildPaletteGroups,
   flattenPalette,
   nextPaletteFilter,
   paletteActions,
+  paletteLiveLabel,
+  parsePaletteQuery,
 } from "./palette/paletteModel";
+import "./palette/paletteUpgrade.css";
 import { HighlightedText } from "./sidebar/highlight";
-import { Badge } from "./ui";
+import { Badge, StatusPill, useToast } from "./ui";
+import { AtelierIcon } from "./ui/AtelierIcons";
+import { AtelierLazyIcon } from "./ui/AtelierLazyIcons";
+import { ModelFamilyIcon } from "./ui/ModelFamilyIcons";
 
 export const PALETTE_SEARCH_DEBOUNCE_MS = 200;
 const ASSET_SEARCH_LIMIT = 20;
@@ -64,13 +90,47 @@ export type CommandPaletteProps = {
   onMoveSession?: (session: Session, projectId: string | null) => void;
   onOpenBoard?: () => void;
   onOpenSites?: () => void;
+  /** 可选：活态会话状态（与 Sidebar LiveActivityStrip 同源）。 */
+  isSending?: (id: string) => boolean;
+  liveTerminal?: (
+    id: string,
+  ) => { lastOutcome?: string | null; lastErrorCode?: string | null } | undefined;
+  sessionNeedsYou?: (id: string) => SessionNeedsYouKind | null | undefined;
+  unreadIds?: ReadonlySet<string>;
+  swarmSessionIds?: ReadonlySet<string>;
+  onMarkRead?: (id: string) => void;
+  /** 可选：站点列表与按 slug 直达回调。 */
+  sites?: readonly PaletteSiteItem[];
+  onOpenSite?: (slug: string) => void;
+  /** 可选：显式模型切换（绝不隐藏强模型、不做黑盒降级）。 */
+  models?: readonly PublicModel[];
+  activeModelId?: string | null;
+  onSelectModel?: (modelId: string) => void;
+  /** 可选：智能体列表与快速切换回调（支持 `@` 快捷前缀）。 */
+  agents?: readonly PaletteAgentItem[];
+  activeAgentId?: string | null;
+  onSelectAgent?: (agentId: string) => void;
+  /** 可选：工作区常用入口（记忆 / 技能 / 定时任务 / 插件 + 快问小窗 + OS 级操作）。 */
+  onOpenManage?: (tab: ManageTab) => void;
+  onOpenQuickAsk?: () => void;
+  onOpenSettings?: () => void;
+  onToggleTheme?: () => void;
+  onTogglePane?: () => void;
+  onToggleSwarm?: () => void;
+  onOpenGoal?: () => void;
+  onSwitchAgent?: () => void;
+  onFindInSession?: () => void;
+  onShareSession?: () => void;
+  onOpenInbox?: () => void;
+  onCompactSession?: () => void;
+  onOpenContextHealth?: () => void;
 };
 
 type RemoteResults = { q: string; hits: SessionSearchHit[]; assets: ProjectAsset[] };
 
 /**
- * Ctrl/⌘K: jump to a project, chat, file or output, or run an action. Lazy chunk
- * (App mounts it on first open). Desktop: a top-anchored panel; under md: a
+ * Ctrl/⌘K: jump to a live chat, project, site, file, model switch, or workspace entry.
+ * Lazy chunk (App mounts it on first open). Desktop: a top-anchored panel; under md: a
  * full-screen sheet with 44px rows.
  */
 export function CommandPalette(props: CommandPaletteProps) {
@@ -85,13 +145,15 @@ export function CommandPalette(props: CommandPaletteProps) {
     searchMessages,
     searchAssets,
   } = props;
+  const toast = useToast();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<PaletteFilter>("all");
   const [mode, setMode] = useState<"list" | "move">("list");
   // Radix may hold an older onEscapeKeyDown closure; read the step from a ref.
   const modeRef = useRef(mode);
   modeRef.current = mode;
-  const [active, setActive] = useState(0);
+  // 按 item.key 锚定选中项，避免 200ms 异步远程结果回流时顶掉用户已选中的行。
+  const [activeKeyState, setActiveKeyState] = useState<string | null>(null);
   const [remote, setRemote] = useState<RemoteResults | null>(null);
   const [searching, setSearching] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -106,17 +168,19 @@ export function CommandPalette(props: CommandPaletteProps) {
     setQuery("");
     setFilter("all");
     setMode("list");
-    setActive(0);
+    setActiveKeyState(null);
     setRemote(null);
     activatedRef.current = false;
   }, [open]);
 
-  const q = query.trim();
+  const parsedQuery = useMemo(() => parsePaletteQuery(query), [query]);
+  const q = parsedQuery.term;
 
   // Message and file search are server side: debounce, abort the previous one.
   // Both always run (the type filter is applied locally, so Tab never refetches).
+  // `>` / `@` 前缀模式仅做本地命令/模型筛选，不触发远程消息与文件检索。
   useEffect(() => {
-    if (!open || mode !== "list" || !q || (!searchMessages && !searchAssets)) {
+    if (!open || mode !== "list" || parsedQuery.mode !== "none" || !q || (!searchMessages && !searchAssets)) {
       setSearching(false);
       return;
     }
@@ -140,7 +204,7 @@ export function CommandPalette(props: CommandPaletteProps) {
       ac.abort();
       window.clearTimeout(timer);
     };
-  }, [open, mode, q, searchMessages, searchAssets]);
+  }, [open, mode, parsedQuery.mode, q, searchMessages, searchAssets]);
 
   const currentProject = currentProjectId
     ? (projects.find((p) => p.id === currentProjectId) ?? null)
@@ -159,6 +223,18 @@ export function CommandPalette(props: CommandPaletteProps) {
       assets: fresh?.assets,
       currentProjectId: currentProject?.id ?? null,
       recents,
+      isSending: props.isSending,
+      liveTerminal: props.liveTerminal,
+      sessionNeedsYou: props.sessionNeedsYou,
+      unreadIds: props.unreadIds,
+      swarmSessionIds: props.swarmSessionIds,
+      sites: props.sites,
+      models: props.models,
+      activeModelId: props.activeModelId,
+      canSelectModel: Boolean(props.onSelectModel),
+      agents: props.agents,
+      activeAgentId: props.activeAgentId,
+      canSelectAgent: Boolean(props.onSelectAgent),
       actions: paletteActions({
         query,
         currentProject,
@@ -167,11 +243,25 @@ export function CommandPalette(props: CommandPaletteProps) {
         canOpenHome: !props.onProjectHome,
         canOpenBoard: !!props.onOpenBoard,
         canOpenSites: !!props.onOpenSites,
+        canOpenManage: !!props.onOpenManage,
+        canOpenQuickAsk: !!props.onOpenQuickAsk,
+        canOpenSettings: !!props.onOpenSettings,
+        canToggleTheme: !!props.onToggleTheme,
+        canTogglePane: !!props.onTogglePane,
+        canToggleSwarm: !!props.onToggleSwarm,
+        canOpenGoal: !!props.onOpenGoal,
+        canSwitchAgent: Boolean(props.onSwitchAgent || (props.agents?.length && props.onSelectAgent)),
+        canFindInSession: !!props.onFindInSession,
+        canShareSession: Boolean(props.onShareSession && activeSession),
+        canOpenInbox: !!props.onOpenInbox,
+        canCompactSession: Boolean(props.onCompactSession && activeSession),
+        canOpenContextHealth: Boolean(props.onOpenContextHealth && activeSession),
       }),
     });
   }, [
     mode,
     movable,
+    activeSession,
     projects,
     sessions,
     query,
@@ -180,17 +270,51 @@ export function CommandPalette(props: CommandPaletteProps) {
     remote,
     currentProject,
     recents,
+    props.isSending,
+    props.liveTerminal,
+    props.sessionNeedsYou,
+    props.unreadIds,
+    props.swarmSessionIds,
+    props.sites,
+    props.models,
+    props.activeModelId,
+    props.onSelectModel,
+    props.agents,
+    props.activeAgentId,
+    props.onSelectAgent,
     props.onNewSessionInProject,
     props.onProjectHome,
     props.onOpenBoard,
     props.onOpenSites,
+    props.onOpenManage,
+    props.onOpenQuickAsk,
+    props.onOpenSettings,
+    props.onToggleTheme,
+    props.onTogglePane,
+    props.onToggleSwarm,
+    props.onOpenGoal,
+    props.onSwitchAgent,
+    props.onFindInSession,
+    props.onShareSession,
+    props.onOpenInbox,
   ]);
   const flat = useMemo(() => flattenPalette(groups), [groups]);
 
   useEffect(() => {
-    setActive(0);
+    setActiveKeyState(null);
   }, [query, filter, mode]);
-  const activeIndex = flat.length === 0 ? -1 : Math.min(active, flat.length - 1);
+
+  const isDisabledItem = (item: PaletteItem) => item.kind === "model" && Boolean(item.disabled);
+
+  const activeIndex = useMemo(() => {
+    if (flat.length === 0) return -1;
+    if (activeKeyState) {
+      const idx = flat.findIndex((it) => it.key === activeKeyState);
+      if (idx >= 0) return idx;
+    }
+    const firstEnabled = flat.findIndex((it) => !isDisabledItem(it));
+    return firstEnabled >= 0 ? firstEnabled : 0;
+  }, [flat, activeKeyState]);
   const activeKey = activeIndex >= 0 ? flat[activeIndex]!.key : null;
 
   useEffect(() => {
@@ -239,6 +363,75 @@ export function CommandPalette(props: CommandPaletteProps) {
         close();
         props.onOpenSites?.();
         return;
+      case "open-memory":
+        close();
+        props.onOpenManage?.("memory");
+        return;
+      case "open-skills":
+        close();
+        props.onOpenManage?.("skills");
+        return;
+      case "open-cron":
+        close();
+        props.onOpenManage?.("cron");
+        return;
+      case "open-connectors":
+        close();
+        props.onOpenManage?.("connectors");
+        return;
+      case "open-quick-ask":
+        close();
+        props.onOpenQuickAsk?.();
+        return;
+      case "open-settings":
+        close();
+        props.onOpenSettings?.();
+        return;
+      case "toggle-theme":
+        close();
+        props.onToggleTheme?.();
+        return;
+      case "toggle-pane":
+        close();
+        props.onTogglePane?.();
+        return;
+      case "toggle-swarm":
+        close();
+        props.onToggleSwarm?.();
+        return;
+      case "open-goal":
+        close();
+        props.onOpenGoal?.();
+        return;
+      case "switch-agent":
+        if (props.onSwitchAgent) {
+          close();
+          props.onSwitchAgent();
+        } else {
+          setQuery("@");
+          inputRef.current?.focus();
+        }
+        return;
+      case "find-in-session":
+        close();
+        props.onFindInSession?.();
+        return;
+      case "share-session":
+        close();
+        props.onShareSession?.();
+        return;
+      case "open-inbox":
+        close();
+        props.onOpenInbox?.();
+        return;
+      case "compact-session":
+        close();
+        props.onCompactSession?.();
+        return;
+      case "context-health":
+        close();
+        props.onOpenContextHealth?.();
+        return;
     }
   };
 
@@ -249,6 +442,7 @@ export function CommandPalette(props: CommandPaletteProps) {
         props.onOpenProject(item.project.id);
         return;
       case "session":
+        if (item.liveBucket === "unread_done") props.onMarkRead?.(item.sessionId);
         close();
         props.onOpenSession(item.sessionId);
         return;
@@ -264,6 +458,23 @@ export function CommandPalette(props: CommandPaletteProps) {
         }
         return;
       }
+      case "site":
+        close();
+        if (props.onOpenSite) props.onOpenSite(item.site.slug);
+        else props.onOpenSites?.();
+        return;
+      case "model":
+        if (item.disabled) {
+          toast(`${item.meta.label} 当前服务降级，暂不可切换`, "info");
+          return;
+        }
+        close();
+        props.onSelectModel?.(item.model.id);
+        return;
+      case "agent":
+        close();
+        props.onSelectAgent?.(item.agent.id);
+        return;
       case "action":
         runAction(item.action.id);
         return;
@@ -286,7 +497,13 @@ export function CommandPalette(props: CommandPaletteProps) {
       e.preventDefault();
       if (flat.length === 0) return;
       const step = e.key === "ArrowDown" ? 1 : -1;
-      setActive(((Math.max(activeIndex, 0) + step) % flat.length + flat.length) % flat.length);
+      const start = Math.max(activeIndex, 0);
+      let next = start;
+      for (let i = 0; i < flat.length; i += 1) {
+        next = ((next + step) % flat.length + flat.length) % flat.length;
+        if (!isDisabledItem(flat[next]!)) break;
+      }
+      setActiveKeyState(flat[next]!.key);
       return;
     }
     if (e.key === "Enter") {
@@ -307,12 +524,14 @@ export function CommandPalette(props: CommandPaletteProps) {
   };
 
   const placeholder =
-    mode === "move" ? "选择要移入的项目" : "搜索项目、会话、文件、产出，或输入命令";
+    mode === "move"
+      ? "选择要移入的项目"
+      : "搜索活态会话、项目、站点、模型、文件或工作区入口";
 
   return (
     <RD.Root open={open} onOpenChange={onOpenChange}>
       <RD.Portal>
-        <RD.Overlay className="fixed inset-0 z-50 bg-black/30 data-[state=open]:animate-fade" />
+        <RD.Overlay className="fixed inset-0 z-50 bg-black/35 backdrop-blur-xs data-[state=open]:animate-fade" />
         <RD.Content
           aria-describedby={undefined}
           data-testid="command-palette"
@@ -337,23 +556,25 @@ export function CommandPalette(props: CommandPaletteProps) {
             }
           }}
           className={cn(
-            "fixed inset-0 z-50 flex flex-col overflow-hidden bg-elevated outline-none pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] data-[state=open]:animate-in",
-            "md:inset-auto md:left-1/2 md:top-[12vh] md:max-h-[min(72vh,36rem)] md:w-[min(40rem,calc(100vw-2rem))] md:-translate-x-1/2 md:rounded-xl md:border md:border-border md:pb-0 md:pt-0 md:shadow-float",
+            "oc-palette-shell oc-surface-popover fixed inset-0 top-[var(--oc-visual-offset-top,0px)] bottom-auto z-50 flex h-[var(--oc-visual-height,100dvh)] flex-col overflow-hidden outline-none pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] data-[state=open]:animate-in",
+            "md:inset-auto md:left-1/2 md:top-[11vh] md:h-auto md:max-h-[min(74vh,39rem)] md:w-[min(42rem,calc(100vw-2rem))] md:-translate-x-1/2 md:rounded-xl md:pb-0 md:pt-0",
           )}
         >
           <RD.Title className="sr-only">快速跳转</RD.Title>
-          <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 md:px-4">
+          <div className="oc-palette-header">
             {mode === "move" ? (
               <button
                 type="button"
                 aria-label="返回"
                 onClick={backToList}
-                className="flex h-11 w-9 shrink-0 items-center justify-center rounded-sm text-muted hover:text-fg focus-visible:ring-2 focus-visible:ring-ring md:h-8"
+                className="oc-btn-tactile flex h-11 w-9 shrink-0 items-center justify-center rounded-sm text-muted hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring md:h-8"
               >
-                <ArrowLeft size={16} />
+                <ArrowLeft size={16} strokeWidth={1.75} />
               </button>
             ) : (
-              <Search size={16} aria-hidden className="shrink-0 text-faint" />
+              <span aria-hidden className="oc-icon-badge oc-icon-badge-accent size-7 rounded-sm">
+                <Search size={14} strokeWidth={1.75} />
+              </span>
             )}
             <input
               ref={inputRef}
@@ -369,12 +590,15 @@ export function CommandPalette(props: CommandPaletteProps) {
               placeholder={placeholder}
               autoComplete="off"
               spellCheck={false}
-              className="h-14 min-w-0 flex-1 bg-transparent text-base text-fg outline-none placeholder:text-faint md:h-12"
+              className="h-14 min-w-0 flex-1 bg-transparent text-base text-fg outline-none placeholder:text-faint md:h-13"
             />
+            <kbd aria-hidden className="oc-kbd hidden shrink-0 md:inline-flex">
+              Esc
+            </kbd>
             <RD.Close asChild>
               <button
                 type="button"
-                className="flex h-11 shrink-0 items-center rounded-sm px-2 text-sm text-muted hover:text-fg focus-visible:ring-2 focus-visible:ring-ring md:hidden"
+                className="oc-btn-tactile flex h-11 shrink-0 items-center rounded-sm px-2 text-sm text-muted hover:text-fg focus-visible:ring-2 focus-visible:ring-ring md:hidden"
               >
                 取消
               </button>
@@ -384,7 +608,7 @@ export function CommandPalette(props: CommandPaletteProps) {
             <div
               role="group"
               aria-label="结果类型"
-              className="flex shrink-0 items-center gap-1 border-b border-border px-3 py-1.5 md:px-4"
+              className="oc-palette-filter-bar"
             >
               {PALETTE_FILTERS.map((f) => (
                 <button
@@ -394,17 +618,21 @@ export function CommandPalette(props: CommandPaletteProps) {
                   aria-pressed={filter === f.id}
                   onClick={() => {
                     setFilter(f.id);
-                    inputRef.current?.focus();
+                    if (!window.matchMedia?.("(hover: none)").matches) {
+                      inputRef.current?.focus();
+                    }
                   }}
                   className={cn(
-                    "min-h-9 rounded-full px-3 text-meta transition-colors md:min-h-7 md:px-2.5",
-                    filter === f.id ? "bg-accent-soft text-accent" : "text-muted hover:bg-hover hover:text-fg",
+                    "oc-btn-tactile oc-spring-press min-h-11 shrink-0 rounded-full px-3 text-meta font-medium md:min-h-7 md:px-2.5",
+                    filter === f.id
+                      ? "oc-badge-craft bg-accent-soft text-accent"
+                      : "text-muted hover:bg-hover hover:text-fg",
                   )}
                 >
                   {f.label}
                 </button>
               ))}
-              {searching && <span className="ml-auto text-caption text-faint">正在搜索消息与文件…</span>}
+              {searching && <span className="ml-auto shrink-0 text-caption text-faint">正在搜索消息与文件…</span>}
             </div>
           )}
           <div
@@ -412,37 +640,76 @@ export function CommandPalette(props: CommandPaletteProps) {
             id={listId}
             role="listbox"
             aria-label="结果"
-            className="min-h-0 flex-1 overflow-y-auto px-2 py-2"
+            className="min-h-0 flex-1 space-y-1 overflow-y-auto px-2 py-2"
           >
-            {groups.map((g) => (
-              <div key={g.id} role="group" aria-label={g.label} className="mb-1">
-                <div className="px-2 pb-1 pt-2 text-caption text-faint">{g.label}</div>
-                {g.items.map((item) => {
-                  const idx = flat.indexOf(item);
-                  return (
-                    <PaletteRow
-                      key={item.key}
-                      id={paletteOptionId(listId, item.key)}
-                      item={item}
-                      selected={idx === activeIndex}
-                      query={mode === "list" ? q : ""}
-                      inCurrentGroup={g.id === "current"}
-                      projectName={projectName}
-                      onHover={() => setActive(idx)}
-                      onClick={() => activate(item)}
-                    />
-                  );
-                })}
+            {groups.map((g, groupIdx) => (
+              <div
+                key={g.id}
+                role="group"
+                aria-label={g.label}
+                style={{ "--stagger-i": groupIdx } as CSSProperties}
+                className="oc-stagger-in mb-1.5 last:mb-0"
+              >
+                <div className="oc-palette-group-head">
+                  <span>{g.label}</span>
+                  {g.items.length > 1 && (
+                    <span aria-hidden className="oc-palette-group-count">
+                      {g.items.length}
+                    </span>
+                  )}
+                </div>
+                <div className="space-y-0.5">
+                  {g.items.map((item) => {
+                    const idx = flat.indexOf(item);
+                    return (
+                      <PaletteRow
+                        key={item.key}
+                        id={paletteOptionId(listId, item.key)}
+                        item={item}
+                        selected={idx === activeIndex}
+                        query={mode === "list" ? q : ""}
+                        inCurrentGroup={g.id === "current"}
+                        projectName={projectName}
+                        onHover={() => setActiveKeyState(item.key)}
+                        onClick={() => activate(item)}
+                      />
+                    );
+                  })}
+                </div>
               </div>
             ))}
             {flat.length === 0 && (
-              <div className="px-3 py-8 text-center text-sm text-muted">
-                {searching ? "正在搜索…" : mode === "move" ? "没有可移入的项目" : "没有找到匹配的结果"}
+              <div className="flex flex-col items-center justify-center gap-2 px-3 py-10 text-center">
+                <span aria-hidden className="oc-icon-badge size-9 rounded-md">
+                  <Search size={16} strokeWidth={1.75} />
+                </span>
+                <span className="text-sm text-muted">
+                  {searching ? "正在搜索…" : mode === "move" ? "没有可移入的项目" : "没有找到匹配的结果"}
+                </span>
               </div>
             )}
           </div>
-          <div className="hidden shrink-0 border-t border-border px-4 py-2 text-caption text-faint md:block">
-            ↑↓ 选择 · Enter 打开 · Tab 限定类型 · Esc {mode === "move" ? "返回" : "关闭"}
+          <div className="oc-palette-footer">
+            <span className="flex items-center gap-3">
+              <span className="inline-flex items-center gap-1">
+                <kbd className="oc-kbd">↑↓</kbd> 选择
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <kbd className="oc-kbd">↵</kbd> 执行
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <kbd className="oc-kbd">Tab</kbd> 限定类型
+              </span>
+              <span className="hidden items-center gap-1 lg:inline-flex">
+                <kbd className="oc-kbd">&gt;</kbd> 命令
+              </span>
+              <span className="hidden items-center gap-1 lg:inline-flex">
+                <kbd className="oc-kbd">@</kbd> 模型/智能体
+              </span>
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <kbd className="oc-kbd">Esc</kbd> {mode === "move" ? "返回" : "关闭"}
+            </span>
           </div>
         </RD.Content>
       </RD.Portal>
@@ -461,6 +728,85 @@ function ProjectDot({ color }: { color?: string | null }) {
 
 function when(at: number | undefined): string {
   return typeof at === "number" && Number.isFinite(at) && at > 0 ? relativeTime(new Date(at).toISOString()) : "";
+}
+
+function renderActionIcon(id: PaletteActionId): ReactNode {
+  switch (id) {
+    case "new-project":
+      return <Plus size={14} strokeWidth={1.75} />;
+    case "move-session":
+      return <FolderInput size={14} strokeWidth={1.75} />;
+    case "open-home":
+      return <House size={14} strokeWidth={1.75} />;
+    case "open-board":
+      return <AtelierIcon name="tasks" size={15} />;
+    case "open-sites":
+      return <AtelierIcon name="sites" size={15} />;
+    case "open-memory":
+      return <AtelierLazyIcon name="memory" size={15} />;
+    case "open-skills":
+      return <AtelierIcon name="skills" size={15} />;
+    case "open-cron":
+      return <AtelierLazyIcon name="cron" size={15} />;
+    case "open-connectors":
+      return <Plug size={14} strokeWidth={1.75} />;
+    case "open-quick-ask":
+      return <AtelierIcon name="sparkles" size={15} />;
+    case "open-settings":
+      return <AtelierLazyIcon name="settings" size={15} />;
+    case "toggle-theme":
+      return <Moon size={14} strokeWidth={1.75} />;
+    case "toggle-pane":
+      return <AtelierIcon name="workbench" size={15} />;
+    case "toggle-swarm":
+      return <AtelierIcon name="swarm" size={15} />;
+    case "open-goal":
+      return <Target size={14} strokeWidth={1.75} />;
+    case "switch-agent":
+      return <AtelierIcon name="agent" size={15} />;
+    case "find-in-session":
+      return <Search size={14} strokeWidth={1.75} />;
+    case "share-session":
+      return <Share2 size={14} strokeWidth={1.75} />;
+    case "open-inbox":
+      return <Bell size={14} strokeWidth={1.75} />;
+    case "compact-session":
+      return <Minimize2 size={14} strokeWidth={1.75} />;
+    case "context-health":
+      return <Gauge size={14} strokeWidth={1.75} />;
+    default:
+      return <AtelierIcon name="newChat" size={15} />;
+  }
+}
+
+function liveIndicator(bucket: "needs_you" | "running" | "unread_done") {
+  if (bucket === "needs_you") {
+    return <StatusPill status="needs_you" variant="dot" size="sm" mark="question" decorative />;
+  }
+  if (bucket === "running") {
+    return <StatusPill status="running" variant="dot" size="sm" mark="ring" decorative />;
+  }
+  return <StatusPill status="done" variant="dot" size="sm" decorative />;
+}
+
+function actionBadgeTone(id: PaletteActionId): string {
+  switch (id) {
+    case "open-quick-ask":
+    case "toggle-swarm":
+    case "new-session":
+    case "new-in-project":
+      return "oc-icon-badge-accent";
+    case "open-goal":
+      return "oc-icon-badge-warning";
+    case "open-sites":
+    case "open-board":
+      return "oc-icon-badge-info";
+    case "open-memory":
+    case "open-skills":
+      return "oc-icon-badge-success";
+    default:
+      return "";
+  }
 }
 
 function PaletteRow({
@@ -486,6 +832,7 @@ function PaletteRow({
   let body: ReactNode = null;
   let sub: ReactNode = null;
   let trail: ReactNode = null;
+  const disabled = item.kind === "model" && Boolean(item.disabled);
   const prefix = (pid: string | null | undefined) => {
     if (inCurrentGroup) return null;
     const name = pid ? projectName(pid) : "未分类";
@@ -493,11 +840,15 @@ function PaletteRow({
   };
   switch (item.kind) {
     case "project":
-      lead = <Badge size="sm" tone="neutral">项目</Badge>;
+      lead = (
+        <span aria-hidden className="oc-icon-badge size-7 rounded-sm">
+          <Folder size={14} strokeWidth={1.75} />
+        </span>
+      );
       body = (
         <span className="flex min-w-0 items-center gap-2">
           <ProjectDot color={item.project.color} />
-          <span className="truncate">
+          <span className="truncate font-medium">
             <HighlightedText text={item.project.name} query={query} />
           </span>
           {item.project.archivedAt ? <Badge size="sm" tone="warning">已归档</Badge> : null}
@@ -505,10 +856,20 @@ function PaletteRow({
       );
       trail = `${item.project.sessionCount} 个会话`;
       break;
-    case "session":
-      lead = <Badge size="sm" tone="accent">会话</Badge>;
+    case "session": {
+      const liveText = paletteLiveLabel(item);
+      lead = item.liveBucket ? (
+        <span data-bucket={item.liveBucket} className="oc-palette-live-pill">
+          {liveIndicator(item.liveBucket)}
+          <span>{liveText}</span>
+        </span>
+      ) : (
+        <span aria-hidden className="oc-icon-badge oc-icon-badge-accent size-7 rounded-sm">
+          <MessageSquare size={13.5} strokeWidth={1.75} />
+        </span>
+      );
       body = (
-        <span className="truncate">
+        <span className="truncate font-medium">
           {prefix(item.projectId)}
           <HighlightedText text={item.title} query={query} />
         </span>
@@ -522,12 +883,32 @@ function PaletteRow({
       }
       trail = when(item.at);
       break;
+    }
     case "asset":
-      lead = <Badge size="sm" tone={item.asset.source === "output" ? "info" : "neutral"}>{item.asset.source === "output" ? "产出" : "文件"}</Badge>;
+      lead = (
+        <span
+          aria-hidden
+          className={cn(
+            "oc-icon-badge size-7 rounded-sm",
+            item.asset.source === "output" && "oc-icon-badge-info",
+          )}
+        >
+          {item.asset.source === "output" ? (
+            <AtelierLazyIcon name="deliverables" size={15} />
+          ) : (
+            <FileText size={14} strokeWidth={1.75} />
+          )}
+        </span>
+      );
       body = (
-        <span className="truncate">
-          {prefix(item.asset.projectId)}
-          <HighlightedText text={item.asset.name} query={query} />
+        <span className="flex min-w-0 items-center gap-1.5">
+          <span className="truncate font-medium">
+            {prefix(item.asset.projectId)}
+            <HighlightedText text={item.asset.name} query={query} />
+          </span>
+          <Badge size="sm" tone={item.asset.source === "output" ? "info" : "neutral"}>
+            {item.asset.source === "output" ? "产出" : "文件"}
+          </Badge>
         </span>
       );
       if (item.asset.excerpt && query && !item.asset.name.toLowerCase().includes(query.toLowerCase())) {
@@ -539,43 +920,152 @@ function PaletteRow({
       }
       trail = when(item.asset.createdAt);
       break;
+    case "site":
+      lead = (
+        <span aria-hidden className="oc-icon-badge oc-icon-badge-info size-7 rounded-sm">
+          <AtelierIcon name="sites" size={15} />
+        </span>
+      );
+      body = (
+        <span className="flex min-w-0 items-center gap-2">
+          <span className="truncate font-medium">
+            <HighlightedText text={item.site.title || item.site.slug} query={query} />
+          </span>
+          {item.site.hasServerApi ? <Badge size="sm" tone="neutral">全栈</Badge> : null}
+        </span>
+      );
+      sub = (
+        <span className="block truncate text-caption text-muted">
+          <HighlightedText text={item.site.customDomain || item.site.slug} query={query} />
+        </span>
+      );
+      trail = item.site.visibility === "password" ? "密码保护" : item.site.visibility === "disabled" ? "已停用" : "在线";
+      break;
+    case "model":
+      lead = (
+        <span
+          aria-hidden
+          className={cn(
+            "oc-icon-badge size-7 rounded-sm",
+            item.meta.isCurrent
+              ? "oc-icon-badge-success"
+              : item.meta.isFlagship
+                ? "oc-icon-badge-accent"
+                : "",
+          )}
+        >
+          <ModelFamilyIcon model={`${item.model.id} ${item.meta.label}`} size={15} />
+        </span>
+      );
+      body = (
+        <span className="flex min-w-0 items-center gap-1.5">
+          <span className="truncate font-medium">
+            <HighlightedText text={item.meta.label} query={query} />
+          </span>
+          {item.meta.isFlagship && (
+            <span data-testid="palette-model-flagship" className="oc-palette-model-flagship">
+              旗舰
+            </span>
+          )}
+          {item.meta.isCurrent && (
+            <span data-testid="palette-model-current" className="oc-palette-model-current">
+              <Check size={11} strokeWidth={2.25} aria-hidden />
+              当前
+            </span>
+          )}
+          {item.meta.isDegraded && (
+            <span className="oc-palette-model-degraded">暂不可用</span>
+          )}
+          {item.meta.promoLabel && !item.meta.isDegraded && (
+            <Badge size="sm" tone="warning">{item.meta.promoLabel}</Badge>
+          )}
+        </span>
+      );
+      if (item.meta.label !== item.model.id) {
+        sub = <span className="block truncate text-caption text-faint">{item.model.id}</span>;
+      }
+      trail = item.meta.costLabel ?? "";
+      break;
+    case "agent":
+      lead = (
+        <span
+          aria-hidden
+          className={cn(
+            "oc-icon-badge size-7 rounded-sm",
+            item.isCurrent ? "oc-icon-badge-success" : "oc-icon-badge-accent",
+          )}
+        >
+          <AtelierIcon name="agent" size={15} />
+        </span>
+      );
+      body = (
+        <span className="flex min-w-0 items-center gap-1.5">
+          <span className="truncate font-medium">
+            <HighlightedText text={item.agent.name} query={query} />
+          </span>
+          {item.isCurrent && (
+            <span data-testid="palette-agent-current" className="oc-palette-model-current">
+              <Check size={11} strokeWidth={2.25} aria-hidden />
+              当前
+            </span>
+          )}
+        </span>
+      );
+      if (item.agent.description) {
+        sub = <span className="block truncate text-caption text-faint">{item.agent.description}</span>;
+      }
+      trail = "智能体";
+      break;
     case "action": {
-      const Icon =
-        item.action.id === "new-project"
-          ? Plus
-          : item.action.id === "move-session"
-            ? FolderInput
-            : item.action.id === "open-home"
-              ? House
-              : item.action.id === "open-board"
-                ? SquareKanban
-                : MessageSquarePlus;
-      lead = <Icon size={15} aria-hidden className="shrink-0 text-muted" />;
-      body = <span className="truncate">{item.action.label}</span>;
+      lead = (
+        <span aria-hidden className={cn("oc-icon-badge size-7 rounded-sm", actionBadgeTone(item.action.id))}>
+          {renderActionIcon(item.action.id)}
+        </span>
+      );
+      body = <span className="truncate font-medium">{item.action.label}</span>;
+      trail = item.action.hint ? <kbd className="oc-kbd">{item.action.hint}</kbd> : null;
       break;
     }
     case "move-target":
-      lead = item.projectId ? <ProjectDot color={item.color} /> : <span aria-hidden className="size-2 shrink-0 rounded-full border border-border" />;
+      lead = (
+        <span aria-hidden className="oc-icon-badge size-7 rounded-sm">
+          {item.projectId ? (
+            <ProjectDot color={item.color} />
+          ) : (
+            <Folder size={14} strokeWidth={1.75} />
+          )}
+        </span>
+      );
       body = (
-        <span className="truncate">
+        <span className="truncate font-medium">
           <HighlightedText text={item.label} query={query} />
         </span>
       );
       break;
   }
+  const enterLabel =
+    item.kind === "action" && item.action.id === "move-session"
+      ? "选择"
+      : item.kind === "model"
+        ? item.disabled
+          ? "暂不可选"
+          : "切换"
+        : item.kind === "agent"
+          ? "切换"
+          : "打开";
   return (
     <div
       id={id}
       role="option"
       aria-selected={selected}
+      aria-disabled={disabled || undefined}
       data-palette-key={item.key}
       data-palette-kind={item.kind}
       onMouseMove={selected ? undefined : onHover}
       onMouseDown={(e) => e.preventDefault()}
       onClick={onClick}
       className={cn(
-        "flex min-h-11 cursor-pointer items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm text-fg md:min-h-9",
-        selected && "bg-hover",
+        "oc-palette-row oc-spring-press oc-icon-nudge flex min-h-11 cursor-pointer items-center gap-2.5 rounded-md px-2.5 py-2 text-sm text-fg md:min-h-10",
       )}
     >
       {lead}
@@ -584,11 +1074,17 @@ function PaletteRow({
         {sub}
       </span>
       {selected ? (
-        <span aria-hidden className="hidden shrink-0 text-caption text-muted md:inline">
-          {item.kind === "action" && item.action.id === "move-session" ? "Enter 选择" : "Enter 打开"}
+        <span aria-hidden className="hidden shrink-0 items-center gap-1.5 text-caption font-medium text-accent md:inline-flex">
+          <span>{enterLabel}</span>
+          {!disabled && <kbd className="oc-kbd">↵</kbd>}
         </span>
       ) : trail ? (
-        <span className="shrink-0 text-caption text-faint">{trail}</span>
+        <span
+          aria-hidden={item.kind === "action" ? true : undefined}
+          className="shrink-0 text-caption tabular-nums text-faint"
+        >
+          {trail}
+        </span>
       ) : null}
     </div>
   );

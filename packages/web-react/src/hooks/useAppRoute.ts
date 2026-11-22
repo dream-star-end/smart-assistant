@@ -65,8 +65,8 @@ export function sitesPath(slug?: string | null): string {
 }
 
 /** 项目主页页签。概览是默认页签，不进路径（`/p/<id>`）；其余为 `/p/<id>/<tab>`。 */
-export type ProjectTab = 'overview' | 'chats' | 'files' | 'outputs'
-export const PROJECT_TABS: readonly ProjectTab[] = ['overview', 'chats', 'files', 'outputs']
+export type ProjectTab = 'overview' | 'chats' | 'files' | 'outputs' | 'research'
+export const PROJECT_TABS: readonly ProjectTab[] = ['overview', 'chats', 'files', 'outputs', 'research']
 
 /** 项目主页位置：哪个项目、哪个页签。 */
 export type ProjectRoute = { projectId: string; tab: ProjectTab }
@@ -76,7 +76,7 @@ export type ProjectRoute = { projectId: string; tab: ProjectTab }
  * 本地乐观项目是 `local-proj-<ts>`）；未知页签、`/p/<id>/overview`、尾斜杠一律不认（返回 null）。
  */
 export function parseProjectPath(pathname: string): ProjectRoute | null {
-  const m = /^\/p\/([A-Za-z0-9_-]{1,64})(?:\/(chats|files|outputs))?$/.exec(pathname)
+  const m = /^\/p\/([A-Za-z0-9_-]{1,64})(?:\/(chats|files|outputs|research))?$/.exec(pathname)
   if (!m) return null
   return { projectId: m[1], tab: (m[2] as ProjectTab | undefined) ?? 'overview' }
 }

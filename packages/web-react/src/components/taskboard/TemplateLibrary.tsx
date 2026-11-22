@@ -1,4 +1,4 @@
-import { Library } from 'lucide-react'
+import { Library, Workflow } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AuthEpochStaleError } from '../../lib/api'
 import {
@@ -180,8 +180,8 @@ export function TemplateLibrary({
         testId="template-library"
       >
         <>
-          <div className="flex items-center justify-between gap-3 rounded-lg bg-hover px-3 py-2">
-            <span className="text-meta font-medium text-muted">套用时设为该类型默认线</span>
+          <div className="oc-surface-card flex items-center justify-between gap-3 rounded-xl px-3.5 py-2.5">
+            <span className="text-meta font-medium text-fg">套用时设为该类型默认线</span>
             <Switch
               aria-label="套用时设为默认"
               checked={asDefault}
@@ -211,12 +211,20 @@ export function TemplateLibrary({
                 <Card
                   key={t.id}
                   padding="sm"
-                  className="flex flex-col gap-2"
+                  className="oc-surface-card-hover flex flex-col gap-2.5"
                   data-testid={`template-card-${t.id}`}
                   data-source={t.source}
                 >
                   <div className="flex flex-wrap items-center gap-2">
-                    <h3 className="min-w-0 flex-1 truncate text-body font-medium text-fg">
+                    <span
+                      className={`size-7 rounded-lg ${
+                        builtin ? 'oc-icon-badge oc-icon-badge-info' : 'oc-icon-badge oc-icon-badge-accent'
+                      }`}
+                      aria-hidden
+                    >
+                      <Workflow size={14} />
+                    </span>
+                    <h3 className="min-w-0 flex-1 truncate text-body font-semibold text-fg">
                       {t.name}
                     </h3>
                     <Badge size="sm" tone={builtin ? 'info' : 'accent'}>
@@ -226,14 +234,15 @@ export function TemplateLibrary({
                       {typeLabel(t.ticketType)}
                     </Badge>
                   </div>
-                  <p className="text-caption text-muted">
+                  <p className="oc-surface-recessed rounded-lg px-2.5 py-1.5 text-caption leading-relaxed text-muted">
                     {t.stages.length} 个阶段
                     {t.stages.length ? `：${t.stages.map((s) => s.name).join(' → ')}` : ''}
                   </p>
-                  <div className="flex flex-wrap gap-1">
+                  <div className="flex flex-wrap items-center gap-1.5 border-t border-border/60 pt-2">
                     <Button
                       type="button"
                       size="sm"
+                      variant="primary"
                       data-testid={`template-apply-${t.id}`}
                       disabled={!projectId || (builtin && !executionAgentId)}
                       loading={busyId === t.id}
@@ -242,12 +251,13 @@ export function TemplateLibrary({
                       套用到当前项目
                     </Button>
                     {builtin ? (
-                      <span className="self-center text-caption text-faint">不可删除</span>
+                      <span className="ml-auto text-caption text-faint">不可删除</span>
                     ) : (
                       <Button
                         type="button"
                         size="sm"
                         variant="danger"
+                        className="ml-auto"
                         data-testid={`template-delete-${t.id}`}
                         loading={busyId === t.id}
                         onClick={() => void remove(t)}

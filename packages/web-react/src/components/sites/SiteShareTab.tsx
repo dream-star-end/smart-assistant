@@ -330,29 +330,35 @@ export function SiteShareTab({
   const pushCmd = `oc-site publish ./${site.slug} --slug ${site.slug}`;
 
   return (
-    <div className="space-y-8">
-      <div className="flex items-start gap-3 rounded-xl border border-border/80 bg-bg-subtle/60 px-4 py-3 text-caption text-muted">
-        <Shield size={16} className="mt-0.5 shrink-0 text-fg/70" aria-hidden="true" />
+    <div className="space-y-6">
+      <div className="oc-callout oc-callout-info flex items-start gap-3 rounded-xl px-4 py-3.5 text-caption text-muted">
+        <span className="oc-icon-badge oc-icon-badge-info mt-0.5 size-7 rounded-lg" aria-hidden="true">
+          <Shield size={14} strokeWidth={1.75} />
+        </span>
         <div className="space-y-1">
-          <p className="font-medium text-fg">协作权限说明</p>
-          <p>
+          <p className="text-meta font-semibold text-fg">协作权限说明</p>
+          <p className="leading-relaxed">
             <strong>可编辑开发</strong>：可拉取站点代码（<code className="font-mono">oc-site pull</code>）、使用「实时编辑」批注改码、发布新版、修改标题、查看分析与调试 SQLite。删除站点、更改域名、修改访问口令、管理环境变量密钥及成员权限仅归<strong>所有者</strong>。
           </p>
         </div>
       </div>
 
-      <section className="space-y-4">
+      <section className="oc-surface-card space-y-4 rounded-2xl p-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h3 className="flex items-center gap-2 text-section font-semibold text-fg">
-              <Users size={16} aria-hidden="true" />
-              协作成员（{collaborators.length + 1}）
-            </h3>
-            <p className="text-caption text-muted">
-              {isOwner
-                ? "通过站内注册邮箱直接添加协作者，一起开发维护这个站点"
-                : "查看当前参与该站点协作的成员"}
-            </p>
+          <div className="flex items-center gap-2.5">
+            <span className="oc-icon-badge oc-icon-badge-accent size-8 rounded-lg" aria-hidden="true">
+              <Users size={15} strokeWidth={1.75} />
+            </span>
+            <div>
+              <h3 className="text-section font-semibold text-fg">
+                协作成员（{collaborators.length + 1}）
+              </h3>
+              <p className="text-caption text-muted">
+                {isOwner
+                  ? "通过站内注册邮箱直接添加协作者，一起开发维护这个站点"
+                  : "查看当前参与该站点协作的成员"}
+              </p>
+            </div>
           </div>
           {!isOwner && (
             <Button
@@ -405,18 +411,26 @@ export function SiteShareTab({
           </form>
         )}
 
-        <div className="divide-y divide-border/70 rounded-xl border border-border/70 bg-surface">
+        <div className="oc-surface-recessed divide-y divide-border/60 overflow-hidden rounded-xl">
           <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
-            <div className="min-w-0">
-              <p className="truncate text-body font-medium text-fg">
-                {site.ownerDisplayName || site.ownerEmail || "站点所有者"}
-                {isOwner && <span className="ml-1.5 text-caption text-muted">（你）</span>}
-              </p>
-              {site.ownerEmail && (
-                <p className="truncate text-caption text-muted">{site.ownerEmail}</p>
-              )}
+            <div className="flex min-w-0 items-center gap-3">
+              <span
+                aria-hidden="true"
+                className="oc-avatar-ring flex size-8 shrink-0 items-center justify-center rounded-full bg-accent-soft text-caption font-semibold text-accent"
+              >
+                {(site.ownerDisplayName || site.ownerEmail || "O").trim().charAt(0).toUpperCase()}
+              </span>
+              <div className="min-w-0">
+                <p className="truncate text-body font-medium text-fg">
+                  {site.ownerDisplayName || site.ownerEmail || "站点所有者"}
+                  {isOwner && <span className="ml-1.5 text-caption text-muted">（你）</span>}
+                </p>
+                {site.ownerEmail && (
+                  <p className="truncate text-caption text-muted">{site.ownerEmail}</p>
+                )}
+              </div>
             </div>
-            <span className="rounded-full bg-bg-subtle px-2.5 py-0.5 text-caption font-medium text-fg">
+            <span className="oc-badge-craft rounded-full bg-accent-soft px-2.5 py-0.5 text-caption font-medium text-accent">
               所有者
             </span>
           </div>
@@ -428,16 +442,25 @@ export function SiteShareTab({
           ) : (
             collaborators.map((member) => {
               const busy = busyId === `user:${member.userId}`;
+              const initial = (member.displayName || member.email || "?").trim().charAt(0).toUpperCase();
               return (
                 <div
                   key={member.userId}
-                  className="flex flex-wrap items-center justify-between gap-3 px-4 py-3"
+                  className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 transition-colors hover:bg-hover/40"
                 >
-                  <div className="min-w-0">
-                    <p className="truncate text-body font-medium text-fg">
-                      {member.displayName || member.email}
-                    </p>
-                    <p className="truncate text-caption text-muted">{member.email}</p>
+                  <div className="flex min-w-0 items-center gap-3">
+                    <span
+                      aria-hidden="true"
+                      className="oc-avatar-ring flex size-8 shrink-0 items-center justify-center rounded-full bg-surface text-caption font-semibold text-muted"
+                    >
+                      {initial}
+                    </span>
+                    <div className="min-w-0">
+                      <p className="truncate text-body font-medium text-fg">
+                        {member.displayName || member.email}
+                      </p>
+                      <p className="truncate text-caption text-muted">{member.email}</p>
+                    </div>
                   </div>
 
                   <div className="flex items-center gap-2">
@@ -468,7 +491,7 @@ export function SiteShareTab({
                         </IconButton>
                       </>
                     ) : (
-                      <span className="rounded-full bg-bg-subtle px-2.5 py-0.5 text-caption text-muted">
+                      <span className="oc-badge-craft rounded-full bg-surface px-2.5 py-0.5 text-caption text-muted">
                         {roleLabel(member.role)}
                       </span>
                     )}
@@ -481,15 +504,17 @@ export function SiteShareTab({
       </section>
 
       {isOwner && (
-        <section className="space-y-4 border-t border-border/70 pt-6">
-          <div>
-            <h3 className="flex items-center gap-2 text-section font-semibold text-fg">
-              <Link2 size={16} aria-hidden="true" />
-              协作邀请链接
-            </h3>
-            <p className="text-caption text-muted">
-              生成可随时撤销的邀请链接，协作者打开并确认后即可加入开发
-            </p>
+        <section className="oc-surface-card space-y-4 rounded-2xl p-5">
+          <div className="flex items-center gap-2.5">
+            <span className="oc-icon-badge oc-icon-badge-info size-8 rounded-lg" aria-hidden="true">
+              <Link2 size={15} strokeWidth={1.75} />
+            </span>
+            <div>
+              <h3 className="text-section font-semibold text-fg">协作邀请链接</h3>
+              <p className="text-caption text-muted">
+                生成可随时撤销的邀请链接，协作者打开并确认后即可加入开发
+              </p>
+            </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5">
@@ -533,7 +558,7 @@ export function SiteShareTab({
           </div>
 
           {latestInviteUrl && (
-            <div className="space-y-2 rounded-xl border border-success/40 bg-success-soft p-3.5">
+            <div className="oc-callout oc-callout-success space-y-2 rounded-xl p-4">
               <p className="text-caption font-medium text-success">
                 新邀请链接已生成（出于安全考虑仅展示这一次，请及时复制）：
               </p>
@@ -562,7 +587,7 @@ export function SiteShareTab({
           )}
 
           {invites.length > 0 && (
-            <div className="divide-y divide-border/70 rounded-xl border border-border/70 bg-surface">
+            <div className="oc-surface-recessed divide-y divide-border/60 overflow-hidden rounded-xl">
               {invites.map((inv) => {
                 const busy = busyId === `invite:${inv.id}`;
                 return (
@@ -573,7 +598,7 @@ export function SiteShareTab({
                     <div className="space-y-0.5">
                       <p className="font-medium text-fg">
                         {roleLabel(inv.role)}邀请链接
-                        <span className="ml-2 text-caption font-normal text-muted">
+                        <span className="ml-2 text-caption font-normal tabular-nums text-muted">
                           已使用 {inv.useCount}
                           {inv.maxUses !== null ? ` / ${inv.maxUses}` : ""} 次
                         </span>
@@ -600,36 +625,41 @@ export function SiteShareTab({
       )}
 
       {(site.accessRole ?? "owner") !== "viewer" && (
-        <section className="space-y-3 border-t border-border/70 pt-6">
-          <h3 className="flex items-center gap-2 text-section font-semibold text-fg">
-            <Terminal size={16} aria-hidden="true" />
-            协作开发命令
-          </h3>
-          <p className="text-caption text-muted">
-            协作者在自己的对话中点击右上角「实时编辑」或「编辑」即可直接协同修改；也可在容器终端运行以下命令拉取和更新站点：
-          </p>
-          <div className="space-y-2 rounded-xl border border-border/70 bg-bg-subtle/60 p-3.5 font-mono text-caption text-fg">
-            <div className="flex items-center justify-between gap-2">
-              <span className="truncate">{pullCmd}</span>
-              <IconButton
-                variant="ghost"
-                size="sm"
-                aria-label="复制拉取命令"
-                onClick={() => void copyText(pullCmd)}
-              >
-                <Copy size={14} />
-              </IconButton>
-            </div>
-            <div className="flex items-center justify-between gap-2">
-              <span className="truncate">{pushCmd}</span>
-              <IconButton
-                variant="ghost"
-                size="sm"
-                aria-label="复制发布命令"
-                onClick={() => void copyText(pushCmd)}
-              >
-                <Copy size={14} />
-              </IconButton>
+        <section className="oc-code-shell">
+          <div className="oc-code-shell-header flex items-center justify-between gap-2 px-4 py-2.5">
+            <h3 className="flex items-center gap-2 text-meta font-semibold text-fg">
+              <Terminal size={14} className="text-muted" aria-hidden="true" />
+              协作开发命令
+            </h3>
+            <span className="text-micro text-faint">CLI</span>
+          </div>
+          <div className="space-y-2.5 p-4">
+            <p className="text-caption text-muted">
+              协作者在自己的对话中点击右上角「实时编辑」或「编辑」即可直接协同修改；也可在容器终端运行以下命令拉取和更新站点：
+            </p>
+            <div className="space-y-2 font-mono text-caption text-fg">
+              <div className="oc-surface-recessed flex items-center justify-between gap-2 rounded-lg px-3 py-2">
+                <span className="truncate">{pullCmd}</span>
+                <IconButton
+                  variant="ghost"
+                  size="sm"
+                  aria-label="复制拉取命令"
+                  onClick={() => void copyText(pullCmd)}
+                >
+                  <Copy size={14} />
+                </IconButton>
+              </div>
+              <div className="oc-surface-recessed flex items-center justify-between gap-2 rounded-lg px-3 py-2">
+                <span className="truncate">{pushCmd}</span>
+                <IconButton
+                  variant="ghost"
+                  size="sm"
+                  aria-label="复制发布命令"
+                  onClick={() => void copyText(pushCmd)}
+                >
+                  <Copy size={14} />
+                </IconButton>
+              </div>
             </div>
           </div>
         </section>

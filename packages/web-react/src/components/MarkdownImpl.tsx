@@ -178,26 +178,28 @@ function rehypeEmbedMedia() {
   }
 }
 
-/** 单元格不拆词:`.prose{word-break:break-word}` 会把 `MessageRenderer.tsx` / 「风险」这类标识符在任意
- *  位置拆行,把宽表硬压进 390px 容器,横滑区形同虚设。keep-all 让 CJK 只在标点/空格处换行、拉丁词
- *  整词换行;表头一律不折行 —— 放不下的宽表按 min-content 撑出容器,落进 .markdown-table-region 横滑。 */
-//  OCV5-421:但单元格里的链接 / 行内代码是不可拆的长串(URL、长标识符),keep-all 下会把一列撑到上千
-//  像素,同表其它列被挤出视口。只对它们放开 overflow-wrap:anywhere(它参与 min-content 计算),
-//  中文词与普通拉丁词仍保持整词。
+/** 表格排版(OCV5-817)：表头保持不折行(keep-all + nowrap)保住列语义；普通数据单元格采用
+ *  word-break:normal + overflow-wrap:break-word，避免无标点中文说明被 keep-all 当成单个超长词
+ *  撑爆列宽；长 URL/行内代码保持 anywhere 折行防止单列挤飞全表。 */
 const TABLE_CELL_CLASS =
-  "[&_td]:[word-break:keep-all] [&_td]:[overflow-wrap:normal] [&_th]:[word-break:keep-all] [&_th]:whitespace-nowrap " +
+  "[&_td]:[word-break:normal] [&_td]:[overflow-wrap:break-word] [&_th]:[word-break:keep-all] [&_th]:whitespace-nowrap " +
   "[&_td_a]:[overflow-wrap:anywhere] [&_td_code]:[overflow-wrap:anywhere] [&_td_code]:[word-break:break-all]";
 
 function MarkdownTable({ children, className, ...props }: ComponentPropsWithoutRef<"table">) {
   const regionRef = useRef<HTMLElement>(null);
   // 提示只在表格**真的溢出**(scrollWidth > clientWidth)时出现;此前不溢出也常显,文案与实际不符。
   const [overflowing, setOverflowing] = useState(false);
+  const [atEnd, setAtEnd] = useState(false);
   const [dismissed, setDismissed] = useState(false);
   const dismissHint = () => setDismissed(true);
   useEffect(() => {
     const region = regionRef.current;
     if (!region) return;
-    const measure = () => setOverflowing(region.scrollWidth > region.clientWidth + 1);
+    const measure = () => {
+      const ov = region.scrollWidth > region.clientWidth + 1;
+      setOverflowing(ov);
+      setAtEnd(!ov || region.scrollLeft + region.clientWidth >= region.scrollWidth - 2);
+    };
     measure();
     if (typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(measure);
@@ -207,25 +209,38 @@ function MarkdownTable({ children, className, ...props }: ComponentPropsWithoutR
   const showHint = overflowing && !dismissed;
 
   return (
-    <div className="markdown-table-wrap">
+    <div className="markdown-table-wrap relative">
       {showHint && <p className="markdown-table-hint sm:hidden">表格可左右滑动查看更多</p>}
-      <section
-        ref={regionRef}
-        aria-label="Markdown 表格，可横向滚动"
-        // biome-ignore lint/a11y/noNoninteractiveTabindex: 横向滚动区必须可由键盘聚焦和滚动。
-        tabIndex={0}
-        className="markdown-table-region"
-        data-overflowing={overflowing ? "true" : "false"}
-        onPointerDown={dismissHint}
-        onScroll={dismissHint}
-        onKeyDown={(event) => {
-          if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) dismissHint();
-        }}
-      >
-        <table {...props} className={cn(TABLE_CELL_CLASS, className)}>
-          {children}
-        </table>
-      </section>
+      <div className="relative">
+        <section
+          ref={regionRef}
+          aria-label="Markdown 表格，可横向滚动"
+          // biome-ignore lint/a11y/noNoninteractiveTabindex: 横向滚动区必须可由键盘聚焦和滚动。
+          tabIndex={0}
+          className="markdown-table-region"
+          data-overflowing={overflowing ? "true" : "false"}
+          onPointerDown={dismissHint}
+          onScroll={(e) => {
+            dismissHint();
+            const el = e.currentTarget;
+            setAtEnd(el.scrollLeft + el.clientWidth >= el.scrollWidth - 2);
+          }}
+          onKeyDown={(event) => {
+            if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) dismissHint();
+          }}
+        >
+          <table {...props} className={cn(TABLE_CELL_CLASS, className)}>
+            {children}
+          </table>
+        </section>
+        {overflowing && !atEnd && (
+          <div
+            aria-hidden="true"
+            data-testid="markdown-table-fade"
+            className="pointer-events-none absolute inset-y-px right-px w-8 rounded-r-[11px] bg-gradient-to-l from-surface via-surface/75 to-transparent"
+          />
+        )}
+      </div>
     </div>
   );
 }
@@ -238,10 +253,11 @@ const CARET_CLASS = [
   "caret-blink",
   "ml-0.5",
   "inline-block",
-  "h-[1.1em]",
-  "w-[2px]",
-  "translate-y-[3px]",
-  "bg-current",
+  "h-[1.05em]",
+  "w-[3px]",
+  "translate-y-[2.5px]",
+  "rounded-full",
+  "bg-accent",
   "align-baseline",
 ];
 const CARET_INLINE_HOSTS = new Set(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "td", "th"]);

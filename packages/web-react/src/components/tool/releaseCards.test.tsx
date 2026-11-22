@@ -58,8 +58,15 @@ describe("ReleaseProgressCard", () => {
     render(<ReleaseProgressCard job={JOB} loadJob={loadJob} />);
     expect(screen.getByText("发布 canary")).toBeInTheDocument();
     expect(elapsedMs({ ...JOB, createdAt: new Date(Date.now() - 5000).toISOString() }, Date.now())).toBeGreaterThan(0);
-    expect(await screen.findByText("冒烟中")).toBeInTheDocument();
+    expect(await screen.findByText("上线验收中")).toBeInTheDocument();
+    expect(screen.queryByText("冒烟中")).toBeNull();
     expect(loadJob).toHaveBeenCalledWith(JOB.id);
+  });
+
+  test("acquiring_lease displays plain Chinese label without internal lease jargon", () => {
+    render(<ReleaseProgressCard poll={false} job={{ ...JOB, phase: "acquiring_lease", entries: [] }} />);
+    expect(screen.getByText("准备发布中")).toBeInTheDocument();
+    expect(screen.queryByText(/lease/i)).toBeNull();
   });
 
   test("failed card keeps the reason and next step after a refresh snapshot", () => {

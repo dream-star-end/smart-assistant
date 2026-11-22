@@ -24,25 +24,26 @@ export function ErrorBanner({
     <div
       role="alert"
       aria-live="assertive"
-      className="mx-auto mb-2 flex max-w-3xl flex-wrap items-start gap-3 rounded-lg border border-danger/30 bg-danger-soft px-4 py-3 sm:flex-nowrap"
+      data-tone="danger"
+      className="oc-callout oc-callout-danger mx-auto mb-2 flex max-w-3xl flex-wrap items-start gap-3 rounded-xl px-4 py-3 sm:flex-nowrap animate-in"
     >
-      <span className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-md bg-danger-soft text-danger">
-        <AlertTriangle size={14} />
+      <span className="oc-icon-badge oc-icon-badge-danger mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg">
+        <AlertTriangle size={14} strokeWidth={1.75} />
       </span>
-      <div className="min-w-0 flex-1 basis-[calc(100%_-_2.25rem)] sm:basis-auto">
-        <p className="text-body font-medium text-fg">发送失败</p>
+      <div className="min-w-0 flex-1 basis-[calc(100%_-_2.5rem)] sm:basis-auto">
+        <p className="text-body font-semibold text-fg">发送失败</p>
         <p className="mt-0.5 break-words text-body text-muted">{error.message}</p>
         {error.requestId && <ErrorTechDetails collapsible text={`追踪号：${error.requestId}`} />}
       </div>
-      <div className="flex w-full shrink-0 items-center justify-end gap-1 sm:w-auto">
+      <div className="flex w-full shrink-0 items-center justify-end gap-1.5 sm:w-auto">
         <Button
-          variant="ghost"
+          variant="secondary"
           size="sm"
           onClick={onRetry}
-          aria-label="继续"
-          className="text-accent [@media(hover:none)]:h-11"
+          aria-label="重新发送"
+          className="oc-btn-tactile oc-btn-secondary-craft text-accent [@media(hover:none)]:h-11"
         >
-          <RotateCcw size={13} /> 继续
+          <RotateCcw size={13} strokeWidth={1.75} /> 重新发送
         </Button>
         {onSwitchModel && (
           <Button
@@ -50,7 +51,7 @@ export function ErrorBanner({
             size="sm"
             onClick={onSwitchModel}
             aria-label="切换模型"
-            className="text-accent [@media(hover:none)]:h-11"
+            className="oc-btn-tactile text-accent [@media(hover:none)]:h-11"
           >
             切换模型
           </Button>
@@ -61,9 +62,9 @@ export function ErrorBanner({
           shape="square"
           onClick={onDismiss}
           aria-label="关闭错误提示"
-          className="[@media(hover:none)]:size-11"
+          className="oc-btn-tactile [@media(hover:none)]:size-11"
         >
-          <X size={15} />
+          <X size={15} strokeWidth={1.75} />
         </IconButton>
       </div>
     </div>

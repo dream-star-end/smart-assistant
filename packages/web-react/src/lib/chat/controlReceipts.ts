@@ -1,6 +1,7 @@
 import type { StoredPendingControl } from "../persist";
 import type { OutboundControlReceiptWire } from "./frames";
 import type { ChatMessage, ChatSession } from "./model";
+import { DEGRADED_JOURNAL_RETRY_DELAYS_MS, isPermanentJournalError } from "./pure";
 
 export const CONTROL_PERSIST_TIMEOUT_MS = 2_500;
 
@@ -54,7 +55,6 @@ export function applyControlReceipt(frame: OutboundControlReceiptWire, context: 
     frame.peer?.id === item.sessId && !!item.clientMessageId && frame.clientMessageId === item.clientMessageId;
   context.settle(frame.controlId, frame.status);
   if (exactStop && (frame.errorCode === "TURN_ALREADY_ENDED" || frame.errorCode === "TURN_NOT_ACTIVE")) {
-    if (frame.errorCode === "TURN_ALREADY_ENDED") context.notice(item.sessId, "该回合已结束");
     void Promise.resolve(context.sync?.(item.sessId, { clientMessageId: item.clientMessageId! })).catch(() => {});
   }
 }
@@ -257,4 +257,100 @@ export function persistControlWithFallback(
     () => finishPersist(true, false),
     () => finishPersist(false, false),
   );
+}
+
+/**
+ * Bounded, backoff-scheduled silent background retry for degraded live-journal
+ * hydration. Stops on permanent errors (400/401/403/404/410), never resets
+ * backoff on ws.onopen, and cancels timers on clear/clearAll (unmount/stop).
+ */
+export class DegradedJournalRetryTracker {
+  private readonly entries = new Map<string, {
+    session: ChatSession;
+    epoch: number;
+    attempt: number;
+    timer: ReturnType<typeof setTimeout> | null;
+    inFlight: boolean;
+  }>();
+
+  clear(sessId: string): void {
+    const entry = this.entries.get(sessId);
+    if (!entry) return;
+    if (entry.timer) clearTimeout(entry.timer);
+    this.entries.delete(sessId);
+  }
+
+  clearAll(): void {
+    for (const entry of this.entries.values()) {
+      if (entry.timer) clearTimeout(entry.timer);
+    }
+    this.entries.clear();
+  }
+
+  schedule(
+    sessId: string,
+    ctx: {
+      getSession: (id: string) => ChatSession | undefined;
+      getEpoch: () => number;
+      syncSession?: (
+        id: string,
+        context?: { isCurrent?: () => boolean; onPermanentError?: () => void },
+      ) => Promise<boolean | void> | boolean | void;
+    },
+  ): void {
+    const session = ctx.getSession(sessId);
+    if (!session || !session._liveJournalDegraded || !ctx.syncSession) {
+      this.clear(sessId);
+      return;
+    }
+    const epoch = ctx.getEpoch();
+    let entry = this.entries.get(sessId);
+    if (entry && (entry.session !== session || entry.epoch !== epoch)) {
+      this.clear(sessId);
+      entry = undefined;
+    }
+    if (!entry) {
+      entry = { session, epoch, attempt: 0, timer: null, inFlight: false };
+      this.entries.set(sessId, entry);
+    }
+    if (entry.timer || entry.inFlight) return;
+    if (entry.attempt >= DEGRADED_JOURNAL_RETRY_DELAYS_MS.length) return;
+    const delay = DEGRADED_JOURNAL_RETRY_DELAYS_MS[entry.attempt]!;
+    const expected = entry;
+    const isCurrent = (): boolean =>
+      ctx.getEpoch() === expected.epoch &&
+      ctx.getSession(sessId) === expected.session &&
+      this.entries.get(sessId) === expected;
+    entry.timer = setTimeout(() => {
+      expected.timer = null;
+      if (!isCurrent()) return;
+      if (!expected.session._liveJournalDegraded) {
+        this.clear(sessId);
+        return;
+      }
+      expected.inFlight = true;
+      expected.attempt += 1;
+      let permanent = false;
+      void Promise.resolve(ctx.syncSession!(sessId, {
+        isCurrent,
+        onPermanentError: () => { permanent = true; },
+      }))
+        .catch((err) => {
+          if (isPermanentJournalError(err)) permanent = true;
+        })
+        .finally(() => {
+          if (!isCurrent()) return;
+          expected.inFlight = false;
+          if (permanent) {
+            expected.attempt = DEGRADED_JOURNAL_RETRY_DELAYS_MS.length;
+            return;
+          }
+          if (expected.session._liveJournalDegraded) {
+            this.schedule(sessId, ctx);
+          } else {
+            this.clear(sessId);
+          }
+        });
+    }, delay);
+  }
 }

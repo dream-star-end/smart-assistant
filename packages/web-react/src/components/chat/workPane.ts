@@ -81,6 +81,8 @@ export type FileChange = {
   entries: FileChangeEntry[];
   added: number;
   removed: number;
+  /** 至少有一条成功改动具备可信行数统计；全为不可知（如历史裁剪参数或 shell 写入）时为 false，不展示假 +0 -0。 */
+  hasCounts?: boolean;
   /** 任一条改动失败 / 仍在运行(行里如实标出,不把失败的写入算成已改)。 */
   hasError: boolean;
   running: boolean;
@@ -135,6 +137,7 @@ type ChangeCacheEntry = {
   inputJson: unknown;
   inputRevision: number;
   partialLength: number;
+  outputLength: number;
   value: RawChange[];
 };
 const changeCache = new WeakMap<ChatMessage, ChangeCacheEntry>();
@@ -145,18 +148,38 @@ export function toolFileChanges(message: ChatMessage): RawChange[] {
   const cached = changeCache.get(message);
   const partialLength = message.partialJson?.length ?? -1;
   const inputRevision = message._inputRevision ?? 0;
+  const outputLength = message.output?.length ?? -1;
   if (
     cached &&
     cached.toolName === message.toolName &&
     cached.inputJson === message.inputJson &&
     cached.inputRevision === inputRevision &&
-    cached.partialLength === partialLength
+    cached.partialLength === partialLength &&
+    cached.outputLength === outputLength
   ) {
     return cached.value;
   }
   const value = parseToolFileChanges(message);
-  changeCache.set(message, { toolName: message.toolName, inputJson: message.inputJson, inputRevision, partialLength, value });
+  changeCache.set(message, {
+    toolName: message.toolName,
+    inputJson: message.inputJson,
+    inputRevision,
+    partialLength,
+    outputLength,
+    value,
+  });
   return value;
+}
+
+const OUTPUT_LINE_COUNTS_RE = /\(\+(\d+)\s*\/\s*-(\d+)\s+lines?\)/i;
+
+function parseOutputLineCounts(output: string | null | undefined): { added: number; removed: number } | null {
+  if (!output) return null;
+  const m = OUTPUT_LINE_COUNTS_RE.exec(output);
+  if (!m) return null;
+  const added = Number.parseInt(m[1]!, 10);
+  const removed = Number.parseInt(m[2]!, 10);
+  return Number.isFinite(added) && Number.isFinite(removed) ? { added, removed } : null;
 }
 
 function parseToolFileChanges(message: ChatMessage): RawChange[] {
@@ -197,10 +220,20 @@ function parseToolFileChanges(message: ChatMessage): RawChange[] {
     const path = asStr(input?.file_path) || asStr(input?.path);
     if (!path) return [];
     if (name === "Write") {
-      const content = asStr(input?.content);
+      if (typeof input?.content !== "string" || input.content.length === 0) {
+        const fromOut = parseOutputLineCounts(message.output);
+        return [{ path, kind: "write", added: fromOut?.added ?? null, removed: fromOut?.removed ?? null }];
+      }
+      const content = input.content;
       return [{ path, kind: "write", added: countLines(content), removed: 0, content }];
     }
-    const counts = diffCounts(asStr(input?.old_string), asStr(input?.new_string));
+    const oldStr = asStr(input?.old_string);
+    const newStr = asStr(input?.new_string);
+    if (!oldStr && !newStr) {
+      const fromOut = parseOutputLineCounts(message.output);
+      return [{ path, kind: "edit", added: fromOut?.added ?? null, removed: fromOut?.removed ?? null }];
+    }
+    const counts = diffCounts(oldStr, newStr);
     return [{ path, kind: "edit", ...counts }];
   }
   if (name === "Bash") {
@@ -232,7 +265,7 @@ export function collectFileChanges(messages: readonly ChatMessage[]): FileChange
     for (const raw of changes) {
       let file = byPath.get(raw.path);
       if (!file) {
-        file = { path: raw.path, entries: [], added: 0, removed: 0, hasError: false, running: false };
+        file = { path: raw.path, entries: [], added: 0, removed: 0, hasCounts: false, hasError: false, running: false };
         byPath.set(raw.path, file);
       }
       const entry: FileChangeEntry = { message: m, kind: raw.kind, added: raw.added, removed: raw.removed };
@@ -245,15 +278,16 @@ export function collectFileChanges(messages: readonly ChatMessage[]): FileChange
           entry.previousContent = prev;
         }
         if (!failed) lastContent.set(raw.path, raw.content);
-      } else if (raw.kind !== "write") {
-        // 中间被别的方式改过,上次 Write 的全文不再是旧内容。
+      } else if (!failed) {
+        // 中间被别的方式或无正文 Write 成功改过,上次 Write 的全文不再是可信旧内容。
         lastContent.delete(raw.path);
       }
       file.entries.push(entry);
       if (failed) file.hasError = true;
-      else {
-        file.added += entry.added ?? 0;
-        file.removed += entry.removed ?? 0;
+      else if (entry.added !== null && entry.removed !== null) {
+        file.added += entry.added;
+        file.removed += entry.removed;
+        file.hasCounts = true;
       }
       if (running) file.running = true;
     }

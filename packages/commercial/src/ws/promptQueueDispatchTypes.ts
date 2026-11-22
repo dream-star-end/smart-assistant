@@ -29,6 +29,7 @@ export interface PromptQueueDispatchRequest {
       modelSwitchConsent?: string;
       effortLevel?: string | null;
       teamMode?: boolean;
+      swarmMode?: boolean;
       collabMode?: "solo" | "advisor" | "team";
       advisorModel?: string;
       collabConfigVersion?: string;

@@ -19,6 +19,7 @@ import {
   type ContainerIdentityRepo,
   verifyContainerIdentity,
 } from '../auth/containerIdentity.js'
+import { rejectIfCutoverFencing } from '../logging/cutoverInFlight.js'
 import { REQUEST_ID_HEADER, ensureRequestId, sendJson, setSecurityHeaders } from '../http/util.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
 import { readBodyBuffer } from './bridgeHttp.js'
@@ -119,11 +120,13 @@ export function makeMuseInternalHandler(deps: MuseInternalDeps): MuseInternalHan
             'Muse video requires the originating web conversation',
           )
         }
+        const isDurableSubmission = hub.durableVideoEnabled() && spec.kind === 'video'
+        if (!isDurableSubmission && rejectIfCutoverFencing(res)) return
         const jobId = await hub.submit(
           userId,
           String(identity.containerId),
           spec,
-          hub.durableVideoEnabled() && spec.kind === 'video' ? { sessionKey: String(origin) } : {},
+          isDurableSubmission ? { sessionKey: String(origin) } : {},
         )
         sendJson(res, 202, { job_id: jobId })
         return

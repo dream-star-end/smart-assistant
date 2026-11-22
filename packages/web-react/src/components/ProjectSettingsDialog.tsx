@@ -318,7 +318,11 @@ export function ProjectSettingsDialog(props: {
 
           <Field label="颜色" hint="可选。无颜色时侧栏只显示名称。">
             {/* 色块桌面 32px；触屏升到 44px 触控靶（PS-04）。 */}
-            <div role="radiogroup" aria-label="项目颜色" className="flex flex-wrap items-center gap-2">
+            <div
+              role="radiogroup"
+              aria-label="项目颜色"
+              className="oc-surface-recessed flex flex-wrap items-center gap-2 rounded-xl p-2.5"
+            >
               <button
                 type="button"
                 role="radio"
@@ -327,8 +331,8 @@ export function ProjectSettingsDialog(props: {
                 title="无颜色"
                 onClick={() => setColor(null)}
                 className={cn(
-                  "flex size-8 items-center justify-center rounded-full border outline-none transition-shadow focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11",
-                  color === null ? "border-accent ring-2 ring-ring" : "border-border-control hover:border-border-strong",
+                  "oc-btn-tactile flex size-8 items-center justify-center rounded-full border outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11",
+                  color === null ? "border-accent bg-surface ring-2 ring-ring" : "border-border-control hover:border-border-strong",
                 )}
               >
                 {/* 虚线圈用 muted 描边：深色下 border-strong 几乎不可见（PS-05）。 */}
@@ -344,11 +348,11 @@ export function ProjectSettingsDialog(props: {
                   title={c.label}
                   onClick={() => setColor(c.key)}
                   className={cn(
-                    "flex size-8 items-center justify-center rounded-full border outline-none transition-shadow focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11",
-                    color === c.key ? "border-accent ring-2 ring-ring" : "border-transparent hover:border-border-strong",
+                    "oc-btn-tactile flex size-8 items-center justify-center rounded-full border outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11",
+                    color === c.key ? "border-accent bg-surface ring-2 ring-ring" : "border-transparent hover:border-border-strong",
                   )}
                 >
-                  <span className={cn("size-5 rounded-full", c.dotClass)} />
+                  <span className={cn("size-5 rounded-full shadow-soft", c.dotClass)} />
                 </button>
               ))}
             </div>
@@ -402,7 +406,7 @@ export function ProjectSettingsDialog(props: {
                 <span
                   aria-live="polite"
                   className={cn(
-                    "text-caption font-normal tabular-nums",
+                    "oc-badge-craft rounded-full bg-hover px-2 py-0.5 text-caption font-medium tabular-nums",
                     instructionsOver ? "text-danger" : "text-faint",
                   )}
                 >

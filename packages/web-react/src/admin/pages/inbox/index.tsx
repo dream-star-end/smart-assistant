@@ -1,3 +1,4 @@
+import { Mail } from "lucide-react";
 import { useState } from "react";
 import { PageHeader } from "../../components";
 import { getAdminPage } from "../../registry";
@@ -15,7 +16,7 @@ export default function InboxPage() {
 
   return (
     <div className="flex flex-col gap-5">
-      <PageHeader title={meta.title} desc={meta.desc} />
+      <PageHeader icon={Mail} title={meta.title} desc={meta.desc} />
       <ComposeCard onSent={() => setReloadKey((n) => n + 1)} />
       <HistoryTable reloadKey={reloadKey} />
     </div>

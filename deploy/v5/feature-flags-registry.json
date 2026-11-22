@@ -1,0 +1,101 @@
+{
+  "schema": 1,
+  "note": "Authoritative V5 Selfhost feature flag TTL registry (OCV5-847, Blueprint §4.2 ③). Temporary rollout flags default to <=30d TTL; permanent capability/safety toggles must set permanent=true with justification. Monotonicity is guarded by scripts/check-monotonic-baselines.ts.",
+  "flags": [
+    {
+      "name": "OC_P5_CHIPS",
+      "owner": "@dream-star-end",
+      "createdAt": "2026-11-22",
+      "expireAt": "2026-12-22",
+      "permanent": false,
+      "ticket": "OCV5-630",
+      "scope": "packages/protocol/src/serverFeatures.ts",
+      "description": "P5b finish-message memory and project-skill action chips toggle"
+    },
+    {
+      "name": "OC_P5_RECIPE_SCHEDULE",
+      "owner": "@dream-star-end",
+      "createdAt": "2026-11-22",
+      "expireAt": "2026-12-22",
+      "permanent": false,
+      "ticket": "OCV5-630",
+      "scope": "packages/protocol/src/serverFeatures.ts",
+      "description": "P5c one-click scheduled recipes on the project home"
+    },
+    {
+      "name": "OC_P5_UNFILED_SUGGEST",
+      "owner": "@dream-star-end",
+      "createdAt": "2026-11-22",
+      "expireAt": "2026-12-22",
+      "permanent": false,
+      "ticket": "OCV5-630",
+      "scope": "packages/protocol/src/serverFeatures.ts",
+      "description": "P5 suggest a project for unfiled chats"
+    },
+    {
+      "name": "OC_TIMELINE_LIFECYCLE_SHADOW",
+      "owner": "@dream-star-end",
+      "createdAt": "2026-11-22",
+      "expireAt": "2026-12-22",
+      "permanent": false,
+      "ticket": "OCV5-630",
+      "scope": "packages/protocol/src/serverFeatures.ts",
+      "description": "Timeline lifecycle shadow projector comparison toggle"
+    },
+    {
+      "name": "OC_SELFHOST_CC5_T1555U_ENABLED",
+      "owner": "@dream-star-end",
+      "createdAt": "2026-11-22",
+      "expireAt": "2026-12-22",
+      "permanent": false,
+      "ticket": "OCV5-847",
+      "scope": "packages/protocol/src/cc5TestModel.ts",
+      "description": "Scoped CC5 test-model validation rollout flag for selfhost"
+    },
+    {
+      "name": "OC_STUDIO_ENABLED",
+      "owner": "@dream-star-end",
+      "createdAt": "2026-11-22",
+      "expireAt": null,
+      "permanent": true,
+      "scope": "packages/commercial/src/config.ts",
+      "description": "Deployment capability toggle enabling Media Studio subsystem when provider keys are configured"
+    },
+    {
+      "name": "OC_MUSE_BRIDGE_ENABLED",
+      "owner": "@dream-star-end",
+      "createdAt": "2026-11-22",
+      "expireAt": null,
+      "permanent": true,
+      "scope": "packages/commercial/src/config.ts",
+      "description": "Deployment capability toggle enabling Muse media bridge integration"
+    },
+    {
+      "name": "OC_SITES_ENABLED",
+      "owner": "@dream-star-end",
+      "createdAt": "2026-11-22",
+      "expireAt": null,
+      "permanent": true,
+      "scope": "packages/commercial/src/config.ts",
+      "description": "Deployment capability toggle enabling Sites hosting when edge push credentials are provisioned"
+    },
+    {
+      "name": "OC_PROVIDER_HEALTH_ENFORCE",
+      "owner": "@dream-star-end",
+      "createdAt": "2026-11-22",
+      "expireAt": null,
+      "permanent": true,
+      "scope": "packages/commercial/src/config.ts",
+      "description": "Permanent operational safety switch governing upstream provider health circuit enforcement"
+    },
+    {
+      "name": "OC_BOX_MODEL_API",
+      "owner": "@dream-star-end",
+      "createdAt": "2026-11-22",
+      "expireAt": null,
+      "permanent": true,
+      "scope": "packages/commercial/src/config.ts",
+      "description": "Permanent transport mode switch selecting Box Model API routing"
+    }
+  ]
+}

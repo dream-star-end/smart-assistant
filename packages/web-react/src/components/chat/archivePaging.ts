@@ -114,6 +114,10 @@ export function correctToVisibleVirtualRowAnchor(
 
 type FrameScheduler = (callback: () => void) => void;
 
+/** Safety cap so a 0-height or non-shifting prepend cannot spin rAF and hold the history FIFO forever. */
+export const ANCHOR_RESTORE_MAX_FRAMES = 180;
+export const ANCHOR_RESTORE_MAX_MS = 3000;
+
 /** Repeat row correction while the windowed renderer finishes measuring. Real user input
  * is supplied separately through `cancelled`, so programmatic scroll events
  * do not mask a later wheel/touch/keyboard decision. */
@@ -148,8 +152,15 @@ export function restoreVisibleVirtualRowAnchor(
     let lastBeforeTop: number | null = null;
     let beforeTopStableFrames = 0;
     let stableFrames = 0;
+    let frameCount = 0;
+    const startedAt = Date.now();
     const correct = () => {
       if (cancelled()) {
+        finish();
+        return;
+      }
+      frameCount += 1;
+      if (frameCount > ANCHOR_RESTORE_MAX_FRAMES || Date.now() - startedAt > ANCHOR_RESTORE_MAX_MS) {
         finish();
         return;
       }

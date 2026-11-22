@@ -1,11 +1,12 @@
-import { ChevronDown, PanelRight, Pencil } from "lucide-react";
+import { ChevronDown, Pencil } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
-import { type ChatMessage, isRetryingTurnStatus, isServerAuthoredRow } from "../../lib/chat/model";
-import { agentTerminalStatus, isErrorCardHeldWithAnswer } from "../../lib/chat/render";
+import { type ChatMessage, isRetryingTurnStatus } from "../../lib/chat/model";
+import { isErrorCardHeldWithAnswer } from "../../lib/chat/render";
 import { agentDisplayName } from "./agentNames";
 import { STATUS } from "../../lib/ui/statusTone";
+import { StatusPill } from "../ui";
 import { ProgressiveMarkdown, RecoveredStepContext, type CardCallbacks } from "./cards";
-import { normalizeToolForDisplay, parseCodexTypeName, stripShellWrapperForDisplay, type ToolInput } from "../tool/format";
+import { detectShellFileWrites, normalizeToolForDisplay, parseCodexTypeName, stripShellWrapperForDisplay, type ToolInput } from "../tool/format";
 import { detectOcCli, humanStepTitle, resolveToolMeta } from "../tool/meta";
 import { resolveToolStatus } from "../tool/status";
 import { FirstTextPaintCommitProbe } from "./FirstTextPaintCommitProbe";
@@ -14,14 +15,15 @@ import { ProcessStepContext } from "./processStep";
 import { StepMetaBadge, StepTimingContext } from "./stepDuration";
 import type { DisplayTokenUsage } from "./tokenUsage";
 import type { TurnActivityInfo } from "./TurnActivity";
-import { combineStepTimings, computeStepTimings, formatStepDuration, stepTimingsSignature } from "../../lib/chat/stepTiming";
+import { combineStepTimings, computeStepTimings, formatStepDuration, stepTimingsSignature, type StepTiming } from "../../lib/chat/stepTiming";
 import { safeArtifactSrc } from "../tool/artifactSrc";
 import { useArtifactInspect } from "../tool/context";
 import { cn, groupDigits } from "../../lib/utils";
 import { toolChangedFileCount } from "./workPane";
 import { ProcessStages } from "./lazyProcessStages";
+import type { PhaseKind } from "./phaseTimeline";
 
-// 展开时间轴只从外壳拿这些符号。懒块若直接 import cards / meta / status,
+// 展开时间轴与阶段时间线懒块只从外壳拿这些符号。懒块若直接 import cards / meta / status,
 // rolldown 会把它们和 api+protocol 重新并进首屏 styles 块。
 export {
   FirstTextPaintCommitProbe,
@@ -31,13 +33,70 @@ export {
   StepMetaBadge,
   StepTimingContext,
   combineStepTimings,
+  detectOcCli,
+  detectShellFileWrites,
   formatStepDuration,
   humanStepTitle,
   normalizeToolForDisplay,
+  parseCodexTypeName,
   resolveToolMeta,
   resolveToolStatus,
+  stripShellWrapperForDisplay,
   timelineMessageKey,
+  toolChangedFileCount,
+  type PhaseKind,
+  type StepTiming,
+  type ToolInput,
 };
+
+type PhaseSummaryModule = typeof import("./PhaseTimelineSummary");
+let loadedPhaseSummary: PhaseSummaryModule | null = null;
+let pendingPhaseSummary: Promise<PhaseSummaryModule> | null = null;
+
+/** 按需预取阶段时间线懒块（不进首屏 modulepreload 闭包，测试可用 loadBeforeAll 同步就绪）。 */
+export function preloadPhaseTimelineSummary(): Promise<PhaseSummaryModule> {
+  if (loadedPhaseSummary) return Promise.resolve(loadedPhaseSummary);
+  if (!pendingPhaseSummary) {
+    pendingPhaseSummary = import("./PhaseTimelineSummary").then(
+      (module) => {
+        loadedPhaseSummary = module;
+        return module;
+      },
+      (error: unknown) => {
+        pendingPhaseSummary = null;
+        throw error;
+      },
+    );
+  }
+  return pendingPhaseSummary;
+}
+
+function LazyPhaseTimelineStrip(props: {
+  messages: readonly ChatMessage[];
+  stepTimings: ReadonlyMap<string, StepTiming>;
+  active: boolean;
+  selectedPhase: PhaseKind | null;
+  hideFileMetric?: boolean;
+  onSelectPhase: (kind: PhaseKind) => void;
+}) {
+  const [Comp, setComp] = useState<PhaseSummaryModule["PhaseTimelineStripFromMessages"] | null>(
+    () => loadedPhaseSummary?.PhaseTimelineStripFromMessages ?? null,
+  );
+  useEffect(() => {
+    if (Comp) return;
+    let alive = true;
+    preloadPhaseTimelineSummary()
+      .then((module) => {
+        if (alive) setComp(() => module.PhaseTimelineStripFromMessages);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [Comp]);
+  if (!Comp) return null;
+  return <Comp {...props} />;
+}
 /**
  * View-only fold for the main chat. Message ids, tape bytes, and scroll
  * ownership stay where they were; this only decides which rows share a
@@ -56,7 +115,7 @@ const WORK_ROLES = new Set<ChatMessage["role"]>([
 ]);
 
 const INTERACTIVE_TOOL_RE =
-  /ask_user|request_user_input|present_options|present_task_approval|exit_plan_mode|exitplanmode/i;
+  /ask_user|request_user_input|present_options|present_task_approval|exit_plan_mode|exitplanmode|^swarmboard$/i;
 
 export function isFoldableWorkRole(message: ChatMessage): boolean {
   return WORK_ROLES.has(message.role);
@@ -900,37 +959,12 @@ function actionPhrase(message: ChatMessage): string {
   }
 }
 
-export function rawAuditCommand(message: ChatMessage): string {
-  if (message.role !== "tool") return "";
-  const original = commandText(message).trim();
-  if (!original) return "";
-  // Classify the unwrapped head, but show the command the transcript actually stored.
-  const head = reliableHeadCall(stripShellWrapperForDisplay(original).trim());
-  if (head?.bin !== "oc-memory") return "";
-  if (head.op !== "delegate" && head.op !== "delegate-wait" && head.op !== "request-review") return "";
-  return original;
-}
-
-/** Name plus a one-line status. Never the raw tool JSON or the full thinking trace.
- * A later completed sibling must not hide a tool that is still running.
- * `pending` is only the still-running status phrase. Finished and failed lines stay still. */
-export function isDelegateRow(message: ChatMessage): boolean {
-  return message.role === "agent-group" || message.role === "delegate-progress";
-}
-
 /** 「委派给 质量审查员：检查报告格式」;并行委派列出各自接手的子代理与子任务数。 */
 export function delegateTitle(rows: readonly ChatMessage[]): string {
   const names = [...new Set(rows.map((message) => agentDisplayName(message._delegateAgentId) || "子代理"))];
   if (rows.length > 1) return `委派给 ${names.join("、")}（${rows.length} 个子任务）`;
   const goal = (rows[0]?._delegateGoal || rows[0]?.text || "").replace(/\s+/g, " ").trim();
   return goal ? `委派给 ${names[0]}：${goal}` : `委派给 ${names[0]}`;
-}
-
-/** 委派步骤右侧的状态:有一个还在跑就是「进行中」,否则取最差的终态(超时 / 失败 / 完成)。 */
-export function delegateState(rows: readonly ChatMessage[]): { label: string; running: boolean } {
-  if (rows.some((message) => !message._completed && !isServerAuthoredRow(message))) return { label: "进行中", running: true };
-  const states = rows.map((message) => agentTerminalStatus(message));
-  return { label: (states.find((state) => state.tone === "danger") ?? states.find((state) => state.tone === "warning") ?? states[0])?.label ?? "完成", running: false };
 }
 
 function stepLiveStatus(messages: readonly ChatMessage[]): { text: string; pending: boolean } {
@@ -967,8 +1001,8 @@ function stepLiveStatus(messages: readonly ChatMessage[]): { text: string; pendi
 function ShellGlyph({ active, outcome }: { active: boolean; outcome: "done" | "stopped" | "failed" }) {
   if (active) {
     return (
-      <span aria-hidden data-testid="process-glyph-live" className="oc-orbit relative flex size-6 shrink-0 items-center justify-center">
-        <span className="oc-orbit-core size-2 rounded-full bg-accent" />
+      <span aria-hidden data-testid="process-glyph-live" className="oc-orbit relative flex size-5 shrink-0 items-center justify-center">
+        <StatusPill status="running" variant="dot" size="sm" decorative className="oc-orbit-core" />
       </span>
     );
   }
@@ -978,9 +1012,9 @@ function ShellGlyph({ active, outcome }: { active: boolean; outcome: "done" | "s
       aria-hidden
       data-testid="process-glyph-done"
       data-outcome={outcome}
-      className="flex size-6 shrink-0 items-center justify-center rounded-full bg-hover text-muted"
+      className="flex size-5 shrink-0 items-center justify-center text-faint"
     >
-      {Icon ? <Icon size={13} strokeWidth={2.25} fill={filled ? "currentColor" : "none"} /> : null}
+      {Icon ? <Icon size={13.5} strokeWidth={2} fill={filled ? "currentColor" : "none"} /> : null}
     </span>
   );
 }
@@ -1058,7 +1092,7 @@ function shellLivePhrase<T>(
 
 
 const shellToggleClass =
-  "group/shell -mx-1.5 flex min-h-10 w-[calc(100%+0.75rem)] items-center gap-2.5 rounded-lg px-1.5 py-1.5 text-left transition-colors duration-150 hover:bg-hover/60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-11";
+  "group/shell -mx-1.5 flex min-h-8 w-[calc(100%+0.75rem)] items-center gap-2 rounded-lg px-1.5 py-1 text-left transition-colors duration-150 hover:bg-hover/60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-10";
 
 
 /** Sum of assistant cost labels. Zero and non-digits are skipped. */
@@ -1159,12 +1193,11 @@ export function ProcessDisclosure<T>({
       break;
     }
   }
-  // 详情面板入口(OCV5-370):本轮改过文件 → 常显「改动 N 个文件」,点开面板的改动页;
-  // 只有其它步骤 → 一个安静的面板图标(桌面悬停 / 触屏常显),点开步骤页。
+  // 详情面板入口(OCV5-370 / OCV5-844):本轮改过文件 → 常显「改动 N 个文件」,点开面板的产出页;
+  // 不再在完成行右侧挂打开「过程」Tab 的图标(单步全文按需从展开后的工具卡进入)。
   const openPane = useArtifactInspect().openPane;
   const processRows = openPane ? sections.flatMap((section) => section.items.flatMap((item) => messagesOf(item))) : [];
   const changedFiles = openPane ? toolChangedFileCount(processRows) : 0;
-  const hasToolRows = processRows.some((message) => message.role === "tool");
   const elapsedValid = active && typeof startedAt === "number" && Number.isFinite(startedAt) && startedAt > 0;
   // 长步骤 / 步骤间隙的活性信号。当前段是叙述(中途说明)时原本不挂任何动效——流式文字本身就是信号;
   // 但文字写完后模型可能还要想很久、或下一条命令还没到,整屏就没有任何「还在干活」的迹象,
@@ -1210,7 +1243,8 @@ export function ProcessDisclosure<T>({
   const lastSection = sections.at(-1);
   const lastItem = lastSection?.items.at(-1);
   const lastItemKey = lastItem === undefined ? "" : keyOf(lastItem);
-
+  const [phaseFilter, setPhaseFilter] = useState<PhaseKind | null>(null);
+  const maybeMultiStep = messages.length >= 2;
 
   return (
     <StepTimingContext.Provider value={stepTimings}>
@@ -1225,10 +1259,13 @@ export function ProcessDisclosure<T>({
         className={cn(shellToggleClass, "mx-0 w-auto min-w-0 flex-1")}
         aria-expanded={open}
         data-testid="process-toggle"
-        onClick={() => setOpen(!open)}
+        onClick={() => {
+          if (open) setPhaseFilter(null);
+          setOpen(!open);
+        }}
       >
         <ShellGlyph active={active} outcome={outcome} />
-        <span className="flex min-w-0 flex-1 items-baseline gap-2">
+        <span className="flex min-w-0 flex-1 items-baseline gap-1.5">
           <span className="sr-only">{title}</span>
           {live && !liveInRail ? (
             <span
@@ -1246,57 +1283,65 @@ export function ProcessDisclosure<T>({
             </span>
           )}
           {meta ? (
-            <span className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint" data-testid="process-meta">
-              {meta}
-            </span>
+            <>
+              <span aria-hidden className="shrink-0 text-meta text-faint/55">·</span>
+              <span className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint" data-testid="process-meta">
+                {meta}
+              </span>
+            </>
           ) : null}
           {roundCredits ? (
             <span className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint" data-testid="process-round-credits">
-              本轮 {groupDigits(roundCredits)} 积分
+              <span className="hidden sm:inline">本轮 </span>
+              {groupDigits(roundCredits)} 积分
             </span>
           ) : null}
         </span>
         <ChevronDown
-          size={15}
+          size={14}
           aria-hidden
-          className={`shrink-0 text-faint transition-transform duration-300 ease-[var(--ease-spring)] group-hover/shell:text-muted ${open ? "rotate-180" : ""}`}
+          className={`shrink-0 text-faint/75 transition-transform duration-200 group-hover/shell:text-muted ${open ? "rotate-180" : ""}`}
         />
       </button>
       {openPane && changedFiles > 0 ? (
         <button
           type="button"
           data-testid="process-pane-changes"
-          className="inline-flex min-h-8 shrink-0 items-center gap-1 rounded-full border border-border px-2.5 text-meta text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+          className="group/changes oc-btn-tactile inline-flex shrink-0 items-center justify-center rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-10"
           title="在详情面板查看这一轮的产出"
           onClick={() => openPane("outputs", processRows[0])}
         >
-          <Pencil size={12} aria-hidden className="text-faint" />
-          {/* 手机上省掉「改动」二字,给左边的步骤统计留位置;读屏仍念全句。 */}
-          <span className="sr-only sm:not-sr-only">改动 </span>
-          {changedFiles} 个文件
-        </button>
-      ) : openPane && hasToolRows ? (
-        <button
-          type="button"
-          data-testid="process-pane-steps"
-          aria-label="在详情面板查看步骤"
-          title="在详情面板查看步骤"
-          className="flex size-8 shrink-0 items-center justify-center rounded-md text-faint opacity-0 outline-none transition-opacity hover:bg-hover hover:text-fg focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover/shellrow:opacity-100 [@media(hover:none)]:size-11 [@media(hover:none)]:opacity-100"
-          onClick={() => openPane("steps")}
-        >
-          <PanelRight size={15} />
+          <span className="inline-flex h-6 items-center gap-1 rounded-md border border-border/65 px-2 text-caption font-medium text-muted transition-colors group-hover/changes:border-border-strong group-hover/changes:bg-hover/65 group-hover/changes:text-fg">
+            <Pencil size={11} strokeWidth={1.75} aria-hidden className="text-accent" />
+            {/* 手机上省掉「改动」二字,给左边的步骤统计留位置;读屏仍念全句。 */}
+            <span className="sr-only sm:not-sr-only">改动 </span>
+            {changedFiles} 个文件
+          </span>
         </button>
       ) : null}
       </div>
+      {active && !open && maybeMultiStep ? (
+        <LazyPhaseTimelineStrip
+          messages={messages}
+          stepTimings={stepTimings}
+          active={active}
+          selectedPhase={phaseFilter}
+          hideFileMetric={Boolean(openPane && changedFiles > 0)}
+          onSelectPhase={(kind) => {
+            setPhaseFilter(kind);
+            setOpen(true);
+          }}
+        />
+      ) : null}
       {/* 收起时不挂任何隐藏水合节点:>1 MiB 定位桩的正文只在展开(本层或阶段详情)后按原规则
           取——尾部直接取,其余进视口 600px 再取。此前收起态也会把首屏尾部的定位桩塞进 1px
           隐藏容器立即下载并整段渲染,看不见却付全部流量与解析成本。 */}
       {(olderSteps || open) ? (
           <div
-            className={`oc-rail relative mt-1 space-y-0.5 pb-1 ${open ? "oc-reveal" : ""}`}
+            className={open ? "oc-codex-rail oc-reveal relative ml-2.5 mt-1 pb-1 pl-3.5" : "oc-rail relative mt-1 space-y-0.5 pb-1"}
             data-testid={open ? "process-stages" : "process-older-steps"}
           >
-            {olderSteps ? <div className="pl-9">{olderSteps}</div> : null}
+            {olderSteps ? <div className={open ? "pb-1" : "pb-1 pl-9"}>{olderSteps}</div> : null}
             {open ? (
               <ProcessStages
                 sections={sections}
@@ -1316,6 +1361,8 @@ export function ProcessDisclosure<T>({
                 messagesOf={messagesOf}
                 onFirstTextPaint={onFirstTextPaint}
                 tokenUsageOf={tokenUsageOf}
+                phaseFilter={phaseFilter}
+                onPhaseFilterChange={setPhaseFilter}
               />
             ) : null}
           </div>

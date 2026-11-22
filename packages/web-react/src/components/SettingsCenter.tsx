@@ -1,5 +1,10 @@
 import { DEFAULT_PROMPT_PRIVACY_SUPPORT, parsePromptPrivacySupport, type PromptPrivacySupport } from '@openclaude/protocol/browser'
-import { Sparkles } from "lucide-react";
+import {
+  AlertCircle,
+  ArrowUpRight,
+  Lock,
+  RefreshCw,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Theme } from "../hooks/useTheme";
 import { useMdViewport } from "../hooks/useMdViewport";
@@ -23,6 +28,8 @@ import { BuiltinHotkeysTable, PreferencesTab } from "./settings/PreferencesTab";
 import { SubscriptionDialog } from "./settings/SubscriptionDialog";
 import { UsageTab } from "./settings/UsageTab";
 import { Avatar, Button, Modal, SectionNav, Spinner, Tabs } from "./ui";
+import { AtelierIcon } from "./ui/AtelierIcons";
+import { AtelierLazyIcon } from "./ui/AtelierLazyIcons";
 
 export type SettingsSection = SettingsDestinationSection;
 
@@ -87,6 +94,7 @@ export function SettingsCenter({
   feedbackContext,
   initialSection = "account",
   subscribeOpenSignal = 0,
+  onSubscribeSignalConsumed,
   preferencesRevision = 0,
 }: {
   activeSessionId?: string;
@@ -109,6 +117,8 @@ export function SettingsCenter({
   initialSection?: SettingsSection;
   /** Increment to programmatically open SubscriptionDialog on the account tab. */
   subscribeOpenSignal?: number;
+  /** 消费完一次性 subscribeOpenSignal 后通知父级归零，避免组件卸载重挂时重复弹出订阅弹窗。 */
+  onSubscribeSignalConsumed?: () => void;
 }) {
   const desktop = useMdViewport();
   const { sections, groups } = useVisibleSections(user);
@@ -128,20 +138,32 @@ export function SettingsCenter({
   // 只有偏好页真的读 prefs;快捷键是静态表,不该被偏好接口的加载 / 失败挡住(审计 SET-02)。
   const needsPreferences = section === "preferences";
 
+  const onSubscribeSignalConsumedRef = useRef(onSubscribeSignalConsumed);
+  onSubscribeSignalConsumedRef.current = onSubscribeSignalConsumed;
+
   useEffect(() => {
     if (open) {
       // 深链到本角色不可见的分区(如普通用户 → api-access)→ 回落账户页。
       setSection(sections.some((s) => s.id === initialSection) ? initialSection : "account");
-      if (subscribeOpenSignal > 0 && subscribeOpenSignal !== lastSubscribeSignal.current) {
-        lastSubscribeSignal.current = subscribeOpenSignal;
-        setSubOpen(true);
-      }
     } else {
       setSection("account");
       setSubOpen(false);
       setPrivacySupport({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT });
     }
-  }, [open, initialSection, subscribeOpenSignal, sections]);
+  }, [open, initialSection, sections]);
+
+  // 独立消费一次性订阅直达信号：归零时不重置当前分区，且避免卸载重挂后重放历史信号（OCV5-845）。
+  useEffect(() => {
+    if (!open || subscribeOpenSignal <= 0) {
+      lastSubscribeSignal.current = 0;
+      return;
+    }
+    if (subscribeOpenSignal !== lastSubscribeSignal.current) {
+      lastSubscribeSignal.current = subscribeOpenSignal;
+      setSubOpen(true);
+      onSubscribeSignalConsumedRef.current?.();
+    }
+  }, [open, subscribeOpenSignal]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: prefsReloadTick 是显式重试触发器。
   useEffect(() => {
@@ -211,11 +233,18 @@ export function SettingsCenter({
         onOpenChange={(next) => {
           if (!next) onClose();
         }}
-        title={<span className="text-title font-semibold text-fg">设置</span>}
+        title={
+          <span className="inline-flex items-center gap-2.5">
+            <span className="oc-icon-badge oc-icon-badge-accent size-7 rounded-lg" aria-hidden="true">
+              <AtelierLazyIcon name="settings" size={15} />
+            </span>
+            <span className="text-title font-semibold tracking-tight text-fg">设置</span>
+          </span>
+        }
         size="xl"
         fixedHeight
         mobile="center"
-        className="bg-surface"
+        className="oc-surface-popover bg-surface"
         bodyClassName="flex min-h-0 flex-1 flex-col overflow-hidden p-0"
       >
         <div className={cn("flex min-h-0 min-w-0 flex-1", desktop ? "flex-row" : "flex-col")}>
@@ -227,9 +256,10 @@ export function SettingsCenter({
               value={section}
               onChange={setSection}
               groups={groups}
+              className="bg-sidebar/60"
             />
           ) : (
-            <div className="shrink-0 border-b border-border px-4 py-3">
+            <div className="oc-surface-glass shrink-0 border-x-0 border-t-0 border-b border-border/80 px-4 py-3 shadow-none">
               <Tabs
                 aria-label="设置分区"
                 idBase="settings"
@@ -243,7 +273,10 @@ export function SettingsCenter({
                 }))}
                 // 三列宫格放 7 个分区(admin 多一个「API 接入」)会在第三行剩一个孤项;
                 // 超过 6 项时改四列(4+3),6 项保持 3+3(审计 SET-12)。
-                className={cn("[&_[role=tab]]:px-3", sections.length > 6 && "grid-cols-4")}
+                className={cn(
+                  "oc-surface-recessed [&_[role=tab]]:px-3",
+                  sections.length > 6 && "grid-cols-4",
+                )}
               />
             </div>
           )}
@@ -330,7 +363,16 @@ function SettingsPanel({
   onOpenProjectSettings?: () => void;
 }) {
   if (!auth) {
-    return <p className="px-5 py-10 text-center text-body text-faint">请先登录。</p>;
+    return (
+      <div className="px-5 py-10">
+        <div className="oc-surface-card mx-auto flex max-w-sm flex-col items-center gap-2.5 rounded-2xl px-6 py-8 text-center">
+          <span className="oc-icon-badge size-10 rounded-xl" aria-hidden="true">
+            <Lock size={17} strokeWidth={1.8} />
+          </span>
+          <p className="text-body text-muted">请先登录。</p>
+        </div>
+      </div>
+    );
   }
 
   if (section === "account") {
@@ -358,7 +400,16 @@ function SettingsPanel({
   if (section === "api-access") {
     // 分区清单已按角色过滤;这里再兜底一次(角色变更竞态 / 直接改 state)。
     if (!isAdminUser(user)) {
-      return <p className="px-5 py-10 text-center text-body text-faint">该功能暂未对你开放。</p>;
+      return (
+        <div className="px-5 py-10">
+          <div className="oc-callout oc-callout-warning mx-auto flex max-w-sm items-center gap-3 rounded-2xl px-5 py-4">
+            <span className="oc-icon-badge oc-icon-badge-warning size-8 shrink-0 rounded-lg" aria-hidden="true">
+              <Lock size={15} strokeWidth={1.8} />
+            </span>
+            <p className="text-body text-muted">该功能暂未对你开放。</p>
+          </div>
+        </div>
+      );
     }
     return <ApiAccessTab auth={auth} />;
   }
@@ -370,18 +421,26 @@ function SettingsPanel({
     return (
       <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.preferences.id}>
         {prefsLoading || !prefs ? (
-          <div className="flex items-center justify-center gap-2 py-16 text-body text-faint">
+          <div className="flex items-center justify-center px-5 py-14">
             {prefsErr ? (
-              <div className="flex flex-col items-center gap-3 text-center">
-                <span className="text-danger">{prefsErr}</span>
-                <Button size="sm" variant="secondary" onClick={onRetryPrefs}>
+              <div className="oc-callout oc-callout-danger flex w-full max-w-sm flex-col items-center gap-3 rounded-2xl px-5 py-5 text-center">
+                <span className="oc-icon-badge oc-icon-badge-danger size-9 rounded-xl" aria-hidden="true">
+                  <AlertCircle size={17} strokeWidth={1.8} />
+                </span>
+                <span className="text-body font-medium text-danger">{prefsErr}</span>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  className="oc-btn-tactile oc-btn-secondary-craft"
+                  onClick={onRetryPrefs}
+                >
                   重试
                 </Button>
               </div>
             ) : (
-              <>
+              <div className="oc-surface-card inline-flex items-center gap-2.5 rounded-full px-4 py-2 text-body text-muted">
                 <Spinner /> 加载偏好…
-              </>
+              </div>
             )}
           </div>
         ) : (
@@ -405,7 +464,11 @@ function SettingsPanel({
         {user ? (
           <FeedbackTab auth={auth} userId={user.id} context={feedbackContext} />
         ) : (
-          <p className="px-5 py-10 text-center text-body text-faint">正在加载账号信息…</p>
+          <div className="flex justify-center px-5 py-12">
+            <div className="oc-surface-card inline-flex items-center gap-2 rounded-full px-4 py-2 text-body text-muted">
+              <Spinner /> 正在加载账号信息…
+            </div>
+          </div>
         )}
       </div>
     );
@@ -502,14 +565,28 @@ function UpdateCheckRow({ clientBuild }: { clientBuild: string }) {
               : null;
 
   return (
-    <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-caption">
+    <div
+      className={cn(
+        "oc-callout mt-4 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl px-4 py-3 text-caption",
+        state.kind === "available" && "oc-callout-info",
+        state.kind === "latest" && "oc-callout-success",
+        state.kind === "failed" && "oc-callout-warning",
+      )}
+    >
       <Button
         type="button"
         size="sm"
         variant="secondary"
+        className="oc-btn-tactile oc-btn-secondary-craft"
         onClick={() => void check()}
         disabled={state.kind === "checking"}
       >
+        <RefreshCw
+          size={13}
+          strokeWidth={1.9}
+          className={state.kind === "checking" ? "animate-spin" : undefined}
+          aria-hidden="true"
+        />
         检查更新
       </Button>
       {/* live region 常驻:只在有消息时才挂载的话,首次点「检查更新」时区域与文字同帧出现,
@@ -518,7 +595,13 @@ function UpdateCheckRow({ clientBuild }: { clientBuild: string }) {
         {message}
       </output>
       {state.kind === "available" && (
-        <Button type="button" size="sm" variant="primary" onClick={() => appUpdate.reloadNow()}>
+        <Button
+          type="button"
+          size="sm"
+          variant="primary"
+          className="oc-btn-tactile oc-btn-primary-craft ml-auto"
+          onClick={() => appUpdate.reloadNow()}
+        >
           立即刷新
         </Button>
       )}
@@ -529,67 +612,76 @@ function UpdateCheckRow({ clientBuild }: { clientBuild: string }) {
 function AboutSection() {
   const build = currentBuildId();
   return (
-    <div className="px-5 py-5">
-      <div className="flex items-center gap-3">
-        <Avatar tone="brand" size="lg" shape="square" className="shadow-sm">
-          <Sparkles size={22} />
-        </Avatar>
-        <div>
-          <div className="text-title font-semibold text-fg">{BRAND.name}</div>
-          <div className="text-caption text-faint">
-            {BRAND.nameEn} · {BRAND.slogan}
+    <div className="mx-auto max-w-xl px-5 py-5">
+      <div className="oc-surface-card rounded-2xl p-5">
+        <div className="flex items-center gap-3.5">
+          <Avatar tone="brand" size="lg" shape="square" className="oc-icon-badge oc-icon-badge-accent shadow-soft">
+            <AtelierIcon name="sparkles" size={21} />
+          </Avatar>
+          <div className="min-w-0">
+            <div className="text-title font-semibold tracking-tight text-fg">{BRAND.name}</div>
+            <div className="mt-0.5 text-caption text-faint">
+              {BRAND.nameEn} · {BRAND.slogan}
+            </div>
           </div>
         </div>
+        <p className="mt-4 text-body leading-relaxed text-muted">{BRAND.intro}</p>
       </div>
-      <p className="mt-4 text-body leading-relaxed text-muted">{BRAND.intro}</p>
-      <dl className="mt-4 flex flex-col gap-2 text-caption">
-        <div className="flex items-center justify-between gap-3">
-          <dt className="shrink-0 text-faint">运营主体</dt>
-          <dd className="truncate text-fg">{BRAND.company}</dd>
-        </div>
-        {/* 占位文案不上「备案」栏;运营在 brand.ts 填入真实备案号后自动出现。判据与 landing 页脚 /
-            法务页同源:lib/legal.ts filedIcp()(真实备案号必含一串数字,就位才返回),不再各写一份。 */}
-        {filedIcp(BRAND.icp) && (
-          <div className="flex items-center justify-between gap-3">
-            <dt className="shrink-0 text-faint">备案</dt>
-            <dd className="truncate text-fg">{filedIcp(BRAND.icp)}</dd>
+
+      <div className="oc-surface-card mt-4 overflow-hidden rounded-2xl">
+        <dl className="divide-y divide-border/70 text-caption">
+          <div className="flex items-center justify-between gap-3 px-4 py-3">
+            <dt className="shrink-0 text-faint">运营主体</dt>
+            <dd className="truncate font-medium text-fg">{BRAND.company}</dd>
           </div>
-        )}
-        <div className="flex items-center justify-between gap-3">
-          <dt className="shrink-0 text-faint">客户端</dt>
-          <dd className="truncate text-fg">
-            {BRAND.name} Web · © {BRAND.year}
-          </dd>
-        </div>
-        {/* 反馈排障要对齐构建号,关于页是用户最容易找到它的地方(审计 SET-42)。 */}
-        {build && (
-          <div className="flex items-center justify-between gap-3">
-            <dt className="shrink-0 text-faint">版本</dt>
-            <dd className="truncate font-mono text-fg" data-testid="about-build">
-              {build}
+          {/* 占位文案不上「备案」栏;运营在 brand.ts 填入真实备案号后自动出现。判据与 landing 页脚 /
+              法务页同源:lib/legal.ts filedIcp()(真实备案号必含一串数字,就位才返回),不再各写一份。 */}
+          {filedIcp(BRAND.icp) && (
+            <div className="flex items-center justify-between gap-3 px-4 py-3">
+              <dt className="shrink-0 text-faint">备案</dt>
+              <dd className="truncate text-fg">{filedIcp(BRAND.icp)}</dd>
+            </div>
+          )}
+          <div className="flex items-center justify-between gap-3 px-4 py-3">
+            <dt className="shrink-0 text-faint">客户端</dt>
+            <dd className="truncate text-fg">
+              {BRAND.name} Web · © {BRAND.year}
             </dd>
           </div>
-        )}
-      </dl>
+          {/* 反馈排障要对齐构建号,关于页是用户最容易找到它的地方(审计 SET-42)。 */}
+          {build && (
+            <div className="flex items-center justify-between gap-3 px-4 py-3">
+              <dt className="shrink-0 text-faint">版本</dt>
+              <dd className="oc-kbd truncate font-mono text-fg" data-testid="about-build">
+                {build}
+              </dd>
+            </div>
+          )}
+        </dl>
+      </div>
+
       {/* 没有构建号(dev / meta 缺失)时版本握手本身就是 inert 的,检查更新也没有比对对象,不渲染。 */}
       {build && <UpdateCheckRow clientBuild={build} />}
+
       {/* 法务入口:与落地页同一套 /terms、/privacy 路由(LegalPage),新标签打开不打断当前会话。 */}
-      <div className="mt-4 flex flex-wrap gap-x-4 gap-y-1 border-t border-border pt-3 text-caption">
+      <div className="mt-5 flex flex-wrap items-center gap-2 border-t border-border/80 pt-4 text-caption">
         <a
           href="/terms"
           target="_blank"
           rel="noopener noreferrer"
-          className="text-muted underline-offset-2 hover:text-fg hover:underline"
+          className="oc-btn-tactile inline-flex items-center gap-1 rounded-lg border border-border/70 bg-surface px-3 py-1.5 text-muted transition-colors hover:border-border-strong hover:bg-hover hover:text-fg"
         >
           用户协议
+          <ArrowUpRight size={12} strokeWidth={1.8} className="text-faint" aria-hidden="true" />
         </a>
         <a
           href="/privacy"
           target="_blank"
           rel="noopener noreferrer"
-          className="text-muted underline-offset-2 hover:text-fg hover:underline"
+          className="oc-btn-tactile inline-flex items-center gap-1 rounded-lg border border-border/70 bg-surface px-3 py-1.5 text-muted transition-colors hover:border-border-strong hover:bg-hover hover:text-fg"
         >
           隐私政策
+          <ArrowUpRight size={12} strokeWidth={1.8} className="text-faint" aria-hidden="true" />
         </a>
       </div>
     </div>

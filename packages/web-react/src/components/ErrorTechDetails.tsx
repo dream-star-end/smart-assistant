@@ -1,4 +1,4 @@
-import { ChevronRight } from "lucide-react";
+import { Check, ChevronRight, Copy } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 import { cn } from "../lib/utils";
 
@@ -26,15 +26,20 @@ export function ErrorTechDetails({ text, collapsible = false }: { text: string; 
         aria-expanded={open}
         aria-controls={id}
         onClick={() => setOpen((v) => !v)}
-        className="inline-flex items-center gap-0.5 rounded-sm px-1 text-meta text-faint outline-none transition-colors hover:text-muted focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+        className="oc-btn-tactile inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-caption font-medium text-faint outline-none transition-colors hover:bg-hover hover:text-muted focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
       >
         技术详情
-        <ChevronRight aria-hidden="true" size={12} className={cn("transition-transform", open && "rotate-90")} />
+        <ChevronRight
+          aria-hidden="true"
+          size={12}
+          strokeWidth={1.75}
+          className={cn("transition-transform duration-200 ease-[var(--ease-spring)]", open && "rotate-90")}
+        />
       </button>
       <div
         id={id}
         hidden={!open}
-        className="mt-1.5 rounded-sm bg-hover px-2.5 py-2 font-mono text-meta text-muted"
+        className="oc-surface-recessed mt-1.5 rounded-lg border border-border/70 px-3 py-2 font-mono text-caption text-muted"
       >
         {body}
       </div>
@@ -60,8 +65,18 @@ function CopyDetailsButton({ text }: { text: string }) {
         window.clearTimeout(timer.current);
         timer.current = window.setTimeout(() => setState("idle"), 1600);
       }}
-      className="shrink-0 rounded-sm px-1.5 font-sans text-meta text-faint outline-none transition-colors hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+      className={cn(
+        "oc-btn-tactile inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-0.5 font-sans text-caption font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+        state === "copied"
+          ? "bg-success-soft text-success"
+          : "text-faint hover:bg-hover hover:text-fg",
+      )}
     >
+      {state === "copied" ? (
+        <Check size={11} strokeWidth={2} aria-hidden="true" />
+      ) : (
+        <Copy size={11} strokeWidth={1.75} aria-hidden="true" />
+      )}
       {state === "copied" ? "已复制" : state === "failed" ? "请手动选中复制" : "复制"}
     </button>
   );

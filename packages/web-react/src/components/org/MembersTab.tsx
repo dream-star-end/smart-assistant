@@ -318,12 +318,14 @@ export function MembersTab({
   const seatFull = subscription != null && activeMembers >= subscription.seats;
 
   return (
-    <div className="flex flex-col">
+    <div className="flex flex-col gap-4 p-5">
       {/* 成员列表 */}
-      <div className="px-5 py-4">
-        <div className="flex flex-wrap items-center justify-between gap-2 pb-2">
-          <div className="text-caption font-medium uppercase tracking-wide text-faint">
-            成员（{members.length}）
+      <div>
+        <div className="flex flex-wrap items-center justify-between gap-2 pb-3">
+          <div className="flex items-center gap-2">
+            <span className="text-caption font-semibold uppercase tracking-wide text-faint">
+              成员（{members.length}）
+            </span>
           </div>
           {/* 成员多于阈值才出现搜索框（审计 SET-39）；分页条在列表底部，只有一页时不渲染。 */}
           {showMemberSearch && (
@@ -351,31 +353,46 @@ export function MembersTab({
           </p>
         )}
         {filteredMembers.length === 0 ? (
-          <p className="py-6 text-center text-meta text-faint">没有匹配的成员。</p>
+          <p className="oc-surface-recessed rounded-xl py-6 text-center text-meta text-faint">
+            没有匹配的成员。
+          </p>
         ) : null}
-        <ul className="flex flex-col gap-1.5">
+        <ul className="flex flex-col gap-2.5">
           {memberPage.pageRows.map((m) => {
             const ownerRow = m.org_role === "owner";
             const busy = busyUid === m.user_id;
+            const initial = (m.display_name || m.email || "?").trim().charAt(0).toUpperCase();
             return (
-              <li key={m.user_id} className="rounded-lg border border-border px-3 py-2.5">
+              <li key={m.user_id} className="oc-surface-card rounded-xl p-3.5">
                 <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="truncate text-section font-medium text-fg">
-                      {m.display_name || m.email}
+                  <div className="flex min-w-0 items-start gap-3">
+                    <span
+                      aria-hidden="true"
+                      className={
+                        ownerRow
+                          ? "oc-avatar-ring flex size-9 shrink-0 items-center justify-center rounded-full bg-accent-soft text-meta font-semibold text-accent"
+                          : "oc-avatar-ring flex size-9 shrink-0 items-center justify-center rounded-full bg-hover text-meta font-semibold text-muted"
+                      }
+                    >
+                      {initial}
+                    </span>
+                    <div className="min-w-0">
+                      <div className="truncate text-section font-semibold text-fg">
+                        {m.display_name || m.email}
+                      </div>
+                      {/* 邮箱与加入时间分两行：单行 truncate 在移动端会把加入时间吃进省略号（审计 SET-38）。 */}
+                      <div className="truncate text-caption text-muted">{m.email}</div>
+                      <div className="text-caption text-faint">加入 {shortTime(m.joined_at)}</div>
                     </div>
-                    {/* 邮箱与加入时间分两行：单行 truncate 在移动端会把加入时间吃进省略号（审计 SET-38）。 */}
-                    <div className="truncate text-caption text-faint">{m.email}</div>
-                    <div className="text-caption text-faint">加入 {shortTime(m.joined_at)}</div>
                   </div>
-                  <div className="flex shrink-0 items-center gap-1.5">
+                  <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
                     <Badge tone={roleTone(m.org_role)}>{orgRoleLabel(m.org_role)}</Badge>
                     {m.billing_delegate && <Badge tone="accent">财务</Badge>}
                     {m.status === "suspended" && <Badge tone="warning">已暂停</Badge>}
                   </div>
                 </div>
 
-                <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-2">
+                <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-border/60 pt-2.5">
                   {/* 组织结算开关:服务端 owner-only(安全加固),非 owner 只读展示,消除"点了才 403"。
                       非 owner 看到的是禁用态,用 title 说明为什么不可点(审计 SET-40)。 */}
                   <label
@@ -431,14 +448,14 @@ export function MembersTab({
                   )}
 
                   {ownerRow ? (
-                    <span className="text-caption text-faint">拥有者不可变更</span>
+                    <span className="ml-auto text-caption text-faint">拥有者不可变更</span>
                   ) : (
                     <Button
                       variant="ghost"
                       size="sm"
                       onClick={() => removeMember(m)}
                       disabled={busy}
-                      className="text-danger hover:bg-danger-soft"
+                      className="ml-auto text-danger hover:bg-hover"
                     >
                       移除
                     </Button>
@@ -476,14 +493,17 @@ export function MembersTab({
       </div>
 
       {/* 邀请成员 */}
-      <div className="border-t border-border px-5 py-4">
-        <div className="flex items-center gap-1.5 pb-2 text-caption font-medium uppercase tracking-wide text-faint">
-          <UserPlus size={13} /> 邀请成员
+      <div className="oc-surface-card rounded-xl p-4">
+        <div className="mb-3 flex items-center gap-2">
+          <span className="oc-icon-badge oc-icon-badge-accent size-7 rounded-md">
+            <UserPlus size={14} strokeWidth={1.75} />
+          </span>
+          <span className="text-section font-semibold text-fg">邀请成员</span>
         </div>
 
         {seatFull ? (
-          <div className="rounded-lg border border-border bg-warning-soft px-3.5 py-3">
-            <div className="flex items-center gap-1.5 text-meta font-medium text-warning">
+          <div className="oc-callout oc-callout-warning rounded-xl px-4 py-3">
+            <div className="flex items-center gap-1.5 text-meta font-semibold text-warning">
               <Users size={14} /> 席位已满（{activeMembers} / {subscription?.seats} 席）
             </div>
             <p className="mt-1 text-meta text-muted">
@@ -492,7 +512,7 @@ export function MembersTab({
                 : "当前席位已用满，如需邀请更多成员，请联系组织拥有者加席。"}
             </p>
             {canManageBilling && (
-              <Button variant="primary" size="sm" onClick={onAddSeats} className="mt-2">
+              <Button variant="primary" size="sm" onClick={onAddSeats} className="mt-2.5">
                 <Users size={15} /> 去加席
               </Button>
             )}
@@ -530,16 +550,16 @@ export function MembersTab({
         )}
 
         {invitations.length > 0 && (
-          <ul className="mt-3 flex flex-col gap-0.5">
+          <ul className="mt-3 flex flex-col gap-1.5">
             {invitations.map((inv) => {
               const sm = invStatusMeta(inv.status);
               return (
                 <li
                   key={inv.id}
-                  className="flex items-center gap-3 rounded-lg px-2 py-2 hover:bg-hover"
+                  className="oc-surface-recessed flex items-center gap-3 rounded-lg px-3 py-2"
                 >
                   <span className="min-w-0 flex-1">
-                    <span className="block truncate text-body text-fg">{inv.email}</span>
+                    <span className="block truncate text-body font-medium text-fg">{inv.email}</span>
                     <span className="block truncate text-caption text-faint">
                       {orgRoleLabel(inv.org_role)} · {shortTime(inv.created_at)}
                     </span>
@@ -600,19 +620,19 @@ function MemberUsageRow({
   const budgetLabel = member.monthly_org_budget == null ? "不限" : formatCredits(member.monthly_org_budget);
 
   return (
-    <div className="mt-2 flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-t border-border/60 pt-2">
+    <div className="oc-surface-recessed mt-2.5 flex flex-wrap items-center justify-between gap-x-4 gap-y-2 rounded-lg px-3 py-2">
       <div className="min-w-[11rem] flex-1">
         <div className="flex items-center justify-between text-caption">
-          <span className="flex items-center gap-1 text-faint">
+          <span className="flex items-center gap-1 text-muted">
             <Wallet size={12} /> 本月组织用量
           </span>
-          <span className="tabular-nums text-muted">
+          <span className="font-medium tabular-nums text-fg">
             {formatCredits(member.month_org_spent)}
-            {bv.hasBudget && <span className="text-faint"> / {budgetLabel}</span>}
+            {bv.hasBudget && <span className="font-normal text-faint"> / {budgetLabel}</span>}
           </span>
         </div>
         {bv.hasBudget && (
-          <Progress value={bv.pct} className="mt-1" aria-label="月度限额用量" />
+          <Progress value={bv.pct} className="mt-1.5" aria-label="月度限额用量" />
         )}
         {bv.over && (
           <p className="mt-1 text-caption text-faint">本月已达限额，正用个人余额。</p>
@@ -640,14 +660,14 @@ function MemberUsageRow({
           </div>
         ) : (
           <div className="flex items-center gap-1.5 text-meta text-muted">
-            限额 <span className="tabular-nums text-fg">{budgetLabel}</span>
+            限额 <span className="font-medium tabular-nums text-fg">{budgetLabel}</span>
             <Button size="sm" variant="ghost" onClick={onEditStart} disabled={busy}>
               编辑
             </Button>
           </div>
         )
       ) : (
-        <span className="text-caption text-faint">限额 {budgetLabel}</span>
+        <span className="text-caption tabular-nums text-faint">限额 {budgetLabel}</span>
       )}
     </div>
   );

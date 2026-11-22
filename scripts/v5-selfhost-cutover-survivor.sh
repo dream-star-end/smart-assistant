@@ -40,6 +40,8 @@ SURVIVOR_RESTORE_CMD="${SURVIVOR_RESTORE_CMD:-}"
 SURVIVOR_MASTER_URL="${SURVIVOR_MASTER_URL:-http://127.0.0.1:18790/healthz}"
 SURVIVOR_EGRESS_URL="${SURVIVOR_EGRESS_URL:-http://172.31.0.1:18892/internal/v5/egress-health}"
 SURVIVOR_MASTER_UNIT="${SURVIVOR_MASTER_UNIT:-openclaude-v5-selfhost.service}"
+SURVIVOR_MASTER_SLOT_TPL="${SURVIVOR_MASTER_SLOT_TPL:-openclaude-v5-selfhost@.service}"
+SURVIVOR_FRONTDOOR_UNIT="${SURVIVOR_FRONTDOOR_UNIT:-openclaude-v5-selfhost-frontdoor.service}"
 SURVIVOR_EGRESS_UNIT="${SURVIVOR_EGRESS_UNIT:-openclaude-v5-selfhost-egress.service}"
 SURVIVOR_EGRESS_SLOT_TPL="${SURVIVOR_EGRESS_SLOT_TPL:-openclaude-v5-selfhost-egress@.service}"
 
@@ -157,7 +159,13 @@ compound_health_green() {
   fi
   local st
   st="$(systemctl is-active "$SURVIVOR_MASTER_UNIT" 2>/dev/null || true)"
-  [[ "$st" == "active" ]] || return 1
+  if [[ "$st" != "active" ]]; then
+    # OCV5-854: dual-slot master mode (frontdoor + @A/@B active).
+    [[ "$(systemctl is-active "$SURVIVOR_FRONTDOOR_UNIT" 2>/dev/null || true)" == "active" ]] || return 1
+    st="$(systemctl is-active "${SURVIVOR_MASTER_SLOT_TPL/@./@A.}" 2>/dev/null || true)"
+    [[ "$st" == "active" ]] || st="$(systemctl is-active "${SURVIVOR_MASTER_SLOT_TPL/@./@B.}" 2>/dev/null || true)"
+    [[ "$st" == "active" ]] || return 1
+  fi
   # egress:legacy 单 unit 或 双槽 egress@A/@B 任一 active(2026-09-05 蓝绿)。
   st="$(systemctl is-active "$SURVIVOR_EGRESS_UNIT" 2>/dev/null || true)"
   if [[ "$st" != "active" ]]; then
@@ -218,17 +226,27 @@ master_cwd_is_live_rel() {
     eval "$SURVIVOR_LIVE_WD_CMD"
     return
   fi
-  local pid cwd wd live
-  pid="$(systemctl show -p MainPID --value "$SURVIVOR_MASTER_UNIT" 2>/dev/null || true)"
+  local pid cwd wd live active_unit="$SURVIVOR_MASTER_UNIT"
+  if [[ "$(systemctl is-active "$SURVIVOR_MASTER_UNIT" 2>/dev/null || true)" != "active" ]]; then
+    if [[ "$(systemctl is-active "${SURVIVOR_MASTER_SLOT_TPL/@./@A.}" 2>/dev/null || true)" == "active" ]]; then
+      active_unit="${SURVIVOR_MASTER_SLOT_TPL/@./@A.}"
+    elif [[ "$(systemctl is-active "${SURVIVOR_MASTER_SLOT_TPL/@./@B.}" 2>/dev/null || true)" == "active" ]]; then
+      active_unit="${SURVIVOR_MASTER_SLOT_TPL/@./@B.}"
+    fi
+  fi
+  pid="$(systemctl show -p MainPID --value "$active_unit" 2>/dev/null || true)"
   [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
   cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)"
-  wd="$(systemctl show -p WorkingDirectory --value "$SURVIVOR_MASTER_UNIT" 2>/dev/null || true)"
+  wd="$(systemctl show -p WorkingDirectory --value "$active_unit" 2>/dev/null || true)"
   live="$(readlink -f /opt/openclaude/openclaude-v5-selfhost-live 2>/dev/null || true)"
   case "$cwd" in
     /opt/openclaude/openclaude-v5-selfhost-releases/rel-*) return 0 ;;
   esac
   [[ -n "$live" && "$cwd" == "$live" ]] && return 0
-  [[ "$wd" == /opt/openclaude/openclaude-v5-selfhost-live ]] || return 1
+  case "$wd" in
+    /opt/openclaude/openclaude-v5-selfhost-live|/opt/openclaude/openclaude-v5-selfhost-slot-A|/opt/openclaude/openclaude-v5-selfhost-slot-B) ;;
+    *) return 1 ;;
+  esac
   [[ -n "$live" && "$live" == /opt/openclaude/openclaude-v5-selfhost-releases/rel-* ]]
 }
 

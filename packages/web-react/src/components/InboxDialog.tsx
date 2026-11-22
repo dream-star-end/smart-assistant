@@ -29,6 +29,7 @@ import {
   Sheet,
   Skeleton,
   Spinner,
+  StatusDot,
   Tabs,
 } from "./ui";
 
@@ -50,12 +51,12 @@ const LEVEL_ICON: Record<InboxLevel, LucideIcon> = {
   warning: TriangleAlert,
 };
 
-/** 级别 tone → 图标圆形容器的 soft 底色 + 前景色。 */
+/** 级别 tone → 图标徽章容器样式（Clarvy Atelier .oc-icon-badge）。 */
 const LEVEL_ICON_CLASS: Record<InboxLevelTone, string> = {
-  neutral: "bg-hover text-muted",
-  info: "bg-info-soft text-info",
-  accent: "bg-accent-soft text-accent",
-  warning: "bg-warning-soft text-warning",
+  neutral: "oc-icon-badge",
+  info: "oc-icon-badge oc-icon-badge-info",
+  accent: "oc-icon-badge oc-icon-badge-accent",
+  warning: "oc-icon-badge oc-icon-badge-warning",
 };
 
 /**
@@ -289,12 +290,14 @@ export function InboxDialog({
       srTitle="站内信"
       className="w-[100vw] max-w-[100vw] bg-surface sm:w-[44rem] sm:max-w-[44rem]"
     >
-      {/* 头部：铃铛 + 标题 + 未读数 + 全部已读 + 关闭 */}
-      <div className="flex items-center gap-2 border-b border-border px-4 py-3">
-        <Bell size={17} className="shrink-0 text-muted" />
+      {/* 头部：铃铛徽章 + 标题 + 未读数 + 全部已读 + 关闭 */}
+      <div className="flex items-center gap-2.5 border-b border-border px-4 py-3.5">
+        <span className="oc-icon-badge oc-icon-badge-accent h-8 w-8 rounded-md" aria-hidden>
+          <Bell size={15} strokeWidth={1.75} />
+        </span>
         <span className="text-title font-semibold text-fg">站内信</span>
-        {unreadCount > 0 && <Badge tone="danger">{unreadCount}</Badge>}
-        <div className="ml-auto flex items-center gap-0.5">
+        {unreadCount > 0 && <Badge tone="danger" className="tabular-nums">{unreadCount}</Badge>}
+        <div className="ml-auto flex items-center gap-1">
           <Button
             variant="ghost"
             size="sm"
@@ -302,11 +305,11 @@ export function InboxDialog({
             disabled={markingAll || unreadCount === 0}
             className="gap-1.5 text-muted"
           >
-            <CheckCheck size={15} />
+            <CheckCheck size={15} strokeWidth={1.75} />
             全部已读
           </Button>
           <IconButton variant="muted" aria-label="关闭" onClick={onClose}>
-            <X size={18} />
+            <X size={18} strokeWidth={1.75} />
           </IconButton>
         </div>
       </div>
@@ -464,10 +467,10 @@ function InboxItem({
   return (
     <li
       className={cn(
-        "relative overflow-hidden rounded-xl border bg-elevated shadow-soft transition-[border-color,box-shadow]",
+        "oc-surface-card relative overflow-hidden rounded-2xl transition-[border-color,box-shadow,transform]",
         expanded
           ? "border-border-strong shadow-float"
-          : "border-border hover:border-border-strong",
+          : "oc-surface-card-hover",
         !m.read && "border-l-2 border-l-accent",
       )}
     >
@@ -476,30 +479,27 @@ function InboxItem({
         onClick={onToggle}
         aria-expanded={expanded}
         className={cn(
-          "flex w-full gap-3.5 px-3.5 py-3.5 text-left outline-none transition-colors hover:bg-hover/70 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-4",
-          expanded && "bg-hover/60",
+          "flex w-full gap-3.5 px-3.5 py-3.5 text-left outline-none transition-colors hover:bg-hover/60 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-4",
+          expanded && "bg-hover/50",
         )}
       >
         <span
           className={cn(
-            "mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-xl",
+            "mt-0.5 h-9 w-9 rounded-md",
             LEVEL_ICON_CLASS[meta.tone],
           )}
           title={meta.label}
         >
-          <Icon size={17} aria-hidden />
+          <Icon size={16} strokeWidth={1.75} aria-hidden />
         </span>
         <span className="flex min-w-0 flex-1 flex-col">
           <span className="flex items-start gap-2">
             {!m.read && (
-              <span
-                className="size-1.5 shrink-0 rounded-full bg-accent"
-                aria-hidden
-              />
+              <StatusDot tone="accent" className="mt-1.5" />
             )}
             <span
               className={cn(
-                "min-w-0 flex-1 truncate text-[14px] leading-5 text-fg",
+                "min-w-0 flex-1 truncate text-section leading-5 text-fg",
                 m.read ? "font-medium" : "font-semibold",
               )}
             >
@@ -513,26 +513,27 @@ function InboxItem({
             </span>
           </span>
           {!expanded && summary && (
-            <span className="mt-1.5 line-clamp-2 text-[12.5px] leading-relaxed text-muted">
+            <span className="mt-1.5 line-clamp-2 text-meta leading-relaxed text-muted">
               {summary}
             </span>
           )}
           <span className="mt-2 flex min-h-5 flex-wrap items-center gap-1.5">
-            <Badge tone={meta.tone}>{meta.label}</Badge>
+            <Badge tone={meta.tone} size="sm">{meta.label}</Badge>
             {hasImage && (
               <span className="inline-flex items-center gap-1 text-caption text-faint">
-                <ImageIcon size={12} /> 图片
+                <ImageIcon size={12} strokeWidth={1.75} /> 图片
               </span>
             )}
             {hasChart && (
               <span className="inline-flex items-center gap-1 text-caption text-faint">
-                <BarChart3 size={12} /> 图表
+                <BarChart3 size={12} strokeWidth={1.75} /> 图表
               </span>
             )}
           </span>
         </span>
         <ChevronDown
           size={16}
+          strokeWidth={1.75}
           aria-hidden
           className={cn(
             "mt-1 shrink-0 text-faint transition-transform",
@@ -541,7 +542,7 @@ function InboxItem({
         />
       </button>
       {expanded && (
-        <div className="min-w-0 overflow-hidden border-t border-border bg-surface px-4 py-4 text-[13px] leading-relaxed text-fg sm:px-5">
+        <div className="min-w-0 overflow-hidden border-t border-border bg-surface px-4 py-4 text-body leading-relaxed text-fg sm:px-5">
           <Markdown signMedia readOnly>
             {body}
           </Markdown>
@@ -585,9 +586,9 @@ function SkeletonRows() {
       {[0, 1, 2, 3].map((i) => (
         <li
           key={i}
-          className="flex gap-3 rounded-xl border border-border bg-elevated px-4 py-4"
+          className="oc-surface-card flex gap-3 rounded-2xl px-4 py-4"
         >
-          <Skeleton className="size-9 shrink-0 rounded-xl" />
+          <Skeleton className="size-9 shrink-0 rounded-md" />
           <div className="min-w-0 flex-1">
             <Skeleton className="h-3.5 w-1/2" />
             <Skeleton className="mt-2 h-3 w-full" />

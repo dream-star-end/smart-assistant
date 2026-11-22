@@ -110,14 +110,23 @@ export function ProjectFolderBrowser({
 
   return (
     <Card padding="md" className="flex min-w-0 flex-col gap-3" data-testid="project-folder">
-      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-        <h2 className="text-section font-semibold text-fg">项目文件夹</h2>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2.5">
+          <span className="oc-icon-badge oc-icon-badge-accent size-7 rounded-md" aria-hidden="true">
+            <FolderOpen size={14} strokeWidth={1.75} />
+          </span>
+          <h2 className="text-section font-semibold text-fg">项目文件夹</h2>
+        </div>
         {listing?.shared && (
-          <span className="text-caption text-faint">共用的默认工作区，其他项目的文件也在这里</span>
+          <span className="oc-badge-craft rounded-full bg-hover px-2.5 py-0.5 text-caption text-faint">
+            共用的默认工作区，其他项目的文件也在这里
+          </span>
         )}
       </div>
       {error === "none" ? (
-        <p className="text-caption text-faint">这个项目没有自己的文件夹。会话产出的文件在「产出」页签里。</p>
+        <p className="oc-surface-recessed rounded-lg px-3.5 py-3 text-caption text-faint">
+          这个项目没有自己的文件夹。会话产出的文件在「产出」页签里。
+        </p>
       ) : error === "load" ? (
         <Alert tone="danger" title="项目文件夹没有加载出来">
           <Button size="sm" variant="secondary" onClick={() => void load(path)}>
@@ -131,10 +140,13 @@ export function ProjectFolderBrowser({
         </div>
       ) : (
         <>
-          <nav aria-label="当前位置" className="flex min-w-0 flex-wrap items-center gap-1 text-meta">
+          <nav
+            aria-label="当前位置"
+            className="oc-surface-recessed flex min-w-0 flex-wrap items-center gap-1 rounded-lg px-2.5 py-1.5 text-meta"
+          >
             <button
               type="button"
-              className="rounded px-1 text-muted hover:bg-hover hover:text-fg"
+              className="rounded-md px-1.5 py-0.5 font-medium text-muted transition-colors hover:bg-surface hover:text-fg"
               onClick={() => void load("")}
             >
               根目录
@@ -144,7 +156,7 @@ export function ProjectFolderBrowser({
                 <ChevronRight size={12} aria-hidden className="text-faint" />
                 <button
                   type="button"
-                  className="min-w-0 truncate rounded px-1 text-muted hover:bg-hover hover:text-fg"
+                  className="min-w-0 truncate rounded-md px-1.5 py-0.5 font-medium text-muted transition-colors hover:bg-surface hover:text-fg"
                   onClick={() => void load(crumbs.slice(0, i + 1).join("/"))}
                 >
                   {c}
@@ -155,40 +167,48 @@ export function ProjectFolderBrowser({
           {listing.entries.length === 0 ? (
             <EmptyState icon={FolderOpen} title="这个文件夹是空的" />
           ) : (
-            <ul className="flex flex-col">
+            <ul className="divide-y divide-border/50 rounded-xl border border-border/70 bg-bg/30">
               {listing.entries.map((e) => {
                 const rel = childPath(e.name);
                 return (
                   <li
                     key={e.name}
                     data-testid="project-folder-entry"
-                    className="flex min-h-11 min-w-0 items-center gap-2 rounded-md px-2 hover:bg-hover"
+                    className="flex min-h-11 min-w-0 items-center gap-2.5 px-3 py-1 transition-colors first:rounded-t-xl last:rounded-b-xl hover:bg-hover/60"
                   >
                     {e.type === "dir" ? (
                       <button
                         type="button"
-                        className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                        className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
                         onClick={() => void load(rel)}
                       >
-                        <Folder size={16} aria-hidden className="shrink-0 text-muted" />
-                        <span className="min-w-0 truncate text-body">{e.name}</span>
+                        <span className="oc-icon-badge oc-icon-badge-accent size-6 rounded-md" aria-hidden="true">
+                          <Folder size={13} strokeWidth={1.75} />
+                        </span>
+                        <span className="min-w-0 truncate text-body font-medium text-fg">{e.name}</span>
                       </button>
                     ) : (
-                      <span className="flex min-w-0 flex-1 items-center gap-2">
-                        {e.type === "link" ? (
-                          <Link2 size={16} aria-hidden className="shrink-0 text-faint" />
-                        ) : (
-                          <FileIcon size={16} aria-hidden className="shrink-0 text-muted" />
-                        )}
-                        <span className="min-w-0 truncate text-body">{e.name}</span>
+                      <span className="flex min-w-0 flex-1 items-center gap-2.5">
+                        <span className="oc-icon-badge size-6 rounded-md" aria-hidden="true">
+                          {e.type === "link" ? (
+                            <Link2 size={13} strokeWidth={1.75} />
+                          ) : (
+                            <FileIcon size={13} strokeWidth={1.75} />
+                          )}
+                        </span>
+                        <span className="min-w-0 truncate font-mono text-meta text-fg">{e.name}</span>
                       </span>
                     )}
                     {e.type === "file" && (e.size ?? 0) > FOLDER_DOWNLOAD_MAX_BYTES && (
-                      <span className="shrink-0 text-caption text-faint">{formatBytes(e.size)}，超过 2 MB 不能在这里下载</span>
+                      <span className="shrink-0 text-caption tabular-nums text-faint">
+                        {formatBytes(e.size)}，超过 2 MB 不能在这里下载
+                      </span>
                     )}
                     {e.type === "file" && (e.size ?? 0) <= FOLDER_DOWNLOAD_MAX_BYTES && (
                       <>
-                        <span className="hidden shrink-0 text-caption text-faint sm:inline">{formatBytes(e.size)}</span>
+                        <span className="hidden shrink-0 text-caption tabular-nums text-faint sm:inline">
+                          {formatBytes(e.size)}
+                        </span>
                         {e.mtime != null && (
                           <TimeAgo value={e.mtime} className="hidden shrink-0 text-caption text-faint sm:inline" />
                         )}

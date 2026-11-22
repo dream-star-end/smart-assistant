@@ -22,3 +22,5 @@ packages/commercial/src/__tests__/turnTapeJobs.integ.test.ts
 
 packages/commercial/src/__tests__/codexCommissioning.integ.test.ts
 packages/commercial/src/sites/__tests__/sitesRepoPg.integ.test.ts
+# OCV5-824 timeline/live-frame/snapshot perf & 0350/0351 migration fixes
+packages/commercial/src/__tests__/ocv5824PerfFixes.integ.test.ts

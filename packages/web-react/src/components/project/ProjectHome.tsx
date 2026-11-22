@@ -7,10 +7,8 @@ import {
   Clock3,
   Download,
   FolderOpen,
-  Menu,
   MessageSquare,
   MoreHorizontal,
-  PanelLeft,
   Pencil,
   Pin,
   Plus,
@@ -24,8 +22,11 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import {
+  Component,
   type KeyboardEvent,
   type ReactNode,
+  Suspense,
+  lazy,
   useEffect,
   useId,
   useMemo,
@@ -43,6 +44,7 @@ import { cn } from "../../lib/utils";
 import { ProjectAssetsPanel } from "../ProjectAssetsPanel";
 import { useSignedDownload } from "../chat/media";
 import { ProjectFolderBrowser } from "./ProjectFolderBrowser";
+import { WorkspaceShellHeader } from "../ui/WorkspaceShellHeader";
 import { OutputRow, OutputViewer } from "./OutputViewer";
 import { ScheduledRecipeChips } from "./ScheduledRecipes";
 import {
@@ -111,6 +113,9 @@ export type ProjectHomeProps = {
   loadingArchived?: boolean;
   sidebarCollapsed?: boolean;
   onExpandSidebar?: () => void;
+  sessionUnreadCount?: number;
+  updateAvailable?: boolean;
+  onReloadForUpdate?: () => void;
   /**
    * 项目的看板/记忆/技能/定时任务在各自的页面里,按本项目的范围打开。
    * onPrepareBoard 确保本项目的看板已在容器里建好(首次用时创建);成功后本组件把
@@ -133,6 +138,50 @@ const SURFACES: Array<{ id: ProjectSurface; label: string; hint: string; icon: L
 
 const OVERVIEW_SESSION_LIMIT = 5;
 const OVERVIEW_OUTPUT_LIMIT = 6;
+
+function createLazyProjectResearchTab() {
+  return lazy(() =>
+    import("./ProjectResearchTab").catch((err) => {
+      LazyProjectResearchTab = createLazyProjectResearchTab();
+      throw err;
+    }),
+  );
+}
+let LazyProjectResearchTab = createLazyProjectResearchTab();
+
+class ResearchTabErrorBoundary extends Component<
+  { onRetry: () => void; children: ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  render() {
+    if (this.state.failed) {
+      return (
+        <Alert
+          tone="danger"
+          action={
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => {
+                this.props.onRetry();
+                this.setState({ failed: false });
+              }}
+            >
+              重试
+            </Button>
+          }
+        >
+          文献库模块加载失败，请重试。
+        </Alert>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 /**
  * 项目主页（`/p/<id>[/<tab>]`）：一个项目的所有东西在一处 —— 开始新会话、最近会话、
@@ -161,6 +210,9 @@ export function ProjectHome(props: ProjectHomeProps) {
     onPrepareBoard,
     onShowSurface,
     onExpandSidebar,
+    sessionUnreadCount,
+    updateAvailable,
+    onReloadForUpdate,
     recipeSchedule = false,
   } = props;
 
@@ -250,6 +302,7 @@ export function ProjectHome(props: ProjectHomeProps) {
       ),
     },
     { value: "files", label: "文件" },
+    { value: "research", label: "文献" },
     {
       value: "outputs",
       label: (
@@ -267,65 +320,60 @@ export function ProjectHome(props: ProjectHomeProps) {
     <div data-testid="project-home" className="flex h-full min-h-0 flex-col bg-bg">
       {confirmEl}
       {promptEl}
-      <header className="flex shrink-0 items-center gap-2 px-3 pb-2 header-safe-t md:h-14 md:px-4 md:pb-0">
-        <IconButton
-          onClick={onOpenMobileNav}
-          aria-label="打开菜单"
-          shape="square"
-          className="md:hidden"
-        >
-          <Menu size={18} />
-        </IconButton>
-        {sidebarCollapsed && onExpandSidebar && (
-          <IconButton
-            onClick={onExpandSidebar}
-            aria-label="展开侧栏"
-            shape="square"
-            className="hidden md:inline-flex"
-          >
-            <PanelLeft size={18} />
-          </IconButton>
-        )}
-        <span className="text-meta text-muted">项目</span>
-      </header>
+      <WorkspaceShellHeader
+        onOpenMobileNav={onOpenMobileNav}
+        sidebarCollapsed={sidebarCollapsed}
+        onExpandSidebar={onExpandSidebar}
+        sessionUnreadCount={sessionUnreadCount}
+        updateAvailable={updateAvailable}
+        onReloadForUpdate={onReloadForUpdate}
+      >
+        <span className="text-meta font-medium text-muted">项目</span>
+      </WorkspaceShellHeader>
 
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
         <div className="@container mx-auto flex w-full max-w-3xl flex-col gap-4 px-4 pb-10 pt-1 md:px-5 md:pt-4">
-          {/* 标题行：颜色点 · 名称 · ⋯ */}
-          <div className="flex min-w-0 flex-col gap-1">
-            <div className="flex min-w-0 items-center gap-2">
+          {/* 标题行：图标徽章 · 名称 · ⋯ */}
+          <div className="flex min-w-0 items-start gap-3">
+            <span className="oc-icon-badge mt-0.5 size-10 shrink-0 rounded-xl" aria-hidden>
               {swatch ? (
-                <span aria-hidden className={cn("size-3 shrink-0 rounded-full", swatch.dotClass)} />
+                <span className={cn("size-3.5 rounded-full shadow-soft", swatch.dotClass)} />
               ) : (
-                <FolderOpen size={18} aria-hidden className="shrink-0 text-faint" />
+                <FolderOpen size={18} strokeWidth={1.75} className="text-muted" />
               )}
-              <h1 className="min-w-0 truncate text-title font-semibold md:text-xl">{project.name}</h1>
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <IconButton aria-label={`项目 ${project.name} 更多`} size="sm" shape="square">
-                    <MoreHorizontal size={16} />
-                  </IconButton>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="start" className="w-44">
-                  <DropdownMenuItem onSelect={onOpenSettings}>
-                    <Settings2 size={14} className="shrink-0 text-muted" />
-                    项目设置
-                  </DropdownMenuItem>
-                  <DropdownMenuItem onSelect={onRename}>
-                    <Pencil size={14} className="shrink-0 text-muted" />
-                    重命名
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem destructive onSelect={onDelete}>
-                    <Trash2 size={14} className="shrink-0" />
-                    删除
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
+            </span>
+            <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+              <div className="flex min-w-0 items-center gap-2">
+                <h1 className="min-w-0 truncate text-title font-semibold tracking-tight md:text-xl">
+                  {project.name}
+                </h1>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <IconButton aria-label={`项目 ${project.name} 更多`} size="sm" shape="square">
+                      <MoreHorizontal size={16} />
+                    </IconButton>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="w-44">
+                    <DropdownMenuItem onSelect={onOpenSettings}>
+                      <Settings2 size={14} className="shrink-0 text-muted" />
+                      项目设置
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onSelect={onRename}>
+                      <Pencil size={14} className="shrink-0 text-muted" />
+                      重命名
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem destructive onSelect={onDelete}>
+                      <Trash2 size={14} className="shrink-0" />
+                      删除
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+              <p data-testid="project-home-summary" className="text-meta text-muted">
+                {summary}
+              </p>
             </div>
-            <p data-testid="project-home-summary" className="text-meta text-muted">
-              {summary}
-            </p>
           </div>
 
           <StartBox projectName={project.name} onStart={onStart} />
@@ -427,6 +475,29 @@ export function ProjectHome(props: ProjectHomeProps) {
                 )}
               </div>
             )}
+            {tab === "research" && (
+              <ResearchTabErrorBoundary
+                onRetry={() => {
+                  LazyProjectResearchTab = createLazyProjectResearchTab();
+                }}
+              >
+                <Suspense
+                  fallback={
+                    <div className="space-y-3 py-2">
+                      <Skeleton className="h-36 w-full rounded-xl" />
+                      <Skeleton className="h-24 w-full rounded-xl" />
+                    </div>
+                  }
+                >
+                  <LazyProjectResearchTab
+                    projectId={project.id}
+                    projectName={project.name}
+                    demo={demo}
+                    authSession={authSession}
+                  />
+                </Suspense>
+              </ResearchTabErrorBoundary>
+            )}
             {tab === "outputs" && (
               <OutputsTab
                 outputs={outputs}
@@ -479,7 +550,7 @@ function StartBox({ projectName, onStart }: { projectName: string; onStart: (tex
   };
   return (
     <form
-      className="flex items-end gap-2 rounded-2xl border border-border bg-surface p-3 shadow-soft focus-within:border-border-strong"
+      className="oc-composer-dock flex items-end gap-2 rounded-2xl p-3"
       onSubmit={(e) => {
         e.preventDefault();
         submit();
@@ -659,7 +730,7 @@ function OverviewTab({
       >
         {instructions ? (
           <>
-            <p className="line-clamp-4 whitespace-pre-wrap rounded-lg bg-hover px-3 py-2 text-body text-fg">
+            <p className="oc-surface-recessed line-clamp-4 whitespace-pre-wrap rounded-xl px-3.5 py-2.5 text-body text-fg">
               {instructions}
             </p>
             <p className="text-caption text-faint">这个项目里的所有会话都会遵守这些指令。</p>
@@ -701,7 +772,7 @@ function OverviewTab({
               <span
                 key={a.id}
                 title={a.name}
-                className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-border bg-surface px-2.5 py-1 text-meta text-fg"
+                className="oc-badge-craft inline-flex max-w-full items-center gap-1.5 rounded-full bg-hover px-2.5 py-1 text-meta text-fg"
               >
                 <Pin size={12} aria-hidden className="shrink-0 text-warning" />
                 <span className="min-w-0 truncate">{a.name}</span>
@@ -1099,7 +1170,7 @@ function ProjectSurfaceLinks({
       <h2 id={`${id}-title`} className="text-meta font-medium text-faint">
         项目空间
       </h2>
-      <ul className="grid grid-cols-2 gap-px overflow-hidden rounded-[10px] border border-border bg-border @2xl:grid-cols-4">
+      <ul className="oc-surface-card grid grid-cols-2 gap-px overflow-hidden rounded-xl bg-border/60 @2xl:grid-cols-4">
         {SURFACES.map((s) => {
           const Icon = s.icon;
           const busy = opening === s.id;
@@ -1112,12 +1183,14 @@ function ProjectSurfaceLinks({
                 aria-describedby={`${id}-${s.id}`}
                 aria-busy={busy || undefined}
                 data-surface={s.id}
-                className="group flex min-h-12 w-full min-w-0 items-center gap-2.5 px-3.5 py-2.5 text-left outline-none transition-colors duration-100 hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                className="group flex min-h-12 w-full min-w-0 items-center gap-2.5 px-3.5 py-2.5 text-left outline-none transition-colors duration-100 hover:bg-hover/70 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
               >
-                <Icon size={16} strokeWidth={1.75} aria-hidden className="shrink-0 text-muted" />
+                <span className="oc-icon-badge size-7 shrink-0 rounded-md" aria-hidden>
+                  <Icon size={14} strokeWidth={1.75} />
+                </span>
                 <span className="flex min-w-0 flex-1 flex-col">
                   <span className="truncate text-body font-medium text-fg">{s.label}</span>
-                  <span id={`${id}-${s.id}`} className="hidden truncate text-meta text-faint @md:block">
+                  <span id={`${id}-${s.id}`} className="hidden truncate text-caption text-faint @md:block">
                     {s.hint}
                   </span>
                 </span>
@@ -1128,7 +1201,7 @@ function ProjectSurfaceLinks({
                     size={15}
                     strokeWidth={1.75}
                     aria-hidden
-                    className="shrink-0 text-faint transition-colors group-hover:text-muted"
+                    className="shrink-0 text-faint transition-transform duration-150 group-hover:translate-x-0.5 group-hover:text-muted"
                   />
                 )}
               </button>
@@ -1175,16 +1248,19 @@ function useProjectActivity(
 
 function ActivityLine({ item, onOpen }: { item: Exclude<ActivityItem, { kind: "chat" }>; onOpen?: () => void }) {
   const tag = item.kind === "ticket" ? "任务" : "定时";
-  const tone = item.kind === "ticket" ? "bg-[#fdf2f8] text-[#be185d]" : "bg-[#fff7ed] text-[#c2410c]";
+  const tone =
+    item.kind === "ticket"
+      ? "oc-badge-craft bg-accent-soft text-accent"
+      : "oc-badge-craft bg-warning-soft text-warning";
   return (
     <button
       type="button"
       onClick={onOpen}
       disabled={!onOpen}
       data-testid={`activity-${item.kind}`}
-      className="flex min-h-11 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left hover:bg-hover disabled:cursor-default disabled:hover:bg-transparent"
+      className="flex min-h-11 w-full min-w-0 items-center gap-2 rounded-lg px-2 text-left transition-colors hover:bg-hover disabled:cursor-default disabled:hover:bg-transparent"
     >
-      <span className={cn("shrink-0 rounded px-1.5 py-0.5 text-caption", tone)}>{tag}</span>
+      <span className={cn("shrink-0 rounded-full px-2 py-0.5 text-caption font-medium", tone)}>{tag}</span>
       <span className="min-w-0 flex-1 truncate text-body">
         {item.kind === "ticket" ? `${item.identifier} ${item.title}` : item.title}
       </span>

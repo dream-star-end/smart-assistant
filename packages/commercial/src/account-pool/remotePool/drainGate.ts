@@ -17,6 +17,15 @@ import type { Pool } from 'pg'
 
 export const DEFAULT_REMOTE_V4_DRAIN_SOCKET = '/run/openclaude-v5-selfhost/remote-v4-drain.sock'
 
+/** Resolve the per-slot drain socket path from OC_REMOTE_V4_DRAIN_SOCKET, falling back to the legacy default. */
+export function resolveRemoteV4DrainSocketPath(
+  env?: Readonly<Record<string, string | undefined>>,
+): string {
+  const raw = env?.OC_REMOTE_V4_DRAIN_SOCKET?.trim()
+  if (!raw || raw === 'none') return DEFAULT_REMOTE_V4_DRAIN_SOCKET
+  return raw
+}
+
 export interface DrainableRelayHandle {
   readonly idle: boolean
 }
@@ -186,7 +195,7 @@ export function startRemoteReleaseDrainSocketServer(
   gate: RemoteReleaseDrainCoordinator,
   options: { readonly pool: () => Pool; readonly socketPath?: string },
 ): RemoteReleaseDrainSocketHandle {
-  const socketPath = options.socketPath ?? DEFAULT_REMOTE_V4_DRAIN_SOCKET
+  const socketPath = options.socketPath ?? resolveRemoteV4DrainSocketPath()
   const existing = activeDrainServers.get(socketPath)
   if (existing?.server.listening) {
     return existing

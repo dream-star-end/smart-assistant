@@ -21,18 +21,25 @@ export function QueuedSendList({
   if (messages.length === 0) return null;
   return (
     <div className="mx-auto mb-2 w-full max-w-3xl px-4" data-testid="queued-send-list">
-      <div className="overflow-hidden rounded-2xl border border-border bg-elevated shadow-soft">
-        <div className="flex items-center gap-1.5 px-3.5 pt-2.5 text-caption text-faint">
-          <Clock3 size={13} aria-hidden="true" />
-          <span>待发送 {messages.length}</span>
+      <div className="oc-surface-glass overflow-hidden rounded-2xl shadow-soft">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 border-b border-border/60 px-3.5 py-2 text-caption">
+          <span className="inline-flex items-center gap-2 font-medium text-muted">
+            <span className="oc-icon-badge oc-icon-badge-accent flex size-5 shrink-0 items-center justify-center rounded-sm">
+              <Clock3 size={11} strokeWidth={1.75} aria-hidden="true" />
+            </span>
+            <span className="tabular-nums">待发送 {messages.length}</span>
+          </span>
+          <span className="text-faint" data-testid="queued-send-billing-note">
+            本轮结束后自动发出，另行计费
+          </span>
         </div>
-        <ul className="flex max-h-[min(13rem,30dvh)] flex-col overflow-y-auto px-1.5 pb-1.5 pt-1">
+        <ul className="flex max-h-[min(13rem,30dvh)] flex-col gap-0.5 overflow-y-auto p-1.5">
           {messages.map((message) => {
             const text = (message.text || "").trim();
             return (
               <li
                 key={message.id}
-                className="flex items-center gap-1 rounded-xl py-0.5 pl-2 pr-0.5"
+                className="flex items-center gap-1.5 rounded-xl py-1 pl-2.5 pr-1 transition-colors hover:bg-hover/70"
                 data-testid="queued-send-row"
               >
                 <p className="min-w-0 flex-1 truncate text-left text-body text-fg" title={text || undefined}>
@@ -44,9 +51,10 @@ export function QueuedSendList({
                     title="修改"
                     variant="muted"
                     size="sm"
+                    className="oc-btn-tactile"
                     onClick={() => onEdit(message)}
                   >
-                    <PencilLine size={15} />
+                    <PencilLine size={15} strokeWidth={1.75} />
                   </IconButton>
                   {onDelete && (
                     <IconButton
@@ -54,10 +62,10 @@ export function QueuedSendList({
                       title="删除"
                       variant="muted"
                       size="sm"
-                      className="hover:bg-danger-soft hover:text-danger"
+                      className="oc-btn-tactile hover:bg-danger-soft hover:text-danger"
                       onClick={() => onDelete(message)}
                     >
-                      <Trash2 size={15} />
+                      <Trash2 size={15} strokeWidth={1.75} />
                     </IconButton>
                   )}
                   <IconButton
@@ -65,10 +73,10 @@ export function QueuedSendList({
                     title="立即发送"
                     variant="subtle"
                     size="sm"
-                    className="ml-0.5"
+                    className="oc-btn-tactile oc-btn-secondary-craft ml-0.5"
                     onClick={() => onSendNow(message)}
                   >
-                    <ArrowUp size={15} strokeWidth={2.4} />
+                    <ArrowUp size={15} strokeWidth={2.2} />
                   </IconButton>
                 </div>
               </li>

@@ -143,11 +143,11 @@ describe('MarkdownImpl 表格(M-02)', () => {
     }
   })
 
-  test('单元格不拆词:th/td 用 keep-all,表头不折行,宽表按 min-content 撑进横滑区', () => {
+  test('表格排版:表头 keep-all 不折行,正文单元格正常换行防中文长句撑爆横滑', () => {
     render(<MarkdownImpl>{TABLE_SOURCE}</MarkdownImpl>)
     const table = screen.getByRole('table')
-    expect(table).toHaveClass('[&_td]:[word-break:keep-all]')
-    expect(table).toHaveClass('[&_td]:[overflow-wrap:normal]')
+    expect(table).toHaveClass('[&_td]:[word-break:normal]')
+    expect(table).toHaveClass('[&_td]:[overflow-wrap:break-word]')
     expect(table).toHaveClass('[&_th]:[word-break:keep-all]')
     expect(table).toHaveClass('[&_th]:whitespace-nowrap')
   })
@@ -169,7 +169,7 @@ describe('MarkdownImpl 流式光标(caret)', () => {
     expect(nodes).toHaveLength(1)
     const node = nodes[0]
     expect(node.tagName.toLowerCase()).toBe('span')
-    expect(node).toHaveClass('caret-blink', 'inline-block', 'bg-current')
+    expect(node).toHaveClass('caret-blink', 'inline-block', 'rounded-full', 'bg-accent')
     expect(node).toHaveAttribute('aria-hidden', 'true')
     const paragraphs = container.querySelectorAll('.prose > p')
     expect(paragraphs).toHaveLength(2)

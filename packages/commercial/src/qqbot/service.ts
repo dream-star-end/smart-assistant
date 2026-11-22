@@ -3,6 +3,7 @@ import {
   QQ_INBOUND_CONTAINER_PATH,
   QQ_INBOUND_COMPENSATE_PATH,
   QQ_STOP_CONTAINER_PATH,
+  type PendingDecisionItem,
 } from '@openclaude/protocol'
 import {
   QQBot,
@@ -13,6 +14,10 @@ import {
 import type { Pool } from 'pg'
 
 import { type Logger, rootLogger } from '../logging/logger.js'
+import {
+  parseImRemoteCommand,
+  type ImRemoteControlHandler,
+} from '../pendingDecisions/index.js'
 import type {
   InboundDispatcher,
   InboundDispatcherDeps,
@@ -26,6 +31,10 @@ import {
   qqUnsupportedMediaFormat,
 } from './outboundMedia.js'
 import { type QqOutboxWorker, startQqOutboxWorker } from './outbox.js'
+import {
+  pushQqPendingDecision,
+  type QqPendingDecisionPushResult,
+} from './pendingDecisionPush.js'
 import {
   deleteQqSessionPointer,
   getCurrentQqSessionId,
@@ -54,6 +63,7 @@ export interface QqBotService {
   start(): Promise<void>
   stop(): Promise<void>
   kickOutbox(): void
+  pushPendingDecision(item: PendingDecisionItem): Promise<QqPendingDecisionPushResult>
 }
 
 interface QqBotGeneration {
@@ -140,6 +150,8 @@ export function makeQqBotService(args: {
   }) => Promise<SaveQqMediaResult>
   resolveOutboundMedia?: ResolveQqOutboundMediaPartFn
   handleModelCommand?: (bindingUserId: string, text: string) => Promise<string>
+  remoteControl?: ImRemoteControlHandler
+  isProactiveEnabled?: (userId: string) => Promise<boolean>
   onFatal?: (reason: string, err: unknown) => void
 }): QqBotService {
   const log = (args.logger ?? rootLogger).child({ subsys: 'qqBot' })
@@ -240,6 +252,7 @@ export function makeQqBotService(args: {
           await handleMessage(args.pool, args.config, args.dispatcher, instance, message, log, {
             prepareMedia: args.prepareMedia,
             handleModelCommand: args.handleModelCommand,
+            remoteControl: args.remoteControl,
           })
         } catch (err) {
           log.error('inbound_failed', {
@@ -432,6 +445,21 @@ export function makeQqBotService(args: {
     kickOutbox() {
       active?.worker?.kick()
     },
+
+    async pushPendingDecision(item: PendingDecisionItem): Promise<QqPendingDecisionPushResult> {
+      const bot = active?.bot
+      return pushQqPendingDecision({
+        pool: args.pool,
+        item,
+        sendC2cText: bot
+          ? async (openid, text) => {
+              await bot.sendText({ scope: 'c2c', targetId: openid }, text)
+            }
+          : null,
+        isProactiveEnabled: args.isProactiveEnabled,
+        remoteControl: args.remoteControl,
+      })
+    },
   }
 }
 
@@ -449,6 +477,7 @@ async function handleMessage(
       text?: string
     }) => Promise<SaveQqMediaResult>
     handleModelCommand?: (bindingUserId: string, text: string) => Promise<string>
+    remoteControl?: ImRemoteControlHandler
   },
 ): Promise<void> {
   if (message.kind !== 'c2c' || message.replyTarget.scope !== 'c2c') return
@@ -510,7 +539,16 @@ async function handleMessage(
     await safeReply(
       bot,
       message.replyTarget,
-      '直接发送文字、图片、语音或附件即可对话。\n/model 查看或切换模型\n/new 新建会话\n/stop 停止当前任务\n/help 查看帮助',
+      [
+        '直接发送文字、图片、语音或附件即可对话。',
+        '/pending 查看待拍板事项与 4 位短码',
+        '/approve <短码> [附言] 或 /deny <短码> [理由] 远程审批',
+        '/sessions 查看会话列表，/switch <序号> 切换会话',
+        '/model 查看或切换模型',
+        '/new 新建会话',
+        '/stop 停止当前任务',
+        '/help 查看帮助',
+      ].join('\n'),
       log,
     )
     return
@@ -540,6 +578,31 @@ async function handleMessage(
       await safeReply(bot, message.replyTarget, '模型切换暂时失败，请稍后重试。', log)
     }
     return
+  }
+  if (parseImRemoteCommand(text)) {
+    if (!ux.remoteControl) {
+      await safeReply(bot, message.replyTarget, 'QQ 远程审批与会话切换暂未启用，请稍后重试。', log)
+      return
+    }
+    try {
+      const reply = await ux.remoteControl.tryHandleCommand({
+        userId: binding.userId,
+        text,
+        originChannel: 'qqbot',
+        channelName: 'QQ',
+      })
+      if (reply !== null) {
+        await safeReply(bot, message.replyTarget, reply, log)
+        return
+      }
+    } catch (err) {
+      log.error('remote_control_command_failed', {
+        uid: binding.userId,
+        errMessage: err instanceof Error ? err.message : String(err),
+      })
+      await safeReply(bot, message.replyTarget, '远程控制命令暂时执行失败，请稍后重试。', log)
+      return
+    }
   }
   if (command === '/stop' || command === '停止') {
     const outcome = await dispatcher.stop(buildInboundEvent(binding.userId, openid, text, message))

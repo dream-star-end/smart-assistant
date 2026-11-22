@@ -49,6 +49,8 @@ type ToastItem = {
   overflowCount?: number;
   /** 会自隐的提示(success / info 且无动作)。悬停 / 聚焦时暂停计时,离开后重新计满。 */
   autoDismiss: boolean;
+  /** 正在播放 160ms 收起退场动画。 */
+  exiting?: boolean;
 };
 
 const MAX_ERROR_TOASTS = 3;
@@ -124,46 +126,93 @@ function TraceIdButton({ traceId }: { traceId: string }) {
 
 const ToastContext = createContext<ToastFn | null>(null);
 
-const TONE_STYLE: Record<ToastTone, { icon: ReactNode; cls: string }> = {
-  success: { icon: <CheckCircle2 size={16} />, cls: "border-success/40 bg-success-soft text-success" },
-  error: { icon: <TriangleAlert size={16} />, cls: "border-danger/40 bg-danger-soft text-danger" },
-  info: { icon: <Info size={16} />, cls: "border-info/40 bg-info-soft text-info" },
+const TONE_STYLE: Record<ToastTone, { icon: ReactNode; badge: string; cls: string }> = {
+  success: {
+    icon: <CheckCircle2 size={14} strokeWidth={2.1} />,
+    badge: "oc-icon-badge oc-icon-badge-success",
+    cls: "border-success/35 bg-elevated oc-toast-success text-success",
+  },
+  error: {
+    icon: <TriangleAlert size={14} strokeWidth={2.1} />,
+    badge: "oc-icon-badge oc-icon-badge-danger",
+    cls: "border-danger/35 bg-elevated oc-toast-error text-danger",
+  },
+  info: {
+    icon: <Info size={14} strokeWidth={2.1} />,
+    badge: "oc-icon-badge oc-icon-badge-info",
+    cls: "border-info/35 bg-elevated oc-toast-info text-info",
+  },
 };
 
 const AUTO_DISMISS_MS = 3500;
+const TOAST_EXIT_MS = 160;
 
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [items, setItems] = useState<ToastItem[]>([]);
   const seq = useRef(0);
   const dismissTimers = useRef(new Map<number, number>());
+  const exitTimers = useRef(new Map<number, number>());
 
-  const dismiss = useCallback((id: number) => {
-    const timer = dismissTimers.current.get(id);
-    if (timer !== undefined) window.clearTimeout(timer);
-    dismissTimers.current.delete(id);
+  const removeNow = useCallback((id: number) => {
+    const exitTimer = exitTimers.current.get(id);
+    if (exitTimer !== undefined) window.clearTimeout(exitTimer);
+    exitTimers.current.delete(id);
     setItems((cur) => cur.filter((t) => t.id !== id));
   }, []);
 
+  const dismiss = useCallback(
+    (id: number) => {
+      const timer = dismissTimers.current.get(id);
+      if (timer !== undefined) window.clearTimeout(timer);
+      dismissTimers.current.delete(id);
+      if (exitTimers.current.has(id)) return;
+      setItems((cur) => cur.map((t) => (t.id === id ? { ...t, exiting: true } : t)));
+      exitTimers.current.set(
+        id,
+        window.setTimeout(() => removeNow(id), TOAST_EXIT_MS),
+      );
+    },
+    [removeNow],
+  );
+
   // 自隐计时的两个开关(a11y 走查 shell#10 / WCAG 2.2.1):鼠标停在提示上、或键盘把焦点移进
-  // 提示里(动作按钮 / 关闭键)时暂停;离开再从头计 3.5s,读得慢的人不会在读到一半时被收走。
+  // 提示里(动作按钮 / 关闭键)时暂停;离开再从头计满 3.5s(含末尾 160ms 平滑收起退场),读得慢的人不会在读到一半时被收走。
   const schedule = useCallback(
     (id: number) => {
       const prev = dismissTimers.current.get(id);
       if (prev !== undefined) window.clearTimeout(prev);
-      dismissTimers.current.set(id, window.setTimeout(() => dismiss(id), AUTO_DISMISS_MS));
+      const exitTimer = exitTimers.current.get(id);
+      if (exitTimer !== undefined) {
+        window.clearTimeout(exitTimer);
+        exitTimers.current.delete(id);
+        setItems((cur) => cur.map((t) => (t.id === id ? { ...t, exiting: false } : t)));
+      }
+      dismissTimers.current.set(
+        id,
+        window.setTimeout(() => dismiss(id), AUTO_DISMISS_MS - TOAST_EXIT_MS),
+      );
     },
     [dismiss],
   );
   const pause = useCallback((id: number) => {
     const timer = dismissTimers.current.get(id);
-    if (timer === undefined) return;
-    window.clearTimeout(timer);
-    dismissTimers.current.delete(id);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      dismissTimers.current.delete(id);
+    }
+    const exitTimer = exitTimers.current.get(id);
+    if (exitTimer !== undefined) {
+      window.clearTimeout(exitTimer);
+      exitTimers.current.delete(id);
+      setItems((cur) => cur.map((t) => (t.id === id ? { ...t, exiting: false } : t)));
+    }
   }, []);
 
   useEffect(() => () => {
     for (const timer of dismissTimers.current.values()) window.clearTimeout(timer);
     dismissTimers.current.clear();
+    for (const timer of exitTimers.current.values()) window.clearTimeout(timer);
+    exitTimers.current.clear();
   }, []);
 
   const toast = useCallback<ToastFn>(
@@ -236,6 +285,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               role={t.tone === "error" ? "alert" : "status"}
               aria-live={t.tone === "error" ? "assertive" : "polite"}
               data-auto-dismiss={t.autoDismiss ? "true" : undefined}
+              data-state={t.exiting ? "closing" : "open"}
               onMouseEnter={t.autoDismiss ? () => pause(t.id) : undefined}
               onMouseLeave={t.autoDismiss ? () => schedule(t.id) : undefined}
               onFocusCapture={t.autoDismiss ? () => pause(t.id) : undefined}
@@ -249,11 +299,14 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                   : undefined
               }
               className={cn(
-                "pointer-events-auto flex max-w-[92vw] items-center gap-2 rounded-xl border px-3.5 py-2.5 text-body font-medium shadow-float backdrop-blur data-[state=open]:animate-in sm:max-w-md",
+                "oc-toast-card pointer-events-auto flex max-w-[92vw] items-center gap-2.5 rounded-xl border px-3 py-2.5 text-body font-medium shadow-pop sm:max-w-md",
+                t.exiting ? "oc-toast-out pointer-events-none" : "animate-in",
                 s.cls,
               )}
             >
-              <span className="shrink-0">{s.icon}</span>
+              <span aria-hidden="true" className={cn("size-6 rounded-md", s.badge)}>
+                {s.icon}
+              </span>
               <span className="min-w-0 flex-1 break-words">{t.message}</span>
               {t.traceId && <TraceIdButton traceId={t.traceId} />}
               {t.actionLabel && (
@@ -264,7 +317,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                     // 动作触发即收起:提示已经完成使命,留着只会挡住动作的结果。
                     dismiss(t.id);
                   }}
-                  className="shrink-0 rounded-md px-2 py-1 font-semibold underline underline-offset-2 outline-none transition-opacity hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:min-h-11"
+                  className="shrink-0 rounded-md bg-surface/65 px-2.5 py-1 text-meta font-semibold outline-none transition-[background-color,opacity] hover:bg-surface focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:min-h-11"
                 >
                   {t.actionLabel}
                 </button>
@@ -274,7 +327,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                 aria-label="关闭提示"
                 onClick={() => dismiss(t.id)}
                 // 触控靶:原来 p-0.5 的关闭键只有 ~22px,在触屏上属于"看得见点不中"。
-                className="-mr-1 flex shrink-0 items-center justify-center rounded-md p-0.5 opacity-70 outline-none transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:size-11"
+                className="-mr-1 flex shrink-0 items-center justify-center rounded-md p-1 opacity-70 outline-none transition-[background-color,opacity] hover:bg-hover hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:size-11"
               >
                 <X size={14} />
               </button>

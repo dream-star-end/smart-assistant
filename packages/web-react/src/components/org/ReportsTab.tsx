@@ -161,16 +161,14 @@ export function ReportsTab({ auth }: { auth: AuthSession }) {
   );
 
   return (
-    <div className="flex flex-col">
-      <div className="px-5 pt-4">
-        <div className="overflow-x-auto">
-          <Tabs
-            aria-label="统计窗口"
-            value={window}
-            onValueChange={(v) => setWindow(v as OrgUsageWindow)}
-            items={WINDOWS}
-          />
-        </div>
+    <div className="flex flex-col gap-3.5 p-5">
+      <div className="overflow-x-auto">
+        <Tabs
+          aria-label="统计窗口"
+          value={window}
+          onValueChange={(v) => setWindow(v as OrgUsageWindow)}
+          items={WINDOWS}
+        />
       </div>
 
       {loading ? (
@@ -178,7 +176,7 @@ export function ReportsTab({ auth }: { auth: AuthSession }) {
           <Spinner /> 加载报表…
         </div>
       ) : err ? (
-        <div className="px-5 py-4">
+        <div>
           <Alert tone="danger" className="text-meta">
             {err}
           </Alert>
@@ -194,7 +192,7 @@ export function ReportsTab({ auth }: { auth: AuthSession }) {
       ) : !s ? null : (
         <>
           {/* 摘要卡片 */}
-          <div className="grid grid-cols-2 gap-2 px-5 py-4">
+          <div className="grid grid-cols-2 gap-3">
             <StatTile label="总请求数" value={groupDigits(s.requests)} />
             <StatTile label="扣费" value={formatCredits(s.credits)} unit="积分" accent />
             <StatTile label="输入 token" value={formatCompactCount(s.input_tokens)} />
@@ -202,35 +200,43 @@ export function ReportsTab({ auth }: { auth: AuthSession }) {
           </div>
 
           {/* token 构成堆叠条 */}
-          <div className="border-t border-border px-5 py-4">
+          <div className="oc-surface-card rounded-xl p-4">
             {/* normal-case：小节标题的 uppercase 会把「Token」渲成「TOKEN」，与个人版同名图表卡不一致（审计 SET-37）。 */}
-            <div className="pb-2 text-caption font-medium normal-case tracking-wide text-faint">
-              Token 构成
+            <div className="flex items-center justify-between pb-2.5">
+              <span className="text-section font-semibold normal-case text-fg">Token 构成</span>
+              {tokenTotal !== "0" && (
+                <span className="text-caption tabular-nums text-faint">
+                  共 {formatCompactCount(tokenTotal)}
+                </span>
+              )}
             </div>
             {tokenTotal === "0" ? (
               <p className="py-2 text-meta text-faint">该时段暂无用量数据。</p>
             ) : (
               <>
-                <div className="flex h-2.5 w-full overflow-hidden rounded-full bg-hover">
+                <div className="oc-surface-recessed flex h-3 w-full overflow-hidden rounded-full p-0.5">
                   {TOKEN_PARTS.map((p) => {
                     const pct = ratioPct(s[p.key], tokenTotal);
                     if (pct <= 0) return null;
                     return (
                       <div
                         key={p.key}
-                        className={p.color}
+                        className={cn("h-full first:rounded-l-full last:rounded-r-full", p.color)}
                         style={{ width: `${pct}%` }}
                         title={`${p.label} ${formatCompactCount(s[p.key])}`}
                       />
                     );
                   })}
                 </div>
-                <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1">
+                <div className="mt-3 grid grid-cols-2 gap-2">
                   {TOKEN_PARTS.map((p) => (
-                    <div key={p.key} className="flex items-center gap-1.5 text-meta">
-                      <span className={cn("size-2 rounded-full", p.color)} />
-                      <span className="text-muted">{p.label}</span>
-                      <span className="ml-auto tabular-nums text-fg">
+                    <div
+                      key={p.key}
+                      className="oc-surface-recessed flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-meta"
+                    >
+                      <span className={cn("size-2 shrink-0 rounded-full", p.color)} />
+                      <span className="truncate text-muted">{p.label}</span>
+                      <span className="ml-auto font-medium tabular-nums text-fg">
                         {formatCompactCount(s[p.key])}
                       </span>
                     </div>
@@ -241,32 +247,30 @@ export function ReportsTab({ auth }: { auth: AuthSession }) {
           </div>
 
           {/* 趋势面积图（共享 charts，替代原手写 CSS 竖条） */}
-          <div className="border-t border-border px-5 py-4">
-            <ChartCard
-              title={`趋势 · 按${trendMetric === "credits" ? "扣费" : "请求"}`}
-              hint={`近 ${windowLabel}`}
-              height={200}
-              ariaLabel={`组织${trendMetric === "credits" ? "扣费" : "请求"}趋势，近 ${windowLabel}`}
-              dataTable={{
-                columns: ["时间", trendMetric === "credits" ? "扣费积分" : "请求次数"],
-                rows: trend.map((point) => [
-                  fmtBucket(point.bucket, window),
-                  trendMetric === "credits"
-                    ? `${formatCredits(point.credits)} 积分`
-                    : groupDigits(point.requests),
-                ]),
-                emptyText: "该时段暂无趋势数据。",
-              }}
-            >
-              {trendHasData ? (
-                <canvas ref={trendRef} />
-              ) : (
-                <div className="flex h-full items-center justify-center text-meta text-faint">
-                  该时段暂无趋势数据。
-                </div>
-              )}
-            </ChartCard>
-          </div>
+          <ChartCard
+            title={`趋势 · 按${trendMetric === "credits" ? "扣费" : "请求"}`}
+            hint={`近 ${windowLabel}`}
+            height={200}
+            ariaLabel={`组织${trendMetric === "credits" ? "扣费" : "请求"}趋势，近 ${windowLabel}`}
+            dataTable={{
+              columns: ["时间", trendMetric === "credits" ? "扣费积分" : "请求次数"],
+              rows: trend.map((point) => [
+                fmtBucket(point.bucket, window),
+                trendMetric === "credits"
+                  ? `${formatCredits(point.credits)} 积分`
+                  : groupDigits(point.requests),
+              ]),
+              emptyText: "该时段暂无趋势数据。",
+            }}
+          >
+            {trendHasData ? (
+              <canvas ref={trendRef} />
+            ) : (
+              <div className="flex h-full items-center justify-center text-meta text-faint">
+                该时段暂无趋势数据。
+              </div>
+            )}
+          </ChartCard>
 
           {/* 按成员 */}
           <UsageTable
@@ -319,42 +323,52 @@ function UsageTable({
   rows: UsageRow[];
 }) {
   return (
-    <div className="border-t border-border px-5 py-4">
-      <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">{title}</div>
+    <div className="oc-surface-card overflow-hidden rounded-xl">
+      <div className="flex items-center justify-between border-b border-border/70 px-4 py-2.5">
+        <span className="text-section font-semibold text-fg">{title}</span>
+        {rows.length > 0 && (
+          <span className="oc-badge-craft rounded-full bg-hover px-2 py-0.5 text-caption font-medium tabular-nums text-muted">
+            {rows.length}
+          </span>
+        )}
+      </div>
       {rows.length === 0 ? (
-        <p className="py-2 text-meta text-faint">{emptyText}</p>
+        <p className="px-4 py-5 text-center text-meta text-faint">{emptyText}</p>
       ) : (
         <>
-          <p className="pb-1.5 text-caption text-faint sm:hidden">表格可左右滑动查看更多</p>
+          <p className="px-4 pt-2 text-caption text-faint sm:hidden">表格可左右滑动查看更多</p>
           <section
             aria-label={`${title}用量表，可横向滚动`}
             // biome-ignore lint/a11y/noNoninteractiveTabindex: 横向滚动区必须可由键盘聚焦和滚动。
             tabIndex={0}
-            className="overflow-x-auto rounded outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="overflow-x-auto outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
           >
             <table className="w-full min-w-[26rem] text-meta">
               <thead>
-                <tr className="text-left text-caption text-faint">
-                  <th className="pb-1.5 font-medium">名称</th>
-                  <th className="pb-1.5 text-right font-medium">请求</th>
-                  <th className="pb-1.5 text-right font-medium">Token</th>
-                  <th className="pb-1.5 text-right font-medium">扣费</th>
+                <tr className="border-b border-border/60 bg-bg/60 text-left text-caption text-faint">
+                  <th className="px-4 py-2 font-medium">名称</th>
+                  <th className="px-3 py-2 text-right font-medium">请求</th>
+                  <th className="px-3 py-2 text-right font-medium">Token</th>
+                  <th className="px-4 py-2 text-right font-medium">扣费</th>
                 </tr>
               </thead>
               <tbody>
                 {rows.map((r) => (
-                  <tr key={r.key} className="border-t border-border/60">
-                    <td className="max-w-[12rem] py-1.5 pr-2">
-                      <span className="block truncate text-fg">{r.name}</span>
+                  <tr
+                    key={r.key}
+                    className="border-t border-border/50 transition-colors hover:bg-hover/60"
+                  >
+                    <td className="max-w-[12rem] px-4 py-2.5 pr-2">
+                      <span className="block truncate font-medium text-fg">{r.name}</span>
                       {r.sub && <span className="block truncate text-caption text-faint">{r.sub}</span>}
                     </td>
-                    <td className="py-1.5 text-right tabular-nums text-muted">
+                    <td className="px-3 py-2.5 text-right tabular-nums text-muted">
                       {groupDigits(r.requests)}
                     </td>
-                    <td className="py-1.5 text-right tabular-nums text-muted">
+                    <td className="px-3 py-2.5 text-right tabular-nums text-muted">
                       {formatCompactCount(r.tokens)}
                     </td>
-                    <td className="py-1.5 text-right font-medium tabular-nums text-fg">
+                    <td className="px-4 py-2.5 text-right font-semibold tabular-nums text-fg">
                       {formatCredits(r.credits)}
                     </td>
                   </tr>

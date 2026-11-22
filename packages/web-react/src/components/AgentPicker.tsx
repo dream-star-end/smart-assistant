@@ -162,7 +162,7 @@ export function AgentPicker({
           />
           <span className="min-w-0 flex-1">
             <span className="flex items-center gap-1.5">
-              <span className="text-[14.5px] font-semibold text-fg">{defaultAgent.name}</span>
+              <span className="text-title font-semibold text-fg">{defaultAgent.name}</span>
               {/* 徽章落在本就 bg-accent-soft 着色的默认卡上:soft 叠 soft 在深色只有 4.11:1(bg-accent/15 时 3.89),
                   改成与 SubscriptionDialog「当前」同款的实底 accent + -fg(浅 6.2 / 深 6.45),尺寸不变(a11y-C)。 */}
               <span className="rounded bg-accent px-1.5 py-0.5 text-micro font-medium text-accent-fg">
@@ -170,7 +170,7 @@ export function AgentPicker({
               </span>
               {defaultActive && <Check size={14} className="text-accent" />}
             </span>
-            <span className="mt-0.5 line-clamp-2 text-[12.5px] leading-snug text-muted">
+            <span className="mt-0.5 line-clamp-2 text-meta leading-snug text-muted">
               {defaultAgent.description}
             </span>
           </span>
@@ -186,14 +186,14 @@ export function AgentPicker({
                 aria-pressed={mode === 'solo'}
                 onClick={() => onCollabModeChange('solo')}
                 className={cn(
-                  "rounded-lg border px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                  "oc-spring-press rounded-lg border px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
                   mode === 'solo'
                     ? "border-accent bg-accent-soft text-fg"
                     : "border-border bg-surface text-muted hover:border-border-strong",
                 )}
               >
-                <span className="flex items-center gap-1 text-[12.5px] font-semibold">单人</span>
-                <span className="mt-0.5 block text-[11px] leading-snug">主模型独立完成</span>
+                <span className="flex items-center gap-1 text-body font-semibold">单人</span>
+                <span className="mt-0.5 block text-caption leading-snug">主模型独立完成</span>
               </button>
               <button
                 type="button"
@@ -207,17 +207,17 @@ export function AgentPicker({
                   onCollabModeChange('advisor')
                 }}
                 className={cn(
-                  "rounded-lg border px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-65",
+                  "oc-spring-press rounded-lg border px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-65",
                   mode === 'advisor'
                     ? "border-accent bg-accent-soft text-fg"
                     : "border-border bg-surface text-muted hover:border-border-strong",
                 )}
               >
-                <span className="flex items-center gap-1 text-[12.5px] font-semibold">
+                <span className="flex items-center gap-1 text-body font-semibold">
                   <ShieldCheck size={13} />
                   顾问
                 </span>
-                <span className="mt-0.5 block text-[11px] leading-snug">
+                <span className="mt-0.5 block text-caption leading-snug">
                   {advisorDisabled ? advisorDisabledReason : ADVISOR_ENABLED_HINT}
                 </span>
               </button>
@@ -228,32 +228,32 @@ export function AgentPicker({
                 aria-pressed={mode === 'team'}
                 onClick={() => onCollabModeChange('team')}
                 className={cn(
-                  "rounded-lg border px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                  "oc-spring-press rounded-lg border px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
                   mode === 'team'
                     ? "border-accent bg-accent-soft text-fg"
                     : "border-border bg-surface text-muted hover:border-border-strong",
                 )}
               >
-                <span className="flex items-center gap-1 text-[12.5px] font-semibold">
+                <span className="flex items-center gap-1 text-body font-semibold">
                   <Users size={13} />
                   团队
                 </span>
                 {/* 审计 C-32:副标题不再手抄内部代号,引擎展示名与下方说明 / ModelSelector 同源
                     (@openclaude/protocol DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME)。 */}
-                <span className="mt-0.5 block text-[11px] leading-snug">
+                <span className="mt-0.5 block text-caption leading-snug">
                   队长切换为 {DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME} 并委派已安装智能体
                 </span>
               </button>
             </div>
             {mode === 'team' && (
-              <span className="text-[11.5px] leading-snug text-muted">
+              <span className="text-caption leading-snug text-muted">
                 开启后队长引擎将切换为 {DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME}（计费高于默认模型），并按需委派已安装智能体组队协作。每次委派按对应智能体的模型计费。
               </span>
             )}
             {mode === 'advisor' && (
               <div className="flex flex-col gap-1.5">
                 {advisorModels.length > 0 ? (
-                  <label htmlFor={advisorSelectId} className="text-[11.5px] leading-snug text-muted">
+                  <label htmlFor={advisorSelectId} className="text-caption leading-snug text-muted">
                     顾问型号
                     {/* 合并取舍(发布预演 t-1279):控件沿用 ui/Select(审计 C-33,设计系统同构、jsdom 可测),
                         语义取 canonical OCV5-223 —— 已配置的顾问不在可用列表时不再静默回退到第一项,
@@ -289,11 +289,11 @@ export function AgentPicker({
                     />
                   </label>
                 ) : (
-                  <span className="text-[11.5px] leading-snug text-warning">
+                  <span className="text-caption leading-snug text-warning">
                     {advisorUnavailableReason || ADVISOR_UNAVAILABLE_REASON}
                   </span>
                 )}
-                <span className="text-[11.5px] leading-snug text-muted">
+                <span className="text-caption leading-snug text-muted">
                   顾问只出主意，不能改文件、跑命令或再派人。主模型必须用证据验证建议后再交付。用户说不要改文件时，这一轮主模型也不会写。此时只用只读工具验证并在回复中交付。咨询按实际顾问型号计费，不承诺更省。
                 </span>
               </div>
@@ -301,7 +301,7 @@ export function AgentPicker({
             {onAsDefaultChange && (
               // 保持原生 checkbox(App.test / ocv5-210 真浏览器用例按 checkbox 契约 check/isChecked),
               // 只把控件尺寸与触控行高对齐设计系统(C-33)。
-              <label className="flex items-center gap-2 text-[11.5px] text-muted [@media(hover:none)]:min-h-11">
+              <label className="flex items-center gap-2 text-caption text-muted [@media(hover:none)]:min-h-11">
                 <input
                   type="checkbox"
                   checked={!!asDefault}
@@ -313,7 +313,7 @@ export function AgentPicker({
               </label>
             )}
             {collabSaveError && (
-              <span className="text-[11.5px] leading-snug text-danger">{collabSaveError}</span>
+              <span className="text-caption leading-snug text-danger">{collabSaveError}</span>
             )}
           </div>
         ) : onToggleTeamMode ? (
@@ -322,7 +322,7 @@ export function AgentPicker({
               <span className="flex items-center gap-1.5 text-meta font-semibold text-fg">
                 <Users size={13} className="text-accent" /> 团队模式
               </span>
-              <span className="mt-0.5 text-[11.5px] leading-snug text-muted">
+              <span className="mt-0.5 text-caption leading-snug text-muted">
                 开启后队长引擎将切换为 {DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME}（计费高于默认模型），并按需委派已安装智能体组队协作。每次委派按对应智能体的模型计费。
               </span>
             </span>
@@ -379,14 +379,14 @@ export function AgentPicker({
                   <AgentAvatar agent={a} className="size-10 rounded-lg opacity-80 shadow-sm" iconSize={19} />
                   <span className="min-w-0 flex-1">
                     <span className="flex items-center gap-1.5">
-                      <span className="text-[14.5px] font-semibold text-fg">{a.name}</span>
+                      <span className="text-title font-semibold text-fg">{a.name}</span>
                       {a.preset && <Badge tone="accent">预设</Badge>}
                       <Badge tone="warning">{needsAuth ? '插件待授权' : '能力待修复'}</Badge>
                     </span>
-                    <span className="mt-0.5 line-clamp-2 text-[12.5px] leading-snug text-muted">
+                    <span className="mt-0.5 line-clamp-2 text-meta leading-snug text-muted">
                       {a.description}
                     </span>
-                    <span id={whyId} className="mt-1 block text-[11.5px] leading-snug text-warning">
+                    <span id={whyId} className="mt-1 block text-caption leading-snug text-warning">
                       {needsAuth
                         ? `有 ${a.needsAuthorization?.length ?? 0} 项插件待授权，完成授权后即可使用`
                         : '所需能力暂不可用，修复后即可使用'}
@@ -432,11 +432,11 @@ export function AgentPicker({
               <AgentAvatar agent={a} className="size-10 rounded-lg shadow-sm" iconSize={19} />
               <span className="min-w-0 flex-1">
                 <span className="flex items-center gap-1.5">
-                  <span className="text-[14.5px] font-semibold text-fg">{a.name}</span>
+                  <span className="text-title font-semibold text-fg">{a.name}</span>
                   {a.preset && <Badge tone="accent">预设</Badge>}
                   {active && <Check size={14} className="text-accent" />}
                 </span>
-                <span className="mt-0.5 line-clamp-2 text-[12.5px] leading-snug text-muted">
+                <span className="mt-0.5 line-clamp-2 text-meta leading-snug text-muted">
                   {a.description}
                 </span>
               </span>

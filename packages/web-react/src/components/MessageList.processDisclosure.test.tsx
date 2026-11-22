@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
 import { canonicalTaskContinuationError, manualTaskContinuationSource } from "../lib/chat/manualTaskContinuation";
 import { MessageListSkeleton, PartialHistorySkeleton } from "./chat/HistorySkeleton";
-import { workSummary } from "./chat/ProcessDisclosure";
+import { preloadPhaseTimelineSummary, workSummary } from "./chat/ProcessDisclosure";
 import { collectPaneSteps } from "./chat/workPane";
 import { MessageList } from "./MessageRenderer";
 import { ArtifactInspectContext } from "./tool/context";
@@ -22,6 +22,7 @@ loadBeforeAll(prefetchMarkdownImpl);
 loadBeforeAll(preloadToolBody);
 loadBeforeAll(preloadTimelineCards);
 loadBeforeAll(preloadProcessStages);
+loadBeforeAll(preloadPhaseTimelineSummary);
 
 afterEach(() => {
   cleanup();
@@ -61,7 +62,7 @@ function expandDetailButtons(root: HTMLElement, passes = 2) {
 
 function expandAllProcess() {
   fireEvent.click(screen.getByTestId("process-toggle"));
-  for (const toggle of screen.getAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
+  for (const toggle of screen.queryAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
   // UI-3:「准备工作 N 步」和每一步的「技术详情」也点开,原卡(命令、输出入口)才渲染。
   for (const prep of screen.queryAllByTestId("process-prep")) fireEvent.click(within(prep).getAllByRole("button")[0]!);
   for (const step of screen.queryAllByTestId("process-step-row")) fireEvent.click(within(step).getAllByRole("button")[0]!);
@@ -301,7 +302,7 @@ describe("MessageList Manus 过程披露", () => {
       usage: { traceId: "trace-mid-err" },
     });
 
-  test("OCV5-307: 本轮越过的中途错误卡收进过程，作为常显卡片步骤", () => {
+  test("OCV5-307 / P1-8: 本轮越过的中途错误收进过程后静默隐藏，不再用黄色安慰卡打扰用户", () => {
     renderList([
       row("u", "user", "继续合并", { status: "replied" }),
       row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
@@ -315,13 +316,9 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByText("已合并并推送").closest("[data-testid=process-disclosure]")).toBeNull();
     fireEvent.click(screen.getByTestId("process-toggle"));
     const card = screen.getByTestId("process-card");
-    expect(within(card).getByText("模型暂不可用")).toBeInTheDocument();
-    expect(card.closest("[data-testid=process-disclosure]")).not.toBeNull();
-    // OCV5-307:已越过的错误只留一行说明,不再是叫用户「切换模型后重发」的整张警示卡。
-    const note = within(card).getByTestId("recovered-error-note");
-    expect(note).toHaveTextContent("本轮已继续");
+    expect(within(card).queryByTestId("recovered-error-note")).toBeNull();
     expect(within(card).queryByRole("alert")).toBeNull();
-    expect(card.textContent ?? "").not.toMatch(/切换一个模型|后重发/);
+    expect(card.textContent ?? "").not.toMatch(/本轮已继续|切换一个模型|后重发/);
   });
 
   test("OCV5-307: 以 model_not_available 收尾的轮次，错误卡仍在顶层", () => {
@@ -363,7 +360,7 @@ describe("MessageList Manus 过程披露", () => {
     );
     fireEvent.click(screen.getByTestId("process-toggle"));
     const card = screen.getByTestId("process-card");
-    // OCV5-390: an automatically retried error the turn got past leaves nothing behind.
+    // OCV5-390 / P1-8: a recovered error the turn got past leaves no error note behind.
     expect(within(card).queryByTestId("recovered-error-note")).toBeNull();
     expect(card.textContent ?? "").not.toMatch(/任务执行失败|本轮已继续|出错了/);
     expect(within(card).queryByRole("alert")).toBeNull();
@@ -441,7 +438,7 @@ describe("MessageList Manus 过程披露", () => {
     const done = cards().find((card) => card.getAttribute("data-permission-request") === "req-done");
     expect(done?.closest("[data-testid=process-card]")).not.toBeNull();
     expect(done?.className).toContain("border-border/80");
-    expect(open?.className).toContain("border-accent/40");
+    expect(open?.className).toContain("border-accent/45");
   });
 
   test("已回答的问答卡和它同一次调用的 AskUserQuestion 工具行：工具行不再漏在过程外", () => {
@@ -907,13 +904,13 @@ describe("MessageList Manus 过程披露", () => {
     ];
     const view = renderList(messages, { cb: { onFetchTapeRecordPayload } });
     await waitFor(() => {
-      expect(screen.getAllByText(/真实/).length).toBeGreaterThanOrEqual(1);
+      expect(screen.getAllByText(/正在加载内容/).length).toBeGreaterThanOrEqual(1);
     });
     expect(screen.queryByText("deferred-hidden-tool")).not.toBeInTheDocument();
     const fetchedOrdinals = () => onFetchTapeRecordPayload.mock.calls.map((call) => (call as unknown[])[1]);
     expect(fetchedOrdinals()).toEqual([9]);
     expect(screen.queryByTestId("process-deferred-hydrate")).toBeNull();
-    for (const node of screen.getAllByText(/真实/)) {
+    for (const node of screen.getAllByText(/正在加载内容/)) {
       expect(node.closest("[data-testid=process-disclosure]")).toBeNull();
     }
 
@@ -921,7 +918,7 @@ describe("MessageList Manus 过程披露", () => {
     await waitFor(() => {
       expect(fetchedOrdinals()).toContain(4);
     });
-    const inside = screen.getAllByText(/真实/).filter((node) => node.closest("[data-testid=process-disclosure]"));
+    const inside = screen.getAllByText(/正在加载内容/).filter((node) => node.closest("[data-testid=process-disclosure]"));
     expect(inside.length).toBeGreaterThanOrEqual(1);
     const hydrated = messages.map((message) =>
       message.id === "mid" ? { ...message, _payloadDeferred: undefined, text: "水合后的阶段说明" } : message,
@@ -1203,7 +1200,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(new Set(docs).size).toBe(2);
 
     for (const toggle of screen.getAllByTestId("process-toggle")) fireEvent.click(toggle);
-    for (const toggle of screen.getAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
+    for (const toggle of screen.queryAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
     for (const details of screen.getAllByTestId("process-details")) {
       expandDetailButtons(details, 3);
     }
@@ -1569,7 +1566,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(answerRow).not.toBeNull();
     expect(shells[0]!.compareDocumentPosition(answerRow!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     fireEvent.click(screen.getByTestId("process-toggle"));
-    fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    for (const toggle of screen.queryAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
     expandDetailButtons(screen.getByTestId("process-details"), 2);
     expect(screen.getByTestId("process-details").textContent ?? "").toMatch(/probe-before[\s\S]*probe-after-1[\s\S]*probe-after-2/);
   });
@@ -2393,11 +2390,11 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByTestId("process-step-live")).toHaveTextContent("等待子任务完成");
     expect(screen.getByTestId("process-step-live")).toHaveAttribute("data-live-pending", "true");
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
-    // UI-3:步骤行是人话标题,原始命令收在点开后的「技术详情」里。
+    // UI-3 / P2-2:步骤行是人话标题，展开后不再冗余裸露 process-raw-command CLI 命令块。
     expect(screen.getByTestId("process-step-row")).toHaveTextContent("等待子任务完成");
     expect(screen.queryByTestId("process-raw-command")).not.toBeInTheDocument();
     fireEvent.click(within(screen.getByTestId("process-step-row")).getAllByRole("button")[0]!);
-    expect(screen.getByTestId("process-raw-command")).toHaveTextContent("oc-memory delegate-wait dlgjob-audit-SECRET");
+    expect(screen.queryByTestId("process-raw-command")).not.toBeInTheDocument();
     expect(screen.getByTestId("process-step-live").textContent ?? "").not.toMatch(/dlgjob/);
 
     cleanup();
@@ -2415,7 +2412,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByTestId("process-step-live").textContent ?? "").not.toMatch(/\/bin\/bash|dlgjob/);
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
     fireEvent.click(within(screen.getByTestId("process-step-row")).getAllByRole("button")[0]!);
-    expect(screen.getByTestId("process-raw-command").textContent ?? "").toBe(wrapped);
+    expect(screen.queryByTestId("process-raw-command")).not.toBeInTheDocument();
   });
 
   test("UI-3 人话摘要：按工具类别或命令首词归类，不扫参数；思考、准备工作、目标不算；最多三类", () => {
@@ -2535,11 +2532,8 @@ describe("MessageList Manus 过程披露", () => {
     fireEvent.click(goalToggle);
     const historical = screen.getByTestId("process-goal");
     expect(within(historical).getByText("做完的目标")).toBeInTheDocument();
-    const rawToggle = within(historical).getByRole("button", { name: "查看原始目标记录" });
-    expect(historical.querySelector("pre")).toBeNull();
-    fireEvent.click(rawToggle);
-    expect(historical.querySelector("pre")?.textContent).toBe(JSON.stringify(completedGoal, null, 2));
-    fireEvent.click(within(historical).getByRole("button", { name: "收起原始目标记录" }));
+    // P0-6: 普通对话流直接隐藏「查看原始目标记录」JSON 调试开关
+    expect(within(historical).queryByRole("button", { name: "查看原始目标记录" })).toBeNull();
     expect(historical.querySelector("pre")).toBeNull();
     const stage = screen.getByTestId("process-stage");
     expect(stage.className).not.toMatch(/\btext-sm\b|\bleading-6\b|\btext-muted\b/);
@@ -2610,7 +2604,7 @@ describe("MessageList Manus 过程披露", () => {
     if (!answer) throw new Error("missing answer row");
     expect(disclosure.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     fireEvent.click(screen.getByTestId("process-toggle"));
-    fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    for (const toggle of screen.queryAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
     expect(screen.getByText("只剩计划").closest("[data-testid=process-disclosure]")).toBe(disclosure);
   });
 
@@ -2761,20 +2755,40 @@ describe("OCV5-370 过程摘要上的详情面板入口", () => {
     expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "false");
   });
 
-  test("只有其它步骤 → 「在详情面板查看步骤」;没有面板(无 provider)→ 都不出现", () => {
+  test("OCV5-844: 无文件改动时不渲染 process-pane-steps 图标，已完成多步回合默认收起为单行完成摘要且展开后支持阶段筛选", () => {
     const openPane = vi.fn();
+    const multiStepMessages: ChatMessage[] = [
+      row("u1", "user", "检查项目构建", { status: "replied", ts: 1_700_000_000_000 }),
+      row("r1", "tool", "读取", { _clientMessageId: "u1", toolName: "Read", inputJson: { file_path: "src/a.ts" }, _completed: true, output: "a" }),
+      row("r2", "tool", "搜索", { _clientMessageId: "u1", toolName: "Grep", inputJson: { pattern: "foo" }, _completed: true, output: "hit" }),
+      row("v1", "tool", "终端", { _clientMessageId: "u1", toolName: "Bash", inputJson: { command: "pnpm test" }, _completed: true, output: "pass" }),
+      row("v2", "tool", "终端", { _clientMessageId: "u1", toolName: "Bash", inputJson: { command: "pnpm typecheck" }, _completed: true, output: "ok" }),
+      row("a1", "assistant", "全部检查通过。", { _clientMessageId: "u1", ts: 1_700_000_012_000 }),
+    ];
     render(
       <ArtifactInspectContext.Provider value={{ open: () => {}, openPane }}>
-        <MessageList processDisclosure messages={settledTurn()} sending={false} sessionId="session-a" cb={{}} onRespondPermission={() => {}} />
+        <MessageList processDisclosure messages={multiStepMessages} sending={false} sessionId="session-a" cb={{}} onRespondPermission={() => {}} />
       </ArtifactInspectContext.Provider>,
     );
+    // 已完成回合默认只展示单行完成摘要，不展示阶段子行，也不展示 process-pane-steps 小图标
+    expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("phase-timeline-strip")).not.toBeInTheDocument();
     expect(screen.queryByTestId("process-pane-changes")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "在详情面板查看步骤" }));
-    expect(openPane).toHaveBeenCalledWith("steps");
+    expect(screen.queryByTestId("process-pane-steps")).not.toBeInTheDocument();
+
+    // 点击完成行展开后，PhaseTimelineFilterBar 仍完整可用
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "true");
+    const filterBar = screen.getByTestId("phase-filter-bar");
+    fireEvent.click(within(filterBar).getByTestId("phase-filter-verify"));
+    expect(screen.getByTestId("process-phase-filtered")).toHaveAttribute("data-phase-filter", "verify");
+    expect(within(screen.getByTestId("process-phase-filtered")).getAllByTestId("process-step-row")).toHaveLength(2);
+
     cleanup();
     renderList(settledTurn());
     expect(screen.queryByTestId("process-pane-steps")).not.toBeInTheDocument();
     expect(screen.queryByTestId("process-pane-changes")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("phase-timeline-strip")).not.toBeInTheDocument();
   });
 });
 
@@ -2814,7 +2828,7 @@ test("UI-3 步骤行说人话，技术信息收进技术详情，底层步骤并
   expect(screen.getByTestId("process-meta")).toHaveTextContent("6 分 42 秒");
   expect(screen.getByTestId("process-glyph-done")).toHaveAttribute("data-outcome", "done");
   fireEvent.click(screen.getByTestId("process-toggle"));
-  for (const toggle of screen.getAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
+  for (const toggle of screen.queryAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
   const titles = screen.getAllByTestId("process-step-row").map((node) => node.querySelector("button span")?.textContent);
   expect(titles).toEqual(["思考", "运行命令", "读取 周会记录.txt", "读取 missing.txt"]);
   expect(screen.getByTestId("process-prep")).toHaveTextContent("准备工作 2 步");
@@ -2919,7 +2933,7 @@ test("P3 委派步骤写出谁接了、做什么、进行中 / 完成", () => {
   ]);
   expect(screen.getByTestId("process-title")).toHaveTextContent("派出 1 个子任务");
   fireEvent.click(screen.getByTestId("process-toggle"));
-  for (const toggle of screen.getAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
+  for (const toggle of screen.queryAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
   const step = screen.getAllByTestId("process-step-row").find((node) => (node.textContent ?? "").includes("委派给"))!;
   expect(step).toHaveTextContent("委派给 researcher：检查报告格式");
   expect(within(step).getByTestId("process-delegate-state")).toHaveTextContent("完成");
@@ -2953,9 +2967,11 @@ test("U6 委派多子任务在过程总览、分组折叠行与 TeamPanel 步骤
   ]);
   expect(screen.getByTestId("process-title")).toHaveTextContent("派出 3 个子任务");
   fireEvent.click(screen.getByTestId("process-toggle"));
-  const detailToggle = screen.getByTestId("process-detail-toggle");
-  expect(detailToggle).toHaveTextContent("派出 3 个子任务");
-  fireEvent.click(detailToggle);
+  // OCV5-817: 单组工具省略冗余外层 process-step-group，展开外壳后直接露出步骤行。
+  for (const toggle of screen.queryAllByTestId("process-detail-toggle")) {
+    expect(toggle).toHaveTextContent("派出 3 个子任务");
+    fireEvent.click(toggle);
+  }
   const step = screen.getAllByTestId("process-step-row").find((node) => (node.textContent ?? "").includes("委派给"))!;
   expect(step).toHaveTextContent("委派给 research-assistant（3 个子任务）");
   fireEvent.click(within(step).getAllByRole("button")[0]!);
@@ -3240,4 +3256,25 @@ test("a manually continued diagnostic-only error does not become a saved answer"
   expect(screen.queryByText(/PRIVATE_DIAGNOSTIC|MODEL_AUTHORITY_INVALID/)).toBeNull();
   expect(screen.queryByRole("alert")).toBeNull();
   expect(JSON.stringify(messages)).toBe(before);
+});
+
+test("OCV5-834: Codex 活动流无白卡外壳、旁白自然呈现且连续只读探索优雅微折叠", () => {
+  const owner = { _clientMessageId: "u-codex" };
+  renderList([
+    row("u-codex", "user", "排查样式问题", { status: "replied", ts: 1_700_000_000_000 }),
+    row("c-note", "assistant", "我先逐个核对相关样式与组件实现。", { ...owner, ts: 1_700_000_001_000 }),
+    row("c-r1", "tool", "读取", { ...owner, toolName: "Read", inputJson: { file_path: "src/a.tsx" }, _completed: true }),
+    row("c-r2", "tool", "读取", { ...owner, toolName: "Read", inputJson: { file_path: "src/b.tsx" }, _completed: true }),
+    row("c-r3", "tool", "搜索", { ...owner, toolName: "Grep", inputJson: { pattern: "oc-codex-rail" }, _completed: true }),
+    row("c-e1", "tool", "编辑", { ...owner, toolName: "Edit", inputJson: { file_path: "src/a.tsx", old_string: "a", new_string: "b" }, _completed: true }),
+    row("c-ans", "assistant", "已按 Codex 极简流完成重构。", { ...owner, ts: 1_700_000_010_000 }),
+  ]);
+  fireEvent.click(screen.getByTestId("process-toggle"));
+  const stages = screen.getByTestId("process-stages");
+  expect(stages.className).not.toContain("oc-surface-card");
+  expect(stages.className).toContain("oc-codex-rail");
+  expect(within(stages).getByTestId("process-stage")).toHaveTextContent("我先逐个核对相关样式与组件实现。");
+  expect(stages.querySelector(".oc-codex-commentary")).not.toBeNull();
+  for (const toggle of screen.queryAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
+  expect(within(stages).getByTestId("process-explore-cluster")).toHaveTextContent("已探索 3 处文件与代码");
 });

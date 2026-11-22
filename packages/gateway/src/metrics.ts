@@ -131,6 +131,12 @@ export const usageLogDuplicateTotal = new Counter()
 export const usageLogConflictTotal = new Counter()
 export const usageLogFailedTotal = new Counter()
 
+// ── Context governance metrics (OCV5-840) ──
+export const contextPressureTotal = new Counter()
+export const contextCompactionsTotal = new Counter()
+export const contextRebuildsTotal = new Counter()
+export const contextPayloadOffloadsTotal = new Counter()
+
 // ── EventBus subscriber ──
 
 let _metricsStarted = false
@@ -163,6 +169,15 @@ export function startMetricsCollection(): void {
 
   eventBus.on('session.crashed', (ev) => {
     sessionCrashesTotal.inc({ agent: ev.agentId })
+  })
+
+  eventBus.on('session.context_pressure', (ev) => {
+    contextPressureTotal.inc({
+      agent: ev.agentId,
+      engine: ev.engine,
+      level: ev.level,
+      scope: ev.scope,
+    })
   })
 
   logger.info('metrics collection started')
@@ -231,6 +246,22 @@ export function serializeMetrics(): string {
     delegateCursorBackgroundAwaitTotal.serialize(
       'oc_delegate_cursor_background_await_total',
       'Cursor sessions waiting on OC delegate via background shell + await (target 0 after R1/R4)',
+    ),
+    contextPressureTotal.serialize(
+      'oc_context_pressure_total',
+      'Total context pressure observations by agent, engine, level, and scope',
+    ),
+    contextCompactionsTotal.serialize(
+      'oc_context_compactions_total',
+      'Total session context compactions by engine, strategy, and outcome',
+    ),
+    contextRebuildsTotal.serialize(
+      'oc_context_rebuilds_total',
+      'Total session context rebuilds by reason',
+    ),
+    contextPayloadOffloadsTotal.serialize(
+      'oc_context_payload_offloads_total',
+      'Total oversized payloads offloaded to disk artifacts by category',
     ),
   ]
   return sections.join('\n\n') + '\n'

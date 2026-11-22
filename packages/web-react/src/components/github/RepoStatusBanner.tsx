@@ -28,10 +28,17 @@ export function RepoStatusBanner({
   const repoLabel = `${selection.owner}/${selection.repo} @ ${selection.branch}`;
   const tone =
     status === "failed"
-      ? "border-danger/30 bg-danger-soft text-danger"
+      ? "oc-callout oc-callout-danger text-danger"
       : status === "ready"
-        ? "border-success/30 bg-success-soft text-success"
-        : "border-border bg-hover/60 text-muted";
+        ? "oc-callout oc-callout-success text-success"
+        : "oc-callout oc-callout-info text-muted";
+
+  const iconBadgeTone =
+    status === "failed"
+      ? "oc-icon-badge oc-icon-badge-danger"
+      : status === "ready"
+        ? "oc-icon-badge oc-icon-badge-success"
+        : "oc-icon-badge oc-icon-badge-info";
 
   return (
     <div className={cn("mx-auto mt-2 w-full max-w-3xl px-4")}>
@@ -39,15 +46,15 @@ export function RepoStatusBanner({
         data-testid="repo-status-banner"
         aria-live={status === "failed" ? "assertive" : "polite"}
         aria-atomic="true"
-        className={cn("flex items-start gap-2.5 rounded-lg border px-3 py-2 text-meta", tone)}
+        className={cn("flex items-start gap-2.5 rounded-xl px-3.5 py-2.5 text-meta", tone)}
       >
-        <span className="mt-0.5 shrink-0" aria-hidden>
+        <span className={cn("mt-0.5 size-6 shrink-0 rounded-md", iconBadgeTone)} aria-hidden>
           {status === "ready" ? (
-            <CheckCircle2 size={15} />
+            <CheckCircle2 size={14} strokeWidth={1.85} />
           ) : status === "failed" ? (
-            <TriangleAlert size={15} />
+            <TriangleAlert size={14} strokeWidth={1.85} />
           ) : (
-            <Loader2 size={15} className="animate-spin" />
+            <Loader2 size={14} strokeWidth={1.85} className="animate-spin" />
           )}
         </span>
         <div className="min-w-0 flex-1">
@@ -71,7 +78,7 @@ export function RepoStatusBanner({
         </div>
         {status === "failed" && onRetry && (
           <Button type="button" size="sm" variant="secondary" onClick={onRetry}>
-            继续
+            重试
           </Button>
         )}
         {(status === "failed" || status === "ready") && (

@@ -72,17 +72,17 @@ describe('Auto-Dream V2 Codex route admission', () => {
   })
 
   it('wires admission to the commercial route decision before billing side effects', () => {
-    const source = readFileSync(new URL('../index.ts', import.meta.url), 'utf8')
+    const source = readFileSync(new URL('../bootstrap/channelsAndAutoDreamBootstrap.ts', import.meta.url), 'utf8')
     const start = source.indexOf('if (path === AUTO_DREAM_OPTIMIZER_ADMIT_PATH)')
     const end = source.indexOf('if (path === AUTO_DREAM_OPTIMIZER_FINDINGS_PATH)', start)
     assert.ok(start >= 0 && end > start)
     const admission = source.slice(start, end)
 
-    assert.match(admission, /projectAutoDreamCodexRoute\(\s*await createCommercialCodexRoute\(\{/)
+    assert.match(admission, /projectAutoDreamCodexRoute\(\s*await deps\.createCommercialCodexRoute\(\{/)
     assert.doesNotMatch(admission, /createWechatApiRelayRoute/)
     const rejectedAt = admission.indexOf('AUTO_DREAM_ROUTE_UNAVAILABLE')
     assert.ok(rejectedAt >= 0)
-    for (const later of ['pricing.get(', 'preCheckWithCost(', 'startInflightJournal(']) {
+    for (const later of ['deps.pricing.get(', 'preCheckWithCost(', 'startInflightJournal(']) {
       assert.ok(admission.indexOf(later) > rejectedAt, `${later} must follow route rejection`)
     }
     assert.match(admission, /routeToken:\s*route\.token/)

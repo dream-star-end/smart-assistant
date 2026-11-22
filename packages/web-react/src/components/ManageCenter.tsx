@@ -1,4 +1,4 @@
-import { ArrowUpRight, CircleHelp, LogIn, Store } from 'lucide-react'
+import { ArrowUpRight, CircleHelp, LogIn } from 'lucide-react'
 import { useState } from 'react'
 import { useMdViewport } from '../hooks/useMdViewport'
 import { MANAGE_TABS, type ManageTab, SCOPED_MANAGE_TABS } from '../lib/manageTabs'
@@ -18,6 +18,7 @@ import {
   SectionNav,
   Tabs,
 } from './ui'
+import { AtelierLazyIcon } from './ui/AtelierLazyIcons'
 
 export type { ManageTab }
 
@@ -103,14 +104,21 @@ export function ManageCenter({
       onOpenChange={(next) => {
         if (!next) onClose()
       }}
-      title={<span className="text-title font-semibold text-fg">管理中心</span>}
+      title={
+        <span className="inline-flex items-center gap-2.5">
+          <span className="oc-icon-badge size-7 rounded-lg" aria-hidden="true">
+            <AtelierLazyIcon name="manage" size={15} />
+          </span>
+          <span className="text-title font-semibold tracking-tight text-fg">管理中心</span>
+        </span>
+      }
       headerActions={
         onOpenHelp ? (
           <Button
             variant="ghost"
             size="sm"
             onClick={() => onOpenHelp(current.featureId)}
-            className="gap-1.5 text-muted hover:text-fg"
+            className="oc-btn-tactile gap-1.5 rounded-lg text-muted hover:text-fg"
           >
             <CircleHelp size={15} strokeWidth={1.75} aria-hidden="true" />
             怎么用
@@ -123,7 +131,7 @@ export function ManageCenter({
       // 那是 iOS 键盘弹起时把弹层顶回可视视口的 visualViewport / safe-area 契约。
       mobile="center"
       // 桌面比设置宽：记忆 / 技能列表需要行宽。高度与设置同档。
-      className="bg-surface md:max-w-[min(1000px,calc(100vw-2rem))]"
+      className="oc-surface-popover bg-surface md:max-w-[min(1000px,calc(100vw-2rem))]"
       bodyClassName="flex min-h-0 flex-1 flex-col overflow-hidden p-0"
     >
       <QuietSurface>
@@ -137,22 +145,33 @@ export function ManageCenter({
                 value={current.id}
                 onChange={onTabChange}
                 groups={[{ label: '管理', items: navItems }]}
+                className="bg-sidebar/60"
                 footer={
                   onOpenMarketplace && (
                     <button
                       type="button"
                       onClick={() => onOpenMarketplace(tab === 'connectors' ? 'connector' : 'skill')}
-                      className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-body text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+                      className="oc-surface-card oc-surface-card-hover oc-btn-tactile group flex w-full items-center gap-2 rounded-xl px-2.5 py-2 text-left text-body font-medium text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
                     >
-                      <Store size={15} strokeWidth={1.75} aria-hidden="true" className="shrink-0" />
+                      <span
+                        className="oc-icon-badge oc-icon-badge-accent size-6 shrink-0 rounded-md"
+                        aria-hidden="true"
+                      >
+                        <AtelierLazyIcon name="market" size={14} />
+                      </span>
                       <span className="flex-1 truncate">去市场添加</span>
-                      <ArrowUpRight size={14} strokeWidth={1.75} aria-hidden="true" className="shrink-0 text-faint" />
+                      <ArrowUpRight
+                        size={14}
+                        strokeWidth={1.75}
+                        aria-hidden="true"
+                        className="shrink-0 text-faint transition-transform duration-150 group-hover:-translate-y-0.5 group-hover:translate-x-0.5 group-hover:text-fg"
+                      />
                     </button>
                   )
                 }
               />
             ) : (
-              <div className="shrink-0 border-b border-border px-4 py-3">
+              <div className="oc-surface-glass shrink-0 border-x-0 border-t-0 border-b border-border/80 px-4 py-3 shadow-none">
                 <Tabs
                   aria-label="管理分区"
                   idBase="manage"
@@ -160,7 +179,7 @@ export function ManageCenter({
                   value={current.id}
                   onValueChange={(v) => onTabChange(v as ManageTab)}
                   items={navItems.map((it) => ({ value: it.id, label: it.label, featureId: it.featureId }))}
-                  className="grid-cols-4 [&_[role=tab]]:px-1.5"
+                  className="oc-surface-recessed grid-cols-4 [&_[role=tab]]:px-1.5"
                 />
               </div>
             )}
@@ -169,10 +188,10 @@ export function ManageCenter({
               {/* 上下文行：左作用范围，右分区操作插槽（四个分区都至少有其一）。 */}
               <div
                 data-scrolled={scrolled || undefined}
-                className="oc-manage-toolbar flex min-h-12 shrink-0 items-center gap-2 px-4 py-1 md:min-h-14 md:px-6"
+                className="oc-manage-toolbar oc-surface-glass flex min-h-12 shrink-0 items-center gap-2 border-x-0 border-t-0 px-4 py-1.5 shadow-none md:min-h-14 md:px-6"
               >
                 {scoped && (
-                  <div className="oc-manage-scope flex min-w-0 items-center gap-1 max-md:max-w-[62%] md:max-w-72">
+                  <div className="oc-manage-scope oc-surface-recessed flex min-w-0 items-center gap-1.5 rounded-lg px-2.5 py-0.5 max-md:max-w-[62%] md:max-w-72">
                     {/* 可见标签是真 <label>：点「作用范围」也能拉起选择器（触控靶 = 标签 + 值）。 */}
                     <label
                       htmlFor="manage-scope-select"
@@ -186,7 +205,7 @@ export function ManageCenter({
                 <div
                   ref={setSlot}
                   data-manage-slot=""
-                  className="ml-auto flex min-w-0 items-center justify-end gap-1"
+                  className="ml-auto flex min-w-0 items-center justify-end gap-1.5"
                 />
               </div>
 
@@ -210,19 +229,25 @@ export function ManageCenter({
                   className="oc-manage-page flex w-full max-w-[800px] flex-1 flex-col pb-6 pt-1 md:px-2 md:pb-10"
                 >
                   {!auth ? (
-                    <div className="pt-2">
-                      <EmptyState
-                        icon={LogIn}
-                        title="登录后即可管理"
-                        hint="记忆、技能、定时任务与插件都需要登录后才能读写。"
-                        action={
-                          onRequireLogin ? (
-                            <Button variant="primary" onClick={onRequireLogin}>
-                              去登录
-                            </Button>
-                          ) : undefined
-                        }
-                      />
+                    <div className="px-4 pt-3 md:px-2">
+                      <div className="oc-surface-card rounded-2xl p-2">
+                        <EmptyState
+                          icon={LogIn}
+                          title="登录后即可管理"
+                          hint="记忆、技能、定时任务与插件都需要登录后才能读写。"
+                          action={
+                            onRequireLogin ? (
+                              <Button
+                                variant="primary"
+                                className="oc-btn-tactile oc-btn-primary-craft"
+                                onClick={onRequireLogin}
+                              >
+                                去登录
+                              </Button>
+                            ) : undefined
+                          }
+                        />
+                      </div>
                     </div>
                   ) : (
                     <>

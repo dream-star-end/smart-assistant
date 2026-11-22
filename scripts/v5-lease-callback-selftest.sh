@@ -23,6 +23,8 @@ case "$mode" in
  gone) printf '{"kind":"gone"}\n200' ;;
  404) printf '{"error":"not found"}\n404' ;;
  unavailable) printf '{"kind":"no_transport"}\n200' ;;
+ prevfail) printf '{"kind":"failed","reason":"previously_failed"}\n200' ;;
+ transientfail) printf '{"kind":"failed","reason":"delivery_unknown"}\n200' ;;
  fail) echo "connection lost" >&2; exit 7 ;;
  *) printf '{"kind":"%s"}\n200' "$mode" ;;
 esac
@@ -64,6 +66,16 @@ eq "$(q 'SELECT target_kind FROM outbox;')" session "HTTP 404 is endpoint failur
 eq "$(q 'SELECT attempts FROM outbox;')" 1 "404 spends retry attempt"
 reset; echo unavailable >"$T/mode"; deliver_outbox
 eq "$(q 'SELECT status FROM outbox;')" pending "no transport retries"
+reset; echo transientfail >"$T/mode"; deliver_outbox
+eq "$(q 'SELECT target_kind FROM outbox;')" session "transient failed keeps session target"
+eq "$(q 'SELECT status FROM outbox;')" pending "transient failed stays pending for retry"
+eq "$(q 'SELECT attempts FROM outbox;')" 1 "transient failed spends one retry attempt"
+reset; echo prevfail >"$T/mode"; deliver_outbox
+eq "$(q 'SELECT target_kind FROM outbox;')" ticket "previously_failed falls back immediately instead of retrying for 24h"
+deliver_outbox
+eq "$(q 'SELECT status FROM outbox;')" fallback_ticket "previously_failed delivers explicit fallback ticket comment"
+eq "$(grep -c 'lease-outbox' "$T/comments")" 1 "previously_failed writes one fallback comment"
+eq "$(grep -c 'previously_failed' "$T/comments")" 1 "previously_failed reason recorded in fallback comment"
 reset; echo fail >"$T/mode"; deliver_outbox
 eq "$(q 'SELECT attempts FROM outbox;')" 1 "curl failure retries"
 reset; echo gone >"$T/mode"; deliver_outbox

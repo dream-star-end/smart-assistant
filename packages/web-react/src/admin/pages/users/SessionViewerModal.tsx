@@ -401,8 +401,10 @@ export function SessionViewerModal({
         if (!open) onClose()
       }}
       title={
-        <span className="flex min-w-0 items-center gap-2">
-          <MessageSquareText size={17} className="shrink-0 text-accent" />
+        <span className="flex min-w-0 items-center gap-2.5">
+          <span className="oc-icon-badge oc-icon-badge-accent size-7 rounded-lg">
+            <MessageSquareText size={14} strokeWidth={2} />
+          </span>
           <span className="truncate">{displayTitle}</span>
           <Badge tone="neutral" className="shrink-0 gap-1">
             <Eye size={11} /> 只读
@@ -410,16 +412,21 @@ export function SessionViewerModal({
         </span>
       }
       description={
-        <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
-          <span>{userEmail || `用户 #${userId}`}</span>
-          <span aria-hidden>·</span>
-          <code>{payload?.agent_id || session?.agent_id || '—'}</code>
-          <span aria-hidden>·</span>
-          <span>{fmtInt(recordCount)} 条记录</span>
+        <span className="mt-1 flex flex-wrap items-center gap-1.5">
+          <span className="font-medium text-fg">{userEmail || `用户 #${userId}`}</span>
+          <span aria-hidden className="text-faint">·</span>
+          <code className="oc-surface-recessed rounded-md px-1.5 py-0.5 font-mono text-caption text-muted">
+            {payload?.agent_id || session?.agent_id || '—'}
+          </code>
+          <span aria-hidden className="text-faint">·</span>
+          <span className="tabular-nums">{fmtInt(recordCount)} 条记录</span>
           {sessionId && (
             <>
-              <span aria-hidden>·</span>
-              <code className="max-w-[18rem] truncate" title={sessionId}>
+              <span aria-hidden className="text-faint">·</span>
+              <code
+                className="oc-surface-recessed max-w-[18rem] truncate rounded-md px-1.5 py-0.5 font-mono text-caption text-faint"
+                title={sessionId}
+              >
                 {sessionId}
               </code>
             </>
@@ -443,7 +450,7 @@ export function SessionViewerModal({
           onTouchStart={cancelArchiveCorrection}
           onPointerDown={cancelArchiveCorrection}
           onKeyDown={cancelArchiveCorrection}
-          className="chat-scroll-area h-full min-h-0 overflow-y-auto overflow-x-hidden bg-bg"
+          className="chat-scroll-area oc-surface-recessed h-full min-h-0 overflow-y-auto overflow-x-hidden border-x-0 border-b-0"
         >
           {loading && !payload ? (
             <MessageListSkeleton />

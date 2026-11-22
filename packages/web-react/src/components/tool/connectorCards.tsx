@@ -45,7 +45,7 @@ import {
   isConfirmExpired,
 } from "../../lib/connectors";
 import { cn } from "../../lib/utils";
-import { Button, Spinner } from "../ui";
+import { Badge, Button, Spinner } from "../ui";
 import { useChatInteraction, useToolCardActions } from "./context";
 import type { ToolLike } from "./format";
 
@@ -164,7 +164,7 @@ function detailKeyLabel(key: string): string {
 /** 原样保留换行的长文本值（邮件正文/消息全文）。 */
 function DetailText({ text }: { text: string }) {
   return (
-    <div className="whitespace-pre-wrap break-words rounded-md bg-code px-2.5 py-2 text-[12.5px] leading-relaxed text-fg">
+    <div className="oc-surface-recessed whitespace-pre-wrap break-words rounded-md bg-code px-2.5 py-2 text-meta leading-relaxed text-fg">
       {text}
     </div>
   );
@@ -194,7 +194,7 @@ function DetailValue({ value }: { value: unknown }): ReactNode {
     dump = String(value);
   }
   return (
-    <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-2.5 py-2 font-mono text-[11.5px] leading-relaxed text-fg">
+    <pre className="oc-surface-recessed max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-2.5 py-2 font-mono text-caption leading-relaxed text-fg">
       {dump}
     </pre>
   );
@@ -243,21 +243,15 @@ export function isDestructiveConfirmation(detail: ConnectorConfirmationDetail | 
 
 function StatusBadge({ status }: { status: string }) {
   const tone = confirmStatusTone(status);
-  const cls =
-    tone === "ok"
-      ? "bg-success/10 text-success"
-      : tone === "danger"
-        ? "bg-danger/10 text-danger"
-        : tone === "pending"
-          ? "bg-warning/10 text-warning"
-          : "bg-hover text-faint";
+  const badgeTone =
+    tone === "ok" ? "success" : tone === "danger" ? "danger" : tone === "pending" ? "warning" : "neutral";
   const Icon =
     tone === "ok" ? CheckCircle2 : tone === "danger" ? XCircle : tone === "pending" ? Clock : AlertTriangle;
   return (
-    <span className={cn("inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-caption", cls)}>
-      <Icon className="size-2.5" />
+    <Badge tone={badgeTone} size="sm">
+      <Icon className="size-3" strokeWidth={1.75} aria-hidden="true" />
       {confirmStatusLabel(status)}
-    </span>
+    </Badge>
   );
 }
 
@@ -374,50 +368,52 @@ export function ConnectorConfirmCard({
   return (
     <div
       className={cn(
-        "rounded-lg",
-        embedded ? "bg-warning-soft/60" : "mt-1.5 border border-warning/40 bg-surface",
+        "overflow-hidden rounded-lg",
+        embedded ? "oc-callout oc-callout-warning" : "oc-surface-card mt-1.5 border-warning/40",
       )}
     >
       {/* 头部：盾牌警示 + 动作中文名（服务端）+ 状态徽标 */}
-      <div className={cn("flex min-h-10 items-center gap-2 px-3 py-2", !embedded && "border-b border-border")}>
-        <span className="text-warning">
-          <ShieldAlert className="size-4" />
+      <div className={cn("flex min-h-11 items-center gap-2.5 px-3 py-2", !embedded && "border-b border-border/75 bg-bg/40")}>
+        <span className="oc-icon-badge oc-icon-badge-warning size-6">
+          <ShieldAlert size={13} strokeWidth={1.75} />
         </span>
-        <span className="font-medium text-sm text-fg">
+        <span className="text-body font-semibold tracking-[-0.005em] text-fg">
           写操作待确认{actionLabel ? ` · ${actionLabel}` : ""}
         </span>
         <span className="ml-auto">
           {loading ? (
             <Spinner />
           ) : loadError || unverified ? (
-            <span className="inline-flex items-center gap-1 rounded bg-danger/10 px-1.5 py-0.5 text-caption text-danger">
-              <AlertTriangle className="size-2.5" />
+            <Badge tone="danger" size="sm">
+              <AlertTriangle className="size-3" strokeWidth={1.75} />
               无法核验
-            </span>
+            </Badge>
           ) : status ? (
             <StatusBadge status={status} />
           ) : null}
         </span>
       </div>
 
-      <div className="px-3 py-2">
+      <div className="px-3 py-2.5">
         {/* 主体：一切展示以服务端权威为准；拉取中/失败/不符/无凭据各自降级，绝不展示 CLI 内容 */}
         {loading ? (
           <div className="flex items-center gap-2 py-1 text-body text-faint">
             <Spinner /> 正在核验此操作…
           </div>
         ) : loadError ? (
-          <div className="py-1 text-body text-danger">{loadError}</div>
+          <div className="oc-callout oc-callout-danger rounded-md px-2.5 py-1.5 text-body text-danger">{loadError}</div>
         ) : unverified ? (
-          <div className="py-1 text-body text-danger">无法核验此确认，请勿在此操作。</div>
+          <div className="oc-callout oc-callout-danger rounded-md px-2.5 py-1.5 text-body text-danger">
+            无法核验此确认，请勿在此操作。
+          </div>
         ) : detail ? (
           <>
             {/* 摘要：服务端解密后铸造，非 CLI 输出 */}
-            <div className="flex items-start gap-2">
-              <span className="mt-0.5 text-accent">
-                <Icon className="size-4" />
+            <div className="flex items-start gap-2.5">
+              <span className="oc-icon-badge oc-icon-badge-accent mt-0.5 size-6">
+                <Icon size={13} />
               </span>
-              <div className="min-w-0 flex-1 break-words text-[13px] leading-snug text-fg">
+              <div className="min-w-0 flex-1 break-words text-body leading-snug text-fg">
                 {detail.summary}
               </div>
             </div>
@@ -428,17 +424,17 @@ export function ConnectorConfirmCard({
               onClick={() => setDetailOpen((o) => !o)}
               aria-expanded={detailOpen}
               // 确认前的必读入口:触屏下 ≥44px 命中面积(T-08),桌面仍是行内文字链接。
-              className="mt-2 inline-flex items-center gap-1 rounded text-meta text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+              className="mt-2 inline-flex items-center gap-1 rounded-xs text-meta font-medium text-accent outline-none transition-colors hover:text-accent-strong hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
             >
               {detailOpen ? (
-                <ChevronDown className="size-3.5" />
+                <ChevronDown className="size-3.5" strokeWidth={1.75} />
               ) : (
-                <ChevronRight className="size-3.5" />
+                <ChevronRight className="size-3.5" strokeWidth={1.75} />
               )}
               查看完整内容
             </button>
             {detailOpen && (
-              <div className="mt-1.5 rounded-md border border-border px-2.5 py-2">
+              <div className="oc-surface-recessed mt-1.5 rounded-md px-3 py-2.5">
                 <ConfirmationDetailView detail={detail.detail} />
               </div>
             )}
@@ -471,15 +467,19 @@ export function ConnectorConfirmCard({
           </div>
         )}
         {!connectorConfirm && (
-          <div className="mt-2 text-xs text-faint">（此会话中不可操作，请在网页端登录后确认）</div>
+          <div className="mt-2 text-caption text-faint">（此会话中不可操作，请在网页端登录后确认）</div>
         )}
         {status === "expired" && (
-          <div className="mt-2 text-xs text-faint">该确认已过期，如仍需执行请让助手重新发起。</div>
+          <div className="mt-2 text-caption text-faint">该确认已过期，如仍需执行请让助手重新发起。</div>
         )}
-        {error && <div className="mt-2 text-xs text-danger">{error}</div>}
-        {manualFollowUp && <div className="mt-2 text-xs text-success">{manualFollowUp}</div>}
+        {error && (
+          <div className="oc-callout oc-callout-danger mt-2 rounded-md px-2.5 py-1.5 text-caption text-danger">{error}</div>
+        )}
+        {manualFollowUp && <div className="mt-2 text-caption font-medium text-success">{manualFollowUp}</div>}
 
-        <div className="mt-2 text-caption text-faint">确认码 {shortId} · 批准后 10 分钟内有效</div>
+        <div className="mt-2.5 border-t border-border/60 pt-2 font-mono text-caption text-faint tabular-nums">
+          确认码 {shortId} · 批准后 10 分钟内有效
+        </div>
       </div>
     </div>
   );

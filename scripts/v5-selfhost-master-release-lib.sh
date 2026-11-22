@@ -1518,18 +1518,49 @@ build_master_release() {
       return 1
     fi
   }
-  # OCV5-545(第三阶段 P0b 列车步骤):架构护栏在 pinned staging 跑报告期,计数写进 summary.json。
-  # 报告期不拦新增违规(和 PR CI 的 architecture job 一致);检查器 fail-closed(解析失败、modules.json
-  # 或基线不合法,退出 2)照样让列车失败。转强制期时这里改 --enforce。
+  master_job_codex_chatgpt_ws() {
+    mlog "  codex-chatgpt-ws proof @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+        npx --no-install tsx scripts/check-v5-codex-chatgpt-ws.ts ); then
+      mlog "pinned imported codex-chatgpt-ws proof failed"
+      return 1
+    fi
+  }
+  master_job_platform_tool_proofs() {
+    mlog "  ocv5-376 platform tool proofs @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+        npx --no-install tsx scripts/check-v5-ocv5-376-platform-tool-proofs.ts ); then
+      mlog "pinned imported ocv5-376-platform-tool-proofs proof failed"
+      return 1
+    fi
+  }
+  master_job_terminal_unproven() {
+    mlog "  box terminal unproven probe proof @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+        npx --no-install tsx scripts/check-v5-box-terminal-unproven-probe.ts ); then
+      mlog "pinned imported box-terminal-unproven-probe proof failed"
+      return 1
+    fi
+  }
+  master_job_upload_retention() {
+    mlog "  upload retention HTTP responsiveness proof @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+        npx --no-install tsx scripts/check-v5-upload-retention-proof.ts ); then
+      mlog "pinned upload retention HTTP responsiveness proof failed"
+      return 1
+    fi
+  }
+  # OCV5-545 / OCV5-847: 架构护栏在 pinned staging 跑强制期(--enforce),计数写进 summary.json。
+  # 新增/增长违规、未清理的 stale 基线、或检查器 fail-closed(退出 2)均让列车失败。
   master_job_architecture() {
-    mlog "  architecture guardrails (report period) @ pinned staging"
+    mlog "  architecture guardrails (enforced) @ pinned staging"
     if [[ ! -f "$staging/scripts/check-architecture.ts" ]]; then
       mlog "新候选缺 scripts/check-architecture.ts"
       return 1
     fi
     if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-architecture.ts \
-        --json "$MASTER_GATE_TMPDIR/architecture.json" ); then
-      mlog "pinned architecture guardrails 失败(检查器 fail-closed)"
+        --enforce --json "$MASTER_GATE_TMPDIR/architecture.json" ); then
+      mlog "pinned architecture guardrails 失败(新增/增长/过期基线违规或检查器 fail-closed)"
       return 1
     fi
   }
@@ -1627,6 +1658,10 @@ build_master_release() {
     C.system-executor:master_job_system_executor:system-executor-fencing \
     C.host-log-policy:master_job_host_log_policy \
     C.model-policy:master_job_model_policy \
+    C.codex-chatgpt-ws:master_job_codex_chatgpt_ws \
+    C.platform-tool-proofs:master_job_platform_tool_proofs \
+    C.terminal-unproven:master_job_terminal_unproven \
+    C.upload-retention:master_job_upload_retention \
     C.architecture:master_job_architecture \
   ; do
     IFS=: read -r job_id job_fn gate_id <<<"$job"
@@ -1756,6 +1791,7 @@ build_master_release() {
   fi
   # OCV5-763: reverse-imported commercial incidents need actual selfhost runners.
   # Existing train-isolated test DB only; no production credentials or model invocation.
+  tsum_mark C.master-incident-proofs 2>/dev/null || :
   if ! master_local_gate_has master-incident-proofs "$full_sha"; then
     master_ensure_box_host_idle
     master_ensure_gate_db
@@ -1767,43 +1803,7 @@ build_master_release() {
     fi
     master_local_gate_record master-incident-proofs "$full_sha"
   fi
-  if ! master_local_gate_has codex-chatgpt-ws "$full_sha"; then
-    master_ensure_box_host_idle
-    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
-        npx --no-install tsx scripts/check-v5-codex-chatgpt-ws.ts ); then
-      cleanup_master_staging
-      die "pinned imported codex-chatgpt-ws proof failed"
-    fi
-    master_local_gate_record codex-chatgpt-ws "$full_sha"
-  fi
-  if ! master_local_gate_has platform-tool-proofs "$full_sha"; then
-    master_ensure_box_host_idle
-    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
-        npx --no-install tsx scripts/check-v5-ocv5-376-platform-tool-proofs.ts ); then
-      cleanup_master_staging
-      die "pinned imported ocv5-376-platform-tool-proofs proof failed"
-    fi
-    master_local_gate_record platform-tool-proofs "$full_sha"
-  fi
-  if ! master_local_gate_has terminal-unproven "$full_sha"; then
-    master_ensure_box_host_idle
-    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
-        npx --no-install tsx scripts/check-v5-box-terminal-unproven-probe.ts ); then
-      cleanup_master_staging
-      die "pinned imported box-terminal-unproven-probe proof failed"
-    fi
-    master_local_gate_record terminal-unproven "$full_sha"
-  fi
   master_gate_db_drop
-  if ! master_local_gate_has upload-retention-http "$full_sha"; then
-    mlog "  upload retention HTTP responsiveness proof @ pinned staging"
-    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
-        npx --no-install tsx scripts/check-v5-upload-retention-proof.ts ); then
-      cleanup_master_staging
-      die "pinned upload retention HTTP responsiveness proof failed"
-    fi
-    master_local_gate_record upload-retention-http "$full_sha"
-  fi
   tsum_mark C.ccb-mcp 2>/dev/null || :
   if ! master_local_gate_has ccb-mcp-availability "$full_sha"; then
     mlog "  CCB MCP availability contract gate @ pinned staging"
@@ -1818,6 +1818,7 @@ build_master_release() {
     master_local_gate_record ccb-mcp-availability "$full_sha"
   fi
   # Before sealing: fresh same-candidate CCB and real late stop proof; no production DB.
+  tsum_mark C.codex-late-stop 2>/dev/null || :
   if ! master_local_gate_has codex-late-stop-closure "$full_sha"; then
     if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/check-v5-codex-late-stop-proof.sh ); then
       cleanup_master_staging
@@ -2282,19 +2283,19 @@ resolve_worktree_unit_backup() {
 # 后续(installed WD=live):只写 forensics 快照,不覆盖 worktree-current;
 # dest_var 返回已有的工作树备份,供二级回滚使用。
 backup_installed_units_for_cutover() { # <out-var>
-  local dest_var="$1" ts dest wd_m wd_e tmp_link wt
+  local dest_var="$1" ts dest wd_m wd_e tmp_link wt sysdir="${V5_SYSTEMD_DIR:-/etc/systemd/system}"
   [[ "$dest_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
   ts="$(date -u +%Y%m%d-%H%M%S)" || return 1
   dest="${BREAKGLASS_ROOT}/unit-backups/pre-cutover-${ts}"
   mkdir -p -- "$dest" || return 1
-  cp -a -- "/etc/systemd/system/${V5_UNIT}" "$dest/" || return 1
-  cp -a -- "/etc/systemd/system/${V5_EGRESS_UNIT}" "$dest/" || return 1
+  cp -a -- "${sysdir}/${V5_UNIT}" "$dest/" || return 1
+  cp -a -- "${sysdir}/${V5_EGRESS_UNIT}" "$dest/" || return 1
   # 双槽 egress 模板(已装才备;forensics 用,恢复脚本不依赖它们)。
   local sf
   for sf in "${V5_EGRESS_SLOT_SOCKET_TPL:-openclaude-v5-selfhost-egress@.socket}" \
             "${V5_EGRESS_SLOT_SERVICE_TPL:-openclaude-v5-selfhost-egress@.service}"; do
-    if [[ -f "/etc/systemd/system/$sf" ]]; then
-      cp -a -- "/etc/systemd/system/$sf" "$dest/" || return 1
+    if [[ -f "${sysdir}/$sf" ]]; then
+      cp -a -- "${sysdir}/$sf" "$dest/" || return 1
     fi
   done
   if [[ -n "${UNIT_DIR:-}" && -f "${UNIT_DIR}/${V5_UNIT}" ]]; then
@@ -2310,7 +2311,7 @@ backup_installed_units_for_cutover() { # <out-var>
   grep -q '^ExecStart=' "$dest/${V5_UNIT}" || return 1
   grep -q '^ExecStart=' "$dest/${V5_EGRESS_UNIT}" || return 1
   printf 'backup=%s\ninstalled_master=%s\ninstalled_egress=%s\nwd_master=%s\nwd_egress=%s\n' \
-    "$dest" "/etc/systemd/system/${V5_UNIT}" "/etc/systemd/system/${V5_EGRESS_UNIT}" \
+    "$dest" "${sysdir}/${V5_UNIT}" "${sysdir}/${V5_EGRESS_UNIT}" \
     "$wd_m" "$wd_e" \
     >"$dest/MANIFEST.txt" || return 1
   fsync_path "$dest/${V5_UNIT}" || return 1
@@ -2334,7 +2335,15 @@ backup_installed_units_for_cutover() { # <out-var>
   if [[ "$wd_m" == "$MASTER_LIVE_LINK" && "$wd_e" == "$MASTER_LIVE_LINK" ]]; then
     # 二级补偿/幸存者必须用「本次切流前」这份 forensics。禁止再把 dest_var
     # 指回陈旧 worktree-current(2026-08-29 11:21 用 Aug18 工作树 unit 拉倒 18790)。
-    mlog "  当前 unit 已是 live WD;forensics=$dest (本次切流备份,不改 worktree-current)"
+    # OCV5-818: 同步原子发布独立指针 live-current 供 watch 自动 tier2 默认消费,不改动 worktree-current。
+    tmp_link="${BREAKGLASS_ROOT}/unit-backups/live-current.new.$$"
+    ln -sfn -- "$dest" "$tmp_link" || return 1
+    mv -Tf -- "$tmp_link" "${BREAKGLASS_ROOT}/unit-backups/live-current" || {
+      rm -f -- "$tmp_link"
+      return 1
+    }
+    fsync_path "${BREAKGLASS_ROOT}/unit-backups" || true
+    mlog "  当前 unit 已是 live WD;forensics=$dest (本次切流备份,不改 worktree-current; 已更新 live-current)"
     printf -v "$dest_var" '%s' "$dest"
     return 0
   fi
@@ -2413,24 +2422,24 @@ SQL
   log "  --allow-inflight: adopted exact-source registered permission; 用户 11:48 授权个人版不等在途请求"
 }
 
-# OCV5-513: wait after the build, before arming recovery or changing live units.
-# This is an idle snapshot, not an admission fence; new arrivals can still race.
+# OCV5-513 / OCV5-854: tiered idle gate (delegates to dual-slot lib when loaded).
 cutover_wait_for_user_idle() {
+  if declare -F selfhost_cutover_wait_for_safe_window >/dev/null 2>&1; then
+    selfhost_cutover_wait_for_safe_window
+    return $?
+  fi
   local counts started=$SECONDS deadline=$((SECONDS + 600))
   if [[ "${ALLOW_INFLIGHT:-0}" == 1 ]]; then
     [[ "${PG_DB:-}" == openclaude_v5_selfhost ]] || { cutover_clog "  ✗ --allow-inflight 仅用于 selfhost"; return 1; }
     if [[ "$DRY" != 1 ]]; then
       if ! lease_train_load_lib || ! lease_inflight_train_allowed "${LEASE_TRAIN_ID:-}" "${LEASE_TARGET_SHA:-}"; then
-        cutover_clog "  ✗ --allow-inflight 缺少正式列车的精确源授权;拒绝切换"
-        return 1
+        cutover_clog "  ✗ --allow-inflight 缺少正式列车的精确源授权;拒绝切换"; return 1
       fi
     fi
-    cutover_clog "  --allow-inflight: 跳过个人版600s空闲/在途检查;用户已接受在途回合可能中断"
-    return 0
+    cutover_clog "  --allow-inflight: 跳过个人版600s空闲/在途检查;用户已接受在途回合可能中断"; return 0
   fi
   if [[ "$DRY" == 1 ]]; then
-    cutover_clog "  [dry-run] 切换前等待全部用户回合结束(只读,最多 600s;不查询数据库)"
-    return 0
+    cutover_clog "  [dry-run] 切换前等待全部用户回合结束(只读,最多 600s;不查询数据库)"; return 0
   fi
   while :; do
     if ! counts="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
@@ -2443,18 +2452,15 @@ SELECT
      SELECT 1 FROM turn_dispatches d WHERE d.dispatch_id=j.dispatch_id
        AND d.status='terminal' AND d.terminal_at IS NOT NULL));
 COMMIT;")"; then
-      cutover_clog "  ✗ 无法只读确认用户空闲;拒绝切换,旧 master 继续运行"
-      return 1
+      cutover_clog "  ✗ 无法只读确认用户空闲;拒绝切换,旧 master 继续运行"; return 1
     fi
     if [[ ! "$counts" =~ ^[0-9]+\|[0-9]+$ ]]; then
-      cutover_clog "  ✗ 空闲查询结果无效;拒绝切换,旧 master 继续运行"
-      return 1
+      cutover_clog "  ✗ 空闲查询结果无效;拒绝切换,旧 master 继续运行"; return 1
     fi
     cutover_clog "  idle snapshot UTC=$(date -u +%FT%TZ) open_dispatches=${counts%|*} unclassified_journals=${counts#*|} elapsed=$((SECONDS - started))s"
     [[ "$counts" == '0|0' ]] && return 0
     if (( SECONDS >= deadline )); then
-      cutover_clog "  ✗ 等待空闲 600s 超时;拒绝切换,旧 master 继续运行"
-      return 1
+      cutover_clog "  ✗ 等待空闲 600s 超时;拒绝切换,旧 master 继续运行"; return 1
     fi
     sleep 5
   done
@@ -2463,18 +2469,18 @@ COMMIT;")"; then
 REMOTE_V4_CUTOVER_DRAINED=0
 
 remote_v4_cutover_reopen() {
-  local sock="${OC_REMOTE_V4_DRAIN_SOCKET:-/run/openclaude-v5-selfhost/remote-v4-drain.sock}"
+  local sock
+  if declare -F selfhost_master_active_drain_sock >/dev/null 2>&1; then sock="$(selfhost_master_active_drain_sock)"; else sock="${OC_REMOTE_V4_DRAIN_SOCKET:-/run/openclaude-v5-selfhost/remote-v4-drain.sock}"; fi
   REMOTE_V4_CUTOVER_DRAINED=0
   [[ "${DRY:-0}" != 1 ]] || return 0
   [[ -S "$sock" ]] || return 0
   bash "$SCRIPT_DIR/agent-remote/drain-remote-v4.sh" --reopen --socket "$sock" >/dev/null 2>&1 || true
 }
 
-# OCV5-749 AC-5: R1 generation cutover drain fence. Closes new remote-pool admissions
-# (`REMOTE_POOL_DRAINING_RETRY_LATER`) and waits for active relays + remote journals;
-# aborts cutover without killing active turns if drain times out.
+# OCV5-749 AC-5 / OCV5-854: R1 generation cutover drain fence (slot-aware socket).
 remote_v4_cutover_drain() {
-  local sock="${OC_REMOTE_V4_DRAIN_SOCKET:-/run/openclaude-v5-selfhost/remote-v4-drain.sock}"
+  local sock
+  if declare -F selfhost_master_active_drain_sock >/dev/null 2>&1; then sock="$(selfhost_master_active_drain_sock)"; else sock="${OC_REMOTE_V4_DRAIN_SOCKET:-/run/openclaude-v5-selfhost/remote-v4-drain.sock}"; fi
   local timeout_ms="${OC_REMOTE_V4_DRAIN_TIMEOUT_MS:-600000}"
   local run_id="${LEASE_TRAIN_ID:-cutover-$$}" out rc=0 v4_active has_version
   if [[ "${ALLOW_INFLIGHT:-0}" == 1 ]]; then

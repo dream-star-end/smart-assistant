@@ -14,6 +14,11 @@ import { resolveChatRunWorkspace } from './projectWorkspace.js'
 import { appendServerAuthoredMessage } from '@openclaude/storage'
 import { filterUserVisibleByAgentField, isHiddenSystemAgentId } from './agentVisibility.js'
 import type { CronDeliveryContext, CronJob } from './cron.js'
+import {
+  checkCronOriginModelConflict,
+  normalizeCronEffortField,
+  normalizeCronModelField,
+} from './cronModelPolicy.js'
 import { listCronDeliverChannels } from './cronChannels.js'
 import {
   deriveFixedBoardProjectId,
@@ -482,8 +487,12 @@ export async function handleCronApi(
     } catch {
       return this.sendError(res, 400, 'invalid JSON')
     }
-    const { schedule, prompt, deliver, oneshot, label, agent } = parsed
+    const { schedule, prompt, deliver, oneshot, label, agent, model, effort } = parsed
     if (!schedule || !prompt) return this.sendError(res, 400, 'schedule and prompt required')
+    const modelCheck = normalizeCronModelField(model)
+    if (!modelCheck.ok) return this.sendError(res, 400, modelCheck.error)
+    const effortCheck = normalizeCronEffortField(effort)
+    if (!effortCheck.ok) return this.sendError(res, 400, effortCheck.error)
     const cronAgent = typeof agent === 'string' && agent ? agent : 'main'
     if (isHiddenSystemAgentId(cronAgent)) return this.sendError(res, 404, 'agent not found')
     const id = `remind-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
@@ -496,11 +505,19 @@ export async function handleCronApi(
       enabled: true,
       oneshot: oneshot ?? true,
       label: label || prompt.slice(0, 50),
+      ...(modelCheck.value !== undefined ? { model: modelCheck.value } : {}),
+      ...(effortCheck.value !== undefined ? { effort: effortCheck.value } : {}),
       // Stamp creation time so bounded catch-up never "makes up" a missed fire
       // for a schedule point that predates this job (see cron.ts resolveDueMinute).
       createdAt: Date.now(),
     }
     if (parsed.resume === 'origin-session') {
+      const originConflict = checkCronOriginModelConflict({
+        resume: 'origin-session',
+        model: modelCheck.value,
+        effort: effortCheck.value,
+      })
+      if (originConflict) return this.sendError(res, 400, originConflict)
       const origin = parseOriginWebchatSessionKey(
         typeof parsed.originSessionKey === 'string' ? parsed.originSessionKey : '',
       )
@@ -578,6 +595,26 @@ export async function handleCronItem(
       parsed.projectMode = stamped.projectMode
       parsed.boardProjectId = stamped.boardProjectId
     }
+    let nextModelForCheck = existing?.model
+    if (parsed.model !== undefined) {
+      const modelCheck = normalizeCronModelField(parsed.model)
+      if (!modelCheck.ok) return this.sendError(res, 400, modelCheck.error)
+      parsed.model = modelCheck.value ?? ''
+      nextModelForCheck = modelCheck.value
+    }
+    let nextEffortForCheck = existing?.effort
+    if (parsed.effort !== undefined) {
+      const effortCheck = normalizeCronEffortField(parsed.effort)
+      if (!effortCheck.ok) return this.sendError(res, 400, effortCheck.error)
+      parsed.effort = effortCheck.value ?? ''
+      nextEffortForCheck = effortCheck.value
+    }
+    const originConflict = checkCronOriginModelConflict({
+      resume: existing?.resume,
+      model: nextModelForCheck,
+      effort: nextEffortForCheck,
+    })
+    if (originConflict) return this.sendError(res, 400, originConflict)
     const updated = await this.cron.updateJob(id, parsed)
     this.sendJson(res, updated ? 200 : 404, { ok: updated })
     return

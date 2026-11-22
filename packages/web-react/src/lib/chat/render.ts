@@ -416,6 +416,9 @@ export function messageSignature(
         m._inputRevision ?? 0,
         m.inputPreview ? m.inputPreview.length : 0,
         bashTailSig(m.bashTail),
+        m._swarmSnapshot
+          ? `${m._swarmSnapshot.swarmId}:${m._swarmSnapshot.revision}:${m._swarmSnapshot.phase}:${m._swarmSnapshot.totalPosts}`
+          : "",
       ].join("|");
     case "plan":
       return [
@@ -809,6 +812,8 @@ export type ErrorPresentation = {
   bodyText?: string;
   detail?: string;
   waived: boolean;
+  /** True when the presentation should be absorbed silently (e.g. unsealed BOX_REPLAY_PENDING). */
+  silent?: boolean;
 };
 
 /** Only the old SDK's complete fixed diagnostic may bypass a stale error card. */
@@ -1024,11 +1029,11 @@ export function errorPresentation(
       code: normalized,
       fixedMessage: true,
       title: BOX_REPLAY_PENDING_SOFT_TITLE,
-      message:
-        "远端结果仍在确认中。已生成的内容已保留；稍后刷新即可看到完整结果，不会重复扣费。",
+      message: "结果正在自动同步，已生成的内容已保留，不会重复扣费。",
       ...(partialAnswer ? { bodyText: partialAnswer } : {}),
       ...(ref ? { detail: `请求 ID：${ref}` } : {}),
       waived: false,
+      silent: true,
     };
   }
   // Old tapes used ENGINE_ERROR for the SDK's fixed size diagnostic.
@@ -1112,7 +1117,10 @@ export function commitErrorCardSnapshot(
   messageOverride?: string,
 ): "card" | "silent" | undefined {
   const replaceStaleSoft =
-    isSealedDispatchFailure(message) && isStaleSoftBoxReplaySnapshot(message._errorCardSnapshot);
+    isSealedDispatchFailure(message) &&
+    (isStaleSoftBoxReplaySnapshot(message._errorCardSnapshot) ||
+      (message._errorCardSnapshot?.disposition === "silent" &&
+        isBoxReplayPendingDetail(message.text, message._errorDetail)));
   if (message._errorCardSnapshot && !replaceStaleSoft) return message._errorCardSnapshot.disposition;
   if (typeof message._errorCode !== "string" || message._errorCode.length === 0) return undefined;
   if (isSilentTurnErrorCode(message._errorCode)) {
@@ -1129,11 +1137,15 @@ export function commitErrorCardSnapshot(
       dispatchOutcome: message._dispatchOutcome,
     },
   );
+  const override = typeof messageOverride === "string" && messageOverride.length > 0;
+  if (presented.silent && !override) {
+    message._errorCardSnapshot = { disposition: "silent" };
+    return "silent";
+  }
   const tone: "red" | "yellow" =
     presented.waived || problemCardPresentation(message._errorCode, false) === "yellow"
       ? "yellow"
       : "red";
-  const override = typeof messageOverride === "string" && messageOverride.length > 0;
   const body = override ? messageOverride : presented.message;
   // W3:卡片正文用错误目录的人话 —— 帧带的 userError 原样冻结;没有就冻结查目录用的码,由懒加载的
   // 错误卡去查(目录不进首屏)。这一轮特有的事实(覆盖文案、计费 / 白名单说法)仍用 message。
@@ -1198,6 +1210,14 @@ export function freezeErrorCardSnapshots(
       if (isSealedDispatchFailure(message) && isStaleSoftBoxReplaySnapshot(message._errorCardSnapshot)) {
         commitErrorCardSnapshot(message);
       }
+      continue;
+    }
+    if (
+      message._errorCardSnapshot?.disposition === "silent" &&
+      isSealedDispatchFailure(message) &&
+      isBoxReplayPendingDetail(message.text, message._errorDetail)
+    ) {
+      commitErrorCardSnapshot(message);
       continue;
     }
     if (

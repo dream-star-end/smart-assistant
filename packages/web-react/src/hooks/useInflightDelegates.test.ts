@@ -2,6 +2,7 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { createMemoryAuthSession } from "../lib/authSession";
 import { fetchInflightDelegatesResult, type InflightDelegateItem } from "../lib/chat/inflightDelegates";
+import { cancelInflightDelegate } from "../lib/chat/sessionBackgroundTasks";
 import {
   filterVisibleInflightItems,
   readDismissedDelegates,
@@ -15,11 +16,17 @@ vi.mock("../lib/chat/inflightDelegates", async (original) => ({
   fetchInflightDelegatesResult: vi.fn(),
 }));
 
+vi.mock("../lib/chat/sessionBackgroundTasks", async (original) => ({
+  ...await original<typeof import("../lib/chat/sessionBackgroundTasks")>(),
+  cancelInflightDelegate: vi.fn(),
+}));
+
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
   vi.restoreAllMocks();
   vi.mocked(fetchInflightDelegatesResult).mockReset();
+  vi.mocked(cancelInflightDelegate).mockReset();
 });
 
 function item(over: Partial<InflightDelegateItem> = {}): InflightDelegateItem {
@@ -196,5 +203,89 @@ describe("dismissed 持久化(H-14)", () => {
     expect(back.size).toBe(64);
     expect(back.has("job-69")).toBe(true);
     expect(back.has("job-0")).toBe(false);
+  });
+});
+
+describe("refreshTrigger & cancel (OCV5-844)", () => {
+  const auth = createMemoryAuthSession(() => {}, "tok");
+
+  test("进会话时为空，refreshTrigger 递增后带节流补拉并恢复轮询", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    const running = item({ updatedAt: Date.now() });
+    const completed = { ...running, state: "completed" as const };
+    vi.mocked(fetchInflightDelegatesResult)
+      .mockResolvedValueOnce({ ok: true, items: [] })
+      .mockResolvedValueOnce({ ok: true, items: [running] })
+      .mockResolvedValueOnce({ ok: true, items: [completed] });
+
+    const { result, rerender } = renderHook(
+      ({ refreshTrigger }) =>
+        useInflightDelegates({ sessionId: "s1", messages: [], enabled: true, auth, refreshTrigger }),
+      { initialProps: { refreshTrigger: 0 } },
+    );
+    await act(async () => {});
+    expect(result.current.items).toEqual([]);
+    expect(fetchInflightDelegatesResult).toHaveBeenCalledTimes(1);
+
+    // 2s 节流窗内连发两次 trigger，只合并成一次尾沿补拉
+    rerender({ refreshTrigger: 1 });
+    rerender({ refreshTrigger: 2 });
+    expect(fetchInflightDelegatesResult).toHaveBeenCalledTimes(1);
+
+    await act(() => vi.advanceTimersByTimeAsync(2_000));
+    expect(fetchInflightDelegatesResult).toHaveBeenCalledTimes(2);
+    expect(result.current.items).toEqual([running]);
+
+    // 捕到运行中项后自动进入 15s 轮询
+    await act(() => vi.advanceTimersByTimeAsync(15_000));
+    expect(fetchInflightDelegatesResult).toHaveBeenCalledTimes(3);
+    expect(result.current.items).toEqual([completed]);
+  });
+
+  test("cancel 调用单条取消接口成功后立即重拉刷新状态", async () => {
+    const running = item({ updatedAt: Date.now() });
+    const cancelled = { ...running, state: "cancelled" as const, resultSummary: "用户取消" };
+    vi.mocked(fetchInflightDelegatesResult)
+      .mockResolvedValueOnce({ ok: true, items: [running] })
+      .mockResolvedValueOnce({ ok: true, items: [cancelled] });
+    vi.mocked(cancelInflightDelegate).mockResolvedValueOnce({
+      ok: true,
+      cancelled: true,
+      state: "cancelled",
+    });
+
+    const { result } = renderHook(() =>
+      useInflightDelegates({ sessionId: "s1", messages: [], enabled: true, auth }),
+    );
+    await act(async () => {});
+    expect(result.current.items).toEqual([running]);
+
+    let ok = false;
+    await act(async () => {
+      ok = await result.current.cancel("dlgjob-1");
+    });
+    expect(ok).toBe(true);
+    expect(cancelInflightDelegate).toHaveBeenCalledWith("s1", "dlgjob-1", auth);
+    expect(fetchInflightDelegatesResult).toHaveBeenCalledTimes(2);
+    expect(result.current.items).toEqual([cancelled]);
+  });
+
+  test("cancel 失败时返回 false 且不误触发额外拉取", async () => {
+    const running = item({ updatedAt: Date.now() });
+    vi.mocked(fetchInflightDelegatesResult).mockResolvedValueOnce({ ok: true, items: [running] });
+    vi.mocked(cancelInflightDelegate).mockResolvedValueOnce({ ok: false, cancelled: false });
+
+    const { result } = renderHook(() =>
+      useInflightDelegates({ sessionId: "s1", messages: [], enabled: true, auth }),
+    );
+    await act(async () => {});
+
+    let ok = true;
+    await act(async () => {
+      ok = await result.current.cancel("dlgjob-1");
+    });
+    expect(ok).toBe(false);
+    expect(fetchInflightDelegatesResult).toHaveBeenCalledTimes(1);
   });
 });

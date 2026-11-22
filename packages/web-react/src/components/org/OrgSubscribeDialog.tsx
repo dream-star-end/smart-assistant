@@ -160,27 +160,27 @@ export function OrgSubscribeDialog({
                           }}
                           aria-pressed={selected}
                           className={cn(
-                            "flex items-center justify-between gap-3 rounded-xl border px-4 py-3 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                            "flex items-center justify-between gap-3 rounded-xl px-4 py-3.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring",
                             selected
-                              ? "border-accent bg-accent-soft"
-                              : "border-border bg-surface hover:border-border-strong",
+                              ? "border border-accent bg-accent-soft shadow-soft transition-colors"
+                              : "oc-surface-card oc-surface-card-hover",
                           )}
                         >
                           <div className="min-w-0">
                             <div className="flex items-center gap-2">
                               <span className="text-title font-semibold text-fg">{p.name}</span>
                               {isCurrent && (
-                                <span className="rounded-full bg-accent px-1.5 py-0.5 text-micro font-medium text-accent-fg">
+                                <span className="oc-badge-craft rounded-full bg-accent px-2 py-0.5 text-micro font-medium text-accent-fg">
                                   当前
                                 </span>
                               )}
                             </div>
-                            <div className="mt-0.5 text-meta text-faint">
+                            <div className="mt-1 text-meta tabular-nums text-muted">
                               {formatCentsYuan(p.seatPriceCents)}/席·月 · 每席{" "}
                               {formatCredits(p.perSeatCredits)} 积分
                             </div>
                           </div>
-                          <span className="shrink-0 text-caption text-faint">
+                          <span className="oc-badge-craft shrink-0 rounded-full bg-hover px-2 py-0.5 text-caption tabular-nums text-muted">
                             最低 {p.minSeats} 席
                           </span>
                         </button>
@@ -199,14 +199,14 @@ export function OrgSubscribeDialog({
             ) : (
               <>
                 {currentSub && plan ? (
-                  <div className="rounded-xl border border-border bg-bg px-4 py-3 text-meta">
+                  <div className="oc-surface-recessed rounded-xl px-4 py-3 text-meta">
                     <div className="flex items-center justify-between">
                       <span className="text-muted">当前套餐</span>
-                      <span className="font-medium text-fg">{plan.name}</span>
+                      <span className="font-semibold text-fg">{plan.name}</span>
                     </div>
-                    <div className="mt-1 flex items-center justify-between text-faint">
+                    <div className="mt-1.5 flex items-center justify-between text-faint">
                       <span>当前席位</span>
-                      <span className="tabular-nums">{currentSeats} 席</span>
+                      <span className="font-medium tabular-nums text-muted">{currentSeats} 席</span>
                     </div>
                   </div>
                 ) : (
@@ -227,14 +227,14 @@ export function OrgSubscribeDialog({
             )}
 
             {plan && priced && seatsValid && (
-              <div className="rounded-xl border border-border bg-bg px-4 py-3">
+              <div className="oc-surface-recessed rounded-xl px-4 py-3">
                 <div className="flex items-center justify-between text-body">
                   <span className="text-muted">应付合计</span>
-                  <span className="text-[16px] font-semibold text-fg">
+                  <span className="text-base font-semibold tabular-nums text-fg">
                     {formatCentsYuan(priced.totalCents)}
                   </span>
                 </div>
-                <div className="mt-1 text-meta text-faint">
+                <div className="mt-1 text-meta tabular-nums text-faint">
                   {mode === "subscribe"
                     ? `${seats} 席 × ${formatCentsYuan(plan.seatPriceCents)}/月 · 入池 ${formatCredits(priced.totalCredits)} 积分`
                     : `+${seats - currentSeats} 席 × ${formatCentsYuan(plan.seatPriceCents)} · 入池 ${formatCredits(priced.totalCredits)} 积分`}
@@ -242,7 +242,7 @@ export function OrgSubscribeDialog({
               </div>
             )}
 
-            <div className="flex items-center justify-end gap-2">
+            <div className="flex items-center justify-end gap-2 pt-1">
               <Button variant="ghost" size="sm" onClick={onClose} className="text-muted">
                 取消
               </Button>
@@ -257,7 +257,7 @@ export function OrgSubscribeDialog({
               </Button>
             </div>
 
-            <p className="text-[11.5px] leading-relaxed text-faint">
+            <p className="text-caption leading-relaxed text-faint">
               {mode === "subscribe"
                 ? "支付后即时开通，席位积分整份入组织期内池；续费顺延一个计费周期。期内池到期清零，超额与非订阅用量由组织钱包承接。"
                 : "加席按整席全价购，整份积分即时入池，当前计费周期不变。"}

@@ -48,7 +48,7 @@ test('点击换行后 pre 有 whitespace-pre-wrap，再点取消，并写入 loc
 })
 
 // OCV5-421: 历史里的长代码块默认折叠(展开按钮给出行数);流式中挂载的不折叠,结束时不跳动。
-test('超过 40 行的历史代码块默认折叠,点「展开全部」后完整显示', () => {
+test('超过 40 行的历史代码块默认折叠,点「展开全部」后完整显示并可在顶栏再次收起', () => {
   const code = Array.from({ length: 120 }, (_, i) => `line ${i}`).join('\n')
   render(<CodeBlock language="ts" lineCount={120}>{code}</CodeBlock>)
   const pre = document.querySelector('pre')!
@@ -56,6 +56,9 @@ test('超过 40 行的历史代码块默认折叠,点「展开全部」后完整
   fireEvent.click(screen.getByRole('button', { name: /展开全部（120 行）/ }))
   expect(pre).not.toHaveAttribute('data-code-collapsed')
   expect(screen.queryByRole('button', { name: /展开全部/ })).toBeNull()
+  const collapseBtn = screen.getByRole('button', { name: '收起代码块' })
+  fireEvent.click(collapseBtn)
+  expect(pre).toHaveAttribute('data-code-collapsed', 'true')
 })
 
 test('流式中挂载的长代码块不折叠,生成结束后也保持展开', () => {
@@ -93,4 +96,17 @@ test('表头 sticky,外壳用 overflow-clip(不建滚动容器,sticky 才能生�
   const header = screen.getByRole('button', { name: '复制' }).closest('div.sticky')
   expect(header).not.toBeNull()
   expect(header!.parentElement!.className).toContain('overflow-clip')
+})
+
+test('OCV5-838: 复制按钮定宽防抖且成功图标挂 .oc-check-pop，窄屏隐藏换行文字', async () => {
+  const writeText = vi.fn().mockResolvedValue(undefined)
+  Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+  render(<CodeBlock language="ts">const ok = true;</CodeBlock>)
+  const copyBtn = screen.getByRole('button', { name: '复制' })
+  expect(copyBtn).toHaveClass('min-w-[4.5rem]')
+  const wrapBtn = screen.getByRole('button', { name: '换行' })
+  expect(wrapBtn.querySelector('span')).toHaveClass('hidden', 'sm:inline')
+  fireEvent.click(copyBtn)
+  await waitFor(() => expect(copyBtn).toHaveTextContent('已复制'))
+  expect(copyBtn.querySelector('svg')).toHaveClass('oc-check-pop')
 })

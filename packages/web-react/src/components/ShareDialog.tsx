@@ -209,31 +209,38 @@ export function ShareDialog({
     <Modal
       open={open}
       onOpenChange={onOpenChange}
-      title="分享会话"
+      title={
+        <span className="flex items-center gap-2.5">
+          <span className="oc-icon-badge oc-icon-badge-accent h-7 w-7 rounded-sm" aria-hidden>
+            <Share2 size={14} strokeWidth={1.75} />
+          </span>
+          <span>分享会话</span>
+        </span>
+      }
       description="生成一张长图，发到微信、群聊或朋友圈都能直接看。只包含提问和最终回答，不含工具与思考过程。"
       size="md"
       mobile="sheet"
       footer={
         <>
           <Button variant="secondary" onClick={() => void copyText()} disabled={!text}>
-            <Copy size={16} />
+            <Copy size={15} strokeWidth={1.75} />
             复制文字
           </Button>
           {imageActions && canCopyImage() && (
             <Button variant="secondary" onClick={() => void copyImage()} disabled={card.state !== "ready"}>
-              <ImageIcon size={16} />
+              <ImageIcon size={15} strokeWidth={1.75} />
               复制图片
             </Button>
           )}
           {imageActions && (
             <Button variant={shareable ? "secondary" : "primary"} onClick={save} disabled={card.state !== "ready"}>
-              <Download size={16} />
+              <Download size={15} strokeWidth={1.75} />
               保存图片
             </Button>
           )}
           {shareable && (
             <Button variant="primary" onClick={() => void share()}>
-              <Share2 size={16} />
+              <Share2 size={15} strokeWidth={1.75} />
               分享…
             </Button>
           )}
@@ -242,15 +249,19 @@ export function ShareDialog({
     >
       <div data-share-body className="flex flex-col gap-3">
         <SegmentedControl aria-label="分享范围" size="sm" value={range} onValueChange={setRange} options={RANGE_OPTIONS} />
-        {liveTurnSkipped && <p className="text-meta text-muted">这一轮还在生成，分享内容不含进行中的回答。</p>}
+        {liveTurnSkipped && (
+          <p className="oc-callout oc-callout-info rounded-xl px-3 py-2 text-meta text-muted">
+            这一轮还在生成，分享内容不含进行中的回答。
+          </p>
+        )}
         {env.inApp && card.state === "ready" && (
-          <p data-share-hint className="rounded-md bg-hover px-3 py-2 text-center text-body font-medium text-fg">
+          <p data-share-hint className="oc-callout oc-callout-info rounded-xl px-3.5 py-2.5 text-center text-body font-medium text-fg">
             {env.touch ? "长按下方图片，选择「保存图片」或「发送给朋友」" : "在图片上点右键，可以另存或复制"}
           </p>
         )}
         <div
           data-share-preview
-          className="flex max-h-[min(55dvh,32rem)] min-h-40 justify-center overflow-y-auto rounded-lg border border-border bg-hover p-3"
+          className="oc-surface-recessed flex max-h-[min(55dvh,32rem)] min-h-44 justify-center overflow-y-auto rounded-2xl p-4"
         >
           {card.state === "rendering" && (
             <div className="flex items-center gap-2 self-center text-meta text-muted">
@@ -263,7 +274,7 @@ export function ShareDialog({
             <p className="self-center text-center text-meta text-muted">当前浏览器无法生成图片，可以复制文字分享。</p>
           )}
           {card.state === "ready" && (
-            <img src={card.url} alt="分享长图预览" className="h-auto w-full max-w-sm self-start rounded-md shadow-soft" />
+            <img src={card.url} alt="分享长图预览" className="oc-surface-card h-auto w-full max-w-sm self-start rounded-xl" />
           )}
         </div>
         <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
@@ -271,9 +282,9 @@ export function ShareDialog({
           <button
             type="button"
             onClick={() => void handleExportMarkdown()}
-            className="inline-flex min-h-11 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-1 text-meta text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            className="oc-btn-tactile inline-flex min-h-9 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-2 text-meta text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
           >
-            <FileDown size={14} />
+            <FileDown size={14} strokeWidth={1.75} />
             导出 Markdown
           </button>
         </div>

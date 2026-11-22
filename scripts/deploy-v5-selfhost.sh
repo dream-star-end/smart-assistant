@@ -184,9 +184,9 @@ die() {
   exit 1
 }
 
-# shellcheck source=scripts/v5-selfhost-master-release-lib.sh
 # shellcheck disable=SC1091
 source "$MASTER_RELEASE_LIB"
+source "$SCRIPT_DIR/v5-selfhost-dual-slot-lib.sh"       # OCV5-854: dual-slot master + tiered idle gate
 source "$SCRIPT_DIR/lib/v5-selfhost-prewarm.sh"
 source "$SCRIPT_DIR/lib/v5-selfhost-runtime-build.sh"
 # shellcheck source=lib/v5-selfhost-env.sh
@@ -1831,7 +1831,7 @@ egress_slot_flip_then_master_restart() {
   # The generic saga still calls restart after an extra-revert error. Fail closed
   # here, before either service effect, unless the two-key receipt proves safety.
   cc5_activation_restart_guard || return "$?"
-  egress_slot_flip && systemctl restart "$V5_UNIT"
+  egress_slot_flip && selfhost_master_restart_or_flip
 }
 
 # 当前对外服务的 egress 描述(status / 日志用)。
@@ -2898,11 +2898,8 @@ cmd_cutover() {
   if [[ -L "$MASTER_LIVE_LINK" ]]; then
     live_now="$(readlink -f "$MASTER_LIVE_LINK" || true)"
   fi
-  if [[ -n "$live_now" ]]; then
-    prev_val="$live_now"
-  else
-    prev_val="none"
-  fi
+  if [[ -n "$live_now" ]]; then prev_val="$live_now"; else prev_val="none"; fi
+  CUTOVER_PREV_LIVE="$prev_val"
 
   tsum_mark E3.prep 2>/dev/null || :
   if release_policy_enabled && [[ "$DRY" != 1 ]]; then
@@ -2933,7 +2930,7 @@ cmd_cutover() {
     cutover_clog "  .prev-release=$prev_val"
   fi
   tsum_mark E3.wait-idle 2>/dev/null || :
-  if declare -F remote_v4_cutover_drain >/dev/null 2>&1; then remote_v4_cutover_drain || return 1; fi; cutover_wait_for_user_idle || return 1
+  if [[ "$DRY" == 1 ]] || ! selfhost_master_dual_slot_active; then if declare -F remote_v4_cutover_drain >/dev/null 2>&1; then remote_v4_cutover_drain || return 1; fi; cutover_wait_for_user_idle || return 1; fi
   # 第一次覆盖 installed unit 之前:明确 phase/mutated,并武装 survivor。
   if [[ "$DRY" != 1 ]]; then
     cutover_persist_phase "pre-install"
@@ -2980,9 +2977,9 @@ cmd_cutover() {
     esac
     cutover_persist_phase_or_compensate "units-partial" "units-partial" || return $?
     release_policy_guard_owner || return 86
-    if ! install_unit "$unit_snap/$V5_UNIT"; then
-      cutover_compensate "install-master-unit"
-      return $?
+    if ! install_unit "$unit_snap/$V5_UNIT"; then cutover_compensate "install-master-unit"; return $?; fi
+    if selfhost_master_dual_slot_active || [[ "${OC_SELFHOST_ENABLE_DUAL_SLOT_MIGRATE:-0}" == "1" ]]; then
+      install_selfhost_dual_slot_units /etc/systemd/system || { cutover_compensate "install-dual-slot-units"; return $?; }
     fi
     cutover_persist_phase_or_compensate "units-installed" "units-installed" || return $?
     release_policy_guard_owner || return 86
@@ -3056,6 +3053,7 @@ cmd_cutover() {
               fi ;;
           esac
         fi
+        if [[ "$joint_rc" == 79 ]]; then cutover_clog "  ✗ dual-slot recovery_required(rc=79);禁止外层补偿覆写"; return 79; fi
         cutover_compensate "joint-activate"
         return $?
       fi
@@ -3071,10 +3069,10 @@ cmd_cutover() {
     if [[ "$DRY" == 1 ]]; then
       cutover_clog "  [dry-run] $(egress_then_master_restart_cmd) (当前 egress 拓扑: $(egress_describe_topology))"
     else
-      if ! eval "$(egress_then_master_restart_cmd)"; then
-        cutover_compensate "restart"
-        return $?
-      fi
+      local restart_rc=0
+      eval "$(egress_then_master_restart_cmd)" || restart_rc=$?
+      if [[ "$restart_rc" == 79 ]]; then cutover_clog "  ✗ dual-slot recovery_required(rc=79);禁止外层补偿覆写"; return 79; fi
+      if [[ "$restart_rc" != 0 ]]; then cutover_compensate "restart"; return $?; fi
       cutover_persist_phase_or_compensate "restarted" "restarted" || return $?
     fi
 

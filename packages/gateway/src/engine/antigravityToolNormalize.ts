@@ -16,9 +16,12 @@
 const PRODUCT_NAMES: Record<string, string> = {
   run_command: 'Bash',
   view_file: 'Read',
+  read_file: 'Read',
   write_to_file: 'Write',
+  write_file: 'Write',
   replace_file_content: 'Edit',
   multi_replace_file_content: 'Edit',
+  edit_file: 'Edit',
   sed_file: 'Edit',
   grep_search: 'Grep',
   find_by_name: 'Glob',
@@ -26,6 +29,11 @@ const PRODUCT_NAMES: Record<string, string> = {
   read_url_content: 'WebFetch',
   search_web: 'WebSearch',
   notebook_edit: 'NotebookEdit',
+  // Antigravity 1.5.8 native swarm tools (OCV5-809).
+  swarm: 'SwarmManage',
+  post_message: 'SwarmPost',
+  read_board: 'SwarmReadBoard',
+  swarm_wait: 'SwarmWait',
 }
 
 /** Only keys whose declarations were captured on the wire. Tools that appear
@@ -34,8 +42,11 @@ const PRODUCT_NAMES: Record<string, string> = {
 const INPUT_KEYS: Record<string, Record<string, string>> = {
   run_command: { CommandLine: 'command', Cwd: 'cwd' },
   view_file: { AbsolutePath: 'file_path', StartLine: 'offset', EndLine: 'end_line' },
+  read_file: { Path: 'file_path', StartLine: 'offset', EndLine: 'end_line' },
   write_to_file: { TargetFile: 'file_path', CodeContent: 'content' },
+  write_file: { Path: 'file_path', Content: 'content' },
   replace_file_content: { TargetFile: 'file_path', TargetContent: 'old_string', ReplacementContent: 'new_string' },
+  edit_file: { Path: 'file_path', Target: 'old_string', Replacement: 'new_string' },
   read_url_content: { Url: 'url' },
   search_web: { query: 'query', domain: 'domain' },
 }
@@ -103,12 +114,44 @@ export function antigravityProductToolInput(nativeName: string, input: unknown):
   return out
 }
 
-export function antigravityToolOutput(raw: unknown): string {
+export function antigravityToolOutput(raw: unknown, nativeName?: string): string {
   if (raw === undefined || raw === null) return ''
-  if (typeof raw === 'string') return raw.replace(/\r\n/g, '\n')
-  try {
-    return JSON.stringify(raw)
-  } catch {
-    return String(raw)
+  let text: string
+  if (typeof raw === 'string') {
+    text = raw.replace(/\r\n/g, '\n')
+  } else {
+    try {
+      text = JSON.stringify(raw)
+    } catch {
+      text = String(raw)
+    }
   }
+  if (nativeName === 'swarm') {
+    return sanitizeSwarmToolOutput(text)
+  }
+  return text
+}
+
+/** Strip local CLI `open_board` URLs/commands from swarm tool output because OpenClaude
+ * renders the live Swarm Board natively in the web UI (OCV5-809). */
+export function sanitizeSwarmToolOutput(text: string): string {
+  const trimmed = text.trim()
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    try {
+      const parsed = JSON.parse(trimmed) as unknown
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const copy = { ...(parsed as Record<string, unknown>) }
+        if ('open_board' in copy) {
+          delete copy.open_board
+          return JSON.stringify(copy)
+        }
+      }
+    } catch {
+      // Fall through to text cleanup.
+    }
+  }
+  return text
+    .replace(/^\s*open_board\s*[:=].*$/gim, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
 }

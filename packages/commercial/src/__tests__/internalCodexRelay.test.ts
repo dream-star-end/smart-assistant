@@ -794,6 +794,162 @@ describe('internalCodexRelay 遥测辅助路径 fail-closed(nit2)', () => {
       }
     }
   })
+
+  test('OCV5-825: Codex CLI 0.170.0 新增 5 条辅助路径快速返回轻量本地响应，不打上游、不刷 codex_relay_path_rejected', async () => {
+    const cases: Array<{ method: string; path: string; expectedStatus: number }> = [
+      { method: 'GET', path: `${CODEX_RELAY_PREFIX}/backend-api/codex/ps/plugins/suggested/codex`, expectedStatus: 200 },
+      { method: 'GET', path: `${CODEX_RELAY_PREFIX}/backend-api/codex/ps/plugins/installed`, expectedStatus: 200 },
+      { method: 'POST', path: `${CODEX_RELAY_PREFIX}/backend-api/codex/ps/mcp`, expectedStatus: 200 },
+      { method: 'GET', path: `${CODEX_RELAY_PREFIX}/backend-api/codex/wham/accounts/check`, expectedStatus: 200 },
+      { method: 'GET', path: `${CODEX_RELAY_PREFIX}/backend-api/codex/wham/settings/user`, expectedStatus: 200 },
+    ]
+    for (const { method, path, expectedStatus } of cases) {
+      let fetchCalls = 0
+      let dispatcherCalls = 0
+      const warns: string[] = []
+      const fakeLogger = {
+        child() { return this },
+        info() {},
+        debug() {},
+        error() {},
+        warn(msg: string) { warns.push(msg) },
+      }
+      const handler = makeCodexRelayHandler({
+        identityRepo: makeRepo(),
+        db: makeDb(),
+        logger: fakeLogger as any,
+        resolveDispatcher: async (accountId) => {
+          dispatcherCalls += 1
+          return { accountId, proxyId: 4n, dispatcher: DISPATCHER }
+        },
+        readBoundAccountAccessToken: async () => { throw new Error('must not read token for benign aux stub') },
+        fetchImpl: (async () => { fetchCalls += 1; return new Response('nope', { status: 200 }) }) as typeof fetch,
+      })
+      const server = createServer((req, res) => { void handler(req, res, CTX) })
+      const port = await listen(server)
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+          method,
+          headers: { Authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+          body: method === 'GET' ? undefined : '{"jsonrpc":"2.0","id":1,"method":"initialize"}',
+        })
+        assert.equal(res.status, expectedStatus, `${method} ${path}`)
+        const text = await res.text()
+        assert.doesNotThrow(() => JSON.parse(text), `${method} ${path} should return valid JSON`)
+        assert.equal(fetchCalls, 0, `${method} ${path}: 绝不打上游`)
+        assert.equal(dispatcherCalls, 0, `${method} ${path}: 绝不解析代理 dispatcher`)
+        assert.deepEqual(warns, [], `${method} ${path}: 不再产生 codex_relay_path_rejected 告警噪声`)
+      } finally {
+        await close(server)
+      }
+    }
+  })
+
+  test('OCV5-825 (B6): 未授权或非 active 容器访问 5 条 Codex 0.170.0 辅助路径 → 401/409 拒绝，绝不绕开身份校验返回 200 stub', async () => {
+    const stubPaths: Array<{ method: string; path: string }> = [
+      { method: 'GET', path: `${CODEX_RELAY_PREFIX}/backend-api/codex/ps/plugins/suggested/codex` },
+      { method: 'GET', path: `${CODEX_RELAY_PREFIX}/backend-api/codex/ps/plugins/installed` },
+      { method: 'POST', path: `${CODEX_RELAY_PREFIX}/backend-api/codex/ps/mcp` },
+      { method: 'GET', path: `${CODEX_RELAY_PREFIX}/backend-api/codex/wham/accounts/check` },
+      { method: 'GET', path: `${CODEX_RELAY_PREFIX}/backend-api/codex/wham/settings/user` },
+    ]
+    for (const { method, path } of stubPaths) {
+      const handler = makeCodexRelayHandler({
+        identityRepo: makeRepo(),
+        db: makeDb(),
+        fetchImpl: (async () => { throw new Error('must not call upstream') }) as typeof fetch,
+      })
+      const server = createServer((req, res) => { void handler(req, res, CTX) })
+      const port = await listen(server)
+      try {
+        // Missing/invalid Authorization → 401 UNAUTHORIZED
+        const unauth = await fetch(`http://127.0.0.1:${port}${path}`, {
+          method,
+          headers: { Authorization: 'Bearer oc-v3.11.wrongsecret' },
+          body: method === 'GET' ? undefined : '{}',
+        })
+        assert.equal(unauth.status, 401, `unauthenticated ${method} ${path} must return 401`)
+        await unauth.text()
+      } finally {
+        await close(server)
+      }
+    }
+
+    // Valid token but inactive/vanished container binding → 409 CONTAINER_BINDING_CHANGED
+    const inactiveHandler = makeCodexRelayHandler({
+      identityRepo: makeRepo(),
+      db: makeDb({ state: 'vanished' }),
+      fetchImpl: (async () => { throw new Error('must not call upstream') }) as typeof fetch,
+    })
+    const inactiveServer = createServer((req, res) => { void inactiveHandler(req, res, CTX) })
+    const inactivePort = await listen(inactiveServer)
+    try {
+      const res = await fetch(`http://127.0.0.1:${inactivePort}${CODEX_RELAY_PREFIX}/backend-api/codex/ps/plugins/installed`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${TOKEN}` },
+      })
+      assert.equal(res.status, 409, 'inactive container binding must not receive 200 stub')
+      await res.text()
+    } finally {
+      await close(inactiveServer)
+    }
+
+    // Valid token but userId mismatch on binding → 401 UNAUTHORIZED
+    const mismatchHandler = makeCodexRelayHandler({
+      identityRepo: makeRepo(),
+      db: makeDb({ userId: 999n }),
+      fetchImpl: (async () => { throw new Error('must not call upstream') }) as typeof fetch,
+    })
+    const mismatchServer = createServer((req, res) => { void mismatchHandler(req, res, CTX) })
+    const mismatchPort = await listen(mismatchServer)
+    try {
+      const res = await fetch(`http://127.0.0.1:${mismatchPort}${CODEX_RELAY_PREFIX}/backend-api/codex/wham/settings/user`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${TOKEN}` },
+      })
+      assert.equal(res.status, 401, 'uid mismatch binding must not receive 200 stub')
+      await res.text()
+    } finally {
+      await close(mismatchServer)
+    }
+  })
+
+  test('OCV5-825: 辅助路径变体/非允许方法/路径穿越仍 fail-closed 拒绝', async () => {
+    const badCases: Array<{ method: string; path: string; expectedStatus: number }> = [
+      { method: 'POST', path: `${CODEX_RELAY_PREFIX}/backend-api/codex/wham/settings/user`, expectedStatus: 404 },
+      { method: 'GET', path: `${CODEX_RELAY_PREFIX}/backend-api/codex/ps/plugins/installed/extra`, expectedStatus: 404 },
+      { method: 'GET', path: `${CODEX_RELAY_PREFIX}/backend-api/codex/ps/%252e%252e/mcp`, expectedStatus: 404 },
+    ]
+    for (const { method, path, expectedStatus } of badCases) {
+      const handler = makeCodexRelayHandler({
+        identityRepo: makeRepo(),
+        db: makeDb(),
+        fetchImpl: (async () => { throw new Error('must not call upstream') }) as typeof fetch,
+      })
+      const server = createServer((req, res) => { void handler(req, res, CTX) })
+      const port = await listen(server)
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+          method,
+          headers: { Authorization: `Bearer ${TOKEN}` },
+          body: method === 'GET' ? undefined : '{}',
+        })
+        assert.equal(res.status, expectedStatus, `${method} ${path}`)
+        await res.text()
+      } finally {
+        await close(server)
+      }
+    }
+    // Raw un-normalized dot-segment traversals are rejected BEFORE URL normalization with 400 BAD_PATH.
+    for (const traversalUrl of [
+      `${CODEX_RELAY_PREFIX}/backend-api/codex/ps/../ps/mcp`,
+      `${CODEX_RELAY_PREFIX}/backend-api/codex/ps/%2e%2e/ps/mcp`,
+      `${CODEX_RELAY_PREFIX}/backend-api/codex/ps/%2e%2e%2fmcp`,
+    ]) {
+      const mapped = mapCodexRelayUrlMulti(traversalUrl, 'POST', resolveCodexRelayUpstreamBases('https://api.openai.com/v1'))
+      assert.ok('error' in mapped && mapped.error.status === 400 && mapped.error.code === 'BAD_PATH', `expected 400 BAD_PATH for ${traversalUrl}`)
+    }
+  })
 })
 
 describe('relayErrorShape (OCV5-365)', () => {

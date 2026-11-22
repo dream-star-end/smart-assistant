@@ -36,11 +36,16 @@ describe("DropdownMenu short-viewport height cap (OCV5-778)", () => {
     const subMenu = screen.getByTestId("sub-menu");
 
     for (const menu of [mainMenu, subMenu]) {
-      expect(menu.className).toContain("max-h-[var(--radix-dropdown-menu-content-available-height)]");
+      expect(menu.className).toContain("oc-dropdown-max-h");
+      expect(menu.className).toContain(
+        "max-h-[min(80dvh,var(--radix-dropdown-menu-content-available-height))]",
+      );
       expect(menu.className).toContain("overflow-y-auto");
       expect(menu.className).toContain("overflow-x-hidden");
       expect(menu.className).toContain("overscroll-contain");
       expect(menu.className).not.toContain("overflow-hidden");
+      expect(menu.className).toContain("origin-[var(--radix-popper-transform-origin)]");
+      expect(menu.className).toContain("data-[state=closed]:oc-pop-out");
     }
   });
 
@@ -58,7 +63,10 @@ describe("DropdownMenu short-viewport height cap (OCV5-778)", () => {
 
     const menu = screen.getByTestId("model-menu");
     expect(menu.className).toContain("max-h-[80vh]");
-    expect(menu.className).not.toContain("max-h-[var(--radix-dropdown-menu-content-available-height)]");
+    expect(menu.className).not.toContain("oc-dropdown-max-h");
+    expect(menu.className).not.toContain(
+      "max-h-[min(80dvh,var(--radix-dropdown-menu-content-available-height))]",
+    );
     expect(menu.className).toContain("overflow-hidden");
   });
 });

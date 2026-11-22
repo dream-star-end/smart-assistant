@@ -7,6 +7,97 @@ import { recordProductFrictionEvent } from "../productFriction/events.js";
 export type FirstVisibleKind = "thinking" | "text" | "tool" | "agent" | "other";
 export type ResponseMilestoneKind = "thinking" | "text";
 
+export type TelemetryBrowserFamily =
+  | "edge"
+  | "firefox"
+  | "chrome_ios"
+  | "chrome"
+  | "safari"
+  | "other";
+
+export type TelemetryDeviceClass = "desktop" | "mobile" | "tablet" | "unknown";
+
+export type ClientTelemetryContext = {
+  browserFamily: TelemetryBrowserFamily | null;
+  deviceClass: TelemetryDeviceClass | null;
+};
+
+const MAX_USER_AGENT_PARSE_CHARS = 512;
+
+const TELEMETRY_BROWSER_FAMILIES: ReadonlySet<string> = new Set<TelemetryBrowserFamily>([
+  "edge",
+  "firefox",
+  "chrome_ios",
+  "chrome",
+  "safari",
+  "other",
+]);
+
+const TELEMETRY_DEVICE_CLASSES: ReadonlySet<string> = new Set<TelemetryDeviceClass>([
+  "desktop",
+  "mobile",
+  "tablet",
+  "unknown",
+]);
+
+function sanitizeBrowserFamily(value: unknown): TelemetryBrowserFamily | null {
+  return typeof value === "string" && TELEMETRY_BROWSER_FAMILIES.has(value)
+    ? value as TelemetryBrowserFamily
+    : null;
+}
+
+function sanitizeDeviceClass(value: unknown): TelemetryDeviceClass | null {
+  return typeof value === "string" && TELEMETRY_DEVICE_CLASSES.has(value)
+    ? value as TelemetryDeviceClass
+    : null;
+}
+
+/**
+ * Reduce an HTTP User-Agent header to the closed browser_family / device_class
+ * allowlists used by product_friction_events (OCV5-40).
+ *
+ * Bounded to MAX_USER_AGENT_PARSE_CHARS before inspection and never returns
+ * raw header substrings so no PII or version fingerprints can leak into storage.
+ * Absent/empty headers yield null/null to preserve backward compatibility.
+ */
+export function parseClientTelemetryFromUserAgent(userAgent: unknown): ClientTelemetryContext {
+  const raw = typeof userAgent === "string"
+    ? userAgent
+    : Array.isArray(userAgent) && typeof userAgent[0] === "string"
+      ? userAgent[0]
+      : "";
+  const bounded = raw.slice(0, MAX_USER_AGENT_PARSE_CHARS).trim();
+  if (bounded.length === 0) {
+    return { browserFamily: null, deviceClass: null };
+  }
+
+  // Keep browser_family classification identical to packages/web-react/src/lib/clientFriction.ts
+  // (`browserFamily()`) so server FIRST_TEXT_FRAME/FIRST_THINKING_FRAME and client
+  // FIRST_TEXT_PAINT bucket every User-Agent identically.
+  // Note: server device_class is UA-derived because the WS HTTP upgrade has no
+  // viewport width, whereas client FIRST_TEXT_PAINT derives device_class via matchMedia.
+  let browserFamily: TelemetryBrowserFamily = "other";
+  if (/Edg\//.test(bounded)) browserFamily = "edge";
+  else if (/Firefox\//.test(bounded)) browserFamily = "firefox";
+  else if (/CriOS\//.test(bounded)) browserFamily = "chrome_ios";
+  else if (/Chrome\//.test(bounded)) browserFamily = "chrome";
+  else if (/Safari\//.test(bounded)) browserFamily = "safari";
+
+  let deviceClass: TelemetryDeviceClass = "unknown";
+  if (
+    /\biPad\b|\bTablet\b|\bPlayBook\b|\bSilk\b/i.test(bounded) ||
+    (/\bAndroid\b/i.test(bounded) && !/\bMobile\b/i.test(bounded))
+  ) {
+    deviceClass = "tablet";
+  } else if (/\biPhone\b|\biPod\b|\bMobile\b|\bAndroid\b|\bWindows Phone\b/i.test(bounded)) {
+    deviceClass = "mobile";
+  } else if (/\bWindows NT\b|\bMacintosh\b|\bMac OS X\b|\bX11\b|\bLinux\b|\bCrOS\b/i.test(bounded)) {
+    deviceClass = "desktop";
+  }
+
+  return { browserFamily, deviceClass };
+}
+
 export type ResponseVisibilityMilestones = {
   traceId: string;
   sessionId: string | null;
@@ -53,6 +144,8 @@ type ResponseMilestoneStart = {
   sessionId: string;
   model: string | null;
   userId: bigint;
+  browserFamily: TelemetryBrowserFamily | null;
+  deviceClass: TelemetryDeviceClass | null;
   seen: Partial<Record<ResponseMilestoneKind, true>>;
 };
 
@@ -66,6 +159,8 @@ export function recordTurnResponseMilestone(
     userId: bigint;
     kind: ResponseMilestoneKind;
     latencyMs: number;
+    browserFamily?: TelemetryBrowserFamily | null;
+    deviceClass?: TelemetryDeviceClass | null;
   },
 ): void {
   if (
@@ -84,6 +179,8 @@ export function recordTurnResponseMilestone(
     outcome: "succeeded",
     latencyMs: Math.max(0, Math.trunc(input.latencyMs)),
     model: input.model,
+    browserFamily: sanitizeBrowserFamily(input.browserFamily),
+    deviceClass: sanitizeDeviceClass(input.deviceClass),
     traceId: input.traceId,
     sessionId: input.sessionId,
   }, pool as unknown as QueryRunner).catch((err) => {
@@ -95,8 +192,17 @@ export function recordTurnResponseMilestone(
  * inbound turns, so outbound fan-out to other tabs cannot forge a latency. */
 export class TurnResponseMilestoneTracker {
   private readonly starts = new Map<string, ResponseMilestoneStart>();
+  private readonly defaultClientTelemetry: ClientTelemetryContext;
 
-  constructor(private readonly maxEntries = 512) {}
+  constructor(
+    private readonly maxEntries = 512,
+    defaultClientTelemetry?: Partial<ClientTelemetryContext>,
+  ) {
+    this.defaultClientTelemetry = {
+      browserFamily: sanitizeBrowserFamily(defaultClientTelemetry?.browserFamily),
+      deviceClass: sanitizeDeviceClass(defaultClientTelemetry?.deviceClass),
+    };
+  }
 
   begin(input: {
     traceId: string;
@@ -104,6 +210,8 @@ export class TurnResponseMilestoneTracker {
     model: string | null;
     userId: bigint;
     startedAtMs: number;
+    browserFamily?: TelemetryBrowserFamily | null;
+    deviceClass?: TelemetryDeviceClass | null;
   }): void {
     if (
       !/^[0-9a-f]{32}$/.test(input.traceId) ||
@@ -114,11 +222,19 @@ export class TurnResponseMilestoneTracker {
       const oldest = this.starts.keys().next().value as string | undefined;
       if (oldest) this.starts.delete(oldest);
     }
+    const browserFamily = input.browserFamily !== undefined
+      ? sanitizeBrowserFamily(input.browserFamily)
+      : this.defaultClientTelemetry.browserFamily;
+    const deviceClass = input.deviceClass !== undefined
+      ? sanitizeDeviceClass(input.deviceClass)
+      : this.defaultClientTelemetry.deviceClass;
     this.starts.set(input.traceId, {
       startedAtMs: input.startedAtMs,
       sessionId: input.sessionId,
       model: input.model,
       userId: input.userId,
+      browserFamily,
+      deviceClass,
       seen: {},
     });
   }
@@ -144,6 +260,8 @@ export class TurnResponseMilestoneTracker {
         userId: start.userId,
         kind,
         latencyMs: observedAtMs - start.startedAtMs,
+        browserFamily: start.browserFamily,
+        deviceClass: start.deviceClass,
       });
     };
     if (milestones.hasThinking) record("thinking");

@@ -1,27 +1,47 @@
+import { createCommercialProbeDeps, createCommercialShutdown } from "./bootstrap/shutdownBootstrap.js";
+import {
+  buildCronWakeSchedulerOptions,
+  buildTapeJobSchedulerSetup,
+  buildTurnDispatchReconcilerConfig,
+  recordRecoveryJobTerminalFriction,
+  wireTapeSchedulerKick,
+} from "./bootstrap/v5WorkersBootstrap.js";
+import { createCodexBindingHandle, createCommercialUserChatBridge } from "./bootstrap/chatBridgeBootstrap.js";
+import {
+  buildQqBotServiceAndReceivers,
+  buildWechatBrokerDeps,
+  createAutoDreamOptimizerRuntime,
+  createCommercialCodexAndWechatTurns,
+} from "./bootstrap/channelsAndAutoDreamBootstrap.js";
+import { createCommercialPendingDecisionsRuntime } from "./bootstrap/pendingDecisionsBootstrap.js";
+import {
+  assembleV3SupervisorCore,
+  bootstrapMailerBridgeAndAuthority,
+  bootstrapPluginsRuntime,
+  buildContainerHelpersAndPreview,
+  createGrokRelayRouteAllocator,
+  createOptionalContainerPreviewBridge,
+  createOptionalDirectContainerPreview,
+  wireRemoteMuxDeps,
+} from "./bootstrap/runtimeSupervisorBootstrap.js";
+import {
+  bootstrapExternalApiKeyProxy,
+  bootstrapExternalMtlsListener,
+  bootstrapInternalProxyAndListeners,
+} from "./bootstrap/internalProxyBootstrap.js";
 import { createBoxFailureDiagnostics } from "./http/proxy/boxFailureDiagnostic.js";
-import { resolveContainerLinkEndpoint } from "./ws/containerLinkEndpoint.js";
-import { createUnattestedContainerRecycler } from "./ws/recycleUnattestedContainer.js";
 import { containerLinkEnabled } from "./ws/containerLinkPolicy.js";
-import { recoveryDecisionFrame } from './ws/recoveryPresentation.js';
 import { configurePluginCatalog } from './plugins/catalogPolicy.js';
-import { configureModelAvailability, isModelAvailable } from './billing/modelAvailability.js';
-import { makeSystemRuntimeStatusRead } from './system-assistant/runtimeStatusRead.js'
-import { makeCcbTranscriptRestoreHandler, CCB_TRANSCRIPT_RESTORE_PATH } from './http/internalCcbTranscriptRestore.js';
-import { makeCcbTranscriptRestoreReader } from './db/ccbTranscriptRestoreReader.js';
-import { assembleSystemActions, type SystemSessionReadBackend } from './system-assistant/assemble.js'
-import { INTERNAL_SYSTEM_ACTIONS_PATH } from './system-assistant/internalHttp.js'
-import { makePromptPrivacySupportResolver } from './user/promptPrivacySupport.js'
-import { getV3ContainerStatus } from './agent-sandbox/v3supervisor.js'
-import { makeDraftPreparation, makePreparationReady, type DraftPreparationHint } from './agent-sandbox/draftPreparation.js';
-import { makeEnginePreheatPreparation, makeDraftEnginePreparation } from './dispatch/enginePreheatPreparation.js';
-import { makeWorkspacePreparation } from './agent-sandbox/workspacePreparation.js';
-import { isInMaintenance } from './middleware/maintenanceMode.js';
-import { HttpError, sendJson } from './http/util.js';
+import { configureModelAvailability } from './billing/modelAvailability.js';
+import { makeSystemRuntimeStatusRead } from './system-assistant/runtimeStatusRead.js';
+import { assembleSystemActions, type SystemSessionReadBackend } from './system-assistant/assemble.js';
+import { makePromptPrivacySupportResolver } from './user/promptPrivacySupport.js';
+import { getV3ContainerStatus } from './agent-sandbox/v3supervisor.js';
 import { startLogTimingReporter } from './logging/logTimingReporter.js';
-import { setContentReviewAlerter, setContentReviewPrefilter } from '@openclaude/gateway'
-import { omniHardHit } from './openai/omniModeration.js'
-import { selectOpenAiPlatformKey } from './openai/openAiPlatformKey.js'
-import { alertContentReview } from './admin/contentReviewAlert.js'
+import { setContentReviewAlerter, setContentReviewPrefilter } from '@openclaude/gateway';
+import { omniHardHit } from './openai/omniModeration.js';
+import { selectOpenAiPlatformKey } from './openai/openAiPlatformKey.js';
+import { alertContentReview } from './admin/contentReviewAlert.js';
 /**
  * @openclaude/commercial — OpenClaude 商业化模块入口
  *
@@ -34,105 +54,59 @@ import { alertContentReview } from './admin/contentReviewAlert.js'
  *   - 实例化 HTTP 路由处理器,通过 result.handle 暴露给 gateway
  */
 
-import type { IncomingMessage } from "node:http";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
 // P3 双 master 蓝绿交接 + cohort 分批切流(RFC-v5-dual-master-cohort)。
 import type { Slot } from "./deploy/deployState.js";
 import { startDesiredWatch, type DesiredWatch } from "./deploy/deployState.js";
-import { createLeaderBundle, type LeaderBundle, type BundleMemberHandle } from "./deploy/leaderBundle.js";
+import { createLeaderBundle, type LeaderBundle } from "./deploy/leaderBundle.js";
 import {
   createLeaderLeaseController,
   resolveLeaderEnvEligibility,
   type LeaderLeaseController,
   type LeadershipStatus,
 } from "./deploy/leaderLease.js";
-import {
-  createControlListener,
-  privatePortForSlot,
-  type ControlListener,
-} from "./deploy/controlListener.js";
-import {
-  createSlotRelayClient,
-  handleSlotRelayRequest,
-  type SlotRelayLocal,
-} from "./deploy/slotRelay.js";
-import type { TLSSocket } from "node:tls";
+import { type ControlListener } from "./deploy/controlListener.js";
+import { createSlotRelayClient, type SlotRelayLocal } from "./deploy/slotRelay.js";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { isIPv4 } from "node:net";
-import type { Duplex } from "node:stream";
 import * as fs from "node:fs";
-import * as path from "node:path";
-import { homedir } from "node:os";
 import IORedis from "ioredis";
 import Docker from "dockerode";
 import { runMigrations } from "./db/migrate.js";
 import { assertFlavorIdentity } from "./flavor/assertFlavor.js";
-import { createMasterCc5Runtime, selectMasterCc5Backend } from "./agent-sandbox/cc5Runtime.js";
-import { createRemoteNativeTurnFinance, recoverRemoteNativeTurnBilling } from "./billing/remoteNativeTurnBilling.js";
-import {
-  cursorExternalApiOutboxDirForFlavor,
-  openCursorExternalApiOutbox,
-  type CursorExternalApiOutbox,
-} from "./billing/cursorExternalApiOutbox.js";
-import { closePool, createPool, getPool } from "./db/index.js";
+import { shouldStartCommercialScheduler } from "./flavor/commercialSchedulerPolicy.js";
+import { createMasterCc5Runtime } from "./agent-sandbox/cc5Runtime.js";
+import { recoverRemoteNativeTurnBilling } from "./billing/remoteNativeTurnBilling.js";
+import { cursorExternalApiOutboxDirForFlavor } from "./billing/cursorExternalApiOutbox.js";
+import { getPool } from "./db/index.js";
 import { reconcileBoxBillingBatch } from "./billing/boxBillingRecovery.js";
 import { BoxDurableJournal } from "./http/proxy/boxDurableJournal.js";
 import { createProductionBoxAccountResolver } from "./http/proxy/boxAccountResolver.js";
 import { BoxRemoteCleanupWorker } from "./http/proxy/boxRemoteCleanupWorker.js";
 import { BoxHoldRelease } from "./http/proxy/boxHoldRelease.js";
 import { createBoxReplayRecoveryWriter } from "./egress/boxReplaySetup.js";
-import {
-  assertModelCatalogAdminPoolConfigured,
-  closeModelCatalogAdminPool,
-} from "./db/modelCatalogAdmin.js";
 import { loadConfig, type CommercialConfig } from "./config.js";
-import { stubMailer, createResendMailer } from "./auth/mail.js";
 import { wrapIoredis } from "./middleware/rateLimit.js";
 import { CodexCommissioning } from "./account-pool/codexCommissioning.js";
 import { RemoteDriverV4CommissioningService, startRemoteDriverDriftScheduler } from "./account-pool/remotePool/index.js";
 import { makeAdminCommissionContainerSource } from "./account-pool/codexCommissioningContainer.js";
-import { createCommercialHandler, type CommercialHandler } from "./http/router.js";
-import { deriveMediaSignKey } from "./http/mediaSign.js";
-import { ThumbnailDiskCache } from "./http/mediaThumbnail.js";
-import { deriveWechatLiveLinkKey } from "./wechat/liveShare.js";
-import { loadKmsKey, zeroBuffer } from "./crypto/keys.js";
+import { createCommercialHandler } from "./http/router.js";
 import { rootLogger } from "./logging/logger.js";
 import { warmupLoginDummyHash } from "./auth/login.js";
 import { secretToKey } from "./auth/jwt.js";
-import { PricingCache, createModelHintProvider, type ModelPricing } from "./billing/pricing.js";
-import { applyTurnWaiver } from "./billing/refund.js";
-import { canUseModel } from "./billing/authzModels.js";
-import { ALLOWED_INBOUND_MODELS, setModelHintProvider, setLiteratureSkillProvider, setHostStaticProviderKeys } from "@openclaude/gateway";
+import { PricingCache, createModelHintProvider } from "./billing/pricing.js";
+import {
+  ALLOWED_INBOUND_MODELS,
+  setModelHintProvider,
+  setLiteratureSkillProvider,
+  setHostStaticProviderKeys,
+} from "@openclaude/gateway";
 import { setPlatformFlashFallbackKey } from "./http/proxy/shared.js";
-import { getPreferences, patchPreferences } from "./user/preferences.js";
-import {
-  getPhase6AccountUuidEnforce,
-  getSessionPinMode,
-} from "./admin/runtimeFlags.js";
 import { literatureSkillSlotProvider } from "./literatureSkill.js";
-import {
-  estimateMaxCost,
-  InsufficientCreditsError,
-  preCheckWithCost,
-  readTotalSpendableBalance,
-  releasePreCheck,
-  type ReservationHandle,
-  wrapIoredisForPreCheck,
-} from "./billing/preCheck.js";
+import { releasePreCheck, wrapIoredisForPreCheck } from "./billing/preCheck.js";
 import { createHttpHupijiaoClient, type HupijiaoClient, type HupijiaoConfig } from "./payment/hupijiao/client.js";
-import {
-  AccountScheduler,
-  AccountPoolBusyError,
-  AccountPoolUnavailableError,
-  ContainerStaleBindingError,
-  pickCodexAccountForBindingInTx,
-} from "./account-pool/scheduler.js";
-import {
-  commitCodexRebindInTx,
-  fetchSnapshotAndWriteContainerAuth,
-  type WriteAuthDeps,
-} from "./account-pool/codexLazyMigrate.js";
+import { AccountScheduler } from "./account-pool/scheduler.js";
 import {
   type CodexDisableFanoutDeps,
   type CodexDriftReconcilerHandle,
@@ -140,64 +114,20 @@ import {
   startCodexDisableDriftReconciler,
 } from "./account-pool/codexDisableFanout.js";
 import { AccountHealthTracker, wrapIoredisForHealth } from "./account-pool/health.js";
-import {
-  putRemoteCodexContainerAuth,
-  deleteRemoteCodexContainerAuth,
-} from "./codex-auth/remoteCodexAuth.js";
-import { tx } from "./db/queries.js";
-import { GoalStateService } from './goal/goalStateService.js'
-import { recordProductFrictionEvent } from "./productFriction/events.js";
-import {
-  startLifecycleScheduler,
-  type LifecycleScheduler,
-  type LifecycleLogger,
-} from "./agent/index.js";
+import { GoalStateService } from './goal/goalStateService.js';
+import { startLifecycleScheduler, type LifecycleScheduler, type LifecycleLogger } from "./agent/index.js";
 import type { AgentHttpDeps } from "./http/agent.js";
-import { startAlertScheduler, type AlertScheduler } from "./admin/alerts.js";
+import { startAlertScheduler } from "./admin/alerts.js";
 import { EVENTS as ALERT_EVENTS } from "./admin/alertEvents.js";
 import { safeEnqueueAlert } from "./admin/alertOutbox.js";
-import {
-  startRefreshEventsSweeper,
-  type SweeperHandle as RefreshEventsSweeperHandle,
-} from "./account-pool/refreshEventsSweeper.js";
-import {
-  startDesktopEnrollmentSweep,
-  createPgDesktopIdentityRepo,
-  handleDesktopTokenMint,
-  handleDesktopTokenRefresh,
-  desktopTokenRequestContext,
-} from "./http/desktopEnroll.js";
-import { handleDesktopRuntimeManifest } from "./http/desktopBootstrap.js";
-import { startDesktopTlsListener, makeDesktopRequestVerifier } from "./http/desktopTlsListener.js";
-import { makeDesktopIdentityStrategy } from "./auth/desktopIdentity.js";
-import { extractDesktopTlsContext } from "./desktop/tlsContext.js";
-import { makeDesktopContainerTransport } from "./wechat/desktopContainerTransport.js";
-import { resolveDispatchEndpoint } from "./dispatch/resolveDispatchEndpoint.js";
-import { getDesktopFlagSnapshot } from "./desktop/flags.js";
-import { ChatGptProxyCredentialStore } from "./chatgptProxy/credentials.js";
-import { getChatGptProxyFlagSnapshot, readChatGptProxyEnv } from "./chatgptProxy/flags.js";
-import { createChatGptProxyServer, type ChatGptProxyServer } from "./chatgptProxy/server.js";
-import type { ChatGptProxyHttpDeps } from "./http/chatgptProxy.js";
-import { getDesktopTunnelRegistry } from "./ws/desktopTunnelRegistry.js";
-import {
-  startAuditRetentionSweeper,
-  type AuditRetentionSweeperHandle,
-} from "./admin/auditRetention.js";
+import { startRefreshEventsSweeper } from "./account-pool/refreshEventsSweeper.js";
+import { startDesktopEnrollmentSweep } from "./http/desktopEnroll.js";
+import { startAuditRetentionSweeper } from "./admin/auditRetention.js";
 import { startGithubWorkspaceSweeper } from "./github/sessionWorkspaces.js";
 import { startImageUsageSweeper } from "./billing/imageBilling.js";
-import {
-  startCodexRefreshActor,
-  type CodexRefreshActorHandle,
-} from "./account-pool/codexAccountActor.js";
+import { startCodexRefreshActor, type CodexRefreshActorHandle } from "./account-pool/codexAccountActor.js";
 import { createAccountPoolAdapter } from "./account-pool/accountPoolAdapter.js";
-import {
-  apiKeyPoolConfiguredServices,
-  createApiKeyPoolAdapter,
-  createRelayKeyPoolAdapter,
-  importEnvApiKeys,
-  primeApiKeyPool,
-  startApiKeyPoolCache,
-} from "./account-pool/apiKeyPool.js";
+import { createApiKeyPoolAdapter, createRelayKeyPoolAdapter } from "./account-pool/apiKeyPool.js";
 import { createGeminiPoolAdapter } from "./account-pool/geminiPoolAdapter.js";
 import { registerRemoteBrainPoolAdapter } from "./account-pool/remoteBrainPool.js";
 import { registerPoolAdapter, startPoolRecoveryActor } from "./account-pool/policy/registry.js";
@@ -211,35 +141,21 @@ import { startGrokUsageSweeper } from "./account-pool/grokUsageSweeper.js";
 import {
   DEFAULT_V3_CODEX_CONTAINER_DIR,
   V3_CONTAINER_PORT,
-  stopAndRemoveV3Container,
   ocGatewayIpForChannel,
   ocInternalProxyPortForChannel,
 } from "./agent-sandbox/v3supervisor.js";
 import { AuthoritySigner } from "./ws/authoritySigner.js";
-import { ModelCatalogCache, PLATFORM_AUX_MODEL_IDS } from "./billing/modelCatalog.js";
-import { getRuntimeChannel } from "./runtimeChannel.js";
-import { activePoolWhere } from "./account-pool/poolCandidates.js";
+import { ModelCatalogCache } from "./billing/modelCatalog.js";
 import { V3_AGENT_GID, V3_AGENT_UID } from "./agent-sandbox/constants.js";
-import {
-  startPendingOrdersExpirer,
-  type SweeperHandle as PendingOrdersExpirerHandle,
-} from "./payment/pendingOrdersExpirer.js";
-import {
-  startSubscriptionRolloverSweeper,
-  type SubscriptionRolloverHandle,
-} from "./billing/subscriptionRolloverSweeper.js";
-import {
-  startAccountSlotReaper,
-  type SlotReaperHandle,
-} from "./account-pool/accountSlotReaper.js";
+import { startPendingOrdersExpirer } from "./payment/pendingOrdersExpirer.js";
+import { startSubscriptionRolloverSweeper, type SubscriptionRolloverHandle } from "./billing/subscriptionRolloverSweeper.js";
+import { startAccountSlotReaper, type SlotReaperHandle } from "./account-pool/accountSlotReaper.js";
 import {
   startFinalizeJournalReconciler,
   resolveStuckThresholdMs,
   resolveDurableWaiverAgeMs,
-  markGatewayShutdownEvidence,
   DEFAULT_RECONCILE_INTERVAL_MS,
   MIN_INTERVAL_MS as FINALIZE_RECONCILER_MIN_INTERVAL_MS,
-  type ReconcilerHandle as FinalizeJournalReconcilerHandle,
 } from "./billing/finalizeJournalReconciler.js";
 import { startTapeJobScheduler } from "./db/tapeJobScheduler.js";
 import {
@@ -249,36 +165,14 @@ import {
   resolvePruneMaxBatches,
   resolveRetireMinAgeMs,
 } from "./db/liveFrameMaintenanceScheduler.js";
-import {
-  startOnboardingScheduler,
-  type OnboardingSchedulerHandle,
-} from "./inbox/onboarding.js";
-import {
-  startInboxEmailScheduler,
-  type InboxEmailSchedulerHandle,
-} from "./inbox/email.js";
-import {
-  startResearchJobScheduler,
-  type ResearchJobSchedulerHandle,
-} from "./research/scheduler.js";
+import { startOnboardingScheduler } from "./inbox/onboarding.js";
+import { startInboxEmailScheduler } from "./inbox/email.js";
+import { startResearchJobScheduler, type ResearchJobSchedulerHandle } from "./research/scheduler.js";
 import { makeResearchFetchJobHandlers } from "./research/fetchJobs.js";
-import {
-  startCronWakeScheduler,
-  findDueCronWakeUsers,
-  runCronWakeRescan,
-  type CronWakeSchedulerHandle,
-  type CronWakeRunner,
-} from "./agent-sandbox/cronWake.js";
-import { createCronDeliveryInboxMessage, createInboxMessage } from "./inbox/inbox.js";
-import {
-  startMarketplaceAiReviewScheduler,
-  type MarketplaceAiReviewSchedulerHandle,
-} from "./marketplace/aiReview.js";
+import { startCronWakeScheduler } from "./agent-sandbox/cronWake.js";
+import { startMarketplaceAiReviewScheduler, type MarketplaceAiReviewSchedulerHandle } from "./marketplace/aiReview.js";
 import { startTutorialModerationScheduler } from "./tutorials/tutorialModeration.js";
-import {
-  startProviderHealthScheduler,
-  type ProviderHealthSchedulerHandle,
-} from "./admin/providerHealthScheduler.js";
+import { startProviderHealthScheduler, type ProviderHealthSchedulerHandle } from "./admin/providerHealthScheduler.js";
 import {
   startIncidentReconciler,
   startIncidentSweeper,
@@ -287,507 +181,79 @@ import {
   type IncidentReconcilerHandle,
   type IncidentSweeperHandle,
 } from "./selfheal/index.js";
-import {
-  startWecomAlertDispatcher,
-} from "./admin/wecomAlertDispatcher.js";
-import {
-  getWecomAibotConnectionManager,
-} from "./admin/wecomAibotConnection.js";
-import {
-  startUserNoticeApproval,
-} from "./selfheal/userNoticeApproval.js";
-import {
-  makeAnthropicProxyHandler,
-  ConcurrencyLimiter,
-  FallbackRateLimiter,
-  DEFAULT_PROXY_RATE_LIMIT,
-  DEFAULT_MAX_CONCURRENT_PER_UID,
-  type AnthropicProxyHandler,
-} from "./http/anthropicProxy.js";
-import { assertPlatformDefaultModelConfigured, STATIC_PROVIDER_META, staticProviderKeysFromConfig } from "./http/proxy/staticProviderMeta.js";
-import { makeCursorExternalRoute, type CursorExternalRoute } from "./http/proxy/cursorExternal.js";
-import type {
-  DurableCodexBilling,
-  StaticProviderId,
-  StaticProviderKeys,
-} from "@openclaude/protocol";
-import { isGrokEngineModel, normalizeTurnErrorCode, SITES_AGENT_INTERNAL_PREFIX } from "@openclaude/protocol";
+import { startWecomAlertDispatcher } from "./admin/wecomAlertDispatcher.js";
+import { getWecomAibotConnectionManager } from "./admin/wecomAibotConnection.js";
+import { startUserNoticeApproval } from "./selfheal/userNoticeApproval.js";
+import { type AnthropicProxyHandler } from "./http/anthropicProxy.js";
+import { staticProviderKeysFromConfig } from "./http/proxy/staticProviderMeta.js";
+import type { DurableCodexBilling, StaticProviderKeys } from "@openclaude/protocol";
+import { isGrokEngineModel } from "@openclaude/protocol";
 import { createSitesFromConfig } from "./sites/assemble.js";
-import { makeSitesInternalHandler } from "./sites/internalHttp.js";
-import { makePlatformContextLoader } from "./platform/platformContextLoader.js";
-import { makeDefaultVolumeContextReader } from "./platform/volumeContextReader.js";
 import {
-  makeServerAuthoredHandler,
-  makeTurnTapeStateHandler,
-  SERVER_AUTHORED_PATH,
-  TURN_TAPE_STATE_PATH,
-  type ServerAuthoredHandler,
-} from "./http/internalServerAuthored.js";
-import {
-  CODEX_TOKEN_REFRESH_PATH,
-  type CodexTokenRefreshHandler,
-} from "./http/internalCodexTokenRefresh.js";
-import {
-  buildCodexRelayHandler,
-  buildCodexTokenRefreshHandler,
-} from "./http/codexInternalAssembly.js";
-import {
-  MAX_DELEGATE_GROK_LEASES_PER_CONTAINER,
   createCodexRouteContextForModel,
-  createGrokRouteContextForModel,
-  expireCodexRouteContext,
-  expireGrokRouteContext,
-  expireGrokRouteContextByLease,
-  expireSettledGrokRouteLeases,
   hasActiveOfficialOAuthAccountInGroup,
-  listActiveGrokRouteLeases,
   listEnabledGroupsForModel,
-  resolveGrokRouteContext,
 } from "./account-pool/groups.js";
-import {
-  CODEX_RELAY_PREFIX,
-  makeDefaultCodexRelayDb,
-  type CodexRelayHandler,
-} from "./http/internalCodexRelay.js";
-import {
-  selectAdvisorCodexAdmitRoute,
-  type AdvisorCodexSelectorDecision,
-} from "./billing/advisorCodexAdmitRoute.js";
-import {
-  isDelegateGrokRoutePath,
-  makeDelegateGrokRouteHandler,
-  type DelegateGrokRouteAllocation,
-  type DelegateGrokRouteHandler,
-} from "./http/internalDelegateGrokRoute.js";
-import { isDelegateAntigravityRoutePath } from "./http/internalDelegateAntigravityRoute.js";
-import {
-  GROK_RELAY_PREFIX,
-  makeGrokRelayHandler,
-  makeGrokRelayHealthRecorder,
-  type GrokRelayHandler,
-} from "./http/internalGrokRelay.js";
-import {
-  ZCODE_RELAY_PREFIX,
-  makeZcodeRelayHandler,
-  type ZcodeRelayHandler,
-} from "./http/internalZcodeRelay.js";
-import {
-  mintZcodeRelayRoute,
-  expireZcodeRelayRoute,
-  configureZcodeRelayKv,
-  createIoredisZcodeRelayKv,
-} from "./billing/zcodeRouteContext.js";
-import { ANTIGRAVITY_RELAY_PREFIX } from "./http/internalAntigravityRelay.js";
-import {
-  configureAntigravityRouteStores,
-  createAntigravityBridgeHooks,
-  createAntigravityRouteRuntime,
-} from "./http/antigravityRouteRuntime.js";
-import {
-  SKILL_EMBED_PREFIX,
-  makeSkillEmbedHandler,
-  type SkillEmbedHandler,
-} from "./http/internalSkillEmbed.js";
-import {
-  CORE_MEMORY_RANK_PATH,
-  makeCoreMemoryRankHandler,
-  type CoreMemoryRankHandler,
-} from "./http/internalCoreMemoryRank.js";
-import {
-  MARKETPLACE_SYNC_PATH,
-  makeMarketplaceSyncHandler,
-  type MarketplaceSyncHandler,
-} from "./http/internalMarketplaceSync.js";
-import {
-  TURN_WAIVE_PATH,
-  makeTurnWaiveHandler,
-  type TurnWaiveHandler,
-} from "./http/internalTurnWaive.js";
-import {
-  TURN_LEASE_RENEW_PATH,
-  makeTurnLeaseRenewHandler,
-  type TurnLeaseRenewHandler,
-} from "./http/internalTurnLeaseRenew.js";
-import {
-  PROMPT_QUEUE_CLAIM_PATH,
-  PROMPT_QUEUE_DETAIL_PATH,
-  PROMPT_QUEUE_MUTATION_PATH,
-  PROMPT_QUEUE_SNAPSHOT_PATH,
-  isPromptQueueV1Enabled,
-  makePromptQueueHandler,
-  type PromptQueueHandler,
-} from "./http/internalPromptQueue.js";
-import { PgPromptQueueStore } from "./promptQueue/pgPromptQueueStore.js";
-import { LEASE_CALLBACK_PATH, LEASE_CALLBACK_VALIDATE_PATH, makeLeaseCallbackHandler } from "./http/internalLeaseCallback.js";
-import { lookupLeaseCallbackSession } from "./db/pgSessionsBackend.js";
-import {
-  COST_EVENT_PATH,
-  makeCostEventHandler,
-  type CostEventHandler,
-} from "./http/internalCostEvent.js";
-import {
-  MARKETPLACE_AGENT_PREFIX,
-  makeMarketplaceAgentHandler,
-  type MarketplaceAgentHandler,
-} from "./http/internalMarketplaceAgent.js";
-import {
-  TOOL_CALL_ROLLUP_PATH,
-  TOOL_FAILURE_AUDIT_PATH,
-  isToolFailureAuditEnabled,
-  makeToolCallRollupHandler,
-  makeToolFailureAuditHandler,
-  type ToolCallRollupHandler,
-  type ToolFailureAuditHandler,
-} from "./http/internalToolFailureAudit.js";
-import {
-  TURN_OBSERVATION_PATH,
-  makeTurnObservationHandler,
-} from "./http/internalTurnObservation.js";
-import {
-  MEMORY_USAGE_PATH,
-  makeMemoryUsageHandler,
-} from "./http/internalMemoryUsage.js";
-import {
-  SKILL_USAGE_PATH,
-  isSkillUsageEnabled,
-  makeSkillUsageHandler,
-  type SkillUsageHandler,
-} from "./http/internalSkillUsage.js";
-import {
-  SKILL_FEEDBACK_PATH,
-  makeSkillFeedbackHandler,
-  type SkillFeedbackHandler,
-} from "./http/internalSkillFeedback.js";
-import {
-  SKILL_SHADOW_PATH,
-  isSkillShadowEnabled,
-  makeSkillShadowHandler,
-  type SkillShadowHandler,
-} from "./http/internalSkillShadow.js";
-import {
-  AUTO_DREAM_POLICY_PATH,
-  makeAutoDreamPolicyHandler,
-  type AutoDreamPolicyHandler,
-} from "./http/internalAutoDreamPolicy.js";
-import {
-  AUTO_DREAM_OPTIMIZER_ABANDON_PATH,
-  AUTO_DREAM_OPTIMIZER_ACTION_PATH,
-  AUTO_DREAM_OPTIMIZER_ADMIT_PATH,
-  AUTO_DREAM_OPTIMIZER_FINDINGS_PATH,
-  AUTO_DREAM_OPTIMIZER_SETTLE_PATH,
-  isAutoDreamOptimizerInternalPath,
-  makeAutoDreamOptimizerHandler,
-  projectAutoDreamCodexRoute,
-  type AutoDreamOptimizerRuntime,
-} from "./http/internalAutoDreamOptimizer.js";
-import {
-  isDelegateEngineBillingInternalPath,
-  makeDelegateEngineBillingHandler,
-  type DelegateEngineBillingRuntime,
-} from "./http/internalDelegateEngineBilling.js";
-import { DELEGATE_TRACE_PATH, makeDelegateTraceHandler } from "./http/internalDelegateTrace.js";
+import { type AdvisorCodexSelectorDecision } from "./billing/advisorCodexAdmitRoute.js";
+import { makeGrokRelayHandler, makeGrokRelayHealthRecorder } from "./http/internalGrokRelay.js";
+import { configureZcodeRelayKv, createIoredisZcodeRelayKv } from "./billing/zcodeRouteContext.js";
+import { configureAntigravityRouteStores } from "./http/antigravityRouteRuntime.js";
+import { type AutoDreamOptimizerRuntime } from "./http/internalAutoDreamOptimizer.js";
+import { type DelegateEngineBillingRuntime } from "./http/internalDelegateEngineBilling.js";
 import { makeCommercialRuntimeStatus, type CommercialRuntimeStatus } from "./runtimeStatus.js";
 export type { CommercialRuntimeStatus } from "./runtimeStatus.js";
-import { createDelegateEngineBillingRuntime } from "./billing/delegateEngineBillingRuntime.js";
-import {
-  applyAutoDreamPreferenceAction,
-  reportAutoDreamPlatformFindings,
-} from "./autoDream/optimizerStore.js";
-import { getUserSignalTrafficClass } from "./analytics/signalTraffic.js";
-import {
-  CRON_INDEX_PATH,
-  makeCronIndexHandler,
-  type CronIndexHandler,
-} from "./http/internalCronIndex.js";
-import {
-  CRON_ORIGIN_INJECT_PATH,
-  makeCronOriginInjectHandler,
-  type CronOriginInjectHandler,
-} from "./http/internalCronOriginInject.js";
-import {
-  INBOX_ALERT_PATH,
-  INBOX_POST_PATH,
-  makeInboxPostHandler,
-  type InboxPostHandler,
-} from "./http/internalInboxPost.js";
-import {
-  MODEL_CATALOG_EPOCH_PATH,
-  MODEL_CATALOG_PATH,
-  assertSeedModelsActive,
-  makeModelCatalogHandler,
-  type ModelCatalogHandler,
-} from "./http/internalModelCatalog.js";
-import {
-  authorityKeyringProvider,
-  getModelCatalogCache,
-  isModelAuthorityEnforced,
-  peekModelCatalogCache,
-} from "./billing/modelCatalogRuntime.js";
-import {
-  assertModelAuthorityCutoverFloor,
-} from "./runtimeCapabilities.js";
-import {
-  makePgSkillEmbedCache,
-  makePgSkillSearchLogger,
-} from "./http/skillEmbedCachePg.js";
+import { peekModelCatalogCache } from "./billing/modelCatalogRuntime.js";
+import { assertModelAuthorityCutoverFloor } from "./runtimeCapabilities.js";
 import {
   appendCostCredits,
   appendServerAuthoredMessage,
-  appendServerAuthoredMessageForRequest,
-  appendServerAuthoredMessageDrainByUser,
-  drainDelegateCostForClientSession,
-  getClientSession,
   classifyClientSessions,
-  patchServerAuthoredMessage,
-  readArchivedMessages,
-  getEngineContextMessages,
-  hasCompletedClientTurn,
-  // P1.7 slice 7c — broker assembly 需要的 master sqlite helpers
-  upsertMasterClientSession,
-  softDeleteMasterSession,
-  allMasterWsessRows,
-  getWechatBindingByUserId,
-  // P2 master 会话权威迁 PG(RFC-v5-sessions-pg D1):一次性注入 backend 的 composition root 入口。
   setClientSessionsBackend,
 } from "@openclaude/storage";
 import {
   createPgSessionsBackend,
   readPgChatProject,
-  commitVisibleLosslessTurnPhaseA,
-  _setAfterLosslessStageBatch,
   type AutomaticRecoveryDecision,
   type DispatchAdmissionBackend,
   startSessionsGcSweeper,
   type LosslessTurnTapeStorage,
 } from "./db/pgSessionsBackend.js";
-import { persistGatewayLiveFrame } from "./db/liveTurnFrames.js";
-import { makeContainerDispatchClient } from "./dispatch/containerDispatchClient.js";
-import { makeEnginePreheatClient } from "./dispatch/enginePreheatClient.js";
 import {
-  resolveDispatchStuckThresholdMs,
   startTurnDispatchReconciler,
-  buildTurnDispatchReconcileFrame,
   runShutdownDispatchHandoff,
   DEFAULT_SHUTDOWN_HANDOFF_BUDGET_MS,
 } from "./dispatch/turnDispatchReconciler.js";
 import { resolveSessionsStoreAuthority } from "./db/sessionsStoreAuthority.js";
-import {
-  WECHAT_OUTBOUND_PATH,
-  makeOutboundReceiverHandler,
-  type WechatCodexBillingBody,
-} from "./wechat/outboundReceiver.js";
-import {
-  WECHAT_PROACTIVE_PATH,
-  makeProactiveReceiverHandler,
-  canonicalWechatSenderId,
-  type ProactiveReceiverHandler,
-} from "./wechat/proactiveReceiver.js";
-import { getCurrentSessionId } from "./wechat/sessionPointer.js";
+import { type ProactiveReceiverHandler } from "./wechat/proactiveReceiver.js";
 import { MASTER_USER_PREFIX } from "./wechat/userIds.js";
-import {
-  LITERATURE_SEARCH_PATH,
-  makeLiteratureProxyHandler,
-  type LiteratureProxyHandler,
-} from "./literatureProxy.js";
-import {
-  CONNECTORS_RPC_PREFIX,
-  PLUGINS_RPC_PREFIX,
-  makeConnectorsRpcHandler,
-  type ConnectorsRpcHandler,
-} from './connectors/rpc.js'
-import { PREFS_PLUGIN_ENABLEMENT } from './plugins/enablement.js'
-import { PluginRuntimeFacade } from './plugins/runtime.js'
-import { ManagedBrowserRuntime } from './plugins/browserRuntime.js'
-import {
-  KnowledgePlanetDockerService,
-  createKnowledgePlanetRuntimeRegistries,
-} from './plugins/knowledgePlanet.js'
-import { KnowledgePlanetSetupManager } from './plugins/knowledgePlanetSetup.js'
-import { KnowledgePlanetAutomationService } from './plugins/knowledgePlanetAutomation.js'
-import { startKnowledgePlanetAutomationScheduler } from './plugins/knowledgePlanetAutomationScheduler.js'
-import { WeiboDockerService, createWeiboRuntimeRegistries } from './plugins/weibo.js'
-import { WeiboSetupManager } from './plugins/weiboSetup.js'
-import { createCommercialLiteratureRuntime } from './plugins/literatureDb/jieyouLoginSession.js'
-import { ZhihuDockerService, createZhihuRuntimeRegistries } from './plugins/zhihu.js'
-import { ZhihuSetupManager } from './plugins/zhihuSetup.js'
-import {
-  BILI_ACCOUNT_BROKER_ROOT,
-  BILI_ACCOUNT_WORKER_ROOT,
-  BiliAccountDockerService,
-  createBiliAccountRuntimeRegistries,
-} from './plugins/biliAccount.js'
-import { BiliAccountSetupManager } from './plugins/biliAccountSetup.js'
-import {
-  DOUYIN_BROKER_ROOT,
-  DOUYIN_WORKER_ROOT,
-  DouyinDockerService,
-  createDouyinRuntimeRegistries,
-} from './plugins/douyin.js'
-import { DouyinSetupManager } from './plugins/douyinSetup.js'
-import { seedDefaultConnectors } from './connectors/declarativeSeed.js'
-import { startConnectorSweeper } from './connectors/sweeper.js'
-import {
-  RESEARCH_PREFIX,
-  makeResearchProxyHandler,
-  type ResearchProxyHandler,
-} from "./research/researchProxy.js";
-import {
-  OCR_PREFIX,
-  makeOcrProxyHandler,
-  type OcrProxyHandler,
-} from "./ocr/ocrProxy.js";
-import { PgOcrJobStore } from "./ocr/ocrStore.js";
-import { getResearchConfigPublic } from "./admin/researchConfig.js";
-import {
-  seedPlatformGeneralAgents,
-  seedPlatformResearchAgents,
-} from "./marketplace/seedPlatformAgents.js";
-import {
-  PLATFORM_PROMPT_SLOTS_PATH,
-  makePlatformPromptSlotsHandler,
-  type PlatformPromptSlotsHandler,
-} from "./http/internalPlatformPromptSlots.js";
-import {
-  PROJECT_CONTEXT_PATH,
-  makeInternalProjectContextHandler,
-  type InternalProjectContextHandler,
-} from "./http/internalProjectContext.js";
-import {
-  PROJECT_ASSETS_REGISTER_PATH,
-  makeInternalProjectAssetsHandler,
-  type InternalProjectAssetsHandler,
-} from "./http/internalProjectAssets.js";
-import {
-  PROJECT_SEARCH_PATH,
-  makeInternalProjectSearchHandler,
-  type InternalProjectSearchHandler,
-} from "./http/internalProjectSearch.js";
-import {
-  MINIMAX_MEDIA_PATH,
-  makeMiniMaxMediaHandler,
-  type MiniMaxMediaHandler,
-} from "./minimax/mediaProxy.js";
-import { mediaProxyKey } from "./minimax/mediaKey.js";
+import { startKnowledgePlanetAutomationScheduler } from './plugins/knowledgePlanetAutomationScheduler.js';
+import { startConnectorSweeper } from './connectors/sweeper.js';
 import { createMuseFromConfig } from "./muse/assemble.js";
 import { createStudioFromConfig } from "./media-studio/assemble.js";
-import { startStudioOrchestrator } from "./media-studio/orchestrator/assemble.js";
-import { makeMuseInternalHandler } from "./muse/internalHttp.js";
-import { MUSE_INTERNAL_PREFIX } from "./muse/protocol.js";
-import {
-  TAVILY_WEB_SEARCH_PATH,
-  makeTavilyWebSearchHandler,
-  type TavilyWebSearchHandler,
-} from "./tavily/webSearchProxy.js";
-import {
-  MINIMAX_WEB_SEARCH_PATH,
-  makeMiniMaxWebSearchHandler,
-  type MiniMaxWebSearchHandler,
-} from "./minimax/webSearchProxy.js";
-import {
-  GROK_WEB_SEARCH_PATH,
-  makeGrokWebSearchHandler,
-  type GrokWebSearchHandler,
-} from "./grok/webSearchProxy.js";
-import {
-  GROK_VISION_PATH,
-  grokRunMaxCost,
-  makeGrokRunner,
-  resettleGrokRun,
-  makeGrokVisionHandler,
-  type GrokVisionHandler,
-} from "./grok/visionProxy.js";
 import { MediaGenerationService } from "./media-generation/service.js";
-import {
-  MEDIA_GENERATION_INTERNAL_PREFIX,
-  makeMediaGenerationInternalHandler,
-  type MediaGenerationInternalHandler,
-} from "./media-generation/http.js";
-import {
-  makeInboundDispatcher,
-  type PrepareWechatCodexTurnResult,
-} from "./wechat/inboundDispatcher.js";
-import { handleWechatModelCommand } from "./wechat/modelCommand.js";
-import { pickWechatInboundModel } from "./wechat/modelResolver.js";
-import { makeNodeHttpContainerTransport } from "./wechat/nodeHttpContainerTransport.js";
-import { makeIlinkSendAdapter, makeIlinkSendMediaAdapter } from "./wechat/ilinkSendAdapter.js";
-import { makeSaveWechatMediaToUserUploads } from "./wechat/imageIngest.js";
-import { makeWechatOutboundMediaResolver } from "./wechat/outboundMedia.js";
-import { createNoopRateLimiter } from "./wechat/rateLimiter.js";
 import { makeWechatBroker, type WechatBroker } from "./wechat/broker.js";
 import { readQqBotConfig } from "./qqbot/config.js";
-import {
-  makeQqBotService,
-  qqInboundChannelProfile,
-  type QqBotService,
-} from "./qqbot/service.js";
-import { makeSaveQqMediaToUserUploads } from "./qqbot/mediaIngest.js";
-import { makeQqOutboundMediaResolver } from "./qqbot/outboundMedia.js";
-import {
-  QQ_OUTBOUND_PATH,
-  QQ_PROACTIVE_PATH,
-  makeQqOutboundReceiver,
-  makeQqProactiveReceiver,
-} from "./qqbot/receiver.js";
+import { type QqBotService } from "./qqbot/service.js";
+import { makeQqOutboundReceiver, makeQqProactiveReceiver } from "./qqbot/receiver.js";
 import { createPgIdentityRepo } from "./auth/containerIdentity.js";
-import { makeContainerIdentityStrategy } from "./auth/proxyIdentity.js";
-import { makeLoadUserModelAuthz, scopeFromAuthz } from "./auth/userModelAuthz.js";
-import { getProviderRoutingAvailability, getDegradedProviders } from "./admin/providerHealthGate.js";
-import { makePgApiKeyRepo } from "./auth/apiKeyRepo.js";
-import { makeApiKeyIdentityStrategy, resolveApiKeyIdentity } from "./auth/apiKeyIdentity.js";
-import { makeExternalModelsHandler, type ExternalModelsHandler } from "./http/proxy/externalModels.js";
-import { makeExternalUsageHandler, type ExternalUsageHandler } from "./http/proxy/externalUsage.js";
+import { makeLoadUserModelAuthz } from "./auth/userModelAuthz.js";
+import { getDegradedProviders } from "./admin/providerHealthGate.js";
 import {
-  createUserChatBridge,
   ContainerUnreadyError,
-  DEFAULT_MAX_FRAME_BYTES,
   type CodexBindingHandle,
   type ResolveContainerEndpoint,
   type UserChatBridgeHandler,
-  type BridgeMetricSink,
 } from "./ws/userChatBridge.js";
-import { createFrontendBuildProbe } from "./ws/frontendBuild.js";
-import {
-  createVoiceTranscribeHandler,
-  type VoiceTranscribeHandler,
-} from "./ws/voiceTranscribe.js";
-import {
-  composeMultiplier,
-  getAgentCostMultiplier,
-  listAgentCostOverrides,
-} from "./billing/agentMultiplier.js";
-import {
-  startInflightJournal,
-  type JournalFailureCode,
-} from "./billing/proxyBilling.js";
-import {
-  DURABLE_CODEX_RECOVERY_VERSION,
-  deriveEngineSessionId,
-  makeCodexFinalizer,
-  type CodexFinalizeHandle,
-} from "./billing/codexFinalizer.js";
+import { createVoiceTranscribeHandler, type VoiceTranscribeHandler } from "./ws/voiceTranscribe.js";
 import { settleDurableCodexBilling } from "./billing/durableCodexBilling.js";
-import {makeModelSwitchCostService} from './billing/modelSwitchCostTarget.js';
+import { makeModelSwitchCostService } from './billing/modelSwitchCostTarget.js';
 import { isCursorDurableBilling, settleDurableCursorBilling } from "./billing/durableCursorBilling.js";
 import { parseZeroChargeCutoff, startCursorAuditReconciler } from "./billing/cursorAuditReconciler.js";
-import { serializeBillingPricing } from "./billing/persistedBillingPricing.js";
-import { createTunnelContainerSocket } from "./ws/tunnelContainerSocket.js";
-import {
-  CONTAINER_PREVIEW_MAX_FRAME_BYTES,
-  createContainerPreviewBridge,
-  type ContainerPreviewBridgeHandler,
-} from "./ws/containerPreviewBridge.js";
+import { type ContainerPreviewBridgeHandler } from "./ws/containerPreviewBridge.js";
 import { ContainerPreviewTicketStore } from "./ws/containerPreviewTickets.js";
-import {
-  createDirectContainerPreviewService,
-  type DirectContainerPreviewService,
-} from "./ws/directContainerPreview.js";
+import { type DirectContainerPreviewService } from "./ws/directContainerPreview.js";
 import {
   DEFAULT_V3_CCB_BASELINE_DIR,
-  lookupContainerUserRole,
-  resolveCcbBaselineMounts,
-  makePrewarmContainer,
-  makeUidSingleflight,
-  makeV3EnsureRunning,
   makeDesktopOrDockerResolver,
   makeInboundChannelResolver,
   preheatV3Image,
@@ -795,61 +261,19 @@ import {
   INITIAL_SWEEP_BATCH_LIMIT,
   startMigrationReconcileScheduler,
   startOrphanReconcileScheduler,
-  markV3ContainerActivity,
   startV3ContainerEventsWorker,
   startVolumeGcScheduler,
-  createUserMediaResolver,
-  createSyntheticEvalOverlayRuntime,
   isUserVolumeMediaPath,
-  readSyntheticEvalReleaseSourceCommit,
-  resolvePlatformBundleMount,
-  resolveRuntimeReleaseMount,
-  DEFAULT_PLATFORM_ROOT,
-  DEFAULT_RUNTIME_RELEASES_ROOT,
-  type IdleSweepScheduler,
-  type MigrationReconcileScheduler,
-  type OrphanReconcileScheduler,
   type UserMediaLocation,
-  type V3ContainerEventsWorker,
   type V3SupervisorDeps,
-  type V3RuntimeTuple,
-  type VolumeGcScheduler,
 } from "./agent-sandbox/index.js";
-import {
-  observeWsBridgeBuffered,
-  observeWsBridgeSessionDuration,
-  observeWsBridgeTtft,
-} from "./admin/metrics.js";
-import { shutdownDurableMetricRollups } from "./admin/durableMetricRollups.js";
-import { loadOrCreateBridgeSecret, DEFAULT_BRIDGE_SECRET_PATH } from "./bridgeSecret.js";
-import { setRemoteMuxDeps } from "./remoteHosts/sshMux.js";
-import { RemoteHostError } from "./remoteHosts/service.js";
 import * as computeQueries from "./compute-pool/queries.js";
-import {
-  hostRowToTarget,
-  resolveServiceableHostTarget,
-  startSshControlMaster,
-  stopSshControlMaster,
-  putFile as nodeAgentPutFile,
-  deleteFile as nodeAgentDeleteFile,
-  getFile as nodeAgentGetFile,
-} from "./compute-pool/nodeAgentClient.js";
-import { createRemoteHostChunkHooks, type RemoteHostChunkHooks } from "./compute-pool/remoteHostChunkHooks.js";
-import { createContainerService } from "./compute-pool/containerService.js";
-import { getHealthPoller, type HealthPoller } from "./compute-pool/nodeHealth.js";
+import { resolveServiceableHostTarget, getFile as nodeAgentGetFile } from "./compute-pool/nodeAgentClient.js";
+import { createRemoteHostChunkHooks } from "./compute-pool/remoteHostChunkHooks.js";
+import { getHealthPoller } from "./compute-pool/nodeHealth.js";
 import { initComputePool } from "./compute-pool/poolInit.js";
 import { getImagePromoteScheduler } from "./compute-pool/imagePromote.js";
-import {
-  getBaselineServer,
-  type BaselineServer,
-} from "./compute-pool/baselineServer.js";
-import {
-  ensureCa,
-  ensureMasterLeaf,
-  extractSpiffeUris,
-  extractHostUuidFromSpiffe,
-} from "./compute-pool/certAuthority.js";
-import type { ServerResponse } from "node:http";
+import { getBaselineServer, type BaselineServer } from "./compute-pool/baselineServer.js";
 
 /**
  * 控制面 leader 判定(单一权威,可测)。返回 true = 本实例是控制面 leader
@@ -909,153 +333,6 @@ function shouldAutoMigrate(
 }
 import type { RegisterCommercialResult } from "./commercialRegistrationTypes.js";
 export type { RegisterCommercialResult } from "./commercialRegistrationTypes.js";
-
-// ─── D.1b: 18443 mTLS 反代前置校验 ─────────────────────────────────────────
-//
-// remote-host 的 node-agent 通过 mTLS 把容器出站 POST 反代到 master:18443。
-// 入口做四件事:
-//   1. TLS 层已经验了证书链;我们还要从 SAN URI 解出 host uuid
-//   2. DB 查 `compute_hosts.id = hostUuid`:确认 status='ready' + fingerprint pin
-//      (fingerprint 校验是撤销机制 —— cert 泄露时 admin 轮换 db 行的 fp 即时生效)
-//   3. 校验 X-V3-Container-IP 头:只允许单一字符串、不含 CR/LF、且是合法 IPv4
-//   4. 去掉 X-V3-Container-IP 头,再把请求以 { hostUuid, boundIp } ctx 交给 proxyHandler
-//
-// 任意校验失败都直接以 JSON error 结束;不进 proxy,不消耗 account,不扣分。
-
-/** Raw DER → PEM。node TLSSocket.getPeerCertificate(true).raw 是 DER Buffer。 */
-function derToPem(der: Buffer): string {
-  const b64 = der.toString("base64");
-  const lines: string[] = [];
-  for (let i = 0; i < b64.length; i += 64) {
-    lines.push(b64.slice(i, i + 64));
-  }
-  return `-----BEGIN CERTIFICATE-----\n${lines.join("\n")}\n-----END CERTIFICATE-----\n`;
-}
-
-function sendMtlsError(
-  res: ServerResponse,
-  status: number,
-  code: string,
-  extra?: Record<string, unknown>,
-): void {
-  if (res.headersSent) {
-    try { res.end(); } catch { /* socket gone */ }
-    return;
-  }
-  res.statusCode = status;
-  res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify({ error: { code, ...(extra ?? {}) } }));
-}
-
-async function handleExternalMtls(
-  req: IncomingMessage,
-  res: ServerResponse,
-  proxyHandler: AnthropicProxyHandler,
-): Promise<void> {
-  const socket = req.socket as TLSSocket;
-  // TLS 层已经 rejectUnauthorized:true,到这里 authorized 理论必真;额外 belt-and-suspenders
-  if (!socket.authorized) {
-    sendMtlsError(res, 401, "PEER_UNAUTHORIZED", { reason: socket.authorizationError?.message });
-    return;
-  }
-  const peerCert = socket.getPeerCertificate(true);
-  if (!peerCert || !peerCert.raw || peerCert.raw.length === 0) {
-    sendMtlsError(res, 401, "NO_PEER_CERT");
-    return;
-  }
-
-  // SPIFFE URI → host uuid
-  const certPem = derToPem(peerCert.raw);
-  let uris: string[];
-  try {
-    uris = await extractSpiffeUris(certPem);
-  } catch {
-    sendMtlsError(res, 403, "CERT_PARSE_FAIL");
-    return;
-  }
-  const hostUri = uris.find((u) => u.startsWith("spiffe://openclaude/host/"));
-  if (!hostUri) {
-    sendMtlsError(res, 403, "NO_HOST_SPIFFE");
-    return;
-  }
-  const hostUuid = extractHostUuidFromSpiffe(hostUri);
-  if (!hostUuid) {
-    sendMtlsError(res, 403, "BAD_SPIFFE_URI");
-    return;
-  }
-
-  // DB state + fingerprint pin。**不做 in-proc cache**,每请求一查 —— admin 轮换 fp 就即时生效
-  const row = await computeQueries.getHostById(hostUuid);
-  if (!row) {
-    sendMtlsError(res, 403, "HOST_NOT_FOUND");
-    return;
-  }
-  // A3 — 终态 revoked host(被入侵/下线)不得再用 file-proxy。setRevoked 已把
-  // agent_cert_fingerprint_sha256 置 NULL,下面 expectedFp 检查本就会 fail-closed;
-  // 这里显式拒一遍,给出明确 reason code + 不依赖"fp 一定被清"的隐式不变量。
-  if (row.status === "revoked") {
-    sendMtlsError(res, 403, "HOST_REVOKED");
-    return;
-  }
-  const expectedFp = row.agent_cert_fingerprint_sha256;
-  if (!expectedFp) {
-    sendMtlsError(res, 403, "NO_PINNED_FP");
-    return;
-  }
-  // peerCert.fingerprint256 是 "AA:BB:..." 冒号分隔大写 hex。
-  // 异常 TLS 对象形态下可能为 undefined/"",统一落 401 而非走到后面抛 500。
-  if (!peerCert.fingerprint256 || typeof peerCert.fingerprint256 !== "string") {
-    sendMtlsError(res, 401, "NO_PEER_FINGERPRINT");
-    return;
-  }
-  const presentedFp = peerCert.fingerprint256.replace(/:/g, "").toLowerCase();
-  const pBuf = Buffer.from(presentedFp, "hex");
-  const eBuf = Buffer.from(expectedFp.toLowerCase(), "hex");
-  if (pBuf.length !== eBuf.length || pBuf.length === 0 || !timingSafeEqual(pBuf, eBuf)) {
-    sendMtlsError(res, 403, "FINGERPRINT_MISMATCH");
-    return;
-  }
-
-  // 0042 — agent-uplink-probe 专用快路径:绕过 status='ready' 与 X-V3-Container-IP 校验。
-  // 目的:让 quarantined host 也能从 uplink-probe-failed 自愈;同时不开放任何代理能力,
-  // 仅返回 200 {ok:true,hostUuid} 让 agent 知道 mTLS+fingerprint 校验通过。
-  // 请求路径硬匹配 GET /v3/agent-uplink-probe。
-  if (req.method === "GET" && req.url === "/v3/agent-uplink-probe") {
-    res.statusCode = 200;
-    res.setHeader("Content-Type", "application/json");
-    res.end(JSON.stringify({ ok: true, hostUuid }));
-    return;
-  }
-
-  // 业务流量(/v1/messages 等)需要 host 处于 ready
-  if (row.status !== "ready") {
-    sendMtlsError(res, 503, "HOST_NOT_READY", { status: row.status });
-    return;
-  }
-
-  // X-V3-Container-IP 校验:三重防御(数组 / CRLF header-folding / 非 IPv4)
-  const rawIp = req.headers["x-v3-container-ip"];
-  if (Array.isArray(rawIp)) {
-    sendMtlsError(res, 400, "IP_HEADER_ARRAY");
-    return;
-  }
-  if (!rawIp || typeof rawIp !== "string") {
-    sendMtlsError(res, 400, "IP_HEADER_MISSING");
-    return;
-  }
-  if (rawIp.includes("\r") || rawIp.includes("\n")) {
-    sendMtlsError(res, 400, "IP_HEADER_CRLF");
-    return;
-  }
-  if (!isIPv4(rawIp)) {
-    sendMtlsError(res, 400, "IP_HEADER_NOT_IPV4");
-    return;
-  }
-
-  // 剥掉 X-V3-Container-IP 头,防止透传到 anthropic 上游
-  delete req.headers["x-v3-container-ip"];
-  await proxyHandler(req, res, { hostUuid, boundIp: rawIp });
-}
 
 /**
  * 从 commercial config 派生 host 静态 provider 平台 key 表(注入 gateway seam)。
@@ -1262,39 +539,6 @@ export async function registerCommercial(
   const recoveryDecisionBroadcastRef: {
     current: (userId: string, sessionId: string, decision: AutomaticRecoveryDecision) => void;
   } = { current: () => { /* bridge not assembled yet — browser converges via ack/history */ } };
-  const recordRecoveryJobTerminalFriction = (
-    userId: string,
-    sessionId: string,
-    info: {
-      rootClientMessageId: string;
-      errorCode: string;
-      semanticAttempt: number;
-      terminalStatus: "completed" | "paused";
-      pauseReason: string | null;
-    },
-  ): void => {
-    const uidMatch = /^c:([1-9][0-9]*)$/.exec(userId);
-    if (!uidMatch) return;
-    const code = normalizeTurnErrorCode(info.errorCode);
-    if (!/^[A-Za-z0-9_]{1,64}$/.test(code)) return;
-    void recordProductFrictionEvent({
-      correlation: `${sessionId}:${info.rootClientMessageId}`,
-      userId: BigInt(uidMatch[1]!),
-      surface: "recovery",
-      stage: "recovery_job",
-      code,
-      outcome: info.terminalStatus === "completed" ? "recovered" : "failed",
-      attempts: info.semanticAttempt,
-      path: "job_terminal",
-      reason: info.pauseReason ?? undefined,
-      sessionId,
-    }).catch((err: unknown) => {
-      rootLogger.warn("recovery_job_friction_failed", {
-        sessionId,
-        errorClass: err instanceof Error ? err.constructor.name : typeof err,
-      });
-    });
-  };
   // HTTP finalize (Phase A) nudges the leader-owned tape job scheduler so Phase B
   // (and therefore the recovery verdict above) runs now, not on the next 5s tick.
   // Non-leader masters keep the noop: the leader's interval still converges.
@@ -1378,13 +622,12 @@ export async function registerCommercial(
   let deployDesiredWatch: DesiredWatch | undefined;
   let leaderLease: LeaderLeaseController | undefined;
   let controlListener: ControlListener | undefined;
+  let cronOriginBridgeRef: UserChatBridgeHandler | null = null;
   if (dualMasterEnabled) {
     deployDesiredWatch = startDesiredWatch({
       pool: getPool(),
       onError: (err) => rootLogger.warn("[deployDesiredWatch] poll 失败(保留旧缓存)", { err: (err as Error)?.message ?? String(err) }),
     });
-    // env 资格严格解析('1'|'0';unset/非法=fail-closed 拒起)。与 controlPlaneEnabled 分职:
-    // controlPlaneEnabled 仍供 auto-migrate 等一次性启动分支(读 env 资格不动);lease 用严格版。
     const eligibleEnv = resolveLeaderEnvEligibility(process.env);
     leaderLease = createLeaderLeaseController({
       pool: getPool(),
@@ -1392,14 +635,14 @@ export async function registerCommercial(
       desiredWatch: deployDesiredWatch,
       eligibleEnv,
       callbacks: {
-        // BLOCKER 1:onAcquire=bundle start-all-or-fail;required 成员起不来 → start() reject →
-        // lease step-down + onFatal(fail-stop)。onFence 返回 {drained,stuck};drained:false → lease fail-stop。
         onAcquire: async () => {
           await leaderBundle.start();
           await seedPlatformAgentsForLeadership();
+          await cronOriginBridgeRef?.setBackgroundRoleActive?.(true);
         },
-        onFence: (reason) => {
+        onFence: async (reason) => {
           rootLogger.warn(`[leaderLease] fence → stopAndDrain bundle(${reason})`, { subsys: "leaderLease" });
+          await cronOriginBridgeRef?.setBackgroundRoleActive?.(false);
           return leaderBundle.stopAndDrain();
         },
       },
@@ -1497,142 +740,24 @@ export async function registerCommercial(
   const preCheckRedis = wrapIoredisForPreCheck(redis);
 
   const knowledgePlanetMediaResolverRef: {
-    current: ((userId: string) => Promise<UserMediaLocation>) | undefined
-  } = { current: undefined }
-  const knowledgePlanetMediaDeps = {
-    resolveUserMediaDirs: async (userId: string): Promise<UserMediaLocation> => {
-      if (!knowledgePlanetMediaResolverRef.current)
-        throw new Error('Knowledge Planet media resolver unavailable')
-      return knowledgePlanetMediaResolverRef.current(userId)
-    },
-    pullRemoteHostMedia: async (args: { hostUuid: string; remotePath: string }) => {
-      const target = await resolveServiceableHostTarget(args.hostUuid)
-      try {
-        return await nodeAgentGetFile(target, args.remotePath)
-      } finally {
-        target.psk?.fill(0)
-      }
-    },
-    stagingRoot: '/var/lib/openclaude-v5/plugin-media-staging',
-    expectedOwnerUid: 0,
-  }
-
-  // Generic Plugin facade is process-scoped and shared by container RPC + browser HTTP.
-  // The official Knowledge Planet driver is enabled only on V5 with the immutable image ID;
-  // a mutable tag is never accepted as the worker trust root.
-  let knowledgePlanetService: KnowledgePlanetDockerService | undefined
-  let knowledgePlanetSetup: KnowledgePlanetSetupManager | undefined
-  let weiboService: WeiboDockerService | undefined
-  let weiboSetup: WeiboSetupManager | undefined
-  let zhihuService: ZhihuDockerService | undefined
-  let zhihuSetup: ZhihuSetupManager | undefined
-  let biliAccountService: BiliAccountDockerService | undefined
-  let biliAccountSetup: BiliAccountSetupManager | undefined
-  let douyinService: DouyinDockerService | undefined
-  let douyinSetup: DouyinSetupManager | undefined
-  let knowledgePlanetAutomation: KnowledgePlanetAutomationService | undefined
-  // 文献插件(OCV5-524/585):观测日志 literature_plugin_call / literature_artifact 由 runtime 工厂接到 rootLogger。
-  const { literatureSetup, literatureArtifacts, literatureHttp, literatureRelogin, literatureObserver } = createCommercialLiteratureRuntime({ runtimeChannel, redis, logger: rootLogger })
-  let pluginFacade: PluginRuntimeFacade
-  if (runtimeChannel === 'v5' && cfg.OC_RUNTIME_IMAGE_ID) {
-    const pluginDocker = cfg.AGENT_DOCKER_SOCKET
-      ? new Docker({ socketPath: cfg.AGENT_DOCKER_SOCKET })
-      : new Docker()
-    knowledgePlanetService = new KnowledgePlanetDockerService(pluginDocker, {
-      imageId: cfg.OC_RUNTIME_IMAGE_ID,
-      workerRoot: '/var/lib/openclaude-v5/plugin-workers',
-      brokerRoot: '/run/openclaude-v5/plugin-browser-brokers',
-      expectedOwnerUid: 0,
-      socketUid: 1000,
-      socketGid: 1000,
-    })
-    weiboService = new WeiboDockerService(pluginDocker, {
-      imageId: cfg.OC_RUNTIME_IMAGE_ID,
-      workerRoot: '/var/lib/openclaude-v5/plugin-workers-weibo',
-      brokerRoot: '/run/openclaude-v5/plugin-browser-brokers-weibo',
-      expectedOwnerUid: 0,
-      socketUid: 1000,
-      socketGid: 1000,
-    })
-    zhihuService = new ZhihuDockerService(pluginDocker, {
-      imageId: cfg.OC_RUNTIME_IMAGE_ID,
-      workerRoot: '/var/lib/openclaude-v5/plugin-workers-zhihu',
-      brokerRoot: '/run/openclaude-v5/plugin-browser-brokers-zhihu',
-      expectedOwnerUid: 0,
-      socketUid: 1000,
-      socketGid: 1000,
-    })
-    // OCV5-402: read-only Bilibili account Plugin (market only). Smaller worker cap (2) than Weibo.
-    biliAccountService = new BiliAccountDockerService(pluginDocker, {
-      imageId: cfg.OC_RUNTIME_IMAGE_ID,
-      workerRoot: BILI_ACCOUNT_WORKER_ROOT,
-      brokerRoot: BILI_ACCOUNT_BROKER_ROOT,
-      expectedOwnerUid: 0,
-      socketUid: 1000,
-      socketGid: 1000,
-    })
-    // OCV5-553: Douyin Plugin (market only; this version is QR login + read-only `me`).
-    douyinService = new DouyinDockerService(pluginDocker, {
-      imageId: cfg.OC_RUNTIME_IMAGE_ID,
-      workerRoot: DOUYIN_WORKER_ROOT,
-      brokerRoot: DOUYIN_BROKER_ROOT,
-      expectedOwnerUid: 0,
-      socketUid: 1000,
-      socketGid: 1000,
-    })
-    const knowledgePlanetRegistries = createKnowledgePlanetRuntimeRegistries(knowledgePlanetService)
-    const weiboRegistries = createWeiboRuntimeRegistries(weiboService)
-    const zhihuRegistries = createZhihuRuntimeRegistries(zhihuService)
-    const biliAccountRegistries = createBiliAccountRuntimeRegistries(biliAccountService)
-    const douyinRegistries = createDouyinRuntimeRegistries(douyinService)
-    const browserRuntime = new ManagedBrowserRuntime({
-      drivers: new Map([
-        ...knowledgePlanetRegistries.drivers,
-        ...weiboRegistries.drivers,
-        ...zhihuRegistries.drivers,
-        ...biliAccountRegistries.drivers,
-        ...douyinRegistries.drivers,
-      ]),
-      launchers: new Map([
-        ...knowledgePlanetRegistries.launchers,
-        ...weiboRegistries.launchers,
-        ...zhihuRegistries.launchers,
-        ...biliAccountRegistries.launchers,
-        ...douyinRegistries.launchers,
-      ]),
-      profileRoot: '/var/lib/openclaude-v5/plugin-browser-profiles',
-      expectedOwnerUid: 0,
-    })
-    pluginFacade = new PluginRuntimeFacade({
-      redis,
-      browserRuntime,
-      knowledgePlanetMedia: knowledgePlanetMediaDeps,
-      literatureHttp, literatureRelogin, literatureObserver,
-      pluginEnablement: PREFS_PLUGIN_ENABLEMENT,
-    })
-    knowledgePlanetSetup = new KnowledgePlanetSetupManager(knowledgePlanetService, {
-      isAgentReady: (contract) => browserRuntime.supportsContract(contract),
-    })
-    weiboSetup = new WeiboSetupManager(weiboService, {
-      redis,
-      isAgentReady: (contract) => browserRuntime.supportsContract(contract),
-    })
-    zhihuSetup = new ZhihuSetupManager(zhihuService, {
-      redis,
-      isAgentReady: (contract) => browserRuntime.supportsContract(contract),
-    })
-    biliAccountSetup = new BiliAccountSetupManager(biliAccountService, {
-      redis,
-      isAgentReady: (contract) => browserRuntime.supportsContract(contract),
-    })
-    douyinSetup = new DouyinSetupManager(douyinService, {
-      redis,
-      isAgentReady: (contract) => browserRuntime.supportsContract(contract),
-    })
-    knowledgePlanetAutomation = new KnowledgePlanetAutomationService(pluginFacade)
-  } else {
-    pluginFacade = new PluginRuntimeFacade({ redis, literatureHttp, literatureRelogin, literatureObserver, pluginEnablement: PREFS_PLUGIN_ENABLEMENT })
-  }
+    current: ((userId: string) => Promise<UserMediaLocation>) | undefined;
+  } = { current: undefined };
+  const {
+    pluginFacade,
+    knowledgePlanetSetup,
+    weiboSetup,
+    zhihuSetup,
+    biliAccountSetup,
+    douyinSetup,
+    knowledgePlanetAutomation,
+    literatureSetup,
+    literatureArtifacts,
+  } = bootstrapPluginsRuntime({
+    cfg,
+    runtimeChannel,
+    redis,
+    knowledgePlanetMediaResolverRef,
+  });
 
   // T-53: 装配 agent 运行时(image + seccomp + rpc dir + lifecycle scheduler)。
   // 任一必要字段缺失 → agentRuntime 置 undefined;/api/agent/open 返 503,/status 仍然可读。
@@ -1761,94 +886,7 @@ export async function registerCommercial(
   // createCommercialCodexRoute 原 grok 分支的原样抽取:bridge(每帧铸 route)
   // 与下方 delegateGrokRouteHandler(容器本地 delegate turn 主动申请)必须走
   // 同一账号池、同一 grok_route_contexts durable 并发权威,不允许各自解释。
-  const allocateGrokRelayRoute = async ({ containerId, userId, modelId, sessionId, origin }: {
-    containerId: number;
-    userId: bigint;
-    modelId: string;
-    sessionId?: string;
-    /**
-     * bridge(默认)= 浏览器 turn:7 天孤儿 TTL,计费终结帧显式 expire。
-     * delegate = 容器本地 delegate turn:无计费终结帧,走短心跳租约
-     * (GROK_DELEGATE_ROUTE_TTL_MS)+ per-container 并发限额,网关崩溃后
-     * 分钟级自愈,不再占满账号并发上限一周。
-     */
-    origin?: "bridge" | "delegate";
-  }) => {
-    if (!isModelAvailable(modelId)) {
-      return { kind: "unavailable" as const, reason: "model temporarily unavailable" };
-    }
-    // grok_route_contexts is the durable concurrency authority. Rebuild the
-    // local scheduler mirror before every allocation so a browser disconnect,
-    // generic slot reaper, or Master restart cannot make a live route vanish
-    // from the cap check. Reap billed/vanished rows first — restore would
-    // otherwise refill the 10-slot cap from finished turns.
-    await expireSettledGrokRouteLeases();
-    for (const lease of await listActiveGrokRouteLeases()) {
-      scheduler.restoreCodexSlot(lease.accountId, lease.slotId);
-    }
-    const groups = await listEnabledGroupsForModel({ modelId, provider: "grok" });
-    let busy: AccountPoolBusyError | null = null;
-    for (const group of groups) {
-      let picked;
-      try {
-        picked = await scheduler.pick({
-          mode: "agent",
-          provider: "grok",
-          groupId: group.id,
-          sessionId: sessionId ?? `container:${containerId}`,
-          // OCV5-424: user affinity (no pinMode → no session pin / 409 flow).
-          userId,
-        });
-      } catch (err) {
-        if (err instanceof AccountPoolBusyError) { busy = err; continue; }
-        if (err instanceof AccountPoolUnavailableError) continue;
-        throw err;
-      }
-      picked.token.fill(0);
-      picked.refresh?.fill(0);
-      let route;
-      try {
-        route = await tx((client) => createGrokRouteContextForModel({
-          containerId,
-          userId,
-          modelId,
-          accountId: picked.account_id,
-          slotId: picked.slotId,
-          groupId: group.id,
-          runner: client,
-          maxConcurrent: scheduler.maxConcurrent,
-          kind: origin ?? "bridge",
-          ...(origin === "delegate"
-            ? { maxDelegatePerContainer: MAX_DELEGATE_GROK_LEASES_PER_CONTAINER }
-            : {}),
-        }));
-      } catch (err) {
-        scheduler.releaseCodexSlot(picked.account_id, picked.slotId);
-        throw err;
-      }
-      if (!route) {
-        scheduler.releaseCodexSlot(picked.account_id, picked.slotId);
-        continue;
-      }
-      return {
-        kind: "api_relay" as const,
-        engine: "grok" as const,
-        token: route.token,
-        baseUrl: `http://127.0.0.1:${V3_CONTAINER_PORT}/internal/v5/grok-relay/route/${route.token}/v1`,
-        modelProvider: "grok",
-        providerName: "xAI Grok subscription",
-        wireApi: "chat" as const,
-        preferredAuthMethod: "apikey" as const,
-        disableResponseStorage: true,
-        groupId: route.group.id.toString(),
-        credentialId: route.accountId.toString(),
-        accountId: route.accountId.toString(),
-        slotId: picked.slotId,
-      };
-    }
-    if (busy) throw busy;
-    return { kind: "unavailable" as const, reason: "no usable Grok subscription account" };
-  };
+  const allocateGrokRelayRoute = createGrokRelayRouteAllocator(scheduler);
   // Internal listeners are assembled before model-authority startup. Renewal
   // reads this forward ref at request time; startup windows fail closed 503.
   let modelAuthoritySigner: AuthoritySigner | undefined;
@@ -1876,7 +914,6 @@ export async function registerCommercial(
       start: () => mediaGenerationService.start(),
     });
   }
-  if (runtimeChannel === "v5") trackScheduler("tutorialModeration", "v5-owned", startTutorialModerationScheduler({ apiKey: cfg.OPENCODE_GO_API_KEY, logger: rootLogger })); // OCV5-577 经验分享 AI 审核;off 缺省只把残留作业转人工;停机中断的作业由 lease 过期重领
   // OCV5-561 Muse media bridge (selfhost). Off unless OC_MUSE_BRIDGE_ENABLED=1; see muse/assemble.ts.
   const museDeliveryRefs: {
     pushRemote?: (args: { hostUuid: string; remotePath: string; content: Buffer }) => Promise<void>;
@@ -2013,6 +1050,9 @@ export async function registerCommercial(
   const delegateEngineBillingRuntimeRef: { current: DelegateEngineBillingRuntime | null } = {
     current: null,
   };
+  const cc5RuntimeRef: { current: ReturnType<typeof createMasterCc5Runtime> } = {
+    current: undefined,
+  };
   // 主动微信投递接收点(cron/提醒 → master 权威解析收件人 → outbox)。与 broker 同生命周期,
   // 同条件块内装配;未装配时 dispatchInternal 显式 404(同 wechat-outbound 语义)。
   const wechatProactiveRef: { current: ProactiveReceiverHandler | null } = { current: null };
@@ -2058,1537 +1098,128 @@ export async function registerCommercial(
   // 2026-07-02 egress split:authz 加载器抽到 auth/userModelAuthz.ts 单一权威
   // (master 与 egress 两进程共用同一份规则),语义与原内联实现逐行等价。
   const loadUserModelAuthz = makeLoadUserModelAuthz();
-  // cron-origin-inject 的 bridge 晚绑定引用:handler 必须在内层 internal-proxy 作用域
-  // 创建(identityRepo 在那里),而 userChatBridge 要到 registerCommercial 尾部才初始化。
-  // 直接闭包引用 const userChatBridge 会在初始化窗口内 TDZ 抛错(b1d9e4fbb 同类问题);
-  // 用可空 ref:bridge 未就绪 → no_transport(503),容器侧按 retryable 下轮重试。
-  let cronOriginBridgeRef: UserChatBridgeHandler | null = null;
   let systemActions: ReturnType<typeof assembleSystemActions> | undefined;
 
-  if (
-    !options.skipInternalProxy &&
-    proxyBind &&
-    proxyPort !== undefined &&
-    selfHostUuid
-  ) {
-    // fail-closed guard(Codex plan review #4 + diff review Blocker):平台默认模型(2026-06-17 起
-    // glm-5.3)路由到静态 provider ark,若 ARK_CODING_PLAN_KEY 未配 → throw,loud fail 拒绝启动。
-    // guard 动态走 PLATFORM_DEFAULT_MODEL→provider→meta.keyConfigField,非硬编码某 provider。
-    // 注:minimax(文本走 ARK_AGENT_PLAN_KEY)/deepseek 不是平台默认,其 key 不被本 guard 拦,
-    // 缺失则命中各自模型时 503。
-    // **必须放在下面 try 之外** —— 该 try 的 catch 只会打印 "internal proxy ... disabling" 并把
-    // internalProxyHandler 置空后让 master 继续跑;若 guard 在 try 内,缺 key 会被降级吞成
-    // "internal proxy 禁用但 master 照跑",违反 loud-fail。放 try 外则异常直接冒泡崩 master boot。
-    // 触发面仅此 internal-proxy/agent-runtime 启动路径;unit test / external proxy harness 不进此分支。
-    // OCV5-424:env key 先幂等导入服务池,再按"env 或池内成员"校验默认模型。
-    await importEnvApiKeys(staticProviderKeysFromConfig(cfg)).catch((err) => console.warn("[commercial] api-key pool env import failed:", (err as Error)?.message ?? err));
-    await primeApiKeyPool().catch(() => {});
-    startApiKeyPoolCache();
-    assertPlatformDefaultModelConfigured(cfg, {
-      apiKeyPoolConfigured: (service) => apiKeyPoolConfiguredServices().has(service),
-    });
-    try {
-      const identityRepo = createPgIdentityRepo();
-      const rateLimitRedis = sharedRateLimitRedis;
-      // V3 Phase 2(2026-05-18 anthropicProxy 拆分):身份层 strategy。
-      // 把 verify + recordHostRequest + loadUserModelAuthz + canUseModel 收口到
-      // IdentityStrategy 单一注入点。loadUserModelAuthz 闭包形状不变(从权威源 DB
-      // 读 role + grants,fail-closed throw → handler 500)。
-      //
-      // V3 CC 外接 plan Phase 3:loadUserModelAuthz 已提到外层共享(见上方注释),
-      // 这里直接传引用,与 api-key strategy 走同一份业务规则。
-      const identityStrategy = makeContainerIdentityStrategy({
-        repo: identityRepo,
-        pricing,
-        loadUserModelAuthz,
-        // recordHostRequest 不显式注入,strategy 内部走模块级 default
-        // (../compute-pool/hostReqCounter.recordHostRequest)。
-      });
-      // ── 模型执行 catalog(模型权威批次 · 方案 §1.2/§4/§6)──────────────────────
-      //
-      // 进程内唯一一份(modelCatalogRuntime 单例)—— bridge 签发 / 内部下发端点 /
-      // 本 handler 共用同一快照,避免同进程两份快照一新一旧导致 fence 结论互斥。
-      //
-      // **生产的 /v1/messages 不走这个 handler**(走独立 egress 进程,egress/main.ts 里
-      // 有同构装配);这里是非 split 拓扑(dev/测试)的对等实现。
-      //
-      // 失败策略的非对称(有意):
-      //   - enforce(OC_MODEL_AUTHORITY=1)→ 抛,拒启(半开状态 = 全站被 fence 拒,
-      //     不如启动就响亮失败);
-      //   - 影子期 → **fail-soft**:catalog 只是观测面,没有任何判定依赖它;此时因为
-      //     0143 未 apply 就把 master 拒启,是纯自伤(零安全收益)。记 error 继续跑 legacy。
-      const modelAuthorityEnforce = isModelAuthorityEnforced();
-      let modelCatalogForProxy: Awaited<ReturnType<typeof getModelCatalogCache>> | undefined;
-      try {
-        modelCatalogForProxy = await getModelCatalogCache();
-      } catch (err) {
-        if (modelAuthorityEnforce) throw err;
-        console.error(
-          "[commercial] model catalog load failed (shadow mode → legacy 判定继续):",
-          err,
-        );
-      }
-      const sharedProxyConcurrency = new ConcurrencyLimiter(DEFAULT_MAX_CONCURRENT_PER_UID);
-      const sharedProxyFallback = new FallbackRateLimiter(
-        DEFAULT_PROXY_RATE_LIMIT.windowSeconds,
-        Math.max(1, Math.floor(DEFAULT_PROXY_RATE_LIMIT.max / 3)),
-      );
-      internalProxyHandler = makeAnthropicProxyHandler({
-        pgPool: getPool(),
-        pricing,
-        preCheckRedis,
-        scheduler,
-        modelCatalog: modelCatalogForProxy,
-        modelAuthorityEnforce,
-        authorityKeyring: authorityKeyringProvider(),
-        identity: identityStrategy,
-        loadUserModelAuthz,
-        rateLimitRedis,
-        concurrencyLimiter: sharedProxyConcurrency,
-        fallbackLimiter: sharedProxyFallback,
-        // HOTFIX 2026-04-21: 不传 refreshDeps 导致 anthropicProxy 里
-        //   `deps.refreshDeps && pick.expires_at && shouldRefresh(...)` 永远 false,
-        // OAuth token 过期后不会自动 refresh,结果上游直接 401。
-        // health 注入进来是为了 refresh 失败时按规约走 health.manualDisable。
-        // v1.0.120:triggerCodexDisableFanout 注入 — disableOnFailure 内部
-        // 按 provider 二次过滤,claude 账号 refresh 失败不会误触发 codex fanout。
-        refreshDeps: { health: healthTracker, triggerCodexDisableFanout },
-        // 真实扣费积分推送 —— proxy 在 finalize.commit 后调,通过 bridge 把
-        // outbound.cost_charged 帧发给用户。bridge 启动顺序在 proxy 之后,
-        // 故用 ref 打破先后(构造期调用是 noop,请求期 bridge 必已 wire)。
-        broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
-        // Plan §4.2 改动 4 — durable persist of debited costCredits into
-        // master's `client_sessions.messages[i].usage.costCredits`. Storage
-        // owns the (sessionId, msgId) lookup via `server_authored_request_map`
-        // and falls back to `pending_usage_patches` when the assistant sink
-        // POST hasn't landed yet.
-        appendCostCredits: appendCostCreditsForUser, // c:<uid> 前缀对齐 session 存储命名空间
-        // 静态 key 文本 provider 的 key 解析表(deepseek/minimax/ark)。cfg 在外层闭包已
-        // loadConfig() 过,这里直接读取;某 provider 未配 → 命中其模型时 503(各自 reject reason)。
-        // 这是 internal proxy(容器/agent runtime 走的上游),三个 provider 全注入。
-        // key 只留 master,不进用户容器。平台默认模型 glm-5.3(ark)的 key(ARK_CODING_PLAN_KEY)缺失
-        // 已由下方 assertPlatformDefaultModelConfigured guard 在装配前 loud-fail;minimax(文本走
-        // ARK_AGENT_PLAN_KEY)/deepseek 不被该 guard 拦,缺失则命中其模型时 503。
-        staticProviderKeys: staticProviderKeysFromConfig(cfg),
-        apiKeyPoolEnabled: true,
-        // v1.0.207 起 Phase 6 account_uuid 锚定(plan §3.0)+ csap session pin 三态
-        // (0072+0073+0074),从 env-only 迁到 `system_settings` 表(admin UI 立即可改,
-        // 不需要 systemctl restart)。注入 30s TTL cache 的 getter
-        // (`admin/runtimeFlags.ts`)— pickUpstream 入口 await 一次冻结到局部常量,
-        // scheduler.pick 与 hook 同值消费,保留 plan §5.5.4 竞态防护设计。
-        getPhase6AccountUuidEnforce,
-        getSessionPinMode,
-        listEnabledAccountGroupsForModel: listEnabledGroupsForModel,
-      });
-      // 2026-05-05 v3 commercial server-authored persistence — 复用 18791/18443
-      // 同一个 listener,新加 POST /internal/v3/server-authored-message。
-      // 路由由 dispatchInternal 按 url path 分流;仅 path 完全匹配 SERVER_AUTHORED_PATH
-      // 才进新 handler,其它路径仍透到 anthropicProxy(其内部还有 /v1/messages 白名单)。
-      // 新 handler 与 anthropicProxy 共用 (hostUuid, boundIp) ctx 与 verifyContainerIdentity 双因子。
-      // 详见 packages/commercial/src/http/internalServerAuthored.ts。
-      const serverAuthoredHandler: ServerAuthoredHandler = makeServerAuthoredHandler({
-        identityRepo,
-        losslessTurnTapeStorage,
-        settleCodexBilling: settleTapeEngineBilling,
-        applyTurnWaiver: (input) => applyTurnWaiver(getPool(), input),
-        broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
-        onTapeFinalized: () => tapeSchedulerKickRef.current(),
-        storage: {
-          appendServerAuthoredMessage,
-          appendServerAuthoredMessageForRequest,
-          appendServerAuthoredMessageDrainByUser,
-          drainDelegateCostForClientSession,
-          getClientSession,
-          readArchivedMessages,
-          patchServerAuthoredMessage,
-        },
-        recordOversized: ({ userId, requestId, sessionId }) => {
-          void recordProductFrictionEvent({
-            correlation: requestId,
-            userId,
-            surface: "session",
-            stage: "persist",
-            code: "SESSION_OVERSIZED",
-            outcome: "failed",
-            sessionId,
-          }, getPool()).catch(() => {});
-        },
-      });
-      // Codex reverse-RPC `account/chatgptAuthTokens/refresh` over HTTP.
-      // Container's gateway forwards 401-recovery refresh asks here; we read
-      // the bound codex_account, refresh upstream, persist to DB + per-container
-      // auth.json under FOR UPDATE, and return the new token. Without this
-      // path every codex 401 fails the turn (-32601 method-not-found).
-      //
-      // egress split(M1b 架构决策):装配收口在 http/codexInternalAssembly.ts,
-      // 同一份实现同时在 egress 进程本地挂载(egress/main.ts,容器流量不过 master
-      // → master 重启不断 codex 刷新/在飞流);master 侧挂载保留,服务非 split
-      // 拓扑(dev/测试)。改 codex relay/refresh 代码部署须 `deploy-v5.sh --egress`。
-      const codexTokenRefreshHandler: CodexTokenRefreshHandler = buildCodexTokenRefreshHandler({
-        identityRepo,
-        rateLimitRedis,
-        healthTracker,
-        // selfHostId 取自外层闭包 selfHostUuid;此分支已 guard 它非空。
-        selfHostId: selfHostUuid,
-        // v1.0.120:triggerCodexDisableFanout — codex token refresh 失败 disable
-        // 后立刻 fanout rebind 其他活跃容器,避免老 token 仍被 codex CLI 沿用。
-        triggerCodexDisableFanout,
-      });
-      // /v3/literature/search — DeepXiv 文献检索 proxy。复用 identityRepo
-      // (同 anthropicProxy 的双因子身份),token 留在 master,容器只走 mTLS 内部 proxy。
-      // GET-then-INCR Lua 配额 + per-container 60req/5min in-memory limiter。
-      const literatureProxyHandler: LiteratureProxyHandler = makeLiteratureProxyHandler({
-        identityRepo,
-        redis,
-      });
-      // /v3/connectors/{list|call} — 应用连接器容器 RPC(oc-connect CLI 回源)。
-      // 同款 verifyContainerIdentity 双因子;第三方凭据只在 master(connections 表
-      // AES-256-GCM),容器只带自身身份 bearer。写操作过确认门(connector_write_ledger),
-      // 出站过 outboundPolicy(自由域 DNS 钉死 / 固定域静态白名单)。
-      const connectorsRpcHandler: ConnectorsRpcHandler = makeConnectorsRpcHandler({
-        identityRepo,
-        redis,
-        pluginFacade,
-        // 管理中心 → 插件 的启用开关在容器侧生效（OCV5-383）。
-        pluginEnablement: PREFS_PLUGIN_ENABLEMENT,
-      })
-      // /v3/research/* — 科研 agent 能力 proxy(oc-lit 多源检索 + oc-cite 引用门禁)。
-      // 同款 verifyContainerIdentity 双因子;平台 secret(S2/Unpaywall 等)留 master;
-      // enabled 由 research_config 控制(off → 503)。免费源(OpenAlex/Crossref/arXiv)无 key。
-      const researchProxyHandler: ResearchProxyHandler = makeResearchProxyHandler({
-        identityRepo,
-        redis,
-      });
-      // /v3/ocr/* — container-authenticated async SCNet document parsing.
-      // Provider credentials and durable tenant ownership stay on master.
-      const ocrProxyHandler: OcrProxyHandler = makeOcrProxyHandler({
-        identityRepo,
-        store: new PgOcrJobStore(getPool()),
-      });
-      // /internal/v3/platform-prompt-slots — 容器 → master 拉取平台级 prompt slot
-      // (SKILLS_LITERATURE / MODEL_HINT)。镜像 build 排除 packages/commercial,所以
-      // 容器进程内的 gateway 看不到 setLiteratureSkillProvider / setModelHintProvider
-      // 注册的 hook;这条 endpoint 把 master 持有的 slot 内容 GET 给容器,在容器
-      // buildPromptContext 时合并进 extra-prompt.md。详见
-      // packages/commercial/src/http/internalPlatformPromptSlots.ts 头注。
-      const platformPromptSlotsHandler: PlatformPromptSlotsHandler =
-        makePlatformPromptSlotsHandler({
-          identityRepo,
-          pricingCache: pricing,
-          // MODEL_HINT 的 alias→canonical 单一权威 = catalog(model_aliases);
-          // pricingCache 只留 extra_system_prompt 文案。未装配(shadow 期 catalog
-          // 拉不起来)→ handler 内部退 legacy 归一。
-          catalog: modelCatalogForProxy,
-        });
-      const projectContextHandler: InternalProjectContextHandler =
-        makeInternalProjectContextHandler({ identityRepo });
-      // /internal/v3/project-assets — 容器回合产出登记进 master sessions 后端(PG),
-      // 侧栏/资产面板读的就是它;容器本地 SQLite 没人读。租户只取容器身份。
-      const projectAssetsHandler: InternalProjectAssetsHandler =
-        makeInternalProjectAssetsHandler({ identityRepo });
-      // /internal/v3/project-search — the agent's project_search tool (via the
-      // container gateway). Tenant from the container identity only; searches
-      // the tenant's chat project bound to the given board id. 404 unless
-      // OC_PROJECT_CONTEXT and OC_P5_PROJECT_SEARCH are on.
-      const projectSearchHandler: InternalProjectSearchHandler =
-        makeInternalProjectSearchHandler({ identityRepo });
-      // /internal/v3/minimax:master 代持 MiniMax key 调多模态 API 并记账,key 不进容器(OCV5-589/D12 可用独立 key 文件)。
-      const minimaxMediaHandler: MiniMaxMediaHandler = makeMiniMaxMediaHandler({
-        identityRepo,
-        pgPool: getPool(),
-        tokenPlanKey: mediaProxyKey(cfg),
-        windowCap: cfg.OC_MINIMAX_MEDIA_WINDOW_MAX_CALLS,
-      });
-      const mediaGenerationInternalHandler: MediaGenerationInternalHandler =
-        makeMediaGenerationInternalHandler({ identityRepo, service: mediaGenerationService });
-      // /internal/v3/muse-media — oc-muse (OCV5-561). 403 MUSE_NOT_ENABLED when off or not allowlisted.
-      const museInternalHandler = makeMuseInternalHandler({ identityRepo, hub: museHub });
-      const sitesInternalHandler = makeSitesInternalHandler({ identityRepo, sites: sitesService });
-      const tavilyWebSearchHandler: TavilyWebSearchHandler = makeTavilyWebSearchHandler({
-        identityRepo,
-        apiKey: cfg.TAVILY_API_KEY,
-      });
-      // /internal/v3/minimax-search — 容器内 CCB 内置 WebSearch(MiniMaxSearchAdapter)回源 master。
-      // key(MINIMAX_TOKEN_PLAN_KEY)只在 master,不注入容器;同款 verifyContainerIdentity 双因子。
-      // MiniMax coding_plan/search 中文深度强,替代脆弱的 Bing HTML 刮页(Bing Search API 已退役)。
-      const minimaxWebSearchHandler: MiniMaxWebSearchHandler = makeMiniMaxWebSearchHandler({
-        identityRepo,
-        tokenPlanKey: cfg.MINIMAX_TOKEN_PLAN_KEY,
-      });
-      // MiniMax 失败时 CCB 再打这条。Grok 订阅 token 只留在 master。
-      const grokWebSearchHandler: GrokWebSearchHandler = makeGrokWebSearchHandler({
-        identityRepo,
-      });
-      // /internal/v3/grok-vision — 识图后端(oc-figcheck)。
-      // 容器只交图片和问题;master 借一个 Grok 账号调 Grok 4.7,并按 grok-build 目录价
-      // 走 预扣 → journal → 结算(用量取上游响应)。订阅 token 和计费请求号都不出 master。
-      const grokVisionHandler: GrokVisionHandler = makeGrokVisionHandler({
-        identityRepo,
-        getPool,
-        preCheckRedis,
-        pricing,
-        catalog: {
-          async assertFresh() {
-            const cache = modelCatalogForProxy ?? peekModelCatalogCache();
-            if (!cache) throw new Error("GROK_VISION_CATALOG_UNAVAILABLE");
-            return cache.assertFresh();
-          },
-        },
-        loadUserModelAuthz,
-        recordStatus: makeGrokRelayHealthRecorder({ health: healthTracker }),
-        broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
-      });
-      // OCV5-591 A2-1: the studio's director agent plans with the same Grok core (platform-paid steps).
-      if (studioHttp) {
-        const studioGrokCatalog = {
-          async assertFresh() {
-            const cache = modelCatalogForProxy ?? peekModelCatalogCache();
-            if (!cache) throw new Error("GROK_VISION_CATALOG_UNAVAILABLE");
-            return cache.assertFresh();
-          },
-        };
-        stopStudioOrchestrator = startStudioOrchestrator({
-          cfg,
-          pool: getPool(),
-          studio: studioHttp,
-          museHub,
-          push: (uid, frame) => studioPushRef.current(uid, frame),
-          grok: makeGrokRunner({
-            getPool,
-            preCheckRedis,
-            pricing,
-            catalog: studioGrokCatalog,
-            loadUserModelAuthz,
-            recordStatus: makeGrokRelayHealthRecorder({ health: healthTracker }),
-          }),
-          // OCV5-591 A2-1b-1: visual QA reserves one run's worst case against the project budget.
-          grokMaxCost: (model) => grokRunMaxCost(studioGrokCatalog, model),
-          // A stored QA answer whose settle may not have happened is settled again (idempotent).
-          grokResettle: (i) =>
-            resettleGrokRun(
-              { getPool, preCheckRedis, pricing },
-              { ...i, containerId: null, durationMs: 0 },
-            ),
-        })?.stop;
-      }
-      // /internal/v3/codex-relay — 平台管控的 codex api_relay 流式转发。
-      // egress split(M1b 架构决策):同一 handler 同时在 egress 进程本地挂载,
-      // 生产在飞 codex 流走 egress 不经 master;master 挂载留作非 split 拓扑兜底。
-      const codexRelayHandler: CodexRelayHandler = buildCodexRelayHandler({
-        identityRepo,
-        preCheckRedis,
-        pgPool: getPool(),
-        onImageCharge: (uid, charge) => {
-          bridgeBroadcastRef.current(uid, {
-            type: 'outbound.cost_charged',
-            costCredits: charge.costCredits,
-            balanceAfter: charge.balanceAfter,
-          })
-        },
-      });
-      const grokRelayHandler: GrokRelayHandler = makeGrokRelayHandler({
+  ({
+    internalProxyServer,
+    internalProxyHandler,
+    internalProxyAddress,
+    dispatchInternal,
+    controlListener,
+  } = await bootstrapInternalProxyAndListeners({
+    env: process.env,
+    cfg,
+    runtimeChannel,
+    ocSlot,
+    dualMasterEnabled,
+    egressSplitEnabled,
+    skipInternalProxy: options.skipInternalProxy,
+    proxyBind,
+    proxyPort,
+    selfHostUuid,
+    flavorIdentity,
+    jwtSecret,
+    redis,
+    sharedRateLimitRedis,
+    preCheckRedis,
+    pricing,
+    scheduler,
+    healthTracker,
+    loadUserModelAuthz,
+    triggerCodexDisableFanout,
+    appendCostCreditsForUser,
+    losslessTurnTapeStorage,
+    dispatchAdmissionBackend,
+    settleTapeEngineBilling,
+    pluginFacade,
+    mediaGenerationService,
+    museHub,
+    sitesService,
+    studioHttp,
+    allocateGrokRelayRoute,
+    createGrokRelayHandler: (identityRepo) =>
+      makeGrokRelayHandler({
         identityRepo,
         logger: rootLogger.child({ subsys: "grokRelay" }),
-        // Per-request account feedback through the shared health tracker:
-        // 401/403/429/5xx count toward the same 3-strike cooldown as CCB, and
-        // cooldownRecoveryActor half-opens the row 10 minutes later. Previously
-        // the relay only bumped counters, so a dead Grok token stayed routable
-        // until the hourly usage sweep marked it oauth_terminal.
         recordStatus: makeGrokRelayHealthRecorder({ health: healthTracker }),
         renewSlot: (accountId, slotId) => {
           if (!scheduler.renewCodexSlot(accountId, slotId)) {
-            // resolveGrokRouteContext already proved the durable row active.
-            // Rebuild a local mirror forgotten by a restart/orphan reaper.
             scheduler.restoreCodexSlot(accountId, slotId);
           }
           return true;
         },
-      });
-      // /internal/v5/delegate/grok-route/* — 容器本地 delegate turn 的 grok route
-      // mint/renew/release(与浏览器 turn 同一账号池与 durable 并发权威)。两版都挂载:
-      // 容器在 mint 后必须先过 delegate 计费准入(绑定 routeTokenHash),grok relay 对
-      // kind=delegate 的路由只在有 inflight 计费 journal 时放行(OCV5-477)。
-      const delegateGrokRouteHandler: DelegateGrokRouteHandler = makeDelegateGrokRouteHandler({
-        identityRepo,
-        // origin=delegate:短心跳租约 + per-container 限额(与浏览器 bridge
-        // 的 7 天孤儿 TTL 语义分离,见 allocateGrokRelayRoute 注释)。
-        allocate: (input) => allocateGrokRelayRoute({ ...input, origin: "delegate" }),
-        release: async ({ routeToken, containerId, userId }) => {
-          const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
-          if (!context) return false;
-          await expireGrokRouteContextByLease(context.accountId, context.slotId);
-          scheduler.releaseCodexSlot(context.accountId, context.slotId);
-          return true;
-        },
-        renew: async ({ routeToken, containerId, userId }) => {
-          const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
-          if (!context) return false;
-          if (!scheduler.renewCodexSlot(context.accountId, context.slotId)) {
-            scheduler.restoreCodexSlot(context.accountId, context.slotId);
-          }
-          return true;
-        },
-        logger: rootLogger.child({ subsys: "delegateGrokRoute" }),
-      });
-      // /internal/v5/delegate/antigravity-route/* & /internal/v5/antigravity-relay/* (OCV5-738/761)
-      const antigravityRouteRuntime = createAntigravityRouteRuntime({
-        identityRepo, pool: getPool(), relayPort: V3_CONTAINER_PORT,
-        clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
-        readBalance: readTotalSpendableBalance, rootLogger, pricing,
-      });
-      const delegateAntigravityRouteHandler =
-        process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === "1"
-          ? antigravityRouteRuntime.makeDelegateHandler()
-          : undefined;
-      const zcodeRelayHandler: ZcodeRelayHandler = makeZcodeRelayHandler({
-        identityRepo,
-        codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? "",
-      });
-      const antigravityRelayHandler = antigravityRouteRuntime.relayHandler;
-      // /internal/v3/skill-embed — 容器内 mcp-memory 语义 skill_search 回源 master。
-      // master 持 SKILL_EMBEDDING_API_KEY/DASHSCOPE_API_KEY(只在 master env,不注入容器),
-      // 同款 verifyContainerIdentity 双因子鉴权;向量跨租户 PG 缓存,fail-closed 回落关键词。
-      const skillEmbedHandler: SkillEmbedHandler = makeSkillEmbedHandler({
-        identityRepo,
-        cache: makePgSkillEmbedCache(),
-        recordSearch: makePgSkillSearchLogger(),
-      });
-      // Core memory stays first-party: current safe chunks are ranked by the
-      // q8 model bundled in this master release, with no vector persistence.
-      const coreMemoryRankHandler: CoreMemoryRankHandler = makeCoreMemoryRankHandler({
-        identityRepo,
-      });
-      // /internal/v3/marketplace/sync — 容器内 mcp-memory 拉取本用户已安装(未撤回)
-      // 的市场 skill artifact 做 hub 对账(pull 模型,同款 verifyContainerIdentity)。
-      const marketplaceSyncHandler: MarketplaceSyncHandler = makeMarketplaceSyncHandler({
-        identityRepo,
-        flavorIdentity,
-      });
-      // /internal/v3/turn-waive — 滚动升级/审计修复的兼容入口。master 只按
-      // (user, turnKey) 精确冲正，并在同一事务写一封定向站内信。主路径
-      // 由 lossless turn tape 携 waiveReason，不再使用会话时间窗口。
-      const turnWaiveHandler: TurnWaiveHandler = makeTurnWaiveHandler({
-        identityRepo,
-        pgPool: getPool(),
-        broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
-      });
-      const turnLeaseRenewHandler: TurnLeaseRenewHandler = makeTurnLeaseRenewHandler({
-        identityRepo,
-        pgPool: getPool(),
-        getSigner: () => modelAuthoritySigner,
-      });
-      // durable turn dispatch(RFC §2.4 / §3):容器 boot recovery 查 tape 三态。同容器身份双因子。
-      const ccbTranscriptRestoreHandler = makeCcbTranscriptRestoreHandler({
-        identityRepo,
-        read: makeCcbTranscriptRestoreReader(getPool()),
-      });
-      const turnTapeStateHandler: ServerAuthoredHandler = makeTurnTapeStateHandler({
-        identityRepo,
-        storage: dispatchAdmissionBackend,
-      });
-      // V5 queue P1 compatibility layer:strict opt-in. Flag off means no store
-      // instance and no route registration, so legacy internal dispatch remains exact.
-      const promptQueueHandler: PromptQueueHandler | null = isPromptQueueV1Enabled()
-        ? makePromptQueueHandler({
-            identityRepo,
-            store: new PgPromptQueueStore(getPool()),
-          })
-        : null;
-      // /internal/v3/marketplace/agent/* — 容器内 AI(market skill / oc-market CLI)
-      // 代用户做市场操作(search/install/uninstall/publish),同款 verifyContainerIdentity
-      // 限本用户;install 仅已审内容、publish 仅入 pending(管理员审核前不上线)。
-      const marketplaceAgentHandler: MarketplaceAgentHandler = makeMarketplaceAgentHandler({
-        identityRepo,
-        listPublicModels: () => pricing.listPublic(),
-      });
-      // /internal/v3/agent-audit/tool-failure — 容器 gateway 自动上报失败工具调用。
-      // user_id 由 verifyContainerIdentity 推导,不信任容器传入;写入 agent_audit 供后台优化。
-      // 显式开关 OC_TOOL_FAILURE_AUDIT=1(与容器侧 reporter 同名 env,supervisor 只在
-      // master 设了才透传进容器):未开启 → 不注册路由,path fall through 到
-      // internalProxyHandler 返 404,容器侧按 fatal 直接 drop —— 与"未部署"等价。
-      // v3 env 无此键 = 默认关,代码合回 v3 也不会静默对现网开启明文遥测。
-      const toolFailureAuditHandler: ToolFailureAuditHandler | null = isToolFailureAuditEnabled()
-        ? makeToolFailureAuditHandler({
-            identityRepo,
-            queryRunner: getPool(),
-          })
-        : null;
-      const toolCallRollupHandler: ToolCallRollupHandler | null = isToolFailureAuditEnabled()
-        ? makeToolCallRollupHandler({
-            identityRepo,
-            queryRunner: getPool(),
-          })
-        : null;
-      const turnObservationHandler = isToolFailureAuditEnabled()
-        ? makeTurnObservationHandler({ identityRepo, queryRunner: getPool() })
-        : null;
-      // Privacy-minimized memory operation stream. Always registered when the
-      // runtime has a container identity channel; no raw query/session/body is accepted.
-      const memoryUsageHandler = makeMemoryUsageHandler({
-        identityRepo,
-        queryRunner: getPool(),
-      });
-      // /internal/v3/marketplace/skill-usage — 容器 gateway skillUsageReporter 批量上报
-      // 「hub 技能被使用」的低敏信号(slug/agent/trace,不记内容)。user_id 由
-      // verifyContainerIdentity 推导,不信容器传入;写入 marketplace_skill_usage_events 供
-      // 目录聚合(usage30d/users30d + 评分归因)。与 tool-failure 相反 = **默认开**
-      // (OC_MARKET_SKILL_USAGE 显式 '0' 才关):关闭 → 不注册路由,path fall through 到
-      // internalProxyHandler 返 404,容器侧按 fatal drop —— 与"未部署"等价。
-      const skillUsageHandler: SkillUsageHandler | null = isSkillUsageEnabled()
-        ? makeSkillUsageHandler({
-            identityRepo,
-            queryRunner: getPool(),
-          })
-        : null;
-      // /internal/v3/skill-shadow — 四路 cost-free 检索旁路 + 同 turn skill_view 金标。
-      // 严格 opt-in:env 缺省时不注册路由，与容器侧 listener 的门控同源。
-      const skillShadowHandler: SkillShadowHandler | null = isSkillShadowEnabled()
-        ? makeSkillShadowHandler({
-            identityRepo,
-            queryRunner: getPool(),
-          })
-        : null;
-      // /internal/v3/marketplace/skill-feedback — 容器 gateway 起技能训练前拉「该用户对该技能
-      // 差评过的真实场景引用」(只回 sessionKey/traceId/at,内容主权不出容器)。user_id 由
-      // verifyContainerIdentity 推导。**无条件注册**:纯只读端点,无数据时返 {refs:[],total:0};
-      // 即便 skill-usage 上报关闭(无事件写入)本端点也只是恒返空,gateway 侧 fail-open 照常训练。
-      const skillFeedbackHandler: SkillFeedbackHandler = makeSkillFeedbackHandler({
-        identityRepo,
-        queryRunner: getPool(),
-      });
-      const autoDreamPolicyHandler: AutoDreamPolicyHandler = makeAutoDreamPolicyHandler({
-        identityRepo,
-      });
-      const autoDreamOptimizerHandler = makeAutoDreamOptimizerHandler({
-        identityRepo,
-        runtimeRef: autoDreamOptimizerRuntimeRef,
-      });
-      const advisorCodexRelayDb = makeDefaultCodexRelayDb();
-      delegateEngineBillingRuntimeRef.current = createDelegateEngineBillingRuntime({
-        getPool,
-        preCheckRedis,
-        pricing,
-        catalog: {
-          async assertFresh() {
-            const cache = modelCatalogForProxy ?? peekModelCatalogCache();
-            if (!cache) {
-              throw new Error("DELEGATE_ENGINE_BILLING_CATALOG_UNAVAILABLE");
-            }
-            return cache.assertFresh();
-          },
-        },
-        loadUserModelAuthz,
-        createCodexDelegateRoute: async ({ containerId, userId, modelId }) => {
-          const createRoute = commercialCodexRouteRef.current
-          if (!createRoute) return { kind: 'unavailable' as const, reason: 'selector_unwired' }
-          return selectAdvisorCodexAdmitRoute({
-            containerId,
-            userId,
-            modelId,
-            createRoute,
-            readBinding: (id) => advisorCodexRelayDb.readContainerBinding(id),
-          })
-        },
-        expireCodexDelegateRoute: (token) => expireCodexRouteContext(token).then(() => {}),
-        broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
-        logger: rootLogger.child({ subsys: "openTurnAttribution" }),
-      });
-      const delegateTraceHandler = makeDelegateTraceHandler({ pool: getPool(), identityRepo });
-      const delegateEngineBillingHandler = makeDelegateEngineBillingHandler({
-        identityRepo,
-        runtimeRef: delegateEngineBillingRuntimeRef,
-      });
-      // 平台 preset seed 会写双 slot 共享的 marketplace current 指针，必须跟随唯一
-      // leadership，而非 candidate process startup。初次 acquire / finalize 接管 / abort
-      // 后旧 slot re-acquire 都 await 同一幂等逻辑；单个 seed 仍沿用原 fail-soft 语义。
-      if (runtimeChannel === "v5") {
-        seedPlatformAgentsForLeadership = async () => {
-          // 平台官方**科研** agent：仅 research_config 开启时 seed。
-          try {
-            const rc = await getResearchConfigPublic();
-            if (rc.enabled) {
-              const seeded = await seedPlatformResearchAgents({
-                listPublicModels: () => pricing.listPublic(),
-              });
-              console.log(
-                "[commercial] platform research agents seed:",
-                JSON.stringify(seeded),
-              );
-            }
-          } catch (err) {
-            console.error("[commercial] seedPlatformResearchAgents failed:", err);
-          }
-          // 平台官方**通用** agent(办公助手 + 编程助手)：不依赖 research_config，无条件 seed。
-          try {
-            const seeded = await seedPlatformGeneralAgents({
-              listPublicModels: () => pricing.listPublic(),
-            });
-            console.log(
-              "[commercial] platform general agents seed:",
-              JSON.stringify(seeded),
-            );
-          } catch (err) {
-            console.error("[commercial] seedPlatformGeneralAgents failed:", err);
-          }
-        };
-      }
-      // 有效默认集(selfhost 仅 GitHub)经完整 securityApprove 审计；幂等异步 seed，失败仅记录。
-      void (async () => {
-        try {
-          const seeded = await seedDefaultConnectors(getPool());
-          console.log("[commercial] default connectors seed:", JSON.stringify(seeded));
-        } catch (err) {
-          console.error("[commercial] seedDefaultConnectors failed:", err);
-        }
-      })();
-      // egress split:cost 回执接收端(egress finalize 后的 SQLite 持久化 + WS 广播
-      // 回投)。仅 split 模式挂载;秘钥头校验在 handler 内(loopback + egress 剥头 +
-      // 秘钥三层)。
-      const costEventHandler: CostEventHandler = makeCostEventHandler({
-        secret: cfg.OC_EGRESS_SECRET,
-        appendCostCredits: appendCostCreditsForUser,
-        broadcastToUser: async (uid, payload) => {
-          if (dualMasterEnabled) {
-            await slotRelayClient.broadcastToUsers([uid.toString()], payload);
-            return;
-          }
-          bridgeBroadcastRef.current(uid, payload);
-        },
-      });
-      // /internal/v3/cron-index — 容器 gateway 上报「派生唤醒索引」(nextFireAt/enabledCount)。
-      // uid 由 verifyContainerIdentity 推导;upsert cron_wake_index(runtime_channel=当前)。
-      // 见 http/internalCronIndex.ts + agent-sandbox/cronWake.ts。runner 用 getPool()(结构上
-      // 满足 CronWakeRunner 宽松契约,同 toolFailureAudit 传 getPool() 的取舍)。
-      const cronIndexHandler: CronIndexHandler = makeCronIndexHandler({
-        identityRepo,
-        runner: getPool() as unknown as CronWakeRunner,
-      });
-      const cronOriginInjectHandler: CronOriginInjectHandler = makeCronOriginInjectHandler({
-        identityRepo,
-        inject: (input) =>
-          cronOriginBridgeRef
-            ? cronOriginBridgeRef.injectCronOriginTurn(input)
-            : Promise.resolve({ kind: "no_transport" as const }),
-      });
-      // /internal/v3/inbox-post — 容器 onDeliver「离线送达兜底写站内信」。uid 由容器身份推导,
-      // audience 硬编码 'user' 只给自己写;created_by = MIN active admin(同 onboarding 语义,
-      // 每次现解析,不缓存)。无 admin → 抛错 → handler 500。见 http/internalInboxPost.ts。
-      // selfhost 限制:中央网关若共用一个容器 bearer,所有 cron 都会记到该 bearer 对应 uid;
-      // 当前 selfhost 单主用户,cron 跑在 uid 容器内,token 即该用户,路径可用。
-      const postInboxToUser = async (
-        uid: number,
-        msg: { title: string; bodyMd: string; level: "info" | "warning"; deliveryKey?: string },
-      ) => {
-        const adminRow = await getPool().query<{ id: string }>(
-          `SELECT id::text AS id FROM users WHERE role = 'admin' AND status = 'active' ORDER BY id ASC LIMIT 1`,
-        );
-        const senderId = adminRow.rows[0]?.id;
-        if (!senderId) throw new Error("inbox-post: no active admin sender");
-        if (msg.deliveryKey) {
-          await createCronDeliveryInboxMessage({
-            userId: uid,
-            title: msg.title,
-            bodyMd: msg.bodyMd,
-            level: msg.level,
-            createdBy: senderId,
-            deliveryKey: msg.deliveryKey,
-          });
-          return;
-        }
-        await createInboxMessage(senderId, {
-          audience: "user",
-          user_id: uid,
-          title: msg.title,
-          body_md: msg.bodyMd,
-          level: msg.level,
-        });
-      };
-      const inboxPostHandler: InboxPostHandler = makeInboxPostHandler({
-        identityRepo,
-        postMessage: postInboxToUser,
-      });
-      // 熔断告警:允许 warning,仍走同一 createInboxMessage / deliveryKey 幂等。
-      const inboxAlertHandler: InboxPostHandler = makeInboxPostHandler({
-        identityRepo,
-        postMessage: postInboxToUser,
-        allowWarning: true,
-      });
-      // /internal/v3/model-catalog{,-epoch} —— 容器 catalog client 的 per-uid 投影下发
-      // (模型权威批次 §3/§6)。服务的是**本地路径**(cron/synthetic/delegate)判定;浏览器
-      // turn 的判定随 inbound 的签名 descriptor 下来,不经这条路。
-      //
-      // catalog 未装配(影子期 + 0143 未 apply)→ **不注册**:path fall through 到
-      // internalProxyHandler 返 404,容器侧 catalog client 把 404 当"拿不到权威快照" →
-      // 本地路径拒新 turn(fail-closed,与"未部署"等价)。
-      //
-      // **这两条 path 不进 browser→container 代理 allowlist**:那份 allowlist(gateway
-      // bridgeApiAllowlist + commercial containerApiProxy)只收 /api/*,结构上不可能命中
-      // /internal/v3/*;__tests__/internalModelCatalog.test.ts 有显式断言把它钉死。
-      const modelCatalogHandler: ModelCatalogHandler | null = modelCatalogForProxy
-        ? makeModelCatalogHandler({
-            identityRepo,
-            catalog: modelCatalogForProxy,
-            loadUserModelAuthz,
-            // Team fallback selection must see newly opened/cleared quota circuits
-            // immediately; the endpoint itself is already a narrow local-turn call.
-            loadRoutingAvailability: () =>
-              getProviderRoutingAvailability(Date.now(), undefined, undefined, true),
-            loadAgentCostOverrides: () => listAgentCostOverrides(getPool()),
-          })
-        : null;
-      void (async () => {
-        const deskFlags = await getDesktopFlagSnapshot();
-        if (!deskFlags.assembled) return;
-        const deskRepo = createPgDesktopIdentityRepo();
-        const deskVerify = makeDesktopRequestVerifier(deskRepo);
-        const deskIdentity = makeDesktopIdentityStrategy({
-          repo: deskRepo,
-          tlsFromReq: (req) => extractDesktopTlsContext(req),
-          pricing,
-          loadUserModelAuthz,
-        });
-        const deskMessages = makeAnthropicProxyHandler({
-          pgPool: getPool(),
-          pricing,
-          preCheckRedis,
-          scheduler,
-          identity: deskIdentity,
-          loadUserModelAuthz,
-          rateLimitRedis,
-          runtimeKind: "desktop",
-          modelCatalog: modelCatalogForProxy,
-          modelAuthorityEnforce,
-          authorityKeyring: authorityKeyringProvider(),
-          refreshDeps: { health: healthTracker, triggerCodexDisableFanout },
-          broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
-          appendCostCredits: appendCostCreditsForUser,
-          getPhase6AccountUuidEnforce,
-          getSessionPinMode,
-          listEnabledAccountGroupsForModel: listEnabledGroupsForModel,
-          concurrencyLimiter: sharedProxyConcurrency,
-          fallbackLimiter: sharedProxyFallback,
-        });
-        const deskHttpDeps = {
-          jwtSecret,
-          mailer: stubMailer,
-          redis: wrapIoredis(redis),
-          desktopTunnelRegistry: getDesktopTunnelRegistry(),
-        } as import("./http/handlers.js").CommercialHttpDeps;
-        const listener = await startDesktopTlsListener({
-          role: "master",
-          allowRegister: true,
-          handlers: {
-            messages: deskMessages,
-            tokenMint: (req, res) => handleDesktopTokenMint(req, res, desktopTokenRequestContext(req), deskHttpDeps),
-            tokenRefresh: (req, res) => handleDesktopTokenRefresh(req, res, desktopTokenRequestContext(req), deskHttpDeps),
-            runtimeManifest: (req, res) => handleDesktopRuntimeManifest(req, res, desktopTokenRequestContext(req), deskHttpDeps),
-            serverAuthored: makeServerAuthoredHandler({
-              identityRepo,
-              verify: deskVerify,
-              losslessTurnTapeStorage,
-              storage: {
-                appendServerAuthoredMessage,
-                appendServerAuthoredMessageForRequest,
-                appendServerAuthoredMessageDrainByUser,
-                drainDelegateCostForClientSession,
-                getClientSession,
-                readArchivedMessages,
-                patchServerAuthoredMessage,
-              },
-            }),
-            turnTape: makeTurnTapeStateHandler({
-              identityRepo,
-              verify: deskVerify,
-              storage: dispatchAdmissionBackend,
-            }),
-            turnLease: makeTurnLeaseRenewHandler({
-              identityRepo,
-              pgPool: getPool(),
-              getSigner: () => modelAuthoritySigner,
-              verify: deskVerify,
-            }),
-            catalog: modelCatalogHandler
-              ? makeModelCatalogHandler({
-                  identityRepo,
-                  verify: deskVerify,
-                  catalog: modelCatalogForProxy!,
-                  loadUserModelAuthz,
-                })
-              : async (_req, res) => {
-                  res.statusCode = 503;
-                  res.end();
-                },
-          },
-          identityRepo: deskRepo,
-        });
-        if (listener) desktopTlsClose = () => listener.close();
-      })().catch((err) => {
-        rootLogger.warn("[commercial] desktop TLS listener not started", { err: (err as Error)?.message });
-      });
-      // seed 完整性(§5 / R2-M8):平台预设 agent 引用的模型必须在 catalog active,否则用户
-      // 点开预设助手第一句话就被 gate 拒。**全局**断言(per-uid 下发仍严格过滤、不强塞)。
-      // 影子期只告警(判定还没切过去,不该因此拒启);enforce 期 → 抛。
-      if (modelCatalogForProxy) {
-        try {
-          assertSeedModelsActive(modelCatalogForProxy.current());
-        } catch (err) {
-          if (modelAuthorityEnforce) throw err;
-          console.error("[commercial] seed model catalog check failed (shadow):", err);
-        }
-      }
-      dispatchInternal = (req, res, ctx) => {
-        const path = (req.url ?? "/").split("?")[0];
-        if (path === INTERNAL_SYSTEM_ACTIONS_PATH) {
-          if (!systemActions) { sendJson(res, 503, { error: { code: 'UNAVAILABLE', message: '系统操作尚未就绪。' } }); return Promise.resolve(); }
-          return systemActions.handleInternal(req, res, ctx);
-        }
-        if (egressSplitEnabled && path === COST_EVENT_PATH) {
-          return costEventHandler(req, res);
-        }
-        if (
-          modelCatalogHandler &&
-          (path === MODEL_CATALOG_PATH || path === MODEL_CATALOG_EPOCH_PATH)
-        ) {
-          return modelCatalogHandler(req, res, ctx);
-        }
-        if (path === SERVER_AUTHORED_PATH) {
-          return serverAuthoredHandler(req, res, ctx);
-        }
-        if (path === CCB_TRANSCRIPT_RESTORE_PATH) return ccbTranscriptRestoreHandler(req, res, ctx);
-        if (path === TURN_TAPE_STATE_PATH) {
-          return turnTapeStateHandler(req, res, ctx);
-        }
-        if (path === LITERATURE_SEARCH_PATH) {
-          return literatureProxyHandler(req, res, ctx);
-        }
-        if (
-          path.startsWith(CONNECTORS_RPC_PREFIX) ||
-          path.startsWith(PLUGINS_RPC_PREFIX)
-        ) {
-          return connectorsRpcHandler(req, res, ctx);
-        }
-        if (path.startsWith(RESEARCH_PREFIX)) {
-          return researchProxyHandler(req, res, ctx);
-        }
-        if (path.startsWith(OCR_PREFIX)) {
-          return ocrProxyHandler(req, res, ctx);
-        }
-        if (path === PLATFORM_PROMPT_SLOTS_PATH) {
-          return platformPromptSlotsHandler(req, res, ctx);
-        }
-        if (path === PROJECT_CONTEXT_PATH) {
-          return projectContextHandler(req, res, ctx);
-        }
-        if (path === PROJECT_ASSETS_REGISTER_PATH) {
-          return projectAssetsHandler(req, res, ctx);
-        }
-        if (path === PROJECT_SEARCH_PATH) {
-          return projectSearchHandler(req, res, ctx);
-        }
-        if (path === MINIMAX_MEDIA_PATH) {
-          return minimaxMediaHandler(req, res, ctx);
-        }
-        if (
-          path === MEDIA_GENERATION_INTERNAL_PREFIX ||
-          path.startsWith(`${MEDIA_GENERATION_INTERNAL_PREFIX}/`)
-        ) {
-          return mediaGenerationInternalHandler(req, res, ctx);
-        }
-        if (path === MUSE_INTERNAL_PREFIX || path.startsWith(`${MUSE_INTERNAL_PREFIX}/`)) {
-          return museInternalHandler(req, res, ctx);
-        }
-        if (path.startsWith(SITES_AGENT_INTERNAL_PREFIX)) {
-          return sitesInternalHandler(req, res, ctx);
-        }
-        if (path === TAVILY_WEB_SEARCH_PATH) {
-          return tavilyWebSearchHandler(req, res, ctx);
-        }
-        if (path === MINIMAX_WEB_SEARCH_PATH) {
-          return minimaxWebSearchHandler(req, res, ctx);
-        }
-        if (path === GROK_WEB_SEARCH_PATH) {
-          return grokWebSearchHandler(req, res, ctx);
-        }
-        if (path === GROK_VISION_PATH) {
-          return grokVisionHandler(req, res, ctx);
-        }
-        if (path === CODEX_TOKEN_REFRESH_PATH) {
-          return codexTokenRefreshHandler(req, res, ctx);
-        }
-        if (path === CODEX_RELAY_PREFIX || path.startsWith(`${CODEX_RELAY_PREFIX}/`)) {
-          return codexRelayHandler(req, res, ctx);
-        }
-        if (path === GROK_RELAY_PREFIX || path.startsWith(`${GROK_RELAY_PREFIX}/`)) {
-          return grokRelayHandler(req, res, ctx);
-        }
-        if (path === ZCODE_RELAY_PREFIX || path.startsWith(`${ZCODE_RELAY_PREFIX}/`)) {
-          return zcodeRelayHandler(req, res, ctx);
-        }
-        if (path === ANTIGRAVITY_RELAY_PREFIX || path.startsWith(`${ANTIGRAVITY_RELAY_PREFIX}/`)) {
-          return antigravityRelayHandler(req, res, ctx);
-        }
-        if (path === SKILL_EMBED_PREFIX) {
-          return skillEmbedHandler(req, res, ctx);
-        }
-        if (path === CORE_MEMORY_RANK_PATH) {
-          return coreMemoryRankHandler(req, res, ctx);
-        }
-        if (path === MARKETPLACE_SYNC_PATH) {
-          return marketplaceSyncHandler(req, res, ctx);
-        }
-        if (path === TURN_WAIVE_PATH) {
-          return turnWaiveHandler(req, res, ctx);
-        }
-        if (path === TURN_LEASE_RENEW_PATH) {
-          return turnLeaseRenewHandler(req, res, ctx);
-        }
-        if (delegateGrokRouteHandler && isDelegateGrokRoutePath(path)) {
-          return delegateGrokRouteHandler(req, res, ctx);
-        }
-        if (delegateAntigravityRouteHandler && isDelegateAntigravityRoutePath(path)) {
-          return delegateAntigravityRouteHandler(req, res, ctx);
-        }
-        if (
-          promptQueueHandler &&
-          (path === PROMPT_QUEUE_MUTATION_PATH || path === PROMPT_QUEUE_SNAPSHOT_PATH ||
-            path === PROMPT_QUEUE_DETAIL_PATH || path === PROMPT_QUEUE_CLAIM_PATH)
-        ) {
-          return promptQueueHandler(req, res, ctx);
-        }
-        if (toolFailureAuditHandler && path === TOOL_FAILURE_AUDIT_PATH) {
-          return toolFailureAuditHandler(req, res, ctx);
-        }
-        if (toolCallRollupHandler && path === TOOL_CALL_ROLLUP_PATH) {
-          return toolCallRollupHandler(req, res, ctx);
-        }
-        if (turnObservationHandler && path === TURN_OBSERVATION_PATH) {
-          return turnObservationHandler(req, res, ctx);
-        }
-        if (path === MEMORY_USAGE_PATH) {
-          return memoryUsageHandler(req, res, ctx);
-        }
-        if (skillUsageHandler && path === SKILL_USAGE_PATH) {
-          return skillUsageHandler(req, res, ctx);
-        }
-        if (skillShadowHandler && path === SKILL_SHADOW_PATH) {
-          return skillShadowHandler(req, res, ctx);
-        }
-        if (path === SKILL_FEEDBACK_PATH) {
-          return skillFeedbackHandler(req, res, ctx);
-        }
-        if (path === AUTO_DREAM_POLICY_PATH) {
-          return autoDreamPolicyHandler(req, res, ctx);
-        }
-        if (isAutoDreamOptimizerInternalPath(path)) {
-          return autoDreamOptimizerHandler(req, res, ctx, path);
-        }
-        if (path === DELEGATE_TRACE_PATH) return delegateTraceHandler(req, res, ctx);
-        if (isDelegateEngineBillingInternalPath(path)) {
-          return delegateEngineBillingHandler(req, res, ctx, path);
-        }
-        if (path === CRON_INDEX_PATH) {
-          return cronIndexHandler(req, res, ctx);
-        }
-        if (path === CRON_ORIGIN_INJECT_PATH) {
-          return cronOriginInjectHandler(req, res, ctx);
-        }
-        if (path === INBOX_POST_PATH) {
-          return inboxPostHandler(req, res, ctx);
-        }
-        if (path === INBOX_ALERT_PATH) {
-          return inboxAlertHandler(req, res, ctx);
-        }
-        if (path.startsWith(MARKETPLACE_AGENT_PREFIX)) {
-          return marketplaceAgentHandler(req, res, ctx);
-        }
-        if (path === WECHAT_OUTBOUND_PATH) {
-          // P1.7 slice 7c — wechat broker outbound 接收点
-          // broker 自带 brokerEnabled() 短路 403,无需在此重判 cfg.WECHAT_BROKER_ENABLED;
-          // 未装配(ref.current=null)时显式 404,避免 caller container 把缺失误读为 503/超时
-          // (回 retry,污染 retryQueue)— 404 在 v3WechatOutbound 端被分类为 fatal,直接 drop。
-          const broker = wechatBrokerRef.current;
-          if (!broker) {
-            res.statusCode = 404;
-            res.setHeader("Content-Type", "application/json; charset=utf-8");
-            res.end(JSON.stringify({
-              error: { code: "WECHAT_BROKER_NOT_ASSEMBLED", message: "wechat broker not assembled" },
-            }));
-            return Promise.resolve();
-          }
-          return broker.outboundHandler(req, res, ctx);
-        }
-        if (path === WECHAT_PROACTIVE_PATH) {
-          // 主动微信投递(cron/提醒)。未装配 → 404(同 wechat-outbound:容器侧分类为 fatal 直接 drop,
-          // 不污染 retryQueue)。装配条件与 broker 一致,故复用 broker null 判定即可。
-          const proactive = wechatProactiveRef.current;
-          if (!proactive) {
-            res.statusCode = 404;
-            res.setHeader("Content-Type", "application/json; charset=utf-8");
-            res.end(JSON.stringify({
-              error: { code: "WECHAT_BROKER_NOT_ASSEMBLED", message: "wechat broker not assembled" },
-            }));
-            return Promise.resolve();
-          }
-          return proactive(req, res, ctx);
-        }
-        if (path === QQ_OUTBOUND_PATH) {
-          const receiver = qqOutboundRef.current;
-          if (!receiver) {
-            res.statusCode = 404;
-            res.setHeader("Content-Type", "application/json; charset=utf-8");
-            res.end(JSON.stringify({
-              error: { code: "QQ_BOT_NOT_ASSEMBLED", message: "QQ Bot not assembled" },
-            }));
-            return Promise.resolve();
-          }
-          return receiver(req, res, ctx);
-        }
-        if (path === QQ_PROACTIVE_PATH) {
-          const receiver = qqProactiveRef.current;
-          if (!receiver) {
-            res.statusCode = 404;
-            res.setHeader("Content-Type", "application/json; charset=utf-8");
-            res.end(JSON.stringify({
-              error: { code: "QQ_BOT_NOT_ASSEMBLED", message: "QQ Bot not assembled" },
-            }));
-            return Promise.resolve();
-          }
-          return receiver(req, res, ctx);
-        }
-        return internalProxyHandler!(req, res, ctx);
-      };
-      // ── P3 控制口只读端点(RFC D3;私有口 + VIP 共用此 handler)────────────────────
-      // 这两个是 Agent A/C 之间掉的球,现在补上:deploy lane 的 finalize 四门槛 / candidate 自检 /
-      // abort 健康核验都靠它们。在 dispatchInternal(anthropic proxy 路由,不认这些路径)之前拦截。
-      const currentLeadership = (): LeadershipStatus =>
-        leaderLease
-          ? leaderLease.status()
-          : { state: "ineligible", slot: ocSlot, generation: null, leasePid: null };
-      // 私有口 healthz:leadership + vip(owner|released)+ slot —— deploy 脚本据此判断 standby/leader/VIP 归属。
-      const respondControlHealthz = (res: ServerResponse): void => {
-        const vip = controlListener?.status().vipBound ? "owner" : "released";
-        const body = {
-          ok: true, // 本控制口在响应即证明进程存活;深度依赖探活走 /internal/v5/control-probe。
-          channel: runtimeChannel,
-          slot: ocSlot,
-          leadership: currentLeadership(),
-          vip,
-        };
-        res.statusCode = 200;
-        res.setHeader("Content-Type", "application/json; charset=utf-8");
-        res.end(JSON.stringify(body));
-      };
-      // control-probe:egress secret 校验后自检 dispatcher 路由表 + PG SELECT 1 + "本实例持有 VIP"。
-      const respondControlProbe = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-        const reply = (code: number, obj: Record<string, unknown>): void => {
-          res.statusCode = code;
-          res.setHeader("Content-Type", "application/json; charset=utf-8");
-          res.end(JSON.stringify(obj));
-        };
-        const secret = cfg.OC_EGRESS_SECRET;
-        if (!secret) return reply(503, { ok: false, error: "EGRESS_SECRET_UNSET" });
-        const presented = req.headers["x-oc-egress-secret"];
-        const okSecret =
-          typeof presented === "string" &&
-          (() => {
-            const pBuf = Buffer.from(presented);
-            const eBuf = Buffer.from(secret);
-            return pBuf.length === eBuf.length && pBuf.length > 0 && timingSafeEqual(pBuf, eBuf);
-          })();
-        if (!okSecret) return reply(401, { ok: false, error: "UNAUTHORIZED" });
-        // ① dispatcher 路由表已装配 ② PG 连通 ③ 本实例持有 VIP
-        const routeTable = typeof dispatchInternal === "function" && typeof internalProxyHandler === "function";
-        let pgOk = false;
-        try {
-          await getPool().query("SELECT 1");
-          pgOk = true;
-        } catch {
-          pgOk = false;
-        }
-        const vipOwner = controlListener?.status().vipBound === true;
-        return reply(200, {
-          ok: routeTable && pgOk && vipOwner,
-          routeTable,
-          pg: pgOk ? "ok" : "error",
-          vipOwner,
-          slot: ocSlot,
-          leadership: currentLeadership(),
-        });
-      };
-      const leaseCallbackHandler = makeLeaseCallbackHandler({
-        secret: cfg.OC_LEASE_CALLBACK_SECRET,
-        lookupSession: (uid, sid) => lookupLeaseCallbackSession(getPool(), uid, sid),
-        inject: (input) => cronOriginBridgeRef
-          ? cronOriginBridgeRef.injectCronOriginTurn(input)
-          : Promise.resolve({ kind: "no_transport" as const }),
-      });
-      // 请求 dispatcher 闭包(VIP+私有双 listener 与单 listener 共用)。
-      const internalRequestHandler = (req: IncomingMessage, res: ServerResponse): void => {
-        // P3 控制端点前置拦截(GET /healthz、GET /internal/v5/control-probe)。
-        const urlPath = (req.url ?? "").split("?")[0];
-        if (urlPath === LEASE_CALLBACK_PATH || urlPath === LEASE_CALLBACK_VALIDATE_PATH) {
-          void leaseCallbackHandler(req, res, urlPath === LEASE_CALLBACK_VALIDATE_PATH).catch(() => {
-            if (!res.headersSent) res.statusCode = 503;
-            res.end();
-          });
-          return;
-        }
-        if (req.method === "GET" && urlPath === "/healthz") {
-          try { respondControlHealthz(res); } catch { /* socket gone */ }
-          return;
-        }
-        if (req.method === "GET" && urlPath === "/internal/v5/control-probe") {
-          void respondControlProbe(req, res).catch((err) => {
-            // eslint-disable-next-line no-console
-            console.error("[commercial] control-probe handler threw:", err);
-            if (!res.headersSent) {
-              try {
-                res.statusCode = 500;
-                res.setHeader("Content-Type", "application/json");
-                res.end(JSON.stringify({ ok: false, error: "PROBE_INTERNAL" }));
-              } catch { /* socket gone */ }
-            }
-          });
-          return;
-        }
-        // 双槽定向通知 relay 只允许走本 slot 私有控制口；VIP/普通 proxy 端口不暴露该面。
-        if (
-          dualMasterEnabled &&
-          req.socket.localPort === privatePortForSlot(ocSlot) &&
-          handleSlotRelayRequest(req, res, {
-            secret: cfg.OC_EGRESS_SECRET ?? "",
-            local: {
-              onlineUserSubset: (uids) => slotRelayLocalRef.current.onlineUserSubset(uids),
-              broadcastToUsers: (uids, payload) => slotRelayLocalRef.current.broadcastToUsers(uids, payload),
-            },
-            logger: rootLogger.child({ subsys: "commercial", module: "slotRelayServer" }),
-          })
-        ) return;
-        // self-host 路径:container → plain HTTP 18791 → 这里。peerIp 就是 container 的 bound_ip,
-        // hostUuid 固定 = selfHostUuid(本机容器不需要也不可能带 mTLS cert)。
-        // split 模式下容器流量经 egress 转发到达,socket peer 恒为 loopback;
-        // 真实容器 ip 由 egress 注入 x-v5-egress-peer-ip(它同时会剥掉入站同名头,容器伪造不进来)。
-        const fwdPeer = egressSplitEnabled ? req.headers["x-v5-egress-peer-ip"] : undefined;
-        const peerIp =
-          (typeof fwdPeer === "string" && fwdPeer.trim()) || req.socket.remoteAddress || "";
-        Promise.resolve(
-          dispatchInternal!(req, res, { hostUuid: selfHostUuid!, boundIp: peerIp }),
-        ).catch((err) => {
-          // eslint-disable-next-line no-console
-          console.error("[commercial] internal listener handler threw:", err);
-          if (!res.headersSent) {
-            try {
-              res.statusCode = 500;
-              res.setHeader("Content-Type", "application/json");
-              res.end(JSON.stringify({ error: { code: "INTERNAL", message: "internal listener error" } }));
-            } catch { /* socket gone */ }
-          } else {
-            try { res.end(); } catch { /* */ }
-          }
-        });
-      };
-      if (dualMasterEnabled && egressSplitEnabled && deployDesiredWatch) {
-        // ── P3 双 master 控制口:VIP + 私有双 listener(RFC D3)────────────────────
-        // VIP=proxyBind:proxyPort(egress 唯一目标,零改动),仅 desired_control_slot==本 slot bind;
-        // 私有口=127.0.0.1:privatePortForSlot(slot)(本 slot 常驻自检口)。基建版 A slot+desired=A →
-        // 启动即 bind proxyPort(与今日单 listener 同)+ 新增 18896。EADDRINUSE 交接窗重试,余错 fail-loud。
-        controlListener = createControlListener({
-          slot: ocSlot,
-          desiredWatch: deployDesiredWatch,
-          handler: internalRequestHandler,
-          vip: { host: proxyBind, port: proxyPort },
-          logger: {
-            info: (m, meta) => rootLogger.info(m, { subsys: "controlListener", meta }),
-            warn: (m, meta) => rootLogger.warn(m, { subsys: "controlListener", meta }),
-            error: (m, meta) => rootLogger.error(m, { subsys: "controlListener", meta }),
-          },
-        });
-        // 首绑前 prime desired 缓存:确保 controlListener 的 firstAttempt VIP 判定看到真实
-        // desired_control_slot(而非 watch 尚未首轮轮询的 null)。首读失败(PG 抖)不阻塞——
-        // current() 保持 null → VIP 首绑跳过,由 watch onChange 后补 bind。
-        try { await deployDesiredWatch.refreshNow(); } catch { /* 首读失败,后补 */ }
-        await controlListener.start();
-        internalProxyAddress = { host: proxyBind, port: proxyPort };
-        // eslint-disable-next-line no-console
-        console.log(`[commercial] P3 控制口 VIP+私有双 listener 就绪 (slot=${ocSlot}, vip=${proxyBind}:${proxyPort})`);
-      } else {
-        internalProxyServer = createHttpServer(internalRequestHandler);
-        // 同步监听 + 转 promise:监听失败立即 throw,主流程 catch 后降级
-        await new Promise<void>((resolve, reject) => {
-          internalProxyServer!.once("error", reject);
-          internalProxyServer!.listen(proxyPort, proxyBind, () => {
-            internalProxyServer!.removeListener("error", reject);
-            resolve();
-          });
-        });
-        internalProxyAddress = { host: proxyBind, port: proxyPort };
-        // eslint-disable-next-line no-console
-        console.log(
-          `[commercial] internal anthropic proxy listening on ${proxyBind}:${proxyPort}`,
-        );
-      }
-    } catch (err) {
-      // P3:控制口(VIP+私有)bind 失败 = 部署故障,fail-loud 拒起(私有口是本 slot 自检基础设施,
-      // egress 靠 VIP 送 cost 事件——静默 disable 会让 v5 master 带病运行)。单 listener 路径保持
-      // 旧"降级 disable"语义(容器直连非 split,失败退化为无内部代理,/healthz 反映)。
-      if (dualMasterEnabled && egressSplitEnabled) {
-        try { await controlListener?.close(); } catch { /* */ }
-        controlListener = undefined;
-        throw err;
-      }
-      // eslint-disable-next-line no-console
-      console.error("[commercial] internal proxy listener failed; disabling:", err);
-      try { internalProxyServer?.close(); } catch { /* */ }
-      internalProxyServer = undefined;
-      internalProxyHandler = undefined;
-      internalProxyAddress = undefined;
-      dispatchInternal = undefined;
-    }
-  } else if (!options.skipInternalProxy) {
-    // eslint-disable-next-line no-console
-    console.log(
-      "[commercial] internal anthropic proxy disabled; missing INTERNAL_PROXY_BIND / INTERNAL_PROXY_PORT",
-    );
-  }
+      }),
+    verifyEgressSecret: (presented, expected) => {
+      const pBuf = Buffer.from(presented, "utf8");
+      const eBuf = Buffer.from(expected, "utf8");
+      return pBuf.length === eBuf.length && pBuf.length > 0 && timingSafeEqual(pBuf, eBuf);
+    },
+    createHttpServer,
+    deployDesiredWatch,
+    leaderLease,
+    slotRelayClient,
+    slotRelayLocalRef,
+    bridgeBroadcastRef,
+    studioPushRef,
+    tapeSchedulerKickRef,
+    autoDreamOptimizerRuntimeRef,
+    commercialCodexRouteRef,
+    delegateEngineBillingRuntimeRef,
+    cc5RuntimeRef,
+    wechatBrokerRef,
+    wechatProactiveRef,
+    qqOutboundRef,
+    qqProactiveRef,
+    getModelAuthoritySigner: () => modelAuthoritySigner,
+    getCronOriginBridge: () => cronOriginBridgeRef,
+    getSystemActions: () => systemActions,
+    setDesktopTlsClose: (fn) => { desktopTlsClose = fn; },
+    setSeedPlatformAgentsForLeadership: (fn) => { seedPlatformAgentsForLeadership = fn; },
+    setStopStudioOrchestrator: (fn) => { stopStudioOrchestrator = fn; },
+  }));
 
-  // V3 CC 外接 plan Phase 3(2026-05-18)— public-facing
-  // `POST /api/anthropic/v1/messages` 的第二个 AnthropicProxyHandler 实例。
-  //
-  // 与 internalProxyHandler 平行装配,**不**依赖 INTERNAL_PROXY_BIND/PORT/selfHostUuid
-  // —— external 不监听端口、不需要 selfHostUuid,直接挂在公网 commercialHandler 的
-  // pre-route adapter 上(见 http/router.ts 的 `CC 外接 endpoint` 块)。
-  //
-  // 两实例的唯一差异是 IdentityStrategy:
-  //   - internal:`makeContainerIdentityStrategy`(容器双因子 + recordHostRequest)
-  //   - external:`makeApiKeyIdentityStrategy`(Bearer `oc-cc.*` token,无 recordHostRequest)
-  // 其它依赖(pricing / preCheckRedis / scheduler / refreshDeps / 计费 / 广播)完全
-  // 共享 —— 计费 / 账号池 / 上游路由语义两路必须一致,唯一分歧是身份维度。
-  //
-  // 装配失败语义(Codex Phase 3 plan-review MINOR 1):catch + undefined,router
-  // 见 undefined 走 503 EXTERNAL_PROXY_UNAVAILABLE 而非 404(部署故障不该伪装成
-  // "用户 URL 写错")。
-  let externalApiKeyProxy: AnthropicProxyHandler | undefined;
-  // 2026-09-07:`GET /api/anthropic/v1/models` 外接模型发现,与 proxy 同批装配。
-  let externalApiKeyModels: ExternalModelsHandler | undefined;
-  // 2026-09-08:`GET /api/anthropic/v1/usage` 外接余额 / 单 key 消耗,同批装配。
-  let externalApiKeyUsage: ExternalUsageHandler | undefined;
-  // cursor-* 模型在 external API-key 路径上的服务端 Sand relay(本地 Claude Code 接入
-  // Cursor 系模型)。仅 external 实例注入;容器 internal proxy 不注 —— 容器内 cursor 走
-  // 容器自己的 relay。shutdown 时 close() 归零凭据副本。
-  let cursorExternalRoute: CursorExternalRoute | undefined;
-  let cursorExternalOutbox: CursorExternalApiOutbox | undefined;
-  if (!options.skipInternalProxy) {
-    try {
-      const apiKeyRepo = makePgApiKeyRepo(getPool());
-      const apiKeyIdentityDeps = {
-        repo: apiKeyRepo,
-        pricing,
-        loadUserModelAuthz,
-        logger: rootLogger.child({ subsys: "apiKeyIdentity" }),
-      };
-      const apiKeyStrategy = makeApiKeyIdentityStrategy(apiKeyIdentityDeps);
-      // 模型发现与 messages 共用同一条 key 判定链(格式/撤销/禁用/admin gate),
-      // 只是不做 UA 门控(桌面工具用自己的 HTTP 客户端拉列表)。
-      externalApiKeyModels = makeExternalModelsHandler({
-        resolveIdentity: (req) => resolveApiKeyIdentity(apiKeyIdentityDeps, req, { enforceUserAgent: false }),
-        pricing,
-        loadUserModelAuthz,
-        ownedBy: "clarvy",
-        logger: rootLogger.child({ subsys: "externalModels" }),
-      });
-      // 用量端点与 models 同一条 key 判定链 + 同样不做 UA 门控(CC Switch 用量脚本是
-      // reqwest 客户端)。只读、不打上游、不动积分、不 bump last_used_at。
-      externalApiKeyUsage = makeExternalUsageHandler({
-        resolveIdentity: (req) => resolveApiKeyIdentity(apiKeyIdentityDeps, req, { enforceUserAgent: false }),
-        repo: apiKeyRepo,
-        logger: rootLogger.child({ subsys: "externalUsage" }),
-      });
-      // Phase 5 platform envelope rewriter wiring(2026-05-21)。
-      // secret 缺失 → throw → 外层 catch 将 externalApiKeyProxy 置 undefined,
-      // 同 hupi/deepseek 已有的"缺配置 → 端点 503"模式一致(non-fatal,主进程继续)。
-      // Loader 持有 PlatformContextReader 单例,master 进程生命期与之绑定,无须 close。
-      if (!cfg.PLATFORM_HMAC_SECRET) {
-        throw new Error(
-          "PLATFORM_HMAC_SECRET required for external ApiKey proxy (Phase 5 envelope)",
-        );
-      }
-      const platformContextLoader = makePlatformContextLoader({
-        reader: makeDefaultVolumeContextReader(),
-      });
-      if (cursorExternalOutboxDir) {
-        try {
-          cursorExternalOutbox = await openCursorExternalApiOutbox({
-            directory: cursorExternalOutboxDir,
-            logger: rootLogger.child({ subsys: "cursorExternalOutbox" }),
-          });
-          cursorExternalRoute = makeCursorExternalRoute({
-            pgPool: getPool(),
-            pricing,
-            logger: rootLogger.child({ subsys: "cursorExternal" }),
-            outbox: cursorExternalOutbox,
-          });
-        } catch (err) {
-          // Directory failure closes only the Cursor engine channel.
-          // eslint-disable-next-line no-console
-          console.error(
-            "[commercial] cursor external API outbox failed; cursor engine models unavailable on api-key proxy:",
-            err,
-          );
-          cursorExternalOutbox = undefined;
-          const staleCursor = cursorExternalRoute;
-          cursorExternalRoute = undefined;
-          void staleCursor?.close().catch(() => undefined);
-        }
-      } else {
-        // eslint-disable-next-line no-console
-        console.log(
-          "[commercial] cursor external API outbox not configured; cursor engine models unavailable on api-key proxy",
-        );
-      }
-      externalApiKeyProxy = makeAnthropicProxyHandler({
-        pgPool: getPool(),
-        pricing,
-        preCheckRedis,
-        scheduler,
-        identity: apiKeyStrategy,
-        cursorExternal: cursorExternalRoute,
-        // Claude Code 会打 /v1/messages/count_tokens 做上下文估算;external 实例放行。
-        allowCountTokens: true,
-        loadUserModelAuthz,
-        rateLimitRedis: sharedRateLimitRedis,
-        // 与 internal 同型:OAuth refresh 走 health + codex disable fanout。
-        refreshDeps: { health: healthTracker, triggerCodexDisableFanout },
-        // bridge broadcastToUser 同型 ref 闭包;externalApiKeyProxy 装配于
-        // bridge 之前是正常顺序(请求期 bridge 必已就绪)。
-        broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
-        appendCostCredits: appendCostCreditsForUser, // c:<uid> 前缀对齐 session 存储命名空间
-        // external API-key proxy **故意只注入 deepseek**(保持现有能力面,不拓宽 minimax/ark)。
-        // 该 proxy 上 minimax/ark 模型请求维持 not_configured 503,与历史行为一致。
-        staticProviderKeys: { deepseek: cfg.DEEPSEEK_API_KEY },
-        platformContextLoader,
-        platformServerSecret: cfg.PLATFORM_HMAC_SECRET,
-        // v1.0.207 — external ApiKey proxy 与 internal proxy 共用 runtime flag getter,
-        // 同一个 30s TTL cache(`admin/runtimeFlags.ts`)。
-        getPhase6AccountUuidEnforce,
-        getSessionPinMode,
-        listEnabledAccountGroupsForModel: listEnabledGroupsForModel,
-      });
-      // eslint-disable-next-line no-console
-      console.log(
-        "[commercial] external api-key anthropic proxy assembled (POST /api/anthropic/v1/messages + GET /v1/models + GET /v1/usage, engine models via relay)",
-      );
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error(
-        "[commercial] external api-key proxy failed to assemble; endpoint will return 503:",
-        err,
-      );
-      externalApiKeyProxy = undefined;
-      externalApiKeyModels = undefined;
-      externalApiKeyUsage = undefined;
-      const stale = cursorExternalRoute;
-      cursorExternalRoute = undefined;
-      void stale?.close().catch(() => undefined);
-    }
-  }
+  const {
+    externalApiKeyProxy,
+    externalApiKeyModels,
+    externalApiKeyUsage,
+    cursorExternalRoute,
+    cursorExternalOutbox,
+  } = await bootstrapExternalApiKeyProxy({
+    skipInternalProxy: options.skipInternalProxy,
+    cfg,
+    pricing,
+    preCheckRedis,
+    scheduler,
+    healthTracker,
+    loadUserModelAuthz,
+    sharedRateLimitRedis,
+    triggerCodexDisableFanout,
+    bridgeBroadcastRef,
+    appendCostCreditsForUser,
+    cursorExternalOutboxDir,
+  });
 
-  // V3 D.1b: 18443 mTLS listener。remote-host node-agent 走 L7 反代过来,master 这边
-  // 用 master leaf cert 作服务端 cert,并要求对端出示 host leaf cert(SPIFFE host/<uuid>)。
-  // 通过 handleExternalMtls 做 cert + fingerprint + container-ip 头三级校验后,
-  // 走到同一个 internalProxyHandler(和 self-host plain 18791 共用)。
-  //
-  // 启用条件:EXTERNAL_MTLS_ENABLED=1 + bind + port 都配齐 + internalProxyHandler 已就绪。
-  // 关掉 / 配不齐 / 监听失败 → 单边降级,remote host 出不来但 self host 不受影响。
-  if (
-    internalProxyHandler &&
-    dispatchInternal &&
-    cfg.EXTERNAL_MTLS_ENABLED &&
-    cfg.EXTERNAL_MTLS_BIND &&
-    cfg.EXTERNAL_MTLS_PORT !== undefined
-  ) {
-    const mtlsBind = cfg.EXTERNAL_MTLS_BIND;
-    const mtlsPort = cfg.EXTERNAL_MTLS_PORT;
-    try {
-      const caMat = await ensureCa();
-      const masterLeaf = await ensureMasterLeaf();
-      const caPem = await fs.promises.readFile(caMat.caCertPath, "utf8");
-      const masterKey = await fs.promises.readFile(masterLeaf.keyPath, "utf8");
-      // 2026-05-05: 用 dispatchInternal 而不是 internalProxyHandler,这样
-      // remote-host 容器也能命中 /internal/v3/server-authored-message 路径,
-      // 与 self-host 路径行为一致(同一 dispatcher 共享 path 分流逻辑)。
-      const capturedHandler = dispatchInternal;
-      externalMtlsServer = createHttpsServer(
-        {
-          key: masterKey,
-          cert: masterLeaf.certPem,
-          ca: caPem,
-          requestCert: true,
-          rejectUnauthorized: true,
-          // master + node-agent 都我们自己控(Node 18+ / Go 1.22 均原生 TLS 1.3),
-          // 没有历史客户端兼容性包袱,直接 hard-require 1.3。
-          minVersion: "TLSv1.3",
-        },
-        (req, res) => {
-          Promise.resolve(handleExternalMtls(req, res, capturedHandler)).catch((err) => {
-            // eslint-disable-next-line no-console
-            console.error("[commercial] external mTLS handler threw:", err);
-            if (!res.headersSent) {
-              try {
-                res.statusCode = 500;
-                res.setHeader("Content-Type", "application/json");
-                res.end(JSON.stringify({ error: { code: "INTERNAL", message: "mtls error" } }));
-              } catch { /* socket gone */ }
-            } else {
-              try { res.end(); } catch { /* */ }
-            }
-          });
-        },
-      );
-      await new Promise<void>((resolve, reject) => {
-        externalMtlsServer!.once("error", reject);
-        externalMtlsServer!.listen(mtlsPort, mtlsBind, () => {
-          externalMtlsServer!.removeListener("error", reject);
-          resolve();
-        });
-      });
-      externalMtlsAddress = { host: mtlsBind, port: mtlsPort };
-      // eslint-disable-next-line no-console
-      console.log(
-        `[commercial] external mTLS listening on ${mtlsBind}:${mtlsPort}`,
-      );
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error("[commercial] external mTLS listener failed; disabling:", err);
-      try { externalMtlsServer?.close(); } catch { /* */ }
-      externalMtlsServer = undefined;
-      externalMtlsAddress = undefined;
-    }
-  } else if (internalProxyHandler && !cfg.EXTERNAL_MTLS_ENABLED) {
-    // eslint-disable-next-line no-console
-    console.log("[commercial] external mTLS listener disabled (EXTERNAL_MTLS_ENABLED != 1)");
-  }
+  ({ externalMtlsServer, externalMtlsAddress } = await bootstrapExternalMtlsListener({
+    cfg,
+    internalProxyHandler,
+    dispatchInternal,
+    createHttpsServer,
+    constantTimeEqual: timingSafeEqual,
+    isIPv4,
+  }));
 
-  // T-12+ 真实 mailer:env 配 RESEND_API_KEY 后切到 Resend,否则保留 stub(dev/测试)。
-  const resendKey = process.env.RESEND_API_KEY?.trim();
-  const mailFrom = process.env.MAIL_FROM?.trim() || "auth@claudeai.chat";
-  const mailer = resendKey
-    ? createResendMailer({ apiKey: resendKey, from: mailFrom })
-    : stubMailer;
-  if (resendKey) {
-    console.log(`[commercial] mailer = resend (from=${mailFrom})`);
-  } else {
-    console.log("[commercial] mailer = stub (RESEND_API_KEY 未设置, 验证邮件只打日志)");
-  }
-
-  // v3 file proxy:HOST bridge root secret。加载/生成 `/var/lib/openclaude/.v3-bridge-secret`。
-  // 任何失败(权限 / 磁盘 / 路径)→ fail-closed 只警告,让 supervisor 不注入 env,file
-  // proxy 整体降级为 CONTAINER_OUTDATED 503,不会阻止 gateway 启动。
-  let bridgeSecret: string | undefined;
-  try {
-    bridgeSecret = loadOrCreateBridgeSecret();
-    // eslint-disable-next-line no-console
-    console.log("[commercial] v3 bridge secret loaded", { path: DEFAULT_BRIDGE_SECRET_PATH });
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.error(
-      "[commercial] v3 bridge secret load/create failed; file proxy will be DISABLED",
-      { path: DEFAULT_BRIDGE_SECRET_PATH, error: (err as Error)?.message ?? String(err) },
-    );
-    bridgeSecret = undefined;
-  }
-
-  // v3 signed-URL media key —— HKDF(bridgeSecret, info="oc-media-sign-v1") 派生
-  // 32-byte 子 key,与 bridgeSecret 同生命周期。bridgeSecret 缺失时 mediaSignKey 也
-  // undefined,signed URL endpoints 自动 503 SIGN_DISABLED。
-  //
-  // **没有 cookie fallback**:前端拿到 503/null 后媒体保持占位(透明 1x1 / 空 src),
-  // 不会偷偷退回 `<img src="/api/file?path=...">` —— 那条路径正是 iOS Safari 丢
-  // cookie 的根因,绕回去等于把 bug 重新放出来。bridgeSecret 缺失通常意味整个
-  // file proxy 都没装配(单租户 personal 版),本来也用不到 commercial 媒体渲染。
-  let mediaSignKey: Buffer | undefined;
-  let wechatLiveLinkKey: Buffer | undefined;
-  if (bridgeSecret) {
-    try {
-      mediaSignKey = deriveMediaSignKey(bridgeSecret);
-      // eslint-disable-next-line no-console
-      console.log("[commercial] v3 media signing key derived");
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error("[commercial] media sign key derivation failed; signed URL DISABLED", {
-        error: (err as Error)?.message ?? String(err),
-      });
-      mediaSignKey = undefined;
-    }
-    try {
-      wechatLiveLinkKey = deriveWechatLiveLinkKey(bridgeSecret);
-      // eslint-disable-next-line no-console
-      console.log("[commercial] v3 wechat live link key derived");
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error("[commercial] wechat live key derivation failed; live links DISABLED", {
-        error: (err as Error)?.message ?? String(err),
-      });
-      wechatLiveLinkKey = undefined;
-    }
-  }
-
-  // 服务端缩略图磁盘缓存 —— 与 mediaSignKey 同生命周期(依赖 signed media 管线)。
-  // 落 OPENCLAUDE_HOME/media-thumb-cache/,启动清零(init)。缺 mediaSignKey → 不装配,
-  // `?w=` 被 handler 忽略回原图(优雅降级)。
-  let thumbnailCache: ThumbnailDiskCache | undefined;
-  if (mediaSignKey) {
-    try {
-      const home = process.env.OPENCLAUDE_HOME ?? path.join(homedir(), ".openclaude");
-      const cache = new ThumbnailDiskCache(path.join(home, "media-thumb-cache"));
-      await cache.init();
-      thumbnailCache = cache;
-      // eslint-disable-next-line no-console
-      console.log("[commercial] media thumbnail cache ready (startup-cleared)");
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error("[commercial] thumbnail cache init failed; thumbnails DISABLED", {
-        error: (err as Error)?.message ?? String(err),
-      });
-      thumbnailCache = undefined;
-    }
-  }
-
-  // ── 模型执行权威(docs/V5_MODEL_AUTHORITY_PLAN.md §2/§7 步 4)────────────────
-  //
-  // flag `OC_MODEL_AUTHORITY=1` 才装配。装配 = 三件事同时生效(方案的原子开关):
-  //   ① supervisor 往新容器注入公钥 keyring + OC_USER_ID，并在 provision-required=true
-  //      时注入 OC_MODEL_AUTHORITY；回滚清退期显式设 provision-required=false，新容器仍拿
-  //      公钥消费已签票据，但不再成为必须 attest 的强制容器；
-  //   ② bridge 对每条连接要求容器 attest `model_authority_v1`(未 attest 前缓冲用户帧,
-  //      超时/不支持 → 拒连接 + stale recycle);
-  //   ③ bridge 对每条 inbound.message 签发并注入 `__oc_model_authority`,codex 分类
-  //      改用 catalog descriptor.engine(与签发同源)。
-  //
-  // fail-closed 启动:catalog 首次快照拉不起来(0143 迁移未 apply / DB 不可达)→ **抛**,
-  // 不允许「flag 开着但 catalog 空转」这种半开状态(那会让每条帧都被 fence 拒,等于全站
-  // 静默不可用,还不如启动就响亮失败)。
-  //
-  // 关 flag → 全部旧行为(容器不 attest 也不会被拒;帧不带 envelope;判定回 baked)。
-  const modelAuthorityFlag = process.env.OC_MODEL_AUTHORITY === "1";
-  // 缺省为 true，保持既有原子开关语义。只允许 deploy-v5.sh 的回滚闭环短暂写 0：
-  // master 继续签发/验 attest，同时停止制造新的 OC_MODEL_AUTHORITY=1 容器，等旧容器
-  // 经 authenticated drain 全量退出后才真正关总 flag，消除回滚 census 的尾巴竞态。
-  const modelAuthorityProvisionRequired =
-    modelAuthorityFlag && process.env.OC_MODEL_AUTHORITY_PROVISION_REQUIRED !== "0";
-  if (modelAuthorityFlag) {
-    // catalog HTTP mutation 必须走独立低权 admin role；缺失/串用 app role 时拒绝启动。
-    await assertModelCatalogAdminPoolConfigured();
-    modelAuthoritySigner = AuthoritySigner.loadOrCreate();
-    // 与 proxy/internal catalog 共用进程级单例，禁止 bridge 另起一份快照。
-    modelCatalogCache = await getModelCatalogCache();
-    // eslint-disable-next-line no-console
-    console.log("[commercial] model authority ENABLED", {
-      activeKeyId: modelAuthoritySigner.activeKeyId,
-      keyIds: modelAuthoritySigner.keyIds.length,
-      securityEpoch: modelCatalogCache.current().securityEpoch.toString(),
-      executionRevision: modelCatalogCache.current().executionRevision.slice(0, 12),
-    });
-  }
+  const {
+    mailer,
+    bridgeSecret,
+    mediaSignKey,
+    wechatLiveLinkKey,
+    thumbnailCache,
+    modelAuthorityProvisionRequired,
+    modelAuthoritySigner: bootModelAuthoritySigner,
+    modelCatalogCache: bootModelCatalogCache,
+  } = await bootstrapMailerBridgeAndAuthority({ env: process.env });
+  modelAuthoritySigner = bootModelAuthoritySigner;
+  modelCatalogCache = bootModelCatalogCache;
 
   // V3 Phase 3 supervisor 装配 —— 必须在 createCommercialHandler 之前构造,
   // 因为 admin/containers HIGH#6 路径要在 deps.v3Supervisor 上 dispatch v3 行。
@@ -3596,235 +1227,24 @@ export async function registerCommercial(
   let v3Deps: V3SupervisorDeps | undefined;
   let cc5Runtime: ReturnType<typeof createMasterCc5Runtime>;
   if (cfg.OC_RUNTIME_IMAGE) {
-    // 复用 agentRuntime 路径的 docker socket / 默认逻辑,避免 v2/v3 端再各开一个 docker client
-    // (一个进程开多个 dockerode 也无副作用,但同一 socket 没必要)
-    const v3Docker = cfg.AGENT_DOCKER_SOCKET
-      ? new Docker({ socketPath: cfg.AGENT_DOCKER_SOCKET })
-      : new Docker();
-
-    // ── V5 runtime tuple 启动期解析(plan §1.5 prepare/startup 一次性全量校验)──
-    // OC_PLATFORM_BUNDLE / OC_RUNTIME_RELEASE 配了就在此**一次性**跑昂贵的 resolvePlatformBundleMount
-    // (逐文件 sha256)/ resolveRuntimeReleaseMount,把 bundleRev/bootHash/resolved 路径灌进 tuple;
-    // provision 每次只做便宜的 assertCurrentMatches。解析失败**不阻断 gateway 启动**(与 baseline
-    // 自检同范式)——只 console.error 留态;下一次 provision 由 supervisor 依 v5 fail-closed / OPTIONAL
-    // 决定拒/降级(bundlePath 传下去但 bundleRev 空 → provision 侧判 "解析失败" 拒)。
-    let runtimeTuple: V3RuntimeTuple | undefined;
-    if (cfg.OC_RUNTIME_IMAGE_ID || cfg.OC_PLATFORM_BUNDLE || cfg.OC_RUNTIME_RELEASE) {
-      const platformRoot = cfg.OC_PLATFORM_ROOT ?? DEFAULT_PLATFORM_ROOT;
-      const releasesRoot = cfg.OC_RUNTIME_RELEASES_ROOT ?? DEFAULT_RUNTIME_RELEASES_ROOT;
-      const t: V3RuntimeTuple = {
-        imageId: cfg.OC_RUNTIME_IMAGE_ID,
-        bundlePath: cfg.OC_PLATFORM_BUNDLE,
-        releasePath: cfg.OC_RUNTIME_RELEASE,
-        platformRoot,
-        releasesRoot,
-      };
-      if (cfg.OC_PLATFORM_BUNDLE) {
-        try {
-          // B5 containment:传 platformRoot 让校验器显式断言 resolved 落在 <platformRoot>/bundles/ 下
-          // (ancestorRoot 同值锁祖先链;platformRoot 另钉布局根,两者语义分离但生产同一目录)。
-          const resolved = resolvePlatformBundleMount(cfg.OC_PLATFORM_BUNDLE, {
-            ancestorRoot: platformRoot,
-            platformRoot,
-          });
-          t.bundleResolvedPath = resolved.resolvedPath;
-          t.bundleRev = resolved.bundleRev;
-          t.bootHash = resolved.bootHash;
-          // eslint-disable-next-line no-console
-          console.log("[commercial] v5 platform bundle validated", {
-            bundlePath: cfg.OC_PLATFORM_BUNDLE,
-            bundleRev: resolved.bundleRev,
-            bootHash: resolved.bootHash,
-          });
-        } catch (err) {
-          // eslint-disable-next-line no-console
-          console.error(
-            "[commercial] v5 platform bundle validation FAILED — provision will fail-closed (or skip with OC_PLATFORM_BUNDLE_OPTIONAL=1)",
-            { bundlePath: cfg.OC_PLATFORM_BUNDLE, error: (err as Error).message },
-          );
-        }
-      }
-      if (cfg.OC_RUNTIME_RELEASE) {
-        try {
-          t.releaseResolvedPath = resolveRuntimeReleaseMount(cfg.OC_RUNTIME_RELEASE, releasesRoot);
-          // eslint-disable-next-line no-console
-          console.log("[commercial] v5 runtime release validated", {
-            releasePath: cfg.OC_RUNTIME_RELEASE,
-            resolved: t.releaseResolvedPath,
-          });
-        } catch (err) {
-          // eslint-disable-next-line no-console
-          console.error(
-            "[commercial] v5 runtime release validation FAILED — provision will fail-closed",
-            { releasePath: cfg.OC_RUNTIME_RELEASE, error: (err as Error).message },
-          );
-        }
-      }
-      runtimeTuple = t;
-    }
-
-    const cc5 = cc5Runtime = createMasterCc5Runtime({
-      selfhost: getRuntimeChannel() === "v5" && flavorIdentity.status === "ok" && flavorIdentity.flavor === "selfhost",
-      authorityReady: modelAuthoritySigner !== null && modelAuthoritySigner !== undefined && modelAuthorityProvisionRequired,
+    const assembled = assembleV3SupervisorCore({
       env: process.env,
-      ...(modelAuthoritySigner && modelCatalogCache ? {
-        financeFactory: (_binding, lane) => createRemoteNativeTurnFinance({
-          pool: getPool(), preCheckRedis, catalog: modelCatalogCache!,
-          keyring: () => modelAuthoritySigner!.publicKeyring(), loadUserModelAuthz,
-          log: rootLogger.child({ subsys: "remoteNativeBilling" }),
-          upstreamModel: lane.upstreamModel,
-        }),
-      } : {}),
-    });
-    if (cc5) {
-      sessionsDeletedRef.current = (userId, sessionIds) => {
-        const uid = /^c:(\d+)$/.exec(userId)?.[1];
-        if (!uid) return;
-        for (const id of sessionIds) {
-          cc5.releaseChat(Number(uid), id).catch((error: unknown) =>
-            rootLogger.warn("[selfhost] remote lane release on delete failed", {
-              error: error instanceof Error ? error.message : String(error) }));
-        }
-      };
-    }
-    v3Deps = {
-      ...(cc5 ? { cc5 } : {}),
-      docker: v3Docker,
-      pool: getPool(),
-      image: cfg.OC_RUNTIME_IMAGE,
-      // bridgeSecret 注入后,provisionV3Container 会写 OC_CONTAINER_ID / OC_BRIDGE_NONCE
-      // 到容器 env;未注入则容器侧 /healthz 不广播 file-proxy-v1,代理自动 OUTDATED。
+      cfg,
+      flavorIdentity,
       bridgeSecret,
-      // 模型执行权威:公钥 keyring + uid + 强制门注入新容器 env(方案 §7 步 4)。
-      // flag 关 → undefined → 容器 env 完全同旧。
-      ...(modelAuthoritySigner
-        ? {
-            modelAuthority: {
-              // **函数**而非启动期快照:轮换步骤①(addKey)之后新 provision 的容器必须
-              // 立刻拿到含新公钥的 ring —— 传字符串的话要等 master 重启才生效,步骤②
-              // 的 census 永远收敛不到 100%,整条轮换卡死。signer 内部按文件 stat 热重载。
-              keyringEnvAssignment: () => modelAuthoritySigner!.publicKeyringEnvAssignment(),
-              required: modelAuthorityProvisionRequired,
-              // 次级模型 master 单向下发(注入 OPENCLAUDE_SECONDARY_MODEL);与签发 authority 的
-              // auxModels 同源,消除 master/runtime 版本 skew 的 WebFetch/WebSearch 403。
-              auxModels: PLATFORM_AUX_MODEL_IDS,
-            },
-          }
-        : {}),
-      // V5 runtime tuple(启动期已解析);未配 → undefined → provision/ensureRunning 走旧路径。
-      ...(runtimeTuple ? { runtimeTuple } : {}),
-      // Default-no-op exact-prompt evaluation lane. The runtime adapter rejects
-      // every real UID and any absent/invalid/expired root-owned active record.
-      ...(getRuntimeChannel() === "v5"
-        ? {
-            syntheticEvalOverlay: createSyntheticEvalOverlayRuntime({
-              expectedBaseCommit: readSyntheticEvalReleaseSourceCommit(
-                runtimeTuple?.releaseResolvedPath ? process.cwd() : undefined,
-              ),
-            }),
-          }
-        : {}),
-      // 多机路由 wiring:selfHostUuid 取到才同时注入 containerService + selfHostId,
-      // 避免出现 "containerService 注入但 selfHostId undefined" 的半 wire 状态
-      // (provisionV3Container 的 useRemote 判定依赖 selfHostId 非空)。
-      ...(selfHostUuid
-        ? {
-            containerService: createContainerService(v3Docker),
-            selfHostId: selfHostUuid,
-            // v1.0.72 — 远端 codex auth 写/删 helper:统一在此一处做
-            // getHostById → hostRowToTarget → put/delete → finally psk.fill(0)
-            // 三处调用方(provisionV3Container / lazy migrate / stopAndRemove)
-            // 都通过这两个回调,避免泄密 buffer 散落。
-            //
-            // 失败语义:put 抛 → caller fallback NULL bind;delete 抛 → caller
-            // 应吞掉(best-effort,与本地 removeCodexContainerAuthDir 一致)。
-            // 本闭包不做 catch —— 让 caller 决定。
-            putRemoteCodexAuth: async (
-              hostUuid: string,
-              containerId: string,
-              accessToken: string,
-              lastRefreshIso: string,
-            ) => {
-              // A3 — service file-IO:revoked / 缺 fingerprint 的 host 直接拒。
-              const target = await resolveServiceableHostTarget(hostUuid);
-              try {
-                await putRemoteCodexContainerAuth(
-                  target,
-                  containerId,
-                  accessToken,
-                  lastRefreshIso,
-                );
-              } finally {
-                target.psk?.fill(0);
-              }
-            },
-            deleteRemoteCodexAuth: async (
-              hostUuid: string,
-              containerId: string,
-            ) => {
-              // A3 — service file-IO:revoked / 缺 fingerprint 的 host 直接拒
-              // (与 put/pull 对称;清 codex auth 也是 node-agent file 接触)。
-              const target = await resolveServiceableHostTarget(hostUuid);
-              try {
-                await deleteRemoteCodexContainerAuth(target, containerId);
-              } finally {
-                target.psk?.fill(0);
-              }
-            },
-          }
-        : {}),
-    };
-    // eslint-disable-next-line no-console
-    console.log("[commercial] v3 supervisor wired", {
-      image: cfg.OC_RUNTIME_IMAGE,
-      multiHost: Boolean(selfHostUuid),
-      selfHostId: selfHostUuid ?? null,
+      modelAuthoritySigner,
+      modelAuthorityProvisionRequired,
+      modelCatalogCache,
+      preCheckRedis,
+      loadUserModelAuthz,
+      selfHostUuid,
+      sessionsDeletedRef,
     });
+    const v3Docker = assembled.v3Docker;
+    v3Deps = assembled.v3Deps;
+    cc5Runtime = assembled.cc5Runtime;
+    cc5RuntimeRef.current = cc5Runtime;
 
-    // CCB 基线自检(只读诊断,不自己阻断启动 —— 真正的 fail-closed 发生在
-    // provisionV3Container 里抛 SupervisorError("CcbBaselineMissing"))。
-    //
-    // 这里的作用是给运维在 gateway 启动日志上立刻看见 baseline 是否就绪,
-    // 避免"rsync 漏了目录,gateway 跑得好好的但下一个 provision 直接 500"。
-    // MISSING 时日志态势明确,不用等用户踩坑才发现。
-    {
-      const baselineDir = process.env.OC_V3_CCB_BASELINE_DIR?.trim() || DEFAULT_V3_CCB_BASELINE_DIR;
-      const resolved = resolveCcbBaselineMounts(baselineDir);
-      const optional = process.env.OC_V3_CCB_BASELINE_OPTIONAL?.trim().toLowerCase();
-      const optionalFlagOn = optional === "1" || optional === "true" || optional === "yes";
-      if (resolved) {
-        // eslint-disable-next-line no-console
-        console.log("[commercial] v3 ccb baseline ready", {
-          baselineDir,
-          claudeMd: resolved.claudeMdHostPath,
-          skillsDir: resolved.skillsDirHostPath,
-          optional: optionalFlagOn,
-        });
-      } else if (optionalFlagOn) {
-        // dev/test 显式允许缺基线,不阻断
-        // eslint-disable-next-line no-console
-        console.warn(
-          "[commercial] v3 ccb baseline missing (OPTIONAL=1) — new containers will spawn WITHOUT platform guardrails",
-          { baselineDir },
-        );
-      } else {
-        // 生产路径 —— 下一次 provisionV3Container 将抛 CcbBaselineMissing
-        // eslint-disable-next-line no-console
-        console.error(
-          "[commercial] v3 ccb baseline MISSING — next provisionV3Container will FAIL (fail-closed). Fix baseline rsync or set OC_V3_CCB_BASELINE_OPTIONAL=1 for dev only.",
-          { baselineDir },
-        );
-      }
-    }
-
-    // ── P3 MAJOR 4(compute-pool 三件套双 master 护栏 + 收口债)───────────────────────
-    // preheatV3Image / initComputePool / imagePromote 都向共享 compute_hosts 写状态(desired/loaded
-    // image、quarantine、backfill),属 v3 控制面;它们仍以 **静态 controlPlaneEnabled eager-start,
-    // 未纳入 LeaderBundle**。双 master(v5)下两 slot 的 OC_CONTROL_PLANE_LEADER 都=1 → controlPlaneEnabled
-    // 两 slot 都 true → 两 slot 都 eager 跑 = 双写 compute_hosts 竞态;且 imagePromote 以 shared 域 eager
-    // 注册会违反下方"非 leader 不跑 shared"实时不变量。在纳入 bundle 前的硬护栏:v5 下 candidate/incumbent
-    // 任一 slot 都必须显式关掉这些开关,否则 fail-loud 拒起。v3 已下线、v5 镜像本机常驻,compute-pool
-    // 对 v5 本就无用(preheat 是 noop)。【收口债】后续应将 compute-pool 纳入 LeaderBundle 或从 v5 剥离。
     if (dualMasterEnabled && controlPlaneEnabled) {
       const preheatOn = process.env.OC_PREHEAT_DISABLED !== "1";
       const distributeOn = process.env.OC_IMAGE_DISTRIBUTE_DISABLED !== "1";
@@ -3837,36 +1257,16 @@ export async function registerCommercial(
       }
     }
 
-    // V3 Phase 3I — 启动时镜像预热(fire-and-forget):本地已有 → noop;
-    // 没有 → docker pull,把首次 provision 30-60s 拉镜像延迟摊到启动时。
-    // OC_PREHEAT_DISABLED=1 关闭(测试 / 网络受限 / CI)。失败不影响 gateway。
-    // P1d 单一权威:preheat + 其内嵌的 compute pool init / image-promote scheduler 都向
-    // 共享 compute_hosts 写状态。v5(dualMaster)已由上方 MAJOR 4 护栏要求显式关闭这些开关;
-    // 走到此处的 v5 一定 preheatOn=false,故本块实际只在非双 master(v3/legacy leader)执行。
     if (controlPlaneEnabled && process.env.OC_PREHEAT_DISABLED !== "1") {
       void preheatV3Image(v3Docker, cfg.OC_RUNTIME_IMAGE, {
         info: (m, meta) => { /* eslint-disable-next-line no-console */ console.log(m, meta ?? {}); },
         warn: (m, meta) => { /* eslint-disable-next-line no-console */ console.warn(m, meta ?? {}); },
       }).catch((err: unknown) => {
-        // preheatV3Image 内部已经吞了所有错;到这里只是兜底防 unhandledRejection
         // eslint-disable-next-line no-console
         console.warn("[commercial] v3 preheat unexpectedly threw", { error: (err as Error)?.message ?? String(err) });
       });
 
-      // 0042 — 启动时 compute pool 初始化:
-      //   1. inspect 本地 OC_RUNTIME_IMAGE → 算 desiredImageId
-      //   2. setDesiredImage(打开 placement gate)
-      //   3. setLoadedImage(self,= master 本机 image)
-      //   4. backfill:并发 4 / 单 host 30s / 整体 5min,拉一遍 /health 给非-self host 写各维度
-      //   5. 一次 promoteOnce(distribute 把 host 与 desired 对齐)
-      //   后台启动 ImagePromoteScheduler — 每 5min 自动 inspect+distribute,补 master image 升级后的状态收敛。
-      //
-      //  本调用替代旧 distributePreheatToAllHosts startup 调用 —— promoteOnce 内部已经包了
-      //  distribute,且会写 loaded_image_id + clear quarantine。
-      //  OC_IMAGE_DISTRIBUTE_DISABLED=1 仍可关掉(单机 dev / 测试)。
       if (process.env.OC_IMAGE_DISTRIBUTE_DISABLED !== "1") {
-        // imagePromote 实际 .start() 在 initComputePool 完成后(异步),但归属登记必须
-        // 同步发生在 gate 判定点 —— 否则 v5 不变量断言窗口期看不到它(此前的漏登记盲区)。
         trackScheduler("imagePromote", "shared", true);
         void initComputePool({ imageTag: cfg.OC_RUNTIME_IMAGE })
           .then((r) => {
@@ -3880,12 +1280,9 @@ export async function registerCommercial(
               backfillTimedOut: r.backfillTimedOut,
               promoteRan: r.promoteRan,
             });
-            // 启动周期性 promote scheduler(60s 后第一 tick,之后每 5min)。
-            // trackScheduler 幂等:gate 判定点已同步登记占位,此处重复包装不产生重复项。
             trackScheduler("imagePromote", "shared", getImagePromoteScheduler({ imageTag: cfg.OC_RUNTIME_IMAGE })).start();
           })
           .catch((err: unknown) => {
-            // initComputePool 内部 best-effort 不抛;到这里就是 bug
             // eslint-disable-next-line no-console
             console.warn("[commercial] compute pool init unexpectedly threw", {
               error: (err as Error)?.message ?? String(err),
@@ -3989,309 +1386,8 @@ export async function registerCommercial(
   //
   // 注:M1 语义是"一个 user 最多占一台 compute_host"(findUserStickyHost LIMIT 1),故 hostId
   // 参数目前只用于日志;未来若放宽"单用户多容器",此处要重新 keyed by (userId, hostId)。
-  setRemoteMuxDeps({
-    async resolvePlacement(userId, hostId) {
-      const uidInt = Number.parseInt(userId, 10);
-      if (!Number.isFinite(uidInt) || uidInt <= 0 || String(uidInt) !== userId) {
-        throw new RemoteHostError(
-          "INTERNAL",
-          `resolvePlacement: userId not positive integer: ${userId}`,
-        );
-      }
-      const sticky = await computeQueries.findUserStickyHost(uidInt);
-      if (!sticky) {
-        throw new RemoteHostError(
-          "INTERNAL",
-          `NO_CONTAINER: user ${userId} has no active container (hostId=${hostId})`,
-        );
-      }
-      const hostRow = await computeQueries.getHostById(sticky.hostUuid);
-      if (!hostRow) {
-        throw new RemoteHostError(
-          "INTERNAL",
-          `compute_host ${sticky.hostUuid} not found (userId=${userId} hostId=${hostId})`,
-        );
-      }
-      rootLogger.debug("sshMux resolvePlacement", {
-        subsys: "remote-ssh",
-        userId,
-        hostId,
-        resolvedHostUuid: hostRow.id,
-        resolvedName: hostRow.name,
-      });
-      if (hostRow.name === "self") return { kind: "self" };
-      // A3 — 终态 revoked host 不再做 SSH 远端文件操作(deny)。setRevoked 已清
-      // fingerprint;requireFingerprint=true 让缺 pin 的 host 也在 TLS 层 fail-closed。
-      if (hostRow.status === "revoked") {
-        throw new RemoteHostError(
-          "INTERNAL",
-          `compute_host ${sticky.hostUuid} revoked (userId=${userId} hostId=${hostId})`,
-        );
-      }
-      const target = hostRowToTarget(hostRow);
-      target.requireFingerprint = true;
-      return { kind: "remote", target };
-    },
-    startSshControlMaster,
-    stopSshControlMaster,
-    putRemoteFile: nodeAgentPutFile,
-    deleteRemoteFile: nodeAgentDeleteFile,
-  });
-  // eslint-disable-next-line no-console
-  console.log("[commercial] sshMux remote deps wired");
+  wireRemoteMuxDeps();
 
-  // v1.0.191 — /api/media-signed 冷启动护栏 + per-uid singleflight 合并。
-  // 详见 handlers.ts ensureContainerReady JSDoc 与 ensureContainerSingleflight.ts。
-  //
-  // **单一 singleflight 权威**(2026-07-07 saga 根治,修 Codex MAJOR):本进程内**所有**
-  // provision 入口 —— WS bridge `resolveContainerEndpoint` / HTTP `/api/media-signed`
-  // ensureContainerReady / cronWake wakeContainer / prewarm(下方复用本闭包)—— 全部汇入
-  // 这**唯一一个** makeUidSingleflight in-flight map。于是同 uid 有在途 provision 时,任何
-  // 后来者都 **join 同一 promise**,绝不独立走 getV3ContainerStatus 观察到 saga 中段的
-  // active+cid=NULL 在途占位行去销毁它(singleflight 在 ensureRunning 完整 settle 才 unwrap,
-  // 那时 Tx2 已提交 cid)。
-  //
-  // **关键推论**:getV3ContainerStatus 观察到 active+cid=NULL ⟺ 本进程无在途 provision ⟺
-  // 该行是崩溃/重启残留的**孤儿**(Tx1 提交后进程异常留下)。因此 15s grace 回归其原始
-  // "孤儿检测"用途(不需魔法 120s),provisioning 态是孤儿的**有界自愈等待**(≤15s 后转
-  // missing → stopAndRemove + 重建自愈,不引入慢愈退化)。见 v3supervisor
-  // getV3ContainerStatus / v3ensureRunning 2a-bis 的语义注释。
-  const clearResolvedEndpointSecret = (
-    endpoint: Awaited<ReturnType<ResolveContainerEndpoint>>,
-  ): void => {
-    try { endpoint.tunnel?.nodeAgent.psk?.fill(0); } catch { /* best-effort secret cleanup */ }
-  };
-  const cloneResolvedEndpoint = (
-    endpoint: Awaited<ReturnType<ResolveContainerEndpoint>>,
-  ): Awaited<ReturnType<ResolveContainerEndpoint>> => ({
-    ...endpoint,
-    ...(endpoint.tunnel
-      ? {
-          tunnel: {
-            ...endpoint.tunnel,
-            nodeAgent: {
-              ...endpoint.tunnel.nodeAgent,
-              psk: endpoint.tunnel.nodeAgent.psk
-                ? Buffer.from(endpoint.tunnel.nodeAgent.psk)
-                : null,
-            },
-          },
-        }
-      : {}),
-  });
-  const sharedEnsureRunning: ResolveContainerEndpoint | undefined = v3Deps
-    ? makeUidSingleflight(makeV3EnsureRunning(v3Deps), {
-        // A provision singleflight may fan out to chat, legacy preview and
-        // native preview at once. Give every consumer its own mutable PSK
-        // buffer so one transport's mandatory fill(0) cannot break another.
-        cloneResult: cloneResolvedEndpoint,
-        disposeSharedResult: clearResolvedEndpointSecret,
-      })
-    : undefined;
-
-  const ensureContainerEndpointReady: ((uid: bigint) => Promise<void>) | undefined =
-    sharedEnsureRunning
-      ? async (uid) => {
-          const endpoint = await sharedEnsureRunning(uid);
-          clearResolvedEndpointSecret(endpoint);
-        }
-      : undefined;
-
-  const ensureContainerReady: ((uid: bigint) => Promise<void>) | undefined =
-    ensureContainerEndpointReady;
-
-  const preheatUserContainer = bridgeSecret
-      ? makeEnginePreheatClient({
-          transport: makeNodeHttpContainerTransport(),
-          bridgeSecret,
-          resolvePreparation: makeEnginePreheatPreparation({
-            resolveAllowedModel: async (uid, modelId) => {
-              const active = (await getPool().query<{ status: string }>(
-                'SELECT status FROM users WHERE id = $1', [uid.toString()],
-              )).rows[0];
-              if (active?.status !== 'active') return null;
-              const cache = peekModelCatalogCache();
-              if (!cache) return null;
-              const snapshot = await cache.assertFresh();
-              const canonical = snapshot.aliasToCanonical(modelId);
-              const authz = await loadUserModelAuthz(uid, snapshot.securityEpoch);
-              if (!snapshot.canUseModel(scopeFromAuthz(uid, authz), canonical)) return null;
-              const descriptor = snapshot.resolve(canonical);
-              return descriptor ? { engine: descriptor.engine, canonicalModel: descriptor.canonicalModel } : null;
-            },
-            listGroups: modelId => listEnabledGroupsForModel({ modelId, provider: 'codex' }),
-            hasOfficial: groupId => hasActiveOfficialOAuthAccountInGroup(groupId, 'codex'),
-          }),
-          resolveRunningEndpoint: async (uid) => {
-            const r = await getPool().query<{
-              id: string;
-              bound_ip: string | null;
-              port: number | null;
-              host_name: string | null;
-            }>(
-              `SELECT ac.id::text AS id, host(ac.bound_ip) AS bound_ip, ac.port,
-                      ch.name AS host_name
-                 FROM agent_containers ac
-                 LEFT JOIN compute_hosts ch ON ch.id = ac.host_uuid
-                WHERE ac.user_id = $1 AND ac.state = 'active' AND ac.runtime_channel = $2
-                  AND ac.runtime_kind = 'docker'
-                  AND ac.bound_ip IS NOT NULL AND ac.port IS NOT NULL
-                ORDER BY ac.updated_at DESC LIMIT 1`,
-              [uid.toString(), getRuntimeChannel()],
-            );
-            const row = r.rows[0];
-            if (!row || !row.bound_ip || row.port === null) return null;
-            const isRemoteHost = row.host_name !== null && row.host_name !== "self";
-            return {
-              host: row.bound_ip,
-              port: Number(row.port),
-              containerId: Number(row.id),
-              ...(isRemoteHost ? { tunnel: { kind: "remote-host" as const } } : {}),
-            };
-          },
-        })
-      : undefined;
-
-  const authorizePreparation = async (uid: bigint): Promise<void> => {
-          const row = (await getPool().query<{ status: string; role: string }>(
-            'SELECT status, role FROM users WHERE id = $1', [uid.toString()],
-          )).rows[0];
-          if (!row || row.status !== 'active') throw new HttpError(403, 'FORBIDDEN', 'account is not active');
-          if (row.role !== 'admin' && await isInMaintenance()) {
-            throw new HttpError(503, 'MAINTENANCE', 'service is in maintenance');
-          }
-          const catalog = peekModelCatalogCache();
-          const snapshot = catalog ? await catalog.assertFresh() : null;
-          await loadUserModelAuthz(uid, snapshot?.securityEpoch);
-        };
-  const preparationReady = ensureContainerEndpointReady ? makePreparationReady(ensureContainerEndpointReady) : undefined;
-  const prepareContainer = preparationReady ? makeWorkspacePreparation({
-    authorize: authorizePreparation, ensureReady: preparationReady,
-    warn: fields => rootLogger.warn('workspace_prepare', fields),
-  }) : undefined;
-  const prepareDraft = preparationReady ? makeDraftPreparation({
-    enabled: () => process.env.OC_ENGINE_PREHEAT === '1',
-    authorize: authorizePreparation,
-    ensureReady: preparationReady,
-    prepareEngine: preheatUserContainer && dispatchAdmissionBackend ? makeDraftEnginePreparation({
-      loadWorkspaceMode: (uid, sessionId) => dispatchAdmissionBackend!.getClientSessionWorkspaceMode(
-        sessionId, 'c:'.concat(uid.toString())),
-      preheat: preheatUserContainer,
-    }) : async () => {},
-    observe: fields => rootLogger.info('draft_prepare', fields),
-  }) : undefined;
-  const prepareWorkspaceContainer = prepareContainer
-    ? (uid: bigint, draft?: DraftPreparationHint) => draft ? prepareDraft!(uid, draft) : prepareContainer(uid)
-    : undefined;
-
-  // 邮箱验证成功 → fire-and-forget 触发 v3 容器 pre-warm(p50=215s"验证 → 首消息"间隔
-  // 覆盖 docker run 冷启,首条消息命中 running)。
-  // 失败自动再试 1 次(间隔 5s,见 makePrewarmContainer);两次都失败才记 friction。
-  // **复用 sharedEnsureRunning 的同一 singleflight**(不再独立 makeV3EnsureRunning 闭包):
-  // 旧独立闭包让 prewarm 与 WS 走两个 in-flight map,都能独立观察并销毁同一 active+cid=NULL
-  // 在途行(Codex MAJOR)。统一后 prewarm 在途时 WS 请求 join 而非另起观察销毁。fire-and-forget
-  // 语义仍由 makePrewarmContainer 外层 .catch 吞掉保留(它只把返回 promise 吞掉,同步 return void)。
-  // v3Deps 未配 → sharedEnsureRunning undefined → prewarmContainer undefined → handler 端 no-op。
-  const prewarmContainer: ((uid: bigint) => void) | undefined = sharedEnsureRunning
-    ? makePrewarmContainer(
-        sharedEnsureRunning,
-        rootLogger.child({ subsys: "v3/prewarm" }),
-        ({ userId, correlation, latencyMs }) => {
-          void recordProductFrictionEvent({
-            correlation,
-            userId,
-            surface: "container",
-            stage: "prewarm",
-            code: "PREWARM_FAILED",
-            outcome: "failed",
-            latencyMs,
-          }, getPool()).catch(() => {});
-        },
-      )
-    : undefined;
-
-  // V3 multi-tenant media resolver(`c:<uid>` → user volume {uploads, generated})
-  // 仅暴露给 gateway(`RegisterCommercialResult.resolveUserMediaDirs`,装配
-  // _resolveMediaDirs 用于 /api/uploads 写路径)。
-  //
-  // v1.0.131 起 media-sign handler 不再用此 resolver:签 URL / 验签的路径都是
-  // 容器内 `/home/agent/...` 命名空间,master 侧只做 `isContainerPathAllowed`
-  // sanity check,真正 ACL 由 containerFileProxy 转发到容器内 handleApiFile
-  // (走 agentCwds + realpathSync + isFileAllowed) 把权威。
-  //
-  // 装配条件:有 docker client 即可——agentRuntime(legacy)或 v3Deps(on-demand 容器运行时)任一。
-  // ⚠️ v5 回归根因(P7 修复):v5 env 移除 AGENT_IMAGE 以禁 legacy agent runtime + 其 scheduler
-  // → agentRuntime=undefined → 旧代码 resolver=undefined → gateway _resolveMediaDirs 回退到
-  // master 单租户 uploadsDir,/api/uploads 写的文件进不了用户容器卷,容器内 dispatchInbound
-  // 解析 /api/media/<file> 时报"媒体不存在或不可读"。v3 prod 有 AGENT_IMAGE(agentRuntime 在)
-  // 故无此问题。这里把 docker 退到 v3Deps.docker：优先 agentRuntime(v3 行为零改变),v5 用 v3Deps。
-  // resolver 内部按 getRuntimeChannel() 解析 channel 卷(oc-v5-data-u<uid>),安全。
-  const mediaResolverDocker = agentRuntime?.docker ?? v3Deps?.docker;
-  const userMediaResolver = mediaResolverDocker
-    ? createUserMediaResolver({
-        pool: getPool(),
-        docker: mediaResolverDocker,
-      })
-    : undefined;
-  museDeliveryRefs.resolveMedia = userMediaResolver;
-  knowledgePlanetMediaResolverRef.current = userMediaResolver
-
-  // Shared remote-host upload closure. It is used by both gateway /api/uploads
-  // and the master-side WeChat image ingest bridge so the two paths keep the
-  // same node-agent semantics (0644, owner 1000:1000, PSK zeroing).
-  const pushRemoteHostUpload = async (args: {
-    hostUuid: string;
-    remotePath: string;
-    content: Buffer;
-  }) => {
-    // A3 — service file-IO:revoked / 缺 fingerprint 的 host 直接拒。
-    const target = await resolveServiceableHostTarget(args.hostUuid);
-    try {
-      await nodeAgentPutFile(
-        target,
-        args.remotePath,
-        args.content,
-        0o644,
-        1000,
-        1000,
-      );
-    } finally {
-      target.psk?.fill(0);
-    }
-  };
-  museDeliveryRefs.pushRemote = pushRemoteHostUpload;
-
-
-  const chunkHooks = createRemoteHostChunkHooks();
-
-  // Endpoint resolver split (P1-IMPL-09 / design v2 §1.2 / §4.5.3):
-  //
-  //   dockerEnsureRunning — WeChat / QQ inbound, container-local preview
-  //     (direct iframe + preview WS), media-signed / cron / prewarm (already
-  //     on sharedEnsureRunning below). Channel inbound must stay on the cloud
-  //     docker container. Same sharedEnsureRunning singleflight instance; the
-  //     wrapper only fail-closes a desktop endpoint, it does not create a
-  //     second in-flight map.
-  //
-  //   resolveContainerEndpoint — userChatBridge only (plus test override).
-  //     assembled + active desktop row → desktop; registry miss is
-  //     desktop_offline, never silent docker provision. Flag off / no desktop
-  //     row → the same sharedEnsureRunning singleflight.
-  //
-  // Turn-dispatch reconciler does **not** use either of these; it injects
-  // makeDesktopContainerTransport separately for already-admitted desktop
-  // turns. Screencast / legacy /ws/agent is gone (v5 uses user-chat-bridge).
-  const dockerEnsureRunning: ResolveContainerEndpoint =
-    makeInboundChannelResolver(sharedEnsureRunning);
-  const resolveContainerEndpoint: ResolveContainerEndpoint =
-    options.resolveContainerEndpoint
-    ?? makeDesktopOrDockerResolver(sharedEnsureRunning);
-
-  // V5 container-local web preview is intentionally atomic: the HTTP ticket
-  // endpoint stays unavailable until the authenticated public WS bridge has
-  // been assembled below. Model authority provides the existing Ed25519 trust
-  // root; without it, a same-UID process inside the user container could forge
-  // preview capabilities.
   const containerPreviewBaseUrl = process.env.COMMERCIAL_BASE_URL?.trim();
   const containerPreviewTickets =
     runtimeChannel === "v5"
@@ -4300,93 +1396,52 @@ export async function registerCommercial(
     && containerPreviewBaseUrl
       ? new ContainerPreviewTicketStore()
       : undefined;
-  let containerPreviewBridge: ContainerPreviewBridgeHandler | undefined;
-  let directContainerPreview: DirectContainerPreviewService | undefined;
-  if (
-    process.env.OC_CONTAINER_DIRECT_PREVIEW_ENABLED === "1"
-    && containerPreviewTickets
-    && modelAuthoritySigner
-    && containerPreviewBaseUrl
-  ) {
-    try {
-      directContainerPreview = createDirectContainerPreviewService({
-        signer: modelAuthoritySigner,
-        // Preview is container-local HTTP. desktop-reverse is not a routable
-        // docker IP; keep this on dockerEnsureRunning (P1-IMPL-09).
-        resolveContainerEndpoint: dockerEnsureRunning,
-        parentOrigin: containerPreviewBaseUrl,
-        tunnelOrigin: `http://127.0.0.1:${options.gatewayPort}`,
-        cloudflaredBinary: process.env.OC_CONTAINER_PREVIEW_CLOUDFLARED_BIN,
-        maxSessions: Number(process.env.OC_CONTAINER_PREVIEW_MAX_SESSIONS),
-        warmTunnels: Number(process.env.OC_CONTAINER_PREVIEW_WARM_TUNNELS || 2),
-        logger: rootLogger.child({ subsys: "commercial", module: "directContainerPreview" }),
-      });
-      // eslint-disable-next-line no-console
-      console.log("[commercial] V5 native iframe preview ENABLED (temporary Quick Tunnel beta)");
-    } catch (err) {
-      rootLogger.error("[commercial] native iframe preview disabled", {
-        error: (err as Error)?.message ?? String(err),
-      });
-    }
-  }
 
-  // ChatGPT 直连代理:公网 TLS CONNECT 监听(仅白名单域名),链到订阅 egress。
-  // env fail-closed;证书缺失/配置错 → 记 error、功能关闭,不影响 master 启动。
-  let chatgptProxyServer: ChatGptProxyServer | undefined;
-  let chatgptProxyHttp: ChatGptProxyHttpDeps | undefined;
-  {
-    const cgpEnv = readChatGptProxyEnv();
-    if (cgpEnv.enabled && runtimeChannel === "v5" && v3Deps) {
-      if (cgpEnv.configError || !cgpEnv.upstream) {
-        rootLogger.error("[commercial] chatgpt proxy disabled: bad config", {
-          error: cgpEnv.configError ?? "no upstream",
-        });
-      } else {
-        try {
-          const cgpLogger = rootLogger.child({ subsys: "commercial", module: "chatgptProxy" });
-          const credentials = new ChatGptProxyCredentialStore(v3Deps.pool);
-          const pool = v3Deps.pool;
-          chatgptProxyServer = createChatGptProxyServer({
-            publicHost: cgpEnv.publicHost,
-            port: cgpEnv.port,
-            tlsCertPath: cgpEnv.tlsCertPath,
-            tlsKeyPath: cgpEnv.tlsKeyPath,
-            upstream: cgpEnv.upstream,
-            verifyCredential: (uid, secret) => credentials.verify(uid, secret),
-            resolveUserRole: async (uid) => {
-              const r = await pool.query<{ role: string }>(
-                `SELECT role FROM users WHERE id = $1::bigint AND status = 'active' LIMIT 1`,
-                [uid],
-              );
-              const role = r.rows[0]?.role;
-              return role === "admin" || role === "user" ? role : null;
-            },
-            getEntitlement: async () => {
-              const snap = await getChatGptProxyFlagSnapshot();
-              return { assembled: snap.assembled, allowlist: snap.allowlist };
-            },
-            onTunnelUsed: (uid) => credentials.touchLastUsed(uid),
-            logger: cgpLogger,
-          });
-          chatgptProxyHttp = {
-            publicHost: cgpEnv.publicHost,
-            port: cgpEnv.port,
-            credentials,
-            getFlags: () => getChatGptProxyFlagSnapshot(),
-          };
-          chatgptProxyServer.listenWithRetry();
-          // eslint-disable-next-line no-console
-          console.log(`[commercial] ChatGPT direct-connect proxy ENABLED on ${cgpEnv.publicHost}:${cgpEnv.port}`);
-        } catch (err) {
-          chatgptProxyServer = undefined;
-          chatgptProxyHttp = undefined;
-          rootLogger.error("[commercial] chatgpt proxy disabled: init failed", {
-            error: (err as Error)?.message ?? String(err),
-          });
-        }
-      }
-    }
-  }
+  const {
+    sharedEnsureRunning,
+    ensureContainerEndpointReady,
+    preheatUserContainer,
+    prepareWorkspaceContainer,
+    prewarmContainer,
+    userMediaResolver,
+    pushRemoteHostUpload,
+    chatgptProxyServer: initialChatgptProxyServer,
+    chatgptProxyHttp,
+  } = buildContainerHelpersAndPreview({
+    env: process.env,
+    runtimeChannel,
+    v3Deps,
+    agentRuntimeDocker: agentRuntime?.docker,
+    bridgeSecret,
+    loadUserModelAuthz,
+    dispatchAdmissionBackend,
+    modelAuthoritySigner,
+    gatewayPort: options.gatewayPort,
+    containerPreviewTickets,
+    containerPreviewBaseUrl,
+  });
+  let chatgptProxyServer = initialChatgptProxyServer;
+  const ensureContainerReady: ((uid: bigint) => Promise<void>) | undefined =
+    ensureContainerEndpointReady;
+  museDeliveryRefs.resolveMedia = userMediaResolver;
+  knowledgePlanetMediaResolverRef.current = userMediaResolver;
+  museDeliveryRefs.pushRemote = pushRemoteHostUpload;
+
+  const chunkHooks = createRemoteHostChunkHooks();
+  const dockerEnsureRunning: ResolveContainerEndpoint =
+    makeInboundChannelResolver(sharedEnsureRunning);
+  const resolveContainerEndpoint: ResolveContainerEndpoint =
+    options.resolveContainerEndpoint
+    ?? makeDesktopOrDockerResolver(sharedEnsureRunning);
+  let directContainerPreview: DirectContainerPreviewService | undefined =
+    createOptionalDirectContainerPreview({
+      env: process.env,
+      containerPreviewTickets,
+      modelAuthoritySigner,
+      containerPreviewBaseUrl,
+      dockerEnsureRunning,
+      gatewayPort: options.gatewayPort,
+    });
 
   const resolvePromptPrivacySupport = makePromptPrivacySupportResolver({
     inspect: async userId => v3Deps ? getV3ContainerStatus(v3Deps, userId) : null,
@@ -4425,6 +1480,15 @@ export async function registerCommercial(
   const remoteDriverV4 = v4ExecutorDeps
     ? new RemoteDriverV4CommissioningService({ executorDeps: v4ExecutorDeps })
     : undefined;
+  const qqBotServiceRef: { current: QqBotService | undefined } = { current: undefined };
+  const pendingDecisionsRuntime = createCommercialPendingDecisionsRuntime({
+    pool: getPool(),
+    v3Supervisor: v3Deps,
+    bridgeSecret,
+    onControlAdmitted: (uid) => cronOriginBridgeRef?.drainControlsForUser?.(uid) ?? Promise.resolve(),
+    pushToWechat: (item) => wechatBrokerRef.current?.pushPendingDecision(item) ?? Promise.resolve(),
+    pushToQq: (item) => qqBotServiceRef.current?.pushPendingDecision(item) ?? Promise.resolve(),
+  });
   const handler = createCommercialHandler({
     codexCommissioning,
     remoteDriverV4,
@@ -4434,8 +1498,10 @@ export async function registerCommercial(
     mediaGeneration: mediaGenerationService,
     sites: sitesService,
     museBridgeHttp,
+    museHub,
     studio: studioHttp,
     goalStateService,
+    pendingDecisionsService: pendingDecisionsRuntime.service,
     containerPreviewTickets,
     containerPreviewAvailable: () => containerPreviewBridge !== undefined,
     directContainerPreview,
@@ -4654,65 +1720,35 @@ export async function registerCommercial(
     });
   }
 
-  if (
-    containerPreviewTickets
-    && modelAuthoritySigner
-    && containerPreviewBaseUrl
-  ) {
-    try {
-      containerPreviewBridge = createContainerPreviewBridge({
-        tickets: containerPreviewTickets,
-        signer: modelAuthoritySigner,
-        // Same docker-only contract as direct preview (P1-IMPL-09).
-        resolveContainerEndpoint: dockerEnsureRunning,
-        allowedOrigin: containerPreviewBaseUrl,
-        maxGlobalSessions: Number(process.env.OC_CONTAINER_PREVIEW_MAX_SESSIONS),
-        createTunnelContainerSocket: (tunnel, port, assertion, connectionTraceId, signal) =>
-          createTunnelContainerSocket(
-            tunnel.nodeAgent,
-            tunnel.containerInternalId,
-            port,
-            signal,
-            {
-              maxFrameBytes: CONTAINER_PREVIEW_MAX_FRAME_BYTES,
-              connectionTraceId,
-              containerWsPath: "/ws/container-preview",
-              previewAssertion: assertion,
-            },
-          ),
-        logger: rootLogger.child({ subsys: "commercial", module: "containerPreviewBridge" }),
-      });
-      // eslint-disable-next-line no-console
-      console.log("[commercial] V5 container web preview ENABLED");
-    } catch (err) {
-      // Ticket issuance remains fail-closed through containerPreviewAvailable.
-      rootLogger.error("[commercial] container web preview disabled", {
-        error: (err as Error)?.message ?? String(err),
-      });
-    }
-  }
+  let containerPreviewBridge: ContainerPreviewBridgeHandler | undefined =
+    createOptionalContainerPreviewBridge({
+      env: process.env,
+      containerPreviewTickets,
+      modelAuthoritySigner,
+      containerPreviewBaseUrl,
+      dockerEnsureRunning,
+    });
 
-
-  // ─── wechat codex(gpt-*)turn:api_relay 路由 + 真扣费 ─────────────────────
-  // 接收侧插槽:wechat/inboundDispatcher.prepareCodexTurn / outboundReceiver.handleCodexBilling。
-  // v5 计费口径(M1b):finalizer 走双钱包 settle;usage_records.account_id=NULL;
-  // session_id=deriveEngineSessionId 口径;cost 回执走 appendCostCreditsForUser
-  // (c:<uid> 前缀对齐 session 存储命名空间 —— v3 旧版直调 appendCostCredits 是孤儿成本 bug)。
-  const CODEX_PRECHECK_TOKEN_ESTIMATE = 64_000;
-  const DEFAULT_CODEX_SESSION_MAX_MS = 600_000;
-  const readCodexSessionMaxMs = (): number => {
-    const raw = process.env.CODEX_SESSION_MAX_MS;
-    if (!raw) return DEFAULT_CODEX_SESSION_MAX_MS;
-    const n = Number(raw);
-    return Number.isFinite(n) && n >= 1000 ? n : DEFAULT_CODEX_SESSION_MAX_MS;
-  };
-  const newCodexRequestId = (): string => randomBytes(16).toString("hex");
-  const codexRouteLog = rootLogger.child({ subsys: "commercial", module: "codexRoute" });
-
-  // M2 — 网页(bridge)codex turn 的 per-turn 路由决策(与 wechat 版差异:bridge
-  // 需要 api_relay / official_oauth / unavailable 判别联合,由 bridge 决定占槽
-  // 还是 fast-fail;wechat 只走 api_relay)。恢复源 = P1f^ 同名函数,零语义改动。
-  const createCommercialCodexRoute = async ({ containerId, userId, modelId, sessionId }: {
+  // ─── wechat codex(gpt-*) turn + Auto-Dream V2 + QQ Official Bot + WeChat broker ───
+  const {
+    readCodexSessionMaxMs,
+    newCodexRequestId,
+    expireCodexRouteToken,
+    failWechatCodexTurn,
+    handleWechatCodexBilling,
+    prepareWechatCodexTurn,
+  } = createCommercialCodexAndWechatTurns({
+    env: process.env,
+    pricing,
+    preCheckRedis,
+    randomBytesHex: (size) => randomBytes(size).toString("hex"),
+  });
+  const createCommercialCodexRoute = async ({
+    containerId,
+    userId,
+    modelId,
+    sessionId,
+  }: {
     containerId: number;
     userId: bigint;
     modelId: string;
@@ -4756,685 +1792,41 @@ export async function registerCommercial(
   };
   commercialCodexRouteRef.current = (args) => createCommercialCodexRoute(args);
 
-  const createWechatApiRelayRoute = async (args: {
-    containerId: number;
-    userId: bigint;
-    modelId: string;
-  }) => {
-    const groups = await listEnabledGroupsForModel({ modelId: args.modelId, provider: "codex" });
-    for (const group of groups) {
-      if (group.kind !== "api_relay") continue;
-      const route = await createCodexRouteContextForModel({
-        containerId: args.containerId,
-        userId: args.userId,
-        modelId: args.modelId,
-        groupId: group.id,
-      });
-      if (!route) continue;
-      return {
-        token: route.token,
-        routeFrame: {
-          baseUrl: `http://127.0.0.1:${V3_CONTAINER_PORT}/internal/v3/codex-relay/route/${route.token}`,
-          modelProvider: route.credential.model_provider,
-          providerName: route.credential.provider_name ?? null,
-          wireApi: route.credential.wire_api ?? "responses",
-          preferredAuthMethod: route.credential.preferred_auth_method ?? "apikey",
-          disableResponseStorage: route.credential.disable_response_storage ?? true,
-        },
-      };
-    }
-    return null;
-  };
+  autoDreamOptimizerRuntimeRef.current = createAutoDreamOptimizerRuntime({
+    pricing,
+    preCheckRedis,
+    createCommercialCodexRoute,
+    expireCodexRouteToken,
+    newCodexRequestId,
+    readCodexSessionMaxMs,
+    hmacSha256Hex: (input) => createHmac("sha256", jwtSecret).update(input).digest("hex"),
+  });
 
-  type WechatCodexTurnSnapshot = {
-    finalizer: CodexFinalizeHandle;
-    reservation: ReservationHandle;
-    requestId: string;
-    userId: bigint;
-    containerId: number;
-    model: string;
-    traceId: string;
-    routeToken: string;
-    timeout: ReturnType<typeof setTimeout>;
-  };
-  const wechatCodexTurns = new Map<string, WechatCodexTurnSnapshot>();
-
-  const expireCodexRouteToken = (token: string | null | undefined, reason: string): void => {
-    if (!token) return;
-    expireCodexRouteContext(token).catch((err) => {
-      codexRouteLog.warn("expire_codex_route_failed", {
-        reason,
-        errMessage: (err as Error)?.message ?? String(err),
-      });
-    });
-  };
-
-  const failWechatCodexTurn = async (requestId: string, reason: string): Promise<void> => {
-    const snap = wechatCodexTurns.get(requestId);
-    if (!snap) return;
-    wechatCodexTurns.delete(requestId);
-    clearTimeout(snap.timeout);
-    const failureCode: JournalFailureCode = reason === "wechat_container_cold_start"
-      ? "UPSTREAM_UNAVAILABLE"
-      : reason.startsWith("wechat_container_rejected_")
-          || reason === "wechat_container_terminal_before_start"
-        ? "UPSTREAM_REJECTED"
-        : "INTERNAL_ERROR";
-    try {
-      await snap.finalizer.fail(reason, failureCode);
-    } finally {
-      expireCodexRouteToken(snap.routeToken, reason);
-    }
-  };
-
-  const expireWechatCodexRecoverySnapshot = async (requestId: string): Promise<void> => {
-    const snap = wechatCodexTurns.get(requestId);
-    if (!snap) return;
-    wechatCodexTurns.delete(requestId);
-    clearTimeout(snap.timeout);
-    // This is only an in-memory retention timeout, not a billing decision.
-    // Keep the durable journal inflight indefinitely; a delayed fsynced frame
-    // can reconstruct settlement after any master restart.
-    await releasePreCheck(preCheckRedis, snap.reservation).catch(() => {});
-    expireCodexRouteToken(snap.routeToken, "wechat_codex_snapshot_expired");
-  };
-
-  const safeBillingNum = (v: unknown): number => {
-    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) return 0;
-    return Math.trunc(v);
-  };
-
-  const handleWechatCodexBilling = async (
-    body: WechatCodexBillingBody,
-    identity: { userId: number; containerId: number },
-  ): Promise<void> => {
-    const pool = getPool();
-    const journal = await pool.query<{
-      user_id: string;
-      container_id: string | null;
-      ctx: unknown;
-    }>(
-      `SELECT user_id::text AS user_id, container_id::text AS container_id, ctx
-         FROM request_finalize_journal WHERE request_id=$1`,
-      [body.requestId],
-    );
-    const row = journal.rows[0];
-    if (!row) throw new Error(`wechat codex billing journal missing for ${body.requestId}`);
-    if (row.user_id !== String(identity.userId) || row.container_id !== String(identity.containerId)) {
-      throw new Error(`wechat codex billing identity mismatch for ${body.requestId}`);
-    }
-    const ctx = row.ctx !== null && typeof row.ctx === "object" && !Array.isArray(row.ctx)
-      ? row.ctx as Record<string, unknown>
-      : {};
-    const agentId = typeof ctx.agentId === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(ctx.agentId)
-      ? ctx.agentId
-      : "codex";
-    const derivedEngineSessionId = deriveEngineSessionId(
-      `wechat:${identity.userId}:${identity.containerId}:${agentId}`,
-    );
-    const journalEngineSessionId = typeof ctx.engineSessionId === "string"
-      && /^oceng-[0-9a-f]{48}$/.test(ctx.engineSessionId)
-      ? ctx.engineSessionId
-      : derivedEngineSessionId;
-    if (body.engineSessionId !== undefined && body.engineSessionId !== journalEngineSessionId) {
-      throw new Error(`wechat codex billing engine session mismatch for ${body.requestId}`);
-    }
-    const u = body.usage ?? {};
-    const billing: DurableCodexBilling = {
-      requestId: body.requestId,
-      ...(body.turnKey ? { turnKey: body.turnKey } : {}),
-      ...(body.parentTurnKey ? { parentTurnKey: body.parentTurnKey } : {}),
-      ...(body.parentSessionId ? { parentSessionId: body.parentSessionId } : {}),
-      ...(body.delegateAgentId ? { delegateAgentId: body.delegateAgentId } : {}),
-      engineSessionId: journalEngineSessionId,
-      status: body.status,
-      ...(body.terminalCode !== undefined ? { terminalCode: body.terminalCode } : {}),
-      durationMs: body.durationMs,
-      usage: {
-        input_tokens: safeBillingNum(u.input_tokens),
-        output_tokens: safeBillingNum(u.output_tokens),
-        reasoning_output_tokens: safeBillingNum(u.reasoning_output_tokens),
-        cache_read_input_tokens: safeBillingNum(u.cache_read_input_tokens),
-        cache_creation_input_tokens: safeBillingNum(u.cache_creation_input_tokens),
-      },
-      ...(body.rateLimits !== undefined ? { rateLimits: body.rateLimits } : {}),
-    };
-    try {
-      await settleDurableCodexBilling(
-        {
-          pgPool: pool,
-          preCheckRedis,
-          pricing,
-          logger: rootLogger.child({ subsys: "wechatDurableCodexBilling" }),
-        },
-        BigInt(identity.userId),
-        billing,
-      );
-    } catch (err) {
-      codexRouteLog.error("wechat_codex_finalizer_commit_failed", {
-        requestId: body.requestId,
-        errMessage: (err as Error)?.message ?? String(err),
-      });
-      // Propagate so outboundReceiver returns non-2xx and the gateway retains
-      // its fsynced retry frame. Never ACK an unsettled/unknown journal.
-      throw err;
-    }
-    const snap = wechatCodexTurns.get(body.requestId);
-    if (snap) {
-      wechatCodexTurns.delete(body.requestId);
-      clearTimeout(snap.timeout);
-      expireCodexRouteToken(snap.routeToken, "wechat_codex_billing_settled");
-    }
-  };
-
-  const prepareWechatCodexTurn = async (args: {
-    containerId: number;
-    bindingUserId: string;
-    userId: bigint;
-    modelId: string;
-    agentId: string;
-    traceId: string;
-  }): Promise<PrepareWechatCodexTurnResult> => {
-    const route = await createWechatApiRelayRoute(args);
-    if (!route) {
-      return {
-        kind: "unavailable",
-        reply: "GPT 模型通道暂时不可用，请稍后再试，或发送 /model 切换到其它模型。",
-      };
-    }
-
-    const modelPricing = pricing.get(args.modelId);
-    if (!modelPricing) {
-      expireCodexRouteToken(route.token, "wechat_codex_pricing_missing");
-      return { kind: "unavailable", reply: "GPT 模型计费配置暂时不可用，请稍后再试。" };
-    }
-
-    const agentForCharge = args.agentId || "codex";
-    let derivedPricing: ModelPricing;
-    try {
-      const agentMul = await getAgentCostMultiplier(getPool(), agentForCharge);
-      derivedPricing = {
-        ...modelPricing,
-        multiplier: composeMultiplier(modelPricing.multiplier, agentMul),
-      };
-    } catch (err) {
-      expireCodexRouteToken(route.token, "wechat_codex_multiplier_failed");
-      codexRouteLog.error("wechat_codex_multiplier_failed", {
-        agentId: agentForCharge,
-        errMessage: (err as Error)?.message ?? String(err),
-      });
-      return { kind: "unavailable", reply: "GPT 模型计费配置暂时不可用，请稍后再试。" };
-    }
-
-    const requestId = newCodexRequestId();
-    let maxCost: bigint;
-    try {
-      maxCost = estimateMaxCost(CODEX_PRECHECK_TOKEN_ESTIMATE, derivedPricing);
-    } catch (err) {
-      expireCodexRouteToken(route.token, "wechat_codex_estimate_failed");
-      codexRouteLog.error("wechat_codex_estimate_failed", {
-        errMessage: (err as Error)?.message ?? String(err),
-      });
-      return { kind: "unavailable", reply: "GPT 模型计费配置暂时不可用，请稍后再试。" };
-    }
-
-    let preCheckResult: Awaited<ReturnType<typeof preCheckWithCost>>;
-    try {
-      preCheckResult = await preCheckWithCost(preCheckRedis, {
-        userId: args.userId,
-        requestId,
-        maxCost,
-      });
-    } catch (err) {
-      expireCodexRouteToken(route.token, "wechat_codex_precheck_failed");
-      if (err instanceof InsufficientCreditsError) {
-        return { kind: "unavailable", reply: "余额不足，请到网页端充值后再使用 GPT 模型，或发送 /model 切换其它模型。" };
-      }
-      codexRouteLog.error("wechat_codex_precheck_failed", {
-        errMessage: (err as Error)?.message ?? String(err),
-      });
-      return { kind: "unavailable", reply: "GPT 模型计费检查暂时不可用，请稍后再试。" };
-    }
-
-    const engineSessionId = deriveEngineSessionId(
-      `wechat:${args.bindingUserId}:${args.containerId}:${agentForCharge}`,
-    );
-    try {
-      const admitted = await startInflightJournal(getPool(), {
-        requestId,
-        userId: args.userId,
-        containerId: BigInt(args.containerId),
-        model: args.modelId,
-        precheckCredits: preCheckResult.maxCost,
-        ctxJson: {
-          agentId: agentForCharge,
-          codexAccountId: null,
-          source: "wechat_codex_api_relay",
-          durableBillingRecovery: DURABLE_CODEX_RECOVERY_VERSION,
-          billingPricing: serializeBillingPricing(derivedPricing),
-          engineSessionId,
-        },
-      });
-      if (!admitted) {
-        await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
-        expireCodexRouteToken(route.token, "wechat_codex_journal_conflict");
-        codexRouteLog.error("wechat_codex_journal_conflict", { requestId });
-        return { kind: "unavailable", reply: "GPT 模型计费初始化暂时不可用，请稍后再试。" };
-      }
-    } catch (err) {
-      await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
-      expireCodexRouteToken(route.token, "wechat_codex_journal_failed");
-      codexRouteLog.error("wechat_codex_journal_failed", {
-        requestId,
-        errMessage: (err as Error)?.message ?? String(err),
-      });
-      return { kind: "unavailable", reply: "GPT 模型计费初始化暂时不可用，请稍后再试。" };
-    }
-
-    const finalizer = makeCodexFinalizer({
-      pgPool: getPool(),
-      preCheckRedis,
-      userId: args.userId,
-      requestId,
-      // v5 计费口径:usage_records.session_id 单一权威 helper 派生(oceng-<48hex>)。
-      // wechat 会话没有 ccb sessionKey,用 (binding, container, agent) 稳定三元组派生;
-      // M2 gateway billing 事件接入后网页路径改用 gateway 传来的同算法值。
-      engineSessionId,
-      model: args.modelId,
-      derivedPricing,
-      reservation: preCheckResult.reservation,
-    });
-    const timeout = setTimeout(() => {
-      void expireWechatCodexRecoverySnapshot(requestId);
-    }, readCodexSessionMaxMs());
-    timeout.unref?.();
-    wechatCodexTurns.set(requestId, {
-      finalizer,
-      reservation: preCheckResult.reservation,
-      requestId,
-      userId: args.userId,
-      containerId: args.containerId,
-      model: args.modelId,
-      traceId: args.traceId,
-      routeToken: route.token,
-      timeout,
-    });
-
-    return { kind: "ready", requestId, routeFrame: route.routeFrame };
-  };
-
-  // ─── Auto-Dream V2 optimizer: master-owned policy, actions and reporting ──
-  type AutoDreamCodexSnapshot = {
-    reservation: ReservationHandle;
-    finalizer: CodexFinalizeHandle;
-    routeToken: string | null;
-    userId: bigint;
-    containerId: number;
-    engineSessionId: string;
-    timeout: NodeJS.Timeout;
-  };
-  const autoDreamCodexTurns = new Map<string, AutoDreamCodexSnapshot>();
-
-  const requireAutoDreamString = (
-    body: Record<string, unknown>,
-    key: string,
-    re: RegExp,
-  ): string => {
-    const value = body[key];
-    if (typeof value !== "string" || !re.test(value)) {
-      throw new Error(`AUTO_DREAM_INVALID_${key.toUpperCase()}`);
-    }
-    return value;
-  };
-
-  autoDreamOptimizerRuntimeRef.current = {
-    handle: async ({ path, identity, body }) => {
-      const userId = BigInt(identity.userId);
-      if (path === AUTO_DREAM_OPTIMIZER_ADMIT_PATH) {
-        const runId = requireAutoDreamString(body, "runId", /^[0-9a-f-]{36}$/);
-        const callId = requireAutoDreamString(body, "callId", /^[0-9a-f-]{36}:\d{1,8}$/);
-        const agentId = requireAutoDreamString(body, "agentId", /^[A-Za-z0-9_-]{1,64}$/);
-        const model = requireAutoDreamString(body, "model", /^gpt-5\.6-terra$/);
-        const { getAutoDreamPolicy } = await import("./user/autoDream.js");
-        const policy = await getAutoDreamPolicy(userId);
-        if (
-          !policy.enabled ||
-          policy.mode !== "optimizer_v2" ||
-          policy.modelId !== model
-        ) {
-          throw new Error("AUTO_DREAM_INVALID_POLICY");
-        }
-        const route = projectAutoDreamCodexRoute(
-          await createCommercialCodexRoute({
-            containerId: identity.containerId,
-            userId,
-            modelId: model,
-          }),
-        );
-        if (!route) throw new Error("AUTO_DREAM_ROUTE_UNAVAILABLE");
-        const basePricing = pricing.get(model);
-        if (!basePricing) {
-          expireCodexRouteToken(route.token, "auto_dream_pricing_missing");
-          throw new Error("AUTO_DREAM_PRICING_UNAVAILABLE");
-        }
-        const agentMul = await getAgentCostMultiplier(getPool(), agentId);
-        const derivedPricing: ModelPricing = {
-          ...basePricing,
-          multiplier: composeMultiplier(basePricing.multiplier, agentMul),
-        };
-        const requestId = newCodexRequestId();
-        const maxCost = estimateMaxCost(CODEX_PRECHECK_TOKEN_ESTIMATE, derivedPricing);
-        let precheck: Awaited<ReturnType<typeof preCheckWithCost>>;
-        try {
-          precheck = await preCheckWithCost(preCheckRedis, { userId, requestId, maxCost });
-        } catch (err) {
-          expireCodexRouteToken(route.token, "auto_dream_precheck_failed");
-          throw err;
-        }
-        const engineSessionId = deriveEngineSessionId(
-          `auto-dream:${identity.userId}:${identity.containerId}:${agentId}`,
-        );
-        try {
-          const admitted = await startInflightJournal(getPool(), {
-            requestId,
-            userId,
-            containerId: BigInt(identity.containerId),
-            model,
-            precheckCredits: precheck.maxCost,
-            ctxJson: {
-              agentId,
-              runId,
-              callId,
-              source: "auto_dream_optimizer",
-              durableBillingRecovery: DURABLE_CODEX_RECOVERY_VERSION,
-              billingPricing: serializeBillingPricing(derivedPricing),
-              engineSessionId,
-            },
-          });
-          if (!admitted) throw new Error("AUTO_DREAM_JOURNAL_CONFLICT");
-        } catch (err) {
-          await releasePreCheck(preCheckRedis, precheck.reservation).catch(() => {});
-          expireCodexRouteToken(route.token, "auto_dream_journal_failed");
-          throw err;
-        }
-        const finalizer = makeCodexFinalizer({
-          pgPool: getPool(),
-          preCheckRedis,
-          userId,
-          requestId,
-          engineSessionId,
-          model,
-          derivedPricing,
-          reservation: precheck.reservation,
-        });
-        const timeout = setTimeout(() => {
-          const live = autoDreamCodexTurns.get(requestId);
-          if (!live) return;
-          autoDreamCodexTurns.delete(requestId);
-          expireCodexRouteToken(live.routeToken, "auto_dream_admission_expired");
-          void releasePreCheck(preCheckRedis, live.reservation).catch(() => {});
-        }, readCodexSessionMaxMs());
-        timeout.unref?.();
-        autoDreamCodexTurns.set(requestId, {
-          reservation: precheck.reservation,
-          finalizer,
-          routeToken: route.token,
-          userId,
-          containerId: identity.containerId,
-          engineSessionId,
-          timeout,
-        });
-        return {
-          requestId,
-          engineSessionId,
-          routeFrame: route.routeFrame,
-        };
-      }
-      if (path === AUTO_DREAM_OPTIMIZER_FINDINGS_PATH) {
-        const runId = requireAutoDreamString(body, "runId", /^[0-9a-f-]{36}$/);
-        const agentId = requireAutoDreamString(body, "agentId", /^[A-Za-z0-9_-]{1,64}$/);
-        const { getAutoDreamPolicy } = await import("./user/autoDream.js");
-        const policy = await getAutoDreamPolicy(userId);
-        if (!policy.enabled || policy.mode !== "optimizer_v2") {
-          throw new Error("AUTO_DREAM_INVALID_POLICY");
-        }
-        const pseudonymKey = loadKmsKey();
-        try {
-          return await reportAutoDreamPlatformFindings(getPool(), {
-            subjectHash: createHmac("sha256", jwtSecret)
-              .update(`auto-dream-platform-finding-user\0${identity.userId}`)
-              .digest("hex"),
-            agentId,
-            runId,
-            model: policy.modelId,
-            findings: body.findings,
-            rawFindings: body.rawFindings,
-            trafficClass: await getUserSignalTrafficClass(identity.userId, getPool()),
-            pseudonymKey,
-          });
-        } finally {
-          zeroBuffer(pseudonymKey);
-        }
-      }
-      if (path === AUTO_DREAM_OPTIMIZER_ACTION_PATH) {
-        const action = requireAutoDreamString(body, "action", /^preference\.patch$/);
-        void action;
-        return await applyAutoDreamPreferenceAction(getPool(), {
-          userId: identity.userId,
-          proposalId: requireAutoDreamString(body, "proposalId", /^[0-9a-f]{32}$/),
-          targetId: requireAutoDreamString(
-            body,
-            "targetId",
-            /^preferences\.[a-z_]{1,64}$/,
-          ),
-          beforeFingerprint: requireAutoDreamString(
-            body,
-            "beforeFingerprint",
-            /^[0-9a-f]{64}$/,
-          ),
-          after:
-            typeof body.after === "string" && body.after.length <= 32_000
-              ? body.after
-              : (() => {
-                  throw new Error("AUTO_DREAM_INVALID_AFTER");
-                })(),
-        });
-      }
-
-      const requestId = requireAutoDreamString(body, "requestId", /^[0-9a-f]{32}$/);
-      const journal = await getPool().query<{
-        user_id: string;
-        container_id: string | null;
-        ctx: Record<string, unknown> | null;
-      }>(
-        `SELECT user_id::text,container_id::text,ctx
-           FROM request_finalize_journal WHERE request_id=$1`,
-        [requestId],
-      );
-      const journalRow = journal.rows[0];
-      if (
-        !journalRow ||
-        journalRow.user_id !== String(identity.userId) ||
-        journalRow.container_id !== String(identity.containerId) ||
-        journalRow.ctx?.source !== "auto_dream_optimizer"
-      ) {
-        throw new Error("AUTO_DREAM_INVALID_JOURNAL_IDENTITY");
-      }
-
-      if (path === AUTO_DREAM_OPTIMIZER_SETTLE_PATH) {
-        const usage =
-          body.usage && typeof body.usage === "object" && !Array.isArray(body.usage)
-            ? body.usage as Record<string, unknown>
-            : {};
-        const safe = (value: unknown): number =>
-          typeof value === "number" && Number.isFinite(value) && value > 0
-            ? Math.trunc(value)
-            : 0;
-        const status = body.status === "success" ? "success" : "error";
-        await settleDurableCodexBilling(
-          {
-            pgPool: getPool(),
-            preCheckRedis,
-            pricing,
-            logger: rootLogger.child({ subsys: "autoDreamDurableCodexBilling" }),
-          },
-          userId,
-          {
-            requestId,
-            engineSessionId:
-              typeof journalRow.ctx.engineSessionId === "string"
-                ? journalRow.ctx.engineSessionId
-                : deriveEngineSessionId(`auto-dream:${identity.userId}:${identity.containerId}:main`),
-            status,
-            durationMs: safe(body.durationMs),
-            usage: {
-              input_tokens: safe(usage.input_tokens),
-              output_tokens: safe(usage.output_tokens),
-              reasoning_output_tokens: safe(usage.reasoning_output_tokens),
-              cache_read_input_tokens: safe(usage.cache_read_input_tokens),
-              cache_creation_input_tokens: safe(usage.cache_creation_input_tokens),
-            },
-            ...(body.terminalCode === "USER_CANCELLED" || body.terminalCode === "CODEX_ERROR"
-              ? { terminalCode: body.terminalCode }
-              : {}),
-            ...(body.rateLimits !== undefined ? { rateLimits: body.rateLimits as any } : {}),
-          },
-        );
-        const live = autoDreamCodexTurns.get(requestId);
-        if (live) {
-          autoDreamCodexTurns.delete(requestId);
-          clearTimeout(live.timeout);
-          expireCodexRouteToken(live.routeToken, "auto_dream_billing_settled");
-        }
-        return { settled: true };
-      }
-      if (path === AUTO_DREAM_OPTIMIZER_ABANDON_PATH) {
-        const live = autoDreamCodexTurns.get(requestId);
-        if (live) {
-          autoDreamCodexTurns.delete(requestId);
-          clearTimeout(live.timeout);
-          try {
-            await live.finalizer.fail("auto_dream_abandoned", "INTERNAL_ERROR");
-          } finally {
-            expireCodexRouteToken(live.routeToken, "auto_dream_abandoned");
-          }
-        } else {
-          const { abortInflightJournal } = await import("./billing/proxyBilling.js");
-          await abortInflightJournal(
-            getPool(),
-            requestId,
-            "auto_dream_abandoned",
-            "INTERNAL_ERROR",
-          );
-          await releasePreCheck(preCheckRedis, {
-            userId: String(identity.userId),
-            requestId,
-          }).catch(() => {});
-        }
-        return { abandoned: true };
-      }
-      throw new Error("AUTO_DREAM_INVALID_PATH");
-    },
-  };
-
-  // ─── V5 QQ Official Bot ────────────────────────────────────────────────
-  // One platform bot is owned by the LeaderBundle.  HTTP binding/internal
-  // receivers remain stateless on both slots and write the shared PG tables;
-  // only the leader owns Tencent's gateway connection and outbox sends.
   const qqConfig = readQqBotConfig(process.env);
   let qqBotService: QqBotService | undefined;
   if (qqConfig) {
     if (!bridgeSecret) {
       throw new Error("QQ Bot is configured but the container bridge secret is unavailable");
     }
-    const qqDispatcher = makeInboundDispatcher({
-      pgPool: getPool(),
-      // P1-IMPL-09: QQ inbound stays on cloud docker. Same sharedEnsureRunning
-      // singleflight as media-signed / cron; not the desktop-preferring chat resolver.
-      resolveContainerEndpoint: dockerEnsureRunning,
-      fallbackDockerEnsure: dockerEnsureRunning,
+    const qqBuilt = buildQqBotServiceAndReceivers({
+      qqConfig,
       bridgeSecret,
-      resolveModel: async (bindingUserId) => {
-        const uid = BigInt(bindingUserId);
-        const [prefs, authz] = await Promise.all([
-          getPreferences(uid),
-          loadUserModelAuthz(uid),
-        ]);
-        return pickWechatInboundModel({
-          preferredModel: prefs.prefs.default_model,
-          visibleModels: pricing.listForUser({ uid, ...authz }),
-          canUseModel: (modelId) => canUseModel({ pricing }, { uid, ...authz, modelId }),
-          allowedModels: ALLOWED_INBOUND_MODELS,
-        });
-      },
-      prepareCodexTurn: prepareWechatCodexTurn,
-      failCodexTurn: failWechatCodexTurn,
-      upsertMasterClientSession,
-      softDeleteMasterSession: async (sessionId, userId) => {
-        await softDeleteMasterSession(sessionId, userId);
-      },
-      transport: makeNodeHttpContainerTransport(),
-      channel: qqInboundChannelProfile(),
+      dockerEnsureRunning,
+      pricing,
+      loadUserModelAuthz,
+      allowedInboundModels: ALLOWED_INBOUND_MODELS,
+      prepareWechatCodexTurn,
+      failWechatCodexTurn,
+      handleWechatCodexBilling,
+      userMediaResolver,
+      ensureContainerEndpointReady,
+      pushRemoteHostUpload,
+      remoteControl: pendingDecisionsRuntime.qqRemoteControl,
     });
-    const resolveQqOutboundMedia =
-      userMediaResolver
-        ? makeQqOutboundMediaResolver({
-            resolveUserMediaDirs: userMediaResolver,
-            pullRemoteHostMedia: async (args) => {
-              const target = await resolveServiceableHostTarget(args.hostUuid);
-              try {
-                return await nodeAgentGetFile(target, args.remotePath);
-              } finally {
-                target.psk?.fill(0);
-              }
-            },
-          })
-        : undefined;
-    qqBotService = makeQqBotService({
-      pool: getPool(),
-      config: qqConfig,
-      dispatcher: qqDispatcher,
-      prepareMedia:
-        userMediaResolver && ensureContainerEndpointReady
-          ? makeSaveQqMediaToUserUploads({
-              ensureContainerReady: ensureContainerEndpointReady,
-              resolveUserMediaDirs: userMediaResolver,
-              pushRemoteHostUpload,
-            })
-          : undefined,
-      resolveOutboundMedia: resolveQqOutboundMedia,
-      handleModelCommand: async (bindingUserId, text) => {
-        const uid = BigInt(bindingUserId);
-        const [prefs, authz] = await Promise.all([
-          getPreferences(uid),
-          loadUserModelAuthz(uid),
-        ]);
-        return await handleWechatModelCommand({
-          text,
-          channelName: "QQ",
-          preferredModel: prefs.prefs.default_model,
-          visibleModels: pricing.listForUser({ uid, ...authz }),
-          canUseModel: (modelId) =>
-            canUseModel({ pricing }, { uid, ...authz, modelId }),
-          allowedModels: ALLOWED_INBOUND_MODELS,
-          setDefaultModel: async (modelId) => {
-            await patchPreferences(uid, { default_model: modelId });
-          },
-        });
-      },
-    });
-    const qqIdentityRepo = createPgIdentityRepo();
-    qqOutboundRef.current = makeQqOutboundReceiver({
-      pool: getPool(),
-      identityRepo: qqIdentityRepo,
-      handleCodexBilling: handleWechatCodexBilling,
-      onQueued: () => qqBotService?.kickOutbox(),
-    });
-    qqProactiveRef.current = makeQqProactiveReceiver({
-      pool: getPool(),
-      identityRepo: qqIdentityRepo,
-      onQueued: () => qqBotService?.kickOutbox(),
-    });
+    qqBotService = qqBuilt.qqBotService;
+    qqBotServiceRef.current = qqBotService;
+    qqOutboundRef.current = qqBuilt.qqOutbound;
+    qqProactiveRef.current = qqBuilt.qqProactive;
     leaderBundle.add({
       name: "qqBot",
       domain: "shared",
@@ -5445,174 +1837,26 @@ export async function registerCommercial(
     });
   }
 
-  // ─── P1.7 slice 7c — WeChat broker 装配 ───────────────────────────────────
-  //
-  // 装配条件:WECHAT_BROKER_ENABLED=1 + bridgeSecret 已加载(对称要求 — broker 给
-  // container 发 inbound 时 HMAC 来自这个 root secret)。两者任一缺失 →
-  // broker 全程 disabled,wechatBrokerRef.current 保持 null,
-  // /internal/v3/wechat-outbound 永远 404、外部 onInbound 也未暴露。
-  //
-  // 装配后:broker 自带 brokerEnabled() 短路;但本侧已经 gate 过整个装配链
-  // (没装就没 onInbound 也没 outboundHandler),所以 callback 直接 () => true。
-  // 这样后续若加 ConfigService 热重载,把 callback 换成 ConfigService.get 即可,
-  // 不动 broker.ts。
   let wechatBroker: WechatBroker | undefined;
-  // controlPlaneEnabled 纳入:broker 启动 outbox worker/reconcile/housekeeping(写 wechat_outbox /
-  // soft-delete session / 发 iLink)属共享-state mutator,v5 follower 必须静默。
-  // 【P3 MINOR 3 收口债】wechatBroker 目前以 controlPlaneEnabled 静态 gate + eager start(未纳入
-  // LeaderBundle),且 v5 下被 follower 硬 block(WECHAT_BROKER_ENABLED=1 是禁忌项,见文首 v5 env
-  // 守卫)——即 v5 当前根本不跑 broker,故无双 master 双跑面。**未来若为 v5 解除该 legacy gate
-  // 让 broker 在 v5 上线,它是 shared-domain 单跑 mutator,必须同步纳入 LeaderBundle(add 成 member,
-  // 交给 lease 单 leader 启停),绝不能沿用这套静态 eager gate**,否则双 master 会双发 iLink / 双写 outbox。
   if (controlPlaneEnabled && cfg.WECHAT_BROKER_ENABLED && bridgeSecret) {
-    // ─ 依赖装配(自下而上):transport → dispatcher → outboundReceiver →
-    //   sendText → broker
     const wechatLog = rootLogger.child({ subsys: "wechatBrokerAssembly" });
-    const containerTransport = makeNodeHttpContainerTransport();
-    const ilinkSendText = makeIlinkSendAdapter();
-    const ilinkSendMedia = makeIlinkSendMediaAdapter();
-    const resolveWechatOutboundMedia =
-      userMediaResolver
-        ? makeWechatOutboundMediaResolver({
-            resolveUserMediaDirs: userMediaResolver,
-            pullRemoteHostMedia: async (args) => {
-              // A3 — service file-IO:revoked / 缺 fingerprint 的 host 直接拒。
-              const target = await resolveServiceableHostTarget(args.hostUuid);
-              try {
-                return await nodeAgentGetFile(target, args.remotePath);
-              } finally {
-                target.psk?.fill(0);
-              }
-            },
-          })
-        : undefined;
-
-    const inboundDispatcher = makeInboundDispatcher({
-      pgPool: getPool(),
-      // P1-IMPL-09: WeChat inbound stays on cloud docker (design v2 §1.2 / §4.5.3).
-      resolveContainerEndpoint: dockerEnsureRunning,
-      fallbackDockerEnsure: dockerEnsureRunning,
+    const { wechatProactive, brokerConfig } = buildWechatBrokerDeps({
       bridgeSecret,
-      resolveModel: async (bindingUserId) => {
-        const uid = BigInt(bindingUserId);
-        const [prefs, authz] = await Promise.all([
-          getPreferences(uid),
-          loadUserModelAuthz(uid),
-        ]);
-
-        return pickWechatInboundModel({
-          preferredModel: prefs.prefs.default_model,
-          visibleModels: pricing.listForUser({ uid, ...authz }),
-          canUseModel: (modelId) =>
-            canUseModel({ pricing }, { uid, ...authz, modelId }),
-          allowedModels: ALLOWED_INBOUND_MODELS,
-        });
-      },
-      prepareCodexTurn: prepareWechatCodexTurn,
-      failCodexTurn: failWechatCodexTurn,
-      // dispatcher Step 2a / 2b — 走 storage helper 写 master sqlite client_sessions。
-      upsertMasterClientSession,
-      // dispatcher Step 2b 失败 + broker reconcile 共用同一个 soft-delete
-      // (返 boolean,broker.softDeleteMasterSession 期待 Promise<void> — 包一层吞掉返回值)
-      softDeleteMasterSession: async (sessionId, userId) => {
-        await softDeleteMasterSession(sessionId, userId);
-      },
-      transport: containerTransport,
-    });
-
-    const identityRepo = createPgIdentityRepo();
-    const rateLimitRedis = wrapIoredis(redis);
-    void rateLimitRedis; // P1 占位:noop limiter;P3 真实滑窗时切回 rateLimitRedis 依赖
-    const outboundReceiver = makeOutboundReceiverHandler({
-      identityRepo,
-      pool: getPool(),
-      rateLimiter: createNoopRateLimiter(),
-      handleCodexBilling: handleWechatCodexBilling,
-    });
-
-    // 主动微信投递接收点 —— 权威解析收件人(senderId = binding.loginUserId),
-    // 不接受 body 指定收件人。绑微信默认开(prefs.wechat_proactive_push !== false)。
-    wechatProactiveRef.current = makeProactiveReceiverHandler({
-      identityRepo,
-      pool: getPool(),
-      resolveRecipient: async (bindingUserId) => {
-        // SQLite wechat_bindings.user_id 是 `c:<digit>`(MASTER_USER_PREFIX),而容器身份
-        // bindingUserId 是裸数字 —— 与 outboxWorker.getBinding(MASTER_USER_PREFIX + …) 同源约定。
-        // 漏前缀会永远查不到(no_binding),且可能误命中 legacy 裸 id 行破坏 trust boundary。
-        const b = await getWechatBindingByUserId(MASTER_USER_PREFIX + bindingUserId);
-        if (!b || b.status !== "active" || !b.loginUserId) return null;
-        // loginUserId 是 wire 形态(<base64url>@im.wechat),但 contextTokens 的 key 是
-        // canonical(剥后缀)。senderId 必须 canonical 才能命中 contextTokens(否则永久
-        // no_context_token),且与既有 outbound 路径的 canonical senderId 一致。
-        return { senderId: canonicalWechatSenderId(b.loginUserId), contextTokens: b.contextTokens };
-      },
-      isProactiveEnabled: async (userId) => {
-        const snap = await getPreferences(BigInt(userId));
-        return snap.prefs.wechat_proactive_push !== false;
-      },
-      getSessionId: getCurrentSessionId,
-    });
-
-    wechatBroker = trackScheduler("wechatBroker", "shared", makeWechatBroker({
-      pgPool: getPool(),
-      dispatcher: inboundDispatcher,
-      outboundReceiver,
-      // broker reconcile 一次性读全集 wsess 行,然后内部 diff 出孤儿。
-      allMasterWsessRows,
-      softDeleteMasterSession: async (sessionId, userId) => {
-        await softDeleteMasterSession(sessionId, userId);
-      },
-      sendText: ilinkSendText,
-      sendMedia: ilinkSendMedia,
-      resolveOutboundMediaPart: resolveWechatOutboundMedia,
+      redis,
+      dockerEnsureRunning,
+      pricing,
+      loadUserModelAuthz,
+      allowedInboundModels: ALLOWED_INBOUND_MODELS,
+      prepareWechatCodexTurn,
+      failWechatCodexTurn,
+      handleWechatCodexBilling,
+      userMediaResolver,
+      pushRemoteHostUpload,
       wechatLiveLinkKey,
-      wechatUxCommands: {
-        handleModelCommand: async (evt) => {
-          const uid = BigInt(evt.bindingUserId);
-          const [prefs, authz] = await Promise.all([
-            getPreferences(uid),
-            loadUserModelAuthz(uid),
-          ]);
-
-          return await handleWechatModelCommand({
-            text: evt.text,
-            preferredModel: prefs.prefs.default_model,
-            visibleModels: pricing.listForUser({ uid, ...authz }),
-            canUseModel: (modelId) =>
-              canUseModel({ pricing }, { uid, ...authz, modelId }),
-            allowedModels: ALLOWED_INBOUND_MODELS,
-            setDefaultModel: async (modelId) => {
-              await patchPreferences(uid, { default_model: modelId });
-            },
-          });
-        },
-      },
-      wechatProcessVisibility: {
-        getShowToolCalls: async (bindingUserId) => {
-          const snap = await getPreferences(BigInt(bindingUserId));
-          return snap.prefs.wechat_show_tool_calls !== false;
-        },
-        setShowToolCalls: async (bindingUserId, show) => {
-          await patchPreferences(BigInt(bindingUserId), {
-            wechat_show_tool_calls: show,
-          });
-        },
-      },
-      saveWechatMedia: userMediaResolver
-        ? makeSaveWechatMediaToUserUploads({
-            resolveUserMediaDirs: userMediaResolver,
-            pushRemoteHostUpload,
-          })
-        : undefined,
-      // 读 master sqlite wechat_bindings 拿 botToken + contextTokens 给 outboxWorker。
-      // 失败 / 不存在 → 返 null,worker 该 row 走 permanent(无可恢复 token)。
-      getBinding: async (bindingUserId) => {
-        const b = await getWechatBindingByUserId(bindingUserId);
-        if (!b) return null;
-        return { botToken: b.botToken, contextTokens: b.contextTokens };
-      },
-      brokerEnabled: () => true, // 装配链已 gate 过整体开关
-    }));
+      remoteControl: pendingDecisionsRuntime.wechatRemoteControl,
+    });
+    wechatProactiveRef.current = wechatProactive;
+    wechatBroker = trackScheduler("wechatBroker", "shared", makeWechatBroker(brokerConfig));
     wechatBroker.start();
     wechatBrokerRef.current = wechatBroker;
     wechatLog.info("wechat_broker_assembled");
@@ -5629,449 +1873,46 @@ export async function registerCommercial(
     }
   }
 
-  // V3 2I-2:把 buffered_bytes / session_duration 接到 prometheus histogram。
-  // 单帧 / per-uid 字节数不进 metrics —— 标签基数太大。
-  const bridgeMetrics: BridgeMetricSink = {
-    onBufferedBytes: (_uid, side, bytes) => observeWsBridgeBuffered(side, bytes),
-    onClose: (stats) => observeWsBridgeSessionDuration(stats.cause, stats.durationMs / 1000),
-    onTtft: (_uid, kind, seconds) => observeWsBridgeTtft(kind, seconds),
-  };
-  // PR1:bridge 拿到 client→container 帧时刷 last_ws_activity(60s debounce)。
-  // 防 idle sweep 把"长 WS 单连但持续在用"的会话误判为 idle。fire-and-forget 包到
-  // 闭包里;markV3ContainerActivity 自身已 swallow 异常。无 v3Deps(单测 / mock)
-  // → 不注入,bridge 退化为 PR1 之前的行为(只 ensureRunning 刷一次)。
-  const markActivityForBridge = v3Deps
-    ? (cid: number) => { void markV3ContainerActivity(v3Deps!, cid); }
-    : undefined;
-
-  // plan v3 G5/G7 → M2 复活 — codex 容器绑定 / per-account 并发槽 handle。
-  // 恢复源 = P1f^ 同段(byte-parity 除注释);SQL 带 runtime_channel(P1d 加固,
-  // 0098 起为 v5/v3 账号池权威分界)。要点:
-  //   - acquire:tx 内 FOR UPDATE 锁 agent_containers 行 → active 账号直取 /
-  //     legacy NULL 判 stale recycle(池非空)或透传 / 非 active 走 lazy migrate
-  //       * 非 active(disabled / quarantined)→ pickCodexAccountForBindingInTx 重选 →
-  //         getCodexTokenSnapshot → writeCodexContainerAuthFile 原子写 → UPDATE
-  //         codex_account_id;tx 提交后再 acquireCodexSlot(失败 → bridge fast-fail,
-  //         migrate 已落盘永久不回滚:下次重连 active 路径直接走 happy 分支)
-  //   - acquireCodexSlot 在 tx **外**调,避免 commit 失败造成的 in-process slot 永久泄漏:
-  //     已经持有 slot 但 UPDATE 回滚 → 调用方拿到错误 → bridge.acquiredCodexAccountId
-  //     未被赋值 → cleanup() 与 G6 timer 都不知道哪个 account 该 release → 永久泄漏。
-  //   - release(account_id, slotId):按 slotId 精确还槽,幂等。
-  //   - v3Deps 未注入(测试 / 早期 boot 路径)→ codexBinding=undefined,bridge 退化为不做并发管控
-  // 闭包外 capture v3Deps 给 stale recycle fire-and-forget 路径用(必须非空)。
-  const v3DepsForCodex = v3Deps;
-  const codexBinding: CodexBindingHandle | undefined = v3Deps
-    ? {
-        async acquire(containerId: number, groupId?: string | null) {
-          // tx 内做"锁 + 查 + 可能 lazy migrate / stale recycle";acquire slot / 容器 rm 在 tx 外
-          type AcquireResult =
-            | { kind: "active"; account_id: bigint }
-            | { kind: "stale"; containerInternalId: string | null; hostUuid: string | null }
-            | null;
-          const desiredGroupId = groupId ?? null;
-          const result: AcquireResult = await tx<AcquireResult>(async (client) => {
-            const lookup = await client.query<{
-              account_id: string | null;
-              account_status: string | null;
-              account_group_id: string | null;
-              state: string;
-              container_internal_id: string | null;
-              host_uuid: string | null;
-              age_seconds: string;
-            }>(
-              `SELECT ac.codex_account_id::text AS account_id,
-                      ca.status AS account_status,
-                      ca.group_id::text AS account_group_id,
-                      ac.state AS state,
-                      ac.container_internal_id AS container_internal_id,
-                      ac.host_uuid AS host_uuid,
-                      EXTRACT(EPOCH FROM (NOW() - ac.created_at))::text AS age_seconds
-               FROM agent_containers ac
-               LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
-               WHERE ac.id = $1 AND ac.runtime_channel = $2 AND ac.runtime_kind = 'docker'
-               FOR UPDATE OF ac`,
-              [containerId, getRuntimeChannel()],
-            );
-            if (lookup.rows.length === 0) {
-              // 容器在 acquire 前刚被删了 — 当 legacy 透传(下游 sendToContainer 必失败,
-              // 错误从那条路径返回给前端,与本桥状态一致)
-              return null;
-            }
-            const row = lookup.rows[0];
-            if (row.state !== "active") {
-              // 容器已不再 active(stopped / vanished / removed) — 当 legacy 透传,
-              // 让下游 sendToContainer 路径产出标准错误,不在 acquire 这层造一种新的错。
-              return null;
-            }
-            if (row.account_id === null) {
-              // legacy NULL 绑定。检查池子里是否有 active codex 账号:
-              //   - 没有 → 真 legacy 路径不变,return null(N3 行为兼容)
-              //   - 有   → 用户 admin 已加账号但容器 mount immutable 永远 401,
-              //            必须 mark vanished + docker rm 让 ensureRunning 重 provision
-              //            重新走 picker 路径产出 per-container mount。
-              // 池子查询条件与 pickCodexAccountForBinding 同源(poolCandidates.activePoolWhere),
-              // 否则可能误判为"有账号"但 picker 实际拿不到。
-              const poolPredicate = activePoolWhere({ provider: "codex", groupId: desiredGroupId });
-              const poolCount = await client.query<{ cnt: string }>(
-                `SELECT count(*)::text AS cnt
-                   FROM claude_accounts
-                  WHERE ${poolPredicate.clauses.join(" AND ")}`,
-                poolPredicate.params,
-              );
-              if (Number(poolCount.rows[0]?.cnt ?? "0") === 0) {
-                return null;
-              }
-              // **死循环守护(v1.0.72 Codex review High#1)**:
-              // 远端 host 的 putRemoteCodexAuth 短暂故障(node-agent 抖 / fingerprint
-              // 错配 / cert 失效)→ provisionV3Container 写 codex auth 失败 → no-mount
-              // + codex_account_id NULL → 下次 acquire 看池非空 → 又 recycle → 又重 provision
-              // → 又失败 → 死循环烧资源。本地 host 也存在同 case(picker 抛 / write fail),
-              // 只是远端故障频率高。
-              //
-              // 守护:row 才创建 < 60s 又被 stale recycle = 强信号上一轮 provision codex
-              // 绑定失败,**这一轮不再 recycle**,return null 走 legacy 透传(N3 行为)。
-              // 用户 GPT 请求会失败但容器照常用,不会陷入重建循环。运维通过监控 NULL
-              // bind 容器数 + 日志告警感知后,修复 host 后下一轮自然 recycle 自愈
-              // (60s 后行不再"年轻")。
-              const ageSec = Number(row.age_seconds ?? "0");
-              if (Number.isFinite(ageSec) && ageSec < 60) {
-                // eslint-disable-next-line no-console
-                console.warn(
-                  "[codex acquire] skip stale recycle: row too young (likely upstream codex bind failed last provision)",
-                  { containerId, ageSec, hostUuid: row.host_uuid },
-                );
-                return null;
-              }
-              // 池子非空 — recycle。同 tx 内把 row 标 vanished,与下面 lazy migrate
-              // 的 UPDATE 同 commit,避免并发 acquirer 看到 state='active' 走错路径。
-              // WHERE state='active' guard 防 race:并发 acquirer/admin/idleSweep
-              // 已经把 state 改了的话本 UPDATE rowCount=0。FOR UPDATE OF ac 已锁住
-              // 本 row,同 tx 内应永远 rowCount=1;rowCount=0 = 不变量破坏,throw
-              // 抬出问题而不是静默 return null(旧容器仍会 401,只是把问题往后挪)。
-              const upd = await client.query(
-                `UPDATE agent_containers
-                    SET state = 'vanished', updated_at = NOW()
-                  WHERE id = $1 AND state = 'active' AND runtime_channel = $2
-                    AND runtime_kind = 'docker'`,
-                [containerId, getRuntimeChannel()],
-              );
-              if ((upd.rowCount ?? 0) === 0) {
-                throw new Error(
-                  `codex stale recycle: UPDATE state=vanished rowCount=0 for container ${containerId} (invariant: FOR UPDATE row was active)`,
-                );
-              }
-              return {
-                kind: "stale",
-                containerInternalId: row.container_internal_id,
-                hostUuid: row.host_uuid,
-              };
-            }
-            if (row.account_status === "active" && (desiredGroupId === null || row.account_group_id === desiredGroupId)) {
-              return { kind: "active", account_id: BigInt(row.account_id) };
-            }
-            // disabled / quarantined / 任意非 active → lazy migrate
-            //
-            // v1.0.120 feat/codex-disable-rebind:"pick + snapshot + write + UPDATE"
-            // 走 codexLazyMigrate 模块,与 M1(internalCodexTokenRefresh in-turn 自愈)
-            // + M2(codexDisableFanout 后台 actor)共享同一组 helper。
-            //
-            // acquire 走**强一致**(tx 内 pick + write + UPDATE 一同 COMMIT):
-            //   - acquire 是用户 inbound 触发,单容器单流,持锁 IO 开销可接受
-            //   - 写失败 → tx ROLLBACK → row 仍指 disabled 账号 → 下次 inbound 再
-            //     acquire 重试(孤儿 auth.json 由 stop/remove、volume gc、重 provision
-            //     覆盖兜底)
-            const picked = await pickCodexAccountForBindingInTx(client, String(containerId), { groupId: desiredGroupId });
-            if (!picked) {
-              throw new Error(
-                `codex pool empty during lazy migrate for container ${containerId}`,
-              );
-            }
-            const codexContainerDir =
-              process.env.OC_V3_CODEX_CONTAINER_DIR?.trim() || DEFAULT_V3_CODEX_CONTAINER_DIR;
-            // v1.0.72 host 路由由 helper 内部决定(selfHostId / host_uuid / putRemote
-            // 三选一,见 codexLazyMigrate.fetchSnapshotAndWriteContainerAuth);
-            // 远端 helper 未注入抛错 → tx ROLLBACK,与之前行为一致。
-            const writeAuthDeps: WriteAuthDeps = {
-              selfHostId: v3DepsForCodex?.selfHostId ?? null,
-              containerUid: V3_AGENT_UID,
-              containerGid: V3_AGENT_GID,
-              codexContainerDir,
-              putRemoteCodexAuth: v3DepsForCodex?.putRemoteCodexAuth,
-            };
-            // 用 client 传入 helper → 走 in-tx snapshot,**不**申请第二个 PG client
-            // (避免 burst 时撑大 pool 占用)。
-            await fetchSnapshotAndWriteContainerAuth({
-              accountId: picked.account_id,
-              containerId,
-              hostUuidUnderLock: row.host_uuid,
-              deps: writeAuthDeps,
-              client,
-            });
-            // FOR UPDATE 持锁内 UPDATE,COMMIT 时一同落盘。失败 → tx 抛出 → ROLLBACK
-            await commitCodexRebindInTx(client, containerId, picked.account_id);
-            return { kind: "active", account_id: picked.account_id };
-          });
-          if (result === null) return null;
-          if (result.kind === "stale") {
-            // tx 已 commit:row.state 已落 vanished。**必须 await** 把 docker 实体清掉
-            // 再返错,否则容器名是 per-uid 固定,旧实体没 rm 时下条 message 触发
-            // ensureRunning 会撞 docker NameConflict 被卡几秒重试,体验上不"自愈"。
-            // await 失败也 throw stale(下次 ensureRunning 仍会自己 try stop/remove
-            // 旧名字兜底,与 orphanReconcile 路径一致),日志留 warn 便于诊断。
-            try {
-              await stopAndRemoveV3Container(v3DepsForCodex!, {
-                id: containerId,
-                container_internal_id: result.containerInternalId,
-                host_uuid: result.hostUuid,
-              });
-            } catch (err) {
-              rootLogger.warn(
-                "[commercial] codex stale recycle: stopAndRemoveV3Container failed (continuing — ensureRunning will retry on next message)",
-                {
-                  containerId,
-                  err: (err as Error)?.message ?? String(err),
-                },
-              );
-            }
-            throw new ContainerStaleBindingError(containerId);
-          }
-          // tx 已 commit;现在尝试占 in-process per-account slot。Busy → 抛 AccountPoolBusyError
-          // (bridge 转 CODEX_POOL_BUSY)。lazy migrate 已落盘不会回滚,Busy 只影响本 turn。
-          const slotId = scheduler.acquireCodexSlot(result.account_id);
-          return { account_id: result.account_id, slotId };
-        },
-        release(account_id: bigint, slotId: string): void {
-          try { scheduler.releaseCodexSlot(account_id, slotId); } catch { /* */ }
-        },
-        renew(account_id: bigint, slotId: string): boolean {
-          try { return scheduler.renewCodexSlot(account_id, slotId); } catch { return false; }
-        },
-      }
-    : undefined;
-
-  const recycleUnattestedContainer = createUnattestedContainerRecycler(() => v3Deps);
+  const codexBinding: CodexBindingHandle | undefined = createCodexBindingHandle({
+    env: process.env,
+    v3Deps,
+    scheduler,
+  });
 
   const containerLinkOn = containerLinkEnabled(flavorIdentity.status === "ok" ? flavorIdentity.flavor : undefined);
-  const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
-    cc5BackendSelector: input => selectMasterCc5Backend(cc5Runtime, input,
-      getRuntimeChannel() === "v5" && flavorIdentity.status === "ok" && flavorIdentity.flavor === "selfhost",
-      process.env),
-    containerLinkEnabled: containerLinkOn,
-    resolveContainerLinkEndpoint: (uid, cid) => resolveContainerLinkEndpoint(getPool(), runtimeChannel, uid, cid),
-    containerLinkRecovery: { channel: runtimeChannel },
+  const { userChatBridge, recoveryDecisionBroadcast } = createCommercialUserChatBridge({
+    env: process.env,
+    cfg,
+    runtimeChannel,
+    dualMasterEnabled,
+    flavorIdentity,
+    v3Deps,
+    cc5Runtime,
+    containerLinkOn,
     modelSwitchCost,
     jwtSecret,
-    issueSystemHelpBootstrap: systemActions ? scope => systemActions!.runtime.issueBootstrap(scope) : undefined,
-    promptQueueEnabled: isPromptQueueV1Enabled(),
-    // Chat / turn dispatch may prefer a live desktop tunnel (P1-IMPL-01).
+    systemActions,
     resolveContainerEndpoint,
-    // 模型执行权威(方案 §2):注入即开启 flag —— 签发 + attestation 门 + descriptor 分类。
-    ...(modelAuthoritySigner && modelCatalogCache
-      ? {
-          modelAuthority: {
-            signer: modelAuthoritySigner,
-            catalog: modelCatalogCache,
-            recycleContainer: recycleUnattestedContainer,
-          },
-        }
-      : {}),
-    metrics: bridgeMetrics,
-    markContainerActivity: markActivityForBridge,
-    // 每用户并发 /ws/chat 上限。缺省不传 → bridge 内 DEFAULT_MAX_PER_USER(3)。
-    // OC_WS_MAX_PER_USER 覆盖:自用实例多设备/多标签并发常超 3,超限时 registry
-    // 踢最老 → 被踢端 1s 重连再踢别人,形成互踢循环(2026-08-17 排障实录)。
-    ...(Number(process.env.OC_WS_MAX_PER_USER) > 0
-      ? { maxPerUser: Number(process.env.OC_WS_MAX_PER_USER) }
-      : {}),
-    // 版本握手:cli launcher 注入 dist 目录(spa 才有)→ probe 读 index.html 的
-    // oc-build meta;v3/测试 undefined → bridge 不发 sys.frontend_build,零变化。
-    getFrontendBuildId: options.webDistDir
-      ? createFrontendBuildProbe(options.webDistDir)
-      : undefined,
-    // 跨 host 容器:bridge 用 node-agent tunnel 拉容器 WS(direct dial 必然 EHOSTUNREACH)。
-    // 工厂内部走 mTLS+pin 预拨 + ws.createConnection hijack;maxFrameBytes 与 bridge 默认对齐
-    // (factory 内会用同一上限;不显式传则 ws 默认无限,有 OOM 风险)。
-    createTunnelContainerSocket: (tunnel, port, signal, connectionTraceId) =>
-      createTunnelContainerSocket(tunnel.nodeAgent, tunnel.containerInternalId, port, signal, {
-        maxFrameBytes: DEFAULT_MAX_FRAME_BYTES,
-        // S12e CG4:bridge connId(server-side randomUUID)透传到 outgoing tunnel WS
-        // upgrade 的 `X-Connection-Trace-Id` header,与 node-agent / in-container gateway
-        // 共用同一 connection-scoped trace。
-        connectionTraceId,
-      }),
-    // 注入 logger,让 bridge 把 4503 reason / container error 等关键路径日志写出来。
-    // 不传则静默 noop,生产排错时全部不可见(原版 commit 漏了)。
-    logger: rootLogger.child({ subsys: "commercial", module: "userChatBridge" }),
-    // 模型授权 checker。模型权威开启后 role+grants 与 catalog visibility 必须绑定同一
-    // fenced epoch：不信握手 JWT 的旧 role，也不回读可能 reload 失败的 PricingCache。
-    loadAllowedModelChecker: async (uid, requiredEpoch) => {
-      if (modelCatalogCache) {
-        const snapshot = await modelCatalogCache.assertFresh();
-        if (requiredEpoch !== undefined && snapshot.securityEpoch < requiredEpoch) {
-          throw new Error(
-            `catalog snapshot epoch ${snapshot.securityEpoch} < required ${requiredEpoch}`,
-          );
-        }
-        const authz = await loadUserModelAuthz(uid, snapshot.securityEpoch);
-        return (modelId: string) => snapshot.canUseModel({
-          uid: uid.toString(),
-          role: authz.role,
-          grantedModelIds: authz.grantedModelIds,
-          deniedModelIds: authz.deniedModelIds,
-          userPlanTier: authz.userPlanTier ?? null,
-          orgPlanCode: authz.orgPlanCode ?? null,
-        }, modelId);
-      }
-      // cutover 前 legacy 路径仍从 DB loader 取 role+grants，不再信 JWT role。
-      const { canUseModel } = await import("./billing/authzModels.js");
-      const authz = await loadUserModelAuthz(uid);
-      return (modelId: string) =>
-        canUseModel({ pricing }, { uid, ...authz, modelId });
-    },
-    // P0 计费旁路封堵 —— bridge 可信模型推导的 agent 权威(seed 声明 / 常量 +
-    // marketplace 预设/已装 manifest,详见 ws/agentModelAuthority.ts 头注)。
-    // bridge 用它推导「帧无 model 时该 agentId 的有效模型」参与 codex 分类
-    // (与容器 resolveEngine 同构),推导不出且帧无 model → fail-closed 拒帧。
-    //
-    // 模型权威批次 §5 阶段 B(flag OC_SEED_AUTHORITY_BY_REV=1):bridge 在 ensureRunning
-    // 之后把容器 label 上的 bundleRev 传进来 → seed 层按**该 rev 的 platform-seed 声明**
-    // 推导(bundle 全量校验复用 resolvePlatformBundleMount)。rev 缺失 / bundle 坏 →
-    // 抛 SeedDeclarationError → bridge close(1011) fail-closed,绝不回落 master 常量。
-    // 验证为selfhost的部署默认按rev;商业/无manifest兼容旧路径，显式0可回退。
-    loadAgentModelResolver: async (uid, opts) => {
-      const { loadAgentModelResolverForUser } = await import("./ws/agentModelAuthority.js");
-      return loadAgentModelResolverForUser(uid, {
-        bundleRev: opts.bundleRev ?? null,
-        flavor: flavorIdentity.status === "ok" ? flavorIdentity.flavor : undefined,
-        flavorIdentity,
-        // 与 supervisor / bundle 校验器同一稳定根(见上方 runtimeTuple 装配)。
-        platformRoot: cfg.OC_PLATFORM_ROOT ?? DEFAULT_PLATFORM_ROOT,
-      });
-    },
-    // 引擎历史只读真实 Tape 的有限模型窗口 sidecar。浏览器历史不受该窗口影响；当前
-    // prompt/引擎/上下文窗口均由 bridge 的可信 catalog snapshot 传入，避免回退到全量
-    // BYTEA 全量水合后再做固定行数/字符数截断。
-    loadMasterSessionMessages: async (uid, sessionId, context) =>
-      getEngineContextMessages(
-        sessionId,
-        MASTER_USER_PREFIX + uid.toString(),
-        context,
-      ),
-    hasCompletedClientTurn: async (uid, sessionId, clientMessageId) =>
-      hasCompletedClientTurn(
-        sessionId,
-        MASTER_USER_PREFIX + uid.toString(),
-        clientMessageId,
-      ),
-    loadGoalState: (uid, sessionId) => goalStateService.get(uid, sessionId),
-    updateGoalEngineMetrics: (args) => goalStateService.updateEngineMetrics(args),
-    persistMasterUserMessage: async (uid, sessionId, message) =>
-      appendServerAuthoredMessage(
-        sessionId,
-        MASTER_USER_PREFIX + uid.toString(),
-        message,
-      ),
-    persistOutboundFrame: (input) => persistGatewayLiveFrame(getPool(), input),
-    // durable turn dispatch 受理面(RFC §2.1):容器 attest durable-turn-dispatch-v1 时
-    // 替代 persistMasterUserMessage(单事务 append + dispatch 冲突表)。未装 backend → undefined → legacy。
-    admitUserTurn: dispatchAdmissionBackend
-      ? (input) => dispatchAdmissionBackend!.admitUserTurn(input)
-      : undefined,
-    reconcileAutomaticRecoveryJobs: dispatchAdmissionBackend
-      ? (uid, limit) => dispatchAdmissionBackend!.reconcileAutomaticRecoveryJobs(uid, limit)
-      : undefined,
-    loadSessionWorkspaceMode: dispatchAdmissionBackend
-      ? (uid, sessionId) => dispatchAdmissionBackend!.getClientSessionWorkspaceMode(
-          sessionId,
-          MASTER_USER_PREFIX + uid.toString(),
-        )
-      : undefined,
-    // plan v3 G5/G7 → M2 — codex per-account 并发槽 / lazy migrate / 严格单飞 handle。
-    // v3Deps 未注入(测试 mock)→ undefined,bridge 退化为透传不做并发管控(测试默认行为)。
-    codexBinding,
-    createCodexRoute: createCommercialCodexRoute,
-    expireCodexRoute: async (token) => {
-      await Promise.all([expireCodexRouteContext(token), expireGrokRouteContext(token)]);
-    },
-    mintZcodeRoute: ({ containerId, userId, requestId, modelId }) =>
-      mintZcodeRelayRoute({
-        containerId,
-        userId,
-        requestId,
-        modelId,
-        relayPort: V3_CONTAINER_PORT,
-      }),
-    expireZcodeRoute: async (token) => {
-      await expireZcodeRelayRoute(token);
-    },
-    ...createAntigravityBridgeHooks({
-      relayPort: V3_CONTAINER_PORT,
-      clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
-    }),
-    releaseGrokRouteLease: async (accountId, slotId) => {
-      // Expire durable authority before freeing the local mirror. If PG is
-      // unavailable the slot remains occupied and the immutable terminal frame
-      // can retry without admitting an over-cap turn.
-      await expireGrokRouteContextByLease(accountId, slotId);
-      scheduler.releaseCodexSlot(accountId, slotId);
-    },
-    // PR2 v1.0.66 → M2 — codex 真扣费三件套(pgPool / preCheckRedis / pricing 进程级
-    //   singleton):bridge 内 preCheckWithCost / startInflightJournal,settle 收口
-    //   codexFinalizer(双钱包 / 零输出免单 / account_id NULL / engineSessionId 记账)。
-    //   createUserChatBridge entry 已强校验"三件套全有或全无"+"codexBinding 蕴含
-    //   三件套",partial 注入会 throw,防生产配错让 codex 免费。
-    pgPool: getPool(),
-    preCheckRedis,
+    modelAuthoritySigner,
+    modelCatalogCache,
+    webDistDir: options.webDistDir,
+    loadUserModelAuthz,
     pricing,
-    selfHostId: selfHostUuid ?? null,
-    // Plan §4.2 改动 4a — codex billing commit 路径同样把 debit 持久化进
-    // master's `client_sessions.messages[i].usage.costCredits`。与 anthropicProxy
-    // 走同一个 storage helper,签名一致。
-    appendCostCredits: appendCostCreditsForUser, // c:<uid> 前缀对齐 session 存储命名空间
+    goalStateService,
+    dispatchAdmissionBackend,
+    codexBinding,
+    createCommercialCodexRoute,
+    scheduler,
+    preCheckRedis,
+    selfHostUuid,
+    appendCostCreditsForUser,
+    slotRelayClient,
   });
-  // 把 proxy 的 forward-ref 指向真实 broadcastToUser —— 此刻以后,commit 成功
-  // 扣费事件会实时推到用户前端。cron-origin-inject 同理由此刻起可注入。
   cronOriginBridgeRef = userChatBridge;
   bridgeBroadcastRef.current = (uid, payload) => {
     userChatBridge.broadcastToUser(uid, payload);
   };
-  recoveryDecisionBroadcastRef.current = (userId, sessionId, verdict) => {
-    // Session owners are `c:<uid>`; personal/test namespaces have no bridge user.
-    const uidMatch = /^c:([1-9][0-9]*)$/.exec(userId);
-    if (!uidMatch) return;
-    const uid = uidMatch[1]!;
-    const code = normalizeTurnErrorCode(verdict.errorCode);
-    if (/^[A-Za-z0-9_]{1,64}$/.test(code)) {
-      void recordProductFrictionEvent({
-        correlation: `${sessionId}:${verdict.sourceClientMessageId}`,
-        userId: BigInt(uid),
-        surface: "recovery",
-        stage: "recovery_decision",
-        code,
-        outcome: verdict.scheduled ? "pending" : "failed",
-        attempts: verdict.scheduled ? verdict.attempt : undefined,
-        path: "decision",
-        reason: verdict.scheduled ? undefined : verdict.reason,
-        sessionId,
-      }).catch((err: unknown) => {
-        rootLogger.warn("recovery_decision_friction_failed", {
-          sessionId,
-          errorClass: err instanceof Error ? err.constructor.name : typeof err,
-        });
-      });
-    }
-    const payload = recoveryDecisionFrame(sessionId, verdict);
-    // Phase B runs on the leader slot only; the user's WS may live on the
-    // other slot. Same dual-master fan-out as outbound.cost_charged.
-    if (dualMasterEnabled) {
-      void slotRelayClient.broadcastToUsers([uid], payload).catch(() => undefined);
-      return;
-    }
-    userChatBridge.broadcastToUser(BigInt(uid), payload);
-    if (verdict.scheduled) {
-      void userChatBridge.drainRecoveryForUser?.(BigInt(uid));
-    }
-  };
+  recoveryDecisionBroadcastRef.current = recoveryDecisionBroadcast;
   goalBroadcastRef.current = (uid, payload) => {
     userChatBridge.broadcastToUser(uid, payload);
   };
@@ -6295,7 +2136,7 @@ export async function registerCommercial(
   // markOrderPaid 不在事务内对 expires_at 做硬防线(避免用户超时几秒扫码就硬失败
   // 的体验回归);过期清理由本 sweeper 负责,被推 expired 后 markOrderPaid 自然拒。
   // 非法 / 空 / NaN → 60s;下限 1s(防 typo 把 DB 打穿)
-  if (process.env.COMMERCIAL_PENDING_ORDERS_EXPIRER_DISABLED !== "1") {
+  if (shouldStartCommercialScheduler("pendingOrdersExpirer", { flavorIdentity, runtimeChannel, paymentEnabled: Boolean(hupijiao) })) {
     leaderBundle.add({
       name: "pendingOrdersExpirer",
       domain: "shared",
@@ -6448,137 +2289,14 @@ export async function registerCommercial(
       name: "tapeJobScheduler",
       domain: "shared",
       start: () => {
-        const materializePool = createPool({
-          max: 2,
-          statementTimeoutMs: 120_000,
-          idleInTransactionSessionTimeoutMs: 600_000,
-          applicationName: "openclaude-tape-materialize",
+        const { materializePool, schedulerOpts } = buildTapeJobSchedulerSetup({
+          env: process.env,
+          sessionsStoreGeneration,
+          recoveryDecisionBroadcastRef,
+          settleTapeEngineBilling,
         });
-        const materializeBackend = createPgSessionsBackend(materializePool, {
-          expectedGeneration: sessionsStoreGeneration,
-          // Phase B runs here, not on the request-path backend, so the recovery
-          // verdict sideband must be wired on this instance too.
-          onAutomaticRecoveryDecision: (userId, sessionId, verdict) =>
-            recoveryDecisionBroadcastRef.current(userId, sessionId, verdict),
-          onRecoveryJobTerminal: (userId, sessionId, info) =>
-            recordRecoveryJobTerminalFriction(userId, sessionId, info),
-        });
-        const rawInterval = Number(process.env.COMMERCIAL_TAPE_MATERIALIZATION_INTERVAL_MS);
-        const intervalMs = Number.isFinite(rawInterval) && rawInterval >= 1000 ? rawInterval : 5_000;
-        const h = trackScheduler("tapeJobScheduler", "shared", startTapeJobScheduler({
-          pool: getPool(),
-          materializePool,
-          intervalMs,
-          runOnStart: true,
-          onError: (err) => rootLogger.warn("[tapeJobScheduler] tick failed", {
-            err: (err as Error)?.message ?? String(err),
-          }),
-          materializeTape: async (job, renew) => {
-            _setAfterLosslessStageBatch(renew);
-            try {
-              const header = await getPool().query<{
-                agent_id: string;
-                turn_index: number;
-                status: "completed" | "interrupted" | "crashed";
-                turn_key: string;
-                tape_sha256: string;
-                total_bytes: string;
-                part_count: number;
-                created_at: string;
-                waive_reason: string | null;
-                model: string | null;
-                dispatch_id: string | null;
-                attempt_no: number | null;
-                materialized: boolean;
-              }>(
-                `SELECT agent_id, turn_index, status, turn_key, tape_sha256, total_bytes::text,
-                        part_count, created_at::text, waive_reason, NULL::text AS model,
-                        dispatch_id::text, attempt_no,
-                        (materialization_status='complete' OR finalized_at IS NOT NULL) AS materialized
-                   FROM client_session_turn_tapes
-                  WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
-                [job.sessionId, job.userId, job.tapeId],
-              );
-              const row = header.rows[0];
-              if (!row) throw new Error("tape header missing for materialization job");
-              if (row.materialized) return;
-              const result = await materializeBackend.finalizeLosslessTurnTape(job.userId, {
-                protocolVersion: 2,
-                action: "finalize",
-                sessionId: job.sessionId,
-                agentId: row.agent_id,
-                turnIndex: row.turn_index,
-                status: row.status,
-                turnKey: row.turn_key,
-                tapeId: job.tapeId,
-                tapeSha256: row.tape_sha256,
-                totalBytes: Number(row.total_bytes),
-                partCount: row.part_count,
-                createdAt: Number(row.created_at),
-                ...(row.waive_reason ? { waiveReason: row.waive_reason as "idle_timeout" } : {}),
-                ...(row.dispatch_id ? { dispatchId: row.dispatch_id, attemptNo: row.attempt_no ?? 1 } : {}),
-              });
-              if (result.applied === "incomplete") {
-                throw new Error("tape materialization still incomplete");
-              }
-              const done = await getPool().query<{ ok: boolean }>(
-                `SELECT (materialization_status='complete' OR finalized_at IS NOT NULL) AS ok
-                   FROM client_session_turn_tapes
-                  WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
-                [job.sessionId, job.userId, job.tapeId],
-              );
-              if (done.rows[0]?.ok !== true) {
-                throw new Error("tape materialization pending after finalize");
-              }
-            } finally {
-              _setAfterLosslessStageBatch(null);
-            }
-          },
-          settleJob: async (job) => {
-            const uidMatch = /^c:([1-9][0-9]*)$/.exec(job.userId);
-            if (!uidMatch) throw new Error("settlement job requires commercial user");
-            const uid = BigInt(uidMatch[1]!);
-            if (job.kind === "billing") {
-              const billings = Array.isArray((job.payload as { engineBillings?: unknown }).engineBillings)
-                ? (job.payload as { engineBillings: import("@openclaude/protocol").DurableCodexBilling[] }).engineBillings
-                : [];
-              for (const billing of billings) {
-                await settleTapeEngineBilling(uid, billing);
-              }
-              return;
-            }
-            const reason = (job.payload as { reason?: string; turnKey?: string }).reason;
-            const turnKey = (job.payload as { turnKey?: string }).turnKey;
-            if (!reason || !turnKey) throw new Error("waiver job payload missing reason/turnKey");
-            const waiver = await applyTurnWaiver(getPool(), {
-              userId: uid,
-              turnKey,
-              reason: reason as "idle_timeout",
-              logger: rootLogger.child({ subsys: "tapeWaiver" }),
-            });
-            if (waiver.disposition === 'deferred') {
-              throw new Error(`turn waiver proof pending: ${waiver.reason}`);
-            }
-            // Denied is a completed proposal, with no fence/refund/receipt.
-            // Billing jobs and later settlements retain their actual charges.
-          },
-        }));
-        // Coalesce: a burst of finalizes runs at most one extra tick at a time;
-        // kicks that arrive mid-tick fold into a single follow-up tick (each
-        // tick claims one materialization job, so the follow-up is needed for
-        // the second finalize of a burst; anything beyond that waits for the
-        // interval). runNow() itself serialises against the scheduler's inFlight.
-        let kickRunning = false;
-        let kickRequested = false;
-        const drainKicks = (): void => {
-          if (kickRunning) { kickRequested = true; return; }
-          kickRunning = true;
-          void h.runNow().catch(() => undefined).finally(() => {
-            kickRunning = false;
-            if (kickRequested) { kickRequested = false; drainKicks(); }
-          });
-        };
-        tapeSchedulerKickRef.current = drainKicks;
+        const h = trackScheduler("tapeJobScheduler", "shared", startTapeJobScheduler(schedulerOpts));
+        wireTapeSchedulerKick(tapeSchedulerKickRef, () => h.runNow());
         return {
           stop: async () => {
             tapeSchedulerKickRef.current = () => { /* scheduler stopped */ };
@@ -6590,105 +2308,20 @@ export async function registerCommercial(
     });
   }
 
-  // durable turn dispatch reconciler(RFC §2.3):open dispatch 周期收敛(admitted 过期租约 →
-  // 容器求证 → terminal/accepted;terminal 未通知 → 财务联查 → 真实终态 / manual_reconcile)。
-  // leaderBundle shared 单跑(双 master 只 leader)。仅 v5(turn_dispatches 由 0170 建)。
   if (runtimeChannel === "v5" && process.env.COMMERCIAL_TURN_DISPATCH_RECONCILER_DISABLED !== "1") {
     const dispatchBridgeSecret = bridgeSecret;
     leaderBundle.add({
       name: "turnDispatchReconciler",
       domain: "shared",
       start: () => {
-        const rawInterval = Number(process.env.COMMERCIAL_TURN_DISPATCH_RECONCILER_INTERVAL_MS);
-        const intervalMs = Number.isFinite(rawInterval) && rawInterval >= 5000 ? rawInterval : 30_000;
-        const rawCodexMax = Number(process.env.CODEX_SESSION_MAX_MS);
-        const stuckThresholdMs = resolveDispatchStuckThresholdMs(
-          process.env.COMMERCIAL_TURN_DISPATCH_STUCK_MS,
-          Number.isFinite(rawCodexMax) ? rawCodexMax : undefined,
-        );
-        // 独立 transport 实例(keep-alive 池);无 bridgeSecret → resolveRunningEndpoint 恒 null,
-        // 容器求证分支跳过,reconciler 仍跑纯 DB 的财务/告警分支(不静默丢终态)。
-        const container = makeContainerDispatchClient({
-          transport: makeNodeHttpContainerTransport(),
-          desktopTransport: makeDesktopContainerTransport(),
-          bridgeSecret: dispatchBridgeSecret ?? "",
-          resolveRunningEndpoint: async (id) => {
-            if (!dispatchBridgeSecret) return null;
-            return resolveDispatchEndpoint(id);
-          },
+        const { intervalMs, reconcilerDeps } = buildTurnDispatchReconcilerConfig({
+          env: process.env,
+          bridgeSecret: dispatchBridgeSecret,
+          dispatchAdmissionBackend,
+          containerLinkOn,
+          preCheckRedis,
+          userChatBridge,
         });
-        const reconcilerDeps = {
-          recoverInterruptedAdmission: dispatchAdmissionBackend
-            ? (id: string) => dispatchAdmissionBackend!.recoverInterruptedAdmission(id) : undefined,
-          containerLinkEnabled: containerLinkOn,
-          pool: getPool(),
-          container,
-          stuckThresholdMs,
-          // B-R1-1:abort 掉从未执行的 pre-forward journal 后,提前释放其 preCheck reservation
-          // (best-effort;reservation 本会自然过期)。
-          releaseReservation: (ref: { userId: string; requestId: string }) =>
-            releasePreCheck(preCheckRedis, { userId: ref.userId, requestId: ref.requestId }).then(() => {}),
-          // M4:真实终态落库后 best-effort 实时 nudge —— 复用既有 turn_state_unknown
-          // reconcile 帧型(前端收到即 forceSync 拉回该 dispatch 的权威状态卡)。
-          // published≠delivered:用户离线/已切轮则无害吞掉,终态已持久,下次 sync 必达。
-          recordFriction: (event: Parameters<typeof recordProductFrictionEvent>[0]) =>
-            recordProductFrictionEvent(event),
-          nudgeClient: (
-            uid: bigint,
-            sessionId: string,
-            clientMessageId: string,
-            reconcile?: "turn_completed" | "interrupted" | "turn_state_unknown",
-          ) => {
-            try {
-              userChatBridge.broadcastToUser(uid, buildTurnDispatchReconcileFrame({
-                sessionId,
-                clientMessageId,
-                reconcile,
-              }));
-            } catch {
-              /* best-effort */
-            }
-          },
-          commitVisibleTape: async (input: { userId: string; sessionId: string; tapeId: string }) => {
-            const header = await getPool().query<{
-              agent_id: string;
-              turn_index: number;
-              status: "completed" | "interrupted" | "crashed";
-              turn_key: string;
-              tape_sha256: string;
-              total_bytes: string;
-              part_count: number;
-              created_at: string;
-              waive_reason: string | null;
-              dispatch_id: string | null;
-              attempt_no: number | null;
-            }>(
-              `SELECT agent_id, turn_index, status, turn_key, tape_sha256, total_bytes::text,
-                      part_count, created_at::text, waive_reason, dispatch_id::text, attempt_no
-                 FROM client_session_turn_tapes
-                WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
-              [input.sessionId, input.userId, input.tapeId],
-            );
-            const row = header.rows[0];
-            if (!row) throw new Error("visible tape header missing");
-            await commitVisibleLosslessTurnPhaseA(getPool(), input.userId, {
-              protocolVersion: 2,
-              action: "finalize",
-              sessionId: input.sessionId,
-              agentId: row.agent_id,
-              turnIndex: row.turn_index,
-              status: row.status,
-              turnKey: row.turn_key,
-              tapeId: input.tapeId,
-              tapeSha256: row.tape_sha256,
-              totalBytes: Number(row.total_bytes),
-              partCount: row.part_count,
-              createdAt: Number(row.created_at),
-              ...(row.waive_reason ? { waiveReason: row.waive_reason as "idle_timeout" } : {}),
-              ...(row.dispatch_id ? { dispatchId: row.dispatch_id, attemptNo: row.attempt_no ?? 1 } : {}),
-            });
-          },
-        };
         const h = trackScheduler("turnDispatchReconciler", "shared", startTurnDispatchReconciler({
           ...reconcilerDeps,
           intervalMs,
@@ -6802,64 +2435,20 @@ export async function registerCommercial(
   // P3:cronWake 需交接调度器(RFC §2)→ 收口 LeaderBundle(单 leader 唤醒,消双 master 双唤醒烧钱)。
   // membership = ensureContainerReady 在手 + !DISABLED(不含 leadership;lease/legacy 触发启动)。
   if (process.env.COMMERCIAL_CRON_WAKE_DISABLED !== "1" && ensureContainerReady) {
-    const wakeFn = ensureContainerReady; // 已 guard 非空
+    const wakeFn = ensureContainerReady;
     leaderBundle.add({
       name: "cronWake",
       domain: "v5-owned",
       start: () => {
-    const cronWakeRunner = getPool() as unknown as CronWakeRunner;
-    const maxRaw = Number(process.env.COMMERCIAL_CRON_WAKE_MAX_PER_TICK);
-    const maxPerTick = Number.isFinite(maxRaw) && maxRaw >= 1 ? Math.trunc(maxRaw) : undefined;
-    const cdRaw = Number(process.env.COMMERCIAL_CRON_WAKE_COOLDOWN_MIN);
-    const cooldownMs = Number.isFinite(cdRaw) && cdRaw >= 0 ? Math.trunc(cdRaw) * 60_000 : undefined;
-    const cronWakeScheduler = trackScheduler("cronWake", "v5-owned", startCronWakeScheduler({
-      findDueUsers: (scanLimit, horizonSec) =>
-        findDueCronWakeUsers(cronWakeRunner, {
-          runtimeChannel: getRuntimeChannel(),
-          horizonSec,
-          scanLimit,
-        }),
-      // active 判定:**有在跑容器**(state='active' 且 cid 已落库)才跳过唤醒。
-      // 修 Codex MAJOR:不再用 findUserDataHost(纯按 state 派生、不看 cid)—— 否则 saga
-      // 孤儿(active+cid=NULL,master 在 Tx1/Tx2 间崩溃/重启留下)被当 active → skippedActive
-      // → 永不唤醒 → 永不进 sharedEnsureRunning 自愈 → cron 驱动用户 cron 永不 fire。
-      // userHasRunningContainer 用 cid IS NOT NULL 排除孤儿(返回 false),让 cronWake 照常
-      // 唤醒:在途→join singleflight;孤儿→getV3ContainerStatus provisioning/missing 自愈。
-      // (agent_containers 只做「跳过 active」优化,不做发现源;发现源=cron_wake_index。)
-      isContainerActive: async (uid) => computeQueries.userHasRunningContainer(Number(uid)),
-      wakeContainer: (uid) => wakeFn(uid),
-      recordWakeOutcome: ({ userId, correlation, outcome, attempts }) => {
-        void recordProductFrictionEvent({
-          correlation,
-          userId,
-          surface: "cron",
-          stage: "container_wake",
-          code: "WAKE_FAILED",
-          outcome,
-          attempts,
-        }, getPool()).catch(() => {});
-      },
-      runRescan: () => runCronWakeRescan({ runner: cronWakeRunner }),
-      logger: rootLogger,
-      maxPerTick,
-      cooldownMs,
-    }));
+        const cronWakeScheduler = trackScheduler("cronWake", "v5-owned", startCronWakeScheduler(buildCronWakeSchedulerOptions({ env: process.env, wakeFn })));
         return { stop: () => cronWakeScheduler.stop() };
       },
     });
   }
 
-  if (runtimeChannel === "v5") trackScheduler("tutorialModeration", "v5-owned", startTutorialModerationScheduler({ apiKey: cfg.OPENCODE_GO_API_KEY, logger: rootLogger })); // OCV5-577 经验分享 AI 审核;off 缺省只把残留作业转人工;停机中断的作业由 lease 过期重领
-  // 市场发布 AI 自动审批 worker(deepseek-v4-flash via OpenCode Go)。仅 v5 启动:marketplace 表 v3/v5 共享
-  // 无 channel 列,但 v3 跑旧代码不写 ai_review_state → 恒 NULL → 永不被 claim,故 v3 保持
-  // 纯人审、零行为变更。domain 'v5-owned'(v5 合法后台职责;写共享 marketplace 表但由
-  // FOR UPDATE SKIP LOCKED 协调,v3 不参与)。关停:OC_MARKETPLACE_AI_REVIEW_DISABLED=1。
-  // key 缺席不崩:worker 把 queued backlog 转人工 + 启动 warn(fail-closed)。
+  if (shouldStartCommercialScheduler("tutorialModeration", { flavorIdentity, runtimeChannel })) trackScheduler("tutorialModeration", "v5-owned", startTutorialModerationScheduler({ apiKey: cfg.OPENCODE_GO_API_KEY, logger: rootLogger })); // OCV5-577/825
   let marketplaceAiReviewScheduler: MarketplaceAiReviewSchedulerHandle | undefined;
-  if (
-    runtimeChannel === "v5" &&
-    process.env.OC_MARKETPLACE_AI_REVIEW_DISABLED !== "1"
-  ) {
+  if (shouldStartCommercialScheduler("marketplaceAiReview", { flavorIdentity, runtimeChannel })) {
     const raw = Number(process.env.OC_MARKETPLACE_AI_REVIEW_INTERVAL_MS);
     const intervalMs = Number.isFinite(raw) && raw >= 5000 ? raw : 15_000;
     marketplaceAiReviewScheduler = trackScheduler("marketplaceAiReview", "v5-owned", startMarketplaceAiReviewScheduler({
@@ -7148,7 +2737,7 @@ export async function registerCommercial(
     }
   })
 
-  void userChatBridge.rebuildContainerLinks?.();
+  if (!dualMasterEnabled) void userChatBridge.rebuildContainerLinks?.();
   const stopLogTiming = startLogTimingReporter(rootLogger);
   return {
     handle: async (req, res) => {
@@ -7171,173 +2760,67 @@ export async function registerCommercial(
       if (userChatBridge.handleUpgrade(req, socket, head)) return true;
       return false;
     },
-    shutdown: async () => {
-      systemActions?.runtime.closeAdmission();
-      stopLogTiming();
-      // P2:停 sessions GC sweeper —— 清 sweep timer、unlock advisory lease、还/销毁持锁连接
-      // (否则残留 setInterval + 永不归还池的持锁连接会泄漏,且备 master 竞不到锁)。
-      if (sessionsGcSweeper) {
-        try {
-          await sessionsGcSweeper.stop();
-        } catch {
-          /* ignore */
-        }
-      }
-      // P1.7 slice 7c — broker 先停。它会清 reconcile / housekeeping timer +
-      // stop outboxWorker;放在 listener 关之前是为了:进行中的 outbox flush
-      // 还能借 listener 把已经 admitted 的 outbound 完成最后一搏;同样 broker
-      // 内部 fire-and-forget reflection 也能在 listener 拆掉前发送完。
-      if (wechatBroker) {
-        try { await wechatBroker.stop(); } catch { /* ignore */ }
-      }
-      const previewBridge = containerPreviewBridge;
-      containerPreviewBridge = undefined;
-      const directPreview = directContainerPreview;
-      directContainerPreview = undefined;
-      const cgpServer = chatgptProxyServer;
-      chatgptProxyServer = undefined;
-      try { await cgpServer?.close(); } catch { /* ignore */ }
-      try { await closeMusePublic?.(); } catch { /* ignore */ }
-      try { await stopStudioOrchestrator?.(); } catch { /* ignore */ }
-      // OCV5-574: close this process's open Muse jobs (MUSE_MASTER_RESTARTED, never charged).
-      try { await museHub?.stop(); } catch { /* ignore */ }
-      try { await directPreview?.shutdown(); } catch { /* ignore */ }
-      try { await previewBridge?.shutdown(); } catch { /* ignore */ }
-      try { await voiceTranscribeHandler.shutdown(); } catch { /* ignore */ }
-      try { await userChatBridge.shutdown(); } catch { /* ignore */ }
-      try { await cursorExternalRoute?.close(); } catch { /* ignore */ }
-      // Managed setup/action workers must drain while PG/Redis and Docker control are alive.
-      try {
-        await Promise.allSettled([
-          systemActions?.runtime.closeAndDrain(),
-          knowledgePlanetSetup?.closeAndDrain(),
-          weiboSetup?.closeAndDrain(),
-          literatureSetup.close(),
-          Promise.resolve().then(() => literatureArtifacts?.close()),
-          zhihuSetup?.closeAndDrain(),
-          biliAccountSetup?.closeAndDrain(),
-          douyinSetup?.closeAndDrain(),
-        ])
-      } catch {
-        /* ignore */
-      }
-      // ── P3:LeaderBundle + lease + 控制口 teardown(RFC D4)──────────────────────
-      // v5:leaderLease.shutdown() graceful=(若持 lease)drain bundle(有界 30s)+写本 epoch ACK
-      //    +unlock advisory —— 新 holder 拿锁即见 ACK,零等待零重叠;非 leader 则只清连接/timer。
-      // 非 v5:无 lease,直接 stopAndDrain bundle(幂等)。二者都把 shared+4 特例调度器逐个 stop。
-      if (leaderLease) {
-        try { await leaderLease.shutdown(); } catch { /* ignore */ }
-      } else {
-        try { await leaderBundle.stopAndDrain(); } catch { /* ignore */ }
-      }
-      // 停机收尾:先给在飞 journal/dispatch 落「进程退出」证据,预算内再容器求证。
-      // 绝不盲 finalize(引擎可能仍在容器里)。超时只留证据,让重启 tick 立刻判定。
-      try {
-        if (turnDispatchShutdownHandoff) {
-          await turnDispatchShutdownHandoff();
-        } else {
-          await markGatewayShutdownEvidence({ reason: "process_shutdown" });
-        }
-      } catch {
-        /* ignore — 退出优先,证据写失败由重启后的保守阈值兜底 */
-      }
-      if (controlListener) {
-        try { await controlListener.close(); } catch { /* ignore */ }
-      }
-      if (deployDesiredWatch) {
-        try { deployDesiredWatch.stop(); } catch { /* ignore */ }
-      }
-      // 非 bundle 的常驻调度器(v5-owned 安全双跑 + local + eager shared 例外)照旧逐个 stop。
-      if (lifecycleScheduler) {
-        try { await lifecycleScheduler.stop(); } catch { /* ignore */ }
-      }
-      // 0042 — ImagePromoteScheduler 是 module 级单例,getImagePromoteScheduler() 拿到实例后调 stop
-      // (compute-pool trio 保留 controlPlaneEnabled gate,未入 bundle——见文首 P3 residual 说明)
-      try { getImagePromoteScheduler().stop(); } catch { /* ignore */ }
-      if (codexRefreshActor) {
-        try { codexRefreshActor.stop(); } catch { /* ignore */ }
-      }
-      if (subscriptionRolloverSweeper) {
-        try { subscriptionRolloverSweeper.stop(); } catch { /* ignore */ }
-      }
-      if (accountSlotReaper) {
-        try { accountSlotReaper.stop(); } catch { /* ignore */ }
-      }
-      try { logLevelSync.stop(); } catch { /* ignore */ }
-      if (codexDriftReconciler) {
-        try { codexDriftReconciler.stop(); } catch { /* ignore */ }
-      }
-      if (researchJobScheduler) {
-        try { researchJobScheduler.stop(); } catch { /* ignore */ }
-      }
-      if (marketplaceAiReviewScheduler) {
-        try { marketplaceAiReviewScheduler.stop(); } catch { /* ignore */ }
-      }
-      if (providerHealthScheduler) {
-        try { providerHealthScheduler.stop(); } catch { /* ignore */ }
-      }
-      // connector/selfheal/WeCom writers 已迁入 LeaderBundle，由 lease.shutdown→stopAndDrain 回收。
-      if (baselineSrv) {
-        try { await baselineSrv.stop(); } catch { /* ignore */ }
-      }
-      if (internalProxyServer) {
-        await new Promise<void>((resolve) => {
-          try {
-            internalProxyServer!.close(() => resolve());
-            // 主动断现有连接,close 才能尽快回调
-            const closeAll = (internalProxyServer as unknown as { closeAllConnections?: () => void }).closeAllConnections;
-            if (typeof closeAll === "function") closeAll.call(internalProxyServer);
-          } catch { resolve(); }
-        });
-      }
-      if (externalMtlsServer) {
-        await new Promise<void>((resolve) => {
-          try {
-            externalMtlsServer!.close(() => resolve());
-            const closeAll = (externalMtlsServer as unknown as { closeAllConnections?: () => void }).closeAllConnections;
-            if (typeof closeAll === "function") closeAll.call(externalMtlsServer);
-          } catch { resolve(); }
-        });
-      }
-      if (desktopTlsClose) {
-        await desktopTlsClose().catch(() => {});
-      }
-      // 0060 — 清空 model hint provider,避免 shutdown 后还有人持 stale closure
-      // (用于测试热重启场景:同一进程多次 register/shutdown 不能让旧 cache 被新 cache 引用)
-      try { setModelHintProvider(null); } catch { /* ignore */ }
-      // MAJOR-1 — 清空 host 静态 provider key seam(同进程热重启场景,避免旧 key 表被新进程引用)
-      try { setHostStaticProviderKeys(null); } catch { /* ignore */ }
-      // 0069 — 同理清空 literature skill provider(同进程热重启场景,且 closure 持
-      // pg pool 句柄,留着会阻止 closePool 释放最后引用)
-      try { setLiteratureSkillProvider(null); } catch { /* ignore */ }
-      try { await pricing.shutdown(); } catch { /* ignore */ }
-      try { await redis.quit(); } catch { /* ignore */ }
-      await closeModelCatalogAdminPool();
-      try { await shutdownDurableMetricRollups(); } catch { /* best-effort; absolute snapshots retry safely */ }
-      await closePool();
-    },
+    shutdown: createCommercialShutdown({
+      stopLogTiming,
+      closeSystemActionsAdmission: systemActions ? () => systemActions!.runtime.closeAdmission() : undefined,
+      sessionsGcSweeper,
+      wechatBroker,
+      getContainerPreviewBridge: () => containerPreviewBridge,
+      clearContainerPreviewBridge: () => { containerPreviewBridge = undefined; },
+      getDirectContainerPreview: () => directContainerPreview,
+      clearDirectContainerPreview: () => { directContainerPreview = undefined; },
+      getChatgptProxyServer: () => chatgptProxyServer,
+      clearChatgptProxyServer: () => { chatgptProxyServer = undefined; },
+      closeMusePublic,
+      stopStudioOrchestrator,
+      museHub,
+      voiceTranscribeHandler,
+      userChatBridge,
+      cursorExternalRoute,
+      drainManagedWorkers: () => [
+        systemActions?.runtime.closeAndDrain(),
+        knowledgePlanetSetup?.closeAndDrain(),
+        weiboSetup?.closeAndDrain(),
+        literatureSetup.close(),
+        Promise.resolve().then(() => literatureArtifacts?.close()),
+        zhihuSetup?.closeAndDrain(),
+        biliAccountSetup?.closeAndDrain(),
+        douyinSetup?.closeAndDrain(),
+      ],
+      leaderLease,
+      leaderBundle,
+      getTurnDispatchShutdownHandoff: () => turnDispatchShutdownHandoff,
+      controlListener,
+      deployDesiredWatch,
+      lifecycleScheduler,
+      codexRefreshActor,
+      subscriptionRolloverSweeper,
+      accountSlotReaper,
+      logLevelSync,
+      codexDriftReconciler,
+      researchJobScheduler,
+      marketplaceAiReviewScheduler,
+      providerHealthScheduler,
+      baselineSrv,
+      internalProxyServer,
+      externalMtlsServer,
+      getDesktopTlsClose: () => desktopTlsClose,
+      clearGatewayProviders: () => {
+        try { setModelHintProvider(null); } catch { /* ignore */ }
+        try { setHostStaticProviderKeys(null); } catch { /* ignore */ }
+        try { setLiteratureSkillProvider(null); } catch { /* ignore */ }
+      },
+      pricing,
+      redis,
+    }),
     /** V3 2H 测试 / /healthz 探测用:内部代理实际监听地址(undefined = 未启用)。 */
     internalProxyAddress,
     /** V3 D.1b 测试 / /healthz 探测用:外部 mTLS 监听地址(undefined = 未启用)。 */
     externalMtlsAddress,
     // 已规范化为 ≥32 byte Uint8Array,gateway 可直接喂 createHmac
     jwtSecret: secretToKey(jwtSecret),
-    // V3 multi-tenant media resolver — 只有 agentRuntime 起得来(docker client 在手)
-    // 才注入;否则 gateway 自动回退 paths.{uploads,generated}Dir(单租户兼容)。
-    // 详见 RegisterCommercialResult 注释。
-    //
-    // 注:v1.0.131 起 createCommercialHandler 不再消费此 resolver(media-sign 改用
-    // 容器内 ACL),所以唯一消费者是 gateway 自己的 /api/uploads 写路径(由 gateway
-    // 持有这个 closure 调 _resolveMediaDirs)。
     resolveUserMediaDirs: userMediaResolver,
-    // textual 谓词,无依赖,始终暴露 —— 仅供 orphan sweep 启动时按目录壳子
-    // 迭代 user volumes 用。**不要**给 HTTP allowlist 用(cross-tenant IDOR)。
     isUserVolumeMediaPath,
-    // v1.0.192 冷启动护栏 hook for gateway handleUpload。
-    // 共享 sharedEnsureRunning 同一 per-uid singleflight(详见 line 1655 装配处)。
-    // **结构化返回**:不把 ContainerUnreadyError 穿过 gateway 边界(后者零编译期
-    // 依赖 commercial,见 server.ts 头部注释),把已知冷启动 "未就绪" 拍平成
-    // 普通对象;其他 error(DB / docker daemon 抖)继续 throw 让 gateway 兜底 500。
     ensureContainerReady: ensureContainerEndpointReady
       ? async (uid) => {
           try {
@@ -7356,25 +2839,11 @@ export async function registerCommercial(
         }
       : undefined,
     preheatUserContainer,
-    // remote-host media push hook(2026-05-16 hotfix):用户容器调度到 remote
-    // compute host 时,master 收到 /api/uploads → 本地暂存 → 调本 hook 把字节
-    // 推到 host 上的 docker volume(/var/lib/docker/volumes/oc-v3-data-u<uid>/
-    // _data/uploads/<digest>.<ext>)。node-agent 的 AllowedDirRegexes 已经放行
-    // 这一路径形态(files.go 同 hotfix),mode 0o644 + owner 1000:1000 与
-    // self-host 分支等价(容器内 agent uid=1000,确保可读)。
-    //
-    // 错误语义:row 不存在/agent 不可达/HTTP >=400 都直接抛,gateway 自己
-    // 转成 502 "remote storage push failed"。PSK buffer 在 finally 里 fill(0)
-    // 清零,与 putRemoteCodexAuth 同纪律。
     pushRemoteHostUpload,
-    // 2026-05-16 hotfix Phase 2 — remote-host 读路径对称 closure。
-    // 与 pushRemoteHostUpload 同纪律(psk 清零)与同错误语义(throw → gateway 502)。
-    // node-agent 404 → 返 null,让 gateway 决定 fallback 还是终态 404。
     pullRemoteHostMedia: async (args: {
       hostUuid: string;
       remotePath: string;
     }) => {
-      // A3 — service file-IO:revoked / 缺 fingerprint 的 host 直接拒。
       const target = await resolveServiceableHostTarget(args.hostUuid);
       try {
         return await nodeAgentGetFile(target, args.remotePath);
@@ -7383,41 +2852,7 @@ export async function registerCommercial(
       }
     },
     ...chunkHooks,
-    // healthz 深度探活:gateway healthz 经此 seam 探 PG/Redis(gateway 对二者零编译依赖)。
-    // 任一失败 → healthz body.ok=false(HTTP 仍 200,monitor 消费 ok 字段自动告警),补上
-    // "PG/Redis 宕机但 healthz 仍绿零告警"的盲区(2026-07-06 sessions.db 事故的同构面)。
-    // 2s 超时:探活不能被慢依赖拖住 healthz;timer unref 不阻止进程退出。
-    probeDeps: async () => {
-      const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> => {
-        let timer: NodeJS.Timeout | undefined;
-        const timeout = new Promise<never>((_, rej) => {
-          timer = setTimeout(() => rej(new Error(`probe timeout ${ms}ms`)), ms);
-          timer.unref?.();
-        });
-        return Promise.race([p, timeout]).finally(() => clearTimeout(timer)) as Promise<T>;
-      };
-      const out: Record<string, { ok: true } | { ok: false; error: string }> = {};
-      try {
-        await withTimeout(getPool().query("SELECT 1"), 2000);
-        out.pg = { ok: true };
-      } catch (err) {
-        out.pg = { ok: false, error: (err as Error).message };
-      }
-      try {
-        await withTimeout(redis.ping(), 2000);
-        out.redis = { ok: true };
-      } catch (err) {
-        out.redis = { ok: false, error: (err as Error).message };
-      }
-      return out;
-    },
-    // P1.7 slice 7c — broker 装配成功(WECHAT_BROKER_ENABLED=1 + bridgeSecret 齐)
-    // 才暴露。gateway cli 把 commercial.wechatBroker 作为 onInboundOverride 透传给
-    // wechat manager;manager 命中普通文本路径时把 evt 喂给 broker.onInbound,
-    // broker 自己 never-throw 并按 wsess-* 命名空间走 dispatcher → container 链路。
-    //
-    // 类型上只暴露 onInbound 的最小投影(不导出 BrokerInboundOutcome 等内部 union)—
-    // gateway 不需要也不应消费 outcome 字段,broker 内部已做必要的 log。
+    probeDeps: createCommercialProbeDeps(redis),
     wechatBroker: wechatBroker
       ? {
           onInbound: (evt) => wechatBroker!.onInbound(evt),
@@ -7438,350 +2873,49 @@ export { PricingCache, perKtokCredits } from "./billing/pricing.js";
 export type { ModelPricing, PublicModel } from "./billing/pricing.js";
 export { computeCost } from "./billing/calculator.js";
 export type { TokenUsage, PriceSnapshot, CostResult } from "./billing/calculator.js";
-export {
-  adminAdjust,
-  listLedger,
-  InsufficientCreditsError,
-  LEDGER_REASONS,
-} from "./billing/ledger.js";
-export type {
-  LedgerReason,
-  LedgerRef,
-  DebitResult,
-  AdminAdjustResult,
-  LedgerRow,
-} from "./billing/ledger.js";
-export {
-  preCheck,
-  preCheckWithCost,
-  readTotalSpendableBalance,
-  releasePreCheck,
-  estimateMaxCost,
-  InsufficientCreditsError as PreCheckInsufficientCreditsError,
-  InMemoryPreCheckRedis,
-  wrapIoredisForPreCheck,
-} from "./billing/preCheck.js";
-export type {
-  PreCheckRedis,
-  PreCheckInput,
-  PreCheckWithCostInput,
-  PreCheckResult,
-  ReservationHandle,
-  AtomicReserveResult,
-} from "./billing/preCheck.js";
-export {
-  signHupijiao,
-  verifyHupijiao,
-  buildSignBase,
-} from "./payment/hupijiao/sign.js";
+export { adminAdjust, listLedger, InsufficientCreditsError, LEDGER_REASONS } from "./billing/ledger.js";
+export type { LedgerReason, LedgerRef, DebitResult, AdminAdjustResult, LedgerRow } from "./billing/ledger.js";
+export { preCheck, preCheckWithCost, readTotalSpendableBalance, releasePreCheck, estimateMaxCost, InsufficientCreditsError as PreCheckInsufficientCreditsError, InMemoryPreCheckRedis, wrapIoredisForPreCheck } from "./billing/preCheck.js";
+export type { PreCheckRedis, PreCheckInput, PreCheckWithCostInput, PreCheckResult, ReservationHandle, AtomicReserveResult } from "./billing/preCheck.js";
+export { signHupijiao, verifyHupijiao, buildSignBase } from "./payment/hupijiao/sign.js";
 export type { SignParams } from "./payment/hupijiao/sign.js";
-export {
-  createHttpHupijiaoClient,
-  HupijiaoError,
-} from "./payment/hupijiao/client.js";
-export type {
-  HupijiaoClient,
-  HupijiaoConfig,
-  CreateQrInput,
-  CreateQrResult,
-} from "./payment/hupijiao/client.js";
-export {
-  listPlans,
-  getPlanByCode,
-  generateOrderNo,
-  createPendingOrder,
-  getOrderByNo,
-  markOrderPaid,
-  expirePendingOrders,
-  ORDER_STATUSES,
-  PlanNotFoundError,
-  OrderNotFoundError,
-  InvalidOrderStateError,
-} from "./payment/orders.js";
-export type {
-  TopupPlan,
-  OrderRow,
-  OrderStatus,
-  CreatePendingOrderInput,
-  MarkOrderPaidInput,
-  MarkOrderPaidResult,
-} from "./payment/orders.js";
-// T-30 账号池 store
-export {
-  createAccount,
-  getAccount,
-  listAccounts,
-  getTokenForUse,
-  updateAccount,
-  deleteAccount,
-  ACCOUNT_PLANS,
-  ACCOUNT_STATUSES,
-  AccountNotFoundError,
-} from "./account-pool/store.js";
-export type {
-  AccountPlan,
-  AccountStatus,
-  AccountRow,
-  AccountToken,
-  CreateAccountInput,
-  UpdateAccountPatch,
-  ListAccountsOptions,
-} from "./account-pool/store.js";
-// T-31 账号池 health
-export {
-  AccountHealthTracker,
-  InMemoryHealthRedis,
-  wrapIoredisForHealth,
-  healthKey,
-  failKey,
-  DEFAULT_FAIL_THRESHOLD,
-  DEFAULT_COOLDOWN_MS,
-  DEFAULT_HEALTH_TTL_SEC,
-  DEFAULT_FAIL_WINDOW_SEC,
-} from "./account-pool/health.js";
-export type {
-  AccountHealth,
-  HealthRedis,
-  HealthDeps,
-} from "./account-pool/health.js";
-// T-32 账号池 scheduler
-export {
-  AccountScheduler,
-  AccountPoolUnavailableError,
-  AccountPoolBusyError,
-  ERR_ACCOUNT_POOL_UNAVAILABLE,
-  ERR_ACCOUNT_POOL_BUSY,
-  DEFAULT_MAX_CONCURRENT_PER_ACCOUNT,
-  parseMaxConcurrentEnv,
-  pickWRH,
-  computeAccountWeight,
-  defaultHash,
-} from "./account-pool/scheduler.js";
-export type {
-  PickInput,
-  PickResult,
-  ReleaseInput,
-  ReleaseResult,
-  SchedulerDeps,
-  CandidateRow,
-} from "./account-pool/scheduler.js";
-// T-33 账号池 refresh + proxy
-export {
-  refreshAccountToken,
-  shouldRefresh,
-  defaultHttp,
-  RefreshError,
-  DEFAULT_REFRESH_SKEW_MS,
-  DEFAULT_OAUTH_ENDPOINT,
-  DEFAULT_FALLBACK_EXPIRES_MS,
-} from "./account-pool/refresh.js";
-export type {
-  RefreshErrorCode,
-  RefreshHttpClient,
-  RefreshDeps,
-  RefreshedTokens,
-} from "./account-pool/refresh.js";
-export {
-  streamClaude,
-  ProxyError,
-  ProxyAuthError,
-  DEFAULT_CLAUDE_ENDPOINT,
-  DEFAULT_ANTHROPIC_VERSION,
-  DEFAULT_MAX_SSE_BUFFER,
-} from "./account-pool/proxy.js";
-export type {
-  ProxyEvent,
-  ProxyDeps,
-  StreamClaudeInput,
-} from "./account-pool/proxy.js";
-// V3 Phase 2: T-40/T-40b/T-41 v2 chat orchestrator(chat/orchestrator.ts、chat/debit.ts、
-// ws/chat.ts、http/chat.ts)已删除 — v3 chat 不再走 commercial 进程出口,改由用户的
-// docker 容器跑个人版 → 经 anthropicProxy(2D 待加)统一访问上游。
-// ws/connections.ts 保留:ConnectionRegistry 仍是 /ws/user-chat-bridge 的连接注册表
-// (legacy /ws/agent 入口已删除)。
-export {
-  ConnectionRegistry,
-  DEFAULT_MAX_PER_USER,
-} from "./ws/connections.js";
-export type {
-  Conn,
-  RegisterResult,
-} from "./ws/connections.js";
-// V3 Phase 2 Task 2I-1: 结构化 logger
-export {
-  createLogger,
-  rootLogger,
-  parseLevel,
-  SENSITIVE_KEYS,
-} from "./logging/logger.js";
-export type {
-  Logger,
-  LogLevel,
-  LoggerOptions,
-} from "./logging/logger.js";
-// V3 Phase 2 Task 2C: 容器身份双因子校验
-export {
-  verifyContainerIdentity,
-  parseContainerToken,
-  hashSecret,
-  compareHash,
-  createPgIdentityRepo,
-  ContainerIdentityError,
-} from "./auth/containerIdentity.js";
-export type {
-  ContainerIdentity,
-  ContainerIdentityRepo,
-} from "./auth/containerIdentity.js";
-// V3 anthropicProxy 拆分 Phase 2(2026-05-18):身份层 strategy 物理切出
-export {
-  makeContainerIdentityStrategy,
-  IdentityError,
-  AuthzLoadError,
-  AuthzDeniedError,
-} from "./auth/proxyIdentity.js";
-export type {
-  IdentityStrategy,
-  ProxyIdentity,
-  ContainerIdentityStrategyDeps,
-} from "./auth/proxyIdentity.js";
-// V3 Phase 2 Task 2D: 内部 Anthropic 中央代理(monolith)
-export {
-  makeAnthropicProxyHandler,
-  proxyBodySchema,
-  enforceFieldByteBudgets,
-  estimateInputTokens,
-  estimateMaxCostBothSides,
-  buildSafeUpstreamHeaders,
-  ConcurrencyLimiter,
-  pipeStreamWithUsageCapture,
-  DEFAULT_UPSTREAM_ENDPOINT,
-  ANTHROPIC_VERSION,
-  ALLOWED_BETA_VALUES,
-  SIZE_LIMITS,
-  MAX_BODY_BYTES_DEFAULT,
-  MAX_MESSAGES_COUNT,
-  MAX_TOOLS_COUNT,
-  CHARS_PER_TOKEN_ESTIMATE,
-  DEFAULT_PROXY_RATE_LIMIT,
-  DEFAULT_MAX_CONCURRENT_PER_UID,
-} from "./http/anthropicProxy.js";
-export type {
-  AnthropicProxyDeps,
-  AnthropicProxyHandler,
-  ProxyBody,
-  UsageObservation,
-  PipeStreamResult,
-} from "./http/anthropicProxy.js";
-// V3 Phase 1 split: billing 子模块(从 anthropicProxy.ts L956-1485 物理切出)
-export {
-  startInflightJournal,
-  makeFinalizer,
-} from "./billing/proxyBilling.js";
-export type {
-  FinalizeContext,
-  FinalizeOutcome,
-  FinalizerHandle,
-} from "./billing/proxyBilling.js";
-// V3 Phase 4 split: upstream round-trip 子模块(从 anthropicProxy.ts L1421-1639 物理切出)
+export { createHttpHupijiaoClient, HupijiaoError } from "./payment/hupijiao/client.js";
+export type { HupijiaoClient, HupijiaoConfig, CreateQrInput, CreateQrResult } from "./payment/hupijiao/client.js";
+export { listPlans, getPlanByCode, generateOrderNo, createPendingOrder, getOrderByNo, markOrderPaid, expirePendingOrders, ORDER_STATUSES, PlanNotFoundError, OrderNotFoundError, InvalidOrderStateError } from "./payment/orders.js";
+export type { TopupPlan, OrderRow, OrderStatus, CreatePendingOrderInput, MarkOrderPaidInput, MarkOrderPaidResult } from "./payment/orders.js";
+export { createAccount, getAccount, listAccounts, getTokenForUse, updateAccount, deleteAccount, ACCOUNT_PLANS, ACCOUNT_STATUSES, AccountNotFoundError } from "./account-pool/store.js";
+export type { AccountPlan, AccountStatus, AccountRow, AccountToken, CreateAccountInput, UpdateAccountPatch, ListAccountsOptions } from "./account-pool/store.js";
+export { AccountHealthTracker, InMemoryHealthRedis, wrapIoredisForHealth, healthKey, failKey, DEFAULT_FAIL_THRESHOLD, DEFAULT_COOLDOWN_MS, DEFAULT_HEALTH_TTL_SEC, DEFAULT_FAIL_WINDOW_SEC } from "./account-pool/health.js";
+export type { AccountHealth, HealthRedis, HealthDeps } from "./account-pool/health.js";
+export { AccountScheduler, AccountPoolUnavailableError, AccountPoolBusyError, ERR_ACCOUNT_POOL_UNAVAILABLE, ERR_ACCOUNT_POOL_BUSY, DEFAULT_MAX_CONCURRENT_PER_ACCOUNT, parseMaxConcurrentEnv, pickWRH, computeAccountWeight, defaultHash } from "./account-pool/scheduler.js";
+export type { PickInput, PickResult, ReleaseInput, ReleaseResult, SchedulerDeps, CandidateRow } from "./account-pool/scheduler.js";
+export { refreshAccountToken, shouldRefresh, defaultHttp, RefreshError, DEFAULT_REFRESH_SKEW_MS, DEFAULT_OAUTH_ENDPOINT, DEFAULT_FALLBACK_EXPIRES_MS } from "./account-pool/refresh.js";
+export type { RefreshErrorCode, RefreshHttpClient, RefreshDeps, RefreshedTokens } from "./account-pool/refresh.js";
+export { streamClaude, ProxyError, ProxyAuthError, DEFAULT_CLAUDE_ENDPOINT, DEFAULT_ANTHROPIC_VERSION, DEFAULT_MAX_SSE_BUFFER } from "./account-pool/proxy.js";
+export type { ProxyEvent, ProxyDeps, StreamClaudeInput } from "./account-pool/proxy.js";
+export { ConnectionRegistry, DEFAULT_MAX_PER_USER } from "./ws/connections.js";
+export type { Conn, RegisterResult } from "./ws/connections.js";
+export { createLogger, rootLogger, parseLevel, SENSITIVE_KEYS } from "./logging/logger.js";
+export type { Logger, LogLevel, LoggerOptions } from "./logging/logger.js";
+export { verifyContainerIdentity, parseContainerToken, hashSecret, compareHash, createPgIdentityRepo, ContainerIdentityError } from "./auth/containerIdentity.js";
+export type { ContainerIdentity, ContainerIdentityRepo } from "./auth/containerIdentity.js";
+export { makeContainerIdentityStrategy, IdentityError, AuthzLoadError, AuthzDeniedError } from "./auth/proxyIdentity.js";
+export type { IdentityStrategy, ProxyIdentity, ContainerIdentityStrategyDeps } from "./auth/proxyIdentity.js";
+export { makeAnthropicProxyHandler, proxyBodySchema, enforceFieldByteBudgets, estimateInputTokens, estimateMaxCostBothSides, buildSafeUpstreamHeaders, ConcurrencyLimiter, pipeStreamWithUsageCapture, DEFAULT_UPSTREAM_ENDPOINT, ANTHROPIC_VERSION, ALLOWED_BETA_VALUES, SIZE_LIMITS, MAX_BODY_BYTES_DEFAULT, MAX_MESSAGES_COUNT, MAX_TOOLS_COUNT, CHARS_PER_TOKEN_ESTIMATE, DEFAULT_PROXY_RATE_LIMIT, DEFAULT_MAX_CONCURRENT_PER_UID } from "./http/anthropicProxy.js";
+export type { AnthropicProxyDeps, AnthropicProxyHandler, ProxyBody, UsageObservation, PipeStreamResult } from "./http/anthropicProxy.js";
+export { startInflightJournal, makeFinalizer } from "./billing/proxyBilling.js";
+export type { FinalizeContext, FinalizeOutcome, FinalizerHandle } from "./billing/proxyBilling.js";
 export { runUpstreamRoundTrip } from "./http/proxy/core.js";
 export type { RoundTripCtx } from "./http/proxy/core.js";
-// V3 Phase 3 split: upstream session 子模块(从 anthropicProxy.ts §3.4 物理切出)
-export {
-  selectUpstreamRoute,
-  validateUpstreamConfig,
-  pickUpstream,
-  releaseUpstreamSession,
-} from "./http/proxy/upstream.js";
-export type {
-  UpstreamRoute,
-  ConfigError,
-  PreparedUpstreamSession,
-  PickError,
-  PickUpstreamDeps,
-} from "./http/proxy/upstream.js";
-// V3 Phase 2 Task 2E: 用户 WS ↔ 容器 WS 桥接
-export {
-  createUserChatBridge,
-  ContainerUnreadyError,
-  CLOSE_BRIDGE,
-  BRIDGE_WS_PATH,
-} from "./ws/userChatBridge.js";
-export type {
-  UserChatBridgeDeps,
-  UserChatBridgeHandler,
-  ResolveContainerEndpoint,
-  BridgeMetricSink,
-  BridgeCloseCause,
-} from "./ws/userChatBridge.js";
-// T-53: Agent 订阅 + 生命周期
-export {
-  openAgentSubscription,
-  getAgentStatus,
-  cancelAgentSubscription,
-  markContainerRunning,
-  markContainerError,
-  markExpiredSubscriptions,
-  markContainerStoppedAfterExpiry,
-  listVolumeGcCandidates,
-  markContainerRemoved,
-  AgentInsufficientCreditsError,
-  AgentAlreadyActiveError,
-  AgentNotSubscribedError,
-  AGENT_PLAN_BASIC,
-  DEFAULT_AGENT_PLAN_PRICE_CREDITS,
-  DEFAULT_AGENT_PLAN_DURATION_DAYS,
-  DEFAULT_AGENT_VOLUME_GC_DAYS,
-  provisionContainer,
-  runLifecycleTick,
-  startLifecycleScheduler,
-} from "./agent/index.js";
-export type {
-  AgentPlan,
-  AgentSubscriptionStatus,
-  AgentContainerStatus,
-  OpenAgentSubscriptionInput,
-  OpenAgentSubscriptionResult,
-  AgentStatusView,
-  CancelAgentSubscriptionResult,
-  ExpiredSubscriptionRow,
-  GcCandidateRow,
-  ProvisionContainerOptions,
-  LifecycleTickOptions,
-  LifecycleTickResult,
-  LifecycleLogger,
-  LifecycleScheduler,
-  StartLifecycleSchedulerOptions,
-} from "./agent/index.js";
+export { selectUpstreamRoute, validateUpstreamConfig, pickUpstream, releaseUpstreamSession } from "./http/proxy/upstream.js";
+export type { UpstreamRoute, ConfigError, PreparedUpstreamSession, PickError, PickUpstreamDeps } from "./http/proxy/upstream.js";
+export { createUserChatBridge, ContainerUnreadyError, CLOSE_BRIDGE, BRIDGE_WS_PATH } from "./ws/userChatBridge.js";
+export type { UserChatBridgeDeps, UserChatBridgeHandler, ResolveContainerEndpoint, BridgeMetricSink, BridgeCloseCause } from "./ws/userChatBridge.js";
+export { openAgentSubscription, getAgentStatus, cancelAgentSubscription, markContainerRunning, markContainerError, markExpiredSubscriptions, markContainerStoppedAfterExpiry, listVolumeGcCandidates, markContainerRemoved, AgentInsufficientCreditsError, AgentAlreadyActiveError, AgentNotSubscribedError, AGENT_PLAN_BASIC, DEFAULT_AGENT_PLAN_PRICE_CREDITS, DEFAULT_AGENT_PLAN_DURATION_DAYS, DEFAULT_AGENT_VOLUME_GC_DAYS, provisionContainer, runLifecycleTick, startLifecycleScheduler } from "./agent/index.js";
+export type { AgentPlan, AgentSubscriptionStatus, AgentContainerStatus, OpenAgentSubscriptionInput, OpenAgentSubscriptionResult, AgentStatusView, CancelAgentSubscriptionResult, ExpiredSubscriptionRow, GcCandidateRow, ProvisionContainerOptions, LifecycleTickOptions, LifecycleTickResult, LifecycleLogger, LifecycleScheduler, StartLifecycleSchedulerOptions } from "./agent/index.js";
 export type { AgentHttpDeps } from "./http/agent.js";
-// T-62 metrics + alerts
-export {
-  renderPrometheus,
-  incrGatewayRequest,
-  incrBillingDebit,
-  incrClaudeApi,
-  resetMetricsForTest,
-  normalizeRoute,
-  snapshotForAlerts,
-} from "./admin/metrics.js";
-export {
-  startAlertScheduler,
-  createTelegramSender,
-  defaultRules,
-  ruleAccountPoolAllDown,
-  ruleNoAccountsConfigured,
-} from "./admin/alerts.js";
-export type {
-  AlertScheduler,
-  AlertSchedulerOptions,
-  AlertRule,
-  AlertSender,
-  Snapshot,
-} from "./admin/alerts.js";
-// V5 prompt queue P1 repository/internal transport (feature remains opt-in).
+export { renderPrometheus, incrGatewayRequest, incrBillingDebit, incrClaudeApi, resetMetricsForTest, normalizeRoute, snapshotForAlerts } from "./admin/metrics.js";
+export { startAlertScheduler, createTelegramSender, defaultRules, ruleAccountPoolAllDown, ruleNoAccountsConfigured } from "./admin/alerts.js";
+export type { AlertScheduler, AlertSchedulerOptions, AlertRule, AlertSender, Snapshot } from "./admin/alerts.js";
 export { PgPromptQueueStore, PromptQueueStoreError } from "./promptQueue/pgPromptQueueStore.js";
-export type {
-  PromptQueueOwner,
-  PromptQueueDetail,
-  PromptQueueClaimRequest,
-  PromptQueueClaimResult,
-} from "./promptQueue/pgPromptQueueStore.js";
+export type { PromptQueueOwner, PromptQueueDetail, PromptQueueClaimRequest, PromptQueueClaimResult } from "./promptQueue/pgPromptQueueStore.js";

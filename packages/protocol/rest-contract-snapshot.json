@@ -1,0 +1,1373 @@
+{
+  "schema": 1,
+  "domains": [
+    "sessions",
+    "billing",
+    "pendingDecisions",
+    "sites",
+    "models"
+  ],
+  "routes": {
+    "GET /api/me/pending-decisions": {
+      "domain": "pendingDecisions",
+      "method": "GET",
+      "path": "/api/me/pending-decisions",
+      "response": {
+        "properties": {
+          "counts": {
+            "properties": {
+              "bySource": {
+                "properties": {
+                  "browser_handoff": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "connector_write": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "taskboard": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "turn_permission": {
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "turn_permission",
+                  "connector_write",
+                  "taskboard",
+                  "browser_handoff"
+                ],
+                "type": "object"
+              },
+              "total": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "total",
+              "bySource"
+            ],
+            "type": "object"
+          },
+          "generatedAt": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "properties": {
+                "allowedActions": {
+                  "items": {
+                    "anyOf": [
+                      {
+                        "const": "approve",
+                        "type": "string"
+                      },
+                      {
+                        "const": "deny",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "type": "array"
+                },
+                "createdAt": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "expiresAt": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "id": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "metadata": {
+                  "patternProperties": {
+                    "^(.*)$": {}
+                  },
+                  "type": "object"
+                },
+                "riskLevel": {
+                  "anyOf": [
+                    {
+                      "const": "low",
+                      "type": "string"
+                    },
+                    {
+                      "const": "medium",
+                      "type": "string"
+                    },
+                    {
+                      "const": "high",
+                      "type": "string"
+                    },
+                    {
+                      "const": "critical",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "sessionId": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "source": {
+                  "anyOf": [
+                    {
+                      "const": "turn_permission",
+                      "type": "string"
+                    },
+                    {
+                      "const": "connector_write",
+                      "type": "string"
+                    },
+                    {
+                      "const": "taskboard",
+                      "type": "string"
+                    },
+                    {
+                      "const": "browser_handoff",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "sourceId": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "status": {
+                  "anyOf": [
+                    {
+                      "const": "pending",
+                      "type": "string"
+                    },
+                    {
+                      "const": "approved",
+                      "type": "string"
+                    },
+                    {
+                      "const": "denied",
+                      "type": "string"
+                    },
+                    {
+                      "const": "expired",
+                      "type": "string"
+                    },
+                    {
+                      "const": "cancelled",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "summary": {
+                  "type": "string"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "userId": {
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "source",
+                "sourceId",
+                "userId",
+                "sessionId",
+                "title",
+                "summary",
+                "riskLevel",
+                "status",
+                "metadata",
+                "createdAt",
+                "expiresAt",
+                "allowedActions"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "warnings": {
+            "items": {
+              "properties": {
+                "code": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "source": {
+                  "anyOf": [
+                    {
+                      "const": "turn_permission",
+                      "type": "string"
+                    },
+                    {
+                      "const": "connector_write",
+                      "type": "string"
+                    },
+                    {
+                      "const": "taskboard",
+                      "type": "string"
+                    },
+                    {
+                      "const": "browser_handoff",
+                      "type": "string"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "source",
+                "code",
+                "message"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items",
+          "counts",
+          "generatedAt"
+        ],
+        "type": "object"
+      },
+      "query": {
+        "properties": {
+          "limit": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "GET /api/public/models": {
+      "domain": "models",
+      "method": "GET",
+      "path": "/api/public/models",
+      "response": {
+        "properties": {
+          "locked_models": {
+            "items": {
+              "properties": {
+                "cost_x": {
+                  "type": "number"
+                },
+                "display_name": {
+                  "type": "string"
+                },
+                "engine": {
+                  "type": "string"
+                },
+                "id": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "min_plan_code": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "min_plan_name": {
+                  "type": "string"
+                },
+                "placement": {
+                  "anyOf": [
+                    {
+                      "const": "local",
+                      "type": "string"
+                    },
+                    {
+                      "const": "remote_pool",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "promo_label": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "min_plan_code"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "models": {
+            "items": {
+              "properties": {
+                "cache_read_per_ktok_credits": {
+                  "type": "string"
+                },
+                "cache_write_per_ktok_credits": {
+                  "type": "string"
+                },
+                "context_window": {
+                  "anyOf": [
+                    {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "cost_x": {
+                  "type": "number"
+                },
+                "degraded": {
+                  "type": "boolean"
+                },
+                "display_name": {
+                  "type": "string"
+                },
+                "engine": {
+                  "anyOf": [
+                    {
+                      "const": "ccb",
+                      "type": "string"
+                    },
+                    {
+                      "const": "codex",
+                      "type": "string"
+                    },
+                    {
+                      "const": "grok",
+                      "type": "string"
+                    },
+                    {
+                      "const": "cursor",
+                      "type": "string"
+                    },
+                    {
+                      "const": "zcode",
+                      "type": "string"
+                    },
+                    {
+                      "const": "antigravity",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "id": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "input_per_ktok_credits": {
+                  "type": "string"
+                },
+                "multiplier": {
+                  "type": "string"
+                },
+                "output_per_ktok_credits": {
+                  "type": "string"
+                },
+                "placement": {
+                  "anyOf": [
+                    {
+                      "const": "local",
+                      "type": "string"
+                    },
+                    {
+                      "const": "remote_pool",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "promo_label": {
+                  "type": "string"
+                },
+                "provider_id": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "supported_efforts": {
+                  "items": {
+                    "anyOf": [
+                      {
+                        "const": "low",
+                        "type": "string"
+                      },
+                      {
+                        "const": "medium",
+                        "type": "string"
+                      },
+                      {
+                        "const": "high",
+                        "type": "string"
+                      },
+                      {
+                        "const": "xhigh",
+                        "type": "string"
+                      },
+                      {
+                        "const": "max",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "type": "array"
+                },
+                "supports_vision": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "team_leader_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "models"
+        ],
+        "type": "object"
+      }
+    },
+    "GET /api/sessions/list": {
+      "domain": "sessions",
+      "method": "GET",
+      "path": "/api/sessions/list",
+      "response": {
+        "properties": {
+          "nextCursor": {
+            "type": "number"
+          },
+          "sessions": {
+            "items": {
+              "properties": {
+                "agentId": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "archived": {
+                  "type": "boolean"
+                },
+                "createdAt": {
+                  "type": "number"
+                },
+                "id": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "lastAt": {
+                  "type": "number"
+                },
+                "lastErrorCode": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "lastMessagePreview": {
+                  "type": "string"
+                },
+                "lastOutcome": {
+                  "anyOf": [
+                    {
+                      "anyOf": [
+                        {
+                          "const": "completed",
+                          "type": "string"
+                        },
+                        {
+                          "const": "interrupted",
+                          "type": "string"
+                        },
+                        {
+                          "const": "crashed",
+                          "type": "string"
+                        },
+                        {
+                          "const": "not_accepted",
+                          "type": "string"
+                        },
+                        {
+                          "const": "executed_error",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "messageCount": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "modelId": {
+                  "type": "string"
+                },
+                "pinned": {
+                  "type": "boolean"
+                },
+                "projectId": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "runState": {
+                  "anyOf": [
+                    {
+                      "const": "running",
+                      "type": "string"
+                    },
+                    {
+                      "const": "idle",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "title": {
+                  "type": "string"
+                },
+                "unread": {
+                  "type": "boolean"
+                },
+                "updatedAt": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "id",
+                "agentId",
+                "title",
+                "pinned",
+                "createdAt",
+                "lastAt",
+                "messageCount",
+                "updatedAt"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "sessions"
+        ],
+        "type": "object"
+      },
+      "query": {
+        "properties": {
+          "before": {
+            "type": "number"
+          },
+          "includeArchived": {
+            "type": "boolean"
+          },
+          "limit": {
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "GET /api/sites": {
+      "domain": "sites",
+      "method": "GET",
+      "path": "/api/sites",
+      "response": {
+        "properties": {
+          "baseDomain": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "maxPerUser": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxSiteBytes": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sites": {
+            "items": {
+              "properties": {
+                "accessRole": {
+                  "anyOf": [
+                    {
+                      "const": "owner",
+                      "type": "string"
+                    },
+                    {
+                      "const": "editor",
+                      "type": "string"
+                    },
+                    {
+                      "const": "viewer",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "collaboratorCount": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "contentSha256": {
+                  "type": "string"
+                },
+                "createdAt": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "customDomain": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "customDomainStatus": {
+                  "anyOf": [
+                    {
+                      "const": "none",
+                      "type": "string"
+                    },
+                    {
+                      "const": "pending",
+                      "type": "string"
+                    },
+                    {
+                      "const": "verified",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "customDomainTxtName": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "customDomainTxtValue": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "edgeRevision": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "fileCount": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "hasServerApi": {
+                  "type": "boolean"
+                },
+                "id": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "lastPublishedAt": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "originSessionId": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "ownerDisplayName": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "ownerEmail": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "sizeBytes": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "slug": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "spaMode": {
+                  "type": "boolean"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "updatedAt": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "url": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "visibility": {
+                  "anyOf": [
+                    {
+                      "const": "public",
+                      "type": "string"
+                    },
+                    {
+                      "const": "password",
+                      "type": "string"
+                    },
+                    {
+                      "const": "disabled",
+                      "type": "string"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "id",
+                "slug",
+                "url",
+                "customDomain",
+                "originSessionId",
+                "hasServerApi",
+                "title",
+                "visibility",
+                "spaMode",
+                "fileCount",
+                "sizeBytes",
+                "contentSha256",
+                "edgeRevision",
+                "createdAt",
+                "updatedAt",
+                "lastPublishedAt"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "enabled",
+          "baseDomain",
+          "maxPerUser",
+          "maxSiteBytes",
+          "sites"
+        ],
+        "type": "object"
+      }
+    },
+    "GET /api/sites/:slug": {
+      "domain": "sites",
+      "method": "GET",
+      "path": "/api/sites/:slug",
+      "response": {
+        "properties": {
+          "envVars": {
+            "items": {
+              "properties": {
+                "hasValue": {
+                  "type": "boolean"
+                },
+                "isSecret": {
+                  "type": "boolean"
+                },
+                "key": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "updatedAt": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "value": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "key",
+                "value",
+                "isSecret",
+                "hasValue",
+                "updatedAt"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "site": {
+            "properties": {
+              "accessRole": {
+                "anyOf": [
+                  {
+                    "const": "owner",
+                    "type": "string"
+                  },
+                  {
+                    "const": "editor",
+                    "type": "string"
+                  },
+                  {
+                    "const": "viewer",
+                    "type": "string"
+                  }
+                ]
+              },
+              "collaboratorCount": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "contentSha256": {
+                "type": "string"
+              },
+              "createdAt": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "customDomain": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "customDomainStatus": {
+                "anyOf": [
+                  {
+                    "const": "none",
+                    "type": "string"
+                  },
+                  {
+                    "const": "pending",
+                    "type": "string"
+                  },
+                  {
+                    "const": "verified",
+                    "type": "string"
+                  }
+                ]
+              },
+              "customDomainTxtName": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "customDomainTxtValue": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "edgeRevision": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "fileCount": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "hasServerApi": {
+                "type": "boolean"
+              },
+              "id": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "lastPublishedAt": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "originSessionId": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "ownerDisplayName": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "ownerEmail": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "sizeBytes": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "slug": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "spaMode": {
+                "type": "boolean"
+              },
+              "title": {
+                "type": "string"
+              },
+              "updatedAt": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "url": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "visibility": {
+                "anyOf": [
+                  {
+                    "const": "public",
+                    "type": "string"
+                  },
+                  {
+                    "const": "password",
+                    "type": "string"
+                  },
+                  {
+                    "const": "disabled",
+                    "type": "string"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "slug",
+              "url",
+              "customDomain",
+              "originSessionId",
+              "hasServerApi",
+              "title",
+              "visibility",
+              "spaMode",
+              "fileCount",
+              "sizeBytes",
+              "contentSha256",
+              "edgeRevision",
+              "createdAt",
+              "updatedAt",
+              "lastPublishedAt"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "site",
+          "envVars"
+        ],
+        "type": "object"
+      }
+    },
+    "GET /api/subscription/me": {
+      "domain": "billing",
+      "method": "GET",
+      "path": "/api/subscription/me",
+      "response": {
+        "properties": {
+          "data": {
+            "properties": {
+              "balance": {
+                "properties": {
+                  "period": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "total": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "wallet": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "wallet",
+                  "period",
+                  "total"
+                ],
+                "type": "object"
+              },
+              "subscription": {
+                "properties": {
+                  "monthly_credits": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "paid": {
+                    "type": "boolean"
+                  },
+                  "period_credits": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "period_end": {
+                    "type": "string"
+                  },
+                  "period_start": {
+                    "type": "string"
+                  },
+                  "plan_code": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "plan_name": {
+                    "type": "string"
+                  },
+                  "price_cents": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "status": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "tier": {
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "plan_code",
+                  "plan_name",
+                  "status",
+                  "period_start",
+                  "period_end",
+                  "period_credits",
+                  "monthly_credits",
+                  "price_cents",
+                  "tier",
+                  "paid"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "subscription",
+              "balance"
+            ],
+            "type": "object"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "data"
+        ],
+        "type": "object"
+      }
+    },
+    "POST /api/me/pending-decisions/:id/resolve": {
+      "domain": "pendingDecisions",
+      "method": "POST",
+      "path": "/api/me/pending-decisions/:id/resolve",
+      "response": {
+        "properties": {
+          "decision": {
+            "anyOf": [
+              {
+                "const": "approve",
+                "type": "string"
+              },
+              {
+                "const": "deny",
+                "type": "string"
+              }
+            ]
+          },
+          "id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "idempotentReplay": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": "string"
+          },
+          "resolvedAt": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "const": "turn_permission",
+                "type": "string"
+              },
+              {
+                "const": "connector_write",
+                "type": "string"
+              },
+              {
+                "const": "taskboard",
+                "type": "string"
+              },
+              {
+                "const": "browser_handoff",
+                "type": "string"
+              }
+            ]
+          },
+          "sourceId": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "const": "approved",
+                "type": "string"
+              },
+              {
+                "const": "denied",
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "source",
+          "sourceId",
+          "decision",
+          "status",
+          "idempotentReplay",
+          "resolvedAt"
+        ],
+        "type": "object"
+      },
+      "request": {
+        "properties": {
+          "decision": {
+            "anyOf": [
+              {
+                "const": "approve",
+                "type": "string"
+              },
+              {
+                "const": "deny",
+                "type": "string"
+              }
+            ]
+          },
+          "idempotencyKey": {
+            "type": "string"
+          },
+          "originChannel": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "decision"
+        ],
+        "type": "object"
+      }
+    },
+    "PUT /api/sessions/:id": {
+      "domain": "sessions",
+      "method": "PUT",
+      "path": "/api/sessions/:id",
+      "response": {
+        "anyOf": [
+          {
+            "properties": {
+              "applied": {
+                "const": true,
+                "type": "boolean"
+              },
+              "ok": {
+                "const": true,
+                "type": "boolean"
+              },
+              "updatedAt": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "ok",
+              "applied",
+              "updatedAt"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "applied": {
+                "const": false,
+                "type": "boolean"
+              },
+              "existed": {
+                "const": true,
+                "type": "boolean"
+              },
+              "ok": {
+                "const": true,
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "ok",
+              "applied",
+              "existed"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "request": {
+        "properties": {
+          "_baseSyncedAt": {
+            "type": "number"
+          },
+          "agentId": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "number"
+          },
+          "lastAt": {
+            "type": "number"
+          },
+          "messages": {
+            "items": {},
+            "type": "array"
+          },
+          "modelId": {
+            "type": "string"
+          },
+          "pinned": {
+            "type": "boolean"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    }
+  }
+}

@@ -154,7 +154,7 @@ describe("TeamPanel 团队协作面板", () => {
     expect(screen.queryByText("team-child-0")).not.toBeInTheDocument();
     expect(screen.queryByText("team-child-165")).not.toBeInTheDocument();
     expect(screen.getByText("team-child-204")).toBeInTheDocument();
-    expect(screen.getByText(/已加载 30 \/ 205 步/)).toBeInTheDocument();
+    expect(screen.queryByText(/已加载 30 \/ 205 步/)).toBeNull();
     const scroller = screen.getByTestId("delegate-process-scroller");
     Object.defineProperty(scroller, "clientHeight", { configurable: true, get: () => 200 });
     Object.defineProperty(scroller, "scrollHeight", { configurable: true, get: () => 800 });
@@ -184,9 +184,7 @@ describe("TeamPanel 团队协作面板", () => {
     expect(screen.queryByRole("button", { name: "查看原始完整记录" })).not.toBeInTheDocument();
   });
 
-  test("服务端完整 transcript 的结果、计划与终态事件均不被丢弃", () => {
-    const marker = "EXACT_CHILD_RESULT_FINAL_MARKER";
-    const output = `${"r".repeat(140_000)}${marker}`;
+  test("服务端完整 transcript 的结果与计划改以简洁摘要展示，不裸露原始协议 JSON 事件卡", () => {
     render(
       <TeamPanel
         members={[
@@ -199,11 +197,11 @@ describe("TeamPanel 团队协作面板", () => {
                 toolName: "Read",
                 toolUseBlockId: "child-read",
                 preview: "short preview",
-                output,
+                output: "file content",
                 isError: false,
               },
               { kind: "plan", steps: [{ step: "真实计划步骤", status: "pending" }] },
-              { kind: "final", meta: { stopReason: "end_turn" } },
+              { kind: "final" },
             ],
           }),
         ]}
@@ -213,16 +211,10 @@ describe("TeamPanel 团队协作面板", () => {
 
     fireEvent.click(screen.getByText("团队协作 · 1 个智能体"));
     fireEvent.click(screen.getByText("完整过程队员"));
-    expect(screen.getByRole("button", { name: /Read · 原始结果/ })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /子智能体计划事件/ })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /子智能体终态事件/ })).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: /Read · 原始结果/ }));
-    expect(document.body.textContent).not.toContain(marker);
-    fireEvent.click(screen.getByRole("button", { name: /继续显示原始事件/ }));
-    expect(document.body.textContent).not.toContain(marker);
-    fireEvent.click(screen.getByRole("button", { name: /继续显示原始事件/ }));
-    expect(document.body.textContent).toContain(marker);
+    expect(screen.queryByRole("button", { name: /原始结果/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /子智能体计划事件/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /子智能体终态事件/ })).not.toBeInTheDocument();
+    expect(screen.getByText("真实计划步骤")).toBeInTheDocument();
   });
 });
 

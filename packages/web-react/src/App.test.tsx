@@ -315,7 +315,9 @@ function requestToken(init?: RequestInit): string {
 }
 
 async function openAgentPicker() {
-  fireEvent.click(await screen.findByRole('button', { name: /全能助手|切换智能体/ }))
+  const more = await screen.findByTestId('header-overflow-trigger')
+  fireEvent.pointerDown(more, { button: 0, pointerType: 'mouse' })
+  fireEvent.click(await screen.findByTestId('overflow-agent-item'))
   await screen.findByRole('dialog', { name: '选择智能体' })
 }
 
@@ -1218,7 +1220,7 @@ describe('Aurora v5 skeleton — demo mode (no network)', () => {
     vi.stubGlobal('fetch', noFetch as unknown as typeof fetch)
 
     render(<App />)
-    expect(screen.getByText(/帮我把商业版聊天界面基于 ChatGPT 的设计语言完全重做/)).toBeInTheDocument()
+    expect(await screen.findByText(/帮我把商业版聊天界面基于 ChatGPT 的设计语言完全重做/)).toBeInTheDocument()
 
     fireEvent.click(screen.getByText('锂金属负极枝晶抑制机理综述'))
     await waitFor(() =>
@@ -2224,6 +2226,7 @@ describe('经验分享入口跟随 feature_community_blog（OCV5-577）', () => 
       if (u.includes('/api/me')) {
         return okJson({ user: { id: 'u1', email: 'a@b.com', role: 'user', display_name: 'Alice', credits: '300' } })
       }
+      if (u.includes('/api/tutorials')) return okJson({ tutorials: [], nextCursor: null, total: 0 })
       return okJson({})
     }) as unknown as FetchMock
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
@@ -2231,9 +2234,16 @@ describe('经验分享入口跟随 feature_community_blog（OCV5-577）', () => 
     render(<App />)
   }
 
-  test('已登录（静默续期）且开关打开：侧栏出现「经验分享」入口', async () => {
+  test('已登录（静默续期）且开关打开：经验分享收口至帮助与案例，侧栏一级导航不重复渲染 blog-nav', async () => {
     bootLoggedIn(true)
-    expect(await screen.findByTestId('blog-nav')).toBeInTheDocument()
+    expect(await screen.findByTestId('manage-nav')).toBeInTheDocument()
+    expect(screen.getByTestId('marketplace-nav')).toBeInTheDocument()
+    expect(screen.queryByTestId('blog-nav')).toBeNull()
+    const accountTrigger = screen.getByRole('button', { name: '账号菜单' })
+    fireEvent.pointerDown(accountTrigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('menuitem', { name: /帮助与案例/ }))
+    expect(await screen.findByRole('tab', { name: '经验分享' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: '经验分享' })).toBeInTheDocument()
   })
 
   test('未登录访客打开 tab=blog 深链：开关打开时进入经验分享', async () => {
@@ -2268,5 +2278,57 @@ describe('经验分享入口跟随 feature_community_blog（OCV5-577）', () => 
       expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/api/public/config'))).toBe(true),
     )
     expect(screen.queryByTestId('blog-nav')).toBeNull()
+  })
+})
+
+describe('OCV5-845: 订阅弹窗关闭不级联关设置，再次点设置不误弹订阅', () => {
+  test('顶栏打开订阅 → 点订阅关闭仅关订阅保留设置 → 关设置后再点「设置」不误弹订阅弹窗', async () => {
+    fetchMock = routedFetch()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await loginViaUi()
+    await waitFor(() => expect(screen.getByTestId('header-subscription-btn')).toBeInTheDocument())
+
+    // 1) 点击顶栏订阅入口：设置中心与套餐订阅弹窗同时打开。
+    fireEvent.click(screen.getByTestId('header-subscription-btn'))
+    const subDialog = await screen.findByRole('dialog', { name: '套餐订阅' })
+    expect(screen.getByRole('heading', { name: '设置', hidden: true })).toBeInTheDocument()
+
+    // 等 Radix DismissableLayer 的 setTimeout(0) 完成 document pointerdown 绑定。
+    await act(async () => {
+      await new Promise((r) => window.setTimeout(r, 20))
+    })
+
+    // 2) 点击套餐订阅弹窗的关闭按钮（模拟真实指针事件序列）：只关订阅弹窗，设置中心保持打开。
+    const closeSubBtn = within(subDialog).getByRole('button', { name: '关闭' })
+    fireEvent.pointerDown(closeSubBtn, { button: 0, pointerType: 'mouse', isPrimary: true })
+    fireEvent.mouseDown(closeSubBtn, { button: 0 })
+    fireEvent.pointerUp(closeSubBtn, { button: 0, pointerType: 'mouse', isPrimary: true })
+    fireEvent.mouseUp(closeSubBtn, { button: 0 })
+    fireEvent.click(closeSubBtn, { button: 0 })
+    await act(async () => {
+      await new Promise((r) => window.setTimeout(r, 20))
+    })
+
+    expect(screen.queryByRole('dialog', { name: '套餐订阅' })).toBeNull()
+    const settingsDialog = screen.getByRole('dialog', { name: '设置' })
+    expect(settingsDialog).toBeInTheDocument()
+
+    // 3) 关闭设置中心（SettingsCenter 被卸载）。
+    const closeSettingsBtn = within(settingsDialog).getByRole('button', { name: '关闭' })
+    fireEvent.click(closeSettingsBtn)
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '设置' })).toBeNull())
+
+    // 4) 从侧栏账号菜单再次点击「设置」：应直接进入设置（偏好页），不得再次自动弹出套餐订阅弹窗。
+    const accountTrigger = screen.getByRole('button', { name: '账号菜单' })
+    fireEvent.pointerDown(accountTrigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('menuitem', { name: /^设置$/ }))
+
+    await screen.findByRole('dialog', { name: '设置' })
+    await act(async () => {
+      await new Promise((r) => window.setTimeout(r, 20))
+    })
+    expect(screen.queryByRole('dialog', { name: '套餐订阅' })).toBeNull()
   })
 })

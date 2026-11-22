@@ -5,16 +5,14 @@ import {
   Kanban,
   Library,
   List,
-  Menu,
   MoreHorizontal,
-  PanelLeft,
   Plus,
   Settings,
   Settings2,
   Workflow,
   X,
 } from 'lucide-react'
-import { type ReactNode, useEffect, useMemo, useState } from 'react'
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import type { BoardViewParam } from '../../hooks/useAppRoute'
 import { useMdViewport } from '../../hooks/useMdViewport'
 import { useProjectScope } from '../../hooks/useProjectScope'
@@ -54,6 +52,8 @@ import { BoardColumns } from './BoardColumns'
 import { BoardSettingsPanel } from './BoardSettingsPanel'
 import { CostStatsView } from './CostStatsView'
 import { ProjectSettings } from './ProjectSettings'
+import { AtelierIcon } from '../ui/AtelierIcons'
+import { WorkspaceShellHeader } from '../ui/WorkspaceShellHeader'
 import { StageSettings } from './StageSettings'
 import { TemplateLibrary } from './TemplateLibrary'
 import { TicketDrawer } from './TicketDrawer'
@@ -86,6 +86,9 @@ export function TaskboardView({
   sidebarCollapsed,
   onExpandSidebar,
   onOpenProjectSettings,
+  sessionUnreadCount,
+  updateAvailable,
+  onReloadForUpdate,
 }: {
   auth: AuthSession
   view: BoardViewParam
@@ -100,6 +103,9 @@ export function TaskboardView({
   sidebarCollapsed?: boolean
   onExpandSidebar?: () => void
   onOpenProjectSettings?: (projectId: string) => void
+  sessionUnreadCount?: number
+  updateAvailable?: boolean
+  onReloadForUpdate?: () => void
 }) {
   const projectScope = useProjectScope()
   const workQuery = boardWorkQuery(projectScope.scope)
@@ -158,6 +164,25 @@ export function TaskboardView({
     (detailTicket.identifier === ticketId || detailTicket.id === ticketId) ? detailTicket : null
   const actionTicket = ownedDetail && (!selected || ownedDetail.version > selected.version)
     ? ownedDetail : selected
+
+  // 从「待拍板」或 URL 深链直达具体任务单时，若当前未选工作项目或停在别的项目，
+  // 详情到达后自动切到该任务单所属工作项目（每张单仅自动对齐一次，不抢用户的手动切换）。
+  const autoScopedTicketRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!ticketId) {
+      autoScopedTicketRef.current = null
+      return
+    }
+    if (!ownedDetail?.projectId || autoScopedTicketRef.current === ticketId) return
+    if (lockedProjectId === ownedDetail.projectId) {
+      autoScopedTicketRef.current = ticketId
+      return
+    }
+    if (projectScope.workProjects.some((p) => p.id === ownedDetail.projectId)) {
+      autoScopedTicketRef.current = ticketId
+      projectScope.setToken(ownedDetail.projectId)
+    }
+  }, [ticketId, ownedDetail?.projectId, lockedProjectId, projectScope])
 
   const openTicket = (ticket: Ticket) => onOpenTicket(ticket.identifier)
 
@@ -587,17 +612,28 @@ export function TaskboardView({
       className={
         mobile
           ? 'flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-4'
-          : 'mx-4 mb-3 flex flex-col gap-3 rounded-xl border border-border bg-surface p-3'
+          : 'oc-surface-card mx-4 mt-3 mb-2 flex flex-col gap-3.5 rounded-xl p-4'
       }
     >
-      <div className="flex items-start justify-between gap-2">
-        <div>
-          <h2 className={mobile ? 'text-title font-semibold text-fg' : 'text-section font-semibold text-fg'}>
-            新建单据
-          </h2>
-          <p className="mt-1 text-caption text-muted">
-            先记入积压最稳妥；确定要马上处理时再选直接开工。
-          </p>
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex min-w-0 items-start gap-2.5">
+          <span className="oc-icon-badge oc-icon-badge-accent mt-0.5 size-8 rounded-lg" aria-hidden>
+            <Plus size={15} />
+          </span>
+          <div className="min-w-0">
+            <h2
+              className={
+                mobile
+                  ? 'text-title font-semibold tracking-tight text-fg'
+                  : 'text-section font-semibold tracking-tight text-fg'
+              }
+            >
+              新建单据
+            </h2>
+            <p className="mt-0.5 text-caption text-muted">
+              先记入积压最稳妥；确定要马上处理时再选直接开工。
+            </p>
+          </div>
         </div>
         {!mobile && (
           <IconButton
@@ -641,21 +677,23 @@ export function TaskboardView({
           placeholder="复现步骤 / 验收标准 / 范围内外"
           className={
             mobile
-              ? 'min-h-28 w-full rounded-lg border border-border-control bg-surface px-3.5 py-2.5 text-base leading-relaxed text-fg outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-ring'
-              : 'min-h-20 w-full rounded-lg border border-border-control bg-surface px-3.5 py-2.5 text-base leading-relaxed text-fg outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-ring md:text-sm'
+              ? 'oc-field-control min-h-28 w-full rounded-lg border border-border-control bg-surface px-3.5 py-2.5 text-base leading-relaxed text-fg outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-ring'
+              : 'oc-field-control min-h-20 w-full rounded-lg border border-border-control bg-surface px-3.5 py-2.5 text-base leading-relaxed text-fg outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-ring md:text-sm'
           }
           value={draftBody}
           onChange={(e) => setDraftBody(e.target.value)}
         />
       </Field>
-      <div className="flex flex-col gap-1.5">
-        <span className="text-meta font-medium text-muted">下一步</span>
-        {nextStepControl}
+      <div className="oc-surface-recessed flex flex-col gap-2 rounded-xl p-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="text-meta font-medium text-fg">下一步</span>
+          {nextStepControl}
+        </div>
         <p className="text-caption text-muted">
           积压里的单 AI 不会处理；直接开工会进入流水线第一站。
         </p>
       </div>
-      <div className={mobile ? 'mt-auto flex gap-2' : 'flex gap-2'}>
+      <div className={mobile ? 'mt-auto flex gap-2' : 'flex items-center gap-2 border-t border-border/60 pt-3'}>
         <Button
           type="button"
           size="sm"
@@ -833,30 +871,21 @@ export function TaskboardView({
 
   return (
     <div data-testid="taskboard-root" className="flex h-full min-h-0 flex-col bg-bg">
-      <header className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border px-3 pb-2.5 header-safe-t md:h-14 md:flex-nowrap md:border-b-0">
-        <div className="order-1 flex min-w-0 items-center gap-2">
-          <IconButton
-            data-product-control
-            onClick={onOpenMobileNav}
-            aria-label="打开菜单"
-            shape="square"
-            className="md:hidden"
-          >
-            <Menu size={18} />
-          </IconButton>
-          {sidebarCollapsed && (
-            <IconButton
-              data-product-control
-              onClick={onExpandSidebar}
-              aria-label="展开侧栏"
-              shape="square"
-              className="hidden md:inline-flex"
-            >
-              <PanelLeft size={18} />
-            </IconButton>
-          )}
-          <Kanban size={16} className="shrink-0 text-faint" />
-          <h1 className="truncate text-title font-semibold">任务面板</h1>
+      <WorkspaceShellHeader
+        onOpenMobileNav={onOpenMobileNav}
+        sidebarCollapsed={sidebarCollapsed}
+        onExpandSidebar={onExpandSidebar}
+        sessionUnreadCount={sessionUnreadCount}
+        updateAvailable={updateAvailable}
+        onReloadForUpdate={onReloadForUpdate}
+        className="oc-surface-glass border-x-0 border-t-0"
+        contentClassName="flex-wrap gap-2 px-3 py-2 md:flex-nowrap md:px-4"
+      >
+        <div className="order-1 flex min-w-0 items-center gap-2.5">
+          <span className="oc-icon-badge oc-icon-badge-accent size-7 rounded-lg" aria-hidden>
+            <AtelierIcon name="tasks" size={15} />
+          </span>
+          <h1 className="truncate text-title font-semibold tracking-tight text-fg">任务面板</h1>
         </div>
         <div
           data-testid="taskboard-responsive-toolbar"
@@ -871,7 +900,7 @@ export function TaskboardView({
               面板组件只挂一份:桌面显示它们自带的按钮,移动端隐藏按钮、由菜单受控打开
               (Sheet 走 Portal,父级 display:none 不影响)。 */}
           {!desktop && configMenu}
-          <div className={desktop ? 'flex shrink-0 items-center gap-1' : 'hidden'}>
+          <div className={desktop ? 'flex shrink-0 items-center gap-1.5' : 'hidden'}>
             <ProjectSettings
               auth={auth}
               agents={board.agents}
@@ -931,7 +960,7 @@ export function TaskboardView({
         <Button
           type="button"
           size="sm"
-          variant="secondary"
+          variant="primary"
           className="order-2 ml-auto shrink-0 md:order-3 md:ml-0"
           data-testid="ticket-create-toggle"
           disabled={!board.projectId}
@@ -941,9 +970,9 @@ export function TaskboardView({
           <Plus size={14} />
           新建单据
         </Button>
-      </header>
+      </WorkspaceShellHeader>
 
-      <div className="flex flex-wrap items-center gap-2 px-4 pb-2">
+      <div className="flex flex-wrap items-center gap-2 border-b border-border/60 bg-surface/40 px-4 py-2">
         <Tabs
           value={sectionView}
           onValueChange={switchSection}
@@ -959,18 +988,37 @@ export function TaskboardView({
         />
         {taskView && (
           <div className="ml-auto flex items-center gap-2">
-            <Button
+            <button
               type="button"
-              size="sm"
-              variant="ghost"
               data-testid="taskboard-layout-toggle"
               aria-label={effectiveTaskView === 'board' ? '切换到列表展示' : '切换到看板展示'}
               title={effectiveTaskView === 'board' ? '切换到列表展示' : '切换到看板展示'}
               onClick={toggleTaskView}
+              className="oc-surface-recessed oc-btn-tactile inline-flex shrink-0 items-center gap-0.5 rounded-full p-0.5 text-caption font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:min-h-11"
             >
-              {effectiveTaskView === 'board' ? <List size={15} /> : <Kanban size={15} />}
-              <span className="hidden md:inline">{effectiveTaskView === 'board' ? '列表' : '看板'}</span>
-            </Button>
+              <span
+                aria-hidden
+                className={
+                  effectiveTaskView === 'board'
+                    ? 'oc-segmented-thumb inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-fg'
+                    : 'inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-muted'
+                }
+              >
+                <Kanban size={13} />
+                <span className="hidden md:inline">看板</span>
+              </span>
+              <span
+                aria-hidden
+                className={
+                  effectiveTaskView === 'list'
+                    ? 'oc-segmented-thumb inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-fg'
+                    : 'inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-muted'
+                }
+              >
+                <List size={13} />
+                <span className="hidden md:inline">列表</span>
+              </span>
+            </button>
             {effectiveTaskView === 'board' && (
               <Select
                 aria-label="看板类型"
@@ -992,7 +1040,7 @@ export function TaskboardView({
         id={panelId}
         role="tabpanel"
         aria-labelledby={`taskboard-section-tab-${sectionView}`}
-        className="flex min-h-0 flex-1 flex-col"
+        className="flex min-h-0 flex-1 flex-col pt-3"
       >
         {view === 'cost' ? (
           <CostStatsView auth={auth} />

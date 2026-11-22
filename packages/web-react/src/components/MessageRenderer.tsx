@@ -11,6 +11,11 @@ import { ReadOnlySystemActionsBoundary } from "./iui/ReadOnlySystemActionsBounda
  */
 import { returnStrayRowsToOwnerTurn } from "../lib/chat/order";
 import { FirstTextPaintCommitProbe } from "./chat/FirstTextPaintCommitProbe";
+import {
+  ScrollToBottomButton,
+  shouldShowScrollToBottom,
+  useScrollToBottomVisibility,
+} from "./chat/ScrollToBottomButton";
 import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isInteractiveToolMessage, isProcessMessage, keepDistinctActivity, processSections, promptShadowedToolIds, turnOutcome } from "./chat/ProcessDisclosure";
 import { ChevronDown, ChevronUp, Info, X } from "lucide-react";
 import {
@@ -76,9 +81,9 @@ import {
   TurnStatusCard,
   UserCard,
 } from "./chat/cards";
-import { AgentGroupCard } from "./chat/AgentGroupCard";
 import { TimelineEagerMediaContext } from "./chat/timelineEager";
 import {
+  AgentGroupCard,
   GeneratingPlaceholderCard,
   PermissionCard,
   PermissionPromptHost,
@@ -88,8 +93,7 @@ import {
   type PermissionRespond,
   isAwaitingPermissionPrompt,
 } from "./chat/permissionPromptState";
-import { PermissionToolReopenContext, ToolCardSlot } from "./chat/toolCardSlot";
-import { reopenPermissionUi, yieldActiveModal } from "../lib/chat/permissionPopupCoordinator";
+import { ToolCardSlot } from "./chat/toolCardSlot";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
 import { currentTurnStartIndex, projectVisibleAssistantRows, splitStoppedNarration, turnFinalAssistantFlags, turnRatingFlags, turnRecoveryParents } from "./chat/turnSegment";
 import {
@@ -99,7 +103,7 @@ import {
   loadedArchivedMetrics,
   type VisibleVirtualRowAnchor,
 } from "./chat/archivePaging";
-import { JournalHydrationRetry, PartialHistorySkeleton } from "./chat/HistorySkeleton";
+import { PartialHistorySkeleton } from "./chat/HistorySkeleton";
 import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput } from "./tool/format";
 import { Alert, IconButton, Input, Spinner } from "./ui";
@@ -296,7 +300,7 @@ const MessageRendererInner = memo(
         return (
           <TapeBackedCard>
             <PlanCard msg={message} tokenUsage={tokenUsage} />
-            <ExactTapeRecordDisclosure messages={[message]} label="计划" />
+            {readOnly && <ExactTapeRecordDisclosure messages={[message]} label="计划" />}
           </TapeBackedCard>
         );
       case "goal":
@@ -306,7 +310,7 @@ const MessageRendererInner = memo(
         return (
           <TapeBackedCard>
             <p className="whitespace-pre-wrap break-words text-sm text-fg">{message.text || "会话目标"}</p>
-            <ExactTapeRecordDisclosure messages={[message]} label="目标" />
+            {readOnly && <ExactTapeRecordDisclosure messages={[message]} label="目标" />}
           </TapeBackedCard>
         );
       case "permission": {
@@ -403,15 +407,15 @@ function ExactTapeRecordDisclosure({
         {open ? `收起原始${label}记录` : `查看原始${label}记录`}
       </button>
       {open && (
-        <div className="mt-1 rounded-md border border-border bg-surface px-3 py-2">
-          <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-muted">
+        <div className="oc-surface-recessed mt-1 rounded-lg border border-border/70 px-3 py-2">
+          <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words font-mono text-caption leading-relaxed text-muted">
             {serialized.slice(0, visibleChars)}
           </pre>
           {visibleChars < serialized.length && (
             <button
               type="button"
               onClick={() => setVisibleChars((value) => value + RUNTIME_TEXT_STEP)}
-              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+              className="oc-btn-tactile mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
             >
               继续显示原始记录
             </button>
@@ -437,28 +441,28 @@ function RuntimeEventCard({ message }: { message: ChatMessage }) {
   const [visibleChars, setVisibleChars] = useState(RUNTIME_TEXT_STEP);
   const serialized = open ? JSON.stringify(raw, null, 2) : "";
   return (
-    <div className="overflow-hidden rounded-lg border border-border bg-surface animate-in">
+    <div className="oc-surface-card overflow-hidden rounded-xl animate-in">
       <button
         type="button"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
-        className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-meta hover:bg-hover [@media(hover:none)]:min-h-11"
+        className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-meta transition-colors hover:bg-hover/70 [@media(hover:none)]:min-h-11"
       >
         <span className="size-1.5 shrink-0 rounded-full bg-faint" />
         <span className="min-w-0 flex-1 truncate text-muted">{label}</span>
         {message._runtimeSource && <span className="shrink-0 text-caption text-faint">{message._runtimeSource}</span>}
-        <span className="text-faint">{open ? "收起" : "查看原始记录"}</span>
+        <span className="text-caption text-faint">{open ? "收起" : "查看原始记录"}</span>
       </button>
       {open && (
-        <div className="border-t border-border px-3.5 py-2.5">
-          <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-muted">
+        <div className="oc-surface-recessed border-t border-border/70 px-3.5 py-2.5">
+          <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words font-mono text-caption leading-relaxed text-muted">
             {serialized.slice(0, visibleChars)}
           </pre>
           {visibleChars < serialized.length && (
             <button
               type="button"
               onClick={() => setVisibleChars((value) => value + RUNTIME_TEXT_STEP)}
-              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+              className="oc-btn-tactile mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
             >
               继续显示原始记录
             </button>
@@ -715,10 +719,10 @@ function DeferredTapeRecordCard({
           }}
           className="text-muted underline-offset-2 hover:text-fg hover:underline"
         >
-          {isUserPayload ? "完整用户消息加载失败，点击继续" : "真实记录加载失败，点击继续"}
+          {isUserPayload ? "完整消息加载失败，点击重新加载" : "内容加载失败，点击重新加载"}
         </button>
       ) : (
-        <span>{isUserPayload ? "正在读取完整用户消息…" : "正在读取真实 Agent 记录…"}</span>
+        <span>{isUserPayload ? "正在加载完整消息…" : "正在加载内容…"}</span>
       )}
     </div>
   );
@@ -1348,13 +1352,7 @@ function coalesceTeam(
 // hasMore / loadOlder button (scroll never issues a network page).
 export const TIMELINE_INITIAL_TAIL_ITEMS = 80;
 
-export function shouldShowScrollToBottom(
-  following: boolean | undefined,
-  messageCount: number,
-  distance = Number.POSITIVE_INFINITY,
-): boolean {
-  return messageCount > 0 && following === false && distance > 80;
-}
+export { shouldShowScrollToBottom };
 const TIMELINE_WINDOW_EXPAND_ITEMS = 80;
 /** Safety stop for a cursor that keeps moving. One manual page remains after this. */
 const LIVE_UNITS_AUTO_PAGE_CAP = 40;
@@ -1524,7 +1522,7 @@ export type MessageListArchive = {
   archivedThroughSeq?: number;
   /** 云端加载进行中(按钮转 loading 态、禁用)。 */
   loading: boolean;
-  /** 上次云端加载失败(按钮转「加载失败，点击继续」,点击即重试)。 */
+  /** 上次云端加载失败(按钮转「加载失败，点击重试」,点击即重试)。 */
   error: boolean;
   /** 拉更早一页归档(App 接线 loadOlderHistory + 前插后视口保持)。 */
   onLoadOlder: () => void | Promise<void>;
@@ -1562,8 +1560,6 @@ export function MessageList({
   turnActivity,
   transientNotice,
   historyLoading = false,
-  journalDegraded = false,
-  onRetryJournal,
   archive,
   cb,
   onRespondPermission,
@@ -1582,13 +1578,10 @@ export function MessageList({
   liveTurnUsage?: { clientMessageId: string; usage: LiveTurnTokenUsageSnapshot };
   /** 本轮活动快照（TurnActivity 阶段反馈）；null=无活跃轮。*/
   turnActivity?: TurnActivityInfo | null;
-  /** 会话级 transient 软提示（"正在发送…"等，非消息卡片，末尾 info 条渲染）。*/
+  /** 会话级 transient 软提示（非消息卡片，末尾 info 条渲染）。*/
   transientNotice?: { text: string } | null;
-  /** 已有部分消息可见，但 canonical history 仍在加载。Journal 水合不再占用此位。 */
+  /** 已有部分消息可见，但 canonical history 仍在加载。 */
   historyLoading?: boolean;
-  /** Background live-journal hydrate degraded; show an explicit retry. */
-  journalDegraded?: boolean;
-  onRetryJournal?: () => void;
   /** 归档分页上下文；缺省=无归档(仅本地翻页)。*/
   archive?: MessageListArchive | null;
   cb: CardCallbacks;
@@ -1668,7 +1661,13 @@ export function MessageList({
   const didSnapToBottomRef = useRef(false);
   const followBottomRefBox = useRef(followBottomRef);
   followBottomRefBox.current = followBottomRef;
-  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [showScrollToBottom, setShowScrollToBottom] = useScrollToBottomVisibility({
+    scrollParent,
+    listRootRef,
+    followBottomRef,
+    sessionId,
+    messageCount: messages.length,
+  });
   const [findQuery, setFindQuery] = useState("");
   const [findCursor, setFindCursor] = useState(0);
   const [findPin, setFindPin] = useState<FindPinState | null>(null);
@@ -1823,36 +1822,6 @@ export function MessageList({
       if (frame) cancelAnimationFrame(frame);
     };
   }, [findPin, scrollParent, followBottomRef, windowVersion]);
-  useEffect(() => {
-    const el = scrollParent;
-    if (!el || !followBottomRef) {
-      setShowScrollToBottom(false);
-      return;
-    }
-    let frame = 0;
-    const sync = () => {
-      frame = 0;
-      // Store only visibility, not pixel distance: scrolling within the same
-      // state must not force the whole MessageList to re-render every frame.
-      setShowScrollToBottom(shouldShowScrollToBottom(
-        followBottomRef.current, messages.length, el.scrollHeight - el.clientHeight - el.scrollTop,
-      ));
-    };
-    const schedule = () => {
-      if (!frame) frame = requestAnimationFrame(sync);
-    };
-    sync();
-    el.addEventListener("scroll", schedule, { passive: true });
-    // Viewport/keyboard or content changes need not produce a scroll event.
-    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(schedule);
-    observer?.observe(el);
-    if (listRootRef.current) observer?.observe(listRootRef.current);
-    return () => {
-      el.removeEventListener("scroll", schedule);
-      observer?.disconnect();
-      cancelAnimationFrame(frame);
-    };
-  }, [scrollParent, followBottomRef, sessionId, messages.length]);
   const rowHeightCacheRef = useRef<Map<string, number>>(rowHeightBucket(sessionId));
   const visibleKeysRef = useRef<string[]>([]);
   const eagerPayloadKeysRef = useRef<Set<string> | null>(null);
@@ -2711,12 +2680,12 @@ export function MessageList({
         }}
         disabled={liveUnitsBusy}
         aria-busy={liveUnitsBusy}
-        className="inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
+        className="oc-btn-tactile oc-btn-secondary-craft inline-flex items-center gap-1.5 rounded-full border border-border/80 bg-surface px-3.5 py-1 text-caption font-medium text-muted shadow-soft transition-colors hover:border-border-strong hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
       >
         {liveUnitsBusy
           ? <><Spinner size={12} /> 加载中…</>
           : liveAttention === "error"
-            ? <span className="text-danger">加载失败，点击继续</span>
+            ? <span className="text-danger">加载失败，点击重试</span>
             : "加载更早的处理步骤"}
       </button>
     </div>
@@ -2852,7 +2821,7 @@ export function MessageList({
             className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3.5 py-2 text-meta text-muted"
             data-testid="corrupt-message-placeholder"
           >
-            此条消息数据结构异常，已跳过渲染
+            该条内容暂时无法显示
           </div>
         </MessageBoundary>
       );
@@ -2893,14 +2862,14 @@ export function MessageList({
         onClick={windowStart > 0 ? expandLocalWindow : hasOlderHistory ? requestOlderArchive : undefined}
         disabled={!canRevealOlder || Boolean(archive?.loading) || archiveQueued}
         aria-busy={hasOlderHistory && windowStart === 0 && (Boolean(archive?.loading) || archiveQueued)}
-        className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
+        className="oc-btn-tactile oc-btn-secondary-craft mx-auto inline-flex items-center gap-1.5 rounded-full border border-border/80 bg-surface px-3.5 py-1 text-caption font-medium text-muted shadow-soft transition-colors hover:border-border-strong hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
       >
         {!canRevealOlder
           ? "已到最早记录"
           : windowStart === 0 && (archive?.loading || archiveQueued)
           ? <><Spinner size={12} /> 加载中…</>
           : windowStart === 0 && archive?.error
-            ? <span className="text-danger">加载失败，点击继续</span>
+            ? <span className="text-danger">加载失败，点击重试</span>
             : windowStart > 0
               ? `查看更早历史记录（还有 ${windowStart} 条）`
               : legacyArchivedRemaining > 0
@@ -2929,9 +2898,6 @@ export function MessageList({
         </Alert>
       )}
       {historyLoading && <PartialHistorySkeleton />}
-      {journalDegraded && !historyLoading && onRetryJournal && (
-        <JournalHydrationRetry onRetry={onRetryJournal} />
-      )}
     </div>
   );
 
@@ -2940,58 +2906,18 @@ export function MessageList({
     .filter((message) => message.role === "permission")
     .map((message) => `${message.requestId}:${message._resolved}:${message._controlPending}:${message._inputTruncated}`)
     .join("|");
-  const pendingPrompts = useMemo(
-    () => (readOnly ? [] : messages.filter((message) => isAwaitingPermissionPrompt(message))),
-    [pendingSig, readOnly, messages],
-  );
-  const dockReopenedRef = useRef<{ sessionId: string | undefined; requestId: string } | null>(null);
-  useEffect(() => {
-    const active = dockReopenedRef.current;
-    if (!active) return;
-    if (
-      active.sessionId !== sessionId ||
-      !pendingPrompts.some((message) => message.requestId === active.requestId)
-    ) {
-      yieldActiveModal(active.requestId);
-      dockReopenedRef.current = null;
-    }
-  }, [sessionId, pendingPrompts]);
-  useEffect(() => () => {
-    if (dockReopenedRef.current) {
-      yieldActiveModal(dockReopenedRef.current.requestId);
-      dockReopenedRef.current = null;
-    }
-  }, []);
-  // OCV5-421: pendingPrompts 依赖每次渲染新过滤出的 messages,本身不缓存;以前 Context value 也跟着
-  // 每个流式 notify 换新,所有已挂载的工具卡一起重渲。value 只按映射内容换新。
-  const reopenKey = pendingPrompts
-    .map((message) => (message.requestId && message.toolUseId ? `${message.toolUseId}=${message.requestId}` : ""))
-    .join("|");
-  const permissionReopen = useMemo(() => {
-    const requestIdByToolUseId = new Map<string, string>();
-    for (const pair of reopenKey.split("|")) {
-      const at = pair.indexOf("=");
-      if (at > 0) requestIdByToolUseId.set(pair.slice(0, at), pair.slice(at + 1));
-    }
-    return { requestIdByToolUseId };
-  }, [reopenKey]);
 
   // App/admin pass an explicit null during the callback-ref's first commit.
   // Do not mount the transcript in that frame; omitted/undefined remains the
   // lightweight test/non-scroll surface contract.
   if (scrollParent === null) {
-    return (
-      <div className="mx-auto flex max-w-3xl items-center justify-center px-5 py-8 text-muted" role="status">
-        <Spinner size={14} />
-        <span className="ml-2 text-xs">正在准备会话…</span>
-      </div>
-    );
+    return null;
   }
 
   // Empty data must still show loading/activity chrome. A cold mobile tab can
   // have a real history request or active turn with no canonical row yet.
   if (scrollParent && visibleItems.length === 0 && (
-    sending || historyLoading || transientNotice || (journalDegraded && onRetryJournal)
+    sending || historyLoading || transientNotice
   )) {
     return <div className="mx-auto max-w-3xl px-5 py-8">{footer}</div>;
   }
@@ -3049,41 +2975,20 @@ export function MessageList({
   };
   return (
     <ReadOnlySystemActionsBoundary readOnly={readOnly}>
-    <PermissionToolReopenContext.Provider value={permissionReopen}>
     <>
     {!readOnly && pendingSig.length > 0 ? (
-      <PermissionPromptHost messages={messages} onRespond={onRespondPermission} readOnly={readOnly} sending={sending} sessionId={sessionId} />
-    ) : null}
-    {pendingPrompts.length > 0 ? (
-      <div
-        data-testid="pending-permission-dock"
-        className="sticky top-0 z-10 mx-auto flex max-w-3xl flex-wrap items-center gap-2 bg-bg/95 px-5 py-2"
-      >
-        <span className="text-caption text-muted">待回答</span>
-        {pendingPrompts.map((message) => (
-          <button
-            key={message.requestId ?? message.id}
-            type="button"
-            className="rounded-full bg-accent-soft px-2.5 py-1 text-caption text-accent [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
-            onClick={() => {
-              if (message.requestId) {
-                dockReopenedRef.current = { sessionId, requestId: message.requestId };
-                reopenPermissionUi(message.requestId);
-              }
-            }}
-          >
-            {message.toolName === "AskUserQuestion"
-              ? "打开提问"
-              : message.toolName === "ExitPlanMode"
-                ? "打开计划"
-                : "打开审批"}
-          </button>
-        ))}
-      </div>
+      <PermissionPromptHost
+        messages={messages}
+        onRespond={onRespondPermission}
+        readOnly={readOnly}
+        sending={sending}
+        sessionId={sessionId}
+        scrollParent={scrollParent}
+      />
     ) : null}
     {find ? (
       <div
-        className="sticky top-0 z-10 mx-auto flex max-w-3xl flex-wrap items-center gap-1.5 bg-bg/95 px-5 py-2"
+        className="oc-surface-glass sticky top-0 z-10 mx-auto flex max-w-3xl flex-wrap items-center gap-1.5 rounded-b-xl px-5 py-2 shadow-soft"
         onKeyDown={stopFindKeys}
         onPointerDown={stopFindKeys}
         onTouchStart={stopFindKeys}
@@ -3179,13 +3084,14 @@ export function MessageList({
               {archive?.loading || archiveQueued
                 ? <><Spinner size={12} /> 加载中…</>
                 : archive?.error
-                  ? <span className="text-danger">加载失败，点击继续</span>
+                  ? <span className="text-danger">加载失败，点击重试</span>
                   : "搜更早"}
             </button>
           </div>
         ) : null}
       </div>
     ) : null}
+    {!find ? <div aria-hidden data-testid="timeline-top-fade" className="pointer-events-none sticky top-0 z-10 -mb-3 h-3 bg-gradient-to-b from-bg to-transparent" /> : null}
     <div
       ref={listRootRef}
       className="mx-auto max-w-3xl space-y-4 px-5 py-8"
@@ -3249,52 +3155,26 @@ export function MessageList({
       ) : null}
       {olderLiveStepsKey === null ? olderLiveStepsControl : null}
       {footer}
-      {/* 回到底部 FAB。它是滚动内容(也是 ResizeObserver root)的子节点,所以必须
-          **零高度、常驻挂载**,只用 opacity/pointer-events 切可见。若随 following
-          挂载/卸载,按钮自身 52px 就是 scrollHeight 的一部分:滑回底部 → following
-          翻真 → 按钮卸载 → scrollHeight 收缩 → 浏览器 clamp scrollTop → 篱笆仍在
-          (hadUserIntent)→ 零容差判成用户离底 → following 翻假 → 按钮再挂载……
-          几何自激,表现为每次滚回底部都弹一下(2026-09-07 rel-22a377d7f 复现)。
-          -mt-4 抵消 space-y-4 给前一个兄弟加的 16px 下边距,滚动内容总高与无按钮时一致。 */}
       {followBottomRef?.jumpToBottom && messages.length > 0 && (
-        <div
-          aria-hidden={!showScrollToBottom}
-          data-testid="scroll-to-bottom-dock"
-          data-visible={showScrollToBottom ? "true" : "false"}
-          className="sticky bottom-4 z-10 -mt-4 h-0 overflow-visible"
-        >
-          <button
-            type="button"
-            data-testid="scroll-to-bottom"
-            aria-label="回到底部"
-            tabIndex={showScrollToBottom ? 0 : -1}
-            // 移动端 44px 圆钮叠在末行正文/状态标签右侧:加一圈页面底色描边把它从底下的文字里
-            // 抬出来,并在触屏下挪进列表根的 px-5 边距(-right-3),少压 12px 正文。
-            className={
-              "absolute bottom-0 right-0 flex size-9 items-center justify-center rounded-full bg-fg text-bg shadow-float ring-[3px] ring-bg transition-opacity duration-200 [@media(hover:none)]:-right-3 [@media(hover:none)]:size-11 " +
-              (showScrollToBottom ? "opacity-100" : "pointer-events-none opacity-0")
-            }
-            onClick={() => {
-              if (!scrollParent || !followBottomRef?.jumpToBottom) return;
-              pendingExpandCorrectionRef.current = null;
-              viewportPreserveLockRef.current = false;
-              liveUnitsHoldRef.current = null;
-              liveUnitsSettleRef.current = null;
-              lastViewportAnchorRef.current = null;
-              followBottomRef.jumpToBottom(scrollParent);
-              setShowScrollToBottom(shouldShowScrollToBottom(
-                followBottomRef.current, messages.length,
-                scrollParent.scrollHeight - scrollParent.clientHeight - scrollParent.scrollTop,
-              ));
-            }}
-          >
-            <ChevronDown size={18} />
-          </button>
-        </div>
+        <ScrollToBottomButton
+          visible={showScrollToBottom}
+          onClick={() => {
+            if (!scrollParent || !followBottomRef?.jumpToBottom) return;
+            pendingExpandCorrectionRef.current = null;
+            viewportPreserveLockRef.current = false;
+            liveUnitsHoldRef.current = null;
+            liveUnitsSettleRef.current = null;
+            lastViewportAnchorRef.current = null;
+            followBottomRef.jumpToBottom(scrollParent);
+            setShowScrollToBottom(shouldShowScrollToBottom(
+              followBottomRef.current, messages.length,
+              scrollParent.scrollHeight - scrollParent.clientHeight - scrollParent.scrollTop,
+            ));
+          }}
+        />
       )}
     </div>
     </>
-    </PermissionToolReopenContext.Provider>
     </ReadOnlySystemActionsBoundary>
   );
 }

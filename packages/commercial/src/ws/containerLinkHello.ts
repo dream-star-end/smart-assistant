@@ -3,6 +3,21 @@ import type { Queryable } from "../dispatch/turnDispatchStore.js";
 
 type Peer = { peerId: string; agentId: string; lastFrameSeq: number; resumeActiveTurnCandidateMessageIds?: string[] };
 
+/** Extract unique `(peerId, sessionKey)` targets referenced by an `inbound.hello` frame. */
+export function extractHelloPeerTargets(peers: unknown[]): { sessionIds: string[]; sessionKeys: string[] } {
+  const sessionIdSet = new Set<string>();
+  const sessionKeySet = new Set<string>();
+  for (const value of peers) {
+    if (!value || typeof value !== "object") continue;
+    const raw = value as { peerId?: unknown; agentId?: unknown };
+    if (typeof raw.peerId !== "string" || !raw.peerId) continue;
+    const agentId = typeof raw.agentId === "string" && raw.agentId ? raw.agentId : "main";
+    sessionIdSet.add(raw.peerId);
+    sessionKeySet.add(inboundSessionKey({ agentId, channel: "webchat", peer: { id: raw.peerId, kind: "dm" } }));
+  }
+  return { sessionIds: [...sessionIdSet], sessionKeys: [...sessionKeySet] };
+}
+
 /** Browser cursors describe a tab, never the shared consumer's persistence position. */
 export class ContainerLinkHello {
   private readonly registered = new Set<string>();

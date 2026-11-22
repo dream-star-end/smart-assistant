@@ -1,3 +1,4 @@
+import { Terminal } from "lucide-react";
 import { type Column, DataTable, TimeAgo } from "../../components";
 import { QuotaWindowsCell } from "./quota";
 import type { BoxClaudeLoginView, BoxClaudeModelView, BoxClaudeView, MemberQuota, QuotaWindowView } from "./types";
@@ -18,7 +19,7 @@ export function modelStatus(m: BoxClaudeModelView): { on: boolean; text: string 
 function Chip({ on, text }: { on: boolean; text: string }) {
   return (
     <span
-      className={`inline-flex items-center whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium ${
+      className={`oc-badge-craft inline-flex items-center whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium ${
         on ? "bg-success-soft text-success" : "bg-hover text-muted"
       }`}
     >
@@ -83,16 +84,21 @@ export function BoxClaudeSection({ view, loading }: { view: BoxClaudeView | null
   const caps = view?.caps;
   return (
     <section className="flex flex-col gap-3" data-testid="box-claude-section">
-      <div>
-        <h2 className="text-title font-semibold text-fg">Box Claude</h2>
-        <p className="text-meta text-muted">
-          用 Cursor Box 里自己的 Claude Code 登录,不在订阅账号表里;只读展示,不改登录、不读凭据。
-        </p>
+      <div className="flex items-center gap-2.5">
+        <span className="oc-icon-badge oc-icon-badge-accent size-8 rounded-lg">
+          <Terminal size={15} strokeWidth={1.9} />
+        </span>
+        <div>
+          <h2 className="text-title font-semibold tracking-tight text-fg">Box Claude</h2>
+          <p className="text-meta text-muted">
+            用 Cursor Box 里自己的 Claude Code 登录,不在订阅账号表里;只读展示,不改登录、不读凭据。
+          </p>
+        </div>
       </div>
       {view === null ? (
-        <div className="rounded-xl border border-border bg-surface px-4 py-3 text-meta text-muted">Box Claude 信息读取失败,稍后自动刷新。</div>
+        <div className="oc-callout oc-callout-warning rounded-xl px-4 py-3 text-meta text-muted">Box Claude 信息读取失败,稍后自动刷新。</div>
       ) : view === undefined && !loading ? (
-        <div className="rounded-xl border border-border bg-surface px-4 py-3 text-meta text-muted">服务端版本尚未提供 Box Claude 信息。</div>
+        <div className="oc-callout oc-callout-info rounded-xl px-4 py-3 text-meta text-muted">服务端版本尚未提供 Box Claude 信息。</div>
       ) : (
         <>
           {(view?.routes ?? []).map((r) => (
@@ -105,7 +111,7 @@ export function BoxClaudeSection({ view, loading }: { view: BoxClaudeView | null
             </div>
           ))}
           {caps ? (
-            <p className="text-meta text-muted" data-testid="box-claude-caps">
+            <p className="oc-surface-recessed rounded-xl px-3.5 py-2.5 text-meta text-muted tabular-nums" data-testid="box-claude-caps">
               并发上限:每个 Box 账号 {caps.max_runs_per_account} 个运行、每个用户 {caps.max_runs_per_user} 个运行
               {caps.proxy_concurrency !== null ? `;每用户代理并发 ${caps.proxy_concurrency}` : ""}
               {caps.proxy_rate_per_minute !== null ? `、每分钟 ${caps.proxy_rate_per_minute} 次` : ""}

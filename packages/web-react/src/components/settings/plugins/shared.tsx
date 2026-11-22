@@ -66,7 +66,7 @@ export function ConnectorHead({
             {label}
           </span>
           {status && (
-            <span className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap text-meta text-muted">
+            <span className="oc-badge-craft inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full bg-bg px-2 py-0.5 text-caption font-medium text-muted">
               <StatusDot tone={status.tone} />
               {status.text}
             </span>
@@ -94,10 +94,10 @@ export function ConnectorHead({
   )
 }
 
-/** 段内的一句补充（下架 / 不可授权等）：圆点 + 一句话，不画色块、不缩进。 */
+/** 段内的一句补充（下架 / 不可授权等）：精致编辑风提示条。 */
 export function ConnectorNote({ tone, children }: { tone: StatusTone; children: ReactNode }) {
   return (
-    <p className="mt-2 flex items-start gap-2 text-meta text-muted">
+    <p className="oc-callout mt-2.5 flex items-start gap-2 rounded-xl px-3 py-2 text-meta text-muted">
       <StatusDot tone={tone} className="mt-[5px]" />
       <span>{children}</span>
     </p>
@@ -154,5 +154,5 @@ export function AccountRows({ children }: { children: ReactNode }) {
   return <>{children}</>
 }
 
-/** 段落容器：段与段之间一条发丝线（首段不画）。data-connector-card 是测试定位钩子。 */
-export const CONNECTOR_SECTION = 'border-t border-border py-4 first:border-t-0 first:pt-2'
+/** 段落容器：Clarvy Atelier 精雕卡片面。data-connector-card 是测试定位钩子。 */
+export const CONNECTOR_SECTION = 'oc-surface-card mt-3 rounded-2xl p-4'

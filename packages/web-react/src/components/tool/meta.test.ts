@@ -1,9 +1,20 @@
 import { describe, expect, test } from "vitest";
 import { detectShellFileWrites, normalizeToolForDisplay } from "./format";
-import { Bot, Clock, ShieldCheck } from "lucide-react";
-import { detectOcCli, humanStepTitle, isMemoryFilePath, parseMcpName, resolveToolMeta, toolSummary } from "./meta";
+import { Clock } from "lucide-react";
+import {
+  AtelierAgentIcon,
+  AtelierShieldIcon,
+  AtelierTerminalIcon,
+  detectOcCli,
+  humanStepTitle,
+  isMemoryFilePath,
+  parseMcpName,
+  resolveToolMeta,
+  toolSummary,
+} from "./meta";
 // 跨包取 openclaude-memory 工具名单一权威表(与 index.ts TOOLS 声明同源),做锁步断言。
 import {
+  MEMORY_MCP_REMOTE_SWARM_TOOL_NAMES,
   MEMORY_MCP_TOOL_NAMES,
   MEMORY_MCP_TRAIN_ONLY_TOOL_NAMES,
 } from "../../../../mcp-memory/src/toolNames";
@@ -30,7 +41,11 @@ describe("MCP_OP_META 锁步 openclaude-memory 工具名单(漏登记 → 「记
   // 每个注册工具都必须有 `openclaude-memory:<name>` 专属条目;否则 resolveToolMeta 回落
   // server 兜底 `记忆: <humanizeOp>`(boss 现网看到的「记忆: request review」)。新增工具漏改
   // 这里会直接红,逼两侧同步。
-  const names = [...MEMORY_MCP_TOOL_NAMES, ...MEMORY_MCP_TRAIN_ONLY_TOOL_NAMES];
+  const names = [
+    ...MEMORY_MCP_TOOL_NAMES,
+    ...MEMORY_MCP_TRAIN_ONLY_TOOL_NAMES,
+    ...MEMORY_MCP_REMOTE_SWARM_TOOL_NAMES,
+  ];
   test.each(names)("%s → 专属中文标签(非「记忆:」兜底)", (name) => {
     const label = resolveToolMeta(`mcp__openclaude-memory__${name}`).label;
     expect(label.length).toBeGreaterThan(0);
@@ -283,7 +298,7 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
   test("oc-memory delegate 标成委派，不叫记忆", () => {
     const delegated = resolveToolMeta("Bash", { command: "oc-memory delegate --goal '修卡片'" });
     expect(delegated.label).toBe("委派子任务");
-    expect(delegated.icon).toBe(Bot);
+    expect(delegated.icon).toBe(AtelierAgentIcon);
     expect(toolSummary("Bash", { command: "oc-memory delegate --goal '修卡片'" })).toBe("修卡片");
     expect(resolveToolMeta("Bash", { command: "oc-memory core-search 记忆" }).label).toBe(
       "记忆检索",
@@ -293,13 +308,14 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
     ).toBe("质量审查");
     expect(
       resolveToolMeta("Bash", { command: "oc-memory request-review --draft '草稿'" }).icon,
-    ).toBe(ShieldCheck);
+    ).toBe(AtelierShieldIcon);
     expect(resolveToolMeta("Bash", { command: "oc-memory delegate-wait dlgjob-1" }).label).toBe(
       "等待委派",
     );
     expect(resolveToolMeta("Bash", { command: "oc-memory delegate-wait dlgjob-1" }).icon).toBe(
       Clock,
     );
+    expect(resolveToolMeta("Bash").icon).toBe(AtelierTerminalIcon);
   });
 
   test("oc-memory delegate 包装形态仍解析为委派，不落回记忆", () => {
@@ -312,7 +328,7 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
       "FOO=1 /usr/local/bin/oc-memory request-review --draft '草稿'",
     ];
     expect(resolveToolMeta("Bash", { command: wrapped[0] }).label).toBe("委派子任务");
-    expect(resolveToolMeta("Bash", { command: wrapped[0] }).icon).toBe(Bot);
+    expect(resolveToolMeta("Bash", { command: wrapped[0] }).icon).toBe(AtelierAgentIcon);
     expect(toolSummary("Bash", { command: wrapped[0] })).toBe("修卡片");
     expect(resolveToolMeta("Bash", { command: wrapped[1] }).label).toBe("等待委派");
     expect(resolveToolMeta("Bash", { command: wrapped[2] }).label).toBe("委派子任务");

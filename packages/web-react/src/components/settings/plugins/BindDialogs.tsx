@@ -122,7 +122,7 @@ export function BindDialog({
       {provider && (
         <div className="flex flex-col gap-3">
           {helps.length > 0 && (
-            <div className="rounded-lg bg-hover px-3 py-2.5">
+            <div className="oc-callout oc-callout-info rounded-xl px-3.5 py-2.5">
               {helps.map((f) => (
                 <div key={f.key} className="text-meta leading-relaxed text-muted">
                   {f.helpText}
@@ -131,7 +131,7 @@ export function BindDialog({
                       href={f.helpUrl}
                       target="_blank"
                       rel="noreferrer noopener"
-                      className="ml-1 inline-flex items-center gap-0.5 text-accent hover:underline"
+                      className="ml-1 inline-flex items-center gap-0.5 font-medium text-accent hover:underline"
                     >
                       查看指引
                       <ExternalLink className="size-3" />

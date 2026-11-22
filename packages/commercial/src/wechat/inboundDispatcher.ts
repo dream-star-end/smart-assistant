@@ -493,8 +493,11 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
 
       // ── 2) pointer lookup or allocate ─────────────────────────────────
       let current: WechatSessionId | null
+      let pointerAgentId: string | undefined
       try {
-        current = await channel.getCurrentSessionId(deps.pgPool, evt.bindingUserId)
+        const pointer = await channel.getCurrentSessionPointer(deps.pgPool, evt.bindingUserId)
+        current = pointer?.sessionId ?? null
+        pointerAgentId = pointer?.agentId
       } catch (err) {
         reqLog.error("pointer_read_failed", {
           errMessage: (err as Error)?.message ?? String(err),
@@ -511,7 +514,8 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       const newSession = current === null
       let shouldUpsertMasterSession = newSession
       let shouldSetCurrentPointer = true
-      let routedAgentId = agentId
+      const effectiveAgentId = evt.agentId ?? pointerAgentId ?? agentId
+      let routedAgentId = effectiveAgentId
 
       // **稳定时间戳**:Step 2a 的 createdAt / lastAt 用同一 now() pin 住,避免一次 dispatch
       // 内 createdAt / lastAt 错开 1 ms(测试 `createdAt === lastAt` 断言依赖)。
@@ -527,7 +531,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
             bindingUserId: evt.bindingUserId,
             userId: BigInt(evt.bindingUserId),
             modelId: model,
-            agentId,
+            agentId: effectiveAgentId,
             traceId: requestId,
           })
           if (prepared.kind === "unavailable") {
@@ -591,7 +595,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         peer: { kind: "dm" as const, id: sessionId, displayName: evt.senderId },
         idempotencyKey: evt.idempotencyKey,
         ts: evt.receivedAt,
-        agentId,
+        agentId: effectiveAgentId,
         ...(model ? { model } : {}),
         ...(preparedCodexTurn
           ? {

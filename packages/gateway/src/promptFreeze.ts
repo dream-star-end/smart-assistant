@@ -41,7 +41,7 @@ export const PROMPT_FREEZE_TOUCH_MS = 60_000
 const FLAG_FILE = ['runtime-flags', 'prompt-freeze'] as const
 const DIR = 'prompt-freeze'
 
-/** `OC_PROMPT_FREEZE` wins; else `<home>/runtime-flags/prompt-freeze`; default shadow. */
+/** `OC_PROMPT_FREEZE` wins; else `<home>/runtime-flags/prompt-freeze`; default enforce (OCV5-840). */
 export function resolvePromptFreezeMode(
   home: string,
   env: NodeJS.ProcessEnv = process.env,
@@ -55,7 +55,7 @@ export function resolvePromptFreezeMode(
     }
   }
   const value = raw?.trim().toLowerCase()
-  return value === 'off' || value === 'enforce' || value === 'shadow' ? value : 'shadow'
+  return value === 'off' || value === 'enforce' || value === 'shadow' ? value : 'enforce'
 }
 
 export interface PromptFreezeInputs {

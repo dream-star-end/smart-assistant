@@ -1,4 +1,4 @@
-import { Copy, ExternalLink, RefreshCw } from "lucide-react";
+import { Check, Copy, ExternalLink, RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
 import { reportClientFrictionOnce } from "../../lib/clientFriction";
 import { savePendingPayment, type PendingPayment } from "../../lib/pendingPayment";
@@ -117,14 +117,20 @@ export function HupijiaoPaymentEntry({
   }
 
   const meta = (
-    <div className="flex w-full flex-col items-center gap-1 text-center" data-testid="payment-order-meta">
+    <div className="flex w-full flex-col items-center gap-1.5 text-center" data-testid="payment-order-meta">
       {amountCents ? (
-        <div className="text-[20px] font-semibold text-fg" data-testid="payment-order-amount">
+        <div
+          className="text-xl font-semibold tracking-tight tabular-nums text-fg"
+          data-testid="payment-order-amount"
+        >
           {formatCentsYuan(amountCents)}
         </div>
       ) : null}
       {remaining != null ? (
-        <p className="text-meta text-faint" data-testid="payment-countdown">
+        <p
+          className="oc-surface-recessed rounded-full px-3 py-0.5 text-caption font-medium tabular-nums text-muted"
+          data-testid="payment-countdown"
+        >
           {expired
             ? "订单已过期，请重新下单"
             : `剩余有效时间 ${formatPaymentCountdown(remaining)} · 过期后请重新下单`}
@@ -180,7 +186,8 @@ export function HupijiaoPaymentEntry({
               data-testid="wechat-copy-payment-link"
               onClick={() => void copyRecoveryLink()}
             >
-              <Copy size={16} /> {copied ? "已复制" : "复制链接"}
+              {copied ? <Check size={16} strokeWidth={2} /> : <Copy size={16} strokeWidth={1.75} />}{" "}
+              {copied ? "已复制" : "复制链接"}
             </Button>
             <p className="text-center text-meta text-faint">
               在系统浏览器打开后自动恢复本次订单
@@ -253,18 +260,18 @@ export function HupijiaoPaymentEntry({
   return (
     <>
       {meta}
-      <div className="rounded-xl border border-border bg-white p-3">
+      <div className="oc-surface-card rounded-2xl bg-white p-3.5">
         {/* url_qrcode 本身是 QR PNG，直接挂载；不要再次二维码化。 */}
         <img
           src={qrcodeUrl}
           alt="微信支付二维码"
           width={200}
           height={200}
-          className="size-[200px] object-contain"
+          className="size-[200px] rounded-md object-contain"
           onError={() => setQrFailed(true)}
         />
       </div>
-      <div className="flex items-center gap-1.5 text-meta text-faint">
+      <div className="flex items-center gap-1.5 text-meta text-muted">
         <Spinner size={13} /> 请用微信扫码支付，到账后自动确认…
       </div>
     </>

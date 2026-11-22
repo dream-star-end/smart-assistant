@@ -1,19 +1,25 @@
 import type { MediaGenerationJob, VideoProject } from '@openclaude/protocol/mediaGeneration'
 import {
+  AlertCircle,
+  Check,
+  Clapperboard,
   Copy,
   Download,
   Film,
   LoaderCircle,
+  Play,
   RefreshCw,
   RotateCcw,
   Square,
+  TriangleAlert,
   WandSparkles,
   X,
 } from 'lucide-react'
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { assertAuthResponseCurrent, bearerHeaders, callWithRefresh } from '../lib/api'
 import type { AuthSession } from '../lib/types'
-import { Button, IconButton, Progress as ProgressBar, Sheet, useConfirm } from './ui'
+import { cn } from '../lib/utils'
+import { Alert, Badge, Button, IconButton, Progress as ProgressBar, Sheet, useConfirm } from './ui'
 import { claimInlineVideoSlot, releaseInlineVideoSlot, teardownVideoElement } from './chat/inlineVideoSlot'
 
 type JobsPage = { jobs: MediaGenerationJob[]; nextCursor: string | null }
@@ -133,6 +139,63 @@ const PROJECT_STATUS: Record<VideoProject['status'], string> = {
   canceled: '已取消',
 }
 
+type StatusBadgeTone = 'neutral' | 'accent' | 'success' | 'warning' | 'danger' | 'info'
+type TaskFilter = 'all' | 'active' | 'completed' | 'issue'
+
+const PROJECT_STATUS_TONE: Record<VideoProject['status'], StatusBadgeTone> = {
+  draft: 'neutral',
+  generating: 'accent',
+  needs_review: 'warning',
+  ready: 'info',
+  rendering: 'accent',
+  completed: 'success',
+  failed: 'danger',
+  canceled: 'neutral',
+}
+
+const PROJECT_ICON_BADGE: Record<VideoProject['status'], string> = {
+  draft: 'oc-icon-badge',
+  generating: 'oc-icon-badge oc-icon-badge-accent',
+  needs_review: 'oc-icon-badge oc-icon-badge-warning',
+  ready: 'oc-icon-badge oc-icon-badge-info',
+  rendering: 'oc-icon-badge oc-icon-badge-accent',
+  completed: 'oc-icon-badge oc-icon-badge-success',
+  failed: 'oc-icon-badge oc-icon-badge-danger',
+  canceled: 'oc-icon-badge',
+}
+
+const JOB_STATUS_TONE: Record<MediaGenerationJob['status'], StatusBadgeTone> = {
+  queued: 'info',
+  dispatching: 'accent',
+  running: 'accent',
+  reconnecting: 'warning',
+  completed: 'success',
+  failed: 'danger',
+  canceled: 'neutral',
+}
+
+const ACTIVE_PROJECT_STATUSES = new Set<VideoProject['status']>([
+  'draft',
+  'generating',
+  'needs_review',
+  'ready',
+  'rendering',
+])
+
+function matchesJobFilter(job: MediaGenerationJob, filter: TaskFilter): boolean {
+  if (filter === 'all') return true
+  if (filter === 'active') return ACTIVE.has(job.status)
+  if (filter === 'completed') return job.status === 'completed'
+  return job.status === 'failed' || job.status === 'canceled'
+}
+
+function matchesProjectFilter(project: VideoProject, filter: TaskFilter): boolean {
+  if (filter === 'all') return true
+  if (filter === 'active') return ACTIVE_PROJECT_STATUSES.has(project.status)
+  if (filter === 'completed') return project.status === 'completed'
+  return project.status === 'failed' || project.status === 'canceled'
+}
+
 async function apiCall<T>(auth: AuthSession, path: string, init?: RequestInit): Promise<T> {
   const response = await callWithRefresh(auth, (token) =>
     fetch(path, {
@@ -175,10 +238,12 @@ function Progress({ job }: { job: MediaGenerationJob }) {
   const statusText = phase ? `${STATUS[job.status]} · ${phase}` : STATUS[job.status]
   return (
     <div className="space-y-1.5">
-      <div className="flex items-center justify-between text-meta text-muted">
+      <div className="flex items-center justify-between gap-2 text-meta text-muted">
         {/* 原始 phase 留在 title 里给排障,不进正文(审计 M-05)。 */}
-        <span title={job.phase || undefined}>{statusText}</span>
-        <span className="tabular-nums">
+        <Badge tone={JOB_STATUS_TONE[job.status]} size="sm" title={job.phase || undefined}>
+          {statusText}
+        </Badge>
+        <span className="text-caption font-medium tabular-nums text-muted">
           {job.queuePosition
             ? `前面 ${Math.max(0, job.queuePosition - 1)} 个`
             : determinate
@@ -192,8 +257,8 @@ function Progress({ job }: { job: MediaGenerationJob }) {
           <ProgressBar value={pct} size="sm" tone="brand" aria-label={`${statusText} ${pct}%`} />
         ) : (
           // 无步数时只是一条脉动的装饰条:没有可报的数值,状态由上面那行文字承担,对辅助技术隐藏。
-          <div aria-hidden className="h-1.5 overflow-hidden rounded-full bg-hover">
-            <div className="h-full w-1/3 animate-pulse rounded-full bg-accent" />
+          <div aria-hidden className="oc-surface-recessed h-1.5 overflow-hidden rounded-full">
+            <div className="oc-indeterminate-bar h-full w-1/3 rounded-full bg-accent" />
           </div>
         ))}
     </div>
@@ -206,15 +271,29 @@ function FailureNote({ job }: { job: MediaGenerationJob }) {
   const failure = failureSummary(job)
   if (!failure) return null
   return (
-    <div className="mt-2 text-meta text-danger">
-      <p>{failure.summary}</p>
-      {failure.detail && (
-        <details className="mt-1 text-caption text-muted">
-          {/* 触屏 44px 命中(a11y-B media#2):summary 原本只有 16px 行高。 */}
-          <summary className="cursor-pointer select-none [@media(hover:none)]:py-3.5">技术详情</summary>
-          <p className="mt-1 break-all font-mono text-micro">{failure.detail}</p>
-        </details>
-      )}
+    <div className="oc-callout oc-callout-danger mt-2.5 rounded-xl px-3 py-2.5 text-meta text-danger">
+      <div className="flex items-start gap-2">
+        <span
+          className="oc-icon-badge oc-icon-badge-danger mt-0.5 size-5 shrink-0 rounded-md"
+          aria-hidden="true"
+        >
+          <AlertCircle size={12} strokeWidth={2} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <p className="font-medium leading-relaxed">{failure.summary}</p>
+          {failure.detail && (
+            <details className="mt-1.5 text-caption text-muted">
+              {/* 触屏 44px 命中(a11y-B media#2):summary 原本只有 16px 行高。 */}
+              <summary className="cursor-pointer select-none font-medium text-muted hover:text-fg [@media(hover:none)]:py-3.5">
+                技术详情
+              </summary>
+              <p className="oc-surface-recessed mt-1.5 break-all rounded-lg px-2.5 py-2 font-mono text-micro text-muted">
+                {failure.detail}
+              </p>
+            </details>
+          )}
+        </div>
+      </div>
     </div>
   )
 }
@@ -235,8 +314,13 @@ function CopyPromptButton({ prompt }: { prompt: string }) {
     }
   }
   return (
-    <Button size="sm" variant="secondary" onClick={() => void copy()}>
-      <Copy size={12} />
+    <Button
+      size="sm"
+      variant="secondary"
+      className="oc-btn-tactile oc-btn-secondary-craft"
+      onClick={() => void copy()}
+    >
+      {copied ? <Check size={12} /> : <Copy size={12} />}
       {copied ? '已复制' : '复制提示词'}
     </Button>
   )
@@ -245,7 +329,12 @@ function CopyPromptButton({ prompt }: { prompt: string }) {
 /** Keep the failed job's original session identity through the explicit Continue. */
 function ReusePromptButton({ job, onReuse }: { job: MediaGenerationJob; onReuse: (job: MediaGenerationJob) => void }) {
   return (
-    <Button size="sm" variant="secondary" onClick={() => onReuse(job)}>
+    <Button
+      size="sm"
+      variant="secondary"
+      className="oc-btn-tactile oc-btn-secondary-craft"
+      onClick={() => onReuse(job)}
+    >
       <RotateCcw size={12} />
       继续
     </Button>
@@ -307,35 +396,43 @@ function JobResult({ job, auth }: { job: MediaGenerationJob; auth: AuthSession |
     }
   }
   return (
-    <div className="mt-3 space-y-2">
+    <div className="mt-3 space-y-2.5">
       {resultUrl ? (
         <>
-          <video
-            ref={setVideoRef}
-            className="max-h-64 w-full rounded-xl bg-black"
-            controls
-            playsInline
-            {...({ 'webkit-playsinline': 'true', 'x5-playsinline': 'true' } as Record<string, string>)}
-            preload="metadata"
-            src={resultUrl}
-            onEnded={collapseResult}
-          />
-          <div className="flex items-center gap-3">
+          <div className="overflow-hidden rounded-xl border border-border bg-black shadow-soft">
+            <video
+              ref={setVideoRef}
+              className="max-h-64 w-full bg-black"
+              controls
+              playsInline
+              {...({ 'webkit-playsinline': 'true', 'x5-playsinline': 'true' } as Record<string, string>)}
+              preload="metadata"
+              src={resultUrl}
+              onEnded={collapseResult}
+            />
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
             <a
-              className="inline-flex items-center gap-1 text-meta font-medium text-accent hover:underline"
+              className="oc-btn-tactile oc-btn-secondary-craft inline-flex h-8 items-center gap-1.5 rounded-md border border-border bg-surface px-3 text-meta font-medium text-accent transition-colors hover:border-border-strong hover:bg-hover"
               href={resultUrl}
               download
             >
               <Download size={13} /> 下载 MP4
             </a>
-            <Button size="sm" variant="ghost" onClick={collapseResult}>
+            <Button size="sm" variant="ghost" className="oc-btn-tactile" onClick={collapseResult}>
               收起预览
             </Button>
           </div>
         </>
       ) : (
-        <Button size="sm" variant="secondary" disabled={loading} onClick={() => void loadResult()}>
-          {loading ? <LoaderCircle size={13} className="animate-spin" /> : <Download size={13} />}
+        <Button
+          size="sm"
+          variant="secondary"
+          className="oc-btn-tactile oc-btn-secondary-craft"
+          disabled={loading}
+          onClick={() => void loadResult()}
+        >
+          {loading ? <LoaderCircle size={13} className="animate-spin" /> : <Play size={13} />}
           播放或下载结果
         </Button>
       )}
@@ -370,6 +467,7 @@ export function MediaTaskCenter({
   const [error, setError] = useState<string | null>(null)
   // 正在飞的那条写操作的 path:对应按钮转圈,其余写按钮禁用(审计 M-06/M-16)。
   const [pendingPath, setPendingPath] = useState<string | null>(null)
+  const [filter, setFilter] = useState<TaskFilter>('all')
   const pendingRef = useRef(false)
   const [confirm, confirmEl] = useConfirm()
 
@@ -423,6 +521,7 @@ export function MediaTaskCenter({
     setNextProjectCursor(null)
     setCapability(null)
     setError(null)
+    setFilter('all')
   }, [identityEpoch])
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: cursor/capability changes must not restart the first-page load; identityEpoch tracks auth changes
@@ -480,112 +579,237 @@ export function MediaTaskCenter({
     pendingPath === path ? <LoaderCircle size={12} className="animate-spin" /> : icon
 
   const standalone = jobs.filter((job) => !job.projectId)
+  const filterCounts = useMemo(
+    () => ({
+      all: projects.length + standalone.length,
+      active:
+        projects.filter((project) => matchesProjectFilter(project, 'active')).length +
+        standalone.filter((job) => matchesJobFilter(job, 'active')).length,
+      completed:
+        projects.filter((project) => matchesProjectFilter(project, 'completed')).length +
+        standalone.filter((job) => matchesJobFilter(job, 'completed')).length,
+      issue:
+        projects.filter((project) => matchesProjectFilter(project, 'issue')).length +
+        standalone.filter((job) => matchesJobFilter(job, 'issue')).length,
+    }),
+    [projects, standalone],
+  )
+  const visibleProjects = useMemo(
+    () => (filter === 'all' ? projects : projects.filter((project) => matchesProjectFilter(project, filter))),
+    [projects, filter],
+  )
+  const visibleStandalone = useMemo(
+    () => (filter === 'all' ? standalone : standalone.filter((job) => matchesJobFilter(job, filter))),
+    [standalone, filter],
+  )
+  const showFilterBar =
+    capability?.available !== false && (projects.length > 0 || standalone.length > 0)
   // 「单段视频」标题只在有内容、或空态卡片要挂在它下面时出现;账号未开放 / 只有项目时不悬空标题(审计 M-17)。
   const showEmpty =
     !loading && standalone.length === 0 && projects.length === 0 && capability?.available !== false
-  const showStandaloneHeading = standalone.length > 0 || showEmpty
+  const showFilteredEmpty =
+    filter !== 'all' && visibleProjects.length === 0 && visibleStandalone.length === 0 && !showEmpty
+  const showStandaloneHeading = visibleStandalone.length > 0 || showEmpty
+  const filterItems: { id: TaskFilter; label: string; count: number }[] = [
+    { id: 'all', label: '全部', count: filterCounts.all },
+    { id: 'active', label: '进行中', count: filterCounts.active },
+    { id: 'completed', label: '已完成', count: filterCounts.completed },
+    { id: 'issue', label: '异常', count: filterCounts.issue },
+  ]
+
   return (
     <Sheet
       open={open}
       onOpenChange={onOpenChange}
       side="right"
       srTitle="视频任务中心"
-      className="w-[520px] max-w-[94vw]"
+      className="oc-surface-popover w-[520px] max-w-[94vw]"
     >
       {/* 头部固定、正文滚动(a11y-B media#1):Radix FocusScope 在末尾 Tab 回绕时用 focus({preventScroll})
           落回「刷新」,若 header 随整个抽屉一起滚出视口,焦点就看不见。结构同 Modal:header shrink-0,
           滚动只发生在 body。 */}
       <div className="flex min-h-0 flex-1 flex-col">
-        <div className="flex shrink-0 items-start justify-between gap-3 px-5 pt-5">
-          <div className="min-w-0">
-            <h2 className="flex items-center gap-2 text-lg font-semibold text-fg">
-              <Film size={19} />
-              视频任务
-            </h2>
-            <p className="mt-1 text-meta leading-relaxed text-muted">
-              任务在后台持续执行，关闭页面也不会中断；长视频按分镜连续生成后再合成。
-            </p>
+        <div className="oc-surface-glass shrink-0 border-x-0 border-t-0 border-b border-border/80 px-5 pb-3.5 pt-4 shadow-none">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex min-w-0 items-start gap-3">
+              <span
+                className="oc-icon-badge oc-icon-badge-accent mt-0.5 size-8 shrink-0 rounded-xl"
+                aria-hidden="true"
+              >
+                <Film size={16} strokeWidth={1.9} />
+              </span>
+              <div className="min-w-0">
+                <h2 className="text-title font-semibold tracking-tight text-fg">视频任务</h2>
+                <p className="mt-0.5 text-meta leading-relaxed text-muted">
+                  任务在后台持续执行，关闭页面也不会中断；长视频按分镜连续生成后再合成。
+                </p>
+              </div>
+            </div>
+            <div className="flex shrink-0 items-center gap-1">
+              <Button
+                variant="secondary"
+                size="sm"
+                className="oc-btn-tactile oc-btn-secondary-craft"
+                disabled={loading}
+                onClick={() => void refresh('first')}
+              >
+                <RefreshCw size={14} className={loading ? 'animate-spin' : ''} /> 刷新
+              </Button>
+              {/* 抽屉原语不带关闭钮;窄屏遮罩只剩 6vw,没有它几乎关不掉(审计 M-04)。 */}
+              <IconButton
+                aria-label="关闭视频任务"
+                size="lg"
+                className="oc-btn-tactile"
+                onClick={() => onOpenChange(false)}
+              >
+                <X size={18} />
+              </IconButton>
+            </div>
           </div>
-          <div className="flex shrink-0 items-center gap-1">
-            <Button
-              variant="secondary"
-              size="sm"
-              disabled={loading}
-              onClick={() => void refresh('first')}
+
+          {showFilterBar && (
+            <div
+              role="group"
+              aria-label="任务状态筛选"
+              className="oc-surface-recessed mt-3 grid grid-cols-4 gap-1 rounded-xl p-1"
             >
-              <RefreshCw size={14} className={loading ? 'animate-spin' : ''} /> 刷新
-            </Button>
-            {/* 抽屉原语不带关闭钮;窄屏遮罩只剩 6vw,没有它几乎关不掉(审计 M-04)。 */}
-            <IconButton aria-label="关闭视频任务" size="lg" onClick={() => onOpenChange(false)}>
-              <X size={18} />
-            </IconButton>
-          </div>
+              {filterItems.map((item) => {
+                const active = filter === item.id
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    aria-pressed={active}
+                    onClick={() => setFilter(item.id)}
+                    className={cn(
+                      'inline-flex items-center justify-center gap-1 rounded-lg px-2 py-1.5 text-caption font-medium outline-none transition-[background-color,color,box-shadow] duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11',
+                      active
+                        ? 'bg-surface text-fg shadow-soft'
+                        : 'text-muted hover:text-fg',
+                    )}
+                  >
+                    <span className="truncate">{item.label}</span>
+                    <span className="text-micro tabular-nums text-faint">{item.count}</span>
+                  </button>
+                )
+              })}
+            </div>
+          )}
         </div>
 
         {/* 正文滚动容器:列表里全是可聚焦的按钮,Tab 即可带动滚动;header 不在这里,回绕时始终可见。 */}
-        <div className="min-h-0 flex-1 overflow-y-auto px-5 pb-5">
+        <div className="min-h-0 flex-1 overflow-y-auto px-5 pb-6">
         {error && (
-          <div
-            role="alert"
-            className="mt-4 rounded-xl border border-danger/30 bg-danger-soft p-3 text-meta text-danger"
+          <Alert
+            tone="danger"
+            density="compact"
+            className="oc-callout mt-4 rounded-xl"
+            icon={<AlertCircle size={15} />}
           >
             {error}
-          </div>
+          </Alert>
         )}
         {capability?.available === false && (
-          <div className="mt-6 rounded-2xl border border-border bg-surface p-5 text-sm text-muted">
-            本账号暂未开放本地 H3 视频生成。
+          <div className="oc-callout mt-6 flex items-start gap-3 rounded-2xl p-5 text-sm text-muted">
+            <span className="oc-icon-badge size-9 shrink-0 rounded-xl" aria-hidden="true">
+              <Film size={16} strokeWidth={1.8} />
+            </span>
+            <p className="pt-1 leading-relaxed">本账号暂未开放本地 H3 视频生成。</p>
           </div>
         )}
         {capability?.available && capability.workerReachable === false && (
           // <output> 自带 role=status:算力失联是会自己恢复的状态提示,读屏该被告知但不必打断(审计 M-18)。
-          <output className="mt-4 block rounded-xl border border-warning/30 bg-warning-soft p-3 text-meta text-warning">
-            算力节点暂时失联，已提交的任务和素材不会丢失，恢复连接后可继续处理。
+          <output className="oc-callout oc-callout-warning mt-4 flex items-start gap-2.5 rounded-xl p-3 text-meta text-warning">
+            <span
+              className="oc-icon-badge oc-icon-badge-warning mt-0.5 size-6 shrink-0 rounded-md"
+              aria-hidden="true"
+            >
+              <TriangleAlert size={13} strokeWidth={2} />
+            </span>
+            <span className="leading-relaxed">
+              算力节点暂时失联，已提交的任务和素材不会丢失，恢复连接后可继续处理。
+            </span>
           </output>
         )}
 
-        {projects.length > 0 && (
-          <section className="mt-6 space-y-3">
-            <h3 className="text-body font-semibold text-fg">长视频项目</h3>
-            {projects.map((project) => {
+        {showFilteredEmpty && (
+          <div className="oc-surface-card mt-6 flex flex-col items-center gap-3 rounded-2xl p-8 text-center">
+            <span className="oc-icon-badge size-10 rounded-xl" aria-hidden="true">
+              <Film size={18} strokeWidth={1.8} />
+            </span>
+            <p className="text-body text-muted">当前筛选下暂无匹配任务。</p>
+            <Button
+              size="sm"
+              variant="secondary"
+              className="oc-btn-tactile oc-btn-secondary-craft"
+              onClick={() => setFilter('all')}
+            >
+              查看全部
+            </Button>
+          </div>
+        )}
+
+        {visibleProjects.length > 0 && (
+          <section className="mt-5 space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="text-body font-semibold text-fg">长视频项目</h3>
+              <span className="text-caption tabular-nums text-faint">
+                {visibleProjects.length} 项
+              </span>
+            </div>
+            {visibleProjects.map((project) => {
               const compose = project.currentComposeJobId
                 ? jobs.find((job) => job.id === project.currentComposeJobId)
                 : undefined
               return (
                 <article
                   key={project.id}
-                  className="rounded-2xl border border-border bg-surface p-4 shadow-sm"
+                  className="oc-surface-card oc-surface-card-hover rounded-2xl p-4"
                 >
                   <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <div className="truncate text-sm font-semibold text-fg">{project.title}</div>
-                      {/* rev 是并发控制用的内部版本号,不进正文;留在 title 里给排障(审计 M-05)。 */}
-                      <div className="mt-1 text-meta text-muted" title={`第 ${project.rev} 版`}>
-                        {
-                          project.shots.filter((shot) => shot.activeJob?.status === 'completed')
-                            .length
-                        }
-                        /{project.shots.length} 个分镜
+                    <div className="flex min-w-0 items-start gap-2.5">
+                      <span
+                        className={cn(
+                          PROJECT_ICON_BADGE[project.status],
+                          'mt-0.5 size-7 shrink-0 rounded-lg',
+                        )}
+                        aria-hidden="true"
+                      >
+                        <Clapperboard size={14} strokeWidth={1.9} />
+                      </span>
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-semibold text-fg">{project.title}</div>
+                        {/* rev 是并发控制用的内部版本号,不进正文;留在 title 里给排障(审计 M-05)。 */}
+                        <div
+                          className="mt-0.5 text-meta tabular-nums text-muted"
+                          title={`第 ${project.rev} 版`}
+                        >
+                          {
+                            project.shots.filter((shot) => shot.activeJob?.status === 'completed')
+                              .length
+                          }
+                          /{project.shots.length} 个分镜
+                        </div>
                       </div>
                     </div>
-                    <span className="rounded-full bg-hover px-2 py-1 text-caption text-muted">
+                    <Badge tone={PROJECT_STATUS_TONE[project.status]} size="sm">
                       {PROJECT_STATUS[project.status]}
-                    </span>
+                    </Badge>
                   </div>
                   <div className="mt-3 space-y-2">
                     {project.shots.map((shot) => (
-                      <div key={shot.id} className="rounded-xl bg-bg px-3 py-2.5">
+                      <div key={shot.id} className="oc-surface-recessed rounded-xl px-3.5 py-2.5">
                         <div className="flex items-start gap-2">
-                          <span className="shrink-0 text-caption font-semibold text-faint">
+                          <span className="oc-kbd shrink-0 font-mono text-micro font-semibold text-muted">
                             #{shot.ordinal + 1}
                           </span>
                           <p className="line-clamp-2 flex-1 text-meta leading-relaxed text-fg">
                             {shot.prompt}
                           </p>
                           {shot.stale && project.status !== 'canceled' && (
-                            <span className="shrink-0 rounded-full bg-warning-soft px-1.5 py-0.5 text-micro text-warning">
+                            <Badge tone="warning" size="sm">
                               依赖已变
-                            </span>
+                            </Badge>
                           )}
                         </div>
                         {shot.activeJob && (
@@ -599,6 +823,7 @@ export function MediaTaskCenter({
                             <Button
                               size="sm"
                               variant="secondary"
+                              className="oc-btn-tactile oc-btn-secondary-craft"
                               disabled={busy}
                               onClick={() =>
                                 void mutate(
@@ -618,6 +843,7 @@ export function MediaTaskCenter({
                             <Button
                               size="sm"
                               variant="ghost"
+                              className="oc-btn-tactile"
                               disabled={busy}
                               onClick={() =>
                                 void mutate(
@@ -647,6 +873,8 @@ export function MediaTaskCenter({
                     {project.status === 'draft' && (
                       <Button
                         size="sm"
+                        variant="primary"
+                        className="oc-btn-tactile oc-btn-primary-craft"
                         disabled={busy}
                         onClick={() =>
                           void mutate(`/api/media-generation/projects/${project.id}/start`, {
@@ -664,6 +892,8 @@ export function MediaTaskCenter({
                     {project.status === 'ready' && (
                       <Button
                         size="sm"
+                        variant="primary"
+                        className="oc-btn-tactile oc-btn-primary-craft"
                         disabled={busy}
                         onClick={() =>
                           void mutate(`/api/media-generation/projects/${project.id}/render`, {
@@ -684,6 +914,7 @@ export function MediaTaskCenter({
                       <Button
                         size="sm"
                         variant="secondary"
+                        className="oc-btn-tactile oc-btn-secondary-craft"
                         disabled={busy}
                         onClick={() =>
                           void mutate(
@@ -708,7 +939,7 @@ export function MediaTaskCenter({
                     )}
                   </div>
                   {compose && (
-                    <div className="mt-3">
+                    <div className="oc-surface-recessed mt-3 rounded-xl px-3.5 py-3">
                       <Progress job={compose} />
                       <FailureNote job={compose} />
                       <JobResult job={compose} auth={auth} />
@@ -719,7 +950,7 @@ export function MediaTaskCenter({
             })}
             {nextProjectCursor && (
               <Button
-                className="w-full"
+                className="oc-btn-tactile oc-btn-secondary-craft w-full"
                 variant="secondary"
                 disabled={loading}
                 onClick={() => void refresh('projects')}
@@ -730,17 +961,26 @@ export function MediaTaskCenter({
           </section>
         )}
 
-        <section className="mt-6 space-y-3">
-          {showStandaloneHeading && <h3 className="text-body font-semibold text-fg">单段视频</h3>}
-          {standalone.map((job) => (
+        <section className="mt-5 space-y-3">
+          {showStandaloneHeading && (
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="text-body font-semibold text-fg">单段视频</h3>
+              {visibleStandalone.length > 0 && (
+                <span className="text-caption tabular-nums text-faint">
+                  {visibleStandalone.length} 项
+                </span>
+              )}
+            </div>
+          )}
+          {visibleStandalone.map((job) => (
             <article
               key={job.id}
-              className="rounded-2xl border border-border bg-surface p-4 shadow-sm"
+              className="oc-surface-card oc-surface-card-hover rounded-2xl p-4"
             >
               <p className="line-clamp-3 text-body leading-relaxed text-fg">
                 {job.prompt || '视频合成'}
               </p>
-              <div className="mt-3">
+              <div className="oc-surface-recessed mt-3 rounded-xl px-3 py-2.5">
                 <Progress job={job} />
               </div>
               <FailureNote job={job} />
@@ -755,7 +995,7 @@ export function MediaTaskCenter({
               )}
               {ACTIVE.has(job.status) && (
                 <Button
-                  className="mt-3"
+                  className="oc-btn-tactile oc-btn-secondary-craft mt-3"
                   size="sm"
                   variant="secondary"
                   disabled={busy}
@@ -781,8 +1021,16 @@ export function MediaTaskCenter({
             </article>
           ))}
           {showEmpty && (
-            <div className="rounded-2xl border border-dashed border-border p-8 text-center text-sm text-muted">
-              还没有视频任务。直接告诉 Agent 想制作的内容即可。
+            <div className="oc-surface-card rounded-2xl border-dashed p-8 text-center">
+              <span
+                className="oc-icon-badge oc-icon-badge-accent mx-auto mb-3 size-11 rounded-xl"
+                aria-hidden="true"
+              >
+                <Film size={20} strokeWidth={1.8} />
+              </span>
+              <p className="text-body leading-relaxed text-muted">
+                还没有视频任务。直接告诉 Agent 想制作的内容即可。
+              </p>
             </div>
           )}
           {loading && jobs.length === 0 && (
@@ -792,7 +1040,7 @@ export function MediaTaskCenter({
           )}
           {nextCursor && (
             <Button
-              className="w-full"
+              className="oc-btn-tactile oc-btn-secondary-craft w-full"
               variant="secondary"
               disabled={loading}
               onClick={() => void refresh('jobs')}

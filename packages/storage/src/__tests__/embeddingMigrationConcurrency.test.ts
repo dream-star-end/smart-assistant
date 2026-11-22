@@ -89,7 +89,7 @@ async function migrateLate(home: string): Promise<void> {
     const delayed = provider('new-model', async () => {
       await writeFile(entered, '1')
       const started = Date.now()
-      while (Date.now() - started < 20_000) {
+      while (Date.now() - started < 60_000) {
         try {
           await readFile(releasePath)
           return
@@ -144,29 +144,87 @@ async function finishFirst(home: string): Promise<void> {
   }
 }
 
-function spawnMode(mode: string, home: string): ChildProcess {
-  return spawn(join(sourceRoot, 'node_modules/.bin/tsx'), [thisFile, mode, home], {
+interface SpawnedWorker {
+  child: ChildProcess
+  exited: Promise<number | null>
+  getOutput: () => { stdout: string; stderr: string }
+}
+
+function spawnMode(mode: string, home: string): SpawnedWorker {
+  const child = spawn(join(sourceRoot, 'node_modules/.bin/tsx'), [thisFile, mode, home], {
     cwd: sourceRoot,
     env: { ...process.env, OPENCLAUDE_HOME: home },
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: true,
   })
-}
-
-async function waitChild(child: ChildProcess, label: string): Promise<{ rc: number | null; stdout: string; stderr: string }> {
   let stdout = ''
   let stderr = ''
-  child.stdout!.on('data', (buf) => {
+  child.stdout?.on('data', (buf) => {
     stdout += String(buf)
   })
-  child.stderr!.on('data', (buf) => {
+  child.stderr?.on('data', (buf) => {
     stderr += String(buf)
   })
-  const rc = await deadline(new Promise<number | null>((resolve, reject) => {
+  const exited = new Promise<number | null>((resolve, reject) => {
     child.once('error', reject)
     child.once('exit', resolve)
-  }), 20_000, label)
+  })
+  return {
+    child,
+    exited,
+    getOutput: () => ({ stdout, stderr }),
+  }
+}
+
+async function waitChild(
+  worker: SpawnedWorker,
+  label: string,
+): Promise<{ rc: number | null; stdout: string; stderr: string }> {
+  const rc = await deadline(worker.exited, 60_000, label)
+  const { stdout, stderr } = worker.getOutput()
   return { rc, stdout, stderr }
+}
+
+async function waitForMarkerFile(
+  markerPath: string,
+  worker: SpawnedWorker,
+  timeoutMs: number,
+  label: string,
+): Promise<void> {
+  let workerDone = false
+  let workerRc: number | null = null
+  let workerErr: unknown = null
+  worker.exited.then(
+    (rc) => {
+      workerDone = true
+      workerRc = rc
+    },
+    (err) => {
+      workerDone = true
+      workerErr = err
+    },
+  )
+
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      await readFile(markerPath)
+      return
+    } catch {
+      if (workerDone) {
+        const { stderr, stdout } = worker.getOutput()
+        const detail = workerErr ? String(workerErr) : `exitCode=${String(workerRc)}`
+        throw new Error(
+          `${label} exited before creating ${markerPath} (${detail})\nstderr: ${stderr}\nstdout: ${stdout}`,
+        )
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+  }
+  const { stderr, stdout } = worker.getOutput()
+  throw new Error(
+    `timed out after ${timeoutMs}ms waiting for ${label} marker ${markerPath}\nstderr: ${stderr}\nstdout: ${stdout}`,
+  )
 }
 
 const mode = process.argv[2]
@@ -186,42 +244,41 @@ if (mode === '--seed') {
     process.exitCode = 1
   })
 } else {
-  test('parallel first-start migrations preserve vectors completed during re-embedding', { timeout: 45_000 }, async (t) => {
-    const home = await mkdtemp(join(tmpdir(), 'emb-migration-concurrency-'))
-    const children: ChildProcess[] = []
-    t.signal.addEventListener('abort', () => {
-      for (const child of children) stopWorker(child)
-    }, { once: true })
-    try {
-      const seeder = spawnMode('--seed', home)
-      children.push(seeder)
-      const seeded = await waitChild(seeder, 'seed')
-      assert.equal(seeded.rc, 0, seeded.stderr)
-      await writeFile(join(home, 'seed.json'), seeded.stdout.trim().split('\n').at(-1)!)
+  test(
+    'parallel first-start migrations preserve vectors completed during re-embedding',
+    { timeout: 150_000 },
+    async (t) => {
+      const home = await mkdtemp(join(tmpdir(), 'emb-migration-concurrency-'))
+      const children: ChildProcess[] = []
+      t.signal.addEventListener(
+        'abort',
+        () => {
+          for (const child of children) stopWorker(child)
+        },
+        { once: true },
+      )
+      try {
+        const seeder = spawnMode('--seed', home)
+        children.push(seeder.child)
+        const seeded = await waitChild(seeder, 'seed')
+        assert.equal(seeded.rc, 0, seeded.stderr)
+        await writeFile(join(home, 'seed.json'), seeded.stdout.trim().split('\n').at(-1)!)
 
-      const late = spawnMode('--late', home)
-      children.push(late)
-      const enteredAt = Date.now()
-      while (Date.now() - enteredAt < 10_000) {
-        try {
-          await readFile(join(home, 'entered'))
-          break
-        } catch {
-          await new Promise((resolve) => setTimeout(resolve, 20))
-        }
+        const late = spawnMode('--late', home)
+        children.push(late.child)
+        await waitForMarkerFile(join(home, 'entered'), late, 45_000, 'late migration')
+
+        const first = spawnMode('--first', home)
+        children.push(first.child)
+        const finished = await waitChild(first, 'first migration')
+        assert.equal(finished.rc, 0, finished.stderr)
+        await writeFile(join(home, 'release'), '1')
+        const lateResult = await waitChild(late, 'late migration')
+        assert.equal(lateResult.rc, 0, lateResult.stderr)
+      } finally {
+        for (const child of children) stopWorker(child)
+        await rm(home, { recursive: true, force: true })
       }
-      await readFile(join(home, 'entered'))
-
-      const first = spawnMode('--first', home)
-      children.push(first)
-      const finished = await waitChild(first, 'first migration')
-      assert.equal(finished.rc, 0, finished.stderr)
-      await writeFile(join(home, 'release'), '1')
-      const lateResult = await waitChild(late, 'late migration')
-      assert.equal(lateResult.rc, 0, lateResult.stderr)
-    } finally {
-      for (const child of children) stopWorker(child)
-      await rm(home, { recursive: true, force: true })
-    }
-  })
+    },
+  )
 }

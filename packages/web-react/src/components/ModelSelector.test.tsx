@@ -2,8 +2,12 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import '@testing-library/jest-dom/vitest'
 import type { LockedPublicModel, PublicModel } from '../lib/types'
-import { ModelSelector, modelLabel, teamEngineLabel } from './ModelSelector'
+import { loadBeforeAll } from '../test/moduleLoad'
+import { ModelSelector, compactMobileModelLabel, modelLabel, preloadModelSelectorPanel, teamEngineLabel } from './ModelSelector'
+import { parseModelDisplayMeta } from './ModelSelectorExtras'
 import { EFFORT_OPTIONS } from './settings/labels'
+
+loadBeforeAll(preloadModelSelectorPanel)
 
 // 本仓 vitest 未开 globals 自动 cleanup,显式隔离每个用例的 DOM。
 afterEach(() => {
@@ -359,8 +363,11 @@ describe('ModelSelector Cursor Opus/Fable 上下文档(turn 级 contextTier)', (
     expect(std).toBeTruthy()
     expect(long).toBeTruthy()
     expect(std?.textContent).toContain('默认')
-    // 默认档:300k 行带勾,1M 行不带
-    expect(std?.querySelector('svg')).toBeTruthy()
+    // OCV5-836: 分段滑块去掉生硬 ✓ 对勾，改用浮起亮卡 .oc-segmented-thumb + aria-pressed 表达选中
+    expect(std).toHaveAttribute('aria-pressed', 'true')
+    expect(std?.className).toContain('oc-segmented-thumb')
+    expect(std?.querySelector('svg')).toBeNull()
+    expect(long).toHaveAttribute('aria-pressed', 'false')
     expect(long?.querySelector('svg')).toBeNull()
     if (long) fireEvent.click(long)
     expect(onSelectContextTier).toHaveBeenCalledWith('1m')
@@ -382,8 +389,10 @@ describe('ModelSelector Cursor Opus/Fable 上下文档(turn 级 contextTier)', (
     await screen.findAllByRole('menuitem')
     const std = document.querySelector('[data-cursor-context="300k"]')
     const long = document.querySelector('[data-cursor-context="1m"]')
-    expect(long?.querySelector('svg')).toBeTruthy()
-    expect(std?.querySelector('svg')).toBeNull()
+    expect(long).toHaveAttribute('aria-pressed', 'true')
+    expect(long?.className).toContain('oc-segmented-thumb')
+    expect(std).toHaveAttribute('aria-pressed', 'false')
+    expect(std?.className).not.toContain('oc-segmented-thumb')
     if (std) fireEvent.click(std)
     expect(onSelectContextTier).toHaveBeenCalledWith('300k')
     expect(onSelect).not.toHaveBeenCalled()
@@ -974,9 +983,10 @@ describe('ModelSelector OCV5-434 / OCV5-798 GPT 速度档位(turn 级 serviceTie
     const fast = document.querySelector('[data-gpt-fast="true"]')
     const ultra = document.querySelector('[data-gpt-ultrafast="true"]')
     expect(fast?.textContent).toContain('按 2× 计费')
-    expect(fast?.querySelector('svg')).toBeTruthy()
+    expect(fast).toHaveAttribute('aria-pressed', 'true')
+    expect(fast?.className).toContain('oc-segmented-thumb')
     expect(ultra?.textContent).toContain('按 6× 计费')
-    expect(ultra).toBeTruthy()
+    expect(ultra).toHaveAttribute('aria-pressed', 'false')
     fireEvent.click(ultra!)
     expect(onSelectServiceTier).toHaveBeenCalledWith('ultrafast')
 
@@ -1003,7 +1013,8 @@ describe('ModelSelector OCV5-434 / OCV5-798 GPT 速度档位(turn 级 serviceTie
       const std = document.querySelector('[data-gpt-fast="false"]')
       const fast = document.querySelector('[data-gpt-fast="true"]')
       expect(fast?.textContent).toContain('按 2× 计费')
-      expect(std?.querySelector('svg')).toBeTruthy()
+      expect(std).toHaveAttribute('aria-pressed', 'true')
+      expect(std?.className).toContain('oc-segmented-thumb')
       expect(document.querySelector('[data-gpt-ultrafast]')).toBeNull()
     }
   })
@@ -1121,6 +1132,39 @@ describe('ModelSelector OCV5-434 / OCV5-798 GPT 速度档位(turn 级 serviceTie
     expect(trigger.textContent).not.toMatch(/x\d/)
   })
 
+  it('OCV5-817: 移动端非标准速度档(Fast/Ultrafast)显式渲染紧凑徽标 model-trigger-speed-mobile', () => {
+    const view = render(
+      <ModelSelector
+        models={GPT_MODELS}
+        selectedId="gpt-6.2-sol"
+        onSelect={() => {}}
+        serviceTier="fast"
+        onSelectServiceTier={() => {}}
+      />,
+    )
+    expect(screen.getByTestId('model-trigger-speed-mobile')).toHaveTextContent('Fast 2×')
+    view.rerender(
+      <ModelSelector
+        models={GPT_MODELS}
+        selectedId="gpt-6.2-sol"
+        onSelect={() => {}}
+        serviceTier="ultrafast"
+        onSelectServiceTier={() => {}}
+      />,
+    )
+    expect(screen.getByTestId('model-trigger-speed-mobile')).toHaveTextContent('Ultra 6×')
+    view.rerender(
+      <ModelSelector
+        models={GPT_MODELS}
+        selectedId="gpt-6.2-sol"
+        onSelect={() => {}}
+        serviceTier={null}
+        onSelectServiceTier={() => {}}
+      />,
+    )
+    expect(screen.queryByTestId('model-trigger-speed-mobile')).toBeNull()
+  })
+
   it('Remote Codex 与非加速模型不渲染速度段', async () => {
     for (const id of ['gpt-6-luna-remote', 'opencode-grok-4.7', 'glm-5.2']) {
       cleanup()
@@ -1168,5 +1212,485 @@ describe('OCV5-504 自选档说明保持默认与目录价格权威', () => {
     expect(screen.getByText('较低档偏重响应速度，较高档偏重复杂任务。')).toBeInTheDocument()
     fireEvent.click(document.querySelector('[data-effort="follow"]')!)
     expect(onSelectEffort).toHaveBeenCalledExactlyOnceWith(null)
+  })
+})
+
+function stubViewport({ width, height }: { width: number; height: number }) {
+  const original = window.matchMedia
+  window.matchMedia = ((query: string) => {
+    let matches = false
+    const minW = query.match(/\(min-width:\s*(\d+(?:\.\d+)?)px\)/)
+    const maxW = query.match(/\(max-width:\s*(\d+(?:\.\d+)?)px\)/)
+    const maxH = query.match(/\(max-height:\s*(\d+(?:\.\d+)?)px\)/)
+    if (minW) matches = width >= Number(minW[1])
+    else if (maxW) matches = width <= Number(maxW[1])
+    else if (maxH) matches = height <= Number(maxH[1])
+    return {
+      matches,
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    } as MediaQueryList
+  }) as typeof window.matchMedia
+  return () => {
+    window.matchMedia = original
+  }
+}
+
+describe('ModelSelector OCV5-820 响应式根治（<640 Sheet / ≥640 双栏 / ≤560 矮屏 2-Tab）', () => {
+  const FULL_MODELS: PublicModel[] = [
+    { id: 'glm-5.2', display_name: 'GLM-5.2', cost_x: 0.5 },
+    { id: 'gpt-6.2-sol', display_name: 'GPT-6.2 Sol', cost_x: 0.5 },
+    { id: 'gpt-6.2-sol-1m', display_name: 'GPT-6.2 Sol', cost_x: 0.8 },
+    { id: 'gpt-6.2-astra', display_name: 'GPT-6.2 Astra', cost_x: 4.1 },
+    { id: 'gpt-6.2-astra-1m', display_name: 'GPT-6.2 Astra', cost_x: 6.1 },
+    { id: 'deepseek-v4', display_name: 'DeepSeek-V4', cost_x: 0.3 },
+  ]
+
+  it('手机 <640px（390×844）：固定双区 BottomSheet（中区独立滚模型列表 + 底部参数坞），移除 sm:hidden', async () => {
+    const restore = stubViewport({ width: 390, height: 844 })
+    try {
+      const onSelectServiceTier = vi.fn()
+      const onSelectEffort = vi.fn()
+      render(
+        <ModelSelector
+          models={FULL_MODELS}
+          selectedId="gpt-6.2-sol"
+          onSelect={() => {}}
+          serviceTier="fast"
+          onSelectServiceTier={onSelectServiceTier}
+          effortSupported={['low', 'medium', 'high']}
+          effortActive="high"
+          onSelectEffort={onSelectEffort}
+        />,
+      )
+      fireEvent.click(screen.getByRole('button', { name: '选择对话模型' }))
+      const dialog = await screen.findByRole('dialog')
+      expect(dialog.className).toContain('model-picker-sheet')
+      expect(dialog.className).not.toContain('sm:hidden')
+      expect(dialog.previousElementSibling?.className ?? '').not.toContain('sm:hidden')
+
+      const scroll = screen.getByTestId('model-picker-sheet-scroll')
+      expect(scroll.className).toContain('min-h-0')
+      expect(scroll.className).toContain('flex-1')
+      expect(scroll.className).toContain('overflow-y-auto')
+      expect(scroll.textContent).toContain('GPT-6.2-Sol')
+      expect(scroll.textContent).toContain('GPT-6.2-Astra')
+      expect(scroll.textContent).toContain('DeepSeek-V4')
+
+      const dock = screen.getByTestId('model-picker-extras-dock')
+      expect(dock.className).toContain('shrink-0')
+      expect(dock.textContent).toContain('速度')
+      expect(dock.textContent).toContain('上下文')
+      expect(dock.textContent).toContain('思考档位')
+      fireEvent.click(dock.querySelector('[data-gpt-ultrafast="true"]')!)
+      expect(onSelectServiceTier).toHaveBeenCalledWith('ultrafast')
+    } finally {
+      restore()
+    }
+  })
+
+  it('折叠屏/平板/桌面 ≥640px 且 >560px（768×700）：左右双栏 Popover，左栏 min-h-[14rem] 防坍塌，右栏参数 + 倍率摘要', async () => {
+    const restore = stubViewport({ width: 768, height: 700 })
+    try {
+      const onSelectEffort = vi.fn()
+      const onSelectServiceTier = vi.fn()
+      render(
+        <ModelSelector
+          models={FULL_MODELS}
+          selectedId="gpt-6.2-sol"
+          onSelect={() => {}}
+          serviceTier="ultrafast"
+          onSelectServiceTier={onSelectServiceTier}
+          effortSupported={['low', 'medium', 'high']}
+          effortActive="high"
+          onSelectEffort={onSelectEffort}
+        />,
+      )
+      openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+      const twoCol = await screen.findByTestId('model-picker-two-col')
+      expect(twoCol.className).toContain('model-picker-popover')
+      expect(twoCol.className).toContain('w-[min(620px,calc(100vw-24px))]')
+
+      const listCol = screen.getByTestId('model-picker-list-col')
+      expect(listCol.className).toContain('min-h-[14rem]')
+      expect(listCol.textContent).toContain('GPT-6.2-Astra')
+      expect(listCol.textContent).toContain('DeepSeek-V4')
+
+      const extrasCol = screen.getByTestId('model-picker-extras-col')
+      expect(extrasCol.className).toContain('min-h-[14rem]')
+      expect(screen.getByTestId('model-picker-active-cost')).toHaveTextContent('x3.0')
+      expect(screen.getByTestId('model-picker-active-cost')).toHaveClass('tabular-nums')
+
+      fireEvent.click(extrasCol.querySelector('[data-effort="low"]')!)
+      expect(onSelectEffort).toHaveBeenCalledWith('low')
+    } finally {
+      restore()
+    }
+  })
+
+  it('平板/桌面 ≥640px 无任何 extras 参数时优雅回退单栏 Popover', async () => {
+    const restore = stubViewport({ width: 1024, height: 768 })
+    try {
+      render(<ModelSelector models={FULL_MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
+      openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+      const singleCol = await screen.findByTestId('model-picker-single-col')
+      expect(singleCol.className).toContain('model-picker-popover')
+      expect(screen.queryByTestId('model-picker-two-col')).toBeNull()
+      expect(singleCol.textContent).toContain('DeepSeek-V4')
+    } finally {
+      restore()
+    }
+  })
+
+  it('矮屏/横屏手机 ≤560px（844×390，宽度 ≥640px）：自动切入无 sm:hidden 的 Sheet + 顶部 2-Tab [模型 | 执行参数]', async () => {
+    const restore = stubViewport({ width: 844, height: 390 })
+    try {
+      const onSelect = vi.fn()
+      const onSelectServiceTier = vi.fn()
+      render(
+        <ModelSelector
+          models={FULL_MODELS}
+          selectedId="gpt-6.2-sol"
+          onSelect={onSelect}
+          serviceTier="fast"
+          onSelectServiceTier={onSelectServiceTier}
+          effortSupported={['low', 'medium', 'high']}
+          effortActive="medium"
+          onSelectEffort={() => {}}
+        />,
+      )
+      // 横屏 ≥640px 但高度 ≤560px 走 click 打开 Sheet（而非 DropdownMenu）
+      fireEvent.click(screen.getByRole('button', { name: '选择对话模型' }))
+      const dialog = await screen.findByRole('dialog')
+      expect(dialog.className).toContain('model-picker-sheet')
+      expect(dialog.className).toContain('model-picker-sheet-short')
+      // 关键防坑：绝不能带 sm:hidden，否则 ≥640px 横屏手机会被 CSS display:none 隐藏！
+      expect(dialog.className).not.toContain('sm:hidden')
+      expect(dialog.previousElementSibling?.className ?? '').not.toContain('sm:hidden')
+
+      // 默认落「模型」Tab，列表完整可见且可点选
+      const modelsTab = screen.getByTestId('model-picker-tab-models')
+      const extrasTab = screen.getByTestId('model-picker-tab-extras')
+      expect(modelsTab).toHaveAttribute('aria-selected', 'true')
+      expect(extrasTab).toHaveAttribute('aria-selected', 'false')
+      expect(screen.getByTestId('model-picker-sheet-scroll').textContent).toContain('DeepSeek-V4')
+      expect(screen.queryByTestId('model-picker-extras-panel')).toBeNull()
+
+      // 切到「执行参数」Tab，速度 / 上下文 / 思考档位完整可控
+      fireEvent.click(extrasTab)
+      expect(modelsTab).toHaveAttribute('aria-selected', 'false')
+      expect(extrasTab).toHaveAttribute('aria-selected', 'true')
+      const extrasPanel = screen.getByTestId('model-picker-extras-panel')
+      expect(extrasPanel.textContent).toContain('速度')
+      expect(extrasPanel.textContent).toContain('上下文')
+      expect(extrasPanel.textContent).toContain('思考档位')
+      fireEvent.click(extrasPanel.querySelector('[data-gpt-ultrafast="true"]')!)
+      expect(onSelectServiceTier).toHaveBeenCalledWith('ultrafast')
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+
+      // 再次打开自动重置回「模型」Tab，保证首屏必见模型列表
+      fireEvent.click(screen.getByRole('button', { name: '选择对话模型' }))
+      await screen.findByRole('dialog')
+      expect(screen.getByTestId('model-picker-tab-models')).toHaveAttribute('aria-selected', 'true')
+      fireEvent.click(screen.getByRole('menuitem', { name: /DeepSeek-V4/ }))
+      expect(onSelect).toHaveBeenCalledWith('deepseek-v4')
+    } finally {
+      restore()
+    }
+  })
+
+  it('OCV5-831：手机紧凑胶囊自动去除末尾括号来源后缀，桌面触发器、title 与模型选择面板保留完整名称', async () => {
+    const antigravityModels: PublicModel[] = [
+      { id: 'gemini-4-neon-ag', display_name: 'Gemini 4 Neon (Antigravity)', cost_x: 2.7 },
+      { id: 'glm-5.2', display_name: 'GLM-5.2' },
+    ]
+    expect(compactMobileModelLabel('Gemini 4 Neon (Antigravity)')).toBe('Gemini 4 Neon')
+
+    render(
+      <ModelSelector
+        models={antigravityModels}
+        selectedId="gemini-4-neon-ag"
+        onSelect={() => {}}
+      />,
+    )
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(trigger).toHaveAttribute('title', 'Gemini 4 Neon (Antigravity)')
+    const mobileSpan = screen.getByTestId('model-trigger-label-mobile')
+    expect(mobileSpan).toHaveTextContent('Gemini 4 Neon')
+    expect(mobileSpan).toHaveClass('sm:hidden')
+    expect(trigger.textContent).toContain('Gemini 4 Neon (Antigravity)')
+    expect(trigger.textContent).toContain('2.7')
+
+    openMenu(trigger)
+    const items = await screen.findAllByRole('menuitem')
+    expect(items.some((i) => i.textContent?.includes('Gemini 4 Neon (Antigravity)'))).toBe(true)
+  })
+})
+
+describe('ModelSelector OCV5-836 现代品牌徽标、去刷屏名称清洗与家族分组', () => {
+  const ATELIER_MODELS: PublicModel[] = [
+    { id: 'gemini-4-neon-ag', display_name: 'Gemini 4 Neon (Antigravity)', cost_x: 2.7 },
+    { id: 'gemini-4-flash-ag', display_name: 'Gemini 4 Flash (Antigravity)', cost_x: 0.9 },
+    { id: 'claude-opus-5.5-ag', display_name: 'Claude Opus 5.5 (Antigravity)', cost_x: 5.5 },
+    { id: 'claude-sonnet-5.5-remote', display_name: 'Claude Sonnet 5.5 远端 (Antigravity)', cost_x: 3.1 },
+    { id: 'orchestrator-carbon-ag', display_name: 'Orchestrator Carbon (Antigravity)', cost_x: 4.2 },
+    { id: 'gpt-6.2-sol', display_name: 'GPT-6.2 Sol', cost_x: 1.5 },
+  ]
+
+  it('parseModelDisplayMeta 清洗 (Antigravity) 刷屏后缀并提炼 远端/编排/Go 微标签', () => {
+    expect(parseModelDisplayMeta('Gemini 4 Neon (Antigravity)', 'gemini-4-neon-ag')).toEqual({
+      raw: 'Gemini 4 Neon (Antigravity)',
+      cleanName: 'Gemini 4 Neon',
+      tags: [],
+    })
+    expect(
+      parseModelDisplayMeta('Claude Sonnet 5.5 远端 (Antigravity)', 'claude-sonnet-5.5-remote'),
+    ).toEqual({
+      raw: 'Claude Sonnet 5.5 远端 (Antigravity)',
+      cleanName: 'Claude Sonnet 5.5',
+      tags: [{ label: '远端', tone: 'info' }],
+    })
+    expect(
+      parseModelDisplayMeta('Orchestrator Carbon (Antigravity)', 'orchestrator-carbon-ag'),
+    ).toEqual({
+      raw: 'Orchestrator Carbon (Antigravity)',
+      cleanName: 'Orchestrator Carbon',
+      tags: [{ label: '编排', tone: 'accent' }],
+    })
+    expect(parseModelDisplayMeta('Kimi K3 (Go)', 'kimi-k3-go')).toEqual({
+      raw: 'Kimi K3 (Go)',
+      cleanName: 'Kimi K3',
+      tags: [{ label: 'Go', tone: 'neutral' }],
+    })
+    expect(parseModelDisplayMeta('(Antigravity)', 'ag')).toEqual({
+      raw: '(Antigravity)',
+      cleanName: '(Antigravity)',
+      tags: [],
+    })
+  })
+
+  it('多家族模型自动按家族轻量分组、渲染双色调家族徽标、清洗名称并保留完整 title/sr-only', async () => {
+    render(
+      <ModelSelector
+        models={ATELIER_MODELS}
+        selectedId="gemini-4-neon-ag"
+        onSelect={() => {}}
+        effortSupported={['low', 'medium', 'high']}
+        effortActive="high"
+        onSelectEffort={() => {}}
+      />,
+    )
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+
+    // 轻量家族小标题按首现顺序渲染
+    const groupHeaders = Array.from(document.querySelectorAll('[data-family-group]')).map((el) =>
+      el.getAttribute('data-family-group'),
+    )
+    expect(groupHeaders).toEqual(['gemini', 'claude', 'orchestrator', 'gpt'])
+
+    // 选中项具备暖陶土呼吸光晕徽标与选中高亮类
+    const activeRow = document.querySelector('[data-model-id="gemini-4-neon-ag"]')
+    expect(activeRow).toBeTruthy()
+    expect(activeRow?.className).toContain('model-picker-row-active')
+    expect(activeRow?.querySelector('.oc-breathe-aura')).toBeTruthy()
+    expect(activeRow?.getAttribute('title')).toBe('Gemini 4 Neon (Antigravity)')
+    expect(activeRow?.querySelector('.sr-only')?.textContent).toBe('Gemini 4 Neon (Antigravity)')
+
+    // 远端 & 编排微标签
+    const remoteRow = document.querySelector('[data-model-id="claude-sonnet-5.5-remote"]')
+    expect(remoteRow?.querySelector('[data-model-tag="远端"]')).toBeTruthy()
+    const orchRow = document.querySelector('[data-model-id="orchestrator-carbon-ag"]')
+    expect(orchRow?.querySelector('[data-model-tag="编排"]')).toBeTruthy()
+
+    // 桌面双栏右侧当前模型摘要也带专属呼吸徽标且副名去除了 (Antigravity)
+    const summary = screen.getByTestId('model-picker-extras-summary')
+    expect(summary.querySelector('.oc-breathe-aura')).toBeTruthy()
+    expect(summary.textContent).toContain('Gemini 4 Neon')
+    expect(summary.textContent).not.toContain('(Antigravity)')
+
+    // 思考档位分段控件使用浮起滑块 + 弹簧触感且不含生硬对勾 SVG
+    const highBtn = document.querySelector('[data-effort="high"]')
+    expect(highBtn).toHaveAttribute('aria-pressed', 'true')
+    expect(highBtn?.className).toContain('oc-segmented-thumb')
+    expect(highBtn?.className).toContain('oc-spring-press')
+    expect(highBtn?.querySelector('svg')).toBeNull()
+  })
+
+  it('移动端 BottomSheet 顶部展示专属家族呼吸徽标与清洗后的简洁副标', async () => {
+    const restore = stubViewport({ width: 390, height: 844 })
+    try {
+      render(
+        <ModelSelector
+          models={ATELIER_MODELS}
+          selectedId="gemini-4-neon-ag"
+          onSelect={() => {}}
+          effortSupported={['low', 'medium', 'high']}
+          effortActive="high"
+          onSelectEffort={() => {}}
+        />,
+      )
+      fireEvent.click(screen.getByRole('button', { name: '选择对话模型' }))
+      await screen.findByRole('dialog')
+
+      const sheetIcon = screen.getByTestId('model-picker-sheet-icon')
+      expect(sheetIcon.className).toContain('oc-breathe-aura')
+      expect(sheetIcon.querySelector('svg')).toBeTruthy()
+
+      const subtitle = screen.getByTestId('model-picker-sheet-subtitle')
+      expect(subtitle.textContent).toContain('Gemini 4 Neon')
+      expect(subtitle.textContent).not.toContain('(Antigravity)')
+      expect(subtitle).toHaveAttribute('title', 'Gemini 4 Neon (Antigravity)')
+    } finally {
+      restore()
+    }
+  })
+})
+
+describe('ModelSelector OCV5-843 蜂群模式集成（列表微标 + 参数区协作模式 + 顶栏胶囊激活态）', () => {
+  const SWARM_MODELS: PublicModel[] = [
+    { id: 'antigravity-gemini-4-neon', display_name: 'Gemini 4 Neon (Antigravity)', engine: 'antigravity', cost_x: 2.7 },
+    { id: 'antigravity-orchestrator-neon', display_name: 'Orchestrator Neon (Antigravity)', engine: 'antigravity', cost_x: 4.5 },
+    { id: 'antigravity-claude-opus-5.5', display_name: 'Claude Opus 5.5 (Antigravity)', engine: 'antigravity', cost_x: 2.1 },
+    { id: 'claude-opus-5.5', display_name: 'Claude Opus 5.5', engine: 'ccb', cost_x: 6.1 },
+    { id: 'gpt-6.2-astra', display_name: 'GPT-6.2-Astra', engine: 'codex', cost_x: 4.1 },
+  ]
+
+  it('仅 Antigravity 模型行展示只读蜂群微标，同名双 Claude Opus 5.5 一眼可辨；协作模式点击不关闭面板', async () => {
+    const onSelectSwarmMode = vi.fn()
+    render(
+      <ModelSelector
+        models={SWARM_MODELS}
+        selectedId="antigravity-orchestrator-neon"
+        onSelect={() => {}}
+        swarmSupported
+        swarmMode={false}
+        onSelectSwarmMode={onSelectSwarmMode}
+      />,
+    )
+
+    // 即使 Orchestrator 无思考档位，也应进入桌面双栏并展示协作模式
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findByTestId('model-picker-two-col')
+
+    const agClaudeRow = document.querySelector('[data-model-id="antigravity-claude-opus-5.5"]')
+    const nativeClaudeRow = document.querySelector('[data-model-id="claude-opus-5.5"]')
+    expect(agClaudeRow?.querySelector('[data-testid="model-row-swarm-capable"]')).toBeTruthy()
+    expect(nativeClaudeRow?.querySelector('[data-testid="model-row-swarm-capable"]')).toBeNull()
+
+    const swarmSection = screen.getByTestId('model-picker-swarm-section')
+    expect(swarmSection.textContent).toContain('协作模式')
+    expect(swarmSection.textContent).toContain('多智能体并行拆解与讨论板')
+
+    const swarmPill = document.querySelector('[data-swarm-mode="swarm"]') as HTMLButtonElement
+    const soloPill = document.querySelector('[data-swarm-mode="solo"]') as HTMLButtonElement
+    expect(soloPill).toHaveAttribute('aria-pressed', 'true')
+    expect(swarmPill).toHaveAttribute('aria-pressed', 'false')
+
+    fireEvent.click(swarmPill)
+    expect(onSelectSwarmMode).toHaveBeenCalledWith(true)
+    // 切换协作模式不关闭面板
+    expect(screen.getByTestId('model-picker-two-col')).toBeInTheDocument()
+  })
+
+  it('开启蜂群态时顶栏触发器呈现暖陶土激活态、双端可见图标、桌面蜂群微徽标与运行态属性同步（无闪烁红点）；团队模式时隐藏', async () => {
+    const { rerender } = render(
+      <ModelSelector
+        models={SWARM_MODELS}
+        selectedId="antigravity-gemini-4-neon"
+        onSelect={() => {}}
+        effortSupported={['low', 'medium', 'high']}
+        effortActive="high"
+        onSelectEffort={() => {}}
+        swarmSupported
+        swarmMode
+        swarmRunning
+        onSelectSwarmMode={() => {}}
+      />,
+    )
+
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(trigger).toHaveAttribute('data-swarm-active', 'true')
+    expect(trigger).toHaveAttribute('data-swarm-running', 'true')
+    expect(trigger.className).toContain('oc-model-trigger-swarm')
+    expect(trigger.className).toContain('oc-shimmer-sheen')
+    expect(screen.getByTestId('model-trigger-swarm-icon')).toBeInTheDocument()
+    expect(screen.queryByTestId('model-trigger-swarm-running-dot')).toBeNull()
+
+    const badge = screen.getByTestId('model-trigger-swarm-badge')
+    expect(badge).toHaveTextContent('蜂群')
+    expect(badge.className).toContain('inline-flex')
+    expect(badge.className).not.toContain('hidden')
+
+    openMenu(trigger)
+    await screen.findByTestId('model-picker-two-col')
+    expect(screen.getByTestId('model-picker-extras-swarm-tag')).toHaveTextContent('蜂群')
+    expect(screen.getByTestId('model-picker-swarm-running-hint')).toHaveTextContent('当前蜂群运行中')
+
+    // 团队模式锁定态不叠加蜂群样式
+    rerender(
+      <ModelSelector
+        models={SWARM_MODELS}
+        selectedId="antigravity-gemini-4-neon"
+        onSelect={() => {}}
+        teamEngineActive
+        swarmSupported
+        swarmMode
+        swarmRunning
+        onSelectSwarmMode={() => {}}
+      />,
+    )
+    expect(screen.getByRole('button', { name: '选择对话模型' })).not.toHaveAttribute('data-swarm-active')
+    expect(screen.queryByTestId('model-trigger-swarm-badge')).toBeNull()
+  })
+
+  it('移动端 BottomSheet 头部副标同步显示蜂群微标签，并在底部参数坞可切换协作模式', async () => {
+    const restore = stubViewport({ width: 390, height: 844 })
+    const onSelectSwarmMode = vi.fn()
+    try {
+      render(
+        <ModelSelector
+          models={SWARM_MODELS}
+          selectedId="antigravity-gemini-4-neon"
+          onSelect={() => {}}
+          swarmSupported
+          swarmMode
+          onSelectSwarmMode={onSelectSwarmMode}
+        />,
+      )
+      fireEvent.click(screen.getByRole('button', { name: '选择对话模型' }))
+      await screen.findByRole('dialog')
+
+      expect(screen.getByTestId('model-picker-sheet-swarm-tag')).toHaveTextContent('蜂群')
+      const dock = screen.getByTestId('model-picker-extras-dock')
+      const soloBtn = dock.querySelector('[data-swarm-mode="solo"]') as HTMLButtonElement
+      fireEvent.click(soloBtn)
+      expect(onSelectSwarmMode).toHaveBeenCalledWith(false)
+      expect(screen.getByRole('dialog')).toBeInTheDocument()
+    } finally {
+      restore()
+    }
+  })
+
+  it('非支持蜂群的模型在面板内展示触屏可读引导（切至 Gemini 4 / Antigravity 可启用蜂群）', async () => {
+    render(
+      <ModelSelector
+        models={SWARM_MODELS}
+        selectedId="claude-opus-5-5-native"
+        onSelect={() => {}}
+        swarmSupported={false}
+        swarmMode={false}
+        onSelectSwarmMode={() => {}}
+      />,
+    )
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    openMenu(trigger)
+    const hint = await screen.findByTestId('model-picker-swarm-hint')
+    expect(hint.textContent).toContain('Antigravity')
   })
 })

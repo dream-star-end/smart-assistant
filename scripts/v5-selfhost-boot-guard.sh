@@ -6,6 +6,7 @@
 set -euo pipefail
 
 BOOT_LIVE="${BOOT_LIVE:-/opt/openclaude/openclaude-v5-selfhost-live}"
+BOOT_SLOT_PREFIX="${BOOT_SLOT_PREFIX:-/opt/openclaude/openclaude-v5-selfhost-slot}"
 BOOT_RELEASES_ROOT="${BOOT_RELEASES_ROOT:-/opt/openclaude/openclaude-v5-selfhost-releases}"
 BOOT_RESTORE="${BOOT_RESTORE:-/opt/openclaude/v5-selfhost-breakglass/restore-worktree-units.sh}"
 BOOT_BACKUP_CURRENT="${BOOT_BACKUP_CURRENT:-/opt/openclaude/v5-selfhost-breakglass/unit-backups/worktree-current}"
@@ -59,9 +60,24 @@ restore_worktree_units() {
   bash "$BOOT_RESTORE" "${extra[@]}"
 }
 
+repair_slot_symlinks() { # <validated-live-target>
+  local target="$1" s link cur tmp
+  for s in A B; do
+    link="${BOOT_SLOT_PREFIX}-${s}"
+    [[ -L "$link" ]] || continue
+    cur="$(readlink -f -- "$link" 2>/dev/null || true)"
+    if [[ -n "$cur" && -d "$cur" && -f "$cur/.complete" && "$cur" == "${BOOT_RELEASES_ROOT}"/rel-* && "$cur" != *.poisoned ]]; then
+      continue
+    fi
+    tmp="${link}.bootguard.$$"
+    ln -sfn -- "$target" "$tmp" && mv -Tf -- "$tmp" "$link" && blog "修复悬空槽位软链 ${link} → ${target}" || rm -f -- "$tmp"
+  done
+}
+
 boot_once() {
   local target
   if target="$(live_target_ok)"; then
+    repair_slot_symlinks "$target"
     blog "live ok → $target"
     return 0
   fi

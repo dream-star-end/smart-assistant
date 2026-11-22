@@ -17,6 +17,7 @@ import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import type { Agent } from "../lib/agents";
 import type { PrefsView } from "../lib/modelPreferences";
 import type { AuthSession, ChatProject, DeletedChatProject, ProjectAsset, PublicModel, RepoSelection, Session, SessionSearchHit, User } from "../lib/types";
+import type { SessionNeedsYouKind } from "../lib/sessionStatus";
 import type { UseChatSocket } from "../hooks/useChatSocket";
 import type { CollabMode, CollabUiState } from "../lib/collaborationConfig";
 import type { CreateProjectInput } from "../hooks/useChatProjects";
@@ -50,6 +51,10 @@ const ProjectArchiveDialog = lazy(() =>
 // Ctrl/⌘K palette: lazy, mounted on first open (first-screen budget).
 const CommandPalette = lazy(() =>
   import("./CommandPalette").then((m) => ({ default: m.CommandPalette })),
+);
+// OCV5-840: 上下文健康与一键瘦身弹层，按需懒加载（零首屏开销）。
+const ContextHealthPopover = lazy(() =>
+  import("./chat/ContextHealthPopover").then((m) => ({ default: m.ContextHealthPopover })),
 );
 
 // P5b「记住这条 / 存为项目技能」弹窗：点了才下载（带 lib/taskboard）。
@@ -150,7 +155,7 @@ export type AppDialogsProps = {
   openManage: (tab: ManageTab) => void;
   openMarketplace: (tab: MarketplaceTab, kind?: MarketplaceKind) => void;
   openRepo: () => void;
-  openSites?: () => void;
+  openSites?: (slug?: string | null) => void;
   openTutorial: (id?: "preferences" | "connectors" | "chat-basics" | "inbox" | "taskboard" | "session-goal" | "sessions-history" | "models-reasoning" | "files-media" | "voice-input" | "web-research" | "artifacts-download" | "container-web-preview" | "image-create-edit" | "github-repository" | "agents" | "team-mode" | "advisor-mode" | "memory-auto-dream" | "schedules-reminders" | "skills-training" | "marketplace-discovery" | "marketplace-publishing" | "billing-usage" | "organization" | "feedback-support" | undefined) => void;
   orgOpen: boolean;
   orgSection: OrgSection;
@@ -211,6 +216,7 @@ export type AppDialogsProps = {
   setSaveToProject: React.Dispatch<React.SetStateAction<SaveToProjectRequest | null>>;
   setSettingsOpen: React.Dispatch<React.SetStateAction<boolean>>;
   setShareOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  setSubscribeOpenSignal?: React.Dispatch<React.SetStateAction<number>>;
   setTeamMode: (enabled: boolean) => void;
   setTheme: React.Dispatch<React.SetStateAction<Theme>>;
   setUngroupedAssetsOpen: React.Dispatch<React.SetStateAction<boolean>>;
@@ -228,6 +234,17 @@ export type AppDialogsProps = {
   updateProject: (id: string, patch: { name?: string | undefined; color?: string | null | undefined; instructions?: string | null | undefined; }) => Promise<void>;
   user: User | null;
   wsMessages: ChatMessage[];
+  selectModel?: (modelId: string) => void;
+  liveTerminal?: (id: string) => { lastOutcome?: string | null; lastErrorCode?: string | null } | undefined;
+  sessionNeedsYou?: (id: string) => SessionNeedsYouKind | null | undefined;
+  unreadIds?: ReadonlySet<string>;
+  swarmSessionIds?: ReadonlySet<string>;
+  onMarkRead?: (id: string) => void;
+  onOpenQuickAsk?: () => void;
+  onToggleSwarm?: () => void;
+  contextHealthOpen?: boolean;
+  onContextHealthOpenChange?: (open: boolean) => void;
+  onCompactSession?: () => void;
 };
 
 export function AppDialogs({
@@ -339,6 +356,7 @@ export function AppDialogs({
   setSaveToProject,
   setSettingsOpen,
   setShareOpen,
+  setSubscribeOpenSignal,
   setTeamMode,
   setTheme,
   setUngroupedAssetsOpen,
@@ -358,6 +376,17 @@ export function AppDialogs({
   updateProject,
   user,
   wsMessages,
+  selectModel,
+  liveTerminal,
+  sessionNeedsYou,
+  unreadIds,
+  swarmSessionIds,
+  onMarkRead,
+  onOpenQuickAsk,
+  onToggleSwarm,
+  contextHealthOpen,
+  onContextHealthOpenChange,
+  onCompactSession,
 }: AppDialogsProps) {
   const mediaAuthEpoch = auth?.snapshot().epoch;
   return (
@@ -440,7 +469,10 @@ export function AppDialogs({
             user={user}
             theme={theme}
             demo={demo}
-            onClose={() => setSettingsOpen(false)}
+            onClose={() => {
+              setSubscribeOpenSignal?.(0);
+              setSettingsOpen(false);
+            }}
             onSetTheme={setTheme}
             onRefreshMe={refreshMe}
             onPreferencesChange={applyConversationPreferences}
@@ -455,6 +487,7 @@ export function AppDialogs({
               setProjectSettings(p);
             }}
             subscribeOpenSignal={subscribeOpenSignal}
+            onSubscribeSignalConsumed={() => setSubscribeOpenSignal?.(0)}
           />
         </LazyBoundary>
       )}
@@ -533,7 +566,36 @@ export function AppDialogs({
             onCreateProject={(name) => setCreateProjectFrom(name ? { title: name } : {})}
             onMoveSession={(sess, projectId) => void moveSessionToProject(sess, projectId)}
             onOpenBoard={demo || !TASKBOARD_ENABLED ? undefined : () => setBoardOpen(true)}
-            onOpenSites={demo || !openSites ? undefined : () => openSites()}
+            onOpenSites={demo || !openSites ? undefined : () => openSites(null)}
+            isSending={(id) => !demo && chat.isSending(id)}
+            liveTerminal={liveTerminal}
+            sessionNeedsYou={sessionNeedsYou}
+            unreadIds={unreadIds}
+            swarmSessionIds={swarmSessionIds}
+            onMarkRead={onMarkRead}
+            onOpenSite={demo || !openSites ? undefined : (slug) => openSites(slug)}
+            models={models}
+            activeModelId={modelId}
+            onSelectModel={selectModel}
+            onOpenManage={demo ? undefined : (tab) => openManage(tab)}
+            onOpenQuickAsk={onOpenQuickAsk}
+            onToggleSwarm={onToggleSwarm}
+            onCompactSession={demo ? undefined : onCompactSession}
+            onOpenContextHealth={demo || !onContextHealthOpenChange ? undefined : () => onContextHealthOpenChange(true)}
+          />
+        </LazyBoundary>
+      )}
+      {contextHealthOpen && onContextHealthOpenChange && (
+        <LazyBoundary fallback={null}>
+          <ContextHealthPopover
+            open={contextHealthOpen}
+            onOpenChange={onContextHealthOpenChange}
+            pressure={activeSess?._contextPressure ?? null}
+            compacting={Boolean(activeSess?._compactingManual || activeSess?._turnStatus === "compacting")}
+            canCompact={Boolean(activeId && !demo && onCompactSession)}
+            onCompact={onCompactSession}
+            onStartNewSession={demo ? undefined : handleNew}
+            onOpenManageMemory={demo ? undefined : () => openManage("memory")}
           />
         </LazyBoundary>
       )}

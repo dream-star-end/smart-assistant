@@ -35,6 +35,7 @@ import {
   runBoxExecVideoJob,
 } from './boxExecVideo.js'
 
+import { defaultCutoverInFlightTracker } from '../logging/cutoverInFlight.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
 import {
   MUSE_BACKGROUND_TTL_MS,
@@ -179,6 +180,18 @@ export interface MuseJobView {
   files?: MuseFileView[]
   snapshot_id?: string | null
   charged_credits?: string
+}
+
+export interface MuseSessionJobView {
+  id: string
+  kind: MuseKind
+  status: MuseJobStatus
+  promptPreview: string
+  queuePosition?: number
+  queueLength?: number
+  queuedAt: number
+  startedAt?: number
+  errorCode?: string | null
 }
 
 /** What the bridge receives from /poll. */
@@ -358,7 +371,7 @@ export class MuseBridgeHub {
   private readonly boxExecPollMs: number
   private readonly boxExecRetrySleep?: (ms: number, signal?: AbortSignal) => Promise<void>
   private reservedBox = 0
-  /** Box-exec jobs waiting for a relay slot, and the ones running on it. */
+  private nonDurableSubmitting = 0
   private readonly boxExecPending: HubJob[] = []
   private readonly boxExecInflight = new Set<HubJob>()
 
@@ -486,9 +499,11 @@ export class MuseBridgeHub {
     return [...this.sessions.values()].some((s) => this.sessionOnline(s))
   }
 
-  /** Sent to the bridge in /hello: how many jobs it may run at once. */
-  bridgeConcurrency(): number {
-    return this.perBridgeConcurrency
+  bridgeConcurrency(): number { return this.perBridgeConcurrency }
+  activeNonDurableJobCount(): number {
+    let n = this.nonDurableSubmitting
+    for (const j of this.jobs.values()) if (!j.durable && (j.state !== 'done' || this.persisted.has(j.id))) n += 1
+    return n
   }
 
   private sessionOnline(session: Session): boolean {
@@ -878,7 +893,7 @@ export class MuseBridgeHub {
       this.durability && spec.kind === 'video' && opts.sessionKey !== undefined
         ? await this.durability.validateOrigin(userId, opts.sessionKey)
         : undefined
-    // Offline jobs are admitted once, then consume the same bounded retry budget as failures.
+    if (!origin && defaultCutoverInFlightTracker.isFencing()) throw new MuseError(503, 'CUTOVER_FENCING_RETRY_LATER', 'master cutover fencing active; retry later', true)
     const version = this.sessions.values().next().value?.version ?? null
     if (
       !this.multiBridge && this.bridgeOnline() && spec.source_images?.length &&
@@ -927,20 +942,11 @@ export class MuseBridgeHub {
     this.reserved.set(key, pending + 1)
     const own = this.reservedByUser.get(userId) ?? { count: 0, credits: 0n }
     this.reservedByUser.set(userId, { count: own.count + 1, credits: own.credits + price })
+    if (!origin) this.nonDurableSubmitting += 1
     try {
-      // Other admissions of this account in this process, not yet in the database.
-      return await this.admit(
-        userId,
-        containerId,
-        spec,
-        pending,
-        price,
-        own.credits,
-        opts.jobId,
-        origin,
-        routeBox,
-      )
+      return await this.admit(userId, containerId, spec, pending, price, own.credits, opts.jobId, origin, routeBox)
     } finally {
+      if (!origin) this.nonDurableSubmitting = Math.max(0, this.nonDurableSubmitting - 1)
       if (routeBox) this.reservedBox -= 1
       else this.reservedTotal -= 1
       const left = (this.reserved.get(key) ?? 1) - 1
@@ -1177,6 +1183,188 @@ export class MuseBridgeHub {
       })
     }
     return this.viewOf(job)
+  }
+
+  /** Session-scoped Muse jobs: PG durable rows merged with live hub queue position & state (OCV5-844). */
+  async listSessionJobs(userId: string, sessionId: string): Promise<MuseSessionJobView[]> {
+    const sid = sessionId.trim()
+    if (!userId || !sid) return []
+    const byId = new Map<string, MuseSessionJobView>()
+    if (this.store.listSessionJobs) {
+      const stored = await this.store.listSessionJobs(userId, sid)
+      for (const row of stored) {
+        byId.set(row.id, {
+          id: row.id,
+          kind: row.kind,
+          status: row.status,
+          promptPreview: row.promptPreview,
+          queuedAt: row.queuedAt,
+          ...(row.startedAt !== undefined ? { startedAt: row.startedAt } : {}),
+          ...(row.errorCode ? { errorCode: row.errorCode } : {}),
+        })
+      }
+    }
+    const now = this.now()
+    const recentWindowMs = 10 * 60_000
+    for (const job of this.jobs.values()) {
+      if (job.userId !== userId || job.durable?.sessionId !== sid) continue
+      if (job.state === 'done' && now - job.finishedAt > recentWindowMs) continue
+      const existing = byId.get(job.id)
+      const view = this.viewOf(job)
+      const promptPreview =
+        existing?.promptPreview ||
+        (job.spec.prompt ?? '').replace(/\s+/g, ' ').trim().slice(0, 240)
+      const startedAt =
+        existing?.startedAt ??
+        (job.state === 'running' && job.dispatchedAt > 0 ? job.dispatchedAt : undefined)
+      const errorCode =
+        view.error?.code ??
+        (view.status === 'failed' || view.status === 'cancelled' ? existing?.errorCode : undefined)
+      byId.set(job.id, {
+        id: job.id,
+        kind: job.spec.kind,
+        status: view.status,
+        promptPreview,
+        ...(view.status === 'queued' && view.queue_position !== undefined
+          ? { queuePosition: view.queue_position }
+          : {}),
+        ...(view.status === 'queued' && view.queue_length !== undefined
+          ? { queueLength: view.queue_length }
+          : {}),
+        queuedAt: existing?.queuedAt ?? job.queuedAt,
+        ...(startedAt !== undefined ? { startedAt } : {}),
+        ...(errorCode ? { errorCode } : {}),
+      })
+    }
+    return [...byId.values()].sort((a, b) => b.queuedAt - a.queuedAt).slice(0, 10)
+  }
+
+  /**
+   * Session-scoped Muse cancel (OCV5-844):
+   *   - Verifies both `userId` and `durable.sessionId === sessionId` (returns null on mismatch).
+   *   - Refuses to cancel a job currently in `settling` to prevent billing races.
+   *   - For durable jobs, NEVER swallows PG persistence errors: awaits the pending finish write
+   *     and verifies authoritative PG terminal status (falling back to conditional
+   *     `store.cancelSessionJob` if still open), throwing 503 `MUSE_CANCEL_PERSIST_FAILED` if PG
+   *     persistence fails or the row remains non-terminal.
+   *   - Never charges credits and is idempotent on terminal jobs.
+   */
+  async cancelSessionJob(
+    userId: string,
+    sessionId: string,
+    jobId: string,
+  ): Promise<{ ok: true; cancelled: boolean; status: MuseJobStatus } | null> {
+    const sid = sessionId.trim()
+    if (!userId || !sid || !jobId) return null
+    const isTerminalStatus = (s: MuseJobStatus): boolean =>
+      s === 'cancelled' || s === 'succeeded' || s === 'failed'
+
+    const live = this.jobs.get(jobId)
+    if (live) {
+      if (live.userId !== userId || live.durable?.sessionId !== sid) return null
+      const wasDone = live.state === 'done'
+      if (!wasDone && live.settling) {
+        return { ok: true, cancelled: false, status: 'running' }
+      }
+      const view = wasDone ? this.viewOf(live) : this.cancel(userId, jobId)
+      const pendingWrite = this.persisted.get(jobId)
+
+      if (live.durable) {
+        let persistErr: unknown = null
+        if (pendingWrite) {
+          try {
+            await pendingWrite
+          } catch (err) {
+            persistErr = err
+          }
+        }
+        let rec: MuseJobRecord | null
+        try {
+          rec = await this.store.findJob(userId, jobId)
+        } catch (err) {
+          throw new MuseError(
+            503,
+            'MUSE_CANCEL_PERSIST_FAILED',
+            err instanceof Error ? err.message : 'failed to verify cancelled Muse job in PG',
+            true,
+          )
+        }
+        if (rec && isTerminalStatus(rec.status)) {
+          return {
+            ok: true,
+            cancelled: !wasDone && rec.status === 'cancelled',
+            status: rec.status,
+          }
+        }
+        // Durable row still queued/running (e.g., fenced finishJob missed/errored): try conditional PG cancel.
+        if (this.store.cancelSessionJob) {
+          let fallback: { cancelled: boolean; status: MuseJobStatus } | null
+          try {
+            fallback = await this.store.cancelSessionJob(userId, sid, jobId)
+          } catch (err) {
+            throw new MuseError(
+              503,
+              'MUSE_CANCEL_PERSIST_FAILED',
+              err instanceof Error ? err.message : 'failed to persist Muse job cancellation',
+              true,
+            )
+          }
+          if (fallback && isTerminalStatus(fallback.status)) {
+            return {
+              ok: true,
+              cancelled: !wasDone && fallback.cancelled,
+              status: fallback.status,
+            }
+          }
+        }
+        throw new MuseError(
+          503,
+          'MUSE_CANCEL_PERSIST_FAILED',
+          persistErr instanceof Error
+            ? persistErr.message
+            : 'Muse job cancellation could not be confirmed in PG',
+          true,
+        )
+      }
+
+      if (pendingWrite) {
+        try {
+          await pendingWrite
+        } catch (err) {
+          throw new MuseError(
+            503,
+            'MUSE_CANCEL_PERSIST_FAILED',
+            err instanceof Error ? err.message : 'failed to persist Muse job cancellation',
+            true,
+          )
+        }
+      }
+      const status = view?.status ?? 'cancelled'
+      return { ok: true, cancelled: !wasDone && status === 'cancelled', status }
+    }
+
+    if (!this.store.cancelSessionJob) return null
+    let dbRes: { cancelled: boolean; status: MuseJobStatus } | null
+    try {
+      dbRes = await this.store.cancelSessionJob(userId, sid, jobId)
+    } catch (err) {
+      throw new MuseError(
+        503,
+        'MUSE_CANCEL_PERSIST_FAILED',
+        err instanceof Error ? err.message : 'failed to persist Muse job cancellation',
+        true,
+      )
+    }
+    if (!dbRes) return null
+    if (!isTerminalStatus(dbRes.status)) {
+      throw new MuseError(
+        503,
+        'MUSE_CANCEL_PERSIST_FAILED',
+        'Muse job remained non-terminal after cancel update',
+        true,
+      )
+    }
+    return { ok: true, cancelled: dbRes.cancelled, status: dbRes.status }
   }
 
   /** Path of a finished file, for the owner only. */

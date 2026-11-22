@@ -14,8 +14,12 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
-import { SKILL_PROPOSE_TOOL, TOOLS } from '../toolDefs.js'
-import { MEMORY_MCP_TOOL_NAMES, MEMORY_MCP_TRAIN_ONLY_TOOL_NAMES } from '../toolNames.js'
+import { REMOTE_SWARM_TOOLS, SKILL_PROPOSE_TOOL, TOOLS } from '../toolDefs.js'
+import {
+  MEMORY_MCP_REMOTE_SWARM_TOOL_NAMES,
+  MEMORY_MCP_TOOL_NAMES,
+  MEMORY_MCP_TRAIN_ONLY_TOOL_NAMES,
+} from '../toolNames.js'
 
 describe('TOOLS ↔ toolNames.ts 锁步', () => {
   it('consult_advisor verification instruction preserves the user no-write exception', () => {
@@ -49,11 +53,46 @@ describe('TOOLS ↔ toolNames.ts 锁步', () => {
     }
   })
 
+  it('REMOTE_SWARM_TOOLS 归远端蜂群专属,与 MEMORY_MCP_REMOTE_SWARM_TOOL_NAMES 锁步且不混入常规集', () => {
+    assert.deepEqual(
+      REMOTE_SWARM_TOOLS.map((t) => t.name),
+      [...MEMORY_MCP_REMOTE_SWARM_TOOL_NAMES],
+    )
+    for (const n of MEMORY_MCP_REMOTE_SWARM_TOOL_NAMES) {
+      assert.ok(
+        !MEMORY_MCP_TOOL_NAMES.includes(n as (typeof MEMORY_MCP_TOOL_NAMES)[number]),
+        `${n} 不应同时出现在常规工具集`,
+      )
+    }
+  })
+
   it('每个工具定义结构完整(name 为字符串 + 带 inputSchema)', () => {
-    for (const t of [...TOOLS, SKILL_PROPOSE_TOOL]) {
+    for (const t of [...TOOLS, SKILL_PROPOSE_TOOL, ...REMOTE_SWARM_TOOLS]) {
       assert.equal(typeof t.name, 'string')
       assert.ok(t.name.length > 0)
       assert.ok(t.inputSchema, `${t.name} 缺 inputSchema`)
     }
+  })
+
+  it('P1-3: REMOTE_SWARM_TOOLS schema 与运行时语义对齐 (main/channels/max_bytes/mentions_only/240s)', () => {
+    const swarmTool = REMOTE_SWARM_TOOLS.find((t) => t.name === 'swarm')!
+    const postTool = REMOTE_SWARM_TOOLS.find((t) => t.name === 'post_message')!
+    const readTool = REMOTE_SWARM_TOOLS.find((t) => t.name === 'read_board')!
+    const waitTool = REMOTE_SWARM_TOOLS.find((t) => t.name === 'swarm_wait')!
+
+    const swarmProps = swarmTool.inputSchema.properties as Record<string, any>
+    assert.equal(swarmProps.channels?.type, 'array')
+    assert.equal(swarmProps.channels?.items?.type, 'string')
+
+    const postProps = postTool.inputSchema.properties as Record<string, any>
+    assert.match(postProps.channel?.description ?? '', /`main`/)
+    assert.doesNotMatch(postProps.channel?.description ?? '', /`general`/)
+
+    const readProps = readTool.inputSchema.properties as Record<string, any>
+    assert.equal(readProps.max_bytes?.type, 'number')
+
+    const waitProps = waitTool.inputSchema.properties as Record<string, any>
+    assert.equal(waitProps.mentions_only?.type, 'boolean')
+    assert.match(waitProps.timeout_seconds?.description ?? '', /240/)
   })
 })

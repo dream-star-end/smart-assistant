@@ -1,4 +1,4 @@
-import { RefreshCw } from "lucide-react";
+import { AlertTriangle, RefreshCw } from "lucide-react";
 import { useMemo, useState } from "react";
 import { Badge, Button, useToast } from "../../../components/ui";
 import {
@@ -85,12 +85,12 @@ export function OutboxTab({ events }: { events: EventMeta[] }) {
       key: "created_at",
       title: "时间",
       width: 96,
-      render: (r) => <TimeAgo value={r.created_at} />,
+      render: (r) => <TimeAgo value={r.created_at} className="tabular-nums text-muted" />,
     },
     {
       key: "event_type",
       title: "事件",
-      render: (r) => <span className="font-mono text-meta">{r.event_type}</span>,
+      render: (r) => <span className="font-mono text-meta font-medium text-fg">{r.event_type}</span>,
     },
     {
       key: "severity",
@@ -133,7 +133,13 @@ export function OutboxTab({ events }: { events: EventMeta[] }) {
       align: "right",
       render: (r) =>
         r.status === "failed" && r.attempts < 10 ? (
-          <Button variant="secondary" size="sm" onClick={() => onRetry(r)} disabled={retrying.has(r.id)}>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => onRetry(r)}
+            disabled={retrying.has(r.id)}
+            className="oc-btn-tactile"
+          >
             重试
           </Button>
         ) : null,
@@ -143,18 +149,19 @@ export function OutboxTab({ events }: { events: EventMeta[] }) {
   const canLoadMore = (data?.rows.length ?? 0) >= limit && limit < MAX_LIMIT;
 
   return (
-    <div className="flex flex-col gap-3">
+    <div className="flex flex-col gap-3.5">
       <FilterBar>
         <SelectFilter label="事件" value={eventType} options={eventOpts} onChange={setEventType} />
         <SelectFilter label="严重度" value={severity} options={SEVERITY_OPTS} onChange={setSeverity} />
         <SelectFilter label="状态" value={status} options={STATUS_OPTS} onChange={setStatus} />
-        <Button variant="secondary" size="sm" onClick={reload} disabled={loading}>
+        <Button variant="secondary" size="sm" onClick={reload} disabled={loading} className="oc-btn-tactile">
           <RefreshCw size={14} className={loading ? "animate-spin" : undefined} /> 刷新
         </Button>
       </FilterBar>
 
       {error && (
-        <div className="rounded-lg border border-danger/40 bg-danger-soft px-3 py-2.5 text-body text-danger">
+        <div className="oc-callout oc-callout-danger flex items-center gap-2 rounded-xl px-4 py-3 text-body text-danger">
+          <AlertTriangle size={15} className="shrink-0" />
           加载投递历史失败: {errText(error)}
         </div>
       )}
@@ -166,15 +173,21 @@ export function OutboxTab({ events }: { events: EventMeta[] }) {
         loading={loading}
         emptyTitle="无投递记录"
         emptyHint="尚无告警进入投递队列,或当前过滤条件下无匹配。"
+        footer={
+          canLoadMore ? (
+            <div className="flex justify-center">
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => setLimit((l) => Math.min(MAX_LIMIT, l + PAGE))}
+                className="oc-btn-tactile"
+              >
+                加载更多
+              </Button>
+            </div>
+          ) : undefined
+        }
       />
-
-      {canLoadMore && (
-        <div className="flex justify-center">
-          <Button variant="ghost" size="sm" onClick={() => setLimit((l) => Math.min(MAX_LIMIT, l + PAGE))}>
-            加载更多
-          </Button>
-        </div>
-      )}
     </div>
   );
 }

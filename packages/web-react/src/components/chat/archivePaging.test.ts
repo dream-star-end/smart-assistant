@@ -427,6 +427,36 @@ describe("visible virtual row anchor", () => {
     expect(resolved).toBe(true);
     expect(frames).toHaveLength(0);
   });
+
+  test("releases anchor lock within frame budget when a 0-height prepend never shifts the anchor row", async () => {
+    const scroller = document.createElement("div");
+    const row = document.createElement("div");
+    row.setAttribute("data-chat-virtual-key", "row-static");
+    scroller.appendChild(row);
+    Object.defineProperty(scroller, "scrollHeight", { value: 600, configurable: true });
+    scroller.scrollTop = 100;
+    scroller.getBoundingClientRect = () =>
+      ({ top: 0, bottom: 300, left: 0, right: 300, width: 300, height: 300 } as DOMRect);
+    row.getBoundingClientRect = () =>
+      ({ top: 80, bottom: 120, left: 0, right: 300, width: 300, height: 40 } as DOMRect);
+    const anchor = captureVisibleVirtualRowAnchor(scroller)!;
+    const frames: Array<() => void> = [];
+    let resolved = false;
+    const restoring = restoreVisibleVirtualRowAnchor(
+      scroller,
+      anchor,
+      () => false,
+      (cb) => frames.push(cb),
+      writeTop,
+    ).then(() => { resolved = true; });
+    for (let i = 0; i < 200 && frames.length > 0; i += 1) {
+      frames.shift()!();
+      await Promise.resolve();
+    }
+    await restoring;
+    expect(resolved).toBe(true);
+    expect(scroller.classList.contains("chat-anchor-restoring")).toBe(false);
+  });
 });
 
 describe("planLoadMore 按钮三态 + 切片起点", () => {

@@ -80,17 +80,20 @@ export function ProjectAssetsPanel(props: {
       {promptEl}
 
       {/* 「注入」是实现术语，用户语境是「项目知识 / 已启用」（PA-01）。 */}
-      <p className="text-meta text-muted">
-        设为常用的文件，会作为这个项目里所有会话的共享背景。
-      </p>
-
-      <div className="flex flex-wrap items-center gap-2 text-meta">
-        <span className="tabular-nums text-fg">
-          常用文件 {injected}/{PINNED_INJECT_LIMIT}
-        </span>
-        {pinnedCount > PINNED_INJECT_LIMIT ? (
-          <span className="text-warning">超过 {PINNED_INJECT_LIMIT} 条时只启用前 {PINNED_INJECT_LIMIT} 条</span>
-        ) : null}
+      <div className="oc-surface-recessed flex flex-wrap items-center justify-between gap-2 rounded-xl px-3.5 py-2.5 text-meta">
+        <p className="text-muted">
+          设为常用的文件，会作为这个项目里所有会话的共享背景。
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="oc-badge-craft rounded-full bg-surface px-2.5 py-0.5 text-caption font-medium tabular-nums text-fg">
+            常用文件 {injected}/{PINNED_INJECT_LIMIT}
+          </span>
+          {pinnedCount > PINNED_INJECT_LIMIT ? (
+            <span className="text-caption text-warning">
+              超过 {PINNED_INJECT_LIMIT} 条时只启用前 {PINNED_INJECT_LIMIT} 条
+            </span>
+          ) : null}
+        </div>
       </div>
 
       <UploadDropzone
@@ -196,14 +199,16 @@ function UploadDropzone({
         takeFiles(e.dataTransfer.files);
       }}
       className={cn(
-        "flex min-h-11 cursor-pointer flex-col items-center justify-center gap-1.5 rounded-lg border border-dashed px-4 py-6 text-center outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
-        dragOver ? "border-accent bg-accent-soft text-accent" : "border-border-strong bg-hover/40 text-muted hover:border-accent hover:bg-hover",
+        "oc-surface-recessed flex min-h-11 cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border border-dashed px-4 py-6 text-center outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+        dragOver ? "border-accent bg-accent-soft text-accent" : "border-border-control text-muted hover:border-accent hover:text-fg",
         uploading && "pointer-events-none opacity-70",
       )}
     >
-      {uploading ? <Spinner size={18} className="shrink-0" /> : <Upload size={18} className="shrink-0" />}
+      <span className="oc-icon-badge oc-icon-badge-accent size-9 rounded-xl" aria-hidden>
+        {uploading ? <Spinner size={16} className="shrink-0" /> : <Upload size={16} strokeWidth={1.75} className="shrink-0" />}
+      </span>
       {/* 上传期间拖放区不可再投：进度文案用 status 播报，读屏也知道走到第几个（PA-03）。 */}
-      <span className="text-body" role={uploading ? "status" : undefined} aria-live={uploading ? "polite" : undefined}>
+      <span className="text-body font-medium text-fg" role={uploading ? "status" : undefined} aria-live={uploading ? "polite" : undefined}>
         {uploading ? uploadingLabel(progress) : "点击或拖拽文件到此处上传"}
       </span>
       <span className="text-caption text-faint">可一次选择多个文件，单个失败不影响其它</span>
@@ -247,14 +252,19 @@ function AssetRow({
     <li
       data-asset-id={asset.id}
       className={cn(
-        "flex flex-col gap-2 rounded-lg border border-border bg-surface px-3 py-2.5 sm:flex-row sm:items-center sm:gap-3",
-        asset.pinned && "border-accent/40 bg-accent-soft/40",
+        "flex flex-col gap-2 rounded-xl px-3.5 py-3 sm:flex-row sm:items-center sm:gap-3",
+        asset.pinned
+          ? "border border-accent/40 bg-accent-soft/45 shadow-soft"
+          : "oc-surface-card oc-surface-card-hover",
       )}
     >
       <div className="flex min-w-0 flex-1 items-start gap-2.5">
         <span
           aria-hidden
-          className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-md bg-hover text-muted"
+          className={cn(
+            "oc-icon-badge mt-0.5 size-8 shrink-0 rounded-lg",
+            asset.pinned && "oc-icon-badge-accent",
+          )}
         >
           <FileKindIcon mime={asset.mime} name={asset.name} />
         </span>

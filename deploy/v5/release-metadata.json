@@ -202,7 +202,10 @@
     "0342_commercial_user_sites",
     "0343_commercial_gpt62_sol_astra_models",
     "0344_commercial_antigravity_gemini_4_neon",
-    "0345_commercial_user_site_collaborators"
+    "0345_commercial_user_site_collaborators",
+    "0346_commercial_perf_timeline_and_live_snapshot",
+    "0347_commercial_perf_timeline_and_live_snapshot_indexes",
+    "0348_commercial_pending_browser_handoffs"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

@@ -29,7 +29,7 @@ export function StatusBadge({ status }: { status: string }) {
 /** 小号内联百分比芯片(用于今日错误率 / 累计失败率)。 */
 function MiniChip({ tone, children }: { tone: Tone; children: React.ReactNode }) {
   return (
-    <Badge tone={tone} className="ml-1 px-1.5 py-0 text-caption">
+    <Badge tone={tone} className="oc-badge-craft ml-1 px-1.5 py-0 text-caption tabular-nums">
       {children}
     </Badge>
   );

@@ -157,3 +157,39 @@ func TestBuildUpstreamRequest_DropsCRLFHeaderValues(t *testing.T) {
 		t.Errorf("CR-injected sibling value must be dropped, got %q", out)
 	}
 }
+
+func TestBuildUpstreamRequest_StripsNodeAuthHeadersOnHttpAndWs(t *testing.T) {
+	const pskMarker = "synthetic-node-agent-psk-marker-0123456789abcdef"
+	h := http.Header{}
+	h.Set("Authorization", "Bearer "+pskMarker)
+	h.Set("Proxy-Authorization", "Bearer "+pskMarker)
+	h.Set("X-Node-Agent-Psk", pskMarker)
+	h.Set("X-OpenClaude-Container-Id", "42")
+	h.Set("X-OpenClaude-Bridge-Nonce", "abcdef0123456789")
+	h.Set("X-Oc-Bridge-Ts", "1700000000000")
+	h.Set("X-Oc-Bridge-Req-Nonce", "req-nonce-1234")
+	h.Set("X-Oc-Bridge-Sig", "sig-deadbeef")
+	h.Set("Connection", "Upgrade")
+	h.Set("Upgrade", "websocket")
+
+	for _, isWs := range []bool{false, true} {
+		out := string(buildUpstreamRequest("POST", "/internal/swarm/command?sessionId=s1", "172.18.0.5:3001", h, isWs))
+		if strings.Contains(out, pskMarker) {
+			t.Errorf("isWs=%v: node PSK leaked into upstream container request: %q", isWs, out)
+		}
+		if strings.Contains(out, "Authorization:") || strings.Contains(out, "Proxy-Authorization:") || strings.Contains(out, "X-Node-Agent-Psk:") {
+			t.Errorf("isWs=%v: node auth header must be stripped, got: %q", isWs, out)
+		}
+		for _, kept := range []string{
+			"X-Openclaude-Container-Id: 42\r\n",
+			"X-Openclaude-Bridge-Nonce: abcdef0123456789\r\n",
+			"X-Oc-Bridge-Ts: 1700000000000\r\n",
+			"X-Oc-Bridge-Req-Nonce: req-nonce-1234\r\n",
+			"X-Oc-Bridge-Sig: sig-deadbeef\r\n",
+		} {
+			if !strings.Contains(out, kept) {
+				t.Errorf("isWs=%v: expected container bridge header %q to be preserved, got: %q", isWs, kept, out)
+			}
+		}
+	}
+}

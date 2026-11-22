@@ -13,15 +13,15 @@ import { cn } from "../../lib/utils";
  * 桌面端(hover 可用)渲染零变化,调用方补丁可安全删除(重复写也不会冲突,twMerge 去重)。
  */
 export const iconButtonVariants = cva(
-  "inline-flex shrink-0 items-center justify-center outline-none transition-[background-color,color,box-shadow,transform] duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.94] disabled:pointer-events-none disabled:opacity-50",
+  "oc-icon-btn-tactile inline-flex shrink-0 items-center justify-center outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg disabled:pointer-events-none disabled:opacity-50 [&_svg]:shrink-0",
   {
     variants: {
       variant: {
-        ghost: "text-muted hover:bg-hover hover:text-fg",
-        muted: "text-faint hover:bg-hover hover:text-fg",
-        solid: "bg-primary text-primary-fg hover:opacity-90",
-        accent: "bg-accent text-accent-fg hover:bg-accent-strong",
-        subtle: "bg-hover text-fg hover:bg-active",
+        ghost: "text-muted hover:bg-hover hover:text-fg active:bg-active",
+        muted: "text-faint hover:bg-hover hover:text-fg active:bg-active",
+        solid: "bg-primary text-primary-fg oc-btn-primary-craft",
+        accent: "bg-accent text-accent-fg oc-btn-accent-craft hover:bg-accent-strong",
+        subtle: "border border-border/80 bg-hover text-fg hover:border-border-strong hover:bg-active",
         danger: "text-danger hover:bg-danger-soft hover:text-danger",
       },
       size: {

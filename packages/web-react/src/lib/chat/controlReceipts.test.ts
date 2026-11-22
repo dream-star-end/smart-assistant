@@ -1,7 +1,12 @@
-import { expect, test, vi } from "vitest";
-import { applyControlReceipt, type PendingControlItem } from "./controlReceipts";
+import { afterEach, expect, test, vi } from "vitest";
+import { applyControlReceipt, DegradedJournalRetryTracker, type PendingControlItem } from "./controlReceipts";
 import type { OutboundControlReceiptWire } from "./frames";
 import { addMessage, createSession } from "./model";
+import { DEGRADED_JOURNAL_RETRY_DELAYS_MS } from "./pure";
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 function fixture() {
   const session = createSession({ id: "web-own", agentId: "main" });
@@ -18,14 +23,14 @@ function fixture() {
   return { session, item, frame, context };
 }
 
-test("confirmed ended receipt displays a notice and reads the exact authoritative turn without changing its outcome", () => {
+test("confirmed ended receipt silently reconciles the exact authoritative turn without transient notice", () => {
   const { session, frame, context } = fixture();
   const completed = addMessage(session, "assistant", "completed answer", { _clientMessageId: "m-own", _dispatchOutcome: "completed" });
   const crashed = addMessage(session, "system", "crash evidence", { _clientMessageId: "m-other", _dispatchOutcome: "crashed", _errorCode: "engine_error" });
   const before = structuredClone(session.messages);
   applyControlReceipt(frame, context);
   expect(context.settle).toHaveBeenCalledWith(frame.controlId, "terminal");
-  expect(context.notice).toHaveBeenCalledWith(session.id, "该回合已结束");
+  expect(context.notice).not.toHaveBeenCalled();
   expect(context.sync).toHaveBeenCalledWith(session.id, { clientMessageId: "m-own" });
   expect(session.messages).toEqual(before);
   expect(completed._dispatchOutcome).toBe("completed");
@@ -80,4 +85,40 @@ test.each(["persisted", "applied"] as const)("Stop %s receipt keeps the journal 
   expect(context.settle).not.toHaveBeenCalled();
   expect(context.notice).not.toHaveBeenCalled();
   expect(context.sync).not.toHaveBeenCalled();
+});
+
+test("DegradedJournalRetryTracker retries bounded times with backoff and stops on permanent error or clearAll", async () => {
+  vi.useFakeTimers();
+  const tracker = new DegradedJournalRetryTracker();
+  const sess = createSession({ id: "s-deg", agentId: "main" });
+  sess._liveJournalDegraded = true;
+  const syncSession = vi.fn().mockResolvedValue(false);
+  const ctx = { getSession: (id: string) => (id === sess.id ? sess : undefined), getEpoch: () => 1, syncSession };
+
+  tracker.schedule(sess.id, ctx);
+  for (let i = 0; i < DEGRADED_JOURNAL_RETRY_DELAYS_MS.length; i++) {
+    await vi.advanceTimersByTimeAsync(DEGRADED_JOURNAL_RETRY_DELAYS_MS[i]!);
+    expect(syncSession).toHaveBeenCalledTimes(i + 1);
+  }
+  // Exhausted: further time or repeated schedule calls do not storm
+  tracker.schedule(sess.id, ctx);
+  await vi.advanceTimersByTimeAsync(120_000);
+  expect(syncSession).toHaveBeenCalledTimes(DEGRADED_JOURNAL_RETRY_DELAYS_MS.length);
+
+  // Permanent error (401/404) stops immediately after first failure
+  const tracker2 = new DegradedJournalRetryTracker();
+  const permSync = vi.fn().mockRejectedValue(Object.assign(new Error("not found"), { status: 404 }));
+  tracker2.schedule(sess.id, { ...ctx, syncSession: permSync });
+  await vi.advanceTimersByTimeAsync(DEGRADED_JOURNAL_RETRY_DELAYS_MS[0]!);
+  expect(permSync).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(120_000);
+  expect(permSync).toHaveBeenCalledTimes(1);
+
+  // clearAll cancels pending timer on unmount/stop
+  const tracker3 = new DegradedJournalRetryTracker();
+  const cancelledSync = vi.fn().mockResolvedValue(true);
+  tracker3.schedule(sess.id, { ...ctx, syncSession: cancelledSync });
+  tracker3.clearAll();
+  await vi.advanceTimersByTimeAsync(120_000);
+  expect(cancelledSync).not.toHaveBeenCalled();
 });

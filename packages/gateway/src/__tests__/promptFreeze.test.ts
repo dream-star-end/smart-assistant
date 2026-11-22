@@ -37,15 +37,15 @@ function key(): string {
   return `agent:main:webchat:dm:ocv5-755-unit-${n}`
 }
 
-test('mode: env wins, then the flag file, default shadow', () => {
+test('mode: env wins, then the flag file, default enforce (OCV5-840)', () => {
   const home = mkdtempSync(join(tmpdir(), 'ocv5-755-mode-'))
-  assert.equal(freeze.resolvePromptFreezeMode(home, {}), 'shadow')
-  mkdirSync(join(home, 'runtime-flags'))
-  writeFileSync(join(home, 'runtime-flags', 'prompt-freeze'), 'enforce\n')
   assert.equal(freeze.resolvePromptFreezeMode(home, {}), 'enforce')
+  mkdirSync(join(home, 'runtime-flags'))
+  writeFileSync(join(home, 'runtime-flags', 'prompt-freeze'), 'shadow\n')
+  assert.equal(freeze.resolvePromptFreezeMode(home, {}), 'shadow')
   assert.equal(freeze.resolvePromptFreezeMode(home, { OC_PROMPT_FREEZE: 'off' }), 'off')
   writeFileSync(join(home, 'runtime-flags', 'prompt-freeze'), 'bogus')
-  assert.equal(freeze.resolvePromptFreezeMode(home, {}), 'shadow')
+  assert.equal(freeze.resolvePromptFreezeMode(home, {}), 'enforce')
 })
 
 test('enforce: a respawn with drifted memory index reuses the first prompt', () => {

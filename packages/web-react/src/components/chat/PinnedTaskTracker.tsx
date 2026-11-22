@@ -22,11 +22,7 @@
 import type { TurnTokenUsageSnapshot } from "@openclaude/protocol/frames";
 import { Check, ChevronDown, ChevronUp, Circle, ListChecks, LoaderCircle } from "lucide-react";
 import { type RefObject, useCallback, useEffect, useId, useRef, useState } from "react";
-import type { ChatMessage } from "../../lib/chat/model";
 import { cn } from "../../lib/utils";
-import { asArr, asStr, resolveToolInput } from "../tool/format";
-import { TokenUsageBadge } from "./tokenUsage";
-import { currentTurnStartIndex } from "./turnSegment";
 
 /**
  * 两枚 HUD 共用的头部切换按钮样式(H-05):外层容器 `overflow-hidden rounded-lg` 会把画在
@@ -73,64 +69,8 @@ export function useHudListOverflow(
   return { fadeCls: overflowing ? HUD_LIST_FADE_CLS : "", onScroll: measure };
 }
 
-export type TodoItem = { content: string; status: string; activeForm?: string };
-
-function normalizePlanStatus(status: string): string {
-  if (status === "completed") return "completed";
-  if (status === "inProgress" || status === "in_progress") return "in_progress";
-  return "pending";
-}
-
-function normalizePlanSteps(steps: unknown): TodoItem[] {
-  const raw = asArr(steps);
-  return raw
-    .filter((s): s is Record<string, unknown> => !!s && typeof s === "object" && !Array.isArray(s))
-    .map((s) => ({
-      content: asStr(s.step) || asStr(s.text) || asStr(s.description),
-      status: normalizePlanStatus(asStr(s.status)),
-      activeForm: asStr(s.activeForm),
-    }))
-    .filter((t) => t.content || t.activeForm);
-}
-
-function normalizeTodoItems(todos: unknown): TodoItem[] {
-  const raw = asArr(todos);
-  return raw
-    .filter((t): t is Record<string, unknown> => !!t && typeof t === "object" && !Array.isArray(t))
-    .map((t) => ({ content: asStr(t.content), status: asStr(t.status) || "pending", activeForm: asStr(t.activeForm) }))
-    .filter((t) => t.content || t.activeForm);
-}
-
-/**
- * 从**当前活跃段**(最后一条 user 消息之后,即当前 turn;判定收口 turnSegment.ts,与
- * MessageRenderer 的历史段抑制共用同一函数)提取最新顶层任务源(主 agent 的任务列表;
- * replace 语义,最后一次即权威)。任务源包括:
- *   1. CCB/legacy TodoWrite tool 的 todos;
- *   2. Codex app-server structured `role:"plan"` 的 steps。
- *
- * 归属判定走内容轴(任务集是否属于当前轮)而非时间轴(是否在发送)——全历史反向扫描
- * 会让几十轮前的旧任务在下一轮无关提问时复活钉在输入框上。多轮连续任务场景自然成立:
- * agent 下轮继续更新同一 todo 列表时,新 turn 里有新的 TodoWrite 块。
- * 子 agent 的 TodoWrite 是 agent-group 子块,不进主 HUD。反向扫描,命中最近的结构化
- * 任务源即返回；text-only plan 没有 steps,继续保留 inline PlanCard 兜底。
- */
-export function extractLatestTodos(
-  messages: readonly ChatMessage[],
-  /** 扫描起点。缺省 = 当前活跃段(HUD 语义);详情面板「计划」页传 0 看整个会话最近的一份。 */
-  turnStart: number = currentTurnStartIndex(messages),
-): TodoItem[] {
-  for (let i = messages.length - 1; i >= turnStart; i--) {
-    const m = messages[i];
-    if (!m) continue;
-    if (m.role === "plan" && Array.isArray(m.steps)) {
-      return normalizePlanSteps(m.steps);
-    }
-    if (m.role !== "tool" || m.toolName !== "TodoWrite") continue;
-    const input = resolveToolInput(m);
-    return normalizeTodoItems(input?.todos);
-  }
-  return [];
-}
+import { extractLatestTodos, type TodoItem } from "./todoExtract";
+export { extractLatestTodos, type TodoItem };
 
 const AUTO_COLLAPSE_MS = 3000;
 
@@ -172,6 +112,8 @@ export function PinnedTaskTracker({
   settled?: boolean;
   tokenUsage?: TurnTokenUsageSnapshot;
 }) {
+  // HUD 不展示裸 tok 工程数字，保留 prop 兼容上游调用。
+  void tokenUsage;
   const total = todos.length;
   const doneCount = todos.filter(isDone).length;
   const hasIncomplete = todos.some((t) => !isDone(t));
@@ -243,7 +185,7 @@ export function PinnedTaskTracker({
 
   return (
     <div className="mx-auto mb-2 w-full max-w-3xl px-4">
-      <div className="overflow-hidden rounded-lg border border-border bg-elevated shadow-soft">
+      <div className="oc-surface-glass overflow-hidden rounded-xl shadow-soft">
         {/* 头部:进度 + 折叠态显示「正在执行的一条」+ 展开/折叠 chevron */}
         <button
           type="button"
@@ -251,14 +193,16 @@ export function PinnedTaskTracker({
           aria-expanded={expanded}
           aria-controls={expanded ? listId : undefined}
           className={cn(
-            "flex min-h-11 w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-hover",
+            "flex min-h-11 w-full items-center gap-2.5 px-3 py-2 text-left transition-colors hover:bg-hover/70",
             HUD_TOGGLE_CLS,
           )}
         >
-          <ListChecks className="size-4 shrink-0 text-accent" aria-hidden />
+          <span className="oc-icon-badge oc-icon-badge-accent flex size-6 shrink-0 items-center justify-center rounded-sm">
+            <ListChecks className="size-3.5" strokeWidth={1.75} aria-hidden />
+          </span>
           {/* 读屏补齐动作名(H-09);术语与 inline 工具卡(tool/meta.ts「任务列表」)一致(H-10)。 */}
           <span className="sr-only">{expanded ? "折叠任务列表" : "展开任务列表"}</span>
-          <span className="shrink-0 text-xs font-medium text-muted">
+          <span className="shrink-0 text-caption font-semibold tabular-nums text-muted">
             任务列表 {doneCount}/{total}
           </span>
           {!expanded && activeTodo && (
@@ -274,11 +218,10 @@ export function PinnedTaskTracker({
             </span>
           )}
           {expanded && <span className="flex-1" />}
-          <TokenUsageBadge usage={tokenUsage} />
           {expanded ? (
-            <ChevronDown className="size-4 shrink-0 text-faint" aria-hidden />
+            <ChevronDown className="size-4 shrink-0 text-faint" strokeWidth={1.75} aria-hidden />
           ) : (
-            <ChevronUp className="size-4 shrink-0 text-faint" aria-hidden />
+            <ChevronUp className="size-4 shrink-0 text-faint" strokeWidth={1.75} aria-hidden />
           )}
         </button>
         {/* 展开:全部任务 */}

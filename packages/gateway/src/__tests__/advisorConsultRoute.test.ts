@@ -958,8 +958,14 @@ describe('M4c recovery contracts', () => {
       assert.equal(get.status, 200, JSON.stringify(get.body))
       assert.equal(get.body.advisorConsultAllowed, true)
       assert.equal(get.body.parentEngine, 'grok')
-      assert.deepEqual(get.body.advisorConsultParents, ['ccb', 'codex', 'grok', 'cursor'])
+      assert.deepEqual(get.body.advisorConsultParents, ['ccb', 'codex', 'grok', 'cursor', 'antigravity'])
       assert.doesNotMatch(String(get.body.advisorConsultParentReason), /一期|CCB|tool_use/)
+      parent.providerTag = 'antigravity'
+      const getAgy = await http(gw, 'GET', '/api/collaboration-config?sessionId=wsess-advisor-route', undefined)
+      assert.equal(getAgy.status, 200, JSON.stringify(getAgy.body))
+      assert.equal(getAgy.body.advisorConsultAllowed, true)
+      assert.equal(getAgy.body.parentEngine, 'antigravity')
+      parent.providerTag = 'grok'
       const put = await http(gw, 'PUT', '/api/collaboration-config', {
         sessionId: 'wsess-advisor-route',
         mode: 'advisor',

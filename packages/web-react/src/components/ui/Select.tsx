@@ -82,9 +82,10 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(
         ))}
       </select>
       <ChevronDown
-        size={16}
+        size={15}
+        strokeWidth={2}
         aria-hidden="true"
-        className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-faint peer-disabled:opacity-50"
+        className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-faint transition-colors duration-150 peer-hover:text-muted peer-focus:text-accent peer-disabled:opacity-50"
       />
     </span>
   ),

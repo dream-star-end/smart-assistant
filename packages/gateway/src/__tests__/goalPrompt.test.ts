@@ -21,12 +21,17 @@ const active: GoalStateSnapshot = {
 }
 
 describe('CCB platform goal prompt', () => {
-  it('renders active goal and advisory budgets through the merged prompt payload', () => {
+  it('renders active goal and static advisory budgets without volatile counters', () => {
     const text = renderCcbGoalPrompt(active)
     assert.match(text, /finish the migration/)
     assert.match(text, /token_budget: 1000/)
-    assert.match(text, /credits_used: 34/)
+    assert.match(text, /credit_budget: 500/)
     assert.match(text, /Budgets are advisory/)
+    assert.doesNotMatch(text, /tokens_used:|credits_used:|time_used_seconds:/)
+    assert.equal(
+      text,
+      renderCcbGoalPrompt({ ...active, tokensUsed: 9999, creditsUsed: '888', timeUsedSeconds: 420 }),
+    )
   })
 
   it('does not inject paused/completed/cleared goals', () => {

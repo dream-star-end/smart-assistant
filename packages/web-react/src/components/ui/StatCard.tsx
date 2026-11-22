@@ -16,21 +16,21 @@ import { cn } from "../../lib/utils";
 export type StatTone = "neutral" | "accent" | "success" | "warning" | "danger" | "info";
 
 const iconToneClass: Record<StatTone, string> = {
-  neutral: "bg-hover text-muted",
-  accent: "bg-accent-soft text-accent",
-  success: "bg-success-soft text-success",
-  warning: "bg-warning-soft text-warning",
-  danger: "bg-danger-soft text-danger",
-  info: "bg-info-soft text-info",
+  neutral: "oc-icon-badge",
+  accent: "oc-icon-badge oc-icon-badge-accent",
+  success: "oc-icon-badge oc-icon-badge-success",
+  warning: "oc-icon-badge oc-icon-badge-warning",
+  danger: "oc-icon-badge oc-icon-badge-danger",
+  info: "oc-icon-badge oc-icon-badge-info",
 };
 
 /** delta 趋势:视觉语义由页面决定(涨对某些指标是坏事时传 down/flat 即可)。 */
 export type StatDelta = { value: ReactNode; trend?: "up" | "down" | "flat" };
 
 const trendMeta = {
-  up: { cls: "text-success", Icon: ArrowUp },
-  down: { cls: "text-danger", Icon: ArrowDown },
-  flat: { cls: "text-faint", Icon: Minus },
+  up: { cls: "oc-badge-craft rounded-full bg-success-soft px-1.5 py-0.5 text-caption text-success", Icon: ArrowUp },
+  down: { cls: "oc-badge-craft rounded-full bg-hover px-1.5 py-0.5 text-caption text-danger", Icon: ArrowDown },
+  flat: { cls: "rounded-full bg-hover px-1.5 py-0.5 text-caption text-faint", Icon: Minus },
 } as const;
 
 export function StatCard({
@@ -87,15 +87,15 @@ export function StatCard({
       className={cn("flex items-start justify-between gap-3", onClick && "text-left", className)}
     >
       <div className="min-w-0">
-        <p className="truncate text-meta font-medium text-faint">{label}</p>
-        <p className="mt-1.5 text-xl font-semibold leading-none text-fg tabular-nums">{value}</p>
+        <p className="truncate text-meta font-medium text-muted">{label}</p>
+        <p className="mt-2 text-xl font-semibold leading-none tracking-tight text-fg tabular-nums">{value}</p>
         {(hint || delta) && (
-          <div className="mt-2 flex items-center gap-2 text-meta">
+          <div className="mt-2.5 flex items-center gap-2 text-meta">
             {delta && t && (
               <span
                 className={cn("inline-flex items-center gap-0.5 font-medium tabular-nums", t.cls)}
               >
-                <t.Icon size={13} />
+                <t.Icon size={12} strokeWidth={2.25} />
                 {delta.value}
               </span>
             )}
@@ -106,11 +106,11 @@ export function StatCard({
       {Icon && (
         <span
           className={cn(
-            "flex size-9 shrink-0 items-center justify-center rounded-lg",
+            "size-9 rounded-lg",
             iconToneClass[tone],
           )}
         >
-          <Icon size={18} />
+          <Icon size={18} strokeWidth={1.85} />
         </span>
       )}
     </Card>

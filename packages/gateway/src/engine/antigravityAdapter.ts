@@ -32,13 +32,17 @@ import { dirname, join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import type { Readable, Writable } from 'node:stream'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import {
   ANTIGRAVITY_RELAY_PREFIX,
+  SWARM_BOARD_TOOL_NAME,
   antigravityCliModelId,
+  mergeSwarmSnapshots,
   TOOL_FAILED_EMPTY_SENTINEL,
   type GoalStateSnapshot,
   type OutboundContentBlock,
+  type SwarmPhase,
+  type SwarmSnapshot,
 } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { ExecutionTarget } from '../remoteTarget.js'
@@ -60,6 +64,7 @@ import { bindRouteTrace } from '../relayTrace.js'
 import {
   ANTIGRAVITY_PREAMBLE,
   antigravityRoot,
+  antigravitySessionBrainDir,
   cleanupAntigravityLaunch,
   projectAntigravityPlatform,
   type AntigravityPlatformProjection,
@@ -71,6 +76,16 @@ import {
   writeAntigravityPromptState,
 } from './antigravityPromptState.js'
 import { antigravityProductToolInput, antigravityProductToolName, antigravityToolOutput } from './antigravityToolNormalize.js'
+import { AntigravityToolBackfiller, isBackfillableAntigravityFileTool } from './antigravityToolBackfill.js'
+import {
+  AntigravitySwarmWatcher,
+  buildDurableSwarmBoardInput,
+  formatSwarmWorkingDetail,
+  settleSwarmSnapshotTerminal,
+} from './antigravitySwarmWatcher.js'
+import { GATEWAY_STALL_MONITOR_AGENT } from './swarmStallMonitor.js'
+import { injectSwarmDirective } from '../swarmCommand.js'
+import { lookupRemoteSwarmMcpContext } from '../remoteSwarmRuntime.js'
 import {
   prepareAntigravityNativeTrajectory,
   recoverAntigravityNativeTrajectory,
@@ -101,6 +116,7 @@ const KEEPALIVE_INTERVAL_MS = 30_000
 const BOUNDED_FILE_TOOLS = new Set([
   'view_file', 'write_to_file', 'replace_file_content', 'multi_replace_file_content', 'sed_file',
 ])
+const SWARM_NATIVE_TOOLS = new Set(['swarm', 'post_message', 'read_board', 'swarm_wait'])
 /** After `result`, wait this long for the process to exit so trailing
  * stderr (soft-deny / empty-run notices) is read before the turn settles. */
 const RESULT_SETTLE_MS = 5_000
@@ -242,6 +258,14 @@ interface TurnContext {
   exitCode: number | null
   /** A possibly repeated old ERROR is waiting for the exit code (Codex r2 P1). */
   awaitingExitSince: number | null
+  /** Live watcher for Antigravity native swarm dir (`<brain>/<conv>/.system_generated/swarm`). */
+  swarmWatcher: AntigravitySwarmWatcher | null
+  swarmBlockId: string | null
+  swarmEventOrdinal: number | undefined
+  swarmCommitted: boolean
+  lastEmittedSwarmSnapshot: SwarmSnapshot | null
+  /** Incremental sideband reader for edit_file/write_file full diff arguments (OCV5-812). */
+  toolBackfiller: AntigravityToolBackfiller | null
   resolveSummary: (summary: TurnSummary | null) => void
   resolveDrain: (() => void) | null
 }
@@ -394,6 +418,19 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     this.route = route ? { ...route } : null
   }
 
+  /** Authoritative container-side swarm target for this Antigravity session (never client-supplied). */
+  getActiveSwarmTarget(): { brainDir: string; conversationId: string } | null {
+    const convId =
+      this.active?.conversationId ??
+      this.active?.requestedConversationId ??
+      this.nativeId
+    if (!convId || !CONVERSATION_ID_RE.test(convId)) return null
+    const brainDir =
+      this.active?.projection?.sessionBrainDir ??
+      antigravitySessionBrainDir(antigravityRoot(), this.opts.sessionKey)
+    return { brainDir, conversationId: convId }
+  }
+
   submitTurn(params: TurnParams): EngineTurnRun {
     let resolveSummary!: (summary: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((resolve) => { resolveSummary = resolve })
@@ -453,6 +490,12 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       promptInputsKey: null,
       exitCode: null,
       awaitingExitSince: null,
+      swarmWatcher: null,
+      swarmBlockId: null,
+      swarmEventOrdinal: undefined,
+      swarmCommitted: false,
+      lastEmittedSwarmSnapshot: null,
+      toolBackfiller: null,
       resolveSummary,
       resolveDrain: null,
     }
@@ -489,6 +532,15 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private async spawnTurn(ctx: TurnContext): Promise<void> {
+    // B4 (OCV5-828): Antigravity CLI runs with `--dangerously-skip-permissions` and
+    // cannot enforce a hard read-only sandbox locally. Fail closed BEFORE projection
+    // or spawning so explicit read-only turns never execute with write capabilities
+    // and never silently swap the main model.
+    if (ctx.params.readOnly === true) {
+      throw new Error(
+        'ANTIGRAVITY_READ_ONLY_UNSUPPORTED: Antigravity 本地 CLI 暂不支持硬只读沙箱，已拒绝启动该只读回合（主模型未切换）。',
+      )
+    }
     const route = validateAntigravityRoute(this.route)
     const cliModel = antigravityCliModelId(this.currentModel, this.currentEffort)
     if (!cliModel) {
@@ -586,6 +638,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       maxBytes: ANTIGRAVITY_MAX_PROMPT_BYTES,
       cwd: cwdDecision.cwd,
       engine: this.engineId,
+      sessionKey: this.opts.sessionKey,
       onEvent: (event) => { if (!ctx.terminal) ctx.params.onEvent(event) },
     })
     // Context-file IO can outlive the logical turn. Never launch a paid CLI
@@ -654,7 +707,198 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     ctx.routeToken = route.routeToken
     ctx.routeRenewAt = Date.now()
     ctx.releaseRelayTrace = bindRouteTrace(route.routeToken, this.traceId)
+    if (ctx.requestedConversationId) {
+      this.ensureSwarmWatcher(ctx, ctx.requestedConversationId)
+      // Snapshot pre-spawn transcript_full.jsonl EOF before launching the resumed CLI (B2).
+      const backfiller = this.ensureToolBackfiller(ctx)
+      backfiller?.captureStartOffset()
+    }
     this.spawnChild(ctx, { bin, args, env, cwd: cwdDecision.cwd, line })
+  }
+
+  private ensureSwarmWatcher(ctx: TurnContext, conversationId: string): void {
+    if (ctx.swarmWatcher || ctx.terminal || ctx.abandoned || !ctx.projection) return
+    if (!CONVERSATION_ID_RE.test(conversationId)) return
+    const brainDir = ctx.projection.sessionBrainDir
+    const watcher = new AntigravitySwarmWatcher({
+      brainDir,
+      conversationId,
+      // Resumed conversations may carry a historical swarm directory from an earlier
+      // turn. Treat it as a silent baseline until this turn actually mutates the
+      // board or runs an own native swarm tool (`activateTurnSwarm()`).
+      seedBaselineOnStart: Boolean(ctx.requestedConversationId || ctx.resumedLaunch),
+      onSnapshot: (snapshot) => this.emitSwarmSnapshot(ctx, snapshot),
+      stallMonitor: {
+        onDiagnostic: (diag) => {
+          log.info('antigravity_swarm_stall_diagnostic', {
+            sessionKey: this.opts.sessionKey,
+            conversationId,
+            kind: diag.kind,
+            phase: diag.phase,
+            headSeq: diag.headSeq,
+            idleMs: diag.idleMs,
+            alertCount: diag.alertCount,
+            workingMembers: diag.workingMembers,
+            waitingMembers: diag.waitingMembers,
+            ...(diag.reason ? { reason: diag.reason } : {}),
+            ...(diag.target ? { target: diag.target } : {}),
+            ...(diag.detail ? { detail: diag.detail } : {}),
+          })
+        },
+      },
+      onStallDetected: (alert) => {
+        if (ctx.terminal || ctx.abandoned) return
+        void injectSwarmDirective({
+          brainDir,
+          conversationId,
+          target: alert.target,
+          message: alert.message,
+          channel: alert.channel,
+          sender: GATEWAY_STALL_MONITOR_AGENT,
+          controlKind: 'stall',
+        })
+          .then((res) => {
+            if (ctx.terminal || ctx.abandoned) return
+            if (res.ok) {
+              log.info('antigravity_swarm_stall_alert', {
+                sessionKey: this.opts.sessionKey,
+                conversationId,
+                target: alert.target,
+                reason: alert.reason,
+                attempt: alert.attempt,
+                idleMs: alert.idleMs,
+                seq: res.seq,
+              })
+              ctx.swarmWatcher?.kick()
+            } else {
+              log.warn('antigravity_swarm_stall_alert_failed', {
+                sessionKey: this.opts.sessionKey,
+                conversationId,
+                target: alert.target,
+                reason: alert.reason,
+                code: res.code,
+                error: res.error,
+              })
+            }
+          })
+          .catch((err) => {
+            log.warn('antigravity_swarm_stall_alert_failed', {
+              sessionKey: this.opts.sessionKey,
+              conversationId,
+              target: alert.target,
+              reason: alert.reason,
+              error: String((err as Error)?.message ?? err),
+            })
+          })
+      },
+    })
+    ctx.swarmWatcher = watcher
+    watcher.start()
+  }
+
+  private stopSwarmWatcher(ctx: TurnContext): void {
+    if (!ctx.swarmWatcher) return
+    ctx.swarmWatcher.stop()
+    ctx.swarmWatcher = null
+  }
+
+  private swarmBlockIdFor(ctx: TurnContext, swarmId: string): string {
+    if (!ctx.swarmBlockId) {
+      ctx.swarmBlockId = `agy-swarm-${swarmId.slice(0, 8)}-t${ctx.params.sessionTotals.turns}`
+    }
+    return ctx.swarmBlockId
+  }
+
+  private emitSwarmSnapshot(ctx: TurnContext, snapshot: SwarmSnapshot): void {
+    if (ctx.terminal || ctx.abandoned) return
+    // Sideband disk telemetry must NEVER set `ctx.sawOutput = true`: delivery
+    // evidence comes solely from CLI stdout/tool steps, preserving EMPTY_RUN guards.
+    // Keep `ctx.lastEmittedSwarmSnapshot` as the full merged snapshot even when the
+    // wire frame carries `postsMode: 'delta'` so forced-stop persistence never loses posts.
+    ctx.lastEmittedSwarmSnapshot =
+      ctx.swarmWatcher?.latestSnapshot() ??
+      mergeSwarmSnapshots(ctx.lastEmittedSwarmSnapshot, snapshot) ??
+      structuredClone(snapshot)
+    this.lastActivityAt = Date.now()
+    this.emit('activity')
+    const blockId = this.swarmBlockIdFor(ctx, snapshot.swarmId)
+    if (ctx.swarmEventOrdinal === undefined) {
+      ctx.swarmEventOrdinal = ctx.params.nextDurableEventOrdinal?.()
+    }
+    ctx.params.onEvent({
+      kind: 'block',
+      block: {
+        kind: 'swarm_snapshot',
+        blockId,
+        snapshot,
+      },
+    })
+    if (snapshot.phase === 'running' || snapshot.phase === 'starting') {
+      ctx.params.onEvent({
+        kind: 'turn_status',
+        status: { status: 'working', detail: formatSwarmWorkingDetail(snapshot) },
+      })
+    }
+  }
+
+  /**
+   * Idempotently settle and persist the turn's SwarmBoard into `ctx.tools` (shared
+   * by normal `finish()`, `abandonTurn()`, and forced-stop `getPartialSnapshot()`).
+   * Writes at most once per turn and skips turns that never engaged a swarm.
+   */
+  private commitTerminalSwarmBoard(
+    ctx: TurnContext,
+    phase: SwarmPhase,
+    opts: { emitEvent: boolean; readDisk: boolean },
+  ): void {
+    if (ctx.swarmCommitted) {
+      this.stopSwarmWatcher(ctx)
+      return
+    }
+    const watcher = ctx.swarmWatcher
+    ctx.swarmWatcher = null
+    let finalSwarm: SwarmSnapshot | null = null
+    if (opts.readDisk && watcher) {
+      finalSwarm = watcher.stopAndReadFinal(phase)
+    } else {
+      watcher?.stop()
+      const hadActivity = (watcher?.hasTurnActivity() ?? false) || ctx.lastEmittedSwarmSnapshot !== null
+      const base = ctx.lastEmittedSwarmSnapshot ?? (hadActivity ? watcher?.latestSnapshot() ?? null : null)
+      if (hadActivity && base) {
+        finalSwarm = settleSwarmSnapshotTerminal(base, phase)
+      }
+    }
+    if (!finalSwarm) return
+    ctx.swarmCommitted = true
+    ctx.lastEmittedSwarmSnapshot = structuredClone(finalSwarm)
+    const swarmBlockId = this.swarmBlockIdFor(ctx, finalSwarm.swarmId)
+    if (opts.emitEvent) {
+      ctx.params.onEvent({
+        kind: 'block',
+        block: {
+          kind: 'swarm_snapshot',
+          blockId: swarmBlockId,
+          snapshot: finalSwarm,
+        },
+      })
+    }
+    const durableInput = buildDurableSwarmBoardInput(finalSwarm)
+    const swarmSummary = formatSwarmWorkingDetail(finalSwarm)
+    const swarmStartedAt = finalSwarm.startedAt ?? ctx.startedAt
+    ctx.tools.set(swarmBlockId, {
+      toolUseId: swarmBlockId,
+      blockId: swarmBlockId,
+      toolName: SWARM_BOARD_TOOL_NAME,
+      inputJson: durableInput,
+      inputPreview: durableInput.title.slice(0, 500),
+      output: swarmSummary,
+      completed: true,
+      isError: phase === 'error',
+      durationMs: Math.max(0, Date.now() - swarmStartedAt),
+      ts: Date.now(),
+      arrivedAt: swarmStartedAt,
+      eventOrdinal: ctx.swarmEventOrdinal ?? ctx.params.nextDurableEventOrdinal?.(),
+    })
   }
 
   private spawnChild(
@@ -868,6 +1112,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
         } else {
           ctx.initConversationId = id
           ctx.conversationId = id
+          this.ensureSwarmWatcher(ctx, id)
         }
       }
       return
@@ -989,6 +1234,24 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     return `agy-${conv}-${count(step.step_index)}`
   }
 
+  private ensureToolBackfiller(ctx: TurnContext): AntigravityToolBackfiller | null {
+    if (ctx.toolBackfiller) return ctx.toolBackfiller
+    if (ctx.terminal || ctx.abandoned || !ctx.projection) return null
+    const convId = ctx.conversationId ?? ctx.requestedConversationId
+    if (!convId || !CONVERSATION_ID_RE.test(convId)) return null
+    ctx.toolBackfiller = new AntigravityToolBackfiller({
+      brainDir: ctx.projection.sessionBrainDir,
+      conversationId: convId,
+    })
+    return ctx.toolBackfiller
+  }
+
+  private minOwnStepIndex(ctx: TurnContext): number {
+    if (ctx.firstOwnStepIndex !== null) return ctx.firstOwnStepIndex
+    const baseline = ctx.nativeBinding?.baseline
+    return typeof baseline === 'number' && Number.isSafeInteger(baseline) ? baseline + 1 : 0
+  }
+
   private handleToolStep(ctx: TurnContext, step: Record<string, unknown>, state: string): void {
     ctx.sawOutput = true
     ctx.trailingErrorStep = false
@@ -997,19 +1260,32 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     const info = recordOf(step.tool_info) ?? {}
     const nativeName = asText(info.name) || asText(step.tool_name)
     const parameters = info.parameters ?? {}
+    const stepIndex = typeof step.step_index === 'number' && Number.isSafeInteger(step.step_index) && step.step_index >= 0
+      ? step.step_index
+      : null
     // Only this launch's first ACTIVE proves that local work started. Replayed
     // history, duplicate ACTIVE, unrelated stdout and keepalive cannot renew it.
     if (
       state === 'ACTIVE' && BOUNDED_FILE_TOOLS.has(nativeName) &&
-      ctx.firstOwnStepIndex !== null && typeof step.step_index === 'number' &&
-      Number.isSafeInteger(step.step_index) && step.step_index >= ctx.firstOwnStepIndex &&
+      ctx.firstOwnStepIndex !== null && stepIndex !== null && stepIndex >= ctx.firstOwnStepIndex &&
       !ctx.tools.get(id)?.completed && !ctx.boundedFileToolStartedAt.has(id)
     ) {
       ctx.boundedFileToolStartedAt.set(id, Date.now())
     }
     if (!ctx.tools.has(id)) {
       const toolName = antigravityProductToolName(nativeName, parameters)
-      const inputJson = antigravityProductToolInput(nativeName, parameters)
+      let inputJson = antigravityProductToolInput(nativeName, parameters)
+      if (isBackfillableAntigravityFileTool(nativeName)) {
+        const backfiller = this.ensureToolBackfiller(ctx)
+        const filled = backfiller?.tryBackfill({
+          toolUseId: id,
+          nativeName,
+          productInput: inputJson,
+          stepIndex,
+          minStepIndex: this.minOwnStepIndex(ctx),
+        })
+        if (filled) inputJson = filled
+      }
       const tool: TurnToolEntry = {
         toolUseId: id,
         blockId: id,
@@ -1046,12 +1322,41 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
         },
       })
     }
+    if (SWARM_NATIVE_TOOLS.has(nativeName)) {
+      ctx.swarmWatcher?.activateTurnSwarm()
+    }
     if (state !== 'DONE' && state !== 'ERROR') return
     const tool = ctx.tools.get(id)!
     if (tool.completed) return
+    // Retry backfill once at completion in case transcript_full.jsonl flushed after ACTIVE.
+    if (isBackfillableAntigravityFileTool(nativeName)) {
+      const backfiller = this.ensureToolBackfiller(ctx)
+      const filled = backfiller?.tryBackfill({
+        toolUseId: id,
+        nativeName,
+        productInput: tool.inputJson,
+        stepIndex,
+        minStepIndex: this.minOwnStepIndex(ctx),
+      })
+      if (filled) {
+        tool.inputJson = structuredClone(filled)
+        tool.inputPreview = asText(filled).slice(0, 500)
+        ctx.params.onEvent({
+          kind: 'block',
+          block: {
+            kind: 'tool_use',
+            blockId: id,
+            toolName: tool.toolName,
+            inputJson: structuredClone(filled),
+            inputPreview: tool.inputPreview,
+            partial: false,
+          },
+        })
+      }
+    }
     const error = recordOf(info.error)
     const isError = state === 'ERROR' || error !== null
-    const raw = antigravityToolOutput(info.output)
+    const raw = antigravityToolOutput(info.output, nativeName)
     const output = isError
       ? (asText(error?.message) || raw || TOOL_FAILED_EMPTY_SENTINEL)
       : raw
@@ -1263,6 +1568,8 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     const isError = ctx.errorDetail !== null
     ctx.deliveredSuccess = !isError && !ctx.interrupted && !ctx.abandoned
     const stopReason = ctx.interrupted ? 'interrupted' : isError ? 'error' : 'end_turn'
+    const finalSwarmPhase: SwarmPhase = ctx.interrupted ? 'interrupted' : isError ? 'error' : 'completed'
+    this.commitTerminalSwarmBoard(ctx, finalSwarmPhase, { emitEvent: true, readDisk: true })
     ctx.params.sessionTotals.turns += 1
     if (isError) ctx.params.onEvent({ kind: 'error', error: ctx.errorDetail! })
     // 1.3.4 never streams thought text (only thinking_tokens), so the
@@ -1325,6 +1632,12 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
 
   private forceEnd(ctx: TurnContext): void {
     this.stopKeepalive(ctx)
+    // Preserve any already-displayed swarm board in `ctx.tools` BEFORE terminal
+    // teardown so `getPartialSnapshot()` persists one settled terminal card.
+    this.commitTerminalSwarmBoard(ctx, ctx.interrupted ? 'interrupted' : 'error', {
+      emitEvent: false,
+      readDisk: false,
+    })
     if (ctx.terminal) return
     ctx.deliveredSuccess = false
     ctx.terminal = true
@@ -1332,6 +1645,9 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private cleanupLaunch(ctx: TurnContext, opts?: { persistSummaryCache?: boolean }): void {
+    this.stopSwarmWatcher(ctx)
+    ctx.toolBackfiller?.dispose()
+    ctx.toolBackfiller = null
     // Every caller is the end of the turn's process, so its relay requests stop naming this turn too.
     ctx.releaseRelayTrace?.()
     ctx.releaseRelayTrace = null
@@ -1437,6 +1753,11 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     this.stopKeepalive(ctx)
     ctx.deliveredSuccess = false
     ctx.abandoned = true
+    // Commit last observed swarm snapshot before cleanupLaunch tears down the launch dir.
+    this.commitTerminalSwarmBoard(ctx, ctx.interrupted ? 'interrupted' : 'error', {
+      emitEvent: !ctx.terminal,
+      readDisk: false,
+    })
     this.cleanupLaunch(ctx)
     if (proc) detachChildStdio(proc)
     if (!ctx.terminal) this.finishError(ctx, detail)
@@ -1514,6 +1835,32 @@ registerEngineRemoteContext('antigravity', async ({ opts, supportsVision, prompt
   const { learning, profile, env, cleanup } = await runner.prepareRemoteToolContext({
     supportsVision,
   })
+  const swarmCtx = lookupRemoteSwarmMcpContext(opts.sessionKey)
+  const swarmEnv: Record<string, string> = swarmCtx
+    ? {
+        OPENCLAUDE_REMOTE_SWARM_ENABLED: '1',
+        OPENCLAUDE_REMOTE_SWARM_SESSION_KEY: swarmCtx.coordinatorSessionKey,
+        OPENCLAUDE_REMOTE_SWARM_MEMBER: swarmCtx.memberName,
+        OPENCLAUDE_REMOTE_SWARM_TOKEN: swarmCtx.callerToken,
+      }
+    : {}
+  const mergedEnv: NodeJS.ProcessEnv = { ...env, ...swarmEnv }
+  if (!promptOnly && swarmCtx && profile.mcpConfigPath && existsSync(profile.mcpConfigPath)) {
+    try {
+      const rawCfg = JSON.parse(readFileSync(profile.mcpConfigPath, 'utf8')) as {
+        mcpServers?: Record<string, { env?: Record<string, string> }>
+      }
+      if (rawCfg?.mcpServers?.['openclaude-memory']) {
+        rawCfg.mcpServers['openclaude-memory'].env = {
+          ...(rawCfg.mcpServers['openclaude-memory'].env ?? {}),
+          ...swarmEnv,
+        }
+        writeFileSync(profile.mcpConfigPath, JSON.stringify(rawCfg, null, 2), { mode: 0o600 })
+      }
+    } catch {
+      // keep original mcp config if unreadable
+    }
+  }
   const platformPrompt = learning.extraPromptFile
     ? readFileSync(learning.extraPromptFile, 'utf8')
     : ''
@@ -1521,7 +1868,7 @@ registerEngineRemoteContext('antigravity', async ({ opts, supportsVision, prompt
     cleanup()
     return {
       profile,
-      env,
+      env: mergedEnv,
       platformPrompt,
       promptCwd: profile.cwd,
       promptPolicyFingerprint: runner.promptPolicyFingerprint,
@@ -1531,7 +1878,7 @@ registerEngineRemoteContext('antigravity', async ({ opts, supportsVision, prompt
   }
   return {
     profile,
-    env,
+    env: mergedEnv,
     platformPrompt,
     promptCwd: profile.cwd,
     promptPolicyFingerprint: runner.promptPolicyFingerprint,

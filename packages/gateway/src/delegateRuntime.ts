@@ -6,7 +6,8 @@
  * `this.x` reads/writes are unchanged. DelegateRuntimeHost lists exactly the Gateway members this code
  * touches (typed from the class itself).
  */
-import { fetchIdentityCompatProjection } from '@openclaude/storage'
+import { fetchIdentityCompatProjection, paths as storagePaths } from '@openclaude/storage'
+import { offloadPayloadIfOversized } from './payloadOffloadGate.js'
 import { resolveIdentityCompat, assertIdentityCompatReady } from '@openclaude/protocol'
 import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
@@ -98,6 +99,10 @@ import {
   acquireDelegateAntigravityRoute,
   type DelegateAntigravityRouteLease,
 } from './delegateAntigravityRoute.js'
+import {
+  acquireDelegateRemoteLane,
+  type DelegateRemoteLaneLease,
+} from './delegateRemoteLane.js'
 import {
   _buildCodexAdmitRouteOverride,
   _buildSafeAntigravityRouteOverride,
@@ -949,6 +954,31 @@ export async function handleDelegateTask(
   }
 }
 
+export const SYNC_DELEGATE_INLINE_MAX_CHARS = 12_000
+
+export function boundSyncDelegateOutput(
+  output: string,
+  opts?: { targetAgentId?: string; sessionKey?: string; workspaceDir?: string },
+): { output: string; artifactPath?: string; offloaded: boolean } {
+  if (output.length <= SYNC_DELEGATE_INLINE_MAX_CHARS) {
+    return { output, offloaded: false }
+  }
+  const gated = offloadPayloadIfOversized({
+    workspaceDir: opts?.workspaceDir ?? join(storagePaths.home, 'workspace', 'delegate-artifacts'),
+    sessionKey: opts?.sessionKey,
+    sessionId: opts?.sessionKey,
+    category: `delegate-${opts?.targetAgentId ?? 'worker'}`,
+    label: opts?.targetAgentId ? `delegate:${opts.targetAgentId}` : 'delegate',
+    content: output,
+    inlineMaxChars: SYNC_DELEGATE_INLINE_MAX_CHARS,
+  })
+  return {
+    output: gated.text,
+    ...(gated.artifactPath ? { artifactPath: gated.artifactPath } : {}),
+    offloaded: gated.offloaded,
+  }
+}
+
 export function _delegateResultToHttp(
   this: DelegateRuntimeHost,
   result: DelegateTaskResult,
@@ -976,12 +1006,21 @@ export function _delegateResultToHttp(
       },
     }
   }
+  // Paid child replies must be delivered verbatim in `body.output`
+  // (lossless contract in memberDelegateLimit.test.ts); keep companion
+  // `artifactPath` offloaded for oversized replies so downstream pruning
+  // and on-demand reads have a stable handle.
+  const bounded = boundSyncDelegateOutput(result.output, {
+    targetAgentId,
+    sessionKey: result.sessionKey,
+  })
   return {
     httpStatus: 200,
     body: {
       ok: result.ok,
       agentId: targetAgentId,
       output: result.output,
+      ...(bounded.artifactPath ? { artifactPath: bounded.artifactPath } : {}),
       error: result.error || undefined,
       ...(result.sessionKey ? { sessionKey: result.sessionKey } : {}),
     },
@@ -1699,12 +1738,14 @@ export async function _runDelegateTaskCore(
     route?: DelegateGrokRouteLease | null,
     admission?: DelegateEngineBillingAdmission | null,
     antigravity?: DelegateAntigravityRouteLease | null,
+    remoteLane?: DelegateRemoteLaneLease | null,
   ): Promise<DelegateTaskResult> => {
     try {
       await input.taskboardControl?.waitForDescendants(sessionKey)
       if (admission) await (this._delegateEngineBilling ?? defaultDelegateEngineBilling).abandon(admission.requestId).catch(() => {})
       if (route) await route.release()
       if (antigravity) await antigravity.release()
+      if (remoteLane) await remoteLane.release({ outcome: 'interrupted', releaseLane: true })
       return cancelledBeforeSpawn
     } finally {
       this._delegateOwnerByRunId?.delete(progressRunId)
@@ -1829,6 +1870,39 @@ export async function _runDelegateTaskCore(
     parentTraceId: input.parentTraceId, delegateRunId: input.backgroundJobId ?? progressRunId,
     reason: traceMissingReason,
   })
+  // ── remote-pool delegate turn:向 master 申请 remote-driver-v4 lane + 签发权威(OCV5-835)──
+  const remotePoolModelCandidate = delegateExec?.canonicalModel || requestedModel || execAgent.model
+  const isRemotePoolDelegate =
+    typeof remotePoolModelCandidate === 'string' && remotePoolModelCandidate.endsWith('-remote')
+  let remoteLaneLease: DelegateRemoteLaneLease | null = null
+  if (isRemotePoolDelegate && remotePoolModelCandidate) {
+    const acquiredRemote = await acquireDelegateRemoteLane({
+      sessionKey,
+      model: remotePoolModelCandidate,
+      agentId: targetAgentId,
+      delegateAgentId: targetAgentId,
+      ...(parentClientSessionId ? { parentSessionId: parentClientSessionId } : {}),
+      ...(delegateParent?.billingParentTurnKey
+        ? { parentTurnKey: delegateParent.billingParentTurnKey }
+        : {}),
+      log: this.log,
+    })
+    if (input.taskboardControl?.signal.aborted) {
+      return cancelPreparation(null, null, null, acquiredRemote.ok ? acquiredRemote.lease : null)
+    }
+    if (!acquiredRemote.ok) {
+      if (input._leaseTimer) clearInterval(input._leaseTimer)
+      this._releaseDelegateSlot(slotOpts)
+      unregisterDelegation?.()
+      return {
+        kind: 'rejected',
+        httpStatus: acquiredRemote.httpStatus,
+        message: `远端模型委派暂不可用（${acquiredRemote.code}）: ${acquiredRemote.reason}`,
+      }
+    }
+    remoteLaneLease = acquiredRemote.lease
+  }
+
   // ── grok delegate turn:向 master 铸造 relay route(与浏览器 turn 同一账号池)──
   // delegate 是容器本地 turn,没有 bridge 注入 __oc_grok_route;不铸 route 则
   // GrokAdapter 在 spawn 前 fail-closed(GROK_ROUTE_REQUIRED)。放在资源闸之后:
@@ -1839,11 +1913,13 @@ export async function _runDelegateTaskCore(
     requestedModel,
     agentModel: execAgent.model,
   })
-  const grokDelegate = shouldMintDelegateGrokRoute({
-    delegateEngine: delegateExec?.engine,
-    requestedModel,
-    agentModel: execAgent.model,
-  })
+  const grokDelegate =
+    !isRemotePoolDelegate &&
+    shouldMintDelegateGrokRoute({
+      delegateEngine: delegateExec?.engine,
+      requestedModel,
+      agentModel: execAgent.model,
+    })
   if (input.taskboardControl?.signal.aborted) return cancelPreparation()
   let grokRoute: { baseUrl: string; routeToken: string } | null = null
   let grokRouteLease: DelegateGrokRouteLease | null = null
@@ -1921,13 +1997,15 @@ export async function _runDelegateTaskCore(
   // engine-reported (codex/grok) 委派必须先向 master 签 32-hex requestId +
   // inflight journal,否则 adapter 不 emit billing,usage_records.mode=delegate
   // 永远为空。CCB/GLM 走 anthropicProxy,不进这条。失败 fail-closed,禁止白跑。
-  if (input.taskboardControl?.signal.aborted) return cancelPreparation(grokRouteLease)
+  if (input.taskboardControl?.signal.aborted) return cancelPreparation(grokRouteLease, null, null, remoteLaneLease)
   const billingApi = this._delegateEngineBilling ?? defaultDelegateEngineBilling
-  const engineReported = shouldAdmitDelegateEngineBilling({
-    delegateEngine: delegateExec?.engine,
-    requestedModel,
-    agentModel: execAgent.model,
-  })
+  const engineReported =
+    !isRemotePoolDelegate &&
+    shouldAdmitDelegateEngineBilling({
+      delegateEngine: delegateExec?.engine,
+      requestedModel,
+      agentModel: execAgent.model,
+    })
   let engineBillingAdmission: DelegateEngineBillingAdmission | null = null
   let billingModel: string | undefined
   let billingEngine: DelegateEngineBillingEngine | undefined
@@ -2108,11 +2186,26 @@ export async function _runDelegateTaskCore(
     session = await this.sessions.getOrCreate({
       sessionKey,
       agent: execAgent,
-      // flag 未开 → {}(零变化);flag 开 → catalog 投影的 canonicalModel + engine。
-      ...localExecutionOverride(delegateExec),
-      ...(delegateExec || !requestedModel ? {} : { model: requestedModel }),
+      // flag 未开 → {}(零变化);flag 开 → catalog 投影的 canonicalModel + engine;
+      // 远端模型委派(OCV5-835)→ Master 签发的 bridge_signed executionAuthority + executionBackend。
+      ...(remoteLaneLease
+        ? {
+            model: remoteLaneLease.canonicalModel,
+            executionAuthority: {
+              canonicalModel: remoteLaneLease.canonicalModel,
+              engine: remoteLaneLease.engine,
+              executionBackend: remoteLaneLease.executionBackend,
+              source: 'bridge_signed' as const,
+            },
+          }
+        : {
+            ...localExecutionOverride(delegateExec),
+            ...(delegateExec || !requestedModel ? {} : { model: requestedModel }),
+          }),
       channel: input.channel ?? 'delegate',
-      peerId: sourceAgent || 'system',
+      peerId: remoteLaneLease
+        ? `${sourceAgent || 'system'}_${progressRunId.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 24)}`
+        : sourceAgent || 'system',
       repoSessionId: progressTarget?.peerId ?? delegateParent?.repoSessionId,
       workspaceMode: delegateParent?.workspaceMode,
       workspaceCwd: input.workspaceCwd ?? delegateParent?.workspaceCwd,
@@ -2134,7 +2227,7 @@ export async function _runDelegateTaskCore(
     })
     if (input.taskboardControl?.signal.aborted) {
       await this.sessions.destroySession(sessionKey)
-      return cancelPreparation(grokRouteLease, engineBillingAdmission, antigravityRouteLease)
+      return cancelPreparation(grokRouteLease, engineBillingAdmission, antigravityRouteLease, remoteLaneLease)
     }
     hooks?.onSessionSpawned?.()
     if (session.channel === 'taskboard') session._taskboardLastActivityAt = lastChildActivityAt
@@ -2187,6 +2280,7 @@ export async function _runDelegateTaskCore(
     }
     if (grokRouteLease) grokRouteLease.release().catch(() => {})
     if (antigravityRouteLease) antigravityRouteLease.release().catch(() => {})
+    if (remoteLaneLease) remoteLaneLease.release({ outcome: 'executed_error', releaseLane: true }).catch(() => {})
     this._releaseDelegateSlot(slotOpts)
     unregisterDelegation?.()
     // flag 未开时 resolveLocalExecutionIfEnforced 是 no-op,显式未知型号在
@@ -2357,12 +2451,13 @@ export async function _runDelegateTaskCore(
     // P2 批次4 — effort 透传:子会话是新建的,首次 submit 的 effortLevel 在 runner
     // spawn 前生效(与顶层会话 safeEffortLevel 同法)。undefined = 不指定 → 成员默认档位。
     input.effort,
-    delegateExec?.canonicalModel ?? requestedModel,
-    engineBillingAdmission?.requestId,
+    remoteLaneLease?.canonicalModel ?? delegateExec?.canonicalModel ?? requestedModel,
+    remoteLaneLease?.billingRequestId ?? engineBillingAdmission?.requestId,
     input.traceId,
     undefined,
     {
       platformGoal: session._platformGoal ?? null,
+      ...(remoteLaneLease ? { modelAuthority: remoteLaneLease.turnModelAuthority } : {}),
       ...(engineBillingAdmission?.grokExecutionDescriptor
         ? { grokExecutionDescriptor: engineBillingAdmission.grokExecutionDescriptor } : {}),
       ...(grokRoute ? { grokRoute } : {}),
@@ -2611,6 +2706,12 @@ export async function _runDelegateTaskCore(
     // 不会因清理失败让已完成的委派翻成失败)。
     if (grokRouteLease) await grokRouteLease.release()
     if (antigravityRouteLease) await antigravityRouteLease.release()
+    if (remoteLaneLease) {
+      await remoteLaneLease.release({
+        outcome: error ? (cancelled ? 'interrupted' : 'executed_error') : 'completed',
+        releaseLane: true,
+      })
+    }
     // 本次 delegate 的子会话(sessionKey 带时间戳,一次性)在生命周期内可能
     // 作为"父"再委派(hidden 审查员 / 嵌套成员);它收尾后计数键永远不会复用,
     // 两个 per-turn 计数器都清理防泄漏。注意清的是子会话自己的键,不动 delegateGuardKey

@@ -1,8 +1,10 @@
 import type { IdentityCompatProjection } from "@openclaude/protocol/browser";
+import { BookOpen, ChevronRight, FileText, ShieldCheck } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 import { AuthEpochStaleError, apiErrorMessage } from "../../lib/api";
 import { identityCompatApi, type PersonaDocument } from "../../lib/identityCompat";
 import type { AuthSession } from "../../lib/types";
+import { cn } from "../../lib/utils";
 import { Alert, Badge, Button, Textarea, useToast } from "../ui";
 
 type Registration = IdentityCompatProjection["profiles"][number];
@@ -41,21 +43,58 @@ export function IdentityManual({ auth, agentId, authority }: {
   // 与梦境报告的静默降级对齐：一枚徽章 + 原因 + 行内重试，不抢主内容的注意力。
   if (error)
     return (
-      <section className="flex flex-wrap items-center gap-x-2 gap-y-1 border-t border-border px-4 py-2.5 text-caption text-muted" aria-label="本实例运行手册管理">
-        <Badge tone="warning" size="sm">本实例运行手册</Badge>
-        <span>{error}</span>
-        {/* 可访问名带上对象：同一面板里核心记忆的读失败也有一枚「重试」，读屏按钮列表里要分得开。 */}
-        {/* h-auto 压掉了 Button 自带的触屏 min-h;两个字只有 26px 宽(t-762 manage#4)——触控档补 44px 最小宽高,桌面零变化。 */}
-        <Button variant="link" size="sm" className="h-auto px-0 [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11" aria-label="重试读取本实例运行手册" onClick={retry}>重试</Button>
+      <section className="border-t border-border/80 px-4 py-3" aria-label="本实例运行手册管理">
+        <div className="oc-surface-recessed flex flex-wrap items-center gap-x-2.5 gap-y-1.5 rounded-xl px-3.5 py-2.5 text-caption text-muted">
+          <Badge tone="warning" size="sm" className="oc-badge-craft">本实例运行手册</Badge>
+          <span className="min-w-0 flex-1">{error}</span>
+          {/* 可访问名带上对象：同一面板里核心记忆的读失败也有一枚「重试」，读屏按钮列表里要分得开。 */}
+          {/* h-auto 压掉了 Button 自带的触屏 min-h;两个字只有 26px 宽(t-762 manage#4)——触控档补 44px 最小宽高,桌面零变化。 */}
+          <Button variant="link" size="sm" className="oc-btn-tactile h-auto px-0 [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11" aria-label="重试读取本实例运行手册" onClick={retry}>重试</Button>
+        </div>
       </section>
     );
   if (!registration) return null;
-  return <section className="border-t border-border px-4 py-3" aria-label="本实例运行手册管理">
-    <Button variant="link" size="sm" className="px-0" aria-expanded={open} aria-controls={sectionId} onClick={() => setOpen(v => !v)}>本实例运行手册</Button>
-    <p className="text-caption text-muted">市场底线只读；本地手册是此智能体的补充规则，不是另一个可执行智能体。</p>
-    {registration.readiness === "unavailable" && <Alert tone="warning" className="mt-2">智能体当前不可执行；仍可编辑本实例手册，保存不会恢复执行权限。</Alert>}
-    {open && <div id={sectionId}><ManualEditor auth={auth} registration={registration} /></div>}
-  </section>;
+  return (
+    <section className="border-t border-border/80 px-4 py-4" aria-label="本实例运行手册管理">
+      <div className="oc-surface-card overflow-hidden rounded-xl p-4">
+        <div className="flex items-start gap-3">
+          <span className="oc-icon-badge size-8 shrink-0 rounded-lg" aria-hidden="true">
+            <BookOpen size={15} strokeWidth={1.75} />
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                variant="link"
+                size="sm"
+                className="oc-btn-tactile h-auto gap-1 px-0 text-section font-semibold text-fg hover:text-accent"
+                aria-expanded={open}
+                aria-controls={sectionId}
+                onClick={() => setOpen(v => !v)}
+              >
+                <span>本实例运行手册</span>
+                <ChevronRight
+                  size={14}
+                  strokeWidth={1.75}
+                  aria-hidden="true"
+                  className={cn("text-faint transition-transform duration-150", open && "rotate-90 text-accent")}
+                />
+              </Button>
+              <Badge tone="neutral" size="sm" className="oc-badge-craft">补充规则</Badge>
+            </div>
+            <p className="mt-1 text-caption leading-relaxed text-muted">
+              市场底线只读；本地手册是此智能体的补充规则，不是另一个可执行智能体。
+            </p>
+          </div>
+        </div>
+        {registration.readiness === "unavailable" && (
+          <Alert tone="warning" className="oc-callout oc-callout-warning mt-3 rounded-xl">
+            智能体当前不可执行；仍可编辑本实例手册，保存不会恢复执行权限。
+          </Alert>
+        )}
+        {open && <div id={sectionId} className="mt-4 border-t border-border/70 pt-4"><ManualEditor auth={auth} registration={registration} /></div>}
+      </div>
+    </section>
+  );
 }
 
 function ManualEditor({ auth, registration }: { auth: AuthSession; registration: Registration }) {
@@ -104,20 +143,95 @@ function ManualEditor({ auth, registration }: { auth: AuthSession; registration:
       setError(apiErrorMessage(e, "保存未能确认，请重新读取本地手册后再试"));
     } finally { if (mounted.current) setSaving(false); }
   }
-  return <div className="mt-3 flex flex-col gap-3">
-    <div><h3 className="text-body font-medium">市场底线（只读）</h3>
-      {market && <><p className="break-all text-caption text-muted">来源：{market.path}</p><pre aria-label="市场底线（只读）" tabIndex={0} className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-hover p-3 text-body">{market.text}</pre></>}
-      {marketError && <p className="text-caption text-muted">{marketError}</p>}
+  return <div className="flex flex-col gap-4">
+    <div className="oc-code-shell rounded-xl">
+      <div className="oc-code-shell-header flex flex-wrap items-center justify-between gap-2 px-3.5 py-2">
+        <div className="flex items-center gap-2">
+          <span className="oc-icon-badge oc-icon-badge-info size-5 rounded-md" aria-hidden="true">
+            <ShieldCheck size={12} strokeWidth={1.9} />
+          </span>
+          <h3 className="text-body font-semibold text-fg">市场底线（只读）</h3>
+        </div>
+        {market && <p className="min-w-0 break-all font-mono text-caption text-faint">来源：{market.path}</p>}
+      </div>
+      {market ? (
+        <pre
+          aria-label="市场底线（只读）"
+          tabIndex={0}
+          className="max-h-52 overflow-auto whitespace-pre-wrap break-words px-3.5 py-3 font-mono text-body leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        >
+          {market.text}
+        </pre>
+      ) : marketError ? (
+        <p className="px-3.5 py-2.5 text-caption text-muted">{marketError}</p>
+      ) : (
+        <p className="px-3.5 py-2.5 text-caption text-faint">读取市场底线中…</p>
+      )}
     </div>
-    <div><h3 className="text-body font-medium">本地运行手册（可编辑）</h3>
-      <p className="break-all text-caption text-muted">登记来源：{profile.localPersonaPath}</p>
-      <p className="text-caption text-muted">仅保存本地手册；不修改市场人格、模型或权限。规则冲突时遵守市场底线及平台审批要求。</p>
+
+    <div className="oc-surface-recessed flex flex-col gap-3 rounded-xl p-3.5">
+      <div className="flex items-start gap-2.5">
+        <span className="oc-icon-badge oc-icon-badge-accent mt-0.5 size-6 shrink-0 rounded-md" aria-hidden="true">
+          <FileText size={13} strokeWidth={1.85} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <h3 className="text-body font-semibold text-fg">本地运行手册（可编辑）</h3>
+          <p className="mt-0.5 break-all font-mono text-caption text-faint">登记来源：{profile.localPersonaPath}</p>
+          <p className="mt-1 text-caption leading-relaxed text-muted">
+            仅保存本地手册；不修改市场人格、模型或权限。规则冲突时遵守市场底线及平台审批要求。
+          </p>
+        </div>
+      </div>
+
+      {loading ? (
+        <p role="status" className="text-caption text-muted">正在读取手册…</p>
+      ) : local && (
+        <>
+          <p className="break-all font-mono text-caption text-faint">实际文件：{local.path}</p>
+          <Textarea
+            aria-label="本地运行手册正文"
+            rows={10}
+            value={draft}
+            disabled={saving}
+            onChange={e => setDraft(e.target.value)}
+            className="oc-field-control rounded-xl font-mono text-base leading-relaxed md:text-sm"
+          />
+          <div className="flex flex-wrap items-center gap-2.5">
+            <Button
+              size="sm"
+              variant="primary"
+              className="oc-btn-tactile oc-btn-primary-craft"
+              loading={saving}
+              disabled={draft === local.text}
+              onClick={() => void save()}
+            >
+              保存本地手册
+            </Button>
+            {draft !== local.text && (
+              <span className="text-caption text-warning">有未保存的更改</span>
+            )}
+          </div>
+        </>
+      )}
+      {error && (
+        <Alert
+          tone="danger"
+          className="oc-callout oc-callout-danger rounded-xl"
+          action={
+            <Button
+              size="sm"
+              variant="secondary"
+              className="oc-btn-tactile oc-btn-secondary-craft"
+              disabled={saving}
+              onClick={() => setRetry(n => n + 1)}
+            >
+              重新读取
+            </Button>
+          }
+        >
+          {error}
+        </Alert>
+      )}
     </div>
-    {loading ? <p role="status" className="text-caption text-muted">正在读取手册…</p> : local && <>
-      <p className="break-all text-caption text-muted">实际文件：{local.path}</p>
-      <Textarea aria-label="本地运行手册正文" rows={10} value={draft} disabled={saving} onChange={e => setDraft(e.target.value)} />
-      <div><Button size="sm" variant="primary" loading={saving} disabled={draft === local.text} onClick={() => void save()}>保存本地手册</Button></div>
-    </>}
-    {error && <Alert tone="danger" action={<Button size="sm" disabled={saving} onClick={() => setRetry(n => n + 1)}>重新读取</Button>}>{error}</Alert>}
   </div>;
 }

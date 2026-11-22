@@ -259,6 +259,9 @@ export const InboundMessage = Type.Object({
   // 团队模式(v5 轻量组队):main 队长收到此 flag 的 turn 会被鼓励按任务复杂度自主
   // delegate_task 给已安装 agent 组队,简单任务自己答。turn 级、可中途切,只对 main 生效。
   teamMode: Type.Optional(Type.Boolean()),
+  /** Antigravity native swarm mode (OCV5-809). Turn-level opt-in for Antigravity
+   * models; non-Antigravity engines ignore it. */
+  swarmMode: Type.Optional(Type.Boolean()),
   // Platform collaboration mode. Wire name MUST stay `collabMode` (not
   // collaborationMode) so tape sanitizer private-field stripping cannot eat it.
   collabMode: Type.Optional(
@@ -454,6 +457,7 @@ export const PromptQueueItem = Type.Object({
     effortLevel: Type.Optional(Type.Union([Type.String(), Type.Null()])),
     serviceTier: Type.Optional(Type.Union([Type.Null(), ...SERVICE_TIERS.map((tier) => Type.Literal(tier))])),
     teamMode: Type.Optional(Type.Boolean()),
+    swarmMode: Type.Optional(Type.Boolean()),
     collabMode: Type.Optional(
       Type.Union([Type.Literal('solo'), Type.Literal('advisor'), Type.Literal('team')]),
     ),
@@ -548,6 +552,7 @@ export const InboundPromptQueueEnqueue = Type.Object({
     effortLevel: Type.Optional(Type.Union([Type.String(), Type.Null()])),
     serviceTier: Type.Optional(Type.Union([Type.Null(), ...SERVICE_TIERS.map((tier) => Type.Literal(tier))])),
     teamMode: Type.Optional(Type.Boolean()),
+    swarmMode: Type.Optional(Type.Boolean()),
     collabMode: Type.Optional(
       Type.Union([Type.Literal('solo'), Type.Literal('advisor'), Type.Literal('team')]),
     ),
@@ -858,6 +863,87 @@ export const OutboundContentBlock = Type.Union([
     totalBytes: Type.Number(),
     /** True when output exceeded the tail window and the head is missing. */
     truncatedHead: Type.Boolean(),
+    parentToolUseId: Type.Optional(Type.String()),
+  }),
+  /** Live Antigravity native swarm state snapshot (OCV5-809). Snapshot semantics:
+   * consumers replace prior snapshot for the same `swarmId` only when `revision`
+   * strictly advances (monotonic guard against out-of-order replay frames). */
+  Type.Object({
+    kind: Type.Literal('swarm_snapshot'),
+    blockId: Type.String(),
+    snapshot: Type.Object({
+      swarmId: Type.String(),
+      title: Type.String(),
+      phase: Type.Union([
+        Type.Literal('starting'),
+        Type.Literal('running'),
+        Type.Literal('completed'),
+        Type.Literal('interrupted'),
+        Type.Literal('error'),
+      ]),
+      revision: Type.Integer({ minimum: 1 }),
+      updatedAt: Type.Number(),
+      startedAt: Type.Optional(Type.Number()),
+      members: Type.Array(
+        Type.Object({
+          name: Type.String(),
+          role: Type.Union([
+            Type.Literal('coordinator'),
+            Type.Literal('worker'),
+            Type.Literal('verifier'),
+            Type.Literal('monitor'),
+            Type.Literal('narrator'),
+          ]),
+          status: Type.Union([
+            Type.Literal('working'),
+            Type.Literal('waiting'),
+            Type.Literal('stopped'),
+            Type.Literal('killed'),
+          ]),
+          model: Type.Optional(Type.String()),
+          channels: Type.Optional(Type.Array(Type.String())),
+          workspace: Type.Optional(Type.String()),
+          wakeMode: Type.Optional(Type.String()),
+          stepCount: Type.Integer({ minimum: 0 }),
+          activity: Type.Optional(Type.String()),
+          failed: Type.Optional(Type.Boolean()),
+          lastError: Type.Optional(Type.String()),
+          unreadCount: Type.Integer({ minimum: 0 }),
+          lastPostSeq: Type.Optional(Type.Integer({ minimum: 0 })),
+          lastActiveAt: Type.Optional(Type.Number()),
+          elapsedMs: Type.Optional(Type.Number({ minimum: 0 })),
+          inputTokens: Type.Optional(Type.Integer({ minimum: 0 })),
+          outputTokens: Type.Optional(Type.Integer({ minimum: 0 })),
+          toolCalls: Type.Optional(Type.Integer({ minimum: 0 })),
+          telemetryPartial: Type.Optional(Type.Boolean()),
+        }),
+      ),
+      channels: Type.Array(
+        Type.Object({
+          name: Type.String(),
+          topic: Type.Optional(Type.String()),
+          archived: Type.Optional(Type.Boolean()),
+          memberCount: Type.Integer({ minimum: 0 }),
+          postCount: Type.Integer({ minimum: 0 }),
+        }),
+      ),
+      posts: Type.Array(
+        Type.Object({
+          seq: Type.Integer({ minimum: 1 }),
+          agent: Type.String(),
+          text: Type.String(),
+          time: Type.Optional(Type.String()),
+          channel: Type.Optional(Type.String()),
+          mentions: Type.Array(Type.String()),
+        }),
+      ),
+      totalPosts: Type.Integer({ minimum: 0 }),
+      truncatedPosts: Type.Optional(Type.Integer({ minimum: 0 })),
+      postsMode: Type.Optional(
+        Type.Union([Type.Literal('full'), Type.Literal('delta')]),
+      ),
+      deltaBaseSeq: Type.Optional(Type.Integer({ minimum: 0 })),
+    }),
     parentToolUseId: Type.Optional(Type.String()),
   }),
 ])
@@ -1575,8 +1661,30 @@ export const ControlListSessions = Type.Object({
 export const ControlHealth = Type.Object({ type: Type.Literal('control.health') })
 export const ControlCompact = Type.Object({
   type: Type.Literal('control.session.compact'),
-  sessionKey: Type.String(),
+  sessionKey: Type.Optional(Type.String()),
+  sessionId: Type.Optional(Type.String()),
+  instructions: Type.Optional(Type.String()),
+  requestId: Type.Optional(Type.String()),
 })
+export type ControlCompact = Static<typeof ControlCompact>
+export const OutboundSessionCompactResult = Type.Object({
+  type: Type.Literal('outbound.session_compact_result'),
+  sessionKey: Type.String(),
+  channel: Type.Optional(Type.String()),
+  peer: Type.Optional(Peer),
+  requestId: Type.Optional(Type.String()),
+  ok: Type.Boolean(),
+  supported: Type.Boolean(),
+  strategy: Type.Optional(Type.String()),
+  beforeTokens: Type.Optional(Type.Integer({ minimum: 0 })),
+  afterTokens: Type.Optional(Type.Integer({ minimum: 0 })),
+  beforeBytes: Type.Optional(Type.Integer({ minimum: 0 })),
+  afterBytes: Type.Optional(Type.Integer({ minimum: 0 })),
+  summaryPreview: Type.Optional(Type.String()),
+  error: Type.Optional(Type.String()),
+  ts: Type.Optional(Type.Number()),
+})
+export type OutboundSessionCompactResult = Static<typeof OutboundSessionCompactResult>
 export const ControlCancelModelSwitch = Type.Object({
   type: Type.Literal('control.session.cancel_model_switch'),
   sessionKey: Type.String(),
@@ -1638,6 +1746,7 @@ export const AnyFrame = Type.Union([
   OutboundPermissionSettled,
   OutboundControlReceipt,
   OutboundModelSwitchPrepared,
+  OutboundSessionCompactResult,
   OutboundResumeFailed,
   OutboundActiveTurnReplayStart,
   OutboundError,

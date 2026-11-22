@@ -123,7 +123,8 @@ elif action=='failure':
     print(decision)
 elif action=='abort-preparation':p.resolve(path,operation,'preparation-abort')
 elif action=='verify-stack':
-    env,root,live,port,direction,master_unit,egress_unit=a;c,_=exact_operation_context()
+    env,root,live,port,direction,master_unit,egress_unit=a[:7];frontdoor_unit=a[7] if len(a)>7 else ''
+    c,_=exact_operation_context()
     p.require(direction in ('target','before'),'invalid selected stack')
     actual=stack(live,env,root,port)
     p.require(actual==c[direction],'live source/current/tuple differs from selected stack')
@@ -136,8 +137,10 @@ elif action=='verify-stack':
         p.require(v[0]!='Z','service process is zombie')
         return (pid,v[19],str((q/'cwd').resolve(strict=True)))
     m=process(master_unit);e=process(egress_unit)
+    f=process(frontdoor_unit) if frontdoor_unit else None
     p.require(m[2]==actual['masterRelease'] and e[2]==actual['masterRelease'],'process source differs from selected stack')
     p.require(process(master_unit)==m and process(egress_unit)==e,'process generation changed')
+    if frontdoor_unit:p.require(process(frontdoor_unit)==f,'frontdoor generation changed')
     p.require(stack(live,env,root,port)==actual,'serving pointers changed')
     print(p.stack_digest(actual))
 elif action=='resume-info':
@@ -230,9 +233,13 @@ release_policy_failure() { # <stage> [saga-commit-state]
   release_policy_context_present || return 0
   local stage="$1" authority=unobserved live state health=unknown pid cwd="" loopback=unknown decision
   case "${2:-none}" in applied) authority=applied ;; old) authority=original ;; uncertain) authority=unknown ;; esac
+  local master_unit="$V5_UNIT"
+  if declare -F selfhost_master_dual_slot_active >/dev/null 2>&1 && selfhost_master_dual_slot_active; then
+    master_unit="$(selfhost_master_active_unit)"
+  fi
   live="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
-  state="$(systemctl is-active "$V5_UNIT" 2>/dev/null || true)"
-  pid="$(systemctl show "$V5_UNIT" -p MainPID --value 2>/dev/null || true)"
+  state="$(systemctl is-active "$master_unit" 2>/dev/null || true)"
+  pid="$(systemctl show "$master_unit" -p MainPID --value 2>/dev/null || true)"
   [[ "$pid" =~ ^[1-9][0-9]*$ ]] && cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)"
   if [[ "$state" == active ]] && cutover_smoke_healthz_only; then health=usable; fi
   loopback="$(python3 - "$V5_PORT" <<'POLICY_CONNECT'
@@ -410,7 +417,11 @@ release_policy_drain_reader() { # <fixed service> <seconds> <optional>
 
 release_policy_assert_no_service_jobs() {
   local unit stamp
-  for unit in "$V5_UNIT" "$V5_EGRESS_UNIT" "$(egress_slot_unit A service)" "$(egress_slot_unit B service)"; do
+  local -a units=("$V5_UNIT" "$V5_EGRESS_UNIT" "$(egress_slot_unit A service)" "$(egress_slot_unit B service)")
+  if declare -F selfhost_master_dual_slot_active >/dev/null 2>&1 && selfhost_master_dual_slot_active; then
+    units+=("$V5_FRONTDOOR_UNIT" "$(selfhost_master_slot_unit A)" "$(selfhost_master_slot_unit B)")
+  fi
+  for unit in "${units[@]}"; do
     stamp="$(release_policy_unit_stamp "$unit" 1)" || return 79
     [[ "$(jq -r .job <<<"$stamp")" == 0 ]] || return 79
   done
@@ -567,7 +578,8 @@ release_policy_probe_stack() { # owner-bound observed exact digest
   release_policy_observe_stack "$1"
 }
 release_policy_observe_stack() { # read-only, also used before claiming a replay
-  local direction="$1" a=0 b=0 unit live
+  local direction="$1" a=0 b=0 unit live master_unit="$V5_UNIT" frontdoor_unit=""
+  local dual=0 fd_slot="" pg_row="" pg_slot="" pg_gen="" fd_slot_after="" pg_row_after="" pg_slot_after="" pg_gen_after="" digest
   if egress_live_release_has_slots; then
     egress_slot_is_active A && a=1
     egress_slot_is_active B && b=1
@@ -576,8 +588,28 @@ release_policy_observe_stack() { # read-only, also used before claiming a replay
   else
     unit="$V5_EGRESS_UNIT"
   fi
+  # B12: In dual-slot mode, verify exact same-slot agreement across frontdoor /status,
+  # PG deploy_state.active_slot, and active @<slot>.service (MainPID/cwd), plus frontdoor active.
+  if declare -F selfhost_master_dual_slot_active >/dev/null 2>&1 && selfhost_master_dual_slot_active; then
+    dual=1
+    frontdoor_unit="${V5_FRONTDOOR_UNIT:-openclaude-v5-selfhost-frontdoor.service}"
+    fd_slot="$(selfhost_frontdoor_read_slot)" || return 79
+    pg_row="$(selfhost_deploy_state_read)" || return 79
+    IFS='|' read -r pg_slot _ _ _ _ _ pg_gen <<<"$pg_row"
+    [[ -n "$fd_slot" && "$fd_slot" == "$pg_slot" ]] || return 79
+    master_unit="$(selfhost_master_slot_unit "$fd_slot")" || return 79
+  fi
   live="$(readlink -f -- "$MASTER_LIVE_LINK")" || return 79
-  release_policy_py verify-stack "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$live" "$V5_PORT" "$direction" "$V5_UNIT" "$unit" || return 79
+  if (( dual == 1 )); then
+    digest="$(release_policy_py verify-stack "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$live" "$V5_PORT" "$direction" "$master_unit" "$unit" "$frontdoor_unit")" || return 79
+    fd_slot_after="$(selfhost_frontdoor_read_slot)" || return 79
+    pg_row_after="$(selfhost_deploy_state_read)" || return 79
+    IFS='|' read -r pg_slot_after _ _ _ _ _ pg_gen_after <<<"$pg_row_after"
+    [[ "$fd_slot_after" == "$fd_slot" && "$pg_slot_after" == "$pg_slot" && "$pg_gen_after" == "$pg_gen" ]] || return 79
+    printf '%s\n' "$digest"
+  else
+    release_policy_py verify-stack "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$live" "$V5_PORT" "$direction" "$master_unit" "$unit" || return 79
+  fi
 }
 
 # Metadata-only lineage inspection: exact entire predecessor bytes or that

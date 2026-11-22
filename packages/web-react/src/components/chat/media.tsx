@@ -7,10 +7,11 @@
  * <Media> 主动 effect 签名，替代"占位永停"。
  */
 import { createContext, lazy, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
-import { AlertCircle, Download, FileText, Pencil, RotateCcw, X } from "lucide-react";
+import { AlertCircle, Download, FileText, PanelRightOpen, Pencil, RotateCcw, X } from "lucide-react";
 import type { MediaRef } from "../../lib/chat/frames";
 import { classifyMediaRef, needsSignedSrc, type ResolvedMedia } from "../../lib/chat/media";
 import { PRODUCT_CAPABILITIES } from "../../lib/productCapabilities";
+import { dispatchOpenInWorkbench } from "../../lib/workbenchOpen";
 import { useImageEditActions } from "./imageEditActions";
 import {
   DOWNLOAD_STREAM_MAX_BYTES,
@@ -758,7 +759,7 @@ export function SignedFileCard({ src, filename, label }: { src?: string; filenam
             <span
               className={cn(
                 "block h-full rounded-full bg-accent transition-[width] duration-150",
-                pct == null && "w-1/3 animate-pulse",
+                pct == null && "oc-indeterminate-bar w-1/3",
               )}
               style={pct != null ? { width: `${pct}%` } : undefined}
             />
@@ -811,25 +812,62 @@ export function SignedFileCard({ src, filename, label }: { src?: string; filenam
   }
 
   // idle：href 不暴露挂载态 signed URL（右键/长按另存会拿到 5min 后的 410 JSON）。
-  // 左键/右键/辅助键一律走 start()（点击时重签）。
+  // 左键/右键/辅助键一律走 start()（点击时重签）；容器路径同步提供「工作台预览」直达右侧 Workbench。
   const beginDownload = (e: React.MouseEvent) => {
     e.preventDefault();
     void start();
   };
+  const canOpenInWorkbench = typeof src === "string" && src.startsWith("/");
+  if (!canOpenInWorkbench) {
+    return (
+      <a
+        data-product-feature={PRODUCT_CAPABILITIES.artifacts.id}
+        href="#"
+        rel="noreferrer"
+        onClick={beginDownload}
+        onContextMenu={beginDownload}
+        onAuxClick={beginDownload}
+        className="my-1.5 inline-flex max-w-full items-center gap-2.5 rounded-lg border border-border bg-surface px-3 py-2 no-underline transition-colors hover:border-border-strong hover:bg-hover"
+      >
+        {fileIcon}
+        {nameLabel}
+        <Download size={15} className="shrink-0 text-muted" />
+      </a>
+    );
+  }
   return (
-    <a
-      data-product-feature={PRODUCT_CAPABILITIES.artifacts.id}
-      href="#"
-      rel="noreferrer"
-      onClick={beginDownload}
-      onContextMenu={beginDownload}
-      onAuxClick={beginDownload}
-      className="my-1.5 inline-flex max-w-full items-center gap-2.5 rounded-lg border border-border bg-surface px-3 py-2 no-underline transition-colors hover:border-border-strong hover:bg-hover"
-    >
-      {fileIcon}
-      {nameLabel}
-      <Download size={15} className="shrink-0 text-muted" />
-    </a>
+    <span className="my-1.5 inline-flex max-w-full items-center gap-1 rounded-lg border border-border bg-surface pr-1.5 transition-colors hover:border-border-strong">
+      <a
+        data-product-feature={PRODUCT_CAPABILITIES.artifacts.id}
+        href="#"
+        rel="noreferrer"
+        onClick={beginDownload}
+        onContextMenu={beginDownload}
+        onAuxClick={beginDownload}
+        className="inline-flex min-w-0 flex-1 items-center gap-2.5 rounded-l-lg px-3 py-2 no-underline transition-colors hover:bg-hover [@media(hover:none)]:min-h-11"
+      >
+        {fileIcon}
+        {nameLabel}
+        <Download size={15} className="shrink-0 text-muted" />
+      </a>
+      <button
+        type="button"
+        data-testid="signed-file-workbench-preview"
+        aria-label={`在右侧工作台预览 ${name}`}
+        title="在右侧工作台预览"
+        onClick={() =>
+          dispatchOpenInWorkbench({
+            path: src,
+            title: name,
+            tab: "outputs",
+          })
+        }
+        className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md bg-accent-soft px-2 text-caption font-medium text-accent outline-none transition-colors hover:bg-accent/20 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+      >
+        <PanelRightOpen size={13} aria-hidden />
+        工作台预览
+      </button>
+    </span>
   );
 }
 

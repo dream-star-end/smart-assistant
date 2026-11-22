@@ -2,7 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { InflightDelegateItem } from "../../lib/chat/inflightDelegates";
-import { PinnedDelegateTracker } from "./PinnedDelegateTracker";
+import { AUTO_DISMISS_SUCCEEDED_MS, delegateStateLabel, PinnedDelegateTracker } from "./PinnedDelegateTracker";
 
 afterEach(() => {
   cleanup();
@@ -37,7 +37,7 @@ describe("PinnedDelegateTracker", () => {
     expect(screen.getByText("Read PinnedDelegateTracker.tsx")).toBeInTheDocument();
   });
 
-  test("H-01 失败 / 取消 / 被终止的终态同样显示原因(resultSummary),且为 danger 色", () => {
+  test("H-01 失败 / 取消 / 被中断终态显示人话原因(resultSummary)且翻译 cutover 内部术语", () => {
     render(
       <PinnedDelegateTracker
         items={[
@@ -53,10 +53,13 @@ describe("PinnedDelegateTracker", () => {
     expect(reason.className).toContain("text-danger");
     expect(screen.queryByText("第二行")).toBeNull();
     expect(screen.getByText("用户取消")).toBeInTheDocument();
-    expect(screen.getByText("切换时被终止")).toBeInTheDocument();
+    expect(screen.queryByText("切换时被终止")).toBeNull();
+    expect(screen.getByText("服务更新时任务已中断，如需可重新发起")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "服务更新时已中断" })).toBeInTheDocument();
+    expect(delegateStateLabel("unknown_internal_state")).toBe("处理中");
   });
 
-  test("H-07 排队中不转圈、有状态可读名;暂停用 warning 标", () => {
+  test("H-07 排队中不转圈、有状态可读名;cutover 暂停翻译为人话且用 warning 标", () => {
     render(
       <PinnedDelegateTracker
         items={[
@@ -68,7 +71,7 @@ describe("PinnedDelegateTracker", () => {
     );
     const queued = screen.getByRole("img", { name: "排队中" });
     expect(queued.getAttribute("class") ?? "").not.toContain("animate-spin");
-    const paused = screen.getByRole("img", { name: "已暂停（等待切换）" });
+    const paused = screen.getByRole("img", { name: "已暂停，稍后自动恢复" });
     expect(paused.getAttribute("class") ?? "").toContain("text-warning");
     // 没有 running 项 → 头部不给「停止本轮」
     expect(screen.queryByRole("button", { name: "停止本轮" })).toBeNull();
@@ -93,12 +96,12 @@ describe("PinnedDelegateTracker", () => {
     expect(screen.queryByText("原因")).toBeNull();
   });
 
-  test("H-13 全部结束且 ≥2 条 → 「全部知道了」逐条调用 onDismiss;有运行项时不出现", () => {
+  test("H-13 全部结束且 ≥2 条失败/取消项 → 「全部知道了」逐条调用 onDismiss;有运行项时不出现", () => {
     const onDismiss = vi.fn();
     const view = render(
       <PinnedDelegateTracker
         items={[
-          item({ jobId: "a", runId: "ra", state: "completed" }),
+          item({ jobId: "a", runId: "ra", state: "cancelled" }),
           item({ jobId: "b", runId: "rb", state: "failed" }),
         ]}
         onDismiss={onDismiss}
@@ -109,7 +112,7 @@ describe("PinnedDelegateTracker", () => {
     expect(onDismiss.mock.calls.map((c) => c[0]).sort()).toEqual(["a", "b"]);
     view.rerender(
       <PinnedDelegateTracker
-        items={[item({ jobId: "a", runId: "ra", state: "completed" }), item({ jobId: "r", runId: "rr" })]}
+        items={[item({ jobId: "a", runId: "ra", state: "failed" }), item({ jobId: "r", runId: "rr" })]}
         onDismiss={onDismiss}
       />,
     );
@@ -146,18 +149,37 @@ describe("PinnedDelegateTracker", () => {
     vi.useRealTimers();
   });
 
-  test("终态项 dismiss 调用 onDismiss", () => {
+  test("失败终态项保留「知道了」并调用 onDismiss", () => {
     const onDismiss = vi.fn();
     render(
+      <PinnedDelegateTracker
+        items={[item({ state: "failed", resultSummary: "失败摘要第一行\n其余" })]}
+        onDismiss={onDismiss}
+      />,
+    );
+    expect(screen.getByText("失败摘要第一行")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "知道了" }));
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+    expect(onDismiss).toHaveBeenCalledWith("dlgjob-1");
+  });
+
+  test("成功终态不强迫点「知道了」，几秒后静默自动隐藏并回调 onDismiss", () => {
+    vi.useFakeTimers();
+    const onDismiss = vi.fn();
+    const { container } = render(
       <PinnedDelegateTracker
         items={[item({ state: "completed", resultSummary: "已完成摘要第一行\n其余" })]}
         onDismiss={onDismiss}
       />,
     );
     expect(screen.getByText("已完成摘要第一行")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "知道了" }));
+    expect(screen.queryByRole("button", { name: "知道了" })).toBeNull();
+    act(() => {
+      vi.advanceTimersByTime(AUTO_DISMISS_SUCCEEDED_MS);
+    });
     expect(onDismiss).toHaveBeenCalledTimes(1);
     expect(onDismiss).toHaveBeenCalledWith("dlgjob-1");
+    expect(container.firstChild).toBeNull();
   });
 
   test("父 turn 结束时仍渲染（无 wsSending/active 隐藏条件）", () => {
@@ -206,5 +228,45 @@ describe("PinnedDelegateTracker", () => {
     });
     expect(screen.queryByText("已完成摘要第一行")).toBeNull();
     vi.useRealTimers();
+  });
+
+  test("非终态项传入 onCancel 时渲染单条取消按钮，提交中禁用防双击", async () => {
+    let resolveCancel!: (v: boolean) => void;
+    const onCancel = vi.fn(
+      () =>
+        new Promise<boolean>((r) => {
+          resolveCancel = r;
+        }),
+    );
+    render(
+      <PinnedDelegateTracker
+        items={[
+          item({ jobId: "run-1", state: "running", goal: "拉取日志" }),
+          item({ jobId: "done-1", state: "completed", goal: "已完结任务", resultSummary: "ok" }),
+        ]}
+        onDismiss={() => {}}
+        onCancel={onCancel}
+      />,
+    );
+
+    const cancelBtn = screen.getByRole("button", { name: "取消任务：拉取日志" });
+    expect(cancelBtn).toHaveTextContent("取消");
+    expect(screen.queryByRole("button", { name: "取消任务：已完结任务" })).toBeNull();
+
+    fireEvent.click(cancelBtn);
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    expect(onCancel).toHaveBeenCalledWith("run-1");
+    expect(cancelBtn).toBeDisabled();
+    expect(cancelBtn).toHaveTextContent("取消中…");
+
+    // 禁用态再次点击不重复提交
+    fireEvent.click(cancelBtn);
+    expect(onCancel).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveCancel(true);
+    });
+    expect(cancelBtn).not.toBeDisabled();
+    expect(cancelBtn).toHaveTextContent("取消");
   });
 });

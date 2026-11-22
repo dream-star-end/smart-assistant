@@ -181,6 +181,8 @@ describe("BLOCKED_FOR_USER_RULES — user role → 403", () => {
     { path: "/api/agents/main", method: "DELETE" },
     { path: "/api/agents/main/persona", method: "GET" },
     { path: "/api/agents/main/persona", method: "PUT" },
+    { path: "/api/agents/main/browser/live", method: "GET" },
+    { path: "/api/agents/main/browser/action", method: "POST" },
     { path: "/api/agents/main/message", method: "POST" },
     { path: "/api/agents/main/delegate", method: "POST" },
     // 内存 / 技能

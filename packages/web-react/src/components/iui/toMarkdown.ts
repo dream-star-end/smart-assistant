@@ -372,6 +372,7 @@ export function specToMarkdown(spec: IuiSpec, values?: Record<string, number>): 
     case "prompt_template":
     case "storyboard":
     case "flashcards":
+    case "browser_handoff":
       return v2ToMarkdown(spec);
   }
 }

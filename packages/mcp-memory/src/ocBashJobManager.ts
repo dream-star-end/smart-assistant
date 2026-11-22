@@ -7,6 +7,9 @@
  * immediately reap the entire detached process group and destroy stdio streams.
  */
 import { spawn, type ChildProcess } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
+import { mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 export const OC_BASH_MAX_OUTPUT_BYTES = 200 * 1024
 export const OC_BASH_HEAD_BYTES = 64 * 1024
@@ -15,8 +18,143 @@ export const OC_BASH_MAX_ACTIVE_JOBS = 4
 export const OC_BASH_IDLE_JOB_TTL_MS = 5 * 60_000
 export const OC_BASH_MAX_JOB_LIFETIME_MS = 2 * 60 * 60_000
 export const OC_BASH_TOMBSTONE_MAX = 64
+export const OC_BASH_SNAPSHOT_PREVIEW_MAX_CHARS = 240
 export const KILL_GRACE_MS = 400
 export const CLOSE_DRAIN_SAFETY_MS = 2_000
+
+export interface OcBashJobSnapshot {
+  id: string
+  jobId: string
+  pid: number
+  pgid: number
+  ownerPid: number
+  startTimeTicks: number | null
+  sessionKey: string
+  sessionId: string
+  commandPreview: string
+  cwd: string
+  startedAt: number
+  updatedAt: number
+  maxLifetimeAt: number
+}
+
+export function resolveOcBashRegistryDir(env: NodeJS.ProcessEnv = process.env): string {
+  const explicit = env.OC_BASH_REGISTRY_DIR?.trim()
+  if (explicit) return explicit
+  const base =
+    env.OPENCLAUDE_STATE_DIR?.trim() ||
+    env.OPENCLAUDE_RUNTIME_DIR?.trim() ||
+    '/home/agent/.openclaude'
+  return join(base, 'run', 'oc-bash-jobs')
+}
+
+export function resolveOcBashSessionIdentity(
+  env: NodeJS.ProcessEnv = process.env,
+  overrideSessionKey?: string,
+): { sessionKey: string; sessionId: string } {
+  const sessionKey = (
+    overrideSessionKey ??
+    env.OC_SESSION_KEY ??
+    env.OPENCLAUDE_SESSION_KEY ??
+    ''
+  ).trim()
+  if (!sessionKey) return { sessionKey: '', sessionId: '' }
+  const lastColon = sessionKey.lastIndexOf(':')
+  const sessionId = lastColon >= 0 ? sessionKey.slice(lastColon + 1) : sessionKey
+  return { sessionKey, sessionId }
+}
+
+/**
+ * Parse field 22 (`starttime`, clock ticks since boot) from Linux `/proc/${pid}/stat`.
+ * Handles process `comm` names containing spaces or parentheses by splitting after the last `)`.
+ */
+export function readProcStartTimeTicks(pid: number): number | null {
+  if (!Number.isInteger(pid) || pid <= 1) return null
+  if (process.platform !== 'linux') return null
+  try {
+    const raw = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    return parseProcStatStartTimeTicks(raw)
+  } catch {
+    return null
+  }
+}
+
+export function parseProcStatStartTimeTicks(statLine: string): number | null {
+  const rparen = statLine.lastIndexOf(')')
+  if (rparen < 0) return null
+  const rest = statLine.slice(rparen + 1).trim()
+  if (!rest) return null
+  const fields = rest.split(/\s+/)
+  // Field 1=pid, 2=(comm); after last ')', index 0 is field 3 (state), so field 22 is index 19.
+  const rawTicks = fields[19]
+  if (!rawTicks || !/^\d+$/.test(rawTicks)) return null
+  const ticks = Number(rawTicks)
+  return Number.isSafeInteger(ticks) && ticks >= 0 ? ticks : null
+}
+
+/**
+ * Returns true if any live non-zombie process still belongs to verified process group `pgid`
+ * with `starttime >= minStartTicks` (prevents deleting the control snapshot when the shell
+ * leader exits while detached sub-children in the same process group are still running).
+ */
+export function hasAliveVerifiedGroupMembers(pgid: number, minStartTicks: number | null): boolean {
+  if (process.platform !== 'linux' || !Number.isInteger(pgid) || pgid <= 1 || minStartTicks === null) {
+    return false
+  }
+  let entries: string[]
+  try {
+    entries = readdirSync('/proc')
+  } catch {
+    return false
+  }
+  for (const name of entries) {
+    if (!/^\d+$/.test(name)) continue
+    try {
+      const raw = readFileSync(`/proc/${name}/stat`, 'utf8')
+      const rparen = raw.lastIndexOf(')')
+      if (rparen < 0) continue
+      const fields = raw.slice(rparen + 1).trim().split(/\s+/)
+      const state = fields[0] ?? ''
+      if (state === 'Z' || state === 'X' || state === 'x') continue
+      const pgrp = Number(fields[2])
+      if (pgrp !== pgid) continue
+      const ticks = Number(fields[19])
+      if (Number.isSafeInteger(ticks) && ticks >= minStartTicks) {
+        return true
+      }
+    } catch {
+      /* exited during scan */
+    }
+  }
+  return false
+}
+
+/**
+ * Single-line redacted command preview bounded to <= 240 chars for disk job snapshots.
+ */
+export function sanitizeOcBashCommandPreview(
+  command: string,
+  maxChars = OC_BASH_SNAPSHOT_PREVIEW_MAX_CHARS,
+): string {
+  let text = command.replace(/\s+/g, ' ').trim()
+  // Redact URL credentials (scheme://user:pass@host)
+  text = text.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/\s:@]+:)([^@\s]+)(@)/g, '$1[REDACTED]$3')
+  // Redact Bearer / Basic authorization tokens
+  text = text.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 [REDACTED]')
+  // Redact common secret key assignments (ENV=val or --flag=val / --flag val)
+  text = text.replace(
+    /\b([A-Za-z0-9_-]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|ACCESS_KEY|AUTH)[A-Za-z0-9_-]*)(\s*[:=]\s*|\s+)("[^"]*"|'[^']*'|[^\s"'`;|&]+)/gi,
+    '$1$2[REDACTED]',
+  )
+  // Redact high-confidence provider secret prefixes
+  text = text.replace(
+    /\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|xox[baprs]-[A-Za-z0-9-]{12,}|AKIA[0-9A-Z]{16})\b/g,
+    '[REDACTED]',
+  )
+  if (text.length <= maxChars) return text
+  const cut = Math.max(0, maxChars - 3)
+  return `${text.slice(0, cut)}...`
+}
 
 export type OcBashAction = 'wait' | 'status' | 'kill'
 export type JobTerminationReason = 'killed' | 'hard_timeout' | 'idle_timeout' | 'max_lifetime'
@@ -263,7 +401,12 @@ export function killChildProcessGroup(child: ChildProcess, signal: NodeJS.Signal
 interface ManagedBashJob {
   id: string
   commandPreview: string
+  snapshotPreview: string
+  cwd: string
   startedAt: number
+  maxLifetimeAt: number
+  startTimeTicks: number | null
+  snapshotPath: string | null
   child: ChildProcess
   stdout: DeltaStreamBuffer
   stderr: DeltaStreamBuffer
@@ -292,6 +435,12 @@ export interface OcBashJobManagerOptions {
   closeDrainSafetyMs?: number
   trackProcessGroup?: (pid: number) => void
   untrackProcessGroup?: (pid: number | undefined) => void
+  /** Override disk snapshot registry directory; pass `null` to disable snapshots. */
+  registryDir?: string | null
+  /** Override session key stamped into snapshots (defaults to OC_SESSION_KEY / OPENCLAUDE_SESSION_KEY). */
+  sessionKey?: string
+  /** Environment source for registryDir / sessionKey resolution (defaults to process.env). */
+  env?: NodeJS.ProcessEnv
 }
 
 function makeCommandPreview(command: string): string {
@@ -308,11 +457,15 @@ export class OcBashJobManager {
   private readonly closeDrainSafetyMs: number
   private readonly trackProcessGroup?: (pid: number) => void
   private readonly untrackProcessGroup?: (pid: number | undefined) => void
+  private readonly registryDir: string | null
+  private readonly sessionKeyOverride?: string
+  private readonly env: NodeJS.ProcessEnv
 
   private seq = 0
   private readonly jobs = new Map<string, ManagedBashJob>()
   private readonly tombstones = new Map<string, JobTombstone>()
   private readonly localProcessGroups = new Set<number>()
+  private readonly activeSnapshotPaths = new Set<string>()
   private isShutdown = false
 
   constructor(opts: OcBashJobManagerOptions = {}) {
@@ -324,6 +477,83 @@ export class OcBashJobManager {
     this.closeDrainSafetyMs = opts.closeDrainSafetyMs ?? CLOSE_DRAIN_SAFETY_MS
     this.trackProcessGroup = opts.trackProcessGroup
     this.untrackProcessGroup = opts.untrackProcessGroup
+    this.env = opts.env ?? process.env
+    this.sessionKeyOverride = opts.sessionKey
+    this.registryDir =
+      opts.registryDir === undefined
+        ? resolveOcBashRegistryDir(this.env)
+        : opts.registryDir && opts.registryDir.trim()
+          ? opts.registryDir.trim()
+          : null
+  }
+
+  private writeJobSnapshot(job: ManagedBashJob): void {
+    if (!this.registryDir || job.closed || this.isShutdown) return
+    const pid = job.child.pid
+    if (!pid || pid <= 1) return
+    if (job.startTimeTicks === null) {
+      job.startTimeTicks = readProcStartTimeTicks(pid)
+    }
+    const now = Date.now()
+    const { sessionKey, sessionId } = resolveOcBashSessionIdentity(this.env, this.sessionKeyOverride)
+    const id = `${process.pid}-${job.id}`
+    const snapshot: OcBashJobSnapshot = {
+      id,
+      jobId: job.id,
+      pid,
+      pgid: pid,
+      ownerPid: process.pid,
+      startTimeTicks: job.startTimeTicks,
+      sessionKey,
+      sessionId,
+      commandPreview: job.snapshotPreview,
+      cwd: job.cwd,
+      startedAt: job.startedAt,
+      updatedAt: now,
+      maxLifetimeAt: job.maxLifetimeAt,
+    }
+    const targetPath = join(this.registryDir, `${id}.json`)
+    const tmpPath = `${targetPath}.${randomBytes(6).toString('hex')}.tmp`
+    try {
+      mkdirSync(this.registryDir, { recursive: true })
+      writeFileSync(tmpPath, JSON.stringify(snapshot), { encoding: 'utf8', mode: 0o600 })
+      renameSync(tmpPath, targetPath)
+      job.snapshotPath = targetPath
+      this.activeSnapshotPaths.add(targetPath)
+    } catch {
+      // Fail-open: disk registry errors must never disrupt oc_bash execution.
+      try {
+        unlinkSync(tmpPath)
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  private removeJobSnapshot(job: ManagedBashJob): void {
+    const filePath =
+      job.snapshotPath ??
+      (this.registryDir ? join(this.registryDir, `${process.pid}-${job.id}.json`) : null)
+    job.snapshotPath = null
+    if (!filePath) return
+    this.activeSnapshotPaths.delete(filePath)
+    try {
+      unlinkSync(filePath)
+    } catch {
+      /* already removed or unwritable */
+    }
+  }
+
+  /** Synchronously unlink all tracked snapshot files (safe for process exit/signal handlers). */
+  cleanupSnapshotsSync(): void {
+    for (const filePath of this.activeSnapshotPaths) {
+      try {
+        unlinkSync(filePath)
+      } catch {
+        /* ignore */
+      }
+    }
+    this.activeSnapshotPaths.clear()
   }
 
   activeRunningCount(): number {
@@ -370,6 +600,7 @@ export class OcBashJobManager {
 
   private recordTombstone(job: ManagedBashJob, reason: JobTombstoneReason): void {
     this.clearJobTimers(job)
+    this.removeJobSnapshot(job)
     job.stdout.clear()
     job.stderr.clear()
     this.jobs.delete(job.id)
@@ -461,6 +692,17 @@ export class OcBashJobManager {
       this.localProcessGroups.delete(pid)
       this.untrackProcessGroup?.(pid)
     }
+    const groupStillRunning =
+      !job.killRequested &&
+      Boolean(pid && pid > 1) &&
+      hasAliveVerifiedGroupMembers(pid!, job.startTimeTicks)
+    if (!groupStillRunning) {
+      this.removeJobSnapshot(job)
+    } else if (job.snapshotPath) {
+      // Leader exited while child processes in the same process group are still alive:
+      // keep the disk snapshot so gateway list/cancel retains control until the group exits.
+      this.activeSnapshotPaths.delete(job.snapshotPath)
+    }
     job.resolveClose()
 
     if (!job.waiterInFlight && job.yielded) {
@@ -530,10 +772,16 @@ export class OcBashJobManager {
       resolveClose = resolve
     })
 
+    const startedAt = Date.now()
     const job: ManagedBashJob = {
       id: jobId,
       commandPreview: makeCommandPreview(spec.command),
-      startedAt: Date.now(),
+      snapshotPreview: sanitizeOcBashCommandPreview(spec.command),
+      cwd: spec.cwd ?? process.cwd(),
+      startedAt,
+      maxLifetimeAt: startedAt + this.maxJobLifetimeMs,
+      startTimeTicks: null,
+      snapshotPath: null,
       child,
       stdout: new DeltaStreamBuffer(this.maxBytes),
       stderr: new DeltaStreamBuffer(this.maxBytes),
@@ -556,6 +804,7 @@ export class OcBashJobManager {
     if (child.pid && child.pid > 0) {
       this.localProcessGroups.add(child.pid)
       this.trackProcessGroup?.(child.pid)
+      this.writeJobSnapshot(job)
     }
 
     child.stdout?.on('data', (chunk: Buffer) => {
@@ -641,6 +890,7 @@ export class OcBashJobManager {
 
     job.yielded = true
     job.waiterInFlight = false
+    this.writeJobSnapshot(job)
     this.armIdleTimer(job)
     const out = job.stdout.drain(false)
     const err = job.stderr.drain(false)
@@ -726,6 +976,7 @@ export class OcBashJobManager {
       if (job.closed) {
         return this.collectClosedJob(job)
       }
+      this.writeJobSnapshot(job)
       this.armIdleTimer(job)
       const out = job.stdout.drain(false)
       const err = job.stderr.drain(false)
@@ -774,6 +1025,7 @@ export class OcBashJobManager {
     }
 
     job.waiterInFlight = false
+    this.writeJobSnapshot(job)
     this.armIdleTimer(job)
     const out = job.stdout.drain(false)
     const err = job.stderr.drain(false)
@@ -820,6 +1072,10 @@ export class OcBashJobManager {
     }
   }
 
+  disposeAll(): void {
+    this.shutdown()
+  }
+
   shutdown(): void {
     this.isShutdown = true
     for (const pid of this.localProcessGroups) {
@@ -834,6 +1090,7 @@ export class OcBashJobManager {
 
     for (const job of this.jobs.values()) {
       this.clearJobTimers(job)
+      this.removeJobSnapshot(job)
       if (!job.closed) {
         job.killRequested = true
         killChildProcessGroup(job.child, 'SIGKILL')
@@ -852,5 +1109,6 @@ export class OcBashJobManager {
       job.stderr.clear()
     }
     this.jobs.clear()
+    this.cleanupSnapshotsSync()
   }
 }

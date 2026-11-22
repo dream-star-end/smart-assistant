@@ -10,7 +10,6 @@ import {
   AppWindow,
   Archive,
   BarChart3,
-  Bot,
   Boxes,
   Brain,
   Camera,
@@ -34,9 +33,7 @@ import {
   Search,
   Send,
   Server,
-  ShieldCheck,
   Sparkles,
-  Terminal,
   TrendingUp,
   Users,
   Video,
@@ -44,10 +41,27 @@ import {
   XCircle,
   type LucideIcon,
 } from "lucide-react";
+import { createElement } from "react";
 import { agentDisplayName } from "../chat/agentNames";
 import { searchExtraToolsQuery } from "../../lib/chat/extraTool";
 import { mappedLiveActivityLabel } from "../../lib/chat/liveActivityLabel";
+import { AtelierIcon } from "../ui/AtelierIcons";
 import { asArr, asStr, detectShellFileWrites, parseCodexTypeName, safeSubtaskDescription, shortPath, stripShellWrapperForDisplay } from "./format";
+
+function makeAtelierToolIcon(name: "agent" | "terminal" | "shield"): LucideIcon {
+  const Icon = ({ size = 16, className }: { size?: number | string; className?: string }) =>
+    createElement(AtelierIcon, {
+      name,
+      size: typeof size === "number" ? size : Number(size) || 16,
+      className,
+    });
+  Icon.displayName = `AtelierToolIcon(${name})`;
+  return Icon as unknown as LucideIcon;
+}
+
+export const AtelierAgentIcon = makeAtelierToolIcon("agent");
+export const AtelierTerminalIcon = makeAtelierToolIcon("terminal");
+export const AtelierShieldIcon = makeAtelierToolIcon("shield");
 
 /** 工具卡图标底色语义(对齐设计稿 aurora-conversation-cards 的 .tic.tn-* 分色)。 */
 export type ToolTone = "accent" | "success" | "info" | "warning" | "neutral";
@@ -55,7 +69,7 @@ export type ToolMeta = { icon: LucideIcon; label: string; tone?: ToolTone };
 
 // ── builtin claude-code 工具(tone 对齐设计稿:终端紫/编辑写入绿/读取搜索灰/网页蓝)──
 const TOOL_META: Record<string, ToolMeta> = {
-  Bash: { icon: Terminal, label: "终端", tone: "accent" },
+  Bash: { icon: AtelierTerminalIcon, label: "终端", tone: "accent" },
   Read: { icon: FileText, label: "读取文件", tone: "neutral" },
   Edit: { icon: Pencil, label: "编辑文件", tone: "success" },
   Write: { icon: FilePlus, label: "写入文件", tone: "success" },
@@ -72,8 +86,8 @@ const TOOL_META: Record<string, ToolMeta> = {
   ExecuteExtraTool: { icon: Plug, label: "调用工具", tone: "info" },
   TodoWrite: { icon: ListChecks, label: "任务列表", tone: "accent" },
   NotebookEdit: { icon: NotebookPen, label: "笔记本", tone: "neutral" },
-  Task: { icon: Bot, label: "子任务", tone: "accent" },
-  Agent: { icon: Bot, label: "子任务", tone: "accent" },
+  Task: { icon: AtelierAgentIcon, label: "子任务", tone: "accent" },
+  Agent: { icon: AtelierAgentIcon, label: "子任务", tone: "accent" },
   // cursor 引擎经网关归一化后的产品名;CCB 的 AskUserQuestion 走 PermissionCard 专用答题卡,
   // 此条只兜 cursor 工具消息与历史降级渲染。
   AskUserQuestion: { icon: FormInput, label: "向用户提问", tone: "accent" },
@@ -84,28 +98,38 @@ const TOOL_META: Record<string, ToolMeta> = {
   CronDelete: { icon: Clock, label: "删除定时任务", tone: "accent" },
   // v3/Codex 历史会话里可能出现的非标准 toolName，补语义标签避免裸英文。
   Skill: { icon: Sparkles, label: "启用技能", tone: "accent" },
-  TaskOutput: { icon: Bot, label: "子任务结果", tone: "accent" },
+  TaskOutput: { icon: AtelierAgentIcon, label: "子任务结果", tone: "accent" },
   EnterPlanMode: { icon: ListChecks, label: "进入计划模式", tone: "accent" },
   ExitPlanMode: { icon: ListChecks, label: "退出计划模式", tone: "accent" },
-  TaskStop: { icon: Bot, label: "停止子任务", tone: "warning" },
-  delegate_task: { icon: Bot, label: "委托子任务", tone: "accent" },
+  TaskStop: { icon: AtelierAgentIcon, label: "停止子任务", tone: "warning" },
+  delegate_task: { icon: AtelierAgentIcon, label: "委托子任务", tone: "accent" },
   delegate_tasks: { icon: Users, label: "并行委派", tone: "accent" },
   delegate_wait: { icon: Clock, label: "等待委派", tone: "accent" },
+  // Antigravity 1.5.8 native swarm tools (OCV5-809).
+  SwarmBoard: { icon: Users, label: "蜂群协作看板", tone: "accent" },
+  SwarmManage: { icon: Users, label: "蜂群调度", tone: "accent" },
+  SwarmPost: { icon: Send, label: "蜂群广播", tone: "info" },
+  SwarmReadBoard: { icon: Eye, label: "读取讨论板", tone: "neutral" },
+  SwarmWait: { icon: Clock, label: "等待蜂群回复", tone: "neutral" },
+  swarm: { icon: Users, label: "蜂群调度", tone: "accent" },
+  post_message: { icon: Send, label: "蜂群广播", tone: "info" },
+  read_board: { icon: Eye, label: "读取讨论板", tone: "neutral" },
+  swarm_wait: { icon: Clock, label: "等待蜂群回复", tone: "neutral" },
 };
 
 const CODEX_TYPE_META: Record<string, ToolMeta> = {
   imageView: { icon: Eye, label: "查看图片", tone: "warning" },
   imageGeneration: { icon: ImageIcon, label: "生成图片", tone: "accent" },
   contextCompaction: { icon: Archive, label: "压缩上下文", tone: "neutral" },
-  enteredReviewMode: { icon: Bot, label: "进入审阅模式", tone: "accent" },
-  exitedReviewMode: { icon: Bot, label: "退出审阅模式", tone: "neutral" },
+  enteredReviewMode: { icon: AtelierAgentIcon, label: "进入审阅模式", tone: "accent" },
+  exitedReviewMode: { icon: AtelierAgentIcon, label: "退出审阅模式", tone: "neutral" },
   dynamicToolCall: { icon: Wrench, label: "工具调用", tone: "neutral" },
   mcpToolCall: { icon: Wrench, label: "MCP 工具", tone: "neutral" },
-  userMessage: { icon: Bot, label: "Codex 消息", tone: "neutral" },
+  userMessage: { icon: AtelierAgentIcon, label: "Codex 消息", tone: "neutral" },
   // 子代理生命周期事件(started/completed);存量孤儿消息(toolName 'unknown' + item 在
   // output)也会经 format 层兜底归一化到这里。注:webSearch 恒被归一化为内置 WebSearch
   // (normalizeCodexTool 无失败分支),不需要 codex 级 meta 条目。
-  subAgentActivity: { icon: Bot, label: "子代理活动", tone: "accent" },
+  subAgentActivity: { icon: AtelierAgentIcon, label: "子代理活动", tone: "accent" },
 };
 
 // ── 容器内 oc-* CLI(经 Bash 调用)→ 语义卡:单一权威表 ──
@@ -220,12 +244,12 @@ const MCP_OP_META: Record<string, ToolMeta> = {
   "browser:browser_fill_form": { icon: FormInput, label: "填写表单" },
   "browser:browser_press_key": { icon: Keyboard, label: "按键" },
   "browser:browser_select_option": { icon: FormInput, label: "选择选项" },
-  "browser:browser_evaluate": { icon: Terminal, label: "执行脚本" },
-  "browser:browser_run_code": { icon: Terminal, label: "执行代码" },
+  "browser:browser_evaluate": { icon: AtelierTerminalIcon, label: "执行脚本" },
+  "browser:browser_run_code": { icon: AtelierTerminalIcon, label: "执行代码" },
   "browser:browser_wait_for": { icon: Clock, label: "等待" },
   "browser:browser_close": { icon: AppWindow, label: "关闭浏览器" },
   "browser:browser_tabs": { icon: AppWindow, label: "标签页" },
-  "browser:browser_console_messages": { icon: Terminal, label: "控制台" },
+  "browser:browser_console_messages": { icon: AtelierTerminalIcon, label: "控制台" },
   "browser:browser_network_requests": { icon: Globe, label: "网络请求" },
   "browser:browser_pdf_save": { icon: FileText, label: "保存 PDF" },
   "browser:browser_resize": { icon: AppWindow, label: "调整窗口" },
@@ -257,7 +281,7 @@ const MCP_OP_META: Record<string, ToolMeta> = {
   "openclaude-memory:list_reminders": { icon: Clock, label: "定时任务列表" },
   "openclaude-memory:update_reminder": { icon: Clock, label: "修改定时任务" },
   "openclaude-memory:delete_reminder": { icon: Clock, label: "删除定时任务" },
-  "openclaude-memory:delegate_task": { icon: Bot, label: "委托子任务" },
+  "openclaude-memory:delegate_task": { icon: AtelierAgentIcon, label: "委托子任务" },
   "openclaude-memory:delegate_tasks": { icon: Users, label: "并行委派" },
   "openclaude-memory:delegate_wait": { icon: Clock, label: "等待委派" },
   "openclaude-memory:send_to_agent": { icon: Send, label: "发送给子 Agent" },
@@ -267,22 +291,26 @@ const MCP_OP_META: Record<string, ToolMeta> = {
   "openclaude-memory:skill_save": { icon: Sparkles, label: "保存技能" },
   "openclaude-memory:skill_delete": { icon: Sparkles, label: "删除技能" },
   "openclaude-memory:skill_propose": { icon: Sparkles, label: "提议技能" },
-  "openclaude-memory:request_review": { icon: ShieldCheck, label: "申请质量审查" },
-  "openclaude-memory:consult_advisor": { icon: ShieldCheck, label: "咨询顾问" },
+  "openclaude-memory:request_review": { icon: AtelierShieldIcon, label: "申请质量审查" },
+  "openclaude-memory:consult_advisor": { icon: AtelierShieldIcon, label: "咨询顾问" },
   "openclaude-memory:ask_user": { icon: ListChecks, label: "向用户提问" },
   "openclaude-memory:present_options": { icon: ListChecks, label: "投递选项卡" },
-  "openclaude-memory:ask_gpt55_codex": { icon: Bot, label: "Codex 审查" },
+  "openclaude-memory:ask_gpt55_codex": { icon: AtelierAgentIcon, label: "Codex 审查" },
   "openclaude-memory:task_create": { icon: FilePlus, label: "创建任务单" },
   "openclaude-memory:task_update": { icon: Pencil, label: "更新任务单" },
   "openclaude-memory:task_comment": { icon: NotebookPen, label: "任务单评论" },
   "openclaude-memory:task_list": { icon: ListChecks, label: "任务单列表" },
   "openclaude-memory:task_get": { icon: FileText, label: "查看任务单" },
   "openclaude-memory:task_approve": { icon: ListChecks, label: "批准任务单" },
-  "openclaude-memory:present_task_approval": { icon: ShieldCheck, label: "任务审批卡" },
+  "openclaude-memory:present_task_approval": { icon: AtelierShieldIcon, label: "任务审批卡" },
   "openclaude-memory:project_search": { icon: Search, label: "搜索项目文件" },
-  "openclaude-memory:oc_bash": { icon: Terminal, label: "执行命令" },
+  "openclaude-memory:oc_bash": { icon: AtelierTerminalIcon, label: "执行命令" },
   "openclaude-memory:oc_grep": { icon: Search, label: "搜索内容" },
   "openclaude-memory:oc_glob": { icon: FolderOpen, label: "查找文件" },
+  "openclaude-memory:swarm": { icon: Users, label: "蜂群调度" },
+  "openclaude-memory:post_message": { icon: Send, label: "讨论板发言" },
+  "openclaude-memory:read_board": { icon: NotebookPen, label: "查看讨论板" },
+  "openclaude-memory:swarm_wait": { icon: Clock, label: "等待蜂群消息" },
   // codex 内建 MCP 资源清单(op 无摘要,空态即全部信息)。
   "codex:list_mcp_resources": { icon: Boxes, label: "MCP 资源列表" },
   "codex:list_mcp_resource_templates": { icon: Layers, label: "MCP 资源模板" },
@@ -450,8 +478,8 @@ function ocCommandMeta(cli: OcCli, command: string): ToolMeta {
   if (cli === "oc-web") return { ...base, label: "提取网页内容" };
   if (cli === "oc-memory") {
     const labels: Record<string, ToolMeta> = {
-      delegate: { icon: Bot, label: "委派子任务", tone: "accent" },
-      "request-review": { icon: ShieldCheck, label: "质量审查", tone: "accent" },
+      delegate: { icon: AtelierAgentIcon, label: "委派子任务", tone: "accent" },
+      "request-review": { icon: AtelierShieldIcon, label: "质量审查", tone: "accent" },
       "delegate-wait": { icon: Clock, label: "等待委派", tone: "accent" },
       "core-search": { icon: Brain, label: "记忆检索", tone: "accent" },
       "session-search": { icon: Search, label: "历史检索", tone: "accent" },
@@ -683,6 +711,36 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
       return delegateTasksSummary(input);
     case "delegate_wait":
       return asStr(input.jobId);
+    case "SwarmBoard":
+      return asStr(input.title) || "蜂群协作";
+    case "SwarmManage":
+    case "swarm": {
+      const action = asStr(input.action);
+      const memberName = asStr(input.name);
+      const title = asStr(input.title);
+      if (action === "title" && title) return `命名「${title}」`;
+      if (action === "add" && memberName) return `招募 @${memberName}`;
+      if (action === "kill" && memberName) return `回收 @${memberName}`;
+      if (action === "model" && memberName) return `切换 @${memberName} 模型`;
+      if (action === "status") return "查看蜂群成员状态";
+      if (action === "models") return "查询可用模型";
+      if (action === "channel") return `频道 ${asStr(input.channel) || asStr(input.op)}`;
+      return title || memberName || action;
+    }
+    case "SwarmPost":
+    case "post_message": {
+      const ch = asStr(input.channel);
+      const text = asStr(input.text).replace(/\s+/g, " ").trim().slice(0, 60);
+      return ch && ch !== "main" ? `#${ch} ${text}` : text;
+    }
+    case "SwarmReadBoard":
+    case "read_board": {
+      const ch = asStr(input.channel);
+      return ch ? `频道 #${ch}` : "同步最新讨论";
+    }
+    case "SwarmWait":
+    case "swarm_wait":
+      return "等待成员汇报";
   }
   const codexType = parseCodexTypeName(name);
   if (codexType) return codexSummary(codexType, input).slice(0, 80);

@@ -1,4 +1,5 @@
 import type { ChartConfiguration } from "chart.js";
+import { Server } from "lucide-react";
 import { useRef, useState } from "react";
 import { Badge, Button, Card, Input, useToast } from "../../../components/ui";
 import { TimeAgo, useChart } from "../../components";
@@ -170,15 +171,25 @@ export function ProviderCard({
 
   const row = "flex items-center gap-2 text-[12.5px]";
   const rowLabel = "w-16 shrink-0 text-faint";
+  const isHealthy = provider.keyConfigured && provider.health.effective !== "degraded";
 
   return (
-    <Card className="flex flex-col gap-2.5 p-4">
+    <Card className="oc-surface-card-hover flex flex-col gap-3 rounded-xl p-4">
       <div className="flex items-start justify-between gap-2">
-        <div className="min-w-0">
-          <h3 className="truncate text-body font-semibold text-fg">
-            {provider.display_name || provider.id}
-          </h3>
-          <span className="font-mono text-caption text-faint">{provider.id}</span>
+        <div className="flex min-w-0 items-center gap-2.5">
+          <span
+            className={`oc-icon-badge size-9 rounded-lg ${
+              isHealthy ? "oc-icon-badge-accent" : "oc-icon-badge-danger"
+            }`}
+          >
+            <Server size={16} strokeWidth={1.9} />
+          </span>
+          <div className="min-w-0">
+            <h3 className="truncate text-body font-semibold tracking-tight text-fg">
+              {provider.display_name || provider.id}
+            </h3>
+            <span className="font-mono text-caption text-faint">{provider.id}</span>
+          </div>
         </div>
         {provider.keyConfigured ? (
           <Badge tone="success">已配置</Badge>
@@ -187,67 +198,74 @@ export function ProviderCard({
         )}
       </div>
 
-      <div className="flex items-center gap-1.5 text-meta text-muted">
-        <span className="truncate font-mono">{provider.endpoint || "—"}</span>
-        <Badge tone={provider.egress === "proxy" ? "success" : "neutral"}>
+      <div className="oc-surface-recessed flex items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-meta text-muted">
+        <span className="truncate font-mono text-caption">{provider.endpoint || "—"}</span>
+        <Badge tone={provider.egress === "proxy" ? "success" : "neutral"} className="shrink-0">
           {provider.egress || "direct"}
         </Badge>
       </div>
 
-      <div className={row}>
-        <span className={rowLabel}>延迟</span>
-        {provider.probeEnabled === false ? (
-          <Badge tone="neutral">不探测(经账号代理)</Badge>
-        ) : provider.latest ? (
-          <span className="inline-flex items-center gap-1.5">
-            <Badge
-              tone={provider.latest.ok ? "success" : "danger"}
-              title={
-                provider.latest.ok
-                  ? undefined
-                  : provider.latest.error || `HTTP ${provider.latest.status_code ?? "?"}`
-              }
-            >
-              {provider.latest.latency_ms ?? "—"}ms
-            </Badge>
-            <TimeAgo value={provider.latest.probed_at} className="text-caption text-faint" />
-          </span>
-        ) : (
-          <Badge tone="neutral">未探测</Badge>
-        )}
-      </div>
-
-      <div className={row}>
-        <span className={rowLabel}>健康</span>
-        <HealthBadge provider={provider} />
-      </div>
-
-      <div className="flex items-center gap-1.5">
-        <span className={rowLabel}>降级策略</span>
-        <div className="flex flex-wrap gap-1">
-          {(["auto", "forced_degraded", "forced_healthy"] as HealthMode[]).map((m) => {
-            const active = provider.health.mode === m;
-            return (
-              <Button
-                key={m}
-                variant={active ? "subtle" : "secondary"}
-                size="sm"
-                disabled={active || switching !== null}
-                onClick={() => switchMode(m)}
+      <div className="flex flex-col gap-2">
+        <div className={row}>
+          <span className={rowLabel}>延迟</span>
+          {provider.probeEnabled === false ? (
+            <Badge tone="neutral">不探测(经账号代理)</Badge>
+          ) : provider.latest ? (
+            <span className="inline-flex items-center gap-1.5">
+              <Badge
+                tone={provider.latest.ok ? "success" : "danger"}
+                className="tabular-nums"
+                title={
+                  provider.latest.ok
+                    ? undefined
+                    : provider.latest.error || `HTTP ${provider.latest.status_code ?? "?"}`
+                }
               >
-                {active ? "✓ " : ""}
-                {HEALTH_MODE_LABELS[m]}
-              </Button>
-            );
-          })}
+                {provider.latest.latency_ms ?? "—"}ms
+              </Badge>
+              <TimeAgo value={provider.latest.probed_at} className="text-caption text-faint" />
+            </span>
+          ) : (
+            <Badge tone="neutral">未探测</Badge>
+          )}
+        </div>
+
+        <div className={row}>
+          <span className={rowLabel}>健康</span>
+          <HealthBadge provider={provider} />
+        </div>
+
+        <div className="flex items-center gap-1.5">
+          <span className={rowLabel}>降级策略</span>
+          <div className="flex flex-wrap gap-1">
+            {(["auto", "forced_degraded", "forced_healthy"] as HealthMode[]).map((m) => {
+              const active = provider.health.mode === m;
+              return (
+                <Button
+                  key={m}
+                  variant={active ? "subtle" : "secondary"}
+                  size="sm"
+                  disabled={active || switching !== null}
+                  onClick={() => switchMode(m)}
+                >
+                  {active ? "✓ " : ""}
+                  {HEALTH_MODE_LABELS[m]}
+                </Button>
+              );
+            })}
+          </div>
         </div>
       </div>
 
       {provider.probeEnabled !== false &&
         (provider.samples?.length ? (
-          <LatencySparkline provider={provider} />
+          <div className="oc-surface-recessed rounded-lg px-2 py-1">
+            <LatencySparkline provider={provider} />
+          </div>
         ) : (
-          <div className="flex h-10 items-center text-caption text-faint">暂无探测样本</div>
+          <div className="oc-surface-recessed flex h-10 items-center justify-center rounded-lg text-caption text-faint">
+            暂无探测样本
+          </div>
         ))}
 
       <div className="flex flex-col gap-1">
@@ -258,7 +276,7 @@ export function ProviderCard({
               当前并发 <b className="tabular-nums">{inflightCurrent}</b> / 上限 {String(limit)}
               <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-hover" title={`利用率 ${util.pct}%`}>
                 <div
-                  className={`h-full rounded-full ${util.tone === "danger" ? "bg-danger" : util.tone === "warning" ? "bg-warning" : "bg-success"}`}
+                  className={`oc-progress-fill h-full rounded-full ${util.tone === "danger" ? "bg-danger" : util.tone === "warning" ? "bg-warning" : "bg-success"}`}
                   style={{ width: `${util.pct}%` }}
                 />
               </div>
@@ -272,50 +290,52 @@ export function ProviderCard({
         </div>
       </div>
 
-      <div className={row}>
-        <span className={rowLabel}>并发上限</span>
-        <Input
-          type="number"
-          min={1}
-          step={1}
-          value={climit}
-          onChange={(e) => setClimit(e.target.value)}
-          placeholder="空=不限"
-          className="h-8 w-28 text-body tabular-nums"
-        />
+      <div className="flex flex-col gap-2 border-t border-border/70 pt-2.5">
+        <div className={row}>
+          <span className={rowLabel}>并发上限</span>
+          <Input
+            type="number"
+            min={1}
+            step={1}
+            value={climit}
+            onChange={(e) => setClimit(e.target.value)}
+            placeholder="空=不限"
+            className="oc-field-control h-8 w-28 text-body tabular-nums"
+          />
+        </div>
+
+        <div className="text-caption text-faint tabular-nums">{providerUsageLine(provider.usage_d1)}</div>
+
+        <div className={row}>
+          <span className={rowLabel}>订阅到期</span>
+          <Input
+            type="date"
+            value={subDate}
+            onChange={(e) => setSubDate(e.target.value)}
+            className="oc-field-control h-8 w-40 text-body tabular-nums"
+          />
+          <Badge
+            tone={
+              countdown.tone as "neutral" | "success" | "warning" | "danger" | "info" | "accent"
+            }
+          >
+            {countdown.label}
+          </Badge>
+        </div>
+
+        <div className={row}>
+          <span className={rowLabel}>备注</span>
+          <Input
+            value={notes}
+            onChange={(e) => setNotes(e.target.value)}
+            maxLength={500}
+            placeholder="账号归属 / 续费渠道等"
+            className="oc-field-control h-8 flex-1 text-body"
+          />
+        </div>
       </div>
 
-      <div className="text-caption text-faint">{providerUsageLine(provider.usage_d1)}</div>
-
-      <div className={row}>
-        <span className={rowLabel}>订阅到期</span>
-        <Input
-          type="date"
-          value={subDate}
-          onChange={(e) => setSubDate(e.target.value)}
-          className="h-8 w-40 text-body"
-        />
-        <Badge
-          tone={
-            countdown.tone as "neutral" | "success" | "warning" | "danger" | "info" | "accent"
-          }
-        >
-          {countdown.label}
-        </Badge>
-      </div>
-
-      <div className={row}>
-        <span className={rowLabel}>备注</span>
-        <Input
-          value={notes}
-          onChange={(e) => setNotes(e.target.value)}
-          maxLength={500}
-          placeholder="账号归属 / 续费渠道等"
-          className="h-8 flex-1 text-body"
-        />
-      </div>
-
-      <div className="flex justify-end">
+      <div className="flex justify-end border-t border-border/70 pt-2.5">
         <Button variant="secondary" size="sm" onClick={save} disabled={saving}>
           {saving ? "保存中…" : "保存"}
         </Button>

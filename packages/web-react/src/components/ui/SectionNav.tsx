@@ -58,19 +58,19 @@ export function SectionNav<T extends string>({
   };
 
   return (
-    <div className={cn("flex w-[168px] shrink-0 flex-col border-r border-border", className)}>
+    <div className={cn("flex w-[168px] shrink-0 flex-col border-r border-border bg-sidebar/35", className)}>
       <div
         role="tablist"
         aria-label={ariaLabel}
         aria-orientation="vertical"
         onKeyDown={onKeyDown}
-        className="flex min-h-0 flex-1 flex-col overflow-y-auto p-2"
+        className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto p-2"
       >
         {groups.map((group) => (
-          <div key={group.label}>
+          <div key={group.label} className="flex flex-col gap-0.5">
             {/* 只有一个分组时分组标题是多余层级(审计 SET-41);多组才需要区分。 */}
             {groups.length > 1 ? (
-              <div className="px-2.5 pb-1 pt-3 text-meta font-medium uppercase tracking-wide text-faint">
+              <div className="px-2.5 pb-1 pt-3 text-caption font-semibold uppercase tracking-wider text-faint">
                 {group.label}
               </div>
             ) : (
@@ -94,8 +94,10 @@ export function SectionNav<T extends string>({
                   data-product-feature={it.featureId}
                   onClick={() => onChange(it.id)}
                   className={cn(
-                    "flex w-full rounded-md px-2.5 py-1.5 text-left text-body outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                    selected ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg",
+                    "flex w-full items-center rounded-md px-2.5 py-1.5 text-left text-body outline-none transition-[background-color,color,box-shadow] duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring",
+                    selected
+                      ? "oc-segmented-thumb font-medium text-fg"
+                      : "text-muted hover:bg-hover hover:text-fg",
                   )}
                 >
                   {it.label}

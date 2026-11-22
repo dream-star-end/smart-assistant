@@ -99,11 +99,11 @@ export interface ApiKeyUsageRecentPage {
 /**
  * 最近明细的游标分页(0280 后续)。
  *
- * 与 {@link getApiKeyUsageReport} 的 `recent` 段**同一 SQL 形状**(同一 `whereFor("u.", false)`
- * 谓词:不过滤 status,让失败/被拒的请求也在列;同一 LEFT JOIN 取 label),差别只有两处:
- *   - 排序键收敛成单列 `u.id DESC` —— 游标语义必须与排序键严格一致,`created_at DESC, id DESC`
- *     的复合排序无法用单值 `before` 精确切分(同一毫秒多行会漏/重);usage_records.id 单调递增,
- *     `id DESC` 与 `created_at DESC` 在实践中同序。
+ * 与 {@link getApiKeyUsageReport} 的 `recent` 段**同一 SQL 形状与排序键**(同一 `whereFor("u.", false)`
+ * 谓词:不过滤 status,让失败/被拒的请求也在列;同一 LEFT JOIN 取 label;同按单列 `u.id DESC` 排序):
+ *   - 排序键与首屏严格一致为单列 `u.id DESC` —— 游标语义必须与首屏/翻页排序键完全一致,
+ *     若首屏按 `created_at DESC, id DESC` 而后续页按 `u.id < $n / u.id DESC`,并发事务的
+ *     `created_at`(事务开始时间)与 `id` 分配序不同或时间戳打平时会跨页漏行/重行。
  *   - `before` = `u.id < $n`,多取一行判断是否还有下一页。
  *
  * user_id 双重限定(`u.user_id = $1` + 可选 `u.api_key_id = $n`)—— 别人的 key_id 只会得到空集,
@@ -249,6 +249,8 @@ export async function getApiKeyUsageReport(
       usageParams,
     ),
     // 最近明细:这里**不**过滤 status —— 让 owner 看到失败/被拒的请求(0 积分)也在列。
+    // 排序键必须与 listApiKeyUsageRecent 的 `u.id < $before / ORDER BY u.id DESC` 严格一致,
+    // 否则并发事务 created_at(tx 开始时间)与 id 分配序不同或打平时,首屏→翻页会漏行或重行。
     query<ApiKeyUsageRecentRow>(
       `SELECT u.id::text                 AS id,
               u.created_at::text         AS created_at,
@@ -264,7 +266,7 @@ export async function getApiKeyUsageReport(
          FROM usage_records u
          LEFT JOIN user_api_keys k ON k.id = u.api_key_id
         ${whereFor("u.", false)}
-        ORDER BY u.created_at DESC, u.id DESC
+        ORDER BY u.id DESC
         LIMIT ${API_KEY_USAGE_RECENT_LIMIT}`,
       usageParams,
     ),

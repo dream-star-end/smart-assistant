@@ -1,0 +1,288 @@
+/* 侧栏统一「待拍板」极简分区（PendingDecisionsDock · OCV5-838 · Clarvy Atelier）。
+ * 去除外层厚重套娃卡盒，改为轻盈极简分区 + 干净单条 .oc-pd-card 与 Codex 侧栏浑然一体。
+ * 仅使用 styles.css 已定义语义 token，零硬编码裸色，明暗双态高质感。 */
+
+.oc-pd-dock {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  min-height: 0;
+  max-height: 22rem;
+  max-height: min(44vh, 24rem);
+  max-height: min(44dvh, 24rem);
+  margin: 0.25rem 0.5rem 0.375rem;
+  padding: 0.25rem 0 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.oc-pd-dock[data-collapsed="true"] {
+  margin: 0.375rem 0.5rem 0.125rem;
+  padding: 0;
+  border-bottom: 0;
+}
+
+.oc-pd-head {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0 0.125rem;
+}
+
+.oc-pd-dock[data-collapsed="true"] .oc-pd-head {
+  padding: 0;
+}
+
+.oc-pd-title-btn {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  align-items: center;
+  gap: 0.375rem;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  padding: 0.25rem 0.375rem;
+  background: transparent;
+  color: var(--fg);
+  font-size: var(--text-caption);
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background-color 150ms var(--ease-standard),
+    border-color 150ms var(--ease-standard),
+    box-shadow 150ms var(--ease-standard);
+}
+
+.oc-pd-title-btn:hover {
+  background: var(--hover);
+}
+
+.oc-pd-dock[data-collapsed="true"] .oc-pd-title-btn {
+  padding: 0.375rem 0.5rem;
+  border-color: color-mix(in srgb, var(--border) 90%, transparent);
+  background: color-mix(in srgb, var(--surface) 68%, transparent);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--fg) 3%, transparent);
+}
+
+.oc-pd-dock[data-collapsed="true"] .oc-pd-title-btn:hover {
+  border-color: var(--border-strong);
+  background: var(--surface);
+  box-shadow: var(--shadow-soft);
+}
+
+.oc-pd-dock[data-collapsed="true"][data-highest-risk="high"] .oc-pd-title-btn {
+  border-color: color-mix(in srgb, var(--warning) 28%, var(--border));
+}
+
+.oc-pd-dock[data-collapsed="true"][data-highest-risk="critical"] .oc-pd-title-btn {
+  border-color: color-mix(in srgb, var(--danger) 30%, var(--border));
+}
+
+.oc-pd-title-btn:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+
+.oc-pd-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  border-radius: var(--radius-sm);
+  background: var(--warning-soft);
+  color: var(--warning);
+  flex-shrink: 0;
+}
+
+.oc-pd-risk-dot {
+  width: 0.375rem;
+  height: 0.375rem;
+  border-radius: var(--radius-full);
+  flex-shrink: 0;
+}
+
+.oc-pd-risk-dot[data-risk="high"] {
+  background: var(--warning);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--warning) 18%, transparent);
+}
+
+.oc-pd-risk-dot[data-risk="critical"] {
+  background: var(--danger);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 20%, transparent);
+}
+
+.oc-pd-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.25rem;
+  height: 1.125rem;
+  padding: 0 0.375rem;
+  border-radius: var(--radius-full);
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-size: var(--text-micro);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.oc-pd-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: auto;
+  color: var(--faint);
+  transition:
+    transform 180ms var(--ease-standard),
+    color 140ms var(--ease-standard);
+}
+
+.oc-pd-title-btn:hover .oc-pd-chevron {
+  color: var(--muted);
+}
+
+.oc-pd-chevron[data-expanded="true"] {
+  transform: rotate(90deg);
+}
+
+.oc-pd-filters {
+  display: flex;
+  flex-shrink: 0;
+  gap: 0.25rem;
+  overflow-x: auto;
+  padding: 0.375rem 0.125rem 0.125rem;
+  scrollbar-width: none;
+}
+
+.oc-pd-filters::-webkit-scrollbar {
+  display: none;
+}
+
+.oc-pd-filter-pill {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 0.25rem;
+  height: 1.5rem;
+  padding: 0 0.5rem;
+  border-radius: var(--radius-full);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--text-micro);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 140ms var(--ease-standard), color 140ms var(--ease-standard);
+}
+
+.oc-pd-filter-pill:hover {
+  background: var(--hover);
+  color: var(--fg);
+}
+
+.oc-pd-filter-pill[aria-pressed="true"] {
+  background: var(--warning-soft);
+  border-color: color-mix(in srgb, var(--warning) 26%, transparent);
+  color: var(--warning);
+}
+
+.oc-pd-list {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  flex-direction: column;
+  gap: 0.375rem;
+  margin-top: 0.375rem;
+  padding: 0.0625rem 0.125rem 0.25rem 0;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--fg) 18%, transparent) transparent;
+}
+
+.oc-pd-list::-webkit-scrollbar {
+  width: 4px;
+}
+
+.oc-pd-list::-webkit-scrollbar-thumb {
+  border-radius: 9999px;
+  background: color-mix(in srgb, var(--fg) 18%, transparent);
+}
+
+.oc-pd-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.oc-pd-list > * {
+  flex-shrink: 0;
+}
+
+.oc-pd-card {
+  display: flex;
+  flex-shrink: 0;
+  flex-direction: column;
+  gap: 0.375rem;
+  padding: 0.5625rem 0.625rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--fg) 4%, transparent);
+  transition: border-color 150ms var(--ease-standard), box-shadow 150ms var(--ease-standard);
+}
+
+.oc-pd-card:hover {
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-soft);
+}
+
+.oc-pd-card[data-risk="critical"] {
+  border-color: color-mix(in srgb, var(--danger) 36%, var(--border));
+}
+
+.oc-pd-body-btn {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  border-radius: var(--radius-xs);
+  padding: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.oc-pd-body-btn:hover .oc-pd-card-title {
+  color: var(--accent);
+}
+
+.oc-pd-body-btn:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+.oc-pd-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.375rem;
+  padding-top: 0.125rem;
+}
+
+@media (hover: none), (max-width: 767px) {
+  .oc-pd-dock {
+    max-height: 20rem;
+    max-height: min(44vh, 22rem);
+    max-height: min(44dvh, 22rem);
+  }
+  .oc-pd-title-btn {
+    min-height: 2.75rem;
+  }
+  .oc-pd-filter-pill {
+    min-height: 2.25rem;
+    padding: 0 0.625rem;
+  }
+}

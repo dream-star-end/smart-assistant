@@ -4,6 +4,9 @@ import {
   backoffDelay,
   classifyClose,
   classifyEmptyTurn,
+  nextReconnectDelay,
+  RECONNECT_BACKOFF_RESET_MS,
+  serverRestartFirstDelay,
   contextRebuiltNotice,
   countAnswerBlocks,
   deriveConnBanner,
@@ -297,14 +300,24 @@ describe("classifyClose / nonAuthPolicyCloseInfo (§5)", () => {
   });
   test("known error reason still maps to its label", () => {
     const d = classifyClose(4503, JSON.stringify({ retryAfterSec: 3, reason: "image_outdated" }));
-    expect(d.closeReasonLabel).toBe("运行镜像更新中，稍后自动重试");
+    expect(d.closeReasonLabel).toBe("运行环境更新中，稍后自动重试");
   });
-  test("4509 服务重启 → 瞬态 reconnect + 「服务更新中」横幅,绝不落 policy/错误路径", () => {
+  test("4509 服务重启 → 瞬态 reconnect + fastFirstReconnect + 「服务更新中」横幅,绝不落 policy/错误路径", () => {
     const d = classifyClose(4509, "server_restart");
     expect(d.action).toBe("reconnect");
     expect(d.serverHintedDelay).toBe(0);
+    expect(d.fastFirstReconnect).toBe(true);
     expect(d.provisioning).toBe(false);
     expect(d.closeReasonLabel).toContain("服务更新中");
+    expect(serverRestartFirstDelay(() => 0)).toBe(250);
+    expect(serverRestartFirstDelay(() => 0.9999)).toBeLessThan(600);
+    expect(serverRestartFirstDelay(() => 0.9999)).toBeGreaterThanOrEqual(250);
+    const first = nextReconnectDelay(d, 0, () => 0.5);
+    expect(first).toEqual({ delay: 425, nextAttempts: 1 });
+    const second = nextReconnectDelay(d, first.nextAttempts, () => 0.5);
+    expect(second.delay).toBeGreaterThanOrEqual(4000);
+    expect(second.delay).toBeLessThan(5001);
+    expect(second.nextAttempts).toBe(2);
   });
   test("4509 不被误判为连接数超限(与 4505 kick 语义分流)", () => {
     expect(nonAuthPolicyCloseInfo(4509, "server_restart")).toBeNull();
@@ -730,14 +743,16 @@ describe("模型思考阶段(空思考也要让用户感知 agent 在响应)", (
     expect(long.cls).toBe("long-thinking");
   });
 
-  test("keepalive 断了(真静默)仍按静默升级,不假装在动", () => {
+  test("keepalive 断了(真静默)仍按静默升级,但不再展示焦虑的「无新数据」", () => {
     const out = computeTypingLabel({
       name: "助手",
       secs: 136,
       silenceMs: STALE_WARN_MS,
       progressHint: MODEL_THINKING_WORKING_DETAIL,
     });
-    expect(out.text).toContain("无新数据");
+    expect(out.cls).toBe("stale-warn");
+    expect(out.text).toContain("深度思考中");
+    expect(out.text).not.toContain("无新数据");
   });
 
   test("null 复位帧丢失:正文内容帧兜底清 thinking hint,思考增量帧不清", () => {
@@ -765,14 +780,16 @@ describe("computeTypingLabel progressHint vs stall", () => {
     expect(out.text).not.toContain("无新数据");
   });
 
-  test("stall 文案盖过 leftover progressHint，不假装在动", () => {
+  test("stall 文案盖过 leftover progressHint，不假装在动且不展示「无新数据」", () => {
     const out = computeTypingLabel({
       name: "助手",
       secs: 120,
       silenceMs: STALE_WARN_MS,
       progressHint: "Read foo.ts",
     });
-    expect(out.text).toContain("无新数据");
+    expect(out.cls).toBe("stale-warn");
+    expect(out.text).toContain("深度思考中");
+    expect(out.text).not.toContain("无新数据");
     expect(out.text).not.toContain("Read foo.ts");
     expect(out.text).not.toContain("读取文件");
   });
@@ -8283,8 +8300,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       return frame.type === "inbound.message" && frame.clientMessageId === user.id;
     })).toHaveLength(1));
     expect(persistPendingDispatch).toHaveBeenCalledTimes(1);
-    expect(sock.getTransientNotice("s1")?.text).toBe("正在确认发送…");
-    expect(sock.getTransientNotice("s1")?.text).not.toContain("浏览器");
+    expect(sock.getTransientNotice("s1")).toBeNull();
     expect(user.status).toBe("sending");
     expect(sock.sessions.get("s1")?._sendingInFlight).toBe(true);
     ws.onmessage?.({ data: JSON.stringify({
@@ -9755,7 +9771,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       type: "outbound.control.receipt", controlId: stop.controlId, controlKind: "stop", status: "terminal",
       peer: { id: "s1", kind: "dm" }, clientMessageId: user.id, errorCode: "TURN_ALREADY_ENDED",
     }) });
-    expect(sock.getTransientNotice("s1")?.text).toBe("该回合已结束");
+    expect(sock.getTransientNotice("s1")).toBeNull();
     expect(syncSession).toHaveBeenCalledWith("s1", { clientMessageId: user.id });
     expect(deletePendingControl).toHaveBeenCalledWith("s1", stop.controlId);
     expect(session._sendingInFlight).toBe(false);
@@ -10562,6 +10578,143 @@ describe("ChatSocket 4503 server-hinted reconnect (no 12-min loop)", () => {
   });
 });
 
+// ═══════════════ §5.1 close 4509 短抖动首连 + 防重连风暴（OCV5-854）═══════════════
+describe("ChatSocket 4509 fast first reconnect & anti-storm backoff (OCV5-854)", () => {
+  afterEach(() => {
+    FakeWS.instances = [];
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  test("稳定连接收到 4509 后在 [250, 600)ms 内完成首连（远低于 2s 横幅阈值）", () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws1 = FakeWS.instances.at(-1)!;
+    ws1.open();
+    expect(FakeWS.instances.length).toBe(1);
+
+    ws1.close(4509, "server_restart");
+    vi.advanceTimersByTime(249);
+    expect(FakeWS.instances.length).toBe(1);
+    vi.advanceTimersByTime(352); // 累计 601ms
+    expect(FakeWS.instances.length).toBe(2);
+    sock.stop();
+  });
+
+  test("快闪断连（onopen 后未收 relay_ready 或未满稳定窗即再遇 4509）不重置退避，严格按指数阶梯递增", () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws1 = FakeWS.instances.at(-1)!;
+    ws1.open();
+
+    // 第 1 次 4509 → 短抖动 [250, 600)ms，attempts: 0 → 1
+    ws1.close(4509, "server_restart");
+    vi.advanceTimersByTime(601);
+    expect(FakeWS.instances.length).toBe(2);
+
+    // 第 2 条连接 onopen 成功但未收 sys.relay_ready 就立刻再遇 4509 → attempts 仍为 1，退避 [4000, 5000)ms
+    const ws2 = FakeWS.instances.at(-1)!;
+    ws2.readyState = 1;
+    ws2.onopen?.();
+    ws2.close(4509, "server_restart");
+    vi.advanceTimersByTime(3999);
+    expect(FakeWS.instances.length).toBe(2);
+    vi.advanceTimersByTime(1002); // 累计 5001ms
+    expect(FakeWS.instances.length).toBe(3);
+
+    // 第 3 条连接收到 sys.relay_ready 但仅存活 2s (< RECONNECT_BACKOFF_RESET_MS) 即断 → 定时器清掉，attempts 仍为 2，退避 [8000, 9000)ms
+    const ws3 = FakeWS.instances.at(-1)!;
+    ws3.open();
+    vi.advanceTimersByTime(2000);
+    ws3.close(4509, "server_restart");
+    vi.advanceTimersByTime(7999);
+    expect(FakeWS.instances.length).toBe(3);
+    vi.advanceTimersByTime(1002); // 累计 9001ms
+    expect(FakeWS.instances.length).toBe(4);
+    sock.stop();
+  });
+
+  test("收到 sys.relay_ready 且稳定存活达 RECONNECT_BACKOFF_RESET_MS 后，退避清零并恢复 4509 短抖动首连资格", () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws1 = FakeWS.instances.at(-1)!;
+    ws1.open();
+
+    // 第 1 次 4509（attempts 0 → 1）
+    ws1.close(4509, "server_restart");
+    vi.advanceTimersByTime(601);
+    expect(FakeWS.instances.length).toBe(2);
+
+    // 第 2 条连接稳定存活超过 RECONNECT_BACKOFF_RESET_MS → attempts 归零
+    const ws2 = FakeWS.instances.at(-1)!;
+    ws2.open();
+    vi.advanceTimersByTime(RECONNECT_BACKOFF_RESET_MS);
+
+    // 下一次计划发版 4509 再次走 [250, 600)ms 短抖动首连
+    ws2.close(4509, "server_restart");
+    vi.advanceTimersByTime(601);
+    expect(FakeWS.instances.length).toBe(3);
+    sock.stop();
+  });
+
+  test("4509 瞬断并发回归：未 ack 消息与未 receipt 权限响应在 600ms 重连 + relay_ready 后按原身份幂等重发", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws1 = FakeWS.instances.at(-1)!;
+    ws1.open();
+
+    sock.ensureSession("s-4509-concurrent", "main");
+    // 1) 发送一条消息（停在 awaiting_admission，未收 outbound.ack）
+    await sock.sendMessage({ sessId: "s-4509-concurrent", agentId: "main", text: "deploy concurrent msg" });
+    await vi.waitFor(() =>
+      expect(ws1.sent.some((raw) => JSON.parse(raw).type === "inbound.message")).toBe(true),
+    );
+    const firstMsg = ws1.sent.map((raw) => JSON.parse(raw)).find((f) => f.type === "inbound.message");
+
+    // 2) 同时发一条权限响应（停在 awaiting_receipt，未收 outbound.control.receipt）
+    sock.respondPermission({
+      sessId: "s-4509-concurrent",
+      requestId: "perm-4509-1",
+      behavior: "allow",
+    });
+    await vi.waitFor(() =>
+      expect(ws1.sent.some((raw) => JSON.parse(raw).type === "inbound.permission_response")).toBe(true),
+    );
+    const firstPerm = ws1.sent
+      .map((raw) => JSON.parse(raw))
+      .find((f) => f.type === "inbound.permission_response");
+
+    // 3) 4509 切流瞬断 → 600ms 内重连并收到 sys.relay_ready
+    ws1.close(4509, "server_restart");
+    vi.advanceTimersByTime(601);
+    expect(FakeWS.instances.length).toBe(2);
+    const ws2 = FakeWS.instances.at(-1)!;
+    ws2.open();
+
+    // 4) 断言新连接上两条载荷均以完全相同的身份字段自动重发且各仅 1 次
+    await vi.waitFor(() => {
+      const frames = ws2.sent.map((raw) => JSON.parse(raw));
+      const msgs = frames.filter((f) => f.type === "inbound.message");
+      const perms = frames.filter((f) => f.type === "inbound.permission_response");
+      expect(msgs).toHaveLength(1);
+      expect(perms).toHaveLength(1);
+      expect(msgs[0].clientMessageId).toBe(firstMsg.clientMessageId);
+      expect(msgs[0].idempotencyKey).toBe(firstMsg.idempotencyKey);
+      expect(perms[0].controlId).toBe(firstPerm.controlId);
+      expect(perms[0].requestId).toBe("perm-4509-1");
+    });
+    sock.stop();
+  });
+});
+
 // ═══════════════ §7 auto-continue 确定性 idempotencyKey（dedup 对账）═══════════════
 describe("ChatSocket auto-continue deterministic idempotencyKey (#3)", () => {
   afterEach(() => {
@@ -10813,8 +10966,8 @@ describe("sys.context_rebuilt 帧处理", () => {
     expect(sysRows).toHaveLength(1);
     expect(sysRows[0].text).toBe(contextRebuiltNotice(40));
     expect(isServerAuthoredRow(sysRows[0])).toBe(false); // client-owned
-    // 同文案的会话级 transient 软提示(live flash)。
-    expect(sock.getTransientNotice("s1")?.text).toBe(contextRebuiltNotice(40));
+    // P0-5: 不再额外写入同文案 transientNotice，避免与 SystemCard 同屏双卡重复。
+    expect(sock.getTransientNotice("s1")).toBeNull();
     sock.stop();
   });
 

@@ -43,7 +43,24 @@ export type StoryboardSpec = Sub & { type: "storyboard"; title?: string; cps: nu
 export type FlashcardItem = { front: string; back: string; tag?: string; hint?: string };
 export type FlashcardsSpec = Sub & { type: "flashcards"; title?: string; cards: FlashcardItem[] };
 
-export type V2Spec = DeliverablesSpec | CitationsSpec | RunbookSpec | PromptTemplateSpec | StoryboardSpec | FlashcardsSpec;
+export type BrowserHandoffSpec = Sub & {
+  type: "browser_handoff";
+  title?: string;
+  url?: string;
+  reason?: string;
+  action_label?: string;
+  continue_label?: string;
+  continue_prompt?: string;
+};
+
+export type V2Spec =
+  | DeliverablesSpec
+  | CitationsSpec
+  | RunbookSpec
+  | PromptTemplateSpec
+  | StoryboardSpec
+  | FlashcardsSpec
+  | BrowserHandoffSpec;
 export type V2Type = V2Spec["type"];
 
 const V2_LIMITS = {
@@ -317,6 +334,18 @@ function flashcards(raw: Record<string, unknown>, ctx: Ctx): FlashcardsSpec | nu
   return { type: "flashcards", ...optional("title", str(raw.title)), cards: cap(cards, V2_LIMITS.flashcards, ctx, "闪卡") };
 }
 
+function browserHandoff(raw: Record<string, unknown>, _ctx: Ctx): BrowserHandoffSpec {
+  return {
+    type: "browser_handoff",
+    ...optional("title", str(raw.title, 120)),
+    ...optional("url", httpUrl(raw.url ?? raw.page_url ?? raw.href)),
+    ...optional("reason", str(raw.reason ?? raw.body ?? raw.message ?? raw.description, 600)),
+    ...optional("action_label", str(raw.action_label ?? raw.cta, 40)),
+    ...optional("continue_label", str(raw.continue_label, 40)),
+    ...optional("continue_prompt", str(raw.continue_prompt ?? raw.prompt, 400)),
+  };
+}
+
 export const V2_VALIDATORS: Record<V2Type, (raw: Record<string, unknown>, ctx: Ctx) => V2Spec | null> = {
   deliverables,
   citations,
@@ -324,6 +353,7 @@ export const V2_VALIDATORS: Record<V2Type, (raw: Record<string, unknown>, ctx: C
   prompt_template: promptTemplate,
   storyboard,
   flashcards,
+  browser_handoff: browserHandoff,
 };
 
 export const V2_ALIASES: Record<string, V2Type> = {
@@ -336,4 +366,8 @@ export const V2_ALIASES: Record<string, V2Type> = {
   shots: "storyboard",
   script: "storyboard",
   flashcard: "flashcards",
+  browser_takeover: "browser_handoff",
+  browser_login: "browser_handoff",
+  live_browser: "browser_handoff",
+  takeover: "browser_handoff",
 };

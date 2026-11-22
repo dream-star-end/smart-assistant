@@ -10,8 +10,8 @@
 > - 部署入口:[`scripts/deploy-v3.sh`](scripts/deploy-v3.sh)(**不是**下方 `deploy/` 那套)
 > - Hotfix 流程:[`docs/hotfix-deploy-checklist.md`](docs/hotfix-deploy-checklist.md)
 >
-> 下文 Quickstart / 配置 / 项目结构 主要描述个人版资产(`deploy/legacy-master/` 等),
-> 阅读时请注意区分,不要把个人版步骤套到 v3 商用版上。
+> 下文 Quickstart / 配置 / 项目结构 主要描述早期个人版架构(早期 `deploy/legacy-master/` 已于 OCV5-829 清理，保留于 git 历史),
+> 阅读时请注意区分,不要把个人版步骤套到 v3/v5 商用版上。
 
 > 基于 Claude Code 的全能个人 AI 助理
 
@@ -127,30 +127,9 @@ npm run onboard
 npm run gateway
 ```
 
-### 部署到 VPS(个人版)
+### 部署(历史个人版已归档)
 
-> v3 商用版部署走 [`scripts/deploy-v3.sh`](scripts/deploy-v3.sh) — 不要用本节。
-
-```bash
-# 配置部署环境变量
-cp deploy/legacy-master/.env.example deploy/legacy-master/.env
-# 编辑 deploy/legacy-master/.env 填入服务器信息
-
-# 部署
-export DEPLOY_HOST=your-server-ip
-export DEPLOY_PORT=22
-export DEPLOY_PASSWORD=your-password
-python3 deploy/legacy-master/deploy_runner.py local_file remote_path
-```
-
-### systemd 服务(个人版)
-
-```bash
-sudo cp deploy/legacy-master/openclaude.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable openclaude
-sudo systemctl start openclaude
-```
+> v5 商用版 / 个人自托管版部署请使用 [`scripts/deploy-v5.sh`](scripts/deploy-v5.sh) 与 [`scripts/deploy-v5-selfhost.sh`](scripts/deploy-v5-selfhost.sh)。早期 `deploy/legacy-master/` 资产已于 OCV5-829 清理（完整历史保留在 git 中）。
 
 ---
 
@@ -186,11 +165,7 @@ smart-assistant/
 │   │   └── webchat/           # WebChat 直连
 │   ├── cli/                   # CLI 入口 (onboard / gateway)
 │   └── plugin-sdk/            # ChannelAdapter 接口
-├── deploy/legacy-master/      # 个人版残留资产,归档保留 git 历史(详见 deploy/README.md)
-│   ├── .env.example           # 环境变量模板(个人版)
-│   ├── deploy_runner.py       # SSH 部署工具(个人版)
-│   ├── browser-stealth.js     # Playwright 反检测脚本(个人版)
-│   └── seeds/skills/          # 个人版 7 个预置系统 skills
+├── deploy/                    # v5 / v5-selfhost 部署配置与发布清单(详见 deploy/README.md)
 └── docs/archive/              # 历史 audit/refactor plan 归档(详见 docs/archive/README.md)
     ├── AUDIT_REMEDIATION_TASKS_2026-04-11.md
     ├── AUDIT_REMEDIATION_TASKS_2026-04-25.md

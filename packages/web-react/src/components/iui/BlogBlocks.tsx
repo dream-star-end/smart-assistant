@@ -15,7 +15,7 @@ import type { CommunityTutorialMine } from "../../lib/types";
 import { Markdown } from "../Markdown";
 import { type CommunityBlogDraftPayload, chatInteractionUnavailableText, useChatInteraction, useToolCardActions } from "../tool/context";
 import { BlogChips, BlogCover } from "../tutorials/blog/BlogArticle";
-import { blogMineStage, blogReadMinutes, compressBlogImage } from "../tutorials/blog/blogLib";
+import { blogCategoryLabel, blogMineStage, blogReadMinutes, compressBlogImage } from "../tutorials/blog/blogLib";
 import { Button, Modal } from "../ui";
 import {
   type BlogIssue,
@@ -37,8 +37,6 @@ import { type BlogDraftSpec, type BlogPublishedSpec, type BlogStatusSpec, bodyFo
 import { CopyButton, Frame, Media } from "./shell";
 
 type BlockProps<S> = { spec: S; notes: string[]; streaming: boolean; readOnly?: boolean; nested?: boolean };
-
-const CATEGORY_LABEL = { research: "研究", coding: "编程", general: "通用" } as const;
 
 function payloadOf(spec: BlogDraftSpec, body: string): CommunityBlogDraftPayload {
   return { title: spec.title.trim(), summary: spec.summary.trim(), category: spec.category, bodyMarkdown: body.trim() };
@@ -227,7 +225,7 @@ export function BlogDraftBlock({ spec, notes, streaming, readOnly, nested }: Blo
             <dt>标题</dt>
             <dd>{spec.title}</dd>
             <dt>分类</dt>
-            <dd>{CATEGORY_LABEL[spec.category]}</dd>
+            <dd>{blogCategoryLabel(spec.category)}</dd>
             <dt>图片</dt>
             <dd>{images.length > 0 ? `${images.length} 张（投稿时自动压缩上传）` : "无"}</dd>
           </dl>

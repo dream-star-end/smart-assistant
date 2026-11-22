@@ -215,7 +215,7 @@ function buildRuntimeFixture(): {
 
 describe("syntheticEvalOverlay filesystem runtime", () => {
   test("uses the application release only when the runtime release axis resolved", () => {
-    const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+    const source = readFileSync(new URL("../bootstrap/runtimeSupervisorBootstrap.ts", import.meta.url), "utf8");
     assert.match(
       source,
       /expectedBaseCommit:\s*readSyntheticEvalReleaseSourceCommit\(\s*runtimeTuple\?\.releaseResolvedPath\s*\?\s*process\.cwd\(\)\s*:\s*undefined,?\s*\)/,

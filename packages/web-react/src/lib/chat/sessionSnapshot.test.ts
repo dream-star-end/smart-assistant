@@ -950,7 +950,7 @@ describe("INC-20261115-CONTAINER-SWAP-FRAMESEQ: 跨容器游标归零与租约�
     expect(s.messages.some((m) => m.role === "tool" && m.blockId === "blk-1")).toBe(true);
     expect(assistantText(s.messages, lscId)).toBe("已核验在线");
     const userRow = s.messages.find((m) => m.role === "user" && m.id === lscId)!;
-    expect(summarizeSystemCallbackUserTurn(userRow)).toBe("系统回调 · 发布列车已上线");
+    expect(summarizeSystemCallbackUserTurn(userRow)).toBe("发布已上线");
     sock.stop();
   });
 
@@ -1436,5 +1436,436 @@ describe("INC-20261115-CONTAINER-SWAP-FRAMESEQ: 跨容器游标归零与租约�
     expect(s2._lastFrameSeqByKey?.[SK]).toBe(2);
     expect(assistantText(s2.messages)).toBe("a + b");
     sock2.stop();
+  });
+
+  test("OCV5-837: applyLiveUnits binds authoritative resume.streamKey without guessing legacy checkpoints or mixing old high watermarks", () => {
+    const { sock, ws, s } = boot();
+    const swarmUnit = {
+      id: "tool:252:agy-swarm-7474cf40-t7",
+      kind: "tool" as const,
+      seqFirst: 252,
+      seqLast: 2800,
+      recordIdFirst: "100",
+      recordIdLast: "2800",
+      open: true,
+      clientMessageId: CMID,
+      sessionKey: SK,
+      blockId: "agy-swarm-7474cf40-t7",
+      toolName: "SwarmBoard",
+      inputJson: {
+        swarmId: "7474cf40-399d-415c-a951-6713ce671aef",
+        title: "Wave 4",
+        phase: "running",
+        snapshot: {
+          swarmId: "7474cf40-399d-415c-a951-6713ce671aef",
+          title: "Wave 4",
+          phase: "running",
+          revision: 800,
+          updatedAt: 1_700_000_000_000,
+          members: [],
+          channels: [],
+          posts: [],
+          totalPosts: 0,
+        },
+      },
+      payloadRef: { recordId: "2800", streamKey: STREAM, frameSeq: 2800 },
+    };
+
+    // 1) Legacy backend omitting resume.streamKey must NOT guess _snapshotStream from unit payloadRef
+    sock.applyLiveUnits(
+      "s1",
+      [swarmUnit],
+      [CMID],
+      { sessionKey: SK, frameSeq: 900, recordId: "900" },
+      0,
+    );
+    expect(s._lastFrameSeqByKey?.[SK]).toBe(900);
+    expect(s._snapshotStream).toBeUndefined();
+
+    // 2) Authoritative resume.streamKey for a new stream must NOT inherit the unknown old stream's high watermark (900)
+    sock.applyLiveUnits(
+      "s1",
+      [swarmUnit],
+      [CMID],
+      { sessionKey: SK, frameSeq: 12, recordId: "12", streamKey: STREAM },
+      0,
+    );
+    expect(s._lastFrameSeqByKey?.[SK]).toBe(12);
+    expect(s._snapshotStream).toEqual({ streamKey: STREAM, agentId: "main" });
+
+    // 3) Same known stream advances monotonically and background reconnect sends BOTH lastFrameSeq & lastStreamKey
+    sock.applyLiveUnits(
+      "s1",
+      [swarmUnit],
+      [CMID],
+      { sessionKey: SK, frameSeq: 2805, recordId: "2805", streamKey: STREAM },
+      0,
+    );
+    ws.sent.length = 0;
+    ws.onopen?.();
+    const hello = ws.sent.map((raw) => JSON.parse(raw)).find((f) => f.type === "inbound.hello");
+    const peer = hello?.peers?.find((p: { peerId: string }) => p.peerId === "s1");
+    expect(peer?.lastFrameSeq).toBe(2805);
+    expect(peer?.lastStreamKey).toBe(STREAM);
+    sock.stop();
+  });
+
+  test("OCV5-837: degraded cursor_reset rebuild self-heals via matching units, rejects post-completion empty/foreign units, and still merges fetched snapshot frames", async () => {
+    const makeSwarmSnap = (rev: number) => ({
+      swarmId: "7474cf40-399d-415c-a951-6713ce671aef",
+      title: "Wave 4",
+      phase: "running" as const,
+      revision: rev,
+      updatedAt: 1_700_000_000_000 + rev,
+      members: [],
+      channels: [],
+      posts: [],
+      totalPosts: 64,
+    });
+    const swarmUnit = (rev: number, cmid = CMID) => ({
+      id: "tool:252:agy-swarm-7474cf40-t7",
+      kind: "tool" as const,
+      seqFirst: 252,
+      seqLast: 2826,
+      recordIdFirst: "100",
+      recordIdLast: "2826",
+      open: true,
+      clientMessageId: cmid,
+      sessionKey: SK,
+      blockId: "agy-swarm-7474cf40-t7",
+      toolName: "SwarmBoard",
+      inputJson: {
+        swarmId: "7474cf40-399d-415c-a951-6713ce671aef",
+        title: "Wave 4",
+        phase: "running",
+        snapshot: makeSwarmSnap(rev),
+      },
+      payloadRef: { recordId: "2826", streamKey: STREAM, frameSeq: 2826 },
+    });
+
+    // 1) Self-heal via matching open readLiveUnits when snapshot rebuild hits page cap (degraded=true)
+    const readLiveUnits = vi.fn(async () => ({
+      view: "units" as const,
+      units: [swarmUnit(810)],
+      n: 20,
+      hasMoreBefore: true,
+      beforeCursor: "u:1167",
+      streamClientMessageIds: [CMID],
+      openDispatch: true,
+      hasTapeProjection: false,
+      tapeProjectionVersion: 0,
+      reducerEpoch: "4",
+      degraded: false as const,
+      resume: { sessionKey: SK, frameSeq: 2826, recordId: "2826", streamKey: STREAM },
+      streamGeneration: 0,
+    }));
+    const readSessionSnapshot = vi.fn(async () => {
+      throw new Error("network aborted mid-rebuild");
+    });
+    const { sock, ws, s } = boot({ readSessionSnapshot, readLiveUnits });
+    sock.applyLiveUnits("s1", [swarmUnit(700)], [CMID], { sessionKey: SK, frameSeq: 2500, recordId: "2500", streamKey: STREAM }, 0);
+    s._snapshotStream = undefined; // force cursor_reset rebuild path
+
+    pushSnapshot(
+      ws,
+      openSnapshot({
+        frames: [record(1, "early truncated chunk")],
+        lastFrameSeq: 2826,
+        nextAfterSeq: 1,
+        hasMore: true,
+        gap: { reason: "cursor_reset" },
+      }),
+    );
+    await flush();
+    expect(readLiveUnits).toHaveBeenCalledTimes(1);
+    const healedCard = s.messages.find((m) => m.role === "tool" && m.toolName === "SwarmBoard");
+    expect(healedCard?._swarmSnapshot?.revision).toBe(810);
+    expect(s._liveJournalDegraded).toBe(false);
+    expect(s._snapshotStream).toEqual({ streamKey: STREAM, agentId: "main" });
+    sock.stop();
+
+    // 2) BLOCKER 2: turn settled while paging -> readLiveUnits legally returns empty openDispatch:false pack;
+    //    must NEVER wipe existing SwarmBoard (1 -> 0) or clear _liveJournalDegraded
+    const emptySettledUnits = vi.fn(async () => ({
+      view: "units" as const,
+      units: [],
+      n: 20,
+      hasMoreBefore: false,
+      beforeCursor: null,
+      streamClientMessageIds: [],
+      openDispatch: false,
+      hasTapeProjection: true,
+      tapeProjectionVersion: 1,
+      reducerEpoch: "4",
+      degraded: false as const,
+      streamGeneration: 0,
+    }));
+    const { sock: sock2, ws: ws2, s: s2 } = boot({ readSessionSnapshot, readLiveUnits: emptySettledUnits });
+    sock2.applyLiveUnits("s1", [swarmUnit(750)], [CMID], { sessionKey: SK, frameSeq: 2600, recordId: "2600", streamKey: STREAM }, 0);
+    s2._snapshotStream = undefined;
+
+    pushSnapshot(
+      ws2,
+      openSnapshot({
+        frames: [],
+        lastFrameSeq: 2826,
+        nextAfterSeq: 0,
+        hasMore: true,
+        gap: { reason: "cursor_reset" },
+      }),
+    );
+    await flush();
+    expect(emptySettledUnits).toHaveBeenCalledTimes(1);
+    const preservedCard = s2.messages.find((m) => m.role === "tool" && m.toolName === "SwarmBoard");
+    expect(preservedCard?._swarmSnapshot?.revision).toBe(750);
+    expect(s2._liveJournalDegraded).toBe(true);
+    sock2.stop();
+
+    // 3) BLOCKER 3: local session has text row only; fetched snapshot page carries a new SwarmBoard
+    //    above cursor before next page fails & readLiveUnits is unavailable -> must preserve text AND merge SwarmBoard
+    const failingUnits = vi.fn(async () => {
+      throw new Error("units unavailable");
+    });
+    const { sock: sock3, ws: ws3, s: s3 } = boot({ readSessionSnapshot, readLiveUnits: failingUnits });
+    ws3.push(textFrame(10, "existing local text"));
+    await flush();
+    expect(s3.messages.filter((m) => m.toolName === "SwarmBoard")).toHaveLength(0);
+    s3._snapshotStream = undefined;
+
+    const swarmRecord = {
+      recordId: "20",
+      frameSeq: 20,
+      payload: {
+        type: "outbound.message",
+        channel: "webchat",
+        peer: { id: "s1", kind: "dm" },
+        sessionKey: SK,
+        clientMessageId: CMID,
+        frameSeq: 20,
+        isFinal: false,
+        blocks: [{ kind: "swarm_snapshot", blockId: "agy-swarm-7474cf40-t7", snapshot: makeSwarmSnap(20) }],
+        ts: 1_700_000_000_020,
+      },
+    };
+    pushSnapshot(
+      ws3,
+      openSnapshot({
+        frames: [swarmRecord],
+        lastFrameSeq: 30,
+        nextAfterSeq: 20,
+        hasMore: true,
+        gap: { reason: "cursor_reset" },
+      }),
+    );
+    await flush();
+    expect(assistantText(s3.messages)).toContain("existing local text");
+    const mergedCards = s3.messages.filter((m) => m.role === "tool" && m.toolName === "SwarmBoard");
+    expect(mergedCards).toHaveLength(1);
+    expect(mergedCards[0]?._swarmSnapshot?.revision).toBe(20);
+    expect(s3._liveJournalDegraded).toBe(true);
+    sock3.stop();
+
+    // 4) Cross-version rolling safety: legacy units pack omitting resume.streamKey (carrying old stream seq=900)
+    //    must NOT be accepted for a known new stream B; subsequent live frame B:13 must render normally
+    const STREAM_B = "dispatch:d1:2";
+    const legacyCrossStreamUnits = vi.fn(async () => ({
+      view: "units" as const,
+      units: [swarmUnit(700)],
+      n: 20,
+      hasMoreBefore: false,
+      beforeCursor: null,
+      streamClientMessageIds: [CMID],
+      openDispatch: true,
+      hasTapeProjection: false,
+      tapeProjectionVersion: 0,
+      reducerEpoch: "4",
+      degraded: false as const,
+      resume: { sessionKey: SK, frameSeq: 900, recordId: "900" }, // no streamKey!
+      streamGeneration: 1,
+    }));
+    const { sock: sock4, ws: ws4, s: s4 } = boot({ readSessionSnapshot, readLiveUnits: legacyCrossStreamUnits });
+    s4._snapshotStream = { streamKey: STREAM, agentId: "main" };
+    s4._lastFrameSeqByKey = { [SK]: 900 };
+    pushSnapshot(
+      ws4,
+      openSnapshot({
+        streamKey: STREAM_B,
+        frames: [record(12, "stream-B-12")],
+        lastFrameSeq: 12,
+        nextAfterSeq: 12,
+        hasMore: true,
+        gap: { reason: "cursor_reset" },
+      }),
+    );
+    await flush();
+    expect(legacyCrossStreamUnits).toHaveBeenCalledTimes(1);
+    expect(s4._lastFrameSeqByKey?.[SK]).toBe(12);
+    expect(s4._snapshotStream).toEqual({ streamKey: STREAM_B, agentId: "main" });
+    ws4.push(textFrame(13, " + stream-B-13"));
+    await flush();
+    expect(assistantText(s4.messages)).toContain("stream-B-13");
+    sock4.stop();
+  });
+
+  test("P0-1: _liveJournalDegraded auto-clears on live WS frame, non-degraded snapshot, and turn final/tape cutover", async () => {
+    vi.useFakeTimers();
+    const readSessionSnapshot = vi.fn(async () => { throw new Error("page-2 failed"); });
+    const syncSession = vi.fn(async () => false);
+    const { sock, ws, s } = boot({ readSessionSnapshot, syncSession });
+    s._snapshotStream = { streamKey: STREAM, agentId: "main" };
+
+    // 1) Degraded snapshot sets _liveJournalDegraded = true
+    pushSnapshot(
+      ws,
+      openSnapshot({
+        frames: [record(1, "part-1")],
+        lastFrameSeq: 10,
+        nextAfterSeq: 1,
+        hasMore: true,
+        gap: { reason: "cursor_reset" },
+      }),
+    );
+    await flush();
+    expect(s._liveJournalDegraded).toBe(true);
+
+    // 2) Normal live WS frame automatically clears _liveJournalDegraded
+    ws.push(textFrame(2, " + live-2"));
+    await flush();
+    expect(s._liveJournalDegraded).toBe(false);
+
+    // 3) Re-degrade, then non-degraded snapshot clears _liveJournalDegraded via else branch
+    s._liveJournalDegraded = true;
+    pushSnapshot(
+      ws,
+      openSnapshot({
+        frames: [record(3, " + snap-3")],
+        lastFrameSeq: 3,
+        nextAfterSeq: 3,
+        hasMore: false,
+      }),
+    );
+    await flush();
+    expect(s._liveJournalDegraded).toBe(false);
+
+    // 4) Re-degrade, then isFinal clears _liveJournalDegraded
+    s._liveJournalDegraded = true;
+    ws.push({
+      type: "outbound.message",
+      sessionKey: SK,
+      channel: "webchat",
+      peer,
+      clientMessageId: CMID,
+      blocks: [{ kind: "text", text: "done" }],
+      isFinal: true,
+      frameSeq: 4,
+      ts: 1_700_000_000_010,
+    });
+    await flush();
+    expect(s._liveJournalDegraded).toBe(false);
+
+    // 5) Authoritative tape applyServerMessages when idle also clears _liveJournalDegraded
+    s._liveJournalDegraded = true;
+    sock.applyServerMessages(s.id, "main", [
+      { id: CMID, role: "user", text: "hi", ts: 1, _seq: 1 },
+      { id: "srv-a1", role: "assistant", text: "done", ts: 2, _seq: 2, _clientMessageId: CMID },
+    ], true, 2);
+    expect(s._liveJournalDegraded).toBe(false);
+    sock.stop();
+  });
+
+  test("P0-1: hydrateDurableLiveFrameJournal degraded fallback preserves existing local live rows (no resetOwnerIds wipe)", async () => {
+    vi.useFakeTimers();
+    const { sock, ws, s } = boot({});
+    // Local live rows already received over WS for CMID
+    ws.push(textFrame(10, "latest local progress"));
+    await flush();
+    expect(assistantText(s.messages)).toContain("latest local progress");
+
+    // Cold hydrateDurableLiveFrameJournal falls back from view=units to raw frames and aborts on page 2 (degraded=true)
+    const fetchUnits = vi.fn(async () => ({
+      view: "units" as const,
+      degraded: "fallback" as const,
+      units: [],
+      n: 20,
+      hasMoreBefore: false,
+      beforeCursor: null,
+      streamClientMessageIds: [CMID],
+      openDispatch: true,
+      hasTapeProjection: false,
+      tapeProjectionVersion: 0,
+      reducerEpoch: "1",
+      resume: null,
+      streamGeneration: 1,
+    }));
+    const abortErr = Object.assign(new Error("aborted"), { name: "AbortError" });
+    let pageCalls = 0;
+    const fetchPage = vi.fn(async () => {
+      pageCalls += 1;
+      if (pageCalls === 1) {
+        return {
+          frames: [
+            {
+              recordId: "1",
+              streamKey: STREAM,
+              source: "gateway" as const,
+              clientMessageId: CMID,
+              payload: {
+                type: "outbound.message",
+                sessionKey: SK,
+                channel: "webchat",
+                peer,
+                clientMessageId: CMID,
+                blocks: [{ kind: "text", text: "older truncated frame" }],
+                isFinal: false,
+                frameSeq: 1,
+                ts: 1_700_000_000_001,
+              },
+            },
+          ],
+          hasMore: true,
+          nextCursor: "1",
+          streamClientMessageIds: [CMID],
+          hasTapeProjection: false,
+        };
+      }
+      throw abortErr;
+    });
+
+    await sock.hydrateDurableLiveFrameJournal(s.id, fetchPage, async () => {}, fetchUnits);
+    // Local live rows MUST NOT be wiped by degraded raw-frame fallback
+    expect(assistantText(s.messages)).toContain("latest local progress");
+    expect(s._liveJournalDegraded).toBe(true);
+    sock.stop();
+  });
+
+  test("P0-1: degraded journal runs bounded silent background retry and cleans up timer on stop()", async () => {
+    vi.useFakeTimers();
+    const readSessionSnapshot = vi.fn(async () => { throw new Error("page-2 timeout"); });
+    const syncSession = vi.fn(async () => false);
+    const { sock, ws, s } = boot({ readSessionSnapshot, syncSession });
+    s._snapshotStream = { streamKey: STREAM, agentId: "main" };
+
+    pushSnapshot(
+      ws,
+      openSnapshot({
+        frames: [record(1, "p1")],
+        lastFrameSeq: 10,
+        nextAfterSeq: 1,
+        hasMore: true,
+        gap: { reason: "cursor_reset" },
+      }),
+    );
+    await flush();
+    expect(s._liveJournalDegraded).toBe(true);
+    syncSession.mockClear();
+
+    // First backoff tick (5s) triggers silent syncSession
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(syncSession).toHaveBeenCalledTimes(1);
+
+    // Stop cancels remaining backoff timers so no further syncSession fires
+    sock.stop();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(syncSession).toHaveBeenCalledTimes(1);
   });
 });

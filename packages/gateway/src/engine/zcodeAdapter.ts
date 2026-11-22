@@ -1,5 +1,5 @@
 import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
-import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
+import { identityCompatEnvironment, paths, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 /**
  * Experimental community ZCode CLI adapter (zcode.cjs 0.16.9; behaviour notes below were measured on 0.16.3).
  * Not an official standalone CLI. Adapter never reads or logs the Coding Plan
@@ -34,7 +34,15 @@ import { createLogger } from '../logger.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
 import { decideEngineCwd } from '../engineCwd.js'
 import { persistRunContextSnapshot } from '../runContextPersist.js'
-import { buildPromptContext } from '../promptSlots.js'
+import { buildPromptContext, memoryInstructionsFingerprint } from '../promptSlots.js'
+import { prepareBoundedPrompt } from './boundedPrompt.js'
+import {
+  buildResumedEnvelopeInputsKey,
+  clearResumedEnvelopeState,
+  decideResumedEnvelopeElision,
+  resumedEnvelopePreamble,
+  writeResumedEnvelopeState,
+} from './resumedEnvelopeDedup.js'
 import { renderCcbGoalPrompt } from '../goalPrompt.js'
 import { bindRouteTrace } from '../relayTrace.js'
 import {
@@ -129,6 +137,8 @@ interface ZcodeTurnContext {
   relayLastKind: 'reasoning' | 'text' | null
   relayBaseUrl: string | null
   zcodeSessionId: string | null
+  promptInputsKey: string | null
+  elidedPlatformContext: boolean
   contentParts: Map<string, {
     kind: ZcodeContentPart['kind']
     segmentIndex: number
@@ -402,8 +412,17 @@ function suffixPrefixOverlap(existing: string, incoming: string): number {
   return matched
 }
 
-function assembleZcodePrompt(prefix: string, input: string, goal: GoalStateSnapshot | null): string {
+function assembleZcodePrompt(
+  prefix: string,
+  input: string,
+  goal: GoalStateSnapshot | null,
+  opts?: { elidePlatformContext?: boolean },
+): string {
   const goalText = renderCcbGoalPrompt(goal)
+  if (opts?.elidePlatformContext) {
+    const head = [resumedEnvelopePreamble('zcode'), goalText].filter(Boolean).join('\n\n')
+    return `${head}\n\n${input}`
+  }
   const head = [prefix, goalText].filter(Boolean).join('\n\n')
   return head ? `${head}\n\n${input}` : input
 }
@@ -458,7 +477,10 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
   start(): Promise<void> { return Promise.resolve() }
 
   get nativeSessionId(): string | null { return this.nativeId }
-  clearSessionId(): void { this.nativeId = null }
+  clearSessionId(): void {
+    this.nativeId = null
+    clearResumedEnvelopeState(process.env.OPENCLAUDE_HOME?.trim() || paths.home, 'zcode', this.opts.sessionKey)
+  }
   setResumeSessionId(sessionId: string): void { this.nativeId = sessionId }
 
   setModel(model: string | undefined): void { this.currentModel = model }
@@ -528,6 +550,8 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       relayLastKind: null,
       relayBaseUrl: null,
       zcodeSessionId: null,
+      promptInputsKey: null,
+      elidedPlatformContext: false,
       contentParts: new Map(),
       pendingHookRecords: new Map(),
     }
@@ -570,13 +594,11 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     return upstream
   }
 
-  private async composePrompt(
-    params: TurnParams,
+  private async composePlatformContext(
     cwd: string,
     availableMcpTools: string[],
     cwdDecision?: { source: 'project_workspace' | 'session_repo' | 'default'; sessionRepoOverlay: boolean },
-  ): Promise<string> {
-    const input = promptText(params.input)
+  ): Promise<{ prefix: string; inputsKey: string | null; platformBytes: number }> {
     try {
       const platform = await buildPromptContext({
         agentId: this.opts.agentId,
@@ -600,15 +622,37 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
         cwdSource: cwdDecision?.source ?? (this.opts.projectId ? 'project_workspace' : 'default'),
         sessionRepoOverlay: cwdDecision?.sessionRepoOverlay ?? false,
       })
+      const prefix = platform.content || ''
+      const platformBytes = Buffer.byteLength(prefix, 'utf8')
+      const inputsKey = buildResumedEnvelopeInputsKey({
+        engine: 'zcode',
+        preamble: '',
+        agentId: this.opts.agentId,
+        projectId: this.opts.projectId,
+        sessionId: typeof this.opts.sessionId === 'string' ? this.opts.sessionId : undefined,
+        cwd,
+        cwdSource: cwdDecision?.source ?? (this.opts.projectId ? 'project_workspace' : 'default'),
+        sessionRepoOverlay: cwdDecision?.sessionRepoOverlay ?? false,
+        availableMcpTools,
+        identityCompatFingerprint: this.opts.identityCompat?.fingerprint,
+        skillEvalMode: this.opts.skillEvalMode,
+        skillEvalExclude: this.opts.skillEvalExclude,
+        skillEvalDraft: this.opts.skillEvalDraft,
+        intelligentUi: platform.intelligentUi,
+        promptPolicyFingerprint: platform.promptPolicyFingerprint,
+        frozenProjectContext: platform.frozenProjectContext,
+        applied: platform.applied,
+        memoryInstructionsFingerprint: memoryInstructionsFingerprint(this.opts.agentId),
+      })
       log.info('prompt_context_built', {
         sessionKey: this.opts.sessionKey,
         agentId: this.opts.agentId,
         backend: 'zcode',
-        prompt_bytes: Buffer.byteLength(platform.content || '', 'utf8'),
-        prompt_sha256: createHash('sha256').update(platform.content || '', 'utf8').digest('hex').slice(0, 12),
+        prompt_bytes: platformBytes,
+        prompt_sha256: createHash('sha256').update(prefix, 'utf8').digest('hex').slice(0, 12),
         board_project_id: this.opts.runContext?.boardProjectId ?? this.opts.projectId ?? null,
       })
-      return assembleZcodePrompt(platform.content || '', input, this.platformGoal)
+      return { prefix, inputsKey, platformBytes }
     } catch {
       if (this.opts.identityCompat?.assets) throw new Error('COMPAT_CONFIG_CONFLICT: identity prompt assembly failed')
       let persona = ''
@@ -616,7 +660,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
         try { persona = readFileSync(this.opts.persona, 'utf8').trim() } catch { persona = '' }
       }
       void cwd
-      return assembleZcodePrompt(persona, input, this.platformGoal)
+      return { prefix: persona, inputsKey: null, platformBytes: Buffer.byteLength(persona, 'utf8') }
     }
   }
 
@@ -1084,12 +1128,43 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       })
       ctx.artifacts = null
     }
-    const prompt = await this.composePrompt(
-      ctx.params,
+    const composed = await this.composePlatformContext(
       cwd,
       ctx.artifacts?.advertisedMcpTools ?? [],
       cwdDecision,
     )
+    const ocHome = process.env.OPENCLAUDE_HOME?.trim() || paths.home
+    ctx.promptInputsKey = composed.inputsKey
+    const elideDecision = decideResumedEnvelopeElision({
+      openClaudeHome: ocHome,
+      engine: 'zcode',
+      sessionKey: this.opts.sessionKey,
+      requestedResumeId: this.nativeId,
+      inputsKey: composed.inputsKey,
+      forceFull: ctx.staleResumeRetried,
+    })
+    ctx.elidedPlatformContext = Boolean(this.nativeId) && elideDecision.elide
+    log.info('zcode_prompt_context_mode', {
+      sessionKey: this.opts.sessionKey,
+      traceId: ctx.params.traceId,
+      resumeId: this.nativeId,
+      decision: ctx.elidedPlatformContext ? 'elide_resumed' : 'full_inject',
+      reason: elideDecision.reason,
+      savedBytes: ctx.elidedPlatformContext ? composed.platformBytes : 0,
+    })
+    const input = promptText(ctx.params.input)
+    const prompt = await prepareBoundedPrompt({
+      input,
+      serialize: (turnInput) =>
+        assembleZcodePrompt(composed.prefix, turnInput, this.platformGoal, {
+          elidePlatformContext: ctx.elidedPlatformContext,
+        }),
+      maxBytes: ZCODE_MAX_PROMPT_ARG_BYTES,
+      cwd,
+      engine: this.engineId,
+      sessionKey: this.opts.sessionKey,
+      onEvent: (event) => { if (!ctx.terminal) ctx.params.onEvent(event) },
+    })
     const usingWrapper = !process.env.OC_ZCODE_CLI_BIN
     if (usingWrapper && !this.route) {
       throw new Error('ZCODE_RELAY_MISSING: hosted zcode turns require an opaque relay route')
@@ -1292,6 +1367,22 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
         cacheCreationTokens: ctx.lastUsage.cacheWriteTokens,
       },
     })
+    if (
+      !ctx.interrupted &&
+      !ctx.abandoned &&
+      !ctx.elidedPlatformContext &&
+      this.nativeId &&
+      ctx.promptInputsKey
+    ) {
+      writeResumedEnvelopeState(process.env.OPENCLAUDE_HOME?.trim() || paths.home, {
+        v: 1,
+        engine: 'zcode',
+        sessionKey: this.opts.sessionKey,
+        resumeId: this.nativeId,
+        inputsKey: ctx.promptInputsKey,
+        updatedAt: Date.now(),
+      })
+    }
     this.finalize(ctx, false)
   }
 

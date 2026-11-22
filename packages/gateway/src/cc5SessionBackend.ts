@@ -3,6 +3,7 @@ import {
   type RemoteExecutionBackend,
   boxClaudeRunner,
   isCc5ExecutionBackend,
+  isRemoteDriverChildSessionKey,
   isRemoteDriverExecutionBackend,
   parseCodexExecutionBackend,
   parseRemoteDriverExecutionBackend,
@@ -40,18 +41,48 @@ export function cc5SessionBackend(input: {
   }
   if (scope === undefined) return undefined
   // The signed scope is the only authority for a remote lane, whatever engine it selects.
-  if (input.executionAuthority?.source !== 'bridge_signed' ||
-    scope.sessionKey !== input.sessionKey || input.hermeticNoTools || input.delegationDepth ||
-    input.usageAttribution || input.advisorExecutionLock || input.channel && input.channel !== 'webchat'
-  ) throw new Error('CC5_BACKEND_SCOPE_INVALID')
-  if (isCc5ExecutionBackend(scope)) {
-    if (input.engineId !== 'ccb') throw new Error('CC5_BACKEND_SCOPE_INVALID')
-    return scope
+  if (
+    input.executionAuthority?.source !== 'bridge_signed' ||
+    scope.sessionKey !== input.sessionKey ||
+    input.hermeticNoTools ||
+    input.advisorExecutionLock
+  ) {
+    throw new Error('CC5_BACKEND_SCOPE_INVALID')
   }
   if (isRemoteDriverExecutionBackend(scope)) {
     const parsed = parseRemoteDriverExecutionBackend(scope)
     if (parsed.authorityEngine !== input.engineId) throw new Error('CC5_BACKEND_SCOPE_INVALID')
+    const isSignedChild =
+      (input.channel === 'delegate' || input.channel === 'swarm') &&
+      isRemoteDriverChildSessionKey(parsed.sessionKey)
+    if (isSignedChild) {
+      if (
+        input.delegationDepth !== undefined &&
+        (!Number.isSafeInteger(input.delegationDepth) || input.delegationDepth < 1)
+      ) {
+        throw new Error('CC5_BACKEND_SCOPE_INVALID')
+      }
+      return parsed
+    }
+    if (
+      input.delegationDepth ||
+      input.usageAttribution ||
+      (input.channel && input.channel !== 'webchat')
+    ) {
+      throw new Error('CC5_BACKEND_SCOPE_INVALID')
+    }
     return parsed
+  }
+  if (
+    input.delegationDepth ||
+    input.usageAttribution ||
+    (input.channel && input.channel !== 'webchat')
+  ) {
+    throw new Error('CC5_BACKEND_SCOPE_INVALID')
+  }
+  if (isCc5ExecutionBackend(scope)) {
+    if (input.engineId !== 'ccb') throw new Error('CC5_BACKEND_SCOPE_INVALID')
+    return scope
   }
   if ((scope as { kind?: unknown }).kind !== 'codex-app-server-v1' || input.engineId !== 'codex') {
     throw new Error('CC5_BACKEND_SCOPE_INVALID')

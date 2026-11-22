@@ -43,7 +43,9 @@ before(async () => {
       agent_id text,status text,outcome text,attempt_no int,admitted_at timestamptz,accepted_at timestamptz,terminal_at timestamptz,
       agent_container_id bigint DEFAULT NULL);
     CREATE TABLE client_session_live_streams(stream_key text PRIMARY KEY,session_id text,user_id text,
-      client_message_id text,projection_source text,provenance jsonb DEFAULT '{}',created_at timestamptz DEFAULT now());
+      client_message_id text,projection_source text,provenance jsonb DEFAULT '{}',
+      latest_turn_status_json jsonb,latest_turn_usage_json jsonb,
+      latest_turn_status_seq bigint,latest_turn_usage_seq bigint,created_at timestamptz DEFAULT now());
     CREATE TABLE client_session_live_frames(record_id bigserial PRIMARY KEY,stream_key text,frame_seq bigint,
       source text DEFAULT 'gateway',payload bytea,payload_sha256 text DEFAULT repeat('a',64),created_at timestamptz DEFAULT now());
     CREATE TABLE usage_records(user_id bigint,dispatch_id uuid,attempt_no int,created_at timestamptz,turn_key text,parent_turn_key text);
@@ -245,14 +247,38 @@ describe('PG session snapshot transport contract', () => {
     assert.equal(snapshot.recovery?.retryStatus.maxAttempts, undefined)
     assert.equal(snapshot.recovery?.retryStatus.message, '正在自动重试（第 2 次）。')
   })
-  test('unavailable optional recovery query rolls back its savepoint without losing dispatch state', async () => {
-    await db.query('ALTER TABLE turn_recovery_jobs RENAME TO turn_recovery_jobs_unavailable')
-    try {
-      const snapshot = (await readSessionSnapshot(pool, '3', sessionId))!
-      assert.equal(snapshot.recovery, null)
-      assert.equal(snapshot.dispatch?.status, 'accepted')
-      assert.equal(snapshot.turnStatus?.status, 'engine_starting')
-    } finally { await db.query('ALTER TABLE turn_recovery_jobs_unavailable RENAME TO turn_recovery_jobs') }
+  test('hot path omits redundant recovery SAVEPOINT and uses O(1) pointer columns without BYTEA scan', async () => {
+    await db.query(
+      `UPDATE client_session_live_streams
+          SET latest_turn_status_json=$1::jsonb, latest_turn_usage_json=$2::jsonb
+        WHERE stream_key=$3`,
+      [
+        JSON.stringify({ frameSeq: 21, type: 'outbound.turn_status', status: 'working', detail: 'ptr' }),
+        JSON.stringify({ frameSeq: 20, usage: { totalTokens: 42, inputTokens: 30, outputTokens: 12 } }),
+        streamKey,
+      ],
+    )
+    await frame(22, { type: 'outbound.message', blocks: [] })
+    const queries: string[] = []
+    const spyPool = {
+      async connect() {
+        const client = await pool.connect()
+        return {
+          query(sql: string, values?: unknown[]) {
+            queries.push(sql)
+            return client.query(sql, values)
+          },
+          release: () => client.release(),
+        }
+      },
+    } as unknown as Pool
+    const snapshot = (await readSessionSnapshot(spyPool, '3', sessionId))!
+    assert.equal(snapshot.turnStatus?.status, 'working')
+    assert.equal(snapshot.turnStatus?.detail, 'ptr')
+    assert.equal(snapshot.usage?.frameSeq, 20)
+    assert.equal(snapshot.usage?.usage.totalTokens, 42)
+    assert.equal(queries.some((q) => q.includes('session_snapshot_recovery')), false, 'no hot-path recovery SAVEPOINT')
+    assert.equal(queries.some((q) => q.includes('session-snapshot-facts')), false, 'O(1) pointers skip BYTEA scan')
   })
   test('a recovery read timeout never becomes an interrupted parent snapshot', async () => {
     await db.query("UPDATE turn_dispatches SET status='terminal',outcome='interrupted',terminal_at=now()")
@@ -272,9 +298,8 @@ describe('PG session snapshot transport contract', () => {
       },
     } as unknown as Pool
     await assert.rejects(readSessionSnapshot(unavailable, '3', sessionId, { clientMessageId: cmid }), error => error === timeout)
-    assert.deepEqual(queries.slice(-3), [
-      'ROLLBACK TO SAVEPOINT session_snapshot_recovery', 'RELEASE SAVEPOINT session_snapshot_recovery', 'ROLLBACK',
-    ])
+    assert.equal(queries.at(-1), 'ROLLBACK')
+    assert.equal(queries.some((q) => q.includes('session_snapshot_recovery')), false)
   })
   test('HTTP rejects malformed cursors without a backend query', async () => {
     for (const q of ['?afterSeq=-1', '?afterSeq=1.5', '?dispatch=%20', '?streamKey=garbage', '?limit=501']) {

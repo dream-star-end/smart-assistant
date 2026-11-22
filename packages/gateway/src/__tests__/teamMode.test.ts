@@ -8,6 +8,7 @@ import { describe, it } from 'node:test'
 
 import { type LocalCatalogView, parseCatalogResponse } from '../modelCatalogClient.js'
 import {
+  DELIBERATION_PANEL_PREFERENCE,
   REVIEW_DRAFT_MAX_CHARS,
   buildTeamPreamble,
   buildTeamReviewContext,
@@ -98,6 +99,11 @@ describe('pickDeliberationPanel', () => {
       ['deepseek-v4-flash'],
     )
     assert.deepEqual(pickDeliberationPanel(view([]), {}), [])
+  })
+
+  it('DELIBERATION_PANEL_PREFERENCE prefers active glm-5.3 instead of disabled glm-5.3-zai (OCV5-829)', () => {
+    assert.equal((DELIBERATION_PANEL_PREFERENCE as readonly string[]).includes('glm-5.3-zai'), false)
+    assert.equal((DELIBERATION_PANEL_PREFERENCE as readonly string[]).includes('glm-5.3'), true)
   })
 })
 

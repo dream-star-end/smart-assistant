@@ -1,14 +1,13 @@
 /**
- * InspectorPanel —— 详情面板(右侧第三栏,OCV5-370 改版)。
+ * InspectorPanel —— 详情面板(右侧第三栏,OCV5-370 / OCV5-844)。
  *
- * 一个面板三个分区,数据全部来自会话自己的消息(不打后端):
- *   - 步骤:会话里每一次工具调用,按轮分组(最近一轮在上)。点一步进入全文详情
- *     (ToolBodyFullContext=true:diff / 终端输出 / 读文件全文),带「全部步骤」返回、`3 / 9`
- *     计数、上一步 / 下一步(按钮 + 面板内 K/J、←/→)。正在运行的那一轮里停在最新一步时
- *     「跟随中」:新步骤到来自动切过去;翻回旧步骤后给「回到最新」。
- *   - 改动:会话里改过的文件,一个文件一行(改动次数、+/− 行数),点进去按顺序看这份文件的
- *     每一次改动;同会话里对同一文件的再次 Write 按与上次写入的 diff 展示。
+ * 顶栏聚焦高价值交付面，数据全部来自会话自己的消息(不打后端):
+ *   - 产出:会话里按轮汇总的文件/预览/媒体/改动与参考来源。
+ *   - 浏览器:有浏览器操作或云端实时浏览器时出现。
  *   - 计划:会话里最近一份 TodoWrite / plan(只读;没有计划时不出这个分区)。
+ *   - 单步全文下钻(StepDetail):不再作为顶栏常驻「过程」Tab，仅在从工具卡「查看全文」、
+ *     产出改动「查看这一步」或浏览器操作记录「详情」点入具体步骤时按需展示(支持复制、
+ *     >1 MiB 水合、K/J / ←/→ 翻步、运行中跟随最新)，点「返回产出 / 返回浏览器」退出。
  *
  * 布局接入(App.tsx):宽屏(≥1100px)是与 Sidebar | main 并列的内联 <aside>,可拖宽、
  * 宽度与开合记住;更窄的视口不挤三列,复用 Sheet 贴底抽屉呈现同一 InspectorPanelContent。
@@ -16,20 +15,17 @@
  * 数据:消息对象由 ChatSocket 就地 mutate,App 随 version 重渲时面板自然读到最新流式内容。
  * 状态徽标与卡片共用 {@link resolveToolStatus}(T-05):卡片「受阻/未成功」面板就不会是「完成/已结束」。
  */
+import * as RD from "@radix-ui/react-dialog";
 import {
   ArrowDownToLine,
   Check,
   ChevronDown,
   ChevronLeft,
-  ChevronRight,
   ChevronUp,
   Circle,
-  Copy,
-  FileDiff,
-  FilePen,
-  ListChecks,
   LoaderCircle,
-  Route,
+  Maximize2,
+  Minimize2,
   X,
 } from "lucide-react";
 import {
@@ -44,30 +40,40 @@ import {
   useState,
 } from "react";
 import {
+  DETAIL_PANE_WIDTH,
+  InspectorStopTurnContext,
   PANE_TAB_STORAGE_KEY,
+  computeDynamicPaneMaxWidth,
   type DeferredPayloadLoader,
   type PaneRequest,
   type PaneTab,
+  type PrimaryPaneTab,
+  type TargetOutputRequest,
 } from "./chat/inspectorState";
 export {
   DETAIL_PANE_WIDTH,
   PANE_OPEN_STORAGE_KEY,
   PANE_TAB_STORAGE_KEY,
+  computeDynamicPaneMaxWidth,
   paneRequestForSession,
   readDetailPaneOpen,
   writeDetailPaneOpen,
   type DeferredPayloadLoader,
+  type LiveBrowserHandoffRequest,
   type PaneRequest,
   type PaneTab,
+  type PrimaryPaneTab,
+  type TargetOutputRequest,
 } from "./chat/inspectorState";
 import type { ChatMessage } from "../lib/chat/model";
-import { computeStepTimings, formatStepDuration } from "../lib/chat/stepTiming";
+import type { AuthSession } from "../lib/types";
 import { cn } from "../lib/utils";
-import { extractLatestTodos, type TodoItem } from "./chat/PinnedTaskTracker";
+import { extractLatestTodos, type TodoItem } from "./chat/todoExtract";
 import { CopyIconButton, FullToolBody } from "./chat/paneParts";
-import { collectWorkTurns, turnIndexOf } from "./chat/workTurns";
+import { collectWorkTurns, formatStepSummary, turnIndexOf } from "./chat/workTurns";
+import { findTurnIndexForPath } from "./chat/workbench";
 import { isBrowserStepMessage } from "./tool/browserDetect";
-import { collectPaneSteps, type PaneTurn } from "./chat/workPane";
+import { collectPaneSteps } from "./chat/workPane";
 import {
   type DisplayTool,
   type ToolLike,
@@ -81,7 +87,10 @@ import { resolveToolMeta, toolSummary } from "./tool/meta";
 import { parseShellEnvelope } from "./tool/shellEnvelope";
 import { resolveToolStatus } from "./tool/status";
 import { toneTileClass } from "./tool/tone";
-import { Badge, EmptyState, IconButton, Skeleton, Spinner, Tabs, useToast } from "./ui";
+import { Badge, IconButton, Skeleton, Spinner, Tabs } from "./ui";
+import { AtelierIcon } from "./ui/AtelierIcons";
+import { AtelierLazyIcon } from "./ui/AtelierLazyIcons";
+import { WorkbenchSheetContext } from "./chat/WorkbenchBottomBar";
 
 // 产出页(含主产物渲染)只在面板打开且停在产出时才需要:懒加载,不进首屏(first-screen-budget)。
 const OutputsView = lazy(() => import("./chat/OutputsView").then((m) => ({ default: m.OutputsView })));
@@ -239,28 +248,44 @@ function DeferredNotice({ hydrated }: { hydrated: Hydrated }) {
         className="rounded text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
         onClick={hydrated.retry}
       >
-        继续
+        重新加载
       </button>
     </div>
   );
 }
 
-function requestTab(tab: PaneTab | "changes"): PaneTab {
-  return tab === "changes" ? "outputs" : tab;
-}
-
-function readStoredTab(): PaneTab {
-  try {
-    const v = localStorage.getItem(PANE_TAB_STORAGE_KEY);
-    if (v === "steps" || v === "plan" || v === "outputs" || v === "browser") return v;
-  } catch {
-    /* private mode */
-  }
-  // 没记过 / r1 记的「改动」:产出页(改动已并进去)。
+function toPrimaryTab(tab: PaneTab | "changes"): PrimaryPaneTab {
+  if (tab === "plan" || tab === "browser") return tab;
   return "outputs";
 }
 
-function writeStoredTab(tab: PaneTab): void {
+function primaryTabLabel(tab: PrimaryPaneTab): string {
+  switch (tab) {
+    case "browser":
+      return "浏览器";
+    case "plan":
+      return "计划";
+    default:
+      return "产出";
+  }
+}
+
+function readStoredTab(): PrimaryPaneTab {
+  try {
+    const v = localStorage.getItem(PANE_TAB_STORAGE_KEY);
+    if (v === "plan" || v === "outputs" || v === "browser") return v;
+    if (v === "steps") {
+      // OCV5-844: 旧缓存「过程」Tab 静默迁回「产出」
+      localStorage.setItem(PANE_TAB_STORAGE_KEY, "outputs");
+    }
+  } catch {
+    /* private mode */
+  }
+  // 没记过 / 旧版「改动」或「过程」缓存:产出页。
+  return "outputs";
+}
+
+function writeStoredTab(tab: PrimaryPaneTab): void {
   try {
     localStorage.setItem(PANE_TAB_STORAGE_KEY, tab);
   } catch {
@@ -269,34 +294,20 @@ function writeStoredTab(tab: PaneTab): void {
 }
 
 const navButtonClass =
-  "inline-flex min-h-8 items-center gap-1 rounded-md px-2 text-meta text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11";
-
-const rowButtonClass =
-  "flex w-full min-w-0 items-center gap-2.5 px-3 py-1.5 text-left outline-none transition-colors hover:bg-hover/70 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11";
-
-function baseName(path: string): string {
-  const parts = path.replace(/\\/g, "/").split("/").filter(Boolean);
-  return parts.at(-1) ?? path;
-}
-
-function dirName(path: string): string {
-  const norm = path.replace(/\\/g, "/");
-  const i = norm.lastIndexOf("/");
-  return i > 0 ? norm.slice(0, i) : "";
-}
-
+  "oc-btn-tactile oc-spring-press inline-flex min-h-8 items-center gap-1 rounded-md px-2 text-meta font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11";
 
 /** 一步的头部:类型图标 + 标签 + 状态 + 摘要 + 复制全文。 */
 function StepHeader({ message }: { message: ToolLike }) {
   const display = normalizeToolForDisplay(message);
   const meta = resolveToolMeta(display.name, display.input);
   const Icon = meta.icon;
-  const summary = toolSummary(display.name, display.input);
+  const rawSummary = toolSummary(display.name, display.input);
+  const summary = formatStepSummary(display.name, display.input, rawSummary);
   const status = resolveToolStatus(display);
   return (
-    <div className="flex shrink-0 items-center gap-2.5 border-b border-border px-4 py-3">
-      <span className={cn("flex size-7 shrink-0 items-center justify-center rounded-lg", toneTileClass(meta.tone))}>
-        <Icon size={14} />
+    <div className="flex shrink-0 items-center gap-3 border-b border-border bg-gradient-to-b from-hover/35 to-transparent px-4 py-3">
+      <span className={cn("oc-icon-badge size-8 shrink-0 rounded-md", toneTileClass(meta.tone))}>
+        <Icon size={15} strokeWidth={1.75} />
       </span>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
@@ -311,7 +322,7 @@ function StepHeader({ message }: { message: ToolLike }) {
           )}
         </div>
         {summary && (
-          <div className="mt-0.5 truncate font-mono text-xs text-muted" title={summary}>
+          <div className="mt-1 truncate text-caption text-muted" title={rawSummary || summary}>
             {summary}
           </div>
         )}
@@ -328,6 +339,7 @@ function StepDetail({
   total,
   following,
   showLatest,
+  backLabel,
   onBack,
   onPrev,
   onNext,
@@ -339,6 +351,7 @@ function StepDetail({
   total: number;
   following: boolean;
   showLatest: boolean;
+  backLabel: string;
   onBack: () => void;
   onPrev: () => void;
   onNext: () => void;
@@ -349,18 +362,18 @@ function StepDetail({
   const message = hydrated.message;
   return (
     <>
-      <div className="flex shrink-0 items-center gap-1 border-b border-border px-2 py-1" data-testid="pane-stepper">
-        <button type="button" className={navButtonClass} onClick={onBack}>
+      <div className="oc-surface-glass flex shrink-0 items-center gap-1.5 border-b border-border px-2.5 py-1.5" data-testid="pane-stepper">
+        <button type="button" className={navButtonClass} onClick={onBack} data-testid="pane-step-back">
           <ChevronLeft size={14} aria-hidden />
-          全部步骤
+          返回{backLabel}
         </button>
         <span className="flex-1" />
         {following ? (
           <span
             data-testid="pane-following"
-            className="inline-flex items-center gap-1.5 rounded-full bg-accent-soft px-2 py-0.5 text-meta text-accent"
+            className="oc-badge-craft oc-breathe-aura inline-flex items-center gap-1.5 rounded-full bg-accent-soft px-2.5 py-0.5 text-caption font-medium text-accent"
           >
-            <span aria-hidden className="size-1.5 rounded-full bg-accent motion-safe:animate-pulse" />
+            <span aria-hidden className="oc-alive-dot size-1.5 rounded-full bg-accent" />
             跟随中
           </span>
         ) : showLatest ? (
@@ -370,8 +383,8 @@ function StepDetail({
           </button>
         ) : null}
         {inList && (
-          <>
-            <span className="px-1 text-meta tabular-nums text-muted" data-testid="pane-step-counter">
+          <div className="oc-surface-recessed inline-flex items-center gap-0.5 rounded-lg p-0.5">
+            <span className="px-2 text-caption font-medium tabular-nums text-muted" data-testid="pane-step-counter">
               {index + 1} / {total}
             </span>
             <IconButton
@@ -394,7 +407,7 @@ function StepDetail({
             >
               <ChevronDown size={15} />
             </IconButton>
-          </>
+          </div>
         )}
       </div>
       <StepHeader message={message} />
@@ -412,126 +425,6 @@ function StepDetail({
   );
 }
 
-function StepRow({
-  message,
-  active,
-  durationMs,
-  onPick,
-}: {
-  message: ToolLike;
-  active: boolean;
-  /** 与过程时间轴同口径(computeStepTimings):从上一步结束到这一步结束,含模型写这一步的时间。 */
-  durationMs?: number;
-  onPick: () => void;
-}) {
-  const display = normalizeToolForDisplay(message);
-  const meta = resolveToolMeta(display.name, display.input);
-  const Icon = meta.icon;
-  const summary = toolSummary(display.name, display.input);
-  const status = resolveToolStatus(display);
-  const duration = durationMs === undefined ? null : formatStepDuration(durationMs);
-  return (
-    <button
-      type="button"
-      data-testid="pane-step"
-      data-tool-status={status.kind}
-      aria-current={active ? "true" : undefined}
-      className={cn(rowButtonClass, active && "bg-accent-soft/60")}
-      onClick={onPick}
-    >
-      <span className={cn("flex size-6 shrink-0 items-center justify-center rounded-md", toneTileClass(meta.tone))}>
-        <Icon size={13} />
-      </span>
-      <span className="min-w-0 flex-1">
-        <span className="block truncate text-body text-fg">{meta.label}</span>
-        {summary && <span className="block truncate font-mono text-[12px] text-faint">{summary}</span>}
-      </span>
-      <span className="flex shrink-0 items-center text-meta tabular-nums text-faint">
-        {status.isRunning ? (
-          <>
-            <span className="sr-only">{status.label}</span>
-            <Spinner size={13} className="text-accent" />
-          </>
-        ) : status.kind === "done" ? (
-          (duration ?? <span className="sr-only">{status.label}</span>)
-        ) : (
-          <Badge tone={status.tone} size="sm">
-            {status.label}
-          </Badge>
-        )}
-      </span>
-    </button>
-  );
-}
-
-function StepList({
-  turns,
-  total,
-  active,
-  onPick,
-}: {
-  turns: PaneTurn[];
-  total: number;
-  active: ToolLike | null;
-  onPick: (message: ToolLike) => void;
-}) {
-  // 最近一轮默认展开,更早的轮默认收起;用户点过的以用户为准。
-  const [toggled, setToggled] = useState<Record<string, boolean>>({});
-  if (total === 0) {
-    return (
-      <EmptyState
-        icon={Route}
-        title="还没有执行步骤"
-        hint="助手运行命令、读写文件、搜索网页时，每一步都会出现在这里。"
-      />
-    );
-  }
-  const ordered = [...turns].reverse();
-  const newestKey = ordered[0]?.key;
-  return (
-    <div className="min-h-0 flex-1 overflow-y-auto py-1" data-testid="pane-step-list">
-      {ordered.map((turn) => {
-        const open = toggled[turn.key] ?? turn.key === newestKey;
-        const timings = open ? computeStepTimings(turn.rows, { turnStartedAt: turn.startedAt, active: false }) : null;
-        return (
-          <section key={turn.key} data-testid="pane-turn" className="pb-1">
-            <button
-              type="button"
-              aria-expanded={open}
-              className={cn(rowButtonClass, "gap-1.5 py-2")}
-              onClick={() => setToggled((t) => ({ ...t, [turn.key]: !open }))}
-            >
-              <ChevronRight
-                size={14}
-                aria-hidden
-                className={cn("shrink-0 text-faint transition-transform", open && "rotate-90")}
-              />
-              <span className="min-w-0 flex-1 truncate text-body font-medium text-fg" title={turn.title}>
-                {turn.title}
-              </span>
-              <span className="shrink-0 text-meta tabular-nums text-faint">{turn.steps.length} 步</span>
-            </button>
-            {open && (
-              <ol className="pl-3">
-                {turn.steps.map((step) => (
-                  <li key={step.message.id}>
-                    <StepRow
-                      message={step.message}
-                      active={sameMessage(active, step.message)}
-                      durationMs={timings?.get(step.message.id)?.ms}
-                      onPick={() => onPick(step.message)}
-                    />
-                  </li>
-                ))}
-              </ol>
-            )}
-          </section>
-        );
-      })}
-    </div>
-  );
-}
-
 function OutputsFallback() {
   return (
     <div className="space-y-3 px-4 py-4" data-testid="outputs-loading">
@@ -544,28 +437,53 @@ function OutputsFallback() {
 
 function PlanView({ todos }: { todos: TodoItem[] }) {
   const done = todos.filter((t) => t.status === "completed").length;
+  const pct = todos.length > 0 ? Math.round((done / todos.length) * 100) : 0;
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3" data-testid="pane-plan">
-      <p className="mb-2 text-meta text-muted">
-        已完成 {done} / {todos.length}
-      </p>
-      <ol className="space-y-2">
+    <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-3.5" data-testid="pane-plan">
+      <div className="oc-surface-card rounded-xl p-3.5">
+        <div className="mb-2 flex items-center justify-between gap-2 text-meta">
+          <span className="font-medium text-fg">已完成 {done} / {todos.length}</span>
+          <span className="font-mono text-caption font-semibold tabular-nums text-accent">{pct}%</span>
+        </div>
+        <div className="oc-surface-recessed h-1.5 overflow-hidden rounded-full">
+          <div
+            className="h-full rounded-full bg-accent transition-[width] duration-300"
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+      </div>
+      <ol className="oc-surface-card divide-y divide-border/60 overflow-hidden rounded-xl">
         {todos.map((t, i) => {
           const isDone = t.status === "completed";
           const active = t.status === "in_progress";
           return (
             // biome-ignore lint/suspicious/noArrayIndexKey: 计划条目没有稳定 id,同一份列表按位置替换
-            <li key={i} className="flex items-start gap-2 text-body">
-              <span className="mt-0.5 shrink-0">
+            <li
+              key={i}
+              className={cn(
+                "flex items-start gap-2.5 px-3.5 py-2.5 text-body transition-colors",
+                active && "bg-accent-soft/45",
+              )}
+            >
+              <span
+                className={cn(
+                  "mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-sm",
+                  isDone
+                    ? "oc-icon-badge-success"
+                    : active
+                      ? "oc-icon-badge-accent"
+                      : "oc-icon-badge",
+                )}
+              >
                 {isDone ? (
-                  <Check className="size-3.5 text-success" />
+                  <Check className="size-3" strokeWidth={2.5} />
                 ) : active ? (
-                  <LoaderCircle className="size-3.5 animate-spin text-accent" />
+                  <LoaderCircle className="size-3 animate-spin" />
                 ) : (
-                  <Circle className="size-3.5 text-faint" />
+                  <Circle className="size-3 text-faint" />
                 )}
               </span>
-              <span className={cn("min-w-0 break-words", isDone ? "text-faint line-through" : active ? "text-fg" : "text-muted")}>
+              <span className={cn("min-w-0 break-words leading-relaxed", isDone ? "text-faint line-through" : active ? "font-medium text-fg" : "text-muted")}>
                 {active && t.activeForm ? t.activeForm : t.content}
                 <span className="sr-only">{isDone ? "(已完成)" : active ? "(进行中)" : "(待办)"}</span>
               </span>
@@ -577,6 +495,31 @@ function PlanView({ todos }: { todos: TodoItem[] }) {
   );
 }
 
+function filePathFromToolMessage(message: ToolLike | null | undefined): string | undefined {
+  if (!message) return undefined;
+  const { name, input } = normalizeToolForDisplay(message);
+  if (name !== "Write" && name !== "Edit" && name !== "MultiEdit") return undefined;
+  const direct = asStr(input?.file_path) || asStr(input?.path);
+  if (direct) return direct;
+  const firstPatch = asArr(input?.changes).find(
+    (c): c is Record<string, unknown> => !!c && typeof c === "object" && !Array.isArray(c),
+  );
+  return firstPatch ? asStr(firstPatch.path) || undefined : undefined;
+}
+
+function targetOutputFromRequest(req: PaneRequest | null | undefined): TargetOutputRequest | null {
+  if (!req) return null;
+  const path = req.targetPath || (req.tab === "outputs" || req.tab === "changes" ? filePathFromToolMessage(req.message) : undefined);
+  if (!path && !req.manifestSrc && !req.previewUrl) return null;
+  return {
+    path,
+    title: req.targetTitle,
+    manifestSrc: req.manifestSrc,
+    previewUrl: req.previewUrl,
+    nonce: req.nonce,
+  };
+}
+
 /** 面板内容(分区 + 当前视图)。桌面 aside 与窄屏 Sheet 共用。`titleId` 供外层容器 aria-labelledby。 */
 export function InspectorPanelContent({
   messages,
@@ -586,6 +529,13 @@ export function InspectorPanelContent({
   deferredLoader,
   onClose,
   onActiveChange,
+  onAnnotateToComposer,
+  onStopTurn,
+  liveBrowserAgentId,
+  liveBrowserAuth,
+  fullscreen = false,
+  sheet = false,
+  onToggleFullscreen,
   titleId,
 }: {
   messages: readonly ChatMessage[];
@@ -599,42 +549,76 @@ export function InspectorPanelContent({
   onClose: () => void;
   /** 当前在详情里查看的那一步 → 源卡片选中态(T-18)。 */
   onActiveChange?: (message: ToolLike | null) => void;
+  /** 可选：右侧交付物批注精修时，将结构化修改指令直接回填至左侧 Composer 输入框。 */
+  onAnnotateToComposer?: (draft: string) => void;
+  /** 可选：停止当前运行中的助手回合（供云浏览器「暂停助手并接管」使用）。 */
+  onStopTurn?: () => void;
+  /** 可选：云端实时浏览器与人工接管的目标智能体及鉴权会话（OCV5-813）。 */
+  liveBrowserAgentId?: string;
+  liveBrowserAuth?: AuthSession | null;
+  /** 是否处于全屏/影院阅读模式。 */
+  fullscreen?: boolean;
+  /** 是否渲染在移动端/平板端底部 Sheet 中（去掉多余顶部安全区并启用「2-Bar」紧凑阅读器）。 */
+  sheet?: boolean;
+  /** 切换全屏/影院阅读模式。 */
+  onToggleFullscreen?: () => void;
   titleId?: string;
 }) {
-  // 浏览器卡点进来:那一步不在顶层轮里(团队子任务等)就退回步骤详情,不落到一个没有它的「浏览器」页。
-  const resolveTab = (req: PaneRequest): PaneTab | null => {
-    if (!req.tab) return null;
-    if (req.tab === "browser" && req.message && turnIndexOf(collectWorkTurns(messages), req.message as { id?: string }) < 0) {
-      return "steps";
+  // 浏览器卡点进来:那一步不在顶层轮里(团队子任务等)就退回按需单步详情,不落到一个没有它的「浏览器」页。
+  // OCV5-844:「过程」不再是常驻 Tab，带具体 message 的 steps 请求进入 StepDetail 下钻；无 message 则落回「产出」。
+  const resolveRequest = (
+    req: PaneRequest,
+  ): { kind: "step"; message: ToolLike } | { kind: "tab"; tab: PrimaryPaneTab } | null => {
+    if (!req.tab) {
+      return req.targetPath || req.manifestSrc || req.previewUrl ? { kind: "tab", tab: "outputs" } : null;
     }
-    return requestTab(req.tab);
+    if (req.tab === "browser" && req.message && turnIndexOf(collectWorkTurns(messages), req.message as { id?: string }) < 0) {
+      return { kind: "step", message: req.message };
+    }
+    if (req.tab === "steps") {
+      return req.message ? { kind: "step", message: req.message } : { kind: "tab", tab: "outputs" };
+    }
+    return { kind: "tab", tab: toPrimaryTab(req.tab) };
   };
-  const [tab, setTabState] = useState<PaneTab>(() => (request ? resolveTab(request) : null) ?? readStoredTab());
-  const [selected, setSelected] = useState<ToolLike | null>(() =>
-    request && resolveTab(request) === "steps" ? (request.message ?? null) : null,
-  );
+  const [tab, setTabState] = useState<PrimaryPaneTab>(() => {
+    const resolved = request ? resolveRequest(request) : null;
+    return resolved?.kind === "tab" ? resolved.tab : readStoredTab();
+  });
+  const [selected, setSelected] = useState<ToolLike | null>(() => {
+    const resolved = request ? resolveRequest(request) : null;
+    return resolved?.kind === "step" ? resolved.message : null;
+  });
+  const [targetOutput, setTargetOutput] = useState<TargetOutputRequest | null>(() => targetOutputFromRequest(request));
   const fallbackTitleId = useId();
   const headingId = titleId ?? fallbackTitleId;
   const idBase = useId();
 
-  const setTab = (next: PaneTab) => {
+  const setTab = (next: PrimaryPaneTab) => {
     setTabState(next);
     writeStoredTab(next);
+    setSelected(null);
+    setFollow(false);
   };
 
-  const { turns, steps } = collectPaneSteps(messages);
+  const { steps } = collectPaneSteps(messages);
   // biome-ignore lint/correctness/useExhaustiveDependencies: version 是就地 mutate 消息的变更信号
   const workTurns = useMemo(() => collectWorkTurns(messages), [messages, version]);
   const todos = extractLatestTodos(messages, 0);
   const lastTurn = workTurns.length - 1;
   // 产出页看的那一轮:null = 最新一轮(新一轮开始时自动跟过去);翻到旧轮时记它的 key。
-  const turnKeyFor = (message: ToolLike | null | undefined): string | null => {
-    const i = turnIndexOf(workTurns, message as { id?: string } | null | undefined);
+  const turnKeyFor = (message: ToolLike | null | undefined, targetPath?: string): string | null => {
+    const i = message
+      ? turnIndexOf(workTurns, message as { id?: string } | null | undefined)
+      : targetPath
+        ? findTurnIndexForPath(workTurns, targetPath)
+        : -1;
     return i < 0 || i === lastTurn ? null : (workTurns[i]?.key ?? null);
   };
-  const turnScoped = (t: PaneRequest["tab"]) => t !== undefined && (requestTab(t) === "outputs" || t === "browser");
+  const turnScoped = (t: PaneRequest["tab"]) => t !== undefined && (t === "outputs" || t === "changes" || t === "browser");
   const [turnKey, setTurnKey] = useState<string | null>(() =>
-    request && turnScoped(request.tab) ? turnKeyFor(request.message) : null,
+    request && (turnScoped(request.tab) || Boolean(request.targetPath))
+      ? turnKeyFor(request.message, request.targetPath)
+      : null,
   );
   const keyedTurn = turnKey === null ? -1 : workTurns.findIndex((t) => t.key === turnKey);
   const outputsIndex = keyedTurn >= 0 ? keyedTurn : lastTurn;
@@ -644,9 +628,10 @@ export function InspectorPanelContent({
   );
   const latest = steps.at(-1)?.message ?? null;
   // 首次挂载带着请求(面板 / 底部抽屉刚打开)时和后续请求一样:运行中点开最新那张卡就跟随。
-  const [follow, setFollow] = useState(
-    () => !!request && resolveTab(request) === "steps" && !!request.message && running && sameMessage(request.message, latest),
-  );
+  const [follow, setFollow] = useState(() => {
+    const resolved = request ? resolveRequest(request) : null;
+    return resolved?.kind === "step" && running && sameMessage(resolved.message, latest);
+  });
   // 选中按消息 id 记:历史重载 / 同步会用同 id 的新对象替换旧行,按引用记会停在旧正文上。
   // 不在顶层步骤里的消息(团队子任务 / demo)按原对象显示。
   const resolveSelected = (m: ToolLike | null): ToolLike | null => {
@@ -654,8 +639,8 @@ export function InspectorPanelContent({
     const id = idOf(m);
     return (id ? steps.find((s) => s.message.id === id)?.message : undefined) ?? m;
   };
-  // 「步骤」页只覆盖 plan / browser 的回退,tab === "steps" 时 view 必是 steps。
-  const stepShown: ToolLike | null = tab === "steps" ? (follow ? latest : resolveSelected(selected)) : null;
+  // OCV5-844: 按需下钻到单步全文查看器（有具体步骤选中或跟随最新步时生效）。
+  const stepShown: ToolLike | null = follow ? (latest ?? resolveSelected(selected)) : resolveSelected(selected);
 
   // 大记录定位桩没有命令和输出,认不出是浏览器步:换成请求带来的完整消息,或页面缓存里已取到的正文。
   const clicked = request?.message as ChatMessage | undefined;
@@ -731,12 +716,38 @@ export function InspectorPanelContent({
   );
   // 停在「浏览器」页而这一轮的大记录还在补取:先给读取态,不退回产出(取完仍没有浏览器步再退回)。
   const browserPending = tab === "browser" && browserCount === 0 && browserProbing;
+  const liveBrowserAvailable = Boolean(liveBrowserAgentId && liveBrowserAuth);
+  const latestTurnSteps = browserTurns[lastTurn]?.steps;
+  // 只有当前轮真正存在正在执行中的浏览器工具步时，才把实时浏览器标记为「助手操作中」，
+  // 避免普通聊天 / 写代码 / 思考阶段误锁浏览器或误报「助手正在操作浏览器」。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: version 是就地 mutate 消息的变更信号
+  const liveBrowserRunning = useMemo(
+    () =>
+      running &&
+      Boolean(
+        latestTurnSteps?.some(
+          (m) =>
+            isBrowserStepMessage(m) &&
+            resolveToolStatus(normalizeToolForDisplay(m)).kind === "running",
+        ),
+      ),
+    [latestTurnSteps, running, version],
+  );
+  const [consumedHandoffNonce, setConsumedHandoffNonce] = useState<number | null>(null);
+  const liveBrowserHandoff = useMemo(
+    () =>
+      request?.tab === "browser" && request.liveBrowser && request.nonce !== consumedHandoffNonce
+        ? { ...request.liveBrowser, nonce: request.nonce }
+        : null,
+    [request, consumedHandoffNonce],
+  );
 
-  const view: PaneTab =
-    (tab === "plan" && todos.length === 0) || (tab === "browser" && browserCount === 0 && !browserPending)
+  const view: PrimaryPaneTab =
+    (tab === "plan" && todos.length === 0) ||
+    (tab === "browser" && browserCount === 0 && !browserPending && !liveBrowserAvailable)
       ? "outputs"
       : tab;
-  const shown: ToolLike | null = view === "steps" ? stepShown : null;
+  const shown: ToolLike | null = stepShown;
   const index = shown ? steps.findIndex((s) => sameMessage(s.message, shown)) : -1;
   const following = follow && running && !!latest;
 
@@ -745,15 +756,24 @@ export function InspectorPanelContent({
   useEffect(() => {
     if (!request || request.nonce === handledNonce.current) return;
     handledNonce.current = request.nonce;
-    const next = resolveTab(request);
-    if (!next) return;
-    setTabState(next);
-    if (next === "outputs" || next === "browser") setTurnKey(turnKeyFor(request.message));
-    if (next === "browser") setBrowserFocus(idOf(request.message) ?? null);
-    if (next === "steps") {
-      setSelected(request.message ?? null);
+    const resolved = resolveRequest(request);
+    if (!resolved) return;
+    if (resolved.kind === "step") {
+      setSelected(resolved.message);
       // 运行中从最新那张卡点开 = 想看它往下走:直接跟随。
-      setFollow(!!request.message && running && sameMessage(request.message, latest));
+      setFollow(running && sameMessage(resolved.message, latest));
+      return;
+    }
+    setSelected(null);
+    setFollow(false);
+    setTabState(resolved.tab);
+    const nextTarget = targetOutputFromRequest(request);
+    if (resolved.tab === "outputs") {
+      setTargetOutput(nextTarget);
+      setTurnKey(turnKeyFor(request.message, request.targetPath));
+    } else if (resolved.tab === "browser") {
+      setTurnKey(turnKeyFor(request.message));
+      setBrowserFocus(idOf(request.message) ?? null);
     }
   }, [request]);
 
@@ -771,13 +791,12 @@ export function InspectorPanelContent({
     if (target) pick(target);
   };
   const openStep = (message: ToolLike) => {
-    setTab("steps");
     setSelected(message);
     setFollow(false);
   };
 
   const onKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (view !== "steps" || !shown || index < 0) return;
+    if (!shown || index < 0) return;
     if (e.altKey || e.ctrlKey || e.metaKey || e.defaultPrevented) return;
     if (isEditableTarget(e.target)) return;
     const el = e.target instanceof HTMLElement ? e.target : null;
@@ -792,30 +811,91 @@ export function InspectorPanelContent({
     }
   };
 
-  const count = (n: number) => (n > 0 ? <span className="ml-1 tabular-nums text-faint">{n}</span> : null);
+  const subtleCount = (n: number) =>
+    n > 0 ? <span className="ml-1 text-caption font-normal tabular-nums text-faint">{n}</span> : null;
   const tabItems = [
-    { value: "outputs", label: <span>产出</span> },
-    ...(browserCount > 0 || browserPending ? [{ value: "browser", label: <span>浏览器{count(browserCount)}</span> }] : []),
-    { value: "steps", label: <span>步骤{count(steps.length)}</span> },
-    ...(todos.length > 0 ? [{ value: "plan", label: <span>计划</span> }] : []),
+    {
+      value: "outputs",
+      label: (
+        <span className="inline-flex items-center gap-1.5">
+          <AtelierLazyIcon name="deliverables" size={14} />
+          <span>产出</span>
+        </span>
+      ),
+    },
+    ...(browserCount > 0 || browserPending || liveBrowserAvailable
+      ? [
+          {
+            value: "browser",
+            label: (
+              <span className="inline-flex items-center gap-1.5">
+                <AtelierLazyIcon name="browser" size={14} />
+                <span>浏览器{subtleCount(browserCount)}</span>
+              </span>
+            ),
+          },
+        ]
+      : []),
+    ...(todos.length > 0
+      ? [
+          {
+            value: "plan",
+            label: (
+              <span className="inline-flex items-center gap-1.5">
+                <AtelierIcon name="tasks" size={14} />
+                <span>计划</span>
+              </span>
+            ),
+          },
+        ]
+      : []),
   ];
 
   return (
+    <WorkbenchSheetContext.Provider value={sheet}>
+    <InspectorStopTurnContext.Provider value={onStopTurn}>
     <div className="flex min-h-0 flex-1 flex-col bg-surface" onKeyDown={onKeyDown} data-testid="detail-pane">
-      <header className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2 header-safe-t">
+      <header
+        data-testid="pane-header"
+        className={cn(
+          "oc-surface-glass flex min-h-12 shrink-0 items-center gap-1.5 border-b border-border px-3 py-1.5",
+          (!sheet || fullscreen) && "header-safe-t",
+        )}
+      >
         <h2 id={headingId} className="sr-only">
           详情面板
         </h2>
         <div className="min-w-0 flex-1">
           <Tabs
             value={view}
-            onValueChange={(v) => setTab(v as PaneTab)}
+            onValueChange={(v) => setTab(v as PrimaryPaneTab)}
             items={tabItems}
             idBase={idBase}
             aria-label="详情面板分区"
+            className="[&_[role=tab]]:px-2.5 [&_[role=tab]]:py-1 [&_[role=tab]]:text-meta [&_[role=tab]]:transition-all [&_[role=tab]]:duration-150 [@media(hover:none)]:[&_[role=tab]]:min-h-9"
           />
         </div>
-        <IconButton aria-label="关闭详情面板" size="sm" shape="square" data-inspector-close="" onClick={onClose}>
+        {onToggleFullscreen && (
+          <IconButton
+            aria-label={fullscreen ? "退出全屏阅读" : "全屏阅读"}
+            title={fullscreen ? "恢复默认高度 (Esc)" : "全屏沉浸阅读"}
+            size="sm"
+            shape="square"
+            className="oc-spring-press oc-icon-nudge"
+            data-testid="pane-fullscreen-toggle"
+            onClick={onToggleFullscreen}
+          >
+            {fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+          </IconButton>
+        )}
+        <IconButton
+          aria-label="关闭详情面板"
+          size="sm"
+          shape="square"
+          className="oc-spring-press"
+          data-inspector-close=""
+          onClick={onClose}
+        >
           <X size={16} />
         </IconButton>
       </header>
@@ -825,26 +905,23 @@ export function InspectorPanelContent({
         aria-labelledby={`${idBase}-tab-${view}`}
         className="flex min-h-0 flex-1 flex-col"
       >
-        {view === "steps" ? (
-          shown ? (
-            <StepDetail
-              message={shown}
-              loader={deferredLoader}
-              index={index}
-              total={steps.length}
-              following={following}
-              showLatest={!!latest && !sameMessage(shown, latest)}
-              onBack={() => {
-                setSelected(null);
-                setFollow(false);
-              }}
-              onPrev={() => goTo(index - 1)}
-              onNext={() => goTo(index + 1)}
-              onLatest={() => setFollow(true)}
-            />
-          ) : (
-            <StepList turns={turns} total={steps.length} active={selected} onPick={pick} />
-          )
+        {shown ? (
+          <StepDetail
+            message={shown}
+            loader={deferredLoader}
+            index={index}
+            total={steps.length}
+            following={following}
+            showLatest={!!latest && !sameMessage(shown, latest)}
+            backLabel={primaryTabLabel(view)}
+            onBack={() => {
+              setSelected(null);
+              setFollow(false);
+            }}
+            onPrev={() => goTo(index - 1)}
+            onNext={() => goTo(index + 1)}
+            onLatest={() => setFollow(true)}
+          />
         ) : view === "browser" && browserPending ? (
           <div className="flex items-center gap-2 px-4 py-4 text-meta text-muted" data-testid="browser-hydrating">
             <Spinner size={13} className="text-accent" />
@@ -855,19 +932,20 @@ export function InspectorPanelContent({
             <BrowserView
               turns={browserTurns}
               index={outputsIndex}
-              running={running && outputsIndex === lastTurn}
+              running={liveBrowserRunning && outputsIndex === lastTurn}
+              liveRunning={liveBrowserRunning}
               focusId={browserFocus}
               onSelectTurn={(i) => {
                 const t = workTurns[i];
                 if (t) setTurnKey(i === lastTurn ? null : t.key);
                 setBrowserFocus(null);
               }}
-              onOpenSteps={() => {
-                setTab("steps");
-                setSelected(null);
-                setFollow(false);
-              }}
               onOpenStep={openStep}
+              liveBrowserAgentId={liveBrowserAgentId}
+              liveBrowserAuth={liveBrowserAuth}
+              liveHandoff={liveBrowserHandoff}
+              onHandoffSettled={setConsumedHandoffNonce}
+              onAnnotateToComposer={onAnnotateToComposer}
             />
           </Suspense>
         ) : view === "outputs" ? (
@@ -877,16 +955,14 @@ export function InspectorPanelContent({
             turns={workTurns}
             index={outputsIndex}
             running={running && outputsIndex === lastTurn}
+            targetOutput={targetOutput}
             onSelectTurn={(i) => {
               const t = workTurns[i];
               if (t) setTurnKey(i === lastTurn ? null : t.key);
-            }}
-            onOpenSteps={() => {
-              setTab("steps");
-              setSelected(null);
-              setFollow(false);
+              setTargetOutput(null);
             }}
             onOpenStep={openStep}
+            onAnnotateToComposer={onAnnotateToComposer}
           />
           </Suspense>
         ) : (
@@ -894,6 +970,8 @@ export function InspectorPanelContent({
         )}
       </div>
     </div>
+    </InspectorStopTurnContext.Provider>
+    </WorkbenchSheetContext.Provider>
   );
 }
 
@@ -913,7 +991,7 @@ export function InspectorPanel({
   focusNonce,
   onClose,
   ...content
-}: Omit<Parameters<typeof InspectorPanelContent>[0], "titleId"> & {
+}: Omit<Parameters<typeof InspectorPanelContent>[0], "titleId" | "fullscreen" | "onToggleFullscreen"> & {
   width?: number;
   resizing?: boolean;
   widthMin?: number;
@@ -925,17 +1003,34 @@ export function InspectorPanel({
   const asideRef = useRef<HTMLElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
   const titleId = useId();
+  const [fullscreen, setFullscreen] = useState(false);
+  const [viewportWidth, setViewportWidth] = useState(() =>
+    typeof window !== "undefined" ? window.innerWidth : 1440,
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener("resize", onResize, { passive: true });
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  const configuredMax = widthMax ?? DETAIL_PANE_WIDTH.max;
+  const effectiveMax =
+    viewportWidth >= 1024
+      ? Math.min(configuredMax, computeDynamicPaneMaxWidth(viewportWidth))
+      : configuredMax;
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       // Radix 弹层(Dialog/Sheet/Popover)处理过的 Escape 会 preventDefault,不抢。
-      if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (e.key !== "Escape" || e.defaultPrevented || fullscreen) return;
       if (!(e.target instanceof Node) || !asideRef.current?.contains(e.target)) return;
       onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [onClose, fullscreen]);
 
   // 每次从外面点开(换了一步 / 点了顶栏开关)都记下当时的焦点元素并把焦点移进面板;
   // 面板整体卸载时把焦点还给最后那个入口。
@@ -964,36 +1059,94 @@ export function InspectorPanel({
   );
 
   return (
-    <aside
-      ref={asideRef}
-      aria-labelledby={titleId}
-      style={width !== undefined ? { width } : undefined}
-      className={cn(
-        "relative flex min-h-0 max-w-[45vw] shrink-0 flex-col border-l border-border",
-        width === undefined && "w-[clamp(20rem,36vw,34rem)]",
-        resizing && "select-none",
-      )}
-    >
-      {onResizeStart && (
-        <div
-          role="separator"
-          aria-orientation="vertical"
-          aria-label="调整详情面板宽度"
-          aria-valuenow={width}
-          aria-valuemin={widthMin}
-          aria-valuemax={widthMax}
-          title="拖动调整宽度，双击复位默认宽度"
-          tabIndex={onResizeKeyDown ? 0 : undefined}
-          onKeyDown={onResizeKeyDown}
-          onPointerDown={onResizeStart}
-          data-testid="pane-resize-handle"
-          className={cn(
-            "absolute inset-y-0 left-0 z-10 w-1 -translate-x-1/2 cursor-col-resize touch-none outline-none hover:bg-accent/40 focus-visible:bg-accent/60",
-            resizing && "bg-accent/40",
-          )}
-        />
-      )}
-      <InspectorPanelContent {...content} onClose={onClose} titleId={titleId} />
-    </aside>
+    <>
+      <aside
+        ref={asideRef}
+        aria-labelledby={titleId}
+        style={width !== undefined ? { width, maxWidth: effectiveMax } : { maxWidth: effectiveMax }}
+        className={cn(
+          "relative flex min-h-0 max-w-[62vw] shrink-0 flex-col border-l border-border",
+          width === undefined && "w-[clamp(20rem,36vw,34rem)]",
+          resizing && "select-none",
+        )}
+      >
+        {onResizeStart && (
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="调整详情面板宽度"
+            aria-valuenow={width}
+            aria-valuemin={widthMin}
+            aria-valuemax={effectiveMax}
+            title="拖动调整宽度，双击复位默认宽度"
+            tabIndex={onResizeKeyDown ? 0 : undefined}
+            onKeyDown={onResizeKeyDown}
+            onPointerDown={onResizeStart}
+            data-testid="pane-resize-handle"
+            className={cn(
+              "absolute inset-y-0 left-0 z-10 w-1 -translate-x-1/2 cursor-col-resize touch-none outline-none hover:bg-accent/40 focus-visible:bg-accent/60",
+              resizing && "bg-accent/40",
+            )}
+          />
+        )}
+        {fullscreen ? (
+          <div
+            className="flex flex-1 flex-col items-center justify-center bg-bg/40 px-6 text-center"
+            data-testid="pane-fullscreen-docked"
+          >
+            <div className="oc-surface-card flex max-w-xs flex-col items-center gap-3 rounded-2xl px-6 py-7">
+              <span className="oc-icon-badge-accent flex size-11 items-center justify-center rounded-xl">
+                <Maximize2 size={18} strokeWidth={1.75} aria-hidden />
+              </span>
+              <p className="text-meta leading-relaxed text-muted">工作台正在全屏影院阅读模式中打开</p>
+              <button
+                type="button"
+                onClick={() => setFullscreen(false)}
+                className="oc-btn-tactile oc-btn-secondary-craft inline-flex min-h-8 items-center gap-1.5 rounded-lg px-3.5 text-meta font-medium text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+              >
+                <Minimize2 size={13} aria-hidden />
+                恢复到侧栏
+              </button>
+            </div>
+          </div>
+        ) : (
+          <InspectorPanelContent
+            {...content}
+            onClose={onClose}
+            fullscreen={false}
+            onToggleFullscreen={() => setFullscreen(true)}
+            titleId={titleId}
+          />
+        )}
+      </aside>
+
+      <RD.Root open={fullscreen} onOpenChange={setFullscreen}>
+        <RD.Portal>
+          <RD.Overlay
+            className="fixed inset-0 z-[60] bg-bg/75 backdrop-blur-md"
+            data-testid="pane-fullscreen-backdrop"
+          />
+          <RD.Content
+            aria-describedby={undefined}
+            data-testid="pane-fullscreen-dialog"
+            className="oc-surface-popover fixed left-1/2 top-1/2 z-[61] flex h-[92dvh] w-[min(94vw,90rem)] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl outline-none"
+          >
+            <RD.Title className="sr-only">工作台全屏影院阅读</RD.Title>
+            {fullscreen ? (
+              <InspectorPanelContent
+                {...content}
+                onClose={() => {
+                  setFullscreen(false);
+                  onClose();
+                }}
+                fullscreen
+                onToggleFullscreen={() => setFullscreen(false)}
+                titleId={titleId}
+              />
+            ) : null}
+          </RD.Content>
+        </RD.Portal>
+      </RD.Root>
+    </>
   );
 }

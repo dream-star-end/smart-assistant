@@ -28,12 +28,14 @@ import {
   BLOG_IMAGE_MAX_PER_POST,
   BlogImageError,
   type BlogDraft,
+  type BlogDraftField,
   EMPTY_BLOG_DRAFT,
   type TextEdit,
   type ToolbarAction,
   applyToolbar,
   blogClock,
   blogDraftKey,
+  blogDraftMissingItems,
   blogEditDraftKey,
   blogImageShas,
   blogReadMinutes,
@@ -101,6 +103,8 @@ export function BlogEditor({
   const [dragging, setDragging] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [touched, setTouched] = useState<Partial<Record<BlogDraftField, boolean>>>({});
+  const [attemptedSubmit, setAttemptedSubmit] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const draftRef = useRef(draft);
@@ -108,7 +112,13 @@ export function BlogEditor({
   const dirtyRef = useRef(false);
 
   const imageCount = blogImageShas(draft.bodyMarkdown).length + uploads.length;
-  const issue = communityTutorialDraftIssue(draft) ?? (uploads.length > 0 ? "图片还在上传" : null);
+  const missingItems = useMemo(() => blogDraftMissingItems(draft), [draft]);
+  const missingByField = useMemo(
+    () => new Map(missingItems.map((entry) => [entry.field, entry.message])),
+    [missingItems],
+  );
+  const categoryIssue = !BLOG_CATEGORIES.some((c) => c.value === draft.category) ? "请选择文章分类" : null;
+  const issue = communityTutorialDraftIssue(draft) ?? categoryIssue ?? (uploads.length > 0 ? "图片还在上传" : null);
 
   // 每 5 秒把改动存到本机;离开编辑器前再存一次。
   useEffect(() => {
@@ -143,6 +153,10 @@ export function BlogEditor({
     const next = { ...draftRef.current, ...patch };
     draftRef.current = next;
     setDraft(next);
+    if (error) setError(null);
+  };
+  const markTouched = (field: BlogDraftField) => {
+    setTouched((prev) => (prev[field] ? prev : { ...prev, [field]: true }));
   };
   const updateBody = (change: (body: string) => string) => update({ bodyMarkdown: change(draftRef.current.bodyMarkdown) });
 
@@ -232,6 +246,7 @@ export function BlogEditor({
   };
 
   const submit = async () => {
+    setAttemptedSubmit(true);
     if (issue) {
       setError(issue);
       return;
@@ -269,18 +284,29 @@ export function BlogEditor({
   const pendingPercent = useMemo(() => new Map(uploads.map((u) => [u.id, u.percent])), [uploads]);
   const activeUpload = uploads[0] ?? null;
 
+  const titleHint = (touched.title || attemptedSubmit) ? missingByField.get("title") : undefined;
+  const summaryHint = (touched.summary || attemptedSubmit) ? missingByField.get("summary") : undefined;
+  const categoryHint = (touched.category || attemptedSubmit) ? missingByField.get("category") : undefined;
+  const bodyHint = (touched.bodyMarkdown || attemptedSubmit) ? missingByField.get("bodyMarkdown") : undefined;
+  const missingSummary =
+    missingItems.length > 0
+      ? `还需补全：${missingItems.map((entry) => entry.label).join("、")}`
+      : uploads.length > 0
+        ? "等待图片上传完成后即可提交"
+        : null;
+
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex flex-wrap items-center gap-3 border-b border-border bg-surface px-3.5 py-2.5 sm:px-6 sm:py-3.5">
         <button
           type="button"
           onClick={onBack}
-          className="inline-flex items-center gap-1.5 rounded-md text-[13px] text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+          className="inline-flex min-h-11 items-center gap-1.5 rounded-md text-body text-muted outline-none transition-colors hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9"
         >
-          <ArrowLeft size={15} /> 返回
+          <ArrowLeft size={15} aria-hidden /> 返回
         </button>
         {editing && (
-          <span className="inline-flex items-center gap-1.5 text-[13.5px] font-semibold text-fg">
+          <span className="inline-flex items-center gap-1.5 text-section font-semibold text-fg">
             <SquarePen size={15} aria-hidden /> 修改投稿
           </span>
         )}
@@ -288,7 +314,7 @@ export function BlogEditor({
         <div
           role="tablist"
           aria-label="编辑或预览"
-          className="flex rounded-full border border-border bg-hover p-[3px] md:hidden"
+          className="oc-surface-recessed flex rounded-full p-0.5 md:hidden"
         >
           {(["edit", "preview"] as const).map((tab) => (
             <button
@@ -298,7 +324,7 @@ export function BlogEditor({
               aria-selected={mobileTab === tab}
               onClick={() => setMobileTab(tab)}
               className={cn(
-                "rounded-full px-3.5 py-1.5 text-[12.5px] font-semibold",
+                "min-h-9 rounded-full px-3.5 text-meta font-semibold transition-colors",
                 mobileTab === tab ? "bg-surface text-fg shadow-soft" : "text-muted",
               )}
             >
@@ -314,7 +340,7 @@ export function BlogEditor({
       </div>
 
       {editing && (
-        <div className="border-b border-border bg-info-soft px-3.5 py-2 text-[12.5px] leading-[1.6] text-fg sm:px-6" role="note">
+        <div className="border-b border-border bg-info-soft px-3.5 py-2 text-meta leading-relaxed text-fg sm:px-6" role="note">
           {editing.published
             ? "这篇已经公开。提交修改后会重新审核，审核通过前读者看到的仍是原来的版本；没通过也不影响原文。"
             : "提交修改后会重新审核。"}
@@ -337,47 +363,75 @@ export function BlogEditor({
           onDragLeave={() => setDragging(false)}
           onDrop={onDrop}
         >
-          <div className="flex flex-col gap-3 px-4 pb-1.5 pt-4 sm:px-6 sm:pt-5">
-            <textarea
-              aria-label="标题"
-              rows={2}
-              maxLength={100}
-              value={draft.title}
-              onChange={(event) => update({ title: event.target.value.replace(/\n/g, "") })}
-              placeholder="标题：一句话说清你做成了什么"
-              className="resize-none border-0 bg-transparent p-0 text-[20px] font-bold leading-[1.35] text-fg outline-none placeholder:text-faint sm:text-[24px]"
-            />
-            <textarea
-              aria-label="摘要"
-              rows={2}
-              maxLength={280}
-              value={draft.summary}
-              onChange={(event) => update({ summary: event.target.value })}
-              placeholder="摘要：适合谁、能得到什么结果（会显示在卡片上）"
-              className="resize-none rounded-xl border border-border bg-bg px-3 py-2.5 text-[14px] leading-[1.6] text-fg outline-none placeholder:text-faint focus:ring-2 focus:ring-ring"
-            />
-            <div className="-mt-1.5 text-right text-[11.5px] text-faint">摘要 {[...draft.summary].length}/280</div>
-            <fieldset className="m-0 flex min-w-0 items-center gap-1.5 border-0 p-0 text-[12.5px] text-muted" aria-label="分类">
-              分类
-              {BLOG_CATEGORIES.map((option) => (
-                <button
-                  key={option.value}
-                  type="button"
-                  aria-pressed={draft.category === option.value}
-                  onClick={() => update({ category: option.value })}
-                  className={cn(
-                    "inline-flex h-7 items-center rounded-full border px-3.5 text-[13px] font-semibold",
-                    draft.category === option.value
-                      ? "border-primary bg-primary text-primary-fg"
-                      : "border-border bg-surface text-muted hover:text-fg",
-                  )}
-                >
-                  {option.label}
-                </button>
-              ))}
-            </fieldset>
+          <div className="flex flex-col gap-3 px-4 pb-2.5 pt-4 sm:px-6 sm:pt-5">
+            <div>
+              <textarea
+                aria-label="标题"
+                aria-invalid={Boolean(attemptedSubmit && missingByField.has("title"))}
+                rows={2}
+                maxLength={100}
+                value={draft.title}
+                onBlur={() => markTouched("title")}
+                onChange={(event) => update({ title: event.target.value.replace(/\n/g, "") })}
+                placeholder="标题：一句话说清你做成了什么"
+                className="w-full resize-none border-0 bg-transparent p-0 text-xl font-bold leading-snug text-fg outline-none placeholder:text-faint sm:text-2xl"
+              />
+              {titleHint && (
+                <p className={cn("mt-1 text-caption", attemptedSubmit ? "text-danger" : "text-warning")}>
+                  {titleHint}
+                </p>
+              )}
+            </div>
+            <div>
+              <textarea
+                aria-label="摘要"
+                aria-invalid={Boolean(attemptedSubmit && missingByField.has("summary"))}
+                rows={2}
+                maxLength={280}
+                value={draft.summary}
+                onBlur={() => markTouched("summary")}
+                onChange={(event) => update({ summary: event.target.value })}
+                placeholder="摘要：适合谁、能得到什么结果（会显示在卡片上）"
+                className="w-full resize-none rounded-xl border border-border-control bg-bg px-3 py-2.5 text-base leading-relaxed text-fg outline-none transition-colors placeholder:text-faint focus:border-accent focus:ring-2 focus:ring-ring md:text-body"
+              />
+              <div className="mt-1 flex items-center justify-between gap-2 text-caption">
+                <span className={cn(summaryHint ? (attemptedSubmit ? "text-danger" : "text-warning") : "text-faint")}>
+                  {summaryHint ?? "会展示在经验列表卡片上"}
+                </span>
+                <span className="shrink-0 text-faint tabular-nums">摘要 {[...draft.summary].length}/280</span>
+              </div>
+            </div>
+            <div>
+              <fieldset className="m-0 flex min-w-0 flex-wrap items-center gap-1.5 border-0 p-0 text-meta text-muted" aria-label="分类">
+                <span className="mr-1">分类</span>
+                {BLOG_CATEGORIES.map((option) => (
+                  <button
+                    key={option.value}
+                    type="button"
+                    aria-pressed={draft.category === option.value}
+                    onClick={() => {
+                      markTouched("category");
+                      update({ category: option.value });
+                    }}
+                    className={cn(
+                      "inline-flex min-h-11 items-center rounded-full border px-4 text-body font-medium transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8 sm:px-3.5",
+                      draft.category === option.value
+                        ? "border-primary bg-primary text-primary-fg"
+                        : "border-border bg-surface text-muted hover:border-border-strong hover:text-fg",
+                    )}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </fieldset>
+              {categoryHint && (
+                <p className={cn("mt-1 text-caption", attemptedSubmit ? "text-danger" : "text-warning")}>
+                  {categoryHint}
+                </p>
+              )}
+            </div>
           </div>
-          <div className="no-scrollbar sticky top-0 z-[1] flex shrink-0 items-center gap-0.5 overflow-x-auto border-y border-border bg-surface px-2.5 py-2 sm:px-[18px]">
+          <div className="no-scrollbar sticky top-0 z-(--z-sticky) flex shrink-0 items-center gap-0.5 overflow-x-auto border-y border-border bg-surface px-2.5 py-2 sm:px-4">
             {TOOLBAR.map(({ action, label, icon: Icon }) => (
               <button
                 key={action}
@@ -385,18 +439,18 @@ export function BlogEditor({
                 aria-label={label}
                 title={label}
                 onClick={() => applyEdit(applyToolbar(currentEdit(), action))}
-                className="grid size-8 shrink-0 place-items-center rounded-lg text-muted hover:bg-hover hover:text-fg"
+                className="grid size-8 shrink-0 place-items-center rounded-lg text-muted transition-colors hover:bg-hover hover:text-fg"
               >
                 <Icon size={15} />
               </button>
             ))}
-            <span aria-hidden className="mx-1.5 h-[18px] w-px shrink-0 bg-border" />
+            <span aria-hidden className="mx-1.5 h-4 w-px shrink-0 bg-border" />
             <button
               type="button"
               aria-label="插入图片"
               title="插入图片（也可以拖拽或粘贴）"
               onClick={() => fileRef.current?.click()}
-              className="grid size-8 shrink-0 place-items-center rounded-lg bg-hover text-fg"
+              className="grid size-8 shrink-0 place-items-center rounded-lg bg-hover text-fg transition-colors hover:bg-active"
             >
               <ImagePlus size={15} />
             </button>
@@ -411,18 +465,18 @@ export function BlogEditor({
                 event.target.value = "";
               }}
             />
-            <span className="ml-auto flex shrink-0 items-center gap-1.5 whitespace-nowrap pl-2 text-meta text-faint">
+            <span className="ml-auto flex shrink-0 items-center gap-1.5 whitespace-nowrap pl-2 text-meta text-faint tabular-nums">
               <ImageIcon size={14} aria-hidden /> 图片 {imageCount}/{BLOG_IMAGE_MAX_PER_POST}
             </span>
           </div>
-          <div className="relative flex min-h-[320px] flex-1 flex-col px-4 pb-6 pt-3.5 sm:px-6">
+          <div className="relative flex min-h-80 flex-1 flex-col px-4 pb-6 pt-3.5 sm:px-6">
             {activeUpload && (
-              <div className="mb-2 inline-flex max-w-full items-center gap-2 self-start rounded-lg bg-info-soft px-2.5 py-1 text-[12.5px] text-info">
+              <div className="mb-2 inline-flex max-w-full items-center gap-2 self-start rounded-lg bg-info-soft px-2.5 py-1 text-meta text-info">
                 <span className="truncate">
                   正在压缩并上传 {activeUpload.name} · {formatBytes(activeUpload.fromBytes)}
                   {activeUpload.toBytes != null ? ` → ${formatBytes(activeUpload.toBytes)} webp` : ""}
                 </span>
-                <span className="inline-block h-[5px] w-[90px] shrink-0 overflow-hidden rounded-full bg-info/20">
+                <span className="inline-block h-1.5 w-24 shrink-0 overflow-hidden rounded-full bg-info/20">
                   <i className="block h-full bg-info" style={{ width: `${activeUpload.percent}%` }} />
                 </span>
               </div>
@@ -430,17 +484,24 @@ export function BlogEditor({
             <textarea
               ref={textareaRef}
               aria-label="正文（Markdown）"
+              aria-invalid={Boolean(attemptedSubmit && missingByField.has("bodyMarkdown"))}
               value={draft.bodyMarkdown}
               maxLength={50000}
+              onBlur={() => markTouched("bodyMarkdown")}
               onChange={(event) => update({ bodyMarkdown: event.target.value })}
               onPaste={onPaste}
               placeholder={"## 背景\n\n## 做法\n\n## 踩过的坑\n\n图片可以直接拖进来、粘贴，或点工具栏的图片按钮。"}
-              className="min-h-[260px] flex-1 resize-none border-0 bg-transparent p-0 font-mono text-[13px] leading-[1.85] text-fg outline-none placeholder:text-faint sm:text-[13.5px]"
+              className="min-h-64 flex-1 resize-none border-0 bg-transparent p-0 font-mono text-base leading-relaxed text-fg outline-none placeholder:text-faint md:text-body"
             />
+            {bodyHint && (
+              <p className={cn("mt-2 text-caption", attemptedSubmit ? "text-danger" : "text-warning")}>
+                {bodyHint}
+              </p>
+            )}
             {dragging && (
-              <div className="pointer-events-none absolute inset-x-4 bottom-5 flex flex-col items-center justify-center gap-1 rounded-2xl border-[1.5px] border-dashed border-accent bg-accent-soft p-4 text-center text-[13.5px] font-semibold text-accent sm:inset-x-6 sm:flex-row sm:gap-2.5">
-                <ImageDown size={16} /> 松开即可插入图片
-                <small className="font-medium text-muted">
+              <div className="pointer-events-none absolute inset-x-4 bottom-5 flex flex-col items-center justify-center gap-1 rounded-xl border border-dashed border-accent bg-accent-soft p-4 text-center text-section font-semibold text-accent sm:inset-x-6 sm:flex-row sm:gap-2.5">
+                <ImageDown size={16} aria-hidden /> 松开即可插入图片
+                <small className="text-meta font-medium text-muted">
                   支持拖拽 / 粘贴 / 点击，自动压缩为 webp，单张 ≤10MB，最多 20 张
                 </small>
               </div>
@@ -452,17 +513,15 @@ export function BlogEditor({
           aria-label="实时预览"
           className={cn("min-h-0 overflow-y-auto bg-bg", mobileTab === "edit" && "max-md:hidden")}
         >
-          <div className="sticky top-0 z-[1] flex items-center gap-1.5 border-b border-border bg-bg px-6 py-2.5 text-meta text-faint">
+          <div className="sticky top-0 z-(--z-sticky) flex items-center gap-1.5 border-b border-border bg-bg px-6 py-2.5 text-meta text-faint">
             <Eye size={14} aria-hidden /> 实时预览 · 与发布后效果一致
           </div>
           <div className="px-5 pb-10 pt-3.5 sm:px-8">
             <BlogChips category={draft.category} minutes={blogReadMinutes(draft.bodyMarkdown)} approx />
-            <h1 className="my-3 text-[24px] font-bold leading-[1.35] text-fg">{draft.title || "（未填写标题）"}</h1>
-            {draft.summary && <p className="mb-4 text-[15px] leading-[1.7] text-muted">{draft.summary}</p>}
+            <h1 className="my-3 text-xl font-bold leading-snug text-fg sm:text-2xl">{draft.title || "（未填写标题）"}</h1>
+            {draft.summary && <p className="mb-4 text-title leading-relaxed text-muted">{draft.summary}</p>}
             {draft.bodyMarkdown.trim() ? (
-              <div className="[&_.blog-prose_.prose]:text-[15px]">
-                <BlogProse markdown={draft.bodyMarkdown} source={source} pending={pendingPercent} />
-              </div>
+              <BlogProse markdown={draft.bodyMarkdown} source={source} pending={pendingPercent} compact />
             ) : (
               <p className="text-body text-faint">正文写好后会在这里实时预览。</p>
             )}
@@ -471,27 +530,38 @@ export function BlogEditor({
       </div>
 
       <div className="flex flex-wrap items-center gap-2.5 border-t border-border bg-surface px-3.5 py-2.5 sm:px-6 sm:py-3">
-        <span className="flex w-full items-center gap-1.5 text-[12.5px] text-muted sm:w-auto">
-          <ShieldCheck size={14} aria-hidden />
-          {aiReview
-            ? "提交后由 AI 自动审核，通常 1 分钟内出结果；拿不准的会转人工复核"
-            : "提交后由管理员审核，通过后公开"}
-        </span>
-        {error && <Alert tone="danger" className="w-full sm:order-last">{error}</Alert>}
+        <div className="flex w-full flex-col gap-0.5 sm:w-auto">
+          <span className="flex items-center gap-1.5 text-meta text-muted">
+            <ShieldCheck size={14} className="shrink-0" aria-hidden />
+            {aiReview
+              ? "提交后由 AI 自动审核，通常 1 分钟内出结果；拿不准的会转人工复核"
+              : "提交后由管理员审核，通过后公开"}
+          </span>
+          {missingSummary && (
+            <span className="text-caption text-warning" role="status">
+              {missingSummary}
+            </span>
+          )}
+        </div>
+        {error && (
+          <Alert tone="danger" density="compact" className="w-full sm:order-last">
+            {error}
+          </Alert>
+        )}
         <div className="hidden flex-1 sm:block" />
-        <Button variant="ghost" shape="pill" className="text-muted max-sm:flex-1" onClick={saveLocal}>
+        <Button variant="ghost" shape="pill" className="text-muted max-sm:min-h-11 max-sm:flex-1" onClick={saveLocal}>
           存为草稿
         </Button>
         <Button
           variant="accent"
           shape="pill"
-          className="shadow-[0_4px_14px_#5a3fee38] max-sm:flex-1"
+          className="max-sm:min-h-11 max-sm:flex-1"
           loading={submitting}
           aria-disabled={!!issue}
           title={issue ?? undefined}
           onClick={() => void submit()}
         >
-          <Send size={15} /> {editing ? "提交修改" : "提交发布"}
+          <Send size={15} aria-hidden /> {editing ? "提交修改" : "提交发布"}
         </Button>
       </div>
     </div>

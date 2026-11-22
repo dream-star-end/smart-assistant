@@ -5,6 +5,7 @@ import { ApiError, api } from "../lib/api";
 import { reportClientFriction } from "../lib/clientFriction";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import { isLiveUnitsPage } from "../lib/chat/liveUnitsHydrate";
+import { isPermanentJournalError } from "../lib/chat/pure";
 import { ChatSocket, type ChatSnapshot, type DispatchStatus } from "../lib/chat/socket";
 import { DeferredPayloadQueue } from "../lib/chat/deferredPayloadQueue";
 import { parseTapeRecordPayload, type TapePayloadExpectation } from "../lib/chat/tapePayload";
@@ -68,6 +69,8 @@ export type UseChatSocket = {
   /** 快照单调版本号:消息数组是就地 mutation 的同一引用,version 才是变更的权威信号
    *  (autoscroll 等 effect 的依赖必须用它;依赖数组引用恒等则流式期间永不触发)。*/
   version: number;
+  /** 低频壳层元数据版本号：仅在运行态/待拍板/终态/标题/模型/连接态变化时递增，普通文本流式 delta 不递增。 */
+  metaVersion?: number;
   /** 取某会话当前消息快照（就地 mutation 的数组，随 version 变更触发重渲）。*/
   getMessages: (sessId: string | undefined) => ChatMessage[];
   getSession: (sessId: string | undefined) => ChatSession | undefined;
@@ -85,6 +88,7 @@ export type UseChatSocket = {
   setSessionModel: (sessId: string, modelId: string, modelSwitchId?: string) => void;
   prepareModelSwitch: (sessId: string, sourceModel: string, targetModel: string) => Promise<string>;
   cancelPendingModelSwitches: (sessId: string) => void;
+  compactSession: (sessId: string, instructions?: string) => Promise<import("../lib/chat/frames").OutboundSessionCompactResultWire>;
   /** 切换会话 agent（§11 跨 agent 污染守卫的写入点）。*/
   switchAgent: (sessId: string, agentId: string) => void;
   send: (p: {
@@ -99,6 +103,7 @@ export type UseChatSocket = {
     model?: string;
     effortLevel?: InboundMessage["effortLevel"];
     teamMode?: boolean;
+    swarmMode?: boolean;
     collabMode?: "solo" | "advisor" | "team";
     advisorModel?: string;
     collabConfigVersion?: string;
@@ -184,8 +189,6 @@ export type UseChatSocket = {
     applyTapeProjection: () => Promise<void>,
     fetchUnits?: (query?: { before?: string | null }) => Promise<unknown>,
   ) => Promise<void>;
-  /** Re-run background journal hydrate after a page/time-cap degrade. */
-  retryLiveJournalHydration: (sessId: string) => Promise<void>;
   /** server 增量游标（getSession 的 sinceSeq；无则 0=全量）。*/
   storedMaxSeq: (sessId: string | undefined) => number;
   /** History revision paired with storedMaxSeq; absent forces a full fallback. */
@@ -363,6 +366,10 @@ export function useChatSocket(opts: {
         const { limit, ...snapshot } = query;
         return (await api.getSessionLiveFrames(a, sessId, "0", limit ?? 200, { snapshot })).snapshot;
       },
+      readLiveUnits: (sessId) => {
+        const a = authRef.current;
+        return a ? api.getSessionLiveUnits(a, sessId, { n: 20 }) : Promise.reject(new Error("signed out"));
+      },
       readLiveFramePayload: (sessId, ref) => {
         const a = authRef.current;
         return a ? api.getLiveFramePayload(a, sessId, ref) : Promise.reject(new Error("signed out"));
@@ -531,7 +538,8 @@ export function useChatSocket(opts: {
           if (!isCurrent()) return false;
           persistRef.current(sessId); // server-wins 合并后落地新 tape + 游标
           return true;
-        } catch {
+        } catch (err) {
+          if (isPermanentJournalError(err)) context?.onPermanentError?.();
           /* sync 失败：保留现状，下次重连/前台再试 */
           return false;
         }
@@ -613,6 +621,7 @@ export function useChatSocket(opts: {
     const stored = socket.toStored(sessId);
     if (!stored) return;
     sigRef.current.set(sessId, persistSignature(stored));
+    socket.markPersisted(sessId);
     void store.putSession(stored);
   };
   // 生命周期：enabled 时 start（绑事件）；卸载/禁用时 stop（解绑 + 关 ws）。
@@ -684,7 +693,11 @@ export function useChatSocket(opts: {
       .getAllForHydration()
       .then((all) => {
         if (cancelled) return;
-        for (const stored of all) socket.loadStored(stored);
+        for (const stored of all) {
+          socket.loadStored(stored);
+          sigRef.current.set(stored.id, persistSignature(stored));
+          socket.markPersisted(stored.id);
+        }
         onHydratedRef.current?.(all);
       })
       .catch(() => {
@@ -731,12 +744,14 @@ export function useChatSocket(opts: {
     };
   }, [enabled, userId, socket]);
 
-  // 流式期尾沿 debounce 落盘（高频 delta 不每帧写 IDB）；签名去重避免无谓写。
+  // 流式期尾沿 debounce 增量落盘：仅对本窗口内变更过的 dirtyPersistIds 执行 toStored + putSession，
+  // 不再全量遍历所有缓存会话；签名二次去重避免无谓 IDB 写。
   useEffect(() => {
     const store = storeRef.current;
     if (!store) return;
     const t = setTimeout(() => {
-      for (const [id] of socket.sessions) {
+      const dirtyIds = socket.consumeDirtyPersistIds();
+      for (const id of dirtyIds) {
         const stored = socket.toStored(id);
         if (!stored) continue;
         const sig = persistSignature(stored);
@@ -805,6 +820,10 @@ export function useChatSocket(opts: {
   );
   const cancelPendingModelSwitches = useCallback(
     (sessId: string) => socket.cancelPendingModelSwitches(sessId),
+    [socket],
+  );
+  const compactSession = useCallback(
+    (sessId: string, instructions?: string) => socket.compactSession(sessId, instructions),
     [socket],
   );
   const switchAgent = useCallback((sessId: string, agentId: string) => socket.switchAgent(sessId, agentId), [socket]);
@@ -878,43 +897,6 @@ export function useChatSocket(opts: {
   const hydrateDurableLiveFrameJournal = useCallback<UseChatSocket["hydrateDurableLiveFrameJournal"]>(
     (sessId, fetchPage, applyTapeProjection, fetchUnits) =>
       socket.hydrateDurableLiveFrameJournal(sessId, fetchPage, applyTapeProjection, fetchUnits),
-    [socket],
-  );
-  const retryLiveJournalHydration = useCallback<UseChatSocket["retryLiveJournalHydration"]>(
-    async (sessId) => {
-      const a = authRef.current;
-      const live = socketRef.current;
-      if (!a || !live) return;
-      const sess = live.sessions.get(sessId);
-      if (sess) sess._liveJournalDegraded = false;
-      await live.hydrateDurableLiveFrameJournal(
-        sessId,
-        (after) => api.getSessionLiveFrames(a, sessId, after, 500),
-        async () => {
-          const tapeDetail = await api.getSession(a, sessId, 0);
-          live.applyServerMessages(
-            sessId,
-            tapeDetail.agentId || sess?.agentId || "main",
-            Array.isArray(tapeDetail.messages) ? tapeDetail.messages as ChatMessage[] : [],
-            !tapeDetail.isPartial,
-            tapeDetail.maxSeq,
-            {
-              archivedThroughSeq: tapeDetail.archivedThroughSeq,
-              archivedCount: tapeDetail.archivedCount,
-              serverUpdatedAt: tapeDetail.updatedAt,
-              historyRevision: tapeDetail.historyRevision,
-              timelineGeneration: tapeDetail.timelineGeneration,
-              timelineCursor: tapeDetail.timelineCursor,
-              timelineHasMore: tapeDetail.timelineHasMore,
-              timelineSnapshotMaxSeq: tapeDetail.timelineSnapshotMaxSeq,
-              automaticRecoveries: tapeDetail.automaticRecoveries,
-              invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
-            },
-          );
-        },
-        (query) => api.getSessionLiveUnits(a, sessId, { n: 20, ...query }),
-      );
-    },
     [socket],
   );
   // 统一时间线点击加载并发闸。同一页只能由显式按钮触发一次；滚动与重渲染
@@ -1181,6 +1163,7 @@ export function useChatSocket(opts: {
       provisioning: snap.provisioning,
       browserOnline: snap.browserOnline,
       version: snap.version,
+      metaVersion: snap.metaVersion,
       getMessages,
       getSession,
       isSending,
@@ -1192,6 +1175,7 @@ export function useChatSocket(opts: {
       setSessionModel,
       prepareModelSwitch,
       cancelPendingModelSwitches,
+      compactSession,
       switchAgent,
       send,
       stop,
@@ -1208,7 +1192,6 @@ export function useChatSocket(opts: {
       applyDurableLiveFrames,
       runDurableLiveFrameHydration,
       hydrateDurableLiveFrameJournal,
-      retryLiveJournalHydration,
       storedMaxSeq,
       storedHistoryRevision,
       loadOlderHistory,
@@ -1236,6 +1219,7 @@ export function useChatSocket(opts: {
       setSessionModel,
       prepareModelSwitch,
       cancelPendingModelSwitches,
+      compactSession,
       switchAgent,
       send,
       stop,
@@ -1252,7 +1236,6 @@ export function useChatSocket(opts: {
       applyDurableLiveFrames,
       runDurableLiveFrameHydration,
       hydrateDurableLiveFrameJournal,
-      retryLiveJournalHydration,
       storedMaxSeq,
       storedHistoryRevision,
       loadOlderHistory,

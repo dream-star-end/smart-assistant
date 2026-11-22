@@ -45,3 +45,14 @@ export function taskboardContainerEnv(opts: TaskboardEnvOpts = {}): string[] {
   }
   return [];
 }
+
+/**
+ * Master 侧统一任务面板启用判定(与容器注入 `taskboardContainerEnv` 共享同一套决策):
+ *   - `OC_TASKBOARD_ENABLED=0` → false
+ *   - `OC_TASKBOARD_ENABLED=1` → true
+ *   - `flavor.manifest` 为 `commercial` 或身份判定失败(`FlavorIdentityError`) → false(fail-closed)
+ *   - selfhost / 无 manifest(dev、测试) → true
+ */
+export function isMasterTaskboardEnabled(opts: TaskboardEnvOpts = {}): boolean {
+  return !taskboardContainerEnv(opts).includes(`${TASKBOARD_ENABLED_ENV}=0`);
+}

@@ -15,6 +15,8 @@
 set -Eeuo pipefail
 
 ACTION="drain"
+SLOT=""
+SOCK_EXPLICIT=0
 SOCK="${OC_REMOTE_V4_DRAIN_SOCKET:-/run/openclaude-v5-selfhost/remote-v4-drain.sock}"
 TIMEOUT_MS="${OC_REMOTE_V4_DRAIN_TIMEOUT_MS:-600000}"
 POLL_MS="${OC_REMOTE_V4_DRAIN_POLL_MS:-100}"
@@ -26,7 +28,8 @@ while (( $# > 0 )); do
     --drain) ACTION="drain"; shift ;;
     --reopen) ACTION="reopen"; shift ;;
     --status) ACTION="status"; shift ;;
-    --socket) SOCK="${2:?missing --socket value}"; shift 2 ;;
+    --slot) SLOT="${2:?missing --slot value}"; shift 2 ;;
+    --socket) SOCK="${2:?missing --socket value}"; SOCK_EXPLICIT=1; shift 2 ;;
     --timeout-ms) TIMEOUT_MS="${2:?missing --timeout-ms value}"; shift 2 ;;
     --poll-ms) POLL_MS="${2:?missing --poll-ms value}"; shift 2 ;;
     --release-run-id) RUN_ID="${2:?missing --release-run-id value}"; shift 2 ;;
@@ -34,6 +37,13 @@ while (( $# > 0 )); do
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+if [[ -n "$SLOT" ]]; then
+  [[ "$SLOT" == "A" || "$SLOT" == "B" ]] || { echo "Invalid --slot '$SLOT' (must be A or B)" >&2; exit 2; }
+  if [[ "$SOCK_EXPLICIT" == 0 ]]; then
+    SOCK="/run/openclaude-v5-selfhost/remote-v4-drain-${SLOT}.sock"
+  fi
+fi
 
 exec /usr/bin/python3 -I -B - "$ACTION" "$SOCK" "$TIMEOUT_MS" "$POLL_MS" "$RUN_ID" "$KEEP_CLOSED" <<'PY'
 import http.client

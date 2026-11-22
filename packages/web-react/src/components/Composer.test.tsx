@@ -2,7 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { BRAND } from "../lib/brand";
-import { Composer, ENV_PREP_EXPECTED_MS } from "./Composer";
+import { Composer, ENV_PREP_EXPECTED_MS, SWARM_PLACEHOLDER } from "./Composer";
 import { ToastProvider } from "./ui";
 
 afterEach(cleanup);
@@ -35,14 +35,57 @@ describe("Composer 两行式布局", () => {
     }
     // 工具行在输入行之后(视觉上位于下方)。
     expect(inputRow.compareDocumentPosition(toolRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    // 仓库入口:sm+ 在工具行(hidden sm:flex),<sm 在外壳下方底栏(sm:hidden)—— 390px 生成中 5 个 44px 按钮
-    // 加不可截断的未绑定 pill 会撑爆一行。
-    const pills = screen.getAllByRole("button", { name: "关联 GitHub 仓库" });
-    expect(pills).toHaveLength(2);
+    // 已彻底消灭 <640px 独立底部悬浮废行 composer-repo-slot-mobile。
+    expect(screen.queryByTestId("composer-repo-slot-mobile")).toBeNull();
+    // 未绑定仓库且无项目时：顶部微上下文条不占位；桌面 sm+ 工具行保留无框轻量入口，移动端收敛进「+」菜单。
+    expect(screen.queryByTestId("composer-context-bar")).toBeNull();
+    expect(screen.getAllByRole("button", { name: "关联 GitHub 仓库" })).toHaveLength(1);
     expect(screen.getByTestId("composer-repo-slot")).toHaveClass("hidden", "sm:flex");
     expect(toolRow).toContainElement(screen.getByTestId("composer-repo-slot"));
-    expect(screen.getByTestId("composer-repo-slot-mobile")).toHaveClass("sm:hidden");
-    expect(toolRow).not.toContainElement(screen.getByTestId("composer-repo-slot-mobile"));
+    // 守住 <768px 16px (text-base) 防 iOS 缩放红线。
+    expect(textarea).toHaveClass("text-base", "md:text-sm");
+  });
+
+  test("已绑定仓库或项目时在卡片顶部微上下文条展示紧凑 chips，且未绑定仓库可通过「+」菜单触发", () => {
+    const onOpenRepo = vi.fn();
+    const { rerender } = render(
+      <Composer
+        onSend={() => {}}
+        onOpenRepo={onOpenRepo}
+        onSetGoal={vi.fn()}
+        onGoalAction={vi.fn()}
+      />,
+    );
+    const plusBtn = screen.getByRole("button", { name: "更多选项" });
+    fireEvent.pointerDown(plusBtn, { button: 0, pointerType: "mouse" });
+    fireEvent.click(plusBtn);
+    const menuRepo = screen.getByTestId("composer-menu-repo");
+    expect(menuRepo).toHaveTextContent("关联 GitHub 仓库");
+    fireEvent.click(menuRepo);
+    expect(onOpenRepo).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <Composer
+        onSend={() => {}}
+        onOpenRepo={onOpenRepo}
+        repoSelection={{
+          selected: true,
+          owner: "acme",
+          repo: "openclaude",
+          branch: "main",
+          status: "ready",
+          selection_version: 1,
+        }}
+        projectSlot={<span data-testid="fake-project">项目 A</span>}
+      />,
+    );
+    const contextBar = screen.getByTestId("composer-context-bar");
+    const shell = screen.getByTestId("composer-shell");
+    expect(shell).toContainElement(contextBar);
+    expect(contextBar).toContainElement(screen.getByTestId("fake-project"));
+    expect(contextBar).toContainElement(screen.getByTestId("composer-repo-slot"));
+    expect(screen.getByTestId("composer-tool-row")).not.toContainElement(screen.getByTestId("composer-repo-slot"));
+    expect(screen.queryByTestId("composer-repo-slot-mobile")).toBeNull();
   });
 
   test("品牌名来自 lib/brand,不写死(M-16)", () => {
@@ -114,14 +157,12 @@ describe("Composer 语音不可用原因", () => {
 });
 
 describe("Composer 控件边框 token", () => {
-  test("外壳非聚焦用 border-border-control，聚焦用 border-border-strong，不用分隔线 border-border", () => {
+  test("外壳使用悬浮输入坞工艺类 oc-composer-dock，不用浮层 --shadow-float 或分隔线 border-border", () => {
     render(<Composer onSend={() => {}} />);
-    // OCV5-295:用稳定 testid 取外壳,不再拿圆角类当选择器;外壳改轻阴影,不再用浮层 --shadow-float。
+    // OCV5-822:外壳收敛为共享材质类 oc-composer-dock（内含双层景深、发丝高光与 focus-within 暖光晕）。
     const shell = screen.getByTestId("composer-shell");
-    expect(shell.className).toContain("shadow-[var(--shadow-soft)]");
+    expect(shell.className).toContain("oc-composer-dock");
     expect(shell.className).not.toContain("--shadow-float");
-    expect(shell?.className).toContain("border-border-control");
-    expect(shell?.className).toContain("focus-within:border-border-strong");
     expect(shell?.className).not.toMatch(/(?:^|\s)border-border(?:\s|$)/);
   });
 });
@@ -151,7 +192,7 @@ describe("Composer environment preparing", () => {
     expect(bar).toHaveAttribute("data-overdue", "true");
     expect(bar).toHaveTextContent("仍在准备环境，请稍候…");
     expect(bar).not.toHaveTextContent("约 20 秒");
-    expect(bar.querySelector(".animate-pulse")).not.toBeNull();
+    expect(bar.querySelector(".oc-indeterminate-bar")).not.toBeNull();
   });
 });
 
@@ -348,5 +389,107 @@ describe("Composer goalOpenRequest", () => {
     );
     expect(await screen.findByPlaceholderText("这次会话要达成什么？")).toBeInTheDocument();
     expect(screen.getByText("会话目标")).toBeInTheDocument();
+  });
+});
+
+describe("OCV5-817 Composer prefill append / slash menu / stopping indicator", () => {
+  test("prefill.mode === 'append' 保留现有草稿并以空行追加，不静默覆盖", () => {
+    const { rerender } = render(<Composer onSend={() => {}} />);
+    const textarea = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "我已写的草稿" } });
+    rerender(
+      <Composer
+        onSend={() => {}}
+        prefill={{ text: "> 引用的要点", nonce: 1, mode: "append" }}
+      />,
+    );
+    expect(textarea.value).toBe("我已写的草稿\n\n> 引用的要点");
+  });
+
+  test("行首输入 / 弹出 Slash 命令补全菜单，回车补全 /btw", () => {
+    render(<Composer onSend={() => {}} onQuickAskCommand={vi.fn()} />);
+    const textarea = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "/b" } });
+    expect(screen.getByTestId("composer-slash-menu")).toBeInTheDocument();
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(textarea.value).toBe("/btw ");
+  });
+
+  test("stopping 为 true 时展示可见的「正在停止…」状态提示", () => {
+    render(<Composer onSend={() => {}} busy stopping onStop={vi.fn()} />);
+    expect(screen.getByTestId("composer-stopping-status")).toHaveTextContent("正在停止");
+  });
+});
+
+describe("OCV5-831 Composer 蜂群占位符单行化与视觉重心", () => {
+  test("swarmMode 开启时展示紧凑单行占位文案，未开启时回落默认品牌文案", () => {
+    const { rerender } = render(<Composer onSend={() => {}} swarmSupported swarmMode />);
+    const ta = screen.getByLabelText("消息输入框");
+    expect(ta).toHaveAttribute("placeholder", SWARM_PLACEHOLDER);
+    expect(SWARM_PLACEHOLDER.length).toBeLessThanOrEqual(22);
+
+    rerender(<Composer onSend={() => {}} swarmSupported swarmMode={false} />);
+    expect(ta).toHaveAttribute("placeholder", `给${BRAND.name}发消息…`);
+  });
+
+  test("OCV5-843: 底栏移除独立蜂群胶囊与桌面剧本按钮，保留外壳柔光与发送键高光工艺类", () => {
+    const { rerender } = render(
+      <Composer onSend={() => {}} swarmSupported swarmMode={false} onToggleSwarmMode={vi.fn()} />,
+    );
+    expect(screen.queryByTestId("composer-swarm-toggle")).toBeNull();
+    expect(screen.queryByTestId("composer-swarm-playbooks")).toBeNull();
+    const shell = screen.getByTestId("composer-shell");
+    expect(shell).not.toHaveAttribute("data-swarm");
+
+    const ta = screen.getByLabelText("消息输入框");
+    fireEvent.change(ta, { target: { value: "写一个计划" } });
+    expect(screen.getByRole("button", { name: "发送" })).toHaveClass(
+      "oc-btn-primary-craft",
+      "oc-shimmer-sheen",
+      "oc-spring-press",
+      "oc-icon-nudge",
+      "text-primary-fg",
+    );
+
+    rerender(<Composer onSend={() => {}} swarmSupported swarmMode onToggleSwarmMode={vi.fn()} />);
+    expect(shell).toHaveAttribute("data-swarm", "true");
+    expect(screen.queryByTestId("composer-swarm-toggle")).toBeNull();
+    expect(screen.getByRole("button", { name: "发送" })).toHaveClass(
+      "oc-btn-accent-craft",
+      "oc-shimmer-sheen",
+      "text-accent-fg",
+    );
+
+    rerender(<Composer onSend={() => {}} busy onStop={vi.fn()} swarmSupported swarmMode onToggleSwarmMode={vi.fn()} />);
+    expect(screen.getByRole("button", { name: "停止" })).toHaveClass("oc-btn-primary-craft", "text-primary-fg");
+  });
+
+  test("OCV5-838 / OCV5-843: 状态提示收敛至输入区上方轻提示条、桌面与移动统一在「+」菜单提供剧本模板、textarea 软键盘高度上限与 16px 守卫", () => {
+    render(
+      <Composer
+        onSend={() => {}}
+        busy
+        stopping
+        onStop={vi.fn()}
+        swarmSupported
+        swarmMode
+        onToggleSwarmMode={vi.fn()}
+      />,
+    );
+    const ta = screen.getByLabelText("消息输入框");
+    expect(ta.className).toContain("max-h-[min(140px,28dvh)]");
+    expect(ta.className).toContain("sm:max-h-[240px]");
+    expect(ta).toHaveClass("text-base", "md:text-sm");
+
+    const statusStrip = screen.getByTestId("composer-status-strip");
+    expect(statusStrip).toContainElement(screen.getByTestId("composer-stopping-status"));
+    expect(screen.getByTestId("composer-tool-row")).not.toContainElement(screen.getByTestId("composer-stopping-status"));
+
+    const plusBtn = screen.getByRole("button", { name: "更多选项" });
+    fireEvent.pointerDown(plusBtn, { button: 0, pointerType: "mouse" });
+    fireEvent.click(plusBtn);
+    const playbookItem = screen.getByTestId("composer-menu-swarm-playbooks");
+    expect(playbookItem).toHaveTextContent("蜂群剧本模板");
+    expect(playbookItem.className).not.toContain("sm:hidden");
   });
 });

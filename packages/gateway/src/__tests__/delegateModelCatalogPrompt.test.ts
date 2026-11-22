@@ -86,10 +86,10 @@ describe('renderDelegateModelSection', () => {
     ...mk(['grok-build'], 'grok'),
     ...mk(CURSOR_REAL, 'cursor'),
   ]
-  it('按 engine 分组、只列 available、标注投影与核验状态、声明服务端重校验', () => {
+  it('按 engine 分组、只列 available、不含易变投影戳与在线缓存态、声明服务端重校验', () => {
     const s = renderAllModels({ models, projectionRevision: 'rev-42', verifiedAt: 1 })
     assert.ok(s.startsWith(DELEGATE_MODEL_SECTION_HEADING))
-    assert.match(s, /投影 rev-42,已在线核验/)
+    assert.doesNotMatch(s, /rev-42|已在线核验|仅本地缓存/)
     assert.match(s, /服务端仍会重新校验/)
     assert.match(s, /^- CCB: `glm-5\.3-zai`, `kimi-k3`$/m)
     assert.match(s, /^- Codex: `gpt-5\.6-sol`, `gpt-6-astra`$/m)
@@ -97,9 +97,10 @@ describe('renderDelegateModelSection', () => {
     assert.match(s, /^- Cursor: .*`cursor-fable-5\.1-\{low,medium,high,xhigh,max\}`/m)
     assert.ok(!/`glm-5\.3`[,\n]/.test(s), '不可用型号不得列出')
   })
-  it('verifiedAt=0 → 标注仅本地缓存', () => {
-    const s = renderAllModels({ models, projectionRevision: 'r', verifiedAt: 0 })
-    assert.match(s, /仅本地缓存,可能滞后/)
+  it('verifiedAt / projectionRevision 变化不改变渲染字节（缓存前缀稳定）', () => {
+    const online = renderAllModels({ models, projectionRevision: 'rev-1', verifiedAt: 100 })
+    const cached = renderAllModels({ models, projectionRevision: 'rev-2', verifiedAt: 0 })
+    assert.equal(online, cached)
   })
   it('投影为空 → 明确提示不要填 model', () => {
     const s = renderAllModels({ models: [], projectionRevision: 'r', verifiedAt: 1 })

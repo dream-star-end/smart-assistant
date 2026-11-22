@@ -1683,6 +1683,15 @@ export const taskboardApi = {
       'POST',
       { expectedVersion },
     ),
+
+  /** OCV5-840: 恢复已废弃的项目记忆（POST /api/board/projects/:id/memories/:slug/restore）。 */
+  restoreProjectMemory: (a: AuthSession, projectId: string, slug: string) =>
+    boardSend<{ ok: boolean; restored?: boolean; official?: ProjectMemoryItem }>(
+      a,
+      `/api/board/projects/${encodeURIComponent(projectId)}/memories/${encodeURIComponent(slug)}/restore`,
+      'POST',
+      {},
+    ),
 }
 
 export interface ProjectMemoryItem {
