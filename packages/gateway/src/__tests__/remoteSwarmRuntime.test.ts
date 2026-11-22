@@ -17,7 +17,7 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
@@ -853,9 +853,59 @@ describe('RemoteSwarmRuntime & Admission (OCV5-835)', () => {
       assert.equal(woke.posts.length, 1)
       assert.equal(woke.posts[0]!.agent, 'gateway-monitor')
 
+      // Blocker 4: trusted stall alert targeting coordinator must NOT wake bystander worker even if text contains @all/@worker-b
       releaseWorker()
+      await new Promise((r) => setTimeout(r, 40))
+      const turnsBeforeBystanderCheck = workerTurns
+      const targetedAlert = rt.postGatewayStallAlert(s, {
+        target: 'coordinator',
+        channel: 'main',
+        reason: 'member_failed',
+        attempt: 1,
+        message: '@coordinator [stall] 错误包含 @all 和 @worker-a',
+      })
+      assert.ok(targetedAlert)
+      await new Promise((r) => setTimeout(r, 60))
+      assert.equal(workerTurns, turnsBeforeBystanderCheck, 'bystander worker must not wake on coordinator stall alert')
     } finally {
       releaseWorker()
+      await rt.shutdownAll()
+    }
+  })
+
+  it('OCV5-848 Blocker 3: rejects symlinked board.jsonl when posting remote stall alert', async () => {
+    const rootBase = makeTempDir('oc-rswarm-sym-')
+    const ws = makeTempDir('oc-rswarm-sym-ws-')
+    const outsideFile = join(ws, 'outside.txt')
+    writeFileSync(outsideFile, 'do-not-touch\n', 'utf8')
+    const rt = new RemoteSwarmRuntime({
+      rootBase,
+      executor: {
+        async runWorkerTurn() {
+          return { text: 'ok' }
+        },
+        async releaseWorkerSession() {},
+      },
+    })
+    try {
+      const s = 'agent:main:webchat:dm:stall-symlink-test'
+      rt.registerSession({ sessionKey: s, model: 'antigravity-gemini-4-neon-remote', workspaceCwd: ws })
+      const loc = rt.locationFor(s)
+      mkdirSync(loc.swarmDir, { recursive: true })
+      symlinkSync(outsideFile, join(loc.swarmDir, 'board.jsonl'))
+      assert.throws(
+        () =>
+          rt.postGatewayStallAlert(s, {
+            target: 'coordinator',
+            channel: 'main',
+            reason: 'idle_waiting',
+            attempt: 1,
+            message: '@coordinator [stall] test',
+          }),
+        /SWARM_BOARD_SYMLINK_REJECTED/,
+      )
+      assert.equal(readFileSync(outsideFile, 'utf8'), 'do-not-touch\n')
+    } finally {
       await rt.shutdownAll()
     }
   })

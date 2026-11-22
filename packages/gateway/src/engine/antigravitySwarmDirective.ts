@@ -12,11 +12,17 @@ import { join } from 'node:path'
 import { parseSwarmSlashCommand } from '@openclaude/protocol'
 import { antigravityRoot, antigravitySessionBrainDir } from './antigravityPlatform.js'
 import { remoteSwarmLocationForSession } from '../remoteSwarmRuntime.js'
-import { isSwarmMonitorAgentName } from './swarmStallMonitor.js'
 
 const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const MAX_MEMBERS_JSON_BYTES = 512 * 1024
 const MAX_LIVE_MONITORS_REPORTED = 16
+/** Strict allowlist for native built-in monitor names safe to interpolate into prompts. */
+const STRICT_NATIVE_MONITOR_NAME_RE = /^monitor(?:-\d{1,4})?$/i
+
+function isSafeLegacyMonitorName(name: string): boolean {
+  const trimmed = name.trim()
+  return trimmed.length > 0 && trimmed.length <= 16 && STRICT_NATIVE_MONITOR_NAME_RE.test(trimmed)
+}
 
 export const ANTIGRAVITY_SWARM_OFF_MARKER = '[OpenClaude 蜂群模式已关闭]'
 
@@ -118,9 +124,10 @@ export function listLiveAntigravitySwarmMonitors(opts: {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
     const rec = raw as Record<string, unknown>
     if (rec.killed === true) continue
-    const roleStr = typeof rec.role === 'string' ? rec.role.trim().toLowerCase() : ''
-    if (roleStr === 'monitor' || isSwarmMonitorAgentName(name)) {
-      live.push(name)
+    // Only accept strictly validated built-in monitor names (`monitor` / `monitor-N`)
+    // so untrusted or corrupted roster keys can never inject arbitrary text into prompts.
+    if (isSafeLegacyMonitorName(name)) {
+      live.push(name.trim())
     }
   }
   return live.sort().slice(0, MAX_LIVE_MONITORS_REPORTED)
@@ -184,7 +191,10 @@ export function applyAntigravitySwarmTurnDirective(opts: {
     const swarmToolsIntro = opts.isRemoteAntigravity
       ? '用户已显式开启远端 Antigravity 蜂群（Swarm）模式（由容器侧蜂群运行时驱动，通过 `swarm`、`post_message`、`read_board`、`swarm_wait` 四个 MCP 工具编排并行成员，每个成员同样运行在远端 Gemini 并拥有完整的本地工作区工具与 Git Worktree 隔离）。请按以下规则作为 Coordinator 编排蜂群：'
       : '用户已显式开启 Antigravity 原生蜂群（Swarm）模式。请按以下规则作为 Coordinator 编排蜂群：'
-    const liveMonitors = (opts.liveMonitorNames ?? []).map((n) => n.trim()).filter(Boolean)
+    const liveMonitors = (opts.liveMonitorNames ?? [])
+      .map((n) => n.trim())
+      .filter((n) => isSafeLegacyMonitorName(n))
+      .slice(0, MAX_LIVE_MONITORS_REPORTED)
     const legacyMonitorCleanupLine =
       liveMonitors.length > 0
         ? `   - 检测到历史蜂群仍有残留原生监控成员（${liveMonitors.map((n) => `\`${n}\``).join('、')}），请优先调用 \`swarm{action:"kill", name:"..."}\` 将其回收，避免后台定时空转消耗上下文。`

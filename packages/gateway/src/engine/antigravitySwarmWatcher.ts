@@ -60,6 +60,7 @@ interface RawRosterMember {
   conversation_id?: unknown
   model?: unknown
   role?: unknown
+  phase?: unknown
   wake_mode?: unknown
   wait_since?: unknown
   last_read_seq?: unknown
@@ -720,14 +721,34 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
     }
   }
 
-  // Otherwise inspect the active tool or latest planner call.
+  // Otherwise inspect the active tool or latest planner call (handles both native
+  // tool steps and RemoteSwarm `TOOL_CALL` records that store `tool_calls[]`).
   const directTool = asStr(last.tool_name || last.name)
   if (directTool) {
     return {
       ...telBase,
       stepCount: maxStepIndex,
-      status: lastStatus === 'RUNNING' || lastStatus === 'PENDING' ? 'working' : 'working',
+      status: lastStatus === 'RUNNING' || lastStatus === 'PENDING' || lastStatus === 'ACTIVE' ? 'working' : 'working',
       activity: describeToolActivity(directTool, recordOf(last.arguments ?? last.args)),
+    }
+  }
+  if ((lastType === 'TOOL_CALL' || lastType === 'TOOL_USE') && Array.isArray(last.tool_calls) && last.tool_calls.length > 0) {
+    const latestToolCall = recordOf(last.tool_calls[last.tool_calls.length - 1])
+    const toolName = asStr(latestToolCall?.name)
+    const toolArgs = recordOf(latestToolCall?.arguments ?? latestToolCall?.args)
+    if (toolName.toLowerCase() === 'swarm_wait' && lastStatus === 'DONE') {
+      return {
+        ...telBase,
+        stepCount: maxStepIndex,
+        status: 'waiting',
+        activity: '等待讨论板消息',
+      }
+    }
+    return {
+      ...telBase,
+      stepCount: maxStepIndex,
+      status: 'working',
+      activity: describeToolActivity(toolName, toolArgs),
     }
   }
   if (lastPlanner && Array.isArray(lastPlanner.tool_calls) && lastPlanner.tool_calls.length > 0) {
@@ -882,11 +903,20 @@ export function readAntigravitySwarmSnapshot(opts: {
         ? opts.telemetryCache.scan(opts.brainDir, memberConvId, { drainAll: opts.drainTelemetry })
         : null
     const wakeMode = asStr(m.wake_mode) || undefined
+    const rawPhase = asStr(m.phase).toUpperCase()
     let status: SwarmMemberStatus
-    if (killed) {
+    if (killed || rawPhase === 'KILLED') {
       status = 'killed'
     } else if (opts.phase === 'completed' || opts.phase === 'interrupted' || opts.phase === 'error') {
       status = transcript.status === 'killed' ? 'killed' : 'waiting'
+    } else if (rawPhase === 'RUNNING') {
+      // RemoteSwarm runtime authoritatively tracks in-flight execution in `phase`
+      // even before a slow first tool call flushes transcript steps.
+      status = transcript.failed ? 'waiting' : 'working'
+    } else if (rawPhase === 'WAITING') {
+      status = 'waiting'
+    } else if (rawPhase === 'STOPPED') {
+      status = 'stopped'
     } else if (transcript.status) {
       status = transcript.status
     } else if (wakeMode) {

@@ -6,11 +6,18 @@
  * cache-read tokens on idle ticks).
  *
  * Bounded state only (never accumulates transcript/prompt history):
- *   1. Stage boundary (`lastDoneSeq`) — resets cleanly across `[done]` stages.
- *   2. Last genuine non-monitor progress key & timestamp (`lastProgressKey`, `lastProgressAt`).
- *   3. Alert backoff state (`alertCount`, `lastAlertAt`) — capped at `maxAlerts`.
- *   4. Per-member re-ping map (`repingedMentions`) — bounded by active roster size,
- *      escalating to `@coordinator` if a direct re-ping went unanswered.
+ *   1. Stage boundary (`lastDoneSeq`, `doneMemberSnapshot`) — resets cleanly
+ *      only on an explicit new-stage start signal (coordinator non-`[done]`
+ *      post or newly recruited core worker), ignoring late worker stragglers.
+ *   2. Business progress key (`lastBusinessKey`) separated from transient
+ *      activity (`lastActivityKey`, `lastQuietSince`): transient wake/re-park
+ *      (e.g. a member waking on `[stall]`, bumping `stepCount`, and re-entering
+ *      `swarm_wait` without posting work) delays the idle clock but NEVER resets
+ *      `alertCount` or `repingedMentions`.
+ *   3. Alert backoff state (`alertCount`, `lastAlertAt`) — hard-capped at
+ *      `maxAlerts`.
+ *   4. Per-member re-ping map (`repingedMentions`) — bounded by active roster
+ *      size, escalating to `@coordinator` if a direct re-ping went unanswered.
  */
 import type {
   SwarmBoardPost,
@@ -140,10 +147,18 @@ function formatIdleMinutes(idleMs: number): number {
   return Math.max(1, Math.round(idleMs / 60_000))
 }
 
-function clampInlineError(text: string | undefined): string {
-  const clean = (text ?? '').replace(/\s+/g, ' ').trim()
-  if (!clean) return '执行出错'
-  return clean.length <= 120 ? clean : `${clean.slice(0, 119)}…`
+/**
+ * Neutralize `@mention` tokens in quoted error/member strings so a single-target
+ * stall alert can NEVER accidentally wake `@all`, `@#channel`, or other workers.
+ */
+function sanitizeQuotedText(text: string | undefined, maxChars: number, fallback: string): string {
+  const clean = (text ?? '')
+    .replace(/\s+/g, ' ')
+    .replace(/@/g, '＠')
+    .replace(/`/g, "'")
+    .trim()
+  if (!clean) return fallback
+  return clean.length <= maxChars ? clean : `${clean.slice(0, Math.max(1, maxChars - 1))}…`
 }
 
 export class SwarmStallMonitor {
@@ -151,9 +166,25 @@ export class SwarmStallMonitor {
   private readonly retryCooldownMs: number
   private readonly maxAlerts: number
 
+  /** Highest coordinator `[done]` post seq observed. */
   private lastDoneSeq = 0
-  private lastProgressKey: string | null = null
-  private lastProgressAt = 0
+  /** Whether the swarm is currently settled in a `[done]` stage awaiting an explicit new-stage start. */
+  private stageDone = false
+  /** Live core worker names present when the stage entered `[done]` (detects newly added workers). */
+  private doneWorkerNames = new Set<string>()
+  /**
+   * Independent business-progress fingerprint (excludes `stepCount`, `unreadCount`,
+   * and transient `working`/`waiting` toggles). Only a change here resets `alertCount`
+   * and `repingedMentions`.
+   */
+  private lastBusinessKey: string | null = null
+  /**
+   * Transient activity fingerprint (includes `stepCount` and effective status).
+   * A change here pushes `lastQuietSince` forward while members settle, without
+   * resetting the alert budget.
+   */
+  private lastActivityKey: string | null = null
+  private lastQuietSince = 0
   private alertCount = 0
   private lastAlertAt = 0
   private readonly repingedMentions = new Map<string, number>()
@@ -167,8 +198,11 @@ export class SwarmStallMonitor {
   /** Clear all state on turn end, user stop, or swarm teardown. */
   reset(): void {
     this.lastDoneSeq = 0
-    this.lastProgressKey = null
-    this.lastProgressAt = 0
+    this.stageDone = false
+    this.doneWorkerNames.clear()
+    this.lastBusinessKey = null
+    this.lastActivityKey = null
+    this.lastQuietSince = 0
     this.clearAlertState()
   }
 
@@ -181,7 +215,7 @@ export class SwarmStallMonitor {
   /**
    * Inspect a snapshot in O(members + recentPosts) memory time with zero I/O and
    * zero LLM calls. Returns an alert only when every live core member is parked
-   * past `stallThresholdMs` and the current stage is not `[done]`.
+   * past `stallThresholdMs` and the current stage is active (not `[done]`).
    */
   evaluate(snap: SwarmSnapshot, now: number = Date.now()): SwarmStallAlert | null {
     if (snap.phase !== 'running' && snap.phase !== 'starting') {
@@ -194,8 +228,9 @@ export class SwarmStallMonitor {
     )
     const liveWorkers = liveCoreMembers.filter((m) => m.role !== 'coordinator')
     if (liveWorkers.length === 0) {
-      this.lastProgressKey = null
-      this.lastProgressAt = now
+      this.lastBusinessKey = null
+      this.lastActivityKey = null
+      this.lastQuietSince = now
       this.clearAlertState()
       return null
     }
@@ -204,46 +239,92 @@ export class SwarmStallMonitor {
     const effectiveHeadSeq =
       nonMonitorPosts.length > 0 ? nonMonitorPosts[nonMonitorPosts.length - 1]!.seq : 0
 
+    let newestDoneSeq = this.lastDoneSeq
     for (const post of nonMonitorPosts) {
-      if (isCoordinatorDonePost(post) && post.seq > this.lastDoneSeq) {
-        this.lastDoneSeq = post.seq
+      if (isCoordinatorDonePost(post) && post.seq > newestDoneSeq) {
+        newestDoneSeq = post.seq
       }
     }
-    const stagePosts = nonMonitorPosts.filter((p) => p.seq > this.lastDoneSeq)
+    const currentWorkerNames = new Set(liveWorkers.map((w) => w.name.toLowerCase()))
 
-    // Intentionally exclude `unreadCount` from progressKey: posting a `[stall]`
-    // alert increments other members' unreadCount, which must NOT look like
-    // genuine swarm progress and reset the backoff counter.
+    if (newestDoneSeq > this.lastDoneSeq) {
+      this.lastDoneSeq = newestDoneSeq
+      this.stageDone = true
+      this.doneWorkerNames = currentWorkerNames
+      this.clearAlertState()
+    }
+
+    const postsAfterDone = nonMonitorPosts.filter((p) => p.seq > this.lastDoneSeq)
+    if (this.stageDone) {
+      // Only an explicit new-stage start signal re-arms monitoring after `[done]`:
+      //   1. Coordinator posts a new non-`[done]` message after `lastDoneSeq`, OR
+      //   2. A brand-new core worker was added after `[done]`.
+      // Late worker straggler replies after `[done]` MUST NOT re-arm the monitor.
+      const coordinatorStartedNewStage = postsAfterDone.some(
+        (p) => p.agent.trim().toLowerCase() === 'coordinator' && !isCoordinatorDonePost(p),
+      )
+      const newWorkerRecruited = [...currentWorkerNames].some((n) => !this.doneWorkerNames.has(n))
+      if (!coordinatorStartedNewStage && !newWorkerRecruited) {
+        this.lastQuietSince = now
+        return null
+      }
+      this.stageDone = false
+      this.doneWorkerNames.clear()
+      this.clearAlertState()
+    }
+
+    const stagePosts = postsAfterDone
     const sortedCore = [...liveCoreMembers].sort((a, b) => a.name.localeCompare(b.name))
-    const progressKey = [
+
+    // Independent business progress key: strictly excludes `stepCount`, `unreadCount`,
+    // and transient `working`/`waiting` toggles so an alert waking a member that merely
+    // re-enters `swarm_wait` CANNOT reset `alertCount` or bypass the 3-alert cap.
+    const businessKey = [
       effectiveHeadSeq,
+      ...sortedCore.map((m) => `${m.name}:${m.failed ? 1 : 0}:${m.lastPostSeq ?? 0}`),
+    ].join('|')
+
+    // Activity key tracks transient work/step movement so we postpone alerting while
+    // a member is actively stepping, without resetting the alert budget.
+    const activityKey = [
+      businessKey,
       ...sortedCore.map(
-        (m) =>
-          `${m.name}:${isMemberEffectivelyWaiting(m) ? 'parked' : m.status}:${m.stepCount}:${m.failed ? 1 : 0}:${m.lastPostSeq ?? 0}`,
+        (m) => `${m.name}:${isMemberEffectivelyWaiting(m) ? 'parked' : m.status}:${m.stepCount}`,
       ),
     ].join('|')
 
     const anyWorking = liveCoreMembers.some((m) => !isMemberEffectivelyWaiting(m))
+
+    if (this.lastBusinessKey === null) {
+      this.lastBusinessKey = businessKey
+      this.lastActivityKey = activityKey
+      this.lastQuietSince = now
+      return null
+    }
+
+    if (businessKey !== this.lastBusinessKey) {
+      this.lastBusinessKey = businessKey
+      this.lastActivityKey = activityKey
+      this.lastQuietSince = now
+      this.clearAlertState()
+      return null
+    }
+
     if (anyWorking) {
-      this.lastProgressKey = progressKey
-      this.lastProgressAt = now
-      this.clearAlertState()
+      this.lastActivityKey = activityKey
+      this.lastQuietSince = now
       return null
     }
 
-    if (this.lastProgressKey === null || this.lastProgressKey !== progressKey) {
-      this.lastProgressKey = progressKey
-      this.lastProgressAt = now
-      this.clearAlertState()
+    if (activityKey !== this.lastActivityKey) {
+      // Member briefly woke / stepped and re-parked with no new business post:
+      // postpone idle timer, but keep `alertCount` and `repingedMentions` intact.
+      this.lastActivityKey = activityKey
+      this.lastQuietSince = now
       return null
     }
 
-    // Current stage already ended with `[done]` and no new non-monitor posts arrived.
-    if (this.lastDoneSeq > 0 && stagePosts.length === 0 && effectiveHeadSeq <= this.lastDoneSeq) {
-      return null
-    }
-
-    const idleMs = Math.max(0, now - this.lastProgressAt)
+    const idleMs = Math.max(0, now - this.lastQuietSince)
     if (idleMs < this.stallThresholdMs) return null
     if (this.alertCount >= this.maxAlerts) return null
     if (this.alertCount > 0 && now - this.lastAlertAt < this.retryCooldownMs) return null
@@ -277,16 +358,18 @@ export class SwarmStallMonitor {
     const idleMins = formatIdleMinutes(idleMs)
     const coordinator = liveCoreMembers.find((m) => m.role === 'coordinator')
 
-    // 1. Failed worker needs coordinator intervention (never @ the failed worker itself).
+    // 1. Failed worker needs coordinator intervention (never @ the failed worker itself,
+    //    and strip `@` from error text so no bystander member or `@all` is ever woken).
     const failedWorker = liveWorkers.find((w) => w.failed === true)
     if (failedWorker) {
-      const errSummary = clampInlineError(failedWorker.lastError)
+      const safeName = sanitizeQuotedText(failedWorker.name, 64, 'worker')
+      const errSummary = sanitizeQuotedText(failedWorker.lastError, 120, '执行出错')
       const cited = failedWorker.lastPostSeq ? [failedWorker.lastPostSeq] : []
       return {
         target: 'coordinator',
         channel: 'main',
         reason: 'member_failed',
-        message: `@coordinator [stall] 成员 \`${failedWorker.name}\` 执行异常（${errSummary}），全员已静默 ${idleMins} 分钟，请检查是否需要重试、切换模型或回收。`,
+        message: `@coordinator [stall] 成员 \`${safeName}\` 执行异常（${errSummary}），全员已静默 ${idleMins} 分钟，请检查是否需要重试、切换模型或回收。`,
         attempt,
         idleMs,
         headSeq: effectiveHeadSeq,
@@ -308,11 +391,12 @@ export class SwarmStallMonitor {
 
         const alreadyRepingedSeq = this.repingedMentions.get(workerLower)
         if (alreadyRepingedSeq === post.seq) {
+          const safeName = sanitizeQuotedText(worker.name, 64, 'worker')
           return {
             target: 'coordinator',
             channel: 'main',
             reason: 'unanswered_mention_escalated',
-            message: `@coordinator [stall] 成员 \`${worker.name}\` 对 #${post.seq}（此前已催促）仍无响应，全员已静默 ${idleMins} 分钟，可能受限或异常，请排查、切换模型或改派。`,
+            message: `@coordinator [stall] 成员 \`${safeName}\` 对 #${post.seq}（此前已催促）仍无响应，全员已静默 ${idleMins} 分钟，可能受限或异常，请排查、切换模型或改派。`,
             attempt,
             idleMs,
             headSeq: effectiveHeadSeq,
@@ -351,7 +435,7 @@ export class SwarmStallMonitor {
     if (unclaimedPosts.length > 0) {
       const recent = unclaimedPosts.slice(-3)
       const seqLabel = recent.map((p) => `#${p.seq}`).join('、')
-      const authors = [...new Set(recent.map((p) => `\`${p.agent}\``))].join('、')
+      const authors = [...new Set(recent.map((p) => `\`${sanitizeQuotedText(p.agent, 64, 'worker')}\``))].join('、')
       return {
         target: 'coordinator',
         channel: 'main',
@@ -374,11 +458,12 @@ export class SwarmStallMonitor {
     ) {
       const chMeta = snap.channels.find((c) => c.name === latestStagePost.channel)
       if (!chMeta?.archived) {
+        const safeCh = sanitizeQuotedText(latestStagePost.channel, 64, 'channel')
         return {
           target: 'coordinator',
           channel: 'main',
           reason: 'channel_stalled',
-          message: `@coordinator [stall] 频道 #${latestStagePost.channel} 自 #${latestStagePost.seq} 后已静默 ${idleMins} 分钟且未通知协调者，请核查是否需要推进或收口。`,
+          message: `@coordinator [stall] 频道 #${safeCh} 自 #${latestStagePost.seq} 后已静默 ${idleMins} 分钟且未通知协调者，请核查是否需要推进或收口。`,
           attempt,
           idleMs,
           headSeq: effectiveHeadSeq,

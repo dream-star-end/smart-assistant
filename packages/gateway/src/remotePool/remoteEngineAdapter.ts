@@ -388,9 +388,13 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
           if (finalized) return
           const runtime = lookupRemoteSwarmRuntimeForSession(sessionKeyForSwarm)
           if (!runtime) return
-          const posted = runtime.postGatewayStallAlert(sessionKeyForSwarm, alert)
-          if (posted) {
-            swarmWatcher?.kick()
+          try {
+            const posted = runtime.postGatewayStallAlert(sessionKeyForSwarm, alert)
+            if (posted) {
+              swarmWatcher?.kick()
+            }
+          } catch {
+            // Fail closed on lock timeout or symlink rejection without crashing watcher.
           }
         },
       })

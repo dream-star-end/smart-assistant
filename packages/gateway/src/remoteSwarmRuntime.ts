@@ -22,14 +22,16 @@ import {
   closeSync,
   constants as fsConstants,
   existsSync,
+  fstatSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
   renameSync,
   rmSync,
-  statSync,
   unlinkSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs'
 import { join, resolve } from 'node:path'
 import {
@@ -237,6 +239,19 @@ export function remoteSwarmLocationForSession(
   return { brainDir, swarmId, swarmDir }
 }
 
+function trustedStallAlertTarget(post: BoardPostRecord): string | null {
+  if (
+    post.agent === GATEWAY_STALL_MONITOR_AGENT &&
+    post.kind === 'control' &&
+    post.control?.kind === 'stall' &&
+    typeof post.control.target === 'string'
+  ) {
+    const clean = post.control.target.trim().toLowerCase()
+    if (clean && clean !== 'all') return clean
+  }
+  return null
+}
+
 function formatBoardTimestamp(now = new Date()): string {
   return now.toISOString().replace('T', ' ').slice(0, 19)
 }
@@ -261,8 +276,42 @@ function atomicWriteJson(filePath: string, data: unknown): void {
   renameSync(tmpPath, filePath)
 }
 
+function assertSafeSwarmDir(swarmDir: string): { dev: number; ino: number } {
+  const st = lstatSync(swarmDir)
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
+  }
+  return { dev: st.dev, ino: st.ino }
+}
+
+function appendBoardLineNoSymlink(swarmDir: string, line: string): void {
+  const boardPath = join(swarmDir, 'board.jsonl')
+  let fd: number | null = null
+  try {
+    const flags =
+      fsConstants.O_WRONLY |
+      fsConstants.O_APPEND |
+      fsConstants.O_CREAT |
+      (typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0)
+    fd = openSync(boardPath, flags, 0o600)
+    const fst = fstatSync(fd)
+    if (!fst.isFile()) {
+      throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
+    }
+    writeSync(fd, line, null, 'utf8')
+  } catch (err: any) {
+    if (err?.code === 'ELOOP') throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
+    throw err
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd) } catch { /* ignore */ }
+    }
+  }
+}
+
 function withBoardFileLock<T>(swarmDir: string, fn: () => T): T {
   ensurePrivateDir(swarmDir)
+  const dirId = assertSafeSwarmDir(swarmDir)
   const lockPath = join(swarmDir, '.board.lock')
   const deadline = Date.now() + BOARD_LOCK_MAX_WAIT_MS
   let fd: number | null = null
@@ -275,26 +324,35 @@ function withBoardFileLock<T>(swarmDir: string, fn: () => T): T {
         (typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0)
       fd = openSync(lockPath, flags, 0o600)
     } catch (err: any) {
+      if (err?.code === 'ELOOP') throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
       if (err?.code !== 'EEXIST') throw err
+      let unlinkedStale = false
       try {
-        const st = statSync(lockPath)
+        const st = lstatSync(lockPath)
+        if (st.isSymbolicLink()) throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
         if (Date.now() - st.mtimeMs > BOARD_LOCK_STALE_MS) {
           unlinkSync(lockPath)
-          continue
+          unlinkedStale = true
         }
-      } catch {
-        continue
+      } catch (statErr: any) {
+        if (statErr?.message === 'SWARM_BOARD_SYMLINK_REJECTED') throw statErr
+        // Lock disappeared or transient stat error: still enforce deadline below.
       }
       if (Date.now() >= deadline) {
         throw new Error('SWARM_BOARD_LOCK_TIMEOUT')
       }
-      const until = Date.now() + 15
+      if (unlinkedStale) continue
+      const until = Math.min(deadline, Date.now() + 15)
       while (Date.now() < until) {
         // bounded short spin for lock file release
       }
     }
   }
   try {
+    const afterId = assertSafeSwarmDir(swarmDir)
+    if (afterId.dev !== dirId.dev || afterId.ino !== dirId.ino) {
+      throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
+    }
     return fn()
   } finally {
     try {
@@ -312,8 +370,31 @@ function withBoardFileLock<T>(swarmDir: string, fn: () => T): T {
 
 function readBoardPostsFromDisk(swarmDir: string): BoardPostRecord[] {
   const boardPath = join(swarmDir, 'board.jsonl')
-  if (!existsSync(boardPath)) return []
-  const raw = readFileSync(boardPath, 'utf8')
+  let fd: number | null = null
+  let raw = ''
+  try {
+    const lst = lstatSync(boardPath)
+    if (lst.isSymbolicLink() || !lst.isFile()) {
+      throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
+    }
+    const flags =
+      fsConstants.O_RDONLY |
+      (typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0)
+    fd = openSync(boardPath, flags)
+    const fst = fstatSync(fd)
+    if (!fst.isFile() || fst.dev !== lst.dev || fst.ino !== lst.ino) {
+      throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
+    }
+    raw = readFileSync(fd, 'utf8')
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') return []
+    if (err?.code === 'ELOOP') throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
+    throw err
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd) } catch { /* ignore */ }
+    }
+  }
   const posts: BoardPostRecord[] = []
   for (const line of raw.split('\n')) {
     const trimmed = line.trim()
@@ -767,9 +848,7 @@ export class RemoteSwarmRuntime {
         ...(input.control ? { control: input.control } : {}),
         request_id: randomUUID(),
       }
-      appendFileSync(join(state.location.swarmDir, 'board.jsonl'), `${JSON.stringify(next)}\n`, {
-        mode: 0o600,
-      })
+      appendBoardLineNoSymlink(state.location.swarmDir, `${JSON.stringify(next)}\n`)
       return next
     })
     state.boardSeqKnown = Math.max(state.boardSeqKnown, post.seq)
@@ -904,7 +983,8 @@ export class RemoteSwarmRuntime {
     // Destructive kills go exclusively through `swarm{action:"kill"}` (ownership-checked)
     // or trusted `executeOperatorKill(...)`.
     const roster = this.ensureRoster(state)
-    const mentions = extractSwarmMentions(post.text)
+    const trustedStallTarget = trustedStallAlertTarget(post)
+    const mentions = trustedStallTarget ? [trustedStallTarget] : extractSwarmMentions(post.text)
 
     // 1. Wake matching swarm_wait waiters
     for (const waiter of [...state.waiters]) {
@@ -917,10 +997,10 @@ export class RemoteSwarmRuntime {
         waiter.memberName === 'coordinator' ||
         post.channel === 'main' ||
         memberChannels.includes(post.channel)
-      const mentioned = mentions.some((m) =>
-        memberMatchesMention(waiter.memberName, m, memberChannels, post.channel),
-      )
-      if (!waiter.mentionsOnly ? inChannel || mentioned : mentioned) {
+      const mentioned = trustedStallTarget
+        ? waiter.memberName.toLowerCase() === trustedStallTarget
+        : mentions.some((m) => memberMatchesMention(waiter.memberName, m, memberChannels, post.channel))
+      if (trustedStallTarget ? mentioned : !waiter.mentionsOnly ? inChannel || mentioned : mentioned) {
         state.waiters.delete(waiter)
         clearTimeout(waiter.timer)
         const allPosts = readBoardPostsFromDisk(state.location.swarmDir)
@@ -938,6 +1018,12 @@ export class RemoteSwarmRuntime {
     for (const [name, member] of Object.entries(roster.members)) {
       if (name === 'coordinator' || member.killed) continue
       if (name.toLowerCase() === post.agent.toLowerCase()) continue
+      if (trustedStallTarget) {
+        if (name.toLowerCase() === trustedStallTarget) {
+          this.scheduleWorkerRun(state, name)
+        }
+        continue
+      }
       const mentioned = mentions.some((m) =>
         memberMatchesMention(name, m, member.channels ?? ['main'], post.channel),
       )
@@ -1034,6 +1120,10 @@ export class RemoteSwarmRuntime {
 
         const relevant = unread.filter((p) => {
           if (p.agent.toLowerCase() === rt.name.toLowerCase()) return false
+          const stallTarget = trustedStallAlertTarget(p)
+          if (stallTarget !== null) {
+            return stallTarget === rt.name.toLowerCase()
+          }
           const mentions = extractSwarmMentions(p.text)
           return (
             mentions.some((m) => memberMatchesMention(rt.name, m, member.channels ?? ['main'], p.channel)) ||
@@ -1206,6 +1296,16 @@ export class RemoteSwarmRuntime {
       }
     } finally {
       rt.running = false
+      try {
+        const settleRoster = this.ensureRoster(state)
+        const settleMember = settleRoster.members[rt.name]
+        if (settleMember && !settleMember.killed && settleMember.phase === 'RUNNING') {
+          settleMember.phase = 'WAITING'
+          this.saveRoster(state, settleRoster)
+        }
+      } catch {
+        /* ignore settle error during teardown */
+      }
       this.checkIdleWaiters(state)
     }
   }
@@ -1463,6 +1563,10 @@ export class RemoteSwarmRuntime {
         if (p.seq <= since) return false
         if (p.agent.toLowerCase() === caller.toLowerCase()) return false
         if (channel && channel !== '*' && p.channel !== channel) return false
+        const stallTarget = trustedStallAlertTarget(p)
+        if (stallTarget !== null) {
+          return stallTarget === caller.toLowerCase()
+        }
         const mentions = extractSwarmMentions(p.text)
         const mentioned = mentions.some((m) => memberMatchesMention(caller, m, memberChannels, p.channel))
         const inChannel = caller === 'coordinator' || p.channel === 'main' || memberChannels.includes(p.channel)
@@ -1478,30 +1582,53 @@ export class RemoteSwarmRuntime {
         return { ok: true, woke: false, head_seq: headSeq, posts: delta, reason: 'no_working_members' }
       }
 
-      const waited = await new Promise<{ woke: boolean; posts: BoardPostRecord[]; headSeq: number; reason: string }>(
-        (resolveWait) => {
-          const timer = setTimeout(() => {
-            state.waiters.delete(entry)
-            const cur = readBoardPostsFromDisk(state.location.swarmDir)
-            resolveWait({
-              woke: false,
-              posts: cur.filter((p) => p.seq > since),
-              headSeq: cur.reduce((m, p) => Math.max(m, p.seq), 0),
-              reason: 'timeout',
-            })
-          }, timeoutMs)
-          timer.unref?.()
-          const entry: WaiterEntry = {
-            memberName: caller,
-            since,
-            mentionsOnly,
-            channel,
-            resolve: resolveWait,
-            timer,
+      if (roster.members[caller] && !roster.members[caller]!.killed) {
+        roster.members[caller]!.phase = 'WAITING'
+        roster.members[caller]!.wake_mode = mentionsOnly ? 'mentions' : 'all'
+        roster.members[caller]!.wait_since = since
+        this.saveRoster(state, roster)
+      }
+
+      let waited: { woke: boolean; posts: BoardPostRecord[]; headSeq: number; reason: string }
+      try {
+        waited = await new Promise<{ woke: boolean; posts: BoardPostRecord[]; headSeq: number; reason: string }>(
+          (resolveWait) => {
+            const timer = setTimeout(() => {
+              state.waiters.delete(entry)
+              const cur = readBoardPostsFromDisk(state.location.swarmDir)
+              resolveWait({
+                woke: false,
+                posts: cur.filter((p) => p.seq > since),
+                headSeq: cur.reduce((m, p) => Math.max(m, p.seq), 0),
+                reason: 'timeout',
+              })
+            }, timeoutMs)
+            timer.unref?.()
+            const entry: WaiterEntry = {
+              memberName: caller,
+              since,
+              mentionsOnly,
+              channel,
+              resolve: resolveWait,
+              timer,
+            }
+            state.waiters.add(entry)
+          },
+        )
+      } finally {
+        if (!state.shuttingDown) {
+          try {
+            const resumeRoster = this.ensureRoster(state)
+            const resumeMember = resumeRoster.members[caller]
+            if (resumeMember && !resumeMember.killed) {
+              resumeMember.phase = 'RUNNING'
+              this.saveRoster(state, resumeRoster)
+            }
+          } catch {
+            /* ignore resume settle error */
           }
-          state.waiters.add(entry)
-        },
-      )
+        }
+      }
       return { ok: true, woke: waited.woke, head_seq: waited.headSeq, posts: waited.posts, reason: waited.reason }
     }
 
