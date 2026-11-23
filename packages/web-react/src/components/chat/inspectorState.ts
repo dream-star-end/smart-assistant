@@ -1,3 +1,4 @@
+import type { BrowserHandoffResumeWhen } from "@openclaude/protocol/browser";
 import { createContext, useContext } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import type { ToolLike } from "../tool/format";
@@ -24,6 +25,7 @@ export type LiveBrowserHandoffRequest = {
   url?: string;
   continuePrompt?: string;
   handoffId?: string;
+  resumeWhen?: BrowserHandoffResumeWhen;
 };
 
 /**

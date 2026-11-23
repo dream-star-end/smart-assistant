@@ -3,6 +3,8 @@ import { generateKeyPairSync } from 'node:crypto'
 import { describe, test } from 'node:test'
 
 import {
+  BROWSER_HANDOFF_MAX_DELAY_MS,
+  BROWSER_HANDOFF_MIN_DELAY_MS,
   CONTAINER_PREVIEW_PROTOCOL_VERSION,
   LIVE_BROWSER_ASSERTION_HEADER,
   LIVE_BROWSER_BINARY_HEADER_BYTES,
@@ -15,6 +17,7 @@ import {
   decodeLiveBrowserFrame,
   encodeLiveBrowserFrame,
   liveBrowserModifiersToBitmask,
+  normalizeBrowserHandoffResumeWhen,
 } from '../index.js'
 import {
   ContainerPreviewAssertionError,
@@ -153,6 +156,35 @@ describe('liveBrowser protocol framing', () => {
     assert.equal(liveBrowserModifiersToBitmask({ ctrl: true, shift: true }), 10)
     assert.equal(liveBrowserModifiersToBitmask({ alt: true, ctrl: true, meta: true, shift: true }), 15)
     assert.equal(liveBrowserModifiersToBitmask(7), 7)
+  })
+
+  test('normalizes BrowserHandoffResumeWhen (camelCase + snake_case, bounds, backward compat)', () => {
+    assert.equal(normalizeBrowserHandoffResumeWhen(undefined), undefined)
+    assert.equal(normalizeBrowserHandoffResumeWhen(null), undefined)
+    assert.equal(normalizeBrowserHandoffResumeWhen({}), undefined)
+    assert.equal(normalizeBrowserHandoffResumeWhen('bad'), undefined)
+
+    const snake = normalizeBrowserHandoffResumeWhen({
+      url_leave: ['/login', '  /oauth  ', '', 123, 'bad\nline'],
+      url_match: ['/dashboard'],
+      selector_appear: ' [data-testid="user-menu"] ',
+      selector_gone: 'input[type="password"]',
+      wait_download: true,
+      auto_resume_delay_ms: 4500,
+    })
+    assert.deepEqual(snake, {
+      urlLeave: ['/login', '/oauth'],
+      urlMatch: ['/dashboard'],
+      selectorAppear: '[data-testid="user-menu"]',
+      selectorGone: 'input[type="password"]',
+      waitDownload: true,
+      autoResumeDelayMs: 4500,
+    })
+
+    const clampedLow = normalizeBrowserHandoffResumeWhen({ autoResumeDelayMs: 50 })
+    assert.equal(clampedLow?.autoResumeDelayMs, BROWSER_HANDOFF_MIN_DELAY_MS)
+    const clampedHigh = normalizeBrowserHandoffResumeWhen({ autoResumeDelayMs: 99_999 })
+    assert.equal(clampedHigh?.autoResumeDelayMs, BROWSER_HANDOFF_MAX_DELAY_MS)
   })
 })
 

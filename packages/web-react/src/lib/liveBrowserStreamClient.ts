@@ -11,6 +11,8 @@ import {
   LIVE_BROWSER_TICKET_PROTOCOL,
   type LiveBrowserClientMessage,
   type LiveBrowserDecodedFrame,
+  type LiveBrowserHandoffReadyMessage,
+  type LiveBrowserHandoffVetoedMessage,
   type LiveBrowserServerMessage,
   type LiveBrowserStatePayload,
   type LiveBrowserStreamTicketResponse,
@@ -40,6 +42,8 @@ export interface LiveBrowserStreamCallbacks {
   onState?: (state: LiveBrowserStatePayload, fromReady: boolean) => void;
   onFrame?: (frame: LiveBrowserDecodedFrame) => void;
   onCursor?: (cursor: string) => void;
+  onHandoffReady?: (event: LiveBrowserHandoffReadyMessage) => void;
+  onHandoffVetoed?: (event: LiveBrowserHandoffVetoedMessage) => void;
   onError?: (message: string, code?: string, retryable?: boolean) => void;
   onStats?: (stats: LiveBrowserStreamStats) => void;
   onFallback?: (reason: string) => void;
@@ -422,6 +426,16 @@ export class LiveBrowserStreamClient {
       case "cursor":
         if (typeof msg.cursor === "string") {
           this.callbacks.onCursor?.(msg.cursor);
+        }
+        break;
+      case "handoff_ready":
+        if (typeof msg.signal === "string" && typeof msg.url === "string") {
+          this.callbacks.onHandoffReady?.(msg);
+        }
+        break;
+      case "handoff_vetoed":
+        if (typeof msg.reason === "string") {
+          this.callbacks.onHandoffVetoed?.(msg);
         }
         break;
       case "error":

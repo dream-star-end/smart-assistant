@@ -151,9 +151,14 @@ export {
   LIVE_BROWSER_FRAME_FORMAT_JPEG,
   LIVE_BROWSER_FRAME_FORMAT_PNG,
   LIVE_BROWSER_FRAME_FLAG_SETTLED,
+  BROWSER_HANDOFF_RESUME_MAX_PATTERNS,
+  BROWSER_HANDOFF_RESUME_MAX_STR_LEN,
+  BROWSER_HANDOFF_MIN_DELAY_MS,
+  BROWSER_HANDOFF_MAX_DELAY_MS,
   encodeLiveBrowserFrame,
   decodeLiveBrowserFrame,
   liveBrowserModifiersToBitmask,
+  normalizeBrowserHandoffResumeWhen,
 } from './liveBrowser.js'
 export type {
   LiveBrowserFrameFormat,
@@ -165,7 +170,11 @@ export type {
   LiveBrowserMouseButton,
   LiveBrowserModifiers,
   LiveBrowserStreamTicketResponse,
+  BrowserHandoffResumeWhen,
+  LiveBrowserHandoffReadyMessage,
+  LiveBrowserHandoffVetoedMessage,
   LiveBrowserClientMessage,
   LiveBrowserStatePayload,
   LiveBrowserServerMessage,
+  LiveBrowserServerControlMessage,
 } from './liveBrowser.js'

@@ -222,6 +222,28 @@
 .lb-status-meta[data-mode="ws"] { background: color-mix(in oklch, var(--success) 11%, transparent); color: var(--success); }
 .lb-status-meta[data-mode="warn"] { background: color-mix(in oklch, var(--warning) 14%, transparent); color: var(--warning); }
 
+/* Zero-token Auto-Resume Countdown Strip (OCV5-864) */
+.lb-autoresume-bar {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.4375rem 0.625rem;
+  padding: 0.4375rem 0.6875rem;
+  border-bottom: 1px solid color-mix(in oklch, var(--success) 24%, var(--border));
+  background: linear-gradient(90deg, color-mix(in oklch, var(--success) 11%, var(--surface)) 0%, color-mix(in oklch, var(--accent) 5%, var(--surface)) 100%);
+  color: var(--fg); font-size: var(--text-caption); line-height: 1.45;
+}
+.lb-autoresume-bar[data-mode="manual-lock"] {
+  border-bottom-color: color-mix(in oklch, var(--warning) 26%, var(--border));
+  background: color-mix(in oklch, var(--warning) 9%, var(--surface));
+}
+.lb-autoresume-copy { display: inline-flex; align-items: center; gap: 0.4375rem; min-width: 0; flex: 1 1 12rem; }
+.lb-autoresume-copy strong { font-variant-numeric: tabular-nums; }
+.lb-autoresume-actions { display: inline-flex; align-items: center; gap: 0.375rem; flex-shrink: 0; }
+.lb-autoresume-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 0.25rem;
+  height: 1.625rem; padding: 0 0.625rem; border-radius: var(--radius-full);
+  font-size: var(--text-caption); font-weight: 600; cursor: pointer; white-space: nowrap;
+}
+.lb-autoresume-btn:focus-visible { outline: 2px solid var(--ring); outline-offset: 1px; }
+
 /* Handoff / Mismatch callout banners */
 .lb-handoff-banner { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem 0.75rem; padding: 0.5625rem 0.8125rem; border-radius: var(--radius-md); color: var(--fg); font-size: var(--text-caption); line-height: 1.5; }
 .lb-handoff-body { display: flex; align-items: center; gap: 0.5rem; min-width: 0; flex: 1 1 14rem; }

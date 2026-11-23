@@ -9,6 +9,10 @@
  *     改为展示「直达处理」直接跳至目标会话或云浏览器接管视口。
  */
 import {
+  type BrowserHandoffResumeWhen,
+  normalizeBrowserHandoffResumeWhen,
+} from "@openclaude/protocol/browser";
+import {
   ArrowUpRight,
   Check,
   ChevronRight,
@@ -74,6 +78,14 @@ export function resolveTaskboardTicketRef(item: PendingDecisionItem): string | n
   return stripped || null;
 }
 
+export type PendingDecisionBrowserHandoffOpenOpts = {
+  url?: string;
+  sessionId?: string | null;
+  handoffId?: string;
+  continuePrompt?: string;
+  resumeWhen?: BrowserHandoffResumeWhen;
+};
+
 export type PendingDecisionsDockProps = {
   auth?: AuthSession | null;
   socketVersion?: number;
@@ -81,7 +93,7 @@ export type PendingDecisionsDockProps = {
   sessionNeedsYouItems?: readonly LiveActivityItem[];
   onSelectSession?: (sessionId: string) => void;
   onOpenBoard?: (ticketRef?: string) => void;
-  onOpenLiveBrowser?: (opts?: { url?: string; sessionId?: string | null }) => void;
+  onOpenLiveBrowser?: (opts?: PendingDecisionBrowserHandoffOpenOpts) => void;
   /** 测试或外部控制轮询间隔（默认 30s；传 0 禁用定时轮询）。 */
   pollIntervalMs?: number;
   defaultCollapsed?: boolean;
@@ -305,9 +317,26 @@ export function PendingDecisionsDock({
   const handleDirectGoto = (item: PendingDecisionItem) => {
     if (item.source === "browser_handoff") {
       const url = typeof item.metadata?.url === "string" ? item.metadata.url : undefined;
+      const handoffId = item.sourceId?.trim() || undefined;
+      const rawPrompt =
+        typeof item.metadata?.continuePrompt === "string"
+          ? item.metadata.continuePrompt
+          : typeof item.metadata?.continue_prompt === "string"
+            ? item.metadata.continue_prompt
+            : undefined;
+      const continuePrompt = rawPrompt?.trim() || undefined;
+      const resumeWhen = normalizeBrowserHandoffResumeWhen(
+        item.metadata?.resumeWhen ?? item.metadata?.resume_when,
+      );
       if (item.sessionId && onSelectSession) onSelectSession(item.sessionId);
       if (onOpenLiveBrowser) {
-        onOpenLiveBrowser({ url, sessionId: item.sessionId });
+        onOpenLiveBrowser({
+          url,
+          sessionId: item.sessionId,
+          ...(handoffId ? { handoffId } : {}),
+          ...(continuePrompt ? { continuePrompt } : {}),
+          ...(resumeWhen ? { resumeWhen } : {}),
+        });
         return;
       }
     }

@@ -16,6 +16,7 @@ import {
   LIVE_BROWSER_INTERNAL_WS_PATH,
   LIVE_BROWSER_MAX_BINARY_FRAME_BYTES,
   LIVE_BROWSER_PROTOCOL_VERSION,
+  type BrowserHandoffResumeWhen,
   type LiveBrowserClientMessage,
   type LiveBrowserDialogInfo,
   type LiveBrowserMouseButton,
@@ -25,8 +26,11 @@ import {
   type LiveBrowserViewport,
   encodeLiveBrowserFrame,
   liveBrowserModifiersToBitmask,
+  normalizeBrowserHandoffResumeWhen,
 } from '@openclaude/protocol'
 import { WebSocket, WebSocketServer } from 'ws'
+
+import { LiveBrowserAutoResumeWatcher } from './liveBrowserAutoResume.js'
 
 import {
   LiveBrowserUpgradeAuthError,
@@ -95,6 +99,7 @@ export interface LiveBrowserStreamManagerDeps {
   settledDelayMs?: number
   motionIntervalMs?: number
   takeoverTtlMs?: number
+  autoResumePollIntervalMs?: number
 }
 
 function clampNum(v: number, min: number, max: number): number {
@@ -166,6 +171,9 @@ class LiveBrowserStreamSession {
   private screenshotInFlight = false
   private screenshotAgain = false
   private attachInFlight: Promise<CdpAttachResult> | null = null
+  private pendingResumeWhen: BrowserHandoffResumeWhen | undefined = undefined
+  private pendingWatchId: string | undefined = undefined
+  private readonly autoResumeWatcher: LiveBrowserAutoResumeWatcher
   private closed = false
 
   constructor(
@@ -178,6 +186,28 @@ class LiveBrowserStreamSession {
     this.ownsTakeoverLease = false
     this.humanTakeover = false
     this.lastAgentBusy = this.deps.isAgentBusy(agentId)
+    this.autoResumeWatcher = new LiveBrowserAutoResumeWatcher({
+      getCdp: () =>
+        this.cdp && this.pageSessionId
+          ? { cdp: this.cdp, sessionId: this.pageSessionId }
+          : null,
+      isActive: () => !this.closed && this.humanTakeover && this.ownsTakeoverLease,
+      isLoading: () => this.loading,
+      getFallbackUrl: () => this.url,
+      getFallbackTitle: () => this.title,
+      now: () => this.now(),
+      pollIntervalMs: this.deps.autoResumePollIntervalMs,
+      onReady: (msg) => {
+        if (!this.closed && this.humanTakeover && this.ownsTakeoverLease) {
+          this.send(msg)
+        }
+      },
+      onVetoed: (msg) => {
+        if (!this.closed && this.humanTakeover && this.ownsTakeoverLease) {
+          this.send(msg)
+        }
+      },
+    })
 
     ws.on('message', (data, isBinary) => {
       if (isBinary || this.closed) return
@@ -217,9 +247,12 @@ class LiveBrowserStreamSession {
         this.lastAgentBusy = busy
         this.ownsTakeoverLease = iHoldLease
         this.humanTakeover = iHoldLease
-        if (!iHoldLease && this.leaseRenewTimer) {
-          clearInterval(this.leaseRenewTimer)
-          this.leaseRenewTimer = null
+        if (!iHoldLease) {
+          this.autoResumeWatcher.stop()
+          if (this.leaseRenewTimer) {
+            clearInterval(this.leaseRenewTimer)
+            this.leaseRenewTimer = null
+          }
         }
         this.emitState()
       }
@@ -432,6 +465,9 @@ class LiveBrowserStreamSession {
       }
       this.cdpAvailable = true
       this.emittedCdpUnavailable = false
+      if (this.humanTakeover && this.ownsTakeoverLease && !this.autoResumeWatcher.isRunning()) {
+        this.autoResumeWatcher.start(this.pendingResumeWhen, this.pendingWatchId)
+      }
       if (this.readySent) this.emitState()
       return 'attached'
     } catch {
@@ -613,13 +649,25 @@ class LiveBrowserStreamSession {
   }
 
   private onCdpDisconnected(): void {
+    const wasTakeover = this.humanTakeover
+    const watchId = this.pendingWatchId
+    this.cdpAvailable = false
     this.detachCdpLocal()
     if (!this.closed) {
+      if (wasTakeover) {
+        this.send({
+          type: 'handoff_vetoed',
+          reason: 'cdp_disconnected',
+          ...(watchId ? { watchId } : {}),
+          detectedAt: this.now(),
+        })
+      }
       this.emitState()
     }
   }
 
   private detachCdpLocal(): void {
+    this.autoResumeWatcher.stop()
     this.unsubCdpEvents?.()
     this.unsubCdpEvents = null
     this.unsubCdpClose?.()
@@ -707,12 +755,38 @@ class LiveBrowserStreamSession {
     }
 
     if (
+      (method === 'Page.downloadWillBegin' || method === 'Browser.downloadWillBegin') &&
+      (!sessionId || sessionId === this.pageSessionId)
+    ) {
+      const guid = typeof params?.guid === 'string' ? params.guid : ''
+      const suggestedFilename =
+        typeof params?.suggestedFilename === 'string' ? params.suggestedFilename : undefined
+      if (guid) {
+        this.autoResumeWatcher.onDownloadBegin(guid, suggestedFilename)
+      }
+      return
+    }
+
+    if (
+      (method === 'Page.downloadProgress' || method === 'Browser.downloadProgress') &&
+      (!sessionId || sessionId === this.pageSessionId)
+    ) {
+      const guid = typeof params?.guid === 'string' ? params.guid : ''
+      const state = typeof params?.state === 'string' ? params.state : ''
+      if (guid && state) {
+        this.autoResumeWatcher.onDownloadProgress(guid, state)
+      }
+      return
+    }
+
+    if (
       (method === 'Page.frameStoppedLoading' || method === 'Page.loadEventFired') &&
       sessionId === this.pageSessionId
     ) {
       this.loading = false
       this.emitState()
       this.scheduleSettledScreenshot()
+      this.autoResumeWatcher.onNavigation()
       return
     }
 
@@ -723,6 +797,7 @@ class LiveBrowserStreamSession {
         this.navGen += 1
         this.emitState()
         this.scheduleSettledScreenshot()
+        this.autoResumeWatcher.onNavigation()
       }
       return
     }
@@ -964,6 +1039,7 @@ class LiveBrowserStreamSession {
       if (!renewed) {
         this.ownsTakeoverLease = false
         this.humanTakeover = false
+        this.autoResumeWatcher.stop()
         if (this.leaseRenewTimer) {
           clearInterval(this.leaseRenewTimer)
           this.leaseRenewTimer = null
@@ -973,7 +1049,12 @@ class LiveBrowserStreamSession {
     }
   }
 
-  private setTakeover(active: boolean, gen: number): void {
+  private setTakeover(
+    active: boolean,
+    gen: number,
+    resumeWhen?: BrowserHandoffResumeWhen,
+    watchId?: string,
+  ): void {
     if (!this.isAlive(gen)) return
     if (active) {
       if (this.deps.isAgentBusy(this.agentId)) {
@@ -998,6 +1079,13 @@ class LiveBrowserStreamSession {
       this.lastLeaseRenewAt = now
       this.ownsTakeoverLease = true
       this.humanTakeover = true
+      if (resumeWhen !== undefined) {
+        this.pendingResumeWhen = resumeWhen
+      }
+      if (watchId !== undefined) {
+        this.pendingWatchId = watchId
+      }
+      this.autoResumeWatcher.start(this.pendingResumeWhen, this.pendingWatchId)
       if (!this.leaseRenewTimer) {
         this.leaseRenewTimer = setInterval(() => {
           if (!this.isAlive(gen) || !this.ownsTakeoverLease) return
@@ -1011,6 +1099,7 @@ class LiveBrowserStreamSession {
           if (!renewed) {
             this.ownsTakeoverLease = false
             this.humanTakeover = false
+            this.autoResumeWatcher.stop()
             if (this.leaseRenewTimer) {
               clearInterval(this.leaseRenewTimer)
               this.leaseRenewTimer = null
@@ -1021,6 +1110,9 @@ class LiveBrowserStreamSession {
         this.leaseRenewTimer.unref?.()
       }
     } else {
+      this.autoResumeWatcher.stop()
+      this.pendingResumeWhen = undefined
+      this.pendingWatchId = undefined
       if (this.leaseRenewTimer) {
         clearInterval(this.leaseRenewTimer)
         this.leaseRenewTimer = null
@@ -1061,6 +1153,7 @@ class LiveBrowserStreamSession {
     if (this.ownsTakeoverLease && (!activeLease || activeLease.token !== this.takeoverToken)) {
       this.ownsTakeoverLease = false
       this.humanTakeover = false
+      this.autoResumeWatcher.stop()
       this.emitState()
       throw new LiveBrowserError(409, 'TAKEOVER_TOKEN_MISMATCH', '接管租约已失效，请重新接管')
     }
@@ -1155,9 +1248,35 @@ class LiveBrowserStreamSession {
         this.send({ type: 'pong', ts: msg.ts, serverTs: this.now() })
         return
 
-      case 'takeover':
-        this.setTakeover(msg.active === true, gen)
+      case 'takeover': {
+        const resumeWhen =
+          msg.active === true && 'resumeWhen' in msg
+            ? normalizeBrowserHandoffResumeWhen(msg.resumeWhen)
+            : undefined
+        const watchId =
+          msg.active === true && typeof msg.watchId === 'string' && msg.watchId.trim()
+            ? msg.watchId.trim().slice(0, 128)
+            : undefined
+        this.setTakeover(msg.active === true, gen, resumeWhen, watchId)
         return
+      }
+
+      case 'handoff_watch': {
+        const nextResumeWhen =
+          msg.resumeWhen === null ? undefined : normalizeBrowserHandoffResumeWhen(msg.resumeWhen)
+        const nextWatchId =
+          typeof msg.watchId === 'string' && msg.watchId.trim()
+            ? msg.watchId.trim().slice(0, 128)
+            : undefined
+        this.pendingResumeWhen = nextResumeWhen
+        if (nextWatchId !== undefined || msg.resumeWhen === null) {
+          this.pendingWatchId = nextWatchId
+        }
+        if (this.humanTakeover && this.ownsTakeoverLease) {
+          this.autoResumeWatcher.setResumeWhen(nextResumeWhen, this.pendingWatchId)
+        }
+        return
+      }
 
       case 'open': {
         if (this.deps.isAgentBusy(this.agentId)) {
@@ -1600,6 +1719,8 @@ class LiveBrowserStreamSession {
     if (this.closed) return
     this.closed = true
     this.sessionGen += 1
+    this.autoResumeWatcher.stop()
+    this.pendingResumeWhen = undefined
     this.controlQueue.length = 0
     if (this.motionTimer) clearTimeout(this.motionTimer)
     if (this.settledTimer) clearTimeout(this.settledTimer)

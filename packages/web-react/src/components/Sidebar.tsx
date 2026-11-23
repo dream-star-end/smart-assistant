@@ -41,6 +41,7 @@ import { cn, formatCompactCount, formatCredits } from "../lib/utils";
 import { BrandMark } from "./BrandMark";
 import { LazyBoundary } from "./ChunkErrorBoundary";
 import { ProjectRow } from "./sidebar/ProjectRow";
+import type { PendingDecisionBrowserHandoffOpenOpts } from "./sidebar/PendingDecisionsDock";
 import { SessionRow } from "./sidebar/SessionRow";
 import { VirtualList } from "./sidebar/VirtualList";
 import {
@@ -269,7 +270,7 @@ export type SidebarProps = {
   /** 可选：是否展示侧栏顶部活态指挥区；默认 true（无活态项时自动零占位折叠）。 */
   showLiveActivityStrip?: boolean;
   /** 可选：从待拍板聚合区一键直达实时浏览器接管视口。 */
-  onOpenLiveBrowser?: (opts?: { url?: string; sessionId?: string | null }) => void;
+  onOpenLiveBrowser?: (opts?: PendingDecisionBrowserHandoffOpenOpts) => void;
 };
 
 export function Sidebar({

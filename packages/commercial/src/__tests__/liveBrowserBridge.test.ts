@@ -22,6 +22,10 @@ import { WebSocket, WebSocketServer } from 'ws'
 import { signAccess } from '../auth/jwt.js'
 import { createCommercialPendingDecisionsRuntime } from '../bootstrap/pendingDecisionsBootstrap.js'
 import { handleCreateLiveBrowserStreamTicket } from '../http/liveBrowserTicket.js'
+import {
+  emitOutboundBrowserHandoffFrame,
+  extractBrowserHandoffCardsFromText,
+} from '../pendingDecisions/pgBrowserHandoffStore.js'
 import { InMemoryBrowserHandoffStore } from '../pendingDecisions/sources.js'
 import { AuthoritySigner } from '../ws/authoritySigner.js'
 import {
@@ -177,6 +181,27 @@ describe('createLiveBrowserBridge', () => {
           const msg = JSON.parse(data.toString())
           if (msg.type === 'ping') {
             ws.send(JSON.stringify({ type: 'pong', ts: msg.ts, serverTs: 999 }))
+          } else if (msg.type === 'handoff_watch') {
+            if (msg.resumeWhen === null) {
+              ws.send(
+                JSON.stringify({
+                  type: 'handoff_vetoed',
+                  reason: 'visible_otp_or_captcha_input',
+                  url: 'https://github.com/sessions/two-factor',
+                  detectedAt: 123999,
+                }),
+              )
+            } else {
+              ws.send(
+                JSON.stringify({
+                  type: 'handoff_ready',
+                  signal: 'resume_when_matched',
+                  url: 'https://github.com/org/repo',
+                  title: 'org/repo',
+                  detectedAt: 123456,
+                }),
+              )
+            }
           }
         })
       })
@@ -261,13 +286,48 @@ describe('createLiveBrowserBridge', () => {
       assert.equal(frames[0]!.width, 800)
       assert.equal(frames[0]!.settled, true)
 
-      // Client -> Container -> Client roundtrip
+      // Client -> Container -> Client roundtrip (ping + handoff_watch -> handoff_ready & handoff_vetoed)
       client.send(JSON.stringify({ type: 'ping', ts: 555 }))
+      client.send(
+        JSON.stringify({
+          type: 'handoff_watch',
+          resumeWhen: { urlLeave: ['/login'], urlMatch: ['github.com/org/repo'] },
+        }),
+      )
+      client.send(JSON.stringify({ type: 'handoff_watch', resumeWhen: null }))
       await new Promise<void>((resolve, reject) => {
         const deadline = Date.now() + 2_000
         const poll = () => {
-          if (texts.some((t) => t.type === 'pong' && t.ts === 555)) return resolve()
-          if (Date.now() > deadline) return reject(new Error('timed out waiting for pong'))
+          if (
+            texts.some((t) => t.type === 'pong' && t.ts === 555) &&
+            texts.some(
+              (t) =>
+                t.type === 'handoff_ready' &&
+                t.signal === 'resume_when_matched' &&
+                t.url === 'https://github.com/org/repo',
+            ) &&
+            texts.some(
+              (t) =>
+                t.type === 'handoff_vetoed' &&
+                t.reason === 'visible_otp_or_captcha_input' &&
+                t.url === 'https://github.com/sessions/two-factor',
+            )
+          ) {
+            return resolve()
+          }
+          if (Date.now() > deadline) return reject(new Error('timed out waiting for pong/handoff_ready/handoff_vetoed'))
+          setTimeout(poll, 15)
+        }
+        poll()
+      })
+
+      // Unknown client control message type must be rejected by bridge security check
+      client.send(JSON.stringify({ type: 'evil_unknown_cmd' }))
+      await new Promise<void>((resolve, reject) => {
+        const deadline = Date.now() + 2_000
+        const poll = () => {
+          if (texts.some((t) => t.type === 'error' && t.code === 'BAD_MESSAGE')) return resolve()
+          if (Date.now() > deadline) return reject(new Error('timed out waiting for BAD_MESSAGE'))
           setTimeout(poll, 15)
         }
         poll()
@@ -512,6 +572,94 @@ describe('pendingDecisionsBootstrap browser_handoff resolve loop', () => {
       assert.equal(resolvedEvents[0]!.userId, 'c:42')
       assert.equal(resolvedEvents[0]!.status, 'approved')
       assert.ok(rec.id === 'bh-1')
+    } finally {
+      runtime.dispose()
+    }
+  })
+
+  it('extracts and persists optional resume_when while staying 100% backward compatible with legacy cards', async () => {
+    const legacyText = [
+      '请登录：',
+      '```ui',
+      JSON.stringify({
+        type: 'browser_handoff',
+        title: '旧版登录卡',
+        url: 'https://github.com/login',
+        reason: '需要登录',
+      }),
+      '```',
+    ].join('\n')
+    const legacyCards = extractBrowserHandoffCardsFromText(legacyText)
+    assert.equal(legacyCards.length, 1)
+    assert.equal(legacyCards[0]!.resumeWhen, undefined)
+
+    const modernText = [
+      '请完成登录与下载：',
+      '```ui',
+      JSON.stringify({
+        type: 'browser_handoff',
+        title: '新版自动继续卡',
+        url: 'https://journal.example.org/login',
+        reason: '登录后自动继续',
+        continue_prompt: '继续解析论文',
+        resume_when: {
+          url_leave: ['/login', '/sso'],
+          url_match: ['/paper/'],
+          selector_gone: 'input[type="password"]',
+          wait_download: true,
+          auto_resume_delay_ms: 3000,
+        },
+      }),
+      '```',
+    ].join('\n')
+    const modernCards = extractBrowserHandoffCardsFromText(modernText)
+    assert.equal(modernCards.length, 1)
+    assert.deepEqual(modernCards[0]!.resumeWhen, {
+      urlLeave: ['/login', '/sso'],
+      urlMatch: ['/paper/'],
+      selectorGone: 'input[type="password"]',
+      waitDownload: true,
+      autoResumeDelayMs: 3000,
+    })
+
+    const store = new InMemoryBrowserHandoffStore()
+    const runtime = createCommercialPendingDecisionsRuntime({
+      pool: {} as any,
+      onControlAdmitted: () => {},
+      browserHandoffStore: store,
+    })
+    try {
+      emitOutboundBrowserHandoffFrame({
+        userId: 'c:42',
+        sessionId: 'sess-rw',
+        messageId: 'msg-1',
+        text: modernText,
+      })
+      await new Promise((r) => setTimeout(r, 30))
+      const listed = await store.listPending('c:42', 10)
+      assert.equal(listed.length, 1)
+      assert.deepEqual(listed[0]!.metadata?.resumeWhen, modernCards[0]!.resumeWhen)
+      assert.equal(listed[0]!.metadata?.continuePrompt, '继续解析论文')
+
+      // B7: pending-decisions source must expose persisted resumeWhen & continuePrompt to frontend inbox
+      const pendingList = await runtime.service.list('c:42', { sources: ['browser_handoff'] })
+      assert.equal(pendingList.items.length, 1)
+      assert.deepEqual(pendingList.items[0]!.metadata.resumeWhen, modernCards[0]!.resumeWhen)
+      assert.equal(pendingList.items[0]!.metadata.continuePrompt, '继续解析论文')
+
+      // Legacy persisted handoff without resumeWhen omits it cleanly
+      await store.create({
+        id: 'bh-legacy',
+        userId: 'c:42',
+        sessionId: 'sess-legacy',
+        title: '旧版卡片',
+        url: 'https://github.com/login',
+        reason: '登录',
+      })
+      const pendingWithLegacy = await runtime.service.list('c:42', { sources: ['browser_handoff'] })
+      const legacyItem = pendingWithLegacy.items.find((i) => i.sourceId === 'bh-legacy')
+      assert.ok(legacyItem)
+      assert.equal(legacyItem.metadata.resumeWhen, undefined)
     } finally {
       runtime.dispose()
     }

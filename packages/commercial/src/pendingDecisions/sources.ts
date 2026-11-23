@@ -10,6 +10,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { Pool } from 'pg'
 import {
   encodePendingDecisionId,
+  normalizeBrowserHandoffResumeWhen,
   type InboundPermissionResponse,
   type PendingDecisionAction,
   type PendingDecisionItem,
@@ -841,25 +842,32 @@ export function createBrowserHandoffSource(store: BrowserHandoffStore): PendingD
     async listPending(userId, opts): Promise<PendingDecisionItem[]> {
       const limit = Math.max(1, Math.min(opts?.limit ?? 50, 200))
       const rows = await store.listPending(userId, limit, opts?.nowMs)
-      return rows.map((rec) => ({
-        id: encodePendingDecisionId('browser_handoff', rec.id),
-        source: 'browser_handoff',
-        sourceId: rec.id,
-        userId: rec.userId,
-        sessionId: rec.sessionId,
-        title: rec.title || '浏览器人工接管',
-        summary: `${rec.reason} (${rec.url})`,
-        riskLevel: rec.riskLevel ?? 'high',
-        status: 'pending',
-        metadata: {
-          url: rec.url,
-          reason: rec.reason,
-          ...(rec.metadata ?? {}),
-        },
-        createdAt: rec.createdAt,
-        expiresAt: rec.expiresAt,
-        allowedActions: ['approve', 'deny'],
-      }))
+      return rows.map((rec) => {
+        const rawMeta = rec.metadata ?? {}
+        const normalizedResumeWhen = normalizeBrowserHandoffResumeWhen(
+          rawMeta.resumeWhen ?? rawMeta.resume_when,
+        )
+        return {
+          id: encodePendingDecisionId('browser_handoff', rec.id),
+          source: 'browser_handoff',
+          sourceId: rec.id,
+          userId: rec.userId,
+          sessionId: rec.sessionId,
+          title: rec.title || '浏览器人工接管',
+          summary: `${rec.reason} (${rec.url})`,
+          riskLevel: rec.riskLevel ?? 'high',
+          status: 'pending',
+          metadata: {
+            url: rec.url,
+            reason: rec.reason,
+            ...rawMeta,
+            ...(normalizedResumeWhen ? { resumeWhen: normalizedResumeWhen } : {}),
+          },
+          createdAt: rec.createdAt,
+          expiresAt: rec.expiresAt,
+          allowedActions: ['approve', 'deny'],
+        }
+      })
     },
 
     async resolve(userId, sourceId, req, nowMs = Date.now()): Promise<ResolvePendingDecisionResponse> {

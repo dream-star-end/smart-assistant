@@ -31,6 +31,7 @@ import type {
 } from "../../lib/liveBrowserStreamClient";
 import { Popover, PopoverContent, PopoverTrigger, Spinner } from "../ui";
 import type { LiveBrowserZoomMode } from "./LiveBrowserCanvas";
+import { type AutoResumeSnapshot, formatAutoResumeUiFilename } from "./liveBrowserAutoResume";
 
 const QUICK_PRESETS = [
   { label: "Google Scholar", url: "https://scholar.google.com" },
@@ -810,4 +811,83 @@ export function LiveBrowserToolbar({
       </div>
     </>
   );
+}
+
+export function LiveBrowserAutoResumeBanner({
+  snapshot,
+  onContinueNow,
+  onWait,
+  onManualHandBack,
+}: {
+  snapshot: AutoResumeSnapshot;
+  onContinueNow: () => void;
+  onWait: () => void;
+  onManualHandBack: () => void;
+}) {
+  if (snapshot.phase === "countdown") {
+    const uiFile = formatAutoResumeUiFilename(snapshot.event?.filename);
+    const fileHint = uiFile ? `（已捕获：${uiFile}）` : "";
+    return (
+      <div
+        className="lb-autoresume-bar"
+        role="status"
+        aria-live="polite"
+        data-testid="live-browser-autoresume-banner"
+      >
+        <span className="lb-autoresume-copy">
+          <Check size={13} className="shrink-0 text-success" aria-hidden />
+          <span>
+            检测到已完成操作{fileHint}，<strong>{snapshot.remainingSec}</strong> 秒后自动交还助手继续…
+          </span>
+        </span>
+        <div className="lb-autoresume-actions">
+          <button
+            type="button"
+            className="lb-autoresume-btn oc-btn-tactile oc-btn-accent-craft"
+            data-testid="live-browser-autoresume-now"
+            onClick={onContinueNow}
+          >
+            立即继续
+          </button>
+          <button
+            type="button"
+            className="lb-autoresume-btn oc-btn-tactile oc-btn-secondary-craft"
+            data-testid="live-browser-autoresume-wait"
+            onClick={onWait}
+          >
+            再等等
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (snapshot.phase === "circuit_open") {
+    return (
+      <div
+        className="lb-autoresume-bar"
+        data-mode="manual-lock"
+        role="status"
+        aria-live="polite"
+        data-testid="live-browser-autoresume-manual-lock"
+      >
+        <span className="lb-autoresume-copy">
+          <ShieldAlert size={13} className="shrink-0 text-warning" aria-hidden />
+          <span>检测到已完成操作；连续往返保护已启用，请确认后手动交还助手。</span>
+        </span>
+        <div className="lb-autoresume-actions">
+          <button
+            type="button"
+            className="lb-autoresume-btn oc-btn-tactile oc-btn-accent-craft"
+            data-testid="live-browser-autoresume-manual-btn"
+            onClick={onManualHandBack}
+          >
+            交还并继续
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return null;
 }

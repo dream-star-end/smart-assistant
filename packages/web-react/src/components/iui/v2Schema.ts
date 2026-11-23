@@ -1,6 +1,10 @@
 /**
  * Intelligent UI 二期新增 6 类组件 schema 与校验（deliverables / citations / runbook / prompt_template / storyboard / flashcards）。
  */
+import {
+  type BrowserHandoffResumeWhen,
+  normalizeBrowserHandoffResumeWhen,
+} from "@openclaude/protocol/browser";
 import { needsSignedSrc } from "../../lib/chat/media";
 
 type Sub = { subtitle?: string };
@@ -52,6 +56,7 @@ export type BrowserHandoffSpec = Sub & {
   action_label?: string;
   continue_label?: string;
   continue_prompt?: string;
+  resume_when?: BrowserHandoffResumeWhen;
 };
 
 export type V2Spec =
@@ -345,6 +350,7 @@ function browserHandoff(raw: Record<string, unknown>, _ctx: Ctx): BrowserHandoff
     ...optional("action_label", str(raw.action_label ?? raw.cta, 40)),
     ...optional("continue_label", str(raw.continue_label, 40)),
     ...optional("continue_prompt", str(raw.continue_prompt ?? raw.prompt, 400)),
+    ...optional("resume_when", normalizeBrowserHandoffResumeWhen(raw.resume_when ?? raw.resumeWhen)),
   };
 }
 

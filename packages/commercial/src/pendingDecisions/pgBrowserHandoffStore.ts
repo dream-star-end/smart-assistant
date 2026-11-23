@@ -13,7 +13,12 @@
 
 import { createHash, randomUUID } from 'node:crypto'
 import type { Pool } from 'pg'
-import type { PendingDecisionAction, PendingDecisionRiskLevel } from '@openclaude/protocol'
+import {
+  type BrowserHandoffResumeWhen,
+  type PendingDecisionAction,
+  type PendingDecisionRiskLevel,
+  normalizeBrowserHandoffResumeWhen,
+} from '@openclaude/protocol'
 import { rootLogger } from '../logging/logger.js'
 import { PendingDecisionError, type BrowserHandoffRecord, type BrowserHandoffStore } from './types.js'
 
@@ -275,6 +280,7 @@ export interface ParsedBrowserHandoffCard {
   url: string
   reason: string
   continuePrompt?: string
+  resumeWhen?: BrowserHandoffResumeWhen
 }
 
 const UI_FENCE_RE = /```ui\s*\r?\n([\s\S]*?)```/gi
@@ -306,7 +312,14 @@ export function extractBrowserHandoffCardsFromText(text: string): ParsedBrowserH
         typeof parsed.continue_prompt === 'string' && parsed.continue_prompt.trim()
           ? parsed.continue_prompt.trim()
           : undefined
-      out.push({ title, url, reason, ...(continuePrompt ? { continuePrompt } : {}) })
+      const resumeWhen = normalizeBrowserHandoffResumeWhen(parsed.resume_when ?? parsed.resumeWhen)
+      out.push({
+        title,
+        url,
+        reason,
+        ...(continuePrompt ? { continuePrompt } : {}),
+        ...(resumeWhen ? { resumeWhen } : {}),
+      })
     } catch {
       // ignore malformed ui block
     }

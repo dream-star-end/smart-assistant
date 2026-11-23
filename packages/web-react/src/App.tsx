@@ -2136,7 +2136,7 @@ export function App() {
     loadingArchived,
     onSearchMessages: searchSessionMessages,
     onOpenPalette: closeMobileThen(() => setPaletteOpen(true)),
-    onOpenLiveBrowser: demo ? undefined : (opts?: { url?: string; sessionId?: string | null }) => { setMobileNavOpen(false); const targetSid = opts?.sessionId && sessions.some((s) => s.id === opts.sessionId) ? opts.sessionId : undefined; if (targetSid) selectSession(targetSid); openPane("browser", null, { takeover: true, expand: true, ...(opts?.url ? { url: opts.url } : {}) }, targetSid); },
+    onOpenLiveBrowser: demo ? undefined : (opts?: import("./components/sidebar/PendingDecisionsDock").PendingDecisionBrowserHandoffOpenOpts) => { setMobileNavOpen(false); const targetSid = opts?.sessionId && sessions.some((s) => s.id === opts.sessionId) ? opts.sessionId : undefined; if (targetSid) selectSession(targetSid); openPane("browser", null, { takeover: true, expand: true, ...(opts?.url ? { url: opts.url } : {}), ...(opts?.handoffId ? { handoffId: opts.handoffId } : {}), ...(opts?.continuePrompt ? { continuePrompt: opts.continuePrompt } : {}), ...(opts?.resumeWhen ? { resumeWhen: opts.resumeWhen } : {}) }, targetSid); },
   };
   return (
     <MediaSignProvider

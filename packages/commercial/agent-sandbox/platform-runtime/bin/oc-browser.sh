@@ -577,7 +577,42 @@ esac
 browser_home="${OPENCLAUDE_HOME:-/home/agent/.openclaude}"
 [ -d "$browser_home" ] || die "browser workspace is unavailable: $browser_home"
 state_dir="/tmp/openclaude-playwright-cli/$agent_key"
-profile_dir="${browser_home}/browser-profiles/${agent_key}"
+# Persistent per-Agent Chrome profile lives inside the persistent volume ($browser_home),
+# surviving `oc-browser close`, 30min idle reap, and container recycle.
+# Both default (`$browser_home/browser-profiles/$agent_key`) and optional
+# `OPENCLAUDE_BROWSER_PROFILE_ROOT` override validate EVERY path component down to the
+# final per-Agent profile directory with `lstatSync` (zero live or dangling symlink escapes).
+profile_root_raw="${OPENCLAUDE_BROWSER_PROFILE_ROOT:-${browser_home}/browser-profiles}"
+profile_dir="$(node -e '
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const homeReal = fs.realpathSync(process.argv[1]);
+  const rawRoot = process.argv[2];
+  const agentKey = process.argv[3];
+  if (!rawRoot || rawRoot.includes("\0")) process.exit(1);
+  if (rawRoot.split(/[\\/]/).includes("..")) process.exit(1);
+  if (!agentKey || agentKey.includes("\0") || agentKey.includes("/") || agentKey.includes("\\") || agentKey === "." || agentKey === "..") process.exit(1);
+  const resolvedRoot = path.resolve(homeReal, rawRoot);
+  const resolvedFinal = path.join(resolvedRoot, agentKey);
+  const isInside = (p) => p.startsWith(homeReal + path.sep);
+  if (!isInside(resolvedFinal)) process.exit(1);
+  // Walk every component below homeReal down to and including the final Agent directory.
+  const rel = path.relative(homeReal, resolvedFinal);
+  let cur = homeReal;
+  for (const seg of rel.split(path.sep)) {
+    if (!seg || seg === "." || seg === "..") process.exit(1);
+    cur = path.join(cur, seg);
+    try {
+      const st = fs.lstatSync(cur);
+      if (st.isSymbolicLink() || !st.isDirectory()) process.exit(1);
+    } catch (err) {
+      if (err && err.code === "ENOENT") break;
+      process.exit(1);
+    }
+  }
+  process.stdout.write(resolvedFinal);
+' "$browser_home" "$profile_root_raw" "$agent_key" 2>/dev/null)" \
+  || die "browser profile path must be a non-symlink directory within browser workspace: $browser_home"
 cache_home="$state_dir/cache"
 lock_file="$state_dir/activity.lock"
 activity_file="$state_dir/activity"

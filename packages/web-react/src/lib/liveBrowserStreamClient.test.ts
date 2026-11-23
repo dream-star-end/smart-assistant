@@ -397,6 +397,96 @@ describe("LiveBrowserStreamClient", () => {
     expect(fallbacks).toHaveLength(1);
     client.dispose();
   });
+
+  test("dispatches handoff_ready & handoff_vetoed events and drops stale-generation messages", async () => {
+    const sockets: FakeWebSocket[] = [];
+    const readyEvents: Array<{ signal: string; url: string; filename?: string }> = [];
+    const vetoEvents: Array<{ reason: string; url?: string }> = [];
+
+    const client = new LiveBrowserStreamClient({
+      agentId: "main",
+      getAuth: () => MOCK_AUTH,
+      requestTicket: vi.fn(
+        async (): Promise<LiveBrowserStreamTicketResponse> => ({
+          ticket: "tkt-hr",
+          expiresAt: Date.now() + 60_000,
+          agentId: "main",
+          wsPath: LIVE_BROWSER_PUBLIC_WS_PATH,
+          protocol: LIVE_BROWSER_TICKET_PROTOCOL,
+        }),
+      ),
+      createWebSocket: (url, protocols) => {
+        const ws = new FakeWebSocket(url, protocols);
+        sockets.push(ws);
+        return ws as unknown as WebSocket;
+      },
+      callbacks: {
+        onHandoffReady: (evt) =>
+          readyEvents.push({ signal: evt.signal, url: evt.url, filename: evt.filename }),
+        onHandoffVetoed: (evt) => vetoEvents.push({ reason: evt.reason, url: evt.url }),
+      },
+    });
+
+    client.start();
+    await Promise.resolve();
+    await Promise.resolve();
+    const ws1 = sockets[0]!;
+    ws1.emitOpen();
+    ws1.emitMessage(
+      JSON.stringify({
+        type: "handoff_ready",
+        signal: "download_completed",
+        url: "https://arxiv.org/abs/2501.00001",
+        filename: "2501.00001.pdf",
+        detectedAt: Date.now(),
+      }),
+    );
+    ws1.emitMessage(
+      JSON.stringify({
+        type: "handoff_vetoed",
+        reason: "visible_otp_or_captcha_input",
+        url: "https://arxiv.org/abs/2501.00001",
+        detectedAt: Date.now(),
+      }),
+    );
+    expect(readyEvents).toEqual([
+      {
+        signal: "download_completed",
+        url: "https://arxiv.org/abs/2501.00001",
+        filename: "2501.00001.pdf",
+      },
+    ]);
+    expect(vetoEvents).toEqual([
+      {
+        reason: "visible_otp_or_captcha_input",
+        url: "https://arxiv.org/abs/2501.00001",
+      },
+    ]);
+
+    // Reconnect -> late handoff_ready & handoff_vetoed from ws1 MUST be ignored by connGen fence!
+    client.retryNow();
+    await Promise.resolve();
+    await Promise.resolve();
+    ws1.emitMessage(
+      JSON.stringify({
+        type: "handoff_ready",
+        signal: "login_completed",
+        url: "https://stale.example.com",
+        detectedAt: Date.now(),
+      }),
+    );
+    ws1.emitMessage(
+      JSON.stringify({
+        type: "handoff_vetoed",
+        reason: "page_loading",
+        url: "https://stale.example.com",
+        detectedAt: Date.now(),
+      }),
+    );
+    expect(readyEvents).toHaveLength(1);
+    expect(vetoEvents).toHaveLength(1);
+    client.dispose();
+  });
 });
 
 describe("sendLiveBrowserAction timeout guard", () => {

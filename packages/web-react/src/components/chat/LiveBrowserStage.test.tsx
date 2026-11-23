@@ -1221,4 +1221,356 @@ describe("LiveBrowserStage", () => {
     expect(recorded?.autoSent).toBe(true);
     expect(sendUserText).toHaveBeenCalledWith("我已完成浏览器接管操作，请继续处理。");
   });
+
+  test("WS handoff_ready shows 3s countdown after 2s idle, cancels on '再等等', and auto-hands back on countdown zero", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    class MockAutoResumeWS {
+      static instances: MockAutoResumeWS[] = [];
+      public binaryType = "blob";
+      public readyState = 0;
+      public sent: Array<Record<string, unknown>> = [];
+      public onopen: ((ev: Event) => void) | null = null;
+      public onmessage: ((ev: MessageEvent) => void) | null = null;
+      public onerror: ((ev: Event) => void) | null = null;
+      public onclose: ((ev: CloseEvent) => void) | null = null;
+      constructor() {
+        MockAutoResumeWS.instances.push(this);
+      }
+      send(data: string) {
+        this.sent.push(JSON.parse(data) as Record<string, unknown>);
+      }
+      close(code = 1000, reason = "") {
+        this.readyState = 3;
+        this.onclose?.({ code, reason } as CloseEvent);
+      }
+    }
+
+    const origWS = globalThis.WebSocket;
+    (globalThis as unknown as { WebSocket: unknown }).WebSocket = MockAutoResumeWS;
+    requestTicketMock.mockResolvedValue({
+      ticket: "tkt-ar",
+      expiresAt: Date.now() + 60_000,
+      agentId: "main",
+      wsPath: LIVE_BROWSER_PUBLIC_WS_PATH,
+      protocol: LIVE_BROWSER_TICKET_PROTOCOL,
+    });
+    fetchLiveMock.mockResolvedValue(ACTIVE_STATE);
+    const sendUserText = vi.fn();
+
+    try {
+      render(
+        <ChatInteractionContext.Provider value={{ sendUserText, busy: false, sessionId: "sess-ar" }}>
+          <LiveBrowserStage
+            agentId="main"
+            auth={MOCK_AUTH}
+            running={false}
+            handoffRequest={{
+              nonce: 301,
+              takeover: true,
+              expand: false,
+              url: "https://arxiv.org/login",
+              handoffId: "hid-ar-1",
+              resumeWhen: { urlLeave: ["/login"], autoResumeDelayMs: 3000 },
+            }}
+          />
+        </ChatInteractionContext.Provider>,
+      );
+
+      await waitFor(() => expect(MockAutoResumeWS.instances.length).toBeGreaterThanOrEqual(1));
+      const ws = MockAutoResumeWS.instances[0]!;
+      act(() => {
+        ws.readyState = 1;
+        ws.onopen?.(new Event("open"));
+        ws.onmessage?.({
+          data: JSON.stringify({
+            type: "ready",
+            protocolVersion: 1,
+            agentId: "main",
+            state: {
+              active: true,
+              agentBusy: false,
+              humanTakeover: false,
+              url: "https://arxiv.org/login",
+              origin: "https://arxiv.org",
+              targetId: "tgt-1",
+              navGen: 1,
+              title: "arXiv Login",
+              loading: false,
+              viewport: { width: 1280, height: 720 },
+              tabs: [{ index: 0, id: "tgt-1", title: "arXiv Login", url: "https://arxiv.org/login", active: true }],
+              dialog: null,
+            },
+          }),
+        } as MessageEvent);
+      });
+
+      // Takeover sent with resumeWhen forwarded from browser_handoff card
+      await waitFor(() =>
+        expect(ws.sent).toContainEqual(
+          expect.objectContaining({
+            type: "takeover",
+            active: true,
+            resumeWhen: { urlLeave: ["/login"], autoResumeDelayMs: 3000 },
+          }),
+        ),
+      );
+
+      // Simulate 2.2s user silence -> server emits handoff_ready -> countdown banner appears
+      act(() => {
+        vi.advanceTimersByTime(2_200);
+        ws.onmessage?.({
+          data: JSON.stringify({
+            type: "handoff_ready",
+            signal: "resume_when_matched",
+            url: "https://arxiv.org/abs/2501.00001?secret=1",
+            title: "Paper",
+            detectedAt: Date.now(),
+          }),
+        } as MessageEvent);
+      });
+
+      const banner = await screen.findByTestId("live-browser-autoresume-banner");
+      expect(banner).toHaveTextContent("检测到已完成操作");
+      expect(banner).toHaveTextContent("3 秒后自动交还助手继续");
+
+      // Click "再等等" -> cancels countdown!
+      fireEvent.click(screen.getByTestId("live-browser-autoresume-wait"));
+      expect(screen.queryByTestId("live-browser-autoresume-banner")).toBeNull();
+      act(() => {
+        vi.advanceTimersByTime(4_000);
+      });
+      expect(sendUserText).not.toHaveBeenCalled();
+
+      // New handoff_ready (download completed) -> countdown expires after 3s -> auto hands back!
+      act(() => {
+        ws.onmessage?.({
+          data: JSON.stringify({
+            type: "handoff_ready",
+            signal: "download_completed",
+            url: "https://arxiv.org/abs/2501.00001",
+            filename: "2501.00001.pdf",
+            detectedAt: Date.now(),
+          }),
+        } as MessageEvent);
+      });
+      expect(await screen.findByTestId("live-browser-autoresume-banner")).toHaveTextContent("2501.00001.pdf");
+
+      act(() => {
+        vi.advanceTimersByTime(3_200);
+      });
+
+      // B2: auto-handback MUST send fixed safe message ONLY (never interpolate filename or URL into chat!)
+      expect(sendUserText).toHaveBeenCalledWith("我已完成浏览器接管操作，请继续处理。");
+      expect(sendUserText.mock.calls[0]?.[0]).not.toContain("2501.00001.pdf");
+      expect(sendUserText.mock.calls[0]?.[0]).not.toContain("arxiv.org");
+      expect(ws.sent).toContainEqual(expect.objectContaining({ type: "takeover", active: false }));
+    } finally {
+      (globalThis as unknown as { WebSocket: unknown }).WebSocket = origWS;
+      vi.useRealTimers();
+    }
+  });
+
+  test("B3 & B4: handoff_vetoed, WS disconnect, and Card A->B switch immediately cancel countdown without cross-card handback", async () => {
+    const { getLiveBrowserHandbackFor } = await import("./inspectorState");
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    class MockGuardWS {
+      static instances: MockGuardWS[] = [];
+      public binaryType = "blob";
+      public readyState = 0;
+      public sent: Array<Record<string, unknown>> = [];
+      public onopen: ((ev: Event) => void) | null = null;
+      public onmessage: ((ev: MessageEvent) => void) | null = null;
+      public onerror: ((ev: Event) => void) | null = null;
+      public onclose: ((ev: CloseEvent) => void) | null = null;
+      constructor() {
+        MockGuardWS.instances.push(this);
+      }
+      send(data: string) {
+        this.sent.push(JSON.parse(data) as Record<string, unknown>);
+      }
+      close(code = 1000, reason = "") {
+        this.readyState = 3;
+        this.onclose?.({ code, reason } as CloseEvent);
+      }
+    }
+
+    const origWS = globalThis.WebSocket;
+    (globalThis as unknown as { WebSocket: unknown }).WebSocket = MockGuardWS;
+    requestTicketMock.mockResolvedValue({
+      ticket: "tkt-b34",
+      expiresAt: Date.now() + 60_000,
+      agentId: "main",
+      wsPath: LIVE_BROWSER_PUBLIC_WS_PATH,
+      protocol: LIVE_BROWSER_TICKET_PROTOCOL,
+    });
+    fetchLiveMock.mockResolvedValue(ACTIVE_STATE);
+    const sendUserText = vi.fn();
+
+    const makeReadyStateMsg = () =>
+      JSON.stringify({
+        type: "ready",
+        protocolVersion: 1,
+        agentId: "main",
+        state: {
+          active: true,
+          agentBusy: false,
+          humanTakeover: true,
+          url: "https://arxiv.org/login",
+          origin: "https://arxiv.org",
+          targetId: "tgt-1",
+          navGen: 1,
+          title: "arXiv Login",
+          loading: false,
+          viewport: { width: 1280, height: 720 },
+          tabs: [{ index: 0, id: "tgt-1", title: "arXiv Login", url: "https://arxiv.org/login", active: true }],
+          dialog: null,
+        },
+      });
+
+    try {
+      const { rerender } = render(
+        <ChatInteractionContext.Provider value={{ sendUserText, busy: false, sessionId: "sess-b34" }}>
+          <LiveBrowserStage
+            agentId="main"
+            auth={MOCK_AUTH}
+            running={false}
+            handoffRequest={{
+              nonce: 401,
+              takeover: true,
+              expand: false,
+              url: "https://arxiv.org/login",
+              handoffId: "hid-A",
+              resumeWhen: { urlLeave: ["/login"], autoResumeDelayMs: 3000 },
+            }}
+          />
+        </ChatInteractionContext.Provider>,
+      );
+
+      await waitFor(() => expect(MockGuardWS.instances.length).toBeGreaterThanOrEqual(1));
+      const ws1 = MockGuardWS.instances[0]!;
+      act(() => {
+        ws1.readyState = 1;
+        ws1.onopen?.(new Event("open"));
+        ws1.onmessage?.({ data: makeReadyStateMsg() } as MessageEvent);
+      });
+
+      // B3: handoff_ready starts countdown -> handoff_vetoed cancels it immediately while keeping takeover open
+      act(() => {
+        vi.advanceTimersByTime(2_200);
+        ws1.onmessage?.({
+          data: JSON.stringify({
+            type: "handoff_ready",
+            signal: "login_completed",
+            url: "https://arxiv.org/dashboard",
+            detectedAt: Date.now(),
+          }),
+        } as MessageEvent);
+      });
+      await screen.findByTestId("live-browser-autoresume-banner");
+
+      act(() => {
+        ws1.onmessage?.({
+          data: JSON.stringify({
+            type: "handoff_vetoed",
+            reason: "visible_otp_or_captcha_input",
+            url: "https://arxiv.org/dashboard",
+            detectedAt: Date.now(),
+          }),
+        } as MessageEvent);
+      });
+      expect(screen.queryByTestId("live-browser-autoresume-banner")).toBeNull();
+      expect(screen.getByTestId("live-browser-takeover-dock")).toBeInTheDocument();
+      act(() => {
+        vi.advanceTimersByTime(4_000);
+      });
+      expect(sendUserText).not.toHaveBeenCalled();
+
+      // B4 (Card A -> Card B switch): start countdown on Card A, then rerender with same-origin Card B
+      act(() => {
+        ws1.onmessage?.({
+          data: JSON.stringify({
+            type: "handoff_ready",
+            signal: "login_completed",
+            url: "https://arxiv.org/dashboard",
+            detectedAt: Date.now(),
+          }),
+        } as MessageEvent);
+      });
+      await screen.findByTestId("live-browser-autoresume-banner");
+
+      rerender(
+        <ChatInteractionContext.Provider value={{ sendUserText, busy: false, sessionId: "sess-b34" }}>
+          <LiveBrowserStage
+            agentId="main"
+            auth={MOCK_AUTH}
+            running={false}
+            handoffRequest={{
+              nonce: 402,
+              takeover: true,
+              expand: false,
+              url: "https://arxiv.org/export",
+              handoffId: "hid-B",
+              resumeWhen: { waitDownload: true },
+            }}
+          />
+        </ChatInteractionContext.Provider>,
+      );
+
+      await waitFor(() => expect(screen.queryByTestId("live-browser-autoresume-banner")).toBeNull());
+      expect(ws1.sent).toContainEqual(
+        expect.objectContaining({
+          type: "handoff_watch",
+          resumeWhen: { waitDownload: true },
+          watchId: "handoff-402",
+        }),
+      );
+      // Late in-flight Card A ready must NOT re-arm countdown under Card B
+      act(() => {
+        ws1.onmessage?.({
+          data: JSON.stringify({
+            type: "handoff_ready",
+            signal: "login_completed",
+            url: "https://arxiv.org/dashboard",
+            watchId: "handoff-401",
+            detectedAt: Date.now(),
+          }),
+        } as MessageEvent);
+      });
+      expect(screen.queryByTestId("live-browser-autoresume-banner")).toBeNull();
+      act(() => {
+        vi.advanceTimersByTime(4_000);
+      });
+      expect(sendUserText).not.toHaveBeenCalled();
+      expect(getLiveBrowserHandbackFor("sess-b34", "hid-B")).toBeNull();
+
+      // B4 (WS disconnect): start countdown on Card B (matching watchId), then WS drops -> countdown cancelled immediately
+      act(() => {
+        ws1.onmessage?.({
+          data: JSON.stringify({
+            type: "handoff_ready",
+            signal: "resume_when_matched",
+            url: "https://arxiv.org/export",
+            filename: "out.pdf",
+            watchId: "handoff-402",
+            detectedAt: Date.now(),
+          }),
+        } as MessageEvent);
+      });
+      await screen.findByTestId("live-browser-autoresume-banner");
+
+      act(() => {
+        ws1.close(1006, "network drop");
+      });
+      expect(screen.queryByTestId("live-browser-autoresume-banner")).toBeNull();
+      expect(screen.getByTestId("live-browser-takeover-dock")).toBeInTheDocument();
+      act(() => {
+        vi.advanceTimersByTime(4_000);
+      });
+      expect(sendUserText).not.toHaveBeenCalled();
+      expect(getLiveBrowserHandbackFor("sess-b34", "hid-B")).toBeNull();
+    } finally {
+      (globalThis as unknown as { WebSocket: unknown }).WebSocket = origWS;
+      vi.useRealTimers();
+    }
+  });
 });

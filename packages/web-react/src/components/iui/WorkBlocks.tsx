@@ -473,6 +473,7 @@ export function BrowserHandoffBlock({ spec, notes, streaming, readOnly, nested }
                 url: spec.url,
                 continuePrompt: handbackDraft,
                 handoffId,
+                ...(spec.resume_when ? { resumeWhen: spec.resume_when } : {}),
               });
             }}
           >

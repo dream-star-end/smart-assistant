@@ -1077,6 +1077,9 @@ export function createCommercialPendingDecisionsRuntime(
         title: card.title,
       })
       try {
+        const metadata: Record<string, unknown> = {}
+        if (card.continuePrompt) metadata.continuePrompt = card.continuePrompt
+        if (card.resumeWhen) metadata.resumeWhen = card.resumeWhen
         const rec = await browserHandoffStore.create({
           id,
           userId: evt.userId,
@@ -1085,7 +1088,7 @@ export function createCommercialPendingDecisionsRuntime(
           url: card.url,
           reason: card.reason,
           riskLevel: 'high',
-          ...(card.continuePrompt ? { metadata: { continuePrompt: card.continuePrompt } } : {}),
+          ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
         })
         // Custom injected test stores (e.g. InMemoryBrowserHandoffStore) do not have PgBrowserHandoffStore's
         // built-in onCreated callback, so notify service explicitly (dedup protects PgBrowserHandoffStore).

@@ -42,6 +42,43 @@ const DEFAULT_GLOBAL_CAP = 8
 const CONNECT_TIMEOUT_MS = 30_000
 const UPGRADE_PENDING_TIMEOUT_MS = 5_000
 
+const ALLOWED_CLIENT_CONTROL_TYPES: ReadonlySet<string> = new Set([
+  'takeover',
+  'handoff_watch',
+  'pointer',
+  'wheel',
+  'key',
+  'insert_text',
+  'navigate',
+  'history',
+  'tab',
+  'resize',
+  'dialog',
+  'open',
+  'close_browser',
+  'ping',
+])
+
+const ALLOWED_SERVER_CONTROL_TYPES: ReadonlySet<string> = new Set([
+  'ready',
+  'state',
+  'cursor',
+  'handoff_ready',
+  'handoff_vetoed',
+  'error',
+  'pong',
+])
+
+function isAllowedControlMessage(text: string, allowedTypes: ReadonlySet<string>): boolean {
+  try {
+    const parsed = JSON.parse(text) as { type?: unknown }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false
+    return typeof parsed.type === 'string' && allowedTypes.has(parsed.type)
+  } catch {
+    return false
+  }
+}
+
 export interface LiveBrowserBridgeDeps {
   tickets: LiveBrowserTicketStore
   signer: AuthoritySigner
@@ -397,6 +434,10 @@ class PublicLiveBrowserSession {
       void this.close(1009, 'control message too large')
       return
     }
+    if (!isAllowedControlMessage(message, ALLOWED_CLIENT_CONTROL_TYPES)) {
+      this.sendError('BAD_MESSAGE', '不支持或格式无效的控制消息', false)
+      return
+    }
     if (
       !this.containerReady ||
       !this.containerWs ||
@@ -420,7 +461,10 @@ class PublicLiveBrowserSession {
     if (this.finalized || this.options.ws.readyState !== WebSocket.OPEN) return
     if (!isBinary) {
       const text = raw.toString()
-      if (Buffer.byteLength(text, 'utf8') <= MAX_CONTROL_BYTES) {
+      if (
+        Buffer.byteLength(text, 'utf8') <= MAX_CONTROL_BYTES &&
+        isAllowedControlMessage(text, ALLOWED_SERVER_CONTROL_TYPES)
+      ) {
         try {
           this.options.ws.send(text)
         } catch {}

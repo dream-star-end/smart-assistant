@@ -580,6 +580,77 @@ test('profile-dir declaration, stale SingletonLock cleanup, live-process protect
     res = await run(f.launcher, ['delete-data'], env)
     assert.equal(res.code, 0, res.stderr)
     assert.equal(existsSync(profileDir), false, 'delete-data must delete persistent profile directory')
+
+    // OPENCLAUDE_BROWSER_PROFILE_ROOT allows override strictly within OPENCLAUDE_HOME (still per-Agent isolated)
+    const customRoot = join(f.home, 'browser-profile')
+    res = await run(f.launcher, ['open', 'about:blank'], {
+      ...env,
+      OPENCLAUDE_BROWSER_PROFILE_ROOT: customRoot,
+    })
+    assert.equal(res.code, 0, res.stderr)
+    const customProfileDir = readFileSync(join(agentState, 'profile-dir'), 'utf8').trim()
+    assert.equal(customProfileDir, join(customRoot, agentKey))
+    assert.equal(existsSync(customProfileDir), true)
+    await run(f.launcher, ['close'], { ...env, OPENCLAUDE_BROWSER_PROFILE_ROOT: customRoot })
+
+    // Escape attempts outside OPENCLAUDE_HOME (including dangling symlinks) must fail closed (exit 2)
+    const danglingLink = join(f.home, 'dangling-profile-link')
+    symlinkSync('/tmp/nonexistent-escape-profile-target', danglingLink)
+    for (const badRoot of [
+      '/tmp/shared-browser-profile',
+      join(f.home, '..', 'escape-profile'),
+      danglingLink,
+      join(danglingLink, 'sub'),
+    ]) {
+      res = await run(f.launcher, ['open', 'about:blank'], {
+        ...env,
+        OPENCLAUDE_BROWSER_PROFILE_ROOT: badRoot,
+      })
+      assert.equal(res.code, 2, `expected escape rejection for ${badRoot}`)
+      assert.match(res.stderr, /browser profile path must be a non-symlink directory within browser workspace/)
+    }
+
+    // B1: Symlinked final per-Agent profile directory (both default path & override path)
+    // and symlinked parent browser-profiles directory MUST fail closed BEFORE mkdir/lock cleanup/Chrome launch!
+    const outsideTarget = join(f.root, 'outside-target')
+    mkdirSync(outsideTarget, { recursive: true })
+    const sentinelLock = join(outsideTarget, 'SingletonLock')
+    writeFileSync(sentinelLock, 'keep-me-intact')
+
+    // Case B1-a: default path final agent dir is a symlink to outsideTarget
+    mkdirSync(join(f.home, 'browser-profiles'), { recursive: true })
+    rmSync(join(f.home, 'browser-profiles', agentKey), { recursive: true, force: true })
+    symlinkSync(outsideTarget, join(f.home, 'browser-profiles', agentKey))
+    writeFileSync(f.log, '')
+    res = await run(f.launcher, ['open', 'about:blank'], env)
+    assert.equal(res.code, 2, 'default symlinked agent profile dir must fail closed')
+    assert.match(res.stderr, /browser profile path must be a non-symlink directory within browser workspace/)
+    assert.equal(existsSync(sentinelLock), true, 'lock cleanup must NOT touch symlink target')
+    assert.equal(readFileSync(f.log, 'utf8'), '', 'CLI must NOT be invoked on symlinked profile dir')
+    rmSync(join(f.home, 'browser-profiles', agentKey), { force: true })
+
+    // Case B1-b: default parent browser-profiles is itself a symlink to outsideTarget
+    rmSync(join(f.home, 'browser-profiles'), { recursive: true, force: true })
+    symlinkSync(outsideTarget, join(f.home, 'browser-profiles'))
+    res = await run(f.launcher, ['open', 'about:blank'], env)
+    assert.equal(res.code, 2, 'default symlinked browser-profiles parent must fail closed')
+    assert.match(res.stderr, /browser profile path must be a non-symlink directory within browser workspace/)
+    assert.equal(existsSync(sentinelLock), true)
+    assert.equal(readFileSync(f.log, 'utf8'), '')
+    rmSync(join(f.home, 'browser-profiles'), { force: true })
+
+    // Case B1-c: override root final agent dir is a symlink to outsideTarget
+    rmSync(join(customRoot, agentKey), { recursive: true, force: true })
+    symlinkSync(outsideTarget, join(customRoot, agentKey))
+    res = await run(f.launcher, ['open', 'about:blank'], {
+      ...env,
+      OPENCLAUDE_BROWSER_PROFILE_ROOT: customRoot,
+    })
+    assert.equal(res.code, 2, 'override symlinked agent profile dir must fail closed')
+    assert.match(res.stderr, /browser profile path must be a non-symlink directory within browser workspace/)
+    assert.equal(existsSync(sentinelLock), true)
+    assert.equal(readFileSync(f.log, 'utf8'), '')
+    rmSync(join(customRoot, agentKey), { force: true })
   } finally {
     if (fakeChromeProc?.pid && isPidAlive(fakeChromeProc.pid)) {
       try { process.kill(fakeChromeProc.pid, 'SIGKILL') } catch {}

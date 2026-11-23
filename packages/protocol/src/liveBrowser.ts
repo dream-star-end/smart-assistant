@@ -197,11 +197,100 @@ export interface LiveBrowserStreamTicketResponse {
   readonly protocol: typeof LIVE_BROWSER_TICKET_PROTOCOL
 }
 
+export const BROWSER_HANDOFF_RESUME_MAX_PATTERNS = 12 as const
+export const BROWSER_HANDOFF_RESUME_MAX_STR_LEN = 256 as const
+export const BROWSER_HANDOFF_MIN_DELAY_MS = 500 as const
+export const BROWSER_HANDOFF_MAX_DELAY_MS = 15_000 as const
+
+/**
+ * Optional deterministic completion criteria attached to a `browser_handoff` card or
+ * sent over the live-browser control channel so the container gateway can detect
+ * handoff completion with zero LLM calls (OCV5-864).
+ */
+export interface BrowserHandoffResumeWhen {
+  readonly urlLeave?: readonly string[]
+  readonly urlMatch?: readonly string[]
+  readonly selectorAppear?: string
+  readonly selectorGone?: string
+  readonly waitDownload?: boolean
+  readonly autoResumeDelayMs?: number
+}
+
+function normalizeResumePatternList(raw: unknown): readonly string[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const out: string[] = []
+  for (const item of raw) {
+    if (typeof item !== 'string') continue
+    const trimmed = item.trim()
+    if (!trimmed || trimmed.includes('\0') || /[\r\n]/.test(trimmed)) continue
+    out.push(trimmed.slice(0, BROWSER_HANDOFF_RESUME_MAX_STR_LEN))
+    if (out.length >= BROWSER_HANDOFF_RESUME_MAX_PATTERNS) break
+  }
+  return out.length > 0 ? out : undefined
+}
+
+function normalizeResumeSelector(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined
+  const trimmed = raw.trim()
+  if (!trimmed || trimmed.includes('\0') || /[\r\n]/.test(trimmed)) return undefined
+  return trimmed.slice(0, BROWSER_HANDOFF_RESUME_MAX_STR_LEN)
+}
+
+/**
+ * Sanitize and normalize a `resume_when` / `resumeWhen` object (accepts both camelCase and
+ * snake_case fields for LLM card ergonomics). Returns `undefined` when absent or empty.
+ */
+export function normalizeBrowserHandoffResumeWhen(
+  raw: unknown,
+): BrowserHandoffResumeWhen | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const obj = raw as Record<string, unknown>
+  const urlLeave = normalizeResumePatternList(obj.urlLeave ?? obj.url_leave)
+  const urlMatch = normalizeResumePatternList(obj.urlMatch ?? obj.url_match)
+  const selectorAppear = normalizeResumeSelector(obj.selectorAppear ?? obj.selector_appear)
+  const selectorGone = normalizeResumeSelector(obj.selectorGone ?? obj.selector_gone)
+  const rawWaitDownload = obj.waitDownload ?? obj.wait_download
+  const waitDownload = typeof rawWaitDownload === 'boolean' ? rawWaitDownload : undefined
+  const rawDelay = obj.autoResumeDelayMs ?? obj.auto_resume_delay_ms
+  let autoResumeDelayMs: number | undefined
+  if (typeof rawDelay === 'number' && Number.isFinite(rawDelay)) {
+    autoResumeDelayMs = Math.max(
+      BROWSER_HANDOFF_MIN_DELAY_MS,
+      Math.min(BROWSER_HANDOFF_MAX_DELAY_MS, Math.round(rawDelay)),
+    )
+  }
+  if (
+    !urlLeave &&
+    !urlMatch &&
+    !selectorAppear &&
+    !selectorGone &&
+    waitDownload === undefined &&
+    autoResumeDelayMs === undefined
+  ) {
+    return undefined
+  }
+  return {
+    ...(urlLeave ? { urlLeave } : {}),
+    ...(urlMatch ? { urlMatch } : {}),
+    ...(selectorAppear ? { selectorAppear } : {}),
+    ...(selectorGone ? { selectorGone } : {}),
+    ...(waitDownload !== undefined ? { waitDownload } : {}),
+    ...(autoResumeDelayMs !== undefined ? { autoResumeDelayMs } : {}),
+  }
+}
+
 export type LiveBrowserClientMessage =
   | {
       readonly type: 'takeover'
       readonly active: boolean
       readonly takeoverToken?: string
+      readonly resumeWhen?: BrowserHandoffResumeWhen
+      readonly watchId?: string
+    }
+  | {
+      readonly type: 'handoff_watch'
+      readonly resumeWhen?: BrowserHandoffResumeWhen | null
+      readonly watchId?: string
     }
   | {
       readonly type: 'pointer'
@@ -305,6 +394,24 @@ export interface LiveBrowserStatePayload {
   readonly takeoverToken?: string
 }
 
+export interface LiveBrowserHandoffReadyMessage {
+  readonly type: 'handoff_ready'
+  readonly signal: string
+  readonly url: string
+  readonly title?: string
+  readonly filename?: string
+  readonly watchId?: string
+  readonly detectedAt: number
+}
+
+export interface LiveBrowserHandoffVetoedMessage {
+  readonly type: 'handoff_vetoed'
+  readonly reason: string
+  readonly url?: string
+  readonly watchId?: string
+  readonly detectedAt: number
+}
+
 export type LiveBrowserServerMessage =
   | {
       readonly type: 'ready'
@@ -319,6 +426,8 @@ export type LiveBrowserServerMessage =
       readonly type: 'cursor'
       readonly cursor: string
     }
+  | LiveBrowserHandoffReadyMessage
+  | LiveBrowserHandoffVetoedMessage
   | {
       readonly type: 'error'
       readonly code: string
@@ -330,3 +439,5 @@ export type LiveBrowserServerMessage =
       readonly ts?: number
       readonly serverTs: number
     }
+
+export type LiveBrowserServerControlMessage = LiveBrowserServerMessage

@@ -381,4 +381,41 @@ describe("v2 interactive components", () => {
     expect(screen.getAllByTestId("iui-browser-handoff-continue")[0]).toBeDisabled();
     expect(screen.getAllByTestId("iui-browser-handoff-continue")[1]).not.toBeDisabled();
   });
+
+  it("BrowserHandoffBlock parses optional resume_when (snake_case) and forwards it to openLiveBrowser", () => {
+    const openLiveBrowser = vi.fn();
+    render(
+      <ArtifactInspectContext.Provider value={{ openLiveBrowser }}>
+        <IuiBlock
+          code={j({
+            type: "browser_handoff",
+            decisionId: "handoff-rw-1",
+            title: "请完成 SSO 登录",
+            url: "https://sso.example.com/login",
+            resume_when: {
+              url_leave: ["/login", "/sso"],
+              url_match: ["app.example.com/home"],
+              selector_appear: "[data-user-ready]",
+              auto_resume_delay_ms: 3000,
+            },
+          })}
+        />
+      </ArtifactInspectContext.Provider>,
+    );
+
+    fireEvent.click(screen.getByTestId("iui-browser-handoff-open"));
+    expect(openLiveBrowser).toHaveBeenCalledWith({
+      takeover: true,
+      expand: true,
+      url: "https://sso.example.com/login",
+      continuePrompt: "我已完成 sso.example.com 的浏览器操作，请继续。",
+      handoffId: "handoff-rw-1",
+      resumeWhen: {
+        urlLeave: ["/login", "/sso"],
+        urlMatch: ["app.example.com/home"],
+        selectorAppear: "[data-user-ready]",
+        autoResumeDelayMs: 3000,
+      },
+    });
+  });
 });

@@ -2,7 +2,10 @@ import { ChevronDown, ChevronRight } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { AuthSession } from "../../lib/types";
 import { StatusPill } from "../ui";
-import { PendingDecisionsDock } from "./PendingDecisionsDock";
+import {
+  type PendingDecisionBrowserHandoffOpenOpts,
+  PendingDecisionsDock,
+} from "./PendingDecisionsDock";
 import {
   type CollectLiveActivityInput,
   LIVE_ACTIVITY_BUCKETS,
@@ -206,7 +209,7 @@ export function SidebarLiveActivityStrip({
   onSelect: (sessionId: string) => void;
   onMarkRead?: (sessionId: string) => void;
   onOpenBoard?: (ticketRef?: string) => void;
-  onOpenLiveBrowser?: (opts?: { url?: string; sessionId?: string | null }) => void;
+  onOpenLiveBrowser?: (opts?: PendingDecisionBrowserHandoffOpenOpts) => void;
 }) {
   const summary = useMemo(() => {
     void socketVersion;
