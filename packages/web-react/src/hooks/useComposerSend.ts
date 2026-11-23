@@ -373,7 +373,7 @@ export function useComposerSend({
       const slashSwarm = parseSwarmSlashCommand(text);
       const modelIsAntigravity = isAntigravityModelForUi(modelId, models);
       if (slashSwarm?.matched && !modelIsAntigravity) {
-        toast("蜂群模式仅支持 Antigravity 模型，请先在顶栏切换至 Gemini 4 / Antigravity 模型", "info");
+        toast("蜂群模式仅支持 Antigravity 模型，请先在输入框底部切换至 Gemini 4 / Antigravity 模型", "info");
         return false;
       }
       const activeSwarmMode = getSwarmMode ? getSwarmMode() : swarmMode;

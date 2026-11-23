@@ -257,6 +257,7 @@ export function Composer({
   draftKey,
   goalOpenRequest,
   projectSlot,
+  modelSlot,
   prediction, onQuickAskCommand,
   swarmSupported = false,
   swarmMode = false,
@@ -313,6 +314,8 @@ export function Composer({
   goalOpenRequest?: number;
   /** 项目标识(ComposerProjectPill)。sm+ 在工具行,窄屏在底栏(与仓库入口同排)。 */
   projectSlot?: ReactNode;
+  /** 模型选择器插槽（OCV5-872：渲染在输入坞底栏右侧、语音与发送按钮左侧）。 */
+  modelSlot?: ReactNode;
   /** 输入预测(lib/inputCompletion):空输入框显示 next(直接点发送就发出),输入中按 candidates 补全;Tab / → 填入。
    *  省略或 null = 关闭(设置里关掉、demo)。onQuickAskCommand 拦截 `/btw`、`/ask` 到同屏快问小窗。 */
   prediction?: InputPrediction | null;
@@ -1267,7 +1270,7 @@ export function Composer({
             )}
           </div>
           <div
-            className="mt-1 flex items-center gap-1 border-t border-border/50 pt-1.5 sm:mt-1.5 sm:pt-2"
+            className="mt-1 flex min-w-0 items-center gap-1 border-t border-border/50 pt-1.5 sm:mt-1.5 sm:pt-2"
             data-testid="composer-tool-row"
           >
             {/* file input 用 sr-only(视觉隐藏但非 display:none)+ tabindex=-1,配合工具条
@@ -1369,7 +1372,15 @@ export function Composer({
                 />
               )}
             </span>
-            <div className="ml-auto flex shrink-0 items-center gap-1.5">
+            <div className="ml-auto flex min-w-0 flex-1 items-center justify-end gap-1 sm:flex-initial sm:gap-1.5">
+              {modelSlot && (
+                <div
+                  data-testid="composer-model-slot"
+                  className="flex min-w-0 max-w-full items-center gap-1"
+                >
+                  {modelSlot}
+                </div>
+              )}
               {/* 生成中排队发送(C-02):此前生成中唯一按钮是「停止」,桌面 Enter 排队无反馈,触屏 Enter=换行
                   → 根本没有排队入口。现在 busy 且有可发内容时给一个次级「排队发送」按钮;「停止」仍是唯一
                   Stop 控件(T35),本按钮 aria-label 不含「停止」。
@@ -1380,7 +1391,7 @@ export function Composer({
                   data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
                   aria-label="排队发送"
                   title="本轮结束后自动发送"
-                  className="oc-btn-tactile oc-spring-press text-accent hover:bg-accent-soft"
+                  className="oc-btn-tactile oc-spring-press shrink-0 text-accent hover:bg-accent-soft"
                   onClick={() => submit(false, () => toast("已加入队列，本轮结束后发送", "info"))}
                 >
                   <ListPlus size={18} strokeWidth={1.75} />
@@ -1396,7 +1407,7 @@ export function Composer({
                 disabled={disabled || voiceState === "transcribing"}
                 onClick={onVoiceClick}
                 className={cn(
-                  "oc-btn-tactile oc-spring-press",
+                  "oc-btn-tactile oc-spring-press shrink-0",
                   voiceState === "recording" && "oc-icon-badge-danger text-danger",
                   voiceUnavailableReason && "text-faint",
                 )}

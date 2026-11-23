@@ -18,7 +18,7 @@ import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import type { LockedPublicModel, PublicModel } from "../lib/types";
 import { cn } from "../lib/utils";
 import { AgentAvatar } from "./AgentAvatar";
-import { type LockedSelectInfo, ModelSelector, compactMobileModelLabel, teamEngineLabel } from "./ModelSelector";
+import { type LockedSelectInfo, compactMobileModelLabel, teamEngineLabel } from "./ModelSelector";
 
 export { compactMobileModelLabel };
 import {
@@ -230,12 +230,32 @@ export const ChatHeader = memo(function ChatHeader({
 }: ChatHeaderProps) {
   void projectSuggestion;
   void running;
+  void selectedModelId;
+  void onSelectModel;
+  void onLockedSelect;
+  void modelsLoading;
+  void onCancelModelSwitch;
+  void effortSupported;
+  void effortActive;
+  void onSelectEffort;
+  void contextTier;
+  void onSelectContextTier;
+  void serviceTier;
+  void onSelectServiceTier;
+  void swarmSupported;
+  void swarmMode;
+  void swarmRunning;
+  void onSelectSwarmMode;
+  void modelPickerOpen;
+  void onModelPickerOpenChange;
   const trimmedSessionTitle = typeof sessionTitle === "string" ? sessionTitle.trim() : "";
   const showSessionTitle = Boolean(trimmedSessionTitle && trimmedSessionTitle !== "新对话");
-  const isNonDefaultAgent = agent.id !== "main";
   const hasWorkspaceToggles = Boolean(onToggleQuickAsk || onTogglePane);
+  const hasProjectOverflow = Boolean(projectBreadcrumb?.chatName && onOpenProjectScope);
   const hasDesktopOverflowTools = Boolean(onOpenFind || onShare);
   const hasAnyOverflowTools = Boolean(onToggleQuickAsk || hasDesktopOverflowTools);
+  const hasAnyOverflowItems = hasProjectOverflow || hasAnyOverflowTools;
+  const hasDesktopOverflowItems = hasProjectOverflow || hasDesktopOverflowTools;
   const subscriptionMeta = buildSubscriptionEntryMeta(subscriptionSummary);
   // 团队模式说明弹层的受控开关：点「关闭团队模式」需要主动收起弹层（chip 随
   // teamModeActive 翻 false 一起卸载,不控 open 会留下无锚点的浮层）。
@@ -255,39 +275,26 @@ export const ChatHeader = memo(function ChatHeader({
       className="relative z-[var(--z-header)] border-x-0 border-t-0 border-b border-border/80 bg-bg/95 backdrop-blur-md shadow-xs"
       contentClassName="min-h-12 flex-nowrap items-center gap-1 px-2 py-1 sm:min-h-[52px] sm:gap-1.5 sm:px-4 sm:py-1.5"
     >
-      {/* 模型与协作态核心区：手机 <640px 居中紧凑胶囊（对称留白）；桌面 sm+ 左对齐且优先保障模型与蜂群态宽度。 */}
-      {((models && onSelectModel) || advisorModeActive || teamModeActive) && (
-        <div
-          className="flex min-w-0 flex-1 items-center justify-center gap-0.5 sm:flex-initial sm:justify-start sm:gap-1.5"
-          data-testid="chat-model-row"
+      {/* 智能体与协作态核心区（OCV5-872）：模型选择迁至输入坞底栏后，智能体常驻顶栏原模型位置；
+          手机 <640px 居中紧凑胶囊（对称留白），桌面 sm+ 左对齐。 */}
+      <div
+        className="flex min-w-0 flex-1 items-center justify-center gap-0.5 sm:flex-initial sm:justify-start sm:gap-1.5"
+        data-testid="chat-agent-row"
+      >
+        <button
+          type="button"
+          data-product-feature={PRODUCT_CAPABILITIES.agents.id}
+          data-testid="chat-agent-chip"
+          onClick={onAgentClick}
+          aria-label={`切换智能体，当前${agent.name}`}
+          title={`当前智能体：${agent.name}（点击切换）`}
+          className="oc-btn-tactile oc-spring-press flex min-h-11 min-w-0 max-w-full items-center gap-1.5 rounded-full border border-border/80 bg-surface/85 px-2.5 py-1 text-section font-medium text-fg shadow-xs outline-none hover:border-border-strong hover:bg-surface hover:text-fg hover:shadow-soft focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:min-h-10 sm:rounded-lg sm:border-border/60 sm:bg-surface/65 sm:px-2.5 sm:py-1.5 [@media(hover:none)]:min-h-11"
         >
-          {models && onSelectModel && (
-            <ModelSelector
-              models={models}
-              lockedModels={lockedModels}
-              selectedId={selectedModelId}
-              onSelect={onSelectModel}
-              onLockedSelect={onLockedSelect}
-              loading={modelsLoading}
-              teamEngineActive={teamModeActive}
-              teamLeaderModelId={teamLeaderModelId}
-              effortSupported={effortSupported}
-              effortActive={effortActive}
-              onSelectEffort={onSelectEffort}
-              contextTier={contextTier}
-              onSelectContextTier={onSelectContextTier}
-              serviceTier={serviceTier}
-              onSelectServiceTier={onSelectServiceTier}
-              swarmSupported={swarmSupported}
-              swarmMode={swarmMode}
-              swarmRunning={swarmRunning}
-              onSelectSwarmMode={onSelectSwarmMode}
-              open={modelPickerOpen}
-              onOpenChange={onModelPickerOpenChange}
-              onCancelSwitch={onCancelModelSwitch}
-            />
-          )}
-          {advisorModeActive && (
+          <AgentAvatar agent={agent} className="size-5 shrink-0 rounded-full sm:size-[22px]" iconSize={12} />
+          <span className="min-w-0 max-w-[10.5rem] truncate font-medium sm:max-w-[14rem]">{agent.name}</span>
+          <ChevronDown size={14} strokeWidth={1.75} className="shrink-0 text-faint" />
+        </button>
+        {advisorModeActive && (
             <Popover open={advisorPopoverOpen} onOpenChange={setAdvisorPopoverOpen}>
               <PopoverTrigger asChild>
                 <button
@@ -386,26 +393,9 @@ export const ChatHeader = memo(function ChatHeader({
               </PopoverContent>
             </Popover>
           )}
-        </div>
-      )}
+      </div>
 
-      {/* 次级上下文区（桌面 sm+）：非默认智能体紧凑芯片、会话标题、项目归属/建议；默认全能助手不抢占顶栏 C 位。 */}
-      {isNonDefaultAgent && (
-        <button
-          type="button"
-          data-product-feature={PRODUCT_CAPABILITIES.agents.id}
-          data-testid="chat-agent-chip"
-          onClick={onAgentClick}
-          aria-label={`切换智能体，当前${agent.name}`}
-          title={`当前智能体：${agent.name}（点击切换）`}
-          className="oc-btn-tactile oc-spring-press hidden min-h-8 min-w-0 max-w-[10rem] shrink-0 items-center gap-1.5 rounded-full border border-border/70 bg-surface/75 px-2 py-1 text-caption font-medium text-fg outline-none transition-colors hover:border-border-strong hover:bg-surface focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:inline-flex"
-        >
-          <AgentAvatar agent={agent} className="size-4 shrink-0 rounded-full" iconSize={10} />
-          <span className="truncate whitespace-nowrap">{agent.name}</span>
-          <ChevronDown size={12} strokeWidth={1.75} className="hidden shrink-0 text-faint lg:block" />
-        </button>
-      )}
-
+      {/* 次级上下文区（桌面宽屏）：会话标题、项目归属。 */}
       {showSessionTitle && (
         <span
           data-testid="chat-session-title"
@@ -501,7 +491,8 @@ export const ChatHeader = memo(function ChatHeader({
           </div>
         )}
 
-        <div className="relative">
+        {hasAnyOverflowItems && (
+        <div className={cn("relative", !hasDesktopOverflowItems && "sm:hidden")}>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <IconButton
@@ -516,26 +507,17 @@ export const ChatHeader = memo(function ChatHeader({
               </IconButton>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="min-w-[13.5rem]">
-              <DropdownMenuItem
-                data-product-feature={PRODUCT_CAPABILITIES.agents.id}
-                data-testid="overflow-agent-item"
-                onSelect={onAgentClick}
-              >
-                <Users size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
-                <span className="flex-1">切换智能体</span>
-                <span className="max-w-[6rem] truncate text-caption text-faint">{agent.name}</span>
-              </DropdownMenuItem>
-              {projectBreadcrumb?.chatName && onOpenProjectScope && (
+              {hasProjectOverflow && (
                 <DropdownMenuItem
                   data-product-control
                   data-testid="overflow-project-item"
                   onSelect={onOpenProjectScope}
                 >
                   <FolderOpen size={15} strokeWidth={1.75} className="shrink-0 text-muted" />
-                  <span className="flex-1 truncate">项目：{projectBreadcrumb.chatName}</span>
+                  <span className="flex-1 truncate">项目：{projectBreadcrumb?.chatName}</span>
                 </DropdownMenuItem>
               )}
-              {hasAnyOverflowTools && (
+              {hasProjectOverflow && hasAnyOverflowTools && (
                 <DropdownMenuSeparator className={hasDesktopOverflowTools ? undefined : "sm:hidden"} />
               )}
               {onToggleQuickAsk && (
@@ -590,6 +572,7 @@ export const ChatHeader = memo(function ChatHeader({
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
+        )}
       </div>
     </WorkspaceShellHeader>
   );

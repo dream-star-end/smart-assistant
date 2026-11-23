@@ -103,6 +103,10 @@ export type ModelSelectorPanelProps = {
   tierLabel: string | null
   shortViewport?: boolean
   effectiveMultiplier?: number
+  /** 桌面端下拉展开方向（顶栏向下 bottom / 输入坞底栏向上 top）。 */
+  side?: 'top' | 'bottom'
+  /** 桌面端下拉水平对齐（顶栏左对齐 start / 输入坞右侧右对齐 end）。 */
+  align?: 'start' | 'end'
 }
 
 function PickerItem({
@@ -292,6 +296,8 @@ export function ModelSelectorPanel({
   tierLabel,
   shortViewport = false,
   effectiveMultiplier = 1,
+  side = 'bottom',
+  align = 'start',
 }: ModelSelectorPanelProps) {
   const selected = models.find((m) => m.id === selectedId)
   const selectedCursor = cursorPickerDef(
@@ -1031,7 +1037,9 @@ export function ModelSelectorPanel({
     return (
       <>
         <DropdownMenuContent
-          align="start"
+          side={side}
+          align={align}
+          sideOffset={side === 'top' ? 8 : undefined}
           data-testid="model-picker-two-col"
           className="model-picker-popover oc-surface-popover flex w-[min(620px,calc(100vw-24px))] flex-col overflow-hidden p-0"
         >
@@ -1070,7 +1078,9 @@ export function ModelSelectorPanel({
   return (
     <>
       <DropdownMenuContent
-        align="start"
+        side={side}
+        align={align}
+        sideOffset={side === 'top' ? 8 : undefined}
         data-testid="model-picker-single-col"
         className="model-picker-popover oc-surface-popover flex w-[min(340px,calc(100vw-24px))] min-w-[15.5rem] flex-col overflow-hidden p-1.5"
       >

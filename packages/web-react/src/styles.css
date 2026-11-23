@@ -863,7 +863,7 @@ body {
       var(--shadow-soft);
   }
 
-  /* OCV5-843: 顶栏选中模型胶囊（蜂群激活态）—— 明暗双主题柔光暖陶土边框 + 轻渐变 + 克制投影，
+  /* OCV5-843 / OCV5-872: 选中模型胶囊（蜂群激活态）—— 明暗双主题柔光暖陶土边框 + 轻渐变 + 克制投影，
      区别于 teamEngineActive 实心锁定态，保持可点击切换质感。 */
   .oc-model-trigger-swarm[data-swarm-active="true"] {
     border-color: color-mix(in srgb, var(--accent) 42%, var(--border));

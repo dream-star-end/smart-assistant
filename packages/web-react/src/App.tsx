@@ -197,7 +197,7 @@ import {
   resolveSessionModel,
 } from "./lib/modelPreferences";
 import type { ChatProject, LockedPublicModel, Message, PublicConfig, PublicModel, Session, ToolCard } from "./lib/types";
-import type { LockedSelectInfo } from "./components/ModelSelector";
+import { ModelSelector, type LockedSelectInfo } from "./components/ModelSelector";
 import { lockedModelUnlockNotice } from "./lib/cursorModelPicker";
 import {
   freshSessionRequiredForSwitch,
@@ -2313,26 +2313,6 @@ export function App() {
           }}
           models={models}
           lockedModels={lockedModels}
-          selectedModelId={modelId}
-          onSelectModel={selectModel}
-          onLockedSelect={demo ? undefined : handleLockedSelect}
-          // 已有模型列表时的后台重拉不锁选择器、不显示「切换中…」：拉取无超时，
-          // 弱网下会一直挂着，看起来就是切模型卡死。
-          modelsLoading={(modelsLoading && models.length === 0) || modelSwitchPreparing}
-          onCancelModelSwitch={modelSwitchPreparing ? cancelModelSwitch : undefined}
-          effortSupported={effortSupported}
-          effortActive={effortActive}
-          onSelectEffort={demo ? undefined : setSessionEffort}
-          contextTier={contextTier}
-          onSelectContextTier={demo ? undefined : setContextTier}
-          serviceTier={serviceTier}
-          onSelectServiceTier={demo ? undefined : setServiceTier}
-          swarmSupported={swarmSupported}
-          swarmMode={swarmMode}
-          swarmRunning={swarmRunning}
-          onSelectSwarmMode={demo ? undefined : setSwarmMode}
-          modelPickerOpen={modelPickerOpen}
-          onModelPickerOpenChange={setModelPickerOpen}
           // 团队模式知情指示:与 send 生效条件同构(仅 main 生效),顶栏所见 = 实际所发。
           teamModeActive={!demo && teamMode && agent.id === "main"}
           teamLeaderModelId={teamLeaderModelId}
@@ -2658,6 +2638,22 @@ export function App() {
             onCompactCommand={demo || gated || !activeId ? undefined : (ins) => void handleCompactSession(ins)}
             onOpenContextHealth={demo || gated || !activeId ? undefined : () => setContextHealthOpen(true)}
             onStartNewSession={demo ? undefined : handleNew}
+            modelSlot={
+              <ModelSelector
+                placement="composer"
+                models={models} lockedModels={lockedModels} selectedId={modelId}
+                onSelect={selectModel} onLockedSelect={demo ? undefined : handleLockedSelect}
+                loading={(modelsLoading && models.length === 0) || modelSwitchPreparing}
+                onCancelSwitch={modelSwitchPreparing ? cancelModelSwitch : undefined}
+                teamEngineActive={!demo && teamMode && agent.id === "main"} teamLeaderModelId={teamLeaderModelId}
+                effortSupported={effortSupported} effortActive={effortActive} onSelectEffort={demo ? undefined : setSessionEffort}
+                contextTier={contextTier} onSelectContextTier={demo ? undefined : setContextTier}
+                serviceTier={serviceTier} onSelectServiceTier={demo ? undefined : setServiceTier}
+                swarmSupported={swarmSupported} swarmMode={swarmMode} swarmRunning={swarmRunning}
+                onSelectSwarmMode={demo ? undefined : setSwarmMode}
+                open={modelPickerOpen} onOpenChange={setModelPickerOpen}
+              />
+            }
             projectSlot={
               // 仍是未发首条的草稿时可改归属:包括被 GitHub/目标提前物化成空会话行的草稿。
               activeId && !sessions.some((x) => x.id === activeId && x.messageCount === 0 && !x.projectId) ? undefined : (

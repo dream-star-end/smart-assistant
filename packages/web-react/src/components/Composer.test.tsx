@@ -489,4 +489,29 @@ describe("OCV5-831 Composer 蜂群占位符单行化与视觉重心", () => {
     expect(playbookItem).toHaveTextContent("蜂群剧本模板");
     expect(playbookItem.className).not.toContain("sm:hidden");
   });
+
+  test("OCV5-872: modelSlot 渲染在底栏右侧且位于语音与发送按钮左侧，并具窄屏弹性防溢出边界", () => {
+    render(
+      <Composer
+        onSend={() => {}}
+        onUpload={async () => ({ kind: "file", url: "/x" })}
+        modelSlot={<button type="button" data-testid="fake-model-trigger">Gemini 4 Neon</button>}
+      />,
+    );
+    const toolRow = screen.getByTestId("composer-tool-row");
+    const slot = screen.getByTestId("composer-model-slot");
+    const modelBtn = screen.getByTestId("fake-model-trigger");
+    const voiceBtn = screen.getByRole("button", { name: "语音输入" });
+    const sendBtn = screen.getByRole("button", { name: "发送" });
+    const plusBtn = screen.getByRole("button", { name: "更多选项" });
+
+    expect(toolRow).toHaveClass("min-w-0");
+    expect(toolRow).toContainElement(slot);
+    expect(slot).toContainElement(modelBtn);
+    expect(slot).toHaveClass("min-w-0", "max-w-full");
+    // 位置顺序：[+] < [模型] < [语音] < [发送]
+    expect(plusBtn.compareDocumentPosition(slot) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(slot.compareDocumentPosition(voiceBtn) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(voiceBtn.compareDocumentPosition(sendBtn) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
 });

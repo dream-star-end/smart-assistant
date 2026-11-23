@@ -1694,4 +1694,34 @@ describe('ModelSelector OCV5-843 蜂群模式集成（列表微标 + 参数区�
     expect(hint.textContent).toContain('切至带蜂群星轨徽标的模型即可启用蜂群协作')
     expect(hint.textContent).not.toContain('Antigravity')
   })
+
+  it('OCV5-872: placement="composer" 渲染输入坞融合胶囊且桌面弹层向上右对齐展开', async () => {
+    const onCancelSwitch = vi.fn()
+    render(
+      <ModelSelector
+        placement="composer"
+        models={SWARM_MODELS}
+        selectedId="antigravity-gemini-4-neon"
+        onSelect={() => {}}
+        swarmSupported
+        swarmMode
+        onSelectSwarmMode={() => {}}
+        onCancelSwitch={onCancelSwitch}
+      />,
+    )
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(trigger).toHaveAttribute('data-placement', 'composer')
+    expect(trigger.className).toContain('h-9')
+    expect(trigger.className).toContain('rounded-full')
+    expect(trigger).toHaveAttribute('data-swarm-active', 'true')
+    const cancelBtn = screen.getByTestId('model-switch-cancel')
+    expect(cancelBtn.className).toContain('h-9')
+    fireEvent.click(cancelBtn)
+    expect(onCancelSwitch).toHaveBeenCalledTimes(1)
+
+    openMenu(trigger)
+    const twoCol = await screen.findByTestId('model-picker-two-col')
+    expect(twoCol).toHaveAttribute('data-side', 'top')
+    expect(twoCol).toHaveAttribute('data-align', 'end')
+  })
 })

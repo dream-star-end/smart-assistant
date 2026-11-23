@@ -47,7 +47,7 @@ export const PRACTICAL_GUIDE_BASICS: readonly PracticalGuideBasicItem[] = [
   {
     id: "model-swarm-btw",
     title: "按活选模型，大活开蜂群",
-    description: "顶栏模型胶囊切强模型与思考深度，复杂任务开蜂群并行，或敲 /btw 支线快问不打断主线。",
+    description: "输入框底部模型胶囊切强模型与思考深度，复杂任务开蜂群并行，或敲 /btw 支线快问不打断主线。",
     icon: "swarm",
   },
   {
@@ -108,7 +108,7 @@ export const PRACTICAL_GUIDE_SCENARIOS: readonly PracticalGuideScenario[] = [
       "请在当前绑定的仓库中先定位问题根因并给出最小改动方案，确认边界后再改源码并补充回归单测；跑通测试与构建后，汇报改动文件清单、验证输出和待确认风险，不要未经确认直接推送或合并主分支。",
     tips: [
       "首条指令写清改动边界、禁碰目录和验收命令，可避免顺手改动无关模块。",
-      "跨文件重构或复杂排查时，在顶栏模型胶囊调高思考深度或开启蜂群并行推进。",
+      "跨文件重构或复杂排查时，在输入框底部模型胶囊调高思考深度或开启蜂群并行推进。",
       "遇到写入、推送或敏感命令时，对话内会弹出审批卡展示影响半径，核对后再拍板。",
     ],
     relatedTopics: ["github-repository", "models-reasoning", "team-mode"],
@@ -187,7 +187,7 @@ export const PRACTICAL_GUIDE_SCENARIOS: readonly PracticalGuideScenario[] = [
     prompt:
       "这个任务包含多个可独立推进的子模块，请拆成并行分工：一路负责资料调研与接口核对，一路负责主逻辑实现，一路负责边界测试与验收；各路完成后汇总成统一交付说明和未决事项清单。",
     tips: [
-      "行首输入 /swarm 或在顶栏模型胶囊开启蜂群，即可让复杂任务自动分工并行；按 ⌥/Alt+S 随时开合蜂群看板。",
+      "行首输入 /swarm 或在输入框底部模型胶囊开启蜂群，即可让复杂任务自动分工并行；按 ⌥/Alt+S 随时开合蜂群看板。",
       "主线执行期间想顺手查概念或问细节，行首敲 /btw 或 /ask 开支线快问，默认继承主强模型且不打断主线。",
       "单点小问题保持单兵更快更省，只有能拆成独立子目标的复杂任务再开蜂群。",
     ],

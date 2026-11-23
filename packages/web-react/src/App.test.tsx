@@ -315,9 +315,8 @@ function requestToken(init?: RequestInit): string {
 }
 
 async function openAgentPicker() {
-  const more = await screen.findByTestId('header-overflow-trigger')
-  fireEvent.pointerDown(more, { button: 0, pointerType: 'mouse' })
-  fireEvent.click(await screen.findByTestId('overflow-agent-item'))
+  const chip = await screen.findByTestId('chat-agent-chip')
+  fireEvent.click(chip)
   await screen.findByRole('dialog', { name: '选择智能体' })
 }
 
