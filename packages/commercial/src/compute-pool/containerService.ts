@@ -31,7 +31,7 @@ import { rootLogger } from "../logging/logger.js";
 import { getRuntimeChannel } from "../runtimeChannel.js";
 import * as queries from "./queries.js";
 import { SupervisorError } from "../agent-sandbox/types.js";
-import { buildContainerExtraHosts } from "../agent-sandbox/constants.js";
+import { buildContainerExtraHosts } from "./extraHosts.js";
 import {
   createVolume as agentCreateVolume,
   removeVolume as agentRemoveVolume,
