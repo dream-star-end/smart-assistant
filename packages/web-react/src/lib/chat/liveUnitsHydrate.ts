@@ -65,7 +65,7 @@ function toolInputPreviewOf(unit: LiveUnit): string | undefined {
   return undefined;
 }
 
-function extractSwarmSnapshotFromUnit(unit: LiveUnit): SwarmSnapshot | undefined {
+export function extractSwarmSnapshotFromUnit(unit: LiveUnit): SwarmSnapshot | undefined {
   if (unit.kind !== "tool" || unit.toolName !== SWARM_BOARD_TOOL_NAME) return undefined;
   const input = unit.inputJson;
   if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
@@ -220,6 +220,48 @@ export async function fetchRecoverableLiveUnits(
     return null;
   }
   return raw;
+}
+
+export type SwarmResyncUnit = {
+  blockId?: string;
+  clientMessageId?: string;
+  snapshot: SwarmSnapshot;
+};
+
+/**
+ * Fetch live `SwarmBoard` units from `view=units` when a `postsMode="delta"`
+ * `swarm_snapshot` hits `missing_base` (OCV5-867). Only accepts non-degraded
+ * open-dispatch packs matching `expectedClientMessageId` (when known) so stale
+ * or other-turn swarms can never be injected.
+ */
+export async function fetchSwarmResyncUnits(
+  readLiveUnits: ((sessId: string) => Promise<unknown>) | undefined,
+  sessId: string,
+  expectedClientMessageId?: string,
+): Promise<SwarmResyncUnit[]> {
+  if (!readLiveUnits) return [];
+  const raw = await readLiveUnits(sessId).catch(() => null);
+  if (!isLiveUnitsPage(raw) || raw.degraded === "fallback") return [];
+  if (!raw.openDispatch || raw.units.length === 0) return [];
+  if (expectedClientMessageId) {
+    const listed = raw.streamClientMessageIds.includes(expectedClientMessageId);
+    const matchedUnit = raw.units.some((u) => u.clientMessageId === expectedClientMessageId);
+    if (!listed && !matchedUnit) return [];
+  }
+  const out: SwarmResyncUnit[] = [];
+  for (const unit of raw.units) {
+    if (expectedClientMessageId && unit.clientMessageId && unit.clientMessageId !== expectedClientMessageId) {
+      continue;
+    }
+    const snapshot = extractSwarmSnapshotFromUnit(unit);
+    if (!snapshot) continue;
+    out.push({
+      blockId: unit.blockId ?? undefined,
+      clientMessageId: unit.clientMessageId ?? undefined,
+      snapshot,
+    });
+  }
+  return out;
 }
 
 /** Restore WS continuation pointers so the next delta appends the hydrated row. */

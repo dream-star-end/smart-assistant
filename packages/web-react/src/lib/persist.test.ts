@@ -3101,3 +3101,146 @@ describe("recovery rejection feedback survives authoritative history", () => {
     expect(mergeFullServerWins([server], [noSnapshot]).find((m) => m.id === server.id)?._recoverySkippedNotice).toBe(notice);
   });
 });
+
+describe("OCV5-867: 活跃轮 SwarmBoard 与 live units 在全量/增量同步中不被误删或倒挂", () => {
+  const activeCmid = "m-turn4";
+  const serverBase: ChatMessage[] = [
+    { id: "u1", role: "user", text: "hi", ts: 100, _source: "server", _orderSeq: 1 },
+    { id: "a1", role: "assistant", text: "ok", ts: 101, _source: "server", _orderSeq: 2 },
+    { id: activeCmid, role: "user", text: "run swarm", ts: 200, _source: "server", _orderSeq: 3, _clientMessageId: activeCmid },
+  ];
+  const makeSwarm = (): ChatMessage => ({
+    id: "tool:3521:agy-swarm-1",
+    role: "tool",
+    toolName: "SwarmBoard",
+    blockId: "agy-swarm-1",
+    text: "",
+    ts: 205,
+    _liveUnit: true,
+    _turnOwnerId: activeCmid,
+    _clientMessageId: activeCmid,
+  });
+  const makeBash = (): ChatMessage => ({
+    id: "tool:3522:bash-1",
+    role: "tool",
+    toolName: "oc_bash",
+    text: "",
+    ts: 206,
+    _liveUnit: true,
+    _turnOwnerId: activeCmid,
+    _clientMessageId: activeCmid,
+  });
+  const makeAgentGroup = (): ChatMessage => ({
+    id: "ag-1",
+    role: "agent-group",
+    text: "",
+    ts: 207,
+    _liveUnit: true,
+    _turnOwnerId: activeCmid,
+    _clientMessageId: activeCmid,
+  });
+  const makeRead = (): ChatMessage => ({
+    id: "m-read-live",
+    role: "tool",
+    toolName: "Read",
+    text: "",
+    ts: 210,
+    _turnOwnerId: activeCmid,
+    _clientMessageId: activeCmid,
+  });
+
+  test("live units 先于活跃 user 到达时，两次连续全量同步均保持 user 在前且不删 SwarmBoard/tool", () => {
+    const localBeforeUser: ChatMessage[] = [
+      serverBase[0],
+      serverBase[1],
+      makeSwarm(),
+      makeBash(),
+      makeAgentGroup(),
+    ];
+    const first = mergeFullServerWins(serverBase, localBeforeUser, 0, undefined, {
+      deletionAuthority: true,
+      activeClientMessageId: activeCmid,
+    });
+    expect(first.map((m) => m.id)).toEqual([
+      "u1",
+      "a1",
+      activeCmid,
+      "tool:3521:agy-swarm-1",
+      "tool:3522:bash-1",
+      "ag-1",
+    ]);
+
+    const second = mergeFullServerWins(serverBase, [...first, makeRead()], 0, undefined, {
+      deletionAuthority: true,
+      activeClientMessageId: activeCmid,
+    });
+    expect(second.map((m) => m.id)).toEqual([
+      "u1",
+      "a1",
+      activeCmid,
+      "tool:3521:agy-swarm-1",
+      "tool:3522:bash-1",
+      "ag-1",
+      "m-read-live",
+    ]);
+  });
+
+  test("已污染缓存（SwarmBoard/tool 落在活跃 user 之前）在全量同步时自愈归位且不丢卡", () => {
+    const polluted: ChatMessage[] = [
+      serverBase[0],
+      serverBase[1],
+      makeSwarm(),
+      makeBash(),
+      makeAgentGroup(),
+      serverBase[2],
+      makeRead(),
+    ];
+    const healed = mergeFullServerWins(serverBase, polluted, 0, undefined, {
+      deletionAuthority: true,
+      activeClientMessageId: activeCmid,
+    });
+    expect(healed.map((m) => m.id)).toEqual([
+      "u1",
+      "a1",
+      activeCmid,
+      "tool:3521:agy-swarm-1",
+      "tool:3522:bash-1",
+      "ag-1",
+      "m-read-live",
+    ]);
+  });
+
+  test("applyServerIncremental 首次带回活跃 user 时，把前置活跃 live units 移到 user 之后", () => {
+    const localBeforeUser: ChatMessage[] = [serverBase[0], serverBase[1], makeSwarm(), makeBash()];
+    const merged = applyServerIncremental(localBeforeUser, [serverBase[2]], undefined, {
+      activeClientMessageId: activeCmid,
+    });
+    expect(merged.map((m) => m.id)).toEqual([
+      "u1",
+      "a1",
+      activeCmid,
+      "tool:3521:agy-swarm-1",
+      "tool:3522:bash-1",
+    ]);
+  });
+
+  test("历史已完成轮的陈旧中段 local-only tool 行仍被正常淘汰（不受活跃轮保护误放行）", () => {
+    const staleOldTool: ChatMessage = {
+      id: "stale-old-tool",
+      role: "tool",
+      toolName: "oc_bash",
+      text: "",
+      ts: 100,
+      _turnOwnerId: "u1",
+      _clientMessageId: "u1",
+    };
+    const merged = mergeFullServerWins(
+      serverBase,
+      [serverBase[0], staleOldTool, serverBase[1], serverBase[2]],
+      0,
+      undefined,
+      { deletionAuthority: true, activeClientMessageId: activeCmid },
+    );
+    expect(merged.map((m) => m.id)).toEqual(["u1", "a1", activeCmid]);
+  });
+});

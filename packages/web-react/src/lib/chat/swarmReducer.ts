@@ -161,3 +161,25 @@ export function finalizeSwarmMessageOnTurnEnd(
   m._completed = true;
   if (m.completedAt == null) m.completedAt = Date.now();
 }
+
+export function applySwarmResyncUnits(
+  sess: ChatSession,
+  units: ReadonlyArray<{ blockId?: string; clientMessageId?: string; snapshot: SwarmSnapshot }>,
+  expectedClientMessageId: string | undefined,
+  turnStart: number,
+  isFrozenRow: (m: ChatMessage) => boolean,
+): boolean {
+  let applied = false;
+  for (const unit of units) {
+    const owner = unit.clientMessageId || expectedClientMessageId || sess._activeClientMessageId;
+    const res = applySwarmSnapshotBlock(
+      sess,
+      { blockId: unit.blockId, snapshot: unit.snapshot },
+      turnStart,
+      owner,
+      isFrozenRow,
+    );
+    if (res === "applied") applied = true;
+  }
+  return applied;
+}

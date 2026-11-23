@@ -50,10 +50,12 @@ import {
   AUTO_CONTINUE_PROMPT,
   expireGenPlaceholdersAgainstServerRows,
   isSettledPermissionRequestId,
+  isFrozenLiveTarget,
   normalizeDelegateCards,
   currentFrameSeqAcceptOrder,
   normalizeGoalCards,
   paintDeferredTerminalError,
+  planTurnStart,
   rememberSettledPermissionRequestId,
   resetAgentFrameSeqCursorsForSession,
   resetFrameSeqCursor,
@@ -78,12 +80,14 @@ import {
 import {
   applyLiveUnitsResumeStream,
   fetchRecoverableLiveUnits,
+  fetchSwarmResyncUnits,
   isDurableFramesPage,
   isLiveUnitsPage,
   liveUnitToMessage,
   prependLiveUnitMessages,
   restoreLiveUnitStreamingState,
 } from "./liveUnitsHydrate";
+import { applySwarmResyncUnits } from "./swarmReducer";
 import { repairPostFinalProcessOrder } from "./order";
 import {
   hasPositiveAgentFrameSeqCursor,
@@ -792,6 +796,7 @@ export class ChatSocket {
   private relayContainerId: number | undefined;
   private relayContainerBoundOrder = 0;
   private readonly snapshotHttpInFlight = new Set<string>();
+  private readonly swarmResyncInFlight = new Set<string>();
   private snapshotWatchTimer: ReturnType<typeof setTimeout> | null = null;
   /** 当前选中会话（App 经 setActiveSession 告知）：对账时无条件优先拉它。*/
   private activeSessionId: string | undefined;
@@ -1098,6 +1103,7 @@ export class ChatSocket {
     this.durableHydrationStates.clear();
     this.durableHydrationTails.clear();
     this.snapshotHttpInFlight.clear();
+    this.swarmResyncInFlight.clear();
     this.restoreBannerOwners = null;
     this.automaticRecoveryPending.clear();
     for (const pending of this.pendingRecoveryErrors.values()) clearTimeout(pending.timer);
@@ -1586,6 +1592,9 @@ export class ChatSocket {
         } else {
           this.syncHistory(sessId, context);
         }
+      },
+      resyncSwarmUnits: (sessId, clientMessageId) => {
+        this.resyncSwarmUnits(sessId, clientMessageId);
       },
       persistSession: (sessId) => this.deps.persistSession?.(sessId),
       onAuthControlError: () => {
@@ -3629,6 +3638,7 @@ export class ChatSocket {
     this.durableHydrationStates.clear();
     this.durableHydrationTails.clear();
     this.snapshotHttpInFlight.clear();
+    this.swarmResyncInFlight.clear();
     this.restoreBannerOwners = null;
     this.automaticRecoveryPending.clear();
     this.authoritativeFrameSeqResetEpochBySessionKey.clear();
@@ -4768,6 +4778,42 @@ export class ChatSocket {
     rebuildIndexes(sess);
     this.deps.persistSession?.(sessId);
     this.scheduleNotify();
+  }
+
+  private resyncSwarmUnits(sessId: string, expectedClientMessageId?: string): void {
+    const sess = this.sessions.get(sessId);
+    if (!sess) return;
+    const expectedOwner = expectedClientMessageId || sess._activeClientMessageId;
+    if (!this.deps.readLiveUnits) {
+      this.syncHistory(sessId, expectedOwner ? { clientMessageId: expectedOwner } : undefined);
+      return;
+    }
+    if (this.swarmResyncInFlight.has(sessId)) return;
+    this.swarmResyncInFlight.add(sessId);
+    const lifecycle = this.lifecycleEpoch;
+    void (async () => {
+      try {
+        const units = await fetchSwarmResyncUnits(this.deps.readLiveUnits, sessId, expectedOwner);
+        if (this.lifecycleEpoch !== lifecycle || this.sessions.get(sessId) !== sess) return;
+        if (units.length > 0) {
+          const applied = applySwarmResyncUnits(
+            sess,
+            units,
+            expectedOwner,
+            planTurnStart(sess.messages, sess.messages.length),
+            isFrozenLiveTarget,
+          );
+          if (applied) {
+            this.deps.persistSession?.(sessId);
+            this.scheduleNotify();
+          }
+          return;
+        }
+        this.syncHistory(sessId, expectedOwner ? { clientMessageId: expectedOwner } : undefined);
+      } finally {
+        this.swarmResyncInFlight.delete(sessId);
+      }
+    })();
   }
 
   /**

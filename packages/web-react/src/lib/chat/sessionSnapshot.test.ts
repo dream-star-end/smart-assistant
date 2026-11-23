@@ -1868,4 +1868,179 @@ describe("INC-20261115-CONTAINER-SWAP-FRAMESEQ: 跨容器游标归零与租约�
     await vi.advanceTimersByTimeAsync(120_000);
     expect(syncSession).toHaveBeenCalledTimes(1);
   });
+
+  test("OCV5-867: missing_base delta swarm_snapshot self-heals via readLiveUnits and accepts subsequent deltas", async () => {
+    const blockId = "agy-swarm-86700001-t1";
+    const fullBaseSnap = {
+      swarmId: "86700001-1111-1111-1111-111111111111",
+      title: "AI 辅助科研蜂群",
+      phase: "running" as const,
+      startedAt: 1_700_000_000_000,
+      updatedAt: 1_700_000_005_000,
+      revision: 5,
+      members: [
+        { name: "coordinator", role: "coordinator" as const, model: "gemini-3.1-pro", status: "working" as const },
+        { name: "worker-1", role: "worker" as const, model: "gemini-3.1-pro", status: "working" as const },
+      ],
+      channels: [{ name: "main", memberCount: 2, postCount: 2 }],
+      posts: [
+        { seq: 1, agent: "coordinator", channel: "main", text: "立项", mentions: ["worker-1"] },
+        { seq: 2, agent: "worker-1", channel: "main", text: "初稿完成", mentions: ["coordinator"] },
+      ],
+      totalPosts: 2,
+      postsMode: "full" as const,
+    };
+    const readLiveUnits = vi.fn(async () => ({
+      view: "units" as const,
+      units: [
+        {
+          id: `tool:5:${blockId}`,
+          kind: "tool" as const,
+          seqFirst: 1,
+          seqLast: 5,
+          recordIdFirst: "1",
+          recordIdLast: "5",
+          open: true,
+          clientMessageId: CMID,
+          blockId,
+          toolName: "SwarmBoard",
+          inputJson: { swarmId: fullBaseSnap.swarmId, title: fullBaseSnap.title, phase: "running", snapshot: fullBaseSnap },
+        },
+      ],
+      n: 1,
+      hasMoreBefore: false,
+      beforeCursor: null,
+      streamClientMessageIds: [CMID],
+      openDispatch: true,
+      hasTapeProjection: false,
+      tapeProjectionVersion: 0,
+      reducerEpoch: "4",
+      degraded: false as const,
+      resume: { sessionKey: SK, frameSeq: 5, recordId: "5", streamKey: STREAM },
+      streamGeneration: 1,
+    }));
+    const syncSession = vi.fn(async () => true);
+    const { sock, ws, s } = boot({ readLiveUnits, syncSession });
+    s._sendingInFlight = true;
+    s._activeClientMessageId = CMID;
+    s.messages.push({ id: CMID, role: "user", text: "启动蜂群", ts: 1_700_000_000_000, _source: "server" });
+
+    // Delta arrives when local SwarmBoard card is absent -> missing_base -> self-heals via readLiveUnits
+    ws.push({
+      type: "outbound.message",
+      sessionKey: SK,
+      channel: "webchat",
+      peer,
+      clientMessageId: CMID,
+      frameSeq: 6,
+      isFinal: false,
+      ts: 1_700_000_006_000,
+      blocks: [
+        {
+          kind: "swarm_snapshot",
+          blockId,
+          snapshot: {
+            ...fullBaseSnap,
+            revision: 6,
+            updatedAt: 1_700_000_006_000,
+            postsMode: "delta" as const,
+            deltaBaseSeq: 2,
+            posts: [{ seq: 3, agent: "coordinator", channel: "main", text: "进入评审", mentions: [] }],
+            totalPosts: 3,
+          },
+        },
+      ],
+    });
+    await flush();
+
+    expect(readLiveUnits).toHaveBeenCalledTimes(1);
+    expect(syncSession).not.toHaveBeenCalled();
+    const userIdx = s.messages.findIndex((m) => m.id === CMID);
+    const swarmIdx = s.messages.findIndex((m) => m.role === "tool" && m.toolName === "SwarmBoard");
+    expect(swarmIdx).toBeGreaterThan(userIdx);
+    expect(s.messages[swarmIdx]?._swarmSnapshot?.revision).toBe(5);
+    expect(s.messages[swarmIdx]?._swarmSnapshot?.posts.map((p) => p.seq)).toEqual([1, 2]);
+    expect(s._swarmSyncStale).toBe(false);
+
+    // Subsequent delta merges cleanly onto the restored base without re-triggering readLiveUnits
+    ws.push({
+      type: "outbound.message",
+      sessionKey: SK,
+      channel: "webchat",
+      peer,
+      clientMessageId: CMID,
+      frameSeq: 7,
+      isFinal: false,
+      ts: 1_700_000_007_000,
+      blocks: [
+        {
+          kind: "swarm_snapshot",
+          blockId,
+          snapshot: {
+            ...fullBaseSnap,
+            revision: 7,
+            updatedAt: 1_700_000_007_000,
+            postsMode: "delta" as const,
+            deltaBaseSeq: 2,
+            posts: [{ seq: 3, agent: "coordinator", channel: "main", text: "进入评审", mentions: [] }],
+            totalPosts: 3,
+          },
+        },
+      ],
+    });
+    await flush();
+
+    expect(readLiveUnits).toHaveBeenCalledTimes(1);
+    expect(s.messages[swarmIdx]?._swarmSnapshot?.revision).toBe(7);
+    expect(s.messages[swarmIdx]?._swarmSnapshot?.posts.map((p) => p.seq)).toEqual([1, 2, 3]);
+    expect(s._swarmSyncStale).toBe(false);
+    sock.stop();
+
+    // Fallback: when openDispatch is false (swarm already finished), missing_base falls back to syncSession
+    const closedUnits = vi.fn(async () => ({
+      view: "units" as const,
+      units: [],
+      n: 0,
+      hasMoreBefore: false,
+      beforeCursor: null,
+      streamClientMessageIds: [],
+      openDispatch: false,
+      hasTapeProjection: true,
+      tapeProjectionVersion: 1,
+      reducerEpoch: "4",
+      degraded: false as const,
+    }));
+    const syncFallback = vi.fn(async () => true);
+    const { sock: sock2, ws: ws2, s: s2 } = boot({ readLiveUnits: closedUnits, syncSession: syncFallback });
+    s2._sendingInFlight = true;
+    s2._activeClientMessageId = CMID;
+    ws2.push({
+      type: "outbound.message",
+      sessionKey: SK,
+      channel: "webchat",
+      peer,
+      clientMessageId: CMID,
+      frameSeq: 10,
+      isFinal: false,
+      ts: 1_700_000_010_000,
+      blocks: [
+        {
+          kind: "swarm_snapshot",
+          blockId,
+          snapshot: {
+            ...fullBaseSnap,
+            revision: 8,
+            postsMode: "delta" as const,
+            deltaBaseSeq: 2,
+            posts: [{ seq: 3, agent: "coordinator", channel: "main", text: "收口", mentions: [] }],
+            totalPosts: 3,
+          },
+        },
+      ],
+    });
+    await flush();
+    expect(closedUnits).toHaveBeenCalledTimes(1);
+    expect(syncFallback).toHaveBeenCalledTimes(1);
+    sock2.stop();
+  });
 });

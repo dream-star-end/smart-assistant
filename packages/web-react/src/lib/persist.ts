@@ -37,6 +37,7 @@ import {
 } from "./chat/render";
 import { friendlyDelegateResultPreview } from "./chat/reducer";
 import { sessionTitleFromText } from "./sessionTitle";
+import { isActiveTurnLiveRow, repositionActiveTurnRowsAfterOwner } from "./persistActiveTurn";
 import { observeTimelineShadow } from "./timeline/shadowLifecycle";
 
 /** turn 终态收敛(RFC §5 M5):server 载荷自证的 turn 终态类别。 */
@@ -1218,7 +1219,7 @@ export function mergeFullServerWins(
   // In-flight order is the live order. Repair would pull process cards in
   // front of a partial assistant and the refresh would not match the open tab.
   const settle = (rows: ChatMessage[]) => finishShadow(
-    activeOwner ? rows : coalesceProcessIdentities(repairPostFinalProcessOrder(rows)),
+    activeOwner ? repositionActiveTurnRowsAfterOwner(rows, activeOwner, turnOwnerId) : coalesceProcessIdentities(repairPostFinalProcessOrder(rows)),
   );
   local = activeOwner ? local : repairPostFinalProcessOrder(local);
   const legacyActiveRows = new Set<ChatMessage>();
@@ -1370,7 +1371,8 @@ export function mergeFullServerWins(
           // Repeated Phase-A pages move live process rows into the middle once
           // the fallback assistant is already the durable tail. Preserve them
           // until Phase-B exact tape rows positively supersede the live copy.
-          isUnpublishedProcessRow(m)),
+          isUnpublishedProcessRow(m) ||
+          isActiveTurnLiveRow(m, activeOwner, turnOwnerId)),
     );
   if (!tail.length && !preservedMid.length) {
     return settle(stableSortByTs(serverChanged ? serverMerged : server));
@@ -1501,7 +1503,7 @@ export function applyServerIncremental(
   const seen = new Set<string>();
   for (const m of local) if (m?.id) seen.add(m.id);
   for (const m of incoming) if (m?.id && !seen.has(m.id)) merged.push(m);
-  return finishShadow(activeOwner ? merged : repairPostFinalProcessOrder(stableSortByTs(merged)));
+  return finishShadow(activeOwner ? repositionActiveTurnRowsAfterOwner(merged, activeOwner, turnOwnerId) : repairPostFinalProcessOrder(stableSortByTs(merged)));
 }
 
 /**
