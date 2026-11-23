@@ -53,6 +53,7 @@ import {
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { IdentityCompatProfile } from '@openclaude/protocol'
 import { hashSkillTree, loadProjectSkillFileMap } from './projectSkillLedger.js'
+import { copyPreservedSkillAssets, withSkillSaveLock } from './skillAssetPreservation.js'
 import { paths } from './paths.js'
 import { IdentityAssetsError, isIdentityAssetsError } from './identityCompatAssets.js'
 
@@ -1198,7 +1199,7 @@ export class SkillStore {
     meta: SkillFrontmatter,
     body: string,
     options: SkillSaveOptions = {},
-  ): Promise<{ ok: boolean; error?: string }> {
+  ): Promise<{ ok: boolean; version?: string; error?: string }> {
     const v = validateSkillName(meta.name)
     if (!v.ok) return { ok: false, error: v.error }
     try {
@@ -1247,87 +1248,156 @@ export class SkillStore {
     const ensured = await this.ensureWriteRoot()
     if (!ensured.ok) return ensured
 
-    const skillDir = join(this.writeRoot, meta.name)
-    const skillMd = join(skillDir, 'SKILL.md')
-    const now = new Date().toISOString()
-    const isNew = !existsSync(skillMd)
+    return withSkillSaveLock(this.writeRoot, meta.name, async () => {
+      const skillDir = join(this.writeRoot, meta.name)
+      const skillMd = join(skillDir, 'SKILL.md')
+      const now = new Date().toISOString()
 
-    // Snapshot old version before overwriting
-    let prevVersion = '1.0.0'
-    if (!isNew) {
-      const oldRaw = await this.safeReadFile(skillMd, this.writeRoot)
-      if (!oldRaw) return { ok: false, error: 'failed to read existing skill for snapshot' }
-      const { meta: oldMeta } = parseFrontmatter(oldRaw)
-      prevVersion = oldMeta.version && isValidVersion(oldMeta.version) ? oldMeta.version : '1.0.0'
-      // Save snapshot to history/<version>.md — write via resolved path
-      const historyDir = join(skillDir, 'history')
-      await mkdir(historyDir, { recursive: true })
-      const realHistoryDir = await realpath(historyDir)
-      const realRoot0 = await realpath(this.writeRoot)
-      if (!realHistoryDir.startsWith(realRoot0 + sep)) {
-        return { ok: false, error: 'history directory resolves outside skills root' }
+      // Reject symlinked skill directory before touching anything inside it.
+      let skillDirExisted = false
+      try {
+        const dirStat = await lstat(skillDir)
+        skillDirExisted = true
+        if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
+          return { ok: false, error: 'skill directory is a symlink or invalid' }
+        }
+      } catch (err) {
+        const code = err && typeof err === 'object' && 'code' in err ? (err as { code?: unknown }).code : undefined
+        if (code !== 'ENOENT') throw err
       }
-      const snapshotPath = join(realHistoryDir, `${prevVersion}.md`)
-      // Reject if snapshot target already exists as symlink
-      if (existsSync(snapshotPath)) {
-        const snStat = await lstat(snapshotPath)
-        if (snStat.isSymbolicLink()) {
-          return { ok: false, error: 'snapshot target is a symlink' }
+
+      // Locate existing skill: first in writeRoot, otherwise (when promoting from
+      // per-agent legacy into shared) check visible legacy roots so updating a
+      // legacy multi-file skill preserves its scripts/references and bumps version
+      // instead of resetting to 1.0.0 and shadowing away sibling assets.
+      let existingRaw: string | null = null
+      let existingAssetSourceDir: string | null = null
+      if (existsSync(skillMd)) {
+        existingRaw = await this.safeReadFile(skillMd, this.writeRoot)
+        if (!existingRaw) return { ok: false, error: 'failed to read existing skill for snapshot' }
+      } else if (this.writesToShared) {
+        for (const legacyRoot of await this.legacyRoots()) {
+          const legacyMd = join(legacyRoot.root, meta.name, 'SKILL.md')
+          const raw = await this.safeReadFile(legacyMd, legacyRoot.root)
+          if (raw) {
+            existingRaw = raw
+            existingAssetSourceDir = join(legacyRoot.root, meta.name)
+            break
+          }
         }
       }
-      const tmpSnap = join(realHistoryDir, `.${prevVersion}.md.tmp-${randomUUID()}`)
+      const isNew = existingRaw === null
+
+      await mkdir(skillDir, { recursive: true })
+      // Verify write target resolves within the write root (guards symlinked skill dirs)
+      const realTarget = await realpath(skillDir)
+      const realRoot = await realpath(this.writeRoot)
+      if (!realTarget.startsWith(realRoot + sep)) {
+        return { ok: false, error: 'skill directory resolves outside skills root' }
+      }
+
+      // Preserve sibling scripts/references BEFORE snapshotting or publishing SKILL.md.
+      // Any symlink violation, file-count limit, or I/O error fails the whole save
+      // cleanly so the legacy skill remains intact and visible (OCV5-865).
+      if (existingAssetSourceDir) {
+        try {
+          await copyPreservedSkillAssets(existingAssetSourceDir, realTarget)
+        } catch (err) {
+          if (!skillDirExisted) {
+            await rm(realTarget, { recursive: true, force: true }).catch(() => {})
+          }
+          return {
+            ok: false,
+            error: `failed to preserve skill assets: ${err instanceof Error ? err.message : String(err)}`,
+          }
+        }
+      }
+
+      // Snapshot old version before overwriting
+      let prevVersion = '1.0.0'
+      let oldMeta: Partial<SkillFrontmatter> = {}
+      if (!isNew && existingRaw !== null) {
+        oldMeta = parseFrontmatter(existingRaw).meta
+        prevVersion = oldMeta.version && isValidVersion(oldMeta.version) ? oldMeta.version : '1.0.0'
+        // Save snapshot to history/<version>.md — reject symlinked history dir & enforce containment in realTarget
+        const historyDir = join(realTarget, 'history')
+        try {
+          const hdStat = await lstat(historyDir)
+          if (hdStat.isSymbolicLink() || !hdStat.isDirectory()) {
+            return { ok: false, error: 'history directory must be a real directory inside target skill' }
+          }
+        } catch (err) {
+          const code = err && typeof err === 'object' && 'code' in err ? (err as { code?: unknown }).code : undefined
+          if (code !== 'ENOENT') throw err
+        }
+        await mkdir(historyDir, { recursive: true })
+        const realHistoryDir = await realpath(historyDir)
+        if (realHistoryDir !== join(realTarget, 'history') || !realHistoryDir.startsWith(realTarget + sep)) {
+          return { ok: false, error: 'history directory resolves outside target skill directory' }
+        }
+        const snapshotPath = join(realHistoryDir, `${prevVersion}.md`)
+        // Reject if snapshot target already exists as symlink (lstat catches dangling too)
+        try {
+          const snStat = await lstat(snapshotPath)
+          if (snStat.isSymbolicLink()) {
+            return { ok: false, error: 'snapshot target is a symlink' }
+          }
+        } catch (err) {
+          const code = err && typeof err === 'object' && 'code' in err ? (err as { code?: unknown }).code : undefined
+          if (code !== 'ENOENT') throw err
+        }
+        const tmpSnap = join(realHistoryDir, `.${prevVersion}.md.tmp-${randomUUID()}`)
+        try {
+          await writeFile(tmpSnap, existingRaw)
+          await rename(tmpSnap, snapshotPath)
+        } catch (err) {
+          await rm(tmpSnap, { force: true }).catch(() => {})
+          throw err
+        }
+        await pruneSkillHistoryDir(realHistoryDir, realRoot, MAX_SKILL_HISTORY_VERSIONS).catch(() => {})
+      }
+
+      // Auto-bump patch version if caller didn't specify
+      const nextVersion = meta.version ?? (isNew ? '1.0.0' : bumpPatch(prevVersion))
+
+      const mergedMeta: SkillFrontmatter = {
+        ...meta,
+        version: nextVersion,
+        related_skills: meta.related_skills ?? oldMeta.related_skills,
+        priority: meta.priority ?? oldMeta.priority,
+        created_at: meta.created_at ?? (isNew ? now : oldMeta.created_at),
+        updated_at: now,
+      }
+      // Write to resolved path; reject symlinked SKILL.md (including dangling symlinks)
+      const realSkillMd = join(realTarget, 'SKILL.md')
       try {
-        await writeFile(tmpSnap, oldRaw)
-        await rename(tmpSnap, snapshotPath)
+        const mdStat = await lstat(realSkillMd)
+        if (mdStat.isSymbolicLink()) {
+          return { ok: false, error: 'SKILL.md is a symlink' }
+        }
       } catch (err) {
-        await rm(tmpSnap, { force: true }).catch(() => {})
+        const code = err && typeof err === 'object' && 'code' in err ? (err as { code?: unknown }).code : undefined
+        if (code !== 'ENOENT') throw err
+      }
+      const content = `${formatFrontmatter(mergedMeta)}\n\n${body.trim()}\n`
+      // Atomic write: write a sibling temp then rename, so concurrent readers never
+      // observe a half-written SKILL.md (and a crash mid-write leaves the old file).
+      const tmpMd = join(realTarget, `.SKILL.md.tmp-${randomUUID()}`)
+      try {
+        await writeFile(tmpMd, content)
+        await rename(tmpMd, realSkillMd)
+      } catch (err) {
+        await rm(tmpMd, { force: true }).catch(() => {})
         throw err
       }
-      await pruneSkillHistoryDir(realHistoryDir, realRoot0, MAX_SKILL_HISTORY_VERSIONS).catch(() => {})
-    }
-
-    // Auto-bump patch version if caller didn't specify
-    const nextVersion = meta.version ?? (isNew ? '1.0.0' : bumpPatch(prevVersion))
-
-    const mergedMeta: SkillFrontmatter = {
-      ...meta,
-      version: nextVersion,
-      created_at: meta.created_at ?? (isNew ? now : undefined),
-      updated_at: now,
-    }
-    await mkdir(skillDir, { recursive: true })
-    // Verify write target resolves within the write root (guards symlinked skill dirs)
-    const realTarget = await realpath(skillDir)
-    const realRoot = await realpath(this.writeRoot)
-    if (!realTarget.startsWith(realRoot + sep)) {
-      return { ok: false, error: 'skill directory resolves outside skills root' }
-    }
-    // Write to resolved path; reject symlinked SKILL.md
-    const realSkillMd = join(realTarget, 'SKILL.md')
-    if (existsSync(realSkillMd)) {
-      const mdStat = await lstat(realSkillMd)
-      if (mdStat.isSymbolicLink()) {
-        return { ok: false, error: 'SKILL.md is a symlink' }
+      if (this.writesToShared) {
+        const agentIds =
+          requestedAgentIds ?? (await this.agentScopeForLayer(this.writeRoot, meta.name, 'shared'))
+        const scopeWrite = await this.writeAgentScope(this.writeRoot, meta.name, agentIds)
+        if (!scopeWrite.ok) return scopeWrite
       }
-    }
-    const content = `${formatFrontmatter(mergedMeta)}\n\n${body.trim()}\n`
-    // Atomic write: write a sibling temp then rename, so concurrent readers never
-    // observe a half-written SKILL.md (and a crash mid-write leaves the old file).
-    const tmpMd = join(realTarget, `.SKILL.md.tmp-${randomUUID()}`)
-    try {
-      await writeFile(tmpMd, content)
-      await rename(tmpMd, realSkillMd)
-    } catch (err) {
-      await rm(tmpMd, { force: true }).catch(() => {})
-      throw err
-    }
-    if (this.writesToShared) {
-      const agentIds =
-        requestedAgentIds ?? (await this.agentScopeForLayer(this.writeRoot, meta.name, 'shared'))
-      const scopeWrite = await this.writeAgentScope(this.writeRoot, meta.name, agentIds)
-      if (!scopeWrite.ok) return scopeWrite
-    }
-    return { ok: true }
+      return { ok: true, version: nextVersion }
+    })
   }
 
   /**

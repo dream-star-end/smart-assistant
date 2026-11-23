@@ -289,6 +289,11 @@ describe("checkManifest 红线", () => {
     const { manifest: out } = await checkManifest(manifest, depsFor(doc, {}));
     assert.equal(out.claims[0].status, "verified");
     assert.equal(out.claims[1].status, "unchecked");
+    assert.equal(out.claims[0].evidenceGrade, "A");
+    assert.equal(out.claims[0].verdict?.evidenceGrade, "A");
+    assert.equal(out.claims[1].evidenceGrade, "B");
+    assert.equal(out.claims[1].verdict?.evidenceGrade, "B");
+    assert.equal(out.quotes[0].evidenceGrade, "A");
     assert.equal(out.coverage.verifiedClaims, 1);
     assert.equal(out.coverage.totalClaims, 2);
   });

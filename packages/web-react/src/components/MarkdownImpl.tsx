@@ -68,20 +68,51 @@ const AUDIO_EXT = new Set(["mp3", "wav", "ogg", "m4a", "flac", "aac"]);
 
 type EmbedTag = "img" | "video" | "audio" | "filecard";
 
+const ARTIFACT_CONTAINER_PATH_RE = /^\/(?:home\/agent|root)\/\.openclaude\/(?:generated|uploads)\//;
+const SHELL_METACHAR_RE = /[\r\n;&|<>`$]/;
+const SCRIPT_INVOCATION_RE = /\.(?:sh|bash|py|js|mjs|cjs|ts|rb|pl)\s+\S/i;
+
+/** 规范化行内/裸路径候选(剥离可选 file:// 前缀与首尾空白/单双引号)。 */
+function normalizeEmbedCandidate(raw: string): string {
+  let s = raw.trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1).trim();
+  }
+  if (/^file:\/\/\//i.test(s)) {
+    const stripped = s.slice("file://".length);
+    if (ARTIFACT_CONTAINER_PATH_RE.test(stripped)) s = stripped;
+  }
+  return s;
+}
+
 /** 候选引用归类。媒体扩展名(容器路径/http/URL)→ 媒体标签;非媒体的容器文件路径 → 文件下载卡;否则 null。 */
-function classifyEmbed(raw: string): EmbedTag | null {
-  const s = raw.trim();
-  if (!s || /\s/.test(s)) return null;
+function classifyEmbed(raw: string): { tag: EmbedTag; src: string } | null {
+  const s = normalizeEmbedCandidate(raw);
+  if (!s || SHELL_METACHAR_RE.test(s)) return null;
+  const isArtifactPath = ARTIFACT_CONTAINER_PATH_RE.test(s);
   const isContainerPath = s.startsWith("/") && !s.startsWith("//") && !s.startsWith("/api/");
   const isApiMedia = s.startsWith("/api/media");
   const isUrl = /^https?:\/\//i.test(s);
-  const m = /\.([a-z0-9]+)(?:\?.*)?$/i.exec(s);
+  // 普通路径不含空白;生成/上传交付路径允许文件名内含空格(如中文/英文带空格 .docx/.pdf/.zip),
+  // 但仍拒绝明显命令串、目录路径与路径穿越。
+  if (/\s/.test(s)) {
+    if (!isArtifactPath) return null;
+    if (SCRIPT_INVOCATION_RE.test(s) || /\s--?[A-Za-z]/.test(s)) return null;
+  }
+  if (isContainerPath) {
+    if (s.endsWith("/")) return null;
+    const withoutQuery = s.split("?")[0] ?? s;
+    if (withoutQuery.split("/").some((seg) => seg === "." || seg === "..")) return null;
+  }
+  const basename = (s.split("?")[0] ?? s).split("/").pop() ?? "";
+  // 有效文件扩展名必须以字母开头(排除目录版本号如 v1.0 / run.2026),且前面有非空文件名。
+  const m = /^.+?\.([a-z][a-z0-9]{0,9})$/i.exec(basename);
   if (!m) return null;
   const e = m[1].toLowerCase();
   const media = IMG_EXT.has(e) ? "img" : VIDEO_EXT.has(e) ? "video" : AUDIO_EXT.has(e) ? "audio" : null;
-  if (media) return isContainerPath || isApiMedia || isUrl ? media : null;
+  if (media) return isContainerPath || isApiMedia || isUrl ? { tag: media, src: s } : null;
   // 非媒体:仅容器文件路径(生成/上传)→ 可下载文件卡(http 普通链接不碰,保持普通超链接)。
-  return isContainerPath ? "filecard" : null;
+  return isContainerPath ? { tag: "filecard", src: s } : null;
 }
 
 type HastNode = {
@@ -115,7 +146,8 @@ function embedEl(tag: EmbedTag, src: string): HastNode {
 }
 
 // 纯文本只认 openclaude 生成/上传目录 + /api/media(收口,避免误判普通 "/path")。
-const TEXT_PATH_RE = /(?:\/(?:home\/agent|root)\/\.openclaude|\/api\/media)\/[^\s"'`<>，。、；：）)】」]+\.[A-Za-z0-9]{1,10}/g;
+// 允许中文文件名含全角括号等常见字符,但仍要求以有效字母扩展名结尾。
+const TEXT_PATH_RE = /(?:\/(?:home\/agent|root)\/\.openclaude|\/api\/media)\/[^\s"'`<>，。、；：】」]+\.[A-Za-z][A-Za-z0-9]{0,9}/g;
 
 function rehypeEmbedMedia() {
   return (tree: HastNode) => visit(tree);
@@ -127,24 +159,13 @@ function rehypeEmbedMedia() {
       // ① 行内 code(块级 ``` 在 <pre> 里、带 language- class 的不碰)。
       if (child.type === "element" && child.tagName === "code") {
         if (node.tagName !== "pre" && isInlineCode(child)) {
-          const tag = classifyEmbed(hastText(child));
-          if (tag) kids[i] = embedEl(tag, hastText(child).trim());
+          const classified = classifyEmbed(hastText(child));
+          if (classified) kids[i] = embedEl(classified.tag, classified.src);
         }
         continue;
       }
-      // 已有链接不下钻。pre：仅当整块就是一条白名单路径时转 filecard（防模型套 ```）。
-      if (child.type === "element" && child.tagName === "a") continue;
-      if (child.type === "element" && child.tagName === "pre") {
-        const codeKids = (child.children || []).filter((k) => k.type === "element" && k.tagName === "code");
-        if (codeKids.length === 1) {
-          const text = hastText(codeKids[0]!).trim();
-          if (text && !/\s/.test(text)) {
-            const tag = classifyEmbed(text);
-            if (tag) kids[i] = embedEl(tag, text);
-          }
-        }
-        continue;
-      }
+      // 已有链接与围栏代码块不下钻：三反引号围栏一律保留 pre/code 与复制按钮，绝不替换为下载卡（与 ProcessDisclosure 一致，OCV5-865）。
+      if (child.type === "element" && (child.tagName === "a" || child.tagName === "pre")) continue;
       // ② 纯文本:扫容器路径并切分插入媒体/文件元素。
       if (child.type === "text" && typeof child.value === "string") {
         const parts = splitText(child.value);
@@ -165,10 +186,10 @@ function rehypeEmbedMedia() {
     let last = 0;
     let m: RegExpExecArray | null = TEXT_PATH_RE.exec(value);
     while (m !== null) {
-      const tag = classifyEmbed(m[0]);
-      if (tag) {
+      const classified = classifyEmbed(m[0]);
+      if (classified) {
         if (m.index > last) out.push({ type: "text", value: value.slice(last, m.index) });
-        out.push(embedEl(tag, m[0]));
+        out.push(embedEl(classified.tag, classified.src));
         last = m.index + m[0].length;
       }
       m = TEXT_PATH_RE.exec(value);

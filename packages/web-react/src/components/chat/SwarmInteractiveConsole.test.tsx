@@ -172,8 +172,8 @@ describe("SwarmBoardDrawer · 遥测展示与交互式指挥操控台", () => {
 });
 
 describe("Composer · 蜂群剧本模板快选弹层", () => {
-  it("提供 4 套预设剧本，点击一键填充结构化指令并自动开启蜂群模式", async () => {
-    expect(SWARM_PLAYBOOK_PRESETS).toHaveLength(4);
+  it("提供 6 套预设剧本（含 2 套科研专属剧本），点击一键填充结构化指令并自动开启蜂群模式", async () => {
+    expect(SWARM_PLAYBOOK_PRESETS).toHaveLength(6);
     expect(buildSwarmPlaybookDraft(SWARM_PLAYBOOK_PRESETS[0]!, "实现登录页")).toContain(
       "/swarm-playbook parallel-impl-verify 实现登录页",
     );
@@ -201,18 +201,24 @@ describe("Composer · 蜂群剧本模板快选弹层", () => {
     expect(popover).toHaveTextContent("多源文献深研+核验");
     expect(popover).toHaveTextContent("架构深度体检");
     expect(popover).toHaveTextContent("多方案评审");
+    expect(popover).toHaveTextContent("论文写作+盲审+批判修订");
+    expect(popover).toHaveTextContent("受控实验循环（防刷分）");
 
-    fireEvent.click(screen.getByTestId("swarm-playbook-option-multi-source-lit-verify"));
+    fireEvent.click(screen.getByTestId("swarm-playbook-option-research-write-review-revise"));
 
     const input = screen.getByRole("textbox") as HTMLTextAreaElement;
-    expect(input.value).toContain("/swarm-playbook multi-source-lit-verify");
+    expect(input.value).toContain("/swarm-playbook research-write-review-revise");
     expect(onToggleSwarmMode).toHaveBeenCalledTimes(1);
+
+    // 等选完剧本后的 rAF 回焦输入框完成，避免 JSDOM 慢帧时 rAF 在二次打开「+」菜单途中抢焦关闭菜单。
+    await waitFor(() => expect(document.activeElement).toBe(input));
 
     // OCV5-861 回归：chunk 预热后二次打开剧本弹层，即便触发器收到 focusin 也不得误关弹层。
     fireEvent.pointerDown(plusBtn, { button: 0, pointerType: "mouse" });
     fireEvent.click(plusBtn);
     fireEvent.click(await screen.findByTestId("composer-menu-swarm-playbooks"));
     const reopened = await screen.findByTestId("swarm-playbook-popover");
+    expect(screen.getByTestId("swarm-playbook-option-research-controlled-exp-loop")).toBeInTheDocument();
     fireEvent.focus(plusBtn);
     expect(screen.getByTestId("swarm-playbook-popover")).toBe(reopened);
   });

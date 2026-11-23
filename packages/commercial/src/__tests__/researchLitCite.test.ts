@@ -32,7 +32,11 @@ import {
   type SourceRecord,
   formatApa,
   formatBibtex,
+  formatCitation,
   formatGbt7714,
+  formatIeee,
+  formatNature,
+  resolveEvidenceGrade,
 } from "@openclaude/protocol/research";
 
 // ── mock fetch helper ────────────────────────────────────────────────
@@ -156,7 +160,7 @@ describe("sources: pubmed", () => {
     assert.equal(rec.id, "doi:10.1038/s41591-021-0001");
     assert.equal(rec.year, 2021);
     assert.equal(rec.venue, "Nature Medicine");
-    assert.deepEqual(rec.authors, [{ name: "Smith J" }]); // 非 Author authtype 剔除
+    assert.deepEqual(rec.authors, [{ name: "Smith J", family: "Smith", given: "J" }]); // 非 Author authtype 剔除且保留结构化姓/名
     assert.equal(rec.retracted, null);
   });
 
@@ -644,5 +648,170 @@ describe("cite: formatters", () => {
     const g = formatGbt7714(pre);
     assert.ok(g.includes("[J/OL]"));
     assert.ok(g.includes("arxiv.org/abs/2301.00001"));
+  });
+
+  it("OCV5-865: gbt7714 完整卷期页码/会议[C]/DOI + ieee + nature + formatCitation 调度", () => {
+    const journalRec: SourceRecord = {
+      id: "doi:10.1038/s41586-024-0001",
+      title: "Scalable Graph Reasoning",
+      authors: [
+        { name: "Alice Chen" },
+        { name: "Bob Zhang" },
+        { name: "Carol Li" },
+      ],
+      year: 2024,
+      venue: "Nature",
+      volume: "628",
+      issue: "8007",
+      pages: "112-119",
+      doi: "10.1038/s41586-024-0001",
+    };
+    const confRec: SourceRecord = {
+      id: "doi:10.1109/cvpr.2025.0042",
+      title: "Dense Visual Grounding",
+      authors: [{ name: "John Smith" }, { name: "Jane Doe" }],
+      year: 2025,
+      venue: "Proceedings of CVPR",
+      pages: "450-459",
+      publisher: "IEEE",
+      crossrefType: "proceedings-article",
+      doi: "10.1109/cvpr.2025.0042",
+    };
+
+    const gbtJournal = formatCitation(journalRec, "gb-t-7714");
+    assert.equal(gbtJournal, formatCitation(journalRec, "gb-t-7714-2015"));
+    assert.ok(gbtJournal.includes("[J]"));
+    assert.ok(gbtJournal.includes("2024, 628(8007): 112-119"));
+    assert.ok(gbtJournal.includes("DOI: 10.1038/s41586-024-0001"));
+
+    const gbtConf = formatCitation(confRec, "gb-t-7714");
+    assert.ok(gbtConf.includes("[C]//Proceedings of CVPR"));
+    assert.ok(gbtConf.includes("IEEE, 2025: 450-459"));
+
+    const bibConf = formatCitation(confRec, "bibtex");
+    assert.ok(bibConf.startsWith("@inproceedings{"));
+    assert.ok(bibConf.includes("booktitle = {Proceedings of CVPR}"));
+    assert.ok(bibConf.includes("pages = {450--459}"));
+
+    const ieeeJournal = formatCitation(journalRec, "ieee");
+    assert.ok(ieeeJournal.includes("A. Chen, B. Zhang, and C. Li"));
+    assert.ok(ieeeJournal.includes("vol. 628, no. 8007, pp. 112–119, 2024"));
+    assert.ok(ieeeJournal.includes("doi: 10.1038/s41586-024-0001"));
+
+    const ieeeConf = formatIeee(confRec);
+    assert.ok(ieeeConf.includes("in Proceedings of CVPR"));
+
+    const natureJournal = formatCitation(journalRec, "nature");
+    assert.ok(natureJournal.includes("Chen, A., Zhang, B. & Li, C."));
+    assert.ok(natureJournal.includes("Nature 628, 112–119 (2024)."));
+    assert.ok(natureJournal.includes("https://doi.org/10.1038/s41586-024-0001"));
+
+    const manyAuthorsNature = formatNature({
+      ...journalRec,
+      authors: [
+        { name: "Alice Chen" },
+        { name: "Bob Zhang" },
+        { name: "Carol Li" },
+        { name: "Dave Wang" },
+        { name: "Eve Sun" },
+        { name: "Frank Wu" },
+      ],
+    });
+    assert.ok(manyAuthorsNature.startsWith("Chen, A. et al."));
+  });
+
+  it("OCV5-865: PubMed Smith JA 与 Crossref 多作者 APA/IEEE/Nature 格式化 CLI 与 Web 一致 (#8)", async () => {
+    const { parseCrossrefItem, parsePubmedSummary } = await import("../research/sources.js");
+    const webCiteModulePath = "../../../web-react/src/lib/research/cite.js";
+    const webCite = (await import(webCiteModulePath)) as { formatCitation: typeof formatCitation };
+
+    // 1. PubMed "Smith JA" 姓必须仍是 Smith
+    const pubmedRec = parsePubmedSummary({
+      uid: "39000001",
+      title: "Single-cell atlas of cortical plasticity",
+      pubdate: "2024 May",
+      fulljournalname: "Nature Neuroscience",
+      volume: "27",
+      issue: "5",
+      pages: "801-812",
+      authors: [
+        { name: "Smith JA", authtype: "Author" },
+        { name: "van der Berg HM", authtype: "Author" },
+      ],
+      articleids: [{ idtype: "doi", value: "10.1038/s41593-024-0001" }],
+    });
+    assert.ok(pubmedRec);
+    assert.equal(pubmedRec.authors[0]?.family, "Smith");
+    assert.equal(formatCitation(pubmedRec, "ieee"), webCite.formatCitation(pubmedRec, "ieee"));
+    assert.equal(formatCitation(pubmedRec, "nature"), webCite.formatCitation(pubmedRec, "nature"));
+    assert.equal(formatCitation(pubmedRec, "apa"), webCite.formatCitation(pubmedRec, "apa"));
+    assert.ok(formatCitation(pubmedRec, "ieee").startsWith("J. A. Smith and H. M. van der Berg,"));
+    assert.ok(formatCitation(pubmedRec, "nature").startsWith("Smith, J. A. & van der Berg, H. M."));
+    assert.ok(formatCitation(pubmedRec, "apa").startsWith("Smith, J. A., & van der Berg, H. M. (2024)."));
+    assert.ok(formatCitation(pubmedRec, "bibtex").startsWith("@article{smith2024,"));
+
+    // 2. Crossref 双作者 APA 对照: "Smith, J., & Brown, J."
+    const crossrefRec = parseCrossrefItem({
+      DOI: "10.1000/apa-test",
+      title: ["Empirical Study of Citations"],
+      author: [
+        { given: "Jane", family: "Smith" },
+        { given: "John", family: "Brown" },
+      ],
+      issued: { "date-parts": [[2020]] },
+      "container-title": ["Journal of Testing"],
+      volume: "12",
+      issue: "3",
+      page: "45-60",
+    });
+    assert.equal(formatCitation(crossrefRec, "apa"), webCite.formatCitation(crossrefRec, "apa"));
+    assert.ok(
+      formatCitation(crossrefRec, "apa").startsWith("Smith, J., & Brown, J. (2020). Empirical Study of Citations."),
+      `got APA: ${formatCitation(crossrefRec, "apa")}`,
+    );
+  });
+
+  it("OCV5-865: evidenceGrade A 仅来自已核验本地证据，调用方自报 A 不得提权 (#7)", async () => {
+    const { checkManifest } = await import("../research/checkManifest.js");
+    assert.equal(resolveEvidenceGrade({ quoteBound: true }), "A");
+    assert.equal(resolveEvidenceGrade({ localEvidenceVerified: true }), "A");
+    assert.equal(resolveEvidenceGrade({ localEvidenceVerified: false, docId: "doc:abc", spanId: "s0", evidenceGrade: "A" }), "B");
+    assert.equal(resolveEvidenceGrade({ evidenceGrade: "A" }), "B");
+    assert.equal(resolveEvidenceGrade({ evidenceGrade: "A", quoteBound: false }), "B");
+    assert.equal(resolveEvidenceGrade({}), "B");
+    assert.equal(resolveEvidenceGrade({ docId: "doc:abc" }), "B");
+    assert.equal(resolveEvidenceGrade({ evidenceGrade: "B", quoteBound: true }), "B");
+
+    // checkManifest: 无 quotes/supports 且调用方自报 A → 必须仍为 unchecked + evidenceGrade B
+    const checked = await checkManifest(
+      {
+        sources: [],
+        quotes: [],
+        claims: [
+          {
+            id: "c-spoof",
+            text: "Unverified claim attempting self-grade A",
+            supports: [],
+            status: "unchecked",
+            evidenceGrade: "A",
+          },
+        ],
+        coverage: { verifiedClaims: 0, totalClaims: 1 },
+        gates: {
+          quoteFirst: { checked: 0, failed: 0, passed: true },
+          claimBound: { checked: 0, failed: 0, passed: true },
+          identifier: { checked: 0, failed: 0, passed: true },
+          retraction: { checked: 0, failed: 0, passed: true },
+        },
+      },
+      {
+        getDocument: async () => null,
+        verifyIdentifier: async (id) => ({ identifier: id, resolved: false, retracted: null }),
+      },
+    );
+    assert.equal(checked.manifest.claims[0]?.status, "unchecked");
+    assert.equal(checked.manifest.claims[0]?.evidenceGrade, "B");
+    assert.equal(checked.manifest.claims[0]?.verdict?.quoteBound, false);
+    assert.equal(checked.manifest.claims[0]?.verdict?.evidenceGrade, "B");
   });
 });

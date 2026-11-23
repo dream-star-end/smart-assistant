@@ -13,7 +13,9 @@ export type SkillSaveArgs = {
   name: string
   description: string
   body: string
+  version?: string
   tags?: string[]
+  related_skills?: string[]
   force: boolean
 }
 
@@ -35,6 +37,12 @@ export function normalizeSkillSaveArgs(
     const hint = bodyRaw === undefined ? ' — pass the full markdown in the `body` field' : ''
     return { ok: false, error: `body required (markdown string)${hint}` }
   }
+  let version: string | undefined
+  if (a.version !== undefined && a.version !== null) {
+    if (typeof a.version !== 'string') return { ok: false, error: 'version must be a semver string (N.N.N)' }
+    const v = a.version.trim()
+    if (v) version = v
+  }
   let tags: string[] | undefined
   if (a.tags !== undefined && a.tags !== null) {
     const list = Array.isArray(a.tags) ? a.tags : typeof a.tags === 'string' ? a.tags.split(/[,\n]/) : null
@@ -43,5 +51,28 @@ export function normalizeSkillSaveArgs(
       .map((t) => (typeof t === 'string' ? t.trim() : typeof t === 'number' ? String(t) : ''))
       .filter(Boolean)
   }
-  return { ok: true, args: { name, description, body, ...(tags ? { tags } : {}), force: a.force === true } }
+  let relatedSkills: string[] | undefined
+  if (a.related_skills !== undefined && a.related_skills !== null) {
+    const list = Array.isArray(a.related_skills)
+      ? a.related_skills
+      : typeof a.related_skills === 'string'
+        ? a.related_skills.split(/[,\n]/)
+        : null
+    if (!list) return { ok: false, error: 'related_skills must be an array of strings' }
+    relatedSkills = list
+      .map((t) => (typeof t === 'string' ? t.trim() : ''))
+      .filter(Boolean)
+  }
+  return {
+    ok: true,
+    args: {
+      name,
+      description,
+      body,
+      ...(version ? { version } : {}),
+      ...(tags ? { tags } : {}),
+      ...(relatedSkills ? { related_skills: relatedSkills } : {}),
+      force: a.force === true,
+    },
+  }
 }

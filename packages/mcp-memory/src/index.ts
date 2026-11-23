@@ -686,7 +686,9 @@ async function handleSkillSave(rawArgs: unknown) {
     {
       name: args.name,
       description: args.description,
+      ...(args.version ? { version: args.version } : {}),
       tags: args.tags,
+      ...(args.related_skills ? { related_skills: args.related_skills } : {}),
     },
     args.body,
   )

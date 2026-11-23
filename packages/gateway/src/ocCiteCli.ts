@@ -31,9 +31,17 @@ async function main(): Promise<void> {
     }
     case "format": {
       const id = positional[0] ?? flags.id;
-      if (!id) fail(TOOL, "format <id> --style gb-t-7714-2015|apa|bibtex");
+      if (!id) fail(TOOL, "format <id> --style gb-t-7714|gb-t-7714-2015|apa|bibtex|ieee|nature");
       const style = flags.style ?? "gb-t-7714-2015";
-      out(await callResearch(TOOL, "cite/format", { identifier: id, style }));
+      out(
+        await callResearch(TOOL, "cite/format", {
+          identifier: id,
+          style,
+          ...(flags["evidence-grade"] ? { evidenceGrade: flags["evidence-grade"] } : {}),
+          ...(flags["doc-id"] ? { docId: flags["doc-id"] } : {}),
+          ...(flags["span-id"] ? { spanId: flags["span-id"] } : {}),
+        }),
+      );
       return;
     }
     case "check": {

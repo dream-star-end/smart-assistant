@@ -71,36 +71,153 @@ export function extractHtml(bytes: Buffer): ExtractedText {
   return { text, title };
 }
 
+/** pdf-parse v2 会在每页之间插入 `-- 1 of N --` 分隔符,校验文字层长度时须剥离以防扫描件误判。 */
+const PDF_PARSE_V2_PAGE_MARKER_RE = /^--\s*\d+\s+of\s+\d+\s*--$/gm;
+
 /**
- * PDF:动态 import pdf-parse(present in node_modules)。缺失/解析失败/无文字层
- * (文本极短)→ needs_ocr(扫描件不假设有文字层)。注入 pdfExtract 便于测试。
+ * 进程缺少原生 `@napi-rs/canvas` 绑定时,`pdf-parse` v2 内部的 `pdfjs-dist` 在模块加载阶段会执行
+ * `new DOMMatrix()`。纯文本抽取路径不依赖画布光栅化,补齐最小 2D DOMMatrix 兜底以保证文字 PDF
+ * 本地回落真实可用。
+ */
+function ensurePdfJsDomMatrix(): void {
+  const g = globalThis as Record<string, unknown>;
+  if (typeof g.DOMMatrix !== "undefined") return;
+  class MinimalDOMMatrix {
+    a: number;
+    b: number;
+    c: number;
+    d: number;
+    e: number;
+    f: number;
+    m11: number;
+    m12: number;
+    m21: number;
+    m22: number;
+    m41: number;
+    m42: number;
+    is2D = true;
+    constructor(init?: number[]) {
+      const m = Array.isArray(init) && init.length >= 6 ? init : [1, 0, 0, 1, 0, 0];
+      [this.a, this.b, this.c, this.d, this.e, this.f] = m as [number, number, number, number, number, number];
+      this.m11 = this.a;
+      this.m12 = this.b;
+      this.m21 = this.c;
+      this.m22 = this.d;
+      this.m41 = this.e;
+      this.m42 = this.f;
+    }
+    multiply(other: MinimalDOMMatrix): MinimalDOMMatrix {
+      return new MinimalDOMMatrix([
+        this.a * other.a + this.c * other.b,
+        this.b * other.a + this.d * other.b,
+        this.a * other.c + this.c * other.d,
+        this.b * other.c + this.d * other.d,
+        this.a * other.e + this.c * other.f + this.e,
+        this.b * other.e + this.d * other.f + this.f,
+      ]);
+    }
+    scale(sx: number, sy = sx): MinimalDOMMatrix {
+      return this.multiply(new MinimalDOMMatrix([sx, 0, 0, sy, 0, 0]));
+    }
+    translate(tx: number, ty = 0): MinimalDOMMatrix {
+      return this.multiply(new MinimalDOMMatrix([1, 0, 0, 1, tx, ty]));
+    }
+    inverse(): MinimalDOMMatrix {
+      const det = this.a * this.d - this.b * this.c || 1;
+      return new MinimalDOMMatrix([
+        this.d / det,
+        -this.b / det,
+        -this.c / det,
+        this.a / det,
+        (this.c * this.f - this.d * this.e) / det,
+        (this.b * this.e - this.a * this.f) / det,
+      ]);
+    }
+    transformPoint(pt: { x?: number; y?: number } = {}): { x: number; y: number; z: number; w: number } {
+      const x = pt.x ?? 0;
+      const y = pt.y ?? 0;
+      return { x: this.a * x + this.c * y + this.e, y: this.b * x + this.d * y + this.f, z: 0, w: 1 };
+    }
+  }
+  g.DOMMatrix = MinimalDOMMatrix;
+}
+
+type PdfParseV2Instance = {
+  getText: () => Promise<{ text?: string }>;
+  getInfo?: () => Promise<{ info?: { Title?: string } }>;
+  destroy: () => Promise<void> | void;
+};
+
+/**
+ * PDF:动态 import pdf-parse(锁定 v2.4.5 `PDFParse` 类,并兼容 v1 default 工厂)。
+ * 解析后必须 `destroy()` 释放 worker;缺失/解析失败/无文字层(文本极短)→ needs_ocr。
  */
 export async function extractPdf(
   bytes: Buffer,
   pdfImpl?: (b: Buffer) => Promise<{ text: string; info?: { Title?: string } }>,
 ): Promise<ExtractResult> {
-  let parse = pdfImpl;
-  if (!parse) {
+  if (pdfImpl) {
     try {
-      const mod = (await import("pdf-parse")) as unknown as {
-        default: (b: Buffer) => Promise<{ text: string; info?: { Title?: string } }>;
-      };
-      parse = mod.default;
+      const data = await pdfImpl(bytes);
+      const text = (data.text ?? "").replace(PDF_PARSE_V2_PAGE_MARKER_RE, "").trim();
+      if (text.replace(/\s/g, "").length < 40) {
+        return { needsOcr: true, reason: "no extractable text layer (likely scanned)" };
+      }
+      return { text, title: data.info?.Title?.trim() || undefined };
     } catch {
-      return { needsOcr: true, reason: "pdf parser unavailable; OCR engine required" };
+      return { needsOcr: true, reason: "pdf parse failed; OCR engine required" };
     }
   }
+
+  let mod: {
+    PDFParse?: new (opts: { data: Uint8Array }) => PdfParseV2Instance;
+    default?: (b: Buffer) => Promise<{ text: string; info?: { Title?: string } }>;
+  };
   try {
-    const data = await parse(bytes);
-    const text = (data.text ?? "").trim();
-    // 文字层过短 → 大概率扫描件
-    if (text.replace(/\s/g, "").length < 40) {
-      return { needsOcr: true, reason: "no extractable text layer (likely scanned)" };
-    }
-    return { text, title: data.info?.Title?.trim() || undefined };
+    ensurePdfJsDomMatrix();
+    mod = (await import("pdf-parse")) as unknown as typeof mod;
   } catch {
-    return { needsOcr: true, reason: "pdf parse failed; OCR engine required" };
+    return { needsOcr: true, reason: "pdf parser unavailable; OCR engine required" };
   }
+
+  if (typeof mod.PDFParse === "function") {
+    let parser: PdfParseV2Instance | null = null;
+    try {
+      parser = new mod.PDFParse({ data: new Uint8Array(bytes) });
+      const textRes = await parser.getText();
+      const infoRes = typeof parser.getInfo === "function" ? await parser.getInfo().catch(() => null) : null;
+      const text = (textRes?.text ?? "").replace(PDF_PARSE_V2_PAGE_MARKER_RE, "").trim();
+      if (text.replace(/\s/g, "").length < 40) {
+        return { needsOcr: true, reason: "no extractable text layer (likely scanned)" };
+      }
+      return { text, title: infoRes?.info?.Title?.trim() || undefined };
+    } catch {
+      return { needsOcr: true, reason: "pdf parse failed; OCR engine required" };
+    } finally {
+      if (parser) {
+        try {
+          await parser.destroy();
+        } catch {
+          // ignore cleanup failure
+        }
+      }
+    }
+  }
+
+  if (typeof mod.default === "function") {
+    try {
+      const data = await mod.default(bytes);
+      const text = (data.text ?? "").replace(PDF_PARSE_V2_PAGE_MARKER_RE, "").trim();
+      if (text.replace(/\s/g, "").length < 40) {
+        return { needsOcr: true, reason: "no extractable text layer (likely scanned)" };
+      }
+      return { text, title: data.info?.Title?.trim() || undefined };
+    } catch {
+      return { needsOcr: true, reason: "pdf parse failed; OCR engine required" };
+    }
+  }
+
+  return { needsOcr: true, reason: "pdf parser unavailable; OCR engine required" };
 }
 
 export type IngestEngine = "auto" | "local" | "mineru" | "mistral";

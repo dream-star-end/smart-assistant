@@ -12,6 +12,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
+import { DEFAULT_CODEX_ENGINE_MODEL } from '@openclaude/protocol'
 import { marketplaceArtifactHash } from '@openclaude/storage'
 
 import {
@@ -23,12 +24,13 @@ import {
   PLATFORM_SEED_AGENT_DEFS,
   PLATFORM_SEED_AGENT_MODEL_IDS,
 } from '../marketplace/seedPlatformAgents.js'
+import { scanSkillArtifact } from '../marketplace/skillScanner.js'
 
 const PINNED: Record<string, string> = {
   'office-assistant@1.0.3': '932778674a9a5579f16f3ead635d86db214d6970478d24c9e61157c1038bba1e',
   'coding-assistant@1.0.5': 'c327ca5291da19a59293dd0fbbc6100603fe511c0be556dabb85c295d2a9c5c7',
   'general-assistant@1.0.1': '396cc0515cae85f424992c650625c3dfdf1eec856e24e6888499643a94269c3b',
-  'research-assistant@1.0.2': '715567a658045f1d0af2200ea874f23b90799c756d20be82b3dfa6079df7f46d',
+  'research-assistant@1.0.3': '5871a75c342d5e6e8831b2a6abcae9fca864e5b9e4774fb1be85ff05b8ccc61a',
 }
 
 function currentHashes(): Record<string, string> {
@@ -66,4 +68,23 @@ test('INC-20261011-GENERAL-ASSISTANT-STALE-MODEL: every platform seed agent keep
 test('INC-20261011-GENERAL-ASSISTANT-STALE-MODEL: general-assistant does not pin a model (auto follows the user)', () => {
   const def = PLATFORM_SEED_AGENT_DEFS.find((item) => item.slug === 'general-assistant')
   assert.equal(def?.body.model, 'auto')
+})
+
+test('OCV5-865: research-assistant binds flagship model, documents full research toolchain, and passes static scanner', () => {
+  const def = PLATFORM_SEED_AGENT_DEFS.find((item) => item.slug === 'research-assistant')
+  assert.ok(def)
+  assert.equal(def.body.version, '1.0.3')
+  assert.equal(def.body.model, DEFAULT_CODEX_ENGINE_MODEL)
+  assert.notEqual(def.body.model, 'deepseek-v4-flash')
+  const persona = String(def.body.persona ?? '')
+  for (const tool of ['oc-ocr', 'oc-diagram', 'oc-figcheck', 'oc-docx', 'oc-slides', 'oc-poster', 'oc-stylecheck']) {
+    assert.ok(persona.includes(tool), `research-assistant persona must guide ${tool}`)
+  }
+  const scan = scanSkillArtifact({
+    name: String(def.body.name),
+    description: String(def.body.description),
+    tags: def.body.tags as string[],
+    body: persona,
+  })
+  assert.equal(scan.blocked, false, `scanner blocked research-assistant: ${JSON.stringify(scan.flags)}`)
 })
