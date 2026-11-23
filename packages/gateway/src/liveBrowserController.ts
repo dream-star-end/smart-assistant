@@ -19,49 +19,16 @@
  */
 import { createHash } from 'node:crypto'
 import { execFile as execFileCb, spawn } from 'node:child_process'
-import {
-  existsSync,
-  lstatSync,
-  readdirSync,
-  readFileSync,
-  realpathSync,
-  unlinkSync,
-  utimesSync,
-  writeFileSync,
-} from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { lookup as dnsLookup } from 'node:dns/promises'
 import { createConnection } from 'node:net'
 import { basename, dirname, join } from 'node:path'
 import type { Duplex } from 'node:stream'
-import {
-  LIVE_BROWSER_MAX_URL_CHARS,
-  LiveBrowserError,
-  acquireHumanTakeoverLease,
-  assertLiveBrowserUrlPublic,
-  isPrivateOrReservedIp,
-  readActiveHumanTakeoverLease,
-  releaseHumanTakeoverLease,
-  renewHumanTakeoverLease,
-  validateLiveBrowserUrl,
-} from './liveBrowserSecurity.js'
-import {
-  LiveBrowserStreamManager,
-  type LiveBrowserCdpEndpoint,
-  type LiveBrowserCdpTransport,
-} from './liveBrowserStream.js'
+import { LIVE_BROWSER_MAX_URL_CHARS, LiveBrowserError, acquireHumanTakeoverLease, assertLiveBrowserUrlPublic, isPrivateOrReservedIp, readActiveHumanTakeoverLease, releaseHumanTakeoverLease, renewHumanTakeoverLease, validateLiveBrowserUrl } from './liveBrowserSecurity.js'
+import { LiveBrowserStreamManager, type LiveBrowserCdpEndpoint, type LiveBrowserCdpTransport } from './liveBrowserStream.js'
 
-export {
-  LIVE_BROWSER_MAX_URL_CHARS,
-  LiveBrowserError,
-  acquireHumanTakeoverLease,
-  assertLiveBrowserUrlPublic,
-  isPrivateOrReservedIp,
-  readActiveHumanTakeoverLease,
-  releaseHumanTakeoverLease,
-  renewHumanTakeoverLease,
-  validateLiveBrowserUrl,
-}
+export { LIVE_BROWSER_MAX_URL_CHARS, LiveBrowserError, acquireHumanTakeoverLease, assertLiveBrowserUrlPublic, isPrivateOrReservedIp, readActiveHumanTakeoverLease, releaseHumanTakeoverLease, renewHumanTakeoverLease, validateLiveBrowserUrl }
 
 export const LIVE_BROWSER_AGENT_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/
 export const LIVE_BROWSER_MAX_TYPE_CHARS = 2000
@@ -94,6 +61,11 @@ const DAEMON_SOCKET_DEAD_RE =
   /\b(?:ENOENT|ECONNREFUSED|ECONNRESET|EPIPE)\b|daemon socket closed/i
 
 const ACTIVITY_LOCK_BUSY_RE = /activity lock busy/i
+
+function agentBusyErrorMessage(action?: string): string {
+  const verb = action === 'open' ? '启动' : action === 'close' ? '关闭' : action === 'takeover' ? '接管' : '操作'
+  return `助手正在操作浏览器，请等待当前浏览器操作完成后再${verb}`
+}
 
 export interface LiveBrowserTabInfo {
   index: number
@@ -983,8 +955,9 @@ export class LiveBrowserController {
       touchActivity: (id) => this.touchActivity(id),
       isAgentBusy: (id) => Boolean(this.agentRunningCheck?.(id)) || this.isExternalCliActive(id),
       isBrowserProcessActive: (id) => this.isSessionActive(id) || Boolean(this.daemonEndpointFor(id)),
+      acquireTakeoverLease: (id, opts) => this.acquireTakeoverLeaseLocked(id, opts),
       openBrowser: async (id, url) => { await this.performAction(id, { action: 'open', ...(url ? { url } : {}) }) },
-      closeBrowser: async (id) => { await this.performAction(id, { action: 'close' }) },
+      closeBrowser: async (id, takeoverToken) => { await this.performAction(id, { action: 'close', ...(takeoverToken ? { takeoverToken } : {}) }) },
       syncDaemonTab: (id, op) => this.syncDaemonActiveTab(id, op),
       dnsLookup: deps.dnsLookup,
       discoverCdpEndpoint: deps.discoverCdpEndpoint,
@@ -1037,6 +1010,36 @@ export class LiveBrowserController {
 
   isHumanTakeoverActive(agentId: string): boolean {
     return Boolean(readActiveHumanTakeoverLease(this.stateDirFor(agentId)))
+  }
+
+  /**
+   * Acquire/renew the human takeover lease inside the same `activity.lock` critical section
+   * used by `oc-browser.sh` and daemon RPCs so takeover can never coexist with an active CLI run.
+   */
+  async acquireTakeoverLeaseLocked(
+    agentId: string,
+    opts?: { token?: string; ttlMs?: number; now?: number },
+  ): Promise<{ token: string; expiresAt: number }> {
+    if (this.isExternalCliActive(agentId) || Boolean(this.agentRunningCheck?.(agentId))) {
+      throw new LiveBrowserError(409, 'AGENT_RUNNING', agentBusyErrorMessage('takeover'))
+    }
+    const stateDir = this.stateDirFor(agentId)
+    try { mkdirSync(stateDir, { recursive: true, mode: 0o700 }) } catch {}
+    try {
+      return await this.lockFn(stateDir, async () => {
+        if (this.isExternalCliActive(agentId) || Boolean(this.agentRunningCheck?.(agentId))) {
+          throw new LiveBrowserError(409, 'AGENT_RUNNING', agentBusyErrorMessage('takeover'))
+        }
+        return acquireHumanTakeoverLease(stateDir, opts)
+      })
+    } catch (err) {
+      if (err instanceof LiveBrowserError) throw err
+      const msg = err instanceof Error ? err.message : String(err)
+      if (ACTIVITY_LOCK_BUSY_RE.test(msg)) {
+        throw new LiveBrowserError(409, 'AGENT_RUNNING', agentBusyErrorMessage('takeover'))
+      }
+      throw err
+    }
   }
 
   isAvailable(): boolean {
@@ -1253,13 +1256,15 @@ export class LiveBrowserController {
     agentId: string,
     endpoint: PlaywrightDaemonEndpoint,
     action: Exclude<LiveBrowserAction, { action: 'close' | 'open' | 'takeover' | 'dialog' }>,
+    verifyTakeover?: () => void,
   ): Promise<LiveBrowserState> {
     return this.lockFn(endpoint.stateDir, async () => {
-      // Re-verify external CLI ownership AFTER acquiring cross-process flock so a CLI
-      // command that raced ahead before flock acquisition blocks stale human input.
+      // Re-verify external CLI and takeover ownership AFTER acquiring cross-process flock
+      // so a CLI command or lease release that raced ahead blocks stale human input.
       if (this.isExternalCliActive(agentId)) {
-        throw new LiveBrowserError(409, 'AGENT_RUNNING', '助手正在操作浏览器，请等待当前浏览器操作完成后再接管')
+        throw new LiveBrowserError(409, 'AGENT_RUNNING', agentBusyErrorMessage(action.action))
       }
+      verifyTakeover?.()
       this.touchActivity(agentId)
       const rpcOpts = { cwd: this.browserHome, timeoutMs: ACTION_TIMEOUT_MS }
       if ('expectedOrigin' in action && action.expectedOrigin) {
@@ -1555,29 +1560,34 @@ export class LiveBrowserController {
       await assertLiveBrowserUrlPublic(action.url, { lookup: this.dnsLookup })
     }
 
-    // Explicit human takeover lease management (R2 #5: strictly mutually exclusive acquire).
+    // Explicit human takeover lease management (R2 #5: strictly mutually exclusive acquire under activity.lock).
     if (action.action === 'takeover') {
       const stateDir = this.stateDirFor(agentId)
       let takeoverToken: string | undefined
       if (action.active) {
-        if (this.isExternalCliActive(agentId) || this.agentRunningCheck?.(agentId)) {
-          throw new LiveBrowserError(409, 'AGENT_RUNNING', '助手正在操作浏览器，请等待当前浏览器操作完成后再接管')
-        }
-        const lease = acquireHumanTakeoverLease(stateDir, { token: action.token })
+        const lease = await this.acquireTakeoverLeaseLocked(agentId, { token: action.token })
         takeoverToken = lease.token
       } else {
-        releaseHumanTakeoverLease(stateDir, action.token)
-        if (readActiveHumanTakeoverLease(stateDir)) {
-          throw new LiveBrowserError(409, 'TAKEOVER_TOKEN_MISMATCH', '接管租约归属不匹配，无法释放')
+        const releaseCheck = () => {
+          releaseHumanTakeoverLease(stateDir, action.token)
+          if (readActiveHumanTakeoverLease(stateDir)) {
+            throw new LiveBrowserError(409, 'TAKEOVER_TOKEN_MISMATCH', '接管租约归属不匹配，无法释放')
+          }
+        }
+        if (this.checkExists(stateDir)) {
+          await this.lockFn(stateDir, async () => {
+            releaseCheck()
+          })
+        } else {
+          releaseCheck()
         }
       }
       const state = await this.getLiveState(agentId, { includeFrame: false })
-      return {
-        ...state,
-        streamAvailable: true,
-        humanTakeover: this.isHumanTakeoverActive(agentId),
-        ...(takeoverToken ? { takeoverToken } : {}),
-      }
+      return { ...state, streamAvailable: true, humanTakeover: this.isHumanTakeoverActive(agentId), ...(takeoverToken ? { takeoverToken } : {}) }
+    }
+
+    if (this.isExternalCliActive(agentId) || Boolean(this.agentRunningCheck?.(agentId))) {
+      throw new LiveBrowserError(409, 'AGENT_RUNNING', agentBusyErrorMessage(action.action))
     }
 
     const rawObj = rawAction && typeof rawAction === 'object' && !Array.isArray(rawAction) ? (rawAction as Record<string, unknown>) : null
@@ -1585,23 +1595,30 @@ export class LiveBrowserController {
       typeof rawObj?.takeoverToken === 'string' && rawObj.takeoverToken.trim()
         ? rawObj.takeoverToken.trim().slice(0, 64)
         : undefined
-    const verifyCallerTakeoverToken = () => {
-      if (!callerTakeoverToken) return
+    const requiresTakeover = (activeNow: boolean): boolean => {
+      if (action.action === 'dialog') return true
+      if (!activeNow) return false
+      if (action.action === 'open') return Boolean(action.url) && action.ifIdle !== true
+      return true
+    }
+    const verifyCallerTakeoverToken = (activeNow: boolean) => {
       const activeLease = readActiveHumanTakeoverLease(this.stateDirFor(agentId))
-      if (!activeLease || activeLease.token !== callerTakeoverToken) {
-        throw new LiveBrowserError(409, 'TAKEOVER_TOKEN_MISMATCH', '接管租约已失效或已被其他连接独占接管')
+      if (callerTakeoverToken) {
+        if (!activeLease || activeLease.token !== callerTakeoverToken) {
+          throw new LiveBrowserError(409, 'TAKEOVER_TOKEN_MISMATCH', '接管租约已失效或已被其他连接独占接管')
+        }
+        return
+      }
+      if (requiresTakeover(activeNow)) {
+        throw new LiveBrowserError(409, 'TAKEOVER_REQUIRED', '请先点击「接管」后再操作浏览器')
       }
     }
-    verifyCallerTakeoverToken()
+    verifyCallerTakeoverToken(this.isSessionActive(agentId))
 
     if (action.action === 'dialog') {
       await this.streamManager.handleDialogViaActiveStream(agentId, action.accept, action.promptText)
       const state = await this.getLiveState(agentId, { includeFrame: true })
-      return {
-        ...state,
-        streamAvailable: true,
-        humanTakeover: this.isHumanTakeoverActive(agentId),
-      }
+      return { ...state, streamAvailable: true, humanTakeover: this.isHumanTakeoverActive(agentId) }
     }
 
     // Invalidate any pre-action coalesced read so subsequent polls wait for the post-action frame.
@@ -1611,9 +1628,9 @@ export class LiveBrowserController {
     return this.enqueue(agentId, async (): Promise<LiveBrowserState> => {
       // Re-verify external CLI, active agent turn, and takeover token right at the serialized boundary.
       if (this.isExternalCliActive(agentId) || Boolean(this.agentRunningCheck?.(agentId))) {
-        throw new LiveBrowserError(409, 'AGENT_RUNNING', '助手正在操作浏览器，请等待当前浏览器操作完成后再接管')
+        throw new LiveBrowserError(409, 'AGENT_RUNNING', agentBusyErrorMessage(action.action))
       }
-      verifyCallerTakeoverToken()
+      verifyCallerTakeoverToken(this.isSessionActive(agentId))
       const env = this.envFor(agentId)
       if (action.action === 'close') {
         this.metaCache.delete(agentId)
@@ -1700,16 +1717,14 @@ export class LiveBrowserController {
       const endpoint = this.daemonEndpointFor(agentId)
       if (endpoint) {
         try {
-          return await this.performActionViaDaemon(agentId, endpoint, action)
+          return await this.performActionViaDaemon(agentId, endpoint, action, () =>
+            verifyCallerTakeoverToken(true),
+          )
         } catch (err) {
           if (err instanceof LiveBrowserError) throw err
           const msg = err instanceof Error ? err.message : String(err)
           if (ACTIVITY_LOCK_BUSY_RE.test(msg)) {
-            throw new LiveBrowserError(
-              409,
-              'AGENT_RUNNING',
-              '助手正在操作浏览器，请等待当前浏览器操作完成后再接管',
-            )
+            throw new LiveBrowserError(409, 'AGENT_RUNNING', agentBusyErrorMessage(action.action))
           }
           if (SESSION_CLOSED_RE.test(msg) || DAEMON_SOCKET_DEAD_RE.test(msg)) {
             this.metaCache.delete(agentId)
@@ -1889,10 +1904,7 @@ export async function handleLiveBrowserActionHttp(
   }
   const agentBusy = Boolean(host.isAgentRunning?.(agentId) || host.controller.isExternalCliActive(agentId))
   if (agentBusy && !host.readBody && typeof (req as { on?: unknown }).on !== 'function') {
-    host.sendJson(res, 409, {
-      error: '助手正在操作浏览器，请等待当前浏览器操作完成后再接管',
-      code: 'AGENT_RUNNING',
-    })
+    host.sendJson(res, 409, { error: agentBusyErrorMessage(), code: 'AGENT_RUNNING' })
     return
   }
   let rawBody: string
@@ -1915,15 +1927,11 @@ export async function handleLiveBrowserActionHttp(
     host.sendJson(res, 400, { error: '请求体不是有效的 JSON', code: 'INVALID_JSON' })
     return
   }
-  const isTakeoverRelease =
-    Boolean(parsed && typeof parsed === 'object' && !Array.isArray(parsed)) &&
-    (parsed as Record<string, unknown>).action === 'takeover' &&
-    (parsed as Record<string, unknown>).active === false
+  const parsedObj = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null
+  const actionName = typeof parsedObj?.action === 'string' ? parsedObj.action.trim() : undefined
+  const isTakeoverRelease = actionName === 'takeover' && parsedObj?.active === false
   if (!isTakeoverRelease && agentBusy) {
-    host.sendJson(res, 409, {
-      error: '助手正在操作浏览器，请等待当前浏览器操作完成后再接管',
-      code: 'AGENT_RUNNING',
-    })
+    host.sendJson(res, 409, { error: agentBusyErrorMessage(actionName), code: 'AGENT_RUNNING' })
     return
   }
   try {

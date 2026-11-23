@@ -403,9 +403,6 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
   this.wss.on('error', (err) => {
     this.log.error('wss.server_error', undefined, err)
   })
-  this.liveBrowser.setAgentRunningCheck((id: string) =>
-    this.sessions.list().some((s) => s.agentId === id && (this.sessions.getByKey(s.sessionKey)?._activeTurnCount ?? 0) > 0),
-  )
   this.liveBrowser.setUpgradeAuthCheck((req) => this.checkHttpAuth(req))
   this.liveBrowser.setCommercialMasterMode(Boolean(this.deps.commercial))
   this.httpServer.on('upgrade', (req, socket, head) => {

@@ -6,6 +6,10 @@ import { dispatchOpenInWorkbench } from "../../lib/workbenchOpen";
 import {
   getLiveBrowserHandbackFor,
   getLiveBrowserHandbackVersion,
+  getLiveBrowserHandoffPhaseFor,
+  hasLiveBrowserHandbackHandler,
+  notifyLiveBrowserHandoffPhase,
+  requestLiveBrowserHandback,
   subscribeLiveBrowserHandback,
 } from "../chat/inspectorState";
 import { useMediaSigner } from "../chat/media";
@@ -401,6 +405,7 @@ export function BrowserHandoffBlock({ spec, notes, streaming, readOnly, nested }
   const { sendUserText, busy, reason, sessionId } = useChatInteraction();
   const [opened, setOpened] = useState(false);
   const [sent, setSent] = useState(false);
+  const [continuing, setContinuing] = useState(false);
   const instanceId = useId();
   const handoffId = spec.decisionId || `bh:${instanceId}`;
   useSyncExternalStore(
@@ -409,6 +414,7 @@ export function BrowserHandoffBlock({ spec, notes, streaming, readOnly, nested }
     getLiveBrowserHandbackVersion,
   );
   const matchedHandback = getLiveBrowserHandbackFor(sessionId ?? null, handoffId);
+  const matchedPhase = getLiveBrowserHandoffPhaseFor(sessionId ?? null, handoffId);
 
   const parsedUrl = spec.url ? parseHandoffUrl(spec.url) : null;
   const handedBack = Boolean(matchedHandback);
@@ -422,7 +428,8 @@ export function BrowserHandoffBlock({ spec, notes, streaming, readOnly, nested }
     : "我已完成云端浏览器操作，请继续。";
   const handbackDraft = spec.continue_prompt ?? visibleContinueMessage;
   const canTakeover = !readOnly && !streaming && Boolean(openLiveBrowser);
-  const canContinue = !readOnly && !streaming && Boolean(sendUserText) && !busy && !effectiveSent;
+  const canContinue = !readOnly && !streaming && Boolean(sendUserText) && !busy && !effectiveSent && !continuing;
+  const activePhase = matchedPhase?.phase ?? (opened ? "opening" : null);
 
   return (
     <Frame
@@ -467,6 +474,11 @@ export function BrowserHandoffBlock({ spec, notes, streaming, readOnly, nested }
             onClick={() => {
               if (!canTakeover) return;
               setOpened(true);
+              notifyLiveBrowserHandoffPhase({
+                sessionId: sessionId ?? null,
+                handoffId,
+                phase: "opening",
+              });
               openLiveBrowser?.({
                 takeover: true,
                 expand: true,
@@ -487,12 +499,30 @@ export function BrowserHandoffBlock({ spec, notes, streaming, readOnly, nested }
             data-testid="iui-browser-handoff-continue"
             onClick={() => {
               if (!canContinue) return;
-              setSent(true);
-              sendUserText?.(visibleContinueMessage);
+              if (!hasLiveBrowserHandbackHandler()) {
+                setSent(true);
+                sendUserText?.(visibleContinueMessage);
+                return;
+              }
+              setContinuing(true);
+              void requestLiveBrowserHandback({
+                sessionId: sessionId ?? null,
+                handoffId,
+                continueMessage: visibleContinueMessage,
+              })
+                .then((res) => {
+                  if (!res.handled && !res.blocked && !res.failed) {
+                    setSent(true);
+                    sendUserText?.(visibleContinueMessage);
+                  }
+                })
+                .finally(() => {
+                  setContinuing(false);
+                });
             }}
           >
             <Check size={14} aria-hidden />
-            {effectiveSent ? "已通知助手继续" : (spec.continue_label ?? "我已完成，继续任务")}
+            {effectiveSent ? "已通知助手继续" : continuing ? "正在交还并继续…" : (spec.continue_label ?? "我已完成，继续任务")}
           </button>
         </div>
         {handedBack ? (
@@ -501,9 +531,15 @@ export function BrowserHandoffBlock({ spec, notes, streaming, readOnly, nested }
               ? "已完成接管并已通知助手继续任务。"
               : "已完成接管并交还浏览器控制权；如需继续任务请点击上方按钮。"}
           </p>
-        ) : opened && !effectiveSent ? (
-          <p className="oc-iui-bh-note" role="status">
-            正在为你打开实时浏览器… 完成操作后可点击浏览器顶栏「交还并继续」或上方按钮继续。
+        ) : activePhase && !effectiveSent ? (
+          <p className="oc-iui-bh-note" role="status" data-phase={activePhase}>
+            {activePhase === "active"
+              ? "实时浏览器已就绪，请完成操作后点击下方「我已完成，继续任务」或浏览器顶栏「完成并继续」。"
+              : activePhase === "blocked"
+                ? matchedPhase?.reason || "助手正在执行浏览器步骤，稍候即可在右侧接管操作。"
+                : activePhase === "error"
+                  ? `${matchedPhase?.reason ? `${matchedPhase.reason}，` : "打开实时浏览器失败，"}请重新点击上方按钮重试。`
+                  : "正在为你打开实时浏览器…"}
           </p>
         ) : null}
         {!readOnly && !streaming && !openLiveBrowser && (

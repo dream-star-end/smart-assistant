@@ -11,61 +11,15 @@ import type { lookup as dnsLookup } from 'node:dns/promises'
 import type { IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
 
-import {
-  LIVE_BROWSER_BINARY_HEADER_BYTES,
-  LIVE_BROWSER_INTERNAL_WS_PATH,
-  LIVE_BROWSER_MAX_BINARY_FRAME_BYTES,
-  LIVE_BROWSER_PROTOCOL_VERSION,
-  type BrowserHandoffResumeWhen,
-  type LiveBrowserClientMessage,
-  type LiveBrowserDialogInfo,
-  type LiveBrowserMouseButton,
-  type LiveBrowserServerMessage,
-  type LiveBrowserStatePayload,
-  type LiveBrowserTab,
-  type LiveBrowserViewport,
-  encodeLiveBrowserFrame,
-  liveBrowserModifiersToBitmask,
-  normalizeBrowserHandoffResumeWhen,
-} from '@openclaude/protocol'
+import { LIVE_BROWSER_BINARY_HEADER_BYTES, LIVE_BROWSER_INTERNAL_WS_PATH, LIVE_BROWSER_MAX_BINARY_FRAME_BYTES, LIVE_BROWSER_PROTOCOL_VERSION, type BrowserHandoffResumeWhen, type LiveBrowserClientMessage, type LiveBrowserDialogInfo, type LiveBrowserMouseButton, type LiveBrowserServerMessage, type LiveBrowserStatePayload, type LiveBrowserTab, type LiveBrowserViewport, encodeLiveBrowserFrame, liveBrowserModifiersToBitmask, normalizeBrowserHandoffResumeWhen } from '@openclaude/protocol'
 import { WebSocket, WebSocketServer } from 'ws'
 
 import { LiveBrowserAutoResumeWatcher } from './liveBrowserAutoResume.js'
 
-import {
-  LiveBrowserUpgradeAuthError,
-  type LiveBrowserCdpEndpoint,
-  type LiveBrowserCdpTransport,
-  type VerifiedLiveBrowserUpgrade,
-  defaultConnectCdp,
-  discoverLiveBrowserCdpEndpoint,
-  extractHttpOrigin,
-  readJpegDimensions,
-  resolveLiveBrowserKeyEvent,
-  safePathname,
-  verifyLiveBrowserUpgrade,
-  writeHttpRejection,
-} from './liveBrowserCdpHelpers.js'
-import {
-  DEFAULT_HUMAN_TAKEOVER_TTL_MS,
-  LiveBrowserError,
-  acquireHumanTakeoverLease,
-  assertLiveBrowserUrlPublic,
-  readActiveHumanTakeoverLease,
-  releaseHumanTakeoverLease,
-  renewHumanTakeoverLease,
-} from './liveBrowserSecurity.js'
+import { LiveBrowserUpgradeAuthError, type LiveBrowserCdpEndpoint, type LiveBrowserCdpTransport, type VerifiedLiveBrowserUpgrade, defaultConnectCdp, discoverLiveBrowserCdpEndpoint, extractHttpOrigin, readJpegDimensions, resolveLiveBrowserKeyEvent, safePathname, verifyLiveBrowserUpgrade, writeHttpRejection } from './liveBrowserCdpHelpers.js'
+import { DEFAULT_HUMAN_TAKEOVER_TTL_MS, LiveBrowserError, acquireHumanTakeoverLease, assertLiveBrowserUrlPublic, readActiveHumanTakeoverLease, releaseHumanTakeoverLease, renewHumanTakeoverLease } from './liveBrowserSecurity.js'
 
-export {
-  LiveBrowserUpgradeAuthError,
-  type LiveBrowserCdpEndpoint,
-  type LiveBrowserCdpTransport,
-  type VerifiedLiveBrowserUpgrade,
-  discoverLiveBrowserCdpEndpoint,
-  readJpegDimensions,
-  resolveLiveBrowserKeyEvent,
-  verifyLiveBrowserUpgrade,
-}
+export { LiveBrowserUpgradeAuthError, type LiveBrowserCdpEndpoint, type LiveBrowserCdpTransport, type VerifiedLiveBrowserUpgrade, discoverLiveBrowserCdpEndpoint, readJpegDimensions, resolveLiveBrowserKeyEvent, verifyLiveBrowserUpgrade }
 
 const MAX_CONTROL_BYTES = 64 * 1024
 const MAX_BUFFERED_BYTES = 2 * 1024 * 1024
@@ -84,8 +38,12 @@ export interface LiveBrowserStreamManagerDeps {
   touchActivity: (agentId: string) => void
   isAgentBusy: (agentId: string) => boolean
   isBrowserProcessActive?: (agentId: string) => boolean
+  acquireTakeoverLease?: (
+    agentId: string,
+    opts: { token: string; ttlMs: number; now: number },
+  ) => Promise<{ token: string; expiresAt: number }>
   openBrowser: (agentId: string, url?: string) => Promise<void>
-  closeBrowser: (agentId: string) => Promise<void>
+  closeBrowser: (agentId: string, takeoverToken?: string) => Promise<void>
   syncDaemonTab?: (
     agentId: string,
     op: { index: number; url?: string; occurrenceIndex?: number },
@@ -465,7 +423,7 @@ class LiveBrowserStreamSession {
       }
       this.cdpAvailable = true
       this.emittedCdpUnavailable = false
-      if (this.humanTakeover && this.ownsTakeoverLease && !this.autoResumeWatcher.isRunning()) {
+      if (this.humanTakeover && this.ownsTakeoverLease && this.pendingResumeWhen && !this.autoResumeWatcher.isRunning()) {
         this.autoResumeWatcher.start(this.pendingResumeWhen, this.pendingWatchId)
       }
       if (this.readySent) this.emitState()
@@ -654,7 +612,7 @@ class LiveBrowserStreamSession {
     this.cdpAvailable = false
     this.detachCdpLocal()
     if (!this.closed) {
-      if (wasTakeover) {
+      if (wasTakeover && this.pendingResumeWhen) {
         this.send({
           type: 'handoff_vetoed',
           reason: 'cdp_disconnected',
@@ -1049,34 +1007,35 @@ class LiveBrowserStreamSession {
     }
   }
 
-  private setTakeover(
+  private async setTakeover(
     active: boolean,
     gen: number,
     resumeWhen?: BrowserHandoffResumeWhen,
     watchId?: string,
-  ): void {
+  ): Promise<void> {
     if (!this.isAlive(gen)) return
     if (active) {
       if (this.deps.isAgentBusy(this.agentId)) {
-        throw new LiveBrowserError(
-          409,
-          'AGENT_RUNNING',
-          '助手正在操作浏览器，请等待当前浏览器操作完成后再接管',
-        )
+        throw new LiveBrowserError(409, 'AGENT_RUNNING', '助手正在操作浏览器，请等待当前浏览器操作完成后再接管')
       }
       if (!this.isAlive(gen)) return
       const now = this.now()
-      // R2 #5: strictly mutually exclusive — throws 409 TAKEOVER_ALREADY_HELD if held by another token.
-      acquireHumanTakeoverLease(this.stateDir, {
+      const leaseOpts = {
         token: this.takeoverToken,
         ttlMs: this.deps.takeoverTtlMs ?? DEFAULT_HUMAN_TAKEOVER_TTL_MS,
         now,
-      })
+      }
+      // R2 #5 + OCV5-873: strictly mutually exclusive acquire under activity.lock when wired.
+      if (this.deps.acquireTakeoverLease) {
+        await this.deps.acquireTakeoverLease(this.agentId, leaseOpts)
+      } else {
+        acquireHumanTakeoverLease(this.stateDir, leaseOpts)
+      }
       if (!this.isAlive(gen)) {
         releaseHumanTakeoverLease(this.stateDir, this.takeoverToken, this.now())
         return
       }
-      this.lastLeaseRenewAt = now
+      this.lastLeaseRenewAt = this.now()
       this.ownsTakeoverLease = true
       this.humanTakeover = true
       if (resumeWhen !== undefined) {
@@ -1085,7 +1044,11 @@ class LiveBrowserStreamSession {
       if (watchId !== undefined) {
         this.pendingWatchId = watchId
       }
-      this.autoResumeWatcher.start(this.pendingResumeWhen, this.pendingWatchId)
+      if (this.pendingResumeWhen) {
+        this.autoResumeWatcher.start(this.pendingResumeWhen, this.pendingWatchId)
+      } else {
+        this.autoResumeWatcher.stop()
+      }
       if (!this.leaseRenewTimer) {
         this.leaseRenewTimer = setInterval(() => {
           if (!this.isAlive(gen) || !this.ownsTakeoverLease) return
@@ -1124,21 +1087,10 @@ class LiveBrowserStreamSession {
     this.emitState()
   }
 
-  private assertReadyForInput(
-    gen: number,
-    callerToken?: string,
-  ): { cdp: LiveBrowserCdpTransport; sessionId: string } {
+  private assertTakeoverOwned(gen: number, callerToken?: string): void {
     if (!this.isAlive(gen)) {
       throw new LiveBrowserError(409, 'SESSION_CLOSED', '连接已关闭')
     }
-    if (this.deps.isAgentBusy(this.agentId)) {
-      throw new LiveBrowserError(
-        409,
-        'AGENT_RUNNING',
-        '助手正在操作浏览器，请等待当前浏览器操作完成后再操作',
-      )
-    }
-    // R2 #5: verify takeover lease ownership on input path.
     const activeLease = readActiveHumanTakeoverLease(this.stateDir, this.now())
     if (
       typeof callerToken === 'string' &&
@@ -1150,13 +1102,30 @@ class LiveBrowserStreamSession {
     if (activeLease && activeLease.token !== this.takeoverToken) {
       throw new LiveBrowserError(409, 'TAKEOVER_TOKEN_MISMATCH', '当前已由其他连接独占接管')
     }
-    if (this.ownsTakeoverLease && (!activeLease || activeLease.token !== this.takeoverToken)) {
-      this.ownsTakeoverLease = false
-      this.humanTakeover = false
-      this.autoResumeWatcher.stop()
-      this.emitState()
-      throw new LiveBrowserError(409, 'TAKEOVER_TOKEN_MISMATCH', '接管租约已失效，请重新接管')
+    if (!this.ownsTakeoverLease || !activeLease || activeLease.token !== this.takeoverToken) {
+      if (this.ownsTakeoverLease) {
+        this.ownsTakeoverLease = false
+        this.humanTakeover = false
+        this.autoResumeWatcher.stop()
+        this.emitState()
+        throw new LiveBrowserError(409, 'TAKEOVER_TOKEN_MISMATCH', '接管租约已失效，请重新接管')
+      }
+      throw new LiveBrowserError(409, 'TAKEOVER_REQUIRED', '请先点击「接管」后再操作浏览器')
     }
+  }
+
+  private assertReadyForInput(
+    gen: number,
+    callerToken?: string,
+  ): { cdp: LiveBrowserCdpTransport; sessionId: string } {
+    if (!this.isAlive(gen)) {
+      throw new LiveBrowserError(409, 'SESSION_CLOSED', '连接已关闭')
+    }
+    if (this.deps.isAgentBusy(this.agentId)) {
+      throw new LiveBrowserError(409, 'AGENT_RUNNING', '助手正在操作浏览器，请等待当前浏览器操作完成后再操作')
+    }
+    // R2 #5 + OCV5-873: enforce active takeover ownership on every mutating input path.
+    this.assertTakeoverOwned(gen, callerToken)
     if (!this.cdp || !this.pageSessionId) {
       throw new LiveBrowserError(409, 'BROWSER_NOT_ACTIVE', '云端浏览器尚未启动，请先打开网页')
     }
@@ -1257,7 +1226,7 @@ class LiveBrowserStreamSession {
           msg.active === true && typeof msg.watchId === 'string' && msg.watchId.trim()
             ? msg.watchId.trim().slice(0, 128)
             : undefined
-        this.setTakeover(msg.active === true, gen, resumeWhen, watchId)
+        await this.setTakeover(msg.active === true, gen, resumeWhen, watchId)
         return
       }
 
@@ -1273,18 +1242,22 @@ class LiveBrowserStreamSession {
           this.pendingWatchId = nextWatchId
         }
         if (this.humanTakeover && this.ownsTakeoverLease) {
-          this.autoResumeWatcher.setResumeWhen(nextResumeWhen, this.pendingWatchId)
+          if (nextResumeWhen) {
+            if (this.autoResumeWatcher.isRunning()) {
+              this.autoResumeWatcher.setResumeWhen(nextResumeWhen, this.pendingWatchId)
+            } else {
+              this.autoResumeWatcher.start(nextResumeWhen, this.pendingWatchId)
+            }
+          } else {
+            this.autoResumeWatcher.stop()
+          }
         }
         return
       }
 
       case 'open': {
         if (this.deps.isAgentBusy(this.agentId)) {
-          throw new LiveBrowserError(
-            409,
-            'AGENT_RUNNING',
-            '助手正在操作浏览器，请等待当前浏览器操作完成后再操作',
-          )
+          throw new LiveBrowserError(409, 'AGENT_RUNNING', '助手正在操作浏览器，请等待当前浏览器操作完成后再启动')
         }
         const safeUrl =
           typeof msg.url === 'string' && msg.url.trim()
@@ -1295,6 +1268,7 @@ class LiveBrowserStreamSession {
         if (!this.isAlive(gen)) return
         if (this.cdp && this.pageSessionId) {
           if (safeUrl) {
+            this.assertTakeoverOwned(gen)
             this.loading = true
             this.emitState()
             await this.cdp.send('Page.navigate', { url: safeUrl }, this.pageSessionId)
@@ -1312,16 +1286,17 @@ class LiveBrowserStreamSession {
       case 'close_browser': {
         // P1 #7: refuse destroying browser while agent is actively running / operating browser.
         if (this.deps.isAgentBusy(this.agentId)) {
-          throw new LiveBrowserError(
-            409,
-            'AGENT_RUNNING',
-            '助手正在操作浏览器，请等待当前浏览器操作完成后再关闭',
-          )
+          throw new LiveBrowserError(409, 'AGENT_RUNNING', '助手正在操作浏览器，请等待当前浏览器操作完成后再关闭')
         }
+        this.assertTakeoverOwned(gen)
         if (!this.isAlive(gen)) return
-        this.setTakeover(false, gen)
+        const tok = this.takeoverToken
         this.detachCdpLocal()
-        await this.deps.closeBrowser(this.agentId)
+        try {
+          await this.deps.closeBrowser(this.agentId, tok)
+        } finally {
+          await this.setTakeover(false, gen)
+        }
         if (this.isAlive(gen)) this.emitState()
         return
       }

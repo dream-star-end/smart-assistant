@@ -463,10 +463,11 @@ describe('liveBrowserStream', () => {
     }
   })
 
-  it('controller handles flock busy gracefully (agentBusy on GET, 409 on POST) and propagates OPENCLAUDE_LIVE_BROWSER_INTERNAL=1', async () => {
+  it('controller handles flock busy gracefully (agentBusy on GET, 409 on POST & takeover) and propagates OPENCLAUDE_LIVE_BROWSER_INTERNAL=1', async () => {
     const stateRoot = mkdtempSync(join(tmpdir(), 'lb-ctrl-busy-'))
     try {
       const seenInternalEnv: Array<string | undefined> = []
+      let lockBusy = true
       const ctrl = new LiveBrowserController({
         ocBrowserBin: '/usr/local/bin/oc-browser',
         stateRoot,
@@ -477,8 +478,9 @@ describe('liveBrowserStream', () => {
         },
         resolveDaemonEndpoint: (stateDir) => ({ socketPath: join(stateDir, 'x.sock'), version: '0.1.14', stateDir }),
         daemonRpcFn: async () => ({ text: '' }),
-        withLock: async () => {
-          throw new Error('activity lock busy (flock exit 1)')
+        withLock: async (_dir, fn) => {
+          if (lockBusy) throw new Error('activity lock busy (flock exit 1)')
+          return fn()
         },
         dnsLookup: (async () => [{ address: '93.184.216.34', family: 4 }]) as any,
       })
@@ -488,15 +490,25 @@ describe('liveBrowserStream', () => {
       assert.equal(live.agentBusy, true)
       assert.equal(live.streamAvailable, true)
 
+      // OCV5-873 Blocker 1: takeover MUST fail 409 AGENT_RUNNING when activity.lock is held by CLI
       await assert.rejects(
-        () => ctrl.performAction('main', { action: 'reload' }),
+        () => ctrl.performAction('main', { action: 'takeover', active: true }),
         (err: unknown) => err instanceof LiveBrowserError && err.status === 409 && err.code === 'AGENT_RUNNING',
       )
 
-      // HTTP takeover lease action returns takeoverToken and enforces token-matched release (P1 #5)
+      // Release lock to acquire takeover, then re-engage lockBusy to verify reload gets 409 AGENT_RUNNING
+      lockBusy = false
       const acquired = await ctrl.performAction('main', { action: 'takeover', active: true })
       assert.equal(acquired.humanTakeover, true)
       assert.equal(typeof acquired.takeoverToken, 'string')
+
+      lockBusy = true
+      await assert.rejects(
+        () => ctrl.performAction('main', { action: 'reload', takeoverToken: acquired.takeoverToken }),
+        (err: unknown) => err instanceof LiveBrowserError && err.status === 409 && err.code === 'AGENT_RUNNING',
+      )
+      lockBusy = false
+
       // Release without token or wrong token fails with 409 TAKEOVER_TOKEN_MISMATCH
       await assert.rejects(
         () => ctrl.performAction('main', { action: 'takeover', active: false }),
@@ -520,8 +532,9 @@ describe('liveBrowserStream', () => {
       )
       ctrl.setAgentRunningCheck(() => false)
 
-      // Close invokes execFn with OPENCLAUDE_LIVE_BROWSER_INTERNAL=1
-      await ctrl.performAction('main', { action: 'close' })
+      // Close requires takeover when browser is active, and invokes execFn with OPENCLAUDE_LIVE_BROWSER_INTERNAL=1
+      const closeLease = await ctrl.performAction('main', { action: 'takeover', active: true })
+      await ctrl.performAction('main', { action: 'close', takeoverToken: closeLease.takeoverToken })
       assert.equal(seenInternalEnv[0], '1')
     } finally {
       rmSync(stateRoot, { recursive: true, force: true })
@@ -662,6 +675,34 @@ describe('liveBrowserStream', () => {
       mockCdp.emitEvent('Fetch.requestPaused', { requestId: 'req-pub', request: { url: 'https://public.example.com/app.js' } }, 'sid-t-b')
       await waitFor(() => mockCdp.calls.find((c) => c.method === 'Fetch.failRequest' && c.params?.requestId === 'req-priv'))
       await waitFor(() => mockCdp.calls.find((c) => c.method === 'Fetch.continueRequest' && c.params?.requestId === 'req-pub'))
+
+      // OCV5-873 Blocker 2: watching mode (no takeover) MUST reject mutating WS ops with TAKEOVER_REQUIRED
+      const callsBeforeWatchReject = mockCdp.calls.length
+      for (const watchMsg of [
+        { type: 'tab', action: 'close', targetId: 't-a' },
+        { type: 'navigate', url: 'https://other.example.com/' },
+        { type: 'pointer', action: 'click', x: 0.5, y: 0.5 },
+        { type: 'open', url: 'https://other.example.com/' },
+        { type: 'close_browser' },
+      ]) {
+        const errBefore = msgs.filter((m) => m.type === 'error' && m.code === 'TAKEOVER_REQUIRED').length
+        ws.send(JSON.stringify(watchMsg))
+        await waitFor(
+          () => msgs.filter((m) => m.type === 'error' && m.code === 'TAKEOVER_REQUIRED').length > errBefore,
+        )
+      }
+      assert.equal(
+        mockCdp.calls
+          .slice(callsBeforeWatchReject)
+          .some((c) => c.method.startsWith('Input.') || c.method === 'Target.closeTarget' || c.method === 'Page.navigate'),
+        false,
+        'watching-mode rejected writes must not mutate CDP state',
+      )
+      assert.equal(mockCdp.targets.length, 2)
+
+      // Enter takeover before running interactive write tests
+      ws.send(JSON.stringify({ type: 'takeover', active: true }))
+      await waitFor(() => msgs.find((m) => m.type === 'state' && m.humanTakeover === true))
 
       // P1 #4: ORIGIN_MISMATCH blocks input when expectedOrigin or expectedTargetId mismatches
       const inputCallsBefore = mockCdp.calls.filter((c) => c.method.startsWith('Input.')).length
@@ -1035,6 +1076,10 @@ describe('liveBrowserStream', () => {
       })
       await waitFor(() => msgs.find((m) => m.type === 'ready'))
 
+      // Acquire takeover before selecting tabs
+      ws.send(JSON.stringify({ type: 'takeover', active: true }))
+      await waitFor(() => msgs.find((m) => m.type === 'state' && m.humanTakeover === true))
+
       // First select t-blank-0, then explicitly select t-blank-1 (second about:blank)
       ws.send(JSON.stringify({ type: 'tab', action: 'select', targetId: 't-blank-0' }))
       await waitFor(() => rpcCalls.find((c) => Array.isArray(c._) && c._[0] === 'tab-select' && c._[1] === '0'))
@@ -1047,6 +1092,101 @@ describe('liveBrowserStream', () => {
       assert.deepEqual(selectCall._, ['tab-select', '1'])
 
       ws.close()
+    } finally {
+      await ctrl.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+      rmSync(stateRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('OCV5-873 Blocker 1 & 2 (WS via controller): WS takeover waits on activity.lock, releases orphan lease if socket closes mid-wait, and close_browser works cleanly in takeover', async () => {
+    const stateRoot = mkdtempSync(join(tmpdir(), 'lb-b1-ws-'))
+    const mockCdp = new MockCdpTransport()
+    let lockHeld = true
+    let releaseLock!: () => void
+    const lockGate = new Promise<void>((r) => {
+      releaseLock = r
+    })
+    let closeCalls = 0
+    const ctrl = new LiveBrowserController({
+      ocBrowserBin: '/usr/local/bin/oc-browser',
+      stateRoot,
+      env: {},
+      existsSync: () => true,
+      execFn: async (_bin, args) => {
+        if (args[0] === 'close') closeCalls += 1
+        return { stdout: '', stderr: '' }
+      },
+      withLock: async (_dir, fn) => {
+        if (lockHeld) await lockGate
+        return fn()
+      },
+      discoverCdpEndpoint: (stateDir) => ({
+        port: 9222,
+        browserWsUrl: 'ws://127.0.0.1:9222/devtools/browser/mock',
+        profileDir: stateDir,
+      }),
+      connectCdp: async () => mockCdp,
+      dnsLookup: (async () => [{ address: '93.184.216.34', family: 4 }]) as any,
+    })
+    ctrl.setUpgradeAuthCheck((req) => req.headers.authorization === 'Bearer ok')
+
+    const server: Server = createServer()
+    server.on('upgrade', (req, socket, head) => {
+      if (!ctrl.handleUpgrade(req, socket, head)) socket.destroy()
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const port = (server.address() as { port: number }).port
+
+    try {
+      // 1) WS takeover blocks while simulated CLI holds activity.lock; closing WS mid-wait releases lease immediately on wake
+      const wsDrop = new WebSocket(`ws://127.0.0.1:${port}${LIVE_BROWSER_INTERNAL_WS_PATH}`, {
+        headers: { authorization: 'Bearer ok' },
+        origin: `http://127.0.0.1:${port}`,
+      })
+      const dropMsgs: any[] = []
+      wsDrop.on('message', (d, isBinary) => {
+        if (!isBinary) dropMsgs.push(JSON.parse(d.toString()))
+      })
+      await new Promise<void>((resolve, reject) => {
+        wsDrop.once('open', () => resolve())
+        wsDrop.once('error', reject)
+      })
+      await waitFor(() => dropMsgs.find((m) => m.type === 'ready'))
+
+      wsDrop.send(JSON.stringify({ type: 'takeover', active: true }))
+      await new Promise((r) => setTimeout(r, 40))
+      assert.equal(ctrl.isHumanTakeoverActive('main'), false, 'WS takeover must not coexist with held activity.lock')
+
+      // Close WS while still waiting on lock -> releasing lock must NOT leave an orphan takeover lease
+      wsDrop.close()
+      await new Promise((r) => setTimeout(r, 30))
+      lockHeld = false
+      releaseLock()
+      await new Promise((r) => setTimeout(r, 40))
+      assert.equal(ctrl.isHumanTakeoverActive('main'), false, 'dropped WS must immediately release post-await lease')
+
+      // 2) Active WS in takeover can cleanly close_browser (passes takeoverToken to controller close) and releases lease
+      const ws2 = new WebSocket(`ws://127.0.0.1:${port}${LIVE_BROWSER_INTERNAL_WS_PATH}`, {
+        headers: { authorization: 'Bearer ok' },
+        origin: `http://127.0.0.1:${port}`,
+      })
+      const msgs2: any[] = []
+      ws2.on('message', (d, isBinary) => {
+        if (!isBinary) msgs2.push(JSON.parse(d.toString()))
+      })
+      await new Promise<void>((resolve, reject) => {
+        ws2.once('open', () => resolve())
+        ws2.once('error', reject)
+      })
+      await waitFor(() => msgs2.find((m) => m.type === 'ready'))
+      ws2.send(JSON.stringify({ type: 'takeover', active: true }))
+      await waitFor(() => msgs2.find((m) => m.type === 'state' && m.humanTakeover === true))
+
+      ws2.send(JSON.stringify({ type: 'close_browser' }))
+      await waitFor(() => closeCalls === 1)
+      await waitFor(() => !ctrl.isHumanTakeoverActive('main'))
+      ws2.close()
     } finally {
       await ctrl.shutdown()
       await new Promise<void>((resolve) => server.close(() => resolve()))

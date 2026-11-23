@@ -31,7 +31,6 @@ import type {
 } from "../../lib/liveBrowserStreamClient";
 import { Popover, PopoverContent, PopoverTrigger, Spinner } from "../ui";
 import type { LiveBrowserZoomMode } from "./LiveBrowserCanvas";
-import { type AutoResumeSnapshot, formatAutoResumeUiFilename } from "./liveBrowserAutoResume";
 
 const QUICK_PRESETS = [
   { label: "Google Scholar", url: "https://scholar.google.com" },
@@ -96,27 +95,60 @@ export function LiveBrowserUnavailableView({
   );
 }
 
+export function LiveBrowserConnectErrorView({
+  error,
+  onRetry,
+}: {
+  error: string;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="lb-root" data-testid="live-browser-connect-error">
+      <div className="lb-idle-surface oc-surface-card" data-tone="warning">
+        <span className="lb-idle-icon oc-icon-badge oc-icon-badge-danger" aria-hidden>
+          <ShieldAlert size={18} />
+        </span>
+        <h3 className="lb-idle-title">云端浏览器连接失败</h3>
+        <p className="lb-idle-desc">{error}</p>
+        <button
+          type="button"
+          className="lb-preset-chip oc-btn-tactile oc-btn-secondary-craft"
+          data-testid="live-browser-connect-retry"
+          onClick={onRetry}
+        >
+          <RotateCw size={12} aria-hidden />
+          立即重试
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function LiveBrowserErrorBanner({
   error,
+  retryable = true,
   onRetry,
   onDismiss,
 }: {
   error: string;
-  onRetry: () => void;
+  retryable?: boolean;
+  onRetry?: () => void;
   onDismiss: () => void;
 }) {
   return (
     <div className="lb-error-banner oc-callout oc-callout-danger" role="alert" data-testid="live-browser-error">
       <span>{error}</span>
       <div className="lb-error-actions">
-        <button
-          type="button"
-          className="lb-error-retry oc-btn-tactile oc-btn-secondary-craft"
-          data-testid="live-browser-error-retry"
-          onClick={onRetry}
-        >
-          立即重试
-        </button>
+        {retryable && onRetry && (
+          <button
+            type="button"
+            className="lb-error-retry oc-btn-tactile oc-btn-secondary-craft"
+            data-testid="live-browser-error-retry"
+            onClick={onRetry}
+          >
+            立即重试
+          </button>
+        )}
         <button type="button" className="lb-error-close" aria-label="关闭提示" onClick={onDismiss}>
           <X size={13} />
         </button>
@@ -127,7 +159,7 @@ export function LiveBrowserErrorBanner({
 
 export function LiveBrowserIdleView({
   error,
-  handoffWaiting,
+  errorRetryable = true,
   launchUrl,
   busy,
   lockedByAssistant,
@@ -138,7 +170,7 @@ export function LiveBrowserIdleView({
   onDismissError,
 }: {
   error: string | null;
-  handoffWaiting: boolean;
+  errorRetryable?: boolean;
   launchUrl: string;
   busy: boolean;
   lockedByAssistant: boolean;
@@ -150,14 +182,13 @@ export function LiveBrowserIdleView({
 }) {
   return (
     <div className="lb-root" data-testid="live-browser-idle">
-      {error && <LiveBrowserErrorBanner error={error} onRetry={onRetry} onDismiss={onDismissError} />}
-      {handoffWaiting && (
-        <div className="lb-handoff-banner oc-callout oc-callout-info" role="status" data-testid="live-browser-handoff-waiting">
-          <span className="lb-handoff-body">
-            <Spinner size={13} className="shrink-0 text-accent" />
-            <span>助手正在操作浏览器，当前步骤完成后将自动为你开启接管…</span>
-          </span>
-        </div>
+      {error && (
+        <LiveBrowserErrorBanner
+          error={error}
+          retryable={errorRetryable}
+          onRetry={onRetry}
+          onDismiss={onDismissError}
+        />
       )}
       <div className="lb-idle-surface oc-surface-card">
         <span className="lb-idle-icon oc-icon-badge oc-icon-badge-accent" aria-hidden>
@@ -398,6 +429,14 @@ export function LiveBrowserToolbar({
   }, []);
 
   const isHttps = (url ?? "").startsWith("https://");
+  const writeLocked = lockedByAssistant || !effectiveTakeover;
+  const writeDisabledTitle = lockedByAssistant
+    ? running
+      ? "助手执行中，暂不可操作"
+      : "助手正在执行浏览器步骤，稍候即可接管"
+    : !effectiveTakeover
+      ? "观看模式下只读，请先点击「接管」"
+      : null;
   const isReconnecting = connectionStatus === "reconnecting";
   const isReplaced = connectionStatus === "replaced";
   const isDisconnected = isReconnecting || isReplaced || hasConnectionError;
@@ -415,6 +454,7 @@ export function LiveBrowserToolbar({
   const telemetryText = (() => {
     if (isReplaced) return "已被替换";
     if (isReconnecting) return "重连中";
+    if (hasConnectionError) return "连接异常";
     if (effectiveTakeover) return "已接管";
     return "实时同步中";
   })();
@@ -422,6 +462,7 @@ export function LiveBrowserToolbar({
   const telemetryTitle = (() => {
     if (isReplaced) return "当前浏览器画面已在其他标签页接管";
     if (isReconnecting) return "实时连接中断，正在自动重连";
+    if (hasConnectionError) return "云端浏览器连接异常，请稍候或点击重试";
     if (connectionStatus === "connected" && streamStats.mode === "ws") {
       const parts = ["实时流"];
       if (streamStats.fps > 0) parts.push(`${streamStats.fps} fps`);
@@ -461,8 +502,8 @@ export function LiveBrowserToolbar({
             type="button"
             className="lb-icon-btn oc-btn-tactile"
             aria-label="后退"
-            title={lockedByAssistant ? "助手执行中，暂不可操作" : "后退"}
-            disabled={busy || lockedByAssistant}
+            title={writeDisabledTitle ?? "后退"}
+            disabled={busy || writeLocked}
             onClick={() => onHistory("back")}
           >
             <ArrowLeft size={14} />
@@ -471,8 +512,8 @@ export function LiveBrowserToolbar({
             type="button"
             className="lb-icon-btn oc-btn-tactile"
             aria-label="前进"
-            title={lockedByAssistant ? "助手执行中，暂不可操作" : "前进"}
-            disabled={busy || lockedByAssistant}
+            title={writeDisabledTitle ?? "前进"}
+            disabled={busy || writeLocked}
             onClick={() => onHistory("forward")}
           >
             <ArrowRight size={14} />
@@ -482,8 +523,8 @@ export function LiveBrowserToolbar({
               type="button"
               className="lb-icon-btn oc-btn-tactile"
               aria-label="停止加载"
-              title={lockedByAssistant ? "助手执行中，暂不可操作" : "停止加载"}
-              disabled={lockedByAssistant}
+              title={writeDisabledTitle ?? "停止加载"}
+              disabled={writeLocked}
               data-testid="live-browser-stop-btn"
               onClick={() => onHistory("stop")}
             >
@@ -494,8 +535,8 @@ export function LiveBrowserToolbar({
               type="button"
               className="lb-icon-btn oc-btn-tactile"
               aria-label="刷新页面"
-              title={lockedByAssistant ? "助手执行中，暂不可操作" : "刷新页面"}
-              disabled={busy || lockedByAssistant}
+              title={writeDisabledTitle ?? "刷新页面"}
+              disabled={busy || writeLocked}
               onClick={() => onHistory("reload")}
             >
               <RotateCw size={13} className={busy ? "lb-spin" : undefined} />
@@ -510,9 +551,10 @@ export function LiveBrowserToolbar({
           <input
             type="text"
             value={addressDraft}
-            readOnly={lockedByAssistant}
+            readOnly={writeLocked}
+            title={writeDisabledTitle ?? undefined}
             onFocus={() => {
-              if (!lockedByAssistant) onAddressEditingChange(true);
+              if (!writeLocked) onAddressEditingChange(true);
             }}
             onBlur={() => onAddressEditingChange(false)}
             onChange={(e) => onAddressDraftChange(e.target.value)}
@@ -551,7 +593,7 @@ export function LiveBrowserToolbar({
                 onClick={onHandBackAndContinue}
               >
                 <Check size={13} />
-                {canAutoSendContinue ? "交还并继续" : "交还助手"}
+                {canAutoSendContinue ? "完成并继续" : "完成并填入"}
               </button>
               <button
                 type="button"
@@ -561,7 +603,7 @@ export function LiveBrowserToolbar({
                 title="仅退出人工接管，不发送对话消息"
                 onClick={onHandBackOnly}
               >
-                仅交还
+                退出接管
               </button>
             </>
           ) : lockedByAssistant && running && canPauseAndTakeover ? (
@@ -584,7 +626,9 @@ export function LiveBrowserToolbar({
               disabled={lockedByAssistant || originMismatchLocked}
               title={
                 lockedByAssistant
-                  ? "助手正在操作浏览器，本轮结束或停止后即可接管"
+                  ? running
+                    ? "助手正在操作浏览器，本轮结束或停止后即可接管"
+                    : "助手正在执行浏览器步骤，稍候即可接管"
                   : originMismatchLocked
                     ? "请先核对域名提示并确认后再接管"
                     : "接管云端浏览器"
@@ -603,8 +647,8 @@ export function LiveBrowserToolbar({
                 type="button"
                 className="lb-icon-btn oc-btn-tactile"
                 aria-label="新建标签页"
-                title="新建标签页"
-                disabled={busy || lockedByAssistant}
+                title={writeDisabledTitle ?? "新建标签页"}
+                disabled={busy || writeLocked}
                 data-testid="live-browser-new-tab-btn"
                 onClick={onTabNew}
               >
@@ -649,8 +693,8 @@ export function LiveBrowserToolbar({
                   type="button"
                   className="lb-icon-btn lb-icon-btn-danger oc-btn-tactile"
                   aria-label="关闭云端浏览器"
-                  title={lockedByAssistant ? "助手执行中，暂不可关闭" : "关闭云端浏览器"}
-                  disabled={busy || lockedByAssistant}
+                  title={lockedByAssistant ? "助手执行中，暂不可关闭" : !effectiveTakeover ? "观看模式下只读，请先点击「接管」" : "关闭云端浏览器"}
+                  disabled={busy || writeLocked}
                   data-testid="live-browser-close-btn"
                 >
                   <Power size={13} />
@@ -696,18 +740,19 @@ export function LiveBrowserToolbar({
                 type="button"
                 role="tab"
                 aria-selected={t.active}
-                disabled={busy || lockedByAssistant}
+                disabled={busy || writeLocked}
                 className="lb-tab-select"
-                title={t.title || t.url}
+                title={writeDisabledTitle ?? (t.title || t.url)}
                 onClick={() => onTabSelect(t)}
               >
                 {t.title || t.url || `标签页 ${t.index + 1}`}
               </button>
               <button
                 type="button"
-                disabled={busy || lockedByAssistant}
+                disabled={busy || writeLocked}
                 className="lb-tab-close"
                 aria-label={`关闭标签页 ${t.title || t.index + 1}`}
+                title={writeDisabledTitle ?? undefined}
                 onClick={() => onTabClose(t)}
               >
                 <X size={11} />
@@ -718,8 +763,8 @@ export function LiveBrowserToolbar({
             type="button"
             className="lb-icon-btn oc-btn-tactile"
             aria-label="新建标签页"
-            title="新建标签页"
-            disabled={busy || lockedByAssistant}
+            title={writeDisabledTitle ?? "新建标签页"}
+            disabled={busy || writeLocked}
             data-testid="live-browser-new-tab-btn"
             onClick={onTabNew}
           >
@@ -748,23 +793,27 @@ export function LiveBrowserToolbar({
               ? "已在其他标签页接管实时画面 · 可点击画布上方「重新连接」切回本页"
               : isReconnecting
                 ? "实时连接已中断，正在自动重连…"
-                : lockedByAssistant
-                  ? "助手正在操作浏览器 · 实时观看中（本轮结束或停止后可一键接管）"
-                  : effectiveTakeover
-                    ? (() => {
-                        const prefix =
-                          takeoverLeaseMode === "exclusive"
-                            ? "独占接管中"
-                            : takeoverLeaseMode === "compat"
-                              ? "兼容接管（无独占锁）"
-                              : "已接管";
-                        return title
-                          ? `${prefix} · ${title}`
-                          : `${prefix} · 可直接键鼠操作或粘贴文本，完成后交还助手`;
-                      })()
-                    : title
-                      ? `实时画面 · ${title}`
-                      : "实时画面同步中 · 点击画布或「接管」即可操作"}
+                : hasConnectionError
+                  ? "云端浏览器连接异常 · 画面可能未及时更新"
+                  : lockedByAssistant
+                    ? running
+                      ? "助手正在操作浏览器 · 实时观看中（本轮结束或停止后可一键接管）"
+                      : "助手正在执行浏览器步骤，稍候即可接管"
+                    : effectiveTakeover
+                      ? (() => {
+                          const prefix =
+                            takeoverLeaseMode === "exclusive"
+                              ? "独占接管中"
+                              : takeoverLeaseMode === "compat"
+                                ? "兼容接管（无独占锁）"
+                                : "已接管";
+                          return title
+                            ? `${prefix} · ${title}`
+                            : `${prefix} · 可直接键鼠操作或粘贴文本，完成后点击「完成并继续」`;
+                        })()
+                      : title
+                        ? `实时画面 · ${title}`
+                        : "实时画面同步中 · 点击画布或「接管」即可操作"}
           </span>
         </div>
 
@@ -801,7 +850,7 @@ export function LiveBrowserToolbar({
           )}
           <span
             className="lb-status-meta"
-            data-mode={connectionStatus === "connected" ? "ws" : isDisconnected ? "warn" : "polling"}
+            data-mode={isDisconnected ? "warn" : connectionStatus === "connected" ? "ws" : "polling"}
             data-testid="live-browser-telemetry"
             title={telemetryTitle}
           >
@@ -811,83 +860,4 @@ export function LiveBrowserToolbar({
       </div>
     </>
   );
-}
-
-export function LiveBrowserAutoResumeBanner({
-  snapshot,
-  onContinueNow,
-  onWait,
-  onManualHandBack,
-}: {
-  snapshot: AutoResumeSnapshot;
-  onContinueNow: () => void;
-  onWait: () => void;
-  onManualHandBack: () => void;
-}) {
-  if (snapshot.phase === "countdown") {
-    const uiFile = formatAutoResumeUiFilename(snapshot.event?.filename);
-    const fileHint = uiFile ? `（已捕获：${uiFile}）` : "";
-    return (
-      <div
-        className="lb-autoresume-bar"
-        role="status"
-        aria-live="polite"
-        data-testid="live-browser-autoresume-banner"
-      >
-        <span className="lb-autoresume-copy">
-          <Check size={13} className="shrink-0 text-success" aria-hidden />
-          <span>
-            检测到已完成操作{fileHint}，<strong>{snapshot.remainingSec}</strong> 秒后自动交还助手继续…
-          </span>
-        </span>
-        <div className="lb-autoresume-actions">
-          <button
-            type="button"
-            className="lb-autoresume-btn oc-btn-tactile oc-btn-accent-craft"
-            data-testid="live-browser-autoresume-now"
-            onClick={onContinueNow}
-          >
-            立即继续
-          </button>
-          <button
-            type="button"
-            className="lb-autoresume-btn oc-btn-tactile oc-btn-secondary-craft"
-            data-testid="live-browser-autoresume-wait"
-            onClick={onWait}
-          >
-            再等等
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  if (snapshot.phase === "circuit_open") {
-    return (
-      <div
-        className="lb-autoresume-bar"
-        data-mode="manual-lock"
-        role="status"
-        aria-live="polite"
-        data-testid="live-browser-autoresume-manual-lock"
-      >
-        <span className="lb-autoresume-copy">
-          <ShieldAlert size={13} className="shrink-0 text-warning" aria-hidden />
-          <span>检测到已完成操作；连续往返保护已启用，请确认后手动交还助手。</span>
-        </span>
-        <div className="lb-autoresume-actions">
-          <button
-            type="button"
-            className="lb-autoresume-btn oc-btn-tactile oc-btn-accent-craft"
-            data-testid="live-browser-autoresume-manual-btn"
-            onClick={onManualHandBack}
-          >
-            交还并继续
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  return null;
 }

@@ -418,4 +418,133 @@ describe("v2 interactive components", () => {
       },
     });
   });
+
+  it("BrowserHandoffBlock transitions phase opening -> blocked -> active -> error strictly isolated by sessionId + handoffId", async () => {
+    const { notifyLiveBrowserHandoffPhase } = await import("../chat/inspectorState");
+    const openLiveBrowser = vi.fn();
+    const sendUserText = vi.fn();
+    render(
+      <ArtifactInspectContext.Provider value={{ openLiveBrowser }}>
+        <ChatInteractionContext.Provider value={{ sendUserText, sessionId: "sess-phase" }}>
+          <IuiBlock
+            code={j({
+              type: "browser_handoff",
+              decisionId: "handoff-phase-1",
+              title: "请完成验证",
+              url: "https://example.org/verify",
+            })}
+          />
+        </ChatInteractionContext.Provider>
+      </ArtifactInspectContext.Provider>,
+    );
+
+    // Click open -> starts in opening phase
+    fireEvent.click(screen.getByTestId("iui-browser-handoff-open"));
+    expect(screen.getByRole("status")).toHaveTextContent("正在为你打开实时浏览器");
+
+    // Notification for another session MUST NOT affect this card
+    act(() => {
+      notifyLiveBrowserHandoffPhase({ sessionId: "sess-other", handoffId: "handoff-phase-1", phase: "active" });
+    });
+    expect(screen.getByRole("status")).toHaveTextContent("正在为你打开实时浏览器");
+
+    // blocked phase
+    act(() => {
+      notifyLiveBrowserHandoffPhase({ sessionId: "sess-phase", handoffId: "handoff-phase-1", phase: "blocked" });
+    });
+    expect(screen.getByRole("status")).toHaveTextContent("助手正在执行浏览器步骤，稍候即可在右侧接管操作。");
+
+    // active phase
+    act(() => {
+      notifyLiveBrowserHandoffPhase({ sessionId: "sess-phase", handoffId: "handoff-phase-1", phase: "active" });
+    });
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "实时浏览器已就绪，请完成操作后点击下方「我已完成，继续任务」或浏览器顶栏「完成并继续」。",
+    );
+
+    // error phase
+    act(() => {
+      notifyLiveBrowserHandoffPhase({
+        sessionId: "sess-phase",
+        handoffId: "handoff-phase-1",
+        phase: "error",
+        reason: "云端浏览器连接超时",
+      });
+    });
+    expect(screen.getByRole("status")).toHaveTextContent("云端浏览器连接超时");
+    expect(screen.getByRole("status")).toHaveTextContent("请重新点击上方按钮重试");
+  });
+
+  it("BrowserHandoffBlock awaits handback handler release before continuing, avoids duplicate sendUserText, and falls back when unhandled", async () => {
+    const { notifyLiveBrowserHandback, registerLiveBrowserHandbackHandler } = await import("../chat/inspectorState");
+    const openLiveBrowser = vi.fn();
+    const sendUserText = vi.fn();
+    let resolveRelease!: () => void;
+    const releaseDone = new Promise<void>((r) => {
+      resolveRelease = r;
+    });
+    const handlerCalls: Array<{ sessionId: string | null; handoffId: string }> = [];
+    const unregister = registerLiveBrowserHandbackHandler(async (req) => {
+      handlerCalls.push({ sessionId: req.sessionId, handoffId: req.handoffId });
+      if (req.handoffId !== "hid-active-card") return { handled: false };
+      await releaseDone;
+      sendUserText(req.continueMessage ?? "fallback");
+      notifyLiveBrowserHandback({ sessionId: req.sessionId, handoffId: req.handoffId, autoSent: true });
+      return { handled: true };
+    });
+
+    try {
+      render(
+        <ArtifactInspectContext.Provider value={{ openLiveBrowser }}>
+          <ChatInteractionContext.Provider value={{ sendUserText, sessionId: "sess-hb" }}>
+            <IuiBlock
+              code={j({
+                type: "browser_handoff",
+                decisionId: "hid-active-card",
+                title: "当前接管卡",
+                url: "https://example.org/login",
+              })}
+            />
+            <IuiBlock
+              code={j({
+                type: "browser_handoff",
+                decisionId: "hid-unmatched-card",
+                title: "未接管历史卡",
+                url: "https://example.org/other",
+              })}
+            />
+          </ChatInteractionContext.Provider>
+        </ArtifactInspectContext.Provider>,
+      );
+
+      const continueBtns = screen.getAllByTestId("iui-browser-handoff-continue");
+      // Click active card -> disabled immediately (no re-entry), waits for lease release
+      fireEvent.click(continueBtns[0]!);
+      expect(continueBtns[0]).toBeDisabled();
+      expect(sendUserText).not.toHaveBeenCalled();
+
+      await act(async () => {
+        resolveRelease();
+        await Promise.resolve();
+      });
+      // Exactly 1 continuation message sent (by handler, NOT duplicated by card)
+      expect(sendUserText).toHaveBeenCalledTimes(1);
+      expect(sendUserText).toHaveBeenCalledWith("我已完成 example.org 的浏览器操作，请继续。");
+      expect(continueBtns[0]).toBeDisabled();
+
+      // Clicking unmatched card returns handled=false -> card falls back to sending once directly
+      sendUserText.mockClear();
+      await act(async () => {
+        fireEvent.click(continueBtns[1]!);
+        await Promise.resolve();
+      });
+      expect(sendUserText).toHaveBeenCalledTimes(1);
+      expect(handlerCalls).toEqual([
+        { sessionId: "sess-hb", handoffId: "hid-active-card" },
+        { sessionId: "sess-hb", handoffId: "hid-unmatched-card" },
+      ]);
+    } finally {
+      unregister();
+    }
+  });
 });

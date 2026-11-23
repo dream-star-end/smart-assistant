@@ -10,9 +10,7 @@
  *   one-click "交还并继续" + session-level `BrowserHandoffBlock` sync.
  */
 import type {
-  BrowserHandoffResumeWhen,
   LiveBrowserDecodedFrame,
-  LiveBrowserHandoffReadyMessage,
   LiveBrowserMouseButton,
   LiveBrowserStatePayload,
 } from "@openclaude/protocol/browser";
@@ -46,14 +44,14 @@ import {
 } from "../../lib/liveBrowserStreamClient";
 import type { AuthSession } from "../../lib/types";
 import { useChatInteraction } from "../tool/context";
-import { Spinner, useToast } from "../ui";
+import { useToast } from "../ui";
 import {
   LiveBrowserCanvas,
   type LiveBrowserCanvasHandle,
   type LiveBrowserZoomMode,
 } from "./LiveBrowserCanvas";
 import {
-  LiveBrowserAutoResumeBanner,
+  LiveBrowserConnectErrorView,
   LiveBrowserErrorBanner,
   LiveBrowserIdleView,
   LiveBrowserLoadingView,
@@ -62,14 +60,11 @@ import {
   LiveBrowserUnavailableView,
 } from "./LiveBrowserToolbar";
 import {
-  AUTO_RESUME_SAFE_CONTINUE_MESSAGE,
-  type AutoResumeBindingContext,
-  type AutoResumeSnapshot,
-  LiveBrowserAutoResumeController,
-} from "./liveBrowserAutoResume";
-import {
+  type LiveBrowserHandoffPhase,
   type LiveBrowserHandoffRequest,
   notifyLiveBrowserHandback,
+  notifyLiveBrowserHandoffPhase,
+  registerLiveBrowserHandbackHandler,
   useInspectorStopTurn,
 } from "./inspectorState";
 import "./liveBrowser.css";
@@ -120,8 +115,11 @@ interface HandoffOriginMismatch {
   actualHost: string;
   continuePrompt: string | null;
   handoffId?: string | null;
-  nonce?: number | null;
-  resumeWhen?: BrowserHandoffResumeWhen;
+}
+
+interface LiveBrowserErrorState {
+  message: string;
+  kind: "connection" | "business";
 }
 
 function parseOriginAndHost(url?: string): { origin: string; host: string } | null {
@@ -143,6 +141,12 @@ function errorMessageOf(err: unknown): string {
   return apiErrorMessage(err, "云端浏览器连接失败，请稍后重试");
 }
 
+function isTakeoverRequiredError(err: unknown): boolean {
+  const code = (err as { code?: string })?.code ?? "";
+  const msg = errorMessageOf(err);
+  return code === "TAKEOVER_REQUIRED" || /TAKEOVER_REQUIRED|请先点击「接管」/.test(msg);
+}
+
 function isTakeoverConflictError(err: unknown): boolean {
   const status = (err as { status?: number })?.status;
   const code = (err as { code?: string })?.code ?? "";
@@ -151,8 +155,21 @@ function isTakeoverConflictError(err: unknown): boolean {
     code === "TAKEOVER_ALREADY_HELD" ||
     code === "TAKEOVER_TOKEN_MISMATCH" ||
     /TAKEOVER_ALREADY_HELD|TAKEOVER_TOKEN_MISMATCH|独占接管|租约/.test(msg) ||
-    (status === 409 && !/助手正在操作浏览器|AGENT_RUNNING/.test(msg))
+    (status === 409 && !/助手正在操作浏览器|AGENT_RUNNING|TAKEOVER_REQUIRED|请先点击「接管」/.test(msg))
   );
+}
+
+const BUSINESS_ERROR_CODES = new Set([
+  "AGENT_RUNNING", "TAKEOVER_REQUIRED", "TAKEOVER_ALREADY_HELD",
+  "TAKEOVER_TOKEN_MISMATCH", "INVALID_URL", "BAD_REQUEST", "ORIGIN_MISMATCH", "TARGET_MISMATCH",
+]);
+
+function isBusinessError(err: unknown, msg: string, code?: string): boolean {
+  const status = (err as { status?: number })?.status;
+  const errCode = code ?? (err as { code?: string })?.code ?? "";
+  if (BUSINESS_ERROR_CODES.has(errCode)) return true;
+  if (status === 400 || status === 403 || status === 404 || status === 409 || status === 422) return true;
+  return /助手正在操作浏览器|AGENT_RUNNING|TAKEOVER_REQUIRED|请先点击「接管」|独占接管|租约/.test(msg);
 }
 
 function mergeStreamState(prev: LiveBrowserState | null, next: LiveBrowserStatePayload): LiveBrowserState {
@@ -209,11 +226,25 @@ export function LiveBrowserStage({
   const [takeoverLeaseMode, setTakeoverLeaseMode] = useState<"none" | "exclusive" | "compat">("none");
   const [expanded, setExpanded] = useState(false);
   const [zoomMode, setZoomMode] = useState<LiveBrowserZoomMode>("fit");
-  const [error, setError] = useState<string | null>(null);
+  const [errorState, setErrorState] = useState<LiveBrowserErrorState | null>(null);
+  const error = errorState?.message ?? null;
+  const errorRetryable = errorState?.kind === "connection";
   const [originMismatch, setOriginMismatch] = useState<HandoffOriginMismatch | null>(null);
   const [originMismatchDismissed, setOriginMismatchDismissed] = useState(false);
-  const [handoffWaiting, setHandoffWaiting] = useState(false);
   const [pollEpoch, setPollEpoch] = useState(0);
+
+  const setConnectionError = useCallback((message: string) => {
+    setErrorState({ message, kind: "connection" });
+  }, []);
+  const setBusinessError = useCallback((message: string) => {
+    setErrorState({ message, kind: "business" });
+  }, []);
+  const clearError = useCallback(() => {
+    setErrorState(null);
+  }, []);
+  const clearConnectionError = useCallback(() => {
+    setErrorState((prev) => (prev?.kind === "connection" ? null : prev));
+  }, []);
 
   const [streamStatus, setStreamStatus] = useState<LiveBrowserConnectionStatus>("idle");
   const [streamFrame, setStreamFrame] = useState<LiveBrowserDecodedFrame | null>(null);
@@ -230,13 +261,6 @@ export function LiveBrowserStage({
   const [addressDraft, setAddressDraft] = useState("");
   const [addressEditing, setAddressEditing] = useState(false);
   const [typeDraft, setTypeDraft] = useState("");
-  const [autoResumeState, setAutoResumeState] = useState<AutoResumeSnapshot>({
-    phase: "idle",
-    event: null,
-    remainingSec: 0,
-    totalSec: 3,
-    circuitOpen: false,
-  });
 
   const stageRef = useRef<HTMLDivElement>(null);
   const canvasHandleRef = useRef<LiveBrowserCanvasHandle | null>(null);
@@ -245,6 +269,26 @@ export function LiveBrowserStage({
   const mountedRef = useRef(true);
   const authRef = useRef(auth);
   authRef.current = auth;
+  const chatSessionIdRef = useRef<string | null | undefined>(chatSessionId);
+  chatSessionIdRef.current = chatSessionId;
+  const sendUserTextRef = useRef(sendUserText);
+  sendUserTextRef.current = sendUserText;
+  const chatBusyRef = useRef(chatBusy);
+  chatBusyRef.current = chatBusy;
+  const handbackInFlightRef = useRef(false);
+
+  const reportHandoffPhase = useCallback(
+    (handoffId: string | null | undefined, phase: LiveBrowserHandoffPhase, reason?: string) => {
+      if (!handoffId) return;
+      notifyLiveBrowserHandoffPhase({
+        sessionId: chatSessionIdRef.current ?? null,
+        handoffId,
+        phase,
+        reason,
+      });
+    },
+    [],
+  );
 
   // Monotonic sequence fencing: stale GET polls can never overwrite newer POST/WS states.
   const reqSeqRef = useRef(0);
@@ -283,8 +327,14 @@ export function LiveBrowserStage({
   const httpTakeoverTokenRef = useRef<string | null>(null);
   const httpLeaseRenewTimerRef = useRef<number | null>(null);
   const httpLeaseHeldRef = useRef(false);
+  const httpLeaseAcquiringRef = useRef(false);
   const httpLeaseGenRef = useRef(0);
   const wsTakeoverRequestedRef = useRef(false);
+  const wsReleaseWaitersRef = useRef<Set<() => void>>(new Set());
+  const flushWsReleaseWaiters = useCallback(() => {
+    for (const resolve of wsReleaseWaitersRef.current) resolve();
+    wsReleaseWaitersRef.current.clear();
+  }, []);
 
   const navGenMetaRef = useRef<Map<number, { origin?: string; targetId?: string }>>(new Map());
   const paintedNavGenRef = useRef<number | null>(null);
@@ -300,16 +350,9 @@ export function LiveBrowserStage({
     url?: string;
     continuePrompt?: string | null;
     handoffId?: string | null;
-    resumeWhen?: BrowserHandoffResumeWhen;
   } | null>(null);
   const handoffContinuePromptRef = useRef<string | null>(null);
-  const handoffResumeWhenRef = useRef<BrowserHandoffResumeWhen | null>(null);
   const activeHandoffIdRef = useRef<string | null>(null);
-  const activeHandoffNonceRef = useRef<number | null>(null);
-  const autoResumeRef = useRef<LiveBrowserAutoResumeController | null>(null);
-  const handleAutoHandBackRef = useRef<
-    (evt: LiveBrowserHandoffReadyMessage, ctx: AutoResumeBindingContext) => void
-  >(() => {});
   const onHandoffSettledRef = useRef(onHandoffSettled);
   onHandoffSettledRef.current = onHandoffSettled;
 
@@ -362,12 +405,10 @@ export function LiveBrowserStage({
   const syncTakeoverToStream = useCallback((active: boolean) => {
     wsTakeoverRequestedRef.current = active;
     const tok = stateRef.current?.takeoverToken;
-    const resumeWhen = active ? handoffResumeWhenRef.current : null;
     streamClientRef.current?.send({
       type: "takeover",
       active,
       ...(tok ? { takeoverToken: tok } : {}),
-      ...(resumeWhen ? { resumeWhen } : {}),
     });
   }, []);
 
@@ -381,55 +422,74 @@ export function LiveBrowserStage({
   const revokeTakeoverOnLeaseLost = useCallback(
     (notice = "当前由另一标签页独占接管") => {
       httpLeaseGenRef.current += 1;
+      httpLeaseAcquiringRef.current = false;
       stopHttpLeaseRenewal();
       httpTakeoverTokenRef.current = null;
       httpLeaseHeldRef.current = false;
       wsTakeoverRequestedRef.current = false;
       takeoverActiveRef.current = false;
       prevTakeoverRef.current = false;
+      const lostHandoffId = activeHandoffIdRef.current;
+      activeHandoffIdRef.current = null;
+      handoffContinuePromptRef.current = null;
       clearPendingInputBuffers();
       setTakeover(false);
       setTakeoverLeaseMode("none");
-      setError(notice);
+      setBusinessError(notice);
+      reportHandoffPhase(lostHandoffId, "error", notice);
       toast(notice, "info");
     },
-    [stopHttpLeaseRenewal, clearPendingInputBuffers, toast],
+    [stopHttpLeaseRenewal, clearPendingInputBuffers, setBusinessError, reportHandoffPhase, toast],
   );
 
   const releaseHttpTakeoverLease = useCallback(
-    (keepalive = false) => {
+    (keepalive = false, strict = false): Promise<void> => {
       httpLeaseGenRef.current += 1;
+      httpLeaseAcquiringRef.current = false;
       stopHttpLeaseRenewal();
       const token = httpTakeoverTokenRef.current;
       const hadLease = httpLeaseHeldRef.current || Boolean(token);
-      httpTakeoverTokenRef.current = null;
-      httpLeaseHeldRef.current = false;
-      if (mountedRef.current) setTakeoverLeaseMode("none");
-      if (!hadLease) return;
+      if (!strict) {
+        httpTakeoverTokenRef.current = null;
+        httpLeaseHeldRef.current = false;
+        if (mountedRef.current) setTakeoverLeaseMode("none");
+      }
+      if (!hadLease) return Promise.resolve();
       const payload: LiveBrowserActionPayload = token
         ? { action: "takeover", active: false, token }
         : { action: "takeover", active: false };
-      void Promise.resolve(
+      return Promise.resolve(
         sendLiveBrowserAction(
           authRef.current,
           agentId,
           payload,
           keepalive ? { keepalive: true } : undefined,
         ),
-      ).catch(() => {
-        /* best-effort release on teardown */
-      });
+      )
+        .then(() => {
+          if (strict) {
+            httpTakeoverTokenRef.current = null;
+            httpLeaseHeldRef.current = false;
+            if (mountedRef.current) setTakeoverLeaseMode("none");
+          }
+        })
+        .catch((err) => {
+          if (strict) throw err;
+          /* best-effort release on teardown */
+        });
     },
     [agentId, stopHttpLeaseRenewal],
   );
 
   const acquireHttpTakeoverLease = useCallback(() => {
     const gen = ++httpLeaseGenRef.current;
+    httpLeaseAcquiringRef.current = true;
     stopHttpLeaseRenewal();
     void Promise.resolve(
       sendLiveBrowserAction(authRef.current, agentId, { action: "takeover", active: true }),
     )
       .then((res) => {
+        if (gen === httpLeaseGenRef.current) httpLeaseAcquiringRef.current = false;
         if (!mountedRef.current || gen !== httpLeaseGenRef.current || !takeoverActiveRef.current) {
           // Released before acquire completed: proactively release returned token.
           if (res?.humanTakeover && res.takeoverToken) {
@@ -484,6 +544,7 @@ export function LiveBrowserStage({
         }
       })
       .catch((err) => {
+        if (gen === httpLeaseGenRef.current) httpLeaseAcquiringRef.current = false;
         if (!mountedRef.current || gen !== httpLeaseGenRef.current) return;
         const msg = errorMessageOf(err);
         if (isTakeoverConflictError(err)) {
@@ -504,6 +565,8 @@ export function LiveBrowserStage({
   const focusCanvasSoon = useCallback(() => {
     window.requestAnimationFrame(() => {
       if (!mountedRef.current || !takeoverActiveRef.current) return;
+      const activeEl = document.activeElement;
+      if (activeEl && activeEl !== document.body && activeEl !== stageRef.current) return;
       canvasHandleRef.current?.focusCapture();
     });
   }, []);
@@ -511,32 +574,26 @@ export function LiveBrowserStage({
   const activateHandoffOnActivePage = useCallback(
     (
       req: {
-        nonce?: number;
         takeover?: boolean;
         expand?: boolean;
         url?: string;
         continuePrompt?: string | null;
         handoffId?: string | null;
-        resumeWhen?: BrowserHandoffResumeWhen;
       },
       actualUrl: string | undefined,
       isBusyNow: boolean,
     ) => {
       const nextHandoffId = req.handoffId ?? null;
-      const nextNonce = req.nonce ?? null;
       const expected = parseOriginAndHost(req.url);
       const actual = parseOriginAndHost(actualUrl);
       if (expected && actual && expected.origin !== actual.origin) {
         takeoverActiveRef.current = false;
-        autoResumeRef.current?.invalidatePending();
         clearPendingInputBuffers();
         setTakeover(false);
         syncTakeoverToStream(false);
         releaseHttpTakeoverLease(false);
         handoffContinuePromptRef.current = null;
-        handoffResumeWhenRef.current = null;
         activeHandoffIdRef.current = null;
-        activeHandoffNonceRef.current = null;
         setOriginMismatch({
           expectedOrigin: expected.origin,
           expectedHost: expected.host,
@@ -544,86 +601,40 @@ export function LiveBrowserStage({
           actualHost: actual.host,
           continuePrompt: req.continuePrompt?.trim() || null,
           handoffId: nextHandoffId,
-          nonce: nextNonce,
-          ...(req.resumeWhen ? { resumeWhen: req.resumeWhen } : {}),
         });
         setOriginMismatchDismissed(false);
         if (req.expand) setExpanded(true);
+        reportHandoffPhase(
+          nextHandoffId,
+          "blocked",
+          `当前页面域名为 ${actual.host}（与卡片 ${expected.host} 不一致），请在右侧浏览器核对后确认接管。`,
+        );
         return;
       }
       setOriginMismatch(null);
       setOriginMismatchDismissed(false);
       activeHandoffIdRef.current = nextHandoffId;
-      activeHandoffNonceRef.current = nextNonce;
       handoffContinuePromptRef.current = req.continuePrompt?.trim() || null;
-      handoffResumeWhenRef.current = req.resumeWhen ?? null;
-      if (takeoverActiveRef.current) {
-        autoResumeRef.current?.onHandoffContextChanged(req.resumeWhen ?? null, {
-          handoffNonce: nextNonce,
-          handoffId: nextHandoffId,
-        });
-        const nextWatchId = nextNonce !== null ? `handoff-${nextNonce}` : undefined;
-        streamClientRef.current?.send({
-          type: "handoff_watch",
-          resumeWhen: req.resumeWhen ?? null,
-          ...(nextWatchId ? { watchId: nextWatchId } : {}),
-        });
-      }
       if (req.takeover && !isBusyNow) {
         setTakeover(true);
         syncTakeoverToStream(true);
         focusCanvasSoon();
       }
       if (req.expand) setExpanded(true);
+      reportHandoffPhase(nextHandoffId, "active");
     },
-    [clearPendingInputBuffers, syncTakeoverToStream, releaseHttpTakeoverLease, focusCanvasSoon],
+    [clearPendingInputBuffers, syncTakeoverToStream, releaseHttpTakeoverLease, focusCanvasSoon, reportHandoffPhase],
   );
 
   useEffect(() => {
     mountedRef.current = true;
-    const ctrl = new LiveBrowserAutoResumeController({
-      onChange: (snap) => {
-        if (mountedRef.current) setAutoResumeState(snap);
-      },
-      onAutoHandBack: (evt, ctx) => {
-        if (mountedRef.current) handleAutoHandBackRef.current(evt, ctx);
-      },
-    });
-    autoResumeRef.current = ctrl;
     return () => {
       mountedRef.current = false;
-      ctrl.dispose();
-      if (autoResumeRef.current === ctrl) autoResumeRef.current = null;
       pollAbortRef.current?.abort();
       clearPendingInputBuffers();
       releaseHttpTakeoverLease(true);
     };
   }, [clearPendingInputBuffers, releaseHttpTakeoverLease]);
-
-  // Synchronize effectiveTakeover, typing state, and page loading with auto-resume guard.
-  const prevAutoResumeTakeoverRef = useRef(false);
-  useEffect(() => {
-    if (effectiveTakeover && !prevAutoResumeTakeoverRef.current) {
-      prevAutoResumeTakeoverRef.current = true;
-      autoResumeRef.current?.onTakeoverEntered(handoffResumeWhenRef.current, {
-        handoffNonce: activeHandoffNonceRef.current,
-        handoffId: activeHandoffIdRef.current,
-      });
-    } else if (!effectiveTakeover && prevAutoResumeTakeoverRef.current) {
-      prevAutoResumeTakeoverRef.current = false;
-      autoResumeRef.current?.onTakeoverExited();
-    }
-  }, [effectiveTakeover]);
-
-  useEffect(() => {
-    autoResumeRef.current?.setTyping(addressEditing || typeDraft.length > 0);
-  }, [addressEditing, typeDraft]);
-
-  useEffect(() => {
-    if (state?.loading) {
-      autoResumeRef.current?.onPageLoading();
-    }
-  }, [state?.loading]);
 
   // Synchronize HTTP fallback human-takeover lease & honest WS lease confirmation.
   const serverConfirmedHumanTakeover = state?.humanTakeover === true;
@@ -643,7 +654,8 @@ export function LiveBrowserStage({
       );
       return;
     }
-    // HTTP fallback mode: acquire & 30s-renew a real server-side human-takeover lease.
+    // HTTP fallback mode: acquire & 30s-renew a real server-side human-takeover lease once per takeover.
+    if (httpLeaseHeldRef.current || httpLeaseAcquiringRef.current) return;
     acquireHttpTakeoverLease();
   }, [
     effectiveTakeover,
@@ -703,10 +715,9 @@ export function LiveBrowserStage({
     setExpanded(false);
     setZoomMode("fit");
     setAddressEditing(false);
-    setError(null);
+    setErrorState(null);
     setOriginMismatch(null);
     setOriginMismatchDismissed(false);
-    setHandoffWaiting(false);
     setState(null);
     setStreamFrame(null);
     paintedNavGenRef.current = null;
@@ -726,11 +737,7 @@ export function LiveBrowserStage({
     pendingHandoffRef.current = null;
     pendingPostOpenHandoffRef.current = null;
     handoffContinuePromptRef.current = null;
-    handoffResumeWhenRef.current = null;
     activeHandoffIdRef.current = null;
-    activeHandoffNonceRef.current = null;
-    prevAutoResumeTakeoverRef.current = false;
-    autoResumeRef.current?.resetSession();
     reqSeqRef.current += 1;
     appliedSeqRef.current = reqSeqRef.current;
     lastPollEpochRef.current = pollEpoch;
@@ -738,7 +745,7 @@ export function LiveBrowserStage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId, clearPendingInputBuffers, releaseHttpTakeoverLease]);
 
-  // Release takeover lease cleanly on session switch without tearing down agent viewport state.
+  // Release takeover lease & transient session errors cleanly on session switch.
   const prevSessionIdRef = useRef<string | null | undefined>(chatSessionId);
   useEffect(() => {
     if (prevSessionIdRef.current !== chatSessionId) {
@@ -750,11 +757,19 @@ export function LiveBrowserStage({
         releaseHttpTakeoverLease(false);
         clearPendingInputBuffers();
       }
-      handoffResumeWhenRef.current = null;
+      setErrorState(null);
+      setOriginMismatch(null);
+      setOriginMismatchDismissed(false);
+      pendingTakeoverAfterStopRef.current = false;
+      pendingHandoffRef.current = null;
+      pendingPostOpenHandoffRef.current = null;
+      handoffContinuePromptRef.current = null;
       activeHandoffIdRef.current = null;
-      activeHandoffNonceRef.current = null;
-      prevAutoResumeTakeoverRef.current = false;
-      autoResumeRef.current?.resetSession();
+      if (stateRef.current === null) {
+        pollErrorStreakRef.current = 0;
+        setInitialLoading(true);
+        setPollEpoch((n) => n + 1);
+      }
     }
   }, [chatSessionId, syncTakeoverToStream, releaseHttpTakeoverLease, clearPendingInputBuffers]);
 
@@ -769,8 +784,16 @@ export function LiveBrowserStage({
       const wasActive = prevActiveRef.current;
       prevActiveRef.current = next.active;
       setState(next);
+      if (next.humanTakeover === false || !next.active) {
+        flushWsReleaseWaiters();
+      }
       setInitialLoading(false);
-      setError(null);
+      setErrorState((prev) => {
+        if (!prev) return null;
+        if (prev.kind === "connection") return null;
+        if (!next.agentBusy && /助手正在操作浏览器|AGENT_RUNNING/.test(prev.message)) return null;
+        return prev;
+      });
       onActiveStateChange?.(next.active);
 
       // Clear origin-mismatch lock automatically if the browser navigated back to expected origin.
@@ -834,20 +857,14 @@ export function LiveBrowserStage({
           if (!mountedRef.current) return;
           setStreamStatus(nextStatus);
           if (nextStatus === "connected") {
+            clearConnectionError();
             if (takeoverActiveRef.current) {
-              const rw = handoffResumeWhenRef.current;
-              const watchId =
-                activeHandoffNonceRef.current !== null ? `handoff-${activeHandoffNonceRef.current}` : undefined;
               client.send({
                 type: "takeover",
                 active: true,
-                ...(rw ? { resumeWhen: rw } : {}),
-                ...(watchId ? { watchId } : {}),
               });
             }
           } else {
-            // B4: Invalidate any running auto-resume countdown on WS disconnect/reconnect/fallback.
-            autoResumeRef.current?.invalidatePending();
             // Immediately clear stale canvas frame so HTTP polling <img> renders cleanly without overlap.
             setStreamFrame(null);
             paintedNavGenRef.current = null;
@@ -874,7 +891,6 @@ export function LiveBrowserStage({
             });
           }
           if (payload.cdpAvailable === false) {
-            autoResumeRef.current?.invalidatePending();
             setStreamFrame(null);
             paintedNavGenRef.current = null;
           }
@@ -884,29 +900,21 @@ export function LiveBrowserStage({
         },
         onFrame: (frame) => {
           if (!mountedRef.current) return;
+          clearConnectionError();
           setStreamFrame(frame);
         },
         onCursor: (cursor) => {
           if (!mountedRef.current) return;
           setRemoteCursor(cursor || "default");
         },
-        onHandoffReady: (evt) => {
-          if (!mountedRef.current) return;
-          autoResumeRef.current?.onHandoffReady(evt);
-        },
-        onHandoffVetoed: () => {
-          if (!mountedRef.current) return;
-          autoResumeRef.current?.onHandoffVetoed();
-        },
         onStats: (stats) => {
           if (!mountedRef.current) return;
           setStreamStats(stats);
         },
-        onError: (msg, code) => {
+        onError: (msg, code, retryable) => {
           if (!mountedRef.current) return;
           if (code === "CDP_UNAVAILABLE") {
             // Silently fall back to HTTP polling preserving active HTTP screenshot.
-            autoResumeRef.current?.invalidatePending();
             setStreamFrame(null);
             setState((prev) => (prev ? { ...prev, cdpAvailable: false } : prev));
             setPollEpoch((n) => n + 1);
@@ -916,9 +924,16 @@ export function LiveBrowserStage({
             revokeTakeoverOnLeaseLost("当前由另一标签页独占接管");
             return;
           }
+          if (code === "TAKEOVER_REQUIRED") {
+            if (takeoverActiveRef.current) {
+              revokeTakeoverOnLeaseLost(msg);
+            } else {
+              setBusinessError(msg);
+            }
+            return;
+          }
           if (code === "ORIGIN_MISMATCH" || code === "TARGET_MISMATCH") {
             // Pause takeover immediately and demand explicit user confirmation on the new page/origin.
-            autoResumeRef.current?.invalidatePending();
             takeoverActiveRef.current = false;
             setTakeover(false);
             client.send({ type: "takeover", active: false });
@@ -932,18 +947,24 @@ export function LiveBrowserStage({
               actualHost: actual?.host ?? "当前新页面",
               continuePrompt: handoffContinuePromptRef.current,
               handoffId: activeHandoffIdRef.current,
-              nonce: activeHandoffNonceRef.current,
-              ...(handoffResumeWhenRef.current ? { resumeWhen: handoffResumeWhenRef.current } : {}),
             });
             setOriginMismatchDismissed(false);
             toast("页面来源或标签页已变化，已暂停输入，请核对地址栏后重新确认接管", "info");
             return;
           }
-          setError(msg);
+          if (code === "AGENT_RUNNING" || /助手正在操作浏览器|AGENT_RUNNING/.test(msg)) {
+            setState((prev) => (prev ? { ...prev, agentBusy: true } : prev));
+            setBusinessError(msg);
+            return;
+          }
+          if (retryable === false || isBusinessError(undefined, msg, code)) {
+            setBusinessError(msg);
+          } else {
+            setConnectionError(msg);
+          }
         },
         onFallback: () => {
           if (!mountedRef.current) return;
-          autoResumeRef.current?.invalidatePending();
           setStreamFrame(null);
         },
       },
@@ -957,7 +978,7 @@ export function LiveBrowserStage({
         streamClientRef.current = null;
       }
     };
-  }, [agentId]);
+  }, [agentId, clearConnectionError, setBusinessError, setConnectionError]);
 
   const pollOnce = useCallback(async (): Promise<boolean> => {
     if (!mountedRef.current || actionInFlightRef.current || pollInFlightRef.current) return true;
@@ -981,8 +1002,15 @@ export function LiveBrowserStage({
     } catch (err) {
       if (isAbortError(err) || !mountedRef.current) return true;
       pollErrorStreakRef.current += 1;
+      const msg = errorMessageOf(err);
       setInitialLoading(false);
-      setError((prev) => prev ?? errorMessageOf(err));
+      setErrorState((prev) => prev ?? { message: msg, kind: "connection" });
+      if (stateRef.current === null && pendingHandoffRef.current) {
+        const failedReq = pendingHandoffRef.current;
+        pendingHandoffRef.current = null;
+        reportHandoffPhase(failedReq.handoffId, "error", msg);
+        onHandoffSettledRef.current?.(failedReq.nonce);
+      }
       return false;
     } finally {
       if (pollAbortRef.current === ctrl) {
@@ -990,19 +1018,19 @@ export function LiveBrowserStage({
         pollInFlightRef.current = false;
       }
     }
-  }, [agentId, applyState]);
+  }, [agentId, applyState, reportHandoffPhase]);
 
   const handleRetryConnection = useCallback(() => {
     pollErrorStreakRef.current = 0;
     unavailableStreakRef.current = 0;
-    setError(null);
-    if (state && !state.available) {
+    clearError();
+    if (!state || !state.available) {
       setState(null);
       setInitialLoading(true);
     }
     streamClientRef.current?.retryNow();
     setPollEpoch((n) => n + 1);
-  }, [state]);
+  }, [state, clearError]);
 
   // Adaptive HTTP polling: active whenever WS is NOT connected; automatically pauses when WS is live.
   // Also handles exponential backoff re-check when `available: false` (cold-start recovery).
@@ -1105,12 +1133,12 @@ export function LiveBrowserStage({
       pollAbortRef.current?.abort();
       actionInFlightRef.current = true;
       setBusy(true);
-      setError(null);
+      clearError();
       const mySeq = ++reqSeqRef.current;
       let succeeded = false;
       try {
         const liveOrigin = parseOriginAndHost(stateUrlRef.current)?.origin;
-        const enrichedPayload: LiveBrowserActionPayload =
+        const withOrigin: LiveBrowserActionPayload =
           liveOrigin &&
           (payload.action === "click" ||
             payload.action === "dblclick" ||
@@ -1123,6 +1151,10 @@ export function LiveBrowserStage({
           !payload.expectedOrigin
             ? { ...payload, expectedOrigin: liveOrigin }
             : payload;
+        const activeToken = payload.action !== "takeover" ? httpTakeoverTokenRef.current : null;
+        const enrichedPayload = (
+          activeToken ? { ...withOrigin, takeoverToken: activeToken } : withOrigin
+        ) as LiveBrowserActionPayload;
         const next = await sendLiveBrowserAction(authRef.current, agentId, enrichedPayload);
         succeeded = true;
         applyState(mySeq, next);
@@ -1134,26 +1166,50 @@ export function LiveBrowserStage({
         if (!isAbortError(err) && mountedRef.current) {
           const msg = errorMessageOf(err);
           const isAgentBusyConflict =
-            /助手正在操作浏览器|AGENT_RUNNING/.test(msg) ||
-            ((err as { status?: number })?.status === 409 && !isTakeoverConflictError(err));
-          if (post && isAgentBusyConflict) {
-            pendingHandoffRef.current = {
-              nonce: post.nonce,
-              takeover: post.takeover,
-              expand: post.expand,
-              url: post.url,
-              continuePrompt: post.continuePrompt ?? undefined,
-              handoffId: post.handoffId ?? undefined,
-              ...(post.resumeWhen ? { resumeWhen: post.resumeWhen } : {}),
-            };
-            setHandoffWaiting(true);
+            !isTakeoverRequiredError(err) &&
+            (/助手正在操作浏览器|AGENT_RUNNING/.test(msg) ||
+              ((err as { status?: number })?.status === 409 && !isTakeoverConflictError(err)));
+          if (isAgentBusyConflict) {
             setState((prev) => (prev ? { ...prev, agentBusy: true } : prev));
+            if (post) {
+              pendingHandoffRef.current = {
+                nonce: post.nonce,
+                takeover: post.takeover,
+                expand: post.expand,
+                url: post.url,
+                continuePrompt: post.continuePrompt ?? undefined,
+                handoffId: post.handoffId ?? undefined,
+              };
+              reportHandoffPhase(post.handoffId, "blocked", "助手正在执行浏览器步骤，稍候即可在右侧接管操作。");
+            } else {
+              setBusinessError(msg);
+            }
           } else if (isTakeoverConflictError(err)) {
-            if (post) onHandoffSettledRef.current?.(post.nonce);
+            if (post) {
+              reportHandoffPhase(post.handoffId, "error", "当前由另一标签页独占接管");
+              onHandoffSettledRef.current?.(post.nonce);
+            }
             revokeTakeoverOnLeaseLost("当前由另一标签页独占接管");
+          } else if (isTakeoverRequiredError(err)) {
+            if (post) {
+              reportHandoffPhase(post.handoffId, "error", msg);
+              onHandoffSettledRef.current?.(post.nonce);
+            }
+            if (takeoverActiveRef.current) {
+              revokeTakeoverOnLeaseLost(msg);
+            } else {
+              setBusinessError(msg);
+            }
           } else {
-            if (post) onHandoffSettledRef.current?.(post.nonce);
-            setError(msg);
+            if (post) {
+              reportHandoffPhase(post.handoffId, "error", msg);
+              onHandoffSettledRef.current?.(post.nonce);
+            }
+            if (isBusinessError(err, msg)) {
+              setBusinessError(msg);
+            } else {
+              setConnectionError(msg);
+            }
           }
         }
       } finally {
@@ -1172,14 +1228,23 @@ export function LiveBrowserStage({
         }
       }
     },
-    [agentId, applyState, clearPendingInputBuffers],
+    [
+      agentId,
+      applyState,
+      clearError,
+      clearPendingInputBuffers,
+      reportHandoffPhase,
+      revokeTakeoverOnLeaseLost,
+      setBusinessError,
+      setConnectionError,
+    ],
   );
 
   const enqueueCanvasInput = useCallback(
     (payload: LiveBrowserActionPayload): boolean => {
       if (!takeoverActiveRef.current) return false;
       if (inputQueueRef.current.length >= 12) {
-        setError("操作队列已满，请等待当前操作完成后再试");
+        setBusinessError("操作队列已满，请等待当前操作完成后再试");
         return false;
       }
       inputQueueRef.current.push(payload);
@@ -1189,7 +1254,7 @@ export function LiveBrowserStage({
       }
       return true;
     },
-    [runAction],
+    [runAction, setBusinessError],
   );
 
   const flushKeyBufferToQueue = useCallback(() => {
@@ -1219,7 +1284,7 @@ export function LiveBrowserStage({
     if (lockedByAssistant || busy) return;
     const url = normalizeBrowserUrlInput(launchUrl);
     if (!url) {
-      setError("请输入有效的 http:// 或 https:// 网址");
+      setBusinessError("请输入有效的 http:// 或 https:// 网址");
       return;
     }
     if (streamClientRef.current?.send({ type: "open", url })) return;
@@ -1228,10 +1293,10 @@ export function LiveBrowserStage({
 
   const handleAddressSubmit = (e: FormEvent) => {
     e.preventDefault();
-    if (lockedByAssistant || busy) return;
+    if (lockedByAssistant || busy || !takeoverActiveRef.current) return;
     const url = normalizeBrowserUrlInput(addressDraft);
     if (!url) {
-      setError("仅支持打开 http:// 或 https:// 网址");
+      setBusinessError("仅支持打开 http:// 或 https:// 网址");
       return;
     }
     setAddressEditing(false);
@@ -1241,7 +1306,7 @@ export function LiveBrowserStage({
 
   const handleHistory = useCallback(
     (action: "back" | "forward" | "reload" | "stop") => {
-      if (lockedByAssistant) return;
+      if (lockedByAssistant || !takeoverActiveRef.current) return;
       if (streamClientRef.current?.send({ type: "history", action })) return;
       void runAction({ action });
     },
@@ -1250,7 +1315,7 @@ export function LiveBrowserStage({
 
   const handleTabSelect = useCallback(
     (tab: LiveBrowserTabInfo) => {
-      if (lockedByAssistant) return;
+      if (lockedByAssistant || !takeoverActiveRef.current) return;
       if (
         streamClientRef.current?.send({
           type: "tab",
@@ -1268,7 +1333,7 @@ export function LiveBrowserStage({
 
   const handleTabClose = useCallback(
     (tab: LiveBrowserTabInfo) => {
-      if (lockedByAssistant) return;
+      if (lockedByAssistant || !takeoverActiveRef.current) return;
       if (tab.id) {
         const sent = streamClientRef.current?.send({
           type: "tab",
@@ -1289,91 +1354,56 @@ export function LiveBrowserStage({
   );
 
   const handleTabNew = useCallback(() => {
-    if (lockedByAssistant) return;
+    if (lockedByAssistant || !takeoverActiveRef.current) return;
     if (streamClientRef.current?.send({ type: "tab", action: "new" })) return;
     void runAction({ action: "tab_new" });
   }, [lockedByAssistant, runAction]);
 
   const handleCloseBrowser = useCallback(() => {
+    if (lockedByAssistant || !takeoverActiveRef.current) return;
     userClosingRef.current = true;
-    takeoverActiveRef.current = false;
-    prevTakeoverRef.current = false;
     pendingTakeoverAfterStopRef.current = false;
     clearPendingInputBuffers();
-    setTakeover(false);
-    releaseHttpTakeoverLease(false);
-    setExpanded(false);
-    if (streamClientRef.current?.send({ type: "close_browser" })) return;
-    void runAction({ action: "close" });
-  }, [clearPendingInputBuffers, releaseHttpTakeoverLease, runAction]);
+    const sentViaWs = Boolean(streamClientRef.current?.send({ type: "close_browser" }));
+    if (sentViaWs) {
+      setExpanded(false);
+      return;
+    }
+    // Wait for HTTP close to finish WHILE httpTakeoverTokenRef is still held so backend verifies lease ownership.
+    void runAction({ action: "close" }).finally(() => {
+      if (!mountedRef.current) return;
+      takeoverActiveRef.current = false;
+      prevTakeoverRef.current = false;
+      setTakeover(false);
+      setExpanded(false);
+    });
+  }, [lockedByAssistant, clearPendingInputBuffers, runAction]);
 
   const handleEnterTakeover = useCallback(() => {
     if (lockedByAssistant || originMismatch) return;
     activeHandoffIdRef.current = null;
-    activeHandoffNonceRef.current = null;
     setTakeover(true);
     syncTakeoverToStream(true);
     focusCanvasSoon();
   }, [lockedByAssistant, originMismatch, syncTakeoverToStream, focusCanvasSoon]);
 
   const handlePointerEvent = useCallback(
-    (evt: {
-      action: "move" | "down" | "up" | "click" | "dblclick";
-      x: number;
-      y: number;
-      button?: LiveBrowserMouseButton;
-      clickCount?: number;
-      modifiers?: number;
-    }): boolean => {
+    (evt: { action: "move" | "down" | "up" | "click" | "dblclick"; x: number; y: number; button?: LiveBrowserMouseButton; clickCount?: number; modifiers?: number }): boolean => {
       if (!takeoverActiveRef.current) return false;
-      autoResumeRef.current?.recordUserActivity();
       if (streamClientRef.current?.isConnected()) {
         const fence = getWsInputFence();
-        if (!fence) return false;
-        return streamClientRef.current.send({
-          type: "pointer",
-          action: evt.action,
-          x: evt.x,
-          y: evt.y,
-          button: evt.button,
-          clickCount: evt.clickCount,
-          modifiers: evt.modifiers,
-          ...fence,
-        });
+        return fence ? streamClientRef.current.send({ type: "pointer", ...evt, ...fence }) : false;
       }
-      if (evt.action === "dblclick") {
-        return enqueueCanvasInput({
-          action: "dblclick",
-          x: evt.x,
-          y: evt.y,
-          normalized: true,
-        });
-      }
-      if (evt.action === "click") {
-        return enqueueCanvasInput({
-          action: "click",
-          x: evt.x,
-          y: evt.y,
-          normalized: true,
-          button: evt.button ?? "left",
-        });
-      }
+      if (evt.action === "dblclick") return enqueueCanvasInput({ action: "dblclick", x: evt.x, y: evt.y, normalized: true });
+      if (evt.action === "click") return enqueueCanvasInput({ action: "click", x: evt.x, y: evt.y, normalized: true, button: evt.button ?? "left" });
       return false;
     },
-    [enqueueCanvasInput],
+    [enqueueCanvasInput, getWsInputFence],
   );
 
   const handleDragFallback = useCallback(
     (evt: { fromX: number; fromY: number; toX: number; toY: number }) => {
-      autoResumeRef.current?.recordUserActivity();
-      enqueueCanvasInput({
-        action: "drag",
-        fromX: evt.fromX,
-        fromY: evt.fromY,
-        toX: evt.toX,
-        toY: evt.toY,
-        normalized: true,
-      });
+      enqueueCanvasInput({ action: "drag", ...evt, normalized: true });
     },
     [enqueueCanvasInput],
   );
@@ -1381,95 +1411,60 @@ export function LiveBrowserStage({
   const handleWheelEvent = useCallback(
     (evt: { x?: number; y?: number; deltaX: number; deltaY: number; modifiers?: number }) => {
       if (!takeoverActiveRef.current) return;
-      autoResumeRef.current?.recordUserActivity();
       if (streamClientRef.current?.isConnected()) {
         const fence = getWsInputFence();
-        if (!fence) return;
-        streamClientRef.current.send({
-          type: "wheel",
-          x: evt.x,
-          y: evt.y,
-          deltaX: evt.deltaX,
-          deltaY: evt.deltaY,
-          modifiers: evt.modifiers,
-          ...fence,
-        });
+        if (fence) streamClientRef.current.send({ type: "wheel", ...evt, ...fence });
         return;
       }
-      enqueueCanvasInput({
-        action: "wheel",
-        x: evt.x,
-        y: evt.y,
-        normalized: true,
-        deltaX: evt.deltaX,
-        deltaY: evt.deltaY,
-      });
+      enqueueCanvasInput({ action: "wheel", x: evt.x, y: evt.y, normalized: true, deltaX: evt.deltaX, deltaY: evt.deltaY });
     },
-    [enqueueCanvasInput],
+    [enqueueCanvasInput, getWsInputFence],
   );
 
   const handleKeyEvent = useCallback(
     (evt: { action: "down" | "up" | "press"; key: string; code?: string; modifiers?: number }) => {
       if (!takeoverActiveRef.current) return;
-      autoResumeRef.current?.recordUserActivity();
       if (streamClientRef.current?.isConnected()) {
         const fence = getWsInputFence();
-        if (!fence) return;
-        streamClientRef.current.send({
-          type: "key",
-          action: evt.action,
-          key: evt.key,
-          code: evt.code,
-          modifiers: evt.modifiers,
-          ...fence,
-        });
+        if (fence) streamClientRef.current.send({ type: "key", ...evt, ...fence });
         return;
       }
-      enqueueCanvasInput({
-        action: "press",
-        key: formatPlaywrightKey(evt.key, evt.modifiers),
-      });
+      enqueueCanvasInput({ action: "press", key: formatPlaywrightKey(evt.key, evt.modifiers) });
     },
-    [enqueueCanvasInput],
+    [enqueueCanvasInput, getWsInputFence],
   );
 
   const handleInsertText = useCallback(
     (text: string) => {
       if (!text || !takeoverActiveRef.current) return;
-      autoResumeRef.current?.recordUserActivity();
       if (streamClientRef.current?.isConnected()) {
         const fence = getWsInputFence();
-        if (!fence) return;
-        streamClientRef.current.send({ type: "insert_text", text, ...fence });
+        if (fence) streamClientRef.current.send({ type: "insert_text", text, ...fence });
         return;
       }
       enqueueCanvasInput({ action: "type", text, submit: false });
     },
-    [enqueueCanvasInput],
+    [enqueueCanvasInput, getWsInputFence],
   );
 
   const handlePasteText = useCallback(
     (text: string) => {
       if (!text || !takeoverActiveRef.current) return;
-      autoResumeRef.current?.recordUserActivity();
       if (streamClientRef.current?.isConnected()) {
         const fence = getWsInputFence();
-        if (!fence) return;
-        streamClientRef.current.send({ type: "insert_text", text, ...fence });
+        if (fence) streamClientRef.current.send({ type: "insert_text", text, ...fence });
         return;
       }
       enqueueCanvasInput({ action: "paste", text });
     },
-    [enqueueCanvasInput],
+    [enqueueCanvasInput, getWsInputFence],
   );
 
   const handleStagePrintableKey = useCallback(
     (char: string) => {
-      autoResumeRef.current?.recordUserActivity();
       if (streamClientRef.current?.isConnected()) {
         const fence = getWsInputFence();
-        if (!fence) return;
-        streamClientRef.current.send({ type: "insert_text", text: char, ...fence });
+        if (fence) streamClientRef.current.send({ type: "insert_text", text: char, ...fence });
         return;
       }
       const buf = keyBufferRef.current;
@@ -1480,20 +1475,20 @@ export function LiveBrowserStage({
         flushKeyBufferToQueue();
       }, 160);
     },
-    [flushKeyBufferToQueue],
+    [flushKeyBufferToQueue, getWsInputFence],
   );
 
   const handleRespondDialog = useCallback(
     (accept: boolean, promptText?: string) => {
+      if (lockedByAssistant || !takeoverActiveRef.current) return;
       if (streamClientRef.current?.send({ type: "dialog", accept, promptText })) return;
       void runAction({ action: "dialog", accept, promptText });
     },
-    [runAction],
+    [lockedByAssistant, runAction],
   );
 
   const handleSendText = (submit: boolean) => {
-    if (!typeDraft || busy || lockedByAssistant) return;
-    autoResumeRef.current?.recordUserActivity();
+    if (!typeDraft || busy || lockedByAssistant || !takeoverActiveRef.current) return;
     const text = typeDraft;
     setTypeDraft("");
     if (streamClientRef.current?.isConnected()) {
@@ -1508,132 +1503,131 @@ export function LiveBrowserStage({
     void runAction({ action: "type", text, submit });
   };
 
-  const releaseTakeoverCommon = useCallback(() => {
-    takeoverActiveRef.current = false;
-    prevTakeoverRef.current = false;
-    prevAutoResumeTakeoverRef.current = false;
-    pendingTakeoverAfterStopRef.current = false;
-    autoResumeRef.current?.onTakeoverExited();
-    clearPendingInputBuffers();
-    setTakeover(false);
-    syncTakeoverToStream(false);
-    releaseHttpTakeoverLease(false);
-    setExpanded(false);
-    setOriginMismatch(null);
-    setOriginMismatchDismissed(false);
-  }, [clearPendingInputBuffers, syncTakeoverToStream, releaseHttpTakeoverLease]);
-
-  const handleAutoHandBack = useCallback(
-    (_evt: LiveBrowserHandoffReadyMessage, ctx: AutoResumeBindingContext) => {
-      // B4: Never auto-handback while WS is disconnected / CDP unavailable or context shifted.
-      if (!wsConnectedRef.current || !takeoverActiveRef.current) return;
-      if (
-        ctx.handoffId !== activeHandoffIdRef.current ||
-        ctx.handoffNonce !== activeHandoffNonceRef.current
-      ) {
+  const releaseTakeoverCommon = useCallback(
+    async (strict = false): Promise<void> => {
+      const clearLocal = () => {
+        takeoverActiveRef.current = false;
+        prevTakeoverRef.current = false;
+        pendingTakeoverAfterStopRef.current = false;
+        clearPendingInputBuffers();
+        if (!mountedRef.current) return;
+        setTakeover(false);
+        setExpanded(false);
+        setOriginMismatch(null);
+        setOriginMismatchDismissed(false);
+      };
+      if (!strict) {
+        clearLocal();
+        syncTakeoverToStream(false);
+        await releaseHttpTakeoverLease(false, false);
         return;
       }
+      const waitWsAck =
+        wsConnectedRef.current && stateRef.current?.humanTakeover === true
+          ? new Promise<void>((resolve) => {
+              let done = false;
+              const finish = () => {
+                if (done) return;
+                done = true;
+                window.clearTimeout(timer);
+                wsReleaseWaitersRef.current.delete(finish);
+                resolve();
+              };
+              const timer = window.setTimeout(finish, 1200);
+              wsReleaseWaitersRef.current.add(finish);
+            })
+          : null;
+      syncTakeoverToStream(false);
+      await releaseHttpTakeoverLease(false, true);
+      if (waitWsAck) await waitWsAck;
+      clearLocal();
+    },
+    [clearPendingInputBuffers, syncTakeoverToStream, releaseHttpTakeoverLease],
+  );
+
+  const emitHandback = useCallback(
+    (handoffId: string | null, autoSent: boolean, sessionId = chatSessionIdRef.current ?? null) => {
+      notifyLiveBrowserHandback({ sessionId, handoffId, agentId, autoSent });
+    },
+    [agentId],
+  );
+
+  // Allow chat BrowserHandoffBlock's "我已完成，继续任务" button to release our active takeover
+  // lease BEFORE sending the single continuation message (strictly matching sessionId + handoffId).
+  useEffect(() => {
+    return registerLiveBrowserHandbackHandler(async (req) => {
+      const currentSessionId = chatSessionIdRef.current ?? null;
+      if (req.sessionId !== currentSessionId) return { handled: false };
+      if (!takeoverActiveRef.current && !httpLeaseHeldRef.current && !wsTakeoverRequestedRef.current) {
+        return { handled: false };
+      }
+      if (activeHandoffIdRef.current !== req.handoffId) {
+        toast("当前正在进行另一项浏览器接管，请先从浏览器顶栏完成或退出接管", "info");
+        return { handled: false, blocked: true };
+      }
+      if (handbackInFlightRef.current) return { handled: true };
+      handbackInFlightRef.current = true;
+      try {
+        await releaseTakeoverCommon(true);
+        handoffContinuePromptRef.current = null;
+        activeHandoffIdRef.current = null;
+        const canSend = Boolean(sendUserTextRef.current && !chatBusyRef.current);
+        if (canSend) {
+          sendUserTextRef.current?.(req.continueMessage || SAFE_HANDBACK_CONTINUE_MESSAGE);
+          emitHandback(req.handoffId, true, currentSessionId);
+          toast("已交还控制权并通知助手继续任务", "success");
+        } else {
+          emitHandback(req.handoffId, false, currentSessionId);
+          toast("已交还云端浏览器控制权", "success");
+        }
+        return { handled: true };
+      } catch {
+        toast("交还浏览器控制权失败，请重试", "error");
+        return { handled: false, failed: true };
+      } finally {
+        handbackInFlightRef.current = false;
+      }
+    });
+  }, [emitHandback, releaseTakeoverCommon, toast]);
+
+  const handleHandBackAndContinue = useCallback(async () => {
+    if (handbackInFlightRef.current) return;
+    handbackInFlightRef.current = true;
+    try {
+      await releaseTakeoverCommon(true);
       const customPrompt = handoffContinuePromptRef.current;
       const handoffId = activeHandoffIdRef.current;
-      releaseTakeoverCommon();
       handoffContinuePromptRef.current = null;
-      handoffResumeWhenRef.current = null;
       activeHandoffIdRef.current = null;
-      activeHandoffNonceRef.current = null;
-      // B2: Never interpolate third-party page URL or server-suggested filename into chat text.
-      const safeComposerPrompt = customPrompt || AUTO_RESUME_SAFE_CONTINUE_MESSAGE;
-
+      // Never interpolate untrusted external webpage title or URL (prevents token leakage & prompt injection).
+      const safeContinue = customPrompt || SAFE_HANDBACK_CONTINUE_MESSAGE;
       if (sendUserText && !chatBusy) {
-        sendUserText(AUTO_RESUME_SAFE_CONTINUE_MESSAGE);
-        notifyLiveBrowserHandback({
-          sessionId: chatSessionId ?? null,
-          handoffId,
-          agentId,
-          autoSent: true,
-        });
-        toast("已自动交还控制权并唤醒助手继续任务", "success");
-        return;
+        sendUserText(SAFE_HANDBACK_CONTINUE_MESSAGE);
+        emitHandback(handoffId, true);
+        toast("已交还控制权并通知助手继续任务", "success");
+      } else if (onHandBackToComposer) {
+        onHandBackToComposer(safeContinue);
+        emitHandback(handoffId, false);
+        toast("已交还控制权，并将续跑指令填入输入框", "success");
+      } else {
+        emitHandback(handoffId, false);
+        toast("已交还云端浏览器控制权", "success");
       }
-      if (onHandBackToComposer) {
-        onHandBackToComposer(safeComposerPrompt);
-        notifyLiveBrowserHandback({
-          sessionId: chatSessionId ?? null,
-          handoffId,
-          agentId,
-          autoSent: false,
-        });
-        toast("已自动交还控制权，并将续跑指令填入输入框", "success");
-        return;
-      }
-      notifyLiveBrowserHandback({
-        sessionId: chatSessionId ?? null,
-        handoffId,
-        agentId,
-        autoSent: false,
-      });
-      toast("已自动交还云端浏览器控制权", "success");
-    },
-    [releaseTakeoverCommon, sendUserText, chatBusy, chatSessionId, onHandBackToComposer, agentId, toast],
-  );
-  handleAutoHandBackRef.current = handleAutoHandBack;
-
-  const handleHandBackAndContinue = useCallback(() => {
-    releaseTakeoverCommon();
-    const customPrompt = handoffContinuePromptRef.current;
-    const handoffId = activeHandoffIdRef.current;
-    handoffContinuePromptRef.current = null;
-    handoffResumeWhenRef.current = null;
-    activeHandoffIdRef.current = null;
-    activeHandoffNonceRef.current = null;
-    // Never interpolate untrusted external webpage title or URL (prevents token leakage & prompt injection).
-    const safeContinue = customPrompt || SAFE_HANDBACK_CONTINUE_MESSAGE;
-
-    if (sendUserText && !chatBusy) {
-      sendUserText(SAFE_HANDBACK_CONTINUE_MESSAGE);
-      notifyLiveBrowserHandback({
-        sessionId: chatSessionId ?? null,
-        handoffId,
-        agentId,
-        autoSent: true,
-      });
-      toast("已交还控制权并通知助手继续任务", "success");
-      return;
+    } catch {
+      toast("交还浏览器控制权失败，请重试", "error");
+    } finally {
+      handbackInFlightRef.current = false;
     }
-    if (onHandBackToComposer) {
-      onHandBackToComposer(safeContinue);
-      notifyLiveBrowserHandback({
-        sessionId: chatSessionId ?? null,
-        handoffId,
-        agentId,
-        autoSent: false,
-      });
-      toast("已交还控制权，并将续跑指令填入输入框", "success");
-      return;
-    }
-    notifyLiveBrowserHandback({
-      sessionId: chatSessionId ?? null,
-      handoffId,
-      agentId,
-      autoSent: false,
-    });
-    toast("已交还云端浏览器控制权", "success");
-  }, [releaseTakeoverCommon, sendUserText, chatBusy, chatSessionId, onHandBackToComposer, agentId, toast]);
+  }, [releaseTakeoverCommon, sendUserText, chatBusy, emitHandback, onHandBackToComposer, toast]);
 
   const handleHandBackOnly = useCallback(() => {
-    releaseTakeoverCommon();
+    void releaseTakeoverCommon();
     const handoffId = activeHandoffIdRef.current;
     handoffContinuePromptRef.current = null;
-    handoffResumeWhenRef.current = null;
     activeHandoffIdRef.current = null;
-    activeHandoffNonceRef.current = null;
-    notifyLiveBrowserHandback({
-      sessionId: chatSessionId ?? null,
-      handoffId,
-      agentId,
-      autoSent: false,
-    });
+    emitHandback(handoffId, false);
     toast("已退出人工接管，交还助手控制权", "info");
-  }, [releaseTakeoverCommon, chatSessionId, agentId, toast]);
+  }, [releaseTakeoverCommon, emitHandback, toast]);
 
   const handlePauseAndTakeover = () => {
     if (!effectiveStopTurn) return;
@@ -1683,21 +1677,33 @@ export function LiveBrowserStage({
   const stateActive = state?.active === true;
   const stateAvailable = state?.available !== false;
   const stateUrl = state?.url;
+  const stateReason = state?.reason;
   useEffect(() => {
     const req = pendingHandoffRef.current;
-    if (!req || !stateLoaded) return;
+    if (!req) return;
+    if (!stateLoaded) {
+      if (!initialLoading && error) {
+        pendingHandoffRef.current = null;
+        reportHandoffPhase(req.handoffId, "error", error);
+        onHandoffSettledRef.current?.(req.nonce);
+      }
+      return;
+    }
     if (!stateAvailable) {
       pendingHandoffRef.current = null;
-      setHandoffWaiting(false);
+      reportHandoffPhase(
+        req.handoffId,
+        "error",
+        stateReason && stateReason !== "unavailable" ? stateReason : "当前环境未启用云端浏览器",
+      );
       onHandoffSettledRef.current?.(req.nonce);
       return;
     }
     if (lockedByAssistant || busy || actionInFlightRef.current) {
-      setHandoffWaiting(true);
+      reportHandoffPhase(req.handoffId, "blocked", "助手正在执行浏览器步骤，稍候即可在右侧接管操作。");
       return;
     }
     pendingHandoffRef.current = null;
-    setHandoffWaiting(false);
     if (stateActive) {
       activateHandoffOnActivePage(req, stateUrl, false);
       onHandoffSettledRef.current?.(req.nonce);
@@ -1714,27 +1720,38 @@ export function LiveBrowserStage({
           url: normalized,
           continuePrompt: req.continuePrompt?.trim() || null,
           handoffId: req.handoffId ?? null,
-          ...(req.resumeWhen ? { resumeWhen: req.resumeWhen } : {}),
         };
         void runAction({ action: "open", url: normalized, ifIdle: true });
         return;
       }
+      reportHandoffPhase(req.handoffId, "error", "目标网址格式无效");
+      onHandoffSettledRef.current?.(req.nonce);
+      return;
     }
+    reportHandoffPhase(req.handoffId, "error", "云端浏览器尚未启动，请先在右侧启动浏览器");
     onHandoffSettledRef.current?.(req.nonce);
   }, [
     handoffRequest,
+    initialLoading,
+    error,
     stateLoaded,
     stateActive,
     stateAvailable,
     stateUrl,
+    stateReason,
     lockedByAssistant,
     busy,
     runAction,
     activateHandoffOnActivePage,
+    reportHandoffPhase,
   ]);
 
   if (initialLoading && !state) {
     return <LiveBrowserLoadingView />;
+  }
+
+  if (!state && error) {
+    return <LiveBrowserConnectErrorView error={error} onRetry={handleRetryConnection} />;
   }
 
   if (state && !state.available) {
@@ -1745,7 +1762,7 @@ export function LiveBrowserStage({
     return (
       <LiveBrowserIdleView
         error={error}
-        handoffWaiting={handoffWaiting}
+        errorRetryable={errorRetryable}
         launchUrl={launchUrl}
         busy={busy}
         lockedByAssistant={lockedByAssistant}
@@ -1758,7 +1775,7 @@ export function LiveBrowserStage({
           }
         }}
         onRetry={handleRetryConnection}
-        onDismissError={() => setError(null)}
+        onDismissError={clearError}
       />
     );
   }
@@ -1771,18 +1788,10 @@ export function LiveBrowserStage({
       {error && (
         <LiveBrowserErrorBanner
           error={error}
+          retryable={errorRetryable}
           onRetry={handleRetryConnection}
-          onDismiss={() => setError(null)}
+          onDismiss={clearError}
         />
-      )}
-
-      {handoffWaiting && (
-        <div className="lb-handoff-banner oc-callout oc-callout-info" role="status" data-testid="live-browser-handoff-waiting">
-          <span className="lb-handoff-body">
-            <Spinner size={13} className="shrink-0 text-accent" />
-            <span>助手正在操作浏览器，当前步骤完成后将自动为你开启接管…</span>
-          </span>
-        </div>
       )}
 
       {originMismatch && !originMismatchDismissed && !effectiveTakeover && (
@@ -1815,18 +1824,15 @@ export function LiveBrowserStage({
                   return;
                 }
                 const prompt = originMismatch.continuePrompt;
-                const resumeWhen = originMismatch.resumeWhen ?? null;
                 const nextHandoffId = originMismatch.handoffId ?? null;
-                const nextNonce = originMismatch.nonce ?? null;
                 setOriginMismatch(null);
                 setOriginMismatchDismissed(false);
                 handoffContinuePromptRef.current = prompt;
-                handoffResumeWhenRef.current = resumeWhen;
                 activeHandoffIdRef.current = nextHandoffId;
-                activeHandoffNonceRef.current = nextNonce;
                 setTakeover(true);
                 syncTakeoverToStream(true);
                 focusCanvasSoon();
+                reportHandoffPhase(nextHandoffId, "active");
               }}
             >
               确认接管当前页
@@ -1873,7 +1879,7 @@ export function LiveBrowserStage({
           captureFocused={captureFocused}
           onReleaseCaptureFocus={() => canvasHandleRef.current?.blurCapture()}
           connectionStatus={streamStatus}
-          hasConnectionError={Boolean(error)}
+          hasConnectionError={errorRetryable}
           streamStats={streamStats}
           onHistory={handleHistory}
           onTabSelect={handleTabSelect}
@@ -1888,15 +1894,6 @@ export function LiveBrowserStage({
           onCopyUrl={handleCopyUrl}
           onScreenshot={handleScreenshot}
         />
-
-        {effectiveTakeover && (
-          <LiveBrowserAutoResumeBanner
-            snapshot={autoResumeState}
-            onContinueNow={() => autoResumeRef.current?.triggerNow(false)}
-            onWait={() => autoResumeRef.current?.cancelByUser()}
-            onManualHandBack={handleHandBackAndContinue}
-          />
-        )}
 
         <LiveBrowserCanvas
           canvasHandleRef={canvasHandleRef}

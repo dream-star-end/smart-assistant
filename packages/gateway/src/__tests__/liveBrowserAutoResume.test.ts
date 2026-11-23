@@ -529,8 +529,33 @@ describe('LiveBrowserStreamManager + LiveBrowserAutoResumeWatcher integration & 
       await new Promise((r) => setTimeout(r, 70))
       assert.equal(evalCount, 0)
 
-      // Enter takeover without resumeWhen (backward-compatible generic watcher)
+      // OCV5-873: Plain takeover without explicit resumeWhen must NOT run heuristic DOM polling
+      // or emit handoff_ready — user manually clicks "完成并继续" after finishing.
       ws.send(JSON.stringify({ type: 'takeover', active: true }))
+      await waitForMsg((m) => m.type === 'state' && m.humanTakeover === true)
+      await new Promise((r) => setTimeout(r, 70))
+      assert.equal(evalCount, 0)
+      currentProbe = makeProbe({
+        url: 'https://github.com/my-org/my-repo',
+        title: 'my-org/my-repo',
+      })
+      await new Promise((r) => setTimeout(r, 70))
+      assert.equal(evalCount, 0)
+      assert.equal(msgs.some((m) => m.type === 'handoff_ready'), false)
+
+      // Exit plain takeover and reset to login page
+      ws.send(JSON.stringify({ type: 'takeover', active: false }))
+      await waitForMsg((m) => m.type === 'state' && m.humanTakeover === false)
+      currentProbe = makeProbe({
+        url: 'https://github.com/login',
+        title: 'Sign in',
+        hasVisiblePasswordInput: true,
+        hasLoginForm: true,
+      })
+
+      // Explicit resumeWhen on takeover retains watcher support (handoff_ready + Blocker Veto + clean stop)
+      msgs.length = 0
+      ws.send(JSON.stringify({ type: 'takeover', active: true, resumeWhen: { urlLeave: ['/login'] } }))
       await waitForMsg((m) => m.type === 'state' && m.humanTakeover === true)
       await new Promise((r) => setTimeout(r, 70))
       assert.ok(evalCount >= 1)
@@ -545,7 +570,7 @@ describe('LiveBrowserStreamManager + LiveBrowserAutoResumeWatcher integration & 
       const readyMsg = (await waitForMsg(
         (m) => m.type === 'handoff_ready',
       )) as LiveBrowserHandoffReadyMessage
-      assert.equal(readyMsg.signal, 'login_completed')
+      assert.equal(readyMsg.signal, 'resume_when_matched')
       assert.equal(readyMsg.url, 'https://github.com/my-org/my-repo')
 
       // B3: SPA mounts visible OTP blocker after handoff_ready -> gateway emits handoff_vetoed over WS!

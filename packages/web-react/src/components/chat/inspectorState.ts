@@ -73,12 +73,62 @@ export interface LiveBrowserHandbackEvent {
   ts: number;
 }
 
+/** 会话级云端浏览器人工接管打开阶段（严格按 sessionId + handoffId 隔离，与 handback 共用订阅通道）。 */
+export type LiveBrowserHandoffPhase = "opening" | "active" | "blocked" | "error";
+
+export interface LiveBrowserHandoffPhaseEvent {
+  sessionId: string | null;
+  handoffId: string;
+  phase: LiveBrowserHandoffPhase;
+  reason?: string;
+  ts: number;
+}
+
+const MAX_LIVE_BROWSER_SYNC_ENTRIES = 64;
 const liveBrowserHandbacks = new Map<string, LiveBrowserHandbackEvent>();
+const liveBrowserHandoffPhases = new Map<string, LiveBrowserHandoffPhaseEvent>();
 let liveBrowserHandbackVersion = 0;
 const liveBrowserHandbackListeners = new Set<() => void>();
 
+export interface LiveBrowserHandbackRequest {
+  sessionId: string | null;
+  handoffId: string;
+  continueMessage?: string;
+}
+
+export interface LiveBrowserHandbackResult {
+  handled: boolean;
+  /** True when another active takeover owns the browser so this card must neither release nor auto-send. */
+  blocked?: boolean;
+  /** True when lease release failed so the caller must NOT send continue and should let the user retry. */
+  failed?: boolean;
+}
+
+type LiveBrowserHandbackHandler = (
+  req: LiveBrowserHandbackRequest,
+) => Promise<LiveBrowserHandbackResult> | LiveBrowserHandbackResult;
+
+const liveBrowserHandbackHandlers = new Set<LiveBrowserHandbackHandler>();
+
 function handbackScopeKey(sessionId: string | null | undefined, handoffId: string): string {
   return `${sessionId ?? ""}::${handoffId}`;
+}
+
+function setBoundedMapEntry<V>(map: Map<string, V>, key: string, value: V): void {
+  if (map.has(key)) map.delete(key);
+  map.set(key, value);
+  while (map.size > MAX_LIVE_BROWSER_SYNC_ENTRIES) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+}
+
+function emitLiveBrowserSync(): void {
+  liveBrowserHandbackVersion += 1;
+  for (const listener of liveBrowserHandbackListeners) {
+    listener();
+  }
 }
 
 export function notifyLiveBrowserHandback(
@@ -89,17 +139,62 @@ export function notifyLiveBrowserHandback(
 ): void {
   if (!evt.handoffId) return;
   const sessionId = evt.sessionId ?? null;
-  liveBrowserHandbacks.set(handbackScopeKey(sessionId, evt.handoffId), {
+  const key = handbackScopeKey(sessionId, evt.handoffId);
+  liveBrowserHandoffPhases.delete(key);
+  setBoundedMapEntry(liveBrowserHandbacks, key, {
     sessionId,
     handoffId: evt.handoffId,
     agentId: evt.agentId,
     autoSent: evt.autoSent,
     ts: Date.now(),
   });
-  liveBrowserHandbackVersion += 1;
-  for (const listener of liveBrowserHandbackListeners) {
-    listener();
+  emitLiveBrowserSync();
+}
+
+export function notifyLiveBrowserHandoffPhase(
+  evt: Omit<LiveBrowserHandoffPhaseEvent, "ts" | "sessionId" | "handoffId"> & {
+    sessionId?: string | null;
+    handoffId?: string | null;
+  },
+): void {
+  if (!evt.handoffId) return;
+  const sessionId = evt.sessionId ?? null;
+  setBoundedMapEntry(liveBrowserHandoffPhases, handbackScopeKey(sessionId, evt.handoffId), {
+    sessionId,
+    handoffId: evt.handoffId,
+    phase: evt.phase,
+    reason: evt.reason,
+    ts: Date.now(),
+  });
+  emitLiveBrowserSync();
+}
+
+export function registerLiveBrowserHandbackHandler(
+  handler: LiveBrowserHandbackHandler,
+): () => void {
+  liveBrowserHandbackHandlers.add(handler);
+  return () => {
+    liveBrowserHandbackHandlers.delete(handler);
+  };
+}
+
+export function hasLiveBrowserHandbackHandler(): boolean {
+  return liveBrowserHandbackHandlers.size > 0;
+}
+
+export async function requestLiveBrowserHandback(
+  req: Omit<LiveBrowserHandbackRequest, "sessionId"> & { sessionId?: string | null },
+): Promise<LiveBrowserHandbackResult> {
+  const normalized: LiveBrowserHandbackRequest = {
+    sessionId: req.sessionId ?? null,
+    handoffId: req.handoffId,
+    continueMessage: req.continueMessage,
+  };
+  for (const handler of [...liveBrowserHandbackHandlers]) {
+    const res = await handler(normalized);
+    if (res.handled || res.blocked || res.failed) return res;
   }
+  return { handled: false };
 }
 
 export function subscribeLiveBrowserHandback(listener: () => void): () => void {
@@ -119,6 +214,14 @@ export function getLiveBrowserHandbackFor(
 ): LiveBrowserHandbackEvent | null {
   if (!handoffId) return null;
   return liveBrowserHandbacks.get(handbackScopeKey(sessionId, handoffId)) ?? null;
+}
+
+export function getLiveBrowserHandoffPhaseFor(
+  sessionId: string | null | undefined,
+  handoffId: string | null | undefined,
+): LiveBrowserHandoffPhaseEvent | null {
+  if (!handoffId) return null;
+  return liveBrowserHandoffPhases.get(handbackScopeKey(sessionId, handoffId)) ?? null;
 }
 
 /**
