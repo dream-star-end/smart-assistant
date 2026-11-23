@@ -348,7 +348,7 @@ print(json.dumps({
   });
 
   test("real LibreOffice render check in oc-docx diff catches StarMath ¿/□ and passes once fixed (OCV5-874 #1)", (t) => {
-    const tools = spawnSync("which", ["soffice", "pdftotext", "pandoc"], { encoding: "utf8" });
+    const tools = spawnSync("which", ["soffice", "lowriter", "pdftotext", "pandoc"], { encoding: "utf8" });
     if (tools.status !== 0) {
       t.skip("soffice/pdftotext/pandoc not available");
       return;

@@ -893,7 +893,14 @@ def diff_docx_impl(
     clean_scan = _scan_omml_and_garbled(clean_out)
     hl_scan = _scan_omml_and_garbled(hl_out)
 
-    has_render_tools = bool((shutil.which("libreoffice") or shutil.which("soffice")) and shutil.which("pdftotext"))
+    has_writer = bool(
+        shutil.which("lowriter")
+        or shutil.which("swriter")
+        or Path("/usr/lib/libreoffice/program/libswlo.so").exists()
+    )
+    has_render_tools = bool(
+        (shutil.which("libreoffice") or shutil.which("soffice")) and has_writer and shutil.which("pdftotext")
+    )
     should_render_check = render_check is True or (
         render_check is None and (clean_scan["omml_count"] > 0 or hl_scan["omml_count"] > 0) and has_render_tools
     )

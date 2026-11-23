@@ -392,7 +392,7 @@ describe('oc-docx check', { skip: !pythonDocxAvailable }, () => {
   test('real LibreOffice StarMath render gate catches ¿/□ on bare $|\\Delta\\phi|<\\pi$ and $^\\circ$ and passes after fix (OCV5-874 #1)', async (t) => {
     const hasTools = (() => {
       try {
-        execFileSync('which', ['soffice', 'pdftotext', 'pandoc'], { stdio: 'ignore' })
+        execFileSync('which', ['soffice', 'lowriter', 'pdftotext', 'pandoc'], { stdio: 'ignore' })
         return true
       } catch {
         return false
