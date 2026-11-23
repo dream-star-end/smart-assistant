@@ -510,8 +510,28 @@ describe("grok vision handler", () => {
     assert.equal(h.calls.upstream[0]!.init.headers["x-api-key"], "ms-test-key");
     const sent = JSON.parse(h.calls.upstream[0]!.init.body);
     assert.equal(sent.model, "k3.1-pro");
+    assert.equal(sent.max_tokens, 6144);
+    assert.deepEqual(sent.output_config, { effort: "low" });
     assert.equal(sent.messages[0].content[0].type, "image");
     assert.equal(sent.messages[0].content[0].source.media_type, "image/png");
+
+    // Thinking-only truncated response (no text block) returns 502 and aborts journal without billing
+    const truncatedH = harness({
+      snapshot: flagshipSnapshot,
+      staticProviderKeys: { moonshot: "ms-test-key" },
+      upstream: {
+        statusCode: 200,
+        text: JSON.stringify({
+          content: [{ type: "thinking", thinking: "still analyzing..." }],
+          stop_reason: "max_tokens",
+          usage: { input_tokens: 1500, output_tokens: 6144 },
+        }),
+      },
+    });
+    const truncatedOut = await truncatedH.run();
+    assert.equal(truncatedOut.status, 502);
+    assert.equal(truncatedOut.json.error.code, "GROK_BAD_RESPONSE");
+    assert.deepEqual(truncatedH.events, ["precheck", "journal", "upstream", "abort", "release"]);
 
     // Weak/flash model alone must NOT be selected as silent downgrade
     const weakOnlySnapshot = new ModelCatalogSnapshot({

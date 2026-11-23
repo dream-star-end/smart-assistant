@@ -96,6 +96,10 @@ const UPSTREAM_TIMEOUT_MS = 90_000;
 // Reasoning tokens count against the output cap, so leave room above the
 // 1024-token answer the previous backend allowed.
 const MAX_OUTPUT_TOKENS = 2_048;
+// Thinking-only flagship static vision models (e.g. k3.1-pro) spend output tokens
+// on internal thinking before emitting text blocks; reserve 6144 tokens (still well
+// within PRECHECK_TOKEN_ESTIMATE) and pair with low effort when supported.
+const ANTHROPIC_VISION_MAX_OUTPUT_TOKENS = 6_144;
 // One image is roughly 1.5k input tokens; reserve for the image, the prompt
 // and the full output cap at the output price (estimateMaxCost is output-priced).
 const PRECHECK_TOKEN_ESTIMATE = 8_000;
@@ -355,6 +359,7 @@ export function usageFromAnthropicVisionResponse(json: unknown): GrokVisionUsage
 
 function anthropicVisionBody(input: {
   upstreamModel: string;
+  spec: StaticKeyProviderSpec;
   prompt: string;
   image?: { mediaType: VisionMediaType; data: string };
 }): string {
@@ -370,9 +375,17 @@ function anthropicVisionBody(input: {
     });
   }
   content.push({ type: "text", text: input.prompt });
+  const effortAllowlist =
+    input.spec.modelOutputConfigEfforts?.[input.upstreamModel.toLowerCase()] ??
+    input.spec.allowedOutputConfigEfforts;
+  const outputConfig =
+    effortAllowlist && effortAllowlist.includes("low")
+      ? { output_config: { effort: "low" } }
+      : {};
   return JSON.stringify({
     model: input.upstreamModel,
-    max_tokens: MAX_OUTPUT_TOKENS,
+    max_tokens: ANTHROPIC_VISION_MAX_OUTPUT_TOKENS,
+    ...outputConfig,
     messages: [{ role: "user", content }],
   });
 }
@@ -776,7 +789,12 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
           bodyTimeout: UPSTREAM_TIMEOUT_MS,
           signal: input.signal,
           headers: anthropicVisionHeaders(staticFallback.spec, staticFallback.apiKey),
-          body: anthropicVisionBody({ upstreamModel, prompt: input.prompt, image: input.image }),
+          body: anthropicVisionBody({
+            upstreamModel,
+            spec: staticFallback.spec,
+            prompt: input.prompt,
+            image: input.image,
+          }),
         });
         const rawText = await upstream.body.text();
         if (upstream.statusCode >= 400) {
@@ -794,7 +812,26 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
         }
         input.signal?.throwIfAborted();
         answer = textFromAnthropicVisionResponse(json);
-        if (!answer) throw new GrokRunError(502, "GROK_BAD_RESPONSE", "vision fallback returned no text");
+        if (!answer) {
+          const rec = isObj(json) ? json : null;
+          const contentTypes = Array.isArray(rec?.content)
+            ? rec.content
+                .map((b) => (isObj(b) && typeof b.type === "string" ? b.type : "unknown"))
+                .slice(0, 8)
+            : [];
+          const stopReason = typeof rec?.stop_reason === "string" ? rec.stop_reason : null;
+          const outTokens =
+            isObj(rec?.usage) && typeof rec.usage.output_tokens === "number"
+              ? rec.usage.output_tokens
+              : null;
+          reqLog.warn("grok_vision_fallback_no_text", {
+            model: canonical,
+            stopReason,
+            contentTypes,
+            outputTokens: outTokens,
+          });
+          throw new GrokRunError(502, "GROK_BAD_RESPONSE", "vision fallback returned no text");
+        }
         const metered = usageFromAnthropicVisionResponse(json);
         if (!metered) throw new GrokRunError(502, "GROK_BAD_RESPONSE", "vision fallback returned no usage");
         usage = metered;

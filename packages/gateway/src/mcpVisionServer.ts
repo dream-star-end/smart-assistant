@@ -68,7 +68,10 @@ export const STATIC_VISION_MODEL = 'k3-256k'
  * (e.g. selfhost with grokEnabled=false). Never includes weak/flash/free models.
  */
 export const FLAGSHIP_STATIC_VISION_MODELS = ['k3.1-pro', 'kimi-k3', 'k3-256k'] as const
-const MINIMAX_VISION_MAX_TOKENS = 1024
+// Thinking-only flagship static vision models (e.g. k3.1-pro) count thinking toward
+// max_tokens; give ample headroom alongside low effort (master proxy strips output_config
+// for providers that do not support it).
+const MINIMAX_VISION_MAX_TOKENS = 6_144
 const DEFAULT_MINIMAX_TIMEOUT_MS = 60_000
 // master proxy messages body budget = 8MB(shared.ts);base64 膨胀 ~1.33x → raw cap 5MB → base64 ~6.7MB < 8MB。
 const DEFAULT_MINIMAX_MAX_IMAGE_BYTES = 5 * 1024 * 1024
@@ -813,6 +816,7 @@ async function runMinimaxVision(
     const body = {
       model: modelOverride ?? STATIC_VISION_MODEL,
       max_tokens: MINIMAX_VISION_MAX_TOKENS,
+      output_config: { effort: 'low' },
       messages: [
         {
           role: 'user',

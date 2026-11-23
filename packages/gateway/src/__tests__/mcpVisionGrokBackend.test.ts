@@ -228,7 +228,10 @@ describe('runGrokVision(默认识图后端 = Grok 4.7,经 master)', () => {
               assert.equal(calls[0]!.url, `http://172.30.0.1:18791${GROK_VISION_PATH}`)
               assert.equal(calls[1]!.url, 'http://172.30.0.1:18791/v1/messages')
               assert.equal(calls[1]!.init.headers[LOCAL_CATALOG_HEADER], 'cat-tok')
-              assert.equal(JSON.parse(calls[1]!.init.body as string).model, 'k3.1-pro')
+              const sentBody = JSON.parse(calls[1]!.init.body as string)
+              assert.equal(sentBody.model, 'k3.1-pro')
+              assert.equal(sentBody.max_tokens, 6144)
+              assert.deepEqual(sentBody.output_config, { effort: 'low' })
             },
           ),
       )

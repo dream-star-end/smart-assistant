@@ -416,6 +416,219 @@ print(json.dumps({
       rmSync(work, { recursive: true, force: true });
     }
   });
+
+  test("avoids Chinese word splitting, collapses heavily rewritten clauses without zebra stripes, and aligns inserted paragraphs before equations (OCV5-875)", () => {
+    const work = mkdtempSync(join(tmpdir(), "oc-docx-diff-zh-polish-"));
+    try {
+      const basePath = join(work, "zh-base.docx");
+      const revPath = join(work, "zh-rev.docx");
+      const cleanPath = join(work, "zh-clean.docx");
+      const hlPath = join(work, "zh-hl.docx");
+
+      const makeZhDoc = `
+import sys
+from docx import Document
+from docx.oxml import parse_xml
+
+out_path, mode = sys.argv[1], sys.argv[2]
+doc = Document()
+if mode == "base":
+    doc.add_paragraph("未建模的大气差分路径延迟将直接转化为载波相位残差。本文构建全链路模型，在标准工况下，求得结果。")
+    doc.add_paragraph("电离层属于色散介质，在微波频段其一阶斜路径延迟幅值与工作频率的平方成反比：")
+    p_eq = doc.add_paragraph()
+    p_eq._p.append(parse_xml(
+        '<m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">'
+        '<m:r><m:t>y = 2x</m:t></m:r></m:oMath>'
+    ))
+    doc.add_paragraph("式中，x 为路径残差。后文给出具体结果。")
+else:
+    doc.add_paragraph("未建模的大气差分路径延迟将直接转化为载波相位误差。本文建立全链路模型，在标准工况下，算得结果。")
+    doc.add_paragraph("电离层为色散介质，采用国际单位制常数（斜路径总电子含量单位为电子每平米，载波频率单位为赫兹），其一阶群延迟滞后量与载波相位等效路径超前量大小相等、符号相反：")
+    doc.add_paragraph("新增的过渡说明段落位于公式之前。")
+    p_eq = doc.add_paragraph()
+    p_eq._p.append(parse_xml(
+        '<m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">'
+        '<m:r><m:t>y = 4x</m:t></m:r></m:oMath>'
+    ))
+    doc.add_paragraph("式中，x 为路径残差。后文补充误差预算分析。")
+doc.save(out_path)
+`;
+      for (const [p, mode] of [
+        [basePath, "base"],
+        [revPath, "rev"],
+      ]) {
+        const built = spawnSync("python3", ["-c", makeZhDoc, p, mode], { encoding: "utf8" });
+        assert.equal(built.status, 0, built.stderr);
+      }
+
+      const res = runPy(OC_DOCX, [
+        "diff",
+        "--base",
+        basePath,
+        "--revised",
+        revPath,
+        "--out-clean",
+        cleanPath,
+        "--out-highlighted",
+        hlPath,
+        "--no-render-check",
+      ]);
+      assert.equal(res.status, 0, `${res.stdout}\n${res.stderr}`);
+      const report = JSON.parse(res.stdout);
+      assert.equal(report.passed, true);
+      assert.equal(report.summary.added_paragraphs, 1, "inserted lead-in paragraph must be detected as added");
+      assert.equal(report.summary.changed_omml_nodes, 1, "equation y=2x -> y=4x must stay aligned and diffed");
+
+      // Inspect per-paragraph highlighted segments
+      const inspectPy = `
+import json, sys, zipfile, xml.etree.ElementTree as ET
+W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+with zipfile.ZipFile(sys.argv[1], "r") as z:
+    root = ET.fromstring(z.read("word/document.xml"))
+out = []
+for p in root.findall(f".//{W}body/{W}p"):
+    hl_segs, plain_segs = [], []
+    for r in p.findall(f"{W}r"):
+        t = "".join(x.text or "" for x in r.findall(f"{W}t"))
+        if not t: continue
+        rpr = r.find(f"{W}rPr")
+        is_hl = rpr is not None and rpr.find(f"{W}highlight") is not None
+        (hl_segs if is_hl else plain_segs).append(t)
+    out.append({"hl": hl_segs, "plain": plain_segs})
+print(json.dumps(out, ensure_ascii=False))
+`;
+      const insp = spawnSync("python3", ["-c", inspectPy, hlPath], { encoding: "utf8" });
+      assert.equal(insp.status, 0, insp.stderr);
+      const paras = JSON.parse(insp.stdout) as Array<{ hl: string[]; plain: string[] }>;
+
+      // P0: no split Chinese words ("误差", "建立", "算得" must each be highlighted intact)
+      assert.ok(paras[0]!.hl.includes("误差"), `expected whole word '误差' highlighted, got: ${JSON.stringify(paras[0])}`);
+      assert.ok(paras[0]!.hl.includes("建立"), `expected whole word '建立' highlighted, got: ${JSON.stringify(paras[0])}`);
+      assert.ok(paras[0]!.hl.includes("算得"), `expected whole word '算得' highlighted, got: ${JSON.stringify(paras[0])}`);
+      assert.ok(paras[0]!.plain.some((s) => s.includes("未建模的大气差分路径延迟")), "unchanged text in P0 must remain unhighlighted");
+
+      // P1: heavily rewritten clauses collapse into <= 3 clean yellow blocks (no 10+ zebra fragments, no split 载波频率/相反)
+      assert.ok(paras[1]!.hl.length <= 3, `expected <= 3 clean blocks in rewritten P1, got ${paras[1]!.hl.length}: ${JSON.stringify(paras[1]!.hl)}`);
+      assert.ok(paras[1]!.hl.some((s) => s.includes("载波频率")), `expected intact '载波频率' in P1, got: ${JSON.stringify(paras[1]!.hl)}`);
+      assert.ok(paras[1]!.hl.some((s) => s.includes("相反")), `expected intact '相反' in P1, got: ${JSON.stringify(paras[1]!.hl)}`);
+
+      // P2: newly added lead-in paragraph highlighted completely
+      assert.deepEqual(paras[2]!.plain, []);
+      assert.ok(paras[2]!.hl.join("").includes("新增的过渡说明段落"));
+
+      // P4: aligned with base P3 ("式中，x 为路径残差。" stays unhighlighted!)
+      assert.ok(paras[4]!.plain.some((s) => s.includes("式中，x 为路径残差。")), `expected aligned unchanged prefix in P4, got: ${JSON.stringify(paras[4])}`);
+      assert.ok(paras[4]!.hl.some((s) => s.includes("补充误差预算分析")), `expected changed tail highlighted in P4, got: ${JSON.stringify(paras[4])}`);
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  test("handles clause-splitting comma insert/delete accurately and stays fast on 20 long modified paragraphs (OCV5-875 R1 audit fix)", () => {
+    const work = mkdtempSync(join(tmpdir(), "oc-docx-diff-comma-perf-"));
+    try {
+      // 1. Inserting ONLY one Chinese comma must highlight ONLY that exact comma (between 数据 and 并归档)
+      const insBase = join(work, "ins-base.docx");
+      const insRev = join(work, "ins-rev.docx");
+      const insClean = join(work, "ins-clean.docx");
+      const insHl = join(work, "ins-hl.docx");
+      buildRealDocx(insBase, { paragraphs: ["实验人员记录全部原始数据并归档，等待复核。"] });
+      buildRealDocx(insRev, { paragraphs: ["实验人员记录全部原始数据，并归档，等待复核。"] });
+      const insRes = runPy(OC_DOCX, [
+        "diff", "--base", insBase, "--revised", insRev,
+        "--out-clean", insClean, "--out-highlighted", insHl, "--no-render-check",
+      ]);
+      assert.equal(insRes.status, 0, `${insRes.stdout}\n${insRes.stderr}`);
+      const insRunsPy = `
+import json, sys, zipfile, xml.etree.ElementTree as ET
+W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+with zipfile.ZipFile(sys.argv[1], "r") as z:
+    root = ET.fromstring(z.read("word/document.xml"))
+p = root.findall(f".//{W}body/{W}p")[0]
+segs = []
+for r in p.findall(f"{W}r"):
+    t = "".join(x.text or "" for x in r.findall(f"{W}t"))
+    if not t: continue
+    rpr = r.find(f"{W}rPr")
+    hl = rpr is not None and rpr.find(f"{W}highlight") is not None
+    segs.append([hl, t])
+print(json.dumps(segs, ensure_ascii=False))
+`;
+      const insSegs = JSON.parse(spawnSync("python3", ["-c", insRunsPy, insHl], { encoding: "utf8" }).stdout);
+      assert.deepEqual(insSegs, [
+        [false, "实验人员记录全部原始数据"],
+        [true, "，"],
+        [false, "并归档，等待复核。"],
+      ]);
+
+      // 2. Deleting ONLY one Chinese comma must produce ZERO yellow highlights
+      const delClean = join(work, "del-clean.docx");
+      const delHl = join(work, "del-hl.docx");
+      const delRes = runPy(OC_DOCX, [
+        "diff", "--base", insRev, "--revised", insBase,
+        "--out-clean", delClean, "--out-highlighted", delHl, "--no-render-check",
+      ]);
+      assert.equal(delRes.status, 0, `${delRes.stdout}\n${delRes.stderr}`);
+      const delSegs = JSON.parse(spawnSync("python3", ["-c", insRunsPy, delHl], { encoding: "utf8" }).stdout);
+      assert.deepEqual(delSegs, [[false, "实验人员记录全部原始数据并归档，等待复核。"]]);
+
+      // 2b. Greek / non-ASCII Unicode letters (α) must NOT cause highlight offset drift (OCV5-875 R2 audit fix)
+      const alphaBase1 = join(work, "alpha1-base.docx");
+      const alphaRev1 = join(work, "alpha1-rev.docx");
+      const alphaHl1 = join(work, "alpha1-hl.docx");
+      buildRealDocx(alphaBase1, { paragraphs: ["实验人员记录α组数据并归档，等待复核。"] });
+      buildRealDocx(alphaRev1, { paragraphs: ["实验人员记录α组数据，并归档，等待复核。"] });
+      const alphaRes1 = runPy(OC_DOCX, [
+        "diff", "--base", alphaBase1, "--revised", alphaRev1,
+        "--out-clean", join(work, "alpha1-clean.docx"), "--out-highlighted", alphaHl1, "--no-render-check",
+      ]);
+      assert.equal(alphaRes1.status, 0, `${alphaRes1.stdout}\n${alphaRes1.stderr}`);
+      const alphaSegs1 = JSON.parse(spawnSync("python3", ["-c", insRunsPy, alphaHl1], { encoding: "utf8" }).stdout);
+      assert.deepEqual(alphaSegs1, [
+        [false, "实验人员记录α组数据"],
+        [true, "，"],
+        [false, "并归档，等待复核。"],
+      ]);
+
+      const alphaBase2 = join(work, "alpha2-base.docx");
+      const alphaRev2 = join(work, "alpha2-rev.docx");
+      const alphaHl2 = join(work, "alpha2-hl.docx");
+      buildRealDocx(alphaBase2, { paragraphs: ["α组采集数据，测量电压12伏。"] });
+      buildRealDocx(alphaRev2, { paragraphs: ["α组记录数据，测量电压15伏。"] });
+      const alphaRes2 = runPy(OC_DOCX, [
+        "diff", "--base", alphaBase2, "--revised", alphaRev2,
+        "--out-clean", join(work, "alpha2-clean.docx"), "--out-highlighted", alphaHl2, "--no-render-check",
+      ]);
+      assert.equal(alphaRes2.status, 0, `${alphaRes2.stdout}\n${alphaRes2.stderr}`);
+      const alphaSegs2 = JSON.parse(spawnSync("python3", ["-c", insRunsPy, alphaHl2], { encoding: "utf8" }).stdout);
+      assert.deepEqual(alphaSegs2, [
+        [false, "α组"],
+        [true, "记录"],
+        [false, "数据，测量电压"],
+        [true, "15"],
+        [false, "伏。"],
+      ]);
+
+      // 3. Performance bound: 20 long (~860-char) paragraphs each changing first word stays fast (<5s)
+      const tail = " ".concat("experimental measurement calibration baseline atmospheric delay evaluation ".repeat(12)).trim();
+      const perfBase = join(work, "perf-base.docx");
+      const perfRev = join(work, "perf-rev.docx");
+      buildRealDocx(perfBase, { paragraphs: Array.from({ length: 20 }, (_, i) => `Oldword${i} ${tail}`) });
+      buildRealDocx(perfRev, { paragraphs: Array.from({ length: 20 }, (_, i) => `Newword${i} ${tail}`) });
+      const t0 = Date.now();
+      const perfRes = runPy(OC_DOCX, [
+        "diff", "--base", perfBase, "--revised", perfRev,
+        "--out-clean", join(work, "perf-clean.docx"),
+        "--out-highlighted", join(work, "perf-hl.docx"),
+        "--no-render-check",
+      ]);
+      const elapsedMs = Date.now() - t0;
+      assert.equal(perfRes.status, 0, `${perfRes.stdout}\n${perfRes.stderr}`);
+      assert.ok(elapsedMs < 5_000, `expected 20-paragraph diff to finish <5s, took ${elapsedMs}ms`);
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("oc-stylecheck (OCV5-865)", () => {

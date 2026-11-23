@@ -12,7 +12,16 @@ from typing import Any, Callable
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 M_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 
-_DIFF_TOKEN_RE = re.compile(r"\d+(?:\.\d+)+|[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*|[\u4e00-\u9fff]|\s+|[^\w\s]")
+_DIFF_TOKEN_RE = re.compile(
+    r"\d+(?:\.\d+)+|[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*|[\u4e00-\u9fff\u3400-\u4dbf]|\s+|[^\w\s]|.",
+    re.DOTALL,
+)
+_CLAUSE_OPEN_BRACKETS = set("（([【{「『“‘")
+_CLAUSE_CLOSE_BRACKETS = set("）)]】}」』”’")
+_CLAUSE_ZH_DELIMS = set("。！？；，：")
+_CLAUSE_ASCII_DELIMS = set(";!?")
+_CLAUSE_TRAILING_QUOTES = set("”’」』\"'")
+_ABBREV_BEFORE_DOT = {"fig", "eq", "al", "no", "dr", "vs", "mr", "ms", "prof", "inc", "etc", "ref", "tab", "sec"}
 
 _PPR_AFTER_PBDR = {
     "shd",
@@ -47,7 +56,287 @@ _PPR_AFTER_SHD = _PPR_AFTER_PBDR - {"shd"}
 
 
 def _tokenize_diff(text: str) -> list[str]:
-    return _DIFF_TOKEN_RE.findall(text)
+    return [m.group(0) for m in _DIFF_TOKEN_RE.finditer(text)]
+
+
+def _tokenize_diff_with_offsets(text: str) -> tuple[list[str], list[tuple[int, int]]]:
+    tokens: list[str] = []
+    offsets: list[tuple[int, int]] = []
+    for m in _DIFF_TOKEN_RE.finditer(text):
+        tokens.append(m.group(0))
+        offsets.append((m.start(), m.end()))
+    return tokens, offsets
+
+
+def _is_cjk_char(ch: str) -> bool:
+    return len(ch) == 1 and ("\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf")
+
+
+def _is_punct_or_space(text: str) -> bool:
+    return all((not _is_cjk_char(ch)) and (not ch.isalnum()) for ch in text)
+
+
+def _split_clauses(text: str) -> list[tuple[int, int, str]]:
+    """Split text into clause slices on top-level punctuation without breaking brackets or decimals."""
+    if not text:
+        return []
+    n = len(text)
+    clauses: list[tuple[int, int, str]] = []
+    start = 0
+    depth = 0
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch in _CLAUSE_OPEN_BRACKETS:
+            depth += 1
+            i += 1
+            continue
+        if ch in _CLAUSE_CLOSE_BRACKETS:
+            if depth > 0:
+                depth -= 1
+            i += 1
+            continue
+        is_delim = False
+        if depth == 0:
+            if ch in _CLAUSE_ZH_DELIMS or ch in _CLAUSE_ASCII_DELIMS:
+                is_delim = True
+            elif ch == ".":
+                prev_ch = text[i - 1] if i > 0 else ""
+                next_ch = text[i + 1] if i + 1 < n else ""
+                if (next_ch == "" or next_ch.isspace()) and not prev_ch.isdigit():
+                    m_word = re.search(r"([A-Za-z]+)$", text[start:i])
+                    if not (m_word and m_word.group(1).lower() in _ABBREV_BEFORE_DOT):
+                        is_delim = True
+        if is_delim:
+            end = i + 1
+            while end < n and text[end] in _CLAUSE_TRAILING_QUOTES:
+                end += 1
+            while end < n and text[end] == " ":
+                end += 1
+            clauses.append((start, end, text[start:end]))
+            start = end
+            i = end
+            continue
+        i += 1
+    if start < n:
+        clauses.append((start, n, text[start:n]))
+    return clauses
+
+
+def _shingle_set(text: str, max_chars: int = 512) -> set[str]:
+    sample = text[:max_chars]
+    if len(sample) < 2:
+        return {sample} if sample else set()
+    return {sample[i : i + 2] for i in range(len(sample) - 1)}
+
+
+def _pair_similar_items(
+    base_items: list[str],
+    rev_items: list[str],
+    *,
+    min_ratio: float = 0.22,
+    incompatible_fn: Callable[[int, int], bool] | None = None,
+) -> list[tuple[int, int]]:
+    """Monotonic similarity-maximizing pairing between base_items and rev_items with bounded work."""
+    m = len(base_items)
+    n = len(rev_items)
+    if m == 0 or n == 0:
+        return []
+    if m == 1 and n == 1:
+        if incompatible_fn is not None and incompatible_fn(0, 0):
+            return []
+        return [(0, 0)]
+    total_chars = sum(min(len(s), 512) for s in base_items) + sum(min(len(s), 512) for s in rev_items)
+    avg_chars = total_chars / max(m + n, 1)
+    if m * n > 400 or (m * n * avg_chars) > 250_000:
+        pair_count = min(m, n)
+        return [
+            (k, k)
+            for k in range(pair_count)
+            if incompatible_fn is None or not incompatible_fn(k, k)
+        ]
+
+    base_shingles = [_shingle_set(s) for s in base_items]
+    rev_shingles = [_shingle_set(s) for s in rev_items]
+    scores = [[0.0] * n for _ in range(m)]
+    for i in range(m):
+        sa = base_shingles[i]
+        la = len(sa)
+        for j in range(n):
+            if incompatible_fn is not None and incompatible_fn(i, j):
+                continue
+            sb = rev_shingles[j]
+            lb = len(sb)
+            if la == 0 and lb == 0:
+                sim = 1.0
+            elif la == 0 or lb == 0:
+                sim = 0.0
+            else:
+                denom = la + lb
+                if (2 * min(la, lb)) / denom < min_ratio:
+                    sim = 0.0
+                else:
+                    sim = (2 * len(sa & sb)) / denom
+            if sim >= min_ratio:
+                scores[i][j] = sim
+
+    dp = [[0.0] * (n + 1) for _ in range(m + 1)]
+    choice = [[0] * (n + 1) for _ in range(m + 1)]  # 1=skip base, 2=skip rev, 3=pair
+    for i in range(m - 1, -1, -1):
+        for j in range(n - 1, -1, -1):
+            best = dp[i + 1][j]
+            act = 1
+            if dp[i][j + 1] > best:
+                best = dp[i][j + 1]
+                act = 2
+            if scores[i][j] > 0.0:
+                cand = scores[i][j] + dp[i + 1][j + 1]
+                if cand > best + 1e-9:
+                    best = cand
+                    act = 3
+            dp[i][j] = best
+            choice[i][j] = act
+
+    pairs: list[tuple[int, int]] = []
+    i = 0
+    j = 0
+    while i < m and j < n:
+        act = choice[i][j]
+        if act == 3:
+            pairs.append((i, j))
+            i += 1
+            j += 1
+        elif act == 2:
+            j += 1
+        else:
+            i += 1
+    return pairs
+
+
+def _promote_clause_ranges(clause_text: str, ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Rule C: Promote fragmented high-density rewrites inside a single clause to one clean block."""
+    if len(ranges) <= 1:
+        return ranges
+    span_start = ranges[0][0]
+    span_end = ranges[-1][1]
+    active_text = clause_text[span_start:span_end]
+    if "\t" in active_text or "\n" in active_text:
+        return ranges
+    active_nonspace = sum(1 for ch in active_text if not ch.isspace())
+    hl_nonspace = sum(
+        sum(1 for ch in clause_text[a:b] if not ch.isspace())
+        for a, b in ranges
+    )
+    ratio = (hl_nonspace / active_nonspace) if active_nonspace > 0 else 0.0
+    has_cjk = any(_is_cjk_char(ch) for ch in active_text)
+    if ratio >= 0.55 or (has_cjk and len(ranges) >= 3 and ratio >= 0.40):
+        prefix = clause_text[:span_start]
+        if (
+            has_cjk
+            and prefix
+            and "\t" not in prefix
+            and "\n" not in prefix
+            and sum(1 for ch in prefix if not ch.isspace()) <= 2
+            and any(_is_cjk_char(ch) for ch in prefix)
+        ):
+            span_start = 0
+        return [(span_start, span_end)]
+    return ranges
+
+
+def _token_diff_ranges(base_span: str, rev_span: str) -> list[tuple[int, int]]:
+    """Token-level diff with Rule A (short-island bridge) and Rule B (CJK 2-char word completion)."""
+    if not rev_span or base_span == rev_span:
+        return []
+    if not base_span:
+        return [(0, len(rev_span))]
+
+    base_tokens = _tokenize_diff(base_span)
+    rev_tokens, offsets = _tokenize_diff_with_offsets(rev_span)
+    matcher = difflib.SequenceMatcher(None, base_tokens, rev_tokens, autojunk=False)
+    opcodes = matcher.get_opcodes()
+
+    changed_rev = [False] * len(rev_tokens)
+    for tag, _i1, _i2, j1, j2 in opcodes:
+        if tag in {"replace", "insert"}:
+            for j in range(j1, j2):
+                changed_rev[j] = True
+
+    # Rule A: Bridge tiny sandwiched equal islands (whitespace/punct or <=2 CJK chars)
+    # between two edits (including delete+equal+insert like 构建 -> 建立 or 反比 -> 相反).
+    for idx, (tag, _i1, _i2, j1, j2) in enumerate(opcodes):
+        if tag != "equal" or j1 >= j2:
+            continue
+        if idx == 0 or idx == len(opcodes) - 1:
+            continue
+        prev_tag = opcodes[idx - 1][0]
+        next_tag = opcodes[idx + 1][0]
+        if prev_tag == "equal" or next_tag == "equal":
+            continue
+        if prev_tag == "delete" and next_tag == "delete":
+            continue
+        eq_text = "".join(rev_tokens[j1:j2])
+        if "\t" in eq_text or "\n" in eq_text:
+            continue
+        eq_stripped = eq_text.strip()
+        is_tiny_sep = (
+            prev_tag in {"replace", "insert"}
+            and next_tag in {"replace", "insert"}
+            and len(eq_text) <= 3
+            and (not eq_stripped or _is_punct_or_space(eq_text))
+        )
+        is_short_cjk_island = (
+            any(_is_cjk_char(ch) for ch in eq_text)
+            and len(eq_stripped) <= 2
+            and len(eq_text) <= 4
+        )
+        if is_tiny_sep or is_short_cjk_island:
+            for j in range(j1, j2):
+                changed_rev[j] = True
+
+    # Rule B: Avoid splitting 2-char Chinese words on 1-char CJK replacements
+    # (e.g. 残差 -> [误差], 求得结果 -> [算得]结果, 定位 -> [定向], 延迟 -> [延时]).
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag != "replace" or j2 - j1 != 1 or i2 <= i1:
+            continue
+        if not _is_cjk_char(rev_tokens[j1]):
+            continue
+        if not all(_is_cjk_char(tok) for tok in base_tokens[i1:i2]):
+            continue
+        at_cjk_start = j1 == 0 or not _is_cjk_char(rev_tokens[j1 - 1])
+        at_cjk_end = j2 == len(rev_tokens) or not _is_cjk_char(rev_tokens[j2])
+        if j2 < len(rev_tokens) and not changed_rev[j2] and _is_cjk_char(rev_tokens[j2]):
+            right_is_lone = (
+                j2 + 1 == len(rev_tokens)
+                or changed_rev[j2 + 1]
+                or not _is_cjk_char(rev_tokens[j2 + 1])
+            )
+            if right_is_lone or at_cjk_start:
+                changed_rev[j2] = True
+                continue
+        if j1 > 0 and not changed_rev[j1 - 1] and _is_cjk_char(rev_tokens[j1 - 1]):
+            left_is_lone = (
+                j1 - 1 == 0
+                or changed_rev[j1 - 2]
+                or not _is_cjk_char(rev_tokens[j1 - 2])
+            )
+            if left_is_lone or at_cjk_end:
+                changed_rev[j1 - 1] = True
+
+    ranges: list[tuple[int, int]] = []
+    for idx, is_changed in enumerate(changed_rev):
+        if not is_changed:
+            continue
+        start, end = offsets[idx]
+        if ranges and start <= ranges[-1][1]:
+            ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
+        else:
+            ranges.append((start, end))
+    return ranges
+
+
+def _changed_ranges_in_clause(base_clause: str, rev_clause: str) -> list[tuple[int, int]]:
+    return _promote_clause_ranges(rev_clause, _token_diff_ranges(base_clause, rev_clause))
 
 
 def _changed_char_ranges(base_text: str, revised_text: str) -> list[tuple[int, int]]:
@@ -55,25 +344,63 @@ def _changed_char_ranges(base_text: str, revised_text: str) -> list[tuple[int, i
         return []
     if not base_text:
         return [(0, len(revised_text))]
-    base_tokens = _tokenize_diff(base_text)
-    rev_tokens = _tokenize_diff(revised_text)
-    matcher = difflib.SequenceMatcher(None, base_tokens, rev_tokens, autojunk=False)
-    offsets: list[tuple[int, int]] = []
-    pos = 0
-    for tok in rev_tokens:
-        end = pos + len(tok)
-        offsets.append((pos, end))
-        pos = end
-    ranges: list[tuple[int, int]] = []
-    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
-        if tag in {"replace", "insert"} and j1 < j2:
-            start = offsets[j1][0]
-            end = offsets[j2 - 1][1]
-            if ranges and start <= ranges[-1][1]:
-                ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
-            else:
-                ranges.append((start, end))
-    return ranges
+    if base_text == revised_text:
+        return []
+
+    base_clauses = _split_clauses(base_text)
+    rev_clauses = _split_clauses(revised_text)
+    if len(base_clauses) <= 1 and len(rev_clauses) <= 1:
+        return _changed_ranges_in_clause(base_text, revised_text)
+
+    base_clause_texts = [c[2] for c in base_clauses]
+    rev_clause_texts = [c[2] for c in rev_clauses]
+    matcher = difflib.SequenceMatcher(None, base_clause_texts, rev_clause_texts, autojunk=False)
+    raw_ranges: list[tuple[int, int]] = []
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        elif tag == "insert":
+            for rj in range(j1, j2):
+                c_start, c_end, _ = rev_clauses[rj]
+                if c_start < c_end:
+                    raw_ranges.append((c_start, c_end))
+        elif tag == "replace":
+            # Diff the contiguous joined span so clause split/merge (e.g. inserting or
+            # deleting a single comma) never drops the real edit or falsely highlights
+            # unchanged text, then apply Rule C per revised clause.
+            joined_base = "".join(base_clause_texts[i1:i2])
+            block_rev_start = rev_clauses[j1][0]
+            joined_rev = "".join(rev_clause_texts[j1:j2])
+            span_ranges = _token_diff_ranges(joined_base, joined_rev)
+            if not span_ranges:
+                continue
+            for rj in range(j1, j2):
+                c_start, c_end, c_text = rev_clauses[rj]
+                rel_start = c_start - block_rev_start
+                rel_end = c_end - block_rev_start
+                cl_ranges: list[tuple[int, int]] = []
+                for a, b in span_ranges:
+                    if b <= rel_start or a >= rel_end:
+                        continue
+                    cl_ranges.append((max(a, rel_start) - rel_start, min(b, rel_end) - rel_start))
+                for a, b in _promote_clause_ranges(c_text, cl_ranges):
+                    raw_ranges.append((c_start + a, c_start + b))
+
+    if not raw_ranges:
+        return []
+    raw_ranges.sort()
+    merged: list[tuple[int, int]] = [raw_ranges[0]]
+    for start, end in raw_ranges[1:]:
+        prev_start, prev_end = merged[-1]
+        gap = revised_text[prev_end:start]
+        if start <= prev_end or (
+            len(gap) <= 2 and "\t" not in gap and "\n" not in gap and _is_punct_or_space(gap)
+        ):
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def _set_run_yellow_highlight(run_el: Any, OxmlElement: Any, qn: Any) -> None:
@@ -459,56 +786,81 @@ def diff_docx_impl(
                     }
                 )
         elif tag == "replace":
-            pair_count = min(i2 - i1, j2 - j1)
-            for k in range(pair_count):
-                base_p = base_doc.paragraphs[i1 + k]
-                rev_p = rev_doc.paragraphs[j1 + k]
-                bt = base_texts[i1 + k]
-                rt = rev_texts[j1 + k]
-                modified += 1
-                ranges = _changed_char_ranges(bt, rt) if bt != rt else []
-                highlighted_runs += _highlight_paragraph_ranges(rev_p, ranges, OxmlElement, qn)
-                omml_changed, omml_hl = _diff_paragraph_omml(base_p, rev_p, OxmlElement, qn)
-                changed_omml_nodes += omml_changed
-                highlighted_runs += omml_hl
-                changes.append(
-                    {
-                        "index": j1 + k,
-                        "kind": "modified",
-                        "base_text": _paragraph_display_text(base_p, qn),
-                        "revised_text": _paragraph_display_text(rev_p, qn),
-                        "omml_changed": omml_changed > 0,
-                    }
-                )
-            for rj in range(j1 + pair_count, j2):
-                added += 1
+            sub_base_indices = list(range(i1, i2))
+            sub_rev_indices = list(range(j1, j2))
+            sub_base_disp = [_paragraph_display_text(base_doc.paragraphs[bi], qn) for bi in sub_base_indices]
+            sub_rev_disp = [_paragraph_display_text(rev_doc.paragraphs[rj], qn) for rj in sub_rev_indices]
+
+            def _para_incompatible(rel_i: int, rel_j: int) -> bool:
+                bi = sub_base_indices[rel_i]
+                rj = sub_rev_indices[rel_j]
+                b_pure_omml = (not base_texts[bi].strip()) and bool(_omml_nodes(base_doc.paragraphs[bi]))
+                r_pure_omml = (not rev_texts[rj].strip()) and bool(_omml_nodes(rev_doc.paragraphs[rj]))
+                b_pure_text = bool(base_texts[bi].strip()) and not bool(_omml_nodes(base_doc.paragraphs[bi]))
+                r_pure_text = bool(rev_texts[rj].strip()) and not bool(_omml_nodes(rev_doc.paragraphs[rj]))
+                return (b_pure_omml and r_pure_text) or (b_pure_text and r_pure_omml)
+
+            pairs = _pair_similar_items(
+                sub_base_disp,
+                sub_rev_disp,
+                min_ratio=0.22,
+                incompatible_fn=_para_incompatible,
+            )
+            paired_base = {rel_i for rel_i, _ in pairs}
+            paired_rev = {rel_j: rel_i for rel_i, rel_j in pairs}
+
+            for rel_i, bi in enumerate(sub_base_indices):
+                if rel_i not in paired_base:
+                    deleted += 1
+                    changes.append(
+                        {
+                            "index": bi,
+                            "kind": "deleted",
+                            "base_text": _paragraph_display_text(base_doc.paragraphs[bi], qn),
+                            "revised_text": "",
+                            "omml_changed": bool(_omml_nodes(base_doc.paragraphs[bi])),
+                        }
+                    )
+
+            for rel_j, rj in enumerate(sub_rev_indices):
+                rev_p = rev_doc.paragraphs[rj]
                 rt = rev_texts[rj]
-                highlighted_runs += _highlight_paragraph_ranges(
-                    rev_doc.paragraphs[rj], [(0, len(rt))] if rt else [], OxmlElement, qn
-                )
-                omml_changed, omml_hl = _diff_paragraph_omml(None, rev_doc.paragraphs[rj], OxmlElement, qn)
-                changed_omml_nodes += omml_changed
-                highlighted_runs += omml_hl
-                changes.append(
-                    {
-                        "index": rj,
-                        "kind": "added",
-                        "base_text": "",
-                        "revised_text": _paragraph_display_text(rev_doc.paragraphs[rj], qn),
-                        "omml_changed": omml_changed > 0,
-                    }
-                )
-            for bi in range(i1 + pair_count, i2):
-                deleted += 1
-                changes.append(
-                    {
-                        "index": bi,
-                        "kind": "deleted",
-                        "base_text": _paragraph_display_text(base_doc.paragraphs[bi], qn),
-                        "revised_text": "",
-                        "omml_changed": bool(_omml_nodes(base_doc.paragraphs[bi])),
-                    }
-                )
+                if rel_j in paired_rev:
+                    bi = sub_base_indices[paired_rev[rel_j]]
+                    base_p = base_doc.paragraphs[bi]
+                    bt = base_texts[bi]
+                    modified += 1
+                    ranges = _changed_char_ranges(bt, rt) if bt != rt else []
+                    highlighted_runs += _highlight_paragraph_ranges(rev_p, ranges, OxmlElement, qn)
+                    omml_changed, omml_hl = _diff_paragraph_omml(base_p, rev_p, OxmlElement, qn)
+                    changed_omml_nodes += omml_changed
+                    highlighted_runs += omml_hl
+                    changes.append(
+                        {
+                            "index": rj,
+                            "kind": "modified",
+                            "base_text": _paragraph_display_text(base_p, qn),
+                            "revised_text": _paragraph_display_text(rev_p, qn),
+                            "omml_changed": omml_changed > 0,
+                        }
+                    )
+                else:
+                    added += 1
+                    highlighted_runs += _highlight_paragraph_ranges(
+                        rev_p, [(0, len(rt))] if rt else [], OxmlElement, qn
+                    )
+                    omml_changed, omml_hl = _diff_paragraph_omml(None, rev_p, OxmlElement, qn)
+                    changed_omml_nodes += omml_changed
+                    highlighted_runs += omml_hl
+                    changes.append(
+                        {
+                            "index": rj,
+                            "kind": "added",
+                            "base_text": "",
+                            "revised_text": _paragraph_display_text(rev_p, qn),
+                            "omml_changed": omml_changed > 0,
+                        }
+                    )
 
     changed_tables = 0
     for t_idx, rev_table in enumerate(rev_doc.tables):
