@@ -169,7 +169,7 @@ export function ProviderCard({
     }
   };
 
-  const row = "flex items-center gap-2 text-[12.5px]";
+  const row = "flex items-center gap-2 text-meta";
   const rowLabel = "w-16 shrink-0 text-faint";
   const isHealthy = provider.keyConfigured && provider.health.effective !== "degraded";
 

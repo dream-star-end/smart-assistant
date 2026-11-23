@@ -10,6 +10,7 @@ import { downloadPercent } from '../lib/chat/download'
 import { getCachedThumbnail } from '../lib/chat/imageBytes'
 import { cn } from '../lib/utils'
 import { normalizeImageSourceForGateway } from './ImageAnnotationEditor'
+import { Alert } from './ui'
 import {
   canvasToPngFile,
   drawDisplayCanvas,
@@ -232,9 +233,9 @@ export function ImageResizeMode({
       {/* 底部弹出:五比例菜单 */}
       <div className="shrink-0 px-3 pb-[max(1rem,env(safe-area-inset-bottom))] pt-2">
         {error && (
-          <p role="alert" className="mx-auto mb-2 max-w-2xl rounded-lg bg-danger/25 px-3 py-1.5 text-center text-sm text-white">
+          <Alert density="compact" tone="danger" className="mx-auto mb-2 w-full max-w-2xl justify-center text-center">
             {error}
-          </p>
+          </Alert>
         )}
         {!canSubmit && (
           <p className="mb-2 text-center text-xs text-white/60">当前模型不支持调整大小</p>

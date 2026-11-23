@@ -10,7 +10,7 @@ import {
   Share2,
   Users,
 } from "lucide-react";
-import { useState } from "react";
+import { memo, useState } from "react";
 import type { SubscriptionSummary } from "../hooks/useSubscriptionSummary";
 import type { Agent } from "../lib/agents";
 import type { PreferenceEffort } from "../lib/modelPreferences";
@@ -85,56 +85,7 @@ function buildSubscriptionEntryMeta(summary?: SubscriptionSummary | null): {
   };
 }
 
-export function ChatHeader({
-  agent,
-  onAgentClick,
-  models,
-  lockedModels,
-  selectedModelId,
-  onSelectModel,
-  onLockedSelect,
-  modelsLoading,
-  onCancelModelSwitch,
-  effortSupported,
-  effortActive,
-  onSelectEffort,
-  contextTier,
-  onSelectContextTier,
-  serviceTier,
-  onSelectServiceTier,
-  swarmSupported,
-  swarmMode,
-  swarmRunning,
-  onSelectSwarmMode,
-  modelPickerOpen,
-  onModelPickerOpenChange,
-  teamModeActive,
-  teamLeaderModelId,
-  onDisableTeamMode,
-  advisorModeActive,
-  advisorModelLabel,
-  onDisableAdvisorMode,
-  sidebarCollapsed,
-  onExpandSidebar,
-  onOpenMobileNav,
-  onOpenSubscription,
-  subscriptionSummary,
-  onOpenFind,
-  onShare,
-  onToggleQuickAsk,
-  quickAskOpen = false,
-  quickAskSending = false,
-  onTogglePane,
-  paneOpen = false,
-  sessionUnreadCount,
-  projectBreadcrumb,
-  projectSuggestion,
-  onOpenProjectScope,
-  sessionTitle,
-  running = false,
-  updateAvailable = false,
-  onReloadForUpdate,
-}: {
+export type ChatHeaderProps = {
   agent: Agent;
   onAgentClick: () => void;
   /** 对话模型列表（GET /api/public/models 驱动；省略则不渲染选择器）。 */
@@ -225,7 +176,58 @@ export function ChatHeader({
   /** @deprecated 顶栏不再渲染常驻新版本通栏，保留可选类型兼容旧调用方。 */
   updateAvailable?: boolean;
   onReloadForUpdate?: () => void;
-}) {
+};
+
+export const ChatHeader = memo(function ChatHeader({
+  agent,
+  onAgentClick,
+  models,
+  lockedModels,
+  selectedModelId,
+  onSelectModel,
+  onLockedSelect,
+  modelsLoading,
+  onCancelModelSwitch,
+  effortSupported,
+  effortActive,
+  onSelectEffort,
+  contextTier,
+  onSelectContextTier,
+  serviceTier,
+  onSelectServiceTier,
+  swarmSupported,
+  swarmMode,
+  swarmRunning,
+  onSelectSwarmMode,
+  modelPickerOpen,
+  onModelPickerOpenChange,
+  teamModeActive,
+  teamLeaderModelId,
+  onDisableTeamMode,
+  advisorModeActive,
+  advisorModelLabel,
+  onDisableAdvisorMode,
+  sidebarCollapsed,
+  onExpandSidebar,
+  onOpenMobileNav,
+  onOpenSubscription,
+  subscriptionSummary,
+  onOpenFind,
+  onShare,
+  onToggleQuickAsk,
+  quickAskOpen = false,
+  quickAskSending = false,
+  onTogglePane,
+  paneOpen = false,
+  sessionUnreadCount,
+  projectBreadcrumb,
+  projectSuggestion,
+  onOpenProjectScope,
+  sessionTitle,
+  running = false,
+  updateAvailable = false,
+  onReloadForUpdate,
+}: ChatHeaderProps) {
   void projectSuggestion;
   void running;
   const trimmedSessionTitle = typeof sessionTitle === "string" ? sessionTitle.trim() : "";
@@ -591,4 +593,4 @@ export function ChatHeader({
       </div>
     </WorkspaceShellHeader>
   );
-}
+});

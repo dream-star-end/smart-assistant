@@ -864,7 +864,7 @@ export function InspectorPanelContent({
           (!sheet || fullscreen) && "header-safe-t",
         )}
       >
-        <h2 id={headingId} className="sr-only">
+        <h2 id={headingId} className="sr-only text-ellipsis">
           工作台
         </h2>
         <div className="min-w-0 flex-1">
@@ -1149,7 +1149,7 @@ export function InspectorPanel({
             data-testid="pane-fullscreen-dialog"
             className="oc-surface-popover fixed left-1/2 top-1/2 z-[var(--z-viewer)] flex h-[92dvh] w-[min(94vw,90rem)] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl outline-none"
           >
-            <RD.Title className="sr-only">工作台全屏影院阅读</RD.Title>
+            <RD.Title className="sr-only text-ellipsis">工作台全屏影院阅读</RD.Title>
             {fullscreen ? (
               <InspectorPanelContent
                 {...content}

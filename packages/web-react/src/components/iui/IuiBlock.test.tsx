@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { __resetIntelligentUiForTests, applyIntelligentUiSnapshot, setIntelligentUiPref } from "../../lib/intelligentUi";
 import { exportSessionMarkdown } from "../../lib/chat/exportMarkdown";
@@ -329,13 +329,13 @@ describe("streaming", () => {
 describe("switch on/off through the Markdown renderer", () => {
   const doc = ["对比如下:", "", "```ui", j({ type: "table", columns: ["型号", "价格"], rows: [["A", 100]] }), "```", "", "以上。"].join("\n");
 
-  it("on: renders the native component", () => {
+  it("on: renders the native component", async () => {
     const { container } = render(<MarkdownImpl>{doc}</MarkdownImpl>);
-    expect(container.querySelector('figure[data-iui="table"]')).toBeTruthy();
+    await waitFor(() => expect(container.querySelector('figure[data-iui="table"]')).toBeTruthy());
     expect(container.textContent).not.toContain('"type"');
   });
 
-  it("off: renders plain Markdown (a GFM table), never raw JSON, and switches back instantly", () => {
+  it("off: renders plain Markdown (a GFM table), never raw JSON, and switches back instantly", async () => {
     setIntelligentUiPref(false);
     const { container } = render(<MarkdownImpl>{doc}</MarkdownImpl>);
     expect(container.querySelector("figure[data-iui]")).toBeNull();
@@ -343,7 +343,7 @@ describe("switch on/off through the Markdown renderer", () => {
     expect(container.textContent).toContain("型号");
     expect(container.textContent).not.toContain('"type"');
     act(() => setIntelligentUiPref(true));
-    expect(container.querySelector('figure[data-iui="table"]')).toBeTruthy();
+    await waitFor(() => expect(container.querySelector('figure[data-iui="table"]')).toBeTruthy());
   });
 
   it("server kill switch acts as off even when the user preference is on", () => {
@@ -352,10 +352,10 @@ describe("switch on/off through the Markdown renderer", () => {
     expect(container.querySelector("figure[data-iui]")).toBeNull();
   });
 
-  it("missing preference and old servers default to on", () => {
+  it("missing preference and old servers default to on", async () => {
     applyIntelligentUiSnapshot({ prefs: {} });
     const { container } = render(<MarkdownImpl>{doc}</MarkdownImpl>);
-    expect(container.querySelector('figure[data-iui="table"]')).toBeTruthy();
+    await waitFor(() => expect(container.querySelector('figure[data-iui="table"]')).toBeTruthy());
   });
 
   it("export writes the Markdown version of components", async () => {

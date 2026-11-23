@@ -13,11 +13,7 @@ import type {
   AgentCancelResult,
   AgentOpenResult,
   AgentStatus,
-  ApiKeyPatch,
-  ApiKeySummary,
-  ApiKeyUsageReport,
   AuthSession,
-  CreatedApiKey,
   LoginResult,
   Preferences,
   PublicConfig,
@@ -39,33 +35,12 @@ import type {
   SessionMeta,
   SessionTimelinePage,
   TapeRecordPayload,
-  UsageQuery,
-  UsageReport,
-  UsageReportWindow,
-  UsageResponse,
   User,
   VerifyEmailResult,
-  OrgSummary,
-  OrgMember,
-  OrgInvitation,
-  OrgRole,
-  OrgUsageReport,
-  OrgUsageWindow,
-  OrgInvoiceProfile,
-  OrgInvoiceProfileInput,
-  OrgInvoiceRequest,
-  OrgTopupResult,
-  OrgOrder,
-  OrgLedgerRow,
-  OrgSkillsResponse,
-  OrgPlan,
-  OrgSubscriptionInfo,
-  OrgPayResult,
 } from "./types";
 import { captureIdentityAttempt, resolveIdentity, type ResolvedIdentity } from './resolvedIdentity';
 import type { ContainerPreviewViewport } from "@openclaude/protocol/containerPreview";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
-import { normalizeOrgPlan, normalizeOrgSubscription } from "./orgBilling";
 import {
   type RefreshSurface,
   refreshStates,
@@ -80,6 +55,7 @@ import {
   throwApi,
   jsonOrThrow,
 } from "./api/http";
+import { createLazyApiDomain } from "./api/lazyDomain";
 import { projectsApi } from "./api/projectsApi";
 import { knownUserError } from "./chat/userErrorView";
 import { memorySkillsApi } from "./api/memorySkillsApi";
@@ -405,28 +381,6 @@ export function apiErrorMessage(err: unknown, fallback: string): string {
   return fallback;
 }
 
-/**
- * 企业席位订单下单响应 → OrgPayResult。与批次 F issueOrderQr 同形：
- * `{ ok, data: { order_no, qrcode_url, mobile_url, amount_cents, credits, expires_at } }`。
- * 归一为 {orderNo, qr, mobileUrl};到账轮询走 getOrder。
- */
-function parseOrgOrder(p: Promise<Response>): Promise<OrgPayResult> {
-  return jsonOrThrow<{
-    ok?: boolean;
-    data?: {
-      order_no: string;
-      qrcode_url: string;
-      mobile_url: string | null;
-      amount_cents?: string;
-    };
-  }>(p).then((b) => ({
-    orderNo: b.data?.order_no ?? "",
-    qr: b.data?.qrcode_url ?? "",
-    mobileUrl: b.data?.mobile_url ?? null,
-    amountCents: b.data?.amount_cents,
-  }));
-}
-
 // ─── v5 后端 wire 形态 → 前端类型适配 ────────────────────────────────
 type WireUser = {
   id: string;
@@ -625,30 +579,64 @@ export const LIVE_FRAMES_REQUEST_TIMEOUT_MS = 12_000;
 /** Per canonical session GET request so stalled connections trigger retry instead of pinning loading forever. */
 export const SESSION_REQUEST_TIMEOUT_MS = 20_000;
 
-/** /api/me/api-keys 线上形状（snake_case）；list / PATCH 共用。 */
-type ApiKeyWire = {
-  id: string;
-  label: string;
-  key_prefix: string;
-  created_at: string;
-  last_used_at: string | null;
-  disabled_at?: string | null;
-  credit_limit?: string | null;
-  spent_credits?: string;
-};
+type OrgApiImpl = typeof import("./api/orgApiImpl").orgApiImpl;
+type SecondaryAccountApiImpl =
+  typeof import("./api/secondaryAccountApiImpl").secondaryAccountApiImpl;
 
-function apiKeyFromWire(k: ApiKeyWire): ApiKeySummary {
-  return {
-    id: k.id,
-    label: k.label,
-    keyPrefix: k.key_prefix,
-    createdAt: k.created_at,
-    lastUsedAt: k.last_used_at,
-    disabledAt: k.disabled_at ?? null,
-    creditLimit: k.credit_limit ?? null,
-    spentCredits: k.spent_credits ?? "0",
-  };
-}
+const orgApiProxy = createLazyApiDomain<OrgApiImpl>(
+  () => import("./api/orgApiImpl").then((m) => m.orgApiImpl),
+  [
+    "getOrg",
+    "listOrgMembers",
+    "patchOrgMember",
+    "removeOrgMember",
+    "listOrgInvitations",
+    "createOrgInvitation",
+    "revokeOrgInvitation",
+    "acceptOrgInvitation",
+    "getOrgUsage",
+    "getOrgInvoiceProfile",
+    "putOrgInvoiceProfile",
+    "listOrgInvoices",
+    "createOrgInvoice",
+    "orgTopup",
+    "getOrgBalance",
+    "listOrgOrders",
+    "listOrgLedger",
+    "getOrgSkills",
+    "installOrgSkill",
+    "uninstallOrgSkill",
+    "getOrgPlans",
+    "provisionOrg",
+    "getOrgSubscription",
+    "subscribeOrg",
+    "addOrgSeats",
+  ],
+);
+
+const secondaryAccountApiProxy = createLazyApiDomain<SecondaryAccountApiImpl>(
+  () => import("./api/secondaryAccountApiImpl").then((m) => m.secondaryAccountApiImpl),
+  [
+    "getQqBinding",
+    "startQqBinding",
+    "deleteQqBinding",
+    "submitFeedback",
+    "getUsage",
+    "getMyUsageReport",
+    "listApiKeys",
+    "updateApiKey",
+    "getApiKeyUsage",
+    "createApiKey",
+    "deleteApiKey",
+    "createContainerPreviewTicket",
+    "heartbeatContainerPreview",
+    "revokeContainerPreview",
+    "getChatGptProxyAccess",
+    "createChatGptProxyCredential",
+    "revokeChatGptProxyCredential",
+    "confirmDesktopEnroll",
+  ],
+);
 
 const MODEL_SWITCH_ESTIMATE_TIMEOUT_MS = 5_000;
 
@@ -995,223 +983,7 @@ export const api = {
       ),
     ),
 
-  getQqBinding: (a: AuthSession) =>
-    jsonOrThrow<QqBindingStatus>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/me/qq-binding", {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ),
-
-  startQqBinding: (a: AuthSession) =>
-    jsonOrThrow<QqBindingStart>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/me/qq-binding/start", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: "{}",
-        }),
-      ),
-    ),
-
-  deleteQqBinding: (a: AuthSession) =>
-    jsonOrThrow<{ ok: boolean; unbound: boolean }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/me/qq-binding", {
-          method: "DELETE",
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ),
-
-  /**
-   * 自由文本反馈（POST /api/feedback）。缺 Bearer 的公共调用仍可匿名；浏览器登录态提供
-   * 无效 Bearer 时后端返回 401，callWithRefresh 刷新重放，避免把登录用户静默记成匿名。
-   * 两种 source 分支分别重建 payload，消息上下文不会意外泄漏到设置反馈，反之亦然。
-   */
-  submitFeedback: (a: AuthSession, input: FeedbackSubmitInput): Promise<FeedbackSubmitResult> =>
-    jsonOrThrow<FeedbackSubmitResult>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/feedback", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(
-            input.category !== "response"
-              ? {
-                  category: input.category,
-                  description: input.description,
-                  ...(input.version ? { version: input.version } : {}),
-                  ...(input.requestId ? { request_id: input.requestId } : {}),
-                  ...(input.sessionId ? { session_id: input.sessionId } : {}),
-                  meta: {
-                    source: "settings",
-                    ...(input.meta.locale ? { locale: input.meta.locale } : {}),
-                    ...(input.meta.timezone ? { timezone: input.meta.timezone } : {}),
-                  },
-                }
-              : {
-                  category: "response",
-                  description: input.description,
-                  ...(input.requestId ? { request_id: input.requestId } : {}),
-                  ...(input.sessionId ? { session_id: input.sessionId } : {}),
-                  meta: {
-                    source: "message",
-                    message_id: input.meta.messageId,
-                    role: input.meta.role,
-                    ...(input.meta.errorCode ? { error_code: input.meta.errorCode } : {}),
-                    ...(input.meta.reason ? { reason: input.meta.reason } : {}),
-                    ...(input.meta.responseExcerpt
-                      ? { response_excerpt: input.meta.responseExcerpt }
-                      : {}),
-                  },
-                },
-          ),
-        }),
-      ),
-    ),
-
-  /**
-   * 用量统计（GET /api/me/usage，Bearer）。summary + 分页 sessions（offset）+
-   * keyset ledger（before）+ savings。**所有大数字段为字符串，勿数值化。**
-   * 抛 ApiError（含 400 INVALID_USAGE_QUERY）—— 调用方自行兜底，不再吞成 null。
-   */
-  getUsage: (a: AuthSession, q?: UsageQuery): Promise<UsageResponse> => {
-    const qs = new URLSearchParams();
-    if (q?.sessionsLimit != null) qs.set("sessions_limit", String(q.sessionsLimit));
-    if (q?.sessionsOffset != null) qs.set("sessions_offset", String(q.sessionsOffset));
-    if (q?.ledgerLimit != null) qs.set("ledger_limit", String(q.ledgerLimit));
-    if (q?.ledgerBefore) qs.set("ledger_before", q.ledgerBefore);
-    if (q?.boardProjectId) qs.set("boardProjectId", q.boardProjectId);
-    const suffix = qs.toString() ? `?${qs.toString()}` : "";
-    return jsonOrThrow<UsageResponse>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/me/usage${suffix}`, { credentials: "include", headers: bearerHeaders(t) }),
-      ),
-    );
-  },
-
-  /**
-   * 用量报表（GET /api/me/usage/report，Bearer，图表化窗口口径）。summary + 趋势 +
-   * 按模型 + 账本（收支趋势 / 支出构成），window 默认由后端取 7d。trend 已补零升序。
-   * **所有数字字段为字符串大数，勿数值化后当权威。** 抛 ApiError 由调用方兜底。
-   */
-  getMyUsageReport: (
-    a: AuthSession,
-    window: UsageReportWindow,
-    q?: { boardProjectId?: string },
-  ): Promise<UsageReport> => {
-    const qs = new URLSearchParams({ window });
-    if (q?.boardProjectId) qs.set("boardProjectId", q.boardProjectId);
-    return jsonOrThrow<UsageReport>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/me/usage/report?${qs.toString()}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    );
-  },
-
-  // ── API Keys（注意：当前后端 admin-only rollout，普通用户调用返 403） ─────────
-
-  /** 列出我的 API key（GET /api/me/api-keys，Bearer）。不含明文。 */
-  listApiKeys: (a: AuthSession): Promise<ApiKeySummary[]> =>
-    jsonOrThrow<{ keys: ApiKeyWire[] }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/me/api-keys", { credentials: "include", headers: bearerHeaders(t) }),
-      ),
-    ).then((b) => b.keys.map(apiKeyFromWire)),
-
-  /**
-   * 0277：改名 / 临时禁用 / 单 key 上限（PATCH /api/me/api-keys/:id，Bearer）。
-   * 400 INVALID_LABEL / INVALID_LIMIT / INVALID_BODY，404 不存在或非本人，经 ApiError 抛。
-   */
-  updateApiKey: (a: AuthSession, id: string, patch: ApiKeyPatch): Promise<ApiKeySummary> => {
-    const body: Record<string, unknown> = {};
-    if (patch.label !== undefined) body.label = patch.label;
-    if (patch.disabled !== undefined) body.disabled = patch.disabled;
-    if (patch.creditLimit !== undefined) body.credit_limit = patch.creditLimit;
-    return jsonOrThrow<ApiKeyWire>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/me/api-keys/${encodeURIComponent(id)}`, {
-          method: "PATCH",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(body),
-        }),
-      ),
-    ).then(apiKeyFromWire);
-  },
-
-  /**
-   * 0277：经 API key 的消耗报表（GET /api/me/api-keys/usage，Bearer）。
-   * summary + 趋势 + 按 key + 按模型 + 最近明细；keyId 可选钉单 key。
-   * **所有数字字段为字符串大数。**
-   */
-  getApiKeyUsage: (
-    a: AuthSession,
-    window: UsageReportWindow,
-    keyId?: string | null,
-  ): Promise<ApiKeyUsageReport> => {
-    const qs = new URLSearchParams({ window });
-    if (keyId) qs.set("key_id", keyId);
-    return jsonOrThrow<ApiKeyUsageReport>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/me/api-keys/usage?${qs.toString()}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    );
-  },
-
-  /**
-   * 新建 API key（POST /api/me/api-keys，201，Bearer）。返完整明文 plaintext **仅一次**，
-   * 必须立即引导用户复制保存；后端永远无法重新生成。400 INVALID_LABEL 经 ApiError 抛。
-   */
-  createApiKey: (a: AuthSession, label: string): Promise<CreatedApiKey> =>
-    jsonOrThrow<{
-      id: string;
-      label: string;
-      key_prefix: string;
-      plaintext: string;
-      created_at: string;
-    }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/me/api-keys", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({ label }),
-        }),
-      ),
-    ).then((b) => ({
-      id: b.id,
-      label: b.label,
-      keyPrefix: b.key_prefix,
-      plaintext: b.plaintext,
-      createdAt: b.created_at,
-    })),
-
-  /**
-   * 撤销 API key（DELETE /api/me/api-keys/:id，Bearer）。软撤销，幂等。
-   * 不存在 / 已撤销 / 非本人一律 404（不暴露存在性），经 ApiError 抛。
-   */
-  deleteApiKey: (a: AuthSession, id: string): Promise<void> =>
-    jsonOrThrow<{ ok: true }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/me/api-keys/${encodeURIComponent(id)}`, {
-          method: "DELETE",
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ).then(() => undefined),
+  ...secondaryAccountApiProxy,
 
   // ── 公开（匿名可读） ────────────────────────────────────────────────
 
@@ -2021,384 +1793,7 @@ export const api = {
   ...projectsApi,
   ...memorySkillsApi,
   ...integrationsApi,
-
-  // ── 企业版(P3.1)org 自助后台 ─────────────────────────────────────────
-  // org 由服务端从 caller membership 推导,前端**不带** org_id。批次 D 端点(usage/
-  // invoice)本文件权威;批次 B(topup/balance/orders/ledger)、批次 C(skills)按方案契约
-  // 调用(字段名以后端为准)。大数一律字符串贯穿。
-
-  /** GET /api/org 概要(member+)。403=无 org 归属 / org 停用。 */
-  getOrg: (a: AuthSession): Promise<OrgSummary> =>
-    jsonOrThrow<{ org: OrgSummary }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/org", { credentials: "include", headers: bearerHeaders(t) }),
-      ),
-    ).then((b) => b.org),
-
-  // ── 成员(A 批次后端已就绪) ──────────────────────────────────────────
-  listOrgMembers: (a: AuthSession): Promise<OrgMember[]> =>
-    jsonOrThrow<{ members: OrgMember[] }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/org/members", { credentials: "include", headers: bearerHeaders(t) }),
-      ),
-    ).then((b) => b.members),
-
-  patchOrgMember: (
-    a: AuthSession,
-    uid: string,
-    patch: {
-      org_role?: OrgRole;
-      billing_enabled?: boolean;
-      status?: "active" | "suspended";
-      /** 财务委派(三期):仅 owner 可改。 */
-      billing_delegate?: boolean;
-      /** 月度组织用量限额(积分;null=不限,字符串大数或数值;admin 可改)。 */
-      monthly_org_budget?: string | number | null;
-    },
-  ): Promise<void> =>
-    jsonOrThrow<unknown>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/org/members/${encodeURIComponent(uid)}`, {
-          method: "PATCH",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(patch),
-        }),
-      ),
-    ).then(() => undefined),
-
-  removeOrgMember: (a: AuthSession, uid: string): Promise<void> =>
-    jsonOrThrow<unknown>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/org/members/${encodeURIComponent(uid)}`, {
-          method: "DELETE",
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ).then(() => undefined),
-
-  listOrgInvitations: (a: AuthSession): Promise<OrgInvitation[]> =>
-    jsonOrThrow<{ invitations: OrgInvitation[] }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/org/invitations", { credentials: "include", headers: bearerHeaders(t) }),
-      ),
-    ).then((b) => b.invitations),
-
-  createOrgInvitation: (a: AuthSession, email: string, orgRole: OrgRole): Promise<void> =>
-    jsonOrThrow<unknown>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/org/invitations", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({ email, org_role: orgRole }),
-        }),
-      ),
-    ).then(() => undefined),
-
-  revokeOrgInvitation: (a: AuthSession, id: string): Promise<void> =>
-    jsonOrThrow<unknown>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/org/invitations/${encodeURIComponent(id)}`, {
-          method: "DELETE",
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ).then(() => undefined),
-
-  /** POST /api/org/invitations/accept(受邀者尚非成员,仅 requireAuth)。 */
-  acceptOrgInvitation: (
-    a: AuthSession,
-    token: string,
-  ): Promise<{ org_id: string; org_role: OrgRole }> =>
-    jsonOrThrow<{ joined: boolean; org_id: string; org_role: OrgRole }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/org/invitations/accept", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({ token }),
-        }),
-      ),
-    ).then((b) => ({ org_id: b.org_id, org_role: b.org_role })),
-
-  // ── 报表(D 批次,本文件权威) ────────────────────────────────────────
-  getOrgUsage: (a: AuthSession, window: OrgUsageWindow): Promise<OrgUsageReport> =>
-    jsonOrThrow<OrgUsageReport>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/org/usage?window=${encodeURIComponent(window)}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ),
-
-  // ── 发票(D 批次,本文件权威) ────────────────────────────────────────
-  getOrgInvoiceProfile: (a: AuthSession): Promise<OrgInvoiceProfile | null> =>
-    jsonOrThrow<{ profile: OrgInvoiceProfile | null }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/org/invoice-profile", { credentials: "include", headers: bearerHeaders(t) }),
-      ),
-    ).then((b) => b.profile),
-
-  putOrgInvoiceProfile: (
-    a: AuthSession,
-    input: OrgInvoiceProfileInput,
-  ): Promise<OrgInvoiceProfile> =>
-    jsonOrThrow<{ profile: OrgInvoiceProfile }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/org/invoice-profile", {
-          method: "PUT",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(input),
-        }),
-      ),
-    ).then((b) => b.profile),
-
-  listOrgInvoices: (a: AuthSession): Promise<OrgInvoiceRequest[]> =>
-    jsonOrThrow<{ invoices: OrgInvoiceRequest[] }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/org/invoices", { credentials: "include", headers: bearerHeaders(t) }),
-      ),
-    ).then((b) => b.invoices),
-
-  createOrgInvoice: (a: AuthSession, orderIds: string[]): Promise<OrgInvoiceRequest> =>
-    jsonOrThrow<{ invoice: OrgInvoiceRequest }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/org/invoices", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({ order_ids: orderIds }),
-        }),
-      ),
-    ).then((b) => b.invoice),
-
-  // ── 充值(统一支付契约;topup 返 {ok,data:{order_no,qrcode_url,mobile_url}},轮询到账) ──
-  orgTopup: (a: AuthSession, amountCents: string): Promise<OrgTopupResult> =>
-    parseOrgOrder(
-      callWithRefresh(a, (t) =>
-        fetch("/api/org/topup", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({ amount_cents: amountCents }),
-        }),
-      ),
-    ),
-
-  /** GET /api/org/balance → {credits}(批次 B)。轮询到账用。 */
-  getOrgBalance: (a: AuthSession): Promise<string> =>
-    jsonOrThrow<{ credits: string }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/org/balance", { credentials: "include", headers: bearerHeaders(t) }),
-      ),
-    ).then((b) => b.credits),
-
-  listOrgOrders: (a: AuthSession): Promise<OrgOrder[]> =>
-    jsonOrThrow<{ rows: OrgOrder[] }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/org/orders", { credentials: "include", headers: bearerHeaders(t) }),
-      ),
-    ).then((b) => b.rows ?? []),
-
-  listOrgLedger: (a: AuthSession): Promise<OrgLedgerRow[]> =>
-    jsonOrThrow<{ rows: OrgLedgerRow[] }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/org/ledger", { credentials: "include", headers: bearerHeaders(t) }),
-      ),
-    ).then((b) => b.rows ?? []),
-
-  // ── 技能(批次 C 契约) ───────────────────────────────────────────────
-  getOrgSkills: (a: AuthSession): Promise<OrgSkillsResponse> =>
-    jsonOrThrow<OrgSkillsResponse>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/org/skills", { credentials: "include", headers: bearerHeaders(t) }),
-      ),
-    ).then((b) => ({ installed: b.installed ?? [], available: b.available ?? [] })),
-
-  installOrgSkill: (a: AuthSession, slug: string): Promise<void> =>
-    jsonOrThrow<unknown>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/org/skills/install", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({ slug }),
-        }),
-      ),
-    ).then(() => undefined),
-
-  uninstallOrgSkill: (a: AuthSession, slug: string): Promise<void> =>
-    jsonOrThrow<unknown>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/org/skills/${encodeURIComponent(slug)}`, {
-          method: "DELETE",
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ).then(() => undefined),
-
-  // ── 席位订阅 + 自助开通(二期批次 F 契约;已按 F 实际响应形对齐,normalizeOrg* 适配字段名)──
-  //
-  // 到账判定统一复用 GET /api/payment/orders/:order_no(getOrder,status→'paid')。
-  // 下单响应形(与 F issueOrderQr 对齐):{ ok, data: { order_no, qrcode_url, ... } }。
-  // 经 parseOrgOrder 归一为 {orderNo, qr, mobileUrl};现行 UI 仅消费 qr，mobileUrl 只保留协议兼容。
-  // GET plans / subscription 为顶层裸对象(无 ok/data 包裹)。大数全字符串贯穿。
-  // owner 门在 UI 层按 role 控制,403 响应兜底 toast(防降权窗口)。
-
-  /** GET /api/org/plans:企业套餐档(无 org 也可读,创建向导用)。normalizeOrgPlan 适配字段名。 */
-  getOrgPlans: (a: AuthSession): Promise<OrgPlan[]> =>
-    jsonOrThrow<{ plans?: unknown[] }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/org/plans", { credentials: "include", headers: bearerHeaders(t) }),
-      ),
-    ).then((b) => (Array.isArray(b.plans) ? b.plans : []).map(normalizeOrgPlan)),
-
-  /** POST /api/org/provision:自助开通(组织名+档+席位)→ 扫码。401 未登录;已有 org → 结构化错。 */
-  provisionOrg: (
-    a: AuthSession,
-    input: { orgName: string; planCode: string; seats: number },
-  ): Promise<OrgPayResult> =>
-    parseOrgOrder(
-      callWithRefresh(a, (t) =>
-        fetch("/api/org/provision", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({
-            org_name: input.orgName,
-            plan_code: input.planCode,
-            seats: input.seats,
-          }),
-        }),
-      ),
-    ),
-
-  /** GET /api/org/subscription:当前订阅 + 档列表(member 可读)。normalizeOrg* 适配。 */
-  getOrgSubscription: (a: AuthSession): Promise<OrgSubscriptionInfo> =>
-    jsonOrThrow<{ subscription?: unknown; plans?: unknown[] }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/org/subscription", { credentials: "include", headers: bearerHeaders(t) }),
-      ),
-    ).then((b) => ({
-      subscription: normalizeOrgSubscription(b.subscription),
-      plans: (Array.isArray(b.plans) ? b.plans : []).map(normalizeOrgPlan),
-    })),
-
-  /** POST /api/org/subscribe(owner):订阅 / 续费(档+**总席位**)→ 扫码。403 非 owner。 */
-  subscribeOrg: (
-    a: AuthSession,
-    input: { planCode: string; seats: number },
-  ): Promise<OrgPayResult> =>
-    parseOrgOrder(
-      callWithRefresh(a, (t) =>
-        fetch("/api/org/subscribe", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({ plan_code: input.planCode, seats: input.seats }),
-        }),
-      ),
-    ),
-
-  /** POST /api/org/seats(owner):加席。**seats = 席位增量(>0)**,对齐 F createOrgSeatsOrder
-   *  「席位增量」语义(kind='upgrade',整份即时入池,period 不变)。403 非 owner。 */
-  addOrgSeats: (a: AuthSession, seatsDelta: number): Promise<OrgPayResult> =>
-    parseOrgOrder(
-      callWithRefresh(a, (t) =>
-        fetch("/api/org/seats", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({ seats: seatsDelta }),
-        }),
-      ),
-    ),
-
-  /** Mint a 30-second, single-use ticket for a container-local Chromium preview. */
-  createContainerPreviewTicket: (
-    a: AuthSession,
-    url: string,
-    viewport: ContainerPreviewViewport,
-    options?: { direct?: boolean },
-  ): Promise<ContainerPreviewTicketResponse> =>
-    jsonOrThrow<ContainerPreviewTicketResponse>(
-      callWithRefresh(a, (token) =>
-        fetch("/api/container-preview/ticket", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(token, true),
-          body: JSON.stringify({ url, viewport, ...options }),
-        }),
-      ),
-    ),
-
-  heartbeatContainerPreview: (a: AuthSession, sessionId: string): Promise<void> =>
-    jsonOrThrow<{ ok: true }>(
-      callWithRefresh(a, (token) =>
-        fetch("/api/container-preview/heartbeat", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(token, true),
-          body: JSON.stringify({ sessionId }),
-        }),
-      ),
-    ).then(() => undefined),
-
-  revokeContainerPreview: (a: AuthSession, sessionId: string): Promise<void> =>
-    jsonOrThrow<{ ok: true }>(
-      callWithRefresh(a, (token) =>
-        fetch("/api/container-preview/revoke", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(token, true),
-          body: JSON.stringify({ sessionId }),
-          keepalive: true,
-        }),
-      ),
-    ).then(() => undefined),
-
-  // ── ChatGPT 直连代理（仅管理员 + system_settings 白名单用户） ───────────────
-
-  /** GET /api/chatgpt-proxy/access：授权状态 + 连接信息。未授权 → `{ enabled: false }`。 */
-  getChatGptProxyAccess: (a: AuthSession): Promise<ChatGptProxyAccess> =>
-    jsonOrThrow<ChatGptProxyAccess>(
-      callWithRefresh(a, (token) =>
-        fetch("/api/chatgpt-proxy/access", {
-          credentials: "include",
-          headers: bearerHeaders(token),
-        }),
-      ),
-    ),
-
-  /** POST /api/chatgpt-proxy/credential：生成 / 轮换代理凭据，明文密码只返回这一次。 */
-  createChatGptProxyCredential: (a: AuthSession): Promise<ChatGptProxyCredential> =>
-    jsonOrThrow<ChatGptProxyCredential>(
-      callWithRefresh(a, (token) =>
-        fetch("/api/chatgpt-proxy/credential", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(token),
-        }),
-      ),
-    ),
-
-  /** DELETE /api/chatgpt-proxy/credential：吊销当前凭据。 */
-  revokeChatGptProxyCredential: (a: AuthSession): Promise<void> =>
-    jsonOrThrow<{ ok: true }>(
-      callWithRefresh(a, (token) =>
-        fetch("/api/chatgpt-proxy/credential", {
-          method: "DELETE",
-          credentials: "include",
-          headers: bearerHeaders(token),
-        }),
-      ),
-    ).then(() => undefined),
+  ...orgApiProxy,
 
   // ── 逐条响应评价反馈（commercial REST，需登录 401，限流 60/60s） ──────────────
   //
@@ -2466,30 +1861,6 @@ export const api = {
         }),
       ),
     ),
-
-  /**
-   * 确认桌面 enrollment（POST /api/desktop/enroll/confirm，Bearer）。
-   * 成功 200 `{enrollment_id, code, deep_link}`；sim 平台 `deep_link` 为 null。
-   * `code` 只用于服务端拼深链，本 helper **不**把 code 交给调用方，以免误渲染。
-   * 失败经 ApiError 抛（401 / 403 DESKTOP_NOT_ENTITLED / 409 DEVICE_LIMIT|ENROLL_INVALID / 404 / 429）。
-   */
-  confirmDesktopEnroll: (
-    a: AuthSession,
-    enrollmentId: string,
-  ): Promise<{ enrollmentId: string; deepLink: string | null }> =>
-    jsonOrThrow<{ enrollment_id: string; code?: string; deep_link?: string | null }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/desktop/enroll/confirm", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({ enrollment_id: enrollmentId }),
-        }),
-      ),
-    ).then((b) => ({
-      enrollmentId: b.enrollment_id,
-      deepLink: typeof b.deep_link === "string" && b.deep_link ? b.deep_link : null,
-    })),
 
   // ── 对话传输（P4 已接入：WS user-chat-bridge） ────────────────────────
   //

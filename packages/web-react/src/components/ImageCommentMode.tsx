@@ -13,6 +13,7 @@ import { fetchImageBlobWithResign } from '../lib/chat/media'
 import { useProgressiveImage } from '../lib/chat/useProgressiveImage'
 import { cn } from '../lib/utils'
 import type { ImageCommentSubmit } from './chat/imageEditActions'
+import { Alert } from './ui'
 
 type Anchor = { id: string; x: number; y: number; text: string }
 
@@ -305,7 +306,7 @@ export function ImageCommentMode({
                   aria-hidden
                   className={cn(
                     'flex size-7 items-center justify-center rounded-full border-2 border-white text-xs font-bold text-white shadow-float',
-                    editingId === a.id ? 'bg-accent' : 'bg-[rgba(56,132,255,0.96)]',
+                    editingId === a.id ? 'bg-accent' : 'bg-info',
                   )}
                 >
                   {i + 1}
@@ -317,7 +318,7 @@ export function ImageCommentMode({
               <span
                 aria-hidden
                 style={{ left: `${draft.x * 100}%`, top: `${draft.y * 100}%` }}
-                className="absolute z-10 flex size-7 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border-2 border-white bg-[rgba(56,132,255,0.7)] text-xs font-bold text-white"
+                className="absolute z-10 flex size-7 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border-2 border-white bg-info/70 text-xs font-bold text-white"
               >
                 {count + 1}
               </span>
@@ -329,9 +330,9 @@ export function ImageCommentMode({
       {/* 底部:输入条 或 空态提示 */}
       <div className="shrink-0 px-3 pb-[max(1rem,env(safe-area-inset-bottom))] pt-2">
         {error && (
-          <p role="alert" className="mx-auto mb-2 max-w-2xl rounded-lg bg-danger/25 px-3 py-1.5 text-center text-sm text-white">
+          <Alert density="compact" tone="danger" className="mx-auto mb-2 w-full max-w-2xl justify-center text-center">
             {error}
-          </p>
+          </Alert>
         )}
         {editing ? (
           <div className="mx-auto flex w-full max-w-2xl items-center gap-2 rounded-2xl bg-white/10 px-3 py-2 backdrop-blur">

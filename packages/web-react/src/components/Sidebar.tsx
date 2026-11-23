@@ -17,6 +17,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   lazy,
+  memo,
   useEffect,
   useMemo,
   useRef,
@@ -28,6 +29,7 @@ import { useOptionalAuth, useProjectScope } from "../hooks/useProjectScope";
 import { SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN } from "../hooks/useSidebarWidth";
 import type { Theme } from "../hooks/useTheme";
 import { BRAND } from "../lib/brand";
+import { readNetworkInformation, shouldPrefetchCenters } from "../lib/prefetchPolicy";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { type SessionNeedsYouKind, isSidebarSessionRunning } from "../lib/sessionStatus";
 import type {
@@ -112,11 +114,15 @@ const LazyAccountMenuContent = lazy(() => {
   return preloadAccountMenu().then((mod) => ({ default: mod.AccountMenuContent }));
 });
 
-if (typeof window !== "undefined") {
+if (typeof window !== "undefined" && shouldPrefetchCenters(readNetworkInformation())) {
+  const prefetch = () => {
+    if (!shouldPrefetchCenters(readNetworkInformation())) return;
+    void preloadAccountMenu().catch(() => {});
+  };
   const idle = (window as Window & { requestIdleCallback?: (cb: () => void) => number })
     .requestIdleCallback;
-  if (idle) idle(() => { void preloadAccountMenu().catch(() => {}); });
-  else window.setTimeout(() => { void preloadAccountMenu().catch(() => {}); }, 10);
+  if (idle) idle(prefetch);
+  else window.setTimeout(prefetch, 10);
 }
 
 /** 空态提示行叠加「新建会话」CTA 后的行高(文字 + gap + 按钮 + 原 py-6 呼吸位)。 */
@@ -273,7 +279,7 @@ export type SidebarProps = {
   onOpenLiveBrowser?: (opts?: PendingDecisionBrowserHandoffOpenOpts) => void;
 };
 
-export function Sidebar({
+export const Sidebar = memo(function Sidebar({
   sessions: incomingSessions,
   activeId,
   user,
@@ -1098,7 +1104,7 @@ export function Sidebar({
         {/* 主操作：干练克制的 Codex/Linear 比例，去厚重白砖阴影；有智能体选择时右侧细线切出下拉。 */}
         <div
           data-sidebar-new
-          className="group/new oc-btn-tactile oc-spring-press mb-2 flex h-9 w-full items-stretch rounded-sm border border-border/80 bg-surface/90 text-section shadow-2xs transition-colors duration-150 ease-standard hover:border-border-strong hover:bg-surface [@media(hover:none)]:h-11"
+          className="group/new oc-btn-tactile oc-spring-press mb-2 flex h-9 w-full items-stretch rounded-sm border border-border/80 bg-surface/90 text-section shadow-2xs transition-colors duration-150 ease-standard hover:border-border-strong hover:bg-surface [@media(hover:none)]:h-[46px] max-sm:h-[46px]"
         >
           <button
             type="button"
@@ -1125,7 +1131,7 @@ export function Sidebar({
                 aria-label="选择智能体后新建"
                 title="选择智能体后新建"
                 onClick={onNewWithAgent}
-                className="flex w-8 shrink-0 items-center justify-center rounded-r-sm text-faint outline-none transition-colors duration-150 hover:bg-hover/60 hover:text-fg focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:w-11"
+                className="flex w-8 shrink-0 items-center justify-center rounded-r-sm text-faint outline-none transition-colors duration-150 hover:bg-hover/60 hover:text-fg focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:w-11 max-sm:w-11"
               >
                 <ChevronDown size={14} strokeWidth={1.75} />
               </button>
@@ -1442,7 +1448,7 @@ export function Sidebar({
       </div>
     </aside>
   );
-}
+});
 
 /** 「Ctrl K」/「⌘K」 hint for the palette button (Mac-family shows ⌘). */
 function paletteKeyLabel(): string {

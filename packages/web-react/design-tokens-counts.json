@@ -11,9 +11,9 @@
     "components/ui": 0
   },
   "rawColor": {
-    "components/*": 19,
+    "components/*": 17,
     "components/chat": 2,
-    "components/iui": 3,
+    "components/iui": 0,
     "components/marketplace": 0,
     "components/org": 0,
     "components/project": 0,
@@ -42,7 +42,7 @@
     "components/taskboard": 0
   },
   "adhocError": {
-    "components/*": 6,
+    "components/*": 1,
     "components/chat": 6,
     "components/github": 0,
     "components/manage": 0,

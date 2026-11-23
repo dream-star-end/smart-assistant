@@ -136,29 +136,43 @@ export function useChatCardActions({
 }: ChatCardActionsInput) {
   const activeSessionRef = useRef(activeId);
   activeSessionRef.current = activeId;
+  const onCompactSessionRef = useRef(onCompactSession);
+  onCompactSessionRef.current = onCompactSession;
+  const hasCompactSession = Boolean(onCompactSession);
+  // 解构 useChatSocket 提供的稳定方法，避免依赖每帧随 snap.version 换新引用的 chat 对象。
+  const {
+    isSending: chatIsSending,
+    getSession: chatGetSession,
+    getMessages: chatGetMessages,
+    stop: chatStop,
+    fetchTapeRecordPayload,
+    peekTapeRecordPayload,
+    fetchUserMessagePayload,
+    peekUserMessagePayload,
+  } = chat;
   // 停止当前轮：demo 本地停回放；非 demo 发 inbound.control.stop 并本地收尾。
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); sendImplicitRatingRef, setBusy, setChatError, setStreamText, stopRef, stoppedTurnRef are App useState setter/useRef passed in, stable
   const stopTurnTarget = useCallback((expectedClientMessageId?: string) => {
     // A confirmation may outlive the rendered turn. Check the mutable socket
     // before feedback/local teardown, then carry the same identity to Stop.
     if (!demo && expectedClientMessageId !== undefined &&
-      (!activeId || !chat.isSending(activeId) ||
-        chat.getSession(activeId)?._activeClientMessageId !== expectedClientMessageId)) return;
+      (!activeId || !chatIsSending(activeId) ||
+        chatGetSession(activeId)?._activeClientMessageId !== expectedClientMessageId)) return;
     if (demo) {
       stopRef.current = true;
       setBusy(false);
       setStreamText("");
     } else if (activeId) {
       // 隐式负反馈（中途打断）：过秒停窗后 Stop → 对本轮末条 assistant 静默记 implicit down。
-      // 现场取消息（chat 已在依赖内），不捕获每帧刷新的 wsMessages。
-      const stopTarget = findStopTarget(chat.getMessages(activeId), Date.now());
+      // 现场取消息（走稳定 chatGetMessages），不捕获每帧刷新的 wsMessages / chat 对象。
+      const stopTarget = findStopTarget(chatGetMessages(activeId), Date.now());
       if (stopTarget) sendImplicitRatingRef.current?.(stopTarget, { reason: "中途打断" });
       // 本轮由用户主动打断 → 不做完成脉冲高亮（nudge effect 消费该标记后清）。
       stoppedTurnRef.current = true;
-      chat.stop(activeId, expectedClientMessageId);
+      chatStop(activeId, expectedClientMessageId);
     }
     setChatError(null);
-  }, [demo, activeId, chat]);
+  }, [demo, activeId, chatIsSending, chatGetSession, chatGetMessages, chatStop]);
   // Keep event-facing callbacks argument-free (React may supply a click event).
   const stopTurn = useCallback(() => stopTurnTarget(), [stopTurnTarget]);
   const stopTurnIfCurrent = useCallback((clientMessageId: string) => stopTurnTarget(clientMessageId), [stopTurnTarget]);
@@ -372,12 +386,6 @@ export function useChatCardActions({
   // 卡片回调集（稳定引用：作为 MessageRenderer memo 比较键之一，避免无谓重渲）。
   // True tape process paging + oversized-record loading. Hook methods are stable;
   // demo/readonly surfaces leave the cursor disabled rather than inventing content.
-  const {
-    fetchTapeRecordPayload,
-    peekTapeRecordPayload,
-    fetchUserMessagePayload,
-    peekUserMessagePayload,
-  } = chat;
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); authRef, setComposerPrefill, setMessageReplyTarget, setModelPickerOpen, setSaveToProject, setSubscribeOpenSignal, sockRef are App useState setter/useRef passed in, stable
   const cardCallbacks: CardCallbacks = useMemo(
     () => ({
@@ -390,7 +398,8 @@ export function useChatCardActions({
             setSubscribeOpenSignal((n) => n + 1);
           },
       onStartNewSession: demo ? undefined : newSession,
-      onCompactSession: demo ? undefined : onCompactSession,
+      onCompactSession:
+        demo || !hasCompactSession ? undefined : () => onCompactSessionRef.current?.(),
       onFeedback,
       onFirstTextPaint: demo
         ? undefined
@@ -508,6 +517,7 @@ export function useChatCardActions({
       demo,
       openSettings,
       newSession,
+      hasCompactSession,
       onFeedback,
       retrySend,
       editResend,

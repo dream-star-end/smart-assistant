@@ -100,7 +100,7 @@ export function CodeBlock({
               type="button"
               onClick={() => setCollapsed(true)}
               aria-label="收起代码块"
-              className="oc-btn-tactile flex items-center gap-1 rounded-md px-2 py-1 text-caption font-medium text-faint transition-colors hover:bg-hover hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+              className="oc-btn-tactile flex items-center justify-center gap-1 rounded-md px-2 py-1 text-caption font-medium text-faint transition-colors hover:bg-hover hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring max-sm:min-h-11 max-sm:min-w-11 [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11 [@media(hover:none)]:px-3"
             >
               <ChevronUp size={13} strokeWidth={1.75} />
               收起
@@ -113,7 +113,7 @@ export function CodeBlock({
             aria-pressed={wrap}
             title={wrap ? "取消换行" : "换行"}
             className={cn(
-              "oc-btn-tactile flex items-center gap-1.5 rounded-md border px-2 py-1 text-caption font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3",
+              "oc-btn-tactile flex items-center justify-center gap-1.5 rounded-md border px-2 py-1 text-caption font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring max-sm:min-h-11 max-sm:min-w-11 [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11 [@media(hover:none)]:px-3",
               wrap
                 ? "border-accent/30 bg-accent-soft text-accent"
                 : "border-transparent text-faint hover:bg-hover hover:text-fg",
@@ -126,7 +126,7 @@ export function CodeBlock({
             type="button"
             onClick={copy}
             className={cn(
-              "oc-btn-tactile flex min-w-[4.5rem] items-center justify-center gap-1.5 rounded-md border px-2 py-1 text-caption font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3",
+              "oc-btn-tactile flex min-w-[4.5rem] items-center justify-center gap-1.5 rounded-md border px-2 py-1 text-caption font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring max-sm:min-h-11 [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3",
               copied
                 ? "border-success/30 bg-success-soft text-success"
                 : "border-transparent text-faint hover:bg-hover hover:text-fg",

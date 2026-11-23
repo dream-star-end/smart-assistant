@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { type Agent, MAIN_AGENT } from "../lib/agents";
 import type { PublicModel } from "../lib/types";
-import { ChatHeader, compactMobileModelLabel, modKeyLabel } from "./ChatHeader";
+import { ChatHeader, type ChatHeaderProps, compactMobileModelLabel, modKeyLabel } from "./ChatHeader";
 
 // 本仓 vitest 未开 globals 自动 cleanup,显式隔离每个用例的 DOM。
 afterEach(cleanup);
@@ -20,7 +20,7 @@ const CODER_AGENT: Agent = {
   description: "资深全栈工程师",
 };
 
-function renderHeader(extra: Partial<Parameters<typeof ChatHeader>[0]> = {}) {
+function renderHeader(extra: Partial<ChatHeaderProps> = {}) {
   return render(
     <ChatHeader
       agent={MAIN_AGENT}

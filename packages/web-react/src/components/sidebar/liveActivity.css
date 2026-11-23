@@ -238,26 +238,27 @@
 
 @media (hover: none), (max-width: 767px) {
   .oc-live-strip-pill {
-    min-height: 2rem;
+    min-width: 2.75rem;
+    min-height: 2.75rem;
     height: auto;
-    padding: 0 0.5rem;
+    padding: 0 0.625rem;
   }
 
   .oc-live-strip-toggle {
-    min-width: 2rem;
-    min-height: 2rem;
-    width: 2rem;
-    height: 2rem;
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+    width: 2.75rem;
+    height: 2.75rem;
   }
 
   .oc-live-strip-item {
-    min-height: 2.25rem;
+    min-height: 2.75rem;
     height: auto;
     padding: 0 0.5rem 0 0.625rem;
   }
 
   .oc-live-strip-more {
-    min-height: 2.25rem;
+    min-height: 2.75rem;
     height: auto;
     padding: 0 0.625rem 0 2.25rem;
   }

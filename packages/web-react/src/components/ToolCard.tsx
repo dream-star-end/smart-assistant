@@ -138,7 +138,7 @@ export function ToolCard({
           <HeaderTag
             {...toggle}
             className={cn(
-              "-mx-2 flex min-h-9 min-w-0 flex-1 items-center gap-2 overflow-hidden rounded-md px-2 py-1.5 text-left outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+              "-mx-2 flex min-h-9 min-w-0 flex-1 items-center gap-2 overflow-hidden text-ellipsis rounded-md px-2 py-1.5 text-left outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11",
               hasBody && "cursor-pointer hover:bg-hover/70 active:bg-active/60",
             )}
           >
@@ -244,7 +244,7 @@ export function ToolCard({
       <HeaderTag
         {...toggle}
         className={cn(
-          "flex min-h-11 min-w-0 flex-1 items-center gap-2.5 overflow-hidden px-3 py-2 text-left outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+          "flex min-h-11 min-w-0 flex-1 items-center gap-2.5 overflow-hidden text-ellipsis px-3 py-2 text-left outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11",
           hasBody && "cursor-pointer hover:bg-hover/55 active:bg-active/55",
         )}
       >

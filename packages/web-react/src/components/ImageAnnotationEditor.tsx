@@ -19,6 +19,7 @@ import { downloadPercent } from '../lib/chat/download'
 import { getCachedThumbnail } from '../lib/chat/imageBytes'
 import { apiErrorMessage } from '../lib/api'
 import { cn } from '../lib/utils'
+import { Alert } from './ui'
 
 export type ImageAnnotationSource = { url: string; name?: string }
 export type ImageAnnotationExport = {
@@ -923,9 +924,9 @@ export function ImageAnnotationEditor({
           {/* 底栏:提示词输入条 + 居中撤销/重做 + 更多工具/缩放(次级) */}
           <div className="flex shrink-0 flex-col gap-2 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-1">
             {error && (
-              <p role="alert" className="mx-auto max-w-2xl rounded-lg bg-danger/25 px-3 py-1.5 text-center text-sm text-fg">
+              <Alert density="compact" tone="danger" className="mx-auto w-full max-w-2xl justify-center text-center">
                 {error}
-              </p>
+              </Alert>
             )}
             {submitHint && (
               <p role="status" className="mx-auto w-full max-w-2xl text-center text-body text-warning">

@@ -229,7 +229,7 @@ describe('StudioApp (OCV5-593)', () => {
     // The start went out before the brief page opened (Q3: one click, not two).
     const posts = calls.filter((c) => c.method === 'POST').map((c) => c.path)
     expect(posts).toEqual(['/api/studio/projects', `/api/studio/projects/${ID}/start`])
-    expect(await screen.findByTestId('studio-planning')).toHaveTextContent('导演 agent 正在写分镜')
+    expect(await screen.findByTestId('studio-planning')).toHaveTextContent('导演助手正在写分镜')
     expect(screen.getByTestId('studio-planning-elapsed')).toHaveTextContent(/已用 \d+ 秒/)
     expect(screen.queryByText('分镜还没写')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /全自动开始/ })).not.toBeInTheDocument()
@@ -334,7 +334,7 @@ describe('StudioApp (OCV5-593)', () => {
       expect(screen.queryByRole('button', { name: /全自动开始/ })).not.toBeInTheDocument(),
     )
     expect(screen.getByTestId('studio-progress-note')).toHaveTextContent(
-      '导演 agent 正在写分镜（通常一分钟内），写好后会显示镜头和预估费用。',
+      '导演助手正在写分镜（通常一分钟内），写好后会显示镜头和预估费用。',
     )
   })
 
@@ -502,7 +502,7 @@ describe('StudioApp (OCV5-593)', () => {
     })
     mount(`/studio/p/${ID}/brief`)
     expect(await screen.findByTestId('studio-progress-note')).toHaveTextContent(
-      '分镜预估 456 积分，导演 agent 正在生成。',
+      '分镜预估 456 积分，导演助手正在生成。',
     )
     cleanup()
     view = {
@@ -511,7 +511,7 @@ describe('StudioApp (OCV5-593)', () => {
     }
     mount(`/studio/p/${ID}/brief`)
     expect(
-      await screen.findByText('分镜已写好，预估 456 积分；确认后导演 agent 开始生成镜头。'),
+      await screen.findByText('分镜已写好，预估 456 积分；确认后导演助手开始生成镜头。'),
     ).toBeInTheDocument()
     cleanup()
     view = {

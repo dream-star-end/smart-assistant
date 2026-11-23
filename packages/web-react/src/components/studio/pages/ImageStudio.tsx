@@ -11,8 +11,6 @@ import {
   MessageCircle,
   MousePointer2,
   Plus,
-  Sparkles,
-  Wand2,
 } from 'lucide-react'
 import { type ChangeEvent, type PointerEvent, useCallback, useMemo, useRef, useState } from 'react'
 
@@ -180,7 +178,7 @@ export function ImageStudioPage(props: {
               还没有{KINDS.find(([k]) => k === kind)![1]}设定
             </div>
             <div className="st-cap">
-              开拍后导演 agent 会生成设定图并锁定，每个镜头都原样带上。可以先上传参考图。
+              开拍后导演助手会生成设定图并锁定，每个镜头都原样带上。可以先上传参考图。
             </div>
           </div>
         ) : (
@@ -310,7 +308,7 @@ export function ImageStudioPage(props: {
             </span>
           ) : null}
           {score !== null ? (
-            <span className="st-chip st-chip-dark st-chip-agent">QA {score.toFixed(2)}</span>
+            <span className="st-chip st-chip-dark st-chip-agent">质量评估 {score.toFixed(2)}</span>
           ) : null}
         </div>
         <div className="st-image-canvas">
@@ -319,7 +317,7 @@ export function ImageStudioPage(props: {
               className="st-cap"
               style={{ color: 'var(--st-stage-muted)', textAlign: 'center', maxWidth: 360 }}
             >
-              这里会显示设定图的各个版本。导演 agent 开拍后会先生成角色和场景设定。
+              这里会显示设定图的各个版本。导演助手开拍后会先生成角色和场景设定。
             </div>
           ) : compare && compareWith ? (
             <div className="st-compare">
@@ -433,10 +431,6 @@ export function ImageStudioPage(props: {
               下载
             </a>
           ) : null}
-          <button type="button" className="st-btn st-btn-sm" disabled title="导演 agent 上线后可用">
-            <Lock />
-            锁定为设定
-          </button>
         </div>
       </section>
 
@@ -452,7 +446,7 @@ export function ImageStudioPage(props: {
               画面描述
             </div>
             <div className="st-card st-prompt-box">
-              {asset?.descriptor ?? '开拍后由导演 agent 根据需求写出画面描述。'}
+              {asset?.descriptor ?? '开拍后由导演助手根据需求写出画面描述。'}
               {asset?.locked ? (
                 <div className="st-row" style={{ marginTop: 8, gap: 6 }}>
                   <span className="st-chip st-chip-agent">
@@ -465,7 +459,7 @@ export function ImageStudioPage(props: {
           </div>
           <div>
             <div className="st-label" style={{ marginBottom: 8 }}>
-              模型 · Muse / GPT 可选（agent 自动选可用）
+              模型 · Muse / GPT 可选（导演助手自动选可用）
             </div>
             {imageKind.providers.length === 0 ? (
               <div className="st-card st-model-row" data-state="unconfigured">
@@ -522,18 +516,8 @@ export function ImageStudioPage(props: {
         <div className="st-image-side-foot">
           <div className="st-cap st-row" style={{ gap: 6, alignItems: 'flex-start' }}>
             <Info size={13} style={{ flex: 'none', marginTop: 2 }} />
-            评论会变成指令交给 agent，发送前先看“agent 理解为”。导演 agent 上线后可以直接再生成。
+            在画面上点按可留下批注草稿，后续会作为修改指令交给导演助手。
           </div>
-          <button
-            type="button"
-            className="st-btn st-btn-primary st-btn-lg"
-            style={{ width: '100%' }}
-            disabled
-            title="导演 agent 上线后可用"
-          >
-            {imageKind.state === 'ready' ? <Wand2 /> : <Sparkles />}
-            再生成（即将开放）
-          </button>
         </div>
       </aside>
     </div>

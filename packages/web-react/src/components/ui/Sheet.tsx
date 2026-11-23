@@ -83,7 +83,7 @@ export function Sheet({
           onFocusCapture={revealFocusedElement}
           className={cn(sheetVariants({ side }), className)}
         >
-          <RD.Title className="sr-only">{srTitle}</RD.Title>
+          <RD.Title className="sr-only text-ellipsis">{srTitle}</RD.Title>
           {closeButton && (
             // 绝对定位在面板右上:Content 是 fixed 容器,不占内容流;贴底抽屉的抓握条居中,与它不打架。
             <RD.Close asChild>

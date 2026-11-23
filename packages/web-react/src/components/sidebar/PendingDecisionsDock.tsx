@@ -369,7 +369,7 @@ export function PendingDecisionsDock({
           aria-expanded={!collapsed}
           title={toggleTitle}
           onClick={handleToggleCollapsed}
-          className="oc-pd-title-btn"
+          className="oc-pd-title-btn flex min-w-0 flex-1 items-center gap-1.5 max-sm:min-h-11 [@media(hover:none)]:min-h-11"
         >
           <span className="oc-pd-icon" aria-hidden>
             <AtelierIcon name="shield" size={13} />
@@ -422,7 +422,7 @@ export function PendingDecisionsDock({
                 type="button"
                 aria-pressed={effectiveFilter === "all"}
                 onClick={() => setSourceFilter("all")}
-                className="oc-pd-filter-pill"
+                className="oc-pd-filter-pill inline-flex shrink-0 items-center max-sm:min-h-11 max-sm:min-w-11 [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11"
               >
                 全部 {mergedItems.length}
               </button>
@@ -432,7 +432,7 @@ export function PendingDecisionsDock({
                   type="button"
                   aria-pressed={effectiveFilter === src}
                   onClick={() => setSourceFilter(effectiveFilter === src ? "all" : src)}
-                  className="oc-pd-filter-pill"
+                  className="oc-pd-filter-pill inline-flex shrink-0 items-center max-sm:min-h-11 max-sm:min-w-11 [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11"
                 >
                   {sourceIcon(src)}
                   <span>{PENDING_DECISION_SOURCE_LABELS[src]}</span>
@@ -602,7 +602,7 @@ export function PendingDecisionsDock({
               <button
                 type="button"
                 onClick={() => setShowAll(true)}
-                className="oc-live-strip-more"
+                className="oc-live-strip-more flex w-full items-center max-sm:min-h-11 [@media(hover:none)]:min-h-11"
                 data-testid="pending-decisions-show-more"
               >
                 展开其余 {hiddenCount} 条待拍板
@@ -612,7 +612,7 @@ export function PendingDecisionsDock({
               <button
                 type="button"
                 onClick={() => setShowAll(false)}
-                className="oc-live-strip-more"
+                className="oc-live-strip-more flex w-full items-center max-sm:min-h-11 [@media(hover:none)]:min-h-11"
               >
                 收起部分待拍板
               </button>

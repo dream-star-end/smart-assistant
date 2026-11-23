@@ -32,8 +32,10 @@ import { SignedAudio, SignedFileCard, SignedImg, SignedVideo, ZoomableImage } fr
 import { HtmlFileEmbed } from "./HtmlEmbed";
 import { CodeBlock } from "./CodeBlock";
 import { OptionsBlock, ChartBlock, HtmlPreview, MermaidBlock } from "./RichBlocks";
-import { IuiBlock } from "./iui/IuiBlock";
+import { LazyBoundary } from "./ChunkErrorBoundary";
+import { createRetryableLazy } from "./ui/retryableLazy";
 import { uiFencesToMarkdown } from "./iui/toMarkdown";
+import { isNextBlockCode } from "../lib/nextBlock";
 import { normalizeInlineUiFences } from "../lib/uiFence";
 import { useIntelligentUiEnabled } from "../lib/intelligentUi";
 import type { MarkdownProps } from "./Markdown";
@@ -44,6 +46,21 @@ import {
   detectCodeLanguageNow,
   SYNC_DETECT_MAX_CHARS,
 } from "../lib/codeLanguageDetect";
+
+/** Intelligent UI 渲染器（含 50+ 组件与 121 KB iui.css）按需懒加载，普通文本/代码回复零下载。 */
+const LazyIuiBlock = createRetryableLazy(() =>
+  import("./iui/IuiBlock").then((m) => ({ default: m.IuiBlock })),
+);
+
+const IUI_LAZY_FALLBACK = (
+  <div
+    className="oc-iui my-2 rounded-xl border border-border/70 bg-surface/60 px-3 py-2.5 text-meta text-faint"
+    data-iui="loading"
+    aria-busy="true"
+  >
+    正在加载交互视图…
+  </div>
+);
 
 /** 从(可能被 highlight 包成 span 的)code children 递归还原纯源码文本 —— mermaid/html 富块要原文。 */
 function nodeText(node: ReactNode): string {
@@ -487,9 +504,16 @@ export default function MarkdownImpl({
               // 富块:mermaid 流程图 / html 沙盒预览(取原文,绕开 highlight 的 span 包裹)。
               if (lang === "mermaid") return <MermaidBlock code={nodeText(children).replace(/\n$/, "")} />;
               if (lang === "chart") return <ChartBlock code={nodeText(children).replace(/\n$/, "")} />;
-              // Intelligent UI(OCV5-361):```ui 块 → 原生组件。关闭可选组件时仅保留完整严格的系统审批引用，其余围栏已转成 Markdown。
-              if (lang === "ui")
-                return <IuiBlock code={nodeText(children).replace(/\n$/, "")} live={liveRef.current} readOnly={readOnly} />;
+              // Intelligent UI(OCV5-361):```ui 块 → 按需懒加载原生组件。输入预测块提前短路不触发下载。
+              if (lang === "ui") {
+                const rawCode = nodeText(children).replace(/\n$/, "");
+                if (isNextBlockCode(rawCode, !!liveRef.current)) return null;
+                return (
+                  <LazyBoundary fallback={IUI_LAZY_FALLBACK}>
+                    <LazyIuiBlock code={rawCode} live={liveRef.current} readOnly={readOnly} />
+                  </LazyBoundary>
+                );
+              }
               if (lang === "options")
                 return <OptionsBlock code={nodeText(children).replace(/\n$/, "")} readOnly={readOnly} />;
               if (!readOnly && (lang === "html" || lang === "htmlpreview"))
@@ -577,6 +601,11 @@ export default function MarkdownImpl({
     }),
     [signMedia, blockImages, readOnly, tutorialImage],
   );
+  const skipRichHighlight: SkipRichHighlightMode = tutorialImage
+    ? false
+    : readOnly
+      ? "non-html"
+      : "all";
   const rehypePlugins = useMemo(
     () => [
       rehypeBareBreaks,
@@ -587,6 +616,7 @@ export default function MarkdownImpl({
         knownLanguage,
         // 只在流式尾段预取(项目文件预览等主动关探测的场景不探测)。
         prefetchDetect: live && !autoDetectCode ? prefetchDetect : undefined,
+        skipRichBlocks: skipRichHighlight,
       }],
       // 数学公式：$..$ / $$..$$ → KaTeX 渲染(remarkMath 解析 + rehypeKatex 出 HTML)。
       // errorColor 跟随主题 token(KaTeX 默认 #cc0000 在暗色底上对比度不足)。
@@ -596,7 +626,7 @@ export default function MarkdownImpl({
       // 流式光标内联到最后一个文本块末尾(最后执行,看到的是最终树)。
       ...(caret ? [rehypeLiveCaret] : []),
     ] as ComponentProps<typeof ReactMarkdown>["rehypePlugins"],
-    [autoDetectCode, onPendingDetect, knownLanguage, live, prefetchDetect, signMedia, readOnly, caret],
+    [autoDetectCode, onPendingDetect, knownLanguage, live, prefetchDetect, skipRichHighlight, signMedia, readOnly, caret],
   );
   let source = typeof children === "string" ? children : "";
   // 流式中未闭合的 $$:截掉半截公式,块后给一行静默占位(OCV5-421)。
@@ -648,6 +678,11 @@ function sharedHighlight(options: Parameters<typeof rehypeHighlight>[0]) {
   return transformer;
 }
 
+type SkipRichHighlightMode = false | "non-html" | "all";
+
+const RICH_NON_HTML_LANGS = new Set(["mermaid", "chart", "ui", "options"]);
+const RICH_ALL_LANGS = new Set(["mermaid", "chart", "ui", "options", "html", "htmlpreview"]);
+
 type HighlightOptions = {
   detect?: boolean;
   onPendingDetect?: (text: string) => void;
@@ -658,49 +693,98 @@ type HighlightOptions = {
    * 直接命中缓存上色。尾段最后一个节点可能是还没闭合的围栏,不预取。
    */
   prefetchDetect?: (text: string) => void;
+  /** 跳过 mermaid/chart/ui/options/(非只读 html/htmlpreview) 富块的 highlight.js 无效分词。 */
+  skipRichBlocks?: SkipRichHighlightMode;
 };
 
-/**
- * 高亮插件。有标注的代码块照常交给 rehype-highlight;无标注的块(detect 开时)由 lib/codeLanguageDetect 定语言
- * (OCV5-422):已知或小块 → 按该语言高亮一次,与 rehype-highlight 自带探测选中该语言时的输出相同(类名 hljs、
- * language-x);都不像(null)→ 借 plaintext 跳过探测,再还原成「自动探测无结果」的样子(只加 hljs,正文原样);
- * 大块且还没探测过 → 本次按不探测渲染(与流式尾段相同的纯文本代码块),交给 onPendingDetect 分片探测,结果出来后
- * 调用方重渲一次上色。attacher 每次渲染都会被调用(react-markdown 每次重建处理器),所以回调按本次渲染闭包。
- */
-function rehypeHighlightShared({ detect = false, onPendingDetect, knownLanguage, prefetchDetect }: HighlightOptions = {}) {
-  const base = sharedHighlight({ detect: false });
-  if (!detect && prefetchDetect) {
-    return (tree: Parameters<typeof base>[0], file: Parameters<typeof base>[1]) => {
-      const root = tree as unknown as HastNode;
-      const tail = lastTextNode(root);
-      for (const node of unlabelledCodeBlocks(root)) {
-        if (tail && containsNode(node, tail)) continue; // 正文以它结尾:可能还没闭合
-        const text = hastText(node);
-        if (text.length > SYNC_DETECT_MAX_CHARS && cachedCodeLanguage(text) === undefined) prefetchDetect(text);
-      }
-      base(tree, file);
-    };
+function richBlockLanguage(node: HastNode): string | null {
+  for (const value of codeClassNames(node) ?? []) {
+    const name = String(value);
+    if (name === "no-highlight" || name === "nohighlight") return null;
+    if (name.startsWith("language-")) return name.slice(9).toLowerCase();
+    if (name.startsWith("lang-")) return name.slice(5).toLowerCase();
   }
-  if (!detect) return base;
+  return null;
+}
+
+function collectSkippedRichBlocks(tree: HastNode, mode: SkipRichHighlightMode): { node: HastNode; classes: unknown[] }[] {
+  if (!mode) return [];
+  const skipSet = mode === "all" ? RICH_ALL_LANGS : RICH_NON_HTML_LANGS;
+  const skipped: { node: HastNode; classes: unknown[] }[] = [];
+  const walk = (node: HastNode, parent: HastNode | null) => {
+    if (node.type === "element" && node.tagName === "code" && parent?.type === "element" && parent.tagName === "pre") {
+      const lang = richBlockLanguage(node);
+      if (lang && skipSet.has(lang)) {
+        const classes = codeClassNames(node) ?? [];
+        node.properties = { ...node.properties, className: [...classes, "no-highlight"] };
+        skipped.push({ node, classes });
+      }
+    }
+    for (const child of node.children ?? []) walk(child, node);
+  };
+  walk(tree, null);
+  return skipped;
+}
+
+function restoreSkippedRichBlocks(skipped: { node: HastNode; classes: unknown[] }[]): void {
+  for (const item of skipped) {
+    item.node.properties = { ...item.node.properties, className: item.classes };
+  }
+}
+
+/**
+ * 高亮插件。有标注的代码块照常交给 rehype-highlight（富块语言提前跳过分词）；无标注的块(detect 开时)由
+ * lib/codeLanguageDetect 定语言(OCV5-422):已知或小块 → 按该语言高亮一次,与 rehype-highlight 自带探测选中该语言
+ * 时的输出相同(类名 hljs、language-x);都不像(null)→ 借 plaintext 跳过探测,再还原成「自动探测无结果」的样子
+ * (只加 hljs,正文原样);大块且还没探测过 → 本次按不探测渲染(与流式尾段相同的纯文本代码块),交给 onPendingDetect
+ * 分片探测,结果出来后调用方重渲一次上色。attacher 每次渲染都会被调用(react-markdown 每次重建处理器),所以回调按本次渲染闭包。
+ */
+function rehypeHighlightShared({
+  detect = false,
+  onPendingDetect,
+  knownLanguage,
+  prefetchDetect,
+  skipRichBlocks = false,
+}: HighlightOptions = {}) {
+  const base = sharedHighlight({ detect: false });
+  if (!detect && !prefetchDetect && !skipRichBlocks) return base;
   return (tree: Parameters<typeof base>[0], file: Parameters<typeof base>[1]) => {
-    const blocks = unlabelledCodeBlocks(tree as unknown as HastNode).map((node) => {
-      const text = hastText(node);
-      const classes = codeClassNames(node) ?? [];
-      let language = knownLanguage?.(text);
-      if (language === undefined) language = cachedCodeLanguage(text);
-      if (language === undefined && text.length <= SYNC_DETECT_MAX_CHARS) language = detectCodeLanguageNow(text);
-      if (language === undefined) onPendingDetect?.(text);
-      node.properties = { ...node.properties, className: [...classes, `language-${language ?? "plaintext"}`] };
-      return { node, language, classes, children: node.children };
-    });
-    base(tree, file);
-    for (const block of blocks) {
-      if (typeof block.language === "string") continue;
-      block.node.children = block.children;
-      block.node.properties = {
-        ...block.node.properties,
-        className: block.language === null ? ["hljs", ...block.classes.filter((name) => name !== "hljs")] : block.classes,
-      };
+    const root = tree as unknown as HastNode;
+    const skipped = collectSkippedRichBlocks(root, skipRichBlocks);
+    try {
+      if (!detect) {
+        if (prefetchDetect) {
+          const tail = lastTextNode(root);
+          for (const node of unlabelledCodeBlocks(root)) {
+            if (tail && containsNode(node, tail)) continue; // 正文以它结尾:可能还没闭合
+            const text = hastText(node);
+            if (text.length > SYNC_DETECT_MAX_CHARS && cachedCodeLanguage(text) === undefined) prefetchDetect(text);
+          }
+        }
+        base(tree, file);
+        return;
+      }
+      const blocks = unlabelledCodeBlocks(root).map((node) => {
+        const text = hastText(node);
+        const classes = codeClassNames(node) ?? [];
+        let language = knownLanguage?.(text);
+        if (language === undefined) language = cachedCodeLanguage(text);
+        if (language === undefined && text.length <= SYNC_DETECT_MAX_CHARS) language = detectCodeLanguageNow(text);
+        if (language === undefined) onPendingDetect?.(text);
+        node.properties = { ...node.properties, className: [...classes, `language-${language ?? "plaintext"}`] };
+        return { node, language, classes, children: node.children };
+      });
+      base(tree, file);
+      for (const block of blocks) {
+        if (typeof block.language === "string") continue;
+        block.node.children = block.children;
+        block.node.properties = {
+          ...block.node.properties,
+          className: block.language === null ? ["hljs", ...block.classes.filter((name) => name !== "hljs")] : block.classes,
+        };
+      }
+    } finally {
+      restoreSkippedRichBlocks(skipped);
     }
   };
 }
