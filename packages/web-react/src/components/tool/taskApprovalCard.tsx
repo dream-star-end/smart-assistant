@@ -3,7 +3,7 @@
  * 为准;agent 工具参数只提供 id / 可选提问,不能伪造单据状态。
  */
 import { ClipboardCheck, AlertTriangle, ChevronDown, RotateCcw } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useState } from "react";
 import { ApiError } from "../../lib/api";
 import { recordTicketApprovalPending, syncTicketApprovalFromTicket } from "../../lib/sessionStatus";
 import {
@@ -19,6 +19,11 @@ import { cn } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { Badge, Button, Spinner, Textarea } from "../ui";
 import { useChatInteraction, useToolCardActions } from "./context";
+import {
+  useTaskApprovalGroup,
+  useTaskApprovalGroupSnapshot,
+  type TaskApprovalDecisionKind,
+} from "./taskApprovalGroup";
 
 function statusTone(status: TicketStatus): "warning" | "accent" | "success" | "neutral" | "danger" {
   if (status === "waiting_human" || status === "backlog") return "warning";
@@ -35,6 +40,9 @@ function isApprovable(status: TicketStatus): boolean {
 export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }) {
   const { taskApproval, onOpenTaskboard } = useToolCardActions();
   const { sendUserText, busy: chatBusy } = useChatInteraction();
+  const approvalGroup = useTaskApprovalGroup();
+  const groupSnap = useTaskApprovalGroupSnapshot();
+  const cardKey = useId();
   const [ticket, setTicket] = useState<Ticket | null>(null);
   const [loading, setLoading] = useState(() => !!taskApproval);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -44,8 +52,14 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
   const [error, setError] = useState<string | null>(null);
   const [rejectOpen, setRejectOpen] = useState(false);
   const [rejectReason, setRejectReason] = useState("");
-  const [settled, setSettled] = useState<"approve" | "reject" | "defer" | null>(null);
+  const [settled, setSettled] = useState<TaskApprovalDecisionKind | null>(null);
   const [manualFollowUp, setManualFollowUp] = useState<string | null>(null);
+
+  useLayoutEffect(() => {
+    if (!approvalGroup || !id) return;
+    approvalGroup.registerCard(cardKey, id);
+    return () => approvalGroup.detachCard(cardKey);
+  }, [approvalGroup, cardKey, id]);
 
   useEffect(() => {
     if (!taskApproval || !id) return;
@@ -75,7 +89,12 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
   }, [taskApproval, id, reloadTick]);
 
   const announce = useCallback(
-    (message: string) => {
+    (kind: TaskApprovalDecisionKind, message: string) => {
+      if (approvalGroup?.isActiveGrouped()) {
+        approvalGroup.recordDecision(cardKey, { kind, summary: message });
+        setManualFollowUp(null);
+        return;
+      }
       if (sendUserText) {
         sendUserText(message);
         setManualFollowUp(null);
@@ -83,7 +102,7 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
         setManualFollowUp("请回复助手继续。");
       }
     },
-    [sendUserText],
+    [approvalGroup, cardKey, sendUserText],
   );
 
   const runWithRetry = useCallback(
@@ -103,33 +122,43 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
     [taskApproval, ticket, id],
   );
 
-  const onApprove = useCallback(() => {
-    if (!taskApproval || !ticket || deciding) return;
+  const approveTicket = useCallback(async (): Promise<boolean> => {
+    if (!taskApproval || !ticket || deciding) return false;
     setDeciding(true);
     setError(null);
-    void runWithRetry((t) => taskApproval.approve(t.identifier, t.version))
-      .then((next) => {
-        if (!next) return;
-        syncTicketApprovalFromTicket(next);
-        recordTicketApprovalPending(next.identifier, false, next.version);
-        recordTicketApprovalPending(next.id, false, next.version);
-        if (id !== next.identifier) recordTicketApprovalPending(id, false, next.version);
-        setTicket(next);
-        setSettled("approve");
-        const ident = next.identifier;
-        announce(next.status === "ready" && ticket.status === "backlog" ? `已批准开工 ${ident}` : `已通过 ${ident}`);
-      })
-      .catch((e) => {
-        setError(e instanceof ApiError ? taskboardErrorMessage(e, "更新单据失败") : "更新单据失败，请重试");
-        void taskApproval
-          .getTicket(id)
-          .then((t) => setTicket(t))
-          .catch(() => {
-            /* 刷新失败时保留本地错误 */
-          });
-      })
-      .finally(() => setDeciding(false));
+    try {
+      const next = await runWithRetry((t) => taskApproval.approve(t.identifier, t.version));
+      if (!next) return false;
+      syncTicketApprovalFromTicket(next);
+      recordTicketApprovalPending(next.identifier, false, next.version);
+      recordTicketApprovalPending(next.id, false, next.version);
+      if (id !== next.identifier) recordTicketApprovalPending(id, false, next.version);
+      setTicket(next);
+      setSettled("approve");
+      setDeciding(false);
+      const ident = next.identifier;
+      announce(
+        "approve",
+        next.status === "ready" && ticket.status === "backlog" ? `已批准开工 ${ident}` : `已通过 ${ident}`,
+      );
+      return true;
+    } catch (e) {
+      setError(e instanceof ApiError ? taskboardErrorMessage(e, "更新单据失败") : "更新单据失败，请重试");
+      void taskApproval
+        .getTicket(id)
+        .then((t) => setTicket(t))
+        .catch(() => {
+          /* 刷新失败时保留本地错误 */
+        });
+      return false;
+    } finally {
+      setDeciding(false);
+    }
   }, [taskApproval, ticket, deciding, runWithRetry, announce, id]);
+
+  const onApprove = useCallback(() => {
+    void approveTicket();
+  }, [approveTicket]);
 
   const onReject = useCallback(() => {
     const reason = rejectReason.trim();
@@ -146,28 +175,60 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
         setTicket(next);
         setSettled("reject");
         setRejectOpen(false);
-        announce(`已打回 ${next.identifier}：${reason}`);
+        setDeciding(false);
+        announce("reject", `已打回 ${next.identifier}：${reason}`);
       })
       .catch((e) => {
         setError(e instanceof ApiError ? taskboardErrorMessage(e, "打回失败") : "打回失败，请重试");
       })
       .finally(() => setDeciding(false));
-  }, [taskApproval, ticket, deciding, rejectReason, runWithRetry, announce]);
+  }, [taskApproval, ticket, deciding, rejectReason, runWithRetry, announce, id]);
 
   const onDefer = useCallback(() => {
     if (deciding || settled) return;
     recordTicketApprovalPending(ticket?.identifier ?? id, false);
     if (ticket?.identifier && id !== ticket.identifier) recordTicketApprovalPending(id, false);
     setSettled("defer");
-    announce(`暂不批准 ${ticket?.identifier ?? id}`);
+    announce("defer", `暂不批准 ${ticket?.identifier ?? id}`);
   }, [announce, deciding, settled, ticket, id]);
-
-  if (!id) return null;
 
   const status = ticket?.status;
   const approvable = !!status && isApprovable(status) && settled === null;
+  const alreadySettledExternally = !!status && !isApprovable(status) && settled === null;
+  const awaitingGroupSend = !!groupSnap && groupSnap.grouped && !groupSnap.sent;
+  const batchApproving = groupSnap?.batchApproving === true;
+
+  useEffect(() => {
+    if (!approvalGroup || !id) return;
+    approvalGroup.updateCard(cardKey, {
+      identifier: ticket?.identifier ?? id,
+      loading,
+      approvable: !!taskApproval && !loading && !loadError && approvable,
+      ticketStatus: status,
+      ticketStatusLabel: status ? TICKET_STATUS_LABEL[status] : undefined,
+      deciding: deciding && settled === null,
+      alreadySettledExternally,
+      triggerApprove: approvable ? approveTicket : undefined,
+    });
+  }, [
+    approvalGroup,
+    cardKey,
+    id,
+    ticket?.identifier,
+    loading,
+    loadError,
+    taskApproval,
+    approvable,
+    status,
+    deciding,
+    alreadySettledExternally,
+    approveTicket,
+  ]);
+
+  if (!id) return null;
+
   const actionable =
-    !!taskApproval && !loading && !loadError && approvable && !deciding && !chatBusy;
+    !!taskApproval && !loading && !loadError && approvable && !deciding && !chatBusy && !batchApproving;
   const approveLabel = status === "backlog" ? "批准开工" : "通过";
 
   return (
@@ -267,10 +328,20 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
           </output>
         ) : null}
         {settled === "approve" ? (
-          <p className="mt-2 text-caption font-medium text-success">已在对话中确认</p>
+          <p className="mt-2 text-caption font-medium text-success">
+            {awaitingGroupSend ? "已生效 · 待底部汇总发送" : "已在对话中确认"}
+          </p>
         ) : null}
-        {settled === "reject" ? <p className="mt-2 text-caption font-medium text-danger">已打回</p> : null}
-        {settled === "defer" ? <p className="mt-2 text-caption text-faint">已暂不处理</p> : null}
+        {settled === "reject" ? (
+          <p className="mt-2 text-caption font-medium text-danger">
+            {awaitingGroupSend ? "已打回 · 待底部汇总发送" : "已打回"}
+          </p>
+        ) : null}
+        {settled === "defer" ? (
+          <p className="mt-2 text-caption text-faint">
+            {awaitingGroupSend ? "已暂不处理 · 待底部汇总发送" : "已暂不处理"}
+          </p>
+        ) : null}
         {manualFollowUp ? <p className="mt-1 text-caption text-faint">{manualFollowUp}</p> : null}
 
         {rejectOpen && approvable && (

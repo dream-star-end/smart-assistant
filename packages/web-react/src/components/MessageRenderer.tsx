@@ -102,6 +102,10 @@ import {
 import { PartialHistorySkeleton } from "./chat/HistorySkeleton";
 import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput } from "./tool/format";
+import {
+  TaskApprovalGroupSlot,
+  coalesceTaskApprovalGroups,
+} from "./tool/taskApprovalCoalesce";
 import { Alert, IconButton, Input, Spinner, StatusPill } from "./ui";
 import { cn } from "../lib/utils";
 import {
@@ -775,9 +779,24 @@ type LeafRenderItem =
       tokenUsage?: DisplayTokenUsage;
     };
 
-type RenderItem = LeafRenderItem | {
-  kind: "process"; key: string; members: ChatMessage[]; items: LeafRenderItem[]; active: boolean;
-};
+type SingleRenderItem = Extract<LeafRenderItem, { kind: "single" }>;
+
+type RenderItem =
+  | LeafRenderItem
+  | {
+      kind: "process";
+      key: string;
+      members: ChatMessage[];
+      items: LeafRenderItem[];
+      active: boolean;
+    }
+  | {
+      kind: "approval-group";
+      key: string;
+      members: ChatMessage[];
+      items: SingleRenderItem[];
+      ticketIds: string[];
+    };
 function itemMessages(item: LeafRenderItem): ChatMessage[] {
   return item.kind === "single" ? [item.m] : item.members;
 }
@@ -1154,7 +1173,7 @@ function processTimeBounds(
 }
 
 function itemRows(item: RenderItem): ChatMessage[] {
-  return item.kind === "process" ? item.members : itemMessages(item);
+  return item.kind === "process" || item.kind === "approval-group" ? item.members : itemMessages(item);
 }
 
 function tapeRenderPageKey(message: ChatMessage | undefined): string {
@@ -1426,7 +1445,7 @@ function defaultTailStart(length: number): number {
 
 function renderItemKey(item: RenderItem): string {
   try {
-    if (item.kind === "process") return item.key;
+    if (item.kind === "process" || item.kind === "approval-group") return item.key;
     if (item.kind === "single") {
       return timelineMessageKey(item.m);
     }
@@ -2442,6 +2461,10 @@ export function MessageList({
         turnLineageParents,
       );
     }
+    nextRenderItems = coalesceTaskApprovalGroups<SingleRenderItem, RenderItem>(
+      nextRenderItems,
+      renderItemKey,
+    );
     const nextActionRowFinal = turnRatingFlags(renderableMessages, nextRatingFinal, turnLineageParents);
     return {
       turnStart: nextTurnStart,
@@ -2669,6 +2692,15 @@ export function MessageList({
   };
 
   const renderItem = (it: RenderItem, renderIndex?: number): ReactNode => {
+    if (it.kind === "approval-group") {
+      return (
+        <TaskApprovalGroupSlot ticketIds={it.ticketIds}>
+          {it.items.map((child) => (
+            <div key={renderItemKey(child)}>{renderItem(child, renderIndex)}</div>
+          ))}
+        </TaskApprovalGroupSlot>
+      );
+    }
     if (it.kind === "process") {
       const sections = processSections(it.items, itemMessages, renderItemKey);
       const needle = findQuery.trim().toLowerCase();
