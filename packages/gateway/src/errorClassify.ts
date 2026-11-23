@@ -25,6 +25,8 @@ export type ClassifiedErrorCode =
   | 'model_config_changed_retry_turn'
   | 'model_not_available'
   | 'upstream_failed'
+  | 'upstream_timeout'
+  | 'network_error'
   | 'context_too_long'
   | 'request_too_large'
   | 'bad_request'
@@ -126,7 +128,7 @@ const PATTERNS: Array<{
   {
     re: /(?:\b429\b|rate[_ ]?limit(?:ed)?|RATE_LIMITED)/i,
     code: 'rate_limited',
-    message: '当前账号被限流，请稍后再试',
+    message: '请求暂时较多，请稍后再试',
   },
   {
     // CCB intentionally normalizes provider 400/413 details to the exact
@@ -235,6 +237,13 @@ const PATTERNS: Array<{
     code: 'model_capacity',
     message: '上游连续失败，已停止自动重试。请切换引擎后再试',
   },
+  // 上游请求/响应超时 —— 必须排在通用 upstream_failed 之前，避免 ETIMEDOUT /
+  // Gateway Timeout / upstream timed out 被泛化吞成 upstream_failed。
+  {
+    re: /(?:\bUPSTREAM_TIMEOUT\b|\bETIMEDOUT\b|\bESOCKETTIMEDOUT\b|\bUND_ERR_(?:HEADERS|BODY|CONNECT)_TIMEOUT\b|\bGateway Time-?out\b|\b(?:request|response|upstream|read|headers?|body|connect(?:ion)?|socket|stream)\s+timed?\s*out\b|\btimeout waiting for\b|\bdeadline exceeded\b)/i,
+    code: 'upstream_timeout',
+    message: '模型响应超时，请稍后重试',
+  },
   // 通用 5xx / 上游连接失败。
   // 审计 R1:
   //   - `\b5\d{2}\b` 覆盖全部 5xx(不再只认 502/503/504)。边界写法与旧
@@ -244,10 +253,16 @@ const PATTERNS: Array<{
   //     402/429 分别归 credits/rate_limited(均排在本档之前),不会被本正则劫走。
   //   - ECONNREFUSED / EAI_AGAIN 补齐连接被拒与 DNS 瞬时失败两类网络错误。
   {
-    re: /(?:\b5\d{2}\b|upstream|ECONNRESET|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|Network unreachable|failed to connect to websocket|CODEX_CHATGPT_WS_DIRECT|ECONNREFUSED|EAI_AGAIN|ACCOUNT_POOL_(?:BUSY|UNAVAILABLE)|UPSTREAM_FAILED)/i,
+    re: /(?:\b5\d{2}\b|upstream|ECONNRESET|ENETUNREACH|EHOSTUNREACH|Network unreachable|failed to connect to websocket|CODEX_CHATGPT_WS_DIRECT|ECONNREFUSED|EAI_AGAIN|ACCOUNT_POOL_(?:BUSY|UNAVAILABLE)|UPSTREAM_FAILED)/i,
     code: 'upstream_failed',
     // 文案刻意不绑定具体厂商:同一分类被 CCB/Codex/多提供商路径共用。
     message: '模型服务上游暂时异常，请稍后重试',
+  },
+  // 传输/网络层中断 —— 兜底未命中 upstream_failed 既有回归集的高确定性网络错误。
+  {
+    re: /(?:\bNETWORK_ERROR\b|\bENOTFOUND\b|\bEPIPE\b|\bECONNABORTED\b|\bERR_SOCKET_CLOSED\b|\bUND_ERR_SOCKET\b|\bfetch failed\b|\bsocket hang up\b|\bnetwork\s+error\b|\bconnection\s+(?:reset|closed|dropped|refused|aborted|terminated)\b|\b(?:tls|ssl)\s+handshake\b|\bdns\s+(?:lookup|resolution)\s+failed\b)/i,
+    code: 'network_error',
+    message: '网络波动导致本轮中断，请检查连接后重试',
   },
 ]
 

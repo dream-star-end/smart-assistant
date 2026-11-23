@@ -1470,10 +1470,10 @@ export class CronScheduler {
         occurrenceRecords.filter((row) => row.state !== 'delivered').map((row) => row.jobId),
       )
 
-      // Cleanup: remove completed oneshot jobs from yaml
+      // Cleanup: remove completed oneshot jobs from yaml (require lastRun so manually paused unexecuted oneshots are preserved)
       const before = file.jobs.length
       file.jobs = file.jobs.filter((j) => !(
-        j.oneshot && j.enabled === false && !this.retryState.has(j.id) &&
+        j.oneshot && j.enabled === false && Boolean(lastRun[j.id]) && !this.retryState.has(j.id) &&
         !pendingOccurrenceJobs.has(j.id)
       ))
       if (file.jobs.length < before) {
@@ -1971,16 +1971,21 @@ export class CronScheduler {
               keepDelivered ? { callbackState: 'delivered' } : undefined,
             )
           }
-          // A one-shot remains enabled across retryable failures. Completed,
-          // silent, permanent and explicitly exhausted outcomes consume it.
-          if (job.oneshot) {
-            job.enabled = false
-            await saveCronFile(await ensureCronFile(), job)
-          }
           // Record the minute that actually fired (catch-up records the missed
           // minute M, not "now") so it stays idempotent across restarts.
+          // For oneshot jobs, flush lastRun immediately before disabling in cron.yaml
+          // so concurrent background-state readers never observe enabled=false && lastRunAt=null.
           lastRun[job.id] = dueMinuteKey
           lastRunDirty = true
+          if (job.oneshot) {
+            try {
+              await this.persistLastRun(lastRun)
+              lastRunDirty = false
+            } finally {
+              job.enabled = false
+              await saveCronFile(await ensureCronFile(), job)
+            }
+          }
           if (this.retryState.has(job.id)) completedRetryIds.add(job.id)
         }
       } finally {

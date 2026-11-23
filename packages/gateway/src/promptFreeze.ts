@@ -14,7 +14,7 @@
  * shadow comparison. Explicit inputs changing, or a gap longer than the cache
  * window, always take the fresh prompt.
  */
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import {
   mkdirSync,
   readFileSync,
@@ -197,7 +197,7 @@ function pruneStale(home: string, now: number): void {
 export function writeFrozenPrompt(home: string, record: FrozenPromptRecord, now = Date.now()): void {
   const path = promptFreezePath(home, record.sessionKey)
   mkdirSync(join(home, DIR), { recursive: true, mode: 0o700 })
-  const tmp = `${path}.${process.pid}.tmp`
+  const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
   writeFileSync(tmp, JSON.stringify(record), { mode: 0o600 })
   renameSync(tmp, path)
   pruneStale(home, now)

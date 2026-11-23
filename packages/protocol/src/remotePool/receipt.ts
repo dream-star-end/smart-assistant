@@ -7,10 +7,33 @@
  *   reconnects on the same turn produce the identical semantic digest).
  * - `receiptDigest`: canonical sha256 over the full v4 receipt (excluding `receiptDigest` itself).
  */
-import { isDeepStrictEqual } from 'node:util'
 import { REMOTE_DRIVER_BACKEND } from './backend.js'
 import { remoteCanonicalSha256 } from './canonical.js'
 import type { RemoteDriverUsagePolicy } from './events.js'
+
+function deepStrictEqual(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true
+  if (typeof a !== 'object' || a === null || typeof b !== 'object' || b === null) return false
+  if (Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false
+  if (Array.isArray(a)) {
+    if (!Array.isArray(b) || a.length !== b.length) return false
+    for (let i = 0; i < a.length; i += 1) {
+      if (!deepStrictEqual(a[i], b[i])) return false
+    }
+    return true
+  }
+  if (Array.isArray(b)) return false
+  const recA = a as Record<string, unknown>
+  const recB = b as Record<string, unknown>
+  const keysA = Object.keys(recA)
+  const keysB = Object.keys(recB)
+  if (keysA.length !== keysB.length) return false
+  for (const key of keysA) {
+    if (!Object.prototype.hasOwnProperty.call(recB, key)) return false
+    if (!deepStrictEqual(recA[key], recB[key])) return false
+  }
+  return true
+}
 
 const IDENT_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const SHA256_RE = /^[a-f0-9]{64}$/
@@ -377,6 +400,6 @@ export function validateRemoteReceiptV4(
       probeFingerprint: String(prov.probeFingerprint),
     },
   })
-  need(isDeepStrictEqual(rebuilt, raw), 'REMOTE_RECEIPT_V4_DIGEST_MISMATCH')
+  need(deepStrictEqual(rebuilt, raw), 'REMOTE_RECEIPT_V4_DIGEST_MISMATCH')
   return rebuilt
 }

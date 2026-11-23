@@ -1,19 +1,10 @@
 import { randomBytes } from 'node:crypto'
 import dns from 'node:dns'
+import { rootLogger } from '../logging/logger.js'
 import type { SitesEdgeClient } from './edgeClient.js'
-import {
-  computeEnvMapDigest,
-  decryptSiteSecretFromDb,
-  deriveSiteDbEnvKey,
-  encryptSiteSecretForDb,
-  sealEdgeEnvMap,
-} from './envCrypto.js'
-import type {
-  SitesRepo,
-  StoredSiteCollaboratorRow,
-  StoredSiteEnvVarRow,
-  StoredSiteInviteRow,
-} from './repo.js'
+const sitesLog = rootLogger.child({ module: 'sites.service' })
+import { computeEnvMapDigest, decryptSiteSecretFromDb, deriveSiteDbEnvKey, encryptSiteSecretForDb, sealEdgeEnvMap } from './envCrypto.js'
+import type { SitesRepo, StoredSiteCollaboratorRow, StoredSiteEnvVarRow, StoredSiteInviteRow } from './repo.js'
 import {
   DEFAULT_SITE_MAX_PER_USER,
   DEFAULT_SITE_MAX_TOTAL_BYTES,
@@ -398,8 +389,9 @@ export class SitesService {
             } else {
               await repo.releaseLease(claimed.row.id, ownerId, claimed.leaseId, false)
             }
-          } catch {
-            await repo.releaseLease(claimed.row.id, ownerId, claimed.leaseId, false).catch(() => {})
+          } catch (err) {
+            sitesLog.warn('reconcile pending rename failed', { siteId: claimed.row.id, userId: ownerId, slug: claimed.row.slug, targetSlug, err })
+            await repo.releaseLease(claimed.row.id, ownerId, claimed.leaseId, false).catch((relErr) => sitesLog.warn('releaseLease after rename reconcile failure failed', { siteId: claimed.row.id, err: relErr }))
           }
         })
         continue
@@ -539,8 +531,9 @@ export class SitesService {
             // Never delete a PG row on non-delete ops (e.g. an intermediate crash or rename tombstone).
             await repo.releaseLease(claimed.row.id, ownerId, claimed.leaseId, true)
           }
-        } catch {
-          await repo.releaseLease(claimed.row.id, ownerId, claimed.leaseId, false).catch(() => {})
+        } catch (err) {
+          sitesLog.warn('reconcile pending site operation failed', { siteId: claimed.row.id, userId: ownerId, slug: claimed.row.slug, opKind: claimed.row.opKind, err })
+          await repo.releaseLease(claimed.row.id, ownerId, claimed.leaseId, false).catch((relErr) => sitesLog.warn('releaseLease after reconcile failure failed', { siteId: claimed.row.id, err: relErr }))
         }
       })
     }

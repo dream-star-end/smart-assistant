@@ -285,7 +285,7 @@ export function sessionStartFailureMessage(code: string): string {
     return '这个对话的历史没法接到当前模型上继续。这一轮还没有开始，也不会计费。请新开一个对话再发送，或换回原来的模型。'
   }
   if (code === 'MODEL_SWITCH_IN_PROGRESS') return '模型正在切换，这一轮还没有开始，也不会计费。请稍后重新发送。'
-  return `这一轮没能开始（${code}），不会计费。请稍后重新发送；反复出现可以换个模型或新开对话。`
+  return '这一轮没能开始，不会计费。请稍后重新发送；反复出现可以换个模型或新开对话。'
 }
 
 /**

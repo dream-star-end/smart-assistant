@@ -30,6 +30,7 @@ import {
 } from './clientSessionsPlan.js'
 import { cjkFtsColumn, literalFtsQuery } from './ftsQuery.js'
 import { migrateSessionsFtsCjk, registerFtsCjkFunctions } from './ftsCjkMigrate.js'
+import { ensureSessionsDbObservabilityIndexes, pruneOrphanedSessionsFtsRows } from './sessionsDbIndexes.js'
 import { paths } from './paths.js'
 // wechat_bindings 是 master 六表之一,其 SQLite 实现在 wechatBindings.ts(靠近 wechat 专用
 // helper),这里 import 进来组合成完整的 sqliteBackend。函数声明,循环 import 下实例化即就绪。
@@ -180,6 +181,7 @@ export type {
 } from './sessionsDbProjects.js'
 
 let _db: Database.Database | null = null
+let _dbInitPromise: Promise<Database.Database> | null = null
 let _walTimer: ReturnType<typeof setInterval> | null = null
 
 function _onExit(): void {
@@ -204,8 +206,20 @@ function _logMigrationFailure(step: string, err: unknown): void {
 
 export async function getSessionsDb(): Promise<Database.Database> {
   if (_db) return _db
+  if (_dbInitPromise) return _dbInitPromise
+  const initPromise = _openSessionsDb()
+  _dbInitPromise = initPromise
+  try {
+    return await initPromise
+  } finally {
+    if (_dbInitPromise === initPromise) _dbInitPromise = null
+  }
+}
+
+async function _openSessionsDb(): Promise<Database.Database> {
   await mkdir(dirname(paths.sessionsDb), { recursive: true })
   const db = new Database(paths.sessionsDb)
+  try {
   // Gateway, MCP memory workers, and migration helpers can legitimately open
   // the same WAL database from separate processes.  A turn-id reservation is
   // a durability prerequisite, so an instantaneous SQLITE_BUSY must wait for
@@ -394,57 +408,11 @@ export async function getSessionsDb(): Promise<Database.Database> {
   } catch (err) { _logMigrationFailure('event_log add peer_id/channel', err) }
 
   // ── Create indexes (after migrations) ──
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_event_log_type_ts ON event_log(type, timestamp);
-    CREATE INDEX IF NOT EXISTS idx_event_log_agent_ts ON event_log(agent_id, timestamp);
-    CREATE INDEX IF NOT EXISTS idx_event_log_session ON event_log(session_key);
-    CREATE INDEX IF NOT EXISTS idx_event_log_peer ON event_log(peer_id);
-    CREATE INDEX IF NOT EXISTS idx_usage_log_agent_ts ON usage_log(agent_id, timestamp);
-    CREATE INDEX IF NOT EXISTS idx_usage_log_session ON usage_log(session_id);
-    CREATE INDEX IF NOT EXISTS idx_memory_usage_agent_ts ON memory_usage_events(agent_id, timestamp);
-    CREATE INDEX IF NOT EXISTS idx_memory_usage_session_turn ON memory_usage_events(session_key, turn_index);
-    CREATE INDEX IF NOT EXISTS idx_memory_usage_pending ON memory_usage_events(reported_at, timestamp);
-    CREATE INDEX IF NOT EXISTS idx_memory_turn_context_agent_ts ON memory_turn_context(agent_id, created_at);
-  `)
-
-  // Periodic WAL checkpoint to prevent unbounded WAL growth
-  // E10 — checkpoint 失败加 warn:长期静默失败 = WAL 无界膨胀(doctor 会报体积),
-  // 必须有日志线索;单次失败不致命,下个周期重试。
-  _walTimer = setInterval(() => {
-    try {
-      db.pragma('wal_checkpoint(TRUNCATE)')
-    } catch (err) {
-      console.warn(
-        '[sessionsDb] periodic wal_checkpoint(TRUNCATE) failed:',
-        err instanceof Error ? err.message : String(err),
-      )
-    }
-  }, 30 * 60_000) // every 30 min
-  // Don't prevent process exit — mcp-memory processes are short-lived
-  _walTimer.unref()
-  // Run one immediately
-  try {
-    db.pragma('wal_checkpoint(TRUNCATE)')
-  } catch (err) {
-    console.warn(
-      '[sessionsDb] startup wal_checkpoint(TRUNCATE) failed:',
-      err instanceof Error ? err.message : String(err),
-    )
-  }
-
-  // Ensure WAL is checkpointed and DB is closed on process exit.
-  // Use process.on (not once) so that closeSessionsDb() + reopen still works,
-  // but the guard `if (_db)` makes repeated calls idempotent.
-  process.on('exit', _onExit)
+  ensureSessionsDbObservabilityIndexes(db)
 
   // CJK FTS rebuild (idempotent). Existing DBs still have the 4-column
   // unicode61 schema from CREATE IF NOT EXISTS; this swaps in content_fts.
   migrateSessionsFtsCjk(db)
-
-  // Clean up orphaned FTS records (sessions_fts rows with no matching sessions_meta)
-  try {
-    db.exec('DELETE FROM sessions_fts WHERE NOT EXISTS (SELECT 1 FROM sessions_meta WHERE sessions_meta.id = sessions_fts.session_id)')
-  } catch { /* non-fatal: stale FTS rows are harmless */ }
 
   // ── Client sessions (cross-device sync, multi-user) ──
   db.exec(`
@@ -905,10 +873,30 @@ export async function getSessionsDb(): Promise<Database.Database> {
     }
   } catch { /* 水位抬升失败不挡开库;下次 open 再试 */ }
 
+  // Startup & periodic WAL checkpoint + exit hook (installed only after all DDL/migrations succeed)
+  try {
+    db.pragma('wal_checkpoint(TRUNCATE)')
+  } catch (err) {
+    console.warn('[sessionsDb] startup wal_checkpoint(TRUNCATE) failed:', err instanceof Error ? err.message : String(err))
+  }
+  if (_walTimer !== null) { clearInterval(_walTimer); _walTimer = null }
+  _walTimer = setInterval(() => {
+    try { db.pragma('wal_checkpoint(TRUNCATE)') } catch (err) {
+      console.warn('[sessionsDb] periodic wal_checkpoint(TRUNCATE) failed:', err instanceof Error ? err.message : String(err))
+    }
+  }, 30 * 60_000)
+  _walTimer.unref()
+  process.off('exit', _onExit)
+  process.on('exit', _onExit)
+
   // 旧重量级团队模式(team_runs / team_delegations)已整套删除:schema 不再声明,
   // 存量本地 DB 里已建的表留着无害(不写 DROP TABLE,不迁移)。
   _db = db
   return db
+  } catch (err) {
+    try { db.close() } catch {}
+    throw err
+  }
 }
 
 /**
@@ -6274,9 +6262,14 @@ export {
   getLocalSkillUsageMap,
 } from './skillUsageLocal.js'
 
+export async function pruneOrphanedSessionsFts(): Promise<number> {
+  return pruneOrphanedSessionsFtsRows(await getSessionsDb())
+}
+
 export async function closeSessionsDb(): Promise<void> {
+  if (_dbInitPromise) { try { await _dbInitPromise } catch {} }
   if (_walTimer !== null) { clearInterval(_walTimer); _walTimer = null }
-  process.removeListener('exit', _onExit)
+  process.off('exit', _onExit)
   if (_db) {
     try { _db.pragma('wal_checkpoint(TRUNCATE)'); _db.close() } catch {}
     _db = null

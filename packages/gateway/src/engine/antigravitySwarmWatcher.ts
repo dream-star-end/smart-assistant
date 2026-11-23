@@ -88,6 +88,7 @@ interface TranscriptSummary {
   stepCount: number
   status: SwarmMemberStatus | null
   activity?: string
+  waitingOnBoard?: boolean
   failed?: boolean
   lastError?: string
   firstStepAt?: number
@@ -256,8 +257,22 @@ function shortFileTarget(args: Record<string, unknown> | null): string {
   return basename(raw) || raw
 }
 
+const SWARM_MCP_TOOL_PREFIX = 'mcp_openclaude-memory_'
+
+/** Strip the container MCP prefix (`mcp_openclaude-memory_`) so remote swarm tools
+ *  (`mcp_openclaude-memory_swarm_wait` / `_post_message` / `_read_board` / `_swarm`)
+ *  normalize to the same canonical names as native Antigravity CLI tools. */
+export function normalizeSwarmToolName(raw: string): string {
+  const trimmed = raw.trim()
+  if (trimmed.toLowerCase().startsWith(SWARM_MCP_TOOL_PREFIX)) {
+    return trimmed.slice(SWARM_MCP_TOOL_PREFIX.length)
+  }
+  return trimmed
+}
+
 function describeToolActivity(toolName: string, args: Record<string, unknown> | null): string {
-  const name = toolName.trim()
+  const rawName = toolName.trim()
+  const name = normalizeSwarmToolName(rawName)
   const target = shortFileTarget(args)
   switch (name) {
     case 'read_file':
@@ -272,14 +287,14 @@ function describeToolActivity(toolName: string, args: Record<string, unknown> | 
     case 'sed_file':
       return target ? `编辑 ${target}` : '编辑文件'
     case 'run_command':
-    case 'mcp_openclaude-memory_oc_bash':
+    case 'oc_bash':
       return '运行命令'
     case 'grep_search':
-    case 'mcp_openclaude-memory_oc_grep':
+    case 'oc_grep':
       return '检索代码'
     case 'find_by_name':
     case 'list_dir':
-    case 'mcp_openclaude-memory_oc_glob':
+    case 'oc_glob':
       return '浏览目录'
     case 'search_web':
       return '联网检索'
@@ -299,7 +314,7 @@ function describeToolActivity(toolName: string, args: Record<string, unknown> | 
       return '调度蜂群'
     }
     default:
-      if (name.startsWith('mcp_')) return `调用 ${name.split('_').slice(-1)[0] || name}`
+      if (rawName.startsWith('mcp_')) return `调用 ${rawName.split('_').slice(-1)[0] || rawName}`
       return name ? `执行 ${name}` : '处理中…'
   }
 }
@@ -635,7 +650,7 @@ export class IncrementalTranscriptTelemetryCache {
 }
 
 function hasSwarmWaitCall(calls: readonly unknown[]): boolean {
-  return calls.some((c) => asStr(recordOf(c)?.name).toLowerCase() === 'swarm_wait')
+  return calls.some((c) => normalizeSwarmToolName(asStr(recordOf(c)?.name)).toLowerCase() === 'swarm_wait')
 }
 
 /**
@@ -747,6 +762,7 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
         stepCount: maxStepIndex,
         status: 'waiting',
         activity: '已完成本轮思考',
+        waitingOnBoard: true,
       }
     }
     if (calls.length > 0) {
@@ -756,6 +772,7 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
           stepCount: maxStepIndex,
           status: lastStatus === 'DONE' ? 'waiting' : 'working',
           activity: '等待讨论板消息',
+          waitingOnBoard: true,
         }
       }
       const lastCall = recordOf(calls[calls.length - 1])
@@ -783,7 +800,7 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
     lastPlanner && Array.isArray(lastPlanner.tool_calls) ? lastPlanner.tool_calls : []
   const isSwarmWaitDone =
     turnSteps.slice(-6).some((step) => {
-      const name = asStr(step.tool_name || step.name).toLowerCase()
+      const name = normalizeSwarmToolName(asStr(step.tool_name || step.name)).toLowerCase()
       const st = asStr(step.status).toUpperCase()
       return name === 'swarm_wait' && st === 'DONE'
     }) ||
@@ -794,6 +811,7 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
       stepCount: maxStepIndex,
       status: 'waiting',
       activity: '等待讨论板消息',
+      waitingOnBoard: true,
     }
   }
 
@@ -801,11 +819,13 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
   // tool steps and RemoteSwarm `TOOL_CALL` records that store `tool_calls[]`).
   const directTool = asStr(last.tool_name || last.name)
   if (directTool) {
+    const isSwarmWait = normalizeSwarmToolName(directTool).toLowerCase() === 'swarm_wait'
     return {
       ...telBase,
       stepCount: maxStepIndex,
-      status: 'working',
+      status: isSwarmWait && lastStatus === 'DONE' ? 'waiting' : 'working',
       activity: describeToolActivity(directTool, recordOf(last.arguments ?? last.args)),
+      ...(isSwarmWait ? { waitingOnBoard: true } : {}),
     }
   }
   if ((lastType === 'TOOL_CALL' || lastType === 'TOOL_USE') && Array.isArray(last.tool_calls) && last.tool_calls.length > 0) {
@@ -815,6 +835,7 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
         stepCount: maxStepIndex,
         status: lastStatus === 'DONE' ? 'waiting' : 'working',
         activity: '等待讨论板消息',
+        waitingOnBoard: true,
       }
     }
     const latestToolCall = recordOf(last.tool_calls[last.tool_calls.length - 1])
@@ -834,6 +855,7 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
         stepCount: maxStepIndex,
         status: lastStatus === 'DONE' ? 'waiting' : 'working',
         activity: '等待讨论板消息',
+        waitingOnBoard: true,
       }
     }
     const latestCall = recordOf(lastPlannerCalls[lastPlannerCalls.length - 1])
@@ -1157,6 +1179,9 @@ export function readAntigravitySwarmSnapshot(opts: {
       killed
         ? '已回收'
         : transcript.activity || (wakeModeLower === 'mentions' ? '等待 @提及' : status === 'waiting' ? '待命中' : '工作中…')
+    const waitingOnBoard =
+      status !== 'killed' &&
+      (status === 'waiting' || status === 'stopped' || transcript.waitingOnBoard === true)
 
     members.push({
       name,
@@ -1168,6 +1193,7 @@ export function readAntigravitySwarmSnapshot(opts: {
       ...(wakeMode ? { wakeMode } : {}),
       stepCount: transcript.stepCount,
       activity,
+      ...(waitingOnBoard ? { waitingOnBoard: true } : {}),
       ...(transcript.failed ? { failed: true } : {}),
       ...(transcript.lastError ? { lastError: transcript.lastError } : {}),
       unreadCount,
@@ -1303,6 +1329,7 @@ function structuralFingerprint(snap: SwarmSnapshot): string {
       workspaceBranch: m.workspaceBranch,
       workspacePath: m.workspacePath,
       wakeMode: m.wakeMode,
+      waitingOnBoard: m.waitingOnBoard,
       failed: m.failed,
       lastError: m.lastError,
       lastPostSeq: m.lastPostSeq,

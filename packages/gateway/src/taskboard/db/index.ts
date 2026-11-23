@@ -20,6 +20,7 @@ import Database from 'better-sqlite3'
 import {
   TASKBOARD_DDL_V1,
   TASKBOARD_DDL_V2,
+  TASKBOARD_DDL_V11,
   TASKBOARD_SCHEMA_VERSION,
   type TaskboardDb,
 } from './schema.js'
@@ -98,6 +99,10 @@ export function migrate(db: TaskboardDb): void {
       // B2 原占 v9,与 B1 回填撞号,合入时让到 v10。
       db.exec('ALTER TABLE tb_ticket ADD COLUMN approved_by TEXT')
       db.exec('ALTER TABLE tb_ticket ADD COLUMN approved_at INTEGER')
+    }
+    if (current < 11) {
+      // v11:补齐热路径索引（评论/租约回收/会话关联/反向关系/项目状态/来源会话）。
+      db.exec(TASKBOARD_DDL_V11)
     }
     db.pragma(`user_version = ${TASKBOARD_SCHEMA_VERSION}`)
     ensureSettingsRow(db)

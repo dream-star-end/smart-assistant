@@ -1,6 +1,6 @@
 // Set OPENCLAUDE_HOME to an isolated temp dir BEFORE importing cron.ts —
 // `paths.cronYaml` snapshots HOME at module load time, so this must run first.
-import { mkdtempSync, rmSync, existsSync, unlinkSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, existsSync, unlinkSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -1402,5 +1402,61 @@ describe('CronScheduler.runJob — HEARTBEAT_OK 静默不送达', () => {
       { kind: 'silent' },
     )
     assert.deepEqual(silenced.deliveries, [])
+  })
+})
+
+describe('OCV5-858 oneshot lastRun immediate flush & paused unexecuted guard', () => {
+  it('preserves manually paused unexecuted oneshot jobs during tick cleanup while still cleaning completed oneshots with lastRun', async () => {
+    process.env.OC_SEED_DEFAULT_CRON = '0'
+    const lastRunPath = join(TEST_HOME, 'cron', 'last-run.json')
+    const retryPath = join(TEST_HOME, 'cron', 'retry-state.json')
+    for (const p of [paths.cronYaml, paths.agentsYaml, lastRunPath, retryPath]) {
+      if (existsSync(p)) unlinkSync(p)
+    }
+    writeFileSync(
+      paths.cronYaml,
+      stringifyYaml({
+        jobs: [
+          {
+            id: 'oneshot-paused-unexecuted',
+            schedule: '0 2 23 11 *',
+            agent: 'x',
+            prompt: 'paused before ever firing',
+            deliver: 'local',
+            enabled: false,
+            oneshot: true,
+          },
+          {
+            id: 'oneshot-already-completed',
+            schedule: '0 1 23 11 *',
+            agent: 'x',
+            prompt: 'already fired',
+            deliver: 'local',
+            enabled: false,
+            oneshot: true,
+          },
+        ],
+      }),
+    )
+    writeFileSync(
+      paths.agentsYaml,
+      stringifyYaml({ agents: [{ id: 'x', model: 'glm-5.2' }], routes: [], default: 'x' }),
+    )
+    mkdirSync(join(TEST_HOME, 'cron'), { recursive: true })
+    writeFileSync(lastRunPath, JSON.stringify({ 'oneshot-already-completed': 29_900_000 }))
+
+    const sched = new CronScheduler(
+      { defaults: { model: 'glm-5.2' } } as any,
+      { getOrCreate: async () => ({}), submit: async () => {}, destroySession: async () => {} } as any,
+      async () => {},
+    )
+    await (sched as any).tick()
+
+    const after = parseYaml(readFileSync(paths.cronYaml, 'utf8')) as { jobs: Array<{ id: string }> }
+    assert.deepEqual(
+      after.jobs.map((j) => j.id),
+      ['oneshot-paused-unexecuted'],
+      'manually paused unexecuted oneshot must NOT be deleted during cleanup',
+    )
   })
 })

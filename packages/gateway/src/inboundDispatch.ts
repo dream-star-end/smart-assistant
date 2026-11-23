@@ -352,7 +352,7 @@ export async function dispatchInbound(
           sessionKey: `agent:${frame.agentId}:${frame.channel}:${frame.peer.kind}:${safePeerId}`,
           channel: frame.channel,
           peer: frame.peer,
-          blocks: [{ kind: 'text' as const, text: '[error] agent not found' }],
+          blocks: [{ kind: 'text' as const, text: '[error] 未找到指定的助手' }],
           isFinal: true,
           traceId: turnTraceId,
           _userId: hiddenAgentUserId,
@@ -401,7 +401,7 @@ export async function dispatchInbound(
           sessionKey,
           channel: frame.channel,
           peer: frame.peer,
-          blocks: [{ kind: 'text' as const, text: '[error] agent not found' }],
+          blocks: [{ kind: 'text' as const, text: '[error] 未找到指定的助手' }],
           isFinal: true,
           traceId: turnTraceId,
           _userId: hiddenAgentUserId,
@@ -459,7 +459,7 @@ export async function dispatchInbound(
           traceId: turnTraceId,
           code: 'upstream_failed',
           message: '模型服务暂时不可用，请稍后重试或切换模型',
-          legacyErrorText: `[error] model routing rejected (${decision.error})`,
+          legacyErrorText: '[error] 模型服务暂时不可用，请稍后重试或切换模型',
         })
         // 不要泄漏 decision.reason 内文(可能含 agent provider 等内部线索),
         // 仅给前端 error code,内部细节走 log。
@@ -705,7 +705,7 @@ export async function dispatchInbound(
           traceId: turnTraceId,
           code: 'upstream_failed',
           message: '模型服务暂时不可用，请稍后重试或切换模型',
-          legacyErrorText: `[error] ${mapped.code}`,
+          legacyErrorText: '[error] 模型服务暂时不可用，请稍后重试或切换模型',
         })
         for (const f of rejectFrames) this.deliver(f, adapter)
         return
@@ -742,9 +742,11 @@ export async function dispatchInbound(
         message: !storage
           ? '项目信息暂时没有加载出来，这一轮还没有开始，也不会计费。请稍后用下方按钮重新发送。'
           : chatWorkspace.unavailableCode === 'EACCES' || chatWorkspace.unavailableCode === 'EPERM'
-            ? `这个项目在容器里的文件没有读取权限（${chatWorkspace.unavailableCode}），这一轮还没有开始，也不会计费。重试不会好转，需要先修复项目目录的权限。`
-            : `这个项目在容器里的文件读取出错（${chatWorkspace.unavailableCode ?? 'unknown'}），这一轮还没有开始，也不会计费。可以稍后重新发送；反复出现需要检查容器存储。`,
-        legacyErrorText: storage ? '[error] PROJECT_STORAGE_UNAVAILABLE' : '[error] PROJECT_CONTEXT_UNAVAILABLE',
+            ? '这个项目在容器里的文件没有读取权限，这一轮还没有开始，也不会计费。重试不会好转，需要先修复项目目录的权限。'
+            : '这个项目在容器里的文件读取出错，这一轮还没有开始，也不会计费。可以稍后重新发送；反复出现需要检查容器存储。',
+        legacyErrorText: storage
+          ? '[error] 项目文件暂时无法读取，这一轮尚未开始。'
+          : '[error] 项目信息暂时没有加载出来，这一轮尚未开始。',
       })
       for (const f of heldFrames) this.deliver(f, adapter)
       return
@@ -775,7 +777,7 @@ export async function dispatchInbound(
         traceId: turnTraceId,
         code: 'engine_error',
         message: sessionStartFailureMessage(code),
-        legacyErrorText: `[error] ${code}`,
+        legacyErrorText: `[error] ${sessionStartFailureMessage(code)}`,
       })
       for (const f of frames) this.deliver(f, adapter)
       return undefined
@@ -1712,7 +1714,7 @@ export async function dispatchInbound(
               traceId: turnTraceId,
               code: 'upstream_failed',
               message: ADVISOR_CONSULT_PARENT_REASON,
-              legacyErrorText: `[error] advisor parent engine unsupported: ${parentEngine}`,
+              legacyErrorText: `[error] ${ADVISOR_CONSULT_PARENT_REASON}`,
             })
             for (const f of rejectFrames) this.deliver(f, adapter)
             return
@@ -1728,6 +1730,10 @@ export async function dispatchInbound(
             requested: requestedAdvisorModel,
             error: freeze.error,
           })
+          const publicAdvisorReason =
+            /[\u4e00-\u9fff]/.test(freeze.error) && freeze.error.length <= 160
+              ? freeze.error
+              : '当前顾问模型暂不可用，请稍后重试或切换模型'
           const rejectFrames = _earlyRejectErrorFrames({
             sessionKey,
             channel: frame.channel,
@@ -1735,8 +1741,8 @@ export async function dispatchInbound(
             userId: _errUserId,
             traceId: turnTraceId,
             code: 'upstream_failed',
-            message: `顾问模式无法启动：${freeze.error}`,
-            legacyErrorText: `[error] advisor mode rejected: ${freeze.error}`,
+            message: `顾问模式无法启动：${publicAdvisorReason}`,
+            legacyErrorText: `[error] 顾问模式无法启动：${publicAdvisorReason}`,
           })
           for (const f of rejectFrames) this.deliver(f, adapter)
           return
@@ -1907,14 +1913,15 @@ export async function dispatchInbound(
         if (frame.idempotencyKey && !(frame as any)._idempotencyPreReserved) {
           this._seenIdempotencyKeys.delete(frame.idempotencyKey)
         }
+        const compatApiErrorText = `[error] ${_pendingApiErrorFrame.message}`
         this.deliver(_pendingApiErrorFrame, liveWechatAdapter ? undefined : adapter)
         if (liveWechatAdapter) {
-          const errBlocks = [{ kind: 'text', text: `[error] ${_apiErrorText}` } as any]
+          const errBlocks = [{ kind: 'text', text: compatApiErrorText } as any]
           this.deliver({ ...out, blocks: errBlocks, isFinal: true }, undefined)
           enqueueLiveWechatMessage(errBlocks, true, 'error')
         } else {
           this.deliver(
-            { ...out, blocks: [{ kind: 'text', text: `[error] ${_apiErrorText}` }], isFinal: true },
+            { ...out, blocks: [{ kind: 'text', text: compatApiErrorText }], isFinal: true },
             adapter,
           )
         }

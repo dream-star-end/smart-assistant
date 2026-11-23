@@ -41,18 +41,23 @@ export interface AutoDreamFeature {
   min_new_sessions: number
 }
 
-async function resolveAutoDreamEntitlement(userId: bigint | number | string) {
-  const [eligible, setting] = await Promise.all([
-    isAutoDreamEligible(userId),
-    getSystemSetting('auto_dream_model'),
-  ])
+async function resolveConfiguredAutoDreamModel() {
+  const setting = await getSystemSetting('auto_dream_model')
   let model: Awaited<ReturnType<typeof resolveAutoDreamModel>> = null
   try {
     model = await resolveAutoDreamModel(setting.value)
   } catch {
     model = null
   }
-  return { eligible, modelId: setting.value, model }
+  return { modelId: setting.value, model }
+}
+
+async function resolveAutoDreamEntitlement(userId: bigint | number | string) {
+  const [eligible, resolved] = await Promise.all([
+    isAutoDreamEligible(userId),
+    resolveConfiguredAutoDreamModel(),
+  ])
+  return { eligible, modelId: resolved.modelId, model: resolved.model }
 }
 
 /** Active, unexpired personal subscription at or above the Max tier. */
@@ -138,9 +143,8 @@ export async function getAutoDreamPolicy(userId: bigint | number | string): Prom
   const eligible = await isAutoDreamEligible(userId)
   if (!eligible) return { enabled: false }
   const entitlement = optimizerEnabled
-    ? await resolveAutoDreamEntitlement(userId)
+    ? await resolveConfiguredAutoDreamModel()
     : {
-        eligible,
         modelId: LEGACY_AUTO_DREAM_MODEL,
         model: await resolveLegacyAutoDreamModel(),
       }

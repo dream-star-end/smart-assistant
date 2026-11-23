@@ -228,6 +228,12 @@ import {
 } from "../db/liveTurnFrames.js";
 import { OutboundBrowserHandoffFrameObserver } from "../pendingDecisions/pgBrowserHandoffStore.js";
 import {
+  boundedMapSet,
+  boundedSetAdd,
+  createOutboundFrameAccessor,
+  pruneTimestampMap,
+} from "./outboundFrameDecode.js";
+import {
   admitDurableControl,
   HELLO_PENDING_PERMISSION_MAX_SESSIONS,
   markTurnControlReceipt,
@@ -2208,8 +2214,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   const runSingleRecoveryDrainPass = async (uid: bigint, key: string, epoch: number): Promise<void> => {
     if (!deps.pgPool || !isBackgroundCurrent(epoch)) return;
     const lastScanAt = recoveryLastScanAt.get(key) ?? 0;
-    if (deps.reconcileAutomaticRecoveryJobs && Date.now() - lastScanAt >= 30_000) {
-      recoveryLastScanAt.set(key, Date.now());
+    const nowMs = Date.now();
+    if (deps.reconcileAutomaticRecoveryJobs && nowMs - lastScanAt >= 30_000) {
+      boundedMapSet(recoveryLastScanAt, key, nowMs, 4096);
+      if (recoveryLastScanAt.size > 1024) pruneTimestampMap(recoveryLastScanAt, nowMs, 5 * 60_000, 4096);
       await deps.reconcileAutomaticRecoveryJobs(uid, 100);
       if (!isBackgroundCurrent(epoch)) return;
     }
@@ -2308,30 +2316,61 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     recoveryDrainInFlight.set(key, work);
     return work;
   };
+  let recoveryPollInFlight = false;
+  let lastOnlineReconcileSweepAt = 0;
   const recoveryDrainTimer = setInterval(() => {
-    if (!backgroundActive) return;
-    for (const uid of uidToRecoveryExecutors.keys()) {
-      void drainDurableRecoveryForUser(BigInt(uid));
+    if (!backgroundActive || shuttingDown || !deps.pgPool) return;
+    const nowMs = Date.now();
+    // Periodically (every 30s) re-scan online users for newly crashed tapes requiring job reconciliation,
+    // without relying on a smaller bounded map that could thrash at >4096 online users.
+    if (nowMs - lastOnlineReconcileSweepAt >= 30_000) {
+      lastOnlineReconcileSweepAt = nowMs;
+      for (const uidKey of uidToRecoveryExecutors.keys()) {
+        void drainDurableRecoveryForUser(BigInt(uidKey));
+      }
     }
-    if (deps.pgPool && recovery && links && !shuttingDown) {
-      void deps.pgPool
-        .query<{ user_id: string }>(
-          `SELECT DISTINCT user_id::text AS user_id
-             FROM turn_recovery_jobs
-            WHERE status IN ('queued','leased') AND next_attempt_at<=NOW()
-              AND (status='queued' OR lease_until<NOW())
-              AND dispatch_id IS NULL
-            LIMIT 20`,
-        )
-        .then((res) => {
-          for (const row of res.rows ?? []) {
-            if (!uidToRecoveryExecutors.has(row.user_id)) {
-              void drainDurableRecoveryForUser(BigInt(row.user_id));
-            }
+    if (recoveryPollInFlight) return;
+    recoveryPollInFlight = true;
+    const onlineUids = Array.from(uidToRecoveryExecutors.keys());
+    void deps.pgPool
+      .query<{ user_id: string }>(
+        `SELECT user_id
+           FROM (
+             SELECT candidate.user_id::text AS user_id, MIN(candidate.next_attempt_at) AS earliest_due
+               FROM turn_recovery_jobs candidate
+              WHERE candidate.next_attempt_at<=NOW()
+                AND (
+                  (candidate.status IN ('queued','leased') AND candidate.dispatch_id IS NULL
+                    AND (candidate.status='queued' OR candidate.lease_until<NOW()))
+                  OR (candidate.user_id = ANY($1::bigint[])
+                    AND candidate.status IN ('queued','leased','sent')
+                    AND (candidate.status='queued' OR candidate.lease_until<NOW())
+                    AND NOT EXISTS (
+                      SELECT 1 FROM turn_dispatches bound
+                       WHERE bound.dispatch_id=candidate.dispatch_id
+                         AND bound.attempt_no=candidate.dispatch_attempt_no
+                         AND bound.status<>'admitted'
+                    ))
+                )
+              GROUP BY candidate.user_id
+              ORDER BY earliest_due ASC
+              LIMIT 20
+           ) due_users`,
+        [onlineUids],
+      )
+      .then((res) => {
+        for (const row of res.rows ?? []) {
+          if (uidToRecoveryExecutors.has(row.user_id) || (recovery && links)) {
+            void drainDurableRecoveryForUser(BigInt(row.user_id));
           }
-        })
-        .catch(() => {});
-    }
+        }
+      })
+      .catch((error) => {
+        log?.warn("user-chat-bridge: durable recovery poll failed", { error });
+      })
+      .finally(() => {
+        recoveryPollInFlight = false;
+      });
   }, 1_000);
   recoveryDrainTimer.unref?.();
 
@@ -4168,7 +4207,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               clientMessageId,
             });
           }
-          skippedRecoveryIds.add(clientMessageId);
+          boundedSetAdd(skippedRecoveryIds, clientMessageId, 512);
           const skippedAckPayload = {
             type: "outbound.ack",
             recoverySkipped: true,
@@ -4944,7 +4983,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           // A job already bound to a dispatch is not touched here (dispatch_id fence); the
           // pre-forward failure exit reads this mark and pauses it with its dispatch.
           if (pause) {
-            refusedRecoveryJobs.set(`${recoveryJob.jobId}:${recoveryJob.leaseEpoch}`, reasonCode);
+            boundedMapSet(refusedRecoveryJobs, `${recoveryJob.jobId}:${recoveryJob.leaseEpoch}`, reasonCode, 512);
           }
           if (!hasBoundDispatch) {
             if (pause) {
@@ -5567,8 +5606,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                       break;
                     }
                   }
-                } catch {
-                  // hello 补齐失败只能静默:不得挡转发、不得关连接。
+                } catch (error) {
+                  bridgeLog?.debug("user-chat-bridge: hello live catchup skipped", { uid: uidStr, error });
                 }
               })().catch(() => {});
             }
@@ -5630,8 +5669,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                       }));
                     } catch { /* */ }
                   }
-                } catch {
-                  // 补发失败只能静默:不得挡转发、不得关连接。
+                } catch (error) {
+                  bridgeLog?.debug("user-chat-bridge: hello pending permission replay skipped", { uid: uidStr, error });
                 }
               })().catch(() => {});
             }
@@ -8012,19 +8051,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         cleanup("frame_too_big", true);
         return;
       }
+      const frame = createOutboundFrameAccessor(data, isBinary);
+      const frameText = frame.getFrameText();
       // ── 容器 attestation 帧(方案 §7 步 3/4)────────────────────────────────
-      // container→master 的内部控制帧,**绝不**透传给浏览器(与 outbound.codex_billing
-      // 同款拦截:cheap string 预筛,不解 JSON 影响热路径)。必须在 TTFT 观测之前处理 ——
-      // attest 是连接握手的一部分,不是"容器的第一帧响应"。
-      if (!isBinary) {
-        let attestPeek: string | null = null;
-        if (typeof data === "string") attestPeek = data;
-        else if (Buffer.isBuffer(data)) {
-          try { attestPeek = data.toString("utf8"); } catch { attestPeek = null; }
-        }
-        if (attestPeek !== null && attestPeek.includes(`"${CONTAINER_ATTEST_FRAME_TYPE}"`)) {
-          let parsedAttest: unknown = null;
-          try { parsedAttest = JSON.parse(attestPeek); } catch { /* 非 JSON → 落回常规路径 */ }
+      // container→master 的内部控制帧,**绝不**透传给浏览器(单次惰性解码/解析共享)。
+      if (frameText !== null) {
+        if (frameText.includes(`"${CONTAINER_ATTEST_FRAME_TYPE}"`)) {
+          const parsedAttest = frame.getParsedTextFrame();
           if (
             parsedAttest !== null && typeof parsedAttest === "object" &&
             (parsedAttest as { type?: unknown }).type === CONTAINER_ATTEST_FRAME_TYPE
@@ -8033,9 +8066,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             return;
           }
         }
-        if (attestPeek !== null && attestPeek.includes('"outbound.external_engine_billing"')) {
-          let external: unknown = null;
-          try { external = JSON.parse(attestPeek); } catch { /* rejected below */ }
+        if (frameText.includes('"outbound.external_engine_billing"')) {
+          const external = frame.getParsedTextFrame();
           if (isPlainRecord(external) && external.type === 'outbound.external_engine_billing') {
             const requestId = typeof external.requestId === 'string' && /^[0-9a-f]{32}$/.test(external.requestId) ? external.requestId : null;
             const status = external.status === 'success' || external.status === 'error' || external.status === 'unavailable' ? external.status : null;
@@ -8267,7 +8299,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             return;
           }
         }
-        if (handleTurnDispatchReceipt(attestPeek, {
+        if (handleTurnDispatchReceipt(frameText, {
           pool: deps.pgPool, uid, admittedDispatches, enrichmentDispatches,
           ...(containerId !== undefined ? {
             agentContainerId: containerId,
@@ -8282,9 +8314,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         // Durable Stop/permission runtime receipt. Commit the lifecycle edge
         // before notifying tabs; if PG is unavailable the lease expires and
         // the identical control is retried instead of being guessed applied.
-        if (attestPeek !== null && attestPeek.includes('"outbound.control.receipt"')) {
-          let parsedControl: unknown = null;
-          try { parsedControl = JSON.parse(attestPeek); } catch { /* ordinary frame */ }
+        if (frameText.includes('"outbound.control.receipt"')) {
+          const parsedControl = frame.getParsedTextFrame();
           if (
             isPlainRecord(parsedControl) &&
             parsedControl.type === "outbound.control.receipt" &&
@@ -8313,23 +8344,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             return;
           }
         }
-        // OCV5-746: 容器侧模型执行权威在准入前拒帧。这不是一条可以透传的普通错误帧 ——
-        // master 已为本轮建了 dispatch(admitted + lease)。若只是把 error 转发给浏览器,
-        // PG 侧那一行永远停在 admitted,用户的 Stop 打到容器只会拿到 TURN_NOT_ACTIVE
-        // (容器根本没有这一轮的会话),而前端按设计不把 runtime miss 当 turn 已结束,
-        // 于是这一轮会一直"运行中",直到容器重建后 reconciler 把它 CAS 成 rejecting
-        // 再也等不到 tombstone。这里必须由 master 自己把它收敛:
-        //   普通轮:CAS terminal(executed_error)+ 释放 lease + 移除本连接受理记录 +
-        //   按 never-executed waiver abort pre-forward journal(本地 Codex 可能在转发前
-        //   已建 inflight journal;不 abort 会被 reconciler 判成 billed_but_failed 转人工);
-        //   recoveryJob 轮:该失败码属需用户处理(MODEL_AUTHORITY_REJECTED 已进
-        //   userActionRequiredCodes)→ 走既有 pauseRecoveryPreReceipt(dispatch 终态
-        //   not_accepted + job paused + 通知),不重复写第二套终态;
-        //   远端 lane 若已建(ensureLane 发生在签票前)→ 用受理时记录的**引擎 sessionKey**
-        //   走既有 proof-only 的 reconcileRemoteChat 释放绑定,不新造第二套释放语义。
-        if (attestPeek !== null && attestPeek.includes('"MODEL_AUTHORITY_REJECTED"')) {
-          let rejectedFrame: unknown = null;
-          try { rejectedFrame = JSON.parse(attestPeek); } catch { /* ordinary frame */ }
+        // OCV5-746: 容器侧模型执行权威在准入前拒帧，由 master 自己收敛终态与资源。
+        if (frameText.includes('"MODEL_AUTHORITY_REJECTED"')) {
+          const rejectedFrame = frame.getParsedTextFrame();
           if (
             isPlainRecord(rejectedFrame) &&
             rejectedFrame.type === "error" &&
@@ -8410,23 +8427,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           }
         }
       }
-      // Queue dispatch is a container→master control request, never a browser
-      // broadcast. Convert it into one ordinary inbound.message and feed that
-      // message through the exact same authority/route/precheck/journal helper
-      // as a legacy turn. The private correlation comes back to the gateway only
-      // after those gates have succeeded.
-      if (!isBinary) {
-        let dispatchText: string | null = null;
-        if (typeof data === "string") dispatchText = data;
-        else if (Buffer.isBuffer(data)) {
-          try { dispatchText = data.toString("utf8"); } catch { dispatchText = null; }
-        }
-        if (dispatchText !== null) {
-          let candidate: unknown = null;
-          try { candidate = JSON.parse(dispatchText); } catch { /* ordinary non-JSON frame */ }
+      // Queue dispatch is a container→master control request, never a browser broadcast.
+      if (deps.promptQueueEnabled === true && frameText !== null && frameText.includes("outbound.prompt_queue.")) {
+        const candidate = frame.getParsedTextFrame();
+        if (candidate !== null) {
           const isActivatedEnvelope = isPlainRecord(candidate) &&
             candidate.type === PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE;
-          if (isActivatedEnvelope && deps.promptQueueEnabled === true) {
+          if (isActivatedEnvelope) {
             const activated = parsePromptQueueDispatchActivated(candidate);
             if (activated === null) {
               bridgeLog?.warn("user-chat-bridge: malformed prompt queue activation acknowledgement dropped");
@@ -8528,17 +8535,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
       }
       // Incident, GoalState and durable media progress are master-authored namespaces.
-      // Containers are tenant-controlled execution surfaces and must never forge
-      // either an approval notice or the platform-authoritative PG GoalState.
-      // Reject before TTFT accounting, outboundRing.storeStamped and live forwarding,
-      // so a forged approved_recovery cannot reach the user now or on reconnect replay.
-      const incidentCandidate = Buffer.isBuffer(data)
-        ? data.toString("utf8")
-        : data instanceof ArrayBuffer
-          ? Buffer.from(data).toString("utf8")
-          : Buffer.concat(data).toString("utf8");
-      let parsedMasterFrameCandidate: unknown = null;
-      try { parsedMasterFrameCandidate = JSON.parse(incidentCandidate); } catch { /* non-JSON remains normal traffic */ }
+      // Reject before TTFT accounting, outboundRing.storeStamped and live forwarding.
+      const parsedMasterFrameCandidate = frame.getParsedFrame();
       const masterOnlyFrameType =
         parsedMasterFrameCandidate !== null && typeof parsedMasterFrameCandidate === "object"
           ? (parsedMasterFrameCandidate as { type?: unknown }).type
@@ -8557,29 +8555,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
         return;
       }
-      // PR2 v1.0.66 — outbound.codex_billing 是 container→master 内部侧信道,
-      // **绝不**透传给用户浏览器(用户不可见 billing,且帧含内部计费字段)。
-      //
-      // **必须在 userWs.readyState 检查之前**:
-      //   - drain 期 userWs 已关(detachUserSide → unregister),但 inflightCodexTurns
-      //     仍有 turn 等 billing 帧 settle。如果先 readyState gate 就 drop,用户跑路
-      //     免费送 token(B.5 plan invariant)
-      //   - 与 G6 早释放同一帧(outbound.message isFinal)无冲突 — 那个走 message
-      //     type,billing 走 codex_billing type,互斥
-      // cheap pre-filter:只对文本帧做 string includes,不解 JSON 影响热路径。
-      if (!isBinary) {
-        let billingPeek: string | null = null;
-        if (typeof data === "string") billingPeek = data;
-        else if (Buffer.isBuffer(data)) {
-          try { billingPeek = data.toString("utf8"); } catch { billingPeek = null; }
-        }
-        if (billingPeek !== null && billingPeek.includes('"outbound.codex_billing"')) {
-          let parsedBilling: unknown = null;
-          try { parsedBilling = JSON.parse(billingPeek); } catch { /* 非 JSON 不该走到这,稳妥起见仍直返 */ }
-          if (
-            parsedBilling !== null && typeof parsedBilling === "object" &&
-            (parsedBilling as { type?: unknown }).type === "outbound.codex_billing"
-          ) {
+      // PR2 v1.0.66 — outbound.codex_billing 是 container→master 内部侧信道,绝不透传给用户浏览器。
+      if (frameText !== null && frameText.includes('"outbound.codex_billing"')) {
+        const parsedBilling = frame.getParsedTextFrame();
+        if (
+          parsedBilling !== null && typeof parsedBilling === "object" &&
+          (parsedBilling as { type?: unknown }).type === "outbound.codex_billing"
+        ) {
             const billing = parsedBilling as {
               requestId?: unknown;
               turnKey?: unknown;
@@ -8705,7 +8687,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // debit,但两个 IIFE 各自 await commit 后都会读 result.debitedCredits>0
             // 各广播一次 — 用 Map.delete + 本地簿记早断。
             inflightCodexTurns.delete(reqId);
-            locallySettledCodexTurns.add(reqId);
+            boundedSetAdd(locallySettledCodexTurns, reqId, 512);
             // requestId resolves to this exact turn snapshot, so the internal
             // terminal billing frame can release even if a legacy gateway does
             // not echo peer/clientMessageId on its later user-facing final frame.
@@ -8865,7 +8847,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             })();
             return;
           }
-        }
       }
       // Permission prompt authority is durable before browser visibility. The
       // exact runtime-authored tool identity/input survives a browser or
@@ -8884,15 +8865,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // forwardCommittedFrame still only runs after both awaits inside the
       // task.
       let permissionAuthorityCommit: (() => Promise<void>) | null = null;
-      if (!isBinary && deps.pgPool) {
-        let permissionText: string | null = null;
-        if (typeof data === "string") permissionText = data;
-        else if (Buffer.isBuffer(data)) {
-          try { permissionText = data.toString("utf8"); } catch { permissionText = null; }
-        }
-        if (permissionText?.includes('"outbound.permission_request"')) {
-          let parsedPermission: unknown = null;
-          try { parsedPermission = JSON.parse(permissionText); } catch { /* generic frame */ }
+      if (frameText !== null && deps.pgPool) {
+        if (frameText.includes('"outbound.permission_request"')) {
+          const parsedPermission = frame.getParsedTextFrame();
           if (
             isPlainRecord(parsedPermission) &&
             parsedPermission.type === "outbound.permission_request" &&
@@ -8902,9 +8877,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             typeof parsedPermission.peer.id === "string" &&
             isPlainRecord(parsedPermission.inputJson)
           ) {
-            // Capture the narrowed values now: TS does not carry control-flow
-            // narrowing of `deps.pgPool` / `parsedPermission.peer` into the
-            // deferred closure, and the frame must be validated at receipt.
             const permissionPool = deps.pgPool;
             const permissionAuthorityInput = {
               userId: uid,
@@ -8926,16 +8898,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             permissionAuthorityCommit = () =>
               persistPermissionAuthority(permissionPool, permissionAuthorityInput).then(() => {});
           }
-        } else if (permissionText?.includes('"outbound.permission_settled"')) {
-          // INC-20260903-PENDING-PERMISSION-ZOMBIE — the runtime is the only
-          // authority on whether a prompt is still answerable. Every settlement
-          // it reports (another tab answered, Stop/disconnect/timeout/crash
-          // auto-deny, duplicate already_settled) must close the durable row,
-          // otherwise the hello-time replay re-materialises a dead card on
-          // every reconnect. Side effect only: the frame still flows to userWs
-          // unchanged, and a DB hiccup here must not stall the live stream.
-          let parsedSettled: unknown = null;
-          try { parsedSettled = JSON.parse(permissionText); } catch { /* generic frame */ }
+        } else if (frameText.includes('"outbound.permission_settled"')) {
+          const parsedSettled = frame.getParsedTextFrame();
           if (
             isPlainRecord(parsedSettled) &&
             parsedSettled.type === "outbound.permission_settled" &&
@@ -8983,47 +8947,20 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
       }
 
-      // Phase 4 — outbound.control.session_repo_status 侧信道(容器→master→user):
-      //   master 须**先**落 DB(applyStatusFrame:更新 status / token_invalid 触发
-      //   revoke + clear sessions),再让帧流到 userWs 让前端 UI 反映状态。
-      //
-      //   设计要点:
-      //   - **不进 outbound ring**:status 帧不带 sessionKey/frameSeq,自然通不过下方
-      //     ring 写入条件;且重连重放无意义(状态以 DB 为权威源)。
-      //   - 与 codex_billing 不同,status 帧**要**透传给 userWs(用户需看到
-      //     "cloning" / "ready" / "error" 进度);所以这里只 side-effect,不 return。
-      //   - DB 写失败(stale ack 等)→ updateGithubWorkspaceStatusIfVersion 返回
-      //     {updated:false},applyStatusFrame swallow,状态帧仍透传(用户至少能看到
-      //     "已被新版本覆盖"的语义,不会卡住)。
-      //   - cheap pre-filter 同 billing,不解 JSON 影响热路径。
-      if (!isBinary) {
-        let statusPeek: string | null = null;
-        if (typeof data === "string") statusPeek = data;
-        else if (Buffer.isBuffer(data)) {
-          try { statusPeek = data.toString("utf8"); } catch { statusPeek = null; }
-        }
-        // turn 收尾(isFinal 帧)→ 把 turn 宽限收窄到 POST_FINAL_GRACE_MS(只缩不延):既给
-        // cost_charged(isFinal 之后才广播)留投递窗口,又不让已结束 turn 的连接(浏览器可能已离开)
-        // 长期占用到 10min 硬上限。仅在 turn 在飞时收窄(turnActiveUntil>0)。cheap 子串预筛。
-        if (turnActiveUntil > 0 && statusPeek !== null && statusPeek.includes('"isFinal":true')) {
+      // Phase 4 — outbound.control.session_repo_status 侧信道 + isFinal 宽限收窄（复用单次解码/解析）。
+      if (frameText !== null) {
+        if (turnActiveUntil > 0 && frameText.includes('"isFinal":true')) {
           turnActiveUntil = Math.min(turnActiveUntil, Date.now() + POST_FINAL_GRACE_MS);
         }
-        if (
-          statusPeek !== null &&
-          statusPeek.includes('"outbound.control.session_repo_status"')
-        ) {
-          let parsedStatus: unknown = null;
-          try { parsedStatus = JSON.parse(statusPeek); } catch { /* 非 JSON 跳过 */ }
+        if (frameText.includes('"outbound.control.session_repo_status"')) {
+          const parsedStatus = frame.getParsedTextFrame();
           if (parsedStatus !== null && typeof parsedStatus === "object") {
             const statusFrame = parseStatusFrame(parsedStatus);
             if (statusFrame !== null && deps.pgPool) {
               const pgPoolBound = deps.pgPool;
-              // fire-and-forget:DB 写后 status 帧仍透传给 userWs(下方 send 路径)。
               ;(async () => {
                 try {
                   const r = await applyStatusFrame(pgPoolBound, Number(uid), statusFrame);
-                  // v1.0.94 — 诊断 instrument。状态帧从容器到 user 这段也要可见,
-                  // 才能区分「容器没推 status」和「bridge 推了但 user 没收到」。
                   bridgeLog?.info("user-chat-bridge: repo_status_forwarded", {
                     sessionId: statusFrame.sessionId,
                     selectionVersion: statusFrame.selectionVersion,
@@ -9039,7 +8976,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 }
               })();
             }
-            // 不 return — status 帧继续走透传路径让前端 UI 看到状态变化
           }
         }
       }
@@ -9100,71 +9036,53 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         /** outbound.message isFinal=true = 回合终止器(protocol frames.ts)。 */
         isFinal: boolean;
       } | null = null;
-      if (containerId !== undefined && !isBinary) {
-        let frameStr: string | null = null;
-        if (typeof data === "string") frameStr = data;
-        else if (Buffer.isBuffer(data)) {
-          try { frameStr = data.toString("utf8"); } catch { frameStr = null; }
-        }
-        if (frameStr !== null) {
-          let parsedOut: unknown = null;
-          try { parsedOut = JSON.parse(frameStr); } catch { /* non-JSON: skip */ }
-          if (parsedOut !== null && typeof parsedOut === "object") {
-            const wire = parsedOut as {
-              type?: unknown;
-              isFinal?: unknown;
-              sessionKey?: unknown;
-              frameSeq?: unknown;
-              clientMessageId?: unknown;
-              peer?: { id?: unknown };
+      if (containerId !== undefined && frameText !== null) {
+        const parsedOut = frame.getParsedTextFrame();
+        if (parsedOut !== null && typeof parsedOut === "object") {
+          const wire = parsedOut as {
+            type?: unknown;
+            isFinal?: unknown;
+            sessionKey?: unknown;
+            frameSeq?: unknown;
+            clientMessageId?: unknown;
+            peer?: { id?: unknown };
+          };
+          if (
+            typeof wire.sessionKey === "string" &&
+            typeof wire.frameSeq === "number" &&
+            Number.isSafeInteger(wire.frameSeq) &&
+            wire.frameSeq > 0
+          ) {
+            const storeKey = `${uid.toString()}:${containerId.toString()}:${wire.sessionKey}`;
+            durableStampedFrame = {
+              storeKey,
+              sessionId: wire.peer && typeof wire.peer === "object" &&
+                typeof wire.peer.id === "string"
+                ? wire.peer.id
+                : null,
+              clientMessageId: isClientMessageId(wire.clientMessageId)
+                ? wire.clientMessageId
+                : null,
+              sessionKey: wire.sessionKey,
+              frameSeq: wire.frameSeq,
+              payload: frameText,
+              isFinal: wire.type === "outbound.message" && wire.isFinal === true,
             };
-            if (
-              typeof wire.sessionKey === "string" &&
-              typeof wire.frameSeq === "number" &&
-              Number.isSafeInteger(wire.frameSeq) &&
-              wire.frameSeq > 0
-            ) {
-              const storeKey = `${uid.toString()}:${containerId.toString()}:${wire.sessionKey}`;
-              durableStampedFrame = {
-                storeKey,
-                sessionId: wire.peer && typeof wire.peer === "object" &&
-                  typeof wire.peer.id === "string"
-                  ? wire.peer.id
-                  : null,
-                clientMessageId: isClientMessageId(wire.clientMessageId)
-                  ? wire.clientMessageId
-                  : null,
-                sessionKey: wire.sessionKey,
-                frameSeq: wire.frameSeq,
-                payload: frameStr,
-                isFinal: wire.type === "outbound.message" && wire.isFinal === true,
-              };
-            }
           }
         }
       }
-      // Codex-native goal notifications are advisory. The runner stamps the
-      // platform generation it last synchronized; master rejects stale
-      // generations and writes only engine-owned diagnostics.
-      if (!isBinary && deps.updateGoalEngineMetrics) {
-        let text: string | null = null;
-        if (typeof data === "string") text = data;
-        else if (Buffer.isBuffer(data)) text = data.toString("utf8");
-        if (text?.includes('"kind":"goal"')) {
-          try {
-            const frame = JSON.parse(text) as {
-              type?: unknown;
-              peer?: { id?: unknown };
-              blocks?: Array<Record<string, unknown>>;
-            };
-            const sessionId = frame.peer?.id;
-            if (frame.type === "outbound.message" && typeof sessionId === "string") {
-              for (const block of frame.blocks ?? []) {
-                if (
-                  block.kind !== "goal" ||
-                  typeof block.platformGoalId !== "string" ||
-                  typeof block.platformStateRevision !== "number"
-                ) continue;
+      // Codex-native goal notifications are advisory (reuse single parsed frame).
+      if (frameText !== null && deps.updateGoalEngineMetrics && frameText.includes('"kind":"goal"')) {
+        try {
+          const parsedGoal = frame.getParsedTextFrame();
+          if (parsedGoal !== null && typeof parsedGoal === "object") {
+            const goalFrame = parsedGoal as { type?: unknown; peer?: { id?: unknown }; blocks?: Array<Record<string, unknown>> };
+            const sessionId = goalFrame.peer?.id;
+            if (goalFrame.type === "outbound.message" && typeof sessionId === "string") {
+              for (const block of goalFrame.blocks ?? []) {
+                if (block.kind !== "goal" || typeof block.platformGoalId !== "string" || typeof block.platformStateRevision !== "number") continue;
+                const rawDt = typeof block.updatedAt === "number" && Number.isFinite(block.updatedAt) ? new Date(block.updatedAt * 1000) : null;
+                const engineUpdatedAt = rawDt && !Number.isNaN(rawDt.getTime()) ? rawDt.toISOString() : undefined;
                 void deps.updateGoalEngineMetrics({
                   uid,
                   sessionId,
@@ -9172,70 +9090,55 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   stateRevision: block.platformStateRevision,
                   ...(typeof block.status === "string" ? { engineStatus: block.status } : {}),
                   ...(typeof block.tokensUsed === "number" ? { tokensUsed: block.tokensUsed } : {}),
-                  ...(typeof block.timeUsedSeconds === "number"
-                    ? { timeUsedSeconds: block.timeUsedSeconds }
-                    : {}),
-                  ...(typeof block.updatedAt === "number"
-                    ? { engineUpdatedAt: new Date(block.updatedAt * 1000).toISOString() }
-                    : {}),
-                }).catch((err) => {
-                  bridgeLog?.warn("user-chat-bridge: goal engine metrics update failed", { err });
-                });
+                  ...(typeof block.timeUsedSeconds === "number" ? { timeUsedSeconds: block.timeUsedSeconds } : {}),
+                  ...(engineUpdatedAt ? { engineUpdatedAt } : {}),
+                }).catch((err) => { bridgeLog?.warn("user-chat-bridge: goal engine metrics update failed", { err }); });
               }
             }
-          } catch { /* ordinary non-JSON or malformed goal frame */ }
+          }
+        } catch (err) {
+          bridgeLog?.warn("user-chat-bridge: goal engine metrics parse failed", { err });
         }
       }
       // OCV5-832 (B3): Reassemble streamed assistant `outbound.message` text frames and
-      // persist complete `browser_handoff` UI cards into PgBrowserHandoffStore.
-      if (!isBinary) {
-        browserHandoffObserver.observeOutboundFrame(uid.toString(), data);
-      }
-      // Goal usage broadcasts are commit-driven by the PG tape/cost backend.
-      // Do not guess durability with a one-shot terminal-frame timer: CCB cost
-      // settlement and the GC late-fold can legitimately happen much later.
-      // Terminal release is exact by peer + clientMessageId. Peer-only fallback
-      // is restricted to genuinely legacy inbound turns that never had a client
-      // id; otherwise a late id-less final from turn A could ABA-release a newer
-      // turn B after A's requestId-scoped billing frame already released it.
-      if (activeCodexTurnsByPeer.size > 0 && !isBinary) {
-        let outText: string | null = null;
-        if (typeof data === "string") outText = data;
-        else if (Buffer.isBuffer(data)) {
-          try { outText = data.toString("utf8"); } catch { outText = null; }
+      // persist complete `browser_handoff` UI cards (pass already-parsed frame object).
+      if (frameText !== null) {
+        const parsedHandoff = frame.getParsedTextFrame();
+        if (parsedHandoff !== null && typeof parsedHandoff === "object") {
+          browserHandoffObserver.observeOutboundFrame(uid.toString(), parsedHandoff);
         }
-        if (
-          outText !== null &&
-          (outText.includes('"isFinal":true') || outText.includes('"outbound.error"'))
-        ) {
-          let parsedOut: unknown = null;
-          try { parsedOut = JSON.parse(outText); } catch { /* 非 JSON 透传 */ }
-          if (parsedOut !== null && typeof parsedOut === "object") {
-            const obj = parsedOut as {
-              type?: unknown;
-              isFinal?: unknown;
-              peer?: { id?: unknown };
-              clientMessageId?: unknown;
-            };
-            const peerId = obj.peer && typeof obj.peer === "object"
-              ? (typeof obj.peer.id === "string" ? obj.peer.id : null)
+      }
+      if (
+        activeCodexTurnsByPeer.size > 0 &&
+        frameText !== null &&
+        (frameText.includes('"isFinal":true') || frameText.includes('"outbound.error"'))
+      ) {
+        const parsedOut = frame.getParsedTextFrame();
+        if (parsedOut !== null && typeof parsedOut === "object") {
+          const obj = parsedOut as {
+            type?: unknown;
+            isFinal?: unknown;
+            peer?: { id?: unknown };
+            clientMessageId?: unknown;
+          };
+          const peerId = obj.peer && typeof obj.peer === "object"
+            ? (typeof obj.peer.id === "string" ? obj.peer.id : null)
+            : null;
+          const isFinalMsg = obj.type === "outbound.message" && obj.isFinal === true;
+          const isErr = obj.type === "outbound.error";
+          if ((isFinalMsg || isErr) && peerId !== null) {
+            const state = activeCodexTurnsByPeer.get(codexPeerKey(peerId));
+            const terminalClientMessageId = isClientMessageId(obj.clientMessageId)
+              ? obj.clientMessageId
               : null;
-            const isFinalMsg = obj.type === "outbound.message" && obj.isFinal === true;
-            const isErr = obj.type === "outbound.error";
-            if ((isFinalMsg || isErr) && peerId !== null) {
-              const state = activeCodexTurnsByPeer.get(codexPeerKey(peerId));
-              const terminalClientMessageId = isClientMessageId(obj.clientMessageId)
-                ? obj.clientMessageId
-                : null;
-              const exactClientMatch = state !== undefined &&
-                terminalClientMessageId !== null &&
-                state.clientMessageId === terminalClientMessageId;
-              const legacyPeerFallback = state !== undefined &&
-                terminalClientMessageId === null &&
-                state.clientMessageId === null;
-              if (state !== undefined && (exactClientMatch || legacyPeerFallback)) {
-                releaseCodexTurnState(state, isFinalMsg ? "turn_final" : "turn_error");
-              }
+            const exactClientMatch = state !== undefined &&
+              terminalClientMessageId !== null &&
+              state.clientMessageId === terminalClientMessageId;
+            const legacyPeerFallback = state !== undefined &&
+              terminalClientMessageId === null &&
+              state.clientMessageId === null;
+            if (state !== undefined && (exactClientMatch || legacyPeerFallback)) {
+              releaseCodexTurnState(state, isFinalMsg ? "turn_final" : "turn_error");
             }
           }
         }
@@ -9898,7 +9801,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // `finalizing` can be observed before the settlement transaction is
             // visible. Only suppress later frames after immutable attribution
             // was read and its fold/rebroadcast completed successfully.
-            if (attributionRepaired) locallySettledCodexTurns.add(requestId);
+            if (attributionRepaired) boundedSetAdd(locallySettledCodexTurns, requestId, 512);
             return;
           }
           if (row.state === "aborted") {
@@ -9913,7 +9816,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               [uid.toString(), requestId],
             );
             if (settled.rows[0]?.present === true) {
-              locallySettledCodexTurns.add(requestId);
+              boundedSetAdd(locallySettledCodexTurns, requestId, 512);
               return;
             }
             if (isPermanentCodexWaiver(row.error_msg)) {
@@ -10138,7 +10041,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             },
           );
           // settle 已收口 → 后续同桥 duplicate 帧同步丢弃(与主路径簿记同构)。
-          locallySettledCodexTurns.add(requestId);
+          boundedSetAdd(locallySettledCodexTurns, requestId, 512);
           recordBillingRecovery(requestId, "recovered", {
             model,
             traceId: ctxTraceId ?? requestId,

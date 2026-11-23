@@ -25,7 +25,9 @@ export type DurableJobResult = {
   body: Record<string, unknown>
 }
 
-export const DELEGATE_DURABLE_SCHEMA_VERSION = 5
+export const DELEGATE_DURABLE_SCHEMA_VERSION = 6
+
+const DELEGATE_WAL_CHECKPOINT_INTERVAL_MS = 30 * 60_000
 
 /**
  * OCV5-164: how long a retired (TTL-elapsed) terminal row stays readable for
@@ -166,6 +168,15 @@ CREATE INDEX IF NOT EXISTS idx_delegate_jobs_retired
   ON delegate_jobs(retired_at) WHERE retired_at IS NOT NULL;
 `
 
+const DDL_V6 = `
+CREATE INDEX IF NOT EXISTS idx_delegate_jobs_parent_session
+  ON delegate_jobs(parent_session_key);
+CREATE INDEX IF NOT EXISTS idx_delegate_jobs_callback_retry
+  ON delegate_jobs(callback_state, notify_retry_at);
+CREATE INDEX IF NOT EXISTS idx_delegate_jobs_expires_at
+  ON delegate_jobs(expires_at);
+`
+
 export function resolveDelegateJobsDbPath(env: NodeJS.ProcessEnv = process.env): string {
   const override = env.OPENCLAUDE_DELEGATE_JOBS_DB?.trim()
   if (override) return override
@@ -180,6 +191,7 @@ export class DelegateDurableDb {
   private readonly db: SqliteDb
   failNextWrite = false
   private closed = false
+  private walTimer: ReturnType<typeof setInterval> | null = null
   private readonly upsertStmt
   private readonly insertStmt
   private readonly casUpdateStmt
@@ -507,6 +519,15 @@ export class DelegateDurableDb {
               MIN(created_at) AS oldest
          FROM delegate_jobs`,
     )
+    this.walTimer = setInterval(() => {
+      if (this.closed) return
+      try {
+        this.db.pragma('wal_checkpoint(PASSIVE)')
+      } catch {
+        /* non-fatal; retried on next 30m checkpoint interval */
+      }
+    }, DELEGATE_WAL_CHECKPOINT_INTERVAL_MS)
+    this.walTimer.unref()
   }
 
   private migrate(): void {
@@ -523,6 +544,7 @@ export class DelegateDurableDb {
           if (!columns.has(name)) this.db.exec(`ALTER TABLE delegate_jobs ADD COLUMN ${name} TEXT`)
         }
       }
+      if (current < 6) this.db.exec(DDL_V6)
       this.db.pragma(`user_version = ${DELEGATE_DURABLE_SCHEMA_VERSION}`)
     })
     apply()
@@ -855,6 +877,10 @@ export class DelegateDurableDb {
   close(): void {
     if (this.closed) return
     this.closed = true
+    if (this.walTimer !== null) {
+      clearInterval(this.walTimer)
+      this.walTimer = null
+    }
     try {
       this.db.pragma('wal_checkpoint(TRUNCATE)')
     } catch {

@@ -45,6 +45,7 @@ import {
 import {
   ackPendingCheckpointIfTurnSucceeded,
   clearPendingCheckpoint,
+  markCheckpointTurnOutcome,
   peekPendingCheckpoint,
 } from '../sessionCheckpointStore.js'
 import type { SessionLifecycleHost } from '../sessionLifecycle.js'
@@ -706,6 +707,7 @@ describe('OCV5-841 Wave 2 T2 Blocker Counter-Examples (B2/B3/B4/B5/B6/B7/B8/B10/
           if (remoteCalls === 1) {
             throw new SafeUniversalOverflowRetryError('PROMPT_TOO_LONG', true)
           }
+          markCheckpointTurnOutcome(_s, 'completed')
         },
       } as unknown as TurnRunnerHost
       await runOneTurnWithRetry.call(remoteHost, remoteSession, bloatedPayload, () => {})
@@ -717,12 +719,14 @@ describe('OCV5-841 Wave 2 T2 Blocker Counter-Examples (B2/B3/B4/B5/B6/B7/B8/B10/
         'B5: retry payload MUST wrap original rawUserInput, NEVER bloated runnerPayload',
       )
 
-      // B5: New checkpoint generation recorded and ACKable on turn completion
+      // B5: New checkpoint generation recorded and ACKable strictly after completed outcome (fail-closed)
       const newGen = getTurnActiveCheckpointGeneration(remoteSession)
       assert.ok(newGen && newGen !== 'gen-stale', 'B5: active generation must advance to new checkpoint')
       assert.equal(peekPendingCheckpoint(remoteSession.sessionKey)?.generation, newGen)
       assert.equal(ackPendingCheckpointIfTurnSucceeded(remoteSession, newGen!), true)
       assert.equal(peekPendingCheckpoint(remoteSession.sessionKey), null, 'ACKed checkpoint must not re-inject on next turn')
+      // Fail-closed guard: calling ack without an explicit 'completed' outcome MUST return false
+      assert.equal(ackPendingCheckpointIfTurnSucceeded(remoteSession, newGen!), false)
       clearTurnOverflowContext(remoteSession)
 
       // B4 Remote Fence: unknown remote error MUST throw immediately without blind retry!

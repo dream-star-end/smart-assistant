@@ -35,6 +35,7 @@ export class ShortCodeRegistry {
   private readonly defaultTtlMs: number
   private readonly cooldownMs: number
   private readonly randDigit: () => number
+  private lastPruneAt = 0
 
   constructor(opts?: {
     now?: () => number
@@ -59,6 +60,7 @@ export class ShortCodeRegistry {
   }
 
   pruneExpired(nowMs = this.now()): number {
+    this.lastPruneAt = nowMs
     let removed = 0
     for (const [k, entry] of this.byUserCode.entries()) {
       if (entry.expiresAt <= nowMs) {
@@ -77,6 +79,12 @@ export class ShortCodeRegistry {
       if (until <= nowMs) this.cooldownUntil.delete(k)
     }
     return removed
+  }
+
+  private maybePruneExpired(nowMs: number): void {
+    if (nowMs - this.lastPruneAt >= 60_000 || this.byUserCode.size + this.cooldownUntil.size > 4096) {
+      this.pruneExpired(nowMs)
+    }
   }
 
   private isCodeUnavailable(userId: string, candidate: string, nowMs: number): boolean {
@@ -168,9 +176,11 @@ export class ShortCodeRegistry {
     const key = this.userCodeKey(uid, code)
     const entry = this.byUserCode.get(key)
     if (!entry) {
+      this.maybePruneExpired(nowMs)
       return { ok: false, reason: 'not_found' }
     }
     if (entry.userId !== uid) {
+      this.maybePruneExpired(nowMs)
       return { ok: false, reason: 'not_found' }
     }
     if (entry.expiresAt <= nowMs) {
@@ -179,8 +189,13 @@ export class ShortCodeRegistry {
       if (this.byUserDecision.get(decKey) === code) {
         this.byUserDecision.delete(decKey)
       }
+      if (this.cooldownMs > 0) {
+        this.cooldownUntil.set(key, nowMs + this.cooldownMs)
+      }
+      this.maybePruneExpired(nowMs)
       return { ok: false, reason: 'expired' }
     }
+    this.maybePruneExpired(nowMs)
     return { ok: true, entry: { ...entry } }
   }
 
@@ -188,6 +203,7 @@ export class ShortCodeRegistry {
   getCodeForDecision(userId: string, decisionId: string): string | null {
     const uid = userId.trim()
     const nowMs = this.now()
+    this.maybePruneExpired(nowMs)
     const code = this.byUserDecision.get(this.userDecisionKey(uid, decisionId))
     if (!code) return null
     const entry = this.byUserCode.get(this.userCodeKey(uid, code))
@@ -197,6 +213,8 @@ export class ShortCodeRegistry {
 
   invalidateByDecisionId(userId: string, decisionId: string): boolean {
     const uid = userId.trim()
+    const nowMs = this.now()
+    this.maybePruneExpired(nowMs)
     const decKey = this.userDecisionKey(uid, decisionId)
     const code = this.byUserDecision.get(decKey)
     if (!code) return false
@@ -204,13 +222,15 @@ export class ShortCodeRegistry {
     this.byUserDecision.delete(decKey)
     this.byUserCode.delete(codeKey)
     if (this.cooldownMs > 0) {
-      this.cooldownUntil.set(codeKey, this.now() + this.cooldownMs)
+      this.cooldownUntil.set(codeKey, nowMs + this.cooldownMs)
     }
     return true
   }
 
   invalidateByCode(userId: string, code: string): boolean {
     const uid = userId.trim()
+    const nowMs = this.now()
+    this.maybePruneExpired(nowMs)
     const key = this.userCodeKey(uid, code.trim())
     const entry = this.byUserCode.get(key)
     if (!entry) return false
@@ -220,7 +240,7 @@ export class ShortCodeRegistry {
       this.byUserDecision.delete(decKey)
     }
     if (this.cooldownMs > 0) {
-      this.cooldownUntil.set(key, this.now() + this.cooldownMs)
+      this.cooldownUntil.set(key, nowMs + this.cooldownMs)
     }
     return true
   }
