@@ -347,6 +347,18 @@ describe("researchProxy: external PDF extraction via real local HTTP server (OCV
     mode = "mineru-ok";
     const cases: Array<{ filename: string; mime: string; content: string; engine: "auto" | "mineru" | "mistral" }> = [
       { filename: "notes.md", mime: "text/markdown", content: "# Local Markdown\n\nClean local text.", engine: "mineru" },
+      {
+        filename: "pdf-header-guide.md",
+        mime: "text/markdown",
+        content: "# PDF Format Notes\n\nEvery valid PDF file begins with the magic header `%PDF-1.7` at byte 0.\n",
+        engine: "mineru",
+      },
+      {
+        filename: "pdf-header-line0.md",
+        mime: "text/markdown",
+        content: "%PDF-1.7 is the magic header of a PDF document.\n\nThis is still Markdown documentation.",
+        engine: "mistral",
+      },
       { filename: "paper.txt", mime: "text/plain", content: "Plain local research notes without external OCR.", engine: "mistral" },
       { filename: "page.html", mime: "text/html", content: "<html><title>Local HTML</title><body><p>Body text</p></body></html>", engine: "auto" },
     ];
@@ -368,9 +380,28 @@ describe("researchProxy: external PDF extraction via real local HTTP server (OCV
       assert.equal(captured.statusCode, 200);
       assert.equal(requestCount, 0, `${c.filename} under ${c.engine} must make 0 external OCR requests`);
       const doc = savedDocs.get(captured.body.docId);
-      assert.ok(doc, "local doc must be minted");
+      assert.ok(doc, `local doc must be minted for ${c.filename}`);
       assert.ok(!doc.spans.some((s: any) => s.text.includes("MinerU Extracted Paper")));
     }
+
+    // Generic binary mentioning %PDF- in body (not at byte 0) must ALSO make 0 external OCR requests
+    requestCount = 0;
+    const { store: binStore } = makeMemoryStore(
+      Buffer.from("# Spec excerpt\nThe parser checks for %PDF-1.4 before dispatching.\n", "utf8"),
+      "application/octet-stream",
+      "blob-bin",
+    );
+    const binHandler = makeResearchProxyHandler({
+      identityRepo: passingRepo(),
+      readConfig: cfgFor({ engine: "auto", mineruEndpoint: `${baseUrl}/parse`, mistralEndpoint: `${baseUrl}/ocr` }),
+      readSecrets: async () => ({}),
+      store: binStore,
+    });
+    const binRes = makeRes();
+    await binHandler(makeReq("/v3/research/ingest/parse", { blobId: "blob-bin", filename: "unknown-notes" }), binRes.res, CTX);
+    assert.equal(binRes.captured.statusCode, 200);
+    assert.equal(requestCount, 0, "non-PDF binary mentioning %PDF- in body must make 0 external OCR requests");
+    assert.equal(binRes.captured.body.needsOcr, true);
   });
 
   it("real pdf-parse v2 fallback (NO pdfImpl mock!) extracts real text PDF and returns needsOcr for scanned PDF (OCV5-865 #5)", async () => {
