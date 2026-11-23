@@ -227,7 +227,8 @@ describe('self-contained office/document oc-* CLIs', () => {
       assert.equal(readFileSync(qmdOut, 'utf8'), 'docx')
 
       const renderLog = readFileSync(log, 'utf8')
-      assert.match(renderLog, /pandoc .*--toc --number-sections/)
+      assert.match(renderLog, /pandoc .*--standalone.*--to=docx/)
+      assert.doesNotMatch(renderLog, /pandoc .*(--toc|--number-sections)/)
       assert.match(renderLog, /quarto render slides\.qmd --to docx/)
     } finally {
       rmSync(work, { recursive: true, force: true })

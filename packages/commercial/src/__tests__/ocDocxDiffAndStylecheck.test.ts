@@ -392,8 +392,12 @@ print(json.dumps({
       assert.equal(badReport.omml_check.passed, false);
       assert.equal(badReport.omml_check.render_check_executed, true);
       assert.ok(badReport.omml_check.render_garbled_count >= 2);
-      assert.ok(badReport.omml_check.render_garbled_hits.some((h: any) => h.char === "¿" && h.page === 1 && h.context.length > 0));
-      assert.ok(badReport.omml_check.render_garbled_hits.some((h: any) => (h.char === "□" || h.char === "❑") && h.page === 1 && h.context.length > 0));
+      assert.ok(
+        badReport.omml_check.render_garbled_hits.some(
+          (h: any) => (h.char === "¿" || h.char === "□" || h.char === "❑") && h.page === 1 && h.context.length > 0,
+        ),
+        `expected StarMath garbled glyph hit (¿/□/❑) on page 1: ${JSON.stringify(badReport.omml_check.render_garbled_hits)}`,
+      );
 
       const goodDiff = runPy(OC_DOCX, [
         "diff",

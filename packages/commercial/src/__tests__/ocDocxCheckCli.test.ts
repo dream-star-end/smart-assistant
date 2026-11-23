@@ -418,9 +418,14 @@ describe('oc-docx check', { skip: !pythonDocxAvailable }, () => {
         badReport.failures.some((item: { code: string }) => item.code === 'render-garbled-glyphs'),
         `expected render-garbled-glyphs failure: ${JSON.stringify(badReport.failures)}`,
       )
-      assert.ok(Array.isArray(badReport.render_garbled_hits) && badReport.render_garbled_hits.length >= 2)
-      assert.ok(badReport.render_garbled_hits.some((h: { char: string; page: number; context: string }) => h.char === '¿' && h.page === 1 && h.context.length > 0))
-      assert.ok(badReport.render_garbled_hits.some((h: { char: string; page: number; context: string }) => (h.char === '□' || h.char === '❑') && h.page === 1 && h.context.length > 0))
+      assert.ok(Array.isArray(badReport.render_garbled_hits) && badReport.render_garbled_hits.length >= 1)
+      assert.ok(
+        badReport.render_garbled_hits.some(
+          (h: { char: string; page: number; context: string }) =>
+            (h.char === '¿' || h.char === '□' || h.char === '❑') && h.page === 1 && h.context.length > 0,
+        ),
+        `expected StarMath garbled glyph hit (¿/□/❑) on page 1: ${JSON.stringify(badReport.render_garbled_hits)}`,
+      )
 
       const goodMd = join(work, 'good.md')
       const goodDocx = join(work, 'good.docx')

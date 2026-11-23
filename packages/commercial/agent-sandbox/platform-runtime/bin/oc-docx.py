@@ -171,6 +171,8 @@ def _clean_converted_docx(output: Path, *, strip_empty_toc: bool) -> None:
     """Strip Pandoc's empty word/comments.xml and unpopulated TOC placeholders."""
     import xml.etree.ElementTree as ET
 
+    if not zipfile.is_zipfile(output):
+        return
     with zipfile.ZipFile(output, "r") as archive:
         members = set(archive.namelist())
         strip_comments = False
