@@ -41,26 +41,62 @@ export function isPdfLike(bytes: Buffer, _mime: string, _filename?: string): boo
   return head.indexOf("%PDF-") !== -1;
 }
 
+interface ExternalPdfAdapterSpec {
+  readonly id: ExternalEngineName;
+  readonly endpointOf: (ingest: ResearchConfigPublic["config"]["ingest"]) => string;
+  readonly apiKeyOf: (secrets: ResearchSecrets) => string | undefined;
+  readonly buildPayload: (base64: string, mime: string, filename?: string) => Record<string, unknown>;
+}
+
+const EXTERNAL_PDF_ADAPTERS: Readonly<Record<ExternalEngineName, ExternalPdfAdapterSpec>> = {
+  mineru: {
+    id: "mineru",
+    endpointOf: (ingest) => ingest.mineruEndpoint?.trim() || "",
+    apiKeyOf: (secrets) => secrets.mineruApiKey,
+    buildPayload: (base64, mime, filename) => ({
+      filename: filename || "document.pdf",
+      mime: mime || "application/pdf",
+      contentBase64: base64,
+    }),
+  },
+  mistral: {
+    id: "mistral",
+    endpointOf: (ingest) => ingest.mistralEndpoint?.trim() || "",
+    apiKeyOf: (secrets) => secrets.mistralApiKey,
+    buildPayload: (base64) => ({
+      model: "mistral-ocr-latest",
+      document: {
+        type: "document_url",
+        document_url: `data:application/pdf;base64,${base64}`,
+      },
+    }),
+  },
+};
+
+const INGEST_ADAPTER_PREFERENCE: Readonly<
+  Record<ResearchConfigPublic["config"]["ingest"]["engine"], readonly ExternalEngineName[]>
+> = {
+  local: [],
+  mineru: ["mineru"],
+  mistral: ["mistral"],
+  auto: ["mineru", "mistral"],
+};
+
 function resolveConfiguredTarget(
   ingest: ResearchConfigPublic["config"]["ingest"],
-  requestedEngine?: ExternalEngineName,
-): { engine: ExternalEngineName; endpoint: string } | null {
-  if (ingest.engine === "local") return null;
-  const mineru = ingest.mineruEndpoint?.trim() || "";
-  const mistral = ingest.mistralEndpoint?.trim() || "";
-
-  if (ingest.engine === "mineru" || requestedEngine === "mineru") {
-    if (mineru) return { engine: "mineru", endpoint: mineru };
-    if (ingest.engine === "auto" && mistral) return { engine: "mistral", endpoint: mistral };
-    return null;
+  requested?: ExternalEngineName,
+): { adapter: ExternalPdfAdapterSpec; endpoint: string } | null {
+  const configured = INGEST_ADAPTER_PREFERENCE[ingest.engine] ?? [];
+  if (configured.length === 0) return null;
+  const order: ExternalEngineName[] =
+    requested && configured.includes(requested)
+      ? [requested, ...configured.filter((id) => id !== requested)]
+      : [...configured];
+  for (const id of order) {
+    const adapter = EXTERNAL_PDF_ADAPTERS[id];
+    const endpoint = adapter.endpointOf(ingest);
+    if (endpoint) return { adapter, endpoint };
   }
-  if (ingest.engine === "mistral" || requestedEngine === "mistral") {
-    if (mistral) return { engine: "mistral", endpoint: mistral };
-    if (ingest.engine === "auto" && mineru) return { engine: "mineru", endpoint: mineru };
-    return null;
-  }
-  if (mineru) return { engine: "mineru", endpoint: mineru };
-  if (mistral) return { engine: "mistral", endpoint: mistral };
   return null;
 }
 
@@ -173,16 +209,17 @@ export function buildExternalPdfExtractor(
 
   return async (bytes, mime, requestedEngine, filename): Promise<ExtractResult> => {
     const target = resolveConfiguredTarget(cfg.config.ingest, requestedEngine) ?? initialTarget;
+    const adapterId = target.adapter.id;
     if (!isPdfLike(bytes, mime, filename)) {
       return {
         needsOcr: true,
-        reason: `external ${target.engine} skipped: non-pdf input`,
+        reason: `external ${adapterId} skipped: non-pdf input`,
       };
     }
     if (bytes.length > maxInputBytes) {
       return {
         needsOcr: true,
-        reason: `external ${target.engine} skipped: input exceeds ${maxInputBytes} bytes`,
+        reason: `external ${adapterId} skipped: input exceeds ${maxInputBytes} bytes`,
       };
     }
 
@@ -192,18 +229,18 @@ export function buildExternalPdfExtractor(
       if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
         return {
           needsOcr: true,
-          reason: `external ${target.engine} endpoint protocol rejected`,
+          reason: `external ${adapterId} endpoint protocol rejected`,
         };
       }
     } catch {
       return {
         needsOcr: true,
-        reason: `external ${target.engine} endpoint invalid URL`,
+        reason: `external ${adapterId} endpoint invalid URL`,
       };
     }
 
     const secrets = await readSecrets().catch(() => ({} as ResearchSecrets));
-    const apiKey = target.engine === "mistral" ? secrets.mistralApiKey : secrets.mineruApiKey;
+    const apiKey = target.adapter.apiKeyOf(secrets);
 
     const headers: Record<string, string> = {
       "content-type": "application/json",
@@ -212,20 +249,7 @@ export function buildExternalPdfExtractor(
     if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
     const base64 = bytes.toString("base64");
-    const requestPayload =
-      target.engine === "mistral"
-        ? {
-            model: "mistral-ocr-latest",
-            document: {
-              type: "document_url",
-              document_url: `data:application/pdf;base64,${base64}`,
-            },
-          }
-        : {
-            filename: filename || "document.pdf",
-            mime: mime || "application/pdf",
-            contentBase64: base64,
-          };
+    const requestPayload = target.adapter.buildPayload(base64, mime, filename);
 
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -239,12 +263,12 @@ export function buildExternalPdfExtractor(
       if (!res.ok) {
         await cancelResponseBody(res);
         log("warn", "external_pdf_extract_http_error", {
-          engine: target.engine,
+          engine: adapterId,
           status: res.status,
         });
         return {
           needsOcr: true,
-          reason: `external ${target.engine} HTTP ${res.status}`,
+          reason: `external ${adapterId} HTTP ${res.status}`,
         };
       }
       const mediaType = parseMediaType(res.headers.get("content-type"));
@@ -254,12 +278,12 @@ export function buildExternalPdfExtractor(
       if (mediaType !== "" && !isJsonType && !isPlainOrMdType) {
         await cancelResponseBody(res);
         log("warn", "external_pdf_extract_unsupported_content_type", {
-          engine: target.engine,
+          engine: adapterId,
           mediaType,
         });
         return {
           needsOcr: true,
-          reason: `external ${target.engine} rejected unsupported content-type ${mediaType}`,
+          reason: `external ${adapterId} rejected unsupported content-type ${mediaType}`,
         };
       }
       const rawBody = await readBoundedResponseText(res, maxResponseBytes);
@@ -274,10 +298,10 @@ export function buildExternalPdfExtractor(
         extracted = { text: rawBody.trim() };
       }
       if (!extracted || !extracted.text.trim()) {
-        log("warn", "external_pdf_extract_empty", { engine: target.engine, mediaType });
+        log("warn", "external_pdf_extract_empty", { engine: adapterId, mediaType });
         return {
           needsOcr: true,
-          reason: `external ${target.engine} returned empty or invalid payload`,
+          reason: `external ${adapterId} returned empty or invalid payload`,
         };
       }
       const heading = extracted.text.match(/^#\s+(.+)$/m)?.[1]?.trim();
@@ -289,12 +313,12 @@ export function buildExternalPdfExtractor(
       const isAbort =
         (err instanceof Error && err.name === "AbortError") || ctrl.signal.aborted;
       const reason = isAbort
-        ? `external ${target.engine} timeout after ${timeoutMs}ms`
+        ? `external ${adapterId} timeout after ${timeoutMs}ms`
         : err instanceof Error && err.message === "external_response_too_large"
-          ? `external ${target.engine} response exceeds ${maxResponseBytes} bytes`
-          : `external ${target.engine} request failed`;
+          ? `external ${adapterId} response exceeds ${maxResponseBytes} bytes`
+          : `external ${adapterId} request failed`;
       log("warn", "external_pdf_extract_failed", {
-        engine: target.engine,
+        engine: adapterId,
         reason,
         err: err instanceof Error ? err.message : String(err),
       });
