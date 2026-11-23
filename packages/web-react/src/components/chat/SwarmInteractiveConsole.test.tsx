@@ -207,5 +207,13 @@ describe("Composer · 蜂群剧本模板快选弹层", () => {
     const input = screen.getByRole("textbox") as HTMLTextAreaElement;
     expect(input.value).toContain("/swarm-playbook multi-source-lit-verify");
     expect(onToggleSwarmMode).toHaveBeenCalledTimes(1);
+
+    // OCV5-861 回归：chunk 预热后二次打开剧本弹层，即便触发器收到 focusin 也不得误关弹层。
+    fireEvent.pointerDown(plusBtn, { button: 0, pointerType: "mouse" });
+    fireEvent.click(plusBtn);
+    fireEvent.click(await screen.findByTestId("composer-menu-swarm-playbooks"));
+    const reopened = await screen.findByTestId("swarm-playbook-popover");
+    fireEvent.focus(plusBtn);
+    expect(screen.getByTestId("swarm-playbook-popover")).toBe(reopened);
   });
 });

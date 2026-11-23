@@ -41,7 +41,7 @@ import type { SessionContextPressureState } from "../lib/chat/model";
 import type { RepoSelection } from "../lib/types";
 import { cn } from "../lib/utils";
 import { ComposerPlusMenu } from "./ComposerPlusMenu";
-import { SwarmPlaybookPopoverLazy } from "./chat/lazyTimelineCards";
+import { preloadSwarmViews, SwarmPlaybookPopoverLazy } from "./chat/lazyTimelineCards";
 import { RepoPill } from "./github/RepoPill";
 import {
   IconButton,
@@ -384,6 +384,18 @@ export function Composer({
   const [plusMenuOpen, setPlusMenuOpen] = useState(false);
   const [playbookOpen, setPlaybookOpen] = useState(false);
   const plusAnchorRef = useRef<HTMLSpanElement>(null);
+  const playbookOpenTimerRef = useRef<number | null>(null);
+  const playbookFocusRafRef = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (playbookOpenTimerRef.current !== null) {
+      window.clearTimeout(playbookOpenTimerRef.current);
+      playbookOpenTimerRef.current = null;
+    }
+    if (playbookFocusRafRef.current !== null) {
+      window.cancelAnimationFrame(playbookFocusRafRef.current);
+      playbookFocusRafRef.current = null;
+    }
+  }, []);
   const toast = useToast();
   const [voiceMsg, setVoiceMsg] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
@@ -1274,7 +1286,13 @@ export function Composer({
             <span ref={plusAnchorRef} className="inline-flex shrink-0 items-center">
               <ComposerPlusMenu
                 open={plusMenuOpen}
-                onOpenChange={setPlusMenuOpen}
+                onOpenChange={(next) => {
+                  setPlusMenuOpen(next);
+                  if (next) {
+                    setPlaybookOpen(false);
+                    if (swarmSupported) preloadSwarmViews().catch(() => {});
+                  }
+                }}
                 disabled={disabled}
                 canGoal={canGoal}
                 visibleGoal={visibleGoal}
@@ -1284,7 +1302,17 @@ export function Composer({
                 hasSwarmPlaybooks={Boolean(swarmSupported)}
                 onOpenSwarmPlaybooks={() => {
                   setPlusMenuOpen(false);
-                  window.setTimeout(() => setPlaybookOpen(true), 0);
+                  if (playbookFocusRafRef.current !== null) {
+                    window.cancelAnimationFrame(playbookFocusRafRef.current);
+                    playbookFocusRafRef.current = null;
+                  }
+                  if (playbookOpenTimerRef.current !== null) {
+                    window.clearTimeout(playbookOpenTimerRef.current);
+                  }
+                  playbookOpenTimerRef.current = window.setTimeout(() => {
+                    playbookOpenTimerRef.current = null;
+                    setPlaybookOpen(true);
+                  }, 0);
                 }}
               />
               {swarmSupported && playbookOpen && (
@@ -1297,20 +1325,17 @@ export function Composer({
                   onSelectPlaybook={(draft) => {
                     setValue(draft);
                     if (!swarmMode) onToggleSwarmMode?.();
-                    window.requestAnimationFrame(() => ref.current?.focus());
+                    if (playbookFocusRafRef.current !== null) {
+                      window.cancelAnimationFrame(playbookFocusRafRef.current);
+                    }
+                    playbookFocusRafRef.current = window.requestAnimationFrame(() => {
+                      playbookFocusRafRef.current = null;
+                      ref.current?.focus();
+                    });
                   }}
                 />
               )}
             </span>
-            {onOpenRepo && !hasBoundRepo && (
-              <span aria-hidden className="mx-0.5 hidden h-4 w-px shrink-0 bg-border/70 sm:block" />
-            )}
-            {/* 未绑定仓库时：移动端收纳在「+」菜单内，桌面 sm+ 保留无框轻量入口；已绑定则统一展示于顶部微上下文条。 */}
-            {onOpenRepo && !hasBoundRepo && (
-              <span className="hidden min-w-0 items-center sm:flex" data-testid="composer-repo-slot">
-                <RepoPill selection={null} onClick={onOpenRepo} quiet />
-              </span>
-            )}
             <div className="ml-auto flex shrink-0 items-center gap-1.5">
               {/* 生成中排队发送(C-02):此前生成中唯一按钮是「停止」,桌面 Enter 排队无反馈,触屏 Enter=换行
                   → 根本没有排队入口。现在 busy 且有可发内容时给一个次级「排队发送」按钮;「停止」仍是唯一

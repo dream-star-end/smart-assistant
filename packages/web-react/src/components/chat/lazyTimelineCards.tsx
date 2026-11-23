@@ -393,7 +393,7 @@ export function PermissionPromptHost(props: PermissionPromptHostProps) {
 // ── Antigravity Native Swarm UI (OCV5-809) & PinnedDelegateTracker: single shared lazy chunks ──
 let loadedSwarm: SwarmViewsModule | null = null
 let pendingSwarm: Promise<SwarmViewsModule> | null = null
-function preloadSwarmViews(): Promise<SwarmViewsModule> {
+export function preloadSwarmViews(): Promise<SwarmViewsModule> {
   if (!pendingSwarm) {
     pendingSwarm = import('./SwarmViews').then(
       (m) => { loadedSwarm = m; return m },
