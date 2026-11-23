@@ -66,14 +66,15 @@ it('a chat that needs a new session gets an error card and a final, and nothing 
   assert.equal(card.peer.id, PEER)
   assert.match(card.message, /新开一个对话/)
   assert.equal(final.isFinal, true)
-  assert.equal(final.blocks[0].text, '[error] CC5_BACKEND_REQUIRES_NEW_SESSION')
+  assert.match(final.blocks[0].text, /^\[error\] .*新开一个对话/)
+  assert.doesNotMatch(final.blocks[0].text, /CC5_BACKEND_REQUIRES_NEW_SESSION/)
 })
 
 it('an unexpected failure shows only its public code, never internal detail', async () => {
   const { delivered, gw } = makeGateway(new Error('spawn /opt/openclaude/bin/codex EACCES at /home/box/x'))
   await send(gw)
   assert.equal(delivered[0].type, 'outbound.error')
-  assert.match(delivered[0].message, /SESSION_START_FAILED/)
+  assert.match(delivered[0].message, /这一轮没能开始/)
   assert.doesNotMatch(JSON.stringify(delivered), /\/opt\/openclaude|\/home\/box|EACCES/)
 })
 
