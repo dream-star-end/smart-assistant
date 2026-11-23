@@ -131,6 +131,8 @@ export type FrameEffects = {
   forceSync?: (sessId: string, context?: { clientMessageId?: string }) => void;
   /** swarm_snapshot 遇到 missing_base 时，从活跃 view=units 补拉 SwarmBoard 基线（OCV5-867）。*/
   resyncSwarmUnits?: (sessId: string, clientMessageId?: string) => void;
+  /** 跨 tab 收到未知活跃 clientMessageId 实时帧且本地缺对应 user 气泡时补拉一次历史（OCV5-868）。*/
+  syncMissingTurnUser?: (sessId: string, clientMessageId: string) => void;
   /**
    * tape 提交后的合成 turn_completed 命中**正在流式**的本轮:返回 true 表示 socket 接管——宽限期内
    * 等 live 尾巴与真 final 自然收口,期满仍未收口再按 reconcile 收口。缺省/false → 立即收口(旧行为)。
@@ -1862,6 +1864,17 @@ export function applyOutboundMessage(
   if (!lifecycleSidebandFrame) {
     if (hasBlocks) {
       if (!frame.isFinal && !frame.cronJob && !sess._sendingInFlight) sess._sendingInFlight = true;
+      if (!frame.isFinal && !frame.cronJob && !progressOnlyFrame && typeof frame.clientMessageId === "string" && frame.clientMessageId) {
+        const isUnclaimedTurn = sess._activeClientMessageId !== frame.clientMessageId;
+        if (!sess._activeClientMessageId) sess._activeClientMessageId = frame.clientMessageId;
+        const hasOwnerUser = sess.messages.some(
+          (m) => m.role === "user" && (m.id === frame.clientMessageId || m._clientMessageId === frame.clientMessageId),
+        );
+        if (isUnclaimedTurn && !hasOwnerUser && sess._missingUserSyncCmid !== frame.clientMessageId) {
+          sess._missingUserSyncCmid = frame.clientMessageId;
+          effects.syncMissingTurnUser?.(sess.id, frame.clientMessageId);
+        }
+      }
       if (isRetryingTurnStatus(sess._turnStatus) || isEngineStartupTurnStatus(sess._turnStatus))
         sess._turnStatus = null;
       const hint = sess._turnProgressHint;

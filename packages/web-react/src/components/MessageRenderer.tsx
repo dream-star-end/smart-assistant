@@ -91,7 +91,7 @@ import {
 } from "./chat/permissionPromptState";
 import { ToolCardSlot } from "./chat/toolCardSlot";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
-import { currentTurnStartIndex, turnFinalAssistantFlags, turnRatingFlags } from "./chat/turnSegment";
+import { currentTurnStartIndex, turnFinalAssistantFlags, turnLineageRoot, turnRatingFlags } from "./chat/turnSegment";
 import {
   captureVisibleVirtualRowAnchor,
   correctedScrollTop,
@@ -805,10 +805,46 @@ const ProcessGroupMemo = memo(
  * answer. A deferred empty locator for a finished turn stays outside too.
  * Deliverable rows are excluded separately by isProcessMessage.
  */
-function disclosureAnswerIds(messages: ChatMessage[], finals: boolean[], sending: boolean): Set<string> {
+function explicitRowTurnRoot(
+  message: ChatMessage | undefined,
+  rootOf: (id: string) => string,
+): string | undefined {
+  if (!message) return undefined;
+  const raw = message.role === "user"
+    ? message.id
+    : (typeof message._turnOwnerId === "string" && message._turnOwnerId) ||
+      (typeof message._clientMessageId === "string" && message._clientMessageId) ||
+      undefined;
+  return raw ? rootOf(raw) : undefined;
+}
+
+function disclosureAnswerIds(
+  messages: ChatMessage[],
+  finals: boolean[],
+  sending: boolean,
+  turnLineageParents?: ReadonlyMap<string, string>,
+): Set<string> {
   const ids = new Set<string>();
   const activeStart = currentTurnStartIndex(messages);
-  const live = (index: number) => sending && index >= activeStart;
+  const rootOf = turnLineageRoot(messages, turnLineageParents);
+  const trailingOwnerAfter = (index: number, ownerRoot: string): boolean => {
+    for (let j = index + 1; j < messages.length; j += 1) {
+      const otherRoot = explicitRowTurnRoot(messages[j], rootOf);
+      if (otherRoot && otherRoot !== ownerRoot) return true;
+    }
+    return false;
+  };
+  const live = (index: number) => {
+    if (!sending || index < activeStart) return false;
+    const message = messages[index];
+    // OCV5-868: 跨 tab 尚缺新轮 user 行或分页截断场景，已完整落盘的前轮 tape 终答
+    // 若后方已出现另一轮的活跃行，绝不视为当前活跃轮的中间叙述。
+    if (message?._turnTapeComplete === true) {
+      const ownerRoot = explicitRowTurnRoot(message, rootOf);
+      if (ownerRoot && trailingOwnerAfter(index, ownerRoot)) return false;
+    }
+    return true;
+  };
   for (let i = 0; i < messages.length; i++) {
     if (!finals[i] || live(i)) continue;
     const id = messages[i]?.id;
@@ -890,12 +926,37 @@ function continuedErrorIds(messages: ChatMessage[]): Set<string> {
   return ids;
 }
 
-function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], finals: boolean[], sending: boolean): RenderItem[] {
+function discloseProcess(
+  items: LeafRenderItem[],
+  messages: ChatMessage[],
+  finals: boolean[],
+  sending: boolean,
+  turnLineageParents?: ReadonlyMap<string, string>,
+): RenderItem[] {
   const out: RenderItem[] = [];
-  const answerIds = disclosureAnswerIds(messages, finals, sending);
+  const rootOf = turnLineageRoot(messages, turnLineageParents);
+  const answerIds = disclosureAnswerIds(messages, finals, sending, turnLineageParents);
   const continuedErrors = continuedErrorIds(messages);
   const activeStart = currentTurnStartIndex(messages);
-  const activeIds = new Set(sending ? messages.slice(activeStart).map((message) => message.id) : []);
+  const hasLaterDifferentTurnOwner = (index: number, ownerRoot: string): boolean => {
+    for (let j = index + 1; j < messages.length; j += 1) {
+      const otherRoot = explicitRowTurnRoot(messages[j], rootOf);
+      if (otherRoot && otherRoot !== ownerRoot) return true;
+    }
+    return false;
+  };
+  const activeIds = new Set(
+    sending
+      ? messages
+          .slice(activeStart)
+          .filter((message, offset) => {
+            if (message._turnTapeComplete !== true) return true;
+            const ownerRoot = explicitRowTurnRoot(message, rootOf);
+            return !(ownerRoot && hasLaterDifferentTurnOwner(activeStart + offset, ownerRoot));
+          })
+          .map((message) => message.id)
+      : [],
+  );
   const assistantArtifactKeys = new Map<string, Set<string>>();
   let scanOwner = "head";
   for (const item of items) {
@@ -924,7 +985,7 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
   // the answer: never open a second 工作过程 underneath. Rows that must stay
   // put (question, approval, failure, artifact) are not foldable, end the
   // carry, and keep their place.
-  let carry: { boundary: string; group: ProcessGroup | undefined; answerIndex: number } | undefined;
+  let carry: { boundary: string; answerOwner?: string; group: ProcessGroup | undefined; answerIndex: number } | undefined;
   // Key off the turn, not the first row. Prepending an older live page must
   // not remount the shell the reader already has open.
   const shellOrdinal = new Map<string, number>();
@@ -1000,8 +1061,10 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
       const crossedAnswer = rows.some((message) => answerIds.has(message.id));
       if (crossedAnswer) {
         beforeAnswer.delete(boundary);
+        const answerRow = rows.find((message) => answerIds.has(message.id));
+        const answerOwner = explicitRowTurnRoot(answerRow, rootOf);
         const kept = group ?? (carry?.boundary === nextBoundary ? carry.group : undefined);
-        carry = { boundary: nextBoundary, group: kept, answerIndex: out.length };
+        carry = { boundary: nextBoundary, answerOwner, group: kept, answerIndex: out.length };
       } else if (group && out.includes(group)) {
         beforeAnswer.set(boundary, group);
         carry = undefined;
@@ -1012,7 +1075,9 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
       out.push(item);
       continue;
     }
-    if (carry && carry.boundary === nextBoundary && !group) {
+    const rowOwner = explicitRowTurnRoot(rows[0], rootOf);
+    const carryMatchesTurn = !(carry?.answerOwner && rowOwner && rowOwner !== carry.answerOwner);
+    if (carry && carry.boundary === nextBoundary && carryMatchesTurn && !group) {
       if (!carry.group || out.indexOf(carry.group) < 0) {
         const created: ProcessGroup = { kind: "process", key: "", members: [], items: [], active: false };
         carry.group = created;
@@ -2374,6 +2439,7 @@ export function MessageList({
         renderableMessages,
         nextRatingFinal,
         sending,
+        turnLineageParents,
       );
     }
     const nextActionRowFinal = turnRatingFlags(renderableMessages, nextRatingFinal, turnLineageParents);

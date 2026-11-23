@@ -88,4 +88,22 @@ describe("returnStrayRowsToOwnerTurn (OCV5-313)", () => {
     const once = returnStrayRowsToOwnerTurn(rows);
     expect(returnStrayRowsToOwnerTurn(once)).toBe(once);
   });
+
+  test("OCV5-868: 分页截断缺 u1 时，凭借 _orderSeq < u2._orderSeq 或页首同 owner 将落到 u2 后的前轮行归位到 u2 之前", () => {
+    const byOrderSeq = [
+      m("u2", "user", { ts: T0 + 60 * MIN, _orderSeq: 3 }),
+      m("t2-live", "tool", { _clientMessageId: "u2", _turnOwnerId: "u2", _source: "local", ts: T0 + 61 * MIN }),
+      m("t1-75", "tool", { _clientMessageId: "u1", _orderSeq: 2, ts: T0 + 10 * MIN }),
+      m("a1-final", "assistant", { _clientMessageId: "u1", _orderSeq: 2, ts: T0 + 20 * MIN }),
+    ];
+    expect(ids(returnStrayRowsToOwnerTurn(byOrderSeq))).toEqual(["t1-75", "a1-final", "u2", "t2-live"]);
+
+    const byHeadOwner = [
+      m("t1-75", "tool", { _clientMessageId: "u1", ts: T0 + 10 * MIN }),
+      m("u2", "user", { ts: T0 + 60 * MIN }),
+      m("t2-live", "tool", { _clientMessageId: "u2", _turnOwnerId: "u2", _source: "local", ts: T0 + 61 * MIN }),
+      m("a1-final", "assistant", { _clientMessageId: "u1", ts: T0 + 20 * MIN }),
+    ];
+    expect(ids(returnStrayRowsToOwnerTurn(byHeadOwner))).toEqual(["t1-75", "a1-final", "u2", "t2-live"]);
+  });
 });

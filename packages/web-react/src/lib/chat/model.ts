@@ -779,6 +779,8 @@ export type ChatSession = {
   _turnProgressHint?: string;
   /** User-row id of the turn currently streaming in this browser. */
   _activeClientMessageId?: string;
+  /** Cross-tab dedupe marker for one-shot history sync when a live frame arrives without its user row (OCV5-868). */
+  _missingUserSyncCmid?: string;
   /**
    * Browser-only stop settlement fence. A successful online Stop stays busy
    * until this exact turn reaches a terminal frame and the authoritative REST

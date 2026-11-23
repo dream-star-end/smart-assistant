@@ -1218,8 +1218,8 @@ export function mergeFullServerWins(
   };
   // In-flight order is the live order. Repair would pull process cards in
   // front of a partial assistant and the refresh would not match the open tab.
-  const settle = (rows: ChatMessage[]) => finishShadow(
-    activeOwner ? repositionActiveTurnRowsAfterOwner(rows, activeOwner, turnOwnerId) : coalesceProcessIdentities(repairPostFinalProcessOrder(rows)),
+  const settle = (rows: ChatMessage[], preOverrides?: ReadonlyMap<ChatMessage, number>) => finishShadow(
+    activeOwner ? repositionActiveTurnRowsAfterOwner(rows, activeOwner, turnOwnerId, (pre) => stableSortByTs(pre, preOverrides)) : coalesceProcessIdentities(repairPostFinalProcessOrder(rows)),
   );
   local = activeOwner ? local : repairPostFinalProcessOrder(local);
   const legacyActiveRows = new Set<ChatMessage>();
@@ -1431,9 +1431,7 @@ export function mergeFullServerWins(
       if (m?.id) emittedServerIds.add(m.id);
     }
   }
-  return settle(
-    activeOwner ? inLocalOrder : stableSortByTs(inLocalOrder, anchorOverrides),
-  );
+  return settle(activeOwner ? inLocalOrder : stableSortByTs(inLocalOrder, anchorOverrides), anchorOverrides);
 }
 
 /**
@@ -1503,7 +1501,7 @@ export function applyServerIncremental(
   const seen = new Set<string>();
   for (const m of local) if (m?.id) seen.add(m.id);
   for (const m of incoming) if (m?.id && !seen.has(m.id)) merged.push(m);
-  return finishShadow(activeOwner ? repositionActiveTurnRowsAfterOwner(merged, activeOwner, turnOwnerId) : repairPostFinalProcessOrder(stableSortByTs(merged)));
+  return finishShadow(activeOwner ? repositionActiveTurnRowsAfterOwner(merged, activeOwner, turnOwnerId, stableSortByTs) : repairPostFinalProcessOrder(stableSortByTs(merged)));
 }
 
 /**

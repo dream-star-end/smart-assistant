@@ -1596,6 +1596,9 @@ export class ChatSocket {
       resyncSwarmUnits: (sessId, clientMessageId) => {
         this.resyncSwarmUnits(sessId, clientMessageId);
       },
+      syncMissingTurnUser: (sessId, clientMessageId) => {
+        this.syncHistory(sessId, { clientMessageId });
+      },
       persistSession: (sessId) => this.deps.persistSession?.(sessId),
       onAuthControlError: () => {
         // 交给 close(1008) handler 续期，不渲染。
