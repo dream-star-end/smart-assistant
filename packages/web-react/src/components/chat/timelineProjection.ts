@@ -1,11 +1,11 @@
-import type { ChatMessage } from "./model";
-import { collectRecoveredTurnStatusRecordIds } from "./manualTaskContinuation";
-import { returnStrayRowsToOwnerTurn } from "./order";
-import { isRecoveryControlUserTurn } from "./pure";
+import type { ChatMessage } from "../../lib/chat/model";
+import { collectRecoveredTurnStatusRecordIds } from "../../lib/chat/manualTaskContinuation";
+import { returnStrayRowsToOwnerTurn } from "../../lib/chat/order";
+import { isRecoveryControlUserTurn } from "../../lib/chat/pure";
 import {
   collectAutomaticRecoveredSourceIds,
   recoveryFailureIsPresentedBelow,
-} from "./recoveryFailureOutlet";
+} from "../../lib/chat/recoveryFailureOutlet";
 import {
   collectResolvedDispatchTurnIds,
   collectTurnStatusRecordTurnIds,
@@ -14,13 +14,13 @@ import {
   isErrorCardSupersededByTurnStatus,
   isRedundantRuntimeEnvelope,
   isTurnStatusSuppressedByTape,
-} from "./render";
-import { sanitizeChatMessages } from "./sanitizeChatMessages";
+} from "../../lib/chat/render";
+import { sanitizeChatMessages } from "../../lib/chat/sanitizeChatMessages";
 import {
   projectVisibleAssistantRows,
   splitStoppedNarration,
   turnRecoveryParents,
-} from "../../components/chat/turnSegment";
+} from "./turnSegment";
 
 function isNonEmptyId(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;

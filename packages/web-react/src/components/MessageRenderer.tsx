@@ -44,7 +44,7 @@ import { isPlatedAssistantMessage, isRecoveryTurnClientMessageId } from "../lib/
 import {
   projectTimelineMessages,
   timelineMessagesFingerprint,
-} from "../lib/chat/timelineProjection";
+} from "./chat/timelineProjection";
 import {
   EAGER_MEDIA_TAIL_ITEMS,
   EAGER_PAYLOAD_TAIL_ITEMS,
