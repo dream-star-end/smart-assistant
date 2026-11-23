@@ -24,7 +24,7 @@ export interface IssuedLiveBrowserTicket extends LiveBrowserTicketRecord {
 
 export class LiveBrowserTicketStore {
   private readonly records = new Map<string, LiveBrowserTicketRecord>()
-  private readonly keyBySlot = new Map<string, string>()
+  private readonly keyByUid = new Map<string, string>()
 
   constructor(private readonly now: () => number = Date.now) {}
 
@@ -39,8 +39,8 @@ export class LiveBrowserTicketStore {
 
     const ticket = randomBytes(TICKET_BYTES).toString('base64url')
     const key = ticketKey(ticket)
-    const slot = slotKey(uid, agentId)
-    const prior = this.keyBySlot.get(slot)
+    const uidKey = uid.toString()
+    const prior = this.keyByUid.get(uidKey)
     if (prior) this.records.delete(prior)
 
     const record: LiveBrowserTicketRecord = {
@@ -49,7 +49,7 @@ export class LiveBrowserTicketStore {
       expiresAt: now + LIVE_BROWSER_TICKET_TTL_MS,
     }
     this.records.set(key, record)
-    this.keyBySlot.set(slot, key)
+    this.keyByUid.set(uidKey, key)
     this.enforceCap()
     return { ticket, ...record }
   }
@@ -63,9 +63,9 @@ export class LiveBrowserTicketStore {
     const record = this.records.get(key)
     if (!record) return null
     this.records.delete(key)
-    const slot = slotKey(record.uid, record.agentId)
-    if (this.keyBySlot.get(slot) === key) {
-      this.keyBySlot.delete(slot)
+    const uidKey = record.uid.toString()
+    if (this.keyByUid.get(uidKey) === key) {
+      this.keyByUid.delete(uidKey)
     }
     if (record.expiresAt <= now) return null
     return record
@@ -80,9 +80,9 @@ export class LiveBrowserTicketStore {
     for (const [key, record] of this.records) {
       if (record.expiresAt > now) continue
       this.records.delete(key)
-      const slot = slotKey(record.uid, record.agentId)
-      if (this.keyBySlot.get(slot) === key) {
-        this.keyBySlot.delete(slot)
+      const uidKey = record.uid.toString()
+      if (this.keyByUid.get(uidKey) === key) {
+        this.keyByUid.delete(uidKey)
       }
     }
   }
@@ -93,16 +93,12 @@ export class LiveBrowserTicketStore {
     for (let i = 0; i < oldest.length - MAX_PENDING_TICKETS; i++) {
       const [key, record] = oldest[i]!
       this.records.delete(key)
-      const slot = slotKey(record.uid, record.agentId)
-      if (this.keyBySlot.get(slot) === key) {
-        this.keyBySlot.delete(slot)
+      const uidKey = record.uid.toString()
+      if (this.keyByUid.get(uidKey) === key) {
+        this.keyByUid.delete(uidKey)
       }
     }
   }
-}
-
-function slotKey(uid: bigint, agentId: string): string {
-  return `${uid.toString()}:${agentId}`
 }
 
 function ticketKey(ticket: string): string {

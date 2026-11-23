@@ -280,5 +280,5 @@ test('exhausted API error attempt still emits the structured terminal error and 
   assert.equal(delivered[0]!.out.code, 'rate_limited')
   assert.equal(delivered[0]!.out.isFinal, false)
   assert.equal(delivered[1]!.out.isFinal, true)
-  assert.match(delivered[1]!.out.blocks[0]!.text, /^\[error\] API Error: 429/)
+  assert.match(delivered[1]!.out.blocks[0]!.text, /^\[error\] 请求暂时较多，请稍后再试/)
 })

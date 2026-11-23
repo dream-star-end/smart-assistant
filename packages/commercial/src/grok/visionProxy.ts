@@ -658,19 +658,19 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
       if (!snapshot.canUseModel(scope, canonical)) {
         throw new GrokRunError(403, "GROK_VISION_NOT_AUTHORIZED", "this model is not available to this user");
       }
-      // If flagship static failover is configured and no active Grok account exists,
-      // fail over before freezing billing so price and journal match the model actually called.
+      // Check Grok account availability first so healthy Grok calls never touch static key pools
+      // or pollute pool_user_affinity; only resolve flagship static failover when no Grok account exists.
       if (!requested && (deps.staticProviderKeys || deps.resolveStaticApiKey)) {
-        const candidate = await resolveFlagshipStaticVisionFallback(snapshot, scope, billTo, userId, deps);
-        if (candidate) {
-          const acct = await pickAccountId().catch(() => null);
-          if (acct === null) {
+        const acct = await pickAccountId().catch(() => null);
+        if (acct === null) {
+          const candidate = await resolveFlagshipStaticVisionFallback(snapshot, scope, billTo, userId, deps);
+          if (candidate) {
             staticFallback = candidate;
             canonical = candidate.canonical;
             upstreamModel = candidate.upstreamModel;
-          } else {
-            prePickedAccountId = acct;
           }
+        } else {
+          prePickedAccountId = acct;
         }
       }
     } else {

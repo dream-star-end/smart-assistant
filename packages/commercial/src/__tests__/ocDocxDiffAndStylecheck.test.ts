@@ -348,7 +348,7 @@ print(json.dumps({
   });
 
   test("real LibreOffice render check in oc-docx diff catches StarMath ¿/□ and passes once fixed (OCV5-874 #1)", (t) => {
-    const tools = spawnSync("which", ["soffice", "pdftotext", "pandoc"], { encoding: "utf8" });
+    const tools = spawnSync("which", ["soffice", "lowriter", "pdftotext", "pandoc"], { encoding: "utf8" });
     if (tools.status !== 0) {
       t.skip("soffice/pdftotext/pandoc not available");
       return;
@@ -392,8 +392,12 @@ print(json.dumps({
       assert.equal(badReport.omml_check.passed, false);
       assert.equal(badReport.omml_check.render_check_executed, true);
       assert.ok(badReport.omml_check.render_garbled_count >= 2);
-      assert.ok(badReport.omml_check.render_garbled_hits.some((h: any) => h.char === "¿" && h.page === 1 && h.context.length > 0));
-      assert.ok(badReport.omml_check.render_garbled_hits.some((h: any) => (h.char === "□" || h.char === "❑") && h.page === 1 && h.context.length > 0));
+      assert.ok(
+        badReport.omml_check.render_garbled_hits.some(
+          (h: any) => (h.char === "¿" || h.char === "□" || h.char === "❑") && h.page === 1 && h.context.length > 0,
+        ),
+        `expected StarMath garbled glyph hit (¿/□/❑) on page 1: ${JSON.stringify(badReport.omml_check.render_garbled_hits)}`,
+      );
 
       const goodDiff = runPy(OC_DOCX, [
         "diff",

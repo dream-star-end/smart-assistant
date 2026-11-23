@@ -190,8 +190,8 @@ ${call}
     timeout: seconds * 1000 + 1500, killSignal: "SIGKILL",
     env: { PATH: "/usr/bin:/bin", HOME: box.root, CAPSULE: box.root, STANDIN_GROK: grok, STANDIN_UNIT: unit,
       STANDIN_COMMIT: box.commit, ALLOW_ANY_BRANCH: "1",
-      STANDIN_CODEX_LABEL: codex?.label ?? "0.170.0",
-      STANDIN_CODEX_BIN: codex?.bin ?? "codex-cli 0.170.0",
+      STANDIN_CODEX_LABEL: codex?.label ?? "0.171.0",
+      STANDIN_CODEX_BIN: codex?.bin ?? "codex-cli 0.171.0",
       STANDIN_CODEX_RC: String(codex?.rc ?? 0) } });
   if (ran.status === 137 || ran.signal === "SIGKILL" || ran.error) fail("DEADLINE_EXCEEDED");
   return { status: ran.status, out: `${ran.stdout}`, err: `${ran.stderr}`, calls: box.calls() };
@@ -210,15 +210,15 @@ function proveOfflinePrepare(box: Capsule): string {
   if (old.calls.some((line) => line.startsWith("psql ")) || box.exists(`remote/cutovers/${NONCE}`)) {
     fail("OFFLINE_PREPARE_OLD_CLI_WENT_ON");
   }
-  const badCodexLabel = consumer(box, current, "active", call, { label: "0.169.0" });
-  if (badCodexLabel.status === 0 || !badCodexLabel.err.includes("expected 0.170.0")) {
+  const badCodexLabel = consumer(box, current, "active", call, { label: "0.170.0" });
+  if (badCodexLabel.status === 0 || !badCodexLabel.err.includes("expected 0.171.0")) {
     fail(`OFFLINE_PREPARE_ACCEPTED_OLD_CODEX_LABEL_${badCodexLabel.status}: ${badCodexLabel.err.slice(-300)}`);
   }
-  const badCodexBin = consumer(box, current, "active", call, { label: "0.170.0", bin: "codex-cli 0.169.0" });
-  if (badCodexBin.status === 0 || !badCodexBin.err.includes("expected codex-cli 0.170.0")) {
+  const badCodexBin = consumer(box, current, "active", call, { label: "0.171.0", bin: "codex-cli 0.170.0" });
+  if (badCodexBin.status === 0 || !badCodexBin.err.includes("expected codex-cli 0.171.0")) {
     fail(`OFFLINE_PREPARE_ACCEPTED_OLD_CODEX_BIN_${badCodexBin.status}: ${badCodexBin.err.slice(-300)}`);
   }
-  const missingCodex = consumer(box, current, "active", call, { label: "0.170.0", rc: 127 });
+  const missingCodex = consumer(box, current, "active", call, { label: "0.171.0", rc: 127 });
   if (missingCodex.status === 0 || !missingCodex.err.includes("codex --version failed")) {
     fail(`OFFLINE_PREPARE_ACCEPTED_MISSING_CODEX_${missingCodex.status}: ${missingCodex.err.slice(-300)}`);
   }
@@ -241,20 +241,20 @@ assert_target_runtime_image_ready`;
   if (old.status === 0 || !old.err.includes(`expected='grok ${PINNED}`)) {
     fail(`ONLINE_IMAGE_ACCEPTED_OLD_CLI_${old.status}: ${old.err.slice(-300)}`);
   }
-  const badCodexLabel = consumer(box, current, "active", call, { label: "0.169.0" });
-  if (badCodexLabel.status === 0 || !badCodexLabel.err.includes("expected=0.170.0")) {
+  const badCodexLabel = consumer(box, current, "active", call, { label: "0.170.0" });
+  if (badCodexLabel.status === 0 || !badCodexLabel.err.includes("expected=0.171.0")) {
     fail(`ONLINE_IMAGE_ACCEPTED_OLD_CODEX_LABEL_${badCodexLabel.status}: ${badCodexLabel.err.slice(-300)}`);
   }
-  const badCodexBin = consumer(box, current, "active", call, { label: "0.170.0", bin: "codex-cli 0.169.0" });
-  if (badCodexBin.status === 0 || !badCodexBin.err.includes("expected='codex-cli 0.170.0'")) {
+  const badCodexBin = consumer(box, current, "active", call, { label: "0.171.0", bin: "codex-cli 0.170.0" });
+  if (badCodexBin.status === 0 || !badCodexBin.err.includes("expected='codex-cli 0.171.0'")) {
     fail(`ONLINE_IMAGE_ACCEPTED_OLD_CODEX_BIN_${badCodexBin.status}: ${badCodexBin.err.slice(-300)}`);
   }
-  const missingCodex = consumer(box, current, "active", call, { label: "0.170.0", rc: 127 });
+  const missingCodex = consumer(box, current, "active", call, { label: "0.171.0", rc: 127 });
   if (missingCodex.status === 0 || !missingCodex.err.includes("codex --version failed")) {
     fail(`ONLINE_IMAGE_ACCEPTED_MISSING_CODEX_${missingCodex.status}: ${missingCodex.err.slice(-300)}`);
   }
   const ok = consumer(box, current, "active", call);
-  if (ok.status !== 0 || !ok.out.includes(`grok=${current}`) || !ok.out.includes("codex=codex-cli 0.170.0")) {
+  if (ok.status !== 0 || !ok.out.includes(`grok=${current}`) || !ok.out.includes("codex=codex-cli 0.171.0")) {
     fail(`ONLINE_IMAGE_REFUSED_${ok.status}: ${ok.err.slice(-400)}`);
   }
   return "[grok-426-online-image] PASS — the online image switch accepts only Grok CLI 1.0.77";
@@ -274,20 +274,20 @@ function proveStagedActivation(box: Capsule): string {
     fail(`STAGED_ACTIVATION_ACCEPTED_OLD_CLI_${old.status}: ${old.err.slice(-300)}`);
   }
   if (old.calls.some((line) => line.startsWith("systemctl start"))) fail("STAGED_ACTIVATION_OLD_CLI_STARTED");
-  const badCodexLabel = staged(current, { label: "0.169.0" });
-  if (badCodexLabel.status === 0 || !badCodexLabel.err.includes("expected=0.170.0")) {
+  const badCodexLabel = staged(current, { label: "0.170.0" });
+  if (badCodexLabel.status === 0 || !badCodexLabel.err.includes("expected=0.171.0")) {
     fail(`STAGED_ACTIVATION_ACCEPTED_OLD_CODEX_LABEL_${badCodexLabel.status}: ${badCodexLabel.err.slice(-300)}`);
   }
-  const badCodexBin = staged(current, { label: "0.170.0", bin: "codex-cli 0.169.0" });
-  if (badCodexBin.status === 0 || !badCodexBin.err.includes("expected='codex-cli 0.170.0'")) {
+  const badCodexBin = staged(current, { label: "0.171.0", bin: "codex-cli 0.170.0" });
+  if (badCodexBin.status === 0 || !badCodexBin.err.includes("expected='codex-cli 0.171.0'")) {
     fail(`STAGED_ACTIVATION_ACCEPTED_OLD_CODEX_BIN_${badCodexBin.status}: ${badCodexBin.err.slice(-300)}`);
   }
-  const missingCodex = staged(current, { label: "0.170.0", rc: 127 });
+  const missingCodex = staged(current, { label: "0.171.0", rc: 127 });
   if (missingCodex.status === 0 || !missingCodex.err.includes("codex --version failed")) {
     fail(`STAGED_ACTIVATION_ACCEPTED_MISSING_CODEX_${missingCodex.status}: ${missingCodex.err.slice(-300)}`);
   }
   const ok = staged(current);
-  if (!ok.out.includes(`✓ runtime image source=${box.commit},codex=codex-cli 0.170.0,grok=${current}`)) {
+  if (!ok.out.includes(`✓ runtime image source=${box.commit},codex=codex-cli 0.171.0,grok=${current}`)) {
     fail(`STAGED_ACTIVATION_REFUSED_${ok.status}: ${ok.err.slice(-400)}`);
   }
   // the manifest's image was installed into the env file before the check, by the product's own step

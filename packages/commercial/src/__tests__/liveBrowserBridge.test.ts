@@ -72,7 +72,7 @@ function makeFakeRes() {
 }
 
 describe('LiveBrowserTicketStore & tunnel headers', () => {
-  it('issues, atomically consumes once, expires, and replaces per-(uid, agentId) slot', () => {
+  it('issues, atomically consumes once, expires, and enforces a single pending slot per uid across agentIds', () => {
     let now = 1_700_000_000_000
     const store = new LiveBrowserTicketStore(() => now)
 
@@ -81,14 +81,23 @@ describe('LiveBrowserTicketStore & tunnel headers', () => {
     assert.equal(t1.agentId, 'main')
     assert.equal(t1.expiresAt, now + LIVE_BROWSER_TICKET_TTL_MS)
 
-    // Re-issuing for same (uid, agentId) invalidates prior pending ticket
-    const t2 = store.issue(42n, 'main')
+    // Re-issuing for same uid invalidates prior pending ticket even for a different agentId
+    const t2 = store.issue(42n, 'coder')
     assert.equal(store.consume(t1.ticket), null)
 
     // Atomic one-time consume
     const rec = store.consume(t2.ticket)
-    assert.deepEqual(rec, { uid: 42n, agentId: 'main', expiresAt: now + LIVE_BROWSER_TICKET_TTL_MS })
+    assert.deepEqual(rec, { uid: 42n, agentId: 'coder', expiresAt: now + LIVE_BROWSER_TICKET_TTL_MS })
     assert.equal(store.consume(t2.ticket), null)
+
+    // One abusive tenant spamming distinct agentIds cannot evict another tenant's pending ticket
+    const victim = store.issue(7n, 'main')
+    for (let i = 0; i < 600; i++) {
+      now += 1
+      store.issue(99n, `fake-agent-${i}`)
+    }
+    assert.equal(store.size, 2)
+    assert.equal(store.consume(victim.ticket)?.uid, 7n)
 
     // Expired ticket rejected
     const t3 = store.issue(42n, 'coder')

@@ -347,6 +347,18 @@ describe("researchProxy: external PDF extraction via real local HTTP server (OCV
     mode = "mineru-ok";
     const cases: Array<{ filename: string; mime: string; content: string; engine: "auto" | "mineru" | "mistral" }> = [
       { filename: "notes.md", mime: "text/markdown", content: "# Local Markdown\n\nClean local text.", engine: "mineru" },
+      {
+        filename: "pdf-header-guide.md",
+        mime: "text/markdown",
+        content: "# PDF Format Notes\n\nEvery valid PDF file begins with the magic header `%PDF-1.7` at byte 0.\n",
+        engine: "mineru",
+      },
+      {
+        filename: "pdf-header-line0.md",
+        mime: "text/markdown",
+        content: "%PDF-1.7 is the magic header of a PDF document.\n\nThis is still Markdown documentation.",
+        engine: "mistral",
+      },
       { filename: "paper.txt", mime: "text/plain", content: "Plain local research notes without external OCR.", engine: "mistral" },
       { filename: "page.html", mime: "text/html", content: "<html><title>Local HTML</title><body><p>Body text</p></body></html>", engine: "auto" },
     ];
@@ -368,8 +380,34 @@ describe("researchProxy: external PDF extraction via real local HTTP server (OCV
       assert.equal(captured.statusCode, 200);
       assert.equal(requestCount, 0, `${c.filename} under ${c.engine} must make 0 external OCR requests`);
       const doc = savedDocs.get(captured.body.docId);
-      assert.ok(doc, "local doc must be minted");
+      assert.ok(doc, `local doc must be minted for ${c.filename}`);
       assert.ok(!doc.spans.some((s: any) => s.text.includes("MinerU Extracted Paper")));
+    }
+
+    // Generic/extensionless binary mentioning %PDF- in body, starting with "%PDF-1.7 is...",
+    // or having "%PDF-1.7\n" without PDF structure must ALSO make 0 external OCR requests.
+    for (const [name, body] of [
+      ["unknown-notes", "# Spec excerpt\nThe parser checks for %PDF-1.4 before dispatching.\n"],
+      ["README", "%PDF-1.7 is the magic header of a PDF document.\n\nThis is still plain documentation.\n"],
+      ["README-multiline", "%PDF-1.7\nPlain text note explaining PDF headers without PDF structure.\n"],
+    ] as const) {
+      requestCount = 0;
+      const { store: binStore } = makeMemoryStore(
+        Buffer.from(body, "utf8"),
+        "application/octet-stream",
+        `blob-${name}`,
+      );
+      const binHandler = makeResearchProxyHandler({
+        identityRepo: passingRepo(),
+        readConfig: cfgFor({ engine: "auto", mineruEndpoint: `${baseUrl}/parse`, mistralEndpoint: `${baseUrl}/ocr` }),
+        readSecrets: async () => ({}),
+        store: binStore,
+      });
+      const binRes = makeRes();
+      await binHandler(makeReq("/v3/research/ingest/parse", { blobId: `blob-${name}`, filename: name }), binRes.res, CTX);
+      assert.equal(binRes.captured.statusCode, 200);
+      assert.equal(requestCount, 0, `${name} must make 0 external OCR requests`);
+      assert.equal(binRes.captured.body.needsOcr, true);
     }
   });
 

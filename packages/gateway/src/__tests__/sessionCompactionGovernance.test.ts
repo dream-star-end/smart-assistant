@@ -1134,8 +1134,9 @@ describe('OCV5-840 T2 Blocker Counter-Examples (B1/B2 API, B3, B4, B5, B6, B7, B
     // Retry on ANOTHER rebuilt AgentSession -> succeeds -> checkpoint is delivered AND acked/deleted
     const rebuiltOkSession = makeFakeSession({ sessionKey: key, providerTag: 'antigravity', ccbSessionId: null })
     let okAttemptPayload = ''
-    const okSubmitHost = makeRealSubmitHost(rebuiltOkSession, async (_s, payload) => {
+    const okSubmitHost = makeRealSubmitHost(rebuiltOkSession, async (s, payload) => {
       okAttemptPayload = String(payload)
+      markCheckpointTurnOutcome(s, 'completed')
     })
     await submit.call(okSubmitHost, rebuiltOkSession, 'Next turn attempt 2', () => {})
     assert.match(okAttemptPayload, /<openclaude_rolling_checkpoint>/)

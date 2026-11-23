@@ -653,6 +653,20 @@ describe("grok vision handler", () => {
     assert.equal(emptyPoolH.calls.upstream.length, 1);
   });
 
+  it("does not query resolveStaticApiKey when an active Grok account is available (OCV5-876)", async () => {
+    let staticKeyLookups = 0;
+    const h = harness({
+      resolveStaticApiKey: async () => {
+        staticKeyLookups++;
+        return "should-not-be-used";
+      },
+    });
+    const out = await h.run();
+    assert.equal(out.status, 200);
+    assert.equal(out.json.model, "grok-build");
+    assert.equal(staticKeyLookups, 0);
+  });
+
   it("rate limits per container", async () => {
     const h = harness();
     for (let i = 0; i < 30; i++) assert.equal((await h.run()).status, 200);
