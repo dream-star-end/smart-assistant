@@ -247,9 +247,13 @@ export async function handleInternalSessionBackgroundState(
     if (surface) {
       if (jobs) {
         try {
-          surface.rebuildFromJobs(jobs.listNonTerminal(), {
-            resolveJob: (id) => jobs.snapshotOf(id),
-          })
+          const nonTerminal = jobs.listNonTerminal()
+          const rebuildOpts = { resolveJob: (id: string) => jobs.snapshotOf(id) }
+          if (typeof surface.syncFromJobsIfNeeded === 'function') {
+            surface.syncFromJobsIfNeeded(nonTerminal, rebuildOpts)
+          } else {
+            surface.rebuildFromJobs(nonTerminal, rebuildOpts)
+          }
         } catch {
           /* fail-open overlay */
         }
@@ -259,7 +263,8 @@ export async function handleInternalSessionBackgroundState(
       const cursor = url.searchParams.get('cursor') || undefined
       // Single-tenant container: master already verified PG ownership of `sessionId`.
       // Omit userId filter so container-local 'default' vs 'master:<uid>' rows both match.
-      const page = surface.listForSessionId(sessionId, { limit, cursor })
+      // Read-only poll path: zero SQLite writes to prevent SQLITE_BUSY contention & card flicker.
+      const page = surface.listForSessionId(sessionId, { limit, cursor, readOnly: true })
       delegates = page.items
       nextCursor = page.nextCursor
       truncated = page.truncated

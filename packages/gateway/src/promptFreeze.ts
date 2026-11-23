@@ -40,18 +40,42 @@ export const PROMPT_FREEZE_TOUCH_MS = 60_000
 
 const FLAG_FILE = ['runtime-flags', 'prompt-freeze'] as const
 const DIR = 'prompt-freeze'
+/** In-memory TTL for runtime flag file reads so hot spawns avoid repeated sync disk I/O. */
+export const PROMPT_FREEZE_FLAG_CACHE_TTL_MS = 5_000
+const PROMPT_FREEZE_FLAG_CACHE_MAX_ENTRIES = 128
+const promptFreezeFlagCache = new Map<string, { raw: string | undefined; expiresAt: number }>()
 
-/** `OC_PROMPT_FREEZE` wins; else `<home>/runtime-flags/prompt-freeze`; default enforce (OCV5-840). */
+/** Test helper: clears the in-memory runtime-flag TTL cache. */
+export function resetPromptFreezeFlagCache(): void {
+  promptFreezeFlagCache.clear()
+}
+
+/** `OC_PROMPT_FREEZE` wins; else `<home>/runtime-flags/prompt-freeze` (5s TTL cache); default enforce (OCV5-840). */
 export function resolvePromptFreezeMode(
   home: string,
   env: NodeJS.ProcessEnv = process.env,
+  nowMs: number = Date.now(),
 ): PromptFreezeMode {
   let raw = env.OC_PROMPT_FREEZE
   if (raw === undefined || raw.trim() === '') {
-    try {
-      raw = readFileSync(join(home, ...FLAG_FILE), 'utf8')
-    } catch {
-      raw = undefined
+    const flagPath = join(home, ...FLAG_FILE)
+    const cached = promptFreezeFlagCache.get(flagPath)
+    if (cached && nowMs < cached.expiresAt) {
+      raw = cached.raw
+    } else {
+      try {
+        raw = readFileSync(flagPath, 'utf8')
+      } catch {
+        raw = undefined
+      }
+      if (promptFreezeFlagCache.size >= PROMPT_FREEZE_FLAG_CACHE_MAX_ENTRIES) {
+        const oldestKey = promptFreezeFlagCache.keys().next().value
+        if (oldestKey !== undefined) promptFreezeFlagCache.delete(oldestKey)
+      }
+      promptFreezeFlagCache.set(flagPath, {
+        raw,
+        expiresAt: nowMs + PROMPT_FREEZE_FLAG_CACHE_TTL_MS,
+      })
     }
   }
   const value = raw?.trim().toLowerCase()

@@ -41,6 +41,8 @@ export interface AutoDreamFeature {
   min_new_sessions: number
 }
 
+export type AutoDreamMode = 'legacy_memory_v1' | 'optimizer_v2'
+
 async function resolveConfiguredAutoDreamModel() {
   const setting = await getSystemSetting('auto_dream_model')
   let model: Awaited<ReturnType<typeof resolveAutoDreamModel>> = null
@@ -52,10 +54,26 @@ async function resolveConfiguredAutoDreamModel() {
   return { modelId: setting.value, model }
 }
 
-async function resolveAutoDreamEntitlement(userId: bigint | number | string) {
+export async function resolveAutoDreamModelForMode(mode: AutoDreamMode) {
+  if (mode === 'legacy_memory_v1') {
+    let model: Awaited<ReturnType<typeof resolveLegacyAutoDreamModel>> = null
+    try {
+      model = await resolveLegacyAutoDreamModel()
+    } catch {
+      model = null
+    }
+    return { modelId: LEGACY_AUTO_DREAM_MODEL, model }
+  }
+  return resolveConfiguredAutoDreamModel()
+}
+
+async function resolveAutoDreamEntitlement(
+  userId: bigint | number | string,
+  mode: AutoDreamMode,
+) {
   const [eligible, resolved] = await Promise.all([
     isAutoDreamEligible(userId),
-    resolveConfiguredAutoDreamModel(),
+    resolveAutoDreamModelForMode(mode),
   ])
   return { eligible, modelId: resolved.modelId, model: resolved.model }
 }
@@ -86,7 +104,13 @@ export async function getAutoDreamFeature(
   enabled: boolean,
   optimizerEnabled = false,
 ): Promise<AutoDreamFeature> {
-  const { eligible, model } = await resolveAutoDreamEntitlement(userId)
+  // The UI switch driven by `features.auto_dream.available` (MemoryContextHealthCard)
+  // exclusively toggles `auto_dream_enabled` (`legacy_memory_v1`), while optimizer V2
+  // uses its own endpoint and `auto_optimizer_enabled` flag. Thus `available` checks
+  // `optimizer_v2` ONLY when optimizer is active/requested, and `legacy_memory_v1`
+  // otherwise — keeping display and PATCH validation 100% symmetric in both directions.
+  const mode: AutoDreamMode = optimizerEnabled ? 'optimizer_v2' : 'legacy_memory_v1'
+  const { eligible, model } = await resolveAutoDreamEntitlement(userId, mode)
   const available = model !== null
   const readiness = optimizerEnabled
     ? await import('../analytics/telemetryReadiness.js')
@@ -117,7 +141,7 @@ export type AutoDreamPolicy =
   | { enabled: false }
   | {
       enabled: true
-      mode: 'legacy_memory_v1' | 'optimizer_v2'
+      mode: AutoDreamMode
       modelId: string
       modelName: string
       minIntervalHours: number
@@ -142,12 +166,8 @@ export async function getAutoDreamPolicy(userId: bigint | number | string): Prom
   }
   const eligible = await isAutoDreamEligible(userId)
   if (!eligible) return { enabled: false }
-  const entitlement = optimizerEnabled
-    ? await resolveConfiguredAutoDreamModel()
-    : {
-        modelId: LEGACY_AUTO_DREAM_MODEL,
-        model: await resolveLegacyAutoDreamModel(),
-      }
+  const mode: AutoDreamMode = optimizerEnabled ? 'optimizer_v2' : 'legacy_memory_v1'
+  const entitlement = await resolveAutoDreamModelForMode(mode)
   if (entitlement.model === null) return { enabled: false }
   let auditContext:
     | {

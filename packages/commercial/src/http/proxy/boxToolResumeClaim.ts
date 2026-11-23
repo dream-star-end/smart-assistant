@@ -14,6 +14,8 @@ import { matchPreparedToolResults, type BoxMatchedToolResult } from "./boxToolRe
 import { normalizeBoxResultImagesForCli } from "./boxToolResultImages.js";
 import { parseBoxBillingContext } from "./boxBillingContext.js";
 import { parseBillingPricing } from "../../billing/persistedBillingPricing.js";
+import { updateClaimResumeOwner, updateLinkResumeChild, updateReclaimResumeOwner,
+  updateRetireUnsentResumeChild } from "../../billing/boxBillingStore.js";
 import type { ProxyBody } from "./shared.js";
 import { claimToolRollover, BoxToolRolloverRequired } from "./boxToolRollover.js";
 import { resumingParentWithUnsentChildSql, unsentResumeChildClaimSql } from "./boxOrphanRecovery.js";
@@ -231,43 +233,17 @@ export async function claimBoundBoxToolResume(pool: Pick<Pool,"connect"|"query">
           || typeof unsentRevision !== "string" || !UUID_V4.test(unsentRevision)) {
           throw new BoxDurableJournalError("BOX_TOOL_OWNER_INVALID");
         }
-        const retiredChild = await client.query(
-          `UPDATE request_finalize_journal resume_child
-              SET state='aborted',
-                  failure_code=COALESCE(failure_code,'UPSTREAM_UNAVAILABLE'),
-                  final_credits=0,
-                  error_msg=COALESCE(NULLIF(error_msg,''),'box_resume_unsent_superseded'),
-                  ctx=(resume_child.ctx
-                    - ARRAY['boxOwnerRequestId','boxInvocationMode','boxAccountId','boxRunNonce',
-                      'boxLeaseEpoch','boxResumeSpoolOffset','boxRoundNo','boxPriorMessageIds',
-                      'boxDetachedRunnerHash','boxCatalogHash','boxReplayFingerprint',
-                      'boxFallbackAlias','boxReplayRequired','boxRequestHash','boxContextHash',
-                      'boxImageIdentity','boxParentResumeRevision','boxUnknownPhase',
-                      'boxNativeSessionId','boxNativeCliCwd','boxNativeCliVersion',
-                      'boxNativePromptLayout']::text[])
-                    || jsonb_build_object('boxState','prestart_stopped','boxUnsentSupersededBy',$5::text),
-                  updated_at=NOW()
-            WHERE resume_child.request_id=$1 AND resume_child.user_id=$2
-              AND resume_child.ctx->>'boxOwnerRequestId'=$3
-              AND resume_child.ctx->>'boxParentResumeRevision'=$4
-              AND ${unsentResumeChildClaimSql("resume_child")}`,
-          [unsentChildId, input.uid.toString(), owner.request_id, unsentRevision, input.requestId]);
-        if (retiredChild.rowCount !== 1) throw new BoxDurableJournalError("BOX_RESUME_IN_PROGRESS");
-        const reclaimedOwner = await client.query(
-          `UPDATE request_finalize_journal
-              SET ctx=(ctx - ARRAY['boxResumeRequestId','boxResumeRevision','boxResumeResultHashes']::text[])
-                || '{"boxState":"handoff"}'::jsonb,
-                  updated_at=NOW()
-            WHERE request_id=$1 AND user_id=$2
-              AND ctx->>'boxState'='resuming' AND NOT (ctx ? 'boxCancelIntent')
-              AND NOT (ctx ? 'boxRecoveredBy')
-              AND state IN ('inflight','finalizing','committed')
-              AND ctx->>'boxHandoffRevision'=$3
-              AND ctx->>'boxResumeRequestId'=$4
-              AND ctx->>'boxResumeRevision'=$5`,
-          [owner.request_id, input.uid.toString(), ctx.boxHandoffRevision,
-            unsentChildId, unsentRevision]);
-        if (reclaimedOwner.rowCount !== 1) throw new BoxDurableJournalError("BOX_TOOL_RESUME_FENCE_LOST");
+        const retiredChild = await updateRetireUnsentResumeChild(client, {
+          unsentChildId, uid: input.uid, ownerRequestId: owner.request_id,
+          unsentRevision, supersededByRequestId: input.requestId,
+          unsentChildClaimSql: unsentResumeChildClaimSql("resume_child"),
+        });
+        if (!retiredChild) throw new BoxDurableJournalError("BOX_RESUME_IN_PROGRESS");
+        const reclaimedOwner = await updateReclaimResumeOwner(client, {
+          ownerRequestId: owner.request_id, uid: input.uid,
+          handoffRevision: ctx.boxHandoffRevision, unsentChildId, unsentRevision,
+        });
+        if (!reclaimedOwner) throw new BoxDurableJournalError("BOX_TOOL_RESUME_FENCE_LOST");
       }
       const resultHashes = results.map((result) => ({
         modelToolUseId: result.modelToolUseId, contentHash: result.contentHash,
@@ -280,48 +256,39 @@ export async function claimBoundBoxToolResume(pool: Pick<Pool,"connect"|"query">
         throw new BoxToolRolloverRequired(rollover);
       }
       const durableRevision = randomUUID();
-      const claimedOwner = await client.query(
-        `UPDATE request_finalize_journal
-            SET ctx=ctx || $4::jsonb, updated_at=NOW()
-          WHERE request_id=$1 AND user_id=$2
-            AND ctx->>'boxState'='handoff' AND NOT (ctx ? 'boxCancelIntent')
-            AND state IN ('inflight','finalizing','committed')
-            AND ctx->>'boxHandoffRevision'=$3`,
-        [owner.request_id, input.uid.toString(), ctx.boxHandoffRevision,
-          JSON.stringify({ boxState: "resuming", boxResumeRequestId: input.requestId,
-            boxResumeRevision: durableRevision, boxResumeResultHashes: resultHashes })]);
-      if (claimedOwner.rowCount !== 1) throw new BoxDurableJournalError("BOX_TOOL_RESUME_FENCE_LOST");
-      const linked = await client.query<{ ctx: Record<string, unknown> }>(
-        `UPDATE request_finalize_journal
-            SET ctx=ctx || $4::jsonb, updated_at=NOW()
-          WHERE request_id=$1 AND user_id=$2 AND state='inflight'
-            AND ctx->>'model'=$3 AND ctx->>'boxInvocationRecovery'='v1'
-            AND ctx ? 'billingPricing' AND ctx ? 'boxBillingContext'
-            AND NOT (ctx ? 'boxState') RETURNING ctx`,
-        [input.requestId, input.uid.toString(), input.canonicalModel,
-          JSON.stringify({ boxState: "linked", boxOwnerRequestId: owner.request_id,
-            boxInvocationMode: "detached_tool",
-            boxAccountId: ctx.boxAccountId, boxRunNonce: ctx.boxRunNonce,
-            boxLeaseEpoch: ctx.boxLeaseEpoch, boxTurnKey: fingerprint.turnKey,
-            boxResumeSpoolOffset: handoff.spoolOffset,
-            boxRoundNo: handoff.roundNo + 1,
-            boxPriorMessageIds: [...priorIds, handoff.messageId],
-            boxDetachedRunnerHash: handoff.detachedRunnerHash,
-            boxCatalogHash: handoff.catalogHash,
-            boxSessionId: fingerprint.sessionId,
-             boxReplayFingerprint: fingerprint.replayFingerprint,
-             boxFallbackAlias: fallbackAlias,
-             ...(ctx.boxReplayRequired === true ? { boxReplayRequired: true } : {}),
-             boxRequestHash: fingerprint.requestHash,
-             boxContextHash: nextContextHash,
-             boxImageIdentity: imageIdentity,
-             boxParentResumeRevision: durableRevision,
-             ...(nativeSessionId === undefined ? {} : {
-               boxNativeSessionId: nativeSessionId,
-               boxNativeCliCwd: nativeCliCwd,
-               ...(nativeCliVersion ? { boxNativeCliVersion: nativeCliVersion } : {}),
-               ...(nativePromptLayout ? { boxNativePromptLayout: nativePromptLayout } : {}) }) })]);
-      const linkedCtx = linked.rows[0]?.ctx;
+      const claimedOwner = await updateClaimResumeOwner(client, {
+        ownerRequestId: owner.request_id, uid: input.uid,
+        handoffRevision: ctx.boxHandoffRevision,
+        patchJson: JSON.stringify({ boxState: "resuming", boxResumeRequestId: input.requestId,
+          boxResumeRevision: durableRevision, boxResumeResultHashes: resultHashes }),
+      });
+      if (!claimedOwner) throw new BoxDurableJournalError("BOX_TOOL_RESUME_FENCE_LOST");
+      const linked = await updateLinkResumeChild(client, {
+        requestId: input.requestId, uid: input.uid, canonicalModel: input.canonicalModel,
+        patchJson: JSON.stringify({ boxState: "linked", boxOwnerRequestId: owner.request_id,
+          boxInvocationMode: "detached_tool",
+          boxAccountId: ctx.boxAccountId, boxRunNonce: ctx.boxRunNonce,
+          boxLeaseEpoch: ctx.boxLeaseEpoch, boxTurnKey: fingerprint.turnKey,
+          boxResumeSpoolOffset: handoff.spoolOffset,
+          boxRoundNo: handoff.roundNo + 1,
+          boxPriorMessageIds: [...priorIds, handoff.messageId],
+          boxDetachedRunnerHash: handoff.detachedRunnerHash,
+          boxCatalogHash: handoff.catalogHash,
+          boxSessionId: fingerprint.sessionId,
+           boxReplayFingerprint: fingerprint.replayFingerprint,
+           boxFallbackAlias: fallbackAlias,
+           ...(ctx.boxReplayRequired === true ? { boxReplayRequired: true } : {}),
+           boxRequestHash: fingerprint.requestHash,
+           boxContextHash: nextContextHash,
+           boxImageIdentity: imageIdentity,
+           boxParentResumeRevision: durableRevision,
+           ...(nativeSessionId === undefined ? {} : {
+             boxNativeSessionId: nativeSessionId,
+             boxNativeCliCwd: nativeCliCwd,
+             ...(nativeCliVersion ? { boxNativeCliVersion: nativeCliVersion } : {}),
+             ...(nativePromptLayout ? { boxNativePromptLayout: nativePromptLayout } : {}) }) }),
+      });
+      const linkedCtx = linked.ctx;
       const basis = parseBoxBillingContext(linkedCtx?.boxBillingContext);
       if (linked.rowCount !== 1 || !basis || basis.turnKey !== fingerprint.turnKey
         || !parseBillingPricing(linkedCtx?.billingPricing, input.canonicalModel)) {

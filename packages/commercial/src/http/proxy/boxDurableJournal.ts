@@ -2,11 +2,13 @@ import { BoxToolRolloverRequired, finishToolRollover, cancelToolRollovers,
   assertToolRolloverLaunch, withToolRolloverLaunchFence, retiredToolRolloverSql,
   type BoxToolRolloverClaim } from "./boxToolRollover.js";
 import { claimBoundBoxToolResume, type BoxToolResumeInput } from "./boxToolResumeClaim.js";
+import { completeBoxToolChain, markBoxRunExpiredUnproven,
+  markBoxToolChainStoppedFailure } from "./boxToolChainClose.js";
 import { deriveBoxImageIdentity } from './boxImageIdentity.js';
 /** Box invocation fence on the existing request_finalize_journal.ctx JSONB.
  * No schema change. This is deliberately stricter than HTTP idempotency: an
  * identical body in one signed turn remains ambiguous and is never re-run. */
-import { BOX_API_MODELS, boxApiUpstreamModelFor, isBoxApiModel, isBoxApiModelPair,
+import { boxApiUpstreamModelFor, isBoxApiModel, isBoxApiModelPair,
   isBoxApiUpstreamModel, type BoxApiModelId, type BoxApiUpstreamModelId } from "@openclaude/protocol";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
@@ -48,18 +50,71 @@ import { recordBoxFirstFailure, readBoxFallbackOutcome, selectBoxReadOnlyCandida
   requireBoxFirstFailure, assertBoxFailureTerminal, type BoxFirstFailureRecordInput,
   type BoxFailureLookupInput, type BoxReadOnlyFallbackOutcome } from "./boxJournalFailure.js";
 export type { BoxReadOnlyFallbackOutcome } from "./boxJournalFailure.js";
-import { BOX_EXPIRED_UNPROVEN_STATE, BOX_OPERATOR_UNREACHABLE_CLOSED_STATE,
-  isBoxExpiredCloseCause, isBoxUnknownPhase, parseBoxExpiredClose,
-  parseBoxOperatorUnreachableClose, BOX_ABSENCE_CONFIRM_MS, BOX_PROCESS_ABSENT_CAUSE,
-  isBoxBootId, parseBoxRunAbsent } from "./boxExpiredClose.js";
+import { BOX_EXPIRED_UNPROVEN_STATE, isBoxUnknownPhase } from "./boxExpiredClose.js";
+import {
+  clearOrphanRecoveryClaim,
+  selectAdmitCapacityUsage,
+  selectAdmitDuplicateExists,
+  selectCancelableRunRow,
+  selectCancelLeafRow,
+  selectIdleProofExpiredRows,
+  selectIdleProofOpenRows,
+  selectIdleProofTurnRows,
+  selectLatestNativeOwnerForAdmit,
+  selectNativeCandidateRow,
+  selectNativeGcCandidateRows,
+  selectNativeTranscriptSourceRows,
+  selectOrphanToolHandoffRows,
+  selectPrelaunchCleanupDoneRow,
+  selectPrelaunchRecoveryCandidateRows,
+  selectRemoteCleanupCandidateRows,
+  selectRemoteCleanupDoneRow,
+  selectRemoteCleanupStatusRow,
+  selectRemoteCleanedAlreadyExists,
+  selectStoppedFailureProbeCandidateRows,
+  selectTextUnknownCandidateRows,
+  selectUsageRecordExists,
+  selectWaitingToolHandoffRows,
+  updateAdmitJournalRow,
+  updateAttachNativePointer,
+  updateClaimNativeGc,
+  updateClaimNativeOwnerForAdmit,
+  updateClaimOrphanRecovery,
+  updateClaimPrelaunchRecovery,
+  updateClaimRemoteCleanup,
+  updateClaimStoppedFailureProbe,
+  updateClaimTextUnknownCandidate,
+  updateFinishNativeGc,
+  updateFirstRoundHandoffStoppedFailure,
+  updateFirstRoundRejectedStream,
+  updateFirstRoundUnbilledStoppedFailure,
+  updateJournalArmGuardedLaunch,
+  updateJournalArmTextLaunch,
+  updateJournalCancelIntent,
+  updateJournalComplete,
+  updateJournalGuardedPrestartStopped,
+  updateJournalMarkPrestartStopped,
+  updateJournalMarkRunning,
+  updateJournalMarkUnknown,
+  updateJournalPrelaunchControl,
+  updateJournalRecordToolHandoff,
+  updateMarkRemoteCleaned,
+  updateQuarantinePrelaunchRecovery,
+  updateQuarantineRemoteCleanup,
+  updateRecordStaleResumeStop,
+  type BoxIdleQueryRow,
+} from "../../billing/boxBillingStore.js";
+export {
+  BOX_MODEL_IDS_SQL,
+  OWNER_CONTAINER_GONE,
+  STOP_MODE_FENCE,
+  STOP_PROBE_STATE_FENCE,
+} from "../../billing/boxBillingStore.js";
 
 const journalLog = rootLogger.child({ subsys: "box-journal" });
 const ACTIVE = ["reserved", "starting", "running", "unknown", "handoff", "resuming", "linked"];
 /** OCV5-322: past this age (from its first active row) a run cannot be alive. */
 export const BOX_RUN_EXPIRED_AFTER_MS = BOX_TOOL_MAX_WALL_MS + 15 * 60 * 1000;
-/** OCV5-488: a run younger than this may not have started its keeper yet;
- * finding nothing of it on the Box is no evidence. */
-const BOX_ABSENCE_LAUNCH_GRACE_SEC = 180;
 
 export class BoxDurableJournalError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxDurableJournalError"; }
@@ -71,7 +126,7 @@ export interface BoxUsageEvidence {
   cacheReadTokens: number;
   cacheWriteTokens: number;
 }
-function validUsageEvidence(value: unknown): value is BoxUsageEvidence {
+export function validUsageEvidence(value: unknown): value is BoxUsageEvidence {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const usage = value as Record<string, unknown>;
   const keys = ["cacheReadTokens", "cacheWriteTokens", "inputTokens", "outputTokens"];
@@ -297,50 +352,6 @@ function cleanupProofMatchesState(state: unknown, proof: BoxTerminalProof): bool
     : state === "failed_stopped" && proof.reason !== "worker_complete";
 }
 
-// The listed Box models as SQL. The ids are fixed strings from the protocol
-// table (charset checked there), never request data.
-export const BOX_MODEL_IDS_SQL = BOX_API_MODELS.map((m) => `'${m.id}'`).join(",");
-/** The row's upstream id is the one its own canonical model maps to. */
-const BOX_MODEL_PAIR_SQL = `(${BOX_API_MODELS.map((m) =>
-  `(ctx->>'model'='${m.id}' AND ctx->>'boxUpstreamModel'='${m.upstreamModel}')`).join(" OR ")})`;
-
-// A rejected_stream settlement (OCV5-300) carries the keeper's real proof,
-// possibly worker_complete; it is never a cleanup candidate here.
-const CLEANUP_STATE_FENCE = `((ctx->>'boxState'='terminal'
-  AND state IN ('inflight','finalizing','committed'))
-  OR (ctx->>'boxState'='failed_stopped'
-    AND ctx->>'boxStopOutcome' IS DISTINCT FROM 'rejected_stream'
-    AND (state='aborted' OR (state IN ('inflight','finalizing','committed')
-      AND ctx ? 'boxToolHandoff'))))`;
-
-const CLEANUP_PROOF_FENCE = `((ctx->>'boxState'='terminal'
-  AND ctx->'boxTerminalProof'->>'reason'='worker_complete'
-  AND state IN ('inflight','finalizing','committed'))
-  OR (ctx->>'boxState'='failed_stopped'
-    AND ctx->'boxTerminalProof'->>'reason' IN ('keeper_stopped','worker_failed')
-      AND (state='aborted' OR (state IN ('inflight','finalizing','committed')
-        AND ctx ? 'boxToolHandoff'))))`;
-// New successful Box rounds retain the completed Message before stdout is
-// truncated. Old rows and proven stopped failures keep their cleanup route.
-/** OCV5-384: a finished run that recorded a native start attaches its native pointer right
- * after the terminal proof lands (after a remote transcript inspection). Cleanup claimed in
- * between made attachNativePointer refuse, so the next turn found no candidate and re-staged the
- * whole conversation at cache-write price. Such a run waits for its pointer, or for this grace. */
-const CLEANUP_NATIVE_POINTER_GRACE = `(ctx->>'boxState'<>'terminal'
-  OR NOT (ctx ? 'boxNativeSessionId')
-  OR ctx ? 'boxNativePointer'
-  OR updated_at <= NOW() - INTERVAL '20 seconds')`;
-const CLEANUP_REPLAY_FENCE = `(ctx->>'boxState'<>'terminal'
-  OR ctx->>'boxReplayRequired' IS DISTINCT FROM 'true'
-  OR ctx ? 'boxReplayMessage')`;
-// Legacy connected text has no detached spool and must never enter the
-// runner cleanup queue. Only the new, durably armed text lane shares it.
-const CLEANUP_MODE_FENCE = `(ctx->>'boxInvocationMode'='detached_tool'
-  OR (ctx->>'boxInvocationMode'='text'
-    AND ctx->>'boxLaunchPermit'='true'
-    AND ${BOX_MODEL_PAIR_SQL}
-    AND (ctx->>'boxDetachedRunnerHash') ~ '^[a-f0-9]{64}$'))`;
-export const STOP_MODE_FENCE = CLEANUP_MODE_FENCE;
 function stoppedRunMode(ctx: Record<string, unknown>): boolean {
   return ctx.boxInvocationMode === "detached_tool"
     || (ctx.boxInvocationMode === "text" && ctx.boxLaunchPermit === true
@@ -349,26 +360,8 @@ function stoppedRunMode(ctx: Record<string, unknown>): boolean {
       && /^[a-f0-9]{64}$/.test(ctx.boxDetachedRunnerHash));
 }
 
-/* OCV5-488 (user-approved deviation from a gateway keepalive lease, 10-17):
- * whether the turn that handed a tool call to a Box run can still answer it
- * is decided server-side. A user has at most one active container; a run
- * whose turn ran in any other (rebuilt, swept, removed) can never be
- * answered, while one in the active container is left alone however long
- * its tools run. A keepalive would only cover containers already running a
- * new runtime. */
-// lint-agent-containers-kind: allow — 按本行自己的 container_id 查它是否仍 active;与容器种类无关
-export const OWNER_CONTAINER_GONE = `(container_id IS NULL OR NOT EXISTS (
-  SELECT 1 FROM agent_containers ac
-   WHERE ac.id = request_finalize_journal.container_id AND ac.state = 'active'))`;
 /** A handoff this recent may belong to a container being replaced right now. */
 const BOX_ABANDONED_HANDOFF_GRACE_MS = 2 * 60_000;
-
-export const STOP_PROBE_STATE_FENCE = `((state='inflight'
-  AND ctx->>'boxState' IN ('running','unknown','linked')
-  AND NOT (ctx ? 'boxToolHandoff'))
-  OR (state IN ('inflight','finalizing','committed')
-    AND ctx->>'boxState' IN ('handoff','unknown')
-    AND ctx ? 'boxToolHandoff'))`;
 
 export interface BoxJournalPort {
   admit(input: BoxJournalAdmission): Promise<void>;
@@ -453,7 +446,7 @@ export async function lock(client: PoolClient, keys: string[]): Promise<void> {
 
 /** Every multi-row transition and resume uses the session advisory lock
  * before taking any row lock. The later FOR UPDATE must revalidate this peek. */
-async function lockChainSession(client: PoolClient, uid: bigint,
+export async function lockChainSession(client: PoolClient, uid: bigint,
   requestId: string): Promise<string> {
   const found = await client.query<{ session_id: string }>(
     `SELECT ctx->>'boxSessionId' AS session_id FROM request_finalize_journal
@@ -531,18 +524,12 @@ export class BoxDurableJournal implements BoxJournalPort {
     | { kind: "waiting"; identity: { requestId: string; uid: bigint; accountId: bigint;
       runNonce: string; leaseEpoch: string } }> {
     const want = [...input.toolIds].sort().join(",");
-    const rows = await this.pool.query<{ request_id: string; ctx: Record<string, unknown>;
-      unsent_stop_inflight: boolean }>(
-      `SELECT handoff_row.request_id, handoff_row.ctx,
-          ${unsentChildStopInflightSql("handoff_row")} AS unsent_stop_inflight
-        FROM request_finalize_journal handoff_row
-        WHERE handoff_row.user_id=$1 AND handoff_row.ctx->>'boxSessionId'=$2
-          AND handoff_row.ctx->>'boxTurnKey'=$3
-          AND (handoff_row.ctx->>'boxState'='handoff'
-            OR ${resumingParentWithUnsentChildSql("handoff_row")})
-          AND handoff_row.state IN ('inflight','finalizing','committed')`,
-      [input.uid.toString(), input.sessionId, input.turnKey]);
-    const matches = rows.rows.filter((row) => {
+    const rows = await selectWaitingToolHandoffRows(this.pool, {
+      uid: input.uid, sessionId: input.sessionId, turnKey: input.turnKey,
+      unsentChildStopInflightSql: unsentChildStopInflightSql("handoff_row"),
+      resumingParentSql: resumingParentWithUnsentChildSql("handoff_row"),
+    });
+    const matches = rows.filter((row) => {
       const handoff = parseBoxStoredToolHandoff(row.ctx.boxToolHandoff);
       return handoff === null || handoff.toolUses.map((use) => use.id).sort().join(",") === want;
     });
@@ -578,20 +565,13 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (input.toolIds.length < 1 || input.toolIds.length > 32
       || input.toolIds.some((id) => !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(id))) return { kind: "none" };
     const want = [...input.toolIds].sort().join(",");
-    const rows = await this.pool.query<{ request_id: string; ctx: Record<string, unknown>;
-      unsent_stop_inflight: boolean; stopped_unsent_child_ctx: Record<string, unknown> | null }>(
-      `SELECT handoff_row.request_id, handoff_row.ctx,
-          ${unsentChildStopInflightSql("handoff_row")} AS unsent_stop_inflight,
-          ${stoppedUnsentChildCtxSql("handoff_row")} AS stopped_unsent_child_ctx
-        FROM request_finalize_journal handoff_row
-        WHERE handoff_row.user_id=$1 AND handoff_row.ctx->>'boxSessionId'=$2
-          AND (handoff_row.ctx->>'boxState' IN ('handoff','failed_stopped')
-            OR ${resumingParentWithUnsentChildSql("handoff_row")})
-          AND (handoff_row.ctx->>'boxTurnKey' IS DISTINCT FROM $3
-            OR handoff_row.ctx->>'boxState'='failed_stopped')
-          AND handoff_row.state IN ('inflight','finalizing','committed','aborted')`,
-      [input.uid.toString(), input.sessionId, input.turnKey]);
-    const matches = rows.rows.filter((row) => {
+    const rows = await selectOrphanToolHandoffRows(this.pool, {
+      uid: input.uid, sessionId: input.sessionId, turnKey: input.turnKey,
+      unsentChildStopInflightSql: unsentChildStopInflightSql("handoff_row"),
+      stoppedUnsentChildCtxSql: stoppedUnsentChildCtxSql("handoff_row"),
+      resumingParentSql: resumingParentWithUnsentChildSql("handoff_row"),
+    });
+    const matches = rows.filter((row) => {
       const handoff = parseBoxStoredToolHandoff(row.ctx.boxToolHandoff);
       return handoff !== null && handoff.toolUses.map((use) => use.id).sort().join(",") === want;
     });
@@ -678,20 +658,13 @@ export class BoxDurableJournal implements BoxJournalPort {
           await client.query("ROLLBACK"); committed = true; return false;
         }
       }
-      const changed = await client.query(
-        `UPDATE request_finalize_journal handoff_row
-            SET ctx = handoff_row.ctx || jsonb_build_object('boxRecoveredBy', $3::text),
-                updated_at=NOW()
-          WHERE handoff_row.request_id=$1 AND handoff_row.user_id=$2
-            AND handoff_row.ctx->>'boxSessionId'=$4
-            AND (NOT (handoff_row.ctx ? 'boxRecoveredBy') OR handoff_row.ctx->>'boxRecoveredBy' = $5)
-            AND (handoff_row.ctx->>'boxState'='failed_stopped'
-              OR ((handoff_row.ctx->>'boxState'='handoff'
-                OR ${resumingParentWithUnsentChildSql("handoff_row", unsentResumeChildClaimSql("resume_child"))})
-                AND NOT (handoff_row.ctx ? 'boxCancelIntent')))`,
-        [input.requestId, input.uid.toString(), input.by, sessionId, input.replacing ?? null]);
+      const changed = await updateClaimOrphanRecovery(client, {
+        requestId: input.requestId, uid: input.uid, by: input.by,
+        sessionId, replacing: input.replacing ?? null,
+        resumingParentSql: resumingParentWithUnsentChildSql("handoff_row", unsentResumeChildClaimSql("resume_child")),
+      });
       await client.query("COMMIT"); committed = true;
-      return changed.rowCount === 1;
+      return changed;
     } finally {
       if (!committed) await client.query("ROLLBACK").catch(() => {});
       client.release();
@@ -700,10 +673,7 @@ export class BoxDurableJournal implements BoxJournalPort {
 
   /** Give the exchange back when the claimed recovery could not stop it. */
   async releaseOrphanRecovery(input: { requestId: string; uid: bigint; by: string }): Promise<void> {
-    await this.pool.query(
-      `UPDATE request_finalize_journal SET ctx = ctx - 'boxRecoveredBy', updated_at=NOW()
-        WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxRecoveredBy'=$3`,
-      [input.requestId, input.uid.toString(), input.by]);
+    await clearOrphanRecoveryClaim(this.pool, input);
   }
 
   async findNativeCandidate(input: { uid: bigint; sessionId: string;
@@ -712,17 +682,8 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (input.uid <= 0n || !/^[A-Za-z0-9._:-]{1,256}$/.test(input.sessionId)
       || !/^[A-Za-z0-9_-]{1,64}$/.test(input.currentRequestId)
       || !/^(?:box-(?:api-)?)?claude-[a-z0-9-]{3,64}$/.test(input.canonicalModel)) return null;
-    const found = await this.pool.query<{ request_id: string;
-      ctx: Record<string, unknown> }>(
-      `SELECT request_id,ctx FROM request_finalize_journal
-        WHERE user_id=$1 AND ctx->>'boxSessionId'=$2
-          AND ctx->>'model'=$3 AND ctx->>'boxInvocationRecovery'='v1'
-          AND request_id<>$4
-        ORDER BY updated_at DESC, (ctx ? 'boxNativePointer') DESC,
-          request_id DESC LIMIT 1`,
-      [input.uid.toString(), input.sessionId, input.canonicalModel,
-        input.currentRequestId]);
-    const row = found.rows[0];
+    const found = await selectNativeCandidateRow(this.pool, input);
+    const row = found.row;
     if (found.rowCount !== 1 || !row || !row.ctx
       || row.ctx.boxState !== "terminal" || row.ctx.boxNativeClaimRequestId !== undefined
       || !/^[A-Za-z0-9_-]{1,64}$/.test(row.request_id)) return null;
@@ -747,25 +708,9 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (input.uid <= 0n || !/^[A-Za-z0-9._:-]{1,256}$/.test(input.sessionId)
       || !/^[A-Za-z0-9_-]{1,64}$/.test(input.currentRequestId)
       || !/^(?:box-api-|box-)?claude-[a-z0-9-]{3,64}$/.test(input.canonicalModel)) return [];
-    const found = await this.pool.query<{ cwd: unknown; sid: unknown; version: unknown }>(
-      `(SELECT ctx->>'boxNativeCliCwd' AS cwd, ctx->>'boxNativeSessionId' AS sid,
-               ctx->>'boxNativeCliVersion' AS version, 0 AS rank
-          FROM request_finalize_journal
-         WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'model'=$3
-           AND ctx->>'boxInvocationRecovery'='v1' AND request_id<>$4
-           AND ctx ? 'boxNativeCliCwd' AND ctx ? 'boxNativeSessionId' AND ctx ? 'boxNativeCliVersion'
-         ORDER BY created_at ASC, request_id ASC LIMIT 1)
-       UNION ALL
-       (SELECT ctx->>'boxNativeCliCwd', ctx->>'boxNativeSessionId', ctx->>'boxNativeCliVersion', 1
-          FROM request_finalize_journal
-         WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'model'=$3
-           AND ctx->>'boxInvocationRecovery'='v1' AND request_id<>$4
-           AND ctx ? 'boxNativeCliCwd' AND ctx ? 'boxNativeSessionId' AND ctx ? 'boxNativeCliVersion'
-         ORDER BY created_at DESC, request_id DESC LIMIT 1)
-       ORDER BY rank`,
-      [input.uid.toString(), input.sessionId, input.canonicalModel, input.currentRequestId]);
+    const found = await selectNativeTranscriptSourceRows(this.pool, input);
     const out: { cliCwd: string; nativeSessionId: string; cliVersion: string }[] = [];
-    for (const row of found.rows) {
+    for (const row of found) {
       if (typeof row.cwd !== "string" || !/^\/tmp\/ocv5-289-run-[a-f0-9]{24}$/.test(row.cwd)
         || typeof row.sid !== "string"
         || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(row.sid)
@@ -779,35 +724,10 @@ export class BoxDurableJournal implements BoxJournalPort {
   /** At most one latest expired pointer per native project. A successful
    * cleanup claim is still required before any remote file operation. */
   async listNativeGcCandidates(limit = 10): Promise<BoxNativeGcCandidate[]> {
-    const found = await this.pool.query<{ request_id: string; user_id: string;
-      ctx: Record<string, unknown> }>(
-      `WITH pointers AS (
-         SELECT request_id,user_id,ctx,
-           row_number() OVER (PARTITION BY user_id,ctx->>'boxAccountId',
-             ctx->'boxNativePointer'->>'cliCwd',
-             ctx->'boxNativePointer'->>'nativeSessionId'
-             ORDER BY (ctx->'boxNativePointer'->>'expiresAtMs')::bigint DESC,
-               request_id DESC) AS rn
-           FROM request_finalize_journal
-          WHERE ctx ? 'boxNativePointer'
-            AND jsonb_typeof(ctx->'boxNativePointer'->'expiresAtMs')='number'
-            AND (ctx->'boxNativePointer'->>'expiresAtMs') ~ '^[0-9]{13}$'
-       ) SELECT request_id,user_id::text,ctx FROM pointers
-         WHERE rn=1
-           AND (ctx->'boxNativePointer'->>'expiresAtMs')::bigint
-             <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint
-           AND NOT (ctx ? 'boxNativeGcQuarantine')
-           AND COALESCE(ctx->>'boxNativeGcStatus','pending')<>'done'
-           AND (ctx->>'boxNativeGcStatus' IS DISTINCT FROM 'claimed'
-             OR (jsonb_typeof(ctx->'boxNativeGcRetryAfterMs')='number'
-               AND (ctx->>'boxNativeGcRetryAfterMs') ~ '^[0-9]{13}$'
-               AND (ctx->>'boxNativeGcRetryAfterMs')::bigint
-                 <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint))
-         ORDER BY (ctx->'boxNativePointer'->>'expiresAtMs')::bigint ASC
-         LIMIT $1`,
-      [Math.max(1, Math.min(10, Number.isSafeInteger(limit) ? limit : 10))]);
+    const found = await selectNativeGcCandidateRows(
+      this.pool, Math.max(1, Math.min(10, Number.isSafeInteger(limit) ? limit : 10)));
     const out: BoxNativeGcCandidate[] = [];
-    for (const row of found.rows) {
+    for (const row of found) {
       const ctx = row.ctx;
       const pointer = parseBoxNativePointer(ctx?.boxNativePointer, Date.now(), true);
       if (!pointer || pointer.expiresAtMs > Date.now()
@@ -881,16 +801,13 @@ export class BoxDurableJournal implements BoxJournalPort {
         && (row.ctx.boxInvocationMode === "detached_tool"
           ? row.ctx.boxRemoteCleanup === "done" : row.ctx.boxInvocationMode === "text"));
       if (!proven) return false;
-      const changed = await client.query(
-        `UPDATE request_finalize_journal
-            SET ctx=ctx || $4::jsonb,updated_at=NOW()
-          WHERE request_id=$1 AND user_id=$2 AND ctx->'boxNativePointer'=$3::jsonb
-            AND COALESCE(ctx->>'boxNativeGcStatus','pending')<>'done'
-            AND NOT (ctx ? 'boxNativeGcQuarantine')`,
-        [input.requestId, input.uid.toString(), JSON.stringify(input.pointer),
-          JSON.stringify({ boxNativeGcStatus: "claimed",
-            boxNativeGcRetryAfterMs: Date.now() + 120_000 })]);
-      if (changed.rowCount !== 1) return false;
+      const changed = await updateClaimNativeGc(client, {
+        requestId: input.requestId, uid: input.uid,
+        pointerJson: JSON.stringify(input.pointer),
+        updateJson: JSON.stringify({ boxNativeGcStatus: "claimed",
+          boxNativeGcRetryAfterMs: Date.now() + 120_000 }),
+      });
+      if (!changed) return false;
       await client.query("COMMIT");
       committed = true;
       return true;
@@ -905,16 +822,11 @@ export class BoxDurableJournal implements BoxJournalPort {
     const update = outcome === "done"
       ? { boxNativeGcStatus: "done" }
       : { boxNativeGcQuarantine: "remote_project_not_exclusive" };
-    const changed = await this.pool.query(
-      `UPDATE request_finalize_journal
-          SET ctx=ctx || $4::jsonb,updated_at=NOW()
-        WHERE request_id=$1 AND user_id=$2
-          AND ctx->'boxNativePointer'=$3::jsonb
-          AND ctx->>'boxNativeGcStatus'='claimed'
-          AND NOT (ctx ? 'boxNativeGcQuarantine')`,
-      [input.requestId, input.uid.toString(), JSON.stringify(input.pointer),
-        JSON.stringify(update)]);
-    return changed.rowCount === 1;
+    return updateFinishNativeGc(this.pool, {
+      requestId: input.requestId, uid: input.uid,
+      pointerJson: JSON.stringify(input.pointer),
+      updateJson: JSON.stringify(update),
+    });
   }
 
   /** Failure observation never changes billing, launch or stop state. */
@@ -1241,29 +1153,8 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20) {
       throw new BoxDurableJournalError("BOX_TEXT_OBSERVER_LIMIT_INVALID");
     }
-    const found = await this.pool.query<{ request_id: string;
-      user_id: string; ctx: Record<string, unknown> }>(
-      `SELECT request_id,user_id::text,ctx FROM request_finalize_journal
-        WHERE state='inflight' AND ctx->>'boxInvocationRecovery'='v1'
-          AND ctx->>'boxInvocationMode'='text' AND ctx->>'boxState'='unknown'
-          AND ctx->>'boxLaunchPermit'='true'
-          AND ${BOX_MODEL_PAIR_SQL}
-          AND (ctx->>'boxDetachedRunnerHash') ~ '^[a-f0-9]{64}$'
-          AND (ctx->>'boxAccountId') ~ '^[1-9][0-9]{0,19}$'
-          AND (ctx->>'boxRunNonce') ~ '^[a-f0-9]{24}$'
-          AND (ctx->>'boxLeaseEpoch') ~ '^[a-f0-9]{32}$'
-          AND NOT (ctx ? 'boxOwnerRequestId')
-          AND NOT (ctx ? 'boxReplayMessage') AND NOT (ctx ? 'boxTerminalProof')
-          AND (NOT (ctx ? 'boxTextObserverRetryAfterMs')
-            OR (jsonb_typeof(ctx->'boxTextObserverRetryAfterMs')='number'
-              AND (ctx->>'boxTextObserverRetryAfterMs') ~ '^[0-9]{13}$'
-              AND (ctx->>'boxTextObserverRetryAfterMs')::bigint
-                <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint))
-        ORDER BY CASE WHEN jsonb_typeof(ctx->'boxTextObserverLastAttemptMs')='number'
-          AND (ctx->>'boxTextObserverLastAttemptMs') ~ '^[0-9]{13}$'
-          THEN (ctx->>'boxTextObserverLastAttemptMs')::bigint ELSE 0 END ASC,
-          updated_at ASC LIMIT $1`, [limit]);
-    return found.rows.flatMap((row): BoxReplayIdentity[] => {
+    const found = await selectTextUnknownCandidateRows(this.pool, limit);
+    return found.flatMap((row): BoxReplayIdentity[] => {
       const ctx = row.ctx;
       if (!/^[A-Za-z0-9_-]{1,64}$/.test(row.request_id)
         || !/^[1-9][0-9]{0,19}$/.test(row.user_id)
@@ -1294,31 +1185,11 @@ export class BoxDurableJournal implements BoxJournalPort {
       || !isBoxApiUpstreamModel(input.upstreamModel)) {
       throw new BoxDurableJournalError("BOX_TEXT_OBSERVER_IDENTITY_INVALID");
     }
-    const changed = await this.pool.query(
-      `UPDATE request_finalize_journal
-          SET ctx=ctx || jsonb_build_object(
-            'boxTextObserverLastAttemptMs',(EXTRACT(EPOCH FROM NOW())*1000)::bigint,
-            'boxTextObserverRetryAfterMs',
-              (EXTRACT(EPOCH FROM NOW()+INTERVAL '1 minute')*1000)::bigint)
-        WHERE request_id=$1 AND user_id=$2 AND state='inflight'
-          AND ctx->>'boxInvocationRecovery'='v1'
-          AND ctx->>'boxInvocationMode'='text' AND ctx->>'boxState'='unknown'
-          AND ctx->>'boxLaunchPermit'='true'
-          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
-          AND ctx->>'boxLeaseEpoch'=$5
-          AND ctx->>'boxDetachedRunnerHash'=$6
-          AND ctx->>'boxUpstreamModel'=$7
-          AND NOT (ctx ? 'boxOwnerRequestId')
-          AND NOT (ctx ? 'boxReplayMessage') AND NOT (ctx ? 'boxTerminalProof')
-          AND (NOT (ctx ? 'boxTextObserverRetryAfterMs')
-            OR (jsonb_typeof(ctx->'boxTextObserverRetryAfterMs')='number'
-              AND (ctx->>'boxTextObserverRetryAfterMs') ~ '^[0-9]{13}$'
-              AND (ctx->>'boxTextObserverRetryAfterMs')::bigint
-                <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint))`,
-      [input.requestId, input.uid.toString(), input.accountId.toString(),
-        input.runNonce, input.leaseEpoch, input.detachedRunnerHash,
-        input.upstreamModel]);
-    return changed.rowCount === 1;
+    return updateClaimTextUnknownCandidate(this.pool, {
+      requestId: input.requestId, uid: input.uid, accountId: input.accountId,
+      runNonce: input.runNonce, leaseEpoch: input.leaseEpoch,
+      detachedRunnerHash: input.detachedRunnerHash, upstreamModel: input.upstreamModel,
+    });
   }
 
   async admit(input: BoxJournalAdmission): Promise<void> {
@@ -1370,16 +1241,11 @@ export class BoxDurableJournal implements BoxJournalPort {
       // user filter keeps the check exact and lets it use idx_rfj_user_time.
       // A settled, unbilled stopped attempt without a completed Message is
       // dead: the same call sent again is a new launch, not a duplicate.
-      const duplicate = await client.query(
-        `SELECT 1 FROM request_finalize_journal
-          WHERE user_id = $3 AND ctx->>'boxInvocationRecovery' = 'v1'
-            AND (ctx->>'boxReplayFingerprint' = $1
-             OR ctx->>'boxFallbackAlias' = $2)
-            AND NOT (state = 'aborted' AND NOT (ctx ? 'boxReplayMessage')
-              AND COALESCE(ctx->>'boxState', '') IN ('failed_stopped', 'prestart_stopped'))
-          LIMIT 1`,
-        [input.fingerprint.replayFingerprint, fallbackAlias ?? null, input.uid.toString()]);
-      if (duplicate.rowCount) throw new BoxDurableJournalError("BOX_CALL_AMBIGUOUS");
+      const duplicate = await selectAdmitDuplicateExists(client, {
+        replayFingerprint: input.fingerprint.replayFingerprint,
+        fallbackAlias: fallbackAlias ?? null, uid: input.uid,
+      });
+      if (duplicate) throw new BoxDurableJournalError("BOX_CALL_AMBIGUOUS");
       const policy = this.capacity(input.uid, input.accountId);
       const caps: BoxRunCapacity = typeof policy === "number"
         ? { maxRunsPerAccount: policy, maxRunsPerUser: BOX_RUNS_CEILING } : policy;
@@ -1396,39 +1262,11 @@ export class BoxDurableJournal implements BoxJournalPort {
       // still execute, so an unprovable unknown/handoff row no longer pins the
       // session or eats account/user slots forever (#7da201bd: a 09:00 chain
       // held its session for hours; 10-01 rows still held account 20).
-      const occupied = await client.query<{ same_session: boolean;
-        account_occupied: string; user_occupied: string; malformed_ids: string[] | null }>(
-        `WITH rows AS (
-           SELECT request_id, user_id, created_at,
-             ctx->>'boxSessionId' AS session_id, COALESCE(ctx->>'boxAccountId',ctx#>>'{boxRolloverFrom,accountId}') AS account_id,
-             (state='inflight' AND ctx ? 'boxRolloverFrom' AND NOT (ctx ? 'boxState')) AS rollover_pending,
-             CASE WHEN COALESCE(COALESCE(ctx->>'boxRunNonce',ctx#>>'{boxRolloverFrom,runNonce}'),'') ~ '^[a-f0-9]{24}$'
-                    AND COALESCE(COALESCE(ctx->>'boxLeaseEpoch',ctx#>>'{boxRolloverFrom,leaseEpoch}'),'') ~ '^[a-f0-9]{32}$'
-                    AND COALESCE(ctx->>'boxAccountId',ctx#>>'{boxRolloverFrom,accountId}') IS NOT NULL
-                    AND ctx->>'boxSessionId' IS NOT NULL
-                  THEN 'run:' || (COALESCE(ctx->>'boxRunNonce',ctx#>>'{boxRolloverFrom,runNonce}')) || ':' || (COALESCE(ctx->>'boxLeaseEpoch',ctx#>>'{boxRolloverFrom,leaseEpoch}'))
-                  ELSE 'row:' || request_id END AS run_key,
-             NOT (COALESCE(COALESCE(ctx->>'boxRunNonce',ctx#>>'{boxRolloverFrom,runNonce}'),'') ~ '^[a-f0-9]{24}$'
-                    AND COALESCE(COALESCE(ctx->>'boxLeaseEpoch',ctx#>>'{boxRolloverFrom,leaseEpoch}'),'') ~ '^[a-f0-9]{32}$'
-                    AND COALESCE(ctx->>'boxAccountId',ctx#>>'{boxRolloverFrom,accountId}') IS NOT NULL
-                    AND ctx->>'boxSessionId' IS NOT NULL) AS malformed
-           FROM request_finalize_journal
-           WHERE (ctx->>'boxState' = ANY($1::text[])
-              OR (state='inflight' AND ctx ? 'boxRolloverFrom' AND NOT (ctx ? 'boxState') AND request_id<>$6))
-             AND (COALESCE(ctx->>'boxAccountId',ctx#>>'{boxRolloverFrom,accountId}') = $2 OR user_id = $3)),
-         active AS (
-           SELECT * FROM rows
-            WHERE rollover_pending OR run_key IN (SELECT run_key FROM rows GROUP BY run_key
-              HAVING MIN(created_at) > NOW() - make_interval(secs => $5::double precision)))
-         SELECT
-           COALESCE(bool_or(user_id = $3 AND session_id = $4), false) AS same_session,
-           COUNT(DISTINCT run_key) FILTER (WHERE account_id = $2) AS account_occupied,
-           COUNT(DISTINCT run_key) FILTER (WHERE user_id = $3) AS user_occupied,
-           (array_agg(request_id ORDER BY request_id) FILTER (WHERE malformed))[1:5] AS malformed_ids
-         FROM active`,
-        [ACTIVE, input.accountId.toString(), input.uid.toString(),
-          input.fingerprint.sessionId, BOX_RUN_EXPIRED_AFTER_MS / 1000,input.requestId]);
-      const usage = occupied.rows[0];
+      const usage = await selectAdmitCapacityUsage(client, {
+        activeStates: ACTIVE, accountId: input.accountId, uid: input.uid,
+        sessionId: input.fingerprint.sessionId,
+        expiredAfterSec: BOX_RUN_EXPIRED_AFTER_MS / 1000, requestId: input.requestId,
+      });
       if (!usage || usage.same_session) throw new BoxDurableJournalError("BOX_CAPACITY_HELD");
       if (usage.malformed_ids?.length) {
         journalLog.warn("box_capacity_malformed_active_rows", {
@@ -1449,17 +1287,11 @@ export class BoxDurableJournal implements BoxJournalPort {
         }
         // The candidate was read before the account/turn locks. A completed
         // intervening turn can make it stale without leaving ACTIVE capacity.
-        const latest = await client.query<{ request_id: string }>(
-          `SELECT request_id FROM request_finalize_journal
-            WHERE user_id=$1 AND ctx->>'boxSessionId'=$2
-              AND ctx->>'model'=$3 AND ctx->>'boxInvocationRecovery'='v1'
-              AND request_id<>$4
-            ORDER BY updated_at DESC, (ctx ? 'boxNativePointer') DESC,
-              request_id DESC LIMIT 1 FOR UPDATE`,
-          [input.uid.toString(), input.fingerprint.sessionId,
-            input.model, input.requestId]);
-        if (latest.rowCount !== 1
-          || latest.rows[0]?.request_id !== native.ownerRequestId) {
+        const latest = await selectLatestNativeOwnerForAdmit(client, {
+          uid: input.uid, sessionId: input.fingerprint.sessionId,
+          model: input.model, requestId: input.requestId,
+        });
+        if (latest.rowCount !== 1 || latest.requestId !== native.ownerRequestId) {
           throw new BoxDurableJournalError("BOX_NATIVE_CLAIM_LOST");
         }
         const prior = await client.query<{ ctx: Record<string, unknown> }>(
@@ -1478,14 +1310,11 @@ export class BoxDurableJournal implements BoxJournalPort {
           || (ctx.boxTerminalProof as { reason?: unknown }).reason !== "worker_complete") {
           throw new BoxDurableJournalError("BOX_NATIVE_CLAIM_LOST");
         }
-        const claimed = await client.query(
-          `UPDATE request_finalize_journal
-              SET ctx=ctx || $3::jsonb, updated_at=NOW()
-            WHERE request_id=$1 AND user_id=$2
-              AND ctx->>'boxState'='terminal' AND NOT (ctx ? 'boxNativeClaimRequestId')`,
-          [native.ownerRequestId, input.uid.toString(),
-            JSON.stringify({ boxNativeClaimRequestId: input.requestId })]);
-        if (claimed.rowCount !== 1) throw new BoxDurableJournalError("BOX_NATIVE_CLAIM_LOST");
+        const claimed = await updateClaimNativeOwnerForAdmit(client, {
+          ownerRequestId: native.ownerRequestId, uid: input.uid,
+          claimRequestId: input.requestId,
+        });
+        if (!claimed) throw new BoxDurableJournalError("BOX_NATIVE_CLAIM_LOST");
       }
       const rolloverChild = await client.query<{ ctx: Record<string,unknown> }>(
         `SELECT ctx FROM request_finalize_journal WHERE user_id=$1 AND request_id=$2 FOR UPDATE`,
@@ -1521,17 +1350,12 @@ export class BoxDurableJournal implements BoxJournalPort {
           ...(input.nativeStart.cliVersion ? { boxNativeCliVersion: input.nativeStart.cliVersion } : {}),
           ...(input.nativeStart.promptLayout
             ? { boxNativePromptLayout: input.nativeStart.promptLayout } : {}) } : {}) };
-      const updated = await client.query<{ ctx: Record<string, unknown> }>(
-        `UPDATE request_finalize_journal
-            SET ctx = ctx || $4::jsonb, updated_at = NOW()
-          WHERE request_id = $1 AND user_id = $2 AND state = 'inflight'
-            AND ctx->>'model' = $3 AND ctx->>'boxInvocationRecovery' = 'v1'
-            AND ctx ? 'billingPricing' AND ctx ? 'boxBillingContext'
-            AND NOT (ctx ? 'boxState')
-          RETURNING ctx`,
-        [input.requestId, input.uid.toString(), input.model, JSON.stringify(identity)]);
+      const updated = await updateAdmitJournalRow(client, {
+        requestId: input.requestId, uid: input.uid, model: input.model,
+        identityJson: JSON.stringify(identity),
+      });
       if (updated.rowCount !== 1) throw new BoxDurableJournalError("BOX_JOURNAL_NOT_INFLIGHT");
-      const ctx = updated.rows[0]?.ctx;
+      const ctx = updated.ctx;
       const billingContext = parseBoxBillingContext(ctx?.boxBillingContext);
       if (!parseBillingPricing(ctx?.billingPricing, input.model)
         || !billingContext || billingContext.turnKey !== input.fingerprint.turnKey) {
@@ -1546,16 +1370,8 @@ export class BoxDurableJournal implements BoxJournalPort {
   }
 
   async markRunning(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch">): Promise<void> {
-    const changed = await this.pool.query(
-      `UPDATE request_finalize_journal
-          SET ctx = jsonb_set(ctx, '{boxState}', '"running"'::jsonb), updated_at = NOW()
-        WHERE request_id = $1 AND user_id = $2 AND state = 'inflight'
-          AND ctx->>'boxLeaseEpoch' = $3 AND ctx->>'boxState' = 'reserved'
-          AND NOT (ctx->>'boxInvocationMode'='text'
-            AND ctx ? 'boxDetachedRunnerHash')
-          AND NOT (ctx ? 'boxPrelaunchControl')`,
-      [input.requestId, input.uid.toString(), input.leaseEpoch]);
-    if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_JOURNAL_START_FENCE_LOST");
+    const changed = await updateJournalMarkRunning(this.pool, input);
+    if (!changed) throw new BoxDurableJournalError("BOX_JOURNAL_START_FENCE_LOST");
   }
 
   /** One durable text launch permit. Once committed, a missing/ambiguous
@@ -1570,39 +1386,16 @@ export class BoxDurableJournal implements BoxJournalPort {
       || !isBoxApiUpstreamModel(input.upstreamModel)) {
       throw new BoxDurableJournalError("BOX_TEXT_LAUNCH_IDENTITY_INVALID");
     }
-    const changed = await this.pool.query(
-      `UPDATE request_finalize_journal
-          SET ctx=ctx || '{"boxState":"running","boxLaunchPermit":true}'::jsonb,
-              updated_at=NOW()
-        WHERE request_id=$1 AND user_id=$2 AND state='inflight'
-          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
-          AND ctx->>'boxLeaseEpoch'=$5
-          AND ctx->>'boxInvocationMode'='text' AND ctx->>'boxState'='reserved'
-          AND ctx->>'boxDetachedRunnerHash'=$6
-          AND ctx->>'boxUpstreamModel'=$7
-          AND NOT (ctx ? 'boxLaunchPermit')
-          AND NOT (ctx ? 'boxPrelaunchControl')`,
-      [input.requestId, input.uid.toString(), input.accountId.toString(),
-        input.runNonce, input.leaseEpoch, input.detachedRunnerHash,
-        input.upstreamModel]);
-    if (changed.rowCount !== 1) {
+    const changed = await updateJournalArmTextLaunch(this.pool, input);
+    if (!changed) {
       throw new BoxDurableJournalError("BOX_TEXT_LAUNCH_FENCE_LOST");
     }
   }
 
   /** Only the caller that has not invoked plan.run may use this transition. */
   async markPrestartStopped(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch">): Promise<void> {
-    const changed = await this.pool.query(
-      `UPDATE request_finalize_journal
-          SET ctx = jsonb_set(ctx, '{boxState}', '"prestart_stopped"'::jsonb),
-              updated_at = NOW()
-        WHERE request_id = $1 AND user_id = $2 AND state = 'inflight'
-          AND ctx->>'boxLeaseEpoch' = $3
-          AND ctx->>'boxState' IN ('reserved', 'running')
-          AND NOT (ctx ? 'boxPrelaunchControl')
-          AND NOT (ctx ? 'boxLaunchPermit')`,
-      [input.requestId, input.uid.toString(), input.leaseEpoch]);
-    if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_JOURNAL_PRESTART_FENCE_LOST");
+    const changed = await updateJournalMarkPrestartStopped(this.pool, input);
+    if (!changed) throw new BoxDurableJournalError("BOX_JOURNAL_PRESTART_FENCE_LOST");
   }
 
   /** Persist the exact remote lock/control identity before the first private
@@ -1611,20 +1404,12 @@ export class BoxDurableJournal implements BoxJournalPort {
     "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch"> &
     { receipt: BoxPrelaunchReceipt }): Promise<void> {
     this.validatePrelaunchReceipt(input);
-    const changed = await this.pool.query(
-      `UPDATE request_finalize_journal
-          SET ctx=ctx || $6::jsonb, updated_at=NOW()
-        WHERE request_id=$1 AND user_id=$2 AND state='inflight'
-          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
-          AND ctx->>'boxLeaseEpoch'=$5
-          AND ctx->>'boxInvocationMode'='detached_tool'
-          AND ctx->>'boxState'='reserved'
-          AND NOT (ctx ? 'boxPrelaunchControl')
-          AND NOT (ctx ? 'boxLaunchPermit')`,
-      [input.requestId, input.uid.toString(), input.accountId.toString(),
-        input.runNonce, input.leaseEpoch,
-        JSON.stringify({ boxPrelaunchControl: input.receipt })]);
-    if (changed.rowCount !== 1) {
+    const changed = await updateJournalPrelaunchControl(this.pool, {
+      requestId: input.requestId, uid: input.uid, accountId: input.accountId,
+      runNonce: input.runNonce, leaseEpoch: input.leaseEpoch,
+      receiptJson: JSON.stringify({ boxPrelaunchControl: input.receipt }),
+    });
+    if (!changed) {
       throw new BoxDurableJournalError("BOX_PRELAUNCH_CONTROL_FENCE_LOST");
     }
   }
@@ -1636,21 +1421,12 @@ export class BoxDurableJournal implements BoxJournalPort {
     { receipt: BoxPrelaunchReceipt }): Promise<void> {
     this.validatePrelaunchReceipt(input);
     await withToolRolloverLaunchFence(this.pool,input.uid,input.requestId,async (query) => {
-    const changed = await query(
-      `UPDATE request_finalize_journal
-          SET ctx=ctx || '{"boxState":"running","boxLaunchPermit":true}'::jsonb,
-              updated_at=NOW()
-        WHERE request_id=$1 AND user_id=$2 AND state='inflight'
-          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
-          AND ctx->>'boxLeaseEpoch'=$5
-          AND ctx->>'boxInvocationMode'='detached_tool'
-          AND ctx->>'boxState'='reserved'
-          AND ctx->'boxPrelaunchControl'=$6::jsonb
-          AND NOT (ctx ? 'boxLaunchPermit')
-          AND NOT (ctx ? 'boxPrelaunchCleanup')`,
-      [input.requestId, input.uid.toString(), input.accountId.toString(),
-        input.runNonce, input.leaseEpoch, JSON.stringify(input.receipt)]);
-    if (changed.rowCount !== 1) {
+    const changed = await updateJournalArmGuardedLaunch({ query }, {
+      requestId: input.requestId, uid: input.uid, accountId: input.accountId,
+      runNonce: input.runNonce, leaseEpoch: input.leaseEpoch,
+      receiptJson: JSON.stringify(input.receipt),
+    });
+    if (!changed) {
       throw new BoxDurableJournalError("BOX_PRELAUNCH_ARM_FENCE_LOST");
     }
     });
@@ -1665,22 +1441,14 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (input.cleanedReceipt !== `cleaned:${input.receipt.identityHash}`) {
       throw new BoxDurableJournalError("BOX_PRELAUNCH_CLEAN_EVIDENCE_INVALID");
     }
-    const changed = await this.pool.query(
-      `UPDATE request_finalize_journal
-          SET ctx=ctx || $7::jsonb, updated_at=NOW()
-        WHERE request_id=$1 AND user_id=$2 AND state='inflight'
-          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
-          AND ctx->>'boxLeaseEpoch'=$5
-          AND ctx->>'boxInvocationMode'='detached_tool'
-          AND ctx->>'boxState' IN ('reserved','unknown')
-          AND ctx->'boxPrelaunchControl'=$6::jsonb
-          AND NOT (ctx ? 'boxLaunchPermit')
-          AND NOT (ctx ? 'boxTerminalProof')`,
-      [input.requestId, input.uid.toString(), input.accountId.toString(),
-        input.runNonce, input.leaseEpoch, JSON.stringify(input.receipt),
-        JSON.stringify({ boxState: "prestart_stopped",
-          boxPrelaunchCleanup: { v: 1, receipt: input.cleanedReceipt } })]);
-    if (changed.rowCount !== 1) {
+    const changed = await updateJournalGuardedPrestartStopped(this.pool, {
+      requestId: input.requestId, uid: input.uid, accountId: input.accountId,
+      runNonce: input.runNonce, leaseEpoch: input.leaseEpoch,
+      receiptJson: JSON.stringify(input.receipt),
+      cleanupPatchJson: JSON.stringify({ boxState: "prestart_stopped",
+        boxPrelaunchCleanup: { v: 1, receipt: input.cleanedReceipt } }),
+    });
+    if (!changed) {
       throw new BoxDurableJournalError("BOX_PRELAUNCH_STOP_FENCE_LOST");
     }
   }
@@ -1704,19 +1472,12 @@ export class BoxDurableJournal implements BoxJournalPort {
 
   async markUnknown(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
     { phase: string }): Promise<void> {
-    const changed = await this.pool.query(
-      `UPDATE request_finalize_journal
-          SET ctx = ctx || $4::jsonb, updated_at = NOW()
-        WHERE request_id = $1 AND user_id = $2
-          AND ctx->>'boxLeaseEpoch' = $3
-          AND ctx->>'boxState' = ANY($5::text[])
-          AND NOT (ctx ? 'boxToolHandoff')
-          AND NOT (ctx ? 'boxReplayMessage')
-          AND NOT (ctx ? 'boxTerminalProof')`,
-      [input.requestId, input.uid.toString(), input.leaseEpoch,
-        JSON.stringify({ boxState: "unknown", boxUnknownPhase: input.phase.slice(0, 80) }),
-        ["reserved", "starting", "running", "linked", "resuming", "unknown"]]);
-    if (changed.rowCount === 1) return;
+    const changed = await updateJournalMarkUnknown(this.pool, {
+      requestId: input.requestId, uid: input.uid, leaseEpoch: input.leaseEpoch,
+      patchJson: JSON.stringify({ boxState: "unknown", boxUnknownPhase: input.phase.slice(0, 80) }),
+      activeStates: ["reserved", "starting", "running", "linked", "resuming", "unknown"],
+    });
+    if (changed) return;
     // A late caller abort or stream error cannot turn already-published model
     // evidence back into unknown. No UPDATE (or updated_at bump) on that path.
     const found = await this.pool.query<{ ctx: Record<string, unknown> }>(
@@ -1809,15 +1570,13 @@ export class BoxDurableJournal implements BoxJournalPort {
           throw new BoxDurableJournalError("BOX_CANCEL_CHAIN_INVALID");
         }
         if (linked.boxCancelIntent !== undefined) continue;
-        const changed = await client.query(
-          `UPDATE request_finalize_journal SET ctx=ctx || $5::jsonb
-            WHERE request_id=$1 AND user_id=$2
-              AND ctx->>'boxRunNonce'=$3 AND ctx->>'boxLeaseEpoch'=$4
-              AND ctx->>'boxState'=ANY($6::text[])
-              AND NOT (ctx ? 'boxCancelIntent')`,
-          [current.request_id, input.uid.toString(), input.runNonce,
-            input.leaseEpoch, JSON.stringify({ boxCancelIntent: intent }), ACTIVE]);
-        if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_CANCEL_FENCE_LOST");
+        const changed = await updateJournalCancelIntent(client, {
+          requestId: current.request_id, uid: input.uid, runNonce: input.runNonce,
+          leaseEpoch: input.leaseEpoch,
+          intentPatchJson: JSON.stringify({ boxCancelIntent: intent }),
+          activeStates: ACTIVE,
+        });
+        if (!changed) throw new BoxDurableJournalError("BOX_CANCEL_FENCE_LOST");
       }
       if (active.rowCount === 0 && prior === undefined) {
         throw new BoxDurableJournalError("BOX_CANCEL_FENCE_LOST");
@@ -1878,44 +1637,28 @@ export class BoxDurableJournal implements BoxJournalPort {
           || !["handoff", "unknown"].includes(String(ctx.boxState))) {
           throw new BoxDurableJournalError("BOX_FAILED_STOP_FENCE_LOST");
         }
-        const changed = await client.query(
-          `UPDATE request_finalize_journal SET ctx=ctx || $4::jsonb
-            WHERE request_id=$1 AND user_id=$2
-              AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$5
-              AND ctx->>'boxInvocationMode'='detached_tool'
-              AND ctx->>'boxState' IN ('handoff','unknown')
-              AND ctx ? 'boxToolHandoff' AND NOT (ctx ? 'boxOwnerRequestId')
-              AND NOT (ctx ? 'boxResumeRequestId')
-              AND state IN ('inflight','finalizing','committed')`,
-          [input.requestId, input.uid.toString(), input.leaseEpoch,
-            JSON.stringify({ boxState: "failed_stopped", boxTerminalProof: input.proof,
-              boxStopOutcome: "failed" }), input.proof.runNonce]);
-        if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_FAILED_STOP_FENCE_LOST");
+        const changed = await updateFirstRoundHandoffStoppedFailure(client, {
+          requestId: input.requestId, uid: input.uid, leaseEpoch: input.leaseEpoch,
+          patchJson: JSON.stringify({ boxState: "failed_stopped", boxTerminalProof: input.proof,
+            boxStopOutcome: "failed" }),
+          runNonce: input.proof.runNonce,
+        });
+        if (!changed) throw new BoxDurableJournalError("BOX_FAILED_STOP_FENCE_LOST");
         await client.query("COMMIT"); committed = true; return;
       }
       if (row.state !== "inflight" || !["running", "unknown"].includes(String(ctx.boxState))) {
         throw new BoxDurableJournalError("BOX_FAILED_STOP_FENCE_LOST");
       }
-      const usage = await client.query(
-        `SELECT 1 FROM usage_records WHERE request_id=$1 AND user_id=$2 LIMIT 1`,
-        [input.requestId, input.uid.toString()]);
-      if (usage.rowCount) throw new BoxDurableJournalError("BOX_FAILED_STOP_USAGE_CONFLICT");
-      const changed = await client.query(
-        `UPDATE request_finalize_journal
-            SET state='aborted', failure_code='STREAM_FAILED',
-                final_credits=0,
-                error_msg=COALESCE(NULLIF(error_msg, ''), 'box_stopped:' || COALESCE($4::jsonb#>>'{boxTerminalProof,reason}', 'failed')),
-                ctx=ctx || $4::jsonb, updated_at=NOW()
-          WHERE request_id=$1 AND user_id=$2 AND state='inflight'
-            AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$5
-            AND ${STOP_MODE_FENCE}
-            AND ctx->>'boxState' IN ('running','unknown')
-            AND NOT (ctx ? 'boxToolHandoff') AND NOT (ctx ? 'boxOwnerRequestId')
-            AND NOT (ctx ? 'boxResumeRequestId')`,
-        [input.requestId, input.uid.toString(), input.leaseEpoch,
-          JSON.stringify({ boxState: "failed_stopped", boxTerminalProof: input.proof,
-            boxStopOutcome: "failed" }), input.proof.runNonce]);
-      if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_FAILED_STOP_FENCE_LOST");
+      if (await selectUsageRecordExists(client, input.requestId, input.uid)) {
+        throw new BoxDurableJournalError("BOX_FAILED_STOP_USAGE_CONFLICT");
+      }
+      const changed = await updateFirstRoundUnbilledStoppedFailure(client, {
+        requestId: input.requestId, uid: input.uid, leaseEpoch: input.leaseEpoch,
+        patchJson: JSON.stringify({ boxState: "failed_stopped", boxTerminalProof: input.proof,
+          boxStopOutcome: "failed" }),
+        runNonce: input.proof.runNonce,
+      });
+      if (!changed) throw new BoxDurableJournalError("BOX_FAILED_STOP_FENCE_LOST");
       await client.query("COMMIT"); committed = true;
     } finally {
       if (!committed) await client.query("ROLLBACK").catch(() => {});
@@ -1972,26 +1715,16 @@ export class BoxDurableJournal implements BoxJournalPort {
       if (row.state !== "inflight" || !["running", "unknown"].includes(String(ctx.boxState))) {
         throw new BoxDurableJournalError("BOX_REJECTED_STREAM_FENCE_LOST");
       }
-      const usage = await client.query(
-        `SELECT 1 FROM usage_records WHERE request_id=$1 AND user_id=$2 LIMIT 1`,
-        [input.requestId, input.uid.toString()]);
-      if (usage.rowCount) throw new BoxDurableJournalError("BOX_REJECTED_STREAM_USAGE_CONFLICT");
-      const changed = await client.query(
-        `UPDATE request_finalize_journal
-            SET state='aborted', failure_code='STREAM_FAILED',
-                final_credits=0,
-                error_msg=COALESCE(NULLIF(error_msg, ''), 'box_rejected_stream:' || COALESCE($4::jsonb#>>'{boxTerminalProof,reason}', 'rejected')),
-                ctx=ctx || $4::jsonb, updated_at=NOW()
-          WHERE request_id=$1 AND user_id=$2 AND state='inflight'
-            AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$5
-            AND ctx->>'boxInvocationMode'='detached_tool'
-            AND ctx->>'boxState' IN ('running','unknown')
-            AND NOT (ctx ? 'boxToolHandoff') AND NOT (ctx ? 'boxOwnerRequestId')
-            AND NOT (ctx ? 'boxResumeRequestId')`,
-        [input.requestId, input.uid.toString(), input.leaseEpoch,
-          JSON.stringify({ boxState: "failed_stopped", boxTerminalProof: input.proof,
-            boxStopOutcome: "rejected_stream" }), input.proof.runNonce]);
-      if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_REJECTED_STREAM_FENCE_LOST");
+      if (await selectUsageRecordExists(client, input.requestId, input.uid)) {
+        throw new BoxDurableJournalError("BOX_REJECTED_STREAM_USAGE_CONFLICT");
+      }
+      const changed = await updateFirstRoundRejectedStream(client, {
+        requestId: input.requestId, uid: input.uid, leaseEpoch: input.leaseEpoch,
+        patchJson: JSON.stringify({ boxState: "failed_stopped", boxTerminalProof: input.proof,
+          boxStopOutcome: "rejected_stream" }),
+        runNonce: input.proof.runNonce,
+      });
+      if (!changed) throw new BoxDurableJournalError("BOX_REJECTED_STREAM_FENCE_LOST");
       await client.query("COMMIT"); committed = true;
     } finally {
       if (!committed) await client.query("ROLLBACK").catch(() => {});
@@ -2013,23 +1746,13 @@ export class BoxDurableJournal implements BoxJournalPort {
       || (input.messagePointer !== undefined && !pointer)) {
       throw new BoxDurableJournalError("BOX_JOURNAL_EVIDENCE_INVALID");
     }
-    const changed = await this.pool.query(
-      `UPDATE request_finalize_journal
-          SET ctx = ctx || $4::jsonb, updated_at = NOW()
-        WHERE request_id = $1 AND user_id = $2 AND state = 'inflight'
-           AND ctx->>'boxLeaseEpoch' = $3 AND ctx->>'boxRunNonce' = $5
-           AND ctx->>'boxState' IN ('running', 'unknown')
-           AND ($6::boolean = false OR (
-             COALESCE(ctx->>'boxRoundNo','1')='1'
-             AND NOT (ctx ? 'boxToolHandoff')
-             AND NOT (ctx ? 'boxReplayMessage')))
-           AND (ctx->>'boxReplayRequired' IS DISTINCT FROM 'true' OR $6::boolean = true)
-           AND ctx ? 'billingPricing'`,
-      [input.requestId, input.uid.toString(), input.leaseEpoch,
-        JSON.stringify({ boxState: "terminal", boxUsage: u, boxTerminalProof: input.proof,
-          ...(pointer ? { boxReplayMessage: pointer } : {}) }),
-        input.proof.runNonce, pointer !== undefined]);
-    if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_JOURNAL_COMPLETE_FENCE_LOST");
+    const changed = await updateJournalComplete(this.pool, {
+      requestId: input.requestId, uid: input.uid, leaseEpoch: input.leaseEpoch,
+      patchJson: JSON.stringify({ boxState: "terminal", boxUsage: u, boxTerminalProof: input.proof,
+        ...(pointer ? { boxReplayMessage: pointer } : {}) }),
+      runNonce: input.proof.runNonce, hasPointer: pointer !== undefined,
+    });
+    if (!changed) throw new BoxDurableJournalError("BOX_JOURNAL_COMPLETE_FENCE_LOST");
   }
 
   /** Optional text cache publication AFTER exact terminal proof and billable
@@ -2043,32 +1766,15 @@ export class BoxDurableJournal implements BoxJournalPort {
       || pointer.accountId !== input.accountId.toString()
       || input.proof.reason !== "worker_complete") return false;
     const ownerCwd = `/tmp/ocv5-289-run-${input.proof.runNonce}`;
-    const changed = await this.pool.query(
-      `UPDATE request_finalize_journal
-          SET ctx=ctx || $5::jsonb
-        WHERE request_id=$1 AND user_id=$2
-          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxState'='terminal'
-          AND (ctx->>'boxInvocationMode'='text' OR
-            (ctx->>'boxInvocationMode'='detached_tool'
-              AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
-              AND ctx->>'boxRemoteCleanupClaimed' IS DISTINCT FROM 'true'
-              AND NOT (ctx ? 'boxRemoteCleanupQuarantine')))
-          AND ctx->'boxTerminalProof'=$4::jsonb
-          AND ctx ? 'boxUsage' AND NOT (ctx ? 'boxNativePointer')
-          AND ((ctx ? 'boxNativeCliCwd' AND ctx->>'boxNativeCliCwd'=$6)
-            OR (NOT (ctx ? 'boxNativeCliCwd')
-              AND $6=$11 AND ctx->>'boxRunNonce'=$7))
-          AND (ctx->>'boxNativeSessionId' IS NULL
-            OR ctx->>'boxNativeSessionId'=$8)
-          AND (ctx->>'boxContextHash' IS NULL
-            OR ctx->>'boxContextHash'=$9)
-          AND (ctx->>'boxCatalogHash' IS NULL
-            OR ctx->>'boxCatalogHash'=$10)`,
-      [input.requestId, input.uid.toString(), input.accountId.toString(),
-        JSON.stringify(input.proof), JSON.stringify({ boxNativePointer: pointer }),
-        pointer.cliCwd, input.proof.runNonce, pointer.nativeSessionId,
-        pointer.contextHashBeforeFinal, pointer.catalogHash, ownerCwd]);
-    return changed.rowCount === 1;
+    return updateAttachNativePointer(this.pool, {
+      requestId: input.requestId, uid: input.uid, accountId: input.accountId,
+      proofJson: JSON.stringify(input.proof),
+      pointerPatchJson: JSON.stringify({ boxNativePointer: pointer }),
+      cliCwd: pointer.cliCwd, runNonce: input.proof.runNonce,
+      nativeSessionId: pointer.nativeSessionId,
+      contextHashBeforeFinal: pointer.contextHashBeforeFinal,
+      catalogHash: pointer.catalogHash, ownerCwd,
+    });
   }
 
   /** The full model set and exact round usage must commit before the first
@@ -2164,50 +1870,17 @@ export class BoxDurableJournal implements BoxJournalPort {
       throw new BoxDurableJournalError("BOX_TOOL_HANDOFF_TOO_LARGE");
     }
     const durableRevision = randomUUID();
-    const changed = await this.pool.query(
-      `UPDATE request_finalize_journal AS handoff_row
-          SET ctx = handoff_row.ctx || $4::jsonb, updated_at = NOW()
-        WHERE request_id = $1 AND user_id = $2 AND state = 'inflight'
-           AND ctx->>'boxLeaseEpoch' = $3
-           AND ($10::text IS NULL OR ctx->>'boxRunNonce' = $10)
-           AND (ctx->>'boxReplayRequired' IS DISTINCT FROM 'true' OR $10::text IS NOT NULL)
-           AND ctx->>'boxInvocationMode' = 'detached_tool'
-          AND NOT (ctx ? 'boxCancelIntent')
-           AND NOT (ctx ? 'boxToolHandoff')
-           AND NOT (ctx ? 'boxReplayMessage')
-           AND NOT (ctx ? 'boxTerminalProof')
-           AND ((($5::int = 1) AND (ctx->>'boxState' = 'running'
-             OR (ctx->>'boxState'='unknown'
-               AND ctx->>'boxReplayRequired'='true'
-               AND ctx->>'boxLaunchPermit'='true')))
-             OR (($5::int > 1) AND (ctx->>'boxState' = 'linked'
-               OR (ctx->>'boxState'='unknown'
-                 AND ctx->>'boxReplayRequired'='true'
-                 AND EXISTS (SELECT 1 FROM request_finalize_journal root
-                   WHERE root.user_id=$2
-                     AND root.ctx->>'boxRunNonce'=handoff_row.ctx->>'boxRunNonce'
-                     AND root.ctx->>'boxLeaseEpoch'=$3
-                     AND root.ctx->>'boxAccountId'=handoff_row.ctx->>'boxAccountId'
-                     AND root.ctx->>'boxSessionId'=handoff_row.ctx->>'boxSessionId'
-                     AND root.ctx->>'boxTurnKey'=handoff_row.ctx->>'boxTurnKey'
-                     AND root.ctx->>'boxLaunchPermit'='true'
-                     AND NOT (root.ctx ? 'boxOwnerRequestId'))))
-               AND ctx->>'boxRoundNo' = $5::text
-              AND ctx->>'boxCatalogHash' = $6
-              AND ctx->>'boxDetachedRunnerHash' = $7
-              AND jsonb_typeof(ctx->'boxResumeSpoolOffset') = 'number'
-              AND (ctx->>'boxResumeSpoolOffset')::bigint < $9::bigint
-              AND jsonb_typeof(ctx->'boxPriorMessageIds') = 'array'
-              AND jsonb_array_length(ctx->'boxPriorMessageIds') = $5::int - 1
-              AND NOT (ctx->'boxPriorMessageIds' ? $8)))
-          AND ctx ? 'billingPricing' AND ctx ? 'boxBillingContext'`,
-      [input.requestId, input.uid.toString(), input.leaseEpoch,
-         JSON.stringify({ boxState: "handoff", boxHandoffRevision: durableRevision,
-           boxToolHandoff: frozen,
-           ...(pointer ? { boxReplayMessage: pointer } : {}) }), roundNo, input.catalogHash,
-         input.detachedRunnerHash, candidate.messageId, input.spoolOffset,
-         pointer?.runNonce ?? null]);
-    if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_TOOL_HANDOFF_FENCE_LOST");
+    const changed = await updateJournalRecordToolHandoff(this.pool, {
+      requestId: input.requestId, uid: input.uid, leaseEpoch: input.leaseEpoch,
+      patchJson: JSON.stringify({ boxState: "handoff", boxHandoffRevision: durableRevision,
+        boxToolHandoff: frozen,
+        ...(pointer ? { boxReplayMessage: pointer } : {}) }),
+      roundNo, catalogHash: input.catalogHash,
+      detachedRunnerHash: input.detachedRunnerHash,
+      messageId: candidate.messageId, spoolOffset: input.spoolOffset,
+      pointerRunNonce: pointer?.runNonce ?? null,
+    });
+    if (!changed) throw new BoxDurableJournalError("BOX_TOOL_HANDOFF_FENCE_LOST");
     return { durableRevision, journaledToolUseIds: ids,
       verifiedPendingToolUseIds: pendingIds };
   }
@@ -2249,127 +1922,7 @@ export class BoxDurableJournal implements BoxJournalPort {
   async completeToolChain(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
     { proof: BoxTerminalProof; usage: BoxUsageEvidence;
       messagePointer?: BoxReplayMessagePointer }): Promise<void> {
-    const usage = input.usage;
-    const pointer = input.messagePointer === undefined ? undefined
-      : parseBoxReplayMessagePointer(input.messagePointer);
-    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
-      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)
-      || !validUsageEvidence(usage)
-      || (input.messagePointer !== undefined && (!pointer
-        || pointer.uid !== input.uid.toString()
-        || pointer.requestId !== input.requestId
-        || pointer.runNonce !== input.proof.runNonce
-        || pointer.leaseEpoch !== input.leaseEpoch))) {
-      throw new BoxDurableJournalError("BOX_TOOL_CHAIN_EVIDENCE_INVALID");
-    }
-    try {
-      parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", {
-        runNonce: input.proof.runNonce, leaseEpoch: input.leaseEpoch });
-    } catch { throw new BoxDurableJournalError("BOX_TOOL_CHAIN_EVIDENCE_INVALID"); }
-    if (input.proof.reason !== "worker_complete") {
-      throw new BoxDurableJournalError("BOX_TOOL_CHAIN_EVIDENCE_INVALID");
-    }
-    const client = await this.pool.connect();
-    let committed = false;
-    try {
-      await client.query("BEGIN");
-      const lockedSessionId = await lockChainSession(client, input.uid, input.requestId);
-      type Row = { request_id: string; state: string; ctx: Record<string, unknown> };
-      const rows: Row[] = [];
-      const seen = new Set<string>();
-      let cursor: string | null = input.requestId;
-      while (cursor !== null) {
-        if (rows.length >= BOX_TOOL_MAX_ROUNDS || seen.has(cursor)) {
-          throw new BoxDurableJournalError("BOX_TOOL_CHAIN_INVALID");
-        }
-        seen.add(cursor);
-        const found: { rows: Row[]; rowCount: number | null } = await client.query<Row>(
-          `SELECT request_id,state,ctx FROM request_finalize_journal
-            WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
-          [cursor, input.uid.toString()]);
-        const row: Row | undefined = found.rows[0];
-        if (found.rowCount !== 1 || !row || !row.ctx
-          || row.ctx.boxInvocationRecovery !== "v1"
-          || row.ctx.boxInvocationMode !== "detached_tool"
-          || row.ctx.boxRunNonce !== input.proof.runNonce
-          || row.ctx.boxLeaseEpoch !== input.leaseEpoch) {
-          throw new BoxDurableJournalError("BOX_TOOL_CHAIN_INVALID");
-        }
-        rows.push(row);
-        const parent: unknown = row.ctx.boxOwnerRequestId;
-        if (parent === undefined) cursor = null;
-        else if (typeof parent === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(parent)) {
-          cursor = parent;
-        } else throw new BoxDurableJournalError("BOX_TOOL_CHAIN_INVALID");
-      }
-      const current = rows[0]!;
-      const basis = current.ctx;
-      const roundNo = basis.boxRoundNo;
-      if (!Number.isSafeInteger(roundNo) || Number(roundNo) < 2
-        || Number(roundNo) > BOX_TOOL_MAX_ROUNDS || rows.length !== roundNo
-        || (pointer && pointer.roundNo !== roundNo)
-        || (basis.boxReplayRequired === true && !pointer)
-        || basis.boxSessionId !== lockedSessionId
-        || current.state !== "inflight"
-        || !["linked", "unknown"].includes(String(basis.boxState))
-        || basis.boxToolHandoff !== undefined
-        || typeof basis.boxCatalogHash !== "string"
-        || !/^[a-f0-9]{64}$/.test(basis.boxCatalogHash)
-        || typeof basis.boxDetachedRunnerHash !== "string"
-        || !/^[a-f0-9]{64}$/.test(basis.boxDetachedRunnerHash)) {
-        throw new BoxDurableJournalError("BOX_TOOL_CHAIN_INVALID");
-      }
-      for (let i = 1; i < rows.length; i++) {
-        const child = rows[i - 1]!, parent = rows[i]!;
-        const ctx = parent.ctx;
-        const handoff = parseBoxStoredToolHandoff(ctx.boxToolHandoff);
-        if (!handoff || handoff.roundNo !== Number(roundNo) - i
-          || handoff.catalogHash !== basis.boxCatalogHash
-          || handoff.detachedRunnerHash !== basis.boxDetachedRunnerHash
-          || !["inflight", "finalizing", "committed"].includes(parent.state)
-          || !["resuming", "unknown"].includes(String(ctx.boxState))
-          || ctx.boxResumeRequestId !== child.request_id
-          || typeof ctx.boxResumeRevision !== "string"
-          || !UUID_V4.test(ctx.boxResumeRevision)
-          || typeof child.ctx.boxParentResumeRevision !== "string"
-          || !UUID_V4.test(child.ctx.boxParentResumeRevision)
-          || ctx.boxResumeRevision !== child.ctx.boxParentResumeRevision
-          || ctx.boxAccountId !== basis.boxAccountId
-          || ctx.boxSessionId !== basis.boxSessionId
-          || ctx.boxTurnKey !== basis.boxTurnKey
-          || ctx.model !== basis.model
-          || ctx.boxReplayRequired !== basis.boxReplayRequired
-          || ctx.boxNativeSessionId !== basis.boxNativeSessionId
-          || ctx.boxNativeCliCwd !== basis.boxNativeCliCwd) {
-          throw new BoxDurableJournalError("BOX_TOOL_CHAIN_INVALID");
-        }
-      }
-      const final = await client.query(
-        `UPDATE request_finalize_journal
-            SET ctx=ctx || $4::jsonb, updated_at=NOW()
-          WHERE request_id=$1 AND user_id=$2 AND state='inflight'
-            AND ctx->>'boxLeaseEpoch'=$3
-            AND ctx->>'boxState' IN ('linked','unknown')`,
-        [current.request_id, input.uid.toString(), input.leaseEpoch,
-           JSON.stringify({ boxState: "terminal", boxTerminalProof: input.proof,
-             boxUsage: usage,
-             ...(pointer ? { boxReplayMessage: pointer } : {}) })]);
-      if (final.rowCount !== 1) throw new BoxDurableJournalError("BOX_TOOL_CHAIN_FENCE_LOST");
-      for (const ancestor of rows.slice(1)) {
-        const changed = await client.query(
-          `UPDATE request_finalize_journal
-              SET ctx=jsonb_set(ctx,'{boxState}','"terminal"'::jsonb), updated_at=NOW()
-            WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxLeaseEpoch'=$3
-              AND ctx->>'boxState' IN ('resuming','unknown')`,
-          [ancestor.request_id, input.uid.toString(), input.leaseEpoch]);
-        if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_TOOL_CHAIN_FENCE_LOST");
-      }
-      await client.query("COMMIT");
-      committed = true;
-    } finally {
-      if (!committed) await client.query("ROLLBACK").catch(() => {});
-      client.release();
-    }
+    return completeBoxToolChain(this.pool, input);
   }
 
   /** A linked final round failed after earlier tool messages were durably
@@ -2378,398 +1931,30 @@ export class BoxDurableJournal implements BoxJournalPort {
    * No missing model usage is invented and no CLI/tool call is replayed. */
   async markToolChainStoppedFailure(input: Pick<BoxJournalAdmission,
     "requestId" | "uid" | "leaseEpoch"> & { proof: BoxTerminalProof;
-    /** OCV5-306 (#2ee979cd): the leaf's CLI exited by itself (worker_complete)
-     * after an ambiguous continuation cut, and its only post-resume output is
-     * a tool call nobody received. Same settlement as the first-round
-     * rejected_stream (OCV5-300): unbilled leaf, ancestors stop holding the
-     * session/account. Only a handoff-free unknown leaf qualifies. */
     rejectedStream?: true }): Promise<void> {
-    const rejectedStream = input.rejectedStream === true;
-    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
-      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch) || !input.proof
-      || (input.proof.reason === "worker_complete") !== rejectedStream) {
-      throw new BoxDurableJournalError("BOX_FAILED_STOP_EVIDENCE_INVALID");
-    }
-    try { parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", {
-      runNonce: input.proof.runNonce, leaseEpoch: input.leaseEpoch }); }
-    catch { throw new BoxDurableJournalError("BOX_FAILED_STOP_EVIDENCE_INVALID"); }
-    const client = await this.pool.connect();
-    let committed = false;
-    try {
-      await client.query("BEGIN");
-      const lockedSessionId = await lockChainSession(client, input.uid, input.requestId);
-      type Row = { request_id: string; state: string; ctx: Record<string, unknown> };
-      const rows: Row[] = [];
-      const seen = new Set<string>();
-      let cursor: string | null = input.requestId;
-      while (cursor !== null) {
-        if (rows.length >= BOX_TOOL_MAX_ROUNDS || seen.has(cursor)) {
-          throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
-        }
-        seen.add(cursor);
-        const found: { rows: Row[]; rowCount: number | null } = await client.query<Row>(
-          `SELECT request_id,state,ctx FROM request_finalize_journal
-            WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
-          [cursor, input.uid.toString()]);
-        const row = found.rows[0];
-        if (found.rowCount !== 1 || !row?.ctx
-          || row.ctx.boxInvocationRecovery !== "v1"
-          || row.ctx.boxInvocationMode !== "detached_tool"
-          || row.ctx.boxRunNonce !== input.proof.runNonce
-          || row.ctx.boxLeaseEpoch !== input.leaseEpoch) {
-          throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
-        }
-        rows.push(row);
-        const parent: unknown = row.ctx.boxOwnerRequestId;
-        if (parent === undefined) cursor = null;
-        else if (typeof parent === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(parent)) cursor = parent;
-        else throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
-      }
-      const current = rows[0]!;
-      const basis = current.ctx;
-      const roundNo = basis.boxRoundNo;
-      const handoff = basis.boxToolHandoff === undefined ? null
-        : parseBoxStoredToolHandoff(basis.boxToolHandoff);
-      if (basis.boxToolHandoff !== undefined && !handoff) {
-        throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
-      }
-      if (rejectedStream && (handoff || current.state !== "inflight" && current.state !== "aborted"
-        || (current.state === "inflight" && !["linked", "unknown"].includes(String(basis.boxState))))) {
-        throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
-      }
-      if ((handoff ? ["inflight", "finalizing", "committed"].includes(current.state)
-        : current.state === "aborted") && basis.boxState === "failed_stopped"
-        && (basis.boxStopOutcome === "rejected_stream") === rejectedStream
-        && rows.length === roundNo && isDeepStrictEqual(basis.boxTerminalProof, input.proof)) {
-        await client.query("COMMIT"); committed = true; return;
-      }
-      if (!Number.isSafeInteger(roundNo) || Number(roundNo) < 2
-        || Number(roundNo) > BOX_TOOL_MAX_ROUNDS || rows.length !== roundNo
-        || basis.boxSessionId !== lockedSessionId
-        || (handoff
-          ? (!["inflight", "finalizing", "committed"].includes(current.state)
-            || !["handoff", "unknown"].includes(String(basis.boxState))
-            || handoff.roundNo !== roundNo
-            || typeof basis.boxHandoffRevision !== "string"
-            || !UUID_V4.test(basis.boxHandoffRevision)
-            || handoff.catalogHash !== basis.boxCatalogHash
-            || handoff.detachedRunnerHash !== basis.boxDetachedRunnerHash)
-          : (current.state !== "inflight"
-            || !["linked", "unknown"].includes(String(basis.boxState))))
-        || basis.boxResumeRequestId !== undefined
-        || typeof basis.boxAccountId !== "string"
-        || !/^[1-9][0-9]{0,19}$/.test(basis.boxAccountId)
-        || typeof basis.boxCatalogHash !== "string"
-        || !/^[a-f0-9]{64}$/.test(basis.boxCatalogHash)
-        || typeof basis.boxDetachedRunnerHash !== "string"
-        || !/^[a-f0-9]{64}$/.test(basis.boxDetachedRunnerHash)) {
-        throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
-      }
-      for (let i = 1; i < rows.length; i++) {
-        const child = rows[i - 1]!, parent = rows[i]!;
-        const ctx = parent.ctx;
-        const handoff = parseBoxStoredToolHandoff(ctx.boxToolHandoff);
-        if (!handoff || handoff.roundNo !== Number(roundNo) - i
-          || handoff.catalogHash !== basis.boxCatalogHash
-          || handoff.detachedRunnerHash !== basis.boxDetachedRunnerHash
-          || !["inflight", "finalizing", "committed"].includes(parent.state)
-          || !["resuming", "unknown"].includes(String(ctx.boxState))
-          || ctx.boxResumeRequestId !== child.request_id
-          || typeof ctx.boxResumeRevision !== "string"
-          || !UUID_V4.test(ctx.boxResumeRevision)
-          || typeof child.ctx.boxParentResumeRevision !== "string"
-          || !UUID_V4.test(child.ctx.boxParentResumeRevision)
-          || ctx.boxResumeRevision !== child.ctx.boxParentResumeRevision
-          || ctx.boxAccountId !== basis.boxAccountId
-          || ctx.boxSessionId !== basis.boxSessionId
-          || ctx.boxTurnKey !== basis.boxTurnKey
-          || ctx.model !== basis.model) {
-          throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
-        }
-      }
-      if (!handoff) {
-        const usage = await client.query(
-          `SELECT 1 FROM usage_records WHERE request_id=$1 AND user_id=$2 LIMIT 1`,
-          [current.request_id, input.uid.toString()]);
-        if (usage.rowCount) throw new BoxDurableJournalError("BOX_FAILED_STOP_USAGE_CONFLICT");
-      }
-      const stopParams = [current.request_id, input.uid.toString(), input.leaseEpoch,
-        JSON.stringify({ boxState: "failed_stopped", boxTerminalProof: input.proof,
-          boxStopOutcome: rejectedStream ? "rejected_stream" : "failed" }), input.proof.runNonce];
-      const stopped = handoff ? await client.query(
-        `UPDATE request_finalize_journal SET ctx=ctx || $4::jsonb
-          WHERE request_id=$1 AND user_id=$2
-            AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$5
-            AND ctx->>'boxState' IN ('handoff','unknown')
-            AND ctx ? 'boxToolHandoff' AND NOT (ctx ? 'boxResumeRequestId')
-            AND state IN ('inflight','finalizing','committed')`, stopParams)
-        : await client.query(
-          `UPDATE request_finalize_journal
-              SET state='aborted', failure_code='STREAM_FAILED', final_credits=0,
-                  error_msg=COALESCE(NULLIF(error_msg, ''), 'box_toolchain_stopped:' || COALESCE($4::jsonb#>>'{boxTerminalProof,reason}', 'failed')),
-                  ctx=ctx || $4::jsonb, updated_at=NOW()
-            WHERE request_id=$1 AND user_id=$2 AND state='inflight'
-              AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$5
-              AND ctx->>'boxState' IN ('linked','unknown')
-              AND NOT (ctx ? 'boxResumeRequestId')
-              AND NOT (ctx ? 'boxToolHandoff')`, stopParams);
-      if (stopped.rowCount !== 1) throw new BoxDurableJournalError("BOX_FAILED_STOP_FENCE_LOST");
-      for (const ancestor of rows.slice(1)) {
-        const changed = await client.query(
-          `UPDATE request_finalize_journal
-              SET ctx=ctx || '{"boxState":"failed_stopped","boxStopOutcome":"failed"}'::jsonb,
-                  updated_at=NOW()
-            WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxLeaseEpoch'=$3
-              AND ctx->>'boxState' IN ('resuming','unknown')
-              AND ctx ? 'boxToolHandoff'`,
-          [ancestor.request_id, input.uid.toString(), input.leaseEpoch]);
-        if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_FAILED_STOP_FENCE_LOST");
-      }
-      await client.query("COMMIT"); committed = true;
-    } finally {
-      if (!committed) await client.query("ROLLBACK").catch(() => {});
-      client.release();
-    }
+    return markBoxToolChainStoppedFailure(this.pool, input);
   }
 
   /** OCV5-313: close a run that cannot be alive any more and whose keeper
    * proof cannot be read (disabled or unreachable account, proof files gone).
    * Nothing is proven and nothing remote is touched: the leaf and its waiting
-   * ancestors only stop being unknown forever. The chain must pass every
-   * check of the proof-based closers for its round type; the proof is replaced
-   * by the leaf's own age. An unbilled leaf is aborted with no charge, a billed
-   * handoff keeps its settlement. apply=false runs the same locks, reads and
-   * updates and rolls back. `operatorClosed` additionally accepts the leaf the
-   * OCV5-312 operator close left in operator_unreachable_closed. */
+   * ancestors only stop being unknown forever. */
   async markRunExpiredUnproven(input: Pick<BoxJournalAdmission,
     "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch"> & {
     cause: string; operatorClosed?: true; apply?: boolean;
-    /** OCV5-488: instead of the age, the leaf's boxRunAbsent first look plus
-     * this second one (same boot id at least BOX_ABSENCE_CONFIRM_MS later, or
-     * another boot id) found nothing of the run on the Box. */
     absence?: { boot: string } }): Promise<BoxExpiredCloseResult> {
-    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
-      || input.accountId <= 0n || !/^[a-f0-9]{24}$/.test(input.runNonce)
-      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch) || !isBoxExpiredCloseCause(input.cause)
-      || (input.absence !== undefined && (input.cause !== BOX_PROCESS_ABSENT_CAUSE
-        || !isBoxBootId(input.absence.boot) || input.operatorClosed === true))) {
-      throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_IDENTITY_INVALID");
-    }
-    const uid = input.uid.toString(), accountId = input.accountId.toString();
-    const expirySec = BOX_RUN_EXPIRED_AFTER_MS / 1000;
-    const invalid = (): never => {
-      throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_CHAIN_INVALID");
-    };
-    const client = await this.pool.connect();
-    let finished = false;
-    try {
-      await client.query("BEGIN");
-      const lockedSessionId = await lockChainSession(client, input.uid, input.requestId);
-      type Row = { request_id: string; state: string; final_credits: string | null;
-        failure_code: string | null; expired: boolean; launched: boolean; now_ms: string;
-        ctx: Record<string, unknown> };
-      const rows: Row[] = [];
-      const seen = new Set<string>();
-      let cursor: string | null = input.requestId;
-      while (cursor !== null) {
-        if (rows.length >= BOX_TOOL_MAX_ROUNDS || seen.has(cursor)) invalid();
-        seen.add(cursor);
-        const found: { rows: Row[]; rowCount: number | null } = await client.query<Row>(
-          `SELECT request_id,state,final_credits::text AS final_credits,failure_code,ctx,
-              created_at <= NOW() - make_interval(secs => $3::double precision) AS expired,
-              created_at <= NOW() - make_interval(secs => $4::double precision) AS launched,
-              (EXTRACT(EPOCH FROM NOW())*1000)::bigint::text AS now_ms
-             FROM request_finalize_journal
-            WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
-          [cursor, uid, expirySec, BOX_ABSENCE_LAUNCH_GRACE_SEC]);
-        const row = found.rows[0];
-        if (found.rowCount !== 1 || !row?.ctx || row.ctx.boxInvocationRecovery !== "v1"
-          || !stoppedRunMode(row.ctx) || row.ctx.boxRunNonce !== input.runNonce
-          || row.ctx.boxLeaseEpoch !== input.leaseEpoch
-          || row.ctx.boxAccountId !== accountId) invalid();
-        rows.push(row!);
-        const parent: unknown = row!.ctx.boxOwnerRequestId;
-        if (parent === undefined) cursor = null;
-        else if (typeof parent === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(parent)) cursor = parent;
-        else invalid();
-      }
-      const leaf = rows[0]!, basis = leaf.ctx;
-      const linked = basis.boxOwnerRequestId !== undefined;
-      const handoff = basis.boxToolHandoff === undefined ? null
-        : parseBoxStoredToolHandoff(basis.boxToolHandoff);
-      if ((basis.boxToolHandoff !== undefined && !handoff) || basis.boxSessionId !== lockedSessionId) {
-        invalid();
-      }
-      if (basis.boxTerminalProof !== undefined || basis.boxResumeRequestId !== undefined
-        || basis.settlementClaimId !== undefined) {
-        throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_EVIDENCE_PRESENT");
-      }
-      const resumable = ["inflight", "finalizing", "committed"].includes(leaf.state);
-      const shape = handoff ? "billed_handoff" as const : "unbilled_leaf" as const;
-      const closed = parseBoxExpiredClose(basis.boxExpiredClose);
-      if (basis.boxState === BOX_EXPIRED_UNPROVEN_STATE) {
-        // Idempotent only for the complete end state this method writes, as
-        // judged by the same projection the idle proof uses.
-        const valid = validExpiredChainIds(rows.map((row) => ({ requestId: row.request_id,
-          state: row.state, ctx: row.ctx, finalCredits: row.final_credits,
-          failureCode: row.failure_code })));
-        if (!closed || rows.some((row) => !valid.has(row.request_id))) invalid();
-        await client.query("ROLLBACK"); finished = true;
-        return { action: "already_closed", shape, priorBoxState: closed!.priorBoxState,
-          ancestors: rows.length - 1 };
-      }
-      if (basis.boxExpiredClose !== undefined) invalid();
-      const actual = String(basis.boxState);
-      let prior = actual;
-      if (actual === BOX_OPERATOR_UNREACHABLE_CLOSED_STATE) {
-        const operatorPrior = parseBoxOperatorUnreachableClose(basis.boxOperatorUnreachableClose);
-        if (input.operatorClosed !== true || !operatorPrior) invalid();
-        prior = operatorPrior!;
-      } else if (basis.boxOperatorUnreachableClose !== undefined) invalid();
-      // The same leaf states the proof-based closers accept per round type.
-      const priorAllowed = handoff ? ["handoff", "unknown"]
-        : linked ? ["linked", "unknown"] : ["running", "unknown"];
-      if (!priorAllowed.includes(prior) || (handoff ? !resumable : leaf.state !== "inflight")
-        || (!handoff && leaf.final_credits !== null)) invalid();
-      if (linked) {
-        const roundNo = basis.boxRoundNo;
-        if (rows.some((row) => row.ctx.boxInvocationMode !== "detached_tool")
-          || !Number.isSafeInteger(roundNo) || Number(roundNo) < 2
-          || Number(roundNo) > BOX_TOOL_MAX_ROUNDS || rows.length !== roundNo
-          || (handoff && (handoff.roundNo !== roundNo
-            || typeof basis.boxHandoffRevision !== "string"
-            || !UUID_V4.test(basis.boxHandoffRevision)
-            || handoff.catalogHash !== basis.boxCatalogHash
-            || handoff.detachedRunnerHash !== basis.boxDetachedRunnerHash))
-          || typeof basis.boxCatalogHash !== "string"
-          || !/^[a-f0-9]{64}$/.test(basis.boxCatalogHash)
-          || typeof basis.boxDetachedRunnerHash !== "string"
-          || !/^[a-f0-9]{64}$/.test(basis.boxDetachedRunnerHash)) invalid();
-        for (let i = 1; i < rows.length; i++) {
-          const child = rows[i - 1]!, parent = rows[i]!, ctx = parent.ctx;
-          const stored = parseBoxStoredToolHandoff(ctx.boxToolHandoff);
-          if (!stored || stored.roundNo !== Number(roundNo) - i
-            || stored.catalogHash !== basis.boxCatalogHash
-            || stored.detachedRunnerHash !== basis.boxDetachedRunnerHash
-            || !["inflight", "finalizing", "committed"].includes(parent.state)
-            || !["resuming", "unknown"].includes(String(ctx.boxState))
-            // A proof anywhere in the chain belongs to the proof-based closers.
-            || ctx.boxTerminalProof !== undefined
-            || ctx.boxResumeRequestId !== child.request_id
-            || typeof ctx.boxResumeRevision !== "string"
-            || !UUID_V4.test(ctx.boxResumeRevision)
-            || typeof child.ctx.boxParentResumeRevision !== "string"
-            || !UUID_V4.test(child.ctx.boxParentResumeRevision)
-            || ctx.boxResumeRevision !== child.ctx.boxParentResumeRevision
-            || ctx.boxSessionId !== basis.boxSessionId
-            || ctx.boxTurnKey !== basis.boxTurnKey
-            || ctx.model !== basis.model) invalid();
-        }
-      } else if (rows.length !== 1 || (handoff && (handoff.roundNo !== 1
-        || basis.boxInvocationMode !== "detached_tool"
-        || typeof basis.boxHandoffRevision !== "string"
-        || !UUID_V4.test(basis.boxHandoffRevision)))) invalid();
-      if (input.absence) {
-        const seen = parseBoxRunAbsent(basis.boxRunAbsent);
-        if (!leaf.launched || !seen || (seen.boot === input.absence.boot
-          && Number(leaf.now_ms) - seen.atMs < BOX_ABSENCE_CONFIRM_MS)) {
-          throw new BoxDurableJournalError("BOX_ABSENT_CLOSE_NOT_CONFIRMED");
-        }
-        // Calls the run completed before it vanished are settled first: the
-        // Box billing scan does not read expired rows. Nothing here bills.
-        if (rows.some((row) => row.ctx.boxToolHandoff !== undefined && row.state !== "committed")) {
-          throw new BoxDurableJournalError("BOX_ABSENT_CLOSE_BILLING_UNSETTLED");
-        }
-      } else if (!leaf.expired) throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_RUN_NOT_EXPIRED");
-      if (!handoff) {
-        const usage = await client.query(
-          `SELECT 1 FROM usage_records WHERE request_id=$1 AND user_id=$2 LIMIT 1`,
-          [leaf.request_id, uid]);
-        if (usage.rowCount) throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_USAGE_CONFLICT");
-      }
-      const params = [leaf.request_id, uid, input.leaseEpoch, input.runNonce, actual,
-        BOX_EXPIRED_UNPROVEN_STATE, prior, input.cause,
-        input.absence ? BOX_ABSENCE_LAUNCH_GRACE_SEC : expirySec];
-      const marker = `ctx || jsonb_build_object('boxState',$6::text,
-              'boxExpiredClose',jsonb_build_object('v',1,
-                'atMs',(EXTRACT(EPOCH FROM NOW())*1000)::bigint,
-                'priorBoxState',$7::text,'cause',$8::text))`;
-      const fence = `request_id=$1 AND user_id=$2
-            AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxState'=$5
-            AND NOT (ctx ? 'boxTerminalProof') AND NOT (ctx ? 'boxResumeRequestId')
-            AND NOT (ctx ? 'settlementClaimId') AND NOT (ctx ? 'boxExpiredClose')${
-              input.absence ? "\n            AND ctx ? 'boxRunAbsent'" : ""}
-            AND created_at <= NOW() - make_interval(secs => $9::double precision)`;
-      const changed = handoff ? await client.query(
-        `UPDATE request_finalize_journal SET ctx=${marker}
-          WHERE ${fence} AND ctx ? 'boxToolHandoff'
-            AND state IN ('inflight','finalizing','committed')`, params)
-        : await client.query(
-          `UPDATE request_finalize_journal
-              SET state='aborted', failure_code='STREAM_FAILED', final_credits=0,
-                  error_msg=COALESCE(NULLIF(error_msg, ''), 'box_expired_unproven:' || COALESCE($8::text, 'expired')),
-                  ctx=${marker}, updated_at=NOW()
-            WHERE ${fence} AND NOT (ctx ? 'boxToolHandoff')
-              AND state='inflight' AND final_credits IS NULL`, params);
-      if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_FENCE_LOST");
-      for (const ancestor of rows.slice(1)) {
-        const moved = await client.query(
-          `UPDATE request_finalize_journal
-              SET ctx=ctx || jsonb_build_object('boxState',$4::text), updated_at=NOW()
-            WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxLeaseEpoch'=$3
-              AND ctx->>'boxState' IN ('resuming','unknown')
-              AND ctx ? 'boxToolHandoff' AND NOT (ctx ? 'boxTerminalProof')`,
-          [ancestor.request_id, uid, input.leaseEpoch, BOX_EXPIRED_UNPROVEN_STATE]);
-        if (moved.rowCount !== 1) throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_FENCE_LOST");
-      }
-      const apply = input.apply !== false;
-      await client.query(apply ? "COMMIT" : "ROLLBACK"); finished = true;
-      return { action: apply ? "closed" : "would_close", shape, priorBoxState: prior,
-        ancestors: rows.length - 1 };
-    } finally {
-      if (!finished) await client.query("ROLLBACK").catch(() => {});
-      client.release();
-    }
+    return markBoxRunExpiredUnproven(this.pool, input);
   }
 
   /** Bounded, shared-leader discovery only. These rows are unknown until a
    * pinned Box read returns a valid terminal marker; no paid call is retried. */
   async listStoppedFailureProbeCandidates(limit = 10): Promise<BoxStoppedFailureProbeCandidate[]> {
-    const found = await this.pool.query<{ request_id: string; user_id: string;
-      state: string; unknown_for_ms: string; expired: boolean; owner_gone: boolean;
-      ctx: Record<string, unknown> }>(
-      `SELECT request_id,user_id::text,state,ctx,
-          GREATEST(0,(EXTRACT(EPOCH FROM (NOW()-updated_at))*1000))::bigint::text AS unknown_for_ms,
-          created_at <= NOW() - make_interval(secs => $2::double precision) AS expired,
-          ${OWNER_CONTAINER_GONE} AS owner_gone
-        FROM request_finalize_journal
-        WHERE ${STOP_PROBE_STATE_FENCE} AND ctx->>'boxInvocationRecovery'='v1'
-          AND ${STOP_MODE_FENCE}
-          AND request_id ~ '^[A-Za-z0-9_-]{1,64}$' AND user_id>0
-          AND jsonb_typeof(ctx->'boxAccountId')='string'
-          AND ctx->>'boxAccountId' ~ '^[1-9][0-9]{0,19}$'
-          AND jsonb_typeof(ctx->'boxRunNonce')='string'
-          AND ctx->>'boxRunNonce' ~ '^[a-f0-9]{24}$'
-          AND jsonb_typeof(ctx->'boxLeaseEpoch')='string'
-          AND ctx->>'boxLeaseEpoch' ~ '^[a-f0-9]{32}$'
-          AND (NOT (ctx ? 'boxOwnerRequestId')
-            OR (jsonb_typeof(ctx->'boxOwnerRequestId')='string'
-              AND ctx->>'boxOwnerRequestId' ~ '^[A-Za-z0-9_-]{1,64}$'))
-          AND NOT (ctx ? 'boxResumeRequestId')
-          AND NOT (ctx ? 'boxTerminalProof')
-          AND (NOT (ctx ? 'boxStopProbeAfterMs')
-            OR (jsonb_typeof(ctx->'boxStopProbeAfterMs')='number'
-              AND (ctx->>'boxStopProbeAfterMs') ~ '^[0-9]{13}$'
-              AND (ctx->>'boxStopProbeAfterMs')::bigint
-                <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint))
-        ORDER BY CASE WHEN jsonb_typeof(ctx->'boxStopProbeLastAttemptMs')='number'
-            AND (ctx->>'boxStopProbeLastAttemptMs') ~ '^[0-9]{13}$'
-          THEN (ctx->>'boxStopProbeLastAttemptMs')::bigint ELSE 0 END ASC,
-          updated_at ASC LIMIT $1`,
-      [Math.max(1, Math.min(20, Number.isSafeInteger(limit) ? limit : 10)),
-        BOX_RUN_EXPIRED_AFTER_MS / 1000]);
+    const found = await selectStoppedFailureProbeCandidateRows(this.pool, {
+      limit: Math.max(1, Math.min(20, Number.isSafeInteger(limit) ? limit : 10)),
+      expiredAfterSec: BOX_RUN_EXPIRED_AFTER_MS / 1000,
+    });
     const candidates: BoxStoppedFailureProbeCandidate[] = [];
-    for (const row of found.rows) {
+    for (const row of found) {
       const ctx = row.ctx;
       if (!ctx || !/^[A-Za-z0-9_-]{1,64}$/.test(row.request_id)
         || !/^[1-9][0-9]{0,19}$/.test(row.user_id)
@@ -2820,22 +2005,10 @@ export class BoxDurableJournal implements BoxJournalPort {
       || !/^[a-f0-9]{32}$/.test(input.leaseEpoch) || !isBoxUnknownPhase(input.phase)) {
       throw new BoxDurableJournalError("BOX_STALE_RESUME_IDENTITY_INVALID");
     }
-    const changed = await this.pool.query(
-      `UPDATE request_finalize_journal
-          SET ctx=ctx || jsonb_build_object('boxStaleResumeStop',
-            COALESCE(ctx->'boxStaleResumeStop', jsonb_build_object('phase',$6::text,
-              'atMs',(EXTRACT(EPOCH FROM NOW())*1000)::bigint)))
-        WHERE request_id=$1 AND user_id=$2 AND state='inflight'
-          AND ctx->>'boxInvocationRecovery'='v1'
-          AND ctx->>'boxInvocationMode'='detached_tool'
-          AND ctx->>'boxState'='unknown' AND ctx->>'boxUnknownPhase'=$6
-          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
-          AND ctx->>'boxLeaseEpoch'=$5
-          AND NOT (ctx ? 'boxToolHandoff') AND NOT (ctx ? 'boxTerminalProof')
-          AND NOT (ctx ? 'boxResumeRequestId')`,
-      [input.requestId, input.uid.toString(), input.accountId.toString(),
-        input.runNonce, input.leaseEpoch, input.phase]);
-    return changed.rowCount === 1;
+    return updateRecordStaleResumeStop(this.pool, {
+      requestId: input.requestId, uid: input.uid, accountId: input.accountId,
+      runNonce: input.runNonce, leaseEpoch: input.leaseEpoch, phase: input.phase,
+    });
   }
 
   /** Cross-worker CAS with a durable retry clock; never changes billing age. */
@@ -2845,35 +2018,10 @@ export class BoxDurableJournal implements BoxJournalPort {
       || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)) {
       throw new BoxDurableJournalError("BOX_STOP_PROBE_IDENTITY_INVALID");
     }
-    const changed = await this.pool.query(
-      `UPDATE request_finalize_journal
-          SET ctx=ctx || jsonb_build_object(
-            'boxStopProbeLastAttemptMs',(EXTRACT(EPOCH FROM NOW())*1000)::bigint,
-            'boxStopProbeAfterMs',
-              (EXTRACT(EPOCH FROM NOW()+INTERVAL '2 minutes')*1000)::bigint)
-        WHERE request_id=$1 AND user_id=$2 AND ${STOP_PROBE_STATE_FENCE}
-          AND ctx->>'boxInvocationRecovery'='v1'
-          AND ${STOP_MODE_FENCE}
-          AND jsonb_typeof(ctx->'boxAccountId')='string'
-          AND jsonb_typeof(ctx->'boxRunNonce')='string'
-          AND jsonb_typeof(ctx->'boxLeaseEpoch')='string'
-          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
-          AND ctx->>'boxLeaseEpoch'=$5
-          AND NOT (ctx ? 'boxResumeRequestId')
-          AND NOT (ctx ? 'boxTerminalProof')
-          AND (NOT (ctx ? 'boxOwnerRequestId')
-            OR (jsonb_typeof(ctx->'boxOwnerRequestId')='string'
-              AND ctx->>'boxOwnerRequestId' ~ '^[A-Za-z0-9_-]{1,64}$'))
-          AND (($6::boolean AND ctx->>'boxOwnerRequestId' IS NOT NULL)
-            OR (NOT $6::boolean AND NOT (ctx ? 'boxOwnerRequestId')))
-          AND (NOT (ctx ? 'boxStopProbeAfterMs')
-            OR (jsonb_typeof(ctx->'boxStopProbeAfterMs')='number'
-              AND (ctx->>'boxStopProbeAfterMs') ~ '^[0-9]{13}$'
-              AND (ctx->>'boxStopProbeAfterMs')::bigint
-                <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint))`,
-      [input.requestId, input.uid.toString(), input.accountId.toString(),
-        input.runNonce, input.leaseEpoch, input.linked]);
-    return changed.rowCount === 1;
+    return updateClaimStoppedFailureProbe(this.pool, {
+      requestId: input.requestId, uid: input.uid, accountId: input.accountId,
+      runNonce: input.runNonce, leaseEpoch: input.leaseEpoch, linked: input.linked,
+    });
   }
 
   /** Read-only chain evidence for one already selected unknown leaf.
@@ -3045,20 +2193,8 @@ export class BoxDurableJournal implements BoxJournalPort {
       || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)) {
       throw new BoxDurableJournalError("BOX_CANCEL_IDENTITY_INVALID");
     }
-    const found = await this.pool.query<{ request_id: string; user_id: string;
-      ctx: Record<string, unknown> }>(
-      `SELECT request_id,user_id::text,ctx FROM request_finalize_journal
-        WHERE user_id=$1 AND ctx->>'boxAccountId'=$2
-          AND ctx->>'boxRunNonce'=$3 AND ctx->>'boxLeaseEpoch'=$4
-          AND ctx->>'boxInvocationRecovery'='v1'
-          AND ${STOP_MODE_FENCE}
-          AND ${STOP_PROBE_STATE_FENCE}
-          AND NOT (ctx ? 'boxResumeRequestId')
-          AND NOT (ctx ? 'boxTerminalProof')
-          AND ctx ? 'boxCancelIntent'`,
-      [input.uid.toString(), input.accountId.toString(), input.runNonce,
-        input.leaseEpoch]);
-    const row = found.rows[0], ctx = row?.ctx;
+    const found = await selectCancelLeafRow(this.pool, input);
+    const row = found.row, ctx = row?.ctx;
     if (found.rowCount !== 1 || !row || !ctx
       || !/^[A-Za-z0-9_-]{1,64}$/.test(row.request_id)
       || typeof ctx.boxAccountId !== "string"
@@ -3088,19 +2224,8 @@ export class BoxDurableJournal implements BoxJournalPort {
       || !/^[a-f0-9]{64}$/.test(input.turnKey)) {
       throw new BoxDurableJournalError("BOX_CANCEL_IDENTITY_INVALID");
     }
-    const found = await this.pool.query<{ request_id: string; ctx: Record<string, unknown> }>(
-      `SELECT request_id,ctx FROM request_finalize_journal
-        WHERE user_id=$1 AND container_id=$2
-          AND ctx->>'boxSessionId'=$3 AND ctx->>'boxTurnKey'=$4
-          AND ctx->>'model' IN (${BOX_MODEL_IDS_SQL})
-          AND ctx->>'boxInvocationRecovery'='v1'
-          AND ${STOP_MODE_FENCE}
-          AND ${STOP_PROBE_STATE_FENCE}
-          AND NOT (ctx ? 'boxResumeRequestId')
-          AND NOT (ctx ? 'boxTerminalProof')`,
-      [input.uid.toString(), input.containerId.toString(),
-        input.sessionId, input.turnKey]);
-    const row = found.rows[0], ctx = row?.ctx;
+    const found = await selectCancelableRunRow(this.pool, input);
+    const row = found.row, ctx = row?.ctx;
     if (found.rowCount !== 1 || !row || !ctx
       || !/^[A-Za-z0-9_-]{1,64}$/.test(row.request_id)
       || typeof ctx.boxAccountId !== "string"
@@ -3128,58 +2253,38 @@ export class BoxDurableJournal implements BoxJournalPort {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
-      type IdleRow = { request_id: string; state: string; final_credits: string | null;
-        failure_code: string | null; ctx: Record<string, unknown> };
-      const idleRow = (row: IdleRow): IdleChainRow => ({ requestId: row.request_id,
+      const idleRow = (row: BoxIdleQueryRow): IdleChainRow => ({ requestId: row.request_id,
         state: row.state, ctx: row.ctx, finalCredits: row.final_credits,
         failureCode: row.failure_code });
-      const found = await client.query<IdleRow>(
-        `SELECT current_row.request_id,current_row.state,current_row.final_credits::text AS final_credits,current_row.failure_code,current_row.ctx
-           FROM request_finalize_journal current_row
-          WHERE user_id=$1 AND container_id=$2
-            AND ctx->>'boxSessionId'=$3 AND ctx->>'boxTurnKey'=$4
-            AND ctx->>'model' IN (${BOX_MODEL_IDS_SQL})
-            AND ctx->>'boxInvocationRecovery'='v1'
-            AND NOT ${retiredToolRolloverSql("current_row")}
-            AND NOT ${supersededUnsentResumeSql("current_row")} LIMIT 129`,
-        [input.uid.toString(), input.containerId.toString(), input.sessionId, input.turnKey]);
-      const open = await client.query<{ request_id: string }>(
-        `SELECT request_id FROM request_finalize_journal
-          WHERE user_id=$1 AND container_id=$2
-            AND ctx->>'boxSessionId'=$3
-            AND ctx->>'boxInvocationRecovery'='v1'
-            AND (
-              COALESCE(ctx->>'boxState','') NOT IN ('terminal','failed_stopped','prestart_stopped')
-              OR (ctx->>'boxState'='terminal' AND state <> 'committed')
-              -- A prestart stop is closed only under its own fence (never launched).
-              OR (ctx->>'boxState'='prestart_stopped' AND ctx ? 'boxLaunchPermit')
-            )`,
-        [input.uid.toString(), input.containerId.toString(), input.sessionId]);
+      const foundRows = await selectIdleProofTurnRows(client, {
+        uid: input.uid, containerId: input.containerId,
+        sessionId: input.sessionId, turnKey: input.turnKey,
+        retiredRolloverSql: retiredToolRolloverSql("current_row"),
+        supersededUnsentSql: supersededUnsentResumeSql("current_row"),
+      });
+      const openRows = await selectIdleProofOpenRows(client, {
+        uid: input.uid, containerId: input.containerId, sessionId: input.sessionId,
+      });
       // OCV5-313: a run closed as expired_unproven stops holding the session,
       // but only as a whole, structurally valid chain (exact marker, linkage,
       // identity). The state name alone releases nothing.
-      const expired = await client.query<IdleRow>(
-        `SELECT request_id,state,final_credits::text AS final_credits,failure_code,ctx
-           FROM request_finalize_journal
-          WHERE user_id=$1 AND container_id=$2
-            AND ctx->>'boxSessionId'=$3
-            AND ctx->>'boxInvocationRecovery'='v1'
-            AND ctx->>'boxState'=$4`,
-        [input.uid.toString(), input.containerId.toString(), input.sessionId,
-          BOX_EXPIRED_UNPROVEN_STATE]);
+      const expiredRows = await selectIdleProofExpiredRows(client, {
+        uid: input.uid, containerId: input.containerId, sessionId: input.sessionId,
+        expiredState: BOX_EXPIRED_UNPROVEN_STATE,
+      });
       await client.query("COMMIT");
-      const released = validExpiredChainIds(expired.rows.map(idleRow));
-      const rows: IdleChainRow[] = found.rows.map(idleRow);
+      const released = validExpiredChainIds(expiredRows.map(idleRow));
+      const rows: IdleChainRow[] = foundRows.map(idleRow);
       const proof = projectBoxIdleChain({
         sessionId: input.sessionId,
         turnKey: input.turnKey,
         rows,
-        otherOpenRequestIds: open.rows.map((row) => row.request_id)
+        otherOpenRequestIds: openRows.map((row) => row.request_id)
           .filter((id) => !released.has(id)),
       });
       if (!readCapsule) return proof;
       if (proof.status === "terminal") {
-        const leaf = found.rows.find((row) => row.request_id === proof.requestId);
+        const leaf = foundRows.find((row) => row.request_id === proof.requestId);
         return withVerifiedCapsule(proof, leaf?.ctx.boxReplayMessage, readCapsule);
       }
       if (proof.status !== "terminal_set") return proof;
@@ -3213,22 +2318,11 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
       throw new BoxDurableJournalError("BOX_PRELAUNCH_LIMIT_INVALID");
     }
-    const found = await this.pool.query<{ request_id: string; user_id: string;
-      ctx: Record<string, unknown> }>(
-      `SELECT request_id,user_id,ctx FROM request_finalize_journal
-        WHERE state='inflight' AND ctx->>'boxInvocationMode'='detached_tool'
-          AND ctx ? 'boxPrelaunchControl' AND NOT (ctx ? 'boxLaunchPermit')
-          AND NOT (ctx ? 'boxTerminalProof')
-          AND NOT (ctx ? 'boxPrelaunchRecoveryQuarantine')
-          AND ((ctx->>'boxState'='unknown') OR
-            (ctx->>'boxState'='reserved' AND updated_at < NOW() - INTERVAL '16 minutes'))
-          AND (NOT (ctx ? 'boxPrelaunchRetryAfterMs') OR
-            (jsonb_typeof(ctx->'boxPrelaunchRetryAfterMs')='number'
-             AND (ctx->>'boxPrelaunchRetryAfterMs') ~ '^[0-9]{13}$'
-             AND (ctx->>'boxPrelaunchRetryAfterMs')::bigint <= $2))
-        ORDER BY updated_at ASC LIMIT $1`, [limit, Date.now()]);
+    const found = await selectPrelaunchRecoveryCandidateRows(this.pool, {
+      limit, nowMs: Date.now(),
+    });
     const out: BoxPrelaunchRecoveryCandidate[] = [];
-    for (const row of found.rows) {
+    for (const row of found) {
       const ctx = row.ctx;
       try {
         const uid = BigInt(row.user_id);
@@ -3250,14 +2344,9 @@ export class BoxDurableJournal implements BoxJournalPort {
           runNonce: receipt.runNonce, leaseEpoch: receipt.leaseEpoch, receipt });
       } catch {
         // A malformed row is held, not promoted or retried on every tick.
-        await this.pool.query(
-          `UPDATE request_finalize_journal
-             SET ctx=ctx || '{"boxPrelaunchRecoveryQuarantine":"invalid_evidence"}'::jsonb
-           WHERE request_id=$1 AND user_id=$2 AND state='inflight'
-             AND ctx->>'boxInvocationMode'='detached_tool'
-             AND ctx ? 'boxPrelaunchControl' AND NOT (ctx ? 'boxLaunchPermit')
-             AND NOT (ctx ? 'boxPrelaunchRecoveryQuarantine')`,
-          [row.request_id, row.user_id]);
+        await updateQuarantinePrelaunchRecovery(this.pool, {
+          requestId: row.request_id, userId: row.user_id,
+        });
       }
     }
     return out;
@@ -3268,67 +2357,27 @@ export class BoxDurableJournal implements BoxJournalPort {
   async claimPrelaunchRecovery(input: BoxPrelaunchRecoveryCandidate): Promise<boolean> {
     this.validatePrelaunchReceipt(input);
     const now = Date.now();
-    const changed = await this.pool.query(
-      `UPDATE request_finalize_journal
-          SET ctx=ctx || $7::jsonb, updated_at=NOW()
-        WHERE request_id=$1 AND user_id=$2 AND state='inflight'
-          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
-          AND ctx->>'boxLeaseEpoch'=$5
-          AND ctx->>'boxInvocationMode'='detached_tool'
-          AND ctx->'boxPrelaunchControl'=$6::jsonb
-          AND NOT (ctx ? 'boxLaunchPermit') AND NOT (ctx ? 'boxTerminalProof')
-          AND NOT (ctx ? 'boxPrelaunchRecoveryQuarantine')
-          AND ((ctx->>'boxState'='unknown') OR
-            (ctx->>'boxState'='reserved' AND updated_at < NOW() - INTERVAL '16 minutes'))
-          AND (NOT (ctx ? 'boxPrelaunchRetryAfterMs') OR
-            (jsonb_typeof(ctx->'boxPrelaunchRetryAfterMs')='number'
-             AND (ctx->>'boxPrelaunchRetryAfterMs') ~ '^[0-9]{13}$'
-             AND (ctx->>'boxPrelaunchRetryAfterMs')::bigint <= $8))`,
-      [input.requestId, input.uid.toString(), input.accountId.toString(),
-        input.runNonce, input.leaseEpoch, JSON.stringify(input.receipt),
-        JSON.stringify({ boxState: "unknown", boxPrelaunchLastAttemptMs: now,
-          boxPrelaunchRetryAfterMs: now + 60_000 }), now]);
-    return changed.rowCount === 1;
+    return updateClaimPrelaunchRecovery(this.pool, {
+      requestId: input.requestId, uid: input.uid, accountId: input.accountId,
+      runNonce: input.runNonce, leaseEpoch: input.leaseEpoch,
+      receiptJson: JSON.stringify(input.receipt),
+      patchJson: JSON.stringify({ boxState: "unknown", boxPrelaunchLastAttemptMs: now,
+        boxPrelaunchRetryAfterMs: now + 60_000 }),
+      nowMs: now,
+    });
   }
 
   async listRemoteCleanupCandidates(limit = 10): Promise<BoxRemoteCleanupCandidate[]> {
-    const found = await this.pool.query<{ request_id: string; user_id: string;
-      ctx: Record<string, unknown> }>(
-      `SELECT request_id,user_id::text,ctx FROM request_finalize_journal
-        WHERE ctx->>'boxInvocationRecovery'='v1'
-          AND ${CLEANUP_MODE_FENCE}
-           AND ${CLEANUP_STATE_FENCE} AND ctx ? 'boxTerminalProof'
-           AND ${CLEANUP_REPLAY_FENCE}
-           AND ${CLEANUP_NATIVE_POINTER_GRACE}
-          AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
-          AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
-           AND (ctx->>'boxRemoteCleanupClaimed' IS DISTINCT FROM 'true'
-             OR (jsonb_typeof(ctx->'boxRemoteCleanupRetryAfterMs')='number'
-               AND (ctx->>'boxRemoteCleanupRetryAfterMs') ~ '^[0-9]{13}$'
-               AND (ctx->>'boxRemoteCleanupRetryAfterMs')::bigint
-                 <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint)
-             OR (NOT (ctx ? 'boxRemoteCleanupRetryAfterMs')
-               AND updated_at <= NOW()-INTERVAL '2 minutes'))
-         ORDER BY CASE WHEN jsonb_typeof(ctx->'boxRemoteCleanupLastAttemptMs')='number'
-             AND (ctx->>'boxRemoteCleanupLastAttemptMs') ~ '^[0-9]{13}$'
-           THEN (ctx->>'boxRemoteCleanupLastAttemptMs')::bigint ELSE 0 END ASC,
-           updated_at ASC LIMIT $1`,
-      [Math.max(1, Math.min(20, Number.isSafeInteger(limit) ? limit : 10))]);
+    const found = await selectRemoteCleanupCandidateRows(
+      this.pool, Math.max(1, Math.min(20, Number.isSafeInteger(limit) ? limit : 10)));
     const candidates: BoxRemoteCleanupCandidate[] = [];
-    for (const row of found.rows) {
+    for (const row of found) {
       const ctx = row.ctx;
       const quarantine = async (): Promise<void> => {
-        await this.pool.query(
-          `UPDATE request_finalize_journal
-              SET ctx=ctx || '{"boxRemoteCleanupQuarantine":"invalid_evidence"}'::jsonb
-            WHERE request_id=$1 AND user_id=$2
-              AND ctx->'boxTerminalProof'=$3::jsonb
-              AND ctx->>'boxInvocationRecovery'='v1'
-              AND ${CLEANUP_MODE_FENCE}
-              AND ${CLEANUP_STATE_FENCE} AND ctx ? 'boxTerminalProof'
-              AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
-              AND NOT (ctx ? 'boxRemoteCleanupQuarantine')`,
-          [row.request_id, row.user_id, JSON.stringify(ctx?.boxTerminalProof)]);
+        await updateQuarantineRemoteCleanup(this.pool, {
+          requestId: row.request_id, userId: row.user_id,
+          terminalProofJson: JSON.stringify(ctx?.boxTerminalProof),
+        });
       };
       if (!ctx || typeof ctx.boxRunNonce !== "string"
         || !/^[a-f0-9]{24}$/.test(ctx.boxRunNonce)
@@ -3375,37 +2424,12 @@ export class BoxDurableJournal implements BoxJournalPort {
       || input.nativePointer.accountId !== input.accountId.toString())) {
       throw new BoxDurableJournalError("BOX_CLEANUP_IDENTITY_INVALID");
     }
-    const changed = await this.pool.query(
-      `UPDATE request_finalize_journal
-          SET ctx=ctx || jsonb_build_object(
-             'boxRemoteCleanupClaimed',true,
-             'boxRemoteCleanupLastAttemptMs',
-               (EXTRACT(EPOCH FROM NOW())*1000)::bigint,
-             'boxRemoteCleanupRetryAfterMs',
-              (EXTRACT(EPOCH FROM NOW()+INTERVAL '2 minutes')*1000)::bigint)
-        WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
-          AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
-          AND ${CLEANUP_MODE_FENCE}
-           AND ${CLEANUP_PROOF_FENCE} AND ctx ? 'boxTerminalProof'
-           AND ${CLEANUP_REPLAY_FENCE}
-           AND ${CLEANUP_NATIVE_POINTER_GRACE}
-          AND ctx->'boxTerminalProof'->>'runNonce'=$4
-          AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
-           AND ctx->'boxTerminalProof'=$6::jsonb
-           AND ctx->'boxNativePointer' IS NOT DISTINCT FROM $7::jsonb
-          AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
-          AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
-           AND (ctx->>'boxRemoteCleanupClaimed' IS DISTINCT FROM 'true'
-             OR (jsonb_typeof(ctx->'boxRemoteCleanupRetryAfterMs')='number'
-               AND (ctx->>'boxRemoteCleanupRetryAfterMs') ~ '^[0-9]{13}$'
-               AND (ctx->>'boxRemoteCleanupRetryAfterMs')::bigint
-                 <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint)
-             OR (NOT (ctx ? 'boxRemoteCleanupRetryAfterMs')
-               AND updated_at <= NOW()-INTERVAL '2 minutes'))`,
-      [input.requestId, input.uid.toString(), input.accountId.toString(),
-        input.runNonce, input.leaseEpoch, JSON.stringify(input.proof),
-        input.nativePointer ? JSON.stringify(input.nativePointer) : null]);
-    return changed.rowCount === 1;
+    return updateClaimRemoteCleanup(this.pool, {
+      requestId: input.requestId, uid: input.uid, accountId: input.accountId,
+      runNonce: input.runNonce, leaseEpoch: input.leaseEpoch,
+      proofJson: JSON.stringify(input.proof),
+      nativePointerJson: input.nativePointer ? JSON.stringify(input.nativePointer) : null,
+    });
   }
 
   /** A losing worker may close only its local ProxyAgent after another worker
@@ -3414,17 +2438,13 @@ export class BoxDurableJournal implements BoxJournalPort {
     try {
       parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", input);
     } catch { return "invalid"; }
-    const found = await this.pool.query<{ status: string | null }>(
-      `SELECT ctx->>'boxRemoteCleanup' AS status FROM request_finalize_journal
-        WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
-          AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
-          AND ${CLEANUP_MODE_FENCE}
-          AND ${CLEANUP_PROOF_FENCE} AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
-          AND ctx->'boxTerminalProof'=$6::jsonb`,
-      [input.requestId, input.uid.toString(), input.accountId.toString(),
-        input.runNonce, input.leaseEpoch, JSON.stringify(input.proof)]);
+    const found = await selectRemoteCleanupStatusRow(this.pool, {
+      requestId: input.requestId, uid: input.uid, accountId: input.accountId,
+      runNonce: input.runNonce, leaseEpoch: input.leaseEpoch,
+      proofJson: JSON.stringify(input.proof),
+    });
     if (found.rowCount !== 1) return "invalid";
-    return found.rows[0]?.status === "done" ? "done" : "pending";
+    return found.status === "done" ? "done" : "pending";
   }
 
   /** The original egress may still own a local ProxyAgent after the shared
@@ -3435,17 +2455,8 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (input.uid <= 0n || input.accountId <= 0n
       || !/^[a-f0-9]{24}$/.test(input.runNonce)
       || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)) return false;
-    const found = await this.pool.query<{ ctx: Record<string, unknown> }>(
-      `SELECT ctx FROM request_finalize_journal
-        WHERE user_id=$1 AND ctx->>'boxAccountId'=$2
-          AND ctx->>'boxRunNonce'=$3 AND ctx->>'boxLeaseEpoch'=$4
-          AND ctx->>'boxInvocationRecovery'='v1'
-          AND ${CLEANUP_MODE_FENCE}
-          AND ctx->>'boxRemoteCleanup'='done'
-          AND ${CLEANUP_PROOF_FENCE}`,
-      [input.uid.toString(), input.accountId.toString(),
-        input.runNonce, input.leaseEpoch]);
-    const ctx = found.rows[0]?.ctx;
+    const found = await selectRemoteCleanupDoneRow(this.pool, input);
+    const ctx = found.ctx;
     if (found.rowCount !== 1 || !ctx) return false;
     try {
       const proof = parseBoxTerminalProof(JSON.stringify(ctx.boxTerminalProof) + "\n",
@@ -3461,18 +2472,8 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (input.uid <= 0n || input.accountId <= 0n
       || !/^[a-f0-9]{24}$/.test(input.runNonce)
       || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)) return false;
-    const found = await this.pool.query<{ ctx: Record<string, unknown> }>(
-      `SELECT ctx FROM request_finalize_journal
-        WHERE user_id=$1 AND ctx->>'boxAccountId'=$2
-          AND ctx->>'boxRunNonce'=$3 AND ctx->>'boxLeaseEpoch'=$4
-          AND ctx->>'boxInvocationRecovery'='v1'
-          AND ctx->>'boxInvocationMode'='detached_tool'
-          AND ctx->>'boxState'='prestart_stopped'
-          AND ctx ? 'boxPrelaunchControl' AND ctx ? 'boxPrelaunchCleanup'
-          AND NOT (ctx ? 'boxLaunchPermit')`,
-      [input.uid.toString(), input.accountId.toString(),
-        input.runNonce, input.leaseEpoch]);
-    const ctx = found.rows[0]?.ctx;
+    const found = await selectPrelaunchCleanupDoneRow(this.pool, input);
+    const ctx = found.ctx;
     if (found.rowCount !== 1 || !ctx) return false;
     try {
       const receipt = ctx.boxPrelaunchControl as BoxPrelaunchReceipt;
@@ -3502,35 +2503,15 @@ export class BoxDurableJournal implements BoxJournalPort {
       || input.nativePointer.accountId !== input.accountId.toString())) {
       throw new BoxDurableJournalError("BOX_CLEANUP_IDENTITY_INVALID");
     }
-    const params = [input.requestId, input.uid.toString(), input.accountId.toString(),
-      input.runNonce, input.leaseEpoch, JSON.stringify(input.proof),
-      input.nativePointer ? JSON.stringify(input.nativePointer) : null];
-    const changed = await this.pool.query(
-      `UPDATE request_finalize_journal
-          SET ctx=ctx || '{"boxRemoteCleanup":"done"}'::jsonb
-        WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
-          AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
-          AND ${CLEANUP_PROOF_FENCE} AND ctx ? 'boxTerminalProof'
-          AND ${CLEANUP_MODE_FENCE}
-          AND ctx->'boxTerminalProof'->>'runNonce'=$4
-          AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
-          AND ctx->'boxTerminalProof'=$6::jsonb
-          AND ctx->'boxNativePointer' IS NOT DISTINCT FROM $7::jsonb
-          AND ctx->>'boxRemoteCleanupClaimed'='true'
-          AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
-          AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'`, params);
-    if (changed.rowCount === 1) return;
-    const already = await this.pool.query(
-      `SELECT 1 FROM request_finalize_journal
-        WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
-          AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
-          AND ${CLEANUP_PROOF_FENCE} AND ctx ? 'boxTerminalProof'
-          AND ${CLEANUP_MODE_FENCE}
-          AND ctx->'boxTerminalProof'->>'runNonce'=$4
-          AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
-          AND ctx->'boxTerminalProof'=$6::jsonb
-          AND ctx->'boxNativePointer' IS NOT DISTINCT FROM $7::jsonb
-          AND ctx->>'boxRemoteCleanup'='done'`, params);
-    if (already.rowCount !== 1) throw new BoxDurableJournalError("BOX_CLEANUP_FENCE_LOST");
+    const args = {
+      requestId: input.requestId, uid: input.uid, accountId: input.accountId,
+      runNonce: input.runNonce, leaseEpoch: input.leaseEpoch,
+      proofJson: JSON.stringify(input.proof),
+      nativePointerJson: input.nativePointer ? JSON.stringify(input.nativePointer) : null,
+    };
+    if (await updateMarkRemoteCleaned(this.pool, args)) return;
+    if (!(await selectRemoteCleanedAlreadyExists(this.pool, args))) {
+      throw new BoxDurableJournalError("BOX_CLEANUP_FENCE_LOST");
+    }
   }
 }

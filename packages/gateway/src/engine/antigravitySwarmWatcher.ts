@@ -13,9 +13,7 @@
  *   - Timer is `.unref()`'d and unconditionally cleared on `stop()`.
  */
 import { createHash } from 'node:crypto'
-import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readSync, realpathSync, type Stats } from 'node:fs'
-import { basename, join, sep } from 'node:path'
-import { StringDecoder } from 'node:string_decoder'
+import { basename } from 'node:path'
 import {
   SWARM_MAX_CHANNELS,
   SWARM_MAX_MEMBERS,
@@ -32,19 +30,35 @@ import {
   type SwarmSnapshot,
 } from '@openclaude/protocol'
 import {
+  CONVERSATION_ID_RE,
+  IncrementalTranscriptTelemetryCache,
+  extractStepTelemetry,
+  getSwarmRealRootResolveCount,
+  readBoundedFileWithinRoot,
+  readBoundedFileWithinRootAsync,
+  recordOf,
+  resetSwarmRealRootCache,
+  statSignatureWithinRoot,
+  statSignatureWithinRootAsync,
+  type MemberTelemetrySnapshot,
+} from './antigravitySwarmTelemetry.js'
+import {
   SwarmStallMonitor,
   type SwarmStallAlert,
   type SwarmStallMonitorOptions,
 } from './swarmStallMonitor.js'
 
+export {
+  IncrementalTranscriptTelemetryCache,
+  extractStepTelemetry,
+  getSwarmRealRootResolveCount,
+  resetSwarmRealRootCache,
+  type MemberTelemetrySnapshot,
+}
+
 const MAX_MEMBERS_JSON_BYTES = 512 * 1024
 const MAX_BOARD_JSONL_BYTES = 2 * 1024 * 1024
 const TRANSCRIPT_TAIL_BYTES = 64 * 1024
-/** Max bytes parsed per member per tick by the incremental telemetry scanner so large bursts never block the event loop. */
-const MAX_TELEMETRY_DELTA_BYTES = 128 * 1024
-/** Max total bytes drained per member during terminal `stopAndReadFinal` before marking `telemetryPartial: true`. */
-const MAX_TELEMETRY_DRAIN_BYTES = 16 * 1024 * 1024
-const MAX_TELEMETRY_REMAINDER_BYTES = 256 * 1024
 const DEFAULT_POLL_MS = 750
 /** Minimum interval between activity-only (`stepCount`/`activity`/`unreadCount`) emissions.
  * Structural changes (new posts, member status/role/error changes, channels, terminal phase)
@@ -54,7 +68,6 @@ export const SWARM_ACTIVITY_THROTTLE_MS = 2_500
  *  so partial replays self-heal without bloating live_frames on activity-only churn (OCV5-837). */
 export const SWARM_FULL_KEYFRAME_INTERVAL_EMITS = 120
 export const SWARM_FULL_KEYFRAME_INTERVAL_MS = 300_000
-const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 interface RawRosterMember {
   conversation_id?: unknown
@@ -98,128 +111,6 @@ interface TranscriptSummary {
   cacheReadTokens: number
   thinkingTokens: number
   toolCalls: number
-}
-
-export interface MemberTelemetrySnapshot {
-  firstStepAt?: number
-  lastActiveAt?: number
-  inputTokens: number
-  outputTokens: number
-  cacheReadTokens: number
-  thinkingTokens: number
-  toolCalls: number
-  /** True when unread bytes remain (`byteOffset < fileSize`) or an oversized line/budget cap prevented complete counting. */
-  partial?: boolean
-  hasBacklog?: boolean
-}
-
-interface TelemetryCursor extends MemberTelemetrySnapshot {
-  dev: number
-  ino: number
-  byteOffset: number
-  lastSeenSize: number
-  remainder: string
-  decoder: StringDecoder
-  droppedOversizedLine: boolean
-  hadMalformedLine: boolean
-}
-
-function isSafePathSegment(seg: string): boolean {
-  return (
-    seg.length > 0 &&
-    seg !== '.' &&
-    seg !== '..' &&
-    !seg.includes('/') &&
-    !seg.includes('\\') &&
-    !seg.includes('\0')
-  )
-}
-
-/**
- * Walk every path component under `rootDir` rejecting symlinks at EVERY level
- * (root, intermediate directories, and leaf). Returns the verified path and
- * lstat result for a regular file, or null on any symlink/traversal/missing node.
- */
-function resolveRegularFileWithinRoot(
-  rootDir: string,
-  segments: readonly string[],
-): { fullPath: string; stat: Stats } | null {
-  if (segments.length === 0) return null
-  try {
-    const rootStat = lstatSync(rootDir)
-    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) return null
-    let cur = rootDir
-    for (let i = 0; i < segments.length - 1; i += 1) {
-      const seg = segments[i]!
-      if (!isSafePathSegment(seg)) return null
-      cur = join(cur, seg)
-      const st = lstatSync(cur)
-      if (st.isSymbolicLink() || !st.isDirectory()) return null
-    }
-    const leaf = segments[segments.length - 1]!
-    if (!isSafePathSegment(leaf)) return null
-    const fullPath = join(cur, leaf)
-    const leafStat = lstatSync(fullPath)
-    if (leafStat.isSymbolicLink() || !leafStat.isFile()) return null
-    return { fullPath, stat: leafStat }
-  } catch {
-    return null
-  }
-}
-
-function statSignatureWithinRoot(rootDir: string, segments: readonly string[]): string {
-  const resolved = resolveRegularFileWithinRoot(rootDir, segments)
-  if (!resolved) return '-'
-  const st = resolved.stat
-  return `${st.dev}:${st.ino}:${st.size}:${Math.trunc(st.mtimeMs)}`
-}
-
-function readBoundedFileWithinRoot(
-  rootDir: string,
-  segments: readonly string[],
-  maxBytes: number,
-): string | null {
-  const resolved = resolveRegularFileWithinRoot(rootDir, segments)
-  if (!resolved) return null
-  let fd: number | null = null
-  try {
-    const flags =
-      fsConstants.O_RDONLY |
-      (typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0) |
-      (typeof fsConstants.O_NONBLOCK === 'number' ? fsConstants.O_NONBLOCK : 0)
-    fd = openSync(resolved.fullPath, flags)
-    const st = fstatSync(fd)
-    if (!st.isFile() || st.dev !== resolved.stat.dev || st.ino !== resolved.stat.ino || st.size <= 0) {
-      return null
-    }
-    // Defense-in-depth containment verification against realpath of trusted rootDir.
-    const realRoot = realpathSync(rootDir)
-    const realFile = realpathSync(resolved.fullPath)
-    if (!realFile.startsWith(realRoot.endsWith(sep) ? realRoot : `${realRoot}${sep}`)) {
-      return null
-    }
-    const size = Math.min(st.size, maxBytes)
-    const startOffset = st.size > maxBytes ? st.size - maxBytes : 0
-    const buf = Buffer.allocUnsafe(size)
-    let offset = 0
-    while (offset < size) {
-      const n = readSync(fd, buf, offset, size - offset, startOffset + offset)
-      if (n <= 0) break
-      offset += n
-    }
-    const text = buf.subarray(0, offset).toString('utf8')
-    if (startOffset > 0) {
-      const firstNewline = text.indexOf('\n')
-      return firstNewline >= 0 ? text.slice(firstNewline + 1) : ''
-    }
-    return text
-  } catch {
-    return null
-  } finally {
-    if (fd !== null) {
-      try { closeSync(fd) } catch { /* ignore */ }
-    }
-  }
 }
 
 function asStr(v: unknown): string {
@@ -316,336 +207,6 @@ function describeToolActivity(toolName: string, args: Record<string, unknown> | 
     default:
       if (rawName.startsWith('mcp_')) return `调用 ${rawName.split('_').slice(-1)[0] || rawName}`
       return name ? `执行 ${name}` : '处理中…'
-  }
-}
-
-function recordOf(v: unknown): Record<string, unknown> | null {
-  return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null
-}
-
-function firstNonNegInt(...candidates: unknown[]): number {
-  for (const c of candidates) {
-    if (typeof c === 'number' && Number.isFinite(c) && c > 0) {
-      return Math.floor(c)
-    }
-  }
-  return 0
-}
-
-/** Extract token usage and tool-call counts from a single transcript JSONL step. */
-export function extractStepTelemetry(step: Record<string, unknown>): {
-  ts?: number
-  inputTokens: number
-  outputTokens: number
-  cacheReadTokens: number
-  thinkingTokens: number
-  toolCalls: number
-} {
-  let ts: number | undefined
-  const createdAt = asStr(step.created_at)
-  if (createdAt) {
-    const parsedTs = Date.parse(createdAt)
-    if (Number.isFinite(parsedTs)) ts = parsedTs
-  }
-
-  const meta = recordOf(step.metadata)
-  const usage =
-    recordOf(step.usage) ??
-    recordOf(step.token_usage) ??
-    recordOf(step.metrics) ??
-    recordOf(meta?.usage) ??
-    recordOf(meta?.token_usage)
-
-  const inputTokens = firstNonNegInt(
-    usage?.input_tokens,
-    usage?.inputTokens,
-    usage?.prompt_tokens,
-    usage?.promptTokens,
-    usage?.promptTokenCount,
-    step.input_tokens,
-    step.inputTokens,
-  )
-  const outputTokens = firstNonNegInt(
-    usage?.output_tokens,
-    usage?.outputTokens,
-    usage?.completion_tokens,
-    usage?.completionTokens,
-    usage?.candidatesTokenCount,
-    step.output_tokens,
-    step.outputTokens,
-  )
-  const cacheReadTokens = firstNonNegInt(
-    usage?.cache_read_tokens,
-    usage?.cacheReadTokens,
-    usage?.cached_content_token_count,
-    usage?.cachedContentTokenCount,
-    step.cache_read_tokens,
-    step.cacheReadTokens,
-  )
-  const thinkingTokens = firstNonNegInt(
-    usage?.thinking_tokens,
-    usage?.thinkingTokens,
-    usage?.thoughts_tokens,
-    usage?.thoughtsTokens,
-    usage?.thoughts_token_count,
-    usage?.thoughtsTokenCount,
-    step.thinking_tokens,
-    step.thinkingTokens,
-    step.thoughts_tokens,
-    step.thoughtsTokens,
-  )
-
-  let toolCalls = 0
-  const stepType = asStr(step.type).toUpperCase()
-  if (Array.isArray(step.tool_calls) && step.tool_calls.length > 0) {
-    toolCalls = step.tool_calls.length
-  } else if (stepType === 'TOOL_CALL' || stepType === 'TOOL_USE') {
-    toolCalls = 1
-  }
-
-  return { ts, inputTokens, outputTokens, cacheReadTokens, thinkingTokens, toolCalls }
-}
-
-function applyTelemetryLine(cursor: MemberTelemetrySnapshot, line: string): boolean {
-  const trimmed = line.trim()
-  if (!trimmed) return true
-  try {
-    const obj = recordOf(JSON.parse(trimmed))
-    if (!obj) return false
-    const delta = extractStepTelemetry(obj)
-    if (delta.ts !== undefined) {
-      if (cursor.firstStepAt === undefined || delta.ts < cursor.firstStepAt) {
-        cursor.firstStepAt = delta.ts
-      }
-      if (cursor.lastActiveAt === undefined || delta.ts > cursor.lastActiveAt) {
-        cursor.lastActiveAt = delta.ts
-      }
-    }
-    cursor.inputTokens += delta.inputTokens
-    cursor.outputTokens += delta.outputTokens
-    cursor.cacheReadTokens += delta.cacheReadTokens
-    cursor.thinkingTokens += delta.thinkingTokens
-    cursor.toolCalls += delta.toolCalls
-    return true
-  } catch {
-    return false
-  }
-}
-
-/**
- * Incremental byte-offset telemetry scanner for member `transcript.jsonl` files (B7).
- *
- * - Uses per-member `StringDecoder('utf8')` so multi-byte UTF-8 characters split across
- *   chunk boundaries never corrupt into U+FFFD replacement characters.
- * - Tracks `hasBacklog` (`byteOffset < fileSize`) and `partial` (unread backlog or oversized
- *   line drop), so callers continue draining quiet large logs across ticks and NEVER emit a
- *   partial count disguised as an exact terminal total.
- */
-export class IncrementalTranscriptTelemetryCache {
-  private readonly cursors = new Map<string, TelemetryCursor>()
-  private readonly maxChunkBytes: number
-  private readonly maxDrainBytes: number
-
-  constructor(maxChunkBytes = MAX_TELEMETRY_DELTA_BYTES, maxDrainBytes = MAX_TELEMETRY_DRAIN_BYTES) {
-    this.maxChunkBytes = Math.max(4096, maxChunkBytes)
-    this.maxDrainBytes = Math.max(this.maxChunkBytes, maxDrainBytes)
-  }
-
-  hasAnyBacklog(): boolean {
-    for (const c of this.cursors.values()) {
-      if (c.hasBacklog) return true
-    }
-    return false
-  }
-
-  private createCursor(st: Stats): TelemetryCursor {
-    return {
-      dev: st.dev,
-      ino: st.ino,
-      byteOffset: 0,
-      lastSeenSize: st.size,
-      remainder: '',
-      decoder: new StringDecoder('utf8'),
-      droppedOversizedLine: false,
-      hadMalformedLine: false,
-      inputTokens: 0,
-      outputTokens: 0,
-      cacheReadTokens: 0,
-      thinkingTokens: 0,
-      toolCalls: 0,
-      hasBacklog: st.size > 0,
-      partial: st.size > 0,
-    }
-  }
-
-  private computePartial(c: TelemetryCursor): boolean {
-    // B7: 区分“读到物理 EOF”与“最后一条记录完整”——只要仍有未闭合/不可解析尾行或损坏行，
-    // 必须诚实标记 partial=true，绝不将已解析小计伪装为完整总计。
-    return Boolean(
-      c.hasBacklog ||
-        c.droppedOversizedLine ||
-        c.hadMalformedLine ||
-        c.remainder.trim().length > 0,
-    )
-  }
-
-  private consumeTextChunk(cursor: TelemetryCursor, decoded: string, atEof: boolean): void {
-    const combined = cursor.remainder + decoded
-    const lastNewline = combined.lastIndexOf('\n')
-    if (lastNewline >= 0) {
-      const completePart = combined.slice(0, lastNewline)
-      const trailing = combined.slice(lastNewline + 1)
-      for (const line of completePart.split('\n')) {
-        if (!applyTelemetryLine(cursor, line)) {
-          cursor.hadMalformedLine = true
-        }
-      }
-      if (trailing.length > MAX_TELEMETRY_REMAINDER_BYTES) {
-        cursor.remainder = ''
-        cursor.droppedOversizedLine = true
-      } else {
-        cursor.remainder = trailing
-      }
-    } else if (combined.length > MAX_TELEMETRY_REMAINDER_BYTES) {
-      cursor.remainder = ''
-      cursor.droppedOversizedLine = true
-    } else {
-      cursor.remainder = combined
-    }
-
-    // Only attempt to parse a trailing line without newline when we have reached EOF
-    // and the trailing text is a complete JSON object (avoiding premature truncation mid-chunk).
-    if (atEof && cursor.remainder.trim().endsWith('}')) {
-      if (applyTelemetryLine(cursor, cursor.remainder)) {
-        cursor.remainder = ''
-      }
-    }
-  }
-
-  scan(
-    brainDir: string,
-    memberConvId: string,
-    opts?: { drainAll?: boolean; maxBytesBudget?: number },
-  ): MemberTelemetrySnapshot | null {
-    if (!CONVERSATION_ID_RE.test(memberConvId)) return null
-    const resolved = resolveRegularFileWithinRoot(brainDir, [
-      memberConvId,
-      '.system_generated',
-      'logs',
-      'transcript.jsonl',
-    ])
-    if (!resolved) {
-      this.cursors.delete(memberConvId)
-      return null
-    }
-
-    const st = resolved.stat
-    let cursor = this.cursors.get(memberConvId)
-    const rotated =
-      !cursor ||
-      cursor.dev !== st.dev ||
-      cursor.ino !== st.ino ||
-      st.size < cursor.byteOffset
-    if (rotated) {
-      cursor = this.createCursor(st)
-      this.cursors.set(memberConvId, cursor)
-    }
-    const c = cursor!
-    c.lastSeenSize = st.size
-
-    if (st.size === c.byteOffset) {
-      c.hasBacklog = false
-      c.partial = this.computePartial(c)
-      return {
-        firstStepAt: c.firstStepAt,
-        lastActiveAt: c.lastActiveAt,
-        inputTokens: c.inputTokens,
-        outputTokens: c.outputTokens,
-        cacheReadTokens: c.cacheReadTokens,
-        thinkingTokens: c.thinkingTokens,
-        toolCalls: c.toolCalls,
-        hasBacklog: false,
-        partial: c.partial,
-      }
-    }
-
-    let fd: number | null = null
-    try {
-      const flags =
-        fsConstants.O_RDONLY |
-        (typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0) |
-        (typeof fsConstants.O_NONBLOCK === 'number' ? fsConstants.O_NONBLOCK : 0)
-      fd = openSync(resolved.fullPath, flags)
-      const fst = fstatSync(fd)
-      if (!fst.isFile() || fst.dev !== st.dev || fst.ino !== st.ino) {
-        return null
-      }
-      const realRoot = realpathSync(brainDir)
-      const realFile = realpathSync(resolved.fullPath)
-      if (!realFile.startsWith(realRoot.endsWith(sep) ? realRoot : `${realRoot}${sep}`)) {
-        return null
-      }
-      c.lastSeenSize = fst.size
-
-      const budget = opts?.drainAll
-        ? Math.max(this.maxChunkBytes, opts.maxBytesBudget ?? this.maxDrainBytes)
-        : Math.max(4096, opts?.maxBytesBudget ?? this.maxChunkBytes)
-      let bytesBudgetLeft = budget
-
-      while (c.byteOffset < fst.size && bytesBudgetLeft > 0) {
-        const toRead = Math.min(fst.size - c.byteOffset, this.maxChunkBytes, bytesBudgetLeft)
-        if (toRead <= 0) break
-        const buf = Buffer.allocUnsafe(toRead)
-        let readTotal = 0
-        while (readTotal < toRead) {
-          const n = readSync(fd, buf, readTotal, toRead - readTotal, c.byteOffset + readTotal)
-          if (n <= 0) break
-          readTotal += n
-        }
-        if (readTotal <= 0) break
-        c.byteOffset += readTotal
-        bytesBudgetLeft -= readTotal
-        const atEof = c.byteOffset >= fst.size
-        const decoded = c.decoder.write(buf.subarray(0, readTotal))
-        this.consumeTextChunk(c, decoded, atEof)
-      }
-
-      if (opts?.drainAll && c.byteOffset >= fst.size) {
-        const flushed = c.decoder.end()
-        if (flushed) {
-          this.consumeTextChunk(c, flushed, true)
-        }
-        // Re-initialize fresh decoder in case more bytes are appended later.
-        c.decoder = new StringDecoder('utf8')
-      }
-
-      c.hasBacklog = c.byteOffset < fst.size
-      c.partial = this.computePartial(c)
-    } catch {
-      return null
-    } finally {
-      if (fd !== null) {
-        try { closeSync(fd) } catch { /* ignore */ }
-      }
-    }
-
-    return {
-      firstStepAt: c.firstStepAt,
-      lastActiveAt: c.lastActiveAt,
-      inputTokens: c.inputTokens,
-      outputTokens: c.outputTokens,
-      cacheReadTokens: c.cacheReadTokens,
-      thinkingTokens: c.thinkingTokens,
-      toolCalls: c.toolCalls,
-      hasBacklog: c.hasBacklog,
-      partial: c.partial,
-    }
-  }
-
-  prune(activeMemberConvIds: ReadonlySet<string>): void {
-    for (const key of this.cursors.keys()) {
-      if (!activeMemberConvIds.has(key)) this.cursors.delete(key)
-    }
   }
 }
 
@@ -1040,43 +601,25 @@ function parseBoardPosts(text: string | null): {
   return { posts, totalPosts, headSeq, lastPostByAgent, postCountByChannel }
 }
 
-/** Pure one-shot reader for a coordinator conversation's swarm directory. */
-export function readAntigravitySwarmSnapshot(opts: {
-  brainDir: string
-  conversationId: string
-  phase: SwarmPhase
-  revision: number
-  startedAt?: number
-  now?: number
-  /** Internal collector so the watcher can stat member transcripts without exposing IDs on wire. */
-  outMemberConvIds?: string[]
-  /** Optional incremental transcript telemetry cache (avoids re-scanning full transcripts). */
-  telemetryCache?: IncrementalTranscriptTelemetryCache
-  /** When true (terminal snapshot), drain unread telemetry backlog up to the terminal budget. */
-  drainTelemetry?: boolean
-}): SwarmSnapshot | null {
-  if (!CONVERSATION_ID_RE.test(opts.conversationId)) return null
-  const membersRaw = readBoundedFileWithinRoot(
-    opts.brainDir,
-    [opts.conversationId, '.system_generated', 'swarm', 'members.json'],
-    MAX_MEMBERS_JSON_BYTES,
-  )
-  if (!membersRaw) return null
-  let roster: RawRoster
-  try {
-    const parsed = JSON.parse(membersRaw) as unknown
-    const obj = recordOf(parsed)
-    if (!obj) return null
-    roster = obj as RawRoster
-  } catch {
-    return null
-  }
+interface LoadedMemberData {
+  name: string
+  member: RawRosterMember
+  transcriptText: string | null
+  incTelemetry: MemberTelemetrySnapshot | null
+}
 
-  const boardRaw = readBoundedFileWithinRoot(
-    opts.brainDir,
-    [opts.conversationId, '.system_generated', 'swarm', 'board.jsonl'],
-    MAX_BOARD_JSONL_BYTES,
-  )
+function buildSwarmSnapshotFromLoadedData(
+  opts: {
+    conversationId: string
+    phase: SwarmPhase
+    revision: number
+    startedAt?: number
+    now?: number
+  },
+  roster: RawRoster,
+  boardRaw: string | null,
+  loadedMembers: readonly LoadedMemberData[],
+): SwarmSnapshot {
   const { posts, totalPosts, headSeq, lastPostByAgent, postCountByChannel } = parseBoardPosts(boardRaw)
 
   const rawMembersObj = recordOf(roster.members) ?? {}
@@ -1085,27 +628,9 @@ export function readAntigravitySwarmSnapshot(opts: {
   const memberCountByChannel = new Map<string, number>()
   const members: SwarmMemberSnapshot[] = []
 
-  const entries = Object.entries(rawMembersObj).slice(0, SWARM_MAX_MEMBERS)
-  for (const [name, rawVal] of entries) {
-    const m = (recordOf(rawVal) ?? {}) as RawRosterMember
+  for (const { name, member: m, transcriptText, incTelemetry } of loadedMembers) {
     const killed = m.killed === true
-    const memberConvId = asStr(m.conversation_id)
-    if (memberConvId && CONVERSATION_ID_RE.test(memberConvId)) {
-      opts.outMemberConvIds?.push(memberConvId)
-    }
-    const transcriptText =
-      memberConvId && CONVERSATION_ID_RE.test(memberConvId)
-        ? readBoundedFileWithinRoot(
-            opts.brainDir,
-            [memberConvId, '.system_generated', 'logs', 'transcript.jsonl'],
-            TRANSCRIPT_TAIL_BYTES,
-          )
-        : null
     const transcript = parseMemberTranscriptTail(transcriptText)
-    const incTelemetry =
-      opts.telemetryCache && memberConvId && CONVERSATION_ID_RE.test(memberConvId)
-        ? opts.telemetryCache.scan(opts.brainDir, memberConvId, { drainAll: opts.drainTelemetry })
-        : null
     const wakeMode = asStr(m.wake_mode) || undefined
     const wakeModeLower = wakeMode?.toLowerCase()
     const rawPhase = asStr(m.phase).toUpperCase()
@@ -1258,6 +783,129 @@ export function readAntigravitySwarmSnapshot(opts: {
     totalPosts,
     ...(truncatedPosts ? { truncatedPosts } : {}),
   }
+}
+
+/** Pure one-shot reader for a coordinator conversation's swarm directory. */
+export function readAntigravitySwarmSnapshot(opts: {
+  brainDir: string
+  conversationId: string
+  phase: SwarmPhase
+  revision: number
+  startedAt?: number
+  now?: number
+  /** Internal collector so the watcher can stat member transcripts without exposing IDs on wire. */
+  outMemberConvIds?: string[]
+  /** Optional incremental transcript telemetry cache (avoids re-scanning full transcripts). */
+  telemetryCache?: IncrementalTranscriptTelemetryCache
+  /** When true (terminal snapshot), drain unread telemetry backlog up to the terminal budget. */
+  drainTelemetry?: boolean
+}): SwarmSnapshot | null {
+  if (!CONVERSATION_ID_RE.test(opts.conversationId)) return null
+  const membersRaw = readBoundedFileWithinRoot(
+    opts.brainDir,
+    [opts.conversationId, '.system_generated', 'swarm', 'members.json'],
+    MAX_MEMBERS_JSON_BYTES,
+  )
+  if (!membersRaw) return null
+  let roster: RawRoster
+  try {
+    const parsed = JSON.parse(membersRaw) as unknown
+    const obj = recordOf(parsed)
+    if (!obj) return null
+    roster = obj as RawRoster
+  } catch {
+    return null
+  }
+
+  const boardRaw = readBoundedFileWithinRoot(
+    opts.brainDir,
+    [opts.conversationId, '.system_generated', 'swarm', 'board.jsonl'],
+    MAX_BOARD_JSONL_BYTES,
+  )
+  const rawMembersObj = recordOf(roster.members) ?? {}
+  const entries = Object.entries(rawMembersObj).slice(0, SWARM_MAX_MEMBERS)
+  const loadedMembers: LoadedMemberData[] = []
+  for (const [name, rawVal] of entries) {
+    const m = (recordOf(rawVal) ?? {}) as RawRosterMember
+    const memberConvId = asStr(m.conversation_id)
+    const validConvId = Boolean(memberConvId && CONVERSATION_ID_RE.test(memberConvId))
+    if (validConvId) opts.outMemberConvIds?.push(memberConvId)
+    const transcriptText = validConvId
+      ? readBoundedFileWithinRoot(
+          opts.brainDir,
+          [memberConvId, '.system_generated', 'logs', 'transcript.jsonl'],
+          TRANSCRIPT_TAIL_BYTES,
+        )
+      : null
+    const incTelemetry =
+      opts.telemetryCache && validConvId
+        ? opts.telemetryCache.scan(opts.brainDir, memberConvId, { drainAll: opts.drainTelemetry })
+        : null
+    loadedMembers.push({ name, member: m, transcriptText, incTelemetry })
+  }
+  return buildSwarmSnapshotFromLoadedData(opts, roster, boardRaw, loadedMembers)
+}
+
+/** Async reader used by high-frequency interval polling to avoid blocking the gateway event loop. */
+async function readAntigravitySwarmSnapshotAsync(opts: {
+  brainDir: string
+  conversationId: string
+  phase: SwarmPhase
+  revision: number
+  startedAt?: number
+  now?: number
+  outMemberConvIds?: string[]
+  telemetryCache?: IncrementalTranscriptTelemetryCache
+  drainTelemetry?: boolean
+}): Promise<SwarmSnapshot | null> {
+  if (!CONVERSATION_ID_RE.test(opts.conversationId)) return null
+  const membersRaw = await readBoundedFileWithinRootAsync(
+    opts.brainDir,
+    [opts.conversationId, '.system_generated', 'swarm', 'members.json'],
+    MAX_MEMBERS_JSON_BYTES,
+  )
+  if (!membersRaw) return null
+  let roster: RawRoster
+  try {
+    const parsed = JSON.parse(membersRaw) as unknown
+    const obj = recordOf(parsed)
+    if (!obj) return null
+    roster = obj as RawRoster
+  } catch {
+    return null
+  }
+
+  const rawMembersObj = recordOf(roster.members) ?? {}
+  const entries = Object.entries(rawMembersObj).slice(0, SWARM_MAX_MEMBERS)
+  const [boardRaw, loadedMembers] = await Promise.all([
+    readBoundedFileWithinRootAsync(
+      opts.brainDir,
+      [opts.conversationId, '.system_generated', 'swarm', 'board.jsonl'],
+      MAX_BOARD_JSONL_BYTES,
+    ),
+    Promise.all(
+      entries.map(async ([name, rawVal]): Promise<LoadedMemberData> => {
+        const m = (recordOf(rawVal) ?? {}) as RawRosterMember
+        const memberConvId = asStr(m.conversation_id)
+        const validConvId = Boolean(memberConvId && CONVERSATION_ID_RE.test(memberConvId))
+        if (validConvId) opts.outMemberConvIds?.push(memberConvId)
+        const [transcriptText, incTelemetry] = validConvId
+          ? await Promise.all([
+              readBoundedFileWithinRootAsync(
+                opts.brainDir,
+                [memberConvId, '.system_generated', 'logs', 'transcript.jsonl'],
+                TRANSCRIPT_TAIL_BYTES,
+              ),
+              opts.telemetryCache
+                ? opts.telemetryCache.scanAsync(opts.brainDir, memberConvId, { drainAll: opts.drainTelemetry })
+                : Promise.resolve(null),
+            ])
+          : [null, null]
+        return { name, member: m, transcriptText, incTelemetry }
+      }),
+    ),
+  ])
+  return buildSwarmSnapshotFromLoadedData(opts, roster, boardRaw, loadedMembers)
 }
 
 function stripVolatileMemberFields(m: SwarmMemberSnapshot) {
@@ -1431,6 +1079,8 @@ export class AntigravitySwarmWatcher {
   private backlogTimer: NodeJS.Timeout | null = null
   private pendingActivitySnap: SwarmSnapshot | null = null
   private stopped = false
+  private pollInFlight = false
+  private pollGeneration = 0
   private revision = 0
   private startedAt: number | undefined
   private lastHash: string | null = null
@@ -1471,7 +1121,7 @@ export class AntigravitySwarmWatcher {
       this.pollOnce(true)
     }
     this.timer = setInterval(() => {
-      this.pollOnce(false)
+      void this.pollOnceAsync(false)
     }, this.pollMs)
     this.timer.unref()
   }
@@ -1479,6 +1129,7 @@ export class AntigravitySwarmWatcher {
   /** Trigger an immediate poll (e.g., right after a `swarm` / `post_message` tool step). */
   kick(): void {
     if (this.stopped) return
+    this.pollGeneration += 1
     this.pollOnce(true)
   }
 
@@ -1489,6 +1140,7 @@ export class AntigravitySwarmWatcher {
    */
   activateTurnSwarm(): void {
     if (this.stopped) return
+    this.pollGeneration += 1
     this.turnActive = true
     if (!this.emittedInTurn && this.lastSnapshot) {
       const nextRev = this.revision + 1
@@ -1529,6 +1181,20 @@ export class AntigravitySwarmWatcher {
         statSignatureWithinRoot(this.brainDir, [memberConvId, '.system_generated', 'logs', 'transcript.jsonl']),
       )
     }
+    return parts.join('|')
+  }
+
+  private async computeStatSignatureAsync(): Promise<string> {
+    const probes: Array<Promise<string>> = [
+      statSignatureWithinRootAsync(this.brainDir, [this.conversationId, '.system_generated', 'swarm', 'members.json']),
+      statSignatureWithinRootAsync(this.brainDir, [this.conversationId, '.system_generated', 'swarm', 'board.jsonl']),
+    ]
+    for (const memberConvId of this.trackedMemberConvIds) {
+      probes.push(
+        statSignatureWithinRootAsync(this.brainDir, [memberConvId, '.system_generated', 'logs', 'transcript.jsonl']),
+      )
+    }
+    const parts = await Promise.all(probes)
     return parts.join('|')
   }
 
@@ -1689,7 +1355,7 @@ export class AntigravitySwarmWatcher {
     this.backlogTimer = setTimeout(() => {
       this.backlogTimer = null
       if (!this.stopped && this.telemetryCache.hasAnyBacklog()) {
-        this.pollOnce(false)
+        void this.pollOnceAsync(false)
       }
     }, 15)
     this.backlogTimer.unref()
@@ -1706,67 +1372,35 @@ export class AntigravitySwarmWatcher {
     }
   }
 
-  private pollOnce(force: boolean): void {
-    if (this.stopped) return
-    const isDormantBaseline =
-      !this.turnActive && this.seedBaselineOnStart && this.baselineActivationHash !== null
-    const statSig = this.computeStatSignature()
-    const hasBacklog = !isDormantBaseline && this.telemetryCache.hasAnyBacklog()
-    if (!force && !hasBacklog && this.lastStatSignature !== null && statSig === this.lastStatSignature) {
-      // When disk files stop changing completely (true stall), still evaluate
-      // the in-memory stall state machine with zero disk I/O and zero LLM calls.
-      if (this.turnActive && this.lastSnapshot) {
-        this.evaluateStall(this.lastSnapshot, this.now())
-      }
-      return
+  private static trackedSignaturesAdvanced(
+    prevIds: readonly string[],
+    preSig: string,
+    nextIds: readonly string[],
+    postSig: string,
+  ): boolean {
+    const preParts = preSig.split('|')
+    const postParts = postSig.split('|')
+    // Board or members.json changed during read -> must re-read on next tick.
+    if (preParts[0] !== postParts[0] || preParts[1] !== postParts[1]) return true
+    const prevSet = new Set(prevIds)
+    // Newly discovered members had no pre-read signature; force one catch-up tick
+    // so writes appended between reading their transcript and taking postSig are never missed.
+    for (const id of nextIds) {
+      if (!prevSet.has(id)) return true
     }
-    this.lastStatSignature = statSig
-    const nextRev = this.revision + 1
-    const memberConvIds: string[] = []
-    const ts = this.now()
-    let snap = readAntigravitySwarmSnapshot({
-      brainDir: this.brainDir,
-      conversationId: this.conversationId,
-      phase: 'running',
-      revision: nextRev,
-      startedAt: this.startedAt,
-      now: ts,
-      outMemberConvIds: memberConvIds,
-      ...(isDormantBaseline ? {} : { telemetryCache: this.telemetryCache }),
-    })
-    if (!snap) return
-    this.setTrackedMembers(memberConvIds)
-    this.lastStatSignature = this.computeStatSignature()
-    if (isDormantBaseline) {
-      const actHash = swarmActivationFingerprint(snap)
-      if (actHash === this.baselineActivationHash) {
-        // Coordinator-only transcript advance on an ordinary resumed turn:
-        // keep baseline fresh without activating or emitting the historical board.
-        this.lastHash = snapshotFingerprint(snap)
-        this.lastStructuralHash = structuralFingerprint(snap)
-        this.lastSnapshot = snap
-        return
-      }
-      // Genuine non-coordinator / board mutation woke the dormant board:
-      // transition to active and re-read with incremental telemetry enabled.
-      this.turnActive = true
-      const activeMemberConvIds: string[] = []
-      const activeSnap = readAntigravitySwarmSnapshot({
-        brainDir: this.brainDir,
-        conversationId: this.conversationId,
-        phase: 'running',
-        revision: nextRev,
-        startedAt: this.startedAt,
-        now: ts,
-        outMemberConvIds: activeMemberConvIds,
-        telemetryCache: this.telemetryCache,
-      })
-      if (activeSnap) {
-        snap = activeSnap
-        this.setTrackedMembers(activeMemberConvIds)
-        this.lastStatSignature = this.computeStatSignature()
-      }
+    const postById = new Map<string, string>()
+    for (let i = 0; i < nextIds.length; i += 1) {
+      postById.set(nextIds[i]!, postParts[i + 2] ?? '-')
     }
+    for (let i = 0; i < prevIds.length; i += 1) {
+      const id = prevIds[i]!
+      const after = postById.get(id)
+      if (after !== undefined && after !== (preParts[i + 2] ?? '-')) return true
+    }
+    return false
+  }
+
+  private finishPollEmit(snap: SwarmSnapshot, ts: number): void {
     if (this.telemetryCache.hasAnyBacklog()) {
       this.scheduleBacklogCatchup()
     }
@@ -1797,17 +1431,210 @@ export class AntigravitySwarmWatcher {
       }
     }
 
+    // Allocate revision strictly synchronously at publish time so concurrent
+    // throttle timers and async polls can never emit two snapshots with the same revision.
+    const nextRev = this.revision + 1
+    const toEmit: SwarmSnapshot = snap.revision === nextRev ? snap : { ...snap, revision: nextRev }
     this.revision = nextRev
-    this.lastSnapshot = snap
-    this.emitWireSnapshot(snap, false)
-    this.evaluateStall(snap, ts)
+    this.lastSnapshot = toEmit
+    this.emitWireSnapshot(toEmit, false)
+    this.evaluateStall(toEmit, ts)
+  }
+
+  private pollOnce(force: boolean): void {
+    if (this.stopped) return
+    const isDormantBaseline =
+      !this.turnActive && this.seedBaselineOnStart && this.baselineActivationHash !== null
+    const prevTracked = this.trackedMemberConvIds
+    const statSig = this.computeStatSignature()
+    const hasBacklog = !isDormantBaseline && this.telemetryCache.hasAnyBacklog()
+    if (!force && !hasBacklog && this.lastStatSignature !== null && statSig === this.lastStatSignature) {
+      // When disk files stop changing completely (true stall), still evaluate
+      // the in-memory stall state machine with zero disk I/O and zero LLM calls.
+      if (this.turnActive && this.lastSnapshot) {
+        this.evaluateStall(this.lastSnapshot, this.now())
+      }
+      return
+    }
+    const memberConvIds: string[] = []
+    const ts = this.now()
+    let snap = readAntigravitySwarmSnapshot({
+      brainDir: this.brainDir,
+      conversationId: this.conversationId,
+      phase: 'running',
+      revision: this.revision + 1,
+      startedAt: this.startedAt,
+      now: ts,
+      outMemberConvIds: memberConvIds,
+      ...(isDormantBaseline ? {} : { telemetryCache: this.telemetryCache }),
+    })
+    if (!snap) return
+    this.setTrackedMembers(memberConvIds)
+    const postSig = this.computeStatSignature()
+    this.lastStatSignature = AntigravitySwarmWatcher.trackedSignaturesAdvanced(
+      prevTracked,
+      statSig,
+      this.trackedMemberConvIds,
+      postSig,
+    )
+      ? null
+      : postSig
+    if (isDormantBaseline) {
+      const actHash = swarmActivationFingerprint(snap)
+      if (actHash === this.baselineActivationHash) {
+        // Coordinator-only transcript advance on an ordinary resumed turn:
+        // keep baseline fresh without activating or emitting the historical board.
+        this.lastHash = snapshotFingerprint(snap)
+        this.lastStructuralHash = structuralFingerprint(snap)
+        this.lastSnapshot = snap
+        return
+      }
+      // Genuine non-coordinator / board mutation woke the dormant board:
+      // transition to active and re-read with incremental telemetry enabled.
+      this.turnActive = true
+      const activePrevTracked = this.trackedMemberConvIds
+      const activePreSig = this.computeStatSignature()
+      const activeMemberConvIds: string[] = []
+      const activeSnap = readAntigravitySwarmSnapshot({
+        brainDir: this.brainDir,
+        conversationId: this.conversationId,
+        phase: 'running',
+        revision: this.revision + 1,
+        startedAt: this.startedAt,
+        now: ts,
+        outMemberConvIds: activeMemberConvIds,
+        telemetryCache: this.telemetryCache,
+      })
+      if (activeSnap) {
+        snap = activeSnap
+        this.setTrackedMembers(activeMemberConvIds)
+        const activePostSig = this.computeStatSignature()
+        this.lastStatSignature = AntigravitySwarmWatcher.trackedSignaturesAdvanced(
+          activePrevTracked,
+          activePreSig,
+          this.trackedMemberConvIds,
+          activePostSig,
+        )
+          ? null
+          : activePostSig
+      }
+    }
+    this.finishPollEmit(snap, ts)
+  }
+
+  private async pollOnceAsync(force: boolean): Promise<void> {
+    if (this.stopped || this.pollInFlight) return
+    this.pollInFlight = true
+    const gen = this.pollGeneration
+    try {
+      const isDormantBaseline =
+        !this.turnActive && this.seedBaselineOnStart && this.baselineActivationHash !== null
+      const prevTracked = this.trackedMemberConvIds
+      const statSig = await this.computeStatSignatureAsync()
+      if (this.stopped || gen !== this.pollGeneration) return
+      const hasBacklog = !isDormantBaseline && this.telemetryCache.hasAnyBacklog()
+      if (!force && !hasBacklog && this.lastStatSignature !== null && statSig === this.lastStatSignature) {
+        if (this.turnActive && this.lastSnapshot) {
+          this.evaluateStall(this.lastSnapshot, this.now())
+        }
+        return
+      }
+      const memberConvIds: string[] = []
+      const ts = this.now()
+      let snap = await readAntigravitySwarmSnapshotAsync({
+        brainDir: this.brainDir,
+        conversationId: this.conversationId,
+        phase: 'running',
+        revision: this.revision + 1,
+        startedAt: this.startedAt,
+        now: ts,
+        outMemberConvIds: memberConvIds,
+        ...(isDormantBaseline ? {} : { telemetryCache: this.telemetryCache }),
+      })
+      if (this.stopped || gen !== this.pollGeneration || !snap) return
+      this.setTrackedMembers(memberConvIds)
+      const postSig = await this.computeStatSignatureAsync()
+      if (this.stopped || gen !== this.pollGeneration) return
+      // Never stamp a newer concurrent write's signature onto an older snapshot.
+      this.lastStatSignature = AntigravitySwarmWatcher.trackedSignaturesAdvanced(
+        prevTracked,
+        statSig,
+        this.trackedMemberConvIds,
+        postSig,
+      )
+        ? null
+        : postSig
+      if (isDormantBaseline) {
+        const actHash = swarmActivationFingerprint(snap)
+        if (actHash === this.baselineActivationHash) {
+          this.lastHash = snapshotFingerprint(snap)
+          this.lastStructuralHash = structuralFingerprint(snap)
+          this.lastSnapshot = snap
+          return
+        }
+        this.turnActive = true
+        const activePrevTracked = this.trackedMemberConvIds
+        const activePreSig = await this.computeStatSignatureAsync()
+        if (this.stopped || gen !== this.pollGeneration) return
+        const activeMemberConvIds: string[] = []
+        const activeSnap = await readAntigravitySwarmSnapshotAsync({
+          brainDir: this.brainDir,
+          conversationId: this.conversationId,
+          phase: 'running',
+          revision: this.revision + 1,
+          startedAt: this.startedAt,
+          now: ts,
+          outMemberConvIds: activeMemberConvIds,
+          telemetryCache: this.telemetryCache,
+        })
+        if (this.stopped || gen !== this.pollGeneration) return
+        if (activeSnap) {
+          snap = activeSnap
+          this.setTrackedMembers(activeMemberConvIds)
+          const activePostSig = await this.computeStatSignatureAsync()
+          if (this.stopped || gen !== this.pollGeneration) return
+          this.lastStatSignature = AntigravitySwarmWatcher.trackedSignaturesAdvanced(
+            activePrevTracked,
+            activePreSig,
+            this.trackedMemberConvIds,
+            activePostSig,
+          )
+            ? null
+            : activePostSig
+        }
+      }
+      this.finishPollEmit(snap, ts)
+    } finally {
+      this.pollInFlight = false
+    }
   }
 
   /** Stop polling and capture one final authoritative snapshot with terminal phase.
    *  Returns null if this turn never created, modified, or explicitly engaged a swarm. */
   stopAndReadFinal(phase: SwarmPhase): SwarmSnapshot | null {
     this.stop()
-    if (!this.turnActive) return null
+    if (!this.turnActive) {
+      // Do one final synchronous disk check before returning null so board/member
+      // mutations written while an async poll was pending or invalidated by stop()
+      // are never silently skipped at turn end.
+      const probe = readAntigravitySwarmSnapshot({
+        brainDir: this.brainDir,
+        conversationId: this.conversationId,
+        phase: 'running',
+        revision: this.revision + 1,
+        startedAt: this.startedAt,
+        now: this.now(),
+      })
+      if (!probe) return null
+      if (
+        this.seedBaselineOnStart &&
+        this.baselineActivationHash !== null &&
+        swarmActivationFingerprint(probe) === this.baselineActivationHash
+      ) {
+        return null
+      }
+      this.turnActive = true
+    }
     const nextRev = this.revision + 1
     const snap = readAntigravitySwarmSnapshot({
       brainDir: this.brainDir,
@@ -1833,6 +1660,7 @@ export class AntigravitySwarmWatcher {
 
   stop(): void {
     this.stopped = true
+    this.pollGeneration += 1
     this.stallMonitor?.reset()
     this.clearThrottleTimer()
     this.clearKeyframeTimer()

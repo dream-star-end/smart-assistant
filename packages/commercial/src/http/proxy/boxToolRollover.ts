@@ -11,11 +11,12 @@ import { BOX_TOOL_MAX_ROUNDS, BOX_TOOL_MAX_WALL_MS, BOX_TOOL_SPOOL_MAX_BYTES,
   BOX_TOOL_MESSAGE_STREAM_MAX_BYTES, BOX_TOOL_POST_ECHO_RESERVE_BYTES,
   reserveBoxToolEcho } from "./boxToolCapacity.js";
 
-import { parseToolRollover, unadmittedToolRollover, unadmittedToolRolloverFieldsSql,
+import { parseToolRollover, unadmittedToolRollover,
   type BoxToolRolloverReceipt, type BoxToolRolloverClaim } from "../../billing/boxToolRolloverIdentity.js";
+import { updateCancelToolRollovers, updateRolloverMarkChild, updateRolloverMarkChildReady,
+  updateRolloverMarkOwner, updateRolloverRetireOldChain } from "../../billing/boxBillingStore.js";
 export { parseToolRollover, unadmittedToolRollover,
   type BoxToolRolloverReceipt, type BoxToolRolloverClaim } from "../../billing/boxToolRolloverIdentity.js";
-const UNADMITTED_SQL = unadmittedToolRolloverFieldsSql();
 type Db = Pick<Pool,"connect"|"query">;
 type Hash = { modelToolUseId: string; contentHash: string; isError: boolean };
 export class BoxToolRolloverRequired extends Error {
@@ -75,20 +76,18 @@ export async function claimToolRollover(client: PoolClient, input: { uid: bigint
     nextContextHash: input.nextContextHash,resultHashes: input.resultHashes,roundNo: handoff.roundNo,
     catalogHash: handoff.catalogHash,detachedRunnerHash: handoff.detachedRunnerHash };
   if (!parseToolRollover(receipt)) fail();
-  const owner = await client.query(`UPDATE request_finalize_journal SET ctx=ctx || $4::jsonb,updated_at=NOW()
-    WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxHandoffRevision'=$3
-      AND ctx->>'boxState'='handoff' AND state IN ('inflight','finalizing','committed')
-      AND NOT (ctx ? 'boxCancelIntent') AND NOT (ctx ? 'boxRecoveredBy')`,
-    [input.ownerRequestId,input.uid.toString(),ctx.boxHandoffRevision,
-      JSON.stringify({ boxRecoveredBy: input.requestId,boxRolloverTo: receipt })]);
-  const child = await client.query(`UPDATE request_finalize_journal SET ctx=ctx || $3::jsonb,updated_at=NOW()
-    WHERE request_id=$1 AND user_id=$2 AND state='inflight'
-      AND ctx->>'model'=$4 AND ctx->>'boxInvocationRecovery'='v1'
-      AND ctx ? 'billingPricing' AND ctx ? 'boxBillingContext'
-      AND NOT (ctx ? 'boxState') AND NOT (ctx ? 'boxRolloverFrom')`,
-    [input.requestId,input.uid.toString(),JSON.stringify({ boxRolloverFrom: receipt,
-      boxSessionId: receipt.sessionId,boxTurnKey: receipt.turnKey }),receipt.model]);
-  if (owner.rowCount !== 1 || child.rowCount !== 1) fail();
+  const owner = await updateRolloverMarkOwner(client, {
+    ownerRequestId: input.ownerRequestId, uid: input.uid,
+    handoffRevision: ctx.boxHandoffRevision,
+    patchJson: JSON.stringify({ boxRecoveredBy: input.requestId, boxRolloverTo: receipt }),
+  });
+  const child = await updateRolloverMarkChild(client, {
+    requestId: input.requestId, uid: input.uid,
+    patchJson: JSON.stringify({ boxRolloverFrom: receipt,
+      boxSessionId: receipt.sessionId, boxTurnKey: receipt.turnKey }),
+    model: receipt.model,
+  });
+  if (!owner || !child) fail();
   return { ...receipt,accountId: BigInt(receipt.accountId) };
 }
 
@@ -153,15 +152,15 @@ export async function finishToolRollover(pool: Db, input: { uid: bigint; request
       cursor = parentId as string | undefined;
     }
     if (seen.size !== old.rows.length || expected !== 0) fail();
-    await client.query(`UPDATE request_finalize_journal SET ctx=ctx || $4::jsonb,updated_at=NOW()
-      WHERE user_id=$1 AND ctx->>'boxRunNonce'=$2 AND ctx->>'boxLeaseEpoch'=$3
-        AND ctx->>'boxInvocationMode'='detached_tool' AND ctx->>'boxState'='failed_stopped'`,
-      [input.uid.toString(),receipt.runNonce,receipt.leaseEpoch,JSON.stringify({ boxRolloverRetired: receipt })]);
-    const ready = await client.query(`UPDATE request_finalize_journal SET ctx=ctx || $3::jsonb,updated_at=NOW()
-      WHERE user_id=$1 AND request_id=$2 AND state='inflight'
-        AND NOT (ctx ? 'boxRolloverCancelled') AND NOT (ctx ? 'boxCancelIntent') AND NOT (ctx ? 'boxState')`,
-      [input.uid.toString(),input.requestId,JSON.stringify({ boxRolloverReady: receipt.durableRevision })]);
-    if (ready.rowCount !== 1) fail();
+    await updateRolloverRetireOldChain(client, {
+      uid: input.uid, runNonce: receipt.runNonce, leaseEpoch: receipt.leaseEpoch,
+      patchJson: JSON.stringify({ boxRolloverRetired: receipt }),
+    });
+    const ready = await updateRolloverMarkChildReady(client, {
+      uid: input.uid, requestId: input.requestId,
+      patchJson: JSON.stringify({ boxRolloverReady: receipt.durableRevision }),
+    });
+    if (!ready) fail();
     await client.query("COMMIT"); done = true;
   } finally { if (!done) await client.query("ROLLBACK").catch(() => {}); client.release(); }
 }
@@ -220,22 +219,10 @@ export async function cancelToolRollovers(pool: Db, input: { uid: bigint; contai
     // remote stage/paid launch. Close it through the existing prestart state,
     // without inventing a keeper proof or rewriting prior settled generations.
     // Admitted/unknown successors retain their physical stop-proof path.
-    const cancelled = await client.query<{ request_id: string; state: string; ctx: Record<string,unknown> }>(
-      `UPDATE request_finalize_journal
-      SET ctx=ctx || '{"boxRolloverCancelled":true}'::jsonb ||
-        CASE WHEN NOT (ctx ? 'boxState') AND ${UNADMITTED_SQL}
-        THEN '{"boxState":"prestart_stopped"}'::jsonb ELSE '{}'::jsonb END,updated_at=NOW()
-      WHERE user_id=$1 AND container_id=$2 AND ctx->>'boxSessionId'=$3 AND ctx->>'boxTurnKey'=$4
-        AND (state='inflight' OR (state='aborted' AND final_credits=0 AND ${UNADMITTED_SQL}
-          AND (NOT (ctx ? 'boxState') OR (ctx->>'boxState'='prestart_stopped'
-            AND ctx->>'boxRolloverCancelled'='true'))))
-        AND jsonb_typeof(ctx->'boxRolloverFrom')='object'
-        AND ctx#>>'{boxRolloverFrom,requestId}'=request_id
-        AND ctx#>>'{boxRolloverFrom,v}'='1'
-        AND ctx#>>'{boxRolloverFrom,sessionId}'=$3 AND ctx#>>'{boxRolloverFrom,turnKey}'=$4
-        AND ctx#>>'{boxRolloverFrom,model}'=ctx->>'model'
-      RETURNING request_id,state,ctx`,
-      [input.uid.toString(),input.containerId.toString(),input.sessionId,input.turnKey]);
+    const cancelled = await updateCancelToolRollovers(client, {
+      uid: input.uid, containerId: input.containerId,
+      sessionId: input.sessionId, turnKey: input.turnKey,
+    });
     // Validate before COMMIT: the SQL has locked each returned row, and an
     // HTTP abort racing this transaction preserves ctx and zeroes this request
     // only. finalizing/committed financial ownership is never closed here.

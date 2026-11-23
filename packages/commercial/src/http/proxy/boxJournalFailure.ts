@@ -4,6 +4,7 @@ import { unsentResumeChildClaimSql } from "./boxOrphanRecovery.js";
  * transaction/session lock and the complete prepared/owner-chain binder. */
 import { isBoxApiModel } from "@openclaude/protocol";
 import type { Pool, PoolClient } from "pg";
+import { updateRecordBoxFirstFailure } from "../../billing/boxBillingStore.js";
 import type { ProxyBody } from "./shared.js";
 import type { BoxCallFingerprint } from "./boxCallFingerprint.js";
 import type { AuthorityProjection, PreparedContinuation } from "./boxPreparedContinuation.js";
@@ -89,17 +90,12 @@ export async function recordBoxFirstFailure(pool: Pick<Pool, "connect">,
     }
     const evidence = parseBoxFirstFailure({ ...projected, observedAtMs: Number(row.observed_ms) });
     if (!evidence) throw new ErrorType("BOX_FAILURE_EVIDENCE_INVALID");
-    const changed = await client.query(
-      `UPDATE request_finalize_journal
-          SET ctx=ctx || jsonb_build_object('boxFirstFailure',$6::jsonb),updated_at=NOW()
-        WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
-          AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
-          AND ctx->>'boxOwnerRequestId' IS NOT DISTINCT FROM $7::text
-          AND NOT (ctx ? 'boxFirstFailure') AND NOT (ctx ? 'boxReplayMessage')
-          AND NOT (ctx ? 'boxToolHandoff') AND NOT (ctx ? 'boxUsage')`,
-      [input.requestId, input.uid.toString(), input.accountId.toString(), input.runNonce,
-        input.leaseEpoch, JSON.stringify(evidence), input.ownerRequestId ?? null]);
-    if (changed.rowCount !== 1) throw new ErrorType("BOX_FAILURE_FENCE_LOST");
+    const changed = await updateRecordBoxFirstFailure(client, {
+      requestId: input.requestId, uid: input.uid, accountId: input.accountId,
+      runNonce: input.runNonce, leaseEpoch: input.leaseEpoch,
+      evidenceJson: JSON.stringify(evidence), ownerRequestId: input.ownerRequestId ?? null,
+    });
+    if (!changed) throw new ErrorType("BOX_FAILURE_FENCE_LOST");
     await client.query("COMMIT"); committed = true; return evidence;
   } finally {
     if (!committed) await client.query("ROLLBACK").catch(() => {});

@@ -302,19 +302,26 @@ export async function getVersionedPreferences(userId: string): Promise<Preferenc
 
 /** Shared business validation for manual settings and approved actions; preparation performs no mutation. */
 export async function resolvePreferencesPatch(userId: string, raw: unknown, deps: {
-  feature?: (userId: string) => Promise<{ eligible: boolean; available: boolean }>
+  feature?: (
+    userId: string,
+    mode?: { legacyEnabled: boolean; optimizerEnabled: boolean },
+  ) => Promise<{ eligible: boolean; available: boolean }>
 } = {}): Promise<PreferencesPatch> {
   const parsed = PreferencesPatchSchema.safeParse(raw);
   if (!parsed.success) throw new PreferencesError('VALIDATION', parsed.error.issues.map(i => `${i.path.join('.') || '<root>'}: ${i.message}`).join('; '));
   if (parsed.data.enabled_plugins?.some((slug) => !isPluginAvailable(slug)))
     throw new PreferencesError('VALIDATION', '不能启用已下架的插件');
   const { getAutoDreamFeature, normalizeAutoDreamPreferencePatch } = await import('./autoDream.js');
-  if (parsed.data.auto_dream_enabled === true || parsed.data.auto_optimizer_enabled === true) {
-    const feature = await (deps.feature ? deps.feature(userId) : getAutoDreamFeature(userId, true));
+  const normalized = PreferencesPatchSchema.safeParse(normalizeAutoDreamPreferencePatch(parsed.data));
+  if (!normalized.success) throw new PreferencesError('INTERNAL', '规范化后的偏好补丁无效');
+  const legacyEnabled = normalized.data.auto_dream_enabled === true;
+  const optimizerEnabled = normalized.data.auto_optimizer_enabled === true;
+  if (legacyEnabled || optimizerEnabled) {
+    const feature = await (deps.feature
+      ? deps.feature(userId, { legacyEnabled, optimizerEnabled })
+      : getAutoDreamFeature(userId, legacyEnabled, optimizerEnabled));
     if (!feature.eligible) throw new PreferencesError('FORBIDDEN', 'Auto-Dream 需要 Max 及以上订阅套餐');
     if (!feature.available) throw new PreferencesError('UNAVAILABLE', 'Auto-Dream 模型当前不可用，请稍后重试');
   }
-  const normalized = PreferencesPatchSchema.safeParse(normalizeAutoDreamPreferencePatch(parsed.data));
-  if (!normalized.success) throw new PreferencesError('INTERNAL', '规范化后的偏好补丁无效');
   return normalized.data;
 }

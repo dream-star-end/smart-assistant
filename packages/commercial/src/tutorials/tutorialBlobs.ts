@@ -6,15 +6,22 @@ export async function upsertTutorialBlobs(
   blobs: readonly TutorialBlobDraft[],
   runner: QueryRunner,
 ): Promise<void> {
-  for (const blob of blobs) {
-    await query(
-      `INSERT INTO tutorial_blobs (sha256, kind, mime, bytes, body)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (sha256) DO NOTHING`,
-      [blob.sha256, blob.kind, blob.mime, blob.bytes, blob.body],
-      runner,
-    )
-  }
+  if (blobs.length === 0) return
+  await query(
+    `INSERT INTO tutorial_blobs (sha256, kind, mime, bytes, body)
+     SELECT t.sha256, t.kind, t.mime, t.bytes, t.body
+       FROM unnest($1::text[], $2::text[], $3::text[], $4::int[], $5::bytea[])
+         AS t(sha256, kind, mime, bytes, body)
+     ON CONFLICT (sha256) DO NOTHING`,
+    [
+      blobs.map((b) => b.sha256),
+      blobs.map((b) => b.kind),
+      blobs.map((b) => b.mime),
+      blobs.map((b) => b.bytes),
+      blobs.map((b) => b.body),
+    ],
+    runner,
+  )
 }
 
 export async function replaceTutorialBlobRefs(
@@ -23,14 +30,14 @@ export async function replaceTutorialBlobRefs(
   runner: QueryRunner,
 ): Promise<void> {
   await query('DELETE FROM tutorial_blob_refs WHERE publication_id = $1::bigint', [publicationId], runner)
-  for (const blob of blobs) {
-    await query(
-      `INSERT INTO tutorial_blob_refs (publication_id, sha256, role)
-       VALUES ($1::bigint, $2, $3)`,
-      [publicationId, blob.sha256, blob.role],
-      runner,
-    )
-  }
+  if (blobs.length === 0) return
+  await query(
+    `INSERT INTO tutorial_blob_refs (publication_id, sha256, role)
+     SELECT $1::bigint, t.sha256, t.role
+       FROM unnest($2::text[], $3::text[]) AS t(sha256, role)`,
+    [publicationId, blobs.map((b) => b.sha256), blobs.map((b) => b.role)],
+    runner,
+  )
 }
 
 export type PublicTutorialBlob = {

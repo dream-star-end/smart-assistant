@@ -1459,7 +1459,13 @@ export async function handleListPublicModels(
   if (typeof authHeader === "string") {
     token = authHeader.replace(/^Bearer\s+/i, "").trim();
   }
-  const claims = token ? verifyCommercialJwtSync(token, deps.jwtSecret) : null;
+  let claims = token ? verifyCommercialJwtSync(token, deps.jwtSecret) : null;
+  if (!claims) {
+    const cookieToken = getSessionCookieToken(req);
+    if (cookieToken && cookieToken !== token) {
+      claims = verifyCommercialJwtSync(cookieToken, deps.jwtSecret);
+    }
+  }
   // 0108 provider 健康度:degraded provider 的模型附 degraded:true(**只注解不过滤**;
   // 前端标「暂不可用」+ 禁选)。fail-soft:读失败返回空集 → 不误标降级(UX 红线)。
   const degraded = await getDegradedProviders();

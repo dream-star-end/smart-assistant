@@ -4868,10 +4868,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         // legacy 路径的 dedup 在持久之后判定(dispatch 路径已在受理前 dedup,useDispatchAdmission 分支
         // 内 tryDedupCompleted 已消费;此处仅对 legacy 生效,避免二次 dedup 同一轮)。
         if (!useDispatchAdmission && await tryDedupCompleted()) return null;
-        let enriched: Record<string, unknown> = {
-          ...frameObj,
-          _workspaceMode: sessionWorkspaceMode,
-        };
+        let enriched: Record<string, unknown> = { ...frameObj, _workspaceMode: sessionWorkspaceMode };
+        delete enriched._masterHistoricalMessages;
         if (rawHistory !== null) {
           const historical = _sanitizeMasterHistoricalMessagesForFrame(rawHistory, {
             ...(clientMessageId ? { excludeClientMessageId: clientMessageId } : {}),
@@ -5190,10 +5188,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         try {
           const bytes = typeof data === 'string' ? Buffer.from(data) : Array.isArray(data) ? Buffer.concat(data) : Buffer.isBuffer(data) ? data : Buffer.from(data);
           const parsed: unknown = JSON.parse(bytes.toString('utf8'));
-          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Object.prototype.hasOwnProperty.call(parsed, SYSTEM_HELP_BOOTSTRAP_FIELD)) {
-            takeSystemHelpBootstrap(parsed);
-            passthroughData = Buffer.from(JSON.stringify(parsed), 'utf8');
-            passthroughLen = passthroughData.byteLength;
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            const p = parsed as Record<string, unknown>;
+            const sH = Object.prototype.hasOwnProperty.call(p, SYSTEM_HELP_BOOTSTRAP_FIELD), sM = Object.prototype.hasOwnProperty.call(p, '_masterHistoricalMessages');
+            if (sH || sM) { if (sH) takeSystemHelpBootstrap(p); if (sM) delete p._masterHistoricalMessages; passthroughData = Buffer.from(JSON.stringify(p), 'utf8'); passthroughLen = passthroughData.byteLength; }
           }
         } catch { /* ordinary binary payloads retain their original transport */ }
       }
@@ -5218,8 +5216,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // Browser never authors platform GoalState or the master-only sync
             // control frame. Strip the former and drop the latter before any
             // async enrichment/forwarding.
-            if (Object.prototype.hasOwnProperty.call(parsedObj, "_goalState")) {
+            if (Object.prototype.hasOwnProperty.call(parsedObj, "_goalState") || Object.prototype.hasOwnProperty.call(parsedObj, "_masterHistoricalMessages")) {
               delete parsedObj._goalState;
+              delete parsedObj._masterHistoricalMessages;
               const strippedStr = JSON.stringify(parsedObj);
               passthroughData = Buffer.from(strippedStr, "utf8");
               passthroughLen = Buffer.byteLength(strippedStr);
