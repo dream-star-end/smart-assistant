@@ -176,7 +176,7 @@ export function AccountMenuContent({
                   data-product-feature={PRODUCT_CAPABILITIES.preferences.id}
                   onClick={() => handleSelectTheme(opt.value)}
                   className={cn(
-                    "oc-spring-press flex h-7 items-center justify-center gap-1 rounded-sm text-caption font-medium outline-none transition-[background-color,color,box-shadow] duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:h-9",
+                    "oc-spring-press flex h-7 items-center justify-center gap-1 rounded-sm text-caption font-medium outline-none transition-[background-color,color,box-shadow] duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:h-11 [@media(hover:none)]:min-h-11",
                     active
                       ? "bg-surface text-fg shadow-xs ring-1 ring-inset ring-border/70"
                       : "text-faint hover:text-fg",

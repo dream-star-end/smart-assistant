@@ -71,7 +71,7 @@ export function EmptyState({
       />
       <div className="relative flex w-full max-w-3xl flex-col items-center">
         {/* 当前智能体身份 + 切换入口收成一枚雕塑磨砂胶囊，轻盈漂浮 + 柔和暖陶土呼吸光晕。 */}
-        <div className="oc-surface-glass oc-float-gentle oc-breathe-aura oc-shimmer-sheen inline-flex items-center gap-1.5 rounded-full py-1 pl-1.5 pr-1">
+        <div className="oc-surface-glass oc-float-gentle oc-breathe-aura inline-flex items-center gap-1.5 rounded-full py-1 pl-1.5 pr-1">
           <AgentAvatar agent={agent} className="size-7 rounded-full" iconSize={14} />
           <span className="max-w-[40vw] truncate pl-1 text-body font-semibold tracking-tight text-fg">
             {agent.name}
@@ -82,7 +82,7 @@ export function EmptyState({
             size="sm"
             shape="pill"
             onClick={onChangeAgent}
-            className="oc-spring-press h-7 gap-1 px-2.5 text-caption font-medium text-muted hover:bg-accent-soft hover:text-accent"
+            className="oc-spring-press h-7 gap-1 px-2.5 text-caption font-medium text-muted hover:bg-accent-soft hover:text-accent [@media(hover:none)]:h-11 [@media(hover:none)]:min-h-11"
           >
             <ArrowLeftRight size={12} strokeWidth={1.75} aria-hidden="true" />
             换一个智能体
@@ -114,7 +114,7 @@ export function EmptyState({
                 style={{ "--stagger-i": i } as CSSProperties}
                 // 手机竖屏放不下 4 张卡(占满整屏视口):前 2 张足以下手,其余 md 起恢复。
                 // 装饰性眉标与箭头均 aria-hidden，保证按钮可访问名精确等于 starter 文本。
-                className={`oc-surface-card oc-hover-lift oc-spring-press oc-shimmer-sheen oc-stagger-in oc-icon-nudge group flex flex-col justify-between gap-3 rounded-lg p-4 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg${
+                className={`oc-surface-card oc-hover-lift oc-spring-press${i === 0 ? " oc-shimmer-sheen" : ""} oc-stagger-in oc-icon-nudge group flex flex-col justify-between gap-3 rounded-lg p-4 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg${
                   i >= 2 ? " hidden md:flex" : ""
                 }`}
               >

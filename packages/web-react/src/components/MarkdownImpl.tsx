@@ -20,6 +20,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ComponentProps,
   type ComponentPropsWithoutRef,
   type ReactNode,
 } from "react";
@@ -237,7 +238,7 @@ function MarkdownTable({ children, className, ...props }: ComponentPropsWithoutR
           <div
             aria-hidden="true"
             data-testid="markdown-table-fade"
-            className="pointer-events-none absolute inset-y-px right-px w-8 rounded-r-[11px] bg-gradient-to-l from-surface via-surface/75 to-transparent"
+            className="pointer-events-none absolute inset-y-px right-px w-8 rounded-r-md bg-gradient-to-l from-surface via-surface/75 to-transparent"
           />
         )}
       </div>
@@ -350,6 +351,9 @@ function hasMarkdownImage(children: ReactNode): boolean {
     return child.props.node?.tagName === "img" || hasMarkdownImage(child.props.children);
   });
 }
+
+const REMARK_PLUGINS = [remarkGfm, remarkMath];
+const REHYPE_KATEX_OPTIONS = { strict: false, throwOnError: false, errorColor: "var(--danger)" } as const;
 
 export default function MarkdownImpl({
   children,
@@ -552,6 +556,27 @@ export default function MarkdownImpl({
     }),
     [signMedia, blockImages, readOnly, tutorialImage],
   );
+  const rehypePlugins = useMemo(
+    () => [
+      rehypeBareBreaks,
+      // detect=false 时没标语言的块不做同步语言探测（大文件预览防卡死，见 MarkdownProps.autoDetectCode）。
+      [rehypeHighlightShared, {
+        detect: autoDetectCode,
+        onPendingDetect,
+        knownLanguage,
+        // 只在流式尾段预取(项目文件预览等主动关探测的场景不探测)。
+        prefetchDetect: live && !autoDetectCode ? prefetchDetect : undefined,
+      }],
+      // 数学公式：$..$ / $$..$$ → KaTeX 渲染(remarkMath 解析 + rehypeKatex 出 HTML)。
+      // errorColor 跟随主题 token(KaTeX 默认 #cc0000 在暗色底上对比度不足)。
+      [rehypeKatex, REHYPE_KATEX_OPTIONS],
+      // 仅在 signMedia(助手正文)启用：把媒体路径行内码转成可签名媒体节点。
+      ...(signMedia && !readOnly ? [rehypeEmbedMedia] : []),
+      // 流式光标内联到最后一个文本块末尾(最后执行,看到的是最终树)。
+      ...(caret ? [rehypeLiveCaret] : []),
+    ] as ComponentProps<typeof ReactMarkdown>["rehypePlugins"],
+    [autoDetectCode, onPendingDetect, knownLanguage, live, prefetchDetect, signMedia, readOnly, caret],
+  );
   let source = typeof children === "string" ? children : "";
   // 流式中未闭合的 $$:截掉半截公式,块后给一行静默占位(OCV5-421)。
   const heldMath = live && typeof children === "string" ? unclosedDisplayMathStart(children) : -1;
@@ -559,25 +584,8 @@ export default function MarkdownImpl({
   const body = (
     <>
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[
-          rehypeBareBreaks,
-          // detect=false 时没标语言的块不做同步语言探测（大文件预览防卡死，见 MarkdownProps.autoDetectCode）。
-          [rehypeHighlightShared, {
-            detect: autoDetectCode,
-            onPendingDetect,
-            knownLanguage,
-            // 只在流式尾段预取(项目文件预览等主动关探测的场景不探测)。
-            prefetchDetect: live && !autoDetectCode ? prefetchDetect : undefined,
-          }],
-          // 数学公式：$..$ / $$..$$ → KaTeX 渲染(remarkMath 解析 + rehypeKatex 出 HTML)。
-          // errorColor 跟随主题 token(KaTeX 默认 #cc0000 在暗色底上对比度不足)。
-          [rehypeKatex, { strict: false, throwOnError: false, errorColor: "var(--danger)" }],
-          // 仅在 signMedia(助手正文)启用：把媒体路径行内码转成可签名媒体节点。
-          ...(signMedia && !readOnly ? [rehypeEmbedMedia] : []),
-          // 流式光标内联到最后一个文本块末尾(最后执行,看到的是最终树)。
-          ...(caret ? [rehypeLiveCaret] : []),
-        ]}
+        remarkPlugins={REMARK_PLUGINS}
+        rehypePlugins={rehypePlugins}
         components={components}
         urlTransform={tutorialImage ? tutorialUrlTransform : undefined}
       >

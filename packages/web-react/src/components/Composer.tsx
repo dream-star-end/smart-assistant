@@ -13,7 +13,6 @@ import {
 } from "lucide-react";
 import {
   lazy,
-  Suspense,
   useCallback,
   useEffect,
   useId,
@@ -114,6 +113,10 @@ type SlashCommandDef = {
   desc: string;
 };
 
+function isImeComposing(e: { nativeEvent: { isComposing?: boolean }; keyCode: number }, composing: boolean): boolean {
+  return composing || Boolean(e.nativeEvent.isComposing) || e.keyCode === 229;
+}
+
 function availableSlashCommands(opts: {
   hasQuickAsk: boolean;
   swarmSupported: boolean;
@@ -134,7 +137,7 @@ function availableSlashCommands(opts: {
     );
   }
   if (opts.swarmSupported) {
-    list.push({ cmd: "/swarm", label: "/swarm", desc: "以 Antigravity 蜂群多智能体协作执行本轮" });
+    list.push({ cmd: "/swarm", label: "/swarm", desc: "以蜂群多智能体协作执行本轮" });
   }
   return list;
 }
@@ -415,10 +418,31 @@ export function Composer({
   const [textareaScrollTop, setTextareaScrollTop] = useState(0);
   const [slashIndex, setSlashIndex] = useState(0);
   const [slashDismissedFor, setSlashDismissedFor] = useState<string | null>(null);
+  const slashMenuId = useId();
   const predictionHintId = useId();
   const [composing, setComposing] = useState(false);
   const [caretAtEnd, setCaretAtEnd] = useState(true);
   const [dismissedPrediction, setDismissedPrediction] = useState<string | null>(null);
+  const prevDraftKeyRef = useRef(draftKey);
+  useEffect(() => {
+    const prev = prevDraftKeyRef.current;
+    if (prev === draftKey) return;
+    prevDraftKeyRef.current = draftKey;
+    const isDraftMaterializing =
+      prev === "new" || (typeof prev === "string" && prev.endsWith(":new"));
+    setTotalLimitNotice(null);
+    if (!isDraftMaterializing) setGoalOpen(false);
+    setPlusMenuOpen(false);
+    setPlaybookOpen(false);
+    setPreview(null);
+    setVoiceMsg(null);
+    if (voiceMsgTimerRef.current !== null) {
+      window.clearTimeout(voiceMsgTimerRef.current);
+      voiceMsgTimerRef.current = null;
+    }
+    setSlashDismissedFor(null);
+    setDismissedPrediction(null);
+  }, [draftKey]);
   // 删字时不叠预测(OCV5-642):框里留着上一轮发过的那句时,每按一次 Backspace 补全都把删掉的尾巴
   // 用浅色字补回来,整句纹丝不动;删空后又冒出整句预测 —— 看起来就是「草稿删不掉」。
   // 最后一次编辑是删除、之后没再改过 → 不显示任何预测。
@@ -750,7 +774,7 @@ export function Composer({
     // webview 兜底:选择结果为空(取消/被就地清空/webview 返回空)时给出可见反馈,
     // 把"点了没反应"的静默失败变成可诊断的提示,而不是让用户以为功能坏了。
     if (picked.length === 0) {
-      toast("未获取到所选文件,请重试", "info");
+      toast("未获取到所选文件，请重试", "info");
       return;
     }
     const oversized = picked.filter((file) => file.size > MAX_UPLOAD_FILE_BYTES);
@@ -774,7 +798,7 @@ export function Composer({
     const room = Math.max(0, MAX_ATTACH - attachCountRef.current);
     const arr = accepted.slice(0, room);
     const dropped = accepted.length - arr.length;
-    if (dropped > 0) toast(`最多 ${MAX_ATTACH} 个附件,已忽略 ${dropped} 个`, "info");
+    if (dropped > 0) toast(`最多 ${MAX_ATTACH} 个附件，已忽略 ${dropped} 个`, "info");
     attachCountRef.current += arr.length;
     attachBytesRef.current += arr.reduce((sum, file) => sum + finiteAttachmentBytes(file.size), 0);
     for (const file of arr) {
@@ -873,16 +897,18 @@ export function Composer({
       <div className="relative">
       {slashMenuOpen && (
         <div
+          id={slashMenuId}
           role="listbox"
           aria-label="快捷指令"
           data-testid="composer-slash-menu"
-          className="oc-surface-popover absolute inset-x-0 bottom-full z-30 mb-2 overflow-hidden rounded-lg p-1.5 animate-in"
+          className="oc-surface-popover absolute inset-x-0 bottom-full z-[var(--z-popover-inline)] mb-2 overflow-hidden rounded-lg p-1.5 animate-in"
         >
           {slashMatches.map((item, idx) => {
             const active = idx === activeSlashIndex;
             return (
               <button
                 key={item.cmd}
+                id={`${slashMenuId}-opt-${idx}`}
                 type="button"
                 role="option"
                 aria-selected={active}
@@ -1047,7 +1073,8 @@ export function Composer({
         {/* 输入区上方轻提示条：承接触屏「填入建议」、停止/上传状态、超长草稿与字数，确保 375px 底栏发送键永不溢出。 */}
         {((coarsePointer && ghostRest && !busy) ||
           stopping ||
-          (!busy && (attachFailed || uploading)) ||
+          attachFailed ||
+          uploading ||
           draftVolatile ||
           value.length > 2000) && (
           <div
@@ -1074,7 +1101,7 @@ export function Composer({
                 正在停止…
               </output>
             )}
-            {!busy && (attachFailed || uploading) && (
+            {(attachFailed || uploading) && (
               <output
                 data-testid="composer-send-blocked-reason"
                 className={cn("text-caption", attachFailed ? "text-danger" : "text-faint")}
@@ -1111,7 +1138,12 @@ export function Composer({
               rows={1}
               value={value}
               disabled={disabled}
+              role={slashMenuOpen ? "combobox" : undefined}
               aria-label="消息输入框"
+              aria-autocomplete="list"
+              aria-expanded={slashMenuOpen ? true : undefined}
+              aria-controls={slashMenuOpen ? slashMenuId : undefined}
+              aria-activedescendant={slashMenuOpen ? `${slashMenuId}-opt-${activeSlashIndex}` : undefined}
               aria-describedby={ghostRest ? predictionHintId : undefined}
               onChange={(e) => {
                 setValue(e.target.value);
@@ -1138,7 +1170,8 @@ export function Composer({
                 void onFiles(files);
               }}
               onKeyDown={(e) => {
-                if (slashMenuOpen && !e.nativeEvent.isComposing && e.keyCode !== 229) {
+                if (isImeComposing(e, composing)) return;
+                if (slashMenuOpen) {
                   if (e.key === "ArrowDown" || e.key === "ArrowUp") {
                     e.preventDefault();
                     const step = e.key === "ArrowDown" ? 1 : -1;
@@ -1168,7 +1201,6 @@ export function Composer({
                 if (
                   ghostRest &&
                   (e.key === "Tab" || e.key === "ArrowRight") &&
-                  !e.nativeEvent.isComposing &&
                   !e.shiftKey &&
                   !e.altKey &&
                   !e.ctrlKey &&
@@ -1178,7 +1210,7 @@ export function Composer({
                   acceptPrediction();
                   return;
                 }
-                if (e.key === "ArrowUp" && value === "" && !e.nativeEvent.isComposing && lastUserText) {
+                if (e.key === "ArrowUp" && value === "" && lastUserText) {
                   e.preventDefault();
                   setValue(lastUserText);
                   requestAnimationFrame(() => {
@@ -1191,19 +1223,19 @@ export function Composer({
                 }
                 // 引用块只能点「×」取消(C-23):textarea 聚焦且不在生成中时 Esc 直接取消引用;
                 // 生成中不拦,让全局 Esc 仍走「停止生成」(lib/hotkeys)。
-                if (e.key === "Escape" && replyTo && onCancelReply && !busy && !e.nativeEvent.isComposing) {
+                if (e.key === "Escape" && replyTo && onCancelReply && !busy) {
                   e.preventDefault();
                   onCancelReply();
                   return;
                 }
                 // Esc 收起整句预测(不在生成中才会显示,不和全局「停止生成」抢键)。空框按 Backspace 同样
                 // 收起:浅色整句像一段删不掉的旧草稿(OCV5-642)。
-                if ((e.key === "Escape" || e.key === "Backspace") && value === "" && ghostRest && !e.nativeEvent.isComposing) {
+                if ((e.key === "Escape" || e.key === "Backspace") && value === "" && ghostRest) {
                   e.preventDefault();
                   setDismissedPrediction(ghostRest);
                   return;
                 }
-                if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+                if (e.key === "Enter") {
                   // 粗指针(移动/触屏):Enter=换行,发送交给按钮 —— 否则无法输入多段消息。
                   if (coarsePointer) return;
                   const mod = e.metaKey || e.ctrlKey;
@@ -1222,7 +1254,7 @@ export function Composer({
               )}
             />
             {ghostRest && (
-              <Suspense fallback={null}>
+              <LazyBoundary fallback={null}>
                 <ComposerPrediction
                   value={value}
                   rest={ghostRest}
@@ -1231,7 +1263,7 @@ export function Composer({
                   scrollTop={textareaScrollTop}
                   onShown={onPredictionShown}
                 />
-              </Suspense>
+              </LazyBoundary>
             )}
           </div>
           <div
@@ -1249,6 +1281,7 @@ export function Composer({
               ref={fileRef}
               type="file"
               multiple
+              disabled={disabled}
               tabIndex={-1}
               className="sr-only"
               // 结构红线(T4:type=file/无 accept/非 display:none/tabindex=-1)一项不动。
@@ -1380,6 +1413,7 @@ export function Composer({
                 type="button"
                 data-product-control
                 aria-label={stopping ? "正在停止" : busy ? "停止" : "发送"}
+                aria-busy={stopping || submitting || undefined}
                 aria-describedby={!busy && sendablePrediction ? predictionHintId : undefined}
                 title={
                   totalLimitMessage
@@ -1401,15 +1435,15 @@ export function Composer({
                   }
                   submit(true);
                 }}
-                disabled={stopping || (!canSend && !busy) || disabled}
+                disabled={stopping || submitting || (!canSend && !busy) || disabled}
                 className={cn(
-                  "oc-btn-tactile oc-spring-press oc-icon-nudge flex size-9 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface [@media(hover:none)]:size-10",
+                  "oc-btn-tactile oc-spring-press oc-icon-nudge flex size-9 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface [@media(hover:none)]:size-11",
                   busy
                     ? "oc-btn-primary-craft text-primary-fg"
                     : canSend
                       ? swarmMode
-                        ? "oc-btn-accent-craft oc-shimmer-sheen text-accent-fg"
-                        : "oc-btn-primary-craft oc-shimmer-sheen text-primary-fg"
+                        ? "oc-btn-accent-craft text-accent-fg"
+                        : "oc-btn-primary-craft text-primary-fg"
                       : swarmMode
                         ? "border border-accent/25 bg-accent-soft/75 text-accent/70"
                         : "oc-surface-recessed border border-border/80 text-muted",
@@ -1435,7 +1469,7 @@ export function Composer({
           aria-live="polite"
           data-testid="composer-voice-status"
           className={cn(
-            "flex min-h-[30px] items-center justify-end px-1.5 py-1.5 text-xs",
+            "flex min-h-[30px] items-center justify-end px-1.5 py-1.5 text-caption",
             !voiceStatus && "sr-only",
           )}
         >
@@ -1444,7 +1478,7 @@ export function Composer({
       )}
 
       {voiceToggleNonce > 0 && (
-        <Suspense fallback={null}>
+        <LazyBoundary fallback={null}>
           <ComposerVoiceController
             toggleNonce={voiceToggleNonce}
             getToken={getVoiceToken}
@@ -1452,13 +1486,13 @@ export function Composer({
             onError={onVoiceErr}
             onStateChange={setVoiceState}
           />
-        </Suspense>
+        </LazyBoundary>
       )}
       {/* 图片附件灯箱:点击缩略图才按需加载，不进首屏包。 */}
       {preview && (
-        <Suspense fallback={null}>
+        <LazyBoundary fallback={null}>
           <ComposerImageLightbox preview={preview} onClose={() => setPreview(null)} />
-        </Suspense>
+        </LazyBoundary>
       )}
 
       {/* 会话目标对话框:由「+」菜单里的目标项打开(入口自会话头部迁入,功能本身不变)。 */}

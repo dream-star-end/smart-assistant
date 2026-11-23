@@ -16,7 +16,6 @@ import {
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
-  Suspense,
   lazy,
   useEffect,
   useMemo,
@@ -40,6 +39,7 @@ import type {
 } from "../lib/types";
 import { cn, formatCompactCount, formatCredits } from "../lib/utils";
 import { BrandMark } from "./BrandMark";
+import { LazyBoundary } from "./ChunkErrorBoundary";
 import { ProjectRow } from "./sidebar/ProjectRow";
 import { SessionRow } from "./sidebar/SessionRow";
 import { VirtualList } from "./sidebar/VirtualList";
@@ -123,7 +123,7 @@ const EMPTY_HINT_CTA_HEIGHT = 108;
 /** 零会话零项目的引导空态（图标 + 标题 + 两行说明 + 两个按钮，S-13）。 */
 const EMPTY_ALL_HEIGHT = 200;
 const NAV_ITEM_BASE =
-  "oc-spring-press oc-icon-nudge group relative flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:h-9";
+  "oc-spring-press oc-icon-nudge group relative flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:h-11 [@media(hover:none)]:min-h-11";
 const NAV_ITEM_ACTIVE = "bg-sidebar-active font-medium text-fg shadow-sidebar-active";
 const NAV_ITEM_IDLE = "text-muted hover:bg-hover/80 hover:text-fg";
 
@@ -723,7 +723,7 @@ export function Sidebar({
       aria-label={hasAccountMenu ? "账号菜单" : undefined}
       onPointerEnter={warmAccountMenu}
       onFocus={warmAccountMenu}
-      className="oc-btn-tactile oc-spring-press group flex min-w-0 flex-1 items-center gap-2 rounded-sm py-1.5 pl-1.5 pr-2 text-left outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring enabled:hover:bg-hover/80 data-[state=open]:bg-sidebar-active data-[state=open]:shadow-sidebar-active [@media(hover:none)]:min-h-10"
+      className="oc-btn-tactile oc-spring-press group flex min-w-0 flex-1 items-center gap-2 rounded-sm py-1.5 pl-1.5 pr-2 text-left outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring enabled:hover:bg-hover/80 data-[state=open]:bg-sidebar-active data-[state=open]:shadow-sidebar-active [@media(hover:none)]:min-h-11"
     >
       <Avatar
         size="sm"
@@ -861,7 +861,7 @@ export function Sidebar({
     if (item.kind === "more") {
       // 与项目下缩进会话标题同一左对齐基线（pl-2 + pl-7 = 36px）。
       return (
-        <div className="relative h-full py-px pl-2">
+        <div className="relative h-full pl-2 [@media(hover:hover)]:py-px">
           <button
             type="button"
             onClick={() => onOpenProject?.(item.projectId)}
@@ -1009,7 +1009,7 @@ export function Sidebar({
             }
           }}
           // 与项目行同一骨架（16px 图标列 / 名称 / 旋转箭头 / 计数），整行取 faint：归档是次要入口。
-          className="mt-1 flex h-[calc(100%-0.25rem)] w-full items-center gap-2.5 rounded-sm px-2.5 text-left text-section text-faint outline-none transition-colors duration-150 hover:bg-hover/80 hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+          className="mt-1 flex h-[calc(100%-0.25rem)] w-full items-center gap-2.5 rounded-sm px-2.5 text-left text-section text-faint outline-none transition-colors duration-150 hover:bg-hover/80 hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:mt-0 [@media(hover:none)]:h-full"
         >
           <span className="flex size-4 shrink-0 items-center justify-center">
             <Archive size={14} strokeWidth={1.75} aria-hidden />
@@ -1097,7 +1097,7 @@ export function Sidebar({
         {/* 主操作：干练克制的 Codex/Linear 比例，去厚重白砖阴影；有智能体选择时右侧细线切出下拉。 */}
         <div
           data-sidebar-new
-          className="group/new oc-btn-tactile oc-spring-press mb-2 flex h-9 w-full items-stretch rounded-sm border border-border/80 bg-surface/90 text-section shadow-2xs transition-colors duration-150 ease-standard hover:border-border-strong hover:bg-surface [@media(hover:none)]:h-10"
+          className="group/new oc-btn-tactile oc-spring-press mb-2 flex h-9 w-full items-stretch rounded-sm border border-border/80 bg-surface/90 text-section shadow-2xs transition-colors duration-150 ease-standard hover:border-border-strong hover:bg-surface [@media(hover:none)]:h-11"
         >
           <button
             type="button"
@@ -1124,7 +1124,7 @@ export function Sidebar({
                 aria-label="选择智能体后新建"
                 title="选择智能体后新建"
                 onClick={onNewWithAgent}
-                className="flex w-8 shrink-0 items-center justify-center rounded-r-sm text-faint outline-none transition-colors duration-150 hover:bg-hover/60 hover:text-fg focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:w-10"
+                className="flex w-8 shrink-0 items-center justify-center rounded-r-sm text-faint outline-none transition-colors duration-150 hover:bg-hover/60 hover:text-fg focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:w-11"
               >
                 <ChevronDown size={14} strokeWidth={1.75} />
               </button>
@@ -1132,8 +1132,8 @@ export function Sidebar({
           )}
         </div>
 
-        {/* 搜索条：轻柔微凹槽，图标与快捷键轻盈协调。 */}
-        <label className="group/search flex h-8 min-w-0 items-center gap-2.5 rounded-sm border border-transparent bg-hover/65 pl-2.5 pr-1 text-muted transition-colors duration-150 hover:border-border/70 focus-within:border-border-strong focus-within:bg-sidebar-active focus-within:shadow-sidebar-active [@media(hover:none)]:min-h-10">
+        {/* 搜索条：轻柔微凹槽，图标与快捷键轻盈协调；使用 div 容器避免点右侧清除/命令面板/多选按钮时误触关联聚焦弹起软键盘。 */}
+        <div className="group/search flex h-8 min-w-0 items-center gap-2.5 rounded-sm border border-transparent bg-hover/65 pl-2.5 pr-1 text-muted transition-colors duration-150 hover:border-border/70 focus-within:border-border-strong focus-within:bg-sidebar-active focus-within:shadow-sidebar-active [@media(hover:none)]:min-h-11">
           <Search
             size={15}
             strokeWidth={1.75}
@@ -1182,7 +1182,7 @@ export function Sidebar({
                 e.preventDefault();
                 onOpenPalette();
               }}
-              className="oc-btn-tactile flex h-6 shrink-0 items-center justify-center rounded-xs px-0.5 text-faint outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-10 [@media(hover:none)]:px-0"
+              className="oc-btn-tactile flex h-6 shrink-0 items-center justify-center rounded-xs px-0.5 text-faint outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11 [@media(hover:none)]:px-0"
             >
               <kbd className="oc-kbd [@media(hover:none)]:hidden">{paletteKeyLabel()}</kbd>
               <Command size={15} strokeWidth={1.75} aria-hidden className="hidden [@media(hover:none)]:block" />
@@ -1203,7 +1203,7 @@ export function Sidebar({
               <ListChecks size={15} strokeWidth={1.75} />
             </IconButton>
           )}
-        </label>
+        </div>
         {searching && scopeFilterForSearch !== undefined && (
           <div
             data-testid="sidebar-search-scope"
@@ -1306,7 +1306,7 @@ export function Sidebar({
       </div>
 
       {showLiveActivityStrip && !searching && !multiSelect && (hasLiveCandidate || Boolean(optionalAuth)) && (
-        <Suspense fallback={null}>
+        <LazyBoundary fallback={null}>
           <SidebarLiveActivityStrip
             sessions={activeSessions}
             projects={orderedProjects}
@@ -1323,23 +1323,23 @@ export function Sidebar({
             onOpenBoard={onOpenBoard}
             onOpenLiveBrowser={onOpenLiveBrowser}
           />
-        </Suspense>
+        </LazyBoundary>
       )}
 
       {multiSelect && onBatch && (
-        <Suspense fallback={null}>
-        <BatchBar
-          count={selectedIds.size}
-          projects={orderedProjects}
-          hasArchivedSelected={sessions.some((s) => s.archived && selectedIds.has(s.id))}
-          onAction={(action, projectId) => {
-            if (selectedIds.size === 0) return;
-            onBatch([...selectedIds], action, projectId);
-            clearMulti();
-          }}
-          onCancel={clearMulti}
-        />
-        </Suspense>
+        <LazyBoundary fallback={null}>
+          <BatchBar
+            count={selectedIds.size}
+            projects={orderedProjects}
+            hasArchivedSelected={sessions.some((s) => s.archived && selectedIds.has(s.id))}
+            onAction={(action, projectId) => {
+              if (selectedIds.size === 0) return;
+              onBatch([...selectedIds], action, projectId);
+              clearMulti();
+            }}
+            onCancel={clearMulti}
+          />
+        </LazyBoundary>
       )}
 
       {/* 会话列表导航语义:读屏用户按 landmark/region 快速跳到会话区(探针:工作区 nav=0)。 */}
@@ -1383,7 +1383,7 @@ export function Sidebar({
               {accountMenuOpened && (() => {
                 const AccountMenuComp = loadedAccountMenu?.AccountMenuContent ?? LazyAccountMenuContent;
                 return (
-                  <Suspense fallback={null}>
+                  <LazyBoundary fallback={null}>
                     <AccountMenuComp
                       displayName={displayName}
                       email={email}
@@ -1403,7 +1403,7 @@ export function Sidebar({
                       onOpenFeedback={onOpenFeedback}
                       onLogout={onLogout}
                     />
-                  </Suspense>
+                  </LazyBoundary>
                 );
               })()}
             </DropdownMenu>
@@ -1427,11 +1427,12 @@ export function Sidebar({
                 <Bell size={16} strokeWidth={1.75} />
               </IconButton>
               {hasUnreadInbox && (
-                <span
+                <StatusPill
+                  status="unread"
+                  decorative
                   data-testid="sidebar-inbox-badge"
                   data-unread-count={unreadCount}
-                  aria-hidden="true"
-                  className="pointer-events-none absolute right-1 top-1 size-1.5 rounded-full bg-accent ring-2 ring-sidebar [@media(hover:none)]:right-2.5 [@media(hover:none)]:top-2.5"
+                  className="pointer-events-none absolute right-1 top-1 ring-2 ring-sidebar [@media(hover:none)]:right-2.5 [@media(hover:none)]:top-2.5"
                 />
               )}
             </div>

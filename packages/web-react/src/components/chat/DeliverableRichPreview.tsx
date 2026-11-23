@@ -66,6 +66,7 @@ import {
   serializeCsvSlice,
 } from "./deliverablePreview";
 import { useFreshSignedUrl, useSignedDownload } from "./media";
+import { scrollContainerTo } from "./stickToBottom";
 import { AnnotationComposer, FileOverflowMenu, WorkbenchBottomBar, useWorkbenchSheet } from "./WorkbenchBottomBar";
 import { baseName, displayDir } from "./workbench";
 import "./workbenchPreview.css";
@@ -467,7 +468,7 @@ function SlideDeckView({
               type="button"
               aria-expanded={showNotes}
               onClick={() => setShowNotes((v) => !v)}
-              className="flex w-full items-center gap-1.5 text-left text-caption font-medium text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+              className="flex w-full items-center gap-1.5 text-left text-caption font-medium text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
             >
               <ChevronDown size={13} className={cn("transition-transform", !showNotes && "-rotate-90")} aria-hidden />
               演讲者备注
@@ -618,13 +619,7 @@ function LongDocumentView({
         const containerRect = workbenchScroller.getBoundingClientRect();
         const targetRect = target.getBoundingClientRect();
         const nextTop = Math.max(0, workbenchScroller.scrollTop + (targetRect.top - containerRect.top) - 12);
-        if (typeof workbenchScroller.scrollTo === "function") {
-          workbenchScroller.scrollTo({ top: nextTop, behavior: "smooth" });
-        } else {
-          workbenchScroller.scrollTop = nextTop;
-        }
-      } else if (typeof target.scrollIntoView === "function") {
-        target.scrollIntoView({ behavior: "smooth", block: "start" });
+        scrollContainerTo(workbenchScroller, nextTop);
       }
     },
     [],
@@ -673,7 +668,7 @@ function LongDocumentView({
                     type="button"
                     aria-current={active ? "location" : undefined}
                     onClick={() => scrollToHeading(h, idx)}
-                    className="min-w-0 flex-1 truncate text-left text-meta text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    className="min-w-0 flex-1 truncate text-left text-meta text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
                     title={`${h.text}（第 ${h.line} 行）`}
                   >
                     {h.text}
@@ -690,7 +685,7 @@ function LongDocumentView({
                         `${"#".repeat(h.level)} ${h.text}`,
                       );
                     }}
-                    className="shrink-0 rounded px-1.5 py-0.5 text-caption text-accent outline-none hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring"
+                    className="shrink-0 rounded px-1.5 py-0.5 text-caption text-accent outline-none hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-2.5"
                   >
                     批注此节
                   </button>
@@ -712,7 +707,7 @@ function LongDocumentView({
           </Markdown>
         </div>
       ) : (
-        <pre className="flex-1 overflow-auto px-4 py-3 font-mono text-xs text-fg">{text}</pre>
+        <pre className="flex-1 overflow-auto px-4 py-3 font-mono text-caption text-fg">{text}</pre>
       )}
 
       <div className="wb-bottom-dock">
@@ -773,10 +768,10 @@ function BinaryOfficeCard({
 
   const ctaLabel =
     meta.format === "pptx"
-      ? "让 Agent 导出预览图 / 转 Markdown 大纲"
+      ? "让助手导出预览图 / 转 Markdown 大纲"
       : meta.format === "excel"
-        ? "让 Agent 导出 CSV 数据表在线查看"
-        : "让 Agent 转为 Markdown 长文档阅读";
+        ? "让助手导出 CSV 数据表在线查看"
+        : "让助手转为 Markdown 长文档阅读";
 
   const hintText =
     meta.format === "pptx"
@@ -959,7 +954,7 @@ function PdfPreviewView({
             }
           >
             <AtelierIcon name="sparkles" size={14} />
-            让 Agent 提炼摘要
+            让助手提炼摘要
           </Button>
         )}
         {isContainerFile && !state.retryable && (
@@ -1150,7 +1145,7 @@ export function DeliverableRichPreview({
     // 代码 / 纯文本兜底渲染
     const bodyText = text ?? "";
     if (bodyText.length > CODE_HIGHLIGHT_MAX_CHARS) {
-      return <pre className="overflow-auto px-4 py-3 font-mono text-xs text-fg">{bodyText}</pre>;
+      return <pre className="overflow-auto px-4 py-3 font-mono text-caption text-fg">{bodyText}</pre>;
     }
     const language = meta.format === "text" ? "text" : codeLanguageOf(name);
     return (

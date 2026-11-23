@@ -2041,10 +2041,11 @@ describe("Sidebar SIDEBAR-R1 行菜单：右键 / 触屏长按", () => {
     }
   });
 
-  it("多选入口收进搜索行尾部的图标钮，可访问名仍是「多选」", async () => {
+  it("多选入口收进搜索行尾部的图标钮，可访问名仍是「多选」且不被 label 包裹", async () => {
     renderSidebar({ sessions: rows, onBatch: () => {} });
     const entry = screen.getByRole("button", { name: "多选" });
-    expect(entry.closest("label")?.querySelector("[data-sidebar-search]")).not.toBeNull();
+    expect(entry.closest("label")).toBeNull();
+    expect(entry.parentElement?.querySelector("[data-sidebar-search]")).not.toBeNull();
     fireEvent.click(entry);
     expect(await screen.findByTestId("sidebar-batch-bar")).toBeInTheDocument();
   });

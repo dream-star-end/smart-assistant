@@ -172,7 +172,7 @@ function ClaimRow({
     .sort((a, b) => a - b)
 
   return (
-    <li className="text-[13.5px] leading-relaxed text-fg">
+    <li className="text-section leading-relaxed text-fg">
       <div className="flex items-start gap-2">
         <span
           className={cn(

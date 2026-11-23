@@ -47,7 +47,7 @@ function RatioGlyph({ w, h }: { w: number; h: number }) {
       className="flex items-center justify-center"
       style={{ width: `${base}px`, height: `${base}px` }}
     >
-      <span className="rounded-[3px] border-[1.5px] border-current" style={{ width: `${width}px`, height: `${height}px` }} />
+      <span className="rounded-xs border-[1.5px] border-current" style={{ width: `${width}px`, height: `${height}px` }} />
     </span>
   )
 }
@@ -239,7 +239,7 @@ export function ImageResizeMode({
         {!canSubmit && (
           <p className="mb-2 text-center text-xs text-white/60">当前模型不支持调整大小</p>
         )}
-        <div className="mx-auto flex w-full max-w-2xl flex-col gap-1 rounded-2xl bg-neutral-900/90 p-1.5 backdrop-blur">
+        <div className="mx-auto flex w-full max-w-2xl flex-col gap-1 rounded-2xl bg-elevated/90 p-1.5 backdrop-blur">
           {RATIOS.map((r) => (
             <button
               key={r.value}

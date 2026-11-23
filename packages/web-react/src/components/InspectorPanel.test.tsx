@@ -151,7 +151,7 @@ describe("产物详情列(inspector)", () => {
     // 全文:超过卡内 60 行上限的行也在
     expect(screen.getByText(/line-120/)).toBeInTheDocument();
     expect(screen.queryByText(/已截断|查看全文/)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByLabelText("关闭详情面板"));
+    fireEvent.click(screen.getByLabelText("关闭工作台"));
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
@@ -267,10 +267,10 @@ describe("产物详情列(inspector)", () => {
       />,
     );
     const aside = screen.getByRole("complementary");
-    const heading = screen.getByRole("heading", { level: 2, name: "详情面板" });
+    const heading = screen.getByRole("heading", { level: 2, name: "工作台" });
     expect(aside).toHaveAttribute("aria-labelledby", heading.id);
     expect(screen.getByRole("heading", { level: 3, name: "编辑文件" })).toBeInTheDocument();
-    expect(document.activeElement).toBe(screen.getByLabelText("关闭详情面板"));
+    expect(document.activeElement).toBe(screen.getByLabelText("关闭工作台"));
     // Escape 只在焦点在面板里时关面板(OCV5-370:面板可常开,别处的 Esc 属于输入法 / 弹层 / 停止生成)
     const input = document.createElement("textarea");
     document.body.appendChild(input);
@@ -278,7 +278,7 @@ describe("产物详情列(inspector)", () => {
     fireEvent.keyDown(input, { key: "Escape" });
     fireEvent.keyDown(document.body, { key: "Escape" });
     expect(onClose).not.toHaveBeenCalled();
-    fireEvent.keyDown(screen.getByLabelText("关闭详情面板"), { key: "Escape" });
+    fireEvent.keyDown(screen.getByLabelText("关闭工作台"), { key: "Escape" });
     expect(onClose).toHaveBeenCalledTimes(1);
     unmount();
     expect(document.activeElement).toBe(trigger);

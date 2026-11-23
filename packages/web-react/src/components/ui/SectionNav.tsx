@@ -94,13 +94,13 @@ export function SectionNav<T extends string>({
                   data-product-feature={it.featureId}
                   onClick={() => onChange(it.id)}
                   className={cn(
-                    "flex w-full items-center rounded-md px-2.5 py-1.5 text-left text-body outline-none transition-[background-color,color,box-shadow] duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring",
+                    "flex w-full min-w-0 items-center overflow-hidden rounded-md px-2.5 py-1.5 text-left text-body outline-none transition-[background-color,color,box-shadow] duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring",
                     selected
                       ? "oc-segmented-thumb font-medium text-fg"
                       : "text-muted hover:bg-hover hover:text-fg",
                   )}
                 >
-                  {it.label}
+                  <span className="min-w-0 truncate">{it.label}</span>
                 </button>
               );
             })}

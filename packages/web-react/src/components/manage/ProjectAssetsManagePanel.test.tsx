@@ -63,7 +63,7 @@ describe('ProjectAssetsManagePanel', () => {
     expect(text).not.toMatch(/\/api\/|digest|facade|API/i)
   })
 
-  test('工作项目没有绑定会话组：空态说明下一步，而不是「绑定聊天 facade」', () => {
+  test('工作项目没有绑定会话组：空态说明下一步并提供去项目设置入口，不出现「facade」', () => {
     const saved = scopeRef.current
     scopeRef.current = {
       ...saved,
@@ -72,8 +72,9 @@ describe('ProjectAssetsManagePanel', () => {
       chatProjectIdForFilter: undefined,
     }
     const { container } = mount()
-    expect(screen.getByText('这个工作项目还没有绑定会话组')).toBeInTheDocument()
-    expect(screen.getByText(/把一个会话组绑定到这个工作项目后/)).toBeInTheDocument()
+    expect(screen.getByText('当前项目暂未关联项目文件空间')).toBeInTheDocument()
+    expect(screen.getByText(/前往项目设置关联对应的对话项目后/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '去项目设置' })).toBeInTheDocument()
     expect(container.textContent ?? '').not.toMatch(/facade/)
     scopeRef.current = saved
   })

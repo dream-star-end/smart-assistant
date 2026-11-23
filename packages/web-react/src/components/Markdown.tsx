@@ -55,16 +55,34 @@ let markdownImplLoader: Promise<typeof import("./MarkdownImpl")> | null = null;
 // （OCV5-373）。有了它，之后挂载的 Markdown 直接渲染实现，不再走这一次占位。
 let markdownImplModule: typeof import("./MarkdownImpl") | null = null;
 
+function makeLazyMarkdownImpl() {
+  return lazy(() => prefetchMarkdownImpl());
+}
+
+let LazyMarkdownImpl = makeLazyMarkdownImpl();
+
 /** Kick the lazy chunk as soon as a session mounts, before the first Suspense. */
 export function prefetchMarkdownImpl(): Promise<typeof import("./MarkdownImpl")> {
-  markdownImplLoader ??= import("./MarkdownImpl").then((mod) => {
-    markdownImplModule = mod;
-    return mod;
-  });
+  if (!markdownImplLoader) {
+    markdownImplLoader = import("./MarkdownImpl").then(
+      (mod) => {
+        markdownImplModule = mod;
+        return mod;
+      },
+      (err: unknown) => {
+        markdownImplLoader = null;
+        LazyMarkdownImpl = makeLazyMarkdownImpl();
+        throw err;
+      },
+    );
+  }
   return markdownImplLoader;
 }
 
-const LazyMarkdownImpl = lazy(() => prefetchMarkdownImpl());
+function RetryableMarkdownImpl(props: MarkdownProps) {
+  const Impl = LazyMarkdownImpl;
+  return <Impl {...props} />;
+}
 
 type HtmlFenceFallback = {
   before: string;
@@ -176,8 +194,9 @@ export const Markdown = memo(function Markdown({
   tutorialImage,
 }: MarkdownProps) {
   // 组件类型按实例在挂载时定一次：chunk 到达前挂载的实例（如正在流式的消息）保持 lazy，
-  // 不会在 chunk 到达后因类型变化再被整块重挂（HTML 预览 iframe 会因此重载）。
-  const [MarkdownImpl] = useState(() => markdownImplModule?.default ?? LazyMarkdownImpl);
+  // 不会在 chunk 到达后因类型变化再被整块重挂（HTML 预览 iframe 会因此重载）；
+  // 若 chunk 拉取失败则由 RetryableMarkdownImpl 读取重建后的新 lazy，配合 MarkdownBoundary 自动恢复。
+  const [MarkdownImpl] = useState(() => markdownImplModule?.default ?? RetryableMarkdownImpl);
   const fallback = <MarkdownFallback live={live} readOnly={readOnly} bare={bare}>{children}</MarkdownFallback>;
   return (
     <MarkdownBoundary fallback={fallback} resetKey={children}>

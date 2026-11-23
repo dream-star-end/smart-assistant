@@ -816,7 +816,7 @@ describe("LiveBrowserStage", () => {
     fireEvent.click(img, { clientX: 100, clientY: 50 });
     fireEvent.click(img, { clientX: 300, clientY: 150 });
     rejectFirst(new Error("action failed"));
-    expect(await screen.findByTestId("live-browser-error")).toHaveTextContent("action failed");
+    expect(await screen.findByTestId("live-browser-error")).toHaveTextContent("云端浏览器连接失败，请稍后重试");
     const clickCalls = sendActionMock.mock.calls.filter(
       (c) => (c[2] as { action?: string })?.action === "click",
     );

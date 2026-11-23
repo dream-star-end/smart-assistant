@@ -311,10 +311,10 @@ export function HtmlPreview({ code, live, fileSrc }: { code: string; live?: bool
       </span>
       <Dialog.Root open={full} onOpenChange={setFull}>
         <Dialog.Portal>
-          <Dialog.Overlay className="fixed inset-0 z-[60] bg-bg/80 backdrop-blur-sm animate-in" />
+          <Dialog.Overlay className="fixed inset-0 z-[var(--z-viewer)] bg-bg/80 backdrop-blur-sm animate-in" />
           <Dialog.Content
             aria-describedby={undefined}
-            className="fixed inset-2 z-[61] flex flex-col overflow-hidden rounded-2xl border border-border bg-bg shadow-2xl outline-none sm:inset-6"
+            className="fixed inset-2 z-[var(--z-viewer)] flex flex-col overflow-hidden rounded-2xl border border-border bg-bg shadow-2xl outline-none sm:inset-6"
           >
             <Dialog.Title className="sr-only">交互内容全屏</Dialog.Title>
             <iframe

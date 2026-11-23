@@ -10,7 +10,6 @@ import {
   Quote,
   RotateCcw,
   Square,
-  Unlink,
   Zap,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -36,6 +35,7 @@ import {
 } from "../../lib/quickAskSession";
 import type { AuthSession, PublicModel, Session, User } from "../../lib/types";
 import { cn } from "../../lib/utils";
+import { altKeyLabel, modKeyLabel } from "../ChatHeader";
 import { MessageList } from "../MessageRenderer";
 import { modelLabel } from "../ModelSelector";
 import { parseModelDisplayMeta } from "../ModelSelectorExtras";
@@ -53,6 +53,7 @@ import {
 import { ModelFamilyIcon } from "../ui/ModelFamilyIcons";
 import type { CardCallbacks } from "./cards";
 import type { PermissionRespond } from "./permissionPromptState";
+import { snapScrollToBottomOnce } from "./stickToBottom";
 
 const QUICK_ASK_MODEL_STORAGE_KEY = "oc.quickAsk.model";
 const QUICK_ASK_LANES_STORAGE_PREFIX = "oc.quickAsk.lanes.";
@@ -268,6 +269,7 @@ export function QuickAskWindow({
   authRef,
   user,
   demo,
+  agent,
   models,
   mainlineSessionId,
   mainlineModelId,
@@ -281,6 +283,7 @@ export function QuickAskWindow({
   onQuoteToComposer,
   onPromoteSession,
 }: QuickAskWindowProps) {
+  const effectiveAgentId = agent?.id?.trim() || "main";
   const laneKey = mainlineSessionId?.trim() || DEFAULT_LANE_KEY;
   const userId = user?.id ?? null;
 
@@ -288,7 +291,6 @@ export function QuickAskWindow({
     initLanesForUser(userId, laneKey),
   );
   const [selectedModel, setSelectedModel] = useState<string | null>(() => readSavedQuickAskModel());
-  const [attachContext, setAttachContext] = useState(true);
   const [contextExpanded, setContextExpanded] = useState(false);
   const [modelHighlight, setModelHighlight] = useState(false);
   const [authorizing, setAuthorizing] = useState(false);
@@ -458,7 +460,7 @@ export function QuickAskWindow({
       const targetSessId = qaSessId;
       const model = activeModelId;
       const shouldInjectContext =
-        attachContext && contextPrefix.length > 0 && contextPrefix !== activeLane.lastInjectedContext;
+        contextPrefix.length > 0 && contextPrefix !== activeLane.lastInjectedContext;
       const finalPrompt = shouldInjectContext ? `${contextPrefix}${rawQuestion}` : rawQuestion;
 
       if (demo) {
@@ -530,7 +532,7 @@ export function QuickAskWindow({
               sessionId: targetSessId,
               requestId: mintMsgId(),
               targetModel: model,
-              agentId: "main",
+              agentId: effectiveAgentId,
               text: finalPrompt,
               mediaCount: 0,
             },
@@ -545,19 +547,19 @@ export function QuickAskWindow({
 
       const initialTitle = `${QUICK_ASK_TITLE_PREFIX}${rawQuestion.replace(/\s+/g, " ").slice(0, 32)}`;
       if (messages.length === 0) {
-        chat.ensureSession(targetSessId, "main", initialTitle);
+        chat.ensureSession(targetSessId, effectiveAgentId, initialTitle);
         const existingSess = chat.getSession(targetSessId);
         if (existingSess && isDefaultSessionTitle(existingSess.title)) {
           chat.renameSession(targetSessId, initialTitle);
         }
       } else {
-        chat.ensureSession(targetSessId, "main");
+        chat.ensureSession(targetSessId, effectiveAgentId);
       }
       if (model) chat.setSessionModel(targetSessId, model);
 
       const sent = await chat.send({
         sessId: targetSessId,
-        agentId: "main",
+        agentId: effectiveAgentId,
         text: finalPrompt,
         ...(finalPrompt !== rawQuestion ? { displayText: rawQuestion } : {}),
         ...(model ? { model } : {}),
@@ -586,7 +588,7 @@ export function QuickAskWindow({
       laneKey,
       qaSessId,
       activeModelId,
-      attachContext,
+      effectiveAgentId,
       contextPrefix,
       activeLane.lastInjectedContext,
       activeLane.lastSentModel,
@@ -629,7 +631,7 @@ export function QuickAskWindow({
     void scrollSignal;
     const el = scrollRef.current;
     if (!el || !open || !pinnedToBottomRef.current) return;
-    el.scrollTop = el.scrollHeight;
+    snapScrollToBottomOnce(el);
   }, [open, scrollSignal]);
 
   // Auto-resize textarea cleanly.
@@ -699,11 +701,11 @@ export function QuickAskWindow({
     const snapshotDemo = demo ? [...messages] : undefined;
 
     if (!demo) {
-      chat.ensureSession(qaSessId, "main", title);
+      chat.ensureSession(qaSessId, effectiveAgentId, title);
       chat.renameSession(qaSessId, title);
       const authSession = authRef.current;
       void chat
-        .ensureServerSession(qaSessId, "main", title)
+        .ensureServerSession(qaSessId, effectiveAgentId, title)
         .then((ok) => (ok ? api.patchSessionTitle(authSession, qaSessId, title) : undefined))
         .catch(() => {});
     } else {
@@ -720,7 +722,7 @@ export function QuickAskWindow({
       lastAt: Date.now(),
       updatedAt: new Date().toISOString(),
       messageCount: messages.length,
-      agentId: "main",
+      agentId: effectiveAgentId,
       ...(activeModelId ? { modelId: activeModelId } : {}),
     };
 
@@ -735,6 +737,7 @@ export function QuickAskWindow({
     demo,
     chat,
     qaSessId,
+    effectiveAgentId,
     authRef,
     clearDemoTimer,
     laneKey,
@@ -798,7 +801,7 @@ export function QuickAskWindow({
       onRetrySend: demo
         ? undefined
         : (msg) => {
-            chat.retryMessage({ sessId: qaSessId, msgId: msg.id, agentId: "main" });
+            chat.retryMessage({ sessId: qaSessId, msgId: msg.id, agentId: effectiveAgentId });
           },
       resolveRetryTarget: demo
         ? undefined
@@ -821,16 +824,14 @@ export function QuickAskWindow({
         ? undefined
         : (mid, exp) => chat.peekUserMessagePayload(qaSessId, mid, exp),
     }),
-    [demo, chat, qaSessId, sendQuestion, onQuoteToComposer, quoteTextToMainline],
+    [demo, chat, qaSessId, effectiveAgentId, sendQuestion, onQuoteToComposer, quoteTextToMainline],
   );
 
   const qaSess = demo ? undefined : chat.getSession(qaSessId);
   const hasMainlineContext = contextPrefix.length > 0;
   const contextLabel = !hasMainlineContext
     ? "独立支线快问"
-    : attachContext
-      ? `已关联主线：${clipText(!isDefaultSessionTitle(mainlineTitle) ? mainlineTitle : "当前会话", 20)}`
-      : "已断开主线上下文";
+    : `已关联主线：${clipText(!isDefaultSessionTitle(mainlineTitle) ? mainlineTitle : "当前会话", 20)}`;
   const contextPreview = useMemo(() => {
     if (!hasMainlineContext) return "";
     const goal = clipText(mainlineGoalObjective, 60);
@@ -898,7 +899,7 @@ export function QuickAskWindow({
       data-quick-ask-session={qaSessId}
       style={isMdViewport ? { right: rightOffsetPx } : undefined}
       className={cn(
-        "oc-surface-popover fixed inset-x-3 bottom-[max(0.75rem,env(safe-area-inset-bottom))] z-40 flex h-[min(68dvh,calc(var(--oc-visual-height,100dvh)-1.5rem))] max-h-[min(560px,calc(var(--oc-visual-height,100dvh)-1.5rem))] flex-col overflow-hidden rounded-2xl",
+        "oc-surface-popover fixed inset-x-3 bottom-[max(0.75rem,env(safe-area-inset-bottom))] z-[var(--z-drawer)] flex h-[min(68dvh,calc(var(--oc-visual-height,100dvh)-1.5rem))] max-h-[min(560px,calc(var(--oc-visual-height,100dvh)-1.5rem))] flex-col overflow-hidden rounded-2xl",
         "sm:inset-x-auto sm:bottom-4 sm:w-[430px]",
         open ? "animate-pop" : "hidden",
       )}
@@ -1075,7 +1076,7 @@ export function QuickAskWindow({
             shape="square"
             className="oc-btn-tactile"
             aria-label="收起快问小窗"
-            title="收起 (Esc / Alt+K)"
+            title={`收起 (Esc / ${altKeyLabel()}K)`}
             onClick={onClose}
           >
             <Minimize2 size={15} />
@@ -1106,7 +1107,7 @@ export function QuickAskWindow({
               {!coarsePointer && (
                 <div className="oc-surface-recessed mt-1 flex flex-wrap items-center justify-center gap-x-3 gap-y-1.5 rounded-lg px-3 py-1.5 text-caption text-muted">
                   <span className="inline-flex items-center gap-1">
-                    <kbd className="oc-kbd">Alt+K</kbd>
+                    <kbd className="oc-kbd">{altKeyLabel()}K</kbd>
                     <span>唤起/收起</span>
                   </span>
                   <span className="inline-flex items-center gap-1">
@@ -1143,32 +1144,17 @@ export function QuickAskWindow({
           <div className="flex items-center justify-between gap-2 text-caption">
             {hasMainlineContext ? (
               <div className="inline-flex min-w-0 max-w-full items-center rounded-full border border-border/80 bg-surface/80 p-0.5 shadow-xs">
-                <button
-                  type="button"
+                <span
                   data-testid="quick-ask-context-hint"
-                  aria-pressed={attachContext}
-                  title={
-                    attachContext
-                      ? `点击断开主线背景注入\n\n${contextPrefix}`
-                      : "当前不注入主线背景，点击重新关联"
-                  }
-                  onClick={() => {
-                    setAttachContext((v) => {
-                      if (v) setContextExpanded(false);
-                      return !v;
-                    });
-                  }}
-                  className={cn(
-                    "oc-btn-tactile flex min-w-0 items-center gap-1.5 rounded-full px-2 py-0.5 text-left transition-colors hover:bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-10",
-                    attachContext ? "text-fg" : "text-faint line-through",
-                  )}
+                  title={contextPrefix}
+                  className="flex min-w-0 items-center gap-1.5 rounded-full px-2 py-0.5 text-left text-fg"
                 >
-                  <span aria-hidden className={cn("shrink-0", attachContext ? "text-accent" : "text-faint")}>
-                    {attachContext ? <Link2 size={11} /> : <Unlink size={11} />}
+                  <span aria-hidden className="shrink-0 text-accent">
+                    <Link2 size={11} />
                   </span>
                   <span className="truncate font-medium">{contextLabel}</span>
-                </button>
-                {attachContext && contextPreview && (
+                </span>
+                {contextPreview && (
                   <button
                     type="button"
                     data-testid="quick-ask-context-expand"
@@ -1176,7 +1162,7 @@ export function QuickAskWindow({
                     aria-label={contextExpanded ? "收起主线摘要预览" : "展开主线摘要预览"}
                     title={contextExpanded ? "收起主线摘要" : "查看关联的主线摘要"}
                     onClick={() => setContextExpanded((v) => !v)}
-                    className="oc-spring-press inline-flex size-5 shrink-0 items-center justify-center rounded-full text-faint transition-colors hover:bg-hover hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-9"
+                    className="oc-spring-press inline-flex size-5 shrink-0 items-center justify-center rounded-full text-faint transition-colors hover:bg-hover hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11"
                   >
                     <ChevronDown
                       size={11}
@@ -1196,7 +1182,7 @@ export function QuickAskWindow({
             )}
             <span className="shrink-0 text-micro font-medium text-faint">不进主历史</span>
           </div>
-          {contextExpanded && hasMainlineContext && attachContext && contextPreview && (
+          {contextExpanded && hasMainlineContext && contextPreview && (
             <p
               data-testid="quick-ask-context-preview"
               className="oc-surface-recessed animate-in mt-1.5 rounded-lg px-2.5 py-1.5 text-caption leading-relaxed text-muted"
@@ -1225,10 +1211,10 @@ export function QuickAskWindow({
             enterKeyHint={coarsePointer ? "enter" : "send"}
             placeholder={
               coarsePointer
-                ? "输入技术问题…"
+                ? "输入支线问题，不打断主线…"
                 : sendKey === "mod-enter"
-                  ? "输入技术问题（⌘/Ctrl+Enter 发送）…"
-                  : "输入技术问题（Enter 发送）…"
+                  ? `输入支线问题，不打断主线（${modKeyLabel()}Enter 发送）…`
+                  : "输入支线问题，不打断主线（Enter 发送）…"
             }
             aria-label="快问输入框"
             className="max-h-28 min-h-9 flex-1 resize-none bg-transparent py-1.5 text-base leading-relaxed text-fg outline-none placeholder:text-faint md:text-sm"

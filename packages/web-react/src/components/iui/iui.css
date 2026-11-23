@@ -616,6 +616,7 @@ figure.oc-iui, .oc-iui { margin: 14px 0 22px; font-size: 14.5px; line-height: 1.
 .oc-iui-range::-moz-range-thumb { width: 22px; height: 22px; border: 0; border-radius: 999px; background: #fff; box-shadow: 0 0 0 1px rgb(0 0 0 / 0.08), 0 2px 8px rgb(0 0 0 / 0.22); }
 .oc-iui-range:disabled { opacity: 0.5; cursor: default; }
 .oc-iui-select { height: 42px; padding: 0 12px; border: 0; border-radius: 12px; background: var(--iui-surface); box-shadow: inset 0 0 0 1px var(--iui-line); color: var(--fg); font-size: 14.5px; font-weight: 500; outline: none; }
+@media (max-width: 767px) { .oc-iui-select, .oc-iui-input, .oc-iui-textarea { font-size: 16px; } }
 @media (hover: none) { .oc-iui-select { height: 46px; } }
 .oc-iui-select:focus-visible { box-shadow: 0 0 0 2px var(--ring); }
 .oc-iui-switch { position: relative; width: 44px; height: 26px; flex-shrink: 0; border-radius: 999px; background: var(--iui-track); transition: background-color 0.2s; outline: none; }
@@ -677,7 +678,7 @@ figure.oc-iui, .oc-iui { margin: 14px 0 22px; font-size: 14.5px; line-height: 1.
 .oc-iui-gallery-caption { position: absolute; left: 0; right: 0; bottom: 0; padding: 24px 12px 10px; background: linear-gradient(transparent, rgb(0 0 0 / 0.55)); color: #fff; font-size: 12.5px; text-align: left; }
 
 /* 灯箱预览 */
-.oc-iui-lightbox { position: fixed; inset: 0; z-index: 90; display: flex; flex-direction: column; justify-content: space-between; gap: 12px; padding: 16px; background: rgb(10 12 18 / 0.88); backdrop-filter: blur(8px); }
+.oc-iui-lightbox { position: fixed; inset: 0; z-index: var(--z-viewer); display: flex; flex-direction: column; justify-content: space-between; gap: 12px; padding: 16px; background: rgb(10 12 18 / 0.88); backdrop-filter: blur(8px); }
 .oc-iui-lightbox-bar { display: flex; align-items: center; justify-content: space-between; color: #fff; font-size: 13.5px; font-variant-numeric: tabular-nums; }
 .oc-iui-lightbox-close, .oc-iui-lightbox-nav { display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; border-radius: 999px; background: rgb(255 255 255 / 0.12); color: #fff; outline: none; transition: background-color 0.15s; }
 @media (hover: none) { .oc-iui-lightbox-close, .oc-iui-lightbox-nav { width: 44px; height: 44px; } }

@@ -1,11 +1,10 @@
-import * as Dialog from "@radix-ui/react-dialog";
-import { Lock, X } from "lucide-react";
+import { Lock } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { canManageOrgBilling } from "../lib/orgBilling";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import type { AuthSession, OrgRole, OrgSubscriptionInfo, User } from "../lib/types";
-import { Badge, IconButton, Tabs } from "./ui";
+import { Badge, Modal, Tabs } from "./ui";
 import { AtelierLazyIcon } from "./ui/AtelierLazyIcons";
 import { CreateOrgWizard } from "./org/CreateOrgWizard";
 import { InvoicesTab } from "./org/InvoicesTab";
@@ -122,121 +121,108 @@ export function OrgCenter({
   const showWizard = !!auth && noOrg;
 
   return (
-    <Dialog.Root open={open} onOpenChange={(o) => !o && onClose()}>
-      <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/35 backdrop-blur-sm data-[state=open]:animate-fade" />
-        <Dialog.Content
-          aria-describedby={undefined}
-          data-testid="org-center-dialog"
-          // 五分区内容多、要定高让内部滚动；创建向导只有一两个输入框，定高会留下 700px 空白
-          // （审计 SET-34），改为按内容自适应、只封顶。不走 cn()：twMerge 会把 vh 回退类当重复项吞掉。
-          className={`oc-center-dialog oc-surface-popover fixed left-1/2 z-50 flex w-[calc(100vw-2rem)] max-w-2xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl border border-border bg-elevated text-fg shadow-float focus:outline-none data-[state=open]:animate-in ${
-            showWizard
-              ? "max-h-[min(85vh,46rem)] max-h-[min(85dvh,46rem)]"
-              : "h-[min(85vh,46rem)] h-[min(85dvh,46rem)]"
-          }`}
-        >
-          <div className="oc-surface-glass shrink-0 border-x-0 border-t-0 border-b border-border/80 shadow-none">
-            <div className="flex items-center justify-between gap-3 px-5 py-3.5">
-              <div className="flex min-w-0 items-center gap-2.5">
-                <span
-                  className="oc-icon-badge oc-icon-badge-accent size-7 shrink-0 rounded-lg"
-                  aria-hidden="true"
-                >
-                  <AtelierLazyIcon name="org" size={15} />
-                </span>
-                <Dialog.Title className="min-w-0 truncate text-title font-semibold tracking-tight text-fg">
-                  {showWizard ? "创建组织" : (user?.org?.name ?? "组织")}
-                </Dialog.Title>
-                {!showWizard && user?.org && (
-                  <Badge tone="neutral" size="sm">
-                    {orgRoleLabel(callerRole)}
-                  </Badge>
-                )}
-              </div>
-              <Dialog.Close asChild>
-                <IconButton variant="muted" size="sm" aria-label="关闭" className="oc-btn-tactile">
-                  <X size={16} />
-                </IconButton>
-              </Dialog.Close>
-            </div>
-
-            {/* 无 org 用户(如深链 ?panel=org):直呈创建向导,不显分区 Tabs。 */}
-            {!showWizard && (
-              <div className="px-4 pb-3">
-                <div className="overflow-x-auto">
-                  <Tabs
-                    aria-label="组织分区"
-                    idBase="org"
-                    value={section}
-                    onValueChange={(v) => setSection(v as OrgSection)}
-                    items={SECTIONS.map((s) => ({
-                      value: s.id,
-                      label: s.label,
-                      featureId: PRODUCT_CAPABILITIES.organization.id,
-                    }))}
-                    className="oc-surface-recessed"
-                  />
-                </div>
-              </div>
-            )}
-          </div>
-
-          <div
-            role={showWizard ? undefined : "tabpanel"}
-            id={showWizard ? undefined : `org-panel-${section}`}
-            aria-labelledby={showWizard ? undefined : `org-tab-${section}`}
-            className="min-h-0 flex-1 overflow-y-auto"
-            data-product-feature={PRODUCT_CAPABILITIES.organization.id}
+    <Modal
+      open={open}
+      onOpenChange={(o) => !o && onClose()}
+      mobile="center"
+      size="lg"
+      title={
+        <span className="flex min-w-0 items-center gap-2.5">
+          <span
+            className="oc-icon-badge oc-icon-badge-accent size-7 shrink-0 rounded-lg"
+            aria-hidden="true"
           >
-            {!auth ? (
-              <div className="px-5 py-10">
-                <div className="oc-surface-card mx-auto flex max-w-sm flex-col items-center gap-2.5 rounded-2xl px-6 py-8 text-center">
-                  <span className="oc-icon-badge size-10 rounded-xl" aria-hidden="true">
-                    <Lock size={17} strokeWidth={1.8} />
-                  </span>
-                  <p className="text-body text-muted">请先登录。</p>
-                </div>
-              </div>
-            ) : showWizard ? (
-              <CreateOrgWizard auth={auth} onCreated={() => onRefreshMe?.()} onCancel={onClose} />
-            ) : (
-              <>
-                {section === "overview" && (
-                  <OverviewTab
-                    auth={auth}
-                    onRefreshMe={onRefreshMe}
-                    reloadKey={overviewReload}
-                    subInfo={subInfo}
-                    subLoading={subLoading}
-                    subErr={subErr}
-                    canManageBilling={canManageBilling}
-                    onSubscribe={() => setPayDialog("subscribe")}
-                    onAddSeats={() => setPayDialog("seats")}
-                  />
-                )}
-                {section === "members" && (
-                  <MembersTab
-                    auth={auth}
-                    callerRole={callerRole}
-                    onRefreshMe={onRefreshMe}
-                    subscription={subInfo?.subscription ?? null}
-                    canManageBilling={canManageBilling}
-                    onAddSeats={() => setPayDialog("seats")}
-                  />
-                )}
-                {section === "skills" && <SkillsTab auth={auth} />}
-                {section === "reports" && <ReportsTab auth={auth} />}
-                {section === "invoices" && (
-                  <InvoicesTab auth={auth} canManageBilling={canManageBilling} />
-                )}
-              </>
-            )}
+            <AtelierLazyIcon name="org" size={15} />
+          </span>
+          <span className="min-w-0 truncate text-title font-semibold tracking-tight text-fg">
+            {showWizard ? "创建组织" : (user?.org?.name ?? "组织")}
+          </span>
+          {!showWizard && user?.org && (
+            <Badge tone="neutral" size="sm">
+              {orgRoleLabel(callerRole)}
+            </Badge>
+          )}
+        </span>
+      }
+      toolbar={
+        !showWizard ? (
+          <div className="overflow-x-auto">
+            <Tabs
+              aria-label="组织分区"
+              idBase="org"
+              value={section}
+              onValueChange={(v) => setSection(v as OrgSection)}
+              items={SECTIONS.map((s) => ({
+                value: s.id,
+                label: s.label,
+                featureId: PRODUCT_CAPABILITIES.organization.id,
+              }))}
+              className="oc-surface-recessed"
+            />
           </div>
-        </Dialog.Content>
-      </Dialog.Portal>
+        ) : undefined
+      }
+      className={
+        showWizard
+          ? "max-h-[min(85dvh,46rem)] rounded-2xl"
+          : "h-[min(85dvh,46rem)] rounded-2xl"
+      }
+      bodyClassName="flex min-h-0 flex-1 flex-col overflow-hidden p-0"
+    >
+      <div
+        role={showWizard ? undefined : "tabpanel"}
+        id={showWizard ? undefined : `org-panel-${section}`}
+        aria-labelledby={showWizard ? undefined : `org-tab-${section}`}
+        className="min-h-0 flex-1 overflow-y-auto"
+        data-product-feature={PRODUCT_CAPABILITIES.organization.id}
+      >
+        {!auth ? (
+          <div className="px-5 py-10">
+            <div className="oc-surface-card mx-auto flex max-w-sm flex-col items-center gap-2.5 rounded-2xl px-6 py-8 text-center">
+              <span className="oc-icon-badge size-10 rounded-xl" aria-hidden="true">
+                <Lock size={17} strokeWidth={1.8} />
+              </span>
+              <p className="text-body text-muted">请先登录。</p>
+            </div>
+          </div>
+        ) : showWizard ? (
+          <CreateOrgWizard auth={auth} onCreated={() => onRefreshMe?.()} onCancel={onClose} />
+        ) : (
+          <>
+            {section === "overview" && (
+              <OverviewTab
+                auth={auth}
+                onRefreshMe={onRefreshMe}
+                reloadKey={overviewReload}
+                subInfo={subInfo}
+                subLoading={subLoading}
+                subErr={subErr}
+                onRetrySub={() => setSubReload((n) => n + 1)}
+                canManageBilling={canManageBilling}
+                onSubscribe={() => setPayDialog("subscribe")}
+                onAddSeats={() => setPayDialog("seats")}
+              />
+            )}
+            {section === "members" && (
+              <MembersTab
+                auth={auth}
+                callerRole={callerRole}
+                onRefreshMe={onRefreshMe}
+                subscription={subInfo?.subscription ?? null}
+                canManageBilling={canManageBilling}
+                onAddSeats={() => setPayDialog("seats")}
+              />
+            )}
+            {section === "skills" && <SkillsTab auth={auth} />}
+            {section === "reports" && <ReportsTab auth={auth} />}
+            {section === "invoices" && (
+              <InvoicesTab auth={auth} canManageBilling={canManageBilling} />
+            )}
+          </>
+        )}
+      </div>
 
-      {/* owner 订阅 / 加席弹层(概览与成员页共用触发)。 */}
+      {/* owner 订阅 / 加席弹层(挂在内容子树内,走 openModalStack 避免关闭子弹窗级联误关组织中心)。 */}
       {auth && !noOrg && (
         <OrgSubscribeDialog
           open={payDialog != null}
@@ -247,6 +233,6 @@ export function OrgCenter({
           onPaid={onSubPaid}
         />
       )}
-    </Dialog.Root>
+    </Modal>
   );
 }

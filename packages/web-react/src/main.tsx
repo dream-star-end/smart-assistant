@@ -1,7 +1,9 @@
-import { lazy, StrictMode, Suspense } from 'react'
+import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { App, prefetchLazyCentersOnIdle } from './App'
+import { LazyBoundary } from './components/ChunkErrorBoundary'
 import { ToastProvider, TooltipProvider } from './components/ui'
+import { createRetryableLazy } from './components/ui/retryableLazy'
 import { registerServiceWorker } from './registerSW'
 import { installGlobalClientFrictionHandlers } from './lib/clientFriction'
 import { waitForEntryStyles } from './lib/nonBlockingCss'
@@ -11,7 +13,7 @@ import './styles.css'
 // 不走 App 的路由/鉴权/WS 体系(App 内的 /reset-password 特判需要 AuthGate,故留在 App)。
 // 依赖 gateway SPA fallback 对无扩展名路径回退 index.html。
 // 仅访问法务路径时按需加载 LegalPage 与 lib/legal.ts,不占首屏闭包。
-const LegalPage = lazy(() =>
+const LegalPage = createRetryableLazy(() =>
   import('./components/LegalPage').then((m) => ({ default: m.LegalPage })),
 )
 
@@ -28,9 +30,9 @@ void waitForEntryStyles().then(() => {
       <ToastProvider>
         <TooltipProvider>
           {legalKind ? (
-            <Suspense fallback={null}>
+            <LazyBoundary fallback={null}>
               <LegalPage kind={legalKind} />
-            </Suspense>
+            </LazyBoundary>
           ) : (
             <App />
           )}

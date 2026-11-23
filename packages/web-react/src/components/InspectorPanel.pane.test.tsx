@@ -262,7 +262,7 @@ describe("计划页与记忆", () => {
       />,
     );
     expect(document.activeElement).toBe(composer);
-    const handle = screen.getByRole("separator", { name: "调整详情面板宽度" });
+    const handle = screen.getByRole("separator", { name: "调整工作台宽度" });
     expect(handle).toHaveAttribute("aria-valuenow", "440");
     expect(screen.getByRole("complementary")).toHaveStyle({ width: "440px" });
     rafSpy.mockRestore();

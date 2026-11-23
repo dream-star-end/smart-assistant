@@ -388,7 +388,7 @@ export function ImageCommentMode({
           aria-label="放弃评论确认"
           className="absolute inset-0 z-40 flex items-center justify-center bg-black/70 px-6 backdrop-blur-sm"
         >
-          <div className="w-full max-w-xs rounded-2xl bg-neutral-900 p-5 text-center shadow-float">
+          <div className="w-full max-w-xs rounded-2xl bg-elevated p-5 text-center shadow-float">
             <p className="text-sm text-white">
               {count > 0 ? `放弃这 ${count} 条评论？返回后已添加的标注不会保留。` : '放弃正在输入的评论？'}
             </p>

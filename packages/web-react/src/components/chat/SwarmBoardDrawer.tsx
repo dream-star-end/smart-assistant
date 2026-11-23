@@ -32,6 +32,7 @@ import { cn } from "../../lib/utils";
 import { Badge, Button, IconButton, Spinner, useToast } from "../ui";
 import { AtelierIcon } from "../ui/AtelierIcons";
 import { PostRow, RosterMemberRow } from "./SwarmBoardRows";
+import { scrollContainerTo, snapScrollToBottomOnce } from "./stickToBottom";
 import { SwarmCommandBar } from "./SwarmCommandBar";
 import { SwarmElapsedTicker } from "./SwarmElapsedTicker";
 import { SwarmMemberProfileBar } from "./SwarmMemberProfileBar";
@@ -237,11 +238,7 @@ export function SwarmBoardDrawer({
       const el = feedRef.current;
       if (!el) return;
       armProgrammaticScrollFence(smooth ? 420 : 80);
-      if (smooth && typeof el.scrollTo === "function") {
-        el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-      } else {
-        el.scrollTop = el.scrollHeight;
-      }
+      snapScrollToBottomOnce(el);
     },
     [armProgrammaticScrollFence],
   );
@@ -338,10 +335,17 @@ export function SwarmBoardDrawer({
     const seq = pendingJumpSeqRef.current;
     if (!open || seq === null) return;
     const target = postRefs.current.get(seq);
-    if (!target) return;
+    const feed = feedRef.current;
+    if (!target || !feed) return;
     pendingJumpSeqRef.current = null;
     armProgrammaticScrollFence(420);
-    target.scrollIntoView?.({ behavior: "smooth", block: "center" });
+    const feedRect = feed.getBoundingClientRect();
+    const targetRect = target.getBoundingClientRect();
+    const targetTop = Math.max(
+      0,
+      feed.scrollTop + (targetRect.top - feedRect.top) - Math.max(0, (feed.clientHeight - targetRect.height) / 2),
+    );
+    scrollContainerTo(feed, targetTop);
   }, [open, filteredPosts, highlightedSeq, armProgrammaticScrollFence]);
 
   const quotePostToMainline = useCallback(
@@ -545,9 +549,10 @@ export function SwarmBoardDrawer({
                   variant="secondary"
                   data-testid="swarm-abort-trigger"
                   onClick={() => setConfirmAbort((v) => !v)}
+                  aria-label="中止整轮蜂群协作"
                   title="中止整轮蜂群协作"
                   className={cn(
-                    "oc-spring-press min-h-11 shrink-0 text-danger sm:min-h-8",
+                    "oc-spring-press min-h-11 min-w-11 shrink-0 text-danger sm:min-h-8 sm:min-w-0",
                     confirmAbort && "ring-2 ring-ring",
                   )}
                 >
@@ -668,7 +673,7 @@ export function SwarmBoardDrawer({
                       jumpToSeq(alerts.primaryFocusSeq);
                     }
                   }}
-                  className="oc-spring-press shrink-0 rounded-md bg-surface/85 px-2 py-0.5 text-caption font-semibold text-fg transition-colors hover:bg-surface"
+                  className="oc-spring-press shrink-0 rounded-md bg-surface/85 px-2 py-0.5 text-caption font-semibold text-fg transition-colors hover:bg-surface [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
                 >
                   {alerts.primaryFocusMember ? `聚焦 @${alerts.primaryFocusMember}` : "查看预警"}
                 </button>
@@ -728,7 +733,7 @@ export function SwarmBoardDrawer({
                 type="button"
                 onClick={() => setMobileTab("board")}
                 className={cn(
-                  "oc-spring-press flex items-center gap-1 rounded-md px-2.5 py-1 text-caption font-medium transition-all",
+                  "oc-spring-press flex min-h-11 items-center gap-1 rounded-md px-2.5 py-1 text-caption font-medium transition-all sm:min-h-8 [@media(hover:none)]:min-h-11",
                   mobileTab === "board" ? "oc-segmented-thumb text-fg" : "text-muted",
                 )}
               >
@@ -739,7 +744,7 @@ export function SwarmBoardDrawer({
                 type="button"
                 onClick={() => setMobileTab("roster")}
                 className={cn(
-                  "oc-spring-press flex items-center gap-1 rounded-md px-2.5 py-1 text-caption font-medium transition-all",
+                  "oc-spring-press flex min-h-11 items-center gap-1 rounded-md px-2.5 py-1 text-caption font-medium transition-all sm:min-h-8 [@media(hover:none)]:min-h-11",
                   mobileTab === "roster" ? "oc-segmented-thumb text-fg" : "text-muted",
                 )}
               >
@@ -757,7 +762,7 @@ export function SwarmBoardDrawer({
                   type="button"
                   onClick={() => setSelectedChannel(null)}
                   className={cn(
-                    "oc-spring-press shrink-0 rounded-lg px-2 py-1 text-caption font-medium transition-colors",
+                    "oc-spring-press min-h-11 shrink-0 rounded-lg px-2 py-1 text-caption font-medium transition-colors sm:min-h-0 [@media(hover:none)]:min-h-11",
                     selectedChannel === null
                       ? "bg-accent-soft text-accent"
                       : "text-muted hover:bg-hover hover:text-fg",
@@ -771,7 +776,7 @@ export function SwarmBoardDrawer({
                     type="button"
                     onClick={() => setSelectedChannel(selectedChannel === ch.name ? null : ch.name)}
                     className={cn(
-                      "oc-spring-press inline-flex shrink-0 items-center gap-0.5 rounded-lg px-2 py-1 text-caption font-medium transition-colors",
+                      "oc-spring-press inline-flex min-h-11 shrink-0 items-center gap-0.5 rounded-lg px-2 py-1 text-caption font-medium transition-colors sm:min-h-0 [@media(hover:none)]:min-h-11",
                       selectedChannel === ch.name
                         ? "bg-info-soft text-info"
                         : "text-muted hover:bg-hover hover:text-fg",

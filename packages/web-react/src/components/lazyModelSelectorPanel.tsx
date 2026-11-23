@@ -4,7 +4,8 @@
  * - 一旦模块就绪，lazy 工厂返回同步 thenable，React 当场解析不挂起、不闪白；
  * - 供 appLazyViews.tsx 与单测按需调用 preloadModelSelectorPanel() 预热。
  */
-import { lazy, Suspense, type ComponentProps } from 'react'
+import { lazy, type ComponentProps } from 'react'
+import { LazyBoundary } from './ChunkErrorBoundary'
 
 type PanelModule = typeof import('./ModelSelectorPanel')
 export type ModelSelectorPanelProps = ComponentProps<PanelModule['ModelSelectorPanel']>
@@ -51,8 +52,8 @@ if (typeof window !== 'undefined') {
 
 export function LazyModelSelectorPanel(props: ModelSelectorPanelProps) {
   return (
-    <Suspense fallback={null}>
+    <LazyBoundary fallback={null}>
       <LazyPanel {...props} />
-    </Suspense>
+    </LazyBoundary>
   )
 }

@@ -209,8 +209,8 @@ export function filterSessionOriginCrons(
     const oneshot = o.oneshot === true;
     const nextRunAt = parseTimestampMs(o.nextRunAt);
     const lastRunAt = parseTimestampMs(o.lastRunAt);
-    // 已触发完成的一次性续跑不再常驻胶囊
-    if (oneshot && !enabled && nextRunAt === null && lastRunAt !== null) continue;
+    // 已触发完成的一次性续跑不再常驻胶囊（放宽过滤：lastRunAt 存在且 nextRunAt 为空或已过 lastRunAt）
+    if (oneshot && !enabled && lastRunAt !== null && (nextRunAt === null || nextRunAt <= lastRunAt)) continue;
 
     const promptText =
       typeof o.prompt === "string"

@@ -77,7 +77,6 @@ import {
   DropdownMenuTrigger,
   IconButton,
   TimeAgo,
-  TooltipProvider,
   useToast,
 } from "../ui";
 import { Notice } from "../ui/Notice";
@@ -305,9 +304,7 @@ function MetaRow({ msg }: { msg: ChatMessage }) {
     <div data-testid="assistant-meta" className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-caption text-faint">
       {showTime && (
         <time dateTime={new Date(msg.ts).toISOString()} className="whitespace-nowrap text-caption">
-          <TooltipProvider>
-            <TimeAgo value={msg.ts} format="relative" tooltip className="text-caption text-faint" />
-          </TooltipProvider>
+          <TimeAgo value={msg.ts} format="relative" tooltip className="text-caption text-faint" />
         </time>
       )}
       {waived && (
@@ -753,7 +750,7 @@ function SystemCallbackNoticeCard({ msg, readOnly = false }: { msg: ChatMessage;
             type="button"
             onClick={() => setExpanded((prev) => !prev)}
             aria-expanded={expanded}
-            className="inline-flex min-w-0 items-center gap-1 text-caption leading-snug text-faint transition-colors hover:text-muted"
+            className="inline-flex min-w-0 items-center gap-1 text-caption leading-snug text-faint transition-colors hover:text-muted [@media(hover:none)]:min-h-11"
             data-testid="system-callback-summary"
           >
             <span className="truncate">{summary}</span>
@@ -979,7 +976,7 @@ export function ProgressiveMarkdown({
         <button
           type="button"
           onClick={() => setVisibleChars((value) => value + LONG_MARKDOWN_STEP)}
-          className="mt-2 rounded-full bg-hover px-3 py-1 text-xs text-muted hover:text-fg"
+          className="mt-2 rounded-full bg-hover px-3 py-1 text-caption text-muted hover:text-fg [@media(hover:none)]:min-h-11"
         >
           {hasLiveGap
             ? `继续显示中间正文（还有 ${(liveTailStart - headEnd).toLocaleString()} 个字符）`
@@ -1618,7 +1615,7 @@ function DelegateSummaryPlainText({ text, className }: { text: string; className
         <button
           type="button"
           onClick={() => setVisibleChars((value) => value + DELEGATE_SUMMARY_STEP)}
-          className="oc-btn-tactile mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg"
+          className="oc-btn-tactile mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
         >
           继续显示完整结果
         </button>
@@ -1681,7 +1678,7 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
               <button
                 type="button"
                 onClick={() => setVisibleEntries((value) => value + 100)}
-                className="oc-btn-tactile mx-auto mt-2 block rounded-full bg-hover px-3 py-1 text-caption font-medium text-muted hover:text-fg"
+                className="oc-btn-tactile mx-auto mt-2 block rounded-full bg-hover px-3 py-1 text-caption font-medium text-muted hover:text-fg [@media(hover:none)]:min-h-11"
               >
                 继续加载委派记录（还有 {entries.length - visibleEntries} 条）
               </button>
@@ -1742,7 +1739,7 @@ export function SystemCard({ msg }: { msg: ChatMessage }) {
             type="button"
             onClick={() => setExpanded((v) => !v)}
             aria-expanded={expanded}
-            className="inline-flex max-w-full items-center gap-1.5 text-left outline-none transition-colors hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            className="inline-flex max-w-full items-center gap-1.5 text-left outline-none transition-colors hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
           >
             <span className="break-words [overflow-wrap:anywhere]">{msg.text}</span>
             <ChevronRight

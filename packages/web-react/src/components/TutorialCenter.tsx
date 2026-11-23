@@ -372,7 +372,7 @@ export function TutorialCenter({
             }
             dialogRef.current?.focus();
           }}
-          className="tutorial-shell oc-surface-popover fixed inset-x-2 bottom-2 top-2 z-(--z-modal) flex min-h-0 flex-col overflow-hidden rounded-xl bg-bg focus:outline-none data-[state=open]:animate-in sm:inset-x-4 sm:bottom-4 sm:top-4 sm:rounded-xl2 lg:left-1/2 lg:w-[min(1200px,calc(100vw-2rem))] lg:-translate-x-1/2"
+          className="tutorial-shell oc-surface-popover fixed inset-x-2 bottom-[max(0.5rem,env(safe-area-inset-bottom))] top-[max(0.5rem,env(safe-area-inset-top))] z-(--z-modal) flex min-h-0 flex-col overflow-hidden rounded-xl bg-bg focus:outline-none data-[state=open]:animate-in sm:inset-x-4 sm:bottom-[max(1rem,env(safe-area-inset-bottom))] sm:top-[max(1rem,env(safe-area-inset-top))] sm:rounded-xl2 lg:left-1/2 lg:w-[min(1200px,calc(100vw-2rem))] lg:-translate-x-1/2"
         >
           <header className="relative z-10 grid shrink-0 grid-cols-[1fr_auto] items-center gap-x-3 gap-y-2.5 border-b border-border bg-surface px-4 py-3 sm:px-5 lg:min-h-15 lg:grid-cols-[1fr_auto_1fr] lg:gap-y-0 lg:py-2">
             <div className="flex min-w-0 items-center">

@@ -811,10 +811,10 @@ export function SiteLiveEditModal({
                   size={16}
                 />
                 <span className="min-w-0 flex-1">
-                  <span className="block truncate text-meta font-semibold text-white/90">
+                  <span className="block truncate text-meta font-semibold text-white/95">
                     {navState.title}
                   </span>
-                  <span className="block truncate text-micro text-white/45">{navState.url}</span>
+                  <span className="block truncate text-micro text-white/70">{navState.url}</span>
                 </span>
               </div>
               <a
@@ -934,7 +934,7 @@ export function SiteLiveEditModal({
               <div
                 role="application"
                 aria-label="网页画面，点按选择要修改的元素"
-                className="absolute inset-0 z-[5] touch-none cursor-crosshair outline-none"
+                className="absolute inset-0 z-0 touch-none cursor-crosshair outline-none"
                 onPointerDown={onOverlayPointerDown}
                 onPointerMove={onOverlayPointerMove}
                 onPointerUp={onOverlayPointerUp}
@@ -950,7 +950,7 @@ export function SiteLiveEditModal({
             {mode === "comment" && hoverTarget && (
               <div
                 style={targetOverlayStyle(hoverTarget, viewport)}
-                className="pointer-events-none absolute z-[8] rounded border border-dashed border-info bg-info-soft"
+                className="pointer-events-none absolute z-0 rounded border border-dashed border-info bg-info-soft"
               />
             )}
 
@@ -1090,7 +1090,7 @@ export function SiteLiveEditModal({
                 }}
                 aria-label="输入网页文字"
                 placeholder="输入到网页当前焦点…"
-                className="min-w-0 flex-1 bg-transparent px-1 text-base text-white outline-none placeholder:text-white/35"
+                className="min-w-0 flex-1 bg-transparent px-1 text-base text-white outline-none placeholder:text-white/70"
               />
               <button
                 type="submit"
@@ -1258,12 +1258,12 @@ function SiteCommentEditor({
             <div className="preview-accent-text truncate text-xs font-semibold">
               {draft.target.selector}
             </div>
-            <div className="mt-1 flex flex-wrap gap-1 text-micro text-white/45">
-              <span className="rounded-md bg-white/[0.06] px-1.5 py-0.5">
+            <div className="mt-1 flex flex-wrap gap-1 text-micro text-white/75">
+              <span className="rounded-md bg-white/[0.1] px-1.5 py-0.5">
                 &lt;{draft.target.tag}&gt;
               </span>
               {draft.target.role && (
-                <span className="rounded-md bg-white/[0.06] px-1.5 py-0.5">
+                <span className="rounded-md bg-white/[0.1] px-1.5 py-0.5">
                   role={draft.target.role}
                 </span>
               )}
@@ -1292,7 +1292,7 @@ function SiteCommentEditor({
           }}
           aria-label="描述网页修改"
           placeholder="例如：主标题字号调大一些，按钮改成圆角绿色并居中。"
-          className="mt-3 min-h-20 w-full resize-none bg-transparent text-sm leading-6 text-white outline-none placeholder:text-white/30"
+          className="mt-3 min-h-20 w-full resize-none bg-transparent text-base leading-6 text-white outline-none placeholder:text-white/70 md:text-sm"
         />
         <div className="mt-2 flex items-center justify-between gap-2 border-t border-white/10 pt-2">
           <div className="flex items-center gap-1">
@@ -1342,8 +1342,8 @@ function SiteCommentsDrawer({
     <section className="preview-comments-drawer">
       <header className="flex items-center justify-between border-b border-white/10 px-4 py-3.5">
         <div>
-          <h2 className="text-sm font-semibold tracking-tight">站点修改意见</h2>
-          <p className="mt-0.5 text-xs tabular-nums text-white/45">
+          <h2 className="text-sm font-semibold tracking-tight text-white/95">站点修改意见</h2>
+          <p className="mt-0.5 text-xs tabular-nums text-white/75">
             {annotations.length}/{MAX_ANNOTATIONS} 条
           </p>
         </div>
@@ -1358,8 +1358,8 @@ function SiteCommentsDrawer({
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
         {annotations.length === 0 ? (
-          <div className="flex min-h-48 flex-col items-center justify-center gap-3 px-6 text-center text-white/45">
-            <span className="flex size-11 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.04]">
+          <div className="flex min-h-48 flex-col items-center justify-center gap-3 px-6 text-center text-white/75">
+            <span className="flex size-11 items-center justify-center rounded-2xl border border-white/15 bg-white/[0.06]">
               <MessageSquarePlus size={20} />
             </span>
             <p className="text-sm leading-6">还没有修改意见，关闭列表后点按页面元素即可添加。</p>
@@ -1369,7 +1369,7 @@ function SiteCommentsDrawer({
             {annotations.map((annotation, index) => (
               <div
                 key={annotation.id}
-                className="flex items-start gap-1 rounded-2xl border border-white/10 bg-white/[0.04] p-2 transition-colors hover:border-white/20 hover:bg-white/[0.06]"
+                className="flex items-start gap-1 rounded-2xl border border-white/15 bg-white/[0.06] p-2 transition-colors hover:border-white/25 hover:bg-white/[0.08]"
               >
                 <button
                   type="button"
@@ -1388,7 +1388,7 @@ function SiteCommentsDrawer({
                     <span className="preview-accent-text block truncate font-mono text-xs font-medium">
                       {annotation.target.selector}
                     </span>
-                    <span className="mt-1 line-clamp-3 block text-sm leading-5 text-white/75">
+                    <span className="mt-1 line-clamp-3 block text-sm leading-5 text-white/85">
                       {annotation.comment}
                     </span>
                   </span>
@@ -1406,7 +1406,7 @@ function SiteCommentsDrawer({
           </div>
         )}
       </div>
-      <p className="border-t border-white/10 px-4 py-3 text-xs leading-5 text-white/40">
+      <p className="border-t border-white/15 px-4 py-3 text-xs leading-5 text-white/70">
         点击条目可修改内容；点击右上角「加入输入框」即可带回对话让 AI 改码并重新发布。
       </p>
     </section>

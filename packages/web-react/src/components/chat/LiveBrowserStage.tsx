@@ -28,6 +28,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { apiErrorMessage } from "../../lib/api";
 import {
   type LiveBrowserActionPayload,
   type LiveBrowserState,
@@ -127,8 +128,7 @@ function isAbortError(err: unknown): boolean {
 }
 
 function errorMessageOf(err: unknown): string {
-  if (err instanceof Error && err.message) return err.message;
-  return "云端浏览器连接失败，请稍后重试";
+  return apiErrorMessage(err, "云端浏览器连接失败，请稍后重试");
 }
 
 function isTakeoverConflictError(err: unknown): boolean {
@@ -1447,13 +1447,18 @@ export function LiveBrowserStage({
     toast("正在暂停助手，暂停完成后自动进入人工接管…", "info");
   };
 
-  const handleCopyUrl = useCallback(() => {
-    if (!state?.url) return;
+  const handleCopyUrl = useCallback(async (): Promise<boolean> => {
+    if (!state?.url) return false;
     try {
-      void navigator.clipboard?.writeText(state.url);
+      if (!navigator.clipboard?.writeText) {
+        throw new Error("clipboard unavailable");
+      }
+      await navigator.clipboard.writeText(state.url);
       toast("已复制当前页面网址", "success");
+      return true;
     } catch {
-      toast("复制失败，请手动复制地址栏内容", "info");
+      toast("复制失败，请手动复制地址栏内容", "error");
+      return false;
     }
   }, [state?.url, toast]);
 

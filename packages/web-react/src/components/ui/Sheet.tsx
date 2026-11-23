@@ -17,7 +17,7 @@ import { IconButton } from "./IconButton";
 export type SheetSide = "left" | "right" | "bottom";
 
 const sheetVariants = cva(
-  "fixed z-50 flex flex-col bg-sidebar shadow-float outline-none",
+  "fixed z-[var(--z-drawer)] flex flex-col bg-sidebar shadow-float outline-none",
   {
     variants: {
       side: {
@@ -71,7 +71,7 @@ export function Sheet({
       <RD.Portal>
         <RD.Overlay
           className={cn(
-            "fixed inset-0 z-40 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade",
+            "fixed inset-0 z-[var(--z-drawer)] bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade",
             overlayClassName,
           )}
         />

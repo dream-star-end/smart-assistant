@@ -1,5 +1,5 @@
 import { ArrowRight, Check, ChevronRight, Copy, Download, ExternalLink, History, RotateCcw } from "lucide-react";
-import { Suspense, lazy, type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatBytes, openInNewTab } from "../../lib/chat/download";
 import { useProgressiveImage } from "../../lib/chat/useProgressiveImage";
 import type { ProjectAsset } from "../../lib/types";
@@ -418,14 +418,14 @@ function TextPreview({
   if ((kind === "markdown" && text.length <= MARKDOWN_RENDER_MAX_CHARS) || isRichDelimited) {
     return (
       <div className="min-w-0">
-        <Suspense fallback={<PreviewLoading />}>
+        <LazyBoundary fallback={<PreviewLoading />}>
           <DeliverableRichPreview
             path={outputSrc(asset) ?? asset.name}
             name={asset.name}
             text={text}
             showActionBar={false}
           />
-        </Suspense>
+        </LazyBoundary>
       </div>
     );
   }
@@ -773,13 +773,13 @@ export function OutputViewer({
         {kind === "file" && (
           <div className="flex flex-col gap-4">
             {BINARY_OFFICE_EXTS.has(extOfName(asset.name)) && (
-              <Suspense fallback={<PreviewLoading />}>
+              <LazyBoundary fallback={<PreviewLoading />}>
                 <DeliverableRichPreview
                   path={outputSrc(asset) ?? asset.name}
                   name={asset.name}
                   showActionBar={false}
                 />
-              </Suspense>
+              </LazyBoundary>
             )}
             <FileDetails
               asset={asset}

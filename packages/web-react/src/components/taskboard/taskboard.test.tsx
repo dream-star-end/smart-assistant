@@ -929,7 +929,7 @@ describe('BoardSettingsPanel', () => {
     await act(async () => {
       fireEvent.click(pause)
     })
-    expect(await screen.findByText('急停全部巡检？')).toBeInTheDocument()
+    expect(await screen.findByText('急停全部自动调度？')).toBeInTheDocument()
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: '返回' }))
     })
@@ -1285,7 +1285,7 @@ describe('流水线 / 阶段配置', () => {
   test('阶段配置能加载 agent 下拉，hidden agent 不出现', async () => {
     mockStageApis()
     await openStageEditor()
-    const agentSelect = screen.getByLabelText('绑定 agent') as HTMLSelectElement
+    const agentSelect = screen.getByLabelText('绑定智能体') as HTMLSelectElement
     const values = [...agentSelect.options].map((o) => o.value)
     expect(values).toContain('coding-assistant')
     expect(values).toContain('research')
@@ -1306,9 +1306,9 @@ describe('流水线 / 阶段配置', () => {
       }),
     })
     await openStageEditor()
-    fireEvent.change(screen.getByLabelText('绑定 agent'), { target: { value: 'research' } })
+    fireEvent.change(screen.getByLabelText('绑定智能体'), { target: { value: 'research' } })
     fireEvent.change(screen.getByLabelText('提示词模板'), { target: { value: '新提示词' } })
-    fireEvent.change(screen.getByLabelText('巡检表达式'), { target: { value: '0 10 * * 1-5' } })
+    fireEvent.change(screen.getByLabelText('自动调度表达式'), { target: { value: '0 10 * * 1-5' } })
     await act(async () => {
       fireEvent.click(screen.getByTestId('stage-save-s1'))
     })
@@ -1335,9 +1335,9 @@ describe('流水线 / 阶段配置', () => {
     })
     await openStageEditor()
     fireEvent.change(screen.getByLabelText('阶段类型'), { target: { value: 'human' } })
-    expect(screen.getByLabelText('巡检表达式')).toBeDisabled()
-    expect(screen.getByLabelText('启用巡检')).toBeDisabled()
-    expect(screen.getByText(/人工阶段不参与巡检/)).toBeInTheDocument()
+    expect(screen.getByLabelText('自动调度表达式')).toBeDisabled()
+    expect(screen.getByLabelText('启用自动调度')).toBeDisabled()
+    expect(screen.getByText(/人工阶段不参与自动调度/)).toBeInTheDocument()
     await act(async () => {
       fireEvent.click(screen.getByTestId('stage-save-s1'))
     })

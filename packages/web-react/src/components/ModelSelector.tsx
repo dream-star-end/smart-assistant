@@ -315,11 +315,11 @@ export function ModelSelector({
       data-swarm-active={swarmActive ? 'true' : undefined}
       data-swarm-running={swarmRunningActive ? 'true' : undefined}
       className={cn(
-        'oc-btn-tactile oc-spring-press flex min-h-10 min-w-0 max-w-full items-center gap-1.5 rounded-full border border-border/80 bg-surface/85 px-3 py-1 text-section font-medium text-fg shadow-xs outline-none sm:min-h-10 sm:rounded-lg sm:border-border/60 sm:bg-surface/65 sm:px-2.5 sm:py-1.5',
+        'oc-btn-tactile oc-spring-press flex min-h-11 min-w-0 max-w-full items-center gap-1.5 rounded-full border border-border/80 bg-surface/85 px-3 py-1 text-section font-medium text-fg shadow-xs outline-none sm:min-h-10 sm:rounded-lg sm:border-border/60 sm:bg-surface/65 sm:px-2.5 sm:py-1.5 [@media(hover:none)]:min-h-11',
         'hover:border-border-strong hover:bg-surface hover:text-fg hover:shadow-soft focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
         'disabled:pointer-events-none disabled:opacity-50',
         sheetOpen && 'border-accent/45 bg-surface shadow-soft',
-        swarmActive && 'oc-model-trigger-swarm oc-shimmer-sheen',
+        swarmActive && 'oc-model-trigger-swarm',
         teamEngineActive && 'border-accent/25 bg-accent-soft/70 text-accent hover:text-accent disabled:opacity-100',
       )}
     >

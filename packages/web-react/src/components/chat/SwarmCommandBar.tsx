@@ -10,6 +10,7 @@
 import type { SwarmBoardPost, SwarmMemberSnapshot } from "@openclaude/protocol/browser";
 import { AlertTriangle, Check, ChevronDown, Lock, OctagonX, Quote, Send, ShieldAlert } from "lucide-react";
 import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useMemo, useState } from "react";
+import { apiErrorMessage } from "../../lib/api";
 import { requestSwarmTerminate, sendSwarmSteer } from "../../lib/api/wave4Api";
 import type { AuthSession } from "../../lib/types";
 import { cn } from "../../lib/utils";
@@ -147,8 +148,7 @@ export function SwarmCommandBar({
       });
       toast(`已向 @${res.target} 发送指令（#${res.seq}）`, "success");
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "发送指令失败，请稍后重试";
-      toast(msg, "error");
+      toast(apiErrorMessage(err, "发送指令失败，请稍后重试"), "error");
     } finally {
       setSending(false);
     }
@@ -172,15 +172,14 @@ export function SwarmCommandBar({
         toast(`已请求停止 @${res.memberName}`, "info");
       }
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "停止成员失败，请稍后重试";
-      toast(msg, "error");
+      toast(apiErrorMessage(err, "停止成员失败，请稍后重试"), "error");
     } finally {
       setKilling(false);
     }
   };
 
   const onInputKeyDown = (e: ReactKeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && e.keyCode !== 229) {
       e.preventDefault();
       void handleSendSteer();
     }

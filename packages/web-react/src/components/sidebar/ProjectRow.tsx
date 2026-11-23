@@ -185,7 +185,7 @@ export function ProjectRow({
       }}
       style={{ height: "100%" }}
       data-project-row
-      className="relative py-px"
+      className="relative [@media(hover:hover)]:py-px"
     >
       <div
         className={cn(

@@ -444,7 +444,6 @@ describe("OCV5-831 Composer 蜂群占位符单行化与视觉重心", () => {
     fireEvent.change(ta, { target: { value: "写一个计划" } });
     expect(screen.getByRole("button", { name: "发送" })).toHaveClass(
       "oc-btn-primary-craft",
-      "oc-shimmer-sheen",
       "oc-spring-press",
       "oc-icon-nudge",
       "text-primary-fg",
@@ -455,7 +454,6 @@ describe("OCV5-831 Composer 蜂群占位符单行化与视觉重心", () => {
     expect(screen.queryByTestId("composer-swarm-toggle")).toBeNull();
     expect(screen.getByRole("button", { name: "发送" })).toHaveClass(
       "oc-btn-accent-craft",
-      "oc-shimmer-sheen",
       "text-accent-fg",
     );
 

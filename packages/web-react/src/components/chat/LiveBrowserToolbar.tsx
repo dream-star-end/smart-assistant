@@ -327,7 +327,7 @@ export interface LiveBrowserToolbarProps {
   onHandBackOnly: () => void;
   onToggleExpand: () => void;
   onCloseBrowser: () => void;
-  onCopyUrl: () => void;
+  onCopyUrl: () => void | Promise<boolean | void>;
   onScreenshot: () => void;
 }
 
@@ -414,19 +414,27 @@ export function LiveBrowserToolbar({
   const telemetryText = (() => {
     if (isReplaced) return "已被替换";
     if (isReconnecting) return "重连中";
+    if (effectiveTakeover) return "已接管";
+    return "实时同步中";
+  })();
+
+  const telemetryTitle = (() => {
+    if (isReplaced) return "当前浏览器画面已在其他标签页接管";
+    if (isReconnecting) return "实时连接中断，正在自动重连";
     if (connectionStatus === "connected" && streamStats.mode === "ws") {
-      const parts = ["WS"];
+      const parts = ["实时流"];
       if (streamStats.fps > 0) parts.push(`${streamStats.fps} fps`);
       if (streamStats.rttMs !== null) parts.push(`${streamStats.rttMs}ms`);
       return parts.join(" · ");
     }
     const ts = formatSyncTime(capturedAt);
-    return ts ? `轮询 · ${ts}` : "轮询";
+    return ts ? `自动轮询同步 · ${ts}` : "自动轮询同步";
   })();
 
-  const handleCopyClick = () => {
+  const handleCopyClick = async () => {
     if (!url) return;
-    onCopyUrl();
+    const ok = await onCopyUrl();
+    if (ok === false) return;
     setUrlCopied(true);
     if (copiedTimerRef.current !== null) window.clearTimeout(copiedTimerRef.current);
     copiedTimerRef.current = window.setTimeout(() => {
@@ -519,7 +527,7 @@ export function LiveBrowserToolbar({
               aria-label="复制当前网址"
               title="复制当前网址"
               data-testid="live-browser-copy-url"
-              onClick={handleCopyClick}
+              onClick={() => void handleCopyClick()}
             >
               {urlCopied ? <Check size={11} className="text-success" /> : <Copy size={11} />}
             </button>
@@ -794,6 +802,7 @@ export function LiveBrowserToolbar({
             className="lb-status-meta"
             data-mode={connectionStatus === "connected" ? "ws" : isDisconnected ? "warn" : "polling"}
             data-testid="live-browser-telemetry"
+            title={telemetryTitle}
           >
             {telemetryText}
           </span>

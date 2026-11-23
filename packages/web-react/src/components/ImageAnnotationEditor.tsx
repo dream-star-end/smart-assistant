@@ -782,12 +782,12 @@ export function ImageAnnotationEditor({
     <Dialog.Root open={open} onOpenChange={(next) => !submitting && onOpenChange(next)}>
       <Dialog.Portal>
         <Dialog.Overlay
-          className="dark fixed inset-x-0 z-[70] bg-bg/95 backdrop-blur-sm"
+          className="dark fixed inset-x-0 z-[var(--z-viewer)] bg-bg/95 backdrop-blur-sm"
           style={{ top: 'var(--oc-visual-offset-top, 0px)', height: 'var(--oc-visual-height, 100dvh)' }}
         />
         <Dialog.Content
           aria-describedby="image-edit-help"
-          className="dark fixed inset-x-0 top-[var(--oc-visual-offset-top,0px)] z-[71] flex h-[var(--oc-visual-height,100dvh)] min-h-0 select-none flex-col bg-bg text-fg outline-none"
+          className="dark fixed inset-x-0 top-[var(--oc-visual-offset-top,0px)] z-[var(--z-viewer)] flex h-[var(--oc-visual-height,100dvh)] min-h-0 select-none flex-col bg-bg text-fg outline-none"
           // ESC 逐层退出 + 误触保护(需求 §5):菜单 → 确认层 → 脏则弹确认 → 干净才退。
           // 全程接管,不放行 Radix 直接关(否则脏状态会被直接丢弃)。
           onEscapeKeyDown={(e) => {

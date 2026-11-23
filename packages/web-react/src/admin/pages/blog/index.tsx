@@ -2,7 +2,7 @@ import { Check, Eye, EyeOff, Image as ImageIcon, PenLine, Sparkles, SquarePen, X
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { BlogProse, type BlogImageSource } from '../../../components/tutorials/blog/BlogArticle'
 import { blogCategoryLabel } from '../../../components/tutorials/blog/blogLib'
-import { Alert, Button, Textarea } from '../../../components/ui'
+import { Alert, Button, ListSkeleton, Textarea, useToast } from '../../../components/ui'
 import { apiErrorMessage } from '../../../lib/api'
 import { adminApi } from '../../../lib/api/admin'
 import type {
@@ -62,7 +62,7 @@ function Verdict({ moderation }: { moderation: BlogModeration }) {
         <span className="oc-icon-badge oc-icon-badge-accent size-6 rounded-md">
           <Sparkles size={12.5} />
         </span>
-        <h4 className="m-0 text-[12.5px] font-semibold text-faint">AI 判定（置信度）</h4>
+        <h4 className="m-0 text-caption font-semibold text-faint">AI 判定（置信度）</h4>
       </div>
       <div className="oc-surface-recessed flex flex-col gap-2 rounded-xl p-3">
         {DIMENSIONS.map((dim) => {
@@ -70,7 +70,7 @@ function Verdict({ moderation }: { moderation: BlogModeration }) {
           const pct = yes == null ? null : Math.round(yes * 100)
           const color = yes == null ? 'var(--faint)' : meterColor(yes)
           return (
-            <div key={dim.key} className="grid grid-cols-[62px_1fr_42px] items-center gap-2 text-[12.5px]">
+            <div key={dim.key} className="grid grid-cols-[62px_1fr_42px] items-center gap-2 text-caption">
               <span className="text-fg">{dim.label}</span>
               <span className="blog-meter">
                 <i className="oc-progress-fill" style={{ width: `${pct ?? 0}%`, background: color }} />
@@ -83,7 +83,7 @@ function Verdict({ moderation }: { moderation: BlogModeration }) {
         })}
       </div>
       {moderation.adminNote && (
-        <div className="oc-callout oc-callout-warning rounded-xl px-3 py-2.5 text-[12.5px] leading-[1.6] text-muted">
+        <div className="oc-callout oc-callout-warning rounded-xl px-3 py-2.5 text-caption leading-relaxed text-muted">
           {moderation.adminNote}
         </div>
       )}
@@ -139,8 +139,8 @@ function ReviewCard({
             <span className="blog-chip oc-badge-craft">{item.reviewSource === 'ai' ? 'AI 处理' : '人工处理'}</span>
           )}
         </div>
-        <h3 className="m-0 mb-2 text-[16px] font-bold tracking-tight text-fg">{item.title}</h3>
-        <div className="oc-surface-recessed my-2.5 rounded-xl p-3.5 text-[13px] leading-[1.65] text-muted">
+        <h3 className="m-0 mb-2 text-title font-bold tracking-tight text-fg">{item.title}</h3>
+        <div className="oc-surface-recessed my-2.5 rounded-xl p-3.5 text-body leading-relaxed text-muted">
           {excerpt.slice(0, 120)}
           {excerpt.length > 120 ? '……' : ''}
           <br />
@@ -149,7 +149,7 @@ function ReviewCard({
         {item.reviewNote && tab !== 'human' && (
           <div
             className={cn(
-              'oc-callout mb-3 rounded-xl px-3 py-2 text-[12.5px] leading-relaxed text-muted',
+              'oc-callout mb-3 rounded-xl px-3 py-2 text-caption leading-relaxed text-muted',
               tab === 'approved' ? 'oc-callout-info' : 'oc-callout-danger',
             )}
           >
@@ -281,9 +281,9 @@ function RecordRow({ record }: { record: BlogModerationRecord }) {
             #{record.publicationId} · {record.authorName} · {stamp(record.createdAt)}
           </span>
         </div>
-        <h3 className="m-0 text-[15px] font-semibold tracking-tight text-fg">{record.title}</h3>
+        <h3 className="m-0 text-section font-semibold tracking-tight text-fg">{record.title}</h3>
         {record.reason && (
-          <div className="oc-callout oc-callout-info mt-3 rounded-xl px-3 py-2 text-[12.5px] leading-relaxed text-muted">
+          <div className="oc-callout oc-callout-info mt-3 rounded-xl px-3 py-2 text-caption leading-relaxed text-muted">
             给作者的理由：{record.reason}
           </div>
         )}
@@ -297,6 +297,7 @@ function RecordRow({ record }: { record: BlogModerationRecord }) {
 
 export default function BlogAdminPage() {
   const meta = getAdminPage('blog')
+  const toast = useToast()
   const [tab, setTab] = useState<Tab>('human')
   const [items, setItems] = useState<AdminBlogPost[]>([])
   const [records, setRecords] = useState<BlogModerationRecord[]>([])
@@ -352,18 +353,25 @@ export default function BlogAdminPage() {
       .catch(() => {})
   }, [])
 
-  const act = async (item: AdminBlogPost, run: () => Promise<unknown>, failure: string) => {
+  const act = async (
+    item: AdminBlogPost,
+    run: () => Promise<unknown>,
+    successMsg: string,
+    failure: string,
+  ) => {
     setBusyId(item.id)
     setError(null)
     try {
       await run()
       setItems((current) => current.filter((entry) => entry.id !== item.id))
       if (tab === 'human') setHumanCount((n) => (n == null ? n : Math.max(0, n - 1)))
+      toast(successMsg, 'success')
     } catch (cause) {
       // 作者中途改过（409）或已被处理：先刷新列表（load 会清掉旧错误），再显示原因。
       const message = apiErrorMessage(cause, failure)
       await load(null)
       setError(message)
+      toast(message, 'error')
     } finally {
       setBusyId(null)
     }
@@ -392,7 +400,7 @@ export default function BlogAdminPage() {
             aria-selected={tab === entry.value}
             onClick={() => setTab(entry.value)}
             className={cn(
-              'oc-btn-tactile flex shrink-0 items-center gap-1.5 rounded-full px-3.5 py-1.5 text-[13.5px] outline-none transition-[background-color,color,box-shadow] duration-150 focus-visible:ring-2 focus-visible:ring-ring',
+              'oc-btn-tactile flex shrink-0 items-center gap-1.5 rounded-full px-3.5 py-1.5 text-body outline-none transition-[background-color,color,box-shadow] duration-150 focus-visible:ring-2 focus-visible:ring-ring',
               tab === entry.value
                 ? 'oc-segmented-thumb font-semibold text-fg'
                 : 'font-medium text-muted hover:text-fg',
@@ -400,15 +408,30 @@ export default function BlogAdminPage() {
           >
             {entry.label}
             {entry.value === 'human' && humanCount != null && humanCount > 0 && (
-              <span className="oc-badge-craft rounded-full bg-warning-soft px-1.5 py-0.5 text-[11px] font-bold tabular-nums leading-none text-warning">
+              <span className="oc-badge-craft rounded-full bg-warning-soft px-1.5 py-0.5 text-micro font-bold tabular-nums leading-none text-warning">
                 {humanCount}
               </span>
             )}
           </button>
         ))}
       </div>
-      {error && <Alert tone="danger">{error}</Alert>}
-      {empty && !loading ? (
+      {error && (
+        <Alert
+          tone="danger"
+          action={
+            <Button size="sm" variant="secondary" onClick={() => void load(null)}>
+              重试
+            </Button>
+          }
+        >
+          {error}
+        </Alert>
+      )}
+      {loading && empty ? (
+        <div className="oc-surface-card rounded-2xl p-5" data-testid="blog-admin-loading">
+          <ListSkeleton rows={3} />
+        </div>
+      ) : empty ? (
         <div className="oc-surface-card rounded-2xl p-12 text-center">
           <span className="oc-icon-badge oc-icon-badge-success mx-auto size-12 rounded-2xl">
             <Check size={24} />
@@ -435,6 +458,7 @@ export default function BlogAdminPage() {
                 void act(
                   item,
                   () => adminApi.adminReviewCommunityTutorial(adminSession, item.id, 'approve', undefined, item.reviewToken),
+                  item.editId ? '已通过并替换线上版本' : '已通过发布',
                   '通过失败',
                 )
               }
@@ -442,11 +466,17 @@ export default function BlogAdminPage() {
                 void act(
                   item,
                   () => adminApi.adminReviewCommunityTutorial(adminSession, item.id, 'reject', note, item.reviewToken),
+                  '已驳回投稿',
                   '驳回失败',
                 )
               }
               onTakedown={(note) =>
-                void act(item, () => adminApi.adminTakedownCommunityTutorial(adminSession, item.id, note), '下架失败')
+                void act(
+                  item,
+                  () => adminApi.adminTakedownCommunityTutorial(adminSession, item.id, note),
+                  '已下架文章',
+                  '下架失败',
+                )
               }
             />
           ))}

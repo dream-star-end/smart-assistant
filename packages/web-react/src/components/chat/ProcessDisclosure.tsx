@@ -1092,7 +1092,7 @@ function shellLivePhrase<T>(
 
 
 const shellToggleClass =
-  "group/shell -mx-1.5 flex min-h-8 w-[calc(100%+0.75rem)] items-center gap-2 rounded-lg px-1.5 py-1 text-left transition-colors duration-150 hover:bg-hover/60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-10";
+  "group/shell -mx-1.5 flex min-h-8 w-[calc(100%+0.75rem)] items-center gap-2 rounded-lg px-1.5 py-1 text-left transition-colors duration-150 hover:bg-hover/60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-11";
 
 
 /** Sum of assistant cost labels. Zero and non-digits are skipped. */
@@ -1307,8 +1307,8 @@ export function ProcessDisclosure<T>({
         <button
           type="button"
           data-testid="process-pane-changes"
-          className="group/changes oc-btn-tactile inline-flex shrink-0 items-center justify-center rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-10"
-          title="在详情面板查看这一轮的产出"
+          className="group/changes oc-btn-tactile inline-flex shrink-0 items-center justify-center rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+          title="在工作台查看这一轮的产出"
           onClick={() => openPane("outputs", processRows[0])}
         >
           <span className="inline-flex h-6 items-center gap-1 rounded-md border border-border/65 px-2 text-caption font-medium text-muted transition-colors group-hover/changes:border-border-strong group-hover/changes:bg-hover/65 group-hover/changes:text-fg">

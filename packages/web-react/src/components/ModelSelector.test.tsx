@@ -882,7 +882,7 @@ describe('ModelSelector 窄屏贴底 sheet', () => {
       expect(screen.getByText('思考档位')).toBeInTheDocument()
       const summary = screen.getByText('思考档位').parentElement
       expect(summary?.textContent).toMatch(/高/)
-      expect(screen.getByRole('menuitem', { name: '高' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: '高' })).toBeInTheDocument()
       expect(screen.queryByRole('textbox', { name: '搜索模型' })).toBeNull()
     } finally {
       restore()
@@ -1618,7 +1618,7 @@ describe('ModelSelector OCV5-843 蜂群模式集成（列表微标 + 参数区�
     expect(trigger).toHaveAttribute('data-swarm-active', 'true')
     expect(trigger).toHaveAttribute('data-swarm-running', 'true')
     expect(trigger.className).toContain('oc-model-trigger-swarm')
-    expect(trigger.className).toContain('oc-shimmer-sheen')
+    expect(trigger.className).not.toContain('oc-shimmer-sheen')
     expect(screen.getByTestId('model-trigger-swarm-icon')).toBeInTheDocument()
     expect(screen.queryByTestId('model-trigger-swarm-running-dot')).toBeNull()
 
@@ -1677,7 +1677,7 @@ describe('ModelSelector OCV5-843 蜂群模式集成（列表微标 + 参数区�
     }
   })
 
-  it('非支持蜂群的模型在面板内展示触屏可读引导（切至 Gemini 4 / Antigravity 可启用蜂群）', async () => {
+  it('非支持蜂群的模型在面板内展示触屏可读引导（品牌中性文案，不暴露内部代号）', async () => {
     render(
       <ModelSelector
         models={SWARM_MODELS}
@@ -1691,6 +1691,7 @@ describe('ModelSelector OCV5-843 蜂群模式集成（列表微标 + 参数区�
     const trigger = screen.getByRole('button', { name: '选择对话模型' })
     openMenu(trigger)
     const hint = await screen.findByTestId('model-picker-swarm-hint')
-    expect(hint.textContent).toContain('Antigravity')
+    expect(hint.textContent).toContain('切至带蜂群星轨徽标的模型即可启用蜂群协作')
+    expect(hint.textContent).not.toContain('Antigravity')
   })
 })

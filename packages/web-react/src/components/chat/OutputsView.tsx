@@ -17,10 +17,11 @@ import {
   MessageSquarePlus,
   MonitorPlay,
 } from "lucide-react";
-import { type ReactNode, Suspense, lazy, useEffect, useState } from "react";
+import { type ReactNode, lazy, useEffect, useState } from "react";
 import { useViewportClass } from "../../hooks/useMdViewport";
 import type { ChatMessage } from "../../lib/chat/model";
 import { cn } from "../../lib/utils";
+import { LazyBoundary } from "../ChunkErrorBoundary";
 import type { ToolLike } from "../tool/format";
 import { SegmentedControl, Skeleton, Spinner } from "../ui";
 import type { TargetOutputRequest } from "./inspectorState";
@@ -125,7 +126,7 @@ export function TurnBar({
             aria-label="上一轮"
             disabled={index <= 0}
             onClick={onPrev}
-            className="oc-btn-tactile inline-flex size-5 items-center justify-center rounded-full outline-none transition-colors hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30"
+            className="oc-btn-tactile inline-flex size-5 items-center justify-center rounded-full outline-none transition-colors hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30 [@media(hover:none)]:size-11"
           >
             <ChevronLeft size={13} />
           </button>
@@ -137,7 +138,7 @@ export function TurnBar({
             aria-label="下一轮"
             disabled={index >= total - 1}
             onClick={onNext}
-            className="oc-btn-tactile inline-flex size-5 items-center justify-center rounded-full outline-none transition-colors hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30"
+            className="oc-btn-tactile inline-flex size-5 items-center justify-center rounded-full outline-none transition-colors hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30 [@media(hover:none)]:size-11"
           >
             <ChevronRight size={13} />
           </button>
@@ -266,7 +267,7 @@ function FileHero({
           ))}
         </div>
       ) : textual || richPreview ? (
-        <Suspense fallback={<PreviewFallback />}>
+        <LazyBoundary fallback={<PreviewFallback />}>
           <FilePreview
             path={file.path}
             name={file.name}
@@ -278,7 +279,7 @@ function FileHero({
             onBackToList={onBackToList}
             onStatusChange={setPreviewStatus}
           />
-        </Suspense>
+        </LazyBoundary>
       ) : (
         <div className="px-5 py-8 text-center text-meta text-muted">这类文件不在面板里预览，可以下载查看。</div>
       )}
@@ -318,7 +319,7 @@ function FileHero({
                         aria-pressed={opt.value === view}
                         onClick={() => setView(opt.value)}
                         className={cn(
-                          "h-7 rounded-md px-2 text-caption font-medium transition-colors",
+                          "h-7 rounded-md px-2 text-caption font-medium transition-colors [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3",
                           opt.value === view ? "bg-accent-soft text-accent" : "text-muted hover:bg-hover hover:text-fg",
                         )}
                       >
@@ -439,9 +440,9 @@ function MediaHero({
     return (
       <article className="flex min-h-0 flex-1 flex-col bg-surface" data-testid="outputs-hero" data-compact="true" aria-label={`图片 ${media.name}`}>
         <div className="flex-1">
-          <Suspense fallback={<PreviewFallback />}>
+          <LazyBoundary fallback={<PreviewFallback />}>
             <MediaPreview src={media.src} kind={media.kind} name={media.name} />
-          </Suspense>
+          </LazyBoundary>
         </div>
         <div className="wb-bottom-dock">
           {annotateOpen && (
@@ -468,9 +469,9 @@ function MediaHero({
   }
   return (
     <article className="flex min-h-0 flex-1 flex-col bg-surface" data-testid="outputs-hero" aria-label={`图片 ${media.name}`}>
-      <Suspense fallback={<PreviewFallback />}>
+      <LazyBoundary fallback={<PreviewFallback />}>
         <MediaPreview src={media.src} kind={media.kind} name={media.name} />
-      </Suspense>
+      </LazyBoundary>
       {annotateOpen && (
         <QuickAnnotateDrawer
           filePath={media.src}
@@ -580,7 +581,7 @@ function DeliverableSummaryStrip({
           data-testid="outputs-filter-all"
           onClick={() => onSelectCategory("all")}
           className={cn(
-            "oc-btn-tactile inline-flex h-7 shrink-0 items-center gap-1 rounded-sm px-2.5 text-caption font-medium whitespace-nowrap outline-none transition-all focus-visible:ring-2 focus-visible:ring-ring",
+            "oc-btn-tactile inline-flex h-7 shrink-0 items-center gap-1 rounded-sm px-2.5 text-caption font-medium whitespace-nowrap outline-none transition-all focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
             activeCategory === "all"
               ? "oc-segmented-thumb text-accent"
               : "text-muted hover:text-fg",
@@ -599,7 +600,7 @@ function DeliverableSummaryStrip({
               data-testid={`outputs-filter-${c.category}`}
               onClick={() => onSelectCategory(active ? "all" : c.category)}
               className={cn(
-                "oc-btn-tactile inline-flex h-7 shrink-0 items-center gap-1 rounded-sm px-2.5 text-caption font-medium whitespace-nowrap outline-none transition-all focus-visible:ring-2 focus-visible:ring-ring",
+                "oc-btn-tactile inline-flex h-7 shrink-0 items-center gap-1 rounded-sm px-2.5 text-caption font-medium whitespace-nowrap outline-none transition-all focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
                 active
                   ? "oc-segmented-thumb text-accent"
                   : "text-muted hover:text-fg",
@@ -677,7 +678,7 @@ function DirectoryOverview({
                   aria-label="上一轮"
                   disabled={turnIndex <= 0}
                   onClick={onPrevTurn}
-                  className="oc-btn-tactile inline-flex size-5 items-center justify-center rounded-xs text-muted outline-none hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30"
+                  className="oc-btn-tactile inline-flex size-5 items-center justify-center rounded-xs text-muted outline-none hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30 [@media(hover:none)]:size-11"
                 >
                   <ChevronLeft size={12} />
                 </button>
@@ -689,7 +690,7 @@ function DirectoryOverview({
                   aria-label="下一轮"
                   disabled={turnIndex >= turnTotal - 1}
                   onClick={onNextTurn}
-                  className="oc-btn-tactile inline-flex size-5 items-center justify-center rounded-xs text-muted outline-none hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30"
+                  className="oc-btn-tactile inline-flex size-5 items-center justify-center rounded-xs text-muted outline-none hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30 [@media(hover:none)]:size-11"
                 >
                   <ChevronRight size={12} />
                 </button>
@@ -828,7 +829,7 @@ function DirectoryOverview({
                   onClick={() => setAllSources((v) => !v)}
                   aria-expanded={allSources}
                   data-testid="outputs-sources-more"
-                  className="oc-btn-tactile mt-2 rounded-full px-2.5 py-1 text-meta font-medium text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+                  className="oc-btn-tactile mt-2 rounded-full px-2.5 py-1 text-meta font-medium text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3.5"
                 >
                   {allSources ? "收起" : `显示全部 ${sources.length} 条`}
                 </button>

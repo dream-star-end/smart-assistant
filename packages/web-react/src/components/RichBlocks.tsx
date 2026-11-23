@@ -5,22 +5,37 @@
  */
 import * as Dialog from "@radix-ui/react-dialog";
 import { Check, Code2, Copy, Eye, Maximize2, X } from "lucide-react";
-import { type ReactNode, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { chatInteractionUnavailableText, useChatInteraction } from "./tool/context";
 import { OptionsGroupFooter, OptionsGroupProvider, useOptionsGroup, useOptionsGroupSnapshot } from "./optionsGroup";
 
-/** 主题响应:观察 <html> class(useTheme 切换写入 .dark)。mermaid/chart 的配色在渲染时
- *  快照,若不进依赖,切明暗主题后已渲染的图配色错乱(暗底浅字/浅底暗字)。 */
-function useIsDark(): boolean {
-  const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
-  useEffect(() => {
-    const mo = new MutationObserver(() => {
-      setDark(document.documentElement.classList.contains("dark"));
+/** 模块级共享暗色主题订阅器：全页多个 MermaidBlock/ChartBlock 共用单一 MutationObserver 观察 <html> class。 */
+const darkThemeListeners = new Set<() => void>();
+let darkThemeObserver: MutationObserver | null = null;
+
+function getIsDarkSnapshot(): boolean {
+  return typeof document !== "undefined" && document.documentElement.classList.contains("dark");
+}
+
+function subscribeDarkTheme(listener: () => void): () => void {
+  darkThemeListeners.add(listener);
+  if (!darkThemeObserver && typeof document !== "undefined" && typeof MutationObserver !== "undefined") {
+    darkThemeObserver = new MutationObserver(() => {
+      for (const cb of darkThemeListeners) cb();
     });
-    mo.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
-    return () => mo.disconnect();
-  }, []);
-  return dark;
+    darkThemeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
+  }
+  return () => {
+    darkThemeListeners.delete(listener);
+    if (darkThemeListeners.size === 0 && darkThemeObserver) {
+      darkThemeObserver.disconnect();
+      darkThemeObserver = null;
+    }
+  };
+}
+
+function useIsDark(): boolean {
+  return useSyncExternalStore(subscribeDarkTheme, getIsDarkSnapshot, () => false);
 }
 
 function readCssToken(name: string, fallback: string): string {
@@ -121,10 +136,10 @@ function RichFullscreenModal({
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-[60] bg-fg/35 backdrop-blur-xs data-[state=open]:animate-fade" />
+        <Dialog.Overlay className="fixed inset-0 z-[var(--z-viewer)] bg-fg/35 backdrop-blur-xs data-[state=open]:animate-fade" />
         <Dialog.Content
           aria-describedby={undefined}
-          className="oc-surface-popover oc-dialog-in fixed inset-3 z-[61] flex flex-col overflow-hidden rounded-2xl outline-none sm:inset-6"
+          className="oc-surface-popover oc-dialog-in fixed inset-3 z-[var(--z-viewer)] flex flex-col overflow-hidden rounded-2xl outline-none sm:inset-6"
         >
           <div className="flex shrink-0 items-center justify-between border-b border-border/80 px-4 py-2.5">
             <Dialog.Title className="text-section font-semibold text-fg">{title}</Dialog.Title>
@@ -147,6 +162,9 @@ function RichFullscreenModal({
   );
 }
 
+/** 流式防抖：避免 ```mermaid 流式输出期间每个 chunk 都触发 parse/render 与骨架闪烁。 */
+const MERMAID_RENDER_DEBOUNCE_MS = 160;
+
 /** ```mermaid 代码块 → 渲染成 SVG 流程图;失败回退源码。 */
 export function MermaidBlock({ code }: { code: string }) {
   const [svg, setSvg] = useState<string | null>(null);
@@ -155,12 +173,15 @@ export function MermaidBlock({ code }: { code: string }) {
   const [fullscreen, setFullscreen] = useState(false);
   const rawId = useId();
   const isDark = useIsDark();
+  const prevCodeRef = useRef(code);
 
   useEffect(() => {
     let alive = true;
-    setSvg(null);
-    setErr(false);
-    (async () => {
+    const codeChanged = prevCodeRef.current !== code;
+    prevCodeRef.current = code;
+    const delay = codeChanged ? MERMAID_RENDER_DEBOUNCE_MS : 0;
+
+    const run = async () => {
       try {
         const mermaid = (await import("mermaid")).default;
         const accent = readCssToken("--accent", isDark ? "hsl(16, 68%, 61%)" : "hsl(16, 71%, 38%)");
@@ -201,18 +222,33 @@ export function MermaidBlock({ code }: { code: string }) {
         // "Syntax error" SVG 注入 body 残留)。代码写完变有效后,effect 重跑再真正 render。
         const ok = await mermaid.parse(code, { suppressErrors: true });
         if (!ok) {
-          if (alive) setErr(true);
+          if (alive) {
+            setSvg(null);
+            setErr(true);
+          }
           return;
         }
         const id = "mmd" + rawId.replace(/[^a-zA-Z0-9]/g, "");
         const out = await mermaid.render(id, code);
-        if (alive) setSvg(out.svg);
+        if (alive) {
+          setErr(false);
+          setSvg(out.svg);
+        }
       } catch {
-        if (alive) setErr(true);
+        if (alive) {
+          setSvg(null);
+          setErr(true);
+        }
       }
-    })();
+    };
+
+    const timer = window.setTimeout(() => {
+      void run();
+    }, delay);
+
     return () => {
       alive = false;
+      window.clearTimeout(timer);
     };
   }, [code, rawId, isDark]);
 

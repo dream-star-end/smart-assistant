@@ -239,11 +239,11 @@ describe("calculator", () => {
 
 describe("fallbacks never crash the message", () => {
   it.each([
-    ["invalid JSON", '{"type":"table", rows: oops}', /无法解析/],
-    ["not an object", '["a","b"]', /无法解析/],
-    ["unknown type without items", j({ type: "hologram", x: 1 }), /无法显示/],
-    ["invalid known type", j({ type: "table" }), /无法显示/],
-    ["too large", `{"type":"callout","body":"${"x".repeat(70_000)}"}`, /过大/],
+    ["invalid JSON", '{"type":"table", rows: oops}', /内容已转为文本展示/],
+    ["not an object", '["a","b"]', /内容已转为文本展示/],
+    ["unknown type without items", j({ type: "hologram", x: 1 }), /内容已转为文本展示/],
+    ["invalid known type", j({ type: "table" }), /内容已转为文本展示/],
+    ["too large", `{"type":"callout","body":"${"x".repeat(70_000)}"}`, /内容较长，已转为文本展示/],
   ])("%s → readable original", (_n, code, msg) => {
     render(<IuiBlock code={code} />);
     expect(screen.getByText(msg)).toBeInTheDocument();
@@ -255,6 +255,24 @@ describe("fallbacks never crash the message", () => {
     expect(screen.getByText("看板")).toBeInTheDocument();
     expect(screen.getByText("写设计 —— 我")).toBeInTheDocument();
     expect(screen.getByText("评审")).toBeInTheDocument();
+  });
+
+  it("unknown type with steps / body / cards degrades cleanly to Markdown", () => {
+    render(
+      <IuiBlock
+        code={j({
+          type: "custom_plan",
+          title: "执行计划",
+          body: "按以下顺序推进",
+          steps: ["调研需求", "产出原型"],
+        })}
+      />,
+    );
+    expect(screen.getByText("执行计划")).toBeInTheDocument();
+    expect(screen.getByText("按以下顺序推进")).toBeInTheDocument();
+    expect(screen.getByText("调研需求")).toBeInTheDocument();
+    expect(screen.getByText("产出原型")).toBeInTheDocument();
+    expect(screen.queryByText(/无法显示/)).not.toBeInTheDocument();
   });
 
   it("a component that throws falls back to its Markdown", () => {
@@ -304,7 +322,7 @@ describe("streaming", () => {
     const { rerender } = render(<IuiBlock code='{"type":"table","columns":[' live />);
     expect(document.querySelector('[data-iui-skeleton="table"]')).toBeTruthy();
     rerender(<IuiBlock code='{"type":"table","columns":[' />);
-    expect(screen.getByText(/无法显示|无法解析/)).toBeInTheDocument();
+    expect(screen.getByText(/内容已转为文本展示/)).toBeInTheDocument();
   });
 });
 

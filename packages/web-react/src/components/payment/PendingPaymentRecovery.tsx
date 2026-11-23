@@ -114,7 +114,7 @@ export function PendingPaymentRecovery({
 
   return (
     <div
-      className="oc-surface-popover fixed inset-x-4 bottom-[calc(1rem+env(safe-area-inset-bottom))] z-[70] mx-auto flex max-w-md items-center gap-3 rounded-2xl px-4 py-3"
+      className="oc-surface-popover fixed inset-x-4 bottom-[calc(1rem+env(safe-area-inset-bottom))] z-[var(--z-toast)] mx-auto flex max-w-md items-center gap-3 rounded-2xl px-4 py-3"
       role="status"
       aria-live="polite"
       data-testid={pending ? "payment-recovery-pending" : `payment-recovery-${result?.kind}`}
@@ -148,11 +148,24 @@ export function PendingPaymentRecovery({
               : result?.message}
         </div>
       </div>
-      {result && (
+      {pending ? (
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => {
+            clearPendingPayment(pending.orderNo);
+            setPending(null);
+          }}
+          className="shrink-0 text-muted"
+          data-testid="payment-recovery-dismiss"
+        >
+          暂不等待
+        </Button>
+      ) : result ? (
         <Button variant="secondary" size="sm" onClick={() => setResult(null)} className="shrink-0">
           知道了
         </Button>
-      )}
+      ) : null}
     </div>
   );
 }

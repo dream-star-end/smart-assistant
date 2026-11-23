@@ -42,7 +42,7 @@ export function AttachChip({
           type="button"
           onClick={onPreview}
           aria-label={`预览 ${a.name}`}
-          className="oc-btn-tactile relative size-8 shrink-0 overflow-hidden rounded-xs ring-1 ring-inset ring-border/70 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="oc-btn-tactile relative size-8 shrink-0 overflow-hidden rounded-xs ring-1 ring-inset ring-border/70 outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11"
         >
           <img src={a.previewUrl} alt={a.name} className="size-full object-cover" />
           {a.status === "uploading" && (
@@ -108,7 +108,7 @@ export function AttachChip({
           onClick={onAnnotate}
           disabled={!onAnnotate}
           aria-label={`编辑图片 ${a.name}`}
-          title={annotateDisabledReason ?? "编辑 · Image 2"}
+          title={annotateDisabledReason ?? "编辑图片"}
           className="oc-btn-tactile flex h-7 min-h-11 shrink-0 items-center gap-1 rounded-xs px-2 text-caption font-medium text-accent hover:bg-accent-soft disabled:cursor-not-allowed disabled:opacity-35 sm:min-h-7"
         >
           <Pencil size={13} strokeWidth={1.75} />

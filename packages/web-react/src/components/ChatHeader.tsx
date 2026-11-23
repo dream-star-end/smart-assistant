@@ -250,7 +250,7 @@ export function ChatHeader({
       sessionUnreadCount={sessionUnreadCount}
       updateAvailable={updateAvailable}
       onReloadForUpdate={onReloadForUpdate}
-      className="relative z-20 border-x-0 border-t-0 border-b border-border/80 bg-bg/95 backdrop-blur-md shadow-xs"
+      className="relative z-[var(--z-header)] border-x-0 border-t-0 border-b border-border/80 bg-bg/95 backdrop-blur-md shadow-xs"
       contentClassName="min-h-12 flex-nowrap items-center gap-1 px-2 py-1 sm:min-h-[52px] sm:gap-1.5 sm:px-4 sm:py-1.5"
     >
       {/* 模型与协作态核心区：手机 <640px 居中紧凑胶囊（对称留白）；桌面 sm+ 左对齐且优先保障模型与蜂群态宽度。 */}
@@ -293,7 +293,7 @@ export function ChatHeader({
                   data-product-feature={PRODUCT_CAPABILITIES.advisorMode.id}
                   aria-label="顾问模式已开启"
                   title="顾问模式已开启"
-                  className="oc-btn-tactile oc-spring-press group flex min-h-10 min-w-9 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:min-h-11 sm:min-w-11"
+                  className="oc-btn-tactile oc-spring-press group flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
                 >
                   <span className="oc-badge-craft flex items-center gap-1 rounded-full bg-accent-soft px-1.5 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15 sm:px-2.5">
                     <AtelierIcon name="shield" size={12} className="shrink-0" />
@@ -346,7 +346,7 @@ export function ChatHeader({
                   data-product-feature={PRODUCT_CAPABILITIES.teamMode.id}
                   aria-label="团队模式已开启"
                   title="团队模式已开启"
-                  className="oc-btn-tactile oc-spring-press group flex min-h-10 min-w-9 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:min-h-11 sm:min-w-11"
+                  className="oc-btn-tactile oc-spring-press group flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
                 >
                   <span className="oc-badge-craft flex items-center gap-1 rounded-full bg-accent-soft px-1.5 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15 sm:px-2.5">
                     <Users size={12} strokeWidth={1.75} className="shrink-0" />
@@ -442,7 +442,7 @@ export function ChatHeader({
             aria-label={subscriptionMeta.detailLabel}
             title={subscriptionMeta.detailLabel}
             className={cn(
-              "oc-btn-tactile oc-spring-press oc-badge-craft inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md border text-caption font-medium leading-none outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11 sm:h-8 sm:w-auto sm:gap-1.5 sm:rounded-full sm:px-2.5",
+              "oc-btn-tactile oc-spring-press oc-badge-craft inline-flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-md border text-caption font-medium leading-none outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:h-8 sm:min-h-0 sm:w-auto sm:min-w-0 sm:gap-1.5 sm:rounded-full sm:px-2.5 [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11",
               subscriptionMeta.paid
                 ? "border-warning/30 bg-warning-soft/80 text-warning hover:border-warning/50 hover:bg-warning-soft"
                 : "border-accent/25 bg-accent-soft/75 text-accent hover:border-accent/45 hover:bg-accent-soft",
@@ -484,9 +484,9 @@ export function ChatHeader({
                 data-product-control
                 data-testid="detail-pane-toggle"
                 onClick={onTogglePane}
-                aria-label="详情面板"
+                aria-label="工作台（产出、浏览器、计划）"
                 aria-pressed={paneOpen}
-                title={`${paneOpen ? "收起" : "打开"}详情面板：步骤、改动、计划 (${modKeyLabel()}\\)`}
+                title={`${paneOpen ? "收起" : "打开"}工作台（产出、浏览器、计划） (${modKeyLabel()}\\)`}
                 shape="square"
                 className={cn(
                   "oc-btn-tactile oc-spring-press oc-icon-nudge",

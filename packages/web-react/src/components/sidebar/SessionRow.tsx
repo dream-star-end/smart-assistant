@@ -157,7 +157,7 @@ export const SessionRow = memo(function SessionRow({
       style={{ height: "100%" }}
       data-session-row
       data-indented={indent ? "true" : undefined}
-      className={cn("relative py-px", indent && "pl-2")}
+      className={cn("relative [@media(hover:hover)]:py-px", indent && "pl-2")}
     >
       <div
         onPointerDown={onRowPointerDown}

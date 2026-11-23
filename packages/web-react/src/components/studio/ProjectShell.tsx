@@ -6,6 +6,7 @@ import { ChevronRight, Clapperboard, Coins } from 'lucide-react'
 import { useEffect, useRef } from 'react'
 
 import { useStudioProject } from '../../hooks/useStudioProject'
+import { studioErrorText } from '../../lib/studio/api'
 import { budgetPercent, formatCredits } from '../../lib/studio/format'
 import type { StudioPage, StudioRoute } from '../../lib/studio/path'
 import { STAGE_ORDER, type StudioStage, followStage, workStage } from '../../lib/studio/stage'
@@ -89,7 +90,7 @@ export function ProjectShell(props: {
       <StateView
         kind="error"
         title="项目加载失败"
-        body="网络异常，请稍后再试"
+        body={studioErrorText(state.error)}
         action={{ label: '重试', onClick: () => void reload() }}
       />
     )

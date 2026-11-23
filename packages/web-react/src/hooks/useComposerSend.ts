@@ -13,7 +13,6 @@ import { type MessageReplyQuote, type ServiceTier, cursorModelSupportsContextTie
 import { isAntigravityModelForUi } from "../components/chat/swarmDetect";
 import { sessionTitleFromText } from "../lib/sessionTitle";
 import type { Message, Session } from "../lib/types";
-import { demoReply } from "../lib/demo";
 import { findRewriteTarget } from "../lib/implicitFeedback";
 import { prepareAdvisorSend, saveInitialCollaboration, persistRecoveredAdvisor } from "../lib/collaborationSend";
 import { writeSessionEffort } from "../lib/sessionEffort";
@@ -136,7 +135,25 @@ export function useComposerSend({
   toast,
   user,
 }: ComposerSendInput) {
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); authRef, collabEpochRef, draftProjectRef, selectedSessionIdRef, sendImplicitRatingRef, setBusy, setChatError, setCollabSaveError, setCollabUi, setMessages, setStreamText, sockRef, stopRef are App useState setter/useRef passed in, stable
+  const userRef = useRef(user);
+  userRef.current = user;
+  const sessionsRef = useRef(sessions);
+  sessionsRef.current = sessions;
+  const blobUrlsRef = useRef<Set<string>>(new Set());
+  const revokeAllBlobUrls = useCallback(() => {
+    for (const url of blobUrlsRef.current) {
+      try {
+        URL.revokeObjectURL(url);
+      } catch {
+        // ignore invalid/already-revoked object URL
+      }
+    }
+    blobUrlsRef.current.clear();
+  }, []);
+  const userId = user?.id ?? null;
+  useEffect(() => revokeAllBlobUrls, [userId, revokeAllBlobUrls]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); authRef, collabEpochRef, draftProjectRef, selectedSessionIdRef, sendImplicitRatingRef, setBusy, setChatError, setCollabSaveError, setCollabUi, setMessages, setStreamText, sockRef, stopRef, userRef, sessionsRef are stable refs/setters
   const send = useCallback(
     async (
       text: string,
@@ -163,6 +180,7 @@ export function useComposerSend({
         setBusy(true);
         setStreamText("");
         stopRef.current = false;
+        const { demoReply } = await import("../lib/demo");
         const full = demoReply(text);
         for (let i = 0; i < full.length && !stopRef.current; i += 3) {
           setStreamText(full.slice(0, i + 3));
@@ -177,7 +195,8 @@ export function useComposerSend({
         return true;
       }
 
-      if (!user || !sockRef.current) {
+      const currentUser = userRef.current;
+      if (!currentUser || !sockRef.current) {
         if (target) throw new Error("登录状态或会话连接不可用");
         return false;
       }
@@ -199,8 +218,10 @@ export function useComposerSend({
       let createdSession: Session | null = null;
       const recoveryEpoch = collabEpochRef.current;
       const recoverySelection = selectedSessionIdRef.current;
+      const authAtStart = authRef.current;
       const recoveryIdentity = auth?.snapshot().epoch;
-      const recoveryIdentityIsCurrent = () => auth?.snapshot().epoch === recoveryIdentity;
+      const recoveryIdentityIsCurrent = () =>
+        authRef.current === authAtStart && auth?.snapshot().epoch === recoveryIdentity;
       const recoveryIsCurrent = () =>
         (selectedSessionIdRef.current === recoverySelection
           ? collabEpochRef.current === recoveryEpoch
@@ -229,7 +250,7 @@ export function useComposerSend({
         createdSession = {
           id: sessionId,
           title: sessionTitle,
-          ownerUserId: user.id,
+          ownerUserId: currentUser.id,
           updatedAt: new Date().toISOString(),
           messageCount: 0,
           // 项目下新建：草稿建行即归属目标项目（侧栏首帧正确分组；服务端归属在下方首发收尾 PATCH）。
@@ -295,6 +316,7 @@ export function useComposerSend({
               )
               .catch(() => null)
           : normalizedTurnTier;
+      if (!recoveryIdentityIsCurrent()) return false;
       const authorization=!imageEdit&&modelId&&authorizeSwitch?await authorizeSwitch({
         sessionId,requestId:mintMsgId(),targetModel:modelId,agentId:agent.id,teamMode:sendCollab.teamMode,
         collabMode:sendCollab.collabMode,...(sendCollab.advisorModel?{advisorModel:sendCollab.advisorModel}:{}),
@@ -305,10 +327,12 @@ export function useComposerSend({
         canPrompt:recoveryIsCurrent,
         isCurrent:()=>recoveryIdentityIsCurrent()&&(!originalSessionId||!!sockRef.current?.getSession(sessionId))}):undefined;
       if(!imageEdit&&modelId&&authorizeSwitch&&!authorization)return false;
+      if (!recoveryIdentityIsCurrent()) return false;
       if (persistInitialCollab && keepCollabChoiceOnSaveFailure(latestCollab.mode)) void persistInitialCollab();
+      const currentSessions = sessionsRef.current;
       const materializedDraft =
         !createdSession && (
-          sessions.some((session) => session.id === sessionId && session.messageCount === 0) ||
+          currentSessions.some((session) => session.id === sessionId && session.messageCount === 0) ||
           (!!target && (sockRef.current?.getMessages(sessionId).length ?? 0) === 0)
         );
       // 项目草稿被首轮前操作（Goal / GitHub 绑定）物化成会话行的场景：归属同样在首发落定。
@@ -323,11 +347,13 @@ export function useComposerSend({
         // Goal/GitHub 可在首条消息前物化服务端行。首发时须同步收敛真正标题；否则
         // 后端幂等 INSERT 不更新既有行，刷新后 listSessions 会把「新对话」盖回来。
         sockRef.current?.renameSession(sessionId, sessionTitle);
-        void api.patchSessionTitle(authRef.current, sessionId, sessionTitle).catch(() => {
-          // 行尚未建时 PATCH 可 404；随后 send 的幂等 PUT 会使用上面已更新的 socket 标题。
-        });
+        if (recoveryIdentityIsCurrent()) {
+          void api.patchSessionTitle(authAtStart, sessionId, sessionTitle).catch(() => {
+            // 行尚未建时 PATCH 可 404；随后 send 的幂等 PUT 会使用上面已更新的 socket 标题。
+          });
+        }
       }
-      const existingHasModel = Boolean(sessions.find((session) => session.id === sessionId)?.modelId);
+      const existingHasModel = Boolean(currentSessions.find((session) => session.id === sessionId)?.modelId);
       if ((materializedDraft || (!createdSession && !existingHasModel)) && modelId) {
         sockRef.current?.setSessionModel(sessionId, modelId);
         // 与 selectModel 共用 queueModelPatch 同会话单飞队列/水位，避免首发在途 PATCH 后落库覆盖用户随后的显式换模。
@@ -382,7 +408,7 @@ export function useComposerSend({
         // OCV5-434 GPT Fast:只在当前模型支持且用户开着时随帧发送;不带 = 标准。
         ...(effectiveTurnTier ? { serviceTier: effectiveTurnTier } : {}),
       });
-      if(sent===false)return false;
+      if(sent===false || !recoveryIdentityIsCurrent())return false;
       if (effectiveSwarmMode && (!originalSessionId || Boolean(slashSwarm?.matched))) {
         writeSessionSwarmMode(sessionId, true);
       }
@@ -400,7 +426,7 @@ export function useComposerSend({
       setSessions((c) => {
         const sid = sessionId!;
         const found = c.find((s) => s.id === sid);
-        const base = found ?? createdSession ?? ({ ownerUserId: user.id } as Session);
+        const base = found ?? createdSession ?? ({ ownerUserId: currentUser.id } as Session);
         const updated: Session = {
           ...base,
           id: sid,
@@ -423,7 +449,9 @@ export function useComposerSend({
             (!target || selectedSessionIdRef.current === sessionId)
           ) setDraftProject(null);
           const applyProject = (retries: number) => {
-            api.patchSessionMeta(authRef.current, sessionId!, { projectId: draftPid }).catch((e: unknown) => {
+            if (!recoveryIdentityIsCurrent()) return;
+            api.patchSessionMeta(authAtStart, sessionId!, { projectId: draftPid }).catch((e: unknown) => {
+              if (!recoveryIdentityIsCurrent()) return;
               if (retries > 0) window.setTimeout(() => applyProject(retries - 1), 1500);
               else console.warn("patchSessionMeta(projectId) failed", e);
             });
@@ -434,9 +462,7 @@ export function useComposerSend({
       return true;
     },
     // teamMode 不再入依赖:自 08326136f 起 send 只从 collabUi/collabMode 取模式(sendCollabFields),
-    // 不读 teamMode 本身(OCV5-376)。applyCollabDoc/toast/setDraftProject 都是稳定引用,补齐不改重建时机。
-    // setSessions/setActiveId 是 useSessionList 透传的 useState dispatcher(恒稳定),入 deps
-    // 仅为满足 lint(跨 hook 返回值 biome 不再推断稳定性),不改变 send 的重建时机。
+    // 不读 teamMode 本身(OCV5-376)。user / sessions 经 ref 读取以稳定 send 与下游 cardCallbacks 引用。
     [
       activeId,
       authorizeSwitch,
@@ -444,7 +470,6 @@ export function useComposerSend({
       stopPreparing,
       auth,
       demo,
-      user,
       agent,
       modelId,
       swarmMode,
@@ -455,7 +480,6 @@ export function useComposerSend({
       serviceTier,
       collabUi,
       collabAsDefault,
-      sessions,
       setSessions,
       setActiveId,
       applyCollabDoc,
@@ -537,6 +561,16 @@ export function useComposerSend({
     // socket.sendMessage 出站帧 + 跨设备持久化 + toStored(IndexedDB)都显式剥离,刷新即回落签名管线。
     const localSrc =
       kind !== "file" ? URL.createObjectURL(file) : undefined;
+    if (localSrc) {
+      blobUrlsRef.current.add(localSrc);
+      if (blobUrlsRef.current.size > 48) {
+        const oldest = blobUrlsRef.current.values().next().value;
+        if (oldest) {
+          blobUrlsRef.current.delete(oldest);
+          try { URL.revokeObjectURL(oldest); } catch { /* ignore */ }
+        }
+      }
+    }
     return {
       kind,
       url: r.url,

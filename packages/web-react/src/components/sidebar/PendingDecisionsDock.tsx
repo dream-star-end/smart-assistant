@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useOptionalAuth } from "../../hooks/useProjectScope";
+import { apiErrorMessage } from "../../lib/api";
 import { ApiError } from "../../lib/api/http";
 import {
   PENDING_DECISION_SOURCE_LABELS,
@@ -133,7 +134,7 @@ export function PendingDecisionsDock({
   const [sourceFilter, setSourceFilter] = useState<PendingDecisionSource | "all">("all");
   const [showAll, setShowAll] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [resolvingId, setResolvingId] = useState<string | null>(null);
+  const [resolving, setResolving] = useState<{ id: string; action: PendingDecisionAction } | null>(null);
   const [conflictNotice, setConflictNotice] = useState<string | null>(null);
   const mountedRef = useRef(true);
   const lastFetchAtRef = useRef(0);
@@ -270,8 +271,8 @@ export function PendingDecisionsDock({
   const hiddenCount = filteredItems.length - visibleItems.length;
 
   const handleResolve = async (item: PendingDecisionItem, decision: PendingDecisionAction) => {
-    if (!auth || resolvingId) return;
-    setResolvingId(item.id);
+    if (!auth || resolving) return;
+    setResolving({ id: item.id, action: decision });
     setConflictNotice(null);
     try {
       const res = await resolvePendingDecision(auth, item.id, {
@@ -294,10 +295,10 @@ export function PendingDecisionsDock({
         toast(msg, "info");
         void fetchItems({ silent: false });
       } else {
-        toast(err instanceof Error ? err.message : "提交决策失败，请稍后重试", "error");
+        toast(apiErrorMessage(err, "提交决策失败，请稍后重试"), "error");
       }
     } finally {
-      if (mountedRef.current) setResolvingId(null);
+      if (mountedRef.current) setResolving(null);
     }
   };
 
@@ -422,7 +423,10 @@ export function PendingDecisionsDock({
             {visibleItems.map((item) => {
               const interactiveOnly =
                 isInteractiveOnlyDecision(item) || !item.allowedActions.includes("approve");
-              const busy = resolvingId === item.id;
+              const busy = resolving?.id === item.id;
+              const approving = busy && resolving?.action === "approve";
+              const denying = busy && resolving?.action === "deny";
+              const anyResolving = Boolean(resolving);
               const canDeny = item.allowedActions.includes("deny");
               const canGoto =
                 (item.source === "taskboard" && Boolean(onOpenBoard)) ||
@@ -463,7 +467,7 @@ export function PendingDecisionsDock({
                         {item.title}
                       </div>
                       {item.summary && (
-                        <p className="line-clamp-2 text-micro leading-relaxed text-muted">
+                        <p className="line-clamp-2 text-caption leading-relaxed text-muted">
                           {item.summary}
                         </p>
                       )}
@@ -474,7 +478,7 @@ export function PendingDecisionsDock({
                         {item.title}
                       </div>
                       {item.summary && (
-                        <p className="line-clamp-2 text-micro leading-relaxed text-muted" title={item.summary}>
+                        <p className="line-clamp-2 text-caption leading-relaxed text-muted" title={item.summary}>
                           {item.summary}
                         </p>
                       )}
@@ -484,29 +488,35 @@ export function PendingDecisionsDock({
                   <div className="oc-pd-actions">
                     {interactiveOnly ? (
                       <>
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="accent"
-                          disabled={busy}
-                          data-testid="pending-decision-goto"
-                          onClick={() => handleDirectGoto(item)}
-                          className="oc-spring-press h-7 flex-1 gap-1 px-2 text-caption [@media(hover:none)]:h-11 [@media(hover:none)]:min-h-11"
-                        >
-                          <ArrowUpRight size={12} aria-hidden />
-                          {gotoLabel}
-                        </Button>
+                        {canGoto ? (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="accent"
+                            disabled={busy}
+                            data-testid="pending-decision-goto"
+                            onClick={() => handleDirectGoto(item)}
+                            className="oc-spring-press h-7 flex-1 gap-1 px-2 text-caption [@media(hover:none)]:h-11 [@media(hover:none)]:min-h-11"
+                          >
+                            <ArrowUpRight size={12} aria-hidden />
+                            {gotoLabel}
+                          </Button>
+                        ) : (
+                          <span className="flex-1 text-caption text-faint">
+                            请前往对应会话或终端处理
+                          </span>
+                        )}
                         {canDeny && (
                           <Button
                             type="button"
                             size="sm"
                             variant="ghost"
-                            disabled={busy || Boolean(resolvingId)}
+                            disabled={busy || anyResolving}
                             data-testid="pending-decision-deny"
                             onClick={() => void handleResolve(item, "deny")}
                             className="oc-spring-press h-7 px-2 text-caption text-muted [@media(hover:none)]:h-11 [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
                           >
-                            {busy ? <Spinner size={11} /> : <X size={12} aria-hidden />}
+                            {denying ? <Spinner size={11} /> : <X size={12} aria-hidden />}
                             拒绝
                           </Button>
                         )}
@@ -517,12 +527,12 @@ export function PendingDecisionsDock({
                           type="button"
                           size="sm"
                           variant="accent"
-                          disabled={busy || Boolean(resolvingId)}
+                          disabled={busy || anyResolving}
                           data-testid="pending-decision-approve"
                           onClick={() => void handleResolve(item, "approve")}
                           className="oc-spring-press h-7 flex-1 gap-1 px-2 text-caption [@media(hover:none)]:h-11 [@media(hover:none)]:min-h-11"
                         >
-                          {busy ? <Spinner size={11} /> : <Check size={12} aria-hidden />}
+                          {approving ? <Spinner size={11} /> : <Check size={12} aria-hidden />}
                           批准
                         </Button>
                         {canDeny && (
@@ -530,16 +540,16 @@ export function PendingDecisionsDock({
                             type="button"
                             size="sm"
                             variant="secondary"
-                            disabled={busy || Boolean(resolvingId)}
+                            disabled={busy || anyResolving}
                             data-testid="pending-decision-deny"
                             onClick={() => void handleResolve(item, "deny")}
                             className="oc-spring-press h-7 flex-1 gap-1 px-2 text-caption [@media(hover:none)]:h-11 [@media(hover:none)]:min-h-11"
                           >
-                            <X size={12} aria-hidden />
+                            {denying ? <Spinner size={11} /> : <X size={12} aria-hidden />}
                             拒绝
                           </Button>
                         )}
-                        {(item.sessionId || item.source === "taskboard") && (
+                        {canGoto && (
                           <IconButton
                             size="sm"
                             shape="square"
