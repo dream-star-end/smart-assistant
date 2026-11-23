@@ -8,6 +8,7 @@
 
 import type { SourceRecord } from "@openclaude/protocol/research";
 import {
+  ARXIV_DEFAULT_TIMEOUT_MS,
   type FetchLike,
   type SourceSearchOpts,
   normalizeArxivId,
@@ -161,20 +162,35 @@ async function unpaywallOA(
   }
 }
 
+const DEFAULT_SOURCE_PER_ATTEMPT_MS = 12_000;
+/** 单源重试总预算上限(ms):严格低于容器 CLI 60s 超时,防止慢源(如 arXiv)拖垮其他已成功源的整包返回。 */
+const DEFAULT_SOURCE_TOTAL_BUDGET_MS = 38_000;
+
 /** 多源检索 + 去重 + OA 富化。 */
-/** 瞬时出站失败的有界重试:网络(fetch failed)、超时(abort)、5xx/429 才重试;4xx(404 等)
- *  与最后一次直接抛。指数退避(400ms→800ms)。最坏 3×timeout + 1.2s,仍在容器 60s 调用窗内。 */
-async function withRetry<T>(fn: () => Promise<T>, attempts = 3, baseDelayMs = 400): Promise<T> {
+/** 瞬时出站失败的有界重试:网络(fetch failed)、超时(abort/timeout)、5xx/429 才重试;4xx(404 等)
+ *  与最后一次直接抛。所有尝试与退避共享 totalBudgetMs 预算,确保单源绝不拖超容器 60s CLI 窗口。 */
+async function withRetry<T>(
+  fn: (attemptTimeoutMs: number) => Promise<T>,
+  opts: { attempts: number; baseDelayMs: number; perAttemptTimeoutMs: number; totalBudgetMs: number },
+): Promise<T> {
+  const deadline = Date.now() + opts.totalBudgetMs;
   let lastErr: unknown;
-  for (let i = 0; i < attempts; i++) {
+  for (let i = 0; i < opts.attempts; i++) {
+    const remaining = deadline - Date.now();
+    if (i > 0 && remaining <= 0) break;
+    const attemptTimeout = Math.max(1, Math.min(opts.perAttemptTimeoutMs, Math.max(1, remaining)));
     try {
-      return await fn();
+      return await fn(attemptTimeout);
     } catch (e) {
       lastErr = e;
       const msg = errMsg(e);
-      const transient = /fetch failed|abort|terminated|ECONN|ETIMEDOUT|EAI_AGAIN|socket|network|upstream_5\d\d|upstream_429/i.test(msg);
-      if (!transient || i === attempts - 1) throw e;
-      await new Promise((r) => setTimeout(r, baseDelayMs * 2 ** i));
+      const transient = /fetch failed|abort|timeout|terminated|ECONN|ETIMEDOUT|EAI_AGAIN|socket|network|upstream_5\d\d|upstream_429/i.test(msg);
+      if (!transient || i === opts.attempts - 1) throw e;
+      const delayMs = opts.baseDelayMs * 2 ** i;
+      if (deadline - Date.now() <= delayMs) throw e;
+      if (delayMs > 0) {
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
     }
   }
   throw lastErr;
@@ -202,28 +218,54 @@ export async function searchMultiSource(
     }
     return true;
   });
-  const opts: SourceSearchOpts = {
+  const baseOpts: Omit<SourceSearchOpts, "timeoutMs"> = {
     size,
     yearMin: input.yearMin,
     mailto: deps.mailto,
     pubmedEmail: deps.pubmedEmail ?? deps.mailto,
-    timeoutMs: deps.timeoutMs,
     fetchImpl: deps.fetchImpl,
   };
 
-  const fns: Record<LitSourceName, () => Promise<SourceRecord[]>> = {
-    openalex: () => searchOpenAlex(input.query, opts),
-    crossref: () => searchCrossref(input.query, opts),
-    arxiv: () => searchArxiv(input.query, opts),
-    pubmed: () => searchPubmed(input.query, opts),
-    s2: () => searchS2(input.query, opts, { apiKey: deps.s2ApiKey }),
+  const runSource = (s: LitSourceName, timeoutMs: number): Promise<SourceRecord[]> => {
+    const opts: SourceSearchOpts = { ...baseOpts, timeoutMs };
+    switch (s) {
+      case "openalex":
+        return searchOpenAlex(input.query, opts);
+      case "crossref":
+        return searchCrossref(input.query, opts);
+      case "arxiv":
+        return searchArxiv(input.query, opts);
+      case "pubmed":
+        return searchPubmed(input.query, opts);
+      case "s2":
+        return searchS2(input.query, opts, { apiKey: deps.s2ApiKey });
+    }
   };
 
   // 研究 API 出站走 master 全局 EnvHttpProxyAgent(→ 日本 sing-box 代理),偶发瞬时 fetch failed/
-  // 超时/5xx(boss #faa3c041:英文检索三源全 fetch failed、中文才成,即代理瞬时抖动)。每个源
-  // **整体重试**(重跑 searchX → 新 AbortController/signal,绕开复用已 abort 的 signal);只重试瞬时
-  // 类错误(网络/超时/5xx/429),4xx(如 404 not found)不重试。
-  const settled = await Promise.allSettled(sources.map((s) => withRetry(() => fns[s](), 3, deps.retryDelayMs ?? 400)));
+  // 超时/5xx(boss #faa3c041:英文检索三源全 fetch failed、中文才成,即代理瞬时抖动)。单层重试
+  // 统一在编排层(各源内部不再叠加重试),并按每源总预算封顶,确保慢源超时不拖死其他成功源。
+  const baseDelayMs = deps.retryDelayMs ?? 400;
+  const settled = await Promise.allSettled(
+    sources.map((s) => {
+      const attempts = s === "arxiv" ? 2 : 3;
+      const perAttemptTimeoutMs =
+        deps.timeoutMs ?? (s === "arxiv" ? ARXIV_DEFAULT_TIMEOUT_MS : DEFAULT_SOURCE_PER_ATTEMPT_MS);
+      const totalBudgetMs =
+        deps.timeoutMs !== undefined
+          ? Math.max(
+              deps.timeoutMs,
+              Math.min(DEFAULT_SOURCE_TOTAL_BUDGET_MS, deps.timeoutMs * attempts + baseDelayMs * attempts * 2),
+            )
+          : DEFAULT_SOURCE_TOTAL_BUDGET_MS;
+      return withRetry((attemptTimeoutMs) => runSource(s, attemptTimeoutMs), {
+        attempts,
+        baseDelayMs,
+        perAttemptTimeoutMs,
+        totalBudgetMs,
+      });
+    }),
+  );
   const all: SourceRecord[] = [];
   settled.forEach((r, i) => {
     if (r.status === "fulfilled") all.push(...r.value);
@@ -242,7 +284,16 @@ export async function searchMultiSource(
   // 仅当请求的源包含 arxiv 时兜底(DeepXiv 是 arxiv 类;尊重用户显式 --sources 排除 arxiv 的语义)。
   if (merged.length === 0 && deps.deepxiv?.base && deps.deepxiv.token && sources.includes("arxiv")) {
     try {
-      const dx = await withRetry(() => searchDeepXiv(input.query, opts, deps.deepxiv!), 2, deps.retryDelayMs ?? 400);
+      const perAttemptTimeoutMs = deps.timeoutMs ?? DEFAULT_SOURCE_PER_ATTEMPT_MS;
+      const dx = await withRetry(
+        (attemptTimeoutMs) => searchDeepXiv(input.query, { ...baseOpts, timeoutMs: attemptTimeoutMs }, deps.deepxiv!),
+        {
+          attempts: 2,
+          baseDelayMs,
+          perAttemptTimeoutMs,
+          totalBudgetMs: Math.min(18_000, Math.max(perAttemptTimeoutMs, perAttemptTimeoutMs * 2 + baseDelayMs * 2)),
+        },
+      );
       if (dx.length > 0) {
         merged = dedupAndMerge(dx);
         warnings.push("主源暂不可用,已用 DeepXiv(域内 arXiv RAG)兜底召回");

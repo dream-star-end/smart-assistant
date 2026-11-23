@@ -135,6 +135,35 @@ def patch_document_xml(document: str) -> str:
     return patched
 
 
+def strip_empty_comments(src: Path) -> None:
+    """Remove Pandoc's default empty word/comments.xml and its package references."""
+    comments_path = src / "word" / "comments.xml"
+    if not comments_path.is_file():
+        return
+    comments_xml = comments_path.read_text(encoding="utf-8", errors="replace")
+    if "<w:comment " in comments_xml or "<w:comment>" in comments_xml:
+        return
+    comments_path.unlink()
+    rels_path = src / "word" / "_rels" / "document.xml.rels"
+    if rels_path.is_file():
+        rels = rels_path.read_text(encoding="utf-8")
+        rels = re.sub(
+            r'<Relationship\b[^>]*\bTarget="comments\.xml"[^>]*/>',
+            "",
+            rels,
+        )
+        rels_path.write_text(rels, encoding="utf-8")
+    ct_path = src / "[Content_Types].xml"
+    if ct_path.is_file():
+        ct = ct_path.read_text(encoding="utf-8")
+        ct = re.sub(
+            r'<Override\b[^>]*\bPartName="/word/comments\.xml"[^>]*/>',
+            "",
+            ct,
+        )
+        ct_path.write_text(ct, encoding="utf-8")
+
+
 def main() -> int:
     out = Path(sys.argv[1] if len(sys.argv) > 1 else "/usr/local/share/openclaude-docgen/reference.docx")
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -157,6 +186,8 @@ def main() -> int:
 
         document_path = src / "word" / "document.xml"
         document_path.write_text(patch_document_xml(document_path.read_text(encoding="utf-8")), encoding="utf-8")
+
+        strip_empty_comments(src)
 
         tmp_out = out.with_suffix(out.suffix + ".tmp")
         if tmp_out.exists():

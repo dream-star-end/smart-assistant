@@ -18,6 +18,7 @@ import {
   parseOpenAlexWork,
   parsePubmedSummary,
   parseS2Paper,
+  searchArxiv,
   searchOpenAlex,
   searchPubmed,
   searchS2,
@@ -133,6 +134,104 @@ describe("sources: normalize & parse", () => {
     const recs = await searchOpenAlex("q", { size: 5, mailto: "a@b.com", fetchImpl: f });
     assert.equal(recs.length, 1);
     assert.equal(recs[0].doi, "10.1/x");
+  });
+
+  it("OCV5-874 #7c: searchArxiv 带 User-Agent/Accept 请求头、单层请求不叠加内层重试", async () => {
+    const atomOk = `<feed><entry><title>Resilient ArXiv</title><id>https://arxiv.org/abs/2405.00001v1</id><published>2024-05-01T00:00:00Z</published><author><name>Alice Smith</name></author></entry></feed>`;
+    const seenHeaders: Array<Record<string, string>> = [];
+    let calls = 0;
+    const f = (async (_url: string | URL | Request, init?: RequestInit) => {
+      calls++;
+      seenHeaders.push((init?.headers ?? {}) as Record<string, string>);
+      return new Response(atomOk, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const recs = await searchArxiv("climate", { size: 5, mailto: "ops@example.com", fetchImpl: f });
+    assert.equal(calls, 1);
+    assert.equal(recs.length, 1);
+    assert.equal(recs[0].arxivId, "2405.00001");
+    assert.match(seenHeaders[0]["User-Agent"] ?? "", /OpenClaude-research\/1\.0.*ops@example\.com/);
+    assert.match(seenHeaders[0].Accept ?? "", /application\/atom\+xml/);
+
+    // 404 直接抛，不叠加内层重试
+    let errCalls = 0;
+    const notFoundFetch = (async () => {
+      errCalls++;
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+    await assert.rejects(() => searchArxiv("climate", { size: 5, fetchImpl: notFoundFetch }), /upstream_404/);
+    assert.equal(errCalls, 1);
+  });
+
+  it("OCV5-874 #7c: searchMultiSource 编排层单层有界重试 — arXiv 持续超时不放大也不拖垮 OpenAlex 结果", async () => {
+    // 1) 瞬时 AbortError：精确重试 2 次（单层，绝不乘以 3×2=6）
+    let immediateArxivCalls = 0;
+    const fastFailFetch = ((url: string | URL | Request) => {
+      const u = String(url);
+      if (u.includes("api.openalex.org")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ results: [{ title: "Fast OpenAlex Paper", doi: "10.1/fast" }] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      }
+      if (u.includes("export.arxiv.org")) {
+        immediateArxivCalls++;
+        const e = new Error("This operation was aborted");
+        e.name = "AbortError";
+        return Promise.reject(e);
+      }
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    }) as unknown as typeof fetch;
+
+    const resFast = await searchMultiSource(
+      { query: "vlbi atmospheric delay", sources: ["openalex", "arxiv"] },
+      { fetchImpl: fastFailFetch, timeoutMs: 200, retryDelayMs: 0 },
+    );
+    assert.equal(immediateArxivCalls, 2, `arXiv 编排层应精确尝试 2 次(不乘以 3×2=6), 实际 ${immediateArxivCalls}`);
+    assert.equal(resFast.sources.length, 1);
+    assert.equal(resFast.sources[0]?.title, "Fast OpenAlex Paper");
+    assert.ok(resFast.warnings.some((w) => w.includes("source arxiv failed")));
+
+    // 2) 持续挂死请求：受总预算封顶快速收敛，仍保留 OpenAlex 成功结果
+    let hangingArxivCalls = 0;
+    const hangingFetch = ((url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("api.openalex.org")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ results: [{ title: "Fast OpenAlex Paper", doi: "10.1/fast" }] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      }
+      if (u.includes("export.arxiv.org")) {
+        hangingArxivCalls++;
+        return new Promise<Response>((_resolve, reject) => {
+          const onAbort = () => {
+            const e = new Error("This operation was aborted");
+            e.name = "AbortError";
+            reject(e);
+          };
+          if (init?.signal?.aborted) onAbort();
+          else init?.signal?.addEventListener("abort", onAbort, { once: true });
+        });
+      }
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    }) as unknown as typeof fetch;
+
+    const t0 = Date.now();
+    const res = await searchMultiSource(
+      { query: "vlbi atmospheric delay", sources: ["openalex", "arxiv"] },
+      { fetchImpl: hangingFetch, timeoutMs: 50, retryDelayMs: 5 },
+    );
+    const elapsed = Date.now() - t0;
+    assert.ok(hangingArxivCalls >= 1 && hangingArxivCalls <= 2, `arXiv 挂死最多尝试 2 次, 实际 ${hangingArxivCalls}`);
+    assert.ok(elapsed < 1000, `应在有界预算内返回(实际 ${elapsed}ms)`);
+    assert.equal(res.sources.length, 1);
+    assert.equal(res.sources[0]?.title, "Fast OpenAlex Paper");
+    assert.ok(res.warnings.some((w) => w.includes("source arxiv failed")));
   });
 });
 
@@ -630,24 +729,91 @@ describe("cite: formatters", () => {
     assert.ok(a.includes("https://doi.org/10.5555/x"));
   });
 
-  it("gbt7714 期刊 [J] + 超 3 作者用等", () => {
+  it("gbt7714 期刊 [J] + 超 3 作者西文用 et al. / 中文用等 (OCV5-874 #7b)", () => {
     const g = formatGbt7714(sample);
     assert.ok(g.includes("[J]"));
     assert.ok(g.includes("NeurIPS"));
-    const many = rec({
+    const manyLatin = rec({
       title: "Big",
-      authors: [{ name: "A" }, { name: "B" }, { name: "C" }, { name: "D" }],
+      authors: [{ name: "Alice" }, { name: "Bob" }, { name: "Carol" }, { name: "Dave" }],
       year: 2020,
       doi: "10.1/m",
     });
-    assert.ok(formatGbt7714(many).includes("等"));
+    const gLatin = formatGbt7714(manyLatin);
+    assert.ok(gLatin.startsWith("Alice, Bob, Carol, et al. Big[J]."), `got: ${gLatin}`);
+    assert.ok(!gLatin.includes("等"), "西文作者不应输出 等");
+    assert.ok(!gLatin.includes("et al.."), "不应出现双句点");
+
+    const manyZh = rec({
+      title: "基于深度检索的引用接地",
+      authors: [{ name: "张三" }, { name: "李四" }, { name: "王五" }, { name: "赵六" }],
+      year: 2024,
+      venue: "计算机学报",
+    });
+    const gZh = formatGbt7714(manyZh);
+    assert.ok(gZh.startsWith("张三, 李四, 王五, 等. 基于深度检索的引用接地[J]."), `got: ${gZh}`);
+    assert.ok(!gZh.includes("et al"), "中文作者不应输出 et al.");
   });
 
-  it("gbt7714 arXiv 预印本 [J/OL]", () => {
-    const pre = rec({ title: "Pre", authors: [{ name: "X" }], year: 2023, arxivId: "2301.00001" });
+  it("gbt7714 arXiv 预印本 [J/OL] + BibTeX @misc 规范 eprint/archivePrefix 无 journal 冲突 (OCV5-874 #7b)", async () => {
+    const webCiteModulePath = "../../../web-react/src/lib/research/cite.js";
+    const webCite = (await import(webCiteModulePath)) as {
+      formatCitation: typeof formatCitation;
+      formatBibtex: typeof formatBibtex;
+      formatGbt7714: typeof formatGbt7714;
+    };
+
+    const pre = rec({
+      title: "Pre",
+      authors: [
+        { name: "Alice Chen" },
+        { name: "Bob Zhang" },
+        { name: "Carol Li" },
+        { name: "Dave Wang" },
+      ],
+      year: 2023,
+      venue: "arXiv",
+      arxivId: "2301.00001",
+    });
     const g = formatGbt7714(pre);
-    assert.ok(g.includes("[J/OL]"));
+    assert.ok(g.startsWith("Alice Chen, Bob Zhang, Carol Li, et al. Pre[J/OL]."), `got: ${g}`);
     assert.ok(g.includes("arxiv.org/abs/2301.00001"));
+    assert.equal(g, webCite.formatGbt7714(pre), "protocol 与 web-react GB/T 7714 必须字节一致");
+
+    const bib = formatBibtex(pre);
+    assert.ok(bib.startsWith("@misc{chen2023,"), `got: ${bib}`);
+    assert.ok(bib.includes("  eprint = {2301.00001}"), `got: ${bib}`);
+    assert.ok(bib.includes("  archivePrefix = {arXiv}"), `got: ${bib}`);
+    assert.ok(!bib.includes("journal ="), `@misc arXiv 预印本不应含 journal 字段, got: ${bib}`);
+    assert.equal(bib, webCite.formatBibtex(pre), "protocol 与 web-react BibTeX 必须字节一致");
+
+    // 同步核对中文 4 作者与已发表带 DOI+arXiv 论文在 protocol 与 web-react 字节一致
+    const zhRec = rec({
+      title: "气候模式评估",
+      authors: [{ name: "张三" }, { name: "李四" }, { name: "王五" }, { name: "赵六" }],
+      year: 2025,
+      venue: "大气科学",
+    });
+    assert.equal(formatCitation(zhRec, "gb-t-7714-2015"), webCite.formatCitation(zhRec, "gb-t-7714-2015"));
+
+    const publishedWithArxiv: SourceRecord = {
+      ...rec({
+        title: "Published Paper",
+        authors: [{ name: "Jane Doe" }],
+        year: 2024,
+        venue: "Nature",
+        doi: "10.1038/s41586-024-9999",
+        arxivId: "2401.12345",
+      }),
+      pmid: "39999999",
+    };
+    const pubBib = formatBibtex(publishedWithArxiv);
+    assert.ok(pubBib.startsWith("@article{doe2024,"));
+    assert.ok(pubBib.includes("  journal = {Nature}"));
+    assert.ok(pubBib.includes("  eprint = {2401.12345}"));
+    assert.ok(pubBib.includes("  archivePrefix = {arXiv}"));
+    assert.ok(pubBib.includes("  pmid = {39999999}"));
+    assert.equal(pubBib, webCite.formatBibtex(publishedWithArxiv));
   });
 
   it("OCV5-865: gbt7714 完整卷期页码/会议[C]/DOI + ieee + nature + formatCitation 调度", () => {

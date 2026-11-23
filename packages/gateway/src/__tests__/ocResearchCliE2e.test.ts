@@ -275,7 +275,7 @@ describe('research oc-* CLI public operations against a loopback master', () => 
     assertBearer()
   })
 
-  test('oc-ingest / oc-litrag --help 新文案', async () => {
+  test('oc-ingest / oc-litrag / oc-cite --help 新文案', async () => {
     let result = await runCli('packages/gateway/src/ocIngestCli.ts', ['--help'])
     assert.equal(result.code, 0, result.stderr)
     assert.match(result.stdout, /oc-ingest parse/)
@@ -284,6 +284,49 @@ describe('research oc-* CLI public operations against a loopback master', () => 
     assert.equal(result.code, 0, result.stderr)
     assert.match(result.stdout, /\[--docs/)
     assert.match(result.stdout, /\[--project/)
+    // OCV5-874 #7a: oc-cite --help 明确列出全部 5 种格式及 --doc-id/--span-id/--evidence-grade 与示例
+    for (const args of [['--help'], ['format', '--help']]) {
+      result = await runCli('packages/gateway/src/ocCiteCli.ts', args)
+      assert.equal(result.code, 0, result.stderr)
+      for (const expected of [
+        'gb-t-7714-2015',
+        'ieee',
+        'nature',
+        'apa',
+        'bibtex',
+        '--doc-id',
+        '--span-id',
+        '--evidence-grade',
+        'oc-cite format',
+      ]) {
+        assert.ok(result.stdout.includes(expected), `oc-cite ${args.join(' ')} missing ${expected}`)
+      }
+    }
+    assert.equal(captured.length, 0)
+  })
+
+  test('oc-cite format 透传 --doc-id / --span-id / --evidence-grade', async () => {
+    const result = await runCli('packages/gateway/src/ocCiteCli.ts', [
+      'format',
+      '10.1000/a',
+      '--style',
+      'ieee',
+      '--doc-id',
+      'doc:abc',
+      '--span-id',
+      's0',
+      '--evidence-grade',
+      'B',
+    ])
+    assert.equal(result.code, 0, result.stderr)
+    assert.equal(captured[0].url, '/v3/research/cite/format')
+    assert.deepEqual(bodyJson(0), {
+      identifier: '10.1000/a',
+      style: 'ieee',
+      docId: 'doc:abc',
+      spanId: 's0',
+      evidenceGrade: 'B',
+    })
   })
 
   test('oc-litrag 无 --docs 且 workspace 开 → body 含 projectId、不含空 docIds', async () => {

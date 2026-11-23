@@ -6,8 +6,12 @@ import type { Pool } from "pg";
 import { InMemoryPreCheckRedis, InsufficientCreditsError } from "../billing/preCheck.js";
 import { PricingCache } from "../billing/pricing.js";
 import { parseBillingPricing } from "../billing/persistedBillingPricing.js";
-import type { ModelCatalogSnapshot } from "../billing/modelCatalog.js";
+import {
+  CAPABILITY_SCHEMA_VERSION,
+  ModelCatalogSnapshot,
+} from "../billing/modelCatalog.js";
 import type { UserModelAuthz } from "../auth/userModelAuthz.js";
+import type { StaticProviderKeys } from "@openclaude/protocol";
 import {
   GROK_VISION_JOURNAL_SOURCE,
   GROK_VISION_MAX_IMAGE_BYTES,
@@ -46,6 +50,9 @@ function harness(opts: {
   upstream?: { statusCode: number; text: string } | Error;
   noAccount?: boolean;
   settle?: "committed" | "waived" | Error;
+  staticProviderKeys?: StaticProviderKeys;
+  resolveStaticApiKey?: (providerId: any, userId: bigint) => Promise<string | null>;
+  apiKeyPoolHasMembers?: (providerId: any) => boolean;
 } = {}) {
   const events: string[] = [];
   const calls = {
@@ -112,6 +119,9 @@ function harness(opts: {
     }) as any,
     // A conflicting row here belongs to no running call (the route mints a fresh id per request).
     readJournalForTakeoverFn: (async () => null) as any,
+    ...(opts.staticProviderKeys ? { staticProviderKeys: opts.staticProviderKeys } : {}),
+    ...(opts.resolveStaticApiKey ? { resolveStaticApiKey: opts.resolveStaticApiKey } : {}),
+    ...(opts.apiKeyPoolHasMembers ? { apiKeyPoolHasMembers: opts.apiKeyPoolHasMembers } : {}),
   });
   const run = async (body: unknown = BODY, method = "POST", auth = TOKEN) => {
     const { res, json } = visionRes();
@@ -382,6 +392,245 @@ describe("grok vision handler", () => {
       assert.equal(raw.includes(GROK_TOKEN_BYTES), false);
       assert.equal(raw.includes(BILLING_ID), false);
     }
+  });
+
+  it("fails over to active flagship vision model (k3.1-pro) when grok-build is unavailable, and never downgrades to weak models (OCV5-874 #2)", async () => {
+    const flagshipSnapshot = new ModelCatalogSnapshot({
+      entries: [
+        {
+          entryId: 1,
+          modelId: "grok-build",
+          engine: "grok",
+          providerId: "grok",
+          upstreamModelId: "grok-4.7",
+          contextWindow: 256_000,
+          capabilityProfile: {
+            supportsVision: false,
+            reasoning: { supported: ["medium"] as const, codexModelDefault: null },
+            ccb: { capabilityZero: false, supportsThinking: false },
+          },
+          capabilitySchemaVersion: CAPABILITY_SCHEMA_VERSION,
+          state: "disabled",
+          lockVersion: 1,
+        },
+        {
+          entryId: 2,
+          modelId: "k3.1-pro",
+          engine: "ccb",
+          providerId: "moonshot",
+          upstreamModelId: "k3.1-pro",
+          contextWindow: 1_048_576,
+          capabilityProfile: {
+            supportsVision: true,
+            reasoning: { supported: ["low", "high", "max"] as const, codexModelDefault: null },
+            ccb: { capabilityZero: false, supportsThinking: true },
+          },
+          capabilitySchemaVersion: CAPABILITY_SCHEMA_VERSION,
+          state: "active",
+          lockVersion: 1,
+        },
+        {
+          entryId: 3,
+          modelId: "k3-256k",
+          engine: "ccb",
+          providerId: "moonshot",
+          upstreamModelId: "k3-256k",
+          contextWindow: 262_144,
+          capabilityProfile: {
+            supportsVision: true,
+            reasoning: { supported: ["low", "high", "max"] as const, codexModelDefault: null },
+            ccb: { capabilityZero: false, supportsThinking: true },
+          },
+          capabilitySchemaVersion: CAPABILITY_SCHEMA_VERSION,
+          state: "active",
+          lockVersion: 1,
+        },
+      ],
+      aliases: new Map(),
+      pricing: new Map([
+        [
+          "k3.1-pro",
+          {
+            modelId: "k3.1-pro",
+            displayName: "Kimi K3.1 Pro",
+            inputPerMtok: 600n,
+            outputPerMtok: 3000n,
+            cacheReadPerMtok: 60n,
+            cacheWritePerMtok: 0n,
+            multiplier: "1.000",
+            visibility: "public",
+            sortOrder: 89,
+            defaultEffort: null,
+          },
+        ],
+        [
+          "k3-256k",
+          {
+            modelId: "k3-256k",
+            displayName: "Kimi K3 256K",
+            inputPerMtok: 500n,
+            outputPerMtok: 2500n,
+            cacheReadPerMtok: 50n,
+            cacheWritePerMtok: 0n,
+            multiplier: "1.000",
+            visibility: "public",
+            sortOrder: 90,
+            defaultEffort: null,
+          },
+        ],
+      ]),
+      securityEpoch: 8n,
+    });
+
+    const h = harness({
+      snapshot: flagshipSnapshot,
+      staticProviderKeys: { moonshot: "ms-test-key" },
+      upstream: {
+        statusCode: 200,
+        text: JSON.stringify({
+          content: [
+            { type: "thinking", thinking: "inspecting chart" },
+            { type: "text", text: "PASS: figure layout clean" },
+          ],
+          usage: {
+            input_tokens: 1500,
+            output_tokens: 120,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        }),
+      },
+    });
+    const out = await h.run();
+    assert.equal(out.status, 200);
+    assert.deepEqual(out.json, { text: "PASS: figure layout clean", model: "k3.1-pro" });
+    assert.deepEqual(h.events, ["precheck", "journal", "upstream", "settle"]);
+    assert.equal(h.calls.journal[0].model, "k3.1-pro");
+    assert.equal(h.calls.upstream[0]!.url, "https://api.kimi.com/coding/v1/messages");
+    assert.equal(h.calls.upstream[0]!.init.headers["x-api-key"], "ms-test-key");
+    const sent = JSON.parse(h.calls.upstream[0]!.init.body);
+    assert.equal(sent.model, "k3.1-pro");
+    assert.equal(sent.messages[0].content[0].type, "image");
+    assert.equal(sent.messages[0].content[0].source.media_type, "image/png");
+
+    // Weak/flash model alone must NOT be selected as silent downgrade
+    const weakOnlySnapshot = new ModelCatalogSnapshot({
+      entries: [
+        {
+          entryId: 10,
+          modelId: "deepseek-v4-flash",
+          engine: "ccb",
+          providerId: "opencodego",
+          upstreamModelId: "deepseek-v4.1-flash",
+          contextWindow: 128_000,
+          capabilityProfile: {
+            supportsVision: true,
+            reasoning: { supported: [] as const, codexModelDefault: null },
+            ccb: { capabilityZero: false, supportsThinking: false },
+          },
+          capabilitySchemaVersion: CAPABILITY_SCHEMA_VERSION,
+          state: "active",
+          lockVersion: 1,
+        },
+      ],
+      aliases: new Map(),
+      pricing: new Map([
+        [
+          "deepseek-v4-flash",
+          {
+            modelId: "deepseek-v4-flash",
+            displayName: "DeepSeek V4 Flash",
+            inputPerMtok: 50n,
+            outputPerMtok: 100n,
+            cacheReadPerMtok: 10n,
+            cacheWritePerMtok: 0n,
+            multiplier: "1.000",
+            visibility: "public",
+            sortOrder: 120,
+            defaultEffort: null,
+          },
+        ],
+      ]),
+      securityEpoch: 9n,
+    });
+    const weakH = harness({
+      snapshot: weakOnlySnapshot,
+      staticProviderKeys: { opencodego: "go-test-key" },
+    });
+    const weakOut = await weakH.run();
+    assert.equal(weakOut.status, 503);
+    assert.equal(weakOut.json.error.code, "GROK_VISION_MODEL_UNAVAILABLE");
+    assert.deepEqual(weakH.events, []);
+  });
+
+  it("refuses staticProviderKeys env fallback when API-key pool has members but none are usable (OCV5-874)", async () => {
+    const moonshotOnlySnapshot = new ModelCatalogSnapshot({
+      entries: [
+        {
+          entryId: 20,
+          modelId: "k3.1-pro",
+          engine: "ccb",
+          providerId: "moonshot",
+          upstreamModelId: "kimi-k2.5",
+          contextWindow: 256_000,
+          capabilityProfile: {
+            supportsVision: true,
+            reasoning: { supported: [] as const, codexModelDefault: null },
+            ccb: { capabilityZero: false, supportsThinking: true },
+          },
+          capabilitySchemaVersion: CAPABILITY_SCHEMA_VERSION,
+          state: "active",
+          lockVersion: 1,
+        },
+      ],
+      aliases: new Map(),
+      pricing: new Map([
+        [
+          "k3.1-pro",
+          {
+            modelId: "k3.1-pro",
+            displayName: "Kimi K3.1 Pro",
+            inputPerMtok: 400n,
+            outputPerMtok: 2_000n,
+            cacheReadPerMtok: 40n,
+            cacheWritePerMtok: 0n,
+            multiplier: "1.000",
+            visibility: "public",
+            sortOrder: 20,
+            defaultEffort: null,
+          },
+        ],
+      ]),
+      securityEpoch: 11n,
+    });
+    const disabledPoolH = harness({
+      snapshot: moonshotOnlySnapshot,
+      staticProviderKeys: { moonshot: "env-disabled-key" },
+      resolveStaticApiKey: async () => null,
+      apiKeyPoolHasMembers: () => true,
+    });
+    const blocked = await disabledPoolH.run();
+    assert.equal(blocked.status, 503);
+    assert.equal(blocked.json.error.code, "GROK_VISION_MODEL_UNAVAILABLE");
+    assert.equal(disabledPoolH.calls.upstream.length, 0);
+
+    const emptyPoolH = harness({
+      snapshot: moonshotOnlySnapshot,
+      staticProviderKeys: { moonshot: "env-fallback-key" },
+      resolveStaticApiKey: async () => null,
+      apiKeyPoolHasMembers: () => false,
+      upstream: {
+        statusCode: 200,
+        text: JSON.stringify({
+          content: [{ type: "text", text: "ok-from-env" }],
+          usage: { input_tokens: 100, output_tokens: 20 },
+        }),
+      },
+    });
+    const allowed = await emptyPoolH.run();
+    assert.equal(allowed.status, 200);
+    assert.equal(allowed.json.text, "ok-from-env");
+    assert.equal(emptyPoolH.calls.upstream.length, 1);
   });
 
   it("rate limits per container", async () => {

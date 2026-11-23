@@ -109,10 +109,11 @@ function normalizePages(pages: string | undefined, dash: string): string | undef
 }
 
 function gbtAuthors(rec: SourceRecord): string {
-  const names = rec.authors.map((a) => a.name);
+  const names = rec.authors.map((a) => a.name.trim()).filter(Boolean);
   if (names.length === 0) return "佚名";
   if (names.length <= 3) return names.join(", ");
-  return `${names.slice(0, 3).join(", ")}, 等`;
+  const hasCjk = names.some((n) => isCjk(n));
+  return `${names.slice(0, 3).join(", ")}, ${hasCjk ? "等" : "et al"}`;
 }
 
 export function formatGbt7714(rec: SourceRecord): string {
@@ -179,10 +180,13 @@ export function formatBibtex(rec: SourceRecord): string {
   const key = `${(surname.replace(/[^A-Za-z]/g, "") || "ref").toLowerCase()}${rec.year ?? ""}`;
   const conf = isConference(rec);
   const book = isBook(rec);
-  const type = rec.arxivId && !rec.doi && !conf && !book ? "misc" : conf ? "inproceedings" : book ? "book" : "article";
+  const isArxivPreprint = Boolean(rec.arxivId && !rec.doi && !conf && !book);
+  const type = isArxivPreprint ? "misc" : conf ? "inproceedings" : book ? "book" : "article";
   const fields = [`  title = {${rec.title}}`];
   if (rec.authors.length) fields.push(`  author = {${rec.authors.map((a) => a.name).join(" and ")}}`);
-  if (rec.venue) fields.push(`  ${conf ? "booktitle" : "journal"} = {${rec.venue}}`);
+  if (rec.venue && !isArxivPreprint && !/^arxiv$/i.test(rec.venue.trim())) {
+    fields.push(`  ${conf ? "booktitle" : "journal"} = {${rec.venue}}`);
+  }
   if (rec.year) fields.push(`  year = {${rec.year}}`);
   if (rec.volume) fields.push(`  volume = {${rec.volume}}`);
   if (rec.issue) fields.push(`  number = {${rec.issue}}`);
@@ -190,7 +194,11 @@ export function formatBibtex(rec: SourceRecord): string {
   if (pages) fields.push(`  pages = {${pages}}`);
   if (rec.publisher) fields.push(`  publisher = {${rec.publisher}}`);
   if (rec.doi) fields.push(`  doi = {${rec.doi}}`);
-  if (rec.arxivId) fields.push(`  eprint = {${rec.arxivId}}`);
+  if (rec.arxivId) {
+    fields.push(`  eprint = {${rec.arxivId}}`);
+    fields.push(`  archivePrefix = {arXiv}`);
+  }
+  if (rec.pmid) fields.push(`  pmid = {${rec.pmid}}`);
   return `@${type}{${key},\n${fields.join(",\n")}\n}`;
 }
 

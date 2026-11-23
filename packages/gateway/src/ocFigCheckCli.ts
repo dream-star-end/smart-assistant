@@ -42,7 +42,11 @@ import {
   recordFigcheckVisionRound,
   resolveFigcheckTurnId,
 } from './figcheckRounds.js'
-import { resolveVisionInput, runVision, visionBackendLabel } from './mcpVisionServer.js'
+import {
+  resolveVisionInput,
+  runVisionWithBackend,
+  visionBackendLabel,
+} from './mcpVisionServer.js'
 import { exitWithCliHelp, fail, isCliHelpArg, parseFlags } from './ocResearchClient.js'
 
 const TOOL = 'oc-figcheck'
@@ -291,6 +295,7 @@ async function main(): Promise<void> {
   const capped = turnId !== null && usedBefore >= FIGCHECK_VISION_ROUND_MAX
 
   let visionText = ''
+  let visionBackendUsed = visionBackendLabel()
   let visionOk = true
   let visionSkipped = false
   let visionCount = usedBefore
@@ -300,7 +305,9 @@ async function main(): Promise<void> {
     visionText = '已达上限，未做视觉复核。'
   } else {
     try {
-      visionText = (await runVision(resolved)).trim()
+      const visionResult = await runVisionWithBackend(resolved)
+      visionText = visionResult.text.trim()
+      visionBackendUsed = visionResult.backend
       if (turnId) {
         const recorded = recordFigcheckVisionRound(roundsDir, turnId, resolved.imagePath)
         visionCount = recorded > 0 ? recorded : usedBefore + 1
@@ -323,7 +330,7 @@ async function main(): Promise<void> {
         : 'WARN'
   const hint = capped ? figcheckCapHint(visionCount, issues.length) : VERDICT_HINT[verdict]
   const vision: Record<string, unknown> = {
-    backend: visionBackendLabel(),
+    backend: visionBackendUsed,
     pass: visionPass,
     review: visionText,
   }

@@ -24,8 +24,10 @@ import {
 import type IORedis from "ioredis";
 import {
   apiKeyPoolConfiguredServices,
+  apiKeyPoolHasMembers,
   importEnvApiKeys,
   primeApiKeyPool,
+  selectApiKey,
   startApiKeyPoolCache,
 } from "../account-pool/apiKeyPool.js";
 import {
@@ -651,6 +653,7 @@ export async function bootstrapInternalProxyAndListeners(
         tokenPlanKey: deps.cfg.MINIMAX_TOKEN_PLAN_KEY,
       });
       const grokWebSearchHandler: GrokWebSearchHandler = makeGrokWebSearchHandler({ identityRepo });
+      const visionStaticProviderKeys = staticProviderKeysFromConfig(deps.cfg);
       const grokVisionHandler: GrokVisionHandler = makeGrokVisionHandler({
         identityRepo,
         getPool,
@@ -666,6 +669,12 @@ export async function bootstrapInternalProxyAndListeners(
         loadUserModelAuthz: deps.loadUserModelAuthz,
         recordStatus: makeGrokRelayHealthRecorder({ health: deps.healthTracker }),
         broadcastToUser: (uid, payload) => deps.bridgeBroadcastRef.current(uid, payload),
+        staticProviderKeys: visionStaticProviderKeys,
+        resolveStaticApiKey: async (providerId, userId) => {
+          const picked = await selectApiKey(providerId, `vision:u:${userId.toString()}`, undefined, { userId });
+          return picked?.apiKey ?? null;
+        },
+        apiKeyPoolHasMembers: (providerId) => apiKeyPoolHasMembers(providerId),
       });
       if (deps.studioHttp) {
         const studioGrokCatalog = {

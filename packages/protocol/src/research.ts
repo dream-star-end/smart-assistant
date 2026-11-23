@@ -728,17 +728,19 @@ function normalizePagesDash(pages: string | undefined, dash: string): string | u
 export function formatBibtex(rec: SourceRecord): string {
   const isConf = isConferenceRecord(rec)
   const isBook = isBookRecord(rec)
-  const type =
-    rec.arxivId && !rec.doi && !isConf && !isBook
-      ? 'misc'
-      : isConf
-        ? 'inproceedings'
-        : isBook
-          ? 'book'
-          : 'article'
+  const isArxivPreprint = Boolean(rec.arxivId && !rec.doi && !isConf && !isBook)
+  const type = isArxivPreprint
+    ? 'misc'
+    : isConf
+      ? 'inproceedings'
+      : isBook
+        ? 'book'
+        : 'article'
   const fields: string[] = [`  title = {${rec.title}}`]
   if (rec.authors.length) fields.push(`  author = {${rec.authors.map((a) => a.name).join(' and ')}}`)
-  if (rec.venue) fields.push(`  ${isConf ? 'booktitle' : 'journal'} = {${rec.venue}}`)
+  if (rec.venue && !isArxivPreprint && !/^arxiv$/i.test(rec.venue.trim())) {
+    fields.push(`  ${isConf ? 'booktitle' : 'journal'} = {${rec.venue}}`)
+  }
   if (rec.year) fields.push(`  year = {${rec.year}}`)
   if (rec.volume) fields.push(`  volume = {${rec.volume}}`)
   if (rec.issue) fields.push(`  number = {${rec.issue}}`)
@@ -746,17 +748,21 @@ export function formatBibtex(rec: SourceRecord): string {
   if (pages) fields.push(`  pages = {${pages}}`)
   if (rec.publisher) fields.push(`  publisher = {${rec.publisher}}`)
   if (rec.doi) fields.push(`  doi = {${rec.doi}}`)
-  if (rec.arxivId) fields.push(`  eprint = {${rec.arxivId}}`)
+  if (rec.arxivId) {
+    fields.push(`  eprint = {${rec.arxivId}}`)
+    fields.push(`  archivePrefix = {arXiv}`)
+  }
   if (rec.pmid) fields.push(`  pmid = {${rec.pmid}}`)
   return `@${type}{${asciiCiteKey(rec)},\n${fields.join(',\n')}\n}`
 }
 
-/** 作者列表(GB/T 7714:超 3 人取前 3 + 等)。 */
+/** 作者列表(GB/T 7714-2015 §8.1.2:超 3 人取前 3, 中文含 CJK 接 ", 等", 西文/拉丁字母接 ", et al")。 */
 function gbtAuthors(rec: SourceRecord): string {
-  const names = rec.authors.map((a) => a.name)
+  const names = rec.authors.map((a) => a.name.trim()).filter(Boolean)
   if (names.length === 0) return '佚名'
   if (names.length <= 3) return names.join(', ')
-  return `${names.slice(0, 3).join(', ')}, 等`
+  const hasCjk = names.some((n) => isCjkName(n))
+  return `${names.slice(0, 3).join(', ')}, ${hasCjk ? '等' : 'et al'}`
 }
 
 /**

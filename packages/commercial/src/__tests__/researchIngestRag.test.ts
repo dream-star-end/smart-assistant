@@ -12,8 +12,10 @@ import {
   extractHtml,
   extractLocal,
   extractPdf,
+  extractPdfTitle,
   extractPlainText,
   isNeedsOcr,
+  isUselessPdfTitle,
   mintDocument,
   splitSpans,
 } from "../research/ingest.js";
@@ -57,6 +59,121 @@ describe("ingest: extract", () => {
   it("extractLocal 路由:md 直取", async () => {
     const r = await extractLocal(Buffer.from("# T\n\nbody"), "text/markdown", "a.md");
     assert.ok(!isNeedsOcr(r));
+  });
+
+  it("OCV5-874 #4b: Copernicus GMD PDF 无 /Title 元数据时从正文抽取真实多行标题与章节路径", async () => {
+    const gmdText = [
+      "Geosci. Model Dev., 16, 4215–4238, 2023",
+      "https://doi.org/10.5194/gmd-16-4215-2023",
+      "© Author(s) 2023. This work is distributed under",
+      "the Creative Commons Attribution 4.0 License.",
+      "Geoscientific",
+      "Model Development",
+      "Open Access",
+      "Model description paper",
+      "A high-resolution global coupled ocean–atmosphere model for",
+      "seasonal climate prediction (GCOAM v2.1)",
+      "Alice Smith1, Bob Jones2, and Carol Lee1",
+      "1Department of Atmospheric Sciences, University of Example",
+      "Correspondence: Alice Smith (alice@example.edu)",
+      "Received: 10 January 2023 – Discussion started: 25 January 2023",
+      "Abstract. In this study we present the GCOAM v2.1 coupled Earth system model.",
+      "1 Introduction",
+      "Seasonal climate prediction relies on coupled ocean and atmosphere dynamics.",
+      "2 Model description",
+      "The coupled framework integrates atmospheric and oceanic components.",
+      "2.1 Dynamical core",
+      "We employ a finite-volume dynamical core on a cubed-sphere grid.",
+      "3 Results",
+      "Skill scores improve significantly across the tropical Pacific.",
+      "References",
+      "1. Smith, A. and Jones, B. (2020) Coupled Climate Dynamics.",
+    ].join("\n");
+
+    const r = await extractPdf(Buffer.from("gmd"), async () => ({ text: gmdText, info: { Title: "" } }));
+    assert.ok(!isNeedsOcr(r));
+    if (!isNeedsOcr(r)) {
+      assert.equal(
+        r.title,
+        "A high-resolution global coupled ocean–atmosphere model for seasonal climate prediction (GCOAM v2.1)",
+      );
+      const doc = mintDocument({ text: r.text, title: r.title });
+      const paths = doc.spans.map((s) => s.sectionPath).filter((p) => p.length > 0);
+      assert.ok(paths.some((p) => p.join(" / ") === "Abstract"));
+      assert.ok(paths.some((p) => p.join(" / ") === "1 Introduction"));
+      assert.ok(paths.some((p) => p.join(" / ") === "2 Model description"));
+      assert.ok(paths.some((p) => p.join(" / ") === "2 Model description / 2.1 Dynamical core"));
+      assert.ok(paths.some((p) => p.join(" / ") === "3 Results"));
+      assert.ok(paths.some((p) => p.join(" / ") === "References"));
+      // References 下的编号条目不应被误识别为章节标题
+      assert.ok(!paths.some((p) => p.some((seg) => seg.includes("Smith, A."))));
+      for (const s of doc.spans) {
+        assert.equal(r.text.slice(s.charStart, s.charEnd), s.text);
+      }
+    }
+  });
+
+  it("OCV5-874 #4b: arXiv PDF 过滤 Template for manuscripts 等模板元数据与运行页眉", async () => {
+    const arxivText = [
+      "Template for manuscripts in Advances in Space Research",
+      "arXiv:2405.12345v1 [astro-ph.EP] 20 May 2024",
+      "Preprint submitted to Advances in Space Research",
+      "May 20, 2024",
+      "",
+      "Orbital Perturbations of Near-Earth Asteroids under Non-Gravitational Forces",
+      "Jane Doe a , John Smith b",
+      "Department of Planetary Sciences, Example Institute",
+      "",
+      "Abstract",
+      "We investigate the long-term orbital evolution of near-Earth asteroids.",
+    ].join("\n");
+
+    const r = await extractPdf(Buffer.from("arxiv"), async () => ({
+      text: arxivText,
+      info: { Title: "Template for manuscripts in Advances in Space Research" },
+    }));
+    assert.ok(!isNeedsOcr(r));
+    if (!isNeedsOcr(r)) {
+      assert.equal(r.title, "Orbital Perturbations of Near-Earth Asteroids under Non-Gravitational Forces");
+    }
+
+    // 其它常见模板/页眉/无意义标题必须被识别为无效标题
+    for (const junk of [
+      "Template for manuscripts in Advances in Space Research",
+      "Preprint",
+      "Preprint. Under review.",
+      "Under review as a conference paper at ICLR 2025",
+      "Manuscript submitted to Journal of Geophysical Research",
+      "arXiv:2301.00001v2 [cs.CL] 1 Jan 2023",
+      "https://doi.org/10.5194/gmd-16-4215-2023",
+      "© 2024 The Authors. All rights reserved.",
+      "Page 1 of 12",
+      "2024-05-20",
+      "paper.pdf",
+      "CONFIDENTIAL",
+      "Draft",
+      "Draft v2",
+    ]) {
+      assert.equal(isUselessPdfTitle(junk), true, `应过滤垃圾标题: ${junk}`);
+    }
+
+    // 正常中文/英文真实标题（含 Confidential / Draft 词首的合法学术标题）不得被误滤
+    assert.equal(isUselessPdfTitle("基于大语言模型的科研文献证据接地方法研究"), false);
+    assert.equal(isUselessPdfTitle("Confidential Computing for Genomics"), false);
+    assert.equal(isUselessPdfTitle("Draft Genome Sequence of Arabidopsis"), false);
+    assert.equal(
+      extractPdfTitle(
+        "第 45 卷 第 3 期 计 算 机 学 报 Vol. 45 No. 3\n2022 年 3 月\n基于大语言模型的科研文献证据接地方法研究\n张三1, 李四2, 王五1\n摘要：本文提出一种可核验的引用接地方法。",
+      ),
+      "基于大语言模型的科研文献证据接地方法研究",
+    );
+    assert.equal(
+      extractPdfTitle(
+        "Under review\narXiv:2501.00001v1 [cs.AI] 2 Jan 2025\n1\n\nScalable Verification of Scientific Claims\nWei Zhang, Li Wang\nAbstract\nDetails follow.",
+        "Under review",
+      ),
+      "Scalable Verification of Scientific Claims",
+    );
   });
 });
 

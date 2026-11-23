@@ -22,7 +22,14 @@
 
 import { randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { GROK_VISION_PATH, grokExecutionUpstream } from "@openclaude/protocol";
+import {
+  GROK_VISION_PATH,
+  findRouteProviderForModel,
+  grokExecutionUpstream,
+  type StaticKeyProviderSpec,
+  type StaticProviderId,
+  type StaticProviderKeys,
+} from "@openclaude/protocol";
 import type { Pool } from "pg";
 import type { Dispatcher } from "undici";
 import { request as undiciRequest } from "undici";
@@ -72,6 +79,12 @@ export { GROK_VISION_PATH };
 export const GROK_VISION_UPSTREAM = "https://cli-chat-proxy.grok.com/v1/responses";
 /** Product model the vision backend runs on and is billed as. */
 export const GROK_VISION_MODEL = "grok-build";
+/**
+ * Flagship vision models allowed for automatic failover when `grok-build` is unavailable
+ * (e.g. selfhost with `grokEnabled: false` or no active Grok account). Ordered by capability;
+ * weak/flash/free models must never be added here.
+ */
+export const FALLBACK_FLAGSHIP_VISION_MODELS = ["k3.1-pro", "kimi-k3", "k3-256k"] as const;
 export const GROK_VISION_JOURNAL_SOURCE = "vision_grok";
 
 // Raw image cap matches the gateway side (5MB default, 6MB hard cap). Base64
@@ -151,6 +164,12 @@ export interface GrokVisionHandlerDeps {
   attributeOpenTurnFn?: typeof attributeOpenTurn;
   /** Live outbound.cost_charged. Absent on replay so a replay cannot push twice. */
   broadcastToUser?: (userId: bigint, payload: Record<string, unknown>) => void;
+  /** Configured static-key provider credentials for flagship vision failover (e.g. moonshot). */
+  staticProviderKeys?: StaticProviderKeys;
+  /** Optional pool-backed key resolver for static vision providers (e.g. pool_api_keys). */
+  resolveStaticApiKey?: (providerId: StaticProviderId, userId: bigint) => Promise<string | null>;
+  /** Reports whether the provider's API-key pool has any members (disabled/cooling included). */
+  apiKeyPoolHasMembers?: (providerId: StaticProviderId) => boolean;
 }
 
 export type GrokVisionHandler = (
@@ -300,6 +319,124 @@ export function usageFromGrokVisionResponse(json: unknown): GrokVisionUsage | nu
     cache_read_input_tokens: cacheRead,
     cache_creation_input_tokens: 0,
   };
+}
+
+/** Text of an Anthropic Messages API response (ignores thinking blocks). */
+export function textFromAnthropicVisionResponse(json: unknown): string {
+  const content = isObj(json) && Array.isArray(json.content) ? json.content : [];
+  let text = "";
+  for (const block of content) {
+    if (isObj(block) && block.type === "text" && typeof block.text === "string") {
+      text += block.text;
+    }
+  }
+  return text.trim();
+}
+
+/** Anthropic Messages API usage -> disjoint billing counters. */
+export function usageFromAnthropicVisionResponse(json: unknown): GrokVisionUsage | null {
+  if (!isObj(json) || !isObj(json.usage)) return null;
+  const usage = json.usage;
+  const count = (value: unknown): number | null =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.trunc(value) : null;
+  const input = count(usage.input_tokens);
+  const output = count(usage.output_tokens);
+  if (input === null || output === null) return null;
+  const cacheRead = count(usage.cache_read_input_tokens) ?? 0;
+  const cacheCreate = count(usage.cache_creation_input_tokens) ?? 0;
+  return {
+    input_tokens: input,
+    output_tokens: output,
+    reasoning_output_tokens: 0,
+    cache_read_input_tokens: cacheRead,
+    cache_creation_input_tokens: cacheCreate,
+  };
+}
+
+function anthropicVisionBody(input: {
+  upstreamModel: string;
+  prompt: string;
+  image?: { mediaType: VisionMediaType; data: string };
+}): string {
+  const content: Array<Record<string, unknown>> = [];
+  if (input.image) {
+    content.push({
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: input.image.mediaType,
+        data: input.image.data,
+      },
+    });
+  }
+  content.push({ type: "text", text: input.prompt });
+  return JSON.stringify({
+    model: input.upstreamModel,
+    max_tokens: MAX_OUTPUT_TOKENS,
+    messages: [{ role: "user", content }],
+  });
+}
+
+function anthropicVisionHeaders(spec: StaticKeyProviderSpec, apiKey: string): Record<string, string> {
+  return {
+    "content-type": "application/json",
+    accept: "application/json",
+    "anthropic-version": "2023-06-01",
+    ...(spec.authScheme === "x-api-key"
+      ? { "x-api-key": apiKey }
+      : { authorization: `Bearer ${apiKey}` }),
+  };
+}
+
+async function resolveFlagshipStaticVisionFallback(
+  snapshot: ModelCatalogSnapshot,
+  scope: ReturnType<typeof scopeFromAuthz>,
+  billTo: "user" | "platform",
+  userId: bigint,
+  deps: Pick<GrokVisionHandlerDeps, "staticProviderKeys" | "resolveStaticApiKey" | "apiKeyPoolHasMembers">,
+): Promise<{
+  canonical: string;
+  upstreamModel: string;
+  spec: StaticKeyProviderSpec;
+  apiKey: string;
+} | null> {
+  if (!deps.staticProviderKeys && !deps.resolveStaticApiKey) return null;
+  for (const candidate of FALLBACK_FLAGSHIP_VISION_MODELS) {
+    const canonical = snapshot.aliasToCanonical(candidate);
+    let descriptor: ReturnType<ModelCatalogSnapshot["resolve"]>;
+    try {
+      descriptor = snapshot.resolve(canonical);
+    } catch {
+      continue;
+    }
+    if (!descriptor || descriptor.capabilityProfile.supportsVision !== true) continue;
+    if (!snapshot.canUseModel(scope, canonical)) continue;
+    if (billTo === "user" && !snapshot.billingPricingFor(canonical)) continue;
+    const spec = findRouteProviderForModel(canonical);
+    if (!spec || spec.supportsVision !== true) continue;
+    let apiKey = "";
+    if (deps.resolveStaticApiKey) {
+      const pooled = await deps.resolveStaticApiKey(spec.id, userId).catch(() => null);
+      if (pooled && pooled.trim()) {
+        apiKey = pooled.trim();
+      } else if (deps.apiKeyPoolHasMembers?.(spec.id) === true) {
+        // Pool has members (including any imported env key) but none are usable (disabled/cooling):
+        // never fall back to staticProviderKeys, which would bypass admin disable/cooldown policy.
+        continue;
+      }
+    }
+    if (!apiKey) {
+      apiKey = (deps.staticProviderKeys?.[spec.id] ?? "").trim();
+    }
+    if (!apiKey) continue;
+    return {
+      canonical,
+      upstreamModel: descriptor.upstreamModelId,
+      spec,
+      apiKey,
+    };
+  }
+  return null;
 }
 
 async function defaultPickAccountId(): Promise<bigint | null> {
@@ -476,14 +613,63 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
     if (requested && !/^[A-Za-z0-9._:-]{1,64}$/.test(requested)) {
       throw new GrokRunError(400, "BAD_BODY", "model id is invalid");
     }
-    const canonical = snapshot.aliasToCanonical(requested || GROK_VISION_MODEL);
-    let upstreamModel: string;
+
+    let scope: ReturnType<typeof scopeFromAuthz>;
+    try {
+      scope = scopeFromAuthz(userId, await deps.loadUserModelAuthz(userId, snapshot.securityEpoch));
+    } catch {
+      throw new GrokRunError(503, "GROK_VISION_AUTHZ_UNAVAILABLE", "model authorization unavailable");
+    }
+
+    let canonical = snapshot.aliasToCanonical(requested || GROK_VISION_MODEL);
+    let upstreamModel = "";
+    let staticFallback: {
+      canonical: string;
+      upstreamModel: string;
+      spec: StaticKeyProviderSpec;
+      apiKey: string;
+    } | null = null;
+    let prePickedAccountId: bigint | null | undefined;
+
+    let grokResolved = false;
     try {
       const descriptor = snapshot.resolve(canonical);
       if (!descriptor || descriptor.engine !== "grok") throw new Error("not a grok model");
       upstreamModel = grokExecutionUpstream(canonical, descriptor.upstreamModelId);
+      grokResolved = true;
     } catch {
-      throw new GrokRunError(503, "GROK_VISION_MODEL_UNAVAILABLE", "vision model is not available");
+      grokResolved = false;
+    }
+
+    if (grokResolved) {
+      if (!snapshot.canUseModel(scope, canonical)) {
+        throw new GrokRunError(403, "GROK_VISION_NOT_AUTHORIZED", "this model is not available to this user");
+      }
+      // If flagship static failover is configured and no active Grok account exists,
+      // fail over before freezing billing so price and journal match the model actually called.
+      if (!requested && (deps.staticProviderKeys || deps.resolveStaticApiKey)) {
+        const candidate = await resolveFlagshipStaticVisionFallback(snapshot, scope, billTo, userId, deps);
+        if (candidate) {
+          const acct = await pickAccountId().catch(() => null);
+          if (acct === null) {
+            staticFallback = candidate;
+            canonical = candidate.canonical;
+            upstreamModel = candidate.upstreamModel;
+          } else {
+            prePickedAccountId = acct;
+          }
+        }
+      }
+    } else {
+      if (!requested) {
+        staticFallback = await resolveFlagshipStaticVisionFallback(snapshot, scope, billTo, userId, deps);
+      }
+      if (staticFallback) {
+        canonical = staticFallback.canonical;
+        upstreamModel = staticFallback.upstreamModel;
+      } else {
+        throw new GrokRunError(503, "GROK_VISION_MODEL_UNAVAILABLE", "vision model is not available");
+      }
     }
 
     const reservation = { userId: userId.toString(), requestId: billingRequestId };
@@ -491,15 +677,6 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
       containerId !== null ? `vision:${userId}:${containerId}` : `studio:${userId}`,
     );
     let abandon: (reason: string) => Promise<void> = async () => {};
-    let scope: ReturnType<typeof scopeFromAuthz>;
-    try {
-      scope = scopeFromAuthz(userId, await deps.loadUserModelAuthz(userId, snapshot.securityEpoch));
-    } catch {
-      throw new GrokRunError(503, "GROK_VISION_AUTHZ_UNAVAILABLE", "model authorization unavailable");
-    }
-    if (!snapshot.canUseModel(scope, canonical)) {
-      throw new GrokRunError(403, "GROK_VISION_NOT_AUTHORIZED", "this model is not available to this user");
-    }
     if (billTo === "user") {
       const pricing = snapshot.billingPricingFor(canonical);
       if (!pricing) {
@@ -590,37 +767,71 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
     let usage: GrokVisionUsage;
     let accessToken: Buffer | null = null;
     try {
-      const accountId = await pickAccountId().catch(() => null);
-      if (accountId === null) {
-        throw new GrokRunError(503, "GROK_VISION_NOT_CONFIGURED", "no active grok account");
+      if (staticFallback) {
+        input.signal?.throwIfAborted();
+        const upstream = await requestFn(staticFallback.spec.upstreamEndpoint, {
+          method: "POST",
+          dispatcher: directEgressDispatcher(),
+          headersTimeout: UPSTREAM_TIMEOUT_MS,
+          bodyTimeout: UPSTREAM_TIMEOUT_MS,
+          signal: input.signal,
+          headers: anthropicVisionHeaders(staticFallback.spec, staticFallback.apiKey),
+          body: anthropicVisionBody({ upstreamModel, prompt: input.prompt, image: input.image }),
+        });
+        const rawText = await upstream.body.text();
+        if (upstream.statusCode >= 400) {
+          reqLog.warn("grok_vision_fallback_upstream_status", {
+            model: canonical,
+            status: upstream.statusCode,
+          });
+          throw new GrokRunError(502, "GROK_UPSTREAM_ERROR", "vision fallback upstream rejected the request");
+        }
+        let json: unknown;
+        try {
+          json = JSON.parse(rawText);
+        } catch {
+          throw new GrokRunError(502, "GROK_BAD_RESPONSE", "vision fallback returned invalid JSON");
+        }
+        input.signal?.throwIfAborted();
+        answer = textFromAnthropicVisionResponse(json);
+        if (!answer) throw new GrokRunError(502, "GROK_BAD_RESPONSE", "vision fallback returned no text");
+        const metered = usageFromAnthropicVisionResponse(json);
+        if (!metered) throw new GrokRunError(502, "GROK_BAD_RESPONSE", "vision fallback returned no usage");
+        usage = metered;
+      } else {
+        const accountId =
+          prePickedAccountId !== undefined ? prePickedAccountId : await pickAccountId().catch(() => null);
+        if (accountId === null) {
+          throw new GrokRunError(503, "GROK_VISION_NOT_CONFIGURED", "no active grok account");
+        }
+        accessToken = await freshToken(accountId);
+        input.signal?.throwIfAborted();
+        const streaming = !input.image && !!input.onDelta;
+        const upstream = await requestFn(GROK_VISION_UPSTREAM, {
+          method: "POST",
+          dispatcher: directEgressDispatcher(),
+          headersTimeout: UPSTREAM_TIMEOUT_MS,
+          bodyTimeout: UPSTREAM_TIMEOUT_MS,
+          signal: input.signal,
+          headers: { ...grokVisionHeaders(accessToken, canonical), ...(streaming ? { accept: "text/event-stream" } : {}) },
+          body: input.image
+            ? grokVisionBody({ upstreamModel, mediaType: input.image.mediaType, data: input.image.data, prompt: input.prompt })
+            : grokTextBody({ upstreamModel, prompt: input.prompt, stream: streaming }),
+        });
+        void recordStatus(accountId, upstream.statusCode).catch(() => {});
+        if (upstream.statusCode >= 400) {
+          await upstream.body.text();
+          reqLog.warn("grok_vision_upstream_status", { status: upstream.statusCode });
+          throw new GrokRunError(502, "GROK_UPSTREAM_ERROR", "grok vision upstream rejected the request");
+        }
+        const json = await readResponses(upstream, streaming ? input.onDelta : undefined, input.signal);
+        input.signal?.throwIfAborted();
+        answer = textFromGrokVisionResponse(json);
+        if (!answer) throw new GrokRunError(502, "GROK_BAD_RESPONSE", "grok vision returned no text");
+        const metered = usageFromGrokVisionResponse(json);
+        if (!metered) throw new GrokRunError(502, "GROK_BAD_RESPONSE", "grok vision returned no usage");
+        usage = metered;
       }
-      accessToken = await freshToken(accountId);
-      input.signal?.throwIfAborted();
-      const streaming = !input.image && !!input.onDelta;
-      const upstream = await requestFn(GROK_VISION_UPSTREAM, {
-        method: "POST",
-        dispatcher: directEgressDispatcher(),
-        headersTimeout: UPSTREAM_TIMEOUT_MS,
-        bodyTimeout: UPSTREAM_TIMEOUT_MS,
-        signal: input.signal,
-        headers: { ...grokVisionHeaders(accessToken, canonical), ...(streaming ? { accept: "text/event-stream" } : {}) },
-        body: input.image
-          ? grokVisionBody({ upstreamModel, mediaType: input.image.mediaType, data: input.image.data, prompt: input.prompt })
-          : grokTextBody({ upstreamModel, prompt: input.prompt, stream: streaming }),
-      });
-      void recordStatus(accountId, upstream.statusCode).catch(() => {});
-      if (upstream.statusCode >= 400) {
-        await upstream.body.text();
-        reqLog.warn("grok_vision_upstream_status", { status: upstream.statusCode });
-        throw new GrokRunError(502, "GROK_UPSTREAM_ERROR", "grok vision upstream rejected the request");
-      }
-      const json = await readResponses(upstream, streaming ? input.onDelta : undefined, input.signal);
-      input.signal?.throwIfAborted();
-      answer = textFromGrokVisionResponse(json);
-      if (!answer) throw new GrokRunError(502, "GROK_BAD_RESPONSE", "grok vision returned no text");
-      const metered = usageFromGrokVisionResponse(json);
-      if (!metered) throw new GrokRunError(502, "GROK_BAD_RESPONSE", "grok vision returned no usage");
-      usage = metered;
     } catch (err) {
       await abandon("grok_vision_upstream_failed");
       if (err instanceof ResponsesDeltaError) throw err.original;

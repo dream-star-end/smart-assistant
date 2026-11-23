@@ -309,6 +309,9 @@ p2 = paras[1]
 p2_ommls = p2.findall(f".//{M}oMath")
 p2_omml_text = "".join((t.text or "") for t in p2.findall(f".//{M}t"))
 p2_omml_yellow = sum(1 for hl in p2.findall(f".//{M}oMath//{W}highlight") if hl.get(f"{W}val") == "yellow")
+p2_ppr = p2.find(f"{W}pPr")
+p2_shd = p2_ppr.find(f"{W}shd") if p2_ppr is not None else None
+p2_left = p2_ppr.find(f"{W}pBdr/{W}left") if p2_ppr is not None else None
 print(json.dumps({
     "p1_text": "".join(p1_stream),
     "p1_tabs": p1_tabs,
@@ -317,6 +320,11 @@ print(json.dumps({
     "p2_omml_count": len(p2_ommls),
     "p2_omml_text": p2_omml_text,
     "p2_omml_yellow": p2_omml_yellow,
+    "p2_shd_fill": p2_shd.get(f"{W}fill") if p2_shd is not None else None,
+    "p2_shd_val": p2_shd.get(f"{W}val") if p2_shd is not None else None,
+    "p2_left_color": p2_left.get(f"{W}color") if p2_left is not None else None,
+    "p2_left_sz": p2_left.get(f"{W}sz") if p2_left is not None else None,
+    "p2_left_space": p2_left.get(f"{W}space") if p2_left is not None else None,
 }))
 `;
       const inspected = spawnSync("python3", ["-c", inspectScript, hlPath], { encoding: "utf8" });
@@ -329,6 +337,81 @@ print(json.dumps({
       assert.equal(xml.p2_omml_count, 1, "equation must remain editable native <m:oMath>");
       assert.equal(xml.p2_omml_text, "x=2");
       assert.ok(xml.p2_omml_yellow >= 1, "revised OMML must carry yellow highlight");
+      assert.equal(xml.p2_shd_fill, "FFF9C4", "revised OMML paragraph must have soft yellow shading for LibreOffice + Word");
+      assert.equal(xml.p2_shd_val, "clear");
+      assert.equal(xml.p2_left_color, "F59E0B", "revised OMML paragraph must have amber left revision bar");
+      assert.equal(xml.p2_left_sz, "18");
+      assert.equal(xml.p2_left_space, "6");
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  test("real LibreOffice render check in oc-docx diff catches StarMath ¿/□ and passes once fixed (OCV5-874 #1)", (t) => {
+    const tools = spawnSync("which", ["soffice", "pdftotext", "pandoc"], { encoding: "utf8" });
+    if (tools.status !== 0) {
+      t.skip("soffice/pdftotext/pandoc not available");
+      return;
+    }
+    const work = mkdtempSync(join(tmpdir(), "oc-docx-diff-render-gate-"));
+    try {
+      const baseMd = join(work, "base.md");
+      const badRevMd = join(work, "bad-rev.md");
+      const goodRevMd = join(work, "good-rev.md");
+      const baseDocx = join(work, "base.docx");
+      const badRevDocx = join(work, "bad-rev.docx");
+      const goodRevDocx = join(work, "good-rev.docx");
+
+      writeFileSync(baseMd, "# Experiment\n\nBaseline phase $\\left|\\Delta\\phi\\right| < \\pi$ at 20°.\n", "utf8");
+      writeFileSync(badRevMd, "# Experiment\n\nUpdated phase $|\\Delta\\phi| < \\pi$ at 30 $^\\circ$.\n", "utf8");
+      writeFileSync(goodRevMd, "# Experiment\n\nUpdated phase $\\left|\\Delta\\phi\\right| < \\pi$ at 30°.\n", "utf8");
+
+      for (const [src, dst] of [
+        [baseMd, baseDocx],
+        [badRevMd, badRevDocx],
+        [goodRevMd, goodRevDocx],
+      ]) {
+        const c = runPy(OC_DOCX, ["convert", src, "--no-reference-doc", "-o", dst]);
+        assert.equal(c.status, 0, c.stderr);
+      }
+
+      const badDiff = runPy(OC_DOCX, [
+        "diff",
+        "--base",
+        baseDocx,
+        "--revised",
+        badRevDocx,
+        "--out-clean",
+        join(work, "bad-clean.docx"),
+        "--out-highlighted",
+        join(work, "bad-hl.docx"),
+      ]);
+      assert.equal(badDiff.status, 1, `expected render-garbled diff to FAIL:\n${badDiff.stdout}\n${badDiff.stderr}`);
+      const badReport = JSON.parse(badDiff.stdout);
+      assert.equal(badReport.passed, false);
+      assert.equal(badReport.omml_check.passed, false);
+      assert.equal(badReport.omml_check.render_check_executed, true);
+      assert.ok(badReport.omml_check.render_garbled_count >= 2);
+      assert.ok(badReport.omml_check.render_garbled_hits.some((h: any) => h.char === "¿" && h.page === 1 && h.context.length > 0));
+      assert.ok(badReport.omml_check.render_garbled_hits.some((h: any) => (h.char === "□" || h.char === "❑") && h.page === 1 && h.context.length > 0));
+
+      const goodDiff = runPy(OC_DOCX, [
+        "diff",
+        "--base",
+        baseDocx,
+        "--revised",
+        goodRevDocx,
+        "--out-clean",
+        join(work, "good-clean.docx"),
+        "--out-highlighted",
+        join(work, "good-hl.docx"),
+      ]);
+      assert.equal(goodDiff.status, 0, `expected fixed diff to PASS:\n${goodDiff.stdout}\n${goodDiff.stderr}`);
+      const goodReport = JSON.parse(goodDiff.stdout);
+      assert.equal(goodReport.passed, true);
+      assert.equal(goodReport.omml_check.passed, true);
+      assert.equal(goodReport.omml_check.render_check_executed, true);
+      assert.equal(goodReport.omml_check.render_garbled_count, 0);
     } finally {
       rmSync(work, { recursive: true, force: true });
     }

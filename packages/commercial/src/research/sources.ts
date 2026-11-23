@@ -24,10 +24,14 @@ export interface SourceSearchOpts {
   /** PubMed E-utilities polite email(未配时 litSearch 回落 mailto)。 */
   pubmedEmail?: string;
   timeoutMs?: number;
+  /** 瞬时失败轻重试的退避基数(ms);测试可传 0 加速。 */
+  retryDelayMs?: number;
   fetchImpl?: FetchLike;
 }
 
 const DEFAULT_TIMEOUT_MS = 12_000;
+/** arXiv Atom API 经出站代理时响应常在 12~16s,单独给更宽裕默认超时(仍完全尊重显式 timeoutMs);重试统一由 litSearch 预算控制。 */
+export const ARXIV_DEFAULT_TIMEOUT_MS = 18_000;
 
 async function fetchJson(
   url: string,
@@ -51,13 +55,17 @@ async function fetchJson(
 
 async function fetchText(
   url: string,
-  opts: { timeoutMs?: number; fetchImpl?: FetchLike },
+  opts: { timeoutMs?: number; fetchImpl?: FetchLike; headers?: Record<string, string> },
 ): Promise<string> {
   const fetchFn = opts.fetchImpl ?? fetch;
   const ctrl = new AbortController();
   const to = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   try {
-    const res = await fetchFn(url, { method: "GET", signal: ctrl.signal });
+    const res = await fetchFn(url, {
+      method: "GET",
+      ...(opts.headers ? { headers: opts.headers } : {}),
+      signal: ctrl.signal,
+    });
     if (!res.ok) throw new Error(`upstream_${res.status}`);
     return await res.text();
   } finally {
@@ -344,7 +352,18 @@ export async function searchArxiv(query: string, opts: SourceSearchOpts): Promis
   params.set("start", "0");
   params.set("max_results", String(Math.min(Math.max(opts.size, 1), 100)));
   const url = `https://export.arxiv.org/api/query?${params.toString()}`;
-  const xml = await fetchText(url, opts);
+  const timeoutMs = opts.timeoutMs ?? ARXIV_DEFAULT_TIMEOUT_MS;
+  const headers: Record<string, string> = {
+    Accept: "application/atom+xml, application/xml;q=0.9, */*;q=0.8",
+    "User-Agent": opts.mailto
+      ? `OpenClaude-research/1.0 (mailto:${opts.mailto})`
+      : "OpenClaude-research/1.0 (+https://openclaude.ai)",
+  };
+  const xml = await fetchText(url, {
+    timeoutMs,
+    fetchImpl: opts.fetchImpl,
+    headers,
+  });
   return parseArxivAtom(xml);
 }
 
