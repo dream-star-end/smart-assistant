@@ -186,18 +186,20 @@ describe('self-contained office/document oc-* CLIs', () => {
     }
   })
 
-  test('oc-docx covers Pandoc Markdown and Quarto QMD engines', async () => {
+  test('oc-docx covers Pandoc Markdown and Quarto QMD engines and rejects corrupt non-ZIP output', async () => {
     const work = mkdtempSync(join(tmpdir(), 'oc-docx-cli-'))
     try {
-      const bin = minimalBin(work, [])
+      const bin = minimalBin(work, ['python3'])
       const log = join(work, 'render.log')
+      const writeMinimalZip =
+        'python3 -c \'import sys, zipfile; z = zipfile.ZipFile(sys.argv[1], "w"); z.writestr("word/document.xml", "<w:document/>"); z.close()\' "$out"'
       executable(
         join(bin, 'pandoc'),
-        '#!/bin/bash\nprintf "pandoc %s\\n" "$*" >> "$OC_TEST_LOG"\nout=""; prev=""\nfor arg in "$@"; do [ "$prev" = "--output" ] && out="$arg"; prev="$arg"; done\nprintf docx > "$out"\n',
+        `#!/bin/bash\nprintf "pandoc %s\\n" "$*" >> "$OC_TEST_LOG"\nout=""; prev=""\nfor arg in "$@"; do [ "$prev" = "--output" ] && out="$arg"; prev="$arg"; done\nif [ "\${OC_TEST_CORRUPT_DOCX:-}" = "1" ]; then printf docx > "$out"; else ${writeMinimalZip}; fi\n`,
       )
       executable(
         join(bin, 'quarto'),
-        '#!/bin/bash\nprintf "quarto %s\\n" "$*" >> "$OC_TEST_LOG"\nout=""; prev=""\nfor arg in "$@"; do [ "$prev" = "--output" ] && out="$arg"; prev="$arg"; done\nprintf docx > "$out"\n',
+        `#!/bin/bash\nprintf "quarto %s\\n" "$*" >> "$OC_TEST_LOG"\nout=""; prev=""\nfor arg in "$@"; do [ "$prev" = "--output" ] && out="$arg"; prev="$arg"; done\n${writeMinimalZip}\n`,
       )
       const md = join(work, 'draft.md')
       const qmd = join(work, 'slides.qmd')
@@ -215,7 +217,7 @@ describe('self-contained office/document oc-* CLIs', () => {
       )
       assert.equal(result.code, 0, result.stderr)
       assert.equal(result.stdout.trim(), mdOut)
-      assert.equal(readFileSync(mdOut, 'utf8'), 'docx')
+      assert.equal(readFileSync(mdOut).subarray(0, 2).toString('ascii'), 'PK')
 
       result = await run(
         realCommand('python3'),
@@ -224,7 +226,16 @@ describe('self-contained office/document oc-* CLIs', () => {
       )
       assert.equal(result.code, 0, result.stderr)
       assert.equal(result.stdout.trim(), qmdOut)
-      assert.equal(readFileSync(qmdOut, 'utf8'), 'docx')
+      assert.equal(readFileSync(qmdOut).subarray(0, 2).toString('ascii'), 'PK')
+
+      // Corrupt non-ZIP output must fail non-zero instead of falsely reporting success
+      const corruptOut = join(work, 'corrupt.docx')
+      const corruptRes = await run(
+        realCommand('python3'),
+        [join(BIN_DIR, 'oc-docx.py'), '--no-reference-doc', md, '-o', corruptOut],
+        { env: { PATH: bin, OC_TEST_LOG: log, OC_TEST_CORRUPT_DOCX: '1' } },
+      )
+      assert.notEqual(corruptRes.code, 0, 'corrupt non-ZIP docx output must exit non-zero')
 
       const renderLog = readFileSync(log, 'utf8')
       assert.match(renderLog, /pandoc .*--standalone.*--to=docx/)

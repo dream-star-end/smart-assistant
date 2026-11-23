@@ -46,10 +46,11 @@ const NON_PDF_EXPLICIT_EXT_RE =
   /\.(?:md|markdown|txt|html|htm|xhtml|csv|tsv|json|xml|yaml|yml|rst|tex)$/i;
 
 /**
- * 判断输入字节是否为真实 PDF(防普通文本/Markdown/HTML 外发给外部 OCR):
+ * 判断输入字节是否为真实 PDF(防普通文本/Markdown/HTML/无扩展名说明外发给外部 OCR):
  * - 显式 text/* 或结构化文本 MIME/扩展名一律返回 false,强制走本地解析;
- * - 其余(含 application/pdf、application/octet-stream 或缺省元数据)要求文件起始处即
- *   为合法 `%PDF-<major>.<minor>` 版本头,不再扫描正文前 1024 字节。
+ * - 要求文件起始处即为严格的 `%PDF-<major>.<minor>` 后跟换行(`\r`/`\n`),不把普通空格当头结束;
+ * - 对无 `.pdf` 扩展名且非 `application/pdf` MIME 的泛型二进制(如无扩展名 README),额外要求
+ *   包含真实 PDF 结构标记(`%%EOF` 或 `endobj`),无法确认结构绝不外发。
  */
 export function isPdfLike(bytes: Buffer, mime: string, filename?: string): boolean {
   const normalizedMime = parseMediaType(mime);
@@ -64,9 +65,16 @@ export function isPdfLike(bytes: Buffer, mime: string, filename?: string): boole
   if (trimmedName && NON_PDF_EXPLICIT_EXT_RE.test(trimmedName) && !isExplicitPdfMime) {
     return false;
   }
-  if (bytes.length < 8) return false;
+  if (bytes.length < 9) return false;
   const header = bytes.subarray(0, Math.min(bytes.length, 16)).toString("ascii");
-  return /^%PDF-\d\.\d(?=$|\r|\n|\s)/.test(header);
+  if (!/^%PDF-\d\.\d(?:\r\n|\r|\n)/.test(header)) {
+    return false;
+  }
+  const hasPdfExt = /\.pdf$/i.test(trimmedName);
+  if (!isExplicitPdfMime && !hasPdfExt) {
+    return bytes.indexOf("%%EOF") !== -1 || bytes.indexOf("endobj") !== -1;
+  }
+  return true;
 }
 
 interface ExternalPdfAdapterSpec {
