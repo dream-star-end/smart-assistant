@@ -95,9 +95,9 @@ REDIS_URL="redis://127.0.0.1:6379/3"
 # agy134 (OCV5-415) = patch of the v5-cli-cc2280-codex01592-grok1013-zcode381-slim image that adds the official
 # Antigravity CLI 1.3.4 (same RUN block as Dockerfile.openclaude-runtime, sha512-pinned);
 # the previous tag stays for rollback.
-# cc2325/codex01700/grok1077/zcode3153/agy158-chrome (OCV5-857) = OCV5-798 CLI set + official Google Chrome Stable 158,
-# openbox WM, Xvfb, and en_US/zh_CN UTF-8 locales for real desktop live browser; previous agy158-slim tag stays for rollback.
-RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-cc2325-codex01700-grok1077-zcode3153-agy158-chrome-slim"
+# cc2325/codex01710/grok1077/zcode3153/agy1515-chrome (OCV5-860) = Codex 0.171.0 + Antigravity CLI 1.5.15 +
+# official Google Chrome Stable 158, openbox WM, Xvfb, and en_US/zh_CN UTF-8 locales; previous agy158-chrome-slim / agy158-slim tags stay for rollback.
+RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-cc2325-codex01710-grok1077-zcode3153-agy1515-chrome-slim"
 SECRETS_ENV="/etc/openclaude/secrets.env"
 PERSONAL_UNIT="openclaude.service"
 PERSONAL_PORT="18789"

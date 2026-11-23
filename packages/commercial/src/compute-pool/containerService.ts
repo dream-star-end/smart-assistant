@@ -31,6 +31,7 @@ import { rootLogger } from "../logging/logger.js";
 import { getRuntimeChannel } from "../runtimeChannel.js";
 import * as queries from "./queries.js";
 import { SupervisorError } from "../agent-sandbox/types.js";
+import { buildContainerExtraHosts } from "../agent-sandbox/constants.js";
 import {
   createVolume as agentCreateVolume,
   removeVolume as agentRemoveVolume,
@@ -118,6 +119,8 @@ export interface ContainerSpec {
   internalPort: number;
   /** cmd 覆盖(可选;默认走镜像 entrypoint/cmd)。 */
   cmd?: string[];
+  /** 可选附加 /etc/hosts 映射(如 host.docker.internal:host-gateway);平台默认拦截项自动合并去重。 */
+  extraHosts?: readonly string[];
 }
 
 /**
@@ -259,6 +262,7 @@ export class LocalDockerBackend {
         },
         HostConfig: {
           NetworkMode: v3NetworkNameForChannel(),
+          ExtraHosts: buildContainerExtraHosts(spec.extraHosts),
           Memory: spec.memoryBytes,
           MemorySwap: spec.memoryBytes,
           MemorySwappiness: 0,

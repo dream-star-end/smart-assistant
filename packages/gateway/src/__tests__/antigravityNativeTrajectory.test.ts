@@ -8,6 +8,7 @@ import Database from 'better-sqlite3'
 import protobuf from 'protobufjs'
 import {
   ANTIGRAVITY_EXTRA_CLI_SHA256_ENV,
+  ANTIGRAVITY_NATIVE_CLI_1_5_15_SHA256,
   ANTIGRAVITY_NATIVE_CLI_1_5_8_SHA256,
   ANTIGRAVITY_NATIVE_CLI_SHA256,
   ANTIGRAVITY_NATIVE_CLI_SHA256_ALLOWLIST,
@@ -354,6 +355,32 @@ test('OCV5-852: built-in allowlist includes verified Antigravity CLI 1.5.8 SHA-2
   const degraded: AntigravityNativeDegradationEvent[] = []
   assert.equal(
     await verifyAntigravityNativeBinary(cli158Path, ANTIGRAVITY_NATIVE_CLI_SHA256, {
+      onDegraded: (e) => degraded.push(e),
+    }),
+    true,
+  )
+  assert.equal(degraded.length, 0)
+})
+
+test('OCV5-860: built-in allowlist appends verified Antigravity CLI 1.5.15 SHA-256 while retaining 1.4.0 and 1.5.8', async () => {
+  assert.equal(ANTIGRAVITY_NATIVE_CLI_1_5_15_SHA256, 'e938b2983fbceda2583f173c0e7fc6a9f09e1acb7c5537f5b25aed05283e0400')
+  assert.ok(ANTIGRAVITY_NATIVE_CLI_SHA256_ALLOWLIST.includes(ANTIGRAVITY_NATIVE_CLI_SHA256))
+  assert.ok(ANTIGRAVITY_NATIVE_CLI_SHA256_ALLOWLIST.includes(ANTIGRAVITY_NATIVE_CLI_1_5_8_SHA256))
+  assert.ok(ANTIGRAVITY_NATIVE_CLI_SHA256_ALLOWLIST.includes(ANTIGRAVITY_NATIVE_CLI_1_5_15_SHA256))
+  const resolved = resolveAntigravityNativeCliSha256Allowlist(undefined)
+  assert.equal(resolved.has(ANTIGRAVITY_NATIVE_CLI_SHA256), true)
+  assert.equal(resolved.has(ANTIGRAVITY_NATIVE_CLI_1_5_8_SHA256), true)
+  assert.equal(resolved.has(ANTIGRAVITY_NATIVE_CLI_1_5_15_SHA256), true)
+
+  const cli1515Path = '/opt/antigravity-cli/versions/1.5.15/antigravity'
+  try {
+    await readFile(cli1515Path)
+  } catch {
+    return
+  }
+  const degraded: AntigravityNativeDegradationEvent[] = []
+  assert.equal(
+    await verifyAntigravityNativeBinary(cli1515Path, ANTIGRAVITY_NATIVE_CLI_SHA256, {
       onDegraded: (e) => degraded.push(e),
     }),
     true,
