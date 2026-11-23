@@ -454,10 +454,10 @@ describe('oc-docx check', { skip: !pythonDocxAvailable }, () => {
       const esCheckForced = await run(['check', esDocx, '--render-check'], {})
       assert.equal(esCheckForced.code, 0, `Spanish plain DOCX must PASS --render-check:\n${esCheckForced.stdout}`)
 
-      // Spanish document WITH garbled OMML must STILL FAIL (excess ¿ beyond source text is caught)
+      // Spanish document WITH garbled OMML must STILL FAIL (excess ¿/□ beyond source text is caught)
       const esBadMd = join(work, 'spanish-bad.md')
       const esBadDocx = join(work, 'spanish-bad.docx')
-      writeFileSync(esBadMd, '# Pregunta\n\n¿Dónde está $|\\Delta\\phi| < \\pi$?\n', 'utf8')
+      writeFileSync(esBadMd, '# Pregunta\n\n¿Dónde está $|\\Delta\\phi| < \\pi$ a 30 $^\\circ$?\n', 'utf8')
       const convEsBad = await run(['convert', esBadMd, '--no-reference-doc', '-o', esBadDocx], {})
       assert.equal(convEsBad.code, 0, convEsBad.stderr)
       const esBadCheck = await run(['check', esBadDocx, '--expect-formulas'], {})
