@@ -37,11 +37,10 @@ describe("Composer 两行式布局", () => {
     expect(inputRow.compareDocumentPosition(toolRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     // 已彻底消灭 <640px 独立底部悬浮废行 composer-repo-slot-mobile。
     expect(screen.queryByTestId("composer-repo-slot-mobile")).toBeNull();
-    // 未绑定仓库且无项目时：顶部微上下文条不占位；桌面 sm+ 工具行保留无框轻量入口，移动端收敛进「+」菜单。
+    // 未绑定仓库且无项目时：顶部微上下文条不占位；全端统一将「关联 GitHub 仓库」收进「+」菜单，底栏不再重复展示（OCV5-861）。
     expect(screen.queryByTestId("composer-context-bar")).toBeNull();
-    expect(screen.getAllByRole("button", { name: "关联 GitHub 仓库" })).toHaveLength(1);
-    expect(screen.getByTestId("composer-repo-slot")).toHaveClass("hidden", "sm:flex");
-    expect(toolRow).toContainElement(screen.getByTestId("composer-repo-slot"));
+    expect(screen.queryByTestId("composer-repo-slot")).toBeNull();
+    expect(screen.queryByRole("button", { name: "关联 GitHub 仓库" })).toBeNull();
     // 守住 <768px 16px (text-base) 防 iOS 缩放红线。
     expect(textarea).toHaveClass("text-base", "md:text-sm");
   });
@@ -445,7 +444,6 @@ describe("OCV5-831 Composer 蜂群占位符单行化与视觉重心", () => {
     fireEvent.change(ta, { target: { value: "写一个计划" } });
     expect(screen.getByRole("button", { name: "发送" })).toHaveClass(
       "oc-btn-primary-craft",
-      "oc-shimmer-sheen",
       "oc-spring-press",
       "oc-icon-nudge",
       "text-primary-fg",
@@ -456,7 +454,6 @@ describe("OCV5-831 Composer 蜂群占位符单行化与视觉重心", () => {
     expect(screen.queryByTestId("composer-swarm-toggle")).toBeNull();
     expect(screen.getByRole("button", { name: "发送" })).toHaveClass(
       "oc-btn-accent-craft",
-      "oc-shimmer-sheen",
       "text-accent-fg",
     );
 
@@ -491,5 +488,30 @@ describe("OCV5-831 Composer 蜂群占位符单行化与视觉重心", () => {
     const playbookItem = screen.getByTestId("composer-menu-swarm-playbooks");
     expect(playbookItem).toHaveTextContent("蜂群剧本模板");
     expect(playbookItem.className).not.toContain("sm:hidden");
+  });
+
+  test("OCV5-872: modelSlot 渲染在底栏右侧且位于语音与发送按钮左侧，并具窄屏弹性防溢出边界", () => {
+    render(
+      <Composer
+        onSend={() => {}}
+        onUpload={async () => ({ kind: "file", url: "/x" })}
+        modelSlot={<button type="button" data-testid="fake-model-trigger">Gemini 4 Neon</button>}
+      />,
+    );
+    const toolRow = screen.getByTestId("composer-tool-row");
+    const slot = screen.getByTestId("composer-model-slot");
+    const modelBtn = screen.getByTestId("fake-model-trigger");
+    const voiceBtn = screen.getByRole("button", { name: "语音输入" });
+    const sendBtn = screen.getByRole("button", { name: "发送" });
+    const plusBtn = screen.getByRole("button", { name: "更多选项" });
+
+    expect(toolRow).toHaveClass("min-w-0");
+    expect(toolRow).toContainElement(slot);
+    expect(slot).toContainElement(modelBtn);
+    expect(slot).toHaveClass("min-w-0", "max-w-full");
+    // 位置顺序：[+] < [模型] < [语音] < [发送]
+    expect(plusBtn.compareDocumentPosition(slot) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(slot.compareDocumentPosition(voiceBtn) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(voiceBtn.compareDocumentPosition(sendBtn) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });

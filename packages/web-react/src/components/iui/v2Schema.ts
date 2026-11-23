@@ -1,6 +1,10 @@
 /**
  * Intelligent UI 二期新增 6 类组件 schema 与校验（deliverables / citations / runbook / prompt_template / storyboard / flashcards）。
  */
+import {
+  type BrowserHandoffResumeWhen,
+  normalizeBrowserHandoffResumeWhen,
+} from "@openclaude/protocol/browser";
 import { needsSignedSrc } from "../../lib/chat/media";
 
 type Sub = { subtitle?: string };
@@ -45,12 +49,14 @@ export type FlashcardsSpec = Sub & { type: "flashcards"; title?: string; cards: 
 
 export type BrowserHandoffSpec = Sub & {
   type: "browser_handoff";
+  decisionId?: string;
   title?: string;
   url?: string;
   reason?: string;
   action_label?: string;
   continue_label?: string;
   continue_prompt?: string;
+  resume_when?: BrowserHandoffResumeWhen;
 };
 
 export type V2Spec =
@@ -337,12 +343,14 @@ function flashcards(raw: Record<string, unknown>, ctx: Ctx): FlashcardsSpec | nu
 function browserHandoff(raw: Record<string, unknown>, _ctx: Ctx): BrowserHandoffSpec {
   return {
     type: "browser_handoff",
+    ...optional("decisionId", str(raw.decisionId ?? raw.decision_id ?? raw.handoffId ?? raw.handoff_id ?? raw.id, 120)),
     ...optional("title", str(raw.title, 120)),
     ...optional("url", httpUrl(raw.url ?? raw.page_url ?? raw.href)),
     ...optional("reason", str(raw.reason ?? raw.body ?? raw.message ?? raw.description, 600)),
     ...optional("action_label", str(raw.action_label ?? raw.cta, 40)),
     ...optional("continue_label", str(raw.continue_label, 40)),
     ...optional("continue_prompt", str(raw.continue_prompt ?? raw.prompt, 400)),
+    ...optional("resume_when", normalizeBrowserHandoffResumeWhen(raw.resume_when ?? raw.resumeWhen)),
   };
 }
 

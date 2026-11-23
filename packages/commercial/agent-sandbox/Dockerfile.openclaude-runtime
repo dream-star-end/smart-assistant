@@ -290,7 +290,7 @@ RUN printf '%s\n' 'deb http://deb.debian.org/debian bookworm-backports main' \
 # P1d / v5 ccb 单底座:OC_INCLUDE_CODEX=0 → 不装 codex CLI(镜像更小、冷启更快;v5 runner
 # seam 永不走 codex、模型面无 gpt-*,故 codex 二进制对 v5 是纯死重)。v3 默认 1,行为不变。
 ARG OC_INCLUDE_CODEX=1
-ARG OC_CODEX_VERSION=0.170.0
+ARG OC_CODEX_VERSION=0.171.0
 RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then \
       npm install -g "@openai/codex@${OC_CODEX_VERSION}" --no-audit --no-fund \
       && test "$(codex --version)" = "codex-cli ${OC_CODEX_VERSION}" \
@@ -609,6 +609,49 @@ RUN apt-get update \
     && test -x /usr/bin/ssh-keyscan \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
+# ------------------------------------------------------------
+# Real desktop browser environment (OCV5-857 Phase 2)
+# ------------------------------------------------------------
+# Official Google Chrome Stable + lightweight Openbox WM + Xvfb + UTF-8 locales
+# (en_US.UTF-8, zh_CN.UTF-8; container default remains LANG=C.UTF-8 / LC_ALL=C.UTF-8).
+# Placed after the heavy Playwright/Chromium + CLI layers so cached layers above stay
+# valid, and before the trailing oc-browser smoke check so image builds verify headed Chrome.
+RUN set -eux; \
+    test "$(dpkg --print-architecture)" = amd64; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        gnupg \
+        openbox \
+        xvfb \
+        locales; \
+    sed -i -e 's/^# *en_US\.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' \
+           -e 's/^# *zh_CN\.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen; \
+    grep -q '^en_US\.UTF-8 UTF-8' /etc/locale.gen || echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen; \
+    grep -q '^zh_CN\.UTF-8 UTF-8' /etc/locale.gen || echo 'zh_CN.UTF-8 UTF-8' >> /etc/locale.gen; \
+    locale-gen; \
+    mkdir -p /usr/share/keyrings; \
+    curl -fsSL --retry 3 https://dl.google.com/linux/linux_signing_key.pub \
+      | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg; \
+    chmod 0644 /usr/share/keyrings/google-chrome.gpg; \
+    printf '%s\n' 'deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main' \
+      > /etc/apt/sources.list.d/google-chrome.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends google-chrome-stable; \
+    chmod u-s /opt/google/chrome/chrome-sandbox 2>/dev/null || true; \
+    google-chrome-stable --version; \
+    command -v openbox; \
+    command -v Xvfb; \
+    locale -a | grep -qiE '^en_US\.utf-?8$'; \
+    locale -a | grep -qiE '^zh_CN\.utf-?8$'; \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+
+# GNU Octave: lightweight MATLAB-compatible numerical computing runtime (OCV5-874).
+# Trailing base-stage layer so heavy LibreOffice/Playwright/Chromium layers stay cached.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends octave \
+    && octave --version | head -1 \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # ── oc-* 工具: trailing base-stage layers (after CLI/Playwright/Chromium) ──
 # 镜像内 /usr/local/bin 副本仅当 bundle 未挂载时兜底;source 已迁 platform-runtime/bin/(改动真热)。
@@ -616,6 +659,7 @@ RUN apt-get update \
 # one-line oc-*.sh edit no longer busts the 966MB Chromium layer or CLI installs.
 # oc-browser smoke moved here from the Playwright install RUN (that RUN needs oc-browser).
 COPY --chown=root:root ./platform-runtime/bin/oc-docx.py /usr/local/bin/oc-docx
+COPY --chown=root:root ./platform-runtime/entrypoint/oc_docx_diff.py /usr/local/lib/openclaude/oc_docx_diff.py
 COPY --chown=root:root ./runtime/create-docgen-reference.py /usr/local/lib/openclaude/create-docgen-reference.py
 COPY --chown=root:root ./platform-runtime/bin/oc-minimax.py /usr/local/bin/oc-minimax
 COPY --chown=root:root ./platform-runtime/bin/oc-web-context.py /usr/local/bin/oc-web-context
@@ -671,6 +715,7 @@ COPY --chown=root:root ./platform-runtime/bin/oc-memory.sh /usr/local/bin/oc-mem
 COPY --chown=root:root ./platform-runtime/bin/oc-connect.sh /usr/local/bin/oc-connect
 RUN set -eux; \
     chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-skill /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/bin/oc-report /usr/local/bin/oc-slides /usr/local/bin/oc-poster /usr/local/bin/oc-rank /usr/local/bin/oc-xlsx /usr/local/bin/oc-pdf /usr/local/bin/oc-artifact-qa /usr/local/bin/oc-figcheck /usr/local/bin/oc-diagram /usr/local/bin/oc-memory /usr/local/bin/oc-connect /usr/local/lib/openclaude/create-docgen-reference.py; \
+    ln -sf /run/oc/platform/current/bin/oc-stylecheck /usr/local/bin/oc-stylecheck; \
     ln -sf /usr/local/bin/oc-minimax /usr/local/bin/mmx; \
     python3 /usr/local/lib/openclaude/create-docgen-reference.py /usr/local/share/openclaude-docgen/reference.docx; \
     printf '%s\n' '# DOCX smoke' 'Inline $\bar{x}=\frac{1}{n}\sum_{i=1}^{n}x_i$.' '' '$$' '\mathrm{MSE}=\frac{1}{n}\sum_{i=1}^{n}(y_i-\hat{y}_i)^2' '$$' > /tmp/oc-docx-smoke.md; \
@@ -788,6 +833,8 @@ RUN set -eux; \
     OPENCLAUDE_AGENT_ID=image-build-smoke OPENCLAUDE_HOME="$SMOKE_HOME" \
       OPENCLAUDE_PLAYWRIGHT_CLI_IDLE_SECONDS=60 OPENCLAUDE_PLAYWRIGHT_CLI_POLL_SECONDS=1 \
       oc-browser open about:blank >/dev/null; \
+    test -s "$SMOKE_HOME"/browser-profiles/image-build-smoke-*/DevToolsActivePort; \
+    test -s /tmp/openclaude-playwright-cli/image-build-smoke-*/xvfb.display; \
     OPENCLAUDE_AGENT_ID=image-build-smoke OPENCLAUDE_HOME="$SMOKE_HOME" \
       OPENCLAUDE_PLAYWRIGHT_CLI_IDLE_SECONDS=60 OPENCLAUDE_PLAYWRIGHT_CLI_POLL_SECONDS=1 \
       oc-browser snapshot >/dev/null; \
@@ -805,9 +852,9 @@ RUN set -eux; \
 # 1.5.0 (docs/antigravity-large-history-resume.md). No Node dependency. Auto-update
 # is disabled at runtime by the adapter (AGY_CLI_DISABLE_AUTO_UPDATE=true).
 ARG OC_INCLUDE_ANTIGRAVITY=0
-ARG OC_ANTIGRAVITY_CLI_VERSION=1.5.8
-ARG OC_ANTIGRAVITY_CLI_BUILD=1.5.8-4602374149505024
-ARG OC_ANTIGRAVITY_CLI_SHA512=f08faaee588327dba8722bdc60f26a14f6915a8f2d756ed7959cde0a706d4e62fd9f831ab1a077dace5f947caaa6e851457df5023180bb8d3f54386804a3787f
+ARG OC_ANTIGRAVITY_CLI_VERSION=1.5.15
+ARG OC_ANTIGRAVITY_CLI_BUILD=1.5.15-5944945928962048
+ARG OC_ANTIGRAVITY_CLI_SHA512=e659293510ca6192b2aed009d00fe2b800a81548bb0bc0e83c9c1aa9c84b572e08242e13f41a651a74e79d7b6459280b0608109f0c655c50a7d726d98610d63b
 RUN if [ "$OC_INCLUDE_ANTIGRAVITY" = "1" ]; then set -eux; \
       test "$(dpkg --print-architecture)" = amd64; \
       archive=/tmp/antigravity-cli-${OC_ANTIGRAVITY_CLI_VERSION}.tar.gz; \

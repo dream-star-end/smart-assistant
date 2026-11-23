@@ -31,7 +31,6 @@ import {
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
-  Suspense,
   lazy,
   useEffect,
   useId,
@@ -87,7 +86,8 @@ import { resolveToolMeta, toolSummary } from "./tool/meta";
 import { parseShellEnvelope } from "./tool/shellEnvelope";
 import { resolveToolStatus } from "./tool/status";
 import { toneTileClass } from "./tool/tone";
-import { Badge, IconButton, Skeleton, Spinner, Tabs } from "./ui";
+import { Badge, IconButton, Skeleton, Spinner, StatusPill, Tabs } from "./ui";
+import { LazyBoundary } from "./ChunkErrorBoundary";
 import { AtelierIcon } from "./ui/AtelierIcons";
 import { AtelierLazyIcon } from "./ui/AtelierLazyIcons";
 import { WorkbenchSheetContext } from "./chat/WorkbenchBottomBar";
@@ -311,7 +311,7 @@ function StepHeader({ message }: { message: ToolLike }) {
       </span>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          <h3 className="text-body font-semibold text-fg">{meta.label}</h3>
+          <h3 className="min-w-0 truncate text-body font-semibold text-fg">{meta.label}</h3>
           {status.isRunning ? (
             <>
               <span className="sr-only">{status.label}</span>
@@ -373,7 +373,7 @@ function StepDetail({
             data-testid="pane-following"
             className="oc-badge-craft oc-breathe-aura inline-flex items-center gap-1.5 rounded-full bg-accent-soft px-2.5 py-0.5 text-caption font-medium text-accent"
           >
-            <span aria-hidden className="oc-alive-dot size-1.5 rounded-full bg-accent" />
+            <StatusPill status="running" decorative className="oc-alive-dot" />
             跟随中
           </span>
         ) : showLatest ? (
@@ -582,7 +582,9 @@ export function InspectorPanelContent({
   };
   const [tab, setTabState] = useState<PrimaryPaneTab>(() => {
     const resolved = request ? resolveRequest(request) : null;
-    return resolved?.kind === "tab" ? resolved.tab : readStoredTab();
+    if (resolved?.kind === "tab") return resolved.tab;
+    if (messages.length === 0 && liveBrowserAgentId && liveBrowserAuth) return "browser";
+    return readStoredTab();
   });
   const [selected, setSelected] = useState<ToolLike | null>(() => {
     const resolved = request ? resolveRequest(request) : null;
@@ -862,8 +864,8 @@ export function InspectorPanelContent({
           (!sheet || fullscreen) && "header-safe-t",
         )}
       >
-        <h2 id={headingId} className="sr-only">
-          详情面板
+        <h2 id={headingId} className="sr-only text-ellipsis">
+          工作台
         </h2>
         <div className="min-w-0 flex-1">
           <Tabs
@@ -871,11 +873,11 @@ export function InspectorPanelContent({
             onValueChange={(v) => setTab(v as PrimaryPaneTab)}
             items={tabItems}
             idBase={idBase}
-            aria-label="详情面板分区"
-            className="[&_[role=tab]]:px-2.5 [&_[role=tab]]:py-1 [&_[role=tab]]:text-meta [&_[role=tab]]:transition-all [&_[role=tab]]:duration-150 [@media(hover:none)]:[&_[role=tab]]:min-h-9"
+            aria-label="工作台分区"
+            className="[&_[role=tab]]:px-2.5 [&_[role=tab]]:py-1 [&_[role=tab]]:text-meta [&_[role=tab]]:transition-all [&_[role=tab]]:duration-150"
           />
         </div>
-        {onToggleFullscreen && (
+        {onToggleFullscreen && (fullscreen || !(view === "browser" && liveBrowserAvailable && !shown)) && (
           <IconButton
             aria-label={fullscreen ? "退出全屏阅读" : "全屏阅读"}
             title={fullscreen ? "恢复默认高度 (Esc)" : "全屏沉浸阅读"}
@@ -889,7 +891,8 @@ export function InspectorPanelContent({
           </IconButton>
         )}
         <IconButton
-          aria-label="关闭详情面板"
+          aria-label="关闭工作台"
+          title="关闭工作台"
           size="sm"
           shape="square"
           className="oc-spring-press"
@@ -928,7 +931,7 @@ export function InspectorPanelContent({
             正在读取这一轮的浏览器记录…
           </div>
         ) : view === "browser" ? (
-          <Suspense fallback={<OutputsFallback />}>
+          <LazyBoundary fallback={<OutputsFallback />}>
             <BrowserView
               turns={browserTurns}
               index={outputsIndex}
@@ -947,24 +950,24 @@ export function InspectorPanelContent({
               onHandoffSettled={setConsumedHandoffNonce}
               onAnnotateToComposer={onAnnotateToComposer}
             />
-          </Suspense>
+          </LazyBoundary>
         ) : view === "outputs" ? (
-          <Suspense fallback={<OutputsFallback />}>
-          <OutputsView
-            messages={messages}
-            turns={workTurns}
-            index={outputsIndex}
-            running={running && outputsIndex === lastTurn}
-            targetOutput={targetOutput}
-            onSelectTurn={(i) => {
-              const t = workTurns[i];
-              if (t) setTurnKey(i === lastTurn ? null : t.key);
-              setTargetOutput(null);
-            }}
-            onOpenStep={openStep}
-            onAnnotateToComposer={onAnnotateToComposer}
-          />
-          </Suspense>
+          <LazyBoundary fallback={<OutputsFallback />}>
+            <OutputsView
+              messages={messages}
+              turns={workTurns}
+              index={outputsIndex}
+              running={running && outputsIndex === lastTurn}
+              targetOutput={targetOutput}
+              onSelectTurn={(i) => {
+                const t = workTurns[i];
+                if (t) setTurnKey(i === lastTurn ? null : t.key);
+                setTargetOutput(null);
+              }}
+              onOpenStep={openStep}
+              onAnnotateToComposer={onAnnotateToComposer}
+            />
+          </LazyBoundary>
         ) : (
           <PlanView todos={todos} />
         )}
@@ -1032,8 +1035,14 @@ export function InspectorPanel({
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose, fullscreen]);
 
+  const liveBrowserFocusOwnedRef = useRef(false);
+  liveBrowserFocusOwnedRef.current = Boolean(
+    content.request?.tab === "browser" &&
+      (content.request.liveBrowser?.takeover || content.request.liveBrowser?.expand),
+  );
+
   // 每次从外面点开(换了一步 / 点了顶栏开关)都记下当时的焦点元素并把焦点移进面板;
-  // 面板整体卸载时把焦点还给最后那个入口。
+  // 面板整体卸载时把焦点还给最后那个入口。若焦点已进入面板或实时浏览器接管画布则不抢占。
   useEffect(() => {
     if (focusNonce === undefined) return;
     const active = document.activeElement;
@@ -1045,6 +1054,15 @@ export function InspectorPanel({
       returnFocusRef.current = active;
     }
     const raf = requestAnimationFrame(() => {
+      if (liveBrowserFocusOwnedRef.current) return;
+      const curr = document.activeElement;
+      if (
+        curr instanceof HTMLElement &&
+        (asideRef.current?.contains(curr) ||
+          curr.closest('[data-testid="live-browser-theater-dialog"]'))
+      ) {
+        return;
+      }
       asideRef.current?.querySelector<HTMLElement>("[data-inspector-close]")?.focus();
     });
     return () => cancelAnimationFrame(raf);
@@ -1074,7 +1092,7 @@ export function InspectorPanel({
           <div
             role="separator"
             aria-orientation="vertical"
-            aria-label="调整详情面板宽度"
+            aria-label="调整工作台宽度"
             aria-valuenow={width}
             aria-valuemin={widthMin}
             aria-valuemax={effectiveMax}
@@ -1123,15 +1141,15 @@ export function InspectorPanel({
       <RD.Root open={fullscreen} onOpenChange={setFullscreen}>
         <RD.Portal>
           <RD.Overlay
-            className="fixed inset-0 z-[60] bg-bg/75 backdrop-blur-md"
+            className="fixed inset-0 z-[var(--z-viewer)] bg-bg/75 backdrop-blur-md"
             data-testid="pane-fullscreen-backdrop"
           />
           <RD.Content
             aria-describedby={undefined}
             data-testid="pane-fullscreen-dialog"
-            className="oc-surface-popover fixed left-1/2 top-1/2 z-[61] flex h-[92dvh] w-[min(94vw,90rem)] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl outline-none"
+            className="oc-surface-popover fixed left-1/2 top-1/2 z-[var(--z-viewer)] flex h-[92dvh] w-[min(94vw,90rem)] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl outline-none"
           >
-            <RD.Title className="sr-only">工作台全屏影院阅读</RD.Title>
+            <RD.Title className="sr-only text-ellipsis">工作台全屏影院阅读</RD.Title>
             {fullscreen ? (
               <InspectorPanelContent
                 {...content}

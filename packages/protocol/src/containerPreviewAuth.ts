@@ -1,12 +1,19 @@
 /** Domain-separated Ed25519 assertion for commercial master → container preview. */
 
-import { createHash, createPublicKey, verify as cryptoVerify } from 'node:crypto'
+import {
+  createHash,
+  createPublicKey,
+  sign as cryptoSign,
+  verify as cryptoVerify,
+  type KeyObject,
+} from 'node:crypto'
 
 import {
   CONTAINER_PREVIEW_PROTOCOL_VERSION,
   type ContainerPreviewViewport,
   canonicalContainerPreviewTarget,
 } from './containerPreview.js'
+import { LIVE_BROWSER_PROTOCOL_VERSION } from './liveBrowser.js'
 import { type AuthorityKeyring, type JsonValue, canonicalizePayload } from './modelAuthority.js'
 
 export const CONTAINER_PREVIEW_ASSERTION_KIND = 'container_preview_bridge'
@@ -185,4 +192,158 @@ function safePositiveInteger(value: unknown): value is number {
 
 function safeTimestamp(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+// ---------------------------------------------------------------------------
+// Live Cloud Browser Bridge Assertion (domain-separated from container preview)
+// ---------------------------------------------------------------------------
+
+export const LIVE_BROWSER_ASSERTION_KIND = 'live-browser'
+export const LIVE_BROWSER_ASSERTION_MAX_TTL_MS = 30_000
+const LIVE_BROWSER_ASSERTION_DOMAIN = 'oc-live-browser-bridge-v1'
+const LIVE_BROWSER_AGENT_ID_RE = /^[a-zA-Z0-9._-]{1,64}$/
+
+export interface LiveBrowserBridgeAssertionPayload {
+  readonly v: typeof LIVE_BROWSER_PROTOCOL_VERSION
+  readonly keyId: string
+  readonly uid: number
+  readonly containerId: number
+  readonly agentId: string
+  /** 128-bit lower-case hex, consumed once by the container gateway. */
+  readonly sessionId: string
+  readonly issuedAt: number
+  readonly expiresAt: number
+}
+
+export function liveBrowserAssertionSigningInput(
+  payload: LiveBrowserBridgeAssertionPayload,
+): Buffer {
+  return Buffer.from(
+    `${LIVE_BROWSER_ASSERTION_DOMAIN}\n${canonicalizePayload(payload as unknown as JsonValue)}`,
+    'utf8',
+  )
+}
+
+export function encodeLiveBrowserAssertion(
+  payload: LiveBrowserBridgeAssertionPayload,
+  signature: Uint8Array,
+): string {
+  if (signature.byteLength !== 64) {
+    throw new ContainerPreviewAssertionError('BadShape', 'bad signature length')
+  }
+  const envelope = {
+    v: LIVE_BROWSER_PROTOCOL_VERSION,
+    kind: LIVE_BROWSER_ASSERTION_KIND,
+    payload,
+    sig: Buffer.from(signature).toString('base64url'),
+  }
+  return Buffer.from(canonicalizePayload(envelope as unknown as JsonValue), 'utf8').toString(
+    'base64url',
+  )
+}
+
+export function signLiveBrowserAssertion(
+  payload: LiveBrowserBridgeAssertionPayload,
+  signer: KeyObject | ((signingInput: Buffer) => Uint8Array),
+): string {
+  const validated = parseLiveBrowserPayload(payload)
+  const input = liveBrowserAssertionSigningInput(validated)
+  const signature = typeof signer === 'function' ? signer(input) : cryptoSign(null, input, signer)
+  return encodeLiveBrowserAssertion(validated, signature)
+}
+
+export function verifyLiveBrowserAssertion(
+  envelope: string,
+  keyring: AuthorityKeyring,
+  now: number = Date.now(),
+): LiveBrowserBridgeAssertionPayload {
+  if (typeof envelope !== 'string' || envelope.length < 1 || envelope.length > 4_096) {
+    throw new ContainerPreviewAssertionError('BadShape', 'assertion length invalid')
+  }
+  let decoded: unknown
+  try {
+    decoded = JSON.parse(Buffer.from(envelope, 'base64url').toString('utf8'))
+  } catch {
+    throw new ContainerPreviewAssertionError('BadShape', 'assertion is not valid JSON')
+  }
+  if (!isRecord(decoded) || !hasExactKeys(decoded, ['kind', 'payload', 'sig', 'v'])) {
+    throw new ContainerPreviewAssertionError('BadShape', 'assertion envelope shape invalid')
+  }
+  if (
+    decoded.v !== LIVE_BROWSER_PROTOCOL_VERSION ||
+    decoded.kind !== LIVE_BROWSER_ASSERTION_KIND
+  ) {
+    throw new ContainerPreviewAssertionError('BadShape', 'assertion kind or version invalid')
+  }
+  const payload = parseLiveBrowserPayload(decoded.payload)
+  if (typeof decoded.sig !== 'string' || !/^[A-Za-z0-9_-]{86}$/.test(decoded.sig)) {
+    throw new ContainerPreviewAssertionError('BadShape', 'assertion signature shape invalid')
+  }
+  const signature = Buffer.from(decoded.sig, 'base64url')
+  if (signature.byteLength !== 64) {
+    throw new ContainerPreviewAssertionError('BadShape', 'bad signature length')
+  }
+
+  const publicRaw = keyring.get(payload.keyId)
+  if (!publicRaw) {
+    throw new ContainerPreviewAssertionError('UnknownKey', 'assertion key is not trusted')
+  }
+  if (publicRaw.byteLength !== 32) {
+    throw new ContainerPreviewAssertionError('BadShape', 'bad public key length')
+  }
+  const publicKey = createPublicKey({
+    key: { kty: 'OKP', crv: 'Ed25519', x: Buffer.from(publicRaw).toString('base64url') },
+    format: 'jwk',
+  })
+  if (!cryptoVerify(null, liveBrowserAssertionSigningInput(payload), publicKey, signature)) {
+    throw new ContainerPreviewAssertionError('VerifyFail', 'assertion signature invalid')
+  }
+  if (payload.expiresAt <= now) {
+    throw new ContainerPreviewAssertionError('Expired', 'assertion expired')
+  }
+  if (
+    payload.issuedAt > now + 5_000 ||
+    payload.expiresAt <= payload.issuedAt ||
+    payload.expiresAt - payload.issuedAt > LIVE_BROWSER_ASSERTION_MAX_TTL_MS
+  ) {
+    throw new ContainerPreviewAssertionError('BadShape', 'assertion timestamps invalid')
+  }
+  return payload
+}
+
+function parseLiveBrowserPayload(value: unknown): LiveBrowserBridgeAssertionPayload {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      'agentId',
+      'containerId',
+      'expiresAt',
+      'issuedAt',
+      'keyId',
+      'sessionId',
+      'uid',
+      'v',
+    ])
+  ) {
+    throw new ContainerPreviewAssertionError('BadShape', 'live browser payload shape invalid')
+  }
+  if (value.v !== LIVE_BROWSER_PROTOCOL_VERSION) {
+    throw new ContainerPreviewAssertionError('BadShape', 'live browser payload version invalid')
+  }
+  if (typeof value.keyId !== 'string' || !/^mak1_[0-9a-f]{16}$/.test(value.keyId)) {
+    throw new ContainerPreviewAssertionError('BadShape', 'live browser payload keyId invalid')
+  }
+  if (!safePositiveInteger(value.uid) || !safePositiveInteger(value.containerId)) {
+    throw new ContainerPreviewAssertionError('BadShape', 'live browser payload identity invalid')
+  }
+  if (typeof value.agentId !== 'string' || !LIVE_BROWSER_AGENT_ID_RE.test(value.agentId)) {
+    throw new ContainerPreviewAssertionError('BadShape', 'live browser payload agentId invalid')
+  }
+  if (typeof value.sessionId !== 'string' || !/^[0-9a-f]{32}$/.test(value.sessionId)) {
+    throw new ContainerPreviewAssertionError('BadShape', 'live browser payload sessionId invalid')
+  }
+  if (!safeTimestamp(value.issuedAt) || !safeTimestamp(value.expiresAt)) {
+    throw new ContainerPreviewAssertionError('BadShape', 'live browser payload timestamps invalid')
+  }
+  return value as unknown as LiveBrowserBridgeAssertionPayload
 }

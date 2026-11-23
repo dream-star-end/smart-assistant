@@ -48,7 +48,7 @@ test('SQLite v4 upgrade adds only nullable identities; legacy writes keep workin
     oldWriter.prepare("UPDATE delegate_jobs SET state='running' WHERE job_id='old-before'").run()
     assert.equal(current.get('old-before')?.traceId, traceId)
     assert.equal(current.get('old-before')?.parentTraceId, parentTraceId)
-    assert.equal(oldWriter.pragma('user_version', { simple: true }), 5)
+    assert.equal(oldWriter.pragma('user_version', { simple: true }), 6)
     oldWriter.close()
     current.close()
   } finally {

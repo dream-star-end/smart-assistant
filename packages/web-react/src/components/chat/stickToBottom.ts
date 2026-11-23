@@ -236,3 +236,22 @@ export function createStickToBottomController() {
 }
 
 export type StickToBottomController = ReturnType<typeof createStickToBottomController>;
+
+/**
+ * Controlled one-shot bottom snap for isolated or read-only scrollers outside
+ * the main chat `StickToBottomController`, keeping all programmatic `scrollTop`
+ * writes centralized in this single-writer module.
+ */
+export function snapScrollToBottomOnce(el: HTMLElement | null): void {
+  if (!el) return;
+  el.scrollTop = el.scrollHeight;
+}
+
+/**
+ * Controlled programmatic scroll offset write for isolated sub-scrollers
+ * (e.g. delegate process list, swarm board drawer, quick-ask window).
+ */
+export function scrollContainerTo(el: HTMLElement | null, top: number): void {
+  if (!el) return;
+  el.scrollTop = Number.isFinite(top) ? Math.max(0, top) : 0;
+}

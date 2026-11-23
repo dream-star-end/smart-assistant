@@ -405,10 +405,12 @@ function finiteTs(message: ChatMessage | undefined): number | undefined {
  * moves, so the active turn's live order (OCV5-272) is untouched.
  */
 export function returnStrayRowsToOwnerTurn(messages: ChatMessage[]): ChatMessage[] {
-  if (messages.length < 3) return messages;
+  if (messages.length < 2) return messages;
   const userIds: string[] = [];
   const userTs: Array<number | undefined> = [];
+  const userOrderSeq: Array<number | undefined> = [];
   const turnIndexById = new Map<string, number>();
+  const headExplicitOwners = new Set<string>();
   const turnOf: number[] = new Array(messages.length);
   let turn = -1;
   for (let index = 0; index < messages.length; index++) {
@@ -417,11 +419,20 @@ export function returnStrayRowsToOwnerTurn(messages: ChatMessage[]): ChatMessage
       turn += 1;
       userIds.push(message.id);
       userTs.push(finiteTs(message));
+      const seq = message._orderSeq;
+      userOrderSeq.push(typeof seq === "number" && Number.isSafeInteger(seq) && seq > 0 ? seq : undefined);
       turnIndexById.set(message.id, turn);
+    } else if (turn === -1 && message) {
+      const headOwner = nonEmptyString(message._turnOwnerId)
+        ? message._turnOwnerId
+        : nonEmptyString(message._clientMessageId)
+          ? message._clientMessageId
+          : undefined;
+      if (headOwner) headExplicitOwners.add(headOwner);
     }
     turnOf[index] = turn;
   }
-  if (userIds.length < 2) return messages;
+  if (userIds.length < 1) return messages;
 
   // Users sorted by ts (not array order: cross-device clocks need not be monotonic).
   const byTs = userTs
@@ -443,6 +454,13 @@ export function returnStrayRowsToOwnerTurn(messages: ChatMessage[]): ChatMessage
     }
     return found;
   };
+  const ownerBeforeByOrderSeq = (rowSeq: number, current: number): number | undefined => {
+    for (let uIdx = 0; uIdx <= current; uIdx++) {
+      const uSeq = userOrderSeq[uIdx];
+      if (uSeq !== undefined && rowSeq < uSeq) return uIdx - 1;
+    }
+    return undefined;
+  };
 
   const strays = new Map<number, ChatMessage[]>();
   const moved = new Set<ChatMessage>();
@@ -450,7 +468,7 @@ export function returnStrayRowsToOwnerTurn(messages: ChatMessage[]): ChatMessage
     const message = messages[index];
     if (!message || message.role === "user") continue;
     const current = turnOf[index] ?? -1;
-    if (current <= 0) continue;
+    if (current < 0) continue;
     if (message.role === "permission" && message._resolved !== true) continue;
 
     let owner: number | undefined;
@@ -461,7 +479,19 @@ export function returnStrayRowsToOwnerTurn(messages: ChatMessage[]): ChatMessage
         : undefined;
     if (explicit) {
       owner = turnIndexById.get(explicit);
-    } else if (message.role === "permission") {
+      if (owner === undefined) {
+        // OCV5-868: 分页截断时上一轮 user 已在页外（turn=-1），若该行归属已在页首出现
+        // 或耐久 _orderSeq 严格早于当前 user，仍须归位到该 user 之前。
+        if (headExplicitOwners.has(explicit)) {
+          owner = -1;
+        } else {
+          const rowSeq = message._orderSeq;
+          if (typeof rowSeq === "number" && Number.isSafeInteger(rowSeq) && rowSeq > 0) {
+            owner = ownerBeforeByOrderSeq(rowSeq, current);
+          }
+        }
+      }
+    } else if (message.role === "permission" && current > 0) {
       const ts = finiteTs(message);
       const sitsUnder = userTs[current];
       if (ts === undefined || sitsUnder === undefined || ts >= sitsUnder - STRAY_TS_MARGIN_MS) continue;

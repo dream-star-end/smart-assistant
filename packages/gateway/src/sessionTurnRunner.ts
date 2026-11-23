@@ -240,7 +240,13 @@ function combineRetryAssistantOutput(
   }
 }
 
-const TRANSIENT_RETRY_ERROR_CODES = new Set(['rate_limited', 'model_capacity', 'upstream_failed'])
+const TRANSIENT_RETRY_ERROR_CODES = new Set([
+  'rate_limited',
+  'model_capacity',
+  'upstream_failed',
+  'upstream_timeout',
+  'network_error',
+])
 
 function safeUsageCounter(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined
@@ -440,7 +446,7 @@ export async function _runOneTurn(
   retryTools: TurnToolEntry[] = [],
   retryStructuredBlocks: Array<Record<string, unknown>> = [],
   queueTurn = false,
-  retryAuthErrors = true,
+  _retryAuthErrors = false,
   retryPhantomErrors = true,
   retryTransientErrors = false,
   attemptOrdinal = 0,
@@ -1510,18 +1516,6 @@ export async function _runOneTurn(
         session._historicalContextInjectedKey = undefined
       }
 
-      // Detect auth error — roll back counters and reject. 分类逻辑(isError +
-      // 关键字宽匹配 / CCB 精确错误前缀)已下沉 CcbAdapter(底座私有知识),
-      // 本层只消费 errorKind === 'auth'。
-      if (result?.errorKind === 'auth' && retryAuthErrors) {
-        retryRuntimeEvents.push(...result.runtimeEvents.map((event) => structuredClone(event)))
-        session.totalCostUSD = prevCostUSD
-        session.turns = prevTurns
-        session._lastCcbCumulativeCost = prevLastCcbCost
-        settle(() => reject(new Error('AUTH_ERROR: Token expired or invalid')))
-        return
-      }
-
       const transientErrorClass = terminalResultErrorClass
       const contextOverflowHasUsage =
         result !== null &&
@@ -1897,7 +1891,7 @@ export async function _runOneTurn(
       // Update session accumulators from turn result
       if (result) {
         const persistedResultStatus = terminalOverride?.status
-          ?? (result.isError || result.errorDetail !== undefined ? 'crashed' : 'completed')
+          ?? (result.isError || result.errorDetail !== undefined || result.errorKind === 'auth' ? 'crashed' : 'completed')
         terminalPersistenceClaim = 'complete'
         flushTerminalBilling()
         const completedAssistantRaw = normalizeAssistantOutputUiFences(
@@ -2103,7 +2097,10 @@ export async function _runOneTurn(
         }
         const completedHasRuntimeEvents = completedRuntimeEvents.length > 0
         const completedHasError =
-          terminalOverride !== null || result.isError || result.errorDetail !== undefined
+          terminalOverride !== null ||
+          result.isError ||
+          result.errorDetail !== undefined ||
+          result.errorKind === 'auth'
         if (completedHasError) {
           terminalErrorForClient =
             terminalOverride?.reason ?? result.errorDetail ?? pendingAttemptError?.error ?? 'engine reported an error'
@@ -2255,10 +2252,10 @@ export async function _runOneTurn(
         // Unified turn-usage emit (eventPersist writes usage_log).
         recordTurnUsage(
           mapTurnTerminalStatus({
-            persistStatus: terminalOverride?.status,
-            errorCode: terminalOverride?.errorCode,
+            persistStatus: terminalOverride?.status ?? (result.errorKind === 'auth' ? 'crashed' : undefined),
+            errorCode: terminalOverride?.errorCode ?? (result.errorKind === 'auth' ? 'AUTH_ERROR' : undefined),
             hasResult: true,
-            resultIsError: terminalOverride !== null || result.isError,
+            resultIsError: completedHasError,
           }),
           {
             inputTokens: result.usage.inputTokens,
@@ -2848,7 +2845,7 @@ export async function runOneTurnWithRetry(
         retryTools,
         retryStructuredBlocks,
         queueLifecycle?.queueTurn === true,
-        canRetry(),
+        false,
         !phantomRetryUsed,
         canRetry(),
         attemptOrdinal,

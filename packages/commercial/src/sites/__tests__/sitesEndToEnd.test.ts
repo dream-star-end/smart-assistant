@@ -1018,6 +1018,7 @@ describe('sites hosting end-to-end (edge + master + oc-site CLI)', () => {
           await dispatchSitesBrowserRoute(req, res, ctx, {
             jwtSecret: JWT_SECRET,
             sites: service,
+            verifyActiveAccount: async () => true,
           })
           return
         }
@@ -1989,6 +1990,7 @@ describe('fullstack sites: /api/* worker, SQLite, encrypted env, analytics, rena
           await dispatchSitesBrowserRoute(req, res, ctx, {
             jwtSecret: JWT_SECRET,
             sites: service,
+            verifyActiveAccount: async () => true,
           })
           return
         }
@@ -2847,6 +2849,7 @@ export default async function handler(req, ctx) {
               jwtSecret: JWT_SECRET,
               sites: cService,
               verifyEmailUrlBase: 'https://app.congjianai.com',
+              verifyActiveAccount: async () => true,
             },
           )
           return

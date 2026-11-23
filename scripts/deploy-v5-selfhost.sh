@@ -95,9 +95,9 @@ REDIS_URL="redis://127.0.0.1:6379/3"
 # agy134 (OCV5-415) = patch of the v5-cli-cc2280-codex01592-grok1013-zcode381-slim image that adds the official
 # Antigravity CLI 1.3.4 (same RUN block as Dockerfile.openclaude-runtime, sha512-pinned);
 # the previous tag stays for rollback.
-# cc2325/codex01700/grok1077/zcode3153/agy158 (OCV5-798) = Claude Code 2.1.325, Codex 0.170.0,
-# Grok 1.0.77, ZCode 3.15.3 (CLI 0.16.9), Antigravity 1.5.8 and Cursor Agent 2026.10.16-e3cb207; previous agy150 tag stays for rollback.
-RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-cc2325-codex01700-grok1077-zcode3153-agy158-slim"
+# cc2325/codex01710/grok1077/zcode3153/agy1515-chrome (OCV5-860) = Codex 0.171.0 + Antigravity CLI 1.5.15 +
+# official Google Chrome Stable 158, openbox WM, Xvfb, and en_US/zh_CN UTF-8 locales; previous agy158-chrome-slim / agy158-slim tags stay for rollback.
+RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-cc2325-codex01710-grok1077-zcode3153-agy1515-chrome-slim"
 SECRETS_ENV="/etc/openclaude/secrets.env"
 PERSONAL_UNIT="openclaude.service"
 PERSONAL_PORT="18789"
@@ -2106,7 +2106,7 @@ cmd_deploy() {
   fi
   tsum_init 2>/dev/null || :
   log "══ v5 selfhost --deploy(不可变 master + 容器制品 + joint 翻转) ══"
-  log "流程: 构建 master release(staging vite) → runtime-release → platform bundle"
+  log "流程: 构建 master release(Wave 1/2 治理快门 + staging vite) → runtime-release → platform bundle"
   log "      → 复用 --cutover 同一套状态机翻转(survivor / 两级回滚 / 候选 snapshot unit)"
   log "      前端不再吃工作树;masterRelease/transitionKind 记新 live rel-*"
   preflight_common

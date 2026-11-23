@@ -152,16 +152,49 @@ export interface ImRemoteControlDeps {
   now?: () => number
   maxPendingList?: number
   maxSessionsList?: number
+  sessionSnapshotTtlMs?: number
+  maxSessionSnapshots?: number
 }
+
+const DEFAULT_SESSION_SNAPSHOT_TTL_MS = 30 * 60_000
+const DEFAULT_MAX_SESSION_SNAPSHOTS = 1000
 
 export function createImRemoteControlHandler(deps: ImRemoteControlDeps): ImRemoteControlHandler {
   const shortCodes = deps.shortCodes ?? new ShortCodeRegistry({ now: deps.now })
   const now = deps.now ?? (() => Date.now())
   const maxPendingList = deps.maxPendingList ?? 10
   const maxSessionsList = deps.maxSessionsList ?? 10
+  const sessionSnapshotTtlMs = Math.max(1000, deps.sessionSnapshotTtlMs ?? DEFAULT_SESSION_SNAPSHOT_TTL_MS)
+  const maxSessionSnapshots = Math.max(1, deps.maxSessionSnapshots ?? DEFAULT_MAX_SESSION_SNAPSHOTS)
 
-  // Per-user snapshot of the last `/sessions` listing so `/switch <n>` resolves deterministically.
-  const recentSessionSnapshot = new Map<string, ImSessionSummary[]>()
+  // Bounded TTL per-user snapshot of the last `/sessions` listing so `/switch <n>` stays fresh & bounded.
+  const recentSessionSnapshot = new Map<string, { sessions: ImSessionSummary[]; updatedAt: number }>()
+
+  function getFreshSessionSnapshot(uid: string): ImSessionSummary[] | undefined {
+    const entry = recentSessionSnapshot.get(uid)
+    if (!entry) return undefined
+    if (now() - entry.updatedAt > sessionSnapshotTtlMs) {
+      recentSessionSnapshot.delete(uid)
+      return undefined
+    }
+    return entry.sessions
+  }
+
+  function putSessionSnapshot(uid: string, sessions: ImSessionSummary[]): void {
+    const nowMs = now()
+    for (const [k, v] of recentSessionSnapshot) {
+      if (nowMs - v.updatedAt > sessionSnapshotTtlMs) {
+        recentSessionSnapshot.delete(k)
+      }
+    }
+    recentSessionSnapshot.delete(uid)
+    while (recentSessionSnapshot.size >= maxSessionSnapshots) {
+      const oldest = recentSessionSnapshot.keys().next()
+      if (oldest.done) break
+      recentSessionSnapshot.delete(oldest.value)
+    }
+    recentSessionSnapshot.set(uid, { sessions, updatedAt: nowMs })
+  }
 
   function formatResolveError(err: unknown, code: string): string {
     if (err instanceof PendingDecisionError) {
@@ -312,7 +345,7 @@ export function createImRemoteControlHandler(deps: ImRemoteControlDeps): ImRemot
           recentSessionSnapshot.delete(uid)
           return '当前还没有可切换的历史会话，直接发消息即可开启新会话。'
         }
-        recentSessionSnapshot.set(uid, sessions)
+        putSessionSnapshot(uid, sessions)
         const lines = [
           `最近会话（${label}）：`,
           ...sessions.map((s, idx) => {
@@ -333,17 +366,22 @@ export function createImRemoteControlHandler(deps: ImRemoteControlDeps): ImRemot
         if (!parsed.target) {
           return '用法：/switch <序号>\n先发送 /sessions 查看会话编号。'
         }
-        let sessions = recentSessionSnapshot.get(uid)
+        const isNumericIndex = /^\d+$/.test(parsed.target)
+        let sessions = getFreshSessionSnapshot(uid)
+        if (isNumericIndex && (!sessions || sessions.length === 0)) {
+          return '当前会话编号列表已过期或尚未加载，请先发送 /sessions 查看最新编号后再使用 /switch <序号> 切换。'
+        }
         if (!sessions || sessions.length === 0) {
+          // Non-numeric explicit sessionId lookup: fetch fresh list for ID matching without
+          // mutating recentSessionSnapshot (which must only reflect a /sessions list the user saw).
           sessions = await deps.sessions.listSessions(uid, maxSessionsList)
-          recentSessionSnapshot.set(uid, sessions)
         }
         if (sessions.length === 0) {
           return '当前没有可切换的会话，请先发送 /sessions 查看。'
         }
 
         let targetSession: ImSessionSummary | undefined
-        if (/^\d+$/.test(parsed.target)) {
+        if (isNumericIndex) {
           const index = Number(parsed.target) - 1
           if (index >= 0 && index < sessions.length) {
             targetSession = sessions[index]

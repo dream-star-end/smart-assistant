@@ -194,7 +194,10 @@ describe('Wave 4A Group 1: Pending Decisions router wiring + bootstrap runtime',
             rowCount: 1,
           }
         }
-        if (sql.includes('FROM turn_permission_requests') && sql.includes('WHERE request_id = $1')) {
+        if (
+          sql.includes('FROM turn_permission_requests') &&
+          (sql.includes('WHERE user_id = $1 AND request_id = $2') || sql.includes('WHERE request_id = $1'))
+        ) {
           return {
             rows: [
               {

@@ -24,6 +24,7 @@ import {
   isNeedsOcr,
   mintDocument,
 } from "./ingest.js";
+import { isPdfLike } from "./externalExtract.js";
 import {
   type QueryOpts,
   type SemanticQueryDeps,
@@ -54,7 +55,12 @@ export interface IngestDeps {
   /** 本地抽取注入(测试用 pdfImpl)。 */
   extract?: ExtractDeps;
   /** 外部引擎(mineru/mistral)抽取;config engine != local 时调用。返回 ExtractResult。 */
-  externalExtract?: (bytes: Buffer, mime: string, engine: "mineru" | "mistral") => Promise<ExtractResult>;
+  externalExtract?: (
+    bytes: Buffer,
+    mime: string,
+    engine: "mineru" | "mistral",
+    filename?: string,
+  ) => Promise<ExtractResult>;
 }
 
 export interface IngestInput {
@@ -77,8 +83,34 @@ export async function ingestBlob(input: IngestInput, deps: IngestDeps): Promise<
   const mime = blob.mime ?? "";
 
   let extracted: ExtractResult;
-  if ((input.engine === "mineru" || input.engine === "mistral") && deps.externalExtract) {
-    extracted = await deps.externalExtract(bytes, mime, input.engine);
+  const shouldTryExternal =
+    Boolean(deps.externalExtract) &&
+    input.engine !== "local" &&
+    isPdfLike(bytes, mime, input.filename);
+
+  if (shouldTryExternal && deps.externalExtract) {
+    const extEngine: "mineru" | "mistral" = input.engine === "mistral" ? "mistral" : "mineru";
+    let externalFailure: string | undefined;
+    try {
+      const extResult = await deps.externalExtract(bytes, mime, extEngine, input.filename);
+      if (!isNeedsOcr(extResult) && extResult.text.trim().length > 0) {
+        extracted = extResult;
+      } else {
+        externalFailure = isNeedsOcr(extResult)
+          ? extResult.reason
+          : `external ${extEngine} returned empty text`;
+        extracted = await extractLocal(bytes, mime, input.filename, deps.extract ?? {});
+      }
+    } catch (err) {
+      externalFailure = `external ${extEngine} error: ${err instanceof Error ? err.message : String(err)}`;
+      extracted = await extractLocal(bytes, mime, input.filename, deps.extract ?? {});
+    }
+    if (isNeedsOcr(extracted) && externalFailure) {
+      extracted = {
+        needsOcr: true,
+        reason: `${externalFailure}; local fallback: ${extracted.reason}`,
+      };
+    }
   } else {
     extracted = await extractLocal(bytes, mime, input.filename, deps.extract ?? {});
   }
@@ -248,6 +280,8 @@ export interface FetchIntoLibraryDeps {
   addMembership?: (userId: string, docId: string, projectId: string) => Promise<void>;
   /** 透传 ingest 抽取注入(测试)。 */
   extract?: ExtractDeps;
+  /** 外部 PDF 抽取器(MinerU / Mistral / HTTP)。 */
+  externalExtract?: IngestDeps["externalExtract"];
 }
 
 async function recordAttempts(
@@ -320,6 +354,7 @@ export async function fetchRecordIntoLibrary(
           readBlobBytes: deps.readBlobBytes,
           putDocument: deps.putDocument,
           extract: deps.extract,
+          externalExtract: deps.externalExtract,
         },
       )
     : null;

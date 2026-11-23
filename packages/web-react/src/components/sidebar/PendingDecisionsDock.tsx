@@ -9,6 +9,10 @@
  *     改为展示「直达处理」直接跳至目标会话或云浏览器接管视口。
  */
 import {
+  type BrowserHandoffResumeWhen,
+  normalizeBrowserHandoffResumeWhen,
+} from "@openclaude/protocol/browser";
+import {
   ArrowUpRight,
   Check,
   ChevronRight,
@@ -18,6 +22,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useOptionalAuth } from "../../hooks/useProjectScope";
+import { apiErrorMessage } from "../../lib/api";
 import { ApiError } from "../../lib/api/http";
 import {
   PENDING_DECISION_SOURCE_LABELS,
@@ -73,6 +78,14 @@ export function resolveTaskboardTicketRef(item: PendingDecisionItem): string | n
   return stripped || null;
 }
 
+export type PendingDecisionBrowserHandoffOpenOpts = {
+  url?: string;
+  sessionId?: string | null;
+  handoffId?: string;
+  continuePrompt?: string;
+  resumeWhen?: BrowserHandoffResumeWhen;
+};
+
 export type PendingDecisionsDockProps = {
   auth?: AuthSession | null;
   socketVersion?: number;
@@ -80,7 +93,7 @@ export type PendingDecisionsDockProps = {
   sessionNeedsYouItems?: readonly LiveActivityItem[];
   onSelectSession?: (sessionId: string) => void;
   onOpenBoard?: (ticketRef?: string) => void;
-  onOpenLiveBrowser?: (opts?: { url?: string; sessionId?: string | null }) => void;
+  onOpenLiveBrowser?: (opts?: PendingDecisionBrowserHandoffOpenOpts) => void;
   /** 测试或外部控制轮询间隔（默认 30s；传 0 禁用定时轮询）。 */
   pollIntervalMs?: number;
   defaultCollapsed?: boolean;
@@ -133,7 +146,7 @@ export function PendingDecisionsDock({
   const [sourceFilter, setSourceFilter] = useState<PendingDecisionSource | "all">("all");
   const [showAll, setShowAll] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [resolvingId, setResolvingId] = useState<string | null>(null);
+  const [resolving, setResolving] = useState<{ id: string; action: PendingDecisionAction } | null>(null);
   const [conflictNotice, setConflictNotice] = useState<string | null>(null);
   const mountedRef = useRef(true);
   const lastFetchAtRef = useRef(0);
@@ -270,8 +283,8 @@ export function PendingDecisionsDock({
   const hiddenCount = filteredItems.length - visibleItems.length;
 
   const handleResolve = async (item: PendingDecisionItem, decision: PendingDecisionAction) => {
-    if (!auth || resolvingId) return;
-    setResolvingId(item.id);
+    if (!auth || resolving) return;
+    setResolving({ id: item.id, action: decision });
     setConflictNotice(null);
     try {
       const res = await resolvePendingDecision(auth, item.id, {
@@ -294,19 +307,36 @@ export function PendingDecisionsDock({
         toast(msg, "info");
         void fetchItems({ silent: false });
       } else {
-        toast(err instanceof Error ? err.message : "提交决策失败，请稍后重试", "error");
+        toast(apiErrorMessage(err, "提交决策失败，请稍后重试"), "error");
       }
     } finally {
-      if (mountedRef.current) setResolvingId(null);
+      if (mountedRef.current) setResolving(null);
     }
   };
 
   const handleDirectGoto = (item: PendingDecisionItem) => {
     if (item.source === "browser_handoff") {
       const url = typeof item.metadata?.url === "string" ? item.metadata.url : undefined;
+      const handoffId = item.sourceId?.trim() || undefined;
+      const rawPrompt =
+        typeof item.metadata?.continuePrompt === "string"
+          ? item.metadata.continuePrompt
+          : typeof item.metadata?.continue_prompt === "string"
+            ? item.metadata.continue_prompt
+            : undefined;
+      const continuePrompt = rawPrompt?.trim() || undefined;
+      const resumeWhen = normalizeBrowserHandoffResumeWhen(
+        item.metadata?.resumeWhen ?? item.metadata?.resume_when,
+      );
       if (item.sessionId && onSelectSession) onSelectSession(item.sessionId);
       if (onOpenLiveBrowser) {
-        onOpenLiveBrowser({ url, sessionId: item.sessionId });
+        onOpenLiveBrowser({
+          url,
+          sessionId: item.sessionId,
+          ...(handoffId ? { handoffId } : {}),
+          ...(continuePrompt ? { continuePrompt } : {}),
+          ...(resumeWhen ? { resumeWhen } : {}),
+        });
         return;
       }
     }
@@ -339,7 +369,7 @@ export function PendingDecisionsDock({
           aria-expanded={!collapsed}
           title={toggleTitle}
           onClick={handleToggleCollapsed}
-          className="oc-pd-title-btn"
+          className="oc-pd-title-btn flex min-w-0 flex-1 items-center gap-1.5 max-sm:min-h-11 [@media(hover:none)]:min-h-11"
         >
           <span className="oc-pd-icon" aria-hidden>
             <AtelierIcon name="shield" size={13} />
@@ -392,7 +422,7 @@ export function PendingDecisionsDock({
                 type="button"
                 aria-pressed={effectiveFilter === "all"}
                 onClick={() => setSourceFilter("all")}
-                className="oc-pd-filter-pill"
+                className="oc-pd-filter-pill inline-flex shrink-0 items-center max-sm:min-h-11 max-sm:min-w-11 [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11"
               >
                 全部 {mergedItems.length}
               </button>
@@ -402,7 +432,7 @@ export function PendingDecisionsDock({
                   type="button"
                   aria-pressed={effectiveFilter === src}
                   onClick={() => setSourceFilter(effectiveFilter === src ? "all" : src)}
-                  className="oc-pd-filter-pill"
+                  className="oc-pd-filter-pill inline-flex shrink-0 items-center max-sm:min-h-11 max-sm:min-w-11 [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11"
                 >
                   {sourceIcon(src)}
                   <span>{PENDING_DECISION_SOURCE_LABELS[src]}</span>
@@ -422,7 +452,10 @@ export function PendingDecisionsDock({
             {visibleItems.map((item) => {
               const interactiveOnly =
                 isInteractiveOnlyDecision(item) || !item.allowedActions.includes("approve");
-              const busy = resolvingId === item.id;
+              const busy = resolving?.id === item.id;
+              const approving = busy && resolving?.action === "approve";
+              const denying = busy && resolving?.action === "deny";
+              const anyResolving = Boolean(resolving);
               const canDeny = item.allowedActions.includes("deny");
               const canGoto =
                 (item.source === "taskboard" && Boolean(onOpenBoard)) ||
@@ -463,7 +496,7 @@ export function PendingDecisionsDock({
                         {item.title}
                       </div>
                       {item.summary && (
-                        <p className="line-clamp-2 text-micro leading-relaxed text-muted">
+                        <p className="line-clamp-2 text-caption leading-relaxed text-muted">
                           {item.summary}
                         </p>
                       )}
@@ -474,7 +507,7 @@ export function PendingDecisionsDock({
                         {item.title}
                       </div>
                       {item.summary && (
-                        <p className="line-clamp-2 text-micro leading-relaxed text-muted" title={item.summary}>
+                        <p className="line-clamp-2 text-caption leading-relaxed text-muted" title={item.summary}>
                           {item.summary}
                         </p>
                       )}
@@ -484,29 +517,35 @@ export function PendingDecisionsDock({
                   <div className="oc-pd-actions">
                     {interactiveOnly ? (
                       <>
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="accent"
-                          disabled={busy}
-                          data-testid="pending-decision-goto"
-                          onClick={() => handleDirectGoto(item)}
-                          className="oc-spring-press h-7 flex-1 gap-1 px-2 text-caption [@media(hover:none)]:h-11 [@media(hover:none)]:min-h-11"
-                        >
-                          <ArrowUpRight size={12} aria-hidden />
-                          {gotoLabel}
-                        </Button>
+                        {canGoto ? (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="accent"
+                            disabled={busy}
+                            data-testid="pending-decision-goto"
+                            onClick={() => handleDirectGoto(item)}
+                            className="oc-spring-press h-7 flex-1 gap-1 px-2 text-caption [@media(hover:none)]:h-11 [@media(hover:none)]:min-h-11"
+                          >
+                            <ArrowUpRight size={12} aria-hidden />
+                            {gotoLabel}
+                          </Button>
+                        ) : (
+                          <span className="flex-1 text-caption text-faint">
+                            请前往对应会话或终端处理
+                          </span>
+                        )}
                         {canDeny && (
                           <Button
                             type="button"
                             size="sm"
                             variant="ghost"
-                            disabled={busy || Boolean(resolvingId)}
+                            disabled={busy || anyResolving}
                             data-testid="pending-decision-deny"
                             onClick={() => void handleResolve(item, "deny")}
                             className="oc-spring-press h-7 px-2 text-caption text-muted [@media(hover:none)]:h-11 [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
                           >
-                            {busy ? <Spinner size={11} /> : <X size={12} aria-hidden />}
+                            {denying ? <Spinner size={11} /> : <X size={12} aria-hidden />}
                             拒绝
                           </Button>
                         )}
@@ -517,12 +556,12 @@ export function PendingDecisionsDock({
                           type="button"
                           size="sm"
                           variant="accent"
-                          disabled={busy || Boolean(resolvingId)}
+                          disabled={busy || anyResolving}
                           data-testid="pending-decision-approve"
                           onClick={() => void handleResolve(item, "approve")}
                           className="oc-spring-press h-7 flex-1 gap-1 px-2 text-caption [@media(hover:none)]:h-11 [@media(hover:none)]:min-h-11"
                         >
-                          {busy ? <Spinner size={11} /> : <Check size={12} aria-hidden />}
+                          {approving ? <Spinner size={11} /> : <Check size={12} aria-hidden />}
                           批准
                         </Button>
                         {canDeny && (
@@ -530,16 +569,16 @@ export function PendingDecisionsDock({
                             type="button"
                             size="sm"
                             variant="secondary"
-                            disabled={busy || Boolean(resolvingId)}
+                            disabled={busy || anyResolving}
                             data-testid="pending-decision-deny"
                             onClick={() => void handleResolve(item, "deny")}
                             className="oc-spring-press h-7 flex-1 gap-1 px-2 text-caption [@media(hover:none)]:h-11 [@media(hover:none)]:min-h-11"
                           >
-                            <X size={12} aria-hidden />
+                            {denying ? <Spinner size={11} /> : <X size={12} aria-hidden />}
                             拒绝
                           </Button>
                         )}
-                        {(item.sessionId || item.source === "taskboard") && (
+                        {canGoto && (
                           <IconButton
                             size="sm"
                             shape="square"
@@ -563,7 +602,7 @@ export function PendingDecisionsDock({
               <button
                 type="button"
                 onClick={() => setShowAll(true)}
-                className="oc-live-strip-more"
+                className="oc-live-strip-more flex w-full items-center max-sm:min-h-11 [@media(hover:none)]:min-h-11"
                 data-testid="pending-decisions-show-more"
               >
                 展开其余 {hiddenCount} 条待拍板
@@ -573,7 +612,7 @@ export function PendingDecisionsDock({
               <button
                 type="button"
                 onClick={() => setShowAll(false)}
-                className="oc-live-strip-more"
+                className="oc-live-strip-more flex w-full items-center max-sm:min-h-11 [@media(hover:none)]:min-h-11"
               >
                 收起部分待拍板
               </button>

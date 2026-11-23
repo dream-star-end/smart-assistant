@@ -65,12 +65,15 @@ function makeFakePool(state: { perms: FakePermRow[]; ledger: FakeLedgerRow[] }) 
         )
         return { rows, rowCount: rows.length }
       }
+      if (sql.includes('FROM turn_permission_requests') && sql.includes('WHERE user_id = $1 AND request_id = $2')) {
+        const uid = String(params[0])
+        const reqId = String(params[1])
+        const matches = state.perms.filter((r) => r.user_id === uid && r.request_id === reqId)
+        return { rows: matches.slice(0, 1), rowCount: matches.length > 0 ? 1 : 0 }
+      }
       if (sql.includes('FROM turn_permission_requests') && sql.includes('WHERE request_id = $1')) {
         const reqId = String(params[0])
-        const uid = String(params[1])
-        const matches = state.perms
-          .filter((r) => r.request_id === reqId)
-          .sort((a, b) => Number(b.user_id === uid) - Number(a.user_id === uid))
+        const matches = state.perms.filter((r) => r.request_id === reqId)
         return { rows: matches.slice(0, 1), rowCount: matches.length > 0 ? 1 : 0 }
       }
       if (sql.includes('FROM connector_write_ledger') && sql.includes("status = 'pending'")) {

@@ -73,4 +73,26 @@ describe('normalizeSkillSaveArgs', () => {
     const missing = normalizeSkillSaveArgs(null)
     assert.equal(missing.ok, false)
   })
+
+  it('OCV5-865: preserves optional version and related_skills and rejects non-string version', () => {
+    const ok = normalizeSkillSaveArgs({
+      name: 'research-pipeline',
+      description: 'desc',
+      body: '# body',
+      version: ' 1.2.3 ',
+      related_skills: 'oc-cite, oc-docx',
+    })
+    assert.equal(ok.ok, true)
+    if (ok.ok) {
+      assert.equal(ok.args.version, '1.2.3')
+      assert.deepEqual(ok.args.related_skills, ['oc-cite', 'oc-docx'])
+    }
+    const bad = normalizeSkillSaveArgs({
+      name: 'research-pipeline',
+      description: 'desc',
+      body: '# body',
+      version: 123,
+    })
+    assert.equal(bad.ok, false)
+  })
 })

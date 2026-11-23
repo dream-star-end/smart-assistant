@@ -12,8 +12,7 @@
  * exposed as getters). Equivalence with the original chain: __tests__/httpRouteTables.test.ts.
  */
 import { randomBytes } from 'node:crypto'
-import { existsSync, readFileSync, readdirSync } from 'node:fs'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { join } from 'node:path'
 import { type AgentsConfig, paths } from '@openclaude/storage'
@@ -60,13 +59,13 @@ export const WORKSPACE_API_ROUTES: readonly HttpRoute<WorkspaceApiRoutesIo>[] = 
     (req, url) => url.pathname === '/api/changelog' && req.method === 'GET',
     (io, _req, res, _url) => {
       const changelogPath = join(paths.home, 'changelog.json')
-      try {
-        const raw = readFileSync(changelogPath, 'utf-8')
-        const data = JSON.parse(raw)
-        io.sendJson(res, 200, data)
-      } catch {
-        io.sendJson(res, 200, { currentVersion: '0.0.0', releases: [] })
-      }
+      readFile(changelogPath, 'utf-8')
+        .then((raw) => {
+          io.sendJson(res, 200, JSON.parse(raw))
+        })
+        .catch(() => {
+          io.sendJson(res, 200, { currentVersion: '0.0.0', releases: [] })
+        })
       return true
     },
   ),
@@ -113,27 +112,27 @@ export const WORKSPACE_API_ROUTES: readonly HttpRoute<WorkspaceApiRoutesIo>[] = 
     (io, req, res, _url) => {
       const feedbackDir = join(paths.home, 'feedback')
       const userId = io.getUserId(req)
-      try {
-        const files = existsSync(feedbackDir)
-          ? readdirSync(feedbackDir)
-              .filter((f) => f.endsWith('.json'))
-              .sort()
-              .reverse()
-          : []
-        const items: unknown[] = []
-        for (const f of files) {
-          if (items.length >= 50) break
-          try {
-            const entry = JSON.parse(readFileSync(join(feedbackDir, f), 'utf-8'))
-            if (entry && entry.userId === userId) items.push(entry)
-          } catch {
-            /* skip corrupt files */
+      void (async () => {
+        try {
+          const files = (await readdir(feedbackDir))
+            .filter((f) => f.endsWith('.json'))
+            .sort()
+            .reverse()
+          const items: unknown[] = []
+          for (const f of files) {
+            if (items.length >= 50) break
+            try {
+              const entry = JSON.parse(await readFile(join(feedbackDir, f), 'utf-8'))
+              if (entry && entry.userId === userId) items.push(entry)
+            } catch {
+              /* skip corrupt files */
+            }
           }
+          io.sendJson(res, 200, { feedback: items })
+        } catch {
+          io.sendJson(res, 200, { feedback: [] })
         }
-        io.sendJson(res, 200, { feedback: items })
-      } catch {
-        io.sendJson(res, 200, { feedback: [] })
-      }
+      })()
       return true
     },
   ),

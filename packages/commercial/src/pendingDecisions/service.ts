@@ -17,11 +17,14 @@ import {
   type ResolvePendingDecisionRequest,
   type ResolvePendingDecisionResponse,
 } from '@openclaude/protocol'
+import { rootLogger } from '../logging/logger.js'
 import {
   PendingDecisionError,
   type PendingDecisionLifecycleHooks,
   type PendingDecisionSourceAdapter,
 } from './types.js'
+
+const log = rootLogger.child({ module: 'pending-decisions.service' })
 
 const RISK_ORDER: Record<PendingDecisionItem['riskLevel'], number> = {
   critical: 4,
@@ -99,10 +102,17 @@ export function createPendingDecisionsService(
             // can never leak another user's pending decisions.
             return rows.filter((item) => item.userId === uid)
           } catch (err) {
+            const code = err instanceof PendingDecisionError ? err.code : 'SOURCE_UNAVAILABLE'
+            log.warn('pending-decisions: source listPending degraded', {
+              source,
+              userId: uid,
+              code,
+              err,
+            })
             warnings.push({
               source,
-              code: err instanceof PendingDecisionError ? err.code : 'SOURCE_UNAVAILABLE',
-              message: err instanceof Error ? err.message : String(err),
+              code,
+              message: '该来源暂时不可用，请稍后重试',
             })
             return [] as PendingDecisionItem[]
           }
@@ -159,8 +169,13 @@ export function createPendingDecisionsService(
         for (const listener of resolvedListeners) {
           try {
             await listener(result, uid)
-          } catch {
+          } catch (err) {
             // Listener failure must never roll back or mask an already-committed resolution.
+            log.warn('pending-decisions: onResolved listener failed', {
+              decisionId: result.id,
+              userId: uid,
+              err,
+            })
           }
         }
       }
@@ -171,8 +186,13 @@ export function createPendingDecisionsService(
       for (const listener of createdListeners) {
         try {
           await listener(item)
-        } catch {
+        } catch (err) {
           // Best-effort notification fan-out.
+          log.warn('pending-decisions: onCreated listener failed', {
+            decisionId: item.id,
+            userId: item.userId,
+            err,
+          })
         }
       }
     },

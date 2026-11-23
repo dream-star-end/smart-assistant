@@ -220,7 +220,7 @@ describe("researchProxy: routes", () => {
     assert.equal(captured.statusCode, 400);
   });
 
-  it("cite/format → 200 {verdict.formatted}", async () => {
+  it("cite/format → 200 {verdict.formatted} 支持 gb-t-7714/ieee/nature 与防伪造 evidenceGrade A/B (OCV5-865 #7)", async () => {
     const { res, captured } = makeRes();
     await handler([crossrefWork])(
       makeReq("POST", "/v3/research/cite/format", { identifier: "10.1234/x", style: "gb-t-7714-2015" }),
@@ -229,5 +229,93 @@ describe("researchProxy: routes", () => {
     );
     assert.equal(captured.statusCode, 200);
     assert.ok(captured.body.verdict.formatted.includes("[J]"));
+    assert.equal(captured.body.verdict.evidenceGrade, "B");
+
+    // 1. 自报 evidenceGrade:'A' 或伪造不存在的 docId/spanId 不得提权 → 仍判 'B'
+    const spoofRes = makeRes();
+    await handler([crossrefWork])(
+      makeReq("POST", "/v3/research/cite/format", {
+        identifier: "10.1234/x",
+        style: "ieee",
+        evidenceGrade: "A",
+        docId: "doc:nonexistent",
+        spanId: "s0",
+      }),
+      spoofRes.res,
+      ctx,
+    );
+    assert.equal(spoofRes.captured.statusCode, 200);
+    assert.ok(spoofRes.captured.body.verdict.formatted.includes('"T,"'));
+    assert.equal(spoofRes.captured.body.verdict.evidenceGrade, "B");
+
+    // 2. 真实归属当前用户(user_id=42)且关联该 DOI 的本地全文 docId + spanId → 权威 'A'
+    const boundDocHandler = makeResearchProxyHandler({
+      identityRepo: passingRepo(),
+      readConfig: enabledCfg(),
+      readSecrets: async () => ({}),
+      fetchImpl: mockFetch([crossrefWork]),
+      store: {
+        getDocument: async (uid, docId) =>
+          uid === 42 && docId === "doc:bound-1"
+            ? {
+                docId: "doc:bound-1",
+                contentSha256: "abc",
+                lang: "en",
+                title: "T",
+                spans: [{ spanId: "s0", sectionPath: ["Intro"], charStart: 0, charEnd: 40, text: "Full text referencing 10.1234/x." }],
+                references: [],
+              }
+            : null,
+      },
+    });
+    const verifiedRes = makeRes();
+    await boundDocHandler(
+      makeReq("POST", "/v3/research/cite/format", {
+        identifier: "10.1234/x",
+        style: "ieee",
+        docId: "doc:bound-1",
+        spanId: "s0",
+      }),
+      verifiedRes.res,
+      ctx,
+    );
+    assert.equal(verifiedRes.captured.statusCode, 200);
+    assert.equal(verifiedRes.captured.body.verdict.evidenceGrade, "A");
+
+    // 3. 本地存在 doc/span 但与目标引用无关 → 仍判 'B'
+    const unrelatedDocHandler = makeResearchProxyHandler({
+      identityRepo: passingRepo(),
+      readConfig: enabledCfg(),
+      readSecrets: async () => ({}),
+      fetchImpl: mockFetch([crossrefWork]),
+      store: {
+        getDocument: async (_uid, docId) =>
+          docId === "doc:other"
+            ? {
+                docId: "doc:other",
+                contentSha256: "def",
+                lang: "en",
+                title: "Completely Unrelated Paper",
+                spans: [{ spanId: "s0", sectionPath: ["Body"], charStart: 0, charEnd: 30, text: "Unrelated text." }],
+                references: [],
+              }
+            : null,
+      },
+    });
+    const unrelatedRes = makeRes();
+    await unrelatedDocHandler(
+      makeReq("POST", "/v3/research/cite/format", {
+        identifier: "10.1234/x",
+        style: "nature",
+        evidenceGrade: "A",
+        docId: "doc:other",
+        spanId: "s0",
+      }),
+      unrelatedRes.res,
+      ctx,
+    );
+    assert.equal(unrelatedRes.captured.statusCode, 200);
+    assert.ok(unrelatedRes.captured.body.verdict.formatted.includes("(2020)"));
+    assert.equal(unrelatedRes.captured.body.verdict.evidenceGrade, "B");
   });
 });

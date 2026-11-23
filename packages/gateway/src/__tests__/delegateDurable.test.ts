@@ -1688,3 +1688,63 @@ describe('OCV5-164 reaper wiring interrupts the child session', () => {
     }
   })
 })
+
+describe('v6 hot-path indexes and periodic WAL checkpoint timer cleanup', () => {
+  it('upgrades a v5 DB to v6 with all 3 hot-path indexes and closes cleanly (idempotent)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-v6-idx-'))
+    const dbPath = join(dir, 'delegate-jobs.db')
+    try {
+      const { default: Database } = await import('better-sqlite3')
+      // Bootstrap a fresh DB, then downgrade to v5 and drop the 3 v6 indexes to simulate an existing v5 DB.
+      const seed = new DelegateDurableDb(dbPath)
+      seed.upsert({
+        id: 'dlgjob-v5-row',
+        agentId: 'coding-assistant',
+        state: 'running',
+        kind: 'delegate',
+        parentSessionKey: 'agent:main:webchat:dm:p1',
+        generation: 0,
+        fencingEpoch: 1,
+        attemptNo: 1,
+        checkpointKind: 'none',
+        callback: 'none',
+        callbackState: 'pending',
+        callbackEpoch: 0,
+        notifyRetryAt: 2000,
+        expiresAt: 5000,
+        createdAt: 1000,
+        updatedAt: 1000,
+        lastActivityAt: 1000,
+      })
+      seed.close()
+
+      const raw = new Database(dbPath)
+      raw.exec('DROP INDEX IF EXISTS idx_delegate_jobs_parent_session')
+      raw.exec('DROP INDEX IF EXISTS idx_delegate_jobs_callback_retry')
+      raw.exec('DROP INDEX IF EXISTS idx_delegate_jobs_expires_at')
+      raw.pragma('user_version = 5')
+      raw.close()
+
+      const upgraded = new DelegateDurableDb(dbPath)
+      const row = upgraded.get('dlgjob-v5-row')
+      assert.equal(row?.parentSessionKey, 'agent:main:webchat:dm:p1')
+      // Closing twice must remain idempotent and clear the periodic WAL timer.
+      upgraded.close()
+      upgraded.close()
+
+      const check = new Database(dbPath, { readonly: true })
+      const version = Number(check.pragma('user_version', { simple: true }))
+      const idxNames = new Set(
+        (check.prepare(`SELECT name FROM sqlite_master WHERE type='index'`).all() as Array<{ name: string }>)
+          .map((r) => r.name),
+      )
+      check.close()
+      assert.equal(version, 6)
+      assert.ok(idxNames.has('idx_delegate_jobs_parent_session'))
+      assert.ok(idxNames.has('idx_delegate_jobs_callback_retry'))
+      assert.ok(idxNames.has('idx_delegate_jobs_expires_at'))
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})

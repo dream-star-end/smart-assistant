@@ -3337,7 +3337,7 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/ChatHeader.test.tsx",
-          "assertion": "keeps the agent accessible and groups the model independently of actions"
+          "assertion": "keeps the agent directly accessible in the primary slot and independent of actions"
         },
         {
           "layer": "browser",

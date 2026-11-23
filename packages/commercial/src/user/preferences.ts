@@ -55,14 +55,17 @@ const disabledPluginsSchema = z
   .refine((a) => new Set(a).size === a.length, { message: "duplicate plugin slug" });
 
 /** Explicit nickname consent is scoped to one conversation; absent means disabled. */
-const assistantProfileSchema = z.object({
+const assistantProfileFields = {
   enabled: z.boolean(),
   nickname: z.string().trim().min(1).max(80).refine(value => !hasPromptPrivacyControlCharacters(value), "不接受控制字符").refine(value => scanMemoryContent(value).ok, "称呼应为简短名称，不能包含系统指令"),
   sessionId: z.string().min(1).max(256).refine(value => !hasPromptPrivacyControlCharacters(value), "不接受控制字符"),
-}).strict();
+};
+const assistantProfileSchema = z.object(assistantProfileFields).strict();
+const assistantProfileReadSchema = z.object(assistantProfileFields).strip();
 
 /**
  * 全字段 schema(GET 返回 / 内部表示)。所有字段都是可选 — DB 默认行不存在时为空对象。
+ * 读回 DB JSONB 使用 `.strip()`：滚动发布新增字段后，旧实例丢弃未知字段而非整行解析失败静默清零全部用户偏好。
  */
 export const PreferencesSchema = z
   .object({
@@ -81,10 +84,10 @@ export const PreferencesSchema = z
     input_prediction: z.boolean().optional(),
     disabled_plugins: disabledPluginsSchema.optional(),
     enabled_plugins: disabledPluginsSchema.optional(),
-    system_assistant_profile: assistantProfileSchema.optional(),
+    system_assistant_profile: assistantProfileReadSchema.optional(),
     system_assistant_recommendations: z.boolean().optional(),
   })
-  .strict();
+  .strip();
 export type Preferences = z.infer<typeof PreferencesSchema>;
 
 /**
@@ -164,7 +167,7 @@ export async function patchPreferences(
   runner?: QueryRunner,
 ): Promise<PreferencesSnapshot> {
   if (expectedVersion !== undefined && expectedVersion !== 'missing' && !/^[1-9][0-9]{0,19}$/.test(expectedVersion)) {
-    throw new PreferencesError('VALIDATION', 'invalid preference snapshot version');
+    throw new PreferencesError('VALIDATION', '无效的偏好快照版本');
   }
   const parsed = PreferencesPatchSchema.safeParse(rawPatch);
   if (!parsed.success) {
@@ -185,21 +188,21 @@ export async function patchPreferences(
     else if (v !== undefined) setPart[k] = v;
   }
 
-  if (Object.keys(setPart).length === 0 && unsetKeys.length === 0) {
-    // 空 patch:保持幂等返回当前快照(不写 DB,不动 updated_at)
+  if (
+    Object.keys(setPart).length === 0 &&
+    unsetKeys.length === 0 &&
+    expectedVersion === undefined &&
+    expectedRole === undefined
+  ) {
+    // 无 CAS 守卫的空 patch:保持幂等返回当前快照(不写 DB,不动 updated_at)
     return await getPreferences(userId);
   }
 
   // 构造 SQL 表达式:从 COALESCE(prefs, '{}') 起,先按顺序 - 'key',再 || setJsonb
   // 用 parameter 占位避免 SQL 注入(虽然 key 已被 zod 限制成 enum-ish,但仍按数据通道传)。
   let exprParamIdx = 2; // $1 = user_id,$2 = setJsonb,$3+ = unset keys
-  const expr = ["COALESCE(user_preferences.prefs, '{}'::jsonb)"];
   // 单条 INSERT 时 EXCLUDED.prefs 拿不到旧值,所以走 ON CONFLICT DO UPDATE 时改用列名引用
-  const params: unknown[] = [String(userId)];
-
-  // setJsonb 总是一个 JSONB 对象(可能是空的,但 || '{}'::jsonb 是 noop)
-  exprParamIdx = 2;
-  params.push(JSON.stringify(setPart));
+  const params: unknown[] = [String(userId), JSON.stringify(setPart)];
   // 注意:JSONB 的 - 'k' 操作符按顺序应用
   let unsetExpr = "";
   for (const k of unsetKeys) {
@@ -229,7 +232,9 @@ export async function patchPreferences(
     conflictGuard = ` WHERE user_preferences.xmin::text=${expected}`;
   }
   if (expectedRole !== undefined) {
-    if (expectedVersion === undefined || !['user', 'admin'].includes(expectedRole)) throw new PreferencesError('VALIDATION', 'confirmed preference mutation requires a version and role');
+    if (expectedVersion === undefined || !['user', 'admin'].includes(expectedRole)) {
+      throw new PreferencesError('VALIDATION', '已确认的偏好修改必须提供版本与角色');
+    }
     params.push(expectedRole);
     const roleParam = `$${params.length}`;
     // Lock the actor row for this same statement. Concurrent role/status changes
@@ -253,8 +258,8 @@ export async function patchPreferences(
       runner,
     );
   } catch (err) {
-    if (err instanceof Error && /violates foreign key/i.test(err.message)) {
-      throw new PreferencesError("VALIDATION", "user does not exist");
+    if (typeof err === "object" && err !== null && (err as { code?: unknown }).code === "23503") {
+      throw new PreferencesError("VALIDATION", "用户不存在");
     }
     throw new PreferencesError(
       "INTERNAL",
@@ -297,19 +302,26 @@ export async function getVersionedPreferences(userId: string): Promise<Preferenc
 
 /** Shared business validation for manual settings and approved actions; preparation performs no mutation. */
 export async function resolvePreferencesPatch(userId: string, raw: unknown, deps: {
-  feature?: (userId: string) => Promise<{ eligible: boolean; available: boolean }>
+  feature?: (
+    userId: string,
+    mode?: { legacyEnabled: boolean; optimizerEnabled: boolean },
+  ) => Promise<{ eligible: boolean; available: boolean }>
 } = {}): Promise<PreferencesPatch> {
   const parsed = PreferencesPatchSchema.safeParse(raw);
   if (!parsed.success) throw new PreferencesError('VALIDATION', parsed.error.issues.map(i => `${i.path.join('.') || '<root>'}: ${i.message}`).join('; '));
   if (parsed.data.enabled_plugins?.some((slug) => !isPluginAvailable(slug)))
     throw new PreferencesError('VALIDATION', '不能启用已下架的插件');
   const { getAutoDreamFeature, normalizeAutoDreamPreferencePatch } = await import('./autoDream.js');
-  if (parsed.data.auto_dream_enabled === true || parsed.data.auto_optimizer_enabled === true) {
-    const feature = await (deps.feature ? deps.feature(userId) : getAutoDreamFeature(userId, true));
-    if (!feature.eligible) throw new PreferencesError('FORBIDDEN', 'Auto-Dream requires Max or above');
-    if (!feature.available) throw new PreferencesError('UNAVAILABLE', 'Auto-Dream model is unavailable');
-  }
   const normalized = PreferencesPatchSchema.safeParse(normalizeAutoDreamPreferencePatch(parsed.data));
-  if (!normalized.success) throw new PreferencesError('INTERNAL', 'invalid normalized preference patch');
+  if (!normalized.success) throw new PreferencesError('INTERNAL', '规范化后的偏好补丁无效');
+  const legacyEnabled = normalized.data.auto_dream_enabled === true;
+  const optimizerEnabled = normalized.data.auto_optimizer_enabled === true;
+  if (legacyEnabled || optimizerEnabled) {
+    const feature = await (deps.feature
+      ? deps.feature(userId, { legacyEnabled, optimizerEnabled })
+      : getAutoDreamFeature(userId, legacyEnabled, optimizerEnabled));
+    if (!feature.eligible) throw new PreferencesError('FORBIDDEN', 'Auto-Dream 需要 Max 及以上订阅套餐');
+    if (!feature.available) throw new PreferencesError('UNAVAILABLE', 'Auto-Dream 模型当前不可用，请稍后重试');
+  }
   return normalized.data;
 }

@@ -54,3 +54,16 @@ describe('v5 selfhost egress socket boot order', () => {
       ['docker.service'])
   })
 })
+
+describe('v5 selfhost cloudflared tunnel unit boot order (OCV5-859)', () => {
+  const tunnel = read('cloudflared-v5-selfhost.service')
+
+  it('orders after and wants the dual-slot frontdoor service instead of legacy master unit', () => {
+    const after = values(tunnel, 'Unit', 'After')
+    const wants = values(tunnel, 'Unit', 'Wants')
+    assert.ok(after.includes('network.target'))
+    assert.ok(after.includes('openclaude-v5-selfhost-frontdoor.service'))
+    assert.ok(!after.includes('openclaude-v5-selfhost.service'))
+    assert.deepEqual(wants, ['openclaude-v5-selfhost-frontdoor.service'])
+  })
+})

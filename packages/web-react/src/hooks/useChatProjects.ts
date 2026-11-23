@@ -124,6 +124,21 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
   const listGenRef = useRef(0);
   const listInflightRef = useRef(false);
   const listFailedRef = useRef(false);
+  const projectsRef = useRef(projects);
+  projectsRef.current = projects;
+
+  const captureOwner = useCallback(() => {
+    const gen = listGenRef.current;
+    const authAtStart = cbRef.current.authSession;
+    const epochAtStart = authAtStart.snapshot().epoch;
+    return {
+      authAtStart,
+      isCurrent: () =>
+        listGenRef.current === gen &&
+        cbRef.current.authSession === authAtStart &&
+        authAtStart.snapshot().epoch === epochAtStart,
+    };
+  }, []);
 
   useEffect(() => {
     setToggledIds(userId ? readCollapsed(userId) : new Set());
@@ -215,6 +230,7 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
     async (input: CreateProjectInput): Promise<ChatProject | null> => {
       const name = input.name.trim();
       if (!name) return null;
+      const owner = captureOwner();
       const instructions = input.instructions?.trim() || undefined;
       const color = input.color || undefined;
       const tempId = `local-proj-${Date.now()}`;
@@ -223,7 +239,7 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
         name,
         ...(instructions ? { instructions } : {}),
         ...(color ? { color } : {}),
-        sortOrder: projects.length,
+        sortOrder: projectsRef.current.length,
         createdAt: Date.now(),
         updatedAt: Date.now(),
         sessionCount: 0,
@@ -231,48 +247,55 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
       setProjects((c) => [...c, optimistic]);
       if (demo || !cbRef.current.auth) return optimistic;
       try {
-        const created = await api.createChatProject(cbRef.current.authSession, {
+        const created = await api.createChatProject(owner.authAtStart, {
           name,
           ...(instructions ? { instructions } : {}),
           ...(color ? { color } : {}),
         });
+        if (!owner.isCurrent()) return null;
         setProjects((c) => c.map((p) => (p.id === tempId ? created : p)));
         return created;
       } catch (e) {
+        if (!owner.isCurrent()) return null;
         setProjects((c) => c.filter((p) => p.id !== tempId));
         console.warn("createChatProject failed", e);
         toast(apiErrorMessage(e, "新建项目失败"), "error");
         return null;
       }
     },
-    [demo, projects.length, toast],
+    [demo, captureOwner, toast],
   );
 
   const renameProjectPrompt = useCallback(
     async (p: ChatProject) => {
+      const owner = captureOwner();
       const name = (
         await cbRef.current.promptText({ title: "重命名项目", initial: p.name })
       )?.trim();
+      if (!owner.isCurrent()) return;
       if (!name || name === p.name) return;
       const prev = p.name;
       setProjects((c) => c.map((x) => (x.id === p.id ? { ...x, name } : x)));
       if (demo) return;
       try {
-        const updated = await api.patchChatProject(cbRef.current.authSession, p.id, { name });
+        const updated = await api.patchChatProject(owner.authAtStart, p.id, { name });
+        if (!owner.isCurrent()) return;
         setProjects((c) => c.map((x) => (x.id === p.id ? { ...x, ...updated } : x)));
       } catch (e) {
+        if (!owner.isCurrent()) return;
         setProjects((c) => c.map((x) => (x.id === p.id ? { ...x, name: prev } : x)));
         console.warn("patchChatProject failed", e);
         toast("重命名项目失败，已恢复", "error");
       }
     },
-    [demo, toast],
+    [demo, captureOwner, toast],
   );
 
-  const restoredRef = useRef<{ project: ChatProject; relinkedSessionIds: string[] } | null>(null);
-  const lifecycleDeps = useCallback((): LifecycleDeps => {
-    const a = cbRef.current.authSession;
-    return {
+  const makeLifecycleDeps = useCallback(
+    (
+      a: AuthSession,
+      onRestored?: (r: { project: ChatProject; relinkedSessionIds: string[] }) => void,
+    ): LifecycleDeps => ({
       listCron: (board) => api.listCron(a, { boardProjectId: board }),
       setCronEnabled: (id, enabled) => api.updateCron(a, id, { enabled }).then(() => undefined),
       // lib/taskboard stays out of the entry bundle (first-screen budget).
@@ -288,26 +311,34 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
       deleteProject: (id, paused) => api.deleteChatProject(a, id, paused),
       restoreProject: async (id) => {
         const r = await api.restoreChatProject(a, id);
-        restoredRef.current = r;
+        onRestored?.(r);
         return {
           boardProjectId: r.project.boardProjectId ?? null,
           pausedCronJobIds: r.pausedCronJobIds,
           archived: Boolean(r.project.archivedAt),
         };
       },
-    };
-  }, []);
+    }),
+    [],
+  );
 
   const restoreProject = useCallback(
     async (projectId: string): Promise<boolean> => {
       if (demo || !cbRef.current.auth) return false;
-      restoredRef.current = null;
+      const owner = captureOwner();
+      let restored: { project: ChatProject; relinkedSessionIds: string[] } | null = null;
       try {
-        const { cronNotResumed } = await restoreDeletedProject(lifecycleDeps(), projectId);
-        const restored = restoredRef.current as { project: ChatProject; relinkedSessionIds: string[] } | null;
-        if (restored) {
-          setProjects((c) => [...c.filter((x) => x.id !== restored.project.id), restored.project]);
-          cbRef.current.onRestoreProjectSessions?.(projectId, restored.relinkedSessionIds);
+        const { cronNotResumed } = await restoreDeletedProject(
+          makeLifecycleDeps(owner.authAtStart, (r) => {
+            restored = r;
+          }),
+          projectId,
+        );
+        if (!owner.isCurrent()) return false;
+        const found = restored as { project: ChatProject; relinkedSessionIds: string[] } | null;
+        if (found) {
+          setProjects((c) => [...c.filter((x) => x.id !== found.project.id), found.project]);
+          cbRef.current.onRestoreProjectSessions?.(projectId, found.relinkedSessionIds);
         }
         toast(
           cronNotResumed.length > 0
@@ -317,83 +348,94 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
         );
         return true;
       } catch (e) {
+        if (!owner.isCurrent()) return false;
         console.warn("restoreChatProject failed", e);
         toast(apiErrorMessage(e, "恢复项目失败"), "error");
         return false;
       }
     },
-    [demo, lifecycleDeps, toast],
+    [demo, captureOwner, makeLifecycleDeps, toast],
   );
 
   const deleteProjectConfirm = useCallback(
     async (p: ChatProject) => {
+      const owner = captureOwner();
       const ok = await cbRef.current.confirmDialog({
         title: "删除该项目?",
         body: `「${p.name}」将被删除。会话不会被删除，会移到未分类；项目里的定时任务会先暂停。30 天内可以恢复。`,
         confirmText: "删除",
         danger: true,
       });
-      if (!ok) return;
-      const snapshot = projects;
+      if (!ok || !owner.isCurrent()) return;
+      const snapshot = projectsRef.current;
       setProjects((c) => c.filter((x) => x.id !== p.id));
       const movedIds = cbRef.current.onUngroupProjectSessions?.(p.id) ?? [];
       if (demo) return;
       try {
-        await fenceAndDeleteProject(lifecycleDeps(), p);
+        await fenceAndDeleteProject(makeLifecycleDeps(owner.authAtStart), p);
+        if (!owner.isCurrent()) return;
         toast(`已删除「${p.name}」`, "info", {
           actionLabel: "撤销",
           onAction: () => void restoreProject(p.id),
         });
       } catch (e) {
+        if (!owner.isCurrent()) return;
         setProjects(snapshot);
         cbRef.current.onRestoreProjectSessions?.(p.id, movedIds);
         console.warn("deleteChatProject failed", e);
         toast(apiErrorMessage(e, "删除项目失败，已恢复"), "error");
       }
     },
-    [demo, projects, toast, lifecycleDeps, restoreProject],
+    [demo, captureOwner, toast, makeLifecycleDeps, restoreProject],
   );
 
   const listDeletedProjects = useCallback(async (): Promise<DeletedChatProject[]> => {
     if (demo || !cbRef.current.auth) return [];
+    const owner = captureOwner();
     try {
-      return await api.listDeletedChatProjects(cbRef.current.authSession);
+      const rows = await api.listDeletedChatProjects(owner.authAtStart);
+      return owner.isCurrent() ? rows : [];
     } catch {
       return [];
     }
-  }, [demo]);
+  }, [demo, captureOwner]);
 
   const setProjectArchived = useCallback(
     async (p: ChatProject, archived: boolean) => {
+      const owner = captureOwner();
       const prev = p.archivedAt ?? null;
       setProjects((c) => c.map((x) => (x.id === p.id ? { ...x, archivedAt: archived ? Date.now() : null } : x)));
       if (demo || !cbRef.current.auth) return;
       try {
-        await setProjectArchivedFenced(lifecycleDeps(), p, archived);
+        await setProjectArchivedFenced(makeLifecycleDeps(owner.authAtStart), p, archived);
       } catch (e) {
+        if (!owner.isCurrent()) return;
         setProjects((c) => c.map((x) => (x.id === p.id ? { ...x, archivedAt: prev } : x)));
         console.warn("archive project failed", e);
         toast(archived ? "归档项目失败，已恢复" : "取消归档失败，已恢复", "error");
       }
     },
-    [demo, lifecycleDeps, toast],
+    [demo, captureOwner, makeLifecycleDeps, toast],
   );
 
   const setProjectPinned = useCallback(
     async (p: ChatProject, pinned: boolean) => {
+      const owner = captureOwner();
       const prev = p.pinnedAt ?? null;
       setProjects((c) => c.map((x) => (x.id === p.id ? { ...x, pinnedAt: pinned ? Date.now() : null } : x)));
       if (demo || !cbRef.current.auth) return;
       try {
-        const updated = await api.patchChatProject(cbRef.current.authSession, p.id, { pinned });
+        const updated = await api.patchChatProject(owner.authAtStart, p.id, { pinned });
+        if (!owner.isCurrent()) return;
         setProjects((c) => c.map((x) => (x.id === p.id ? { ...x, ...updated } : x)));
       } catch (e) {
+        if (!owner.isCurrent()) return;
         setProjects((c) => c.map((x) => (x.id === p.id ? { ...x, pinnedAt: prev } : x)));
         console.warn("pin project failed", e);
         toast(pinned ? "置顶失败，已恢复" : "取消置顶失败，已恢复", "error");
       }
     },
-    [demo, toast],
+    [demo, captureOwner, toast],
   );
 
   const updateProject = useCallback(
@@ -406,6 +448,7 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
         boardProjectId?: string | null;
       },
     ) => {
+      const owner = captureOwner();
       let snapshot: ChatProject[] = [];
       setProjects((c) => {
         snapshot = c;
@@ -413,21 +456,24 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
       });
       if (demo || !cbRef.current.auth) return;
       try {
-        const updated = await api.patchChatProject(cbRef.current.authSession, id, patch);
+        const updated = await api.patchChatProject(owner.authAtStart, id, patch);
+        if (!owner.isCurrent()) return;
         setProjects((c) => c.map((x) => (x.id === id ? { ...x, ...updated } : x)));
       } catch (e) {
+        if (!owner.isCurrent()) return;
         setProjects(snapshot);
         console.warn("patchChatProject failed", e);
         toast("更新项目失败，已恢复", "error");
         throw e;
       }
     },
-    [demo, toast],
+    [demo, captureOwner, toast],
   );
 
   const reorderProjects = useCallback(
     async (orderedIds: string[]) => {
-      const snapshot = projects;
+      const owner = captureOwner();
+      const snapshot = projectsRef.current;
       const byId = new Map(snapshot.map((p) => [p.id, p]));
       const seen = new Set<string>();
       const next: ChatProject[] = [];
@@ -449,17 +495,20 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
       const done: ChatProject[] = [];
       try {
         for (const p of changed) {
-          await api.patchChatProject(cbRef.current.authSession, p.id, { sortOrder: p.sortOrder });
+          if (!owner.isCurrent()) return;
+          await api.patchChatProject(owner.authAtStart, p.id, { sortOrder: p.sortOrder });
           done.push(p);
         }
       } catch (e) {
+        if (!owner.isCurrent()) return;
         setProjects(snapshot);
         void (async () => {
           for (const p of done) {
+            if (!owner.isCurrent()) break;
             const prev = byId.get(p.id);
             if (!prev) continue;
             try {
-              await api.patchChatProject(cbRef.current.authSession, p.id, {
+              await api.patchChatProject(owner.authAtStart, p.id, {
                 sortOrder: prev.sortOrder,
               });
             } catch (rollbackErr) {
@@ -472,7 +521,7 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
         throw e;
       }
     },
-    [demo, projects, toast],
+    [demo, captureOwner, toast],
   );
 
   return {

@@ -36,7 +36,7 @@ import type {
   StudioProjectView,
 } from '../../../lib/studio/types'
 import type { AuthSession, PublicModel } from '../../../lib/types'
-import { useConfirm, useToast } from '../../ui'
+import { Select, useConfirm, useToast } from '../../ui'
 
 const ASPECTS: StudioAspect[] = ['16:9', '9:16', '1:1']
 const DURATIONS = [15, 30, 60]
@@ -63,19 +63,18 @@ function DirectorModel(props: {
       <div className="st-cap" style={{ margin: '6px 0 8px' }}>
         分镜、批注理解和画面质检用这个模型，按它的价格从你的账户扣费。默认 grok-build。
       </div>
-      <select
+      <Select
         aria-label="导演模型"
+        inputSize="sm"
         disabled={props.saving}
         value={props.current}
-        onChange={(e) => props.onPick(e.target.value)}
-        style={{ width: '100%', maxWidth: 360 }}
-      >
-        {options.map((id) => (
-          <option key={id} value={id}>
-            {id === 'grok-build' ? 'grok-build（默认）' : id}
-          </option>
-        ))}
-      </select>
+        onValueChange={props.onPick}
+        className="max-w-[360px]"
+        options={options.map((id) => ({
+          value: id,
+          label: id === 'grok-build' ? 'grok-build（默认）' : id,
+        }))}
+      />
     </div>
   )
 }
@@ -117,7 +116,7 @@ export function PlanningStage(props: { project: StudioProject; events: StudioEve
       <div className="st-row" style={{ gap: 8 }}>
         <Loader2 size={16} className="st-spin" aria-hidden="true" />
         <div className="st-h3" style={{ color: 'var(--st-stage-fg)' }}>
-          导演 agent 正在写分镜
+          导演助手正在写分镜
         </div>
         <span style={{ flex: 1 }} />
         {sec !== null ? (
@@ -378,7 +377,7 @@ export function BriefPage(props: {
             <div className="st-cap">
               {shots.length
                 ? `${shots.length} 个镜头 · ${Math.round(totalSec)} 秒 · 每个镜头都会原样带上统一设定`
-                : '导演 agent 开拍后会先写出分镜'}
+                : '导演助手开拍后会先写出分镜'}
             </div>
           </div>
           <div style={{ flex: 1 }} />
@@ -444,8 +443,7 @@ export function BriefPage(props: {
               分镜还没写
             </div>
             <div className="st-cap" style={{ color: 'var(--st-stage-muted)', maxWidth: 440 }}>
-              开拍后，导演 agent
-              会把需求拆成镜头（景别、动作、台词、时长），并定好角色和场景的统一设定。最高自动化下方案会自动通过，只有拿不准时才来问你。
+              开拍后，导演助手会把需求拆成镜头（景别、动作、台词、时长），并定好角色和场景的统一设定。最高自动化下方案会自动通过，只有拿不准时才来问你。
             </div>
           </div>
         )}
@@ -590,7 +588,7 @@ export function BriefPage(props: {
             </div>
           ) : (
             <div className="st-cap" style={{ marginTop: 8 }}>
-              开拍后由 agent 生成角色和场景设定，并锁定给每个镜头使用。
+              开拍后由导演助手生成角色和场景设定，并锁定给每个镜头使用。
             </div>
           )}
         </div>
@@ -620,7 +618,7 @@ export function BriefPage(props: {
               {starting ? '正在开拍…' : '全自动开始'}
             </button>
             <div className="st-cap" style={{ textAlign: 'center' }}>
-              开拍后导演 agent 会写分镜并开始生成。超出预算 {formatCredits(project.budgetCredits)}{' '}
+              开拍后导演助手会写分镜并开始生成。超出预算 {formatCredits(project.budgetCredits)}{' '}
               时会自动暂停并问你。
             </div>
           </>
@@ -643,7 +641,7 @@ export function BriefPage(props: {
             <div className="st-cap" style={{ textAlign: 'center' }}>
               {awaitingReason === 'budget'
                 ? `预估 ${estimate ? formatCredits(estimate) : '—'} 积分，超过了当前预算，调高预算后再继续。`
-                : `分镜已写好，预估 ${estimate ? formatCredits(estimate) : '—'} 积分；确认后导演 agent 开始生成镜头。`}
+                : `分镜已写好，预估 ${estimate ? formatCredits(estimate) : '—'} 积分；确认后导演助手开始生成镜头。`}
             </div>
           </>
         ) : project.status === 'planning' ||
@@ -655,10 +653,10 @@ export function BriefPage(props: {
             data-testid="studio-progress-note"
           >
             {project.status === 'planning'
-              ? '导演 agent 正在写分镜（通常一分钟内），写好后会显示镜头和预估费用。'
+              ? '导演助手正在写分镜（通常一分钟内），写好后会显示镜头和预估费用。'
               : estimate
-                ? `分镜预估 ${formatCredits(estimate)} 积分，导演 agent 正在生成。`
-                : '导演 agent 正在工作。'}
+                ? `分镜预估 ${formatCredits(estimate)} 积分，导演助手正在生成。`
+                : '导演助手正在工作。'}
             超出预算 {formatCredits(project.budgetCredits)} 时会自动暂停并问你。
           </div>
         ) : null}

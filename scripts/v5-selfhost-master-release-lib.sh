@@ -34,6 +34,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-cutover-units.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-gate-receipts.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-build-jobs.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-load-budget.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-governance-gates.sh"
 
 mlog() { echo "$*" >&2; }
 
@@ -1352,7 +1353,7 @@ build_master_release() {
 
   mlog "── build_master_release staging→$reldir (pinned $short_sha) ──"
   if [[ "${DRY:-0}" == 1 ]]; then
-    mlog "  [dry-run] git archive $full_sha → $staging; 硬链或 npm ci; staging vite; .complete; mv -T → $reldir"
+    mlog "  [dry-run] git archive $full_sha → $staging; 硬链或 npm ci; Wave 1/2 governance fast gates; staging vite; .complete; mv -T → $reldir"
     BUILT_MASTER_RELEASE="$reldir"
     return 0
   fi
@@ -1437,6 +1438,7 @@ build_master_release() {
   fi
   mlog "  发布门 TMPDIR=$MASTER_GATE_TMPDIR(tsx 缓存只属于本次构建,门跑完即删)"
   master_gate_receipt_prepare "$staging" "$full_sha"
+  master_run_governance_fast_gates "$staging" "$full_sha" || { cleanup_master_staging; die "pinned Wave 1/2 governance fast gates 失败(live 未改)"; }
   # P3: C/D share up to three load-budgeted slots; Box/ccb-mcp stay isolated.
   # Keep literal commands in these nested functions: parity/incident gates inspect this body.
   tsum_mark C.parallel 2>/dev/null || :

@@ -417,12 +417,44 @@ describe('classifyRunError', () => {
     )
   })
 
+  it('upstream_timeout: 识别上游超时词族并保留 antigravity 观测失败优先', () => {
+    for (const raw of [
+      'UPSTREAM_TIMEOUT: provider did not respond',
+      'connect ETIMEDOUT 10.0.0.1:443',
+      '504 Gateway Timeout',
+      'Request timed out after 30s',
+      'UND_ERR_HEADERS_TIMEOUT',
+      'context deadline exceeded',
+    ]) {
+      const r = classifyRunError(raw)
+      assert.equal(r.code, 'upstream_timeout', raw)
+      assert.equal(r.message, classifiedMessageForCode('upstream_timeout'))
+    }
+  })
+
+  it('network_error: 识别高确定性网络传输故障且不破坏既有 upstream_failed 回归集', () => {
+    for (const raw of [
+      'NETWORK_ERROR: link interrupted',
+      'getaddrinfo ENOTFOUND api.anthropic.com',
+      'TypeError: fetch failed',
+      'write EPIPE',
+      'socket hang up',
+      'TLS handshake failed',
+    ]) {
+      const r = classifyRunError(raw)
+      assert.equal(r.code, 'network_error', raw)
+      assert.equal(r.message, classifiedMessageForCode('network_error'))
+    }
+  })
+
   it('classifiedMessageForCode 与 PATTERNS 同源(无平行文案表)', () => {
     assert.equal(classifiedMessageForCode('model_capacity'), '模型繁忙，请稍后重试或切换模型')
-    assert.equal(classifiedMessageForCode('rate_limited'), '当前账号被限流，请稍后再试')
+    assert.equal(classifiedMessageForCode('rate_limited'), '请求暂时较多，请稍后再试')
     assert.equal(classifiedMessageForCode('insufficient_credits'), '积分已耗尽，请充值')
     // 不绑定具体厂商(E7):同一分类被 CCB/Codex/多提供商路径共用。
     assert.equal(classifiedMessageForCode('upstream_failed'), '模型服务上游暂时异常，请稍后重试')
+    assert.equal(classifiedMessageForCode('upstream_timeout'), '模型响应超时，请稍后重试')
+    assert.equal(classifiedMessageForCode('network_error'), '网络波动导致本轮中断，请检查连接后重试')
     assert.equal(classifiedMessageForCode('auth_error'), '模型服务认证失败，请重新登录或检查凭据后重试')
     assert.equal(classifiedMessageForCode('model_not_available'), '当前模型不可用，请切换模型后再试')
     // classifyRunError 命中同码时,message 与 classifiedMessageForCode 完全一致。

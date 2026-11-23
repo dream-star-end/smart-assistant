@@ -78,9 +78,9 @@ const tabVariants = cva(
 /** 可滚动方向 → 边缘渐隐遮罩:在没有滚动条的容器上,让"还有内容"这件事可见。 */
 const EDGE_MASK: Record<string, string | undefined> = {
   none: undefined,
-  right: "linear-gradient(to right, #000 calc(100% - 28px), transparent)",
-  left: "linear-gradient(to left, #000 calc(100% - 28px), transparent)",
-  both: "linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent)",
+  right: "linear-gradient(to right, black calc(100% - 28px), transparent)",
+  left: "linear-gradient(to left, black calc(100% - 28px), transparent)",
+  both: "linear-gradient(to right, transparent, black 28px, black calc(100% - 28px), transparent)",
 };
 
 /**

@@ -844,26 +844,35 @@ describe("phantom three-state judgment", () => {
 // ── auth / stale-resume 分类 + 回滚 ──────────────────────────────────────
 
 describe("auth / stale-resume classification", () => {
-  test("auth 错误(errorKind='auth')→ AUTH_ERROR reject + totals 回滚", async () => {
-    const sm = new SessionManager(makeConfigStub());
-    const events: SessionStreamEvent[] = [];
-    const runner = new FakeCcbRunner((r) => {
-      setImmediate(() => {
-        r.msg({
-          type: "assistant",
-          error: "auth",
-          message: { content: [{ type: "text", text: "Failed to authenticate. run /login" }] },
+  test("auth 错误(errorKind='auth')→ 持久化 AUTH_ERROR 终态并下发 auth_error 帧(不抛未落库异常)", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.msg({
+            type: "assistant",
+            error: "auth",
+            message: { content: [{ type: "text", text: "Failed to authenticate. run /login" }] },
+          });
+          r.result({ is_error: true, total_cost_usd: 0.3 });
         });
-        r.result({ is_error: true, total_cost_usd: 0.3 });
       });
-    });
-    const session = makeSession(runner);
+      const session = makeSession(runner, { channel: "webchat", userId: "user-1" });
 
-    await assert.rejects(runOneTurn(sm, session, events), /AUTH_ERROR/);
-    assert.equal(session.turns, 0);
-    assert.equal(session.totalCostUSD, 0);
-    assert.equal(session._lastCcbCumulativeCost, 0);
-    assert.equal(events.some((e) => e.kind === "final"), false, "auth 门拦下缓冲 final");
+      await runOneTurn(sm, session, events);
+      await sm.awaitPendingPersistence();
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.errorCode, "AUTH_ERROR");
+      const errEvent = events.find((e) => e.kind === "error") as (SessionStreamEvent & { errorCode?: string }) | undefined;
+      assert.ok(errEvent, "auth 终态应发射 error 事件");
+      assert.equal(errEvent?.errorCode, "auth_error");
+      assert.equal(events.some((e) => e.kind === "final"), false, "auth 终态不得发射正常 final");
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
   });
 
   test("stale --resume → STALE_RESUME_ID reject + _pendingStaleResumeClear 置位", async () => {
@@ -1033,20 +1042,21 @@ describe("crash/interrupt partial persistence", () => {
         userId: "user-1",
       } as Partial<AgentSession>);
 
-      await assert.rejects(
-        sm.submit(
-          session,
-          "retry me",
-          (event) => events.push(event),
-          undefined,
-          undefined,
-          "c".repeat(32),
-        ),
-        /AUTH_ERROR/,
+      await sm.submit(
+        session,
+        "retry me",
+        (event) => events.push(event),
+        undefined,
+        undefined,
+        "c".repeat(32),
       );
+      await sm.awaitPendingPersistence();
 
       assert.equal(submits, 1);
-      assert.equal(captured.payloads.length, 0);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.errorCode, "AUTH_ERROR");
+      const authErr = events.find((event) => event.kind === "error") as (SessionStreamEvent & { errorCode?: string }) | undefined;
+      assert.equal(authErr?.errorCode, "auth_error");
       assert.equal(events.some((event) => event.kind === "turn_status"), false);
     } finally {
       setV3MasterSinkSingleton(null);

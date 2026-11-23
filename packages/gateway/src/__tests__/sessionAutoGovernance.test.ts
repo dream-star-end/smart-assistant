@@ -35,6 +35,7 @@ import {
   clearTurnOverflowContext,
   getSessionContextWatermark,
   getTurnActiveCheckpointGeneration,
+  hasCompactableSessionHistory,
   isSafeUniversalOverflowSummary,
   isUniversalOverflowError,
   markSelfClientTurnForAutoCompact,
@@ -45,6 +46,7 @@ import {
 import {
   ackPendingCheckpointIfTurnSucceeded,
   clearPendingCheckpoint,
+  markCheckpointTurnOutcome,
   peekPendingCheckpoint,
 } from '../sessionCheckpointStore.js'
 import type { SessionLifecycleHost } from '../sessionLifecycle.js'
@@ -706,6 +708,7 @@ describe('OCV5-841 Wave 2 T2 Blocker Counter-Examples (B2/B3/B4/B5/B6/B7/B8/B10/
           if (remoteCalls === 1) {
             throw new SafeUniversalOverflowRetryError('PROMPT_TOO_LONG', true)
           }
+          markCheckpointTurnOutcome(_s, 'completed')
         },
       } as unknown as TurnRunnerHost
       await runOneTurnWithRetry.call(remoteHost, remoteSession, bloatedPayload, () => {})
@@ -717,12 +720,14 @@ describe('OCV5-841 Wave 2 T2 Blocker Counter-Examples (B2/B3/B4/B5/B6/B7/B8/B10/
         'B5: retry payload MUST wrap original rawUserInput, NEVER bloated runnerPayload',
       )
 
-      // B5: New checkpoint generation recorded and ACKable on turn completion
+      // B5: New checkpoint generation recorded and ACKable strictly after completed outcome (fail-closed)
       const newGen = getTurnActiveCheckpointGeneration(remoteSession)
       assert.ok(newGen && newGen !== 'gen-stale', 'B5: active generation must advance to new checkpoint')
       assert.equal(peekPendingCheckpoint(remoteSession.sessionKey)?.generation, newGen)
       assert.equal(ackPendingCheckpointIfTurnSucceeded(remoteSession, newGen!), true)
       assert.equal(peekPendingCheckpoint(remoteSession.sessionKey), null, 'ACKed checkpoint must not re-inject on next turn')
+      // Fail-closed guard: calling ack without an explicit 'completed' outcome MUST return false
+      assert.equal(ackPendingCheckpointIfTurnSucceeded(remoteSession, newGen!), false)
       clearTurnOverflowContext(remoteSession)
 
       // B4 Remote Fence: unknown remote error MUST throw immediately without blind retry!
@@ -1383,6 +1388,321 @@ describe('OCV5-841 Wave 2 T2 Blocker Counter-Examples (B2/B3/B4/B5/B6/B7/B8/B10/
         1,
         'repeated remote 413 must settle with strictly ONE terminal event (attempt 1 rolled back)',
       )
+    } finally {
+      activeBackend.getEngineContextMessages = origGetEngineContextMessages
+    }
+  })
+
+  it('W3 P0: commercial/PG empty SQLite + historicalMessages triggers 78% pre-compact (including wechat/telegram/feishu) and 413 universal retry end-to-end', async () => {
+    const ckptDir = makeTempDir('oc-w3-pg-compact-')
+    const { getActiveBackend } = await import('@openclaude/storage')
+    const activeBackend = getActiveBackend() as {
+      getEngineContextMessages: (...args: any[]) => Promise<unknown[] | null>
+    }
+    const origGetEngineContextMessages = activeBackend.getEngineContextMessages.bind(activeBackend)
+    let sqliteQueries = 0
+    // Simulate commercial/PG container where local SQLite is permanently empty!
+    activeBackend.getEngineContextMessages = async () => {
+      sqliteQueries += 1
+      return []
+    }
+
+    const masterHistoricalMessages = [
+      { role: 'user', text: 'Build commercial PG context governance' },
+      { role: 'tool', toolName: 'Bash', output: 'LARGE_PG_LOG_'.repeat(1_500) },
+      { role: 'assistant', content: 'Identified empty SQLite root cause in container.' },
+      { role: 'user', content: [{ type: 'text', text: 'Wire historicalMessages into auto-compact' }] },
+      { role: 'assistant', text: 'Ready to verify 78% and 413 recovery.' },
+    ]
+
+    try {
+      // 1. 78% pre-turn auto-compact works across webchat + wechat + telegram + feishu with empty SQLite!
+      const baseNow = 1_720_000_000_000
+      for (const ch of ['webchat', 'wechat', 'telegram', 'feishu'] as const) {
+        const sess = makeFakeSession({
+          sessionKey: `agent:main:${ch}:dm:pg-78-${ch}-${Date.now()}`,
+          channel: ch,
+          providerTag: 'antigravity',
+          _activeClientTurnCount: 1,
+        })
+        recordSessionContextWatermark(sess.sessionKey, {
+          engine: 'antigravity',
+          usedTokens: 165_000,
+          windowTokens: 200_000,
+          nowMs: baseNow,
+        })
+        markSelfClientTurnForAutoCompact(sess)
+        const events: any[] = []
+        const res = await maybeAutoCompactBeforeTurn(
+          makeFakeLifecycleHost(),
+          sess,
+          'continue work',
+          (e) => events.push(e),
+          { nowMs: baseNow, historicalMessages: masterHistoricalMessages, checkpointDir: ckptDir },
+        )
+        assert.equal(res.compacted, true, `channel=${ch} must auto-compact from historicalMessages with empty SQLite`)
+        assert.equal(res.strategy, 'checkpoint_reset')
+        assert.equal(events.filter((e) => e.kind === 'context_compacted').length, 1)
+        assert.ok((getSessionContextWatermark(sess.sessionKey)?.usedRatio ?? 1) < 0.2)
+        assert.ok(peekPendingCheckpoint(sess.sessionKey, ckptDir))
+      }
+      assert.equal(sqliteQueries, 0, 'compactable historicalMessages must short-circuit without touching empty local SQLite')
+
+      // 2. Internal non-chat channels (auto-dream / cron / delegate) stay excluded from pre-turn auto-compact
+      for (const excluded of ['auto-dream', 'cron', 'delegate'] as const) {
+        const sess = makeFakeSession({
+          sessionKey: `agent:main:${excluded}:dm:pg-excl-${excluded}-${Date.now()}`,
+          channel: excluded,
+          providerTag: 'antigravity',
+        })
+        recordSessionContextWatermark(sess.sessionKey, {
+          engine: 'antigravity',
+          usedTokens: 180_000,
+          windowTokens: 200_000,
+          nowMs: baseNow,
+        })
+        const res = await maybeAutoCompactBeforeTurn(
+          makeFakeLifecycleHost(),
+          sess,
+          'internal prompt',
+          () => {},
+          { nowMs: baseNow, historicalMessages: masterHistoricalMessages, checkpointDir: ckptDir },
+        )
+        assert.equal(res.compacted, false)
+        assert.equal(res.reason, 'excluded_channel')
+      }
+
+      // 3. Optimistic-only historicalMessages + empty SQLite fails closed (does NOT falsely claim compactable)
+      const emptyOnlySession = makeFakeSession({ providerTag: 'antigravity', _activeTurnCount: 1 })
+      beginTurnOverflowContext(emptyOnlySession, 'first message', undefined, [
+        { role: 'user', text: 'first message', status: 'sending' },
+      ])
+      assert.equal(await hasCompactableSessionHistory(emptyOnlySession), false)
+      clearTurnOverflowContext(emptyOnlySession)
+
+      // 4. End-to-end 413 universal overflow retry via real submit() -> beginTurnOverflowContext -> real _runOneTurn -> runOneTurnWithRetry
+      //    with container SQLite strictly empty and ONLY opts.historicalMessages provided!
+      let submitTurnCalls = 0
+      const seenEngineInputs: string[] = []
+      const agRunner = Object.assign(new EventEmitter(), {
+        engineId: 'antigravity',
+        isRunning: true,
+        nativeSessionId: 'ag-native-pg-1',
+        lastActivityAt: Date.now(),
+        pendingToolCalls: 0,
+        capabilities: {
+          billingMode: 'external' as const,
+          supportsEffort: true,
+          resumeKind: 'antigravity-session' as const,
+          needsServerRequestId: false,
+          historyMode: 'native-resume' as const,
+          permissionModel: 'forced-unattended' as const,
+          emitsCallUsage: false,
+          emitsToolInputDeltas: false,
+          supportsNativeCompact: false,
+          multimodalInput: 'text-only' as const,
+        },
+        setTraceId: () => {},
+        shutdown: async () => {},
+        clearSessionId: () => {},
+        interrupt: () => {},
+        submitTurn: (req: { input: unknown; onEvent: (e: any) => void }) => {
+          const idx = submitTurnCalls
+          submitTurnCalls += 1
+          seenEngineInputs.push(String(req.input))
+          const isOverflowAttempt = idx === 0
+          const summary = {
+            usage: isOverflowAttempt
+              ? { cost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, totalTokens: 0 }
+              : { cost: 0.001, inputTokens: 100, outputTokens: 30, cacheReadTokens: 0, cacheCreationTokens: 0, totalTokens: 130 },
+            assistantText: isOverflowAttempt ? '' : 'Recovered from 413 using master historicalMessages',
+            thinkingText: '',
+            assistantSegments: isOverflowAttempt ? [] : [{ index: 0, text: 'Recovered from 413 using master historicalMessages', ts: Date.now() }],
+            thinkingSegments: [],
+            tools: [],
+            runtimeEvents: [],
+            stopReason: isOverflowAttempt ? 'error' : 'end_turn',
+            numTurns: isOverflowAttempt ? 0 : 1,
+            isError: isOverflowAttempt,
+            errorDetail: isOverflowAttempt ? 'HTTP 413: PROMPT_TOO_LONG' : undefined,
+            staleResumeId: false,
+            phantomSignals: { apiState: 'unknown' as const, skipReason: null },
+          }
+          return {
+            submitted: Promise.resolve(),
+            summary: Promise.resolve(summary),
+            finalized: true,
+            pendingToolCalls: 0,
+            end: () => {},
+            getPartialSnapshot: () => ({
+              assistantText: summary.assistantText,
+              thinkingText: '',
+              assistantSegments: summary.assistantSegments,
+              thinkingSegments: [],
+              tools: [],
+              runtimeEvents: [],
+            }),
+            getPhantomSignals: () => ({ apiState: 'unknown' as const, skipReason: null }),
+          }
+        },
+      })
+      const pgSession = makeFakeSession({
+        channel: 'feishu',
+        providerTag: 'antigravity',
+        runner: agRunner as unknown as AgentSession['runner'],
+        startedAt: Date.now(),
+        totalCostUSD: 0,
+        turns: 2,
+        _lastCcbCumulativeCost: 0,
+      })
+      const sm = new SessionManager({ defaults: { model: 'antigravity-flash' } } as any)
+      ;(sm as any).sessions.set(pgSession.sessionKey, pgSession)
+      ;(sm as any)._transientRetryDelayMs = () => 1
+      ;(sm as any)._saveResumeMap = () => {}
+      ;(sm as any)._cursorWorkspacePathForSession = () => '/tmp'
+      ;(sm as any).isRuntimeRecycleDraining = () => false
+      ;(sm as any).applyIdleResetIfRequested = async () => {}
+
+      const turnEvents: any[] = []
+      await submitImpl.call(
+        sm as unknown as SessionSubmitHost,
+        pgSession,
+        'summarize next step cleanly',
+        (e) => turnEvents.push(e),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { historicalMessages: masterHistoricalMessages },
+      )
+      assert.equal(submitTurnCalls, 2, 'empty SQLite + historicalMessages must trigger 413 auto-compact retry and converge')
+      assert.match(seenEngineInputs[1] ?? '', /<openclaude_rolling_checkpoint>/)
+      assert.match(seenEngineInputs[1] ?? '', /summarize next step cleanly/)
+      assert.ok(!(seenEngineInputs[1] ?? '').includes('LARGE_PG_LOG_'.repeat(1_500)), 'full uncompacted 19.5KB log must be compacted')
+      assert.ok((seenEngineInputs[1] ?? '').length < 8_500, 'compacted checkpoint retry payload must remain tightly bounded')
+      assert.equal(turnEvents.filter((e) => e.kind === 'context_compacted').length, 1)
+      assert.equal(
+        turnEvents.filter((e) => e.kind === 'error').length,
+        0,
+        'must not emit error terminal after 413 recovery succeeds',
+      )
+      assert.equal(pgSession.currentAssistantBuf, 'Recovered from 413 using master historicalMessages')
+      assert.equal(peekPendingCheckpoint(pgSession.sessionKey), null, 'checkpoint must be ACKed after recovered turn succeeds')
+
+      // 5. Auditor R1 regressions (P1 #2, P1 #3, P2 #1):
+      //    (a) Stateless copy of currentUserText and sending+system-tail both fail closed (false)
+      const statelessOnly = makeFakeSession({ providerTag: 'antigravity', _activeTurnCount: 1 })
+      beginTurnOverflowContext(statelessOnly, 'Q', undefined, [{ role: 'user', text: 'Q' }])
+      assert.equal(await hasCompactableSessionHistory(statelessOnly), false, 'stateless current user row must not count as compactable history')
+      clearTurnOverflowContext(statelessOnly)
+
+      const sendingPlusSystem = makeFakeSession({ providerTag: 'antigravity', _activeTurnCount: 1 })
+      beginTurnOverflowContext(sendingPlusSystem, 'Q', undefined, [
+        { role: 'user', text: 'Q', status: 'sending' },
+        { role: 'assistant', text: 'notice', system: true },
+      ])
+      assert.equal(await hasCompactableSessionHistory(sendingPlusSystem), false, 'sending row followed by system row must fail closed')
+      clearTurnOverflowContext(sendingPlusSystem)
+
+      //    (b) Pre-turn auto-compact merges unacknowledged _pendingExternalExchanges into checkpoint
+      const pendingExtSession = makeFakeSession({
+        sessionKey: `agent:main:wechat:dm:pending-ext-w3-${Date.now()}`,
+        peerId: `pending-ext-w3-${Date.now()}`,
+        channel: 'wechat',
+        providerTag: 'antigravity',
+        _pendingExternalExchanges: [
+          {
+            user: { id: 'u-pending-1', role: 'user', text: 'latest paid question', status: 'completed', ts: Date.now() - 2000 },
+            assistant: { id: 'a-pending-1', role: 'assistant', text: 'PAID_UNACKED_ANSWER_MARKER_42', status: 'completed', ts: Date.now() - 1000 },
+          },
+        ],
+      })
+      recordSessionContextWatermark(pendingExtSession.sessionKey, {
+        engine: 'antigravity',
+        usedTokens: 165_000,
+        windowTokens: 200_000,
+      })
+      const pendingCkptDir = mkdtempSync(join(tmpdir(), 'oc-w3-pending-ext-'))
+      const pendingRes = await maybeAutoCompactBeforeTurn(
+        makeFakeLifecycleHost(),
+        pendingExtSession,
+        'next question',
+        () => {},
+        {
+          historicalMessages: [
+            { role: 'user', text: 'older question' },
+            { role: 'assistant', text: 'older answer' },
+          ],
+          checkpointDir: pendingCkptDir,
+        },
+      )
+      assert.equal(pendingRes.compacted, true, 'pre-turn compact must succeed with pending external exchange')
+      const pendingCkpt = peekPendingCheckpoint(pendingExtSession.sessionKey, pendingCkptDir)
+      assert.ok(
+        pendingCkpt?.summary.includes('PAID_UNACKED_ANSWER_MARKER_42'),
+        'pre-turn checkpoint summary must preserve unacknowledged _pendingExternalExchanges',
+      )
+      // Confirm resolveCompactHistoryLoader includes PAID_UNACKED_ANSWER_MARKER_42 without mutating _pendingExternalExchanges
+      assert.equal(pendingExtSession._pendingExternalExchanges?.length, 1)
+      const { resolveCompactHistoryLoader, isAutoCompactAllowedChannel } = await import('../sessionHistoryCompactSource.js')
+      const loader = resolveCompactHistoryLoader(pendingExtSession, {
+        historicalMessages: [{ role: 'user', text: 'older question' }, { role: 'assistant', text: 'older answer' }],
+        currentUserText: 'next question',
+      })
+      const loaded = (await loader!()) ?? []
+      assert.ok(
+        loaded.some((m) => String((m as { text?: string }).text).includes('PAID_UNACKED_ANSWER_MARKER_42')),
+        'compact history loader must include unacknowledged _pendingExternalExchanges',
+      )
+
+      //    (c) Automated channels taskboard / task / webhook stay excluded
+      assert.equal(isAutoCompactAllowedChannel('taskboard'), false)
+      assert.equal(isAutoCompactAllowedChannel('task'), false)
+      assert.equal(isAutoCompactAllowedChannel('webhook'), false)
+      assert.equal(isAutoCompactAllowedChannel('wechat'), true)
+
+      //    (d) Auditor R2 #2/#3 counterexamples:
+      //        - No master history + local SQLite original goal + 1 pending external exchange => preserves BOTH local goal AND pending answer
+      activeBackend.getEngineContextMessages = async () => [
+        { role: 'user', text: 'ORIGINAL_LOCAL_GOAL_MARKER' } as any,
+        { role: 'assistant', text: 'original local reply' } as any,
+      ]
+      const localPlusPendingLoader = resolveCompactHistoryLoader(pendingExtSession, {
+        historicalMessages: null,
+        currentUserText: 'next question',
+      })
+      const localPlusPending = (await localPlusPendingLoader()) ?? []
+      assert.ok(
+        localPlusPending.some((m) => String((m as { text?: string }).text).includes('ORIGINAL_LOCAL_GOAL_MARKER')),
+        'must read local SQLite base history before merging _pendingExternalExchanges',
+      )
+      assert.ok(
+        localPlusPending.some((m) => String((m as { text?: string }).text).includes('PAID_UNACKED_ANSWER_MARKER_42')),
+        'must also include pending external answer alongside local base history',
+      )
+
+      //        - Master tail Q + pending external exchange => Q stripped BEFORE merge (never moved to middle!)
+      const masterQPlusPendingLoader = resolveCompactHistoryLoader(pendingExtSession, {
+        historicalMessages: [{ role: 'user', text: 'CURRENT_TURN_Q' }],
+        currentUserText: 'CURRENT_TURN_Q',
+      })
+      const masterQPlusPending = (await masterQPlusPendingLoader()) ?? []
+      assert.equal(
+        masterQPlusPending.some((m) => String((m as { text?: string }).text) === 'CURRENT_TURN_Q'),
+        false,
+        'current turn Q must be stripped before appending pending external exchange',
+      )
+
+      //        - Local SQLite containing ONLY current sending row Q => 413 check fails closed (false)
+      activeBackend.getEngineContextMessages = async () => [
+        { role: 'user', text: 'Q', status: 'sending' } as any,
+      ]
+      const sqliteSendingOnly = makeFakeSession({ providerTag: 'antigravity', _activeTurnCount: 1 })
+      beginTurnOverflowContext(sqliteSendingOnly, 'Q')
+      assert.equal(await hasCompactableSessionHistory(sqliteSendingOnly), false, 'SQLite sending-only Q must fail closed')
+      clearTurnOverflowContext(sqliteSendingOnly)
+      activeBackend.getEngineContextMessages = async () => { sqliteQueries += 1; return [] }
     } finally {
       activeBackend.getEngineContextMessages = origGetEngineContextMessages
     }

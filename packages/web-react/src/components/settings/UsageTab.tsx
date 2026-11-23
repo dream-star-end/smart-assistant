@@ -417,13 +417,14 @@ export function UsageTab({
           <Alert tone="danger" className="text-meta">
             {reportErr}
           </Alert>
-          <button
-            type="button"
+          <Button
+            size="sm"
+            variant="secondary"
+            className="mt-2"
             onClick={() => setReportReloadTick((t) => t + 1)}
-            className="mt-2 text-body text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
             重试
-          </button>
+          </Button>
         </div>
       ) : (
         report && rs && (

@@ -14,11 +14,16 @@
  *     original raw user input and exact checkpoint generation ACK (B5).
  */
 import { resolveEffectiveModelHistoryContextWindow } from '@openclaude/protocol'
-import { getEngineContextMessages } from '@openclaude/storage'
 import { isCcbSlashCommandPrompt } from './ccbNativeCompaction.js'
 import type { SessionStreamEvent, TurnSummary } from './engine/engineEvents.js'
 import type { HistoricalTurnInput } from './historicalContextPayload.js'
 import { peekPendingCheckpoint } from './sessionCheckpointStore.js'
+import {
+  extractCurrentUserTextFromTurnInput,
+  hasCompactableHistoryFromSources,
+  isAutoCompactAllowedChannel,
+  resolveCompactHistoryLoader,
+} from './sessionHistoryCompactSource.js'
 import {
   compactSession,
   type SessionCompactOptions,
@@ -54,10 +59,15 @@ const selfClientTurnPending = new WeakMap<
   AgentSession,
   { queueExecutionFence?: PromptQueueExecutionFence }
 >()
-/** B5: Per-turn original raw user input & active checkpoint generation (survives inner retries). */
+/** B5: Per-turn original raw user input, active checkpoint generation & master historicalMessages (survives inner retries). */
 const turnOverflowContexts = new WeakMap<
   AgentSession,
-  { rawUserInput?: HistoricalTurnInput; activeCheckpointGeneration?: string; overflowRetried?: boolean }
+  {
+    rawUserInput?: HistoricalTurnInput
+    activeCheckpointGeneration?: string
+    overflowRetried?: boolean
+    historicalMessages?: unknown[]
+  }
 >()
 
 export function markSelfClientTurnForAutoCompact(
@@ -82,11 +92,17 @@ export function beginTurnOverflowContext(
   session: AgentSession,
   rawUserInput: HistoricalTurnInput,
   initialCheckpointGeneration?: string,
+  historicalMessages?: readonly unknown[],
 ): void {
   turnOverflowContexts.set(session, {
     rawUserInput,
     ...(initialCheckpointGeneration ? { activeCheckpointGeneration: initialCheckpointGeneration } : {}),
+    ...(Array.isArray(historicalMessages) ? { historicalMessages: [...historicalMessages] } : {}),
   })
+}
+
+export function getTurnHistoricalMessages(session: AgentSession): readonly unknown[] | undefined {
+  return turnOverflowContexts.get(session)?.historicalMessages
 }
 
 export function getTurnRawUserInput(session: AgentSession): HistoricalTurnInput | undefined {
@@ -267,20 +283,24 @@ export function isUniversalOverflowError(message: string, errorClass?: string): 
 }
 
 /** Check whether the session actually has persisted conversation history that can be compacted
- * into a rolling checkpoint. Fail-closed (`false`) on empty/unavailable history so `_runOneTurn`
- * preserves the authoritative error tape instead of discarding it on a hopeless retry. */
-export async function hasCompactableSessionHistory(session: AgentSession): Promise<boolean> {
-  if (!session.peerId) return false
-  try {
-    const engine = session.providerTag || session.runner.engineId || 'ccb'
-    const messages = await getEngineContextMessages(session.peerId, session.userId ?? 'default', {
-      engine,
-      currentUserText: '',
-    })
-    return Array.isArray(messages) && messages.length > 0
-  } catch {
-    return false
-  }
+ * into a rolling checkpoint. Prefers master-injected turn `historicalMessages` (commercial/PG
+ * container truth) before falling back to local SQLite. Fail-closed (`false`) on empty/unavailable
+ * history so `_runOneTurn` preserves the authoritative error tape instead of discarding it. */
+export async function hasCompactableSessionHistory(
+  session: AgentSession,
+  historicalMessages?: readonly unknown[] | null,
+  currentUserText?: string,
+): Promise<boolean> {
+  const effectiveCurrent =
+    currentUserText ??
+    (extractCurrentUserTextFromTurnInput(getTurnRawUserInput(session)) ||
+      session.currentUserText ||
+      '')
+  return hasCompactableHistoryFromSources(
+    session,
+    historicalMessages ?? getTurnHistoricalMessages(session),
+    effectiveCurrent,
+  )
 }
 
 const AMBIGUOUS_REMOTE_ERR_RE =
@@ -402,6 +422,7 @@ export async function maybeAutoCompactBeforeTurn(
     queueExecutionFence?: PromptQueueExecutionFence
     nowMs?: number
     loadHistoryMessages?: SessionCompactOptions['loadHistoryMessages']
+    historicalMessages?: readonly unknown[]
     checkpointDir?: string
   },
 ): Promise<{ compacted: boolean; strategy?: string; reason?: string }> {
@@ -412,7 +433,9 @@ export async function maybeAutoCompactBeforeTurn(
   if (opts?._internalCompact || opts?.modelSwitchInternal !== undefined) {
     return { compacted: false, reason: 'internal_turn' }
   }
-  if (session.channel !== 'webchat') return { compacted: false, reason: 'non_webchat' }
+  if (!isAutoCompactAllowedChannel(session.channel)) {
+    return { compacted: false, reason: 'excluded_channel' }
+  }
   if (isCcbSlashCommandPrompt(userTextOrBlocks)) return { compacted: false, reason: 'slash_cmd' }
 
   const state = sessionAutoStates.get(session.sessionKey)
@@ -425,12 +448,19 @@ export async function maybeAutoCompactBeforeTurn(
     return { compacted: false, reason: 'throttled' }
   }
 
+  const loadHistoryMessages = resolveCompactHistoryLoader(session, {
+    loadHistoryMessages: opts?.loadHistoryMessages,
+    historicalMessages: opts?.historicalMessages ?? getTurnHistoricalMessages(session),
+    currentUserText:
+      extractCurrentUserTextFromTurnInput(userTextOrBlocks) || session.currentUserText || '',
+  })
+
   try {
     const outcome = await compactSession.call(host, session, {
       mode: 'auto',
       allowSingleSelfClientTurn,
       ...(queueExecutionFence ? { queueExecutionFence } : {}),
-      ...(opts?.loadHistoryMessages ? { loadHistoryMessages: opts.loadHistoryMessages } : {}),
+      loadHistoryMessages,
       ...(opts?.checkpointDir ? { checkpointDir: opts.checkpointDir } : {}),
     })
     if (outcome.ok && outcome.strategy) {
@@ -472,18 +502,26 @@ export async function tryUniversalOverflowAutoCompact(
   opts?: {
     nowMs?: number
     loadHistoryMessages?: SessionCompactOptions['loadHistoryMessages']
+    historicalMessages?: readonly unknown[]
     checkpointDir?: string
   },
 ): Promise<HistoricalTurnInput | null> {
   if (!isAutoCompactEnabled()) return null
   markUniversalOverflowRetryAttempted(session)
   const now = opts?.nowMs ?? Date.now()
+  const rawInputForCurrent = getTurnRawUserInput(session) ?? fallbackInput
+  const loadHistoryMessages = resolveCompactHistoryLoader(session, {
+    loadHistoryMessages: opts?.loadHistoryMessages,
+    historicalMessages: opts?.historicalMessages ?? getTurnHistoricalMessages(session),
+    currentUserText:
+      extractCurrentUserTextFromTurnInput(rawInputForCurrent) || session.currentUserText || '',
+  })
   try {
     const outcome = await compactSession.call(host, session, {
       mode: 'auto',
       skipLock: true,
       forceCheckpointReset: true,
-      ...(opts?.loadHistoryMessages ? { loadHistoryMessages: opts.loadHistoryMessages } : {}),
+      loadHistoryMessages,
       ...(opts?.checkpointDir ? { checkpointDir: opts.checkpointDir } : {}),
     })
     if (!outcome.ok || !outcome.strategy) return null

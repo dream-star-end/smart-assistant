@@ -105,6 +105,7 @@ import {
   TURN_LEASE_TTL_MS,
   type TurnLease,
   CONTAINER_PREVIEW_PROTOCOL_VERSION,
+  LIVE_BROWSER_PROTOCOL_VERSION,
   authoritySigningInput,
   dispatchAuthoritySigningInput,
   encodeAuthorityEnvelope,
@@ -118,8 +119,12 @@ import {
 import {
   CONTAINER_PREVIEW_ASSERTION_MAX_TTL_MS,
   type ContainerPreviewBridgeAssertionPayload,
+  LIVE_BROWSER_ASSERTION_MAX_TTL_MS,
+  type LiveBrowserBridgeAssertionPayload,
   containerPreviewAssertionSigningInput,
   encodeContainerPreviewAssertion,
+  encodeLiveBrowserAssertion,
+  liveBrowserAssertionSigningInput,
 } from '@openclaude/protocol/containerPreviewAuth'
 
 import { checkDirIntegrity } from '../bridgeSecret.js'
@@ -812,6 +817,51 @@ export class AuthoritySigner {
       this.privateKey(payload.keyId),
     )
     return { payload, envelope: encodeContainerPreviewAssertion(payload, signature) }
+  }
+
+  /** Domain-separated short-lived assertion for live cloud browser WS bridge. */
+  signLiveBrowserAssertion(
+    input: {
+      uid: number
+      containerId: number
+      agentId: string
+      sessionId: string
+    },
+    opts: { now?: number; ttlMs?: number } = {},
+  ): { payload: LiveBrowserBridgeAssertionPayload; envelope: string } {
+    const now = opts.now ?? this.now()
+    const ttlMs = opts.ttlMs ?? LIVE_BROWSER_ASSERTION_MAX_TTL_MS
+    if (!Number.isInteger(ttlMs) || ttlMs < 1 || ttlMs > LIVE_BROWSER_ASSERTION_MAX_TTL_MS) {
+      throw new Error('[live-browser] assertion TTL out of range')
+    }
+    if (!Number.isSafeInteger(input.uid) || input.uid < 1) {
+      throw new Error('[live-browser] invalid uid')
+    }
+    if (!Number.isSafeInteger(input.containerId) || input.containerId < 1) {
+      throw new Error('[live-browser] invalid containerId')
+    }
+    if (!/^[a-zA-Z0-9._-]{1,64}$/.test(input.agentId)) {
+      throw new Error('[live-browser] invalid agentId')
+    }
+    if (!/^[0-9a-f]{32}$/.test(input.sessionId)) {
+      throw new Error('[live-browser] invalid sessionId')
+    }
+    const payload: LiveBrowserBridgeAssertionPayload = {
+      v: LIVE_BROWSER_PROTOCOL_VERSION,
+      keyId: this.activeKeyId,
+      uid: input.uid,
+      containerId: input.containerId,
+      agentId: input.agentId,
+      sessionId: input.sessionId,
+      issuedAt: now,
+      expiresAt: now + ttlMs,
+    }
+    const signature = cryptoSign(
+      null,
+      liveBrowserAssertionSigningInput(payload),
+      this.privateKey(payload.keyId),
+    )
+    return { payload, envelope: encodeLiveBrowserAssertion(payload, signature) }
   }
 
   // --- 轮换五步(R3-M7)-----------------------------------------------------

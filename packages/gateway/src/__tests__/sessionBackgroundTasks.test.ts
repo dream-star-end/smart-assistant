@@ -25,6 +25,7 @@ import {
   handleInternalSessionBackgroundState,
   handleInternalSessionBgCmdCancel,
   handleInternalSessionDelegateCancel,
+  listSessionOriginCrons,
 } from '../routes/sessionBackgroundRoute.js'
 import {
   cancelSessionBgCommand,
@@ -873,6 +874,218 @@ describe('internal container background routes (bridge auth + replay)', () => {
       assert.deepEqual(m5.result().json, { ok: true, cancelled: false, alreadyExited: true })
     } finally {
       rmSync(regDir, { recursive: true, force: true })
+    }
+  })
+
+  it('filters completed oneshot origin-session crons before next tick cleanup while keeping paused unexecuted oneshots and forwarding lastRunAt', async () => {
+    const items = await listSessionOriginCrons('sess-cron-1', async () => [
+      {
+        id: 'oneshot-done',
+        schedule: '43 1 23 11 *',
+        agent: 'main',
+        prompt: 'already fired oneshot',
+        enabled: false,
+        oneshot: true,
+        resume: 'origin-session',
+        sourceSessionKey: 'agent:main:webchat:dm:sess-cron-1',
+        lastRunAt: '2026-11-22T17:43:00.000Z',
+      },
+      {
+        id: 'oneshot-paused',
+        schedule: '0 2 23 11 *',
+        agent: 'main',
+        prompt: 'manually paused before running',
+        enabled: false,
+        oneshot: true,
+        resume: 'origin-session',
+        sourceSessionKey: 'agent:main:webchat:dm:sess-cron-1',
+      },
+      {
+        id: 'recurring-active',
+        schedule: '*/30 * * * *',
+        agent: 'main',
+        prompt: 'recurring check',
+        enabled: true,
+        resume: 'origin-session',
+        sourceSessionKey: 'agent:main:webchat:dm:sess-cron-1',
+        nextRunAt: '2026-11-22T18:30:00.000Z',
+        lastRunAt: '2026-11-22T18:00:00.000Z',
+      },
+    ])
+
+    assert.deepEqual(
+      items.map((item) => ({
+        id: item.id,
+        enabled: item.enabled,
+        oneshot: item.oneshot,
+        nextRunAt: item.nextRunAt,
+        lastRunAt: item.lastRunAt,
+      })),
+      [
+        {
+          id: 'recurring-active',
+          enabled: true,
+          oneshot: undefined,
+          nextRunAt: Date.parse('2026-11-22T18:30:00.000Z'),
+          lastRunAt: Date.parse('2026-11-22T18:00:00.000Z'),
+        },
+        {
+          id: 'oneshot-paused',
+          enabled: false,
+          oneshot: true,
+          nextRunAt: null,
+          lastRunAt: undefined,
+        },
+      ],
+    )
+  })
+
+  it('GET /internal/sessions/:id/background-state performs zero SQLite writes on steady-state polls and syncs on demand when dirty or jobs change', async () => {
+    const Database = (await import('better-sqlite3')).default
+    const dir = mkdtempSync(join(tmpdir(), 'oc-bg-readonly-'))
+    const surfaceDb = join(dir, 'delegate-inflight-surface.db')
+    let locker: InstanceType<typeof Database> | null = null
+    try {
+      let fakeNow = 1_700_000_000_000
+      const jobs = new DelegateJobStore({ sm: true, now: () => fakeNow })
+      const surface = new DelegateInflightSurfaceStore({ dbPath: surfaceDb, now: () => fakeNow })
+      const created = jobs.create('researcher', { parentSessionKey: 'agent:main:webchat:dm:sess-ro' })
+      assert.ok('jobId' in created)
+
+      let rebuildCalls = 0
+      const origRebuild = surface.rebuildFromJobs.bind(surface)
+      surface.rebuildFromJobs = ((...args: Parameters<typeof origRebuild>) => {
+        rebuildCalls += 1
+        return origRebuild(...args)
+      }) as typeof surface.rebuildFromJobs
+
+      const pollOnce = async (nowMs: number) => {
+        fakeNow = nowMs
+        const req = mockReq({
+          method: 'GET',
+          url: '/internal/sessions/sess-ro/background-state',
+        })
+        const m = mockRes()
+        await handleInternalSessionBackgroundState(req, m.res, new URL(req.url!, 'http://c'), {
+          verifyAuth: () => true,
+          delegateJobs: () => jobs,
+          ensureDelegateInflightSurface: () => surface,
+          bgCommandsRegistryDir: dir,
+        })
+        assert.equal(m.result().status, 200)
+        return m.result().json!
+      }
+
+      // 1. Cold start runs rebuildFromJobs strictly ONCE
+      const first = await pollOnce(fakeNow)
+      assert.equal(rebuildCalls, 1)
+      assert.equal(surface.isDirty(), false)
+      const firstDelegates = first.delegates as Array<{ jobId: string; updatedAt: number; state: string }>
+      assert.equal(firstDelegates.length, 1)
+      const firstUpdatedAt = firstDelegates[0]!.updatedAt
+
+      // 2. Hold an exclusive SQLite writer lock during steady-state polls:
+      //    zero rebuilds, zero SQLite write attempts (writeFailures === 0), stable updatedAt (no flicker)!
+      locker = new Database(surfaceDb)
+      locker.pragma('busy_timeout = 0')
+      locker.exec('BEGIN IMMEDIATE')
+
+      for (let i = 1; i <= 5; i++) {
+        const polled = await pollOnce(fakeNow + i * 1_000)
+        const delegates = polled.delegates as Array<{ jobId: string; updatedAt: number; state: string }>
+        assert.equal(delegates.length, 1)
+        assert.equal(delegates[0]!.jobId, created.jobId)
+        assert.equal(delegates[0]!.updatedAt, firstUpdatedAt, 'steady-state poll must not churn updatedAt')
+      }
+      assert.equal(rebuildCalls, 1, 'steady-state polls must NEVER re-run rebuildFromJobs')
+      assert.equal(surface.writeFailures, 0, 'steady-state polls must perform ZERO SQLite writes')
+
+      locker.exec('ROLLBACK')
+      locker.close()
+      locker = null
+
+      // 3. Explicit markDirty() OR new job mutation triggers on-demand rebuild once, then returns to read-only
+      surface.markDirty()
+      await pollOnce(fakeNow + 10_000)
+      assert.equal(rebuildCalls, 2)
+      assert.equal(surface.isDirty(), false)
+
+      const created2 = jobs.create('coder', { parentSessionKey: 'agent:main:webchat:dm:sess-ro' })
+      assert.ok('jobId' in created2)
+      const afterNewJob = await pollOnce(fakeNow + 11_000)
+      assert.equal(rebuildCalls, 3, 'newly created job drift must trigger on-demand rebuild')
+      assert.equal((afterNewJob.delegates as unknown[]).length, 2)
+
+      // Subsequent poll with no new drift is zero-write again
+      await pollOnce(fakeNow + 12_000)
+      assert.equal(rebuildCalls, 3)
+
+      // 4. P1 #7: SQLITE_BUSY during upsertEnqueue keeps dirty=true and flushes real runId/goal once unlocked
+      const created3 = jobs.create('auditor', { parentSessionKey: 'agent:main:webchat:dm:sess-ro' })
+      assert.ok('jobId' in created3)
+      const job3 = jobs.snapshotOf(created3.jobId)!
+      locker = new Database(surfaceDb)
+      locker.pragma('busy_timeout = 0')
+      locker.exec('BEGIN IMMEDIATE')
+      surface.upsertEnqueue({
+        jobId: created3.jobId,
+        parentSessionKey: 'agent:main:webchat:dm:sess-ro',
+        agentId: 'auditor',
+        state: 'queued',
+        runId: 'real-run-identity-77',
+        goal: 'Preserve exact card goal across SQLITE_BUSY',
+        fencingEpoch: job3.fencingEpoch,
+        generation: job3.generation,
+      })
+      assert.equal(surface.isDirty(), true, 'failed SQLite persist must keep dirty=true')
+      locker.exec('ROLLBACK')
+      locker.close()
+      locker = null
+
+      await pollOnce(fakeNow + 13_000)
+      assert.equal(surface.isDirty(), false, 'unlock + poll must flush pending persist and clear dirty')
+      const reopened = new DelegateInflightSurfaceStore({ dbPath: surfaceDb, now: () => fakeNow + 13_000 })
+      const persisted = reopened.get(created3.jobId)
+      assert.equal(persisted?.runId, 'real-run-identity-77')
+      assert.equal(persisted?.goal, 'Preserve exact card goal across SQLITE_BUSY')
+      reopened.close()
+
+      // 5. Auditor R2 #7: Persistent store encountering SQLITE_BUSY during constructor open/migrate
+      //    must keep dirty=true, reopen after unlock, and flush buffered runId/goal to SQLite!
+      const busyOpenDb = join(dir, 'busy-open-surface.sqlite')
+      const seedLocker = new Database(busyOpenDb)
+      seedLocker.pragma('journal_mode = DELETE')
+      seedLocker.exec('CREATE TABLE IF NOT EXISTS _seed (id INTEGER)')
+      seedLocker.exec('BEGIN EXCLUSIVE')
+      const busyStore = new DelegateInflightSurfaceStore({ dbPath: busyOpenDb, now: () => fakeNow + 20_000 })
+      busyStore.upsertEnqueue({
+        jobId: created3.jobId,
+        parentSessionKey: 'agent:main:webchat:dm:sess-ro',
+        agentId: 'auditor',
+        state: 'queued',
+        runId: 'open-busy-run-99',
+        goal: 'Survive open-time SQLITE_BUSY',
+        fencingEpoch: job3.fencingEpoch,
+        generation: job3.generation,
+      })
+      assert.equal(busyStore.isDirty(), true, 'failed constructor open must keep dirty=true')
+      seedLocker.exec('ROLLBACK')
+      seedLocker.close()
+
+      busyStore.syncFromJobsIfNeeded(jobs.listNonTerminal(), { resolveJob: (id) => jobs.snapshotOf(id) })
+      assert.equal(busyStore.isDirty(), false, 'sync after unlock must reopen DB and flush buffered rows')
+      const verifyBusyOpen = new DelegateInflightSurfaceStore({ dbPath: busyOpenDb, now: () => fakeNow + 21_000 })
+      assert.equal(verifyBusyOpen.get(created3.jobId)?.runId, 'open-busy-run-99')
+      assert.equal(verifyBusyOpen.get(created3.jobId)?.goal, 'Survive open-time SQLITE_BUSY')
+      verifyBusyOpen.close()
+      busyStore.close()
+
+      surface.close()
+      jobs.close()
+    } finally {
+      try { locker?.exec('ROLLBACK') } catch {}
+      try { locker?.close() } catch {}
+      rmSync(dir, { recursive: true, force: true })
     }
   })
 })

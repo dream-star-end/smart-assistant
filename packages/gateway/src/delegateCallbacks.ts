@@ -9,7 +9,11 @@
 import { clientSessionIsActive } from './routes/clientSessions.js'
 import { isDelegateTerminalState } from '@openclaude/protocol'
 import { appendServerAuthoredMessage } from '@openclaude/storage'
-import { parseOriginWebchatSessionKey, type CronOriginFireResult } from './cronOriginSession.js'
+import {
+  ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE,
+  parseOriginWebchatSessionKey,
+  type CronOriginFireResult,
+} from './cronOriginSession.js'
 import {
   buildSendToAgentCallbackText,
   callbackPayloadFromDurableJob,
@@ -37,6 +41,7 @@ import {
 import { runBoundedOriginInjectBackoff } from './originInjectBackoff.js'
 import {
   persistSendToAgentIntent,
+  readSendToAgentIntent,
   recoverInterruptedSendToAgentIntents,
   removeSendToAgentIntent,
   type SendToAgentIntent,
@@ -48,6 +53,7 @@ import {
   isDelegateNotifierEffective,
   resolveDelegateCallbackOwner,
 } from './delegateSmFlag.js'
+import { isFlagOffJobOwnedOriginInject } from './delegateCallbackOwner.js'
 import { dispatchJobTerminalNotify, retryPendingNotifies } from './delegateNotifyDispatch.js'
 import { parseParentEngine } from './jobTerminal.js'
 import { delegateCallbackMessageId, persistDelegateJobSnapshots } from './delegateCompleter.js'
@@ -221,6 +227,7 @@ export async function _ensureDurableSendToAgentCallback(
   job: DelegateJobSnapshot,
   intent: SendToAgentIntent,
 ): Promise<boolean> {
+  const owner = resolveDelegateCallbackOwner()
   if (isDelegateNotifierEffective() && this._delegateJobs) {
     const notifier = this._ensureEngineNotifier()
     if (!notifier) return false
@@ -238,40 +245,130 @@ export async function _ensureDurableSendToAgentCallback(
     })
     return !('skipped' in result) && result.ok === true
   }
-  if (job.kind === 'delegate' && job.callback === 'origin-inject' && this._delegateJobs) {
-    // Dynamic MCP handoff can race completion with the intent-persist catch-up.
-    // Use the same claim and callback identity regardless of callbackOwner.
+  if (job.kind === 'send_to_agent' && owner !== 'job') {
+    // Under NOTIFIER=0 + CALLBACK_OWNER=intent, send_to_agent delivery is owned
+    // exclusively by the legacy intent path; never redeliver via the job row.
+    return false
+  }
+  if (
+    (job.kind === 'delegate' || (job.kind === 'send_to_agent' && owner === 'job')) &&
+    job.callback === 'origin-inject' &&
+    this._delegateJobs
+  ) {
+    // Dynamic MCP handoff and job-owned send_to_agent callbacks share the same
+    // delivery-token-fenced claim/complete/abandon/epoch-bump/release CAS path.
     const store = this._delegateJobs
     const live = store.snapshotOf(job.id)
     if (!live) return false
-    if (live.callbackState === 'delivered') return true
+    if (live.callbackState === 'delivered' || live.callbackState === 'abandoned') return true
     const fence = live.claimToken
       ? { claimToken: live.claimToken, fencingEpoch: live.fencingEpoch }
       : undefined
     const claim = store.claimNotifyDelivery(job.id, fence)
     if (!claim.ok) return false
     const payload = callbackPayloadFromDurableJob(claim.snapshot)
+    let settled = false
     try {
+      const persistedIntent = intent.goal ? null : await readSendToAgentIntent(job.id)
+      const effectiveGoal = intent.goal || persistedIntent?.goal || ''
       const result = await this.injectSendToAgentCallback({
         parentSessionKey: intent.originSessionKey,
         jobId: intent.jobId,
         agentId: intent.agentId,
-        goal: intent.goal,
-        userId: intent.userId,
+        goal: effectiveGoal,
+        userId: intent.userId ?? persistedIntent?.userId,
         output: payload.output,
         error: payload.error,
         clientMessageId: delegateCallbackMessageId(intent.jobId, claim.snapshot.callbackEpoch || 1),
+        once: true,
       })
-      if (result.kind !== 'injected') return false
-      const delivered = store.completeNotifyDelivery(job.id, claim.token, fence)
-      if (delivered) {
-        this._activeSendToAgentCallbacks?.delete(job.id)
-        await removeSendToAgentIntent(job.id)
+      if (result.kind === 'injected') {
+        const delivered = store.completeNotifyDelivery(job.id, claim.token, fence)
+        settled = true
+        if (delivered) {
+          this._activeSendToAgentCallbacks?.delete(job.id)
+          await removeSendToAgentIntent(job.id)
+        }
+        return delivered
       }
-      return delivered
-    } finally {
+      if (
+        result.kind === 'retryable_failure' &&
+        result.code === ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE
+      ) {
+        const outcome = store.releaseNotifyClaimWithEpochBump(job.id, claim.token, fence)
+        settled = true
+        if (outcome === 'abandoned_at_epoch_cap') {
+          this._activeSendToAgentCallbacks?.delete(job.id)
+          await removeSendToAgentIntent(job.id)
+          return true
+        }
+        // Bumped (retry scheduled) or stale claim (another worker took over); never clear intent.
+        return false
+      }
+      if (result.kind === 'fallback' || result.kind === 'terminal_failure') {
+        const abandoned = store.abandonNotifyClaim(job.id, claim.token, fence)
+        settled = true
+        if (abandoned) {
+          this.log.warn('delegate notify abandoned: origin session gone', {
+            jobId: job.id,
+            callback: claim.snapshot.callback,
+            callbackEpoch: claim.snapshot.callbackEpoch,
+            notifyAttempt: claim.snapshot.notifyAttempt,
+          })
+          this._activeSendToAgentCallbacks?.delete(job.id)
+          await removeSendToAgentIntent(job.id)
+          return true
+        }
+        // Stale delivery token: another worker reclaimed or completed this row.
+        return false
+      }
+      if (store.shouldAbandonNotifyAfterAttempt(job.id)) {
+        const abandoned = store.abandonNotifyClaim(job.id, claim.token, fence)
+        settled = true
+        if (abandoned) {
+          this.log.warn('delegate notify abandoned after retry budget', {
+            jobId: job.id,
+            callback: claim.snapshot.callback,
+            notifyAttempt: claim.snapshot.notifyAttempt,
+            terminalCommittedAt: claim.snapshot.terminalCommittedAt,
+            code: result.code,
+          })
+          this._activeSendToAgentCallbacks?.delete(job.id)
+          await removeSendToAgentIntent(job.id)
+          return true
+        }
+        return false
+      }
       store.releaseNotifyClaim(job.id, claim.token, fence)
-      this._armNotifyRetryScheduler()
+      settled = true
+      return false
+    } catch (err) {
+      if (!settled) {
+        if (store.shouldAbandonNotifyAfterAttempt(job.id)) {
+          const abandoned = store.abandonNotifyClaim(job.id, claim.token, fence)
+          settled = true
+          if (abandoned) {
+            this.log.warn('delegate notify abandoned after retry budget', {
+              jobId: job.id,
+              callback: claim.snapshot.callback,
+              notifyAttempt: claim.snapshot.notifyAttempt,
+              terminalCommittedAt: claim.snapshot.terminalCommittedAt,
+            })
+            this._activeSendToAgentCallbacks?.delete(job.id)
+            await removeSendToAgentIntent(job.id)
+            return true
+          }
+        } else {
+          store.releaseNotifyClaim(job.id, claim.token, fence)
+          settled = true
+        }
+      }
+      throw err
+    } finally {
+      if (!settled) {
+        store.releaseNotifyClaim(job.id, claim.token, fence)
+      }
+      this._armNotifyRetryScheduler?.()
     }
   }
   const epoch = job.callbackEpoch || 1
@@ -576,15 +673,35 @@ export function _queueSendToAgentCallback(
   runInput: RunDelegateInput,
   args: { jobId: string; agentId: string; goal: string; output?: string; error?: string },
 ): void {
+  const owner = resolveDelegateCallbackOwner()
   const snapshot = this._delegateJobs?.snapshotOf(args.jobId)
-  if (snapshot?.kind === 'delegate' && snapshot.callback === 'origin-inject' && snapshot.callbackOriginSessionKey) {
+  const originKey =
+    snapshot?.callbackOriginSessionKey ??
+    runInput.callbackOriginSessionKey ??
+    runInput.parentSessionKey
+  if (
+    snapshot &&
+    isFlagOffJobOwnedOriginInject(
+      {
+        kind: snapshot.kind,
+        callback: snapshot.callback,
+        callbackOriginSessionKey: snapshot.callbackOriginSessionKey,
+        parentSessionKey: originKey,
+      },
+      owner,
+    )
+  ) {
     if (isDelegateNotifierEffective()) return
     const active = this._activeSendToAgentCallbacks?.get(args.jobId)
     void this._ensureDurableSendToAgentCallback(snapshot, {
       v: 1,
       jobId: args.jobId,
-      originSessionKey: snapshot.callbackOriginSessionKey,
-      userId: snapshot.callbackOriginUserId ?? active?.userId,
+      originSessionKey: originKey!,
+      userId:
+        snapshot.callbackOriginUserId ??
+        runInput.callbackOriginUserId ??
+        active?.userId ??
+        this.sessions.getByKey(runInput.parentSessionKey || '')?.userId,
       agentId: args.agentId,
       goal: active?.goal ?? args.goal,
       createdAt: Date.now(),
@@ -597,7 +714,6 @@ export function _queueSendToAgentCallback(
   // Stage 2: EngineNotifier owns origin-inject (and cron-origin-inject)
   // delivery when the flag is on. Completer must not also inject.
   if (isDelegateNotifierEffective()) return
-  const owner = resolveDelegateCallbackOwner()
   const snap = this._delegateJobs?.snapshotOf(args.jobId)
   const epoch = snap?.callbackEpoch || 1
   const clientMessageId = owner === 'job' ? delegateCallbackMessageId(args.jobId, epoch) : undefined
@@ -708,6 +824,9 @@ export async function injectSendToAgentCallback(
       // path so the notifier parks the job as pending instead of degrading.
       if (posted.kind === 'in_flight') {
         return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_BUSY' }
+      }
+      if (posted.kind === 'previously_failed') {
+        return { kind: 'retryable_failure', code: ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE }
       }
       return { kind: 'retryable_failure', code: posted.code }
     }

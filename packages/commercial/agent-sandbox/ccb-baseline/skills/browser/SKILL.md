@@ -1,16 +1,29 @@
 ---
 name: browser
-description: 用官方 Playwright CLI 操作真实浏览器：打开网页、抓 accessibility 快照、按 ref 点击/输入、管理标签页、截图和保存登录状态。用户要操作动态网页、填表、登录或视觉确认时使用。
+description: 用官方 Playwright CLI 操作真实浏览器：打开网页、抓 accessibility 快照、按 ref 点击/输入、管理标签页、截图和复用持久化登录态。用户要操作动态网页、填表、登录或视觉确认时使用。
 tags: [browser, playwright, automation, web]
 priority: 5
 ---
 
 # 浏览器操作（Playwright CLI）
 
-当用户要**打开网页、点击、填表单、登录、操作页面或抓取动态内容**时，用 Bash 调
-`oc-browser`。它是平台为每个 Agent 隔离的官方 `playwright-cli` 启动器：命令语法、
-退出码和浏览器状态均来自 Playwright CLI，不经过 Playwright MCP。普通公开 URL 正文优先
-用 `oc-web extract`（见 `skill_view("web-context")`），需要交互或渲染时才开浏览器。
+当用户要**打开网页、点击、填表单、登录、操作页面或抓取动态内容**时，用 Bash 调 `oc-browser`。它是平台为每个 Agent 隔离的官方 `playwright-cli` 启动器，跨调用共享同一个真实 Chrome 会话与持久化 Profile（Cookie/登录态在 `close`、闲置回收与容器重启后自动保留，无需额外传 `--persistent`）。
+
+## 两条核心原则
+
+1. **除高风险操作外，任何情况下先自己尝试操作**
+   - 仅读取无需交互/登录的公开网页时，优先用 `oc-web extract`（见 `skill_view("web-context")`）。
+   - 需要打开页面、导航、检索、筛选、填表或点击交互时，一律先用 `oc-browser` 自己尝试推进；先直接访问业务页检查是否已处于登录态，绝不未尝试就甩手给用户。
+   - 仅对**高风险操作**（支付、删除、不可逆外部提交/发布）在最终确认前主动停下，交由用户确认或接管。
+2. **尝试操作仍无法推进时，发卡片请用户接管，点完成后继续**
+   - 当你尝试操作后仍卡在人工门禁（账号登录 / SSO / 2FA / 验证码、高风险最终确认，或页面交互连续失败无法自行恢复）时：
+     1. **保持页面停留在当前位置，切勿执行 `oc-browser close`**；
+     2. **严禁**回复“不支持实时接管”或向用户索要账号、密码、验证码；
+     3. 直接输出一张简洁的 `browser_handoff` 交互卡片，请用户在右侧实时云端浏览器接管操作；用户操作完毕后点击「完成并继续」或「我已完成，继续任务」，系统会通知你继续执行。
+
+```ui
+{"type":"browser_handoff","title":"请完成 GitHub 登录","url":"https://github.com/login","reason":"当前页面需要登录验证，请在右侧实时浏览器中完成登录后点击完成，我会继续后续步骤。","continue_prompt":"我已完成 GitHub 登录，请继续刚才的任务。"}
+```
 
 ## 核心流程：open → snapshot → 按 ref 操作
 
@@ -25,31 +38,17 @@ oc-browser screenshot --filename=/home/agent/.openclaude/generated/page.png
 oc-browser close
 ```
 
-- 第一次使用必须 `open [url]`；已有会话后用 `goto <url>` 导航。
-- ref 必须来自最近一次 `snapshot`，不要猜。页面变化后重新 snapshot。
-- 输入框优先 `fill <ref> <text>`；当前已聚焦的输入框才用 `type <text>`。
-- 截图仅在视觉确认或交付图片时使用；普通理解页面优先 snapshot。
-- 正常完成整个任务后再执行 `close`；若需要用户接管登录/验证，**不要 `close`**。Agent 中断时平台会在 30 分钟无浏览器操作后兜底回收。
-
-## 登录 / 2FA / 验证码：实时视口人工接管（重要）
-
-OpenClaude Web 右侧工作台内置**实时云端浏览器视口（支持全屏放大与一键人工接管）**，与 `oc-browser` 共享同一个 Chromium 会话、Cookie 与页面状态。
-
-遇到登录页、二次验证（2FA）、人机验证或需要用户亲自确认的操作时：
-
-1. 让 `oc-browser` 停留在当前待操作页面，**切勿执行 `oc-browser close`**；
-2. **严禁**回复“暂不支持实时远程画面接管”或向用户索要账号、密码、验证码；
-3. 直接在回复中输出一张 `browser_handoff` 智能 UI 卡片，用户点击一次即可全屏放大并接管操作，完成后点「交还助手」即可保留登录态无缝继续：
-
-```ui
-{"type":"browser_handoff","title":"请完成 GitHub 登录","url":"https://github.com/login","reason":"当前页面需要登录授权，接管后你的登录态会自动同步给助手继续执行。","continue_prompt":"我已完成 GitHub 登录，请继续刚才的任务。"}
-```
+- 第一次使用 `open [url]`；已有会话用 `goto <url>` 导航。
+- ref 必须来自最近一次 `snapshot`，页面变化后重新 snapshot。
+- 输入框优先 `fill <ref> <text>`；已聚焦输入框才用 `type <text>`。
+- 优先 snapshot，需视觉确认或交付图片时才 screenshot。
+- 正常完成整个任务后再 `close`；请用户接管时**切勿 `close`**。
 
 ## 常用命令
 
 ```bash
 oc-browser goto https://example.com/next
-oc-browser snapshot  # 在输出中定位“登录”对应的 ref
+oc-browser snapshot
 oc-browser click e12
 oc-browser dblclick e12
 oc-browser fill e5 "文本" --submit
@@ -65,14 +64,10 @@ oc-browser eval "() => document.title"
 oc-browser state-save /home/agent/.openclaude/generated/auth-state.json
 ```
 
-如需登录状态跨浏览器重开保留，可在 `open` 时使用 `--persistent`；不要传 `-s`、
-`--session` 或 `--profile`，会话与 profile 由平台按 Agent 隔离。
+不要传 `-s`、`--session`、`--profile` 或 `--user-data-dir`，会话与持久化 Profile 目录均由平台按 Agent 自动隔离管理；仅在需要彻底清空登录态时才执行 `oc-browser delete-data`。
 
-## 失败恢复
+## 失败恢复与安全边界
 
-- 若提示浏览器未打开，只执行一次 `open <最后确认的 URL>`，然后重新 snapshot。
-- **绝不自动重放** click/fill/press 等可能产生副作用的动作。
-- 命令失败就读取 stderr，修正 ref/参数或如实说明；不要改用 curl/私有接口绕过网页流程。
-- 不绕过 CAPTCHA、登录墙或反爬；遇到拦截时请用户接管登录或改用官方 API/用户数据。
-
-截图和交付文件写到 `/home/agent/.openclaude/generated/<安全文件名>`，最终回复给出绝对路径。
+- 若提示浏览器未打开，只执行一次 `open <最后确认的 URL>`，然后重新 snapshot；**绝不自动重放** click/fill/press 等有副作用动作。
+- 不绕过 CAPTCHA、登录墙或反爬；尝试受阻时保持页面打开并输出 `browser_handoff` 请用户接管，或改用官方 API / 用户提供的数据源。
+- 截图和交付文件写到 `/home/agent/.openclaude/generated/<安全文件名>`，最终回复给出绝对路径。

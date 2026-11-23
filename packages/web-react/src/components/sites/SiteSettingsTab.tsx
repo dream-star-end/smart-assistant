@@ -216,6 +216,15 @@ export function SiteSettingsTab({
   async function saveCustomDomain(domainValue: string | null) {
     if (ownerMutationBlocked || savingDomain) return;
     const gen = siteGenRef.current;
+    if (domainValue === null && site.customDomain) {
+      const ok = await confirmDialog({
+        title: `解绑自定义域名「${site.customDomain}」？`,
+        body: "解绑后该域名将立即停止指向当前站点，之后可随时重新绑定。",
+        confirmText: "确认解绑",
+        danger: true,
+      });
+      if (ok !== true || !isCurrentSiteGen(gen)) return;
+    }
     setSavingDomain(true);
     setDomainErr(null);
     try {
@@ -258,6 +267,17 @@ export function SiteSettingsTab({
   async function submitShare(e: FormEvent) {
     e.preventDefault();
     if (ownerMutationBlocked || savingShare) return;
+    const trimmedPassword = sharePassword.trim();
+    if (shareVisibility === "password") {
+      if (site.visibility !== "password" && trimmedPassword.length === 0) {
+        setShareErr("请设置 4–128 位访问口令。");
+        return;
+      }
+      if (trimmedPassword.length > 0 && (trimmedPassword.length < 4 || trimmedPassword.length > 128)) {
+        setShareErr("访问口令需为 4–128 位字符。");
+        return;
+      }
+    }
     const gen = siteGenRef.current;
     setSavingShare(true);
     setShareErr(null);
@@ -265,7 +285,7 @@ export function SiteSettingsTab({
       const res = await sitesApi.updateSite(auth, site.slug, {
         visibility: shareVisibility,
         spaMode: shareSpaMode,
-        ...(shareVisibility === "password" && sharePassword.trim()
+        ...(shareVisibility === "password" && trimmedPassword
           ? { password: sharePassword }
           : {}),
       });
@@ -306,9 +326,18 @@ export function SiteSettingsTab({
     }
   }
 
-  async function removeEnvVar(key: string) {
+  async function removeEnvVar(key: string, isSecret: boolean) {
     if (ownerMutationBlocked) return;
     const gen = siteGenRef.current;
+    const ok = await confirmDialog({
+      title: `删除${isSecret ? "机密" : ""}环境变量「${key}」？`,
+      body: isSecret
+        ? "该变量为加密密钥，删除后原值无法找回，依赖它的站点接口可能会立即失效。"
+        : "删除后站点后端将无法继续读取该环境变量，确定删除吗？",
+      confirmText: "删除",
+      danger: true,
+    });
+    if (ok !== true || !isCurrentSiteGen(gen)) return;
     setEnvBusyKey(key);
     try {
       const res = await sitesApi.deleteSiteEnvVar(auth, site.slug, key);
@@ -557,7 +586,7 @@ export function SiteSettingsTab({
 
         {envVars.length === 0 && !addingEnv ? (
           <p className="oc-surface-recessed rounded-xl px-4 py-6 text-center text-body text-muted">
-            暂无环境变量 — 点击右上角「添加变量」或在命令行运行 `oc-site env-set` 配置密钥。
+            暂无环境变量 — 点击右上角「添加变量」配置站点所需的参数或 API 密钥。
           </p>
         ) : (
           <div className="space-y-2.5">
@@ -685,7 +714,7 @@ export function SiteSettingsTab({
                       size="sm"
                       disabled={readOnly || busy}
                       aria-label={`删除环境变量 ${envVar.key}`}
-                      onClick={() => void removeEnvVar(envVar.key)}
+                      onClick={() => void removeEnvVar(envVar.key, envVar.isSecret)}
                     >
                       <Trash2 size={15} className="text-muted" aria-hidden="true" />
                     </IconButton>

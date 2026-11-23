@@ -182,7 +182,7 @@ describe('V5 branch deployment policy', () => {
     )
     assert.match(source, /grep -q 'y' \/tmp\/oc-docx-smoke\.txt/)
     assert.match(source, /! grep -q '¿' \/tmp\/oc-docx-smoke\.txt/)
-    assert.match(overrides, /^OC_RUNTIME_IMAGE=openclaude\/openclaude-runtime:v5-cli-cc2325-codex01700-grok1077-zcode3153-agy158-slim$/m)
+    assert.match(overrides, /^OC_RUNTIME_IMAGE=openclaude\/openclaude-runtime:v5-cli-cc2325-codex01710-grok1077-zcode3153-agy1515-chrome-slim$/m)
     assert.match(overrides, /v5-ccb-f8800e0c0480-embedded\(OC_RUNTIME_EMERGENCY_TUPLE/)
   })
 
@@ -4990,12 +4990,12 @@ exec(compile(source, "<actual-release-artifact-digest>", "exec"), dict(__name__=
       'hotcfg_ship_lib() { :; }',
       'ssh() {',
       '  if [[ "$*" == *"docker image inspect"* && "$*" == *"source_commit"* ]]; then',
-      `    printf '%s|%s|%s|%s|%s\\n' "\${ACTUAL_ID:-${imageId}}" "\${SOURCE_COMMIT:-${sourceCommit}}" "\${EMBED_SOURCE:-0}" "\${INCLUDE_GROK:-1}" "\${CODEX_LABEL:-0.170.0}"`,
+      `    printf '%s|%s|%s|%s|%s\\n' "\${ACTUAL_ID:-${imageId}}" "\${SOURCE_COMMIT:-${sourceCommit}}" "\${EMBED_SOURCE:-0}" "\${INCLUDE_GROK:-1}" "\${CODEX_LABEL:-0.171.0}"`,
       '  elif [[ "$*" == *"docker image inspect"* ]]; then',
       `    printf '%s\\n' "\${ACTUAL_ID:-${imageId}}"`,
       '  elif [[ "$*" == *"--entrypoint codex"* ]]; then',
       '    if [[ "${CODEX_RC:-0}" != 0 ]]; then return "${CODEX_RC}"; fi',
-      '    printf "%s\\n" "${CODEX_VERSION:-codex-cli 0.170.0}"',
+      '    printf "%s\\n" "${CODEX_VERSION:-codex-cli 0.171.0}"',
       '  elif [[ "$*" == *"--entrypoint grok-native"* ]]; then',
       '    printf "%s\\n" "${GROK_VERSION:-grok 1.0.77 (test)}"',
       '  elif [[ "$*" == *"OC_RUNTIME_RELEASE"* ]]; then',
@@ -5034,8 +5034,8 @@ exec(compile(source, "<actual-release-artifact-digest>", "exec"), dict(__name__=
       [{ ACTUAL_ID: `sha256:${'9'.repeat(64)}` }, /immutable ID 漂移/],
       [{ EMBED_SOURCE: '1' }, /只接受 slim image/],
       [{ INCLUDE_GROK: '0' }, /缺 official Grok binary/],
-      [{ CODEX_LABEL: '0.169.0' }, /codex label=.*expected=0\.170\.0/],
-      [{ CODEX_VERSION: 'codex-cli 0.169.0' }, /codex binary=.*expected='codex-cli 0\.170\.0/],
+      [{ CODEX_LABEL: '0.170.0' }, /codex label=.*expected=0\.171\.0/],
+      [{ CODEX_VERSION: 'codex-cli 0.170.0' }, /codex binary=.*expected='codex-cli 0\.171\.0/],
       [{ CODEX_RC: '127' }, /codex --version failed/],
       [{ GROK_VERSION: 'grok 1.0.2 (old)' }, /Grok binary=/],
       [{ GROK_VERSION: 'grok 1.0.5 (incident image)' }, /Grok binary=.*expected='grok 1\.0\.77/],

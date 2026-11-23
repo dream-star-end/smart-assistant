@@ -21,6 +21,7 @@ import {
   _turnStatusWireFields,
   GATEWAY_PENDING_PERMISSION_TTL_MS,
 } from '../server.js'
+import { sessionStartFailureMessage } from '../turnFrames.js'
 
 const PEER = { id: 'u1', kind: 'dm' as const }
 
@@ -221,5 +222,13 @@ describe('_permissionRequestExpiresAt', () => {
       _permissionRequestExpiresAt(false, now),
       now + GATEWAY_PENDING_PERMISSION_TTL_MS,
     )
+  })
+})
+
+describe('sessionStartFailureMessage', () => {
+  it('never leaks raw uppercase internal failure codes to users', () => {
+    const msg = sessionStartFailureMessage('ENGINE_NOT_ENABLED')
+    assert.ok(!msg.includes('ENGINE_NOT_ENABLED'))
+    assert.ok(msg.includes('这一轮没能开始'))
   })
 })

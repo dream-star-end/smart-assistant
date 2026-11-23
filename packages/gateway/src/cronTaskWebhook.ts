@@ -26,6 +26,7 @@ import {
   type CronProjectPorts,
 } from './cronProject.js'
 import {
+  ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE,
   buildCronOriginResumeText,
   cronOriginClientMessageId,
   cronOriginIdempotencyKey,
@@ -88,6 +89,12 @@ export async function _drainFlagOffCronOriginNotifies(
       inject: async (event) => {
         const result = await this.injectCronOriginFromTerminal(event)
         if (result.kind === 'injected') return { ok: true }
+        if (
+          result.kind === 'retryable_failure' &&
+          result.code === ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE
+        ) {
+          return { ok: false, failureClass: 'transport' as const, previouslyFailed: true }
+        }
         if (result.kind === 'retryable_failure' && result.code === 'ORIGIN_SESSION_BUSY') {
           return { ok: false, failureClass: 'internal' as const, busy: true }
         }
@@ -338,7 +345,8 @@ export async function injectCronOriginSession(
   if (!origin) return { kind: 'fallback' }
   const text = override?.text ?? buildCronOriginResumeText(job)
   const clientMessageId =
-    override?.clientMessageId ?? cronOriginClientMessageId(delivery.deliveryId)
+    override?.clientMessageId ??
+    cronOriginClientMessageId(delivery.deliveryId, delivery.callbackEpoch)
   const masterCfg = readV3CronOriginInjectConfig()
   if (masterCfg) {
     const posted = await postCronOriginInject(
@@ -354,6 +362,9 @@ export async function injectCronOriginSession(
     if (posted.kind === 'gone') return { kind: 'fallback' }
     if (posted.kind === 'in_flight') {
       return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_IN_FLIGHT' }
+    }
+    if (posted.kind === 'previously_failed') {
+      return { kind: 'retryable_failure', code: ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE }
     }
     return { kind: 'retryable_failure', code: posted.code }
   }

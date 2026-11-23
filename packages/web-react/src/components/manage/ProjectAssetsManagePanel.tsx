@@ -3,13 +3,19 @@ import { useProjectScope } from '../../hooks/useProjectScope'
 import { isWorkScope } from '../../lib/projectScope'
 import type { AuthSession } from '../../lib/types'
 import { ProjectAssetsPanel } from '../ProjectAssetsPanel'
-import { EmptyState } from '../ui'
+import { Button, EmptyState } from '../ui'
 
 /**
  * 工作项目作用域下的「项目资产」入口（复用侧栏的 ProjectAssetsPanel）。
  * 文案面向用户：不提 API 路径、digest、facade 这些实现词（M-07）。
  */
-export function ProjectAssetsManagePanel({ auth }: { auth: AuthSession }) {
+export function ProjectAssetsManagePanel({
+  auth,
+  onOpenProjectSettings,
+}: {
+  auth: AuthSession
+  onOpenProjectSettings?: () => void
+}) {
   const { scope } = useProjectScope()
   const chatId = scope.chatProject?.id ?? null
 
@@ -35,8 +41,23 @@ export function ProjectAssetsManagePanel({ auth }: { auth: AuthSession }) {
           <div className="oc-surface-card rounded-2xl">
             <EmptyState
               icon={Folder}
-              title="这个工作项目还没有绑定会话组"
-              hint="把一个会话组绑定到这个工作项目后，就能在这里管理它的文件。"
+              title="当前项目暂未关联项目文件空间"
+              hint="前往项目设置关联对应的对话项目后，就能在这里统一管理项目的参考文件。"
+              action={
+                onOpenProjectSettings ? (
+                  <Button size="sm" variant="secondary" onClick={onOpenProjectSettings}>
+                    去项目设置
+                  </Button>
+                ) : (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => window.dispatchEvent(new CustomEvent('openclaude:open-project-settings'))}
+                  >
+                    去项目设置
+                  </Button>
+                )
+              }
             />
           </div>
         </div>

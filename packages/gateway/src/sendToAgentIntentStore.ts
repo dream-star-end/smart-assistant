@@ -55,6 +55,21 @@ export async function removeSendToAgentIntent(
   await rm(intentPath(jobId, env), { force: true })
 }
 
+export async function readSendToAgentIntent(
+  jobId: string,
+  env?: NodeJS.ProcessEnv,
+): Promise<SendToAgentIntent | null> {
+  let path: string
+  try {
+    path = intentPath(jobId, env)
+  } catch {
+    return null
+  }
+  const raw = await readFile(path, 'utf8').catch(() => '')
+  if (!raw) return null
+  return parseIntent(raw)
+}
+
 function parseIntent(raw: string): SendToAgentIntent | null {
   try {
     const value = JSON.parse(raw) as Partial<SendToAgentIntent>

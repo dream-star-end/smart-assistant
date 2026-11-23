@@ -6,6 +6,7 @@ import { useCallback, useLayoutEffect, useMemo, useRef, useState, type UIEvent, 
 import type { ChildBlock } from "../../lib/chat/model";
 import { childSignature } from "../../lib/chat/render";
 import { ChildBlockView } from "./AgentGroupCard";
+import { scrollContainerTo, snapScrollToBottomOnce } from "./stickToBottom";
 
 export const DELEGATE_PROCESS_TAIL_SIZE = 30;
 export const DELEGATE_PROCESS_EXPAND_STEP = 10;
@@ -110,9 +111,7 @@ export function DelegateProcessList({ childBlocks }: { childBlocks: ChildBlock[]
   const liveSig = lastChild ? childSignature(lastChild) : "";
 
   const scrollToBottom = useCallback(() => {
-    const el = scrollerRef.current;
-    if (!el) return;
-    el.scrollTop = el.scrollHeight;
+    snapScrollToBottomOnce(scrollerRef.current);
   }, []);
 
   useLayoutEffect(() => {
@@ -121,7 +120,7 @@ export function DelegateProcessList({ childBlocks }: { childBlocks: ChildBlock[]
     const anchor = pendingAnchorRef.current;
     if (anchor != null) {
       pendingAnchorRef.current = null;
-      el.scrollTop = anchoredScrollTop(anchor.height, el.scrollHeight, anchor.top);
+      scrollContainerTo(el, anchoredScrollTop(anchor.height, el.scrollHeight, anchor.top));
       return;
     }
     if (stickRef.current) scrollToBottom();

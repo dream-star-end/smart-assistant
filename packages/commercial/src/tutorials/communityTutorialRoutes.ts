@@ -1,8 +1,12 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { Pool } from 'pg'
 
 import { writeAdminAuditBestEffort } from '../admin/audit.js'
 import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
-import { requireAuth } from '../http/auth.js'
+import {
+  authenticateActiveCommercialUser,
+  authenticateCommercialUser,
+} from '../http/activeUserAuth.js'
 import {
   HttpError,
   clientIpOf,
@@ -57,7 +61,20 @@ export { TUTORIAL_SNAPSHOT_MAX_BODY_BYTES }
  */
 export const COMMUNITY_TUTORIAL_MAX_BODY_BYTES = 256 * 1024
 
-type TutorialRouteDeps = { jwtSecret: string | Uint8Array }
+type TutorialRouteDeps = {
+  jwtSecret: string | Uint8Array
+  v3Supervisor?: { pool?: Pool }
+  verifyActiveAccount?: (userId: string) => Promise<boolean>
+  skipDbActiveCheck?: boolean
+}
+
+function authActiveTutorialUser(req: IncomingMessage, deps: TutorialRouteDeps) {
+  return authenticateActiveCommercialUser(req, deps.jwtSecret, {
+    pool: deps.v3Supervisor?.pool,
+    verifyActiveAccount: deps.verifyActiveAccount,
+    skipDbActiveCheck: deps.skipDbActiveCheck,
+  })
+}
 
 function mapTutorialError(error: unknown): HttpError {
   if (error instanceof TutorialImageError) {
@@ -205,7 +222,7 @@ export async function handleSubmitCommunityTutorial(
   res: ServerResponse,
   deps: TutorialRouteDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authActiveTutorialUser(req, deps)
   const body = (await readJsonBody(req, COMMUNITY_TUTORIAL_MAX_BODY_BYTES)) as Record<string, unknown>
   try {
     const result = await submitCommunityTutorial(user.id, markdownDraft(body))
@@ -228,7 +245,7 @@ export async function handlePrecheckCommunityTutorial(
   res: ServerResponse,
   deps: TutorialRouteDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authActiveTutorialUser(req, deps)
   if (!communityBlogEnabled()) throw new HttpError(404, 'FEATURE_DISABLED', '经验分享未开启')
   if (!takeBlogPrecheckToken(user.id))
     throw new HttpError(429, 'RATE_LIMITED', '检查太频繁，稍等一分钟再试')
@@ -250,7 +267,7 @@ export async function handleSubmitTutorialSnapshot(
   res: ServerResponse,
   deps: TutorialRouteDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authActiveTutorialUser(req, deps)
   const body = (await readJsonBody(req, TUTORIAL_SNAPSHOT_MAX_BODY_BYTES)) as Record<string, unknown>
   try {
     const result = await submitSnapshotTutorial(user.id, {
@@ -278,7 +295,7 @@ export async function handleListOwnCommunityTutorials(
   res: ServerResponse,
   deps: TutorialRouteDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authenticateCommercialUser(req, deps.jwtSecret)
   const args = pageArgs(req)
   try {
     const page = await listOwnCommunityTutorials(user.id, args)
@@ -294,7 +311,7 @@ export async function handleGetOwnCommunityTutorial(
   res: ServerResponse,
   deps: TutorialRouteDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authenticateCommercialUser(req, deps.jwtSecret)
   const match = (req.url ?? '').match(/^\/api\/tutorials\/mine\/([1-9]\d*)(?:\?|$)/)
   if (!match?.[1]) throw new HttpError(400, 'BAD_REQUEST', 'invalid tutorial id')
   const item = await getOwnCommunityTutorial(match[1], user.id)
@@ -309,7 +326,7 @@ export async function handleUploadTutorialImage(
   res: ServerResponse,
   deps: TutorialRouteDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authActiveTutorialUser(req, deps)
   if (!communityBlogEnabled()) throw new HttpError(404, 'FEATURE_DISABLED', '经验分享未开启')
   const body = await readBinaryBody(req, TUTORIAL_IMAGE_MAX_BYTES)
   try {
@@ -339,7 +356,7 @@ export async function handleGetTutorialImage(
   res: ServerResponse,
   deps: TutorialRouteDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authenticateCommercialUser(req, deps.jwtSecret)
   const match = (req.url ?? '').match(/^\/api\/tutorials\/images\/([a-f0-9]{64})(?:\?|$)/)
   if (!match?.[1]) throw new HttpError(400, 'BAD_REQUEST', 'invalid image id')
   let isAdmin = false
@@ -384,7 +401,7 @@ export async function handleWithdrawCommunityTutorial(
   res: ServerResponse,
   deps: TutorialRouteDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authActiveTutorialUser(req, deps)
   try {
     await withdrawCommunityTutorial(tutorialId(req, '/withdraw'), user.id)
     sendJson(res, 200, { ok: true })
@@ -401,7 +418,7 @@ export async function handleReviseCommunityTutorial(
   res: ServerResponse,
   deps: TutorialRouteDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authActiveTutorialUser(req, deps)
   const id = tutorialId(req, '/revise')
   const body = (await readJsonBody(req, COMMUNITY_TUTORIAL_MAX_BODY_BYTES)) as Record<string, unknown>
   try {

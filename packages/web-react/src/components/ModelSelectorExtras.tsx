@@ -195,7 +195,6 @@ export function SegmentPill({
   return (
     <button
       type="button"
-      role="menuitem"
       aria-pressed={active}
       disabled={disabled}
       title={title}
@@ -518,7 +517,7 @@ export function ModelSelectorExtras({
                 }}
               >
                 <span>Fast</span>
-                <span className="text-micro tabular-nums opacity-80">按 {fastTierMult}× 计费</span>
+                <span className="text-caption tabular-nums opacity-80">按 {fastTierMult}× 计费</span>
                 <CostMark model={selected} multiplier={fastTierMult} />
               </SegmentPill>
               {availableServiceTiers.includes('ultrafast') && (
@@ -533,7 +532,7 @@ export function ModelSelectorExtras({
                   }}
                 >
                   <span>Ultrafast</span>
-                  <span className="text-micro tabular-nums opacity-80">按 {ultraTierMult}× 计费</span>
+                  <span className="text-caption tabular-nums opacity-80">按 {ultraTierMult}× 计费</span>
                   <CostMark model={selected} multiplier={ultraTierMult} />
                 </SegmentPill>
               )}
@@ -602,7 +601,7 @@ export function ModelSelectorExtras({
                 }}
               >
                 <span>1M</span>
-                <span className="text-micro tabular-nums opacity-80">1.5 倍基础单价</span>
+                <span className="text-caption tabular-nums opacity-80">1.5 倍基础单价</span>
               </SegmentPill>
             </div>
           </div>
@@ -658,7 +657,7 @@ export function ModelSelectorExtras({
           >
             <AtelierIcon name="swarm" size={13} className="mt-0.5 shrink-0 text-accent/80" />
             <span className="leading-relaxed">
-              当前模型不支持蜂群；切至 Gemini 4 / Antigravity 模型可启用蜂群协作。
+              当前模型不支持蜂群；切至带蜂群星轨徽标的模型即可启用蜂群协作。
             </span>
           </div>
         ) : null}

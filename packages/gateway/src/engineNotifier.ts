@@ -37,6 +37,8 @@ export type ResumeInjectPort = {
     failureClass?: DelegateFailureClass
     busy?: boolean
     gone?: boolean
+    /** Master rejected this epoch's clientMessageId as terminal `previously_failed`. */
+    previouslyFailed?: boolean
   }>
 }
 
@@ -79,6 +81,10 @@ export type NotifyClaimFence = {
   hasAAttempted?: () => boolean
   /** Durable a_attempted stamp; unknown tape holds until this + TAPE_ORACLE_UNKNOWN_HOLD_MS. */
   aAttemptedAt?: () => number | undefined
+  /** Signal that master rejected this epoch's clientMessageId as terminal `previously_failed`. */
+  notePreviouslyFailed?: () => void
+  /** Signal that the origin session is permanently gone (e.g. Master 404 SESSION_GONE). */
+  noteTerminalGone?: () => void
 }
 
 export type InlinePushRuntime = {
@@ -288,7 +294,14 @@ export class DefaultEngineNotifier implements EngineNotifier {
     try {
       const result = await this.opts.resumeInject.inject(event)
       if (result.ok) return { ok: true }
-      if (result.gone) return { ok: false, failureClass: result.failureClass ?? 'transport' }
+      if (result.previouslyFailed) {
+        notifyClaimFenceOf(event)?.notePreviouslyFailed?.()
+        return { ok: false, failureClass: result.failureClass ?? 'transport' }
+      }
+      if (result.gone) {
+        notifyClaimFenceOf(event)?.noteTerminalGone?.()
+        return { ok: false, failureClass: result.failureClass ?? 'transport' }
+      }
       if (result.busy) return { ok: false, failureClass: result.failureClass ?? 'internal' }
       return { ok: false, failureClass: result.failureClass ?? 'transport' }
     } catch {

@@ -20,6 +20,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ComponentProps,
   type ComponentPropsWithoutRef,
   type ReactNode,
 } from "react";
@@ -31,8 +32,10 @@ import { SignedAudio, SignedFileCard, SignedImg, SignedVideo, ZoomableImage } fr
 import { HtmlFileEmbed } from "./HtmlEmbed";
 import { CodeBlock } from "./CodeBlock";
 import { OptionsBlock, ChartBlock, HtmlPreview, MermaidBlock } from "./RichBlocks";
-import { IuiBlock } from "./iui/IuiBlock";
+import { LazyBoundary } from "./ChunkErrorBoundary";
+import { createRetryableLazy } from "./ui/retryableLazy";
 import { uiFencesToMarkdown } from "./iui/toMarkdown";
+import { isNextBlockCode } from "../lib/nextBlock";
 import { normalizeInlineUiFences } from "../lib/uiFence";
 import { useIntelligentUiEnabled } from "../lib/intelligentUi";
 import type { MarkdownProps } from "./Markdown";
@@ -43,6 +46,21 @@ import {
   detectCodeLanguageNow,
   SYNC_DETECT_MAX_CHARS,
 } from "../lib/codeLanguageDetect";
+
+/** Intelligent UI 渲染器（含 50+ 组件与 121 KB iui.css）按需懒加载，普通文本/代码回复零下载。 */
+const LazyIuiBlock = createRetryableLazy(() =>
+  import("./iui/IuiBlock").then((m) => ({ default: m.IuiBlock })),
+);
+
+const IUI_LAZY_FALLBACK = (
+  <div
+    className="oc-iui my-2 rounded-xl border border-border/70 bg-surface/60 px-3 py-2.5 text-meta text-faint"
+    data-iui="loading"
+    aria-busy="true"
+  >
+    正在加载交互视图…
+  </div>
+);
 
 /** 从(可能被 highlight 包成 span 的)code children 递归还原纯源码文本 —— mermaid/html 富块要原文。 */
 function nodeText(node: ReactNode): string {
@@ -67,20 +85,51 @@ const AUDIO_EXT = new Set(["mp3", "wav", "ogg", "m4a", "flac", "aac"]);
 
 type EmbedTag = "img" | "video" | "audio" | "filecard";
 
+const ARTIFACT_CONTAINER_PATH_RE = /^\/(?:home\/agent|root)\/\.openclaude\/(?:generated|uploads)\//;
+const SHELL_METACHAR_RE = /[\r\n;&|<>`$]/;
+const SCRIPT_INVOCATION_RE = /\.(?:sh|bash|py|js|mjs|cjs|ts|rb|pl)\s+\S/i;
+
+/** 规范化行内/裸路径候选(剥离可选 file:// 前缀与首尾空白/单双引号)。 */
+function normalizeEmbedCandidate(raw: string): string {
+  let s = raw.trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1).trim();
+  }
+  if (/^file:\/\/\//i.test(s)) {
+    const stripped = s.slice("file://".length);
+    if (ARTIFACT_CONTAINER_PATH_RE.test(stripped)) s = stripped;
+  }
+  return s;
+}
+
 /** 候选引用归类。媒体扩展名(容器路径/http/URL)→ 媒体标签;非媒体的容器文件路径 → 文件下载卡;否则 null。 */
-function classifyEmbed(raw: string): EmbedTag | null {
-  const s = raw.trim();
-  if (!s || /\s/.test(s)) return null;
+function classifyEmbed(raw: string): { tag: EmbedTag; src: string } | null {
+  const s = normalizeEmbedCandidate(raw);
+  if (!s || SHELL_METACHAR_RE.test(s)) return null;
+  const isArtifactPath = ARTIFACT_CONTAINER_PATH_RE.test(s);
   const isContainerPath = s.startsWith("/") && !s.startsWith("//") && !s.startsWith("/api/");
   const isApiMedia = s.startsWith("/api/media");
   const isUrl = /^https?:\/\//i.test(s);
-  const m = /\.([a-z0-9]+)(?:\?.*)?$/i.exec(s);
+  // 普通路径不含空白;生成/上传交付路径允许文件名内含空格(如中文/英文带空格 .docx/.pdf/.zip),
+  // 但仍拒绝明显命令串、目录路径与路径穿越。
+  if (/\s/.test(s)) {
+    if (!isArtifactPath) return null;
+    if (SCRIPT_INVOCATION_RE.test(s) || /\s--?[A-Za-z]/.test(s)) return null;
+  }
+  if (isContainerPath) {
+    if (s.endsWith("/")) return null;
+    const withoutQuery = s.split("?")[0] ?? s;
+    if (withoutQuery.split("/").some((seg) => seg === "." || seg === "..")) return null;
+  }
+  const basename = (s.split("?")[0] ?? s).split("/").pop() ?? "";
+  // 有效文件扩展名必须以字母开头(排除目录版本号如 v1.0 / run.2026),且前面有非空文件名。
+  const m = /^.+?\.([a-z][a-z0-9]{0,9})$/i.exec(basename);
   if (!m) return null;
   const e = m[1].toLowerCase();
   const media = IMG_EXT.has(e) ? "img" : VIDEO_EXT.has(e) ? "video" : AUDIO_EXT.has(e) ? "audio" : null;
-  if (media) return isContainerPath || isApiMedia || isUrl ? media : null;
+  if (media) return isContainerPath || isApiMedia || isUrl ? { tag: media, src: s } : null;
   // 非媒体:仅容器文件路径(生成/上传)→ 可下载文件卡(http 普通链接不碰,保持普通超链接)。
-  return isContainerPath ? "filecard" : null;
+  return isContainerPath ? { tag: "filecard", src: s } : null;
 }
 
 type HastNode = {
@@ -114,7 +163,8 @@ function embedEl(tag: EmbedTag, src: string): HastNode {
 }
 
 // 纯文本只认 openclaude 生成/上传目录 + /api/media(收口,避免误判普通 "/path")。
-const TEXT_PATH_RE = /(?:\/(?:home\/agent|root)\/\.openclaude|\/api\/media)\/[^\s"'`<>，。、；：）)】」]+\.[A-Za-z0-9]{1,10}/g;
+// 允许中文文件名含全角括号等常见字符,但仍要求以有效字母扩展名结尾。
+const TEXT_PATH_RE = /(?:\/(?:home\/agent|root)\/\.openclaude|\/api\/media)\/[^\s"'`<>，。、；：】」]+\.[A-Za-z][A-Za-z0-9]{0,9}/g;
 
 function rehypeEmbedMedia() {
   return (tree: HastNode) => visit(tree);
@@ -126,24 +176,13 @@ function rehypeEmbedMedia() {
       // ① 行内 code(块级 ``` 在 <pre> 里、带 language- class 的不碰)。
       if (child.type === "element" && child.tagName === "code") {
         if (node.tagName !== "pre" && isInlineCode(child)) {
-          const tag = classifyEmbed(hastText(child));
-          if (tag) kids[i] = embedEl(tag, hastText(child).trim());
+          const classified = classifyEmbed(hastText(child));
+          if (classified) kids[i] = embedEl(classified.tag, classified.src);
         }
         continue;
       }
-      // 已有链接不下钻。pre：仅当整块就是一条白名单路径时转 filecard（防模型套 ```）。
-      if (child.type === "element" && child.tagName === "a") continue;
-      if (child.type === "element" && child.tagName === "pre") {
-        const codeKids = (child.children || []).filter((k) => k.type === "element" && k.tagName === "code");
-        if (codeKids.length === 1) {
-          const text = hastText(codeKids[0]!).trim();
-          if (text && !/\s/.test(text)) {
-            const tag = classifyEmbed(text);
-            if (tag) kids[i] = embedEl(tag, text);
-          }
-        }
-        continue;
-      }
+      // 已有链接与围栏代码块不下钻：三反引号围栏一律保留 pre/code 与复制按钮，绝不替换为下载卡（与 ProcessDisclosure 一致，OCV5-865）。
+      if (child.type === "element" && (child.tagName === "a" || child.tagName === "pre")) continue;
       // ② 纯文本:扫容器路径并切分插入媒体/文件元素。
       if (child.type === "text" && typeof child.value === "string") {
         const parts = splitText(child.value);
@@ -164,10 +203,10 @@ function rehypeEmbedMedia() {
     let last = 0;
     let m: RegExpExecArray | null = TEXT_PATH_RE.exec(value);
     while (m !== null) {
-      const tag = classifyEmbed(m[0]);
-      if (tag) {
+      const classified = classifyEmbed(m[0]);
+      if (classified) {
         if (m.index > last) out.push({ type: "text", value: value.slice(last, m.index) });
-        out.push(embedEl(tag, m[0]));
+        out.push(embedEl(classified.tag, classified.src));
         last = m.index + m[0].length;
       }
       m = TEXT_PATH_RE.exec(value);
@@ -237,7 +276,7 @@ function MarkdownTable({ children, className, ...props }: ComponentPropsWithoutR
           <div
             aria-hidden="true"
             data-testid="markdown-table-fade"
-            className="pointer-events-none absolute inset-y-px right-px w-8 rounded-r-[11px] bg-gradient-to-l from-surface via-surface/75 to-transparent"
+            className="pointer-events-none absolute inset-y-px right-px w-8 rounded-r-md bg-gradient-to-l from-surface via-surface/75 to-transparent"
           />
         )}
       </div>
@@ -351,6 +390,9 @@ function hasMarkdownImage(children: ReactNode): boolean {
   });
 }
 
+const REMARK_PLUGINS = [remarkGfm, remarkMath];
+const REHYPE_KATEX_OPTIONS = { strict: false, throwOnError: false, errorColor: "var(--danger)" } as const;
+
 export default function MarkdownImpl({
   children,
   signMedia,
@@ -462,9 +504,16 @@ export default function MarkdownImpl({
               // 富块:mermaid 流程图 / html 沙盒预览(取原文,绕开 highlight 的 span 包裹)。
               if (lang === "mermaid") return <MermaidBlock code={nodeText(children).replace(/\n$/, "")} />;
               if (lang === "chart") return <ChartBlock code={nodeText(children).replace(/\n$/, "")} />;
-              // Intelligent UI(OCV5-361):```ui 块 → 原生组件。关闭可选组件时仅保留完整严格的系统审批引用，其余围栏已转成 Markdown。
-              if (lang === "ui")
-                return <IuiBlock code={nodeText(children).replace(/\n$/, "")} live={liveRef.current} readOnly={readOnly} />;
+              // Intelligent UI(OCV5-361):```ui 块 → 按需懒加载原生组件。输入预测块提前短路不触发下载。
+              if (lang === "ui") {
+                const rawCode = nodeText(children).replace(/\n$/, "");
+                if (isNextBlockCode(rawCode, !!liveRef.current)) return null;
+                return (
+                  <LazyBoundary fallback={IUI_LAZY_FALLBACK}>
+                    <LazyIuiBlock code={rawCode} live={liveRef.current} readOnly={readOnly} />
+                  </LazyBoundary>
+                );
+              }
               if (lang === "options")
                 return <OptionsBlock code={nodeText(children).replace(/\n$/, "")} readOnly={readOnly} />;
               if (!readOnly && (lang === "html" || lang === "htmlpreview"))
@@ -552,6 +601,33 @@ export default function MarkdownImpl({
     }),
     [signMedia, blockImages, readOnly, tutorialImage],
   );
+  const skipRichHighlight: SkipRichHighlightMode = tutorialImage
+    ? false
+    : readOnly
+      ? "non-html"
+      : "all";
+  const rehypePlugins = useMemo(
+    () => [
+      rehypeBareBreaks,
+      // detect=false 时没标语言的块不做同步语言探测（大文件预览防卡死，见 MarkdownProps.autoDetectCode）。
+      [rehypeHighlightShared, {
+        detect: autoDetectCode,
+        onPendingDetect,
+        knownLanguage,
+        // 只在流式尾段预取(项目文件预览等主动关探测的场景不探测)。
+        prefetchDetect: live && !autoDetectCode ? prefetchDetect : undefined,
+        skipRichBlocks: skipRichHighlight,
+      }],
+      // 数学公式：$..$ / $$..$$ → KaTeX 渲染(remarkMath 解析 + rehypeKatex 出 HTML)。
+      // errorColor 跟随主题 token(KaTeX 默认 #cc0000 在暗色底上对比度不足)。
+      [rehypeKatex, REHYPE_KATEX_OPTIONS],
+      // 仅在 signMedia(助手正文)启用：把媒体路径行内码转成可签名媒体节点。
+      ...(signMedia && !readOnly ? [rehypeEmbedMedia] : []),
+      // 流式光标内联到最后一个文本块末尾(最后执行,看到的是最终树)。
+      ...(caret ? [rehypeLiveCaret] : []),
+    ] as ComponentProps<typeof ReactMarkdown>["rehypePlugins"],
+    [autoDetectCode, onPendingDetect, knownLanguage, live, prefetchDetect, skipRichHighlight, signMedia, readOnly, caret],
+  );
   let source = typeof children === "string" ? children : "";
   // 流式中未闭合的 $$:截掉半截公式,块后给一行静默占位(OCV5-421)。
   const heldMath = live && typeof children === "string" ? unclosedDisplayMathStart(children) : -1;
@@ -559,25 +635,8 @@ export default function MarkdownImpl({
   const body = (
     <>
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[
-          rehypeBareBreaks,
-          // detect=false 时没标语言的块不做同步语言探测（大文件预览防卡死，见 MarkdownProps.autoDetectCode）。
-          [rehypeHighlightShared, {
-            detect: autoDetectCode,
-            onPendingDetect,
-            knownLanguage,
-            // 只在流式尾段预取(项目文件预览等主动关探测的场景不探测)。
-            prefetchDetect: live && !autoDetectCode ? prefetchDetect : undefined,
-          }],
-          // 数学公式：$..$ / $$..$$ → KaTeX 渲染(remarkMath 解析 + rehypeKatex 出 HTML)。
-          // errorColor 跟随主题 token(KaTeX 默认 #cc0000 在暗色底上对比度不足)。
-          [rehypeKatex, { strict: false, throwOnError: false, errorColor: "var(--danger)" }],
-          // 仅在 signMedia(助手正文)启用：把媒体路径行内码转成可签名媒体节点。
-          ...(signMedia && !readOnly ? [rehypeEmbedMedia] : []),
-          // 流式光标内联到最后一个文本块末尾(最后执行,看到的是最终树)。
-          ...(caret ? [rehypeLiveCaret] : []),
-        ]}
+        remarkPlugins={REMARK_PLUGINS}
+        rehypePlugins={rehypePlugins}
         components={components}
         urlTransform={tutorialImage ? tutorialUrlTransform : undefined}
       >
@@ -619,6 +678,11 @@ function sharedHighlight(options: Parameters<typeof rehypeHighlight>[0]) {
   return transformer;
 }
 
+type SkipRichHighlightMode = false | "non-html" | "all";
+
+const RICH_NON_HTML_LANGS = new Set(["mermaid", "chart", "ui", "options"]);
+const RICH_ALL_LANGS = new Set(["mermaid", "chart", "ui", "options", "html", "htmlpreview"]);
+
 type HighlightOptions = {
   detect?: boolean;
   onPendingDetect?: (text: string) => void;
@@ -629,49 +693,98 @@ type HighlightOptions = {
    * 直接命中缓存上色。尾段最后一个节点可能是还没闭合的围栏,不预取。
    */
   prefetchDetect?: (text: string) => void;
+  /** 跳过 mermaid/chart/ui/options/(非只读 html/htmlpreview) 富块的 highlight.js 无效分词。 */
+  skipRichBlocks?: SkipRichHighlightMode;
 };
 
-/**
- * 高亮插件。有标注的代码块照常交给 rehype-highlight;无标注的块(detect 开时)由 lib/codeLanguageDetect 定语言
- * (OCV5-422):已知或小块 → 按该语言高亮一次,与 rehype-highlight 自带探测选中该语言时的输出相同(类名 hljs、
- * language-x);都不像(null)→ 借 plaintext 跳过探测,再还原成「自动探测无结果」的样子(只加 hljs,正文原样);
- * 大块且还没探测过 → 本次按不探测渲染(与流式尾段相同的纯文本代码块),交给 onPendingDetect 分片探测,结果出来后
- * 调用方重渲一次上色。attacher 每次渲染都会被调用(react-markdown 每次重建处理器),所以回调按本次渲染闭包。
- */
-function rehypeHighlightShared({ detect = false, onPendingDetect, knownLanguage, prefetchDetect }: HighlightOptions = {}) {
-  const base = sharedHighlight({ detect: false });
-  if (!detect && prefetchDetect) {
-    return (tree: Parameters<typeof base>[0], file: Parameters<typeof base>[1]) => {
-      const root = tree as unknown as HastNode;
-      const tail = lastTextNode(root);
-      for (const node of unlabelledCodeBlocks(root)) {
-        if (tail && containsNode(node, tail)) continue; // 正文以它结尾:可能还没闭合
-        const text = hastText(node);
-        if (text.length > SYNC_DETECT_MAX_CHARS && cachedCodeLanguage(text) === undefined) prefetchDetect(text);
-      }
-      base(tree, file);
-    };
+function richBlockLanguage(node: HastNode): string | null {
+  for (const value of codeClassNames(node) ?? []) {
+    const name = String(value);
+    if (name === "no-highlight" || name === "nohighlight") return null;
+    if (name.startsWith("language-")) return name.slice(9).toLowerCase();
+    if (name.startsWith("lang-")) return name.slice(5).toLowerCase();
   }
-  if (!detect) return base;
+  return null;
+}
+
+function collectSkippedRichBlocks(tree: HastNode, mode: SkipRichHighlightMode): { node: HastNode; classes: unknown[] }[] {
+  if (!mode) return [];
+  const skipSet = mode === "all" ? RICH_ALL_LANGS : RICH_NON_HTML_LANGS;
+  const skipped: { node: HastNode; classes: unknown[] }[] = [];
+  const walk = (node: HastNode, parent: HastNode | null) => {
+    if (node.type === "element" && node.tagName === "code" && parent?.type === "element" && parent.tagName === "pre") {
+      const lang = richBlockLanguage(node);
+      if (lang && skipSet.has(lang)) {
+        const classes = codeClassNames(node) ?? [];
+        node.properties = { ...node.properties, className: [...classes, "no-highlight"] };
+        skipped.push({ node, classes });
+      }
+    }
+    for (const child of node.children ?? []) walk(child, node);
+  };
+  walk(tree, null);
+  return skipped;
+}
+
+function restoreSkippedRichBlocks(skipped: { node: HastNode; classes: unknown[] }[]): void {
+  for (const item of skipped) {
+    item.node.properties = { ...item.node.properties, className: item.classes };
+  }
+}
+
+/**
+ * 高亮插件。有标注的代码块照常交给 rehype-highlight（富块语言提前跳过分词）；无标注的块(detect 开时)由
+ * lib/codeLanguageDetect 定语言(OCV5-422):已知或小块 → 按该语言高亮一次,与 rehype-highlight 自带探测选中该语言
+ * 时的输出相同(类名 hljs、language-x);都不像(null)→ 借 plaintext 跳过探测,再还原成「自动探测无结果」的样子
+ * (只加 hljs,正文原样);大块且还没探测过 → 本次按不探测渲染(与流式尾段相同的纯文本代码块),交给 onPendingDetect
+ * 分片探测,结果出来后调用方重渲一次上色。attacher 每次渲染都会被调用(react-markdown 每次重建处理器),所以回调按本次渲染闭包。
+ */
+function rehypeHighlightShared({
+  detect = false,
+  onPendingDetect,
+  knownLanguage,
+  prefetchDetect,
+  skipRichBlocks = false,
+}: HighlightOptions = {}) {
+  const base = sharedHighlight({ detect: false });
+  if (!detect && !prefetchDetect && !skipRichBlocks) return base;
   return (tree: Parameters<typeof base>[0], file: Parameters<typeof base>[1]) => {
-    const blocks = unlabelledCodeBlocks(tree as unknown as HastNode).map((node) => {
-      const text = hastText(node);
-      const classes = codeClassNames(node) ?? [];
-      let language = knownLanguage?.(text);
-      if (language === undefined) language = cachedCodeLanguage(text);
-      if (language === undefined && text.length <= SYNC_DETECT_MAX_CHARS) language = detectCodeLanguageNow(text);
-      if (language === undefined) onPendingDetect?.(text);
-      node.properties = { ...node.properties, className: [...classes, `language-${language ?? "plaintext"}`] };
-      return { node, language, classes, children: node.children };
-    });
-    base(tree, file);
-    for (const block of blocks) {
-      if (typeof block.language === "string") continue;
-      block.node.children = block.children;
-      block.node.properties = {
-        ...block.node.properties,
-        className: block.language === null ? ["hljs", ...block.classes.filter((name) => name !== "hljs")] : block.classes,
-      };
+    const root = tree as unknown as HastNode;
+    const skipped = collectSkippedRichBlocks(root, skipRichBlocks);
+    try {
+      if (!detect) {
+        if (prefetchDetect) {
+          const tail = lastTextNode(root);
+          for (const node of unlabelledCodeBlocks(root)) {
+            if (tail && containsNode(node, tail)) continue; // 正文以它结尾:可能还没闭合
+            const text = hastText(node);
+            if (text.length > SYNC_DETECT_MAX_CHARS && cachedCodeLanguage(text) === undefined) prefetchDetect(text);
+          }
+        }
+        base(tree, file);
+        return;
+      }
+      const blocks = unlabelledCodeBlocks(root).map((node) => {
+        const text = hastText(node);
+        const classes = codeClassNames(node) ?? [];
+        let language = knownLanguage?.(text);
+        if (language === undefined) language = cachedCodeLanguage(text);
+        if (language === undefined && text.length <= SYNC_DETECT_MAX_CHARS) language = detectCodeLanguageNow(text);
+        if (language === undefined) onPendingDetect?.(text);
+        node.properties = { ...node.properties, className: [...classes, `language-${language ?? "plaintext"}`] };
+        return { node, language, classes, children: node.children };
+      });
+      base(tree, file);
+      for (const block of blocks) {
+        if (typeof block.language === "string") continue;
+        block.node.children = block.children;
+        block.node.properties = {
+          ...block.node.properties,
+          className: block.language === null ? ["hljs", ...block.classes.filter((name) => name !== "hljs")] : block.classes,
+        };
+      }
+    } finally {
+      restoreSkippedRichBlocks(skipped);
     }
   };
 }

@@ -3278,3 +3278,47 @@ test("OCV5-834: Codex 活动流无白卡外壳、旁白自然呈现且连续只�
   for (const toggle of screen.queryAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
   expect(within(stages).getByTestId("process-explore-cluster")).toHaveTextContent("已探索 3 处文件与代码");
 });
+
+test("OCV5-868: 跨 tab/分页尚缺新轮 user 行时，前轮已落盘终答保持在正式回答位、不与新一轮运行中工具粘连进同一过程壳", async () => {
+  renderList(
+    [
+      row("t1-read", "tool", "读取", {
+        _source: "server",
+        _clientMessageId: "u1-paged",
+        _turnTapeId: "tape-1",
+        _turnTapeOrdinal: 100,
+        _turnTapeComplete: true,
+        toolName: "Read",
+        inputJson: { file_path: "src/lib/persist.ts" },
+        _completed: true,
+        ts: 1_700_000_001_000,
+      }),
+      row("t1-final", "assistant", "要我现在直接建单修复并合入个人版上线吗？", {
+        _source: "server",
+        _clientMessageId: "u1-paged",
+        _turnTapeId: "tape-1",
+        _turnTapeOrdinal: 173,
+        _turnTapeComplete: true,
+        ts: 1_700_000_005_000,
+      }),
+      row("t2-bash", "tool", "", {
+        _clientMessageId: "u2-active",
+        _turnOwnerId: "u2-active",
+        toolName: "oc_bash",
+        inputJson: { command: "npx vitest run" },
+        ts: 1_700_000_020_000,
+      }),
+    ],
+    { sending: true },
+  );
+  const answer = await screen.findByText("要我现在直接建单修复并合入个人版上线吗？");
+  expect(answer).toBeVisible();
+  // 前轮终答必须在顶层 assistant-row（而非被吞进当前活跃轮的 process-stages 中间叙述）
+  expect(answer.closest('[data-testid="assistant-row"]')).not.toBeNull();
+  expect(answer.closest('[data-testid="process-stages"]')).toBeNull();
+  // 新一轮运行中工具必须位于前轮终答之后（独立活跃过程壳，不被 carry 吸到前轮终答上方）
+  const activeStage = screen.getByTestId("process-step-live");
+  expect(
+    answer.compareDocumentPosition(activeStage) & Node.DOCUMENT_POSITION_FOLLOWING,
+  ).toBeTruthy();
+});

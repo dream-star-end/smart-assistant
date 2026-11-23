@@ -1,10 +1,10 @@
 import { Archive, ChevronRight, Lock, MessageSquarePlus, SearchX, Sparkles, Store } from "lucide-react";
-import { lazy, Suspense, useCallback, useEffect, useId, useMemo, useState } from "react";
+import { lazy, useCallback, useEffect, useId, useMemo, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
-import { formatBytes } from "../../lib/chat/download";
 import { CHAT_CREATE_TEMPLATES } from "../../lib/chatCreateTemplates";
 import type { AuthSession, MarketplaceMyAgent, SkillSummary } from "../../lib/types";
 import { cn } from "../../lib/utils";
+import { LazyBoundary } from "../ChunkErrorBoundary";
 import { agentScopeLabels } from "../AgentScopePicker";
 import {
   Alert,
@@ -174,7 +174,7 @@ export function SkillsPanel({
       try {
         await api.archiveSkill(auth, sk.name, "manual_archive");
         setReload((n) => n + 1);
-        toast(`已归档技能「${title}」，随时可在归档箱恢复`, "success");
+        toast(`已收纳技能「${title}」，随时可在已收纳记录恢复`, "success");
       } catch (e) {
         toast(apiErrorMessage(e, "归档失败"), "error");
       } finally {
@@ -212,7 +212,7 @@ export function SkillsPanel({
               onClick={() => setArchiveOpen(true)}
               className="oc-btn-tactile gap-1.5 rounded-lg px-2.5 text-muted hover:text-fg"
             >
-              <Archive size={14} strokeWidth={1.75} aria-hidden="true" /> 归档箱
+              <Archive size={14} strokeWidth={1.75} aria-hidden="true" /> 已收纳记录
             </Button>
             {onOpenMarketplace && (
               <Button
@@ -322,7 +322,7 @@ export function SkillsPanel({
         </>
       )}
       {archiveOpen && (
-        <Suspense fallback={null}>
+        <LazyBoundary fallback={null}>
           <ContextArchiveDrawer
             open={archiveOpen}
             onOpenChange={setArchiveOpen}
@@ -331,7 +331,7 @@ export function SkillsPanel({
             initialTab="skills"
             onRestored={() => setReload((n) => n + 1)}
           />
-        </Suspense>
+        </LazyBoundary>
       )}
     </div>
   );
@@ -388,12 +388,12 @@ function SkillRow({
         aria-haspopup="dialog"
         aria-label={`${skill.writable ? "打开" : "查看"} ${display.title}`}
         aria-describedby={descId}
-        className="group flex min-h-14 min-w-0 flex-1 items-center gap-3 px-4 py-3.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        className="group flex min-h-14 min-w-0 max-w-full flex-1 items-center gap-3 overflow-hidden px-4 py-3.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
       >
         <span
           aria-hidden="true"
           className={cn(
-            "oc-icon-badge size-8 rounded-lg",
+            "oc-icon-badge size-8 shrink-0 rounded-lg",
             isHub ? "oc-icon-badge-info" : skill.writable === false ? "" : "oc-icon-badge-accent",
           )}
         >
@@ -405,7 +405,7 @@ function SkillRow({
             <Sparkles size={14} strokeWidth={1.8} />
           )}
         </span>
-        <span className="min-w-0 flex-1">
+        <span className="min-w-0 max-w-full flex-1 overflow-hidden">
           <span data-skill-title="" className="block truncate text-sm font-medium leading-5 tracking-tight text-fg">
             {display.title}
           </span>
@@ -426,29 +426,12 @@ function SkillRow({
                 {isHub ? "市场" : "自建"}
               </span>
             </span>
-            {skill.tier === "hot" && (
-              <span className="shrink-0">
-                <span className="oc-badge-craft inline-flex items-center rounded-full bg-success-soft px-1.5 py-0.5 text-caption font-medium text-success">
-                  常驻/热
-                </span>
-              </span>
-            )}
-            {skill.tier === "cold" && (
-              <span className="shrink-0">
-                <span className="oc-badge-craft inline-flex items-center rounded-full bg-warning-soft px-1.5 py-0.5 text-caption font-medium text-warning">
-                  冷门
-                </span>
-              </span>
-            )}
             {skill.writable === false && (
               <span className="shrink-0">
                 <span className="oc-badge-craft inline-flex items-center rounded-full bg-hover px-1.5 py-0.5 text-caption text-muted">
                   只读
                 </span>
               </span>
-            )}
-            {typeof skill.bytes === "number" && skill.bytes > 0 && (
-              <span className="shrink-0 tabular-nums text-faint">{formatBytes(skill.bytes)}</span>
             )}
             {typeof skill.useCount30d === "number" && skill.useCount30d > 0 && (
               <span className="shrink-0 tabular-nums text-faint">近30天 {skill.useCount30d} 次</span>
@@ -477,7 +460,7 @@ function SkillRow({
           <IconButton
             size="sm"
             aria-label={`归档技能 ${display.title}`}
-            title="移入归档箱（移出常驻注入，随时可恢复）"
+            title="移入已收纳记录（随时可恢复）"
             disabled={archiving}
             className="oc-icon-btn-tactile shrink-0 text-faint hover:text-fg"
             onClick={(e) => {

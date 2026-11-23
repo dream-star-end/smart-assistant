@@ -5,7 +5,7 @@ import { AuthEpochStaleError, apiErrorMessage } from "../../lib/api";
 import { identityCompatApi, type PersonaDocument } from "../../lib/identityCompat";
 import type { AuthSession } from "../../lib/types";
 import { cn } from "../../lib/utils";
-import { Alert, Badge, Button, Textarea, useToast } from "../ui";
+import { Alert, Badge, Button, Textarea, useConfirm, useToast } from "../ui";
 
 type Registration = IdentityCompatProjection["profiles"][number];
 
@@ -34,9 +34,32 @@ export function IdentityManual({ auth, agentId, authority }: {
   auth: AuthSession; agentId: string; authority: ReturnType<typeof useIdentityManualAuthority>;
 }) {
   const [open, setOpen] = useState(false);
+  const [dirty, setDirty] = useState(false);
+  const [confirmCollapse, confirmCollapseEl] = useConfirm();
   const sectionId = useId();
   const { projection, loading, error, retry } = authority;
   const registration = projection?.profiles.find(({ profile }) => profile.canonicalAgentId === agentId);
+  async function toggleOpen() {
+    if (!open) {
+      setOpen(true);
+      return;
+    }
+    if (!dirty) {
+      setOpen(false);
+      return;
+    }
+    const ok = await confirmCollapse({
+      title: "放弃未保存的手册更改？",
+      body: "本地运行手册还有未保存的修改，收起后会丢失当前草稿。",
+      confirmText: "放弃并收起",
+      cancelText: "继续编辑",
+      danger: true,
+    });
+    if (ok === true) {
+      setDirty(false);
+      setOpen(false);
+    }
+  }
   if (loading) return <span className="sr-only" data-testid="identity-manual-loading">读取手册入口</span>;
   // 附属能力的读失败只值一行：改造前是整宽 warning Alert 压在记忆面板首屏第一块
   // （预览台 /api/agents 未打桩时每张记忆截图都带着它；生产里旧后端 / 网关抖动同样触发）。
@@ -69,7 +92,7 @@ export function IdentityManual({ auth, agentId, authority }: {
                 className="oc-btn-tactile h-auto gap-1 px-0 text-section font-semibold text-fg hover:text-accent"
                 aria-expanded={open}
                 aria-controls={sectionId}
-                onClick={() => setOpen(v => !v)}
+                onClick={() => void toggleOpen()}
               >
                 <span>本实例运行手册</span>
                 <ChevronRight
@@ -91,13 +114,14 @@ export function IdentityManual({ auth, agentId, authority }: {
             智能体当前不可执行；仍可编辑本实例手册，保存不会恢复执行权限。
           </Alert>
         )}
-        {open && <div id={sectionId} className="mt-4 border-t border-border/70 pt-4"><ManualEditor auth={auth} registration={registration} /></div>}
+        {open && <div id={sectionId} className="mt-4 border-t border-border/70 pt-4"><ManualEditor auth={auth} registration={registration} onDirtyChange={setDirty} /></div>}
       </div>
+      {confirmCollapseEl}
     </section>
   );
 }
 
-function ManualEditor({ auth, registration }: { auth: AuthSession; registration: Registration }) {
+function ManualEditor({ auth, registration, onDirtyChange }: { auth: AuthSession; registration: Registration; onDirtyChange?: (dirty: boolean) => void }) {
   const { profile } = registration;
   const toast = useToast();
   const [local, setLocal] = useState<PersonaDocument | null>(null);
@@ -124,6 +148,11 @@ function ManualEditor({ auth, registration }: { auth: AuthSession; registration:
     ]).finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; mounted.current = false; };
   }, [auth, profile.legacyAgentId, profile.canonicalAgentId, retry]);
+  const isDirty = Boolean(local && draft !== local.text);
+  useEffect(() => {
+    onDirtyChange?.(isDirty);
+    return () => onDirtyChange?.(false);
+  }, [isDirty, onDirtyChange]);
   async function save() {
     if (!local || saving || loading) return;
     if (auth.snapshot().epoch !== formEpoch.current) { setLocal(null); return; }
@@ -134,7 +163,7 @@ function ManualEditor({ auth, registration }: { auth: AuthSession; registration:
       if (!mounted.current || auth.snapshot().epoch !== formEpoch.current) return;
       const verified = await identityCompatApi.getPersona(auth, profile.legacyAgentId);
       if (!mounted.current || auth.snapshot().epoch !== formEpoch.current) return;
-      if (verified.text !== submitted) throw new Error("saved text did not match readback");
+      if (verified.text !== submitted) throw new Error("保存未能确认，请重新读取本地手册后再试");
       setLocal(verified); setDraft(verified.text);
       toast("本地手册已保存并核对", "success");
     } catch (e) {
@@ -152,7 +181,6 @@ function ManualEditor({ auth, registration }: { auth: AuthSession; registration:
           </span>
           <h3 className="text-body font-semibold text-fg">市场底线（只读）</h3>
         </div>
-        {market && <p className="min-w-0 break-all font-mono text-caption text-faint">来源：{market.path}</p>}
       </div>
       {market ? (
         <pre
@@ -176,7 +204,6 @@ function ManualEditor({ auth, registration }: { auth: AuthSession; registration:
         </span>
         <div className="min-w-0 flex-1">
           <h3 className="text-body font-semibold text-fg">本地运行手册（可编辑）</h3>
-          <p className="mt-0.5 break-all font-mono text-caption text-faint">登记来源：{profile.localPersonaPath}</p>
           <p className="mt-1 text-caption leading-relaxed text-muted">
             仅保存本地手册；不修改市场人格、模型或权限。规则冲突时遵守市场底线及平台审批要求。
           </p>
@@ -187,7 +214,6 @@ function ManualEditor({ auth, registration }: { auth: AuthSession; registration:
         <p role="status" className="text-caption text-muted">正在读取手册…</p>
       ) : local && (
         <>
-          <p className="break-all font-mono text-caption text-faint">实际文件：{local.path}</p>
           <Textarea
             aria-label="本地运行手册正文"
             rows={10}
@@ -212,6 +238,16 @@ function ManualEditor({ auth, registration }: { auth: AuthSession; registration:
             )}
           </div>
         </>
+      )}
+      {(market?.path || profile.localPersonaPath || local?.path) && (
+        <details className="text-caption text-faint">
+          <summary className="cursor-pointer select-none hover:text-muted">查看文件路径详情</summary>
+          <div className="mt-1.5 space-y-1 break-all font-mono">
+            {market?.path && <p>市场底线：{market.path}</p>}
+            {profile.localPersonaPath && <p>登记路径：{profile.localPersonaPath}</p>}
+            {local?.path && <p>实际文件：{local.path}</p>}
+          </div>
+        </details>
       )}
       {error && (
         <Alert

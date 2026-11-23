@@ -4,7 +4,7 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Session, User } from "../lib/types";
-import { Sidebar } from "./Sidebar";
+import { Sidebar, type SidebarProps } from "./Sidebar";
 import { SEARCH_DEBOUNCE_MS } from "./sidebar/constants";
 
 const dotRenders = vi.hoisted(() => ({ count: 0 }));
@@ -35,7 +35,7 @@ function session(id: string, over: Partial<Session> = {}): Session {
 const sessions = [session("s1"), session("s2"), session("s3")];
 
 /** 模拟 App 一次重渲：所有回调和 isSending 都是新闭包，socketVersion 前进。 */
-function frame(version: number, sending: ReadonlySet<string> = new Set(), extra: Partial<Parameters<typeof Sidebar>[0]> = {}) {
+function frame(version: number, sending: ReadonlySet<string> = new Set(), extra: Partial<SidebarProps> = {}) {
   return (
     <Sidebar
       sessions={sessions}

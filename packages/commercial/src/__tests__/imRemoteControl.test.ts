@@ -219,6 +219,12 @@ describe('B7 — WeChat owner verification, shared-bot negative control & author
       assert.match(approved.reply, /已批准短码 5101/)
     }
 
+    const listed = await broker.onInbound(mkEvt('/sessions', 'owner-wx-42'))
+    assert.equal(listed.kind, 'command_echo')
+    if (listed.kind === 'command_echo') {
+      assert.match(listed.reply, /最近会话（微信）/)
+    }
+
     const switched = await broker.onInbound(mkEvt('/switch 2', 'owner-wx-42'))
     assert.equal(switched.kind, 'command_echo')
     assert.equal(stack.getCurrentSessionId(), 'wsess-2222222222222222')

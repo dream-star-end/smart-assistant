@@ -313,6 +313,210 @@ describe('oc-docx check', { skip: !pythonDocxAvailable }, () => {
     }
   })
 
+  test('OC_DOCXCHECK unset defaults to strict check (emits VERDICT and enforces rules)', async () => {
+    const work = mkdtempSync(join(tmpdir(), 'oc-docx-check-default-on-'))
+    try {
+      const input = join(work, 'plain.docx')
+      writePlainDocx(input)
+      const pathEnv = fakeRenderBin(work)
+      const env: NodeJS.ProcessEnv = { ...process.env, PATH: pathEnv }
+      delete env.OC_DOCXCHECK
+      const result = await new Promise<RunResult>((done, reject) => {
+        const child = spawn(process.env.PYTHON ?? '/usr/bin/python3', [CLI, 'check', input, '--expect-formulas'], {
+          cwd: REPO_ROOT,
+          env,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+        let stdout = ''
+        let stderr = ''
+        child.stdout.on('data', (chunk) => (stdout += String(chunk)))
+        child.stderr.on('data', (chunk) => (stderr += String(chunk)))
+        child.once('error', reject)
+        child.once('close', (code) => done({ code, stdout, stderr }))
+      })
+      assert.equal(result.code, 1)
+      const { report, verdict } = parseCheckStdout(result.stdout)
+      assert.equal(verdict, 'FAIL')
+      assert.ok(report.failures.some((item: { code: string }) => item.code === 'omml-missing'))
+    } finally {
+      rmSync(work, { recursive: true, force: true })
+    }
+  })
+
+  test('default convert strips empty comments.xml, static empty TOC, and avoids duplicate heading numbering (OCV5-874 #5)', async () => {
+    const work = mkdtempSync(join(tmpdir(), 'oc-docx-convert-clean-'))
+    try {
+      const refDocx = join(work, 'reference.docx')
+      execFileSync(
+        process.env.PYTHON ?? '/usr/bin/python3',
+        [join(REPO_ROOT, 'packages/commercial/agent-sandbox/runtime/create-docgen-reference.py'), refDocx],
+        { cwd: REPO_ROOT },
+      )
+      const md = join(work, 'numbered.md')
+      const docx = join(work, 'numbered.docx')
+      writeFileSync(md, '# 1. 引言\n\n正文内容。\n\n## 1.1 研究背景\n\n细节说明。\n', 'utf8')
+      const converted = await run(['convert', md, '--reference-doc', refDocx, '-o', docx], {})
+      assert.equal(converted.code, 0, converted.stderr)
+      const inspected = await run(['inspect', docx], {})
+      assert.equal(inspected.code, 0, inspected.stderr)
+      const report = JSON.parse(inspected.stdout)
+      assert.equal(report.has_comments_xml, false, 'must not carry empty word/comments.xml warning')
+      assert.ok(
+        !report.warnings.some((w: string) => w.includes('批注')),
+        `unexpected comment warning: ${JSON.stringify(report.warnings)}`,
+      )
+      const checkXml = execFileSync(
+        process.env.PYTHON ?? '/usr/bin/python3',
+        [
+          '-c',
+          [
+            'import json, sys, zipfile',
+            'with zipfile.ZipFile(sys.argv[1]) as z:',
+            '  members = z.namelist()',
+            '  doc = z.read("word/document.xml").decode("utf-8")',
+            'print(json.dumps({"has_comments_member": "word/comments.xml" in members, "has_toc_placeholder": "Table of Contents" in doc, "has_section_number": "SectionNumber" in doc}))',
+          ].join('\n'),
+          docx,
+        ],
+        { encoding: 'utf8' },
+      )
+      const xmlFacts = JSON.parse(checkXml)
+      assert.equal(xmlFacts.has_comments_member, false, 'word/comments.xml should be stripped when empty')
+      assert.equal(xmlFacts.has_toc_placeholder, false, 'default convert must not leave static Table of Contents placeholder')
+      assert.equal(xmlFacts.has_section_number, false, 'default convert must not force duplicate SectionNumber prefixes')
+    } finally {
+      rmSync(work, { recursive: true, force: true })
+    }
+  })
+
+  test('real LibreOffice StarMath render gate catches ¿/□ on bare $|\\Delta\\phi|<\\pi$ and $^\\circ$ and passes after fix (OCV5-874 #1)', async (t) => {
+    const hasTools = (() => {
+      try {
+        execFileSync('which', ['soffice', 'lowriter', 'pdftotext', 'pandoc'], { stdio: 'ignore' })
+        return true
+      } catch {
+        return false
+      }
+    })()
+    if (!hasTools) {
+      t.skip('soffice/pdftotext/pandoc not available')
+      return
+    }
+    const work = mkdtempSync(join(tmpdir(), 'oc-docx-starmath-gate-'))
+    try {
+      const badMd = join(work, 'bad.md')
+      const badDocx = join(work, 'bad.docx')
+      writeFileSync(badMd, '# Phase Condition\n\nBare condition $|\\Delta\\phi| < \\pi$ and angle 30 $^\\circ$.\n', 'utf8')
+      const convBad = await run(['convert', badMd, '--no-reference-doc', '-o', badDocx], {})
+      assert.equal(convBad.code, 0, convBad.stderr)
+
+      const badCheck = await run(['check', badDocx, '--expect-formulas'], {})
+      assert.equal(badCheck.code, 1, `expected StarMath garbled DOCX to FAIL:\n${badCheck.stdout}\n${badCheck.stderr}`)
+      const { report: badReport, verdict: badVerdict } = parseCheckStdout(badCheck.stdout)
+      assert.equal(badVerdict, 'FAIL')
+      assert.ok(
+        badReport.failures.some((item: { code: string }) => item.code === 'render-garbled-glyphs'),
+        `expected render-garbled-glyphs failure: ${JSON.stringify(badReport.failures)}`,
+      )
+      assert.ok(Array.isArray(badReport.render_garbled_hits) && badReport.render_garbled_hits.length >= 1)
+      assert.ok(
+        badReport.render_garbled_hits.some(
+          (h: { char: string; page: number; context: string }) =>
+            (h.char === '¿' || h.char === '□' || h.char === '❑') && h.page === 1 && h.context.length > 0,
+        ),
+        `expected StarMath garbled glyph hit (¿/□/❑) on page 1: ${JSON.stringify(badReport.render_garbled_hits)}`,
+      )
+
+      const goodMd = join(work, 'good.md')
+      const goodDocx = join(work, 'good.docx')
+      writeFileSync(goodMd, '# Phase Condition\n\nFixed condition $\\left|\\Delta\\phi\\right| < \\pi$ and angle 30°.\n', 'utf8')
+      const convGood = await run(['convert', goodMd, '--no-reference-doc', '-o', goodDocx], {})
+      assert.equal(convGood.code, 0, convGood.stderr)
+
+      const goodCheck = await run(['check', goodDocx, '--expect-formulas'], {})
+      assert.equal(goodCheck.code, 0, `expected fixed DOCX to PASS:\n${goodCheck.stdout}\n${goodCheck.stderr}`)
+      const { report: goodReport, verdict: goodVerdict } = parseCheckStdout(goodCheck.stdout)
+      assert.equal(goodVerdict, 'PASS')
+      assert.deepEqual(goodReport.render_garbled_hits, [])
+
+      // --no-render-check on badDocx skips StarMath garbled gate cleanly
+      const skippedCheck = await run(['check', badDocx, '--expect-formulas', '--no-render-check'], {})
+      assert.equal(skippedCheck.code, 0, `expected --no-render-check to PASS:\n${skippedCheck.stdout}\n${skippedCheck.stderr}`)
+
+      // Plain Spanish document with legitimate ¿ (omml_count=0) must PASS both default and --render-check
+      const esMd = join(work, 'spanish.md')
+      const esDocx = join(work, 'spanish.docx')
+      writeFileSync(esMd, '# Pregunta\n\n¿Dónde está el resultado experimental?\n', 'utf8')
+      const convEs = await run(['convert', esMd, '--no-reference-doc', '-o', esDocx], {})
+      assert.equal(convEs.code, 0, convEs.stderr)
+      const esCheckDefault = await run(['check', esDocx], {})
+      assert.equal(esCheckDefault.code, 0, `Spanish plain DOCX must PASS default check:\n${esCheckDefault.stdout}`)
+      const esCheckForced = await run(['check', esDocx, '--render-check'], {})
+      assert.equal(esCheckForced.code, 0, `Spanish plain DOCX must PASS --render-check:\n${esCheckForced.stdout}`)
+
+      // Spanish document WITH garbled OMML must STILL FAIL (excess ¿/□ beyond source text is caught)
+      const esBadMd = join(work, 'spanish-bad.md')
+      const esBadDocx = join(work, 'spanish-bad.docx')
+      writeFileSync(esBadMd, '# Pregunta\n\n¿Dónde está $|\\Delta\\phi| < \\pi$ a 30 $^\\circ$?\n', 'utf8')
+      const convEsBad = await run(['convert', esBadMd, '--no-reference-doc', '-o', esBadDocx], {})
+      assert.equal(convEsBad.code, 0, convEsBad.stderr)
+      const esBadCheck = await run(['check', esBadDocx, '--expect-formulas'], {})
+      assert.equal(esBadCheck.code, 1, `Spanish DOCX with StarMath ¿ must FAIL:\n${esBadCheck.stdout}`)
+
+      // Auditor R2 case 1 (leakage): bad formula + UNRENDERED first-page header containing ¿¿¿ must STILL FAIL
+      const badWithUnusedHeader = join(work, 'bad-unused-header.docx')
+      execFileSync(
+        process.env.PYTHON ?? '/usr/bin/python3',
+        [
+          '-c',
+          [
+            'import sys; from docx import Document',
+            'doc = Document(sys.argv[1])',
+            'sec = doc.sections[0]',
+            'sec.different_first_page_header_footer = False',
+            'sec.first_page_header.paragraphs[0].text = "¿¿¿"',
+            'doc.save(sys.argv[2])',
+          ].join('\n'),
+          badDocx,
+          badWithUnusedHeader,
+        ],
+      )
+      const unusedHeaderCheck = await run(['check', badWithUnusedHeader, '--expect-formulas'], {})
+      assert.equal(
+        unusedHeaderCheck.code,
+        1,
+        `unrendered first-page header ¿¿¿ must NOT mask StarMath ¿ in body:\n${unusedHeaderCheck.stdout}`,
+      )
+
+      // Auditor R2 case 2 (false positive): 2-page doc with valid OMML + repeating Spanish header ¿Resultados? must PASS
+      const twoPageHeaderDocx = join(work, 'two-page-header.docx')
+      execFileSync(
+        process.env.PYTHON ?? '/usr/bin/python3',
+        [
+          '-c',
+          [
+            'import sys; from docx import Document',
+            'doc = Document(sys.argv[1])',
+            'doc.sections[0].header.paragraphs[0].text = "¿Resultados?"',
+            'doc.add_page_break()',
+            'doc.add_paragraph("Segunda página con fórmula válida.")',
+            'doc.save(sys.argv[2])',
+          ].join('\n'),
+          goodDocx,
+          twoPageHeaderDocx,
+        ],
+      )
+      const twoPageCheck = await run(['check', twoPageHeaderDocx, '--expect-formulas'], {})
+      assert.equal(
+        twoPageCheck.code,
+        0,
+        `2-page DOCX with valid OMML and repeating Spanish header ¿Resultados? must PASS:\n${twoPageCheck.stdout}`,
+      )
+    } finally {
+      rmSync(work, { recursive: true, force: true })
+    }
+  })
+
   test('oc-docxcheck thin shell forwards to check --help', async () => {
     const result = await new Promise<RunResult>((done, reject) => {
       const child = spawn('bash', [CHECK_SH, '--help'], {

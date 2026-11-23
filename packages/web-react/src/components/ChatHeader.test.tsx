@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { type Agent, MAIN_AGENT } from "../lib/agents";
 import type { PublicModel } from "../lib/types";
-import { ChatHeader, compactMobileModelLabel, modKeyLabel } from "./ChatHeader";
+import { ChatHeader, type ChatHeaderProps, compactMobileModelLabel, modKeyLabel } from "./ChatHeader";
 
 // 本仓 vitest 未开 globals 自动 cleanup,显式隔离每个用例的 DOM。
 afterEach(cleanup);
@@ -20,7 +20,7 @@ const CODER_AGENT: Agent = {
   description: "资深全栈工程师",
 };
 
-function renderHeader(extra: Partial<Parameters<typeof ChatHeader>[0]> = {}) {
+function renderHeader(extra: Partial<ChatHeaderProps> = {}) {
   return render(
     <ChatHeader
       agent={MAIN_AGENT}
@@ -77,7 +77,7 @@ describe("ChatHeader 团队模式与顾问模式指示 chip", () => {
     expect(screen.getByRole("button", { name: "顾问模式已开启" }).textContent).toContain("顾问模式");
   });
 
-  it("顾问 chip 展示冻结型号，不改主模型选择器", () => {
+  it("顾问 chip 展示冻结型号，顶栏不再重复渲染主模型选择器", () => {
     renderHeader({
       advisorModeActive: true,
       advisorModelLabel: "gpt-6-astra",
@@ -88,24 +88,21 @@ describe("ChatHeader 团队模式与顾问模式指示 chip", () => {
     fireEvent.click(chip);
     expect(screen.getByText(/本回合固定使用 gpt-6-astra/)).toBeInTheDocument();
     expect(screen.getByText(/不承诺更省/)).toBeInTheDocument();
-    const trigger = screen.getByRole("button", { name: "选择对话模型" });
-    expect(trigger.textContent).toContain("GLM-5.2");
-    expect(trigger.textContent).not.toContain("GPT-6-Astra");
+    expect(screen.queryByRole("button", { name: "选择对话模型" })).toBeNull();
   });
 
-  it("teamModeActive=true 时顶栏 ModelSelector 显示实际生效的队长引擎(chip 表达团队模式,trigger 不再重复该词)", () => {
+  it("teamModeActive=true 时顶栏展示团队模式 chip 且与常驻智能体按钮同排", () => {
     renderHeader({ teamModeActive: true, onDisableTeamMode: () => {} });
-    const trigger = screen.getByRole("button", { name: "选择对话模型" });
-    expect(trigger.textContent).toContain("队长引擎 · GPT-6.2-Astra");
-    expect(trigger.textContent).not.toContain("团队模式");
-    expect(trigger.textContent).not.toContain("GLM-5.2");
-    expect(screen.getByRole("button", { name: "团队模式已开启" })).toBeInTheDocument();
+    const row = screen.getByTestId("chat-agent-row");
+    expect(row).toContainElement(screen.getByTestId("chat-agent-chip"));
+    expect(row).toContainElement(screen.getByRole("button", { name: "团队模式已开启" }));
+    expect(screen.queryByRole("button", { name: "选择对话模型" })).toBeNull();
   });
 
-  it("常态下 ModelSelector 仍显示用户自选模型", () => {
+  it("常态下顶栏常驻智能体选择器，不渲染对话模型选择器", () => {
     renderHeader();
-    const trigger = screen.getByRole("button", { name: "选择对话模型" });
-    expect(trigger.textContent).toContain("GLM-5.2");
+    expect(screen.getByTestId("chat-agent-chip")).toHaveTextContent(MAIN_AGENT.name);
+    expect(screen.queryByRole("button", { name: "选择对话模型" })).toBeNull();
   });
 });
 
@@ -126,6 +123,7 @@ describe("ChatHeader 未读状态点与零双红点（OCV5-843）", () => {
       unreadCount: 86,
       credits: "1696777",
       onOpenBilling: () => {},
+      onOpenFind: () => {},
     });
 
     const menu = screen.getByRole("button", { name: "打开菜单,128 条未读会话" });
@@ -150,7 +148,8 @@ describe("ChatHeader 未读状态点与零双红点（OCV5-843）", () => {
     expect(screen.queryByRole("button", { name: "账户与计费" })).toBeNull();
 
     openOverflowMenu();
-    await screen.findByTestId("overflow-agent-item");
+    await screen.findByTestId("overflow-find-item");
+    expect(screen.queryByTestId("overflow-agent-item")).toBeNull();
     expect(screen.queryByTestId("overflow-inbox-item")).toBeNull();
     expect(screen.queryByTestId("overflow-billing-item")).toBeNull();
     expect(screen.queryByTestId("overflow-update-item")).toBeNull();
@@ -190,13 +189,15 @@ describe("ChatHeader 快问小窗按钮与移动端菜单发送态（OCV5-843）
 });
 
 describe("ChatHeader 当前会话「···」溢出菜单与快捷键标签", () => {
-  it("「···」菜单桌面与移动常驻，收敛切换智能体、项目、会话内查找与分享会话", async () => {
-    const onAgentClick = vi.fn();
+  it("「···」菜单收敛项目、会话内查找与分享会话，不再重复放置切换智能体；无菜单项时不渲染空触发器", async () => {
+    renderHeader();
+    expect(screen.queryByTestId("header-overflow-trigger")).toBeNull();
+    cleanup();
+
     const onOpenProjectScope = vi.fn();
     const onOpenFind = vi.fn();
     const onShare = vi.fn();
     renderHeader({
-      onAgentClick,
       projectBreadcrumb: { chatName: "前端重构" },
       onOpenProjectScope,
       onOpenFind,
@@ -211,12 +212,10 @@ describe("ChatHeader 当前会话「···」溢出菜单与快捷键标签", ()
     expect(more.parentElement).not.toHaveClass("sm:hidden");
     expect(more.parentElement).not.toHaveClass("@[720px]:hidden");
 
-    const agentItem = await screen.findByTestId("overflow-agent-item");
-    expect(agentItem).toHaveTextContent("切换智能体");
-    expect(agentItem).toHaveTextContent(MAIN_AGENT.name);
+    expect(screen.queryByTestId("overflow-agent-item")).toBeNull();
 
     // 640-1023px 项目菜单项不再 sm:hidden，任何宽度均可直达项目
-    const projectItem = screen.getByTestId("overflow-project-item");
+    const projectItem = await screen.findByTestId("overflow-project-item");
     expect(projectItem).toHaveTextContent("项目：前端重构");
     expect(projectItem).not.toHaveClass("sm:hidden");
 
@@ -235,10 +234,6 @@ describe("ChatHeader 当前会话「···」溢出菜单与快捷键标签", ()
     openOverflowMenu();
     fireEvent.click(await screen.findByTestId("overflow-project-item"));
     expect(onOpenProjectScope).toHaveBeenCalledTimes(1);
-
-    openOverflowMenu();
-    fireEvent.click(await screen.findByTestId("overflow-agent-item"));
-    expect(onAgentClick).toHaveBeenCalledTimes(1);
   });
 
   it("非 Mac 平台显示 Ctrl+F，Mac 显示 ⌘F", async () => {
@@ -276,9 +271,9 @@ describe("ChatHeader 极简左侧与顶栏订阅入口（OCV5-844）", () => {
       sessionTitle: "性能回归排查",
     });
 
-    const headerRow = screen.getByTestId("chat-model-row").parentElement;
+    const headerRow = screen.getByTestId("chat-agent-row").parentElement;
     expect(headerRow).toHaveClass("flex-nowrap", "min-h-12");
-    expect(screen.getByTestId("chat-model-row")).toHaveClass("justify-center", "sm:justify-start");
+    expect(screen.getByTestId("chat-agent-row")).toHaveClass("justify-center", "sm:justify-start");
 
     const mobileLeft = screen.getByTestId("shell-mobile-left");
     const collapsedLeft = screen.getByTestId("shell-collapsed-left");
@@ -358,7 +353,7 @@ describe("ChatHeader 极简左侧与顶栏订阅入口（OCV5-844）", () => {
     expect(onOpenSubscription).toHaveBeenCalledTimes(1);
   });
 
-  it("默认全能助手不在桌面顶栏抢占头像位；非默认智能体展示紧凑芯片且可点击切换", () => {
+  it("默认全能助手与专职智能体均在顶栏主位常驻可点（桌面与移动均可一键切换）", () => {
     const onAgentClick = vi.fn();
     const { rerender } = render(
       <ChatHeader
@@ -369,7 +364,11 @@ describe("ChatHeader 极简左侧与顶栏订阅入口（OCV5-844）", () => {
         onSelectModel={() => {}}
       />,
     );
-    expect(screen.queryByTestId("chat-agent-chip")).toBeNull();
+    const mainChip = screen.getByTestId("chat-agent-chip");
+    expect(mainChip).not.toHaveClass("hidden");
+    expect(mainChip).toHaveTextContent(MAIN_AGENT.name);
+    fireEvent.click(mainChip);
+    expect(onAgentClick).toHaveBeenCalledTimes(1);
 
     rerender(
       <ChatHeader
@@ -381,20 +380,19 @@ describe("ChatHeader 极简左侧与顶栏订阅入口（OCV5-844）", () => {
       />,
     );
     const chip = screen.getByTestId("chat-agent-chip");
-    expect(chip).toHaveClass("hidden", "sm:inline-flex");
+    expect(chip).not.toHaveClass("hidden");
     expect(chip).toHaveTextContent("代码专家");
     fireEvent.click(chip);
-    expect(onAgentClick).toHaveBeenCalledTimes(1);
+    expect(onAgentClick).toHaveBeenCalledTimes(2);
   });
 
   it("项目面包屑按容器宽度 @[720px] 内联展示，不再被锁死在 lg+", () => {
     renderHeader({
-      selectedModelId: "gpt-6.2-astra",
       projectBreadcrumb: { chatName: "设计系统" },
       onOpenProjectScope: vi.fn(),
     });
     expect(screen.getByTestId("chat-project-breadcrumb")).toHaveClass("hidden", "@[720px]:inline-flex");
-    expect(screen.getByRole("button", { name: "选择对话模型" })).toHaveTextContent("GPT-6.2-Astra");
+    expect(screen.getByTestId("chat-agent-chip")).toHaveTextContent(MAIN_AGENT.name);
   });
 });
 
@@ -426,7 +424,7 @@ describe("ChatHeader 顶栏精简（无全宽版本通栏、无未分类推荐�
     expect(screen.getByTestId("chat-project-breadcrumb")).toHaveTextContent("别的项目");
   });
 
-  it("展示可选会话标题与强模型选择器，不再渲染纯展示型运行中胶囊", () => {
+  it("展示可选会话标题与常驻智能体选择器，不再渲染纯展示型运行中胶囊", () => {
     renderHeader({
       sessionTitle: "性能回归排查",
       running: true,
@@ -437,8 +435,8 @@ describe("ChatHeader 顶栏精简（无全宽版本通栏、无未分类推荐�
     });
     expect(screen.getByTestId("chat-session-title")).toHaveTextContent("性能回归排查");
     expect(screen.queryByTestId("header-running-badge")).toBeNull();
-    expect(screen.getByTestId("chat-model-row")).toContainElement(
-      screen.getByRole("button", { name: "选择对话模型" }),
+    expect(screen.getByTestId("chat-agent-row")).toContainElement(
+      screen.getByTestId("chat-agent-chip"),
     );
     expect(screen.getByTestId("header-workspace-toggles")).toContainElement(
       screen.getByTestId("detail-pane-toggle"),
@@ -469,18 +467,17 @@ describe("OCV5-831 ChatHeader 顶栏遮挡层与手机模型名去括号", () =>
 });
 
 describe("ChatHeader compact navigation (INC-20260908-CHAT-NAVIGATION)", () => {
-  it("keeps the agent accessible and groups the model independently of actions", async () => {
+  it("keeps the agent directly accessible in the primary slot and independent of actions", async () => {
     const onAgentClick = vi.fn();
     renderHeader({ onOpenMobileNav: vi.fn(), onOpenFind: vi.fn(), onAgentClick });
-    const row = screen.getByTestId("chat-model-row");
-    expect(row).toContainElement(screen.getByRole("button", { name: "选择对话模型" }));
+    const row = screen.getByTestId("chat-agent-row");
+    const chip = screen.getByTestId("chat-agent-chip");
+    expect(row).toContainElement(chip);
     expect(row).not.toContainElement(screen.getByTestId("header-overflow-trigger"));
     expect(row).not.toHaveClass("bg-hover/50");
     expect(row).not.toHaveClass("rounded-xl");
-    openOverflowMenu();
-    const agentItem = await screen.findByTestId("overflow-agent-item");
-    expect(agentItem).toHaveTextContent(MAIN_AGENT.name);
-    fireEvent.click(agentItem);
+    expect(chip).toHaveTextContent(MAIN_AGENT.name);
+    fireEvent.click(chip);
     expect(onAgentClick).toHaveBeenCalledTimes(1);
   });
 });

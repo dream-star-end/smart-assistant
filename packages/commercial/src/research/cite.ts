@@ -17,12 +17,26 @@
 import {
   type CitationStyle,
   type CitationVerdict,
+  type EvidenceGrade,
   type SourceRecord,
   formatApa,
   formatBibtex,
   formatCitation,
   formatGbt7714,
+  formatIeee,
+  formatNature,
+  resolveEvidenceGrade,
 } from "@openclaude/protocol/research";
+export {
+  type EvidenceGrade,
+  formatApa,
+  formatBibtex,
+  formatCitation,
+  formatGbt7714,
+  formatIeee,
+  formatNature,
+  resolveEvidenceGrade,
+};
 import {
   EUTILS_BASE,
   type FetchLike,
@@ -432,6 +446,10 @@ export async function verifyIdentifier(raw: string, deps: CiteDeps): Promise<Cit
     bibtex: adsBibtex ?? formatBibtex(record),
     gbt7714: formatGbt7714(record),
     apa: formatApa(record),
+    ieee: formatIeee(record),
+    nature: formatNature(record),
+    // 外部 DOI/arXiv/PubMed 题录解析不含本地全文逐字核验,权威分级一律为 'B'。
+    evidenceGrade: "B",
   };
 }
 

@@ -539,7 +539,7 @@ export default function OrgPage() {
     {
       key: "order_ids",
       title: "订单",
-      cellClassName: "font-mono text-[12px] text-muted",
+      cellClassName: "font-mono text-meta text-muted",
       render: (r) => {
         const ids = Array.isArray(r.order_ids) ? r.order_ids.join(", ") : String(r.order_ids ?? "");
         return (
@@ -561,7 +561,7 @@ export default function OrgPage() {
     {
       key: "created_at",
       title: "申请时间",
-      cellClassName: "font-mono text-[12px] tabular-nums text-muted",
+      cellClassName: "font-mono text-meta tabular-nums text-muted",
       render: (r) => fmtDate(r.created_at),
     },
     { key: "admin_note", title: "备注", render: (r) => r.admin_note || "—" },

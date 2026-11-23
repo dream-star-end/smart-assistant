@@ -55,6 +55,8 @@ export function useResponseRatings({
   const nudgeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // sending 沿检测：true→false（turn 完成）才评估是否高亮。
   const prevSendingRef = useRef(sending);
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
   const onRateResponse = useCallback(
     (input: {
       messageId: string;
@@ -201,25 +203,34 @@ export function useResponseRatings({
     if (!expensive && sampleBucket !== 0) return;
     const traceId = message?.usage?.traceId ?? undefined;
     const clientBuild = document.querySelector<HTMLMetaElement>('meta[name="oc-build"]')?.content || undefined;
-    void api.submitResponseRatingNudge(authRef.current, {
+    const authAtStart = authRef.current;
+    const epochAtStart = authAtStart?.snapshot().epoch;
+    const sessionAtStart = activeId;
+    const isCurrentOwner = () =>
+      activeIdRef.current === sessionAtStart &&
+      authRef.current === authAtStart &&
+      authAtStart?.snapshot().epoch === epochAtStart;
+    void api.submitResponseRatingNudge(authAtStart, {
       messageId: id,
-      sessionId: activeId,
+      sessionId: sessionAtStart,
       traceId,
       clientBuild,
       sampleBucket,
       nudgeAction: "expose",
     }).then((result) => {
+      if (!isCurrentOwner()) return;
       if (!result.newlyExposed || result.state !== "exposed") return;
       setSessionNudges((prev) => new Map(prev).set(id, "exposed"));
       if (nudgeTimerRef.current) clearTimeout(nudgeTimerRef.current);
       setRatingNudgeId(id);
       nudgeTimerRef.current = setTimeout(() => {
-        setRatingNudgeId(null);
         nudgeTimerRef.current = null;
+        if (!isCurrentOwner()) return;
+        setRatingNudgeId(null);
         setSessionNudges((prev) => new Map(prev).set(id, "dismissed"));
-        void api.submitResponseRatingNudge(authRef.current, {
+        void api.submitResponseRatingNudge(authAtStart, {
           messageId: id,
-          sessionId: activeId,
+          sessionId: sessionAtStart,
           traceId,
           clientBuild,
           sampleBucket,

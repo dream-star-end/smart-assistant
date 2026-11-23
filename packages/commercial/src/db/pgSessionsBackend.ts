@@ -1007,22 +1007,33 @@ async function execPgSpillPlan(
   now: number,
 ): Promise<number> {
   if (chunksToInsert.length === 0) return 0;
+  // 幂等:重放同批 chunk PK (session_id, first_seq) 冲突 → DO NOTHING no-op,RETURNING 仅返新插入行,delta 不重复计。
+  const chunkRes = await client.query<{ message_count: number }>(
+    `INSERT INTO client_session_archive_chunks
+       (session_id, user_id, first_seq, last_seq, message_count, messages, created_at)
+     SELECT $1, $2, t.first_seq, t.last_seq, t.message_count, t.messages, $3
+       FROM unnest($4::int[], $5::int[], $6::int[], $7::text[])
+         AS t(first_seq, last_seq, message_count, messages)
+     ON CONFLICT (session_id, first_seq) DO NOTHING
+     RETURNING message_count`,
+    [
+      sessId,
+      userId,
+      now,
+      chunksToInsert.map((c) => c.firstSeq),
+      chunksToInsert.map((c) => c.lastSeq),
+      chunksToInsert.map((c) => c.messageCount),
+      chunksToInsert.map((c) => JSON.stringify(c.messages)),
+    ],
+  );
   let archivedDelta = 0;
-  for (const chunk of chunksToInsert) {
-    // 幂等:重放同批 chunk PK (session_id, first_seq) 冲突 → DO NOTHING no-op,delta 不重复计。
-    const cr = await client.query(
-      `INSERT INTO client_session_archive_chunks
-         (session_id, user_id, first_seq, last_seq, message_count, messages, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (session_id, first_seq) DO NOTHING`,
-      [sessId, userId, chunk.firstSeq, chunk.lastSeq, chunk.messageCount, JSON.stringify(chunk.messages), now],
-    );
-    if ((cr.rowCount ?? 0) > 0) archivedDelta += chunk.messageCount;
-  }
-  for (const id of idsToInsert) {
+  for (const row of chunkRes.rows) archivedDelta += Number(row.message_count);
+  if (idsToInsert.length > 0) {
     await client.query(
-      "INSERT INTO client_session_archived_ids (session_id, msg_id) VALUES ($1, $2) ON CONFLICT (session_id, msg_id) DO NOTHING",
-      [sessId, id],
+      `INSERT INTO client_session_archived_ids (session_id, msg_id)
+       SELECT $1, t.msg_id FROM unnest($2::text[]) AS t(msg_id)
+       ON CONFLICT (session_id, msg_id) DO NOTHING`,
+      [sessId, idsToInsert],
     );
   }
   return archivedDelta;
@@ -10466,10 +10477,10 @@ export function createPgSessionsBackend(
             }
           }
         }
-        for (const cost of pending) {
+        if (pending.length > 0) {
           await client.query(
-            "DELETE FROM pending_usage_patches WHERE user_id=$1 AND request_id=$2",
-            [userId, cost.request_id],
+            "DELETE FROM pending_usage_patches WHERE user_id=$1 AND request_id = ANY($2::text[])",
+            [userId, pending.map((c) => c.request_id)],
           );
         }
         const clientMessageId = turn.payload.clientMessageId ?? (
@@ -11008,10 +11019,11 @@ export function createPgSessionsBackend(
         const r = await pgAppendServerAuthoredCore(client, sessId, userId, msgToWrite);
         if (!r.applied) return stripWorkspaceMode(r);
 
-        if (pendings.length) {
-          for (const p of pendings) {
-            await client.query("DELETE FROM pending_usage_patches WHERE user_id = $1 AND request_id = $2", [userId, p.request_id]);
-          }
+        if (pendings.length > 0) {
+          await client.query(
+            "DELETE FROM pending_usage_patches WHERE user_id = $1 AND request_id = ANY($2::text[])",
+            [userId, pendings.map((p) => p.request_id)],
+          );
         }
         return { applied: true };
       });
@@ -11504,8 +11516,11 @@ export function createPgSessionsBackend(
 
         if (plan.kind === "no_positive_cost") {
           // 只有非正/畸形成本 → 清本批(无归并价值,即便 session 缺位也清),不写库、不 bump _seq。
-          for (const p of pendings) {
-            await client.query("DELETE FROM pending_usage_patches WHERE user_id = $1 AND request_id = $2", [userId, p.request_id]);
+          if (pendings.length > 0) {
+            await client.query(
+              "DELETE FROM pending_usage_patches WHERE user_id = $1 AND request_id = ANY($2::text[])",
+              [userId, pendings.map((p) => p.request_id)],
+            );
           }
           return { merged: "0", drained: pendings.length };
         }
@@ -11529,8 +11544,11 @@ export function createPgSessionsBackend(
           [escapeNulInSessionMessagesJson(plan.finalJson), plan.tail.length + newArchivedCount, nowMs, plan.archivedThroughSeq, newArchivedCount, clientSessionId, userId, historyRevisionDelta],
         );
 
-        for (const p of pendings) {
-          await client.query("DELETE FROM pending_usage_patches WHERE user_id = $1 AND request_id = $2", [userId, p.request_id]);
+        if (pendings.length > 0) {
+          await client.query(
+            "DELETE FROM pending_usage_patches WHERE user_id = $1 AND request_id = ANY($2::text[])",
+            [userId, pendings.map((p) => p.request_id)],
+          );
         }
         return {
           merged: plan.merged,
@@ -11732,6 +11750,11 @@ export function createPgSessionsBackend(
               deriveOrderSeqsForRead(JSON.parse(row.messages) as MessageLike[], archivedThroughOrderSeq),
               options,
             );
+        const [automaticRecoveries, openDispatch, permissionPrompts] = await Promise.all([
+          snapshotClient ? readAutomaticRecoveriesForSession(snapshotClient, row.id, row.user_id) : Promise.resolve({}),
+          readOpenDispatchForSession(queryable, row.id, row.user_id),
+          readPermissionPromptsForSession(queryable, row.id, row.user_id, options.permissionLookupIds),
+        ]);
         return {
           id: row.id,
           userId: row.user_id,
@@ -11758,16 +11781,9 @@ export function createPgSessionsBackend(
           // 实际合计为准，读尽后不会留下“还有 N 条”的幽灵按钮。
           archivedCount: bigIntNum(row.archived_count, "archived chunk message count"),
           archivedThroughSeq: archivedThroughOrderSeq,
-          ...(snapshotClient
-            ? await readAutomaticRecoveriesForSession(snapshotClient, row.id, row.user_id)
-            : {}),
-          ...(await readOpenDispatchForSession(queryable, row.id, row.user_id)),
-          ...(await readPermissionPromptsForSession(
-            queryable,
-            row.id,
-            row.user_id,
-            options.permissionLookupIds,
-          )),
+          ...automaticRecoveries,
+          ...openDispatch,
+          ...permissionPrompts,
         };
       };
       return options.view === "timeline"
@@ -11897,6 +11913,13 @@ export function createPgSessionsBackend(
             pool, row.id, row.user_id, null, 100, snapshotClient, row,
           );
           if (!page) return null;
+          const [automaticRecoveries, openDispatch, permissionPrompts] = await Promise.all([
+            snapshotClient
+              ? readAutomaticRecoveriesForSession(snapshotClient, row.id, row.user_id)
+              : Promise.resolve({}),
+            readOpenDispatchForSession(queryable, row.id, row.user_id),
+            readPermissionPromptsForSession(queryable, row.id, row.user_id, options.permissionLookupIds),
+          ]);
           return {
             id: row.id, userId: row.user_id, agentId: row.agent_id, title: row.title,
             pinned: row.pinned === 1,
@@ -11909,15 +11932,15 @@ export function createPgSessionsBackend(
             timelineCursor: page.nextCursor,
             timelineHasMore: page.hasMore,
             timelineSnapshotMaxSeq: page.snapshotMaxSeq,
-            ...(snapshotClient ? await readAutomaticRecoveriesForSession(snapshotClient, row.id, row.user_id) : {}),
+            ...automaticRecoveries,
             ...(row.model_id ? { modelId: row.model_id } : {}),
             totalMessageCount: page.messages.length + archivedCount,
             maxSeq: page.snapshotMaxSeq,
             isPartial: false,
             archivedCount,
             archivedThroughSeq,
-            ...(await readOpenDispatchForSession(queryable, row.id, row.user_id)),
-            ...(await readPermissionPromptsForSession(queryable, row.id, row.user_id, options.permissionLookupIds)),
+            ...openDispatch,
+            ...permissionPrompts,
           };
         }
 
@@ -11950,6 +11973,15 @@ export function createPgSessionsBackend(
         isPartial = false;
       }
       messages = await hydrateTurnTapeMessages(pool, row.id, row.user_id, messages, options);
+      const [openDispatch, permissionPrompts] = await Promise.all([
+        readOpenDispatchForSession(queryable, row.id, row.user_id),
+        readPermissionPromptsForSession(
+          queryable,
+          row.id,
+          row.user_id,
+          options.permissionLookupIds,
+        ),
+      ]);
         return {
         id: row.id,
         userId: row.user_id,
@@ -11967,13 +11999,8 @@ export function createPgSessionsBackend(
         isPartial,
         archivedCount,
         archivedThroughSeq,
-        ...(await readOpenDispatchForSession(queryable, row.id, row.user_id)),
-        ...(await readPermissionPromptsForSession(
-          queryable,
-          row.id,
-          row.user_id,
-          options.permissionLookupIds,
-        )),
+        ...openDispatch,
+        ...permissionPrompts,
         };
       };
       return options.view === "timeline"
@@ -12212,7 +12239,12 @@ export function createPgSessionsBackend(
         await client.query("DELETE FROM client_session_archived_ids WHERE session_id = $1", [id]);
         await client.query("DELETE FROM turn_tape_recovery_links WHERE session_id = $1", [id]);
         await client.query("DELETE FROM client_session_turn_tapes WHERE session_id = $1", [id]);
-        await client.query("DELETE FROM pending_usage_patches WHERE parent_session_id = $1", [id]);
+        await client.query(
+          userId
+            ? "DELETE FROM pending_usage_patches WHERE user_id = $2 AND parent_session_id = $1 AND parent_session_id IS NOT NULL"
+            : "DELETE FROM pending_usage_patches WHERE parent_session_id = $1",
+          userId ? [id, userId] : [id],
+        );
         // Keep dispatch evidence so the reconciler can close any execution that
         // raced with deletion and financial/audit history remains attributable.
         return true;
@@ -12570,24 +12602,28 @@ export function createPgSessionsBackend(
         if (targetIds.length === 0) return { ok: true, updated: 0, skipped };
         let updated = 0;
         if (action === "delete") {
-          for (const id of targetIds) {
-            const result = await client.query(
-              `UPDATE client_sessions
-                  SET deleted_at = ${CLOCK_MS_SQL},
-                      updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
-                      messages = '[]', message_count = 0, last_preview = ''
-                WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
-              [id, userId],
+          const result = await client.query<{ id: string }>(
+            `UPDATE client_sessions
+                SET deleted_at = ${CLOCK_MS_SQL},
+                    updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
+                    messages = '[]', message_count = 0, last_preview = ''
+              WHERE id = ANY($1::text[]) AND user_id = $2 AND deleted_at IS NULL
+              RETURNING id`,
+            [targetIds, userId],
+          );
+          const actuallyDeleted = result.rows.map((r) => r.id);
+          if (actuallyDeleted.length > 0) {
+            await client.query("DELETE FROM client_session_user_payloads WHERE session_id = ANY($1::text[]) AND user_id = $2", [actuallyDeleted, userId]);
+            await client.query("DELETE FROM client_session_archive_chunks WHERE session_id = ANY($1::text[])", [actuallyDeleted]);
+            await client.query("DELETE FROM client_session_archived_ids WHERE session_id = ANY($1::text[])", [actuallyDeleted]);
+            await client.query("DELETE FROM turn_tape_recovery_links WHERE session_id = ANY($1::text[])", [actuallyDeleted]);
+            await client.query("DELETE FROM client_session_turn_tapes WHERE session_id = ANY($1::text[])", [actuallyDeleted]);
+            await client.query(
+              "DELETE FROM pending_usage_patches WHERE user_id = $2 AND parent_session_id = ANY($1::text[]) AND parent_session_id IS NOT NULL",
+              [actuallyDeleted, userId],
             );
-            if ((result.rowCount ?? 0) === 0) continue;
-            await client.query("DELETE FROM client_session_user_payloads WHERE session_id=$1 AND user_id=$2", [id, userId]);
-            await client.query("DELETE FROM client_session_archive_chunks WHERE session_id = $1", [id]);
-            await client.query("DELETE FROM client_session_archived_ids WHERE session_id = $1", [id]);
-            await client.query("DELETE FROM turn_tape_recovery_links WHERE session_id = $1", [id]);
-            await client.query("DELETE FROM client_session_turn_tapes WHERE session_id = $1", [id]);
-            await client.query("DELETE FROM pending_usage_patches WHERE parent_session_id = $1", [id]);
-            deletedIds.push(id);
-            updated++;
+            deletedIds.push(...actuallyDeleted);
+            updated = actuallyDeleted.length;
           }
         } else if (action === "archive") {
           const res = await client.query(

@@ -363,7 +363,7 @@ export function ProjectSettingsDialog(props: {
             <>
           <Field
             label="绑定任务面板项目"
-            hint="绑定后，聊天与看板 stage 共用项目指令、资产、技能和正式记忆。未绑定 GitHub 仓库的会话使用项目工作区；仓库 clone 就绪时会话会切到仓库快照（允许覆盖）。"
+            hint="绑定后，聊天与任务看板各阶段将共用项目指令、文件资产、技能和正式记忆。未绑定 GitHub 仓库的会话使用项目工作区；代码仓库同步就绪后，会话会自动切换到最新代码快照。"
           >
             {boardListErr ? (
               <Alert

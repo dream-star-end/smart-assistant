@@ -19,6 +19,7 @@ import { downloadPercent } from '../lib/chat/download'
 import { getCachedThumbnail } from '../lib/chat/imageBytes'
 import { apiErrorMessage } from '../lib/api'
 import { cn } from '../lib/utils'
+import { Alert } from './ui'
 
 export type ImageAnnotationSource = { url: string; name?: string }
 export type ImageAnnotationExport = {
@@ -782,12 +783,12 @@ export function ImageAnnotationEditor({
     <Dialog.Root open={open} onOpenChange={(next) => !submitting && onOpenChange(next)}>
       <Dialog.Portal>
         <Dialog.Overlay
-          className="dark fixed inset-x-0 z-[70] bg-bg/95 backdrop-blur-sm"
+          className="dark fixed inset-x-0 z-[var(--z-viewer)] bg-bg/95 backdrop-blur-sm"
           style={{ top: 'var(--oc-visual-offset-top, 0px)', height: 'var(--oc-visual-height, 100dvh)' }}
         />
         <Dialog.Content
           aria-describedby="image-edit-help"
-          className="dark fixed inset-x-0 top-[var(--oc-visual-offset-top,0px)] z-[71] flex h-[var(--oc-visual-height,100dvh)] min-h-0 select-none flex-col bg-bg text-fg outline-none"
+          className="dark fixed inset-x-0 top-[var(--oc-visual-offset-top,0px)] z-[var(--z-viewer)] flex h-[var(--oc-visual-height,100dvh)] min-h-0 select-none flex-col bg-bg text-fg outline-none"
           // ESC 逐层退出 + 误触保护(需求 §5):菜单 → 确认层 → 脏则弹确认 → 干净才退。
           // 全程接管,不放行 Radix 直接关(否则脏状态会被直接丢弃)。
           onEscapeKeyDown={(e) => {
@@ -923,9 +924,9 @@ export function ImageAnnotationEditor({
           {/* 底栏:提示词输入条 + 居中撤销/重做 + 更多工具/缩放(次级) */}
           <div className="flex shrink-0 flex-col gap-2 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-1">
             {error && (
-              <p role="alert" className="mx-auto max-w-2xl rounded-lg bg-danger/25 px-3 py-1.5 text-center text-sm text-fg">
+              <Alert density="compact" tone="danger" className="mx-auto w-full max-w-2xl justify-center text-center">
                 {error}
-              </p>
+              </Alert>
             )}
             {submitHint && (
               <p role="status" className="mx-auto w-full max-w-2xl text-center text-body text-warning">

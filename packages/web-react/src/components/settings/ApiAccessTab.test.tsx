@@ -1042,7 +1042,7 @@ describe("ApiKeyAuditPanel · 请求审计", () => {
     expect(url.searchParams.get("errors_only")).toBeNull();
     expect(await screen.findByText("帮我看下这段代码")).toBeInTheDocument();
     // 档位 + 来源(0280 的 classifier 侧查询)与耗时可读。
-    expect(screen.getByText("low · 分类器")).toBeInTheDocument();
+    expect(screen.getByText("轻度 · 自动判定")).toBeInTheDocument();
     expect(screen.getByText("820ms")).toBeInTheDocument();
     // 内部 id 不外泄。
     expect(document.body.textContent).not.toMatch(/cursor/i);

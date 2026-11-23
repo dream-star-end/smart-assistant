@@ -82,16 +82,16 @@ const NUMERIC_FIELDS: NumericField[] = [
   {
     key: 'maxRunsPerDay',
     label: '每日执行上限',
-    hint: '一天内 agent 最多启动多少次执行，到达后当天不再自动开工。',
+    hint: '一天内智能体最多启动多少次执行，到达后当天不再自动开工。',
     min: 1,
     error: '每日执行上限至少为 1',
   },
   {
     key: 'maxRunsPerTick',
-    label: '每轮巡检最多启动',
-    hint: '每次巡检最多同时拉起几条单据，避免一口气把额度用完。',
+    label: '每轮自动调度最多启动',
+    hint: '每次自动调度最多同时拉起几条单据，避免一口气把额度用完。',
     min: 1,
-    error: '每轮巡检至少启动 1 条',
+    error: '每轮自动调度至少启动 1 条',
   },
   {
     key: 'circuitBreakerThreshold',
@@ -214,10 +214,10 @@ export function BoardSettingsPanel({
   const togglePause = async () => {
     const next = !draft.patrolPaused
     const ok = await confirm({
-      title: next ? '急停全部巡检？' : '恢复自动巡检？',
+      title: next ? '急停全部自动调度？' : '恢复自动调度？',
       body: next
-        ? '正在跑的任务不受影响，但不会再启动新的巡检。'
-        : '恢复后将按护栏配置继续自动巡检。',
+        ? '正在跑的任务不受影响，但不会再启动新的自动调度。'
+        : '恢复后将按护栏配置继续自动调度。',
       confirmText: next ? '急停' : '恢复',
       cancelText: '返回',
       danger: next,
@@ -227,7 +227,7 @@ export function BoardSettingsPanel({
     try {
       const out = await taskboardApi.patchSettings(auth, { patrolPaused: next })
       applySnapshot(out)
-      toast(next ? '已急停巡检' : '已恢复巡检', 'success')
+      toast(next ? '已急停自动调度' : '已恢复自动调度', 'success')
     } catch (e) {
       if (e instanceof AuthEpochStaleError) return
       toast(taskboardErrorMessage(e, '更新急停开关失败'), 'error')
@@ -258,7 +258,7 @@ export function BoardSettingsPanel({
         open={open}
         onOpenChange={setOpen}
         title="护栏设置"
-        hint="限制 agent 自动执行的频率与花费。只有你本人能改，agent 调用会被拒绝。"
+        hint="限制智能体自动执行的频率与花费。只有你本人能改，智能体调用会被拒绝。"
         testId="board-settings"
         width="narrow"
       >
@@ -295,7 +295,7 @@ export function BoardSettingsPanel({
             )}
             {draft.patrolPaused && (
               <p className="oc-callout oc-callout-danger rounded-xl px-3.5 py-2.5 text-body text-danger">
-                全局巡检已急停，恢复前不会自动启动新的执行。
+                全局自动调度已急停，恢复前不会自动启动新的执行。
               </p>
             )}
             <section className="oc-surface-card flex flex-col gap-3 rounded-xl p-3.5">
@@ -412,7 +412,7 @@ export function BoardSettingsPanel({
               </div>
               <p className="text-caption leading-relaxed text-muted">
                 {draft.patrolPaused
-                  ? '恢复后将按上面的护栏配置继续自动巡检。'
+                  ? '恢复后将按上面的护栏配置继续自动调度。'
                   : '急停后不再启动新的执行；正在跑的任务不受影响。'}
               </p>
               <div>
@@ -424,7 +424,7 @@ export function BoardSettingsPanel({
                   data-testid="board-settings-pause"
                   onClick={() => void togglePause()}
                 >
-                  {draft.patrolPaused ? '恢复巡检' : '急停巡检'}
+                  {draft.patrolPaused ? '恢复自动调度' : '急停自动调度'}
                 </Button>
               </div>
             </section>

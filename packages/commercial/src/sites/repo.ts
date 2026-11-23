@@ -1231,15 +1231,19 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
             'DELETE FROM user_site_slug_claims WHERE site_id = $1 AND slug <> $2',
             [input.siteId, input.newSlug],
           )
-          await client.query(
+          const claimRes = await client.query<{ slug: string }>(
             `INSERT INTO user_site_slug_claims (slug, site_id, claim_kind, updated_at)
              VALUES ($1, $2, 'active', NOW())
              ON CONFLICT (slug) DO UPDATE SET
                claim_kind = 'active',
                updated_at = NOW()
-             WHERE user_site_slug_claims.site_id = EXCLUDED.site_id`,
+             WHERE user_site_slug_claims.site_id = EXCLUDED.site_id
+             RETURNING slug`,
             [input.newSlug, input.siteId],
           )
+          if (claimRes.rows.length === 0) {
+            throw new SitesError('SLUG_TAKEN', `子域名 "${input.newSlug}" 已被占用，请更换名称`, 409)
+          }
           return mapRow(upd.rows[0])
         } catch (err) {
           if ((err as { code?: string })?.code === '23505') {

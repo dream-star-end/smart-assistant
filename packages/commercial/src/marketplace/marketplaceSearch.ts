@@ -7,6 +7,7 @@
  * problem falls back to a deterministic keyword match so search never breaks.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { Pool } from 'pg'
 
 import { type MarketplacePluginType, marketplaceArtifactCompatibility } from '@openclaude/protocol'
 import {
@@ -21,7 +22,7 @@ import { resolvePlatformSkillEmbeddingConfig } from '../openai/platformSkillEmbe
 
 import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
 import { isDefaultConnectorArtifact } from '../connectors/defaults/index.js'
-import { requireAuth } from '../http/auth.js'
+import { authenticateActiveCommercialUser } from '../http/activeUserAuth.js'
 import { makePgSkillEmbedCache } from '../http/skillEmbedCachePg.js'
 import { sendJson } from '../http/util.js'
 import {
@@ -85,9 +86,18 @@ function toCard(c: ApprovedSearchRow): {
 export async function handleMarketplaceSearch(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: { jwtSecret: string | Uint8Array },
+  deps: {
+    jwtSecret: string | Uint8Array
+    v3Supervisor?: { pool?: Pool }
+    verifyActiveAccount?: (userId: string) => Promise<boolean>
+    skipDbActiveCheck?: boolean
+  },
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authenticateActiveCommercialUser(req, deps.jwtSecret, {
+    pool: deps.v3Supervisor?.pool,
+    verifyActiveAccount: deps.verifyActiveAccount,
+    skipDbActiveCheck: deps.skipDbActiveCheck,
+  })
   const callerOrgId = await resolveCallerOrgId(user.id)
   const url = new URL(req.url ?? '/', 'http://internal')
   const q = (url.searchParams.get('q') ?? '').trim().slice(0, 4000)

@@ -1,17 +1,27 @@
 /** Preserve existing callback delivery without creating new billable parent turns. */
 import type { IncomingMessage } from 'node:http'
 import { parseOriginWebchatSessionKey } from './cronOriginSession.js'
+import { isFlagOffJobOwnedOriginInject } from './delegateCallbackOwner.js'
 import { DELEGATE_CONTEXT_HEADER, verifyDelegateContextToken } from './delegateContext.js'
 import type { DelegateRuntimeHost } from './delegateRuntime.js'
 import type { DelegateCallbacksHost } from './delegateCallbacks.js'
 import type { DelegateJobStore } from './delegateJobs.js'
+import { resolveDelegateCallbackOwner } from './delegateSmFlag.js'
+import { readSendToAgentIntent } from './sendToAgentIntentStore.js'
 
 type HandoffRetryHost = Pick<DelegateCallbacksHost,
   '_delegateJobs' | '_activeSendToAgentCallbacks' | '_ensureDurableSendToAgentCallback' | 'log'>
 
-/** Reuse the gateway notify timer for the legacy delivery path's handed-off subset. */
-export function handedOffDelegateRetryDelay(store: DelegateJobStore, now = Date.now()): number | undefined {
-  const jobs = store.listPendingNotify().filter((job) => job.kind === 'delegate' && job.callback === 'origin-inject' && job.callbackOriginSessionKey)
+/** Reuse the gateway notify timer for the legacy delivery path's job-owned origin-inject subset (handoff + owner=job send_to_agent). */
+export function handedOffDelegateRetryDelay(
+  store: DelegateJobStore,
+  now = Date.now(),
+  env?: NodeJS.ProcessEnv,
+): number | undefined {
+  const owner = resolveDelegateCallbackOwner(env)
+  const jobs = store
+    .listPendingNotify()
+    .filter((job) => isFlagOffJobOwnedOriginInject(job, owner))
   if (jobs.length === 0) return undefined
   return Math.max(0, Math.min(...jobs.map((job) => job.callbackState === 'injecting'
     ? job.notifyClaimedUntil ?? now
@@ -19,19 +29,24 @@ export function handedOffDelegateRetryDelay(store: DelegateJobStore, now = Date.
 }
 
 export async function retryHandedOffDelegateNotifies(host: HandoffRetryHost): Promise<void> {
+  const owner = resolveDelegateCallbackOwner()
   const jobs = host._delegateJobs?.listDueNotify() ?? []
   for (const job of jobs) {
-    if (job.kind !== 'delegate' || job.callback !== 'origin-inject' || !job.callbackOriginSessionKey) continue
+    if (!isFlagOffJobOwnedOriginInject(job, owner)) continue
     const active = host._activeSendToAgentCallbacks?.get(job.id)
+    const persisted = active?.goal ? null : await readSendToAgentIntent(job.id)
+    const originSessionKey =
+      job.callbackOriginSessionKey ?? persisted?.originSessionKey ?? job.parentSessionKey
+    if (!originSessionKey) continue
     try {
       await host._ensureDurableSendToAgentCallback(job, {
         v: 1,
         jobId: job.id,
-        originSessionKey: job.callbackOriginSessionKey,
-        userId: job.callbackOriginUserId,
-        agentId: job.agentId,
-        goal: active?.goal ?? '',
-        createdAt: job.createdAt ?? Date.now(),
+        originSessionKey,
+        userId: job.callbackOriginUserId ?? active?.userId ?? persisted?.userId,
+        agentId: persisted?.agentId ?? job.agentId,
+        goal: active?.goal || persisted?.goal || '',
+        createdAt: persisted?.createdAt ?? job.createdAt ?? Date.now(),
       })
     } catch (err) {
       host.log.warn('delegate handoff callback retry failed', { jobId: job.id }, err as Error)

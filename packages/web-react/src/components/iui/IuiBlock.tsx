@@ -292,7 +292,7 @@ export function IuiBlock({ code, live, readOnly }: IuiBlockProps) {
         const t = /"type"\s*:\s*"([a-z_]+)"/i.exec(code)?.[1];
         return { kind: "skeleton" as const, type: resolveType(t) ?? undefined };
       }
-      return { kind: "raw" as const, message: parsed.reason === "too_large" ? "组件内容过大,已按原文显示" : "组件内容无法解析,已按原文显示" };
+      return { kind: "raw" as const, message: parsed.reason === "too_large" ? "内容较长，已转为文本展示" : "内容已转为文本展示" };
     }
     const streaming = !parsed.complete;
     const v = validateSpec(parsed.value, streaming);
@@ -332,24 +332,88 @@ function safeMarkdown(spec: IuiSpec): string {
   }
 }
 
-/** 未知类型 / 校验失败:有标题和条目就转成列表,否则原文。 */
-function UnknownFallback({ raw, code }: { raw: Record<string, unknown>; code: string }) {
-  const title = typeof raw.title === "string" ? raw.title : undefined;
-  const items = Array.isArray(raw.items) ? raw.items : undefined;
-  if (items && items.length > 0) {
-    const lines = items
-      .map((it) =>
-        typeof it === "string" || typeof it === "number"
-          ? String(it)
-          : it && typeof it === "object"
-            ? Object.values(it as Record<string, unknown>)
-                .filter((v) => typeof v === "string" || typeof v === "number")
-                .join(" —— ")
-            : "",
-      )
+function formatFallbackEntry(entry: unknown): string {
+  if (typeof entry === "string" || typeof entry === "number") return String(entry).trim();
+  if (Array.isArray(entry)) {
+    return entry
+      .map((cell) => (cell === null || cell === undefined ? "" : String(cell).trim()))
       .filter(Boolean)
-      .map((l) => `- ${l}`);
-    if (lines.length > 0) return <BodyMarkdown text={[...(title ? [`**${title}**`, ""] : []), ...lines].join("\n")} />;
+      .join(" | ");
   }
-  return <RawFallback code={code} message="这个组件无法显示,已按原文显示" />;
+  if (entry && typeof entry === "object") {
+    const obj = entry as Record<string, unknown>;
+    const parts = Object.values(obj)
+      .flatMap((v) => {
+        if (typeof v === "string" || typeof v === "number") return [String(v).trim()];
+        if (Array.isArray(v)) {
+          const joined = v
+            .filter((x) => typeof x === "string" || typeof x === "number")
+            .map((x) => String(x).trim())
+            .filter(Boolean)
+            .join("、");
+          return joined ? [joined] : [];
+        }
+        return [];
+      })
+      .filter(Boolean);
+    return parts.join(" —— ");
+  }
+  return "";
+}
+
+/** 未知类型 / 校验失败:兼容 items/rows/steps/cards/sections/options/body 等通用结构降级为干净 Markdown。 */
+function UnknownFallback({ raw, code }: { raw: Record<string, unknown>; code: string }) {
+  const title =
+    typeof raw.title === "string" && raw.title.trim()
+      ? raw.title.trim()
+      : typeof raw.heading === "string" && raw.heading.trim()
+        ? raw.heading.trim()
+        : typeof raw.question === "string" && raw.question.trim()
+          ? raw.question.trim()
+          : undefined;
+
+  const blocks: string[] = [];
+  if (title) blocks.push(`**${title}**`);
+
+  const textBody = [raw.body, raw.content, raw.summary, raw.description, raw.text, raw.message]
+    .filter((v): v is string => typeof v === "string" && v.trim().length > 0)
+    .map((v) => v.trim());
+  if (textBody.length > 0) blocks.push(textBody.join("\n\n"));
+
+  const listKeys = ["items", "steps", "cards", "sections", "options", "rows", "fields"] as const;
+  for (const key of listKeys) {
+    const arr = raw[key];
+    if (!Array.isArray(arr) || arr.length === 0) continue;
+    if (key === "rows" && Array.isArray(raw.columns) && raw.columns.length > 0) {
+      const headers = raw.columns
+        .map((c) => (typeof c === "string" ? c : c && typeof c === "object" && typeof (c as Record<string, unknown>).label === "string" ? String((c as Record<string, unknown>).label) : ""))
+        .filter(Boolean);
+      if (headers.length > 0) {
+        const tableLines = [
+          `| ${headers.join(" | ")} |`,
+          `| ${headers.map(() => "---").join(" | ")} |`,
+          ...arr.map((row) =>
+            Array.isArray(row)
+              ? `| ${headers.map((_, i) => String(row[i] ?? "").replace(/\|/g, "\\|")).join(" | ")} |`
+              : `| ${formatFallbackEntry(row).replace(/\|/g, "\\|")} |`,
+          ),
+        ];
+        blocks.push(tableLines.join("\n"));
+        continue;
+      }
+    }
+    const lines = arr
+      .map((entry, idx) => {
+        const text = formatFallbackEntry(entry);
+        if (!text) return "";
+        return key === "steps" ? `${idx + 1}. ${text}` : `- ${text}`;
+      })
+      .filter(Boolean);
+    if (lines.length > 0) blocks.push(lines.join("\n"));
+  }
+
+  if (blocks.length > 0 && (blocks.length > (title ? 1 : 0))) {
+    return <BodyMarkdown text={blocks.join("\n\n")} />;
+  }
+  return <RawFallback code={code} message="内容已转为文本展示" />;
 }

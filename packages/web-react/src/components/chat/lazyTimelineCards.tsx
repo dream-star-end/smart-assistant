@@ -9,6 +9,8 @@
  * - 需要同步断言的测试文件通过 loadBeforeAll(preloadTimelineCards) 预热。
  */
 import { Component, lazy, Suspense, type ComponentProps, type ReactNode } from 'react'
+import { createRetryableLazy } from '../ui/retryableLazy'
+import { readNetworkInformation, shouldPrefetchCenters } from '../../lib/prefetchPolicy'
 
 type AgentGroupModule = typeof import('./AgentGroupCard')
 type AgentGroupCardProps = ComponentProps<AgentGroupModule['AgentGroupCard']>
@@ -204,68 +206,119 @@ function AgentGroupCardProxy(props: AgentGroupCardProps) {
   return <Comp {...props} />
 }
 
-const LazyAgentGroupCard = lazy(() => {
-  if (loadedAgentGroup) {
-    const sync = {
-      // biome-ignore lint/suspicious/noThenProperty: synchronous thenable for React.lazy once preloaded
-      then(resolve: (value: { default: typeof AgentGroupCardProxy }) => void) {
-        resolve({ default: AgentGroupCardProxy })
-      },
+function makeLazyAgentGroupCard() {
+  return lazy(() => {
+    if (loadedAgentGroup) {
+      const sync = {
+        // biome-ignore lint/suspicious/noThenProperty: synchronous thenable for React.lazy once preloaded
+        then(resolve: (value: { default: typeof AgentGroupCardProxy }) => void) {
+          resolve({ default: AgentGroupCardProxy })
+        },
+      }
+      return sync as unknown as Promise<{ default: typeof AgentGroupCardProxy }>
     }
-    return sync as unknown as Promise<{ default: typeof AgentGroupCardProxy }>
-  }
-  return preloadAgentGroupCard().then(() => ({ default: AgentGroupCardProxy }))
-})
+    return preloadAgentGroupCard().then(() => ({ default: AgentGroupCardProxy }))
+  })
+}
 
-const LazyDelegateProcessList = lazy(() => {
-  const ready = loadedDelegateProcessList
-  if (ready) {
-    const sync = {
-      // biome-ignore lint/suspicious/noThenProperty: synchronous thenable for React.lazy once preloaded
-      then(resolve: (value: { default: DelegateProcessListModule['DelegateProcessList'] }) => void) {
-        resolve({ default: ready.DelegateProcessList })
-      },
+function makeLazyDelegateProcessList() {
+  return lazy(() => {
+    const ready = loadedDelegateProcessList
+    if (ready) {
+      const sync = {
+        // biome-ignore lint/suspicious/noThenProperty: synchronous thenable for React.lazy once preloaded
+        then(resolve: (value: { default: DelegateProcessListModule['DelegateProcessList'] }) => void) {
+          resolve({ default: ready.DelegateProcessList })
+        },
+      }
+      return sync as unknown as Promise<{ default: DelegateProcessListModule['DelegateProcessList'] }>
     }
-    return sync as unknown as Promise<{ default: DelegateProcessListModule['DelegateProcessList'] }>
-  }
-  return preloadDelegateProcessList().then((module) => ({ default: module.DelegateProcessList }))
-})
+    return preloadDelegateProcessList().then((module) => ({ default: module.DelegateProcessList }))
+  })
+}
 
-const LazyTeamPanel = lazy(() => {
-  const ready = loadedTeam
-  if (ready) {
-    const sync = {
-      // biome-ignore lint/suspicious/noThenProperty: synchronous thenable for React.lazy once preloaded
-      then(resolve: (value: { default: TeamPanelModule['TeamPanel'] }) => void) {
-        resolve({ default: ready.TeamPanel })
-      },
+function makeLazyTeamPanel() {
+  return lazy(() => {
+    const ready = loadedTeam
+    if (ready) {
+      const sync = {
+        // biome-ignore lint/suspicious/noThenProperty: synchronous thenable for React.lazy once preloaded
+        then(resolve: (value: { default: TeamPanelModule['TeamPanel'] }) => void) {
+          resolve({ default: ready.TeamPanel })
+        },
+      }
+      return sync as unknown as Promise<{ default: TeamPanelModule['TeamPanel'] }>
     }
-    return sync as unknown as Promise<{ default: TeamPanelModule['TeamPanel'] }>
-  }
-  return preloadTeamPanel().then((module) => ({ default: module.TeamPanel }))
-})
+    return preloadTeamPanel().then((module) => ({ default: module.TeamPanel }))
+  })
+}
 
-const LazyGeneratingPlaceholderCard = lazy(() => {
-  const ready = loadedPlaceholder
-  if (ready) {
-    const sync = {
-      // biome-ignore lint/suspicious/noThenProperty: synchronous thenable for React.lazy once preloaded
-      then(
-        resolve: (value: {
-          default: GeneratingPlaceholderModule['GeneratingPlaceholderCard']
-        }) => void,
-      ) {
-        resolve({ default: ready.GeneratingPlaceholderCard })
-      },
+function makeLazyGeneratingPlaceholderCard() {
+  return lazy(() => {
+    const ready = loadedPlaceholder
+    if (ready) {
+      const sync = {
+        // biome-ignore lint/suspicious/noThenProperty: synchronous thenable for React.lazy once preloaded
+        then(
+          resolve: (value: {
+            default: GeneratingPlaceholderModule['GeneratingPlaceholderCard']
+          }) => void,
+        ) {
+          resolve({ default: ready.GeneratingPlaceholderCard })
+        },
+      }
+      return sync as unknown as Promise<{
+        default: GeneratingPlaceholderModule['GeneratingPlaceholderCard']
+      }>
     }
-    return sync as unknown as Promise<{
-      default: GeneratingPlaceholderModule['GeneratingPlaceholderCard']
-    }>
+    return preloadGeneratingPlaceholderCard().then((module) => ({
+      default: module.GeneratingPlaceholderCard,
+    }))
+  })
+}
+
+let LazyAgentGroupCard = makeLazyAgentGroupCard()
+let LazyDelegateProcessList = makeLazyDelegateProcessList()
+let LazyTeamPanel = makeLazyTeamPanel()
+let LazyGeneratingPlaceholderCard = makeLazyGeneratingPlaceholderCard()
+
+class InlineTimelineErrorBoundary extends Component<
+  { label: string; compact?: boolean; onRebuild?: () => void; renderChildren: () => ReactNode },
+  { error: unknown }
+> {
+  state: { error: unknown } = { error: null }
+  static getDerivedStateFromError(error: unknown) {
+    return { error }
   }
-  return preloadGeneratingPlaceholderCard().then((module) => ({
-    default: module.GeneratingPlaceholderCard,
-  }))
-})
+  private handleRetry = () => {
+    this.props.onRebuild?.()
+    this.setState({ error: null })
+  }
+  render() {
+    if (this.state.error !== null) {
+      return (
+        <div
+          role="alert"
+          className={
+            this.props.compact
+              ? 'mx-auto flex max-w-3xl items-center justify-between gap-2 px-5 py-1.5 text-caption text-muted'
+              : 'flex items-center justify-between gap-2 rounded-md border border-border bg-surface px-3 py-2 text-meta text-muted'
+          }
+        >
+          <span>{this.props.label}</span>
+          <button
+            type="button"
+            onClick={this.handleRetry}
+            className="shrink-0 rounded-full bg-hover px-2.5 py-1 text-caption text-fg hover:bg-border/60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+          >
+            重试
+          </button>
+        </div>
+      )
+    }
+    return this.props.renderChildren()
+  }
+}
 
 class PermissionLazyErrorBoundary extends Component<
   { renderChildren: () => ReactNode; compact?: boolean; resetKey?: string },
@@ -321,6 +374,7 @@ class PermissionLazyErrorBoundary extends Component<
 }
 
 function prefetchWhenIdle(): void {
+  if (!shouldPrefetchCenters(readNetworkInformation())) return
   preloadTimelineCards().catch(() => {})
 }
 
@@ -333,33 +387,58 @@ if (typeof window !== 'undefined') {
 
 export function AgentGroupCard(props: AgentGroupCardProps) {
   return (
-    <Suspense fallback={<div className="py-1 text-caption text-faint">加载中…</div>}>
-      <LazyAgentGroupCard {...props} />
-    </Suspense>
+    <InlineTimelineErrorBoundary
+      label="协作卡片加载失败"
+      onRebuild={() => { if (!loadedAgentGroup) LazyAgentGroupCard = makeLazyAgentGroupCard() }}
+      renderChildren={() => (
+        <Suspense fallback={<div className="py-1 text-caption text-faint">加载中…</div>}>
+          <LazyAgentGroupCard {...props} />
+        </Suspense>
+      )}
+    />
   )
 }
 
 export function DelegateProcessListLazy(props: DelegateProcessListProps) {
   return (
-    <Suspense fallback={<div className="px-3.5 py-2 text-caption text-faint">加载中…</div>}>
-      <LazyDelegateProcessList {...props} />
-    </Suspense>
+    <InlineTimelineErrorBoundary
+      label="子过程详情加载失败"
+      onRebuild={() => { if (!loadedDelegateProcessList) LazyDelegateProcessList = makeLazyDelegateProcessList() }}
+      renderChildren={() => (
+        <Suspense fallback={<div className="px-3.5 py-2 text-caption text-faint">加载中…</div>}>
+          <LazyDelegateProcessList {...props} />
+        </Suspense>
+      )}
+    />
   )
 }
 
 export function TeamPanel(props: TeamPanelProps) {
   return (
-    <Suspense fallback={<div className="py-1 text-caption text-faint">加载中…</div>}>
-      <LazyTeamPanel {...props} />
-    </Suspense>
+    <InlineTimelineErrorBoundary
+      label="团队面板加载失败"
+      onRebuild={() => { if (!loadedTeam) LazyTeamPanel = makeLazyTeamPanel() }}
+      renderChildren={() => (
+        <Suspense fallback={<div className="py-1 text-caption text-faint">加载中…</div>}>
+          <LazyTeamPanel {...props} />
+        </Suspense>
+      )}
+    />
   )
 }
 
 export function GeneratingPlaceholderCard(props: GeneratingPlaceholderProps) {
   return (
-    <Suspense fallback={null}>
-      <LazyGeneratingPlaceholderCard {...props} />
-    </Suspense>
+    <InlineTimelineErrorBoundary
+      compact
+      label="生成状态卡片加载失败"
+      onRebuild={() => { if (!loadedPlaceholder) LazyGeneratingPlaceholderCard = makeLazyGeneratingPlaceholderCard() }}
+      renderChildren={() => (
+        <Suspense fallback={null}>
+          <LazyGeneratingPlaceholderCard {...props} />
+        </Suspense>
+      )}
+    />
   )
 }
 
@@ -393,7 +472,7 @@ export function PermissionPromptHost(props: PermissionPromptHostProps) {
 // ── Antigravity Native Swarm UI (OCV5-809) & PinnedDelegateTracker: single shared lazy chunks ──
 let loadedSwarm: SwarmViewsModule | null = null
 let pendingSwarm: Promise<SwarmViewsModule> | null = null
-function preloadSwarmViews(): Promise<SwarmViewsModule> {
+export function preloadSwarmViews(): Promise<SwarmViewsModule> {
   if (!pendingSwarm) {
     pendingSwarm = import('./SwarmViews').then(
       (m) => { loadedSwarm = m; return m },
@@ -413,16 +492,16 @@ let LazySwarmInlineCard = lazySwarm('SwarmInlineCard')
 let LazyPinnedSwarmDock = lazySwarm('PinnedSwarmDock')
 let LazySwarmBoardDrawer = lazySwarm('SwarmBoardDrawer')
 let LazySwarmPlaybookPopover = lazySwarm('SwarmPlaybookPopover')
-const LazyPinnedDelegateTracker = lazy(() =>
+const LazyPinnedDelegateTracker = createRetryableLazy(() =>
   import('./PinnedDelegateTracker').then((m) => ({ default: m.PinnedDelegateTracker })),
 )
-const LazyPinnedTaskTracker = lazy(() =>
+const LazyPinnedTaskTracker = createRetryableLazy(() =>
   import('./PinnedTaskTracker').then((m) => ({ default: m.PinnedTaskTracker })),
 )
-const LazyPinnedGoalBar = lazy(() =>
+const LazyPinnedGoalBar = createRetryableLazy(() =>
   import('./PinnedGoalBar').then((m) => ({ default: m.PinnedGoalBar })),
 )
-const LazyQueuedSendList = lazy(() =>
+const LazyQueuedSendList = createRetryableLazy(() =>
   import('./QueuedSendList').then((m) => ({ default: m.QueuedSendList })),
 )
 
@@ -440,7 +519,7 @@ class SwarmLazyErrorBoundary extends Component<
           <button
             type="button"
             onClick={() => { this.props.onRebuild(); this.setState({ error: null }) }}
-            className="shrink-0 rounded-full bg-hover px-2.5 py-1 text-caption text-fg hover:bg-border/60"
+            className="shrink-0 rounded-full bg-hover px-2.5 py-1 text-caption text-fg hover:bg-border/60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
           >
             重试
           </button>
@@ -520,35 +599,59 @@ export function SwarmPlaybookPopoverLazy(props: SwarmPlaybookPopoverProps) {
 export function PinnedDelegateTrackerLazy(props: PinnedDelegateProps) {
   if (props.items.length === 0) return null
   return (
-    <Suspense fallback={null}>
-      <LazyPinnedDelegateTracker {...props} />
-    </Suspense>
+    <InlineTimelineErrorBoundary
+      compact
+      label="协作进度条加载失败"
+      renderChildren={() => (
+        <Suspense fallback={null}>
+          <LazyPinnedDelegateTracker {...props} />
+        </Suspense>
+      )}
+    />
   )
 }
 
 export function PinnedTaskTrackerLazy(props: PinnedTaskProps) {
   if (props.todos.length === 0) return null
   return (
-    <Suspense fallback={null}>
-      <LazyPinnedTaskTracker {...props} />
-    </Suspense>
+    <InlineTimelineErrorBoundary
+      compact
+      label="任务进度条加载失败"
+      renderChildren={() => (
+        <Suspense fallback={null}>
+          <LazyPinnedTaskTracker {...props} />
+        </Suspense>
+      )}
+    />
   )
 }
 
 export function PinnedGoalBarLazy(props: PinnedGoalProps) {
   if (!props.messages.some((m) => m?.role === 'goal' && m.cleared !== true)) return null
   return (
-    <Suspense fallback={null}>
-      <LazyPinnedGoalBar {...props} />
-    </Suspense>
+    <InlineTimelineErrorBoundary
+      compact
+      label="会话目标条加载失败"
+      renderChildren={() => (
+        <Suspense fallback={null}>
+          <LazyPinnedGoalBar {...props} />
+        </Suspense>
+      )}
+    />
   )
 }
 
 export function QueuedSendListLazy(props: QueuedSendProps) {
   if (props.messages.length === 0) return null
   return (
-    <Suspense fallback={null}>
-      <LazyQueuedSendList {...props} />
-    </Suspense>
+    <InlineTimelineErrorBoundary
+      compact
+      label="待发队列加载失败"
+      renderChildren={() => (
+        <Suspense fallback={null}>
+          <LazyQueuedSendList {...props} />
+        </Suspense>
+      )}
+    />
   )
 }

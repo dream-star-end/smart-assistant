@@ -12,7 +12,13 @@ import { isIPv4 } from 'node:net'
 import { resolve } from 'node:path'
 import type { InboundFrame } from '@openclaude/protocol'
 import { classifyRunError } from './errorClassify.js'
-import { deleteClientSession } from '@openclaude/storage'
+import {
+  deleteClientSession,
+  deleteWechatBinding,
+  getWechatBindingByUserId,
+  updateWechatBindingStatus,
+  WechatAccountAlreadyBoundError,
+} from '@openclaude/storage'
 import { isModelAuthorityRequired } from './modelAuthority.js'
 import {
   buildTurnDispatchStateResponse,
@@ -907,9 +913,9 @@ export async function _handleWechat(
   // Lazy import so the gateway doesn't pull in qrcode/iLink deps unless the
   // WeChat channel is wired up. Importing a workspace package is ~free in
   // Bun — this is purely to avoid hard-coupling the gateway to it.
-  let pairing: any
+  let pairing: typeof import('@openclaude/channel-wechat')
   try {
-    pairing = await import('@openclaude/channel-wechat' as any)
+    pairing = await import('@openclaude/channel-wechat')
   } catch (err) {
     // E5 — import 失败细节(路径/栈)只进日志。
     this.log.error('channel-wechat module unavailable', undefined, err as Error)
@@ -921,14 +927,7 @@ export async function _handleWechat(
     })
     return
   }
-  const { startPairing, resumePairing, cancelPairing } = pairing as typeof import('@openclaude/channel-wechat')
-
-  const {
-    getWechatBindingByUserId,
-    deleteWechatBinding,
-    updateWechatBindingStatus,
-    WechatAccountAlreadyBoundError,
-  } = await import('@openclaude/storage')
+  const { startPairing, resumePairing, cancelPairing } = pairing
 
   // ── POST /api/wechat/pair/start ──
   if (pathname === '/api/wechat/pair/start' && req.method === 'POST') {

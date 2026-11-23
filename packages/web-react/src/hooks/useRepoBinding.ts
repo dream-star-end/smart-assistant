@@ -50,6 +50,10 @@ export function useRepoBinding(opts: {
 
   // 版本门控：sessId → 已知 selection_version（或 +Infinity 哨兵=已清空）。
   const knownVersionRef = useRef<Map<string, number>>(new Map());
+  const authEpoch = auth?.snapshot().epoch ?? -1;
+  useEffect(() => {
+    knownVersionRef.current.clear();
+  }, [auth, authEpoch, enabled]);
   // 克隆进度计时器 + 起始时刻。
   const cloneStartRef = useRef<number | null>(null);
   const progressTimerRef = useRef<number | null>(null);
@@ -131,10 +135,11 @@ export function useRepoBinding(opts: {
     const a = authRef.current;
     const sid = activeIdRef.current;
     if (!a || !sid) return;
+    const epoch = a.snapshot().epoch;
     api
       .getRepoSelection(a, sid)
       .then((sel) => {
-        if (sid !== activeIdRef.current) return; // 期间切了会话，丢弃
+        if (authRef.current !== a || a.snapshot().epoch !== epoch || sid !== activeIdRef.current) return;
         if (sel.selected) {
           knownVersionRef.current.set(sid, sel.selection_version);
           // 权威态非 cloning（如解绑后/ready）→ 停进度计时器，防泄漏（cloning 中解绑账号的边角）。
@@ -156,16 +161,19 @@ export function useRepoBinding(opts: {
       const a = authRef.current;
       const sid = activeIdRef.current;
       if (!a || !sid) return;
+      const epoch = a.snapshot().epoch;
       const res = await api.putRepoSelection(a, sid, { owner, repo, branch });
       if (!res.selected) throw new Error("后端响应格式异常");
+      if (authRef.current !== a || a.snapshot().epoch !== epoch) return;
       // PUT 成功 = 后端权威新版本，覆盖任何哨兵（unbind→rebind 同 tab）。
       knownVersionRef.current.set(sid, res.selection_version);
+      sendRepoBind(sid, agentIdRef.current, res.selection_version);
+      if (sid !== activeIdRef.current) return;
       stopProgressTimer();
       clearReadyHide();
       setProgressPct(0);
       setBannerDismissed(false);
       setSelection(res); // 立即本地 pending（不等 status 帧）
-      sendRepoBind(sid, agentIdRef.current, res.selection_version);
     },
     [sendRepoBind, stopProgressTimer, clearReadyHide],
   );
@@ -174,12 +182,15 @@ export function useRepoBinding(opts: {
     const a = authRef.current;
     const sid = activeIdRef.current;
     if (!a || !sid) return;
+    const epoch = a.snapshot().epoch;
     const sel = selectionRef.current;
     const ver = sel?.selected ? sel.selection_version : 0;
     await api.deleteRepoSelection(a, sid);
+    if (authRef.current !== a || a.snapshot().epoch !== epoch) return;
     // DELETE 不返新版本 → 哨兵封顶，丢弃任何迟到的旧 status/error 帧。
     knownVersionRef.current.set(sid, VERSION_SENTINEL_CLEARED);
     sendRepoUnbind(sid, ver);
+    if (sid !== activeIdRef.current) return;
     stopProgressTimer();
     clearReadyHide();
     setProgressPct(0);

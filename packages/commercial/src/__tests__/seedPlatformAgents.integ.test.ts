@@ -40,6 +40,7 @@ let pgAvailable = false
 
 const listPublicModels = () => [
   { id: 'deepseek-v4-flash' },
+  { id: 'gpt-6.2-astra' },
   { id: 'MiniMax-M3' },
   { id: 'grok-build' },
   { id: 'glm-5.2' },
@@ -375,11 +376,11 @@ describe('seedPlatformGeneralAgents (integ) — 办公助手 + 编程助手', ()
     assert.deepEqual(
       await listCurrentAgentDefaults(GENERAL_SLUGS),
       {
-        'coding-assistant': { version: '1.0.4', model: 'glm-5.3-zai' },
+        'coding-assistant': { version: '1.0.5', model: 'deepseek-v4-flash' },
         'general-assistant': { version: '1.0.1', model: 'auto' },
         'office-assistant': { version: '1.0.3', model: 'grok-build' },
       },
-      '当前 approved 版本应体现不同助手的默认模型(办公 Grok 4.7,编程 GLM-5.3 Z.AI Coding Plan,通用 auto=不锁模型)',
+      '当前 approved 版本应体现不同助手的默认模型(办公 Grok 4.7,编程 DeepSeek V4 Flash,通用 auto=不锁模型)',
     )
 
     // kind 隔离:通用 agent 不进 skill 目录。
@@ -413,7 +414,7 @@ describe('seedPlatformGeneralAgents (integ) — 办公助手 + 编程助手', ()
     const upgraded = await seedPlatformGeneralAgents({ listPublicModels })
     assert.deepEqual(upgraded.errors, [])
     assert.deepEqual(await listCurrentAgentDefaults(['coding-assistant']), {
-      'coding-assistant': { version: '1.0.4', model: 'glm-5.3-zai' },
+      'coding-assistant': { version: '1.0.5', model: 'deepseek-v4-flash' },
     })
 
     const versionsAfterUpgrade = await query<{ version: string; status: string }>(
@@ -424,7 +425,7 @@ describe('seedPlatformGeneralAgents (integ) — 办公助手 + 编程助手', ()
     )
     assert.deepEqual(versionsAfterUpgrade.rows, [
       { version: '1.0.1', status: 'approved' },
-      { version: '1.0.4', status: 'approved' },
+      { version: '1.0.5', status: 'approved' },
     ])
 
     // 模拟另一 release 取得领导权并把共享 current 指向自己的版本；随后重新调用当前 release
@@ -438,7 +439,7 @@ describe('seedPlatformGeneralAgents (integ) — 办公助手 + 编程助手', ()
     assert.deepEqual(reacquired.errors, [])
     assert.ok(reacquired.skipped.includes('coding-assistant'), '已存在版本应走 DUPLICATE 幂等分支')
     assert.deepEqual(await listCurrentAgentDefaults(['coding-assistant']), {
-      'coding-assistant': { version: '1.0.4', model: 'glm-5.3-zai' },
+      'coding-assistant': { version: '1.0.5', model: 'deepseek-v4-flash' },
     })
     assert.equal(
       (

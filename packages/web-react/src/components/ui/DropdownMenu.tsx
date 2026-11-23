@@ -96,7 +96,7 @@ export const DropdownMenuSubContent = forwardRef<
     collisionPadding={collisionPadding}
     className={cn(
       !hasUnprefixedMaxH(className) && "oc-dropdown-max-h",
-      "oc-surface-popover z-50 min-w-[11.5rem] overflow-y-auto overflow-x-hidden overscroll-contain rounded-xl p-1.5 text-fg outline-none",
+      "oc-surface-popover z-[var(--z-popover-portal)] min-w-[11.5rem] overflow-y-auto overflow-x-hidden overscroll-contain rounded-xl p-1.5 text-fg outline-none",
       DEFAULT_DROPDOWN_MAX_H,
       "origin-[var(--radix-popper-transform-origin)] data-[state=open]:animate-pop data-[state=closed]:oc-pop-out",
       className,

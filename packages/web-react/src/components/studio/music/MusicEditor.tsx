@@ -20,7 +20,7 @@ import {
 } from '../../../lib/studio/music'
 import type { StudioTake } from '../../../lib/studio/types'
 import type { AuthSession } from '../../../lib/types'
-import { useToast } from '../../ui'
+import { Select, useToast } from '../../ui'
 import { Waveform } from '../Waveform'
 import { LicenseBadge } from './TrackRow'
 import type { Preview } from './usePreview'
@@ -307,45 +307,39 @@ export function MusicEditor(props: {
               <label className="st-cap" htmlFor="st-me-from">
                 从
               </label>
-              <select
+              <Select
                 id="st-me-from"
-                className="st-input"
-                value={fromShot}
-                onChange={(e) => {
-                  const i = Number(e.target.value)
+                aria-label="起始镜头"
+                inputSize="sm"
+                className="w-auto min-w-[9.5rem] flex-1"
+                value={String(fromShot)}
+                onValueChange={(val) => {
+                  const i = Number(val)
                   set({
                     startSec: clips[i]!.start,
                     endSec: Math.max(edit.endSec ?? film, clips[i]!.end),
                   })
                 }}
-              >
-                {shotOptions.map((o) => (
-                  <option key={o.i} value={o.i}>
-                    {o.label}
-                  </option>
-                ))}
-              </select>
+                options={shotOptions.map((o) => ({ value: String(o.i), label: o.label }))}
+              />
               <label className="st-cap" htmlFor="st-me-to">
                 到
               </label>
-              <select
+              <Select
                 id="st-me-to"
-                className="st-input"
-                value={toShot}
-                onChange={(e) => {
-                  const i = Number(e.target.value)
+                aria-label="结束镜头"
+                inputSize="sm"
+                className="w-auto min-w-[9.5rem] flex-1"
+                value={String(toShot)}
+                onValueChange={(val) => {
+                  const i = Number(val)
                   set({
                     endSec: clips[i]!.end,
                     startSec: Math.min(edit.startSec ?? 0, clips[i]!.start),
                   })
                 }}
-              >
-                {shotOptions.map((o) => (
-                  <option key={o.i} value={o.i}>
-                    {o.label}
-                  </option>
-                ))}
-              </select>
+                options={shotOptions.map((o) => ({ value: String(o.i), label: o.label }))}
+              />
             </div>
           ) : null}
           <div className="st-cap tnum">

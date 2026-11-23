@@ -297,15 +297,54 @@ describe("浏览器页", () => {
       fireEvent.click(screen.getByTestId("live-browser-handback-btn"));
       await waitFor(() => expect(screen.queryByTestId("live-browser-theater-dialog")).toBeNull());
 
-      // Switch to 步骤记录 then back to 实时视口 (remounts LiveBrowserStage)
+      // Switch to 步骤记录 then back to 实时视口 (hidden keep-alive preserves mount, does not replay handoff)
       fireEvent.click(screen.getByTestId("browser-mode-steps"));
       expect(await screen.findByTestId("browser-window")).toBeInTheDocument();
+      expect(screen.getByTestId("browser-live-keepalive")).toHaveClass("hidden");
       fireEvent.click(screen.getByTestId("browser-mode-live"));
+      expect(screen.getByTestId("browser-live-keepalive")).not.toHaveClass("hidden");
       await screen.findByTestId("live-browser-active");
 
       // Must NOT replay fullscreen theater or takeover
       expect(screen.queryByTestId("live-browser-theater-dialog")).toBeNull();
       expect(screen.queryByTestId("live-browser-takeover-dock")).toBeNull();
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  test("浏览器 Tab 激活实时浏览器时隐藏外层重复全屏按钮，且跨会话 paneRequestForSession 精准命中目标会话", async () => {
+    const { paneRequestForSession } = await import("./InspectorPanel");
+    const req = { tab: "browser" as const, message: null, liveBrowser: { takeover: true, expand: true }, nonce: 99, sessionId: "sess-b" };
+    expect(paneRequestForSession(req, "sess-a")).toBeNull();
+    expect(paneRequestForSession(req, "sess-b")).toEqual(req);
+
+    const mockAuth = {
+      snapshot: () => ({ token: "tok", username: "u", role: "user" as const }),
+      refresh: async () => "tok",
+      logout: () => {},
+    };
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async () => new Response(JSON.stringify({ available: true, active: false }), { status: 200 }));
+    try {
+      render(
+        <InspectorPanelContent
+          messages={[]}
+          liveBrowserAgentId="main"
+          liveBrowserAuth={mockAuth as never}
+          onToggleFullscreen={() => {}}
+          onClose={() => {}}
+        />,
+      );
+      await browserReady();
+      // 零消息新会话默认直达浏览器 Tab，且不展示重复的外层全屏按钮
+      expect(screen.getByRole("tab", { name: /浏览器/ })).toHaveAttribute("aria-selected", "true");
+      expect(screen.queryByTestId("pane-fullscreen-toggle")).toBeNull();
+
+      // 切回产出 Tab 时恢复外层全屏阅读按钮
+      fireEvent.click(screen.getByRole("tab", { name: /产出/ }));
+      expect(screen.getByTestId("pane-fullscreen-toggle")).toBeInTheDocument();
     } finally {
       fetchMock.mockRestore();
     }

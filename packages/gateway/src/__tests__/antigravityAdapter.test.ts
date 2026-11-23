@@ -28,7 +28,10 @@ import {
 import {
   ANTIGRAVITY_COMPACTION_STEP_TYPE,
   buildAntigravityPromptInputsKey,
+  decideAntigravityPromptElision,
+  getAntigravityConversationDbScanCount,
   readAntigravityPromptState,
+  resetAntigravityConversationInspectCache,
   writeAntigravityPromptState,
 } from '../engine/antigravityPromptState.js'
 import { prepareAntigravityNativeTrajectory } from '../engine/antigravityNativeTrajectory.js'
@@ -2134,6 +2137,72 @@ describe('Antigravity prompt state hardening (OCV5-781 audit)', () => {
     })
     assert.equal(indexChurn, k1)
     assert.notEqual(buildAntigravityPromptInputsKey({ ...base, memoryInstructionsFingerprint: 'rules-v2' }), k1)
+  })
+
+  test('W3 hot-path: caches conversations/<uuid>.db inspection by (mtimeMs, size) and invalidates on DB mutation', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-agy-cache-'))
+    try {
+      const openClaudeHome = path.join(dir, 'home')
+      const agyRoot = path.join(dir, 'agy')
+      const convDir = path.join(dir, 'conversations')
+      await mkdir(openClaudeHome, { recursive: true })
+      await mkdir(agyRoot, { recursive: true })
+      await mkdir(convDir, { recursive: true })
+
+      const convId = '9c2f4187-e96d-4840-8c1c-3de86f92aa99'
+      const sessionKey = 'agent:main:webchat:dm:cache-test'
+      const inputsKey = 'b'.repeat(64)
+      const dbPath = path.join(convDir, `${convId}.db`)
+
+      const db = new Database(dbPath)
+      db.exec('CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER)')
+      db.prepare('INSERT INTO steps (idx, step_type) VALUES (?, ?)').run(0, 1)
+      db.prepare('INSERT INTO steps (idx, step_type) VALUES (?, ?)').run(1, 2)
+      db.close()
+
+      writeAntigravityPromptState(agyRoot, {
+        v: 1,
+        sessionKey,
+        conversationId: convId,
+        inputsKey,
+        injectedAfterBaseline: 0,
+        updatedAt: Date.now(),
+      })
+
+      resetAntigravityConversationInspectCache()
+      const decisionArgs = {
+        openClaudeHome,
+        antigravityRootDir: agyRoot,
+        conversationsDir: convDir,
+        sessionKey,
+        requestedConversationId: convId,
+        inputsKey,
+        env: {},
+      }
+
+      // First check opens SQLite once; repeated checks on unchanged DB hit cache without reopening SQLite
+      assert.deepEqual(decideAntigravityPromptElision(decisionArgs), { elide: true, reason: 'elided' })
+      assert.equal(getAntigravityConversationDbScanCount(), 1)
+      assert.deepEqual(decideAntigravityPromptElision(decisionArgs), { elide: true, reason: 'elided' })
+      assert.deepEqual(decideAntigravityPromptElision(decisionArgs), { elide: true, reason: 'elided' })
+      assert.equal(getAntigravityConversationDbScanCount(), 1, 'unchanged DB must hit cache and skip SQLite scan')
+
+      // Mutate DB (insert compaction step + bump mtime/size) -> cache invalidates and detects compaction immediately
+      const db2 = new Database(dbPath)
+      db2.prepare('INSERT INTO steps (idx, step_type) VALUES (?, ?)').run(2, ANTIGRAVITY_COMPACTION_STEP_TYPE)
+      db2.close()
+      const { utimesSync } = await import('node:fs')
+      const futureSec = (Date.now() + 5_000) / 1000
+      utimesSync(dbPath, futureSec, futureSec)
+
+      assert.deepEqual(decideAntigravityPromptElision(decisionArgs), {
+        elide: false,
+        reason: 'compacted_since_injection',
+      })
+      assert.equal(getAntigravityConversationDbScanCount(), 2, 'mutated DB must invalidate cache and re-scan SQLite')
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })
 

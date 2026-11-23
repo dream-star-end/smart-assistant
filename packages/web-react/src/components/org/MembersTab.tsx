@@ -99,6 +99,7 @@ export function MembersTab({
   const [invitations, setInvitations] = useState<OrgInvitation[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
+  const [reloadTick, setReloadTick] = useState(0);
   const [busyUid, setBusyUid] = useState<string | null>(null);
   const [busyInv, setBusyInv] = useState<string | null>(null);
 
@@ -147,7 +148,7 @@ export function MembersTab({
     return () => {
       alive = false;
     };
-  }, [auth]);
+  }, [auth, reloadTick]);
 
   async function reloadMembers() {
     try {
@@ -185,8 +186,19 @@ export function MembersTab({
     }
   }
 
-  // 财务委派开关(仅 owner):乐观更新 + 失败回退。授予后该成员可执行组织计费写操作。
+  // 财务委派开关(仅 owner):先二次确认，再乐观更新 + 失败回退。授予后该成员可执行组织计费写操作。
   async function toggleDelegate(m: OrgMember, next: boolean) {
+    const ok = await confirm({
+      title: next
+        ? `授予「${m.display_name || m.email}」财务委派权限？`
+        : `回收「${m.display_name || m.email}」的财务委派权限？`,
+      body: next
+        ? "授予后，该成员可执行组织充值、企业套餐订阅、加席与发票管理等计费操作。"
+        : "回收后，该成员将无法再执行组织计费操作。",
+      danger: !next,
+      confirmText: next ? "确认授予" : "确认回收",
+    });
+    if (ok !== true) return;
     setBusyUid(m.user_id);
     setMembers((prev) =>
       prev.map((x) => (x.user_id === m.user_id ? { ...x, billing_delegate: next } : x)),
@@ -284,6 +296,13 @@ export function MembersTab({
   }
 
   async function revokeInvite(inv: OrgInvitation) {
+    const ok = await confirm({
+      title: `撤销对「${inv.email}」的邀请？`,
+      body: "撤销后原邀请链接将立即失效，如需邀请可重新发送。",
+      danger: true,
+      confirmText: "撤销邀请",
+    });
+    if (ok !== true) return;
     setBusyInv(inv.id);
     try {
       await api.revokeOrgInvitation(auth, inv.id);
@@ -306,7 +325,15 @@ export function MembersTab({
   if (err) {
     return (
       <div className="px-5 py-4">
-        <Alert tone="danger" className="text-meta">
+        <Alert
+          tone="danger"
+          className="text-meta"
+          action={
+            <Button size="sm" variant="secondary" onClick={() => setReloadTick((n) => n + 1)}>
+              重试
+            </Button>
+          }
+        >
           {err}
         </Alert>
       </div>

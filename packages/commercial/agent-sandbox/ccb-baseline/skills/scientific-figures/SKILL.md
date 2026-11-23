@@ -20,7 +20,7 @@ priority: 5
 ## 1. 核心工作流:出图 → figcheck → 自纠(最多 3 轮)→ 交付
 
 ```
-1) 选对工具(§2)画图,savefig 到 /home/agent/.openclaude/research/<id>/figN.png,dpi=300,bbox_inches='tight'
+1) 选对工具(§2)画图,savefig 到 /home/agent/.openclaude/research/<id>/figN.png,dpi=300,bbox_inches='tight',pad_inches=0.28
 2) oc-figcheck <png> --kind <figure|schematic|network|3d|composite> [--spec <figN.spec.json>]
 3) 读输出:deterministic.issues(确定性硬伤)+ vision.review(审稿意见)+ 末行 VERDICT
 4) VERDICT=PASS/WARN → 交付;FAIL 且未满 3 轮 → 按 issues 改绘图代码重画 → 回到步骤 2
@@ -100,15 +100,17 @@ python3 $T/template.py [参数] --backend pptx --out /home/agent/.openclaude/res
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import scienceplots  # noqa: F401
-plt.style.use(['science', 'nature', 'no-latex'])  # 或 ['science','ieee','no-latex']
+plt.style.use(['science', 'no-latex'])  # 无 TeX 环境必用 ['science', 'no-latex']（或叠加 'nature'/'ieee'）
 plt.rcParams['font.family'] = ['Noto Serif CJK SC', 'serif']  # 中文图注(字体已装)
+plt.rcParams['savefig.pad_inches'] = 0.28  # 留足外边距，防止 bbox_inches='tight' 过紧触发 oc-figcheck edgeInkFrac 告警
 fig, ax = plt.subplots(figsize=(3.5, 2.6))
 ax.plot(x, y, label='method A')
 ax.set_xlabel('Epoch'); ax.set_ylabel('Accuracy (%)'); ax.legend()
-fig.savefig('/home/agent/.openclaude/research/<id>/fig1.png', dpi=300, bbox_inches='tight')
+fig.savefig('/home/agent/.openclaude/research/<id>/fig1.png', dpi=300, bbox_inches='tight', pad_inches=0.28)
 print('/home/agent/.openclaude/research/<id>/fig1.png')
 ```
-- 样式列表**必须含 `'no-latex'`**——容器无 LaTeX,不带会在 savefig 时报 `latex could not be found`。公式用 mathtext(`$...$`)即可。
+- **无 TeX 环境铁律**:容器未安装 LaTeX，SciencePlots 必须使用 `['science', 'no-latex']`（或 `['science', 'nature', 'no-latex']` / `['science', 'ieee', 'no-latex']`），漏写 `'no-latex'` 会在 `savefig` 时报 `latex could not be found`。公式用 matplotlib mathtext(`$...$`)即可。
+- **防 `edgeInkFrac` 边缘告警**:必须设置 `plt.rcParams['savefig.pad_inches'] = 0.28`（或在 `savefig(..., bbox_inches='tight', pad_inches=0.28)` 显式传参），避免默认 `0.1` 英寸裁剪过紧导致坐标轴标签/刻度落入最外 2% 边缘带而触发 `oc-figcheck` 的 `edgeInkFrac` 失败。
 - **期刊黑白/彩色双版**(`references/styles/`,叠加层,版式基底仍来自 SciencePlots 的 science/nature/ieee;与 §6 色板一致):黑白版=灰阶+线型双编码(打印友好、天然压"AI 味"鲜蓝粗线),彩色版=ColorBrewer Set2。期刊常要"正文黑白+补充材料彩色",同数据跑两遍即可:
 
 ```python

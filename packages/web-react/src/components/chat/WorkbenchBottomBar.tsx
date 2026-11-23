@@ -20,8 +20,9 @@ import {
   Send,
   X,
 } from "lucide-react";
-import { createContext, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useContext, useState } from "react";
+import { createContext, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useContext, useEffect, useRef, useState } from "react";
 import { cn } from "../../lib/utils";
+import { modKeyLabel } from "../ChatHeader";
 import {
   Button,
   DropdownMenu,
@@ -63,13 +64,25 @@ export function FileOverflowMenu({
   const toast = useToast();
   const [copied, setCopied] = useState(false);
   const [opening, setOpening] = useState(false);
+  const copiedTimerRef = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (copiedTimerRef.current !== null) window.clearTimeout(copiedTimerRef.current);
+    },
+    [],
+  );
 
   const copyPath = async () => {
     try {
       await navigator.clipboard.writeText(path);
       setCopied(true);
       toast("已复制路径", "success");
-      setTimeout(() => setCopied(false), 1600);
+      if (copiedTimerRef.current !== null) window.clearTimeout(copiedTimerRef.current);
+      copiedTimerRef.current = window.setTimeout(() => {
+        copiedTimerRef.current = null;
+        setCopied(false);
+      }, 1600);
     } catch {
       toast("复制路径失败", "error");
     }
@@ -107,7 +120,7 @@ export function FileOverflowMenu({
           {busy ? <Spinner size={14} /> : <MoreHorizontal size={15} />}
         </IconButton>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" side="top" className="z-[70] min-w-[10rem]">
+      <DropdownMenuContent align="end" side="top" className="min-w-[10rem]">
         <DropdownMenuItem onSelect={() => void copyPath()}>
           {copied ? <Check size={14} className="text-success" /> : <Copy size={14} className="text-muted" />}
           <span>{copied ? "已复制路径" : "复制路径"}</span>
@@ -219,7 +232,7 @@ export function WorkbenchBottomBar({
             aria-expanded={outline.open}
             onClick={outline.onToggle}
             data-testid="doc-outline-toggle"
-            className="oc-spring-press h-8 shrink-0 px-2 text-meta whitespace-nowrap [@media(hover:none)]:min-h-10"
+            className="oc-spring-press h-8 shrink-0 px-2 text-meta whitespace-nowrap [@media(hover:none)]:min-h-11"
           >
             <ListTree size={13} aria-hidden />
             <span>目录</span>
@@ -234,7 +247,7 @@ export function WorkbenchBottomBar({
             variant="ghost"
             onClick={modeToggle.onClick}
             data-testid={modeToggle.testId}
-            className="oc-spring-press h-8 shrink-0 px-2 text-meta whitespace-nowrap [@media(hover:none)]:min-h-10"
+            className="oc-spring-press h-8 shrink-0 px-2 text-meta whitespace-nowrap [@media(hover:none)]:min-h-11"
           >
             {modeToggle.icon === "doc" ? (
               <BookOpen size={13} aria-hidden />
@@ -321,6 +334,7 @@ export function AnnotationComposer({
   };
 
   const onKeyDown = (e: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
       e.preventDefault();
       void handleSubmit();
@@ -340,7 +354,7 @@ export function AnnotationComposer({
           <button
             type="button"
             onClick={onClearAnchor}
-            className="rounded px-1.5 py-0.5 text-caption text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            className="rounded px-1.5 py-0.5 text-caption text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-2.5"
           >
             改为整份文件
           </button>
@@ -361,9 +375,7 @@ export function AnnotationComposer({
       />
       <div className="flex flex-wrap items-center justify-between gap-2">
         <span className="hidden items-center gap-1 text-caption text-faint sm:inline-flex">
-          <kbd className="oc-kbd">⌘ / Ctrl</kbd>
-          <span>+</span>
-          <kbd className="oc-kbd">Enter</kbd>
+          <kbd className="oc-kbd">{modKeyLabel()}Enter</kbd>
           <span>快捷提交</span>
         </span>
         <div className="ml-auto flex items-center gap-2 sm:ml-0">

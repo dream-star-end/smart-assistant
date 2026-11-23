@@ -18,6 +18,7 @@ import {
   parseOpenAlexWork,
   parsePubmedSummary,
   parseS2Paper,
+  searchArxiv,
   searchOpenAlex,
   searchPubmed,
   searchS2,
@@ -32,7 +33,11 @@ import {
   type SourceRecord,
   formatApa,
   formatBibtex,
+  formatCitation,
   formatGbt7714,
+  formatIeee,
+  formatNature,
+  resolveEvidenceGrade,
 } from "@openclaude/protocol/research";
 
 // ── mock fetch helper ────────────────────────────────────────────────
@@ -130,6 +135,104 @@ describe("sources: normalize & parse", () => {
     assert.equal(recs.length, 1);
     assert.equal(recs[0].doi, "10.1/x");
   });
+
+  it("OCV5-874 #7c: searchArxiv 带 User-Agent/Accept 请求头、单层请求不叠加内层重试", async () => {
+    const atomOk = `<feed><entry><title>Resilient ArXiv</title><id>https://arxiv.org/abs/2405.00001v1</id><published>2024-05-01T00:00:00Z</published><author><name>Alice Smith</name></author></entry></feed>`;
+    const seenHeaders: Array<Record<string, string>> = [];
+    let calls = 0;
+    const f = (async (_url: string | URL | Request, init?: RequestInit) => {
+      calls++;
+      seenHeaders.push((init?.headers ?? {}) as Record<string, string>);
+      return new Response(atomOk, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const recs = await searchArxiv("climate", { size: 5, mailto: "ops@example.com", fetchImpl: f });
+    assert.equal(calls, 1);
+    assert.equal(recs.length, 1);
+    assert.equal(recs[0].arxivId, "2405.00001");
+    assert.match(seenHeaders[0]["User-Agent"] ?? "", /OpenClaude-research\/1\.0.*ops@example\.com/);
+    assert.match(seenHeaders[0].Accept ?? "", /application\/atom\+xml/);
+
+    // 404 直接抛，不叠加内层重试
+    let errCalls = 0;
+    const notFoundFetch = (async () => {
+      errCalls++;
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+    await assert.rejects(() => searchArxiv("climate", { size: 5, fetchImpl: notFoundFetch }), /upstream_404/);
+    assert.equal(errCalls, 1);
+  });
+
+  it("OCV5-874 #7c: searchMultiSource 编排层单层有界重试 — arXiv 持续超时不放大也不拖垮 OpenAlex 结果", async () => {
+    // 1) 瞬时 AbortError：精确重试 2 次（单层，绝不乘以 3×2=6）
+    let immediateArxivCalls = 0;
+    const fastFailFetch = ((url: string | URL | Request) => {
+      const u = String(url);
+      if (u.includes("api.openalex.org")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ results: [{ title: "Fast OpenAlex Paper", doi: "10.1/fast" }] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      }
+      if (u.includes("export.arxiv.org")) {
+        immediateArxivCalls++;
+        const e = new Error("This operation was aborted");
+        e.name = "AbortError";
+        return Promise.reject(e);
+      }
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    }) as unknown as typeof fetch;
+
+    const resFast = await searchMultiSource(
+      { query: "vlbi atmospheric delay", sources: ["openalex", "arxiv"] },
+      { fetchImpl: fastFailFetch, timeoutMs: 200, retryDelayMs: 0 },
+    );
+    assert.equal(immediateArxivCalls, 2, `arXiv 编排层应精确尝试 2 次(不乘以 3×2=6), 实际 ${immediateArxivCalls}`);
+    assert.equal(resFast.sources.length, 1);
+    assert.equal(resFast.sources[0]?.title, "Fast OpenAlex Paper");
+    assert.ok(resFast.warnings.some((w) => w.includes("source arxiv failed")));
+
+    // 2) 持续挂死请求：受总预算封顶快速收敛，仍保留 OpenAlex 成功结果
+    let hangingArxivCalls = 0;
+    const hangingFetch = ((url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("api.openalex.org")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ results: [{ title: "Fast OpenAlex Paper", doi: "10.1/fast" }] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      }
+      if (u.includes("export.arxiv.org")) {
+        hangingArxivCalls++;
+        return new Promise<Response>((_resolve, reject) => {
+          const onAbort = () => {
+            const e = new Error("This operation was aborted");
+            e.name = "AbortError";
+            reject(e);
+          };
+          if (init?.signal?.aborted) onAbort();
+          else init?.signal?.addEventListener("abort", onAbort, { once: true });
+        });
+      }
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    }) as unknown as typeof fetch;
+
+    const t0 = Date.now();
+    const res = await searchMultiSource(
+      { query: "vlbi atmospheric delay", sources: ["openalex", "arxiv"] },
+      { fetchImpl: hangingFetch, timeoutMs: 50, retryDelayMs: 5 },
+    );
+    const elapsed = Date.now() - t0;
+    assert.ok(hangingArxivCalls >= 1 && hangingArxivCalls <= 2, `arXiv 挂死最多尝试 2 次, 实际 ${hangingArxivCalls}`);
+    assert.ok(elapsed < 1000, `应在有界预算内返回(实际 ${elapsed}ms)`);
+    assert.equal(res.sources.length, 1);
+    assert.equal(res.sources[0]?.title, "Fast OpenAlex Paper");
+    assert.ok(res.warnings.some((w) => w.includes("source arxiv failed")));
+  });
 });
 
 // ── sources: PubMed ──────────────────────────────────────────────────
@@ -156,7 +259,7 @@ describe("sources: pubmed", () => {
     assert.equal(rec.id, "doi:10.1038/s41591-021-0001");
     assert.equal(rec.year, 2021);
     assert.equal(rec.venue, "Nature Medicine");
-    assert.deepEqual(rec.authors, [{ name: "Smith J" }]); // 非 Author authtype 剔除
+    assert.deepEqual(rec.authors, [{ name: "Smith J", family: "Smith", given: "J" }]); // 非 Author authtype 剔除且保留结构化姓/名
     assert.equal(rec.retracted, null);
   });
 
@@ -626,23 +729,255 @@ describe("cite: formatters", () => {
     assert.ok(a.includes("https://doi.org/10.5555/x"));
   });
 
-  it("gbt7714 期刊 [J] + 超 3 作者用等", () => {
+  it("gbt7714 期刊 [J] + 超 3 作者西文用 et al. / 中文用等 (OCV5-874 #7b)", () => {
     const g = formatGbt7714(sample);
     assert.ok(g.includes("[J]"));
     assert.ok(g.includes("NeurIPS"));
-    const many = rec({
+    const manyLatin = rec({
       title: "Big",
-      authors: [{ name: "A" }, { name: "B" }, { name: "C" }, { name: "D" }],
+      authors: [{ name: "Alice" }, { name: "Bob" }, { name: "Carol" }, { name: "Dave" }],
       year: 2020,
       doi: "10.1/m",
     });
-    assert.ok(formatGbt7714(many).includes("等"));
+    const gLatin = formatGbt7714(manyLatin);
+    assert.ok(gLatin.startsWith("Alice, Bob, Carol, et al. Big[J]."), `got: ${gLatin}`);
+    assert.ok(!gLatin.includes("等"), "西文作者不应输出 等");
+    assert.ok(!gLatin.includes("et al.."), "不应出现双句点");
+
+    const manyZh = rec({
+      title: "基于深度检索的引用接地",
+      authors: [{ name: "张三" }, { name: "李四" }, { name: "王五" }, { name: "赵六" }],
+      year: 2024,
+      venue: "计算机学报",
+    });
+    const gZh = formatGbt7714(manyZh);
+    assert.ok(gZh.startsWith("张三, 李四, 王五, 等. 基于深度检索的引用接地[J]."), `got: ${gZh}`);
+    assert.ok(!gZh.includes("et al"), "中文作者不应输出 et al.");
   });
 
-  it("gbt7714 arXiv 预印本 [J/OL]", () => {
-    const pre = rec({ title: "Pre", authors: [{ name: "X" }], year: 2023, arxivId: "2301.00001" });
+  it("gbt7714 arXiv 预印本 [J/OL] + BibTeX @misc 规范 eprint/archivePrefix 无 journal 冲突 (OCV5-874 #7b)", async () => {
+    const webCiteModulePath = "../../../web-react/src/lib/research/cite.js";
+    const webCite = (await import(webCiteModulePath)) as {
+      formatCitation: typeof formatCitation;
+      formatBibtex: typeof formatBibtex;
+      formatGbt7714: typeof formatGbt7714;
+    };
+
+    const pre = rec({
+      title: "Pre",
+      authors: [
+        { name: "Alice Chen" },
+        { name: "Bob Zhang" },
+        { name: "Carol Li" },
+        { name: "Dave Wang" },
+      ],
+      year: 2023,
+      venue: "arXiv",
+      arxivId: "2301.00001",
+    });
     const g = formatGbt7714(pre);
-    assert.ok(g.includes("[J/OL]"));
+    assert.ok(g.startsWith("Alice Chen, Bob Zhang, Carol Li, et al. Pre[J/OL]."), `got: ${g}`);
     assert.ok(g.includes("arxiv.org/abs/2301.00001"));
+    assert.equal(g, webCite.formatGbt7714(pre), "protocol 与 web-react GB/T 7714 必须字节一致");
+
+    const bib = formatBibtex(pre);
+    assert.ok(bib.startsWith("@misc{chen2023,"), `got: ${bib}`);
+    assert.ok(bib.includes("  eprint = {2301.00001}"), `got: ${bib}`);
+    assert.ok(bib.includes("  archivePrefix = {arXiv}"), `got: ${bib}`);
+    assert.ok(!bib.includes("journal ="), `@misc arXiv 预印本不应含 journal 字段, got: ${bib}`);
+    assert.equal(bib, webCite.formatBibtex(pre), "protocol 与 web-react BibTeX 必须字节一致");
+
+    // 同步核对中文 4 作者与已发表带 DOI+arXiv 论文在 protocol 与 web-react 字节一致
+    const zhRec = rec({
+      title: "气候模式评估",
+      authors: [{ name: "张三" }, { name: "李四" }, { name: "王五" }, { name: "赵六" }],
+      year: 2025,
+      venue: "大气科学",
+    });
+    assert.equal(formatCitation(zhRec, "gb-t-7714-2015"), webCite.formatCitation(zhRec, "gb-t-7714-2015"));
+
+    const publishedWithArxiv: SourceRecord = {
+      ...rec({
+        title: "Published Paper",
+        authors: [{ name: "Jane Doe" }],
+        year: 2024,
+        venue: "Nature",
+        doi: "10.1038/s41586-024-9999",
+        arxivId: "2401.12345",
+      }),
+      pmid: "39999999",
+    };
+    const pubBib = formatBibtex(publishedWithArxiv);
+    assert.ok(pubBib.startsWith("@article{doe2024,"));
+    assert.ok(pubBib.includes("  journal = {Nature}"));
+    assert.ok(pubBib.includes("  eprint = {2401.12345}"));
+    assert.ok(pubBib.includes("  archivePrefix = {arXiv}"));
+    assert.ok(pubBib.includes("  pmid = {39999999}"));
+    assert.equal(pubBib, webCite.formatBibtex(publishedWithArxiv));
+  });
+
+  it("OCV5-865: gbt7714 完整卷期页码/会议[C]/DOI + ieee + nature + formatCitation 调度", () => {
+    const journalRec: SourceRecord = {
+      id: "doi:10.1038/s41586-024-0001",
+      title: "Scalable Graph Reasoning",
+      authors: [
+        { name: "Alice Chen" },
+        { name: "Bob Zhang" },
+        { name: "Carol Li" },
+      ],
+      year: 2024,
+      venue: "Nature",
+      volume: "628",
+      issue: "8007",
+      pages: "112-119",
+      doi: "10.1038/s41586-024-0001",
+    };
+    const confRec: SourceRecord = {
+      id: "doi:10.1109/cvpr.2025.0042",
+      title: "Dense Visual Grounding",
+      authors: [{ name: "John Smith" }, { name: "Jane Doe" }],
+      year: 2025,
+      venue: "Proceedings of CVPR",
+      pages: "450-459",
+      publisher: "IEEE",
+      crossrefType: "proceedings-article",
+      doi: "10.1109/cvpr.2025.0042",
+    };
+
+    const gbtJournal = formatCitation(journalRec, "gb-t-7714");
+    assert.equal(gbtJournal, formatCitation(journalRec, "gb-t-7714-2015"));
+    assert.ok(gbtJournal.includes("[J]"));
+    assert.ok(gbtJournal.includes("2024, 628(8007): 112-119"));
+    assert.ok(gbtJournal.includes("DOI: 10.1038/s41586-024-0001"));
+
+    const gbtConf = formatCitation(confRec, "gb-t-7714");
+    assert.ok(gbtConf.includes("[C]//Proceedings of CVPR"));
+    assert.ok(gbtConf.includes("IEEE, 2025: 450-459"));
+
+    const bibConf = formatCitation(confRec, "bibtex");
+    assert.ok(bibConf.startsWith("@inproceedings{"));
+    assert.ok(bibConf.includes("booktitle = {Proceedings of CVPR}"));
+    assert.ok(bibConf.includes("pages = {450--459}"));
+
+    const ieeeJournal = formatCitation(journalRec, "ieee");
+    assert.ok(ieeeJournal.includes("A. Chen, B. Zhang, and C. Li"));
+    assert.ok(ieeeJournal.includes("vol. 628, no. 8007, pp. 112–119, 2024"));
+    assert.ok(ieeeJournal.includes("doi: 10.1038/s41586-024-0001"));
+
+    const ieeeConf = formatIeee(confRec);
+    assert.ok(ieeeConf.includes("in Proceedings of CVPR"));
+
+    const natureJournal = formatCitation(journalRec, "nature");
+    assert.ok(natureJournal.includes("Chen, A., Zhang, B. & Li, C."));
+    assert.ok(natureJournal.includes("Nature 628, 112–119 (2024)."));
+    assert.ok(natureJournal.includes("https://doi.org/10.1038/s41586-024-0001"));
+
+    const manyAuthorsNature = formatNature({
+      ...journalRec,
+      authors: [
+        { name: "Alice Chen" },
+        { name: "Bob Zhang" },
+        { name: "Carol Li" },
+        { name: "Dave Wang" },
+        { name: "Eve Sun" },
+        { name: "Frank Wu" },
+      ],
+    });
+    assert.ok(manyAuthorsNature.startsWith("Chen, A. et al."));
+  });
+
+  it("OCV5-865: PubMed Smith JA 与 Crossref 多作者 APA/IEEE/Nature 格式化 CLI 与 Web 一致 (#8)", async () => {
+    const { parseCrossrefItem, parsePubmedSummary } = await import("../research/sources.js");
+    const webCiteModulePath = "../../../web-react/src/lib/research/cite.js";
+    const webCite = (await import(webCiteModulePath)) as { formatCitation: typeof formatCitation };
+
+    // 1. PubMed "Smith JA" 姓必须仍是 Smith
+    const pubmedRec = parsePubmedSummary({
+      uid: "39000001",
+      title: "Single-cell atlas of cortical plasticity",
+      pubdate: "2024 May",
+      fulljournalname: "Nature Neuroscience",
+      volume: "27",
+      issue: "5",
+      pages: "801-812",
+      authors: [
+        { name: "Smith JA", authtype: "Author" },
+        { name: "van der Berg HM", authtype: "Author" },
+      ],
+      articleids: [{ idtype: "doi", value: "10.1038/s41593-024-0001" }],
+    });
+    assert.ok(pubmedRec);
+    assert.equal(pubmedRec.authors[0]?.family, "Smith");
+    assert.equal(formatCitation(pubmedRec, "ieee"), webCite.formatCitation(pubmedRec, "ieee"));
+    assert.equal(formatCitation(pubmedRec, "nature"), webCite.formatCitation(pubmedRec, "nature"));
+    assert.equal(formatCitation(pubmedRec, "apa"), webCite.formatCitation(pubmedRec, "apa"));
+    assert.ok(formatCitation(pubmedRec, "ieee").startsWith("J. A. Smith and H. M. van der Berg,"));
+    assert.ok(formatCitation(pubmedRec, "nature").startsWith("Smith, J. A. & van der Berg, H. M."));
+    assert.ok(formatCitation(pubmedRec, "apa").startsWith("Smith, J. A., & van der Berg, H. M. (2024)."));
+    assert.ok(formatCitation(pubmedRec, "bibtex").startsWith("@article{smith2024,"));
+
+    // 2. Crossref 双作者 APA 对照: "Smith, J., & Brown, J."
+    const crossrefRec = parseCrossrefItem({
+      DOI: "10.1000/apa-test",
+      title: ["Empirical Study of Citations"],
+      author: [
+        { given: "Jane", family: "Smith" },
+        { given: "John", family: "Brown" },
+      ],
+      issued: { "date-parts": [[2020]] },
+      "container-title": ["Journal of Testing"],
+      volume: "12",
+      issue: "3",
+      page: "45-60",
+    });
+    assert.equal(formatCitation(crossrefRec, "apa"), webCite.formatCitation(crossrefRec, "apa"));
+    assert.ok(
+      formatCitation(crossrefRec, "apa").startsWith("Smith, J., & Brown, J. (2020). Empirical Study of Citations."),
+      `got APA: ${formatCitation(crossrefRec, "apa")}`,
+    );
+  });
+
+  it("OCV5-865: evidenceGrade A 仅来自已核验本地证据，调用方自报 A 不得提权 (#7)", async () => {
+    const { checkManifest } = await import("../research/checkManifest.js");
+    assert.equal(resolveEvidenceGrade({ quoteBound: true }), "A");
+    assert.equal(resolveEvidenceGrade({ localEvidenceVerified: true }), "A");
+    assert.equal(resolveEvidenceGrade({ localEvidenceVerified: false, docId: "doc:abc", spanId: "s0", evidenceGrade: "A" }), "B");
+    assert.equal(resolveEvidenceGrade({ evidenceGrade: "A" }), "B");
+    assert.equal(resolveEvidenceGrade({ evidenceGrade: "A", quoteBound: false }), "B");
+    assert.equal(resolveEvidenceGrade({}), "B");
+    assert.equal(resolveEvidenceGrade({ docId: "doc:abc" }), "B");
+    assert.equal(resolveEvidenceGrade({ evidenceGrade: "B", quoteBound: true }), "B");
+
+    // checkManifest: 无 quotes/supports 且调用方自报 A → 必须仍为 unchecked + evidenceGrade B
+    const checked = await checkManifest(
+      {
+        sources: [],
+        quotes: [],
+        claims: [
+          {
+            id: "c-spoof",
+            text: "Unverified claim attempting self-grade A",
+            supports: [],
+            status: "unchecked",
+            evidenceGrade: "A",
+          },
+        ],
+        coverage: { verifiedClaims: 0, totalClaims: 1 },
+        gates: {
+          quoteFirst: { checked: 0, failed: 0, passed: true },
+          claimBound: { checked: 0, failed: 0, passed: true },
+          identifier: { checked: 0, failed: 0, passed: true },
+          retraction: { checked: 0, failed: 0, passed: true },
+        },
+      },
+      {
+        getDocument: async () => null,
+        verifyIdentifier: async (id) => ({ identifier: id, resolved: false, retracted: null }),
+      },
+    );
+    assert.equal(checked.manifest.claims[0]?.status, "unchecked");
+    assert.equal(checked.manifest.claims[0]?.evidenceGrade, "B");
+    assert.equal(checked.manifest.claims[0]?.verdict?.quoteBound, false);
+    assert.equal(checked.manifest.claims[0]?.verdict?.evidenceGrade, "B");
   });
 });

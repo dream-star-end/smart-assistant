@@ -1,6 +1,5 @@
-import * as Dialog from '@radix-ui/react-dialog'
-import { CheckCircle2, LogIn, TriangleAlert, X } from 'lucide-react'
-import { type CSSProperties, useCallback, useEffect, useState } from 'react'
+import { CheckCircle2, LogIn, TriangleAlert } from 'lucide-react'
+import { useCallback, useEffect, useState } from 'react'
 import { PRODUCT_CAPABILITIES, type ProductFeatureId } from '../lib/productCapabilities'
 import { marketplaceArtifactKind } from '../lib/marketplace'
 import type { AuthSession, MarketplaceMyPublish } from '../lib/types'
@@ -13,7 +12,7 @@ import {
   useMarketplacePublishes,
 } from './marketplace/useMarketplacePublishes'
 import { useMarketplaceRevision } from './marketplace/useMarketplaceRevision'
-import { Alert, Badge, Button, EmptyState, IconButton, Tabs, useToast } from './ui'
+import { Alert, Badge, Button, EmptyState, Modal, Tabs, useToast } from './ui'
 import { AtelierLazyIcon } from './ui/AtelierLazyIcons'
 
 export type MarketplaceTab = 'browse' | 'installed' | 'publish' | 'review'
@@ -143,179 +142,171 @@ export function MarketplaceCenter({
   const noticeApproved = publishNotice?.publish.status === 'approved'
 
   return (
-    <Dialog.Root open={open} onOpenChange={(o) => !o && requestClose()}>
-      <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/35 backdrop-blur-sm data-[state=open]:animate-fade" />
-        <Dialog.Content
-          aria-describedby={undefined}
-          // 高度上限覆盖 oc-center-dialog 的默认 85dvh:市场是浏览型大弹层,要更高。该变量在未分层的
-          // .oc-center-dialog 规则里有默认值,工具类盖不过,只能走内联样式(取小的兜底仍由该规则负责)。
-          style={{ '--oc-center-max-h': 'calc(var(--oc-visual-height, 100dvh) - 24px)' } as CSSProperties}
-          className="marketplace-window oc-center-dialog oc-surface-popover fixed left-1/2 z-50 flex h-[calc(100dvh-24px)] w-[calc(100vw-16px)] max-w-[1120px] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl border border-border bg-elevated text-fg shadow-float focus:outline-none data-[state=open]:animate-in sm:h-[min(91dvh,940px)] sm:w-[calc(100vw-32px)] lg:w-[calc(100vw-64px)]"
-        >
-          <div className="oc-surface-glass flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2.5 border-x-0 border-t-0 border-b border-border/80 px-4 py-3 shadow-none sm:flex-nowrap sm:px-6">
-            <div className="flex min-w-0 items-center gap-2.5">
+    <Modal
+      open={open}
+      onOpenChange={(o) => !o && requestClose()}
+      mobile="center"
+      size="xl"
+      title={
+        <span className="flex min-w-0 items-center gap-2.5">
+          <span
+            className="oc-icon-badge oc-icon-badge-accent size-7 shrink-0 rounded-lg"
+            aria-hidden="true"
+          >
+            <AtelierLazyIcon name="market" size={15} />
+          </span>
+          <span className="truncate text-title font-semibold tracking-tight text-fg">
+            AI 市场
+          </span>
+        </span>
+      }
+      toolbar={
+        <Tabs
+          aria-label="市场分区"
+          idBase={TAB_ID_BASE}
+          value={safeTab}
+          onValueChange={(v) => onTabChange(v as MarketplaceTab)}
+          items={tabs.map((t) => ({ value: t.value, label: t.label, featureId: t.featureId }))}
+          className="oc-surface-recessed max-sm:w-full max-sm:[&>[role=tab]]:flex-1"
+        />
+      }
+      className="marketplace-window [--oc-center-max-h:calc(var(--oc-visual-height,100dvh)-24px)] h-[calc(100dvh-24px)] w-[calc(100vw-16px)] max-w-[1120px] rounded-2xl sm:h-[min(91dvh,940px)] sm:w-[calc(100vw-32px)] lg:w-[calc(100vw-64px)]"
+      bodyClassName="flex min-h-0 flex-1 flex-col overflow-hidden p-0"
+    >
+      {/* 发布结果通知:留在滚动区外,滚动时不丢;多条时给出剩余计数,不再"看起来只有一条"。 */}
+      {auth && publishNotice && (
+        <div className="shrink-0 border-b border-border/80 bg-surface/65 px-4 py-2.5 sm:px-6">
+          <Alert
+            density="compact"
+            tone={noticeApproved ? 'success' : 'warning'}
+            className="oc-callout rounded-xl"
+            icon={
               <span
-                className="oc-icon-badge oc-icon-badge-accent size-7 shrink-0 rounded-lg"
+                className={
+                  noticeApproved
+                    ? 'oc-icon-badge oc-icon-badge-success size-6 rounded-md'
+                    : 'oc-icon-badge oc-icon-badge-warning size-6 rounded-md'
+                }
                 aria-hidden="true"
               >
-                <AtelierLazyIcon name="market" size={15} />
+                {noticeApproved ? <CheckCircle2 size={14} /> : <TriangleAlert size={14} />}
               </span>
-              <Dialog.Title className="truncate text-title font-semibold tracking-tight text-fg">
-                AI 市场
-              </Dialog.Title>
-            </div>
-            <Tabs
-              aria-label="市场分区"
-              idBase={TAB_ID_BASE}
-              value={safeTab}
-              onValueChange={(v) => onTabChange(v as MarketplaceTab)}
-              items={tabs.map((t) => ({ value: t.value, label: t.label, featureId: t.featureId }))}
-              className="oc-surface-recessed order-last max-sm:w-full max-sm:[&>[role=tab]]:flex-1 sm:order-none"
-            />
-            <Dialog.Close asChild>
-              <IconButton aria-label="关闭" size="sm" className="oc-btn-tactile ml-auto">
-                <X size={16} />
-              </IconButton>
-            </Dialog.Close>
-          </div>
+            }
+            title={
+              <span className="flex flex-wrap items-center gap-1.5">
+                {noticeApproved
+                  ? `${artifactLabel(publishNotice.publish)}已实时上架`
+                  : `${artifactLabel(publishNotice.publish)}未通过审核`}
+                {publishNotices.length > 1 && (
+                  <Badge tone="neutral" size="sm">
+                    还有 {publishNotices.length - 1} 条
+                  </Badge>
+                )}
+              </span>
+            }
+            action={
+              <Button
+                size="sm"
+                variant="secondary"
+                className="oc-btn-tactile oc-btn-secondary-craft"
+                onClick={() => {
+                  if (noticeApproved) {
+                    openApprovedPublish(publishNotice)
+                  } else {
+                    dismissPublishNotice()
+                    onTabChange('publish')
+                  }
+                }}
+              >
+                {noticeApproved ? '在市场查看' : '查看我的发布'}
+              </Button>
+            }
+            onDismiss={dismissPublishNotice}
+          >
+            「{publishNotice.publish.name}」v{publishNotice.publish.version}
+            {noticeApproved
+              ? ' 已发布到市场。'
+              : `：${publishNotice.publish.reviewNote || '请到「发布」页的「我的发布」查看并修改后重新提交。'}`}
+          </Alert>
+        </div>
+      )}
 
-          {/* 发布结果通知:留在滚动区外,滚动时不丢;多条时给出剩余计数,不再"看起来只有一条"。 */}
-          {auth && publishNotice && (
-            <div className="shrink-0 border-b border-border/80 bg-surface/65 px-4 py-2.5 sm:px-6">
-              <Alert
-                density="compact"
-                tone={noticeApproved ? 'success' : 'warning'}
-                className="oc-callout rounded-xl"
-                icon={
-                  <span
-                    className={
-                      noticeApproved
-                        ? 'oc-icon-badge oc-icon-badge-success size-6 rounded-md'
-                        : 'oc-icon-badge oc-icon-badge-warning size-6 rounded-md'
-                    }
-                    aria-hidden="true"
-                  >
-                    {noticeApproved ? <CheckCircle2 size={14} /> : <TriangleAlert size={14} />}
-                  </span>
-                }
-                title={
-                  <span className="flex flex-wrap items-center gap-1.5">
-                    {noticeApproved
-                      ? `${artifactLabel(publishNotice.publish)}已实时上架`
-                      : `${artifactLabel(publishNotice.publish)}未通过审核`}
-                    {publishNotices.length > 1 && (
-                      <Badge tone="neutral" size="sm">
-                        还有 {publishNotices.length - 1} 条
-                      </Badge>
-                    )}
-                  </span>
-                }
+      <div
+        role="tabpanel"
+        id={`${TAB_ID_BASE}-panel-${safeTab}`}
+        aria-labelledby={`${TAB_ID_BASE}-tab-${safeTab}`}
+        className="marketplace-content min-h-0 flex-1 overflow-y-auto overscroll-contain scroll-pt-28 [scrollbar-gutter:stable]"
+      >
+        {!auth ? (
+          <div className="px-4 py-10 sm:px-6">
+            <div className="oc-surface-card mx-auto max-w-md rounded-2xl">
+              <EmptyState
+                icon={LogIn}
+                title="登录后即可浏览市场"
+                hint="你安装的技能与智能体会跟随账号同步。"
                 action={
                   <Button
                     size="sm"
-                    variant="secondary"
-                    className="oc-btn-tactile oc-btn-secondary-craft"
-                    onClick={() => {
-                      if (noticeApproved) {
-                        openApprovedPublish(publishNotice)
-                      } else {
-                        dismissPublishNotice()
-                        onTabChange('publish')
-                      }
-                    }}
+                    variant="primary"
+                    className="oc-btn-tactile oc-btn-primary-craft"
+                    onClick={onRequireLogin ?? onClose}
                   >
-                    {noticeApproved ? '在市场查看' : '查看我的发布'}
+                    去登录
                   </Button>
                 }
-                onDismiss={dismissPublishNotice}
-              >
-                「{publishNotice.publish.name}」v{publishNotice.publish.version}
-                {noticeApproved
-                  ? ' 已发布到市场。'
-                  : `：${publishNotice.publish.reviewNote || '请到「发布」页的「我的发布」查看并修改后重新提交。'}`}
-              </Alert>
+              />
             </div>
-          )}
-
-          <div
-            role="tabpanel"
-            id={`${TAB_ID_BASE}-panel-${safeTab}`}
-            aria-labelledby={`${TAB_ID_BASE}-tab-${safeTab}`}
-            className="marketplace-content min-h-0 flex-1 overflow-y-auto overscroll-contain scroll-pt-28 [scrollbar-gutter:stable]"
-          >
-            {!auth ? (
-              <div className="px-4 py-10 sm:px-6">
-                <div className="oc-surface-card mx-auto max-w-md rounded-2xl">
-                  <EmptyState
-                    icon={LogIn}
-                    title="登录后即可浏览市场"
-                    hint="你安装的技能与智能体会跟随账号同步。"
-                    action={
-                      <Button
-                        size="sm"
-                        variant="primary"
-                        className="oc-btn-tactile oc-btn-primary-craft"
-                        onClick={onRequireLogin ?? onClose}
-                      >
-                        去登录
-                      </Button>
-                    }
-                  />
-                </div>
-              </div>
-            ) : (
-              <>
-                {safeTab === 'browse' && (
-                  <div
-                    className="contents"
-                    data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}
-                  >
-                    <BrowsePanel
-                      auth={auth}
-                      kind={browseKind}
-                      onKindChange={setBrowseKind}
-                      revision={browseRevision}
-                      focusRequest={browseFocus}
-                      onFocusRequestConsumed={consumeBrowseFocus}
-                      onAskAiInChat={onAskAiInChat}
-                      onCreateInChat={
-                        onCreateInChat ? () => onCreateInChat(browseKind) : undefined
-                      }
-                      onGoPublish={() => onTabChange('publish')}
-                      onOpenConnectors={onOpenConnectors}
-                    />
-                  </div>
-                )}
-                {safeTab === 'installed' && (
-                  <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}>
-                    <InstalledPanel
-                      auth={auth}
-                      onGoBrowse={() => onTabChange('browse')}
-                      onOpenConnectors={onOpenConnectors}
-                    />
-                  </div>
-                )}
-                {safeTab === 'publish' && (
-                  <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.publish.id}>
-                    <PublishPanel
-                      auth={auth}
-                      onCreateInChat={onCreateInChat}
-                      publishes={publishes.rows}
-                      publishesLoading={publishes.loading}
-                      publishesError={publishes.error}
-                      onRefreshPublishes={publishes.refresh}
-                      onMutePublishTransition={publishes.muteTransition}
-                      onDirtyChange={setPublishDirty}
-                    />
-                  </div>
-                )}
-                {safeTab === 'review' && isAdmin && <ReviewPanel auth={auth} />}
-              </>
-            )}
           </div>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
+        ) : (
+          <>
+            {safeTab === 'browse' && (
+              <div
+                className="contents"
+                data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}
+              >
+                <BrowsePanel
+                  auth={auth}
+                  kind={browseKind}
+                  onKindChange={setBrowseKind}
+                  revision={browseRevision}
+                  focusRequest={browseFocus}
+                  onFocusRequestConsumed={consumeBrowseFocus}
+                  onAskAiInChat={onAskAiInChat}
+                  onCreateInChat={
+                    onCreateInChat ? () => onCreateInChat(browseKind) : undefined
+                  }
+                  onGoPublish={() => onTabChange('publish')}
+                  onOpenConnectors={onOpenConnectors}
+                />
+              </div>
+            )}
+            {safeTab === 'installed' && (
+              <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}>
+                <InstalledPanel
+                  auth={auth}
+                  onGoBrowse={() => onTabChange('browse')}
+                  onOpenConnectors={onOpenConnectors}
+                />
+              </div>
+            )}
+            {safeTab === 'publish' && (
+              <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.publish.id}>
+                <PublishPanel
+                  auth={auth}
+                  onCreateInChat={onCreateInChat}
+                  publishes={publishes.rows}
+                  publishesLoading={publishes.loading}
+                  publishesError={publishes.error}
+                  onRefreshPublishes={publishes.refresh}
+                  onMutePublishTransition={publishes.muteTransition}
+                  onDirtyChange={setPublishDirty}
+                />
+              </div>
+            )}
+            {safeTab === 'review' && isAdmin && <ReviewPanel auth={auth} />}
+          </>
+        )}
+      </div>
+    </Modal>
   )
 }

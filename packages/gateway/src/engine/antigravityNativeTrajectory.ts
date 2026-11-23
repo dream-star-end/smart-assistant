@@ -16,10 +16,13 @@ const log = createLogger({ module: 'antigravityNativeTrajectory' })
 export const ANTIGRAVITY_NATIVE_CLI_SHA256 = '60e72242f07c131f75afcd9a9e425d6ee097a1a1b3190ea98ae78fa4180bbfa8'
 /** Antigravity CLI 1.5.8 Linux x64 binary verified against SQLite trajectory layout & step_type 14/15/132. */
 export const ANTIGRAVITY_NATIVE_CLI_1_5_8_SHA256 = '9db59b6371107b939befa9c507c0a24989fda974e75d81d8529f3689ef7322e5'
+/** Antigravity CLI 1.5.15 Linux x64 binary verified against SQLite trajectory layout & step_type 14/15 (OCV5-860). */
+export const ANTIGRAVITY_NATIVE_CLI_1_5_15_SHA256 = 'e938b2983fbceda2583f173c0e7fc6a9f09e1acb7c5537f5b25aed05283e0400'
 /** Controlled compatible SHA-256 allowlist for pinned Antigravity native CLI builds. */
 export const ANTIGRAVITY_NATIVE_CLI_SHA256_ALLOWLIST: readonly string[] = Object.freeze([
   ANTIGRAVITY_NATIVE_CLI_SHA256,
   ANTIGRAVITY_NATIVE_CLI_1_5_8_SHA256,
+  ANTIGRAVITY_NATIVE_CLI_1_5_15_SHA256,
 ])
 export const ANTIGRAVITY_EXTRA_CLI_SHA256_ENV = 'OC_ANTIGRAVITY_EXTRA_CLI_SHA256'
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/

@@ -375,7 +375,7 @@ describe('积压列与有条件拖动', () => {
     await act(async () => {
       fireEvent.drop(column('s1'), { dataTransfer: dt })
     })
-    expect(await screen.findByText('这条理由会作为评论交给目标站的 agent。')).toBeInTheDocument()
+    expect(await screen.findByText('这条理由会作为评论交给目标站的智能体。')).toBeInTheDocument()
     fireEvent.change(screen.getByPlaceholderText('请填写理由'), {
       target: { value: '根因判断错了，请重做' },
     })

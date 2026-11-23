@@ -49,6 +49,7 @@ const TEMPLATES: Array<{
   aspect: StudioAspect
   sec: number
   bg: string
+  fg: string
   icon: ReactNode
 }> = [
   {
@@ -57,7 +58,8 @@ const TEMPLATES: Array<{
     brief: '为我的产品拍一条 15 秒竖屏广告：开头 2 秒抓眼球，中间展示卖点，结尾出品牌名和口号。',
     aspect: '9:16',
     sec: 15,
-    bg: 'linear-gradient(135deg,#1f1b3a,#5a3fee 60%,#b9a8ff)',
+    bg: 'var(--accent-soft)',
+    fg: 'var(--accent)',
     icon: <ShoppingBag size={20} />,
   },
   {
@@ -66,7 +68,8 @@ const TEMPLATES: Array<{
     brief: '做一条 60 秒的横屏科普短片，旁白讲清楚一个知识点，画面配示意动画和关键词字幕。',
     aspect: '16:9',
     sec: 60,
-    bg: 'linear-gradient(135deg,#0d2a2a,#127a6a 55%,#7fe0c4)',
+    bg: 'var(--info-soft)',
+    fg: 'var(--info)',
     icon: <GraduationCap size={20} />,
   },
   {
@@ -75,7 +78,8 @@ const TEMPLATES: Array<{
     brief: '拍一条 30 秒的故事短片：一个角色、一个场景、一次转折，带简短对白，结尾留一点余味。',
     aspect: '16:9',
     sec: 30,
-    bg: 'linear-gradient(135deg,#2a1608,#b4581f 55%,#ffcf8a)',
+    bg: 'var(--warning-soft)',
+    fg: 'var(--warning)',
     icon: <BookOpen size={20} />,
   },
   {
@@ -84,7 +88,8 @@ const TEMPLATES: Array<{
     brief: '做一条 20 秒竖屏节日祝福视频，温暖的画面和配乐，结尾出现祝福语。',
     aspect: '9:16',
     sec: 20,
-    bg: 'linear-gradient(135deg,#2a0c19,#c2335f 55%,#ffb3c7)',
+    bg: 'var(--success-soft)',
+    fg: 'var(--success)',
     icon: <Gift size={20} />,
   },
 ]
@@ -237,7 +242,7 @@ export function StudioHome(props: {
           <div className="st-row st-hide-sm" style={{ color: 'var(--st-agent)', gap: 8 }}>
             <Sparkles size={15} />
             <span style={{ fontSize: 12.5, fontWeight: 650, letterSpacing: '.02em' }}>
-              导演 agent · 生图 · 视频 · 配音 · 音乐 · 成片
+              导演助手 · 生图 · 视频 · 配音 · 音乐 · 成片
             </span>
           </div>
           <h1 className="st-display st-home-title">
@@ -246,8 +251,7 @@ export function StudioHome(props: {
             拍一支片。
           </h1>
           <p className="st-home-lede st-hide-sm">
-            说出你想要的画面，agent
-            会写分镜、定角色、逐镜头生成、配音配乐，最后剪成成片。只有拿不准的时候才来问你。
+            说出你想要的画面，导演助手会写分镜、定角色、逐镜头生成、配音配乐，最后剪成成片。只有拿不准的时候才来问你。
           </p>
           <form
             className="st-home-brief"
@@ -276,7 +280,7 @@ export function StudioHome(props: {
             <div className="st-row" style={{ marginTop: 14, gap: 6, flexWrap: 'wrap' }}>
               <button
                 type="button"
-                className="st-chip st-chip-dark"
+                className="st-chip st-chip-dark st-chip-action"
                 aria-label={`画幅 ${aspect}，点击切换`}
                 onClick={() => setAspect(ASPECTS[(ASPECTS.indexOf(aspect) + 1) % ASPECTS.length]!)}
               >
@@ -285,7 +289,7 @@ export function StudioHome(props: {
               </button>
               <button
                 type="button"
-                className="st-chip st-chip-dark"
+                className="st-chip st-chip-dark st-chip-action"
                 aria-label={`时长 ${sec} 秒，点击切换`}
                 onClick={() =>
                   setSec(DURATIONS[(DURATIONS.indexOf(sec) + 1) % DURATIONS.length] ?? 30)
@@ -294,16 +298,16 @@ export function StudioHome(props: {
                 <Timer />
                 {sec} 秒
               </button>
-              <span className="st-chip st-chip-dark" aria-label="旁白">
+              <span className="st-chip st-chip-static" aria-label="默认包含旁白">
                 <Mic />
-                <span className="st-hide-sm">旁白</span>
+                <span className="st-hide-sm">默认旁白</span>
               </span>
               <span
-                className="st-chip st-chip-dark st-hide-sm"
-                title={musicOff ? '音乐生成未配置' : undefined}
+                className="st-chip st-chip-static st-hide-sm"
+                title={musicOff ? '音乐生成未配置' : '默认自动配乐'}
               >
                 <Music />
-                {musicOff ? '配乐（未配置）' : '配乐'}
+                {musicOff ? '配乐（未配置）' : '自动配乐'}
               </span>
               <div style={{ flex: 1 }} />
               <button
@@ -435,7 +439,7 @@ export function StudioHome(props: {
 
         <div className="st-row" style={{ margin: '24px 0 12px', gap: 8 }}>
           <h2 className="st-h3">从模板开始</h2>
-          <span className="st-cap">agent 会按模板的节奏写分镜</span>
+          <span className="st-cap">导演助手会按模板的节奏写分镜</span>
         </div>
         <div className="st-grid">
           {TEMPLATES.map((t) => (
@@ -458,9 +462,10 @@ export function StudioHome(props: {
                   height: 52,
                   borderRadius: 14,
                   background: t.bg,
+                  color: t.fg,
+                  border: '1px solid var(--border)',
                   display: 'grid',
                   placeItems: 'center',
-                  color: '#fff',
                   flex: 'none',
                 }}
               >

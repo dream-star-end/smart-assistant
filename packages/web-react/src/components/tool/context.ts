@@ -119,6 +119,7 @@ export function useToolCardActions(): ToolCardActions {
 export type ChatInteraction = {
   sendUserText?: (text: string) => void;
   busy?: boolean;
+  sessionId?: string | null;
   /**
    * 没有 sendUserText 时,交互块拿它向用户解释「为什么点不了」(misc-p3 D-08):
    * "demo" = ?demo=1 演示模式(离线 fixture,没有真实会话可投递)。

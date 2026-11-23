@@ -18,6 +18,7 @@ import { REMOTE_SWARM_LOCAL_PREFIX } from '@openclaude/protocol'
 import type { AgentDef, AgentsConfig } from '@openclaude/storage'
 import { listClientSessions } from '@openclaude/storage'
 import type { GatewayStreamEvent } from './ccbMessageParser.js'
+import { normalizeSwarmToolName } from './engine/antigravitySwarmWatcher.js'
 import { checkToken } from './auth.js'
 import { probeEnvFacts } from './envProbe.js'
 import {
@@ -283,7 +284,7 @@ export function createGatewayRemoteSwarmExecutor(deps: {
                   input.onTelemetry({
                     type: 'TOOL_CALL',
                     status: 'ACTIVE',
-                    toolName: ev.block.toolName,
+                    toolName: normalizeSwarmToolName(ev.block.toolName),
                     toolArgs:
                       ev.block.inputJson && typeof ev.block.inputJson === 'object'
                         ? (ev.block.inputJson as Record<string, unknown>)
@@ -443,10 +444,6 @@ const REMOTE_SWARM_SELF_TOOLS = new Set([
   'post_message',
   'read_board',
   'swarm_wait',
-  'mcp_openclaude-memory_swarm',
-  'mcp_openclaude-memory_post_message',
-  'mcp_openclaude-memory_read_board',
-  'mcp_openclaude-memory_swarm_wait',
 ])
 
 export async function interruptGatewayRemoteSwarmSession(
@@ -565,15 +562,16 @@ export function recordRemoteSwarmLeaderStreamEvent(
   if (!runtime) return
   if (e.kind === 'block') {
     const b = e.block as { kind?: unknown; toolName?: unknown; inputJson?: unknown }
+    const normalizedTool = typeof b?.toolName === 'string' ? normalizeSwarmToolName(b.toolName) : ''
     if (
       b?.kind === 'tool_use' &&
-      typeof b.toolName === 'string' &&
-      !REMOTE_SWARM_SELF_TOOLS.has(b.toolName)
+      normalizedTool &&
+      !REMOTE_SWARM_SELF_TOOLS.has(normalizedTool)
     ) {
       runtime.recordCoordinatorTelemetry(sessionKey, {
         type: 'TOOL_CALL',
         status: 'ACTIVE',
-        toolName: b.toolName,
+        toolName: normalizedTool,
         toolArgs:
           b.inputJson && typeof b.inputJson === 'object'
             ? (b.inputJson as Record<string, unknown>)

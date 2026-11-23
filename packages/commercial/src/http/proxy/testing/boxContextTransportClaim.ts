@@ -1,6 +1,8 @@
 /** Uses only the caller's session-local TEMP billing mirror. No test reset. */
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
+import { deleteTempBoxJournalRow, deleteTempBoxJournalRowsForUser,
+  insertTempBoxJournalCommittedRow, insertTempBoxJournalInflightRow } from "../../../billing/boxBillingStore.js";
 import { BoxDurableJournal, BoxDurableJournalError } from "../boxDurableJournal.js";
 import { prepareBoxContinuation } from "../boxPreparedContinuation.js";
 import { compileBoxToolCatalog } from "../boxToolCatalog.js";
@@ -66,8 +68,10 @@ export async function assertLegacyContextClaim(db: Db, body: ProxyBody, options:
   const journal = new BoxDurableJournal({ connect: async () => ({
     query: db.query.bind(db), release: () => {} }), query: db.query.bind(db) } as never);
   const fresh = `g607-image-admit-${tag}`;
-  await db.query("INSERT INTO request_finalize_journal(request_id,user_id,state,precheck_credits,ctx) VALUES ($1,$2,'inflight',0,$3::jsonb)",
-    [fresh, uid.toString(), JSON.stringify({ model: body.model, boxInvocationRecovery: "v1", billingPricing: pricing, boxBillingContext: billing })]);
+  await insertTempBoxJournalInflightRow(db, {
+    requestId: fresh, uid,
+    ctxJson: JSON.stringify({ model: body.model, boxInvocationRecovery: "v1", billingPricing: pricing, boxBillingContext: billing }),
+  });
   await journal.admit({ requestId: fresh, uid, accountId: 765n, model: body.model, canonicalBody: body,
     fingerprint: deriveBoxCallFingerprint(uid, body), runNonce: randomBytes(12).toString("hex"), leaseEpoch: randomBytes(16).toString("hex"),
     invocationMode: "detached_tool", contextHash: deriveBoxContextHash(body), detachedRunnerHash: runner, catalogHash: catalog.bindingSha256 });
@@ -77,7 +81,7 @@ export async function assertLegacyContextClaim(db: Db, body: ProxyBody, options:
   assert.deepEqual(freshCtx.boxImageIdentity, expectedImageIdentity(body));
   assert.equal(freshCtx.boxImageIdentity.imageCount, options.imageCount);
   // Only this proof's row in its verified TEMP mirror is removed before the handoff fixture.
-  await db.query("DELETE FROM request_finalize_journal WHERE request_id=$1", [fresh]);
+  await deleteTempBoxJournalRow(db, fresh);
   const handoff = { version: 1, roundNo: 1, messageId: `msg_g607_${tag}`,
     assistantContentHash: hashBoxAssistantContent(assistant),
     assistantNoCallerHash: hashBoxAssistantNoCallerContent(assistant),
@@ -87,8 +91,9 @@ export async function assertLegacyContextClaim(db: Db, body: ProxyBody, options:
       clientName: "Read", inputHash: hashBoxToolInput(tool.input) })),
     verifiedPendingToolUseIds: assistant.map((tool) => tool.id),
     usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } };
-  await db.query("INSERT INTO request_finalize_journal(request_id,user_id,state,precheck_credits,ctx) VALUES ($1,$2,'committed',0,$3::jsonb)",
-    [owner, uid.toString(), JSON.stringify({
+  await insertTempBoxJournalCommittedRow(db, {
+    requestId: owner, uid,
+    ctxJson: JSON.stringify({
       model: body.model, boxInvocationRecovery: "v1", boxInvocationMode: "detached_tool",
       boxAccountId: "765", boxRunNonce: nonce, boxLeaseEpoch: epoch,
       boxContextHash: options.priorContextHash ?? deriveBoxContextHash(body, true), boxHandoffRevision: "g607-legacy",
@@ -96,11 +101,14 @@ export async function assertLegacyContextClaim(db: Db, body: ProxyBody, options:
       billingPricing: pricing, boxBillingContext: billing,
       boxNativeSessionId: "12345678-1234-4123-8123-123456789abc",
       boxNativeCliCwd: `/tmp/ocv5-289-run-${nonce}`, boxNativeCliVersion: "2.1.280",
-    })]);
-  await db.query("INSERT INTO request_finalize_journal(request_id,user_id,state,precheck_credits,ctx) VALUES ($1,$2,'inflight',0,$3::jsonb)",
-    [child, uid.toString(), JSON.stringify({
+    }),
+  });
+  await insertTempBoxJournalInflightRow(db, {
+    requestId: child, uid,
+    ctxJson: JSON.stringify({
       model: body.model, boxInvocationRecovery: "v1", billingPricing: pricing, boxBillingContext: billing,
-    })]);
+    }),
+  });
 
   const rows = async () => (await db.query("SELECT request_id,ctx->>'boxState' AS state FROM request_finalize_journal WHERE request_id=ANY($1::text[]) ORDER BY request_id", [[owner, child]])).rows;
   const prior = await rows();
@@ -134,8 +142,7 @@ export async function assertLegacyContextClaim(db: Db, body: ProxyBody, options:
   assert.equal(await beforeMoney(), money, "stage and claim do not debit or settle prior successful usage");
   // This fixture already proved every table resolves to its own TEMP schema.
   // Release only its seeded rows so a later proof can use the same account.
-  const removed = await db.query("DELETE FROM request_finalize_journal WHERE user_id=$1 AND request_id=ANY($2::text[])",
-    [uid.toString(), [owner, child]]);
+  const removed = await deleteTempBoxJournalRowsForUser(db, { uid, requestIds: [owner, child] });
   assert.equal(removed.rowCount, 2, "only this proof's seeded owner and child are removed");
 }
 

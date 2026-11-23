@@ -170,9 +170,14 @@ const CAT_WRITE_RE = /(?:^|[^0-9&<>])>>?\s*[^\s&|>]/;
 
 const MD_IMAGE_RE = /!\[[^\]]*\]\(([^)\s]+)\)/g;
 const GENERATED_PREFIX = "/home/agent/.openclaude/generated/";
-const GENERATED_PATH_RE = /\/home\/agent\/\.openclaude\/generated\/\S+/g;
+const GENERATED_PREFIX_RE = /^\/(?:home\/agent|root)\/\.openclaude\/generated\//;
+const GENERATED_PATH_RE = /\/(?:home\/agent|root)\/\.openclaude\/generated\/\S+/g;
+const FENCED_CODE_BLOCK_RE = /(^|\r?\n)[ \t]*(`{3,}|~{3,})[^\r\n]*\r?\n[\s\S]*?(?:\r?\n[ \t]*\2[ \t]*(?=\r?\n|$)|$)/g;
+const INLINE_CODE_SPAN_RE = /`([^`\r\n]+)`/g;
 /** Prose/markdown closers only. `+`, `=`, `@`, and interior dots stay — they occur in real names. */
 const TRAILING_PATH_JUNK = /[),.;:，。；"'`\]}>]+$/u;
+const VALID_ARTIFACT_EXT_RE = /^.+?\.[A-Za-z][A-Za-z0-9]{0,9}$/;
+const ARTIFACT_SHELL_RE = /[\r\n;&|<>`$]|\s--?[A-Za-z]/;
 const ARTIFACT_CLIS = new Set(["oc-report", "oc-slides", "oc-poster"]);
 
 function dedupe(keys: string[]): string[] {
@@ -188,15 +193,27 @@ function stableTextId(value: string): string {
   return (hash >>> 0).toString(16);
 }
 
-/** Query/hash and trailing punctuation come off generated paths; the filename itself is kept. */
+/** Query/hash and trailing punctuation come off generated paths; directories & commands are rejected. */
 function normalizeGeneratedPath(raw: string): string {
-  const start = raw.indexOf(GENERATED_PREFIX);
-  if (start < 0) return "";
-  let value = raw.slice(start).replace(TRAILING_PATH_JUNK, "");
+  const match = GENERATED_PREFIX_RE.exec(raw.trim().replace(/^file:\/\//i, ""));
+  let value: string;
+  if (match) {
+    value = raw.trim().replace(/^file:\/\//i, "");
+  } else {
+    const start = raw.indexOf(GENERATED_PREFIX);
+    if (start < 0) return "";
+    value = raw.slice(start);
+  }
+  value = value.replace(TRAILING_PATH_JUNK, "");
   const cut = value.search(/[?#]/);
   if (cut >= 0) value = value.slice(0, cut);
-  value = value.replace(TRAILING_PATH_JUNK, "");
-  if (!value.startsWith(GENERATED_PREFIX) || value.length <= GENERATED_PREFIX.length) return "";
+  value = value.replace(TRAILING_PATH_JUNK, "").trim();
+  if (!GENERATED_PREFIX_RE.test(value)) return "";
+  if (value.endsWith("/") || ARTIFACT_SHELL_RE.test(value)) return "";
+  const parts = value.split("/");
+  if (parts.some((seg) => seg === "." || seg === "..")) return "";
+  const basename = parts[parts.length - 1] ?? "";
+  if (!VALID_ARTIFACT_EXT_RE.test(basename)) return "";
   return value;
 }
 
@@ -264,11 +281,22 @@ function computeArtifactEvidenceKeys(text: string): readonly string[] {
   MD_IMAGE_RE.lastIndex = 0;
   GENERATED_PATH_RE.lastIndex = 0;
   const keys = htmlEvidenceKeys(text);
-  for (const match of text.matchAll(MD_IMAGE_RE)) {
+  // Strip fenced code blocks so shell commands or example paths inside ```...``` do not false-trigger.
+  const withoutFences = text.replace(FENCED_CODE_BLOCK_RE, "\n");
+  for (const match of withoutFences.matchAll(MD_IMAGE_RE)) {
     const key = evidenceKeyForLocator(match[1] ?? "");
     if (key) keys.push(key);
   }
-  for (const match of text.matchAll(GENERATED_PATH_RE)) {
+  // Extract inline backtick-wrapped generated file paths (supporting spaces & CJK filenames).
+  const withoutInlineCode = withoutFences.replace(INLINE_CODE_SPAN_RE, (_full, inner: string) => {
+    const trimmed = inner.trim();
+    if (GENERATED_PREFIX_RE.test(trimmed.replace(/^file:\/\//i, ""))) {
+      const key = generatedFileKey(trimmed);
+      if (key) keys.push(key);
+    }
+    return " ";
+  });
+  for (const match of withoutInlineCode.matchAll(GENERATED_PATH_RE)) {
     const key = generatedFileKey(match[0]);
     if (key) keys.push(key);
   }
@@ -1092,7 +1120,7 @@ function shellLivePhrase<T>(
 
 
 const shellToggleClass =
-  "group/shell -mx-1.5 flex min-h-8 w-[calc(100%+0.75rem)] items-center gap-2 rounded-lg px-1.5 py-1 text-left transition-colors duration-150 hover:bg-hover/60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-10";
+  "group/shell -mx-1.5 flex min-h-8 w-[calc(100%+0.75rem)] items-center gap-2 rounded-lg px-1.5 py-1 text-left transition-colors duration-150 hover:bg-hover/60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-11";
 
 
 /** Sum of assistant cost labels. Zero and non-digits are skipped. */
@@ -1307,8 +1335,8 @@ export function ProcessDisclosure<T>({
         <button
           type="button"
           data-testid="process-pane-changes"
-          className="group/changes oc-btn-tactile inline-flex shrink-0 items-center justify-center rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-10"
-          title="在详情面板查看这一轮的产出"
+          className="group/changes oc-btn-tactile inline-flex shrink-0 items-center justify-center rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+          title="在工作台查看这一轮的产出"
           onClick={() => openPane("outputs", processRows[0])}
         >
           <span className="inline-flex h-6 items-center gap-1 rounded-md border border-border/65 px-2 text-caption font-medium text-muted transition-colors group-hover/changes:border-border-strong group-hover/changes:bg-hover/65 group-hover/changes:text-fg">

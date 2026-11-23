@@ -399,7 +399,7 @@ export default function OrdersPage() {
     {
       key: "order_no",
       title: "order_no",
-      cellClassName: "font-mono text-[12px]",
+      cellClassName: "font-mono text-meta",
       render: (r) => r.order_no,
     },
     {
@@ -433,13 +433,13 @@ export default function OrdersPage() {
     {
       key: "paid_at",
       title: "paid_at",
-      cellClassName: "font-mono text-[12px] tabular-nums text-muted",
+      cellClassName: "font-mono text-meta tabular-nums text-muted",
       render: (r) => fmtDateTime(r.paid_at),
     },
     {
       key: "created_at",
       title: "created_at",
-      cellClassName: "font-mono text-[12px] tabular-nums text-muted",
+      cellClassName: "font-mono text-meta tabular-nums text-muted",
       render: (r) => fmtDateTime(r.created_at),
     },
     {

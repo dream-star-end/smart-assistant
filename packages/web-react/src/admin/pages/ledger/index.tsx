@@ -261,8 +261,8 @@ export default function LedgerPage() {
   ];
 
   const columns: Column<LedgerRow>[] = [
-    { key: "id", title: "id", cellClassName: "font-mono text-[12px] text-muted", render: (r) => r.id },
-    { key: "user_id", title: "用户", cellClassName: "font-mono text-[12px]", render: (r) => r.user_id },
+    { key: "id", title: "id", cellClassName: "font-mono text-meta text-muted", render: (r) => r.id },
+    { key: "user_id", title: "用户", cellClassName: "font-mono text-meta", render: (r) => r.user_id },
     {
       key: "delta",
       title: "delta",
@@ -306,14 +306,14 @@ export default function LedgerPage() {
     {
       key: "model",
       title: "模型",
-      cellClassName: "font-mono text-[12px] text-muted",
+      cellClassName: "font-mono text-meta text-muted",
       render: (r) => r.model || "—",
     },
     { key: "memo", title: "memo", render: (r) => r.memo || "—" },
     {
       key: "created_at",
       title: "时间",
-      cellClassName: "font-mono text-[12px] tabular-nums text-muted",
+      cellClassName: "font-mono text-meta tabular-nums text-muted",
       render: (r) => fmtDateTime(r.created_at),
     },
   ];

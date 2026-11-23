@@ -336,7 +336,7 @@ export function SitesWorkspaceView({
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="搜索站点"
                 aria-label="搜索站点"
-                className="oc-field-control h-10 w-full rounded-full border border-border-control pl-9 pr-4 text-body text-fg placeholder:text-faint outline-none"
+                className="oc-field-control h-10 w-full rounded-full border border-border-control pl-9 pr-4 text-base text-fg placeholder:text-faint outline-none md:text-sm"
               />
             </label>
 
@@ -354,7 +354,7 @@ export function SitesWorkspaceView({
                 <DropdownMenuItem
                   onSelect={() =>
                     onCreateInChat(
-                      "请帮我创建一个现代化网站，构建静态资源后使用 `oc-site publish` 发布到持久域名。",
+                      "请帮我创建一个现代化的展示网站，完成后直接发布到持久访问链接。",
                     )
                   }
                 >
@@ -363,7 +363,7 @@ export function SitesWorkspaceView({
                 <DropdownMenuItem
                   onSelect={() =>
                     onCreateInChat(
-                      "请帮我创建一个全栈 Web 应用，包含前端页面和 `/api/*` 后端接口（使用内置 SQLite `ctx.db` 与安全环境变量 `ctx.env`），并使用 `oc-site publish --api` 发布上线。",
+                      "请帮我创建一个全栈 Web 应用，包含前端页面、后端接口与内置数据存储，配置好所需环境变量后直接发布上线。",
                     )
                   }
                 >
@@ -475,7 +475,7 @@ export function SitesWorkspaceView({
                 filter === "shared"
                   ? "当其他人在站点的「共享」页签添加你的邮箱或发给你邀请链接后，协作站点会显示在这里。"
                   : allSites.length === 0
-                    ? `在对话中让助手构建静态或全栈应用，或运行 oc-site publish，即可持久托管在 *.${baseDomain}。`
+                    ? `在对话中让助手帮你构建静态或全栈应用并发布上线，即可持久托管在 *.${baseDomain}。`
                     : "尝试更换搜索关键词或切换筛选条件。"
               }
               action={
@@ -484,7 +484,7 @@ export function SitesWorkspaceView({
                     variant="primary"
                     onClick={() =>
                       onCreateInChat(
-                        "帮我创建一个现代化的个人展示网页，完成后用 oc-site 发布上线。",
+                        "帮我创建一个现代化的个人展示网页并直接发布上线。",
                       )
                     }
                   >

@@ -576,10 +576,10 @@ export function ImageViewer({
         }}
       >
         <Dialog.Portal>
-          <Dialog.Overlay className="dark fixed inset-0 z-[60] bg-bg/95 backdrop-blur-sm data-[state=open]:animate-fade" />
+          <Dialog.Overlay className="dark fixed inset-0 z-[var(--z-viewer)] bg-bg/95 backdrop-blur-sm data-[state=open]:animate-fade" />
           <Dialog.Content
             aria-describedby={undefined}
-            className="dark fixed inset-0 z-[61] flex select-none flex-col bg-bg text-fg outline-none"
+            className="dark fixed inset-0 z-[var(--z-viewer)] flex select-none flex-col bg-bg text-fg outline-none"
             onOpenAutoFocus={(e) => e.preventDefault()}
             // ESC 逐层退出(需求 §5):更多菜单 → 子模式(评论/调整大小)→ 查看器。edit 模式由
             // 上层编辑器 Dialog 自己捕获 ESC(topmost layer),这里不会触发。
@@ -661,7 +661,7 @@ export function ImageViewer({
                     )}
                     {/* 「更多」走 DropdownMenu 原语(审计 M-14):拿到 menu/menuitem 语义、方向键、
                         打开即聚焦首项、关闭焦点回触发钮;暗房暖炭底样式用 dark + elevated 盖掉原语默认色。
-                        z-[62] 压过查看器自身的 z-[61],否则 Portal 出去的菜单会被查看器盖住。 */}
+                        层级自然继承原语的 z-[var(--z-popover-portal)]（80 > --z-viewer 70）。 */}
                     {!readOnly && (
                       <DropdownMenu open={moreOpen} onOpenChange={setMoreOpen}>
                         <DropdownMenuTrigger asChild>
@@ -677,7 +677,7 @@ export function ImageViewer({
                         <DropdownMenuContent
                           align="end"
                           sideOffset={8}
-                          className="dark z-[62] w-44 min-w-0 rounded-2xl border-white/10 bg-elevated/95 p-1.5 text-fg shadow-float backdrop-blur"
+                          className="dark w-44 min-w-0 rounded-2xl border-white/10 bg-elevated/95 p-1.5 text-fg shadow-float backdrop-blur"
                         >
                           <DropdownMenuItem
                             onSelect={() => void openInTab()}

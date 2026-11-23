@@ -126,4 +126,27 @@ describe("cron-origin-inject handler", () => {
     assert.equal(res.statusCode, 503);
     assert.equal(res.body?.error?.code, "NO_TRANSPORT");
   });
+
+  test("maps previously_failed_unexecuted to dedicated 503 PREVIOUSLY_FAILED_UNEXECUTED and keeps generic previously_failed as INJECT_FAILED (OCV5-73)", async () => {
+    const sequence: CronOriginInjectResult[] = [
+      { kind: "failed", reason: "previously_failed_unexecuted" },
+      { kind: "failed", reason: "previously_failed" },
+    ];
+    const h = makeCronOriginInjectHandler({
+      identityRepo: repoFor(3),
+      inject: async () => sequence.shift() ?? { kind: "failed", reason: "previously_failed" },
+    });
+
+    let res = makeRes();
+    await h(makeReq({ auth: `Bearer ${TOKEN}`, body: VALID_BODY }), res, CTX);
+    assert.equal(res.statusCode, 503);
+    assert.equal(res.body?.error?.code, "PREVIOUSLY_FAILED_UNEXECUTED");
+    assert.equal(res.body?.error?.message, "previously_failed_unexecuted");
+
+    res = makeRes();
+    await h(makeReq({ auth: `Bearer ${TOKEN}`, body: VALID_BODY }), res, CTX);
+    assert.equal(res.statusCode, 503);
+    assert.equal(res.body?.error?.code, "INJECT_FAILED");
+    assert.equal(res.body?.error?.message, "previously_failed");
+  });
 });

@@ -180,6 +180,7 @@ export function ModelSelector({
   open,
   onOpenChange,
   onCancelSwitch,
+  placement = 'header',
 }: {
   models: PublicModel[]
   lockedModels?: LockedPublicModel[]
@@ -202,7 +203,7 @@ export function ModelSelector({
    */
   serviceTier?: ServiceTier | null
   onSelectServiceTier?: (tier: ServiceTier | null) => void
-  /** OCV5-843 Antigravity 蜂群模式：面板内协作模式开关 + 顶栏胶囊激活态样式。 */
+  /** OCV5-843 Antigravity 蜂群模式：面板内协作模式开关 + 模型胶囊激活态样式。 */
   swarmSupported?: boolean
   swarmMode?: boolean
   swarmRunning?: boolean
@@ -211,6 +212,8 @@ export function ModelSelector({
   onOpenChange?: (open: boolean) => void
   /** 压缩切换进行中时给出：trigger 此时禁用，这是放弃等待、保留原模型的唯一入口。 */
   onCancelSwitch?: () => void
+  /** 渲染宿主：header = 顶栏向下左对齐；composer = 输入框底栏右侧向上右对齐（OCV5-872）。 */
+  placement?: 'header' | 'composer'
 }) {
   const selected = models.find((m) => m.id === selectedId)
   const selectedCursor = cursorPickerDef(
@@ -281,11 +284,13 @@ export function ModelSelector({
   const selectedPromo = promoLabelOf(selected)
   const swarmActive = Boolean(swarmMode && !teamEngineActive)
   const swarmRunningActive = Boolean(swarmRunning && swarmActive)
+  const isComposer = placement === 'composer'
 
   const triggerButton = (
     <button
       type="button"
       data-product-feature={PRODUCT_CAPABILITIES.models.id}
+      data-placement={placement}
       disabled={disabled}
       aria-label="选择对话模型"
       aria-haspopup="menu"
@@ -315,11 +320,12 @@ export function ModelSelector({
       data-swarm-active={swarmActive ? 'true' : undefined}
       data-swarm-running={swarmRunningActive ? 'true' : undefined}
       className={cn(
-        'oc-btn-tactile oc-spring-press flex min-h-10 min-w-0 max-w-full items-center gap-1.5 rounded-full border border-border/80 bg-surface/85 px-3 py-1 text-section font-medium text-fg shadow-xs outline-none sm:min-h-10 sm:rounded-lg sm:border-border/60 sm:bg-surface/65 sm:px-2.5 sm:py-1.5',
-        'hover:border-border-strong hover:bg-surface hover:text-fg hover:shadow-soft focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
+        isComposer
+          ? 'oc-btn-tactile oc-spring-press flex h-9 min-w-0 max-w-full items-center gap-1 rounded-full border border-border/70 bg-bg/70 px-2.5 text-caption font-medium text-fg outline-none sm:gap-1.5 sm:px-2.5 sm:text-meta [@media(hover:none)]:min-h-11 hover:border-border-strong hover:bg-surface hover:text-fg hover:shadow-xs focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface'
+          : 'oc-btn-tactile oc-spring-press flex min-h-11 min-w-0 max-w-full items-center gap-1.5 rounded-full border border-border/80 bg-surface/85 px-3 py-1 text-section font-medium text-fg shadow-xs outline-none sm:min-h-10 sm:rounded-lg sm:border-border/60 sm:bg-surface/65 sm:px-2.5 sm:py-1.5 [@media(hover:none)]:min-h-11 hover:border-border-strong hover:bg-surface hover:text-fg hover:shadow-soft focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
         'disabled:pointer-events-none disabled:opacity-50',
         sheetOpen && 'border-accent/45 bg-surface shadow-soft',
-        swarmActive && 'oc-model-trigger-swarm oc-shimmer-sheen',
+        swarmActive && 'oc-model-trigger-swarm',
         teamEngineActive && 'border-accent/25 bg-accent-soft/70 text-accent hover:text-accent disabled:opacity-100',
       )}
     >
@@ -361,12 +367,24 @@ export function ModelSelector({
           >
             {mobileLabel}
           </span>
-          <span className="hidden min-w-0 truncate font-medium sm:inline sm:max-w-[220px] lg:max-w-[260px]">
+          <span
+            className={cn(
+              'hidden min-w-0 truncate font-medium sm:inline',
+              isComposer ? 'sm:max-w-[180px] lg:max-w-[230px]' : 'sm:max-w-[220px] lg:max-w-[260px]',
+            )}
+          >
             {label}
           </span>
         </>
       ) : (
-        <span className="min-w-0 truncate font-medium sm:max-w-[220px] lg:max-w-[260px]">{label}</span>
+        <span
+          className={cn(
+            'min-w-0 truncate font-medium',
+            isComposer ? 'sm:max-w-[180px] lg:max-w-[230px]' : 'sm:max-w-[220px] lg:max-w-[260px]',
+          )}
+        >
+          {label}
+        </span>
       )}
       {loading && selected && !teamEngineActive ? (
         <span className="shrink-0 text-faint" data-testid="model-trigger-loading">
@@ -400,7 +418,7 @@ export function ModelSelector({
       <CostMark
         model={teamEngineActive ? leaderModel : selected}
         multiplier={triggerCostMultiplier}
-        className={swarmActive ? 'text-accent/80' : undefined}
+        className={cn(isComposer && 'hidden sm:inline', swarmActive && 'text-accent/80')}
       />
       {!teamEngineActive && <PromoBadge label={selectedPromo} className="hidden sm:inline-flex" />}
       {!teamEngineActive && (
@@ -441,6 +459,8 @@ export function ModelSelector({
     tierLabel,
     shortViewport,
     effectiveMultiplier: triggerCostMultiplier,
+    side: isComposer ? ('top' as const) : ('bottom' as const),
+    align: isComposer ? ('end' as const) : ('start' as const),
   }
 
   return (
@@ -461,7 +481,12 @@ export function ModelSelector({
           type="button"
           data-testid="model-switch-cancel"
           onClick={onCancelSwitch}
-          className="min-h-11 shrink-0 rounded-xl px-2 text-meta text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+          className={cn(
+            'shrink-0 text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring',
+            isComposer
+              ? 'h-9 rounded-full px-2 text-caption [@media(hover:none)]:min-h-11'
+              : 'min-h-11 rounded-xl px-2 text-meta',
+          )}
         >
           取消
         </button>

@@ -116,6 +116,10 @@ export class RemoteHostError extends Error {
   }
 }
 
+function isPgUniqueViolation(err: unknown): boolean {
+  return typeof err === "object" && err !== null && (err as { code?: unknown }).code === "23505";
+}
+
 function validationErrorFromZod(e: z.ZodError): RemoteHostError {
   return new RemoteHostError(
     "VALIDATION",
@@ -198,7 +202,7 @@ export async function createHostForUser(
       return updRes.rows[0]!;
     });
   } catch (err) {
-    if (err instanceof Error && /duplicate key value/i.test(err.message)) {
+    if (isPgUniqueViolation(err)) {
       throw new RemoteHostError("CONFLICT", `name "${input.name}" already exists`);
     }
     throw err;
@@ -234,7 +238,7 @@ export async function updateHostForUser(
       remoteWorkdir: patch.remote_workdir,
     });
   } catch (err) {
-    if (err instanceof Error && /duplicate key value/i.test(err.message)) {
+    if (isPgUniqueViolation(err)) {
       throw new RemoteHostError("CONFLICT", `name "${patch.name}" already exists`);
     }
     throw err;

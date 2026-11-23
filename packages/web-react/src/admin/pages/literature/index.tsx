@@ -237,7 +237,7 @@ export default function LiteraturePage() {
           <LoadingSkeleton />
         ) : (
           <div className="flex max-w-2xl flex-col gap-5">
-            <div className="oc-callout oc-callout-info rounded-xl px-3.5 py-2.5 text-[12px] leading-relaxed text-muted">
+            <div className="oc-callout oc-callout-info rounded-xl px-3.5 py-2.5 text-meta leading-relaxed text-muted">
               启用后，容器 LLM 系统 prompt 会注入文献检索技能段，引导其调用检索接口；关闭时检索端点
               直接 503。token 在 DB 端 AEAD 加密，本页永远只显示 <code className="font-mono">****last4</code>{" "}
               掩码，不回显明文。

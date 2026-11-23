@@ -120,9 +120,10 @@ describe("paidTier and model metadata refresh (OCV5-516)", () => {
     assert.equal(saved[1][2], null, 'SQL COALESCE preserves last valid directory');
   });
 
-  it("uses CLI 1.5.8 cl=1020628950 user-agent so fetchAvailableModels exposes gemini-pro-orchestrator (OCV5-783)", () => {
-    assert.match(ANTIGRAVITY_QUOTA_USER_AGENT, /^antigravity\/cli\/1\.5\.8 /);
-    assert.match(ANTIGRAVITY_QUOTA_USER_AGENT, /cl=1020628950;/);
+  it("uses CLI 1.5.15 cl=1027744018 user-agent matching the pinned Antigravity binary (OCV5-860)", () => {
+    assert.match(ANTIGRAVITY_QUOTA_USER_AGENT, /^antigravity\/cli\/1\.5\.15 /);
+    assert.match(ANTIGRAVITY_QUOTA_USER_AGENT, /cl=1027744018;/);
+    assert.equal(ANTIGRAVITY_QUOTA_USER_AGENT.includes("cl=1020628950"), false);
     assert.equal(ANTIGRAVITY_QUOTA_USER_AGENT.includes("cl=1000494485"), false);
   });
 });

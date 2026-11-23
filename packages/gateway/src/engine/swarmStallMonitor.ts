@@ -121,6 +121,7 @@ export function isSwarmAuxiliaryRole(role: SwarmMemberRole): boolean {
 export function isMemberEffectivelyWaiting(member: SwarmMemberSnapshot): boolean {
   if (member.status === 'killed') return false
   if (member.status === 'waiting' || member.status === 'stopped') return true
+  if (typeof member.waitingOnBoard === 'boolean') return member.waitingOnBoard
   return (
     member.status === 'working' &&
     typeof member.activity === 'string' &&

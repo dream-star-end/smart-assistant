@@ -380,3 +380,59 @@ describe('Codex 0.163.0 generated schema fixture (runtime image pin 2026-10-17, 
     }
   })
 })
+
+describe('Codex 0.171.0 generated schema fixture (runtime image pin 2026-11-23, OCV5-860)', () => {
+  const root171 = new URL('./fixtures/codex-app-server-0.171.0/', import.meta.url)
+  const read171 = (name: string): Buffer => readFileSync(new URL(name, root171))
+  const manifest171 = JSON.parse(read171('manifest.json').toString('utf8')) as JsonObject
+
+  it('pins 0.171.0 and keeps response/requestUserInput identical while TurnSteerParams only adds backwards-compatible optional fields', () => {
+    assert.equal(manifest171.codexVersion, '0.171.0')
+    assert.equal(
+      manifest171.binarySha256,
+      'b76a027d6b210f9a8da7aaf321dd235c700f0ef7a794d4a5314b9af6c134f0f0',
+    )
+    assert.deepEqual(manifest171.methods, ['turn/steer', 'item/tool/requestUserInput'])
+    const generated171 = object(manifest171.generatedFiles, 'manifest171.generatedFiles')
+    const repository171 = object(manifest171.repositoryFiles, 'manifest171.repositoryFiles')
+    const manifest163 = JSON.parse(
+      readFileSync(new URL('./fixtures/codex-app-server-0.163.0/manifest.json', import.meta.url)).toString('utf8'),
+    ) as JsonObject
+    const generated163 = object(manifest163.generatedFiles, 'manifest163.generatedFiles')
+    for (const name of [
+      'TurnSteerResponse.json',
+      'ToolRequestUserInputParams.json',
+      'ToolRequestUserInputResponse.json',
+    ] as const) {
+      const raw = read171(name)
+      assert.equal(repository171[name], sha256(raw), `${name} repository bytes`)
+      assert.equal(raw.at(-1), 0x0a, `${name} repository fixture must end in LF`)
+      assert.equal(generated171[name], sha256(raw.subarray(0, -1)), `${name} generator bytes`)
+      assert.equal(generated171[name], generated163[name], `${name} must not drift from 0.163.0`)
+    }
+    const steer = read171('TurnSteerParams.json')
+    assert.equal(repository171['TurnSteerParams.json'], sha256(steer))
+    assert.equal(steer.at(-1), 0x0a, 'TurnSteerParams.json repository fixture must end in LF')
+    assert.equal(generated171['TurnSteerParams.json'], sha256(steer.subarray(0, -1)))
+    assert.notEqual(generated171['TurnSteerParams.json'], generated163['TurnSteerParams.json'])
+
+    const schema = JSON.parse(steer.toString('utf8')) as JsonObject
+    assert.deepEqual(schema.required, ['expectedTurnId', 'input', 'threadId'])
+    const properties = object(schema.properties, 'TurnSteerParams.properties')
+    assert.deepEqual(
+      object(properties.responsesapiClientMetadataPatch, 'responsesapiClientMetadataPatch').type,
+      ['object', 'null'],
+    )
+    const defs = object(schema.definitions, 'TurnSteerParams.definitions')
+    const ctxEntry = object(defs.AdditionalContextEntry, 'AdditionalContextEntry')
+    const ctxProps = object(ctxEntry.properties, 'AdditionalContextEntry.properties')
+    assert.deepEqual(object(ctxProps.name, 'AdditionalContextEntry.name').type, ['string', 'null'])
+    const userInput = object(defs.UserInput, 'UserInput')
+    const branches = array(userInput.oneOf, 'UserInput.oneOf')
+    const audio = object(branches[3], 'UserInput audio branch')
+    assert.deepEqual(audio.required, ['type'])
+    const audioChoices = array(audio.anyOf, 'AudioUserInput.anyOf')
+    const audioKeys = audioChoices.map((choice) => Object.keys(object(object(choice, 'choice').properties, 'props')))
+    assert.deepEqual(audioKeys, [['url'], ['fileId']])
+  })
+})

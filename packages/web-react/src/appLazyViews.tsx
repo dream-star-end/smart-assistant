@@ -1,37 +1,37 @@
-import { type ComponentProps, lazy, useState } from "react";
+import { type ComponentProps, useState } from "react";
 import { BootSplash } from "./components/BootSplash";
 import { LazyBoundary } from "./components/ChunkErrorBoundary";
+import { createRetryableLazy } from "./components/ui/retryableLazy";
 import { readNetworkInformation, shouldPrefetchCenters } from "./lib/prefetchPolicy";
 import { TASKBOARD_ENABLED } from "./lib/taskboardFeature";
 
 // 首屏瘦身:营销首页 + 设置/管理/市场/组织/教程中心按需异步加载,移出 entry chunk。
 // 命名导出 → default 适配。渲染点各自套 LazyBoundary（= chunk 加载失败兜底 + Suspense：
-// 对话框仅在 open 时挂载 → 首屏零下载,首次打开拉块时短暂显 loading；React.lazy 解析后模块
-// 常驻,再次打开无回退闪烁。发新版后旧标签页拉不到旧 chunk 时由 ChunkErrorBoundary 兜底,
-// 提示刷新而非白屏——见 components/ChunkErrorBoundary）。
-export const IdentityRecoveryNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.IdentityRecoveryNotice })));
-export const AccountSwitchNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.AccountSwitchNotice })));
-export const AuthGate = lazy(() => import("./components/AuthGate").then((m) => ({ default: m.AuthGate })));
-export const AgentGate = lazy(() => import("./components/AgentGate").then((m) => ({ default: m.AgentGate })));
-const RepoStatusBannerLazy = lazy(() =>
+// 对话框仅在 open 时挂载 → 首屏零下载,首次打开拉块时短暂显 loading；解析后模块常驻,
+// 再次打开无回退闪烁。发新版后旧标签页拉不到旧 chunk 时清缓存重建 lazy 并由 ChunkErrorBoundary 兜底）。
+export const IdentityRecoveryNotice = createRetryableLazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.IdentityRecoveryNotice })));
+export const AccountSwitchNotice = createRetryableLazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.AccountSwitchNotice })));
+export const AuthGate = createRetryableLazy(() => import("./components/AuthGate").then((m) => ({ default: m.AuthGate })));
+export const AgentGate = createRetryableLazy(() => import("./components/AgentGate").then((m) => ({ default: m.AgentGate })));
+const RepoStatusBannerLazy = createRetryableLazy(() =>
   import("./components/github/RepoStatusBanner").then((m) => ({ default: m.RepoStatusBanner })),
 );
-const ErrorBannerLazy = lazy(() =>
+const ErrorBannerLazy = createRetryableLazy(() =>
   import("./components/ErrorBanner").then((m) => ({ default: m.ErrorBanner })),
 );
-const UpdateBannerLazy = lazy(() =>
+const UpdateBannerLazy = createRetryableLazy(() =>
   import("./components/UpdateBanner").then((m) => ({ default: m.UpdateBanner })),
 );
-const BackgroundTurnBannerLazy = lazy(() =>
+const BackgroundTurnBannerLazy = createRetryableLazy(() =>
   import("./components/chat/BackgroundTurnBanner").then((m) => ({ default: m.BackgroundTurnBanner })),
 );
-const TurnCostReminderLazy = lazy(() =>
+const TurnCostReminderLazy = createRetryableLazy(() =>
   import("./components/chat/TurnCostReminder").then((m) => ({ default: m.TurnCostReminder })),
 );
-const PinnedHudStackLazy = lazy(() =>
+const PinnedHudStackLazy = createRetryableLazy(() =>
   import("./components/chat/PinnedHudStack").then((m) => ({ default: m.PinnedHudStack })),
 );
-const AppDialogsLazy = lazy(() =>
+const AppDialogsLazy = createRetryableLazy(() =>
   import("./components/AppDialogs").then((m) => ({ default: m.AppDialogs })),
 );
 export function RepoStatusBanner(props: ComponentProps<typeof RepoStatusBannerLazy>) {
@@ -55,70 +55,45 @@ export function PinnedHudStack(props: ComponentProps<typeof PinnedHudStackLazy>)
 export function AppDialogs(props: ComponentProps<typeof AppDialogsLazy>) {
   return <LazyBoundary fallback={null}><AppDialogsLazy {...props} /></LazyBoundary>;
 }
-export const Landing = lazy(() => import("./components/Landing").then((m) => ({ default: m.Landing })));
-export const DesktopEnrollPage = lazy(() =>
+export const Landing = createRetryableLazy(() => import("./components/Landing").then((m) => ({ default: m.Landing })));
+export const DesktopEnrollPage = createRetryableLazy(() =>
   import("./components/DesktopEnrollPage").then((m) => ({ default: m.DesktopEnrollPage })),
 );
-export const TutorialCenter = lazy(() =>
+export const TutorialCenter = createRetryableLazy(() =>
   import("./components/TutorialCenter").then((m) => ({ default: m.TutorialCenter })),
 );
-export const ContainerWebPreview = lazy(() =>
+export const ContainerWebPreview = createRetryableLazy(() =>
   import("./components/ContainerWebPreview").then((m) => ({ default: m.ContainerWebPreview })),
 );
 // OCV5-593 媒体工作台:/studio 整页独立界面,只有进入时才下载。
-export const StudioApp = lazy(() => import("./components/studio/StudioApp").then((m) => ({ default: m.StudioApp })));
-export const TaskboardView = lazy(() =>
+export const StudioApp = createRetryableLazy(() => import("./components/studio/StudioApp").then((m) => ({ default: m.StudioApp })));
+export const TaskboardView = createRetryableLazy(() =>
   import("./components/taskboard/TaskboardView").then((m) => ({ default: m.TaskboardView })),
 );
-export const SitesWorkspaceView = lazy(() =>
+export const SitesWorkspaceView = createRetryableLazy(() =>
   import("./components/sites/SitesWorkspaceView").then((m) => ({ default: m.SitesWorkspaceView })),
 );
 // 2026-09-17 首屏体量门(first-screen-budget)超限修复:下列对话框/编辑器都是「点开才需要」的
 // 覆盖层,此前静态 import 把它们(连同 ImageViewer 三模式、ProjectAssetsPanel 等)钉在入口静态
-// 闭包里。改 React.lazy 后由渲染点的挂载闸(useMountedOnce / 条件挂载)控制首次下载;打开过
-// 一次即常驻,状态保留与关闭语义与原先「始终挂载、按 open 显隐」一致。
-// 详情面板沿用 paneInline / paneSheetOpen 的打开条件，首次打开时才下载。
-export const InspectorPanel = lazy(() =>
+// 闭包里。改 createRetryableLazy 后由渲染点的挂载闸(useMountedOnce / 条件挂载)控制首次下载。
+export const InspectorPanel = createRetryableLazy(() =>
   import("./components/InspectorPanel").then((m) => ({ default: m.InspectorPanel })),
 );
-export const InspectorPanelContent = lazy(() =>
+export const InspectorPanelContent = createRetryableLazy(() =>
   import("./components/InspectorPanel").then((m) => ({ default: m.InspectorPanelContent })),
 );
-export const ImageAnnotationEditor = lazy(() =>
+export const ImageAnnotationEditor = createRetryableLazy(() =>
   import("./components/ImageAnnotationEditor").then((m) => ({ default: m.ImageAnnotationEditor })),
 );
 // 项目主页(/p/<id>)是并列工作区,点开项目才需要;带着 ProjectAssetsPanel,不能进入口闭包。
-export const ProjectHome = lazy(() =>
+export const ProjectHome = createRetryableLazy(() =>
   import("./components/project/ProjectHome").then((m) => ({ default: m.ProjectHome })),
 );
 
 // 同屏伴随快问小窗:按需加载,失败时清缓存并重建 lazy 工厂以便重试恢复。
-type QuickAskModule = typeof import("./components/chat/QuickAskWindow");
-let loadedQuickAsk: QuickAskModule | null = null;
-let pendingQuickAsk: Promise<QuickAskModule> | null = null;
-function loadQuickAskModule(): Promise<QuickAskModule> {
-  if (!pendingQuickAsk) {
-    pendingQuickAsk = import("./components/chat/QuickAskWindow").then(
-      (mod) => {
-        loadedQuickAsk = mod;
-        return mod;
-      },
-      (err: unknown) => {
-        pendingQuickAsk = null;
-        QuickAskWindow = makeLazyQuickAskWindow();
-        throw err;
-      },
-    );
-  }
-  return pendingQuickAsk;
-}
-function makeLazyQuickAskWindow() {
-  return lazy(() => {
-    if (loadedQuickAsk) return Promise.resolve({ default: loadedQuickAsk.QuickAskWindow });
-    return loadQuickAskModule().then((mod) => ({ default: mod.QuickAskWindow }));
-  });
-}
-export let QuickAskWindow = makeLazyQuickAskWindow();
+export const QuickAskWindow = createRetryableLazy(() =>
+  import("./components/chat/QuickAskWindow").then((m) => ({ default: m.QuickAskWindow })),
+);
 
 // UX 体验对冲（红线:优化不得降低体验）:懒加载省首屏,但慢网下首开中心会多一个
 // loading 瞬间。首屏渲染完成后在浏览器空闲期预取这些懒块——Vite 对同一 specifier

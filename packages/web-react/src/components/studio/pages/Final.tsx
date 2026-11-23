@@ -2,7 +2,7 @@
 // strip, the final QA, export (FE-6: each format's film, a free re-compose for a new one, the .srt),
 // the CC BY credits (d14) and the project cost breakdown.
 
-import { Check, CircleAlert, Clapperboard, Download, MapPin, RefreshCw } from 'lucide-react'
+import { Check, CircleAlert, Clapperboard, Download, RefreshCw } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 
 import { useBlobUrl } from '../../../hooks/useBlobUrl'
@@ -134,7 +134,7 @@ export function FinalPage(props: {
     setRetrying(true)
     try {
       await studioApi.approve(auth, view.project.id)
-      toast('已让导演 agent 重新合成成片，免费', 'success')
+      toast('已让导演助手重新合成成片，免费', 'success')
       props.onReload?.()
     } catch (err) {
       toast(studioErrorText(err), 'error')
@@ -245,7 +245,7 @@ export function FinalPage(props: {
           {qa && qa.passed === true ? (
             <span className="st-chip st-chip-dark st-chip-ok">
               <Check />
-              QA 全部通过
+              质量评估全部通过
             </span>
           ) : null}
         </div>
@@ -271,8 +271,7 @@ export function FinalPage(props: {
                 className="st-cap"
                 style={{ color: 'var(--st-stage-muted)', maxWidth: 420, textAlign: 'center' }}
               >
-                所有镜头通过、配音和配乐就绪后，导演 agent
-                会在合成沙箱里剪成成片，并做一次成片质检。
+                所有镜头通过、配音和配乐就绪后，导演助手会在合成沙箱里剪成成片，并做一次成片质量评估。
               </div>
               <button
                 type="button"
@@ -298,20 +297,13 @@ export function FinalPage(props: {
             ))}
           </div>
         ) : null}
-        <div
-          className="st-row st-cap st-hide-sm"
-          style={{ color: 'var(--st-stage-faint)', gap: 6 }}
-        >
-          <MapPin size={12} />
-          成片批注会在导演 agent 上线后开放（例如“片名晚 1 秒出”）
-        </div>
       </section>
 
       <aside className="st-panel st-final-side" aria-label="成片信息">
         <div className="st-final-side-body">
           <div>
             <div className="st-label" style={{ marginBottom: 8 }}>
-              成片 QA
+              成片质量评估
             </div>
             {qa ? (
               <ul className="st-final-qa">
@@ -504,7 +496,7 @@ export function FinalPage(props: {
             {/* User 2026-10-23 21:42: compose is the director agent's job and is billed only by
                 what the agent uses; there is no fixed per-compose fee to show here. */}
             <div className="st-cap st-cost-note" data-testid="compose-fee-note">
-              成片合成由导演 agent 完成，按 agent 实际用量计费，不另收固定费用。
+              成片合成由导演助手完成，按导演助手实际用量计费，不另收固定费用。
             </div>
           </div>
         </div>

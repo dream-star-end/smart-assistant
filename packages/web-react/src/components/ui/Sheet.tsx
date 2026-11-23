@@ -17,7 +17,7 @@ import { IconButton } from "./IconButton";
 export type SheetSide = "left" | "right" | "bottom";
 
 const sheetVariants = cva(
-  "fixed z-50 flex flex-col bg-sidebar shadow-float outline-none",
+  "fixed z-[var(--z-drawer)] flex flex-col bg-sidebar shadow-float outline-none",
   {
     variants: {
       side: {
@@ -71,7 +71,7 @@ export function Sheet({
       <RD.Portal>
         <RD.Overlay
           className={cn(
-            "fixed inset-0 z-40 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade",
+            "fixed inset-0 z-[var(--z-drawer)] bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade",
             overlayClassName,
           )}
         />
@@ -83,7 +83,7 @@ export function Sheet({
           onFocusCapture={revealFocusedElement}
           className={cn(sheetVariants({ side }), className)}
         >
-          <RD.Title className="sr-only">{srTitle}</RD.Title>
+          <RD.Title className="sr-only text-ellipsis">{srTitle}</RD.Title>
           {closeButton && (
             // 绝对定位在面板右上:Content 是 fixed 容器,不占内容流;贴底抽屉的抓握条居中,与它不打架。
             <RD.Close asChild>

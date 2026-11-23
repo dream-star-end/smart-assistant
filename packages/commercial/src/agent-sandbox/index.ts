@@ -19,6 +19,11 @@ export {
   type ProvisionResult,
   type ContainerStatus,
 } from "./types.js";
+export {
+  ANTIGRAVITY_CLEARCUT_BLOCK_EXTRA_HOST,
+  V3_DEFAULT_EXTRA_HOSTS,
+  buildContainerExtraHosts,
+} from "./constants.js";
 
 // V3 Phase 3C — per-user openclaude-runtime supervisor(独立于 v2 createContainer)
 export {

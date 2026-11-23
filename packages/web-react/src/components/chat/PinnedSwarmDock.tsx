@@ -7,7 +7,7 @@ import type { SwarmSnapshot } from "@openclaude/protocol/browser";
 import { ArrowUpRight, MessageSquare } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { altKeyLabel } from "../ChatHeader";
-import { Badge } from "../ui";
+import { Badge, StatusPill } from "../ui";
 import { AtelierIcon } from "../ui/AtelierIcons";
 import "./liveActivity.css";
 import { SwarmElapsedTicker } from "./SwarmElapsedTicker";
@@ -100,8 +100,10 @@ export function PinnedSwarmDock({
                   >
                     {memberInitial(m.name)}
                     {isWorking && (
-                      <span
-                        className="absolute -bottom-0.5 -right-0.5 size-1.5 rounded-full bg-accent ring-2 ring-elevated"
+                      <StatusPill
+                        status="running"
+                        decorative
+                        className="absolute -bottom-0.5 -right-0.5 ring-2 ring-elevated"
                       />
                     )}
                   </span>

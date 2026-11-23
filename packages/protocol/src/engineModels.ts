@@ -354,7 +354,7 @@ export function zcodeTransportModelId(modelId: string | undefined): string | und
  *   only the route model's CLI ids plus ANTIGRAVITY_AUX_UPSTREAM_MODELS and
  *   meters every call it forwards.
  */
-export const ANTIGRAVITY_CLI_VERSION = '1.5.8'
+export const ANTIGRAVITY_CLI_VERSION = '1.5.15'
 /** Title generation (`requestType: checkpoint`) the CLI makes on every new
  * conversation. It is NOT included in the CLI's own `result.usage`, so CLI
  * usage alone under-bills. */

@@ -47,6 +47,7 @@ import {
 import { resolveParentTapeIngestState, type ParentTapeIngestState } from './delegateNotifyTape.js'
 import { delayUntilNextNotifyRetry } from './delegateNotifyDispatch.js'
 import { formatJobTerminalMarkdown, injectPayloadFromJobTerminal } from './jobTerminal.js'
+const ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE = 'ORIGIN_MESSAGE_PREVIOUSLY_FAILED'
 import { delegateCallbackMessageId, restoreDelegateJobSnapshots } from './delegateCompleter.js'
 import { eventBus } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
@@ -130,6 +131,7 @@ export interface GatewayLifecycleHost {
   _wsKeepaliveTimer: Gateway['_wsKeepaliveTimer']
   bootAutoResume: Gateway['bootAutoResume']
   channels: Gateway['channels']
+  checkHttpAuth: Gateway['checkHttpAuth']
   clientsByPeer: Gateway['clientsByPeer']
   cron: Gateway['cron']
   cronProjectPorts: Gateway['cronProjectPorts']
@@ -143,6 +145,7 @@ export interface GatewayLifecycleHost {
   injectCronOriginSession: Gateway['injectCronOriginSession']
   injectSendToAgentCallback: Gateway['injectSendToAgentCallback']
   lastActiveChannel: Gateway['lastActiveChannel']
+  liveBrowser: Gateway['liveBrowser']
   log: Gateway['log']
   rateLimiter: Gateway['rateLimiter']
   refreshClaudeOAuthIfNeeded: Gateway['refreshClaudeOAuthIfNeeded']
@@ -400,6 +403,8 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
   this.wss.on('error', (err) => {
     this.log.error('wss.server_error', undefined, err)
   })
+  this.liveBrowser.setUpgradeAuthCheck((req) => this.checkHttpAuth(req))
+  this.liveBrowser.setCommercialMasterMode(Boolean(this.deps.commercial))
   this.httpServer.on('upgrade', (req, socket, head) => {
     // 1) 商业化模块优先(/ws/user-chat-bridge / /ws/agent / 未来私有路径)
     try {
@@ -421,6 +426,19 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
         socket.destroy()
       } catch {}
       return
+    }
+    // 2.5) Live cloud browser CDP stream (/ws/live-browser) — container/standalone only.
+    // Commercial master always claims /ws/live-browser in step 1 above.
+    if (!this.deps.commercial) {
+      try {
+        if (this.liveBrowser.handleUpgrade(req, socket, head)) return
+      } catch (err) {
+        this.log.error('liveBrowser.handleUpgrade threw', undefined, err)
+        try {
+          socket.destroy()
+        } catch {}
+        return
+      }
     }
     // 3) gateway 自身 /ws(浏览器 ↔ gateway 的 ChannelAdapter 协议)
     const url = req.url ?? '/'
@@ -1017,11 +1035,16 @@ export async function _doShutdown(this: GatewayLifecycleHost, exit: boolean): Pr
     }
   }
 
-  // ── Stage 3.75: close isolated preview Chromium/CDP sessions ──
+  // ── Stage 3.75: close isolated preview & live browser CDP sessions ──
   try {
     await this._containerPreview.shutdown()
   } catch (err) {
     this.log.warn('container preview shutdown error', undefined, err)
+  }
+  try {
+    await this.liveBrowser.shutdown()
+  } catch (err) {
+    this.log.warn('live browser shutdown error', undefined, err)
   }
 
   // ── Stage 4: drain sessions (kill CCB subprocesses, flush resume map) ──
@@ -1325,6 +1348,12 @@ export function _ensureEngineNotifier(
                 once: true,
               })
         if (result.kind === 'injected') return { ok: true }
+        if (
+          result.kind === 'retryable_failure' &&
+          result.code === ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE
+        ) {
+          return { ok: false, failureClass: 'transport' as const, previouslyFailed: true }
+        }
         if (result.kind === 'retryable_failure' && result.code === 'ORIGIN_SESSION_BUSY') {
           return { ok: false, failureClass: 'internal' as const, busy: true }
         }
@@ -1351,7 +1380,7 @@ export function _armNotifyRetryScheduler(this: GatewayLifecycleHost): void {
     clearTimeout(this._notifyRetryTimer)
     this._notifyRetryTimer = undefined
   }
-  if (!this._delegateJobs) return
+  if (this._shuttingDown || !this._delegateJobs) return
   const notifierOn = isDelegateNotifierEffective()
   const handoffDelay = notifierOn ? undefined : handedOffDelegateRetryDelay(this._delegateJobs)
   const cronDelay = !notifierOn && isDelegateDurableEffective()
@@ -1372,7 +1401,9 @@ export function _armNotifyRetryScheduler(this: GatewayLifecycleHost): void {
           this._drainFlagOffCronOriginNotifies({ dueOnly: true }),
           retryHandedOffDelegateNotifies(this),
         ])
-    void work.finally(() => this._armNotifyRetryScheduler())
+    void work.finally(() => {
+      if (!this._shuttingDown) this._armNotifyRetryScheduler()
+    })
   }, delay)
   this._notifyRetryTimer.unref()
 }

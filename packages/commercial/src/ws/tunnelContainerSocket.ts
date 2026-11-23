@@ -51,9 +51,11 @@ export interface CreateTunnelContainerSocketOpts {
    */
   connectionTraceId: string;
   /** Strict internal target; ordinary chat remains /ws. */
-  containerWsPath?: '/ws' | '/ws/container-preview';
+  containerWsPath?: '/ws' | '/ws/container-preview' | '/ws/live-browser';
   /** Required only for /ws/container-preview; forwarded after verified mTLS dial. */
   previewAssertion?: string;
+  /** Required only for /ws/live-browser; forwarded after verified mTLS dial. */
+  liveBrowserAssertion?: string;
 }
 
 /**
@@ -74,6 +76,7 @@ export function _buildTunnelHeaders(
   pskHex: string | null,
   connectionTraceId: string,
   previewAssertion?: string,
+  liveBrowserAssertion?: string,
 ): Record<string, string> {
   const headers: Record<string, string> = {
     "X-Connection-Trace-Id": connectionTraceId,
@@ -83,6 +86,9 @@ export function _buildTunnelHeaders(
   }
   if (previewAssertion !== undefined) {
     headers['X-OpenClaude-Preview-Assertion'] = previewAssertion;
+  }
+  if (liveBrowserAssertion !== undefined) {
+    headers['X-OpenClaude-Live-Browser-Assertion'] = liveBrowserAssertion;
   }
   return headers;
 }
@@ -132,15 +138,29 @@ export async function createTunnelContainerSocket(
     throw new DOMException("aborted", "AbortError");
   }
   const containerWsPath = opts.containerWsPath ?? '/ws';
-  if (containerWsPath !== '/ws' && containerWsPath !== '/ws/container-preview') {
+  if (
+    containerWsPath !== '/ws' &&
+    containerWsPath !== '/ws/container-preview' &&
+    containerWsPath !== '/ws/live-browser'
+  ) {
     throw new InvalidTunnelArgsError('invalid containerWsPath');
   }
   if (containerWsPath === '/ws/container-preview') {
     if (!opts.previewAssertion || !/^[A-Za-z0-9_-]{1,4096}$/.test(opts.previewAssertion)) {
       throw new InvalidTunnelArgsError('preview assertion missing or malformed');
     }
-  } else if (opts.previewAssertion !== undefined) {
-    throw new InvalidTunnelArgsError('preview assertion is only valid for preview path');
+    if (opts.liveBrowserAssertion !== undefined) {
+      throw new InvalidTunnelArgsError('live browser assertion is not valid for preview path');
+    }
+  } else if (containerWsPath === '/ws/live-browser') {
+    if (!opts.liveBrowserAssertion || !/^[A-Za-z0-9_-]{1,4096}$/.test(opts.liveBrowserAssertion)) {
+      throw new InvalidTunnelArgsError('live browser assertion missing or malformed');
+    }
+    if (opts.previewAssertion !== undefined) {
+      throw new InvalidTunnelArgsError('preview assertion is not valid for live browser path');
+    }
+  } else if (opts.previewAssertion !== undefined || opts.liveBrowserAssertion !== undefined) {
+    throw new InvalidTunnelArgsError('bridge assertion is only valid for dedicated bridge paths');
   }
 
   // pre-dial:全部安全检查(CA + SPIFFE URI + 指纹 pin)在此 await 内完成。
@@ -195,7 +215,12 @@ export async function createTunnelContainerSocket(
     pskHex = target.psk.toString("hex");
     try { target.psk.fill(0); } catch { /* */ }
   }
-  const headers = _buildTunnelHeaders(pskHex, opts.connectionTraceId, opts.previewAssertion);
+  const headers = _buildTunnelHeaders(
+    pskHex,
+    opts.connectionTraceId,
+    opts.previewAssertion,
+    opts.liveBrowserAssertion,
+  );
 
   // 防御:new WebSocket 同步抛错(URL 异常 / options 校验失败)→ preDialed
   // 还没移交给 ws 库,必须自己 destroy,避免 socket 半开 + listener 泄漏。

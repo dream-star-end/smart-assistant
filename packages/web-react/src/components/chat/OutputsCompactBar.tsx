@@ -80,7 +80,7 @@ export function OutputsCompactBar({
           onClick={onBackToList}
           aria-label="返回文件列表"
           data-testid="outputs-back-to-list"
-          className="oc-btn-tactile inline-flex min-h-7 shrink-0 items-center gap-1 rounded-md px-2 py-1 text-caption font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-9"
+          className="oc-btn-tactile inline-flex min-h-7 shrink-0 items-center gap-1 rounded-md px-2 py-1 text-caption font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
         >
           <ArrowLeft size={13} aria-hidden />
           <span>文件列表</span>
@@ -93,7 +93,7 @@ export function OutputsCompactBar({
             aria-label="上一轮"
             disabled={turnIndex <= 0}
             onClick={onPrevTurn}
-            className="oc-btn-tactile inline-flex size-5 items-center justify-center rounded-xs text-muted outline-none hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30"
+            className="oc-btn-tactile inline-flex size-5 items-center justify-center rounded-xs text-muted outline-none hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30 [@media(hover:none)]:size-11"
           >
             <ChevronLeft size={12} />
           </button>
@@ -105,7 +105,7 @@ export function OutputsCompactBar({
             aria-label="下一轮"
             disabled={turnIndex >= turnTotal - 1}
             onClick={onNextTurn}
-            className="oc-btn-tactile inline-flex size-5 items-center justify-center rounded-xs text-muted outline-none hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30"
+            className="oc-btn-tactile inline-flex size-5 items-center justify-center rounded-xs text-muted outline-none hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30 [@media(hover:none)]:size-11"
           >
             <ChevronRight size={12} />
           </button>
@@ -135,7 +135,7 @@ export function OutputsCompactBar({
               const target = deliverables[curIdx - 1];
               if (target) onPick(target);
             }}
-            className="oc-btn-tactile inline-flex size-6 items-center justify-center rounded-xs text-muted outline-none hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30"
+            className="oc-btn-tactile inline-flex size-6 items-center justify-center rounded-xs text-muted outline-none hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30 [@media(hover:none)]:size-11"
           >
             <ChevronLeft size={13} />
           </button>
@@ -148,7 +148,7 @@ export function OutputsCompactBar({
               const target = deliverables[curIdx + 1];
               if (target) onPick(target);
             }}
-            className="oc-btn-tactile inline-flex size-6 items-center justify-center rounded-xs text-muted outline-none hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30"
+            className="oc-btn-tactile inline-flex size-6 items-center justify-center rounded-xs text-muted outline-none hover:bg-surface hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30 [@media(hover:none)]:size-11"
           >
             <ChevronRight size={13} />
           </button>
@@ -169,7 +169,7 @@ export function OutputsCompactBar({
                 title={opt.label}
                 onClick={() => onChangeView(opt.value)}
                 className={cn(
-                  "oc-btn-tactile inline-flex size-6 items-center justify-center rounded-xs outline-none transition-all focus-visible:ring-2 focus-visible:ring-ring",
+                  "oc-btn-tactile inline-flex size-6 items-center justify-center rounded-xs outline-none transition-all focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11",
                   active ? "oc-segmented-thumb text-accent" : "text-muted hover:text-fg",
                 )}
               >

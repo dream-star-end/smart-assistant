@@ -35,7 +35,7 @@ function ResultCover({ item }: { item: TutorialShowcase }) {
     <div className={cn('relative flex min-h-[260px] flex-col justify-between overflow-hidden p-6 sm:p-8', mint ? HERO_MINT_SURFACE_CLASS : HERO_NAVY_SURFACE_CLASS)} data-tutorial-hero={mint ? 'showcase-mint' : 'showcase-navy'}>
       <div className={cn('pointer-events-none absolute -right-10 -top-16 h-64 w-64 rounded-full blur-3xl', mint ? 'bg-emerald-300/15' : 'bg-sky-300/15')} />
       <div className="relative flex items-center justify-between text-caption">
-        <span className="font-medium tracking-widest text-white/70">{mint ? 'DEMAND EXPLORER' : 'MARKET BRIEF'}</span>
+        <span className="font-medium tracking-widest text-white/75">{mint ? '需求洞察看板' : '市场研究简报'}</span>
         <span className="rounded-full border border-white/20 px-2.5 py-1 text-white/80">可交互成果</span>
       </div>
       <div className="relative my-7 grid grid-cols-3 gap-3" aria-label="实作结果摘要">
@@ -63,7 +63,7 @@ export function CaseShowroom({ onSelect, onRun, actionLabel, activeWorkId, onAct
   return (
     <section className="mx-auto max-w-6xl px-4 pb-10 pt-8 sm:px-8 sm:pt-12">
       <SignatureGallery onSelect={(work) => { setRestoreFocusWorkId(work.id); setWorkId(work.id) }} restoreFocusWorkId={restoreFocusWorkId} />
-      <p className="text-micro font-semibold uppercase tracking-[0.16em] text-accent">Public data · 公开数据实作</p>
+      <p className="text-micro font-semibold uppercase tracking-[0.16em] text-accent">公开数据实作</p>
       <h2 className="mt-2 text-balance text-[26px] font-semibold tracking-[-0.025em] text-fg sm:text-[32px]">还有这些，能直接用在工作里。</h2>
       <p className="mt-2.5 max-w-2xl text-body leading-6 text-muted">从真实数据到可核对的结果。继续探索这些公开数据实作。</p>
       <div className="mt-9 grid gap-6 lg:grid-cols-2">

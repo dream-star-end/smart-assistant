@@ -129,6 +129,10 @@ export type FrameEffects = {
   reportTurnError?: (p: { code: string; message: string; traceId?: string; sessionId?: string }) => void;
   /** resume_failed / reconcile：游标已推进后，读一次权威历史。*/
   forceSync?: (sessId: string, context?: { clientMessageId?: string }) => void;
+  /** swarm_snapshot 遇到 missing_base 时，从活跃 view=units 补拉 SwarmBoard 基线（OCV5-867）。*/
+  resyncSwarmUnits?: (sessId: string, clientMessageId?: string) => void;
+  /** 跨 tab 收到未知活跃 clientMessageId 实时帧且本地缺对应 user 气泡时补拉一次历史（OCV5-868）。*/
+  syncMissingTurnUser?: (sessId: string, clientMessageId: string) => void;
   /**
    * tape 提交后的合成 turn_completed 命中**正在流式**的本轮:返回 true 表示 socket 接管——宽限期内
    * 等 live 尾巴与真 final 自然收口,期满仍未收口再按 reconcile 收口。缺省/false → 立即收口(旧行为)。
@@ -772,7 +776,7 @@ function isImmutableTapeViewportRow(message: ChatMessage): boolean {
 /** Only proven-terminal tape/timeline rows are frozen. `_turnTapeId` or
  * `_source:"server"` alone is not enough: rolling refs and REST/WS overlap
  * can carry those marks while later live incrementals are still authoritative. */
-function isFrozenLiveTarget(message: ChatMessage): boolean {
+export function isFrozenLiveTarget(message: ChatMessage): boolean {
   if (isImmutableTapeViewportRow(message)) return true;
   return message._turnTapeComplete === true;
 }
@@ -1509,7 +1513,7 @@ function handleDelegateProgressBlock(
 function isPlanTurnBoundary(msg?: ChatMessage): boolean {
   return !!msg && (msg.role === "user" || msg.role === "system");
 }
-function planTurnStart(messages: ChatMessage[], beforeIndex: number): number {
+export function planTurnStart(messages: ChatMessage[], beforeIndex: number): number {
   let i = Math.min(beforeIndex, messages.length) - 1;
   for (; i >= 0; i--) if (isPlanTurnBoundary(messages[i])) return i + 1;
   return 0;
@@ -1860,6 +1864,17 @@ export function applyOutboundMessage(
   if (!lifecycleSidebandFrame) {
     if (hasBlocks) {
       if (!frame.isFinal && !frame.cronJob && !sess._sendingInFlight) sess._sendingInFlight = true;
+      if (!frame.isFinal && !frame.cronJob && !progressOnlyFrame && typeof frame.clientMessageId === "string" && frame.clientMessageId) {
+        const isUnclaimedTurn = sess._activeClientMessageId !== frame.clientMessageId;
+        if (!sess._activeClientMessageId) sess._activeClientMessageId = frame.clientMessageId;
+        const hasOwnerUser = sess.messages.some(
+          (m) => m.role === "user" && (m.id === frame.clientMessageId || m._clientMessageId === frame.clientMessageId),
+        );
+        if (isUnclaimedTurn && !hasOwnerUser && sess._missingUserSyncCmid !== frame.clientMessageId) {
+          sess._missingUserSyncCmid = frame.clientMessageId;
+          effects.syncMissingTurnUser?.(sess.id, frame.clientMessageId);
+        }
+      }
       if (isRetryingTurnStatus(sess._turnStatus) || isEngineStartupTurnStatus(sess._turnStatus))
         sess._turnStatus = null;
       const hint = sess._turnProgressHint;
@@ -2357,7 +2372,11 @@ export function applyOutboundMessage(
         const nowMs = Date.now();
         if (!sess._swarmResyncLastAt || nowMs - sess._swarmResyncLastAt >= 5_000) {
           sess._swarmResyncLastAt = nowMs;
-          effects.forceSync?.(sess.id);
+          if (effects.resyncSwarmUnits) {
+            effects.resyncSwarmUnits(sess.id, frameTurnOwnerId);
+          } else {
+            effects.forceSync?.(sess.id);
+          }
         }
       }
     }

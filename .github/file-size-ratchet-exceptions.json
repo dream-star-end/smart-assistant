@@ -5,5 +5,12 @@
     "ticket": "OCV5-738",
     "reason": "OCV5-738 adds the Antigravity delegate branch (route acquisition, safe projection, 503 fail-closed with journal abandon/slot release, and exactly-once settle/abandon) next to the Codex/Grok branches; the base branch is already 5 lines over the 3000 absolute limit, and the branch is deliberately kept beside its Codex twin for auditability. Extract to a helper module when the delegate runtime split lands.",
     "expires": "2026-12-04"
+  },
+  {
+    "path": "scripts/deploy-v5.sh",
+    "maxLines": 12152,
+    "ticket": "OCV5-856",
+    "reason": "Backmerging commercial PR #1412 (c6dfda962 / OCV5-808 parallel commercial release gates & digest hashing) via PR #1413 brings scripts/deploy-v5.sh from 11837 to 12152 lines on feat/v5-selfhost; split the new commercial gate helpers into scripts/lib/ in a follow-up cleanup.",
+    "expires": "2026-12-20"
   }
 ]

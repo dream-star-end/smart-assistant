@@ -9,13 +9,13 @@ import { ReadOnlySystemActionsBoundary } from "./iui/ReadOnlySystemActionsBounda
  * MessageList：把会话消息流渲成普通 DOM 卡片列表 + 流式 typing 指示 + 向上历史分页。
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
-import { returnStrayRowsToOwnerTurn } from "../lib/chat/order";
 import { FirstTextPaintCommitProbe } from "./chat/FirstTextPaintCommitProbe";
 import {
   ScrollToBottomButton,
   shouldShowScrollToBottom,
   useScrollToBottomVisibility,
 } from "./chat/ScrollToBottomButton";
+import { snapScrollToBottomOnce } from "./chat/stickToBottom";
 import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isInteractiveToolMessage, isProcessMessage, keepDistinctActivity, processSections, promptShadowedToolIds, turnOutcome } from "./chat/ProcessDisclosure";
 import { ChevronDown, ChevronUp, Info, X } from "lucide-react";
 import {
@@ -34,21 +34,17 @@ import type {
 } from "../lib/chat/model";
 import { UserUpwardPagingController } from "../lib/chat/tapePaging";
 import {
-  collectResolvedDispatchTurnIds,
   HIDDEN_REVIEWER_AGENT_ID,
   isRedundantRuntimeEnvelope,
-  isTurnStatusSuppressedByTape,
-  collectTurnStatusRecordTurnIds,
-  isErrorCardHeld,
   isErrorCardHeldWithAnswer,
-  isErrorCardSupersededByTurnStatus,
   messageKind,
   safeMessageSignature,
 } from "../lib/chat/render";
-import { isPlatedAssistantMessage, isRecoveryControlUserTurn, isRecoveryTurnClientMessageId } from "../lib/chat/pure";
-import { collectAutomaticRecoveredSourceIds, recoveryFailureIsPresentedBelow } from "../lib/chat/recoveryFailureOutlet";
-import { sanitizeChatMessages } from "../lib/chat/sanitizeChatMessages";
-import { collectRecoveredTurnStatusRecordIds } from "../lib/chat/manualTaskContinuation";
+import { isPlatedAssistantMessage, isRecoveryTurnClientMessageId } from "../lib/chat/pure";
+import {
+  projectTimelineMessages,
+  timelineMessagesFingerprint,
+} from "./chat/timelineProjection";
 import {
   EAGER_MEDIA_TAIL_ITEMS,
   EAGER_PAYLOAD_TAIL_ITEMS,
@@ -95,7 +91,7 @@ import {
 } from "./chat/permissionPromptState";
 import { ToolCardSlot } from "./chat/toolCardSlot";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
-import { currentTurnStartIndex, projectVisibleAssistantRows, splitStoppedNarration, turnFinalAssistantFlags, turnRatingFlags, turnRecoveryParents } from "./chat/turnSegment";
+import { currentTurnStartIndex, turnFinalAssistantFlags, turnLineageRoot, turnRatingFlags } from "./chat/turnSegment";
 import {
   captureVisibleVirtualRowAnchor,
   correctedScrollTop,
@@ -106,7 +102,11 @@ import {
 import { PartialHistorySkeleton } from "./chat/HistorySkeleton";
 import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput } from "./tool/format";
-import { Alert, IconButton, Input, Spinner } from "./ui";
+import {
+  TaskApprovalGroupSlot,
+  coalesceTaskApprovalGroups,
+} from "./tool/taskApprovalCoalesce";
+import { Alert, IconButton, Input, Spinner, StatusPill } from "./ui";
 import { cn } from "../lib/utils";
 import {
   findMatches,
@@ -448,7 +448,7 @@ function RuntimeEventCard({ message }: { message: ChatMessage }) {
         aria-expanded={open}
         className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-meta transition-colors hover:bg-hover/70 [@media(hover:none)]:min-h-11"
       >
-        <span className="size-1.5 shrink-0 rounded-full bg-faint" />
+        <StatusPill tone="idle" size="sm" decorative />
         <span className="min-w-0 flex-1 truncate text-muted">{label}</span>
         {message._runtimeSource && <span className="shrink-0 text-caption text-faint">{message._runtimeSource}</span>}
         <span className="text-caption text-faint">{open ? "收起" : "查看原始记录"}</span>
@@ -709,7 +709,7 @@ function DeferredTapeRecordCard({
     );
   }
   return (
-    <div ref={ref} className="rounded-lg border border-dashed border-border bg-surface px-3.5 py-3 text-xs text-muted">
+    <div ref={ref} className="rounded-lg border border-dashed border-border bg-surface px-3.5 py-3 text-caption text-muted">
       {failed ? (
         <button
           type="button"
@@ -717,7 +717,7 @@ function DeferredTapeRecordCard({
             autoRetries.current = 0;
             void load();
           }}
-          className="text-muted underline-offset-2 hover:text-fg hover:underline"
+          className="inline-flex items-center text-muted underline-offset-2 hover:text-fg hover:underline [@media(hover:none)]:min-h-11"
         >
           {isUserPayload ? "完整消息加载失败，点击重新加载" : "内容加载失败，点击重新加载"}
         </button>
@@ -779,9 +779,24 @@ type LeafRenderItem =
       tokenUsage?: DisplayTokenUsage;
     };
 
-type RenderItem = LeafRenderItem | {
-  kind: "process"; key: string; members: ChatMessage[]; items: LeafRenderItem[]; active: boolean;
-};
+type SingleRenderItem = Extract<LeafRenderItem, { kind: "single" }>;
+
+type RenderItem =
+  | LeafRenderItem
+  | {
+      kind: "process";
+      key: string;
+      members: ChatMessage[];
+      items: LeafRenderItem[];
+      active: boolean;
+    }
+  | {
+      kind: "approval-group";
+      key: string;
+      members: ChatMessage[];
+      items: SingleRenderItem[];
+      ticketIds: string[];
+    };
 function itemMessages(item: LeafRenderItem): ChatMessage[] {
   return item.kind === "single" ? [item.m] : item.members;
 }
@@ -809,10 +824,46 @@ const ProcessGroupMemo = memo(
  * answer. A deferred empty locator for a finished turn stays outside too.
  * Deliverable rows are excluded separately by isProcessMessage.
  */
-function disclosureAnswerIds(messages: ChatMessage[], finals: boolean[], sending: boolean): Set<string> {
+function explicitRowTurnRoot(
+  message: ChatMessage | undefined,
+  rootOf: (id: string) => string,
+): string | undefined {
+  if (!message) return undefined;
+  const raw = message.role === "user"
+    ? message.id
+    : (typeof message._turnOwnerId === "string" && message._turnOwnerId) ||
+      (typeof message._clientMessageId === "string" && message._clientMessageId) ||
+      undefined;
+  return raw ? rootOf(raw) : undefined;
+}
+
+function disclosureAnswerIds(
+  messages: ChatMessage[],
+  finals: boolean[],
+  sending: boolean,
+  turnLineageParents?: ReadonlyMap<string, string>,
+): Set<string> {
   const ids = new Set<string>();
   const activeStart = currentTurnStartIndex(messages);
-  const live = (index: number) => sending && index >= activeStart;
+  const rootOf = turnLineageRoot(messages, turnLineageParents);
+  const trailingOwnerAfter = (index: number, ownerRoot: string): boolean => {
+    for (let j = index + 1; j < messages.length; j += 1) {
+      const otherRoot = explicitRowTurnRoot(messages[j], rootOf);
+      if (otherRoot && otherRoot !== ownerRoot) return true;
+    }
+    return false;
+  };
+  const live = (index: number) => {
+    if (!sending || index < activeStart) return false;
+    const message = messages[index];
+    // OCV5-868: 跨 tab 尚缺新轮 user 行或分页截断场景，已完整落盘的前轮 tape 终答
+    // 若后方已出现另一轮的活跃行，绝不视为当前活跃轮的中间叙述。
+    if (message?._turnTapeComplete === true) {
+      const ownerRoot = explicitRowTurnRoot(message, rootOf);
+      if (ownerRoot && trailingOwnerAfter(index, ownerRoot)) return false;
+    }
+    return true;
+  };
   for (let i = 0; i < messages.length; i++) {
     if (!finals[i] || live(i)) continue;
     const id = messages[i]?.id;
@@ -894,12 +945,37 @@ function continuedErrorIds(messages: ChatMessage[]): Set<string> {
   return ids;
 }
 
-function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], finals: boolean[], sending: boolean): RenderItem[] {
+function discloseProcess(
+  items: LeafRenderItem[],
+  messages: ChatMessage[],
+  finals: boolean[],
+  sending: boolean,
+  turnLineageParents?: ReadonlyMap<string, string>,
+): RenderItem[] {
   const out: RenderItem[] = [];
-  const answerIds = disclosureAnswerIds(messages, finals, sending);
+  const rootOf = turnLineageRoot(messages, turnLineageParents);
+  const answerIds = disclosureAnswerIds(messages, finals, sending, turnLineageParents);
   const continuedErrors = continuedErrorIds(messages);
   const activeStart = currentTurnStartIndex(messages);
-  const activeIds = new Set(sending ? messages.slice(activeStart).map((message) => message.id) : []);
+  const hasLaterDifferentTurnOwner = (index: number, ownerRoot: string): boolean => {
+    for (let j = index + 1; j < messages.length; j += 1) {
+      const otherRoot = explicitRowTurnRoot(messages[j], rootOf);
+      if (otherRoot && otherRoot !== ownerRoot) return true;
+    }
+    return false;
+  };
+  const activeIds = new Set(
+    sending
+      ? messages
+          .slice(activeStart)
+          .filter((message, offset) => {
+            if (message._turnTapeComplete !== true) return true;
+            const ownerRoot = explicitRowTurnRoot(message, rootOf);
+            return !(ownerRoot && hasLaterDifferentTurnOwner(activeStart + offset, ownerRoot));
+          })
+          .map((message) => message.id)
+      : [],
+  );
   const assistantArtifactKeys = new Map<string, Set<string>>();
   let scanOwner = "head";
   for (const item of items) {
@@ -928,7 +1004,7 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
   // the answer: never open a second 工作过程 underneath. Rows that must stay
   // put (question, approval, failure, artifact) are not foldable, end the
   // carry, and keep their place.
-  let carry: { boundary: string; group: ProcessGroup | undefined; answerIndex: number } | undefined;
+  let carry: { boundary: string; answerOwner?: string; group: ProcessGroup | undefined; answerIndex: number } | undefined;
   // Key off the turn, not the first row. Prepending an older live page must
   // not remount the shell the reader already has open.
   const shellOrdinal = new Map<string, number>();
@@ -1004,8 +1080,10 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
       const crossedAnswer = rows.some((message) => answerIds.has(message.id));
       if (crossedAnswer) {
         beforeAnswer.delete(boundary);
+        const answerRow = rows.find((message) => answerIds.has(message.id));
+        const answerOwner = explicitRowTurnRoot(answerRow, rootOf);
         const kept = group ?? (carry?.boundary === nextBoundary ? carry.group : undefined);
-        carry = { boundary: nextBoundary, group: kept, answerIndex: out.length };
+        carry = { boundary: nextBoundary, answerOwner, group: kept, answerIndex: out.length };
       } else if (group && out.includes(group)) {
         beforeAnswer.set(boundary, group);
         carry = undefined;
@@ -1016,7 +1094,9 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
       out.push(item);
       continue;
     }
-    if (carry && carry.boundary === nextBoundary && !group) {
+    const rowOwner = explicitRowTurnRoot(rows[0], rootOf);
+    const carryMatchesTurn = !(carry?.answerOwner && rowOwner && rowOwner !== carry.answerOwner);
+    if (carry && carry.boundary === nextBoundary && carryMatchesTurn && !group) {
       if (!carry.group || out.indexOf(carry.group) < 0) {
         const created: ProcessGroup = { kind: "process", key: "", members: [], items: [], active: false };
         carry.group = created;
@@ -1063,8 +1143,9 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
 function processTimeBounds(
   items: readonly RenderItem[],
   process: RenderItem,
+  knownIndex?: number,
 ): { startedAt: number | null; endedAt: number | null; next?: ChatMessage; following: ChatMessage[] } {
-  const index = items.indexOf(process);
+  const index = typeof knownIndex === "number" && items[knownIndex] === process ? knownIndex : items.indexOf(process);
   const time = (value: unknown) =>
     typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
   const before = index > 0 ? itemRows(items[index - 1]!).at(-1) : undefined;
@@ -1092,7 +1173,7 @@ function processTimeBounds(
 }
 
 function itemRows(item: RenderItem): ChatMessage[] {
-  return item.kind === "process" ? item.members : itemMessages(item);
+  return item.kind === "process" || item.kind === "approval-group" ? item.members : itemMessages(item);
 }
 
 function tapeRenderPageKey(message: ChatMessage | undefined): string {
@@ -1364,7 +1445,7 @@ function defaultTailStart(length: number): number {
 
 function renderItemKey(item: RenderItem): string {
   try {
-    if (item.kind === "process") return item.key;
+    if (item.kind === "process" || item.kind === "approval-group") return item.key;
     if (item.kind === "single") {
       return timelineMessageKey(item.m);
     }
@@ -1506,10 +1587,6 @@ function lastUserItemIndex(items: RenderItem[]): number {
   return -1;
 }
 
-function isNonEmptyId(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0;
-}
-
 /**
  * Unified timeline paging context. Loading is an explicit-button action;
  * scrolling only navigates already resident records.
@@ -1613,12 +1690,19 @@ export function MessageList({
   /** 会话内查找条。有值即渲染；关闭后高亮一并清除。 */
   find?: { onClose: () => void };
 }) {
+  const rawMessages = messages;
+  const messagesFingerprint = timelineMessagesFingerprint(rawMessages);
   // 还没开始发送的用户消息不进对话流，改由输入框上方的待发送列表呈现。
-  messages = messages.filter((message) => message.role !== "user" || message.status !== "queued");
   // 用户问答 / 退出计划模式卡已经展示了问题(计划)和结果;同一次调用的工具行只是重复,
   // 留着会被当成交互工具挂在「处理过程」外面。按 tool_use id 精确配对才隐藏。
-  const shadowedAskTools = promptShadowedToolIds(messages);
-  if (shadowedAskTools.size > 0) messages = messages.filter((message) => !shadowedAskTools.has(message.id));
+  const filteredMessages = useMemo(() => {
+    let next = rawMessages.filter((message) => message.role !== "user" || message.status !== "queued");
+    const shadowedAskTools = promptShadowedToolIds(next);
+    if (shadowedAskTools.size > 0) next = next.filter((message) => !shadowedAskTools.has(message.id));
+    return next;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rawMessages, messagesFingerprint]);
+  messages = filteredMessages;
   // MessageList owns expansion so virtual unmounts and live→history updates cannot reset user intent.
   const [disclosureState, setDisclosureState] = useState<{ session?: string; values: Record<string, boolean> }>({ values: {} });
   const disclosureValues = disclosureState.session === sessionId ? disclosureState.values : {};
@@ -2117,6 +2201,7 @@ export function MessageList({
       window.clearInterval(timer);
       scroller.removeEventListener("scroll", onScroll);
       if (w.__ocTimelineDump) delete w.__ocTimelineDump;
+      if (w.__ocTimelineBlankLast) delete w.__ocTimelineBlankLast;
     };
   }, [scrollParent, sessionId, cb]);
 
@@ -2145,140 +2230,11 @@ export function MessageList({
   }, [scrollParent, sessionId, windowVersion, messages.length]);
 
   // Drop legacy substitute rows from an old IndexedDB cache and duplicate
-  // engine transport envelopes. The latter remain byte-complete in the tape;
-  // their canonical immutable Agent blocks are the user-facing timeline.
-  const safeMessages = sanitizeChatMessages(messages, sessionId);
-  const resolvedDispatchTurnIds = collectResolvedDispatchTurnIds(safeMessages);
-  const statusRecordTurnIds = collectTurnStatusRecordTurnIds(safeMessages, resolvedDispatchTurnIds);
-  const recoveredStatusRecordIds = collectRecoveredTurnStatusRecordIds(safeMessages);
-  // Recovery child user turns remain in memory/IndexedDB/PG as exact lineage,
-  // but are transport controls rather than another user utterance. Automatic
-  // and manual children are both hidden. While a child exists, its source
-  // terminal card is likewise an intermediate state; only the final
-  // exhausted/unsafe error remains visible.
-  const recoveredSourceIds = new Set(
-    safeMessages
-      .filter(isRecoveryControlUserTurn)
-      .map((message) => message._recoveryOfClientMessageId)
-      .filter(isNonEmptyId),
+  // engine transport envelopes, resolve recovery lineage, and project visible rows.
+  const { safeMessages, renderableMessages, turnLineageParents, failureIsPresentedBelow } = useMemo(
+    () => projectTimelineMessages(messages, sessionId),
+    [messages, sessionId],
   );
-  const automaticRecoveredSourceIds = collectAutomaticRecoveredSourceIds(safeMessages);
-  // OCV5-307: the user acted on a committed card by clicking 从断点继续. While
-  // that manual continuation runs (or after it finished) the card is resolved,
-  // not a live failure; leaving it up showed 任务执行失败 + 重新尝试 next to
-  // 工具执行中. A declined child is removed (the card returns with its notice)
-  // and a failed child paints its own card; a child that failed without one
-  // keeps the source card. Automatic recovery never repaints a seen card.
-  const childErrorIds = new Set(
-    safeMessages
-      .filter((message) => message.role === "assistant" && !!message._errorCode)
-      .map((message) => message._clientMessageId)
-      .filter(isNonEmptyId),
-  );
-  const manuallyContinuedSourceIds = new Set(
-    safeMessages
-      .filter((message) =>
-        isRecoveryControlUserTurn(message) &&
-        message._automaticRecovery !== true &&
-        (message.status !== "error" || childErrorIds.has(message.id)))
-      .map((message) => message._recoveryOfClientMessageId)
-      .filter(isNonEmptyId),
-  );
-  // A manual continuation retires the notice, never the work stored on its row.
-  // Project a held card for display only: a frozen/raw snapshot remains intact,
-  // and the existing errorPresentation rules still decide whether text is an
-  // answer or a diagnostic. Keeping the row also preserves its exact usage.
-  const continuationViewMessages = safeMessages.map((message): ChatMessage =>
-    message.role === "assistant" && !!message._errorCode &&
-    typeof message._clientMessageId === "string" &&
-    manuallyContinuedSourceIds.has(message._clientMessageId)
-      ? { ...message, _errorHeldForRecovery: true, _errorCardSnapshot: { disposition: "silent" } }
-      : message,
-  );
-  // OCV5-313: view-only — rows of an earlier finished turn that a refresh merge left under a later
-  // user go back to their own turn before grouping, so they never fold into the newest 处理过程.
-  // OCV5-459: a Stop stamped on mid-turn narration splits into that narration (a step) and the stop row.
-  const turnLineageParents = turnRecoveryParents(safeMessages);
-  const renderableMessages = projectVisibleAssistantRows(splitStoppedNarration(returnStrayRowsToOwnerTurn(continuationViewMessages.filter(
-    (m) =>
-      !(m as ChatMessage & { _historyProjection?: unknown })._historyProjection &&
-      typeof m.id === "string" &&
-      !m.id.startsWith("projection-") &&
-      !m.id.startsWith("oc-dispatch-err:") &&
-      m._turnTapeProcess !== true &&
-      m._timelineAuxiliary === undefined &&
-      m.role !== "runtime-event" &&
-      !isRecoveryControlUserTurn(m) &&
-      !(
-        m.role === "assistant" &&
-        !!m._errorCode &&
-        typeof m._clientMessageId === "string" &&
-        recoveredSourceIds.has(m._clientMessageId) &&
-        // 已经提交的卡不许因自动恢复子轮再被藏掉；没提交的中间态仍隐藏。
-        // 用户手动「从断点继续」后，这张卡已被处理，随之收起（OCV5-307）。
-        (m._errorCardSnapshot?.disposition !== "card" ||
-          manuallyContinuedSourceIds.has(m._clientMessageId)) &&
-        // OCV5-645: a held row keeps its partial answer on screen; AssistantCard hides only the card.
-        !isErrorCardHeldWithAnswer(m)
-      ) &&
-      !(isErrorCardHeld(m) && !isErrorCardHeldWithAnswer(m)) &&
-      !isRedundantRuntimeEnvelope(m) &&
-      !recoveredStatusRecordIds.has(m.id) &&
-      !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds) &&
-      !isErrorCardSupersededByTurnStatus(m, statusRecordTurnIds),
-  ))), turnLineageParents);
-  const visibleUserIds = new Set(
-    renderableMessages
-      .filter((message) => message.role === "user")
-      .map((message) => message.id),
-  );
-  // OCV5-390: lineage for the turn's single answer / action row (turnSegment). The control user rows that
-  // link a recovery or 从断点继续 child to its source are filtered out of the rendered list, so it is taken
-  // from the full list here, keyed by both the row id and its client message id (they can differ).
-  const recoveryParents = new Map(
-    safeMessages
-      .filter(
-        (message) =>
-          isRecoveryControlUserTurn(message) &&
-          isNonEmptyId(message._recoveryOfClientMessageId),
-      )
-      .map((message) => [message.id, message._recoveryOfClientMessageId as string]),
-  );
-  const visibleErrorTurnId = (clientMessageId: string) => {
-    let current = clientMessageId;
-    const visited = new Set<string>();
-    while (!visibleUserIds.has(current) && !visited.has(current)) {
-      visited.add(current);
-      const parent = recoveryParents.get(current);
-      if (!parent) break;
-      current = parent;
-    }
-    return current;
-  };
-  const presentedErrorTurnIds = new Set(
-    renderableMessages
-      .filter(
-        (message) =>
-          typeof message._clientMessageId === "string" &&
-          message._clientMessageId.length > 0 &&
-          (message._turnStatusRecord === true ||
-            (message.role === "assistant" && !!message._errorCode && !isErrorCardHeld(message))),
-      )
-      .map((message) => visibleErrorTurnId(message._clientMessageId as string)),
-  );
-  // A manual child has taken over this failure even when its retired assistant
-  // card is no longer visible. Do not resurrect the old user's failed-send CTA.
-  for (const sourceId of manuallyContinuedSourceIds) presentedErrorTurnIds.add(visibleErrorTurnId(sourceId));
-  const renderableIds = new Set(renderableMessages.map((message) => message.id));
-  const failureIsPresentedBelow = (message: ChatMessage): boolean =>
-    recoveryFailureIsPresentedBelow({
-      message,
-      presentedErrorTurnIds,
-      automaticRecoveredSourceIds,
-      safeMessages,
-      renderableIds,
-      visibleErrorTurnId,
-    });
   const legacyArchivedRemaining = archive?.hasMore === undefined
     ? Math.max(
         0,
@@ -2475,32 +2431,48 @@ export function MessageList({
     if (typeof followBottomRef?.scrollToBottom === "function") {
       followBottomRef.scrollToBottom(el);
     } else {
-      // 无 controller 的只读消费方(admin/教程/harness)一次性初始定位,不参与 stick 竞态
-      el.scrollTop = el.scrollHeight;
+      // 无 controller 的只读消费方(admin/教程/harness)一次性初始定位,经单 writer 受控写口
+      snapScrollToBottomOnce(el);
     }
   }, [scrollParent, windowVersion, messages.length, sessionId]);
-  // 当前活跃段起点(最后一条 user 消息之后)——TodoWrite/plan 的 HUD 抑制只作用于该段,
-  // 与 PinnedTaskTracker 的任务源提取共用 turnSegment.ts 同一判定。
-  const turnStart = currentTurnStartIndex(renderableMessages);
-  // 每条消息是否为「所在轮末条 assistant 正文」(评价反馈行唯一可见位)。按全量 messages 下标对齐,
-  // 单一权威在 turnSegment.ts(与 turnStart / coalesceTeam 同源的 user=轮边界判定,不另造第二套)。
-  let ratingFinal: boolean[] = [];
-  let renderItems: RenderItem[] = [];
-  try {
-    ratingFinal = turnFinalAssistantFlags(renderableMessages, turnLineageParents);
-    renderItems = coalesceTeam(renderableMessages, 0, sending, liveTurnUsage);
-  } catch {
-    ratingFinal = renderableMessages.map(() => false);
-    renderItems = renderableMessages.map((m, absIdx) => ({
-      kind: "single" as const,
-      m,
-      isLast: absIdx === renderableMessages.length - 1,
-      idx: absIdx,
-    }));
-  }
-  if (processDisclosure) renderItems = discloseProcess(renderItems as LeafRenderItem[], renderableMessages, ratingFinal, sending);
-  // OCV5-390: the action row follows the answer, minus turns that ended on an error.
-  const actionRowFinal = turnRatingFlags(renderableMessages, ratingFinal, turnLineageParents);
+  // 当前活跃段起点(最后一条 user 消息之后) + 团队聚簇 + 处理过程折叠管线。
+  const { turnStart, ratingFinal, renderItems, actionRowFinal } = useMemo(() => {
+    const nextTurnStart = currentTurnStartIndex(renderableMessages);
+    let nextRatingFinal: boolean[] = [];
+    let nextRenderItems: RenderItem[] = [];
+    try {
+      nextRatingFinal = turnFinalAssistantFlags(renderableMessages, turnLineageParents);
+      nextRenderItems = coalesceTeam(renderableMessages, 0, sending, liveTurnUsage);
+    } catch {
+      nextRatingFinal = renderableMessages.map(() => false);
+      nextRenderItems = renderableMessages.map((m, absIdx) => ({
+        kind: "single" as const,
+        m,
+        isLast: absIdx === renderableMessages.length - 1,
+        idx: absIdx,
+      }));
+    }
+    if (processDisclosure) {
+      nextRenderItems = discloseProcess(
+        nextRenderItems as LeafRenderItem[],
+        renderableMessages,
+        nextRatingFinal,
+        sending,
+        turnLineageParents,
+      );
+    }
+    nextRenderItems = coalesceTaskApprovalGroups<SingleRenderItem, RenderItem>(
+      nextRenderItems,
+      renderItemKey,
+    );
+    const nextActionRowFinal = turnRatingFlags(renderableMessages, nextRatingFinal, turnLineageParents);
+    return {
+      turnStart: nextTurnStart,
+      ratingFinal: nextRatingFinal,
+      renderItems: nextRenderItems,
+      actionRowFinal: nextActionRowFinal,
+    };
+  }, [renderableMessages, turnLineageParents, sending, liveTurnUsage, processDisclosure]);
   itemCountRef.current = renderItems.length;
   const itemKey = renderItemKey;
   // Production scroll surfaces freeze a start index on first content so streaming
@@ -2719,7 +2691,16 @@ export function MessageList({
     return `${rowSig}|ia:${it.idx >= turnStart ? 1 : 0}|dc:${it.delegateCost ?? ""}|ep:${eagerPayloadKeysRef.current?.has(rowId) === true ? 1 : 0}`;
   };
 
-  const renderItem = (it: RenderItem): ReactNode => {
+  const renderItem = (it: RenderItem, renderIndex?: number): ReactNode => {
+    if (it.kind === "approval-group") {
+      return (
+        <TaskApprovalGroupSlot ticketIds={it.ticketIds}>
+          {it.items.map((child) => (
+            <div key={renderItemKey(child)}>{renderItem(child, renderIndex)}</div>
+          ))}
+        </TaskApprovalGroupSlot>
+      );
+    }
     if (it.kind === "process") {
       const sections = processSections(it.items, itemMessages, renderItemKey);
       const needle = findQuery.trim().toLowerCase();
@@ -2733,7 +2714,7 @@ export function MessageList({
       // closed once it has finished. A click stores true or false and is not
       // reset when tokens arrive or the turn completes.
       const open = sections.some(sectionHit) || (explicit === undefined ? it.active : explicit);
-      const bounds = processTimeBounds(renderItems, it);
+      const bounds = processTimeBounds(renderItems, it, renderIndex);
       const olderSteps = olderLiveStepsKey === it.key ? olderLiveStepsControl : null;
       const live = it.active || olderSteps !== null;
       return (
@@ -2995,6 +2976,7 @@ export function MessageList({
       >
         <Input
           aria-label="在会话中查找"
+          placeholder="在会话中查找…"
           autoFocus
           inputSize="sm"
           value={findQuery}
@@ -3057,6 +3039,7 @@ export function MessageList({
           shape="square"
           size="sm"
           aria-label="关闭查找"
+          title="关闭查找"
           onKeyDown={stopFindKeys}
           onClick={find.onClose}
         >
@@ -3079,7 +3062,7 @@ export function MessageList({
               onClick={requestOlderArchive}
               disabled={Boolean(archive?.loading) || archiveQueued}
               aria-busy={Boolean(archive?.loading) || archiveQueued}
-              className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-caption text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11"
             >
               {archive?.loading || archiveQueued
                 ? <><Spinner size={12} /> 加载中…</>
@@ -3141,7 +3124,7 @@ export function MessageList({
               data-find-current={find && findCurrentHere ? "" : undefined}
               style={cachedHeight ? { containIntrinsicSize: `auto ${cachedHeight}px` } : undefined}
             >
-              {renderItem(item)}
+              {renderItem(item, windowStart + visibleIndex)}
             </div>
           </TimelineEagerMediaContext.Provider>
         );

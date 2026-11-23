@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import {
+  hasAliveVerifiedGroupMembers,
   OcBashJobManager,
   parseProcStatStartTimeTicks,
   resolveOcBashRegistryDir,
@@ -201,5 +202,11 @@ describe('ocBashJobManager disk snapshots (OCV5-844)', () => {
       mgr.disposeAll()
       rmSync(regDir, { recursive: true, force: true })
     }
+  })
+
+  it('short-circuits hasAliveVerifiedGroupMembers via process.kill(-pgid, 0) ESRCH for dead groups', () => {
+    if (process.platform !== 'linux') return
+    // PID 99999999 does not exist on Linux (pid_max <= 4194304), so kill(-pgid, 0) yields ESRCH.
+    assert.equal(hasAliveVerifiedGroupMembers(99_999_999, 0), false)
   })
 })

@@ -110,10 +110,11 @@ export async function reviseCommunityTutorial(
           [id, authorUserId, draft.title, draft.summary, draft.category, draft.bodyMarkdown, mode !== 'on'],
         )
       ).rows[0]!
-      for (const sha of imageShas) {
+      if (imageShas.length > 0) {
         await client.query(
-          'INSERT INTO community_tutorial_revision_images (revision_id, sha256) VALUES ($1::bigint, $2)',
-          [revision.id, sha],
+          `INSERT INTO community_tutorial_revision_images (revision_id, sha256)
+           SELECT $1::bigint, t.sha256 FROM unnest($2::text[]) AS t(sha256)`,
+          [revision.id, imageShas],
         )
       }
       await enqueueTutorialModeration(id, mode, client, { reset: true })

@@ -305,3 +305,18 @@
   .preview-comment-editor { border-radius: 20px; padding: 12px; }
   .preview-secondary-button { padding: 0 8px; }
 }
+@media (prefers-reduced-motion: reduce) {
+  .preview-controls-enter,
+  .preview-bottom-layer.preview-controls-enter,
+  .preview-comments-modal {
+    animation: none;
+  }
+  .preview-icon-button:active:not(:disabled),
+  .preview-device-button:active,
+  .preview-primary-button:active:not(:disabled),
+  .preview-action-button:active:not(:disabled),
+  .preview-composer-submit:active:not(:disabled),
+  .preview-anchor-hit:hover .preview-anchor-dot {
+    transform: none;
+  }
+}

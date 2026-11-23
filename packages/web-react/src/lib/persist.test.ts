@@ -3101,3 +3101,290 @@ describe("recovery rejection feedback survives authoritative history", () => {
     expect(mergeFullServerWins([server], [noSnapshot]).find((m) => m.id === server.id)?._recoverySkippedNotice).toBe(notice);
   });
 });
+
+describe("OCV5-867: 活跃轮 SwarmBoard 与 live units 在全量/增量同步中不被误删或倒挂", () => {
+  const activeCmid = "m-turn4";
+  const serverBase: ChatMessage[] = [
+    { id: "u1", role: "user", text: "hi", ts: 100, _source: "server", _orderSeq: 1 },
+    { id: "a1", role: "assistant", text: "ok", ts: 101, _source: "server", _orderSeq: 2 },
+    { id: activeCmid, role: "user", text: "run swarm", ts: 200, _source: "server", _orderSeq: 3, _clientMessageId: activeCmid },
+  ];
+  const makeSwarm = (): ChatMessage => ({
+    id: "tool:3521:agy-swarm-1",
+    role: "tool",
+    toolName: "SwarmBoard",
+    blockId: "agy-swarm-1",
+    text: "",
+    ts: 205,
+    _liveUnit: true,
+    _turnOwnerId: activeCmid,
+    _clientMessageId: activeCmid,
+  });
+  const makeBash = (): ChatMessage => ({
+    id: "tool:3522:bash-1",
+    role: "tool",
+    toolName: "oc_bash",
+    text: "",
+    ts: 206,
+    _liveUnit: true,
+    _turnOwnerId: activeCmid,
+    _clientMessageId: activeCmid,
+  });
+  const makeAgentGroup = (): ChatMessage => ({
+    id: "ag-1",
+    role: "agent-group",
+    text: "",
+    ts: 207,
+    _liveUnit: true,
+    _turnOwnerId: activeCmid,
+    _clientMessageId: activeCmid,
+  });
+  const makeRead = (): ChatMessage => ({
+    id: "m-read-live",
+    role: "tool",
+    toolName: "Read",
+    text: "",
+    ts: 210,
+    _turnOwnerId: activeCmid,
+    _clientMessageId: activeCmid,
+  });
+
+  test("live units 先于活跃 user 到达时，两次连续全量同步均保持 user 在前且不删 SwarmBoard/tool", () => {
+    const localBeforeUser: ChatMessage[] = [
+      serverBase[0],
+      serverBase[1],
+      makeSwarm(),
+      makeBash(),
+      makeAgentGroup(),
+    ];
+    const first = mergeFullServerWins(serverBase, localBeforeUser, 0, undefined, {
+      deletionAuthority: true,
+      activeClientMessageId: activeCmid,
+    });
+    expect(first.map((m) => m.id)).toEqual([
+      "u1",
+      "a1",
+      activeCmid,
+      "tool:3521:agy-swarm-1",
+      "tool:3522:bash-1",
+      "ag-1",
+    ]);
+
+    const second = mergeFullServerWins(serverBase, [...first, makeRead()], 0, undefined, {
+      deletionAuthority: true,
+      activeClientMessageId: activeCmid,
+    });
+    expect(second.map((m) => m.id)).toEqual([
+      "u1",
+      "a1",
+      activeCmid,
+      "tool:3521:agy-swarm-1",
+      "tool:3522:bash-1",
+      "ag-1",
+      "m-read-live",
+    ]);
+  });
+
+  test("已污染缓存（SwarmBoard/tool 落在活跃 user 之前）在全量同步时自愈归位且不丢卡", () => {
+    const polluted: ChatMessage[] = [
+      serverBase[0],
+      serverBase[1],
+      makeSwarm(),
+      makeBash(),
+      makeAgentGroup(),
+      serverBase[2],
+      makeRead(),
+    ];
+    const healed = mergeFullServerWins(serverBase, polluted, 0, undefined, {
+      deletionAuthority: true,
+      activeClientMessageId: activeCmid,
+    });
+    expect(healed.map((m) => m.id)).toEqual([
+      "u1",
+      "a1",
+      activeCmid,
+      "tool:3521:agy-swarm-1",
+      "tool:3522:bash-1",
+      "ag-1",
+      "m-read-live",
+    ]);
+  });
+
+  test("applyServerIncremental 首次带回活跃 user 时，把前置活跃 live units 移到 user 之后", () => {
+    const localBeforeUser: ChatMessage[] = [serverBase[0], serverBase[1], makeSwarm(), makeBash()];
+    const merged = applyServerIncremental(localBeforeUser, [serverBase[2]], undefined, {
+      activeClientMessageId: activeCmid,
+    });
+    expect(merged.map((m) => m.id)).toEqual([
+      "u1",
+      "a1",
+      activeCmid,
+      "tool:3521:agy-swarm-1",
+      "tool:3522:bash-1",
+    ]);
+  });
+
+  test("历史已完成轮的陈旧中段 local-only tool 行仍被正常淘汰（不受活跃轮保护误放行）", () => {
+    const staleOldTool: ChatMessage = {
+      id: "stale-old-tool",
+      role: "tool",
+      toolName: "oc_bash",
+      text: "",
+      ts: 100,
+      _turnOwnerId: "u1",
+      _clientMessageId: "u1",
+    };
+    const merged = mergeFullServerWins(
+      serverBase,
+      [serverBase[0], staleOldTool, serverBase[1], serverBase[2]],
+      0,
+      undefined,
+      { deletionAuthority: true, activeClientMessageId: activeCmid },
+    );
+    expect(merged.map((m) => m.id)).toEqual(["u1", "a1", activeCmid]);
+  });
+});
+
+describe("OCV5-868: 活跃轮全量/增量同步绝不把更早耐久历史行尾追到当前 user 之后", () => {
+  const turn1Owner = "m-mwt0qdt3-n-n10p";
+  const turn2Owner = "m-mwt1tun7-19-10xs";
+  const t1Tool: ChatMessage = {
+    id: "srv-t1-tool-75",
+    role: "tool",
+    toolName: "Read",
+    text: "",
+    ts: 1000,
+    _source: "server",
+    _timelineRecord: true,
+    _orderSeq: 2,
+    _turnTapeId: "tape-1",
+    _turnTapeOrdinal: 75,
+    _turnTapeComplete: true,
+    _clientMessageId: turn1Owner,
+  };
+  const t1Final: ChatMessage = {
+    id: "srv-t1-s0",
+    role: "assistant",
+    text: "要我现在直接建单修复并合入个人版上线吗？",
+    ts: 1050,
+    _source: "server",
+    _timelineRecord: true,
+    _orderSeq: 2,
+    _turnTapeId: "tape-1",
+    _turnTapeOrdinal: 173,
+    _turnTapeComplete: true,
+    _clientMessageId: turn1Owner,
+  };
+  const t1Terminal: ChatMessage = {
+    id: "timeline-terminal-t1",
+    role: "system",
+    text: "",
+    ts: 1051,
+    _source: "server",
+    _timelineRecord: true,
+    _orderSeq: 2,
+    _clientMessageId: turn1Owner,
+  };
+  const u2Server: ChatMessage = {
+    id: turn2Owner,
+    role: "user",
+    text: "要",
+    ts: 2000,
+    _source: "server",
+    _timelineRecord: true,
+    _orderSeq: 3,
+  };
+
+  test("local 仅保留乐观 u2 + Turn 2 实时行（toStored 剥离 _timelineRecord 或旧 live 被淘汰）时，Turn 1 耐久历史严格归位到 u2 之前且保住 Turn 2 实时相对序", () => {
+    const u2Local: ChatMessage = { id: turn2Owner, role: "user", text: "要", ts: 2000, status: "sent" };
+    // 刻意令 t2Live2.ts < t2Live1.ts，验证不会破坏 OCV5-272 的活跃轮实时序。
+    const t2Live1: ChatMessage = {
+      id: "tool:836:bash",
+      role: "tool",
+      toolName: "oc_bash",
+      text: "",
+      ts: 2200,
+      _turnOwnerId: turn2Owner,
+      _clientMessageId: turn2Owner,
+    };
+    const t2Live2: ChatMessage = {
+      id: "tool:842:bash",
+      role: "tool",
+      toolName: "oc_bash",
+      text: "",
+      ts: 2100,
+      _turnOwnerId: turn2Owner,
+      _clientMessageId: turn2Owner,
+    };
+    const serverPage: ChatMessage[] = [t1Tool, t1Final, t1Terminal, u2Server];
+    const merged = mergeFullServerWins(serverPage, [u2Local, t2Live1, t2Live2], 0, undefined, {
+      deletionAuthority: true,
+      activeClientMessageId: turn2Owner,
+    });
+    expect(merged.map((m) => m.id)).toEqual([
+      "srv-t1-tool-75",
+      "srv-t1-s0",
+      "timeline-terminal-t1",
+      turn2Owner,
+      "tool:836:bash",
+      "tool:842:bash",
+    ]);
+    // 二次全量同步保持幂等
+    const remerged = mergeFullServerWins(serverPage, merged, 0, undefined, {
+      deletionAuthority: true,
+      activeClientMessageId: turn2Owner,
+    });
+    expect(remerged.map((m) => m.id)).toEqual(merged.map((m) => m.id));
+  });
+
+  test("u2 尚为纯乐观行（服务端未回 _orderSeq）时，服务端刚补回的 Turn 1 耐久行同样归位到 u2 之前", () => {
+    const u2Optimistic: ChatMessage = { id: turn2Owner, role: "user", text: "要", ts: 2000, status: "sending" };
+    const t2Live: ChatMessage = {
+      id: "m-t2-tool",
+      role: "tool",
+      toolName: "oc_bash",
+      text: "",
+      ts: 2050,
+      _turnOwnerId: turn2Owner,
+      _clientMessageId: turn2Owner,
+    };
+    const merged = mergeFullServerWins([t1Tool, t1Final], [u2Optimistic, t2Live], 0, undefined, {
+      deletionAuthority: true,
+      activeClientMessageId: turn2Owner,
+    });
+    expect(merged.map((m) => m.id)).toEqual(["srv-t1-tool-75", "srv-t1-s0", turn2Owner, "m-t2-tool"]);
+  });
+
+  test("跨 tab 尚缺 u2 且本地已有 Turn 2 实时行时，全量同步拉回 Turn 1 历史行仍排在 Turn 2 实时行之前", () => {
+    const t2Live: ChatMessage = {
+      id: "m-t2-cross-tab",
+      role: "tool",
+      toolName: "oc_bash",
+      text: "",
+      ts: 2050,
+      _turnOwnerId: turn2Owner,
+      _clientMessageId: turn2Owner,
+    };
+    const merged = mergeFullServerWins([t1Tool, t1Final], [t2Live], 0, undefined, {
+      deletionAuthority: true,
+      activeClientMessageId: turn2Owner,
+    });
+    expect(merged.map((m) => m.id)).toEqual(["srv-t1-tool-75", "srv-t1-s0", "m-t2-cross-tab"]);
+  });
+
+  test("applyServerIncremental 在活跃轮带回更早耐久历史行时同样归位到 u2 之前", () => {
+    const t2Live: ChatMessage = {
+      id: "m-t2-inc",
+      role: "tool",
+      toolName: "oc_bash",
+      text: "",
+      ts: 2050,
+      _turnOwnerId: turn2Owner,
+      _clientMessageId: turn2Owner,
+    };
+    const merged = applyServerIncremental([u2Server, t2Live], [t1Tool, t1Final], undefined, {
+      activeClientMessageId: turn2Owner,
+    });
+    expect(merged.map((m) => m.id)).toEqual(["srv-t1-tool-75", "srv-t1-s0", turn2Owner, "m-t2-inc"]);
+  });
+});

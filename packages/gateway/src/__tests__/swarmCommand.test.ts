@@ -444,13 +444,32 @@ describe("B5: handleSwarmCommandRoute (POST /api/sessions/:id/swarm/command)", (
 });
 
 describe("Swarm playbook templates & command parser", () => {
-  it("ships 4 built-in research/engineering templates and expands them cleanly by ID or Chinese title", () => {
+  it("ships 6 built-in research/engineering templates and expands them cleanly by ID or Chinese title", () => {
     const all = listSwarmPlaybooks();
-    assert.equal(all.length, 4);
+    assert.equal(all.length, 6);
     assert.deepEqual(
       all.map((t) => t.title),
-      ["并行实现+验收", "多源文献深研+核验", "架构深度体检", "多方案评审"],
+      [
+        "并行实现+验收",
+        "多源文献深研+核验",
+        "架构深度体检",
+        "多方案评审",
+        "论文写作+盲审+批判修订",
+        "受控实验循环（防刷分）",
+      ],
     );
+
+    const writeReview = getSwarmPlaybook("research-write-review-revise");
+    assert.ok(writeReview);
+    assert.equal(writeReview.category, "research");
+    assert.equal(getSwarmPlaybook("写审修")?.id, "research-write-review-revise");
+    assert.ok(writeReview.roles.some((r) => r.name === "blind-reviewer" && r.readOnly === true));
+
+    const expLoop = getSwarmPlaybook("research-controlled-exp-loop");
+    assert.ok(expLoop);
+    assert.equal(expLoop.category, "research");
+    assert.equal(getSwarmPlaybook("防刷分实验循环")?.id, "research-controlled-exp-loop");
+    assert.ok(expLoop.roles.some((r) => r.name === "eval-guardian" && r.readOnly === true));
 
     for (const tpl of all) {
       assert.equal(getSwarmPlaybook(tpl.id)?.id, tpl.id);

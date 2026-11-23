@@ -2,6 +2,7 @@
 import { COST_INDEX_BASELINE_MODEL_ID, costXVsBaseline } from '@openclaude/protocol'
 import { perKtokCredits, type PublicModel } from './pricing.js'
 import type { ModelCatalogSnapshot, ModelPlacement, UserModelScope } from './modelCatalog.js'
+import { projectContextWindowForRole } from './modelRolePolicy.js'
 
 /**
  * OCV5-721: Transition-period remote brain pool models automatically display with a " 远端" suffix
@@ -97,6 +98,11 @@ export interface LockedPublicModelProjection {
   cost_x?: number;
   promo_label?: string;
   placement?: ModelPlacement;
+  context_window?: number | null;
+  supports_vision?: boolean;
+  supported_efforts?: string[];
+  multiplier?: string;
+  provider_id?: string | null;
 }
 
 export function projectLockedModels(
@@ -124,11 +130,33 @@ export function projectLockedModels(
           }
         : null,
     );
+    const desc = typeof snapshot.resolve === 'function' ? snapshot.resolve(row.modelId) : null;
+    const rawRow = row as typeof row & {
+      contextWindow?: number | null;
+      supportsVision?: boolean;
+      supportedEfforts?: readonly string[];
+      providerId?: string | null;
+    };
+    const contextWindow = desc
+      ? projectContextWindowForRole(row.modelId, desc.contextWindow, scope.role)
+      : rawRow.contextWindow;
+    const supportsVision = desc ? desc.capabilityProfile.supportsVision : rawRow.supportsVision;
+    const supportedEfforts = desc
+      ? [...desc.capabilityProfile.reasoning.supported]
+      : rawRow.supportedEfforts
+        ? [...rawRow.supportedEfforts]
+        : undefined;
+    const providerId = desc ? desc.providerId : rawRow.providerId;
     out.push({
       id: row.modelId,
       display_name: formatRemoteModelDisplayName(row.displayName, row.placement, row.modelId),
       engine: row.engine,
       min_plan_code: row.minPlanCode,
+      multiplier: p.multiplier,
+      ...(contextWindow !== undefined ? { context_window: contextWindow } : {}),
+      ...(supportsVision !== undefined ? { supports_vision: supportsVision } : {}),
+      ...(supportedEfforts !== undefined ? { supported_efforts: supportedEfforts } : {}),
+      ...(providerId !== undefined ? { provider_id: providerId } : {}),
       ...(row.placement === 'remote_pool' ? { placement: 'remote_pool' as const } : {}),
       ...(row.minPlanName ? { min_plan_name: row.minPlanName } : {}),
       ...(costX !== undefined ? { cost_x: costX } : {}),

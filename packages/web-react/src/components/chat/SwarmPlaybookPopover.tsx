@@ -7,7 +7,7 @@
  *   - 支持非受控与受控开合（<640px 移动端由 ComposerPlusMenu 触发打开）。
  */
 import * as RP from "@radix-ui/react-popover";
-import { BookOpenCheck, ChevronDown, Code2, Layers, Scale, X } from "lucide-react";
+import { BookOpenCheck, ChevronDown, Code2, FilePenLine, FlaskConical, Layers, Scale, X } from "lucide-react";
 import { type CSSProperties, type RefObject, useState } from "react";
 import {
   SWARM_PLAYBOOK_PRESETS,
@@ -41,6 +41,10 @@ function presetIcon(id: SwarmPlaybookPreset["id"]) {
       return <AtelierIcon name="shield" size={14} />;
     case "multi-option-review":
       return <Scale size={14} strokeWidth={1.85} aria-hidden />;
+    case "research-write-review-revise":
+      return <FilePenLine size={14} strokeWidth={1.85} aria-hidden />;
+    case "research-controlled-exp-loop":
+      return <FlaskConical size={14} strokeWidth={1.85} aria-hidden />;
   }
 }
 
@@ -106,6 +110,14 @@ export function SwarmPlaybookPopover({
         role="dialog"
         aria-label="蜂群高阶剧本模板"
         data-testid="swarm-playbook-popover"
+        onFocusOutside={(event) => {
+          // 外部 anchorRef 模式下无 RP.Trigger，防止触发器或退场中的「+」菜单焦点回跳误关弹层（OCV5-861）。
+          if (!anchorRef) return;
+          const target = event.target as HTMLElement | null;
+          if (target && (anchorRef.current?.contains(target) || target.closest?.('[role="menu"]'))) {
+            event.preventDefault();
+          }
+        }}
         className="w-[min(20rem,calc(100vw-1.5rem))] overflow-hidden rounded-2xl p-0"
       >
         <div className="flex items-center justify-between gap-2 border-b border-border px-3.5 py-2.5">

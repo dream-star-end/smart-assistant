@@ -290,16 +290,16 @@ body {
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  /* 禁止 body 级滚动/橡皮筋(布局滚动只发生在聊天区 overflow-y-auto 内)。 */
-  overflow: hidden;
+  /* #root 已 position: fixed; overflow: hidden; 此处仅禁橡皮筋回弹，避免 body overflow:hidden 触发全站布局告警。 */
   overscroll-behavior: none;
 }
 
-*::-webkit-scrollbar { width: 9px; height: 9px; }
+* { scrollbar-color: color-mix(in srgb, var(--fg) 18%, transparent) transparent; }
+*::-webkit-scrollbar { width: 7px; height: 7px; }
 *::-webkit-scrollbar-thumb {
   background: color-mix(in srgb, var(--fg) 16%, transparent);
   border-radius: 999px;
-  border: 2px solid transparent;
+  border: 1.5px solid transparent;
   background-clip: padding-box;
 }
 *::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--fg) 28%, transparent); }
@@ -331,7 +331,7 @@ body {
     box-shadow:
       0 1px 2px rgba(0, 0, 0, 0.36),
       0 6px 20px -6px rgba(0, 0, 0, 0.48),
-      inset 0 1px 0 rgba(255, 255, 255, 0.065);
+      inset 0 1px 0 color-mix(in srgb, var(--fg) 8%, transparent);
   }
 
   /* 2. 交互卡片悬停质感：微抬升 -1px + 暖陶土微光描边 + 景深柔和加深 */
@@ -412,7 +412,7 @@ body {
     border-color: color-mix(in srgb, var(--fg) 13%, transparent);
     box-shadow:
       var(--shadow-pop),
-      inset 0 1px 0 rgba(255, 255, 255, 0.085);
+      inset 0 1px 0 color-mix(in srgb, var(--fg) 8%, transparent);
   }
 
   /* 6. 精致圆角方形图标徽章容器：光学居中 + 轻柔染色底 + 1px 内环高光 */
@@ -587,21 +587,25 @@ body {
   .dark .oc-btn-primary-craft {
     background-image: linear-gradient(
       180deg,
-      color-mix(in srgb, #ffffff 35%, var(--primary)) 0%,
+      color-mix(in srgb, #ffffff 18%, var(--primary)) 0%,
       var(--primary) 100%
     );
     box-shadow:
       0 1px 2px rgba(0, 0, 0, 0.42),
       0 4px 12px -2px rgba(0, 0, 0, 0.5),
-      inset 0 1px 0 rgba(255, 255, 255, 0.92);
+      inset 0 1px 0 color-mix(in srgb, #ffffff 45%, var(--primary));
   }
   @media (hover: hover) {
     .dark .oc-btn-primary-craft:hover:not(:disabled) {
-      background-image: linear-gradient(180deg, #ffffff 0%, color-mix(in srgb, #ffffff 25%, var(--primary)) 100%);
+      background-image: linear-gradient(
+        180deg,
+        color-mix(in srgb, #ffffff 28%, var(--primary)) 0%,
+        color-mix(in srgb, #ffffff 10%, var(--primary)) 100%
+      );
       box-shadow:
         0 2px 6px rgba(0, 0, 0, 0.48),
         0 6px 16px -3px rgba(0, 0, 0, 0.55),
-        inset 0 1px 0 #ffffff;
+        inset 0 1px 0 color-mix(in srgb, #ffffff 60%, var(--primary));
     }
   }
 
@@ -859,7 +863,7 @@ body {
       var(--shadow-soft);
   }
 
-  /* OCV5-843: 顶栏选中模型胶囊（蜂群激活态）—— 明暗双主题柔光暖陶土边框 + 轻渐变 + 克制投影，
+  /* OCV5-843 / OCV5-872: 选中模型胶囊（蜂群激活态）—— 明暗双主题柔光暖陶土边框 + 轻渐变 + 克制投影，
      区别于 teamEngineActive 实心锁定态，保持可点击切换质感。 */
   .oc-model-trigger-swarm[data-swarm-active="true"] {
     border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
@@ -1389,10 +1393,9 @@ body {
 @keyframes spin { to { transform: rotate(360deg); } }
 .spin { animation: spin 0.9s linear infinite; }
 
-/* ── 图片加载骨架:深色底(bg=hover token,禁纯白)+ 轻扫光 shimmer。主题自适应
-   (--hover 已随明暗切换;扫光用低透明白,明暗都读得出)。防加载前白屏 + 白闪。
-   prefers-reduced-motion 下由上面的全局规则把动画时长压到 0.01ms(静止深色底)。 ── */
-.oc-img-skeleton { position: relative; overflow: hidden; background: var(--hover); }
+/* ── 图片加载骨架:使用 --skeleton 语义底色（浅色清晰可辨）+ 轻扫光 shimmer。
+   prefers-reduced-motion 下由全局规则把动画时长压到 0.01ms。 ── */
+.oc-img-skeleton { position: relative; overflow: hidden; background: var(--skeleton); }
 .oc-img-skeleton::after {
   content: "";
   position: absolute;
@@ -1558,6 +1561,13 @@ body {
   ::placeholder {
     color: var(--faint);
     opacity: 1;
+  }
+  ::selection {
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    color: var(--fg);
+  }
+  .dark ::selection {
+    background: color-mix(in srgb, var(--accent) 30%, transparent);
   }
 }
 
@@ -1731,7 +1741,7 @@ body {
 }
 
 /* ── Markdown prose (assistant body) — Clarvy Atelier Editorial Typography ── */
-.prose { font-size: 15.5px; line-height: 1.72; color: var(--fg); word-break: break-word; }
+.prose { font-size: 15.5px; line-height: 1.72; color: var(--fg); word-break: break-word; text-wrap: pretty; }
 .prose > :first-child { margin-top: 0; }
 .prose > :last-child { margin-bottom: 0; }
 .prose p { margin: 0 0 13px; }
@@ -1741,7 +1751,7 @@ body {
 .prose li { margin: 4.5px 0; }
 .prose li::marker { color: color-mix(in srgb, var(--accent) 55%, var(--faint)); }
 /* 标题:上距大于下距,让标题贴住它统领的段落;h1/h2 收紧字距,读起来更"排过版"。 */
-.prose h1, .prose h2, .prose h3, .prose h4 { font-weight: 650; line-height: 1.32; margin: 28px 0 10px; letter-spacing: -0.015em; color: var(--fg); }
+.prose h1, .prose h2, .prose h3, .prose h4 { font-weight: 650; line-height: 1.32; margin: 28px 0 10px; letter-spacing: -0.015em; color: var(--fg); text-wrap: balance; }
 .prose h1 { font-size: 1.45em; letter-spacing: -0.024em; }
 .prose h2 { font-size: 1.24em; letter-spacing: -0.018em; padding-bottom: 6px; border-bottom: 1px solid color-mix(in srgb, var(--fg) 7%, transparent); }
 .prose h3 { font-size: 1.1em; letter-spacing: -0.012em; }

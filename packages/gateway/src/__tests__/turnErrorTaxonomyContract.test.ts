@@ -38,6 +38,8 @@ const CLASSIFY_SAMPLES: Array<{ input: string; code: string }> = [
   { input: 'Selected model is at capacity. Please try a different model.', code: 'model_capacity' },
   { input: 'This model has been retired. Please try a different model.', code: 'model_not_available' },
   { input: 'Anthropic returned 502 Bad Gateway', code: 'upstream_failed' },
+  { input: 'Request timed out after 30s (UPSTREAM_TIMEOUT)', code: 'upstream_timeout' },
+  { input: 'getaddrinfo ENOTFOUND api.anthropic.com', code: 'network_error' },
   {
     input: "prompt is too long: ran out of room in the model's context window",
     code: 'context_too_long',
@@ -169,6 +171,8 @@ describe('turnErrorTaxonomy 契约 — wire OutboundError.code 枚举', () => {
     assert.ok(wireCodes.includes('user_cancelled'))
     // E4 — gateway 权威终态透传码 + E6 持久化降级码,钉死在 wire 枚举里。
     for (const code of [
+      'upstream_timeout',
+      'network_error',
       'runner_crashed',
       'service_restart',
       'engine_error',

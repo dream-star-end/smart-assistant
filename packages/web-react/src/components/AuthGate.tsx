@@ -433,25 +433,26 @@ export function AuthGate({
 
   const conflictOnRegister = mode === "register" && !!shownErr && shownErr.includes("该邮箱已注册");
   const errBox = shownErr && (
-    <div
-      role="alert"
+    <Alert
+      tone="danger"
+      density="compact"
       aria-live="assertive"
-      className="rounded-xl border border-danger/30 bg-danger-soft px-3.5 py-2.5 text-body text-danger"
+      className="rounded-xl px-3.5 py-2.5"
     >
-      <span>{shownErr}</span>
+      <span className="text-danger">{shownErr}</span>
       {conflictOnRegister && onRequestReset && (
         <>
           {" "}
           <button
             type="button"
             onClick={() => go("forgot")}
-            className={cn("font-medium underline decoration-danger/60 underline-offset-2", TOUCH_TEXT_BTN)}
+            className={cn("font-medium text-danger underline decoration-danger/60 underline-offset-2", TOUCH_TEXT_BTN)}
           >
             忘记密码？
           </button>
         </>
       )}
-    </div>
+    </Alert>
   );
   const noticeBox = notice && (
     <div
